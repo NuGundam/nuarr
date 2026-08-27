@@ -13,6 +13,8 @@ the arr config.xml files directly so they are never duplicated.
 """
 from __future__ import annotations
 
+import sys
+
 import os
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
@@ -337,7 +339,19 @@ def load_settings() -> Settings:
             # Cost an hour: plex_cross_check read False no matter what the file
             # said.
             raw = yaml.safe_load(cfg_file.read_text(encoding="utf-8-sig")) or {}
-        except Exception:
+        except Exception as e:                           # noqa: BLE001
+            # LOUD, not silent. This swallow used to be wordless, and the cost
+            # was a debugging session that started three symptoms downstream:
+            # the installer once wrote invalid YAML for an empty library list,
+            # the parse failed HERE, raw stayed {}, every setting fell back to
+            # its dev-box default, and the process then died creating a cache
+            # directory on a drive letter that machine did not have. The
+            # traceback pointed at mkdir; the actual fault was on this line,
+            # invisible. A config file that exists but does not apply must
+            # say so somewhere a person will look.
+            print(f"nuarr: config.yml exists but could not be parsed - "
+                  f"IGNORING IT and using defaults. {type(e).__name__}: {e}",
+                  file=sys.stderr)
             raw = {}
 
     for k, v in raw.items():
@@ -356,7 +370,20 @@ def load_settings() -> Settings:
         u, t = _read_plex_conn()
         s.plex_url = s.plex_url or u
         s.plex_token = s.plex_token or t
-    Path(s.cache_dir).mkdir(parents=True, exist_ok=True)
+    # A CACHE THAT CANNOT BE CREATED IS A WARNING, NOT A DEATH SENTENCE.
+    # This mkdir used to be bare, and it is the line that decided whether the
+    # whole application booted: a cache_dir pointing at a drive letter the
+    # machine does not have (which is exactly what a default from another
+    # machine looks like) threw FileNotFoundError during import, before the
+    # web server, before the logs page, before anything that could have told
+    # the user what to fix. The settings page already knows how to say "that
+    # folder does not exist yet" - it just needs the process alive to say it.
+    try:
+        Path(s.cache_dir).mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        print(f"nuarr: cache_dir {s.cache_dir!r} cannot be created ({e}) - "
+              f"starting anyway; set a working cache folder in Settings",
+              file=sys.stderr)
     return s
 
 

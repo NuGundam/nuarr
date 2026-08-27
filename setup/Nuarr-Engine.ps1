@@ -355,15 +355,27 @@ function Write-NuarrConfig {
   [void]$sb.AppendLine("# written by nuarr Setup on $(Get-Date -f 'yyyy-MM-dd HH:mm')")
   [void]$sb.AppendLine("plex_direct: true")
   [void]$sb.AppendLine("plex_cross_check: false")
-  [void]$sb.AppendLine("libraries:")
+  # `libraries:` on one line and `[]` on the next is NOT valid YAML - the bare
+  # flow sequence after a null-valued key is a ScannerError. PyYAML threw, the
+  # app''s loader swallowed the throw into "no config at all", every setting
+  # fell back to its dev-box default, and the first zero-library install died
+  # trying to create E:\nuarr-cache on a machine with no E: drive. The empty
+  # case has to be `libraries: []` on ONE line; only the non-empty case gets
+  # the block form.
+  if (-not $Cfg.Libraries -or $Cfg.Libraries.Count -eq 0) {
+    [void]$sb.AppendLine("libraries: []")
+  } else {
+    [void]$sb.AppendLine("libraries:")
+  }
   foreach ($l in $Cfg.Libraries) {
     [void]$sb.AppendLine("- name: $($l.Name)")
     [void]$sb.AppendLine("  path: $(& $q $l.Path)")
     [void]$sb.AppendLine("  kind: $($l.Kind)")
     [void]$sb.AppendLine("  enabled: true")
   }
-  if (-not $Cfg.Libraries -or $Cfg.Libraries.Count -eq 0) { [void]$sb.AppendLine("[]") }
-  [void]$sb.AppendLine("arrs:")
+  # (empty case emitted above, inline)
+  $anyArr = @($Cfg.Arrs | Where-Object { $_.ApiKey }).Count -gt 0
+  if ($anyArr) { [void]$sb.AppendLine("arrs:") } else { [void]$sb.AppendLine("arrs: []") }
   $any = $false
   foreach ($a in $Cfg.Arrs) {
     if (-not $a.ApiKey) { continue }
@@ -374,7 +386,7 @@ function Write-NuarrConfig {
     [void]$sb.AppendLine("  api_key: $($a.ApiKey)")
     [void]$sb.AppendLine("  enabled: true")
   }
-  if (-not $any) { [void]$sb.AppendLine("[]") }
+  # (empty case emitted above, inline)
   [void]$sb.AppendLine("cache_dir: $(& $q $Cfg.CacheDir)")
   [void]$sb.AppendLine("cache_min_free_gb: 100")
   if ($Cfg.PlexUrl)   { [void]$sb.AppendLine("plex_url: $($Cfg.PlexUrl)") }
