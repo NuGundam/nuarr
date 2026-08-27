@@ -3399,6 +3399,18 @@ async def api_whisper_check():
     return await asyncio.to_thread(_work)
 
 
+@app.post("/api/whisper/install")
+def api_whisper_install(mode: str = Query("cpu")):
+    """Install the language identifier from the page - GPU, CPU, or upgrade.
+
+    Runs on a thread and returns immediately; /api/whisper carries the live
+    state, so the page can show the pip tail rather than a spinner that could
+    mean anything.
+    """
+    from . import audiolang as _al
+    return _al.install_start(mode)
+
+
 @app.get("/api/audiolang/progress")
 def api_audiolang_progress():
     """Just the live counters - cheap enough to poll while a pass runs."""
@@ -16867,11 +16879,67 @@ async function loadWhisper(){
   // The headline is "can it run", not "is it installed" - a present package
   // with a missing CUDA runtime is the failure that presents as a hang.
   let head, colour;
-  if(!w.installed){ head='not installed — detection falls back to inference'; colour='#e2b341'; }
+  if(!w.installed){ head='not installed — untagged audio is still named by inference'; colour='#e2b341'; }
   else if(w.cuda_devices && (!w.cublas_dll || !w.cudnn_dll)){
     head='installed, but the CUDA runtime DLLs are missing'; colour='#e0575b'; }
   else if(!w.cuda_devices){ head='installed, running on CPU'; colour='#e2b341'; }
   else { head='installed and using the GPU'; colour='#7fd4a3'; }
+
+  // ---- the install strip -------------------------------------------------
+  // Whisper is OPTIONAL, and the page says exactly what its absence costs:
+  // nothing breaks, blanks are still filled by inference; installing upgrades
+  // the answer from "inferred from metadata" to "heard in the audio".
+  const inst=w.install||{};
+  let strip='';
+  if(inst.state==='installing'){
+    strip=`<div style="margin-top:8px">
+      <span style="color:#e2b341;font-size:12px">installing (${esc(inst.mode)})…
+        pip is working — this can take a few minutes</span>
+      ${inst.log?`<pre class="mono dim" style="font-size:10.5px;margin:6px 0 0;max-height:120px;
+        overflow:auto;white-space:pre-wrap">${esc(inst.log.split('\\n').slice(-6).join('\\n'))}</pre>`:''}
+    </div>`;
+    setTimeout(loadWhisper, 3000);
+  } else {
+    let btns='';
+    if(!w.installed){
+      btns = (w.nvidia_present
+        ? `<button onclick="whisInstall('gpu')">Install — NVIDIA GPU</button>
+           <button onclick="whisInstall('cpu')">Install — CPU only</button>`
+        : `<button onclick="whisInstall('cpu')">Install — CPU</button>
+           <button onclick="whisInstall('gpu')">Install — NVIDIA GPU</button>`);
+      strip=`<div style="margin-top:8px;font-size:11.5px" class="dim">
+        Without it, nuarr still names untagged audio by <b>inference</b>
+        (original language from TMDB/TheTVDB when the file's shape makes that
+        safe) — installing upgrades the answer to what the audio actually
+        contains. ${w.nvidia_present
+          ? 'An NVIDIA GPU was detected, so the GPU install is the one you want.'
+          : 'No NVIDIA GPU was detected — the CPU install works everywhere, just slower per track.'}
+        <div style="margin-top:7px;display:flex;gap:8px;flex-wrap:wrap">${btns}</div>
+      </div>`;
+    } else if(w.cuda_devices && (!w.cublas_dll || !w.cudnn_dll)){
+      strip=`<div style="margin-top:8px;font-size:11.5px" class="dim">
+        The identifier is installed and a GPU is visible, but the CUDA runtime
+        wheels are missing — without them the first load hangs instead of failing.
+        <div style="margin-top:7px"><button onclick="whisInstall('gpu')">Install the CUDA runtime</button></div>
+      </div>`;
+    } else if(!w.cuda_devices && w.nvidia_present){
+      strip=`<div style="margin-top:8px;font-size:11.5px" class="dim">
+        An NVIDIA GPU is present but CUDA cannot use it yet — this usually
+        means the runtime wheels went missing or the card arrived after install.
+        <div style="margin-top:7px"><button onclick="whisInstall('gpu')">Install GPU support</button></div>
+      </div>`;
+    }
+    if(inst.state==='error'){
+      strip+=`<div style="margin-top:7px;font-size:11.5px;color:#e0575b">
+        install failed: ${esc(inst.error||'')}</div>
+        ${inst.log?`<pre class="mono dim" style="font-size:10.5px;margin:4px 0 0;max-height:120px;
+        overflow:auto;white-space:pre-wrap">${esc(inst.log.split('\\n').slice(-8).join('\\n'))}</pre>`:''}`;
+    } else if(inst.state==='done'){
+      strip+=`<div style="margin-top:7px;font-size:11.5px;color:#7fd4a3">
+        installed — the next listening pass uses it; the model itself
+        (~464 MB) downloads on first use</div>`;
+    }
+  }
 
   el.innerHTML=`
     <div class="lkind" style="padding:11px 12px;margin-bottom:10px">
@@ -16880,6 +16948,7 @@ async function loadWhisper(){
         <b style="color:#6fb0ff">Language identifier</b>
         <span style="color:${colour};font-size:12px">${esc(head)}</span>
       </div>
+      ${strip}
       <div style="margin-top:7px;display:flex;gap:8px;flex-wrap:wrap">
         <button onclick="whisCheck(this)">Check for update</button>
         <span id="whisMsg" class="dim" style="align-self:center;font-size:11.5px"></span>
@@ -16969,8 +17038,8 @@ async function whisCheck(btn){
       else if(r.newer){
         m.style.color='#e2b341';
         m.innerHTML=`<b>${esc(r.latest)}</b> is available — you have
-          ${esc(r.installed)}. Install it with
-          <span class="mono">pip install -U faster-whisper</span>, then restart nuarr.`;
+          ${esc(r.installed)}.
+          <button onclick="whisInstall('update')" style="margin-left:6px">Install the update</button>`;
       }else{
         m.style.color='#7fd4a3';
         m.textContent=`up to date — ${r.installed} is the newest release`;
@@ -16978,6 +17047,18 @@ async function whisCheck(btn){
     }
   }catch(e){ if(m){ m.style.color='#e2b341'; m.textContent='check failed'; } }
   btn.disabled=false; btn.textContent=old;
+}
+
+async function whisInstall(mode){
+  try{
+    const r=await (await fetch('/api/whisper/install?mode='+mode,{method:'POST'})).json();
+    if(r && r.ok===false && r.error){
+      const m=document.getElementById('whisMsg');
+      if(m){ m.style.color='#e2b341'; m.textContent=r.error; }
+      return;
+    }
+  }catch(e){}
+  loadWhisper();   // repaints as "installing…" and keeps polling itself
 }
 
 // ---- Updates ---------------------------------------------------------
@@ -17267,10 +17348,14 @@ function renderAlang(){
 
   if(!_al.available){
     h+=`<div class="lkind" style="padding:10px 12px;margin-bottom:10px">
-        <b style="color:#e2b341">Detection is not installed.</b>
+        <b style="color:#e2b341">Listening is not installed &mdash; inference is doing the work.</b>
         <div class="dim" style="font-size:11px;margin-top:4px">
-        The language identifier (faster-whisper) is missing, so nuarr can only
-        fall back to inference &mdash; which cannot tell a raw from a dub.</div></div>`;
+        Untagged audio is still being named by inference (the title's original
+        language, where the file's shape makes that safe), which works without
+        anything installed &mdash; but it cannot tell a raw from a dub, and it
+        must skip files with no subtitles. Installing the language identifier
+        upgrades the answer to what the audio actually contains.
+        <button style="margin-left:8px" onclick="wtab('whisper')">Install it &mdash; Settings &rarr; Whisper</button></div></div>`;
   }
 
   h+=`<div style="display:flex;gap:7px;margin:10px 0 12px;flex-wrap:wrap">`+

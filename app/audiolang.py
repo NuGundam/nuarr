@@ -293,7 +293,23 @@ def info() -> dict:
         "device": ("cuda" if cuda_n else "cpu"),
         "min_prob": MIN_PROB,
         "last_error": _MODEL_ERR,
+        "install": install_status(),
+        # The GPU as WINDOWS sees it, not as ctranslate2 sees it - when the
+        # package is missing, ctranslate2 cannot answer, and this is what lets
+        # the page say "you have an NVIDIA card, the GPU install applies to you"
+        # before anything is installed.
+        "nvidia_present": _nvidia_present(),
     }
+
+
+def _nvidia_present() -> bool:
+    """Is there an NVIDIA GPU at all - asked of the driver, not of CUDA."""
+    try:
+        r = subprocess.run(["nvidia-smi", "-L"], capture_output=True,
+                           text=True, timeout=10, creationflags=NO_WINDOW)
+        return r.returncode == 0 and "GPU" in (r.stdout or "")
+    except Exception:                                    # noqa: BLE001
+        return False
 
 
 def latest_version(pkg: str = "faster-whisper") -> dict:
@@ -326,6 +342,86 @@ def available() -> bool:
         return importlib.util.find_spec("faster_whisper") is not None
     except Exception:
         return False
+
+
+# ------------------------------------------------------------- installing ---
+# INSTALLABLE FROM THE PAGE, not only from the setup wizard. The wizard offers
+# Whisper exactly once, at install time, gated on a GPU being present that day.
+# Machines change: a GPU gets added later, or the owner decides CPU inference
+# (slow but it finishes - the model loader already falls back to int8 on CPU)
+# is worth it. Re-running a 200 MB installer to flip one optional package is
+# the wrong price, so the page can do it directly.
+
+INSTALL = {"state": "idle", "mode": "", "log": "", "error": "",
+           "started_at": 0.0, "finished_at": 0.0}
+_INSTALL_LOCK = threading.Lock()
+
+# What each button means, in pip terms. GPU adds the CUDA runtime wheels -
+# their absence is the failure that presents as a hang, so they are never
+# left to be discovered separately.
+_INSTALL_PKGS = {
+    "gpu":    ["faster-whisper", "nvidia-cublas-cu12", "nvidia-cudnn-cu12"],
+    "cpu":    ["faster-whisper"],
+    "update": ["--upgrade", "faster-whisper"],
+}
+
+
+def install_status() -> dict:
+    return dict(INSTALL)
+
+
+def install_start(mode: str) -> dict:
+    """Kick off a pip install on a worker thread; the page polls the state."""
+    if mode not in _INSTALL_PKGS:
+        return {"ok": False, "error": f"unknown install mode {mode!r}"}
+    with _INSTALL_LOCK:
+        if INSTALL["state"] == "installing":
+            return {"ok": False, "error": "an install is already running"}
+        INSTALL.update(state="installing", mode=mode, log="", error="",
+                       started_at=time.time(), finished_at=0.0)
+    threading.Thread(target=_install_worker, args=(mode,),
+                     name="whisper-install", daemon=True).start()
+    return {"ok": True, "mode": mode}
+
+
+def _install_worker(mode: str) -> None:
+    import sys
+    from collections import deque
+    cmd = [sys.executable, "-m", "pip", "install", "--prefer-binary",
+           "--no-warn-script-location"] + _INSTALL_PKGS[mode]
+    tail: deque = deque(maxlen=40)
+    try:
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True,
+                             creationflags=NO_WINDOW)
+        for line in p.stdout:                      # live tail for the page
+            line = line.rstrip()
+            if line:
+                tail.append(line)
+                INSTALL["log"] = "\n".join(tail)
+        rc = p.wait()
+        if rc != 0:
+            raise RuntimeError(f"pip exited with code {rc}")
+        # Make the new package importable IN THIS PROCESS - no restart. The
+        # site-packages dir was on sys.path all along; only the import-system
+        # caches and (for GPU) the DLL search path need refreshing.
+        import importlib
+        importlib.invalidate_caches()
+        if mode == "gpu":
+            _add_cuda_dirs()
+        if mode == "update":
+            # A loaded model keeps the OLD code alive; drop it so the next
+            # pass runs on what was just installed.
+            unload()
+        INSTALL.update(state="done", finished_at=time.time())
+        joblog.log(f"faster-whisper installed from the Whisper page "
+                   f"({mode}) - detection now listens instead of inferring",
+                   "ok", system="audiolang")
+        pending_invalidate()
+    except Exception as e:                               # noqa: BLE001
+        INSTALL.update(state="error", finished_at=time.time(),
+                       error=f"{type(e).__name__}: {str(e)[:160]}")
+        joblog.log(f"whisper install failed: {e}", "warn", system="audiolang")
 
 
 def _model():
