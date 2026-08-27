@@ -182,8 +182,15 @@ class LibraryConfig:
 @dataclass
 class Settings:
     # --- media tooling -----------------------------------------------------
-    ffmpeg: str = r"C:\Tdarr\Tdarr_Node\assets\app\ffmpeg\win32_x64\ffmpeg.exe"
-    ffprobe: str = r"C:\Tdarr\Tdarr_Node\assets\app\ffmpeg\win32_x64\ffprobe.exe"
+    # Bare names, resolved via PATH - the LAST resort, not the plan. The
+    # working resolution order lives in ffmpeg_update.paths(): the build nuarr
+    # installed to ProgramData\nuarr\ffmpeg\bin wins whenever it exists, so
+    # these only fire on a machine where that folder is missing. They used to
+    # point at the dev box's Tdarr install, which put "C:\Tdarr\...\ffmpeg.exe
+    # (missing)" in every fresh install's error log - a path from a machine
+    # the reader has never seen, presented as if it were their problem.
+    ffmpeg: str = "ffmpeg"
+    ffprobe: str = "ffprobe"
     mkvmerge: str = r"C:\Program Files\MKVToolNix\mkvmerge.exe"
     mkvpropedit: str = r"C:\Program Files\MKVToolNix\mkvpropedit.exe"
     python: str = r"C:\Users\Administrator\AppData\Local\Programs\Python\Python313\python.exe"

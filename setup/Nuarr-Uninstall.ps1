@@ -143,6 +143,25 @@ Try-Step "Removed shortcuts" {
     if (Test-Path $p) { Remove-Item $p -Force }
   }
 }
+Try-Step "Disconnected network shares" {
+  # nuarr connects to shares as ITSELF (`net use` in the service session) and
+  # those sessions outlive the program - the first reinstall found the pool
+  # still connected from the install it had just removed. Read the servers
+  # out of config.yml before the program folder (which holds it) goes.
+  $cfg = Join-Path $Target 'config.yml'
+  if (Test-Path $cfg) {
+    $inNet = $false
+    foreach ($line in Get-Content $cfg) {
+      if ($line -match '^net_shares:') { $inNet = $true; continue }
+      if ($inNet -and $line -match '^\S') { $inNet = $false }
+      if ($inNet -and $line -match 'server:\s*(\S+)') {
+        $srv = $Matches[1].Trim("'`"")
+        $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+        try { & net.exe use "\\$srv" /delete /y 2>&1 | Out-Null } finally { $ErrorActionPreference = $old }
+      }
+    }
+  }
+}
 Try-Step "Removed the Programs and Features entry" {
   Remove-Item 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\nuarr' `
     -Recurse -Force -EA SilentlyContinue

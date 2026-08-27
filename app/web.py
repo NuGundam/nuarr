@@ -11774,6 +11774,20 @@ let _ffChecking=false;
 // A blocked encoder OUTRANKS the version, because "9.0 up to date" beside a
 // GPU that cannot encode is worse than saying nothing - it reads as healthy.
 let _ffPill = null, _ffNvencOk = null, _ffNvencWhy = '', _ffUp = null;
+// Which encoder families actually work, per the test-encode probe. null =
+// not asked yet; only fetched when NVENC is down, because that is the only
+// moment the header needs the distinction between "slower" and "broken".
+let _encUsable = null, _encFetching = false;
+async function loadEncUsable(){
+  if(_encFetching) return;
+  _encFetching = true;
+  try{
+    const d = await (await fetch('/api/encoders')).json();
+    _encUsable = (d.usable||[]).filter(f=>f!=='nvenc');
+  }catch(e){ _encUsable = []; }
+  _encFetching = false;
+  ffPillPaint();          // repaint with the real slower-vs-broken verdict
+}
 function ffPillPaint(){
   const pill=document.getElementById('ffPill');
   if(!pill || !_ffPill) return;
@@ -11797,13 +11811,33 @@ function ffPillPaint(){
   if(running) label = `ffmpeg ${running}`;
 
   if(_ffNvencOk === false){
-    // Worst case: the build in use cannot encode at all. This one DOES belong
-    // on the main bubble, because it is about the running build.
-    cls = 'p-bad';
-    label = running ? `ffmpeg ${running} — GPU blocked` : 'ffmpeg — GPU blocked';
-    title = `${_ffNvencWhy}\nre-encodes will fail; stream copies still work\n${title}`;
-    extra = `<span class="pill p-bad blink" title="${esc(_ffNvencWhy)}"
-               style="cursor:pointer" onclick="wtab('ffmpeg')">no GPU encode</span>`;
+    // NVENC BEING DEAD STOPPED MEANING ENCODES ARE DEAD. This branch predates
+    // the encoder prober: it painted the header red and declared "every
+    // re-encode will fail" on the strength of NVENC alone, which was true
+    // when NVENC was the only encoder and is flatly wrong now that the
+    // planner falls through to QSV, AMF or CPU. On a machine with no GPU at
+    // all - a VM, a NAS, half the machines this will ever run on - that red
+    // was a permanent alarm for a permanent condition with a working
+    // fallback, which teaches people to ignore the header. Red is reserved
+    // for the case where the PROBE says nothing can encode.
+    if(_encUsable === null){
+      // one fetch, cached server-side; re-render lands via loadEncUsable
+      loadEncUsable();
+      cls = 'p-ok';
+      title = `${_ffNvencWhy}\nchecking which encoders work…\n${title}`;
+    } else if(_encUsable.length){
+      cls = 'p-ok';
+      const fam = _encUsable[0];
+      title = `no GPU encode (${_ffNvencWhy})\nencoding falls back to ${fam} — slower, not broken\n${title}`;
+      extra = `<span class="pill" title="No NVENC on this machine - encodes run on ${esc(fam)} instead. Slower, but everything works. Click for details."
+                 style="cursor:pointer;color:var(--dim)" onclick="wtab('ffmpeg')">${esc(fam)} encode</span>`;
+    } else {
+      cls = 'p-bad';
+      label = running ? `ffmpeg ${running} — cannot encode` : 'ffmpeg — cannot encode';
+      title = `${_ffNvencWhy}\nno encoder family works on this machine - re-encodes will fail; stream copies still work\n${title}`;
+      extra = `<span class="pill p-bad blink" title="${esc(_ffNvencWhy)}"
+                 style="cursor:pointer" onclick="wtab('ffmpeg')">no encoder works</span>`;
+    }
   }else if(_ffUp && _ffUp.blocked){
     // A newer build exists and CANNOT be installed on this driver.
     //
