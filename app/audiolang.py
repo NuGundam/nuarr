@@ -90,6 +90,7 @@ def _add_cuda_dirs() -> list[str]:
 _MODEL = None
 _MODEL_LOCK = threading.Lock()
 _MODEL_ERR = ""
+_MODEL_DEV = ""
 
 MODEL_SIZE = "small"
 
@@ -207,14 +208,20 @@ def paths() -> list[dict]:
     for sp in _s.getsitepackages():
         dll_dirs += glob.glob(os.path.join(sp, "nvidia", "*", "bin"))
     ff, fp = _ff()
+    # A RED CROSS MEANS BROKEN, and "the model has not been fetched yet" is
+    # not broken - it is the documented state of a fresh install, fetched on
+    # first use. Rows like that carry pending=True and draw amber, so the
+    # column stops crying wolf and a real missing piece stays visible.
     rows = [
         {"what": "Model", "path": mc["path"] or str(MODEL_DIR),
-         "ok": bool(mc["path"]),
+         "ok": bool(mc["path"]), "pending": not mc["path"],
          "note": ("in nuarr's folder" if mc.get("managed")
                   else "still in the old user cache - moves on next load"
-                  if mc["path"] else "not downloaded yet")},
+                  if mc["path"] else "downloads on first use (~464 MB) - not an error")},
         {"what": "Model folder nuarr uses", "path": str(MODEL_DIR),
-         "ok": MODEL_DIR.exists(), "note": "download_root passed to Whisper"},
+         "ok": MODEL_DIR.exists(), "pending": not MODEL_DIR.exists(),
+         "note": ("download_root passed to Whisper" if MODEL_DIR.exists()
+                  else "created automatically with the first download")},
         {"what": "faster-whisper", "path": spec("faster_whisper"),
          "ok": bool(spec("faster_whisper")), "note": "the language identifier"},
         {"what": "CTranslate2", "path": spec("ctranslate2"),
@@ -225,8 +232,19 @@ def paths() -> list[dict]:
         rows.append({"what": f"CUDA runtime · {name}", "path": d, "ok": True,
                      "note": "added to PATH before CTranslate2 is imported"})
     if not dll_dirs:
-        rows.append({"what": "CUDA runtime", "path": "(none found)", "ok": False,
-                     "note": "pip install nvidia-cublas-cu12 nvidia-cudnn-cu12"})
+        # On a machine with no NVIDIA card, missing CUDA wheels are CORRECT,
+        # not a fault - a deliberate CPU install must not spend forever with a
+        # red cross telling its owner to install a runtime it cannot use.
+        if _nvidia_present():
+            rows.append({"what": "CUDA runtime", "path": "(none found)",
+                         "ok": False,
+                         "note": "an NVIDIA GPU is present - install GPU "
+                                 "support above to use it"})
+        else:
+            rows.append({"what": "CUDA runtime", "path": "(not needed)",
+                         "ok": True,
+                         "note": "no NVIDIA GPU - running on the CPU is the "
+                                 "correct configuration here"})
     rows += [
         {"what": "ffmpeg", "path": ff, "ok": os.path.exists(ff),
          "note": "decodes the sample windows"},
@@ -413,6 +431,13 @@ def _install_worker(mode: str) -> None:
             # A loaded model keeps the OLD code alive; drop it so the next
             # pass runs on what was just installed.
             unload()
+        # The folder the model will land in, made now rather than at first
+        # load - so the "Where everything is" table goes green on install
+        # instead of showing a cross for a directory nothing has needed yet.
+        try:
+            MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
         INSTALL.update(state="done", finished_at=time.time())
         joblog.log(f"faster-whisper installed from the Whisper page "
                    f"({mode}) - detection now listens instead of inferring",
@@ -452,6 +477,8 @@ def _model():
                 _MODEL = WhisperModel(MODEL_SIZE, device=dev, compute_type=ct,
                                       download_root=str(MODEL_DIR))
                 _MODEL_ERR = ""
+                global _MODEL_DEV
+                _MODEL_DEV = dev
                 joblog.log(f"audio language ID ready: {MODEL_SIZE} on {dev}", "info", system="audiolang")
                 return _MODEL
             except Exception as e:                      # noqa: BLE001
@@ -703,6 +730,80 @@ def detect(path: str, track: int = 0, fracs=(0.30, 0.50, 0.70),
     out["ok"] = True
     out["why"] += f"{len(strong)} window(s) agreed on {code2} at {conf:.2f}"
     return out
+
+
+# ---------------------------------------------------------------- self-test
+
+def self_test() -> dict:
+    """Prove the whole pipeline on one real file - the codec page's
+    test-encode, for ears.
+
+    GRADED, NOT JUST EXERCISED. A test that only proves "it returned
+    something" cannot tell a working detector from a confidently wrong one,
+    so the file is chosen from tracks that already STATE a language: the
+    detector listens blind, and its answer is marked against the tag. Nothing
+    is written anywhere - this is a read, a listen, and a report.
+    """
+    t0 = time.time()
+
+    def _done(d: dict) -> dict:
+        d["elapsed"] = round(time.time() - t0, 1)
+        return d
+
+    if not available():
+        return _done({"ok": False, "ran": False,
+                      "why": "the language identifier is not installed - "
+                             "install it above, or from Settings → Whisper"})
+    had_model = bool(model_cache().get("path"))
+    try:
+        ensure_table()
+        with cursor() as cur:
+            rows = cur.execute(
+                "SELECT id, path, title, audio_langs FROM files "
+                " WHERE state != 'deleted' AND audio_langs IS NOT NULL "
+                "   AND audio_langs != '' ORDER BY RANDOM() LIMIT 300"
+            ).fetchall()
+    except Exception as e:                               # noqa: BLE001
+        return _done({"ok": False, "ran": False,
+                      "why": f"could not read the library: {str(e)[:120]}"})
+    pick = graded = fallback = None
+    for r in rows:
+        if not os.path.exists(r["path"]):
+            continue
+        if fallback is None:
+            fallback = (r, 0)      # ungraded, but still a real run
+        for ai, tg in enumerate((r["audio_langs"] or "").split(",")):
+            tg = (tg or "").strip().lower()
+            if tg and tg not in ("-", "und", "zxx"):
+                pick, graded = (r, ai), tg
+                break
+        if pick:
+            break
+    if pick is None:
+        pick = fallback
+    if not pick:
+        return _done({"ok": False, "ran": False,
+                      "why": "no reachable media file to test with - "
+                             "scan a library first"})
+    r, track = pick
+    res = detect(r["path"], track)
+    heard = res.get("code") or ""
+    return _done({
+        "ok": bool(res.get("ok")), "ran": True,
+        "title": r["title"] or os.path.basename(r["path"]),
+        "path": r["path"], "track": track,
+        "stated": graded or "", "heard": heard,
+        "heard2": res.get("code2", ""),
+        "confidence": res.get("confidence", 0.0),
+        "windows": res.get("windows", 0),
+        "votes": res.get("votes", []),
+        "why": res.get("why", ""),
+        # None = the file carried no tag to grade against; True/False = the
+        # detector's blind answer against what the track says it is.
+        "match": (heard == graded) if (graded and heard) else None,
+        "device": _MODEL_DEV or ("cuda" if info().get("cuda_devices") else "cpu"),
+        "downloaded_model": not had_model and bool(model_cache().get("path")),
+    })
 
 
 # ---------------------------------------------------------------- the cache

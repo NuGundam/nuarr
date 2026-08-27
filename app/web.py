@@ -111,8 +111,24 @@ async def _boot_nvenc() -> None:
     except Exception:
         pass
     n = ffmpeg_update.NVENC
-    _boot("nvenc", "ok" if n.get("ok") else "warn",
-          "" if n.get("ok") else (n.get("cause") or {}).get("reason", "unavailable"))
+    if n.get("ok"):
+        _boot("nvenc", "ok")
+        return
+    # NO GPU IS NOT A WARNING. This step exists to catch a card that SHOULD
+    # encode and cannot - a stale driver, a session limit, a SYSTEM session
+    # that cannot see the device. A machine that simply has no NVIDIA card is
+    # in its correct, permanent state, and painting that amber on every boot
+    # teaches the eye that amber means nothing.
+    try:
+        from . import audiolang as _al
+        has_nv = await asyncio.to_thread(_al._nvidia_present)
+    except Exception:                                        # noqa: BLE001
+        has_nv = False
+    if has_nv:
+        _boot("nvenc", "warn",
+              (n.get("cause") or {}).get("reason", "unavailable"))
+    else:
+        _boot("nvenc", "ok", "no NVIDIA GPU — encoding on CPU")
 
 
 # How many threads sync endpoints may occupy.
@@ -3416,6 +3432,14 @@ def api_audiolang_progress():
     """Just the live counters - cheap enough to poll while a pass runs."""
     from . import audiolang as _al
     return _al.progress()
+
+
+@app.post("/api/audiolang/test")
+async def api_audiolang_test():
+    """One graded detection on a random already-tagged file - the codec
+    page's test-encode, for ears. Reads and listens only; writes nothing."""
+    from . import audiolang as _al
+    return await asyncio.to_thread(_al.self_test)
 
 
 @app.post("/api/audiolang/run")
@@ -16998,7 +17022,8 @@ async function loadWhisper(){
       <table style="width:100%;font-size:12px;border-collapse:collapse">
         ${(w.paths||[]).map(p=>`<tr style="border-top:1px solid var(--line)">
           <td style="padding:5px 12px;white-space:nowrap">
-            <span style="color:${p.ok?'#7fd4a3':'#e0575b'}">${p.ok?'✓':'✗'}</span>
+            <span style="color:${p.ok?'#7fd4a3':p.pending?'#e2b341':'#e0575b'}"
+              >${p.ok?'✓':p.pending?'…':'✗'}</span>
             ${esc(p.what)}</td>
           <td class="mono" style="font-size:11px;word-break:break-all">${esc(p.path)}</td>
           <td class="dim" style="font-size:11px;padding-right:12px;white-space:nowrap"
@@ -17399,8 +17424,12 @@ function renderAlang(){
       <div style="display:flex;justify-content:space-between;align-items:center;
                   gap:12px;flex-wrap:wrap">
         <b style="color:#6fb0ff">When this runs</b>
-        <button id="alRunBtn" onclick="alRun(this)">Listen to anything outstanding</button>
+        <span style="display:flex;gap:8px;flex-wrap:wrap">
+          ${_al.available?`<button onclick="alTest(this)">Test detection now</button>`:''}
+          <button id="alRunBtn" onclick="alRun(this)">Listen to anything outstanding</button>
+        </span>
       </div>
+      <div id="alTestOut" style="font-size:12px"></div>
       <div class="dim" style="font-size:11px;margin-top:5px">
         Automatically, every 30 minutes, on anything that has arrived with a
         blank audio tag &mdash; and only on those, because re-listening to a
@@ -17873,6 +17902,40 @@ function alProgressHtml(p){
          background:#2f6f4f"></i></div>
     <div class="mono dim" style="font-size:10px;margin-top:3px">${esc(p.current||'')}</div>`;
 }
+async function alTest(btn){
+  // LIKE THE CODEC TEST-ENCODE: pick a file whose track already states a
+  // language, listen blind, grade the answer. Writes nothing anywhere.
+  const out=document.getElementById('alTestOut');
+  btn.disabled=true; const old=btn.textContent; btn.textContent='listening…';
+  if(out) out.innerHTML=`<div class="dim" style="margin-top:8px">picking a random
+    tagged file and listening to three 30-second windows — a few seconds on GPU,
+    up to a minute or two on CPU; the first ever run also downloads the model (~464 MB)</div>`;
+  let r=null;
+  try{ r=await (await fetch('/api/audiolang/test',{method:'POST'})).json(); }
+  catch(e){ if(out) out.innerHTML=`<div style="color:#e0575b;margin-top:8px">test failed: ${esc(String(e))}</div>`; }
+  btn.disabled=false; btn.textContent=old;
+  if(!r||!out) return;
+  if(!r.ran){
+    out.innerHTML=`<div style="color:#e2b341;margin-top:8px">${esc(r.why||'could not run')}</div>`;
+    return;
+  }
+  const verdict = r.match===true
+      ? `<b style="color:#7fd4a3">✓ correct</b> — it heard <b>${esc(r.heard)}</b>, and the track is tagged <b>${esc(r.stated)}</b>`
+    : r.match===false
+      ? `<b style="color:#e2b341">✗ mismatch</b> — it heard <b>${esc(r.heard||r.heard2||'nothing')}</b>, but the track is tagged <b>${esc(r.stated)}</b> — worth a listen yourself; tags are sometimes the thing that is wrong`
+    : r.ok
+      ? `heard <b style="color:#7fd4a3">${esc(r.heard)}</b> — the file carried no tag to grade against, so this proves the pipeline rather than the answer`
+      : `<b style="color:#e2b341">no confident answer</b> — ${esc(r.why||'')}`;
+  out.innerHTML=`<div class="lkind" style="margin-top:8px;padding:9px 11px">
+    <div>${verdict}</div>
+    <div class="dim" style="font-size:11px;margin-top:5px">
+      ${esc(r.title||'')} · track ${r.track} ·
+      ${r.windows} window(s) · confidence ${(r.confidence*100).toFixed(0)}% ·
+      ran on ${esc(r.device||'?')} in ${r.elapsed}s${r.downloaded_model?' (including the first-time model download)':''}
+      ${(r.votes&&r.votes.length)?`<br>windows: ${r.votes.map(v=>esc(v[0])+' '+(v[1]*100).toFixed(0)+'%').join(' · ')}`:''}
+    </div></div>`;
+}
+
 async function alRun(btn){
   if(btn){ btn.disabled=true; btn.textContent='listening…'; }
   try{ await fetch('/api/audiolang/run',{method:'POST'}); }catch(e){}
