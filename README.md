@@ -100,6 +100,8 @@ check self-heals: a finding is queued, fixed, and re-verified.
 - Windows 10 / 11 / Server 2019+
 - Python 3.13 — the installer bundles it if missing
 - ffmpeg — bundled
+- MKVToolNix command-line tools (`mkvmerge`, `mkvpropedit`, `mkvextract`) —
+  bundled; an existing MKVToolNix install is used instead if present
 - Plex, and Sonarr / Radarr if you want nuarr to keep names in step with them
 - A scratch directory on fast local storage, off the pool
 
