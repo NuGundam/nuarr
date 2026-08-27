@@ -1,0 +1,1242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nuarr — the library that fixes itself</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --line:#30363d; --fg:#c9d1d9; --dim:#8b949e;
+    --ok:#3fb950; --warn:#d29922; --bad:#f85149; --acc:#58a6ff;
+    --purple:#b48bf2; --lilac:#d2a8ff; --cyan:#58c8d8; --gold:#e3b341;
+  }
+  *{box-sizing:border-box; margin:0; padding:0}
+  html{scroll-behavior:smooth}
+  body{background:var(--bg); color:var(--fg);
+       font:14px/1.55 "Segoe UI",system-ui,sans-serif; overflow-x:hidden}
+  .mono{font-family:Consolas,"Cascadia Mono",monospace}
+
+  /* ---------- top bar, mimicking the real dashboard ---------- */
+  .topbar{position:sticky; top:0; z-index:50; display:flex; align-items:center;
+          gap:12px; padding:10px 22px; background:rgba(13,17,23,.92);
+          backdrop-filter:blur(6px); border-bottom:1px solid var(--line)}
+  .logo{width:26px;height:26px;border-radius:6px;background:linear-gradient(135deg,var(--acc),var(--purple));
+        display:grid;place-items:center;font-weight:800;color:#fff;font-size:15px}
+  .topbar b{font-size:16px}
+  .topbar .dim{color:var(--dim);font-size:12px}
+  .pillrow{margin-left:auto;display:flex;gap:6px;flex-wrap:wrap}
+  .pill{border:1px solid var(--line);border-radius:999px;padding:1px 10px;
+        font-size:11px;color:var(--dim);white-space:nowrap}
+  .pill.ok{color:var(--ok);border-color:#1f4429}
+  .pill.acc{color:var(--acc);border-color:#1c3a5e}
+  .pill.purple{color:var(--purple);border-color:#3d2e5e}
+  .pill.gold{color:var(--gold);border-color:#4d3d1a}
+
+  /* ---------- sections / slides ---------- */
+  section{min-height:92vh; padding:64px 8vw; display:flex; flex-direction:column;
+          justify-content:center; border-bottom:1px solid #11151b; position:relative}
+  h1{font-size:clamp(30px,5vw,54px); line-height:1.12; font-weight:800}
+  h2{font-size:clamp(22px,3vw,32px); margin-bottom:10px}
+  h2 .tag{display:inline-block;font-size:11px;font-weight:600;vertical-align:middle;
+          margin-left:10px;padding:2px 10px;border-radius:999px;border:1px solid var(--line);color:var(--dim)}
+  .lede{color:var(--dim); font-size:clamp(15px,1.6vw,19px); max-width:760px; margin-top:14px}
+  .kicker{color:var(--acc); font-weight:700; letter-spacing:.14em; font-size:12px;
+          text-transform:uppercase; margin-bottom:14px}
+  .rev{opacity:0; transform:translateY(26px); transition:opacity .7s ease, transform .7s ease}
+  .rev.in{opacity:1; transform:none}
+  .cols{display:grid; grid-template-columns:1fr 1fr; gap:44px; align-items:center}
+  @media(max-width:900px){.cols{grid-template-columns:1fr}}
+
+  /* ---------- hero ---------- */
+  #hero{align-items:flex-start}
+  #hero h1 span{background:linear-gradient(90deg,var(--acc),var(--purple));
+                -webkit-background-clip:text; background-clip:text; color:transparent}
+  .statrow{display:flex; gap:34px; margin-top:38px; flex-wrap:wrap}
+  .stat b{display:block; font-size:clamp(22px,3vw,34px); font-variant-numeric:tabular-nums}
+  .stat span{color:var(--dim); font-size:12px}
+  .scrollhint{position:absolute; bottom:26px; left:50%; transform:translateX(-50%);
+              color:var(--dim); font-size:12px; animation:bob 2.2s ease-in-out infinite}
+  @keyframes bob{0%,100%{transform:translate(-50%,0)}50%{transform:translate(-50%,8px)}}
+
+  /* ---------- fake dashboard panel ---------- */
+  .panel{background:var(--panel); border:1px solid var(--line); border-radius:10px;
+         overflow:hidden; box-shadow:0 18px 50px rgba(0,0,0,.45)}
+  .panel h3{padding:11px 16px; border-bottom:1px solid var(--line); font-size:12px;
+            letter-spacing:.1em; color:var(--dim); display:flex; align-items:center; gap:8px}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--ok);animation:blink 1.6s infinite}
+  @keyframes blink{50%{opacity:.25}}
+  .caps{display:flex;gap:16px;padding:9px 16px;border-bottom:1px solid var(--line);
+        font-size:12px;color:var(--dim);flex-wrap:wrap}
+  .caps b{color:var(--fg);font-variant-numeric:tabular-nums}
+
+  .wk{padding:12px 16px; border-bottom:1px solid #1c222b}
+  .wk:last-child{border-bottom:none}
+  .wkhead{display:flex; align-items:center; gap:9px; margin-bottom:4px}
+  .wkhead .title{font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+  .spin{display:inline-flex; gap:2px}
+  .spin i{width:3px;height:11px;background:var(--acc);border-radius:2px;animation:eq 1s ease-in-out infinite}
+  .spin i:nth-child(2){animation-delay:.18s}.spin i:nth-child(3){animation-delay:.36s}
+  @keyframes eq{0%,100%{transform:scaleY(.35)}50%{transform:scaleY(1)}}
+  .wkplan{color:var(--dim);font-size:11px;margin-bottom:7px;overflow:hidden;
+          text-overflow:ellipsis;white-space:nowrap}
+  .bar{height:8px;background:#0b0e12;border-radius:4px;overflow:hidden}
+  .bar i{display:block;height:100%;background:var(--acc);border-radius:4px;
+         transition:width .25s linear, background-color .4s ease}
+  .bar i.indet{width:100% !important;background:repeating-linear-gradient(45deg,
+        #26436b 0 10px, #17273f 10px 20px);animation:slide 1s linear infinite}
+  @keyframes slide{to{background-position:28px 0}}
+  .wkstats{display:flex;gap:18px;font-size:11px;color:var(--dim);margin-top:6px;
+           font-variant-numeric:tabular-nums;flex-wrap:wrap}
+  .wkstats b{color:var(--fg)}
+  .socr{display:flex;align-items:center;gap:8px;font-size:11px;margin-top:7px;color:var(--dim)}
+  .socrbar{flex:0 0 130px;height:4px;background:#20262e;border-radius:2px;overflow:hidden}
+  .socrbar i{display:block;height:100%;background:var(--purple);transition:width .3s linear}
+  .stamp{margin-left:auto;font-size:10px;font-weight:700;padding:2px 9px;border-radius:4px;
+         color:#0d1117;animation:pop .3s ease}
+  @keyframes pop{from{transform:scale(.6);opacity:0}}
+  .wk.ghost{opacity:.45; transition:opacity 1.6s ease}
+
+  /* ---------- gate demo ---------- */
+  .gatecard{display:flex;flex-direction:column;gap:0}
+  .gaterow{display:flex;align-items:center;gap:12px;padding:11px 16px;border-bottom:1px solid #1c222b;font-size:13px}
+  .gaterow:last-child{border-bottom:none}
+  .lamp{width:9px;height:9px;border-radius:50%;background:var(--ok);flex:0 0 auto;transition:background .4s}
+  .lamp.hold{background:var(--warn);box-shadow:0 0 10px rgba(210,153,34,.6)}
+  .gaterow .why{color:var(--dim);font-size:11px;margin-left:auto;text-align:right}
+  .tv{border:2px solid var(--line);border-radius:8px;padding:10px 14px;display:inline-flex;
+      align-items:center;gap:10px;background:#0b0e12;transition:border-color .4s}
+  .tv.on{border-color:var(--warn)}
+  .tv .play{width:0;height:0;border-left:12px solid var(--dim);border-top:8px solid transparent;
+            border-bottom:8px solid transparent;transition:border-left-color .4s}
+  .tv.on .play{border-left-color:var(--warn)}
+
+  /* ---------- viewer buffer / runway demo ---------- */
+  .rwwrap{background:#0b0e12;border:1px solid var(--line);border-radius:10px;padding:22px}
+  .rwlbl{font-size:13px;font-weight:600;margin-bottom:8px;font-variant-numeric:tabular-nums;
+         display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .rwstate{font-size:10px;font-weight:700;padding:2px 10px;border-radius:999px;
+           border:1px solid var(--line);transition:all .3s}
+  .rwstate.full{color:var(--acc);border-color:#1c3a5e}
+  .rwstate.thr{color:var(--gold);border-color:#4d3d1a}
+  .rwstate.stop{color:var(--bad);border-color:#5c2230}
+  .rwbar{position:relative;height:24px;background:#161a20;border:1px solid #3a4150;
+         border-radius:5px;overflow:hidden;box-shadow:inset 0 1px 2px rgba(0,0,0,.5)}
+  .rwbar i{position:absolute;left:0;top:0;height:100%;background:var(--ok);
+           opacity:.6;transition:width .25s linear, background .3s}
+  .rwbar.stop i{background:var(--gold)}
+  .rwbar u,.rwbar o,.rwbar s{position:absolute;top:0;height:100%;z-index:2;pointer-events:none;
+    filter:drop-shadow(0 0 2px rgba(0,0,0,.95))}
+  .rwbar u{left:27.778%;border-left:3px dashed #f0c14b}
+  .rwbar o{left:41.667%;border-left:3px dashed #4ad463;opacity:.9}
+  .rwbar s{left:83.333%;border-left:3px dashed #58a6ff;text-decoration:none}
+  .rwbar::after{content:'';position:absolute;left:27.778%;width:55.555%;top:0;height:100%;
+    background:repeating-linear-gradient(-45deg,rgba(226,179,65,.1) 0 4px,transparent 4px 8px);
+    z-index:1;pointer-events:none}
+  .rwax{position:relative;height:15px;font-size:10.5px;color:var(--dim);margin-top:4px;
+        font-variant-numeric:tabular-nums}
+  .rwax span{position:absolute;top:0}
+  .rwax .z{left:0}.rwax .f{left:27.778%;transform:translateX(-50%);color:#f0c14b;font-weight:600}
+  .rwax .r{left:41.667%;transform:translateX(-50%);color:#4ad463;font-weight:600}
+  .rwax .fs{left:83.333%;transform:translateX(-50%);color:#58a6ff;font-weight:600}
+  .rwax .m{right:0}
+  .rwleg{display:flex;gap:14px;flex-wrap:wrap;font-size:10.5px;color:var(--dim);margin-top:12px}
+  .rwleg s{text-decoration:none;display:inline-flex;align-items:center;gap:5px}
+  .rwleg s::before{content:'';width:0;height:11px;border-left:2px dashed}
+  .rwleg s.a::before{border-color:#f0c14b}.rwleg s.b::before{border-color:#4ad463}
+  .rwleg s.c::before{border-color:#58a6ff}
+  .fltbl{width:100%;border-collapse:collapse;font-size:12px;margin-top:8px}
+  .fltbl td,.fltbl th{padding:7px 10px;border-bottom:1px solid #1c222b;text-align:left;
+        font-variant-numeric:tabular-nums}
+  .fltbl th{color:var(--dim);font-size:10.5px;letter-spacing:.08em;font-weight:600}
+  .fltbl .why{color:var(--dim);font-size:11px}
+  .fltbl b{color:var(--fg)}
+
+  /* ---------- feature grid ---------- */
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:18px;margin-top:34px}
+  .feat{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:20px;
+        transition:transform .25s ease, border-color .25s ease}
+  .feat:hover{transform:translateY(-4px);border-color:var(--acc)}
+  .feat .ico{font-size:22px;margin-bottom:10px}
+  .feat b{display:block;margin-bottom:6px;font-size:15px}
+  .feat p{color:var(--dim);font-size:12.5px}
+  .feat .accent{height:3px;border-radius:2px;margin:-20px -20px 16px;opacity:.85}
+
+  /* ---------- audio fix animation ---------- */
+  .wave{display:flex;align-items:flex-end;gap:3px;height:64px}
+  .wave i{width:6px;border-radius:2px;background:var(--bad);animation:wob 1.1s ease-in-out infinite}
+  .wave.fixed i{background:var(--ok)}
+  .wave.listen i{background:var(--purple)}
+  @keyframes wob{0%,100%{transform:scaleY(.5)}50%{transform:scaleY(1)}}
+  .bufferring{display:inline-block;width:15px;height:15px;border-radius:50%;
+      border:2px solid var(--bad);border-top-color:transparent;animation:rot 1s linear infinite;vertical-align:-3px}
+  @keyframes rot{to{transform:rotate(360deg)}}
+  .beforeafter{display:grid;grid-template-columns:1fr auto 1fr;gap:18px;align-items:center;
+               background:#0b0e12;border:1px solid var(--line);border-radius:10px;padding:22px}
+  .beforeafter .arrow{font-size:26px;color:var(--acc);animation:nudge 1.6s ease-in-out infinite}
+  @keyframes nudge{50%{transform:translateX(6px)}}
+  .beforeafter .lbl{font-size:11px;color:var(--dim);margin-bottom:8px}
+  .beforeafter .big{font-size:18px;font-weight:700;font-variant-numeric:tabular-nums}
+
+  /* ---------- listen demo ---------- */
+  .votes{display:flex;gap:10px;margin-top:16px;flex-wrap:wrap}
+  .vote{border:1px solid var(--line);border-radius:8px;padding:9px 13px;font-size:12px;
+        background:#0b0e12;opacity:0;transform:translateY(10px);
+        transition:opacity .5s, transform .5s, border-color .4s}
+  .vote.in{opacity:1;transform:none}
+  .vote b{display:block;font-size:15px;font-variant-numeric:tabular-nums}
+  .vote span{color:var(--dim);font-size:10.5px}
+  .vote.good{border-color:#1f4429}.vote.good b{color:var(--ok)}
+  .vote.junk{border-color:#5c2230;opacity:.55}.vote.junk b{color:var(--bad);text-decoration:line-through}
+  .verdict{margin-top:14px;font-size:13px;opacity:0;transition:opacity .5s}
+  .verdict.in{opacity:1}
+  .verdict .flag{font-size:11px;font-weight:700;padding:2px 10px;border-radius:999px;
+     color:#0d1117;background:var(--ok);margin-right:8px}
+
+  /* ---------- subtitle morph ---------- */
+  .screen{background:linear-gradient(160deg,#1a2438,#0e1524);border:1px solid var(--line);
+          border-radius:10px;aspect-ratio:16/7;position:relative;overflow:hidden}
+  .screen .sub{position:absolute;left:50%;bottom:12%;transform:translateX(-50%);
+               font-size:clamp(13px,1.6vw,18px);font-weight:600;white-space:nowrap}
+  .sub.pgs{color:#fff;text-shadow:0 0 4px #000;filter:blur(.4px);
+           image-rendering:pixelated;letter-spacing:.5px;
+           background:repeating-linear-gradient(0deg,#fff 0 2px,#dcdcdc 2px 4px);
+           -webkit-background-clip:text;background-clip:text;color:transparent}
+  .sub.srt{color:#fff;text-shadow:0 1px 3px #000}
+  .ocrline{position:absolute;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,var(--purple),transparent);
+           animation:scan 2.6s ease-in-out infinite;opacity:.9}
+  @keyframes scan{0%{top:8%}50%{top:88%}100%{top:8%}}
+  .tracktbl{width:100%;border-collapse:collapse;font-size:12px;margin-top:12px}
+  .tracktbl td{padding:6px 10px;border-bottom:1px solid #1c222b}
+  .tracktbl .flag{font-size:10px;padding:1px 8px;border-radius:999px;border:1px solid var(--line);color:var(--dim)}
+  .tracktbl .first{color:var(--ok);border-color:#1f4429}
+  .strike{color:var(--dim);text-decoration:line-through;text-decoration-color:var(--bad)}
+
+  /* ---------- safety timeline ---------- */
+  .steps{display:flex;flex-direction:column;gap:0;margin-top:8px}
+  .step{display:flex;gap:14px;padding:10px 0;align-items:flex-start}
+  .step .n{width:26px;height:26px;border-radius:50%;border:2px solid var(--line);flex:0 0 auto;
+           display:grid;place-items:center;font-size:12px;color:var(--dim);transition:all .4s}
+  .step.done .n{border-color:var(--ok);color:var(--ok)}
+  .step.active .n{border-color:var(--acc);color:var(--acc);box-shadow:0 0 12px rgba(88,166,255,.5)}
+  .step p{font-size:13px}.step span{color:var(--dim);font-size:11.5px;display:block}
+
+  /* ---------- disks ---------- */
+  .diskrow{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px}
+  .disk{flex:1 1 60px;min-width:60px;background:#0b0e12;border:1px solid var(--line);
+        border-radius:8px;padding:8px 6px;text-align:center;font-size:10px;
+        transition:border-color .3s}
+  .disk .nm{font-weight:700;font-size:9.5px;letter-spacing:.02em}
+  .disk .fill{height:34px;border-radius:4px;background:#161d27;position:relative;overflow:hidden;margin-bottom:5px}
+  .disk .fill i{position:absolute;bottom:0;left:0;right:0;background:var(--acc);opacity:.55;transition:height 1s ease}
+  .disk.hot{border-color:var(--warn)}
+  .disk.hot .fill i{background:var(--warn)}
+  .disk .io{font-variant-numeric:tabular-nums;color:var(--dim)}
+
+  /* ---------- big number strip ---------- */
+  .numstrip{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:16px;margin-top:30px}
+  .num{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:22px;text-align:center}
+  .num b{display:block;font-size:clamp(24px,3vw,38px);font-variant-numeric:tabular-nums}
+  .num span{color:var(--dim);font-size:12px}
+  .num b em{font-style:normal;color:var(--acc)}
+
+  /* ---------- session cards demo ---------- */
+  .pxwrap{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:18px;
+          margin-top:26px;max-width:840px}
+  .pxcard{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+          padding:16px;font-size:12px}
+  .pxtitle{font-weight:700;font-size:14px}
+  .pxsub{color:var(--dim);font-size:11px;margin:2px 0 7px}
+  .pxpills{display:flex;gap:6px;align-items:center;margin-bottom:7px;flex-wrap:wrap}
+  .pxuser{font-weight:700}
+  .pxmore{background:rgba(255,255,255,.025);border:1px solid var(--line);border-radius:6px;
+          padding:9px 10px;margin-top:9px}
+  .kv{display:flex;gap:9px;padding:2.5px 0}
+  .kv .k{flex:0 0 52px;color:var(--dim);text-align:right;font-size:11px}
+  .kv span{flex:1;font-size:11.5px}
+  .rwsm .rwbar{height:16px}
+  .rwsm .rwax{font-size:9.5px;height:13px}
+  .rwlbl2{font-size:11px;font-weight:600;margin:9px 0 3px;font-variant-numeric:tabular-nums}
+  .tl{position:relative;height:16px;background:#161a20;border:1px solid #3a4150;
+      border-radius:5px;overflow:hidden;margin-top:5px}
+  .tl b{position:absolute;left:0;top:0;height:100%;background:var(--acc);opacity:.32;
+        border-right:3px solid #4ad463;box-sizing:border-box;
+        filter:brightness(1.3) drop-shadow(0 0 2px rgba(0,0,0,.95))}
+  .tl i{position:absolute;left:0;top:0;height:100%;background:var(--acc)}
+  .pxclock{display:flex;justify-content:space-between;font-size:11.5px;margin-top:12px;
+           font-variant-numeric:tabular-nums;font-weight:600}
+  .tllbl{font-size:10.5px;font-weight:600;margin-top:9px;font-variant-numeric:tabular-nums}
+
+  /* ---------- settings demo ---------- */
+  .stattiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-top:26px}
+  .stt{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:13px 16px}
+  .stt .h{font-size:9.5px;letter-spacing:.1em;color:var(--dim)}
+  .stt b{font-size:21px;font-variant-numeric:tabular-nums;display:block;margin:2px 0}
+  .stt span{font-size:10.5px;color:var(--dim)}
+  .setwrap{display:grid;grid-template-columns:185px 1fr;margin-top:18px}
+  @media(max-width:800px){.setwrap{grid-template-columns:1fr}.setnav{display:none}}
+  .setnav{border-right:1px solid var(--line);padding:12px 0;font-size:12.5px}
+  .setnav .gh{font-size:9.5px;letter-spacing:.12em;color:#5a6470;padding:11px 16px 4px}
+  .setnav a{display:block;padding:4.5px 16px;color:var(--fg);border-left:2px solid transparent;
+            cursor:default}
+  .setnav a.on{background:rgba(88,166,255,.08);border-left-color:var(--acc);color:var(--acc)}
+  .setpane{padding:16px 22px}
+  .setpane .hint{color:var(--dim);font-size:11.5px;margin-bottom:6px}
+  .srow{display:flex;align-items:center;gap:14px;padding:12px 0;border-bottom:1px solid #1c222b}
+  .srow:last-of-type{border:none}
+  .srow .t b{display:block;font-size:13px}
+  .srow .t span{color:var(--dim);font-size:11px}
+  .stepper{margin-left:auto;display:flex;align-items:center;gap:6px;flex:0 0 auto}
+  .stepper button{width:26px;height:24px;background:#21262d;border:1px solid var(--line);
+     color:var(--fg);border-radius:5px;cursor:pointer;font-size:14px;line-height:1}
+  .stepper button:hover{border-color:var(--acc)}
+  .stepper output{width:52px;height:24px;background:#0b0e12;border:1px solid var(--line);
+     color:var(--fg);border-radius:5px;text-align:right;padding:2px 8px;
+     font-variant-numeric:tabular-nums;font-size:12px}
+  .stepper .rng{font-size:10px;color:var(--dim);margin-left:6px;white-space:nowrap}
+  .setpane{transition:opacity .3s ease}
+  .setpane.swap{opacity:0}
+  .tog{width:34px;height:18px;border-radius:999px;background:#21262d;border:1px solid var(--line);
+       position:relative;flex:0 0 auto;margin-left:auto;cursor:pointer;transition:all .3s}
+  .tog i{position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:50%;
+         background:var(--dim);transition:all .3s}
+  .tog.on{background:#12261a;border-color:#1f4429}
+  .tog.on i{left:18px;background:var(--ok)}
+  .val{margin-left:auto;font-size:11px;border:1px solid var(--line);border-radius:6px;
+       padding:3px 10px;color:var(--fg);background:#0b0e12;font-variant-numeric:tabular-nums;
+       white-space:nowrap;flex:0 0 auto}
+  .pxcard{transition:opacity .6s ease}
+  .rwbar.hold i{background:var(--gold) !important}
+
+  /* ---------- footer / controls ---------- */
+  .navdots{position:fixed;right:16px;top:50%;transform:translateY(-50%);display:flex;
+           flex-direction:column;gap:9px;z-index:60}
+  .navdots a{width:9px;height:9px;border-radius:50%;background:var(--line);transition:all .25s}
+  .navdots a.on{background:var(--acc);transform:scale(1.35)}
+  .keyhint{position:fixed;left:16px;bottom:14px;color:#3a424d;font-size:11px;z-index:60}
+  footer{padding:40px 8vw;color:var(--dim);font-size:12px;text-align:center}
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="logo">N</div><b>Nuarr</b>
+  <span class="dim" id="hdrcount">39,729 files · 59.8 TB · 12 pool disks · 2.30 TB saved</span>
+  <div class="pillrow">
+    <span class="pill ok">Sonarr ok</span><span class="pill ok">Radarr ok</span>
+    <span class="pill acc">encode 4/4</span><span class="pill ok">passthrough 6/6</span>
+    <span class="pill purple">subocr 2/10</span><span class="pill gold">whisper small</span>
+    <span class="pill">ffmpeg 7.1.4</span>
+  </div>
+</div>
+
+<!-- ======================= HERO ======================= -->
+<section id="hero">
+  <div class="kicker rev">NUARR · A MEDIA LIBRARY THAT MAINTAINS ITSELF</div>
+  <h1 class="rev">Every file in the library,<br>ready to <span>press play.</span></h1>
+  <p class="lede rev">One engine with one job: standardise a 60&nbsp;TB library so Plex
+     direct-plays everything — no buffering, no transcoding on the fly, no
+     subtitles that force the CPU to paint pictures. It probes, plans, fixes,
+     verifies — and when metadata can't be trusted, it <i>listens to the audio</i>
+     to find out what language it really is. It never touches a file it can't put back.</p>
+  <div class="statrow rev">
+    <div class="stat"><b data-count="39729">0</b><span>files under management</span></div>
+    <div class="stat"><b data-count="59.8" data-dec="1">0</b><span>TB standardised</span></div>
+    <div class="stat"><b data-count="3273">0</b><span>subtitle tracks OCR'd to text</span></div>
+    <div class="stat"><b data-count="578">0</b><span>audio tracks identified by ear</span></div>
+  </div>
+  <div class="scrollhint">scroll, or press ↓&nbsp;&nbsp;·&nbsp;&nbsp;P = auto-play</div>
+</section>
+
+<!-- ======================= LIVE PIPELINE ======================= -->
+<section id="live">
+  <div class="kicker rev">THE PIPELINE, LIVE</div>
+  <h2 class="rev">Watch it work <span class="tag">simulated feed</span></h2>
+  <p class="lede rev">Every job is one pass: probe → plan → fix → verify → commit.
+     Colour tells you what kind of work at a glance — <b style="color:var(--acc)">blue</b> is the GPU encoding,
+     <b style="color:var(--ok)">green</b> is a stream copy, <b style="color:var(--purple)">purple</b> is subtitle OCR
+     on the CPU, and the <b style="color:var(--cyan)">cyan</b> phase is the verified swap into the library.</p>
+  <div class="panel rev" style="margin-top:26px">
+    <h3><span class="dot"></span>TRANSCODING <span style="margin-left:auto" class="mono" id="qdepth">queued 1,504</span></h3>
+    <div class="caps">
+      <span>ENCODE <b id="capE">0/4</b></span><span>PASSTHROUGH <b id="capP">0/6</b></span>
+      <span>SUBOCR <b id="capS">0/10</b></span>
+      <span style="margin-left:auto">CACHE <b>793 GB free</b></span>
+    </div>
+    <div id="workers"></div>
+  </div>
+</section>
+
+<!-- ======================= GATE ======================= -->
+<section id="gate">
+  <div class="cols">
+    <div>
+      <div class="kicker rev">THE JOB GATE</div>
+      <h2 class="rev">Viewers always win</h2>
+      <p class="lede rev">The moment somebody presses play, the gate reacts —
+         new jobs prefer the other spindles, anything already running on the
+         viewer's disk drops to Very&nbsp;Low I/O so their reads overtake it, and
+         if their buffer runs genuinely thin, work on that spindle stops outright
+         until it recovers. When the session ends, a grace period keeps things
+         calm, then the queue resumes on its own. Nobody has to remember to
+         pause anything.</p>
+      <div style="margin-top:22px" class="rev">
+        <div class="tv" id="tv"><span class="play"></span><span id="tvlbl">nobody is watching</span></div>
+      </div>
+    </div>
+    <div class="panel gatecard rev" id="gatecard">
+      <h3>JOB GATE</h3>
+      <div class="gaterow"><span class="lamp" id="l-manual"></span>Manual<span class="why">not paused</span></div>
+      <div class="gaterow"><span class="lamp" id="l-plex"></span>Plex<span class="why" id="w-plex">nobody is watching</span></div>
+      <div class="gaterow"><span class="lamp" id="l-disk"></span>Disk load<span class="why">no foreign I/O — measured natively, no vendor tools</span></div>
+      <div class="gaterow"><span class="lamp" id="l-arr"></span>Sonarr / Radarr<span class="why">idle — no import running</span></div>
+      <div class="gaterow"><span class="lamp" id="l-health"></span>Arr health<span class="why">watched every 5 min — warnings logged when they appear <i>and</i> clear</span></div>
+      <div class="gaterow"><span class="lamp" id="l-lang"></span>Audio language<span class="why">check idle — nothing waiting</span></div>
+      <div class="gaterow"><span class="lamp" id="l-cache"></span>Cache<span class="why">793 GB free</span></div>
+    </div>
+  </div>
+</section>
+
+<!-- ======================= VIEWER BUFFER ======================= -->
+<section id="viewer">
+  <div class="kicker rev">VIEWER-AWARE PACING</div>
+  <h2 class="rev">It knows exactly how close you are to a stutter <span class="tag">live logic</span></h2>
+  <p class="lede rev">nuarr measures every viewer's real buffer — from the server's own
+     file position — and paces itself against it on a sliding scale: full speed when
+     you're far ahead, progressively slower as your runway shrinks, and a hard stop
+     (the encode is frozen mid-frame, not killed) if you dip under the floor. Stopping
+     and starting use <i>different</i> thresholds, because pausing is itself what lets
+     the buffer recover — one threshold flapped every few seconds; two never do.</p>
+
+  <div class="rwwrap rev" style="margin-top:26px">
+    <div class="rwlbl"><span id="rwtext">220s of runway</span><span class="rwstate full" id="rwstate">nuarr at full speed</span></div>
+    <div class="rwbar" id="rwbar"><i id="rwfill"></i><u></u><o></o><s></s></div>
+    <div class="rwax">
+      <span class="z">0s</span><span class="f">50s</span><span class="r">75s</span>
+      <span class="fs">150s</span><span class="m">180s+</span>
+    </div>
+    <div class="rwleg">
+      <s class="a">50s — nuarr stops</s>
+      <s class="b">75s — nuarr starts again (after holding)</s>
+      <s class="c">150s — nuarr at full speed</s>
+    </div>
+  </div>
+
+  <div class="cols" style="margin-top:26px">
+    <div class="rev">
+      <p class="lede" style="font-size:14px">And the floor isn't one number — it's computed
+         <b>per stream</b>. Seconds aren't disk work: 60s of a 25&nbsp;Mbps 4K remux is
+         189&nbsp;MB off the spindle, 60s of a 6&nbsp;Mbps episode is 44&nbsp;MB. So the floor
+         scales with bitrate — then gets capped by two things the system can't exceed:
+         what <i>this player</i> has actually been measured holding (client buffers are
+         capped in megabytes, so a 4K stream holds fewer seconds), and where Plex parks
+         its own encoder (<span class="mono">TranscoderThrottleBuffer</span>, read live
+         from the server). Demanding more than either would leave a healthy stream
+         reading as "starving" forever.</p>
+    </div>
+    <div class="panel rev" style="padding:6px 10px">
+      <table class="fltbl mono">
+        <tr><th>SESSION</th><th>WANTS</th><th>GETS</th><th>WHY</th></tr>
+        <tr><td>4K remux · 25.2 Mbps</td><td>120s</td><td><b>47s</b></td><td class="why">this player only banks ~66s of a file this heavy</td></tr>
+        <tr><td>1080p ep · 5.9 Mbps</td><td>35s</td><td><b>35s</b></td><td class="why">less disk work per second, lower floor</td></tr>
+        <tr><td>4K transcode</td><td>120s</td><td><b>36s</b></td><td class="why">Plex parks its encoder at 60s — more is never banked</td></tr>
+        <tr><td>buffered to the end</td><td>—</td><td><b>0s</b></td><td class="why">nothing left to read — nuarr runs at full speed</td></tr>
+      </table>
+    </div>
+  </div>
+</section>
+
+<!-- ======================= SESSION CARDS ======================= -->
+<section id="cards">
+  <div class="kicker rev">EVERY STREAM, EXPLAINED</div>
+  <h2 class="rev">The session cards <span class="tag">live replica</span></h2>
+  <p class="lede rev">Expand any stream on the dashboard and it accounts for itself
+     completely: what's playing untouched and why, what Plex reserved for the
+     connection, when it ends — and exactly what nuarr is allowed to do on that
+     spindle, with the floor derivation shown as one line of arithmetic. The runway
+     gauge and the timeline bar share the same edges, the same needle, the same
+     thresholds.</p>
+  <!-- the two cards below are only a no-script fallback: the simulation
+       rebuilds this container with generic, scripted sessions on load -->
+  <div class="pxwrap rev" id="pxwrap">
+
+    <div class="pxcard" id="cardA">
+      <div class="pxtitle">Velvet · S03E09</div>
+      <div class="pxsub">Coup de Theatre</div>
+      <div class="pxpills">
+        <span class="pill ok">direct play</span><span class="pill ok">● playing</span>
+        <span class="pxuser">livingroom</span><span class="dim" style="font-size:11px">BRAVIA BF1</span>
+      </div>
+      <div class="mono" style="font-size:11px"><span style="color:#41b883;font-weight:700">NU-DRIVE-11</span> <span class="dim">· remote · 8.4 Mbps</span></div>
+      <div class="dim" style="font-size:11px;margin-top:2px" id="bufA">1.7 min buffered <span style="opacity:.6">(measured)</span></div>
+      <div class="pxmore">
+        <div class="kv"><span class="k">video</span><span><span class="dim">played untouched</span> 1080p (H.264)</span></div>
+        <div class="kv"><span class="k">audio</span><span><span class="dim">played untouched</span> Spanish (AAC Stereo)</span></div>
+        <div class="kv"><span class="k">subtitle</span><span>English (SRT)</span></div>
+        <div class="kv"><span class="k">source</span><span>1080p · <b>4.0 Mbps file</b> <span class="dim">· Plex has reserved 8.4 Mbps for it (2.1×, headroom for peaks)</span></span></div>
+        <div class="kv"><span class="k">ends</span><span id="endA">11:56 PM · 23:20 left</span></div>
+        <div class="kv"><span class="k">nuarr</span><span><span style="color:#41b883" class="mono">NU-DRIVE-11</span> <span class="dim">· full speed over</span> <b>90s</b><span class="dim">, slows below that, stops under</span> <b>30s</b></span></div>
+        <div class="kv"><span class="k"></span><span class="dim">60s × 0.5 for 4.0 Mbps = 30s</span></div>
+        <div class="rwlbl2" id="rlA">105s — clear, nuarr at full speed</div>
+        <div class="rwsm"><div class="rwbar"><i id="rfA" style="background:var(--ok);opacity:.6"></i><u></u><o></o><s></s></div>
+        <div class="rwax"><span class="z">0s</span><span class="f">30s</span><span class="r">45s</span><span class="fs">90s</span><span class="m">108s+</span></div></div>
+        <div class="rwleg" style="margin-top:8px;font-size:9.5px">
+          <s class="a">30s — nuarr stops</s><s class="b">45s — nuarr starts again</s><s class="c">90s — full speed</s></div>
+      </div>
+      <div class="pxclock"><span class="mono" id="ckA">51:07 / 1:14:28</span><span id="pcA">69%</span></div>
+      <div class="tllbl" id="tlbA">105s buffer · 75s clear of the 30s floor</div>
+      <div class="tl"><b id="tbA"></b><i id="tiA"></i></div>
+    </div>
+
+    <div class="pxcard" id="cardB">
+      <div class="pxtitle">Goblin Slayer · S01E07</div>
+      <div class="pxsub">Onward Unto Death</div>
+      <div class="pxpills">
+        <span class="pill ok">direct play</span><span class="pill ok">● playing</span>
+        <span class="pxuser">laptop</span><span class="dim" style="font-size:11px">Study-PC</span>
+      </div>
+      <div class="mono" style="font-size:11px"><span style="color:#e34c26;font-weight:700">NU-DRIVE-0</span> <span class="dim">· local · 16.4 Mbps</span></div>
+      <div class="dim" style="font-size:11px;margin-top:2px" id="bufB">1.8 min buffered <span style="opacity:.6">(measured)</span></div>
+      <div class="pxmore">
+        <div class="kv"><span class="k">video</span><span><span class="dim">played untouched</span> 1080p (HEVC Main 10)</span></div>
+        <div class="kv"><span class="k">audio</span><span><span class="dim">played untouched</span> English (EAC3 5.1)</span></div>
+        <div class="kv"><span class="k">subtitle</span><span>English Forced (ASS)</span></div>
+        <div class="kv"><span class="k">source</span><span>1080p · <b>7.1 Mbps file</b> <span class="dim">· Plex has reserved 16.4 Mbps for it (2.3×, headroom for peaks)</span></span></div>
+        <div class="kv"><span class="k">ends</span><span id="endB">11:46 PM · 13:02 left</span></div>
+        <div class="kv"><span class="k">nuarr</span><span><span style="color:#e34c26" class="mono">NU-DRIVE-0</span> <span class="dim">· full speed over</span> <b>129s</b><span class="dim">, slows below that, stops under</span> <b>43s</b></span></div>
+        <div class="kv"><span class="k"></span><span class="dim">60s × 0.7 for 7.1 Mbps = 43s</span></div>
+        <div class="rwlbl2" id="rlB">106s of runway — nuarr at 55% speed</div>
+        <div class="rwsm"><div class="rwbar"><i id="rfB" style="background:var(--ok);opacity:.6"></i><u></u><o></o><s></s></div>
+        <div class="rwax"><span class="z">0s</span><span class="f">43s</span><span class="r">65s</span><span class="fs">129s</span><span class="m">155s+</span></div></div>
+        <div class="rwleg" style="margin-top:8px;font-size:9.5px">
+          <s class="a">43s — nuarr stops</s><s class="b">65s — nuarr starts again</s><s class="c">129s — full speed</s></div>
+      </div>
+      <div class="pxclock"><span class="mono" id="ckB">10:39 / 23:41</span><span id="pcB">45%</span></div>
+      <div class="tllbl" id="tlbB">106s buffer · 63s clear of the 43s floor</div>
+      <div class="tl"><b id="tbB"></b><i id="tiB"></i></div>
+    </div>
+
+  </div>
+</section>
+
+<!-- ======================= AUDIO ======================= -->
+<section id="audio">
+  <div class="kicker rev">AUDIO THAT ACTUALLY PLAYS</div>
+  <h2 class="rev">The end of the buffering wheel</h2>
+  <p class="lede rev">Plex's audio decoder silently rejects high-bitrate E-AC3 — the stream
+     buffers forever and nobody knows why. Nuarr found the pattern, proved it on real
+     sessions, and made the fix a standing rule: every incompatible track is re-encoded
+     to the rate Plex direct-plays, automatically, forever. It also downmixes 7.1 where
+     needed, keeps lossless above lossy when deduplicating, and keeps both languages on
+     dual-audio anime.</p>
+  <div class="beforeafter rev" style="margin-top:26px">
+    <div>
+      <div class="lbl">BEFORE — E-AC3 5.1 @ 1536 kbps</div>
+      <div class="wave" id="waveA"></div>
+      <div style="margin-top:10px;color:var(--bad);font-size:12px"><span class="bufferring"></span>&nbsp; buffering… EAE loop</div>
+    </div>
+    <div class="arrow">➜</div>
+    <div>
+      <div class="lbl">AFTER — E-AC3 5.1 @ 640 kbps</div>
+      <div class="wave fixed" id="waveB"></div>
+      <div style="margin-top:10px;color:var(--ok);font-size:12px">▶&nbsp; direct-plays instantly</div>
+    </div>
+  </div>
+  <p class="dim rev" style="margin-top:14px;font-size:12px">~2,400 tracks re-encoded across the library — every one verified with a real transcode check before the rule shipped.</p>
+</section>
+
+<!-- ======================= LISTEN ======================= -->
+<section id="listen">
+  <div class="cols">
+    <div>
+      <div class="kicker rev">WHEN METADATA LIES</div>
+      <h2 class="rev">It listens to the file</h2>
+      <p class="lede rev">A blank language tag isn't neutral — Sonarr, Radarr and every
+         player read it as English, so a mistagged Japanese track plays the wrong audio.
+         Filename inference can't catch a RAW release with no subtitles. So nuarr
+         <b>listens</b>: Whisper on the GPU samples three windows across the track
+         and identifies the language directly — ~0.2s of GPU per window, because
+         language ID only needs the encoder, not a transcription. Windows the model
+         isn't confident about are discarded before the vote, not counted against it;
+         the survivors must <i>agree</i>. A manual override gets a deeper five-window
+         listen before it's written.</p>
+      <p class="lede rev" style="font-size:14px;margin-top:10px">And the write is a
+         <b>header edit</b> — mkvpropedit flips the tag in milliseconds with zero bytes
+         re-encoded. Across 480 files that fast path skipped 0.71&nbsp;TB of pointless
+         rewriting. Every fix restamps, notifies the arrs, and queues the rename.</p>
+    </div>
+    <div class="panel rev" style="padding:22px">
+      <div style="font-size:12px;color:var(--dim);margin-bottom:10px" class="mono" id="listenfile">Blassreiter — S01E05 · track 2 · tagged <span class="strike">eng</span></div>
+      <div class="wave listen" id="waveL"></div>
+      <div class="votes" id="votes">
+        <div class="vote" data-t="1"><b>ja 0.99</b><span>window @ 30%</span></div>
+        <div class="vote" data-t="2"><b>ja 0.99</b><span>window @ 50%</span></div>
+        <div class="vote junk" data-t="3"><b>zh 0.36</b><span>@ 70% — below floor, discarded</span></div>
+      </div>
+      <div class="verdict" id="verdict">
+        <span class="flag">jpn</span>consensus of confident windows —
+        <span class="mono">mkvpropedit</span> header edit, <b>0 bytes re-encoded</b>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ======================= SUBTITLES ======================= -->
+<section id="subs">
+  <div class="kicker rev">THE SUBTITLE ENGINE</div>
+  <h2 class="rev">Pictures become text</h2>
+  <p class="lede rev">Blu-ray subtitles are pictures (PGS). Plex has to burn them into the
+     video on the CPU at playback — a forced transcode. Nuarr OCRs them to real text once,
+     embeds the text track first, and demotes the bitmap. Signs &amp; Songs on anime are
+     burned in permanently on the GPU — 10-bit preserved end to end. And when the release
+     already ships hand-made text subtitles, the redundant bitmap is simply dropped:
+     no OCR spent re-reading what a human already typed. SDH tracks are recognised by
+     role and never sacrificed.</p>
+  <div class="cols" style="margin-top:26px">
+    <div class="screen rev">
+      <div class="ocrline"></div>
+      <div class="sub pgs" id="subline">Because I finally met you</div>
+    </div>
+    <div class="rev">
+      <table class="tracktbl mono" id="tracktbl">
+        <tr><td>1</td><td>Dialogue (OCR) — SRT</td><td><span class="flag first">text · first</span></td></tr>
+        <tr><td>2</td><td>Dialogue — PGS</td><td><span class="flag">kept · demoted</span></td></tr>
+        <tr><td>3</td><td class="strike">Signs &amp; Songs — PGS</td><td><span class="flag" style="color:var(--purple);border-color:#3d2e5e">burned into picture</span></td></tr>
+        <tr><td>4</td><td>English SDH — PGS</td><td><span class="flag" style="color:var(--gold);border-color:#4d3d1a">protected by role</span></td></tr>
+      </table>
+      <p class="dim" style="font-size:12px;margin-top:12px">Side-OCR runs on the CPU <i>while</i> the GPU encodes —
+      one rewrite of the file carries both changes. 3,273 tracks converted so far.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ======================= SAFETY ======================= -->
+<section id="safety">
+  <div class="cols">
+    <div>
+      <div class="kicker rev">NOTHING IS EVER AT RISK</div>
+      <h2 class="rev">Paranoid by design</h2>
+      <p class="lede rev">The original is never deleted until its replacement is verified
+         in place. If Sonarr upgrades a file <i>while it's being encoded</i>, Nuarr notices
+         the bytes changed and discards its own output rather than clobber the better
+         release. Locked by a viewer? The finished encode waits in a retry queue instead
+         of being thrown away. A remux renumbers tracks, so every stored verdict is
+         freshness-checked against the file before it's believed. Every destructive
+         path can roll back.</p>
+    </div>
+    <div class="panel rev" style="padding:18px 22px">
+      <div class="steps" id="steps">
+        <div class="step"><span class="n">1</span><p>Encode to cache <span>the library file is untouched</span></p></div>
+        <div class="step"><span class="n">2</span><p>Verify the output <span>size gate, duration cap, track check</span></p></div>
+        <div class="step"><span class="n">3</span><p>Same bytes? <span>source stamp compared — an arr upgrade aborts the commit</span></p></div>
+        <div class="step"><span class="n">4</span><p>Original → backup <span>still on disk, reversible</span></p></div>
+        <div class="step"><span class="n">5</span><p>Swap in, verify again <span>any failure restores the backup</span></p></div>
+        <div class="step"><span class="n">6</span><p>Only now: clean up <span>and tell Sonarr/Radarr to re-read</span></p></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ======================= DISKS ======================= -->
+<section id="disks">
+  <div class="kicker rev">TWELVE SPINDLES, ONE BRAIN</div>
+  <h2 class="rev">Disk-aware scheduling</h2>
+  <p class="lede rev">The library spans twelve pooled disks, and nuarr watches every one
+     natively — no vendor tools, no product-specific checks. It knows which spindle every
+     file is on, spreads heavy jobs so no two share a disk, and names the destination as
+     each commit lands. Each drive has its own colour, carried through every panel — and
+     a new disk is picked up and assigned one automatically. When a viewer is streaming
+     from a disk, work touching that spindle paces itself against their real buffer while
+     everything else runs at full speed.</p>
+  <div class="diskrow rev" id="diskrow"></div>
+  <p class="dim rev" style="font-size:12px;margin-top:12px"><span style="color:var(--warn)">Amber</span> = a viewer is on this spindle; work there follows the runway ramp. The rest don't slow down.</p>
+</section>
+
+<!-- ======================= INTEGRATION ======================= -->
+<section id="arr">
+  <div class="kicker rev">PLAYS WELL WITH THE STACK</div>
+  <h2 class="rev">Sonarr · Radarr · Plex · Profilarr</h2>
+  <div class="grid">
+    <div class="feat rev"><div class="accent" style="background:var(--acc)"></div><div class="ico">🪝</div><b>Webhooks in, refresh out</b><p>Imports, upgrades, renames and deletes flow in live; after every commit the arr re-reads the file and renames land through a retry queue that survives locks.</p></div>
+    <div class="feat rev"><div class="accent" style="background:var(--bad)"></div><div class="ico">🚫</div><b>Blocklist &amp; re-download</b><p>A corrupt download gets one button: reject the release, blocklist it, search again. Guarded — it refuses to guess on errors it hasn't seen, and checks the file is actually broken first.</p></div>
+    <div class="feat rev"><div class="accent" style="background:var(--warn)"></div><div class="ico">🩺</div><b>Arr health watcher</b><p>Sonarr and Radarr health are polled every five minutes. Warnings surface on the Arrs page the moment they appear — and the log records when they clear, not just when they arrive.</p></div>
+    <div class="feat rev"><div class="accent" style="background:var(--gold)"></div><div class="ico">🔌</div><b>Plex integration page</b><p>Server info, sessions and libraries in one place. The token is auto-detected from the local server — nuarr reads Plex's own settings live, including the transcoder throttle the pacing math depends on.</p></div>
+    <div class="feat rev"><div class="accent" style="background:var(--ok)"></div><div class="ico">📈</div><b>TRaSH guides sync</b><p>Anime custom formats track the guides automatically — updates existing formats by name, never deletes, reports anything new for a human to adopt.</p></div>
+    <div class="feat rev"><div class="accent" style="background:var(--purple)"></div><div class="ico">🩹</div><b>Self-healing library</b><p>Missing files verified and healed, orphans adopted, duplicates flagged, stale scratch reclaimed, database pruned and checkpointed — all on timers, all filterable in the logs by the system that did it.</p></div>
+    <div class="feat rev"><div class="accent" style="background:var(--cyan)"></div><div class="ico">🎞️</div><b>Dolby Vision → HDR10</b><p>DV profiles that break non-DV clients are stripped losslessly — a bitstream operation, no re-encode, so an 85 GB remux keeps every pixel and direct-plays everywhere.</p></div>
+    <div class="feat rev"><div class="accent" style="background:var(--lilac)"></div><div class="ico">👂</div><b>Whisper, managed</b><p>The language-ID model lives under nuarr's own data folder with a version-and-update check like every other tool — repo links and file paths one click away for debugging.</p></div>
+    <div class="feat rev"><div class="accent" style="background:var(--gold)"></div><div class="ico">🛡️</div><b>Profile guard</b><p>Quality profiles tuned so a 2160p profile means <i>the best 2160p</i> — and a watcher re-applies the setup if a Profilarr sync flattens it. Download loops: found, fixed, prevented.</p></div>
+  </div>
+</section>
+
+<!-- ======================= SETTINGS ======================= -->
+<section id="settings">
+  <div class="kicker rev">EVERY KNOB, EXPLAINED IN PLACE</div>
+  <h2 class="rev">Settings that say why they exist</h2>
+  <p class="lede rev">Twenty-one pages across Processing, Tools, Integrations and System —
+     and every control carries its own reasoning, bounds and default inline, so tuning
+     never means guessing. The status tiles above check themselves on visible countdowns:
+     missing files confirmed after three checks, unmanaged imports re-scanned on a timer.</p>
+
+  <div class="stattiles rev">
+    <div class="stt"><div class="h">TOTAL FILES</div><b>39,729</b><span>59.81 TB</span></div>
+    <div class="stt"><div class="h">ELIGIBLE</div><b>19</b><span>past hold, ready to process</span></div>
+    <div class="stt"><div class="h">HELD (NEW)</div><b>0</b><span>still settling</span></div>
+    <div class="stt"><div class="h">MISSING</div><b>0</b><span>next check in <span id="cd1">22</span>s</span></div>
+    <div class="stt"><div class="h">ERRORS</div><b>0</b><span>nothing needs attention</span></div>
+    <div class="stt"><div class="h">UNMANAGED &gt;100MB</div><b>0</b><span>next check in <span id="cd2">52</span>s</span></div>
+    <div class="stt"><div class="h">EXTRAS (KEPT)</div><b>0</b><span>OP/ED, specials, bonus</span></div>
+  </div>
+
+  <div class="panel setwrap rev">
+    <div class="setnav">
+      <div class="gh">PROCESSING</div>
+      <a class="on">Concurrency</a><a>Holds and timing</a><a>Job gate</a><a>Subtitles</a>
+      <a>Video codec</a><a>Audio codec</a><a>Audio language</a><a>Rules</a>
+      <div class="gh">TOOLS</div>
+      <a>ffmpeg</a><a>MKVToolNix</a><a>Whisper</a>
+      <div class="gh">INTEGRATIONS</div>
+      <a>Arrs</a><a>Plex</a><a>Metadata</a>
+      <div class="gh">SYSTEM</div>
+      <a>Libraries</a><a>Cache folder</a><a>Jobs</a><a>Logs</a><a>Backup and restore</a>
+    </div>
+    <div class="setpane" id="setpane">
+      <div class="hint">How much runs at once. Encode is NVENC-bound; passthrough is disk-bound.</div>
+      <div class="srow"><div class="t"><b>encode workers</b><span>NVENC-bound. One engine on the A5000: ~4 saturates it at 1080p.</span></div>
+        <div class="stepper" data-min="0" data-max="8" data-def="4"><button>−</button><output>4</output><button>+</button><span class="rng">min 0 · max 8 · default 4</span></div></div>
+      <div class="srow"><div class="t"><b>passthrough workers</b><span>Remux/copy only, no GPU. Limited by pool disk I/O.</span></div>
+        <div class="stepper" data-min="0" data-max="12" data-def="4"><button>−</button><output>4</output><button>+</button><span class="rng">min 0 · max 12 · default 4</span></div></div>
+      <div class="srow"><div class="t"><b>subocr workers</b><span>Subtitle OCR. CPU-bound and single-threaded per file, so this scales with cores, not the GPU.</span></div>
+        <div class="stepper" data-min="0" data-max="10" data-def="4"><button>−</button><output>4</output><button>+</button><span class="rng">min 0 · max 10 · default 4</span></div></div>
+      <div class="srow"><div class="t"><b>probe workers</b><span>ffprobe scans. Cheap CPU, one pool read each.</span></div>
+        <div class="stepper" data-min="0" data-max="16" data-def="4"><button>−</button><output>4</output><button>+</button><span class="rng">min 0 · max 16 · default 4</span></div></div>
+      <div class="srow"><div class="t"><b>viewer pause buffer</b><span>Seconds of buffer a viewer must keep before nuarr stops work on their spindle — scaled per stream by bitrate, capped by the player and by Plex's own throttle.</span></div>
+        <div class="stepper" data-min="0" data-max="600" data-def="60" data-step="10"><button>−</button><output>60</output><button>+</button><span class="rng">min 0 · max 600 · default 60</span></div></div>
+      <div class="srow"><div class="t"><b>arr concurrency</b><span>Parallel Sonarr/Radarr API calls during scans.</span></div>
+        <div class="stepper" data-min="1" data-max="30" data-def="20"><button>−</button><output>20</output><button>+</button><span class="rng">min 1 · max 30 · default 20</span></div></div>
+    </div>
+  </div>
+</section>
+
+<!-- ======================= NUMBERS ======================= -->
+<section id="numbers">
+  <div class="kicker rev">WHAT IT ADDS UP TO</div>
+  <h2 class="rev">The library, standardised</h2>
+  <div class="numstrip">
+    <div class="num rev"><b><em data-count="39729">0</em></b><span>files probed, planned &amp; tracked</span></div>
+    <div class="num rev"><b><em data-count="3273">0</em></b><span>PGS tracks OCR'd to searchable text</span></div>
+    <div class="num rev"><b>~<em data-count="2400">0</em></b><span>audio tracks fixed for direct play</span></div>
+    <div class="num rev"><b><em data-count="578">0</em></b><span>audio languages identified by listening</span></div>
+    <div class="num rev"><b><em data-count="269">0</em></b><span>Dolby Vision files repaired losslessly</span></div>
+    <div class="num rev"><b><em data-count="2.30" data-dec="2">0</em> TB</b><span>reclaimed by standardising</span></div>
+    <div class="num rev"><b><em data-count="0">0</em></b><span>files lost. Ever.</span></div>
+  </div>
+  <p class="lede rev" style="margin-top:30px">Every rule started as a real playback failure,
+     was proven against live sessions, and became a standing policy — so the same
+     problem never has to be solved twice.</p>
+</section>
+
+<div class="navdots" id="navdots"></div>
+<div class="keyhint">↑/↓ navigate · P auto-play</div>
+<footer>Nuarr — native Windows · FastAPI · NVENC · Whisper · one job: press play.</footer>
+
+<script>
+/* ---------- reveal on scroll ---------- */
+const io = new IntersectionObserver(es => es.forEach(e => {
+  if(e.isIntersecting) e.target.classList.add('in');
+}), {threshold:.18});
+document.querySelectorAll('.rev').forEach(el => io.observe(el));
+setInterval(()=>{
+  document.querySelectorAll('.rev:not(.in)').forEach(el=>{
+    const r=el.getBoundingClientRect();
+    if(r.top < innerHeight*1.2 && r.bottom > -200) el.classList.add('in');
+  });
+}, 1500);
+
+/* ---------- animated counters ---------- */
+const cio = new IntersectionObserver(es => es.forEach(e => {
+  if(!e.isIntersecting) return;
+  const el = e.target, target = parseFloat(el.dataset.count), dec = +(el.dataset.dec||0);
+  const t0 = performance.now(), dur = 1400;
+  (function tick(t){
+    const k = Math.min(1,(t-t0)/dur), v = target*(1-Math.pow(1-k,3));
+    el.textContent = dec ? v.toFixed(dec) : Math.round(v).toLocaleString();
+    if(k<1) requestAnimationFrame(tick);
+  })(t0);
+  cio.unobserve(el);
+}), {threshold:.6});
+document.querySelectorAll('[data-count]').forEach(el => cio.observe(el));
+
+/* ---------- nav dots + keys + autoplay ---------- */
+const sections=[...document.querySelectorAll('section')];
+const dots=document.getElementById('navdots');
+sections.forEach((s,i)=>{const a=document.createElement('a');a.href='#'+s.id;dots.append(a);});
+const sio=new IntersectionObserver(es=>es.forEach(e=>{
+  if(e.isIntersecting){const i=sections.indexOf(e.target);
+    [...dots.children].forEach((d,k)=>d.classList.toggle('on',k===i));}
+}),{threshold:.5});
+sections.forEach(s=>sio.observe(s));
+let cur=0, auto=null;
+function goto(i){cur=Math.max(0,Math.min(sections.length-1,i));
+  sections[cur].scrollIntoView({behavior:'smooth'});}
+addEventListener('keydown',e=>{
+  if(e.key==='ArrowDown'||e.key==='PageDown'){e.preventDefault();goto(cur+1);}
+  if(e.key==='ArrowUp'||e.key==='PageUp'){e.preventDefault();goto(cur-1);}
+  if(e.key.toLowerCase()==='p'){auto?(clearInterval(auto),auto=null):(auto=setInterval(()=>goto((cur+1)%sections.length),9000));}
+});
+const secio=new IntersectionObserver(es=>es.forEach(e=>{
+  if(e.isIntersecting) cur=sections.indexOf(e.target);}),{threshold:.5});
+sections.forEach(s=>secio.observe(s));
+
+/* ---------- live worker simulation ---------- */
+const TITLES=[
+ ['encode','Arifureta — S01E08','re-encode → h265 · burn “Signs & Songs” · 10-bit kept', true],
+ ['passthrough','Yu Yu Hakusho — S04E11','remux · eac3 1536k → E-AC3 640k', false],
+ ['subocr','Kizumonogatari Part 2','subtitle OCR · 2 PGS → SRT, embedded first', false],
+ ['encode','Promare (2019)','re-encode → h265 · burn signs from remux', false],
+ ['passthrough','Foundation — S02E08','remux · strip Dolby Vision → HDR10', false],
+ ['subocr','Moneyball (2011)','subtitle OCR · dialogue PGS → text', false],
+ ['passthrough','Space Dandy — S01E04','remux · audio fix + subs reordered', true],
+ ['passthrough','Blassreiter — S01E05','tag audio jpn (listened) · header edit only', false],
+ ['encode','Fate/stay night: HF III','re-encode → h265 · signs burned · DTS-HD → E-AC3', false],
+];
+const POOLC={encode:'var(--acc)',passthrough:'var(--ok)',subocr:'var(--purple)'};
+const host=document.getElementById('workers');
+let workers=[], wid=0;
+
+function spawn(){
+  if(workers.length>=4) return;
+  const used=new Set(workers.map(w=>w.title));
+  const free=TITLES.filter(t=>!used.has(t[1]));
+  const pick=free.length?free:TITLES;
+  const t=pick[Math.floor(Math.random()*pick.length)];
+  const w={id:++wid,pool:t[0],title:t[1],plan:t[2],ocr:t[3]&&t[0]!=='subocr',
+           p:0,ocrP:0,fps:60+Math.random()*40,stage:'probing',age:0,
+           speed:.004+Math.random()*.01};
+  const el=document.createElement('div');el.className='wk';el.id='w'+w.id;
+  host.append(el);w.el=el;workers.push(w);draw(w);
+}
+function draw(w){
+  const col=w.stage==='committing'?'var(--cyan)':POOLC[w.pool];
+  const indet=['probing','handlers','placing'].includes(w.stage);
+  const pct=w.p*100;
+  w.el.innerHTML=`
+   <div class="wkhead">
+     <span class="spin"><i style="background:${POOLC[w.pool]}"></i><i style="background:${POOLC[w.pool]}"></i><i style="background:${POOLC[w.pool]}"></i></span>
+     <span class="pill" style="color:${POOLC[w.pool]};border-color:${POOLC[w.pool]}">${w.pool}</span>
+     <span class="title">${w.title}</span>
+     ${w.done?`<span class="stamp" style="background:${w.done==='done'?'var(--ok)':'var(--warn)'}">${w.done}</span>`:''}
+   </div>
+   <div class="wkplan">${w.plan}</div>
+   <div class="bar"><i class="${indet?'indet':''}" style="width:${pct.toFixed(1)}%;background:${col}"></i></div>
+   <div class="wkstats">
+     <span><b>${indet?'—':pct.toFixed(1)+'%'}</b></span>
+     ${w.pool!=='subocr'?`<span><b>${w.fps.toFixed(1)}</b> fps</span><span><b>${(w.fps/24).toFixed(2)}×</b></span>`:''}
+     <span>elapsed <b>${Math.floor(w.age/10)}s</b></span>
+     <span style="color:${w.stage==='committing'?'var(--cyan)':'var(--dim)'}">${w.stage}</span>
+     ${w.stage==='committing'?'<span style="color:var(--cyan)">NU-DRIVE-'+(w.id%12)+' · verified swap</span>':''}
+   </div>
+   ${w.ocr&&!w.done?`<div class="socr"><span class="pill" style="color:var(--purple);border-color:var(--purple)">subocr</span>
+     <span class="socrbar"><i style="width:${(w.ocrP*100).toFixed(0)}%"></i></span>
+     <span style="color:var(--purple)">${(w.ocrP*100).toFixed(0)}%</span>
+     <span>OCR running alongside, on the CPU</span></div>`:''}`;
+}
+function step(){
+  workers.forEach(w=>{
+    w.age++;
+    if(w.done){ if(w.age-w.doneAt>26){w.el.remove();workers=workers.filter(x=>x!==w);} return; }
+    if(w.stage==='probing'&&w.age>6){w.stage='handlers';}
+    else if(w.stage==='handlers'&&w.age>13){w.stage=w.pool==='subocr'?'extracting':'encoding';}
+    else if(['encoding','extracting'].includes(w.stage)){
+      w.p=Math.min(.98,w.p+w.speed*(0.7+Math.random()*.6));
+      w.fps=Math.max(40,Math.min(120,w.fps+(Math.random()-.5)*6));
+      if(w.ocr) w.ocrP=Math.min(.97,w.ocrP+w.speed*0.8);
+      if(w.p>=.975){w.stage='committing';w.p=0;}
+    }
+    else if(w.stage==='committing'){
+      w.p=Math.min(1,w.p+.035);
+      if(w.p>=1){w.done=Math.random()<.9?'done':'skipped';w.doneAt=w.age;w.el.classList.add('ghost');}
+    }
+    draw(w);
+  });
+  const n=p=>workers.filter(w=>!w.done&&w.pool===p).length;
+  document.getElementById('capE').textContent=n('encode')+'/4';
+  document.getElementById('capP').textContent=n('passthrough')+'/6';
+  document.getElementById('capS').textContent=(n('subocr')+workers.filter(w=>!w.done&&w.ocr).length)+'/10';
+  document.getElementById('qdepth').textContent='queued '+(1504-wid).toLocaleString();
+  if(workers.filter(w=>!w.done).length<3&&Math.random()<.3) spawn();
+}
+spawn();spawn();spawn();
+setInterval(step,100);
+
+/* ---------- gate demo loop ---------- */
+const tv=document.getElementById('tv'), tvlbl=document.getElementById('tvlbl');
+const lPlex=document.getElementById('l-plex'), wPlex=document.getElementById('w-plex');
+let gatePhase=0;
+const GATE=[
+  ['nobody is watching','nobody is watching',false],
+  ['erik is watching — 224s buffered','1 session playing — new jobs prefer the other spindles',true],
+  ['erik is watching — 41s buffered!','Paused for the viewer: NU-DRIVE-1 (41s) — resumes over 75s and holds',true],
+  ['erik is watching — buffer recovered','1 session playing — throttle ramping back up',true],
+];
+setInterval(()=>{
+  gatePhase=(gatePhase+1)%GATE.length;
+  const [a,b,on]=GATE[gatePhase];
+  tv.classList.toggle('on',on);
+  lPlex.classList.toggle('hold',on);
+  tvlbl.textContent=a; wPlex.textContent=b;
+  wPlex.style.color=on?'var(--warn)':'';
+},4200);
+
+/* ---------- viewer runway simulation ---------- */
+/* The REAL state machine, miniature: floor 50, resume 75 (1.5x), full 150 (3x),
+   min hold + sustained recovery before release. Drains while nuarr works,
+   recovers while nuarr is paused - the same feedback loop the hysteresis
+   exists to tame. */
+const RW={floor:50,resume:75,full:150,max:180,lead:170,paused:false,
+          pausedAt:0,ok:null,t:0,HOLD:6,RECOVER:4};
+const rwFill=document.getElementById('rwfill'), rwBar=document.getElementById('rwbar');
+const rwText=document.getElementById('rwtext'), rwState=document.getElementById('rwstate');
+setInterval(()=>{
+  RW.t+=0.12;
+  if(RW.paused){ RW.lead=Math.min(RW.max,RW.lead+2.2); }
+  else{
+    // the faster nuarr runs, the faster the viewer's runway drains
+    const pace = RW.lead>=RW.full ? 0 : 3*Math.min(1,(RW.full-RW.lead)/(RW.full-RW.floor));
+    RW.lead=Math.max(30,RW.lead-(2.6-pace*0.55));
+  }
+  if(!RW.paused && RW.lead<RW.floor){RW.paused=true;RW.pausedAt=RW.t;RW.ok=null;}
+  if(RW.paused){
+    if(RW.lead<RW.resume){RW.ok=null;}
+    else if(RW.ok==null){RW.ok=RW.t;}
+    if(RW.ok!=null && RW.t-RW.ok>RW.RECOVER && RW.t-RW.pausedAt>RW.HOLD){RW.paused=false;}
+  }
+  rwFill.style.width=Math.min(100,RW.lead/RW.max*100).toFixed(1)+'%';
+  rwBar.classList.toggle('stop',RW.paused);
+  const L=Math.round(RW.lead);
+  if(RW.paused){
+    rwState.className='rwstate stop';
+    if(RW.lead<RW.resume){rwState.textContent='paused';rwText.textContent=L+'s — paused until 75s';}
+    else{const w=Math.ceil(Math.max(RW.HOLD-(RW.t-RW.pausedAt),RW.RECOVER-(RW.t-(RW.ok??RW.t))));
+      rwState.textContent='recovering';rwText.textContent=L+'s — recovering, resumes in ~'+w+'s';}
+  }else if(RW.lead>=RW.full){
+    rwState.className='rwstate full';rwState.textContent='nuarr at full speed';
+    rwText.textContent=L+'s — clear';
+  }else{
+    const pace=3*Math.min(1,(RW.full-RW.lead)/(RW.full-RW.floor));
+    rwState.className='rwstate thr';
+    rwState.textContent='nuarr at '+Math.round(100/(1+pace))+'% speed';
+    rwText.textContent=L+'s of runway';
+  }
+},120);
+
+/* ---------- session cards: generic sessions, full lifecycles ---------- */
+/* Each card runs the REAL pacing loop on an invented stream: the buffer
+   drains while nuarr works and refills while it pauses, so every card cycles
+   through full speed -> ramp -> paused -> recovering -> resumed on its own -
+   and near the end of the file it hits buffered-to-end, plays out, fades, and
+   a new session takes its place. */
+const DKC=['#e34c26','#f1e05a','#3572A5','#563d7c','#b07219','#178600',
+           '#00ADD8','#dea584','#c22d40','#ffac45','#41b883','#8993be'];
+const SESSPOOL=[
+ {t:'The Long Voyage · S02E04',s:'Landfall',u:'living-room-tv',d:'Shield TV',
+  mb:12.4,dec:'direct play',dur:2760,loc:'local',v:'1080p (HEVC Main 10)',a:'English (EAC3 5.1)'},
+ {t:'Midnight Harbor (2024)',s:'4K remux',u:'theater',d:'Apple TV 4K',
+  mb:25.2,dec:'direct play',dur:6840,loc:'remote',v:'4K HDR10 (HEVC Main 10)',a:'English (TrueHD 7.1)'},
+ {t:'Paper Cranes · S01E11',s:'The Fold',u:'laptop',d:'Plex for Windows',
+  mb:5.9,dec:'direct play',dur:1420,loc:'local',v:'1080p (HEVC Main 10)',a:'Japanese (FLAC 2.0)'},
+ {t:'Static & Snow (2019)',s:'burned subtitles force a transcode',u:'tablet',d:'Plex for iOS',
+  mb:8.2,dec:'transcode',dur:5580,loc:'remote',v:'1080p → h264 on the GPU',a:'English (EAC3 5.1)'},
+ {t:'Clockwork Alley · S03E01',s:'Second Wind',u:'phone',d:'Plex for Android',
+  mb:4.1,dec:'direct play',dur:1380,loc:'remote',v:'1080p (H.264)',a:'English (AAC Stereo)'},
+ {t:'Harvest of Iron (2021)',s:'extended cut',u:'den-tv',d:'Roku Ultra',
+  mb:17.3,dec:'direct play',dur:7150,loc:'local',v:'4K HDR10 (HEVC Main 10)',a:'English (EAC3 5.1)'},
+];
+const fmtT=s=>{s=Math.max(0,Math.round(s));const h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;
+  return (h?h+':'+String(m).padStart(2,'0'):m)+':'+String(x).padStart(2,'0');};
+function mkSess(avoid){
+  const opts=SESSPOOL.filter(p=>p.t!==avoid);
+  const p=opts[Math.floor(Math.random()*opts.length)];
+  const sc=Math.min(2,Math.max(.5,p.mb/10));
+  let fl=Math.round(60*sc);
+  let why=`60s × ${sc.toFixed(1)} for ${p.mb.toFixed(1)} Mbps = ${fl}s`;
+  if(p.dec==='transcode'&&fl>36){fl=36;why+=` · held to 36s by Plex's 60s throttle`;}
+  return {...p,di:Math.floor(Math.random()*12),fl,rs:Math.round(fl*1.5),full:fl*3,why,
+    off:p.dur*(0.1+Math.random()*.25),lead:fl*(2.6+Math.random()),
+    paused:false,pausedAt:0,ok:null,tk:0,done:false,swap:false};
+}
+const pxwrap=document.getElementById('pxwrap');
+function cardHTML(c,i){
+  const col=DKC[c.di];
+  return `
+   <div class="pxtitle">${c.t}</div>
+   <div class="pxsub">${c.s}</div>
+   <div class="pxpills">
+     <span class="pill ${c.dec==='transcode'?'purple':'ok'}">${c.dec}</span>
+     <span class="pill ok">● playing</span>
+     <span class="pxuser">${c.u}</span><span class="dim" style="font-size:11px">${c.d}</span>
+   </div>
+   <div class="mono" style="font-size:11px"><span style="color:${col};font-weight:700">NU-DRIVE-${c.di}</span> <span class="dim">· ${c.loc} · ${c.mb.toFixed(1)} Mbps</span></div>
+   <div class="dim" style="font-size:11px;margin-top:2px" id="buf${i}"></div>
+   <div class="pxmore">
+     <div class="kv"><span class="k">video</span><span><span class="dim">${c.dec==='transcode'?'converting':'played untouched'}</span> ${c.v}</span></div>
+     <div class="kv"><span class="k">audio</span><span><span class="dim">played untouched</span> ${c.a}</span></div>
+     <div class="kv"><span class="k">source</span><span><b>${c.mb.toFixed(1)} Mbps file</b> <span class="dim">· Plex has reserved ${(c.mb*2.1).toFixed(1)} Mbps (2.1×, headroom for peaks)</span></span></div>
+     <div class="kv"><span class="k">ends</span><span id="end${i}"></span></div>
+     <div class="kv"><span class="k">nuarr</span><span><span style="color:${col}" class="mono">NU-DRIVE-${c.di}</span> <span class="dim">· full speed over</span> <b>${c.full}s</b><span class="dim">, slows below, stops under</span> <b>${c.fl}s</b></span></div>
+     <div class="kv"><span class="k"></span><span class="dim">${c.why}</span></div>
+     <div class="rwlbl2" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span id="rl${i}"></span><span class="rwstate full" id="rst${i}"></span></div>
+     <div class="rwsm"><div class="rwbar" id="rb${i}"><i id="rf${i}" style="background:var(--ok);opacity:.6"></i><u></u><o></o><s></s></div>
+     <div class="rwax"><span class="z">0s</span><span class="f">${c.fl}s</span><span class="r">${c.rs}s</span><span class="fs">${c.full}s</span><span class="m">${Math.round(c.fl*3.6)}s+</span></div></div>
+     <div class="rwleg" style="margin-top:8px;font-size:9.5px">
+       <s class="a">${c.fl}s — stops</s><s class="b">${c.rs}s — starts again</s><s class="c">${c.full}s — full speed</s></div>
+   </div>
+   <div class="pxclock"><span class="mono" id="ck${i}"></span><span id="pct${i}"></span></div>
+   <div class="tllbl" id="tlb${i}"></div>
+   <div class="tl"><b id="tb${i}"></b><i id="ti${i}"></i></div>`;
+}
+let SES=[mkSess(),null]; SES[1]=mkSess(SES[0].t);
+pxwrap.innerHTML='<div class="pxcard"></div><div class="pxcard"></div>';
+function renderCard(i){pxwrap.children[i].innerHTML=cardHTML(SES[i],i);}
+renderCard(0);renderCard(1);
+setInterval(()=>{
+  SES.forEach((c,i)=>{
+    if(c.swap) return;
+    const el=id=>document.getElementById(id+i);
+    if(!el('rf')) return;
+    // the clock runs fast on purpose - a whole session lifecycle in about
+    // ninety seconds, so every state gets seen without waiting a film out
+    const speed=Math.max(3,c.dur/120);
+    c.off=Math.min(c.dur,c.off+(c.done?speed*2.5:speed));
+    const left=c.dur-c.off;
+    if(!c.done && c.lead>=left-3){c.done=true;c.paused=false;}
+    if(c.done){ c.lead=Math.min(c.lead,left); }
+    else if(c.paused){
+      c.lead=Math.min(c.full*1.15,c.lead+c.fl*.09);
+      if(c.lead<c.rs){c.ok=null;} else if(c.ok==null){c.ok=c.tk;}
+      if(c.ok!=null && c.tk-c.ok>4 && c.tk-c.pausedAt>7){c.paused=false;}
+    } else {
+      const pace=c.lead>=c.full?0:3*Math.min(1,(c.full-c.lead)/(c.full-c.fl));
+      c.lead=Math.max(c.fl-6,c.lead-c.fl*(0.085-pace*.02));
+      if(c.lead<c.fl){c.paused=true;c.pausedAt=c.tk;c.ok=null;}
+    }
+    c.tk++;
+    if(left<=3){
+      c.swap=true;const div=pxwrap.children[i];div.style.opacity=0;
+      setTimeout(()=>{SES[i]=mkSess(SES[1-i].t);renderCard(i);div.style.opacity=1;},700);
+      return;
+    }
+    const L=Math.round(c.lead);
+    el('rf').style.width=Math.min(100,c.lead/(c.fl*3.6)*100).toFixed(1)+'%';
+    el('rb').classList.toggle('hold',c.paused);
+    const rl=el('rl'), st=el('rst');
+    if(c.done){
+      rl.textContent='buffered to the end — nothing left to read';
+      st.className='rwstate full';st.textContent='nuarr at full speed';
+    }else if(c.paused&&c.lead<c.rs){
+      rl.textContent=L+'s — paused until '+c.rs+'s';
+      st.className='rwstate stop';st.textContent='paused';
+    }else if(c.paused){
+      const w=Math.ceil(Math.max(7-(c.tk-c.pausedAt),4-(c.tk-(c.ok??c.tk))));
+      rl.textContent=L+'s — recovering, resumes in ~'+Math.max(1,w)+'s';
+      st.className='rwstate stop';st.textContent='recovering';
+    }else if(c.lead>=c.full){
+      rl.textContent=L+'s — clear';
+      st.className='rwstate full';st.textContent='nuarr at full speed';
+    }else{
+      const pace=3*Math.min(1,(c.full-c.lead)/(c.full-c.fl));
+      rl.textContent=L+'s of runway';
+      st.className='rwstate thr';st.textContent='nuarr at '+Math.round(100/(1+pace))+'% speed';
+    }
+    el('buf').innerHTML=(c.lead/60).toFixed(1)+' min buffered <span style="opacity:.6">(measured)</span>';
+    el('end').textContent=fmtT(left)+' left';
+    el('ck').textContent=fmtT(c.off)+' / '+fmtT(c.dur);
+    el('pct').textContent=Math.round(c.off/c.dur*100)+'%';
+    el('tlb').textContent=c.done?'buffered to the end — nothing left to read'
+      :c.paused?L+'s buffer · under '+c.fl+'s — nuarr paused'
+      :L+'s buffer · '+Math.round(c.lead-c.fl)+'s clear of the '+c.fl+'s floor';
+    el('ti').style.width=(c.off/c.dur*100).toFixed(1)+'%';
+    const tb=el('tb');
+    tb.style.width=Math.min(100,(c.off+c.lead)/c.dur*100).toFixed(1)+'%';
+    tb.style.borderRightColor=c.paused?'var(--gold)':'#4ad463';
+  });
+},1000);
+
+/* ---------- settings: cycle through every page ---------- */
+const tog=on=>`<span class="tog ${on?'on':''}"><i></i></span>`;
+const val=v=>`<span class="val">${v}</span>`;
+const stepper=(v,min,max,def,stp)=>`<div class="stepper" data-min="${min}" data-max="${max}" data-step="${stp||1}">
+  <button>−</button><output>${v}</output><button>+</button>
+  <span class="rng">min ${min} · max ${max} · default ${def}</span></div>`;
+const PANES={
+ 'Concurrency':{h:'How much runs at once. Encode is NVENC-bound; passthrough is disk-bound.',r:[
+   ['encode workers','NVENC-bound. One engine on the GPU: ~4 saturates it at 1080p.',stepper(4,0,8,4)],
+   ['passthrough workers','Remux/copy only, no GPU. Limited by pool disk I/O.',stepper(4,0,12,4)],
+   ['subocr workers','CPU-bound and single-threaded per file — scales with cores, not the GPU.',stepper(4,0,10,4)],
+   ['probe workers','ffprobe scans. Cheap CPU, one pool read each.',stepper(4,0,16,4)],
+   ['arr concurrency','Parallel Sonarr/Radarr API calls during scans.',stepper(20,1,30,20)]]},
+ 'Holds and timing':{h:'When new files become eligible, and how patient the retries are.',r:[
+   ['hold_minutes','MINUTES a file must sit untouched before it can be processed — the “Held (new)” tile',stepper(5,0,10080,5)],
+   ['scan_every_min','MINUTES between automatic library scans. Files only become eligible during a scan.',stepper(180,0,10080,180,30)],
+   ['hold_grace_s','keep holding this long after the last Plex stream stops. 0 resumes immediately.',stepper(120,0,1800,120,30)],
+   ['commit_retry_s','a finished encode whose file swap hit a lock — usually Plex playing it — retries on this cadence',stepper(120,30,1800,120,30)],
+   ['rename_poll_s','rename-queue sweeps, re-checking arr renames that were blocked',stepper(20,5,600,20,5)],
+   ['audit_every_h','HOURS between rule-check audit runs',stepper(24,1,168,24)]]},
+ 'Job gate':{h:'What may hold the queue, and why. Every check is a toggle with its reasoning beside it.',r:[
+   ['gate.plex','viewers always win',tog(1)],
+   ['gate.plex_transcodes_only','a direct play costs almost nothing — only transcodes hold the queue',tog(1)],
+   ['gate.plex_encode_only','passthrough copies keep running; only GPU work waits',tog(1)],
+   ['gate.plex_ignore_throttled','a parked encoder has banked its lead and holds nothing',tog(1)],
+   ['gate.plex_io_throttle','viewer I/O pacing — full speed over 3× the floor, sliding below, stopped underneath',tog(1)],
+   ['viewer_pause_lead_s','SECONDS of buffer a viewer must have before nuarr will merely slow down rather than STOP',stepper(60,0,600,60,10)],
+   ['viewer_share_pct','PERCENT busy a viewer’s own spindle may be before nuarr refuses to share it — one direct play pulls about 1 MB/s',stepper(25,0,100,25,5)],
+   ['disk_busy_pct','PERCENT busy, sustained, before new work is steered away from a disk',stepper(85,0,100,85,5)]]},
+ 'Subtitles':{h:'Pictures become text, once, forever.',r:[
+   ['OCR PGS → text','one conversion, then direct play forever',tog(1)],
+   ['burn Signs & Songs','anime signs composited on the GPU, 10-bit kept',tog(1)],
+   ['drop redundant bitmaps','never re-read what a human already typed',tog(1)],
+   ['protect SDH by role','recognised and never sacrificed',tog(1)]]},
+ 'Video codec':{h:'Per library, not one rule for everything — Anime Shows shown.',r:[
+   ['h265 quality (CQ)','constant-quality target for NVENC hevc',stepper(22,16,32,22)],
+   ['h265 preset','',val('p5')],
+   ['route HEVC sources to h265','and 10-bit stays 10-bit end to end',tog(1)],
+   ['Dolby Vision → HDR10','lossless bitstream repair, no re-encode',tog(1)]]},
+ 'Audio codec':{h:'The rates Plex actually direct-plays.',r:[
+   ['E-AC3 bitrate cap','above this, Plex\u2019s decoder silently loops (the EAE buffering wheel)',val('640 kbps')],
+   ['downmix 7.1 → 5.1','where clients choke',tog(1)],
+   ['lossless beats lossy','when deduplicating tracks',tog(1)]]},
+ 'Audio language':{h:'When metadata can\u2019t be trusted, listen. Per-library policy — Anime Shows keeps eng + jpn audio, eng subs.',r:[
+   ['listen with Whisper','GPU language ID on untagged or suspect tracks — checked every 30 min',tog(1)],
+   ['windows','sampled at 30 / 50 / 70% of the runtime',val('3 × 30s')],
+   ['confidence floor','a single window below 0.60 is not evidence — discarded before the vote, not counted against it',val('0.60')],
+   ['confirm overrides','a manual choice gets a deeper listen first: 5 × 45s windows',tog(1)]]},
+ 'Rules':{h:'Every rule began as a real playback failure.',r:[
+   ['standing rules','proven on live sessions, then made policy',val('24 active')],
+   ['self-healing checks','missing, orphans, duplicates, stale scratch',val('on timers')]]},
+ 'ffmpeg':{h:'Tools are pinned deliberately, not upgraded by surprise.',r:[
+   ['version','pinned — ffmpeg 9.0 needs a driver this box doesn\u2019t run, so Unpin would switch to a broken build',val('7.1.4-Jellyfin · pinned')],
+   ['update check','HOURS between checks. Reports only — it never installs on its own.',stepper(24,0,720,24,6)]]},
+ 'MKVToolNix':{h:'Header edits without touching a single stream byte.',r:[
+   ['version','\u201cDo Hot Girls Like Chords\u201d',val('mkvpropedit v100.0')],
+   ['fast path','language tags flip in milliseconds — 480 files fixed this way skipped 0.71 TB of rewriting',val('enabled')]]},
+ 'Whisper':{h:'The listening model, managed like every other tool.',r:[
+   ['model','under nuarr\u2019s own data folder, not a hidden user cache',val('small · 463.7 MB')],
+   ['runtime','faster-whisper 1.2.1 · ctranslate2 4.8.1 · CUDA, 1 device',val('cuDNN 9.24')],
+   ['debugging','repo links and every path, one click away',val('view paths')]]},
+ 'Arrs':{h:'Webhooks in, refresh out — and health watched both ways.',r:[
+   ['Sonarr','localhost:8989',val('ok')],['Radarr','localhost:7878',val('ok')],
+   ['arr_concurrency','parallel API calls during scans',stepper(20,1,30,20)],
+   ['health watcher','polled every 5 min — logged when warnings appear and when they clear',val('watching')]]},
+ 'Plex':{h:'The server\u2019s own numbers feed the pacing math.',r:[
+   ['server','direct connection, Tautulli only as fallback',val('192.168.1.100:32400')],
+   ['token','auto-detected from the local server\u2019s own saved credential',val('detected')],
+   ['transcoder throttle','read live — caps every transcode\u2019s floor',val('60s')],
+   ['sessions','who is watching, from where, how buffered',val('live')]]},
+ 'Metadata':{h:'Identity comes from the paths the arrs already maintain.',r:[
+   ['ids from folder names','tvdb / tmdb braces',tog(1)]]},
+ 'Libraries':{h:'Six libraries on the pool, scanned on a timer.',r:[
+   ['libraries','Anime Shows · Animated Shows · TV Shows · Anime Movies · Animated Movies · Movies',val('6')],
+   ['auto-scan','files only become eligible during a scan',val('every 180 min')]]},
+ 'Cache folder':{h:'Fast scratch, off the pool.',r:[
+   ['location','',val('E:\\nuarr-cache')],['free','',val('793 GB')]]},
+ 'Jobs':{h:'History is kept, and kept in check.',r:[
+   ['job history','pruned and checkpointed on a timer',val('61k rows')],
+   ['disk_wait_pct','how far a disk-heavy job must get before another starts on the SAME pool disk',stepper(85,0,100,85,5)]]},
+ 'Logs':{h:'Seventeen background loops, each one accountable.',r:[
+   ['system tags','every line filterable by the loop that wrote it',tog(1)],
+   ['renames','shown as before → after',val('pretty')]]},
+ 'Backup and restore':{h:'Config and database, weekly, verified.',r:[
+   ['schedule','Saturdays',val('04:00 · weekly')],
+   ['last run','verified, rebuilt bundle',val('331 MB · ok')],
+   ['retention','keep 4 — only nuarr-* is ever pruned, nothing else is touched',val('4 backups')]]},
+};
+const NAVS=[...document.querySelectorAll('.setnav a')];
+const setpane=document.getElementById('setpane');
+let paneIdx=0;
+function showPane(i){
+  NAVS.forEach((a,k)=>a.classList.toggle('on',k===i));
+  const p=PANES[NAVS[i].textContent]||{h:'',r:[]};
+  setpane.classList.add('swap');
+  setTimeout(()=>{
+    setpane.innerHTML=`<div class="hint">${p.h}</div>`+p.r.map(r=>
+      `<div class="srow"><div class="t"><b>${r[0]}</b><span>${r[1]}</span></div>${r[2]}</div>`).join('');
+    setpane.classList.remove('swap');
+  },320);
+}
+showPane(0);
+setInterval(()=>{paneIdx=(paneIdx+1)%NAVS.length;showPane(paneIdx);},4500);
+/* delegated, so controls keep working after every pane swap */
+setpane.addEventListener('click',e=>{
+  const t=e.target.closest('.tog');
+  if(t){t.classList.toggle('on');return;}
+  const b=e.target.closest('button');if(!b)return;
+  const st=b.closest('.stepper');if(!st)return;
+  const out=st.querySelector('output');
+  const min=+st.dataset.min,max=+st.dataset.max,stp=+(st.dataset.step||1);
+  out.textContent=b.textContent==='−'?Math.max(min,+out.textContent-stp)
+                                     :Math.min(max,+out.textContent+stp);
+});
+let cd1=22,cd2=52;
+setInterval(()=>{
+  cd1=cd1>0?cd1-1:180; cd2=cd2>0?cd2-1:300;
+  const a=document.getElementById('cd1'),b=document.getElementById('cd2');
+  if(a)a.textContent=cd1; if(b)b.textContent=cd2;
+},1000);
+
+/* ---------- audio waves ---------- */
+for(const [id,n] of [['waveA',18],['waveB',18],['waveL',18]]){
+  const w=document.getElementById(id);
+  for(let i=0;i<n;i++){const b=document.createElement('i');
+    b.style.height=(id==='waveA'?26+Math.random()*38:12+Math.random()*24)+'px';
+    b.style.animationDelay=(i*0.07)+'s';w.append(b);}
+}
+
+/* ---------- listen demo loop ---------- */
+const votes=[...document.querySelectorAll('#votes .vote')];
+const verdict=document.getElementById('verdict');
+function listenLoop(){
+  votes.forEach(v=>v.classList.remove('in'));
+  verdict.classList.remove('in');
+  votes.forEach((v,i)=>setTimeout(()=>v.classList.add('in'),700+i*900));
+  setTimeout(()=>verdict.classList.add('in'),700+votes.length*900+400);
+}
+listenLoop(); setInterval(listenLoop,8500);
+
+/* ---------- subtitle morph ---------- */
+const subline=document.getElementById('subline');
+setInterval(()=>{
+  const toText=subline.classList.contains('pgs');
+  subline.classList.toggle('pgs',!toText);
+  subline.classList.toggle('srt',toText);
+  subline.textContent=toText?'Because I finally met you   ← real text (OCR)':'Because I finally met you';
+},2600);
+
+/* ---------- safety steps loop ---------- */
+const steps=[...document.querySelectorAll('#steps .step')];
+let sIdx=0;
+setInterval(()=>{
+  steps.forEach((s,i)=>{s.classList.toggle('done',i<sIdx);s.classList.toggle('active',i===sIdx);});
+  sIdx=(sIdx+1)%(steps.length+2);
+},1100);
+
+/* ---------- disks (per-drive colours, like the real UI) ---------- */
+const dr=document.getElementById('diskrow');
+const fills=[53,53,49,50,51,51,50,50,49,51,50,50];
+const DCOL=['#e34c26','#f1e05a','#3572A5','#563d7c','#b07219','#178600',
+            '#00ADD8','#dea584','#c22d40','#ffac45','#41b883','#8993be'];
+for(let i=0;i<12;i++){
+  const d=document.createElement('div');d.className='disk';
+  d.innerHTML=`<div class="fill"><i style="height:${fills[i]}%"></i></div>
+    <div class="nm" style="color:${DCOL[i]}">NU-DRIVE-${i}</div><div class="io mono">— MB/s</div>`;
+  dr.append(d);
+}
+setInterval(()=>{
+  [...dr.children].forEach((d,i)=>{
+    const hot=i===8&&Math.floor(Date.now()/5200)%2===1;
+    d.classList.toggle('hot',hot);
+    const busy=Math.random()<.5;
+    d.querySelector('.io').textContent=busy?(hot?(2+Math.random()*6).toFixed(0):(20+Math.random()*180).toFixed(0))+' MB/s':'idle';
+  });
+},900);
+</script>
+</body>
+</html>

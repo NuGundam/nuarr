@@ -1,0 +1,287 @@
+      <div id="gatePane" style="display:none">
+        <div class="dim" style="padding:9px 14px;font-size:11px">
+          What is allowed to hold the queue. These are policy, set once: the
+          live answer to &ldquo;is anything holding it right now&rdquo; stays on the
+          dashboard. Manual pause also has a copy in the Job gate panel, because
+          a stop switch should not need a page change to reach.
+        </div>
+        <div id="gateCfg"><div class="dim" style="padding:14px">loading&hellip;</div></div>
+      </div>
+      <div id="rulesPane" style="display:none">
+        <div class="dim" style="padding:9px 14px;font-size:11px">
+          Read live from the rules engine, so this always matches what is
+          actually being applied. Rows marked
+          <span class="rprof anime">anime</span> and
+          <span class="rprof other">live action</span> are where the two
+          profiles differ — everything else applies to both.
+        </div>
+        <div id="rulesBody" style="padding:0 14px 14px"></div>
+      </div>
+      <div id="bkPane" style="display:none">
+        <div class="dim" style="padding:9px 14px;font-size:11px">
+          The database is copied with <span class="mono">VACUUM INTO</span>, which
+          takes a consistent snapshot while nuarr keeps running — a plain file copy
+          of a live SQLite database is torn. Every copy is opened and integrity
+          checked before it counts as a backup.
+        </div>
+        <div style="padding:0 14px 12px">
+          <div id="bkState" class="dim" style="font-size:12px;margin-bottom:8px"></div>
+          <div id="bkBar" class="bar" style="display:none;margin-bottom:8px"><i></i></div>
+
+          <!-- schedule -->
+          <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;
+                      font-size:12px;margin-bottom:10px">
+            <label style="display:flex;align-items:center;gap:5px">
+              <input type="checkbox" id="bkEnabled" onchange="bkSave()">
+              <span>scheduled</span>
+            </label>
+            <select id="bkFreq" onchange="bkSave()">
+              <option value="daily">every day</option>
+              <option value="weekly">every week</option>
+              <option value="monthly">every month</option>
+            </select>
+            <span id="bkDowWrap">on
+              <select id="bkDow" onchange="bkSave()">
+                <option value="0">Monday</option><option value="1">Tuesday</option>
+                <option value="2">Wednesday</option><option value="3">Thursday</option>
+                <option value="4">Friday</option><option value="5">Saturday</option>
+                <option value="6">Sunday</option>
+              </select>
+            </span>
+            <span id="bkDomWrap">on day
+              <input id="bkDom" type="number" min="1" max="28" style="width:56px"
+                     onchange="bkSave()">
+            </span>
+            at <input id="bkTime" type="time" onchange="bkSave()">
+            · keep <input id="bkKeep" type="number" min="1" max="60" style="width:56px"
+                          onchange="bkSave()"> backups
+          </div>
+
+          <div style="margin-bottom:10px">
+            <button onclick="bkRun()">Back up now</button>
+            <button onclick="bkPrune()" title="Apply the retention limit immediately">Apply retention</button>
+            <span id="bkMsg" class="dim" style="margin-left:9px"></span>
+          </div>
+          <div id="bkDest" class="mono dim" style="font-size:11px;margin-bottom:8px"></div>
+          <div id="bkList"></div>
+        </div>
+      </div>
+      <div id="arrsPane" style="display:none">
+        <div class="dim" style="padding:9px 14px 0;font-size:11px">
+          Where Sonarr and Radarr are, and what nuarr is allowed to change on
+          them. The connection details come first because nothing below works
+          without them &mdash; every rename, every import check and every
+          language lookup goes through these two.
+        </div>
+        <div id="arrConns" style="padding:10px 14px 0"></div>
+        <div id="arrHealth" style="padding:4px 14px 0"></div>
+        <div id="arrLangSync" style="padding:4px 14px 0"></div>
+        <div id="arrsBody" style="padding:0 14px 10px"></div>
+      </div>
+      <div id="metaPane" style="display:none">
+        <div id="metaBody" style="padding:10px 14px"></div>
+      </div>
+      <div id="mkvPane" style="display:none">
+        <div class="dim" style="padding:9px 14px;font-size:11px">
+          The muxer behind subtitle embedding and every header edit. nuarr
+          reports its version and checks for updates; installing a new build
+          is a normal Windows install from mkvtoolnix.download.
+        </div>
+        <div id="mkvBody" style="padding:0 14px 12px"></div>
+      </div>
+      <div id="ffPane" style="display:none">
+        <div class="dim" style="padding:9px 14px;font-size:11px">
+          nuarr's own ffmpeg. Downloads are verified by SHA-256 and applied
+          only when the queue is idle, so running jobs are never disturbed.
+        </div>
+        <div style="padding:0 14px 10px">
+          <span id="ffState" class="dim"></span>
+          <div style="margin-top:6px">
+            <button onclick="ffCheck()">Check for update</button>
+            <button onclick="ffLog()">Changelog</button>
+            <button onclick="ffStage()">Download &amp; verify</button>
+            <button onclick="ffApply()">Apply now</button>
+            <button onclick="ffRepair()" title="Re-download the current release and overwrite the install">Repair</button>
+            <button onclick="ffRollback()" title="Restore the previous build">Rollback</button>
+          </div>
+          <!-- Three separate slots. These used to share one element, so the
+               version/path line and the download status overwrote each other
+               every poll - which read as flashing. -->
+          <div id="ffBar" class="bar" style="display:none;margin-top:6px"><i></i></div>
+          <div id="ffMsg" class="dim" style="margin-top:6px;font-size:11px"></div>
+          <div id="ffPath" class="mono dim" style="margin-top:4px;font-size:11px"></div>
+    <!-- Does the GPU encoder actually open, and is the next release safe to
+         take on THIS driver. Both were previously unanswerable without
+         installing an update and waiting for a job to fail. -->
+    <div id="ffNvenc" style="margin-top:8px"></div>
+    <!-- Installed driver vs what NVIDIA is publishing. upgrade_safety() could
+         say "9.x needs 610 and you have 596", but not whether a 610 driver
+         exists yet - the difference between "go update" and "nothing to update
+         to". -->
+    <div id="ffDriver" style="margin-top:10px"></div>
+          <!-- Who actually launches ffmpeg, and does it get the right one.
+               An install can succeed and still be ignored by every job. -->
+          <div id="ffUsers" style="margin-top:10px"></div>
+          <pre id="ffChangelog" class="mono" style="display:none;max-height:220px;
+               overflow:auto;font-size:11px;background:#0b0e12;padding:8px;
+               border-radius:4px;margin-top:6px;white-space:pre-wrap"></pre>
+        </div>
+      </div>
+      <div id="logsPane" style="display:none">
+
+    <div style="padding:9px 14px;border-bottom:1px solid var(--line)">
+      <select id="logLevel" onchange="loadLogs(true)">
+        <option value="">all levels</option><option value="info">info</option>
+        <option value="ok">ok</option><option value="warn">warn</option>
+        <option value="error">error</option><option value="debug">debug</option>
+      </select>
+      <select id="logJob" onchange="loadLogs(true)"><option value="">all activity</option></select>
+      <select id="logSys" onchange="loadLogs(true)" title="Only lines from one
+        of nuarr's background loops"><option value="">all system jobs</option></select>
+      <select id="logSort" onchange="renderLogs()" title="Newest first is the
+        default; oldest first reads a single pass in the order it happened">
+        <option value="new">newest first</option>
+        <option value="old">oldest first</option>
+      </select>
+      <button onclick="openRaw()">Open full log</button>
+      <button onclick="loadOlder()">Load older</button>
+      <span id="logCount" class="dim" style="margin-left:8px"></span>
+      <span class="legend">
+        <b class="l-start">START</b><b class="l-end">END</b><b class="l-plan">plan</b>
+        <b class="l-ok">ok</b><b class="l-warn">warn</b><b class="l-error">failed</b>
+      </span>
+      <span style="margin-left:auto"></span>
+      <span id="logsResumeWrap"></span>
+    </div>
+    <div id="logs" class="logbox" onscroll="if(this.scrollTop<40)loadOlder()">
+      <div class="dim" style="padding:14px">no log lines yet</div></div>
+      </div>
+      <div id="jobsPane" style="display:none">
+        <div class="dim" style="padding:9px 14px;font-size:11px">
+          Every recurring job nuarr runs, and when it next runs. &ldquo;Last run&rdquo;
+          is observed &mdash; each loop reports as it starts a pass &mdash; so a job that
+          is stuck or held shows the truth rather than what its schedule
+          predicts. &ldquo;Next&rdquo; is the only estimate here.
+        </div>
+        <div id="jobsBody" style="padding:0 14px 14px"></div>
+      </div>
+      <div id="langPane" style="display:none">
+        <div class="dim" style="padding:9px 14px;font-size:11px">
+          Which audio and subtitle languages survive, per kind of content. The
+          queue and the transcoder read this directly &mdash; it is the same policy
+          the planner applies, not a copy of it.
+          <b>Keep the original language</b> is a tick rather than an entry in the
+          list because it differs per title: Japanese for one show, Korean for
+          the next, resolved from TMDB/TheTVDB. When that lookup fails there is
+          nothing for it to act on, and the planner keeps every track rather
+          than guessing.
+        </div>
+        <div id="langBody" style="padding:0 14px 14px"></div>
+      </div>
+      <div id="vcodecPane" style="display:none">
+        <div class="dim" style="padding:9px 14px;font-size:11px">
+          How the picture is rebuilt when it has to be rebuilt, per library.
+          These are the numbers the planner and the encoder both read &mdash; the
+          same values, not a copy, so what this page says is what ends up on
+          the ffmpeg command line.
+          <b>Most files never reach an encoder at all.</b> A remux that fixes
+          audio or subtitles copies the video untouched; nothing here applies
+          to those. It applies when the source codec is one Plex will not
+          direct-play, when a subtitle is burned in, or when the shrink rule
+          is on and a file is over its ceiling.
+          Every default is the value that was hardcoded before this page
+          existed, and the note under each one is the measurement that
+          produced it.
+        </div>
+        <div id="vcodecBody" style="padding:0 14px 14px"></div>
+      </div>
+      <div id="acodecPane" style="display:none">
+        <div class="dim" style="padding:9px 14px;font-size:11px">
+          What happens to each audio track that survives the language policy,
+          per library. Which tracks are KEPT is decided on the
+          <b>Languages</b> page; this decides what they are converted to.
+          The goal throughout is a track Plex hands to the client untouched:
+          a format it direct-plays, at a bitrate its decoder accepts, with a
+          channel count the client already has speakers for. Anything else and
+          Plex remixes or re-encodes on the fly, which is the cost this whole
+          system exists to avoid.
+        </div>
+        <div id="acodecBody" style="padding:0 14px 14px"></div>
+      </div>
+      <div id="plexPane" style="display:none">
+        <div class="dim" style="padding:9px 14px;font-size:11px">
+          Plex is the integration the job gate leans on hardest: it is what
+          tells nuarr somebody is watching. When the connection is wrong there
+          is <b>no error</b> &mdash; nuarr simply never sees a viewer and
+          encodes over the top of them, and the first sign is a stuttering
+          stream. So the settings here are tested before they are saved.
+        </div>
+        <div id="plexBody" style="padding:0 14px 14px">
+          <div class="dim" style="padding:14px">loading&hellip;</div>
+        </div>
+      </div>
+      <div id="whisperPane" style="display:none">
+        <div class="dim" style="padding:9px 14px;font-size:11px">
+          The language identifier behind the <b>Audio language</b> page. It is
+          not a transcriber here &mdash; only the model&rsquo;s language head is
+          used, which is one forward pass rather than a decode, and why a
+          30-second window costs about a fifth of a second on the card.
+          Unlike ffmpeg, nuarr does not manage updates for this: it is a Python
+          package, so a new version is a deliberate install, and this page tells
+          you when one exists rather than acting on it.
+        </div>
+        <div id="whisperBody" style="padding:0 14px 14px">
+          <div class="dim" style="padding:14px">loading&hellip;</div>
+        </div>
+      </div>
+      <div id="updPane" style="display:none">
+  <div class="dim" style="padding:9px 14px;font-size:11px">
+    Which nuarr this is, and whether there is a newer one. Checking is
+    automatic once a repository is set; <b>installing never is</b>. nuarr is
+    usually part-way through an encode or a commit, and swapping its own files
+    under a running ffmpeg would leave a half-written file in the library
+    &mdash; the one outcome the whole system exists to prevent. So this page
+    tells you, and you choose when.
+  </div>
+  <div id="updBody" style="padding:0 14px 14px"></div>
+</div>
+<div id="cachePane" style="display:none">
+        <div class="dim" style="padding:9px 14px;font-size:11px">
+          The working folder. Every encode is written here in full before it
+          replaces the original, so it wants to be <b>fast, local and roomy</b>
+          &mdash; and it must <b>not</b> be on the pool. Writing output to the
+          same spindles being read from turns one sequential read into a read
+          and a write on the same disk, which is the easiest way to make Plex
+          stutter while nuarr works. Nothing is moved when you change this:
+          anything mid-flight finishes against the old folder, and the next job
+          starts using the new one.
+        </div>
+        <div id="cacheBody" style="padding:0 14px 14px">
+          <div class="dim" style="padding:14px">loading&hellip;</div>
+        </div>
+      </div>
+      <div id="alangPane" style="display:none">
+        <div class="dim" style="padding:9px 14px;font-size:11px">
+          A language tag is the one thing about a file nuarr cannot take on
+          trust and cannot work out from anything else. An empty tag is not
+          neutral &mdash; Sonarr, Radarr and every player read a blank as
+          <b>English</b> &mdash; and a wrong tag looks exactly like a right one.
+          So it is <b>measured</b>: three 30-second windows from the middle of
+          the file, through Whisper&rsquo;s language identifier, and the
+          confident windows have to agree. This page shows what was heard,
+          what the files claim, and &mdash; deliberately &mdash; every case
+          where nuarr refused to answer.
+        </div>
+        <div id="alangBody" style="padding:0 14px 14px">
+          <div class="dim" style="padding:14px">loading&hellip;</div>
+        </div>
+      </div>
+      <div id="libPane" style="display:none">
+        <div class="dim" style="padding:9px 14px;font-size:11px">
+          The media folders nuarr manages. Adding one starts indexing it on the
+          next scan; removing one stops nuarr looking at it. <b>Nothing here ever
+          deletes media</b> &mdash; these are nuarr&rsquo;s own bookkeeping entries, and the
+          files on the pool are untouched either way.
+        </div>
+        <div id="libBody" style="padding:0 14px 14px"></div>
+      </div>

@@ -1,0 +1,19028 @@
+"""
+nuarr - web API + dashboard
+
+Read-only by default. Every endpoint that can touch a file requires an explicit
+confirm flag, mirroring the rule the rest of the system follows: nothing moves
+until someone says so.
+
+Run:  python -m uvicorn app.web:app --host 0.0.0.0 --port 8770
+  or: python serve.py
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import collections
+import httpx
+from urllib.parse import quote
+import os
+import shutil
+import re
+import sqlite3
+import subprocess
+import tempfile
+import threading
+import time
+
+from fastapi import Body, FastAPI, HTTPException, Query
+from fastapi import Response
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+
+from . import (arrhealth, audiolang, autoqueue, backup, commitqueue,
+               ffmpeg_update, gate,
+               adopter, healer, joblog, jobs, lifecycle, maintenance,
+               refetch, renamequeue, renamer, rules, scanner, system, updates,
+               version, webhooks, workers)
+from .arr import ArrClient
+from .config import DB_PATH, NO_WINDOW, SETTINGS
+from .db import ON_LOOP as db_on_loop
+from .db import cursor, display_label, init_db
+
+app = FastAPI(title="nuarr", version="0.1")
+app.include_router(webhooks.router)
+
+# in-process state so the UI can show what a long job is doing
+STATE: dict = {"scan": {"running": False, "started": None, "last": None,
+                        "result": None, "error": None}}
+
+
+# --- startup progress ------------------------------------------------------
+# The server answers HTTP before it is actually ready: the DB opens in
+# milliseconds, but recovering interrupted commits walks the pool, the arr
+# reachability check is a network round trip, and the GPU probe spawns ffmpeg.
+# During that window the dashboard renders with empty panels and a header that
+# looks identical to a healthy idle system - so a slow start and a broken one
+# are indistinguishable. This makes the difference visible.
+BOOT: dict = {
+    "started": 0.0, "ready": False, "ready_at": 0.0,
+    "steps": [
+        {"key": "db",       "label": "database",        "state": "pending"},
+        {"key": "queue",    "label": "job queue",       "state": "pending"},
+        {"key": "renames",  "label": "rename queue",    "state": "pending"},
+        {"key": "commits",  "label": "commit queue",    "state": "pending"},
+        {"key": "workers",  "label": "background tasks", "state": "pending"},
+        {"key": "recover",  "label": "pool recovery",   "state": "pending"},
+        {"key": "arrs",     "label": "Sonarr / Radarr", "state": "pending"},
+        {"key": "nvenc",    "label": "GPU encoder test", "state": "pending"},
+    ],
+}
+
+
+def _boot(key: str, state: str = "ok", note: str = "") -> None:
+    for s in BOOT["steps"]:
+        if s["key"] == key:
+            s["state"] = state
+            s["at"] = time.time()
+            if note:
+                s["note"] = note
+    if all(s["state"] in ("ok", "warn", "failed") for s in BOOT["steps"]):
+        if not BOOT["ready"]:
+            BOOT["ready"] = True
+            BOOT["ready_at"] = time.time()
+            took = BOOT["ready_at"] - (BOOT["started"] or BOOT["ready_at"])
+            bad = [s["label"] for s in BOOT["steps"] if s["state"] != "ok"]
+            joblog.log(f"nuarr ready in {took:.1f}s"
+                       + (f" — with warnings: {', '.join(bad)}" if bad else ""),
+                       "warn" if bad else "ok")
+
+
+async def _boot_recover() -> None:
+    """Wait for the pool walk that gates the job queue."""
+    await jobs.RECOVERED.wait()
+    _boot("recover", "ok", jobs.RECOVERY.get("note") or "")
+
+
+async def _boot_arrs() -> None:
+    """Confirm at least one arr answers, so 'ready' means ready to work."""
+    try:
+        st = await api_arrs()          # the same check the header pills use
+        ok = [n for n, v in (st or {}).items() if v.get("ok")]
+        if ok:
+            _boot("arrs", "ok", ", ".join(ok))
+        else:
+            _boot("arrs", "warn", "no arr reachable")
+    except Exception as e:
+        _boot("arrs", "warn", f"{type(e).__name__}")
+
+
+async def _boot_nvenc() -> None:
+    try:
+        await asyncio.to_thread(ffmpeg_update.nvenc_startup_check)
+    except Exception:
+        pass
+    n = ffmpeg_update.NVENC
+    _boot("nvenc", "ok" if n.get("ok") else "warn",
+          "" if n.get("ok") else (n.get("cause") or {}).get("reason", "unavailable"))
+
+
+# How many threads sync endpoints may occupy.
+#
+# THIS IS A MEMORY SETTING, NOT A THROUGHPUT ONE. Starlette runs every `def`
+# (non-async) endpoint on anyio's thread pool, which defaults to 40. Each of
+# those threads that touches the database gets its own thread-local SQLite
+# connection (db.connect), and each connection carries an 8 MB page cache. So
+# the default quietly authorises 40 x 8 MB = 320 MB of page cache alone, and
+# measured RSS climbed from 279 MB at rest to over 500 MB as more threads were
+# recruited - the growth people mistake for a leak.
+#
+# 12 is well above what this workload needs: the endpoints are millisecond
+# SQLite reads for a single-user dashboard, and the genuinely slow work
+# (ffmpeg, arr HTTP) is already async or out-of-process. It caps the page cache
+# near 96 MB while leaving far more concurrency than the browser can generate.
+DB_THREADS = 12
+
+
+@app.get("/api/backup")
+async def api_backup():
+    """Schedule, history and live progress for the Backup tab."""
+    s = await asyncio.to_thread(backup.settings)
+    items = await asyncio.to_thread(backup.listing)
+    return {"settings": s, "backups": items, "state": backup.STATE,
+            "next_run": backup.next_run(s),
+            "pending_restore": backup.pending()}
+
+
+@app.post("/api/backup/settings")
+async def api_backup_settings(enabled: bool | None = None,
+                              freq: str | None = None,
+                              dow: int | None = None, dom: int | None = None,
+                              time_of_day: str | None = None,
+                              keep: int | None = None):
+    kw: dict = {}
+    if enabled is not None:
+        kw["enabled"] = enabled
+    if freq:
+        kw["freq"] = freq
+    if dow is not None:
+        kw["dow"] = dow
+    if dom is not None:
+        kw["dom"] = dom
+    if time_of_day:
+        kw["time"] = time_of_day
+    if keep is not None:
+        kw["keep"] = keep
+    s = await asyncio.to_thread(lambda: backup.set_settings(**kw))
+    return {"ok": True, "settings": s, "next_run": backup.next_run(s)}
+
+
+@app.post("/api/backup/run")
+async def api_backup_run():
+    return await backup.run_now()
+
+
+@app.post("/api/backup/restore")
+async def api_backup_restore(name: str, confirm: bool = False):
+    """Restore is destructive, so it will not happen on a stray click."""
+    if not confirm:
+        raise HTTPException(400, "confirm=true is required to restore")
+    res = await asyncio.to_thread(backup.restore, name)
+    if res.get("ok"):
+        # The running process is holding the OLD database on its thread-local
+        # connections. Reading on regardless would serve a mix of both.
+        joblog.log("restart required - the restored database is not live until "
+                   "nuarr restarts", "warn")
+    return res
+
+
+@app.post("/api/backup/restore/cancel")
+async def api_backup_restore_cancel():
+    return await asyncio.to_thread(backup.cancel_pending)
+
+
+@app.post("/api/backup/prune")
+async def api_backup_prune():
+    dropped = await asyncio.to_thread(backup.prune)
+    return {"ok": True, "removed": dropped}
+
+
+@app.get("/api/diag/heap")
+async def api_diag_heap(top: int = 18):
+    r"""Where the resident memory actually is. Task #25.
+
+    gc.get_objects() alone is misleading here: it returns only GC-TRACKED
+    containers, and str/bytes/int are not tracked. A heap that is mostly path
+    strings therefore reads as almost empty - which is exactly how 200k objects
+    sat next to 900 MB of private commit and looked innocent.
+
+    So this does three things instead of one:
+      * totals tracked objects by type, for the container side;
+      * DEEP-SIZES the module-level caches by name, following references once,
+        which is where the untracked strings actually live;
+      * reports the process figures beside them, so the gap between "Python
+        knows about this" and "the OS is holding this" is visible rather than
+        inferred.
+    """
+    import gc
+    import sys
+
+    def _deep(obj, seen=None, depth=0):
+        """Size an object and what it owns. Depth-capped, identity-tracked."""
+        if seen is None:
+            seen = set()
+        oid = id(obj)
+        if oid in seen or depth > 6:
+            return 0
+        seen.add(oid)
+        try:
+            n = sys.getsizeof(obj)
+        except Exception:
+            return 0
+        if isinstance(obj, (str, bytes, bytearray, int, float, bool, type(None))):
+            return n
+        try:
+            if isinstance(obj, dict):
+                for k, v in list(obj.items())[:20000]:
+                    n += _deep(k, seen, depth + 1) + _deep(v, seen, depth + 1)
+            elif isinstance(obj, (list, tuple, set, frozenset)):
+                for v in list(obj)[:20000]:
+                    n += _deep(v, seen, depth + 1)
+            elif hasattr(obj, "__dict__"):
+                n += _deep(vars(obj), seen, depth + 1)
+            elif hasattr(obj, "__slots__"):
+                for s in obj.__slots__:
+                    n += _deep(getattr(obj, s, None), seen, depth + 1)
+        except Exception:
+            pass
+        return n
+
+    import psutil
+
+    def _work() -> dict:
+        gc.collect()
+        objs = gc.get_objects()
+        by_type: dict[str, list] = {}
+        for o in objs:
+            t = type(o).__name__
+            e = by_type.setdefault(t, [0, 0])
+            e[0] += 1
+            try:
+                e[1] += sys.getsizeof(o)
+            except Exception:
+                pass
+        tracked_mb = sum(v[1] for v in by_type.values()) / 1024 / 1024
+
+        # The named suspects - every module-level cache that can grow.
+        from . import gate, joblog, jobs, scanner
+        cand = {
+            "scanner.LAST_ARR_FETCH": getattr(scanner, "LAST_ARR_FETCH", None),
+            "scanner._DISK_CACHE": getattr(scanner, "_DISK_CACHE", None),
+            "scanner.PROGRESS": getattr(scanner, "PROGRESS", None),
+            "joblog._RECENT": getattr(joblog, "_RECENT", None),
+            "joblog._LIVE": getattr(joblog, "_LIVE", None),
+            "jobs.RUNNING": getattr(jobs, "RUNNING", None),
+            "jobs.RECENT": getattr(jobs, "RECENT", None),
+            "gate._PLEX_DISK_CACHE": getattr(gate, "_PLEX_DISK_CACHE", None),
+            "db._KV": getattr(__import__("app.db", fromlist=["_KV"]), "_KV", None),
+        }
+        caches = {}
+        for name, obj in cand.items():
+            if obj is None:
+                continue
+            try:
+                caches[name] = {
+                    "items": len(obj) if hasattr(obj, "__len__") else 1,
+                    "mb": round(_deep(obj) / 1024 / 1024, 2),
+                }
+            except Exception as e:
+                caches[name] = {"error": str(e)}
+
+        p = psutil.Process()
+        mi = p.memory_info()
+        return {
+            "process": {
+                "rss_mb": round(mi.rss / 1024 / 1024, 1),
+                "private_mb": round(getattr(mi, "vms", 0) / 1024 / 1024, 1),
+                "peak_rss_mb": round(getattr(mi, "peak_wset", 0) / 1024 / 1024, 1),
+                "threads": p.num_threads(),
+            },
+            "python": {
+                "gc_tracked_objects": len(objs),
+                "gc_tracked_mb": round(tracked_mb, 1),
+                "note": "tracked containers only - str/bytes are invisible here",
+            },
+            "caches_mb": dict(sorted(caches.items(),
+                                     key=lambda kv: -(kv[1].get("mb") or 0))),
+            "top_types": [
+                {"type": t, "count": v[0], "mb": round(v[1] / 1024 / 1024, 2)}
+                for t, v in sorted(by_type.items(), key=lambda kv: -kv[1][1])[:top]
+            ],
+        }
+
+    return await asyncio.to_thread(_work)
+
+
+@app.get("/api/diag/refs")
+async def api_diag_refs(type_name: str = "WindowsPath", sample: int = 40):
+    r"""WHAT IS HOLDING THESE OBJECTS. The question a type count cannot answer.
+
+    /api/diag/heap said 160,116 WindowsPath objects were alive on a paused,
+    idle system with no workers - which is a leak, but a count alone does not
+    say whose. This walks gc.get_referrers() for a sample and reports the
+    holders by shape, which is what actually names the offending code.
+    """
+    import gc
+
+    def _work() -> dict:
+        gc.collect()
+        targets = [o for o in gc.get_objects()
+                   if type(o).__name__ == type_name]
+        total = len(targets)
+        holders: dict[str, int] = {}
+        examples: list[str] = []
+        for o in targets[:sample]:
+            for r in gc.get_referrers(o):
+                t = type(r).__name__
+                if t == "list":
+                    # A list of paths is the interesting case - who owns THAT?
+                    for rr in gc.get_referrers(r):
+                        tt = type(rr).__name__
+                        if tt == "dict":
+                            key = "dict -> list"
+                        elif tt in ("cell", "function", "frame"):
+                            key = f"{tt} -> list"
+                        else:
+                            key = f"{tt} -> list"
+                        holders[key] = holders.get(key, 0) + 1
+                        if len(examples) < 8 and tt == "frame":
+                            try:
+                                examples.append(
+                                    f"{rr.f_code.co_filename.split(chr(92))[-1]}"
+                                    f":{rr.f_lineno} {rr.f_code.co_name}")
+                            except Exception:
+                                pass
+                else:
+                    holders[t] = holders.get(t, 0) + 1
+                    if t == "frame" and len(examples) < 8:
+                        try:
+                            examples.append(
+                                f"{r.f_code.co_filename.split(chr(92))[-1]}"
+                                f":{r.f_lineno} {r.f_code.co_name}")
+                        except Exception:
+                            pass
+        # Sizes: the object header plus what it owns, which for a path is the
+        # segment list and several strings - none of which the header shows.
+        import sys
+        deep = 0
+        for o in targets[:2000]:
+            try:
+                deep += sys.getsizeof(o)
+                for a in ("_str", "_drv", "_root", "_tail", "_raw_paths"):
+                    v = getattr(o, a, None)
+                    if v is None:
+                        continue
+                    deep += sys.getsizeof(v)
+                    if isinstance(v, (list, tuple)):
+                        deep += sum(sys.getsizeof(x) for x in v)
+            except Exception:
+                pass
+        per = deep / max(1, min(2000, total))
+        return {"type": type_name, "alive": total,
+                "avg_bytes_each": round(per),
+                "projected_mb": round(per * total / 1024 / 1024, 1),
+                "holders": dict(sorted(holders.items(), key=lambda kv: -kv[1])),
+                "frames": examples}
+
+    return await asyncio.to_thread(_work)
+
+
+@app.get("/api/rules")
+def api_rules():
+    """The live transcode rules, generated from CONFIG - see rules.describe()."""
+    return rules.describe()
+
+
+@app.get("/api/diag/pool")
+async def api_diag_pool():
+    """Separate 'the query is slow' from 'nothing could get a thread to run it'.
+
+    Standalone, the queue SQL runs in 14 ms; through the app the same endpoint
+    took 2-10 s, and it did so even at limit=1 - which rules out the query.
+    This times the two halves independently: how long a NO-OP takes to acquire
+    a pool thread, versus how long a trivial DB read takes once it has one.
+    """
+    import anyio.to_thread
+    from starlette.concurrency import run_in_threadpool
+    lim = anyio.to_thread.current_default_thread_limiter()
+    st = lim.statistics()
+
+    t0 = time.perf_counter()
+    await run_in_threadpool(lambda: None)          # pure queueing delay
+    wait_ms = (time.perf_counter() - t0) * 1000
+
+    def _read():
+        a = time.perf_counter()
+        with cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM jobs WHERE state='queued'").fetchone()
+        return (time.perf_counter() - a) * 1000
+
+    t1 = time.perf_counter()
+    sql_ms = await run_in_threadpool(_read)
+    total_ms = (time.perf_counter() - t1) * 1000
+
+    # EVENT LOOP LAG. If a coroutine hogs the loop, every request waits for it
+    # regardless of how fast its own handler is - which is what a 2 ms handler
+    # inside a 464 ms request looks like. sleep(0) should return in
+    # microseconds; anything else is time the loop spent not yielding.
+    lag = []
+    for _ in range(20):
+        a = time.perf_counter()
+        await asyncio.sleep(0)
+        lag.append((time.perf_counter() - a) * 1000)
+    slow = []
+    for _ in range(30):
+        a = time.perf_counter()
+        await asyncio.sleep(0.01)
+        over = (time.perf_counter() - a) * 1000 - 10
+        if over > 1:
+            slow.append(round(over, 1))
+
+    return {"limiter": {"total_tokens": lim.total_tokens,
+                        "borrowed_tokens": st.borrowed_tokens,
+                        "tasks_waiting": st.tasks_waiting},
+            "noop_thread_wait_ms": round(wait_ms, 1),
+            "sql_ms": round(sql_ms, 1),
+            "sql_plus_wait_ms": round(total_ms, 1),
+            "loop_lag_max_ms": round(max(lag), 3),
+            "loop_oversleep_ms": {"count": len(slow), "worst": max(slow) if slow else 0,
+                                  "total": round(sum(slow), 1)},
+            "tasks": len(asyncio.all_tasks()),
+            "threads_alive": threading.active_count(),
+            # Call sites still doing SQLite on the loop thread, worst first.
+            # Self-reporting, so the remaining work is evidence not guesswork.
+            "db_on_loop": dict(sorted(db_on_loop.items(),
+                                      key=lambda kv: -kv[1])[:15]),
+            "db_on_loop_total": sum(db_on_loop.values())}
+
+
+@app.on_event("startup")
+async def _startup() -> None:
+    BOOT["started"] = time.time()
+    try:
+        import anyio.to_thread
+        anyio.to_thread.current_default_thread_limiter().total_tokens = DB_THREADS
+    except Exception as e:                       # never block boot over a tunable
+        joblog.log(f"could not set thread limit: {type(e).__name__}: {e}", "warn")
+    # BEFORE init_db(), and before anything opens a connection: a staged restore
+    # can only be swapped in while no reader holds the old file. See
+    # backup.apply_pending().
+    try:
+        applied = backup.apply_pending()
+        if applied and applied.get("ok"):
+            _boot("restore", "warn", f"database restored from {applied['from']}")
+    except Exception as e:
+        joblog.log(f"restore check failed: {type(e).__name__}: {e}", "warn")
+    init_db()
+    _boot("db")
+    await jobs.start()
+    _boot("queue")
+    _register_schedules()
+    # Register the webhooks with the arrs and keep checking. Without this the
+    # only thing pointing the arrs at nuarr was a button someone had to remember
+    # to press, and a stale registration fails silently - no events, no error.
+    asyncio.create_task(webhooks.watch())
+    asyncio.create_task(_scan_scheduler())
+    asyncio.create_task(_settle_loop())
+    renamequeue.init()
+    _boot("renames")
+    asyncio.create_task(renamequeue.watch())
+    commitqueue.init()
+    _boot("commits")
+    # Start the disk-load ticker up front. It costs one CIM query every few
+    # seconds on a daemon thread, and priming it here means the first UI poll
+    # reads a filled window instead of paying for a cold sample plus the
+    # volume-to-physical-disk mapping - measured at 4.3 s the first time.
+    try:
+        from . import diskload
+        diskload.start()
+    except Exception:
+        pass
+    asyncio.create_task(commitqueue.watch())
+    asyncio.create_task(system.sampler())
+    # Reports only - never installs on its own. See ffmpeg_update.watch().
+    asyncio.create_task(audiolang.watch())
+    asyncio.create_task(arrhealth.watch())
+    asyncio.create_task(ffmpeg_update.watch())
+    # Silent and request-free until a repo is configured - see updates.watch.
+    asyncio.create_task(updates.watch())
+    # Applies a STAGED build the moment the queue goes idle.
+    asyncio.create_task(ffmpeg_update.apply_when_idle())
+    asyncio.create_task(lifecycle.watch())
+    # Re-checks 'missing' files before a human is told about them.
+    asyncio.create_task(healer.watch())
+    # The mirror image: re-checks 'unmanaged' files, which are usually a stale
+    # link rather than a real orphan. Until now this only happened as a side
+    # effect of a full scan, three hours apart.
+    asyncio.create_task(adopter.watch())
+    # Scheduled backups. Checks every five minutes whether one is due rather
+    # than sleeping until the exact moment, so a restart cannot skip a run.
+    asyncio.create_task(backup.watch())
+    # Prunes old evidence and shrinks the WAL, which nothing did before: the
+    # WAL had reached 93.7 MB against a 4 MB checkpoint threshold.
+    asyncio.create_task(maintenance.watch())
+    # Guards arr-side decisions (profile splits, TRaSH anime formats) - both
+    # jobs are toggle-gated and default off, so this idles unless enabled.
+    from . import arrguard
+    asyncio.create_task(arrguard.watch())
+    # CLOSES THE LOOP. Every rule here is a claim that Plex will play the file
+    # without working for it; nothing checked the claim, which is how the EAE
+    # bug survived for months. This watches what Plex actually decided.
+    from . import playback
+    asyncio.create_task(playback.watch())
+    # And this checks the library against its own rules on a timer, because a
+    # check that only runs when somebody remembers is not a guarantee.
+    from . import audit
+    asyncio.create_task(audit.watch())
+    # ...and this flips 'queued to fix' rows to 'fixed' as their jobs land,
+    # instead of leaving the panel a day behind the queue it launched.
+    asyncio.create_task(audit.reverify_watch())
+    # Copies originalLanguage (TMDB via Radarr, TheTVDB via Sonarr) onto our
+    # rows. Nothing in a file says which of its audio tracks is the original.
+    from . import origlang
+    asyncio.create_task(origlang.watch())
+    # What TheTVDB and TMDB say each title IS - anime, animation or live
+    # action - so the audio policy stops depending on which folder somebody
+    # filed it in. Same cadence as origlang; the two answer the same kind of
+    # question about the same titles.
+    from . import contentkind
+    contentkind.init()
+    asyncio.create_task(contentkind.watch())
+    # Lowers encoder disk priority while anyone is watching, so a direct play
+    # on a spindle the queue is also using does not have to compete for it.
+    asyncio.create_task(jobs.io_priority_watch())
+    # Keeps the queue topped up from the eligible backlog, oldest first. Does
+    # nothing at all unless it has been switched on.
+    asyncio.create_task(autoqueue.watch())
+    _boot("workers")
+    # The slow ones run concurrently and report when they land.
+    asyncio.create_task(_boot_recover())
+    asyncio.create_task(_boot_arrs())
+    # Prove the GPU encoder actually opens, rather than assuming it does
+    # because the binary exists. See ffmpeg_update.nvenc_check().
+    asyncio.create_task(_boot_nvenc())
+
+
+@app.get("/api/autoqueue")
+def api_autoqueue():
+    """Auto-queue state and how far through the library it has got."""
+    return autoqueue.progress()
+
+
+@app.post("/api/autoqueue/toggle")
+def api_autoqueue_toggle(on: bool):
+    autoqueue.set_enabled(on)
+    return autoqueue.progress()
+
+
+@app.post("/api/autoqueue/target")
+def api_autoqueue_target(n: int):
+    """How many jobs to keep queued."""
+    return {"target": autoqueue.set_target(n)}
+
+
+@app.post("/api/autoqueue/run")
+async def api_autoqueue_run():
+    """Top up once, now, regardless of the timer."""
+    return {"added": await autoqueue.top_up()}
+
+
+@app.post("/api/autoqueue/prune")
+def api_autoqueue_prune():
+    """Drop queued jobs whose own plan already says there is nothing to do."""
+    return {"resolved": autoqueue.prune_noop()}
+
+
+@app.post("/api/queue/clear")
+def api_queue_clear(source: str = "auto"):
+    """Clear QUEUED jobs of one origin: auto | manual | requeue | all.
+
+    Per-origin because they mean different things. Auto-queued work is
+    replaceable - it will simply be re-added - while a file you queued by hand
+    or deliberately requeued is a decision, and one Stop button that discarded
+    all three equally made clearing the automatic backlog cost you those too.
+    Running jobs are never affected.
+    """
+    if source not in ("auto", "manual", "requeue", "all"):
+        raise HTTPException(400, "source must be auto, manual, requeue or all")
+    n = autoqueue.clear(source)
+    if n:
+        joblog.log(f"cleared {n} queued job(s) [{source}]", "warn")
+    return {"cleared": n, "source": source}
+
+
+def _register_schedules() -> None:
+    """Declare every recurring loop, once, where the loops are started.
+
+    Deliberately here and not scattered across the modules: this list IS the
+    answer to "what runs on this box", and it is only trustworthy if adding a
+    watcher and declaring it are the same edit, in the same place, three lines
+    apart. Intervals are read from each module's own constant rather than
+    retyped, so a cadence change cannot leave this page lying.
+    """
+    from . import (schedules, adopter, healer, maintenance, lifecycle,
+                   commitqueue, renamequeue, autoqueue, backup, audit,
+                   playback, origlang, ffmpeg_update, webhooks, arrguard,
+                   contentkind)
+
+    def poll(mod, default):
+        return float(getattr(mod, "POLL_S", default) or default)
+
+    R = schedules.register
+    R("autoqueue", "Auto-queue top-up", "Queue", poll(autoqueue, 45),
+      "Refills the queue from the eligible backlog, disk-balanced.",
+      toggle="autoqueue.enabled")
+    R("commitqueue", "File replace queue", "Queue", poll(commitqueue, 20),
+      "Puts finished encodes back into the library when the disk is quiet.")
+    R("renamequeue", "Rename retry queue", "Queue", poll(renamequeue, 45),
+      "Retries renames the arrs could not complete.")
+    R("lifecycle", "Restart / shutdown watcher", "Queue",
+      poll(lifecycle, 3), "Carries out a pending stop once the queue is idle.")
+
+    R("scan", "Library scan", "Library", _scan_interval_s(),
+      "Walks the pool and reconciles it against the arrs.")
+    R("adopter", "Unmanaged re-check", "Library", poll(adopter, 150),
+      "Re-checks files the arrs do not know about, and clears leftovers.")
+    R("healer", "Missing re-check", "Library", poll(healer, 60),
+      "Re-checks files that went missing before reporting them.")
+    R("origlang", "Original language sync", "Library",
+      poll(origlang, 300), "Copies originalLanguage from TMDB/TheTVDB.")
+    R("contentkind", "Content kind sync", "Library", 12 * 3600,
+      "Reads genres from the arrs to tell anime, animation and live action "
+      "apart, instead of trusting the folder name.")
+    R("audit", "Rule check", "Library", poll(audit, 600),
+      "Audits the library against the current rules.")
+
+    R("webhooks", "Webhook registration", "Arrs",
+      float(getattr(webhooks, "WATCH_INTERVAL_S", 900)),
+      "Keeps nuarr registered with Sonarr and Radarr.")
+    R("arrguard", "Arr guards", "Arrs", poll(arrguard, 6 * 3600),
+      "Profile split, English-audio scores and TRaSH anime formats.")
+
+    R("playback", "Plex playback poll", "Plex", poll(playback, 90),
+      "Records what Plex had to transcode, and why.")
+
+    R("backup", "Backup", "System", 300.0,
+      "Checks whether a scheduled database backup is due.")
+    R("maintenance", "Housekeeping", "System", poll(maintenance, 300),
+      "Prunes old evidence and checkpoints the write-ahead log.")
+    R("ffmpeg", "ffmpeg update check", "System",
+      poll(ffmpeg_update, 3600), "Reports new ffmpeg builds. Never installs.")
+
+
+def _scan_interval_s() -> float:
+    try:
+        from . import workers
+        return max(60.0, float(workers.get().scan_every_min) * 60.0)
+    except Exception:
+        return 10800.0
+
+
+def _config_path():
+    from pathlib import Path
+    from .config import ROOT
+    return Path(ROOT) / "config.yml"
+
+
+def _write_libraries(libs: list[dict]) -> None:
+    r"""Persist the library list to config.yml and apply it live.
+
+    Reads the file, replaces ONLY the libraries key and writes it back, so
+    every other setting in there survives - config.yml is hand-edited and
+    losing an unrelated key to a UI action would be unforgivable.
+
+    Then mutates SETTINGS.libraries IN PLACE rather than rebuilding Settings:
+    a dozen modules did `from .config import SETTINGS` at import time and hold
+    a reference to that one object, so rebinding the name would leave every one
+    of them reading the old list until the next restart.
+    """
+    import yaml
+    from .config import SETTINGS, LibraryConfig
+
+    p = _config_path()
+    raw = {}
+    if p.exists():
+        try:
+            raw = yaml.safe_load(p.read_text(encoding="utf-8-sig")) or {}
+        except Exception:
+            raw = {}
+    raw["libraries"] = libs
+    # utf-8 with no BOM: load_settings() reads utf-8-sig so it tolerates one,
+    # but anything else reading this file may not.
+    p.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True),
+                 encoding="utf-8")
+    SETTINGS.libraries[:] = [LibraryConfig(**l) for l in libs]
+
+
+@app.get("/api/cache/config")
+def api_cache_config():
+    r"""Where the working cache is, and whether that place is usable.
+
+    The cache is where every encode is written before it replaces the original,
+    so it needs to be fast, local and large - and it must NOT be on the pool.
+    Writing the output to the same spindles being read from turns one sequential
+    read into a read plus a write on the same disk, which is the single easiest
+    way to make Plex stutter while nuarr works.
+    """
+    from . import fileops
+    d = SETTINGS.cache_dir
+    info = {"path": d, "min_free_gb": SETTINGS.cache_min_free_gb,
+            "exists": os.path.isdir(d), "free_gb": None, "total_gb": None,
+            "on_pool": False, "writable": False, "note": ""}
+    try:
+        info["free_gb"] = round(fileops.free_space_gb(d), 1)
+    except Exception:                                    # noqa: BLE001
+        pass
+    try:
+        import shutil
+        info["total_gb"] = round(shutil.disk_usage(d).total / (1024 ** 3), 1)
+    except Exception:                                    # noqa: BLE001
+        pass
+    # Is it sitting on a library root? That is the mistake worth naming.
+    try:
+        nd = os.path.normcase(os.path.abspath(d))
+        for lib in SETTINGS.libraries:
+            lp = os.path.normcase(os.path.abspath(lib.path))
+            if nd.startswith(os.path.splitdrive(lp)[0] + os.sep):
+                info["on_pool"] = True
+                info["note"] = (f"This is on the same volume as {lib.name}. "
+                                f"Every encode would read and write the same "
+                                f"disks at once.")
+                break
+    except Exception:                                    # noqa: BLE001
+        pass
+    if info["exists"]:
+        try:
+            probe = os.path.join(d, ".nuarr-write-test")
+            with open(probe, "w") as fh:
+                fh.write("x")
+            os.remove(probe)
+            info["writable"] = True
+        except Exception as e:                           # noqa: BLE001
+            info["note"] = info["note"] or f"Not writable: {str(e)[:80]}"
+    return info
+
+
+@app.post("/api/cache/config")
+async def api_cache_config_save(body: dict = Body(...)):
+    r"""Move the cache, or change how much head-room it insists on.
+
+    Checked BEFORE it is saved, because a bad cache path does not fail loudly -
+    it fails at the moment a 40 GB encode tries to land, hours later, with the
+    job already done and nowhere to put the result.
+
+    Existing files are NOT moved. Anything mid-flight is finishing against the
+    old directory and would be orphaned by a move; the commit queue drains into
+    the old path and the next job starts using the new one.
+    """
+    import yaml
+
+    path = str(body.get("path") or "").strip().strip('"')
+    min_free = body.get("min_free_gb", SETTINGS.cache_min_free_gb)
+    try:
+        min_free = max(1, int(min_free))
+    except Exception:                                    # noqa: BLE001
+        return {"ok": False, "error": "head-room must be a whole number of GB"}
+    if not path:
+        return {"ok": False, "error": "give a folder path"}
+
+    def _check():
+        try:
+            os.makedirs(path, exist_ok=True)
+        except Exception as e:                           # noqa: BLE001
+            return f"cannot create that folder: {str(e)[:120]}"
+        try:
+            probe = os.path.join(path, ".nuarr-write-test")
+            with open(probe, "w") as fh:
+                fh.write("x")
+            os.remove(probe)
+        except Exception as e:                           # noqa: BLE001
+            return f"folder is not writable: {str(e)[:120]}"
+        return ""
+    err = await asyncio.to_thread(_check)
+    if err:
+        return {"ok": False, "error": err}
+
+    p = _config_path()
+    raw = {}
+    if p.exists():
+        try:
+            raw = yaml.safe_load(p.read_text(encoding="utf-8-sig")) or {}
+        except Exception:                                # noqa: BLE001
+            raw = {}
+    raw["cache_dir"] = path
+    raw["cache_min_free_gb"] = min_free
+    p.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True),
+                 encoding="utf-8")
+    # Mutate in place: modules captured SETTINGS at import and rebinding the
+    # name here would leave them all on the old path until a restart.
+    old = SETTINGS.cache_dir
+    SETTINGS.cache_dir = path
+    SETTINGS.cache_min_free_gb = min_free
+    joblog.log(f"cache directory set to {path} (was {old}), "
+               f"keeping {min_free} GB free", "ok")
+    return {"ok": True, **api_cache_config(), "moved_from": old}
+
+
+def _write_arrs(arrs: list[dict]) -> None:
+    r"""Persist the Sonarr/Radarr connections to config.yml and apply them live.
+
+    Same shape as _write_libraries() and for the same reasons: replace only the
+    `arrs` key so a hand-edited config.yml keeps everything else, and mutate
+    SETTINGS.arrs IN PLACE because a dozen modules hold a reference to that one
+    list and rebinding the name would leave them all on the old value until a
+    restart.
+
+    The cached API clients are dropped too. arr.shared_client() keys its cache
+    on (name, api, api_key), so a changed URL already produces a new client and
+    nothing would break without this - but the old one holds an open httpx
+    connection to an address nuarr is no longer using, and leaking one per edit
+    is the kind of thing that is invisible until it is not.
+    """
+    import yaml
+    from .config import SETTINGS, ArrConfig
+
+    p = _config_path()
+    raw = {}
+    if p.exists():
+        try:
+            raw = yaml.safe_load(p.read_text(encoding="utf-8-sig")) or {}
+        except Exception:
+            raw = {}
+    raw["arrs"] = arrs
+    p.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True),
+                 encoding="utf-8")
+    SETTINGS.arrs[:] = [ArrConfig(**a) for a in arrs]
+    try:
+        from . import arr
+        for c in list(getattr(arr, "_SHARED", {}).values()):
+            try:
+                c._client.close()
+            except Exception:
+                pass
+        getattr(arr, "_SHARED", {}).clear()
+    except Exception:
+        pass
+
+
+def _numish(*vals) -> float:
+    """First value that reads as a number. Tautulli sends these as strings."""
+    for v in vals:
+        if v in (None, ""):
+            continue
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            continue
+    return 0.0
+
+
+@app.get("/api/plex/sessions")
+def api_plex_sessions():
+    """Who is watching what, for the Job gate panel."""
+    out = []
+    # COMPUTED HERE, not read back from the gate's own pass. The gate refreshes
+    # on its own cadence, so a floor stashed during that pass describes a
+    # different instant from the session the card is about to draw - and for a
+    # session the gate had not seen yet, no floor at all. Same function, same
+    # snapshot, so the number on the card is the number that governs it.
+    try:
+        _base = float(workers.get().viewer_pause_lead_s)
+    except Exception:                                    # noqa: BLE001
+        _base = 0.0
+    for s in gate.panel_sessions():
+        show, title = s.get("show") or "", s.get("title") or ""
+        sn, ep = s.get("season"), s.get("episode")
+        label = (f"{show} · S{int(sn):02d}E{int(ep):02d}"
+                 if show and sn is not None and ep is not None
+                 else (show or title))
+        out.append({
+            "label": label or "(unknown)",
+            "sub": title if (show and title and label != title) else
+                   (str(s.get("year")) if s.get("year") else ""),
+            "user": s.get("user") or s.get("friendly_name") or "",
+            "player": s.get("player") or "",
+            "product": s.get("product") or "",
+            "key": s.get("session_key") or "",
+            "decision": s.get("transcode_decision") or "",
+            "state": s.get("state") or "playing",
+            "progress": s.get("progress_percent") or 0,
+            # Position and length in ms. The browser runs its own clock from
+            # these between polls, so the bar glides instead of stepping.
+            # Tautulli spells them differently, hence the fallbacks.
+            "duration_ms": int(_numish(s.get("duration_ms"), s.get("duration"))),
+            "offset_ms": int(_numish(s.get("offset_ms"), s.get("view_offset"))),
+            # Encoder health, for transcodes only. lead_s is how many seconds of
+            # encoded video are ready ahead of the viewer; a shrinking lead is
+            # a stutter that has not happened yet.
+            "lead_s": s.get("lead_s"),
+            # 1 when lead_s is the client-buffer ESTIMATE (integrated from
+            # /statistics/bandwidth) rather than the encoder's reported lead
+            "lead_est": 1 if s.get("lead_est") else 0,
+            # How much the estimate is worth: anchored at a known-empty moment
+            # (fresh playback or a seek) vs a mid-stream join that can only
+            # ever be a floor; whether the client has stopped fetching (buffer
+            # full); and whether the number came from a capacity learned on an
+            # earlier, properly anchored session with the same client.
+            "lead_anchored": 1 if s.get("lead_anchored") else 0,
+            "lead_floor": 1 if s.get("lead_floor") else 0,
+            # proven from the playback side: the client played this long
+            # without fetching, so the buffer demonstrably held it
+            "lead_proven": 1 if s.get("lead_proven") else 0,
+            # measured from the server's own file position for this stream -
+            # the strongest source there is for a direct play
+            "lead_disk": 1 if s.get("lead_disk") else 0,
+            "lead_full": 1 if s.get("lead_full") else 0,
+            "lead_learned": 1 if s.get("lead_learned") else 0,
+            "speed": s.get("speed"),
+            "throttled": 1 if str(s.get("throttled") or "0") in ("1", "True", "true") else 0,
+            "disk": s.get("disk") or "",
+            "location": s.get("location") or "",
+            "bandwidth": s.get("bandwidth"),
+            "video": (s.get("video") or "").strip(" ->"),
+            "audio": (s.get("audio") or "").strip(" ->"),
+            "thumb": s.get("thumb") or "",
+            "file": s.get("file") or "",
+            # stream-by-stream specifics for the expanded card; empty when the
+            # rows came from Tautulli, which does not carry them
+            "detail": s.get("detail") or {},
+            # Seconds of buffer THIS stream needs before nuarr will keep off
+            # its spindle. 0 means it is buffered to the end of the file and
+            # will not read again, so it is never worth holding work for.
+            "floor_s": gate.session_floor(s, _base),
+            # the working behind that number, so the card can justify it
+            "floor_why": gate.floor_reason(s, _base),
+        })
+    return {"sessions": out}
+
+
+@app.get("/api/plex/art")
+def api_plex_art(key: str):
+    r"""Proxy one piece of Plex artwork.
+
+    Proxied rather than linked directly because a direct <img src> would have
+    to carry X-Plex-Token in the URL - putting a credential into the DOM, the
+    browser history and any screenshot of the dashboard. This way the token
+    stays on the server and the browser only ever sees a nuarr path.
+
+    The key is checked against the shape Plex uses for artwork so this cannot
+    be turned into a general-purpose proxy for the Plex API.
+    """
+    if not re.match(r"^/library/[\w/\-.]+$", key or ""):
+        raise HTTPException(400, "not an artwork path")
+    url, token = SETTINGS.plex_url, SETTINGS.plex_token
+    if not (url and token):
+        raise HTTPException(404, "Plex is not configured")
+    # Plex's own photo transcoder, so a 1 MB poster arrives as a few KB. It is
+    # rendered at 52x78; fetching the full-size art per session per refresh was
+    # a megabyte a time for pixels nobody sees.
+    scaled = ("/photo/:/transcode?width=160&height=240&minSize=1&upscale=0"
+              f"&url={quote(key, safe='')}")
+    try:
+        r = httpx.get(f"{url.rstrip('/')}{scaled}",
+                      headers={"X-Plex-Token": token}, timeout=10)
+        if r.status_code >= 400:      # older servers, or art it cannot scale
+            r = httpx.get(f"{url.rstrip('/')}{key}",
+                          headers={"X-Plex-Token": token}, timeout=10)
+        r.raise_for_status()
+    except Exception:
+        raise HTTPException(502, "Plex did not return that image")
+    return Response(r.content,
+                    media_type=r.headers.get("content-type", "image/jpeg"),
+                    headers={"Cache-Control": "public, max-age=3600"})
+
+
+@app.get("/api/queue/blockers")
+async def api_queue_blockers():
+    r"""Why is the queue not moving? Answered per file, not in general.
+
+    The panel said "a worker and their spindles are free" from a static string
+    while the one queued file sat on a spindle a viewer was streaming from -
+    which is a hard exclusion in the claim query, not a preference. The header
+    was describing the pool; the reader wanted to know about the FILE.
+
+    Everything here is derived from the same functions the dispatcher uses, so
+    the explanation cannot drift from the behaviour it explains.
+    """
+    st = await gate.status()
+    watched = gate.plex_disks()
+    load = jobs.disk_load()
+    running = jobs.snapshot(recent_limit=0)
+    caps = {}
+    try:
+        from . import workers
+        w = workers.get()
+        caps = {"encode": w.encode_workers, "passthrough": w.passthrough_workers,
+                "subocr": w.subocr_workers}
+    except Exception:
+        pass
+    busy_pool = collections.Counter(
+        r.get("pool") for r in (running.get("running") or []))
+
+    rows = _rows(
+        "SELECT j.job_id, j.pool, j.title, j.priority, f.pool_disk AS disk "
+        "  FROM jobs j LEFT JOIN files f ON f.id=j.file_id "
+        " WHERE j.state='queued' ORDER BY j.priority DESC, j.id LIMIT 40")
+    live_ids = {r.get("job_id") for r in (running.get("running") or [])}
+    out = []
+    for r in rows:
+        pool, disk = r["pool"], r["disk"] or ""
+        held = [x for x in st.reasons if x.holds(pool)]
+        cap = caps.get(pool)
+        used = busy_pool.get(pool, 0)
+        # TWO LENGTHS OF THE SAME ANSWER.
+        #
+        # `why` is the full sentence: it explains the RULE, and it is what the
+        # section banner and the hover tooltip show. `short` is the part that
+        # differs from file to file, and it is what goes in the row.
+        #
+        # One string tried to be both and could be neither. At a hundred
+        # characters it was truncated in the cell - "...and this file lives
+        # there. Files..." - so the row was unreadable, while the identical
+        # sentence sat complete in the banner directly above it and again on
+        # every other row. The rule belongs in one place; the row needs to say
+        # which disk.
+        if held:
+            why = held[0].detail or held[0].name
+            cls = "held"
+            what = f"{held[0].label} is holding {pool} jobs — {why}"
+            short = f"held by {held[0].label}"
+        elif disk and disk in watched:
+            cls = "viewer"
+            what = (f"someone is watching from {disk}, and this file lives "
+                    f"there. Files on the other disks keep running.")
+            short = f"viewer on {disk}"
+        elif cap is not None and used >= cap:
+            cls = "full"
+            what = f"all {cap} {pool} workers are busy"
+            short = f"all {cap} {pool} workers busy"
+        elif disk and load.get(disk, 0) >= jobs.COPY_WEIGHT:
+            cls = "disk"
+            what = f"{disk} already has a copy running; waiting for it to clear"
+            short = f"{disk} busy — copy running"
+        else:
+            cls = "next"
+            what = "next in line — a worker and its spindle are free"
+            short = ""
+        out.append({"job_id": r["job_id"], "pool": pool, "title": r["title"],
+                    "disk": disk, "state": cls, "why": what, "short": short})
+    head = ""
+    if out:
+        first = out[0]
+        head = first["why"]
+    return {"rows": out, "headline": head,
+            "watched_disks": sorted(watched),
+            "pools": {p: {"used": busy_pool.get(p, 0), "cap": c}
+                      for p, c in caps.items()}}
+
+
+@app.get("/api/fs/folders")
+def api_fs_folders(path: str = ""):
+    r"""Folders only, for the library picker.
+
+    NOT "launch Explorer on the server". nuarr already learned that lesson once
+    and wrote it down on /api/browse: opening a native dialog only works if you
+    happen to be sitting at the machine, and from any other browser it silently
+    opens a window nobody can see. Worse here - nuarr runs as a scheduled task,
+    so the dialog would appear on a different desktop session, or nowhere.
+
+    So the picker browses through this instead: it works from the phone on the
+    sofa exactly as it does at the console.
+
+    Directories only. It never returns file names, never reads contents, and
+    the errors it can raise are "gone" and "not allowed" - so the worst it can
+    tell an unwanted visitor is which folders exist on a machine they already
+    have the port open to.
+    """
+    path = (path or "").strip()
+    if not path:
+        # Drive list. Only the ones that answer - an empty card reader or a
+        # disconnected network drive would otherwise sit there looking real
+        # and fail when clicked.
+        out = []
+        for letter in "CDEFGHIJKLMNOPQRSTUVWXYZ":
+            root = f"{letter}:\\"
+            if os.path.isdir(root):
+                try:
+                    total, used, free = shutil.disk_usage(root)
+                except OSError:
+                    total = free = 0
+                out.append({"name": root, "path": root, "free": free,
+                            "total": total})
+        return {"path": "", "parent": None, "folders": out}
+
+    path = os.path.normpath(path)
+    if not os.path.isdir(path):
+        raise HTTPException(404, f"{path} is not a folder")
+    try:
+        entries = []
+        with os.scandir(path) as it:
+            for e in it:
+                try:
+                    if not e.is_dir(follow_symlinks=False):
+                        continue
+                except OSError:
+                    continue
+                if e.name.startswith("$") or e.name.lower() == "system volume information":
+                    continue           # noise nobody is looking for a library in
+                entries.append({"name": e.name, "path": e.path,
+                                "free": 0, "total": 0})
+    except PermissionError:
+        raise HTTPException(403, "not allowed to read that folder")
+    except OSError as e:
+        raise HTTPException(400, f"could not read that folder: {e}")
+    entries.sort(key=lambda x: x["name"].lower())
+    parent = os.path.dirname(path.rstrip("\\/"))
+    if parent == path or len(path.rstrip("\\/")) <= 2:
+        parent = ""                    # at a drive root: up goes to the list
+    return {"path": path, "parent": parent, "folders": entries}
+
+
+@app.get("/api/libraries/config")
+def api_libraries_config():
+    """The configured libraries, with what nuarr actually knows about each."""
+    from .config import SETTINGS
+    counts = {r["library"]: r["n"] for r in _rows(
+        "SELECT library, COUNT(*) n FROM files WHERE state!='deleted' "
+        "GROUP BY library")}
+    sizes = {r["library"]: r["b"] for r in _rows(
+        "SELECT library, SUM(size) b FROM files WHERE state!='deleted' "
+        "GROUP BY library")}
+    # WHAT NUARR THINKS EACH LIBRARY CONTAINS, from the arrs' metadata rather
+    # than from the folder name. A library called "Animated Shows" holding 282
+    # files of anime is a fact worth surfacing here: it is the difference
+    # between dual audio and English-only, and until now nothing on any page
+    # said it.
+    kinds: dict[str, dict] = {}
+    try:
+        for r in _rows(
+                "SELECT f.library, k.kind, COUNT(*) n FROM files f "
+                "  JOIN parent_kind k ON k.arr_name=f.arr_name "
+                "   AND k.parent_id=f.arr_parent_id "
+                " WHERE f.state!='deleted' GROUP BY f.library, k.kind"):
+            kinds.setdefault(r["library"] or "", {})[r["kind"]] = r["n"]
+    except Exception:
+        kinds = {}
+    out = []
+    for l in SETTINGS.libraries:
+        # Does the folder exist ON THE POOL? A library pointing at a path that
+        # is not there scans clean and silently indexes nothing, which looks
+        # exactly like an empty library.
+        exists = os.path.isdir(l.path)
+        seen = kinds.get(l.name, {})
+        total = counts.get(l.name, 0)
+        # The kind the FOLDER implies, so the page can say when the two differ
+        # rather than making the reader work it out.
+        try:
+            from . import langpolicy as _lp
+            guess = _lp.kind_for(library=l.name)
+        except Exception:
+            guess = "live"
+        out.append({"name": l.name, "path": l.path, "kind": l.kind,
+                    "enabled": bool(l.enabled), "exists": exists,
+                    "files": total,
+                    "bytes": sizes.get(l.name, 0),
+                    "seen": seen,
+                    "seen_total": sum(seen.values()),
+                    "folder_kind": guess})
+    return {"libraries": out, "pool_root": getattr(SETTINGS, "pool_root", "P:\\")}
+
+
+@app.get("/api/arrs/config")
+def api_arrs_config():
+    """The configured connections, WITHOUT the keys.
+
+    An API key is a credential. It goes into the page as a masked placeholder
+    and comes back only if somebody types a new one - so a screenshot of the
+    settings page, or anyone looking over a shoulder, cannot walk away with
+    access to the library.
+    """
+    from .config import SETTINGS
+    out = []
+    for a in SETTINGS.arrs:
+        out.append({"name": a.name, "kind": a.kind, "url": a.url,
+                    "enabled": bool(a.enabled),
+                    "has_key": bool(a.api_key)})
+    # Both slots always offered, configured or not - this page is also where a
+    # first-time setup happens, and an empty list with no way to add anything
+    # is a dead end rather than a starting point.
+    for kind, port in (("sonarr", 8989), ("radarr", 7878)):
+        if not any(a["kind"] == kind for a in out):
+            out.append({"name": kind.capitalize(), "kind": kind,
+                        "url": "", "enabled": True, "has_key": False,
+                        "suggest": f"http://localhost:{port}"})
+    out.sort(key=lambda a: a["kind"])
+    return {"arrs": out}
+
+
+@app.post("/api/arrs/config/test")
+async def api_arrs_test(body: dict = Body(...)):
+    """Try the connection BEFORE storing it.
+
+    Saving first and finding out later means a wrong key sits in config.yml
+    looking correct while every scan quietly fails against it. This asks the
+    server who it is, which needs no write access and fails fast.
+    """
+    from .config import SETTINGS, ArrConfig
+    kind = str(body.get("kind") or "").lower()
+    url = str(body.get("url") or "").strip().rstrip("/")
+    key = str(body.get("api_key") or "").strip()
+    if kind not in ("sonarr", "radarr"):
+        raise HTTPException(400, "kind must be sonarr or radarr")
+    if not url:
+        raise HTTPException(400, "a server URL is required")
+    if not key:
+        # Testing an unchanged key is a normal thing to want, so fall back to
+        # the stored one rather than refusing.
+        key = next((a.api_key for a in SETTINGS.arrs
+                    if a.kind == kind and a.api_key), "") or ""
+    if not key:
+        raise HTTPException(400, "an API key is required")
+    cfg = ArrConfig(kind.capitalize(), kind, url, key)
+    try:
+        from .arr import ArrClient
+        c = ArrClient(cfg)
+        try:
+            st = await c._get("/system/status")
+        finally:
+            try:
+                c._client.close()
+            except Exception:
+                pass
+    except Exception as e:
+        return {"ok": False,
+                "error": f"{type(e).__name__}: {e}"[:200],
+                "hint": "check the URL, the port, and that the API key is the "
+                        "one from Settings → General on that server"}
+    name = (st or {}).get("instanceName") or (st or {}).get("appName") or kind
+    ver = (st or {}).get("version") or ""
+    # A Sonarr key against a Radarr URL answers happily - both are *arrs - and
+    # the only thing that catches it is what the server calls itself.
+    got = str((st or {}).get("appName") or "").lower()
+    if got and got != kind:
+        return {"ok": False,
+                "error": f"that server is {got.capitalize()}, not {kind.capitalize()}",
+                "hint": "the two use the same API shape, so the wrong URL "
+                        "answers without complaining - check the port"}
+    return {"ok": True, "name": name, "version": ver,
+            "note": f"reached {name}{' ' + ver if ver else ''}"}
+
+
+@app.post("/api/arrs/config")
+def api_arrs_save(body: dict = Body(...)):
+    """Store one connection. An empty key means 'leave the stored one alone'."""
+    from .config import SETTINGS
+    kind = str(body.get("kind") or "").lower()
+    if kind not in ("sonarr", "radarr"):
+        raise HTTPException(400, "kind must be sonarr or radarr")
+    url = str(body.get("url") or "").strip().rstrip("/")
+    key = str(body.get("api_key") or "").strip()
+    enabled = bool(body.get("enabled", True))
+    if not url:
+        raise HTTPException(400, "a server URL is required")
+    if "://" not in url:
+        url = "http://" + url          # a bare host:port is what people type
+    arrs = [{"name": a.name, "kind": a.kind, "url": a.url,
+             "api_key": a.api_key, "enabled": bool(a.enabled)}
+            for a in SETTINGS.arrs]
+    hit = next((a for a in arrs if a["kind"] == kind), None)
+    if hit:
+        hit["url"] = url
+        hit["enabled"] = enabled
+        # BLANK MEANS UNCHANGED, because the page never received the real key
+        # to send back. Treating an empty field as "clear it" would wipe a
+        # working connection every time somebody edited only the URL.
+        if key:
+            hit["api_key"] = key
+    else:
+        if not key:
+            raise HTTPException(400, "an API key is required for a new server")
+        arrs.append({"name": kind.capitalize(), "kind": kind, "url": url,
+                     "api_key": key, "enabled": enabled})
+    _write_arrs(arrs)
+    joblog.log(f"{kind} connection updated: {url}"
+               + ("" if enabled else " (disabled)"), "info")
+    return {"ok": True}
+
+
+@app.post("/api/libraries/config/add")
+def api_libraries_add(name: str, path: str, kind: str = "tv"):
+    from .config import SETTINGS
+    name, path = (name or "").strip(), (path or "").strip().rstrip("\\/")
+    if not name or not path:
+        raise HTTPException(400, "a name and a folder are both required")
+    if kind not in ("tv", "movie"):
+        raise HTTPException(400, "kind must be tv or movie")
+    if any(l.name.lower() == name.lower() for l in SETTINGS.libraries):
+        raise HTTPException(409, f"a library called {name!r} already exists")
+    if not os.path.isdir(path):
+        # Refused, not warned. A library pointing nowhere indexes nothing and
+        # looks identical to one that is simply empty.
+        raise HTTPException(400, f"{path} is not a folder that exists")
+    libs = [{"name": l.name, "path": l.path, "kind": l.kind,
+             "enabled": bool(l.enabled)} for l in SETTINGS.libraries]
+    libs.append({"name": name, "path": path, "kind": kind, "enabled": True})
+    _write_libraries(libs)
+    joblog.log(f"library added: {name} -> {path} ({kind})", "ok")
+    return {"ok": True, "name": name,
+            "note": "the next scan will index it; press Rescan to do it now"}
+
+
+@app.post("/api/libraries/config/toggle")
+def api_libraries_toggle(name: str, on: int = 1):
+    from .config import SETTINGS
+    libs = [{"name": l.name, "path": l.path, "kind": l.kind,
+             "enabled": (bool(on) if l.name == name else bool(l.enabled))}
+            for l in SETTINGS.libraries]
+    if not any(l["name"] == name for l in libs):
+        raise HTTPException(404, "no such library")
+    _write_libraries(libs)
+    joblog.log(f"library {name}: scanning turned {'on' if on else 'off'}", "info")
+    return {"ok": True}
+
+
+@app.post("/api/libraries/config/remove")
+def api_libraries_remove(name: str, purge: int = 0):
+    r"""Stop managing a library. Never touches a single file on disk.
+
+    `purge` decides what happens to the rows nuarr has already indexed, and it
+    matters more than it looks. Leave them and every file in that library is
+    about to be scanned-for, not found, and reported MISSING - thousands of
+    rows in a panel built to mean "something went wrong". Purge them and the
+    index simply forgets a folder it no longer manages.
+
+    Either way the media itself is untouched: this removes a folder from
+    nuarr's list, it does not delete anything.
+    """
+    from .config import SETTINGS
+    if not any(l.name == name for l in SETTINGS.libraries):
+        raise HTTPException(404, "no such library")
+    libs = [{"name": l.name, "path": l.path, "kind": l.kind,
+             "enabled": bool(l.enabled)}
+            for l in SETTINGS.libraries if l.name != name]
+    _write_libraries(libs)
+    removed = 0
+    if purge:
+        with cursor() as cur:
+            cur.execute("DELETE FROM files WHERE library=?", (name,))
+            removed = cur.rowcount
+    joblog.log(f"library removed: {name}"
+               + (f"; {removed:,} indexed row(s) dropped" if purge
+                  else "; its rows were kept and will show as missing"),
+               "warn")
+    return {"ok": True, "purged": removed}
+
+
+@app.get("/api/langpolicy")
+def api_langpolicy():
+    from . import langpolicy
+    libs = langpolicy.libraries()
+    return {"policy": langpolicy.load(),
+            # One entry per library nuarr is configured for, in configured
+            # order. The page draws from THIS, so a library added or removed
+            # later needs no code change and no migration.
+            "libraries": [{"name": n,
+                           "kind": langpolicy.kind_for(library=n),
+                           "kind_label": langpolicy.KIND_LABELS[
+                               langpolicy.kind_for(library=n)]}
+                          for n in libs],
+            "iso": langpolicy.iso_languages(),
+            "present": langpolicy.library_languages()}
+
+
+@app.get("/api/codecpolicy")
+def api_codecpolicy():
+    """Schema, current values and defaults, in one call.
+
+    The page is GENERATED from this - the field list, the ranges, the
+    explanations and the reset targets all come from codecpolicy.FIELDS. A
+    setting added there appears here and on the page with no further work, and
+    the two cannot describe different things.
+    """
+    from . import codecpolicy
+    return codecpolicy.describe()
+
+
+def _codecpolicy_impact(before: dict, after: dict) -> dict:
+    """What changing these settings would do to the library.
+
+    TWO KINDS OF CONSEQUENCE, AND THEY ARE NOT THE SAME THING.
+
+    A language change has one: different tracks survive, so a file either needs
+    reprocessing or it does not. Codec settings have two, and collapsing them
+    into one number would be misleading in both directions.
+
+      NEEDS WORK     the plan itself changes - a file that was correct now is
+                     not, or the other way round. Raising the channel ceiling
+                     makes 7.1 files correct; lowering it makes them wrong.
+                     These are the files a requeue would act on.
+
+      ENCODES DIFFER the plan is the same, but the encoder settings behind it
+                     are not. Lowering CQ does not make a single file "wrong" -
+                     every file already correct stays correct. It changes what
+                     the NEXT encode of that file looks like. Nothing to
+                     requeue; it applies to work that happens anyway.
+
+    Reporting a CQ change as "affects 39,000 files" would be false, and the
+    Queue button beside it would rewrite a library over a setting that never
+    required it.
+
+    Measured against the stored probes for the whole library, not a sample -
+    the language preview learned that lesson already: LIMIT 4000 returned rows
+    in rowid order and never reached a single anime file.
+    """
+    import json as _j
+    from . import codecpolicy
+    ids: list[int] = []
+    listed: list[dict] = []
+    enc_listed: list[dict] = []
+    checked = 0
+    enc_diff = 0
+    by_lib: dict[str, int] = {}
+
+    # Only libraries whose settings actually differ are worth deciding twice.
+    # Six libraries times 39,000 probes is a minute of work to answer a
+    # question about one of them.
+    touched = {name for name in after
+               if _j.dumps(after.get(name), sort_keys=True)
+               != _j.dumps(before.get(name), sort_keys=True)}
+    if not touched:
+        return {"checked": 0, "affected": 0, "ids": [], "files": [],
+                "encode_diff": 0, "encodes": [], "libraries": [],
+                "unchanged": True}
+
+    with cursor() as cur:
+        qs = ",".join("?" * len(touched))
+        rows = cur.execute(
+            "SELECT f.id,f.path,f.title,f.season,f.episode,f.library,f.size,"
+            "       p.lang,fp.json "
+            "  FROM files f JOIN file_probes fp ON fp.file_id=f.id "
+            "  LEFT JOIN parent_lang p ON p.parent_id=f.arr_parent_id "
+            "       AND p.arr_name=f.arr_name "
+            f" WHERE f.state='done' AND f.library IN ({qs})",
+            tuple(touched)).fetchall()
+
+    def _decide_with(pol: dict, info: dict, kw: dict):
+        # for_library() reads a module-level cache, so the only honest way to
+        # decide under a policy that is not stored is to put it there for the
+        # duration. Single-threaded here by construction: this runs in one
+        # worker thread off the event loop.
+        codecpolicy._CACHE.update(at=time.time() + 3600, pol=pol)
+        try:
+            return rules.decide(info, **kw)
+        finally:
+            codecpolicy.invalidate()
+
+    for r in rows:
+        try:
+            info = _j.loads(r["json"])
+        except Exception:
+            continue
+        checked += 1
+        kw = dict(filename=r["path"] or "", size_bytes=r["size"] or 0,
+                  orig_lang=r["lang"] or "", library=r["library"] or "",
+                  anime=rules.is_anime(r["path"] or ""))
+        try:
+            a = _decide_with(before, info, kw)
+            b = _decide_with(after, info, kw)
+        except Exception:
+            continue
+        label = (display_label(r["title"], r["season"], r["episode"])
+                 or os.path.basename(r["path"] or ""))
+        same_plan = (a.needed == b.needed
+                     and _j.dumps(a.audio_ops, sort_keys=True)
+                     == _j.dumps(b.audio_ops, sort_keys=True)
+                     and a.encode == b.encode and a.target == b.target
+                     and a.strip_dv == b.strip_dv)
+        if not same_plan:
+            ids.append(r["id"])
+            by_lib[r["library"] or ""] = by_lib.get(r["library"] or "", 0) + 1
+            if len(listed) < 400:
+                if not a.needed and b.needed:
+                    what = "would now need work — " + "; ".join(
+                        x.what for x in b.actions[:2])
+                elif a.needed and not b.needed:
+                    what = "would become correct as it is"
+                else:
+                    what = "; ".join(x.what for x in b.actions[:2]) \
+                           or "different plan"
+                listed.append({"id": r["id"], "label": label,
+                               "library": r["library"] or "", "change": what})
+            continue
+        # Same plan, different encoder settings. Only meaningful where an
+        # encode actually happens - a stream copy has no CQ.
+        if b.encode and _j.dumps(a.venc, sort_keys=True) \
+                != _j.dumps(b.venc, sort_keys=True):
+            enc_diff += 1
+            if len(enc_listed) < 60:
+                bits = [f"{k} {a.venc.get(k)} → {b.venc.get(k)}"
+                        for k in ("cq", "preset", "maxrate_factor")
+                        if a.venc.get(k) != b.venc.get(k)]
+                enc_listed.append({"label": label,
+                                   "library": r["library"] or "",
+                                   "change": ", ".join(bits)})
+    return {"checked": checked, "affected": len(ids), "ids": ids[:5000],
+            "files": listed, "encode_diff": enc_diff, "encodes": enc_listed,
+            "libraries": sorted(by_lib.items(), key=lambda x: -x[1]),
+            "unchanged": False}
+
+
+_CODEC_LAST_IMPACT: dict = {"ids": [], "at": 0.0}
+
+
+@app.post("/api/codecpolicy/test")
+async def api_codecpolicy_test(body: dict = Body(...)):
+    r"""Run these settings for real, before anyone saves them.
+
+    Encodes a few seconds of generated video with EXACTLY the flags a job
+    would use - same encoder, same preset, same quality number, same pixel
+    format. A settings page that accepts a combination ffmpeg will reject is
+    a trap: the failure would otherwise surface hours later as a dead job on
+    a real file.
+
+    Takes the pending, unsaved values, so it tests what is on screen rather
+    than what is stored.
+    """
+    from . import encoders as _enc
+
+    fam = str((body or {}).get("family") or "auto")
+    cq = int((body or {}).get("cq") or 22)
+    preset = str((body or {}).get("preset") or "")
+    ten = bool((body or {}).get("ten_bit", True))
+    codec = "hevc" if str((body or {}).get("target") or "h265") == "h265" else "h264"
+    if codec == "h264":
+        ten = False                       # no h264 path here encodes 10-bit
+
+    def _work():
+        used, why = _enc.resolve(fam)
+        spec = _enc.FAMILIES[used]
+        pre = preset if preset in spec["presets"] else spec["default_preset"]
+        swapped = "" if pre == preset else (
+            f"preset '{preset}' belongs to another encoder; "
+            f"tested with {used}'s '{pre}'")
+        out = os.path.join(tempfile.gettempdir(), f"nuarr_cptest_{used}.mkv")
+        cmd = [_enc._ff(), "-hide_banner", "-loglevel", "error", "-y"]
+        cmd += _enc.decode_args(used, True)
+        cmd += ["-f", "lavfi", "-i",
+                "testsrc2=size=1280x720:rate=24:duration=3"]
+        cmd += _enc.video_args(used, codec, cq, pre, ten)
+        cmd += ["-t", "3", out]
+        t0 = time.time()
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=90, creationflags=NO_WINDOW)
+            took = time.time() - t0
+            ok = p.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 1024
+            size = os.path.getsize(out) if os.path.exists(out) else 0
+            tail = [ln for ln in (p.stderr or "").strip().splitlines() if ln.strip()]
+            return {
+                "ok": ok,
+                "family": used, "encoder": _enc.encoder_for(used, codec),
+                "preset": pre, "cq": cq, "ten_bit": ten,
+                "why": why, "swapped": swapped,
+                "seconds": round(took, 2),
+                "kb": round(size / 1024),
+                # 3 seconds of source at 24 fps = 72 frames
+                "fps": round(72 / took, 1) if took > 0 else 0,
+                "detail": "" if ok else (tail[-1][:200] if tail else "no output produced"),
+                "cmd": " ".join(cmd[cmd.index("-c:v"):]) if "-c:v" in cmd else "",
+            }
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "family": used, "detail": "timed out after 90s"}
+        except Exception as e:                           # noqa: BLE001
+            return {"ok": False, "family": used, "detail": f"{type(e).__name__}: {e}"}
+        finally:
+            try:
+                os.remove(out)
+            except OSError:
+                pass
+
+    return await asyncio.to_thread(_work)
+
+
+@app.post("/api/codecpolicy/preview")
+async def api_codecpolicy_preview(body: dict = Body(...)):
+    """What these settings WOULD change. Stores nothing.
+
+    Same order as the language page, for the same reason: look, then decide,
+    then act. Saving first and reporting afterwards means the planner has
+    already adopted settings nobody agreed to, and everything the queue picks
+    up in between uses them.
+    """
+    from . import codecpolicy
+    before = codecpolicy.load()
+    proposed = codecpolicy.normalise(body or {}, base=before)
+    impact = await asyncio.to_thread(_codecpolicy_impact, before, proposed)
+    return {"policy": proposed, **impact}
+
+
+@app.post("/api/codecpolicy")
+async def api_codecpolicy_save(body: dict = Body(...)):
+    from . import codecpolicy
+    before = codecpolicy.load()
+    pol = codecpolicy.save(body or {})
+    codecpolicy.invalidate()
+    changed = [n for n in pol
+               if json.dumps(pol.get(n), sort_keys=True)
+               != json.dumps(before.get(n), sort_keys=True)]
+    if changed:
+        joblog.log("codec settings updated: " + ", ".join(changed), "info")
+    impact = await asyncio.to_thread(_codecpolicy_impact, before, pol)
+    _CODEC_LAST_IMPACT.update(ids=impact.pop("ids", []), at=time.time())
+    return {"ok": True, "policy": pol, **impact}
+
+
+@app.post("/api/codecpolicy/requeue")
+async def api_codecpolicy_requeue():
+    """Queue exactly the files the last save reported as needing work."""
+    ids = list(_CODEC_LAST_IMPACT.get("ids") or [])
+    queued = 0
+    for fid in ids:
+        rows = _rows("SELECT path,title,season,episode FROM files WHERE id=?",
+                     (fid,))
+        if not rows:
+            continue
+        label = display_label(rows[0]["title"], rows[0]["season"],
+                              rows[0]["episode"])
+        try:
+            if await jobs.enqueue(fid, rows[0]["path"], label, source="manual"):
+                queued += 1
+        except Exception:
+            continue                 # already queued, or nothing to do after all
+    await jobs.start()
+    joblog.log(f"codec settings: queued {queued} file(s) to be replanned", "ok")
+    return {"queued": queued, "considered": len(ids)}
+
+
+@app.post("/api/codecpolicy/reset")
+def api_codecpolicy_reset(library: str = "", side: str = "", key: str = ""):
+    """Put one field, one side, or a whole library back to its default."""
+    from . import codecpolicy
+    if not library:
+        raise HTTPException(400, "library is required")
+    if side and side not in codecpolicy.SIDES:
+        raise HTTPException(400, f"unknown side '{side}'")
+    if key and key not in codecpolicy.FIELD_BY_KEY.get(side, {}):
+        raise HTTPException(400, f"unknown setting '{key}'")
+    pol = codecpolicy.reset(library, side, key)
+    codecpolicy.invalidate()
+    return {"ok": True, "policy": pol}
+
+
+def _langpolicy_impact(old: dict, new: dict) -> dict:
+    """Files whose KEPT TRACKS differ between two policies.
+
+    A DIFF, not a census. The first version of this counted every file whose
+    plan said `needed`, which on this library is 469 files - almost all of them
+    outstanding work from unrelated rules. Reporting that as "your language
+    change affects 469 files" would be false, and the button beside it would
+    have queued hundreds of files the change had nothing to do with.
+
+    It also scanned `LIMIT 4000` rows, which sounded like a sensible guard and
+    was not: rows come back in rowid order, the first 4,000 were Animated Shows
+    and TV Shows, and not one anime file was in them. Every anime policy change
+    therefore measured as "0 affected". The whole population is 39,276 stored
+    probes and plans in about 7 seconds, so there is nothing to guard against.
+    """
+    import json as _j
+    ids: list[int] = []
+    listed: list[dict] = []
+    checked = 0
+    with cursor() as cur:
+        rows = cur.execute(
+            "SELECT f.id,f.path,f.title,f.season,f.episode,f.library,f.size,"
+            "       p.lang,fp.json "
+            "  FROM files f JOIN file_probes fp ON fp.file_id=f.id "
+            "  LEFT JOIN parent_lang p ON p.parent_id=f.arr_parent_id "
+            "       AND p.arr_name=f.arr_name "
+            " WHERE f.state='done'").fetchall()
+
+    def _langs(info: dict, kind: str, idxs) -> list[str]:
+        want = "audio" if kind == "audio" else "subtitle"
+        st = [s for s in info.get("streams", []) if s.get("codec_type") == want]
+        out = []
+        for i in idxs:
+            if 0 <= i < len(st):
+                out.append(((st[i].get("tags") or {}).get("language")
+                            or "und").lower()[:3])
+        return out
+
+    for r in rows:
+        try:
+            info = _j.loads(r["json"])
+        except Exception:
+            continue
+        checked += 1
+        kw = dict(filename=os.path.basename(r["path"] or ""),
+                  size_bytes=r["size"] or 0, orig_lang=r["lang"] or "",
+                  library=r["library"] or "",
+                  anime=rules.is_anime(r["path"] or ""))
+        try:
+            a = rules.decide(info, policy=old, **kw)
+            b = rules.decide(info, policy=new, **kw)
+        except Exception:
+            continue
+        # Only the language decision. Two plans that keep the same tracks are
+        # the same answer as far as this screen is concerned, whatever else
+        # either of them happens to be doing to the file.
+        if sorted(a.keep_audio) == sorted(b.keep_audio) and \
+           sorted(a.keep_subs) == sorted(b.keep_subs):
+            continue
+        ids.append(r["id"])
+        # WHAT changes, not just that something does. A list of 16,000
+        # filenames answers "how many"; naming the tracks answers "did I mean
+        # to do that", which is the question somebody is actually asking
+        # before they press a button that rewrites their library.
+        if len(listed) < 400:
+            bits = []
+            for kindname, ak, bk in (("audio", a.keep_audio, b.keep_audio),
+                                     ("subs", a.keep_subs, b.keep_subs)):
+                was = _langs(info, kindname, ak)
+                now = _langs(info, kindname, bk)
+                gone = [x for x in was if x not in now]
+                added = [x for x in now if x not in was]
+                if gone:
+                    bits.append(f"{kindname}: drop {', '.join(sorted(set(gone)))}")
+                if added:
+                    bits.append(f"{kindname}: keep {', '.join(sorted(set(added)))}")
+            listed.append({
+                "id": r["id"],
+                "label": display_label(r["title"], r["season"], r["episode"])
+                         or os.path.basename(r["path"] or ""),
+                "library": r["library"] or "",
+                "orig": r["lang"] or "",
+                "change": "; ".join(bits) or "different tracks kept",
+            })
+    return {"checked": checked, "affected": len(ids), "ids": ids[:5000],
+            "files": listed}
+
+
+_LANG_LAST_IMPACT: dict = {"ids": [], "at": 0.0}
+
+
+@app.post("/api/langpolicy/preview")
+async def api_langpolicy_preview(body: dict = Body(...)):
+    r"""What this policy WOULD change. Stores nothing.
+
+    Split out from the save so the sequence is look, then decide, then act.
+    Saving first and showing the consequences afterwards means the planner has
+    already adopted a policy you have not agreed to - and between that moment
+    and changing it back, anything the queue picks up uses it.
+    """
+    from . import langpolicy
+    before = langpolicy.load()
+    # Normalise the submitted policy the same way save() would, so the preview
+    # is of the thing that would actually be stored rather than of raw form
+    # input. "ENG " and "eng" must not preview differently from each other.
+    proposed = langpolicy.normalise(body or {}, base=before)
+    impact = await asyncio.to_thread(_langpolicy_impact, before, proposed)
+    return {"policy": proposed, **impact}
+
+
+@app.post("/api/langpolicy")
+async def api_langpolicy_save(body: dict = Body(...)):
+    from . import langpolicy
+    before = langpolicy.load()          # what the planner used until now
+    saved = langpolicy.save(body or {})
+    # Keyed by LIBRARY now. This still said `for k in KINDS` after the move and
+    # threw KeyError on every save - a 500 from a line that only exists to
+    # write a log entry, which is the worst possible reason to lose a setting.
+    joblog.log("language policy updated: "
+               + "; ".join(
+                   f"{name} audio="
+                   f"{'+orig ' if sides['audio']['keep_original'] else ''}"
+                   f"{','.join(sides['audio']['langs']) or 'none'}"
+                   for name, sides in saved.items()), "info")
+    impact = await asyncio.to_thread(_langpolicy_impact, before, saved)
+    # Held so the Queue button acts on the SET THAT WAS SHOWN, not on a fresh
+    # scan that might differ if something changed in between.
+    _LANG_LAST_IMPACT.update(ids=impact.pop("ids", []), at=time.time())
+    return {"policy": saved, **impact}
+
+
+@app.post("/api/langpolicy/requeue")
+async def api_langpolicy_requeue():
+    """Queue exactly the files the last save reported."""
+    ids = list(_LANG_LAST_IMPACT.get("ids") or [])
+    impact = {"affected": len(ids)}
+    queued = 0
+    for fid in ids:
+        rows = _rows("SELECT path,title,season,episode FROM files WHERE id=?", (fid,))
+        if not rows:
+            continue
+        label = display_label(rows[0]["title"], rows[0]["season"], rows[0]["episode"])
+        try:
+            if await jobs.enqueue(fid, rows[0]["path"], label, source="manual"):
+                queued += 1
+        except Exception:
+            continue                 # already queued, or nothing to do after all
+    await jobs.start()
+    joblog.log(f"language policy: queued {queued} file(s) to be replanned", "ok")
+    return {"queued": queued, "considered": impact["affected"]}
+
+
+@app.get("/api/schedules")
+def api_schedules():
+    from . import schedules
+    d = schedules.snapshot()
+    for r in d["rows"]:
+        if r["key"] != "scan":
+            continue
+        # The scan is the one job that already kept its own timestamp, and it
+        # is a better source than a beat() at the top of the loop: that loop
+        # wakes up to decide whether a scan is due, so beating there would
+        # report a scan that did not happen. Use what actually ran. The
+        # interval is a live setting, so re-read it too - changing it in the UI
+        # has to move this row.
+        try:
+            every = _scan_interval_s()
+            last = STATE["scan"].get("last") or 0
+            r["every_s"] = every
+            r["last_run"] = last or None
+            r["next_run"] = (last + every) if last else None
+            r["overdue"] = bool(last and last + every < time.time() - 5)
+            r["status"] = ("off" if _scan_interval_s() <= 60 else
+                           "ok" if last else "waiting")
+            if STATE["scan"].get("running"):
+                r["last_result"] = "running now"
+        except Exception:
+            pass
+    return d
+
+
+@app.get("/api/arrguard")
+def api_arrguard():
+    from . import arrguard
+    try:
+        arrguard.ensure_defaults()
+    except Exception:
+        pass
+    return {"stats": arrguard.STATS,
+            "toggles": {"profile_guard": gate.get_toggle("arrs.profile_guard"),
+                        "score_guard": gate.get_toggle("arrs.score_guard"),
+                        "trash_anime": gate.get_toggle("arrs.trash_anime"),
+                        }}
+
+
+_ARR_JOBS = ("profile_guard", "score_guard", "trash_anime")
+
+
+@app.post("/api/arrguard/toggle")
+def api_arrguard_toggle(job: str, on: int = 1):
+    if job not in _ARR_JOBS:
+        raise HTTPException(400, f"job must be one of {', '.join(_ARR_JOBS)}")
+    gate.set_toggle(f"arrs.{job}", bool(on))
+    joblog.log(f"arr guard: {job} turned {'ON' if on else 'off'}", "info")
+    return {"job": job, "on": bool(on)}
+
+
+@app.post("/api/arrguard/run")
+async def api_arrguard_run(job: str):
+    """Run one guard pass now, regardless of the toggle - 'check now'."""
+    from . import arrguard
+    if job == "profile_guard":
+        return {"result": await arrguard.run_guard()}
+    if job == "score_guard":
+        return {"result": await arrguard.run_score_guard()}
+    if job == "trash_anime":
+        return {"result": await arrguard.run_trash()}
+    raise HTTPException(400, f"job must be one of {', '.join(_ARR_JOBS)}")
+
+
+@app.get("/api/maintenance")
+def api_maintenance():
+    """Database size, row counts and what housekeeping last did."""
+    return maintenance.status()
+
+
+@app.post("/api/maintenance/run")
+def api_maintenance_run(vacuum: bool = False):
+    """Prune and checkpoint now. VACUUM only when explicitly asked.
+
+    VACUUM takes an exclusive lock and rewrites the whole file, so it is opt-in
+    and never part of the periodic sweep.
+    """
+    out = maintenance.sweep()
+    if vacuum:
+        out["vacuum"] = maintenance.vacuum()
+    return out
+
+
+@app.get("/api/maintenance/preview")
+def api_maintenance_preview():
+    """What retention WOULD remove, without removing it.
+
+    Covers the log files as well as the rows. The database was never the thing
+    growing without a bound - the job logs were, at ~10,000 files a day with
+    nothing deleting them - so a preview that showed only rows would keep
+    hiding exactly the problem it exists to reveal.
+    """
+    out = maintenance.prune(dry_run=True)
+    out.update(maintenance.prune_logs(dry_run=True))
+    return out
+
+
+@app.get("/api/memory")
+def api_memory(limit: int = 15):
+    """Heap and process memory. Detail only when tracing is armed."""
+    return maintenance.mem_trace("status", limit)
+
+
+@app.post("/api/memory/trace")
+def api_memory_trace(action: str = "start"):
+    """Arm or disarm allocation tracing. action=start|stop.
+
+    Arm it, run whatever you suspect (a scan, a few hours of queue), then read
+    /api/memory - the top list is the DIFFERENCE from when you armed it, so it
+    names what grew rather than what is merely large.
+    """
+    return maintenance.mem_trace(action)
+
+
+def _recovery_note() -> str:
+    """One line describing where the pool walk has got to.
+
+    This is the only step that can run for minutes, and until now it said
+    nothing at all while it did - so a slow disk and a deadlock produced the
+    identical display. Everything here is already being tracked by the walk;
+    this just phrases it.
+    """
+    r = jobs.RECOVERY
+    if r.get("state") == "done":
+        return r.get("note") or ""
+    if r.get("phase") == "cache sweep":
+        return "clearing stale cache files"
+    if r.get("state") != "running":
+        return ""
+    bits = []
+    if r.get("phase") == "probe":
+        # The fast pass. Says how much it has covered rather than where it is:
+        # it sweeps whole disks, so a folder name would be meaningless.
+        files = r.get("files") or 0
+        el = r.get("elapsed") or 0
+        rate = f", {files / el:,.0f}/s" if el > 1 else ""
+        return (f"checking {r.get('roots') or 0} disks for interrupted "
+                f"commits — {files:,} files{rate}")
+    if r.get("root"):
+        lib = r["root"]
+        if r.get("roots"):
+            lib += f" ({r.get('root_i') or 1} of {r['roots']})"
+        bits.append(lib)
+    if r.get("where"):
+        # Just the leaf. The full relative path is usually
+        # "Show Name\Season 01", and the season adds nothing.
+        leaf = str(r["where"]).replace("/", "\\").split("\\")[0]
+        if leaf and leaf != ".":
+            bits.append(leaf)
+    files = r.get("files") or 0
+    if files:
+        el = r.get("elapsed") or 0
+        rate = f", {files / el:,.0f}/s" if el > 1 else ""
+        bits.append(f"{files:,} files{rate}")
+    if r.get("found"):
+        bits.append(f"{r['found']} to restore")
+    return " · ".join(bits) or "walking the pool"
+
+
+@app.get("/api/startup")
+def api_startup():
+    d = dict(BOOT)
+    d["elapsed"] = round(time.time() - (BOOT["started"] or time.time()), 1)
+    d["done"] = sum(1 for s in BOOT["steps"] if s["state"] != "pending")
+    d["total"] = len(BOOT["steps"])
+    # LIVE DETAIL ON THE STEP THAT IS STILL RUNNING. The steps list is static
+    # markup once written, so the note is filled in here on the way out rather
+    # than having the walk reach back into BOOT.
+    try:
+        note = _recovery_note()
+        if note:
+            d["steps"] = [dict(s, note=note) if s["key"] == "recover" else s
+                          for s in d["steps"]]
+        d["recovery"] = {k: v for k, v in jobs.RECOVERY.items()
+                         if k != "fixed"}
+        d["recovery"]["fixed"] = list(jobs.RECOVERY.get("fixed") or [])
+    except Exception:
+        pass
+    return d
+
+
+# ------------------------------------------------------------------ API ----
+def _rows(sql: str, params: tuple = ()) -> list[dict]:
+    with cursor() as cur:
+        return [dict(r) for r in cur.execute(sql, params).fetchall()]
+
+
+# Short server-side memo for the two aggregate endpoints. Each one runs
+# full-table rollups (~230 ms measured on 39k files); the memo makes a page
+# load, a second tab, or a refresh-spam cost one computation instead of one
+# per caller. 5 s is a third of the 15 s poll, so nothing meaningful is ever
+# served stale.
+_MEMO: dict = {}
+
+
+def _memo(key: str, ttl: float, fn):
+    v = _MEMO.get(key)
+    if v and time.time() - v[0] < ttl:
+        return v[1]
+    r = fn()
+    _MEMO[key] = (time.time(), r)
+    return r
+
+
+@app.get("/api/summary")
+def api_summary():
+    return _memo("summary", 5.0, _summary_impl)
+
+
+def _summary_impl():
+    states = _rows("SELECT state, COUNT(*) n, SUM(size) bytes FROM files "
+                   "GROUP BY state ORDER BY n DESC")
+    disks = _rows("SELECT pool_disk, COUNT(*) n, SUM(size) bytes FROM files "
+                  "WHERE pool_disk IS NOT NULL AND state!='deleted' "
+                  "GROUP BY pool_disk ORDER BY n DESC")
+    # Scale the bars to each disk's REAL capacity. File count alone made a disk
+    # holding many small anime episodes look fuller than one holding a few 4K
+    # remuxes - the opposite of the truth, and useless for spotting a disk that
+    # is about to fill.
+    try:
+        import shutil as _sh
+        # media_roots(), not pool_disks(): derived from where the library's own
+        # files actually are, so it works on a plain disk, a mount point or any
+        # pool, instead of only on something with a PoolPart folder.
+        parts = scanner.media_roots()
+        for d in disks:
+            p = parts.get(d["pool_disk"])
+            if not p:
+                continue
+            try:
+                u = _sh.disk_usage(p)
+                d["total"] = u.total
+                d["free"] = u.free
+                d["used"] = u.used
+                d["pct_used"] = round(u.used / u.total * 100, 1) if u.total else 0
+            except OSError:
+                pass
+    except Exception:
+        pass
+    # 'deleted' IS NOT IN THE LIBRARY. These are rows kept for files that are no
+    # longer on the pool, and counting them inflated every headline figure: the
+    # header read "39,412 files · 55.45 TB" while the scan reported 39,238 on
+    # disk, a 174-file discrepancy made entirely of bookkeeping. Same for the
+    # per-disk and per-library counts.
+    #
+    # 'duplicate' is NOT excluded here, unlike in the auto-queue percentage. A
+    # duplicate is a real file occupying real bytes on a real spindle - it is
+    # not outstanding work, but it is very much part of what is on disk, and
+    # leaving it out would understate the size of the library.
+    libs = _rows("SELECT library, COUNT(*) n, SUM(size) bytes FROM files "
+                 "WHERE state!='deleted' GROUP BY library ORDER BY n DESC")
+    totals = _rows("SELECT COUNT(*) n, SUM(size) bytes FROM files "
+                   "WHERE state!='deleted'")[0]
+    # Split unmanaged files by size. Small ones are extras (OP/ED, AMVs,
+    # specials, bonus features) and are normal; large ones usually mean a failed
+    # or never-completed import, which is the thing worth acting on.
+    cut = SETTINGS.min_orphan_size_mb * 1024 * 1024
+    orphans = _rows("SELECT COUNT(*) n, SUM(size) bytes FROM files "
+                    "WHERE arr_file_id IS NULL AND state NOT IN ('duplicate','deleted') "
+                    "AND COALESCE(size,0) >= ?", (cut,))[0]
+    extras = _rows("SELECT COUNT(*) n, SUM(size) bytes FROM files "
+                   "WHERE arr_file_id IS NULL AND state NOT IN ('duplicate','deleted') "
+                   "AND COALESCE(size,0) < ?", (cut,))[0]
+    dupes = _rows("SELECT COUNT(*) n, SUM(size) bytes FROM files "
+                  "WHERE state='duplicate'")[0]
+    cache = _rows("SELECT COUNT(*) n, SUM(size) bytes FROM files "
+                  "WHERE path LIKE '%TdarrCacheFile%' AND state!='deleted'")[0]
+    # Anything that needs a human: failed processing, or blocked before it began
+    # (path too long, corrupt release group, destination collision).
+    errors = _rows("SELECT COUNT(*) n, SUM(size) bytes FROM files "
+                   "WHERE state IN ('error','blocked')")[0]
+    err_kinds = _rows(
+        "SELECT COALESCE(state_reason,'(no reason recorded)') r, COUNT(*) n "
+        "FROM files WHERE state IN ('error','blocked') GROUP BY r "
+        "ORDER BY n DESC LIMIT 5")
+    # WHAT ALL THIS HAS ACTUALLY SAVED.
+    #
+    # Every finished job already recorded what the file weighed before and
+    # after; nothing had ever added them up. It is the one number that says
+    # whether the whole exercise is worth the electricity, and it was sitting
+    # in the jobs table unread.
+    #
+    # A RECORD OF WORK DONE, NOT A SNAPSHOT OF THE LIBRARY. A file processed
+    # twice counts twice, and one deleted afterwards still counts - because
+    # the claim is "nuarr has written 74.5 TB where the sources were 77.0",
+    # which is true regardless of what happened to those files later. Framing
+    # it as "your library is 2.5 TB smaller" would be the claim it cannot make.
+    saved = _rows(
+        "SELECT COUNT(*) n, "
+        "       COALESCE(SUM(size_before),0) before_b, "
+        "       COALESCE(SUM(size_after),0)  after_b, "
+        "       COALESCE(SUM(CASE WHEN size_after < size_before "
+        "                    THEN size_before-size_after ELSE 0 END),0) shrank, "
+        "       COALESCE(SUM(CASE WHEN size_after > size_before "
+        "                    THEN size_after-size_before ELSE 0 END),0) grew "
+        "  FROM jobs WHERE state='done' "
+        "   AND size_before IS NOT NULL AND size_after IS NOT NULL")[0]
+    saved["net"] = (saved["before_b"] or 0) - (saved["after_b"] or 0)
+    return {"states": states, "disks": disks, "libraries": libs,
+            "saved": saved,
+            "errors": errors, "error_kinds": err_kinds,
+            "totals": totals, "orphans": orphans, "extras": extras,
+            "extras_cutoff_mb": SETTINGS.min_orphan_size_mb,
+            "duplicates": dupes, "tdarr_cache": cache, "scan": STATE["scan"],
+            "missing_heal": healer.counts(),
+            # Both sweeps report the same shape so the two tiles can be
+            # rendered by one function instead of drifting apart.
+            "missing_sweep": {k: healer.STATS.get(k) for k in
+                              ("running", "next_run", "current",
+                               "total", "done", "last_run")},
+            "unmanaged_adopt": adopter.counts(),
+            "unmanaged_sweep": {k: adopter.STATS.get(k) for k in
+                                ("running", "next_run", "current",
+                                 "total", "done", "last_run")}}
+
+
+def _dispatch_order(rows: list, cap: dict, busy: set, want: int) -> list:
+    """Replay the dispatcher over the WHOLE queue and return the first `want`.
+
+    This used to run in the browser over the 300 rows the server had already
+    sent, which quietly made it wrong in the one case it mattered. The queue
+    was 1,975 stream copies and 22 encodes, and every encode sat below position
+    1,198 - so "next to run" never saw a single one. Worse, they were not just
+    missing from the list, they were the items MOST likely to start next: the
+    encode workers were idle, and only an encode job can fill an encode slot.
+    The panel was hiding imminent work behind a page boundary.
+
+    Ordering therefore has to happen before the LIMIT, over every queued row.
+    Waves: claim what can start, assume it finishes, release its slot and its
+    spindle, repeat. Rows that never become claimable keep their queue position
+    at the end rather than being dropped.
+    """
+    pending = list(rows)
+    ordered: list = []
+    slots = dict(cap)
+    held = set(busy)
+    # Each wave claims at most one job per spindle, so ~12 rows per pass. The
+    # guard is generous enough to fill a 300-row page and still terminate on a
+    # queue where most rows are unclaimable.
+    for _ in range(400):
+        if not pending or len(ordered) >= want:
+            break
+        progressed = False
+        i = 0
+        while i < len(pending):
+            r = pending[i]
+            d = r.get("pool_disk") or ""
+            if slots.get(r.get("pool"), 0) > 0 and not (d and d in held):
+                ordered.append(pending.pop(i))
+                slots[r["pool"]] -= 1
+                if d:
+                    held.add(d)
+                progressed = True
+            else:
+                i += 1
+        if not progressed:
+            break
+        # Wave over: slots free, spindles release. After the first wave the
+        # jobs running right now have finished too, so their disks open up.
+        slots = dict(cap)
+        held = set()
+    return (ordered + pending)[:want]
+
+
+def _work_summary(plan_json, pool: str) -> tuple[str, str]:
+    """One short phrase for the queue row, and the full plan for its tooltip.
+
+    Derived from plan_json's STRUCTURED fields, not its prose. The plan already
+    carries human sentences in `actions[].what`, but they run to a hundred
+    characters each - those become the tooltip, where length is a feature.
+    The row gets the facts: what happens to the video, the audio, the subs.
+    """
+    if not plan_json:
+        # No stored plan (rename jobs, some manual queues). Say what the pool
+        # implies rather than nothing.
+        return ({"subocr": "OCR image subs",
+                 "encode": "re-encode video"}.get(pool, ""), "")
+    try:
+        p = json.loads(plan_json)
+    except (ValueError, TypeError):
+        return "", ""
+    bits: list[str] = []
+    if p.get("encode"):
+        tgt = p.get("target") or "h264"
+        bits.append(f"re-encode → {tgt}" + (" 10-bit" if p.get("ten_bit") else ""))
+    if p.get("burn_index") is not None:
+        bits.append("burn subs in")
+    # Audio: name the conversions; "copy" ops are the tracks being kept.
+    tos = sorted({str(o.get("to")) for o in (p.get("audio_ops") or [])
+                  if o.get("to") and o.get("to") != "copy"})
+    if tos:
+        bits.append("audio → " + ", ".join(tos))
+    if p.get("strip_dv"):
+        bits.append("strip DV")
+    # Track removals live in the action list. There is no "remove" kind - the
+    # kinds are the track types (audio/subtitle/video/container) and removal is
+    # in the sentence, so count the sentences that start with it. A subtitle
+    # removal batches many tracks into one action ("remove 24 subtitle
+    # track(s)..."), so pull the number out rather than counting it as one.
+    n_audio = n_subs = other_fixes = 0
+    for a in (p.get("actions") or []):
+        k, what = str(a.get("kind") or ""), str(a.get("what") or "").lower()
+        if what.startswith("remove"):
+            if k == "audio":
+                n_audio += 1
+            elif k == "subtitle":
+                m = re.search(r"remove (\d+) subtitle", what)
+                n_subs += int(m.group(1)) if m else 1
+            # video/container removals (DV, repackage) already have their own
+            # words above; do not double-count them here.
+        elif k in ("subtitle", "audio"):
+            other_fixes += 1              # flag fixes, defaults, dispositions
+    if n_audio:
+        bits.append(f"drop {n_audio} audio")
+    if n_subs:
+        bits.append(f"drop {n_subs} sub{'s' if n_subs != 1 else ''}")
+    if other_fixes and not bits:
+        bits.append("fix track flags")
+    if pool == "subocr":
+        bits.append("OCR image subs")
+    if not bits:
+        bits.append("remux" if p.get("needed") else "verify")
+    full = "; ".join(str(a.get("what") or "") for a in (p.get("actions") or [])
+                     if a.get("what"))
+    if not full:
+        full = "; ".join(str(n) for n in (p.get("notes") or []))
+    return " · ".join(bits), full
+
+
+@app.get("/api/queue")
+def api_queue(pool: str | None = None, disk: str | None = None,
+              q: str | None = None, sort: str = "order", dir: str = "asc",
+              limit: int = Query(300, le=2000)):
+    """What is waiting, with the detail needed to judge it.
+
+    The old queue strip showed five titles and a count. That answers "is there
+    work" but not the questions that actually come up: which spindle is the
+    queue concentrated on, how much data is pending, and is it encode work or
+    stream copies. Disk especially - a queue stacked on one disk runs at a
+    fraction of the speed of the same queue spread across twelve.
+    """
+    where = ["j.state='queued'"]
+    params: list = []
+    if pool:
+        where.append("j.pool=?"); params.append(pool)
+    if disk:
+        where.append("f.pool_disk=?"); params.append(disk)
+    if q:
+        # title OR path, so you can search either the show or the folder
+        where.append("(COALESCE(j.title,f.title) LIKE ? OR "
+                     "COALESCE(j.path,f.path) LIKE ?)")
+        params += [f"%{q}%", f"%{q}%"]
+    w = " AND ".join(where)
+
+    # TRUE QUEUE ORDER: priority, then insertion time. Nothing else.
+    #
+    # This used to re-sort by disk availability so position 1 matched whatever
+    # the dispatcher would claim next. That turned out to conflate two separate
+    # questions and broke both: a new file added to the end appeared partway up
+    # the list because its disk happened to be free, and "move to bottom" looked
+    # like it had done nothing even though the database was correct.
+    #
+    # The list now answers "what order is the queue in" - which is the one you
+    # can reorder and reason about. Which item starts NEXT is a different
+    # question, answered by the ▶ next-up markers, which already account for
+    # busy spindles and the Plex disk.
+    order = "j.priority, j.created_at"
+    order_params: tuple = ()
+
+    # An explicit column sort REPLACES the dispatch ordering - you are asking
+    # "show me the biggest" not "what runs next", and mixing the two would put
+    # the disk-availability shuffle on top of your chosen column.
+    d = "DESC" if (dir or "").lower() == "desc" else "ASC"
+    cols = {"title": "COALESCE(j.title,f.title)", "size": "f.size",
+            "pool_disk": "f.pool_disk", "library": "f.library",
+            "pool": "j.pool"}
+    if sort in cols:
+        order = f"{cols[sort]} {d}, j.priority, j.created_at"
+        order_params = ()
+
+    cols_sel = ("SELECT j.job_id, j.kind, j.pool, j.priority, j.created_at, "
+                "       j.plan_json, "
+                "       COALESCE(j.source,'manual') AS source, "
+                "       COALESCE(j.title, f.title) AS title, "
+                "       COALESCE(j.path,  f.path)  AS path, "
+                "       f.pool_disk, f.size, f.library, f.season, f.episode "
+                "FROM jobs j LEFT JOIN files f ON f.id = j.file_id ")
+
+    cap_now = {p: jobs._capacity(p) for p in ("encode", "passthrough")}
+    busy_now = {w.disk for w in jobs.RUNNING.values() if w.disk}
+    _t: dict = {}
+    _m0 = time.perf_counter()
+
+    if sort == "next":
+        # ONE statement, not two. Ranking on three cheap columns and then
+        # hydrating the winning 300 by id reads better and moves less data, but
+        # it needs two trips through the DB thread pool - and when twelve
+        # workers are saturating the box that pool, not the row width, is the
+        # scarce resource. Whether that actually costs more is unproven: end to
+        # end this endpoint swings between 2 and 12 seconds under load, which
+        # buries a difference this size. Chosen for the smaller lock footprint,
+        # not on a measurement. 2,000 rows of thirteen columns is ~1 MB.
+        _all = _rows(cols_sel + f"WHERE {w} ORDER BY j.priority, j.created_at",
+                     tuple(params))
+        _t["sql_ms"] = round((time.perf_counter() - _m0) * 1000, 1)
+        _t["scanned"] = len(_all)
+        _m1 = time.perf_counter()
+        rows = _dispatch_order(_all, cap_now, busy_now, limit)
+        _t["sim_ms"] = round((time.perf_counter() - _m1) * 1000, 1)
+    else:
+        rows = _rows(cols_sel + f"WHERE {w} ORDER BY {order} LIMIT ?",
+                     tuple(params) + order_params + (limit,))
+        _t["sql_ms"] = round((time.perf_counter() - _m0) * 1000, 1)
+    _m2 = time.perf_counter()
+
+    # WHAT WILL BE DONE, per file. The plan was decided at queue time and has
+    # sat in plan_json ever since; the queue never said. Summarised to a short
+    # phrase for the row, with the plan's own action sentences as the hover.
+    for r in rows:
+        r["work"], r["work_full"] = _work_summary(r.pop("plan_json", None),
+                                                  r.get("pool") or "")
+
+    tot = _rows(f"SELECT COUNT(*) n, COALESCE(SUM(f.size),0) bytes "
+                f"FROM jobs j LEFT JOIN files f ON f.id=j.file_id WHERE {w}",
+                tuple(params))[0]
+    by_disk = _rows(
+        "SELECT COALESCE(f.pool_disk,'—') disk, COUNT(*) n, "
+        "       COALESCE(SUM(f.size),0) bytes "
+        "FROM jobs j LEFT JOIN files f ON f.id=j.file_id "
+        f"WHERE {w} GROUP BY f.pool_disk", tuple(params))
+
+    # Sort by DRIVE NUMBER, not by count and not as text. Ordering by count
+    # made the chips reshuffle every few seconds as the queue drained, so the
+    # one you were reading moved. Plain text ordering is worse still - it gives
+    # 0, 1, 10, 11, 2, 3 - so pull the trailing integer out and sort on that.
+    def _disk_key(d: dict):
+        m = re.search(r"(\d+)\s*$", d.get("disk") or "")
+        return (0, int(m.group(1))) if m else (1, 0)
+
+    by_disk.sort(key=_disk_key)
+    by_pool = _rows(
+        "SELECT j.pool, COUNT(*) n FROM jobs j "
+        "LEFT JOIN files f ON f.id=j.file_id "
+        f"WHERE {w} GROUP BY j.pool ORDER BY n DESC", tuple(params))
+    # Ship the worker state WITH the queue so the panel can work out what runs
+    # next on its own. Reading it from the job poll's cached payload meant the
+    # marker silently did nothing whenever that poll had not completed yet -
+    # which is exactly the case on a fresh page load.
+    running = [{"pool": w.pool, "disk": w.disk}
+               for w in jobs.RUNNING.values()]
+    _t["aggregates_ms"] = round((time.perf_counter() - _m2) * 1000, 1)
+    _t["total_ms"] = round((time.perf_counter() - _m0) * 1000, 1)
+    return {"total": tot["n"], "bytes": tot["bytes"], "shown": len(rows),
+            "items": rows, "by_disk": by_disk, "by_pool": by_pool,
+            "capacity": cap_now, "sorted_by": sort, "running": running,
+            "timing": _t}
+
+
+@app.post("/api/queue/by_codec")
+async def api_queue_by_codec(codec: str, dry_run: bool = True,
+                             limit: int = Query(2000, le=20000)):
+    r"""Queue every file in a given video codec, whatever state it is in.
+
+    For "I have decided this codec has to go". The normal queue paths work from
+    `state='eligible'`, which is the wrong filter here: a file already marked
+    `done` under the old rules is exactly the one that needs revisiting when the
+    rules change. AV1 was the case that prompted this - it had been listed as a
+    codec to leave alone, so 50 files were passed over permanently.
+
+    Files already `done` are reset to `eligible` first, so the normal pipeline
+    picks them up rather than needing a special case downstream.
+    """
+    codec = (codec or "").strip().lower()
+    if not codec:
+        raise HTTPException(400, "codec is required")
+
+    def _work() -> dict:
+        rows = _rows(
+            "SELECT id, path, title, state FROM files "
+            "WHERE LOWER(COALESCE(video_codec,''))=? AND state!='deleted' "
+            "AND arr_file_id IS NOT NULL LIMIT ?", (codec, limit))
+        unmanaged = _rows(
+            "SELECT COUNT(*) n FROM files "
+            "WHERE LOWER(COALESCE(video_codec,''))=? AND state!='deleted' "
+            "AND arr_file_id IS NULL", (codec,))[0]["n"]
+        return {"rows": rows, "unmanaged": unmanaged}
+
+    found = await asyncio.to_thread(_work)
+    rows, unmanaged = found["rows"], found["unmanaged"]
+    if dry_run:
+        return {"dry_run": True, "codec": codec, "found": len(rows),
+                "unmanaged_skipped": unmanaged,
+                "by_state": {s: sum(1 for r in rows if r["state"] == s)
+                             for s in {r["state"] for r in rows}},
+                "sample": [os.path.basename(r["path"] or "") for r in rows[:5]]}
+
+    ids = [r["id"] for r in rows]
+
+    def _reset() -> int:
+        with cursor() as cur:
+            cur.execute(
+                "UPDATE files SET state='eligible', state_reason=? "
+                "WHERE LOWER(COALESCE(video_codec,''))=? AND state='done'",
+                (f"requeued: {codec} is no longer an accepted codec", codec))
+            # DROP THE STALE PLANS.
+            #
+            # This is the whole reason the endpoint exists: the RULES changed,
+            # so any job queued under the old ones is planned wrong. Measured on
+            # the AV1 pass - five files were already sitting in the queue as
+            # `passthrough`, planned when AV1 was still an accepted codec. Left
+            # alone they would have remuxed and come out AV1 again, quietly
+            # doing nothing while reporting success.
+            #
+            # Only QUEUED jobs. A running one is mid-encode and killing it would
+            # throw away real work; it is re-examined next time round anyway.
+            ph = ",".join("?" * len(ids)) if ids else "NULL"
+            cur.execute(f"DELETE FROM jobs WHERE state='queued' "
+                        f"AND file_id IN ({ph})", tuple(ids))
+            return cur.rowcount or 0
+
+    dropped = await asyncio.to_thread(_reset) if ids else 0
+
+    queued = nowork = running = failed = 0
+    errors: list[str] = []
+    for r in rows:
+        try:
+            await jobs.enqueue(r["id"], r["path"], r["title"] or "",
+                               source="requeue")
+            queued += 1
+        except jobs.NothingToDo:
+            # The plan says there is nothing to do. Worth counting rather than
+            # hiding - if this is high, the rule change did not take.
+            nowork += 1
+        except ValueError:
+            # enqueue() reports "already queued or running" as a plain
+            # ValueError. Queued ones were just deleted above, so anything
+            # reaching here is genuinely RUNNING - not a failure, and not
+            # something to interrupt.
+            running += 1
+        except Exception as e:
+            failed += 1
+            if len(errors) < 5:
+                errors.append(f"{type(e).__name__}: {e}")
+    joblog.log(f"requeued {queued} {codec} file(s) for conversion "
+               f"({dropped} stale plan(s) replaced, {running} already running, "
+               f"{nowork} had no work, {failed} failed)", "warn")
+    return {"codec": codec, "queued": queued, "stale_plans_replaced": dropped,
+            "already_running": running, "no_work": nowork, "failed": failed,
+            "errors": errors, "unmanaged_skipped": unmanaged}
+
+
+@app.post("/api/queue/eae_audio")
+async def api_queue_eae_audio(dry_run: bool = True, limit: int = Query(200, le=3000)):
+    """Requeue files whose E-AC3 audio Plex's EAE decoder cannot handle.
+
+    EAE rejects E-AC3 above ~960k ("Cannot group in blocks of 6!", looping) -
+    verified five for five on this library, and confirmed fixed by the
+    Kizumonogatari test: all three played only after re-encoding to 640k.
+    The rule in rules.py handles NEW files; this endpoint is for the ~2,709
+    already marked done under the old rules.
+
+    Marks matching files eligible in CHUNKS (limit) and lets the normal
+    auto-queue feed them through, so the whole backlog never lands on the
+    queue at once. Run it repeatedly until it reports 0.
+    """
+    thresh = (rules.CONFIG.get("eac3MaxBitrateK", 960)) * 1000
+
+    def _find():
+        out = []
+        for r in _rows("SELECT p.file_id, p.json, f.path, f.title FROM file_probes p "
+                       "JOIN files f ON f.id=p.file_id WHERE f.state='done' "
+                       "AND f.arr_file_id IS NOT NULL"):
+            if len(out) >= limit:
+                break
+            try:
+                pr = json.loads(r["json"])
+            except Exception:
+                continue
+            for s in pr.get("streams") or []:
+                if s.get("codec_type") == "audio" \
+                        and (s.get("codec_name") or "") == "eac3":
+                    try:
+                        if int(s.get("bit_rate") or 0) > thresh:
+                            out.append(r)
+                            break
+                    except (TypeError, ValueError):
+                        pass
+        return out
+
+    rows = await asyncio.to_thread(_find)
+    if dry_run:
+        return {"dry_run": True, "would_mark": len(rows),
+                "threshold_kbps": thresh // 1000,
+                "sample": [r["title"] for r in rows[:6]]}
+    ids = [r["file_id"] for r in rows]
+    def _mark():
+        with cursor() as cur:
+            ph = ",".join("?" * len(ids))
+            cur.execute(f"UPDATE files SET state='eligible', state_reason="
+                        f"'requeued: E-AC3 above {thresh//1000}k is "
+                        f"EAE-incompatible' WHERE id IN ({ph})", tuple(ids))
+            n = cur.rowcount
+            # Stale queued plans were made under the old rules and would just
+            # remux the same audio back out. Same reasoning as by_codec.
+            cur.execute(f"DELETE FROM jobs WHERE state='queued' "
+                        f"AND file_id IN ({ph})", tuple(ids))
+            return n
+    marked = await asyncio.to_thread(_mark) if ids else 0
+    joblog.log(f"EAE audio requeue: {marked} file(s) marked eligible "
+               f"(E-AC3 > {thresh//1000}k)", "info")
+    return {"marked": marked, "threshold_kbps": thresh // 1000}
+
+
+def _sched_row(key: str) -> dict:
+    """One recurring job's registry entry, or {} if it has not registered yet.
+
+    Registration happens when the loop first runs, so a request during the
+    first two minutes after a restart legitimately finds nothing - the caller
+    must treat {} as "not started", not as an error.
+    """
+    try:
+        from . import schedules
+        for r in schedules.snapshot().get("rows", []):
+            if r.get("key") == key:
+                return r
+    except Exception:                                    # noqa: BLE001
+        pass
+    return {}
+
+
+@app.get("/api/audiolang")
+async def api_audiolang(limit: int = Query(400, le=3000)):
+    r"""What nuarr has HEARD, versus what the files claim.
+
+    The point of this screen is that a language tag is the one piece of
+    metadata nuarr cannot take on trust and cannot derive: an empty tag reads
+    as English everywhere, and a wrong tag looks exactly like a right one. So
+    it is measured, and this is where the measurement is shown - including,
+    deliberately, the files where the answer was refused.
+    """
+    def _work():
+        from . import audiolang
+        audiolang.ensure_table()
+        det: dict[tuple[int, int], dict] = {}
+        with cursor() as cur:
+            for r in cur.execute("SELECT * FROM audio_lang").fetchall():
+                det[(r["file_id"], r["track"])] = dict(r)
+            # THE WHOLE POINT OF audio_langs. This used to join file_probes and
+            # json.loads() all 39,563 blobs - 188 MB of parsing - to count
+            # tracks and find the handful that are blank. The counting now runs
+            # off one small column, and the probe is only opened for the few
+            # rows actually shown (below), which is never more than a few
+            # hundred and usually about ten.
+            files = cur.execute(
+                "SELECT id, path, title, season, episode, library, "
+                "       orig_lang, audio_langs "
+                "FROM files WHERE state!='deleted'").fetchall()
+
+        NAME = {"eng": "English", "jpn": "Japanese", "kor": "Korean",
+                "chi": "Chinese", "spa": "Spanish", "por": "Portuguese",
+                "fre": "French", "ger": "German", "ita": "Italian",
+                "rus": "Russian", "hin": "Hindi", "tha": "Thai"}
+        tot = tagged = untagged = heard = refused = stale = 0
+        langs: dict[str, int] = {}
+        by_lib: dict[str, dict] = {}
+        rows: list[dict] = []
+        odd: list[dict] = []
+        # Probes are opened lazily, and only for rows that will be RETURNED.
+        # Keyed by file id so a file with two interesting tracks is read once.
+        _probe_cache: dict[int, list] = {}
+
+        def _streams(fid: int) -> list:
+            if fid not in _probe_cache:
+                try:
+                    with cursor() as c2:
+                        r = c2.execute("SELECT json FROM file_probes "
+                                       "WHERE file_id=?", (fid,)).fetchone()
+                    _probe_cache[fid] = json.loads(r["json"])["streams"] if r else []
+                except Exception:                        # noqa: BLE001
+                    _probe_cache[fid] = []
+            return _probe_cache[fid]
+
+        for f in files:
+            langs_raw = (f["audio_langs"] or "")
+            if not langs_raw:
+                continue          # never probed, or probed before this column
+            track_tags = langs_raw.split(",")
+            lib = f["library"] or "?"
+            b = by_lib.setdefault(lib, {"library": lib, "tracks": 0,
+                                        "untagged": 0, "heard": 0, "refused": 0})
+            for ai, raw in enumerate(track_tags):
+                tot += 1
+                b["tracks"] += 1
+                lg = "" if raw == "-" else raw
+                blank = not lg
+                d = det.get((f["id"], ai))
+                # A VERDICT OLDER THAN THE FILE IS NOT EVIDENCE. A remux
+                # renumbers tracks, so an old row does not merely go out of
+                # date - it starts describing a different track. Seven TaleSpin
+                # episodes were reported as mislabelled for exactly this reason.
+                if d is not None and not audiolang.row_fresh(d, f["path"]):
+                    stale += 1
+                    d = None
+                if blank:
+                    untagged += 1
+                    b["untagged"] += 1
+                else:
+                    tagged += 1
+                    langs[lg] = langs.get(lg, 0) + 1
+                if d and d["ok"]:
+                    heard += 1
+                    b["heard"] += 1
+                elif d and blank:
+                    refused += 1
+                    b["refused"] += 1
+                if not d:
+                    if not blank:
+                        continue
+                    # BLANK AND NEVER LISTENED TO. Previously this fell through
+                    # and the track appeared nowhere at all - the page could
+                    # show "10 outstanding" while 13 tracks were untagged,
+                    # because three of them had no verdict row to hang off.
+                    # A gap you cannot see is worse than one you can.
+                    # Must carry EVERY field a real row has. This stood in for
+                    # a database row and omitted checked_at, which the sort
+                    # later started reading - a KeyError that took out the
+                    # whole page rather than one row.
+                    d = {"code": "", "code2": "", "confidence": 0.0, "ok": 0,
+                         "votes": "[]", "overall": "[]",
+                         "why": "not listened to yet", "checked_at": 0.0}
+                # A CONTRADICTION is the interesting row: the file states one
+                # language and the audio is demonstrably another. nuarr does
+                # not act on these - it never overwrites a stated tag - but
+                # refusing to act is not a reason to refuse to mention it.
+                if d["ok"] and not blank and d["code"] and d["code"] != lg:
+                    odd.append({
+                        "file_id": f["id"],
+                        "path": f["path"],
+                        # The series name alone is useless when 200 episodes
+                        # share it - you cannot tell which file a row means.
+                        "title": display_label(f["title"], f["season"],
+                                               f["episode"]),
+                        "library": lib, "track": ai,
+                        "says": lg, "says_name": NAME.get(lg, lg),
+                        "heard": d["code"], "heard_name": NAME.get(d["code"], d["code"]),
+                        "confidence": round(float(d["confidence"]), 2),
+                        "n_audio": len(track_tags)})
+                # An OUTSTANDING row is always included, whatever the limit.
+                # `open` is derived from this list, so capping it first would
+                # silently under-report the backlog - the one number on this
+                # page that must not be flattering.
+                outstanding = blank and not d["ok"]
+                if outstanding or len(rows) < limit:
+                    try:
+                        votes = json.loads(d["votes"] or "[]")
+                    except Exception:                    # noqa: BLE001
+                        votes = []
+                    try:
+                        overall = json.loads((d["overall"] if "overall" in
+                                              d.keys() else "") or "[]")
+                    except Exception:                    # noqa: BLE001
+                        overall = []
+                    # Only NOW is the probe opened, for a row being returned.
+                    st = _streams(f["id"])
+                    aud = [x for x in st if x.get("codec_type") == "audio"]
+                    s = aud[ai] if ai < len(aud) else {}
+                    st_tags = s.get("tags") or {}
+                    rows.append({
+                        "file_id": f["id"],
+                        "path": f["path"],
+                        "title": display_label(f["title"], f["season"],
+                                               f["episode"]),
+                        # Enough to TELL THE TRACKS APART by eye. "a:1 of 2" is
+                        # a position, not an identity - on a dual-audio release
+                        # the codec and channel count are usually what actually
+                        # distinguishes the dub from the original.
+                        "codec": (s.get("codec_name") or "").upper(),
+                        "channels": s.get("channels") or 0,
+                        "track_title": (st_tags.get("title") or "").strip('"'),
+                        "library": lib, "track": ai, "n_audio": len(track_tags),
+                        "tag": lg, "blank": blank,
+                        "heard": d["code"], "heard_name": NAME.get(d["code"], d["code"]),
+                        "confidence": round(float(d["confidence"]), 2),
+                        "ok": bool(d["ok"]), "why": d["why"], "votes": votes,
+                        "overall": overall,
+                        "orig_lang": f["orig_lang"] or "",
+                        # .get-style access: `d` is a sqlite Row for a real
+                        # verdict and a plain dict for a synthesised one, and
+                        # the two must not be able to disagree about fields.
+                        "checked_at": float(
+                            (d["checked_at"] if "checked_at" in d.keys()
+                             else 0) or 0)})
+        _waiting = audiolang.pending(limit=100000)
+        # Still blank AND never resolved - the honest backlog.
+        openq = [r for r in rows if r["blank"] and not r["ok"]]
+        return {
+            "available": audiolang.available(),
+            "model": audiolang.MODEL_SIZE,
+            "min_prob": audiolang.MIN_PROB,
+            "progress": audiolang.progress(),
+            "choices": audiolang.CHOICES,
+            # THE QUEUE, not just its size. A count tells you something is
+            # outstanding; the list tells you whether it is one new import or
+            # a whole season that just arrived, which is the difference
+            # between waiting and looking into it.
+            # ONE call, so the tab count and the list cannot disagree. The
+            # cached pending_count() exists for the job gate, which polls; a
+            # page that says "Waiting (5)" above a list of ten is worse than
+            # either number on its own.
+            "waiting": [
+                {**w, "title": display_label(
+                    w.get("title"), w.get("season"), w.get("episode"))}
+                for w in _waiting[:500]],
+            "waiting_total": len(_waiting),
+            # The loop's own registry entry, plus the server's clock. Both are
+            # needed: the browser ticks the counters locally between polls, and
+            # it can only do that honestly if it knows what time the SERVER
+            # thought it was - otherwise a machine a few seconds out of step
+            # shows a next run in the past.
+            "schedule": _sched_row("audiolang"),
+            "server_now": time.time(),
+            "totals": {"tracks": tot, "tagged": tagged, "untagged": untagged,
+                       "heard": heard, "refused": refused,
+                       "checked": len(det), "stale": stale},
+            "languages": dict(sorted(langs.items(), key=lambda kv: -kv[1])),
+            "by_library": sorted(by_lib.values(), key=lambda x: -x["tracks"]),
+            "contradictions": sorted(odd, key=lambda x: -x["confidence"])[:200],
+            "open": openq[:200],
+            "rows": rows,
+        }
+    return await asyncio.to_thread(_work)
+
+
+@app.post("/api/audiolang/check")
+async def api_audiolang_check(file_id: int, track: int = 0,
+                              refresh: bool = True):
+    """Listen to one track on demand, from the file's own row in the UI."""
+    def _work():
+        from . import audiolang
+        with cursor() as cur:
+            r = cur.execute("SELECT path FROM files WHERE id=?",
+                            (file_id,)).fetchone()
+        if not r:
+            return {"error": "no such file"}
+        res = audiolang.check(file_id, r["path"], track, refresh=refresh)
+        res["path"] = r["path"]
+        return res
+    return await asyncio.to_thread(_work)
+
+
+def _local_addresses() -> set[str]:
+    """Every address that means THIS machine, for deciding if Plex is local."""
+    import socket
+    out = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+    try:
+        host = socket.gethostname()
+        out.add(host.lower())
+        for info in socket.getaddrinfo(host, None):
+            out.add(str(info[4][0]))
+    except Exception:                                    # noqa: BLE001
+        pass
+    return out
+
+
+@app.post("/api/plex/detect")
+async def api_plex_detect(url: str = ""):
+    r"""Read the token Plex already stored, when Plex is on this machine.
+
+    NOT A LOGIN. There is no way to derive a token from a URL - a Plex token is
+    an authentication credential and the server will not hand one out. What IS
+    possible, and is all this does, is read the one the local Plex Media Server
+    has already saved for itself on this box.
+
+    So it only fires when the URL points HERE. Against a remote server the
+    honest answer is "I cannot", and it says so rather than silently offering
+    this machine's token for somebody else's server - which would look like it
+    worked right up until it did not.
+
+    Windows keeps it in the registry rather than Preferences.xml when the
+    service runs under a user account; measured on this box, LocalAppDataPath
+    is redirected to E:\Plex and Preferences.xml is not where the docs say.
+    Both are tried.
+    """
+    def _work() -> dict:
+        import re as _re
+        import urllib.parse as _up
+
+        host = ""
+        try:
+            host = (_up.urlparse(url if "://" in url else "http://" + url)
+                    .hostname or "").lower()
+        except Exception:                                # noqa: BLE001
+            host = ""
+        if not host:
+            return {"ok": False, "error": "put the server URL in first"}
+        if host not in _local_addresses():
+            return {"ok": False, "remote": True,
+                    "error": f"{host} is not this machine, so its token is not "
+                             f"stored here — paste it from Plex instead"}
+
+        # 1. The registry, which is where a service-installed Plex keeps it.
+        try:
+            import winreg
+            k = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                               r"Software\Plex, Inc.\Plex Media Server")
+            try:
+                tok, _ = winreg.QueryValueEx(k, "PlexOnlineToken")
+                if tok:
+                    return {"ok": True, "token": tok, "source": "registry"}
+            finally:
+                winreg.CloseKey(k)
+        except Exception:                                # noqa: BLE001
+            pass
+
+        # 2. Preferences.xml, wherever LocalAppDataPath actually points.
+        cands = []
+        try:
+            import winreg
+            k = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                               r"Software\Plex, Inc.\Plex Media Server")
+            try:
+                base, _ = winreg.QueryValueEx(k, "LocalAppDataPath")
+                if base:
+                    cands.append(os.path.join(base, "Plex Media Server",
+                                              "Preferences.xml"))
+            finally:
+                winreg.CloseKey(k)
+        except Exception:                                # noqa: BLE001
+            pass
+        la = os.environ.get("LOCALAPPDATA")
+        if la:
+            cands.append(os.path.join(la, "Plex Media Server", "Preferences.xml"))
+        for p in cands:
+            try:
+                if not os.path.isfile(p):
+                    continue
+                txt = open(p, "r", encoding="utf-8", errors="ignore").read()
+                m = _re.search(r'PlexOnlineToken="([^"]+)"', txt)
+                if m:
+                    return {"ok": True, "token": m.group(1),
+                            "source": os.path.basename(p)}
+            except Exception:                            # noqa: BLE001
+                continue
+        return {"ok": False,
+                "error": "Plex is on this machine but no saved token was "
+                         "found — it may be running as a different user"}
+    return await asyncio.to_thread(_work)
+
+
+@app.get("/api/plex/config")
+async def api_plex_config():
+    r"""How nuarr reaches Plex, and whether it is actually reaching it.
+
+    These were editable only by hand in config.yml, which is a poor place for
+    the one integration the whole gate depends on: if the token is wrong, the
+    only symptom is that nuarr never notices anyone watching and quietly
+    transcodes over the top of them.
+    """
+    def _probe() -> dict:
+        out = {
+            "plex_url": SETTINGS.plex_url or "",
+            "plex_token_set": bool(SETTINGS.plex_token),
+            "plex_direct": bool(SETTINGS.plex_direct),
+            "plex_cross_check": bool(SETTINGS.plex_cross_check),
+            "tautulli_url": SETTINGS.tautulli_url or "",
+            "tautulli_key_set": bool(SETTINGS.tautulli_api_key),
+            "source": "", "ok": False, "detail": "", "server": {},
+            "sessions": 0, "libraries": [],
+        }
+        try:
+            from . import gate
+            sess, src = gate._sessions()
+            out["source"] = src
+            if sess is not None:
+                out["ok"] = True
+                out["sessions"] = len(sess)
+                out["detail"] = (f"{len(sess)} session(s) right now"
+                                 if sess else "connected, nothing playing")
+            else:
+                out["detail"] = "no answer from either Plex or Tautulli"
+        except Exception as e:                           # noqa: BLE001
+            out["detail"] = f"{type(e).__name__}: {str(e)[:110]}"
+
+        # Server identity, straight from Plex. Worth showing because "which
+        # server am I actually pointed at" is the question a wrong URL makes
+        # unanswerable, and the version decides what its API supports.
+        if SETTINGS.plex_url and SETTINGS.plex_token:
+            try:
+                import httpx
+                r = httpx.get(SETTINGS.plex_url.rstrip("/") + "/",
+                              params={"X-Plex-Token": SETTINGS.plex_token},
+                              headers={"Accept": "application/json"},
+                              timeout=6.0)
+                if r.status_code == 200:
+                    d = (r.json() or {}).get("MediaContainer", {})
+                    out["server"] = {
+                        "name": d.get("friendlyName", ""),
+                        "version": d.get("version", ""),
+                        "platform": d.get("platform", ""),
+                        "machine": (d.get("machineIdentifier", "") or "")[:12],
+                    }
+                elif r.status_code in (401, 403):
+                    out["detail"] = "Plex rejected the token"
+            except Exception as e:                       # noqa: BLE001
+                if not out["detail"]:
+                    out["detail"] = f"could not reach Plex: {str(e)[:90]}"
+        return out
+    return await asyncio.to_thread(_probe)
+
+
+@app.post("/api/plex/config")
+async def api_plex_config_save(body: dict = Body(...)):
+    r"""Save the Plex connection, after checking it actually works.
+
+    TESTED BEFORE IT IS SAVED. A bad Plex token does not announce itself - the
+    gate simply stops seeing viewers, and the first sign is a stuttering stream
+    while nuarr encodes underneath it. Far better to refuse the save.
+
+    A blank token means "leave the stored one alone", so the page never has to
+    echo a secret back to the browser to keep it.
+    """
+    import yaml
+
+    url = str(body.get("plex_url") or "").strip().rstrip("/")
+    token = str(body.get("plex_token") or "").strip()
+    turl = str(body.get("tautulli_url") or "").strip().rstrip("/")
+    tkey = str(body.get("tautulli_api_key") or "").strip()
+    direct = bool(body.get("plex_direct", SETTINGS.plex_direct))
+    cross = bool(body.get("plex_cross_check", SETTINGS.plex_cross_check))
+
+    if not token:
+        token = SETTINGS.plex_token or ""
+    if not tkey:
+        tkey = SETTINGS.tautulli_api_key or ""
+
+    def _test() -> str:
+        if direct:
+            if not url or not token:
+                return ("Direct Plex is on, so both a server URL and a token "
+                        "are needed")
+            try:
+                import httpx
+                r = httpx.get(url + "/status/sessions",
+                              params={"X-Plex-Token": token},
+                              headers={"Accept": "application/json"},
+                              timeout=8.0)
+            except Exception as e:                       # noqa: BLE001
+                return f"could not reach {url}: {str(e)[:110]}"
+            if r.status_code in (401, 403):
+                return "Plex rejected that token"
+            if r.status_code != 200:
+                return f"Plex answered {r.status_code}"
+            return ""
+        if not turl or not tkey:
+            return "Tautulli is the source, so its URL and API key are needed"
+        try:
+            import httpx
+            r = httpx.get(turl + "/api/v2",
+                          params={"apikey": tkey, "cmd": "get_activity"},
+                          timeout=10.0)
+        except Exception as e:                           # noqa: BLE001
+            return f"could not reach {turl}: {str(e)[:110]}"
+        if r.status_code != 200:
+            return f"Tautulli answered {r.status_code}"
+        return ""
+
+    err = await asyncio.to_thread(_test)
+    if err:
+        return {"ok": False, "error": err}
+
+    p = _config_path()
+    raw = {}
+    if p.exists():
+        try:
+            raw = yaml.safe_load(p.read_text(encoding="utf-8-sig")) or {}
+        except Exception:                                # noqa: BLE001
+            raw = {}
+    raw.update({"plex_url": url or None, "plex_token": token or None,
+                "plex_direct": direct, "plex_cross_check": cross,
+                "tautulli_url": turl or None,
+                "tautulli_api_key": tkey or None})
+    p.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True),
+                 encoding="utf-8")
+    # In place, for the same reason as the arrs and the cache: modules captured
+    # SETTINGS at import and rebinding here would leave them on the old values.
+    SETTINGS.plex_url = url or None
+    SETTINGS.plex_token = token or None
+    SETTINGS.plex_direct = direct
+    SETTINGS.plex_cross_check = cross
+    SETTINGS.tautulli_url = turl or None
+    SETTINGS.tautulli_api_key = tkey or None
+    try:
+        from . import gate
+        gate._CACHE.clear()          # do not serve a hold decided by old creds
+    except Exception:                                    # noqa: BLE001
+        pass
+    joblog.log(f"Plex connection saved ({'direct' if direct else 'Tautulli'})",
+               "ok")
+    return {"ok": True, **(await api_plex_config())}
+
+
+@app.get("/api/version")
+async def api_version():
+    """Just the number. Called on every page load, so it must never block."""
+    return {"version": version.VERSION, "build_date": version.BUILD_DATE}
+
+
+@app.get("/api/updates")
+async def api_updates(force: int = 0):
+    r"""Current, latest and previous, plus why the answer is what it is.
+
+    `force` bypasses the six-hour cache for the Check now button. Without it
+    the button would appear to do nothing on its second press, which reads as
+    broken rather than as cached.
+    """
+    if force and updates.configured():
+        await asyncio.to_thread(updates.check, True)
+    return updates.status()
+
+
+@app.post("/api/updates/repo")
+async def api_updates_repo(repo: str = ""):
+    """Point the checker at a repository, or clear it with an empty string."""
+    r = (repo or "").strip().strip("/")
+    # Accept a pasted URL as well as owner/name: everyone copies the address
+    # bar, and rejecting that is a pointless thing to make somebody discover.
+    m = re.search(r"github\.com/([^/]+/[^/#?]+)", r, re.I)
+    if m:
+        r = m.group(1)
+    if r and not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", r):
+        raise HTTPException(400, "expected owner/name, e.g. NuGundam/nuarr")
+    r = r.removesuffix(".git")
+    # Same read-mutate-write as the cache path above rather than a whole-object
+    # dump: config.yml is hand-editable and round-tripping the entire dataclass
+    # would quietly reformat and reorder somebody's file to change one line.
+    import yaml
+    p = _config_path()
+    raw = {}
+    if p.exists():
+        try:
+            raw = yaml.safe_load(p.read_text(encoding="utf-8-sig")) or {}
+        except Exception:                                    # noqa: BLE001
+            raw = {}
+    raw["update_repo"] = r
+    p.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True),
+                 encoding="utf-8")
+    # Mutated in place for the same reason the cache path is: other modules
+    # captured SETTINGS at import.
+    SETTINGS.update_repo = r
+    # State from the previous repo would otherwise be shown against the new
+    # one until the next scheduled check.
+    updates._STATE.update(checked_at=0.0, ok=False, error="", latest="",
+                          previous="", releases=[])
+    if r:
+        await asyncio.to_thread(updates.check, True)
+    return updates.status()
+
+
+@app.get("/api/encoders")
+async def api_encoders(force: int = 0):
+    """Which video encoders this machine can ACTUALLY use.
+
+    The probe test-encodes two seconds with each family, so a cold call costs
+    a few seconds - hence the thread and the hour-long cache inside.
+    """
+    from . import encoders as _enc
+    return await asyncio.to_thread(lambda: _enc.info() if not force
+                                   else (_enc.probe(force=True), _enc.info())[1])
+
+
+@app.get("/api/whisper")
+def api_whisper():
+    """What the language identifier is, and whether it can actually run."""
+    from . import audiolang as _al
+    return _al.info()
+
+
+@app.post("/api/whisper/check")
+async def api_whisper_check():
+    """Is there a newer faster-whisper than the installed one."""
+    from . import audiolang as _al
+    def _work():
+        cur = _al._pkg_version("faster-whisper")
+        got = _al.latest_version("faster-whisper")
+        newer = bool(got.get("latest") and cur and got["latest"] != cur)
+        return {**got, "installed": cur, "newer": newer}
+    return await asyncio.to_thread(_work)
+
+
+@app.get("/api/audiolang/progress")
+def api_audiolang_progress():
+    """Just the live counters - cheap enough to poll while a pass runs."""
+    from . import audiolang as _al
+    return _al.progress()
+
+
+@app.post("/api/audiolang/run")
+async def api_audiolang_run(limit: int = Query(400, le=5000)):
+    """Listen to everything outstanding now, rather than waiting for the timer."""
+    from . import audiolang as _al
+    if not _al.available():
+        return {"ok": False, "error": "detection is not installed"}
+    if _al.progress().get("state") not in ("idle", "error"):
+        return {"ok": False, "error": "already running"}
+    asyncio.create_task(asyncio.to_thread(_al.run_once, limit, True))
+    return {"ok": True, "started": True}
+
+
+@app.post("/api/audiolang/confirm")
+async def api_audiolang_confirm(file_id: int, track: int, code: str):
+    r"""Listen harder and report whether `code` is what is really on the track.
+
+    Evidence, not a gate. It is deliberately possible to save a language this
+    disagrees with: the tracks that reach this screen are the ones the model
+    could not settle, and a person who has watched the episode knows something
+    the model does not.
+    """
+    def _work():
+        from . import audiolang as _al
+        with cursor() as cur:
+            r = cur.execute("SELECT path FROM files WHERE id=?",
+                            (file_id,)).fetchone()
+        if not r:
+            return {"ok": False, "error": "no such file"}
+        if not os.path.exists(r["path"]):
+            return {"ok": False, "error": "file not found on disk"}
+        if not _al.available():
+            return {"ok": False, "error": "detection is not installed"}
+        out = _al.confirm(r["path"], track, code)
+        out["ok"] = True
+        return out
+    return await asyncio.to_thread(_work)
+
+
+@app.post("/api/audiolang/set")
+async def api_audiolang_set(file_id: int, track: int, code: str):
+    r"""A PERSON says what this track is. Written as stated, no second-guessing.
+
+    This exists because the detector is allowed to refuse. Ten tracks in this
+    library have confident windows that genuinely disagree - a dual-language
+    track, or a stretch of music - and no amount of tuning turns those into an
+    answer. Someone who can listen to the file settles it in one click.
+
+    The choice is recorded with confidence 1.0 and a why that names it as
+    manual, so the page never presents a human decision as a measurement.
+    """
+    def _work():
+        from . import audiolang as _al
+        with cursor() as cur:
+            r = cur.execute("SELECT path, title, season, episode FROM files "
+                            "WHERE id=?", (file_id,)).fetchone()
+        if not r:
+            return {"ok": False, "error": "no such file"}
+        path = r["path"]
+        if not os.path.exists(path):
+            return {"ok": False, "error": "file not found on disk"}
+        if not _al.can_fast_path(path):
+            return {"ok": False, "error": "not a Matroska file"}
+        valid = {c["code"] for c in _al.CHOICES}
+        if code not in valid:
+            return {"ok": False, "error": f"unknown language code {code!r}"}
+
+        # The steps are REPORTED, not narrated by the page. A progress bar that
+        # invents stages it cannot see is worse than no bar, because it looks
+        # like evidence. Each entry below is added only once the work is done.
+        steps: list[dict] = []
+        t0 = time.time()
+        ok, why = _al.apply_tags(path, {track: code})
+        if not ok:
+            return {"ok": False, "error": why,
+                    "steps": steps + [{"what": "write the language tag",
+                                       "ok": False, "detail": why}]}
+        steps.append({"what": "wrote the language tag into the file header",
+                      "ok": True, "ms": int((time.time() - t0) * 1000)})
+
+        t1 = time.time()
+        _reprobe(file_id, path)
+        _al.restamp(file_id, path)
+        _al.store(file_id, track, path, {
+            "code": code, "code2": "", "confidence": 1.0, "ok": True,
+            "votes": [], "overall": [], "why": "set by hand"})
+        steps.append({"what": "re-read the file so nuarr matches it",
+                      "ok": True, "ms": int((time.time() - t1) * 1000)})
+
+        t2 = time.time()
+        told = _al.notify_arrs([file_id])
+        steps.append({
+            "what": ("asked Sonarr/Radarr to rescan it, and queued a rename "
+                     "in case the filename carries the language"
+                     if told else
+                     "queued a rename; no rescan needed — the arrs were told "
+                     "recently"),
+            "ok": True, "ms": int((time.time() - t2) * 1000)})
+
+        label = display_label(r["title"], r["season"], r["episode"])
+        joblog.log(f"audio language set by hand: a:{track} of {label} = {code}",
+                   "ok", system="audiolang")
+        return {"ok": True, "code": code, "detail": why, "steps": steps,
+                "arrs_told": told}
+    return await asyncio.to_thread(_work)
+
+
+@app.post("/api/audiolang/apply")
+async def api_audiolang_apply(file_id: int, track: int, code: str,
+                              force: bool = False):
+    r"""Write one language tag onto one file, by header edit.
+
+    `force` is what lets a CONTRADICTION be corrected. The automatic rule never
+    overwrites a stated tag - that restraint is the only thing standing between
+    this feature and re-labelling every English dub in the library - so
+    overruling it stays a deliberate, per-file act taken by a person who has
+    looked at the evidence on screen.
+    """
+    def _work():
+        from . import audiolang
+        with cursor() as cur:
+            r = cur.execute("SELECT path FROM files WHERE id=?",
+                            (file_id,)).fetchone()
+        if not r:
+            return {"ok": False, "error": "no such file"}
+        path = r["path"]
+        if not audiolang.can_fast_path(path):
+            return {"ok": False, "error": "not a Matroska file - needs a remux"}
+        if not force:
+            d = audiolang.for_file(file_id, track)
+            if not d or d["code"] != code:
+                return {"ok": False,
+                        "error": "that is not what was heard; pass force=true"}
+        ok, why = audiolang.apply_and_restamp(file_id, path, {track: code})
+        if ok:
+            _reprobe(file_id, path)
+            # _reprobe writes a new probe but must NOT wipe the verdicts here:
+            # a header edit leaves track order alone, so restamp above is the
+            # correct treatment and this row stays valid.
+            audiolang.restamp(file_id, path)
+            # The arrs cache a file's languages; without this they keep showing
+            # the old one and the correction is invisible where it matters.
+            audiolang.notify_arrs([file_id])
+            joblog.log(f"audio language set to {code} on a:{track} of "
+                       f"{os.path.basename(path)}", "ok")
+        return {"ok": ok, "detail": why}
+    return await asyncio.to_thread(_work)
+
+
+def _reprobe(file_id: int, path: str) -> None:
+    """Refresh the stored probe after a header edit.
+
+    Without this the next plan is made from a picture of the file that no
+    longer exists - it would still show the track as untagged and try to tag
+    it again on every pass.
+    """
+    from . import audiolang
+    _ff, fp = audiolang._ff()
+    try:
+        q = subprocess.run([fp, "-v", "quiet", "-print_format", "json",
+                            "-show_streams", "-show_format", path],
+                           capture_output=True, text=True, timeout=120,
+                           creationflags=NO_WINDOW)
+        if q.returncode == 0 and q.stdout:
+            with cursor() as cur:
+                cur.execute("UPDATE file_probes SET json=? WHERE file_id=?",
+                            (q.stdout, file_id))
+                cur.execute("UPDATE files SET size=? WHERE id=?",
+                            (os.path.getsize(path), file_id))
+            # The extracted language columns are what the page reads, so a new
+            # probe that does not refresh them leaves the page describing the
+            # file as it was BEFORE the edit.
+            jobs.refresh_track_langs(file_id, json.loads(q.stdout))
+    except Exception:                                    # noqa: BLE001
+        pass
+
+
+@app.post("/api/queue/untagged_audio")
+async def api_queue_untagged_audio(dry_run: bool = True,
+                                   limit: int = Query(300, le=3000)):
+    """Requeue files whose only audio track carries no language tag.
+
+    An empty language tag is not neutral. Sonarr, Radarr and most players read
+    a blank as English, so a Japanese track presents itself as English and the
+    language policy can never act on it - it cannot prefer the original
+    language over a dub when it has been told the original IS the dub.
+
+    The planner rule handles files as they come through. This is for the
+    backlog already marked done. It asks the PLANNER rather than re-implementing
+    the test, so the endpoint cannot drift from the rule: whatever
+    `rules.decide()` puts in `plan.audio_lang_tags` is what gets requeued, and
+    turning the setting off on a library empties this for that library too.
+
+    The fix is metadata only - the audio is stream-copied - so these are cheap
+    jobs whatever their size.
+    """
+    def _find():
+        out = []
+        for r in _rows("SELECT p.file_id, p.json, f.path, f.title, f.library, "
+                       "f.orig_lang FROM file_probes p "
+                       "JOIN files f ON f.id=p.file_id WHERE f.state='done'"):
+            if len(out) >= limit:
+                break
+            try:
+                pr = json.loads(r["json"])
+                plan = rules.decide(pr, filename=r["path"] or "",
+                                    library=r["library"] or "",
+                                    orig_lang=r["orig_lang"] or "",
+                                    file_id=r["file_id"])
+            except Exception:
+                continue
+            if plan.audio_lang_tags:
+                out.append((r, sorted(set(plan.audio_lang_tags.values()))))
+        return out
+
+    found = await asyncio.to_thread(_find)
+    langs: dict[str, int] = {}
+    for _r, cs in found:
+        for c in cs:
+            langs[c] = langs.get(c, 0) + 1
+    if dry_run:
+        return {"dry_run": True, "would_mark": len(found), "languages": langs,
+                "sample": [f"{r['title']} → {'/'.join(cs)}"
+                           for r, cs in found[:6]]}
+    ids = [r["file_id"] for r, _cs in found]
+
+    def _mark():
+        with cursor() as cur:
+            ph = ",".join("?" * len(ids))
+            cur.execute(f"UPDATE files SET state='eligible', state_reason="
+                        f"'requeued: audio track has no language tag' "
+                        f"WHERE id IN ({ph})", tuple(ids))
+            n = cur.rowcount
+            # Any plan already queued was decided before this rule existed and
+            # would remux the same blank tag straight back out.
+            cur.execute(f"DELETE FROM jobs WHERE state='queued' "
+                        f"AND file_id IN ({ph})", tuple(ids))
+            return n
+    marked = await asyncio.to_thread(_mark) if ids else 0
+    joblog.log(f"Untagged audio requeue: {marked} file(s) marked eligible "
+               f"({', '.join(f'{v} {k}' for k, v in sorted(langs.items()))})",
+               "info")
+    return {"marked": marked, "languages": langs}
+
+
+@app.post("/api/queue/move")
+def api_queue_move(job_id: str, where: str = "top"):
+    r"""Reorder one queued job: top | bottom | up | down.
+
+    The dispatcher claims by (priority, created_at), so moving an item means
+    rewriting those two fields rather than maintaining a separate position
+    column that would then have to be kept in step with every insert.
+
+    'up'/'down' swap with the adjacent job IN THE SAME priority band, which is
+    what makes repeated presses walk an item through the list predictably.
+    """
+    where = (where or "top").lower()
+    with cursor() as cur:
+        me = cur.execute(
+            "SELECT id, priority, created_at FROM jobs "
+            "WHERE job_id=? AND state='queued'", (job_id,)).fetchone()
+        if not me:
+            raise HTTPException(404, "job is not queued")
+
+        if where in ("top", "bottom"):
+            row = cur.execute(
+                "SELECT MIN(priority) lo, MAX(priority) hi FROM jobs "
+                "WHERE state='queued'").fetchone()
+            if where == "top":
+                # one band above the current minimum, so it sorts first without
+                # disturbing anything else's relative order
+                cur.execute("UPDATE jobs SET priority=?, created_at=? WHERE id=?",
+                            (int(row["lo"] or 100) - 1, 0.0, me["id"]))
+            else:
+                cur.execute("UPDATE jobs SET priority=?, created_at=? WHERE id=?",
+                            (int(row["hi"] or 100) + 1, time.time(), me["id"]))
+            return {"ok": True, "moved": where}
+
+        if where not in ("up", "down"):
+            raise HTTPException(400, "where must be top, bottom, up or down")
+
+        # the neighbour immediately before/after in dispatch order
+        if where == "up":
+            nb = cur.execute(
+                "SELECT id, priority, created_at FROM jobs WHERE state='queued' "
+                "AND (priority < ? OR (priority = ? AND created_at < ?)) "
+                "ORDER BY priority DESC, created_at DESC LIMIT 1",
+                (me["priority"], me["priority"], me["created_at"])).fetchone()
+        else:
+            nb = cur.execute(
+                "SELECT id, priority, created_at FROM jobs WHERE state='queued' "
+                "AND (priority > ? OR (priority = ? AND created_at > ?)) "
+                "ORDER BY priority ASC, created_at ASC LIMIT 1",
+                (me["priority"], me["priority"], me["created_at"])).fetchone()
+        if not nb:
+            return {"ok": True, "moved": "none", "message": "already at the end"}
+        # swap their sort keys
+        cur.execute("UPDATE jobs SET priority=?, created_at=? WHERE id=?",
+                    (nb["priority"], nb["created_at"], me["id"]))
+        cur.execute("UPDATE jobs SET priority=?, created_at=? WHERE id=?",
+                    (me["priority"], me["created_at"], nb["id"]))
+    return {"ok": True, "moved": where}
+
+
+@app.get("/api/missing/heal")
+def api_missing_heal_status():
+    """Healing progress, and what is still under investigation."""
+    rows = _rows("SELECT id,title,path,arr_name,state_reason,"
+                 "COALESCE(heal_attempts,0) attempts, heal_last_at, heal_state "
+                 "FROM files WHERE state='missing' "
+                 "ORDER BY COALESCE(heal_state,'') DESC, COALESCE(heal_attempts,0) DESC")
+    return {"counts": healer.counts(), "max_attempts": healer.MAX_ATTEMPTS,
+            "stats": healer.STATS, "files": rows}
+
+
+@app.post("/api/missing/heal")
+async def api_missing_heal_run():
+    """Run a healing pass now instead of waiting for the timer."""
+    return await healer.sweep()
+
+
+@app.get("/api/unmanaged/adopt")
+def api_unmanaged_adopt_status():
+    """Adoption progress, and what is still unclaimed by any arr."""
+    rows = _rows("SELECT id,title,path,size,state_reason,"
+                 "COALESCE(adopt_attempts,0) attempts, adopt_last_at, "
+                 "adopt_state FROM files WHERE arr_file_id IS NULL "
+                 "AND state NOT IN ('duplicate','deleted') "
+                 "AND COALESCE(size,0) >= ? "
+                 "ORDER BY COALESCE(adopt_state,'') DESC, "
+                 "COALESCE(adopt_attempts,0) DESC", (adopter.MIN_SIZE_B,))
+    return {"counts": adopter.counts(), "max_attempts": adopter.MAX_ATTEMPTS,
+            "stats": adopter.STATS, "files": rows}
+
+
+@app.post("/api/unmanaged/adopt")
+async def api_unmanaged_adopt_run():
+    """Run an adoption pass now instead of waiting for the timer."""
+    return await adopter.sweep()
+
+
+@app.get("/api/subocr/preview")
+def api_subocr_preview(limit: int = 25):
+    """Which files the subtitle converter would take, and why. Read-only."""
+    from . import subocr
+    rows, files, tracks, byt = [], 0, 0, 0
+    for r in _rows("SELECT p.file_id, p.json, f.path, f.title, f.size "
+                   "FROM file_probes p JOIN files f ON f.id=p.file_id "
+                   "WHERE f.state NOT IN ('deleted','duplicate')"):
+        try:
+            d = json.loads(r["json"])
+        except Exception:
+            continue
+        t = subocr.select_targets(d)
+        if not t:
+            continue
+        files += 1
+        tracks += len(t)
+        byt += r["size"] or 0
+        if len(rows) < limit:
+            rows.append({"file_id": r["file_id"], "title": r["title"],
+                         "path": r["path"], "size": r["size"],
+                         "tracks": [{"rel": x["rel"], "cues": x.get("cues"),
+                                     "title": (x.get("tags") or {}).get("title"),
+                                     "why": x.get("why")} for x in t]})
+    return {"files": files, "tracks": tracks, "bytes": byt, "sample": rows}
+
+
+@app.post("/api/subocr/queue")
+async def api_subocr_queue(limit: int = Query(10, le=6000), dry: int = 0,
+                           file_id: int = 0):
+    """Queue subtitle-OCR jobs. Bounded on purpose.
+
+    `limit` has a hard ceiling and defaults low because this rewrites library
+    files: 5,264 of them is not something anybody should be able to start by
+    fat-fingering a URL. Run it repeatedly rather than once enormously.
+    """
+    from . import subocr
+    picked = []
+    # file_id targets ONE file. Needed for trials: without it the only way to
+    # test a specific file was to hope it sorted first, which it did not.
+    # Skip what a previous pass already proved unconvertible. Targeting an
+    # explicit file_id deliberately IGNORES that memory, so a single file can
+    # always be retried by hand after a rule change.
+    # ...and skip anything already queued or running. Without this, a second
+    # call re-tried the same first files (their enqueue raised as duplicates)
+    # and never advanced past them - so "run it again for the next chunk"
+    # silently queued nothing.
+    where = ("AND f.id=?" if file_id else
+             "AND f.arr_file_id IS NOT NULL "
+             "AND COALESCE(f.subocr_state,'') != 'rejected' "
+             "AND f.id NOT IN (SELECT file_id FROM jobs WHERE file_id IS NOT "
+             "NULL AND state IN ('queued','running'))")
+    args = (file_id,) if file_id else ()
+    for r in _rows("SELECT p.file_id, p.json, f.path, f.title FROM file_probes p "
+                   "JOIN files f ON f.id=p.file_id "
+                   "WHERE f.state NOT IN ('deleted','duplicate') " + where, args):
+        if len(picked) >= limit:
+            break
+        try:
+            d = json.loads(r["json"])
+        except Exception:
+            continue
+        if subocr.select_targets(d):
+            picked.append(r)
+    if dry:
+        return {"dry": True, "would_queue": len(picked),
+                "titles": [p["title"] for p in picked]}
+    made = []
+    for p in picked:
+        try:
+            job = await jobs.enqueue(p["file_id"], p["path"], p["title"] or "",
+                                     kind="sub_ocr", priority=90)
+            made.append(job.id if job else None)
+        except Exception as e:
+            joblog.log(f"sub_ocr enqueue failed for {p['title']}: "
+                       f"{type(e).__name__}: {e}", "error")
+    joblog.log(f"queued {len(made)} subtitle-OCR jobs", "info")
+    return {"queued": len(made), "job_ids": made}
+
+
+@app.get("/api/subocr/pending")
+def api_subocr_pending():
+    """SRTs that are OCR'd but not yet embedded in any file.
+
+    The subs-pending area is a baton pass: the side OCR (or a handoff) leaves
+    prepared tracks here and whichever job next rewrites the file carries them
+    in. A baton nobody can see is a baton that gets dropped silently - this is
+    the panel that makes a stranded one visible.
+    """
+    root = os.path.join(SETTINGS.cache_dir, "subs-pending")
+    out, total_b = [], 0
+    try:
+        dirs = sorted(os.listdir(root))
+    except OSError:
+        dirs = []
+    for name in dirs:
+        try:
+            fid = int(name)
+        except ValueError:
+            continue
+        d = os.path.join(root, name)
+        man = os.path.join(d, "manifest.json")
+        try:
+            with open(man, encoding="utf-8") as f:
+                items = json.load(f)
+            age_s = time.time() - os.path.getmtime(man)
+        except Exception:
+            continue
+        srt_b = 0
+        names = []
+        for it in items:
+            names.append(it.get("name") or "English (OCR)")
+            try:
+                srt_b += os.path.getsize(it.get("srt") or "")
+            except OSError:
+                pass
+        total_b += srt_b
+        # display_label, not the bare title: a show with 13 pending episodes
+        # rendered as thirteen identical rows saying "Arifureta", which is not
+        # enough to tell you WHICH baton is stranded. Everywhere else in the UI
+        # names an episode; this panel was the exception.
+        row = _rows("SELECT title, path, state, season, episode "
+                    "FROM files WHERE id=?", (fid,))
+        title = (display_label(row[0]["title"], row[0]["season"],
+                               row[0]["episode"]) if row else f"file #{fid}")
+        path = row[0]["path"] if row else ""
+        # Who will pick these up? Named explicitly, because "waiting" without
+        # a consumer is exactly the stranded case this panel exists to catch.
+        stranded = False
+        j = _rows("SELECT kind, state FROM jobs WHERE file_id=? AND state IN "
+                  "('queued','running','deferred') ORDER BY created_at DESC "
+                  "LIMIT 1", (fid,))
+        if j and j[0]["kind"] == "transcode":
+            consumer = f"a {j[0]['state']} transcode will carry them in"
+        elif j:
+            consumer = f"a {j[0]['state']} {j[0]['kind']} job will embed them"
+        elif not row or row[0]["state"] == "deleted":
+            consumer = "ORPHANED - the file is gone"
+            stranded = True
+        else:
+            # "the subtitle queue embeds them on its next pass" was a promise
+            # the panel could not keep. There IS no next pass unless something
+            # queues one, and after the queue was cleared these sat with a
+            # confident consumer line and no consumer - which is the exact
+            # failure the panel was built to make visible, wearing the
+            # reassuring text. Say what is true, and only claim a pass when one
+            # is actually scheduled.
+            waiting = _rows("SELECT COUNT(*) n FROM jobs WHERE kind='sub_ocr' "
+                            "AND state IN ('queued','running')")[0]["n"]
+            if waiting:
+                consumer = (f"the subtitle queue reaches this file on a later "
+                            f"pass ({waiting:,} OCR jobs ahead)")
+            else:
+                consumer = ("NOTHING IS COMING FOR THESE - no transcode and no "
+                            "OCR job is queued for this file")
+                stranded = True
+        out.append({"file_id": fid, "title": title, "path": path,
+                    "tracks": names, "srt_bytes": srt_b,
+                    "age_s": round(age_s), "consumer": consumer,
+                    "stranded": stranded})
+    return {"pending": len(out), "bytes": total_b, "rows": out}
+
+
+@app.post("/api/subocr/pending/clear")
+def api_subocr_pending_clear(file_id: int):
+    """Discard one file's prepared SRTs. Cheap to redo - it costs one OCR."""
+    from . import subocr
+    subocr.clear_pending(file_id, SETTINGS.cache_dir)
+    joblog.log(f"discarded prepared OCR subtitles for file #{file_id}", "info")
+    return {"cleared": file_id}
+
+
+@app.get("/api/files/{file_id}/refetch")
+async def api_refetch_plan(file_id: int):
+    """What rejecting this file's release would do. Changes nothing.
+
+    Separate from the POST on purpose. The panel has to be able to ask "is
+    this even offerable, and what would it cost" without any chance of a
+    mis-click doing it, and the answer needs a round trip to the arr.
+    """
+    return await refetch.plan(file_id)
+
+
+@app.post("/api/files/{file_id}/refetch")
+async def api_refetch_run(file_id: int, confirm: str = ""):
+    """Blocklist the release and search for a replacement. DESTRUCTIVE.
+
+    `confirm` must echo back the file id. This is not ceremony: the drill-down
+    rebuilds itself every few seconds, so a row can move under the pointer
+    between the click landing and the request going out. Echoing the id means
+    a stray click cannot delete the file that happened to slide into that spot.
+    """
+    if confirm != str(file_id):
+        return {"ok": False, "why": "not confirmed"}
+    return await refetch.run(file_id)
+
+
+@app.get("/api/files")
+def api_files(state: str | None = None, library: str | None = None,
+              q: str | None = None, disk: str | None = None,
+              unmanaged: int = 0, extras: int = 0, errors: int = 0,
+              queueable: int = 0,
+              limit: int = Query(200, le=5000), offset: int = 0):
+    where, params = [], []
+    cut = SETTINGS.min_orphan_size_mb * 1024 * 1024
+    if queueable:
+        # Match _eligible_rows() exactly, so a preview shows what the queue
+        # will actually take rather than everything in that state.
+        where.append("arr_file_id IS NOT NULL")
+    if errors:
+        where.append("state IN ('error','blocked')")
+    if unmanaged:
+        where.append("arr_file_id IS NULL AND state NOT IN ('duplicate','deleted') "
+                     "AND COALESCE(size,0) >= ?"); params.append(cut)
+    if extras:
+        where.append("arr_file_id IS NULL AND state NOT IN ('duplicate','deleted') "
+                     "AND COALESCE(size,0) < ?"); params.append(cut)
+    if state:
+        where.append("state=?"); params.append(state)
+    if library:
+        where.append("library=?"); params.append(library)
+    if disk:
+        where.append("pool_disk=?"); params.append(disk)
+    if q:
+        where.append("(title LIKE ? OR path LIKE ?)")
+        params += [f"%{q}%", f"%{q}%"]
+    sql = ("SELECT id,arr_name,arr_file_id,title,season,episode,library,path,"
+           "size,pool_disk,state,state_reason,mtime,processed_at,updated_at,"
+           "adopt_state,adopt_attempts,subocr_state FROM files")
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    total = _rows(f"SELECT COUNT(*) n FROM ({sql})", tuple(params))[0]["n"]
+    sql += " ORDER BY size DESC LIMIT ? OFFSET ?"
+    rows = _rows(sql, tuple(params) + (limit, offset))
+    # A file can be marked error/blocked without a reason on the row itself -
+    # the detail lives on the job that failed. An error list with blank reasons
+    # is just a list of names, so pull the job's message in as a fallback.
+    missing = [r["id"] for r in rows
+               if r.get("state") in ("error", "blocked") and not r.get("state_reason")]
+    if missing:
+        qs = ",".join("?" * len(missing))
+        jerr = {r["file_id"]: r["error"] for r in _rows(
+            f"SELECT file_id, error FROM jobs WHERE file_id IN ({qs}) "
+            "AND error IS NOT NULL ORDER BY finished_at DESC", tuple(missing))}
+        for r in rows:
+            if not r.get("state_reason") and jerr.get(r["id"]):
+                r["state_reason"] = jerr[r["id"]]
+
+    # Can this error be answered by rejecting the release? Classified here, on
+    # the row, rather than by the button asking per-click: the answer decides
+    # whether the button is drawn at all, and a destructive control should not
+    # appear first and refuse afterwards. Cheap - pure string matching, no arr
+    # call; the arr round trip only happens once the user asks for the plan.
+    for r in rows:
+        if r.get("state") in ("error", "blocked"):
+            kind, why = refetch.classify(r.get("state_reason"))
+            r["refetch_kind"] = kind
+            r["refetch_why"] = why
+
+    # THE JOB THAT PRODUCED THIS STATE, so the row can open its transcript.
+    # "ffmpeg exited 3199971767" is the summary, not the explanation - the
+    # explanation is in the job log, and without an id to open there was no way
+    # to get from the error list to it except by hunting through the log tab.
+    ids = [r["id"] for r in rows if r.get("id")]
+    if ids:
+        for i in range(0, len(ids), 400):
+            chunk = ids[i:i + 400]
+            qs = ",".join("?" * len(chunk))
+            # The most recent job per file - MAX(rowid) rather than a date,
+            # because finished_at is NULL on a job that never got that far.
+            for j in _rows(
+                    "SELECT file_id, job_id, state AS job_state FROM jobs "
+                    f"WHERE file_id IN ({qs}) AND rowid IN ("
+                    f"  SELECT MAX(rowid) FROM jobs WHERE file_id IN ({qs}) "
+                    "   GROUP BY file_id)", tuple(chunk) + tuple(chunk)):
+                for r in rows:
+                    if r["id"] == j["file_id"]:
+                        r["job_id"] = j["job_id"]
+                        r["job_state"] = j["job_state"]
+                        break
+    # WHEN WILL A HELD FILE SETTLE? ASK THE LOCK CLOCK, NOT THE FILE'S DATE.
+    #
+    # This counted down mtime + hold_minutes*60 - a rule mark_eligible() stopped
+    # applying when the hold became lock-based. The panel therefore said
+    # "settles in 4m" (300 s from a five-minute hold_minutes that nothing reads)
+    # while the code underneath was waiting on 30 s of exclusive access, and the
+    # header directly above it said "promoted after 30s with no reader". Two
+    # numbers, one of them fictional, contradicting each other on the same row.
+    #
+    # There are only three honest states now, and only one of them has a
+    # countdown at all:
+    #
+    #   LOCKED        somebody has the file open. There is no deadline - the
+    #                 30 s clock has not started and will not start until they
+    #                 let go. A timer here would be a guess about when Plex
+    #                 stops playing, which nuarr cannot know.
+    #   COUNTING      free, and the clock is running. Settles in the remainder.
+    #   NOT YET SEEN  new since the last settling pass. The clock starts on the
+    #                 next one, a few seconds away.
+    now = time.time()
+    quiet_s = _lock_quiet_s()
+
+    for r in rows:
+        # Files the arrs don't know about have no title, and a list of
+        # "(untitled)" rows is useless - fall back to the filename.
+        if r.get("title"):
+            r["label"] = display_label(r["title"], r.get("season"), r.get("episode"))
+        else:
+            r["label"] = os.path.basename(r.get("path") or "") or "(unknown)"
+        if r.get("state") != "new":
+            continue
+        try:
+            from . import scanner as _sc
+            note = _sc.lock_note(r["id"])
+        except Exception:
+            note = None
+        r["settles_at"] = None
+        r["settles_in_s"] = None
+        if not note:
+            # Never probed. Not an error and not a fault in the file - it
+            # simply arrived since the last pass.
+            r["settle_note"] = "waiting for its first check"
+            continue
+        r["lock"] = note
+        if note.get("locked"):
+            who = ", ".join(note.get("holders") or []) or "another program"
+            r["hold_note"] = f"in use by {who}"
+            # Deliberately no countdown. See above.
+            r["settle_note"] = f"{quiet_s:.0f}s after it is released"
+            continue
+        held_for = float(note.get("quiet_for_s") or 0.0)
+        left = max(0.0, quiet_s - held_for)
+        r["settles_at"] = now + left
+        r["settles_in_s"] = round(left)
+        r["hold_note"] = (f"free for {held_for:.0f}s — needs {quiet_s:.0f}s clear")
+    return {"total": total, "rows": rows, "lock_quiet_s": quiet_s}
+
+
+def _lock_quiet_s() -> float:
+    try:
+        from . import scanner as _sc
+        return _sc.LOCK_QUIET_S
+    except Exception:
+        return 30.0
+
+
+@app.get("/api/files/raw", response_class=PlainTextResponse)
+def api_files_raw(state: str | None = None, library: str | None = None,
+                  q: str | None = None, disk: str | None = None,
+                  unmanaged: int = 0, extras: int = 0, errors: int = 0,
+                  limit: int = Query(5000, le=5000)):
+    """The same list as plain text, for when you want to read or keep it.
+
+    CALLED BY KEYWORD, DELIBERATELY. This used to be:
+
+        api_files(state, library, q, disk, unmanaged, extras, limit, 0)
+
+    which was correct when api_files took eight parameters. It later gained
+    `errors` and `queueable` in the middle, and this call was not updated - so
+    the seventh positional argument, meant to be `limit`, silently became
+    `errors`, and `limit` fell back to its default. That default is a FastAPI
+    Query object, not an int, because a plain function call gets no dependency
+    injection - so it went into the SQL as a Query instance and the endpoint
+    returned 500. That is the "Open as text" button: every use of it, on every
+    drill-down, since the parameters were added.
+
+    Keywords make the call immune to the next parameter that gets inserted.
+    """
+    d = api_files(state=state, library=library, q=q, disk=disk,
+                  unmanaged=unmanaged, extras=extras, errors=errors,
+                  queueable=0, limit=limit, offset=0)
+    head = (f"nuarr — {len(d['rows'])} of {d['total']} file(s)"
+            + (f"  state={state}" if state else "")
+            + ("  unmanaged" if unmanaged else "")
+            + ("  extras" if extras else "")
+            + ("  errors" if errors else ""))
+    out = [head, "=" * 78]
+    for r in d["rows"]:
+        sz = (r.get("size") or 0) / 1024 ** 3
+        out.append(f"{sz:8.2f} GB  {str(r.get('pool_disk') or '-'):<12} "
+                   f"{r.get('state',''):<9} {r.get('path','')}")
+    return "\n".join(out)
+
+
+@app.get("/api/history")
+def api_history(limit: int = Query(100, le=1000), event: str | None = None):
+    # f.size rides along so the Activity panel can show a file's current size
+    # on rows that never ran a job - an upgrade or import has no
+    # before/after pair, but the file it left behind has a size right now.
+    sql = ("SELECT h.id,h.event,h.detail,h.at,h.label,f.title,f.season,"
+           "f.episode,f.path,f.size FROM history h "
+           "LEFT JOIN files f ON f.id=h.file_id")
+    params: tuple = ()
+    if event:
+        sql += " WHERE h.event=?"; params = (event,)
+    sql += " ORDER BY h.at DESC LIMIT ?"
+    rows = _rows(sql, params + (limit,))
+    for r in rows:
+        if r.get("title"):
+            r["label"] = display_label(r["title"], r.get("season"), r.get("episode"))
+        else:
+            # pool-wide jobs carry their own name; fall back to it before giving up
+            r["label"] = r.get("label") or "—"
+    return {"rows": rows}
+
+
+@app.get("/api/arrs")
+async def api_arrs():
+    from .arr import shared_client
+    out = {}
+    for cfg in SETTINGS.arrs:
+        # Shared client - this endpoint is polled by the dashboard, and building
+        # an httpx.AsyncClient here meant an SSL-context construction on the
+        # event loop every time. Same defect as gate.check_arrs had.
+        c = shared_client(cfg)
+        st = await c.ping()
+        if st.get("ok"):
+            busy, reason = await c.busy()
+            st["busy"] = busy
+            st["busy_reason"] = reason
+        out[cfg.name] = st
+    return out
+
+
+_SCAN_LOCK = asyncio.Lock()
+
+
+async def _run_scan(library: str | None = None) -> None:
+    """One reconciliation pass. NEVER two at once.
+
+    The guard lives here, not at the call site. /api/libraries/rescan checked
+    STATE["scan"]["running"] before starting one, but the scheduled loop called
+    this function directly with no check at all - so a manual rescan and the
+    180-minute timer could overlap. They did, and the second one died with:
+
+        UNIQUE constraint failed: files.arr_name, files.arr_file_id
+
+    because both passes snapshot the files table up front, both decide the same
+    newly-imported file is missing, and both INSERT it. A guard on one of two
+    callers is not a guard; putting it on the function makes it impossible to
+    add a third caller that forgets.
+    """
+    if _SCAN_LOCK.locked():
+        joblog.log("library scan skipped: one is already running", "warn")
+        return
+
+    async with _SCAN_LOCK:
+        await _run_scan_locked(library)
+
+
+async def _log_scan_phases(scan_id: str) -> None:
+    """Write a line each time the scan changes phase or disk.
+
+    On a CHANGE, not on a timer. A 12-disk walk polled every few seconds would
+    bury the interesting transitions in hundreds of identical progress lines,
+    which is the thing that makes a long log useless. Percentage and rate ride
+    along on the line that was going to be written anyway.
+    """
+    last = None
+    try:
+        while True:
+            p = scanner.PROGRESS
+            key = (p.get("phase"), p.get("disk"), p.get("library"))
+            if key != last and (p.get("phase") or p.get("disk")):
+                last = key
+                bits = []
+                if p.get("phase"):
+                    bits.append(str(p["phase"]))
+                if p.get("disk"):
+                    bits.append(f"{p['disk']}"
+                                f" ({p.get('disk_i') or 0}/{p.get('disks') or 0})")
+                if p.get("library"):
+                    bits.append(str(p["library"]))
+                tail = []
+                if p.get("files"):
+                    tail.append(f"{int(p['files']):,} files")
+                if p.get("pct") is not None:
+                    tail.append(f"{p['pct']}%")
+                if p.get("eta_s"):
+                    tail.append(f"~{int(p['eta_s'])}s left")
+                joblog.log("  " + " · ".join(bits)
+                           + (f"   [{', '.join(tail)}]" if tail else ""),
+                           "debug", scan_id)
+            await asyncio.sleep(1.0)
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        pass                       # a progress log must never break the scan
+
+
+async def _run_scan_locked(library: str | None = None) -> None:
+    # THE SCAN GETS ITS OWN TRACKED LOG, LIKE A TRANSCODE.
+    #
+    # Every transcode writes a START/…/END transcript under its job id, which
+    # is what makes "what did this actually do" answerable afterwards. The
+    # library scan - the longest-running thing nuarr does, and the one that
+    # decides what everything else sees - wrote two loose lines into the main
+    # log and nothing else. Its phases were visible only as a label in the
+    # Libraries header while it ran, and unrecoverable once it finished.
+    #
+    # Same joblog machinery, same activity filter, so it can be read back the
+    # same way. The id is time-based rather than random so the dropdown sorts
+    # chronologically and one scan is telling apart from the next.
+    scan_id = "scan-" + time.strftime("%Y%m%d-%H%M%S")
+    STATE["scan"].update(running=True, started=time.time(), error=None,
+                         library=library or "all", phase="starting",
+                         job_id=scan_id)
+    joblog.log("=" * 60, "info", scan_id)
+    joblog.log(f"START [library scan] {library or 'all libraries'}",
+               "info", scan_id)
+    joblog.log("=" * 60, "info", scan_id)
+    joblog.log(f"library scan started: {library or 'all libraries'}", "info")
+    _scan_ticker = asyncio.create_task(_log_scan_phases(scan_id))
+    try:
+        # the live sub-phase comes from scanner.PROGRESS - this is just the
+        # opening label before the walk sets its own
+        STATE["scan"]["phase"] = "starting"
+        libs = [library] if library else None
+        rep = await scanner.scan(libraries=libs)
+        scanner.phase("promote")
+        STATE["scan"]["phase"] = "promoting eligible files"
+        # to_thread, not a bare call. These are ordinary sync functions that
+        # walk the files table and stat paths on the pool; invoked directly
+        # from a coroutine they run ON the event loop and freeze every HTTP
+        # request until they return. Same defect as verify_missing had.
+        promoted = await asyncio.to_thread(scanner.mark_eligible)
+        # A row inserted by this scan - an upgrade replacing a file, a new
+        # import - starts with no original language. The TITLE's answer is
+        # already known and never changes, so hand it straight over instead of
+        # leaving the row blank until the twelve-hourly sweep.
+        try:
+            from . import origlang as _ol
+            filled = await asyncio.to_thread(_ol.fill_missing)
+            if filled:
+                joblog.log(f"original language: filled {filled:,} new row(s) "
+                           f"from the titles already known", "debug")
+        except Exception:
+            pass
+        # Clear stale 'missing' rows left behind by upgrades, so the tile shows
+        # real losses rather than 700 rows of bookkeeping.
+        sw = await asyncio.to_thread(scanner.sweep_missing)
+        # Authoritative pass: the arrs decide what is missing, not our rows.
+        scanner.phase("missing")
+        STATE["scan"]["phase"] = "verifying missing files against the arrs"
+        # Reuse the scan's own arr fetch for both verify passes - refetching
+        # cost ~26 s and 39k objects each, twice, for data seconds old.
+        af, ast = scanner.take_arr_fetch()
+        vm = await scanner.verify_missing(af, ast)
+        scanner.phase("unmanaged")
+        STATE["scan"]["phase"] = "verifying unmanaged files against the arrs"
+        vu = await scanner.verify_unmanaged(af, ast)
+        scanner.drop_arr_fetch()      # release ~39k objects promptly
+        # Drop failure records that later work has already resolved, so the
+        # panel counts things that still need a human.
+        scanner.phase("tidy")
+        STATE["scan"]["phase"] = "tidying resolved failures"
+        cf = await asyncio.to_thread(scanner.clear_resolved_failures)
+        STATE["scan"]["result"] = rep.__dict__ | {"text": str(rep)}
+        STATE["scan"]["phase"] = "done"
+        scanner.end_scan()
+
+        # ONE readable report instead of four raw dict dumps.
+        # The old output printed Python repr - including the full arr status
+        # blob twice, ~400 characters of version strings nobody reads - and
+        # then logged the summary a second time from the caller. Report the
+        # numbers that changed, skip the ones that did not.
+        _log_scan_report(rep, promoted, sw, vm, vu, ast or {})
+        # Its own block: the tidy is a distinct pass with its own outcome, and
+        # burying it in the scan report made it invisible.
+        if cf.get("cleared") or cf.get("kept"):
+            with joblog.section("failure tidy") as ts:
+                ts.keep()
+                for r, n in (cf.get("reasons") or {}).items():
+                    ts.note(f"cleared {n} — {r}", "ok")
+                if cf.get("kept"):
+                    ts.note(f"{cf['kept']} failure(s) still unresolved — kept "
+                            f"for a human", "warn")
+                ts.result = f"{cf.get('cleared', 0)} cleared, {cf.get('kept', 0)} kept"
+        joblog.log(f"  found {int(getattr(rep, 'on_disk', 0) or 0):,} files on "
+                   f"{int(getattr(rep, 'disks', 0) or 0)} disks; "
+                   f"{promoted:,} promoted to eligible", "ok", scan_id)
+    except Exception as e:
+        STATE["scan"]["error"] = f"{type(e).__name__}: {e}"
+        STATE["scan"]["phase"] = "failed"
+        joblog.log(f"library scan failed: {e}", "error")
+        joblog.log(f"FAILED  {type(e).__name__}: {e}", "error", scan_id)
+        scanner.end_scan()
+    finally:
+        _scan_ticker.cancel()
+        took = time.time() - (STATE["scan"].get("started") or time.time())
+        joblog.log("=" * 60, "info", scan_id)
+        joblog.log(f"END    library scan  ({took:.0f}s)", "info", scan_id)
+        joblog.log("=" * 60, "info", scan_id)
+        STATE["scan"].update(running=False, last=time.time())
+
+
+def _log_scan_report(rep, promoted: int, sw: dict, vm: dict, vu: dict,
+                     arr_status: dict) -> None:
+    """Human-readable scan summary.
+
+    Design rules, learned from the output this replaces:
+      * never log a raw dict - it printed the arr status blob twice;
+      * only mention a counter that is non-zero, so a quiet scan is two lines
+        and a busy one is worth reading;
+      * group by what the reader cares about: what was found, what changed,
+        what needs attention.
+    """
+    def n(x) -> str:
+        return f"{int(x or 0):,}"
+
+    took = getattr(rep, "seconds", 0) or 0
+    joblog.log(f"scan complete in {took:.0f}s — {n(rep.on_disk)} files on "
+               f"{n(rep.disks)} disks, {n(rep.from_arrs)} tracked by the arrs",
+               "ok")
+
+    # what the arrs cost us, since that dominates the runtime
+    for name, st in (arr_status or {}).items():
+        if isinstance(st, dict) and st.get("ok"):
+            joblog.log(f"  {name}: {n(st.get('files'))} files in "
+                       f"{st.get('seconds', 0):.1f}s", "debug")
+        elif isinstance(st, dict):
+            joblog.log(f"  {name}: UNREACHABLE — {st.get('error', '?')}", "warn")
+
+    changed = []
+    for label, val in (("new", rep.inserted), ("renamed", rep.renamed),
+                       ("moved disk", rep.moved_disk), ("changed", rep.changed),
+                       ("superseded", rep.superseded)):
+        if val:
+            changed.append(f"{label} {n(val)}")
+    joblog.log("  changes: " + (", ".join(changed) if changed
+                                else "none — library matches the database"),
+               "info" if changed else "debug")
+
+    if promoted:
+        joblog.log(f"  {n(promoted)} file(s) settled and are now eligible", "ok")
+
+    # Reconcile is nearly all in-memory work - reads, two indexes and one
+    # executemany measured at ~1.1 s together. The only part that touches the
+    # pool is hashing files the arrs do not know about, so when the phase is
+    # slow this is the line that says why.
+    sig = getattr(rep, "sig_seconds", 0) or 0
+    hashed = getattr(rep, "sig_hashed", 0) or 0
+    if rep.orphans or sig:
+        reused = max(0, rep.orphans - hashed)
+        joblog.log(f"  reconcile: {n(rep.orphans)} orphan(s) — "
+                   f"{n(hashed)} hashed in {sig:.1f}s, "
+                   f"{n(reused)} reused an unchanged signature",
+                   "warn" if sig > 5 else "debug")
+
+    # HOW THE MISSING CHECK WAS ANSWERED.
+    #
+    # This phase used to stat every arr record - 39,244 filesystem calls whose
+    # cost swung from 26 s to 772 s depending on how busy the spindles were,
+    # because a handful of them block for over a second when a copy is queued
+    # ahead. It now answers from the set the walk already built and stats only
+    # what that set says is absent. Logged because "it is fast now" is a claim,
+    # and the stat count is the evidence.
+    if vm.get("stats_done") is not None:
+        joblog.log(
+            f"  missing check: {vm.get('total_s', 0)}s — "
+            f"{n(vm.get('arr_files'))} records, "
+            + (f"{n(vm.get('stats_done'))} disk checks (walk set used)"
+               if vm.get("used_walk_set")
+               else f"{n(vm.get('stats_done'))} disk checks, NO walk set")
+            + (f", arr re-fetch {vm.get('fetch_s')}s"
+               if vm.get("arr_refetched") else ""),
+            "warn" if vm.get("arr_refetched") else "debug")
+
+    # tidy-up done on our own bookkeeping
+    tidy = []
+    if sw.get("superseded_removed"):
+        tidy.append(f"{n(sw['superseded_removed'])} stale 'missing' rows dropped")
+    if sw.get("reappeared"):
+        tidy.append(f"{n(sw['reappeared'])} reappeared on disk")
+    if vm.get("stale_rows_removed"):
+        tidy.append(f"{n(vm['stale_rows_removed'])} rows the arrs no longer know")
+    if vu.get("linked_to_arr"):
+        tidy.append(f"{n(vu['linked_to_arr'])} adopted by an arr")
+    if vu.get("merged_duplicate_rows"):
+        tidy.append(f"{n(vu['merged_duplicate_rows'])} duplicate rows merged")
+    if tidy:
+        joblog.log("  tidied: " + ", ".join(tidy), "ok")
+
+    # things that want a human
+    attn = []
+    if vm.get("really_missing"):
+        attn.append(f"{n(vm['really_missing'])} genuinely missing "
+                    f"(the arr tracks a file that is not on disk)")
+    if vu.get("arr_knows_folder_not_file"):
+        attn.append(f"{n(vu['arr_knows_folder_not_file'])} unimported "
+                    f"(arr manages the folder but never took the file)")
+    if vu.get("not_in_any_arr"):
+        attn.append(f"{n(vu['not_in_any_arr'])} not in any arr")
+    if rep.orphans:
+        attn.append(f"{n(rep.orphans)} orphans")
+    if rep.duplicates:
+        attn.append(f"{n(rep.duplicates)} byte-identical duplicates")
+    for a in attn:
+        joblog.log(f"  needs attention: {a}", "warn")
+
+
+async def _settle_loop() -> None:
+    """Promote settled files without waiting for a full library scan.
+
+    mark_eligible() is one indexed UPDATE - milliseconds - while a full scan
+    walks 40,000 files across 12 disks and takes minutes. Tying promotion to
+    the scan meant a file could finish its 5-minute hold and then sit in 'Held'
+    for up to 3 hours purely because nothing had run. Separating them makes the
+    hold mean what it says.
+    """
+    await asyncio.sleep(20)
+    fast = False
+    while True:
+        try:
+            if not STATE["scan"]["running"]:      # let a scan own the DB
+                n = await asyncio.to_thread(scanner.mark_eligible)
+                if n:
+                    joblog.log(f"{n} file(s) settled and are now eligible", "ok")
+                # WATCH HELD FILES CLOSELY, IDLE OTHERWISE.
+                #
+                # The promotion test needs the file to be free for
+                # LOCK_QUIET_S, and a 20 s sweep gives that window only two
+                # samples - so a file grabbed briefly between them is missed,
+                # and a clean one waits up to 40 s to be promoted. While
+                # anything is held, sample every few seconds instead: more
+                # evidence that the file is really idle, and promotion lands
+                # close to the moment it earns it. With nothing held this
+                # costs one indexed count.
+                fast = bool(await asyncio.to_thread(scanner.held_count))
+        except Exception as e:
+            fast = False
+            joblog.log(f"settle loop error: {type(e).__name__}: {e}", "warn")
+        await asyncio.sleep(SETTLE_FAST_S if fast else SETTLE_POLL_S)
+
+
+SETTLE_POLL_S = 60.0
+# While files are held, sample often enough that LOCK_QUIET_S gets several
+# looks rather than two.
+SETTLE_FAST_S = 4.0
+
+
+async def _scan_scheduler() -> None:
+    """Run a library scan on a timer.
+
+    This matters more than it looks: mark_eligible() only runs as part of a
+    scan, so with no schedule a file can finish settling and still sit in
+    'Held' indefinitely because nothing ever promotes it. The 5-minute hold is
+    meaningless without something to act on it.
+    """
+    await asyncio.sleep(30)          # let startup settle
+    while True:
+        try:
+            every = int(workers.get().scan_every_min)
+        except Exception:
+            every = 180
+        if every <= 0:
+            await asyncio.sleep(60)   # disabled - re-read in case it changes
+            continue
+        last = STATE["scan"].get("last") or 0
+        due = last + every * 60
+        wait = max(30.0, due - time.time())
+        await asyncio.sleep(wait)
+        try:
+            if not STATE["scan"]["running"]:
+                joblog.log(f"scheduled library scan (every {every} min)", "info")
+                await _run_scan()
+        except Exception as e:
+            joblog.log(f"scheduled scan failed: {type(e).__name__}: {e}", "error")
+
+
+@app.post("/api/scan")
+async def api_scan():
+    if STATE["scan"]["running"]:
+        raise HTTPException(409, "a scan is already running")
+    asyncio.create_task(_run_scan())
+    return {"started": True}
+
+
+_RENAMES_CACHE: dict = {"rows": [], "at": 0.0, "running": False, "arr": None}
+_RENAMES_TTL = 900.0          # 15 min; the arrs' own libraries move slower
+
+
+@app.get("/api/renames")
+async def api_renames(arr: str | None = None, limit: int | None = None,
+                      refresh: bool = False):
+    r"""Pre-flighted rename plans. Never performs anything.
+
+    WHY THIS IS CACHED. The work is one HTTP round-trip to Sonarr or Radarr per
+    series - 1,081 of them here, at concurrency 20 - and it measured 88 seconds.
+    That cost is not nuarr's to optimise away: it is the arrs' API, and asking
+    them faster is what the concurrency limit already does.
+
+    What nuarr CAN do is stop paying it twice. A rename plan is a statement
+    about the arrs' library, which changes on the timescale of imports, not
+    seconds. So the answer is kept for 15 minutes and served instantly, with
+    its age attached so the page can say how old it is rather than implying it
+    is live. `refresh=true` forces a fresh pass.
+    """
+    now = time.time()
+    fresh_enough = (not refresh
+                    and _RENAMES_CACHE["rows"] is not None
+                    and _RENAMES_CACHE["at"]
+                    and _RENAMES_CACHE["arr"] == arr
+                    and (now - _RENAMES_CACHE["at"]) < _RENAMES_TTL)
+    if fresh_enough:
+        return {"count": len(_RENAMES_CACHE["rows"]),
+                "rows": _RENAMES_CACHE["rows"],
+                "cached": True,
+                "age_s": round(now - _RENAMES_CACHE["at"]),
+                "ttl_s": int(_RENAMES_TTL)}
+
+    out = []
+    for cfg in SETTINGS.arrs:
+        if arr and cfg.name.lower() != arr.lower():
+            continue
+        c = ArrClient(cfg)
+        try:
+            if not (await c.ping()).get("ok"):
+                continue
+            for p in await renamer.plan_all(c, limit=limit):
+                d = renamer.diagnose(p)
+                out.append({
+                    "arr": p.arr_name, "title": p.parent_title,
+                    "file_id": p.file_id, "parent_id": p.parent_id,
+                    "from": os.path.basename(p.existing_rel),
+                    "to": os.path.basename(p.new_rel),
+                    "blocked": p.blocked, "issues": p.issues,
+                    "category": d.category, "why": d.explanation,
+                    "remedy": d.remedy, "auto_fixable": d.auto_fixable,
+                    "locked_by": p.locked_by,
+                })
+        finally:
+            await c.close()
+    # Only cache a WHOLE pass. A limited or per-arr run is a different question
+    # and must not be served back as the answer to the general one.
+    if limit is None:
+        _RENAMES_CACHE.update(rows=out, at=time.time(), arr=arr)
+    return {"count": len(out), "rows": out, "cached": False, "age_s": 0,
+            "ttl_s": int(_RENAMES_TTL)}
+
+
+@app.post("/api/renames/apply")
+async def api_renames_apply(arr: str, parent_id: int, file_id: int,
+                            confirm: bool = False):
+    """Apply ONE rename. confirm=false is a dry run."""
+    cfg = next((c for c in SETTINGS.arrs if c.name.lower() == arr.lower()), None)
+    if not cfg:
+        raise HTTPException(404, f"unknown arr {arr}")
+    c = ArrClient(cfg)
+    try:
+        plans = [p for p in await renamer.plan_for_parent(c, parent_id)
+                 if p.file_id == file_id]
+        if not plans:
+            raise HTTPException(404, "no pending rename for that file")
+        p = plans[0]
+        d = renamer.diagnose(p)
+        if p.blocked and d.category == "orphan_record":
+            r = await renamer.repair_orphan(c, p, confirm=confirm)
+        elif p.blocked and d.category == "corrupt_parse":
+            r = await renamer.repair_corrupt_name(c, p, confirm=confirm)
+        else:
+            r = await renamer.apply_rename(c, p, confirm=confirm)
+        # The cached plan list just became wrong about at least one row.
+        # A dry run changes nothing, so it does not invalidate anything.
+        if confirm:
+            _RENAMES_CACHE.update(rows=[], at=0.0)
+        return JSONResponse(r.__dict__ | {"confirmed": confirm})
+    finally:
+        await c.close()
+
+
+@app.get("/api/jobs")
+def api_jobs(recent: int = Query(60, le=1000)):
+    # system load rides along with the job poll - one request, always in step
+    # with the worker rows it sits above.
+    # `recent` defaults low: this is polled every 2 s, and shipping 300 finished
+    # rows each time made a 160 KB response out of data that rarely changes.
+    return jobs.snapshot(recent_limit=recent) | {"system": system.snapshot()}
+
+
+@app.get("/api/playback")
+def api_playback(days: int = Query(30, le=365)):
+    """What Plex had to work at, and which track caused it."""
+    from . import playback
+    try:
+        return playback.offenders(days=days)
+    except Exception as e:
+        return {"files": [], "by_cause": [], "by_client": [], "total": 0,
+                "watching": False, "error": f"{type(e).__name__}: {e}"}
+
+
+@app.get("/api/playback/detail")
+def api_playback_detail(path: str = "", file_id: int | None = None,
+                        days: int = Query(90, le=365)):
+    from . import playback
+    try:
+        return playback.detail_for(path=path, file_id=file_id, days=days)
+    except Exception as e:
+        return {"events": [], "error": f"{type(e).__name__}: {e}"}
+
+
+@app.post("/api/playback/poll")
+async def api_playback_poll():
+    from . import playback
+    return await playback.poll_once()
+
+
+@app.get("/api/arrs/health")
+async def api_arrs_health(refresh: bool = False):
+    r"""What Sonarr and Radarr say is wrong with THEMSELVES.
+
+    This lived on the Metadata page, under the TheTVDB and TMDB rows, which put
+    "your indexer has been down for six hours" beneath a heading about metadata
+    providers. Indexers, download clients, root folders and disk space are the
+    arr's own business - the same server whose URL and API key are configured
+    on this page - so a warning about them belongs here, next to the connection
+    it is describing.
+
+    SERVED FROM THE WATCHER, not fetched per request: arrhealth.watch() polls
+    every five minutes, so the page paints instantly and - more usefully - the
+    appearance and the CLEARING of each warning are both logged as they happen,
+    rather than only being visible to whoever is looking at the time.
+
+    `refresh` forces a live pass, for the button on the page.
+    """
+    from . import arrhealth
+    if refresh or not arrhealth.STATE["checked"]:
+        return await arrhealth.refresh()
+    return arrhealth.snapshot()
+
+
+@app.get("/api/metadata")
+async def api_metadata():
+    r"""The metadata chain, stated as a chain rather than as a status light.
+
+    nuarr has no connection to TMDB or TheTVDB and never will - the arrs own
+    that relationship. Reporting "TMDB: connected" would be an invention, and
+    when a title's language looked wrong it would send someone to check the
+    wrong thing. So each link is reported separately and named for who owns it:
+
+        TMDB / TheTVDB  ->  the arr        (the arr's own refresh task)
+        the arr         ->  nuarr          (origlang.sync, every 12h)
+    """
+    from . import origlang
+    from .arr import shared_client
+
+    # Which scheduled task in each arr is the one that talks to the provider.
+    WANT = {"sonarr": ("RefreshSeries", "TheTVDB"),
+            "radarr": ("RefreshMovie", "TMDB")}
+    out = []
+    for cfg in SETTINGS.arrs:
+        if not cfg.enabled or not cfg.api_key:
+            continue
+        task_name, provider = WANT.get(cfg.kind, ("", ""))
+        row = {"arr": cfg.name, "kind": cfg.kind, "provider": provider,
+               "ok": False, "version": None, "health": [], "task": None,
+               "error": None}
+        c = shared_client(cfg)
+        try:
+            st = await c._get("/system/status")
+            row["ok"] = True
+            row["version"] = st.get("version")
+        except Exception as e:
+            row["error"] = f"{type(e).__name__}"
+            out.append(row)
+            continue
+        try:
+            row["health"] = [
+                {"type": h.get("type"), "source": h.get("source"),
+                 "message": (h.get("message") or "")[:160]}
+                for h in (await c._get("/health") or [])]
+        except Exception:
+            pass
+        try:
+            for t in (await c._get("/system/task") or []):
+                if (t.get("taskName") or "") == task_name:
+                    row["task"] = {
+                        "name": task_name,
+                        "interval_min": t.get("interval"),
+                        "last": t.get("lastExecution"),
+                        "next": t.get("nextExecution"),
+                        "duration": t.get("lastDuration"),
+                    }
+                    break
+        except Exception:
+            pass
+        out.append(row)
+    return {"arrs": out, "nuarr": origlang.coverage()}
+
+
+@app.post("/api/metadata/refresh")
+async def api_metadata_refresh(arr: str):
+    """Ask ONE arr to re-read its metadata provider now."""
+    from .arr import shared_client
+    cfg = next((c for c in SETTINGS.arrs
+                if c.name.lower() == arr.lower() and c.enabled), None)
+    if not cfg:
+        raise HTTPException(404, "unknown arr")
+    name = "RefreshSeries" if cfg.kind == "sonarr" else "RefreshMovie"
+    c = shared_client(cfg)
+    try:
+        await c._post("/command", {"name": name})
+    except Exception as e:
+        raise HTTPException(502, f"{type(e).__name__}: {e}")
+    joblog.log(f"asked {cfg.name} to refresh its metadata ({name})", "info")
+    return {"ok": True, "arr": cfg.name, "command": name}
+
+
+@app.get("/api/origlang")
+def api_origlang():
+    from . import origlang
+    return origlang.coverage()
+
+
+@app.post("/api/origlang/sync")
+async def api_origlang_sync():
+    from . import origlang
+    return await origlang.sync()
+
+
+@app.get("/api/audit")
+def api_audit(run_id: int = 0):
+    """A rule-conformance run, its findings, the trend and the heal record."""
+    from . import audit
+    try:
+        return audit.latest(run_id=run_id)
+    except Exception as e:
+        return {"run": None, "history": [], "findings": [], "heals": [],
+                "stats": {"last_error": f"{type(e).__name__}: {e}"}}
+
+
+@app.post("/api/audit/run")
+async def api_audit_run(per_bucket: int = Query(6, le=40)):
+    from . import audit
+    audit.init()
+    return await audit.run_once(per_bucket=per_bucket)
+
+
+@app.post("/api/audit/heal/clear")
+def api_audit_heal_clear(file_id: int):
+    """Drop a terminal heal verdict, so the next run may try the file again."""
+    from . import audit
+    return {"cleared": audit.clear_heal(file_id)}
+
+
+@app.post("/api/audit/heal/try")
+async def api_audit_heal_try(file_id: int):
+    """Heal ONE file now, recording the verdict the way a nightly run would."""
+    from . import audit
+    return await audit.heal_file(file_id)
+
+
+@app.get("/api/jobs/live")
+def api_jobs_live():
+    """The worker cards only, for the fast poll. See jobs.live_snapshot().
+
+    No system snapshot either - loadSys() already polls that on its own second,
+    and sampling it twice would make the CPU bar disagree with itself.
+    """
+    return jobs.live_snapshot()
+
+
+# ----------------------------------------------------------------- icon ----
+# Drawn as SVG rather than shipped as a .ico: it stays crisp at any size, is a
+# few hundred bytes, and needs no build step or binary in the repo.
+#
+# Constraints that shaped it - a favicon is rendered at 16px. Anything with
+# fine detail turns to mush, so: one bold glyph, high contrast, no thin strokes.
+# The N's right leg IS the play triangle, which ties the letter to what the app
+# does instead of bolting a second symbol beside it.
+FAVICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#58a6ff"/>
+      <stop offset="1" stop-color="#3fb950"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="14" fill="#0f1216"/>
+  <rect x="2" y="2" width="60" height="60" rx="12" fill="url(#g)"/>
+  <!-- N: left stem, diagonal, and a right leg that reads as a play arrow -->
+  <path d="M14 48V16h8l14 20V16h8v32h-8L22 28v20z" fill="#0f1216"/>
+  <path d="M44 22l10 6-10 6z" fill="#0f1216" opacity=".85"/>
+</svg>"""
+
+
+@app.get("/favicon.svg", include_in_schema=False)
+def favicon_svg():
+    return Response(FAVICON_SVG, media_type="image/svg+xml",
+                    headers={"Cache-Control": "public, max-age=86400"})
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon_ico():
+    # Browsers still request /favicon.ico unprompted. Serving the SVG here
+    # keeps a 404 out of the log; the <link> tags below are what actually get
+    # used by anything modern.
+    return Response(FAVICON_SVG, media_type="image/svg+xml",
+                    headers={"Cache-Control": "public, max-age=86400"})
+
+
+# Installed-version reads are cached: mkvmerge --version spawns a process, and
+# the header pill would otherwise pay that on every poll.
+_MKV: dict = {"at": 0.0, "merge": None, "prop": None,
+              "chk_at": 0.0, "latest": "", "chk_err": ""}
+
+
+@app.get("/api/mkvtool")
+async def api_mkvtool(check: int = 0):
+    """MKVToolNix status, mirroring the ffmpeg tab's shape.
+
+    Reports and verifies only - never installs. MKVToolNix ships as a system
+    installer, not a droppable binary, so an auto-apply here would be the
+    ffmpeg updater's UI wrapped around a thing it cannot actually do.
+    """
+    import subprocess
+
+    mm = r"C:\Program Files\MKVToolNix\mkvmerge.exe"
+    mp = r"C:\Program Files\MKVToolNix\mkvpropedit.exe"
+
+    def _ver(exe):
+        if not os.path.exists(exe):
+            return {"ok": False, "error": "not installed", "path": exe}
+        try:
+            out = subprocess.run([exe, "--version"], capture_output=True,
+                                 text=True, timeout=15,
+                                 creationflags=NO_WINDOW).stdout or ""
+            m = re.search(r"v(\d+(?:\.\d+)*)\s*\('([^']*)'\)", out)
+            return {"ok": True, "version": m.group(1) if m else out.strip()[:40],
+                    "codename": m.group(2) if m else "", "path": exe}
+        except Exception as e:
+            return {"ok": False, "error": f"{type(e).__name__}: {e}", "path": exe}
+
+    now = time.time()
+    if now - _MKV["at"] > 300 or _MKV["merge"] is None:
+        _MKV["merge"], _MKV["prop"] = await asyncio.to_thread(
+            lambda: (_ver(mm), _ver(mp)))
+        _MKV["at"] = now
+
+    if check and now - _MKV["chk_at"] > 600:
+        def _latest():
+            import gzip
+            import httpx
+            r = httpx.get("https://mkvtoolnix.download/latest-release.xml.gz",
+                          timeout=15)
+            r.raise_for_status()
+            xml = gzip.decompress(r.content).decode("utf-8", "replace")
+            m = re.search(r"<latest-source>.*?<version>([\d.]+)</version>",
+                          xml, re.S)
+            return m.group(1) if m else ""
+        try:
+            _MKV["latest"] = await asyncio.to_thread(_latest)
+            _MKV["chk_err"] = ""
+        except Exception as e:
+            _MKV["chk_err"] = f"{type(e).__name__}: {e}"
+        _MKV["chk_at"] = now
+
+    uses = [
+        {"component": "Subtitle embed (subocr)", "tool": "mkvmerge",
+         "why": "muxes the OCR'd SRT in and reorders tracks so text subs "
+                "come first; the PGS demote happens in the same pass"},
+        {"component": "Track flag edits", "tool": "mkvpropedit",
+         "why": "header-only default/forced changes - about a second, no "
+                "remux, video untouched"},
+        {"component": "Repair scripts", "tool": "mkvmerge / mkvpropedit",
+         "why": "the PowerShell OCR and flag-repair scripts resolve the same "
+                "installed binaries"},
+    ]
+    return {"merge": _MKV["merge"], "prop": _MKV["prop"],
+            "latest": _MKV["latest"], "check_error": _MKV["chk_err"],
+            "checked_at": _MKV["chk_at"], "uses": uses}
+
+
+@app.get("/api/ffmpeg/check")
+async def api_ffmpeg_check():
+    """Is there a newer build, AND could this machine actually run it?
+
+    upgrade_safety() is answered here rather than only on /api/ffmpeg/nvenc
+    because the header renders from THIS response. Split across two endpoints,
+    the bubble painted "ffmpeg 9.0 available" the moment the version check
+    landed and only corrected itself to "blocked" seconds later, once the
+    slower nvenc call returned - so the header spent that window inviting an
+    update that would break every re-encode on this driver. One request, one
+    verdict, no wrong intermediate state.
+    """
+    out = await ffmpeg_update.check() | {"staged": ffmpeg_update.staged()}
+    try:
+        out["upgrade"] = ffmpeg_update.upgrade_safety(out.get("latest") or "")
+    except Exception as e:
+        out["upgrade"] = {"known": False, "error": str(e)}
+    out["pinned"] = ffmpeg_update.pinned_dir() or None
+    return out
+
+
+@app.get("/api/ffmpeg/progress")
+def api_ffmpeg_progress():
+    """Live staging progress - cheap, safe to poll while downloading."""
+    return ffmpeg_update.progress() | {"running_jobs": len(jobs.RUNNING)}
+
+
+@app.post("/api/ffmpeg/stage")
+async def api_ffmpeg_stage(confirm: bool = False, background: bool = True,
+                           force: bool = False):
+    """Download + verify without touching the live binary.
+
+    Runs detached by default: the download takes minutes and an HTTP request
+    should not be held open for it. Poll /api/ffmpeg/progress.
+    """
+    if not confirm or not background:
+        return await ffmpeg_update.stage(confirm=confirm, force=force)
+    if ffmpeg_update.PROGRESS.get("active"):
+        return {"ok": False, "error": "a download is already running"}
+    # check the already-installed guard BEFORE detaching, so the caller gets a
+    # real answer instead of a task that quietly declines
+    pre = await ffmpeg_update.stage(confirm=False)
+    chk = await ffmpeg_update.check()
+    if not chk.get("update_available") and not force:
+        return {"ok": False, "already": chk.get("current"),
+                "error": f"{chk.get('current')} is already installed - "
+                         f"use force=true to re-download"}
+    asyncio.create_task(ffmpeg_update.stage(confirm=True, force=force))
+    return {"ok": True, "started": True,
+            "message": "downloading in the background - watch progress"}
+
+
+@app.post("/api/ffmpeg/apply")
+def api_ffmpeg_apply(force: bool = False):
+    """Swap a staged build in. Refuses while jobs run unless forced."""
+    if jobs.RUNNING and not force:
+        return {"ok": False, "waiting": True,
+                "running_jobs": len(jobs.RUNNING),
+                "message": "jobs are running - it will apply automatically "
+                           "when the queue is idle, or pass force=true"}
+    return ffmpeg_update.apply_staged()
+
+
+# ------------------------------------------------------------- lifecycle ----
+@app.get("/api/control/status")
+def api_control_status():
+    return lifecycle.status()
+
+
+@app.post("/api/control/restart")
+def api_control_restart(wait_for_idle: bool = True, force: bool = False):
+    return lifecycle.request("restart", wait_for_idle, force)
+
+
+@app.post("/api/control/shutdown")
+def api_control_shutdown(wait_for_idle: bool = True, force: bool = False):
+    return lifecycle.request("shutdown", wait_for_idle, force)
+
+
+@app.post("/api/control/cancel")
+def api_control_cancel():
+    return lifecycle.cancel()
+
+
+@app.get("/api/ffmpeg/changelog")
+async def api_ffmpeg_changelog(version: str = ""):
+    v = version or (await ffmpeg_update.check()).get("latest", "")
+    return {"version": v, "changelog": await ffmpeg_update.changelog(v)}
+
+
+@app.post("/api/ffmpeg/install")
+async def api_ffmpeg_install(confirm: bool = False):
+    """Download and adopt the latest build. confirm=false only reports."""
+    return await ffmpeg_update.install(confirm=confirm)
+
+
+@app.get("/api/ffmpeg/consumers")
+def api_ffmpeg_consumers():
+    """Which components use ffmpeg, and whether they resolve to the right one."""
+    return ffmpeg_update.consumers()
+
+
+@app.get("/api/ffmpeg/verify")
+def api_ffmpeg_verify():
+    """Is the installed build usable? Cheap - runs both binaries."""
+    return ffmpeg_update.verify_install()
+
+
+@app.post("/api/ffmpeg/repair")
+async def api_ffmpeg_repair(confirm: bool = False, background: bool = True):
+    """Re-download the current release and overwrite the install."""
+    if not confirm:
+        return await ffmpeg_update.repair(confirm=False)
+    if ffmpeg_update.PROGRESS.get("active"):
+        return {"ok": False, "error": "a download is already running"}
+    if not background:
+        return await ffmpeg_update.repair(confirm=True)
+    asyncio.create_task(ffmpeg_update.repair(confirm=True))
+    return {"ok": True, "started": True,
+            "message": "re-downloading in the background - watch progress"}
+
+
+@app.get("/api/ffmpeg/driver")
+async def api_driver_outlook(force: bool = False):
+    """Installed driver vs newest published, and what each would allow.
+
+    Network call, so it runs off the event loop and is cached for six hours by
+    ffmpeg_update.latest_driver().
+    """
+    if force:
+        await asyncio.to_thread(ffmpeg_update.latest_driver, True)
+    return await asyncio.to_thread(ffmpeg_update.driver_outlook)
+
+
+@app.get("/api/ffmpeg/nvenc")
+async def api_ffmpeg_nvenc(force: bool = False):
+    """Does hevc_nvenc actually open, and is the next version safe to take?"""
+    # nvenc_check launches ffmpeg to open an encoder session - seconds of
+    # subprocess work. It was doing that on the event loop.
+    res = await asyncio.to_thread(ffmpeg_update.nvenc_check, force)
+    res["pinned"] = ffmpeg_update.pinned_dir() or None
+    try:
+        chk = await ffmpeg_update.check()
+        res["upgrade"] = ffmpeg_update.upgrade_safety(chk.get("latest") or "")
+        res["current"] = chk.get("current")
+        res["update_available"] = chk.get("update_available")
+    except Exception as e:
+        res["upgrade"] = {"known": False, "error": str(e)}
+    return res
+
+
+@app.post("/api/ffmpeg/pin")
+def api_ffmpeg_pin(path: str | None = None):
+    """Pin the directory ffmpeg is used from, or unpin with no path.
+
+    For when the newest build cannot encode on this machine - the updater keeps
+    reporting, but jobs use the build that works.
+    """
+    res = ffmpeg_update.set_pin(path)
+    if res.get("ok"):
+        ffmpeg_update.nvenc_check(force=True)      # re-test the new binary
+        joblog.log(f"ffmpeg pinned to {res.get('pinned') or '(unpinned)'}", "warn")
+    return res
+
+
+@app.post("/api/ffmpeg/rollback")
+def api_ffmpeg_rollback(force: bool = False):
+    return ffmpeg_update.rollback(force=force)
+
+
+@app.get("/api/diag/memory")
+def api_diag_memory():
+    """Sizes of every long-lived in-memory structure, plus process RSS.
+
+    A leak in a long-running server is only visible as growth over time, and
+    guessing which dict is to blame is how you end up rewriting the wrong one.
+    Report the counts so the question is answerable by sampling twice.
+    """
+    import gc
+    import psutil
+
+    p = psutil.Process()
+    live = joblog._LIVE
+    return {
+        "rss_mb": round(p.memory_info().rss / 1024 ** 2, 1),
+        "threads": p.num_threads(),
+        "handles": getattr(p, "num_handles", lambda: None)(),
+        "gc_objects": len(gc.get_objects()),
+        "gc_counts": gc.get_count(),
+        "structures": {
+            # unbounded unless something removes entries
+            "joblog._LIVE": len(live),
+            "joblog._LIVE_lines": sum(len(d) for d in live.values()),
+            "joblog._RECENT": len(joblog._RECENT),
+            "jobs.RUNNING": len(jobs.RUNNING),
+            "jobs._LAST_REFRESH": len(jobs._LAST_REFRESH),
+            "jobs.BATCH_pools": len(jobs.BATCH.get("pools", {})),
+            "gate._CACHE": len(gate._CACHE),
+            "gate._CACHE_LOCKS": len(gate._CACHE_LOCKS),
+            "scanner.PROGRESS": len(scanner.PROGRESS),
+            "webhooks.RECENT": len(webhooks.RECENT),
+            "webhooks.STATUS": len(webhooks.STATUS),
+        },
+    }
+
+
+@app.get("/api/system")
+def api_system():
+    return system.snapshot()
+
+
+@app.post("/api/files/sweep-missing")
+def api_sweep_missing():
+    """Offline pass: drop 'missing' rows an upgrade already superseded."""
+    r = scanner.sweep_missing()
+    joblog.log(f"missing sweep: {r}", "ok")
+    return r
+
+
+@app.post("/api/files/verify-missing")
+async def api_verify_missing():
+    """Ask Sonarr/Radarr what is actually missing and reconcile to that."""
+    r = await scanner.verify_missing()
+    joblog.log(f"missing verified against the arrs: {r}", "ok")
+    return r
+
+
+@app.post("/api/files/verify-unmanaged")
+async def api_verify_unmanaged():
+    """Adopt any 'unmanaged' file the arrs actually track, and explain the rest."""
+    r = await scanner.verify_unmanaged()
+    joblog.log(f"unmanaged verified against the arrs: {r}", "ok")
+    return r
+
+
+@app.get("/api/commits/queue")
+def api_commit_queue():
+    """Encodes finished but not yet swapped in, usually blocked by a lock."""
+    return commitqueue.stats()
+
+
+@app.post("/api/commits/retry")
+async def api_commit_retry(all: bool = False):
+    if all:
+        with cursor() as cur:
+            cur.execute("UPDATE commit_queue SET next_try_at=? "
+                        "WHERE done_at IS NULL", (time.time(),))
+    return await commitqueue.run_due(limit=100)
+
+
+@app.get("/api/renames/queue")
+def api_rename_queue():
+    return renamequeue.stats()
+
+
+@app.post("/api/renames/retry")
+async def api_rename_retry(all: bool = False):
+    """Run due retries now. all=true drags every pending row forward."""
+    if all:
+        with cursor() as cur:
+            cur.execute("UPDATE rename_queue SET next_try_at=? "
+                        "WHERE done_at IS NULL", (time.time(),))
+    return await renamequeue.run_due(limit=200)
+
+
+RENAME_SCAN: dict = {"running": False, "queued": 0, "arr": None,
+                     "started": None, "finished": None, "error": None}
+
+
+async def _rename_scan(arr: str | None = None) -> None:
+    """Sweep both arrs for names that no longer match and queue them.
+
+    Runs detached: plan_all walks every series/movie and takes minutes, which
+    is far longer than any HTTP request should live. This catches everything
+    stranded BEFORE the retry queue existed - the arrs already know which files
+    need renaming, so ask them rather than re-deriving it.
+    """
+    from .arr import ArrClient
+    RENAME_SCAN.update(running=True, queued=0, arr=arr or "all",
+                       started=time.time(), finished=None, error=None)
+    joblog.log(f"rename sweep started ({arr or 'all arrs'})", "info")
+    try:
+        for cfg in SETTINGS.arrs:
+            if not (cfg.enabled and cfg.api_key):
+                continue
+            if arr and cfg.name.lower() != arr.lower():
+                continue
+            client = ArrClient(cfg)
+            try:
+                plans = await renamer.plan_all(client)
+                joblog.log(f"{cfg.name}: {len(plans)} file(s) need renaming", "info")
+                for p in plans:
+                    with cursor() as cur:
+                        f = cur.execute(
+                            "SELECT id FROM files WHERE path=? COLLATE NOCASE",
+                            (p.existing_abs,)).fetchone()
+                    if not f:
+                        continue
+                    renamequeue.enqueue(f["id"], cfg.name, p.parent_id,
+                                        p.existing_abs, "found by rename sweep")
+                    RENAME_SCAN["queued"] += 1
+            finally:
+                await client.close()
+        joblog.log(f"rename sweep queued {RENAME_SCAN['queued']} file(s)", "ok")
+    except Exception as e:
+        RENAME_SCAN["error"] = f"{type(e).__name__}: {e}"
+        joblog.log(f"rename sweep failed: {e}", "error")
+    finally:
+        RENAME_SCAN.update(running=False, finished=time.time())
+
+
+@app.post("/api/renames/scan")
+async def api_rename_scan(arr: str | None = None):
+    if RENAME_SCAN["running"]:
+        raise HTTPException(409, "a rename sweep is already running")
+    asyncio.create_task(_rename_scan(arr))
+    return {"started": True, "message": "sweeping in the background — "
+                                        "watch /api/renames/queue"}
+
+
+@app.get("/api/renames/scan/status")
+def api_rename_scan_status():
+    return RENAME_SCAN | {"queue": renamequeue.stats()}
+
+
+ENQ = {"running": False, "done": 0, "total": 0, "library": None, "error": None,
+       # libraries waiting their turn behind the one being built
+       "pending": [], "queued_libraries": []}
+
+
+def _prio(row: dict) -> int:
+    """Job priority for an eligible file. Lower runs first.
+
+    Ordering _eligible_rows is not enough on its own: it only decides the order
+    jobs are CREATED in, and the dispatcher sorts the jobs table by
+    (priority, created_at). A requeued file added to an existing queue would
+    still sit behind everything already there. Giving it a lower priority moves
+    it ahead in the dispatcher's own ordering too.
+
+    60, not 0: handler jobs sit at 50 and must stay in front, because a repair
+    has to finish before a transcode touches the same file.
+    """
+    return 60 if row.get("requeued_at") else 100
+
+
+def _clear_requeued(file_ids: list[int]) -> None:
+    """Drop the marker once the job exists, so the boost applies once."""
+    if not file_ids:
+        return
+    with cursor() as cur:
+        cur.executemany("UPDATE files SET requeued_at=NULL WHERE id=?",
+                        [(i,) for i in file_ids])
+
+
+def _eligible_rows(library: str | None, limit: int | None) -> list[dict]:
+    # EXCLUDE what is already in flight.
+    # enqueue() does not change files.state, so a queued file is still
+    # 'eligible'. Ordering by size then meant "Queue 10" picked the same ten
+    # largest files every time - all already queued - and reported "queued 0".
+    # Pressing the button a second time appeared to do nothing at all.
+    sql = ("SELECT id, path, title, season, episode, requeued_at "
+           "FROM files WHERE state='eligible' "
+           "AND arr_file_id IS NOT NULL "
+           "AND id NOT IN (SELECT file_id FROM jobs "
+           "               WHERE file_id IS NOT NULL "
+           "                 AND state IN ('queued','running'))")
+    params: tuple = ()
+    if library:
+        sql += " AND library=?"
+        params = (library,)
+    # Requeued files first, newest requeue at the very top; everything else by
+    # size as before. This ordering is what makes "Requeue" actually mean
+    # "run these next" rather than "put them somewhere in a queue of 2,000".
+    sql += (" ORDER BY CASE WHEN requeued_at IS NULL THEN 1 ELSE 0 END, "
+            "requeued_at DESC, size DESC")
+    if limit:
+        sql += " LIMIT ?"
+        params = params + (limit,)
+    rows = _rows(sql, params)
+    for r in rows:
+        r["label"] = display_label(r.get("title"), r.get("season"), r.get("episode"))
+    return rows
+
+
+async def _bulk_one(library: str | None) -> None:
+    """Queue every eligible file in ONE library."""
+    ENQ.update(running=True, done=0, total=0, library=library, error=None)
+    with joblog.section(f"bulk queue: {library or 'all libraries'}") as sec:
+        sec.keep()
+        try:
+            rows = _eligible_rows(library, None)
+            ENQ["total"] = len(rows)
+            sec.note(f"{len(rows):,} eligible file(s)")
+            skipped = 0
+            for r in rows:
+                try:
+                    # A file carrying requeued_at was put back deliberately, so
+                    # it keeps that identity even when a bulk queue is what
+                    # actually picks it up - otherwise "clear requeued" would
+                    # miss the very files it exists to clear.
+                    await jobs.enqueue(r["id"], r["path"], r["label"],
+                                       priority=_prio(r),
+                                       source=("requeue" if r.get("requeued_at")
+                                               else "manual"))
+                except ValueError as e:
+                    # already queued or running - expected when a bulk queue
+                    # overlaps existing work, not an error worth a red line
+                    skipped += 1
+                    joblog.log(f"skipped {r['label']}: {e}", "debug")
+                except Exception as e:
+                    sec.note(f"enqueue failed for {r['label']}: {e}", "error")
+                ENQ["done"] += 1
+            _clear_requeued([r["id"] for r in rows if r.get("requeued_at")])
+            sec.result = (f"{ENQ['done']:,} queued"
+                          + (f", {skipped:,} already in flight" if skipped else ""))
+        except Exception as e:
+            ENQ["error"] = f"{type(e).__name__}: {e}"
+            sec.result = f"failed: {e}"
+            raise
+
+
+async def _bulk_runner(first: str | None) -> None:
+    r"""Run bulk queues ONE AT A TIME, draining anything queued behind them.
+
+    Queueing used to be a single in-flight operation: asking for a second
+    library while the first was still building returned 409 "a bulk queue is
+    already running", so you had to sit and watch a 20,000-file pass finish
+    before you could line up the next one. There is no reason the request has
+    to be refused - it just has to WAIT. Requests now stack, and each starts as
+    the previous one finishes.
+
+    Deliberately sequential rather than concurrent: enqueue() runs an ffprobe
+    per file, and two passes interleaving would double the probe load on the
+    pool for no gain - the dispatcher can only start as many jobs as it has
+    workers either way.
+    """
+    pending: list[str | None] = [first]
+    try:
+        while pending:
+            lib = pending.pop(0)
+            # Absorb anything added while the previous pass ran, THEN publish
+            # the whole remaining list. Publishing ENQ["pending"] alone showed
+            # nothing, because the runner had already drained it into here -
+            # so the UI said "then …" with an empty list.
+            if ENQ.get("pending"):
+                pending += ENQ["pending"]
+                ENQ["pending"] = []
+            ENQ["queued_libraries"] = [x or "all libraries" for x in pending]
+            try:
+                await _bulk_one(lib)
+            except Exception as e:
+                # one library failing must not strand the rest of the list
+                joblog.log(f"bulk queue for {lib or 'all'} failed: {e}", "error")
+    finally:
+        ENQ["running"] = False
+        ENQ["pending"] = []
+        ENQ["queued_libraries"] = []
+
+
+@app.get("/api/jobs/enqueue/status")
+def api_enqueue_status():
+    return ENQ
+
+
+@app.post("/api/jobs/enqueue")
+async def api_enqueue(limit: int = Query(10, le=5000), library: str | None = None,
+                      dry_run: bool = True, all_files: bool = False):
+    """Queue eligible files. dry_run=true only reports what WOULD be queued."""
+    # How many eligible files are NOT queueable, and why. Without this the two
+    # screens disagreed with no explanation: 65 eligible, 18 offered.
+    skipped = _rows("SELECT COUNT(*) n FROM files WHERE state='eligible' "
+                    "AND arr_file_id IS NULL"
+                    + (" AND library=?" if library else ""),
+                    (library,) if library else ())[0]["n"]
+
+    if all_files:
+        total = _rows("SELECT COUNT(*) n FROM files WHERE state='eligible' "
+                      "AND arr_file_id IS NOT NULL"
+                      + (" AND library=?" if library else ""),
+                      (library,) if library else ())[0]["n"]
+        if dry_run:
+            return {"dry_run": True, "would_queue": total, "all": True,
+                    "unmanaged_skipped": skipped,
+                    "sample": [r["label"] for r in _eligible_rows(library, 10)]}
+        if ENQ["running"]:
+            # LINE IT UP instead of refusing it. This used to 409, which meant
+            # queueing three libraries was three separate waits at the screen.
+            ENQ.setdefault("pending", []).append(library)
+            await jobs.start()
+            return {"queued": 0, "bulk": True, "total": total,
+                    "queued_behind": len(ENQ["pending"]),
+                    "now_building": ENQ.get("library"),
+                    "message": f"added to the queue - starts when "
+                               f"{ENQ.get('library') or 'the current pass'} finishes"}
+        asyncio.create_task(_bulk_runner(library))
+        await jobs.start()
+        return {"queued": 0, "bulk": True, "total": total,
+                "message": "queueing in the background - watch the progress"}
+
+    rows = _eligible_rows(library, limit)
+    if dry_run:
+        return {"dry_run": True, "would_queue": len(rows),
+                "unmanaged_skipped": skipped,
+                "sample": [r["label"] for r in rows[:10]]}
+    out, skipped_dupes = [], 0
+    # APPENDS, never interleaves: enqueue() stamps created_at=now and uses the
+    # same priority band (100) as everything else, so a numbered add lands at
+    # the end of the existing queue rather than among it. Requeued files are
+    # the deliberate exception - _prio() gives them 60 so a "run this again"
+    # goes to the front, which is the whole point of pressing Requeue.
+    try:
+        for r in rows:
+            try:
+                j = await jobs.enqueue(r["id"], r["path"], r["label"],
+                                       priority=_prio(r),
+                                       source=("requeue" if r.get("requeued_at")
+                                               else "manual"))
+                out.append(j.id)
+            except ValueError:
+                # already queued or running. The BULK path has always tolerated
+                # this; here it propagated, so one file that happened to be in
+                # flight aborted the whole request - taking the requeue-marker
+                # cleanup with it and leaving the boost applied forever.
+                skipped_dupes += 1
+    finally:
+        # clear in a finally: the marker is a one-shot boost, and leaving it set
+        # because of an error means these files jump the queue on every future
+        # enqueue too.
+        _clear_requeued([r["id"] for r in rows if r.get("requeued_at")])
+    await jobs.start()
+    return {"queued": len(out), "job_ids": out,
+            "already_in_flight": skipped_dupes}
+
+
+@app.get("/api/libraries")
+def api_libraries():
+    return _memo("libraries", 5.0, _libraries_impl)
+
+
+def _libraries_impl():
+    # WHAT IS OUTSTANDING - not what has ever gone wrong.
+    #
+    # This counted files whose LATEST JOB was cancelled or failed, which was
+    # already better than counting every historical row, but it still answered
+    # the wrong question. Two later changes broke it outright:
+    #
+    #   * the no-op short-circuit marks a file done WITHOUT creating a job, and
+    #   * prune_noop() DELETES the queued job row,
+    #
+    # so for those files the newest surviving row is an old cancelled one, and
+    # a finished file kept being reported as cancelled forever. Movies showed
+    # "504 cancelled" when 947 of those files were already done and only 20 had
+    # any work left.
+    #
+    # A job row cannot answer "is there work left" because it describes an
+    # attempt, not the file. The FILE's current state can, so that is what is
+    # asked - and a cancelled attempt on a file that is now done is simply
+    # history, which belongs in the log rather than in a status line.
+    jobstate = {}
+    for r in _rows(
+            "SELECT f.library lib, j.state st, COUNT(DISTINCT f.id) n "
+            "FROM jobs j JOIN files f ON f.id = j.file_id "
+            "JOIN (SELECT file_id, MAX(COALESCE(finished_at, started_at, "
+            "             created_at)) AS t "
+            "      FROM jobs WHERE file_id IS NOT NULL GROUP BY file_id) last "
+            "  ON last.file_id = j.file_id "
+            " AND COALESCE(j.finished_at, j.started_at, j.created_at) = last.t "
+            "WHERE j.state IN ('cancelled','failed') "
+            # ...and the file still has work outstanding. A done file is done
+            # however its last attempt ended.
+            "  AND f.state NOT IN ('done','deleted') "
+            # ...and nothing is already queued or running for it, or it is not
+            # outstanding, it is in progress.
+            "  AND f.id NOT IN (SELECT file_id FROM jobs WHERE file_id IS NOT NULL "
+            "                   AND state IN ('queued','running')) "
+            "GROUP BY lib, st"):
+        jobstate.setdefault(r["lib"], {})[r["st"]] = r["n"]
+
+    # How much of each library is queued or running right now. "912 eligible"
+    # on its own cannot distinguish a library being worked through from one
+    # nothing has started on.
+    inflight = {r["library"]: r["n"] for r in _rows(
+        "SELECT f.library library, COUNT(DISTINCT f.id) n FROM files f "
+        "JOIN jobs j ON j.file_id = f.id "
+        "WHERE j.state IN ('queued','running') GROUP BY 1")}
+
+    counts = {r["library"]: r for r in _rows(
+        "SELECT library, COUNT(*) n, SUM(size) bytes,"
+        " SUM(state='eligible') eligible, SUM(state='new') held,"
+        " SUM(state='done') done, SUM(state='error') errors,"
+        " SUM(state='blocked') blocked"
+        " FROM files WHERE state!='deleted' GROUP BY library")}
+    out = []
+    for l in SETTINGS.libraries:
+        c = counts.get(l.name, {})
+        js = jobstate.get(l.name, {})
+        out.append({"name": l.name, "path": l.path, "kind": l.kind,
+                    "enabled": l.enabled, "exists": os.path.isdir(l.path),
+                    "files": c.get("n", 0), "bytes": c.get("bytes", 0),
+                    "eligible": c.get("eligible", 0) or 0,
+                    "held": c.get("held", 0) or 0,
+                    "done": c.get("done", 0) or 0,
+                    "errors": c.get("errors", 0) or 0,
+                    "blocked": c.get("blocked", 0) or 0,
+                    # Files queued or running for this library right now.
+                    "inflight": inflight.get(l.name, 0),
+                    # Outstanding only - see the comment above. A cancelled or
+                    # failed attempt on a file that has since been processed is
+                    # not counted, because there is nothing to act on.
+                    "cancelled": js.get("cancelled", 0),
+                    "failed_jobs": js.get("failed", 0)})
+    # Live walk position + when the next automatic scan is due, so a long scan
+    # is distinguishable from a stuck one.
+    try:
+        every = int(workers.get().scan_every_min)
+    except Exception:
+        every = 0
+    nxt = None
+    if every > 0:
+        nxt = (STATE["scan"].get("last") or time.time()) + every * 60
+    return {"libraries": out, "scan": STATE["scan"],
+            "progress": scanner.progress(),   # refreshes pct/eta as it is read
+            "phases": [{"key": k, "label": v} for k, v in scanner.PHASES],
+            "scan_every_min": every, "next_scan_at": nxt}
+
+
+@app.get("/api/browse")
+def api_browse_list(path: str | None = None, library: str | None = None):
+    r"""List one folder, with what nuarr knows about everything in it.
+
+    Replaces "open Explorer on the server", which only worked if you happened
+    to be sitting at the machine - from any other browser it silently opened a
+    window nobody could see.
+
+    Everything shown comes from the files table rather than a fresh probe, so
+    this is a cheap read: media info was recorded when the file was probed, and
+    the processed state is the same column the rest of the system uses.
+    """
+    roots = {os.path.normcase(os.path.normpath(l.path)): l
+             for l in SETTINGS.libraries}
+    if library and not path:
+        lib = next((l for l in SETTINGS.libraries if l.name == library), None)
+        if not lib:
+            raise HTTPException(404, f"unknown library {library!r}")
+        path = lib.path
+    if not path:
+        raise HTTPException(400, "path or library is required")
+
+    target = os.path.normpath(path)
+    norm = os.path.normcase(target)
+    # CONFINE TO A LIBRARY. Same rule the old endpoint had, but it has to hold
+    # for SUBfolders too now that this walks into them - so it is a prefix test
+    # against every configured root, not equality with one.
+    root = next((r for r in roots if norm == r or norm.startswith(r + os.sep)),
+                None)
+    if root is None:
+        raise HTTPException(403, "path is outside every configured library")
+    if not os.path.isdir(target):
+        raise HTTPException(404, f"not a folder: {target}")
+
+    # Everything nuarr knows about files under this folder, in one query. Used
+    # both for the file rows and to total up the subfolders.
+    # THREE COLUMNS FOR THE ROLLUP, NOT FOURTEEN.
+    #
+    # This query covers the WHOLE SUBTREE - at a library root that is every file
+    # in the library - but the folder rollup only needs path, size and state.
+    # Pulling video_codec, audio_codecs, height, duration, bitrate, pool_disk,
+    # title, season and episode for 22,521 rows cost ~1 s building dictionaries
+    # that were then used for nothing: a library root lists FOLDERS, and has no
+    # file rows to render at all.
+    #
+    # The heavy columns are fetched afterwards, for the handful of media files
+    # actually in this one folder.
+    _bt: dict = {}
+    _b0 = time.perf_counter()
+    like = target.rstrip("\\/") + os.sep + "%"
+    rows = _rows("SELECT path, size, state FROM files "
+                 "WHERE path LIKE ? AND state != 'deleted'", (like,))
+    known = {os.path.normcase(r["path"]): r for r in rows}
+    _bt["sql_ms"] = round((time.perf_counter() - _b0) * 1000, 1)
+    _bt["rows"] = len(rows)
+    _b1 = time.perf_counter()
+
+    # BUCKET ONCE, NOT ONCE PER FOLDER.
+    #
+    # The rollup below used to filter the whole `known` map for every subfolder:
+    # 722 folders x 22,521 rows = 16.3 MILLION startswith calls for one listing,
+    # measured at 2.6 s of pure CPU. It is accidentally quadratic - the cost
+    # grows with library size AND folder count together, so it got slower every
+    # time the library grew, which is exactly when you want this to stay quick.
+    #
+    # One pass instead: take each known path's first component below `target`
+    # and file it under that name. The per-folder lookup is then a dict hit.
+    tprefix = os.path.normcase(target.rstrip("\\/")) + os.sep
+    tlen = len(tprefix)
+    buckets: dict[str, list] = {}
+    for k, r in known.items():
+        if not k.startswith(tprefix):
+            continue
+        rest = k[tlen:]
+        i = rest.find(os.sep)
+        if i > 0:                       # anything deeper belongs to that folder
+            buckets.setdefault(rest[:i], []).append(r)
+
+    _bt["bucket_ms"] = round((time.perf_counter() - _b1) * 1000, 1)
+    _b2 = time.perf_counter()
+    try:
+        entries = list(os.scandir(target))
+    except OSError as e:
+        raise HTTPException(500, f"cannot read folder: {e}")
+    _bt["scandir_ms"] = round((time.perf_counter() - _b2) * 1000, 1)
+    _bt["entries"] = len(entries)
+    _b3 = time.perf_counter()
+
+    folders, media = [], []
+    for e in entries:
+        try:
+            if e.is_dir():
+                # Roll the folder's contents up into a progress figure - the
+                # question this panel exists to answer is "have I done this
+                # show yet", and that is a per-FOLDER question.
+                inside = buckets.get(os.path.normcase(e.name), ())
+                done = sum(1 for r in inside if r["state"] == "done")
+                folders.append({
+                    "name": e.name, "path": e.path,
+                    "files": len(inside), "done": done,
+                    "bytes": sum(r["size"] or 0 for r in inside),
+                    "pct": round(done / len(inside) * 100) if inside else None,
+                })
+            elif e.is_file():
+                ext = os.path.splitext(e.name)[1].lower()
+                if ext in scanner.MEDIA_EXT:
+                    media.append(e)
+        except OSError:
+            continue
+    _bt["walk_ms"] = round((time.perf_counter() - _b3) * 1000, 1)
+    _b4 = time.perf_counter()
+
+    # Detail for the media files in THIS folder only - typically one season's
+    # worth, versus the whole subtree the rollup query covers. Chunked because
+    # SQLite caps host parameters per statement.
+    detail: dict = {}
+    for i in range(0, len(media), 400):
+        batch = [e.path for e in media[i:i + 400]]
+        ph = ",".join("?" * len(batch))
+        for r in _rows(
+                "SELECT path, title, season, episode, size, state, state_reason, "
+                "       processed_at, video_codec, audio_codecs, height, duration, "
+                "       bitrate, pool_disk "
+                f"FROM files WHERE path IN ({ph})", tuple(batch)):
+            detail[os.path.normcase(r["path"])] = r
+
+    files = []
+    for e in media:
+        try:
+            r = detail.get(os.path.normcase(e.path)) or {}
+            files.append({
+                "name": e.name, "path": e.path,
+                "size": r.get("size") or e.stat().st_size,
+                # None means nuarr has never seen this file - worth showing
+                # rather than pretending it is simply unprocessed.
+                "state": r.get("state"),
+                "reason": r.get("state_reason"),
+                "processed_at": r.get("processed_at"),
+                "video": r.get("video_codec"), "height": r.get("height"),
+                "audio": r.get("audio_codecs"),
+                "duration": r.get("duration"), "bitrate": r.get("bitrate"),
+                "disk": r.get("pool_disk"),
+                "probed": bool(r.get("video_codec")),
+            })
+        except OSError:
+            continue
+
+    _bt["detail_ms"] = round((time.perf_counter() - _b4) * 1000, 1)
+    _bt["total_ms"] = round((time.perf_counter() - _b0) * 1000, 1)
+    folders.sort(key=lambda x: x["name"].lower())
+    files.sort(key=lambda x: x["name"].lower())
+    up = os.path.dirname(target)
+    # POSTER, when this folder belongs to one show/movie. Any tracked file
+    # under the folder names its arr parent, and the arr serves the artwork.
+    # Only below the library root - the root spans hundreds of parents.
+    poster = None
+    meta: dict = {}
+    if norm != root:
+        pr = _rows("SELECT arr_name, arr_parent_id, orig_lang FROM files "
+                   "WHERE path LIKE ? AND arr_parent_id IS NOT NULL "
+                   "AND state != 'deleted' LIMIT 1", (like,))
+        if pr:
+            poster = f"/api/poster/{pr[0]['arr_name']}/{pr[0]['arr_parent_id']}"
+            meta = _title_meta(target, pr[0]["orig_lang"])
+            # WHAT NUARR DECIDED THIS TITLE IS, and the evidence for it.
+            #
+            # The folder view already shows where the title lives online and
+            # what language it was made in. The one thing it could not show was
+            # the decision those facts feed into - which is the decision that
+            # actually changes what happens to every file underneath.
+            try:
+                from . import contentkind, langpolicy
+                d = contentkind.detail(pr[0]["arr_name"],
+                                       pr[0]["arr_parent_id"])
+                if d:
+                    folder_kind = langpolicy.kind_for(
+                        library=roots[root].name)
+                    meta["kind"] = contentkind.combine(folder_kind, d["kind"])
+                    meta["kind_meta"] = d["kind"]
+                    meta["kind_folder"] = folder_kind
+                    meta["kind_why"] = d["why"]
+                    meta["genres"] = d["genres"]
+                    meta["stype"] = d["stype"]
+                    if d.get("lang") and not meta.get("orig_lang"):
+                        meta["orig_lang"] = d["lang"]
+            except Exception:
+                pass
+    return {
+        "path": target,
+        "root": roots[root].path,
+        "library": roots[root].name,
+        # None at the library root, so the UI knows not to offer "up".
+        "up": up if os.path.normcase(up).startswith(root) and norm != root else None,
+        "folders": folders, "files": files, "poster": poster,
+        "meta": meta,
+        "totals": {"files": len(files), "folders": len(folders)},
+        "timing": _bt,
+    }
+
+
+_ID_RE = re.compile(r"\{(tvdb|tmdb|imdb)-([a-z0-9]+)\}", re.I)
+
+
+def _title_meta(folder: str, orig_lang: str | None) -> dict:
+    r"""Where this title lives on the internet, and what language it was made in.
+
+    The id is taken from the FOLDER NAME rather than looked up. The arrs put it
+    there themselves - `{tvdb-436603}`, `{tmdb-18764}` - as part of their own
+    naming format, so it is already on disk, already correct, and costs no API
+    call. Falling back to an arr lookup would mean a request per folder view for
+    a number that is sitting in the path.
+
+    Original language comes from the file rows, which origlang.py fills in from
+    the same providers these links point at.
+    """
+    out: dict = {"orig_lang": (orig_lang or "").strip() or None}
+    for kind, ident in _ID_RE.findall(os.path.basename(folder)):
+        k = kind.lower()
+        if k == "tvdb":
+            out["provider"] = "TheTVDB"
+            out["url"] = f"https://thetvdb.com/dereferrer/series/{ident}"
+        elif k == "tmdb":
+            out["provider"] = "TMDB"
+            # Movies are the only thing the arrs tag with tmdb in a folder name
+            # here; Sonarr uses tvdb. A wrong guess would 404 rather than
+            # mislead, and the id itself is shown either way.
+            out["url"] = f"https://www.themoviedb.org/movie/{ident}"
+        elif k == "imdb":
+            out.setdefault("imdb", f"https://www.imdb.com/title/{ident}/")
+            continue
+        out["id"] = ident
+    return out
+
+
+@app.get("/api/poster/{arr_name}/{parent_id}")
+async def api_poster(arr_name: str, parent_id: int):
+    """The show/movie poster, proxied from the arr and cached on disk.
+
+    Proxied because the arr's MediaCover endpoint wants the API key, which
+    must not appear in an <img src> for anyone reading the page source.
+    Cached because the browser panel would otherwise hit the arr once per
+    folder visit for an image that changes roughly never.
+    """
+    from fastapi.responses import Response as _Resp
+    import httpx as _hx
+    cfg = next((c for c in SETTINGS.arrs
+                if c.name.lower() == arr_name.lower() and c.enabled), None)
+    if not cfg:
+        raise HTTPException(404, "unknown arr")
+    cache_dir = os.path.join(os.path.dirname(str(DB_PATH)), "posters")
+    os.makedirs(cache_dir, exist_ok=True)
+    p = os.path.join(cache_dir, f"{cfg.kind}-{parent_id}.jpg")
+    if not os.path.exists(p) or time.time() - os.path.getmtime(p) > 7 * 86400:
+        try:
+            async with _hx.AsyncClient(timeout=15) as h:
+                r = await h.get(
+                    f"{cfg.url.rstrip('/')}/api/v3/mediacover/{parent_id}"
+                    f"/poster-250.jpg", headers={"X-Api-Key": cfg.api_key or ""})
+                r.raise_for_status()
+            with open(p, "wb") as f:
+                f.write(r.content)
+        except Exception:
+            if not os.path.exists(p):
+                raise HTTPException(404, "no poster")
+    with open(p, "rb") as f:
+        return _Resp(f.read(), media_type="image/jpeg",
+                     headers={"Cache-Control": "public, max-age=86400"})
+
+
+def _lang(s: dict) -> str:
+    t = s.get("tags") or {}
+    return (t.get("language") or t.get("LANGUAGE") or "").strip()
+
+
+def _track_title(s: dict) -> str:
+    t = s.get("tags") or {}
+    return (t.get("title") or t.get("TITLE") or "").strip()
+
+
+def _flags(s: dict) -> list[str]:
+    d = s.get("disposition") or {}
+    out = [k for k in ("default", "forced", "hearing_impaired",
+                       "visual_impaired", "comment", "attached_pic")
+           if d.get(k)]
+    return out
+
+
+@app.get("/api/browse/mediainfo")
+async def api_media_info(path: str):
+    r"""Per-track detail for one file: video, every audio track, every subtitle.
+
+    Served from the STORED probe where possible - file_probes holds the full
+    ffprobe output for anything nuarr has processed, so this is usually a
+    single row read rather than spawning ffprobe against a pool disk. Falls
+    back to a live probe for files that have never been through the pipeline,
+    which is the only way to answer for them at all.
+    """
+    roots = [os.path.normcase(os.path.normpath(l.path)) for l in SETTINGS.libraries]
+    norm = os.path.normcase(os.path.normpath(path))
+    if not any(norm == r or norm.startswith(r + os.sep) for r in roots):
+        raise HTTPException(403, "path is outside every configured library")
+    if not os.path.isfile(path):
+        raise HTTPException(404, "not a file")
+
+    data, source = None, "stored"
+    # Match on the path as stored. The browser hands back exactly what the
+    # listing gave it, so this is the same string - but normalise anyway,
+    # because a path that differs only by separator or case would otherwise
+    # silently fall through to a live ffprobe against a busy pool disk.
+    row = _rows("SELECT p.json AS j FROM file_probes p JOIN files f ON f.id=p.file_id "
+                "WHERE f.path = ? COLLATE NOCASE LIMIT 1",
+                (os.path.normpath(path),))
+    if row:
+        try:
+            data = json.loads(row[0]["j"])
+        except (ValueError, TypeError) as e:
+            # Narrow on purpose. A bare `except Exception` here hid a missing
+            # `import json` - every lookup raised NameError, was swallowed, and
+            # silently fell through to a live ffprobe against a pool disk the
+            # encoders were already reading. It looked like it worked.
+            joblog.log(f"stored probe unreadable for {path}: "
+                       f"{type(e).__name__}", "debug")
+            data = None
+    if data is None:
+        data, source = await jobs.probe(path), "live"
+    if not data:
+        raise HTTPException(500, "could not read this file")
+
+    streams = data.get("streams") or []
+    fmt = data.get("format") or {}
+
+    def num(v, d=0):
+        try:
+            return type(d)(v)
+        except (TypeError, ValueError):
+            return d
+
+    video, audio, subs, other = [], [], [], []
+    for s in streams:
+        kind = s.get("codec_type")
+        base = {"index": s.get("index"), "codec": s.get("codec_name"),
+                "profile": s.get("profile"), "lang": _lang(s),
+                "title": _track_title(s), "flags": _flags(s),
+                "bitrate": num(s.get("bit_rate"), 0)}
+        if kind == "video":
+            if (s.get("disposition") or {}).get("attached_pic"):
+                other.append({**base, "kind": "cover art"})
+                continue
+            fr = (s.get("avg_frame_rate") or "0/0").split("/")
+            fps = round(num(fr[0], 0) / num(fr[1], 1), 3) if len(fr) == 2 and num(fr[1], 1) else 0
+            # bits_per_raw_sample is frequently absent - it is None on every
+            # HEVC stream in this library - so fall back to the pixel format,
+            # which always carries it (yuv420p10le -> 10-bit).
+            depth = s.get("bits_per_raw_sample")
+            if not depth:
+                m = re.search(r"p(\d{1,2})(?:le|be)?$", s.get("pix_fmt") or "")
+                depth = m.group(1) if m else (8 if s.get("pix_fmt") else None)
+            video.append({**base,
+                          "width": s.get("width"), "height": s.get("height"),
+                          "fps": fps,
+                          "pix_fmt": s.get("pix_fmt"),
+                          "bit_depth": depth,
+                          "colour": s.get("color_primaries"),
+                          "transfer": s.get("color_transfer"),
+                          # What actually decides whether Plex transcodes it.
+                          "hdr": (s.get("color_transfer") or "") in
+                                 ("smpte2084", "arib-std-b67"),
+                          # Reuse the planner's own detection rather than a
+                          # second guess. ffprobe labels this side data "DOVI
+                          # configuration record", not anything starting with
+                          # "dolby", so my first attempt reported False on
+                          # every DV file in the library.
+                          "dv_profile": rules._dv_profile(s, os.path.basename(path))})
+        elif kind == "audio":
+            audio.append({**base,
+                          "channels": s.get("channels"),
+                          "layout": s.get("channel_layout"),
+                          "sample_rate": num(s.get("sample_rate"), 0)})
+        elif kind == "subtitle":
+            subs.append({**base,
+                         # Text subs are cheap for Plex; image subs force a
+                         # burn-in transcode, which is the thing worth seeing.
+                         "image": (s.get("codec_name") or "") in
+                                  ("hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle")})
+        elif kind:
+            other.append({**base, "kind": kind})
+
+    return {"path": path, "source": source,
+            "container": fmt.get("format_name"),
+            "duration": num(fmt.get("duration"), 0.0),
+            "size": num(fmt.get("size"), 0),
+            "bitrate": num(fmt.get("bit_rate"), 0),
+            "video": video, "audio": audio, "subs": subs, "other": other}
+
+
+@app.post("/api/libraries/browse")
+def api_browse(path: str):
+    """Open this folder in Explorer on the server's desktop."""
+    if not os.path.isdir(path):
+        raise HTTPException(404, f"not a folder: {path}")
+    # Only ever open a configured library path - never an arbitrary string from
+    # the request, which would be a way to launch Explorer anywhere on the box.
+    allowed = {os.path.normcase(os.path.normpath(l.path))
+               for l in SETTINGS.libraries}
+    if os.path.normcase(os.path.normpath(path)) not in allowed:
+        raise HTTPException(403, "path is not a configured library")
+    try:
+        # CREATE_NO_WINDOW suppresses CONSOLE windows only - Explorer is a GUI
+        # app, so its window still opens. The flag is here so the "every spawn
+        # passes NO_WINDOW" rule has no exceptions to remember.
+        subprocess.Popen(["explorer.exe", os.path.normpath(path)],
+                         creationflags=NO_WINDOW)
+    except OSError as e:
+        raise HTTPException(500, str(e))
+    return {"ok": True, "opened": path}
+
+
+@app.post("/api/libraries/rescan")
+async def api_rescan(library: str | None = None):
+    """Rescan everything, or one library."""
+    if STATE["scan"]["running"]:
+        raise HTTPException(409, "a scan is already running")
+    asyncio.create_task(_run_scan(library))
+    return {"started": True, "library": library or "all"}
+
+
+# THE POWERSHELL HANDLER SUBSYSTEM WAS REMOVED on 2026-08-26.
+#
+# /api/handlers and /api/jobs/run wrapped eight .ps1 scripts as queueable job
+# kinds. Audited before removal, across all 39,755 probed files:
+#
+#   * not one of them had ever run - zero jobs, ever, for every kind except
+#     pool_map
+#   * every condition they existed to fix now measures zero: no forced image
+#     sub without a text alternative, no file claiming a 1193-hour runtime, no
+#     image sub still flagged default, no Dolby Vision layer left anywhere
+#   * the two that mattered are done natively now and better - subocr.py OCRs
+#     inline with the encode, and strip_dv is a bitstream filter on a copied
+#     stream rather than a re-encode
+#
+# The scripts are archived at P:\BackUp Data\NuarrBackup\legacy with a README
+# explaining what each did, and can be run by hand if one is ever needed.
+
+
+@app.post("/api/files/{file_id}/queue")
+async def api_queue_one(file_id: int):
+    """Queue ONE file as a transcode, whatever state it is in.
+
+    Every existing queue path is a sweep - eligible files, a whole codec, the
+    EAE backlog. Verifying a rule change needs the opposite: this exact file,
+    right now, planned under the code that is actually running. Requeuing
+    Vexille after the lossless-ranking fix had to borrow a sweep endpoint;
+    this is the honest version.
+    """
+    rows = _rows("SELECT path,title,season,episode FROM files WHERE id=?",
+                 (file_id,))
+    if not rows:
+        raise HTTPException(404, "file not found")
+    label = display_label(rows[0]["title"], rows[0]["season"],
+                          rows[0]["episode"])
+    try:
+        j = await jobs.enqueue(file_id, rows[0]["path"], label,
+                               source="manual")
+    except jobs.NothingToDo:
+        return {"ok": False, "queued": False,
+                "reason": "the plan says there is nothing to do"}
+    except ValueError as e:
+        # enqueue's "already queued or running"
+        raise HTTPException(409, str(e))
+    await jobs.start()
+    return {"ok": True, "queued": True, "job_id": j.id, "label": label}
+
+
+@app.post("/api/jobs/stop")
+async def api_stop(cancel_running: bool = False):
+    """Clear the queue. Optionally kill what is already running.
+
+    Equivalent to Tdarr's 'stop' - but it does NOT touch the files table, so
+    every cleared file stays eligible and can simply be queued again.
+    """
+    with cursor() as cur:
+        cur.execute("UPDATE jobs SET state='cancelled', finished_at=? "
+                    "WHERE state='queued'", (time.time(),))
+        cleared = cur.rowcount
+    killed = 0
+    if cancel_running:
+        for jid in list(jobs.RUNNING.keys()):
+            if await jobs.cancel(jid):
+                killed += 1
+    joblog.log(f"queue stopped: {cleared} cleared"
+               + (f", {killed} running cancelled" if cancel_running else ""), "warn")
+    return {"cleared": cleared, "cancelled_running": killed}
+
+
+@app.post("/api/jobs/requeue")
+async def api_requeue(what: str = "failed", library: str | None = None,
+                      dry_run: bool = True):
+    """Re-queue previously processed files.
+
+    what=failed     only the ones that errored or were blocked
+    what=cancelled  files whose most recent job was cancelled
+    what=done       everything already processed (Tdarr's 'Requeue all items')
+    what=all        done + failed + skipped
+    """
+    if what in ("cancelled", "failed"):
+        # ASK THE JOBS TABLE, NOT files.state.
+        #
+        # This branch existed only for 'cancelled', because a cancel does not
+        # write files.state. It turns out 'failed' has exactly the same problem
+        # from the other direction: _finish DOES write state='error', but any
+        # later scan that finds the file unchanged promotes it back to
+        # 'eligible'. The failure is then invisible to a state lookup while the
+        # Libraries panel - which counts jobs.state='failed' - still reports it.
+        #
+        # Observed: Anime Shows showed "3 failed jobs", Requeue [failed/blocked]
+        # answered "nothing to requeue", and all three files sat at
+        # state='eligible' with a failed commit as their most recent job.
+        #
+        # So match on the most recent JOB, and union in the file states as well
+        # so a file still parked in error/blocked is not missed either.
+        js = "cancelled" if what == "cancelled" else "failed"
+        sql = ("SELECT DISTINCT f.id FROM jobs j JOIN files f ON f.id=j.file_id "
+               "JOIN (SELECT file_id, MAX(COALESCE(finished_at, started_at, "
+               "             created_at)) t FROM jobs WHERE file_id IS NOT NULL "
+               "      GROUP BY file_id) last ON last.file_id=j.file_id "
+               "  AND COALESCE(j.finished_at,j.started_at,j.created_at)=last.t "
+               f"WHERE j.state='{js}' AND f.arr_file_id IS NOT NULL "
+               "  AND f.state NOT IN ('deleted','duplicate')")
+        params: tuple = ()
+        if library:
+            sql += " AND f.library=?"
+            params += (library,)
+        if what == "failed":
+            sql += (" UNION SELECT id FROM files WHERE state IN ('error','blocked') "
+                    "AND arr_file_id IS NOT NULL")
+            if library:
+                sql += " AND library=?"
+                params += (library,)
+        rows = _rows(sql, params)
+    else:
+        states = {"done": ("done",),
+                  "all": ("done", "error", "blocked")}.get(what)
+        if not states:
+            raise HTTPException(
+                400, "what must be failed, cancelled, done or all")
+        qs = ",".join("?" * len(states))
+        sql = (f"SELECT id FROM files WHERE state IN ({qs}) "
+               f"AND arr_file_id IS NOT NULL")
+        params = tuple(states)
+        if library:
+            sql += " AND library=?"
+            params += (library,)
+        rows = _rows(sql, params)
+    if dry_run:
+        return {"dry_run": True, "would_requeue": len(rows), "what": what}
+    now = time.time()
+    with cursor() as cur:
+        cur.executemany("UPDATE files SET state='eligible', state_reason=NULL, "
+                        "requeued_at=? WHERE id=?",
+                        [(now, r["id"]) for r in rows])
+    joblog.log(f"requeued {len(rows)} file(s) [{what}]"
+               + (f" in {library}" if library else "") + " - now eligible", "info")
+    return {"requeued": len(rows), "what": what,
+            "message": "files are eligible again; press Queue to start them"}
+
+
+@app.post("/api/jobs/cancel")
+async def api_cancel(job_id: str):
+    ok = await jobs.cancel(job_id)
+    if not ok:
+        raise HTTPException(404, "job not found")
+    return {"ok": True}
+
+
+@app.get("/api/logs")
+def api_logs(level: str | None = None, limit: int = Query(200, le=2000),
+             offset: int = 0, system: str | None = None):
+    rows, total = joblog.recent(level, limit, offset)
+    # Filter AFTER paging rather than inside joblog.recent(): the tail reader
+    # there widens its window progressively for a level filter, and threading a
+    # second predicate through that is a much bigger change than this screen
+    # justifies. The cost is that a narrow system filter shows fewer rows per
+    # page, not wrong ones - and "Load older" still walks back through history.
+    if system:
+        rows = [r for r in rows if (r.get("system") or "") == system]
+    # Which loops appear in this page, so the picker only ever offers filters
+    # that would actually match something.
+    seen: dict[str, int] = {}
+    for r in rows if system else rows:
+        k = r.get("system") or ""
+        if k:
+            seen[k] = seen.get(k, 0) + 1
+    labels = {}
+    try:
+        from . import schedules
+        labels = {x["key"]: x["label"] for x in schedules.snapshot()["rows"]}
+    except Exception:                                    # noqa: BLE001
+        pass
+    # Size of the file behind the view. The panel could say how many lines it
+    # had fetched but not how big the thing it was reading actually is, which
+    # is the number that matters when deciding whether it needs pruning.
+    try:
+        size = joblog.MAIN_LOG.stat().st_size if joblog.MAIN_LOG.exists() else 0
+    except OSError:
+        size = 0
+    return {"rows": rows, "total": total, "offset": offset,
+            "bytes": size, "has_more": offset + len(rows) < total,
+            "systems": [{"key": k, "n": v, "label": labels.get(k, k)}
+                        for k, v in sorted(seen.items(), key=lambda kv: -kv[1])],
+            "system": system or ""}
+
+
+@app.get("/api/logs/jobs")
+def api_log_jobs():
+    return {"rows": joblog.list_job_logs()}
+
+
+@app.get("/api/logs/job/{job_id}")
+def api_log_job(job_id: str, since: float = 0.0):
+    return {"job_id": job_id, "rows": joblog.job_lines(job_id, since)}
+
+
+@app.get("/api/logs/job/{job_id}/raw", response_class=PlainTextResponse)
+def api_log_job_raw(job_id: str):
+    """The whole transcript as plain text - the 'open the log file' button."""
+    return joblog.read_job_log(job_id) or "(no log for this job)"
+
+
+@app.get("/api/logs/raw", response_class=PlainTextResponse)
+def api_logs_raw(level: str | None = None, limit: int = Query(2000, le=20000)):
+    """All activity as readable text.
+
+    'Open full log' used to point at the JSON endpoint, which rendered as one
+    unreadable wall of escaped braces in the browser. A log you cannot read is
+    not a log, so this returns the same aligned format that is written to disk.
+    """
+    rows, total = joblog.recent(level, limit, 0)
+    out = [f"nuarr log — {len(rows)} of {total} lines"
+           + (f" (level={level})" if level else ""), "=" * 78]
+    for r in reversed(rows):                     # oldest first, like a file
+        ts = (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(r["at"]))
+              if r.get("at") else " " * 19)
+        job = f"  [job {r['job_id']}]" if r.get("job_id") else ""
+        out.append(f"{ts}  {r['level'].upper():<5} {r['text']}{job}")
+    return "\n".join(out)
+
+
+@app.get("/api/gate")
+async def api_gate():
+    from . import fileops          # module-scope import is deferred here
+    st = await gate.status()
+    # Buffer per watched spindle, and anything currently frozen for a viewer.
+    # Both are read straight from the running process rather than recomputed,
+    # so the panel cannot describe a different instant from the decision.
+    try:
+        leads = gate.viewer_leads()
+    except Exception:                                    # noqa: BLE001
+        leads = {}
+    try:
+        paused = jobs.suspended_jobs()
+    except Exception:                                    # noqa: BLE001
+        paused = {}
+    try:
+        floor = int(workers.get().viewer_pause_lead_s)
+    except Exception:                                    # noqa: BLE001
+        floor = 0
+    try:
+        starving = jobs.starving_disks()
+    except Exception:                                    # noqa: BLE001
+        starving = {}
+    return st.as_dict() | {"toggles": gate.toggles(),
+                           "viewer_leads": leads,
+                           "paused_for_viewer": sorted(paused),
+                           # The two lines the session cards draw on their
+                           # bars: work stops below the first and does not
+                           # start again until the buffer is over the second.
+                           "viewer_pause_lead_s": floor,
+                           "viewer_resume_lead_s":
+                               round(floor * jobs.VIEWER_RESUME_MULT),
+                           "viewer_resume_mult": jobs.VIEWER_RESUME_MULT,
+                           # above this multiple of the floor nuarr stops
+                           # throttling on the viewer's spindle entirely
+                           "viewer_full_speed_mult": jobs.VIEWER_FULL_SPEED_MULT,
+                           # the effective, per-session floor for each spindle
+                           "viewer_floors": gate.viewer_floors(),
+                           # Plex's own encoder throttle point, which caps ours
+                           "plex_throttle_buffer_s": gate.throttle_buffer_s(),
+                           # The hardest sleep multiplier the ramp can reach,
+                           # and how much Windows background I/O mode softens
+                           # it once engaged. BOTH are needed to state a speed:
+                           # the card used to derive one from the raw ramp
+                           # alone and understated the copy's real share of the
+                           # spindle by more than half.
+                           "viewer_throttle_max": jobs.VIEWER_THROTTLE_MAX,
+                           "viewer_bg_discount": fileops.BG_DISCOUNT,
+                           # Spindles nuarr genuinely has a throttleable copy
+                           # on. Without this the card announced a percentage
+                           # for a disk nuarr was not touching at all - a
+                           # throttle is only a fact when there is work to slow.
+                           "viewer_paced_disks": sorted(jobs.paced_disks()),
+                           # which spindles are held right now, and why
+                           "starving_disks": starving}
+
+
+@app.post("/api/gate/toggle")
+async def api_gate_toggle(key: str, on: bool):
+    if key not in gate.DEFAULTS:
+        raise HTTPException(400, f"unknown gate setting '{key}'")
+    gate.set_toggle(key, on)
+    st = await gate.status()
+    return {"ok": True, "gate": st.as_dict() | {"toggles": gate.toggles()}}
+
+
+@app.get("/api/workers")
+def api_workers():
+    return workers.get().as_dict()
+
+
+@app.post("/api/workers")
+def api_workers_set(key: str, value: int):
+    changed, msg, applied = workers.set_one(key, value)
+    if not changed:
+        raise HTTPException(400, msg)
+    return {"ok": True, "message": msg, "value": applied,
+            "workers": workers.get().as_dict()}
+
+
+@app.post("/api/workers/reset")
+def api_workers_reset():
+    return {"ok": True, "workers": workers.reset()}
+
+
+@app.get("/api/cleanup")
+def api_cleanup(under_mb: int = 100):
+    """What cleanup.py would target. Read-only - removal is CLI-only, on purpose."""
+    cache = _rows("SELECT COUNT(*) n, SUM(size) bytes FROM files "
+                  "WHERE path LIKE '%TdarrCacheFile%' AND state!='deleted'")[0]
+    small = _rows("SELECT COUNT(*) n, SUM(size) bytes FROM files "
+                  "WHERE arr_file_id IS NULL AND state!='deleted' "
+                  "AND size IS NOT NULL AND size < ?", (under_mb * 1024 * 1024,))[0]
+    big = _rows("SELECT COUNT(*) n, SUM(size) bytes FROM files "
+                "WHERE arr_file_id IS NULL AND state!='deleted' "
+                "AND size >= ?", (under_mb * 1024 * 1024,))[0]
+    samples = _rows("SELECT path,size FROM files WHERE arr_file_id IS NULL "
+                    "AND state!='deleted' AND size < ? ORDER BY size DESC LIMIT 10",
+                    (under_mb * 1024 * 1024,))
+    return {"tdarr_cache": cache, "small_orphans": small,
+            "large_orphans_kept": big, "under_mb": under_mb,
+            "sample": samples}
+
+
+# ------------------------------------------------------------ dashboard ----
+INDEX = r"""
+<!doctype html><html><head><meta charset="utf-8"><title>Nuarr</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="apple-touch-icon" href="/favicon.svg">
+<meta name="theme-color" content="#58a6ff">
+<!-- Without this a phone lays the page out at a virtual 980px and then zooms
+     out, so every responsive rule below is measured against a width the device
+     does not have and none of them ever fire. -->
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root{--bg:#0f1216;--panel:#171b21;--line:#242a33;--fg:#e6e9ef;--dim:#8b95a5;
+      --ok:#3fb950;--warn:#d29922;--bad:#f85149;--acc:#58a6ff;
+      /* THE NATIVE CONTROLS ARE NOT OURS TO STYLE - THIS IS HOW WE ASK.
+         A <select> popup, the <input type=time> clock panel, the scrollbars
+         and the checkbox glyph are drawn by the browser, outside the page, so
+         no CSS rule below can reach them. Without this declaration Chrome
+         assumes a light page and paints all of them white on a dark
+         dashboard - which is why the time picker opened as a white sheet.
+         color-scheme is the supported way to say "this document is dark";
+         everything native then follows in one go. */
+      color-scheme: dark;
+      /* Checkboxes and the picker's selected highlight, in our blue rather
+         than the browser default. */
+      accent-color: var(--acc)}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,Segoe UI,sans-serif}
+header{padding:14px 20px;border-bottom:1px solid var(--line);display:flex;
+       align-items:center;gap:16px;position:sticky;top:0;background:var(--bg);z-index:5}
+h1{font-size:17px;margin:0;letter-spacing:.5px}
+h1 span{color:var(--dim);font-weight:400;font-size:13px;margin-left:8px}
+/* Inherit, so the mark looks exactly as it did - it should read as the app's
+   name that happens to be clickable, not as a blue link in the chrome. The
+   hover is the only affordance, which is enough with a cursor and a tooltip. */
+h1 a.home{color:inherit;text-decoration:none;cursor:pointer}
+h1 a.home:hover{color:var(--acc)}
+button{background:var(--panel);color:var(--fg);border:1px solid var(--line);
+       padding:6px 12px;border-radius:6px;cursor:pointer;font-size:13px}
+button:hover{border-color:var(--acc)}
+button:disabled{opacity:.5;cursor:default}
+.wrap{padding:18px 20px;display:grid;gap:16px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(165px,1fr));gap:12px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:12px 14px}
+.card .k{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.7px}
+.card .v{font-size:23px;margin-top:5px;font-variant-numeric:tabular-nums}
+.card .s{color:var(--dim);font-size:12px;margin-top:2px}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:9px;overflow:hidden}
+.panel h2{margin:0;padding:11px 14px;font-size:13px;border-bottom:1px solid var(--line);
+          color:var(--dim);text-transform:uppercase;letter-spacing:.7px;font-weight:600}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;color:var(--dim);font-weight:500;padding:7px 14px;
+   border-bottom:1px solid var(--line);font-size:11px;text-transform:uppercase}
+td{padding:7px 14px;border-bottom:1px solid var(--line);vertical-align:top}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:#1c2129}
+.mono{font-family:ui-monospace,Consolas,monospace;font-size:12px}
+/* Detail text used to be cut with slice(0,110), which hid the useful half of
+   every message (paths, rename before/after). Wrap instead of truncate. */
+td.detail{white-space:normal;overflow-wrap:anywhere;word-break:break-word;line-height:1.5}
+/* fixed layout so the declared widths actually hold and long paths wrap inside
+   their column instead of stretching the table */
+table.fixed{table-layout:fixed}
+td.wrap{white-space:normal;overflow-wrap:anywhere;word-break:break-word}
+.arrow{color:var(--acc)}
+.was{opacity:.65}
+td.detail b{color:var(--fg);font-weight:600}
+.scrollbox{height:400px;overflow-y:scroll}
+/* Same scrolling and sticky headers, but the box SHRINKS to its content.
+   Recent activity is always full so a fixed 400px suits it; the pending
+   panels usually hold one or two rows and a fixed height would leave most of
+   the panel as empty space. They only need to scroll on the days they are
+   long - a rename backlog after a big import, or several commits held behind
+   a locked file. */
+.scrollbox.auto{height:auto;max-height:340px;overflow-y:auto}
+/* no sideways scrolling - the table must fit the panel and wrap instead */
+.nohz{overflow-x:hidden}
+.nohz table{width:100%;table-layout:fixed}
+/* Only the TITLE/PATH columns may break mid-word. Applying it everywhere
+   split "cancelled" and stacked "Log" one letter per line. */
+.nohz td.wrap,.nohz td.mono{overflow-wrap:anywhere}
+.nohz td,.nohz th{vertical-align:middle}
+/* File lists have a long wrapping PATH beside a short TITLE. Centring makes the
+   title drift to the middle of a two-line row and the columns stop reading as
+   rows at all - these tables align to the top instead. */
+table.vtop td,table.vtop th{vertical-align:top;padding-top:9px;padding-bottom:9px}
+table.vtop tr:hover td{background:#1c2129}
+table.vtop tr+tr td{border-top:1px solid var(--line)}
+/* secondary lines under a title: path, failure reason */
+.sub{font-size:11px;line-height:1.45;margin-top:3px;overflow-wrap:anywhere}
+td.wrap>div:first-child{font-weight:500}
+.nohz td.nb,.nohz th.nb{white-space:nowrap}
+/* Buttons inside a fixed-layout table need their own breathing room: stretching
+   them to 100% of a narrow column squeezed the label until it clipped. */
+.nohz td.nb button{padding:4px 10px;font-size:12px;line-height:1.2;width:auto}
+td.act{text-align:right;padding-right:12px}
+/* THE PLAYBACK DETAIL BLOCK.
+   First version nested a <table> inside the expanded cell, which inherited
+   .vtop's row borders and the accent underline meant for a job log - so every
+   event carried a stray blue rule and none of the columns lined up with each
+   other, let alone with the parent. A grid instead: it owns its own columns,
+   its own separators, and nothing above it can reach in. */
+/* Track pills. Three of them ("video audio subtitle") filled the 150px column
+   edge to edge and sat hard against the codec text in the next one, so the two
+   read as one run-on cell.
+   The flex box is an inner DIV, not the td. Putting display:flex on the cell
+   itself pulled it out of the table's formatting context and it stretched to
+   1570px, taking every other column with it - measured, not guessed. */
+.pbkinds{display:flex;flex-wrap:wrap;gap:4px;padding-right:14px}
+/* One viewing = one bordered block. The date, device and viewer are said once
+   in its header instead of being repeated on every track row. */
+.pbsess{margin:8px 14px 0;border:1px solid var(--line);border-radius:8px}
+.pbsesshead{display:flex;flex-wrap:wrap;gap:10px;align-items:baseline;
+  padding:7px 12px;border-bottom:1px solid var(--line);font-size:12px;
+  background:rgba(255,255,255,.02);border-radius:8px 8px 0 0}
+.pbsess:last-child{margin-bottom:10px}
+.pbdet3{display:grid;grid-template-columns:150px 150px 1fr;
+        padding:2px 12px 8px;font-size:12px;column-gap:14px}
+.pbdet3>span{padding:6px 0;border-top:1px solid var(--line);
+             overflow-wrap:anywhere;align-self:start}
+.pbdet3>span.h{border-top:none;padding-top:6px;color:var(--dim);
+               font-size:10.5px;letter-spacing:.06em;text-transform:uppercase}
+.pbdet{display:grid;grid-template-columns:145px 132px 132px 178px 1fr;
+       padding:2px 14px 10px;font-size:12px;column-gap:14px}
+.pbdet>span{padding:7px 0;border-top:1px solid var(--line);
+            overflow-wrap:anywhere;align-self:start}
+.pbdet>span.h{border-top:none;padding-top:2px;color:var(--dim);
+              font-size:10.5px;letter-spacing:.06em;text-transform:uppercase}
+#pb tr.logdrop td{border-bottom:none;padding-bottom:2px}
+/* inline expanded job log, attached to its own row */
+tr.rowopen td{background:#1c2129;border-bottom:none}
+tr.logdrop td{padding:0 0 8px 0;background:#1c2129;border-bottom:1px solid var(--acc)}
+/* the expanded entry gets room to breathe; the panel grows to suit */
+.logbox.inline{height:auto;max-height:none;margin:0 12px;border:1px solid var(--line);
+               border-radius:6px;background:#0b0e12}
+/* The Transcoding panel is a FIXED size - four job rows, always.
+   It used to size itself to its contents (auto height under four cards, a
+   measured height above), so the panel grew and shrank every time a job
+   started or finished and everything below it jumped down the page. A static
+   height means the layout never moves; the list scrolls inside it instead.
+
+   --wk-slot is one job row, and 180px is measured rather than guessed: across
+   14 live jobs the card height had a median of 176px and a mean of 191px, so
+   four rows is 720px. The spread is what makes an average necessary - a plain
+   stream copy renders at 176px, while a job whose plan lists six dropped audio
+   tracks reaches 329px. Those tall ones scroll; they do not resize the panel.
+
+   Idle placeholders are pinned to exactly this height so an empty panel reads
+   as four even slots instead of a collapsed strip. */
+:root{--wk-slot:180px}
+.runbox{height:calc(var(--wk-slot) * 4);overflow-y:auto}
+/* one placeholder per configured worker that is not busy */
+.wk.slot{height:var(--wk-slot);display:flex;align-items:center;gap:10px;
+         justify-content:center;opacity:.42}
+.wk.slot .pill{opacity:.65}
+/* A finished job fades out rather than blinking away. Jobs here can complete in
+   about a second, so cards disappearing between two polls read as a glitch. */
+/* HOLD 2s, then fade over 0.6s. The card carries a "done"/"skipped"/"failed"
+   stamp, and fading the moment it appears meant the outcome was disappearing
+   as you started reading it. The ghost never delays actual work - the queue
+   runs server-side regardless - and it is dropped early if a new job needs the
+   slot, so a held card cannot make the panel look busier than it is. */
+.wk.fading{animation:wkfade .6s ease 2s forwards;pointer-events:none}
+@keyframes wkfade{0%{opacity:1}100%{opacity:0;transform:translateY(-4px)}}
+/* and a card ARRIVES rather than snapping in, so a slot changing occupant
+   reads as a handover instead of a flicker */
+.wk.arriving{animation:wkin .35s ease both}
+@keyframes wkin{0%{opacity:0;transform:translateY(5px)}100%{opacity:1;transform:none}}
+/* the "done" stamp on a card that has just finished */
+.wkdone{display:inline-block;margin-left:8px;padding:1px 8px;border-radius:10px;
+        font-size:11px;font-weight:600;color:#0b0e12;background:var(--ok)}
+@media (prefers-reduced-motion:reduce){
+  .wk.fading{animation:none;opacity:.35}.wk.arriving{animation:none}}
+
+/* ---- scan progress ---- */
+.scanwrap{display:inline-flex;align-items:center;gap:9px;margin-left:10px;
+          vertical-align:middle}
+.scanpct{font-variant-numeric:tabular-nums;font-weight:600;min-width:34px}
+.scansteps{display:inline-flex;gap:3px;font-size:10px;letter-spacing:1px}
+.scanstep{line-height:1}
+
+/* ---- queue panel ---- */
+/* NOT scroll-behavior:smooth. Auto-scroll advances by a few pixels every tick,
+   and smooth turns each of those into its own animation that the next tick
+   interrupts - the list stalls and scrollTop reads back mid-flight. The Top
+   button asks for smooth explicitly instead. */
+.qbox{height:300px;overflow-y:auto}
+.qbox::-webkit-scrollbar{width:12px}
+.qbox::-webkit-scrollbar-thumb{background:#2b3340;border-radius:6px}
+.qbox::-webkit-scrollbar-track{background:#0b0e12}
+.qrow{display:flex;align-items:center;gap:10px;padding:5px 14px;font-size:12px;
+      border-bottom:1px solid rgba(255,255,255,.04)}
+.qrow:hover{background:#161b22}
+/* The header row: styled to match the <th> of every table on the page (Recent
+   activity in particular, which sits just below), but built from the row's own
+   flex cells so the labels are aligned by construction rather than by keeping
+   two width lists in agreement. Overrides below undo the per-cell colors and
+   sizes the data cells carry. It also does not scroll away: the queue box
+   scrolls, and a label you have to scroll back up to read names nothing. */
+.qrow.qhead{position:sticky;top:0;z-index:2;background:var(--panel);
+  color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.02em;
+  font-weight:500;padding:7px 14px;border-bottom:1px solid var(--line)}
+.qrow.qhead:hover{background:var(--panel)}
+.qrow.qhead .qpool,.qrow.qhead .qsrc{text-align:left}
+.qrow.qhead .qwork,.qrow.qhead .qwhy,.qrow.qhead .qlib,.qrow.qhead .qsz{
+  color:var(--dim);font-size:11px}
+.qrow.qhead .qsz,.qrow.qhead .qwhy{text-align:right}
+.qrow.qhead .qmv{opacity:1}
+/* ABOUT TO BE CLAIMED BY A FREE WORKER.
+   The tint alone was easy to miss on a 300-row list, and these rows are the
+   only ones on screen that are about to become something else - they belong in
+   the Transcoding panel within seconds. A slow pulse says "moving" in the same
+   way the running cards' spinner does, without the jitter of anything faster. */
+@keyframes qglow{
+  0%,100%{background:rgba(88,166,255,.07);
+          box-shadow:inset 2px 0 0 var(--acc), 0 0 0 0 rgba(88,166,255,0)}
+  50%    {background:rgba(88,166,255,.15);
+          box-shadow:inset 2px 0 0 var(--acc), 0 0 16px 1px rgba(88,166,255,.30)}
+}
+.qrow.qnext{background:rgba(88,166,255,.09);
+            box-shadow:inset 2px 0 0 var(--acc);
+            animation:qglow 2.4s ease-in-out infinite}
+.qrow.qnext .qt{font-weight:600}
+/* A pulsing background behind text is a readability problem for some people,
+   and the browser already knows who. */
+@media (prefers-reduced-motion: reduce){
+  .qrow.qnext{animation:none}
+}
+/* Divider between "these are starting" and "these are behind them". */
+.qsplit{display:flex;align-items:center;gap:8px;padding:5px 14px 4px;
+        font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;
+        color:var(--dim);background:#0e1218;
+        border-bottom:1px solid rgba(255,255,255,.05)}
+.qsplit i{flex:1;height:1px;background:var(--line)}
+.qsplit b{color:var(--acc);font-weight:600;letter-spacing:.08em}
+/* The next-up marker uses the SAME three-dot indicator as the Transcoding
+   panel's running groups (.spin). A static ▶ said "this one is next" but not
+   "and the system is actively working towards it"; the two panels sit one
+   above the other, so sharing one vocabulary for "in progress" means you read
+   them the same way instead of learning two. */
+/* LIBRARY BROWSER. Expands inline under its library row, the same shape as the
+   Watch panel under a worker card - the context stays on screen instead of the
+   view jumping somewhere else. */
+.browserow td{padding:0 !important;background:#12161c}
+.browsebox{border-top:1px solid var(--line);padding:0 0 6px}
+.bcrumbs{display:flex;align-items:center;gap:6px;flex-wrap:wrap;
+         padding:8px 14px 4px;font-size:12px}
+.bcrumbs .sep{color:var(--dim)}
+.crumb{cursor:pointer;color:var(--acc)}
+.crumb:hover{text-decoration:underline}
+.bpath{padding:0 14px 7px;font-size:10.5px;overflow-wrap:anywhere}
+.blist{max-height:360px;overflow-y:auto;border-top:1px solid var(--line)}
+/* SKIP LAYOUT FOR ROWS NOBODY IS LOOKING AT.
+   Opening P:\Movies renders 1,437 folders as 10,067 DOM nodes, and measured on
+   this library the cost was not the server (34 ms), the JSON (546 KB), the
+   string building (8 ms) or even parsing it (17 ms) - it was 178 ms of LAYOUT,
+   computing the geometry of 1,400 rows of which about a dozen are on screen.
+   content-visibility:auto lets the browser defer that work until a row scrolls
+   into view. 153 ms -> 31 ms measured on the same folder.
+   contain-intrinsic-size is what keeps the scrollbar honest: it is the height
+   to ASSUME for a row that has not been laid out. Measured in the page at 39px
+   - and measured IN THE PAGE deliberately, because the same row in a detached
+   probe element comes out at 28px, inheriting none of the surrounding grid.
+   Taking the easy measurement would have put an 11px error on every one of
+   1,400 rows. The `auto` keyword makes it self-correcting once a row has been
+   seen for real, so this is the starting guess rather than a promise. */
+.brow{display:grid;grid-template-columns:1fr auto 74px;gap:12px;
+      align-items:center;padding:5px 14px;font-size:12px;
+      border-bottom:1px solid #1b2027;
+      content-visibility:auto;contain-intrinsic-size:auto 39px}
+.brow:last-child{border-bottom:none}
+.bdir{cursor:pointer}
+.bdir:hover{background:rgba(88,166,255,.07)}
+.bfile{cursor:pointer}
+.bfile:hover{background:rgba(255,255,255,.03)}
+/* Per-file track list. Indented and on a darker ground so it reads as detail
+   BELONGING to the row above rather than as another file. */
+.minfo{background:#0d1116;border-bottom:1px solid #1b2027}
+.minfobox{padding:7px 14px 9px 26px;font-size:11.5px}
+.mrow{display:grid;grid-template-columns:52px 1fr;gap:10px;padding:2px 0;
+      align-items:baseline}
+.mk{color:var(--dim);font-size:10px;text-transform:uppercase;letter-spacing:.5px}
+.mv{overflow-wrap:anywhere}
+.mtag{display:inline-block;font-size:9px;padding:0 5px;border-radius:9px;
+      border:1px solid;margin-left:4px;vertical-align:middle}
+.mflag{color:var(--dim);border-color:var(--line)}
+.mhdr{color:#f0c674;border-color:#7a5a1e}
+.mdv{color:#d2a8ff;border-color:#5a3a7a}
+/* Image subs are the ones that force Plex to burn in and transcode, so they
+   are called out rather than blending in with the text ones. */
+.mimg{color:var(--warn);border-color:#7a5a1e}
+.mtext{color:var(--ok);border-color:#1f4426}
+.bname{overflow-wrap:anywhere}
+.bmeta{display:flex;gap:9px;align-items:center;font-size:11px;white-space:nowrap}
+.binfo{font-variant-numeric:tabular-nums}
+.bsize{text-align:right;font-variant-numeric:tabular-nums;font-size:11px}
+/* File rows get real columns so state, media info, disk and size align
+   vertically. Folders keep the 3-column shape - their middle cell is a
+   progress bar, not comparable data. */
+.brow.bfile{grid-template-columns:1fr 58px minmax(230px,330px) 92px 74px}
+.bstate{font-size:11px}
+.bdisk{font-size:11px}
+.bposter{height:96px;border-radius:6px;margin:8px 0 0 12px;
+         box-shadow:0 2px 10px #0007}
+/* provider link + original language, under the path */
+.bmetarow{display:flex;gap:9px;align-items:center;flex-wrap:wrap;
+          padding:5px 14px 2px;font-size:11px}
+.bmetarow a{text-decoration:none}
+.bmetarow a:hover{text-decoration:underline}
+/* ONE LINK IN THE METADATA CHAIN.
+   Every row is the same four parts in the same order - who talks to whom,
+   the schedule, any warning, then the action - so the three read as one list
+   instead of three different shapes. The panel lives in a narrow column, so
+   nothing here may assume it has room: the header wraps as a unit, and the
+   action sits on its own line where it cannot land among the chips and make
+   "Japanese 21,842" look like "Japanese 2".
+
+   NAMED metaXxx, NOT mXxx. The first version called the container .mrow,
+   which already exists further up as a 52px/1fr GRID for the media-info rows.
+   Adding a border and a background to it did nothing about the inherited
+   `display:grid`, so every child became a cell in a 52-pixel column: the
+   arrow wrapped onto its own line, the language chips stacked one per row,
+   and the Sync button landed in the middle of them. The styles were right and
+   the name was wrong. */
+.metarow{display:block;border:1px solid var(--line);border-radius:8px;
+         padding:11px 13px;margin-bottom:10px;background:#0e1218}
+.metarow .metahead{display:flex;align-items:center;gap:7px;flex-wrap:wrap;
+                   line-height:1.5}
+.metarow .metahead b{white-space:nowrap}
+.metarow .metato{color:var(--dim);white-space:nowrap}
+.metarow .metawhen{color:var(--dim);font-size:11.5px;margin-top:5px;
+                   line-height:1.55}
+.metarow .metanote{font-size:11.5px;margin-top:4px;line-height:1.5}
+.metarow .metachips{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+.metarow .metaact{margin-top:10px;padding-top:9px;
+                  border-top:1px solid var(--line);
+                  display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+/* Folder completion, small enough to sit in a row without dominating it. */
+.bmini{display:inline-block;width:52px;height:4px;border-radius:2px;
+       background:#22272e;overflow:hidden;vertical-align:middle}
+.bmini i{display:block;height:100%}
+@media(max-width:800px){
+  .brow{grid-template-columns:1fr auto}
+  .brow.bfile{grid-template-columns:1fr 58px}
+  .bsize{display:none}
+  .binfo{display:none}
+  .bdisk{display:none}
+  .bposter{display:none}
+}
+.qsrc{font-size:9px;padding:0 5px;opacity:.85}
+/* Per-origin counts with their own clear button. Separate buttons because the
+   three kinds are not interchangeable: auto work regenerates itself, a manual
+   or requeued file does not. */
+.aqchip{display:inline-flex;align-items:center;gap:5px;font-size:11px;
+        border:1px solid;border-radius:20px;padding:1px 4px 1px 9px}
+.aqchip b{font-variant-numeric:tabular-nums}
+.aqchip .aqx{border:none;background:none;color:inherit;cursor:pointer;
+             font-size:13px;line-height:1;padding:0 4px;opacity:.65}
+.aqchip .aqx:hover{opacity:1}
+.aqclear{font-size:11px;padding:1px 9px}
+button.on{border-color:var(--ok);color:var(--ok)}
+.qarrow{color:var(--acc);margin-right:4px}
+.qspin{display:inline-block;width:18px;margin-right:3px;color:var(--acc);
+       vertical-align:middle}
+.qspin i{display:inline-block;width:4px;height:4px;border-radius:50%;
+         background:currentColor;margin-right:2px;animation:blink 1.2s infinite}
+.qspin i:nth-child(2){animation-delay:.2s}
+.qspin i:nth-child(3){animation-delay:.4s}
+@media (prefers-reduced-motion:reduce){.qspin i{animation:none;opacity:.7}}
+/* Activity cell: a grid so every row's Read/Write value lands in the same
+   column and the numbers never move. The VALUE cells are fixed - tabular-nums
+   alone does not stop "—" and "123.2 MB/s" changing width - but the labels
+   shrink, so the whole thing still scales down. */
+/* Activity gets its OWN full-width row under each disk, centred.
+   As a seventh column it was permanently fighting for space: its content is
+   fixed-width (two labels, two numbers, a job count) while the column was a
+   share of the table, so every narrowing either spilled it over the Free
+   column or clipped it. Given the whole row it simply fits, at any width, and
+   the responsive rules collapse to almost nothing. */
+/* The flex box is a DIV INSIDE the cell, never the <td> itself. Setting
+   display:flex on a td takes it out of the table layout algorithm - it stops
+   being a table-cell, and colspan is then ignored, so the "full width" row
+   silently rendered at the width of column one. */
+.iorow td{border-top:none;padding:0 14px 8px}
+.iorow{border-bottom:1px solid var(--line)}
+
+/* EACH DISK IS ONE BOX, NOT TWO ROWS.
+   The capacity figures and the activity line belong to the same drive, but
+   stacked twelve deep they read as twenty-four independent rows - and the
+   throughput line sits BELOW the name it belongs to, so tracing "133 MB/s" back
+   to its disk meant reading upwards against the flow. Boxing the pair fixes
+   that without adding a word.
+
+   Built from CELL borders rather than a border on the tbody: this table is
+   border-collapse:collapse, where tbody borders are unreliable across browsers
+   and get overridden by the cell borders anyway. The horizontal rules that used
+   to separate every row are removed inside the group, so the only lines left
+   are the ones that mean something.
+
+   The left edge takes the disk's own colour via --dcol, set per group. That
+   colour is already used for the drive name, so the box does not introduce a
+   new visual language - it extends one that is there. */
+#disks tbody.dgrp > tr > td{border-bottom:none;border-top:none}
+#disks tbody.dgrp > tr:first-child > td{border-top:1px solid var(--line)}
+#disks tbody.dgrp > tr:last-child > td{border-bottom:1px solid var(--line);
+  padding-bottom:9px}
+#disks tbody.dgrp > tr > td:first-child{
+  border-left:3px solid var(--dcol,var(--line))}
+#disks tbody.dgrp > tr > td:last-child{border-right:1px solid var(--line)}
+/* Breathing room INSIDE the box rather than between boxes. A gap between them
+   would need border-spacing, which in a collapsed table splits each group down
+   the middle instead - and a transparent tbody border wins the collapse
+   against the 1px edge and erases it. Padding is the only version of this that
+   behaves. */
+#disks tbody.dgrp > tr:first-child > td{padding-top:9px}
+/* ALTERNATING FILL, because a line is not enough on its own here.
+   Twelve boxes stacked with no gap between them share every horizontal edge,
+   so the outline alone gave one continuous grid rather than twelve objects -
+   and the coloured left edges ran together into a single striped bar. Filling
+   every other group makes the boundary a change of surface instead of a line
+   to find, which survives at a glance and at low contrast.
+   nth-of-type counts tbody elements only, so the header - now a real thead -
+   does not shift the parity. */
+#disks tbody.dgrp:nth-of-type(odd) > tr > td{background:rgba(255,255,255,.028)}
+/* Hover lights the whole drive, not the one row under the pointer - which is
+   the same claim the box makes, restated on contact. */
+#disks tbody.dgrp:hover > tr > td{background:#1c2129}
+/* A drive under load earns a tinted box; the row tint alone only marked half
+   of it and made the group look like it had come apart. */
+/* A drive nuarr is working on. This tint used to live on .iorow.io-busy, so it
+   coloured the activity row and not the capacity row above it - which split
+   the drive down the middle and undid the grouping on exactly the drives you
+   are watching. It belongs to the whole box. */
+#disks tbody.dgrp.dwork > tr > td{background:rgba(88,166,255,.05)}
+#disks tbody.dgrp.dwork > tr > td:first-child{border-left-color:var(--acc)}
+#disks tbody.dgrp.dhot > tr > td{background:rgba(210,153,34,.055)}
+#disks tbody.dgrp.dhot > tr > td:first-child{border-left-color:var(--warn)}
+#disks tbody.dgrp.dwatch > tr > td:first-child{border-left-color:var(--warn)}
+#disks tbody.dgrp.dhot:hover > tr > td{background:rgba(210,153,34,.1)}
+/* The totals. Heavier top edge and no accent colour, because it is a summary
+   of the boxes above rather than another one of them. */
+#disks tbody.dgrp.dpool > tr:first-child > td{border-top:2px solid var(--line)}
+#disks tbody.dgrp.dpool > tr > td:first-child{
+  border-left:3px solid var(--line)}
+#disks tbody.dgrp.dpool{border-bottom:0}
+/* THE THROUGHPUT LINE.
+   Two things made this blend into itself. It was CENTRED in a full-width row,
+   so on twelve stacked disks the figures sat at a different horizontal
+   position on every row - whatever the number widths happened to add up to -
+   leaving nothing to read down the column. And Read and Write were bare text
+   separated by a gap, so at a glance the pair was one grey smear and you had
+   to stop and parse which number belonged to which word.
+   Now: each measurement is its own bordered chip, so the two cannot run
+   together.
+
+   FIXED SLOTS, CENTRED. Indenting the row to the Capacity column lined up the
+   FIRST chip and nothing after it: a disk with only a viewer put that group
+   where another disk put its system figure, so reading down the column meant
+   re-finding each label on every row. And every chip resized as its own value
+   changed, so the whole run shuffled sideways twice a second.
+
+   Each of the four now owns a fixed-width slot in a fixed order - busy, nuarr,
+   system, viewer - present or not. An absent group leaves its slot empty
+   rather than closing the gap, which is what makes a column readable: the
+   viewer figures are always in the viewer place, and a disk with nothing to
+   report is visibly a hole rather than a differently-arranged row. */
+/* A MINIMUM, NOT AN EXACT WIDTH - and the row wraps rather than overlapping.
+   These were fixed `width` values, which is fine until the box is narrower
+   than the text inside it. Browser zoom is exactly that case and it is not
+   obvious why: zooming in does not enlarge the CSS pixel, it SHRINKS the
+   viewport measured in CSS pixels, so a 1920px screen at 150% reports about
+   1280 and trips the max-width:1300px breakpoint. The slots duly narrowed to
+   240px - and the font did not, because 11px is still 11px. "nuarr READ 18.3
+   MB/s WRITE 13.0 MB/s" needs more than that, and with white-space:nowrap and
+   a hard width it had nowhere to go but on top of the system and viewer
+   groups next to it.
+   The uniform-box goal the widths were serving still holds at every normal
+   size; min-width keeps that and lets a slot grow instead of spilling, and
+   flex-wrap gives the row somewhere to put the overflow when it cannot. */
+.diskio{white-space:nowrap;font-size:11px;display:flex;gap:7px;flex-wrap:wrap;
+        align-items:center;justify-content:center}
+/* THE BUBBLE FILLS THE SLOT, so every box on the panel is the same size.
+   Letting each chip size to its content meant a row of four boxes in four
+   different widths, which reads as four different KINDS of thing - the shape
+   was carrying meaning it did not have. Uniform boxes let the colour and the
+   contents do that job instead. */
+.diskio .io-slot{flex:0 0 auto;display:inline-flex;align-items:center}
+.diskio .io-slot > *{width:100%;box-sizing:border-box}
+.diskio .io-slot > .io-grp{justify-content:flex-start}
+.diskio .io-slot > .io-p{justify-content:space-between}
+.diskio .sl-busy{min-width:150px}
+.diskio .sl-ours{min-width:300px}
+.diskio .sl-sys{min-width:130px}
+.diskio .sl-view{min-width:150px}
+@media(max-width:1300px){
+  .diskio .sl-busy{min-width:120px}
+  .diskio .sl-ours{min-width:240px}
+  .diskio .sl-sys{min-width:110px}
+  .diskio .sl-view{min-width:120px}
+}
+.diskio .io-p{display:inline-flex;align-items:baseline;gap:7px;
+        border:1px solid var(--line);border-radius:9px;padding:1px 9px;
+        background:rgba(255,255,255,.022)}
+.diskio .io-l{color:var(--dim);font-size:9.5px;text-transform:uppercase;
+        letter-spacing:.5px}
+/* Fixed WIDTH, not min-width. A minimum still grows: "9 KB/s" and "109.0 MB/s"
+   are different sizes, so every chip breathed in and out twice a second and
+   dragged its neighbours with it. Locked to the widest realistic reading, in
+   tabular figures so the digits change in place. */
+.diskio .io-v{font-variant-numeric:tabular-nums;width:62px;text-align:right;
+              font-weight:600}
+.diskio .io-busyp .io-v{width:34px}
+.diskio .io-j{width:40px;display:inline-block}
+.diskio .io-j{color:var(--dim);font-size:10px;padding-left:2px}
+/* Eleven idle rows should not shout as loudly as the one that is working. */
+.diskio .io-idle{color:#525c6b;font-size:10.5px;letter-spacing:.4px}
+/* HOW BUSY THE SPINDLE IS, as a number and as a bar in the same chip.
+   The number alone made twelve rows a column of percentages you had to read
+   one at a time; the bar alone loses the value. Together the column can be
+   scanned and any single row still says exactly what it means.
+   The bar is SPLIT: accent for load nuarr is causing, warn for everything
+   else. Total width is the busy percentage, so a half-full bar is a
+   half-busy disk however the two parts divide it. */
+.diskio .io-busyp .io-v{min-width:34px}
+.diskio .iobar{display:inline-block;width:60px;height:5px;border-radius:3px;
+        background:rgba(255,255,255,.08);overflow:hidden;
+        vertical-align:middle;margin-left:1px;font-size:0}
+.diskio .iobar i{display:inline-block;height:100%;vertical-align:top}
+/* "Other" reuses the warn colour rather than getting its own, because it is
+   the same fact the busy pill and the gate row report - load that is not ours.
+   A third colour would imply a third category. */
+.diskio .m-other{color:var(--warn)}
+/* A DISK THAT HAS DRIFTED FROM THE REST.
+   Only ever applied to the one or two that are actually out of line - if this
+   lit up on a balanced pool it would be decoration, and decoration is what
+   you stop seeing. Two directions rather than one colour, because they mean
+   opposite things: fuller than the pool is the disk that runs out first,
+   emptier is the disk that is not being written to.
+   Underlined as well as coloured, so it survives being read at a glance and
+   by anyone who does not separate these two hues easily.
+
+   Opacity and weight are set inline, per disk, from how far out it is - see
+   outStrength(). At a 0.1-point threshold most of the pool is coloured on any
+   given day, so uniform emphasis would just be twelve coloured numbers saying
+   nothing; graded emphasis makes the column a picture of the spread.
+
+   THE RANGE IS 0.78-1.0, NOT 0.42-1.0. The first version faded the smallest
+   deviations almost to nothing on the reasoning that they matter least, which
+   confused two different jobs: the fill percentage is a figure you read on
+   every row, and the tint is a comparison layered on top of it. Making the
+   comparison subtle by making the NUMBER unreadable was the wrong trade - the
+   number is the thing, and it should never be harder to read than the plain
+   grey it replaced. */
+.fillpct{color:#c2ccd6}
+.fill-hi,.fill-lo{cursor:help;
+  text-decoration:underline dotted;text-underline-offset:2px}
+.fill-hi{color:var(--warn)}
+.fill-lo{color:#79c0ff}
+/* TWO OWNERS, TWO BOXES.
+   The chips are all the same shape, so a run of five of them read as one
+   measurement in five parts - "Busy 50% · Other 710 KB/s · Read 2.2 MB/s ·
+   Write 9.7 MB/s · 1 job" gives no clue that three of those are nuarr and one
+   is not. Grouping them behind a name is the whole fix; the tint and the rule
+   down the left edge are what stop the two groups merging back together at a
+   glance.
+   Busy% deliberately sits outside both, because it belongs to the spindle
+   rather than to either program. */
+.diskio .io-grp{display:inline-flex;align-items:center;gap:6px;
+  border:1px solid var(--line);border-radius:9px;padding:1px 8px 1px 0;
+  position:relative}
+.diskio .io-gl{font-size:9px;text-transform:uppercase;letter-spacing:.6px;
+  padding:2px 7px;border-radius:8px 0 0 8px;align-self:stretch;
+  display:inline-flex;align-items:center;font-weight:600}
+/* No inner borders: the group's own outline is the boundary, and chips inside
+   it drawing their own made a box of boxes. */
+.diskio .io-grp .io-p{border:0;background:transparent;padding:1px 0}
+.diskio .io-ours{border-color:#2d5c8a;background:rgba(88,166,255,.05)}
+.diskio .io-ours .io-gl{background:rgba(88,166,255,.14);color:var(--acc)}
+.diskio .io-sys{border-color:#7a5a1e;background:rgba(210,153,34,.05)}
+.diskio .io-sys .io-gl{background:rgba(210,153,34,.14);color:var(--warn)}
+/* A viewer. Green, because it is the only one of the three that is the point
+   rather than a cost - and a different colour from both so a glance down the
+   column separates "somebody is watching" from "something is in the way". */
+.diskio .io-view{border-color:#2f6b3f;background:rgba(63,185,80,.05)}
+.diskio .io-view .io-gl{background:rgba(63,185,80,.14);color:var(--ok)}
+.diskio .m-view{color:var(--ok)}
+/* NOTHING HAPPENING HERE. Present so the row keeps its shape, and drained of
+   colour so it cannot be mistaken for something that is. The label stays
+   readable - it is what makes the empty box legible as "no viewer" rather
+   than as a gap somebody forgot to fill. */
+/* The per-job I/O tier. Present on every card, so the NORMAL state has to be
+   quiet enough not to compete with the rates beside it while still being
+   findable - it is the answer to "why is this one slow", and an answer you
+   only get by noticing an absence is not one. */
+.iotier{font-size:9px;padding:0 5px;white-space:nowrap}
+.iotier-norm{color:#5b6672;border-color:#2a313a}
+.diskio .off{border-color:#23292f !important;background:transparent !important}
+.diskio .off .io-gl{background:rgba(255,255,255,.03) !important;
+        color:#4d5560 !important}
+.diskio .io-off{color:#454d57;font-size:10.5px;padding-left:2px;
+        white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.diskio .io-busyp.off .io-v{color:#454d57}
+.diskio .io-busyp.off .iobar{background:rgba(255,255,255,.04)}
+@media(max-width:1250px){
+  /* The name is what carries the meaning, so it is the last thing to go -
+     the figures shorten first (Read -> R), and only below this do the group
+     labels drop to their initial. */
+  .diskio .io-gl{letter-spacing:.3px;padding:2px 5px}
+}
+.diskio .sm{display:none}          /* short labels appear only when narrow */
+/* A disk that is actually moving data gets a tint, so the busy ones can be
+   found without reading every row.
+   NAMED io-busy, NOT busy. There is already a global .busy for the in-button
+   spinner - .busy{display:inline-flex} - and putting that class on a <tr> took
+   the row out of the table layout, so its colspan=6 cell was ignored and
+   collapsed to 299px while the idle rows stayed 1031px. Same failure the note
+   above the .iorow rules describes, arrived at from the other direction: there
+   it was display on the cell, here it was display inherited onto the row from
+   a class name that already meant something else. */
+/* Superseded inside #disks by tbody.dgrp.dwork, which tints the whole drive
+   rather than half of it. Kept for any other table that uses .iorow. */
+.iorow.io-busy td{background:rgba(88,166,255,.05)}
+#disks .iorow.io-busy td{background:transparent}
+
+/* PERCENTAGES, NOT PIXELS. Fixed px widths kept the columns from jittering but
+   their sum exceeded the panel, so the table overflowed and the Activity cell
+   was clipped off the right edge. table-layout:fixed still pins the columns -
+   the widths just scale with the panel now. overflow-x is the safety net for
+   anything narrower than the minimum. */
+#disks{overflow-x:auto}
+#disks table{table-layout:fixed;width:100%;min-width:520px}
+#disks th:nth-child(1),#disks tr:not(.iorow) td:nth-child(1){width:15%}
+#disks th:nth-child(2),#disks tr:not(.iorow) td:nth-child(2){width:9%}
+#disks th:nth-child(3),#disks tr:not(.iorow) td:nth-child(3){width:10%}
+#disks th:nth-child(4),#disks tr:not(.iorow) td:nth-child(4){width:10%}
+#disks th:nth-child(6),#disks tr:not(.iorow) td:nth-child(6){width:14%}
+
+/* CONTAINER queries, not viewport ones.
+   The panel sits in a .two grid that collapses to one column below 900px - so
+   at an 880px viewport this panel is FULL width and has more room than it had
+   at 1200px. Sizing off the viewport would strip columns exactly when the
+   panel had space for them. @container asks the only question that matters:
+   how wide is THIS panel. */
+#disks{overflow-x:auto;container-type:inline-size;container-name:diskpanel}
+
+/* 940, not 720: at ~900 all seven columns still rendered but the fixed-width
+   Activity grid no longer fit its share, so the table scrolled sideways - the
+   exact jitter this panel was supposed to stop. Shed the two derivable columns
+   before it gets tight rather than after. */
+@container diskpanel (max-width:940px){
+  /* Size and Used first - both are implied by Capacity + Free. */
+  #disks th:nth-child(3),#disks tr:not(.iorow) td:nth-child(3),
+  #disks th:nth-child(4),#disks tr:not(.iorow) td:nth-child(4){display:none}
+  #disks table{min-width:0}
+  /* Activity needs a bigger SHARE as the table narrows, not a smaller one -
+     its content is fixed-width numbers, so a shrinking percentage is what
+     made the cell overflow its column and scroll the whole table. */
+  /* The slots narrow together rather than the row losing its indent - it has
+     no indent now, it is centred, so what has to give is the slot widths. */
+  .diskio{gap:6px}
+  .diskio .sl-busy{min-width:118px}
+  .diskio .sl-ours{min-width:228px}
+  .diskio .sl-sys{min-width:104px}
+  .diskio .sl-view{min-width:114px}
+}
+@container diskpanel (max-width:560px){
+  #disks th:nth-child(2),#disks tr:not(.iorow) td:nth-child(2){display:none}   /* Files */
+  /* Swap Read/Write for R/W rather than dropping the labels: a bare pair of
+     numbers gives no clue which is which. The job count always stays - it is
+     what says whether a quiet disk is idle or merely slow. */
+  .diskio{gap:5px;font-size:10px}
+  .diskio .lg{display:none}
+  .diskio .sm{display:inline}
+  .diskio .io-v{width:56px}
+  .diskio .io-busyp .io-v{width:30px}
+  .diskio .io-p{padding:1px 7px;gap:5px}
+  .diskio .sl-busy{min-width:96px}
+  .diskio .sl-ours{min-width:186px}
+  .diskio .sl-sys{min-width:88px}
+  .diskio .sl-view{min-width:96px}
+}
+@container diskpanel (max-width:420px){
+  /* Phone: identity, free space and live activity are what is worth the width.
+     The capacity bar is the first thing to go - it is decoration next to the
+     Free number it duplicates. */
+  #disks th:nth-child(5),#disks tr:not(.iorow) td:nth-child(5){display:none}
+  #disks table{min-width:0}
+  #disks th:nth-child(1),#disks tr:not(.iorow) td:nth-child(1){width:55%}
+  #disks th:nth-child(6),#disks tr:not(.iorow) td:nth-child(6){width:45%}
+  /* Phone: the slots stop being fixed. There is not enough width to hold a
+     column shape, and a row that scrolls sideways is worse than one that
+     simply packs - the alignment was only ever worth having because you can
+     see twelve rows at once, which you cannot here. */
+  .diskio{gap:5px;justify-content:flex-start}
+  .diskio .io-v{width:52px}
+  .diskio .io-slot{width:auto !important}
+  .diskio .io-slot:empty{display:none}
+  .diskio .io-p{gap:4px;padding:1px 6px}
+}
+/* THESE ARE COLUMNS, SO THEY ARE FIXED - not merely minimum - WIDTHS.
+
+   Every cell here used to be `min-width`, which sets a floor and nothing else:
+   a flex item with `min-width:110px` and a fourteen-character library name is
+   148px wide, and every cell to its right on THAT ROW ONLY slides across by the
+   difference. Measured on the live queue: a long library name moved its row's
+   disk, size and reason 38px right, and two rows whose reasons differed by one
+   character sat 6px apart. `flex:0 0 Npx` fixes the width outright, so a column
+   is a column on every row whatever it contains.
+
+   The title is the one elastic cell, and needs min-width:0 or a flex item
+   refuses to shrink below its content and the ellipsis never engages. */
+.qrow .qn{color:var(--dim);font-variant-numeric:tabular-nums;flex:0 0 44px}
+.qrow .qpool{flex:0 0 84px;text-align:center;justify-content:center}
+.qrow .qsrc{flex:0 0 56px;text-align:center;justify-content:center}
+.qrow .qt{flex:3 1 0;min-width:0;overflow:hidden;text-overflow:ellipsis;
+          white-space:nowrap}
+/* What this job will actually do - "re-encode → hevc · audio → eac3". The
+   plan existed the whole time; the queue just never said. Hover for the plan's
+   own sentences. */
+.qrow .qwork{flex:2 1 0;min-width:0;font-size:11px;color:#9fb0c8;
+             overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.qrow .qdisk{flex:0 0 96px;overflow:hidden;text-overflow:ellipsis;
+             white-space:nowrap}
+.qrow .qsz{color:var(--dim);font-variant-numeric:tabular-nums;flex:0 0 70px;
+           text-align:right}
+/* Reorder controls. Hidden until the row is hovered so 300 rows are not 1,200
+   buttons competing with the text. */
+.qrow .qmv{display:flex;gap:2px;opacity:0;transition:opacity .12s}
+.qrow:hover .qmv{opacity:1}
+.qrow .qmv button{padding:0 5px;font-size:11px;line-height:17px;min-width:0}
+@media (hover:none){.qrow .qmv{opacity:1}}   /* touch has no hover */
+.qrow .qlib{color:var(--dim);flex:0 0 120px;overflow:hidden;text-overflow:ellipsis;
+            white-space:nowrap}
+/* A row label: says what the controls beside it do, without competing with
+   them for attention. */
+.rowlbl{font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;
+  min-width:62px}
+/* Inline now, on the right of the filter row, acting as a legend for the POOL
+   column rather than as its own strip - so no padding and no wrap. */
+.qdisks{display:flex;gap:6px;flex-wrap:wrap;margin-left:auto;align-items:center}
+.qchip{font-size:11px;padding:2px 8px;border-radius:10px;border:1px solid var(--line);
+       background:#161b22;cursor:pointer;white-space:nowrap}
+.qchip.on{border-color:var(--acc);color:var(--acc)}
+.runbox::-webkit-scrollbar{width:12px}
+.runbox::-webkit-scrollbar-thumb{background:#2b3340;border-radius:6px}
+.runbox::-webkit-scrollbar-track{background:#0b0e12}
+.watchbox{margin-top:8px;border-top:1px solid var(--line);padding-top:8px}
+.watchbox .logbox.inline{margin:0;max-height:200px}
+td.act button.on{border-color:var(--acc);color:var(--acc)}
+button.resume{border-color:var(--acc);color:var(--acc);font-size:11px;padding:2px 8px}
+/* clickable titles */
+.tl{cursor:pointer;border-bottom:1px dotted #3a4150}
+.tl:hover{color:var(--acc);border-bottom-color:var(--acc)}
+.whypool{font-size:11px;color:var(--dim);margin:2px 0 6px}
+.acts{margin:4px 0 0;font-size:11px}
+.acts li{margin:2px 0;color:var(--dim);list-style:none}
+.acts b{color:var(--fg);font-weight:500}
+.pill{white-space:nowrap}
+td.when{white-space:nowrap;font-variant-numeric:tabular-nums}
+.scrollbox::-webkit-scrollbar{width:12px}
+.scrollbox::-webkit-scrollbar-thumb{background:#2b3340;border-radius:6px}
+.scrollbox::-webkit-scrollbar-track{background:#0b0e12}
+.scrollbox th{position:sticky;top:0;background:var(--panel);z-index:1;
+              box-shadow:inset 0 -1px 0 var(--line)}
+.logbox{height:460px;overflow-y:scroll;font-family:ui-monospace,Consolas,monospace;
+        font-size:12px;padding:8px 14px;background:#0b0e12}
+.logbox::-webkit-scrollbar{width:12px}
+.logbox::-webkit-scrollbar-thumb{background:#2b3340;border-radius:6px}
+.logbox::-webkit-scrollbar-track{background:#0b0e12}
+.logbox div{white-space:pre-wrap;overflow-wrap:anywhere;padding:1px 0}
+/* Colour carries meaning, so each level looks distinct and RED MEANS FAILED.
+   Info is deliberately muted - it is the bulk of the log and should recede so
+   the ok/warn/error lines stand out. */
+.l-error{color:#ff6b63;font-weight:600}
+.l-warn{color:#e3b341}
+.l-ok{color:#56d364}
+.l-debug{color:#5d6673}
+.l-info{color:#b9c2cf}
+/* job boundaries: cyan and bold, impossible to miss when scrolling */
+.l-start{color:#2ecfd6;font-weight:700;letter-spacing:.3px}
+.l-end{color:#9d7bff;font-weight:700;letter-spacing:.3px}
+/* the plan block, so decisions read differently from chatter */
+.l-plan{color:#79c0ff;font-weight:600}
+.l-why{color:#7d8694;font-style:italic}
+/* The ffmpeg command is the single most useful line when something looks
+   wrong - it was dimmer than ordinary text, so it vanished into the wall.
+   Tinted and set apart instead. */
+.l-cmd{color:#d2a8ff;background:#1a1420;border-left:2px solid #6f42c1;
+       padding-left:6px;display:block}
+/* rename: old name muted and struck, new name bright, so the change reads at
+   a glance instead of having to diff two near-identical 120-char strings */
+.r-old{color:#8b95a5;text-decoration:line-through;text-decoration-color:#5d6673}
+.r-new{color:#56d364;font-weight:600}
+.r-arrow{color:#e3b341;font-weight:700;padding:0 4px}
+/* live load strip above the workers */
+/* A blocked GPU encoder is easy to scroll past as one more grey pill, so this
+   one pulses. Slow and low-contrast on purpose - it has to be noticeable
+   without becoming the thing you resent about the page. */
+.blink{animation:blk 2.2s ease-in-out infinite}
+@keyframes blk{0%,100%{opacity:1}50%{opacity:.45}}
+@media (prefers-reduced-motion:reduce){.blink{animation:none}}
+
+/* Work-in-progress indicator for Preview / Queue.
+   Both buttons fire requests that can take many seconds - Preview does two
+   round trips, one of which counts queueable files across a whole library, and
+   Queue probes and plans every file it takes. Neither said anything while that
+   happened, so the only signal you had was the result appearing. A spinner
+   alone is not enough either: it says "busy" but not "busy with what", and the
+   steps here have genuinely different costs. So this shows the STEP and a
+   running clock - a number that visibly moves is what separates "working" from
+   "hung". */
+.busy{display:inline-flex;align-items:center;gap:7px;white-space:nowrap}
+.busy .sp{width:11px;height:11px;flex:none;border-radius:50%;
+  border:2px solid var(--line);border-top-color:var(--acc,#58a6ff);
+  animation:busyspin .7s linear infinite}
+.busy .el{font-variant-numeric:tabular-nums;opacity:.6}
+.busy .step{color:var(--dim)}
+@keyframes busyspin{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){.busy .sp{animation-duration:2s}}
+button[disabled]{opacity:.5;cursor:default}
+/* In-button working indicator. Same three-dot vocabulary as the Transcoding
+   and Queue panels, sized to sit inside a button without changing its height.
+   The button keeps its measured width while this shows, so nothing around it
+   reflows. */
+.bspin{display:inline-flex;align-items:center;gap:3px;vertical-align:middle}
+.bspin i{width:3px;height:3px;border-radius:50%;background:currentColor;
+         animation:blink 1.2s infinite}
+.bspin i:nth-child(2){animation-delay:.2s}
+.bspin i:nth-child(3){animation-delay:.4s}
+@media (prefers-reduced-motion:reduce){.bspin i{animation:none;opacity:.7}}
+/* Skeleton rows for a sub-panel that is open but still loading. An empty
+   panel reads as "no results"; this reads as "not yet". */
+.skel{padding:12px 14px}
+.skel i{display:block;height:11px;border-radius:3px;margin:7px 0;
+  background:linear-gradient(90deg,var(--chip,#161b22),var(--line),var(--chip,#161b22));
+  background-size:200% 100%;animation:skelshine 1.2s ease-in-out infinite}
+@keyframes skelshine{to{background-position:-200% 0}}
+
+/* Startup pill. Sits ahead of the CPU/RAM chips because until it clears,
+   every other number in the header is provisional. */
+/* The pill is now a button inside a positioned wrapper, so its panel can hang
+   under it the same way the cpu/gpu/ram panels do. The wrapper carries the
+   margin and the fade; the button carries the border and the state colour. */
+.bootwrap{position:relative;display:inline-flex;margin-right:10px;
+  transition:opacity .6s ease}
+.boot{display:inline-flex;align-items:center;gap:7px;
+  font-size:11px;border:1px solid var(--line);border-radius:11px;
+  padding:2px 9px;background:var(--chip,#161b22);white-space:nowrap;
+  font-family:inherit;cursor:pointer;color:inherit}
+.boot:empty{display:none}
+.boot .caret{font-size:9px;opacity:.75;margin-left:1px}
+.boot.on{border-color:var(--acc)}
+/* The step list. Three columns - state, what, when - because "which step" and
+   "how long did it take" are different questions and a run-on line answers
+   neither well. */
+.boottab td{padding:3px 0;vertical-align:top}
+.boottab .bmark{width:14px;text-align:center;padding-right:6px}
+.boottab .sub{font-size:10.5px;line-height:1.45;margin-top:1px;
+  white-space:normal;max-width:34ch}
+.boottab .bs-ok .bmark{color:var(--ok)}
+.boottab .bs-run .bmark{color:var(--acc)}
+.boottab .bs-run td{color:var(--fg)}
+.boottab .bs-warn .bmark,.boottab .bs-warn td{color:var(--warn)}
+.boottab .bs-bad .bmark,.boottab .bs-bad td{color:var(--bad)}
+.boot.go{border-color:#2d5c8a;color:#9cc4ea}
+.boot.rdy{border-color:#2f6b3f;color:#7fd394}
+.boot.warn{border-color:#7a5a1e;color:#e2b455}
+.boot .bt{width:54px;height:4px;border-radius:2px;background:#22272e;overflow:hidden}
+.boot .bf{height:100%;width:0;background:currentColor;transition:width .35s ease}
+.boot .dot{width:7px;height:7px;border-radius:50%;background:currentColor;flex:none}
+.boot.go .dot{animation:bootpulse 1.1s ease-in-out infinite}
+.boot .el{font-variant-numeric:tabular-nums;opacity:.65}
+/* The live detail line for a long step. Separated by a rule rather than more
+   whitespace, because the pill is already a row of loosely-spaced fragments
+   and another gap would not read as "this belongs to the step before it".
+   Capped and ellipsised: a folder name can be arbitrarily long and the header
+   must not reflow while it scrolls past. */
+.boot .bn{border-left:1px solid currentColor;padding-left:7px;opacity:.5;
+  max-width:34ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+@media (max-width:1100px){.boot .bn{display:none}}
+@keyframes bootpulse{0%,100%{opacity:.3}50%{opacity:1}}
+@media (prefers-reduced-motion:reduce){.boot.go .dot{animation:none}}
+
+/* nuarr's own load, in the header beside the arr pills */
+.selfuse{display:inline-flex;gap:6px;align-items:center;margin-right:10px}
+.selfuse .su{font-size:11px;color:var(--dim);background:var(--chip,#161b22);
+  border:1px solid var(--line);border-radius:11px;padding:2px 8px;white-space:nowrap}
+.selfuse .su b{font-weight:600;font-variant-numeric:tabular-nums}
+/* THE PROCESS COUNT IS A BUTTON WITH A PINNED PANEL, NOT A HOVER TOOLTIP.
+   A native title= is drawn by the browser and is torn down the instant its
+   element is replaced. This bar refreshes once a second, so the tooltip
+   flickered out and back on every sample and could never be read. A panel you
+   click open is ours: it survives the repaint and stays until dismissed. */
+.suwrap{position:relative;display:inline-flex}
+.selfuse .procbtn{cursor:pointer;font-family:inherit;font-size:11px;
+  line-height:1.45;color:var(--dim);background:var(--chip,#161b22);
+  border:1px solid var(--line);border-radius:11px;padding:2px 8px;
+  white-space:nowrap}
+.selfuse .procbtn:hover{color:var(--fg);border-color:#3a4552}
+.selfuse .procbtn.on{color:var(--fg);border-color:var(--acc)}
+.selfuse .procbtn .caret{font-size:9px;opacity:.75;margin-left:3px}
+/* THESE THREE MUST NOT MOVE.
+   They sample once a second, and every part of them was elastic: "2.2%" and
+   "24%" are different widths, "179 MB" and "1.2 GB" are different widths, and
+   "1 process" and "11 processes" differ by three characters. Each change
+   resized its own chip and shoved the two beside it sideways, so a header you
+   want to GLANCE at was in constant motion and a chip you were reaching for
+   had moved by the time you got there.
+
+   Fixed widths on the value and on the chip. Sized for the widest realistic
+   reading - 100% cpu, a two-digit GB figure, a three-digit process count - so
+   nothing has to reflow to fit, and the numbers are right-aligned in tabular
+   figures so the digits line up in place rather than sliding.
+
+   The caret is pushed to the right edge instead of trailing the text, which
+   means the plural on "process(es)" no longer moves it either. */
+.selfuse .procbtn{display:inline-flex;align-items:baseline;gap:4px;
+  justify-content:flex-start}
+.selfuse .procbtn b{display:inline-block;text-align:right;
+  font-variant-numeric:tabular-nums}
+.selfuse .procbtn .caret{margin-left:auto;padding-left:5px}
+#suCpuBtn{min-width:82px}
+#suCpuBtn b{min-width:38px}
+#suRamBtn{min-width:92px}
+#suRamBtn b{min-width:48px}
+#suGpuBtn{min-width:78px}
+#suGpuBtn b{min-width:34px}
+#suProcBtn{min-width:104px}
+#suProcBtn b{min-width:18px}
+/* The process chip is always present. It used to be display:none whenever
+   nuarr had no child processes, so the moment the last encode finished the
+   whole chip vanished and the two beside it slid right - the disappearing act
+   this is fixing. "1 process" is a true and stable answer; there is simply
+   nothing to open. */
+/* A dot on the gpu chip when the CARD is busy but nuarr is not the one using
+   it. Without this, "0% gpu" beside a saturated encoder reads as "nothing is
+   happening" - which is the opposite of the truth and the one case where you
+   most want to look. */
+#suGpuBtn.otherbusy{border-color:#7a5a1e}
+#suGpuBtn.otherbusy::after{content:"";width:5px;height:5px;border-radius:50%;
+  background:var(--warn);margin-left:1px;align-self:center;flex:none}
+.selfuse .procbtn[disabled]{cursor:default;opacity:.75}
+.selfuse .procbtn[disabled]:hover{color:var(--dim);border-color:var(--line)}
+.selfuse .procbtn[disabled] .caret{visibility:hidden}
+.procpop{position:absolute;top:calc(100% + 7px);right:0;z-index:60;display:none;
+  min-width:340px;max-height:60vh;overflow:auto;background:var(--panel);
+  border:1px solid var(--line);border-radius:9px;padding:9px 11px;
+  box-shadow:0 12px 30px rgba(0,0,0,.6);font-size:11px;color:var(--fg);
+  text-align:left;cursor:default}
+.procpop.open{display:block}
+.procpop table{border-collapse:collapse;width:100%}
+.procpop td{padding:3px 0;white-space:nowrap}
+/* The GPU block's little meters. A percentage and a bar together, because
+   three engine figures in a column are read as a comparison and a bar is the
+   fastest way to make one. */
+.procpop .gbar{display:inline-block;width:70px;height:4px;border-radius:2px;
+  background:rgba(255,255,255,.09);overflow:hidden;vertical-align:middle}
+.procpop .gbar i{display:block;height:100%}
+.procpop .gputab td:first-child{white-space:nowrap;padding-right:10px}
+/* AIR BETWEEN THE FIGURE AND THE BAR. They were butted together, so "81%" and
+   its bar read as one smeared object and the eye could not take either
+   cleanly - and the numbers, being different widths, sat at a different
+   distance from the bar on every row. Fixed-width right-aligned column with a
+   gap after it: the digits line up under each other and the bars all start in
+   the same place. */
+.procpop .gputab td.v{width:52px;padding-right:14px}
+.procpop .gputab td:last-child{padding-left:0}
+.procpop td.v{text-align:right;padding-left:16px;
+  font-variant-numeric:tabular-nums;color:var(--dim)}
+.procpop .ph{color:var(--dim);font-size:10px;text-transform:uppercase;
+  letter-spacing:.4px;margin-bottom:7px;padding-bottom:6px;
+  border-bottom:1px solid var(--line)}
+.procpop .pf{color:var(--dim);font-size:10px;margin-top:7px;padding-top:6px;
+  border-top:1px solid var(--line);white-space:normal;max-width:340px}
+.procpop .me{color:var(--acc)}
+.procpop .old{color:var(--warn)}
+/* Save feedback on the audio language rows. The bar is indeterminate on
+   purpose: the page cannot see inside the request, and a bar that invents a
+   percentage reads as a measurement. On completion it fills once and stops. */
+/* FIT TO THE PAGE. At 500 rows the table ran off the bottom and took the
+   column names with it. The header sticks; the body scrolls. */
+#alangPane .alscroll{max-height:calc(100vh - 330px);min-height:220px;
+  overflow:auto;border:1px solid var(--line);border-radius:8px}
+#alangPane .alhead td{position:sticky;top:0;z-index:2;background:#12161c;
+  border-bottom:1px solid var(--line)}
+#alangPane .alhead td:hover{color:#c2ccd6}
+#alangPane .albar{height:4px;border-radius:3px;background:#161a20;
+  overflow:hidden;max-width:230px}
+#alangPane .albar i{display:block;height:100%;width:40%;border-radius:3px;
+  background:#3d6ea8;animation:alslide 1.1s ease-in-out infinite}
+#alangPane .albar.done i{width:100%;background:#2f6f4f;animation:none;
+  transition:width .25s ease-out}
+@keyframes alslide{
+  0%{margin-left:-40%} 100%{margin-left:100%} }
+#alangPane .altick{color:#7fd4a3;font-weight:600;margin-top:4px;
+  animation:alpop .3s ease-out}
+@keyframes alpop{
+  0%{opacity:0;transform:translateY(2px)} 100%{opacity:1;transform:none} }
+#alangPane .alstep{color:var(--dim);font-size:10.5px;margin-top:2px;
+  animation:alpop .3s ease-out}
+.procpop .mult{color:var(--dim)}
+/* What the process is working on, under its name. Wraps rather than
+   truncating: an episode title cut off mid-word answers nothing. */
+.procpop .pdet{color:var(--dim);font-size:10px;margin-top:2px;
+  line-height:1.35;max-width:330px;word-break:break-word}
+/* A background sweep working, shown on the tile it maintains. Same three-dot
+   vocabulary as the Transcoding and Queue panels so "something is happening"
+   looks the same everywhere. */
+.card .swrun{display:inline-flex;align-items:center;gap:6px;color:var(--acc)}
+.card .swrun .spin i{width:3px;height:3px}
+/* nuarr's share of the machine, drawn rather than stated. The whole reason
+   these panels exist is that a bare "24% cpu" is a fraction of something the
+   header never showed. */
+.surow{display:flex;justify-content:space-between;align-items:baseline;
+       gap:14px;margin-top:7px;font-size:11.5px}
+.surow .suv{font-variant-numeric:tabular-nums;font-weight:600}
+.surow .me{color:var(--acc)}
+.surow .mult{color:var(--dim)}
+.subar{height:5px;border-radius:3px;background:#11161d;overflow:hidden;
+       margin-top:3px;border:1px solid var(--line)}
+.subar i{display:block;height:100%;border-radius:3px;transition:width .3s ease}
+.selfuse .procbtn b{font-weight:600;font-variant-numeric:tabular-nums}
+/* The ffmpeg bubble emits two pills - the running build, and a note about the
+   update - straight after one another with no whitespace between the spans.
+   .pill is inline-block with no margin, so they touched: "ffmpeg 7.1.4" and
+   "9.0 blocked" rendered as "ffmpeg 7.1.49.0 blocked", which reads as one
+   mangled version number. The header's own gap does not reach inside here. */
+#ffPill,#ctlPill{display:inline-flex;gap:6px;align-items:center}
+.sysbar{display:flex;gap:20px;align-items:center;flex-wrap:wrap;
+        padding:9px 14px;border-bottom:1px solid var(--line);font-size:12px}
+.met{display:flex;align-items:center;gap:7px;min-width:150px}
+.met .lbl{color:var(--dim);font-size:10px;text-transform:uppercase;
+          letter-spacing:.6px;min-width:34px}
+.met .val{font-variant-numeric:tabular-nums;min-width:52px;font-weight:600}
+.met .gauge{flex:1;height:6px;background:#0b0e12;border-radius:3px;overflow:hidden;
+            min-width:56px}
+.met .gauge i{display:block;height:100%;transition:width .4s ease}
+.met .sub{color:var(--dim);font-size:10px}
+.legend{margin-left:10px;font-size:10px;letter-spacing:.4px}
+.legend b{margin-right:9px;font-size:10px}
+.ts{color:var(--dim);margin-right:8px}
+/* Log grouped by job: a coloured gutter makes it obvious where one file's work
+   starts and the next begins, even with four workers interleaving. */
+.jg{border-left:3px solid #2b3340;padding:4px 0 4px 10px;margin:8px 0}
+.jg.run{border-left-color:var(--acc);
+        animation:gutter 1.6s ease-in-out infinite}
+@keyframes gutter{0%,100%{border-left-color:#1f4d7a}50%{border-left-color:#79c0ff}}
+.jg .jh{color:var(--dim);font-size:11px;letter-spacing:.4px;margin-bottom:2px;
+        display:flex;align-items:center;gap:7px}
+.jg.run .jh{color:var(--acc)}
+/* three-dot working indicator */
+.spin{display:inline-block;width:22px;color:var(--acc)}
+.spin i{display:inline-block;width:4px;height:4px;border-radius:50%;
+        background:currentColor;margin-right:2px;animation:blink 1.2s infinite}
+.spin i:nth-child(2){animation-delay:.2s}
+.spin i:nth-child(3){animation-delay:.4s}
+@keyframes blink{0%,80%,100%{opacity:.2}40%{opacity:1}}
+/* Reduced motion stops the pulsing but KEEPS the dots visible - they are the
+   "something is happening here" signal, so hiding them would remove
+   information rather than just calming the page. The Queue panel's .qspin
+   carries the identical rule so the two panels behave the same either way. */
+@media (prefers-reduced-motion:reduce){.spin i{animation:none;opacity:.7}}
+.jg .rule{color:#2b3340}
+/* one card per running worker - a table row could not carry plan, progress,
+   throughput and the live ffmpeg line without becoming unreadable */
+.wk{padding:11px 14px;border-bottom:1px solid var(--line)}
+.wk:last-child{border-bottom:none}
+.wkhead{display:flex;align-items:center;gap:9px;margin-bottom:4px}
+.wkhead b{font-weight:600}
+.right2{margin-left:auto;display:flex;gap:6px}
+.wkfile{font-size:11px;overflow-wrap:anywhere}
+.wkplan{font-size:11px;margin:3px 0 6px}
+.bar.big{height:8px}
+/* the side-OCR strip: a second, thinner bar under the main one, so the card
+   reads as "this job is doing two things" rather than "this job is slow" */
+.socr{display:flex;align-items:center;gap:8px;font-size:11px;margin-top:6px}
+.socrbar{flex:0 0 140px;height:4px;background:#20262e;border-radius:2px;
+         overflow:hidden}
+/* .18s, matching the main bar, and for the same reason recorded there: the
+   interpolator writes this width every 120 ms, so a .4s ease meant each write
+   started an animation the next one interrupted - the bar trailed nearly half
+   a second behind the number printed beside it and never settled. */
+.socrbar i{display:block;height:100%;transition:width .18s linear}
+.wkstats{display:flex;gap:18px;font-size:12px;color:var(--dim);margin-top:5px}
+.wkstats b{color:var(--fg);font-variant-numeric:tabular-nums}
+/* The encoder chip. Green for hardware because that is the fast, expected
+   case; lilac for CPU so a software encode is obvious at a glance among a
+   row of hardware ones - it will be an order of magnitude slower and the
+   card's fps figure should not be read as a problem. Amber when the family
+   is not the one the library asked for. */
+/* The version tag rides at the baseline of the brand, deliberately quiet: it
+   is reference information, not news, until there is actually an update - at
+   which point .vertag-new gives it the only colour in the header. */
+.vertag{font-size:11px;font-weight:600;color:var(--dim);text-decoration:none;
+  margin-left:8px;padding:2px 6px;border:1px solid var(--line);border-radius:5px;
+  vertical-align:3px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.vertag:hover{color:var(--fg);border-color:var(--dim)}
+.vertag-new{color:#d29922;border-color:#4a3a12;background:rgba(210,153,34,.09)}
+.pill.venc{color:#3fb950;border-color:#1f4429;font-weight:600}
+.pill.venc-cpu{color:#b48bf2;border-color:#3d2e5e}
+.pill.venc-fb{color:#d29922;border-color:#4a3a12}
+/* A worker card is ~8 near-identical grey numbers. Give each KIND its own
+   colour so the eye can find one without reading the labels - read and write
+   especially, since those two are constantly compared against each other. */
+.m-file {color:#c9d1d9}                    /* the file being processed  */
+.m-read {color:#58a6ff;font-variant-numeric:tabular-nums}   /* pulled off disk */
+.m-write{color:#e3b341;font-variant-numeric:tabular-nums}   /* pushed back     */
+.m-size {color:#7ee787;font-variant-numeric:tabular-nums}   /* bytes written   */
+.m-pct  {color:var(--fg);font-weight:600;font-variant-numeric:tabular-nums}
+.m-fps  {color:#39d3c3;font-variant-numeric:tabular-nums}   /* encoder rate    */
+.m-time {color:#d2a8ff;font-variant-numeric:tabular-nums}   /* elapsed / ETA   */
+.m-lbl  {color:var(--dim);font-weight:400}                  /* the word, not the number */
+/* The live ffmpeg line sits directly under the progress bar - the first place
+   the eye lands on a running job - and it was --dim (#8b95a5) at 10.5px with
+   opacity .65 on top, i.e. roughly #5b6472 against #171b21. That is well under
+   a readable contrast ratio for text you are actually meant to read, and it is
+   the only continuously-updating figure on the card. Brighter, slightly
+   larger, and no opacity multiplier; .wk prefix so it beats the .dim on the
+   same element without needing !important. */
+.wk .wkline{color:#aeb9c9;font-size:11.5px;margin-top:5px;opacity:1;
+            letter-spacing:.2px;overflow-wrap:anywhere;
+            font-variant-numeric:tabular-nums}
+/* One colour per event type. A wall of identical grey pills is unreadable;
+   colour lets you spot a failure or a rename without reading every row. */
+.e-imported{color:#3fb950;border-color:#1f4426}
+/* an upgrade is the library improving, not losing a file - teal like the
+   rule-check's "since fixed", nothing like deleted's grey */
+.e-upgraded{color:#39d3c3;border-color:#155e56}
+/* Red is reserved for FAILURE. A delete is routine - most of them here are
+   Sonarr replacing a file during an upgrade - so colouring it red made a
+   healthy library look like it was on fire. */
+.e-deleted{color:#a0a8b4;border-color:#3a4150}
+.e-renamed{color:#58a6ff;border-color:#1f3a5f}
+.e-name_repaired{color:#79c0ff;border-color:#1f3a5f}
+.e-moved_disk{color:#d2a8ff;border-color:#3c2a5a}
+.e-content_changed{color:#d29922;border-color:#4a3a12}
+.e-recycled{color:#ff9e64;border-color:#5a3a1f}
+.e-done{color:#3fb950;border-color:#1f4426}
+.e-failed{color:#f85149;border-color:#5a2225}
+/* MISSING UNTIL NOW. `error` is the state the Errors tile filters on, so it is
+   the one state guaranteed to appear in that list - and it was the one with no
+   colour rule, rendering as a plain grey pill next to a red failure message. */
+.e-error{color:#f85149;border-color:#5a2225}
+.e-new{color:#58a6ff;border-color:#1f3a5f}
+/* Eligible was the SAME green as done, so "ready to process" and "finished"
+   were indistinguishable in any mixed list - the two states a drill-down
+   most often compares. Gold reads as "to-do" without reading as "wrong". */
+.e-eligible{color:#e3b341;border-color:#4a3a12}
+.e-missing{color:#d29922;border-color:#4a3a12}
+.e-duplicate{color:#a0a8b4;border-color:#3a4150}
+.e-deleted{color:#8b95a5;border-color:#242a33}
+.e-skipped{color:#8b95a5;border-color:#242a33}
+.e-cancelled{color:#8b95a5;border-color:#242a33}
+.e-blocked{color:#d29922;border-color:#4a3a12}
+/* deferred = encode done, swap waiting on the commit queue - work in flight,
+   not a verdict, so amber. The state can appear in Activity now that the
+   recent feed stopped excluding it. */
+.e-deferred{color:#e3b341;border-color:#4a3a12}
+/* Border pulse when a panel's data actually changes */
+@keyframes glow{0%{box-shadow:0 0 0 0 rgba(88,166,255,.55);border-color:var(--acc)}
+                100%{box-shadow:0 0 0 8px rgba(88,166,255,0);border-color:var(--line)}}
+.changed{animation:glow 1.4s ease-out}
+.card.changed{animation:glow 1.4s ease-out}
+.card.click{cursor:pointer}
+.card.click:hover{border-color:var(--acc)}
+/* a non-zero error count should be visible without reading the label */
+.card.err-hot{border-color:#5a2225}
+.card.err-hot .v{color:var(--bad)}
+.live{font-size:10px;color:var(--dim);text-transform:none;letter-spacing:0;
+      font-weight:400;margin-left:8px}
+.dot{display:inline-block;width:6px;height:6px;border-radius:50%;
+     background:var(--ok);margin-right:5px;vertical-align:middle}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
+.dot{animation:pulse 2s infinite}
+.dim{color:var(--dim)}
+.num{text-align:right;font-variant-numeric:tabular-nums}
+.pill{display:inline-block;padding:1px 8px;border-radius:20px;font-size:11px;border:1px solid}
+.p-ok{color:var(--ok);border-color:#1f4426}.p-warn{color:var(--warn);border-color:#4a3a12}
+.p-bad{color:var(--bad);border-color:#5a2225}.p-dim{color:var(--dim);border-color:var(--line)}
+.p-acc{color:var(--acc);border-color:var(--acc)}
+/* RULE CHECK: the run timeline.
+   These were passive coloured blocks. They are buttons now, so they need to
+   look pressable and to show which run is open - a selector with no selected
+   state is a selector you cannot navigate with. Kept the same 9px block so the
+   row still reads as a trend at a glance and only reveals itself as
+   interactive on hover. */
+.aubars{margin-top:9px;display:flex;align-items:center;flex-wrap:wrap;gap:2px}
+.aubar{width:11px;height:16px;padding:0;border:1px solid transparent;
+  border-radius:2px;cursor:pointer;transition:transform .12s ease,opacity .12s ease}
+.aubar:hover{transform:scaleY(1.25);opacity:1!important}
+.aubar.on{border-color:var(--fg);transform:scaleY(1.25);opacity:1!important}
+/* The explainer is four paragraphs of prose above the thing you came to read.
+   Folded away by default; the findings are the panel. */
+.auwhat{border-bottom:1px solid var(--line)}
+.auwhat>summary{padding:8px 14px;cursor:pointer;color:var(--dim);font-size:11.5px;
+  list-style:none}
+.auwhat>summary::-webkit-details-marker{display:none}
+.auwhat>summary:before{content:"▸ ";display:inline-block;width:12px}
+.auwhat[open]>summary:before{content:"▾ "}
+.auwhat>summary:hover{color:var(--fg)}
+/* ACTIVITY: one row per file, drop-down for its full record. The header row
+   is the only clickable one, so it alone gets the pointer and the hover. */
+.actrow{cursor:pointer}
+.actrow:hover td{background:rgba(255,255,255,.035)}
+.actrow td{border-top:1px solid var(--line)}
+.actcaret{display:inline-block;width:14px;color:var(--dim);font-size:10px}
+/* flex on an inner div, NEVER on the td itself - display:flex takes a cell
+   out of table flow and every column after it shifts */
+.actpills{display:flex;flex-wrap:wrap;gap:3px;align-items:center}
+/* detail rows sit visually INSIDE their file: inset, slightly sunken, and
+   with their own grid so the outer table's column widths cannot squeeze them */
+.actsub td{background:rgba(255,255,255,.016);font-size:11.5px;border-top:none;
+  padding:0}
+/* minmax(0,1fr), not bare 1fr: a grid track's default minimum is the content's
+   min-width, and one unbroken 260-character path in a rename detail was enough
+   to force the track to ~1500px and blow the whole table past its box. */
+.subgrid{display:grid;grid-template-columns:104px 128px minmax(0,1fr) 168px 58px;
+  gap:0 10px;align-items:start;padding:5px 14px 5px 26px}
+.subgrid .num{text-align:right}
+.subgrid .act{text-align:right}
+/* RULE CHECK: the scoreboard. Four numbers with colour doing the reading -
+   the panel's whole answer before any table is looked at. */
+.auscore{display:flex;align-items:flex-end;flex-wrap:wrap;gap:4px}
+.aubox{display:inline-flex;align-items:baseline;gap:6px;margin-right:16px}
+.aunum{font-size:19px;font-weight:700;line-height:1;font-variant-numeric:tabular-nums}
+.aulbl{font-size:11px;color:var(--dim)}
+/* is -> should-be, rendered like a diff: what the file has in red, what the
+   rules want in green, monospaced so two values read as values. */
+.auiw{margin-top:3px;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;
+  font-size:11.5px}
+.auis{color:var(--bad)}
+.auis.fixed{color:var(--dim);text-decoration:line-through}
+.auarr{color:var(--dim);margin:0 7px}
+.auwant{color:var(--ok)}
+/* A finding whose file has since been re-checked and passes. Held back rather
+   than hidden - the run it was found on is a record and must keep it - but it
+   is no longer competing for attention with the rows that still need doing.
+   The green edge is the same signal .p-ok carries, read down the whole row. */
+.aufixed{opacity:.62}
+.aufixed td:first-child{box-shadow:inset 2px 0 0 var(--ok)}
+.aufixed:hover{opacity:1}
+/* Section heading INSIDE a panel, for the standing-gaps list. */
+.auhead{padding:9px 14px;font-weight:600;font-size:12.5px;
+  border-top:1px solid var(--line);border-bottom:1px solid var(--line);
+  background:rgba(255,255,255,.02)}
+/* GATE PILLS.
+   Every non-blocking check rendered as the same flat grey, so a Plex with two
+   people watching looked exactly like a Plex that is not configured, and a
+   pool with 155 GB of pending placement looked like an idle one. Three states
+   now, each earning its colour:
+     .g-hold   this check is holding the queue      - amber, pulsing
+     .g-live   something is happening, not holding  - green, gentle breathing
+     .g-idle   nothing to report                    - grey, still
+   The animation is the "right now" signal: a still pill is a settled fact, a
+   moving one is a live condition. */
+.g-hold{color:var(--warn);border-color:#7a5a1e;background:rgba(210,153,34,.10);
+        animation:gpulse 1.6s ease-in-out infinite}
+.g-live{color:var(--ok);border-color:#1f4426;background:rgba(63,185,80,.09);
+        animation:gbreathe 2.8s ease-in-out infinite}
+.g-idle{color:var(--dim);border-color:var(--line)}
+.g-err{color:var(--bad);border-color:#5a2225;background:rgba(248,81,73,.10);
+       animation:gpulse 1s ease-in-out infinite}
+@keyframes gpulse{0%,100%{opacity:1}50%{opacity:.45}}
+@keyframes gbreathe{0%,100%{opacity:1}50%{opacity:.68}}
+/* THE GATE PANEL.
+   The pills were rendering the raw internal key in 11px lowercase - "plex",
+   "arrs" - which reads like a variable name, and the detail beside it was one
+   long dim run at the same weight as everything else. Names are capitalised
+   and sized to be read; the headline of each row is normal text, and the
+   supporting facts sit under it, dimmer and smaller, so the eye can stop at
+   the first line when that is all it wanted. */
+.gbanner{padding:11px 14px;border-bottom:1px solid var(--line)}
+.gbanner.hold{background:rgba(210,153,34,.05)}
+.ghead{display:flex;align-items:center;gap:9px}
+.ghead b{font-size:13.5px;font-weight:600}
+.gbanner.hold .ghead b{color:var(--warn)}
+.gsub{margin:4px 0 0 2px;font-size:12px;color:var(--dim)}
+.gsub.ok{color:var(--ok)}
+/* What has to happen for the hold to lift - the question the panel could not
+   answer before, so it gets its own line and its own label. */
+.gclear{margin:6px 0 0 2px;font-size:12px;color:var(--fg);line-height:1.5}
+.gck{display:inline-block;font-size:10px;text-transform:uppercase;
+     letter-spacing:.6px;color:var(--warn);border:1px solid #4a3a12;
+     border-radius:9px;padding:0 7px;margin-right:7px;vertical-align:1px}
+.gtab td{vertical-align:top;padding:9px 14px}
+.gtab td.gname{width:150px}
+.gtab .pill{font-size:11.5px;padding:2px 9px}
+.gtab tr.grow-hold{background:rgba(210,153,34,.045)}
+.gdet{font-size:13px;color:var(--fg)}
+.gx{font-size:11.5px;color:var(--dim);margin-top:3px;line-height:1.5}
+.gscope{margin-left:8px;font-size:10px;text-transform:uppercase;
+        letter-spacing:.5px;color:var(--warn);border:1px solid #4a3a12;
+        border-radius:9px;padding:0 6px;vertical-align:1px}
+/* A dot beside the pill carries the same state without relying on colour
+   alone, which matters for the amber/green pair. */
+.gdot{display:inline-block;width:6px;height:6px;border-radius:50%;
+      margin-right:5px;vertical-align:middle;background:currentColor}
+.g-hold .gdot,.g-err .gdot{animation:gpulse 1.6s ease-in-out infinite}
+@media (prefers-reduced-motion:reduce){
+  .g-hold,.g-live,.g-err,.g-hold .gdot,.g-err .gdot{animation:none}
+}
+/* editable number field in settings rows */
+.wnum{width:74px;text-align:right;font-variant-numeric:tabular-nums;
+      background:#0b0e12;color:var(--fg);border:1px solid var(--line);
+      border-radius:4px;padding:3px 6px;margin:0 4px;font-size:13px}
+.wnum:focus{outline:none;border-color:var(--acc)}
+/* the spin arrows are redundant next to the -/+ buttons and cramp the field */
+.wnum::-webkit-outer-spin-button,.wnum::-webkit-inner-spin-button{
+  -webkit-appearance:none;margin:0}
+.wnum{-moz-appearance:textfield}
+/* Settings gear. Bordered like .menu>button so the two read as a pair, but the
+   glyph is larger and full white: at 15px in --dim it was the faintest thing
+   in a bar full of coloured status pills, which is backwards for a control you
+   are meant to find. Box height is pinned to 27px and the padding trimmed to
+   match, so the bigger glyph does not make this button taller than the power
+   button standing next to it. */
+.gearbtn{display:inline-flex;align-items:center;justify-content:center;
+  box-sizing:border-box;height:27px;min-width:34px;font-size:19px;line-height:1;
+  padding:0 8px;border:1px solid var(--line);border-radius:6px;
+  background:var(--panel);color:#fff;text-decoration:none}
+.gearbtn:hover{border-color:var(--dim);background:#20262e}
+/* Who is watching - one card per Plex session */
+/* A GRID, NOT A FLEX WRAP.
+   With flex:1 1 330px a lone session stretched to the full panel width and a
+   third one dropped onto its own row at a different size, so the block changed
+   shape every time somebody started or stopped watching. auto-fill with a
+   fixed minimum keeps every card identical and fills rows evenly at any
+   count. */
+#plexCards{display:grid;gap:10px;padding:10px 14px 12px;
+  grid-template-columns:repeat(auto-fill, minmax(330px, 1fr));
+  border-top:1px solid var(--line)}
+.pxcard{display:flex;gap:10px;border:1px solid var(--line);border-radius:8px;
+  padding:8px;min-width:0;background:rgba(255,255,255,.02);cursor:pointer}
+.pxcard:hover{border-color:#3a4150}
+.pxcaret{font-size:10px;margin-left:5px}
+/* the expanded story: label column + value, tight lines, quiet background so
+   it reads as the card's footnotes rather than a second card */
+.pxmore{margin:5px 0 3px;padding:6px 8px;border-radius:6px;font-size:11.5px;
+  background:rgba(255,255,255,.025);border:1px solid var(--line)}
+.pxrow{display:flex;gap:8px;padding:1.5px 0;min-width:0}
+.pxk{flex:0 0 62px;color:var(--dim);text-align:right}
+/* flex:1 so the value column actually OWNS the rest of the row. Sized to
+   content it was fine for text, but any block child with no intrinsic width -
+   the runway gauge - collapsed to its own borders, 2px wide. */
+.pxv{flex:1 1 auto;min-width:0;overflow-wrap:anywhere}
+.pxcard.px-paused{border-color:#4a3a12;background:rgba(227,179,65,.05)}
+.pxcard.px-buffering{border-color:#5c2230;background:rgba(248,81,73,.06)}
+.pxart{width:52px;height:78px;object-fit:cover;border-radius:4px;flex:0 0 52px;
+  background:#11151b}
+.pxnone{background:#11151b}
+.pxbody{min-width:0;flex:1;display:flex;flex-direction:column;gap:2px}
+.pxtitle{font-size:12.5px;font-weight:500;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap}
+.pxsub{font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pxmeta{display:flex;align-items:center;gap:7px;font-size:11.5px;margin-top:2px;
+  flex-wrap:wrap}
+/* clock, bar and percentage share one row pinned to the bottom of the card, so
+   cards of differing text length still line their progress up with each other */
+.pxfoot{display:flex;align-items:center;gap:9px;margin-top:auto;padding-top:7px}
+/* THE NUMBERS ARE THE POINT OF THE ROW, so they are no longer 10.5px of --dim.
+   Both were styled as supporting detail, which is what made them hard to read;
+   they are now near-body-size, high contrast and tabular so the digits do not
+   shuffle sideways as they tick. */
+.pxclock{font-size:12px;flex:0 0 auto;color:var(--fg);font-variant-numeric:tabular-nums}
+/* Outlined and a touch taller: the filled bar, the lighter buffered band and
+   the empty track are three close darks, and without an edge the eye had to
+   guess where each one ended. The border gives the whole bar a definite
+   frame, and the inset shadow keeps the empty track visibly darker than the
+   band sitting on top of it. */
+.pxbar{height:8px;background:#161a20;border-radius:4px;overflow:hidden;flex:1;
+  position:relative;border:1px solid #3a4150;
+  box-shadow:inset 0 1px 2px rgba(0,0,0,.5)}
+/* the tick runs at 4 Hz; the transition carries the bar across the gaps so it
+   reads as movement rather than as four steps a second */
+.pxbar i{display:block;height:100%;background:var(--acc);
+  transition:width .25s linear, background .2s;position:relative;z-index:1}
+/* the buffered band: how far ahead the stream is READY, in the bar's own
+   colour but lighter. The position bar paints over its watched part, so what
+   shows is exactly the runway between "here" and "ready up to" - encoder lead
+   on a transcode, the client's fetched-ahead estimate on a direct play */
+/* AND A BRIGHT EDGE WHERE IT ENDS, because the band alone cannot be seen.
+   A minute of buffer on a 77-minute episode is 1.4% of the bar - a sliver at
+   28% opacity, which is why this read as "no buffer info" rather than as a
+   small one. The band is not made wider, because that would be a lie about
+   the amount; instead the buffered-to POINT gets a 2px full-brightness tick,
+   which is legible at any size and is the thing being pointed at anyway. */
+/* THE NEEDLE HAS TO SURVIVE ITS OWN BACKGROUND. At 2px in the bar's own
+   accent colour it disappeared against the played portion, and worst of all
+   on a PAUSED card, where the whole bar turns amber and an amber needle on an
+   amber fill is nothing at all. It is now wider, and carries a dark hairline
+   either side so it reads as an edge against any fill, light or dark. */
+.pxbar b{position:absolute;left:0;top:0;height:100%;width:0;
+  background:var(--acc);opacity:.34;transition:width .4s linear;
+  box-sizing:border-box;border-right:3px solid var(--acc);
+  filter:brightness(1.35) drop-shadow(0 0 2px rgba(0,0,0,.95))}
+.pxopen .pxbar b{border-right-width:4px}
+.pxbar b[style*="width: 0"]{border-right:0}
+/* Paused: the fill goes amber, so the needle goes bright and cool to keep the
+   two apart rather than matching and vanishing into it. */
+.px-paused .pxbar b{border-right-color:#e8eef5}
+
+/* EXPANDED: the bar becomes the diagram.
+   At 8px the buffered band is a sliver and the threshold is invisible, so the
+   open card gets a bar tall enough to carry marks and a label. This is the one
+   place that answers "how close is this viewer to the line where nuarr stops
+   working their disk", which is otherwise only knowable from the settings page
+   and a stopwatch. */
+.pxopen .pxbar{height:26px;border-radius:5px}
+.pxopen .pxbar i{border-radius:4px 0 0 4px}
+/* AND IT GETS THE WHOLE WIDTH. Collapsed, the footer is one row - clock, bar,
+   percent - which leaves the bar about 100px. That is enough for a plain
+   progress bar and nowhere near enough to carry a threshold mark and a label:
+   the label ran straight through the clock. Open, the row wraps so the numbers
+   keep the top line and the bar drops beneath them at full card width. */
+/* Collapsed the footer is one line: clock, bar, percent. Open it wraps into
+   three - the two numbers, then the label, then a bar across the full card. */
+.pxfoot .pxclock{order:1}
+.pxfoot .pxbar{order:2}
+.pxfoot .pxpct{order:3}
+.pxopen .pxfoot{flex-wrap:wrap;gap:3px 9px}
+.pxopen .pxfoot .pxclock{order:1}
+.pxopen .pxfoot .pxpct{order:2;margin-left:auto}
+.pxopen .pxfoot .pxblbl{order:3;flex:1 0 100%}
+.pxopen .pxfoot .pxbar{order:4;flex:1 0 100%}
+/* THE PAUSE LINE. Where the playhead would be after viewer_pause_lead_s of
+   playback - i.e. if the buffered edge is left of this mark, the viewer has
+   less than the floor and nuarr suspends work on their spindle. */
+.pxbar u{position:absolute;top:0;height:100%;width:0;border-left:3px dashed #f0c14b;
+  opacity:0;z-index:3;pointer-events:none;transition:left .4s linear;
+  filter:drop-shadow(0 0 2px rgba(0,0,0,.95))}
+.pxopen .pxbar u{opacity:.85}
+/* Buffer safely past the line: the band edge goes green rather than accent, so
+   "nuarr may work here" is readable at a glance without reading the number. */
+.pxopen.px-safe .pxbar b{border-right-color:#3fb950}
+/* Under the line - work on this spindle is paused. Amber, matching the pill on
+   the worker card, so the two read as the same event. */
+.pxopen.px-starved .pxbar b{border-right-color:#e2b341}
+/* THE LABEL IS NOT ON THE BAR ANY MORE, so it needs no tricks to survive what
+   is behind it - it sits on the card, above its own bar, on a line of its own.
+   Which also means the bar is never covered by the text describing it, and
+   both bars can run the full width of what contains them. */
+.pxblbl{display:none;font-style:normal;font-size:11px;font-weight:600;
+  color:#e6edf3;letter-spacing:.1px;font-variant-numeric:tabular-nums}
+.pxopen .pxblbl{display:block}
+/* The starved label used to go amber. It is white like every other bar label
+   now - the state is already carried by the needle and the threshold dashes,
+   which is where a colour belongs, and amber-on-amber was the weakest place
+   to put it. */
+/* THE RUNWAY GAUGE - same data, different axis. Full width of the value
+   column, scaled 0..3x the pause floor rather than 0..film length. */
+.pxrun{position:relative;height:20px;background:#161a20;border:1px solid #3a4150;
+  border-radius:4px;overflow:hidden;box-shadow:inset 0 1px 2px rgba(0,0,0,.5)}
+.pxrun i{position:absolute;left:0;top:0;height:100%;width:0;
+  background:var(--acc);opacity:.55;transition:width .4s linear}
+.px-safe .pxrun i{background:#3fb950}
+.px-starved .pxrun i{background:#e2b341}
+/* THREE LINES, because nuarr does three different things. The axis runs to
+   3.6x the floor so the last of them has somewhere to sit: below 1x it stops,
+   between 1x and 3x it throttles by a sliding amount, and past 3x it gets out
+   of the way completely. */
+.pxrun u{position:absolute;left:27.778%;top:0;height:100%;
+  border-left:3px dashed #f0c14b;z-index:2;pointer-events:none;
+  filter:drop-shadow(0 0 2px rgba(0,0,0,.95))}
+/* THE RESUME LINE at 1.5x the floor. The gap between it and the floor is the
+   hysteresis band: inside it nothing changes state, which is the whole reason
+   the pausing stopped chattering. */
+.pxrun o{position:absolute;left:41.667%;top:0;height:100%;display:block;
+  border-left:3px dashed #4ad463;opacity:.9;z-index:2;pointer-events:none;
+  filter:drop-shadow(0 0 2px rgba(0,0,0,.95))}
+/* THE FULL SPEED LINE at 3x the floor. Past here the viewer cannot be hurt by
+   anything nuarr does to the spindle, so nuarr stops holding back at all -
+   the thing the old flat quarter-speed rule never allowed for. */
+.pxrun s{position:absolute;left:83.333%;top:0;height:100%;display:block;
+  text-decoration:none;border-left:3px dashed #58a6ff;z-index:2;
+  pointer-events:none;filter:drop-shadow(0 0 2px rgba(0,0,0,.95))}
+/* shade the throttled region so it reads as one band rather than three marks */
+.pxrun::after{content:'';position:absolute;left:27.778%;width:55.555%;top:0;
+  height:100%;background:repeating-linear-gradient(-45deg,
+    rgba(226,179,65,.11) 0 4px, transparent 4px 8px);z-index:1;
+  pointer-events:none}
+/* FULL WIDTH OF THE INNER TILE, not of the value column. Sitting in the grid
+   the gauge started 62px in, under the key column, so it lined up with
+   nothing - least of all the timeline bar across the bottom of the card. It
+   is its own block now, edge to edge, and the two bars read as a pair. */
+/* Full bleed: the negative margins cancel .pxmore's 8px padding and 1px
+   border, so this bar ends up exactly as wide as the timeline bar under the
+   card and the two line up rather than being inset from each other by 9px. */
+.pxrunwrap{margin:9px -9px 0;padding-bottom:2px}
+.pxrunlbl{display:block;font-style:normal;font-size:11px;font-weight:600;
+  color:#e6edf3;letter-spacing:.1px;margin-bottom:3px;
+  font-variant-numeric:tabular-nums}
+.pxrunax{position:relative;height:14px;font-size:10.5px;color:#8b98a5;margin-top:4px;
+  font-variant-numeric:tabular-nums}
+/* Positioned by class, not by nth-child - adding the full-speed tick moved
+   every index and silently repositioned the last label. */
+.pxrunax span{position:absolute;top:0}
+.pxrunax span.zero{left:0}
+.pxrunax span.fl{left:27.778%;transform:translateX(-50%);color:#f0c14b;font-weight:600}
+.pxrunax span.rs{left:41.667%;transform:translateX(-50%);color:#4ad463;font-weight:600}
+.pxrunax span.fs{left:83.333%;transform:translateX(-50%);color:#58a6ff;font-weight:600}
+.pxrunax span.mx{right:0}
+.pxlegend{display:flex;gap:12px;flex-wrap:wrap;font-size:10.5px;
+  color:#8b98a5;margin-top:5px;align-items:center}
+.pxlegend s{text-decoration:none;display:inline-flex;align-items:center;gap:4px}
+.pxlegend s::before{content:'';width:10px;height:3px;border-radius:2px;
+  background:var(--acc)}
+.pxlegend s.rsm::before{width:0;height:11px;border-left:2px dashed #3fb950;
+  border-radius:0;background:none}
+.pxlegend s.fsp::before{width:0;height:11px;border-left:2px dashed #58a6ff;
+  border-radius:0;background:none}
+.pxlegend s.thr::before{width:0;height:11px;border-left:2px dashed #e2b341;
+  background:none;border-radius:0}
+.pxlegend s.pos::before{background:var(--acc);filter:none}
+.pxlegend s.buf::before{background:var(--acc);opacity:.45}
+.px-paused .pxbar b{background:var(--warn)}
+.px-buffering .pxbar b{background:var(--bad)}
+.pxpct{font-size:12.5px;font-weight:600;color:var(--fg);flex:0 0 auto;
+  min-width:36px;text-align:right;font-variant-numeric:tabular-nums}
+.px-paused .pxbar i{background:var(--warn)}
+.px-paused .pxpct,.px-paused .pxclock{color:var(--warn)}
+/* Buffering: red, and the bar breathes. A still red bar is easy to read as
+   just another colour; a moving one says something is happening right now. */
+.px-buffering .pxbar i{background:var(--bad)}
+.px-buffering .pxpct,.px-buffering .pxclock{color:var(--bad)}
+.px-buffering .pxbar{animation:pxbuf 1.1s ease-in-out infinite}
+/* faster and shallower than the playing pulse: urgent, but the word stays
+   legible at the bottom of the cycle */
+.pxbuf{animation:pxbufpill .9s ease-in-out infinite}
+@keyframes pxbufpill{0%,100%{opacity:1}50%{opacity:.55}}
+@keyframes pxbuf{0%,100%{background:#20262e}50%{background:#4a1d24}}
+.pxlead{font-size:11px;min-height:13px}
+.pxwarn{color:var(--warn)}
+.px-buffering .pxwarn{color:var(--bad)}
+/* a slow pulse on the playing pill: the one thing on the card that proves the
+   panel is live even when a viewer is parked on a long film */
+.pxlive::before{content:'';display:inline-block;width:5px;height:5px;
+  border-radius:50%;background:var(--ok);margin-right:4px;vertical-align:1px;
+  animation:pxpulse 2s ease-in-out infinite}
+@keyframes pxpulse{0%,100%{opacity:1}50%{opacity:.25}}
+/* The per-row reason a queued file is not moving. A COLUMN, so it is either
+   present on every row of a render or on none of them - see loadQueue. A
+   percentage max-width made it size to its own text, which is what made two
+   otherwise identical rows sit six pixels apart. */
+/* The blocker reason. RIGHT-ALIGNED against the far edge: it is the row's
+   status, and status reads best pinned to a margin the way the size column is
+   - centred in leftover space it looked adrift between columns. Alignment
+   survives its growth because every row carries the same cells with the same
+   grow factors, so they all resolve to identical widths - which was never true
+   while the cell was optional. */
+/* A held rename explains itself in two lines: what is wrong, coloured by
+   whether it can still clear on its own, and what would fix it. The remedy is
+   deliberately a different colour from the fault - it is an instruction, not a
+   symptom, and the two used to be one grey run-on sentence. */
+.rq-warn{color:var(--warn)}
+.rq-bad{color:var(--bad)}
+.rq-fix{color:#58c8d8;opacity:.92}
+.qrow .qwhy{flex:1 1 170px;min-width:0;font-size:11px;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap;text-align:right}
+.qrow .qlib{flex:0 0 120px}
+/* header power menu */
+.menu{position:relative;display:inline-block}
+.menu>button{font-size:15px;line-height:1;padding:5px 9px}
+/* Matched to .gearbtn so the two read as one pair of controls: same height,
+   same border, same white glyph. The old glyph sat at whatever height the
+   font gave it, which is part of why it looked wrong even where it rendered. */
+.pwrbtn{display:inline-flex;align-items:center;justify-content:center;
+  box-sizing:border-box;height:27px;min-width:34px;padding:0 8px;color:#fff}
+.pwrbtn svg{width:15px;height:15px;display:block}
+.pwrbtn:hover{border-color:var(--dim);background:#20262e}
+.menuBox{display:none;position:absolute;right:0;top:calc(100% + 6px);z-index:50;
+  min-width:210px;background:var(--panel);border:1px solid var(--line);
+  border-radius:8px;padding:6px;box-shadow:0 8px 24px rgba(0,0,0,.5)}
+.menuBox.open{display:block}
+.menuBox button{display:block;width:100%;text-align:left;margin:2px 0}
+.menuBox button.danger{color:var(--bad);border-color:#5a2225}
+.menuSep{height:1px;background:var(--line);margin:5px 2px}
+/* panel tabs - flat, underline marks the active one */
+.tabs{display:flex;gap:4px}
+.tab{background:none;border:none;border-bottom:2px solid transparent;
+     color:var(--dim);padding:6px 10px;cursor:pointer;font-size:12px;
+     border-radius:0}
+.tab:hover{color:var(--fg)}
+.tab.on{color:var(--fg);border-bottom-color:var(--acc)}
+.bar{height:5px;background:#0b0e12;border-radius:3px;overflow:hidden;margin-top:5px}
+/* GROW, don't jump. The fill used to teleport from one width to the next - on
+   a long encode, a bar that looks frozen between two twitches.
+   This transition was 1.9s, chosen to span the old 2 s poll and animate across
+   the gap. That is now the WRONG tool and actively harmful: tickProgress()
+   sets the width every 120 ms, and a 1.9 s ease from each new value means
+   every update restarts a long animation the next one interrupts - the bar
+   would trail about two seconds behind the number printed beside it and never
+   catch up. Just enough easing to smooth one tick into the next, and the
+   motion comes from the interpolator instead.
+   .nogrow suppresses it for the one case where animating is a lie: when the
+   bar RESETS between phases, easing backwards from 100% to 0% would read as
+   the job losing progress. */
+.bar i{display:block;height:100%;background:var(--acc);
+       transition:width .18s linear, background-color .4s ease}
+.bar i.nogrow{transition:none}
+/* A phase with no percentage to report - verifying a copy, waiting on a lock -
+   gets a moving stripe instead of a dead bar. It says "working, no ETA" rather
+   than implying a stalled measurement. */
+.bar i.indet{width:100% !important;transition:none;
+  background-image:linear-gradient(90deg,transparent 0 35%,
+    rgba(255,255,255,.28) 50%,transparent 65% 100%);
+  background-size:220% 100%;animation:barsweep 1.25s linear infinite}
+@keyframes barsweep{from{background-position:120% 0}to{background-position:-120% 0}}
+/* Reduced motion keeps the GROW. Easing a progress bar between two real
+   measurements is not the kind of motion that rule protects against - it is
+   strictly gentler than the alternative, which is the fill teleporting every
+   two seconds. What does get suppressed is the indeterminate sweep, which is
+   decorative, repeating and carries no data. */
+@media (prefers-reduced-motion:reduce){
+  .bar i.indet{animation:none;opacity:.75;
+    background-image:linear-gradient(90deg,transparent,rgba(255,255,255,.18),transparent)}
+}
+/* Pinned summary above a scrollbox. Same padding and rule as the header it
+   replaces, so nothing shifts - it simply stops scrolling away. */
+.pinhead{padding:9px 14px;border-bottom:1px solid var(--line);font-size:14px}
+.pinhead b{font-size:15px}
+/* Worker occupancy, at the top of Transcoding. Sized to be read across the
+   room rather than squinted at: this is the line that answers "is it working". */
+.capbar{padding:10px 14px;border-bottom:1px solid var(--line);
+        font-size:15px;display:flex;gap:14px;align-items:center;flex-wrap:wrap}
+.capbar .k{color:var(--dim);font-size:12px;text-transform:uppercase;
+           letter-spacing:.4px;margin-right:4px}
+.capbar .v{font-variant-numeric:tabular-nums;font-weight:600}
+.capbar .grp{display:flex;align-items:baseline;gap:3px}
+/* Per-pool I/O priority, sat against the pool it describes. */
+.iop{font-size:10px;padding:1px 6px;border-radius:9px;margin-left:6px;
+     border:1px solid;white-space:nowrap;cursor:help}
+.iop.norm{color:var(--dim);border-color:var(--line)}
+.iop.low{color:var(--warn);border-color:var(--warn);
+         background:rgba(210,153,34,.10)}
+/* State pill as a button, in the drill-down. Same silhouette as the read-only
+   pill it replaces - it should not look like a different kind of thing just
+   because it became clickable - with a caret to say it opens. */
+.statebtn{font:inherit;font-size:11px;padding:1px 8px;border-radius:10px;
+          border:1px solid;background:transparent;cursor:pointer;
+          display:inline-flex;align-items:center;gap:5px;line-height:1.5}
+.statebtn:hover{filter:brightness(1.25)}
+.statebtn.on{background:rgba(88,166,255,.12)}
+.statebtn .caret{font-size:8px;opacity:.75}
+/* Destructive, so it does not get to look like the neutral controls. Warning
+   colour at rest rather than only on hover - the person needs to know what
+   kind of button it is before the pointer is already on it. */
+/* justify-self, because the cell this lands in is <td class="wrap"> and the
+   page-layout rule .wrap{display:grid} applies to it - the same class
+   collision that took .busy rows out of table layout. Every child of that
+   cell is therefore a grid item, so the button stretched the full column
+   width and read as a banner rather than a control. The divs around it are
+   block-level and never showed the problem. Fixing it here rather than in
+   .wrap: that selector is the outer page container and re-scoping it is a
+   much larger blast radius than one destructive button justifies. */
+.refetch{font:inherit;font-size:11px;margin:4px 0 2px;padding:2px 9px;
+         border-radius:10px;cursor:pointer;background:transparent;
+         justify-self:start;width:fit-content;
+         border:1px solid var(--warn);color:var(--warn)}
+.refetch:hover{background:rgba(210,153,34,.14)}
+/* Colour comes from the .e-<state> class the pill already carries, so the
+   button and the pill are the same colour for the same state. Only the border
+   width and the cursor differ. */
+/* The expanded transcript row underneath it. */
+tr.logrow td{background:#1c2129;border-bottom:1px solid var(--acc);padding:0 12px 10px}
+.loghead{display:flex;gap:12px;align-items:center;padding:6px 2px;font-size:11px}
+.loghead a{color:var(--acc)}
+.joblog{margin:0;max-height:280px;overflow:auto;background:#0b0e12;
+        border:1px solid var(--line);border-radius:6px;padding:8px 10px;
+        font-family:ui-monospace,Consolas,monospace;font-size:11.5px;
+        line-height:1.5;white-space:pre-wrap;word-break:break-word}
+/* The tiny r/w suffix on the cache throughput figures. */
+.sysx{color:var(--dim);font-size:9px;margin:0 5px 0 2px}
+/* CURRENTLY PROBING. One row per file being read right now: a spinner that
+   says work is happening, the file, and a sweep that says the reading itself
+   is ongoing rather than stalled. Rows slide in as probes start and fade as
+   verdicts land, so the section is a picture of NOW - it is empty whenever
+   the top-up is idle. */
+/* how much of the 30 s lock-quiet window a held file has earned */
+.lockbar{display:inline-block;width:44px;height:3px;border-radius:2px;
+  background:rgba(255,255,255,.09);margin-left:5px;vertical-align:middle;
+  overflow:hidden}
+.lockbar i{display:block;height:100%;background:var(--acc);opacity:.75}
+.aqchead{display:flex;align-items:center;gap:8px;margin:2px 0 5px;min-height:24px}
+.aqchead .resume{margin-left:auto}
+/* Capped and scrolled, not open-ended. A top-up runs several probes at once
+   and each one is a row - letting the list grow pushed the queue itself off
+   the screen, which is the thing the panel exists to show. */
+.aqprobes{display:flex;flex-direction:column;gap:5px;
+  max-height:196px;overflow-y:auto}
+/* flex:0 0 auto matters: in a column flex container children shrink to fit by
+   default, so a burst of probes squashed into the capped height instead of
+   overflowing it - the box never scrolled and the freeze rule never engaged. */
+.aqprobe{display:flex;align-items:center;gap:9px;min-width:0;font-size:12px;
+  padding:5px 9px;border:1px solid var(--line);border-radius:7px;
+  background:rgba(255,255,255,.015);position:relative;overflow:hidden;
+  flex:0 0 auto}
+.aqprobe.arriving{animation:aqin .28s ease both}
+.aqprobe.leaving{animation:aqout .26s ease both}
+@keyframes aqin {from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:none}}
+@keyframes aqout{to{opacity:0;transform:translateY(-4px)}}
+.aqp-title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  font-weight:500}
+.aqp-disk,.aqp-size{font-size:10px;flex:0 0 auto}
+.aqp-state{margin-left:auto;flex:0 0 auto}
+.aqp-read{font-size:10.5px}
+.aqp-el{font-size:10.5px;flex:0 0 auto;min-width:34px;text-align:right}
+/* three dots, same grammar as the worker cards' .spin */
+.aqp-spin{display:inline-flex;gap:3px;flex:0 0 auto}
+.aqp-spin i{width:4px;height:4px;border-radius:50%;background:var(--acc);
+  animation:aqdot 1s ease-in-out infinite}
+.aqp-spin i:nth-child(2){animation-delay:.15s}
+.aqp-spin i:nth-child(3){animation-delay:.3s}
+@keyframes aqdot{0%,100%{opacity:.25}50%{opacity:1}}
+/* the indeterminate sweep along the bottom edge: reading a 30 GB file off a
+   spindle has no percentage to report, so this says "moving", not "n% done" */
+.aqp-track{position:absolute;left:0;right:0;bottom:0;height:2px;
+  background:rgba(255,255,255,.05);overflow:hidden}
+.aqp-track i{position:absolute;left:0;top:0;height:100%;width:32%;
+  background:var(--acc);opacity:.5;animation:aqsweep 1.25s ease-in-out infinite}
+@keyframes aqsweep{0%{left:-32%}100%{left:100%}}
+/* settled: the answer has landed, so the motion stops before the row leaves */
+.aqprobe.settled .aqp-spin i{animation:none;opacity:.3}
+.aqprobe.settled .aqp-track i{animation:none;left:0;width:100%;opacity:.18}
+/* Auto-queue panel: same label/value shape as the Transcoding status line, so
+   a figure is found by its label rather than by counting middots. */
+.aqstats{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:7px;align-items:baseline}
+.aq-g{display:inline-flex;align-items:baseline;gap:5px;white-space:nowrap}
+.aq-k{color:var(--dim);font-size:10.5px;text-transform:uppercase;letter-spacing:.5px}
+.aq-v{font-weight:600;font-size:13px;font-variant-numeric:tabular-nums}
+.aq-v.v-ok{color:var(--ok)} .aq-v.v-acc{color:var(--acc)}
+.v-ok{color:var(--ok)} .v-warn{color:var(--warn)}
+/* Why the queue is not filling. Warn-coloured because it is a state you might
+   not have intended, not an error. */
+.aqhold{margin-top:9px;padding:7px 10px;border:1px solid var(--warn);
+        border-radius:6px;background:rgba(210,153,34,.08);font-size:12px;
+        display:flex;gap:9px;align-items:baseline;flex-wrap:wrap;color:var(--fg)}
+/* Per-disk spread of the queue. */
+.aqspread{margin-top:10px}
+.aqbars{display:flex;flex-wrap:wrap;gap:4px 14px}
+.aqd{display:inline-flex;align-items:center;gap:6px;font-size:11.5px}
+/* wide enough for the full NU-DRIVE-11, so the bars start on a common edge
+   and the row reads as a chart rather than ragged text */
+.aqd-n{font-family:ui-monospace,Consolas,monospace;font-size:11px;
+  min-width:86px;white-space:nowrap}
+.aqd-bar{display:inline-block;width:54px;height:5px;border-radius:3px;
+         background:var(--line);overflow:hidden}
+.aqd-bar i{display:block;height:100%}
+.aqd-v{font-variant-numeric:tabular-nums;min-width:24px}
+/* Whole-run status line under the Transcoding bar. Groups with a small dim
+   label and a bright value, so one figure can be found without reading all of
+   them - it was previously a single 11px dim sentence of middots. */
+.ovl{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:8px;font-size:12.5px;
+     align-items:baseline}
+.ovl-g{display:inline-flex;align-items:baseline;gap:5px;white-space:nowrap}
+.ovl-k{color:var(--dim);font-size:10.5px;text-transform:uppercase;
+       letter-spacing:.5px}
+.ovl-v{font-weight:600;font-variant-numeric:tabular-nums}
+.ovl-v.v-acc{color:var(--acc)}      /* encode - GPU bound */
+.ovl-v.v-ok{color:var(--ok)}        /* stream copy - disk bound */
+.ovl-sep{color:var(--dim);font-size:10px;margin:0 4px 0 3px}
+.ovl-note{color:var(--dim);font-size:11.5px}
+.ovl-wait{cursor:help}
+.ovl-wait .ovl-k{color:var(--warn)}
+.ovl-d{display:inline-flex;align-items:baseline;gap:4px;margin-right:10px;
+       white-space:nowrap}
+.ovl-dv{font-variant-numeric:tabular-nums;font-weight:600}
+.ovl-x{color:var(--warn);font-size:11px;cursor:help}
+/* Files per pool disk. Sized so nothing can be squeezed off the end: the
+   figures get fixed widths and the capacity bar - the only elastic thing -
+   absorbs whatever is left. */
+/* The colour key. Sits in the panel header at header weight - it is a legend,
+   not a status, and must not read as three things that are currently true. */
+.dkey{float:right;display:inline-flex;gap:9px;align-items:center;
+  text-transform:none;letter-spacing:0;font-weight:400}
+.dk{font-size:9.5px;display:inline-flex;align-items:center;gap:4px}
+.dk::before{content:"";width:7px;height:7px;border-radius:2px;flex:none}
+.dk-view{color:var(--ok)}      .dk-view::before{background:var(--ok)}
+.dk-ours{color:var(--acc)}     .dk-ours::before{background:var(--acc)}
+.dk-sys{color:var(--warn)}     .dk-sys::before{background:var(--warn)}
+/* Data moving between spindles. Above the table rather than inside it, because
+   it is a statement about a PAIR of rows and there is no row for that. */
+.xfer{display:flex;align-items:center;gap:10px;flex-wrap:wrap;cursor:help;
+  padding:7px 14px;border-bottom:1px solid var(--line);font-size:11px;
+  background:rgba(210,153,34,.05)}
+.xlbl{font-size:9.5px;text-transform:uppercase;letter-spacing:.5px;
+  color:var(--warn);cursor:help}
+.xpair{display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
+.xpair b{color:var(--warn);font-variant-numeric:tabular-nums}
+.xarrow{color:var(--warn);font-weight:600}
+/* nuarr's own moves in the accent, matching the NUARR bubbles below - so the
+   half of this line that is us is the same colour as us everywhere else. */
+.xlbl-mine{color:var(--acc)}
+.xmine b,.xmine .xarrow{color:var(--acc)}
+/* The strip carries both kinds now, so it cannot be tinted for one of them. */
+.xfer{background:rgba(255,255,255,.025)}
+@media(max-width:900px){.dkey{display:none}}
+.disktab{width:100%;table-layout:fixed}
+.disktab th,.disktab td{overflow:hidden;text-overflow:ellipsis}
+.disktab .dcol-size,.disktab .dcol-used,.disktab .dcol-free{width:82px}
+.disktab .dcol-bar{width:auto;min-width:96px}
+/* The "x of y" restatement inside the bar cell only appears once the Size and
+   Used columns have gone, so the numbers are never shown twice. */
+.dcol-of{display:none}
+@media(max-width:1400px){
+  .disktab .dcol-used{display:none}
+  .disktab .dcol-of{display:inline}
+}
+@media(max-width:1150px){
+  .disktab .dcol-size{display:none}
+}
+/* Below 900px .two already stacks to one column, so the panel is full width
+   again and everything comes back. */
+@media(max-width:900px){
+  .disktab .dcol-size,.disktab .dcol-used{display:table-cell}
+  .disktab .dcol-of{display:none}
+}
+/* Gate settings panel.
+   ALIGNED *AND* CAPPED - it needs both, and each alone was wrong.
+   With only a fixed max-height the two panels ended at different points. With
+   only stretch-to-fit the settings panel grew to all eight entries, about
+   850px, and dragged the six-row gate panel up to match it - swapping a small
+   misalignment for 550px of empty space. So: cap the scroll area, and let the
+   row stretch to that.
+   THE CAP IS MEASURED, NOT GUESSED. It used to be a flat 300px, picked to
+   match the gate panel's height on the day. The gate panel's height is not
+   constant - it depends on how many checks are holding and how much each has
+   to say - so as soon as it grew, the settings list was cut off with the last
+   entry unreachable. sizeGateCfg() measures the gate panel and follows it,
+   both ways. The value here is only the pre-measurement fallback. */
+.two.top{align-items:stretch}
+.one.top .panel{margin-bottom:0}
+/* Quick pause, in the Job gate heading.
+   The heading is not a flex container, so margin-left:auto did nothing and the
+   control sat jammed against the "live" pill. Making just this h2 a flex row
+   pushes it to the right edge where a control belongs, away from the status
+   text. text-transform is reset because the heading uppercases everything and
+   "MANUAL PAUSE" beside a Pause button reads like a second heading. */
+#gatePanel h2{display:flex;align-items:center}
+.gquick{margin-left:auto;display:inline-flex;align-items:center;gap:8px;
+  font-weight:400;text-transform:none;letter-spacing:0}
+.gqlabel{font-size:11px;color:var(--dim)}
+.gqbtn{font-size:11px;padding:3px 10px;border-radius:5px;cursor:pointer;
+  border:1px solid var(--line);background:var(--panel);color:var(--fg)}
+.gqbtn:hover{border-color:var(--dim)}
+.gqbtn.on{color:#ffb84d;border-color:#5a4520;background:#2a2113}
+#gateCfg{display:flex;flex-direction:column}
+/* No max-height any more. The 300px cap existed only so this column ended
+   level with the Job gate panel beside it; on its own settings page there is
+   nothing to line up with, and a scrollbox inside a page that already scrolls
+   is two scrollbars competing for the same gesture. */
+.gsetwrap{flex:1;min-height:0}
+.gset{padding:11px 14px;border-bottom:1px solid var(--line)}
+.gset:last-child{border-bottom:0}
+.gchild{padding-left:30px;position:relative}
+/* A rail down the left of the three Plex refinements, so they read as
+   belonging to the switch above rather than as three more equals. */
+.gchild:before{content:"";position:absolute;left:14px;top:0;bottom:0;
+               width:2px;background:var(--line)}
+.ginert{opacity:.45}
+.gsw{display:flex;align-items:center;gap:8px;cursor:pointer}
+.gname{font-size:13.5px;font-weight:600}
+.gstate{font-size:10px;padding:1px 7px;border-radius:9px;border:1px solid;
+        margin-left:auto;text-transform:uppercase;letter-spacing:.5px}
+.gstate.on{color:var(--ok);border-color:var(--ok);background:rgba(63,185,80,.10)}
+.gstate.off{color:var(--dim);border-color:var(--line)}
+.gwhat{font-size:12.5px;color:var(--fg);opacity:.85;margin:5px 0 0 26px;line-height:1.45}
+.gba{margin:7px 0 0 26px;display:grid;gap:4px;font-size:12px;line-height:1.45}
+.gba>div{display:flex;gap:7px;align-items:baseline;color:var(--dim)}
+.gtag{flex:none;font-size:9.5px;padding:0 5px;border-radius:8px;border:1px solid;
+      text-transform:uppercase;letter-spacing:.4px;min-width:26px;text-align:center}
+.gtag.on{color:var(--ok);border-color:var(--ok)}
+.gtag.off{color:var(--dim);border-color:var(--line)}
+.gnote{margin:7px 0 0 26px;font-size:11.5px;color:var(--dim);line-height:1.45;
+       border-left:2px solid var(--line);padding-left:9px}
+.gnote.gwarn{border-left-color:var(--warn);color:var(--warn)}
+/* Rules tab */
+.rsec{font-size:12px;text-transform:uppercase;letter-spacing:.6px;color:var(--dim);
+      margin:16px 0 6px;font-weight:600}
+.rtab{width:100%;border-collapse:collapse;font-size:13px;table-layout:fixed}
+.rtab td{border-top:1px solid var(--line);padding:7px 10px 7px 0;vertical-align:top}
+.rk{width:210px;color:var(--fg);font-weight:600}
+.rv{color:var(--dim);line-height:1.5}
+.rdiff{width:calc((100% - 210px)/2);padding-right:14px}
+.rprof{display:inline-block;font-size:10px;padding:1px 6px;border-radius:9px;
+       border:1px solid;margin-right:6px;vertical-align:1px;white-space:nowrap}
+.rprof.anime{color:#d2a8ff;border-color:#d2a8ff;background:rgba(210,168,255,.10)}
+.rprof.other{color:var(--ok);border-color:var(--ok);background:rgba(63,185,80,.10)}
+.rprofbox{display:flex;gap:22px;flex-wrap:wrap;padding:9px 0 2px;font-size:12px}
+@media(max-width:900px){.rtab,.rtab tbody,.rtab tr,.rtab td{display:block;width:auto}
+  .rk{width:auto} .rdiff{width:auto;padding-right:0}}
+/* Library scan progress panel */
+.scanfacts{margin-top:7px;font-size:12.5px}
+.scanlist{margin-top:8px;display:flex;flex-wrap:wrap;gap:4px 16px;font-size:12px}
+.scanrow{display:flex;align-items:baseline;gap:5px;white-space:nowrap}
+.scanmark{font-size:10px}
+.scant{font-variant-numeric:tabular-nums}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media(max-width:900px){.two{grid-template-columns:1fr}}
+input,select{background:#0b0e12;color:var(--fg);border:1px solid var(--line);
+             padding:5px 9px;border-radius:6px;font-size:13px}
+/* A time input has to fit "04:00 AM" AND the picker icon. At 104px the meridiem
+   was clipped to "04:00 A", which reads as a rendering fault rather than a
+   too-narrow box.
+   NOT sized in ch. That was the first attempt and it made things worse: this
+   field renders in 13px monospace, so 12ch resolved to 85.8px - NARROWER than
+   the 104px it replaced. Chrome also lays a time input out as separate
+   hour/minute/meridiem segments in its shadow DOM, each with its own padding,
+   so measuring the string "04:00 AM" understates what the control needs. An
+   explicit px floor with room to spare is the honest answer here. */
+input[type=time]{width:auto;min-width:140px;padding-right:6px;
+                 font-variant-numeric:tabular-nums}
+input[type=number]{font-variant-numeric:tabular-nums}
+/* The pickers and dropdowns are native; these two keep the FIELD legible. */
+input[type=time]::-webkit-calendar-picker-indicator{filter:invert(.75);cursor:pointer}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-thumb{background:var(--line);border-radius:6px}
+::-webkit-scrollbar-thumb:hover{background:#333b47}
+::-webkit-scrollbar-track{background:transparent}
+.right{margin-left:auto;display:flex;gap:8px;align-items:center}
+.err{color:var(--bad)}
+.warn{color:var(--warn)}
+/* a count that opens the matching file list - looks clickable, because it is */
+.lnk{cursor:pointer;text-decoration:underline dotted;text-underline-offset:2px}
+.lnk:hover{text-decoration-style:solid}
+</style></head><body>
+<header>
+  <!-- The mark is a link home, which is what every other web app trains you to
+       expect. It matters more now that /settings is a separate page: the only
+       way back was a small "Back to dashboard" at the bottom of the sidebar,
+       and the first thing anyone tries is the logo. -->
+  <h1><a href="/" class="home" title="Back to the dashboard"><img src="/favicon.svg"
+           alt="" width="22" height="22"
+           style="vertical-align:-4px;margin-right:8px;border-radius:5px">Nuarr</a><!--
+    THE VERSION BELONGS WHERE THE NAME IS. It was written down nowhere at all -
+    not in the UI, not in the bundle, not in a constant - so "which nuarr is
+    this" could only be answered by diffing source against a backup. Next to
+    the brand it costs no space and answers the first question anyone asks
+    about a running install, including the person who built it.
+ --><a href="/settings#updates" id="vertag" class="vertag"
+       title="Version - click for updates"></a><span
+       id="sub">loading…</span></h1>
+  <div class="right">
+    <!-- nuarr's own live load. In the HEADER rather than the system panel
+         further down the page: that panel reports the MACHINE, and it is
+         2,000px below the fold, so "what is nuarr costing me right now" was
+         only answerable by scrolling or by opening Task Manager. -->
+    <!-- Startup progress, then a brief "ready", then it gets out of the way. -->
+    <span id="bootPill"></span>
+    <span id="selfUse" class="selfuse" title="nuarr's own CPU and memory, including ffmpeg and script children"></span>
+    <span id="arrs" class="dim"></span>
+    <!-- ffmpeg health sits beside the arr pills: it is the third external
+         thing every job depends on, and a stale or broken build is exactly as
+         fatal as an unreachable Sonarr. -->
+    <span id="ffPill"></span>
+    <span id="mkvPill"></span>
+    <span id="ctlPill"></span>
+    <button onclick="loadAll()">Refresh</button>
+    <!-- Settings sits with the power control for the same reason the power
+         control sits here: it is global, and it should be reachable from any
+         scroll position rather than only when Workers happens to be in view.
+         A gear rather than a word because its neighbour is an icon too, and a
+         lone text button between them read as part of the status pills. -->
+    <a href="/settings" class="gearbtn" title="Settings" aria-label="Settings">&#9881;</a>
+    <!-- Power controls belong here, not buried in a settings panel: they are
+         global actions, and a pending stop must be visible from anywhere on
+         the page rather than only when Workers is scrolled into view. -->
+    <div class="menu">
+      <!-- DRAWN, NOT TYPED. This was &#9211; (U+23FB POWER SYMBOL), which most
+           Windows UI fonts do not contain - so it rendered as an empty box
+           next to a gear that renders fine, and the one control that restarts
+           the server looked broken. An inline SVG cannot be missing from a
+           font, inherits currentColor, and stays sharp at any zoom. -->
+      <button onclick="toggleMenu(event)" title="Server controls"
+              aria-label="Server controls" class="pwrbtn">
+        <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"
+             fill="none" stroke="currentColor" stroke-width="2.1"
+             stroke-linecap="round"><path d="M12 3.2v8.4"/>
+          <path d="M6.9 6.6a8.2 8.2 0 1 0 10.2 0"/></svg>
+      </button>
+      <div class="menuBox" id="ctlMenu">
+        <button onclick="ctl('restart',true)">Restart when idle</button>
+        <button onclick="ctl('shutdown',true)">Shutdown when idle</button>
+        <div class="menuSep"></div>
+        <button class="danger" onclick="ctl('restart',false)">Restart now</button>
+        <button class="danger" onclick="ctl('shutdown',false)">Shutdown now</button>
+        <div class="menuSep"></div>
+        <button id="ctlCancel" style="display:none"
+                onclick="ctlCancel()">Cancel pending stop</button>
+        <div id="ctlMsg" class="dim" style="font-size:11px;padding:4px 8px"></div>
+      </div>
+    </div>
+  </div>
+</header>
+<div class="wrap">
+  <!-- Gate STATE stays on the dashboard; gate SETTINGS moved to /settings.
+       They are different jobs on different timescales: the state answers "why
+       is nothing running, right now" and is worth a permanent place, while the
+       eight policy switches are set once and then read maybe twice a year. As
+       a side-effect the state panel gets the full width, which it wanted -
+       the hold reasons are sentences, and they were wrapping in a half-width
+       column.
+       The one exception is Manual pause, which is not policy but a stop
+       switch, so a working copy of it stays here - see #gateQuick. -->
+  <div class="one top">
+    <div class="panel" id="gatePanel">
+      <h2>Job gate<span class="live"><span class="dot"></span>live</span>
+        <span id="gateQuick" class="gquick"></span></h2>
+      <div id="gate"><div class="dim" style="padding:14px">checking…</div></div>
+      <!-- Who is watching, with artwork. Under the gate rows rather than
+           inside the Plex row: it is evidence for that row, and squeezing
+           poster art into a status line would make the status harder to read
+           rather than easier. -->
+      <div id="plexCards" style="display:none"></div>
+    </div>
+  </div>
+  <!-- Skeletons live in the INITIAL markup, not injected by JS: they are
+       what the page shows before any script has run, which is exactly the
+       window they exist to cover. Each loader's first paint replaces them. -->
+  <div class="cards" id="cards">
+    <div class="card"><div class="skel"><i style="width:55%"></i><i style="width:70%"></i></div></div>
+    <div class="card"><div class="skel"><i style="width:60%"></i><i style="width:45%"></i></div></div>
+    <div class="card"><div class="skel"><i style="width:50%"></i><i style="width:65%"></i></div></div>
+    <div class="card"><div class="skel"><i style="width:58%"></i><i style="width:40%"></i></div></div>
+    <div class="card"><div class="skel"><i style="width:52%"></i><i style="width:68%"></i></div></div>
+    <div class="card"><div class="skel"><i style="width:47%"></i><i style="width:62%"></i></div></div>
+    <div class="card"><div class="skel"><i style="width:56%"></i><i style="width:44%"></i></div></div>
+  </div>
+  <div class="panel" id="drillPanel" style="display:none">
+    <h2><span id="drillTitle"></span>
+        <span class="live"><a href="#" onclick="document.getElementById('drillPanel').style.display='none';return false">close</a></span></h2>
+    <div style="padding:9px 14px;border-bottom:1px solid var(--line)">
+      <input id="drillQ" placeholder="filter by title or path" style="width:280px"
+             oninput="drillRefresh()">
+      <span id="drillCount" class="dim" style="margin-left:8px"></span>
+      <span id="drillLive" title="refreshing" style="opacity:0;transition:opacity .3s;
+            color:var(--acc);margin-left:6px">⟳</span>
+      <button onclick="drillRaw()" style="margin-left:8px">Open as text</button>
+    </div>
+    <div id="drillBody" class="scrollbox nohz" style="height:420px"></div>
+  </div>
+  <div class="two">
+    <!-- The key belongs in the header, not repeated on every row. Three
+         colours carry the whole activity line, and without naming them once
+         the reader has to infer them from a chip they may never see lit. -->
+    <div class="panel"><h2>Files per pool disk<span class="dkey">
+      <span class="dk dk-view">viewer</span>
+      <span class="dk dk-ours">nuarr</span>
+      <span class="dk dk-sys">system</span></span></h2>
+      <div id="disks"><div class="skel" style="padding:14px">
+      <i style="width:88%"></i><i style="width:82%"></i><i style="width:90%"></i>
+      <i style="width:78%"></i><i style="width:85%"></i><i style="width:80%"></i></div></div></div>
+    <div class="panel">
+      <h2>Libraries<span id="scanPhase" class="live"></span></h2>
+      <div style="padding:9px 14px;border-bottom:1px solid var(--line)">
+        <button onclick="rescan()">Rescan all libraries</button>
+        <span id="nextScan" style="margin-left:10px;font-size:11px"></span>
+      </div>
+      <!-- Scan progress as a PANEL, not a footnote in the heading. A full pass
+           crosses 12 disks and ~39,000 files over several minutes; squeezed
+           into the h2 it had room for a phase name and a 200px bar, so the one
+           question it exists to answer - is this progressing or wedged - was
+           the hardest to read. Same shape as the Transcoding run bar. -->
+      <div id="scanPanel" style="display:none"></div>
+      <div id="libs"><div class="skel" style="padding:14px">
+        <i style="width:72%"></i><i style="width:86%"></i>
+        <i style="width:68%"></i><i style="width:80%"></i></div></div>
+    </div>
+  </div>
+  <div class="two">
+    <div class="panel" id="workersPanel">
+      <!-- CONCURRENCY ONLY on the dashboard.
+           The other seven panes were configuration wearing a monitoring
+           panel's clothes: ffmpeg, MKVToolNix, the Arr guards, Metadata,
+           Backup and Rules get set once and then never looked at again, but
+           they sat in the middle of a page that repaints every 750 ms and cost
+           the live pipeline half its width. They now render at /settings, into
+           the marker below, so there is still exactly one copy of each and the
+           two pages cannot drift.
+           Concurrency stays because it is the one you reach for WHILE watching
+           the queue - it is a dial on the running system, not a setting. -->
+      <h2>Workers <span id="wtabhint" class="dim" style="font-weight:400"></span></h2>
+<!--SETTINGSPANES-->
+      <div id="wSettings">
+        <div id="workers"></div>
+        <div style="padding:9px 14px;border-top:1px solid var(--line)">
+          <button onclick="resetWorkers()"
+                  title="Puts every setting on this page back to its default — not just this tab">Reset all to default</button>
+          <span id="wmsg" class="dim" style="margin-left:9px"></span>
+        </div>
+      </div>
+      <!-- Arrs tab: standing guards over arr-side configuration, plus the
+           webhook plumbing that used to live in the events panel header. -->
+      <!-- Metadata tab. nuarr does NOT talk to TMDB or TheTVDB - the arrs do,
+           and nuarr copies one field from them. The panel is laid out as that
+           chain on purpose, because "TMDB: connected" would be a lie and would
+           send someone looking in the wrong place when a title's language is
+           wrong. -->
+      <!-- MKVToolNix tab: same shape as the ffmpeg one. It reports and
+           verifies; it does NOT auto-install, because MKVToolNix ships as a
+           system installer rather than a droppable binary, and pretending
+           otherwise would be the ffmpeg tab's clothes on a different tool. -->
+      <!-- ffmpeg tab: nuarr's own copy, so it stops depending on Tdarr's -->
+    </div>
+    <div class="panel">
+      <h2>Live arr events</h2>
+      <!-- The re-register button and hook health moved to Workers > Arrs -
+           they are plumbing you visit when something is wrong, not something
+           to look past every time you read the event stream. -->
+      <div id="hooks" class="scrollbox" style="height:300px"></div>
+    </div>
+  </div>
+  <!-- QUEUE. Everything about work that has not started yet lives here: the
+       controls that build the queue, what it contains, and where it is going.
+       It used to be split - the buttons sat in the Transcoding panel header and
+       the contents were a one-line strip of five titles under the worker cards,
+       so "what is queued" and "what is running" were interleaved in one panel
+       and neither read clearly. -->
+  <!-- AUTO-QUEUE.
+       Directly above the Queue because it is the thing filling it, and the two
+       numbers you actually compare - how much is queued now, and how much of
+       the library is still waiting - belong next to each other. -->
+  <!-- ONE PANEL. Auto-queue answered "what is being fed in" and Queue answered
+       "what is waiting" - two halves of a single question, separated by a
+       panel border and a screenful of scrolling. Merged, the feed's progress
+       and controls sit directly above the list they fill. -->
+  <div class="panel">
+    <h2>Queue<span class="live"><span class="dot"></span>live</span>
+        <span id="aqState" class="live"></span></h2>
+    <div id="aqBody" style="padding:11px 14px;border-bottom:1px solid var(--line)"></div>
+    <!-- CURRENTLY PROBING. Its own element outside aqBody, which is rebuilt
+         wholesale on every poll - a live animation cannot survive being
+         replaced four times a minute. Each file the top-up is reading right
+         now gets a row; they appear as probing starts and leave as the
+         verdict lands, so the section is empty whenever nothing is running. -->
+    <div id="aqProbeWrap" style="display:none;padding:9px 14px;
+         border-bottom:1px solid var(--line)">
+      <div class="aq-k aqchead">probing now
+        <span id="aqProbeCount" class="dim" style="font-weight:400"></span>
+        <button id="aqProbeResume" style="display:none" class="resume"
+                onclick="resumeFollow('aqProbe')">↑ back to newest</button></div>
+      <div id="aqProbe" class="aqprobes"></div>
+    </div>
+    <!-- ADDING work to the queue. Distinct from the row beneath it, which only
+         changes what you are looking at - one row writes, the other filters,
+         and unlabelled they were two indistinguishable banks of dropdowns. -->
+    <div style="padding:9px 14px;border-bottom:1px solid var(--line);display:flex;
+                gap:8px;align-items:center;flex-wrap:wrap">
+      <span class="dim rowlbl">add work</span>
+      <select id="qLib"><option value="">all libraries</option></select>
+      <select id="qN">
+        <option value="10">10 files</option><option value="25">25</option>
+        <option value="50">50</option><option value="100">100</option>
+        <option value="250">250</option><option value="1000">1000</option>
+        <option value="all">All eligible</option>
+      </select>
+      <button id="qPreviewBtn" onclick="queueWork(true)">Preview</button>
+      <button id="qQueueBtn" onclick="queueWork(false)">Queue</button>
+      <button id="qStopBtn" onclick="stopQueue()" title="clear the queue">Stop</button>
+      <select id="qReq">
+        <option value="failed">failed/blocked</option>
+        <option value="cancelled">cancelled</option>
+        <option value="done">already processed</option>
+        <option value="all">everything</option>
+      </select>
+      <button id="qRequeueBtn" onclick="requeue()">Requeue</button>
+      <span id="qMsg" class="dim"></span>
+    </div>
+    <!-- WHAT THE LIST BELOW SHOWS, on one line, directly above it. The filters
+         sat two rows up with the pool-count chips stranded on their own row in
+         between, so neither row said what it was for and the chips read as a
+         third, unrelated control. Same row now, labelled, counts on the right
+         where they act as a legend for the POOL column beneath them. -->
+    <div id="qFilterBar" style="padding:8px 14px;border-bottom:1px solid var(--line);display:flex;
+                gap:8px;align-items:center;flex-wrap:wrap;font-size:12px;
+                transition:opacity .15s">
+      <span class="dim rowlbl">showing</span>
+      <select id="qfPool" onchange="qReload('showing '+(this.value||'all pools')+'…')">
+        <option value="">all pools</option>
+        <option value="encode">encode</option>
+        <option value="passthrough">passthrough</option>
+        <option value="subocr">subocr</option></select>
+      <select id="qfDisk" onchange="qReload(this.value?('filtering to '+this.value+'…'):'showing all disks…')">
+        <option value="">all disks</option></select>
+      <input id="qfText" placeholder="filter by title or path" style="width:200px"
+             oninput="qFilter()">
+      <select id="qfSort" onchange="qSortChange()">
+        <option value="next">next to run</option>
+        <option value="order">queue order</option>
+        <option value="title">title</option>
+        <option value="size">size</option>
+        <option value="pool_disk">disk</option>
+        <option value="library">library</option>
+      </select>
+      <button id="qfDir" onclick="qSortDir()" title="reverse the sort">▲</button>
+      <button onclick="queueTop()">Top</button>
+      <span id="qSummary" class="dim"></span>
+      <!-- pushed right: a legend for the POOL column below, not a control -->
+      <span id="queueDisks" class="qdisks"></span>
+    </div>
+    <!-- Preview / handler output opens HERE, under the buttons that produce it.
+         It used to live in the Transcoding panel, which is where these controls
+         used to be - so after the controls moved, pressing Preview appeared to
+         do nothing until you scrolled past Transcoding to find the result. -->
+    <div id="tcSub" style="display:none;border-top:1px solid var(--line)">
+      <div style="padding:8px 14px;display:flex;align-items:center;gap:8px;
+                  border-bottom:1px solid var(--line)">
+        <b id="tcSubTitle" style="font-size:12px"></b>
+        <span id="tcSubMeta" class="dim" style="font-size:11px"></span>
+        <span style="margin-left:auto"><button onclick="closeSub()">close</button></span>
+      </div>
+      <div id="tcSubBody" class="scrollbox nohz" style="height:340px"></div>
+    </div>
+    <div id="queueList" class="qbox"></div>
+  </div>
+  <div class="panel">
+    <h2>Transcoding<span class="live"><span class="dot"></span>live</span>
+        <span class="live"><button onclick="cancelAll()"
+          title="cancel every running job — the queue is left alone"
+          >Cancel all</button></span></h2>
+    <!-- Worker occupancy, moved here from the Queue heading. It describes what
+         is RUNNING, not what is waiting, so it belongs above the worker cards
+         it is counting - and at 9px in a heading it was the smallest text on a
+         page reporting the most important number on it. -->
+    <div id="jobCap" class="capbar"></div>
+    <!-- Separate, PERSISTENT containers. These used to be one div rebuilt every
+         2s, which destroyed the finished table and then skipped refilling it -
+         hence the panel blinking in and out. -->
+    <div id="sysbar" class="sysbar"></div>
+    <!-- Whole-run progress. The per-worker bars only ever describe one file, so
+         with hundreds queued there was no way to see how far along the RUN was
+         or when it would finish. -->
+    <div id="jobsOverall"></div>
+    <div id="jobsHeld"></div>
+    <!-- Fixed height for ~4 cards. With up to 8 workers the panel grew and
+         shrank as jobs started and finished, shoving everything below it up and
+         down the page mid-read. -->
+    <div id="jobsRun" class="runbox"><div class="dim" style="padding:14px">idle</div></div>
+  </div>
+  <div class="panel">
+    <!-- NOT "Pending renames", and not a retry queue.
+         Every finished job is handed to this queue - jobs.py enqueues
+         "post-transcode" unconditionally - so a file sitting here for twenty
+         seconds while the arr rescans is the happy path, not a fault. Of
+         21,848 files that have been through it, 21,845 completed on the first
+         attempt and two ever needed a second. The old heading described the
+         0.01% case and made the normal one look broken. -->
+    <h2 style="color:#e3b341">Renames waiting on the arrs
+        <span id="renCount" class="dim"></span></h2>
+    <div style="padding:9px 14px;border-bottom:1px solid var(--line)">
+      <button onclick="loadRenames()">Check renames</button>
+      <button onclick="retryRenames()">Retry all now</button>
+      <span id="renqMsg" class="dim" style="margin-left:8px">every processed file
+        passes through here — nuarr waits for the arr to re-read it, then asks
+        for the rename. "Check renames" is read-only.</span>
+    </div>
+    <!-- The retry queue is what actually performs renames now that the commit
+         hands them off instead of doing them inline. Showing only the
+         read-only check hid the work that was really happening. -->
+    <!-- The summary lives OUTSIDE the scrollbox on purpose. Rendered inside it
+         it scrolled away with the first few rows, so the one line that tells
+         you how much work is outstanding was the first thing to disappear the
+         moment there was enough of it to be worth reading. -->
+    <div id="renqHead" style="display:none"></div>
+    <div id="renq" class="scrollbox auto nohz"></div>
+    <div id="renames" class="scrollbox auto nohz"><div class="dim" style="padding:14px">not checked yet</div></div>
+  </div>
+  <!-- Pending file replaces. The counterpart to the rename queue: an encode
+       that finished but whose SWAP is still outstanding, almost always because
+       something holds the original open. The finished output is being kept in
+       the cache, so this panel is also where that disk space is accounted for. -->
+  <!-- Prepared OCR subtitles waiting for a rewrite to carry them in. The
+       subs-pending area is a baton pass between the side OCR and the next
+       job; this panel exists so a dropped baton is visible instead of being
+       a directory nobody looks in. -->
+  <div class="panel">
+    <h2 style="color:#b48bf2">Pending OCR subtitles <span id="socrpCount" class="dim"></span></h2>
+    <div id="socrp"></div>
+  </div>
+
+  <div class="panel">
+    <!-- Each pending panel gets its phase's colour: renames gold, replaces
+         the commit cyan (same as the commit progress bar), OCR subs the
+         subocr purple - so a glance ties the panel to the work it tracks. -->
+    <h2 style="color:#58c8d8">Pending file replaces <span id="cmqCount" class="dim"></span></h2>
+    <div style="padding:9px 14px;border-bottom:1px solid var(--line)">
+      <button onclick="retryCommits()">Retry all now</button>
+      <span id="cmqMsg" class="dim" style="margin-left:8px">encodes that finished but could not be swapped in yet</span>
+    </div>
+    <!-- Pinned summary - see the note on #renqHead. -->
+    <div id="cmqHead" style="display:none"></div>
+    <div id="cmq" class="scrollbox auto nohz"></div>
+  </div>
+  <!-- What Plex actually did. Everything else in this dashboard reports what
+       nuarr decided; this is the only panel that reports whether it worked. -->
+  <div class="panel">
+    <h2 style="color:#f778ba">What Plex had to work at
+        <span id="pbCount" class="dim"></span>
+        <span style="float:right;font-weight:400">
+          <button onclick="pbPoll()">Check now</button></span></h2>
+    <div id="pb"><div class="dim" style="padding:14px">loading…</div></div>
+  </div>
+  <!-- Nightly conformance check: does the library match its own rules? -->
+  <div class="panel">
+    <h2 style="color:#39d3c3">Rule check <span id="auCount" class="dim"></span>
+        <span style="float:right;font-weight:400">
+          <button onclick="auRun()">Run now</button></span></h2>
+    <div id="au"><div class="dim" style="padding:14px">loading…</div></div>
+  </div>
+  <!-- THE ONE FEED. Finished jobs and file events used to live in two panels
+       a screenful apart, so following one file meant scrolling between "the
+       job ran" up there and "then Sonarr renamed it" down here. Everything
+       that happened, in the order it happened: job rows keep their size delta
+       and expandable log, event rows carry their detail, one filter covers
+       both. -->
+  <div class="panel">
+    <h2>Activity<span class="live"><span class="dot"></span>live</span>
+        <span id="doneCount" class="live"></span>
+        <span style="float:right;font-weight:400;display:flex;gap:8px;align-items:center">
+          <select id="doneFilter" onchange="applyDoneFilter()">
+            <option value="">everything</option>
+          </select>
+          <button id="doneBoxResume" style="display:none" class="resume"
+                  onclick="resumeFollow('doneBox')">↑ back to newest</button></span></h2>
+    <div id="jobsDone"><div class="skel" style="padding:14px">
+      <i style="width:84%"></i><i style="width:76%"></i><i style="width:88%"></i></div></div>
+  </div>
+</div>
+<script>
+const fmt=n=>(n||0).toLocaleString();
+const gb=b=>!b?'0':(b/1073741824>=1024?(b/1099511627776).toFixed(2)+' TB':(b/1073741824).toFixed(1)+' GB');
+const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const stateClass=s=>'e-'+String(s||'').replace(/[^a-z_]/gi,'');
+// Relative time for row timestamps - "2h ago" answers the panel's question;
+// the exact datetime lives in the tooltip for when it matters.
+function ago(ts){
+  const s=Math.max(0, Date.now()/1000-ts);
+  if(s<90) return 'just now';
+  if(s<5400) return Math.round(s/60)+'m ago';
+  if(s<129600) return Math.round(s/3600)+'h ago';
+  if(s<3456000) return Math.round(s/86400)+'d ago';
+  return new Date(ts*1000).toLocaleDateString();
+}
+// WRITE MARKUP ONLY WHEN IT HAS ACTUALLY CHANGED.
+//
+// Replacing an element destroys everything the browser has attached to it, and
+// the most visible casualty is a native title= tooltip: it is dismissed the
+// instant its anchor is removed. Every pill in the header is repainted on a
+// timer - the arr pills, ffmpeg, the boot progress, the pending-stop pill - so
+// hovering any of them meant watching the tooltip strobe, re-created faster
+// than it could be read.
+//
+// The repaints were almost all pointless. "Sonarr ok" is the same markup it was
+// five seconds ago; the poll confirms it rather than changes it. Comparing the
+// string first costs one compare, skips the DOM write, and leaves the anchor -
+// and the tooltip on it - alive. Returns true when it really did write, for
+// callers that want to know.
+function setHTML(el, html){
+  if(!el) return false;
+  if(el.dataset.k===html) return false;
+  el.dataset.k=html;
+  el.innerHTML=html;
+  return true;
+}
+// flash a panel/tile border when its contents actually change
+function pulse(el){ if(!el) return; el.classList.remove('changed');
+  void el.offsetWidth; el.classList.add('changed'); }
+// ---- per-panel auto-scroll ------------------------------------------------
+// Scrolling up to read something must not be undone two seconds later by the
+// next refresh. Each panel tracks its own state and offers a way back.
+const _follow={};
+function follows(id){ return _follow[id]!==false; }
+function watchScroll(id){
+  const el=document.getElementById(id);
+  if(!el || el.dataset.watched) return;
+  el.dataset.watched='1';
+  el.addEventListener('scroll',()=>{
+    const atEnd = el.scrollTop+el.clientHeight >= el.scrollHeight-40;
+    _follow[id]=atEnd;
+    const b=document.getElementById(id+'Resume');
+    if(b) b.style.display = atEnd ? 'none' : '';
+  });
+}
+function keepPinned(id){
+  const el=document.getElementById(id);
+  if(el && follows(id)) el.scrollTop=el.scrollHeight;
+}
+
+// THE fix for "it keeps moving while I read".
+// Replacing innerHTML resets scrollTop to 0 no matter what the follow flag
+// says, so every refresh yanked you back to the top mid-read. When you are not
+// at the bottom the panel is now FROZEN - not repainted at all - and it counts
+// what arrived so you know there is more waiting.
+const _pending={};
+function paint(id, html, changed){
+  const el=document.getElementById(id);
+  if(!el) return false;
+  watchScroll(id);
+  if(!follows(id)){
+    if(changed) _pending[id]=(_pending[id]||0)+1;
+    const b=document.getElementById(id+'Resume');
+    if(b){ b.style.display='';
+           b.textContent=_pending[id] ? `↓ ${_pending[id]} new — resume` : '↓ resume auto-scroll'; }
+    return false;                       // frozen: leave the DOM alone
+  }
+  _pending[id]=0;
+  el.innerHTML=html;
+  el.scrollTop=el.scrollHeight;
+  const b=document.getElementById(id+'Resume');
+  if(b) b.style.display='none';
+  return true;
+}
+function resumeFollow(id){
+  _follow[id]=true; _pending[id]=0;
+  const b=document.getElementById(id+'Resume');
+  if(b){ b.style.display='none'; b.textContent='↓ resume auto-scroll'; }
+  // repaint immediately with whatever arrived while it was frozen
+  if(id==='logs') loadLogs(true);
+  else if(id==='hooks'){ lastHookKey=''; loadHooks(); }
+  else if(id==='doneBox'){ lastListSig=null; renderDone(lastJobs); }
+  else if(id==='aqProbe'){ if(_aqLast) renderAqProbes(_aqLast); }
+  const el=document.getElementById(id);
+  // Activity and the probe list grow at the TOP; every other followed box
+  // grows at the bottom
+  if(el) el.scrollTop = (id==='doneBox'||id==='aqProbe') ? 0 : el.scrollHeight;
+}
+function followBtn(id){
+  return `<button id="${id}Resume" style="display:none" class="resume"
+            onclick="resumeFollow('${id}')">↓ resume auto-scroll</button>`;
+}
+
+// Keep a filter dropdown stocked with the values that actually appear, with a
+// count beside each - a list of every theoretically possible state is noise, and
+// you cannot tell which ones are worth clicking.
+function syncFilter(id, values, allLabel){
+  const sel=document.getElementById(id);
+  if(!sel) return;
+  const counts={};
+  for(const v of values){ if(v) counts[v]=(counts[v]||0)+1; }
+  const sig=Object.entries(counts).map(([k,n])=>k+n).sort().join(',');
+  if(sel.dataset.sig===sig) return;      // unchanged; leave the selection alone
+  sel.dataset.sig=sig;
+  const cur=sel.value;
+  sel.innerHTML=`<option value="">${allLabel}</option>`
+    +Object.keys(counts).sort().map(k=>
+        `<option value="${esc(k)}">${esc(k)} (${counts[k]})</option>`).join('');
+  sel.value=cur;                          // preserve what the user picked
+  if(sel.value!==cur) sel.value='';       // that value vanished; fall back to all
+}
+// Choosing a filter is an explicit action, so it repaints even when the panel
+// is frozen because you had scrolled up.
+let doneForce=false;
+function applyDoneFilter(){ doneForce=true; lastListSig=null;
+                            _follow['doneBox']=true; renderDone(lastJobs); }
+
+const _sig={};
+function ifChanged(key,val,el){
+  if(_sig[key]===undefined){ _sig[key]=val; return false; }
+  if(_sig[key]===val) return false;
+  _sig[key]=val; pulse(el); return true;
+}
+
+async function loadAll(){
+  const s=await (await fetch('/api/summary')).json();
+  // SPACE SAVED, BESIDE THE LIBRARY SIZE IT IS A FACT ABOUT.
+  //
+  // Not a header chip: cpu, gpu, ram and processes are all live meters that
+  // change second to second, and this is a running total that only ever goes
+  // up. Putting it there would have implied it was another gauge. It belongs
+  // next to "59.33 TB", which is the number it modifies.
+  const sv = s.saved || {};
+  const net = sv.net || 0;
+  let svTxt = '';
+  if(net > 0){
+    const pct = sv.before_b ? (net/sv.before_b*100) : 0;
+    svTxt = ` · <b class="hdrsave" title="Across ${fmt(sv.n||0)} finished jobs `
+      + `nuarr has written ${gb(sv.after_b)} where the sources were `
+      + `${gb(sv.before_b)}.\n\n`
+      + `${gb(sv.shrank)} came off files that shrank; ${gb(sv.grew)} went back `
+      + `on ones that grew — a conversion away from AV1 costs size on purpose, `
+      + `because the point of it is that every client can play the result.\n\n`
+      + `This counts WORK DONE, not the library as it stands: a file processed `
+      + `twice counts twice, and one deleted since still counts.">`
+      + `${gb(net)} saved</b> <span class="dim">(${pct.toFixed(1)}%)</span>`;
+  }
+  setHTML(document.getElementById('sub'),
+    fmt(s.totals.n)+' files · '+gb(s.totals.bytes)+' · '
+    + s.disks.length+' pool disks' + svTxt);
+
+  const byState=Object.fromEntries(s.states.map(x=>[x.state,x]));
+  const c=[];
+
+  // THE SUBTITLE ON A SWEPT TILE, in priority order.
+  //
+  // Missing and Unmanaged are both maintained by a background sweep, and a
+  // sweep nobody can see is indistinguishable from one that has died. So the
+  // line under the number says, in order of what is worth knowing:
+  //   working now   -> a live indicator and what it is on
+  //   files pending -> how many are still being re-checked
+  //   otherwise     -> when it will next look
+  // The plain description is the fallback, not the default.
+  const sweepNote = (sw, pending, pendingText, idleText) => {
+    if(sw && sw.running){
+      const of = sw.total ? ` ${(sw.done||0)+1} of ${sw.total}` : '';
+      return `<span class="swrun"><span class="spin"><i></i><i></i><i></i></span>`
+           + `checking${of}${sw.current?` · ${esc(String(sw.current).slice(0,28))}`:''}</span>`;
+    }
+    if(pending) return pendingText;
+    if(sw && sw.next_run){
+      const left = sw.next_run - Date.now()/1000;
+      // A next-run in the past means the loop is between its sleep and its
+      // next pass; "due now" is honest, a negative countdown is not.
+      return `<span class="dim">next check ${left>1?`in ${hms(left)}`:'due now'}</span>`;
+    }
+    return idleText;
+  };
+  const add=(k,v,sub,q)=>c.push(
+    `<div class="card ${q?'click':''} ${(k==='Errors'&&s.errors.n>0)?'err-hot':''}"
+       ${q?`onclick='drill(${JSON.stringify(q)})'`:''}
+       data-k="${esc(k)}"><div class="k">${k}</div>
+      <div class="v">${v}</div><div class="s">${sub||''}</div></div>`);
+  add('Total files',fmt(s.totals.n),gb(s.totals.bytes),{t:'All files'});
+  add('Eligible',fmt((byState.eligible||{}).n||0),'past hold, ready to process',
+      {state:'eligible',t:'Eligible'});
+  add('Held (new)',fmt((byState.new||{}).n||0),'still settling',{state:'new',t:'Held'});
+  // CONFIRMED missing only. A file the arr tracks but cannot find on disk is
+  // usually a stale arr record, not a lost file - so the healer re-checks it
+  // up to 3 times before it counts here. Showing the raw 'missing' state put
+  // transient staleness in front of you as if a disk had died, which is how a
+  // number like this stops being believed.
+  const mh = s.missing_heal || {confirmed:(byState.missing||{}).n||0, checking:0};
+  add('Missing', fmt(mh.confirmed),
+      sweepNote(s.missing_sweep, mh.checking,
+                `${fmt(mh.checking)} more being re-checked`,
+                'confirmed after 3 checks'),
+      {state:'missing',t:'Missing'});
+  const eTop=(s.error_kinds&&s.error_kinds[0])
+    ? esc(s.error_kinds[0].r).slice(0,44) : 'nothing needs attention';
+  add('Errors',fmt(s.errors.n),eTop,{errors:1,t:'Errors — needs attention'});
+  const ua = s.unmanaged_adopt || {checking:0, no_folder:0};
+  add('Unmanaged &gt;'+s.extras_cutoff_mb+'MB',fmt(s.orphans.n),
+      sweepNote(s.unmanaged_sweep, ua.checking,
+                `${fmt(ua.checking)} being re-checked`,
+                ua.no_folder ? `${fmt(ua.no_folder)} not in any arr`
+                             : gb(s.orphans.bytes)+' — likely failed imports'),
+      {unmanaged:1,t:'Unmanaged'});
+  add('Extras (kept)',fmt(s.extras.n),gb(s.extras.bytes)+' OP/ED, specials, bonus',
+      {extras:1,t:'Extras'});
+  document.getElementById('cards').innerHTML=c.join('');
+  // pulse only the tiles whose number moved
+  [['Total files',s.totals.n],['Eligible',(byState.eligible||{}).n||0],
+   ['Held (new)',(byState.new||{}).n||0],
+   ['Missing',(s.missing_heal||{}).confirmed||0],
+   ['Errors',s.errors.n],
+   ['Unmanaged &gt;'+s.extras_cutoff_mb+'MB',s.orphans.n],['Extras (kept)',s.extras.n]]
+   .forEach(([k,v])=>ifChanged('card:'+k,v,
+      document.querySelector(`.card[data-k="${CSS.escape(k)}"]`)));
+
+  // Bars scale to each disk's real capacity, so the fill level means
+  // "how full is this disk" rather than "how many files does it happen to hold".
+  lastDisks=s.disks; renderDisks();
+
+  loadLibs();
+
+  // rescan is driven from the Libraries panel now, which can also do one library
+  if(s.scan.running) setTimeout(loadAll,3000);
+
+  loadWorkers(); loadHooks(); loadHistory(); loadGate(); loadRenq();
+ffCheck(); loadCtl(); loadCmq();
+// A download survives a page reload - pick it back up, and surface a build
+// that finished staging while the page was closed.
+ffProgress();
+
+  const a=await (await fetch('/api/arrs')).json();
+  setHTML(document.getElementById('arrs'), Object.entries(a).map(([n,v])=>
+    `<span class="pill ${v.ok?(v.busy?'p-warn':'p-ok'):'p-bad'}" title="${esc(v.busy_reason||v.error||'')}">
+       ${esc(n)} ${v.ok?(v.busy?'busy':'ok'):'down'}</span>`).join(' '));
+}
+
+async function loadRenames(){
+  const el=document.getElementById('renames');
+  // Declared on window so the inline "check again now" link can set it - an
+  // undeclared assignment inside a handler is a ReferenceError in strict mode
+  // and would silently do nothing.
+  if(typeof renForce==='undefined') window.renForce=false;
+  el.innerHTML='<div class="dim" style="padding:14px">asking both arrs — one request '
+    +'per series, so a first run takes ~90s. The answer is then kept for 15 minutes.</div>';
+  try{
+    const r=await (await fetch('/api/renames'+(window.renForce?'?refresh=true':''))).json();
+    window.renForce=false;
+    document.getElementById('renCount').textContent='('+r.count+')';
+    // NEVER let a cached answer look live. The whole reason this is cached is
+    // that it is expensive to recompute, which is exactly the situation where
+    // someone would otherwise trust a stale list.
+    const age = r.cached
+      ? `<div class="dim" style="padding:6px 14px;font-size:11px">
+           showing a result from ${Math.round((r.age_s||0)/60)} min ago ·
+           kept for ${Math.round((r.ttl_s||900)/60)} min ·
+           <a href="#" onclick="window.renForce=true;loadRenames();return false;">check again now</a></div>`
+      : '';
+    el.innerHTML = age + (r.count
+      ? '<table><tr><th>Arr</th><th>Title</th><th>Status</th><th>Change</th><th>Why</th></tr>'
+        +r.rows.map(x=>`<tr>
+          <td class="dim">${esc(x.arr)}</td><td>${esc(x.title)}</td>
+          <td><span class="pill ${x.blocked?'p-warn':'p-ok'}">${esc(x.blocked?x.category:'ready')}</span></td>
+          <td class="mono wrap" style="width:36%">${esc(x.from)}
+              <br><span class="arrow">→</span> <span class="dim">${esc(x.to)}</span></td>
+          <td class="dim wrap" style="width:30%">${esc(x.blocked?x.why:'')}</td></tr>`).join('')
+        +'</table>'
+      : '<div style="padding:14px" class="p-ok">no pending renames — library matches the naming scheme</div>');
+  }catch(e){ el.innerHTML='<div class="err" style="padding:14px">'+esc(e)+'</div>'; }
+}
+// Pool disks: sorted by disk NAME by default, since that is the stable
+// identity you cross-reference against StableBit Scanner. Every column is
+// clickable; clicking the active column flips direction.
+let lastDisks=[], diskSort='pool_disk', diskDir=1;
+function sortDisks(col){
+  if(diskSort===col) diskDir=-diskDir; else { diskSort=col; diskDir=1; }
+  renderDisks();
+}
+function renderDisks(){
+  const key=diskSort;
+  const rows=lastDisks.slice().sort((a,b)=>{
+    let x=a[key], y=b[key];
+    if(key==='pool_disk'){
+      // natural order so NU-DRIVE-2 sorts before NU-DRIVE-10
+      const nx=parseInt(String(x).replace(/\D+/g,''),10), ny=parseInt(String(y).replace(/\D+/g,''),10);
+      if(!isNaN(nx)&&!isNaN(ny)&&nx!==ny) return (nx-ny)*diskDir;
+      return String(x).localeCompare(String(y))*diskDir;
+    }
+    x=x==null?-1:x; y=y==null?-1:y;
+    return (x<y?-1:x>y?1:0)*diskDir;
+  });
+  const arrow=c=>diskSort===c?(diskDir>0?' ▲':' ▼'):'';
+  const th=(c,label,cls)=>`<th class="${cls||''}" style="cursor:pointer"
+      onclick="sortDisks('${c}')">${label}${arrow(c)}</th>`;
+  const tot=rows.reduce((a,d)=>a+(d.total||0),0);
+  const usd=rows.reduce((a,d)=>a+(d.used||0),0);
+  const fre=rows.reduce((a,d)=>a+(d.free||0),0);
+  // Live I/O, keyed by disk, from the SAME per-job measurements the worker
+  // cards show - so a rate here and a rate on a card mean the same thing and
+  // use the same colours. NOTE: this is nuarr's own traffic, not the whole
+  // physical disk; a Plex stream on an otherwise idle disk reads as 0 here.
+  // _lastIo is the whole io object - {read_bps, write_bps, by_disk:[...]} -
+  // not a bare list. Iterating it directly silently produced nothing.
+  const io = {};
+  (((_lastIo||{}).by_disk)||[]).forEach(x=>{ io[x.disk]=x; });
+
+  // ---- IS THIS DISK OUT OF LINE WITH THE OTHERS? ------------------------
+  //
+  // "50.7% full" means nothing on its own; it means something the moment you
+  // notice the other eleven say 50.4. Twelve near-identical numbers in a
+  // column are read as one number, which is exactly the reading that hides
+  // the one that has drifted - and a drifting disk is the early sign of a
+  // balancer that has stopped, a disk excluded from placement, or one filling
+  // faster than the rest because everything new is landing on it.
+  //
+  // MEDIAN AND MEDIAN ABSOLUTE DEVIATION, not mean and standard deviation.
+  // A single badly-off disk drags a mean towards itself and inflates a
+  // standard deviation, so the outlier partly hides its own outlier-ness -
+  // the classic reason to use the robust pair when the thing you are looking
+  // for IS the outlier.
+  //
+  // SENSITIVE TO A TENTH OF A POINT, and it has to earn that.
+  //
+  // The first version only spoke up past 2 points, which meant it said nothing
+  // at all about a pool sitting inside 0.6 - and "which disks are running
+  // ahead of the others" is a real question at that scale, since a tenth of a
+  // point here is about 9 GB. Dropping the threshold to 0.1 flags eight of the
+  // twelve, though, and eight amber numbers is not a signal, it is a mess.
+  //
+  // So the threshold and the EMPHASIS are separated. Anything off the median
+  // by 0.1 is coloured; how strongly is proportional to how far out it is. A
+  // disk 0.2 points high is a faint tint you can find if you look for it; one
+  // 5 points high is loud and bold. The column becomes a readout of the spread
+  // rather than a binary alarm, which is what a tenth-of-a-point threshold
+  // implies whether or not it is stated.
+  //
+  // MAD is gone as a gate. It described the spread, and at a 0.1 threshold the
+  // spread IS the thing being displayed - suppressing anything inside 3x MAD
+  // would have hidden exactly the differences this now exists to show. It is
+  // still computed, for the tooltip.
+  const fills = rows.map(d=>d.pct_used).filter(v=>v!=null && isFinite(v));
+  const med = a => { if(!a.length) return null;
+    const s=[...a].sort((x,y)=>x-y), h=s.length>>1;
+    return s.length%2 ? s[h] : (s[h-1]+s[h])/2; };
+  const midFill = med(fills);
+  const mad = midFill==null ? null : med(fills.map(v=>Math.abs(v-midFill)));
+  const OUT_FLOOR = 0.1;          // percentage points - the smallest gap shown
+  const OUT_FULL  = 3.0;          // where the colour reaches full strength
+  const outlier = pct => {
+    if(midFill==null || fills.length<4 || pct==null) return 0;
+    const d = pct - midFill;
+    if(Math.abs(d) < OUT_FLOOR) return 0;
+    return d>0 ? 1 : -1;          // 1 = fuller than the pool, -1 = emptier
+  };
+  // 0 at the floor, 1 at OUT_FULL. Square-rooted so the first tenth of a point
+  // is visible at all - a linear ramp makes 0.2 of 3.0 a 7% tint, which is
+  // indistinguishable from plain text and would make the threshold a lie.
+  const outStrength = pct => {
+    if(midFill==null || pct==null) return 0;
+    const d = Math.abs(pct - midFill);
+    return Math.sqrt(Math.max(0, Math.min(1, (d-OUT_FLOOR)/(OUT_FULL-OUT_FLOOR))));
+  };
+  // PHYSICAL disk load, which answers the question the block above cannot:
+  // how busy is the spindle, including everything nuarr is not doing. Our own
+  // counters show a disk under a 4K direct play or a backup as completely
+  // idle, which is exactly when you most want to see it.
+  const dl = {};
+  ((_diskLoad.disks)||[]).forEach(x=>{ dl[x.disk]=x; });
+
+  // COLUMNS THAT DROP IN A CHOSEN ORDER, rather than whichever one runs out of
+  // room. Six columns plus a progress bar in a half-width panel does not fit
+  // between about 900 and 1400px, and what was being lost was Free - the one
+  // column you actually look at. Size and Used are marked droppable because
+  // both are recoverable from what stays: the bar already shows the ratio, and
+  // Used is Size minus Free.
+  // DATA MOVING BETWEEN SPINDLES, named. The arrows on the rows say a disk is
+  // being read from or written to; this says which pairs with which, which is
+  // the fact you actually want - "something is rebalancing NU-DRIVE-1 onto
+  // NU-DRIVE-3 and NU-DRIVE-10" rather than three separately busy disks.
+  //
+  // Worded as an inference throughout. It is derived from rates alone, with no
+  // product asked and nothing observing the file operations, so it can be
+  // wrong about the pairing when several things move at once - and a panel
+  // that overstates its evidence is worse than one that shows less.
+  // TWO KINDS OF MOVE, AND THE DIFFERENCE MATTERS.
+  //
+  //   ours     nuarr finished a file and the pool placed the rebuilt copy on a
+  //            different disk than the original. Known exactly - the job says
+  //            where it read from and where it is writing to - and it is a
+  //            thing nuarr chose to do.
+  //   external something else is shifting bytes between spindles. Inferred
+  //            from the counters, so hedged, and not something nuarr controls.
+  //
+  // Same line, because the reader's first question is "is a file changing
+  // disks"; different colour and wording, because the second question is
+  // immediately "is that us".
+  const moves=(_diskLoad.moves)||[];
+  const mine=moves.filter(m=>m.mine), other=moves.filter(m=>!m.mine);
+  const pair=(m,cls)=>`<span class="xpair ${cls}"${
+      m.what?` title="${esc(m.what)}"`:''}>${
+      m.from?diskTag(m.from):'<span class="dim">elsewhere</span>'} <span
+      class="xarrow">→</span> ${
+      m.to?diskTag(m.to):'<span class="dim">elsewhere</span>'} <b>${
+      mbps(m.bps)}</b></span>`;
+  let moveLine='';
+  if(mine.length||other.length){
+    moveLine = '<div class="xfer">'
+      + (mine.length ? `<span class="xlbl xlbl-mine" title="nuarr rebuilt these
+files and the pool placed the finished copy on a different disk than the
+original — so the file has changed drives. Exact, not inferred: the job knows
+both ends.">nuarr moving</span>${mine.slice(0,3).map(m=>pair(m,'xmine')).join('')}` : '')
+      + (other.length ? `<span class="xlbl" title="Inferred from the read/write
+split on each disk — one spindle reading at the same rate another is writing. No
+product is asked, so this works for a pool balance, a parity rebuild, a backup or
+a plain file copy alike. With several moves at once the pairing is a best
+guess.">looks like data moving</span>${other.slice(0,3).map(m=>pair(m,'')).join('')}` : '')
+      + '</div>';
+  }
+  document.getElementById('disks').innerHTML = moveLine
+    + '<table class="disktab"><thead><tr>'
+    +th('pool_disk','Disk')+th('n','Files','num')
+    +th('total','Size','num dcol-size')+th('used','Used','num dcol-used')
+    +th('pct_used','Capacity','dcol-bar')+th('free','Free','num dcol-free')
+    +'</tr></thead>'
+    +rows.map(d=>{
+      const pct = d.pct_used!=null ? d.pct_used : 0;
+      const col = pct>=90?'var(--bad)':(pct>=75?'var(--warn)':'var(--acc)');
+      const dc = diskColor(d.pool_disk);
+      const a = io[d.pool_disk];
+      // Same classes as the worker cards - m-read / m-write are the paired
+      // colours you compare there, and a rate should not change meaning just
+      // because you are reading it in a different panel.
+      // An idle disk says "idle" - once - instead of "Read — Write —".
+      // Two placeholder dashes sitting where numbers belong read as "Read is
+      // dash, Write is dash" and made the eye hunt for which value each one
+      // went with; on twelve idle rows that is a column of noise. Labels are
+      // emitted long and short so a narrow panel can swap Read/Write for R/W
+      // rather than dropping them and leaving bare numbers.
+      const pair = (cls,lbl,short,val) =>
+        `<span class="io-p"><span class="io-l"><span class="lg">${lbl}</span>`
+        + `<span class="sm">${short}</span></span>`
+        + `<b class="${cls} io-v">${val}</b></span>`;
+      // Three states, and none of them prints a placeholder dash:
+      //   moving data -> Read/Write figures + how many jobs
+      //   job but no throughput yet -> just the job count. A job that has been
+      //     claimed but is still probing genuinely has nothing to report, and
+      //     "Read — Write —" beside "1 job" looked like a fault rather than a
+      //     job that had not started moving bytes yet.
+      //   nothing at all -> idle
+      const moving = a && (a.read_bps || a.write_bps);
+      const jobTag = a ? `<span class="io-j">${a.jobs}<span class="lg"> job${
+              a.jobs===1?'':'s'}</span><span class="sm">j</span></span>` : '';
+
+      const L = dl[d.pool_disk];
+
+      // ---- TWO SOURCES OF LOAD, SHOWN AS TWO THINGS -----------------------
+      //
+      // These figures answer different questions and used to sit in one
+      // undifferentiated run of chips: Busy, Other, Read, Write, 1 job - where
+      // Read and Write are NUARR's own per-job byte counters and Other is
+      // everything else on the spindle. Reading left to right there was
+      // nothing to say which was which, so "Other 710 KB/s" beside "Read
+      // 2.2 MB/s" looked like two halves of one measurement rather than two
+      // different programs.
+      //
+      // They are also acted on differently, which is the real reason to
+      // separate them. Load nuarr is causing is load nuarr can stop - it is
+      // doing what it was asked. Load from anything else is a reason to steer
+      // work elsewhere, and it is the only half the gate reacts to.
+      //
+      // Busy% stays OUTSIDE both groups on purpose. It is the whole spindle,
+      // and it is a proportion of TIME - it cannot be divided between the two
+      // by their share of BYTES, because a seek costs time and no bytes. The
+      // split bar under it shows the byte ratio as an approximation and says
+      // so in the tooltip; the two throughput figures beside it are exact.
+      const grp = (cls,label,body) =>
+        `<span class="io-grp ${cls}"><span class="io-gl">${label}</span>${body}</span>`;
+      // A VIEWER IS THE THIRD SOURCE OF LOAD, and the one that outranks the
+      // other two: nuarr's own work can be slowed down and the system's cannot
+      // be helped, but a viewer is the reason this whole panel exists.
+      //
+      // Built OUTSIDE the "is this disk measurably busy" branch below, because
+      // a viewer on an otherwise quiet disk is precisely the case that must
+      // not vanish - a direct play at 7 Mbps barely moves the busy figure, and
+      // the row would have said "idle" while somebody was watching from it.
+      //
+      // W IS LOOKED UP HERE, not further down beside the pill. `const` is
+      // block-scoped and hoisted into a temporal dead zone, so reading it
+      // above its declaration is a ReferenceError - which is exactly what
+      // happened: renderDisks threw halfway through, the table kept the markup
+      // from the previous successful paint, and the panel looked merely stale
+      // rather than broken.
+      const W = (_plexDetail||{})[d.pool_disk];
+      let viewGrp='';
+      if(W && W.viewers){
+        // BYTES PER SECOND, not megabits. Plex reports kilobits, and this
+        // group sits beside nuarr's and the system's figures which are both
+        // bytes off the disk - printing 7.2 next to 0.9 for the same traffic
+        // would make a viewer look eight times heavier than they are. Same
+        // unit or no comparison: kbps * 1000 / 8.
+        const bps=(W.kbps||0)*125;
+        const tip = (W.who||[]).map(w=>
+            `${w.state==='paused'?'paused':'playing'} · ${w.user||'someone'}`
+            + ` · ${w.title||''}`
+            + (w.kbps?` · ${(w.kbps/1000).toFixed(1)} Mbps`:'')
+            + (w.local?' · local':' · remote')).join('\n')
+          + (W.paused?`\n\n${W.paused} paused — counted, but adding nothing to `
+                     +`the rate, because a paused stream is not reading.`:'');
+        viewGrp = `<span class="io-grp io-view" title="${esc(tip)}"
+          ><span class="io-gl">${W.viewers>1?W.viewers+' viewers':'viewer'}</span>`
+          + (bps>=1000 ? `<b class="m-view io-v">${mbps(bps)}</b>`
+                       : '<span class="io-idle">paused</span>')
+          + '</span>';
+      }
+      // FOUR BUBBLES, ALWAYS PRESENT, ALWAYS THE SAME SIZE.
+      //
+      // An empty slot held the POSITION but not the shape, so a quiet disk was
+      // a row of gaps and a busy one a row of boxes - the column still changed
+      // appearance depending on what was happening, just in a different way.
+      // Drawing all four every time and greying the inactive ones makes every
+      // row structurally identical: same boxes, same places, same widths, only
+      // the contents differ.
+      //
+      // The greyed state has to be unmistakably OFF rather than broken, which
+      // is why it keeps its label and shows an em-dash rather than "0 B/s" - a
+      // zero is a measurement, and there is no measurement here.
+      let sBusy='', sOurs='', sSys='';
+      const slot=(cls,inner)=>`<span class="io-slot ${cls}">${inner}</span>`;
+      const offGrp=(cls,label,body)=>
+        `<span class="io-grp ${cls} off"><span class="io-gl">${label}</span>`
+        + `<span class="io-off">${body||'—'}</span></span>`;
+      let act = '';
+      if(L){
+        // EVERY DISK SHOWS ITS PERCENTAGE, ALWAYS.
+        //
+        // This used to hide the figure below 5% and print "idle" instead, on
+        // the reasoning that ten rows of "BUSY 1%" is noise. It is - if all ten
+        // are drawn at the same weight. But suppressing it entirely means the
+        // column cannot be read DOWN: "idle, idle, 77%, idle" gives you one
+        // number and no sense of what the rest of the array is doing, and 4%
+        // against 1% is a real difference on a spindle you are about to send
+        // work to.
+        //
+        // Same fix as the fill percentages: keep the number, grade the
+        // emphasis. A disk at 1% is a faint grey figure you can find when you
+        // look for it; one at 80% is bright and impossible to miss. The column
+        // becomes a picture of the array instead of a list of exceptions.
+        const b = L.busy||0;
+        const bc = L.hot ? 'var(--warn)'
+                 : (b>=10 ? 'var(--acc)' : '#8b98a6');
+        // Full strength by 60%, because past that the exact value matters less
+        // than the fact that the disk is close to saturated.
+        const bo = (0.45 + 0.55*Math.min(1, b/60)).toFixed(2);
+        const mine = L.mine_bps||0, ext = L.ext_bps||0;
+        const share = v => L.bps ? Math.round(v/L.bps*100) : 0;
+        const seg = (v,c) => `<i style="width:${
+            Math.max(0,Math.min(100,(L.bps? v/L.bps*100 : 0)*(b/100)))
+          }%;background:${c}"></i>`;
+        sBusy = `<span class="io-p io-busyp" title="${
+                 b.toFixed(0)}% busy over the last ${_diskLoad.window_s||20}s${
+                 L.queue?' · queue '+L.queue:''}
+The bar splits it by share of bytes moved — nuarr ${share(mine)}%, everything else ${share(ext)}%. That is an approximation: busy time is not proportional to bytes, because a seek costs time and moves none. The throughput figures beside it are exact.${
+                 L.hot?'\nHeld above '+(_diskLoad.thresh||85)+'% by something other than nuarr, so new jobs go elsewhere.':''}"
+               style="opacity:${bo}"
+               ><span class="io-l"><span class="lg">Busy</span><span class="sm">B</span></span>
+                <b class="io-v" style="color:${bc}">${b.toFixed(0)}%</b>
+                <span class="iobar">${seg(mine,'var(--acc)')}${seg(ext,'var(--warn)')}</span></span>`;
+        // nuarr's own half. Read and Write separately when we know them from
+        // the job counters, a single total when the disk figures say we are
+        // moving bytes but no worker claims them yet.
+        if(moving){
+          sOurs = grp('io-ours','nuarr',
+                      pair('m-read','Read','R',mbps(a.read_bps))
+                      + pair('m-write','Write','W',mbps(a.write_bps)) + jobTag);
+        }else if(a){
+          sOurs = grp('io-ours','nuarr',
+                      '<span class="io-idle">starting</span>' + jobTag);
+        }else if(mine>0){
+          sOurs = grp('io-ours','nuarr', `<b class="m-read io-v">${mbps(mine)}</b>`);
+        }
+        // Everything else on the spindle. Named "system" rather than "other"
+        // because "other" only means anything once you already know what the
+        // first thing was.
+        // No inner label on this one. Read and Write need naming because there
+        // are two of them; a group holding a single figure does not, and
+        // "system · Disk 72 KB/s" made the reader look for the other one.
+        if(ext>0){
+          // WHICH WAY. A rate on its own says the disk is busy; the direction
+          // says whether something is copying OFF it or filling it, and with
+          // the matching arrow on another row that is a transfer you can see
+          // rather than infer. Only shown when the traffic is clearly one-way
+          // - a mixed read/write is a disk doing several things and an arrow
+          // would be picking one of them to believe.
+          const er=L.ext_read_bps||0, ew=L.ext_write_bps||0;
+          const dir = er>=ew*3 ? '<span class="xarrow" title="being read from — '
+                       +'something is copying data off this disk">↑</span>'
+                    : ew>=er*3 ? '<span class="xarrow" title="being written to — '
+                       +'something is copying data onto this disk">↓</span>' : '';
+          sSys = grp('io-sys','system',
+                     `${dir}<b class="m-other io-v">${mbps(ext)}</b>`);
+        }
+      }else if(moving){
+        // Counters unavailable for this disk, but our own jobs are running on
+        // it. Still label the group - a lone pair of figures with no owner is
+        // exactly the ambiguity this is fixing.
+        sOurs = grp('io-ours','nuarr',
+                    pair('m-read','Read','R',mbps(a.read_bps))
+                    + pair('m-write','Write','W',mbps(a.write_bps)) + jobTag);
+      }else if(a){
+        sOurs = grp('io-ours','nuarr',
+                    '<span class="io-idle">starting</span>' + jobTag);
+      }
+      // Fill the blanks, then assemble in one fixed order. A disk doing
+      // nothing is now the same shape as a disk doing everything.
+      if(!sBusy) sBusy = '<span class="io-p io-busyp off"'
+        + ' title="no reading for this disk — the counters did not report it">'
+        + '<span class="io-l"><span class="lg">Busy</span><span class="sm">B</span></span>'
+        + '<b class="io-v io-off">—</b><span class="iobar"></span></span>';
+      if(!sOurs) sOurs = offGrp('io-ours','nuarr','no jobs here');
+      if(!sSys)  sSys  = offGrp('io-sys','system');
+      if(!viewGrp) viewGrp = offGrp('io-view','viewer');
+      act = slot('sl-busy', sBusy) + slot('sl-ours', sOurs)
+          + slot('sl-sys', sSys) + slot('sl-view', viewGrp);
+      const watched = (_plexDisks||[]).indexOf(d.pool_disk)>=0;
+      const hot = L && L.hot;
+      const out = outlier(pct);
+      // NO PILLS BESIDE THE NAME. "busy" and "watching" were added when the
+      // activity row could not say either thing - it showed nuarr's own bytes
+      // and nothing else, so a disk under a viewer or a backup looked idle and
+      // needed a badge to contradict it. The row says both now, in colour and
+      // with figures, and the badges had become a second, vaguer copy sitting
+      // where the disk name wants the space.
+      //
+      // The tooltip they carried moves onto the viewer group, which is where
+      // somebody would now look for it.
+      // ONE TBODY PER DISK, so the capacity row and the activity row below it
+      // are a single object rather than two rows that happen to be adjacent.
+      // With twelve disks stacked, "which drive is this 133 MB/s attached to?"
+      // was a question you had to answer by counting, and the answer was
+      // always the row ABOVE - the opposite of the reading order.
+      // --dcol carries the disk's own palette colour into the outline, tying
+      // the box to the name at the top of it.
+      return `<tbody class="dgrp${hot?' dhot':''}${watched?' dwatch':''}${
+                       moving?' dwork':''}" style="--dcol:${dc}">
+        <tr><td class="mono" style="color:${dc}">${esc(d.pool_disk)}</td>
+        <td class="num">${fmt(d.n)}</td>
+        <td class="num dim dcol-size">${gb(d.total)}</td>
+        <td class="num dim dcol-used">${gb(d.used!=null?d.used:d.bytes)}</td>
+        <td class="dcol-bar"><div class="bar"><i style="width:${pct}%;background:${col}"></i></div>
+            <div style="font-size:11px"><span class="fillpct ${
+                out?(out>0?'fill-hi':'fill-lo'):''}"${out?` style="opacity:${
+                  (0.78+0.22*outStrength(pct)).toFixed(2)};font-weight:${
+                  outStrength(pct)>0.45?600:500}" title="${
+                  Math.abs(pct-midFill).toFixed(1)} points ${
+                  out>0?'fuller':'emptier'} than the pool median of ${
+                  midFill.toFixed(1)}% — half the disks sit within ${
+                  (mad||0).toFixed(1)} of it. About ${
+                  gb(Math.abs(pct-midFill)/100*(d.total||0))} of difference on
+                  this disk. A gap that keeps growing means the balancer has
+                  stopped, or new files are all landing in one place."`:''}>${
+                pct}% full</span><span class="dcol-of dim">
+              · ${gb(d.used!=null?d.used:d.bytes)} of ${gb(d.total)}</span></div></td>
+        <td class="num dcol-free" style="color:${col}">${d.free!=null?gb(d.free):'—'}</td></tr>
+        <tr class="iorow${(moving||hot)?' io-busy':''}"><td colspan="6"
+            ><div class="diskio">${act}</div></td></tr></tbody>`;
+    }).join('')
+    // pool totals, so you can see the whole array at a glance
+    +`<tbody class="dgrp dpool">
+      <tr>
+        <td class="mono"><b>POOL</b></td><td class="num"><b>${fmt(
+          rows.reduce((a,d)=>a+(d.n||0),0))}</b></td>
+        <td class="num dcol-size"><b>${gb(tot)}</b></td>
+        <td class="num dcol-used"><b>${gb(usd)}</b></td>
+        <td class="dcol-bar"><div class="bar"><i style="width:${tot?(usd/tot*100).toFixed(1):0}%;
+             background:var(--acc)"></i></div>
+            <div class="dim" style="font-size:11px">${tot?(usd/tot*100).toFixed(1):0}% of pool<span
+              class="dcol-of"> · ${gb(usd)} of ${gb(tot)}</span></div></td>
+        <td class="num dcol-free"><b>${gb(fre)}</b></td></tr>
+      <tr class="iorow"><td colspan="6"><div class="diskio">${(()=>{
+            const r=(_lastIo||{}).read_bps||0, w=(_lastIo||{}).write_bps||0;
+            const L=(_diskLoad.disks)||[];
+            const nh=L.filter(x=>x.hot).length;
+            const ext=L.reduce((a,x)=>a+(x.ext_bps||0),0);
+            const jobs=((_lastIo||{}).by_disk||[])
+                        .reduce((t,x)=>t+(x.jobs||0),0);
+            // THE AVERAGE, IN THE SAME PLACE THE ROWS PUT THEIR PERCENTAGE.
+            //
+            // This slot used to count hot disks - "2/12" - on the reasoning
+            // that an average is near zero whenever a single spindle is
+            // pinned. True, and it made the totals row the one line on the
+            // panel that did not summarise the column above it: eleven busy
+            // percentages and then a fraction of something else.
+            //
+            // Averaging is the honest summary of "how loaded is the array",
+            // which is the question this row exists to answer, and the case
+            // the count protected against is not lost - the hot tally moves
+            // into the tooltip, and a pinned disk is already unmissable in
+            // its own row directly above.
+            const avg = L.length
+              ? L.reduce((t,x)=>t+(x.busy||0),0)/L.length : 0;
+            const tb  = L.reduce((t,x)=>t+(x.bps||0),0);
+            const tm  = L.reduce((t,x)=>t+(x.mine_bps||0),0);
+            // SAME markup as the per-disk rows. Built differently, the totals
+            // row laid out differently and pulled its numbers out of line with
+            // the column above it.
+            const pr=(cls,lbl,short,val)=>
+              `<span class="io-p"><span class="io-l"><span class="lg">${lbl}</span>`
+              +`<span class="sm">${short}</span></span>`
+              +`<b class="${cls} io-v">${val}</b></span>`;
+            const gp=(cls,label,body)=>
+              `<span class="io-grp ${cls}"><span class="io-gl">${label}</span>${body}</span>`;
+            // The array-wide version of the per-disk busy chip: same shape,
+            // same split bar, averaged instead of measured on one spindle.
+            const seg=(v,c)=>`<i style="width:${
+                Math.max(0,Math.min(100,(tb? v/tb*100 : 0)*(avg/100)))
+              }%;background:${c}"></i>`;
+            const ac = nh ? 'var(--warn)' : (avg>=10 ? 'var(--acc)' : '#8b98a6');
+            const head = L.length
+              ? `<span class="io-p io-busyp" title="Mean busy across all ${
+                   L.length} pool disks over the last ${_diskLoad.window_s||20}s.
+${nh?nh+' of '+L.length+' held above '+(_diskLoad.thresh||85)
+     +'% by something other than nuarr — new jobs are steered to the rest.'
+   :'No disk is under sustained load from anything but nuarr.'}
+An average hides a single pinned spindle, so read it with the rows above rather than instead of them."
+                 ><span class="io-l"><span class="lg">Busy avg</span><span class="sm">B</span></span>
+                  <b class="io-v" style="color:${ac}">${avg.toFixed(0)}%</b>
+                  <span class="iobar">${seg(tm,'var(--acc)')}${
+                    seg(tb-tm,'var(--warn)')}</span></span>`
+              : '';
+            // The job count belongs here as much as on the rows - it is the
+            // one number that says whether the read/write figures are one
+            // worker or eight.
+            const jobTag = jobs
+              ? `<span class="io-j">${jobs}<span class="lg"> job${
+                  jobs===1?'':'s'}</span><span class="sm">j</span></span>` : '';
+            const ours = (r||w)
+              ? gp('io-ours','nuarr',
+                   pr('m-read','Read','R',mbps(r))+pr('m-write','Write','W',mbps(w))
+                   + jobTag)
+              : '';
+            const sys = ext>0
+              ? gp('io-sys','system', `<b class="m-other io-v">${mbps(ext)}</b>`)
+              : '';
+            // EVERY VIEWER ON THE ARRAY, added up. The per-disk groups answer
+            // "is this spindle spoken for"; this answers "how much of the pool
+            // is people watching", which is the figure you want when deciding
+            // whether the queue has room - and it was the one group missing
+            // from the totals while the other two were already there.
+            //
+            // Counted across DISKS rather than sessions, so two viewers on the
+            // same spindle are one entry in the sum and two in the count, the
+            // same arithmetic the rows above use.
+            const V=Object.values(_plexDetail||{});
+            const vN=V.reduce((t,x)=>t+(x.viewers||0),0);
+            const vB=V.reduce((t,x)=>t+(x.kbps||0),0)*125;
+            const view = vN
+              ? gp('io-view', vN>1?vN+' viewers':'viewer',
+                   vB>=1000 ? `<b class="m-view io-v">${mbps(vB)}</b>`
+                            : '<span class="io-idle">paused</span>')
+              : '';
+            // SAME FOUR SLOTS as the rows above, so the totals sit directly
+            // under the columns they total rather than in their own
+            // arrangement - which is what a summary row has to do or it stops
+            // reading as one.
+            const sl=(c,x)=>`<span class="io-slot ${c}">${x}</span>`;
+            const og=(c,l,b)=>`<span class="io-grp ${c} off"><span class="io-gl"
+              >${l}</span><span class="io-off">${b||'—'}</span></span>`;
+            return sl('sl-busy', head || og('io-busyp','busy avg','—'))
+                 + sl('sl-ours', ours || og('io-ours','nuarr','no jobs'))
+                 + sl('sl-sys',  sys  || og('io-sys','system'))
+                 + sl('sl-view', view || og('io-view','viewer'));
+            })()}</div></td></tr></tbody>`
+    +'</table>';
+}
+
+let drillQuery=null;
+function drillUrl(extra){
+  const q=drillQuery||{}; const p=new URLSearchParams();
+  if(q.state) p.set('state',q.state);
+  if(q.unmanaged) p.set('unmanaged','1');
+  if(q.extras) p.set('extras','1');
+  if(q.errors) p.set('errors','1');
+  if(q.library) p.set('library',q.library);
+  const t=document.getElementById('drillQ');
+  if(t && t.value) p.set('q',t.value);
+  // the Preview button asks for exactly the N that would be queued
+  p.set('limit', extra || q.limit || 500);
+  return '/api/files?'+p.toString();
+}
+async function drill(q){
+  const p=document.getElementById('drillPanel');
+  // clicking the same tile again closes the panel - a toggle, not a one-way door
+  const same = drillQuery && JSON.stringify(drillQuery)===JSON.stringify(q);
+  if(same && p.style.display!=='none'){ p.style.display='none'; return; }
+  drillQuery=q;
+  drillSchedule();          // Held polls faster than the rest; pick that up now
+  p.style.display='';
+  document.getElementById('drillTitle').textContent=q.t||'Files';
+  document.getElementById('drillQ').value='';
+  // Skeleton immediately - the unfiltered list is a real query over the whole
+  // library, and an empty panel for a quarter second reads as a broken click.
+  _drillKey='';
+  const bb=document.getElementById('drillBody');
+  if(bb) bb.innerHTML='<div class="skel" style="padding:14px">'
+    +'<i style="width:65%"></i><i style="width:82%"></i><i style="width:48%"></i>'
+    +'<i style="width:74%"></i><i style="width:57%"></i></div>';
+  await drillRefresh(true);
+  p.scrollIntoView({behavior:'smooth',block:'nearest'});
+}
+// Keep the open drill-down current. The tiles above it update live, so a
+// stale list underneath them contradicts the numbers you just clicked on.
+// Guarded the same way as the job poll: skip if one is in flight, and never
+// repaint while the reader has scrolled away from the top.
+//
+// AND NEVER WHILE A LOG IS OPEN. The scrollTop>40 test was only half a guard:
+// it protects a reader who has scrolled the OUTER list, but an expanded
+// transcript sits inside its own <pre>, so you can be four hundred lines deep
+// in a log with the list still at scrollTop 0. Every 5 s the tick then rebuilt
+// the whole table, the <pre> was recreated from scratch, and the log jumped
+// back to its first line - mid-read. A finished job's transcript does not
+// change, so there is nothing to gain by repainting it.
+let _drillBusy=false;
+async function drillTick(){
+  const p=document.getElementById('drillPanel');
+  if(!p || p.style.display==='none' || !drillQuery) return;
+  if(_drillBusy) return;
+  if(_drillLogId) return;                    // frozen: a transcript is open
+  const box=document.getElementById('drillBody');
+  if(box && box.scrollTop>40) return;        // frozen: they are reading it
+  _drillBusy=true;
+  try{ await drillRefresh(true); } finally{ _drillBusy=false; }
+  drillSchedule();
+}
+// THE HELD LIST IS A COUNTDOWN, so it needs a countdown's refresh rate. Every
+// other drill-down is a list of facts that change when a job finishes; Held
+// shows seconds ticking against the 30 s no-reader window, and at 5 s that
+// read as a number that jumped rather than one that ran. Fast while Held is
+// open, unchanged for everything else.
+let _drillTimer=null;
+function drillSchedule(){
+  clearTimeout(_drillTimer);
+  const held = !!(drillQuery && drillQuery.state==='new');
+  _drillTimer=setTimeout(drillTick, held ? 1500 : 5000);
+}
+drillSchedule();
+
+// The last thing actually written into #drillBody. Rebuilding innerHTML with
+// byte-identical markup is not free - it drops the scroll position, kills any
+// text selection, and restarts the caret animation - so the poll compares
+// first and writes only on a real change.
+let _drillKey='';
+async function drillRefresh(force){
+  // A quiet pulse while the fetch is in flight, so a background refresh is
+  // visible without repainting anything that would drop scroll or selection.
+  const dot=document.getElementById('drillLive');
+  if(dot) dot.style.opacity='1';
+  let d;
+  try{ d=await (await fetch(drillUrl())).json(); }
+  finally{ if(dot) setTimeout(()=>{dot.style.opacity='0';},250); }
+  // The Settles column only means anything for held files.
+  const held=d.rows.some(r=>r.state==='new');
+  document.getElementById('drillCount').textContent=
+    `${fmt(d.rows.length)} shown of ${fmt(d.total)}`
+    // "hold is 5 min" described a rule that no longer exists: nothing waits on
+    // a clock now, it waits on the file being free.
+    + (held && d.lock_quiet_s ? ` · promoted after ${Math.round(d.lock_quiet_s)}s with no reader` : '')
+    // Say so, rather than letting a frozen list look like a broken one.
+    + (_drillLogId ? ' · paused while you read the log' : '');
+  const html = d.rows.length
+    // Path lives UNDER the title, not in its own column. As a column it wrapped
+    // to two or three lines and made every row a different height, so the size,
+    // disk and state values never read across as a row.
+    ? '<table class="fixed vtop"><tr><th>Title</th>'
+      +'<th class="num nb" style="width:90px">Size</th>'
+      +'<th class="nb" style="width:110px">Disk</th>'
+      +'<th class="nb" style="width:118px">When</th>'
+      +(held?'<th class="nb" style="width:150px">Settles</th>':'')
+      +'<th class="nb" style="width:100px">State</th></tr>'
+      +d.rows.map(r=>{
+        // THE STATE PILL IS A BUTTON when there is a job behind it.
+        //
+        // The error list gave you a one-line summary - "ffmpeg exited
+        // 3199971767" - and no way to reach the transcript that explains it,
+        // short of going to the log tab and searching for the title. The
+        // Finished panel already had this; the drill-down did not.
+        const open = _drillLogId && _drillLogId===r.job_id;
+        const cols = 5 + (held?1:0);
+        // WHEN: processed beats updated beats file mtime, and the label says
+        // which one it is - "processed 2h ago" and "seen 3d ago" answer
+        // different questions and were previously both invisible.
+        const ts = r.processed_at ? [r.processed_at, 'processed']
+                 : r.updated_at   ? [r.updated_at,   'updated']
+                 : r.mtime        ? [r.mtime,        'file date'] : null;
+        const when = ts
+          ? `<span title="${ts[1]} ${new Date(ts[0]*1000).toLocaleString()}">
+               ${ago(ts[0])}<div class="dim" style="font-size:9px">${ts[1]}</div></span>`
+          : '<span class="dim">—</span>';
+        // Two 'done' bubbles used to render side by side - a plain pill when
+        // no job exists and a caret button when one does - identical text,
+        // different behaviour, nothing saying why. The button now SAYS it
+        // opens a log, and the plain pill explains itself on hover.
+        const pill = r.job_id
+          ? `<button class="statebtn ${stateClass(r.state)}${open?' on':''}"
+                     title="this state came from a job — click for its full log"
+                     onclick="drillLog('${esc(r.job_id)}')">${esc(r.state)}
+               <span class="caret">${open?'▾ log':'▸ log'}</span></button>`
+          : `<span class="pill ${stateClass(r.state)}"
+               title="no job recorded — this state came from a scan">${esc(r.state)}</span>`;
+        // ONLY content errors get the destructive button. A path-too-long
+        // block gets the naming remedy instead, because re-downloading it
+        // lands at the same path and blocks again - having deleted a good
+        // file to do it. Unrecognised errors get nothing: an error string
+        // nobody has classified must not arrive with a delete button already
+        // attached.
+        const rk = r.refetch_kind;
+        const act = rk==='content'
+          ? `<button class="refetch" title="reject the release this came from and ask the arr for another"
+                     onclick="refetchAsk(${r.id})">Blocklist &amp; re-download</button>`
+          : (rk && r.refetch_why
+              ? `<div class="dim sub">fix: ${esc(r.refetch_why)}</div>` : '');
+        // WHY, with the class of reason coloured differently: an error is
+        // red, an unmanaged file's adoption story is amber, and a plain note
+        // ("no work needed") stays dim - one red style for all three made
+        // every drill list look like a fault report.
+        const bad = r.state==='error' || r.state==='blocked';
+        let why = r.state_reason
+          ? `<div class="${bad?'err':'dim'} sub">${esc(r.state_reason)}</div>` : '';
+        if(r.adopt_state){
+          const atext = r.adopt_state==='no_folder'
+            ? 'no arr has a folder for this path — it cannot be adopted automatically'
+            : r.adopt_state==='duplicate'
+            ? 'the episode/movie already has a file — this is a leftover copy'
+            : r.adopt_state==='adopted'
+            ? 'adopted by the arr after a rescan'
+            : `adoption: ${r.adopt_state}`
+              + (r.adopt_attempts?` (attempt ${r.adopt_attempts} of 3)`:'');
+          why += `<div class="warn sub" style="color:var(--warn)">${esc(atext)}</div>`;
+        }
+        if(r.subocr_state==='rejected')
+          why += `<div class="dim sub">subtitle OCR rejected this file — see reason above</div>`;
+        const main = `<tr class="${open?'rowopen':''}">
+         <td class="wrap"><div>${esc(r.label||r.title||'')}</div>
+           ${why}
+           ${act}
+           <div class="mono dim sub">${esc(r.path||'')}</div></td>
+         <td class="num dim nb">${gb(r.size)}</td>
+         <td class="mono nb" style="color:${r.pool_disk?diskColor(r.pool_disk)
+           :'var(--dim)'}">${esc(r.pool_disk||'—')}</td>
+         <td class="nb" style="font-size:11px">${when}</td>
+         ${held?`<td class="nb">${settleCell(r)}</td>`:''}
+         <td class="nb">${pill}</td></tr>`;
+        if(!open) return main;
+        return main + `<tr class="logrow"><td colspan="${cols}">
+            <div class="loghead">
+              <span class="mono dim">job ${esc(r.job_id)}</span>
+              <a href="/api/logs/job/${esc(r.job_id)}/raw" target="_blank">open as text</a>
+              <button onclick="drillLog('${esc(r.job_id)}')">close</button>
+            </div>
+            <pre class="joblog">${_drillLogHtml||'loading…'}</pre></td></tr>`;
+      }).join('')
+      +'</table>'
+    : '<div class="dim" style="padding:14px">nothing matches</div>';
+
+  const box=document.getElementById('drillBody');
+  if(!box) return;
+  if(!force && html===_drillKey) return;     // identical markup: leave it alone
+  _drillKey=html;
+  // Hold the scroll position across the rebuild. Even a genuine change - one
+  // file leaving the error list - should not throw the reader back to the top
+  // of the other ninety.
+  const top=box.scrollTop;
+  box.innerHTML=html;
+  if(top) box.scrollTop=top;
+}
+
+// Which drill row has its log open, and the transcript for it. Separate from
+// the Finished panel's openLogId so the two can be open at once without
+// fighting over one variable.
+let _drillLogId=null, _drillLogHtml='';
+async function drillLog(id){
+  if(!id) return;
+  if(_drillLogId===id){ _drillLogId=null; _drillLogHtml=''; return drillRefresh(true); }
+  _drillLogId=id; _drillLogHtml='loading…';
+  await drillRefresh(true);                    // show the open row immediately
+  try{
+    const j=await (await fetch('/api/logs/job/'+encodeURIComponent(id))).json();
+    const rows=j.rows||[];
+    _drillLogHtml = rows.length
+      ? rows.map(l=>{
+          const c = l.level==='error' ? 'var(--bad)'
+                  : l.level==='warn'  ? 'var(--warn)'
+                  : l.level==='ok'    ? 'var(--ok)' : '';
+          const t = l.at ? new Date(l.at*1000).toLocaleTimeString() : '';
+          return `<span class="dim">${esc(t)}</span>  `
+               + `<span${c?` style="color:${c}"`:''}>${esc(l.text||'')}</span>`;
+        }).join('\n')
+      : 'no transcript kept for this job';
+  }catch(e){ _drillLogHtml='could not load the log'; }
+  drillRefresh(true);
+}
+
+// WHEN A HELD FILE BECOMES ELIGIBLE, from the rule that actually applies.
+//
+// This used to count down mtime + hold_minutes, which mark_eligible() stopped
+// using when the hold became lock-based. The cell showed four minutes left
+// while the header above it said "promoted after 30s with no reader", and both
+// were rendered from the same response.
+//
+// The rule is now one sentence: the file must be openable exclusively, and
+// must have STAYED that way for 30 s. So there is a countdown only while the
+// file is free and the clock is running. A locked file has no deadline at all
+// - the clock has not started, and nuarr cannot know when Plex will stop
+// playing. Printing a number there would be inventing one.
+function settleCell(r){
+  const L=r.lock;
+  if(L && L.locked){
+    const who=(L.holders||[]).join(', ')||'another program';
+    return `<span class="pill p-warn" title="Held because the file cannot be opened exclusively — starting a job now would fight this reader for the spindle, or fail the commit outright. The 30s clock has not started; it starts when this program lets go.
+Holder: ${esc(who)}">in use</span>
+            <div class="dim sub">${esc(who)}</div>
+            <div class="dim sub">${esc(r.settle_note||'')}</div>`;
+  }
+  if(L && !L.locked){
+    // Free, and the clock is running. One clean probe proves nothing - Plex
+    // opens and closes a file repeatedly while scanning - so the bar shows how
+    // much of the evidence has been gathered.
+    const need=L.needs_s||30, got=Math.min(L.quiet_for_s||0, need);
+    const left=r.settles_in_s;
+    if(left>0){
+      const pct=Math.max(0,Math.min(100, got/need*100));
+      return `<span class="pill p-acc" title="The file is free right now, but the hold needs it to STAY free — one clean probe could just be a gap between two reads.">settling</span>
+              <div class="dim sub">${hms(left)} left
+                <span class="lockbar"><i style="width:${pct.toFixed(0)}%"></i></span></div>`;
+    }
+    // Clock satisfied. It is promoted by the settling loop, which runs every
+    // few seconds while anything is held - not "at next scan", which was the
+    // old answer and was out by up to three hours.
+    return `<span class="pill p-ok">ready</span>
+            <div class="dim sub">on the next check</div>`;
+  }
+  // No probe yet. Says so rather than showing a dash, which read as "unknown
+  // and possibly stuck" on a file that had simply just arrived.
+  return `<span class="pill p-acc">queued to check</span>
+          <div class="dim sub">${esc(r.settle_note||'waiting for its first check')}</div>`;
+}
+function drillRaw(){ window.open(drillUrl(5000).replace('/api/files?','/api/files/raw?'),'_blank'); }
+
+// ---------------------------------------------------------------- refetch --
+// Two steps, always. The first asks the arr what rejecting this file would
+// actually mean and shows it; only the second acts. The plan is worth the
+// round trip because its answer is frequently "there is nothing to blocklist"
+// - about four files in five have no surviving grab record - and that changes
+// the offer from "reject this release" to "delete it and hope", which the
+// person clicking deserves to know before they commit, not after.
+async function refetchAsk(id){
+  let p;
+  try{ p = await (await fetch(`/api/files/${id}/refetch`)).json(); }
+  catch(e){ return alert('could not reach the arr: '+e); }
+
+  if(!p.ok && !p.can_search){
+    return alert(`Cannot re-download this file.\n\n${p.why||''}` +
+                 (p.remedy?`\n\nWhat would fix it:\n${p.remedy}`:''));
+  }
+  const gb = p.size ? (p.size/1073741824).toFixed(2)+' GB' : 'unknown size';
+  let msg = `${p.title||''}\n${gb}\n\nWhy this is offered:\n  ${p.explain||''}\n\n`;
+  if(p.grab_id){
+    msg += `This will BLOCKLIST the release:\n  ${p.release||'(unnamed)'}\n`
+         + `  via ${p.indexer||'unknown indexer'}\n\n`
+         + `${p.arr} will then search for a replacement.\n`;
+  }else{
+    msg += `There is no grab record to blocklist.\n\n`
+         + `${p.arr} will delete the file and search again.\n`;
+  }
+  if(p.warning) msg += `\nWARNING\n  ${p.warning}\n`;
+  msg += `\nThe file is deleted. This cannot be undone from nuarr.\n\nProceed?`;
+  if(!confirm(msg)) return;
+
+  const r = await (await fetch(`/api/files/${id}/refetch?confirm=${id}`,
+                               {method:'POST'})).json();
+  alert(r.ok ? 'Done:\n\n  ' + (r.did||[]).join('\n  ')
+             : 'Failed:\n\n' + (r.why||'unknown')
+               + ((r.did&&r.did.length)?'\n\nbut this had already happened:\n  '
+                  + r.did.join('\n  '):''));
+  drillRefresh(true);
+  loadAll();                       // the Errors tile count has just changed
+}
+
+async function loadLibs(){
+  const d=await (await fetch('/api/libraries')).json();
+  const sc=d.scan||{};
+  const busy=sc.running;
+  // A bare "scanning all" gave no way to tell a slow pass from a wedged one.
+  // Show which disk of how many, the library, and the running file count.
+  const p=d.progress||{};
+  // Prefer the scanner's live sub-phase over the coarse one on STATE.
+  const phase=p.phase||sc.phase||'';
+  const walking=/walking/i.test(phase);
+  let detail='';
+  if(busy){
+    const bits=[];
+    // The disk counter only means anything DURING the walk. Leaving it up
+    // afterwards showed a frozen 12/12 and looked like a hang.
+    if(walking && p.disks){
+      if(p.disk) bits.push(`disk ${p.disk_i}/${p.disks} (${esc(p.disk)})`);
+      if(p.library) bits.push(esc(p.library));
+    }
+    if(p.files) bits.push(`${fmt(p.files)} files`
+                          + (p.rate?` @ ${fmt(Math.round(p.rate))}/s`:''));
+    if(p.detail) bits.push(esc(p.detail));
+    if(p.started) bits.push(hms(Math.round(Date.now()/1000-p.started)));
+    detail=bits.length?' — '+bits.join(' · '):'';
+  }
+  // WHOLE-SCAN progress, not just the disk walk. The old bar tracked disks
+  // only, so it filled to 100% about a third of the way through the pass and
+  // then sat there for the ~130 s Sonarr fetch looking stuck. The server now
+  // reports an overall percentage weighted by each phase's measured cost.
+  const phases = d.phases || [];
+  const cur = p.phase_key;
+  const steps = phases.map(f=>{
+    const i = phases.findIndex(x=>x.key===f.key);
+    const ci = phases.findIndex(x=>x.key===cur);
+    const state = ci<0 ? 'todo' : (i<ci ? 'done' : (i===ci ? 'now' : 'todo'));
+    const col = state==='done' ? 'var(--ok)'
+              : state==='now'  ? 'var(--acc)' : 'var(--dim)';
+    const t = (p.timings||{})[f.key];
+    return `<span class="scanstep" style="color:${col}"
+             title="${esc(f.label)}${t?` — took ${t}s`:''}">${
+             state==='done'?'●':(state==='now'?'◉':'○')}</span>`;
+  }).join('');
+
+  const pct = Math.max(0, Math.min(100, p.pct||0));
+  // The heading keeps only the live marker; the numbers moved into the panel.
+  document.getElementById('scanPhase').innerHTML = busy
+    ? `<span class="dot"></span>scanning${sc.library&&sc.library!=='all'?' '+esc(sc.library):''}`
+    : (sc.result? `last: ${esc((sc.result.text||'').split('\n')[0])}` : '');
+
+  const sp=document.getElementById('scanPanel');
+  if(sp){
+    if(!busy){ sp.style.display='none'; sp.innerHTML=''; }
+    else{
+      sp.style.display='';
+      // Elapsed matters as much as the estimate. An ETA that stops moving is
+      // ambiguous; an elapsed clock that keeps ticking next to a stalled bar
+      // says plainly that something is stuck.
+      const el = p.started ? Math.max(0, Math.round(Date.now()/1000 - p.started)) : null;
+      // Per-phase step list with the running one named, rather than 7 dots you
+      // have to hover to identify.
+      const ci = phases.findIndex(x=>x.key===cur);
+      const list = phases.map((f,i)=>{
+        const st = ci<0 ? 'todo' : (i<ci?'done':(i===ci?'now':'todo'));
+        const t=(p.timings||{})[f.key];
+        const col = st==='done'?'var(--ok)':(st==='now'?'var(--acc)':'var(--dim)');
+        const mark = st==='done'?'●':(st==='now'?'◉':'○');
+        return `<span class="scanrow" style="color:${col}">`
+              +`<span class="scanmark">${mark}</span>${esc(f.label)}`
+              +(t?`<span class="dim scant">${t}s</span>`
+                 :(st==='now'&&p.phase_started
+                    ? `<span class="dim scant">${hms(Math.max(0,Math.round(
+                        Date.now()/1000-p.phase_started)))}</span>`:''))
+              +`</span>`;
+      }).join('');
+      const facts=[];
+      if(p.disks) facts.push(`disk <b>${p.disk_i||0}</b>/<b>${p.disks}</b>`
+                            +(p.disk?` <span class="dim">${esc(p.disk)}</span>`:''));
+      if(p.files) facts.push(`<b>${fmt(p.files)}</b> files seen`);
+      if(p.rate)  facts.push(`<b>${fmt(Math.round(p.rate))}</b>/s`);
+      if(p.detail) facts.push(`<span class="dim">${esc(p.detail)}</span>`);
+      sp.innerHTML=
+        `<div style="padding:10px 14px;border-bottom:1px solid var(--line)">
+           <div style="display:flex;justify-content:space-between;align-items:baseline;
+                       gap:12px;flex-wrap:wrap;margin-bottom:6px">
+             <span style="font-size:14px"><b>${esc(phase)}</b>
+               <span class="dim">· step ${p.phase_i||0} of ${phases.length||7}</span></span>
+             <span style="font-size:13px">
+               <b>${pct.toFixed(0)}%</b>
+               ${p.eta_s!=null?`<span class="dim">· ~${hms(p.eta_s)} left</span>`
+                 : p.overrun_s!=null
+                   // NOT "~1s left". The estimate is the thing that turned out
+                   // to be wrong, so say that rather than inventing a number -
+                   // this bar sat at 99% claiming a second remained while the
+                   // phase ran twelve minutes over.
+                   ? `<span class="warn">· over the ${hms(p.overrun_s)} estimate</span>`
+                   : ''}
+               ${el!=null?`<span class="dim">· ${hms(el)} elapsed</span>`:''}
+             </span>
+           </div>
+           <div class="bar big"><i style="width:${pct.toFixed(1)}%"></i></div>
+           ${facts.length?`<div class="scanfacts">${facts.join('<span class="dim"> · </span>')}</div>`:''}
+           <div class="scanlist">${list}</div>
+         </div>`;
+    }
+  }
+
+  // Next scheduled scan - the schedule is what actually promotes settled files.
+  const ns=document.getElementById('nextScan');
+  if(ns){
+    if(!d.scan_every_min) ns.innerHTML='<span class="pill p-warn">auto-scan off</span>';
+    else if(busy) ns.innerHTML='<span class="dim">running now</span>';
+    else if(d.next_scan_at){
+      const left=Math.max(0,Math.round(d.next_scan_at-Date.now()/1000));
+      const t=new Date(d.next_scan_at*1000);
+      ns.innerHTML=`<span class="dim">next auto-scan in ${hms(left)} · `
+        +`${String(t.getHours()).padStart(2,'0')}:${String(t.getMinutes()).padStart(2,'0')}`
+        +` · every ${d.scan_every_min} min</span>`;
+    } else ns.innerHTML='';
+  }
+  saveBrowseScroll();          // the next line destroys the open listing
+  document.getElementById('libs').innerHTML='<table class="fixed"><tr><th>Library</th>'
+    +'<th class="num" style="width:80px">Files</th><th class="num" style="width:90px">Size</th>'
+    +'<th style="width:170px"></th></tr>'
+    +d.libraries.map(l=>`<tr data-lib="${esc(l.name)}">
+      <td class="wrap">${esc(l.name)}
+        <div class="dim mono" style="font-size:11px">${esc(l.path)}${l.exists?'':' <span class="err">(missing)</span>'}</div>
+        <div style="font-size:11px;margin-top:3px">
+          <!-- Reads as a sentence about WORK, in the order you care about it:
+               what is left, what is moving, what is finished, what is wrong.
+               "cancelled" used to sit here as a permanent historical tally and
+               looked like a backlog; it now only appears when those files
+               genuinely still need doing. -->
+          <span style="color:var(--ok)">${fmt(l.eligible)} eligible</span>
+          ${l.inflight?`<span style="color:var(--acc)"> · ${fmt(l.inflight)} in progress</span>`:''}
+          <span class="dim"> · ${fmt(l.held)} held · ${fmt(l.done)} done</span>
+          ${l.errors?`<span class="err lnk" onclick="drill({state:'error',library:'${esc(l.name)}',t:'Errors — '+${JSON.stringify(l.name)}})"> · ${fmt(l.errors)} error</span>`:''}
+          ${l.blocked?`<span class="warn lnk" onclick="drill({state:'blocked',library:'${esc(l.name)}',t:'Blocked — '+${JSON.stringify(l.name)}})"> · ${fmt(l.blocked)} blocked</span>`:''}
+          ${l.cancelled?`<span class="warn" title="cancelled and never re-run — these still need doing"> · ${fmt(l.cancelled)} cancelled, still to do</span>`:''}
+          ${l.failed_jobs?`<span class="err" title="the last attempt failed and nothing has been queued since"> · ${fmt(l.failed_jobs)} failed, still to do</span>`:''}
+        </div></td>
+      <td class="num">${fmt(l.files)}</td><td class="num dim">${gb(l.bytes)}</td>
+      <td style="white-space:nowrap">
+        <button ${busy?'disabled':''} onclick="rescan('${esc(l.name)}')">Rescan</button>
+        <button onclick="browse('${esc(l.name)}')"
+              title="list this library's folders and files, with what has been processed"
+              >Browse</button>
+      </td></tr>`).join('')+'</table>';
+  // Put an open browser back after the table is rebuilt, or it vanishes every
+  // 15 s - and every 2 s during a scan, which is exactly when you are most
+  // likely to be watching a folder fill up.
+  restoreBrowse();
+  if(busy) setTimeout(loadLibs,2000);
+}
+async function rescan(lib){
+  const u='/api/libraries/rescan'+(lib?'?library='+encodeURIComponent(lib):'');
+  const r=await fetch(u,{method:'POST'});
+  if(!r.ok){ const j=await r.json(); alert(j.detail||'scan already running'); }
+  loadLibs();
+}
+// ---- library browser -----------------------------------------------------
+// Was "open Explorer on the server", which only did anything if you were sat
+// at the machine - from any other browser it opened a window nobody could see.
+// This expands inline under the library row, the same way Watch expands under
+// a worker card, and answers the question you actually open a folder to ask:
+// what is in here, what has been done, and what is this file?
+let browsePath=null, browseLib=null;
+// Library names contain spaces ("Anime Movies"), which makes both a quoted
+// attribute selector and an element id awkward. Match on the dataset property
+// instead of building a selector, and derive a safe id - CSS.escape is for
+// SELECTORS and silently breaks getElementById, which is what stopped the
+// panel appearing at all the first time.
+function browseRow(lib){
+  return [...document.querySelectorAll('tr[data-lib]')]
+    .find(r => r.dataset.lib === lib) || null;
+}
+function browseId(lib){ return 'browse-' + lib.replace(/[^a-zA-Z0-9]+/g,'_'); }
+// The libraries table is repainted from innerHTML by loadLibs(), which runs on
+// the 15 s summary poll and every 2 s while a scan is running - so an inserted
+// row is wiped moments after it appears. Keep the rendered panel and put it
+// back after each repaint, the same way the worker cards keep the watch log.
+let browseHtml='';
+// Scroll position of the open listing, kept across the table rebuild. Without
+// it a folder list jumped back to the top every 15 s - and every 2 s during a
+// scan, which is exactly when you are most likely to be reading it.
+let browseScroll=0;
+function restoreBrowse(){
+  if(!browseLib || !browseHtml) return;
+  const row=browseRow(browseLib);
+  if(!row || document.getElementById(browseId(browseLib))) return;
+  const tr=document.createElement('tr');
+  tr.id=browseId(browseLib);
+  tr.className='browserow';
+  tr.innerHTML='<td colspan="4"><div class="browsebox">'+browseHtml+'</div></td>';
+  row.after(tr);
+  const list=tr.querySelector('.blist');
+  if(list && browseScroll) list.scrollTop=browseScroll;
+  // An expanded file's track list is not part of browseHtml, so it has to be
+  // re-applied too - otherwise opening one and waiting two seconds closed it
+  // again, which is what made this look like it simply did not work.
+  if(openFile && openFileHtml){
+    const fr=tr.querySelector('.bfile[data-fk="'+openFile+'"]');
+    if(fr && !(fr.nextElementSibling||{}).classList?.contains('minfo')){
+      const box=document.createElement('div');
+      box.className='minfo';
+      box.innerHTML=openFileHtml;
+      fr.after(box);
+    }
+  }
+}
+// Remember where the reader was, just before loadLibs() wipes the table.
+function saveBrowseScroll(){
+  const list=document.querySelector('.browsebox .blist');
+  if(list) browseScroll=list.scrollTop;
+}
+async function browse(lib, path){
+  const row=browseRow(lib);
+  // Same row again with no new path = close.
+  if(browseLib===lib && !path){
+    closeBrowse(); return;
+  }
+  if(browseLib && browseLib!==lib) closeBrowse();
+  browseLib=lib;
+  let host=document.getElementById(browseId(lib));
+  if(!host && row){
+    const tr=document.createElement('tr');
+    tr.id=browseId(lib);
+    tr.className='browserow';
+    tr.innerHTML='<td colspan="4"><div class="browsebox"></div></td>';
+    row.after(tr);
+    host=tr;
+  }
+  browseHtml='<div class="skel"><i style="width:60%"></i>'
+            +'<i style="width:80%"></i><i style="width:45%"></i></div>';
+  const box=host && host.querySelector('.browsebox');
+  if(box) box.innerHTML=browseHtml;
+  let d;
+  try{
+    const qs = path ? 'path='+encodeURIComponent(path)
+                    : 'library='+encodeURIComponent(lib);
+    d=await (await fetch('/api/browse?'+qs)).json();
+    if(d.detail) throw new Error(d.detail);
+  }catch(e){
+    browseHtml='<div class="err" style="padding:12px">'+esc(String(e.message||e))+'</div>';
+    const b2=document.querySelector('#'+browseId(lib)+' .browsebox');
+    if(b2) b2.innerHTML=browseHtml;
+    return;
+  }
+  browsePath=d.path;
+  browseHtml=renderBrowse(d);
+  // Re-query: a repaint may have replaced the element while the fetch was in
+  // flight, so the reference captured before the await can be detached.
+  const b3=document.querySelector('#'+browseId(lib)+' .browsebox');
+  if(b3) b3.innerHTML=browseHtml;
+  else restoreBrowse();
+}
+function closeBrowse(){
+  const el=browseLib && document.getElementById(browseId(browseLib));
+  if(el) el.remove();
+  browseLib=null; browsePath=null;
+}
+// Paths ride through onclick as BASE64, exactly like the file rows already
+// do. Inline-JS string literals cannot safely carry arbitrary names: esc()
+// turns ' into an entity, the HTML parser decodes it back BEFORE the JS
+// parses, and the quote terminates the string - which is why the folder
+// "'Tis Time for Torture, Princess" was simply unclickable.
+function b64e(s){ return btoa(unescape(encodeURIComponent(s))).replace(/=+$/,''); }
+function b64d(s){ return decodeURIComponent(escape(atob(s))); }
+function bgo(l64, p64){ browse(b64d(l64), b64d(p64)); }
+function renderBrowse(d){
+  // Breadcrumb from the library root down, so the current location is always
+  // visible and any level of it is one click away.
+  const rel=d.path.slice(d.root.length).split(/[\\/]/).filter(Boolean);
+  let acc=d.root;
+  const L=b64e(d.library);
+  // The root crumb passes the root PATH explicitly. Calling browse(lib) with no
+  // path is the Browse button's toggle - "same library again means close" - so
+  // clicking "Anime Movies" to go home shut the panel instead of navigating to
+  // it. Only the button gets to toggle.
+  const crumbs=[`<span class="crumb" onclick="bgo('${L}','${b64e(d.root)}')">${esc(d.library)}</span>`];
+  for(const part of rel){
+    acc = acc.replace(/[\\/]+$/,'') + '\\' + part;
+    crumbs.push(`<span class="crumb" onclick="bgo('${L}','${b64e(acc)}')">${esc(part)}</span>`);
+  }
+  // The poster rides along once the folder resolves to a single show/movie -
+  // the artwork is the fastest "am I in the right place" check there is.
+  const art = d.poster
+    ? `<img class="bposter" src="${d.poster}" loading="lazy"
+         onerror="this.remove()">` : '';
+  // WHERE THIS TITLE LIVES, AND WHAT IT WAS MADE IN.
+  //
+  // The id is already in the folder name because the arrs put it there, so the
+  // link costs nothing to build. Original language is the field the audio
+  // rules care about and the one thing about a title you cannot learn by
+  // looking at the file - worth showing next to the link it came from.
+  const m = d.meta || {};
+  const langChip = m.orig_lang
+    ? `<span class="pill" style="color:#39d3c3;border-color:#1e5a55"
+         title="the language this was made in — from ${esc(m.provider||'the metadata provider')}, not from the file"
+         >original: ${esc(m.orig_lang)}</span>` : '';
+  const idLink = (m.url && m.provider)
+    ? `<a class="crumb" href="${esc(m.url)}" target="_blank" rel="noopener"
+         title="open this title on ${esc(m.provider)}">${esc(m.provider)} ${esc(m.id||'')} ↗</a>` : '';
+  const imdbLink = m.imdb
+    ? `<a class="crumb" href="${esc(m.imdb)}" target="_blank" rel="noopener">IMDb ↗</a>` : '';
+  // WHAT NUARR TREATS THIS AS, and why.
+  //
+  // The link and the language were already here; the verdict they feed into
+  // was not, and it is the one that decides which audio tracks survive every
+  // file below. Shown with its evidence, because a classification nobody can
+  // check is one nobody can correct - if TheTVDB has mistagged a show, this
+  // row is where you would find out.
+  const KL={anime:'anime', animation:'animation', live:'live action'};
+  let kindChip='';
+  if(m.kind){
+    // Say when the folder and the metadata disagree, and which way it went.
+    // They agree on 98% of this library, so the interesting case is the 2%.
+    const promoted = m.kind!==m.kind_folder;
+    const overruled = m.kind_meta && m.kind!==m.kind_meta;
+    const bits=[];
+    if(m.kind_why) bits.push('metadata says '+(KL[m.kind_meta]||m.kind_meta)
+                             +' — '+m.kind_why);
+    bits.push('folder implies '+(KL[m.kind_folder]||m.kind_folder));
+    if(promoted) bits.push('treated as '+(KL[m.kind]||m.kind)
+      +' because the metadata outranks the folder');
+    if(overruled) bits.push('kept as '+(KL[m.kind]||m.kind)
+      +' because the folder outranks the metadata — the combination only ever '
+      +'moves up, never down, so a thin genre list cannot strip a track');
+    kindChip=`<span class="pill kchip k-${m.kind}" title="${esc(bits.join('\n'))}"
+      >${esc(KL[m.kind]||m.kind)}${promoted||overruled?' *':''}</span>`;
+  }
+  // The genres themselves, so the verdict can be checked against its input.
+  const genreChips=(m.genres||[]).length
+    ? `<span class="bgenres" title="genres as ${esc(m.provider||'the provider')} has them">${
+        m.genres.slice(0,6).map(g=>esc(g)).join(' · ')}</span>` : '';
+  const metaRow = (langChip||idLink||imdbLink||kindChip||genreChips)
+    ? `<div class="bmetarow">${idLink}${imdbLink}${kindChip}${langChip}${genreChips}</div>` : '';
+  const head=`<div style="display:flex;gap:12px;align-items:flex-start">${art}
+    <div style="flex:1;min-width:0">
+      <div class="bcrumbs">${crumbs.join('<span class="sep">›</span>')}
+        <span class="right2"><button onclick="closeBrowse()">Close</button></span></div>
+      <div class="mono dim bpath">${esc(d.path)}</div>
+      ${metaRow}
+    </div></div>`;
+
+  const folders=(d.folders||[]).map(f=>{
+    // A folder's progress is the whole point - "have I done this show yet"
+    // cannot be answered by a file list.
+    const bar = f.pct==null ? '<span class="dim">no tracked files</span>'
+      : `<span class="bmini"><i style="width:${f.pct}%;background:${
+           f.pct>=100?'var(--ok)':'var(--acc)'}"></i></span>
+         <span class="${f.pct>=100?'ok':'dim'}">${f.done}/${f.files}</span>`;
+    return `<div class="brow bdir" onclick="bgo('${L}','${b64e(f.path)}')">
+        <span class="bname">📁 ${esc(f.name)}</span>
+        <span class="bmeta">${bar}</span>
+        <span class="bsize dim">${f.bytes?gb(f.bytes):''}</span></div>`;
+  }).join('');
+
+  const files=(d.files||[]).map(f=>{
+    const st = f.state==null ? ['unknown','dim']
+             : f.state==='done' ? ['done','ok']
+             : f.state==='error' ? ['error','err']
+             : f.state==='eligible' ? ['to do','warn']
+             : [f.state,'dim'];
+    // Media info comes from the stored probe. A file nuarr has not probed says
+    // so rather than showing a row of blanks.
+    const info = f.probed
+      ? `${esc(f.video||'?')}${f.height?' '+f.height+'p':''}`
+        + (f.audio?` · ${esc(f.audio)}`:'')
+        + (f.bitrate?` · ${Math.round(f.bitrate/1000)} kbps`:'')
+        + (f.duration?` · ${Math.round(f.duration/60)} min`:'')
+      : '<span class="dim">not probed</span>';
+    // Clicking a file expands its full track list underneath - the thing you
+    // would otherwise open MediaInfo for.
+    const key=btoa(unescape(encodeURIComponent(f.path))).replace(/=+$/,'');
+    // Fixed columns, not a nested flex blob: state/info/disk each own a
+    // column so every row's values line up under the previous row's. The
+    // old markup packed all three into one auto-sized cell, which is why
+    // the middle of the listing looked ragged.
+    return `<div class="brow bfile" onclick="fileInfo('${key}')"
+                 data-fk="${key}" data-fp="${esc(f.path)}">
+        <span class="bname" title="${esc(f.path)}">${esc(f.name)}</span>
+        <span class="bstate ${st[1]}">${esc(st[0])}</span>
+        <span class="dim binfo">${info}</span>
+        <span class="bdisk mono" style="color:${f.disk?diskColor(f.disk)
+          :'var(--dim)'}">${f.disk?esc(f.disk):''}</span>
+        <span class="bsize dim">${gb(f.size)}</span></div>`;
+  }).join('');
+
+  const body = (folders+files) ||
+    '<div class="dim" style="padding:12px">nothing here</div>';
+  return head + `<div class="blist">${body}</div>`;
+}
+
+// ---- per-file media info -------------------------------------------------
+// Expands under the file row it belongs to. Served from the stored probe, so
+// for anything nuarr has processed this is a database read rather than an
+// ffprobe against a pool disk that the encoders are already using.
+let openFile=null, openFileHtml='';
+async function fileInfo(key){
+  const row=document.querySelector('.bfile[data-fk="'+key+'"]');
+  if(!row) return;
+  const existing=row.nextElementSibling;
+  if(existing && existing.classList.contains('minfo')){
+    existing.remove(); openFile=null; openFileHtml=''; return;   // toggle shut
+  }
+  document.querySelectorAll('.minfo').forEach(e=>e.remove());
+  openFile=key; openFileHtml='';
+  const box=document.createElement('div');
+  box.className='minfo';
+  box.innerHTML='<div class="skel" style="padding:8px 14px"><i style="width:55%"></i>'
+               +'<i style="width:70%"></i></div>';
+  row.after(box);
+  let d;
+  try{
+    d=await (await fetch('/api/browse/mediainfo?path='
+        +encodeURIComponent(row.dataset.fp))).json();
+    if(d.detail) throw new Error(d.detail);
+  }catch(e){
+    openFileHtml='<div class="err" style="padding:8px 14px">'
+                +esc(String(e.message||e))+'</div>';
+    box.innerHTML=openFileHtml;
+    return;
+  }
+  openFileHtml=renderMediaInfo(d);
+  // Re-query: a repaint during the fetch may have replaced the element the
+  // reference above points at.
+  const live=document.querySelector('.bfile[data-fk="'+key+'"]');
+  const target=live && live.nextElementSibling;
+  if(target && target.classList.contains('minfo')) target.innerHTML=openFileHtml;
+  else if(live){
+    const nb=document.createElement('div');
+    nb.className='minfo'; nb.innerHTML=openFileHtml; live.after(nb);
+  }
+}
+function renderMediaInfo(d){
+  const tag=(t,cls)=>`<span class="mtag ${cls||''}">${esc(t)}</span>`;
+  const flags=f=>(f||[]).map(x=>tag(x,'mflag')).join('');
+  const br=b=>b?`${Math.round(b/1000)} kbps`:'';
+
+  const v=(d.video||[]).map(s=>`<div class="mrow">
+      <span class="mk">video</span>
+      <span class="mv"><b>${esc(s.codec||'?')}</b>
+        ${s.profile?`<span class="dim">${esc(s.profile)}</span>`:''}
+        ${s.width?`· ${s.width}×${s.height}`:''}
+        ${s.fps?`· ${s.fps} fps`:''}
+        ${s.bit_depth?`· ${esc(s.bit_depth)}-bit`:''}
+        ${s.pix_fmt?`<span class="dim">· ${esc(s.pix_fmt)}</span>`:''}
+        ${br(s.bitrate)?`· ${br(s.bitrate)}`:''}
+        ${s.hdr?tag('HDR','mhdr'):''}${s.dv_profile?tag('Dolby Vision P'+s.dv_profile,'mdv'):''}
+        ${flags(s.flags)}</span></div>`).join('');
+
+  // Audio and subtitles are LISTS - the whole point of opening this is to see
+  // every track, not a summary. Language and title first, because that is how
+  // you tell them apart.
+  const a=(d.audio||[]).map((s,i)=>`<div class="mrow">
+      <span class="mk">${i===0?'audio':''}</span>
+      <span class="mv"><span class="dim">#${s.index}</span>
+        ${s.lang?`<b>${esc(s.lang)}</b>`:'<span class="dim">und</span>'}
+        ${esc(s.codec||'?')}
+        ${s.layout?esc(s.layout):(s.channels?s.channels+'ch':'')}
+        ${br(s.bitrate)?`· ${br(s.bitrate)}`:''}
+        ${s.sample_rate?`<span class="dim">· ${Math.round(s.sample_rate/1000)} kHz</span>`:''}
+        ${s.title?`<span class="dim">— ${esc(s.title)}</span>`:''}
+        ${flags(s.flags)}</span></div>`).join('');
+
+  const su=(d.subs||[]).map((s,i)=>`<div class="mrow">
+      <span class="mk">${i===0?'subs':''}</span>
+      <span class="mv"><span class="dim">#${s.index}</span>
+        ${s.lang?`<b>${esc(s.lang)}</b>`:'<span class="dim">und</span>'}
+        ${esc(s.codec||'?')}
+        ${s.image?tag('image','mimg'):tag('text','mtext')}
+        ${s.title?`<span class="dim">— ${esc(s.title)}</span>`:''}
+        ${flags(s.flags)}</span></div>`).join('');
+
+  const o=(d.other||[]).map(s=>`<div class="mrow">
+      <span class="mk dim">${esc(s.kind||'other')}</span>
+      <span class="mv dim">#${s.index} ${esc(s.codec||'')}</span></div>`).join('');
+
+  const head=`<div class="mrow"><span class="mk">file</span>
+     <span class="mv dim">${esc(d.container||'')}
+       ${d.duration?`· ${Math.round(d.duration/60)} min`:''}
+       ${d.bitrate?`· ${br(d.bitrate)} overall`:''}
+       · <span title="where this came from">${d.source==='live'
+           ? 'probed just now' : 'from the stored probe'}</span></span></div>`;
+  return `<div class="minfobox">${head}${v}${a}${su}${o}</div>`;
+}
+
+// Size the worker list to exactly the cards present, up to four. A fixed
+// height left dead space with one job and hid the rest with eight; measuring
+// the real cards handles both, and card height varies with the plan detail.
+// Load colour: green until it matters, amber when it is getting tight, red
+// when it is the thing limiting you.
+function loadCol(p){ return p>=90?'var(--bad)':p>=70?'var(--warn)':'var(--ok)'; }
+function metric(label,val,pct,sub,tip){
+  const c=loadCol(pct);
+  // `tip` exists for the GPU figure, where the number is accurate and the
+  // obvious reading of it is wrong - see renderSys.
+  return `<div class="met"${tip?` title="${esc(tip)}" style="cursor:help"`:''}>
+    <span class="lbl">${label}</span>
+    <span class="val" style="color:${c}">${val}</span>
+    <span class="gauge"><i style="width:${Math.min(pct,100)}%;background:${c}"></i></span>
+    ${sub?`<span class="sub">${sub}</span>`:''}</div>`;
+}
+function renderSys(s){
+  const el=document.getElementById('sysbar');
+  if(!el||!s) return;
+  const g=s.gpu||{};
+  let h = metric('CPU', s.cpu_pct+'%', s.cpu_pct, s.cpu_cores+' threads')
+        + metric('RAM', s.ram_pct+'%', s.ram_pct,
+                 `${s.ram_used_gb} / ${s.ram_total_gb} GB`);
+  if(g.name){
+    // THREE ENGINES, NOT ONE NUMBER.
+    // A re-encode uses NVDEC to decode, the SMs for filter work, and NVENC to
+    // encode - and they saturate independently. Measured on this card mid-run:
+    // NVENC 99%, SM cores 35%, decoder 14%. Read on its own "GPU 35%" says
+    // there is plenty of headroom when the encoder is completely full, so the
+    // encoder leads and the SM figure is labelled as cores rather than "GPU".
+    h += metric('NVENC', g.encoder_pct+'%', g.encoder_pct, 'encode engine')
+       + (g.decoder_pct!=null
+            ? metric('NVDEC', g.decoder_pct+'%', g.decoder_pct, 'decode engine')
+            : '')
+       + metric('GPU', g.gpu_pct+'%', g.gpu_pct,
+                `cores · ${Math.round(g.vram_used_mb/1024*10)/10} / ${
+                  Math.round(g.vram_total_mb/1024)} GB · ${g.temp_c}°C`,
+                'Shader cores only. The encode itself runs on NVENC, which is '
+                +'a separate engine - this figure can read low while the encoder '
+                +'is saturated, so judge worker headroom by NVENC.');
+  }
+  // CACHE THROUGHPUT. Every encode writes its output to E: and every commit
+  // reads it straight back, which makes this the busiest volume in the system
+  // and the one most likely to be the bottleneck - and it was the only figure
+  // on this bar with no rate beside it.
+  const ci=s.cache_io||{};
+  const crw = (ci.read_bps!=null)
+    ? `<span class="m-read">${mbps(ci.read_bps)}</span>`
+      +`<span class="sysx">r</span><span class="m-write">${mbps(ci.write_bps)}</span>`
+      +`<span class="sysx">w</span>`
+    : '';
+  h += `<div class="met"><span class="lbl">Cache</span>
+        <span class="val" style="color:${s.cache_free_gb<100?'var(--warn)':'var(--fg)'}">
+        ${s.cache_free_gb} GB</span><span class="sub">free on E:${
+          crw?' · ':''}${crw}</span></div>`;
+  el.innerHTML=h;
+  renderSelfUse(s);
+}
+
+// ---- startup progress ---------------------------------------------------
+// The header cannot distinguish "quiet because nothing is queued" from "quiet
+// because the boot never finished". This says which, then stops taking up room.
+//
+// It keeps polling for a few seconds AFTER ready so the green state is actually
+// seen - a boot that completes in 400 ms would otherwise never render at all,
+// and you would be left wondering whether the check ran.
+let _bootDone=false, _bootTimer=null, _bootFade=null, _bootStarted=0,
+    _bootHidden=false, _bootMs=0;
+
+// Fast while something is happening, lazy once it is not. The lazy poll is not
+// optional: this dashboard is left open for days across nuarr restarts, and if
+// polling simply stopped at ready, a restart would show a stale green "ready"
+// from the PREVIOUS process while the new one was still booting - the exact
+// misreading this pill exists to prevent. A changed start time means a new
+// process, so we wind back up.
+function bootPoll(ms){
+  // The interval is tracked in _bootMs, not as a property on the handle:
+  // setInterval returns a NUMBER in browsers, so assigning timer._ms silently
+  // does nothing and the "already at this rate?" test never matched - every
+  // single poll tore the timer down and built a new one.
+  if(_bootTimer!==null && _bootMs===ms) return;
+  clearInterval(_bootTimer);
+  _bootMs=ms;
+  _bootTimer=setInterval(loadBoot, ms);
+}
+
+// THE PILL IS A BUTTON WITH A PANEL, like every other chip in this header.
+//
+// It carried its step list in a native title= tooltip, which is the one thing
+// this header has already learned does not work here: the pill repaints every
+// 700 ms while booting, and a native tooltip is destroyed the instant its
+// element is replaced - so the list you most want to read, during the one
+// minute it is worth reading, could never stay on screen long enough to read.
+//
+// Built once and updated in place, with the panel as a SIBLING of the button,
+// so repainting the label cannot tear the panel down while it is open.
+let _bootOpen=false, _bootBuilt=false;
+
+function bootParts(){
+  const el=document.getElementById('bootPill');
+  if(!el) return null;
+  if(!_bootBuilt){
+    el.className='bootwrap';
+    el.innerHTML='<button class="boot" id="bootBtn" onclick="toggleBoot(event)"></button>'
+               + '<div class="procpop" id="bootPop" onclick="event.stopPropagation()"></div>';
+    _bootBuilt=true;
+  }
+  return {btn:document.getElementById('bootBtn'),
+          pop:document.getElementById('bootPop')};
+}
+
+function toggleBoot(ev){
+  if(ev) ev.stopPropagation();
+  closeSu(); closeProcs();          // one header panel open at a time
+  _bootOpen=!_bootOpen;
+  const p=bootParts();
+  if(!p) return;
+  p.pop.classList.toggle('open', _bootOpen);
+  p.btn.classList.toggle('on', _bootOpen);
+  if(_bootOpen && _bootLast) paintBoot(_bootLast);
+}
+function closeBoot(){ if(_bootOpen) toggleBoot(); }
+document.addEventListener('click', ()=>closeBoot());
+
+let _bootLast=null;
+function paintBoot(b){
+  const p=bootParts();
+  if(!p || !b) return;
+  const MARK={ok:'✓', pending:'…', warn:'!', failed:'✗'};
+  const CLS ={ok:'bs-ok', pending:'bs-run', warn:'bs-warn', failed:'bs-bad'};
+  const rows=(b.steps||[]).map(s=>{
+    // The step's own elapsed time, where it finished. A boot that took 13 s is
+    // not interesting; a boot where ONE step took 12 of them is, and the list
+    // is the only place that can be seen.
+    const at=(s.at&&b.started)?Math.round((s.at-b.started)*10)/10+'s':'';
+    return `<tr class="${CLS[s.state]||''}">`
+         + `<td class="bmark">${MARK[s.state]||'·'}</td>`
+         + `<td>${esc(s.label)}${s.note?`<div class="dim sub">${esc(s.note)}</div>`:''}</td>`
+         + `<td class="v dim">${at}</td></tr>`;
+  }).join('');
+  const took=(b.ready_at&&b.started)
+    ? Math.round((b.ready_at-b.started)*10)/10+'s'
+    : Math.round(b.elapsed||0)+'s';
+  setHTML(p.pop,
+    `<div class="ph">${b.ready?'Started in '+took:'Starting — '+took+' so far'}</div>`
+    + `<table class="boottab">${rows}</table>`
+    + '<div class="pf">Each step in order, and how far into the boot it '
+    + 'finished. The server answers HTTP before all of this is done, so a '
+    + 'dashboard that looks empty during startup is loading rather than '
+    + 'broken — but nothing is <b>processed</b> until pool recovery clears, '
+    + 'because that is the step the job queue waits on.</div>');
+}
+
+async function loadBoot(){
+  const p=bootParts();
+  if(!p) return;
+  const el=document.getElementById('bootPill');
+  let b;
+  try{ b=await (await fetch('/api/startup')).json(); }
+  catch(_){
+    // The server is not answering. That is itself the most useful thing the
+    // pill can say, so don't blank it - and go back to fast polling so we
+    // catch the moment it returns.
+    clearTimeout(_bootFade);
+    el.style.opacity=''; el.style.display='';
+    _bootDone=false; _bootHidden=false;
+    p.btn.className='boot go';
+    setHTML(p.btn, '<span class="dot"></span><span>reconnecting…</span>');
+    bootPoll(700);
+    return;
+  }
+  _bootLast=b;
+  if(_bootOpen) paintBoot(b);
+  // A new process. Start the whole display over.
+  if(b.started && b.started!==_bootStarted){
+    _bootStarted=b.started; _bootDone=false; _bootHidden=false;
+    clearTimeout(_bootFade);
+    el.style.opacity=''; el.style.display='';   // undo the fade-out
+  }
+  const bad=(b.steps||[]).filter(s=>s.state==='warn'||s.state==='failed');
+  const pct=Math.round(100*(b.done||0)/Math.max(1,b.total||1));
+
+  if(!b.ready){
+    const cur=(b.steps||[]).find(s=>s.state==='pending');
+    p.btn.className='boot go'+(_bootOpen?' on':'');
+    // This one polls every 700 ms, so it was the worst offender of the lot: the
+    // step list in the tooltip is exactly what you want to read while it is
+    // starting, and it was torn down twice a second. Between step transitions
+    // the markup is identical, so the guard leaves it alone for whole seconds
+    // at a time and the tooltip finally stays up.
+    // THE STEP'S OWN NOTE, ON THE PILL. Every step but one finishes too fast
+    // to need this; pool recovery walks the whole library and can run for
+    // minutes, and "7/8 pool recovery" held steady for four of them is
+    // indistinguishable from a hang. Showing what it is walking answers the
+    // only question worth asking at that point: is it stuck, or is it just
+    // reading 39,000 files off busy spindles?
+    setHTML(p.btn, '<span class="dot"></span><span>starting</span>'
+      +'<span class="bt"><span class="bf" style="width:'+pct+'%"></span></span>'
+      +'<span class="el">'+(b.done||0)+'/'+(b.total||0)+'</span>'
+      +(cur?'<span class="el">'+esc(cur.label)+'</span>':'')
+      +(cur&&cur.note?'<span class="el bn">'+esc(cur.note)+'</span>':'')
+      +'<span class="caret">'+(_bootOpen?'▾':'▸')+'</span>');
+    p.btn.title='click for every step';
+    bootPoll(700);
+    return;
+  }
+
+  // How long the boot TOOK, not how long ago it was. b.elapsed is time since
+  // the process started and keeps climbing forever, so a pill left on screen
+  // slowly turned into an uptime counter labelled "ready".
+  const took=(b.ready_at&&b.started) ? Math.round((b.ready_at-b.started)*10)/10
+                                     : (b.elapsed||0);
+  const cls='boot '+(bad.length?'warn':'rdy')+(_bootOpen?' on':'');
+  const html='<span class="dot"></span><span>'
+    +(bad.length?'ready, '+bad.length+' warning'+(bad.length>1?'s':'')
+                : 'ready')
+    +'</span><span class="el">'+took+'s</span>'
+    +'<span class="caret">'+(_bootOpen?'▾':'▸')+'</span>';
+  // _bootHidden is what makes the fade stick. The heartbeat below runs forever,
+  // and without this the next poll simply repainted the pill it had just faded
+  // out - it flickered back every 5 s. Only a NEW boot clears the flag.
+  if(!_bootHidden){ p.btn.className=cls; setHTML(p.btn, html); }
+  p.btn.title='click for every step';
+
+  // Nothing left to watch for, but keep a slow heartbeat so a restart is seen.
+  bootPoll(5000);
+  if(_bootDone) return;
+  _bootDone=true;
+  // A clean boot has nothing left to say, so it fades out and gives the space
+  // back. A boot with warnings STAYS - that is a standing condition (no arr,
+  // no GPU) you need to keep seeing, not a transient status message.
+  if(!bad.length){
+    // NOT WHILE SOMEBODY IS READING IT. The fade fires six seconds after
+    // ready, which is easily inside the time it takes to open the panel and
+    // look down the list - and it would have taken the panel with it. Waiting
+    // rather than cancelling, so closing the panel still gives the space back.
+    const fade=()=>{
+      if(_bootOpen){ _bootFade=setTimeout(fade, 3000); return; }
+      el.style.opacity='0';
+      setTimeout(()=>{ if(el.style.opacity==='0' && !_bootOpen){
+                         _bootHidden=true;
+                         setHTML(p.btn, ''); p.btn.className='';
+                         // HIDE THE WRAPPER, not just its contents. Emptying
+                         // the button left a 26px stub in the header - a
+                         // borderless button with no text still occupies its
+                         // own padding, which the old markup never had to
+                         // think about because the pill WAS the element.
+                         el.style.display='none';
+                         el.style.opacity=''; }
+                     }, 700);
+    };
+    _bootFade=setTimeout(fade, 6000);
+  }
+}
+
+// nuarr's own footprint, in the header. Deliberately terse - it sits beside the
+// arr pills and must not push them off a narrow window.
+// BUILT ONCE, THEN UPDATED IN PLACE.
+//
+// This used to rewrite el.innerHTML on every sample - once a second. Replacing
+// an element destroys anything the browser has attached to it, so a native
+// title= tooltip was dismissed and re-created a second later: it strobed, and
+// you could not finish reading a line before it vanished. Nothing here needs
+// new elements, only new numbers, so the elements are created once and only
+// their text changes after that. The tooltip on cpu and ram now survives, and
+// the process list is a click-open panel that cannot be blinked away at all.
+let _suBuilt=false;
+function renderSelfUse(s){
+  const el=document.getElementById('selfUse');
+  if(!el) return;
+  const n=s&&s.nuarr;
+  // A MISSING SAMPLE IS NOT A REASON TO DELETE THE CHIPS.
+  //
+  // This used to wipe the strip whenever a sample came back without process
+  // data - one failed poll and three chips vanished, taking their width with
+  // them and dragging the whole header left. They are seeded with "—" for
+  // exactly this case: keep the shape, blank the numbers, and let the next
+  // sample fill them back in. Only a page that has never had a sample shows
+  // nothing at all, because there is no shape to hold yet.
+  if(!n||!n.procs){
+    if(_suBuilt){
+      const cb=document.querySelector('#suCpuBtn b');
+      const rb=document.querySelector('#suRamBtn b');
+      if(cb){ cb.firstChild.nodeValue='—'; cb.style.color=''; }
+      if(rb) rb.firstChild.nodeValue='—';
+    }
+    return;
+  }
+  if(!_suBuilt){
+    // ALL THREE ARE BUTTONS NOW.
+    //
+    // cpu and ram were plain pills with a title= tooltip, which said what nuarr
+    // was using and nothing about what that was a share OF. "24% cpu" reads
+    // completely differently on a machine at 30% than on one at 95%, and the
+    // header could not tell you which. Each opens a panel comparing nuarr
+    // against the whole box, and naming who has the rest.
+    //
+    // The <b>s are seeded with a placeholder so each one owns a TEXT NODE from
+    // the start. Assigning .textContent would drop that node and create a new
+    // one every second - a childList mutation, and the same kind of teardown
+    // that broke the tooltips. Writing .nodeValue changes the number in place
+    // and touches no structure at all.
+    el.innerHTML =
+      '<span class="suwrap">'
+    +   '<button class="procbtn" id="suCpuBtn" title="nuarr\'s CPU against the whole machine"'
+    +           ' onclick="toggleSu(event,\'cpu\')"><b>—</b> cpu'
+    +           '<span class="caret" id="suCpuCaret">▸</span></button>'
+    +   '<div class="procpop" id="suCpuPop" onclick="event.stopPropagation()"></div>'
+    + '</span>'
+    // ORDER: cpu, gpu, ram - the three things nuarr consumes, and all three
+    // read as NUARR'S OWN share rather than the machine's. The gpu chip sat
+    // after ram and reported the whole card, which made it the odd one out in
+    // a row that otherwise answers one question: what is nuarr costing me.
+    + '<span class="suwrap" id="suGpuWrap">'
+    +   '<button class="procbtn" id="suGpuBtn" title="nuarr\'s GPU use, and what else is on the card"'
+    +           ' onclick="toggleSu(event,\'gpu\')"><b>—</b> gpu'
+    +           '<span class="caret" id="suGpuCaret">▸</span></button>'
+    +   '<div class="procpop" id="suGpuPop" onclick="event.stopPropagation()"></div>'
+    + '</span>'
+    + '<span class="suwrap">'
+    +   '<button class="procbtn" id="suRamBtn" title="nuarr\'s memory against the whole machine"'
+    +           ' onclick="toggleSu(event,\'ram\')"><b>—</b> ram'
+    +           '<span class="caret" id="suRamCaret">▸</span></button>'
+    +   '<div class="procpop" id="suRamPop" onclick="event.stopPropagation()"></div>'
+    + '</span>'
+    + '<span class="suwrap" id="suWrap">'
+    +   '<button class="procbtn" id="suProcBtn" title="what nuarr is running"'
+    +           ' onclick="toggleProcs(event)"><b>—</b>'
+    +           ' <span>process<span id="suProcPl">es</span></span>'
+    +           '<span class="caret" id="suProcCaret">▸</span></button>'
+    +   '<div class="procpop" id="procPop" onclick="event.stopPropagation()"></div>'
+    + '</span>';
+    _suBuilt=true;
+  }
+  const ram = n.ram_mb>=1024 ? (Math.round(n.ram_mb/102.4)/10)+' GB'
+                             : Math.round(n.ram_mb)+' MB';
+  // Colour on nuarr's SHARE OF THE MACHINE, not the raw per-core number: 100%
+  // of one core is unremarkable on 20 threads and should not read as hot.
+  const c = n.cpu_pct>=60 ? 'var(--bad)' : n.cpu_pct>=25 ? 'var(--warn)' : 'var(--ok)';
+  const cb=document.querySelector('#suCpuBtn b');
+  cb.firstChild.nodeValue = n.cpu_pct+'%';
+  cb.style.color = c;
+  const rb=document.querySelector('#suRamBtn b');
+  rb.firstChild.nodeValue = ram;
+  // THE GPU CHIP IS NUARR'S, LIKE THE OTHER TWO.
+  //
+  // It reported the whole card, which made it the one chip in the row that was
+  // not about nuarr - "0% gpu" while nuarr encodes nothing and Plex saturates
+  // NVENC is a true statement about the wrong subject.
+  //
+  // Attribution is only possible one way round, and the code has to be honest
+  // about that. nvidia-smi CANNOT split engine utilisation per process; it can
+  // only say which pids hold VRAM. So: when nuarr has a process on the card,
+  // the encoder figure is nuarr's, because nuarr's only reason to be there is
+  // an encode. When it does not, nuarr's use is zero however busy the card is,
+  // and the chip says zero - with a dot to show the card is not idle, so the
+  // number cannot be mistaken for "nothing is happening".
+  //
+  // NVENC rather than utilization.gpu, for the same reason the panel leads
+  // with it: they are different engines, and measured here the SM figure sits
+  // at 35-40% while NVENC is at 99%.
+  const G=(s&&s.gpu)||{};
+  const gpids=new Set((G.procs||[]).map(p=>p.pid));
+  const ourPids=(n.proc_list||[]).map(p=>p.pid);
+  const onCard=ourPids.some(p=>gpids.has(p));
+  const busyElsewhere=!onCard && (G.encoder_pct>=1 || (G.procs||[]).length>0);
+  const gb2=document.querySelector('#suGpuBtn b');
+  if(gb2){
+    const e = G.name==null ? null : (onCard ? (G.encoder_pct||0) : 0);
+    gb2.firstChild.nodeValue = (e==null?'—':Math.round(e)+'%');
+    gb2.style.color = e==null ? ''
+      : (e>=90?'var(--bad)':e>=50?'var(--warn)':'var(--ok)');
+  }
+  const gbtn=document.getElementById('suGpuBtn');
+  if(gbtn){
+    gbtn.classList.toggle('otherbusy', busyElsewhere);
+    gbtn.title = busyElsewhere
+      ? `nuarr is not using the GPU — something else is (encoder ${
+          Math.round(G.encoder_pct||0)}%). Click for what.`
+      : (onCard ? 'nuarr\'s GPU use — click for the card\'s engines'
+                : 'nuarr\'s GPU use, and what else is on the card');
+  }
+  const gw=document.getElementById('suGpuWrap');
+  // No card, no chip - and unlike the process chip this one really can be
+  // absent, because a box with no NVIDIA GPU has nothing to say here ever.
+  // That is a permanent condition, not a per-sample one, so it cannot cause
+  // the appearing and disappearing the fixed widths were meant to stop.
+  if(gw) gw.style.display = G.name ? '' : 'none';
+  _suLast = s;
+  if(_suOpen) paintSu(_suOpen, s);
+
+  // ALWAYS PRESENT AND ALWAYS OPENABLE.
+  //
+  // This was first hidden when nuarr had no children, then merely disabled -
+  // both wrong for the same reason. The panel does not only list what nuarr
+  // spawned; it is where the GPU lives, and the GPU is at its most interesting
+  // when nuarr is doing NOTHING. An idle encoder at 60% means something else
+  // on this box is using it, which is exactly the thing you would open a panel
+  // to find out - and until now the panel refused to open in precisely that
+  // situation.
+  const btn=document.getElementById('suProcBtn');
+  paintProcBtn(n);
+  if(btn){
+    btn.disabled=false;
+    btn.title='what nuarr is running';
+  }
+  // The pill above reads as a share of the WHOLE machine, and so does Task
+  // Manager. Leaving the panel on raw psutil per-core numbers put "300%" next
+  // to "18.7% cpu" for the same instant, which reads as a contradiction rather
+  // than as two units.
+  _cpuCores = s.cpu_cores || _cpuCores;
+  // The WHOLE sample, not just the nuarr block. The panel now shows the GPU
+  // too, and that lives on s.gpu - keeping only s.nuarr meant reopening the
+  // panel from a stale click had no GPU to draw.
+  _procLast=s;
+  if(_procOpen) paintProcs(s);
+}
+
+// The panel. Open state lives here so a repaint cannot close it, and the
+// contents are refreshed in place each second - the numbers move, the panel
+// does not.
+// THE CPU AND RAM PANELS.
+//
+// One open at a time - two overlapping popups in a header strip is unreadable,
+// and nobody wants to compare two panels that are covering each other.
+let _suOpen=null, _suLast=null;
+function toggleSu(ev, which){
+  if(ev) ev.stopPropagation();
+  closeProcs();
+  _suOpen = (_suOpen===which) ? null : which;
+  const cap=k=>k.charAt(0).toUpperCase()+k.slice(1);
+  for(const k of ['cpu','ram','gpu']){
+    const pop=document.getElementById('su'+cap(k)+'Pop');
+    const btn=document.getElementById('su'+cap(k)+'Btn');
+    const car=document.getElementById('su'+cap(k)+'Caret');
+    const on = _suOpen===k;
+    if(pop) pop.classList.toggle('open', on);
+    if(btn) btn.classList.toggle('on', on);
+    if(car) car.textContent = on?'▾':'▸';
+  }
+  if(_suOpen && _suLast) paintSu(_suOpen, _suLast);
+}
+function closeSu(){ if(_suOpen) toggleSu(null, _suOpen); }
+
+// A share as a percentage, without lying at either end. Math.round() turns
+// 0.49% into "0%", which on a panel whose whole job is proportions reads as a
+// failed measurement; and "0.0%" for a genuine zero is fussy.
+function pctOf(part, whole){
+  if(!whole) return '0%';
+  const p = part/whole*100;
+  if(p <= 0) return '0%';
+  if(p < 1)  return p.toFixed(1)+'%';
+  return Math.round(p)+'%';
+}
+function paintSu(which, s){
+  const cap=k=>k.charAt(0).toUpperCase()+k.slice(1);
+  const pop=document.getElementById('su'+cap(which)+'Pop');
+  if(!pop || !s) return;
+  if(which==='gpu'){ setHTML(pop, gpuPanel(s)); return; }
+  const n=s.nuarr||{};
+  const others=(s.others||[]).slice();
+  const mb=v=>v>=1024 ? (Math.round(v/102.4)/10)+' GB' : Math.round(v)+' MB';
+
+  // A share-of-the-machine bar. The point of the whole panel is that nuarr's
+  // number is a FRACTION of something, so it gets drawn as one.
+  const bar=(pct,col)=>`<div class="subar"><i style="width:${
+      Math.max(0,Math.min(100,pct)).toFixed(1)}%;background:${col}"></i></div>`;
+
+  let html='', rows='';
+  if(which==='cpu'){
+    const machine = s.cpu_pct||0, mine = n.cpu_pct||0;
+    const rest = Math.max(0, machine-mine);
+    html = `<div class="ph">CPU — ${s.cpu_cores||'?'} threads</div>`
+      + `<div class="surow"><span>Whole machine</span>`
+      +   `<b class="suv">${machine.toFixed(1)}%</b></div>`
+      + bar(machine, machine>=85?'var(--bad)':machine>=60?'var(--warn)':'var(--acc)')
+      + `<div class="surow"><span class="me">nuarr and its children</span>`
+      +   `<b class="suv me">${mine.toFixed(1)}%</b></div>`
+      + bar(mine, 'var(--acc)')
+      + `<div class="surow"><span class="mult">everything else</span>`
+      +   `<b class="suv mult">${rest.toFixed(1)}%</b></div>`
+      + `<div class="pf">nuarr is <b>${pctOf(mine, machine)}</b>`
+      + ` of the load on this box. Its raw figure is ${n.cpu_pct_raw||0}% of a`
+      + ` single core, which is why it can exceed 100 before this division.</div>`;
+    others.sort((a,b)=>b.cpu_pct-a.cpu_pct);
+    rows = others.filter(o=>o.cpu_pct>=0.5).slice(0,6).map(o=>
+      `<tr><td>${esc(o.name)}${o.n>1?`<span class="mult"> ×${o.n}</span>`:''}</td>`
+      +`<td class="v">${o.cpu_pct.toFixed(1)}%</td></tr>`).join('');
+  }else{
+    const total=s.ram_total_gb||0, used=s.ram_used_gb||0;
+    const mineGb=(n.ram_mb||0)/1024;
+    html = `<div class="ph">Memory — ${total.toFixed(1)} GB installed</div>`
+      + `<div class="surow"><span>In use on this machine</span>`
+      +   `<b class="suv">${used.toFixed(1)} GB</b></div>`
+      + bar(s.ram_pct||0, (s.ram_pct||0)>=90?'var(--bad)'
+                          :(s.ram_pct||0)>=75?'var(--warn)':'var(--acc)')
+      + `<div class="surow"><span class="me">nuarr and its children</span>`
+      +   `<b class="suv me">${mb(n.ram_mb||0)}</b></div>`
+      + bar(total>0?mineGb/total*100:0, 'var(--acc)')
+      + `<div class="surow"><span class="mult">everything else</span>`
+      +   `<b class="suv mult">${(Math.max(0,used-mineGb)).toFixed(1)} GB</b></div>`
+      // A share under 1% must not round to "0%" - on a server using 149 MB of
+      // 30 GB that reads as a broken measurement rather than as the good news
+      // it actually is.
+      + `<div class="pf">nuarr is <b>${pctOf(mineGb, used)}</b>`
+      + ` of what is in use, and <b>${pctOf(mineGb, total)}</b>`
+      + ` of the installed ${total.toFixed(1)} GB.</div>`;
+    others.sort((a,b)=>b.ram_mb-a.ram_mb);
+    rows = others.slice(0,6).map(o=>
+      `<tr><td>${esc(o.name)}${o.n>1?`<span class="mult"> ×${o.n}</span>`:''}</td>`
+      +`<td class="v">${mb(o.ram_mb)}</td></tr>`).join('');
+  }
+  if(rows) html += `<div class="ph" style="margin-top:9px">Biggest outside nuarr</div>`
+                 + `<table>${rows}</table>`;
+  setHTML(pop, html);
+}
+document.addEventListener('click', ()=>closeSu());
+
+let _procOpen=false, _procLast=null, _procBtnKey='', _cpuCores=0;
+// Even the label is left alone when it has not changed. Rewriting a button's
+// children once a second is what made the old tooltip strobe; there is no
+// reason to touch the DOM to say "11 processes" for the eleventh time.
+function paintProcBtn(n){
+  const btn=document.getElementById('suProcBtn');
+  if(!btn) return;
+  const key=n.procs+'|'+_procOpen;
+  if(_procBtnKey!==key){
+    _procBtnKey=key;
+    // WRITE THE PARTS IN PLACE, never innerHTML.
+    //
+    // Rewriting innerHTML rebuilt the whole button once a second, which is the
+    // teardown that broke the tooltips elsewhere in this header. Each piece now
+    // owns a text node: the count inside a width-locked <b>, the plural on its
+    // own, the caret on its own.
+    //
+    // The plural is still correct. It can be, now that the chip has a fixed
+    // width wide enough for "128 processes" and the caret is pushed to the
+    // right edge by margin-left:auto - dropping two letters shortens the word
+    // and moves nothing around it. Before, it moved the caret and resized the
+    // chip, so the honest grammar had to go; now it does not.
+    const b=btn.querySelector('b');
+    if(b && b.firstChild) b.firstChild.nodeValue=String(n.procs);
+    const pl=document.getElementById('suProcPl');
+    if(pl) pl.textContent = n.procs==1 ? '' : 'es';
+    const c=btn.querySelector('.caret');
+    if(c) c.textContent=_procOpen?'▾':'▸';
+  }
+  btn.classList.toggle('on', _procOpen);
+}
+function toggleProcs(ev){
+  if(ev) ev.stopPropagation();
+  closeSu();                       // only one header panel open at a time
+  _procOpen=!_procOpen;
+  const pop=document.getElementById('procPop');
+  if(pop) pop.classList.toggle('open', _procOpen);
+  if(_procLast){
+    paintProcBtn(_procLast.nuarr||_procLast);
+    if(_procOpen) paintProcs(_procLast);
+  }
+}
+function closeProcs(){ if(_procOpen) toggleProcs(); }
+// Click anywhere else to dismiss - the panel itself stops the event.
+document.addEventListener('click', ()=>closeProcs());
+
+function paintProcs(s){
+  const pop=document.getElementById('procPop');
+  if(!pop) return;
+  // Accepts the whole sample now; older callers passed just the nuarr block.
+  const n=(s&&s.nuarr)||s||{};
+  const list=n.proc_list||[];
+  const mb=v=>v>=1024 ? (Math.round(v/102.4)/10)+' GB' : Math.round(v)+' MB';
+  // GROUP BY WHAT IT IS DOING, not by which executable it is.
+  //
+  // "ffprobe.exe" and "conhost.exe" are true and useless: they say a process
+  // exists, not what nuarr is doing with it. The server names each child from
+  // its own arguments, so a row can say "Audio language — listening to
+  // Blue Gender S01E06" instead. Anything unrecognised falls back to its
+  // executable name, which is worth seeing on its own: nuarr should not be
+  // spawning things it cannot account for.
+  const by=new Map();
+  for(const p of list){
+    const k=p.activity || (p.name||'?');
+    const g=by.get(k)||{n:0,mb:0,cpu:0,age:0,self:false,named:!!p.activity,
+                        details:[],exes:new Set()};
+    g.n++; g.mb+=p.rss_mb||0; g.cpu+=p.cpu_pct||0;
+    g.age=Math.max(g.age, p.age_s||0);
+    if(p.self) g.self=true;
+    if(p.detail && g.details.length<3 && g.details.indexOf(p.detail)<0)
+      g.details.push(p.detail);
+    if(p.name) g.exes.add(p.name);
+    by.set(k,g);
+  }
+  const rows=[...by.entries()]
+    .sort((a,b)=>(b[1].self-a[1].self) || (b[1].mb-a[1].mb))
+    .map(([name,g])=>{
+      // A handler that should take seconds and has been up for an hour is the
+      // thing you opened this panel to find. Say so in the warning colour.
+      const stale = !g.self && g.age>=600;
+      const share = _cpuCores ? g.cpu/_cpuCores : g.cpu;
+      const sub = g.details.length
+        ? `<div class="pdet">${g.details.map(d=>esc(d)).join('<br>')}</div>` : '';
+      // Keep the executable visible once the row is named after the work -
+      // "Transcode · ffmpeg.exe" still answers "what is actually running".
+      const exe = (!g.self && g.named && g.exes.size)
+        ? `<span class="mult"> · ${esc([...g.exes].join(', '))}</span>` : '';
+      return `<tr><td class="${g.self?'me':(stale?'old':'')}">`
+           + (g.n>1?`<span class="mult">${g.n} × </span>`:'')
+           + `${esc(name)}${g.self?' <span class="mult">(the server)</span>':exe}`
+           + sub + `</td>`
+           + `<td class="v">${mb(g.mb)}</td>`
+           + `<td class="v">${share>=0.5?share.toFixed(share<10?1:0)+'%':'—'}</td>`
+           + `<td class="v ${stale?'old':''}">${g.age>=60?hms(g.age):'—'}</td></tr>`;
+    }).join('');
+  let html = `<div class="ph">Running right now — ${n.procs} process${
+                  n.procs==1?'':'es'}, ${mb(n.ram_mb)} total</div>`
+           + `<table><tr><td class="mult">name</td><td class="v">ram</td>`
+           + `<td class="v" title="share of all ${_cpuCores||'?'} threads, `
+           + `the same scale as the pill and Task Manager">cpu</td>`
+           + `<td class="v">up</td></tr>${rows}</table>`
+           + `<div class="pf">Everything nuarr has spawned, named by the work `
+           + `it is doing rather than by the executable. Anything other than `
+           + `the server sitting here for more than ten minutes is a straggler.</div>`;
+
+  setHTML(pop, html);      // same rule as every other pill in the header
+}
+
+// ---- THE GPU PANEL -------------------------------------------------------
+//
+// Its own chip rather than a section inside the process list. It was there
+// first because "who is on the card" is a question about processes, and that
+// reasoning was half right: the compute-apps list belongs beside the process
+// list, but the engine meters do not. They are a load reading, exactly like
+// cpu and ram, and they were the only one of the three you could not see
+// without opening a panel about something else.
+function gpuPanel(s){
+  const G=(s&&s.gpu)||{};
+  const mine=new Set((((s&&s.nuarr)||{}).proc_list||[]).map(p=>p.pid));
+  const mb=v=>v>=1024 ? (Math.round(v/102.4)/10)+' GB' : Math.round(v)+' MB';
+  if(!G.name){
+    // Say why rather than showing nothing - an empty panel reads as a bug.
+    return '<div class="ph">GPU</div><div class="pf">No reading — nvidia-smi '
+         + 'did not answer. Encodes still run; only this panel is affected.</div>';
+  }
+  const bar=(v,c)=>`<span class="gbar"><i style="width:${
+    Math.max(0,Math.min(100,v))}%;background:${c}"></i></span>`;
+  const hue=v=>v>=90?'var(--bad)':v>=50?'var(--warn)':'var(--ok)';
+  const g=(label,v,tip)=> v==null ? '' :
+    `<tr><td title="${esc(tip||'')}">${label}</td>`
+    +`<td class="v" style="color:${hue(v)}">${v.toFixed(0)}%</td>`
+    +`<td style="width:74px">${bar(v,hue(v))}</td></tr>`;
+  const vr=G.vram_total_mb ? Math.round(G.vram_used_mb/G.vram_total_mb*100) : 0;
+  const apps0=G.procs||[];
+  // PER-PROCESS ATTRIBUTION IS NOT AVAILABLE HERE, and pretending otherwise
+  // produced a flat contradiction: "not encoding" and "nothing is using the
+  // GPU" printed directly above NVENC at 81%.
+  //
+  // nvidia-smi --query-compute-apps returns twenty pids on this box with
+  // used_memory "[N/A]" for every one - Windows' display driver model does
+  // not attribute video memory per process - and the list itself is dwm.exe,
+  // explorer.exe and two Chromes, every process holding a graphics context
+  // rather than anyone encoding.
+  //
+  // So attribution comes from the job pump instead, which knows for certain:
+  // a worker in the encode pool at the encoding stage IS running NVENC. That
+  // is exact where the driver was empty, and it is the question being asked.
+  const perProc = !!G.per_proc_vram;
+  const ourJobs = _nuarrEnc||[];
+  const onCard = ourJobs.length > 0
+              || (perProc && apps0.some(a=>mine.has(a.pid)));
+  const ourVram = perProc
+    ? apps0.filter(a=>mine.has(a.pid)).reduce((t,a)=>t+(a.vram_mb||0),0) : 0;
+  // Is anything at all using it? Engine load answers that even when nothing
+  // can be attributed, and it is what stops the panel claiming an idle card.
+  const busyCard = (G.encoder_pct||0) >= 1 || (G.decoder_pct||0) >= 1
+                || (G.gpu_pct||0) >= 5;
+  // NUARR FIRST, THE CARD SECOND. The chip is about nuarr, so the panel behind
+  // it opens with the same subject rather than making you find nuarr's share
+  // inside a table about the whole GPU.
+  //
+  // And it says plainly which half can be attributed. VRAM can: nvidia-smi
+  // reports it per pid. Engine utilisation cannot - there is no per-process
+  // NVENC figure at all - so claiming "nuarr is using 40% of the encoder"
+  // would be a number nothing measured.
+  let html = '<div class="ph">nuarr on this GPU</div>'
+    + '<table><tr><td>encoder</td><td class="v" style="color:'
+    + (onCard?hue(G.encoder_pct||0):'var(--dim)') + '">'
+    + (onCard ? Math.round(G.encoder_pct||0)+'%' : 'not encoding') + '</td></tr>'
+    + `<tr><td>encode jobs</td><td class="v">${
+        ourJobs.length ? ourJobs.length : '<span class="dim">none</span>'}</td></tr>`
+    + (perProc
+        ? `<tr><td>video memory</td><td class="v">${
+            ourVram?mb(ourVram):'—'}</td></tr>`
+        : '')
+    + '</table>'
+    + (ourJobs.length
+        ? `<div class="pf">${ourJobs.length} encode job${
+            ourJobs.length===1?'':'s'} running, so the encoder figure above is
+           nuarr's. Engine load cannot be split per program — the driver does
+           not report it — so with something else also encoding the two would
+           share this number.</div>`
+        : (busyCard
+            ? `<div class="pf">nuarr has no encode running, so <b>the load
+               below is something else</b> — most likely Plex transcoding.
+               ${perProc?'':`This driver does not report which process owns a
+               video session, so it cannot be named here.`}</div>`
+            : `<div class="pf">Nothing is encoding. nuarr only uses the GPU for
+               a rebuild; a remux copies the picture untouched and never
+               touches it.</div>`))
+    + `<div class="ph" style="margin-top:11px">${esc(G.name)}${
+        G.temp_c!=null?` <span class="mult">${G.temp_c.toFixed(0)}°C</span>`:''}</div>`
+    + '<table class="gputab">'
+    + g('encoder (NVENC)', G.encoder_pct,
+        'The engine that does the encoding. This is the one that limits how '
+        +'many encode workers are worth running — the A5000 has one.')
+    + g('decoder (NVDEC)', G.decoder_pct,
+        'ffmpeg runs with -hwaccel cuda, so a re-encode decodes on the GPU '
+        +'too. This is what explains a burn-in being slower than a plain '
+        +'encode.')
+    + g('cores (SM)', G.gpu_pct,
+        'General compute and filter work. Low while NVENC is saturated, '
+        +'because they are different engines.')
+    + '<tr><td title="Video memory in use across every program on the card"'
+    + '>memory</td>'
+    + `<td class="v">${mb(G.vram_used_mb||0)} <span class="mult">of ${
+        mb(G.vram_total_mb||0)}</span></td>`
+    + `<td style="width:74px">${bar(vr,hue(vr))}</td></tr>`
+    + '</table>';
+  // WHO IS ON THE CARD. The utilisation figures say it is busy; they cannot
+  // say whether that is nuarr or Plex, and on this box the two compete for one
+  // NVENC engine. Those two answers call for opposite responses, so the panel
+  // has to distinguish them.
+  // ONLY LIST PROCESSES WHEN THE LIST MEANS SOMETHING.
+  //
+  // Without per-process VRAM the rows are every application holding a
+  // graphics context - dwm.exe, explorer.exe, Chrome - which is true and
+  // useless, and putting them under "Using the GPU" beside an 81% encoder
+  // actively misleads. Better to say what cannot be known than to fill the
+  // space with what can.
+  const apps=G.procs||[];
+  if(perProc && apps.length){
+    html += '<div class="ph" style="margin-top:10px">Using the GPU</div>'
+          + '<table>'
+          + apps.slice(0,8).map(a=>{
+              const ours=mine.has(a.pid);
+              return `<tr><td class="${ours?'me':''}">${esc(a.name)}`
+                   + `${ours?' <span class="mult">(nuarr)</span>':''}</td>`
+                   + `<td class="v">${a.vram_mb!=null?mb(a.vram_mb):'—'}</td></tr>`;
+            }).join('')
+          + '</table>';
+  }else if(!busyCard){
+    html += '<div class="pf">Every engine is idle — nothing is using the card '
+          + 'right now.</div>';
+  }
+  return html;
+}
+
+// sizeRunBox() is gone. It measured the live cards and rewrote the panel's
+// height on every 2-second repaint, which is precisely what made the panel
+// jump: one job finishing changed the height and shoved the rest of the page
+// up. The height is now a constant in CSS (--wk-slot * 4) and nothing in JS
+// touches it.
+
+// A placeholder for every configured worker that is not currently busy, so the
+// panel shows the SHAPE OF THE MACHINE - 4 encode + 4 passthrough - instead of
+// collapsing to a single "no jobs running" line when the queue drains.
+//
+// Counted from j.running rather than j.in_use: in_use tracks the pools the
+// scheduler manages, but a handler job carries pool "handler", which has no
+// capacity entry. Deriving the count from what is actually running keeps the
+// slot total honest whichever pools appear.
+function idleSlots(j, ghosts){
+  const cap = j.capacity || {};
+  const busy = {};
+  (j.running || []).forEach(w => { busy[w.pool] = (busy[w.pool] || 0) + 1; });
+  let skip = ghosts || 0;         // fading cards still standing in their slot
+  let out = '';
+  for(const pool of Object.keys(cap)){
+    let free = Math.max(0, (cap[pool] || 0) - (busy[pool] || 0));
+    const take = Math.min(skip, free);
+    free -= take; skip -= take;
+    const col = pool === 'encode' ? 'var(--acc)' : 'var(--ok)';
+    for(let i = 0; i < free; i++){
+      out += `<div class="wk slot">
+        <span class="pill" style="color:${col};border-color:${col}">${esc(pool)}</span>
+        <span class="dim">idle</span></div>`;
+    }
+  }
+  return out;
+}
+// When a log is expanded, grow the Finished box so the entry is readable
+// instead of squeezing it into a scrollbar inside a scrollbar.
+function sizeDoneBox(){
+  const box=document.getElementById('doneBox');
+  if(!box) return;
+  box.style.height = openLogId
+    ? Math.min(Math.round(window.innerHeight*0.72), 900)+'px'
+    : '460px';
+}
+
+function hms(s){ if(s==null) return '—';
+  s=Math.max(0,Math.round(s)); const h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;
+  return h? `${h}h ${m}m` : (m? `${m}m ${x}s` : `${x}s`); }
+// The rename retry queue. Every transcode hands its rename here rather than
+// blocking a worker on the arr, so this is where renames actually happen -
+// "post-transcode" is the normal reason, not an error.
+const RENQ_WHY = {
+  'post-transcode':      ['queued after transcode', 'p-ok'],
+  'refresh debounced':   ['waiting for the arr to re-read the file', 'p-dim'],
+  'after deferred commit':['queued after a late commit', 'p-warn'],
+  'found by rename sweep':['found by the sweep', 'p-dim'],
+  'found by rename scan': ['found by the sweep', 'p-dim']
+};
+// THE REASON AND THE REMEDY ARE TWO DIFFERENT THINGS, so they are split apart
+// rather than run together into one long line. "the release group in the name
+// looks mangled" tells you what happened; "correct the filename by hand, then
+// rescan" tells you it will never clear on its own - and that second half is
+// what decides whether to keep waiting or go and do something. Buried at the
+// end of a sentence nobody finished reading, it may as well not be there.
+function renqWhy(err){
+  const s = String(err||'');
+  if(!s) return ['queued', 'p-dim', ''];
+  for(const k in RENQ_WHY) if(s.indexOf(k)===0) return [...RENQ_WHY[k], ''];
+  if(s.indexOf('name repaired')===0)
+    return ['filename repaired, re-checking', 'p-ok', ''];
+  // Everything the server writes for a held rename now reads as prose and may
+  // carry a "To fix:" tail. Peel that off so it can be shown as guidance.
+  const i = s.indexOf('To fix:');
+  const why = (i >= 0 ? s.slice(0, i) : s).trim().replace(/\.$/, '');
+  const fix = i >= 0 ? s.slice(i + 7).trim().replace(/\.$/, '') : '';
+  const permanent = /^not retrying/i.test(s) || /^gave up/i.test(s);
+  return [why, permanent ? 'p-bad' : 'p-warn', fix];
+}
+async function loadRenq(){
+  const el=document.getElementById('renq'), head=document.getElementById('renqHead');
+  if(!el) return;
+  let q;
+  try{ q=await (await fetch('/api/renames/queue')).json(); }catch(_){ return; }
+  if(!q.pending && !q.gave_up){
+    if(head) head.style.display='none';
+    el.innerHTML='<div class="dim" style="padding:10px 14px;border-bottom:1px solid var(--line)">'
+      +'nothing waiting — every processed file has been renamed'
+      +(q.done?` <span style="opacity:.7">(${fmt(q.done)} handled so far)</span>`:'')
+      +'</div>';
+    return;
+  }
+  const rows=(q.rows||[]).map(r=>{
+    const [why,cls,fix]=renqWhy(r.last_error);
+    const wait=Math.max(0,Math.round(r.next_try_at-Date.now()/1000));
+    // A first pass is not "try 1 of 6". Only call it a retry once an attempt
+    // has actually failed, which is what attempts>1 means.
+    const retrying = (r.attempts||0) > 1;
+    const pill = retrying
+      ? `<span class="pill p-warn" title="an earlier attempt did not land">retry ${r.attempts-1}/5</span>`
+      : `<span class="pill p-ok" title="the normal path: waiting for the arr to re-read the file">first pass</span>`;
+    return `<tr>
+      <td class="wrap"><div>${esc((r.path||'').split('\\').pop())}</div>
+        <div class="sub ${cls==='p-bad'?'rq-bad':cls==='p-warn'?'rq-warn':'dim'}"
+          >${esc(why)}</div>
+        ${fix?`<div class="sub rq-fix">To fix: ${esc(fix)}</div>`:''}</td>
+      <td class="nb">${pill}</td>
+      <td class="num dim nb">${wait>0?('in '+hms(wait)):'due now'}</td></tr>`;
+  }).join('');
+  if(head){
+    head.style.display='';
+    head.className='pinhead';
+    // Counted separately. Lumping the two together is what made a queue that
+    // is almost always just "waiting its turn" read as a backlog of failures.
+    const bits=[];
+    if(q.first_try) bits.push(`<b>${fmt(q.first_try)}</b> waiting for the arrs`);
+    if(q.retrying)  bits.push(`<b class="err">${fmt(q.retrying)}</b> retrying after a failure`);
+    head.innerHTML=
+      (bits.join(' <span class="dim">·</span> ') || `<b>${fmt(q.pending)}</b> queued`)
+      + ` <span class="dim">· ${fmt(q.due)} due now</span>`
+      + (q.gave_up?`<span class="err"> · ${fmt(q.gave_up)} gave up</span>`:'');
+  }
+  el.innerHTML=
+    (rows?`<table class="fixed vtop"><tr><th>File</th>
+        <th class="nb" style="width:92px">Attempt</th>
+        <th class="num nb" style="width:92px">Next try</th></tr>${rows}</table>`:'');
+}
+// ---- pending file replaces ----------------------------------------------
+// A deferred commit means the ENCODE IS DONE and only the swap is outstanding,
+// so the wording avoids "failed": nothing was lost, and the output is being
+// held in the cache until the original can be replaced.
+function cmqWhy(err){
+  const s=String(err||'');
+  if(!s) return ['waiting to retry','p-dim'];
+  if(/still in use by/i.test(s))  return [s,'p-warn'];
+  if(/gave up/i.test(s))          return [s,'p-bad'];
+  if(/no longer exists|cache output is gone/i.test(s)) return [s,'p-dim'];
+  return [s,'p-warn'];
+}
+async function loadCmq(){
+  const el=document.getElementById('cmq'), cnt=document.getElementById('cmqCount');
+  const head=document.getElementById('cmqHead');
+  if(!el) return;
+  let q;
+  try{ q=await (await fetch('/api/commits/queue')).json(); }catch(_){ return; }
+  if(cnt) cnt.textContent = q.pending ? `(${fmt(q.pending)})` : '';
+  if(!q.pending && !q.gave_up){
+    if(head) head.style.display='none';
+    el.innerHTML='<div class="dim" style="padding:14px">'
+      +'nothing pending — every finished encode was swapped in cleanly</div>';
+    return;
+  }
+  const rows=(q.rows||[]).map(r=>{
+    const [why,cls]=cmqWhy(r.last_error);
+    const wait=Math.max(0,Math.round(r.next_try_at-Date.now()/1000));
+    return `<tr>
+      <td class="wrap"><div>${esc((r.target||'').split('\\').pop())}</div>
+        <div class="dim sub">${esc(why)}</div></td>
+      <td class="nb"><span class="pill ${cls}">${r.attempts?('try '+r.attempts+'/6'):'queued'}</span></td>
+      <td class="num dim nb">${wait>0?('in '+hms(wait)):'due now'}</td></tr>`;
+  }).join('');
+  if(head){
+    head.style.display='';
+    head.className='pinhead';
+    head.innerHTML=
+      `<b>${fmt(q.pending)}</b> waiting to replace the original
+       ${q.cache_held_bytes?`<span class="dim">· <span class="m-size">`
+          +`${gb(q.cache_held_bytes)}</span> held in cache</span>`:''}
+       ${q.gave_up?`<span class="err"> · ${fmt(q.gave_up)} gave up</span>`:''}`;
+  }
+  el.innerHTML=
+    (rows?`<table class="fixed vtop"><tr><th>File</th>
+        <th class="nb" style="width:92px">Attempt</th>
+        <th class="num nb" style="width:92px">Next try</th></tr>${rows}</table>`:'');
+}
+async function retryCommits(){
+  const m=document.getElementById('cmqMsg');
+  m.textContent='retrying…';
+  try{
+    const r=await (await fetch('/api/commits/retry?all=true',{method:'POST'})).json();
+    m.textContent=`tried ${r.tried}: ${r.ok} replaced, ${r.failed} still waiting`
+      +(r.gave_up?`, ${r.gave_up} gave up`:'');
+  }catch(e){ m.textContent='retry failed'; }
+  loadCmq();
+}
+setInterval(loadCmq, 8000);
+
+// ---- pending OCR subtitles ----------------------------------------------
+async function loadSocrPending(){
+  const el=document.getElementById('socrp'), cnt=document.getElementById('socrpCount');
+  if(!el) return;
+  let d;
+  try{ d=await (await fetch('/api/subocr/pending')).json(); }catch(_){ return; }
+  if(cnt) cnt.textContent = d.pending ? `(${fmt(d.pending)})` : '';
+  if(!d.pending){
+    setHTML(el, '<div class="dim" style="padding:14px">nothing waiting — '
+      +'every prepared subtitle has been embedded</div>');
+    return;
+  }
+  const rows=(d.rows||[]).map(r=>{
+    const orphan = /ORPHANED/.test(r.consumer);
+    // Stranded is not the same as orphaned: the FILE is fine, but nothing is
+    // scheduled to carry these subtitles in, so they would wait forever. It
+    // gets its own pill and its own remedy rather than hiding inside "waiting".
+    const stuck = !!r.stranded && !orphan;
+    // Age matters: freshly prepared is normal, hours-old means the consumer
+    // never came and the subtitle queue should be the one picking it up.
+    const stale = r.age_s > 6*3600;
+    return `<tr>
+      <td class="wrap"><div>${esc(r.title||'')}</div>
+        <div class="dim sub">${esc(r.tracks.join(', '))}</div></td>
+      <td class="nb"><span class="pill ${orphan?'p-bad':(stuck?'p-bad':(stale?'p-warn':'p-ok'))}"
+          title="${esc(r.path||'')}">${orphan?'orphaned':(stuck?'stranded':(stale?'stale':'waiting'))}</span></td>
+      <td class="${stuck?'err':'dim'} nb">${esc(r.consumer)}</td>
+      <td class="num dim nb">${hms(r.age_s)} old</td>
+      <td class="nb">${stuck?`<button class="on"
+            title="queue the rewrite that carries these in — no second OCR, the subtitles are already made"
+            onclick="socrpCollect(${r.file_id})">Collect</button> `:''}<button
+          title="discard these prepared subtitles — redoing them costs one OCR pass"
+          onclick="socrpClear(${r.file_id})">Discard</button></td></tr>`;
+  }).join('');
+  setHTML(el, `<div class="dim" style="padding:6px 14px;font-size:11px">
+      ${fmt(d.pending)} prepared, ${gb(d.bytes)} of SRT waiting for the next rewrite of each file
+    </div><table class="fixed vtop">${rows}</table>`);
+}
+// Queue the rewrite that will carry stranded subtitles in. A transcode is
+// tried first because it does everything in ONE pool rewrite; if the file
+// needs no transcode, the subtitle job embeds them on its own. Either way the
+// OCR is not repeated - the SRTs already exist and the pending-first branch
+// picks them up.
+async function socrpCollect(id){
+  try{
+    let r = await fetch('/api/files/'+id+'/queue', {method:'POST'});
+    let j = await r.json();
+    if(!j.queued){
+      // "nothing to do" for a transcode still leaves subtitles to embed.
+      await fetch('/api/subocr/queue?file_id='+id, {method:'POST'});
+    }
+  }catch(_){}
+  loadSocrPending();
+}
+// ---- what Plex had to work at --------------------------------------------
+const PBCOL = {audio:'#e3b341', video:'var(--acc)', subtitle:'#b48bf2',
+               container:'#58c8d8'};
+// SORTED BY LATEST, NOT BY HIT COUNT.
+//
+// The server returns these "n DESC, last_at DESC" - most-repeated first -
+// which answers "what is the worst offender in 30 days". That is a good
+// question, but it is not the one people arrive with. Coming to this panel
+// usually means something just stuttered, and "what happened in the last hour"
+// was buried under month-old rows that had simply accumulated more hits.
+//
+// Latest first by default; every column clickable; clicking the active column
+// flips direction. Sorting re-renders from the cached response rather than
+// re-fetching, so it cannot cost a round trip or lose the open detail row.
+let _pbData=null, _pbSort='last_at', _pbDir=-1;
+function sortPb(col){
+  if(_pbSort===col) _pbDir = -_pbDir;
+  // Text starts A-Z, numbers and dates start biggest-first, because that is
+  // what each one is useful for on first click.
+  else { _pbSort = col; _pbDir = (col==='title'||col==='kinds'||col==='codecs') ? 1 : -1; }
+  renderPlayback();
+}
+async function loadPlayback(){
+  const el=document.getElementById('pb');
+  if(!el) return;
+  let d; try{ d=await (await fetch('/api/playback?days=30')).json(); }catch(_){ return; }
+  _pbData=d;
+  renderPlayback();
+}
+function renderPlayback(){
+  const el=document.getElementById('pb'), cnt=document.getElementById('pbCount');
+  if(!el || !_pbData) return;
+  const d=_pbData;
+  if(cnt) cnt.textContent = d.total ? `(${fmt(d.total)} in 30 days)` : '';
+  if(!d.watching){
+    setHTML(el,'<div class="dim" style="padding:14px">Plex is not connected, '
+      +'so playback cannot be observed.</div>'); return; }
+  if(!d.total){
+    setHTML(el,'<div class="dim" style="padding:14px">Nothing in the last 30 '
+      +'days — every session played straight from the file, which is the '
+      +'whole point.</div>'); return; }
+  const causes=(d.by_cause||[]).map(c=>{
+    const col=PBCOL[c.stream_kind]||'var(--dim)';
+    return `<span class="pill" style="color:${col};border-color:${col}"
+      title="${esc(c.stream_act)} — ${fmt(c.n)} time(s)">${esc(c.stream_kind)}${
+      c.src_codec?' '+esc(c.src_codec):''} x${fmt(c.n)}</span>`;
+  }).join(' ');
+  const clients=(d.by_client||[]).slice(0,4)
+    .map(c=>`${esc(c.product||c.client||'?')} x${fmt(c.n)}`).join(' · ');
+
+  const files=(d.files||[]).slice().sort((a,b)=>{
+    const k=_pbSort;
+    let x=a[k], y=b[k];
+    if(k==='title'||k==='kinds'||k==='codecs')
+      return String(x||'').localeCompare(String(y||''))*_pbDir;
+    x = (x==null?-1:x); y = (y==null?-1:y);
+    // Ties fall back to most recent, so equal counts never shuffle between
+    // repaints - the panel polls, and a list that reorders itself under the
+    // cursor is worse than one sorted slightly differently.
+    if(x===y) return (b.last_at||0)-(a.last_at||0);
+    return (x<y?-1:1)*_pbDir;
+  });
+
+  const rows=files.map(r=>{
+    const open = _pbOpen === (r.path||r.title);
+    const head = `<tr class="${open?'rowopen':''}">
+      <td class="wrap"><span class="tl" onclick="pbDetail('${b64e(r.path||'')}')"
+            title="click for every session, client by client">${esc(r.title||'')}</span></td>
+      <td class="nb"><div class="pbkinds">${String(r.kinds||'').split(',').map(k=>{
+          const col=PBCOL[k]||'var(--dim)';
+          return `<span class="pill" style="color:${col};border-color:${col}">${esc(k)}</span>`;
+        }).join('')}</div></td>
+      <td class="dim nb mono" style="padding-left:4px">${esc(r.codecs||'')}</td>
+      <td class="num nb">${fmt(r.n)}</td>
+      <td class="num dim nb">${r.clients}</td>
+      <td class="num dim nb" title="${esc(new Date((r.last_at||0)*1000).toLocaleString())}"
+        >${ago(r.last_at)}</td></tr>`;
+    return head + (open ? `<tr class="logdrop"><td colspan="6">${
+      _pbDetailHtml||'<div class="dim" style="padding:10px 14px">loading…</div>'
+    }</td></tr>` : '');
+  }).join('');
+
+  const arrow=c=>_pbSort===c?(_pbDir>0?' \u25b2':' \u25bc'):'';
+  const th=(c,label,cls,w)=>`<th class="${cls||''}" style="cursor:pointer${
+      w?';width:'+w:''}" title="sort by ${label.toLowerCase()}"
+      onclick="sortPb('${c}')">${label}${arrow(c)}</th>`;
+  setHTML(el, `<div style="padding:8px 14px;border-bottom:1px solid var(--line)">
+      <div class="dim" style="font-size:11px;margin-bottom:5px">what caused it</div>
+      ${causes}
+      ${clients?`<div class="dim" style="font-size:11px;margin-top:7px">clients: ${clients}</div>`:''}
+    </div>
+    <div class="scrollbox auto nohz"><table class="fixed vtop">
+      <tr>${th('title','Title')}${th('kinds','Track','nb','186px')}
+          ${th('codecs','Codec','nb','122px')}
+          ${th('n','Times','num nb','56px')}
+          ${th('clients','Clients','num nb','62px')}
+          ${th('last_at','Last','num nb','74px')}</tr>
+      ${rows}</table></div>
+    <div class="dim" style="padding:8px 14px;font-size:11px">
+      A file here made Plex rebuild something instead of playing it. One hit from
+      one unusual client is normal; the same file across several clients is a
+      rule worth adding.</div>`);
+}
+async function pbPoll(){
+  try{ await fetch('/api/playback/poll',{method:'POST'}); }catch(_){}
+  loadPlayback();
+}
+// The evidence behind one summary row: every session, with the client that
+// asked and what Plex sent it. Base64 for the path - see bgo() for why a
+// quoted Windows path inside an inline onclick does not survive.
+let _pbOpen=null, _pbDetailHtml='';
+async function pbDetail(p64){
+  const path = b64d(p64);
+  if(_pbOpen === path){ _pbOpen=null; _pbDetailHtml=''; loadPlayback(); return; }
+  _pbOpen = path; _pbDetailHtml='';
+  loadPlayback();
+  let d; try{
+    d = await (await fetch('/api/playback/detail?path='
+        + encodeURIComponent(path))).json();
+  }catch(_){ return; }
+  // One block per SESSION, its tracks inside it. The flat list repeated the
+  // same client and the same reason once per stream per poll, so a single
+  // viewing looked like a recurring fault - which is the opposite of what this
+  // panel exists to tell you.
+  const blocks=(d.sessions||[]).map(s=>{
+    const started=new Date(s.started*1000), ended=new Date(s.ended*1000);
+    const mins=Math.max(0, Math.round((s.ended-s.started)/60));
+    const span = mins>=1
+      ? `${started.toLocaleTimeString()} – ${ended.toLocaleTimeString()} <span class="dim">(${mins} min)</span>`
+      : started.toLocaleTimeString();
+    const cells=(s.streams||[]).map(e=>{
+      const col=PBCOL[e.stream_kind]||'var(--dim)';
+      const change = (e.src_codec||e.dst_codec)
+        ? `<b class="mono">${esc(e.src_codec||'?')}</b>`
+          + `<span class="arrow"> → </span>`
+          + `<b class="mono">${esc(e.dst_codec||'?')}</b>`
+        : '<span class="dim">container only</span>';
+      return `<span><span class="pill" style="color:${col};border-color:${col}"
+          >${esc(e.stream_kind)} ${esc(e.stream_act)}</span></span>
+        <span>${change}</span>
+        <span class="dim">${esc(e.detail||'')}</span>`;
+    }).join('');
+    return `<div class="pbsess">
+      <div class="pbsesshead">
+        <span>${esc(started.toLocaleDateString())} · ${span}</span>
+        <span class="dim">${esc(s.product||'')}${s.client?' · '+esc(s.client):''}${
+          s.user?' · '+esc(s.user):''}</span>
+        ${s.legacy?'<span class="dim" title="recorded before nuarr tracked session ids, so these were grouped by viewer, device and start time">grouped by time</span>':''}
+      </div>
+      <div class="pbdet3">
+        <span class="h">Track</span><span class="h">Sent as</span><span class="h">Why</span>
+        ${cells}</div></div>`;
+  }).join('');
+  const n=(d.sessions||[]).length;
+  _pbDetailHtml = `<div class="dim mono" style="font-size:10.5px;
+        padding:2px 14px 0;overflow-wrap:anywhere">${esc(d.path||path)}</div>
+    ${blocks ? `<div class="dim" style="padding:6px 14px 0;font-size:11px"
+        >${fmt(n)} session${n===1?'':'s'} recorded</div>${blocks}`
+      : '<div class="dim" style="padding:10px 14px">no sessions recorded</div>'}
+    <div class="dim" style="padding:0 14px 10px;font-size:11px">Same track on
+      several different clients means the file is the problem. One client every
+      time means that device is.</div>`;
+  loadPlayback();
+}
+setInterval(loadPlayback, 30000);
+
+// ---- nightly rule check ---------------------------------------------------
+// WHICH RUN THE PANEL IS SHOWING. 0 means "whatever is newest", which is what
+// it has to be for an auto-refreshing panel - pinning to an id would silently
+// stop following as soon as a new run landed. Set by clicking a run in the
+// timeline; cleared by clicking the latest one again.
+let _auRun = 0;
+// WHAT EACH HEAL VERDICT MEANS. These are the whole point of the healer: the
+// difference between "this will fix itself" and "no rule will ever fix this"
+// is the difference between a backlog and a bug.
+const AUHEAL = {
+  queued:    ['requeued',        'var(--warn)',
+              'the planner had work for this file, so it has been queued — '
+             +'this finding should be gone by the next check'],
+  fixed:     ['fixed',           'var(--ok)',
+              're-read from disk after the requeue and it now matches every rule'],
+  unfixable: ['no rule fixes it','var(--bad)',
+              'the planner has no work for this file, so nothing in the rules '
+             +'acts on this finding. The check is right and the rules have a '
+             +'gap — this needs a rule change, not another requeue'],
+  'gave-up': ['not fixing',      'var(--bad)',
+              'requeued the maximum number of times and still flagged, so the '
+             +'plan is not doing what the audit measures'],
+  error:     ['heal failed',     'var(--bad)', 'the requeue itself errored'],
+};
+function auHealCell(h){
+  if(!h) return '';
+  const [word, col, why] = AUHEAL[h.state] || [h.state, 'var(--dim)', ''];
+  return `<span class="pill" style="color:${col};border-color:${col}"
+            title="${esc(why)}">${esc(word)}</span>`
+       + (h.attempts>1?` <span class="dim" style="font-size:10px"
+            title="how many times the audit has requeued this file">×${h.attempts}</span>`:'');
+}
+// A SLOW OR FAILED LOAD MUST NOT LOOK LIKE A DEAD PANEL.
+//
+// This used to be `catch(_){ return; }` - on any failure the panel silently
+// kept whatever it was already showing. /api/audit was measured between 0.3 s
+// and 4.6 s while /api/jobs/live answered in 0.03 s, so clicking a run could
+// leave the panel unchanged for seconds with no sign anything was happening,
+// then fail with no sign anything had. Both read as "the panel is locked".
+//
+// _auSeq drops stale responses: two clicks in quick succession used to race,
+// and whichever request happened to finish last won regardless of which run
+// was actually asked for last.
+let _auSeq=0, _auBusy=false;
+async function loadAudit(){
+  const el=document.getElementById('au'), cnt=document.getElementById('auCount');
+  if(!el) return;
+  const seq=++_auSeq;
+  // Only mark the panel busy if the fetch is actually slow. Flashing a spinner
+  // on a 30 ms response is noise.
+  const slow=setTimeout(()=>{ if(seq===_auSeq && cnt) cnt.textContent='(loading…)'; }, 400);
+  let d;
+  try{
+    const res=await fetch('/api/audit?run_id='+(_auRun||0));
+    if(!res.ok) throw new Error('HTTP '+res.status);
+    d=await res.json();
+  }catch(e){
+    clearTimeout(slow);
+    if(seq!==_auSeq) return;
+    if(cnt) cnt.textContent='';
+    setHTML(el,`<div class="err" style="padding:14px">could not read the rule
+      check — ${esc(String(e&&e.message||e))}
+      <div class="dim" style="margin-top:6px">the server may be busy committing
+      a file; this retries on its own</div>
+      <div style="margin-top:8px"><button onclick="loadAudit()">try now</button>
+      ${_auRun?` <button onclick="auShowRun(0)">back to the latest</button>`:''}</div>
+      </div>`);
+    auSchedule(15000);
+    return;
+  }
+  clearTimeout(slow);
+  if(seq!==_auSeq) return;          // a newer click already won
+  const r=d.run;
+  if(!r){
+    setHTML(el,'<div class="dim" style="padding:14px">No check has run yet — '
+      +'the first one happens on its own, or press Run now.</div>'); return; }
+  const isLatest = !_auRun || _auRun===d.latest_id;
+  if(cnt) cnt.textContent = isLatest ? `(${ago(r.at)})`
+                                     : `(viewing an older run)`;
+  let by={}; try{ by=JSON.parse(r.by_rule||'{}'); }catch(_){}
+  // Heal state keyed by file - needed here already, because the headline and
+  // the rule pills below have to tell the same story the timeline tells.
+  const hmap={}; (d.heals||[]).forEach(h=>{ hmap[h.file_id]=h; });
+  // THE HEADLINE FOLLOWS THE HEALS, exactly like the timeline bars. It used
+  // to show the run's stored violation count forever, so the panel could say
+  // "1 breaking a rule" in red above a teal bar meaning "that one was fixed"
+  // - two elements reading the same fact from different moments. Same source
+  // as the bars now: flagged minus fixed is what is STILL broken.
+  const hrow=(d.history||[]).find(h=>h.id===d.run_id)||{};
+  const stillN=Math.max(0,(hrow.flagged_files||0)-(hrow.fixed_files||0));
+  const allHealed = r.violations>0 && (hrow.flagged_files||0)>0 && stillN===0;
+  // Per-rule fix state from the findings themselves, so each pill can go teal
+  // the moment every file IT flagged is fixed - not just when the whole run
+  // is. A rule whose findings are only partially fixed stays red.
+  const ruleFix={};
+  (d.findings||[]).forEach(f=>{
+    const o=ruleFix[f.rule]=ruleFix[f.rule]||{n:0,fixed:0};
+    o.n++; if((hmap[f.file_id]||{}).state==='fixed') o.fixed++;
+  });
+  const pills=Object.entries(by).sort((a,b)=>b[1]-a[1]).map(([k,v])=>{
+    const rf=ruleFix[k];
+    const done=rf && rf.n>=v && rf.fixed>=rf.n;
+    return done
+      ? `<span class="pill" style="color:var(--auheal,#39d3c3);border-color:#155e56"
+           title="every file this run flagged for ${esc(k)} has since been fixed"
+           >${esc(k)} x${v} ✓</span>`
+      : `<span class="pill p-bad">${esc(k)} x${v}</span>`;
+  }).join(' ')
+    || '<span class="pill p-ok">every checked file matches the rules</span>';
+
+  // THE TIMELINE IS NOW THE NAVIGATION, not decoration.
+  //
+  // It was a row of coloured blocks with a tooltip - it could tell you a run
+  // had found something and then refused to say what. Every block is a button
+  // onto that run's findings, which is the only way to answer "was this
+  // happening last week" without opening the database.
+  // Three colours, not two. Red kept meaning "this run found problems" long
+  // after every one of those problems was fixed, so the timeline could never
+  // show the healer winning - a fully-resolved run looked identical to an
+  // ignored one. Teal is "found problems, all since fixed": historically
+  // interesting, no longer anyone's job. Red now always means work standing.
+  const hist=(d.history||[]).slice().reverse();
+  const bars=hist.map(h=>{
+    const sel = (h.id===d.run_id);
+    const allFixed = h.violations>0 && h.flagged_files>0
+                     && h.fixed_files>=h.flagged_files;
+    const col = allFixed ? 'var(--auheal, #39d3c3)'
+              : h.violations ? 'var(--bad)' : 'var(--ok)';
+    let hb={}; try{ hb=JSON.parse(h.by_rule||'{}'); }catch(_){}
+    const what=Object.entries(hb).map(([k,v])=>`${k} x${v}`).join(', ')
+               || 'clean';
+    return `<button class="aubar${sel?' on':''}"
+      onclick="auShowRun(${h.id})"
+      title="${esc(new Date(h.at*1000).toLocaleString())}
+${h.violations} of ${h.checked} files breaking a rule — ${esc(what)}${
+  allFixed ? `
+every file this run flagged has since been fixed` : (h.violations && h.fixed_files
+  ? `
+${h.fixed_files} of ${h.flagged_files} flagged file(s) since fixed` : '')}
+click to read this run's findings"
+      style="background:${col};opacity:${h.violations?(allFixed?.85:1):.4}"></button>`;
+  }).join('');
+
+  // A FIXED ROW IS EVIDENCE, NOT A TASK.
+  //
+  // The finding stays on the run that recorded it - that is the whole point of
+  // being able to open an old run - but once the file has been re-read from
+  // disk and matches every rule, the row is history. It was still painted in
+  // the same red as an outstanding violation and still carried a Requeue
+  // button, which invited you to queue a rewrite of a file that is already
+  // correct: the planner would answer "nothing to do", and that reply is
+  // indistinguishable from the one a genuinely unfixable file gives. So a
+  // healed row goes green and loses the button, and the only thing left to
+  // read is what was wrong and that it no longer is.
+  // THE BUTTON HAS TO MATCH THE VERDICT.
+  //
+  // Every row offered "Requeue" regardless of what had already been decided
+  // about it, and on a file the rules cannot fix that is an invitation to keep
+  // pressing something that answers "nothing to do" forever. Three states, three
+  // affordances: a fixed row is finished and offers nothing, a row no rule can
+  // fix offers "Try again" (which is honest - it only helps once a RULE has
+  // changed), and everything else is a genuine requeue.
+  // WHAT IT IS -> WHAT IT SHOULD BE, as two values, not a sentence.
+  //
+  // "picture sub 0 sits before the text dialogue track 1" made the reader
+  // reconstruct both halves of the comparison from prose. Every violation IS a
+  // comparison - the server now sends found/want split apart, so the row can
+  // show them the way a diff would. Older findings predate the split and fall
+  // back to their stored sentence.
+  const auIsWant=(f,done)=> f.found
+    ? `<span class="auis${done?' fixed':''}">${esc(f.found)}</span>
+       <span class="auarr">→</span><span class="auwant">${esc(f.want||'')}</span>`
+    : `<span class="${done?'dim':'err'}">${esc(f.detail||'')}</span>`;
+  const rows=(d.findings||[]).map(f=>{
+    const h=hmap[f.file_id], st=(h||{}).state;
+    const done=st==='fixed', stuckRow=(st==='unfixable'||st==='gave-up');
+    let act='';
+    if(f.file_id && !done) act = stuckRow
+      ? `<button onclick="auRequeue(${f.file_id})"
+           title="No rule currently fixes this. Worth pressing after you have changed a rule that was meant to.">Try again</button>`
+      : `<button onclick="auRequeue(${f.file_id})"
+           title="Plan this file again under the current rules and queue it if there is work to do">Requeue</button>`;
+    return `<tr class="${done?'aufixed':''}">
+      <td class="nb"><span class="pill ${done?'p-ok':'p-bad'}">${esc(f.rule)}</span></td>
+      <td class="wrap"><div title="from the ${esc(f.bucket)} sample">${esc(String(f.path||'').split('\\').pop())}</div>
+        <div class="auiw">${auIsWant(f,done)}</div>
+        <div class="dim sub" id="aufix${f.file_id}">${_auFix[f.file_id]||''}</div></td>
+      <td class="nb">${auHealCell(h)}</td>
+      <td class="nb">${act}</td></tr>`;
+  }).join('');
+
+  // STANDING GAPS. Files the healer has concluded no rule will fix, carried
+  // across runs on purpose - they are absent from today's findings whenever
+  // the random sample misses them, and they are exactly the rows that must not
+  // be forgotten. This list not shrinking is the signal to go and change a rule.
+  // NEVER LIST THE SAME FILE TWICE. A file flagged in the run being viewed AND
+  // carrying a terminal verdict appeared in both tables, with the same pill and
+  // the same message - and because both rows used id="aufix<file_id>", the two
+  // copies had DUPLICATE DOM IDS, so pressing the button on the lower one wrote
+  // its reply into the upper one and the row you clicked never changed.
+  const shown=new Set((d.findings||[]).map(f=>f.file_id));
+  const stuck=(d.heals||[]).filter(h=>
+    (h.state==='unfixable'||h.state==='gave-up') && !shown.has(h.file_id));
+  const stuckRows=stuck.map(h=>`<tr>
+      <td class="nb"><span class="pill p-bad">${esc(h.rule)}</span></td>
+      <td class="wrap"><div>${esc(String(h.path||'').split('\\').pop())}</div>
+        <div class="dim sub">${esc(h.detail||'')}</div>
+        <div class="dim sub" id="augap${h.file_id}">${_auFix[h.file_id]||''}</div></td>
+      <td class="dim nb">${esc(ago(h.last_at))}</td>
+      <td class="nb">${auHealCell(h)}</td>
+      <td class="nb"><button onclick="auRequeue(${h.file_id})"
+        title="Plan this file again. Worth pressing after you have changed a rule that was meant to fix this.">Try again</button></td>
+    </tr>`).join('');
+
+  const t=d.heal_tally||{}, hc=d.heal||{};
+  const st=d.stats||{};
+  const next = st.next_run
+    ? (st.next_run*1000 > Date.now()
+        ? 'next in ' + hms(Math.round(st.next_run - Date.now()/1000))
+        : 'due now')
+    : 'not scheduled yet';
+  const covers=(d.covers||[]).map(c=>
+    `<div style="margin:3px 0"><b>${esc(c.area)}</b>
+      <span class="dim"> — ${esc(c.what)}</span></div>`).join('');
+  const err = st.last_error || st.heal_error;
+
+  // THE SCOREBOARD. The old header was one long sentence: five numbers spread
+  // through fifteen words, all the same size, and "what failed / what got
+  // fixed" - the two things the panel exists to answer - visually identical
+  // to the bookkeeping around them. Four figures, one glance, colour doing
+  // the reading: red means files are wrong, green means the healer dealt with
+  // some, and the red "need a rule change" is the only number a person ever
+  // has to act on.
+  const score = `
+    <span class="aubox"><b class="aunum">${fmt(r.checked)}</b>
+      <span class="aulbl">files read</span></span>
+    <span class="aubox"><b class="aunum" style="color:${
+        stillN?'var(--bad)':allHealed?'var(--auheal,#39d3c3)':'var(--ok)'}"
+      >${fmt(stillN||(allHealed?r.violations:0))}</b><span class="aulbl">${
+        stillN? 'still breaking a rule'
+               +((hrow.fixed_files||0)?` (of ${fmt(r.violations)} found)`:'')
+        : allHealed? 'found, all since fixed'
+        : 'breaking a rule'}</span></span>
+    ${t.fixed?`<span class="aubox"><b class="aunum" style="color:var(--ok)"
+      >${fmt(t.fixed)}</b><span class="aulbl">self-healed</span></span>`:''}
+    ${t.queued?`<span class="aubox"><b class="aunum" style="color:var(--warn)"
+      >${fmt(t.queued)}</b><span class="aulbl">queued to fix</span></span>`:''}
+    ${stuck.length?`<span class="aubox"><b class="aunum" style="color:var(--bad)"
+      >${fmt(stuck.length)}</b><span class="aulbl">need a rule change</span></span>`:''}`;
+
+  // LIVE STATUS. A run is 60+ ffprobes off spinning disks and a heal re-reads
+  // every flagged file; both take real time, and a panel that only repaints at
+  // the end reads as frozen for exactly that long - which got reported as
+  // "clicking locks the panel" when the click was merely waiting. While either
+  // is active this line shows it moving and loadAudit polls fast (see
+  // auSchedule) so the numbers climb in front of you.
+  let live='';
+  if(st.running){
+    live = `<span class="busy"><span class="sp"></span><span class="step">
+      checking now — ${fmt(st.live_checked||0)} file(s) read so far</span></span>`;
+  }else if(st.heal_running){
+    live = `<span class="busy"><span class="sp"></span><span class="step">
+      self-heal running — ${fmt(st.heal_done||0)} of ${fmt(st.heal_total||0)} re-read
+      ${st.heal_current?' · '+esc(st.heal_current):''}</span></span>`;
+  }
+
+  setHTML(el, `<div style="padding:9px 14px;border-bottom:1px solid var(--line)">
+      ${err?`<div class="err" style="margin-bottom:7px">${esc(err)}</div>`:''}
+      <div class="auscore">${score}
+        <span class="dim" style="margin-left:auto;font-size:11px;text-align:right">
+          ${esc(new Date(r.at*1000).toLocaleString())}<br>
+          ${isLatest?`runs every ${d.every_hours||24}h, ${esc(next)}`
+                    :`<button onclick="auShowRun(0)">back to the latest</button>`}</span>
+      </div>
+      ${live?`<div style="margin-top:7px">${live}</div>`:''}
+      <div style="margin-top:8px">${pills}</div>
+      ${bars?`<div class="aubars"><span class="dim"
+        style="font-size:11px;margin-right:7px">every run</span>${bars}
+        <span class="dim" style="font-size:10.5px;margin-left:7px">oldest → newest ·
+        <span style="color:var(--bad)">■</span> still broken
+        <span style="color:var(--auheal,#39d3c3)">■</span> since fixed
+        <span style="color:var(--ok)">■</span> clean ·
+        click one to read it</span></div>`:''}
+    </div>
+    <details class="auwhat"><summary>What this check reads, and what the words mean</summary>
+    <div class="dim" style="padding:2px 14px 10px;font-size:11.5px">
+      Takes ${d.per_bucket||6} random finished files from each of
+      ${(d.buckets||[]).length} kinds of file — ${esc((d.buckets||[]).join(', '))}
+      — and reads the real streams back off the pool with ffprobe rather than
+      trusting the database. Then it checks:
+      <div style="margin-top:6px">${covers}</div>
+      <div style="margin-top:7px"><b style="color:var(--bad)">Breaking a rule</b>
+        means the file contradicts what the rules promise — either a rule is not
+        doing its job, or something wrote the file after nuarr did.
+        <b>Waiting to be reprocessed</b> is not a fault: the file predates a rule
+        and its job has not run yet.</div>
+      <div style="margin-top:7px"><b>Self-heal</b> offers every flagged file to
+        the planner, which is the same code the queue uses. If the planner has
+        work, the file is requeued (at most ${hc.max_attempts||2} times, and no
+        more than ${hc.max_per_run||20} files per run). If it does not, the file
+        cannot be fixed by any current rule and is listed below rather than
+        retried forever.</div>
+    </div></details>
+    ${rows?`<div class="scrollbox auto nohz"><table class="fixed vtop">${rows}</table></div>`
+          :`<div class="dim" style="padding:12px 14px">Nothing to report — this
+             run's sample matched every rule.</div>`}
+    ${stuckRows?`<div class="auhead">No rule fixes these
+        <span class="dim" style="font-weight:400">— the check is right and the
+        rules have a gap. Requeuing will not clear them; a rule change will.</span></div>
+      <div class="scrollbox auto nohz"><table class="fixed vtop">${stuckRows}</table></div>`:''}`);
+  // Three speeds. Fast while a run or heal is visibly working; a middle gear
+  // while files sit at 'queued to fix', because the server re-verifies those
+  // the moment their jobs land and the colour flips deserve to be seen close
+  // to when the Transcoding panel shows the job finishing; a lazy minute when
+  // there is nothing in flight anywhere.
+  auSchedule((st.running||st.heal_running) ? 2500
+             : (t.queued>0) ? 10000 : 60000);
+}
+// Jump the panel to one run's findings. 0 restores follow-the-latest.
+function auShowRun(id){ _auRun = (id===_auRun ? 0 : id); loadAudit(); }
+async function auClearHeal(fid){
+  const el=document.getElementById('aufix'+fid);
+  if(el) el.textContent='clearing…';
+  try{ await fetch('/api/audit/heal/clear?file_id='+fid,{method:'POST'}); }catch(_){}
+  delete _auFix[fid];
+  loadAudit();
+}
+// Requeue one file straight from the finding that named it.
+//
+// It reports "nothing to do" when that is the answer, and this matters more
+// than it sounds. The first file this was tried on - Kaiju No. 8 S01E06,
+// flagged subs/order - came back with the planner saying "already set up
+// correctly", because nothing in the rules reorders subtitle tracks. A button
+// that queued a job, showed a spinner and left the finding standing would have
+// looked like nuarr failing to fix its own file. Saying so is the feature.
+// The answer is kept per file, because loadAudit() repaints this panel every
+// 60 seconds and rebuilds the rows from scratch. The first version wrote
+// straight into the div and the reply vanished at the next repaint - you
+// pressed a button, something flickered, and the panel looked unchanged.
+// THE BUTTON GOES THROUGH THE HEALER, NOT THE RAW QUEUE.
+//
+// It used to POST to the generic /api/files/{id}/queue and print the answer.
+// That made the most important reply - "nothing to do" - a piece of throwaway
+// text: nothing recorded it, so the row stayed red, kept its button, and gave
+// the same answer to the next press. Routing it through the healer means one
+// press produces the same stored verdict a nightly run would, so the row
+// repaints with the right colour, the right pill, and the right button - and
+// an unfixable file drops into the standing-gaps list where it belongs.
+const _auFix = {};
+async function auRequeue(fid){
+  // Write to BOTH possible homes for this file's reply. The row lives in the
+  // findings table or in the standing-gaps table depending on its verdict, and
+  // the verdict can change under this very call.
+  const show=html=>{ _auFix[fid]=html;
+    ['aufix','augap'].forEach(p=>{
+      const el=document.getElementById(p+fid); if(el) el.innerHTML=html; }); };
+  show('<span class="busy"><span class="sp"></span>'
+      +'<span class="step">planning under the current rules…</span></span>');
+  try{
+    const r=await (await fetch('/api/audit/heal/try?file_id='+fid,
+                               {method:'POST'})).json();
+    if(r.queued){
+      show('<span style="color:var(--ok)">queued</span> — '
+          +'this row clears once the check reads the file again');
+    }else if(r.fixed){
+      show('<span style="color:var(--ok)">already fixed</span> — '
+          +'re-read from disk just now and it matches every rule; the finding '
+          +'is history');
+    }else if(r.unfixable){
+      show('<span style="color:var(--bad)">no rule fixes this</span> — '
+          +'the planner has no work for this file, so nothing in the rules acts '
+          +'on this finding. It needs a rule change, not another requeue.');
+    }else if(r.skipped){
+      show('already queued or running');
+    }else{
+      show('<span style="color:var(--warn)">'+esc(r.why||'nothing happened')+'</span>');
+    }
+  }catch(e){ show('requeue failed: '+esc(String(e))); }
+  loadAudit();          // repaint the row with the verdict just recorded
+}
+// FIRE THE RUN, THEN WATCH IT - never await it.
+//
+// The old version awaited the POST, which does not return until every ffprobe
+// has finished, so the panel showed a static spinner for the whole run and
+// none of the live counters the server was maintaining. Kick the run off,
+// leave the promise to resolve whenever it does, and let loadAudit's fast
+// poll (which sees stats.running) narrate the progress instead. The short
+// delay before the first poll gives the server a beat to flip running=true.
+function auRun(){
+  _auRun = 0;                          // a fresh run is only visible on latest
+  fetch('/api/audit/run?per_bucket=5',{method:'POST'})
+    .catch(()=>{}).finally(()=>loadAudit());
+  setTimeout(loadAudit, 300);
+}
+// ADAPTIVE POLL, replacing a flat setInterval(60s). Sixty seconds is right
+// for a check that runs nightly and absurd while one is actually running -
+// the live counters above would move once, at the end, defeating the point of
+// sending them. Each load schedules the next itself: 2.5 s while the server
+// says a run or heal is active, a minute when idle. loadAudit clears the
+// pending timer first, so a click-triggered load never stacks on the timer's.
+let _auTimer=null;
+function auSchedule(ms){ clearTimeout(_auTimer); _auTimer=setTimeout(loadAudit, ms); }
+auSchedule(60000);
+
+async function socrpClear(id){
+  try{ await fetch('/api/subocr/pending/clear?file_id='+id, {method:'POST'}); }catch(_){}
+  loadSocrPending();
+}
+loadSocrPending();
+setInterval(loadSocrPending, 10000);
+
+async function retryRenames(){
+  const m=document.getElementById('renqMsg');
+  m.textContent='retrying…';
+  try{
+    const r=await (await fetch('/api/renames/retry?all=true',{method:'POST'})).json();
+    m.textContent=`tried ${r.tried}: ${r.ok} renamed, ${r.failed} still waiting`
+      +(r.gave_up?`, ${r.gave_up} gave up`:'');
+  }catch(e){ m.textContent='retry failed'; }
+  loadRenq();
+}
+setInterval(loadRenq, 8000);
+
+// ---- ffmpeg -------------------------------------------------------------
+// Writes ONLY to #ffState and #ffPath. It must never touch #ffMsg, which
+// belongs to the download - sharing it is what made the panel flicker.
+// Also guarded so two overlapping calls cannot interleave their writes.
+// "8.1.2-essentials_build-www.gyan.dev" is far too long for a header bubble -
+// keep the version, drop the build suffix.
+const short = v => String(v||'?').split('-')[0];
+let _ffChecking=false;
+// The header bubble is painted from TWO facts that arrive separately: the
+// version check and the NVENC probe. Whichever lands last must not wipe the
+// other's verdict, so both write to state and this repaints from both.
+//
+// A blocked encoder OUTRANKS the version, because "9.0 up to date" beside a
+// GPU that cannot encode is worse than saying nothing - it reads as healthy.
+let _ffPill = null, _ffNvencOk = null, _ffNvencWhy = '', _ffUp = null;
+function ffPillPaint(){
+  const pill=document.getElementById('ffPill');
+  if(!pill || !_ffPill) return;
+  let {cls, label, title} = _ffPill;
+  let extra='';
+
+  // THE MAIN BUBBLE ALWAYS NAMES THE BUILD THAT IS ACTUALLY RUNNING.
+  //
+  // It used to be rewritten to `ffmpeg 9.0 blocked` - the version you cannot
+  // have - which reads as though 9.0 is installed and broken, when in fact
+  // 7.1.4-Jellyfin is running perfectly well. And because the label depended
+  // on a verdict that arrives from a SECOND endpoint, it visibly switched:
+  // ffCheck() painted "ffmpeg 9.0 available", then ffNvenc() landed and
+  // flipped it to "ffmpeg 9.0 blocked". Two different wrong answers in
+  // sequence, for a version that is not on this machine.
+  //
+  // Now the version never moves - it is whatever is installed - and everything
+  // about the UPDATE is a separate pill beside it. Nothing async can rewrite
+  // the primary fact.
+  const running = (_ffUp && _ffUp.current) ? short(_ffUp.current) : null;
+  if(running) label = `ffmpeg ${running}`;
+
+  if(_ffNvencOk === false){
+    // Worst case: the build in use cannot encode at all. This one DOES belong
+    // on the main bubble, because it is about the running build.
+    cls = 'p-bad';
+    label = running ? `ffmpeg ${running} — GPU blocked` : 'ffmpeg — GPU blocked';
+    title = `${_ffNvencWhy}\nre-encodes will fail; stream copies still work\n${title}`;
+    extra = `<span class="pill p-bad blink" title="${esc(_ffNvencWhy)}"
+               style="cursor:pointer" onclick="wtab('ffmpeg')">no GPU encode</span>`;
+  }else if(_ffUp && _ffUp.blocked){
+    // A newer build exists and CANNOT be installed on this driver.
+    //
+    // No second bubble any more. It sat in the header saying "9.0 blocked"
+    // permanently, which is a standing alarm for a condition nothing on this
+    // machine can clear - and a header full of warnings you have learned to
+    // skip is worse than one that only lights up when something is actionable.
+    // The fact still exists: it is in this bubble's tooltip and spelled out in
+    // the ffmpeg tab, where the driver requirement is compared to the
+    // installed one line by line.
+    cls = 'p-ok';
+    title = `running ${_ffUp.current}`
+          + (_ffUp.pinned ? ' (pinned)' : '')
+          + `\n${_ffUp.latest} exists but cannot be installed here: ${_ffUp.why}`
+          + `\n${title}`;
+  }else if(_ffUp && _ffUp.pinned){
+    // Not blocked, but not the build the updater would pick either - say which
+    // one is really running so a pin cannot be forgotten about.
+    title = `pinned to ${_ffUp.current}\n${title}`;
+    extra = `<span class="pill p-warn" title="${esc('pinned to '+_ffUp.pinned)}"
+               style="cursor:pointer" onclick="wtab('ffmpeg')">pinned</span>`;
+  }
+
+  setHTML(pill, `<span class="pill ${cls}" title="${esc(title)}"
+    style="cursor:pointer" onclick="wtab('ffmpeg')">${esc(label)}</span>` + extra);
+}
+
+// GPU encoder self-test + whether the offered update is safe on this driver.
+// The distinction that matters: ffmpeg running is not the same as ffmpeg being
+// able to ENCODE. A build whose NVENC API is newer than the driver still runs,
+// still reports a version, and fails only when something needs the GPU.
+async function ffNvenc(){
+  const el=document.getElementById('ffNvenc');
+  if(!el) return;
+  // The NVENC probe spawns ffmpeg and the version check is a network call, so
+  // this panel can sit blank for seconds. Same skeleton the library browser
+  // uses, so "still loading" never looks like "nothing to report".
+  if(!el.innerHTML) el.innerHTML='<div class="skel"><i style="width:42%"></i>'
+                                +'<i style="width:66%"></i></div>';
+  let d;
+  try{ d=await (await fetch('/api/ffmpeg/nvenc')).json(); }
+  catch(_){ el.innerHTML=''; return; }
+  const u=d.upgrade||{};
+  const test = d.ok
+    ? `<span class="pill p-ok">GPU encode OK</span>`
+    : `<span class="pill p-bad">GPU encode UNAVAILABLE</span>`;
+  const drv = d.driver ? `<span class="dim">NVIDIA driver ${esc(d.driver)}</span>` : '';
+  let advice='';
+  if(u.known && d.update_available){
+    advice = u.safe
+      ? `<span class="pill p-ok">${esc(u.latest)} is safe to install</span>`
+      : `<span class="pill p-bad">do NOT install ${esc(u.latest)}</span>`
+        +` <span class="dim">${esc(u.why||'')}</span>`;
+  }else if(u.known && !d.update_available){
+    advice=`<span class="dim">on the newest build</span>`;
+  }
+  const pinned = d.pinned
+    ? `<div class="dim" style="margin-top:4px;font-size:11px">pinned to `
+      +`<span class="mono">${esc(d.pinned)}</span> — the updater still checks, `
+      +`jobs use this. <button onclick="ffUnpin()">Unpin</button></div>` : '';
+  // When it fails, lead with the CLASSIFIED reason and what to do about it;
+  // keep the raw ffmpeg text underneath so an unrecognised cause still shows
+  // everything we know rather than being swallowed by a friendly summary.
+  const c = d.cause || {};
+  const why = d.ok ? '' :
+      `<div style="margin-top:4px;font-size:11px">`
+    + `<b class="err">${esc(c.reason||'unknown')}</b>`
+    + (c.meaning?` <span class="dim">— ${esc(c.meaning)}</span>`:'')
+    + (c.known===false?` <span class="pill p-warn">unrecognised</span>`:'')
+    + `</div>`
+    + (d.error?`<div class="mono dim" style="margin-top:3px;font-size:10px;
+         overflow-wrap:anywhere">ffmpeg said: ${esc(d.error)}</div>`:'');
+  el.innerHTML = `<div style="display:flex;gap:9px;align-items:center;flex-wrap:wrap">`
+    + test + drv + advice + `</div>` + why + pinned;
+  // Let the header bubble reflect it too. The upgrade verdict exists ONLY on
+  // this endpoint - /api/ffmpeg/check knows a newer build is out but not
+  // whether this driver could run it - which is why ffCheck() on its own could
+  // never paint the blocked state, and why the bubble kept saying "available".
+  ffDriver();          // cached six hours server-side, so this is cheap
+  _ffNvencOk = d.ok; _ffNvencWhy = d.ok ? '' : (c.reason||'GPU encode blocked');
+  _ffUp = {
+    blocked: !!(d.update_available && u.known && u.safe === false),
+    latest:  short(u.latest || d.latest || ''),
+    current: d.current || '?',
+    pinned:  d.pinned || '',
+    why:     u.why || '',
+  };
+  ffPillPaint();
+}
+// ---- NVIDIA driver outlook ------------------------------------------------
+async function ffDriver(force){
+  const el=document.getElementById('ffDriver');
+  if(!el) return;
+  if(!el.innerHTML || force)
+    el.innerHTML='<div class="skel"><i style="width:38%"></i>'
+                +'<i style="width:58%"></i></div>';
+  let d;
+  try{ d=await (await fetch('/api/ffmpeg/driver'+(force?'?force=true':''))).json(); }
+  catch(_){ el.innerHTML='<div class="dim" style="font-size:11px">'
+                        +'driver check unavailable</div>'; return; }
+  const L=d.latest||{};
+  const rows=(d.generations||[]).map(g=>{
+    const now = g.works_now
+      ? '<span class="ok">works now</span>'
+      : (g.works_after_update
+          ? '<span class="warn">needs a driver update</span>'
+          : '<span class="err">no driver available yet</span>');
+    return `<tr><td class="mono">ffmpeg ${esc(g.ffmpeg)}</td>
+      <td class="dim">NVENC ${esc(g.nvenc)}</td>
+      <td class="num dim">${g.needs.toFixed(2)}+</td>
+      <td>${now}</td></tr>`;
+  }).join('');
+  // Provenance matters here: the endpoint NVIDIA exposes cannot be pinned to
+  // the RTX A-series branch, so the panel says which branch the number came
+  // from rather than implying it is the exact build for this card.
+  const prov = (L.ok && !L.stale)
+    ? `<span class="dim">newest published: </span><b>${esc(L.version)}</b>
+       <span class="dim">— ${esc(L.name)}${L.released?', '+esc(L.released):''}</span>`
+    : `<a href="${esc(L.url||'https://www.nvidia.com/en-us/drivers/')}"
+          target="_blank" rel="noreferrer">check NVIDIA for your card →</a>`;
+  el.innerHTML=`
+    <div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;font-size:11px">
+      <span><span class="dim">installed driver: </span><b>${esc(d.installed||'?')}</b></span>
+      <span>${prov}</span>
+      <button style="font-size:10px;padding:1px 7px" onclick="ffDriver(true)">Re-check</button>
+    </div>
+    <table style="margin-top:6px;font-size:11px">${rows}</table>
+    <div style="margin-top:5px;font-size:11px" class="${
+        (d.would_unlock||[]).length?'warn':'dim'}">${esc(d.verdict||'')}</div>
+    ${L.stale ? `<div class="dim" style="margin-top:4px;font-size:10px">
+       ${esc(L.error||'')}. The installed version and the requirement above are
+       read locally and are accurate; only the "newest available" figure is
+       unavailable automatically.</div>`:''}`;
+}
+
+async function ffUnpin(){
+  if(!confirm('Unpin ffmpeg?\n\nJobs will use nuarr\'s own downloaded build '
+    +'again. If that build needs a newer NVIDIA driver than this machine has, '
+    +'every re-encode will fail.')) return;
+  await fetch('/api/ffmpeg/pin',{method:'POST'});
+  ffCheck();
+}
+async function ffCheck(){
+  if(_ffChecking) return;
+  _ffChecking=true;
+  const s=document.getElementById('ffState'), pth=document.getElementById('ffPath');
+  try{
+    const d=await (await fetch('/api/ffmpeg/check')).json();
+    // A broken install outranks "up to date" - a binary that will not run is
+    // the more urgent fact, and every job would be failing because of it.
+    let health={};
+    try{ health=await (await fetch('/api/ffmpeg/verify')).json(); }catch(_){}
+    // one verdict, rendered in two places: the tab and the header bubble
+    // AN UPDATE YOU CANNOT INSTALL IS NOT AN UPDATE.
+    //
+    // ffmpeg 9.x needs NVENC 13.1, which needs driver 610.00+; this machine is
+    // on 596.86, so 9.0 is unreachable until NVIDIA ships a driver. Amber said
+    // "there is something for you to do" every time you looked at the header,
+    // for months, about a thing that cannot be done - and the only safe action
+    // was to ignore it, which trains you to ignore the colour everywhere else.
+    const upv = d.upgrade || {};
+    const upBlocked = !!(d.update_available && upv.known && upv.safe === false);
+    let cls='p-ok', label=`ffmpeg ${short(d.current)}`, full;
+    if(health && health.healthy===false){
+      cls='p-bad'; label='ffmpeg broken';
+      full=`<span class="pill p-bad">broken — ${esc(health.problem||'?')}</span>`;
+    }else if(d.update_available && !upBlocked){
+      cls='p-warn'; label=`ffmpeg ${short(d.latest)} available`;
+      full=`<span class="pill p-warn">${esc(d.current||'?')} → ${esc(d.latest||'?')}</span>`;
+    }else if(upBlocked){
+      // Green, because the running build is fine. The blocked newer one is a
+      // footnote in the tooltip and a full explanation in the ffmpeg tab.
+      full=`<span class="pill p-ok">${esc(d.current||'?')} — newest usable on this driver</span>`;
+    }else if(d.using_tdarr){
+      cls='p-warn'; label='ffmpeg (Tdarr build)';
+      full=`<span class="pill p-warn">${esc(d.current||'?')} — Tdarr's bundled build</span>`;
+    }else{
+      full=`<span class="pill p-ok">${esc(d.current||'?')} up to date</span>`;
+    }
+    if(s) s.innerHTML=full;
+    _ffPill = {cls, label, title:d.current_path||''};
+    // Set the upgrade verdict from THIS response, before the first paint. It
+    // used to arrive later from ffNvenc(), so the bubble showed "available"
+    // for as long as that call took and then flipped to "blocked".
+    const up=d.upgrade||{};
+    _ffUp = {
+      blocked: !!(d.update_available && up.known && up.safe === false),
+      latest:  short(up.latest || d.latest || ''),
+      current: d.current || '?',
+      pinned:  d.pinned || '',
+      why:     up.why || '',
+    };
+    ffPillPaint();
+    let notes=[esc(d.current_path||'')];
+    if(d.using_tdarr) notes.push('using Tdarr’s bundled build');
+    if(pth) pth.innerHTML=notes.join(' · ');
+    ffNvenc();
+  }catch(e){
+    if(s) s.innerHTML='<span class="pill p-bad">check failed</span>';
+  }finally{ _ffChecking=false; }
+}
+async function ffLog(){
+  const p=document.getElementById('ffChangelog');
+  if(p.style.display!=='none'){ p.style.display='none'; return; }
+  p.style.display=''; p.textContent='loading…';
+  try{
+    const d=await (await fetch('/api/ffmpeg/changelog')).json();
+    p.textContent=`ffmpeg ${d.version}\n\n${d.changelog}`;
+  }catch(e){ p.textContent='changelog unavailable'; }
+}
+async function ffStage(){
+  if(!confirm('Download ~160 MB from gyan.dev and verify its SHA-256?\n\n'
+    +'Nothing is swapped now — running jobs are untouched. The new build is '
+    +'applied automatically once the queue is idle.')) return;
+  try{
+    const d=await (await fetch('/api/ffmpeg/stage?confirm=true',{method:'POST'})).json();
+    if(!d.ok){ ffSay(ffResult(d, ()=>'', 'download failed')); return; }
+    ffSay('starting…');
+    ffPoll(true);
+  }catch(e){ ffSay(`<span class="err">download failed: ${esc(e.message||e)}</span>`); }
+}
+// Poll only while something is happening. A 160 MB download plus a checksum of
+// the same 160 MB is a minute of apparent silence otherwise, and silence reads
+// as a hang.
+let _ffTimer=null;
+function ffPoll(on){
+  if(_ffTimer) clearInterval(_ffTimer);
+  _ffTimer = on ? setInterval(ffProgress, 1000) : null;
+  if(on) ffProgress();
+}
+let _ffWasActive=false, _ffLastHtml='';
+async function ffProgress(){
+  const m=document.getElementById('ffMsg');
+  const bar=document.getElementById('ffBar');
+  // The ffmpeg pane lives on /settings now, so on the dashboard these do not
+  // exist and bar.style threw on every poll. Checked BEFORE the fetch, not
+  // after: there is no point asking the server for progress nobody can see.
+  if(!bar || !m) return;
+  let p;
+  try{ p=await (await fetch('/api/ffmpeg/progress')).json(); }catch(_){ return; }
+  let html='';
+
+  if(p.active){
+    bar.style.display='';
+    const pct = p.total ? p.pct : 0;
+    bar.querySelector('i').style.width = (p.phase==='downloading'? pct : 100)+'%';
+    const bits=[`<b>${esc(p.phase)}</b>`];
+    if(p.phase==='downloading' && p.total){
+      bits.push(`${gb(p.bytes)} of ${gb(p.total)} (${pct.toFixed(0)}%)`);
+      if(p.bps) bits.push(mbps(p.bps));
+      if(p.eta_s) bits.push(`${hms(p.eta_s)} left`);
+    }
+    html=bits.join(' · ');
+    _ffWasActive=true;
+  }else{
+    ffPoll(false);
+    bar.style.display='none';
+    bar.querySelector('i').style.width='0%';     // do not leave a stale fill
+    if(p.error) html=`<span class="err">failed: ${esc(p.error)}</span>`;
+    else if(p.staged && p.staged.version)
+      html=`<span class="pill p-ok">${esc(p.staged.version)} ready to apply</span> `
+        + (p.running_jobs
+            ? `<span class="dim">applies automatically when the ${p.running_jobs} `
+              +`running job(s) finish — or press Apply now</span>`
+            : `<span class="dim">queue is idle — press Apply now</span>`);
+    else if(p.phase==='applied')
+      html=`<span class="pill p-ok">installed ${esc(p.version)}</span> `
+        +`<span class="dim">restart nuarr so new jobs use it</span>`;
+    // Refresh the version line ONCE, on the transition out of active - not on
+    // every poll. Calling it each tick had ffCheck and ffProgress writing the
+    // same element in turn, which is what flashed.
+    if(_ffWasActive){ _ffWasActive=false; ffCheck(); ffUsers(); }
+  }
+
+  // Only touch the DOM when the text actually changed. An identical repaint
+  // every second still restarts CSS transitions and makes text shimmer.
+  if(html!==_ffLastHtml){ m.innerHTML=html; _ffLastHtml=html; }
+}
+// Who launches ffmpeg, and is each one getting the intended binary.
+async function ffUsers(){
+  const el=document.getElementById('ffUsers');
+  if(!el) return;
+  let d;
+  try{ d=await (await fetch('/api/ffmpeg/consumers')).json(); }catch(_){ return; }
+  const rows=(d.consumers||[]).map(c=>{
+    // A path that is merely present is not enough - it has to be the one we
+    // expect, or the install is being silently bypassed.
+    const bad = !c.ok || !c.exists;
+    const note = !c.exists ? 'missing' : (c.ok ? 'correct' : 'NOT the installed build');
+    return `<tr>
+      <td>${esc(c.name)}<div class="dim sub">${esc(c.why)}</div></td>
+      <td class="nb mono dim">${esc(c.tool)}</td>
+      <td class="wrap mono" style="font-size:11px;color:${bad?'var(--bad)':'var(--dim)'}">
+        ${esc(c.path||'—')}</td>
+      <td class="nb"><span class="pill ${bad?'p-bad':'p-ok'}">${note}</span></td></tr>`;
+  }).join('');
+  el.innerHTML =
+    `<div style="font-size:11px;margin-bottom:4px">
+       <b>Uses ffmpeg</b>
+       ${d.all_ok ? '<span class="pill p-ok">all pointing at the installed build</span>'
+                  : '<span class="pill p-bad">a component is using a different binary</span>'}
+     </div>
+     <table class="fixed vtop"><tr><th>Component</th>
+       <th class="nb" style="width:70px">Tool</th><th>Resolved path</th>
+       <th class="nb" style="width:130px"></th></tr>${rows}</table>
+     <div class="dim" style="font-size:11px;margin-top:4px">
+       fallback if nuarr has no build: <span class="mono">${esc(d.fallback_ffmpeg||'')}</span>
+     </div>`;
+}
+async function ffRepair(){
+  // Lead with what is actually wrong. If the install is fine this is a
+  // 160 MB download for nothing, and the dialog should say so.
+  let h={};
+  try{ h=await (await fetch('/api/ffmpeg/verify')).json(); }catch(_){}
+  const state = h.healthy
+    ? `The current install looks HEALTHY (${h.ffmpeg_version||'?'}).`
+    : `Problem detected: ${h.problem||'unknown'}.`;
+  if(!confirm(`Repair ffmpeg?\n\n${state}\n\n`
+    +'This re-downloads ~160 MB of the current release, verifies its SHA-256 '
+    +'and overwrites the installed build. The swap still waits for the queue '
+    +'to be idle.')) return;
+  try{
+    const d=await (await fetch('/api/ffmpeg/repair?confirm=true',{method:'POST'})).json();
+    if(!d.ok){ ffSay(ffResult(d, ()=>'', 'repair failed')); return; }
+    ffSay('starting repair…');
+    ffPoll(true);
+  }catch(e){ ffSay(`<span class="err">repair failed: ${esc(e.message||e)}</span>`); }
+}
+async function ffRollback(){
+  if(!confirm('Restore the previous ffmpeg build?\n\n'
+    +'Use this if a new version misbehaves. The current build is kept as '
+    +'"broken" so nothing is lost.')) return;
+  try{
+    const d=await (await fetch('/api/ffmpeg/rollback',{method:'POST'})).json();
+    ffSay(ffResult(d,
+      x=>`<span class="pill p-warn">rolled back to ${esc(x.version)}</span>`,
+      'rollback failed'));
+  }catch(e){ ffSay(`<span class="err">rollback failed: ${esc(e.message||e)}</span>`); }
+  ffCheck();
+}
+function ffSay(html){                    // single writer for #ffMsg
+  const m=document.getElementById('ffMsg');
+  if(html!==_ffLastHtml){ m.innerHTML=html; _ffLastHtml=html; }
+}
+// NOT EVERY ok:false IS A FAILURE.
+// "nothing staged", "already installed", "no previous build", "jobs are
+// running" are all normal answers to a button press - the server now marks
+// them noop:true. Painting them red as "failed:" trained you to ignore red,
+// which is the one colour that has to keep meaning something.
+function ffResult(d, okHtml, fallback){
+  if(d && d.noop) return `<span class="dim">${esc(d.error||d.message||'nothing to do')}</span>`;
+  if(d && d.ok)   return okHtml(d);
+  return `<span class="err">${esc((d&&d.error)||fallback)}</span>`;
+}
+async function ffApply(){
+  try{
+    const d=await (await fetch('/api/ffmpeg/apply',{method:'POST'})).json();
+    if(d.waiting) ffSay(`<span class="dim">${d.running_jobs} job(s) running — `
+                        +`${esc(d.message)}</span>`);
+    else ffSay(ffResult(d,
+      x=>`<span class="pill p-ok">installed ${esc(x.installed)}</span>`,
+      'apply failed'));
+  }catch(e){ ffSay(`<span class="err">apply failed: ${esc(e.message||e)}</span>`); }
+  ffCheck();
+}
+
+// ---- restart / shutdown -------------------------------------------------
+async function ctl(action, waitIdle){
+  const verb = waitIdle ? `${action} when the queue is idle` : `${action} NOW`;
+  if(!confirm(`${action==='restart'?'Restart':'Shut down'} nuarr — ${verb}?\n\n`
+    +(waitIdle ? 'New jobs stop immediately; running jobs finish first.'
+               : 'Running jobs are interrupted and requeued on next start.'))) return;
+  const d=await (await fetch(`/api/control/${action}?wait_for_idle=${waitIdle?'true':'false'}`,
+                             {method:'POST'})).json();
+  renderCtl(d);
+  _ctlSchedule(true);          // a stop is pending now - watch it closely
+}
+async function ctlCancel(){
+  renderCtl(await (await fetch('/api/control/cancel',{method:'POST'})).json());
+  _ctlSchedule(false);         // back to the idle cadence
+}
+function toggleMenu(e){
+  e.stopPropagation();
+  document.getElementById('ctlMenu').classList.toggle('open');
+}
+// close on any outside click, so it behaves like a menu rather than a panel
+document.addEventListener('click', ()=>{
+  const m=document.getElementById('ctlMenu');
+  if(m) m.classList.remove('open');
+});
+function renderCtl(d){
+  const m=document.getElementById('ctlMsg'), b=document.getElementById('ctlCancel');
+  const pill=document.getElementById('ctlPill');
+  if(!d || !d.action){
+    if(m) m.textContent='';
+    if(b) b.style.display='none';
+    setHTML(pill, '');
+    return;
+  }
+  if(b) b.style.display='';
+  const detail = d.running_jobs
+    ? `waiting for ${d.running_jobs} job(s): `
+      +`<span class="dim">${esc((d.waiting_on||[]).join(', '))}</span>`
+    : 'stopping…';
+  setHTML(m, detail);
+  // Also surface it in the header itself - a pending stop should be obvious
+  // without opening the menu to find out.
+  setHTML(pill, `<span class="pill p-warn">${esc(d.action)} pending`
+    +(d.running_jobs?` · ${d.running_jobs} job(s)`:'')+`</span>`);
+}
+// ADAPTIVE POLL. Control status only changes when you press a button or the
+// last job finishes, so hitting it every 5 s was a request every 5 s to learn
+// nothing. Poll slowly when idle; switch to a fast tick only while a stop is
+// actually pending, which is the one time the countdown matters.
+let _ctlTimer=null, _ctlFast=null, _ctlIdleMs=60000;
+const CTL_FAST_MS=3000;                         // while a stop is pending
+function _ctlSchedule(fast){
+  const ms = fast ? CTL_FAST_MS : _ctlIdleMs;
+  // re-arm when the mode OR the configured interval changed, so editing
+  // control_poll_s in Settings takes effect without a page reload
+  if(_ctlTimer && _ctlFast===fast && _ctlTimer._ms===ms) return;
+  if(_ctlTimer) clearInterval(_ctlTimer);
+  _ctlFast=fast;
+  _ctlTimer=setInterval(loadCtl, ms);
+  _ctlTimer._ms=ms;
+}
+async function loadCtl(){
+  try{
+    const d=await (await fetch('/api/control/status')).json();
+    renderCtl(d);
+    _ctlSchedule(!!(d && d.action));
+  }catch(_){}
+}
+_ctlSchedule(false);
+
+// System bar on its own 1 s clock. It is the cheapest endpoint in the app -
+// the server samples in the background, so this only reads the latest value.
+let _sysBusy=false;
+async function loadSys(){
+  if(_sysBusy) return;
+  _sysBusy=true;
+  try{ renderSys(await (await fetch('/api/system')).json()); }
+  catch(_){ }
+  finally{ _sysBusy=false; }
+}
+loadSys(); setInterval(loadSys, 1000);
+
+// A STABLE COLOUR PER SPINDLE.
+// Twelve near-identical "NU-DRIVE-n 264.1 MB/s" strings on one line is a wall
+// of text; colour lets you track one disk across the header, the worker cards
+// and the wait notices without reading the number every time.
+//
+// Keyed off the drive NUMBER, not a hash, so NU-DRIVE-7 is the same colour on
+// every refresh and in every panel - a hash would shuffle if a disk appeared
+// or vanished. Hues are spaced around the wheel and kept light enough to read
+// on the dark background.
+const DISK_COLORS = ['#58a6ff','#3fb950','#e3b341','#ff7b72','#d2a8ff',
+                     '#39d3c3','#f778ba','#a5d6ff','#7ee787','#ffab70',
+                     '#79c0ff','#c9a0ff'];
+// ONE pool colour map, used by every panel that shows a pool.
+//
+// There were three copies of this: the running cards, the queue rows, and
+// nothing at all in Finished (which coloured by verdict, so an encode and an
+// OCR were both plain green). The second copy had already drifted once - it
+// was missing purple, which is how subocr rows came out green in the queue
+// while they were purple in the card right above. A third copy was the reason
+// to collapse them, so here it is, and the callers just ask.
+function poolColor(pool){
+  return pool==='encode'      ? 'var(--acc)'      // blue - GPU work
+       : pool==='subocr'      ? '#b48bf2'         // purple - CPU OCR
+       : pool==='handler'     ? '#d2a8ff'         // lilac - script handlers
+       : pool==='passthrough' ? 'var(--ok)'       // green - stream copy
+       : 'var(--ok)';
+}
+function diskColor(name){
+  const s=String(name||'');
+  const m=s.match(/(\d+)\s*$/);            // NU-DRIVE-7 -> 7
+  let i;
+  if(m){
+    const n = parseInt(m[1],10);
+    // A NEW DISK COLOURS ITSELF. Within the curated palette the hand-picked
+    // colours are used as-is; beyond it a hue is GENERATED rather than
+    // wrapping, because wrapping would give disk 12 the same colour as disk 0
+    // and the whole point is telling spindles apart at a glance.
+    //
+    // The golden angle (137.5°) is what spaces them: successive numbers land
+    // as far from each other on the wheel as possible, so 12, 13 and 14 are
+    // three clearly different colours rather than three neighbouring ones.
+    if(n < DISK_COLORS.length) return DISK_COLORS[n];
+    return `hsl(${Math.round((n * 137.508) % 360)} 70% 68%)`;
+  }
+  // no number (e.g. "?"): fall back to a stable hash of the name
+  let h=0; for(let k=0;k<s.length;k++) h=(h*31+s.charCodeAt(k))>>>0;
+  i = h % DISK_COLORS.length;
+  return DISK_COLORS[i];
+}
+function diskTag(name, extra){
+  return `<b class="mono" style="color:${diskColor(name)}">${esc(name)}</b>`
+       + (extra||'');
+}
+
+// Per-job disk activity. A stream copy is pure I/O, so "7.15x" on its own says
+// nothing - "12 MB/s, where this file usually moves at 200" says the pool is
+// the bottleneck. Read comes from the OS per process; write from ffmpeg.
+const mbps = b => !b ? '—' : (b >= 1048576 ? (b/1048576).toFixed(1)+' MB/s'
+                                           : Math.round(b/1024)+' KB/s');
+// THE SECOND JOB RUNNING INSIDE THIS ONE.
+//
+// When a file needs both a rewrite and subtitle OCR, the OCR runs on a CPU
+// thread beside ffmpeg so one pool rewrite carries both. That is the right
+// design and it was completely invisible: the card showed the encode, the OCR
+// ran silently, and the only hint was that this job took longer than its
+// neighbours - then an unexplained "waiting for subtitle OCR" at the end.
+// Its own bar, in the subocr purple, so the card shows both pieces of work.
+function subOcrCell(w){
+  if(!w.sub_ocr_stage) return '';
+  // THE NUMBER HAS ONE SOURCE, AND IT IS NOT w.sub_ocr_frac.
+  //
+  // This is what made the percentage bounce. Two different pieces of code were
+  // writing the same label from two different values: tickProgress() paints the
+  // interpolated, ratcheted sdisp every 120 ms, while this function - which
+  // runs on every repaint - painted the RAW server fraction. So the label
+  // climbed to 7.4, a repaint knocked it back to 7.0, the interpolator pushed
+  // it up again, and it oscillated twice a second.
+  //
+  // The main bar never had this because barState() already reads _prog. Doing
+  // the same here means the interpolator and the repaint agree by construction
+  // rather than by both happening to be right. Falling back to the raw value
+  // covers the first paint, before any interpolator state exists.
+  const st = _prog.get(w.job_id);
+  const frac = (st && st.sdisp != null) ? Math.max(st.sdisp, w.sub_ocr_frac||0)
+                                        : (w.sub_ocr_frac||0);
+  const pct = Math.max(0, Math.min(100, frac*100));
+  const col = poolColor('subocr');
+  const waiting = /waiting for subtitle OCR/.test(w.stage||'');
+  return `<div class="socr">
+    <span class="pill" style="color:${col};border-color:${col}">subocr</span>
+    <span class="socrbar"><i style="width:${pct.toFixed(1)}%;background:${col}"></i></span>
+    <span class="mono socrpct" style="color:${col};min-width:44px">${pct.toFixed(0)}%</span>
+    <span class="dim">reading the picture subtitles into text</span>
+    <span class="dim">${waiting
+      ? '· the video is finished; this is the last step'
+      : '· happening at the same time as the video work'}</span></div>`;
+}
+// "-2% vs source" ASKS THE READER TO DO TWO CONVERSIONS IN THEIR HEAD.
+//
+// First, what does the sign mean? Minus is smaller, which is usually the good
+// direction - but the number was coloured green for negative and amber for
+// positive with nothing saying so, and a signed percentage next to a size is
+// as easily read as "2% worse" as "2% smaller". Second, 2% of what? The source
+// size was not on the card at all, so the one figure that makes a percentage
+// meaningful - how many gigabytes it actually is - had to be worked out from a
+// projected total that is itself an estimate.
+//
+// So: say the direction in words, put the magnitude in bytes next to it, and
+// keep the percentage as the supporting figure rather than the headline. The
+// arrow carries the sign for anyone scanning rather than reading.
+//
+// GROWING IS NOT ALWAYS BAD, which the old amber could not express. Some
+// conversions trade size for compatibility deliberately - an unplayable file
+// that becomes a playable one is the job working - so a plan that expects to
+// grow says so instead of warning about itself.
+function bytesShort(b){
+  b = Math.abs(b||0);
+  if(b >= 1073741824) return (b/1073741824).toFixed(b >= 10737418240 ? 0 : 1)+' GB';
+  return Math.round(b/1048576)+' MB';
+}
+function sizeDelta(w){
+  if(!(w.est_out_bytes && w.src_bytes)) return '';
+  const d   = w.est_out_bytes - w.src_bytes;
+  const pct = d / w.src_bytes * 100;
+  const tip = `source ${gb(w.src_bytes)}, projected ${gb(w.est_out_bytes)} — `
+            + `projected from the bytes written so far, so it settles as the job runs`;
+  // Under a percent either way is noise on an estimate, and "0% smaller" reads
+  // like a bug. Say what it means instead of printing a rounded zero.
+  if(Math.abs(pct) < 1)
+    return ` <span class="dim" title="${esc(tip)}">about the same size</span>`;
+  const grow = d > 0;
+  const expected = grow && w.grow_ok;
+  const col = !grow ? 'var(--ok)' : (expected ? 'var(--dim)' : 'var(--warn)');
+  return ` <span style="color:${col}" title="${esc(tip)}">`
+       + `${grow ? '▲' : '▼'} ${bytesShort(d)} ${grow ? 'larger' : 'smaller'}`
+       + `</span> <span class="dim" title="${esc(tip)}">(${Math.abs(pct).toFixed(0)}%`
+       + `${expected ? ', expected for this conversion' : ''})</span>`;
+}
+
+// SUBTITLE RESCUE - the same strip as the side OCR, and deliberately so.
+//
+// Both are "a second piece of subtitle work attached to this job", and giving
+// them different shapes would make the card teach two vocabularies for one
+// idea. Different colour and wording because they are different work: OCR
+// reads pictures into text, this pulls out a track ffmpeg cannot read from the
+// container and rewrites it as SRT.
+//
+// No interpolator here, unlike subOcrCell. mkvextract reports its own real
+// percentage several times a second, so there is nothing to smooth over -
+// the ratchet exists for OCR because its progress arrives in long, uneven
+// jumps.
+function subFixCell(w){
+  if(!w.sub_fix_stage) return '';
+  const pct = Math.max(0, Math.min(100, (w.sub_fix_frac||0)*100));
+  const col = '#58c8d8';
+  return `<div class="socr">
+    <span class="pill" style="color:${col};border-color:${col}">subfix</span>
+    <span class="socrbar"><i style="width:${pct.toFixed(1)}%;background:${col}"></i></span>
+    <span class="mono socrpct" style="color:${col};min-width:44px">${pct.toFixed(0)}%</span>
+    <span class="dim">${esc(w.sub_fix_stage)}</span>
+    <span class="dim">· ffmpeg cannot read it from the container, so it is
+      extracted and converted</span></div>`;
+}
+function ioCell(w){
+  // The commit is the most disk-bound phase of the whole job, so it needs the
+  // contention markers too - it was excluded because it has no ffmpeg rates,
+  // which is a reason to skip the rate fields, not the whole row.
+  //
+  // subocr passes whatever its stage says. Its stages are its own strings
+  // ("extracting track 1/2", "OCR ~40% (est)", "muxing"), so a stage
+  // whitelist can never match them - which is exactly how these cards
+  // rendered with no disk and no R/W while the passthrough card next to them
+  // had both.
+  // NO STAGE WHITELIST. It listed the stages that were known to have rates and
+  // dropped the entire row for anything else - so a passthrough job that had
+  // finished its video and moved on to an inline subtitle OCR lost its spindle,
+  // its throughput and its size all at once, mid-job. The stage is not what
+  // decides whether there is something to say; the FIELDS are, and each one
+  // below now tests for itself.
+  const bits=[];
+  // Name the spindle. Two jobs sharing one disk is the usual reason a copy
+  // that normally runs at 200x is crawling. Shown whenever it is known - the
+  // disk a job is working does not stop being true because the job moved to a
+  // phase that reads no bytes.
+  if(w.disk){
+    const moved = w.dest_disk && w.dest_disk!==w.disk;
+    // same colour as the header breakdown, so a card and its spindle match
+    bits.push(moved ? `${diskTag(w.disk)} → ${diskTag(w.dest_disk)}`
+                    : diskTag(w.disk));
+  }
+  // read and write get opposite colours - they are the pair you compare, and
+  // on a stream copy a big gap between them is the interesting signal
+  // WHY IS THIS ONE SLOW. The header says the queue is yielding disk priority,
+  // but with four cards on screen that does not say whether THIS job is the
+  // one sharing a spindle with a viewer. Two different facts, so two markers:
+  //   viewer here - this job is on the disk being watched, so it is genuinely
+  //                 contending and its rate will be visibly down
+  //   yielding    - throttled, but on a different spindle, so the effect is
+  //                 mostly CPU scheduling rather than disk
+  // ONLY IF THIS JOB IS ACTUALLY DEMOTED.
+  //
+  // The card used to show a badge on every job whenever the throttle was on
+  // anywhere, which was true when the demotion was global and became a lie the
+  // moment it was scoped per spindle. The server now reports exactly which job
+  // ids it lowered, so the card states its own state rather than the panel's.
+  // THE TIER, ON EVERY CARD, ALWAYS.
+  //
+  // It only appeared when a job was demoted, so "no badge" meant both "running
+  // at full priority" and "this card does not report that" - and the header's
+  // per-pool "normal I/O" is about the pool, not about this job. With four
+  // cards on screen and one of them yielding, the one fact you want per row is
+  // which tier it is on, and its absence cannot carry that.
+  // WHICH ENCODER IS DOING THIS ONE, first, because it is the fact that
+  // changes what every other figure on the row means: 40 fps is respectable
+  // for libx265 and terrible for NVENC. Only on jobs that re-encode - a
+  // stream copy has no encoder and saying "NVENC" on one would be a lie.
+  if(w.venc && w.venc.family){
+    const FAM = {nvenc:['NVENC','NVIDIA hardware encoder'],
+                 qsv:  ['QuickSync','Intel hardware encoder'],
+                 amf:  ['AMF','AMD hardware encoder'],
+                 cpu:  ['CPU','software x264/x265 - slower, smaller files']};
+    const f = FAM[w.venc.family] || [w.venc.family, ''];
+    const soft = w.venc.family === 'cpu';
+    const tip = `${f[1]}\n${w.venc.encoder||''}`
+              + (w.venc.preset?`  preset ${w.venc.preset}`:'')
+              + (w.venc.cq!=null?`  cq ${w.venc.cq}`:'')
+              + (w.venc.why?`\n\n${w.venc.why}`:'');
+    bits.push(`<span class="pill venc${soft?' venc-cpu':''}${w.venc.why?' venc-fb':''}"
+       title="${esc(tip)}">${esc(f[0])}${w.venc.why?' · fallback':''}</span>`);
+  }
+  const low = _ioLowJobs.has(w.job_id);
+  const onWatched = w.disk && (_plexDisks||[]).indexOf(w.disk)>=0;
+  const destW = w.dest_disk && (_plexDisks||[]).indexOf(w.dest_disk)>=0;
+  if(low){
+    bits.push(onWatched || destW
+      ? `<span class="pill p-warn iotier" title="a viewer is playing from ${
+           esc(onWatched?w.disk:w.dest_disk)} — this job ${
+           onWatched?'reads from':'writes to'} that disk, so it runs at Very Low
+I/O priority and the viewer's reads overtake it">very low I/O · viewer on ${
+           esc(onWatched?w.disk:w.dest_disk)}</span>`
+      : `<span class="pill p-warn iotier"
+           title="${esc(_ioReason||'lowered disk priority')}">low I/O</span>`);
+  }else{
+    bits.push(`<span class="pill iotier iotier-norm"
+      title="full disk priority — nothing is competing for this spindle">normal I/O</span>`);
+  }
+  // subocr rows earn the same R/W readout as a copy: their extract and mux
+  // phases pull the whole file off a spindle exactly like passthrough does.
+  // (During the OCR itself the rates sit near zero, which is honest - that
+  // phase is pure CPU.)
+  // Rates whenever there are rates. The old `showIo` gate asked what STAGE the
+  // job was in, which is a proxy for "does it move bytes" and a bad one - the
+  // fields themselves answer that exactly.
+  if(w.read_bps)
+    bits.push(`<span class="m-lbl">read</span> `
+             +`<span class="m-read">${mbps(w.read_bps)}</span>`);
+  if(w.write_bps)
+    bits.push(`<span class="m-lbl">write</span> `
+             +`<span class="m-write">${mbps(w.write_bps)}</span>`);
+  if((w.pool==='subocr' || w.sub_ocr_active) && !w.read_bps && !w.write_bps)
+    bits.push(`<span class="dim" title="the OCR phase is pure CPU - disk rates
+appear during extract, mux and commit">no disk I/O (OCR is CPU work)</span>`);
+  // SIZE FOR AS LONG AS IT IS KNOWN, not only while encoding.
+  //
+  // Gated on stage==='encoding', the figures vanished the moment the video
+  // finished - so a job sitting in an inline subtitle OCR, which is exactly
+  // when you have time to look at it, showed no size at all. The bytes written
+  // do not become unknown because the phase changed.
+  if(w.out_bytes){
+    // show progress in BYTES as well as percent - on a copy the byte count is
+    // the honest measure, and the projected size tells you if it will shrink
+    //
+    // WHEN THERE IS NO PROJECTION, SHOW THE SOURCE. est_out_bytes is left
+    // unset on purpose whenever progress is byte-derived, because
+    // out_bytes/progress would just give back the source size and the card
+    // would claim "about the same size" for a file that finishes 55% smaller.
+    // Correct - but it left "10.9 GB" on its own with nothing to measure it
+    // against, on exactly the files ffmpeg gives no timeline for. The source
+    // size is not a projection and is not presented as one: it is what the
+    // byte progress is a fraction OF, which is the honest comparator and the
+    // same pair the raw ffmpeg line underneath already prints.
+    let est='', delta=sizeDelta(w);
+    if(w.est_out_bytes){
+      est = ` <span class="m-lbl">of</span> <span class="m-size">~${
+              gb(w.est_out_bytes)}</span>`;
+    }else if(w.src_bytes){
+      est = ` <span class="m-lbl">of</span> <span class="m-size">${
+              gb(w.src_bytes)}</span> <span class="m-lbl"
+              title="ffmpeg gives no output timeline for this file, so progress
+is measured in bytes against the source. No final size is projected — dividing
+the bytes written by a fraction derived from those same bytes would just hand
+back the source size.">source</span>`;
+      delta = '';          // nothing has been projected, so nothing to compare
+    }
+    bits.push(`<span class="m-size">${gb(w.out_bytes)}</span>${est}${delta}`);
+  }
+  if(!bits.length) return '';
+  return `<div class="wkstats dim" style="font-size:11px">${bits.map(b=>'<span>'+b+'</span>').join('')}</div>`;
+}
+
+// What the worker is doing right now. ffmpeg hitting 100% is not the job
+// finishing - commit, arr refresh and rename follow, and on a big remux those
+// take longer than the copy did. Showing the stage stops a working job from
+// reading as a hung one stuck at "ETA 0s".
+const STAGE_LABEL = {
+  starting:'starting', probing:'probing', handlers:'running handlers',
+  encoding:'', committing:'committing to library',
+  'arr refresh / rename':'updating Sonarr/Radarr', done:'finishing',
+  // Terminal stages, set by _finish so that EVERY job kind leaves a card in a
+  // finished-looking state. Only _transcode used to walk itself to a final
+  // stage; subocr, and every early-return path, stopped wherever they were.
+  failed:'failed', skipped:'nothing to do', cancelled:'cancelled',
+  'waiting to commit':'waiting to commit',
+};
+function stageCell(w){
+  // DELIBERATELY STOPPED beats a frozen ETA. When a viewer on this spindle is
+  // low on buffer the job is suspended outright, so the progress bar stops
+  // moving — and a stopped bar with an ETA still counting down is exactly what
+  // a hang looks like. Say what it is instead.
+  if(w.paused_for_viewer)
+    return `<span class="pill p-warn" title="A viewer reading this spindle is `
+         + `short of buffer, so this job is paused. It resumes on its own `
+         + `within a second of the buffer recovering.">paused for viewer</span>`;
+  if(w.stage==='encoding')
+    return w.eta_s!=null
+      ? `<span class="m-lbl">ETA</span> <span class="m-time">${hms(w.eta_s)}</span>`
+      : '<span class="m-lbl">ETA —</span>';
+  // During the commit, name the spindle it is being written to. DrivePool
+  // re-places the file, so it often is not the one it was read from.
+  if(w.stage==='committing'){
+    // FROM -> TO, both named. Showing only the destination left the more
+    // interesting fact implicit: whether DrivePool moved the file to a
+    // different spindle at all, which is what explains a commit that is
+    // suddenly slow or that lands somewhere unexpected.
+    const from = w.disk ? diskTag(w.disk) : '<span class="dim">cache</span>';
+    // The destination is now known from the first chunk of the copy, because
+    // the staging file already sits at its final pool location. "placing…"
+    // should only ever be visible for the instant before that.
+    if(!w.dest_disk)
+      return `<span>committing <span class="dim">from</span> ${from} `
+           + `<span class="dim">→ placing…</span></span>`;
+    const moved = w.dest_disk !== w.disk;
+    let live='';
+    if(w.commit_phase==='verifying'){
+      live = ` <span class="dim">· verifying copy…</span>`;
+    }else if(w.commit_total){
+      const pct = Math.min(100, w.commit_bytes/w.commit_total*100);
+      live = ` <span class="m-lbl">·</span> `
+        + `<span class="m-size">${gb(w.commit_bytes)}</span>`
+        + `<span class="m-lbl"> of </span>`
+        + `<span class="m-size">${gb(w.commit_total)}</span>`
+        + ` <span class="dim">(${pct.toFixed(0)}%)</span>`
+        + (w.commit_bps ? ` <span class="m-lbl">at</span> `
+                          +`<span class="m-write">${mbps(w.commit_bps)}</span>` : '')
+        + (w.commit_eta_s!=null ? ` <span class="m-lbl">ETA</span> `
+                          +`<span class="m-time">${hms(w.commit_eta_s)}</span>` : '');
+    }
+    return `<span>committing ${from} <span class="arrow">→</span> `
+         + `${diskTag(w.dest_disk)}`
+         + (moved ? ` <span class="pill p-warn">moved</span>`
+                  : ` <span class="dim">same disk</span>`)
+         + live
+         + `</span>`;
+  }
+  const lbl = STAGE_LABEL[w.stage] || w.stage || '';
+  // once past the encode the elapsed time in THIS stage is the useful number
+  return `<span class="dim">${esc(lbl)}${w.stage_s?` ${hms(w.stage_s)}`:''}</span>`;
+}
+
+// Whole-run progress bar + ETA.
+function renderOverall(o){
+  const el=document.getElementById('jobsOverall');
+  if(!el) return;
+  if(!o || !o.active){ el.innerHTML=''; return; }
+  const pct=Math.min(100,Math.max(0,o.fraction*100));
+  // "finish time" is easier to act on than a raw countdown - you can compare it
+  // to the clock without doing arithmetic.
+  let right='';
+  if(o.eta_s!=null){
+    const done=new Date(Date.now()+o.eta_s*1000);
+    const hh=String(done.getHours()).padStart(2,'0'),
+          mm=String(done.getMinutes()).padStart(2,'0');
+    // A files-per-hour estimate is honest but coarser than the media rate -
+    // mark it with ~ and say why, rather than dressing it up as precise.
+    const approx = o.eta_basis==='files'
+      ? `<span class="dim" title="estimated from files completed per hour — this pool has no media-rate yet, so quick skips and slow files average together">~</span>` : '';
+    right=`${approx}<b>${hms(o.eta_s)}</b> left <span class="dim">· done ~${hh}:${mm}</span>`;
+  }else{
+    // Be explicit rather than showing a made-up number before any encode has
+    // finished - a wrong ETA is worse than an absent one.
+    right='<span class="dim">measuring throughput…</span>';
+  }
+  // Report the measured rate, not a per-file average. "3.4x" means the encoder
+  // is chewing 3.4 seconds of video per second of wall clock, which stays
+  // meaningful whether the next file is 22 minutes or two hours.
+  // LABELLED GROUPS, NOT ONE RUN-ON SENTENCE.
+  //
+  // This was a single 11px dim string joined by middots: "1.7% of this run ·
+  // encode 3.5x · passthrough 92.7x · disk 401.0 MB/s (r 202.8 MB/s / w 198.2
+  // MB/s) · NU-DRIVE-0 waiting 15% of 85% · ...". Everything the same weight
+  // and the same colour, so finding one figure meant reading all of them.
+  // Each fact now gets a small label and a bright value, and the colours mean
+  // what they mean everywhere else on the page: m-read / m-write for the
+  // paired throughput figures, the per-disk palette for spindle names, warn
+  // for anything contended.
+  const G=(k,v,cls)=>`<span class="ovl-g"><span class="ovl-k">${k}</span>`
+                    +`<span class="ovl-v ${cls||''}">${v}</span></span>`;
+  const bits=[G('run', pct.toFixed(1)+'%')];
+
+  // Encoder throughput. 3.5x means 3.5 seconds of video per second of wall
+  // clock; a stream copy sits in the tens or hundreds, an encode near 1-5, so
+  // the two are colour-split rather than left to be told apart by their labels.
+  Object.entries(o.rates||{}).forEach(([p,v])=>{
+    bits.push(G(esc(p), v.toFixed(1)+'x',
+                p==='encode' ? 'v-acc' : 'v-ok'));
+  });
+
+  // Pool disk load across every worker. Four copies at 12 MB/s each is a
+  // saturated pool, not four slow jobs - and that decides whether adding
+  // passthrough workers would help or just split the same bandwidth.
+  if(_lastIo && _lastIo.total_bps){
+    bits.push(G('disk', mbps(_lastIo.total_bps)
+      + ` <span class="m-read">${mbps(_lastIo.read_bps)}</span>`
+      + `<span class="ovl-sep">read</span>`
+      + `<span class="m-write">${mbps(_lastIo.write_bps)}</span>`
+      + `<span class="ovl-sep">write</span>`));
+  }
+
+  // A held worker slot looks like a stall unless you say why it is held.
+  // "waiting 15% of 85%" was two bare percentages of two different things -
+  // now it says whose progress it is waiting on and what it is waiting for.
+  if(_lastWaits && _lastWaits.length){
+    _lastWaits.forEach(w=>{
+      // TWO DIFFERENT HOLDS, and they used to render identically.
+      //
+      // A progress hold clears when the job in the way reaches the threshold,
+      // so a percentage is the right thing to show - and it is now read live
+      // rather than from a snapshot taken when the wait began, which is why
+      // this used to say "at 0%" beside a card plainly showing 2.7%.
+      //
+      // A viewer hold has no threshold at all. It was being given need=100 and
+      // rendered as "starts at 100%", inviting you to wait for a number that
+      // would never arrive; it clears when the viewer stops, not when a job
+      // finishes.
+      const viewer = w.why==='viewer' || w.at==null;
+      bits.push(`<span class="ovl-g ovl-wait" title="${viewer
+          ? 'A Plex client is streaming from this spindle. Jobs stay off it '
+            +'until playback stops, so a viewer never competes with a copy.'
+          : 'Starting a second job on this spindle makes both crawl - 63 MB/s '
+            +'shared versus 997 MB/s spread. nuarr waits for the job already '
+            +'on it to finish rather than interleaving.'}">`
+        +`<span class="ovl-k">waiting</span>`
+        +`<span class="ovl-v">${diskTag(w.disk)}</span>`
+        +`<span class="ovl-note">${viewer
+            ? 'a viewer is on this disk'
+            : `behind a job at ${(w.at||0).toFixed(0)}%`
+              +` · starts at ${(w.need||0).toFixed(0)}%`}</span></span>`);
+    });
+  }
+
+  // Per-spindle breakdown. A disk carrying more than one job is flagged,
+  // because that is the case where the jobs are competing rather than the
+  // pool simply being busy.
+  if(_lastIo && (_lastIo.by_disk||[]).length){
+    const per=_lastIo.by_disk.filter(d=>d.total_bps).map(d=>{
+      const shared = d.jobs>1
+        ? `<span class="ovl-x" title="${d.jobs} jobs sharing one spindle - they are
+competing with each other, not just keeping the pool busy">×${d.jobs}</span>`
+        : '';
+      return `<span class="ovl-d">${diskTag(d.disk)}`
+           + `<b class="ovl-dv">${mbps(d.total_bps)}</b>${shared}</span>`;
+    });
+    if(per.length) bits.push(`<span class="ovl-g"><span class="ovl-k">spindles</span>`
+                             +per.join('')+`</span>`);
+  }
+  if(o.remaining_media_s)
+    bits.push(G('video left', hms(o.remaining_media_s)));
+  if(o.skipped) bits.push(G('skipped', fmt(o.skipped)));
+  el.innerHTML=
+    `<div style="padding:10px 14px;border-bottom:1px solid var(--line)">
+       <div style="display:flex;justify-content:space-between;align-items:baseline;
+                   gap:12px;flex-wrap:wrap;margin-bottom:6px">
+         <!-- "queued" is NOT repeated here. The bar above already carries it,
+              and the two were computed a moment apart so they disagreed by a
+              handful - two different numbers for the same thing, six lines
+              apart, is worse than one. -->
+         <span><b>${fmt(o.done)}</b> of <b>${fmt(o.total)}</b> done
+           <span class="dim">· ${fmt(o.running)} running</span></span>
+         <span>${right}</span>
+       </div>
+       <div class="bar big"><i style="width:${pct.toFixed(1)}%"></i></div>
+       <div class="ovl">${bits.join('')}</div>
+     </div>`;
+}
+
+// Overlap guard. The poll fires every 2 s; when a response took longer than
+// that, requests piled up and an OLDER reply could land after a newer one,
+// repainting worker cards from a stale snapshot - which read as encodes
+// starting and stopping at random. Skip a tick if one is still in flight, and
+// ignore any reply that arrives out of order.
+// ------------------------------------------------------------- queue panel --
+// No auto-scroll. The queue is a reference list you look something up in, not
+// a feed to watch, and a list that moves under the cursor is only ever in the
+// way. Scrolling is entirely manual; "Top" jumps back.
+let _qBusy=false, _qLastKey='', _qDir='asc', _qFilterTimer=null, _qRerun=false;
+// Bumped on every user-initiated filter/sort change. A queue response only
+// owns the summary line if it is answering the newest one - see loadQueue.
+let _qSeq=0, _qPendMsg='';
+// Which sort the panel is showing. 'next' is resolved in the browser (see
+// loadQueue) because it depends on the live running set, not on the database.
+let sortMode='next';
+
+// Debounced: the list is 300 rows and refetching on every keystroke made
+// typing feel like it was fighting back.
+// Typing showed nothing at all until the new list appeared, so on a 2,000-row
+// queue the box felt unresponsive and it was impossible to tell "still
+// searching" from "no matches". The debounce is deliberate, so the honest
+// thing is to say a search is COMING, then that it is running.
+let _qFiltering=false;
+function qFilter(){
+  clearTimeout(_qFilterTimer);
+  const sum=document.getElementById('qSummary');
+  const txt=(document.getElementById('qfText')||{}).value||'';
+  if(sum) sum.innerHTML='<span class="busy"><span class="sp"></span>'
+    +`<span class="step">${txt?'searching for “'+esc(txt)+'”…':'clearing filter…'}</span></span>`;
+  _qFiltering=true;
+  _qFilterTimer=setTimeout(()=>{ _qLastKey=''; loadQueue(); }, 250);
+}
+// ---- auto-queue ----------------------------------------------------------
+let _aqBusy=false;
+async function loadAuto(){
+  let a;
+  try{ a=await (await fetch('/api/autoqueue')).json(); }catch(_){ return; }
+  const on=!!a.enabled;
+  document.getElementById('aqState').innerHTML = on
+    ? `<span class="pill p-ok">ON</span>`
+    : `<span class="pill p-dim">OFF</span>`;
+
+  const src=a.by_source||{};
+  const chip=(k,n)=>{
+    if(!n) return '';
+    const t=SRC_TAG[k]||SRC_TAG.manual;
+    return `<span class="aqchip" style="color:${t[1]};border-color:${t[1]}">`
+          +`${t[0]} <b>${fmt(n)}</b>`
+          +`<button class="aqx" title="clear the ${t[0]} jobs from the queue"
+                    onclick="clearQueue('${k}')">×</button></span>`;
+  };
+  // Library-wide progress. The bar is DONE out of everything nuarr manages,
+  // which is the only figure that answers "how far through are we" - the
+  // queue depth answers a completely different question and was the only
+  // number on the page before.
+  const pct=a.pct||0;
+  document.getElementById('aqBody').innerHTML = `
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:9px">
+      <button id="aqToggle" class="${on?'on':''}" onclick="toggleAuto(${!on})">
+        ${on?'Turn off':'Turn on'}</button>
+      <span class="dim" style="font-size:11px">keep</span>
+      <input id="aqTarget" type="number" min="0" max="5000" value="${a.target}"
+             style="width:74px" onchange="setAutoTarget(this.value)">
+      <span class="dim" style="font-size:11px">files queued</span>
+      <button onclick="runAuto()" title="top up now instead of waiting for the timer">Top up now</button>
+      <span id="aqMsg" class="dim" style="font-size:11px"></span>
+    </div>
+    <div class="bar big"><i style="width:${pct}%;background:var(--ok)"></i></div>
+    <div class="aqstats">
+      <span class="aq-g"><span class="aq-k">processed</span>
+            <span class="aq-v v-ok">${pct}%</span></span>
+      <span class="aq-g"><span class="aq-k">done</span>
+            <span class="aq-v">${fmt(a.done)}</span></span>
+      <span class="aq-g"><span class="aq-k">still to queue</span>
+            <span class="aq-v">${fmt(a.waiting)}</span></span>
+      <span class="aq-g"><span class="aq-k">queued now</span>
+            <span class="aq-v ${a.queued>=a.target?'v-ok':'v-acc'}">${fmt(a.queued)}</span>
+            <span class="dim">/ ${fmt(a.target)}</span></span>
+    </div>
+    <!-- WHY THE QUEUE IS THE DEPTH IT IS.
+         Every early return in the top-up is a deliberate decision, and without
+         saying so a queue sitting at 77 against a 2,000 target reads as broken
+         rather than intentional. -->
+    ${a.hold_reason?`<div class="aqhold">
+       <span class="pill p-warn">not topping up</span>
+       <span>${esc(a.hold_reason)}</span></div>`:''}
+    <!-- HOW WIDE THE WORK IS SPREAD.
+         Selection takes the oldest files from EACH disk rather than the oldest
+         overall, because the oldest files in the library are the ones DrivePool
+         placed first and they cluster on the disks that filled first. Measured
+         before that change: 1,924 of 1,966 queued jobs on two spindles, with
+         eight passthrough workers to share them. A total cannot show this, so
+         the per-disk counts are here. -->
+    ${(a.spread||[]).length?`<div class="aqspread">
+       <div class="aq-k" style="margin-bottom:4px">queue spread
+         <span class="${a.spread_disks>=4?'v-ok':'v-warn'}">${a.spread_disks}</span>
+         <span class="dim">of ${a.source_disks} disks with work · oldest first within each</span>
+       </div>
+       <div class="aqbars">${(()=>{
+         // BY DISK NUMBER, NOT BY COUNT. Sorted by size the bars re-ordered
+         // themselves every poll, so the same spindle was never in the same
+         // place twice and the row could not be read as a shape. A fixed
+         // 0-11 order makes a gap mean "this disk has no work" at a glance.
+         const dnum = d => { const m=/(\d+)\s*$/.exec(d||''); return m?+m[1]:9999; };
+         const rows=a.spread.slice().sort((x,y)=>dnum(x.disk)-dnum(y.disk));
+         const top=Math.max(1, ...rows.map(r=>r.n));
+         return rows.map(s=>{
+           const w=Math.max(4, Math.round(s.n / top * 100));
+           return `<span class="aqd" title="${fmt(s.n)} queued on ${esc(s.disk)}">
+                     <span class="aqd-n" style="color:${diskColor(s.disk)}">${esc(s.disk)}</span>
+                     <span class="aqd-bar"><i style="width:${w}%;background:${
+                       diskColor(s.disk)}"></i></span>
+                     <b class="aqd-v">${fmt(s.n)}</b></span>`;
+         }).join('');
+       })()}</div></div>`:''}
+    <div style="display:flex;gap:7px;flex-wrap:wrap;margin-top:9px">
+      ${chip('auto',src.auto)}${chip('manual',src.manual)}${chip('requeue',src.requeue)}
+      ${a.queued?`<button class="aqclear" onclick="clearQueue('all')">clear all queued</button>`:''}
+    </div>
+    ${a.oldest_waiting?`<div class="dim" style="margin-top:8px;font-size:11px">
+       next from the backlog: <b>${esc(a.oldest_waiting)}</b>
+       ${a.oldest_at?`<span class="dim">· ${new Date(a.oldest_at*1000).toLocaleDateString()}</span>`:''}
+     </div>`:''}
+    <!-- CHECKING, not adding. The probe decides the outcome, so claiming it is
+         being added was wrong roughly half the time - and the name then
+         vanished without ever saying which way it went. Now it says what is
+         being checked, and what the last answer was. -->
+    ${a.running?`<div style="margin-top:7px"><span class="busy"><span class="sp"></span>
+       <span class="step">checking ${
+         // checking_names carries OBJECTS now (label, disk, size, at) so the
+         // probe rows can be drawn - joining them as strings printed
+         // "[object Object]" on screen.
+         (a.checking_names&&a.checking_names.length)
+           ? esc(a.checking_names.slice(0,3).map(c=>c.label||'').join(' · '))
+             + (a.checking_names.length>3?` <span class="dim">(+${a.checking_names.length-3} more)</span>`:'')
+           : esc(a.current||'…')}</span></span></div>`:''}
+    ${(!a.running && (a.last_added||a.last_nowork))?`<div class="dim"
+       style="margin-top:7px;font-size:11px">last check:
+       <b style="color:var(--ok)">${fmt(a.last_added)}</b> queued ·
+       <b>${fmt(a.last_nowork)}</b> already fine, skipped</div>`:''}
+    ${(a.added_total||a.nowork_total)?`<div class="dim" style="margin-top:4px;font-size:11px">
+       since start: ${fmt(a.added_total)} queued · ${fmt(a.nowork_total)} skipped</div>`:''}
+    ${a.last_error?`<div class="err" style="margin-top:7px;font-size:11px">${esc(a.last_error)}</div>`:''}`;
+  _aqLast = a;
+  renderAqProbes(a);
+}
+
+// CURRENTLY PROBING - the files being read right now to decide whether they
+// need work. Keyed by file id and patched in place rather than rebuilt, so a
+// row that is still probing keeps its element (and therefore its animation)
+// across polls; only arrivals and departures touch the DOM.
+//
+// Rows are added as probing starts, wear their verdict for a couple of
+// seconds when the answer lands, then leave. No scroll, no freeze rule, no
+// history: this is a picture of NOW, and the Activity panel below already
+// keeps the record of what happened.
+let _aqLast=null;
+function renderAqProbes(a){
+  const wrap=document.getElementById('aqProbeWrap');
+  const box=document.getElementById('aqProbe');
+  if(!wrap||!box) return;
+  const list=a.checking_names||[];
+  wrap.style.display=list.length?'':'none';
+  const cnt=document.getElementById('aqProbeCount');
+  if(cnt) cnt.textContent=list.length
+    ? `(${list.length} file${list.length===1?'':'s'} being read)` : '';
+  watchScrollTop('aqProbe');
+  // FROZEN WHILE YOU READ. Rows are patched in place, so an existing row
+  // updating is harmless - but ADDING one shifts everything below it, which
+  // is exactly what pulls the line out from under someone scrolled down the
+  // list. While that is the case, new probes are counted into the resume
+  // button instead of inserted; updates and removals still flow.
+  const frozen = !follows('aqProbe');
+  const seen=new Set();
+  let held=0;
+  for(const c of list){
+    const key='aqp'+c.id;
+    seen.add(key);
+    let el=document.getElementById(key);
+    if(!el && frozen){ held++; continue; }
+    if(!el){
+      el=document.createElement('div');
+      el.id=key; el.className='aqprobe arriving';
+      el.innerHTML=`
+        <span class="aqp-spin"><i></i><i></i><i></i></span>
+        <b class="aqp-title wrap">${esc(c.label||'')}</b>
+        ${c.disk?`<span class="mono aqp-disk" style="color:${diskColor(c.disk)}">${esc(c.disk)}</span>`:''}
+        ${c.size?`<span class="dim aqp-size">${gb(c.size)}</span>`:''}
+        <span class="aqp-state"></span>
+        <span class="dim mono aqp-el"></span>
+        <span class="aqp-track"><i></i></span>`;
+      box.appendChild(el);
+    }
+    // the only per-poll writes: verdict, elapsed, and the sweep's state
+    const r=c.result, done=!!c.done_at;
+    const st=el.querySelector('.aqp-state');
+    if(st) st.innerHTML = done && r
+      ? `<span class="pill ${r.verdict==='queued'?'p-ok':r.verdict==='error'?'e-failed':'p-dim'}"
+           title="${esc(r.summary||'')}">${esc(r.verdict==='skipped'?'already fine':r.verdict)}</span>`
+      : '<span class="dim aqp-read">reading the file…</span>';
+    el.classList.toggle('settled', done);
+    el.dataset.at=c.at;
+  }
+  for(const el of [...box.children])
+    if(!seen.has(el.id)){ el.classList.add('leaving');
+      setTimeout(()=>el.remove(), 260); }
+  const rb=document.getElementById('aqProbeResume');
+  if(rb){
+    if(held){ rb.style.display='';
+              rb.textContent=`↑ ${held} more — back to newest`; }
+    else if(!frozen) rb.style.display='none';
+  }
+}
+// Elapsed ticks locally so a probe that outlives one poll visibly keeps
+// working, without asking the server four times a second.
+setInterval(()=>{
+  const box=document.getElementById('aqProbe');
+  if(!box) return;
+  const now=Date.now()/1000;
+  for(const el of box.children){
+    if(el.classList.contains('settled')) continue;
+    const t=el.querySelector('.aqp-el');
+    const at=parseFloat(el.dataset.at||'0');
+    if(t&&at) t.textContent=(now-at).toFixed(1)+'s';
+  }
+}, 250);
+async function toggleAuto(on){
+  if(_aqBusy) return; _aqBusy=true;
+  try{ await fetch('/api/autoqueue/toggle?on='+(on?'true':'false'),{method:'POST'}); }
+  finally{ _aqBusy=false; }
+  loadAuto();
+}
+async function setAutoTarget(n){
+  await fetch('/api/autoqueue/target?n='+encodeURIComponent(n),{method:'POST'});
+  loadAuto();
+}
+async function runAuto(){
+  const m=document.getElementById('aqMsg');
+  if(m) m.textContent='topping up…';
+  try{
+    const r=await (await fetch('/api/autoqueue/run',{method:'POST'})).json();
+    if(m) m.textContent = r.added ? `added ${fmt(r.added)}`
+                                  : 'nothing to add right now';
+  }catch(_){ if(m) m.textContent='top-up failed'; }
+  loadAuto(); loadQueue();
+}
+async function clearQueue(src){
+  const a=await (await fetch('/api/autoqueue')).json();
+  const n=(src==='all') ? a.queued : ((a.by_source||{})[src]||0);
+  if(!n){ const m=document.getElementById('aqMsg');
+          if(m) m.textContent=`nothing ${src==='all'?'queued':'from '+src}`; return; }
+  // Auto work is replaceable and gets a lighter warning; the other two are
+  // decisions somebody made, so they get named explicitly.
+  const warn = src==='auto'
+    ? `Clear ${n.toLocaleString()} auto-queued job(s)?\n\nThey will be added back automatically unless you also turn auto-queue off.`
+    : `Clear ${n.toLocaleString()} ${src==='all'?'queued':src} job(s)?\n\nRunning jobs keep going. This cannot be undone.`;
+  if(!confirm(warn)) return;
+  const r=await (await fetch('/api/queue/clear?source='+encodeURIComponent(src),
+                             {method:'POST'})).json();
+  const m=document.getElementById('aqMsg');
+  if(m) m.textContent=`cleared ${fmt(r.cleared)}`;
+  _qLastKey=''; loadAuto(); loadQueue(); loadJobs();
+}
+
+// Where a queued job came from. Colour-coded because the three have different
+// weight: auto is replaceable (it will just be re-added), manual and requeue
+// are decisions somebody made and should not be discarded casually.
+const SRC_TAG = {
+  auto:    ['auto',   '#8b95a5', 'added automatically from the eligible backlog'],
+  manual:  ['manual', '#58a6ff', 'you queued this one'],
+  requeue: ['requeue','#d2a8ff', 'sent back through deliberately'],
+};
+function srcTag(s){
+  const t = SRC_TAG[s] || SRC_TAG.manual;
+  return `<span class="pill qsrc" style="color:${t[1]};border-color:${t[1]}"
+            title="${esc(t[2])}">${t[0]}</span>`;
+}
+
+// EVERY QUEUE CONTROL SAYS SOMETHING.
+//
+// The pool and disk dropdowns had no handler at all - they changed a value that
+// loadQueue happened to read on its next poll, so a selection did nothing
+// visible for up to two seconds and then the list silently changed underneath
+// you. The text filter and the sort had feedback; these did not. Same treatment
+// for all of them: name the thing being applied, spin while it is in flight.
+//
+// The bar itself dims too, because "next to run" now ranks the whole queue
+// server-side and can take a beat longer than a plain page fetch - long enough
+// that a second click while the first is still running is a real possibility.
+function qBarIdle(){
+  const bar=document.getElementById('qFilterBar');
+  if(bar) bar.style.opacity='';
+}
+function qReload(msg){
+  const sum=document.getElementById('qSummary');
+  if(sum) sum.innerHTML='<span class="busy"><span class="sp"></span>'
+    +`<span class="step">${esc(msg)}</span></span>`;
+  const bar=document.getElementById('qFilterBar');
+  if(bar) bar.style.opacity='.55';
+  _qFiltering=true;
+  _qSeq++; _qPendMsg=msg;        // this is now the newest intent
+  _qLastKey='';                  // the ordering changed; force a repaint
+  loadQueue();
+}
+function qSortChange(){
+  const s=document.getElementById('qfSort');
+  const lbl=s && s.options[s.selectedIndex] ? s.options[s.selectedIndex].text : 'sort';
+  qReload(`sorting by ${lbl}…`);
+}
+function qSortDir(){
+  _qDir = _qDir==='asc' ? 'desc' : 'asc';
+  const b=document.getElementById('qfDir');
+  if(b) b.textContent = _qDir==='asc' ? '▲' : '▼';
+  qReload(_qDir==='asc' ? 'sorting ascending…' : 'sorting descending…');
+}
+async function qMove(id, where){
+  try{
+    await fetch(`/api/queue/move?job_id=${encodeURIComponent(id)}&where=${where}`,
+                {method:'POST'});
+  }catch(_){}
+  _qLastKey='';                 // force a repaint; the order has changed
+  loadQueue();
+}
+
+function queueTop(){
+  const b=document.getElementById('queueList');
+  if(b) b.scrollTo({top:0, behavior:'smooth'});
+}
+
+async function loadQueue(){
+  // A control changed while a poll was in flight used to be DROPPED - the
+  // guard returned, nothing re-ran, and the spinner sat there forever showing
+  // a filter that had never been applied. Remember the request and honour it
+  // when the current fetch lands.
+  if(_qBusy){ _qRerun=true; return; }
+  _qBusy=true;
+  const mySeq=_qSeq;             // which user intent this response answers
+  let q;
+  try{
+    const pool=(document.getElementById('qfPool')||{}).value||'';
+    const disk=(document.getElementById('qfDisk')||{}).value||'';
+    const txt=(document.getElementById('qfText')||{}).value||'';
+    const srt=(document.getElementById('qfSort')||{}).value||'next';
+    // 'next' IS a server sort now. Simulating dispatch in the browser meant
+    // reordering only the 300 rows already fetched, so with 1,975 stream copies
+    // ahead of them the 22 encode jobs - the ones actually about to start -
+    // were never in the window to be ranked. Ordering has to precede the LIMIT.
+    const srvSort = (srt==='order') ? '' : srt;
+    sortMode = srt;
+    q=await (await fetch(`/api/queue?limit=300`
+        +(pool?`&pool=${encodeURIComponent(pool)}`:'')
+        +(disk?`&disk=${encodeURIComponent(disk)}`:'')
+        +(txt?`&q=${encodeURIComponent(txt)}`:'')
+        +(srvSort?`&sort=${srvSort}&dir=${_qDir}`:''))).json();
+  } catch(e){ _qBusy=false; qBarIdle(); return; }
+  _qBusy=false;
+  qBarIdle();
+  // RE-RUN, BUT RENDER FIRST.
+  //
+  // This used to `return` here to go straight into the fresher fetch, which
+  // starved the render completely. The 2 s poll fires during almost every
+  // request, so almost every request set _qRerun, so almost every request
+  // bailed before painting - fetch, discard, fetch, discard. The spinner never
+  // cleared and the list kept showing pre-filter rows: exactly the "showing
+  // encode… forever" symptom, with passthrough titles still listed underneath.
+  // Paint what just arrived, then queue the refresh on the next tick.
+  if(_qRerun){ _qRerun=false; _qLastKey=''; setTimeout(loadQueue, 0); }
+
+  _qFiltering=false;
+
+  // Which spindle the queue is stacked on is the single most useful fact here:
+  // 2,000 files on one disk run at a fraction of the speed of the same 2,000
+  // spread across twelve, and nothing else on the page shows it.
+  const dwrap=document.getElementById('queueDisks');
+  if(dwrap){
+    const cur=(document.getElementById('qfDisk')||{}).value||'';
+    // Same per-disk palette as the "Files per pool disk" panel, so a colour
+    // means the same spindle everywhere on the page.
+    // NO PER-DISK CHIPS HERE. "Queue spread" directly above already gives the
+    // same counts with bars showing the balance, so this row repeated every
+    // number a few pixels lower - and the duplicate was the wordier of the
+    // two. The pool chips stay: those are the one thing the spread does not
+    // show. The disk dropdown below is still how you filter to a spindle.
+    // Same palette as the pool pills in the rows beneath, and everywhere else
+    // on the page: purple is subocr in the queue legend, in the row's pill, in
+    // the worker card and in Activity. A legend in a different colour from the
+    // thing it labels is not a legend.
+    dwrap.innerHTML = (q.by_pool||[]).map(p=>{
+      const c = poolColor(p.pool);
+      return `<span class="qchip" style="cursor:default;color:${c};border-color:${c}"
+             >${esc(p.pool)} <b>${fmt(p.n)}</b></span>`;
+    }).join('');
+    // keep the disk filter list in sync with what is actually queued
+    const sel=document.getElementById('qfDisk');
+    const want=['']+(q.by_disk||[]).map(d=>d.disk).join(',');
+    if(sel && sel.__key!==want){
+      sel.__key=want;
+      const v=sel.value;
+      sel.innerHTML='<option value="">all disks</option>'
+        +(q.by_disk||[]).filter(d=>d.disk!=='—')
+          .map(d=>`<option value="${esc(d.disk)}">${esc(d.disk)} (${fmt(d.n)})</option>`).join('');
+      sel.value=v;
+    }
+  }
+
+  const box=document.getElementById('queueList');
+  if(!box) return;
+  // The key decides whether to repaint. It has to cover everything the render
+  // depends on, and with "next to run" that now includes WHICH SPINDLES ARE
+  // BUSY - the same queue rows reorder when a disk frees up. Keyed on server
+  // order alone, a job finishing changed the answer without changing the key,
+  // so the panel kept showing an ordering that was no longer true.
+  const key=(q.items||[]).map(i=>i.job_id).join(',')+'|'+q.total
+    +'|'+sortMode
+    +'|'+(q.running||[]).map(w=>w.disk||'').sort().join(',')
+    +'|'+JSON.stringify(q.capacity||{});
+  if(key!==_qLastKey){
+    _qLastKey=key;
+    // Rebuilding innerHTML resets scrollTop to 0. With scrolling now entirely
+    // manual, that would throw you back to the top every time a job left the
+    // queue - which, at this throughput, is constantly.
+    const keepScroll = box.scrollTop;
+    // WHICH ONES ARE ABOUT TO START.
+    // The list is already sorted the way the dispatcher will claim, so the next
+    // files are simply the first N where N is the number of free worker slots -
+    // but only counting pools that actually have a slot free, and only one per
+    // disk, because the dispatcher will not start two disk-heavy jobs on one
+    // spindle. Without this the top of the queue and the Transcoding panel felt
+    // unrelated: you could not tell which of 2,000 rows was seconds away.
+    // Show the NEXT WAVE, not only what can start this instant. Marking just
+    // the free slots meant the indicator vanished whenever the pools were
+    // saturated - which is most of the time on a full queue, and exactly when
+    // you want to know what is coming. Instead: for each pool, the next
+    // `capacity` files that are not on a disk already in use.
+    const cap = q.capacity || {};
+    const run = q.running || [];
+    const freeBy = Object.assign({}, cap);
+    const busyDisks = new Set(run.map(w=>w.disk).filter(Boolean));
+    const diskTaken = new Set(busyDisks);
+    const nextUp = new Set();
+    (q.items||[]).forEach(it=>{
+      const p = it.pool;
+      if(!freeBy[p]) return;
+      if(it.pool_disk && diskTaken.has(it.pool_disk)) return;
+      nextUp.add(it.job_id);
+      freeBy[p] -= 1;
+      if(it.pool_disk) diskTaken.add(it.pool_disk);
+    });
+
+    // SORT BY WHAT ACTUALLY RUNS NEXT.
+    //
+    // Queue order is dispatch PRIORITY, which is not the same as dispatch
+    // ORDER: the claimer skips any file whose spindle is already in use, so
+    // row 1 can sit untouched while row 40 starts. With 11 of 15 files on one
+    // disk that gap is the whole list, and the top of the panel was showing
+    // things that were nowhere near running.
+    //
+    // This replays the dispatcher in waves - claim what can start, assume it
+    // runs, free its slot, repeat - so the list reads top-to-bottom in the
+    // order the files will genuinely be picked up. Anything that never becomes
+    // claimable (its disk is held by a job that outlasts the simulation) keeps
+    // its queue position at the end rather than being dropped.
+    // (The wave simulation that used to live here now runs in _dispatch_order
+    // on the server, where it can see all 1,997 queued rows instead of the 300
+    // that fit in one page. q.items already arrives in dispatch order.)
+
+    // WHY IS NOTHING MARKED NEXT-UP?
+    // With every queued file sitting on the one or two spindles already in
+    // use, no row qualifies - correct, but the panel then showed no marker and
+    // no explanation, so a queue working exactly as designed looked identical
+    // to a stalled one. Measured here: 15 files, all on NU-DRIVE-0 and
+    // NU-DRIVE-1, both busy. Say it out loud.
+    //
+    // Computed HERE, after nextUp exists. It was above the summary line, where
+    // nextUp/busyDisks are still in their temporal dead zone - loadQueue threw
+    // on every poll and the whole panel rendered empty.
+    let stallNote='';
+    if((q.items||[]).length && !nextUp.size){
+      const blocked=[...new Set((q.items||[]).map(x=>x.pool_disk)
+                                 .filter(d=>d && busyDisks.has(d)))];
+      const poolFull=Object.keys(cap).filter(p=>!freeBy[p]);
+      if(blocked.length)
+        stallNote=` · <span class="dim">waiting for ${esc(blocked.join(', '))} `
+                 +`— every queued file is on a disk already in use</span>`;
+      else if(poolFull.length)
+        stallNote=` · <span class="dim">all ${esc(poolFull.join(' and '))} `
+                 +`workers busy</span>`;
+    }
+    const sum2=document.getElementById('qSummary');
+    const ftxt=(document.getElementById('qfText')||{}).value||'';
+    if(sum2){
+      // DO NOT CLOBBER A PENDING FILTER'S SPINNER.
+      //
+      // This line repaints whenever the render key changes, and the key
+      // includes which spindles are busy - so a job moving into the
+      // Transcoding panel repaints the queue. If a dropdown change was still
+      // in flight, that background repaint overwrote its "filtering to
+      // NU-DRIVE-3…" with a normal summary, and the user lost all feedback
+      // while still waiting for their own request.
+      //
+      // _qSeq is bumped by every user-initiated change. A response only owns
+      // the summary if it is answering the LATEST intent; anything older
+      // leaves the spinner alone and lets the real answer land.
+      if(_qPendMsg && mySeq !== _qSeq){
+        // stale response, user is still waiting - leave the spinner up
+      } else {
+        _qPendMsg='';
+        // Distinguish "no matches" from "queue is empty" - they look identical
+        // otherwise and mean opposite things.
+        sum2.innerHTML = q.total
+          ? esc(`${fmt(q.total)} waiting · ${gb(q.bytes)} · showing ${fmt(q.shown)}`
+                + (ftxt ? ` matching “${ftxt}”` : '')) + stallNote
+          : esc(ftxt ? `no queued files match “${ftxt}”` : 'queue is empty');
+      }
+    }
+
+    // PIN WHAT IS ABOUT TO START.
+    //
+    // q.items arrives in dispatch order, which is nearly the same thing - but
+    // "nearly" is what makes you scan. The rows that will actually be claimed
+    // in the next wave are lifted to the very top under their own heading, so
+    // the question "what is running next" is answered by looking, not reading.
+    // Only under the 'next to run' view: if you have deliberately sorted by
+    // title or size, reordering underneath you would be rude.
+    const sortSel=(document.getElementById('qfSort')||{}).value||'next';
+    let items=(q.items||[]).slice();
+    let pinned=0;
+    if(sortSel==='next' && nextUp.size){
+      const head=items.filter(x=>nextUp.has(x.job_id));
+      const tail=items.filter(x=>!nextUp.has(x.job_id));
+      pinned=head.length;
+      items=head.concat(tail);
+    }
+    // IS THERE A REASON COLUMN AT ALL, for this whole render?
+    //
+    // Decided once, for every row together. Deciding it per row is what pulled
+    // the table apart: a row with no blocker simply omitted the cell, the title
+    // grew into the gap, and that row's library, disk and size landed 511px
+    // right of the row above it. A column that exists on some rows is not a
+    // column. When nothing is blocked there is no column at all, rather than a
+    // stripe of empty space down a healthy queue.
+    const whyOf = (it) => {
+      const b = _qWhy[it.job_id];
+      return (!b || b.state === 'next') ? null : b;
+    };
+    const anyWhy = items.some(whyOf);
+    const WHYCOL = {viewer:'#e3b341', held:'#f778ba', full:'var(--dim)'};
+
+    const rowHtml=(it,i,up)=>{
+      const col = poolColor(it.pool);
+      const b = whyOf(it);
+      return `<div class="qrow${up?' qnext':''}"${up?` title="${esc((_qWhy[it.job_id]||{}).why||'next in line')}"`:''}>
+            <span class="qn">${up?'<span class="qspin"><i></i><i></i><i></i></span>':''}${i+1}</span>
+            <span class="pill qpool" style="color:${col};border-color:${col}">${esc(it.pool||'')}</span>
+          ${srcTag(it.source)}
+            <span class="qt" title="${esc(it.path||'')}">${esc(it.title||it.path||'')}</span>
+            <span class="qwork" title="${esc(it.work_full||it.work||'')}">${esc(it.work||'')}</span>
+            <span class="qlib">${esc(it.library||'')}</span>
+            <span class="mono qdisk" style="color:${
+              it.pool_disk?diskColor(it.pool_disk):'var(--dim)'}">${esc(it.pool_disk||'—')}</span>
+            <span class="qsz">${it.size?gb(it.size):'—'}</span>
+            ${anyWhy
+              ? `<span class="qwhy" style="color:${b?(WHYCOL[b.state]||'#58c8d8'):'transparent'}"
+                       title="${esc(b?b.why:'')}">${esc(b?(b.short||b.why):'')}</span>`
+              : ''}
+            <span class="qmv">
+              <button title="run next" onclick="qMove('${esc(it.job_id)}','top')">⤒</button>
+              <button title="up one" onclick="qMove('${esc(it.job_id)}','up')">↑</button>
+              <button title="down one" onclick="qMove('${esc(it.job_id)}','down')">↓</button>
+              <button title="run last" onclick="qMove('${esc(it.job_id)}','bottom')">⤓</button>
+            </span>
+          </div>`;
+    };
+    // COLUMN HEADERS, built from the same cells as the rows.
+    //
+    // The rows had grown real columns - work, library, disk, size, reason -
+    // with nothing naming them, while Recent activity next door labels its
+    // four. Same vocabulary now. Built with the row's own classes and flex
+    // widths so the headers cannot drift out of line with the cells: a width
+    // change in one place moves both together.
+    const headHtml =
+      `<div class="qrow qhead">
+        <span class="qn">#</span>
+        <span class="qpool">Pool</span>
+        <span class="qsrc">Source</span>
+        <span class="qt">Title</span>
+        <span class="qwork">Planned work</span>
+        <span class="qlib">Library</span>
+        <span class="qdisk">Disk</span>
+        <span class="qsz">Size</span>
+        ${anyWhy?'<span class="qwhy">Waiting on</span>':''}
+        <span class="qmv" style="visibility:hidden"><button>⤒</button
+          ><button>↑</button><button>↓</button><button>⤓</button></span>
+      </div>`;
+    box.innerHTML = items.length
+      ? headHtml
+        + (pinned
+          ? `<div class="qsplit"><b>starting next</b><span>${pinned} file${
+                pinned===1?'':'s'}${_qHead?' — '+esc(_qHead):''}</span><i></i></div>`
+            + items.slice(0, pinned).map((it,i)=>rowHtml(it,i,true)).join('')
+            + (items.length > pinned
+                ? `<div class="qsplit"><span>then, in order</span><i></i></div>`
+                  + items.slice(pinned).map((it,i)=>rowHtml(it,i+pinned,false)).join('')
+                : '')
+          : items.map((it,i)=>rowHtml(it,i,nextUp.has(it.job_id))).join(''))
+      : '<div class="dim" style="padding:14px">nothing queued</div>';
+    box.scrollTop = Math.min(keepScroll, Math.max(0, box.scrollHeight - box.clientHeight));
+  }
+}
+function filterDisk(d){
+  const sel=document.getElementById('qfDisk');
+  if(!sel) return;
+  sel.value = (sel.value===d || d==='—') ? '' : d;
+  qReload(sel.value ? `filtering to ${sel.value}…` : 'showing all disks…');
+}
+
+let _jobsBusy=false, _jobsSeq=0, _lastIo=null, _lastWaits=[];
+// Pool disks a Plex client is currently reading from, and whether encoders are
+// yielding disk priority because of it. Both ride along on the job poll.
+let _plexDisks=[], _ioThrottled=false;
+// Physical per-spindle load, refreshed on the 2 s job poll. Defaults to an
+// object rather than null so every reader can index it without a guard.
+let _diskLoad={disks:[],thresh:85,window_s:20};
+// disk -> who is watching from it and at what combined rate.
+let _plexDetail={};
+// Running encode jobs, for GPU attribution the driver cannot provide.
+let _nuarrEnc=[];
+// Job ids the server has actually demoted. Priority is per spindle now, so a
+// card can only claim "low I/O" if its own job is in this set.
+let _ioLowJobs=new Set(), _ioReason='';
+// Ghost cards for jobs that just finished. FADE_MS is deliberately shorter than
+// the 2 s poll, so the animation is always complete before the next repaint
+// clears the entry - no timer of our own to keep in sync.
+// 2 s holding the finished card + 0.6 s fading it. This is now LONGER than the
+// 2 s poll, so a ghost survives a repaint - _fading is keyed on an expiry
+// timestamp rather than on "cleared next tick" precisely so that is safe.
+const FADE_MS=2600;
+let _cardHtml=new Map(), _fading=new Map(), _lastRunIds=new Set();
+// job_id -> the phase its bar was last drawn in. Used only to decide whether
+// the width change should animate; a phase switch resets the bar and easing
+// that backwards looks like the job losing progress.
+const _barPhase={};
+async function loadJobs(){
+  if(_jobsBusy) return;
+  _jobsBusy=true;
+  const seq=++_jobsSeq;
+  let j;
+  try{
+    j=await (await fetch('/api/jobs')).json();
+  } finally { _jobsBusy=false; }
+  if(seq!==_jobsSeq) return;          // a newer poll already painted
+  // the log viewer animates a job's gutter only while it is genuinely running
+  const before=runningJobs.size;
+  runningJobs=new Set(j.running.map(w=>w.job_id));
+  if(before!==runningJobs.size) renderLogs(false);
+  // a watched job's inline log keeps tailing; collapse it once the job ends
+  if(watchId){
+    if(runningJobs.has(watchId)) await fetchWatch();
+    else { watchId=null; watchHtml=''; }
+  }
+  // WORKER OCCUPANCY AND I/O PRIORITY.
+  //
+  // Each figure gets a label and its own group rather than being run together
+  // in one dim sentence - "encode 0/4 · passthrough 3/8 · 1,996 queued" reads
+  // as a single blob, and the numbers are what you are actually looking for.
+  // Full capacity is highlighted, since "4/4" and "0/4" mean opposite things
+  // and were previously the same colour and size.
+  //
+  // The old single "yielding disk" badge said the machine was yielding but not
+  // WHO, and the two pools are not treated alike: a Plex transcode holds the
+  // encode pool outright, while a direct play only lowers disk priority. The
+  // state now sits beside each pool, which is what makes "encode 0/4"
+  // explicable rather than mysterious.
+  const held = new Set(j.plex_disks||[]);
+  _ioLowJobs = new Set(j.io_low_jobs||[]);
+  // HOW MANY of this pool's jobs are actually demoted, not "is the feature on".
+  // Priority is now applied per spindle, so with a viewer on one disk and four
+  // jobs spread across four disks the honest answer is "1 of 4", not "low I/O"
+  // stamped across everything.
+  const ioTag = (pool)=>{
+    const mine=(j.running||[]).filter(w=>w.pool===pool);
+    const low = mine.filter(w=>_ioLowJobs.has(w.job_id)).length;
+    if(!j.io_throttled || !low)
+      return `<span class="iop norm" title="${esc(j.io_throttled
+        ? 'nothing in this pool shares a spindle with the contention, so these run at normal priority'
+        : 'normal disk priority — nothing is competing for the pool')}">normal I/O</span>`;
+    return `<span class="iop low" title="${esc(j.io_reason
+        ? j.io_reason + ' — ' + low + ' of ' + mine.length
+          + ' running job(s) in this pool touch that and are at lowered disk priority'
+        : 'lowered disk priority')}">low I/O ${low}/${mine.length}</span>`;
+  };
+  const capCell=(name,used,cap,pool,note)=>{
+    const full = cap>0 && used>=cap;
+    const col = full ? 'var(--ok)' : (used>0 ? 'var(--acc)' : 'var(--dim)');
+    return `<span class="grp"${note?` title="${esc(note)}"`:''}>`
+          +`<span class="k">${esc(name)}</span>`
+          +`<span class="v" style="color:${col}">${used}</span>`
+          +`<span class="dim">/${cap}</span>`
+          +(note?`<span class="dim" style="font-size:10px;margin-left:3px"
+                       >inline</span>`:'')
+          +`${ioTag(pool)}</span>`;
+  };
+  document.getElementById('jobCap').innerHTML =
+    capCell('encode', j.in_use.encode, j.capacity.encode, 'encode')
+    + capCell('passthrough', j.in_use.passthrough, j.capacity.passthrough, 'passthrough')
+    // subocr sat invisible here while running four workers - the header said
+    // "encode 0/4 passthrough 0/6" over a machine grinding at full tilt.
+    + capCell('subocr', (j.in_use||{}).subocr||0, (j.capacity||{}).subocr||0, 'subocr',
+              // An OCR running inside a transcode spends the same budget, so
+              // it is counted - but it has no card of its own in this pool,
+              // and a number that moves with nothing to point at is worse than
+              // no number. Name the inline ones.
+              (j.subocr_inline||0)
+                ? `${j.subocr_inline} of these run inside a transcode or `
+                  + `passthrough job (one rewrite carrying both changes); `
+                  + `they use the same OCR budget as a standalone subtitle job`
+                : '')
+    // THE ONE queued figure. It used to appear here AND six lines below in the
+    // run-progress line, computed a moment apart so the two disagreed by a
+    // handful - two different numbers for the same thing. The other one is
+    // gone; this is the one that stays, next to the workers it feeds.
+    + `<span class="grp"><span class="k">queued</span>`
+    + `<span class="v">${fmt(j.queued)}</span></span>`
+    // WHICH SPINDLE, not just "a viewer exists". This is the fact that decides
+    // where the next stream copy can go.
+    + (held.size
+        ? `<span class="grp"><span class="k">viewer on</span>`
+          +[...held].map(d=>`<span class="v" style="color:var(--warn)">${esc(d)}</span>`)
+             .join('<span class="dim">, </span>')
+          +`</span>`
+        : (j.io_throttled
+            ? `<span class="grp"><span class="k">viewer on</span>`
+              +`<span class="dim" title="a session is playing but its file could not be
+resolved to a pool disk, so the per-spindle avoidance cannot apply">unknown disk</span></span>`
+            : ''));
+  // show bulk-queue progress while it builds
+  try{
+    const e=await (await fetch('/api/jobs/enqueue/status')).json();
+    const m=document.getElementById('qMsg');
+    // Do not paint over a request that is still in flight. This poll and
+    // queueWork() both own #qMsg, and at 2 s intervals it would erase the
+    // spinner and its clock a moment after they appeared.
+    if(_qwBusy){ /* queueWork owns the line until its fetch returns */ }
+    else if(e.running){
+      // Say what is being built AND what is lined up behind it, so a second
+      // Queue press has visible confirmation rather than looking ignored.
+      // queued_libraries is the runner's OWN remaining list; e.pending only
+      // holds requests it has not absorbed yet, so show both.
+      const waiting=(e.queued_libraries||[])
+        .concat((e.pending||[]).map(x=>x||'all libraries'));
+      // Rate and ETA, derived here rather than server-side so it costs
+      // nothing: a bare "160 / 1,435" does not say whether that is ten
+      // seconds away or twenty minutes, which is the question being asked.
+      const now=Date.now()/1000;
+      if(_bulkSeen.total!==e.total || e.done < _bulkSeen.done)
+        _bulkSeen={total:e.total, done:e.done, at:now, startDone:e.done, startAt:now};
+      _bulkSeen.done=e.done;
+      const dt=now-_bulkSeen.startAt, dn=e.done-_bulkSeen.startDone;
+      let rate = dt>3 && dn>0 ? dn/dt : 0;
+      const left = Math.max(0, (e.total||0)-(e.done||0));
+      const eta = rate>0 ? left/rate : 0;
+      m.innerHTML='<span class="busy"><span class="sp"></span><span class="step">'
+        +esc(`building queue: ${fmt(e.done)} / ${fmt(e.total)}`
+             +(e.library?` (${e.library})`:''))
+        +'</span>'
+        +(rate>0?`<span class="el">${rate.toFixed(1)}/s · ~${hms(eta)} left</span>`:'')
+        +'</span>'
+        +(waiting.length?`<span class="dim"> · then ${esc(waiting.join(', '))}</span>`:'');
+    }
+    else if(e.total && (m.textContent||'').startsWith('building')){
+      m.textContent=`queued ${fmt(e.done)}`;
+      _bulkSeen={total:-1,done:0,at:0,startDone:0,startAt:0};
+    }
+  }catch(_){}
+  // renderSys is driven by its own 1 s poll now - see loadSys(). Painting it
+  // from here too would make the bar jump backwards whenever a slow /api/jobs
+  // reply arrived carrying an older sample than the one already displayed.
+  paintRunning(j);
+  lastJobs=j;
+  renderDone(j);
+}
+
+// THE MOVING HALF OF THE PANEL, painted by both polls.
+//
+// Split out of loadJobs so the fast /api/jobs/live poll can drive the worker
+// cards without also refetching the Finished list and the queue preview. Those
+// two are why the panel ran at 2 s: they are large and they rarely change,
+// while the thing you actually watch - the bar - changes continuously.
+function paintRunning(j){
+  _lastIo = j.io || null;
+  if(j.disk_load && j.disk_load.disks) _diskLoad = j.disk_load;
+  // IS NUARR ON THE GPU? ASK NUARR, NOT THE DRIVER.
+  //
+  // nvidia-smi cannot answer this on Windows - see gpuPanel() - but the job
+  // pump knows exactly: a worker in the encode pool at the encoding stage is
+  // running NVENC by definition. Captured here because the GPU panel is drawn
+  // from the system sample, which has no idea what the queue is doing.
+  _nuarrEnc = (j.running||[]).filter(w=>w.pool==='encode' && w.stage==='encoding');
+  _plexDisks = j.plex_disks || [];
+  _plexDetail = j.plex_disk_detail || {};
+  _ioThrottled = !!j.io_throttled;
+  _ioLowJobs = new Set(j.io_low_jobs || []);
+  _ioReason = j.io_reason || '';
+  _lastWaits = j.disk_waits || [];
+  // Repaint the pool-disk table from the JOB poll (2 s) rather than waiting for
+  // the summary poll (15 s) - an "activity" column that updates four times a
+  // minute is not activity.
+  if(lastDisks.length) renderDisks();
+  renderOverall(j.overall);
+  document.getElementById('jobsHeld').innerHTML = j.paused_reason
+    ? `<div style="padding:10px 14px;border-bottom:1px solid var(--line)">
+       <span class="pill p-warn">HELD</span> <span class="dim">${esc(j.paused_reason)}</span></div>`
+    : '';
+
+  // Feed the interpolator FIRST, so barState() below - in either the patch or
+  // the rebuild path - reads this sample rather than the previous one.
+  noteProgress(j.running);
+
+  // Same jobs as last paint? Refresh the numbers in place and stop - the
+  // string-building below only runs when the panel's structure changed.
+  if(tryPatchCards(j)) return;
+
+  // Last phase seen per job, so the bar knows when NOT to animate. Pruned to
+  // the jobs still running, or it would grow for the life of the page.
+  const liveIds=new Set(j.running.map(w=>w.job_id));
+  for(const k of Object.keys(_barPhase)) if(!liveIds.has(k)) delete _barPhase[k];
+
+  let html='';
+  if(j.running.length){
+    html+=j.running.map(w=>{
+      // subocr gets its own colour (purple) so four background OCR jobs are
+      // never mistaken for four passthrough copies at a glance.
+      const poolCol = poolColor(w.pool);
+      // THE BAR FOLLOWS THE ACTIVE PHASE, not just ffmpeg.
+      //
+      // w.progress is the ENCODE's progress and stops updating the moment
+      // ffmpeg exits. The commit that follows copies the whole file onto the
+      // pool - 53.5 GB in the case that prompted this - so the bar sat frozen
+      // at whatever the encode reached (90.8%) for the entire longest step of
+      // the job. Now the commit drives it, in its own colour so the reset from
+      // near-full back to zero reads as "second phase", not "lost progress".
+      const bs = barState(w, poolCol);
+      let pct = bs.pct, col = bs.col, indet = bs.indet;
+      // Suppress the grow transition on the frame where the phase flips, so a
+      // 98% -> 0% reset does not ease backwards across the card.
+      const phaseKey = w.job_id+':'+(w.stage||'');
+      const reset = _barPhase[w.job_id] !== undefined && _barPhase[w.job_id] !== phaseKey;
+      _barPhase[w.job_id] = phaseKey;
+      // data-job lets Watch/Hide find and edit THIS card without a full
+      // repaint - see watchLive().
+      const card = `<div class="wk" data-job="${esc(w.job_id)}">
+        <div class="wkhead">
+          <span class="spin"><i></i><i></i><i></i></span>
+          <span class="pill" style="color:${poolCol};border-color:${poolCol}"
+            >${esc(w.pool)}</span>
+          <b class="wrap">${esc(w.title||w.file)}</b>
+          <span class="right2">
+            <button class="${watchId===w.job_id?'on':''}"
+                    onclick="watchLive('${esc(w.job_id)}')">${
+                      watchId===w.job_id?'Hide':'Watch'}</button>
+            <button onclick="cancelJob('${esc(w.job_id)}')">Cancel</button></span>
+        </div>
+        <div class="mono wkfile m-file">${esc(w.file)}</div>
+        <div class="whypool">${esc(w.why_pool||'')}</div>
+        <div class="dim wkplan">${esc(w.plan||'')}</div>
+        ${(w.actions&&w.actions.length)?`<ul class="acts">`
+           // 6 was a guess at how many would fit on a card that turned out to
+           // be the full width of the page and as tall as it needs to be. A
+           // file with eight things wrong with it had two of them silently
+           // dropped - and the ones that get cut are the tail of the list,
+           // which is where the unusual ones sort.
+           +w.actions.slice(0,12).map(a=>
+           `<li>• <b>${esc(a.what)}</b> — ${esc(a.why)}</li>`).join('')
+           +(w.actions.length>12
+              ? `<li class="dim">• …and ${w.actions.length-12} more</li>` : '')
+           +`</ul>`:''}
+        <div class="bar big"><i class="${indet?'indet':''}${reset?' nogrow':''}"
+             style="width:${pct.toFixed(1)}%;background:${col}"></i></div>
+        <div class="wkstats">${wkStatsHtml(w, pct, indet)}</div>
+        <div class="socrzone">${subOcrCell(w)}${subFixCell(w)}</div>
+        <div class="iozone">${ioCell(w)}</div>
+        <div class="wlzone">${w.last_line?`<div class="dim mono wkline">${esc(w.last_line)}</div>`:''}</div>
+        ${watchId===w.job_id
+          ? `<div class="watchbox">${watchHtml||'<div class="dim">loading…</div>'}</div>`
+          : ''}
+      </div>`;
+      // Keep the last painted card so it can be faded out when the job ends.
+      _cardHtml.set(w.job_id, card);
+      // Fade a card IN only on its first appearance. Re-running the animation
+      // on every 2 s repaint would make every running card pulse forever.
+      // NOTE the missing '>' in the match. The card opens
+      // `<div class="wk" data-job="...">`, so matching on `<div class="wk">`
+      // never fired and no card has faded in since data-job was added.
+      return _lastRunIds.has(w.job_id)
+        ? card : card.replace('<div class="wk"', '<div class="wk arriving"');
+    }).join('');
+  }
+
+  // WHAT EACH ENDING MEANS, in words rather than internal state names.
+  //
+  // "deferred" is the important one and the reason this table exists: the
+  // encode finished and the swap could not happen, so the file is still in the
+  // cache and the commit queue will place it later. The job is over; the WORK
+  // is not. Stamping that "done" told you a file had been replaced when it had
+  // not been touched.
+  const WKFATE = {
+    done:      ['done',            'var(--ok)'],
+    deferred:  ['waiting to move', 'var(--warn)'],
+    skipped:   ['skipped',         'var(--warn)'],
+    cancelled: ['cancelled',       'var(--warn)'],
+    failed:    ['failed',          'var(--bad)'],
+    error:     ['failed',          'var(--bad)'],
+    finished:  ['finished',        'var(--dim)'],
+  };
+  // A finished job leaves a GHOST of its card for a moment instead of blinking
+  // out of existence. Jobs here can complete in about a second, and cards
+  // vanishing between two polls read as a glitch rather than as work finishing.
+  const nowMs = Date.now();
+  const live = new Set(j.running.map(w=>w.job_id));
+  // Look up how each vanished job actually ENDED, so the ghost can say so.
+  // Without this the card just faded, which told you a job stopped but not
+  // whether it succeeded - and "skipped" vs "done" vs "failed" is the whole
+  // point of watching the panel.
+  // THE OUTCOME COMES FROM THE POLL THAT IS ACTUALLY DRIVING THESE CARDS.
+  //
+  // This read j.recent, which only the SLOW poll carries - live_snapshot()
+  // says so itself ("there is no recent/queue here"). So on every fast poll
+  // the lookup was empty and `|| 'done'` stamped a green DONE on everything,
+  // whatever had really happened. j.fate travels with the fast poll for
+  // exactly this.
+  const fate = Object.assign({}, j.fate || {});
+  (j.recent || []).forEach(r => { if(r.job_id) fate[r.job_id] = r.state; });
+  for(const id of _lastRunIds){
+    if(!live.has(id) && _cardHtml.has(id) && !_fading.has(id)){
+      // No default of 'done'. Not knowing how a job ended is not evidence
+      // that it ended well.
+      const st = fate[id] || 'finished';
+      const [word, col] = WKFATE[st] || [st, 'var(--dim)'];
+      const stamp = `<span class="wkdone" style="background:${col}">${esc(word)}</span>`;
+      // A GHOST MUST NOT KEEP CLAIMING TO BE WORKING.
+      //
+      // _cardHtml holds the card as it was last PAINTED, which is up to one
+      // poll before the job actually ended - so it still carries a moving bar,
+      // a live stage line and mid-flight counters. Stamping "done" on top of
+      // that produced a card that argued with itself, worst on subocr: its
+      // commit block sets no stage after "committing", so the row read
+      // "committing from NU-DRIVE-3 → placing…" under a green done badge.
+      //
+      // The outcome is known at this point and nothing else on the card is
+      // still true, so the live parts are replaced rather than frozen: full
+      // bar in the outcome's colour, stage line replaced by the outcome, and
+      // the per-phase zones (OCR progress, disk rates, last ffmpeg line)
+      // cleared. What remains is what a finished card should say - which file,
+      // which pool, and how it ended.
+      const html = _cardHtml.get(id)
+        .replace(/<span class="spin">.*?<\/span>/s, '')
+        .replace('</div>', stamp + '</div>')
+        .replace(/<div class="bar big">[\s\S]*?<\/div>/,
+                 `<div class="bar big"><i class="nogrow" style="width:100%;`
+                 + `background:${col}"></i></div>`)
+        .replace(/<div class="wkstats">[\s\S]*?<\/div>/,
+                 `<div class="wkstats dim" style="font-size:11px">`
+                 + `<span><span class="m-lbl">ended</span> `
+                 + `<span class="m-time">${esc(word)}</span></span></div>`)
+        .replace(/<div class="socrzone">[\s\S]*?<\/div>\s*(?=<div class="iozone")/,
+                 '<div class="socrzone"></div>')
+        .replace(/<div class="iozone">[\s\S]*?<\/div>\s*(?=<div class="wlzone")/,
+                 '<div class="iozone"></div>')
+        // wlzone's content is itself a div, so an anchored match would need a
+        // lookahead like the two above and there is nothing stable after it
+        // (the watch box is optional). Remove the inner line instead - same
+        // result, no chance of eating the card's own closing tag.
+        .replace(/<div class="dim mono wkline">[\s\S]*?<\/div>/, '');
+      _fading.set(id, {html, until:nowMs+FADE_MS});
+    }
+  }
+  for(const [id, f] of [..._fading]) if(f.until <= nowMs) _fading.delete(id);
+
+  // NEVER let a ghost hold a slot a real job needs. The hold is 2 s and jobs
+  // here can start in under one, so with every worker busy the panel would
+  // otherwise show more rows than the machine has workers - a finished card
+  // appearing to occupy capacity that is already back in use. Keep only as
+  // many ghosts as there are genuinely free slots, dropping the oldest first.
+  const totalCap = Object.values(j.capacity || {}).reduce((a,b)=>a+b, 0);
+  const freeSlots = Math.max(0, totalCap - j.running.length);
+  while(_fading.size > freeSlots) _fading.delete(_fading.keys().next().value);
+  _lastRunIds = live;
+  for(const id of _cardHtml.keys())
+    if(!live.has(id) && !_fading.has(id)) _cardHtml.delete(id);
+
+  for(const f of _fading.values())
+    html += f.html.replace('<div class="wk"', '<div class="wk fading"');
+
+  // A ghost stands in the slot the job just vacated, so the panel keeps the
+  // same eight rows rather than briefly showing nine.
+  html += idleSlots(j, _fading.size);
+  // NO AUTO-SCROLL IN THE WATCH LOG.
+  //
+  // The whole worker panel is rebuilt from innerHTML every 2 s, which destroys
+  // the open watch box and recreates it with scrollTop back at 0 - so the log
+  // yanked itself to the top twice a second and reading anything in it was a
+  // fight. Save the reader's position across the repaint and put it back.
+  // Nothing chases the tail on its own; scrolling is manual, the same rule the
+  // Queue panel already follows.
+  const _wb = document.querySelector('.watchbox .logbox');
+  const _wbTop = _wb ? _wb.scrollTop : null;
+  // Sitting at the very bottom is a position too - keep it, so a reader who
+  // wants to follow the tail can, without the panel deciding for them.
+  const _wbEnd = _wb && (_wb.scrollTop + _wb.clientHeight >= _wb.scrollHeight - 4);
+  document.getElementById('jobsRun').innerHTML=html;
+  if(_wbTop !== null){
+    const nb = document.querySelector('.watchbox .logbox');
+    if(nb) nb.scrollTop = _wbEnd ? nb.scrollHeight : _wbTop;
+  }
+
+  // The queue strip that used to sit here has moved to the Queue panel above,
+  // which shows the whole list with disk and size rather than five titles.
+
+  ifChanged('jobs', j.running.map(w=>w.job_id).join(',')+'|'+j.queued,
+            document.getElementById('jobsRun').closest('.panel'));
+}
+
+// ---- between-poll motion --------------------------------------------------
+//
+// Polling faster helps, but a bar that steps four times a second is still a
+// bar that steps. ffmpeg only emits a progress block about once a second, so
+// beyond that there is nothing new to fetch - the smoothness has to come from
+// here.
+//
+// Each real sample gives a position and a time. Two samples give a RATE, and
+// between polls the bar is advanced along that rate. The next sample is
+// authoritative and snaps it back into line, so this can drift for at most one
+// interval and never invents progress that did not happen: it only continues a
+// trend already measured, is clamped to just short of the next expected
+// sample, and never moves backwards on a bar that is climbing.
+const _prog = new Map();   // job_id -> {p, t, rate, phase, disp}
+function noteProgress(running){
+  const now = performance.now() / 1000;
+  const live = new Set();
+  for(const w of running || []){
+    live.add(w.job_id);
+    // The commit drives the bar in its own phase; a phase change means the
+    // number means something different, so the rate must not carry over.
+    const phase = w.stage==='committing' ? 'commit' : 'work';
+    const p = phase==='commit'
+      ? (w.commit_total ? w.commit_bytes / w.commit_total : 0)
+      : (w.progress || 0);
+    const prev = _prog.get(w.job_id);
+    let rate = 0, disp = p;
+    if(prev && prev.phase===phase){
+      if(now > prev.t){
+        const dt = now - prev.t, dp = p - prev.p;
+        // A fresh forward-moving rate when we have one. When two samples are
+        // IDENTICAL - ffmpeg emits about once a second, so at 750 ms half the
+        // polls repeat the last block - keep half the old rate rather than
+        // zero: the work has not stopped, only the reporting.
+        if(dp > 0 && dt > 0.2) rate = Math.min(dp/dt, 0.05);   // <=5%/s
+        else rate = (prev.rate || 0) * 0.5;
+      }
+      // NEVER BACKWARDS WITHIN A PHASE. This is the jump being fixed: the
+      // interpolator eases ahead of the last sample, then a repaint arrives
+      // carrying the OLDER server number and the label flicks back before
+      // catching up again - 13.6, 13.4, 13.7, twice a second. The displayed
+      // value only ratchets forward; the server still owns the truth, and
+      // since extrapolation is capped below, it catches up within one poll.
+      disp = Math.max(prev.disp || 0, p);
+    }
+    // The side OCR gets the same treatment. It is a second piece of work with
+    // its own bar, and without this it stepped once per poll while the main
+    // bar beside it glided - the one card showing two different qualities of
+    // motion for no reason a viewer could see.
+    const sp = w.sub_ocr_frac || 0;
+    let srate = 0, sdisp = sp;
+    if(prev){
+      if(now > prev.t){
+        const dt = now - prev.t, dp = sp - (prev.sp || 0);
+        if(dp > 0 && dt > 0.2) srate = Math.min(dp/dt, 0.05);
+        else srate = (prev.srate || 0) * 0.5;
+      }
+      sdisp = Math.max(prev.sdisp || 0, sp);
+    }
+    _prog.set(w.job_id, {p, t: now, rate, phase, disp,
+                         sp, srate, sdisp});
+  }
+  for(const k of _prog.keys()) if(!live.has(k)) _prog.delete(k);
+}
+
+// One place decides what the bar shows, whether the card is being built from
+// scratch or patched in place. Two copies of this logic is how the label and
+// the bar came to disagree in the first place.
+function barState(w, poolCol){
+  let pct = w.progress*100, col = poolCol, indet = false;
+  if(w.stage==='committing'){
+    col = '#58c8d8';                       // distinct from every pool colour
+    if(w.commit_phase==='verifying' || !w.commit_total) indet = true;
+    else pct = Math.min(100, w.commit_bytes/w.commit_total*100);
+  }else if(w.stage && w.stage!=='encoding' && !w.progress){
+    // probing, handlers, arr refresh - real work, no percentage to report
+    indet = true; col = poolCol;
+  }
+  if(!indet){
+    const s = _prog.get(w.job_id);
+    const phase = w.stage==='committing' ? 'commit' : 'work';
+    if(s && s.phase===phase) pct = Math.max(pct, s.disp*100);
+  }
+  return {pct, col, indet};
+}
+
+function wkStatsHtml(w, pct, indet){
+  return `<span class="m-pct"${w.by_bytes&&w.stage==='encoding'
+      ? ' title="estimated from bytes written — ffmpeg reports no usable output timeline for this file"'
+      : ''}>${indet?'—':pct.toFixed(1)+'%'
+      }${(w.by_bytes&&w.stage==='encoding')?'<span class="dim" style="font-size:10px">~</span>':''}</span>
+    <span>${w.fps?`<span class="m-fps">${w.fps}</span> <span class="m-lbl">fps</span>`:'—'}</span>
+    <span>${w.speed?`<span class="m-fps">${w.speed}×</span>`
+            : (w.by_bytes?'<span class="dim" title="the ×-multiplier comes from ffmpeg\'s output timeline, which is not usable on this file">n/a</span>':'—')}</span>
+    <span><span class="m-lbl">elapsed</span> <span class="m-time">${hms(w.elapsed_s)}</span></span>
+    <span>${stageCell(w)}</span>`;
+}
+
+// IN-PLACE REFRESH: same jobs, new numbers, no innerHTML on the panel.
+//
+// Rebuilding eight cards from strings four times a second is most of what the
+// fast poll would cost the browser, and it destroys transient DOM state (the
+// bar's CSS transition restarts, text selection dies). When the SET of jobs is
+// unchanged, only numbers moved - so write the numbers into the existing
+// nodes and leave the structure alone. Any structural change (job started or
+// ended, watch opened, ghost fading) falls back to the full rebuild.
+function tryPatchCards(j){
+  if(_fading.size || watchId) return false;
+  const host = document.getElementById('jobsRun');
+  if(!host) return false;
+  const cards = host.querySelectorAll('.wk[data-job]');
+  if(cards.length !== j.running.length) return false;
+  for(const w of j.running)
+    if(!host.querySelector(`.wk[data-job="${CSS.escape(w.job_id)}"]`))
+      return false;
+  for(const w of j.running){
+    const card = host.querySelector(`.wk[data-job="${CSS.escape(w.job_id)}"]`);
+    const poolCol = poolColor(w.pool);
+    const bs = barState(w, poolCol);
+    const bar = card.querySelector('.bar.big > i');
+    if(bar){
+      bar.classList.toggle('indet', bs.indet);
+      // The phase flip (encode -> commit) resets the bar; suppress the ease
+      // for that one write, same rule the rebuild path applies via .nogrow.
+      const phaseKey = w.job_id+':'+(w.stage||'');
+      if(_barPhase[w.job_id] !== phaseKey){
+        bar.classList.add('nogrow');
+        _barPhase[w.job_id] = phaseKey;
+      } else bar.classList.remove('nogrow');
+      if(!bs.indet) bar.style.width = bs.pct.toFixed(1)+'%';
+      bar.style.background = bs.col;
+    }
+    const st = card.querySelector('.wkstats');
+    if(st) st.innerHTML = wkStatsHtml(w, bs.pct, bs.indet);
+    const sz = card.querySelector('.socrzone');
+    if(sz) sz.innerHTML = subOcrCell(w) + subFixCell(w);
+    const io = card.querySelector('.iozone');
+    if(io) io.innerHTML = ioCell(w);
+    const wl = card.querySelector('.wlzone');
+    if(wl) wl.innerHTML = w.last_line
+      ? `<div class="dim mono wkline">${esc(w.last_line)}</div>` : '';
+  }
+  return true;
+}
+
+// Between real samples, advance the bar along its measured rate. Clamped to
+// at most 2% past the last confirmed sample, so it can never wander far from
+// the truth; the ratchet in noteProgress stops the correction jumping back.
+function tickProgress(){
+  if(document.hidden) return;
+  const now = performance.now() / 1000;
+  for(const [id, s] of _prog){
+    const card = document.querySelector(`.wk[data-job="${CSS.escape(id)}"]`);
+    if(!card) continue;
+    const dt = Math.min(now - s.t, 2.5);
+    // main bar
+    const bar = card.querySelector('.bar.big > i');
+    if(s.rate && s.phase!=='commit' && bar && !bar.classList.contains('indet')){
+      const cand = Math.min(s.p + s.rate*dt, s.p + 0.02, 0.999);
+      if(cand > s.disp) s.disp = cand;
+      const pct = s.disp * 100;
+      bar.style.width = pct.toFixed(2) + '%';
+      const lbl = card.querySelector('.m-pct');
+      if(lbl && lbl.childNodes.length && lbl.childNodes[0].nodeType===3)
+        lbl.childNodes[0].nodeValue = pct.toFixed(1) + '%';
+    }
+    // side-OCR bar, same rules
+    const sbar = card.querySelector('.socrbar > i');
+    if(s.srate && sbar){
+      const cand = Math.min(s.sp + s.srate*dt, s.sp + 0.02, 0.999);
+      if(cand > s.sdisp) s.sdisp = cand;
+      const spct = s.sdisp * 100;
+      sbar.style.width = spct.toFixed(2) + '%';
+      const slbl = card.querySelector('.socrpct');
+      if(slbl) slbl.textContent = spct.toFixed(0) + '%';
+    }
+  }
+}
+setInterval(tickProgress, 120);
+
+// The finished table is rendered SEPARATELY and deliberately not repainted
+// while a log is expanded. Rebuilding it every 2 seconds tore the open log out
+// of the DOM mid-read and reset its scroll - unreadable.
+let lastJobs=null, lastListSig=null, lastOpenId=null;
+// Events fetched by loadHistory, newest first. Module state rather than an
+// argument because the two sources refresh on different clocks - jobs on the
+// fast poll, events on their own - and either arrival repaints the one feed.
+let _histRows=[];
+function renderDone(j){
+  const host=document.getElementById('jobsDone');
+  if(!host) return;
+  const all=((j&&j.recent)||[]).slice().reverse();
+  // THE PILL NAMES THE PROCESS, NOT JUST THE VERDICT. A column of "done"
+  // pills says everything succeeded and nothing about what ran - which is
+  // useless the moment you are hunting one subocr among fifty audio remuxes.
+  // The label is the pool/kind ("passthrough", "subocr", "encode"), with the
+  // outcome appended only when it is NOT plain success. Colour still carries
+  // the verdict, so green subocr and green passthrough read apart by text
+  // while a red anything still jumps out.
+  const donePool = r => r.kind==='transcode' ? (r.pool||'transcode')
+                      : r.kind==='sub_ocr'   ? 'subocr'
+                      : (r.kind||'job');
+  const doneLbl = r => {
+    const proc = donePool(r);
+    return r.state==='done' ? proc : proc+' · '+r.state;
+  };
+  // ONE FEED, TWO SOURCES. Job rows and file events merge into a single
+  // timeline, but _finish also writes an event for every job it closes - so a
+  // naive merge showed each completion twice, once rich (the job row, with
+  // size and log) and once as its own echo. The echo is suppressed: an
+  // OUTCOME-type event within 20 s of a job row for the same path or title is
+  // the same fact, and the job row is the better telling of it. Only outcome
+  // events are candidates - a rename lands seconds after its job too, and
+  // must never be swallowed with it.
+  const OUTCOME=new Set(['transcoded','subtitled','done','skipped','failed',
+                         'deferred','cancelled','error']);
+  const isEcho=e=>{
+    if(!OUTCOME.has(e.event)) return false;
+    return all.some(r=>Math.abs((e.at||0)-(r.finished_at||0))<20 &&
+      ((e.path && r.path && e.path===r.path) ||
+       (e.label && r.title && e.label===r.title)));
+  };
+  const events=(_histRows||[]).filter(e=>!isEcho(e)).slice().reverse();
+
+  // Merged oldest -> newest: inside a file's drop-down the entries read as a
+  // story, top to bottom.
+  const items=[
+    ...all.map(r=>({ts:r.finished_at||0, job:r})),
+    ...events.map(e=>({ts:e.at||0, ev:e})),
+  ].sort((x,y)=>x.ts-y.ts);
+
+  // AN UPGRADE READS AS AN UPGRADE. New events arrive named 'upgraded' from
+  // the webhook now, but the history keeps months of older rows where the
+  // same fact was spelled 'deleted' ("replaced by upgrade: ...") plus an
+  // 'imported' whose detail carries the old -> new line. Rewriting stored
+  // history would falsify the record; renaming at display time keeps the
+  // bytes honest and the story readable.
+  const evName=e=>{
+    if(e.event==='deleted' && /upgrad/i.test(e.detail||'')) return 'upgraded';
+    if(e.event==='imported' && /(upgrad|->)/i.test(e.detail||'')) return 'upgraded';
+    return e.event;
+  };
+  // ONE ROW PER FILE, like the Plex panel above it. The flat feed told the
+  // same file's story in interleaved fragments - Gundam SEED FREEDOM was five
+  // rows spread down the screen (passthrough, content_changed, skipped,
+  // renamed...) with other files' rows in between. Grouped, each file is one
+  // line summarising everything that happened to it, and clicking it drops
+  // down the full chronological record.
+  const lblOf=it=> it.job ? doneLbl(it.job) : evName(it.ev);
+  syncFilter('doneFilter', items.map(lblOf), 'everything');
+  const want=document.getElementById('doneFilter').value;
+  const groups=new Map();
+  for(const it of items){
+    const t=(it.job?it.job.title:it.ev.label)||'—';
+    let g=groups.get(t);
+    if(!g){ g={title:t, entries:[], last:0, labels:new Map()}; groups.set(t,g); }
+    g.entries.push(it);
+    g.last=Math.max(g.last, it.ts||0);
+    const l=lblOf(it); g.labels.set(l,(g.labels.get(l)||0)+1);
+  }
+  // The dropdown filters FILES, not rows: picking "skipped" keeps every file
+  // that was skipped at least once, with its whole story intact - filtering
+  // away the context is what made the flat feed hard to follow.
+  let glist=[...groups.values()];
+  if(want) glist=glist.filter(g=>g.labels.has(want));
+  glist.sort((x,y)=>y.last-x.last);          // newest activity first, like Plex
+  _actKeys=glist.map(g=>g.title);
+  const shown=glist.reduce((n,g)=>n+g.entries.length,0);
+  const listSig=glist.map(g=>g.title+':'
+      +g.entries.map(it=>it.job?it.job.job_id+it.job.state:'e'+it.ev.id).join('.'))
+    .join(',')+'|'+want+'|'+[..._actOpen].sort().join(';');
+
+  // Compare the LIST and the OPEN LOG separately. Folding both into one
+  // signature meant that clicking Log changed the signature, hit the
+  // "list moved while reading" guard, and returned before rendering - so the
+  // log could never open at all.
+  const listChanged = listSig!==lastListSig;
+  const openChanged = openLogId!==lastOpenId;
+  if(listChanged) _actChangedAt=Date.now();
+  // The header line lives ABOVE the change guard on purpose: "updated just
+  // now" has to keep ticking on every poll, including the polls that find
+  // nothing new - a timestamp that only moves when data moves cannot be told
+  // apart from a panel that stopped polling.
+  const dc=document.getElementById('doneCount');
+  if(dc) dc.textContent=`${fmt(glist.length)} files · ${fmt(shown)} entries`
+        +(want?` (filtered)`:'')
+        +` · updated ${ago(_actChangedAt/1000)}`
+        +(openLogId?' · paused while you read':'')
+        +((!openLogId && !follows('doneBox'))?' · paused (scrolled down)':'');
+  if(!listChanged && !openChanged) return;              // nothing to do
+  if(openLogId && listChanged && !openChanged) return;  // defer: you're reading
+  lastListSig=listSig; lastOpenId=openLogId;
+
+  // Pills coloured the way they are everywhere else: pool colour for a clean
+  // result, verdict class for everything else - one colour means one thing
+  // across the whole page.
+  const pillFor=(lbl,n)=>{
+    const cnt=n>1?` ×${n}`:'';
+    if(lbl.includes(' · ')){
+      const st=lbl.split(' · ').pop();
+      return `<span class="pill ${stateClass(st)}">${esc(lbl+cnt)}</span>`;
+    }
+    if(['passthrough','encode','subocr','transcode','job'].includes(lbl))
+      return `<span class="pill" style="color:${poolColor(lbl)};
+        border-color:${poolColor(lbl)}">${esc(lbl+cnt)}</span>`;
+    return `<span class="pill ${stateClass(lbl)}">${esc(lbl+cnt)}</span>`;
+  };
+  const fullTs=ts=> ts?new Date(ts*1000).toLocaleString(undefined,
+    {month:'numeric',day:'numeric',hour:'numeric',minute:'2-digit'}):'';
+
+  // ---- one detail row inside a file's drop-down ---------------------------
+  // A single colspan cell with its own grid, NOT five table cells. The outer
+  // table is layout:fixed and its columns are sized for the group headers
+  // (Times is 52px); five-cell detail rows inherited those widths and the
+  // summary text rendered one letter per line down the Times column. The
+  // grid gives detail rows their own geometry inside the file's row.
+  const evRow=e=>{
+    const ts=e.at||0, nm=evName(e);
+    return `<tr class="actsub"><td colspan="5"><div class="subgrid">
+      <span class="dim when nb">${esc(fullTs(ts))}</span>
+      <span class="nb"><span class="pill ${stateClass(nm)}">${esc(nm)}</span></span>
+      <div class="wrap">${e.detail
+        ?`<div class="mono dim detail" style="font-size:11px">${fmtDetail(e.detail)}</div>`
+        :`<span class="dim">${esc(nm)}</span>`}</div>
+      <span class="num dim nb">${e.size?gb(e.size):'—'}</span>
+      <span></span></div></td></tr>`;
+  };
+  const jobRow=r=>{
+    const b=r.size_before||0, a=r.size_after||0;
+    const delta=(b&&a)?((a-b)/b*100):null;
+    // A skipped or cancelled job records no before/after on purpose - nothing
+    // was transcoded - but "—" where a size belongs reads as missing data.
+    // The file's current size (joined in by the API) is the honest value.
+    const txt=(b&&a)?`${gb(b)} → ${gb(a)} <span style="color:${
+          delta<0?'var(--ok)':'var(--warn)'}">${delta>0?'+':''}${delta.toFixed(1)}%</span>`
+        :(r.file_size?`<span class="dim">${gb(r.file_size)}</span>`:'—');
+    const isOpen=openLogId && openLogId===r.job_id;
+    const main=`<tr class="actsub ${isOpen?'rowopen':''}"><td colspan="5"><div class="subgrid">
+      <span class="dim when nb">${esc(fullTs(r.finished_at))}</span>
+      <span class="nb">${
+        r.state==='done'
+          ? `<span class="pill" style="color:${poolColor(donePool(r))};
+               border-color:${poolColor(donePool(r))}"
+               title="${esc((r.kind||'')+' — '+r.state)}">${esc(doneLbl(r))}</span>`
+          : `<span class="pill ${stateClass(r.state)}"
+               title="${esc((r.kind||'')+' — '+r.state)}">${esc(r.state)}</span>
+             <div class="dim" style="font-size:10px;margin-top:2px;
+               overflow:hidden;text-overflow:ellipsis">${esc(donePool(r))}</div>`
+      }</span>
+      <div class="wrap">${r.summary
+          ?`<div class="dim" style="font-size:11px">${esc(r.summary)}</div>`
+          :`<span class="dim">${esc(r.state)}</span>`}
+        ${r.error?`<div class="err" style="font-size:11px">${esc(r.error)}</div>`:''}</div>
+      <span class="num dim nb">${txt}</span>
+      <span class="act"><button class="${isOpen?'on':''}"
+          onclick="openJobLog('${esc(r.job_id||'')}')">${isOpen?'Hide':'Log'}</button></span>
+      </div></td></tr>`;
+    const why=(r.actions&&r.actions.length)
+      ? `<div style="padding:8px 14px 4px"><ul class="acts">`
+        +r.actions.map(x=>`<li>• <b>${esc(x.what)}</b> — ${esc(x.why)}`
+          +(x.detail?` <span class="dim">(${esc(x.detail)})</span>`:'')+`</li>`).join('')
+        +`</ul></div>` : '';
+    const pathline=r.path
+      ? `<div class="dim mono" style="padding:4px 14px;font-size:11px;
+           overflow-wrap:anywhere">${esc(r.path)}</div>` : '';
+    return main+(isOpen
+      ? `<tr class="logdrop"><td colspan="5">${pathline}${why}${openLogHtml}</td></tr>`
+      : '');
+  };
+
+  let html='';
+  if(glist.length){
+    html+='<div id="doneBox" class="scrollbox nohz" style="height:460px">'
+      +'<table class="fixed">'
+      +'<tr><th>Title</th>'
+      +'<th style="width:34%">What happened</th>'
+      +'<th class="num nb" style="width:52px" title="entries for this file">Times</th>'
+      +'<th class="num nb" style="width:150px">Size</th>'
+      +'<th class="nb" style="width:74px">Last</th></tr>';
+    html+=glist.map((g,gi)=>{
+      const open=_actOpen.has(g.title);
+      const pills=[...g.labels.entries()].map(([l,n])=>pillFor(l,n)).join(' ');
+      // Net size for the file: first job's before -> last job's after, so two
+      // passes over the same file read as one honest total. When no job in
+      // the window carried a delta (upgrades, imports, skips), fall back to
+      // the file's CURRENT size from the newest entry that knows it - a plain
+      // number, dim, so it cannot be misread as a measured change.
+      let sz='—';
+      const js=g.entries.filter(it=>it.job&&it.job.size_before&&it.job.size_after);
+      if(js.length){
+        const b=js[0].job.size_before, a=js[js.length-1].job.size_after;
+        const d=(a-b)/b*100;
+        sz=`${gb(b)} → ${gb(a)} <span style="color:${d<0?'var(--ok)':'var(--warn)'}"
+            >${d>0?'+':''}${d.toFixed(1)}%</span>`;
+      }else{
+        for(let i=g.entries.length-1;i>=0;i--){
+          const it=g.entries[i];
+          const s=it.job?it.job.file_size:(it.ev.size||0);
+          if(s){ sz=`<span class="dim">${gb(s)}</span>`; break; }
+        }
+      }
+      const head=`<tr class="actrow ${open?'rowopen':''}" onclick="actToggle(${gi})">
+        <td class="wrap"><div><span class="actcaret">${open?'▾':'▸'}</span><b>${esc(g.title)}</b></div></td>
+        <td><div class="actpills">${pills}</div></td>
+        <td class="num dim nb">${g.entries.length}</td>
+        <td class="num dim nb">${sz}</td>
+        <td class="dim nb" title="${esc(new Date(g.last*1000).toLocaleString())}"
+          >${ago(g.last)}</td></tr>`;
+      return head+(open
+        ? g.entries.map(it=> it.ev ? evRow(it.ev) : jobRow(it.job)).join('')
+        : '');
+    }).join('')+'</table></div>';
+  } else {
+    html='<div class="dim" style="padding:14px">nothing has happened yet</div>';
+  }
+  // NEWEST AT THE TOP now, like the Plex panel - so the freeze rule inverts:
+  // following means being AT the top, and scrolling down to read means the
+  // panel freezes and counts what arrived instead of yanking you back up.
+  const box=document.getElementById('doneBox');
+  const forced = !box || openChanged || doneForce;
+  doneForce=false;
+  if(forced || follows('doneBox')){
+    const keep = box ? box.scrollTop : 0;
+    host.innerHTML=html;
+    watchScrollTop('doneBox');
+    sizeDoneBox();
+    // an open drop-down means you are reading; keep your place
+    const nb=document.getElementById('doneBox');
+    if(nb && (_actOpen.size||openLogId)) nb.scrollTop=keep;
+    _pending['doneBox']=0;
+    const rb=document.getElementById('doneBoxResume');
+    if(rb) rb.style.display='none';
+  } else {
+    _pending['doneBox']=(_pending['doneBox']||0)+1;
+    const rb=document.getElementById('doneBoxResume');
+    if(rb){ rb.style.display='';
+            rb.textContent=`↑ ${_pending['doneBox']} new — back to top`; }
+  }
+}
+// Which files' drop-downs are open, by title - titles survive re-sorts and
+// refreshes where row indexes do not. actToggle takes the row's index into
+// the CURRENT render (via _actKeys) purely to dodge quote-escaping titles
+// like "Dexter's Laboratory" into onclick attributes.
+let _actKeys=[];
+const _actOpen=new Set();
+let _actChangedAt=Date.now();     // when the feed's content last changed
+function actToggle(i){
+  const t=_actKeys[i];
+  if(t==null) return;
+  if(_actOpen.has(t)) _actOpen.delete(t); else _actOpen.add(t);
+  doneForce=true; lastListSig=null;
+  renderDone(lastJobs);
+}
+// Top-follow twin of watchScroll: this box grows at the TOP, so "following"
+// means sitting there, and any downward scroll freezes repaints.
+function watchScrollTop(id){
+  const el=document.getElementById(id);
+  if(!el || el.dataset.watched) return;
+  el.dataset.watched='1';
+  el.addEventListener('scroll',()=>{
+    const atTop = el.scrollTop < 40;
+    _follow[id]=atTop;
+    const b=document.getElementById(id+'Resume');
+    if(b) b.style.display = atTop ? 'none' : '';
+  });
+}
+async function cancelJob(id){
+  await fetch('/api/jobs/cancel?job_id='+encodeURIComponent(id),{method:'POST'});
+  loadJobs();
+}
+// The Transcoding panel gets its OWN sub-view for previews and job logs.
+// Routing these into the main Logs panel scrolled the page away and clobbered
+// whatever you were already reading down there.
+let subMode=null;                 // 'preview' | 'log:<id>'
+function closeSub(){
+  document.getElementById('tcSub').style.display='none'; subMode=null;
+}
+function showSub(mode,title,meta,html){
+  if(subMode===mode){ closeSub(); return false; }   // same button again = close
+  subMode=mode;
+  updateSub(title,meta,html);
+  return true;
+}
+// Fill an ALREADY-OPEN panel. Separate from showSub because showSub treats a
+// repeat call with the same mode as "the button was pressed again" and closes
+// the panel - so opening with a placeholder and then calling it a second time
+// with the real content shut the panel instead of filling it.
+function updateSub(title,meta,html){
+  document.getElementById('tcSubTitle').textContent=title;
+  document.getElementById('tcSubMeta').innerHTML=meta||'';
+  document.getElementById('tcSubBody').innerHTML=html;
+  document.getElementById('tcSub').style.display='';
+}
+// The log opens INLINE, directly under the row whose button you pressed, so it
+// stays attached to the file it belongs to instead of appearing somewhere else
+// on the page. Cached because the panel repaints every 2s.
+let openLogId=null, openLogHtml='';
+function renderJobLog(rows){
+  if(!rows.length) return '<div class="dim" style="padding:10px 14px">no log for this job</div>';
+  return '<div class="logbox inline">'+rows.map(x=>{
+    const t=String(x.text||'');
+    if(/^[=─]{8,}$/.test(t)) return `<div class="rule">${esc(t)}</div>`;
+    return `<div class="${logClass(t,x.level)}"><span class="ts">${
+      x.at?new Date(x.at*1000).toLocaleTimeString():''}</span>${esc(t)}</div>`;
+  }).join('')+'</div>';
+}
+async function fetchJobLog(id){
+  const r=await (await fetch('/api/logs/job/'+encodeURIComponent(id))).json();
+  openLogHtml=renderJobLog(r.rows||[]);
+}
+async function openJobLog(id){
+  if(!id) return;
+  if(openLogId===id){ openLogId=null; openLogHtml=''; renderDone(lastJobs); return; }
+  // Remember where the clicked row sits so we can put it back. Re-rendering the
+  // table reset scrollTop to 0, so the log opened somewhere far below and you
+  // had to go hunting for it.
+  const box=document.getElementById('doneBox');
+  const before=box?box.scrollTop:0;
+  openLogId=id;
+  await fetchJobLog(id);
+  renderDone(lastJobs);
+  const nb=document.getElementById('doneBox');
+  if(nb){
+    nb.scrollTop=before;                       // restore the reader's position
+    const row=nb.querySelector('tr.rowopen');
+    if(row){
+      // Put the clicked row at the TOP of the panel, not merely on-screen.
+      // block:'nearest' did the minimum to reveal the ROW - which, for a row
+      // already visible near the bottom, is nothing at all. The log renders
+      // BELOW that row, so it opened into the clipped region and looked like
+      // nothing happened. Aligning to the top hands the whole panel height to
+      // the transcript.
+      //
+      // Measured with rects, NOT offsetTop: offsetTop is relative to the
+      // nearest POSITIONED ancestor, which is not this scroll container, so
+      // the arithmetic silently produced a wrong value and the panel did not
+      // move at all. Rect deltas are independent of the offsetParent chain.
+      nb.scrollTop += row.getBoundingClientRect().top
+                    - nb.getBoundingClientRect().top;
+    }
+    // The log also has to be on-screen in the PAGE. Growing the panel to 72vh
+    // (see sizeDoneBox) pushes its lower half past the fold when the panel
+    // already sits low, and no amount of scrolling INSIDE it helps with that.
+    //
+    // Measure the LOG, not the panel. Keying off the panel meant a tall panel
+    // whose top had scrolled above the viewport counted as "off-screen" and
+    // the page jumped upward - away from the log the click just opened. The
+    // panel's top being out of view is normal and harmless; only the log's
+    // own visibility should move the page.
+    // The clicked row is now pinned to the top of the panel, so the log starts
+    // immediately below it and fills the rest. Bringing the PANEL's top to the
+    // top of the viewport therefore shows the most log possible - no rect
+    // arithmetic against the log's own height, which was fragile and, for a
+    // transcript taller than the screen, produced a scroll that fought itself.
+    // setTimeout, NOT requestAnimationFrame: rAF does not fire in a hidden or
+    // background tab, so the page scroll silently never happened whenever the
+    // tab was not frontmost. A 0ms timer still runs after the layout pass and
+    // does not care about visibility.
+    setTimeout(()=>{
+      const el=document.getElementById('doneBox');
+      if(!el) return;
+      const want=el.getBoundingClientRect().top-16;
+      if(Math.abs(want)>4) window.scrollBy({top:want, behavior:'smooth'});
+    }, 0);
+  }
+}
+// A running job's log opens INSIDE its own worker card and keeps tailing.
+let watchId=null, watchHtml='';
+async function fetchWatch(){
+  if(!watchId) return;
+  const r=await (await fetch('/api/logs/job/'+encodeURIComponent(watchId))).json();
+  // 300, not 60. With scrolling now manual, a 60-line window rolled out from
+  // under the reader - every new line dropped an old one, so a preserved
+  // scroll position still drifted. 300 covers a whole job on this pipeline, so
+  // the content under the cursor stays put.
+  watchHtml=renderJobLog((r.rows||[]).slice(-300));
+}
+// WHY THIS NO LONGER GOES THROUGH loadJobs().
+//
+// It used to set watchId and call loadJobs() to repaint. Two things made that
+// feel broken:
+//
+//   * loadJobs() begins with `if(_jobsBusy) return;` and polls every 2 s, so a
+//     click landing while a poll was in flight repainted NOTHING and you waited
+//     up to two seconds for the next tick;
+//   * Watch also awaited a 300-line log fetch BEFORE any repaint, so even a
+//     clean press showed nothing until the network came back.
+//
+// The button now edits its own card directly and returns at once. The regular
+// poll picks the state up afterwards and renders it identically - this is
+// purely about not waiting for it.
+function watchCard(id){
+  return document.querySelector('.wk[data-job="'+id+'"]');
+}
+async function watchLive(id){
+  const card=watchCard(id);
+  // HIDE - instant, nothing to fetch.
+  if(watchId===id){
+    watchId=null; watchHtml='';
+    const box=card && card.querySelector('.watchbox');
+    if(box) box.remove();
+    if(card){
+      const b=[...card.querySelectorAll('button')]
+        .find(x=>x.textContent.trim()==='Hide');
+      if(b){ b.textContent='Watch'; b.classList.remove('on'); }
+    }
+    return;
+  }
+  // Close any other open one first, so two cards cannot both look open.
+  if(watchId){
+    const oc=watchCard(watchId);
+    const old=oc && oc.querySelector('.watchbox');
+    if(old) old.remove();
+    if(oc){
+      const ob=[...oc.querySelectorAll('button')]
+        .find(x=>x.textContent.trim()==='Hide');
+      if(ob){ ob.textContent='Watch'; ob.classList.remove('on'); }
+    }
+  }
+  watchId=id; watchHtml='';
+  if(card){
+    if(!card.querySelector('.watchbox')){
+      const d=document.createElement('div');
+      d.className='watchbox';
+      d.innerHTML='<div class="skel"><i style="width:80%"></i>'
+                 +'<i style="width:64%"></i><i style="width:72%"></i></div>';
+      card.appendChild(d);
+    }
+    // Flip the label now rather than waiting for the next repaint.
+    const b=[...card.querySelectorAll('button')]
+      .find(x=>x.textContent.trim()==='Watch');
+    if(b){ b.textContent='Hide'; b.classList.add('on'); }
+  }
+  await fetchWatch();
+  const c2=watchCard(id);
+  const box=c2 && c2.querySelector('.watchbox');
+  // Only fill it if this is still the card being watched - a fast second click
+  // must not have its panel overwritten by the first click's late response.
+  if(box && watchId===id)
+    box.innerHTML = watchHtml || '<div class="dim">no log yet</div>';
+}
+// A named step with a running clock, written into #qMsg.
+//
+// The clock is the point. Both of these buttons can sit for ten seconds on a
+// single fetch, and without a moving number there is no way to tell a slow
+// query from a dead one - which is exactly how it felt: press, nothing, then
+// suddenly a result. Returns a handle; call .step() to rename what is
+// happening and .done()/.fail() to stop.
+function busy(msg, buttons){
+  const el=document.getElementById('qMsg');
+  const btns=(buttons||[]).map(id=>document.getElementById(id)).filter(Boolean);
+  btns.forEach(b=>{ b.disabled=true; });
+  const t0=Date.now();
+  let step=msg, timer=null;
+  const paint=()=>{
+    const s=(Date.now()-t0)/1000;
+    el.innerHTML='<span class="busy"><span class="sp"></span>'
+      +`<span class="step">${esc(step)}</span>`
+      // Sub-second precision early on reads as responsive; past ten seconds
+      // the tenths are noise and the whole seconds are the story.
+      +`<span class="el">${s<10?s.toFixed(1):Math.round(s)}s</span></span>`;
+  };
+  paint(); timer=setInterval(paint, 100);
+  // Chrome throttles timers in a BACKGROUND tab to roughly once a minute, so
+  // the clock freezes while you are looking at something else - and you come
+  // back to a stale number that reads as "hung" when the request is fine.
+  // Measured: 5.4s displayed after 20s of real waiting. Repainting the moment
+  // the tab becomes visible again costs nothing and removes the lie.
+  const onVis=()=>{ if(!document.hidden) paint(); };
+  document.addEventListener('visibilitychange', onVis);
+  const stop=()=>{
+    clearInterval(timer);
+    document.removeEventListener('visibilitychange', onVis);
+    btns.forEach(b=>{ b.disabled=false; });
+  };
+  return {
+    step(t){ step=t; paint(); },
+    done(t){ stop(); el.textContent = t==null ? '' : t; },
+    fail(t){ stop(); el.innerHTML=`<span class="err">${esc(t||'failed')}</span>`; },
+    elapsed(){ return (Date.now()-t0)/1000; },
+  };
+}
+
+// NOT _qBusy - that name is already taken by the Queue PANEL's loader further
+// up, and redeclaring it with `let` is a parse error that kills the entire
+// dashboard script, not just this function.
+let _qwBusy=false;
+// Rolling window for the bulk-queue rate. Reset when a new run starts (the
+// total changes, or done goes backwards) so one run's rate never seeds another.
+let _bulkSeen={total:-1,done:0,at:0,startDone:0,startAt:0};
+
+async function queueWork(preview){
+  // A second press while the first is still running used to fire another set
+  // of identical requests, and the two would race to write #qMsg.
+  if(_qwBusy) return;
+  const lib=document.getElementById('qLib').value;
+  const raw=document.getElementById('qN').value||'10';
+  const isAll = raw==='all';
+  const n = isAll ? 500 : parseInt(raw,10);      // preview caps the list length
+  const m=document.getElementById('qMsg');
+  const libLabel = lib || 'all libraries';
+  if(preview){
+    m.textContent='';
+    if(subMode==='preview'){ closeSub(); return; }
+    _qwBusy=true;
+    const b=busy(`finding eligible files in ${libLabel}…`,
+                 ['qPreviewBtn','qQueueBtn']);
+    // Open the panel NOW, with a skeleton. It used to appear only once both
+    // requests had returned, so the whole wait looked like the click had
+    // missed - and the second request counts queueable files across the entire
+    // library, which is the slow one.
+    showSub('preview', isAll ? `All queueable${lib?' — '+lib:''}`
+                             : `Next ${n} to queue${lib?' — '+lib:''}`,
+            'looking…',
+            '<div class="skel"><i style="width:70%"></i><i style="width:92%"></i>'
+            +'<i style="width:55%"></i><i style="width:80%"></i>'
+            +'<i style="width:64%"></i></div>');
+    // Ask the SAME question the queue asks. This listed every eligible file
+    // while the queue only takes arr-tracked ones, so a library could preview
+    // 65 and then offer to queue 18 - the 47 unmanaged files silently dropped
+    // between the two screens.
+    const p=new URLSearchParams({state:'eligible',limit:n,queueable:'1'});
+    if(lib) p.set('library',lib);
+    let d;
+    try{
+      d=await (await fetch('/api/files?'+p.toString())).json();
+    }catch(e){
+      _qwBusy=false; b.fail('could not read the file list'); closeSub(); return;
+    }
+    b.step(`${fmt(d.rows.length)} found · checking what is queueable…`);
+    const body = d.rows.length
+      ? '<table class="fixed vtop"><tr><th>Title</th>'
+        +'<th class="num nb" style="width:90px">Size</th>'
+        +'<th class="nb" style="width:110px">Disk</th></tr>'
+        +d.rows.map(r=>`<tr>
+            <td class="wrap"><div>${esc(r.label||'')}</div>
+              <div class="mono dim sub">${esc(r.path||'')}</div></td>
+            <td class="num dim nb">${gb(r.size)}</td>
+            <td class="mono nb" style="color:${r.pool_disk?diskColor(r.pool_disk)
+              :'var(--dim)'}">${esc(r.pool_disk||'—')}</td></tr>`).join('')
+        +'</table>'
+      : '<div class="dim" style="padding:14px">nothing eligible matches</div>';
+    // Name the files that will NOT be queued, so the number here matches the
+    // number the Queue button offers.
+    let note='';
+    try{
+      const c=await (await fetch('/api/jobs/enqueue?all_files=true&dry_run=true'
+            +(lib?'&library='+encodeURIComponent(lib):''),{method:'POST'})).json();
+      if(c.unmanaged_skipped)
+        note=` · <span class="dim">${fmt(c.unmanaged_skipped)} unmanaged `
+            +`(no arr record) not queueable</span>`;
+    }catch(_){
+      note=' · <span class="dim">queueable count unavailable</span>';
+    }
+    updateSub(isAll ? `All queueable${lib?' — '+lib:''}`
+                    : `Next ${n} to queue${lib?' — '+lib:''}`,
+              `${fmt(d.rows.length)} shown of ${fmt(d.total)} queueable${note}`, body);
+    _qwBusy=false;
+    // Say how long it took rather than blanking. On a big library this is a
+    // few seconds and it is worth knowing that is normal.
+    b.done(`preview ready · ${fmt(d.rows.length)} of ${fmt(d.total)} queueable`
+           +` · ${b.elapsed().toFixed(1)}s`);
+    return;
+  }
+  if(isAll){
+    // Counting "all queueable" is itself a full-library query. That ran before
+    // the confirm dialog with no indication, so pressing Queue on All eligible
+    // looked like nothing happened until a dialog appeared seconds later.
+    _qwBusy=true;
+    const pre=busy(`counting queueable files in ${libLabel}…`,
+                   ['qPreviewBtn','qQueueBtn']);
+    let c;
+    try{
+      c=await (await fetch('/api/jobs/enqueue?all_files=true&dry_run=true'
+            +(lib?'&library='+encodeURIComponent(lib):''),{method:'POST'})).json();
+    }catch(e){
+      _qwBusy=false; pre.fail('could not count queueable files'); return;
+    }
+    pre.done(`${fmt(c.would_queue)} queueable — confirm to start`);
+    _qwBusy=false;
+    // queueing the whole library is a big commitment - say the number out loud
+    if(!confirm(`Queue ALL ${c.would_queue.toLocaleString()} queueable file(s)`
+        +`${lib?' in '+lib:''}?`
+        +(c.unmanaged_skipped ? `\n\n${c.unmanaged_skipped.toLocaleString()} more `
+            +`are eligible but have no Sonarr/Radarr record, so they cannot be `
+            +`renamed afterwards and are not included.` : '')
+        +`\n\nEach one is probed and planned first, so this takes a while to `
+        +`build. Jobs still respect the gate and worker limits.`))
+      { m.textContent=''; return; }              // cancelled at the dialog
+  }
+  _qwBusy=true;
+  // Each file is probed and planned before it can be queued, so even a
+  // 10-file request is real work, not an instant insert. '…' was the entire
+  // feedback for it.
+  const b=busy(isAll ? `starting bulk queue for ${libLabel}…`
+                     : `probing and planning ${n} file(s) in ${libLabel}…`,
+               ['qPreviewBtn','qQueueBtn']);
+  const u='/api/jobs/enqueue?dry_run=false'+(isAll?'&all_files=true':'&limit='+n)
+          +(lib?'&library='+encodeURIComponent(lib):'');
+  let j;
+  try{
+    j=await (await fetch(u,{method:'POST'})).json();
+  }catch(e){
+    _qwBusy=false; b.fail('queueing failed — see the log'); return;
+  }
+  _qwBusy=false;
+  b.done(j.queued_behind
+      // a second library asked for while the first is still building
+      ? `${fmt(j.total)} lined up behind ${j.now_building||'the current pass'}`
+      : (j.bulk ? `queueing ${fmt(j.total)} in the background…`
+                : `queued ${j.queued} in ${b.elapsed().toFixed(1)}s`));
+  // Pull the job poll forward. It runs every 2 s, so the handover from this
+  // message to the live "building queue: x / y" counter had a visible gap
+  // where the panel looked finished when it had barely started.
+  loadJobs();
+}
+// The counterpart to Stop: cancel what is RUNNING and leave the queue intact.
+async function cancelAll(){
+  const j=await (await fetch('/api/jobs')).json();
+  if(!j.running.length){ ffSayQ('nothing is running'); return; }
+  if(!confirm(`Cancel all ${j.running.length} running job(s)?\n\n`
+    +`Partly-encoded output is discarded; the original files are untouched. `
+    +`The ${fmt(j.queued)} queued job(s) stay queued.`)) return;
+  let n=0;
+  for(const w of j.running){
+    try{ await fetch('/api/jobs/cancel?job_id='+encodeURIComponent(w.job_id),
+                     {method:'POST'}); n++; }catch(_){}
+  }
+  ffSayQ(`cancelled ${n} running job(s)`);
+  loadJobs();
+}
+function ffSayQ(t){ const m=document.getElementById('qMsg'); if(m) m.textContent=t; }
+
+// Stop clears the QUEUE ONLY. It used to ask whether to kill running jobs too,
+// which put "throw away work in progress" one mis-clicked dialog away from a
+// button whose name only implies "stop queueing". Cancelling running work is
+// now its own button, in the panel that shows that work.
+async function stopQueue(){
+  if(_qwBusy) return;
+  _qwBusy=true;
+  // Clearing a 2,000-job queue is a bulk DELETE; on a busy database that is
+  // not instant, and this reported nothing until it was over.
+  const b=busy('checking the queue…',['qStopBtn','qQueueBtn','qPreviewBtn']);
+  let j;
+  try{ j=await (await fetch('/api/jobs')).json(); }
+  catch(e){ _qwBusy=false; b.fail('could not read the queue'); return; }
+  if(!j.queued){ _qwBusy=false; b.done('queue is already empty'); return; }
+  b.done(`${fmt(j.queued)} queued — confirm to clear`);
+  _qwBusy=false;
+  if(!confirm(`Clear ${fmt(j.queued)} queued job(s)?\n\n`
+    +`Anything already running keeps going — use "Cancel all" in Transcoding `
+    +`to stop those.`)){ document.getElementById('qMsg').textContent=''; return; }
+  _qwBusy=true;
+  const b2=busy(`clearing ${fmt(j.queued)} queued job(s)…`,
+                ['qStopBtn','qQueueBtn','qPreviewBtn']);
+  let r;
+  try{ r=await (await fetch('/api/jobs/stop?cancel_running=false',
+                            {method:'POST'})).json(); }
+  catch(e){ _qwBusy=false; b2.fail('stop failed — see the log'); return; }
+  _qwBusy=false;
+  b2.done(`cleared ${fmt(r.cleared)} in ${b2.elapsed().toFixed(1)}s`);
+  loadJobs();
+}
+async function requeue(){
+  if(_qwBusy) return;
+  const what=document.getElementById('qReq').value;
+  const lib=document.getElementById('qLib').value;
+  const u='/api/jobs/requeue?what='+what+(lib?'&library='+encodeURIComponent(lib):'');
+  _qwBusy=true;
+  // The dry run scans every file in scope to count candidates - on "everything"
+  // across the whole library that is a full-table pass, and it happened behind
+  // a completely silent button.
+  const b=busy(`counting ${what} files in ${lib||'all libraries'}…`,
+               ['qRequeueBtn','qQueueBtn','qPreviewBtn']);
+  let d;
+  try{ d=await (await fetch(u+'&dry_run=true',{method:'POST'})).json(); }
+  catch(e){ _qwBusy=false; b.fail('could not count candidates'); return; }
+  if(!d.would_requeue){ _qwBusy=false; b.done('nothing to requeue'); return; }
+  b.done(`${fmt(d.would_requeue)} to requeue — confirm to apply`);
+  _qwBusy=false;
+  if(!confirm(`Requeue ${d.would_requeue.toLocaleString()} file(s) [${what}]`
+      +`${lib?' in '+lib:''}?\n\nThey become eligible again; press Queue to start them.`)){
+    document.getElementById('qMsg').textContent=''; return; }
+  _qwBusy=true;
+  const b2=busy(`requeueing ${fmt(d.would_requeue)} file(s)…`,
+                ['qRequeueBtn','qQueueBtn','qPreviewBtn']);
+  let r;
+  try{ r=await (await fetch(u+'&dry_run=false',{method:'POST'})).json(); }
+  catch(e){ _qwBusy=false; b2.fail('requeue failed — see the log'); return; }
+  _qwBusy=false;
+  b2.done(`requeued ${fmt(r.requeued)} in ${b2.elapsed().toFixed(1)}s `
+          +`— press Queue to start`);
+  loadAll();
+}
+
+// The handler buttons that used to sit here are gone with the subsystem - see
+// the note beside the removed /api/handlers endpoint. This kept its name and
+// its one remaining job: filling the library dropdown.
+async function loadHandlerBtns(){
+  const sel=document.getElementById('qLib');
+  if(sel && sel.options.length<2){
+    const d=await (await fetch('/api/libraries')).json();
+    d.libraries.forEach(l=>sel.add(new Option(l.name,l.name)));
+  }
+}
+
+const PAGE=250;
+let logRows=[], logOffset=0, logMore=false, logBusy=false;
+// The markup last written into #logs, so an identical repaint can be skipped.
+let _logKey='';
+
+let runningJobs=new Set();
+// Pick the display class from the CONTENT, not just the level, so job
+// boundaries and plan lines are visually distinct from ordinary chatter.
+function logClass(t, level){
+  if(/^START\s/.test(t)) return 'l-start';
+  if(/^END\s/.test(t))   return 'l-end';
+  if(/^PLAN:|^PIPELINE:/.test(t)) return 'l-plan';
+  if(/^\s+why:/.test(t)) return 'l-why';
+  if(/^ffmpeg |^\s+-NoProfile/.test(t)) return 'l-cmd';
+  return 'l-'+String(level||'info');
+}
+// Rename lines carry two nearly identical 120-character filenames; the only
+// thing that matters is which part changed. Split on the arrow and style the
+// halves so the eye lands on the new name instead of diffing strings.
+const RENAME_LINE=/^(\s*)(rename retry ok:|renaming ->|rename ok:|repaired corrupt filename:)?\s*(.*?)\s+(?:—|--|-)?\s*renamed ->\s*(.*)$/;
+function renameHtml(t){
+  const m=t.match(RENAME_LINE);
+  if(!m) return null;
+  const lead=(m[2]||'').trim(), oldn=(m[3]||'').trim(), newn=(m[4]||'').trim();
+  if(!oldn || !newn) return null;
+  return (lead?`<b>${esc(lead)}</b> `:'')
+       + `<span class="r-old">${esc(oldn)}</span>`
+       + `<span class="r-arrow">→</span>`
+       + `<span class="r-new">${esc(newn)}</span>`;
+}
+function logLine(r){
+  const t=String(r.text||'');
+  if(/^[=─]{8,}$/.test(t)) return `<div class="rule">${esc(t)}</div>`;
+  const ts=r.at?new Date(r.at*1000).toLocaleString():'';
+  const ren=renameHtml(t);
+  if(ren) return `<div class="l-ok"><span class="ts">${ts}</span>${ren}</div>`;
+  return `<div class="${logClass(t,r.level)}"><span class="ts">${ts}</span>${esc(t)}</div>`;
+}
+function renderLogs(keepAnchor){
+  const box=document.getElementById('logs');
+  // THE SAME GUARD loadLogs ALREADY CARRIES, and for the same reason - it was
+  // just never applied to the function itself. loadJobs calls this directly
+  // whenever the number of running jobs changes, which on the dashboard means
+  // every few seconds against a #logs that only exists on /settings. It threw
+  // there every time, and because the throw happened INSIDE loadJobs, the rest
+  // of that function - the watched job's tail and the whole worker occupancy
+  // block - silently stopped running with it.
+  if(!box) return;
+  // Loading OLDER lines is an explicit action, so it always paints and keeps
+  // the anchor. Live appends go through paint() and respect the freeze.
+  const prevH=box.scrollHeight, prevTop=box.scrollTop;
+  if(!keepAnchor && !follows('logs')){
+    paint('logs', null, true);           // frozen: just update the badge
+    return;
+  }
+  // oldest at the top, newest at the bottom - reads like a log file.
+  // "newest first" flips that for scanning back through history, which is the
+  // other thing people do with a log and the one this panel could not do.
+  const sortEl=document.getElementById('logSort');
+  const ordered = (sortEl && sortEl.value==='new')
+    ? logRows.slice() : logRows.slice().reverse();
+
+  // Group by JOB, not by adjacency. With four workers the lines interleave, so
+  // grouping only consecutive lines chopped every job into fragments - START
+  // here, one line there, END somewhere far below. Collect all of a job's lines
+  // into one block, ordered by when that job first appeared, so START..END
+  // always read together.
+  const byJob=new Map(); const blocks=[];
+  for(const r of ordered){
+    const jid=r.job_id||null;
+    if(jid===null){                    // un-owned lines keep their place
+      blocks.push({jid:null, rows:[r], at:r.at||0});
+      continue;
+    }
+    let b=byJob.get(jid);
+    if(!b){ b={jid, rows:[], at:r.at||0}; byJob.set(jid,b); blocks.push(b); }
+    b.rows.push(r);
+    b.last=r.at||b.last;
+  }
+  const html =
+    (logMore?'<div class="dim" style="padding:4px 0">— scroll up to load older —</div>':
+             '<div class="dim" style="padding:4px 0">— start of log —</div>')
+    + (blocks.length
+       ? blocks.map(b=>{
+           if(!b.jid) return b.rows.map(logLine).join('');
+           const live=runningJobs.has(b.jid);
+           // name the block from its own START line so you do not have to read
+           // the job id to know what it is
+           const st=b.rows.find(r=>/^START\s/.test(String(r.text||'')));
+           const name=st?String(st.text).replace(/^START\s*\[[^\]]*\]\s*/,''):'';
+           const head=`<div class="jh">${live?'<span class="spin"><i></i><i></i><i></i></span>':'▪'} `
+                      +`${name?esc(name)+' · ':''}job ${esc(b.jid)}`
+                      +`${live?' — running':''} · ${b.rows.length} lines</div>`;
+           return `<div class="jg ${live?'run':''}">${head}${b.rows.map(logLine).join('')}</div>`;
+         }).join('')
+       : '<div class="dim">no log lines yet</div>');
+
+  // SKIP A REBUILD THAT WOULD CHANGE NOTHING.
+  //
+  // Pick a job in the dropdown and you are looking at a finished transcript -
+  // fixed text that cannot gain a line. But this function is also called from
+  // the job poll whenever the running set changes, and it rewrote innerHTML
+  // unconditionally, so an unrelated job starting anywhere on the box threw the
+  // view back to the bottom while you were reading the middle of it. Comparing
+  // the markup costs one string compare and removes the whole class of jump.
+  if(html!==_logKey){
+    _logKey=html;
+    box.innerHTML=html;
+  }
+  // Lines fetched, then the size of the file behind them. Two different facts:
+  // the view is a window, the size is the whole thing - and the size is the
+  // one that tells you whether the log needs pruning.
+  const cnt=document.getElementById('logCount');
+  const sz=(_logBytes==null) ? ''
+    : ` <span class="dim">· ${logSize(_logBytes)}</span>`;
+  cnt.innerHTML=
+    logRows.length+' line'+(logRows.length==1?'':'s')
+    +(logMore?' (more above)':'')+sz;
+  const lw=document.getElementById('logsResumeWrap');
+  if(lw && !lw.innerHTML) lw.innerHTML=followBtn('logs');
+  watchScroll('logs');
+  // keepAnchor = "loading older", keep the reader's place; otherwise follow
+  if(!keepAnchor && follows('logs')){ box.scrollTop=box.scrollHeight; _pending['logs']=0; }
+  if(keepAnchor) box.scrollTop = box.scrollHeight - prevH + prevTop;
+}
+
+async function loadLogs(reset){
+  // The log panel lives on /settings now. Same guard, same reason, as
+  // ffProgress: these getElementById calls returned an element on every page
+  // for the whole life of this function, and the moment they stopped, reading
+  // .value threw on a timer the dashboard still runs.
+  const lvlEl=document.getElementById('logLevel');
+  const jobEl=document.getElementById('logJob');
+  if(!lvlEl || !jobEl || !document.getElementById('logs')) return;
+  if(logBusy) return; logBusy=true;
+  try{
+    const lvl=lvlEl.value;
+    const job=jobEl.value;
+    if(reset){ logRows=[]; logOffset=0; }
+    if(job){
+      let rows=(await (await fetch('/api/logs/job/'+encodeURIComponent(job))).json()).rows||[];
+      if(lvl) rows=rows.filter(r=>r.level===lvl);
+      _logBytes=_logJobBytes[job];          // size of THIS transcript
+      logRows=rows.slice().reverse(); logMore=false;
+      const box=document.getElementById('logs');
+      const stuck = box.scrollTop+box.clientHeight >= box.scrollHeight-40;
+      renderLogs(false);
+      if(stuck) box.scrollTop=box.scrollHeight;    // follow a running job
+    }else{
+      const sysEl=document.getElementById('logSys');
+      const sys=sysEl?sysEl.value:'';
+      const j=await (await fetch('/api/logs?limit='+PAGE+'&offset='+logOffset
+                                 +(lvl?'&level='+lvl:'')
+                                 +(sys?'&system='+encodeURIComponent(sys):''))).json();
+      logMore=j.has_more;
+      _logBytes=j.bytes;                    // size of nuarr.log itself
+      // Keep the picker in step with what the log actually contains, so it
+      // never offers a filter that would return nothing.
+      if(sysEl && j.systems){
+        const want=['<option value="">all system jobs</option>']
+          .concat(j.systems.map(s=>`<option value="${esc(s.key)}">${esc(s.label)}`
+                                   +` (${s.n})</option>`)).join('');
+        if(sysEl.dataset.built!==want){
+          const keep=sysEl.value;
+          sysEl.innerHTML=want; sysEl.dataset.built=want;
+          if([...sysEl.options].some(o=>o.value===keep)) sysEl.value=keep;
+        }
+      }
+      if(logOffset===0){
+        if(reset){ _follow['logs']=true; _pending['logs']=0; }
+        logRows=j.rows;                            // newest page, replace
+        renderLogs(false);
+      }else{
+        logRows=logRows.concat(j.rows);            // older page, prepend visually
+        renderLogs(true);                          // keep the reader's position
+      }
+    }
+  } finally { logBusy=false; }
+}
+
+async function loadOlder(){
+  if(!logMore||logBusy||document.getElementById('logJob').value) return;
+  logOffset=logRows.length;
+  await loadLogs(false);
+}
+// Size of whatever the log view is currently showing: nuarr.log for "all
+// activity", or the selected transcript. Filled by loadLogs().
+let _logBytes=null;
+const _logJobBytes={};
+// KB up to a megabyte, then MB - two decimals either way. A 70 MB main log
+// printed as "71680.00 KB" is technically the same number and useless.
+function logSize(b){
+  b=b||0;
+  return b < 1048576 ? (b/1024).toFixed(2)+' KB' : (b/1048576).toFixed(2)+' MB';
+}
+async function loadLogJobs(){
+  const sel=document.getElementById('logJob');
+  if(!sel) return;                     // not on this page - see loadLogs()
+  const j=(await (await fetch('/api/logs/jobs')).json()).rows||[];
+  const cur=sel.value;
+  j.forEach(x=>{ _logJobBytes[x.job_id]=x.bytes; });
+  // Two decimals. Math.round(bytes/1024) printed "0 KB" for every log under
+  // half a kilobyte, which is most of the short ones - a size that reads as
+  // "empty" for a file that has content in it.
+  const kb = b => logSize(b);
+  // A scan is not a "job", and labelling it one made the dropdown claim the
+  // library scan was a transcode. Its id already says what it is.
+  const label = id => /^scan-/.test(id)
+    ? 'library scan ' + id.slice(5).replace(/^(\d{4})(\d\d)(\d\d)-(\d\d)(\d\d)(\d\d)$/,
+                                           '$3/$2 $4:$5:$6')
+    : 'job ' + id;
+  sel.innerHTML='<option value="">all activity</option>'
+    +j.map(x=>`<option value="${esc(x.job_id)}">${esc(label(x.job_id))} (${kb(x.bytes)})</option>`).join('');
+  sel.value=cur;
+}
+function openRaw(){
+  const job=document.getElementById('logJob').value;
+  const lvl=document.getElementById('logLevel').value;
+  window.open(job ? '/api/logs/job/'+encodeURIComponent(job)+'/raw'
+                  : '/api/logs/raw?limit=5000'+(lvl?'&level='+lvl:''), '_blank');
+}
+
+// EVERY SETTING SAYS WHAT HAPPENS BOTH WAYS.
+//
+// A checkbox label can only describe the ON state, so the OFF state is left to
+// be inferred - and for a gate the consequence of switching something off is
+// exactly the thing worth knowing before you click it. Each entry therefore
+// carries: what it does, what ON means, what OFF means, and where the number
+// or behaviour came from where that is not obvious.
+//
+// `under` marks a setting as a refinement of another: the three Plex ones do
+// nothing at all unless "Hold while Plex is busy" is on, which the old flat
+// row of eight checkboxes gave no way to see.
+const GATE_META={
+  'gate.plex':{
+    label:'Hold while Plex is busy',
+    what:'Stops new jobs starting while somebody is watching.',
+    on:'No new job starts while a Plex session is playing. Work already running is not cancelled — it finishes.',
+    off:'Jobs start regardless of playback. The disk-priority setting below still applies if it is on.',
+    note:'A grace period keeps the hold for a short while after the last session ends, so moving between episodes does not restart four encodes at once.'},
+  'gate.plex_transcodes_only':{
+    label:'Only when Plex is actually transcoding', under:'gate.plex',
+    what:'Narrows the hold to sessions Plex is transcoding, rather than any playback.',
+    on:'A direct play does not hold the queue — it costs Plex no CPU or GPU.',
+    off:'Any playback holds, including direct play. Safer on a busy server, since even a direct play competes for pool reads.'},
+  'gate.plex_encode_only':{
+    label:'Only hold GPU encodes, not stream copies', under:'gate.plex',
+    what:'Decides which of nuarr’s own pools the hold applies to.',
+    on:'Encodes wait (they want the same GPU Plex does); stream copies keep running, because they use no GPU at all. Copies still avoid the one spindle being watched.',
+    off:'Both pools wait. Simpler, and idles hardware nothing is competing for.'},
+  'gate.plex_ignore_throttled':{
+    label:'Ignore transcodes that have buffered ahead and parked', under:'gate.plex',
+    what:'Releases the hold for a transcode that has run ahead of the viewer and stopped.',
+    on:'A session Plex reports as throttled, with its encoder at 0.0x and comfortably ahead of the viewer, no longer holds the queue.',
+    off:'Any transcode holds, parked or not.',
+    note:'Measured here: throttled=1, speed 0.0, transcode 69% against a viewer at 28% — zero GPU in use while the encode queue was held anyway. The lead requirement is what keeps this safe; a session throttled with only a little in hand is about to wake up and want the GPU back.'},
+  'gate.plex_io_throttle':{
+    label:'Yield disk priority while anyone is watching',
+    what:'Lowers the disk priority of nuarr’s jobs so a viewer’s reads go first. Independent of the hold — this never stops work, it only decides who yields.',
+    on:'Jobs touching the spindle a viewer is reading from run at lowered I/O priority, and a commit writing to that disk is paced back to about a quarter speed. Jobs on other disks are untouched.',
+    off:'Everything runs at normal priority. A viewer on the same disk as a job may see the stream stutter.',
+    note:'Applies per spindle. One viewer occupies one of twelve disks, so demoting jobs elsewhere would cost throughput for nobody’s benefit.'},
+  'gate.disk_busy':{
+    label:'Steer away from disks something else is already hammering',
+    what:'Measures how busy each physical disk is and keeps new work off the loaded ones. It names no product and asks no API, so it covers a pool balance, a parity check, a backup, a rebuild, a big copy, or another app entirely.',
+    on:'A disk held busy for a sustained stretch by something other than nuarr stops receiving new jobs; work goes to the quiet spindles instead. Only when every relevant disk is busy does the queue hold outright.',
+    off:'Jobs start regardless of what else is using the disks, and compete with it.',
+    note:'Reads % Idle Time per physical disk, not % Disk Time — measured here, % Disk Time returned 145, because it sums across queued requests and cannot be compared to a threshold. Physical disks, not volumes: P:\\ reported 100% idle while its member disk sat at 0% idle and 51 MB/s. nuarr’s own throughput is subtracted first, otherwise our encodes would pause us.'},
+  'gate.arrs':{
+    label:'Hold while Sonarr or Radarr is renaming or importing',
+    what:'Waits while an arr is moving files around.',
+    on:'No job starts while an arr reports itself busy. Touching a file mid-rename is the original cause of the ENOENT/EBUSY failures this pipeline was built to avoid.',
+    off:'Jobs may start while an arr is moving files. nuarr still checks the individual file is unlocked before touching it.'},
+  'gate.manual_pause':{
+    label:'Manual pause',
+    what:'The stop switch. Nothing to do with what Plex or the arrs are doing.',
+    on:'The gate is held shut until you turn this off. Running jobs finish; nothing new starts.',
+    off:'Normal operation — the checks above decide.'},
+};
+// THE HEADER TAG. Fetched once per page load, never polled: a version cannot
+// change under a running process, and the update state moves on a six-hour
+// clock, so a second request would only ever confirm the first.
+async function loadVersion(){
+  const el = document.getElementById('vertag');
+  if(!el) return;
+  try{
+    const u = await (await fetch('/api/updates')).json();
+    el.textContent = 'v' + (u.current || '?');
+    if(u.update_available){
+      el.classList.add('vertag-new');
+      el.textContent = `v${u.current} → ${u.latest}`;
+      el.title = `Version ${u.current}. Update ${u.latest} is available`
+        + (u.latest_at ? ` (released ${u.latest_at})` : '') + ' - click for details';
+    } else {
+      el.title = `Version ${u.current}`
+        + (u.build_date ? `, built ${u.build_date}` : '')
+        + (u.configured ? ' - up to date' : ' - update checks are not set up');
+    }
+  }catch(e){
+    // A version that cannot be read is not worth an error state in the header;
+    // the settings panel is where a failed check gets explained.
+    el.textContent = '';
+  }
+}
+loadVersion();
+
+async function loadGate(){
+  const g=await (await fetch('/api/gate')).json();
+  // Stashed for the Plex cards, which draw the pause threshold on their bars.
+  // Read from the gate rather than fetched separately so the line on the bar
+  // and the decision behind it can never come from different settings.
+  window._pxFloor      = Number(g.viewer_pause_lead_s || 0);
+  window._pxResume     = Number(g.viewer_resume_lead_s || 0);
+  window._pxResumeMult = Number(g.viewer_resume_mult || 1.5);
+  window._pxFullMult   = Number(g.viewer_full_speed_mult || 3);
+  window._pxFloors     = g.viewer_floors || {};
+  window._pxThrottle   = g.plex_throttle_buffer_s || 0;
+  window._pxHeld       = g.starving_disks || {};
+  // The ramp's own numbers, so the card can state a speed that matches what
+  // the copy loop really does rather than re-deriving half of it.
+  window._pxThrMax     = Number(g.viewer_throttle_max || 3);
+  window._pxBgDisc     = Number(g.viewer_bg_discount || 3);
+  window._pxPaced      = new Set(g.viewer_paced_disks || []);
+  const h = g.headline || {};
+  // THE BANNER NO LONGER REPEATS THE ROWS.
+  //
+  // It used to print g.why - the blocking check's detail, verbatim - directly
+  // above the very row that shows the same sentence. The panel's most-read
+  // strip was spent saying the same thing twice. It now answers the three
+  // questions the rows cannot: what is held, what is still running, and what
+  // has to happen for the hold to lift.
+  const clears = (g.reasons||[]).filter(r=>r.blocked && r.clears);
+  const hdr = g.open
+    ? `<div class="ghead"><span class="pill p-ok">Open</span>`
+      + `<b>${esc(h.head||'Nothing is holding the queue')}</b></div>`
+      + (h.sub?`<div class="gsub">${esc(h.sub)}</div>`:'')
+    : `<div class="ghead"><span class="pill p-warn">Holding</span>`
+      + `<b>${esc(h.head||'')}</b></div>`
+      + (h.sub?`<div class="gsub ok">${esc(h.sub)}</div>`:'')
+      + clears.map(r=>`<div class="gclear"><span class="gck">Clears</span>`
+          + `${esc(r.clears)}</div>`).join('');
+
+  const rows=g.reasons.map(r=>{
+      // Three states, not two. "not blocking" was covering both "live and
+      // busy" and "nothing here", which are the two most different things on
+      // this panel.
+      const cls = r.error ? 'g-err' : r.blocked ? 'g-hold'
+                : r.active ? 'g-live' : 'g-idle';
+      const tip = r.error ? 'This check could not run'
+                : r.blocked ? `Holding ${r.scope||'all jobs'}`
+                : r.active ? 'Something is happening here, but it is not holding'
+                : 'Nothing to report';
+      // Scope tag only when the hold is partial - "encode jobs" next to a row
+      // that holds everything would be noise.
+      const scope = (r.blocked && r.pools)
+        ? `<span class="gscope">${esc(r.scope)}</span>` : '';
+      const extra = (r.extra||[]).map(x=>`<div class="gx">${esc(x)}</div>`).join('');
+      return `<tr class="${r.blocked?'grow-hold':''}">
+      <td class="gname"><span class="pill ${cls}" title="${esc(tip)}"
+        ><span class="gdot"></span>${esc(r.label||r.name)}</span></td>
+      <td class="wrap">
+        <div class="gdet">${esc(r.detail||'')}${scope}${
+          r.error?' <span class="err">'+esc(r.error)+'</span>':''}</div>
+        ${extra}</td>
+    </tr>`;}).join('');
+  setHTML(document.getElementById('gate'),
+     `<div class="gbanner ${g.open?'open':'hold'}">${hdr}</div>
+      <table class="gtab">${rows}</table>`);
+  paintGateCfg(g.toggles||{});
+  paintGateQuick(g.toggles||{});
+  sizeGateCfg();
+}
+
+// sizeGateCfg() USED TO LIVE HERE and is deliberately gone.
+//
+// It measured the Job gate panel every poll and pinned the settings scrollbox
+// to the same height, so the two side-by-side panels ended level - about 45
+// lines, a ResizeObserver and a resize listener, all of it in service of an
+// alignment problem. Moving the settings to their own page deleted the
+// problem rather than the code that solved it: there is no neighbour to line
+// up with, so the list is simply as long as it is.
+//
+// Left as a note because the CSS it fought with (.gsetwrap max-height) is
+// still nearby, and the next person to see a scrollbox there deserves to know
+// the cap was removed on purpose.
+function sizeGateCfg(){}
+
+// The settings, in their own panel. Ordered so the three Plex refinements sit
+// under the switch they depend on, and dimmed when that switch is off - they
+// genuinely do nothing then, which a flat row of checkboxes could not show.
+let _gateCfgKey='';
+function paintGateCfg(toggles){
+  const el=document.getElementById('gateCfg');
+  if(!el) return;
+  // DO NOT REPAINT WHAT HAS NOT CHANGED.
+  //
+  // loadGate() runs every 6 seconds and this used to rewrite innerHTML every
+  // time, which resets scrollTop to 0 - so scrolling down to read a setting
+  // threw you back to the top a few seconds later, every time. The settings
+  // text is static and only the eight booleans move, so key on those: an
+  // unchanged poll now touches nothing at all.
+  const key=Object.keys(toggles).sort().map(k=>k+'='+(toggles[k]?1:0)).join(',');
+  if(key===_gateCfgKey) return;
+  // And when it DOES change - because you clicked something - hold the scroll
+  // position across the rebuild rather than snapping to the top.
+  const box=el.querySelector('.gsetwrap');
+  const keepScroll=box?box.scrollTop:0;
+  _gateCfgKey=key;
+  const plexOn=!!toggles['gate.plex'];
+  // Manual pause FIRST. It is the stop switch and the only one you reach for
+  // in a hurry; the rest are policy you set once. It also has nothing to do
+  // with Plex or the arrs, so leading with it avoids implying it belongs to
+  // the automatic checks below.
+  const order=['gate.manual_pause',
+               'gate.plex','gate.plex_transcodes_only','gate.plex_encode_only',
+               'gate.plex_ignore_throttled','gate.plex_io_throttle',
+               'gate.disk_busy','gate.arrs'];
+  const keys=order.filter(k=>k in toggles)
+    .concat(Object.keys(toggles).filter(k=>!order.includes(k)));
+  const rows=keys.map(k=>{
+    const m=GATE_META[k]||{label:k};
+    const on=!!toggles[k];
+    const child=!!m.under;
+    const inert=child && !plexOn;      // parent is off, so this cannot apply
+    return `<div class="gset${child?' gchild':''}${inert?' ginert':''}">
+      <label class="gsw">
+        <input type="checkbox" ${on?'checked':''} ${inert?'disabled':''}
+               onchange="setGate('${k}',this.checked)">
+        <span class="gname">${esc(m.label||k)}</span>
+        <span class="gstate ${on?'on':'off'}">${on?'on':'off'}</span>
+      </label>
+      ${m.what?`<div class="gwhat">${esc(m.what)}</div>`:''}
+      <div class="gba">
+        <div><span class="gtag on">on</span>${esc(m.on||'')}</div>
+        <div><span class="gtag off">off</span>${esc(m.off||'')}</div>
+      </div>
+      ${m.note?`<div class="gnote">${esc(m.note)}</div>`:''}
+      ${inert?`<div class="gnote gwarn">Has no effect while “Hold while Plex is
+        busy” is off.</div>`:''}
+    </div>`;
+  }).join('');
+  el.innerHTML=`<div class="gsetwrap">${rows}</div>`;
+  if(keepScroll){
+    const nb=el.querySelector('.gsetwrap');
+    if(nb) nb.scrollTop=keepScroll;
+  }
+  const hint=document.getElementById('gateCfgHint');
+  if(hint){
+    const n=keys.filter(k=>toggles[k]).length;
+    hint.innerHTML=`<span class="dim">${n} of ${keys.length} on</span>`;
+  }
+}
+
+// The stop switch, kept on the dashboard after the rest of the gate settings
+// moved to /settings. It is the one gate control you reach for in a hurry, and
+// needing to open another page to stop the queue is the wrong shape of urgent.
+//
+// Driven by the SAME toggles object as the settings list rather than by its own
+// fetch, so the two can never disagree about whether the queue is paused - a
+// second source of truth for a stop switch is worth avoiding.
+let _quickKey='';
+function paintGateQuick(toggles){
+  const el=document.getElementById('gateQuick');
+  if(!el) return;
+  const on=!!toggles['gate.manual_pause'];
+  const key=on?'1':'0';
+  if(key===_quickKey) return;          // same no-repaint discipline as above
+  _quickKey=key;
+  el.innerHTML=
+    `<span class="gqlabel">${on?'Queue paused':'Manual pause'}</span>`+
+    `<button class="gqbtn${on?' on':''}" onclick="setGate('gate.manual_pause',${on?'false':'true'})"
+       title="${on?'Let jobs start again':'Stop new jobs starting. Running jobs finish.'}"
+     >${on?'Resume':'Pause'}</button>`;
+}
+async function setGate(key,on){
+  await fetch('/api/gate/toggle?key='+encodeURIComponent(key)+'&on='+(on?'true':'false'),{method:'POST'});
+  loadGate();
+}
+
+// Renames arrive as "old path -> new path", which is the most useful line in
+// the log and also the longest. Split it so both halves are readable instead of
+// letting one long path push the other off the end.
+// A disk move reads "moved NU-DRIVE-1 -> NU-DRIVE-4". Pull it out before the
+// generic before/after split, or the arrow handling below would tear the
+// sentence in half and bury which spindle the file ended up on.
+const DISKMOVE=/\bmoved (NU-DRIVE-[\w-]+) -> (NU-DRIVE-[\w-]+)/;
+const DISKON=/\bon (NU-DRIVE-[\w-]+)/;
+// Raw byte counts are unreadable at a glance - "1355011349 -> 1315008798 bytes"
+// tells you almost nothing, while "1.26 GB -> 1.22 GB" is instantly a small
+// shrink. Done at DISPLAY time rather than where the event is written, so the
+// history rows already stored in the database read correctly too.
+function humanBytes(n){
+  n=Number(n);
+  if(!isFinite(n)) return null;
+  const a=Math.abs(n);
+  if(a>=1024**3) return (n/1024**3).toFixed(2)+' GB';
+  if(a>=1024**2) return (n/1024**2).toFixed(1)+' MB';
+  if(a>=1024)    return Math.round(n/1024)+' KB';
+  return n+' B';
+}
+// Colour a size delta. Smaller is the goal, so a negative percentage is good
+// news and a positive one is worth noticing - the sign alone is easy to miss
+// in a dense table.
+function colourPct(html){
+  return String(html).replace(/(^|[\s>(·])([+-]\d+(?:\.\d+)?)%/g, (m,pre,num)=>{
+    const v=parseFloat(num);
+    // Exactly 0.0% is neither a win nor a warning - a remux that changed the
+    // container but not the size is the common case, and painting a whole
+    // column orange for it drowns out the deltas that do matter.
+    const c = v<0 ? 'var(--ok)' : (v>0 ? 'var(--warn)' : 'var(--dim)');
+    return `${pre}<b style="color:${c}">${num}%</b>`;
+  });
+}
+// Wrapper so every exit path gets the size colouring - _fmtDetail has five
+// returns and colouring them one by one is exactly how one gets missed.
+function fmtDetail(s){ return colourPct(_fmtDetail(s)); }
+function _fmtDetail(s){
+  s=String(s||'');
+  // "<int> -> <int> bytes" and any standalone "<int> bytes"
+  s=s.replace(/(\d{4,})\s*->\s*(\d{4,})\s*bytes/g,
+              (m,a,b)=>`${humanBytes(a)} -> ${humanBytes(b)}`)
+     .replace(/\b(\d{7,})\s*bytes\b/g, (m,a)=>humanBytes(a));
+  const mv=s.match(DISKMOVE);
+  if(mv){
+    const rest=s.replace(DISKMOVE,'').replace(/·\s*$/,'').trim().replace(/·$/,'');
+    return (rest?esc(rest)+'<br>':'')
+      +`<span class="pill p-warn">moved disk</span> `
+      +`<span class="mono dim">${esc(mv[1])}</span> `
+      +`<span class="arrow">→</span> <b class="mono">${esc(mv[2])}</b>`;
+  }
+  const on=s.match(DISKON);
+  if(on && s.indexOf('->')<0)
+    return esc(s.replace(DISKON,'').replace(/·\s*$/,'').trim())
+      +` <span class="dim mono">${esc(on[1])}</span>`;
+  // upgrades read "old spec  ->  new spec"; renames "old path -> new path".
+  // Either way the before/after belongs on separate lines.
+  const i=s.indexOf('->');
+  if(i<0) return esc(s);
+  const a=s.slice(0,i).trim(), b=s.slice(i+2).trim();
+  return `<span class="was">${esc(a)}</span><br>`
+        +`<span class="arrow">→</span> <b>${esc(b)}</b>`;
+}
+// FETCH ONLY. The events used to be rendered here into their own panel; they
+// are now one voice in the combined Activity feed, so this just keeps the
+// rows fresh and pokes the one renderer that owns the table. lastListSig is
+// cleared because the FEED changed even when the jobs half of it did not -
+// without that, renderDone's are-we-identical guard would eat every refresh
+// where only an event arrived.
+let lastHistKey='';
+async function loadHistory(){
+  const h=await (await fetch('/api/history?limit=200')).json();
+  const key=(h.rows||[]).map(r=>r.id).join(',');
+  if(key===lastHistKey) return;          // nothing new; don't repaint
+  lastHistKey=key;
+  _histRows=h.rows||[];
+  lastListSig=null;
+  renderDone(lastJobs);
+}
+
+// ONE CLICK, ONE UNIT - for every setting, whatever its range.
+//
+// This used to scale the step to the span (5, 15, 30 for wider ranges) on the
+// reasoning that stepping 0-1800 by ones is 1800 clicks. True, but it made the
+// buttons unpredictable: the same − on two adjacent rows moved one by 1 and
+// the next by 30, and there was no way to nudge a wide setting by a single
+// unit at all. The typed field beside them is the tool for a big jump; the
+// buttons are for a nudge, and a nudge should mean the same thing everywhere.
+function stepFor(v){ return 1; }
+// Units spelled out. "1800s" and "24h" are jargon in a place where the whole
+// point is that somebody who has not read the source can set these safely -
+// the abbreviations saved four characters and cost a reading.
+function unitFor(k,val){
+  const plural=(n,w)=>n===1?`1 ${w}`:`${n} ${w}s`;
+  if(k.endsWith('_min')) return plural(val,'minute');
+  if(k.endsWith('_h'))   return plural(val,'hour');
+  if(k.endsWith('_s'))   return plural(val,'second');
+  return String(val);
+}
+function workerRow(k,v){
+  const st=stepFor(v);
+  // A typed field alongside the steppers: 1800 -> 5 is 60 clicks otherwise, and
+  // the raw number is what the min/max are quoted in. The unit label sits next
+  // to it so "1800" is still readable as 30 h.
+  return `<tr>
+    <td><div>${esc(k.replace(/_/g,' '))}</div>
+        <div class="dim" style="font-size:11px">${esc(v.hint)}</div></td>
+    <td style="width:250px;text-align:right;white-space:nowrap">
+      <button onclick="bump('${k}',${Math.max(v.min,v.value-st)})"
+              ${v.value<=v.min?'disabled':''}>−</button>
+      <input id="wi-${k}" class="wnum" type="number" value="${v.value}"
+             min="${v.min}" max="${v.max}" step="1"
+             onkeydown="if(event.key==='Enter'){event.preventDefault();this.blur();}"
+             onchange="commitNum('${k}',this)">
+      <button onclick="bump('${k}',${Math.min(v.max,v.value+st)})"
+              ${v.value>=v.max?'disabled':''}>+</button>
+      <div class="dim" style="font-size:11px">
+        ${esc(unitFor(k,v.value))} · min ${v.min} · max ${v.max} · default ${v.default}</div>
+    </td></tr>`;
+}
+// Typed values are clamped server-side too; this only avoids a pointless
+// round-trip and shows the correction immediately.
+function commitNum(key, el){
+  const min=Number(el.min), max=Number(el.max);
+  let v=parseInt(el.value,10);
+  if(isNaN(v)){ loadWorkers(); return; }
+  if(v<min) v=min;
+  if(v>max) v=max;
+  el.value=v;
+  bump(key,v);
+}
+let _wtab='counts', _wdata=null;
+function wtab(which){
+  _wtab=which;
+  for(const t of ['counts','timing','ffmpeg','mkv','arrs','meta','backup','rules']){
+    const b=document.getElementById('tab-'+t);
+    if(b) b.className = 'tab' + (t===which?' on':'');
+  }
+  // These keys are PANELS, not settings tables - swap the whole body rather
+  // than re-rendering rows into #workers.
+  //
+  // This was six booleans and six display assignments, which meant adding a
+  // pane touched the function in five places. Adding the seventh (gate) was
+  // the point at which that stopped being a style preference: one table, one
+  // loop, and a new pane is one line.
+  const PANE_OF = {ffmpeg:'ffPane', backup:'bkPane',  rules:'rulesPane',
+                   mkv:'mkvPane',   arrs:'arrsPane',  meta:'metaPane',
+                   gate:'gatePane', logs:'logsPane', jobs:'jobsPane',
+                   lang:'langPane', libs:'libPane',
+                   vcodec:'vcodecPane', acodec:'acodecPane',
+                   alang:'alangPane', cache:'cachePane',
+                   whisper:'whisperPane', plex:'plexPane',
+                   updates:'updPane'};
+  const isPane = Object.prototype.hasOwnProperty.call(PANE_OF, which);
+  const set = document.getElementById('wSettings');
+  if(set) set.style.display = isPane ? 'none' : '';
+  for(const k in PANE_OF){
+    const e = document.getElementById(PANE_OF[k]);
+    if(e) e.style.display = (k===which) ? '' : 'none';
+  }
+  const isFf = which==='ffmpeg', isBk = which==='backup', isRu = which==='rules';
+  const isMk = which==='mkv', isAr = which==='arrs', isMe = which==='meta';
+  const hint=document.getElementById('wtabhint');
+  if(which==='gate'){
+    if(hint) hint.textContent='· job gate';
+    loadGate();                        // repaints #gateCfg wherever it lives
+    return;
+  }
+  if(which==='logs'){
+    if(hint) hint.textContent='· logs';
+    loadLogJobs(); loadLogs(true);     // job filter first, then the lines
+    return;
+  }
+  if(which==='jobs'){
+    if(hint) hint.textContent='· jobs';
+    loadJobsTab();
+    return;
+  }
+  if(which==='lang'){
+    if(hint) hint.textContent='· subtitles';
+    loadLangTab();
+    return;
+  }
+  if(which==='alang'){
+    if(hint) hint.textContent='· audio language';
+    loadAlang();
+    return;
+  }
+  if(which==='cache'){
+    if(hint) hint.textContent='· cache folder';
+    loadCacheCfg();
+    return;
+  }
+  if(which==='updates'){
+    if(hint) hint.textContent='· updates';
+    loadUpdates(0);      // 0: use the cache. The Check now button forces it.
+    return;
+  }
+  if(which==='whisper'){
+    if(hint) hint.textContent='· whisper';
+    loadWhisper();
+    return;
+  }
+  if(which==='plex'){
+    if(hint) hint.textContent='· plex';
+    loadPlexCfg();
+    return;
+  }
+  if(which==='vcodec' || which==='acodec'){
+    const side = which==='vcodec' ? 'video' : 'audio';
+    if(hint) hint.textContent = '· '+(side==='video'?'video':'audio')+' codec';
+    loadCodecTab(side);
+    return;
+  }
+  if(which==='libs'){
+    if(hint) hint.textContent='· libraries';
+    loadLibsTab();
+    return;
+  }
+  if(isMe){
+    if(hint) hint.textContent='· metadata';
+    loadMetaTab();
+    return;
+  }
+  if(isAr){
+    if(hint) hint.textContent='· arrs';
+    loadArrsTab();
+    return;
+  }
+  if(isMk){
+    if(hint) hint.textContent='· MKVToolNix';
+    loadMkv(true);
+    return;
+  }
+  if(isFf){
+    if(hint) hint.textContent='· ffmpeg';
+    ffCheck(); ffUsers();            // refresh on open, not on a timer
+    return;
+  }
+  if(isBk){
+    if(hint) hint.textContent='· backup';
+    loadBackup(true);
+    return;
+  }
+  if(isRu){
+    if(hint) hint.textContent='· rules';
+    loadRules();
+    return;
+  }
+  if(_wdata) paintWorkers();
+}
+
+// ---- Arrs tab ------------------------------------------------------------
+// Standing guards over arr-side configuration. Each job: a toggle, what it
+// last found, and a Run-now that works regardless of the toggle so "check"
+// is always one click even when auto is off.
+// ---- Metadata tab ---------------------------------------------------------
+// Laid out as the CHAIN it actually is. Each hop is owned by something
+// different, so each hop gets its own row and its own refresh button.
+async function loadMetaTab(){
+  const el=document.getElementById('metaBody');
+  if(!el) return;
+  el.innerHTML='<div class="dim">loading…</div>';
+  let d; try{ d=await (await fetch('/api/metadata')).json(); }catch(_){
+    el.innerHTML='<div class="err">could not read metadata status</div>'; return; }
+  const when=t=>{
+    if(!t) return '<span class="dim">—</span>';
+    const ms=Date.parse(t); if(isNaN(ms)) return esc(String(t).slice(0,16));
+    const d2=Math.round((ms-Date.now())/1000);
+    return `${new Date(ms).toLocaleString()} <span class="dim">(${
+      d2>0 ? 'in '+hms(d2) : hms(-d2)+' ago'})</span>`;
+  };
+  const arrs=(d.arrs||[]).map(a=>{
+    // Health warnings moved to the Arrs page — they describe the arr server,
+  // not the provider this row is about.
+    return `<div class="metarow">
+      <div class="metahead">
+        <b>${esc(a.provider||'metadata')}</b><span class="metato">→</span>
+        <b>${esc(a.arr)}</b>
+        ${a.ok ? `<span class="pill p-ok">connected</span>`
+               : `<span class="pill p-bad">unreachable${a.error?' — '+esc(a.error):''}</span>`}
+        ${a.version?`<span class="dim mono" style="font-size:10.5px">v${esc(a.version)}</span>`:''}
+      </div>
+      <div class="metawhen">
+        ${a.task
+          ? `${esc(a.task.name)} runs every ${Math.round((a.task.interval_min||0)/60)}h<br>
+             last ${when(a.task.last)}<br>next ${when(a.task.next)}`
+          : 'no refresh task reported'}
+      </div>
+      <div class="metaact"><button onclick="metaRefresh('${esc(a.arr)}')"
+        >Refresh from ${esc(a.provider||'provider')}</button></div>
+    </div>`;
+  }).join('');
+  el.innerHTML = `
+    <div class="dim" style="font-size:11.5px;margin-bottom:10px;line-height:1.5">
+      nuarr does not talk to TMDB or TheTVDB itself — the arrs do. This page is
+      about those providers and the arrs' own metadata health. What nuarr then
+      copies OUT of the arrs — original language — lives with the arrs
+      themselves, under <b>Integrations &rarr; Arrs</b>.
+    </div>
+    ${arrs}`;
+}
+
+// THE ORIGINAL-LANGUAGE SYNC CARD, rendered on the Arrs page.
+//
+// It used to sit under Metadata, which read as "information about the
+// library". It is not: it is a pull from Sonarr and Radarr, on a schedule,
+// with a connection that can fail - the same shape as everything else on the
+// Arrs page, and the place you would go to fix it when it stops.
+function langSyncCard(n, arrNames){
+  const st=(n&&n.stats)||{};
+  const pct = n && n.total ? Math.round(n.tagged/n.total*100) : 0;
+  const langs=((n&&n.by_language)||[]).map(l=>
+    `<span class="pill" style="color:#39d3c3;border-color:#1e5a55">${
+      esc(l.lang)} ${fmt(l.n)}</span>`).join('');
+  return `
+    <div class="metarow">
+      <div class="metahead">
+        <b>${esc(arrNames || 'the arrs')}</b>
+        <span class="metato">→</span><b>nuarr</b>
+        <span class="pill ${pct>=99?'p-ok':(pct>0?'p-warn':'p-bad')}">${pct}% tagged</span>
+      </div>
+      <div class="dim" style="font-size:11px;margin:4px 0 6px">
+        Copies <b>original language</b> from the arrs. Nothing in a media file
+        says which of its audio tracks is the original, so this is the only way
+        to know — and the whole audio language policy rests on it.
+      </div>
+      <div class="metawhen">
+        ${fmt((n&&n.tagged)||0)} of ${fmt((n&&n.total)||0)} files carry an original language<br>
+        syncs every 12h · last ${st.last_run?when(new Date(st.last_run*1000).toISOString()):'never'}<br>
+        next ${st.next_run?when(new Date(st.next_run*1000).toISOString()):'—'}
+      </div>
+      ${langs?`<div class="metachips">${langs}</div>`:''}
+      ${st.last_error?`<div class="err metanote">${esc(st.last_error)}</div>`:''}
+      <div class="metaact"><button onclick="metaSync()">Sync now</button>
+        <span id="metaMsg" class="dim"></span></div>
+    </div>`;
+}
+async function metaRefresh(arr){
+  const m=document.getElementById('metaMsg');
+  try{
+    const r=await (await fetch('/api/metadata/refresh?arr='+encodeURIComponent(arr),
+                               {method:'POST'})).json();
+    if(m) m.textContent = r.ok ? `${arr} is refreshing — it may take a while`
+                               : 'refresh refused';
+  }catch(_){ if(m) m.textContent='refresh failed'; }
+  setTimeout(loadMetaTab, 2500);
+}
+async function metaSync(){
+  const m=document.getElementById('metaMsg');
+  if(m) m.innerHTML='<span class="busy"><span class="sp"></span>'
+    +'<span class="step">reading both arrs…</span></span>';
+  try{
+    const r=await (await fetch('/api/origlang/sync',{method:'POST'})).json();
+    if(m) m.textContent=`${fmt(r.updated||0)} file(s) updated from ${fmt(r.parents||0)} titles`;
+  }catch(_){ if(m) m.textContent='sync failed'; }
+  loadMetaTab();
+}
+
+// ---- why the queue is not moving -----------------------------------------
+// Filled from /api/queue/blockers, which derives every answer from the same
+// functions the dispatcher uses - so the explanation cannot drift away from
+// the behaviour it is explaining.
+let _qWhy = {}, _qHead = '';
+async function loadQueueWhy(){
+  try{
+    const d = await (await fetch('/api/queue/blockers')).json();
+    const m = {};
+    for(const r of (d.rows||[])) m[r.job_id] = r;
+    _qWhy = m; _qHead = d.headline || '';
+  }catch(_){ }
+}
+setInterval(loadQueueWhy, 6000);
+loadQueueWhy();
+
+// ---- who is watching, with the artwork -----------------------------------
+// The gate row could say "2 sessions playing" and nothing else. Two direct
+// plays of a 480p cartoon and two 4K remuxes off the same spindle are the same
+// sentence and very different situations.
+const PLAYCOL = {'direct play':'var(--ok)', 'copy':'#58c8d8', 'transcode':'#f778ba'};
+
+// LIVE, NOT POLLED-AND-JUMPY.
+//
+// Three separate things were making this feel dead. The panel read the gate's
+// snapshot, which is deliberately up to 20 s old; it refreshed on an 8 s timer,
+// so a bar could be half a minute behind; and every refresh rewrote the whole
+// block, which re-requested the artwork and flickered.
+//
+// Now: the server has a 1.5 s panel feed, this polls it every 2 s while the tab
+// is visible, and a local clock advances each bar between polls from the raw
+// position and duration. The cards are only rebuilt when the SET of sessions
+// changes - a new stream, a pause, a different play method - so posters load
+// once and stay put while the numbers underneath keep moving.
+let _pxRows = [], _pxAt = 0, _pxSig = '', _pxPollTimer = null, _pxRate = 2000;
+
+function pxTime(ms){
+  if(!(ms > 0)) return '';
+  const t = Math.floor(ms/1000), h = Math.floor(t/3600),
+        m = Math.floor(t%3600/60), sec = t%60;
+  const mm = h ? String(m).padStart(2,'0') : String(m);
+  return (h ? h+':' : '') + mm + ':' + String(sec).padStart(2,'0');
+}
+
+// Three states, not two. Buffering used to fall into "paused" here, which read
+// as "this viewer stopped" when what it actually means is "this viewer is
+// stuck". Opposite meanings, and the second one matters far more.
+function pxState(s){
+  const st = String(s.state||'playing').toLowerCase();
+  return st === 'buffering' ? 'buffering' : (st === 'playing' ? 'playing' : 'paused');
+}
+// Only a paused stream freezes its clock. A buffering one is still trying to
+// advance, so the position keeps running and the next report corrects it.
+function pxPaused(s){ return pxState(s) === 'paused'; }
+function pxKey(s){ return s.key || s.label; }
+
+// PLEX DOES NOT REPORT POSITION IN REAL TIME.
+//
+// Measured on this server: viewOffset moves in ~10,000 ms steps, because that
+// is how often a client checks in. Polling the server faster than that buys
+// nothing for position - which is exactly why the browser keeps its own clock.
+//
+// But that clock will run AHEAD of the next report. Naively trusting each
+// snapshot would yank the bar backwards by up to ten seconds every poll, which
+// looks far worse than the slow bar it replaced. So a report is only adopted
+// when it is ahead of what is already on screen, or when it disagrees by
+// enough to be a real seek rather than staleness.
+// A report that disagrees with the display by more than this is not staleness,
+// it is a seek or a stall, and the display should give way to it. Comfortably
+// above the ~10 s a healthy report normally trails by.
+const PX_SEEK = 20000;
+// key -> {off, at} the position being DISPLAYED, and when that was set
+const _pxClock = {};
+
+function pxSync(ss, at){
+  const seen = {};
+  for(const s of ss){
+    const k = pxKey(s), rep = s.offset_ms || 0;
+    let cur = _pxClock[k];
+    seen[k] = 1;
+    if(!cur){ _pxClock[k] = {off: rep, at: at}; continue; }
+    if(pxPaused(s)){ cur.off = rep; cur.at = at; continue; }
+    const shown = cur.off + (at - cur.at);
+    if(rep >= shown || Math.abs(rep - shown) > PX_SEEK){ cur.off = rep; cur.at = at; }
+    // else: the report is simply older than our clock. Keep running.
+  }
+  for(const k in _pxClock) if(!seen[k]) delete _pxClock[k];
+}
+
+function pxNow(s){
+  const dur = s.duration_ms || 0, c = _pxClock[pxKey(s)];
+  let off = c ? c.off : (s.offset_ms || 0);
+  // NO CEILING ON THE PREDICTION, DELIBERATELY.
+  //
+  // Two ceilings were tried and both froze the bar. Capping at N seconds past
+  // the last rebase fails because a report always trails the true position, so
+  // the rebase condition can go unmet indefinitely on a perfectly healthy
+  // stream. Capping at N seconds past the newest report fails whenever polling
+  // slows - a background tab throttles its timers - because the newest report
+  // then goes stale through no fault of the stream.
+  //
+  // A ceiling is not needed anyway. If the display ever drifts more than
+  // PX_SEEK from reality, the next report is that far off and pxSync snaps to
+  // it. The error is self-correcting and bounded, with no state that can get
+  // stuck.
+  if(c && !pxPaused(s)) off += Math.max(0, Date.now() - c.at);
+  if(dur > 0) off = Math.min(off, dur);
+  return {off: off, dur: dur,
+          pct: dur > 0 ? Math.max(0, Math.min(100, off/dur*100))
+                       : Math.max(0, Math.min(100, s.progress||0))};
+}
+
+// What forces a rebuild. Position is deliberately NOT in here - it changes
+// constantly and is handled by pxTick without touching the DOM structure.
+function pxSignature(ss){
+  return ss.map(s => [s.key, s.label, s.state, s.decision, s.user,
+                      s.disk, s.bandwidth].join('|')).join(';;');
+}
+
+// A STREAM'S EXPANDED STORY: what each track is doing and why the card says
+// "transcoding". The pills name the verdict; this names the mechanism -
+// which codec is being rebuilt into which, what is merely copied, whether a
+// subtitle is being burned into the picture (the usual hidden culprit), and
+// whether the GPU or the CPU is paying for it.
+function pxDetail(s){
+  const d = s.detail || {};
+  const rows = [];
+  const dec = w => w==='transcode' ? '<span class="pxwarn">converting</span>'
+             : w==='copy' ? '<span class="dim">copied as-is</span>'
+             : w==='burn' ? '<span class="pxwarn">burning in</span>' : '';
+  // codec pairs arrive as "eac3 -> opus"; the arrow everyone else uses
+  const pair = t => esc(String(t||'').replace(/\s*->\s*/,' → '));
+  // videoResolution is sometimes "1080", sometimes already "1080p" or "4k" -
+  // only bare numbers earn a suffix, or the card reads "1080pp"
+  const res = d.src_res ? (/^\d+$/.test(d.src_res)?d.src_res+'p':d.src_res) : '';
+  if(s.decision === 'transcode' || s.decision === 'copy'){
+    // A missing decision is not a missing track. A subtitle-only remux (Plex
+    // converting SRT for a web client) carries ONLY subtitleDecision in its
+    // transcode session - video and audio are direct-played and simply not
+    // mentioned. The expanded card then showed subtitle and container rows
+    // with the two biggest tracks absent. No decision + a known stream means
+    // "played untouched", the same as a full direct play.
+    if(d.video_decision || d.video_title)
+      rows.push(['video', `${d.video_decision?dec(d.video_decision)
+          :'<span class="dim">played untouched</span>'} ${esc(d.video_title||'')}`
+        + (d.video_decision==='transcode' && s.video ? ` <span class="mono">${pair(s.video)}</span>` : '')
+        + (d.video_decision==='transcode'
+            ? ` <span class="dim">${d.hw||d.hw_full?'on the GPU':'on the CPU'}</span>` : '')]);
+    if(d.audio_decision || d.audio_title)
+      rows.push(['audio', `${d.audio_decision?dec(d.audio_decision)
+          :'<span class="dim">played untouched</span>'} ${esc(d.audio_title||'')}`
+        + (d.audio_decision==='transcode' && s.audio ? ` <span class="mono">${pair(s.audio)}</span>` : '')]);
+    if(d.sub_title || d.sub_decision)
+      rows.push(['subtitle', d.sub_burn
+        ? `<span class="pxwarn">burning into the picture</span> ${esc(d.sub_title||'')}`
+          + ' <span class="dim">\u2014 this alone forces the video to be re-encoded</span>'
+        : `${dec(d.sub_decision)||'<span class="dim">shown</span>'} ${esc(d.sub_title||'')}`]);
+    if(d.src_container || d.dst_container)
+      rows.push(['container', d.dst_container && d.src_container!==d.dst_container
+        ? `<span class="mono">${esc(d.src_container)} \u2192 ${esc(d.dst_container)}</span>`
+        : `<span class="mono">${esc(d.src_container||d.dst_container)}</span>`]);
+  } else {
+    // a direct play still deserves to say what is inside the file
+    if(d.video_title) rows.push(['video', `<span class="dim">played untouched</span> ${esc(d.video_title)}`]);
+    if(d.audio_title) rows.push(['audio', `<span class="dim">played untouched</span> ${esc(d.audio_title)}`]);
+    if(d.sub_title)   rows.push(['subtitle', esc(d.sub_title)]);
+  }
+  if(d.src_bitrate)
+    // "streaming at 52.9 Mbps" was wrong, and confusingly so on a direct play
+    // of a 25.2 Mbps file - it read as the file being sent at twice its own
+    // bitrate. Session.bandwidth is what Plex has RESERVED for the stream, not
+    // what is flowing: it carries headroom for VBR peaks, and it is measured
+    // here at 2.1x the file on a WAN stream and 2.9x on a LAN one, so it is
+    // plainly an allocation rather than a rate.
+    rows.push(['source', `${esc(res?res+' \u00b7 ':'')}${(d.src_bitrate/1000).toFixed(1)} Mbps file`
+      + (s.bandwidth?` <span class="dim" title="Plex reserves headroom above the file's average bitrate to cover peaks \u2014 it is a bandwidth allocation for the connection, not the rate the file is being sent at.">\u00b7 Plex has reserved ${(s.bandwidth/1000).toFixed(1)} Mbps for it <span style="opacity:.7">(${(s.bandwidth/d.src_bitrate).toFixed(1)}\u00d7, headroom for peaks)</span></span>`:'')]);
+  if(s.decision === 'transcode'){
+    const sp = s.speed ? `${Number(s.speed).toFixed(1)}\u00d7 realtime` : '';
+    const th = s.throttled ? '<span class="dim">\u00b7 parked (far enough ahead, not struggling)</span>' : '';
+    if(sp || th) rows.push(['encoder', `${sp} ${th}`
+      + (d.enc_progress?` <span class="dim">\u00b7 ${Number(d.enc_progress).toFixed(0)}% of the file already converted</span>`:'')]);
+  }
+  rows.push(['ends', `<span class="pxeta"></span>`]);
+  // WHAT NUARR IS ALLOWED TO DO ON THIS VIEWER'S DISK, in the same card as the
+  // bar that shows why. Two settings decide it and both were previously only
+  // findable on the settings page, which meant the bar could show a viewer
+  // running dry with nothing on screen connecting that to nuarr's behaviour.
+  // THE FLOOR THAT GOVERNS *THIS* SESSION. floor_s is computed per stream -
+  // 0 when it is buffered to the end, scaled by its bitrate, capped under
+  // Plex's throttle buffer when it is a transcode - so the global setting is
+  // only a fallback for a session the gate has not costed yet.
+  const fl = s.floor_s != null ? Number(s.floor_s) : Number(window._pxFloor || 0);
+  const rs = Math.round(fl * Number(window._pxResumeMult || 1.5));
+  const done = s.floor_s === 0;
+  // Built below but rendered outside the key/value grid, so it can run the
+  // full width of the tile instead of starting 62px in under the value column.
+  let runway = '';
+  if(done){
+    rows.push(['nuarr', `<b style="color:#3fb950">full speed</b> <span class="dim"
+      >— buffered to the end, will not read
+      <span class="mono" style="color:${diskColor(s.disk)}">${esc(s.disk||'')}</span>
+      again</span>`]);
+  }
+  if(fl && s.disk && !done){
+    // SUMMARISED, WITH THE ESSAY ON HOVER. Both of these paragraphs were
+    // worth writing once and are not worth reading on three cards at a time:
+    // together they ran longer than the stream details above them and pushed
+    // the bar off the bottom of the card. The line now states what nuarr does
+    // and at what numbers; the reasoning moves to the tooltip, where it costs
+    // nothing until it is wanted.
+    const fsp = Math.round(fl * Number(window._pxFullMult || 3));
+    const tip = `Above ${fsp}s of buffer nuarr does not hold back at all - you `
+      + `are too far ahead for anything it does to this disk to reach you. `
+      + `Between ${fsp}s and ${fl}s it slows down by a sliding amount, hardest `
+      + `at the bottom. Under ${fl}s it stops completely, and does not start `
+      + `again until ${rs}s and only once the buffer has held there: stopping `
+      + `and starting on the same number made it flip states every few `
+      + `seconds, because pausing is itself what lets the buffer recover.`;
+    rows.push(['nuarr', `<span class="mono" style="color:${diskColor(s.disk)}"
+      >${esc(s.disk)}</span> <span class="dim" title="${esc(tip)}">· full speed
+      over</span> <b>${fsp}s</b><span class="dim">, slows below that, stops
+      under</span> <b>${fl}s</b>`]);
+    // WHERE THAT NUMBER CAME FROM. It is no longer the setting, so a card
+    // showing 36s while the settings page says 60s needs to account for
+    // itself rather than looking like a bug.
+    const w = s.floor_why || {};
+    const base = Number(w.base || window._pxFloor || 0);
+    if(base && Math.abs(fl - base) > 0.5){
+      // The derivation as one line of arithmetic rather than a paragraph.
+      const bits = [];
+      if(d.src_bitrate && Math.abs(w.wanted - base) > 0.5)
+        bits.push(`${base}s × ${(w.wanted/base).toFixed(1)} for
+          ${(d.src_bitrate/1000).toFixed(1)} Mbps = ${w.wanted}s`);
+      if(w.client_cap != null && w.client_cap <= fl + 0.5)
+        bits.push(`held to <b>${fl}s</b>, this player banks ~${w.client_seen}s here`);
+      if(w.throttle_cap != null && w.throttle_cap <= fl + 0.5)
+        bits.push(`held to <b>${fl}s</b> by Plex's ${window._pxThrottle}s throttle`);
+      const deep = `Configured floor ${base}s. A second of buffer on a `
+        + `${(d.src_bitrate/1000).toFixed(1)} Mbps source is `
+        + `${d.src_bitrate > 10000 ? 'more' : 'less'} disk work than average, so `
+        + `the floor scales to ${w.wanted}s.`
+        + (w.client_cap != null && w.client_cap <= fl + 0.5
+           ? ` But client buffers are capped in megabytes, not seconds, so a `
+             + `high-bitrate stream holds fewer seconds: this player has been `
+             + `measured holding about ${w.client_mb} MB, which is only about `
+             + `${w.client_seen}s of this file. Demanding more than it can reach `
+             + `would leave it reading as starving for the whole film, so the `
+             + `floor is held down to ${fl}s.` : '')
+        + (w.throttle_cap != null && w.throttle_cap <= fl + 0.5
+           ? ` Plex also parks its own encoder ${window._pxThrottle}s ahead, so `
+             + `more than that is never banked in the first place.` : '');
+      if(bits.length)
+        rows.push(['', `<span class="dim" title="${esc(deep)}">${
+          bits.join(' <span style="opacity:.55">·</span> ')}</span>`]);
+    }
+    // THE RUNWAY GAUGE, and the reason it exists: on the timeline bar above,
+    // the whole question lives in a sliver. A 20s buffer on a 78-minute film is
+    // 0.4% of the width and the 60s line is 1.3% - the two marks land on top of
+    // each other and of the playhead, so the one case worth looking at (a
+    // viewer running out) is the one case the timeline cannot draw. This bar
+    // throws away the film's length and plots seconds of runway instead, 0 to
+    // 3x the floor, which puts the threshold a third of the way across and
+    // makes "20s against a 60s floor" a gap you can see from across the room.
+    const fs = Math.round(fl * Number(window._pxFullMult || 3));
+    runway = `<div class="pxrunwrap"><em class="pxrunlbl"></em>
+      <div class="pxrun"><i></i><u></u><o></o><s></s></div>
+      <div class="pxrunax"><span class="zero">0s</span><span class="fl">${fl}s</span
+      ><span class="rs">${rs}s</span><span class="fs">${fs}s</span
+      ><span class="mx">${Math.round(fl*3.6)}s+</span></div></div>`;
+  }
+  if(s.file) rows.push(['file', `<span class="mono dim" style="overflow-wrap:anywhere">${esc(s.file)}</span>`]);
+  return `<div class="pxmore">`+rows.map(([k,v])=>
+    `<div class="pxrow"><span class="pxk">${k}</span><span class="pxv">${v}</span></div>`).join('')
+    + runway
+    + (fl?`<div class="pxlegend">
+        <s class="pos">watched</s><s class="buf">buffered ahead</s>
+        <s class="thr">${fl}s — nuarr stops</s>
+        <s class="rsm">${rs}s — nuarr starts again</s>
+        <s class="fsp">${Math.round(fl*Number(window._pxFullMult||3))}s — nuarr at full speed</s></div>`:'')
+    + `</div>`;
+}
+// ONE CLICK OPENS THEM ALL. The expanded views are for comparing - who is
+// transcoding and why, who is buffered how far - and comparing means seeing
+// them side by side, not clicking three cards in a row. Any card toggles the
+// whole set.
+let _pxOpenAll = false;
+function pxToggle(){
+  _pxOpenAll = !_pxOpenAll;
+  pxRender(_pxRows);
+}
+
+function pxRender(ss){
+  const el = document.getElementById('plexCards');
+  if(!el) return;
+  el.innerHTML = ss.map((s,i)=>{
+    const col = PLAYCOL[s.decision] || 'var(--dim)';
+    const how = s.decision === 'direct play' ? 'direct play'
+              : s.decision === 'copy' ? 'direct stream (remuxed)'
+              : 'transcoding';
+    const st = pxState(s);
+    const open = _pxOpenAll;
+    const bits = [];
+    if(s.disk) bits.push(`<span class="mono" style="color:${diskColor(s.disk)}">${esc(s.disk)}</span>`);
+    if(s.location) bits.push(esc(s.location==='wan'?'remote':'local'));
+    if(s.bandwidth) bits.push((s.bandwidth/1000).toFixed(1)+' Mbps');
+    return `<div class="pxcard px-${st}${open?' pxopen':''}" data-key="${esc(s.key||s.label)}"
+        onclick="pxToggle()"
+        title="${open?'click to collapse all':'click for the full story of every stream'}">
+      ${s.thumb?`<img class="pxart" src="/api/plex/art?key=${encodeURIComponent(s.thumb)}"
+                      alt="" loading="lazy">`:'<div class="pxart pxnone"></div>'}
+      <div class="pxbody">
+        <div class="pxtitle">${esc(s.label)}
+          <span class="pxcaret dim">${open?'\u25be':'\u25b8'}</span></div>
+        ${s.sub?`<div class="dim pxsub">${esc(s.sub)}</div>`:''}
+        <div class="pxmeta">
+          <span class="pill" style="color:${col};border-color:${col}">${esc(how)}</span>
+          ${st==='buffering' ? '<span class="pill p-bad pxbuf">buffering</span>'
+            : st==='paused'  ? '<span class="pill p-warn">paused</span>'
+                             : '<span class="pill p-ok pxlive">playing</span>'}
+          <b>${esc(s.user||'?')}</b>
+          <span class="dim">${esc(s.player||s.product||'')}</span>
+        </div>
+        <div class="dim pxsub">${bits.join(' \u00b7 ')}</div>
+        <div class="pxsub pxlead"></div>
+        ${open?pxDetail(s):''}
+        <div class="pxfoot">
+          <span class="pxclock mono"></span>
+          <em class="pxblbl"></em>
+          <div class="pxbar"><b></b><i></i><u></u></div>
+          <span class="pxpct mono"></span>
+        </div>
+      </div></div>`;
+  }).join('');
+  pxTick();
+}
+
+// THE ENCODER'S LEAD OVER THE VIEWER, in words.
+//
+// Plex encodes ahead and parks when it is comfortable. The number that matters
+// is how much finished video is waiting: a healthy transcode sits minutes
+// ahead, a struggling one is measured in seconds and shrinking. Naming it here
+// means a stutter is visible on the dashboard BEFORE the viewer feels it -
+// which for a box whose whole job is smooth playback is the more useful moment.
+function pxLead(s, leadNow){
+  if(s.lead_s === null || s.lead_s === undefined) return '';
+  const L = (leadNow===undefined || leadNow===null) ? s.lead_s : leadNow;
+  // THE ESTIMATE NEVER RAISES ALARMS. It is a lower bound that starts at zero
+  // when observation starts - whatever the client buffered before that is
+  // invisible - so "only 0s ahead" would be a false alarm on a perfectly
+  // healthy direct play. It states what it has measured and says it is
+  // approximate; only the encoder's REAL lead earns warning colours.
+  if(s.lead_est){
+    const t = L < 90 ? `${L.toFixed(0)}s` :
+      `${(L/60) < 10 ? (L/60).toFixed(1) : (L/60).toFixed(0)} min`;
+    // ONE PHRASING FOR ALL FIVE PATHS.
+    //
+    // These said "buffered ahead", "fetched ahead", "fetched ahead by the
+    // client", "buffered" - five wordings for one idea, and three of them
+    // could appear side by side on three cards. That is what made the numbers
+    // look wrong: two figures that mean the same thing but are described
+    // differently invite the reader to assume they are measuring different
+    // things. The provenance still matters, so it stays - as a short
+    // parenthetical and a full explanation on hover, not as a different
+    // sentence each time.
+    if(s.lead_disk)
+      return `<span class="dim" title="Read from the server's own file position for this stream — Plex's handle sits at the furthest byte it has served the client, which is exactly the player's buffered-to point.">
+        ${t} buffered <span style="opacity:.7">(measured)</span></span>`;
+    // A FLOOR IS NOT AN ESTIMATE. When the session was already running before
+    // nuarr saw it, the integral can only measure growth since we started
+    // watching - a client sitting on a full buffer fetches at exactly 1x, so
+    // the number freezes far below the truth. Say which kind of number this
+    // is rather than dressing a floor up as a measurement.
+    if(L < 5 && !s.lead_full)
+      return `<span class="dim">measuring client buffer\u2026</span>`;
+    if(s.lead_floor)
+      return `<span class="dim" title="This session was already playing when nuarr started, so its buffer can only be measured from now on \u2014 the real figure is larger. It corrects itself on the next seek, or when this client has been measured from the start once.">
+        \u2265${t} buffered <span style="opacity:.7">(at least)</span></span>`;
+    if(s.lead_learned)
+      return `<span class="dim" title="Taken from this client's buffer size, measured on an earlier session that nuarr watched from the start.">
+        \u2248${t} buffered <span style="opacity:.7">(typical for this client)</span></span>`;
+    if(s.lead_proven)
+      return `<span class="dim" title="Proven from playback: the client played this far without fetching a single byte, so it must have held it. Measured across a resume, so it does not depend on when nuarr started watching.">
+        ${t} buffered <span style="opacity:.7">(proven)</span></span>`;
+    return `<span class="dim" title="Estimated from the bytes Plex has delivered to this client against the file's bitrate. Less certain than the other readings \u2014 it cannot see what the player did with them.">
+        ${t} buffered <span style="opacity:.7">(${
+          s.lead_full ? 'buffer full' : 'estimated'})</span></span>`;
+  }
+  // Kept short: this shares a 330px card with the title, the user and the
+  // device, and an explanation nobody can read is worse than a number.
+  if(L < 8)  return `<span class="pxwarn" title="The encoder is barely ahead of the viewer. Any hiccup now is a stall.">only ${L.toFixed(0)}s buffered <span style="opacity:.7">(encoder)</span></span>`;
+  if(L < 30) return `<span class="pxwarn" title="The encoder's lead over the viewer, reported by Plex.">${L.toFixed(0)}s buffered <span style="opacity:.7">(encoder)</span></span>`;
+  const mins = L/60;
+  return `<span class="dim" title="The encoder's lead over the viewer, reported by Plex \u2014 the most reliable of these readings, because Plex is doing the encoding.">${
+      mins < 10 ? mins.toFixed(1) : mins.toFixed(0)} min buffered `
+       + `<span style="opacity:.7">(${s.throttled ? 'encoder parked' : 'encoder'})</span></span>`;
+}
+
+// Runs four times a second and touches nothing but three text/style values per
+// card, so it is cheap enough to leave running and smooth enough to read as
+// motion rather than as a series of updates.
+function pxTick(){
+  const el = document.getElementById('plexCards');
+  if(!el || !_pxRows.length) return;
+  const cards = el.children;
+  for(let i=0; i<_pxRows.length && i<cards.length; i++){
+    const s = _pxRows[i], c = cards[i], n = pxNow(s);
+    const bar = c.querySelector('.pxbar i');
+    const pct = c.querySelector('.pxpct');
+    const clk = c.querySelector('.pxclock');
+    const led = c.querySelector('.pxlead');
+    if(bar) bar.style.width = n.pct.toFixed(2)+'%';
+    if(pct) pct.textContent = n.pct.toFixed(0)+'%';
+    if(clk) clk.textContent = n.dur ? pxTime(n.off)+' / '+pxTime(n.dur) : '';
+    // THE LEAD DRAINS IN REAL TIME between polls. The server's figure is a
+    // snapshot at fetch; while the stream plays, every second watched is a
+    // second spent from the buffer, so the display pays it out continuously
+    // using the same local clock the bar runs on. Refills arrive as upward
+    // corrections with the next poll. Paused clocks do not advance, so a
+    // paused card holds still by construction.
+    let leadNow = s.lead_s;
+    if(leadNow!=null){
+      const spent = Math.max(0, (n.off - (s.offset_ms||0))/1000);
+      leadNow = Math.max(0, leadNow - spent);
+    }
+    if(led) led.innerHTML = pxLead(s, leadNow);
+    // the lighter band behind the bar: position + buffered-ahead, whether
+    // that lead is the encoder's (reported) or the client's (estimated)
+    const band = c.querySelector('.pxbar b');
+    if(band){
+      const lead = (leadNow||0)*1000;
+      band.style.width = (n.dur && lead)
+        ? Math.min(100,(n.off+lead)/n.dur*100).toFixed(2)+'%'
+        : '0%';
+    }
+    // THE PAUSE LINE, drawn where the playhead will be after `floor` seconds.
+    // Putting it on the same axis as the buffered edge is what makes it
+    // readable: if the band's bright edge is LEFT of the dashes, this viewer
+    // has less runway than the floor and nuarr has stopped work on their disk.
+    // Both marks move with the playhead, so the gap between them is the margin.
+    const thr = c.querySelector('.pxbar u');
+    const lbl = c.querySelector('.pxblbl');
+    // per-session floor, falling back to the global setting
+    const floor = s.floor_s != null ? Number(s.floor_s)
+                                    : Number(window._pxFloor || 0);
+    // The card follows what the SCHEDULER is doing, not a fresh comparison
+    // against the floor. Inside the hysteresis band the disk is still held
+    // while the buffer already reads healthy, and a green card over a paused
+    // job is the exact mismatch that makes the UI untrustworthy.
+    // A stream that already has the rest of the file is never starved, even
+    // when the spindle it sits on is held for somebody else. Neither is one
+    // whose player is PAUSED: it is not spending its buffer, and the gate
+    // builds its floors from playing sessions only, so a paused card showing
+    // "nuarr paused" was claiming a hold that was not happening.
+    const starved = s.floor_s !== 0 && s.state !== 'paused'
+      && (!!(window._pxHeld||{})[s.disk]
+          || (floor > 0 && leadNow != null && leadNow < floor));
+    c.classList.toggle('px-starved', !!starved);
+    c.classList.toggle('px-safe', floor > 0 && leadNow != null && !starved);
+    if(thr){
+      thr.style.left = (floor > 0 && n.dur)
+        ? Math.min(100, (n.off + floor*1000)/n.dur*100).toFixed(2)+'%' : '0%';
+      thr.style.display = (floor > 0 && n.dur) ? '' : 'none';
+    }
+    if(lbl){
+      // WHERE THE BUFFER REACHES, not merely how long it is.
+      //
+      // "230s buffer" is a duration floating free of the thing being watched,
+      // and the bar underneath is an axis of the FILM - so the number and the
+      // picture were in different units and the eye had to convert. The edge of
+      // the bright band has a position, and that position has a name: the
+      // timecode it reaches. Said out loud - "buffered to 1:06:48" against
+      // "1:10:48 total" - it also answers the question the seconds cannot, which
+      // is how close this viewer is to simply having the rest of it.
+      const toMs = n.off + (leadNow||0)*1000;
+      const at = pxTime(toMs);
+      const upto = at ? `buffered to ${at}` : '';
+      // Says what the state MEANS, not what the numbers are - the numbers are
+      // already on the line above. Only rendered when the card is open.
+      // ONE LINE, AND THE PART AFTER THE DASH IS A VERDICT, NOT A SUM.
+      //
+      // It used to end "— 195s clear of the 30s floor", which wrapped the label
+      // onto a second row and restated two numbers already drawn on the gauge
+      // directly above: the floor is the tick, the margin is the gap to it. The
+      // reader does not need the arithmetic spelled out, only the answer, so
+      // the tail is now a single word for the state and the working stays in
+      // the gauge where it is shown rather than told.
+      lbl.textContent = s.floor_s === 0 ? 'buffered to the end'
+        : s.state === 'paused' ? `${upto} — player paused`
+        : !floor ? ''
+        : leadNow == null ? 'buffer not measured'
+        : starved ? `${upto} · ${Math.round(leadNow)}s ahead — nuarr paused`
+        : `${upto} · ${Math.round(leadNow)}s ahead — clear`;
+    }
+    // The runway gauge, on its own axis: 0 .. 3x the floor, in seconds. Past
+    // the top of the scale it simply pins full - the difference between four
+    // minutes of buffer and ten does not matter, only the distance to the line
+    // does, and that end of the scale is where it is legible.
+    const run = c.querySelector('.pxrun i');
+    if(run && floor > 0){
+      const span = floor * 3.6;
+      run.style.width = leadNow == null ? '0%'
+        : Math.min(100, leadNow/span*100).toFixed(2)+'%';
+      const rl = c.querySelector('.pxrunlbl');
+      // If this disk is actually being HELD, say what it is waiting for
+      // rather than just how much buffer there is. "Paused" with a healthy
+      // number next to it is the confusing state, and it is a real one now:
+      // the release needs the buffer over the resume line AND held there.
+      const hs = (window._pxHeld||{})[s.disk];
+      const rsm = Math.round(floor * Number(window._pxResumeMult||1.5));
+      // WHAT NUARR IS ACTUALLY DOING AT THIS BUFFER LEVEL. The gauge now has
+      // three regions rather than two, so "of runway" alone no longer says
+      // which one this viewer is in.
+      const fsAt = floor * Number(window._pxFullMult || 3);
+      const thrMax = Number(window._pxThrMax || 3);
+      const pace = leadNow == null ? null
+        : leadNow >= fsAt ? 0
+        : Math.max(0, Math.min(1, (fsAt - leadNow) / (fsAt - floor))) * thrMax;
+      // THE SPEED HAS TO BE THE ONE THAT ACTUALLY RUNS.
+      //
+      // `pace` is the RAW ramp - "sleep this many times the chunk time" - but
+      // the copy loop softens it by BG_DISCOUNT once Windows background I/O
+      // mode has taken, which is whenever it is throttling at all. Printing
+      // 100/(1+pace) therefore described a slowdown three times harsher than
+      // the one being applied: the card said 44% while the commit was running
+      // at about 70%. Same divisor as fileops now, published by the gate so the
+      // two cannot drift apart again.
+      const eff = pace == null ? null : pace / Number(window._pxBgDisc || 3);
+      // ...AND ONLY WHEN THERE IS SOMETHING TO SLOW. The ramp governs the
+      // commit copy alone; an encode on this spindle is stopped and started
+      // outright, not paced. With nothing copying here, a percentage is a
+      // statement about a mechanism that is not running.
+      const pacedHere = (window._pxPaced || new Set()).has(s.disk);
+      const speed = (eff == null || !pacedHere) ? ''
+        : ` — nuarr at ${Math.round(100/(1+eff))}% speed`;
+      // The same "where does it reach" the bar label now leads with, so the two
+      // lines describe one edge rather than two unrelated quantities.
+      const at2 = pxTime(n.off + (leadNow||0)*1000);
+      const to2 = at2 ? ` (to ${at2})` : '';
+      // Nothing of nuarr's is copying here, so there is no speed to quote - but
+      // silence would read as an omission. Say which it is.
+      const idleHere = !pacedHere ? ' — nuarr idle here' : '';
+      if(rl) rl.textContent = leadNow == null ? 'buffer not measured'
+        : hs ? (leadNow < rsm
+                 ? `${Math.round(leadNow)}s${to2} — paused until ${rsm}s`
+                 : `${Math.round(leadNow)}s${to2} — recovering, resumes in ${
+                     Math.ceil(Math.max(hs.hold_left_s, hs.recover_left_s||0))}s`)
+        // Under its own floor but nuarr has nothing on that spindle to stop -
+        // saying "of runway" here contradicted the bar directly above it.
+        : starved ? `${Math.round(leadNow)}s${to2} — under the ${floor}s it needs`
+        : leadNow >= fsAt ? `${Math.round(leadNow)}s${to2} — nuarr at full speed`
+        : `${Math.round(leadNow)}s of runway${to2}${speed || idleHere}`;
+    }
+    // the expanded card's ETA rides the same clock as the bar, so "ends at"
+    // stays honest while a report is up to ten seconds stale
+    const eta = c.querySelector('.pxeta');
+    if(eta && n.dur){
+      const left = Math.max(0, n.dur - n.off);
+      eta.textContent = pxPaused(s)
+        ? `${pxTime(left)} left — paused, so no finish time`
+        : `${new Date(Date.now()+left).toLocaleTimeString(undefined,
+             {hour:'numeric',minute:'2-digit'})} · ${pxTime(left)} left`;
+    }
+  }
+}
+
+async function loadPlexCards(){
+  const el = document.getElementById('plexCards');
+  if(!el) return;
+  let d;
+  try{ d = await (await fetch('/api/plex/sessions')).json(); }
+  catch(_){ return; }
+  const ss = d.sessions || [];
+  _pxRows = ss; _pxAt = Date.now();
+  pxSync(ss, _pxAt);
+  pxRate(ss.length);
+  if(!ss.length){ _pxSig=''; el.innerHTML=''; el.style.display='none'; return; }
+  el.style.display='';
+  const sig = pxSignature(ss);
+  if(sig !== _pxSig){
+    const first = !_pxSig;
+    _pxSig = sig;
+    pxRender(ss);
+    // AND PULL THE ROW ABOVE WITH IT.
+    //
+    // loadGate() is on a 6 s timer and the cards are on a 2 s one, so a stream
+    // starting, pausing or buffering showed up on the cards several seconds
+    // before the Plex row agreed with them - two things side by side saying
+    // different things, which reads as one of them being broken. The cards are
+    // the ones that notice first, so they now say so.
+    if(!first && typeof loadGate === 'function') loadGate();
+  }
+  else pxTick();
+}
+
+// Poll fast while somebody is looking, not at all while the tab is hidden -
+// a dashboard left open on a second monitor overnight should not be asking
+// Plex who is watching 40,000 times.
+// Two cadences. Fast enough to feel live while somebody is watching; slow
+// enough the rest of the time that a dashboard left open on a second monitor
+// is not asking Plex who is streaming twice a second all night for an answer
+// that is always "nobody".
+function pxSchedule(){
+  clearInterval(_pxPollTimer); _pxPollTimer = null;
+  // Load once either way. A page opened in a background tab - restored on
+  // startup, or middle-clicked - is hidden at parse time, and gating the first
+  // fetch on visibility left it showing nothing at all until it was focused.
+  loadPlexCards();
+  if(document.hidden) return;
+  _pxPollTimer = setInterval(loadPlexCards, _pxRate);
+}
+function pxRate(n){
+  // 1500 matches the server's own session-cache TTL - polling faster than
+  // that reads the same snapshot twice. Idle drops to 4s so a stream that
+  // starts appears within a breath rather than after six seconds.
+  const want = n ? 1500 : 4000;
+  if(want === _pxRate || document.hidden) { _pxRate = want; return; }
+  _pxRate = want;
+  clearInterval(_pxPollTimer);
+  _pxPollTimer = setInterval(loadPlexCards, _pxRate);
+}
+document.addEventListener('visibilitychange', pxSchedule);
+setInterval(pxTick, 250);
+pxSchedule();
+
+// ---- Libraries: the media folders nuarr manages --------------------------
+async function loadLibsTab(){
+  const el=document.getElementById('libBody');
+  if(!el) return;
+  if(!el.innerHTML) el.innerHTML='<div class="skel" style="padding:4px 0">'
+    +'<i style="width:52%"></i><i style="width:80%"></i><i style="width:66%"></i></div>';
+  let d;
+  try{ d=await (await fetch('/api/libraries/config')).json(); }
+  catch(e){ el.innerHTML=`<div class="err">could not load: ${esc(String(e))}</div>`; return; }
+  // WHAT NUARR ACTUALLY SEES IN EACH LIBRARY, from the arrs' metadata.
+  //
+  // The folder name is a guess and it was the only thing on this page. A
+  // library called "Animated Shows" holding 282 files that TheTVDB calls anime
+  // is the difference between dual audio and English-only, and nothing said
+  // so. Now the row shows the mix, and flags the ones where the metadata does
+  // not match what the name implies.
+  const KL={anime:'anime', animation:'animation', live:'live action'};
+  const kindLine=l=>{
+    const seen=l.seen||{}, tot=l.seen_total||0;
+    if(!tot) return '<div class="dim sub">no metadata yet — the arrs have not '
+                  + 'been read, or nothing here is tracked by them</div>';
+    const parts=['anime','animation','live'].filter(k=>seen[k])
+      .map(k=>`<span class="kchip k-${k}">${KL[k]} ${fmt(seen[k])}</span>`);
+    // ONLY PROMOTIONS ARE WORTH A NOTE, because only promotions change what
+    // happens. The first version counted every file whose metadata differed
+    // from the folder, which on Anime Shows read "427 of 22,685 not anime" -
+    // true of the metadata and false about the behaviour, since the folder
+    // keeps every one of them as anime. Saying that beside a library called
+    // Anime Shows would have sent somebody looking for a problem that does
+    // not exist.
+    const RANK={live:0, animation:1, anime:2};
+    const base=RANK[l.folder_kind]||0;
+    const up=Object.entries(seen)
+      .filter(([k,n])=>n && (RANK[k]||0)>base)
+      .sort((a,b)=>(RANK[b[0]]||0)-(RANK[a[0]]||0));
+    const upN=up.reduce((t,[,n])=>t+n,0);
+    return `<div class="kchips">${parts.join('')}</div>`
+         + (upN?`<div class="dim sub">${fmt(upN)} of ${fmt(tot)} treated as ${
+              up.map(([k,n])=>esc(KL[k])).join(' or ')} rather than ${
+              esc(KL[l.folder_kind]||l.folder_kind)}, because the metadata says
+              so and the folder name only sets a floor</div>`:'');
+  };
+  const rows=(d.libraries||[]).map(l=>`<tr>
+    <td><b>${esc(l.name)}</b>
+      <div class="dim sub mono">${esc(l.path)}</div>
+      ${kindLine(l)}
+      ${l.exists?'':'<div class="err sub">this folder does not exist — nothing here is being indexed</div>'}</td>
+    <td class="dim nb">${esc(l.kind==='movie'?'movies':'shows')}</td>
+    <td class="num nb">${fmt(l.files)}</td>
+    <td class="num dim nb">${gb(l.bytes||0)}</td>
+    <td class="nb"><span class="pill ${l.enabled?'p-ok':'p-dim'}" style="cursor:pointer"
+        title="click to turn scanning ${l.enabled?'off':'on'}"
+        onclick="libToggle('${b64e(l.name)}',${l.enabled?0:1})">${l.enabled?'scanned':'paused'}</span></td>
+    <td class="nb"><button onclick="libRemove('${b64e(l.name)}',${l.files})">Remove</button></td>
+  </tr>`).join('');
+  el.innerHTML=`
+    <table class="fixed vtop"><tr>
+      <th>Library</th><th class="nb" style="width:70px">Type</th>
+      <th class="num nb" style="width:80px">Files</th>
+      <th class="num nb" style="width:90px">Size</th>
+      <th class="nb" style="width:88px">Scanning</th>
+      <th class="nb" style="width:86px"></th></tr>${rows}</table>
+    <div class="lkind" style="margin-top:12px">
+      <div class="lkindhead">Add a library</div>
+      <div style="padding:10px 12px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <input id="libName" placeholder="name, e.g. Documentaries" style="width:210px">
+        <input id="libPath" placeholder="folder, e.g. ${esc(d.pool_root||'P:\\\\')}Documentaries" style="width:320px">
+        <button onclick="libPick()">Browse…</button>
+        <select id="libKind"><option value="tv">shows (season folders)</option>
+                             <option value="movie">movies</option></select>
+        <button onclick="libAdd()">Add</button>
+        <span id="libMsg" class="dim" style="font-size:11.5px"></span>
+      </div>
+      <div id="libPicker" style="display:none"></div>
+      <div class="dim" style="padding:0 12px 10px;font-size:11px">
+        The folder has to exist already — a library pointing at a path that is
+        not there scans clean and indexes nothing, which looks exactly like an
+        empty library.</div>
+    </div>
+    <div class="dim" style="margin-top:10px;font-size:11px;line-height:1.55">
+      <b>How nuarr decides what something is.</b> Genres and original language
+      come from Sonarr and Radarr, which get them from TheTVDB and TMDB, and
+      are re-read every 12 hours. That verdict is combined with the folder name
+      and <b>the higher of the two wins</b> — anime over animation over live
+      action. It is deliberately one-way: metadata can promote a misfiled
+      title, and can never demote one. Measured on this library, 127 files in
+      Anime Shows carry no animation genre at all upstream, so trusting the
+      metadata outright would have handed them the live-action policy and
+      dropped their Japanese audio.
+    </div>`;
+}
+// Folder picker. Browses the SERVER's disks through /api/fs/folders rather
+// than opening a native dialog: nuarr runs as a scheduled task, so an Explorer
+// window would open on a different desktop session - or on the console while
+// you are looking at a phone. This works from anywhere the page does.
+//
+// Paths are held in an array and referenced by INDEX. Building
+// onclick="libPickAt('C:\Users\...')" means escaping Windows backslashes
+// through an HTML attribute and then a JS string literal, and every folder
+// with an apostrophe in it becomes a syntax error.
+let _pickPath='', _pickItems=[], _pickParent='';
+// WHICH fields this picker is currently driving. The picker was written for
+// the library form and hard-coded its two element ids; the cache folder page
+// wants the identical browser over the identical server disks, and a second
+// copy would be two things to keep in step. These are set on open instead.
+let _pickBox='libPicker', _pickInput='libPath', _pickAfter=null;
+
+function pickOpen(boxId, inputId, after){
+  _pickBox=boxId; _pickInput=inputId; _pickAfter=after||null;
+  const box=document.getElementById(boxId);
+  if(!box) return null;
+  if(box.style.display!=='none'){ libPickClose(); return null; }
+  box.style.display='';
+  return (document.getElementById(inputId).value||'').trim();
+}
+
+async function libPick(){
+  const typed=pickOpen('libPicker','libPath',null);
+  if(typed===null) return;
+  await libPickAt(typed.replace(/[\\\/]+$/,''));
+}
+
+async function cachePick(){
+  const typed=pickOpen('cachePicker','cachePath', ()=>{
+    // Warn as soon as the folder is chosen rather than waiting for Save: the
+    // pool is the one wrong answer that still passes every write test.
+    const v=document.getElementById('cachePath').value;
+    const m=document.getElementById('cacheMsg');
+    if(m && /^[Pp]:/.test(v)){
+      m.style.color='#e2b341';
+      m.textContent='that is on the pool — encodes would read and write the same disks';
+    }
+  });
+  if(typed===null) return;
+  await libPickAt(typed.replace(/[\\\/]+$/,''));
+}
+async function libPickAt(path){
+  const box=document.getElementById(_pickBox);
+  if(!box) return;
+  box.innerHTML='<div class="dim" style="padding:8px 12px">reading…</div>';
+  let d;
+  try{
+    const res=await fetch('/api/fs/folders?path='+encodeURIComponent(path||''));
+    d=await res.json();
+    if(!res.ok) throw new Error(d.detail||'could not read that folder');
+  }catch(e){
+    // A typed path that does not exist should not strand the picker - offer
+    // the drive list rather than a dead end.
+    box.innerHTML=`<div class="pickbox"><div class="pickhead">
+      <span class="err">${esc(String(e.message||e))}</span>
+      <span style="margin-left:auto"><button onclick="libPickAt('')">start at the drives</button>
+      <button onclick="libPickClose()">Close</button></span></div></div>`;
+    return;
+  }
+  _pickPath=d.path||''; _pickParent=d.parent||''; _pickItems=d.folders||[];
+  const items=_pickItems.map((f,i)=>`
+    <div class="pickrow" onclick="libPickAt(_pickItems[${i}].path)">
+      <span>${esc(f.name)}</span>
+      ${f.total?`<span class="dim">${gb(f.free)} free of ${gb(f.total)}</span>`:''}
+    </div>`).join('');
+  box.innerHTML=`<div class="pickbox">
+    <div class="pickhead">
+      ${d.path?`<button onclick="libPickAt(_pickParent)">↑ up</button>`:''}
+      <span class="mono">${esc(d.path||'This PC')}</span>
+      <span style="margin-left:auto">
+        ${d.path?`<button onclick="libUse(_pickPath)">Use this folder</button>`:''}
+        <button onclick="libPickClose()">Close</button></span>
+    </div>
+    <div class="picklist">${items||'<div class="dim" style="padding:10px 12px">no sub-folders here</div>'}</div>
+  </div>`;
+}
+function libUse(p){
+  const inp=document.getElementById(_pickInput);
+  if(inp) inp.value=p;
+  if(_pickAfter){ const f=_pickAfter; libPickClose(); f(); return; }
+  // Offer the folder's own name as the library name when the field is empty -
+  // right often enough to save the typing, and wrong only in ways that are
+  // obvious before you press Add.
+  const n=document.getElementById('libName');
+  if(n && !n.value.trim()){
+    const parts=String(p).replace(/[\\\/]+$/,'').split(/[\\\/]/);
+    n.value=parts[parts.length-1]||'';
+  }
+  libPickClose();
+}
+function libPickClose(){
+  const box=document.getElementById(_pickBox);
+  if(box){ box.style.display='none'; box.innerHTML=''; }
+  _pickPath=''; _pickItems=[]; _pickParent='';
+}
+async function libAdd(){
+  const n=document.getElementById('libName').value.trim();
+  const p=document.getElementById('libPath').value.trim();
+  const k=document.getElementById('libKind').value;
+  const m=document.getElementById('libMsg');
+  if(!n||!p){ if(m) m.textContent='name and folder are both required'; return; }
+  if(m) m.innerHTML='<span class="busy"><span class="sp"></span><span class="step">adding…</span></span>';
+  try{
+    const res=await fetch('/api/libraries/config/add?name='+encodeURIComponent(n)
+      +'&path='+encodeURIComponent(p)+'&kind='+k,{method:'POST'});
+    const r=await res.json().catch(()=>({}));
+    if(!res.ok){ if(m) m.innerHTML=`<span class="err">${esc(r.detail||'could not add')}</span>`; return; }
+    if(m) m.textContent=r.note||'added';
+    document.getElementById('libName').value='';
+    document.getElementById('libPath').value='';
+  }catch(e){ if(m) m.textContent='add failed'; }
+  document.getElementById('libBody').innerHTML='';
+  loadLibsTab();
+}
+async function libToggle(n64,on){
+  await fetch('/api/libraries/config/toggle?name='+encodeURIComponent(b64d(n64))
+    +'&on='+on,{method:'POST'});
+  document.getElementById('libBody').innerHTML='';
+  loadLibsTab();
+}
+async function libRemove(n64,files){
+  const name=b64d(n64);
+  // Two decisions, asked separately, because they have different consequences
+  // and lumping them into one OK button would hide the second.
+  if(!confirm(`Remove "${name}" from nuarr?\n\nnuarr stops scanning and managing `
+    +`this folder. The media on disk is NOT touched.`)) return;
+  let purge=0;
+  if(files){
+    purge = confirm(`Also forget the ${files.toLocaleString()} file(s) nuarr has `
+      +`indexed for "${name}"?\n\nOK   — drop them from the index (recommended)\n`
+      +`Cancel — keep them, and they will start showing as MISSING because nothing `
+      +`scans that folder any more.`) ? 1 : 0;
+  }
+  const r=await (await fetch('/api/libraries/config/remove?name='
+    +encodeURIComponent(name)+'&purge='+purge,{method:'POST'})).json();
+  document.getElementById('libBody').innerHTML='';
+  loadLibsTab();
+  loadAll();
+}
+
+// ---- Languages: which tracks survive, per library ------------------------
+let _lang=null, _langDirty=false, _langLoading=false;
+async function loadLangTab(){
+  const el=document.getElementById('langBody');
+  if(!el) return;
+  if(!_lang){
+    // The first load fetches every stored probe to count the languages each
+    // library holds, which takes a moment on 39,000 files. Without this the
+    // pane sat empty and looked broken rather than busy.
+    if(_langLoading) return;
+    _langLoading=true;
+    el.innerHTML='<div class="skel" style="padding:4px 0">'
+      +'<i style="width:38%"></i><i style="width:88%"></i><i style="width:74%"></i>'
+      +'<i style="width:90%"></i><i style="width:52%"></i><i style="width:86%"></i>'
+      +'</div><div class="dim" style="font-size:11px;margin-top:6px">'
+      +'reading which languages each library actually contains…</div>';
+    try{ _lang=await (await fetch('/api/langpolicy')).json(); }
+    catch(e){ _langLoading=false;
+      el.innerHTML=`<div class="err">could not load: ${esc(String(e))}</div>`; return; }
+    _langLoading=false;
+  }
+  const iso=_lang.iso||[], pol=_lang.policy||{};
+  const name=c=>{ const h=iso.find(x=>x.c===c); return h?h.n:c; };
+
+  const block=(lib,side,sideLabel)=>{
+    const cfg=(pol[lib]||{})[side]||{};
+    const chosen=new Set(cfg.langs||[]);
+    // Counts are for THIS library, not the whole pool: a Japanese total driven
+    // by the anime shelf is noise when you are looking at Movies.
+    const here=Object.entries(((_lang.present||{})[lib]||{})[side]||{})
+      .sort((a,b)=>b[1]-a[1]).filter(([c])=>c!=='und').slice(0,12);
+    const chips=here.map(([c,n])=>`
+      <label class="lchip${chosen.has(c)?' on':''}">
+        <input type="checkbox" ${chosen.has(c)?'checked':''}
+               onchange="langToggle('${esc(lib)}','${side}','${c}',this.checked)">
+        ${esc(name(c))} <span class="dim">${fmt(n)}</span></label>`).join('');
+    const extra=[...chosen].filter(c=>!here.some(([cc])=>cc===c));
+    return `<div class="lblock">
+      <div class="lhead">${esc(sideLabel)}</div>
+      <label class="lorig">
+        <input type="checkbox" ${cfg.keep_original?'checked':''}
+               onchange="langToggle('${esc(lib)}','${side}','__orig__',this.checked)">
+        <b>Keep the original language</b>
+        <span class="dim">— whatever this title was made in, per TMDB/TheTVDB</span>
+      </label>
+      ${side==='subs'?`<label class="lorig">
+        <input type="checkbox" ${cfg.keep_untagged?'checked':''}
+               onchange="langToggle('${esc(lib)}','${side}','__untagged__',this.checked)">
+        Keep untagged tracks
+        <span class="dim">— many releases leave subs unlabelled</span></label>`:''}
+      <div class="lchips">${chips||'<span class="dim" style="font-size:11px">no '
+        +esc(sideLabel.toLowerCase())+' tracks scanned in this library yet</span>'}</div>
+      ${extra.length?`<div class="dim" style="font-size:11px;margin-top:5px">also kept:
+        ${extra.map(c=>`<span class="lchip on" onclick="langToggle('${esc(lib)}','${side}','${c}',false)"
+          title="click to remove">${esc(name(c))} ×</span>`).join(' ')}</div>`:''}
+      <div style="margin-top:6px">
+        <select onchange="if(this.value){langToggle('${esc(lib)}','${side}',this.value,true);this.value='';}">
+          <option value="">add another language…</option>
+          ${iso.map(x=>`<option value="${x.c}">${esc(x.n)} (${x.c})</option>`).join('')}
+        </select>
+      </div>
+    </div>`;
+  };
+
+  const libs=_lang.libraries||[];
+  el.innerHTML = (libs.length ? libs.map(L=>`
+    <div class="lkind">
+      <div class="lkindhead">${esc(L.name)}
+        <span class="dim">defaults for ${esc(L.kind_label.toLowerCase())}</span>
+        <span class="dim" style="margin-left:auto">${
+          fmt(Object.values(((_lang.present||{})[L.name]||{}).audio||{})
+              .reduce((a,b)=>a+b,0))} audio tracks scanned</span></div>
+      <div class="lcols">${block(L.name,'audio','Audio')}
+                         ${block(L.name,'subs','Subtitles')}</div>
+    </div>`).join('')
+    : '<div class="dim">no libraries configured</div>')
+    + `<div style="margin-top:12px;display:flex;align-items:center;gap:10px">
+        <button onclick="langSave()">Save policy</button>
+        <span id="langMsg" class="dim" style="font-size:11.5px">${
+          _langDirty?'unsaved changes':'the planner is using this now'}</span>
+       </div>
+       <div id="langImpact" style="margin-top:8px"></div>`;
+}
+// ---- Video / audio codec settings, per library ---------------------------
+// ONE RENDERER FOR BOTH TABS, and one that is GENERATED from the schema the
+// server sends rather than hand-written. There are 28 settings across the two
+// pages; writing them out by hand would be 28 chances to disagree with what
+// the planner actually reads, and every future setting would need adding in
+// two places. codecpolicy.FIELDS is the single description of what exists,
+// what its range is, and what it does.
+// What each arr says is wrong with itself. Indexers, download clients, root
+// folders, disk space - the arr's own business, shown beside the connection it
+// belongs to rather than under a heading about metadata providers.
+// Polls while the page is open so a warning that clears disappears on its own
+// rather than waiting for someone to reload. The server watcher is the thing
+// actually checking; this just follows it.
+let _arrHealthTimer=null;
+function arrHealthPoll(on){
+  if(_arrHealthTimer){ clearInterval(_arrHealthTimer); _arrHealthTimer=null; }
+  if(on) _arrHealthTimer=setInterval(()=>{
+    // Stop once the pane is gone, otherwise this outlives the page it feeds.
+    if(!document.getElementById('arrHealth')){ arrHealthPoll(false); return; }
+    loadArrHealth();
+  }, 30000);
+}
+
+async function loadArrHealth(force){
+  const el=document.getElementById('arrHealth');
+  if(!el) return;
+  let d;
+  try{ d=await (await fetch('/api/arrs/health'+(force?'?refresh=true':''))).json(); }
+  catch(e){ el.innerHTML=''; return; }
+  const rows=(d.arrs||[]);
+  if(!rows.length){ el.innerHTML=''; return; }
+  arrHealthPoll(true);
+  const age = d.age_s==null ? 'just now'
+            : d.age_s<60 ? `${d.age_s}s ago`
+            : `${Math.round(d.age_s/60)}m ago`;
+  el.innerHTML=`<div class="dim" style="font-size:11px;display:flex;
+      align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap">
+      <span>Checked every ${Math.round((d.poll_s||300)/60)} min · last ${esc(age)}
+        ${d.warnings?`· <b style="color:#e2b341">${d.warnings} open</b>`
+                    :'· <b style="color:#7fd4a3">all clear</b>'}</span>
+      <button onclick="loadArrHealth(true)" style="font-size:11px">Check now</button>
+      <span class="dim">Appearing and clearing are both logged — filter the
+        log by <b>Arr health</b>.</span>
+    </div>` + rows.map(a=>{
+    const bad=(a.health||[]).filter(h=>String(h.type||'').toLowerCase()!=='ok');
+    const head=`<b>${esc(a.arr)}</b>`
+      + (a.ok?`<span class="pill p-ok">reachable</span>`
+             :`<span class="pill p-bad">unreachable${a.error?' — '+esc(a.error):''}</span>`)
+      + (a.version?`<span class="dim mono" style="font-size:10.5px">v${esc(a.version)}</span>`:'')
+      + (bad.length?`<span class="pill p-warn">${bad.length} warning${bad.length===1?'':'s'}</span>`
+                   :(a.ok?`<span class="pill p-ok">healthy</span>`:''));
+    // Each warning on its own line, with the source named. "IndexerLongTerm
+    // StatusCheck" alone says nothing; "NZBFinder (Prowlarr)" is the thing to
+    // go and look at.
+    const list = bad.length
+      ? bad.map(h=>`<div class="${h.level==='error'?'err':'dim'}"
+           style="font-size:11px;margin-top:3px;line-height:1.45">
+           <b>${esc(h.source||h.type||'')}</b> — ${esc(h.message||'')}
+           ${h.url?` <a href="${esc(h.url)}" target="_blank"
+             rel="noopener noreferrer">why</a>`:''}</div>`).join('')
+      : (a.ok?'<div class="dim" style="font-size:11px;margin-top:3px">'
+              +'nothing to report</div>':'');
+    return `<div style="border:1px solid var(--line);border-radius:8px;
+              padding:9px 12px;margin-bottom:8px">
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">${head}</div>
+        ${list}</div>`;
+  }).join('');
+}
+
+// The original-language pull, on the Arrs page where it belongs. Reads
+// /api/origlang rather than /api/metadata: same numbers, and it does not drag
+// in a provider-health round trip this page has no use for.
+async function loadLangSync(){
+  const el=document.getElementById('arrLangSync');
+  if(!el) return;
+  try{
+    const n=await (await fetch('/api/origlang')).json();
+    const names=(window._arrNames||[]).join(' + ');
+    el.innerHTML=langSyncCard(n, names);
+  }catch(e){ el.innerHTML=''; }
+}
+
+// ---- Plex ------------------------------------------------------------
+let _plexCfg=null;
+
+async function loadPlexCfg(){
+  const el=document.getElementById('plexBody');
+  if(!el) return;
+  try{ _plexCfg=await (await fetch('/api/plex/config')).json(); }
+  catch(e){ el.innerHTML='<div class="dim" style="padding:14px">could not load</div>'; return; }
+  const c=_plexCfg, sv=c.server||{};
+  const state = c.ok ? (c.source==='plex'?'connected to Plex directly':'connected via Tautulli')
+                     : 'not connected';
+  const col = c.ok ? '#7fd4a3' : '#e0575b';
+  el.innerHTML=`
+    <div class="lkind" style="padding:11px 12px;margin-bottom:10px">
+      <div style="display:flex;justify-content:space-between;align-items:baseline;
+                  flex-wrap:wrap;gap:8px">
+        <b style="color:#6fb0ff">Connection</b>
+        <span style="color:${col};font-size:12px">${esc(state)}</span>
+      </div>
+      <div class="dim" style="font-size:11px;margin-top:5px">
+        ${esc(c.detail||'')}
+        ${sv.name?`<br>Server <b style="color:#c2ccd6">${esc(sv.name)}</b>
+           · Plex ${esc(sv.version||'?')} on ${esc(sv.platform||'?')}`:''}
+      </div>
+    </div>
+
+    <div class="lkind" style="padding:11px 12px;margin-bottom:10px">
+      <b style="color:#6fb0ff">Where nuarr reads sessions from</b>
+      <div class="dim" style="font-size:11px;margin-top:4px">
+        Plex answers <span class="mono">/status/sessions</span> locally in tens
+        of milliseconds. Tautulli's <span class="mono">get_activity</span> takes
+        about 2.4 s on this box, which is the entire reason the gate caches at
+        all &mdash; so direct is preferred unless you have a reason.
+      </div>
+      <label style="display:flex;align-items:center;gap:6px;margin-top:8px;font-size:12px">
+        <input type="checkbox" id="pxDirect" ${c.plex_direct?'checked':''}>
+        <span>Ask Plex directly <span class="dim">(falls back to Tautulli if it does not answer)</span></span>
+      </label>
+      <label style="display:flex;align-items:center;gap:6px;margin-top:5px;font-size:12px">
+        <input type="checkbox" id="pxCross" ${c.plex_cross_check?'checked':''}>
+        <span>Cross-check against Tautulli
+          <span class="dim">(diagnostic — asks both and logs any disagreement)</span></span>
+      </label>
+    </div>
+
+    <div class="lkind" style="padding:11px 12px;margin-bottom:10px">
+      <b style="color:#6fb0ff">Plex server</b>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;align-items:center">
+        <input id="pxUrl" value="${esc(c.plex_url||'')}" spellcheck="false"
+               placeholder="http://192.168.1.100:32400"
+               style="flex:1;min-width:250px;font-family:var(--mono,monospace);font-size:12px">
+        <input id="pxToken" type="password" spellcheck="false"
+               placeholder="${c.plex_token_set?'token saved — leave blank to keep':'X-Plex-Token'}"
+               style="flex:1;min-width:210px;font-family:var(--mono,monospace);font-size:12px">
+        <button onclick="plexDetect(this)"
+          title="Read the token this machine's Plex has already saved">Detect</button>
+      </div>
+      <div class="dim" style="font-size:11px;margin-top:5px">
+        <b>Detect</b> works when Plex runs on this machine — it reads the token
+        Plex has already saved locally. It is not a login: a token cannot be
+        derived from a URL, so for a Plex on another box you still have to
+        paste it. Find it via any library item &rarr; <b>Get Info</b> &rarr;
+        <b>View XML</b>, at the end of the address.
+        The token is stored server-side and never sent back to this page.
+      </div>
+      <div id="pxDetectMsg" class="dim" style="font-size:11px;margin-top:4px"></div>
+    </div>
+
+    <div class="lkind" style="padding:11px 12px">
+      <b style="color:#6fb0ff">Tautulli <span class="dim">(fallback)</span></b>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;align-items:center">
+        <input id="pxTUrl" value="${esc(c.tautulli_url||'')}" spellcheck="false"
+               placeholder="http://localhost:8181"
+               style="flex:1;min-width:250px;font-family:var(--mono,monospace);font-size:12px">
+        <input id="pxTKey" type="password" spellcheck="false"
+               placeholder="${c.tautulli_key_set?'key saved — leave blank to keep':'API key'}"
+               style="flex:1;min-width:210px;font-family:var(--mono,monospace);font-size:12px">
+      </div>
+      <div style="margin-top:9px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <button onclick="savePlexCfg(this)">Test and save</button>
+        <span id="pxMsg" class="dim" style="font-size:11.5px"></span>
+      </div>
+    </div>`;
+}
+
+async function plexDetect(btn){
+  const m=document.getElementById('pxDetectMsg');
+  const url=document.getElementById('pxUrl').value;
+  const old=btn.textContent; btn.disabled=true; btn.textContent='looking…';
+  try{
+    const r=await (await fetch('/api/plex/detect?url='+encodeURIComponent(url),
+                               {method:'POST'})).json();
+    if(r.ok){
+      document.getElementById('pxToken').value=r.token;
+      if(m){ m.style.color='#7fd4a3';
+        m.innerHTML=`found the saved token (from the ${esc(r.source)}) —
+          press <b>Test and save</b> to use it`; }
+    }else{
+      if(m){ m.style.color='#e2b341'; m.textContent=r.error||'could not detect'; }
+    }
+  }catch(e){ if(m){ m.style.color='#e2b341'; m.textContent='detect failed'; } }
+  btn.disabled=false; btn.textContent=old;
+}
+
+async function savePlexCfg(btn){
+  const m=document.getElementById('pxMsg');
+  btn.disabled=true;
+  if(m){ m.style.color=''; m.textContent='testing the connection…'; }
+  try{
+    const r=await (await fetch('/api/plex/config',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        plex_url:document.getElementById('pxUrl').value,
+        plex_token:document.getElementById('pxToken').value,
+        tautulli_url:document.getElementById('pxTUrl').value,
+        tautulli_api_key:document.getElementById('pxTKey').value,
+        plex_direct:document.getElementById('pxDirect').checked,
+        plex_cross_check:document.getElementById('pxCross').checked})})).json();
+    if(r.ok){
+      if(m){ m.style.color='#7fd4a3'; m.textContent='saved — the gate is using it now'; }
+      setTimeout(loadPlexCfg, 900);
+    }else{
+      if(m){ m.style.color='#e2b341'; m.textContent=r.error||'failed'; }
+    }
+  }catch(e){ if(m){ m.style.color='#e2b341'; m.textContent='failed'; } }
+  btn.disabled=false;
+}
+
+// ---- Whisper ---------------------------------------------------------
+let _whis=null;
+
+async function loadWhisper(){
+  const el=document.getElementById('whisperBody');
+  if(!el) return;
+  try{ _whis=await (await fetch('/api/whisper')).json(); }
+  catch(e){ el.innerHTML='<div class="dim" style="padding:14px">could not load</div>'; return; }
+  const w=_whis;
+  const yes=v=>v?'<span style="color:#7fd4a3">yes</span>'
+                :'<span style="color:#e2b341">no</span>';
+  const mc=w.model_cache||{};
+  // The headline is "can it run", not "is it installed" - a present package
+  // with a missing CUDA runtime is the failure that presents as a hang.
+  let head, colour;
+  if(!w.installed){ head='not installed — detection falls back to inference'; colour='#e2b341'; }
+  else if(w.cuda_devices && (!w.cublas_dll || !w.cudnn_dll)){
+    head='installed, but the CUDA runtime DLLs are missing'; colour='#e0575b'; }
+  else if(!w.cuda_devices){ head='installed, running on CPU'; colour='#e2b341'; }
+  else { head='installed and using the GPU'; colour='#7fd4a3'; }
+
+  el.innerHTML=`
+    <div class="lkind" style="padding:11px 12px;margin-bottom:10px">
+      <div style="display:flex;justify-content:space-between;align-items:baseline;
+                  flex-wrap:wrap;gap:8px">
+        <b style="color:#6fb0ff">Language identifier</b>
+        <span style="color:${colour};font-size:12px">${esc(head)}</span>
+      </div>
+      <div style="margin-top:7px;display:flex;gap:8px;flex-wrap:wrap">
+        <button onclick="whisCheck(this)">Check for update</button>
+        <span id="whisMsg" class="dim" style="align-self:center;font-size:11.5px"></span>
+      </div>
+    </div>
+
+    <div class="lkind"><div class="lkindhead"><b style="color:#6fb0ff">What is installed</b></div>
+      <table style="width:100%;font-size:12px;border-collapse:collapse">
+        ${row('faster-whisper', w.faster_whisper||'—', 'the language identifier itself')}
+        ${row('CTranslate2', w.ctranslate2||'—', 'the inference engine it runs on')}
+        ${row('cuBLAS', w.cublas||'—',
+              'CUDA maths library · DLL present: '+ (w.cublas_dll?'yes':'NO'))}
+        ${row('cuDNN', w.cudnn||'—',
+              'CUDA neural-network library · DLL present: '+ (w.cudnn_dll?'yes':'NO'))}
+        ${row('CUDA devices', String(w.cuda_devices),
+              w.cuda_error ? esc(w.cuda_error)
+                           : (w.cuda_devices? 'running on the GPU'
+                                            : 'no usable GPU — would run on CPU'))}
+      </table>
+    </div>
+
+    <div class="lkind" style="margin-top:10px">
+      <div class="lkindhead"><b style="color:#6fb0ff">Model</b></div>
+      <table style="width:100%;font-size:12px;border-collapse:collapse">
+        ${row('size', w.model, 'bigger models are slower and were not more accurate here')}
+        ${row('downloaded', mc.size_mb? (mc.size_mb>=1024?(mc.size_mb/1024).toFixed(1)+' GB'
+                                                         :mc.size_mb+' MB') : 'not yet',
+              !mc.path ? 'fetched on first use, into nuarr&rsquo;s own folder'
+              : mc.managed ? 'kept with nuarr&rsquo;s other managed files'
+              : '<span style="color:#e2b341">still in the old user cache — '
+                +'it moves the next time the model loads</span>')}
+        ${row('loaded now', w.loaded?'yes':'no',
+              'unloaded between passes so the VRAM goes back to the encoder')}
+        ${row('confidence floor', Math.round(w.min_prob*100)+'%',
+              'set per library on the Audio codec tab')}
+      </table>
+    </div>
+    ${w.last_error?`<div class="lkind" style="margin-top:10px;padding:11px 12px">
+       <b style="color:#e2b341">Last load error</b>
+       <div class="mono dim" style="font-size:11px;margin-top:4px">${esc(w.last_error)}</div>
+     </div>`:''}
+
+    <div class="lkind" style="margin-top:10px">
+      <div class="lkindhead"><b style="color:#6fb0ff">Where everything is</b>
+        <span class="dim">resolved live — for when detection stops working and
+          the log does not say why</span></div>
+      <table style="width:100%;font-size:12px;border-collapse:collapse">
+        ${(w.paths||[]).map(p=>`<tr style="border-top:1px solid var(--line)">
+          <td style="padding:5px 12px;white-space:nowrap">
+            <span style="color:${p.ok?'#7fd4a3':'#e0575b'}">${p.ok?'✓':'✗'}</span>
+            ${esc(p.what)}</td>
+          <td class="mono" style="font-size:11px;word-break:break-all">${esc(p.path)}</td>
+          <td class="dim" style="font-size:11px;padding-right:12px;white-space:nowrap"
+            >${esc(p.note||'')}</td></tr>`).join('')}
+      </table>
+    </div>
+
+    <div class="lkind" style="margin-top:10px">
+      <div class="lkindhead"><b style="color:#6fb0ff">Upstream</b>
+        <span class="dim">the projects that own each piece above</span></div>
+      <table style="width:100%;font-size:12px;border-collapse:collapse">
+        ${(w.sources||[]).map(s=>`<tr style="border-top:1px solid var(--line)">
+          <td style="padding:5px 12px;white-space:nowrap">${esc(s.name)}</td>
+          <td class="dim" style="font-size:11px">${esc(s.what)}</td>
+          <td style="padding-right:12px"><a href="${esc(s.url)}" target="_blank"
+            rel="noopener noreferrer" class="mono"
+            style="font-size:11px">${esc(s.url.replace(/^https:\/\//,''))}</a></td>
+          </tr>`).join('')}
+      </table>
+    </div>`;
+
+  function row(k,v,why){
+    return `<tr style="border-top:1px solid var(--line)">
+      <td style="padding:5px 12px;white-space:nowrap">${esc(k)}</td>
+      <td class="mono" style="white-space:nowrap">${esc(String(v))}</td>
+      <td class="dim" style="font-size:11px;padding-right:12px">${why}</td></tr>`;
+  }
+}
+
+async function whisCheck(btn){
+  const m=document.getElementById('whisMsg');
+  btn.disabled=true; const old=btn.textContent; btn.textContent='checking…';
+  try{
+    const r=await (await fetch('/api/whisper/check',{method:'POST'})).json();
+    if(m){
+      if(!r.ok){ m.style.color='#e2b341'; m.textContent=r.detail||'could not reach the package index'; }
+      else if(r.newer){
+        m.style.color='#e2b341';
+        m.innerHTML=`<b>${esc(r.latest)}</b> is available — you have
+          ${esc(r.installed)}. Install it with
+          <span class="mono">pip install -U faster-whisper</span>, then restart nuarr.`;
+      }else{
+        m.style.color='#7fd4a3';
+        m.textContent=`up to date — ${r.installed} is the newest release`;
+      }
+    }
+  }catch(e){ if(m){ m.style.color='#e2b341'; m.textContent='check failed'; } }
+  btn.disabled=false; btn.textContent=old;
+}
+
+// ---- Updates ---------------------------------------------------------
+// CURRENT, LATEST, PREVIOUS - and nothing that installs anything. Checking is
+// automatic, applying is a click, and the click is deliberately a link out to
+// the release rather than a button that swaps files under a running encode.
+// nuarr is usually mid-transcode or mid-commit; a self-update that replaced
+// app/ while ffmpeg held an output open would leave a half-written file in the
+// library, which is the exact outcome the whole system exists to prevent.
+let _upd=null;
+
+async function loadUpdates(force){
+  const el=document.getElementById('updBody');
+  if(!el) return;
+  el.innerHTML='<div class="dim" style="padding:14px">checking…</div>';
+  try{ _upd=await (await fetch('/api/updates'+(force?'?force=1':''))).json(); }
+  catch(e){ el.innerHTML='<div class="dim" style="padding:14px">could not load</div>'; return; }
+  const u=_upd;
+  const when = u.checked_at ? new Date(u.checked_at*1000).toLocaleString() : 'never';
+
+  // The banner answers one question and it differs by state, so it is built
+  // as a state machine rather than by stacking conditionals into one string.
+  let head, colour, note;
+  if(!u.configured){
+    head='Update checks are not set up'; colour='var(--dim)';
+    note='Point nuarr at a GitHub repository below and it will tell you when '
+        +'there is a newer release. Nothing is contacted until you do.';
+  } else if(!u.ok){
+    head='Could not check'; colour='#e0575b';
+    note=esc(u.error||'unknown error');
+  } else if(u.update_available){
+    head=`Version ${esc(u.latest)} is available`; colour='#e2b341';
+    note=`You are running ${esc(u.current)}.`
+        +(u.latest_at?` Released ${esc(u.latest_at)}.`:'');
+  } else if(u.latest){
+    head='Up to date'; colour='#7fd4a3';
+    note=`${esc(u.current)} is the newest release.`;
+  } else {
+    head='No releases published yet'; colour='var(--dim)';
+    note='The repository is reachable but has no tagged releases. nuarr only '
+        +'offers releases, not tags - a tag is a commit somebody labelled, a '
+        +'release is a statement that it is meant to be installed.';
+  }
+
+  const verRow=(label,val,url,extra)=> !val ? '' : `
+    <div style="display:flex;justify-content:space-between;gap:10px;
+                padding:6px 0;border-top:1px solid var(--line)">
+      <span class="dim" style="font-size:12px">${label}</span>
+      <span style="font-size:12px">${url?`<a href="${esc(url)}" target="_blank"
+        rel="noopener" style="color:#6fb0ff">${esc(val)}</a>`:`<b>${esc(val)}</b>`}
+        ${extra?`<span class="dim" style="margin-left:6px">${esc(extra)}</span>`:''}</span>
+    </div>`;
+
+  el.innerHTML=`
+    <div class="lkind" style="padding:11px 12px;margin-bottom:10px">
+      <div style="display:flex;justify-content:space-between;align-items:baseline;
+                  flex-wrap:wrap;gap:8px">
+        <b style="color:${colour}">${esc(head)}</b>
+        <span class="dim" style="font-size:11px">checked ${esc(when)}</span>
+      </div>
+      <div class="dim" style="font-size:12px;margin-top:5px">${note}</div>
+      <div style="margin-top:9px">
+        ${verRow('Current', u.current, '', u.build_date?('built '+u.build_date):'')}
+        ${verRow('Latest', u.latest, u.latest_url, u.latest_at)}
+        ${verRow('Previous', u.previous, u.previous_url, '')}
+      </div>
+      ${u.update_available&&u.latest_notes?`
+        <details style="margin-top:9px">
+          <summary style="cursor:pointer;font-size:12px;color:#6fb0ff">What changed</summary>
+          <pre style="white-space:pre-wrap;font-size:11.5px;margin:7px 0 0;
+                      color:var(--fg);max-height:220px;overflow:auto">${esc(u.latest_notes)}</pre>
+        </details>`:''}
+      ${u.update_available?`
+        <div class="dim" style="font-size:11px;margin-top:9px;padding-top:8px;
+                                border-top:1px solid var(--line)">
+          nuarr does not update itself. Download the release, stop nuarr, and
+          run its installer - it keeps your database, so the library picks up
+          where it left off.
+        </div>`:''}
+    </div>
+
+    <div class="lkind" style="padding:11px 12px">
+      <b style="color:#6fb0ff">Where to check</b>
+      <div class="dim" style="font-size:11.5px;margin:4px 0 8px">
+        A GitHub repository as <span class="mono">owner/name</span>. Pasting the
+        full address works too. Leave it empty and nuarr never contacts GitHub.
+      </div>
+      <div style="display:flex;gap:7px;flex-wrap:wrap">
+        <input id="updRepo" class="inp mono" style="flex:1 1 260px"
+               placeholder="owner/name" value="${esc(u.repo||'')}">
+        <button class="btn" onclick="saveUpdRepo()">Save</button>
+        <button class="btn" onclick="loadUpdates(1)"${u.configured?'':' disabled'}>Check now</button>
+      </div>
+      <div id="updMsg" class="dim" style="font-size:11.5px;margin-top:7px"></div>
+    </div>`;
+}
+
+async function saveUpdRepo(){
+  const inp=document.getElementById('updRepo');
+  const msg=document.getElementById('updMsg');
+  if(!inp) return;
+  msg.textContent='saving…';
+  try{
+    const r=await fetch('/api/updates/repo?repo='+encodeURIComponent(inp.value.trim()),
+                        {method:'POST'});
+    if(!r.ok){
+      const e=await r.json().catch(()=>({detail:'failed'}));
+      msg.textContent=e.detail||'failed'; msg.style.color='#e0575b'; return;
+    }
+    msg.style.color=''; await loadUpdates(0); loadVersion();
+  }catch(e){ msg.textContent='could not save'; msg.style.color='#e0575b'; }
+}
+
+// ---- Cache folder ----------------------------------------------------
+let _cache=null;
+
+async function loadCacheCfg(){
+  const el=document.getElementById('cacheBody');
+  if(!el) return;
+  try{ _cache=await (await fetch('/api/cache/config')).json(); }
+  catch(e){ el.innerHTML='<div class="dim" style="padding:14px">could not load</div>'; return; }
+  const c=_cache;
+  const gb=n=> n===null||n===undefined ? '—' : (n>=1024?(n/1024).toFixed(1)+' TB':n+' GB');
+  // State first, in one line, because "is this folder actually usable" is the
+  // only question this page exists to answer.
+  let state, colour;
+  if(!c.exists){ state='that folder does not exist yet'; colour='#e2b341'; }
+  else if(!c.writable){ state='exists but is not writable'; colour='#e0575b'; }
+  else if(c.on_pool){ state='writable, but it is on the pool'; colour='#e2b341'; }
+  else if(c.free_gb!==null && c.free_gb < c.min_free_gb){
+    state=`writable, but only ${gb(c.free_gb)} free — under the ${gb(c.min_free_gb)} floor`;
+    colour='#e2b341'; }
+  else { state='writable, with room'; colour='#7fd4a3'; }
+
+  el.innerHTML=`
+    <div class="lkind" style="padding:11px 12px;margin-bottom:10px">
+      <div style="display:flex;justify-content:space-between;align-items:baseline;
+                  flex-wrap:wrap;gap:8px">
+        <b style="color:#6fb0ff">Current cache folder</b>
+        <span style="color:${colour};font-size:12px">${esc(state)}</span>
+      </div>
+      <div class="mono" style="margin-top:5px;font-size:12px">${esc(c.path)}</div>
+      <div class="dim" style="font-size:11px;margin-top:4px">
+        ${gb(c.free_gb)} free of ${gb(c.total_gb)}
+        &nbsp;·&nbsp; jobs stop when free space falls below
+        <b>${gb(c.min_free_gb)}</b>
+      </div>
+      ${c.note?`<div style="color:#e2b341;font-size:11px;margin-top:5px">${esc(c.note)}</div>`:''}
+    </div>
+
+    <div class="lkind" style="padding:11px 12px">
+      <b style="color:#6fb0ff">Change it</b>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px">
+        <input id="cachePath" value="${esc(c.path)}" spellcheck="false"
+               style="flex:1;min-width:300px;font-family:var(--mono, monospace);font-size:12px">
+        <button onclick="cachePick()">Browse…</button>
+        <label class="dim" style="font-size:11.5px">keep free
+          <input id="cacheFree" type="number" min="1" max="4000"
+                 value="${c.min_free_gb}" style="width:74px"> GB</label>
+        <button onclick="saveCacheCfg(this)">Save</button>
+      </div>
+      <div id="cachePicker" style="display:none;margin-top:8px"></div>
+      <div class="dim" style="font-size:11px;margin-top:6px">
+        The folder is created and write-tested before anything is saved. A bad
+        cache path does not fail loudly &mdash; it fails hours later when a
+        finished encode has nowhere to land.
+      </div>
+      <div id="cacheMsg" style="font-size:12px;margin-top:7px"></div>
+    </div>`;
+}
+
+async function saveCacheCfg(btn){
+  const path=document.getElementById('cachePath').value;
+  const free=document.getElementById('cacheFree').value;
+  const msg=document.getElementById('cacheMsg');
+  btn.disabled=true;
+  if(msg){ msg.style.color=''; msg.textContent='checking the folder…'; }
+  try{
+    const r=await (await fetch('/api/cache/config',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({path:path, min_free_gb:Number(free)})})).json();
+    if(r.ok){
+      if(msg){ msg.style.color='#7fd4a3'; msg.textContent='saved — new jobs will use it'; }
+      setTimeout(loadCacheCfg, 800);
+    }else{
+      if(msg){ msg.style.color='#e2b341'; msg.textContent=r.error||'failed'; }
+    }
+  }catch(e){ if(msg){ msg.style.color='#e2b341'; msg.textContent='failed'; } }
+  btn.disabled=false;
+}
+
+// ---- Audio language --------------------------------------------------
+// Three questions, in the order someone actually asks them: how much of the
+// library has been checked, where the files and the audio DISAGREE, and what
+// nuarr refused to answer. The refusals are on the page on purpose - a
+// detector that only shows its successes is asking to be trusted blindly.
+let _al=null, _alTab='sum';
+
+async function loadAlang(force){
+  const el=document.getElementById('alangBody');
+  if(!el) return;
+  // A background refresh must not yank the table out from under a reader.
+  // An explicit action (a Save, a tab click) passes force.
+  if(!force && alHeld()) return;
+  if(!_al) el.innerHTML='<div class="dim" style="padding:14px">listening&hellip;</div>';
+  try{ _al = await (await fetch('/api/audiolang')).json(); }
+  catch(e){ el.innerHTML='<div class="dim" style="padding:14px">could not load</div>'; return; }
+  // Anchor the server's clock to this moment so the counters can tick locally
+  // without drifting against it.
+  _alFetchedAt = Date.now();
+  if(_al.schedule) _al.schedule.__base = _al.server_now || 0;
+  renderAlang();
+}
+function alTab(t){ _alTab=t; renderAlang(); }
+
+function alBar(parts){
+  // One bar, segments sized by share. Reads faster than three numbers.
+  const tot=parts.reduce((a,p)=>a+p.n,0)||1;
+  return `<div style="display:flex;height:9px;border-radius:5px;overflow:hidden;
+           background:#161a20;margin:7px 0 4px">`+
+    parts.map(p=>`<i title="${esc(p.label)}: ${p.n}" style="width:${p.n*100/tot}%;
+        background:${p.c};display:block"></i>`).join('')+`</div>`;
+}
+
+function renderAlang(){
+  const el=document.getElementById('alangBody'); if(!el||!_al) return;
+  const t=_al.totals;
+  // Never round UP to 100%: with 10 tracks still blank out of 55,886 the
+  // honest figure is "99.9%", and printing 100.0% next to a non-zero backlog
+  // reads as a contradiction.
+  const pct=(n,d)=>{
+    if(!d) return '0%';
+    const v=n*100/d;
+    return (n<d && v>99.9 ? '99.9' : v.toFixed(1))+'%';
+  };
+  const TABS=[['sum','Coverage'],
+              ['wait','Waiting ('+(_al.waiting_total||0)+')'],
+              ['odd','Disagreements ('+(_al.contradictions||[]).length+')'],
+              ['open','Unresolved ('+(_al.open||[]).length+')'],
+              ['all','Everything checked']];
+  let h='';
+
+  if(!_al.available){
+    h+=`<div class="lkind" style="padding:10px 12px;margin-bottom:10px">
+        <b style="color:#e2b341">Detection is not installed.</b>
+        <div class="dim" style="font-size:11px;margin-top:4px">
+        The language identifier (faster-whisper) is missing, so nuarr can only
+        fall back to inference &mdash; which cannot tell a raw from a dub.</div></div>`;
+  }
+
+  h+=`<div style="display:flex;gap:7px;margin:10px 0 12px;flex-wrap:wrap">`+
+     TABS.map(([k,l])=>`<button class="tab${_alTab===k?' on':''}"
+        onclick="alTab('${k}')">${esc(l)}</button>`).join('')+`</div>`;
+
+  if(_alTab==='sum'){
+    h+=`<div class="lkind" style="padding:11px 12px;margin-bottom:10px">
+      <div style="display:flex;justify-content:space-between;align-items:baseline">
+        <b style="color:#6fb0ff">Every audio track in the library</b>
+        <span class="mono dim" style="font-size:11px">${t.tracks} tracks</span></div>`;
+    h+=alBar([{n:t.tagged,c:'#2f6f4f',label:'named'},
+              {n:t.untagged,c:'#8a5a2b',label:'still blank'}]);
+    h+=`<div class="dim" style="font-size:11px">
+        <b style="color:#7fd4a3">${t.tagged}</b> named (${pct(t.tagged,t.tracks)})
+        &nbsp;·&nbsp; <b style="color:#e2b341">${t.untagged}</b> still blank
+        &nbsp;·&nbsp; a blank tag is read as English by Sonarr, Radarr and
+        every player, so these are not neutral &mdash; they are wrong by
+        default.</div></div>`;
+
+    h+=`<div class="lkind" style="padding:11px 12px;margin-bottom:10px">
+      <div><b style="color:#6fb0ff">What nuarr listened to</b></div>
+      <div class="dim" style="font-size:11px;margin-top:5px">
+        <b style="color:#7fd4a3">${t.heard}</b> tracks answered confidently
+        &nbsp;·&nbsp; <b style="color:#e2b341">${t.refused}</b> refused
+        &nbsp;·&nbsp; ${t.checked} checked in total
+        ${_al.waiting_total?`&nbsp;·&nbsp; <b style="color:#e2b341">`
+          +`${_al.waiting_total}</b> waiting`:''}<br>
+        Model <span class="mono">${esc(_al.model)}</span>, confidence floor
+        <span class="mono">${(_al.min_prob*100).toFixed(0)}%</span>.
+        A window scoring below the floor is discarded before the vote &mdash;
+        it is the model saying it cannot tell, which is not a dissenting
+        opinion. Correct calls on this library land at 94&ndash;100%.
+        ${t.stale? `<br><b style="color:#e2b341">${t.stale}</b> verdict(s)
+        ignored as out of date &mdash; the file was rewritten since, and a
+        remux renumbers tracks, so an old result would describe the wrong
+        one.` : ''}
+      </div></div>`;
+
+    h+=`<div class="lkind" style="padding:11px 12px;margin-bottom:10px">
+      <div style="display:flex;justify-content:space-between;align-items:center;
+                  gap:12px;flex-wrap:wrap">
+        <b style="color:#6fb0ff">When this runs</b>
+        <button id="alRunBtn" onclick="alRun(this)">Listen to anything outstanding</button>
+      </div>
+      <div class="dim" style="font-size:11px;margin-top:5px">
+        Automatically, every 30 minutes, on anything that has arrived with a
+        blank audio tag &mdash; and only on those, because re-listening to a
+        track that already has an answer would burn the GPU for nothing.
+        It runs on a timer rather than during import on purpose: detection
+        wants the GPU and so does NVENC, and putting a CUDA call in front of
+        every import would slow the encoder at exactly its busiest moment.
+        Nothing is waiting on the result, so a late answer costs nothing.
+      </div>
+      <div id="alSched" class="dim" style="margin-top:7px;font-size:11.5px"></div>
+      <div id="alProg" style="margin-top:8px;font-size:12px">
+        ${alProgressHtml(_al.progress)}</div>
+    </div>`;
+    setTimeout(alSchedTick, 30);
+    if(_al.progress && _al.progress.state!=='idle' && _al.progress.state!=='error')
+      setTimeout(alStartPoll, 50);
+
+    h+=`<div class="lkind"><div class="lkindhead"><b style="color:#6fb0ff">By library</b></div>
+        <table style="width:100%;font-size:12px;border-collapse:collapse">
+        <tr class="dim" style="font-size:11px"><td style="padding:4px 12px">library</td>
+        <td>tracks</td><td>blank</td><td>heard</td><td>refused</td></tr>`;
+    for(const b of _al.by_library){
+      h+=`<tr><td style="padding:4px 12px"><b style="color:#6fb0ff">${esc(b.library)}</b></td>
+          <td class="mono">${b.tracks}</td>
+          <td class="mono" style="color:${b.untagged?'#e2b341':'#7f8a96'}">${b.untagged}</td>
+          <td class="mono" style="color:#7fd4a3">${b.heard}</td>
+          <td class="mono dim">${b.refused}</td></tr>`;
+    }
+    h+=`</table></div>`;
+
+    const L=_al.languages||{};
+    h+=`<div class="lkind" style="margin-top:10px"><div class="lkindhead">
+        <b style="color:#6fb0ff">Languages now named on disk</b></div>
+        <div class="lchips" style="padding:9px 12px">`;
+    for(const k of Object.keys(L).slice(0,24))
+      h+=`<span class="lchip on"><span class="mono">${esc(k)}</span>
+           <span class="dim" style="margin-left:5px">${L[k]}</span></span>`;
+    h+=`</div></div>`;
+  }
+
+  if(_alTab==='wait'){
+    const rows=_al.waiting||[], tot=_al.waiting_total||0;
+    h+=`<div class="dim" style="font-size:11px;margin-bottom:9px">
+        Arrived with a blank audio tag and not listened to yet. The check runs
+        every 30 minutes and only looks at these &mdash; re-listening to a
+        track that already has an answer would burn the GPU for nothing.
+        ${tot>rows.length?`<br>Showing the first ${rows.length} of
+          <b>${tot}</b>.`:''}</div>`;
+    if(!tot){
+      h+=`<div class="dim" style="padding:12px">Nothing waiting — every audio
+          track in the library has a language tag.</div>`;
+    }else{
+      // Grouped by show. Twelve episodes of one series that just imported is
+      // one fact; twelve separate rows is twelve things to read.
+      const by=new Map();
+      for(const r of rows){
+        const k=(r.title||'').replace(/ - S\d+E\d+.*$/,'') || r.library;
+        const g=by.get(k)||{lib:r.library,n:0,eps:[]};
+        g.n++; if(g.eps.length<6) g.eps.push(r.title||'');
+        by.set(k,g);
+      }
+      h+=`<div class="alscroll" onscroll="alHold()">
+        <table style="width:100%;font-size:12px;border-collapse:collapse">
+        <tr class="dim alhead" style="font-size:11px;text-align:left">
+          <td style="padding:5px 6px">title</td><td>library</td>
+          <td>tracks waiting</td><td>which</td></tr>`;
+      for(const [k,g] of [...by.entries()].sort((a,b)=>b[1].n-a[1].n)){
+        h+=`<tr style="border-top:1px solid var(--line);vertical-align:top">
+          <td style="padding:6px"><b style="color:#6fb0ff">${esc(k)}</b></td>
+          <td class="dim">${esc(g.lib||'')}</td>
+          <td class="mono">${g.n}</td>
+          <td class="dim" style="font-size:11px">
+            ${g.eps.map(e=>esc(e)).join('<br>')}
+            ${g.n>g.eps.length?`<br><span class="dim">…and ${g.n-g.eps.length} more</span>`:''}
+          </td></tr>`;
+      }
+      h+=`</table></div>`;
+    }
+  }
+
+  if(_alTab==='odd'){
+    const rows=_al.contradictions||[];
+    h+=`<div class="dim" style="font-size:11px;margin-bottom:9px">
+        The file states one language; the audio is demonstrably another.
+        <b>nuarr does not touch these automatically</b> &mdash; never
+        overwriting a stated tag is the only thing keeping it from
+        re-labelling every English dub in the library. Correcting one is a
+        deliberate act, so it is a button, not a rule.</div>`;
+    if(!rows.length) h+=`<div class="dim" style="padding:12px">Nothing disagrees.</div>`;
+    else{
+      h+=`<table style="width:100%;font-size:12px;border-collapse:collapse">
+          <tr class="dim" style="font-size:11px"><td style="padding:4px 6px">file</td>
+          <td>track</td><td>says</td><td>heard</td><td>sure</td><td></td></tr>`;
+      for(const r of rows){
+        h+=`<tr style="border-top:1px solid var(--line)">
+          <td style="padding:5px 6px">${esc((r.title||r.path.split('\\\\').pop()).slice(0,66))}
+            <div class="dim" style="font-size:10px">${esc(r.library)}</div></td>
+          <td class="mono dim">a:${r.track}${r.n_audio>1?'/'+r.n_audio:''}</td>
+          <td class="mono" style="color:#e2b341">${esc(r.says_name)}</td>
+          <td class="mono" style="color:#7fd4a3">${esc(r.heard_name)}</td>
+          <td class="mono dim">${(r.confidence*100).toFixed(0)}%</td>
+          <td style="text-align:right;padding-right:6px">
+            <button onclick="alFix(${r.file_id||0},${r.track},'${esc(r.heard)}',this)"
+              title="Overwrite the stated tag with what was heard">correct</button></td></tr>`;
+      }
+      h+=`</table>`;
+    }
+  }
+
+  if(_alTab==='open'){
+    const rows=_al.open||[];
+    h+=`<div class="dim" style="font-size:11px;margin-bottom:9px">
+        Still blank, and nuarr would not guess. Each one says why. These are
+        left alone on purpose: a wrong tag is worse than a missing one,
+        because a missing one at least looks unfinished.
+        <b>If you know what it is, set it</b> &mdash; a person who can listen
+        to the file settles in one click what no amount of tuning will.</div>`;
+    if(!rows.length) h+=`<div class="dim" style="padding:12px">Nothing outstanding.</div>`;
+    else h+=alRows(rows, true);
+  }
+
+  if(_alTab==='all') h+=alRows((_al.rows||[]).slice(0,400));
+
+  el.innerHTML=h;
+}
+
+// Whisper answers in ISO 639-1; nobody reads "ja" faster than "Japanese".
+const AL_NAME={en:'English',ja:'Japanese',zh:'Chinese',ko:'Korean',es:'Spanish',
+  pt:'Portuguese',fr:'French',de:'German',it:'Italian',ru:'Russian',nl:'Dutch',
+  sv:'Swedish',no:'Norwegian',nn:'Norwegian',da:'Danish',fi:'Finnish',pl:'Polish',
+  tr:'Turkish',ar:'Arabic',hi:'Hindi',th:'Thai',vi:'Vietnamese',id:'Indonesian',
+  he:'Hebrew',cs:'Czech',hu:'Hungarian',el:'Greek',uk:'Ukrainian',ro:'Romanian',
+  ca:'Catalan',tl:'Tagalog',ta:'Tamil',te:'Telugu',kn:'Kannada',ml:'Malayalam',
+  mr:'Marathi',bn:'Bengali'};
+const alName=c=>AL_NAME[c]||c;
+
+// "3 samples: 2 say Japanese, 1 says Chinese" beats restating the raw string.
+function alWhyPlain(r){
+  const floor=_al.min_prob||0.6;
+  const votes=r.votes||[];
+  if(!votes.length) return r.why||'nothing to listen to';
+  const strong=votes.filter(v=>v[1]>=floor);
+  if(!strong.length)
+    return `every sample was too unsure to count (best ${Math.round(
+      Math.max(...votes.map(v=>v[1]))*100)}%, needs ${Math.round(floor*100)}%)`;
+  const tally={};
+  for(const v of strong) tally[v[0]]=(tally[v[0]]||0)+1;
+  const langs=Object.keys(tally);
+  if(langs.length>1){
+    const bits=langs.sort((a,b)=>tally[b]-tally[a])
+      .map(l=>`${tally[l]} say${tally[l]===1?'s':''} ${alName(l)}`);
+    return `samples do not agree — ${bits.join(', ')}. Too close to call, so
+            nothing was written.`;
+  }
+  return `${strong.length} sample${strong.length===1?'':'s'} agreed on
+          ${alName(langs[0])}`;
+}
+
+// Default: most recently checked first, so a pass you just ran is at the top
+// rather than buried alphabetically among 500 files.
+let _alSort='checked', _alDir=-1;
+
+function alSortBy(k){
+  if(_alSort===k) _alDir=-_alDir; else { _alSort=k; _alDir=(k==='checked')?-1:1; }
+  renderAlang();
+}
+
+function alSorted(rows){
+  const key=r=>{
+    switch(_alSort){
+      case 'title':   return (r.title||'').toLowerCase();
+      case 'library': return (r.library||'')+(r.title||'');
+      case 'tag':     return r.blank?'':(r.tag||'');
+      case 'heard':   return r.ok?(r.heard_name||''):'';
+      case 'conf':    return r.ok?(r.confidence||0):-1;
+      default:        return r.checked_at||0;
+    }
+  };
+  // Stable within equal keys - a re-sort should not shuffle rows that tie.
+  return rows.map((r,i)=>[r,i]).sort((a,b)=>{
+    const x=key(a[0]), y=key(b[0]);
+    if(x<y) return -_alDir;
+    if(x>y) return _alDir;
+    return a[1]-b[1];
+  }).map(p=>p[0]);
+}
+
+function alRows(rows, editable){
+  const floor=_al.min_prob||0.6;
+  const th=(k,label,extra)=>`<td ${extra||''} onclick="alSortBy('${k}')"
+      style="cursor:pointer;user-select:none;padding:5px 6px;white-space:nowrap"
+      title="Sort by ${esc(label)}">${esc(label)}${
+      _alSort===k?`<span style="color:#6fb0ff"> ${_alDir<0?'▾':'▴'}</span>`:''}</td>`;
+  rows=alSorted(rows);
+  // STICKY HEADER inside a scroll box. The table used to run off the bottom of
+  // the page at 500 rows, taking the column names with it.
+  let h=`<div class="alscroll" onscroll="alHold()">
+    <table style="width:100%;font-size:12px;border-collapse:collapse">
+    <tr class="dim alhead" style="font-size:11px;text-align:left">
+      ${th('title','episode')}
+      ${th('track','which track')}
+      ${th('tag','tag on it now')}
+      <td style="padding:5px 6px">what each 30s sample heard</td>
+      ${th('heard','result')}
+      <td style="padding:5px 6px">why</td>
+      ${editable?'<td style="text-align:right;padding-right:6px">set the language</td>':''}
+    </tr>`;
+  for(const r of rows){
+    // Each sample on its own line with a full language name and a plain
+    // verdict. The struck-through ones are not "wrong", they are BELOW THE
+    // FLOOR - the model saying it cannot tell - so they never got a vote.
+    const vs=(r.votes||[]).map((v,i)=>{
+      const weak = v[1] < floor;
+      return `<div class="mono" style="font-size:11px;color:${weak?'#7f8a96':'#c2ccd6'}">
+        <span class="dim">${i+1}.</span>
+        <span style="${weak?'text-decoration:line-through':''}">${esc(alName(v[0]))}
+          ${(v[1]*100).toFixed(0)}%</span>
+        ${weak?'<span class="dim"> ignored, under '+Math.round(floor*100)+'%</span>':''}
+      </div>`;
+    }).join('');
+    // THE HONEST SUMMARY. Averaging the per-window probabilities keeps the
+    // near-misses that a vote count hides: three windows at ja 0.55 / zh 0.44
+    // read as "3 of 3 chose Japanese" when counted, and as a genuinely
+    // uncertain 55/44 when averaged.
+    const ov=(r.overall||[]).filter(x=>x[1]>=0.02).slice(0,4);
+    const ovHtml = ov.length ? `<div style="margin-top:4px;font-size:11px">
+        <span class="dim">overall:</span> `
+      + ov.map((x,i)=>`<span style="color:${i===0?'#7fd4a3':'#9aa6b2'}">
+          ${esc(alName(x[0]))} <b>${Math.round(x[1]*100)}%</b></span>`).join(
+          '<span class="dim"> · </span>')
+      + `</div>` : '';
+    const trackNo = r.track+1;
+    const desc = [r.codec, r.channels?r.channels+'ch':'', r.track_title]
+                   .filter(Boolean).join(' · ');
+    h+=`<tr style="border-top:1px solid var(--line);vertical-align:top">
+      <td style="padding:7px 6px">${esc((r.title||r.path.split('\\\\').pop()).slice(0,58))}
+        <div class="dim" style="font-size:10px">${esc(r.library)}</div></td>
+      <td style="white-space:nowrap">
+        <b>track ${trackNo}</b><span class="dim"> of ${r.n_audio}</span>
+        <div class="dim mono" style="font-size:10px">${esc(desc||'audio')}</div></td>
+      <td style="white-space:nowrap">
+        ${r.blank
+          ? `<b style="color:#e2b341">none</b>
+             <div class="dim" style="font-size:10px">players call this English</div>`
+          : `<span class="mono">${esc(r.tag)}</span>`}</td>
+      <td id="ev_${r.file_id}_${r.track}">${vs||'<span class="dim">&mdash;</span>'}${ovHtml}</td>
+      <td style="white-space:nowrap">${r.ok
+          ? `<b style="color:#7fd4a3">${esc(r.heard_name)}</b>
+             <div class="dim" style="font-size:10px">${Math.round(r.confidence*100)}% sure</div>`
+          : `<span class="dim">no answer</span>`}</td>
+      <td class="dim" style="font-size:11px;max-width:290px">${esc(alWhyPlain(r))}</td>`;
+    if(editable){
+      // Pre-select whichever language the windows leaned towards. It is the
+      // most likely answer and it saves hunting the list, but it is NOT
+      // applied until Save is pressed - the point of this row is that a
+      // person decides.
+      // Lean on the MOST COMMON confident answer, not merely the single
+      // highest score: two samples at 96% saying Japanese beat one at 99%
+      // saying Chinese, and picking by peak alone would preselect the outlier.
+      const strongV=(r.votes||[]).filter(v=>v[1]>=floor);
+      const cnt={};
+      for(const v of strongV) cnt[v[0]]=(cnt[v[0]]||0)+1;
+      const lean=Object.keys(cnt).sort((a,b)=>
+        cnt[b]-cnt[a] ||
+        Math.max(...strongV.filter(v=>v[0]===b).map(v=>v[1])) -
+        Math.max(...strongV.filter(v=>v[0]===a).map(v=>v[1])))[0];
+      const guess=lean?({en:'eng',ja:'jpn',zh:'chi',ko:'kor',es:'spa',pt:'por',
+                         fr:'fre',de:'ger',it:'ita',ru:'rus',nl:'dut',sv:'swe',
+                         pl:'pol',th:'tha',hi:'hin',tr:'tur',vi:'vie'}[lean]||''):'';
+      const id=`al_${r.file_id}_${r.track}`;
+      h+=`<td style="text-align:right;white-space:nowrap;padding:7px 6px">
+        <select id="${id}" style="font-size:11px">
+          <option value="">choose&hellip;</option>
+          ${(_al.choices||[]).map(c=>`<option value="${esc(c.code)}"
+             ${c.code===guess?'selected':''}>${esc(c.name)}</option>`).join('')}
+        </select>
+        <button onclick="alCheck(${r.file_id},${r.track},'${id}',this)"
+          title="Listen again, harder, and say whether the file agrees">Check</button>
+        <button onclick="alSet(${r.file_id},${r.track},'${id}',this)">Save</button>
+        <div class="dim" style="font-size:10px;margin-top:3px">
+          writes <b>track ${r.track+1}</b> only &middot; header edit, no re-encode</div>
+        <div id="${id}_msg" class="dim" style="font-size:11px;margin-top:2px"></div>
+      </td>`;
+    }
+    h+=`</tr>`;
+  }
+  return h+`</table></div>`;
+}
+
+// PAUSE THE REFRESH WHILE YOU ARE READING. Same rule as the log panel: a list
+// that reorders under the cursor is worse than one that is briefly out of
+// date, and this one reorders whenever a pass finishes.
+let _alHoldUntil=0;
+function alHold(){ _alHoldUntil=Date.now()+15000; }
+function alHeld(){ return Date.now()<_alHoldUntil; }
+
+// Remembers the last Check result per row, so Save can warn without
+// re-listening and without silently ignoring what was just measured.
+const _alChecked={};
+
+async function alCheck(fileId, track, selId, btn){
+  const sel=document.getElementById(selId);
+  const msg=document.getElementById(selId+'_msg');
+  const code=sel && sel.value;
+  if(!code){ if(msg){ msg.style.color='#e2b341';
+    msg.textContent='pick a language to check against'; } return; }
+  const old=btn.textContent; btn.disabled=true; btn.textContent='listening…';
+  if(msg){ msg.style.color=''; msg.textContent='taking 5 longer samples…'; }
+  try{
+    const r=await (await fetch(
+      `/api/audiolang/confirm?file_id=${fileId}&track=${track}&code=${encodeURIComponent(code)}`,
+      {method:'POST'})).json();
+    if(!r.ok){ if(msg){ msg.style.color='#e2b341'; msg.textContent=r.error||'failed'; }
+      btn.disabled=false; btn.textContent=old; return; }
+    _alChecked[`${fileId}_${track}`]=r;
+    // Replace the routine evidence with the deeper result - it is the same
+    // measurement done properly, so showing both would just invite the
+    // question of which one counts.
+    const cell=document.getElementById(`ev_${fileId}_${track}`);
+    if(cell){
+      const ov=(r.overall||[]).filter(x=>x[1]>=0.02).slice(0,4);
+      cell.innerHTML=(r.votes||[]).map((v,i)=>
+        `<div class="mono" style="font-size:11px">
+           <span class="dim">${i+1}.</span> ${esc(alName(v[0]))} ${(v[1]*100).toFixed(0)}%</div>`).join('')
+        + `<div style="margin-top:4px;font-size:11px">
+             <span class="dim">after ${r.windows} longer samples:</span> `
+        + ov.map((x,i)=>`<span style="color:${i===0?'#7fd4a3':'#9aa6b2'}">
+             ${esc(alName(x[0]))} <b>${Math.round(x[1]*100)}%</b></span>`).join(
+             '<span class="dim"> · </span>') + `</div>`;
+    }
+    const pick=sel.options[sel.selectedIndex].text;
+    if(msg){
+      if(r.agrees){
+        msg.style.color='#7fd4a3';
+        msg.innerHTML=`agrees — ${esc(pick)} scores <b>${Math.round(r.share*100)}%</b>`;
+      }else{
+        msg.style.color='#e2b341';
+        msg.innerHTML=`does not agree — ${esc(pick)} scores only
+          <b>${Math.round(r.share*100)}%</b>, ${esc(alName(r.leader))} scores
+          <b>${Math.round(r.leader_share*100)}%</b>. Save anyway if you know better.`;
+      }
+    }
+  }catch(e){ if(msg){ msg.style.color='#e2b341'; msg.textContent='failed'; } }
+  btn.disabled=false; btn.textContent=old;
+}
+
+async function alSet(fileId, track, selId, btn){
+  const sel=document.getElementById(selId);
+  const msg=document.getElementById(selId+'_msg');
+  const code=sel && sel.value;
+  if(!code){ if(msg) msg.textContent='pick a language first'; return; }
+  // If a Check was run and disagreed, say so once and require a second click.
+  // Not a block - the person may well be right - but a measurement taken and
+  // then silently ignored is worse than never having taken it.
+  const chk=_alChecked[`${fileId}_${track}`];
+  if(chk && chk.want===code && !chk.agrees && !btn.dataset.warned){
+    btn.dataset.warned='1';
+    if(msg){ msg.style.color='#e2b341';
+      msg.innerHTML=`the file sounds like <b>${esc(alName(chk.leader))}</b>
+        (${Math.round(chk.leader_share*100)}%). Click Save again to write
+        ${esc(sel.options[sel.selectedIndex].text)} anyway.`; }
+    return;
+  }
+  btn.disabled=true; sel.disabled=true;
+  // An INDETERMINATE bar while the request is in flight. It does not claim a
+  // percentage, because the page cannot see inside the request and a bar that
+  // invents progress looks like evidence. The real steps are listed after,
+  // from what the server reports it actually did.
+  if(msg){
+    msg.style.color='';
+    msg.innerHTML=`<div class="albar"><i></i></div>
+      <div class="dim" style="margin-top:3px">writing the header…</div>`;
+  }
+  try{
+    const r=await (await fetch(
+      `/api/audiolang/set?file_id=${fileId}&track=${track}&code=${encodeURIComponent(code)}`,
+      {method:'POST'})).json();
+    if(r.ok){
+      if(msg){
+        const steps=(r.steps||[]).map(s=>
+          `<div class="alstep">✓ ${esc(s.what)}${
+            s.ms>=1?` <span class="dim">${s.ms} ms</span>`:''}</div>`).join('');
+        msg.innerHTML=`<div class="albar done"><i></i></div>
+          <div class="altick">✓ saved</div>${steps}`;
+      }
+      // Long enough to read the three ticks, short enough not to feel stuck.
+      setTimeout(()=>loadAlang(true), 2600);
+    }else{
+      if(msg){ msg.style.color='#e2b341'; msg.textContent=r.error||'failed'; }
+      btn.disabled=false; sel.disabled=false;
+    }
+  }catch(e){
+    if(msg){ msg.style.color='#e2b341'; msg.textContent='failed'; }
+    btn.disabled=false; sel.disabled=false;
+  }
+}
+
+// ---- live progress ---------------------------------------------------
+// A GPU pass that reports nothing is indistinguishable from one that has hung,
+// so this polls while a pass is running and stops the moment it is not.
+let _alPoll=null;
+
+// ---- last run / next run, ticking ------------------------------------
+// A schedule shown as a fixed "2m ago" is indistinguishable from a stuck one.
+// These count in real time between polls, anchored to the SERVER's clock at
+// the moment of the fetch so a browser a few seconds out of step cannot show
+// a next run that has already passed.
+let _alSchedTimer=null, _alFetchedAt=0;
+
+function alDur(s){
+  s=Math.max(0, Math.round(s));
+  if(s<60) return s+'s';
+  const m=Math.floor(s/60), r=s%60;
+  if(m<60) return r? `${m}m ${r}s` : `${m}m`;
+  const h=Math.floor(m/60), rm=m%60;
+  return rm? `${h}h ${rm}m` : `${h}h`;
+}
+
+function alSchedTick(){
+  const box=document.getElementById('alSched');
+  if(!box){ if(_alSchedTimer){ clearInterval(_alSchedTimer); _alSchedTimer=null; } return; }
+  const s=(_al&&_al.schedule)||{};
+  if(!s.every_s){
+    box.innerHTML='<span class="dim">not started yet — the loop registers '
+      +'itself about two minutes after a restart</span>';
+    return;
+  }
+  // Elapsed on THIS machine since the fetch, added to the server's clock.
+  const now=(s.__base||0)+((Date.now()-_alFetchedAt)/1000);
+  const since=s.last_run? now-s.last_run : null;
+  const until=s.next_run? s.next_run-now : null;
+  const running=_al.progress && _al.progress.state!=='idle'
+                             && _al.progress.state!=='error';
+  let nextTxt;
+  if(running) nextTxt='<b style="color:#6fb0ff">running now</b>';
+  // Registered but never run: the loop waits ~2 min after a restart so the
+  // first scan and the probe workers settle before it competes for the GPU.
+  // "unscheduled" would read as broken; it is simply not due yet.
+  else if(until===null) nextTxt='<b>shortly</b> <span class="dim">'
+    +'(waits ~2 min after a restart)</span>';
+  else if(until<=0) nextTxt='<b style="color:#e2b341">due now</b>';
+  else nextTxt=`in <b>${alDur(until)}</b>`;
+  box.innerHTML=
+    `last run <b>${since===null?'not since restart':alDur(since)+' ago'}</b>`
+    + `${s.runs?` <span class="dim">(${s.runs} pass${s.runs===1?'':'es'} since start)</span>`:''}`
+    + ` &nbsp;·&nbsp; next run ${nextTxt}`
+    + ` <span class="dim">· every ${alDur(s.every_s)}</span>`
+    + (s.last_error?` <br><span style="color:#e2b341">last error: ${esc(s.last_error)}</span>`:'');
+  if(!_alSchedTimer) _alSchedTimer=setInterval(alSchedTick, 1000);
+}
+
+function alProgressHtml(p){
+  if(!p || p.state==='idle'){
+    const when = p && p.finished_at ? ago(p.finished_at) : '';
+    return `<span class="dim">idle${when?' · last pass '+esc(when)+' ago':''}
+      ${p&&p.applied?' · named '+p.applied+' file(s)':''}</span>`;
+  }
+  if(p.state==='error') return `<span style="color:#e2b341">${esc(p.error||'error')}</span>`;
+  // A pass is running, so the "next run in Xm" line above is about to be
+  // wrong. Tell the ticker to say "running now" immediately rather than
+  // counting down to something already happening.
+  if(_alSchedTimer) alSchedTick();
+  const pctv = p.total ? Math.round(p.done*100/p.total) : 0;
+  return `<b style="color:#6fb0ff">${esc(p.state)}</b>
+    <span class="mono">${p.done}/${p.total}</span> (${pctv}%)
+    ${p.found?`· <span style="color:#7fd4a3">${p.found} heard</span>`:''}
+    ${p.refused?`· <span class="dim">${p.refused} refused</span>`:''}
+    <div style="height:7px;border-radius:4px;background:#161a20;margin-top:5px">
+      <i style="display:block;height:100%;border-radius:4px;width:${pctv}%;
+         background:#2f6f4f"></i></div>
+    <div class="mono dim" style="font-size:10px;margin-top:3px">${esc(p.current||'')}</div>`;
+}
+async function alRun(btn){
+  if(btn){ btn.disabled=true; btn.textContent='listening…'; }
+  try{ await fetch('/api/audiolang/run',{method:'POST'}); }catch(e){}
+  alStartPoll();
+}
+function alStartPoll(){
+  if(_alPoll) return;
+  _alPoll=setInterval(async ()=>{
+    let p=null;
+    try{ p=await (await fetch('/api/audiolang/progress')).json(); }catch(e){ return; }
+    const box=document.getElementById('alProg');
+    if(box) box.innerHTML=alProgressHtml(p);
+    if(!p || p.state==='idle' || p.state==='error'){
+      clearInterval(_alPoll); _alPoll=null;
+      const b=document.getElementById('alRunBtn');
+      if(b){ b.disabled=false; b.textContent='Listen to anything outstanding'; }
+      loadAlang(true);
+    }
+  }, 1200);
+}
+
+async function alFix(fileId, track, code, btn){
+  if(!fileId){ return; }
+  btn.disabled=true; btn.textContent='...';
+  try{
+    const r=await (await fetch(`/api/audiolang/apply?file_id=${fileId}&track=${track}`+
+      `&code=${encodeURIComponent(code)}&force=true`,{method:'POST'})).json();
+    btn.textContent = r.ok ? 'done' : 'failed';
+    if(r.ok) setTimeout(()=>loadAlang(true), 700);
+  }catch(e){ btn.textContent='failed'; }
+}
+
+let _cod=null, _codSide='video', _codDirty=false;
+
+async function loadCodecTab(side){
+  if(side) _codSide=side;
+  const el=document.getElementById(_codSide==='video'?'vcodecBody':'acodecBody');
+  if(!el) return;
+  if(!_cod){
+    el.innerHTML='<div class="skel" style="padding:14px"><i style="width:40%"></i>'
+                +'<i style="width:70%"></i><i style="width:55%"></i></div>';
+    try{ _cod=await (await fetch('/api/codecpolicy')).json(); }
+    catch(e){ el.innerHTML='<div class="dim">could not load: '+esc(e.message)+'</div>';
+              return; }
+  }
+  paintCodecTab();
+}
+
+// Which family a library is set to, with 'auto' already resolved to the one
+// that would really run - the preset list has to narrow to the ACTUAL encoder,
+// not to the word "auto".
+function codecFamilyOf(lib,side){
+  const cur=((_cod.policy||{})[lib]||{})[side]||{};
+  const want=cur.encoder_family||'auto';
+  const E=_cod.encoders||{};
+  if(want==='auto') return E.auto||'nvenc';
+  return ((E.families||{})[want]) ? want : (E.auto||'nvenc');
+}
+
+function codecField(lib,side,f){
+  const cur=((_cod.policy||{})[lib]||{})[side]||{};
+  const def=((_cod.defaults||{})[lib]||{})[side]||{};
+  const v=cur[f.key];
+  const isDefault=JSON.stringify(v)===JSON.stringify(def[f.key]);
+  const id=`cf_${side}_${f.key}_${lib.replace(/[^A-Za-z0-9]/g,'_')}`;
+  let input='';
+  if(f.type==='bool'){
+    input=`<label class="cfsw"><input type="checkbox" ${v?'checked':''}
+      onchange="codecSet('${esc(lib)}','${side}','${f.key}',this.checked)">
+      <span>${v?'on':'off'}</span></label>`;
+  }else if(f.type==='int'){
+    input=`<span class="cfnum">
+      <button onclick="codecStep('${esc(lib)}','${side}','${f.key}',-1)">−</button>
+      <input id="${id}" type="number" value="${v}" min="${f.min}" max="${f.max}"
+             step="${f.step||1}"
+             onchange="codecSet('${esc(lib)}','${side}','${f.key}',this.value)">
+      <button onclick="codecStep('${esc(lib)}','${side}','${f.key}',1)">+</button>
+      ${f.unit?`<em class="dim">${esc(f.unit)}</em>`:''}</span>`;
+  }else if(f.type==='choice'){
+    // THE PRESET LIST FOLLOWS THE ENCODER. Every family spells its ladder
+    // differently and none accepts another's names, so offering all of them
+    // at once invites picking one that cannot work. Narrowed to the family
+    // this library is currently set to.
+    let choices = f.choices;
+    let extra = '';
+    if(/_preset$/.test(f.key)){
+      const fam = codecFamilyOf(lib,side);
+      const spec = ((_cod.encoders||{}).families||{})[fam];
+      if(spec && spec.presets){
+        choices = spec.presets;
+        extra = `<em class="dim cfpre">${esc(spec.label)}: ${
+                   esc(spec.presets[0])} fastest → ${
+                   esc(spec.presets[spec.presets.length-1])} best</em>`;
+      }
+    }
+    // An encoder this machine cannot run is still offered - you may be
+    // setting up for hardware you are about to add - but it is marked, and
+    // the impact line below says what would really be used.
+    const un = f.key==='encoder_family'
+             ? new Set(((_cod.encoders||{}).usable)||[]) : null;
+    input=`<select onchange="codecSet('${esc(lib)}','${side}','${f.key}',this.value)">
+      ${choices.map(c=>{
+        let lbl = c;
+        if(un && c!=='auto' && un.size && !un.has(c)) lbl = c+'  (not available here)';
+        if(un && c==='auto') lbl = 'auto  (→ '+esc((_cod.encoders||{}).auto||'?')+')';
+        return `<option value="${esc(c)}" ${c===v?'selected':''}>${esc(lbl)}</option>`;
+      }).join('')}</select>${extra}`;
+  }else if(f.type==='multi'){
+    const set=new Set(v||[]);
+    input=`<span class="lchips">${f.choices.map(c=>`
+      <label class="lchip${set.has(c)?' on':''}">
+        <input type="checkbox" ${set.has(c)?'checked':''}
+          onchange="codecSet('${esc(lib)}','${side}','${f.key}','${esc(c)}',this.checked)">
+        ${esc(c)}</label>`).join('')}</span>`;
+  }
+  // THE DEFAULT IS ALWAYS VISIBLE, not just reachable.
+  //
+  // "Reset to default" as a bare button answers the wrong question. The one
+  // you actually have, staring at a CQ of 18 six months later, is "what was
+  // this before I touched it" - so the old value is printed beside the
+  // control whenever it differs, and the reset is attached to it.
+  const defTxt=Array.isArray(def[f.key])?(def[f.key].join(', ')||'none')
+              :(typeof def[f.key]==='boolean'?(def[f.key]?'on':'off')
+                                             :def[f.key]);
+  return `<div class="cfrow${isDefault?'':' cfchanged'}">
+    <div class="cfmain">
+      <div class="cflabel">${esc(f.label)}
+        ${isDefault?'':`<button class="cfreset"
+          title="put this back to ${esc(String(defTxt))}"
+          onclick="codecReset('${esc(lib)}','${side}','${f.key}')"
+          >reset to ${esc(String(defTxt))}</button>`}</div>
+      <div class="cfwhat dim">${esc(f.what||'')}</div>
+    </div>
+    <div class="cfctl">${input}</div>
+  </div>`;
+}
+
+// WHICH LIBRARIES ARE OPEN. Collapsed by default: six libraries of twenty
+// settings each is 120 rows, and a page that opens as an undifferentiated wall
+// of controls is one nobody reads. Closed, the page is a list of six folders
+// with "all at default" or "3 changed" beside each - which is the summary you
+// wanted anyway - and you open the one you came for.
+//
+// Kept OUTSIDE _cod so a reload of the data does not close what you opened,
+// and keyed by library only, so switching between the video and audio tabs
+// keeps the same folder open.
+const _codOpen = new Set();
+
+function codecToggle(lib){
+  _codOpen.has(lib) ? _codOpen.delete(lib) : _codOpen.add(lib);
+  paintCodecTab();
+}
+
+function paintCodecTab(){
+  const side=_codSide;
+  const el=document.getElementById(side==='video'?'vcodecBody':'acodecBody');
+  if(!el||!_cod) return;
+  const fields=(_cod.fields||{})[side]||[];
+  const libs=_cod.libraries||[];
+  // HOW AUTO WORKS, said once at the top rather than implied by a dropdown.
+  // The encoder is the one setting here whose behaviour is not obvious from
+  // its own name, and the one where a wrong guess silently changes what every
+  // other number on the page means.
+  const E=_cod.encoders||{};
+  const head = side!=='video' ? '' : `<div class="cfintro">
+    <b>Which encoder does the work</b>
+    <p><b>auto</b> uses the best encoder this machine can actually run, in the
+       order <span class="mono">NVENC → QuickSync → AMF → CPU</span>. That list
+       is not a guess: on startup nuarr encodes a couple of seconds with each
+       one and keeps only the ones that really produced a file — being listed
+       by ffmpeg only means it was compiled in, not that the hardware is here.</p>
+    <p>Pick a specific encoder to override that for this library — a bulk
+       rebuild can sit on the CPU overnight while another library keeps the
+       GPU. Hardware is far faster; the CPU is slower but the most efficient
+       per bit, so it makes smaller files at the same quality setting. If a
+       choice cannot run here, the job falls back to one that can and says so
+       on the card and in the log.</p>
+    <div class="cfprobe">${
+      (E.order||[]).map(f=>{
+        const s=(E.families||{})[f]||{}; const ok=(E.usable||[]).indexOf(f)>=0;
+        return `<span class="cfe ${ok?'y':'n'}" title="${esc(s.note||'')}"
+                 >${ok?'✓':'✗'} ${esc(s.label||f)}</span>`;
+      }).join('')
+    }<span class="dim">auto here → <b>${esc(E.auto||'?')}</b></span></div>
+    <p class="dim">Quality numbers do not carry across encoders — CQ 22 on
+       NVENC is not CQ 22 on libx265. After changing the encoder, test, and
+       expect to retune the quality figure.</p>
+  </div>`;
+  el.innerHTML=head+(libs.length?libs.map(L=>{
+    const cur=((_cod.policy||{})[L.name]||{})[side]||{};
+    const def=((_cod.defaults||{})[L.name]||{})[side]||{};
+    const changed=fields.filter(f=>JSON.stringify(cur[f.key])!==
+                                   JSON.stringify(def[f.key])).length;
+    const open=_codOpen.has(L.name);
+    return `<div class="lkind${open?' lopen':''}">
+      <div class="lkindhead ckhead" onclick="codecToggle('${esc(L.name)}')"
+           title="${open?'collapse':'expand'} ${esc(L.name)}">
+        <span class="ccaret">${open?'▾':'▸'}</span>
+        <span class="clib">${esc(L.name)}</span>
+        <span class="dim">defaults for ${esc(L.kind_label.toLowerCase())}</span>
+        <span class="dim" style="margin-left:auto">${
+          changed?`<b class="cchg">${changed} changed from default</b> ·
+            <a href="#" onclick="event.stopPropagation();codecReset('${esc(L.name)}','${side}','');return false"
+               >reset this library</a>`
+                 :'all at default'}</span></div>
+      ${open?`<div class="cfbody">${
+        // PARENTS RENDER THEIR OWN CHILDREN. A setting that only means
+        // something while another one is on is not a sibling of it - and six
+        // shrink ceilings sitting at full weight under a switch that is OFF
+        // read as six live settings. Nested and collapsed, the page says what
+        // it actually does; expanded, the indent says what they belong to.
+        fields.filter(f=>!f.parent).map(f=>{
+          const kids=fields.filter(k=>k.parent===f.key);
+          if(!kids.length) return codecField(L.name,side,f);
+          const on=!!(((_cod.policy||{})[L.name]||{})[side]||{})[f.key];
+          return codecField(L.name,side,f)
+            +`<div class="cfkids${on?' open':''}">`
+            +(on ? kids.map(k=>codecField(L.name,side,k)).join('')
+                 : `<div class="cfkidsoff dim">${kids.length} more setting${
+                      kids.length===1?'':'s'} — shown when this is on</div>`)
+            +`</div>`;
+        }).join('')}
+        ${side==='video'?`<div class="cftestrow">
+           <button onclick="codecTestRun('${esc(L.name)}','${side}')"
+              title="Runs a real three-second encode with exactly these
+settings - same encoder, preset, quality and pixel format a job would use.
+Nothing is saved and no library file is touched.">Test these settings</button>
+           <span class="dim">runs a real encode, saves nothing</span>
+           ${codecTestHtml(L.name)}</div>`:''}
+        </div>`:''}
+    </div>`;
+  }).join('')
+   :'<div class="dim">no libraries configured</div>')
+  +`<div style="margin-top:12px;display:flex;align-items:center;gap:10px">
+      <button onclick="codecSave()">Save settings</button>
+      <span id="codMsg" class="dim" style="font-size:11.5px">${
+        _codDirty?'unsaved changes':'the planner is using this now'}</span>
+    </div>
+    <div id="codImpact" style="margin-top:8px"></div>`;
+}
+
+function codecSet(lib,side,key,val,on){
+  const cur=((_cod.policy||{})[lib]||{})[side];
+  if(!cur) return;
+  const f=((_cod.fields||{})[side]||[]).find(x=>x.key===key);
+  if(!f) return;
+  if(f.type==='multi'){
+    const s=new Set(cur[key]||[]);
+    on ? s.add(val) : s.delete(val);
+    // Ordered by the declared choices, so the stored list matches what the
+    // server would normalise it to and "changed from default" cannot go true
+    // just because two equivalent selections sorted differently.
+    cur[key]=f.choices.filter(c=>s.has(c));
+  }else if(f.type==='int'){
+    let n=parseInt(val,10);
+    if(isNaN(n)) n=f.default;
+    cur[key]=Math.max(f.min,Math.min(f.max,n));
+  }else if(f.type==='bool'){
+    cur[key]=!!val;
+  }else{
+    cur[key]=val;
+  }
+  // CHANGING THE ENCODER RE-POINTS THE PRESETS, before anything is saved.
+  // 'p5' is meaningless to libx265 and 'medium' is meaningless to NVENC, so
+  // leaving the old value in place would show a setting that cannot be used
+  // and quietly get substituted at encode time. Snapped to the new family's
+  // equivalent rung instead - same position on the ladder, so "fast" stays
+  // fast - and the person sees the change and can adjust before saving.
+  if(key==='encoder_family'){
+    const fam=codecFamilyOf(lib,side);
+    const spec=((_cod.encoders||{}).families||{})[fam];
+    if(spec){
+      for(const pk of ['h265_preset','h264_preset']){
+        const old=cur[pk];
+        if(spec.presets.indexOf(old)>=0) continue;      // already valid
+        // find where the old value sat on ITS ladder, and take the same
+        // fraction along the new one
+        let frac=0.5, from=null;
+        for(const g of Object.values((_cod.encoders||{}).families||{})){
+          const i=g.presets.indexOf(old);
+          if(i>=0){ frac=i/Math.max(1,g.presets.length-1); from=g; break; }
+        }
+        cur[pk]= from ? spec.presets[Math.round(frac*(spec.presets.length-1))]
+                      : spec.default_preset;
+      }
+    }
+    _codTest[lib]=null;          // the previous test result is about the old encoder
+  }
+  _codDirty=true;
+  paintCodecTab();
+}
+
+// Last test result per library, so it survives a repaint but is cleared the
+// moment the thing it was testing changes.
+const _codTest={};
+
+async function codecTestRun(lib,side){
+  const cur=((_cod.policy||{})[lib]||{})[side]||{};
+  _codTest[lib]={running:true};
+  paintCodecTab();
+  try{
+    const r=await (await fetch('/api/codecpolicy/test',{
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({family:cur.encoder_family||'auto',
+                           preset:cur.h265_preset,
+                           cq:cur.h265_cq, target:'h265', ten_bit:true})
+    })).json();
+    _codTest[lib]=r;
+  }catch(e){
+    _codTest[lib]={ok:false,detail:String(e)};
+  }
+  paintCodecTab();
+}
+
+function codecTestHtml(lib){
+  const t=_codTest[lib];
+  if(!t) return '';
+  if(t.running) return `<div class="cftest dim">encoding three seconds…</div>`;
+  if(!t.ok)
+    return `<div class="cftest bad"><b>These settings do not work.</b>
+      ${esc(t.detail||'')}<br><span class="dim">Nothing was saved. Change the
+      encoder or the preset and test again.</span></div>`;
+  const bits=[`<b>Works.</b> ${esc(t.encoder)} · preset ${esc(t.preset)} · cq ${t.cq}`,
+              `${t.fps} fps on 720p, ${t.kb} KB for 3s`];
+  if(t.why) bits.push(`<span class="warn">${esc(t.why)}</span>`);
+  if(t.swapped) bits.push(`<span class="warn">${esc(t.swapped)}</span>`);
+  return `<div class="cftest ok">${bits.join('<br>')}</div>`;
+}
+
+function codecStep(lib,side,key,dir){
+  const cur=((_cod.policy||{})[lib]||{})[side];
+  const f=((_cod.fields||{})[side]||[]).find(x=>x.key===key);
+  if(!cur||!f) return;
+  codecSet(lib,side,key,(parseInt(cur[key],10)||0)+dir*(f.step||1));
+}
+
+async function codecReset(lib,side,key){
+  // Resets go STRAIGHT to the server rather than editing the local copy.
+  // A reset is unambiguous - there is exactly one right answer and no reason
+  // to make someone press Save to confirm it - and doing it server-side means
+  // the default comes from the schema rather than from whatever this page
+  // happened to load.
+  try{
+    const q=new URLSearchParams({library:lib,side:side||'',key:key||''});
+    const r=await (await fetch('/api/codecpolicy/reset?'+q,{method:'POST'})).json();
+    if(r&&r.policy){ _cod.policy=r.policy; }
+    // Anything else edited but not saved is now inconsistent with the server,
+    // so say so plainly instead of leaving a half-saved page.
+    _codDirty=false;
+    paintCodecTab();
+    const m=document.getElementById('codMsg');
+    if(m) m.textContent='reset · the planner is using this now';
+  }catch(e){
+    const m=document.getElementById('codMsg');
+    if(m) m.textContent='reset failed: '+e.message;
+  }
+}
+
+// LOOK, THEN DECIDE, THEN ACT - the same order as the language page, for the
+// same reason. Saving first and reporting the consequences afterwards means
+// the planner has already adopted settings nobody agreed to, and between that
+// moment and changing them back, anything the queue picks up uses them.
+function codecImpactBox(r, committed){
+  const el=document.getElementById('codImpact');
+  if(!el) return;
+  if(r.unchanged){
+    el.innerHTML='<div class="dim" style="font-size:11.5px">nothing to save — '
+                +'these are the settings already in use</div>';
+    return;
+  }
+  const n=r.affected||0, e=r.encode_diff||0;
+  // THE TWO CONSEQUENCES ARE SEPARATED, because they call for different
+  // decisions. "Needs work" is a requeue; "encodes differently" is not
+  // actionable at all - it just describes future jobs.
+  const libs=(r.libraries||[]).map(([lib,c])=>`${esc(lib)} ${fmt(c)}`).join(' · ');
+  let html=`<div class="cimp">
+    <div class="cimphead">${committed?'Applied':'This would change'}</div>
+    <div class="cimprow">
+      <b class="${n?'cimpwarn':''}">${fmt(n)}</b> file${n===1?'':'s'}
+      would be planned differently${libs?` <span class="dim">— ${libs}</span>`:''}
+      <div class="dim">These are already-processed files whose plan changes.
+        They keep working as they are until they are reprocessed.</div>
+    </div>
+    <div class="cimprow">
+      <b>${fmt(e)}</b> file${e===1?'':'s'} would encode differently
+      <div class="dim">Same plan, different encoder settings. Nothing to
+        requeue — this applies whenever these files are next rebuilt.</div>
+    </div>
+    <div class="dim" style="font-size:11px">checked ${fmt(r.checked||0)} stored
+      probes in the affected librar${(r.libraries||[]).length===1?'y':'ies'}</div>`;
+  const list=(r.files||[]).slice(0,12);
+  if(list.length){
+    html+='<div class="cimplist">'+list.map(f=>`<div class="cimpf">
+      <span>${esc(f.label)}</span>
+      <span class="dim">${esc(f.change)}</span></div>`).join('')
+      +(n>list.length?`<div class="dim" style="padding:4px 0">…and ${
+        fmt(n-list.length)} more</div>`:'')+'</div>';
+  }
+  const enc=(r.encodes||[]).slice(0,4);
+  if(enc.length){
+    html+='<div class="cimplist">'+enc.map(f=>`<div class="cimpf">
+      <span>${esc(f.label)}</span>
+      <span class="dim">${esc(f.change)}</span></div>`).join('')+'</div>';
+  }
+  html+='<div class="cimpact">'
+    + (committed
+        ? (n?`<button onclick="codecRequeue()">Queue ${fmt(n)} file${
+             n===1?'':'s'} to be replanned</button>
+             <span class="dim" style="font-size:11.5px">or leave them; the next
+               scan will not touch them either way</span>`
+            :'<span class="dim" style="font-size:11.5px">the planner is using '
+             +'this now</span>')
+        : `<button onclick="codecCommit()">Continue — save these settings</button>
+           <button onclick="codecCancel()">Cancel</button>
+           <span class="dim" style="font-size:11px">Nothing has been saved.
+             Counted from stored probes, so a file rewritten since its last
+             scan may differ.</span>`)
+    + '</div></div>';
+  el.innerHTML=html;
+}
+
+function codecCancel(){
+  const el=document.getElementById('codImpact');
+  if(el) el.innerHTML='';
+  const m=document.getElementById('codMsg');
+  if(m) m.textContent='not saved — your edits are still here, unapplied';
+}
+
+// The preview decides every stored probe in the affected libraries TWICE -
+// measured at ~20 s for 22,679 of them. That is long enough that the button
+// has to say so and has to stop taking clicks, or the natural response to an
+// unresponsive page is to press it again and start a second pass.
+let _codBusy=false;
+async function codecSave(){
+  if(_codBusy) return;
+  const m=document.getElementById('codMsg');
+  const btns=[...document.querySelectorAll('button')]
+    .filter(b=>b.getAttribute('onclick')==='codecSave()');
+  _codBusy=true;
+  btns.forEach(b=>{ b.disabled=true; b.textContent='Checking…'; });
+  if(m) m.innerHTML='<span class="busy"><span class="sp"></span><span class="step">'
+    +'working out what this would change — deciding every file in the '
+    +'libraries you edited</span></span>';
+  try{
+    const r=await (await fetch('/api/codecpolicy/preview',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(_cod.policy||{})})).json();
+    if(m) m.textContent=r.unchanged?'nothing to save':'nothing has been saved yet';
+    codecImpactBox(r,false);
+  }catch(e){ if(m) m.textContent='preview failed: '+e.message; }
+  finally{
+    _codBusy=false;
+    btns.forEach(b=>{ b.disabled=false; b.textContent='Save settings'; });
+  }
+}
+
+async function codecCommit(){
+  const m=document.getElementById('codMsg');
+  if(m) m.textContent='saving…';
+  try{
+    const r=await (await fetch('/api/codecpolicy',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(_cod.policy||{})})).json();
+    if(r&&r.policy) _cod.policy=r.policy;
+    _codDirty=false;
+    paintCodecTab();
+    const m2=document.getElementById('codMsg');
+    // NOT "saved". Saved is about this page; what matters is that the queue
+    // and the encoder are now reading it, and that already-queued jobs are not.
+    if(m2) m2.textContent='the planner is using this now — jobs already in the '
+                        + 'queue keep the settings they were planned with';
+    codecImpactBox(r,true);
+  }catch(e){ if(m) m.textContent='save failed: '+e.message; }
+}
+
+async function codecRequeue(){
+  const el=document.getElementById('codImpact');
+  try{
+    const r=await (await fetch('/api/codecpolicy/requeue',
+                               {method:'POST'})).json();
+    if(el) el.innerHTML=`<div class="dim" style="font-size:11.5px">queued ${
+      fmt(r.queued||0)} of ${fmt(r.considered||0)} file(s) to be replanned</div>`;
+  }catch(e){
+    if(el) el.innerHTML='<div class="dim">requeue failed: '+esc(e.message)+'</div>';
+  }
+}
+
+function langToggle(lib,side,code,on){
+  const cfg=((_lang.policy||{})[lib]||{})[side];
+  if(!cfg) return;
+  if(code==='__orig__')          cfg.keep_original=!!on;
+  else if(code==='__untagged__') cfg.keep_untagged=!!on;
+  else {
+    const s=new Set(cfg.langs||[]);
+    on ? s.add(code) : s.delete(code);
+    cfg.langs=[...s].sort();
+  }
+  _langDirty=true;
+  loadLangTab();
+}
+// LOOK, THEN DECIDE, THEN ACT.
+//
+// "Save policy" used to store the policy and tell you the consequences
+// afterwards, which is the wrong order: between adopting a policy you had not
+// agreed to and changing it back, anything the queue picked up would use it.
+// Now it previews, you press Continue to commit, and only a committed policy
+// offers to queue anything.
+function langImpactList(r){
+  const shown=(r.files||[]).length;
+  if(!shown) return '';
+  return `<div class="scrollbox auto nohz" style="max-height:320px;margin-top:8px">
+      <table class="fixed vtop"><tr>
+        <th>File</th><th class="nb" style="width:130px">Library</th>
+        <th class="nb" style="width:110px">Made in</th>
+        <th class="nb" style="width:210px">What changes</th></tr>
+      ${r.files.map(f=>`<tr>
+        <td class="wrap">${esc(f.label)}</td>
+        <td class="dim nb">${esc(f.library)}</td>
+        <td class="dim nb">${esc(f.orig||'unknown')}</td>
+        <td class="nb" style="color:var(--warn)">${esc(f.change)}</td></tr>`).join('')}
+      </table></div>
+    ${r.affected>shown?`<div class="dim" style="font-size:11px;margin-top:4px">
+        showing the first ${fmt(shown)} of ${fmt(r.affected)}</div>`:''}`;
+}
+async function langSave(){
+  const m=document.getElementById('langMsg'), box=document.getElementById('langImpact');
+  if(m) m.innerHTML='<span class="busy"><span class="sp"></span>'
+    +'<span class="step">checking what this would change…</span></span>';
+  let r;
+  try{
+    r=await (await fetch('/api/langpolicy/preview',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(_lang.policy)})).json();
+  }catch(e){ if(m) m.textContent='could not check'; return; }
+  if(m) m.textContent='nothing saved yet';
+  if(!box) return;
+  const head = r.affected
+    ? `<b>${fmt(r.affected)}</b> existing file(s) would be planned differently
+       <span class="dim">(of ${fmt(r.checked)} checked)</span>`
+    : `<b>No existing file</b> would be planned differently
+       <span class="dim">(of ${fmt(r.checked)} checked)</span>`;
+  box.innerHTML=`<div class="pinhead">${head}
+      <button style="margin-left:10px" onclick="langCommit()">Continue — save this policy</button>
+      <button style="margin-left:6px" onclick="langCancel()">Cancel</button>
+      <div class="dim" style="font-size:11px;margin-top:4px">Nothing has been saved.
+        Counted from stored probes, so a file rewritten since its last scan may
+        differ.</div></div>${langImpactList(r)}`;
+}
+async function langCommit(){
+  const m=document.getElementById('langMsg'), box=document.getElementById('langImpact');
+  if(m) m.innerHTML='<span class="busy"><span class="sp"></span>'
+    +'<span class="step">saving…</span></span>';
+  let r;
+  try{
+    r=await (await fetch('/api/langpolicy',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(_lang.policy)})).json();
+  }catch(e){ if(m) m.textContent='save failed'; return; }
+  _lang.policy=r.policy; _langDirty=false;
+  if(m) m.textContent='saved — the planner is using this now';
+  if(!box) return;
+  box.innerHTML = r.affected
+    ? `<div class="pinhead">Saved. <b>${fmt(r.affected)}</b> existing file(s) are
+         now planned differently
+         <button style="margin-left:10px" onclick="langRequeue()">Queue them</button>
+         <div class="dim" style="font-size:11px;margin-top:4px">They keep their
+           current tracks until they are reprocessed. Anything the queue picks up
+           for another reason will already use this policy.</div></div>`
+       + langImpactList(r)
+    : `<div class="dim" style="font-size:11.5px">Saved. No existing file plans
+         differently under this policy.</div>`;
+}
+async function langCancel(){
+  // Throw away the edits and re-read what is actually stored, so Cancel means
+  // "as it is on the server" rather than "as I last rendered it".
+  _lang=null; _langDirty=false;
+  const box=document.getElementById('langImpact'); if(box) box.innerHTML='';
+  await loadLangTab();
+}
+async function langRequeue(){
+  const box=document.getElementById('langImpact');
+  if(box) box.innerHTML='<span class="busy"><span class="sp"></span>'
+    +'<span class="step">queueing…</span></span>';
+  try{
+    const r=await (await fetch('/api/langpolicy/requeue',{method:'POST'})).json();
+    if(box) box.innerHTML=`<div class="pinhead">queued <b>${fmt(r.queued)}</b>
+      of ${fmt(r.considered)} file(s)</div>`;
+  }catch(e){ if(box) box.textContent='requeue failed'; }
+}
+
+// ---- Jobs: every recurring loop, one table -------------------------------
+let _jobsTimer=null;
+function jobsEvery(s){
+  if(s<90) return Math.round(s)+'s';
+  if(s<5400) return Math.round(s/60)+' min';
+  if(s<172800) return (s/3600).toFixed(s%3600?1:0)+' h';
+  return Math.round(s/86400)+' d';
+}
+function jobsWhen(ts, now){
+  if(!ts) return '<span class="dim">—</span>';
+  const d=ts-now;
+  if(d<=0)  return ago(ts);
+  if(d<90)  return 'in '+Math.round(d)+'s';
+  if(d<5400)return 'in '+Math.round(d/60)+'m';
+  if(d<172800) return 'in '+(d/3600).toFixed(d%3600<60?0:1)+'h';
+  return 'in '+Math.round(d/86400)+'d';
+}
+async function loadJobsTab(){
+  const el=document.getElementById('jobsBody');
+  if(!el){ if(_jobsTimer){clearInterval(_jobsTimer); _jobsTimer=null;} return; }
+  let d;
+  try{ d=await (await fetch('/api/schedules')).json(); }
+  catch(e){ el.innerHTML=`<div class="err">could not load: ${esc(String(e))}</div>`; return; }
+  const now=d.now||Date.now()/1000;
+  const groups=[];
+  for(const r of d.rows||[]){
+    let g=groups.find(x=>x.name===r.group);
+    if(!g){ g={name:r.group, rows:[]}; groups.push(g); }
+    g.rows.push(r);
+  }
+  const pill=r=>{
+    if(r.status==='off')     return '<span class="pill p-dim">off</span>';
+    if(r.status==='error')   return '<span class="pill p-bad">error</span>';
+    if(r.status==='waiting') return '<span class="pill p-dim">waiting</span>';
+    if(r.overdue)            return '<span class="pill p-warn">due</span>';
+    return '<span class="pill p-ok">ok</span>';
+  };
+  el.innerHTML = groups.map(g=>`
+    <div class="jgrp">${esc(g.name)}</div>
+    <table class="jtab"><thead><tr>
+      <th>Job</th><th style="width:78px">Status</th><th style="width:110px">Every</th>
+      <th style="width:120px">Last run</th><th style="width:110px">Next</th>
+    </tr></thead><tbody>
+    ${g.rows.map(r=>`<tr>
+      <td><b>${esc(r.label)}</b>${r.what?`<div class="dim jwhat">${esc(r.what)}</div>`:''}
+        ${r.last_result?`<div class="dim jwhat mono">${esc(r.last_result)}</div>`:''}
+        ${r.last_error?`<div class="err jwhat">${esc(r.last_error)}</div>`:''}</td>
+      <td>${pill(r)}</td>
+      <td class="dim">${jobsEvery(r.every_s)}</td>
+      <td class="dim" title="${r.last_run?new Date(r.last_run*1000).toLocaleString():''}"
+        >${r.last_run?ago(r.last_run):'<span class="dim">never</span>'}</td>
+      <td class="dim">${r.status==='off'?'<span class="dim">—</span>':jobsWhen(r.next_run,now)}</td>
+    </tr>`).join('')}
+    </tbody></table>`).join('');
+  // Refresh while the page is open. Cleared above the moment the pane is gone,
+  // so switching away does not leave a timer fetching forever.
+  if(!_jobsTimer) _jobsTimer=setInterval(loadJobsTab, 10000);
+}
+
+// ---- the connections themselves -----------------------------------------
+//
+// nuarr picked these up by reading Sonarr's and Radarr's own config.xml off
+// C:\ProgramData at first run, which works on the one machine they share and
+// nowhere else - a remote arr, a container, a moved install or a rotated API
+// key all left the only fix as hand-editing config.yml. This is the same
+// settings, entered rather than guessed.
+let _arrCfg=null;
+async function loadArrConns(){
+  const el=document.getElementById('arrConns');
+  if(!el) return;
+  try{ _arrCfg=await (await fetch('/api/arrs/config')).json(); }
+  catch(e){ el.innerHTML=`<div class="err">could not load: ${esc(String(e))}</div>`; return; }
+  // Names for the language-sync card's heading, so it reads "Sonarr + Radarr"
+  // rather than a hardcoded pair that would be wrong on a Sonarr-only setup.
+  window._arrNames=(_arrCfg.arrs||[]).map(a=>a.name);
+  el.innerHTML=(_arrCfg.arrs||[]).map(a=>`
+    <div class="arrconn" data-kind="${a.kind}">
+      <div class="arrhead"><b>${esc(a.name)}</b>
+        <span class="pill ${a.has_key&&a.url?'p-ok':'p-dim'}">${
+          a.has_key&&a.url?'configured':'not set up'}</span>
+        <span class="dim" style="font-size:11px">${
+          a.kind==='sonarr'?'TV shows':'movies'}</span>
+      </div>
+      <div class="arrrow">
+        <label>Server URL</label>
+        <input class="arrurl" value="${esc(a.url||'')}"
+               placeholder="${esc(a.suggest||'http://localhost:'+(a.kind==='sonarr'?8989:7878))}">
+      </div>
+      <div class="arrhint">Including http:// and the port. A base URL goes on
+        the end if that server has one set.</div>
+      <div class="arrrow">
+        <label>API key</label>
+        <input class="arrkey" type="password" autocomplete="new-password"
+               placeholder="${a.has_key?'•••••••• (unchanged)':'from Settings → General on that server'}">
+      </div>
+      <div class="arrhint">${a.has_key
+        ? 'Stored. Leave blank to keep it; type a new one to replace it.'
+        : 'Found in that server under Settings → General → Security.'}</div>
+      <div class="arract">
+        <button onclick="arrTest('${a.kind}')">Test</button>
+        <button onclick="arrSave('${a.kind}')">Save</button>
+        <span class="arrmsg dim" style="font-size:11.5px"></span>
+      </div>
+    </div>`).join('')
+    + `<div class="dim" style="font-size:11px;margin:2px 0 14px">
+         Test asks the server who it is — it needs no write access and fails
+         fast, so a wrong port or a rotated key is caught here rather than by
+         a scan quietly finding nothing hours later.</div>`;
+}
+function _arrBox(kind){
+  return document.querySelector(`.arrconn[data-kind="${kind}"]`);
+}
+async function arrTest(kind){
+  const b=_arrBox(kind), m=b.querySelector('.arrmsg');
+  m.textContent='testing…'; m.className='arrmsg dim';
+  try{
+    const r=await (await fetch('/api/arrs/config/test',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({kind, url:b.querySelector('.arrurl').value,
+                           api_key:b.querySelector('.arrkey').value})})).json();
+    if(r.ok){ m.textContent='✓ '+(r.note||'reached'); m.className='arrmsg ok'; }
+    else { m.innerHTML='✗ '+esc(r.error||r.detail||'failed')
+             +(r.hint?` <span class="dim">— ${esc(r.hint)}</span>`:'');
+           m.className='arrmsg err'; }
+  }catch(e){ m.textContent='✗ '+e.message; m.className='arrmsg err'; }
+}
+async function arrSave(kind){
+  const b=_arrBox(kind), m=b.querySelector('.arrmsg');
+  m.textContent='saving…'; m.className='arrmsg dim';
+  try{
+    const res=await fetch('/api/arrs/config',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({kind, url:b.querySelector('.arrurl').value,
+                           api_key:b.querySelector('.arrkey').value})});
+    const r=await res.json();
+    if(!res.ok) throw new Error(r.detail||'failed');
+    m.textContent='saved — nuarr is using this now';
+    m.className='arrmsg ok';
+    b.querySelector('.arrkey').value='';
+    loadArrConns();                      // repaint the configured/not-set pill
+    if(typeof loadArrs==='function') loadArrs();   // header pills
+  }catch(e){ m.textContent='✗ '+e.message; m.className='arrmsg err'; }
+}
+
+async function loadArrsTab(){
+  loadArrConns();
+  loadArrHealth();
+  loadLangSync();
+  const el=document.getElementById('arrsBody');
+  if(!el) return;
+  let d;
+  try{ d=await (await fetch('/api/arrguard')).json(); }
+  catch(e){ el.innerHTML=`<div class="err">could not load: ${esc(String(e))}</div>`; return; }
+  const g=d.stats.guard||{}, s=d.stats.score||{}, t=d.stats.trash||{};
+  const job=(id,title,desc,on,st)=>`
+    <div style="border:1px solid var(--line);border-radius:8px;padding:10px 14px;margin-bottom:10px">
+      <div style="display:flex;align-items:center;gap:10px">
+        <b>${title}</b>
+        <span class="pill ${on?'p-ok':'p-dim'}" style="cursor:pointer"
+          title="click to turn ${on?'off':'on'}"
+          onclick="arrsToggle('${id}',${on?0:1})">${on?'ON':'off'}</span>
+        <button style="margin-left:auto" onclick="arrsRun('${id}')">Run now</button>
+      </div>
+      <div class="dim" style="font-size:11px;margin:6px 0 4px">${desc}</div>
+      <div class="mono" style="font-size:11px">
+        ${st.last_run?`last run ${new Date(st.last_run*1000).toLocaleString()} — ${esc(st.last_result||'')}`
+                     :'<span class="dim">has not run yet</span>'}
+        ${on&&st.next_run?`<div class="dim">next ~${new Date(st.next_run*1000).toLocaleTimeString()}</div>`:''}
+        ${(st.new_formats&&st.new_formats.length)?`<div class="dim" style="margin-top:4px">new in the guides: ${esc(st.new_formats.join(', '))}</div>`:''}
+        ${(st.detail&&st.detail.length)?`<div class="dim" style="margin-top:4px">${st.detail.map(x=>esc(x)).join('<br>')}</div>`:''}
+      </div>
+    </div>`;
+  el.innerHTML =
+    (d.stats.running?`<div class="dim" style="margin-bottom:8px">running: ${esc(d.stats.running)}…</div>`:'')
+    + job('profile_guard','2160p profile split guard',
+        'Verifies the Nu 2160p profiles still rank resolution first (two ordered '
+        +'quality groups, upgrade-until on the 2160p group) and re-applies the split '
+        +'if a Profilarr sync has flattened them back to one merged group.',
+        d.toggles.profile_guard, g)
+    + job('score_guard','English-audio score guard',
+        'Radarr prefers English audio through two custom formats scored +3000: '
+        +'<b>Language: English</b> and <b>English Audio (Dual/Dubbed)</b>, across the '
+        +'five Nu profiles. Profilarr owns per-profile format scores and pushes its own '
+        +'complete set when it syncs, which sets anything it does not know about back to '
+        +'0 — silently, since a wrong score looks exactly like a right one. This re-asserts '
+        +'both scores and says which profile it had to fix. The profile Language field is '
+        +'never touched: that one is a hard filter, and setting it to English would stop '
+        +'foreign films downloading at all.',
+        d.toggles.score_guard, s)
+    + job('trash_anime','TRaSH anime format sync',
+        'Fetches the current anime custom formats from the TRaSH guides repo and '
+        +'updates existing formats whose matching rules drifted. Never deletes, never '
+        +'adds formats to profiles by itself — new ones are listed here for you.',
+        d.toggles.trash_anime, t)
+    + `<div style="border:1px solid var(--line);border-radius:8px;padding:10px 14px">
+        <div style="display:flex;align-items:center;gap:10px">
+          <b>Webhooks</b>
+          <button style="margin-left:auto" onclick="registerHooks()">Re-register now</button>
+        </div>
+        <div class="dim" style="font-size:11px;margin:6px 0 4px">
+          How nuarr hears about imports, upgrades, renames and deletes the moment
+          they happen. Registration is automatic; this shows whether it is actually
+          holding, because a stale hook produces silence, not an error.</div>
+        <span id="hookmsg" class="dim" style="font-size:11px"></span>
+        <div id="hookstate" class="dim" style="margin-top:5px;font-size:11px"></div>
+      </div>`;
+  loadHookState();
+}
+async function arrsToggle(job,on){
+  await fetch(`/api/arrguard/toggle?job=${job}&on=${on}`,{method:'POST'});
+  loadArrsTab();
+}
+async function arrsRun(job){
+  const el=document.getElementById('arrsBody');
+  if(el) el.insertAdjacentHTML('afterbegin','<div class="dim" id="arrsBusy">running…</div>');
+  try{ await fetch(`/api/arrguard/run?job=${job}`,{method:'POST'}); }catch(e){}
+  loadArrsTab();
+}
+
+// ---- MKVToolNix ----------------------------------------------------------
+// Mirrors the ffmpeg tab's shape: version up top, who-uses-it underneath.
+// The one honest difference: no Apply button, because MKVToolNix installs
+// via a system installer and nuarr will not pretend to drive one.
+async function loadMkv(check){
+  const el=document.getElementById('mkvBody');
+  if(!el) return;
+  let d;
+  try{ d = await (await fetch('/api/mkvtool'+(check?'?check=1':''))).json(); }
+  catch(e){ el.innerHTML = `<div class="err">could not read MKVToolNix status: ${esc(String(e))}</div>`; return; }
+  const m=d.merge||{}, p=d.prop||{};
+  const cur=m.version||'';
+  const upd = d.latest && cur && d.latest!==cur;
+  let head = m.ok
+    ? `<span class="pill" style="color:#b48bf2;border-color:#b48bf2">mkvmerge v${esc(cur)}</span>
+       <span class="dim">('${esc(m.codename||'')}')</span>`
+    : `<span class="pill p-bad">mkvmerge missing</span> <span class="err">${esc(m.error||'')}</span>`;
+  if(d.latest){
+    head += upd
+      ? ` <span class="pill p-warn" title="download and run the installer from mkvtoolnix.download — nuarr does not auto-install this one">v${esc(d.latest)} available</span>`
+      : ` <span class="pill p-ok">up to date</span>`;
+  }else if(d.check_error){
+    head += ` <span class="dim" title="${esc(d.check_error)}">version check failed</span>`;
+  }
+  el.innerHTML = `
+    <div style="margin:6px 0 10px">${head}
+      <button style="margin-left:10px" onclick="loadMkv(true)">Check for update</button>
+      <a href="https://mkvtoolnix.download/downloads.html" target="_blank"
+         style="margin-left:6px">get installer ↗</a></div>
+    <div class="mono dim" style="font-size:11px;margin-bottom:2px">${esc(m.path||'')}</div>
+    <div class="mono dim" style="font-size:11px;margin-bottom:12px">${esc(p.path||'')}
+      ${p.ok?`<span class="pill p-ok" style="margin-left:6px">mkvpropedit v${esc(p.version||'')}</span>`
+            :`<span class="pill p-bad" style="margin-left:6px">mkvpropedit missing</span>`}</div>
+    <div class="dim" style="font-size:11px;margin:4px 0">Uses MKVToolNix</div>
+    <table class="fixed"><tr><th>COMPONENT</th><th style="width:170px">TOOL</th><th>WHY</th></tr>
+      ${(d.uses||[]).map(u=>`<tr>
+        <td><b>${esc(u.component)}</b></td>
+        <td class="mono">${esc(u.tool)}</td>
+        <td class="dim">${esc(u.why)}</td></tr>`).join('')}
+    </table>`;
+  paintMkvPill(d);
+}
+function paintMkvPill(d){
+  const el=document.getElementById('mkvPill');
+  if(!el||!d) return;
+  const m=d.merge||{};
+  const newer = d.latest && m.version && d.latest!==m.version;
+  // Same rule as ffmpeg: amber only for an update that can actually be taken.
+  // MKVToolNix has no driver dependency today, so `blocked` is normally false
+  // and this behaves as before - but the check is here so that if the API ever
+  // reports a reason it cannot be installed, the header stops nagging about it
+  // rather than needing this to be rediscovered.
+  const blocked = !!(d.blocked || (d.upgrade && d.upgrade.safe === false));
+  const upd = newer && !blocked;
+  const cls = m.ok ? (upd?'p-warn':'p-ok') : 'p-bad';
+  const label = m.ok ? `mkv v${m.version}` : 'mkv missing';
+  const title = m.ok
+    ? `mkvmerge v${m.version} ('${m.codename||''}')`
+      + (upd?`\nv${d.latest} available — installer at mkvtoolnix.download`
+            : newer?`\nv${d.latest} exists but cannot be installed here: `
+                    +`${(d.upgrade&&d.upgrade.why)||d.blocked||'blocked'}`
+            : (d.latest?'\nup to date':''))
+      + `\nused for subtitle embedding and header edits`
+    : (m.error||'MKVToolNix not found');
+  setHTML(el, `<span class="pill ${cls}" style="cursor:pointer"
+    title="${esc(title)}" onclick="wtab('mkv')">${esc(label)}</span>`);
+}
+async function mkvPillBoot(){
+  try{ paintMkvPill(await (await fetch('/api/mkvtool')).json()); }catch(e){}
+}
+mkvPillBoot();
+
+// ---- rules ---------------------------------------------------------------
+let _rulesLoaded=false;
+async function loadRules(){
+  const el=document.getElementById('rulesBody');
+  if(!el) return;
+  if(_rulesLoaded) return;           // static until the config changes
+  el.innerHTML='<div class="skel"><i style="width:70%"></i>'
+    +'<i style="width:88%"></i><i style="width:60%"></i></div>';
+  let d;
+  try{ d=await (await fetch('/api/rules')).json(); }
+  catch(e){ el.innerHTML='<div class="err">could not load the rules</div>'; return; }
+  _rulesLoaded=true;
+
+  const row=r=>{
+    if(r.both!==undefined)
+      return `<tr><td class="rk">${esc(r.k)}</td>
+              <td class="rv" colspan="2">${esc(r.both)}</td></tr>`;
+    // Where the profiles differ, show them SIDE BY SIDE. Stacked, the reader
+    // has to hold one in their head to compare it with the other, which is the
+    // whole question this tab exists to answer.
+    return `<tr><td class="rk">${esc(r.k)}</td>
+            <td class="rv rdiff"><span class="rprof anime">anime</span>
+                ${esc(r.anime||'')}</td>
+            <td class="rv rdiff"><span class="rprof other">live action</span>
+                ${esc(r.other||'')}</td></tr>`;
+  };
+  const sect=(title, rows, note)=>
+    `<h3 class="rsec">${esc(title)}</h3>`
+    +(note?`<div class="dim" style="font-size:11.5px;margin:-2px 0 6px">${esc(note)}</div>`:'')
+    +`<table class="rtab">${rows.map(row).join('')}</table>`;
+
+  el.innerHTML =
+    `<div class="rprofbox">
+       <div><span class="rprof anime">anime</span>
+            <span class="mono dim">${esc(d.profiles.anime)}</span></div>
+       <div><span class="rprof other">live action</span>
+            <span class="mono dim">${esc(d.profiles.other)}</span></div>
+     </div>`
+    + sect('Which pool a file goes to', d.pool)
+    + sect('Video', d.video, 'Identical for both profiles.')
+    + sect('Audio', d.audio,
+           'This is the main difference: anime keeps dual audio, everything '
+           + 'else keeps English only.')
+    + sect('Subtitles', d.subs,
+           'The second difference: signs & songs burn-in is an anime rule.')
+    + sect('Safety', d.safety);
+}
+
+// ---- backup & restore ----------------------------------------------------
+let _bkTimer=null, _bkBusy=false;
+function bkAgo(ts){
+  if(!ts) return 'never';
+  const s=Math.max(0,Date.now()/1000-ts);
+  if(s<60) return Math.round(s)+'s ago';
+  if(s<3600) return Math.round(s/60)+'m ago';
+  if(s<86400) return Math.round(s/3600)+'h ago';
+  return Math.round(s/86400)+'d ago';
+}
+function bkWhen(ts){
+  if(!ts) return '—';
+  const d=new Date(ts*1000);
+  return d.toLocaleString([], {month:'short', day:'numeric',
+                               hour:'2-digit', minute:'2-digit'});
+}
+async function loadBackup(showSkeleton){
+  if(showSkeleton){
+    const l=document.getElementById('bkList');
+    if(l) l.innerHTML='<div class="skel"><i style="width:80%"></i>'
+      +'<i style="width:64%"></i><i style="width:72%"></i></div>';
+  }
+  let d;
+  try{ d=await (await fetch('/api/backup')).json(); }catch(_){ return; }
+  const s=d.settings||{}, st=d.state||{};
+
+  // Only overwrite the controls when the user is not mid-edit, otherwise the
+  // poll fights the keyboard.
+  const act=document.activeElement;
+  const setIf=(id,val,prop)=>{
+    const e=document.getElementById(id);
+    if(e && e!==act) e[prop||'value']=val;
+  };
+  setIf('bkEnabled', !!s.enabled, 'checked');
+  setIf('bkFreq', s.freq||'weekly');
+  setIf('bkDow', String(s.dow ?? 6));
+  setIf('bkDom', String(s.dom ?? 1));
+  setIf('bkTime', s.time||'04:00');
+  setIf('bkKeep', String(s.keep ?? 4));
+  // Day-of-week only means something weekly; day-of-month only monthly.
+  const f=(document.getElementById('bkFreq')||{}).value||'weekly';
+  const dw=document.getElementById('bkDowWrap'), dm=document.getElementById('bkDomWrap');
+  if(dw) dw.style.display = f==='weekly' ? '' : 'none';
+  if(dm) dm.style.display = f==='monthly' ? '' : 'none';
+
+  const dest=document.getElementById('bkDest');
+  if(dest) dest.textContent = s.dest||'';
+
+  // A staged restore is the most important thing on this panel when it exists:
+  // the database has NOT changed yet and will change on the next start.
+  const pr=d.pending_restore;
+  let warn=document.getElementById('bkPending');
+  if(pr){
+    if(!warn){
+      warn=document.createElement('div'); warn.id='bkPending';
+      warn.style.cssText='margin:8px 0;padding:9px 11px;border:1px solid var(--warn,#d29922);'
+        +'border-radius:6px;font-size:12px;background:rgba(210,153,34,.08)';
+      dest.parentNode.insertBefore(warn, dest);
+    }
+    warn.innerHTML = `<b>Restore staged from ${esc(pr.from||'')}</b> — the live `
+      +`database is unchanged until nuarr restarts. `
+      +`<button onclick="bkCancelRestore()" style="margin-left:8px">Cancel it</button>`;
+  } else if(warn){ warn.remove(); }
+
+  // live progress
+  const bar=document.getElementById('bkBar');
+  const state=document.getElementById('bkState');
+  if(st.running){
+    if(bar){ bar.style.display=''; bar.querySelector('i').style.width=(st.pct||0)+'%'; }
+    if(state) state.innerHTML='<span class="busy"><span class="sp"></span>'
+      +`<span class="step">${esc(st.phase||'working')}${st.current?' — '+esc(st.current):''}</span></span>`;
+  }else{
+    if(bar) bar.style.display='none';
+    const okTag = s.last_ok
+      ? '<span class="pill p-ok">verified</span>'
+      : (s.last_at ? '<span class="pill p-err">failed</span>' : '');
+    if(state) state.innerHTML = s.last_at
+      ? `last backup ${esc(bkAgo(s.last_at))} ${okTag} `
+        + `<span class="dim">${esc(s.last_detail||'')}</span>`
+        + (d.next_run ? ` · next ${esc(bkWhen(d.next_run))}` : ' · not scheduled')
+      : (s.enabled ? `no backup yet · next ${esc(bkWhen(d.next_run))}`
+                   : 'no backup yet · scheduling is off');
+  }
+
+  const list=document.getElementById('bkList');
+  if(!list) return;
+  const items=d.backups||[];
+  if(!items.length){
+    list.innerHTML='<div class="dim" style="font-size:12px">no backups yet</div>';
+  }else{
+    list.innerHTML='<div style="max-height:260px;overflow:auto">'+items.map(b=>{
+      const tag = b.verified ? '<span class="pill p-ok">verified</span>'
+                : '<span class="pill p-warn">unverified</span>';
+      return `<div class="qrow" style="align-items:center">
+        <span class="qt" title="${esc(b.path)}">${esc(b.name)}</span>
+        <span class="dim" style="min-width:120px">${esc(bkWhen(b.at))}</span>
+        <span class="mono" style="min-width:78px">${esc(String(b.db_mb))} MB</span>
+        <span class="mono dim" style="min-width:92px">${fmt(b.rows||0)} files</span>
+        ${tag}
+        <button ${b.restorable?'':'disabled'} onclick="bkRestore('${esc(b.name)}')"
+          title="Replace the live database with this backup. A safety copy of the current one is taken first.">Restore</button>
+      </div>`;
+    }).join('')+'</div>';
+  }
+
+  clearTimeout(_bkTimer);
+  // Poll quickly only while something is happening.
+  _bkTimer=setTimeout(()=>{ if(_wtab==='backup') loadBackup(false); },
+                      st.running?1000:15000);
+}
+async function bkSave(){
+  const q=new URLSearchParams({
+    enabled: document.getElementById('bkEnabled').checked,
+    freq: document.getElementById('bkFreq').value,
+    dow: document.getElementById('bkDow').value,
+    dom: document.getElementById('bkDom').value||'1',
+    time_of_day: document.getElementById('bkTime').value||'04:00',
+    keep: document.getElementById('bkKeep').value||'4',
+  });
+  const m=document.getElementById('bkMsg');
+  if(m) m.innerHTML='<span class="busy"><span class="sp"></span><span class="step">saving…</span></span>';
+  try{
+    const r=await (await fetch('/api/backup/settings?'+q.toString(),{method:'POST'})).json();
+    if(m) m.textContent = r.next_run ? 'saved — next '+bkWhen(r.next_run) : 'saved';
+  }catch(e){ if(m) m.textContent='could not save'; }
+  loadBackup(false);
+}
+async function bkRun(){
+  if(_bkBusy) return;
+  _bkBusy=true;
+  const m=document.getElementById('bkMsg');
+  if(m) m.innerHTML='<span class="busy"><span class="sp"></span><span class="step">starting…</span></span>';
+  loadBackup(false);
+  try{
+    const r=await (await fetch('/api/backup/run',{method:'POST'})).json();
+    if(m) m.textContent = r.ok
+      ? `done — ${r.db_mb} MB, integrity ${r.integrity}, bundle ${r.bundle}`
+      : ('failed: '+(r.error||'unknown'));
+  }catch(e){ if(m) m.textContent='failed: '+e.message; }
+  _bkBusy=false;
+  loadBackup(false);
+}
+async function bkPrune(){
+  const m=document.getElementById('bkMsg');
+  if(m) m.innerHTML='<span class="busy"><span class="sp"></span><span class="step">applying retention…</span></span>';
+  try{
+    const r=await (await fetch('/api/backup/prune',{method:'POST'})).json();
+    if(m) m.textContent = (r.removed||[]).length
+      ? `removed ${r.removed.length}` : 'nothing to remove';
+  }catch(e){ if(m) m.textContent='failed'; }
+  loadBackup(false);
+}
+async function bkCancelRestore(){
+  const m=document.getElementById('bkMsg');
+  try{
+    await fetch('/api/backup/restore/cancel',{method:'POST'});
+    if(m) m.textContent='staged restore cancelled';
+  }catch(e){ if(m) m.textContent='could not cancel'; }
+  loadBackup(false);
+}
+async function bkRestore(name){
+  // Two-step on purpose. Nothing changes until the restart, but this is still
+  // the button that decides which database you come back with.
+  if(!confirm('Restore '+name+'?\n\nThe backup is staged now and swapped in the '
+              +'next time nuarr starts — the live database is not touched until '
+              +'then, and you can cancel before restarting. A safety copy of the '
+              +'current database is taken either way.')) return;
+  const m=document.getElementById('bkMsg');
+  if(m) m.innerHTML='<span class="busy"><span class="sp"></span><span class="step">restoring…</span></span>';
+  try{
+    const r=await (await fetch('/api/backup/restore?confirm=true&name='
+                  +encodeURIComponent(name),{method:'POST'})).json();
+    if(m) m.innerHTML = r.ok
+      ? `<span class="pill p-warn">staged</span> applied on the next start · `
+        +`safety copy <span class="mono">${esc((r.safety_copy||'').split('\\\\').pop())}</span>`
+      : 'failed: '+esc(r.error||'unknown');
+  }catch(e){ if(m) m.textContent='failed: '+e.message; }
+  loadBackup(false);
+}
+function paintWorkers(){
+  const w=_wdata;
+  const rows=Object.entries(w).filter(([k,v])=> _wtab==='timing' ? v.timing : !v.timing);
+  const blurb = _wtab==='timing'
+    ? `How long files settle before processing, and how long jobs stay held
+       while Plex is playing or another app is working the disks.`
+    : `How much runs at once. Encode is NVENC-bound; passthrough is disk-bound.`;
+  document.getElementById('workers').innerHTML=
+    `<div class="dim" style="padding:9px 14px;font-size:11px">${blurb}</div>`
+    +'<table>'+rows.map(([k,v])=>workerRow(k,v)).join('')+'</table>';
+  const hint=document.getElementById('wtabhint');
+  if(hint) hint.textContent = _wtab==='timing' ? '· holds & timing' : '· concurrency';
+}
+async function loadWorkers(){
+  _wdata=await (await fetch('/api/workers')).json();
+  // the control poll cadence is one of these settings - adopt it immediately
+  if(_wdata.control_poll_s && _wdata.control_poll_s.value){
+    _ctlIdleMs = _wdata.control_poll_s.value * 1000;
+    _ctlSchedule(_ctlFast === true);
+  }
+  paintWorkers();
+}
+async function bump(key,val){
+  const m=document.getElementById('wmsg'); m.textContent='…';
+  const r=await fetch('/api/workers?key='+encodeURIComponent(key)+'&value='+val,{method:'POST'});
+  const j=await r.json();
+  m.textContent = r.ok ? j.message : (j.detail||'failed');
+  loadWorkers();
+}
+async function resetWorkers(){
+  await fetch('/api/workers/reset',{method:'POST'});
+  document.getElementById('wmsg').textContent='reset to defaults';
+  loadWorkers();
+}
+let lastHookKey='';
+async function loadHooks(){
+  const h=await (await fetch('/api/webhook/recent')).json();
+  const key=h.rows.map(r=>r.at+r.event).join(',');
+  if(key===lastHookKey) return;
+  lastHookKey=key;
+  const box=document.getElementById('hooks');
+  const rows=h.rows.slice().reverse();     // oldest first, newest at the bottom
+  const html = rows.length
+    ? '<table class="fixed"><tr><th style="width:90px">When</th><th style="width:70px">Arr</th>'
+      +'<th style="width:120px">Event</th><th>Result</th></tr>'
+      +rows.map(r=>{
+        // Colour by WHAT happened, not just whether the handler survived it:
+        // deletes amber, upgrades blue, imports green, renames dim - so a
+        // scan of the column reads as a story instead of a green stripe.
+        const up = /upgrade/i.test(r.detail||'');
+        const cls = !r.ok ? 'p-bad'
+                  : /delete/i.test(r.event) ? 'p-warn'
+                  : up ? 'p-acc'
+                  : /rename/i.test(r.event) ? 'p-dim' : 'p-ok';
+        const label = up && /^(Download|ImportComplete)$/.test(r.event)
+                    ? 'Upgrade' : r.event;
+        return `<tr><td class="dim">${new Date(r.at*1000).toLocaleTimeString()}</td>
+        <td>${esc(r.arr)}</td><td><span class="pill ${cls}">${esc(label)}</span></td>
+        <td class="dim mono wrap">${esc(r.detail)}</td></tr>`}).join('')+'</table>'
+    : '<div class="dim" style="padding:14px">no events yet — register the webhooks, then import or rename something</div>';
+  if(paint('hooks', html, true)) pulse(box.closest('.panel'));
+}
+async function registerHooks(){
+  const m=document.getElementById('hookmsg'); m.textContent='registering…';
+  const r=await (await fetch('/api/webhooks/register?base_url='+encodeURIComponent(location.origin),
+    {method:'POST'})).json();
+  m.innerHTML=Object.entries(r).map(([n,v])=>
+    `<span class="pill ${v.ok?'p-ok':'p-bad'}">${esc(n)} ${v.ok?(v.updated?'updated':'created'):esc(v.error||'failed')}</span>`).join(' ');
+  loadHooks(); loadHookState();
+}
+
+// Registration health. nuarr re-checks on a timer and repairs drift itself, so
+// this is a read-out, not something to act on - unless it stays red.
+async function loadHookState(){
+  const el=document.getElementById('hookstate');
+  if(!el) return;
+  try{
+    const s=await (await fetch('/api/webhooks/status')).json();
+    const names=Object.keys(s.arrs||{});
+    if(!names.length){ el.textContent='checking registration…'; return; }
+    const pills=names.map(n=>{
+      const v=s.arrs[n];
+      // null = the arr was unreachable, which is not the same as drifted
+      const cls=v.ok===true?'p-ok':(v.ok===null?'p-warn':'p-bad');
+      const what=v.action||(v.ok?'ok':'failed');
+      return `<span class="pill ${cls}">${esc(n)} ${esc(what)}</span>`;
+    }).join(' ');
+    const mins=Math.round((s.interval_s||900)/60);
+    el.innerHTML=`auto-registered · re-checked every ${mins} min · `
+      +`<span class="mono">${esc(s.base_url||'')}</span><br>${pills}`;
+  }catch(_){ el.textContent=''; }
+}
+loadPlayback(); loadAudit();
+setInterval(loadHooks,10000);
+loadHookState(); setInterval(loadHookState,60000);
+setInterval(loadHistory,5000);
+setInterval(loadGate,6000);
+loadHandlerBtns();
+// The FULL poll stays at 2 s - it carries the Finished list and the queue
+// preview, neither of which moves between frames.
+setInterval(loadJobs,3000);
+// The MOVING half runs four times as often against the cheap endpoint. Paused
+// when the tab is hidden: a backgrounded dashboard polling a busy encode box
+// four times a second is rude, and browsers throttle it into bursts anyway.
+let _liveBusy=false, _liveIdle=0;
+async function loadLive(){
+  if(_liveBusy || document.hidden) return;
+  // Nothing running means nothing moving: drop to every fourth tick (3 s)
+  // until work appears. The full poll notices new jobs anyway, and the first
+  // live poll after that resets the backoff.
+  if(runningJobs.size===0 && (++_liveIdle % 4)) return;
+  _liveIdle=0;
+  _liveBusy=true;
+  try{
+    const j = await (await fetch('/api/jobs/live')).json();
+    // A JOB THAT JUST ENDED IS THE FULL POLL'S BUSINESS.
+    //
+    // The ghost card stamps how the job finished - done, skipped, failed - and
+    // that verdict comes from the Finished list, which this payload does not
+    // carry. Painting the disappearance here would stamp every outcome "done",
+    // including failures. So when the set shrinks, hand over: ask for the full
+    // poll immediately and let it own this frame. Costs one extra request per
+    // completed job and keeps the ghosts truthful.
+    // Any CHANGE to the set, in either direction, is the full poll's business.
+    // A job ending needs its verdict for the ghost stamp; a job starting needs
+    // the pool counters in the header, which the full poll owns - otherwise a
+    // new card appears above a header still reading "3/4". Between changes,
+    // which is nearly all of the time, the cheap poll drives the bars.
+    const ids = j.running.map(w => w.job_id);
+    const changed = ids.length !== runningJobs.size
+                    || ids.some(id => !runningJobs.has(id));
+    if(changed){ loadJobs(); return; }
+    paintRunning(j);
+  }catch(_){ }
+  finally{ _liveBusy=false; }
+}
+setInterval(loadLive, 750);
+document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) loadLive(); });
+// 700 ms was only ever to drive the auto-scroll smoothly. With that gone the
+// list just needs to stay current, and a 300-row query every 0.7 s is wasted
+// work on a 2,000-file queue.
+loadQueue(); setInterval(loadQueue,2500);
+// Slower than the queue: the numbers here are library-wide totals that move in
+// minutes, not seconds, and each read counts rows across the whole files table.
+loadAuto(); setInterval(loadAuto,6000);
+// Tiles and library counts change as jobs finish, so refresh them too. Slower
+// than the job poll because the summary also stats every pool disk.
+setInterval(loadAll,15000);
+setInterval(loadLogs,3000);
+loadJobs();
+setInterval(loadLogJobs,15000);
+loadLogs(); loadLogJobs();
+loadAll();
+// ---- portal-wide button feedback -----------------------------------------
+// Preview, Queue, Stop, Requeue and the pool handlers each got a spinner and a
+// clock by hand. There are ~25 more buttons that fire a request and say
+// nothing, and hand-wiring each one means the next button added is silent
+// again. This wraps them generically instead: any handler that returns a
+// promise gets its button disabled with an inline spinner until it settles.
+//
+// The button is captured on the CAPTURE phase, which runs before the inline
+// onclick, so the wrapper knows which element to mark without every call site
+// having to pass it.
+// Cleared on the next macrotask, so ONLY the inline onclick running in this
+// same tick can claim it. Several of these functions - ffCheck, loadAll,
+// loadRenames - are also driven by timers and by other code; without the
+// clear they would spin whichever button happened to be pressed last, on a
+// call the user never made.
+let _clickedBtn=null;
+document.addEventListener('click', e=>{
+  const b=e.target && e.target.closest && e.target.closest('button');
+  if(!b) return;
+  _clickedBtn=b;
+  setTimeout(()=>{ if(_clickedBtn===b) _clickedBtn=null; }, 0);
+}, true);
+
+function _btnBusy(btn){
+  if(!btn || btn.dataset.busy) return null;
+  btn.dataset.busy='1';
+  btn.dataset.label=btn.innerHTML;
+  btn.disabled=true;
+  // Keep the button's width so the row does not reflow around a spinner that
+  // is narrower than the word it replaced.
+  btn.style.minWidth=btn.offsetWidth+'px';
+  btn.innerHTML='<span class="bspin"><i></i><i></i><i></i></span>';
+  return ()=>{
+    btn.disabled=false;
+    btn.innerHTML=btn.dataset.label||'';
+    btn.style.minWidth='';
+    delete btn.dataset.busy; delete btn.dataset.label;
+  };
+}
+
+// Wrap by NAME after everything is defined. Excluded: the five that already
+// have richer treatment (a named step and an elapsed clock in #qMsg), and the
+// pure-UI toggles that never touch the network - a spinner on a tab switch is
+// noise, not information.
+function autoBusy(names){
+  names.forEach(n=>{
+    const orig=window[n];
+    if(typeof orig!=='function') return;
+    window[n]=function(...a){
+      const btn=_clickedBtn;
+      let r;
+      try{ r=orig.apply(this,a); }
+      catch(e){ throw e; }
+      if(r && typeof r.then==='function'){
+        const done=_btnBusy(btn);
+        if(done) r.then(done, done);
+      }
+      return r;
+    };
+  });
+}
+autoBusy([
+  // library / scanning
+  'rescan','loadAll','loadRenames','loadOlder',
+  // queue + job actions
+  'cancelJob','cancelAll','qMove','retryRenames','retryCommits',
+  // ffmpeg tab - ffStage downloads ~160 MB, ffRollback rewrites the install
+  'ffCheck','ffStage','ffApply','ffRollback','ffRepair','ffUnpin','ffLog',
+  // settings / control
+  'registerHooks','resetWorkers','bump','ctl','ctlCancel',
+  // drill-downs and log views
+  // NOT watchLive: it now repaints its own card immediately, so the panel
+  // opening IS the feedback. Wrapping it replaced the button's label with a
+  // spinner for the length of the log fetch, which made a button that had just
+  // become instant look slow again.
+  // Not browse either, for the same reason as watchLive: it paints its own
+  // panel with a skeleton immediately, so replacing the button with a spinner
+  // would only make an instant control look slow.
+  'openJobLog','drillRaw','openRaw',
+]);
+
+// Fast poll: the whole point is to track a window that lasts a few seconds.
+// loadBoot() slows itself to a 5 s heartbeat once there is nothing to watch.
+loadBoot(); bootPoll(700);
+// Kick the ffmpeg verdict off directly rather than waiting its turn inside
+// loadAll(), which stats every pool disk first - that put the header bubble
+// seventeen seconds behind the rest of the page. The _ffChecking guard makes
+// loadAll()'s own call a no-op if this one is still in flight.
+ffCheck();
+</script></body></html>
+"""
+
+
+# --------------------------------------------------------------- /settings ----
+# The eight settings panes outgrew the horizontal strip they live in on the
+# dashboard: eight is more than a tab row reads well at, wtab() keeps its state
+# in a JS variable so a refresh always lands you back on Concurrency, and there
+# is no URL for "the Arrs guards" to bookmark or link to.
+#
+# This serves the SAME page with a sidebar over the top, rather than a second
+# copy of the markup. That matters more than it looks: a duplicated settings
+# page would be correct on the day it was written and quietly wrong the first
+# time a pane changed and only one copy was updated. Here there is exactly one
+# definition of every pane, and /settings cannot drift from it - it is the same
+# string with a script appended.
+#
+# Nothing is removed. The dashboard still has its tab strip and still works
+# exactly as before, so backing this out means ignoring a URL, and backing it
+# out properly means one snapshot restore (tools\Restore-NuarrUI.ps1).
+_SETTINGS_NAV = [
+    ("Processing", [("counts", "Concurrency",      "sliders"),
+                    ("timing", "Holds and timing", "clock"),
+                    ("gate",   "Job gate",         "shield"),
+                    ("lang",   "Subtitles",        "language"),
+                    ("vcodec", "Video codec",      "film"),
+                    ("acodec", "Audio codec",      "sliders"),
+                    ("alang",  "Audio language",   "language"),
+                    ("rules",  "Rules",            "list")]),
+    ("Tools",      [("ffmpeg",  "ffmpeg",          "film"),
+                    ("mkv",     "MKVToolNix",      "tool"),
+                    ("whisper", "Whisper",         "language")]),
+    ("Integrations", [("arrs", "Arrs",             "link"),
+                      ("plex", "Plex",             "play"),
+                      ("meta", "Metadata",         "globe")]),
+    ("System",     [("libs",   "Libraries",         "folder"),
+                    # Not a tool - it is where nuarr keeps its working files,
+                    # which puts it with Libraries and Backup rather than
+                    # beside ffmpeg.
+                    ("cache",  "Cache folder",      "folder"),
+                    ("jobs",   "Jobs",              "clock"),
+                    ("logs",   "Logs",              "file"),
+                    ("updates", "Updates",          "download"),
+                    ("backup", "Backup and restore", "database")]),
+]
+
+_SETTINGS_SHIM = """
+<script>
+// Turn the dashboard into a settings page, client-side, after everything else
+// has defined itself. Runs last, so wtab() and every pane loader already exist.
+(function(){
+  const NAV = %NAV%;
+  const KEYS = NAV.reduce((a,g)=>a.concat(g.items.map(i=>i.key)), []);
+
+  document.title = 'nuarr settings';
+
+  // Hide every dashboard panel except the Workers one, which is where the
+  // panes are injected. Addressed by id rather than by position or by class,
+  // so re-ordering the dashboard cannot quietly point this at the wrong panel.
+  const host = document.getElementById('workersPanel');
+  if(!host){ return; }                       // dashboard changed shape: leave it alone
+  for(const p of document.querySelectorAll('.panel')){
+    if(p !== host) p.style.display = 'none';
+  }
+  for(const g of document.querySelectorAll('.grid,.two')){
+    if(!g.contains(host)) g.style.display = 'none';
+  }
+  const gridParent = host.closest('.two,.grid');
+  if(gridParent){ gridParent.style.display='block'; }
+  const h2 = host.querySelector('h2'); if(h2) h2.style.display='none';
+
+  const wrap = document.createElement('div');
+  wrap.className = 'setwrap';
+  const side = document.createElement('div');
+  side.className = 'setside';
+  let html = '<div class="settitle">Settings</div>';
+  for(const g of NAV){
+    html += '<div class="setgrp">'+g.group+'</div>';
+    for(const it of g.items){
+      html += '<a class="setlink" data-k="'+it.key+'" href="#'+it.key+'">'+it.label+'</a>';
+    }
+  }
+  html += '<a class="setlink setback" href="/">&larr; Back to dashboard</a>';
+  side.innerHTML = html;
+
+  host.parentNode.insertBefore(wrap, host);
+  wrap.appendChild(side);
+  wrap.appendChild(host);
+  host.style.margin = '0';
+  host.style.border = '0';
+  host.style.flex   = '1';
+  host.style.minWidth = '0';
+
+  function go(key, push){
+    if(KEYS.indexOf(key) < 0) key = KEYS[0];
+    wtab(key);
+    for(const a of side.querySelectorAll('.setlink[data-k]')){
+      a.className = 'setlink' + (a.dataset.k===key ? ' on' : '');
+    }
+    if(push && location.hash !== '#'+key) history.replaceState(null,'','#'+key);
+  }
+  // The URL is the point of the exercise: /settings#arrs survives a refresh,
+  // can be bookmarked, and can be linked to from anywhere.
+  window.addEventListener('hashchange', ()=>go((location.hash||'').slice(1), false));
+  go((location.hash||'').slice(1) || KEYS[0], true);
+})();
+</script>
+"""
+
+_SETTINGS_CSS = """
+<style>
+.setwrap{display:flex;gap:0;align-items:stretch;border:1px solid var(--line);
+         border-radius:10px;overflow:hidden;margin:14px}
+.setside{width:210px;flex:0 0 210px;border-right:1px solid var(--line);
+         padding:12px 0;background:rgba(255,255,255,.02)}
+.settitle{font-size:15px;padding:2px 14px 10px;font-weight:500}
+.setgrp{font-size:10px;text-transform:uppercase;letter-spacing:.08em;
+        opacity:.55;padding:12px 14px 4px}
+.setlink{display:block;padding:6px 14px;font-size:13px;text-decoration:none;
+         color:inherit;border-left:2px solid transparent}
+.setlink:hover{background:rgba(255,255,255,.04)}
+.setlink.on{background:rgba(88,166,255,.12);border-left-color:#58a6ff;color:#58a6ff}
+.setback{margin-top:16px;opacity:.6;font-size:12px}
+/* Fill the window rather than sitting in a short box with the rest of the
+   page empty below it. The log is the one pane you read INTO, and 250 lines in
+   a 300px window meant scrolling a scrollbox inside a page that also scrolled.
+   The subtraction is the header, the stat cards and the filter strip. */
+.setwrap{min-height:calc(100vh - 175px)}
+#logsPane{display:flex;flex-direction:column;height:calc(100vh - 190px)}
+#logsPane .logbox{flex:1;min-height:0;max-height:none}
+#jobsPane .jgrp{font-size:10px;text-transform:uppercase;letter-spacing:.08em;
+  opacity:.55;padding:14px 0 4px}
+#jobsPane .jtab{width:100%;border-collapse:collapse}
+#jobsPane .jtab th{font-size:10px;padding:4px 8px}
+#jobsPane .jtab td{padding:8px;vertical-align:top;font-size:12px}
+#jobsPane .jwhat{font-size:11px;margin-top:2px}
+/* Folder picker */
+.pickbox{border:1px solid var(--line);border-radius:8px;margin:0 12px 10px;
+  overflow:hidden}
+.pickhead{display:flex;align-items:center;gap:9px;padding:7px 10px;
+  border-bottom:1px solid var(--line);background:rgba(255,255,255,.02);
+  font-size:12px}
+.picklist{max-height:280px;overflow-y:auto}
+.pickrow{display:flex;justify-content:space-between;gap:12px;padding:6px 12px;
+  font-size:12.5px;cursor:pointer;border-bottom:1px solid var(--line)}
+.pickrow:last-child{border-bottom:0}
+.pickrow:hover{background:rgba(88,166,255,.10)}
+/* Languages pane */
+#langPane .lkind{border:1px solid var(--line);border-radius:8px;margin-top:10px}
+#langPane .lkindhead{padding:7px 12px;border-bottom:1px solid var(--line);
+  background:rgba(255,255,255,.02);font-weight:500;font-size:12.5px;
+  display:flex;gap:10px;align-items:baseline;border-radius:8px 8px 0 0}
+#langPane .lkindhead .dim{font-weight:400;font-size:11px}
+#langPane .lcols{display:grid;grid-template-columns:1fr 1fr;gap:0}
+#langPane .lblock{padding:10px 12px}
+#langPane .lblock+.lblock{border-left:1px solid var(--line)}
+#langPane .lhead{font-size:10px;text-transform:uppercase;letter-spacing:.07em;
+  opacity:.6;margin-bottom:6px}
+#langPane .lorig{display:flex;align-items:center;gap:7px;font-size:12px;
+  padding:5px 0;border-bottom:1px solid var(--line);margin-bottom:6px}
+#langPane .lchips{display:flex;flex-wrap:wrap;gap:5px}
+#langPane .lchip{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;
+  border:1px solid var(--line);border-radius:14px;padding:2px 9px;cursor:pointer}
+#langPane .lchip.on{border-color:#2f6f4f;background:#12251c;color:var(--ok)}
+#langPane select{max-width:100%}
+@media(max-width:1100px){#langPane .lcols{grid-template-columns:1fr}
+  #langPane .lblock+.lblock{border-left:0;border-top:1px solid var(--line)}}
+/* The running saving, in the header subtitle. Green because it is the one
+   figure on this page that is unambiguously good news, and cursor:help
+   because the number on its own overstates what it means - the tooltip is
+   where "work done, not library size" gets said. */
+.hdrsave{color:var(--ok);font-weight:600;cursor:help}
+/* The Sonarr/Radarr connection boxes. Labels in a fixed column so the two
+   inputs line up under each other and the pair reads as one form rather than
+   two unrelated fields. */
+.arrconn{border:1px solid var(--line);border-radius:8px;padding:10px 12px;
+  margin-bottom:10px}
+.arrhead{display:flex;align-items:center;gap:9px;margin-bottom:8px}
+.arrrow{display:grid;grid-template-columns:88px minmax(0,1fr);gap:10px;
+  align-items:center;margin-top:6px}
+.arrrow label{font-size:11.5px;color:var(--dim)}
+.arrrow input{width:100%;font-family:inherit;font-size:12px}
+.arrhint{font-size:10.5px;color:var(--dim);margin:3px 0 0 98px;line-height:1.5}
+.arract{display:flex;align-items:center;gap:8px;margin-top:10px;
+  padding-top:9px;border-top:1px solid var(--line);flex-wrap:wrap}
+.arrmsg.ok{color:var(--ok)}
+.arrmsg.err{color:var(--bad)}
+@media(max-width:700px){
+  .arrrow{grid-template-columns:1fr}
+  .arrhint{margin-left:0}
+}
+/* The content-kind mix on a library row. Three fixed colours, used nowhere
+   else, so "anime" means the same thing every time it appears. */
+.kchips{display:flex;gap:5px;flex-wrap:wrap;margin-top:4px}
+.kchip{font-size:10.5px;border-radius:10px;padding:1px 8px;
+  border:1px solid var(--line);white-space:nowrap;
+  font-variant-numeric:tabular-nums}
+.k-anime{color:#d2a8ff;border-color:#4b3a63;background:rgba(210,168,255,.07)}
+.k-animation{color:#39d3c3;border-color:#2b5a55;background:rgba(57,211,195,.07)}
+.k-live{color:#8b98a6;border-color:var(--line)}
+/* The genre list in the folder header. Deliberately plain text rather than a
+   chip each: they are the EVIDENCE behind the verdict beside them, and six
+   more pills would compete with the one that matters. */
+.bgenres{font-size:11px;color:var(--dim);white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis;max-width:44ch}
+/* The asterisk marks a title where folder and metadata disagreed. Kept subtle:
+   it is a footnote on 2% of titles, not a warning. */
+.bmetarow .kchip{cursor:help}
+/* Codec panes. Reuses .lkind/.lkindhead/.lchip from the Languages pane on
+   purpose - the two pages do the same job (per-library policy) and should not
+   look like two different products. */
+/* .lkind and .lkindhead are declared under #langPane, so they did nothing
+   here - the sections rendered as bare text with no card around them. Repeated
+   rather than re-scoped, because widening the language selectors would change
+   that page too, and it is not the one being edited. */
+#vcodecPane .lkind,#acodecPane .lkind,#alangPane .lkind,#cachePane .lkind,#whisperPane .lkind{border:1px solid var(--line);
+  border-radius:8px;margin-top:10px}
+#vcodecPane .lkindhead,#acodecPane .lkindhead,#alangPane .lkindhead,#cachePane .lkindhead,#whisperPane .lkindhead{padding:7px 12px;
+  border-bottom:1px solid var(--line);background:rgba(255,255,255,.02);
+  font-weight:500;font-size:12.5px;display:flex;gap:10px;align-items:baseline;
+  border-radius:8px 8px 0 0}
+#vcodecPane .lkindhead .dim,#acodecPane .lkindhead .dim,#alangPane .lkindhead .dim{font-weight:400;
+  font-size:11px}
+#vcodecPane .lchip,#acodecPane .lchip,#alangPane .lchip{display:inline-flex;align-items:center;
+  gap:5px;font-size:11.5px;border:1px solid var(--line);border-radius:14px;
+  padding:2px 9px;cursor:pointer}
+#vcodecPane .lchip.on,#acodecPane .lchip.on,#alangPane .lchip.on{border-color:#2f6f4f;
+  background:#12251c;color:var(--ok)}
+/* CHILD SETTINGS. Indented under the switch that governs them, with a rule
+   down the left so the grouping survives a long list of explanations. When
+   the parent is off they collapse to one line rather than vanishing without
+   trace - "there is more here" is itself useful, and a setting that silently
+   disappears is one people hunt for. */
+.cfkids{margin:0 0 0 26px;border-left:2px solid var(--line);padding-left:14px}
+.cfkids.open{border-left-color:#2f6f4f}
+.cfkids .cfrow:last-child{border-bottom:none}
+.cfkidsoff{font-size:11.5px;padding:7px 0 9px;font-style:italic}
+/* the "how auto works" block at the top of the video tab */
+.cfintro{border:1px solid var(--line);border-radius:8px;padding:13px 16px;
+  margin-bottom:12px;background:rgba(255,255,255,.02)}
+.cfintro b{color:var(--fg)}
+.cfintro p{color:var(--dim);font-size:12px;margin:7px 0 0;line-height:1.5;max-width:90ch}
+.cfprobe{display:flex;gap:14px;flex-wrap:wrap;align-items:center;margin-top:10px;
+  font-size:11.5px}
+.cfe{display:inline-flex;gap:5px;align-items:center;font-weight:600}
+.cfe.y{color:var(--ok)} .cfe.n{color:#5a6470;font-weight:400}
+/* preset hint beside the dropdown */
+.cfpre{margin-left:8px;font-size:10.5px}
+/* the test row */
+.cftestrow{margin-top:12px;padding-top:11px;border-top:1px solid var(--line);
+  display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-size:11.5px}
+.cftest{flex:1 0 100%;margin-top:8px;padding:9px 12px;border-radius:6px;
+  font-size:11.5px;line-height:1.55}
+.cftest.ok{border:1px solid #1f4429;background:rgba(63,185,80,.07)}
+.cftest.bad{border:1px solid #5c2230;background:rgba(248,81,73,.07)}
+.cftest .warn{color:var(--warn)}
+#vcodecPane .lchips,#acodecPane .lchips,#alangPane .lchips{display:flex;flex-wrap:wrap;gap:5px;
+  justify-content:flex-end}
+.cfbody{padding:2px 0}
+/* THE LIBRARY NAME IS THE THING YOU ARE LOOKING FOR ON THIS PAGE.
+   Closed, the page is six of these and nothing else, so the name has to be
+   findable at a glance rather than read. Accent blue and bold is what the
+   drive names and every other primary identifier in this UI already use. */
+.ckhead{cursor:pointer;user-select:none}
+.ckhead:hover{background:rgba(88,166,255,.07)}
+.ckhead .clib{color:var(--acc);font-weight:600;font-size:13px}
+.ckhead .ccaret{color:var(--dim);font-size:10px;width:10px;display:inline-block}
+.ckhead .cchg{color:var(--acc);font-weight:600}
+.ckhead a{color:var(--dim)}
+.ckhead a:hover{color:var(--acc)}
+/* Square off the header's bottom corners once a body is showing under it. */
+.lkind.lopen>.lkindhead{border-radius:8px 8px 0 0}
+.lkind:not(.lopen)>.lkindhead{border-bottom:0;border-radius:8px}
+/* The impact box. Deliberately the same shape as the language page's: two
+   counts, a sample of what changes, and the action last. */
+.cimp{border:1px solid var(--line);border-radius:8px;padding:11px 13px;
+  background:#0e1218}
+.cimphead{font-size:10px;text-transform:uppercase;letter-spacing:.07em;
+  opacity:.6;margin-bottom:8px}
+.cimprow{font-size:12.5px;margin-bottom:8px}
+.cimprow .dim{font-size:11px;line-height:1.5;margin-top:2px}
+.cimprow b{font-variant-numeric:tabular-nums;font-size:14px}
+.cimpwarn{color:var(--warn)}
+.cimplist{margin:8px 0;border-top:1px solid var(--line);max-height:210px;
+  overflow-y:auto}
+.cimpf{display:flex;justify-content:space-between;gap:14px;padding:4px 0;
+  font-size:11.5px;border-bottom:1px solid var(--line)}
+.cimpf:last-child{border-bottom:0}
+.cimpf>span:first-child{overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap}
+.cimpf .dim{flex:0 0 auto;max-width:52%;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.cimpact{display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+  margin-top:10px;padding-top:9px;border-top:1px solid var(--line)}
+/* THE EXPLANATION IS PART OF THE ROW, not a tooltip.
+   Every number on these pages is one somebody measured, and the measurement is
+   the only thing that makes the number defensible. Hidden behind a hover it
+   would be read once and never again, which is how a settings page turns into
+   a row of sliders people guess at. */
+.cfrow{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:18px;
+  align-items:start;padding:10px 12px;border-top:1px solid var(--line)}
+.cfrow:first-child{border-top:0}
+.cfrow:hover{background:rgba(255,255,255,.018)}
+.cflabel{font-size:12.5px;font-weight:500;display:flex;align-items:center;
+  gap:8px;flex-wrap:wrap}
+.cfwhat{font-size:11px;line-height:1.5;margin-top:3px;max-width:78ch}
+.cfctl{display:flex;align-items:center;gap:6px;padding-top:1px}
+/* A CHANGED SETTING IS MARKED, because "which of these did I touch?" is the
+   question you have when an encode starts behaving unexpectedly, and reading
+   28 rows against remembered defaults is not an answer. */
+.cfrow.cfchanged{background:rgba(88,166,255,.045)}
+.cfrow.cfchanged .cflabel{color:var(--acc)}
+.cfreset{font-size:10px;padding:1px 7px;border-radius:10px;
+  border:1px solid var(--line);background:transparent;color:var(--dim);
+  cursor:pointer;font-family:inherit}
+.cfreset:hover{border-color:var(--acc);color:var(--acc)}
+.cfnum{display:inline-flex;align-items:center;gap:4px}
+.cfnum input{width:74px;text-align:right;font-variant-numeric:tabular-nums}
+.cfnum button{width:24px;padding:2px 0;line-height:1}
+.cfnum em{font-style:normal;font-size:10.5px;min-width:34px}
+.cfsw{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;
+  color:var(--dim);cursor:pointer}
+@media(max-width:900px){
+  .cfrow{grid-template-columns:1fr;gap:7px}
+  .cfctl{justify-content:flex-start}
+  #vcodecPane .lchips,#acodecPane .lchips,#alangPane .lchips{justify-content:flex-start}
+}
+@media(max-width:820px){.setwrap{display:block}.setside{width:auto;flex:none;
+  border-right:0;border-bottom:1px solid var(--line)}}
+</style>
+"""
+
+
+_PANES_MARKER = "<!--SETTINGSPANES-->"
+_PANES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "_panes_extracted.html")
+try:
+    with open(_PANES_FILE, encoding="utf-8") as _f:
+        _SETTINGS_PANES = _f.read()
+except OSError:
+    _SETTINGS_PANES = ""
+
+# Loud rather than silent. If the panes file goes missing, /settings would
+# still render - as a sidebar whose links all lead to a blank area, which looks
+# like a styling bug and would be hunted in the wrong place for an hour.
+if not _SETTINGS_PANES:
+    joblog.log("settings panes file is missing - /settings will have no "
+               f"content. Expected at {_PANES_FILE}", "error")
+
+
+@app.get("/settings", response_class=HTMLResponse)
+def settings_page() -> HTMLResponse:
+    import json as _json
+    nav = [{"group": g, "items": [{"key": k, "label": l} for k, l, _ in items]}
+           for g, items in _SETTINGS_NAV]
+    shim = _SETTINGS_SHIM.replace("%NAV%", _json.dumps(nav))
+    page = INDEX.replace(_PANES_MARKER, _SETTINGS_PANES)
+    page = page.replace("</body></html>", _SETTINGS_CSS + shim + "</body></html>")
+    return HTMLResponse(page, headers={
+        "Cache-Control": "no-store, no-cache, must-revalidate",
+        "Pragma": "no-cache",
+    })
+
+
+@app.get("/", response_class=HTMLResponse)
+def index() -> HTMLResponse:
+    # The dashboard is a single generated page that changes whenever the app is
+    # updated. Chrome cached it hard enough that a normal reload kept showing an
+    # older build - including buttons that no longer exist - which is confusing
+    # in exactly the way a live dashboard should never be.
+    return HTMLResponse(INDEX.replace(_PANES_MARKER, ""), headers={
+        "Cache-Control": "no-store, no-cache, must-revalidate",
+        "Pragma": "no-cache",
+    })
