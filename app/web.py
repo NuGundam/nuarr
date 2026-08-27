@@ -9026,12 +9026,20 @@ guess.">looks like data moving</span>${other.slice(0,3).map(m=>pair(m,'')).join(
     +'</tr></thead>'
     +rows.map(d=>{
       const pct = d.pct_used!=null ? d.pct_used : 0;
-      // A STATE SCALE, not an accent. The bar was accent-blue below 75%,
-      // which on a pool that lives around 50% meant every bar was the same
-      // decorative blue and the amber/red tiers existed only in theory - the
-      // colour carried no information at exactly the levels people actually
-      // see. Green/amber/red is a reading: fine, filling, act.
-      const col = pct>=90?'var(--bad)':(pct>=75?'var(--warn)':'var(--ok)');
+      // THE BAR FOLLOWS THE LABEL, because the label already had the right
+      // idea. The "% full" text colours by deviation from the pool median -
+      // amber for fuller, blue for emptier, white for typical - which is the
+      // question this panel exists to answer: is the balancer keeping these
+      // even? The bar meanwhile ran its own fullness scale, so the two
+      // elements of one cell disagreed about what colour means. One scheme
+      // now, the label's - with red kept as the override for a disk that is
+      // genuinely nearly full, since "about to run out" outranks "off the
+      // median" whichever way it is off.
+      const out = typeof outlier==='function' ? outlier(pct) : 0;
+      const col = pct>=90 ? 'var(--bad)'
+                : out>0   ? 'var(--warn)'
+                : out<0   ? '#79c0ff'
+                :           '#c2ccd6';
       const dc = diskColor(d.pool_disk);
       const a = io[d.pool_disk];
       // Same classes as the worker cards - m-read / m-write are the paired
@@ -9230,7 +9238,7 @@ The bar splits it by share of bytes moved — nuarr ${share(mine)}%, everything 
           + slot('sl-sys', sSys) + slot('sl-view', viewGrp);
       const watched = (_plexDisks||[]).indexOf(d.pool_disk)>=0;
       const hot = L && L.hot;
-      const out = outlier(pct);
+      // `out` computed up top, where the bar colour needs it too.
       // NO PILLS BESIDE THE NAME. "busy" and "watching" were added when the
       // activity row could not say either thing - it showed nuarr's own bytes
       // and nothing else, so a disk under a viewer or a backup looked idle and
@@ -9279,9 +9287,9 @@ The bar splits it by share of bytes moved — nuarr ${share(mine)}%, everything 
         <td class="num dcol-size"><b>${gb(tot)}</b></td>
         <td class="num dcol-used"><b>${gb(usd)}</b></td>
         <td class="dcol-bar"><div class="bar"><i style="width:${tot?(usd/tot*100).toFixed(1):0}%;
-             background:${tot&&usd/tot>=0.9?'var(--bad)':(tot&&usd/tot>=0.75?'var(--warn)':'var(--ok)')}"></i></div>
+             background:${tot&&usd/tot>=0.9?'var(--bad)':(tot&&usd/tot>=0.75?'var(--warn)':'#c2ccd6')}"></i></div>
             <div class="dim" style="font-size:11px"><span style="color:${
-              tot&&usd/tot>=0.9?'var(--bad)':(tot&&usd/tot>=0.75?'var(--warn)':'var(--ok)')}">${
+              tot&&usd/tot>=0.9?'var(--bad)':(tot&&usd/tot>=0.75?'var(--warn)':'#c2ccd6')}">${
               tot?(usd/tot*100).toFixed(1):0}% of pool</span><span
               class="dcol-of"> · ${gb(usd)} of ${gb(tot)}</span></div></td>
         <td class="num dcol-free"><b>${gb(fre)}</b></td></tr>
