@@ -551,7 +551,9 @@ function Run-Install {
     Tick "Registering the scheduled task"
     if ($S.AtBoot) { New-NuarrTask -Python $S.Python -Target $S.Target -AtBoot }
     else { New-NuarrTask -Python $S.Python -Target $S.Target }
-    Write-Uninstaller -Target $S.Target -DataDir $S.DataDir
+    $bv = '0.0.0'
+    try { $bv = (Get-Content (Join-Path $Root 'bundle.json') -Raw | ConvertFrom-Json).version } catch {}
+    Install-Uninstaller -Target $S.Target -DataDir $S.DataDir -Version $bv -Port $S.Port
     if ($S.Shortcut) { New-Shortcuts -Target $S.Target -Port $S.Port }
 
     Tick "Starting nuarr"

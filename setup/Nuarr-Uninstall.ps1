@@ -24,6 +24,12 @@ param(
   [string] $CacheDir = '',
   [string] $TaskName = 'nuarr',
   [int]    $Port     = 8770,
+  # The cache is REMOVED by default now. It only ever holds encodes in
+  # flight, Setup created it, and the first real uninstall left it behind as
+  # litter - "keeps your database" is a sensible surprise, "keeps an empty
+  # scratch folder" is just mess. The video-file guard below still refuses
+  # if anything that looks like media is inside.
+  [switch] $KeepCache,
   [switch] $RemoveData,
   [switch] $RemoveCache,
   [switch] $Force            # skip the confirmation prompt
@@ -38,7 +44,17 @@ function Say { param($m,$k='')
 if (-not ([Security.Principal.WindowsPrincipal] `
       [Security.Principal.WindowsIdentity]::GetCurrent()
      ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-  Write-Host "Run this as Administrator." -ForegroundColor Red; exit 1
+  # SELF-ELEVATE rather than scold. Programs and Features runs the uninstall
+  # string as the invoker - it does not elevate for us the way MSI does - so
+  # without this the entry would flash a red message and vanish.
+  $argv = @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"",
+            '-Target',"`"$Target`"",'-DataDir',"`"$DataDir`"",'-TaskName',"`"$TaskName`"")
+  if ($CacheDir)   { $argv += @('-CacheDir',"`"$CacheDir`"") }
+  if ($RemoveData) { $argv += '-RemoveData' }
+  if ($KeepCache)  { $argv += '-KeepCache' }
+  if ($Force)      { $argv += '-Force' }
+  try { Start-Process powershell.exe -ArgumentList $argv -Verb RunAs | Out-Null; exit 0 }
+  catch { Write-Host "Administrator rights are required." -ForegroundColor Red; exit 1 }
 }
 
 # ---- work out what is actually there before promising to remove it --------
@@ -62,7 +78,7 @@ $plan = [ordered]@{}
 $plan['scheduled task'] = $TaskName
 $plan['program folder'] = $Target
 $plan['data folder']    = if ($RemoveData)  { $DataDir }  else { "$DataDir  (KEEPING)" }
-$plan['cache folder']   = if ($RemoveCache) { if($CacheDir){$CacheDir}else{'(not found)'} }
+$plan['cache folder']   = if (-not $KeepCache) { if($CacheDir){$CacheDir}else{'(not found)'} }
                           else { "$(if($CacheDir){$CacheDir}else{'(not found)'})  (KEEPING)" }
 foreach ($k in $plan.Keys) { "  {0,-16} {1}" -f $k, $plan[$k] | Write-Host }
 Write-Host ""
@@ -127,6 +143,10 @@ Try-Step "Removed shortcuts" {
     if (Test-Path $p) { Remove-Item $p -Force }
   }
 }
+Try-Step "Removed the Programs and Features entry" {
+  Remove-Item 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\nuarr' `
+    -Recurse -Force -EA SilentlyContinue
+}
 Try-Step "Removed the firewall rule" {
   Get-NetFirewallRule -DisplayName 'nuarr*' -EA SilentlyContinue |
     Remove-NetFirewallRule -EA SilentlyContinue
@@ -147,7 +167,7 @@ if ($RemoveData) {
   Say "Kept $DataDir - reinstalling over it picks the library back up." 'warn'
 }
 
-if ($RemoveCache -and $CacheDir) {
+if ((-not $KeepCache) -and $CacheDir) {
   # A REFUSAL, NOT A DELETE, when the path looks wrong. The cache is the only
   # directory here that the user chose freely, so it is the only one that
   # could plausibly be pointed at something precious - a drive root, or the

@@ -518,25 +518,65 @@ function New-Shortcuts {
   } catch { Write-Step "Could not create the shortcut: $($_.Exception.Message)" 'warn' }
 }
 
-function Write-Uninstaller {
-  param([string]$Target, [string]$DataDir)
-  $txt = @"
+function Install-Uninstaller {
+  <#  Install the REAL uninstaller, and tell Windows it exists.
+
+      What shipped before was a hand-rolled batch stub that knew about the
+      task and the program folder and nothing else - not the shortcut, not
+      the cache, not the firewall rule - while the full Nuarr-Uninstall.ps1
+      sat in the bundle and never reached the target machine. Worse, a global
+      search-and-replace had baked PowerShell syntax into the batch text, so
+      two of its lines were noise to cmd.exe. The first real uninstall left
+      the desktop icon and the cache folder behind, which is how both facts
+      were discovered.
+
+      The wrapper copies the ps1 to TEMP and STARTS it detached before
+      exiting: a batch file is read incrementally, so a wrapper that stayed
+      alive inside C:\nuarr would hold the folder open against its own
+      deletion. The ps1 self-elevates, so the Programs and Features entry -
+      which Windows runs unelevated - works from a double-click too. #>
+  param([string]$Target, [string]$DataDir, [string]$Version, [int]$Port)
+  $src = Join-Path $PSScriptRoot 'Nuarr-Uninstall.ps1'
+  if (Test-Path -LiteralPath $src) {
+    Copy-Item $src (Join-Path $Target 'Nuarr-Uninstall.ps1') -Force
+  } else {
+    Write-Step "Nuarr-Uninstall.ps1 missing from the bundle" 'warn'; return
+  }
+  $cmd = @"
 @echo off
-REM  Removes the nuarr program and its scheduled task.
-REM  Your DATABASE and SETTINGS in $DataDir are left alone on purpose -
-REM  delete that folder by hand if you really want them gone.
-echo Stopping nuarr...
-[void](Invoke-SchTasks @('/End','/TN','nuarr'))
-[void](Invoke-SchTasks @('/Delete','/TN','nuarr','/F'))
-timeout /t 2 >nul
-echo Removing $Target ...
-rmdir /S /Q "$Target"
-del "%CommonProgramFiles%\..\..\Users\Public\Desktop\nuarr.lnk" >nul 2>&1
-echo.
-echo Removed. Data kept at: $DataDir
-pause
+REM  nuarr uninstaller. Removes the program, task, shortcut and cache;
+REM  KEEPS the database at $DataDir unless you pass -RemoveData.
+copy /Y "%~dp0Nuarr-Uninstall.ps1" "%TEMP%\Nuarr-Uninstall.ps1" >nul
+start "" powershell -NoProfile -ExecutionPolicy Bypass -File "%TEMP%\Nuarr-Uninstall.ps1" -Target "$Target" -DataDir "$DataDir" %*
 "@
   $p = Join-Path $Target 'Uninstall-nuarr.cmd'
-  [System.IO.File]::WriteAllText($p, $txt, (New-Object System.Text.ASCIIEncoding))
-  Write-Step "Uninstaller written to $p" 'ok'
+  [System.IO.File]::WriteAllText($p, $cmd, (New-Object System.Text.ASCIIEncoding))
+  Write-Step "Uninstaller installed to $p" 'ok'
+
+  # The Programs and Features entry. EstimatedSize is a DWORD in KB.
+  try {
+    $rk = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\nuarr'
+    New-Item -Path $rk -Force | Out-Null
+    $sz = 0
+    try {
+      $sz = [int](((Get-ChildItem $Target,$DataDir -Recurse -File -EA SilentlyContinue |
+                    Measure-Object Length -Sum).Sum) / 1KB)
+    } catch {}
+    $vals = @{
+      DisplayName     = 'nuarr'
+      DisplayVersion  = $Version
+      Publisher       = 'NuGundam'
+      InstallLocation = $Target
+      DisplayIcon     = (Join-Path $Target 'assets\Nuarr.ico')
+      UninstallString = "`"$p`""
+      URLInfoAbout    = 'https://github.com/NuGundam/nuarr'
+      InstallDate     = (Get-Date -Format 'yyyyMMdd')
+    }
+    foreach ($k in $vals.Keys) { New-ItemProperty -Path $rk -Name $k -Value $vals[$k] -Force | Out-Null }
+    foreach ($k in 'NoModify','NoRepair') { New-ItemProperty -Path $rk -Name $k -Value 1 -PropertyType DWord -Force | Out-Null }
+    if ($sz) { New-ItemProperty -Path $rk -Name EstimatedSize -Value $sz -PropertyType DWord -Force | Out-Null }
+    Write-Step "Registered in Programs and Features" 'ok'
+  } catch {
+    Write-Step "Could not register in Programs and Features: $($_.Exception.Message)" 'warn'
+  }
 }
