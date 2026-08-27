@@ -194,7 +194,7 @@ different build, or type `off` and it never contacts GitHub.
 
 ## Status
 
-Version 1.0.3. Built for one library and one server, then hardened by
+Version 1.0.6. Built for one library and one server, then hardened by
 installing it somewhere else: the installer and app have been through repeated
 clean-VM installs, which is where most of the sharp edges listed in the commit
 history were found and filed off. The primary deployment remains a 12-disk
