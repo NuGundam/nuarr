@@ -479,9 +479,15 @@ print('model ready')
 }
 
 function New-NuarrTask {
-  <#  A scheduled task rather than a service: nuarr needs a real user token to
-      reach mapped/pooled drives and the arrs, and Task Scheduler gives that
-      without a service wrapper. #>
+  <#  A scheduled task rather than a service, running as SYSTEM.
+
+      Honest trade-off, because the old comment claimed the opposite: SYSTEM
+      survives logoff and reboots unattended, but it CANNOT see mapped drive
+      letters - those belong to the login session that mapped them. Local
+      disks and pool mounts are fine; a P: that is really \\server\share is
+      invisible to the task even though Explorer shows it. The library-add
+      check explains this and points at UNC paths, which name the share
+      itself and work from any account that has share permissions. #>
   param([string]$Python, [string]$Target, [switch]$AtBoot)
   Write-Step "Creating the 'nuarr' scheduled task"
   [void](Invoke-SchTasks @('/Query','/TN','nuarr'))

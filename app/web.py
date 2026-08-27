@@ -1303,6 +1303,33 @@ def api_arrs_save(body: dict = Body(...)):
     return {"ok": True}
 
 
+@app.delete("/api/arrs/config")
+def api_arrs_forget(kind: str):
+    r"""Remove a stored arr connection entirely - URL, key and all.
+
+    The page had no way to do this: save demands a URL and treats a blank key
+    as "keep the stored one", both for good reasons, which together meant a
+    connection once entered could never be un-entered. Found on a test VM
+    that had been given production API keys during setup and then had no way
+    to give them back. Forgetting a connection is not the same as disabling
+    it: disabled keeps the credential on disk, and a machine that should not
+    hold a credential should be able to stop holding it.
+    """
+    from .config import SETTINGS
+    kind = (kind or "").lower()
+    if kind not in ("sonarr", "radarr"):
+        raise HTTPException(400, "kind must be sonarr or radarr")
+    arrs = [{"name": a.name, "kind": a.kind, "url": a.url,
+             "api_key": a.api_key, "enabled": bool(a.enabled)}
+            for a in SETTINGS.arrs if a.kind != kind]
+    if len(arrs) == len(SETTINGS.arrs):
+        raise HTTPException(404, f"no {kind} connection is stored")
+    _write_arrs(arrs)
+    joblog.log(f"{kind} connection forgotten - URL and API key removed "
+               f"from config.yml", "warn")
+    return {"ok": True}
+
+
 @app.post("/api/libraries/config/add")
 def api_libraries_add(name: str, path: str, kind: str = "tv"):
     from .config import SETTINGS
@@ -1316,6 +1343,25 @@ def api_libraries_add(name: str, path: str, kind: str = "tv"):
     if not os.path.isdir(path):
         # Refused, not warned. A library pointing nowhere indexes nothing and
         # looks identical to one that is simply empty.
+        #
+        # SAY WHY, when the why is a Windows session boundary. "Is not a
+        # folder that exists" was flatly contradicted by the Explorer window
+        # sitting next to it: a MAPPED drive letter belongs to the login
+        # session that mapped it, and nuarr runs as a scheduled task under
+        # SYSTEM, which has no such mapping. The folder is real; the letter
+        # is not, from here. Caught live against a mapped P: on a VM while
+        # the same path browsed fine in Explorer. A UNC path names the share
+        # itself rather than one session's abbreviation of it, so it means
+        # the same thing to every account - though the service account still
+        # needs share permissions to actually read it.
+        drive = os.path.splitdrive(path)[0]
+        if drive and not path.startswith("\\\\") and not os.path.exists(drive + "\\"):
+            raise HTTPException(400,
+                f"{path} is not visible to nuarr. {drive} looks like a mapped "
+                f"network drive - drive letters belong to your login session, "
+                f"and nuarr runs as a service that has no {drive}. Use the "
+                f"UNC path instead (\\\\server\\share\\...), and make sure "
+                f"the share allows the machine account to read it.")
         raise HTTPException(400, f"{path} is not a folder that exists")
     libs = [{"name": l.name, "path": l.path, "kind": l.kind,
              "enabled": bool(l.enabled)} for l in SETTINGS.libraries]
@@ -17993,6 +18039,9 @@ async function loadArrConns(){
       <div class="arract">
         <button onclick="arrTest('${a.kind}')">Test</button>
         <button onclick="arrSave('${a.kind}')">Save</button>
+        ${a.has_key?`<button onclick="arrForget('${a.kind}')"
+          title="Remove this connection entirely - URL and API key are deleted from nuarr's config. The ${esc(a.kind)} server itself is untouched."
+          style="color:var(--warn)">Forget</button>`:''}
         <span class="arrmsg dim" style="font-size:11.5px"></span>
       </div>
     </div>`).join('')
@@ -18033,6 +18082,25 @@ async function arrSave(kind){
     b.querySelector('.arrkey').value='';
     loadArrConns();                      // repaint the configured/not-set pill
     if(typeof loadArrs==='function') loadArrs();   // header pills
+  }catch(e){ m.textContent='✗ '+e.message; m.className='arrmsg err'; }
+}
+
+async function arrForget(kind){
+  // A held credential the holder cannot release is the worst kind. Confirm,
+  // because unlike Save this is not re-typeable from memory - the key field
+  // has to be fetched from the arr again.
+  if(!confirm(`Forget the ${kind} connection?\n\nThe URL and API key are removed from nuarr's config. `
+      +`The ${kind} server itself is untouched. Reconnecting later means re-entering the key.`)) return;
+  const b=_arrBox(kind), m=b.querySelector('.arrmsg');
+  m.textContent='forgetting…'; m.className='arrmsg dim';
+  try{
+    const res=await fetch('/api/arrs/config?kind='+encodeURIComponent(kind),{method:'DELETE'});
+    const r=await res.json();
+    if(!res.ok) throw new Error(r.detail||'failed');
+    m.textContent='forgotten - the key is no longer stored here';
+    m.className='arrmsg ok';
+    loadArrConns();
+    if(typeof loadArrs==='function') loadArrs();
   }catch(e){ m.textContent='✗ '+e.message; m.className='arrmsg err'; }
 }
 
