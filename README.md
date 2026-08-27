@@ -11,6 +11,10 @@ No Docker, no Node, no service wrapper.
 
 Running against a 12-disk pool: **39,556 files, 59.97 TB, 2.36 TB saved.**
 
+**[▶ Interactive presentation](https://nugundam.github.io/nuarr/presentation.html)** —
+a guided tour of the whole system with animated session cards and live-styled
+panels, no install needed.
+
 ![The dashboard](docs/screenshots/dashboard.png)
 
 ---
