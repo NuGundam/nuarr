@@ -370,9 +370,22 @@ def apply_staged() -> dict:
     task = os.environ.get("NUARR_TASK", "nuarr")
     pid = os.getpid()
     py = os.environ.get("NUARR_PYTHON", "") or "python"
+    data_env = os.environ.get("NUARR_DATA", "")
     helper = base / "apply-update.ps1"
+    # Environment the relaunched copy needs when there is no scheduled task to
+    # carry it (sandbox / source runs): without NUARR_DATA the new instance
+    # would come up pointed at the DEFAULT data directory - somebody else's
+    # database.
+    relaunch = (
+        f"schtasks /Run /TN {task} 2>&1 | Out-Null" if task != "none" else
+        ("$env:NUARR_TASK = 'none'\n"
+         + (f"$env:NUARR_DATA = '{data_env}'\n" if data_env else "")
+         + f'Start-Process "{py}" -ArgumentList '
+           f'"{os.path.join(root, "launch.py")}" '
+           f'-WorkingDirectory "{root}" -WindowStyle Hidden'))
     helper.write_text(f"""
 $ErrorActionPreference = 'Continue'
+Start-Transcript -Path "{base / 'apply.log'}" -Force | Out-Null
 Start-Sleep -Seconds 1
 {f"schtasks /End /TN {task} 2>&1 | Out-Null" if task != "none" else ""}
 # wait for the server process to be gone, up to 30s
@@ -382,20 +395,41 @@ for ($i=0; $i -lt 60; $i++) {{
 }}
 robocopy "{src}" "{root}" /E /NFL /NDL /NJH /NJS /NP /R:2 /W:2
 if ($LASTEXITCODE -ge 8) {{
-  Add-Content "{base / 'apply.log'}" "robocopy failed with $LASTEXITCODE - old install left in place"
+  Write-Output "robocopy failed with $LASTEXITCODE - old install left in place"
+}} else {{
+  Remove-Item "{base / 'staged'}" -Recurse -Force -ErrorAction SilentlyContinue
 }}
-Remove-Item "{base / 'staged'}" -Recurse -Force -ErrorAction SilentlyContinue
-{f"schtasks /Run /TN {task} 2>&1 | Out-Null" if task != "none" else f'Start-Process "{py}" -ArgumentList "{os.path.join(root, "launch.py")}" -WorkingDirectory "{root}" -WindowStyle Hidden'}
+{relaunch}
+Stop-Transcript | Out-Null
 """, encoding="utf-8")
     _set(state="applying")
     joblog.log(f"installing update {st['staged_version']} - nuarr will "
                f"restart", "warn")
-    flags = 0x00000008 | 0x00000200 | 0x08000000  # detached, new group, no window
-    subprocess.Popen(
-        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-         "-File", str(helper)],
-        creationflags=flags, close_fds=True,
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # THE HELPER MUST NOT BE OUR CHILD. A plain Popen makes it one, and a
+    # child dies with its parent's process tree: on a real install
+    # `schtasks /End` kills the task's whole tree - helper included, half a
+    # second before it was going to do the swap - and in the sandbox os._exit
+    # takes it down the same way. Found exactly so: staged tree verified,
+    # server exited cleanly, nothing swapped, no log. Win32_Process.Create
+    # parents the helper to the WMI service instead, outside our tree and
+    # outside the scheduled task's job, so it survives our death - which is
+    # the entire point of its existence.
+    hcmd = (f'powershell -NoProfile -ExecutionPolicy Bypass '
+            f'-WindowStyle Hidden -File "{helper}"')
+    spawn = (f"(Invoke-CimMethod -ClassName Win32_Process -MethodName Create "
+             f"-Arguments @{{CommandLine='{hcmd}'}}).ReturnValue")
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", spawn],
+            creationflags=0x08000000, capture_output=True, text=True,
+            timeout=60)
+        if r.stdout.strip().splitlines()[-1:] != ["0"]:
+            raise RuntimeError(f"WMI create returned {r.stdout.strip()!r} "
+                               f"{r.stderr.strip()!r}")
+    except Exception as e:                                   # noqa: BLE001
+        _set(state="ready", error="")
+        joblog.log(f"could not launch the update helper: {e}", "warn")
+        return {"ok": False, "error": f"could not launch the update helper: {e}"}
     if task == "none":
         # No task to /End us - exit under our own power once the response has
         # had a moment to flush.

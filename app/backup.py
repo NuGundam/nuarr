@@ -230,6 +230,10 @@ def _write_bundle(dest: Path) -> dict:
     # a compiler; wheels are the actual bytes. `pip download` is best-effort -
     # no network at backup time must not fail the backup.
     wheels = dest / "wheels"
+    # This one is ours to reset - stale wheels from a removed dependency
+    # would otherwise accumulate forever.
+    if wheels.exists():
+        shutil.rmtree(wheels, ignore_errors=True)
     wheels.mkdir(exist_ok=True)
     req = dest / "requirements.txt"
     failed: list[str] = []
@@ -369,8 +373,13 @@ def run_backup() -> dict:
         if have != want:
             STATE.update(phase="writing the program bundle "
                                "(source, ffmpeg, wheels, installer)", pct=70)
-            if shared.exists():
-                shutil.rmtree(shared, ignore_errors=True)
+            # REFRESH IN PLACE, never rmtree the whole folder. program-bundle
+            # is SHARED with the installer build: setup\, python\, mkvtoolnix\
+            # and the Setup/Uninstall cmds live there too, and this code once
+            # deleted all of them because it only knew about its own subtrees.
+            # _write_bundle already replaces exactly the parts it owns
+            # (program\, ffmpeg\<name>, wheels\); everything else in the
+            # folder is somebody else's and stays.
             info = _write_bundle(shared)
             marker.write_text(want, encoding="utf-8")
             (shared / "bundle.json").write_text(
