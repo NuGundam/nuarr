@@ -24,7 +24,12 @@ from . import joblog, version
 # GitHub's unauthenticated limit is 60 requests an hour per IP, shared with
 # anything else on this network. A check every 6 hours costs 4 of them a day
 # and still finds a release the same day it lands.
-CHECK_EVERY_S = 6 * 3600.0
+# ONCE PER DAY. It was six hours, which bought nothing - releases land at
+# most daily and each check is a network call to GitHub that shows up in
+# nobody's favour. Daily also makes the Jobs page entry honest: one row, one
+# cadence, matching what actually happens. "Check now" on the Updates page
+# still forces one on demand.
+CHECK_EVERY_S = 24 * 3600.0
 # Long enough for a slow morning, short enough that a hung request cannot stall
 # the settings page behind it.
 TIMEOUT_S = 12.0
@@ -474,11 +479,29 @@ def _mode() -> str:
 async def watch() -> None:
     """Background loop. Silent when there is no repo to ask about."""
     import asyncio
+
+    from . import schedules
+    # ON THE JOBS PAGE LIKE EVERY OTHER RECURRING JOB. This loop ran from the
+    # start, but nothing declared it, so "when does nuarr phone GitHub" could
+    # only be answered by reading the source - the exact gap the schedules
+    # registry exists to close. beat() fires only when a check actually goes
+    # to the network, so last-run is an observation, not the 60-second tick.
+    schedules.register(
+        "updates", "Update check", "System", CHECK_EVERY_S,
+        what="Asks GitHub once a day whether a newer nuarr release exists. "
+             "Never installs on its own: auto mode only downloads and "
+             "verifies during a quiet stretch, and installing is always "
+             "your click - from the power menu or Settings → Updates.")
     while True:
         try:
             if configured():
                 before = _STATE.get("latest", "")
+                fetched_before = _STATE.get("checked_at") or 0.0
                 st = await asyncio.to_thread(check)
+                if (st.get("checked_at") or 0.0) > fetched_before:
+                    schedules.beat("updates",
+                                   ("newest: " + st["latest"]) if st.get("latest")
+                                   else "no releases found")
                 after = st.get("latest", "")
                 # Logged only on a CHANGE. A line every six hours saying the
                 # version is the same one it was six hours ago is the kind of
