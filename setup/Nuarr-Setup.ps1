@@ -221,6 +221,11 @@ function Add-ArrRow {
   $Panel.Controls.Add((New-Label $Title 0 $Y 200 20))
   $u = New-Box '' 0 ($Y+22) 300
   $k = New-Box '' 308 ($Y+22) 240
+  # A CREDENTIAL FIELD SHOWS DOTS. This page has been screenshotted twice
+  # with live production API keys legible in it. Masking costs nothing -
+  # Test proves a key works without anyone reading it - and makes the
+  # screenshot leak impossible.
+  $k.UseSystemPasswordChar = $true
   $b = New-Btn 'Test' 556 ($Y+21) 70
   $st = New-Label '' 0 ($Y+48) 660 18 $FontSub $C.Dim   # $st, never $s - see Load-Detected
   $st.Text = $Note
@@ -395,15 +400,17 @@ function Load-Detected {
   # the script-level $S state object and every later $S.Something reads the
   # wrong thing. Cost an "unhandled exception" dialog to learn once.
   $son = Find-ArrConfig -Kind sonarr
-  $rSon.Url.Text = $son.Url; $rSon.Key.Text = $son.ApiKey
-  $rSon.Status.Text = if ($son.Found) { 'API key read from Sonarr''s own config.xml' } else { 'Not found locally - paste the URL and key if you have them' }
+  # DETECTED CREDENTIALS ARE USED, NOT SHOWN - they ride in $S and apply
+  # silently when the field is left blank; typing a key still overrides.
+  $rSon.Url.Text = $son.Url; $S.DetSonKey = $son.ApiKey
+  $rSon.Status.Text = if ($son.Found) { 'API key found in Sonarr''s config.xml - leave blank to use it' } else { 'Not found locally - paste the URL and key if you have them' }
   $rad = Find-ArrConfig -Kind radarr
-  $rRad.Url.Text = $rad.Url; $rRad.Key.Text = $rad.ApiKey
-  $rRad.Status.Text = if ($rad.Found) { 'API key read from Radarr''s own config.xml' } else { 'Not found locally - paste the URL and key if you have them' }
+  $rRad.Url.Text = $rad.Url; $S.DetRadKey = $rad.ApiKey
+  $rRad.Status.Text = if ($rad.Found) { 'API key found in Radarr''s config.xml - leave blank to use it' } else { 'Not found locally - paste the URL and key if you have them' }
   $tok = Find-PlexToken
   $rPlex.Url.Text = 'http://localhost:32400'
-  $rPlex.Key.Text = $tok
-  $rPlex.Status.Text = if ($tok) { 'Token read from the local Plex server' } else { 'No local Plex server - paste a token if you have one' }
+  $S.DetPlexTok = $tok
+  $rPlex.Status.Text = if ($tok) { 'Token found on the local Plex server - leave blank to use it' } else { 'No local Plex server - paste a token if you have one' }
   # whisper
   if ($S.Gpu) {
     $chkWhisper.Enabled = $true
@@ -451,12 +458,17 @@ function Collect-Page2 {
 }
 
 function Collect-Page3 {
+  # Typed beats detected; detected beats nothing. A URL is still required
+  # either way - a key with no server is not a connection.
   $arrs = @()
-  if ($rSon.Key.Text.Trim()) { $arrs += [pscustomobject]@{Name='Sonarr';Kind='sonarr';Url=$rSon.Url.Text.Trim();ApiKey=$rSon.Key.Text.Trim()} }
-  if ($rRad.Key.Text.Trim()) { $arrs += [pscustomobject]@{Name='Radarr';Kind='radarr';Url=$rRad.Url.Text.Trim();ApiKey=$rRad.Key.Text.Trim()} }
+  $sk = $rSon.Key.Text.Trim(); if (-not $sk) { $sk = "$($S.DetSonKey)".Trim() }
+  $rk = $rRad.Key.Text.Trim(); if (-not $rk) { $rk = "$($S.DetRadKey)".Trim() }
+  if ($sk -and $rSon.Url.Text.Trim()) { $arrs += [pscustomobject]@{Name='Sonarr';Kind='sonarr';Url=$rSon.Url.Text.Trim();ApiKey=$sk} }
+  if ($rk -and $rRad.Url.Text.Trim()) { $arrs += [pscustomobject]@{Name='Radarr';Kind='radarr';Url=$rRad.Url.Text.Trim();ApiKey=$rk} }
   $S.Arrs = $arrs
   $S.PlexUrl = $rPlex.Url.Text.Trim()
-  $S.PlexToken = $rPlex.Key.Text.Trim()
+  $pt = $rPlex.Key.Text.Trim(); if (-not $pt) { $pt = "$($S.DetPlexTok)".Trim() }
+  $S.PlexToken = $pt
   return $true
 }
 
@@ -598,17 +610,17 @@ $btnLibKind.Add_Click({
 
 $rSon.Btn.Add_Click({
   $rSon.Status.Text='Testing...'; $rSon.Status.ForeColor=$C.Dim
-  $r = Test-ArrConnection -Url $rSon.Url.Text -ApiKey $rSon.Key.Text -Kind sonarr
+  $r = Test-ArrConnection -Url $rSon.Url.Text -ApiKey $(if($rSon.Key.Text.Trim()){$rSon.Key.Text}else{$S.DetSonKey}) -Kind sonarr
   $rSon.Status.Text = $r.Detail; $rSon.Status.ForeColor = if($r.Ok){$C.Ok}else{$C.Bad}
 })
 $rRad.Btn.Add_Click({
   $rRad.Status.Text='Testing...'; $rRad.Status.ForeColor=$C.Dim
-  $r = Test-ArrConnection -Url $rRad.Url.Text -ApiKey $rRad.Key.Text -Kind radarr
+  $r = Test-ArrConnection -Url $rRad.Url.Text -ApiKey $(if($rRad.Key.Text.Trim()){$rRad.Key.Text}else{$S.DetRadKey}) -Kind radarr
   $rRad.Status.Text = $r.Detail; $rRad.Status.ForeColor = if($r.Ok){$C.Ok}else{$C.Bad}
 })
 $rPlex.Btn.Add_Click({
   $rPlex.Status.Text='Testing...'; $rPlex.Status.ForeColor=$C.Dim
-  $r = Test-PlexConnection -Url $rPlex.Url.Text -Token $rPlex.Key.Text
+  $r = Test-PlexConnection -Url $rPlex.Url.Text -Token $(if($rPlex.Key.Text.Trim()){$rPlex.Key.Text}else{$S.DetPlexTok})
   $rPlex.Status.Text = $r.Detail; $rPlex.Status.ForeColor = if($r.Ok){$C.Ok}else{$C.Bad}
 })
 
