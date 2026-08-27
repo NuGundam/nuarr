@@ -314,14 +314,13 @@ def _default_arrs() -> list[ArrConfig]:
 
 
 def _default_libraries() -> list[LibraryConfig]:
-    return [
-        LibraryConfig("Anime Shows", r"P:\Anime Shows", "tv"),
-        LibraryConfig("Animated Shows", r"P:\Animated Shows", "tv"),
-        LibraryConfig("TV Shows", r"P:\TV Shows", "tv"),
-        LibraryConfig("Anime Movies", r"P:\Anime Movies", "movie"),
-        LibraryConfig("Animated Movies", r"P:\Animated Movies", "movie"),
-        LibraryConfig("Movies", r"P:\Movies", "movie"),
-    ]
+    # EMPTY, deliberately. This used to return one specific person's six
+    # P:\ folders - reasonable when this file WAS that person's config, wrong
+    # from the moment the code ran anywhere else: a fresh install with an
+    # empty library list booted up showing somebody else's shelves, all
+    # marked (missing). No libraries is a true statement about a new machine;
+    # the UI has a Libraries page for adding real ones.
+    return []
 
 
 def load_settings() -> Settings:
@@ -360,10 +359,18 @@ def load_settings() -> Settings:
         if hasattr(s, k):
             setattr(s, k, v)
 
-    s.arrs = [ArrConfig(**a) for a in raw["arrs"]] if raw.get("arrs") else _default_arrs()
-    s.libraries = (
-        [LibraryConfig(**l) for l in raw["libraries"]] if raw.get("libraries") else _default_libraries()
-    )
+    # AN EXPLICIT EMPTY LIST IS AN ANSWER, NOT AN ABSENCE. `raw.get("arrs")`
+    # is falsy for [] as well as for a missing key, so a config that honestly
+    # said `libraries: []` was overridden by the defaults - which at the time
+    # were one particular machine's six library folders. Auto-detection is
+    # for a config that never mentions the key; a key that says "none" means
+    # none.
+    # (`or []` because a bare `libraries:` key parses as None, and iterating
+    # None would trade the old wrong answer for a crash.)
+    s.arrs = ([ArrConfig(**a) for a in (raw["arrs"] or [])]
+              if "arrs" in raw else _default_arrs())
+    s.libraries = ([LibraryConfig(**l) for l in (raw["libraries"] or [])]
+                   if "libraries" in raw else _default_libraries())
     if not s.tautulli_api_key:
         s.tautulli_api_key = _read_tautulli_key()
     if not (s.plex_url and s.plex_token):

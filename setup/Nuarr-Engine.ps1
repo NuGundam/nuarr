@@ -293,16 +293,34 @@ function Install-Packages {
 }
 
 function Install-Ffmpeg {
+  <#  Put the build where the app actually looks: DataDir\ffmpeg\bin.
+
+      The resolver in ffmpeg_update.py is two lines: if bin\ffmpeg.exe
+      exists, use it; otherwise fall back to SETTINGS.ffmpeg - whose default
+      is a path from the dev machine. This function used to mirror the
+      bundle verbatim, landing the exes in ffmpeg\jellyfin-7.1.4\, a folder
+      NOTHING reads. On the dev box the updater had long since created bin\
+      itself, so the misplacement was invisible; on a fresh machine every
+      ffmpeg-dependent feature reported "missing" while a perfectly good
+      build sat one directory over. #>
   param([string]$Bundle, [string]$DataDir)
   $src = Join-Path $Bundle 'ffmpeg'
   if (-not (Test-Path -LiteralPath $src)) { Write-Step "No ffmpeg in the bundle - skipping" 'warn'; return }
-  $dst = Join-Path $DataDir 'ffmpeg'
-  Write-Step "Restoring the pinned ffmpeg build"
-  New-Item -ItemType Directory -Force -Path $dst | Out-Null
-  robocopy $src $dst /E /NFL /NDL /NJH /NJS /NP /R:1 /W:1 | Out-Null
+  $exeSrc = Get-ChildItem -LiteralPath $src -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+  if (-not $exeSrc) { Write-Step "Bundle ffmpeg folder holds no ffmpeg.exe" 'warn'; return }
+  $bin = Join-Path $DataDir 'ffmpeg\bin'
+  Write-Step "Installing the bundled ffmpeg build"
+  New-Item -ItemType Directory -Force -Path $bin | Out-Null
+  robocopy $exeSrc.DirectoryName $bin /E /NFL /NDL /NJH /NJS /NP /R:1 /W:1 | Out-Null
   if ($LASTEXITCODE -ge 8) { throw "robocopy failed copying ffmpeg" }
-  $exe = Get-ChildItem -LiteralPath $dst -Recurse -Filter ffmpeg.exe | Select-Object -First 1
-  if ($exe) { Write-Step ("ffmpeg at {0}" -f $exe.FullName) 'ok' }
+  $ff = Join-Path $bin 'ffmpeg.exe'
+  $fp = Join-Path $bin 'ffprobe.exe'
+  if ((Test-Path $ff) -and (Test-Path $fp)) {
+    $v = (& $ff -version 2>$null | Select-Object -First 1)
+    Write-Step ("ffmpeg at {0} ({1})" -f $ff, ($v -replace '^ffmpeg version (\S+).*','$1')) 'ok'
+  } else {
+    Write-Step "ffmpeg/ffprobe did not land in bin - encodes will not work" 'bad'
+  }
 }
 
 function Install-MkvTools {
