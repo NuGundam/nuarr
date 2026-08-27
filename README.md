@@ -165,15 +165,27 @@ commit it.
 ## Updates
 
 nuarr shows its version beside its name and follows this repository's
-[Releases](../../releases) out of the box — checking is automatic, installing
-is always your click, because nuarr is usually mid-encode and swapping its own
-files under a running ffmpeg is the one outcome the whole system exists to
-prevent. Under `Settings → System → Updates` you can point it at a fork to
-follow a different build, or type `off` and it never contacts GitHub.
+[Releases](../../releases) out of the box. From 1.0.3 it updates itself: the
+badge in the header walks through *update available → downloading → ready to
+install*, and installing — from the power menu or `Settings → System →
+Updates` — downloads the release installer, verifies it byte-for-byte against
+GitHub's published size, stages the new program files, then restarts nuarr for
+a few seconds while a helper swaps them and brings it back. Your database and
+config are untouched.
+
+Two modes. **Manual** (the default) tells you and waits. **Auto** also does the
+download-and-verify step on its own — but only after ten unbroken minutes of
+idle, meaning no jobs running and nobody watching Plex, so the fetch never
+competes with a viewer for I/O. Installing is *always* your click in either
+mode, because nuarr is usually mid-encode and swapping its own files under a
+running ffmpeg is the one outcome the whole system exists to prevent.
+
+Under `Settings → System → Updates` you can point it at a fork to follow a
+different build, or type `off` and it never contacts GitHub.
 
 ## Status
 
-Version 1.0.1. Built for one library and one server, then hardened by
+Version 1.0.3. Built for one library and one server, then hardened by
 installing it somewhere else: the installer and app have been through repeated
 clean-VM installs, which is where most of the sharp edges listed in the commit
 history were found and filed off. The primary deployment remains a 12-disk

@@ -265,6 +265,13 @@ class Settings:
     # anyway so the panel has something honest to show for "how do updates
     # work here", rather than the answer living only in a comment.
     update_auto_check: bool = True
+    # "manual": nuarr tells you an update exists and waits.
+    # "auto":   nuarr also downloads and VERIFIES it during a quiet stretch
+    #           (no jobs, no viewers, for ten unbroken minutes), so Install
+    #           is instant when you choose it. Installing is a click in both
+    #           modes - the swap restarts nuarr, and when that happens is
+    #           never the software's call.
+    update_mode: str = "manual"
 
     # Tautulli - used to hold jobs while Plex is busy. Key is read from
     # Tautulli's own config so it is not duplicated here.

@@ -91,12 +91,21 @@ def _fetch(repo: str) -> list[dict]:
         tag = str(rel.get("tag_name") or rel.get("name") or "")
         if version.parse(tag) is None:
             continue        # not a version; see version.is_newer for why
+        # The installer asset, if one is attached - the thing self-update
+        # downloads. Name-matched rather than "first asset" so a stray
+        # checksum file or zip cannot be mistaken for the installer.
+        asset = next((a for a in (rel.get("assets") or [])
+                      if str(a.get("name", "")).lower().startswith("nuarr-setup")
+                      and str(a.get("name", "")).lower().endswith(".exe")), None)
         out.append({
             "version": tag.lstrip("vV"),
             "url": rel.get("html_url") or "",
             "notes": (rel.get("body") or "").strip(),
             "published": (rel.get("published_at") or "")[:10],
             "prerelease": bool(rel.get("prerelease")),
+            "asset_url": (asset or {}).get("browser_download_url", ""),
+            "asset_size": int((asset or {}).get("size") or 0),
+            "asset_name": (asset or {}).get("name", ""),
         })
     # Sorted by PARSED version, not by publish date: a patch to an older line
     # can be published after a newer minor, and date order would then offer it
@@ -171,7 +180,253 @@ def status() -> dict:
         "previous_url": s.get("previous_url", ""),
         "update_available": version.is_newer(latest),
         "releases": s.get("releases", []),
+        "mode": _mode(),
+        "apply": apply_status(),
     }
+
+
+# ------------------------------------------------------- self-update ----
+# DOWNLOAD AND VERIFY ARE AUTOMATIC (in auto mode, while idle); INSTALLING IS
+# STILL A DECISION. The staged build sits verified on disk and the header says
+# "ready to install"; the swap itself happens when the person says so - from
+# the power menu - or never. The one exception nuarr makes for itself is the
+# same one it makes for ffmpeg updates: nothing is ever written over the
+# running install in place. The swap is a staged copy, applied by a helper
+# process AFTER this one has exited, so a failed update leaves either the old
+# install or the new one - never a mixture.
+
+APPLY_DIR_NAME = "update"
+IDLE_STAGE_S = 600.0          # auto mode: this long with no jobs and no
+                              # viewers before the download starts
+_APPLY = {
+    "state": "idle",          # idle|downloading|verifying|ready|applying|error
+    "progress": 0.0,          # download fraction 0..1
+    "staged_version": "",
+    "error": "",
+}
+_APPLY_LOCK = threading.Lock()
+_IDLE_SINCE = [0.0]
+
+
+def _data_dir():
+    from .config import DATA_DIR
+    return DATA_DIR
+
+
+def _install_root() -> str:
+    """The folder holding app/ - what gets replaced on apply."""
+    import os
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def apply_status() -> dict:
+    with _APPLY_LOCK:
+        return dict(_APPLY)
+
+
+def _set(state=None, **kw):
+    with _APPLY_LOCK:
+        if state is not None:
+            _APPLY["state"] = state
+        _APPLY.update(kw)
+
+
+def stage(force: bool = False) -> dict:
+    r"""Download the latest release's installer, verify it, unpack the new
+    program tree into DATA_DIR\update\staged. Synchronous - run in a thread.
+
+    The download is the INSTALLER exe, not a bare zip, because that is the
+    one artifact every release is guaranteed to carry. The installer is
+    [stub][zip][offset:8]["NUARRSFX":8], a format this codebase defines, so
+    nuarr can lift the zip straight out of it - the update path and the
+    fresh-install path ship one file between them, which is one file whose
+    integrity matters instead of two.
+    """
+    import os
+    import shutil
+    import zipfile
+    st = check()
+    latest = st.get("latest") or ""
+    if not latest or not version.is_newer(latest):
+        return {"ok": False, "error": "no newer release to stage"}
+    rel = next((r for r in st.get("releases", [])
+                if r.get("version") == latest), None)
+    if not rel or not rel.get("asset_url"):
+        return {"ok": False, "error": "the release has no installer attached"}
+    with _APPLY_LOCK:
+        if _APPLY["state"] in ("downloading", "verifying", "applying"):
+            return {"ok": False, "error": f"already {_APPLY['state']}"}
+        if _APPLY["state"] == "ready" and \
+                _APPLY["staged_version"] == latest and not force:
+            return {"ok": True, "already": True}
+        _APPLY.update(state="downloading", progress=0.0, error="",
+                      staged_version="")
+    base = _data_dir() / APPLY_DIR_NAME
+    exe_path = base / rel["asset_name"]
+    staged = base / "staged"
+    try:
+        shutil.rmtree(staged, ignore_errors=True)
+        base.mkdir(parents=True, exist_ok=True)
+        # ---- download, with progress the UI can show -----------------------
+        req = urllib.request.Request(rel["asset_url"], headers={
+            "User-Agent": f"nuarr/{version.VERSION}"})
+        want = int(rel.get("asset_size") or 0)
+        got = 0
+        with urllib.request.urlopen(req, timeout=60) as r, \
+                open(exe_path, "wb") as f:
+            while True:
+                chunk = r.read(1 << 20)
+                if not chunk:
+                    break
+                f.write(chunk)
+                got += len(chunk)
+                if want:
+                    _set(progress=round(got / want, 3))
+        # SIZE IS THE FIRST TRUTH TEST. The packager this replaced shipped a
+        # silently truncated payload once; a byte count against what the API
+        # promised catches that class outright.
+        if want and got != want:
+            raise RuntimeError(f"download is {got:,} bytes, "
+                               f"the release says {want:,}")
+        _set(state="verifying", progress=1.0)
+        # ---- lift the zip out of the installer -----------------------------
+        with open(exe_path, "rb") as f:
+            f.seek(-16, 2)
+            tail = f.read(16)
+            if tail[8:] != b"NUARRSFX":
+                raise RuntimeError("installer payload marker missing")
+            zip_start = int.from_bytes(tail[:8], "little")
+            f.seek(0, 2)
+            zip_len = f.tell() - 16 - zip_start
+            f.seek(zip_start)
+            zpath = base / "payload.zip"
+            with open(zpath, "wb") as z:
+                left = zip_len
+                while left > 0:
+                    chunk = f.read(min(1 << 20, left))
+                    if not chunk:
+                        raise RuntimeError("payload ended early")
+                    z.write(chunk)
+                    left -= len(chunk)
+        # ---- unpack ONLY the program tree ----------------------------------
+        with zipfile.ZipFile(zpath) as z:
+            names = [n for n in z.namelist()
+                     if n.replace("\\", "/").startswith("program/")]
+            if not names:
+                raise RuntimeError("no program/ tree in the payload")
+            z.extractall(staged, members=names)
+        os.remove(zpath)
+        os.remove(exe_path)
+        # ---- the staged tree must SAY it is the version we asked for -------
+        vfile = staged / "program" / "app" / "version.py"
+        staged_ver = ""
+        for line in vfile.read_text(encoding="utf-8").splitlines():
+            if line.startswith("VERSION"):
+                staged_ver = line.split('"')[1]
+                break
+        if staged_ver != latest:
+            raise RuntimeError(f"staged tree is {staged_ver!r}, "
+                               f"expected {latest!r}")
+        _set(state="ready", staged_version=latest)
+        joblog.log(f"update {latest} downloaded and verified - "
+                   f"ready to install", "ok")
+        return {"ok": True, "staged": latest}
+    except Exception as e:                                   # noqa: BLE001
+        shutil.rmtree(staged, ignore_errors=True)
+        try:
+            os.remove(exe_path)
+        except OSError:
+            pass
+        _set(state="error", error=f"{type(e).__name__}: {e}")
+        joblog.log(f"update stage failed: {e}", "warn")
+        return {"ok": False, "error": str(e)}
+
+
+def apply_staged() -> dict:
+    r"""Swap the staged build in, by dying correctly.
+
+    A running process cannot safely replace its own program folder, so the
+    swap is done by a detached PowerShell helper: it stops the scheduled
+    task (which takes this process down), robocopies the staged tree over
+    the install, and starts the task again. Either every file copies and
+    the new version boots, or robocopy fails loudly and the OLD install is
+    still there to restart - the staged tree is never half-applied over a
+    running copy.
+    """
+    import os
+    import subprocess
+    st = apply_status()
+    if st["state"] != "ready":
+        return {"ok": False, "error": f"nothing staged (state={st['state']})"}
+    base = _data_dir() / APPLY_DIR_NAME
+    src = base / "staged" / "program"
+    if not (src / "app" / "version.py").exists():
+        _set(state="error", error="staged tree has gone missing")
+        return {"ok": False, "error": "staged tree has gone missing"}
+    root = _install_root()
+    # NUARR_TASK: 'nuarr' on a real install. The sandbox harness sets it to
+    # 'none' so the helper relaunches the copy it just updated directly
+    # instead of poking the production scheduled task from a test.
+    task = os.environ.get("NUARR_TASK", "nuarr")
+    pid = os.getpid()
+    py = os.environ.get("NUARR_PYTHON", "") or "python"
+    helper = base / "apply-update.ps1"
+    helper.write_text(f"""
+$ErrorActionPreference = 'Continue'
+Start-Sleep -Seconds 1
+{f"schtasks /End /TN {task} 2>&1 | Out-Null" if task != "none" else ""}
+# wait for the server process to be gone, up to 30s
+for ($i=0; $i -lt 60; $i++) {{
+  if (-not (Get-Process -Id {pid} -ErrorAction SilentlyContinue)) {{ break }}
+  Start-Sleep -Milliseconds 500
+}}
+robocopy "{src}" "{root}" /E /NFL /NDL /NJH /NJS /NP /R:2 /W:2
+if ($LASTEXITCODE -ge 8) {{
+  Add-Content "{base / 'apply.log'}" "robocopy failed with $LASTEXITCODE - old install left in place"
+}}
+Remove-Item "{base / 'staged'}" -Recurse -Force -ErrorAction SilentlyContinue
+{f"schtasks /Run /TN {task} 2>&1 | Out-Null" if task != "none" else f'Start-Process "{py}" -ArgumentList "{os.path.join(root, "launch.py")}" -WorkingDirectory "{root}" -WindowStyle Hidden'}
+""", encoding="utf-8")
+    _set(state="applying")
+    joblog.log(f"installing update {st['staged_version']} - nuarr will "
+               f"restart", "warn")
+    flags = 0x00000008 | 0x00000200 | 0x08000000  # detached, new group, no window
+    subprocess.Popen(
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+         "-File", str(helper)],
+        creationflags=flags, close_fds=True,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if task == "none":
+        # No task to /End us - exit under our own power once the response has
+        # had a moment to flush.
+        threading.Timer(2.0, lambda: os._exit(0)).start()
+    return {"ok": True, "installing": st["staged_version"]}
+
+
+def _system_idle() -> bool:
+    """No jobs running and nobody watching - the same bar ffmpeg updates use."""
+    try:
+        from . import jobs
+        if jobs.RUNNING:
+            return False
+    except Exception:                                        # noqa: BLE001
+        return False
+    try:
+        from . import gate
+        if gate.plex_playing():
+            return False
+    except Exception:                                        # noqa: BLE001
+        pass
+    return True
+
+
+def _mode() -> str:
+    try:
+        from .config import SETTINGS
+        m = (getattr(SETTINGS, "update_mode", "") or "").strip().lower()
+    except Exception:                                        # noqa: BLE001
+        m = ""
+    return m if m in ("auto", "manual") else "manual"
 
 
 async def watch() -> None:
@@ -189,6 +444,26 @@ async def watch() -> None:
                 if after and after != before and version.is_newer(after):
                     joblog.log(f"update available: {after} "
                                f"(running {version.VERSION})", "info")
+                # AUTO MODE STAGES WHILE IDLE - it does not install. The
+                # download and verify are the safe, interruptible part;
+                # doing them during a quiet stretch means the day someone
+                # clicks Install, the answer is seconds, not a 200 MB wait.
+                # Idle must HOLD for IDLE_STAGE_S before the download starts,
+                # so a gap between two encodes does not trigger it.
+                if _mode() == "auto" and st.get("update_available"):
+                    ap = apply_status()
+                    if ap["state"] in ("idle", "error") or (
+                            ap["state"] == "ready"
+                            and ap["staged_version"] != st.get("latest")):
+                        if _system_idle():
+                            if not _IDLE_SINCE[0]:
+                                _IDLE_SINCE[0] = time.time()
+                            elif time.time() - _IDLE_SINCE[0] >= IDLE_STAGE_S:
+                                await asyncio.to_thread(stage)
+                                _IDLE_SINCE[0] = 0.0
+                        else:
+                            _IDLE_SINCE[0] = 0.0
         except Exception:                                    # noqa: BLE001
             pass
-        await asyncio.sleep(900)     # re-evaluate every 15 min; check() gates
+        await asyncio.sleep(60)      # a minute of granularity for the idle
+                                     # clock; check() still gates the network

@@ -3333,6 +3333,41 @@ async def api_updates_repo(repo: str = ""):
     return updates.status()
 
 
+@app.post("/api/updates/stage")
+async def api_updates_stage():
+    """Download and verify the latest release now, whatever the mode."""
+    return await asyncio.to_thread(updates.stage, True)
+
+
+@app.post("/api/updates/apply")
+async def api_updates_apply():
+    """Install the staged update. nuarr restarts; the caller should expect
+    the connection to drop and poll / until it answers again."""
+    return updates.apply_staged()
+
+
+@app.post("/api/updates/mode")
+async def api_updates_mode(mode: str):
+    import yaml
+    from .config import SETTINGS
+    mode = (mode or "").strip().lower()
+    if mode not in ("auto", "manual"):
+        raise HTTPException(400, "mode must be auto or manual")
+    p = _config_path()
+    raw = {}
+    if p.exists():
+        try:
+            raw = yaml.safe_load(p.read_text(encoding="utf-8-sig")) or {}
+        except Exception:                                    # noqa: BLE001
+            raw = {}
+    raw["update_mode"] = mode
+    p.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True),
+                 encoding="utf-8")
+    SETTINGS.update_mode = mode
+    joblog.log(f"update mode set to {mode}", "info")
+    return updates.status()
+
+
 @app.get("/api/encoders")
 async def api_encoders(force: int = 0):
     """Which video encoders this machine can ACTUALLY use.
@@ -7357,6 +7392,7 @@ button[disabled]{opacity:.5;cursor:default}
   vertical-align:3px;font-variant-numeric:tabular-nums;white-space:nowrap}
 .vertag:hover{color:var(--fg);border-color:var(--dim)}
 .vertag-new{color:#d29922;border-color:#4a3a12;background:rgba(210,153,34,.09)}
+.vertag-ready{color:#3fb950;border-color:#1f4429;background:rgba(63,185,80,.09)}
 .pill.venc{color:#3fb950;border-color:#1f4429;font-weight:600}
 .pill.venc-cpu{color:#b48bf2;border-color:#3d2e5e}
 .pill.venc-fb{color:#d29922;border-color:#4a3a12}
@@ -8239,6 +8275,9 @@ input[type=time]::-webkit-calendar-picker-indicator{filter:invert(.75);cursor:po
           <path d="M6.9 6.6a8.2 8.2 0 1 0 10.2 0"/></svg>
       </button>
       <div class="menuBox" id="ctlMenu">
+        <button id="ctlUpdate" style="display:none;color:var(--acc)"
+                onclick="ctlUpdate()"></button>
+        <div id="ctlUpdateSep" class="menuSep" style="display:none"></div>
         <button onclick="ctl('restart',true)">Restart when idle</button>
         <button onclick="ctl('shutdown',true)">Shutdown when idle</button>
         <div class="menuSep"></div>
@@ -15005,25 +15044,47 @@ const GATE_META={
     on:'The gate is held shut until you turn this off. Running jobs finish; nothing new starts.',
     off:'Normal operation — the checks above decide.'},
 };
-// THE HEADER TAG. Fetched once per page load, never polled: a version cannot
-// change under a running process, and the update state moves on a six-hour
-// clock, so a second request would only ever confirm the first.
+// THE HEADER TAG - now a small state machine, polled gently, because the
+// update pipeline has states a person should see change without refreshing:
+// available (amber), downloading (progress), READY TO INSTALL (green). Five
+// minutes between polls, plus an immediate one after anything that changes
+// the state, is enough for a value that moves a few times a month.
+let _updState = null;
 async function loadVersion(){
   const el = document.getElementById('vertag');
   if(!el) return;
   try{
     const u = await (await fetch('/api/updates')).json();
-    el.textContent = 'v' + (u.current || '?');
-    if(u.update_available){
+    _updState = u;
+    const ap = u.apply || {state:'idle'};
+    el.classList.remove('vertag-new','vertag-ready');
+    if(ap.state === 'ready'){
+      el.classList.add('vertag-ready');
+      el.textContent = `${ap.staged_version} ready to install`;
+      el.title = `Update ${ap.staged_version} is downloaded and verified. `
+        + `Install it from the power menu (top right) - nuarr restarts briefly.`;
+    } else if(ap.state === 'downloading'){
+      el.classList.add('vertag-new');
+      el.textContent = `downloading ${u.latest} · ${Math.round((ap.progress||0)*100)}%`;
+      el.title = 'The update is downloading in the background.';
+      setTimeout(loadVersion, 3000);       // progress deserves a faster clock
+    } else if(ap.state === 'applying'){
+      el.classList.add('vertag-ready');
+      el.textContent = 'installing…';
+      el.title = 'nuarr is restarting into the new version.';
+      pollUntilBack();
+    } else if(u.update_available){
       el.classList.add('vertag-new');
       el.textContent = `v${u.current} → ${u.latest}`;
       el.title = `Version ${u.current}. Update ${u.latest} is available`
         + (u.latest_at ? ` (released ${u.latest_at})` : '') + ' - click for details';
     } else {
+      el.textContent = 'v' + (u.current || '?');
       el.title = `Version ${u.current}`
         + (u.build_date ? `, built ${u.build_date}` : '')
-        + (u.configured ? ' - up to date' : ' - update checks are not set up');
+        + (u.configured ? ' - up to date' : ' - update checks are off');
     }
+    ctlUpdatePaint();
   }catch(e){
     // A version that cannot be read is not worth an error state in the header;
     // the settings panel is where a failed check gets explained.
@@ -15031,6 +15092,55 @@ async function loadVersion(){
   }
 }
 loadVersion();
+setInterval(loadVersion, 300000);
+
+// ---- the power-menu entry ------------------------------------------------
+// The menu is where restart lives, and installing IS a restart with a
+// payload, so the action belongs beside its consequences.
+function ctlUpdatePaint(){
+  const b = document.getElementById('ctlUpdate');
+  const s = document.getElementById('ctlUpdateSep');
+  if(!b || !s || !_updState) return;
+  const u = _updState, ap = u.apply || {state:'idle'};
+  let label = null;
+  if(ap.state === 'ready') label = `Install update ${ap.staged_version}`;
+  else if(ap.state === 'downloading') label = `Downloading ${u.latest}…`;
+  else if(u.update_available) label = `Get update ${u.latest}`;
+  b.style.display = s.style.display = label ? '' : 'none';
+  if(label){ b.textContent = label; b.disabled = (ap.state === 'downloading'); }
+}
+async function ctlUpdate(){
+  const u = _updState; if(!u) return;
+  const ap = u.apply || {state:'idle'};
+  const m = document.getElementById('ctlMsg');
+  try{
+    if(ap.state === 'ready'){
+      if(!confirm(`Install ${ap.staged_version} now?\n\nnuarr restarts - anything mid-encode resumes afterwards.`)) return;
+      const r = await (await fetch('/api/updates/apply',{method:'POST'})).json();
+      if(!r.ok) throw new Error(r.error||'failed');
+      if(m) m.textContent = 'installing - the page will reconnect';
+      pollUntilBack();
+    } else {
+      // download+verify first; the button becomes Install when it is staged
+      if(m) m.textContent = 'downloading in the background…';
+      fetch('/api/updates/stage',{method:'POST'});
+      setTimeout(loadVersion, 1500);
+    }
+  }catch(e){ if(m) m.textContent = '✗ '+e.message; }
+}
+// After an apply the server goes away on purpose. Poll until it answers,
+// then reload - the returning page is the new version.
+function pollUntilBack(){
+  let tries = 0;
+  const t = setInterval(async ()=>{
+    tries++;
+    try{
+      const r = await fetch('/api/version',{cache:'no-store'});
+      if(r.ok){ clearInterval(t); location.reload(); }
+    }catch(e){}
+    if(tries > 120) clearInterval(t);      // two minutes, then give up quietly
+  }, 1000);
+}
 
 async function loadGate(){
   const g=await (await fetch('/api/gate')).json();
@@ -16945,12 +17055,34 @@ async function loadUpdates(force){
                       color:var(--fg);max-height:220px;overflow:auto">${esc(u.latest_notes)}</pre>
         </details>`:''}
       ${u.update_available?`
-        <div class="dim" style="font-size:11px;margin-top:9px;padding-top:8px;
-                                border-top:1px solid var(--line)">
-          nuarr does not update itself. Download the release, stop nuarr, and
-          run its installer - it keeps your database, so the library picks up
-          where it left off.
+        <div style="font-size:12px;margin-top:9px;padding-top:8px;
+                    border-top:1px solid var(--line);display:flex;gap:7px;
+                    align-items:center;flex-wrap:wrap">
+          ${(u.apply||{}).state==='ready'
+            ? `<button class="btn" onclick="ctlUpdate()">Install ${esc(u.apply.staged_version)} now</button>
+               <span class="dim" style="font-size:11.5px">downloaded and verified - nuarr restarts briefly to apply it</span>`
+            : (u.apply||{}).state==='downloading'
+            ? `<span class="dim">downloading… ${Math.round(((u.apply||{}).progress||0)*100)}%</span>`
+            : `<button class="btn" onclick="updStage()">Download &amp; verify</button>
+               <span class="dim" style="font-size:11.5px">fetches the installer, checks it byte-for-byte, and stages it - nothing restarts until you install</span>`}
+          ${(u.apply||{}).state==='error'?`<span class="err" style="font-size:11.5px">✗ ${esc((u.apply||{}).error||'')}</span>`:''}
         </div>`:''}
+    </div>
+
+    <div class="lkind" style="padding:11px 12px;margin-top:10px">
+      <b style="color:#6fb0ff">How updates arrive</b>
+      <div class="dim" style="font-size:11.5px;margin:4px 0 8px">
+        <b>Manual</b> - nuarr tells you and waits. <b>Auto</b> - nuarr also
+        downloads and verifies the update during a quiet stretch (no jobs, no
+        viewers, for ten unbroken minutes), so installing is instant when you
+        choose it. Installing always restarts nuarr, and is always your click
+        - from here or the power menu.
+      </div>
+      <div style="display:flex;gap:7px">
+        <button class="btn" id="updModeM" onclick="updMode('manual')">Manual</button>
+        <button class="btn" id="updModeA" onclick="updMode('auto')">Auto</button>
+        <span class="dim" style="font-size:11.5px;align-self:center">current: <b>${esc(u.mode||'manual')}</b></span>
+      </div>
     </div>
 
     <div class="lkind" style="padding:11px 12px">
@@ -16972,6 +17104,22 @@ async function loadUpdates(force){
     </div>`;
 }
 
+async function updStage(){
+  try{ fetch('/api/updates/stage',{method:'POST'}); }catch(e){}
+  // repaint on a short clock while the download runs
+  setTimeout(()=>{ loadUpdates(0); loadVersion(); }, 1500);
+  const t=setInterval(async ()=>{
+    const u=await (await fetch('/api/updates')).json();
+    _updState=u; ctlUpdatePaint();
+    if((u.apply||{}).state!=='downloading' && (u.apply||{}).state!=='verifying'){
+      clearInterval(t); loadUpdates(0); loadVersion();
+    } else { loadUpdates(0); }
+  }, 3000);
+}
+async function updMode(m){
+  await fetch('/api/updates/mode?mode='+m,{method:'POST'});
+  loadUpdates(0);
+}
 async function saveUpdRepo(){
   const inp=document.getElementById('updRepo');
   const msg=document.getElementById('updMsg');
