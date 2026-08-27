@@ -242,6 +242,13 @@ class Settings:
     pause_during_arr_rename: bool = True
     pause_during_pool_balance: bool = True
 
+    # NETWORK SHARES nuarr connects to as itself. The service runs as SYSTEM,
+    # which cannot see drive letters mapped in anyone's login session, so
+    # UNC access has to be authenticated BY the service with credentials it
+    # keeps. Same file and same threat model as the arr keys above.
+    # Entries: {server, username, password}.
+    net_shares: list = field(default_factory=list)
+
     # UPDATES. "owner/name" only - not a URL, because the API host and the
     # browse host differ and deriving both from one field is less to get wrong
     # than storing two and letting them disagree. Empty means nuarr never asks

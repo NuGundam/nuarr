@@ -504,6 +504,9 @@ async def _startup() -> None:
     asyncio.create_task(ffmpeg_update.watch())
     # Silent and request-free until a repo is configured - see updates.watch.
     asyncio.create_task(updates.watch())
+    # Stored network shares reconnect at boot: `net use` grants access per
+    # logon session, and this process's session began seconds ago.
+    asyncio.get_event_loop().run_in_executor(None, _net_reconnect_all)
     # Applies a STAGED build the moment the queue goes idle.
     asyncio.create_task(ffmpeg_update.apply_when_idle())
     asyncio.create_task(lifecycle.watch())
@@ -1107,11 +1110,38 @@ def api_fs_folders(path: str = ""):
                     total = free = 0
                 out.append({"name": root, "path": root, "free": free,
                             "total": total})
+        # Network servers nuarr holds credentials for, alongside the drives.
+        # These come from config, not discovery - a picker that scans the
+        # subnet is slow and shows machines nuarr cannot open anyway.
+        for c in _net_stored():
+            srv = c.get("server", "")
+            if srv:
+                out.append({"name": f"\\\\{srv}", "path": f"\\\\{srv}",
+                            "free": 0, "total": 0, "net": True})
         return {"path": "", "parent": None, "folders": out}
+
+    # A bare \\server is not a directory to scandir - it is a question to the
+    # server about what it shares. Answered with `net view`, filtered to disk
+    # shares, presented exactly like folders so the picker needs no new UI.
+    p2 = path.replace("/", "\\").rstrip("\\")
+    if p2.startswith("\\\\") and "\\" not in p2[2:]:
+        srv = p2[2:]
+        shares = _net_share_names(srv)
+        if not shares:
+            raise HTTPException(400,
+                f"\\\\{srv} lists no shares - check the credentials under "
+                f"'Connect a network share', and that the server is up")
+        return {"path": p2, "parent": "",
+                "folders": [{"name": s, "path": f"\\\\{srv}\\{s}",
+                             "free": 0, "total": 0} for s in shares]}
 
     path = os.path.normpath(path)
     if not os.path.isdir(path):
-        raise HTTPException(404, f"{path} is not a folder")
+        # A UNC path on a stored server gets ONE reconnect before the 404 -
+        # the `net use` session can idle out or die with a server reboot
+        # without the stored credentials being any less correct.
+        if not (path.startswith("\\\\") and _net_retry(path)):
+            raise HTTPException(404, f"{path} is not a folder")
     try:
         entries = []
         with os.scandir(path) as it:
@@ -1134,6 +1164,176 @@ def api_fs_folders(path: str = ""):
     if parent == path or len(path.rstrip("\\/")) <= 2:
         parent = ""                    # at a drive root: up goes to the list
     return {"path": path, "parent": parent, "folders": entries}
+
+
+# ---------------------------------------------------- network shares ----
+# WHY NUARR HOLDS SHARE CREDENTIALS ITSELF. The service runs as SYSTEM, and
+# SYSTEM has no access to anything mapped in a user's login session - Explorer
+# showing P:\ proves nothing about what the service can see. `net use` grants
+# access PER LOGON SESSION, so the connection has to be made BY the service,
+# with credentials it keeps: made once by an installer it would vanish at
+# reboot, made by the user it lands in the wrong session entirely. Stored in
+# config.yml alongside the arr keys - same file, same threat model, and the
+# file is already treated as secret.
+
+def _net_use(server: str, user: str, pwd: str) -> tuple[bool, str]:
+    """Authenticate this service's session to `server`. IPC$ is the
+    credential handshake share - connecting to it validates the login without
+    naming any real share."""
+    import subprocess
+    r = subprocess.run(
+        ["net", "use", f"\\\\{server}\\IPC$", pwd, f"/user:{user}",
+         "/persistent:no"],
+        capture_output=True, text=True, timeout=25, creationflags=NO_WINDOW)
+    if r.returncode == 0:
+        return True, ""
+    err = (r.stderr or r.stdout or "").strip().splitlines()
+    msg = err[0] if err else f"net use exited {r.returncode}"
+    # 1219: a session to this server already exists with other credentials.
+    # Windows allows exactly one identity per server per session, so the old
+    # one has to go first - done here rather than reported, because "delete
+    # the old connection yourself" is not an error message, it is homework.
+    if "1219" in msg:
+        subprocess.run(["net", "use", f"\\\\{server}", "/delete", "/y"],
+                       capture_output=True, text=True, timeout=15,
+                       creationflags=NO_WINDOW)
+        r = subprocess.run(
+            ["net", "use", f"\\\\{server}\\IPC$", pwd, f"/user:{user}",
+             "/persistent:no"],
+            capture_output=True, text=True, timeout=25,
+            creationflags=NO_WINDOW)
+        if r.returncode == 0:
+            return True, ""
+        err = (r.stderr or r.stdout or "").strip().splitlines()
+        msg = err[0] if err else f"net use exited {r.returncode}"
+    return False, msg
+
+
+def _net_share_names(server: str) -> list[str]:
+    """The shares `server` offers, minus the administrative ones."""
+    import subprocess
+    r = subprocess.run(["net", "view", f"\\\\{server}"], capture_output=True,
+                       text=True, timeout=25, creationflags=NO_WINDOW)
+    if r.returncode != 0:
+        return []
+    out, in_table = [], False
+    for line in (r.stdout or "").splitlines():
+        if line.startswith("---"):
+            in_table = True
+            continue
+        if not in_table or not line.strip():
+            continue
+        if line.lower().startswith("the command completed"):
+            break
+        # First column is the share name; "Disk" in the type column filters
+        # out printers and IPC entries.
+        parts = line.split()
+        if len(parts) >= 2 and parts[1].lower() == "disk" \
+                and not parts[0].endswith("$"):
+            out.append(parts[0])
+    return out
+
+
+def _net_stored() -> list[dict]:
+    from .config import SETTINGS
+    return list(getattr(SETTINGS, "net_shares", None) or [])
+
+
+def _net_reconnect_all() -> None:
+    """Re-establish every stored connection - run at startup, because a
+    `net use` made yesterday died with yesterday's boot."""
+    for c in _net_stored():
+        try:
+            ok, err = _net_use(c.get("server", ""), c.get("username", ""),
+                               c.get("password", ""))
+            if not ok:
+                joblog.log(f"network share {c.get('server')}: reconnect "
+                           f"failed - {err}", "warn")
+        except Exception as e:                               # noqa: BLE001
+            joblog.log(f"network share {c.get('server')}: {e}", "warn")
+
+
+def _net_server_of(path: str) -> str:
+    """'\\\\host\\share\\x' -> 'host', else ''."""
+    p = (path or "").replace("/", "\\")
+    if not p.startswith("\\\\"):
+        return ""
+    return p[2:].split("\\", 1)[0]
+
+
+def _net_retry(path: str) -> bool:
+    """One reconnect-and-retry for a UNC path on a stored server. The session
+    can drop (idle timeout, server reboot) without the config being wrong."""
+    srv = _net_server_of(path)
+    if not srv:
+        return False
+    hit = next((c for c in _net_stored()
+                if c.get("server", "").lower() == srv.lower()), None)
+    if not hit:
+        return False
+    ok, _ = _net_use(srv, hit.get("username", ""), hit.get("password", ""))
+    return ok and os.path.isdir(path)
+
+
+@app.post("/api/net/connect")
+def api_net_connect(body: dict = Body(...)):
+    """Store credentials for a server, connect as the service, list shares."""
+    import yaml
+    from .config import SETTINGS
+    server = str(body.get("server") or "").strip().strip("\\/")
+    user = str(body.get("username") or "").strip()
+    pwd = str(body.get("password") or "")
+    if not server or not user:
+        raise HTTPException(400, "server and username are required")
+    ok, err = _net_use(server, user, pwd)
+    if not ok:
+        raise HTTPException(400, f"could not connect to \\\\{server}: {err}")
+    shares = _net_share_names(server)
+    stored = [c for c in _net_stored()
+              if c.get("server", "").lower() != server.lower()]
+    stored.append({"server": server, "username": user, "password": pwd})
+    p = _config_path()
+    raw = {}
+    if p.exists():
+        try:
+            raw = yaml.safe_load(p.read_text(encoding="utf-8-sig")) or {}
+        except Exception:                                    # noqa: BLE001
+            raw = {}
+    raw["net_shares"] = stored
+    p.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True),
+                 encoding="utf-8")
+    SETTINGS.net_shares = stored
+    joblog.log(f"network share connected: \\\\{server} as {user} "
+               f"({len(shares)} share(s) visible)", "ok")
+    return {"ok": True, "server": server, "shares": shares}
+
+
+@app.delete("/api/net/connect")
+def api_net_forget(server: str):
+    import subprocess
+    import yaml
+    from .config import SETTINGS
+    server = (server or "").strip().strip("\\/")
+    stored = [c for c in _net_stored()
+              if c.get("server", "").lower() != server.lower()]
+    if len(stored) == len(_net_stored()):
+        raise HTTPException(404, f"no stored connection for {server}")
+    subprocess.run(["net", "use", f"\\\\{server}", "/delete", "/y"],
+                   capture_output=True, text=True, timeout=15,
+                   creationflags=NO_WINDOW)
+    p = _config_path()
+    raw = {}
+    if p.exists():
+        try:
+            raw = yaml.safe_load(p.read_text(encoding="utf-8-sig")) or {}
+        except Exception:                                    # noqa: BLE001
+            raw = {}
+    raw["net_shares"] = stored
+    p.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True),
+                 encoding="utf-8")
+    SETTINGS.net_shares = stored
+    joblog.log(f"network share forgotten: \\\\{server}", "warn")
+    return {"ok": True}
 
 
 @app.get("/api/libraries/config")
@@ -1340,7 +1540,8 @@ def api_libraries_add(name: str, path: str, kind: str = "tv"):
         raise HTTPException(400, "kind must be tv or movie")
     if any(l.name.lower() == name.lower() for l in SETTINGS.libraries):
         raise HTTPException(409, f"a library called {name!r} already exists")
-    if not os.path.isdir(path):
+    if not os.path.isdir(path) and not (path.startswith("\\\\")
+                                        and _net_retry(path)):
         # Refused, not warned. A library pointing nowhere indexes nothing and
         # looks identical to one that is simply empty.
         #
@@ -16098,7 +16299,33 @@ async function libPickAt(path){
         <button onclick="libPickClose()">Close</button></span>
     </div>
     <div class="picklist">${items||'<div class="dim" style="padding:10px 12px">no sub-folders here</div>'}</div>
+    ${!d.path?`
+    <div class="pickhead" style="border-top:1px solid var(--line);gap:6px;flex-wrap:wrap">
+      <span class="dim" style="font-size:11px" title="nuarr runs as a service, which cannot see drive letters mapped in your login session - it connects to shares itself, with credentials it keeps. Stored in nuarr's config like the arr keys.">Connect a network share:</span>
+      <input id="netSrv"  class="inp mono" style="width:130px" placeholder="server or IP">
+      <input id="netUser" class="inp mono" style="width:110px" placeholder="username">
+      <input id="netPass" class="inp mono" style="width:110px" type="password" placeholder="password">
+      <button onclick="netConnect()">Connect</button>
+      <span id="netMsg" class="dim" style="font-size:11px"></span>
+    </div>`:''}
   </div>`;
+}
+async function netConnect(){
+  const s=document.getElementById('netSrv').value.trim();
+  const u=document.getElementById('netUser').value.trim();
+  const p=document.getElementById('netPass').value;
+  const m=document.getElementById('netMsg');
+  if(!s||!u){ m.textContent='server and username are required'; return; }
+  m.textContent='connecting…';
+  try{
+    const res=await fetch('/api/net/connect',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({server:s,username:u,password:p})});
+    const r=await res.json();
+    if(!res.ok) throw new Error(r.detail||'failed');
+    // Straight into the server's share list - the point of connecting.
+    await libPickAt('\\\\'+r.server);
+  }catch(e){ m.textContent='✗ '+e.message; }
 }
 function libUse(p){
   const inp=document.getElementById(_pickInput);
