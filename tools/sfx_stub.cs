@@ -85,14 +85,23 @@ static class NuarrSfx
                 if (worker != null) throw worker;
             }
 
-            string setup = Path.Combine(stage, "Setup.cmd");
-            if (!File.Exists(setup))
-                throw new Exception("the archive unpacked but Setup.cmd is not in it");
+            // STRAIGHT INTO THE WIZARD, NO CONSOLE. The first cut ran
+            // `cmd.exe /c Setup.cmd`, which parks a black console window
+            // behind the wizard for the whole install - Setup.cmd exists for
+            // the unpack-the-zip-by-hand path, where its elevation check and
+            // pauses earn their keep. This stub already IS elevated (the
+            // manifest saw to that), so everything the cmd adds here is that
+            // window. -STA because the wizard's folder pickers are WinForms.
+            string wizard = Path.Combine(stage, "setup\\Nuarr-Setup.ps1");
+            if (!File.Exists(wizard))
+                throw new Exception("the archive unpacked but setup\\Nuarr-Setup.ps1 is not in it");
 
-            var psi = new ProcessStartInfo("cmd.exe", "/c \"" + setup + "\"")
+            var psi = new ProcessStartInfo("powershell.exe",
+                "-NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File \"" + wizard + "\"")
             {
                 WorkingDirectory = stage,
-                UseShellExecute = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
             };
             using (var p = Process.Start(psi))
             {
