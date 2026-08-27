@@ -523,6 +523,16 @@ async def _startup() -> None:
     # Stored network shares reconnect at boot: `net use` grants access per
     # logon session, and this process's session began seconds ago.
     asyncio.get_event_loop().run_in_executor(None, _net_reconnect_all)
+    # Keep Programs and Features telling the truth: the in-app updater swaps
+    # the program without telling Windows, so nuarr re-registers itself every
+    # boot - version, size, and a freshly written uninstall wrapper.
+    def _arp_ensure():
+        try:
+            from . import arp
+            arp.ensure()
+        except Exception:
+            pass
+    asyncio.get_event_loop().run_in_executor(None, _arp_ensure)
     # Applies a STAGED build the moment the queue goes idle.
     asyncio.create_task(ffmpeg_update.apply_when_idle())
     asyncio.create_task(lifecycle.watch())

@@ -50,6 +50,17 @@ foreach ($f in 'launch.py','serve.py','cleanup.py','start-nuarr.cmd','README.md'
   $s = Join-Path $Source $f
   if (Test-Path $s) { Copy-Item $s $P -Force }
 }
+# THE UNINSTALLER RIDES IN THE PROGRAM TREE from 1.0.6 on. It used to reach
+# the machine only through the wizard, which meant a copy installed once and
+# then self-updated forever carried a fossilised uninstaller - and app/arp.py,
+# which re-registers the Programs and Features entry at every boot, needs the
+# ps1 to be a file the updater refreshes like any other.
+$unSrc = Join-Path $Bundle 'setup\Nuarr-Uninstall.ps1'
+if (Test-Path -LiteralPath $unSrc) {
+  Copy-Item $unSrc (Join-Path $P 'Nuarr-Uninstall.ps1') -Force
+} else {
+  throw "setup\Nuarr-Uninstall.ps1 is missing from the bundle - the program tree must carry it"
+}
 Remove-Item (Join-Path $P 'app\__pycache__') -Recurse -Force -EA SilentlyContinue
 Say "copied $((Get-ChildItem (Join-Path $P 'app\*.py')).Count) modules"
 
