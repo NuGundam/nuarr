@@ -178,6 +178,17 @@ def media_roots() -> dict[str, str]:
         pass
 
     out: dict[str, str] = {}
+    # LABELS THAT ARE ALREADY PATHS measure themselves. The direct-walk scan
+    # (non-pool libraries) labels files with the share root or the drive
+    # letter rather than a volume label, and both are things disk_usage()
+    # accepts as-is - a UNC root reports the share's capacity over SMB, which
+    # is the only capacity that path HAS from this machine. Without this the
+    # label matched no local volume and the panel showed 0 free of 0.
+    for lbl in want:
+        if lbl.startswith("\\\\"):
+            out.setdefault(lbl, lbl if lbl.endswith("\\") else lbl + "\\")
+        elif len(lbl) == 2 and lbl[1] == ":":
+            out.setdefault(lbl, lbl + "\\")
     try:
         # Volumes WITHOUT a drive letter included: a pool member is routinely
         # mounted with none, and those are exactly the disks being measured.
@@ -655,6 +666,58 @@ def scan_pool(pool_root: str = "P:\\", libraries: list[str] | None = None
         # Hand the pooled thread back at normal priority, or whatever runs on
         # it next inherits Very Low I/O for the life of the process.
         bg.set(False)
+
+    # ---- LIBRARIES THAT ARE NOT ON THE POOL AT ALL -------------------------
+    # Everything above walks DrivePool's PoolPart folders, which is right for
+    # the pool and DEAD WRONG as the only path: a library on a plain folder -
+    # C:\Movies on an ordinary PC, or \\server\share from a machine that
+    # mounts its media over the network - matched no PoolPart and was simply
+    # never walked. The scan reported disks=0, on_disk=0, and the library sat
+    # at zero files forever while its folder plainly held media. Found on the
+    # first install whose storage was not this dev machine's pool, which is
+    # to say: found on the first install.
+    #
+    # These get a direct walk instead. The "disk" label - which everything
+    # downstream treats as an opaque spindle name - becomes the share root
+    # (\\server\share) or the drive letter, which is exactly the granularity
+    # the OS actually offers here: one filesystem, one queue, one label. The
+    # per-spindle machinery keys off those labels and degrades honestly to
+    # per-filesystem.
+    pooled_norm = os.path.normcase(os.path.normpath(pool_root))
+    for lib in SETTINGS.libraries:
+        if not lib.enabled or lib.name not in libs:
+            continue
+        lp = os.path.normpath(lib.path)
+        if os.path.normcase(lp).startswith(pooled_norm):
+            continue                 # on the pool - the PoolPart walk owns it
+        if not os.path.isdir(lp):
+            continue                 # missing folders are reported elsewhere
+        if lp.startswith("\\\\"):
+            parts = lp.lstrip("\\").split("\\")
+            label = "\\\\" + "\\".join(parts[:2]) if len(parts) >= 2 else lp
+        else:
+            label = os.path.splitdrive(lp)[0] or lp
+        PROGRESS.update(disk=label, library=lib.name)
+        for dirpath, _dirs, files in os.walk(lp):
+            for fn in files:
+                if os.path.splitext(fn)[1].lower() not in MEDIA_EXT:
+                    continue
+                real = os.path.join(dirpath, fn)
+                if is_excluded(real):
+                    continue
+                try:
+                    st = os.stat(real)
+                except OSError:
+                    continue
+                # path == real_path here: there is no pooled alias to translate
+                # to, the path the scanner saw IS the path everything else uses.
+                found[os.path.normcase(real)] = DiskFile(
+                    path=real, real_path=real, disk=label,
+                    library=lib.name,
+                    size=st.st_size, mtime=_sane_mtime(st, walk_now),
+                )
+                PROGRESS["files"] = len(found)
+
     PROGRESS.update(disk=None, library=None)
     return found
 
