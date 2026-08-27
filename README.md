@@ -102,13 +102,22 @@ check self-heals: a finding is queued, fixed, and re-verified.
 - ffmpeg — bundled
 - MKVToolNix command-line tools (`mkvmerge`, `mkvpropedit`, `mkvextract`) —
   bundled; an existing MKVToolNix install is used instead if present
-- Plex, and Sonarr / Radarr if you want nuarr to keep names in step with them
+- Plex
+- **Sonarr and/or Radarr — at least one is required.** nuarr's imports,
+  renames and library bookkeeping run through them; installed without one it
+  looks fine and then quietly cannot keep the library consistent, so Setup
+  insists on a working connection to at least one
 - A scratch directory on fast local storage, off the pool
 
 A GPU is optional. nuarr probes what the machine can actually do by
 test-encoding two seconds with each encoder family, because `ffmpeg -encoders`
 lists what was compiled in, not what works — a build will happily advertise
 QSV and AMF on a box with only an NVIDIA card.
+
+Whisper (audio language detection) is optional too, and installs later with
+one click from `Settings → Whisper` — GPU or CPU. Without it, untagged audio
+is still named by inference; with it, nuarr writes what the track actually
+contains.
 
 ## Install
 
