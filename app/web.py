@@ -9026,7 +9026,12 @@ guess.">looks like data moving</span>${other.slice(0,3).map(m=>pair(m,'')).join(
     +'</tr></thead>'
     +rows.map(d=>{
       const pct = d.pct_used!=null ? d.pct_used : 0;
-      const col = pct>=90?'var(--bad)':(pct>=75?'var(--warn)':'var(--acc)');
+      // A STATE SCALE, not an accent. The bar was accent-blue below 75%,
+      // which on a pool that lives around 50% meant every bar was the same
+      // decorative blue and the amber/red tiers existed only in theory - the
+      // colour carried no information at exactly the levels people actually
+      // see. Green/amber/red is a reading: fine, filling, act.
+      const col = pct>=90?'var(--bad)':(pct>=75?'var(--warn)':'var(--ok)');
       const dc = diskColor(d.pool_disk);
       const a = io[d.pool_disk];
       // Same classes as the worker cards - m-read / m-write are the paired
@@ -9250,7 +9255,7 @@ The bar splits it by share of bytes moved — nuarr ${share(mine)}%, everything 
         <td class="num dim dcol-used">${gb(d.used!=null?d.used:d.bytes)}</td>
         <td class="dcol-bar"><div class="bar"><i style="width:${pct}%;background:${col}"></i></div>
             <div style="font-size:11px"><span class="fillpct ${
-                out?(out>0?'fill-hi':'fill-lo'):''}"${out?` style="opacity:${
+                out?(out>0?'fill-hi':'fill-lo'):''}"${!out?` style="color:${col}"`:''}${out?` style="opacity:${
                   (0.78+0.22*outStrength(pct)).toFixed(2)};font-weight:${
                   outStrength(pct)>0.45?600:500}" title="${
                   Math.abs(pct-midFill).toFixed(1)} points ${
@@ -9274,8 +9279,10 @@ The bar splits it by share of bytes moved — nuarr ${share(mine)}%, everything 
         <td class="num dcol-size"><b>${gb(tot)}</b></td>
         <td class="num dcol-used"><b>${gb(usd)}</b></td>
         <td class="dcol-bar"><div class="bar"><i style="width:${tot?(usd/tot*100).toFixed(1):0}%;
-             background:var(--acc)"></i></div>
-            <div class="dim" style="font-size:11px">${tot?(usd/tot*100).toFixed(1):0}% of pool<span
+             background:${tot&&usd/tot>=0.9?'var(--bad)':(tot&&usd/tot>=0.75?'var(--warn)':'var(--ok)')}"></i></div>
+            <div class="dim" style="font-size:11px"><span style="color:${
+              tot&&usd/tot>=0.9?'var(--bad)':(tot&&usd/tot>=0.75?'var(--warn)':'var(--ok)')}">${
+              tot?(usd/tot*100).toFixed(1):0}% of pool</span><span
               class="dcol-of"> · ${gb(usd)} of ${gb(tot)}</span></div></td>
         <td class="num dcol-free"><b>${gb(fre)}</b></td></tr>
       <tr class="iorow"><td colspan="6"><div class="diskio">${(()=>{

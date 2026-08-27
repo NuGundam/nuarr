@@ -112,13 +112,32 @@ QSV and AMF on a box with only an NVIDIA card.
 
 ## Install
 
-Download the installer from [Releases](../../releases) and run it. The wizard
-finds Plex, Sonarr and Radarr on the machine, tests each connection before it
-continues, and lets you pick which folders are libraries.
+Download the installer from [Releases](../../releases) and run it — one exe,
+double-click, UAC prompt, wizard. Setup installs Python and the MKVToolNix
+command-line tools if the machine lacks them, places its own ffmpeg build,
+detects Sonarr / Radarr / Plex where it can (detected credentials are used
+silently, never displayed), and tests every connection before it continues.
 
-To remove it, `Uninstall.cmd` sits next to `Setup.cmd`. It keeps your database
-by default so reinstalling picks the library back up, and it never touches
-media.
+nuarr registers in **Programs and Features**, so uninstalling works from
+Windows Settings like any other application. The uninstaller removes the
+program, scheduled task, shortcut, cache and network connections; it keeps
+your **database** by default so reinstalling picks the library back up, and it
+never touches media — if the cache folder unexpectedly contains video, it
+refuses and tells you to look yourself.
+
+## Storage
+
+nuarr indexes three kinds of storage, and is honest about what each can do:
+
+| | |
+|---|---|
+| **StableBit DrivePool** | The full experience: files are attributed to the physical spindle they live on, so nuarr yields the exact disk a viewer is reading, orders scans quietest-disk-first, and shows per-disk load |
+| **Plain folders** | `C:\Movies` on any machine works — files are tracked per drive, with real capacity and free-space figures |
+| **Network shares** | nuarr connects to SMB shares **as the service**, with credentials you give it once (Browse → "Connect a network share"). It reconnects after reboots. Per-spindle intelligence degrades to per-share, because that is all SMB exposes |
+
+A note on mapped drives: `P:\` mapped in your login session is invisible to a
+service — that is Windows, not nuarr. Use the UNC path
+(`\\server\share\...`); the picker walks connected servers and their shares.
 
 ## From source
 
@@ -143,13 +162,24 @@ commit it.
 
 ---
 
+## Updates
+
+nuarr shows its version beside its name and follows this repository's
+[Releases](../../releases) out of the box — checking is automatic, installing
+is always your click, because nuarr is usually mid-encode and swapping its own
+files under a running ffmpeg is the one outcome the whole system exists to
+prevent. Under `Settings → System → Updates` you can point it at a fork to
+follow a different build, or type `off` and it never contacts GitHub.
+
 ## Status
 
-Version 1.0.1. Built for one library and one server, and honest about it: it
-has run against a 12-disk StableBit pool with Plex, Sonarr and Radarr on the
-same machine, and nowhere else. Interfaces it depends on — Plex's session
-fields, DrivePool's placement — are read defensively, but a setup unlike that
-one will find edges.
+Version 1.0.1. Built for one library and one server, then hardened by
+installing it somewhere else: the installer and app have been through repeated
+clean-VM installs, which is where most of the sharp edges listed in the commit
+history were found and filed off. The primary deployment remains a 12-disk
+StableBit pool with Plex, Sonarr and Radarr on the same machine; interfaces it
+depends on — Plex's session fields, DrivePool's placement — are read
+defensively, but a setup unlike that one may still find edges.
 
 Bug reports with the relevant lines from `Settings → Logs` are welcome.
 
