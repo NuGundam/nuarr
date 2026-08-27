@@ -45,12 +45,21 @@ _LOCK = threading.Lock()
 
 
 def _repo() -> str:
-    """owner/name from settings, falling back to the built-in default."""
+    """owner/name from settings, falling back to the built-in default.
+
+    "off" is an ANSWER, not an absence. With a real default repo, an empty
+    setting now means "use the official one" - which removed the old way of
+    opting out (leave it blank). The explicit word restores it: someone who
+    wrote "off" has said no to update checks, and no default gets to talk
+    over that.
+    """
     try:
         from .config import SETTINGS
         r = (getattr(SETTINGS, "update_repo", "") or "").strip()
     except Exception:                                        # noqa: BLE001
         r = ""
+    if r.lower() in ("off", "none", "disabled"):
+        return ""
     return r or version.DEFAULT_REPO
 
 

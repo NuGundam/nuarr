@@ -31,9 +31,14 @@ BUILD_DATE = ""
 
 # Where to look for newer versions. Owner/name only, no URL, because the API
 # path and the browse path differ and building both from one field is less to
-# get wrong than storing two. Empty means "not configured", which the UI shows
-# plainly rather than pretending the check passed.
-DEFAULT_REPO = ""
+# get wrong than storing two.
+#
+# The OFFICIAL repository is the default: a fresh install should learn about
+# releases without anyone finding a settings page first, or the update
+# machinery only ever works for the person who built it. Overridable in
+# Settings for anyone following a fork, and "off" there disables checks
+# entirely - the default must not remove the ability to say no.
+DEFAULT_REPO = "NuGundam/nuarr"
 
 _SEMVER = re.compile(r"^\s*v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?\s*$")
 

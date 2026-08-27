@@ -3299,8 +3299,10 @@ async def api_updates_repo(repo: str = ""):
     m = re.search(r"github\.com/([^/]+/[^/#?]+)", r, re.I)
     if m:
         r = m.group(1)
-    if r and not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", r):
-        raise HTTPException(400, "expected owner/name, e.g. NuGundam/nuarr")
+    if r and r.lower() not in ("off", "none", "disabled") \
+            and not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", r):
+        raise HTTPException(400, "expected owner/name (e.g. NuGundam/nuarr), "
+                                 "or 'off' to disable update checks")
     r = r.removesuffix(".git")
     # Same read-mutate-write as the cache path above rather than a whole-object
     # dump: config.yml is hand-editable and round-tripping the entire dataclass
@@ -3323,7 +3325,10 @@ async def api_updates_repo(repo: str = ""):
     # one until the next scheduled check.
     updates._STATE.update(checked_at=0.0, ok=False, error="", latest="",
                           previous="", releases=[])
-    if r:
+    # Re-check whenever there is an EFFECTIVE repo, not merely a typed one -
+    # clearing the field now falls back to the official default, and leaving
+    # the panel stale-empty after that made the fallback look broken.
+    if updates.configured():
         await asyncio.to_thread(updates.check, True)
     return updates.status()
 
@@ -9541,8 +9546,10 @@ async function drillRefresh(force){
            ${act}
            <div class="mono dim sub">${esc(r.path||'')}</div></td>
          <td class="num dim nb">${gb(r.size)}</td>
-         <td class="mono nb" style="color:${r.pool_disk?diskColor(r.pool_disk)
-           :'var(--dim)'}">${esc(r.pool_disk||'—')}</td>
+         <td class="mono nb" title="${esc(r.pool_disk||'')}"
+           style="color:${r.pool_disk?diskColor(r.pool_disk)
+           :'var(--dim)'};max-width:150px;overflow:hidden;text-overflow:ellipsis"
+           >${esc(r.pool_disk||'—')}</td>
          <td class="nb" style="font-size:11px">${when}</td>
          ${held?`<td class="nb">${settleCell(r)}</td>`:''}
          <td class="nb">${pill}</td></tr>`;
@@ -14500,8 +14507,10 @@ async function queueWork(preview){
             <td class="wrap"><div>${esc(r.label||'')}</div>
               <div class="mono dim sub">${esc(r.path||'')}</div></td>
             <td class="num dim nb">${gb(r.size)}</td>
-            <td class="mono nb" style="color:${r.pool_disk?diskColor(r.pool_disk)
-              :'var(--dim)'}">${esc(r.pool_disk||'—')}</td></tr>`).join('')
+            <td class="mono nb" title="${esc(r.pool_disk||'')}"
+              style="color:${r.pool_disk?diskColor(r.pool_disk)
+              :'var(--dim)'};max-width:150px;overflow:hidden;text-overflow:ellipsis"
+              >${esc(r.pool_disk||'—')}</td></tr>`).join('')
         +'</table>'
       : '<div class="dim" style="padding:14px">nothing eligible matches</div>';
     // Name the files that will NOT be queued, so the number here matches the
@@ -16834,9 +16843,13 @@ async function loadUpdates(force){
   // as a state machine rather than by stacking conditionals into one string.
   let head, colour, note;
   if(!u.configured){
-    head='Update checks are not set up'; colour='var(--dim)';
-    note='Point nuarr at a GitHub repository below and it will tell you when '
-        +'there is a newer release. Nothing is contacted until you do.';
+    // With an official default repo, the only road to "not configured" is
+    // the person typing `off` - so say that back to them rather than
+    // pretending the feature was never set up.
+    head='Update checks are off'; colour='var(--dim)';
+    note='You asked nuarr not to contact GitHub. Save a repository below - '
+        +'or clear the field to return to the official releases - to turn '
+        +'checking back on.';
   } else if(!u.ok){
     head='Could not check'; colour='#e0575b';
     note=esc(u.error||'unknown error');
@@ -16892,14 +16905,17 @@ async function loadUpdates(force){
     </div>
 
     <div class="lkind" style="padding:11px 12px">
-      <b style="color:#6fb0ff">Where to check</b>
+      <b style="color:#6fb0ff">Update source</b>
       <div class="dim" style="font-size:11.5px;margin:4px 0 8px">
-        A GitHub repository as <span class="mono">owner/name</span>. Pasting the
-        full address works too. Leave it empty and nuarr never contacts GitHub.
+        Follows the official nuarr releases
+        (<span class="mono">NuGundam/nuarr</span>) out of the box. Point it at
+        a fork as <span class="mono">owner/name</span> to follow a different
+        build of nuarr — pasting the full GitHub address works too. Type
+        <span class="mono">off</span> to stop nuarr contacting GitHub at all.
       </div>
       <div style="display:flex;gap:7px;flex-wrap:wrap">
         <input id="updRepo" class="inp mono" style="flex:1 1 260px"
-               placeholder="owner/name" value="${esc(u.repo||'')}">
+               placeholder="NuGundam/nuarr (official)" value="${esc(u.repo||'')}">
         <button class="btn" onclick="saveUpdRepo()">Save</button>
         <button class="btn" onclick="loadUpdates(1)"${u.configured?'':' disabled'}>Check now</button>
       </div>
