@@ -317,6 +317,14 @@ def stage(force: bool = False) -> dict:
             z.extractall(staged, members=names)
         os.remove(zpath)
         os.remove(exe_path)
+        # ---- the bundle's config TEMPLATE must never reach the install -----
+        # program\config.yml in a release is the placeholder the installer
+        # writes real values into. Left in the staged tree, the apply robocopy
+        # would lay it over the user's actual config - Plex token, libraries,
+        # everything - which the first sandbox run of this feature did.
+        # Removed here AND excluded in the helper's robocopy: either alone is
+        # one edit away from the worst bug this feature can have.
+        (staged / "program" / "config.yml").unlink(missing_ok=True)
         # ---- the staged tree must SAY it is the version we asked for -------
         vfile = staged / "program" / "app" / "version.py"
         staged_ver = ""
@@ -393,7 +401,7 @@ for ($i=0; $i -lt 60; $i++) {{
   if (-not (Get-Process -Id {pid} -ErrorAction SilentlyContinue)) {{ break }}
   Start-Sleep -Milliseconds 500
 }}
-robocopy "{src}" "{root}" /E /NFL /NDL /NJH /NJS /NP /R:2 /W:2
+robocopy "{src}" "{root}" /E /XF config.yml /NFL /NDL /NJH /NJS /NP /R:2 /W:2
 if ($LASTEXITCODE -ge 8) {{
   Write-Output "robocopy failed with $LASTEXITCODE - old install left in place"
 }} else {{
