@@ -146,63 +146,59 @@ Say ("zip: {0}  ({1:N1} MB)" -f $zipName, ((Get-Item $zip).Length/1MB)) 'ok'
 if ($SkipExe) { Say "skipping the exe (-SkipExe)" 'warn'; return }
 
 # ---- 7. the self-extracting exe ------------------------------------------
-# IEXPRESS CANNOT HANDLE SPACES IN ITS PATHS. Pointed at a folder like
-# "P:\BackUp Data\...", it exits 0 in about a second having produced nothing
-# at all - no error, no log. So the whole build happens somewhere flat and the
-# result is moved afterwards.
+# NOT IEXPRESS. IExpress built this once, and past roughly 200 MB its cab
+# writer TRUNCATES the payload and exits success: the 214 MB bundle shipped as
+# a 133 MB cab that failed on the first machine to run it, with no error at
+# build time whatsoever. A packager that corrupts silently near a size the
+# payload will certainly grow past cannot be kept.
+#
+# The replacement is the least machinery that can work: a ~10 KB C# stub
+# compiled by the csc.exe every Windows ships, with the zip APPENDED to the
+# exe and a 16-byte trailer recording where it starts. The stub streams the
+# zip out, extracts it with System.IO.Compression - which fails loudly on
+# truncation, unlike the cab codec - and runs Setup.cmd. Elevation comes from
+# the embedded manifest. Build time: about a second, and the exe is the zip
+# plus 10 KB instead of a recompression that could lie.
+$exeName = "Nuarr-Setup-$Version.exe"
+$exe     = Join-Path $Dist $exeName
+$csc     = "$env:SystemRoot\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+if (-not (Test-Path $csc)) { throw ".NET Framework csc.exe not found - cannot build the stub" }
+$stubSrc = Join-Path $PSScriptRoot 'sfx_stub.cs'
+$stubMan = Join-Path $PSScriptRoot 'sfx_stub.manifest'
+foreach ($x in $stubSrc, $stubMan) { if (-not (Test-Path $x)) { throw "missing $x" } }
 $W = 'C:\nuarrbuild'
 Remove-Item $W -Recurse -Force -EA SilentlyContinue
 New-Item -ItemType Directory $W -Force | Out-Null
-Copy-Item $zip (Join-Path $W 'nuarr-bundle.zip') -Force
-Copy-Item (Join-Path $Bundle 'setup\bootstrap.cmd') (Join-Path $W 'nuarr-install.cmd') -Force
-$exeName = "Nuarr-Setup-$Version.exe"
-$sed = @"
-[Version]
-Class=IEXPRESS
-SEDVersion=3
-[Options]
-PackagePurpose=InstallApp
-ShowInstallProgramWindow=1
-HideExtractAnimation=0
-UseLongFileName=1
-InsideCompressed=0
-CAB_FixedSize=0
-CAB_ResvCodeSigning=0
-RebootMode=N
-TargetName=%TargetName%
-FriendlyName=%FriendlyName%
-AppLaunched=%AppLaunched%
-PostInstallCmd=%PostInstallCmd%
-InstallPrompt=%InstallPrompt%
-DisplayLicense=%DisplayLicense%
-FinishMessage=%FinishMessage%
-AdminQuietInstCmd=%AdminQuietInstCmd%
-UserQuietInstCmd=%UserQuietInstCmd%
-SourceFiles=SourceFiles
-[Strings]
-InstallPrompt=
-DisplayLicense=
-FinishMessage=
-TargetName=$W\$exeName
-FriendlyName=nuarr $Version installer
-AppLaunched=cmd.exe /c nuarr-install.cmd
-PostInstallCmd=<None>
-AdminQuietInstCmd=
-UserQuietInstCmd=
-FILE0="nuarr-install.cmd"
-FILE1="nuarr-bundle.zip"
-[SourceFiles]
-SourceFiles0=$W\
-[SourceFiles0]
-%FILE0%=
-%FILE1%=
-"@
-[IO.File]::WriteAllText("$W\nuarr.sed", $sed, [Text.ASCIIEncoding]::new())
-Say "building $exeName (makecab, a few minutes)..."
-Start-Process "$env:SystemRoot\System32\iexpress.exe" -ArgumentList '/N','/Q',"$W\nuarr.sed" -Wait -NoNewWindow
-if (-not (Test-Path "$W\$exeName")) { throw "iexpress produced nothing - check $W\nuarr.sed" }
-Move-Item "$W\$exeName" (Join-Path $Dist $exeName) -Force
+$stubExe = Join-Path $W 'stub.exe'
+$fw = "$env:SystemRoot\Microsoft.NET\Framework64\v4.0.30319"
+& $csc /nologo /target:winexe /optimize+ /win32manifest:"$stubMan" `
+    /r:"$fw\System.IO.Compression.dll" `
+    /r:"$fw\System.IO.Compression.FileSystem.dll" `
+    /r:"$fw\System.Windows.Forms.dll" `
+    /r:"$fw\System.Drawing.dll" `
+    /out:"$stubExe" "$stubSrc"
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path $stubExe)) { throw "csc failed building the stub" }
+Say ("stub compiled ({0:N0} KB)" -f ((Get-Item $stubExe).Length/1KB))
+
+# stub + zip + trailer, streamed - and then PROVEN, not assumed. The entire
+# reason this section exists is a builder that lied about its output, so this
+# one checks its own: the assembled exe must be exactly stub+zip+16 bytes,
+# and the trailer must read back.
+Remove-Item $exe -Force -EA SilentlyContinue
+$out = [IO.File]::Create($exe)
+try {
+  $in = [IO.File]::OpenRead($stubExe)
+  try { $in.CopyTo($out) } finally { $in.Dispose() }
+  $zipStart = $out.Position
+  $in = [IO.File]::OpenRead($zip)
+  try { $in.CopyTo($out) } finally { $in.Dispose() }
+  $out.Write([BitConverter]::GetBytes([long]$zipStart), 0, 8)
+  $out.Write([Text.Encoding]::ASCII.GetBytes('NUARRSFX'), 0, 8)
+} finally { $out.Dispose() }
+$want = (Get-Item $stubExe).Length + (Get-Item $zip).Length + 16
+$got  = (Get-Item $exe).Length
+if ($got -ne $want) { throw "assembled exe is $got bytes, expected $want - not shipping it" }
 Remove-Item $W -Recurse -Force -EA SilentlyContinue
-Say ("exe: {0}  ({1:N1} MB)" -f $exeName, ((Get-Item (Join-Path $Dist $exeName)).Length/1MB)) 'ok'
+Say ("exe: {0}  ({1:N1} MB, verified stub+zip+trailer)" -f $exeName, ($got/1MB)) 'ok'
 Write-Host ""
 Say "done - dist\ now holds $zipName and $exeName" 'ok'
