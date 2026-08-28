@@ -513,24 +513,29 @@ def select_targets(probe: dict, library: str | None = None) -> list[dict]:
                 and not bool(_s("subocr_forced", False, library)):
             continue
         signs, why = is_signs(s, mins, library)
-        # SIGNS ARE NEVER CONVERTED, and there is no switch for it.
+        # SIGNS ARE NEVER CONVERTED. Not by a switch, not by the override,
+        # not ever.
         #
-        # There was one, briefly, for the case where nothing would ever burn
-        # them. It was wrong: typeset signs are ARTWORK - positioned over a
-        # shop sign, angled to match a letter on screen, styled per line - and
-        # OCR returns a flat list of centred text with none of that. The
-        # result is not a worse version of the signs, it is a wrong one:
-        # captions floating over the middle of the picture, unreadable and
-        # covering the thing they were describing. Burning them in is the only
-        # rendering that works, so a signs track that cannot be burned is left
-        # exactly as it is.
+        # Typeset signs and song captions are POSITIONED ARTWORK, the same
+        # kind of thing an ASS track carries: a caption angled across a shop
+        # front, a translation pinned beside a text message, karaoke timed to
+        # a lyric - each one placed at a specific point on the screen because
+        # that is what makes it mean anything. OCR reads the words and throws
+        # the placement away, so what comes back is a flat list of centred
+        # subtitles: unreadable, and sitting over the very thing they were
+        # describing.
         #
-        # The 'convert everything' override still reaches them, because that
-        # switch says explicitly that the classification stands down.
-        if signs and not convert_all:
-            continue
+        # That is not a degraded version of the track, it is a wrong one - so
+        # there is nothing for a switch to trade off. Two attempts got this
+        # wrong before: first an "unburnable signs" option, then leaving them
+        # inside the convert-everything override on the grounds that the
+        # override says the classification stands down. It does - about which
+        # ROLES to read, not about whether a picture can be turned into text
+        # it never was. Burning them into the video is the only rendering
+        # that works, and a signs track that cannot be burned is left exactly
+        # as it is.
         if signs:
-            why = f"{why} - converted because 'convert every picture track' is on"
+            continue
         t = dict(s)
         t["rel"] = rel
         t["cues"] = cues(s)

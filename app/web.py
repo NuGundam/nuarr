@@ -17229,7 +17229,7 @@ function socPaint(lib){
         !has.forced)}
 
       ${chk('all',s.all,'Convert every picture track, not just dialogue',
-        'Ignores the sorting below and converts every English picture track kept by the language rules — signs included, even though OCR cannot place them correctly. The result is still checked before it is used.',
+        'Ignores the sorting below and converts every English picture track kept by the language rules — dialogue, SDH and forced alike, whatever they are titled. <b>Never signs or songs:</b> those are artwork placed at a particular spot on the screen, like an ASS track, and OCR keeps the words but loses the position — so they are always burned into the picture instead, never converted.',
         !has.image)}
 
       ${chk('remove_image',s.remove_image,'Delete the picture track once text exists',
