@@ -3297,6 +3297,152 @@ async def api_plex_config_save(body: dict = Body(...)):
     return {"ok": True, **(await api_plex_config())}
 
 
+def _plex_headers(with_cid: bool = True) -> dict:
+    """The identity nuarr presents to plex.tv - stable across sign-ins.
+
+    The client identifier is the thing Plex ties the issued token to; a fresh
+    one per attempt would fill the account's device list with orphans.
+    """
+    h = {"Accept": "application/json",
+         "X-Plex-Product": "nuarr",
+         "X-Plex-Version": version.VERSION,
+         "X-Plex-Device-Name": "nuarr",
+         "X-Plex-Platform": "Windows"}
+    if with_cid:
+        from .db import kv_get, kv_set
+        cid = kv_get("plex.client_id") or ""
+        if not cid:
+            import uuid
+            cid = str(uuid.uuid4())
+            kv_set("plex.client_id", cid)
+        h["X-Plex-Client-Identifier"] = cid
+    return h
+
+
+def _plex_pick_server(token: str) -> tuple[str, str]:
+    """From plex.tv's resource list, the URL that actually answers.
+
+    Every server the account can see advertises several connections - relay,
+    plex.direct, LAN address - and the list is plex.tv's OPINION, not a fact
+    about this network. So the candidates are ordered (owned before shared,
+    local before remote, never relay) and then each is asked /identity with a
+    short timeout; the first that answers is the one nuarr uses. Returns
+    (url, server_name), or ("", "") when nothing answered.
+    """
+    import httpx
+    h = {**_plex_headers(), "X-Plex-Token": token}
+    r = httpx.get("https://plex.tv/api/v2/resources",
+                  params={"includeHttps": "1", "includeRelay": "0"},
+                  headers=h, timeout=20.0)
+    r.raise_for_status()
+    servers = [x for x in (r.json() or [])
+               if "server" in (x.get("provides") or "")]
+    servers.sort(key=lambda x: (not x.get("owned"),))
+    for srv in servers:
+        conns = sorted(srv.get("connections") or [],
+                       key=lambda c: (bool(c.get("relay")),
+                                      not c.get("local")))
+        cands = []
+        for c in conns:
+            if c.get("relay"):
+                continue
+            if c.get("local") and c.get("address"):
+                cands.append(f"http://{c['address']}:{c.get('port', 32400)}")
+            if c.get("uri"):
+                cands.append(c["uri"])
+        seen: set = set()
+        for u in cands:
+            if u in seen:
+                continue
+            seen.add(u)
+            try:
+                t = httpx.get(u.rstrip("/") + "/identity",
+                              params={"X-Plex-Token": token},
+                              headers={"Accept": "application/json"},
+                              timeout=4.0)
+                if t.status_code == 200:
+                    return u.rstrip("/"), srv.get("name", "")
+            except Exception:                            # noqa: BLE001
+                continue
+    return "", ""
+
+
+@app.post("/api/plex/link/start")
+async def api_plex_link_start():
+    """Sign in with Plex, the way Tautulli does it.
+
+    Creates a plex.tv PIN and hands back the auth URL for the page to open in
+    a popup. No credentials pass through nuarr - the sign-in happens on
+    plex.tv, and nuarr only ever sees the resulting token.
+    """
+    def _work():
+        import httpx
+        h = _plex_headers()
+        r = httpx.post("https://plex.tv/api/v2/pins",
+                       params={"strong": "true"}, headers=h, timeout=15.0)
+        r.raise_for_status()
+        d = r.json() or {}
+        url = ("https://app.plex.tv/auth#?clientID="
+               + h["X-Plex-Client-Identifier"]
+               + "&code=" + str(d.get("code", ""))
+               + "&context%5Bdevice%5D%5Bproduct%5D=nuarr")
+        return {"ok": True, "id": d.get("id"), "url": url}
+    try:
+        return await asyncio.to_thread(_work)
+    except Exception as e:                               # noqa: BLE001
+        return {"ok": False, "error": f"could not reach plex.tv: {str(e)[:120]}"}
+
+
+@app.post("/api/plex/link/poll")
+async def api_plex_link_poll(id: int = Query(...)):
+    """Has the popup sign-in finished? When it has, finish the whole job.
+
+    The token never travels to the browser: it is kept server-side, the
+    server URL is discovered and proven from plex.tv's resource list, and
+    both are saved through the same tested path as a manual save. The page
+    just gets told it worked.
+    """
+    def _work():
+        import httpx
+        import yaml
+        r = httpx.get(f"https://plex.tv/api/v2/pins/{id}",
+                      headers=_plex_headers(), timeout=15.0)
+        if r.status_code != 200:
+            return {"ok": False, "error": f"plex.tv answered {r.status_code}"}
+        token = (r.json() or {}).get("authToken") or ""
+        if not token:
+            return {"ok": True, "done": False}
+        url, name = _plex_pick_server(token)
+        if not url:
+            return {"ok": False,
+                    "error": "signed in, but no Plex server answered from "
+                             "this machine - check the server is up and "
+                             "reachable, then paste its URL by hand"}
+        p = _config_path()
+        raw = {}
+        if p.exists():
+            try:
+                raw = yaml.safe_load(p.read_text(encoding="utf-8-sig")) or {}
+            except Exception:                            # noqa: BLE001
+                raw = {}
+        raw.update({"plex_url": url, "plex_token": token})
+        p.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True),
+                     encoding="utf-8")
+        SETTINGS.plex_url = url
+        SETTINGS.plex_token = token
+        try:
+            from . import gate
+            gate._CACHE.clear()
+        except Exception:                                # noqa: BLE001
+            pass
+        joblog.log(f"Plex linked by sign-in: {name or url}", "ok")
+        return {"ok": True, "done": True, "url": url, "server": name}
+    try:
+        return await asyncio.to_thread(_work)
+    except Exception as e:                               # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {str(e)[:120]}"}
+
+
 @app.get("/api/version")
 async def api_version():
     """Just the number. Called on every page load, so it must never block."""
@@ -16824,15 +16970,18 @@ async function loadPlexCfg(){
         <input id="pxToken" type="password" spellcheck="false"
                placeholder="${c.plex_token_set?'token saved — leave blank to keep':'X-Plex-Token'}"
                style="flex:1;min-width:210px;font-family:var(--mono,monospace);font-size:12px">
+        <button onclick="plexLink(this)" style="color:var(--acc)"
+          title="Opens a small plex.tv window; nuarr never sees your password">Sign in with Plex</button>
         <button onclick="plexDetect(this)"
           title="Read the token this machine's Plex has already saved">Detect</button>
       </div>
       <div class="dim" style="font-size:11px;margin-top:5px">
-        <b>Detect</b> works when Plex runs on this machine — it reads the token
-        Plex has already saved locally. It is not a login: a token cannot be
-        derived from a URL, so for a Plex on another box you still have to
-        paste it. Find it via any library item &rarr; <b>Get Info</b> &rarr;
-        <b>View XML</b>, at the end of the address.
+        <b>Sign in with Plex</b> is the easy path: a small plex.tv window opens,
+        you sign in there, and nuarr receives a token and finds the server on
+        its own — URL included. Your password goes to plex.tv, never to nuarr.
+        <b>Detect</b> reads the token a local Plex has already saved, and
+        pasting one by hand (any library item &rarr; <b>Get Info</b> &rarr;
+        <b>View XML</b>, end of the address) still works too.
         The token is stored server-side and never sent back to this page.
       </div>
       <div id="pxDetectMsg" class="dim" style="font-size:11px;margin-top:4px"></div>
@@ -16853,6 +17002,43 @@ async function loadPlexCfg(){
         <span id="pxMsg" class="dim" style="font-size:11.5px"></span>
       </div>
     </div>`;
+}
+
+async function plexLink(btn){
+  const m=document.getElementById('pxDetectMsg');
+  const old=btn.textContent; btn.disabled=true; btn.textContent='opening plex.tv…';
+  let s=null;
+  try{ s=await (await fetch('/api/plex/link/start',{method:'POST'})).json(); }catch(e){}
+  if(!s||!s.ok){
+    if(m){ m.style.color='#e2b341'; m.textContent=(s&&s.error)||'could not reach plex.tv'; }
+    btn.disabled=false; btn.textContent=old; return;
+  }
+  // The popup MUST open from this click - browsers block window.open from
+  // timers. If it is blocked anyway, show the link to open by hand.
+  const w=window.open(s.url,'plexauth','width=620,height=760');
+  if(!w && m){ m.style.color='#e2b341';
+    m.innerHTML=`popup blocked — <a href="${s.url}" target="_blank" rel="noopener">open the sign-in page</a> and come back`; }
+  btn.textContent='waiting for sign-in…';
+  if(m && w){ m.style.color=''; m.textContent='sign in in the Plex window — this side finishes on its own'; }
+  const t0=Date.now();
+  const t=setInterval(async ()=>{
+    if(Date.now()-t0 > 180000){ clearInterval(t);
+      if(m){ m.style.color='#e2b341'; m.textContent='sign-in timed out — click the button to try again'; }
+      btn.disabled=false; btn.textContent=old; return; }
+    let p=null;
+    try{ p=await (await fetch('/api/plex/link/poll?id='+s.id,{method:'POST'})).json(); }catch(e){ return; }
+    if(p && p.ok && p.done){
+      clearInterval(t); try{ if(w) w.close(); }catch(e){}
+      if(m){ m.style.color='#7fd4a3';
+        m.textContent=`signed in — connected to ${p.server||p.url} and saved`; }
+      btn.disabled=false; btn.textContent=old;
+      setTimeout(loadPlexCfg, 900);
+    } else if(p && p.ok===false){
+      clearInterval(t);
+      if(m){ m.style.color='#e2b341'; m.textContent=p.error||'sign-in failed'; }
+      btn.disabled=false; btn.textContent=old;
+    }
+  }, 2000);
 }
 
 async function plexDetect(btn){

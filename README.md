@@ -126,6 +126,10 @@ double-click, UAC prompt, wizard. Setup installs Python and the MKVToolNix
 command-line tools if the machine lacks them, places its own ffmpeg build,
 detects Sonarr / Radarr / Plex where it can (detected credentials are used
 silently, never displayed), and tests every connection before it continues.
+For Plex there is also **Sign in with Plex** — a small plex.tv window, the
+same flow Tautulli uses: sign in there and nuarr receives a token and finds
+your server on its own, URL included. Your password goes to plex.tv, never to
+nuarr. The same button lives in `Settings → Plex` after install.
 
 nuarr registers in **Programs and Features**, so uninstalling works from
 Windows Settings like any other application. The uninstaller removes the
