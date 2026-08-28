@@ -4019,6 +4019,93 @@ async def api_subocr_config(body: dict = Body(...)):
     return {"ok": True, **subocr.status()}
 
 
+@app.post("/api/subocr/preview")
+async def api_subocr_preview_change(body: dict = Body(...)):
+    r"""What a proposed subtitle policy WOULD change, before it is saved.
+
+    Same shape and the same reasoning as the language preview: look, then
+    decide, then act. Saving first and counting afterwards means the planner
+    has already adopted a policy nobody agreed to, and anything the queue
+    picks up in between uses it.
+
+    Scoped to ONE library, because these settings are per library - and
+    because it keeps the walk to the files the change can actually reach.
+    """
+    from . import subocr as _so
+    lib = str(body.get("library") or "").strip()
+    if not lib:
+        return {"ok": False, "error": "no library"}
+    before = _so.sub_rules(lib)
+    after = dict(before)
+    for m in _so.RULE_META:
+        k = "subrule_" + m["key"]
+        if k in body:
+            after[m["key"]] = bool(body[k])
+
+    def _work() -> dict:
+        import json as _j
+        changed, checked, listed = 0, 0, []
+        with cursor() as cur:
+            rows = cur.execute(
+                "SELECT f.id,f.path,f.title,f.season,f.episode,f.size,"
+                "       p.lang, fp.json "
+                "  FROM files f JOIN file_probes fp ON fp.file_id=f.id "
+                "  LEFT JOIN parent_lang p ON p.parent_id=f.arr_parent_id "
+                "       AND p.arr_name=f.arr_name "
+                " WHERE f.library=? AND f.state NOT IN ('deleted','duplicate')",
+                (lib,)).fetchall()
+        for r in rows:
+            try:
+                info = _j.loads(r["json"])
+            except Exception:                            # noqa: BLE001
+                continue
+            checked += 1
+            kw = dict(filename=os.path.basename(r["path"] or ""),
+                      size_bytes=r["size"] or 0, orig_lang=r["lang"] or "",
+                      library=lib, anime=rules.is_anime(r["path"] or ""))
+            try:
+                a = rules.decide(info, subrules=before, **kw)
+                b = rules.decide(info, subrules=after, **kw)
+            except Exception:                            # noqa: BLE001
+                continue
+            # Only the SUBTITLE decision - which tracks survive, which get
+            # their flags cleared, and whether anything is burned in.
+            same = (sorted(a.keep_subs) == sorted(b.keep_subs)
+                    and sorted(a.clear_flags) == sorted(b.clear_flags)
+                    and getattr(a, "burn_index", None) ==
+                        getattr(b, "burn_index", None)
+                    and a.encode == b.encode)
+            if same:
+                continue
+            changed += 1
+            if len(listed) < 300:
+                bits = []
+                if getattr(a, "burn_index", None) != getattr(b, "burn_index", None):
+                    bits.append("stops burning in a track"
+                                if getattr(b, "burn_index", None) is None
+                                else "starts burning a track in")
+                dropped = set(a.keep_subs) - set(b.keep_subs)
+                added = set(b.keep_subs) - set(a.keep_subs)
+                if dropped:
+                    bits.append(f"drops {len(dropped)} subtitle track(s)")
+                if added:
+                    bits.append(f"keeps {len(added)} more subtitle track(s)")
+                if sorted(a.clear_flags) != sorted(b.clear_flags):
+                    bits.append("different tracks switched off")
+                if a.encode != b.encode:
+                    bits.append("rebuilds the video" if b.encode
+                                else "no longer rebuilds the video")
+                listed.append({
+                    "id": r["id"],
+                    "label": display_label(r["title"], r["season"], r["episode"])
+                             or os.path.basename(r["path"] or ""),
+                    "change": "; ".join(bits) or "a different subtitle plan",
+                })
+        return {"ok": True, "checked": checked, "affected": changed,
+                "files": listed}
+    return await asyncio.to_thread(_work)
+
+
 @app.post("/api/subocr/update")
 def api_subocr_update():
     """pip-update pgsrip from the page; /api/subocr/status carries the state."""
@@ -17038,10 +17125,14 @@ function socPaint(lib){
         <div class="dim" style="font-size:11px">${why}</div></span>
     </label>`;
   const rules=s.rules||{};
+  // RULE CHANGES ARE PREVIEWED, NOT APPLIED ON CLICK. These rewrite library
+  // files, so they follow the language page's sequence: tick, see the count,
+  // then apply. The conversion switches above only govern which tracks get
+  // read and take effect on the next pass, so they still save immediately.
   const rchk=(k,on,label,why)=>`
     <label style="display:flex;gap:9px;align-items:flex-start;padding:6px 0;cursor:pointer">
       <input type="checkbox" id="${id('r_'+k)}" ${on?'checked':''}
-             onchange="socSaveLib('${esc(lib)}')" style="margin-top:2px">
+             onchange="socRuleDirty('${esc(lib)}')" style="margin-top:2px">
       <span><b>${label}</b><div class="dim" style="font-size:11px">${why}</div></span>
     </label>`;
   host.innerHTML=`
@@ -17089,7 +17180,62 @@ function socPaint(lib){
       <div class="sochead" style="margin-top:12px">Subtitle rules
         <span class="dim">what happens to subtitles when this library is rebuilt</span></div>
       ${(_socAll.rule_meta||[]).map(m=>rchk(m.key,rules[m.key],m.label,m.what)).join('')}
+      <div id="${id('rulebar')}" style="margin-top:8px;display:flex;gap:8px;
+           align-items:center;flex-wrap:wrap;font-size:12px"></div>
+      <div id="${id('ruleimp')}" style="margin-top:6px"></div>
     </div>`;
+}
+
+// Tick a rule -> offer the preview. Nothing is written until "Apply".
+function socRuleDirty(lib){
+  const bar=document.getElementById('soc_'+cssId(lib)+'_rulebar');
+  if(!bar) return;
+  bar.innerHTML=`<button onclick="socRulePreview('${esc(lib)}')">See what would change</button>
+    <button onclick="socRuleApply('${esc(lib)}',true)">Apply without checking</button>
+    <button onclick="langSignsLoad()">Undo</button>
+    <span class="dim">unsaved</span>`;
+}
+function socRuleBody(lib){
+  const id=(k)=>document.getElementById('soc_'+cssId(lib)+'_'+k);
+  const body={library:lib};
+  for(const m of (_socAll.rule_meta||[])){
+    const b=id('r_'+m.key); if(b) body['subrule_'+m.key]=b.checked;
+  }
+  return body;
+}
+async function socRulePreview(lib){
+  const imp=document.getElementById('soc_'+cssId(lib)+'_ruleimp');
+  const bar=document.getElementById('soc_'+cssId(lib)+'_rulebar');
+  if(imp) imp.innerHTML='<div class="dim" style="font-size:11.5px">'
+    +'planning every file in this library both ways…</div>';
+  let r=null;
+  try{ r=await (await fetch('/api/subocr/preview',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(socRuleBody(lib))})).json(); }catch(e){}
+  if(!r||!r.ok){ if(imp) imp.innerHTML='<div class="err">could not check</div>'; return; }
+  if(imp) imp.innerHTML=`
+    <div class="lkind" style="padding:9px 11px">
+      <b style="color:${r.affected?'#e2b341':'#7fd4a3'}">${fmt(r.affected)}</b>
+      of ${fmt(r.checked)} file(s) in this library would be planned differently.
+      ${r.affected?'':'<span class="dim">Nothing changes — safe to apply.</span>'}
+      ${(r.files||[]).length?`<div style="max-height:180px;overflow:auto;margin-top:6px;
+        font-size:11px" class="dim">${r.files.map(f=>
+        `<div>${esc(f.label)} — ${esc(f.change)}</div>`).join('')}</div>`:''}
+    </div>`;
+  if(bar) bar.innerHTML=`<button onclick="socRuleApply('${esc(lib)}')">Apply</button>
+    <button onclick="langSignsLoad()">Undo</button>
+    <span class="dim">${fmt(r.affected)} file(s) affected</span>`;
+}
+async function socRuleApply(lib){
+  const bar=document.getElementById('soc_'+cssId(lib)+'_rulebar');
+  try{
+    const r=await (await fetch('/api/subocr/config',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(socRuleBody(lib))})).json();
+    if(bar) bar.innerHTML=`<span class="dim" style="color:${r.ok?'#7fd4a3':'#e0575b'}"
+      >${r.ok?'saved — the planner is using this now':(r.error||'failed')}</span>`;
+    if(r.ok && r.libraries) _socAll=r;
+  }catch(e){ if(bar) bar.innerHTML='<span class="err">failed</span>'; }
 }
 
 async function socSaveLib(lib){
@@ -17103,9 +17249,6 @@ async function socSaveLib(lib){
     subocr_remove_image:id('remove_image').checked,
     subocr_signs_max_cpm:parseFloat(id('cpm').value)||6,
     subocr_dialogue_min_cues:parseInt(id('cues').value)||500};
-  for(const m of (_socAll.rule_meta||[])){
-    const b=id('r_'+m.key); if(b) body['subrule_'+m.key]=b.checked;
-  }
   try{
     const r=await (await fetch('/api/subocr/config',{method:'POST',
       headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();

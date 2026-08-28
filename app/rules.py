@@ -1098,7 +1098,7 @@ def _orig_codes(name: str | None) -> set[str]:
 def decide(probe: dict, *, anime: bool = False, filename: str = "",
            size_bytes: int = 0, orig_lang: str = "", kind: str = "",
            library: str = "", policy: dict | None = None,
-           file_id: int = 0) -> Plan:
+           file_id: int = 0, subrules: dict | None = None) -> Plan:
     """Turn an ffprobe result into a plan. Pure function - no side effects.
 
     `orig_lang` is the language the TITLE was made in, as the metadata provider
@@ -1184,11 +1184,17 @@ def decide(probe: dict, *, anime: bool = False, filename: str = "",
     # Resolved once per plan - subocr reads SETTINGS and rules.CONFIG, and
     # doing that eight times inside a loop is eight dict walks for an answer
     # that cannot change mid-file.
-    try:
-        from . import subocr as _so_rules
-        SR = _so_rules.sub_rules(library)
-    except Exception:                                    # noqa: BLE001
-        SR = {}
+    # `subrules` lets a caller plan against a policy that has NOT been saved -
+    # which is what the preview needs: show the consequences first, adopt
+    # them second. Same shape as `policy` above, and for the same reason.
+    if subrules is not None:
+        SR = dict(subrules)
+    else:
+        try:
+            from . import subocr as _so_rules
+            SR = _so_rules.sub_rules(library)
+        except Exception:                                # noqa: BLE001
+            SR = {}
 
     def _sr(key):
         val = SR.get(key)
@@ -1791,15 +1797,30 @@ def decide(probe: dict, *, anime: bool = False, filename: str = "",
                 # against the runaway ceiling instead, like codec conversions.
                 p.grow_ok = True
                 why = ("these signs would make Plex redraw the video every time you "
-                       "watch; painting them in once here fixes that for good"
+                       "watch; burning them in once here fixes that for good"
                        if is_image else
                        "the video is being rebuilt anyway, so adding the signs "
                        "costs nothing extra")
-                p.add("subtitle", f"paint the {variant.lower()} into the picture (track {real})", why,
+                p.add("subtitle", f"burn the {variant.lower()} into the picture (track {real})", why,
                       "scale PGS to video" if (is_image and CONFIG["scalePgsToVideo"]) else "")
                 if _sr("remove_burned"):
                     p.add("subtitle", f"remove subtitle {real}, now part of the picture",
                           "it is part of the picture now, so the separate track is not needed")
+                elif real not in p.clear_flags and \
+                        (_disp(subs[real], "default") or _disp(subs[real], "forced")):
+                    # KEEPING IT IS NOT LEAVING IT ARMED. With the removal
+                    # switched off the burned track stays in the file - and if
+                    # it kept its default/forced flag, Plex would switch it on
+                    # and draw the same subtitles a second time, over the copy
+                    # already baked into the picture. Keeping the track is a
+                    # choice about availability; the flag is what makes it
+                    # automatic, and that has to go either way.
+                    p.clear_flags.append(real)
+                    p.add("subtitle",
+                          f"stop subtitle {real} switching itself on, now that "
+                          f"it is part of the picture",
+                          "it is kept so you can still pick it, but showing it "
+                          "automatically would draw these lines twice")
             else:
                 # A NOTE, NOT AN ACTION. This describes what is deliberately
                 # NOT being done, and p.add() sets needed=True - so "leave the

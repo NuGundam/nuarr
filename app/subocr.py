@@ -203,20 +203,55 @@ _KINDS: dict = {"at": 0.0, "data": {}}
 _KINDS_TTL = 900.0
 
 
-def library_track_kinds(force: bool = False) -> dict:
-    """Per library: how many image, signs, forced and dialogue subs exist."""
+def library_track_kinds(force: bool = False, blocking: bool = True) -> dict:
+    """Per library: how many image, signs, forced and dialogue subs exist.
+
+    STALE BEATS SLOW on the settings page. A cached answer a few minutes old
+    is right for a decision about how to handle subtitles - the counts move
+    when a scan imports files, not while somebody reads the page - so a warm
+    cache is served immediately and refreshed on a thread behind it. Only the
+    very first call on a cold start has nothing to serve.
+    """
     now = time.time()
-    if not force and _KINDS["data"] and (now - _KINDS["at"]) < _KINDS_TTL:
-        return dict(_KINDS["data"])
+    if not force and _KINDS["data"]:
+        if (now - _KINDS["at"]) < _KINDS_TTL:
+            return dict(_KINDS["data"])
+        # Stale: hand back what we have and refresh behind the request.
+        if not blocking and not _KINDS.get("busy"):
+            _KINDS["busy"] = True
+
+            def _bg():
+                try:
+                    library_track_kinds(force=True)
+                finally:
+                    _KINDS["busy"] = False
+            threading.Thread(target=_bg, name="subocr-kinds",
+                             daemon=True).start()
+            return dict(_KINDS["data"])
     out: dict = {}
     try:
         from .db import cursor
         with cursor() as cur:
+            # THE JSON FILTER IS THE WHOLE OPTIMISATION. Parsing 39,000 probe
+            # blobs to count picture subtitles took seconds and blocked the
+            # page; only files that actually contain a PGS track can
+            # contribute to any of these counters, and SQLite can decide that
+            # with a substring test far cheaper than json.loads can. On this
+            # library it takes the parse set from ~39,000 rows to ~6,600.
+            # Every library still gets a row, so a library with no image subs
+            # reports zeros rather than going missing.
+            for lname, in cur.execute(
+                    "SELECT DISTINCT library FROM files "
+                    "WHERE library IS NOT NULL").fetchall():
+                out[lname] = {"image": 0, "signs": 0, "forced": 0,
+                              "dialogue": 0, "files": 0}
             rows = cur.execute(
                 "SELECT f.library, p.json FROM file_probes p "
                 "JOIN files f ON f.id=p.file_id "
                 "WHERE f.library IS NOT NULL AND f.state NOT IN "
-                "('deleted','duplicate')").fetchall()
+                "('deleted','duplicate') "
+                "AND (p.json LIKE '%hdmv_pgs_subtitle%' "
+                "     OR p.json LIKE '%pgssub%')").fetchall()
         for r in rows:
             slot = out.setdefault(r["library"], {"image": 0, "signs": 0,
                                                  "forced": 0, "dialogue": 0,
@@ -1033,6 +1068,7 @@ def status() -> dict:
     except Exception:                                    # noqa: BLE001
         pass
     from .config import DATA_DIR
+    kinds = library_track_kinds(blocking=False)
     return {
         "tesseract_dir": tdir if os.path.exists(exe) else "",
         "tesseract_version": tver,
@@ -1054,7 +1090,7 @@ def status() -> dict:
                 "remove_image": bool(_s("subocr_remove_image", False, l.name)),
                 "signs_max_cpm": signs_max_cpm(l.name),
                 "dialogue_min_cues": dialogue_min_cues(l.name),
-                "has": (library_track_kinds().get(l.name)
+                "has": (kinds.get(l.name)
                         or {"image": 0, "signs": 0, "forced": 0,
                             "dialogue": 0, "files": 0}),
                 # The subtitle RULES for this library, each on its own switch.
@@ -1072,15 +1108,15 @@ def status() -> dict:
 # description of what each one does.
 
 RULE_META = [
-    {"key": "burn", "label": "Paint signs and forced lines into the picture",
+    {"key": "burn", "label": "Burn signs and forced lines into the picture",
      "what": "The only way typeset signs and song captions render correctly - "
              "OCR cannot recover where they sit on screen. It needs the video "
              "to be rebuilt, so it happens when a rebuild is happening anyway.",
      "default": True},
     {"key": "burn_image_always",
-     "label": "Rebuild the video just to paint in a picture track",
+     "label": "Rebuild the video just to burn in a picture track",
      "what": "Without this, a file that needs no other work keeps its picture "
-             "subtitles - and Plex paints them on the CPU at playback instead, "
+             "subtitles - and Plex burns them in on the CPU at playback instead, "
              "which is a transcode, and an expensive one at 4K.",
      "default": True},
     {"key": "drop_covered",
@@ -1093,18 +1129,19 @@ RULE_META = [
      "default": True},
     {"key": "clear_flags",
      "label": "Stop kept picture tracks switching themselves on",
-     "what": "A picture track flagged default or forced makes Plex paint it "
+     "what": "A picture track flagged default or forced makes Plex burn it in "
              "at playback. Clearing the flags leaves it selectable by hand "
              "but never automatic.",
      "default": True},
     {"key": "remove_burned",
-     "label": "Remove a track once it is painted into the picture",
-     "what": "It is part of the video now; keeping the separate track means "
-             "the same subtitles can be shown twice, on top of each other.",
+     "label": "Remove a track once it is burned into the picture",
+     "what": "It is part of the video now. With this off the track is kept but "
+             "its default/forced flags are still cleared, so the same lines "
+             "are never drawn twice on top of each other.",
      "default": True},
     {"key": "burn_lang_guard",
-     "label": "Only paint in a track that is English or untagged",
-     "what": "Stops a German or French forced track being painted permanently "
+     "label": "Only burn in a track that is English or untagged",
+     "what": "Stops a German or French forced track being burned permanently "
              "into a picture you wanted in English.",
      "default": True},
     {"key": "force_eng_sub",
@@ -1113,7 +1150,7 @@ RULE_META = [
              "anyone reaching for the menu. Always a text track, never a "
              "picture one, and never the signs track.",
      "default": True},
-    {"key": "burn_hdr", "label": "Allow painting into HDR video",
+    {"key": "burn_hdr", "label": "Allow burning into HDR video",
      "what": "The colour tags and the HDR10 metadata are re-stated on the "
              "output, so the rebuild keeps its HDR. Dolby Vision's per-frame "
              "layer cannot survive any rebuild, so a DV file comes out as "
@@ -1250,7 +1287,14 @@ async def watch() -> None:
              "at a time, so Plex can hand clients text instead of burning "
              "pictures into the video. Which tracks qualify - dialogue, SDH, "
              "signs & songs - is set per library on the Subtitle OCR page.")
-    await asyncio.sleep(240)             # let the first scan settle
+    # Warm the per-library track counts while nobody is waiting, so the
+    # Subtitles page opens instantly instead of paying for the walk itself.
+    await asyncio.sleep(45)
+    try:
+        await asyncio.to_thread(library_track_kinds, True)
+    except Exception:                                    # noqa: BLE001
+        pass
+    await asyncio.sleep(195)             # let the first scan settle
     while True:
         try:
             if bool(_s("subocr_auto", True)):
