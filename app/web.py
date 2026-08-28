@@ -11107,7 +11107,10 @@ function renderSelfUse(s){
   const G=(s&&s.gpu)||{};
   const gpids=new Set((G.procs||[]).map(p=>p.pid));
   const ourPids=(n.proc_list||[]).map(p=>p.pid);
-  const onCard=ourPids.some(p=>gpids.has(p));
+  // Pid-matching OR declared GPU work: PaddleOCR's worker process comes and
+  // goes per file and can miss a sample, but the job list knows it is there.
+  const gpuWork=((s&&s.gpu_work)||[]).some(w=>w.n>0);
+  const onCard=ourPids.some(p=>gpids.has(p)) || gpuWork;
   const busyElsewhere=!onCard && (G.encoder_pct>=1 || (G.procs||[]).length>0);
   const gb2=document.querySelector('#suGpuBtn b');
   if(gb2){
@@ -11420,7 +11423,10 @@ function gpuPanel(s){
   // is exact where the driver was empty, and it is the question being asked.
   const perProc = !!G.per_proc_vram;
   const ourJobs = _nuarrEnc||[];
+  // Declared GPU work counts too - PaddleOCR and Whisper are nuarr on the
+  // card without any encode job existing. See _gpu_work() server-side.
   const onCard = ourJobs.length > 0
+              || (((s&&s.gpu_work)||[]).some(w=>w.n>0))
               || (perProc && apps0.some(a=>mine.has(a.pid)));
   const ourVram = perProc
     ? apps0.filter(a=>mine.has(a.pid)).reduce((t,a)=>t+(a.vram_mb||0),0) : 0;
@@ -11442,6 +11448,11 @@ function gpuPanel(s){
     + (onCard ? Math.round(G.encoder_pct||0)+'%' : 'not encoding') + '</td></tr>'
     + `<tr><td>encode jobs</td><td class="v">${
         ourJobs.length ? ourJobs.length : '<span class="dim">none</span>'}</td></tr>`
+    // GPU WORK THAT IS NOT AN ENCODE. PaddleOCR and Whisper run on the CUDA
+    // cores, so "encoder: not encoding" can be true while nuarr is the thing
+    // loading the card - these rows are what stop that reading as Plex.
+    + ((s&&s.gpu_work)||[]).map(wk=>`<tr><td>${esc(wk.label)}</td>
+        <td class="v">${wk.n>1?wk.n:(wk.n===1?'running':'<span class="dim">idle</span>')}</td></tr>`).join('')
     + (perProc
         ? `<tr><td>video memory</td><td class="v">${
             ourVram?mb(ourVram):'—'}</td></tr>`

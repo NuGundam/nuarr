@@ -508,7 +508,55 @@ def snapshot() -> dict:
     anything yet - otherwise a dashboard load before startup finishes would
     show empty gauges.
     """
-    return _LATEST or _sample()
+    out = dict(_LATEST or _sample())
+    out["gpu_work"] = _gpu_work()
+    return out
+
+
+def _gpu_work() -> list[dict]:
+    """What nuarr is running on the GPU right now, besides encodes.
+
+    The panel already counts encode jobs, and for years that was the whole
+    answer - then subtitle OCR (PaddleOCR) and audio-language listening
+    (Whisper) arrived, both of which run on the CUDA cores and neither of
+    which is an encode. Without this list the panel watched nuarr's own OCR
+    load and attributed it to Plex. Cheap by construction: reads in-memory
+    state only, no subprocess, because snapshot() serves every dashboard poll.
+    """
+    work: list[dict] = []
+    try:
+        from . import subocr
+        if subocr.engine() == "paddle":
+            from . import jobs as _jobs
+            n = sum(1 for w in _jobs.RUNNING.values()
+                    if getattr(getattr(w, "job", None), "kind", "") == "sub_ocr"
+                    or getattr(w, "sub_ocr_active", False))
+            if n:
+                cached = subocr._PADDLE_CACHE.get("data")
+                # An empty cache is "not asked yet", not "no CUDA" - claiming
+                # (CPU) on a GPU build right after boot would be invented.
+                dev = ("" if cached is None
+                       else " (GPU)" if cached.get("cuda") else " (CPU)")
+                work.append({"kind": "subocr",
+                             "label": f"subtitle OCR — PaddleOCR{dev}",
+                             "n": n})
+    except Exception:                                    # noqa: BLE001
+        pass
+    try:
+        from . import audiolang
+        p = audiolang.progress()
+        if (p.get("state") or "") == "listening":
+            work.append({"kind": "whisper",
+                         "label": "audio language — Whisper",
+                         "n": 1,
+                         "detail": (p.get("current") or "")[:60]})
+        elif audiolang._MODEL is not None:
+            work.append({"kind": "whisper",
+                         "label": "Whisper model loaded (idle, holding VRAM)",
+                         "n": 0})
+    except Exception:                                    # noqa: BLE001
+        pass
+    return work
 
 
 async def sampler() -> None:

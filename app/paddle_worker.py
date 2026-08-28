@@ -24,7 +24,22 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess as _sp
 import sys
+
+# HIDE EVERY DESCENDANT. This process runs without a console, so any
+# console-subsystem child anything in here spawns would get a brand new one
+# on the desktop. Patch Popen before the heavy imports - it underlies run,
+# call and check_output, so one patch covers whatever paddle or pytesseract
+# decide to launch. See pgsrip_hidden.py for the full story.
+if os.name == "nt":
+    _orig_popen_init = _sp.Popen.__init__
+
+    def _hidden_popen_init(self, *a, **k):
+        k["creationflags"] = (k.get("creationflags") or 0) | 0x08000000
+        _orig_popen_init(self, *a, **k)
+
+    _sp.Popen.__init__ = _hidden_popen_init
 
 
 def _die(msg: str) -> None:

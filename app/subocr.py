@@ -743,8 +743,12 @@ def ocr(sup: str, tick=None, base: float = 0.0, span: float = 1.0,
     th = threading.Thread(target=_ticker, daemon=True)
     th.start()
     try:
-        rc, err = _run([_python(), "-m", "pgsrip", "--language", "en",
-                        "--force", sup])
+        # Through the wrapper, not `-m pgsrip` - see pgsrip_hidden.py. It is
+        # what stops mkvextract and tesseract flashing consoles per cue.
+        rc, err = _run([_python(),
+                        os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     "pgsrip_hidden.py"),
+                        "--language", "en", "--force", sup])
     finally:
         stop.set()
         th.join(timeout=1)
