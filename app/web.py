@@ -4044,7 +4044,7 @@ async def api_subocr_preview_change(body: dict = Body(...)):
 
     def _work() -> dict:
         import json as _j
-        changed, checked, listed = 0, 0, []
+        changed, checked, listed, ids = 0, 0, [], []
         with cursor() as cur:
             rows = cur.execute(
                 "SELECT f.id,f.path,f.title,f.season,f.episode,f.size,"
@@ -4078,6 +4078,7 @@ async def api_subocr_preview_change(body: dict = Body(...)):
             if same:
                 continue
             changed += 1
+            ids.append(r["id"])
             if len(listed) < 300:
                 bits = []
                 if getattr(a, "burn_index", None) != getattr(b, "burn_index", None):
@@ -4102,8 +4103,48 @@ async def api_subocr_preview_change(body: dict = Body(...)):
                     "change": "; ".join(bits) or "a different subtitle plan",
                 })
         return {"ok": True, "checked": checked, "affected": changed,
-                "files": listed}
-    return await asyncio.to_thread(_work)
+                "files": listed, "ids": ids[:20000]}
+    out = await asyncio.to_thread(_work)
+    # Remembered so "requeue now" queues EXACTLY what was previewed, rather
+    # than re-deriving it from a policy that has since been saved - by then
+    # both plans are the same and the diff would be empty.
+    _SUB_LAST_IMPACT["ids"] = out.get("ids") or []
+    _SUB_LAST_IMPACT["at"] = time.time()
+    out.pop("ids", None)
+    return out
+
+
+_SUB_LAST_IMPACT: dict = {"ids": [], "at": 0.0}
+
+
+@app.post("/api/subocr/requeue")
+async def api_subocr_requeue():
+    """Replan exactly the files the last subtitle preview reported.
+
+    LATER IS A REAL ANSWER. Nothing here is required: the rules are already
+    saved and every one of these files will be replanned the next time it is
+    looked at anyway. This only says "do it now" - which matters when the
+    change was the point of the exercise and you would rather not wait for
+    the next sweep to reach it.
+    """
+    ids = list(_SUB_LAST_IMPACT.get("ids") or [])
+    queued = 0
+    for fid in ids:
+        rows = _rows("SELECT path,title,season,episode FROM files WHERE id=?",
+                     (fid,))
+        if not rows:
+            continue
+        label = display_label(rows[0]["title"], rows[0]["season"],
+                              rows[0]["episode"])
+        try:
+            if await jobs.enqueue(fid, rows[0]["path"], label, source="manual"):
+                queued += 1
+        except Exception:                                # noqa: BLE001
+            continue                 # already queued, or nothing to do
+    if queued:
+        await jobs.start()
+    joblog.log(f"subtitle rules: queued {queued} file(s) to be replanned", "ok")
+    return {"queued": queued, "considered": len(ids)}
 
 
 @app.post("/api/subocr/update")
@@ -15466,46 +15507,76 @@ setInterval(loadVersion, 300000);
 // port now, because libraries, arrs and Plex all configure better HERE -
 // with live tests and a sign-in button - than in a wizard that runs before
 // nuarr exists. So the dashboard notices the blank slate and walks through it.
+// IT HAS TO SURVIVE THE NAVIGATION IT ASKS FOR. The first version was a
+// modal that sent you to a settings page and then vanished - so the moment
+// you did what it asked, the thing keeping track of where you were in the
+// sequence was gone. It now follows you: a modal on the dashboard while
+// nothing is done, a compact card in the corner of the settings pages while
+// you work, ticking steps off as each one starts answering, and telling you
+// what is left.
+const FR_STEPS=[
+  {k:'arrs', n:'Connect Sonarr or Radarr', hash:'#arrs', btn:'Open Arrs',
+   what:'Either one on its own is enough — nuarr keeps names and imports in step with whichever you use.'},
+  {k:'plex', n:'Sign in with Plex', hash:'#plex', btn:'Open Plex',
+   what:'One click: a plex.tv window opens, nuarr gets a token and finds your server itself.'},
+  {k:'libraries', n:'Add your libraries', hash:'#libs', btn:'Open Libraries',
+   what:'The folders nuarr manages. Network shares can be connected right in the picker.'}];
+
 async function firstRun(){
   let s=null;
   try{ s=await (await fetch('/api/firstrun')).json(); }catch(e){ return; }
-  if(s.libraries>0 || s.arrs>0 || s.plex) return;      // not a first run
+  const done={arrs:s.arrs>0, plex:!!s.plex, libraries:s.libraries>0};
+  const old=document.getElementById('frOverlay'); if(old) old.remove();
+  if(done.arrs && done.plex && done.libraries){
+    try{ sessionStorage.removeItem('nuarrFR'); }catch(e){}
+    return;                                  // set up: never shown again
+  }
   try{ if(sessionStorage.getItem('nuarrFR')==='later') return; }catch(e){}
-  const step=(n,title,what,href,btn)=>`
-    <div style="display:flex;gap:12px;align-items:flex-start;padding:11px 0;
-                border-top:1px solid var(--line)">
-      <div style="width:26px;height:26px;border-radius:50%;border:1px solid var(--acc);
-                  color:var(--acc);display:flex;align-items:center;justify-content:center;
-                  font-weight:600;flex-shrink:0">${n}</div>
-      <div style="flex:1"><b>${title}</b>
-        <div class="dim" style="font-size:11.5px;margin-top:2px">${what}</div></div>
-      <a href="${href}"><button style="white-space:nowrap">${btn}</button></a>
-    </div>`;
+  const onSettings=location.pathname.indexOf('/settings')===0;
+  const next=FR_STEPS.find(x=>!done[x.k]);
+  const left=FR_STEPS.filter(x=>!done[x.k]).length;
+  const row=(st)=>{
+    const ok=done[st.k], isNext=(next && next.k===st.k);
+    return `<div style="display:flex;gap:11px;align-items:flex-start;padding:9px 0;
+                border-top:1px solid var(--line);opacity:${ok?0.6:1}">
+      <div style="width:24px;height:24px;border-radius:50%;flex-shrink:0;
+           display:flex;align-items:center;justify-content:center;font-weight:600;
+           border:1px solid ${ok?'#3fb950':'var(--acc)'};color:${ok?'#3fb950':'var(--acc)'}"
+        >${ok?'✓':FR_STEPS.indexOf(st)+1}</div>
+      <div style="flex:1"><b>${st.n}</b>${ok?' <span style="color:#3fb950;font-size:11px">done</span>':''}
+        ${onSettings?'':`<div class="dim" style="font-size:11.5px;margin-top:2px">${st.what}</div>`}</div>
+      ${ok?'':`<a href="/settings${st.hash}"><button style="white-space:nowrap"
+        ${isNext?'':'class="dim"'}>${st.btn}</button></a>`}
+    </div>`;};
   const ov=document.createElement('div');
   ov.id='frOverlay';
-  ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:2000;'
-    +'display:flex;align-items:center;justify-content:center;padding:20px';
-  ov.innerHTML=`
+  const card=`
     <div style="background:var(--panel,#161b22);border:1px solid var(--line);
-                border-radius:8px;max-width:560px;width:100%;padding:20px 22px">
-      <h2 style="margin:0 0 4px">Welcome to nuarr</h2>
-      <div class="dim" style="font-size:12px;margin-bottom:12px">
-        Nothing is connected yet. Three things, in this order, and the whole
-        system comes alive - each page tests the connection before it saves,
-        so a typo is caught on the spot.</div>
-      ${step(1,'Connect Sonarr / Radarr',
-        'nuarr keeps names and imports in step with them - at least one is needed.',
-        '/settings#arrs','Open Arrs')}
-      ${step(2,'Sign in with Plex',
-        'One click: a plex.tv window opens, nuarr gets a token and finds your server itself.',
-        '/settings#plex','Open Plex')}
-      ${step(3,'Add your libraries',
-        'The folders nuarr manages. Network shares can be connected right in the picker.',
-        '/settings#libs','Open Libraries')}
-      <div style="display:flex;justify-content:flex-end;margin-top:14px">
-        <button onclick="frLater()" class="dim" style="font-size:12px">Do this later</button>
+                border-radius:8px;${onSettings?'width:330px;':'max-width:560px;width:100%;'}
+                padding:${onSettings?'13px 15px':'20px 22px'};
+                box-shadow:0 6px 26px rgba(0,0,0,.45)">
+      <div style="display:flex;align-items:baseline;gap:8px">
+        <b style="font-size:${onSettings?'13px':'17px'}">Setting up nuarr</b>
+        <span class="dim" style="font-size:11px;margin-left:auto">${3-left} of 3 done</span>
+      </div>
+      ${onSettings?'':`<div class="dim" style="font-size:12px;margin:4px 0 8px">
+        Nothing is connected yet. These three, in any order — each page tests
+        the connection before it saves, so a typo is caught on the spot.</div>`}
+      ${FR_STEPS.map(row).join('')}
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-top:10px">
+        <span class="dim" style="font-size:11px">${
+          left===0?'all done':`${left} left`}</span>
+        <button onclick="frLater()" class="dim" style="font-size:11.5px">Hide for now</button>
       </div>
     </div>`;
+  if(onSettings){
+    // Beside the work, not over it - you need the page it is pointing at.
+    ov.style.cssText='position:fixed;right:18px;bottom:18px;z-index:2000';
+  }else{
+    ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:2000;'
+      +'display:flex;align-items:center;justify-content:center;padding:20px';
+  }
+  ov.innerHTML=card;
   document.body.appendChild(ov);
 }
 function frLater(){
@@ -15514,6 +15585,9 @@ function frLater(){
   if(ov) ov.remove();
 }
 firstRun();
+// Re-check after anything that could have completed a step, so a saved arr
+// ticks its own box without a reload.
+setInterval(()=>{ if(document.getElementById('frOverlay')) firstRun(); }, 15000);
 
 // ---- the power-menu entry ------------------------------------------------
 // The menu is where restart lives, and installing IS a restart with a
@@ -17226,16 +17300,32 @@ async function socRulePreview(lib){
     <button onclick="langSignsLoad()">Undo</button>
     <span class="dim">${fmt(r.affected)} file(s) affected</span>`;
 }
-async function socRuleApply(lib){
+async function socRuleApply(lib,skipped){
   const bar=document.getElementById('soc_'+cssId(lib)+'_rulebar');
   try{
     const r=await (await fetch('/api/subocr/config',{method:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify(socRuleBody(lib))})).json();
-    if(bar) bar.innerHTML=`<span class="dim" style="color:${r.ok?'#7fd4a3':'#e0575b'}"
-      >${r.ok?'saved — the planner is using this now':(r.error||'failed')}</span>`;
-    if(r.ok && r.libraries) _socAll=r;
+    if(!r.ok){ if(bar) bar.innerHTML=`<span class="err">${esc(r.error||'failed')}</span>`; return; }
+    if(r.libraries) _socAll=r;
+    // NOW OR LATER, and later is a real answer: the rules are saved either
+    // way, and every affected file is replanned the next time it is looked
+    // at. This only offers to bring that forward.
+    if(bar) bar.innerHTML = skipped
+      ? `<span class="dim" style="color:#7fd4a3">saved — the planner is using this now</span>`
+      : `<span class="dim" style="color:#7fd4a3">saved.</span>
+         <button onclick="socRequeue(this)">Replan those files now</button>
+         <button onclick="this.parentNode.innerHTML='<span class=\\'dim\\'>saved — they will be replanned as they come up</span>'">Later</button>`;
   }catch(e){ if(bar) bar.innerHTML='<span class="err">failed</span>'; }
+}
+async function socRequeue(btn){
+  const box=btn.parentNode;
+  btn.disabled=true; btn.textContent='queueing…';
+  try{
+    const r=await (await fetch('/api/subocr/requeue',{method:'POST'})).json();
+    box.innerHTML=`<span class="dim" style="color:#7fd4a3">queued ${fmt(r.queued)}
+      of ${fmt(r.considered)} file(s) — watch them on the dashboard</span>`;
+  }catch(e){ box.innerHTML='<span class="err">could not queue</span>'; }
 }
 
 async function socSaveLib(lib){
