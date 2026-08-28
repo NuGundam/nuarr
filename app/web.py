@@ -3443,6 +3443,23 @@ async def api_plex_link_poll(id: int = Query(...)):
         return {"ok": False, "error": f"{type(e).__name__}: {str(e)[:120]}"}
 
 
+@app.get("/api/firstrun")
+def api_firstrun():
+    """Is anything configured yet - drives the first-load walkthrough.
+
+    The installer deliberately stopped asking about libraries, arrs and Plex:
+    a wizard page filled in before nuarr exists cannot test-drive anything,
+    and every one of those settings has a better home in the app - with live
+    tests, sign-in buttons and a browse dialog. This endpoint is how the
+    dashboard knows to walk a fresh install through them.
+    """
+    return {
+        "libraries": len(SETTINGS.libraries or []),
+        "arrs": len(SETTINGS.arrs or []),
+        "plex": bool(SETTINGS.plex_token),
+    }
+
+
 @app.get("/api/version")
 async def api_version():
     """Just the number. Called on every page load, so it must never block."""
@@ -15285,6 +15302,60 @@ async function loadVersion(){
 }
 loadVersion();
 setInterval(loadVersion, 300000);
+
+// ---- first-run walkthrough ----------------------------------------------
+// A fresh install knows nothing: the installer only asks for folders and a
+// port now, because libraries, arrs and Plex all configure better HERE -
+// with live tests and a sign-in button - than in a wizard that runs before
+// nuarr exists. So the dashboard notices the blank slate and walks through it.
+async function firstRun(){
+  let s=null;
+  try{ s=await (await fetch('/api/firstrun')).json(); }catch(e){ return; }
+  if(s.libraries>0 || s.arrs>0 || s.plex) return;      // not a first run
+  try{ if(sessionStorage.getItem('nuarrFR')==='later') return; }catch(e){}
+  const step=(n,title,what,href,btn)=>`
+    <div style="display:flex;gap:12px;align-items:flex-start;padding:11px 0;
+                border-top:1px solid var(--line)">
+      <div style="width:26px;height:26px;border-radius:50%;border:1px solid var(--acc);
+                  color:var(--acc);display:flex;align-items:center;justify-content:center;
+                  font-weight:600;flex-shrink:0">${n}</div>
+      <div style="flex:1"><b>${title}</b>
+        <div class="dim" style="font-size:11.5px;margin-top:2px">${what}</div></div>
+      <a href="${href}"><button style="white-space:nowrap">${btn}</button></a>
+    </div>`;
+  const ov=document.createElement('div');
+  ov.id='frOverlay';
+  ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:2000;'
+    +'display:flex;align-items:center;justify-content:center;padding:20px';
+  ov.innerHTML=`
+    <div style="background:var(--panel,#161b22);border:1px solid var(--line);
+                border-radius:8px;max-width:560px;width:100%;padding:20px 22px">
+      <h2 style="margin:0 0 4px">Welcome to nuarr</h2>
+      <div class="dim" style="font-size:12px;margin-bottom:12px">
+        Nothing is connected yet. Three things, in this order, and the whole
+        system comes alive - each page tests the connection before it saves,
+        so a typo is caught on the spot.</div>
+      ${step(1,'Connect Sonarr / Radarr',
+        'nuarr keeps names and imports in step with them - at least one is needed.',
+        '/settings#arrs','Open Arrs')}
+      ${step(2,'Sign in with Plex',
+        'One click: a plex.tv window opens, nuarr gets a token and finds your server itself.',
+        '/settings#plex','Open Plex')}
+      ${step(3,'Add your libraries',
+        'The folders nuarr manages. Network shares can be connected right in the picker.',
+        '/settings#libs','Open Libraries')}
+      <div style="display:flex;justify-content:flex-end;margin-top:14px">
+        <button onclick="frLater()" class="dim" style="font-size:12px">Do this later</button>
+      </div>
+    </div>`;
+  document.body.appendChild(ov);
+}
+function frLater(){
+  try{ sessionStorage.setItem('nuarrFR','later'); }catch(e){}
+  const ov=document.getElementById('frOverlay');
+  if(ov) ov.remove();
+}
+firstRun();
 
 // ---- the power-menu entry ------------------------------------------------
 // The menu is where restart lives, and installing IS a restart with a
