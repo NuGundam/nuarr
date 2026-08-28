@@ -2399,8 +2399,44 @@ def _summary_impl():
         "  FROM jobs WHERE state='done' "
         "   AND size_before IS NOT NULL AND size_after IS NOT NULL")[0]
     saved["net"] = (saved["before_b"] or 0) - (saved["after_b"] or 0)
+    # EVERYTHING THAT NEEDS A HUMAN, in one list, for the Attention tile.
+    # The file-error count was the tile's whole story, which meant "0 -
+    # nothing needs attention" while the rule check held three still-broken
+    # files and the audio page had unresolved tracks. Each entry names its
+    # source and where to go; each source is a cheap read, because this rides
+    # the stats poll.
+    attention: list[dict] = []
+    if errors.get("n"):
+        attention.append({"what": "file errors", "n": int(errors["n"]),
+                          "goto": "errors"})
+    try:
+        arow = _rows("SELECT pending FROM audit_runs "
+                     "ORDER BY at DESC LIMIT 1")
+        if arow and arow[0]["pending"]:
+            attention.append({"what": "rule check", "n": int(arow[0]["pending"]),
+                              "note": "still breaking a rule",
+                              "goto": "/settings#ruleschk"})
+    except Exception:                                    # noqa: BLE001
+        pass
+    try:
+        al = _rows("SELECT COUNT(*) n FROM audio_lang "
+                   "WHERE COALESCE(code,'')=''")
+        if al and al[0]["n"]:
+            attention.append({"what": "audio language", "n": int(al[0]["n"]),
+                              "note": "listened, no confident answer",
+                              "goto": "/settings#alang"})
+    except Exception:                                    # noqa: BLE001
+        pass
+    try:
+        st = arrhealth.STATE
+        if st.get("warnings"):
+            attention.append({"what": "arr health", "n": int(st["warnings"]),
+                              "note": "warnings on Sonarr/Radarr",
+                              "goto": "/settings#arrs"})
+    except Exception:                                    # noqa: BLE001
+        pass
     return {"states": states, "disks": disks, "libraries": libs,
-            "saved": saved,
+            "saved": saved, "attention": attention,
             "errors": errors, "error_kinds": err_kinds,
             "totals": totals, "orphans": orphans, "extras": extras,
             "extras_cutoff_mb": SETTINGS.min_orphan_size_mb,
@@ -4262,6 +4298,13 @@ def api_ocr_updates():
             "tess_install": dict(_so.TESS_INSTALL),
             "pgsrip_install": dict(_so._INSTALL),
             "paddle_install": dict(_so.PADDLE_INSTALL)}
+
+
+@app.get("/api/ocr/changelog")
+async def api_ocr_changelog(which: str = Query(...), since: str = Query("")):
+    """Release notes newer than the installed version, from upstream."""
+    from . import subocr as _so
+    return await asyncio.to_thread(_so.changelog, which, since)
 
 
 @app.post("/api/ocr/updates/check")
@@ -9174,17 +9217,17 @@ input[type=time]::-webkit-calendar-picker-indicator{filter:invert(.75);cursor:po
     <div id="cmqHead" style="display:none"></div>
     <div id="cmq" class="scrollbox auto nohz"></div>
   </div>
-  <!-- What Plex actually did. Everything else in this dashboard reports what
-       nuarr decided; this is the only panel that reports whether it worked. -->
-  <div class="panel">
+  <!-- What Plex actually did, and the nightly rule check. MOVED to Settings
+       as their own pages - these wrappers stay only as the DOM home the
+       settings panes adopt the contents from, hidden on the dashboard. -->
+  <div class="panel" id="pbPanel" style="display:none">
     <h2 style="color:#f778ba">What Plex had to work at
         <span id="pbCount" class="dim"></span>
         <span style="float:right;font-weight:400">
           <button onclick="pbPoll()">Check now</button></span></h2>
     <div id="pb"><div class="dim" style="padding:14px">loading…</div></div>
   </div>
-  <!-- Nightly conformance check: does the library match its own rules? -->
-  <div class="panel">
+  <div class="panel" id="auPanel" style="display:none">
     <h2 style="color:#39d3c3">Rule check <span id="auCount" class="dim"></span>
         <span style="float:right;font-weight:400">
           <button onclick="auRun()">Run now</button></span></h2>
@@ -9417,9 +9460,16 @@ async function loadAll(){
                 `${fmt(mh.checking)} more being re-checked`,
                 'confirmed after 3 checks'),
       {state:'missing',t:'Missing'});
-  const eTop=(s.error_kinds&&s.error_kinds[0])
-    ? esc(s.error_kinds[0].r).slice(0,44) : 'nothing needs attention';
-  add('Errors',fmt(s.errors.n),eTop,{errors:1,t:'Errors — needs attention'});
+  // ATTENTION, NOT JUST ERRORS. The tile counted file errors and said
+  // "nothing needs attention" while the rule check held broken files and the
+  // audio page had unresolved tracks. It now sums every source the server
+  // flags and names the loudest one.
+  const att=s.attention||[];
+  const attN=att.reduce((t,a)=>t+(a.n||0),0);
+  const attTop=att.length
+    ? esc(att.map(a=>`${a.what} ${fmt(a.n)}`).join(' · ')).slice(0,64)
+    : 'nothing needs attention';
+  add('Attention',fmt(attN),attTop,{errors:1,t:'Needs attention'});
   const ua = s.unmanaged_adopt || {checking:0, no_folder:0};
   add('Unmanaged &gt;'+s.extras_cutoff_mb+'MB',fmt(s.orphans.n),
       sweepNote(s.unmanaged_sweep, ua.checking,
@@ -16172,7 +16222,7 @@ function wtab(which){
                    vcodec:'vcodecPane', acodec:'acodecPane',
                    alang:'alangPane', cache:'cachePane',
                    whisper:'whisperPane', plex:'plexPane',
-                   ocr:'ocrPane',
+                   ocr:'ocrPane', plexwork:'plexworkPane', ruleschk:'ruleschkPane',
                    updates:'updPane'};
   const isPane = Object.prototype.hasOwnProperty.call(PANE_OF, which);
   const set = document.getElementById('wSettings');
@@ -16217,6 +16267,29 @@ function wtab(which){
   if(which==='updates'){
     if(hint) hint.textContent='· updates';
     loadUpdates(0);      // 0: use the cache. The Check now button forces it.
+    return;
+  }
+  if(which==='plexwork'){
+    if(hint) hint.textContent='· plex playback';
+    // ADOPT the dashboard panel's content node: the loaders target #pb by
+    // id, the poll cycle keeps refreshing it, and moving the node means one
+    // implementation lives in one place instead of two drifting copies.
+    const host=document.getElementById('plexworkBody');
+    const panel=document.getElementById('pbPanel');
+    if(host&&panel&&panel.firstElementChild){
+      while(panel.firstChild) host.appendChild(panel.firstChild);
+    }
+    loadPlayback();
+    return;
+  }
+  if(which==='ruleschk'){
+    if(hint) hint.textContent='· rule check';
+    const host=document.getElementById('ruleschkBody');
+    const panel=document.getElementById('auPanel');
+    if(host&&panel&&panel.firstElementChild){
+      while(panel.firstChild) host.appendChild(panel.firstChild);
+    }
+    loadAudit();
     return;
   }
   if(which==='ocr'){
@@ -17888,7 +17961,6 @@ async function loadOcr(){
       ${(!padReady||!p.cuda)?`<button onclick="padInstall('gpu')" ${hasGpu?'style="color:var(--acc)"':''}
           >Install — GPU${hasGpu?` (${esc(p.gpu_name)})`:''}</button>`:''}
       ${!padReady?`<button onclick="padInstall('cpu')">Install — CPU only</button>`:''}
-      ${padReady?`<button onclick="padInstall('update')">Update PaddleOCR</button>`:''}
       ${inst.state==='error'?`<span style="color:#e0575b;font-size:11px">${esc(inst.error||'')}</span>`:''}
       ${inst.state==='done'?`<span style="color:#7fd4a3;font-size:11px">done</span>`:''}
     </div>`;
@@ -18042,8 +18114,11 @@ async function ocrUpdLoad(){
                  border-top:1px solid var(--line);font-size:12px">
       <b style="width:110px">${label}</b>
       <span class="mono dim" style="width:130px">${esc(x.installed||'—')}</span>
+      ${x.installed?`<a href="#" onclick="ocrChanges('${key}','${esc(x.installed)}');return false"
+        class="dim" style="font-size:11px">what changed</a>`:''}
       <span style="margin-left:auto;display:flex;align-items:center;gap:4px">${right}</span>
-    </div>`;
+    </div>
+    <div id="ocrChg_${key}" style="display:none"></div>`;
   };
   const when=u.at?new Date(u.at*1000).toLocaleString():'';
   el.innerHTML=
@@ -18054,6 +18129,33 @@ async function ocrUpdLoad(){
   if(Object.values(busyOf).some(b=>b.state==='installing'))
     setTimeout(ocrUpdLoad, 4000);
 }
+// "What changed" - releases newer than what is installed, straight from each
+// project's GitHub. Toggles closed on a second click.
+async function ocrChanges(which,since){
+  const box=document.getElementById('ocrChg_'+which);
+  if(!box) return;
+  if(box.style.display!=='none'){ box.style.display='none'; return; }
+  box.style.display='';
+  box.innerHTML='<div class="dim" style="font-size:11px;padding:4px 0 8px">loading release notes…</div>';
+  let r=null;
+  try{ r=await (await fetch(`/api/ocr/changelog?which=${which}&since=${encodeURIComponent(since)}`)).json(); }catch(e){}
+  if(!r||!r.ok){ box.innerHTML=`<div class="dim" style="font-size:11px;padding:4px 0 8px">could not load — <a href="https://github.com" target="_blank" rel="noopener">see upstream</a></div>`; return; }
+  if(!(r.releases||[]).length){
+    box.innerHTML=`<div class="dim" style="font-size:11px;padding:4px 0 8px">
+      nothing newer than ${esc(since)} has release notes —
+      <a href="${esc(r.url)}" target="_blank" rel="noopener">all releases</a></div>`;
+    return;
+  }
+  box.innerHTML=r.releases.map(rel=>`
+    <div style="padding:5px 0 7px 12px;border-left:2px solid var(--line);margin:4px 0">
+      <b style="font-size:12px">${esc(rel.name)}</b>
+      <span class="dim" style="font-size:10.5px">${esc(rel.date)}</span>
+      <div class="dim" style="font-size:11px;white-space:pre-wrap;max-height:140px;overflow:auto">${esc(rel.body||'(no notes)')}</div>
+    </div>`).join('')
+    +`<div style="padding:2px 0 8px"><a href="${esc(r.url)}" target="_blank" rel="noopener"
+       class="dim" style="font-size:10.5px">all releases</a></div>`;
+}
+
 async function ocrUpdCheck(btn){
   btn.disabled=true; const old=btn.textContent; btn.textContent='checking…';
   try{ await fetch('/api/ocr/updates/check',{method:'POST'}); }catch(e){}
@@ -20555,7 +20657,9 @@ _SETTINGS_NAV = [
                     ("vcodec", "Video codec",      "film"),
                     ("acodec", "Audio codec",      "sliders"),
                     ("alang",  "Audio language",   "language"),
-                    ("rules",  "Rules",            "list")]),
+                    ("rules",  "Rules",            "list"),
+                    ("ruleschk", "Rule check",     "list"),
+                    ("plexwork", "Plex playback",  "play")]),
     ("Tools",      [("ffmpeg",  "ffmpeg",          "film"),
                     ("mkv",     "MKVToolNix",      "tool"),
                     ("whisper", "Whisper",         "language"),

@@ -1776,6 +1776,55 @@ def tesseract_update_start(target_version: str = "") -> dict:
     return {"ok": True, "version": v}
 
 
+_CHANGELOG_REPOS = {
+    "tesseract": "UB-Mannheim/tesseract",
+    "pgsrip": "ratoaq2/pgsrip",
+    "paddleocr": "PaddlePaddle/PaddleOCR",
+}
+
+
+def changelog(which: str, since: str = "") -> dict:
+    """What changed between the installed version and now, from upstream.
+
+    Straight from each project's GitHub releases: title, date and body per
+    release newer than `since`, capped so a project that writes essays does
+    not flood the card. Answering "should I press Update" is the whole job.
+    """
+    import urllib.request
+    repo = _CHANGELOG_REPOS.get(which)
+    if not repo:
+        return {"ok": False, "error": "unknown component"}
+    try:
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/{repo}/releases?per_page=10",
+            headers={"User-Agent": "nuarr",
+                     "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            rels = json.loads(r.read().decode("utf-8"))
+        out = []
+        cur = [int(x) for x in re.findall(r"\d+", since or "")][:4]
+        for rel in rels or []:
+            if rel.get("draft"):
+                continue
+            tag = str(rel.get("tag_name") or "")
+            ver = [int(x) for x in re.findall(r"\d+", tag)][:4]
+            if cur and ver and ver <= cur:
+                continue                 # already running this one
+            body = (rel.get("body") or "").strip()
+            if len(body) > 1200:
+                body = body[:1200] + "…"
+            out.append({"tag": tag, "name": rel.get("name") or tag,
+                        "date": (rel.get("published_at") or "")[:10],
+                        "body": body,
+                        "url": rel.get("html_url") or ""})
+            if len(out) >= 5:
+                break
+        return {"ok": True, "which": which, "since": since, "releases": out,
+                "url": f"https://github.com/{repo}/releases"}
+    except Exception as e:                               # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {str(e)[:120]}"}
+
+
 async def updates_watch() -> None:
     """Once a day, ask upstream about all three - the Jobs page row."""
     import asyncio

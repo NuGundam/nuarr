@@ -249,6 +249,25 @@
           <div class="dim" style="padding:14px">loading&hellip;</div>
         </div>
       </div>
+      <div id="plexworkPane" style="display:none">
+        <div class="dim" style="padding:9px 14px;font-size:11px">
+          The only page that reports whether the standardising <b>worked</b>:
+          every time Plex had to rebuild something at playback instead of
+          direct-playing it, with the track and codec that caused it. One hit
+          from an unusual client is normal; the same file across several
+          clients is a rule worth adding.
+        </div>
+        <div id="plexworkBody" style="padding:0 14px 14px"></div>
+      </div>
+      <div id="ruleschkPane" style="display:none">
+        <div class="dim" style="padding:9px 14px;font-size:11px">
+          The nightly conformance check: does the library still match its own
+          rules? A finding is queued, fixed and re-verified on its own -
+          this page is where you see that happening, and where anything
+          still broken is named.
+        </div>
+        <div id="ruleschkBody" style="padding:0 14px 14px"></div>
+      </div>
       <div id="updPane" style="display:none">
   <div class="dim" style="padding:9px 14px;font-size:11px">
     Which nuarr this is, and whether there is a newer one. Checking is
