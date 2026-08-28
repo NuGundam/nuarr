@@ -22,7 +22,7 @@ import re
 #         setting that moved, anything that could surprise an existing install)
 # minor - a new capability
 # patch - a fix to something that was already meant to work
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 
 # Filled in when a bundle is built, so a running install can say not just what
 # it is but when it was made. Left empty in a source checkout on purpose - an

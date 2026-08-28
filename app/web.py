@@ -4157,6 +4157,16 @@ async def api_paddle():
     return await asyncio.to_thread(_so.paddle_info)
 
 
+@app.post("/api/ocr/test")
+async def api_ocr_test(engine: str = Query("tesseract"),
+                       device: str = Query("cpu")):
+    """Read a dozen real cues with one engine. Writes nothing to the library."""
+    from . import subocr as _so
+    if engine not in ("tesseract", "paddle"):
+        return {"ok": False, "error": "unknown engine"}
+    return await asyncio.to_thread(_so.engine_test, engine, device)
+
+
 @app.post("/api/paddle/install")
 def api_paddle_install(mode: str = Query("gpu")):
     """Install or update PaddleOCR - gpu, cpu, or update."""
@@ -17362,15 +17372,22 @@ async function socRequeue(btn){
 async function socSaveLib(lib){
   const id=(k)=>document.getElementById('soc_'+cssId(lib)+'_'+k);
   const m=id('msg');
-  const body={library:lib,
-    subocr_auto:id('auto').checked,
-    subocr_sdh:id('sdh').checked,
-    subocr_forced:id('forced').checked,
-    subocr_all:id('all').checked,
-    subocr_remove_image:id('remove_image').checked,
-    subocr_engine:(id('eng')||{}).value||'tesseract',
-    subocr_signs_max_cpm:parseFloat(id('cpm').value)||6,
-    subocr_dialogue_min_cues:parseInt(id('cues').value)||500};
+  // ONLY SEND WHAT IS ON THE PAGE. `(id('x')||{}).value||'default'` looks
+  // defensive and is the opposite: when a control is missing - an older
+  // render, a pane that has not painted yet - it sends the DEFAULT, which
+  // overwrites whatever was stored. That is how every library quietly ended
+  // up with an engine nobody had chosen. An absent control now contributes
+  // nothing, and the server only applies the keys it is actually given.
+  const body={library:lib};
+  const put=(key,el,read)=>{ if(el) body[key]=read(el); };
+  put('subocr_auto',        id('auto'),        e=>e.checked);
+  put('subocr_sdh',         id('sdh'),         e=>e.checked);
+  put('subocr_forced',      id('forced'),      e=>e.checked);
+  put('subocr_all',         id('all'),         e=>e.checked);
+  put('subocr_remove_image',id('remove_image'),e=>e.checked);
+  put('subocr_engine',      id('eng'),         e=>e.value||'tesseract');
+  put('subocr_signs_max_cpm',    id('cpm'),  e=>parseFloat(e.value)||6);
+  put('subocr_dialogue_min_cues',id('cues'), e=>parseInt(e.value)||500);
   try{
     const r=await (await fetch('/api/subocr/config',{method:'POST',
       headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
@@ -17679,11 +17696,23 @@ async function loadSubocr(){
     </div>
 
     <div class="lkind" style="padding:11px 12px;margin-top:10px">
+      <b style="color:#6fb0ff">Test it</b>
+      <div class="dim" style="font-size:11px;margin-top:3px">
+        Reads a dozen cues from a real picture-subtitle track in your library
+        and shows what came back. Nothing is written and no file is touched.</div>
+      <div style="margin-top:7px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <button onclick="ocrTest('tesseract','cpu','tessTest')">Test Tesseract</button>
+        <span id="tessTestMsg" class="dim" style="font-size:11.5px"></span>
+      </div>
+      <div id="tessTest" style="margin-top:6px"></div>
+    </div>
+
+    <div class="lkind" style="padding:11px 12px;margin-top:10px">
       <b style="color:#6fb0ff">What uses this</b>
       <div class="dim" style="font-size:11px;margin-top:4px">
         Reading image subtitles back as text is a <b>subtitle policy</b>, not a
-        property of the engine — which tracks qualify, per library, on what
-        schedule, all live with the languages and the burn-in rule.
+        property of the engine — which tracks qualify, and per library which
+        engine reads them, live with the languages and the burn-in rule.
         <div style="margin-top:7px"><button onclick="wtab('lang')">Open Subtitles settings</button></div>
       </div>
     </div>`;
@@ -17782,8 +17811,58 @@ async function loadPaddle(){
         Which engine each library uses is set on the <b>Subtitles</b> page.
         <button style="margin-left:6px" onclick="wtab('lang')">Open Subtitles settings</button>
       </div>
-    </div>`;
+    </div>
+
+    ${p.installed?`<div class="lkind" style="padding:11px 12px;margin-top:10px">
+      <b style="color:#6fb0ff">Test it on your own subtitles</b>
+      <div class="dim" style="font-size:11px;margin-top:3px">
+        Reads a dozen cues from a real picture-subtitle track in your library.
+        Run both and compare — same track, same images, so the difference you
+        see is the engine. Nothing is written and no file is touched.</div>
+      <div style="margin-top:7px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        ${p.cuda?`<button onclick="ocrTest('paddle','gpu','padTest')">Test on GPU</button>`
+                :`<button disabled title="this is the CPU build">Test on GPU</button>`}
+        <button onclick="ocrTest('paddle','cpu','padTest')">Test on CPU</button>
+        <button onclick="ocrTest('tesseract','cpu','padTest')">Test Tesseract for comparison</button>
+        <span id="padTestMsg" class="dim" style="font-size:11.5px"></span>
+      </div>
+      <div id="padTest" style="margin-top:6px"></div>
+    </div>`:''}`;
 }
+
+// Shared by both engine pages: run one test, append the result so two runs
+// sit side by side and can actually be compared.
+async function ocrTest(engine,device,into){
+  const box=document.getElementById(into);
+  const msg=document.getElementById(into+'Msg');
+  if(msg){ msg.style.color=''; msg.textContent=
+    `reading with ${engine}${engine==='paddle'?' on '+device.toUpperCase():''}… `
+    +`first run loads the model, so give it a moment`; }
+  let r=null;
+  try{ r=await (await fetch(`/api/ocr/test?engine=${engine}&device=${device}`,
+                            {method:'POST'})).json(); }
+  catch(e){ if(msg){ msg.style.color='#e0575b'; msg.textContent='test failed'; } return; }
+  if(msg) msg.textContent='';
+  const name = engine==='paddle' ? `PaddleOCR · ${device.toUpperCase()}` : 'Tesseract';
+  if(!r.ok){
+    if(box) box.insertAdjacentHTML('afterbegin',
+      `<div class="lkind" style="padding:8px 10px;margin-top:6px">
+         <b>${esc(name)}</b> <span style="color:#e0575b">— ${esc(r.error||'failed')}</span></div>`);
+    return;
+  }
+  if(box) box.insertAdjacentHTML('afterbegin',`
+    <div class="lkind" style="padding:8px 10px;margin-top:6px">
+      <div><b>${esc(name)}</b>
+        <span class="dim">— ${r.cues} cue(s) from “${esc(r.title||'a file')}” in
+        ${r.elapsed}s
+        <span style="font-size:10.5px">· a short sample, so most of that is
+        starting the process and loading the model — read the TEXT below, not
+        the clock</span></span></div>
+      <div class="mono dim" style="font-size:11px;margin-top:5px;max-height:150px;overflow:auto">
+        ${(r.lines||[]).map(l=>esc(l)).join('<br>')||'(nothing read)'}</div>
+    </div>`);
+}
+
 async function padInstall(mode){
   try{ await fetch('/api/paddle/install?mode='+mode,{method:'POST'}); }catch(e){}
   loadPaddle();
@@ -20262,7 +20341,7 @@ _SETTINGS_NAV = [
     ("Tools",      [("ffmpeg",  "ffmpeg",          "film"),
                     ("mkv",     "MKVToolNix",      "tool"),
                     ("whisper", "Whisper",         "language"),
-                    ("subocr",  "Subtitle OCR",    "language"),
+                    ("subocr",  "Tesseract",       "language"),
                     ("paddle",  "PaddleOCR",       "language")]),
     ("Integrations", [("arrs", "Arrs",             "link"),
                       ("plex", "Plex",             "play"),

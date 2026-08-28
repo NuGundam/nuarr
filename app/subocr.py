@@ -605,6 +605,26 @@ def _run(args: list[str], timeout: float = 3600) -> tuple[int, str]:
     return p.returncode, (err or "") + (out or "")
 
 
+def _ffmpeg() -> str:
+    r"""THE SAME ffmpeg every other part of nuarr uses.
+
+    Delegates to jobs rather than resolving its own path, so the pin, the
+    rollback and the "Uses ffmpeg" table on the ffmpeg page all apply here
+    too. SETTINGS.ffmpeg is the last resort and defaults to the bare name
+    "ffmpeg", which only works when it happens to be on PATH - true for the
+    scheduled task, false for anything else, which is exactly how the OCR
+    self-test failed to find a single testable file.
+    """
+    try:
+        from . import jobs
+        ff = jobs._ffmpeg_exe()
+        if ff:
+            return ff
+    except Exception:                                    # noqa: BLE001
+        pass
+    return getattr(SETTINGS, "ffmpeg", "") or "ffmpeg"
+
+
 def _mkvmerge() -> str:
     return getattr(SETTINGS, "mkvmerge", None) or \
         r"C:\Program Files\MKVToolNix\mkvmerge.exe"
@@ -631,7 +651,8 @@ def extract_sup(path: str, rel: int, work: str, tag: str) -> str:
     rather than from an argument.
     """
     sup = os.path.join(work, f"{tag}.en.sup")
-    rc, err = _run([SETTINGS.ffmpeg, "-y", "-v", "error", "-i", path,
+    # _ffmpeg(), not SETTINGS.ffmpeg - see its docstring.
+    rc, err = _run([_ffmpeg(), "-y", "-v", "error", "-i", path,
                     "-map", f"0:s:{rel}", "-c:s", "copy", sup])
     if rc != 0 or not os.path.exists(sup) or os.path.getsize(sup) < 1024:
         raise RuntimeError(f"sup extraction failed: {err.strip()[:200]}")
@@ -689,8 +710,14 @@ def ocr(sup: str, tick=None, base: float = 0.0, span: float = 1.0,
         while not stop.wait(2.0):
             if tick:
                 frac = min(0.95, (time.time() - t0) / expect_s)
+                # NAMES ITSELF, like the Paddle path does. With two engines
+                # in play "OCR 40%" no longer says which one is grinding, and
+                # that is the first thing anyone looking at a slow card wants
+                # to know. "(est)" stays: this bar is a guess from the size of
+                # the .sup, because pgsrip reports nothing per cue.
                 tick(base + span * frac,
-                     f"OCR{who} ~{int(min(99, frac * 100))}% (est)")
+                     f"OCR{who} — Tesseract "
+                     f"~{int(min(99, frac * 100))}% (est)")
 
     th = threading.Thread(target=_ticker, daemon=True)
     th.start()
@@ -1243,8 +1270,30 @@ _PADDLE_STEPS = {
 }
 
 
-def paddle_info() -> dict:
-    """Which Paddle is installed, and can it see the card."""
+_PADDLE_CACHE: dict = {"at": 0.0, "data": None}
+_PADDLE_TTL = 600.0
+
+
+def paddle_invalidate() -> None:
+    """Forget the cached answer - after an install, or on demand."""
+    _PADDLE_CACHE["at"] = 0.0
+
+
+def paddle_info(force: bool = False) -> dict:
+    """Which Paddle is installed, and can it see the card.
+
+    CACHED, because the honest way to answer costs seconds: it starts a
+    Python, imports paddle and asks it about CUDA, and paddle is hundreds of
+    megabytes of native code. That is the right way to ask - see below - but
+    it is not something to do on every page load for an answer that only
+    changes when somebody installs something. The install path clears this.
+    """
+    now = time.time()
+    if not force and _PADDLE_CACHE["data"] is not None \
+            and (now - _PADDLE_CACHE["at"]) < _PADDLE_TTL:
+        d = dict(_PADDLE_CACHE["data"])
+        d["install"] = dict(PADDLE_INSTALL)      # live, never cached
+        return d
     import subprocess as _sp
     import sys as _sys
     out = {"installed": False, "paddleocr": "", "paddlepaddle": "",
@@ -1281,6 +1330,7 @@ def paddle_info() -> dict:
         out["gpu_name"] = encoders.devices().get("gpu_name", "")
     except Exception:                                    # noqa: BLE001
         pass
+    _PADDLE_CACHE.update(at=now, data=dict(out))
     return out
 
 
@@ -1313,6 +1363,7 @@ def paddle_install_start(mode: str) -> dict:
                     raise RuntimeError(f"pip exited {p.returncode} on "
                                        f"{step[0]}")
             PADDLE_INSTALL.update(state="done")
+            paddle_invalidate()          # the cached answer is now wrong
             from . import joblog as _jl
             _jl.log(f"PaddleOCR installed ({mode})", "ok")
         except Exception as e:                           # noqa: BLE001
@@ -1344,15 +1395,158 @@ def ocr_paddle(sup: str, tick=None, base: float = 0.0, span: float = 1.0,
             sup, "--out", out, "--device", dev, "--progress"]
     if ass:
         args.append("--ass")
+    label = f"PaddleOCR · {dev.upper()}"
     if tick:
-        tick(base, f"OCR{who} (PaddleOCR, {dev})")
-    rc, err = _run(args, timeout=7200)
+        tick(base, f"OCR{who} — {label}")
+    # REAL PROGRESS, NOT AN ESTIMATE. The Tesseract path has to guess from the
+    # size of the .sup because pgsrip reports nothing; this worker prints one
+    # line per cue, so the bar can follow the actual work. Same bar, two very
+    # different sources - see ocr().
+    rc, err, tail = _run_progress(args, tick, base, span, who, label)
     if not os.path.exists(out):
         raise RuntimeError(f"PaddleOCR produced nothing (rc={rc}): "
-                           f"{err.strip()[:300]}")
+                           f"{(err or tail).strip()[:300]}")
     if tick:
-        tick(base + span, f"OCR{who} done")
+        tick(base + span, f"OCR{who} — {label} done")
     return out
+
+
+def _run_progress(args: list[str], tick, base: float, span: float,
+                  who: str, label: str) -> tuple[int, str, str]:
+    """Run a child that prints `PROGRESS i/n`, moving the bar as it does."""
+    from collections import deque
+    tail: deque = deque(maxlen=25)
+    p = subprocess.Popen(args, stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT, text=True,
+                         errors="replace", creationflags=NO_WINDOW,
+                         env=_env())
+    hook = getattr(_TLS, "on_child", None)
+    if hook:
+        try:
+            hook(p)
+        except Exception:                                # noqa: BLE001
+            pass
+    try:
+        for line in p.stdout:
+            line = line.rstrip()
+            if not line:
+                continue
+            if line.startswith("PROGRESS "):
+                try:
+                    i, n = line.split(" ", 1)[1].split("/")
+                    frac = min(1.0, int(i) / max(1, int(n)))
+                    if tick:
+                        tick(base + span * frac,
+                             f"OCR{who} — {label} {int(frac * 100)}% "
+                             f"({i}/{n} cues)")
+                except (ValueError, ZeroDivisionError):
+                    pass
+            else:
+                tail.append(line)
+        rc = p.wait()
+    finally:
+        if hook:
+            try:
+                hook(None)
+            except Exception:                            # noqa: BLE001
+                pass
+    return rc, "", "\n".join(tail)
+
+
+_TEST_SUP: dict = {"path": "", "cues": 0, "title": ""}
+
+
+def _test_sample() -> dict:
+    """A real .sup from the library, cached, for the engine tests.
+
+    A REAL TRACK, not a synthetic image: the whole question these tests
+    answer is "how does this engine do on MY subtitles", and a rendered
+    sample of Arial would flatter both engines equally and tell nobody
+    anything.
+    """
+    if _TEST_SUP["path"] and os.path.exists(_TEST_SUP["path"]):
+        return dict(_TEST_SUP)
+    from .db import cursor
+    from .config import DATA_DIR
+    work = os.path.join(str(DATA_DIR), "ocrtest")
+    os.makedirs(work, exist_ok=True)
+    with cursor() as cur:
+        rows = cur.execute(
+            "SELECT f.path, f.title, p.json FROM file_probes p "
+            "JOIN files f ON f.id=p.file_id "
+            "WHERE f.state NOT IN ('deleted','duplicate') "
+            "AND (p.json LIKE '%hdmv_pgs_subtitle%' OR p.json LIKE '%pgssub%') "
+            "LIMIT 400").fetchall()
+    for r in rows:
+        if not os.path.exists(r["path"]):
+            continue
+        try:
+            d = json.loads(r["json"])
+        except Exception:                                # noqa: BLE001
+            continue
+        subs = [s for s in (d.get("streams") or [])
+                if s.get("codec_type") == "subtitle"]
+        for rel, s in enumerate(subs):
+            if (s.get("codec_name") or "").lower() not in IMG_CODECS:
+                continue
+            try:
+                sup = extract_sup(r["path"], rel, work, "sample")
+            except Exception:                            # noqa: BLE001
+                continue
+            _TEST_SUP.update(path=sup, cues=0, title=r["title"] or "")
+            return dict(_TEST_SUP)
+    return {"path": "", "cues": 0, "title": ""}
+
+
+def engine_test(which: str = "tesseract", device: str = "cpu",
+                limit: int = 12) -> dict:
+    """Read a few real cues with one engine and report what came back.
+
+    The codec page's test-encode, for OCR: same images, one engine, honest
+    numbers. Nothing is written to the library and nothing is saved.
+    """
+    import sys as _sys
+    t0 = time.time()
+    samp = _test_sample()
+    if not samp["path"]:
+        return {"ok": False, "error": "no reachable file with a picture "
+                                      "subtitle track to test with"}
+    out = os.path.join(os.path.dirname(samp["path"]),
+                       f"test_{which}_{device}.srt")
+    args = [_sys.executable,
+            os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "paddle_worker.py"),
+            samp["path"], "--out", out, "--engine", which,
+            "--device", device, "--limit", str(limit)]
+    env_dir = tesseract_dir()
+    old = os.environ.get("NUARR_TESSERACT_DIR")
+    os.environ["NUARR_TESSERACT_DIR"] = env_dir
+    try:
+        rc, err = _run(args, timeout=1800)
+    finally:
+        if old is None:
+            os.environ.pop("NUARR_TESSERACT_DIR", None)
+        else:
+            os.environ["NUARR_TESSERACT_DIR"] = old
+    el = time.time() - t0
+    if not os.path.exists(out):
+        return {"ok": False, "engine": which, "device": device,
+                "elapsed": round(el, 1),
+                "error": (err or "").strip()[-300:] or f"exit {rc}"}
+    lines = []
+    for block in open(out, encoding="utf-8").read().split("\n\n"):
+        rows = [x for x in block.splitlines() if x.strip()]
+        if len(rows) >= 3:
+            lines.append(" ".join(rows[2:]))
+    try:
+        os.remove(out)
+    except OSError:
+        pass
+    return {"ok": True, "engine": which, "device": device,
+            "title": samp["title"], "cues": len(lines),
+            "elapsed": round(el, 1),
+            "per_cue_ms": int(el * 1000 / max(1, len(lines))),
+            "lines": lines[:8]}
 
 
 def pip_update_start() -> dict:

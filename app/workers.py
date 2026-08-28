@@ -177,13 +177,45 @@ def _encode_hint() -> str:
         return "Bound by the hardware encoder; ~4 saturates one engine at 1080p."
 
 
+def _subocr_hint() -> str:
+    """What limits subtitle OCR depends on which engine is reading.
+
+    Tesseract is CPU-bound and single-threaded per file, so more workers use
+    more cores. PaddleOCR on a GPU is bound by the card instead, and running
+    several at once mostly queues them behind each other - so the advice
+    inverts, and the hint has to say which world this install is in.
+    """
+    try:
+        from . import subocr
+        libs = {l.name for l in (SETTINGS.libraries or [])}
+        engines = {subocr.engine(n) for n in libs} or {"tesseract"}
+        if engines == {"paddle"}:
+            dev = "GPU" if subocr.paddle_info().get("cuda") else "CPU"
+            if dev == "GPU":
+                return ("Subtitle OCR, reading with PaddleOCR on the GPU. "
+                        "Bound by the card, not by cores - a couple of workers "
+                        "saturate it and more mostly queue behind each other. "
+                        "The commit half is disk I/O, capped by disk_wait_pct.")
+            return ("Subtitle OCR, reading with PaddleOCR on the CPU. "
+                    "Heavier per cue than Tesseract - scales with cores, but "
+                    "each file costs far more. The commit half is disk I/O, "
+                    "capped by disk_wait_pct.")
+        if "paddle" in engines:
+            return ("Subtitle OCR. Mixed engines across libraries - Tesseract "
+                    "scales with cores, PaddleOCR is bound by whatever it runs "
+                    "on. The commit half is disk I/O, capped by disk_wait_pct.")
+    except Exception:                                    # noqa: BLE001
+        pass
+    return ("Subtitle OCR, reading with Tesseract. CPU-bound and "
+            "single-threaded per file, so this scales with cores, not the "
+            "GPU. The commit half is disk I/O and is separately capped by "
+            "disk_wait_pct.")
+
+
 HINTS = {
     "encode_workers": "",   # built live by _encode_hint() - see as_dict()
     "passthrough_workers": "Remux/copy only, no GPU. Limited by pool disk I/O.",
-    "subocr_workers": ("Subtitle OCR. CPU-bound and single-threaded per file, "
-                       "so this scales with cores, not the GPU. The commit "
-                       "half is disk I/O and is separately capped by "
-                       "disk_wait_pct."),
+    "subocr_workers": "",   # engine-dependent; see _subocr_hint()
     "probe_workers": "ffprobe scans. Cheap CPU, one pool read each.",
     "arr_concurrency": "Parallel Sonarr/Radarr API calls during scans.",
     "hold_minutes": "MINUTES a file must sit untouched before it can be "
@@ -302,6 +334,7 @@ class WorkerConfig:
                 "max": LIMITS[k][1],
                 "default": LIMITS[k][2],
                 "hint": (_encode_hint() if k == "encode_workers"
+                         else _subocr_hint() if k == "subocr_workers"
                          else HINTS[k]),
                 "timing": k in TIMING_KEYS,
             }

@@ -112,58 +112,84 @@ def main() -> None:
     ap.add_argument("--ass", action="store_true",
                     help="write positioned ASS instead of flat SRT")
     ap.add_argument("--progress", action="store_true")
+    ap.add_argument("--engine", default="paddle",
+                    choices=("paddle", "tesseract"))
+    ap.add_argument("--limit", type=int, default=0,
+                    help="stop after N cues - used by the settings-page test")
     a = ap.parse_args()
 
-    try:
-        from paddleocr import PaddleOCR
-    except Exception as e:                               # noqa: BLE001
-        _die(f"paddleocr is not installed: {e}")
+    import numpy as np
 
     cues = read_sup(a.sup)
     if not cues:
         _die("no cues decoded from the sup")
+    if a.limit:
+        cues = cues[:a.limit]
 
-    # enable_mkldnn=False: paddlepaddle 3.3.x raises
-    # "ConvertPirAttribute2RuntimeAttribute not support" from its oneDNN
-    # kernel on this class of model. Disabling it costs CPU speed and is the
-    # difference between working and not.
-    kw = dict(use_doc_orientation_classify=False, use_doc_unwarping=False,
-              use_textline_orientation=False, lang=a.lang, device=a.device)
-    try:
-        ocr = PaddleOCR(enable_mkldnn=False, **kw)
-    except TypeError:
-        ocr = PaddleOCR(**kw)
-
-    import numpy as np
-    rows = []
-    n = len(cues)
-    for i, (img, start, end, x, y, vw, vh) in enumerate(cues):
+    # ONE HARNESS, TWO ENGINES. Tesseract normally runs through pgsrip, which
+    # does its own decoding - but a comparison is only worth reading if both
+    # engines saw exactly the same pictures, so the test path drives both from
+    # the decode above. Each `read` takes an image and returns text lines.
+    if a.engine == "paddle":
         try:
+            from paddleocr import PaddleOCR
+        except Exception as e:                           # noqa: BLE001
+            _die(f"paddleocr is not installed: {e}")
+        # enable_mkldnn=False: paddlepaddle 3.3.x raises
+        # "ConvertPirAttribute2RuntimeAttribute not support" from its oneDNN
+        # kernel on this class of model. Disabling it costs CPU speed and is
+        # the difference between working and not working at all.
+        kw = dict(use_doc_orientation_classify=False, use_doc_unwarping=False,
+                  use_textline_orientation=False, lang=a.lang, device=a.device)
+        try:
+            ocr = PaddleOCR(enable_mkldnn=False, **kw)
+        except TypeError:
+            ocr = PaddleOCR(**kw)
+
+        def read(pic):
             # THREE CHANNELS, ALWAYS. The PGS decoder hands back a single
             # greyscale plane; Paddle's detector expects an H x W x 3 image
             # and quietly finds nothing at all in a 2-D array rather than
             # complaining about it.
-            # `pic`, not `a` - `a` is the argument namespace, and shadowing
-            # it here turned `a.progress` into an attribute lookup on a numpy
-            # array a few lines later.
-            pic = img
             if pic.ndim == 2:
                 pic = np.stack([pic] * 3, axis=-1)
-            res = ocr.predict(pic)
+            texts = []
+            for r in ocr.predict(pic):
+                texts += list(r.get("rec_texts") or [])
+            return texts
+    else:
+        try:
+            import pytesseract
+            from PIL import Image
+        except Exception as e:                           # noqa: BLE001
+            _die(f"pytesseract is not available: {e}")
+        tdir = os.environ.get("NUARR_TESSERACT_DIR", "")
+        if tdir and os.path.isdir(tdir):
+            os.environ["PATH"] = tdir + os.pathsep + os.environ.get("PATH", "")
+
+        def read(pic):
+            txt = pytesseract.image_to_string(
+                Image.fromarray(pic).convert("L"), lang="eng", config="--psm 6")
+            return [l for l in txt.splitlines() if l.strip()]
+
+    rows = []
+    n = len(cues)
+    for i, (img, start, end, x, y, vw, vh) in enumerate(cues):
+        try:
+            texts = read(img)
         except Exception:                                # noqa: BLE001
             continue
-        texts, boxes = [], []
-        for r in res:
-            texts += list(r.get("rec_texts") or [])
-            boxes += [list(b) for b in (r.get("rec_polys") or [])]
         txt = "\n".join(t.strip() for t in texts if t and t.strip())
         if not txt:
             continue
         rows.append({"start": start, "end": max(end, start + 500), "text": txt,
                      "x": x, "y": y, "vw": vw, "vh": vh,
                      "h": int(img.shape[0]), "w": int(img.shape[1])})
-        if a.progress and (i % 10 == 0):
-            print(f"PROGRESS {i}/{n}", flush=True)
+        # EVERY CUE, NOT EVERY TENTH: this is the only true progress signal
+        # either engine emits, and nuarr's bar reads it directly. The old
+        # size-based estimate existed purely because pgsrip says nothing.
+        if a.progress:
+            print(f"PROGRESS {i + 1}/{n}", flush=True)
 
     if not rows:
         _die("nothing was read from any cue")
