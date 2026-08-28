@@ -249,6 +249,43 @@ def decode_args(family: str, want_hw: bool) -> list[str]:
     return ["-hwaccel", hw] if hw else []
 
 
+_DEVICES: dict = {}
+
+
+def devices() -> dict:
+    """The actual hardware behind the family labels, asked once and kept.
+
+    "NVENC" answers which door the frames go through; the QUESTION people ask
+    at the concurrency page is what is behind the door - which card, or
+    failing that which CPU. Cached forever because GPUs do not hot-swap.
+    """
+    if _DEVICES:
+        return dict(_DEVICES)
+    import platform
+    import subprocess
+    from .config import NO_WINDOW
+    gpu = ""
+    try:
+        r = subprocess.run(["nvidia-smi", "--query-gpu=name",
+                            "--format=csv,noheader"], capture_output=True,
+                           text=True, timeout=10, creationflags=NO_WINDOW)
+        if r.returncode == 0:
+            gpu = (r.stdout or "").strip().splitlines()[0].strip()
+    except Exception:                                    # noqa: BLE001
+        pass
+    cpu = ""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                            r"HARDWARE\DESCRIPTION\System\CentralProcessor\0"
+                            ) as k:
+            cpu = str(winreg.QueryValueEx(k, "ProcessorNameString")[0]).strip()
+    except Exception:                                    # noqa: BLE001
+        cpu = platform.processor() or ""
+    _DEVICES.update(gpu_name=gpu, cpu_name=cpu)
+    return dict(_DEVICES)
+
+
 def info() -> dict:
     """For the settings page."""
     p = probe()
@@ -259,4 +296,5 @@ def info() -> dict:
         "auto": fam,
         "auto_why": why,
         "order": ORDER,
+        **devices(),
     }

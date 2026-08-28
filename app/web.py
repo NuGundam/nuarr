@@ -19262,6 +19262,7 @@ async function bkRestore(name){
   }catch(e){ if(m) m.textContent='failed: '+e.message; }
   loadBackup(false);
 }
+let _encLine='';   // "encoding on: ..." - fetched once, painted into the header
 function paintWorkers(){
   const w=_wdata;
   const rows=Object.entries(w).filter(([k,v])=> _wtab==='timing' ? v.timing : !v.timing);
@@ -19269,11 +19270,31 @@ function paintWorkers(){
     ? `How long files settle before processing, and how long jobs stay held
        while Plex is playing or another app is working the disks.`
     : `How much runs at once. Encode is NVENC-bound; passthrough is disk-bound.`;
+  const enc = (_wtab!=='timing' && _encLine)
+    ? `<div style="padding:0 14px 8px;font-size:11.5px">${_encLine}</div>` : '';
   document.getElementById('workers').innerHTML=
-    `<div class="dim" style="padding:9px 14px;font-size:11px">${blurb}</div>`
+    `<div class="dim" style="padding:9px 14px ${enc?'4px':'9px'};font-size:11px">${blurb}</div>`+enc
     +'<table>'+rows.map(([k,v])=>workerRow(k,v)).join('')+'</table>';
   const hint=document.getElementById('wtabhint');
   if(hint) hint.textContent = _wtab==='timing' ? '· holds & timing' : '· concurrency';
+  if(_wtab!=='timing' && !_encLine) encLineFetch();
+}
+async function encLineFetch(){
+  // WHICH HARDWARE, not just which door. "NVENC" tells you the API; the
+  // question on a concurrency page is what is actually doing the work.
+  try{
+    const d=await (await fetch('/api/encoders')).json();
+    const fam=(d.families||{})[d.auto]||{};
+    const dev = d.auto==='cpu' ? (d.cpu_name||'CPU')
+              : d.auto==='nvenc' ? (d.gpu_name||'NVIDIA GPU')
+              : (fam.label||d.auto);
+    const via = fam.label||d.auto||'?';
+    const col = d.auto==='cpu' ? '#e2b341' : '#7fd4a3';
+    _encLine=`Encoding on: <b style="color:${col}">${esc(dev)}</b>
+      <span class="dim">via ${esc(via)}</span>`
+      +(d.auto==='cpu' && d.gpu_name ? ` <span class="dim">· ${esc(d.gpu_name)} present but its encoder is unavailable</span>`:'');
+    paintWorkers();
+  }catch(e){}
 }
 async function loadWorkers(){
   _wdata=await (await fetch('/api/workers')).json();
