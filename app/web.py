@@ -519,6 +519,8 @@ async def _startup() -> None:
     # Queues OCR conversions a batch at a time - see subocr.watch().
     from . import subocr as _subocr
     asyncio.create_task(_subocr.watch())
+    # Once a day: are there newer OCR engine builds - see updates_watch().
+    asyncio.create_task(_subocr.updates_watch())
     asyncio.create_task(arrhealth.watch())
     asyncio.create_task(ffmpeg_update.watch())
     # Silent and request-free until a repo is configured - see updates.watch.
@@ -4250,6 +4252,30 @@ def api_paddle_install(mode: str = Query("gpu")):
     """Install or update PaddleOCR - gpu, cpu, or update."""
     from . import subocr as _so
     return _so.paddle_install_start(mode)
+
+
+@app.get("/api/ocr/updates")
+def api_ocr_updates():
+    """The stored daily answer, plus live install states."""
+    from . import subocr as _so
+    return {"updates": _so.updates_state(),
+            "tess_install": dict(_so.TESS_INSTALL),
+            "pgsrip_install": dict(_so._INSTALL),
+            "paddle_install": dict(_so.PADDLE_INSTALL)}
+
+
+@app.post("/api/ocr/updates/check")
+async def api_ocr_updates_check():
+    """Ask upstream about all three pieces right now."""
+    from . import subocr as _so
+    return {"updates": await asyncio.to_thread(_so.updates_check)}
+
+
+@app.post("/api/tesseract/update")
+def api_tesseract_update():
+    """Silent install of the newest build into nuarr's own folder."""
+    from . import subocr as _so
+    return _so.tesseract_update_start()
 
 
 @app.post("/api/tesseract/check")
@@ -17881,19 +17907,18 @@ async function loadOcr(){
                 :(p.gpu_name?`CPU build — a GPU is present (${esc(p.gpu_name)}) but unused`
                             :'CPU build'))}
       </table>
-      <div style="padding:0 12px 11px">${padStrip}
-        <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-          ${(s.install||{}).state==='installing'
-            ? `<span class="dim" style="font-size:11.5px">updating pgsrip…</span>`
-            : `<button onclick="socUpdate(this)">Update pgsrip</button>`}
-          <button onclick="tessCheck(this)">Check Tesseract for updates</button>
-          <span id="tessChkMsg" class="dim" style="font-size:11.5px">${
-            s.tesseract_managed
-              ? 'nuarr&rsquo;s own Tesseract is refreshed by nuarr updates'
-              : ''}</span>
-        </div>
-        ${(s.install||{}).state==='error'?`<div style="color:#e0575b;font-size:11px;margin-top:4px">${esc((s.install||{}).error||'')}</div>`:''}
-        ${(s.install||{}).state==='done'?`<div style="color:#7fd4a3;font-size:11px;margin-top:4px">pgsrip updated</div>`:''}
+      <div style="padding:0 12px 11px">${padStrip}</div>
+    </div>
+
+    <div class="lkind" style="padding:11px 12px;margin-top:10px">
+      <div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap">
+        <b style="color:#6fb0ff">Updates</b>
+        <span class="dim" style="font-size:11px">checked automatically once a
+          day — the Jobs page carries the schedule</span>
+        <button style="margin-left:auto" onclick="ocrUpdCheck(this)">Check now</button>
+      </div>
+      <div id="ocrUpdBody" style="margin-top:6px">
+        <div class="dim" style="font-size:11.5px">loading…</div>
       </div>
     </div>
 
@@ -17920,6 +17945,7 @@ async function loadOcr(){
         <div style="margin-top:7px"><button onclick="wtab('lang')">Open Subtitles settings</button></div>
       </div>
     </div>`;
+  ocrUpdLoad();
 }
 
 // THE TABLE IS WHATEVER WAS LAST MEASURED HERE, not a constant. It shipped
@@ -17988,32 +18014,69 @@ async function padInstall(mode){
   try{ await fetch('/api/paddle/install?mode='+mode,{method:'POST'}); }catch(e){}
   loadOcr();
 }
-async function socUpdate(btn){
-  btn.disabled=true;
-  try{ await fetch('/api/subocr/update',{method:'POST'}); }catch(e){}
-  loadOcr();   // repaints as "updating pgsrip…" from install state
-  setTimeout(loadOcr, 4000);
+// ---- the Updates card: one row per piece, one uniform Update button ------
+// Every one of the three is installed BY NUARR when its button is pressed:
+// pgsrip and paddleocr through pip in place, Tesseract by downloading the
+// UB Mannheim build and running it silently into nuarr's own folder - which
+// the resolver already prefers, so a hand-installed system copy is never
+// touched.
+async function ocrUpdLoad(){
+  const el=document.getElementById('ocrUpdBody');
+  if(!el) return;
+  let d=null;
+  try{ d=await (await fetch('/api/ocr/updates')).json(); }catch(e){ return; }
+  const u=d.updates||{};
+  const busyOf={tesseract:d.tess_install||{}, pgsrip:d.pgsrip_install||{},
+                paddleocr:d.paddle_install||{}};
+  const row=(key,label,updater)=>{
+    const x=u[key]||{}; const busy=busyOf[key]||{};
+    let right='';
+    if(busy.state==='installing') right=`<span class="dim">installing…</span>`;
+    else if(busy.state==='error') right=`<span style="color:#e0575b;font-size:11px">${esc(busy.error||'failed')}</span>`;
+    else if(!x.installed) right=`<span class="dim">not installed</span>`;
+    else if(x.newer) right=`<b style="color:#e2b341">${esc(x.latest)}</b>
+      <button onclick="${updater}" style="margin-left:8px">Update</button>`;
+    else if(x.latest) right=`<span style="color:#7fd4a3">up to date</span>`;
+    else right=`<span class="dim">not checked yet</span>`;
+    return `<div style="display:flex;gap:10px;align-items:center;padding:6px 0;
+                 border-top:1px solid var(--line);font-size:12px">
+      <b style="width:110px">${label}</b>
+      <span class="mono dim" style="width:130px">${esc(x.installed||'—')}</span>
+      <span style="margin-left:auto;display:flex;align-items:center;gap:4px">${right}</span>
+    </div>`;
+  };
+  const when=u.at?new Date(u.at*1000).toLocaleString():'';
+  el.innerHTML=
+      row('tesseract','Tesseract',"ocrUpdRun('tesseract')")
+    + row('pgsrip','pgsrip',"ocrUpdRun('pgsrip')")
+    + row('paddleocr','PaddleOCR',"ocrUpdRun('paddleocr')")
+    + (when?`<div class="dim" style="font-size:10.5px;margin-top:5px">last checked ${esc(when)}</div>`:'');
+  if(Object.values(busyOf).some(b=>b.state==='installing'))
+    setTimeout(ocrUpdLoad, 4000);
 }
-async function tessCheck(btn){
-  const m=document.getElementById('tessChkMsg');
+async function ocrUpdCheck(btn){
   btn.disabled=true; const old=btn.textContent; btn.textContent='checking…';
-  try{
-    const r=await (await fetch('/api/tesseract/check',{method:'POST'})).json();
-    if(m){
-      if(!r.ok){ m.style.color='#e2b341'; m.textContent=r.detail||'could not check'; }
-      else if(r.newer){
-        m.style.color='#e2b341';
-        // The Windows build is an interactive installer, so this reports and
-        // links rather than pretending a service can run it.
-        m.innerHTML=`<b>${esc(r.latest)}</b> is available — you have ${esc(r.installed)}.
-          <a href="${esc(r.url)}" target="_blank" rel="noopener">Get it from UB Mannheim</a>`;
-      }else{
-        m.style.color='#7fd4a3';
-        m.textContent=`up to date — ${r.installed||'?'} is current`;
-      }
-    }
-  }catch(e){ if(m){ m.style.color='#e2b341'; m.textContent='check failed'; } }
+  try{ await fetch('/api/ocr/updates/check',{method:'POST'}); }catch(e){}
   btn.disabled=false; btn.textContent=old;
+  ocrUpdLoad();
+}
+async function ocrUpdRun(which){
+  const ep = which==='tesseract' ? '/api/tesseract/update'
+           : which==='pgsrip'    ? '/api/subocr/update'
+           : '/api/paddle/install?mode=update';
+  let r=null;
+  try{ r=await (await fetch(ep,{method:'POST'})).json(); }catch(e){}
+  // A REFUSAL IS AN ANSWER, not a silent nothing: the Tesseract path
+  // declines outright when a system install exists, and that sentence is
+  // the whole point of the refusal.
+  if(r && r.ok===false && r.error){
+    const el=document.getElementById('ocrUpdBody');
+    if(el) el.insertAdjacentHTML('afterbegin',
+      `<div style="color:#e2b341;font-size:11.5px;padding:4px 0">${esc(r.error)}
+       ${which==='tesseract'?' <a href="https://github.com/UB-Mannheim/tesseract/releases" target="_blank" rel="noopener">newest build</a>':''}</div>`);
+    return;
+  }
+  ocrUpdLoad();
 }
 
 function socRow(k,v,why){

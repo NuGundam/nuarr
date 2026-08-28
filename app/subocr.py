@@ -1609,6 +1609,201 @@ def engine_test(which: str = "tesseract", device: str = "cpu",
     return row
 
 
+# --------------------------------------------------------- engine updates --
+# ONE CHECKER FOR ALL THREE PIECES, one daily job row, and every one of them
+# installable by nuarr itself:
+#   pgsrip, paddleocr - pip packages, updated in place.
+#   Tesseract         - UB Mannheim's Windows build is an NSIS installer,
+#                       which takes /S (silent) and /D= (target dir). Run
+#                       into DataDir\tesseract - nuarr's managed location,
+#                       which tesseract_dir() already prefers - it needs no
+#                       interaction and touches no system install.
+
+TESS_INSTALL = {"state": "idle", "error": "", "version": ""}
+
+
+def _pip_latest(pkg: str) -> str:
+    import sys as _sys
+    try:
+        r = subprocess.run([_sys.executable, "-m", "pip", "index", "versions",
+                            pkg], capture_output=True, text=True, timeout=90,
+                           creationflags=NO_WINDOW)
+        m = re.search(r"LATEST:\s*([0-9][\w.\-]*)",
+                      (r.stdout or "") + (r.stderr or ""))
+        return m.group(1) if m else ""
+    except Exception:                                    # noqa: BLE001
+        return ""
+
+
+def _tess_latest() -> tuple[str, str]:
+    """Newest UB Mannheim build THAT HAS AN INSTALLER: (version, url).
+
+    Releases, not tags. The first version of this read the tag list, which
+    named 5.5.3 - and the download 404'd, because the Mannheim mirror the
+    URL pointed at stops in 2024 and newer builds ship as GitHub release
+    assets instead. A version nothing can install is not an update, so only
+    releases carrying a w64 setup exe count, and the exe's own URL is what
+    gets used - never a guessed one.
+    """
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            "https://api.github.com/repos/UB-Mannheim/tesseract/releases"
+            "?per_page=15",
+            headers={"User-Agent": "nuarr",
+                     "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            rels = json.loads(r.read().decode("utf-8"))
+        best_v, best_url = "", ""
+        for rel in rels or []:
+            if rel.get("draft") or rel.get("prerelease"):
+                continue
+            for a in rel.get("assets") or []:
+                name = str(a.get("name") or "")
+                m = re.match(r"tesseract-ocr-w64-setup-v?"
+                             r"(\d+\.\d+\.\d+(?:\.\d+)?)\.exe$", name)
+                if m and (not best_v
+                          or m.group(1).split(".") > best_v.split(".")):
+                    best_v = m.group(1)
+                    best_url = a.get("browser_download_url") or ""
+        return best_v, best_url
+    except Exception:                                    # noqa: BLE001
+        return "", ""
+
+
+def updates_check() -> dict:
+    """Ask upstream about all three pieces, remember the answer."""
+    st = status()
+    pi = paddle_info()
+    out = {"at": time.time()}
+    cur_t = st.get("tesseract_version") or ""
+    lat_t, url_t = _tess_latest()
+    out["tesseract"] = {"installed": cur_t, "latest": lat_t, "url": url_t,
+                        "newer": bool(cur_t and lat_t
+                                      and lat_t.split(".") > cur_t.split("."))}
+    for pkg, cur in (("pgsrip", st.get("pgsrip_version") or ""),
+                     ("paddleocr", pi.get("paddleocr") or "")):
+        lat = _pip_latest(pkg) if cur else ""
+        out[pkg] = {"installed": cur, "latest": lat,
+                    "newer": bool(cur and lat and lat != cur)}
+    try:
+        from .db import kv_set
+        kv_set("subocr.updates", json.dumps(out))
+    except Exception:                                    # noqa: BLE001
+        pass
+    return out
+
+
+def updates_state() -> dict:
+    try:
+        from .db import kv_get
+        return json.loads(kv_get("subocr.updates") or "{}")
+    except Exception:                                    # noqa: BLE001
+        return {}
+
+
+def tesseract_update_start(target_version: str = "") -> dict:
+    """Download the newest UB Mannheim build and install it silently.
+
+    Into nuarr's OWN folder, never over a system install: /D lands it in
+    DataDir\\tesseract, which the resolver already prefers - so a hand-
+    installed copy in Program Files is left exactly as its owner left it.
+    """
+    import threading as _t
+    if TESS_INSTALL["state"] == "installing":
+        return {"ok": False, "error": "already installing"}
+    # REFUSED WHEN A SYSTEM INSTALL EXISTS, and this is a measurement, not
+    # caution: the NSIS installer, on finding a registered copy, runs that
+    # copy's UNINSTALLER first - and under /S it sat on an invisible prompt
+    # for ten minutes on the very first test, one keypress away from removing
+    # a Tesseract nuarr does not own. So the silent path is only taken when
+    # the machine has no registered install to trip over; otherwise the
+    # answer is a link and an explanation, which is at least always true.
+    if os.path.exists(os.path.join(TESSERACT_DIR, "tesseract.exe")):
+        return {"ok": False,
+                "error": "a system Tesseract is installed at "
+                         f"{TESSERACT_DIR} - its installer would try to "
+                         "remove that copy first, which nuarr will not do. "
+                         "Update it yourself from the link, or uninstall it "
+                         "and press Update again for a nuarr-managed copy."}
+    v, url = _tess_latest()
+    if not v or not url:
+        return {"ok": False, "error": "no installable build found upstream"}
+    TESS_INSTALL.update(state="installing", error="", version=v)
+
+    def _work():
+        import urllib.request
+        from .config import DATA_DIR
+        exe = os.path.join(tempfile.gettempdir(), f"tess-{v}.exe")
+        p = None
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "nuarr"})
+            with urllib.request.urlopen(req, timeout=120) as r, \
+                    open(exe, "wb") as f:
+                shutil.copyfileobj(r, f)
+            dst = os.path.join(str(DATA_DIR), "tesseract")
+            # NSIS: /S silent, /D last and UNQUOTED (its own rule; the path
+            # has no spaces because DATA_DIR does not). Popen rather than
+            # run, so a hang can be killed with its whole tree.
+            p = subprocess.Popen([exe, "/S", f"/D={dst}"],
+                                 creationflags=NO_WINDOW)
+            try:
+                rc = p.wait(timeout=600)
+            except subprocess.TimeoutExpired:
+                subprocess.run(["taskkill", "/T", "/F", "/PID", str(p.pid)],
+                               capture_output=True, creationflags=NO_WINDOW)
+                raise RuntimeError("the installer hung and was stopped - "
+                                   "nothing was changed")
+            if rc != 0:
+                raise RuntimeError(f"installer exited {rc}")
+            got = os.path.join(dst, "tesseract.exe")
+            if not os.path.exists(got):
+                raise RuntimeError("installer finished but tesseract.exe "
+                                   "is not there")
+            TESS_INSTALL.update(state="done")
+            from . import joblog as _jl
+            _jl.log(f"Tesseract {v} installed to nuarr's folder", "ok")
+            updates_check()          # the stored answer just changed
+        except Exception as e:                           # noqa: BLE001
+            TESS_INSTALL.update(state="error",
+                                error=f"{type(e).__name__}: {str(e)[:200]}")
+        finally:
+            try:
+                os.remove(exe)
+            except OSError:
+                pass
+    _t.Thread(target=_work, name="tess-update", daemon=True).start()
+    return {"ok": True, "version": v}
+
+
+async def updates_watch() -> None:
+    """Once a day, ask upstream about all three - the Jobs page row."""
+    import asyncio
+
+    from . import schedules
+    schedules.register(
+        "ocrupd", "OCR engine updates", "System", 86400,
+        what="Asks once a day whether newer Tesseract, pgsrip or PaddleOCR "
+             "builds exist. Reports on the OCR engines page; installing is "
+             "always your click there.")
+    await asyncio.sleep(420)
+    while True:
+        try:
+            st = updates_state()
+            if time.time() - float(st.get("at") or 0) >= 86400:
+                r = await asyncio.to_thread(updates_check)
+                avail = [k for k in ("tesseract", "pgsrip", "paddleocr")
+                         if (r.get(k) or {}).get("newer")]
+                schedules.beat("ocrupd",
+                               ("updates: " + ", ".join(avail)) if avail
+                               else "everything current")
+            else:
+                schedules.beat("ocrupd", "checked recently")
+        except Exception:                                # noqa: BLE001
+            pass
+        await asyncio.sleep(3600)
+
+
 def pip_update_start() -> dict:
     """Update pgsrip from the page - the Whisper pattern, for the OCR rip."""
     import threading as _t
