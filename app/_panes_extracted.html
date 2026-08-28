@@ -234,29 +234,18 @@
           <div class="dim" style="padding:14px">loading&hellip;</div>
         </div>
       </div>
-      <div id="subocrPane" style="display:none">
+      <div id="ocrPane" style="display:none">
         <div class="dim" style="padding:9px 14px;font-size:11px">
-          <b>Tesseract</b> &mdash; the OCR engine nuarr bundles, driven by
-          pgsrip, which is what turns a PGS picture track into real text. It
-          runs on any machine with no GPU and no extra install. This page is
-          about the tool: what is installed, where it lives, and whether it
-          works. <b>What</b> gets converted, for which libraries, is a
+          Turning picture subtitles (PGS) into real text, so Plex hands
+          clients text instead of painting pictures into the video. Two
+          engines do that job here: <b>Tesseract</b>, bundled, running on any
+          machine with no GPU and nothing to install, and <b>PaddleOCR</b>, a
+          modern neural reader that gets italics right &mdash; the case
+          Tesseract reliably mangles &mdash; and that wants a GPU. Pick one
+          for the whole install below; <b>what</b> gets converted is a
           subtitle policy and lives on the Subtitles page.
         </div>
-        <div id="subocrBody" style="padding:0 14px 14px">
-          <div class="dim" style="padding:14px">loading&hellip;</div>
-        </div>
-      </div>
-      <div id="paddlePane" style="display:none">
-        <div class="dim" style="padding:9px 14px;font-size:11px">
-          A second OCR engine, and the more accurate one. Tesseract is bundled
-          and works on any machine; PaddleOCR is a modern neural reader that
-          gets italics right &mdash; the case Tesseract reliably mangles &mdash;
-          and, because it decodes each subtitle image itself, it can keep
-          <b>where on screen</b> that subtitle belonged. It wants a GPU: on
-          CPU it is roughly fifteen times slower than Tesseract.
-        </div>
-        <div id="paddleBody" style="padding:0 14px 14px">
+        <div id="ocrBody" style="padding:0 14px 14px">
           <div class="dim" style="padding:14px">loading&hellip;</div>
         </div>
       </div>

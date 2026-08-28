@@ -1117,6 +1117,8 @@ def status() -> dict:
         "pgsrip_version": pg,
         "ready": bool(tver and pg),
         "install": dict(_INSTALL),
+        # The install-wide engine, for the OCR engines page.
+        "engine": engine(),
         "every_h": int(_s("subocr_every_h", 6)),
         "batch": int(_s("subocr_batch", 20)),
         # Per library: the effective settings, plus what that library
@@ -1498,6 +1500,37 @@ def _test_sample() -> dict:
     return {"path": "", "cues": 0, "title": ""}
 
 
+def measurements() -> dict:
+    """Every engine test that has been run here, newest per engine+device.
+
+    THE TABLE ON THE PAGE IS THIS, not a constant. It shipped as a set of
+    numbers measured on the machine nuarr was written on, which is exactly
+    the kind of claim that goes stale and cannot be checked - a different
+    card, a different library, a newer wheel and it is quietly a lie. Running
+    a test overwrites its row, so the page reports what THIS machine did.
+    """
+    try:
+        from .db import kv_get
+        return json.loads(kv_get("subocr.measurements") or "{}")
+    except Exception:                                    # noqa: BLE001
+        return {}
+
+
+def _record_measurement(row: dict) -> None:
+    try:
+        from .db import kv_get, kv_set
+        cur = json.loads(kv_get("subocr.measurements") or "{}")
+        key = (f"{row['engine']}:{row['device']}" if row["engine"] == "paddle"
+               else row["engine"])
+        cur[key] = {"per_cue_ms": row.get("per_cue_ms"),
+                    "cues": row.get("cues"), "elapsed": row.get("elapsed"),
+                    "title": row.get("title", ""), "at": time.time(),
+                    "lines": (row.get("lines") or [])[:6]}
+        kv_set("subocr.measurements", json.dumps(cur))
+    except Exception:                                    # noqa: BLE001
+        pass
+
+
 def engine_test(which: str = "tesseract", device: str = "cpu",
                 limit: int = 12) -> dict:
     """Read a few real cues with one engine and report what came back.
@@ -1542,11 +1575,13 @@ def engine_test(which: str = "tesseract", device: str = "cpu",
         os.remove(out)
     except OSError:
         pass
-    return {"ok": True, "engine": which, "device": device,
-            "title": samp["title"], "cues": len(lines),
-            "elapsed": round(el, 1),
-            "per_cue_ms": int(el * 1000 / max(1, len(lines))),
-            "lines": lines[:8]}
+    row = {"ok": True, "engine": which, "device": device,
+           "title": samp["title"], "cues": len(lines),
+           "elapsed": round(el, 1),
+           "per_cue_ms": int(el * 1000 / max(1, len(lines))),
+           "lines": lines[:8]}
+    _record_measurement(row)
+    return row
 
 
 def pip_update_start() -> dict:

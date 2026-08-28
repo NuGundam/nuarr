@@ -4157,6 +4157,84 @@ async def api_paddle():
     return await asyncio.to_thread(_so.paddle_info)
 
 
+@app.get("/api/ocr/measurements")
+def api_ocr_measurements():
+    """Whatever the engine tests last recorded ON THIS MACHINE."""
+    from . import subocr as _so
+    return {"measurements": _so.measurements()}
+
+
+@app.post("/api/ocr/engine")
+async def api_ocr_engine(engine: str = Query(...)):
+    r"""Set the OCR engine for the whole install, and re-aim work in flight.
+
+    ONE SETTING, NOT SIX. Which engine reads the pictures is a property of
+    this machine - what it has installed, whether it has a card - not of a
+    library, so it lives here as a single switch. Anything already queued or
+    running was planned against the OLD engine; leaving those alone would
+    quietly finish the backlog with the thing you just switched away from, so
+    they are cancelled and put straight back on the queue.
+    """
+    import yaml
+    if engine not in ("tesseract", "paddle"):
+        return {"ok": False, "error": "unknown engine"}
+    from . import subocr as _so
+    if engine == "paddle":
+        info = await asyncio.to_thread(_so.paddle_info)
+        if not info.get("installed"):
+            return {"ok": False,
+                    "error": "PaddleOCR is not installed yet - install it "
+                             "above first"}
+
+    p = _config_path()
+    raw = {}
+    if p.exists():
+        try:
+            raw = yaml.safe_load(p.read_text(encoding="utf-8-sig")) or {}
+        except Exception:                                # noqa: BLE001
+            raw = {}
+    raw["subocr_engine"] = engine
+    # A per-library override would win over the global switch and make this
+    # button look broken, so setting the engine here clears them.
+    per = dict(raw.get("subocr_libs") or {})
+    for lib, vals in per.items():
+        if isinstance(vals, dict):
+            vals.pop("subocr_engine", None)
+    raw["subocr_libs"] = per
+    p.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True),
+                 encoding="utf-8")
+    SETTINGS.subocr_engine = engine
+    SETTINGS.subocr_libs = per
+
+    # Re-aim what is already in flight.
+    rows = _rows("SELECT j.job_id, j.file_id, j.path, j.state, "
+                 "       f.title, f.season, f.episode "
+                 "  FROM jobs j LEFT JOIN files f ON f.id = j.file_id "
+                 " WHERE j.kind='sub_ocr' AND j.state IN ('queued','running')")
+    cancelled = requeued = 0
+    for r in rows:
+        try:
+            if await jobs.cancel(r["job_id"]):
+                cancelled += 1
+        except Exception:                                # noqa: BLE001
+            continue
+    for r in rows:
+        label = display_label(r["title"], r["season"], r["episode"])
+        try:
+            if await jobs.enqueue(r["file_id"], r["path"], label,
+                                  kind="sub_ocr", priority=90):
+                requeued += 1
+        except Exception:                                # noqa: BLE001
+            continue
+    if cancelled or requeued:
+        await jobs.start()
+    joblog.log(f"OCR engine set to {engine}"
+               + (f" - {cancelled} job(s) stopped and {requeued} requeued"
+                  if cancelled else ""), "ok")
+    return {"ok": True, "engine": engine, "cancelled": cancelled,
+            "requeued": requeued}
+
+
 @app.post("/api/ocr/test")
 async def api_ocr_test(engine: str = Query("tesseract"),
                        device: str = Query("cpu")):
@@ -10218,7 +10296,7 @@ async function loadLibs(){
     const t = (p.timings||{})[f.key];
     return `<span class="scanstep" style="color:${col}"
              title="${esc(f.label)}${t?` — took ${t}s`:''}">${
-             state==='done'?'●':(state==='now'?'◉':'○')}</span>`;
+             state==='done'?'â—':(state==='now'?'â—‰':'â—‹')}</span>`;
   }).join('');
 
   const pct = Math.max(0, Math.min(100, p.pct||0));
@@ -10243,7 +10321,7 @@ async function loadLibs(){
         const st = ci<0 ? 'todo' : (i<ci?'done':(i===ci?'now':'todo'));
         const t=(p.timings||{})[f.key];
         const col = st==='done'?'var(--ok)':(st==='now'?'var(--acc)':'var(--dim)');
-        const mark = st==='done'?'●':(st==='now'?'◉':'○');
+        const mark = st==='done'?'â—':(st==='now'?'â—‰':'â—‹');
         return `<span class="scanrow" style="color:${col}">`
               +`<span class="scanmark">${mark}</span>${esc(f.label)}`
               +(t?`<span class="dim scant">${t}s</span>`
@@ -10530,7 +10608,7 @@ function renderBrowse(d){
            f.pct>=100?'var(--ok)':'var(--acc)'}"></i></span>
          <span class="${f.pct>=100?'ok':'dim'}">${f.done}/${f.files}</span>`;
     return `<div class="brow bdir" onclick="bgo('${L}','${b64e(f.path)}')">
-        <span class="bname">📁 ${esc(f.name)}</span>
+        <span class="bname">ðŸ“ ${esc(f.name)}</span>
         <span class="bmeta">${bar}</span>
         <span class="bsize dim">${f.bytes?gb(f.bytes):''}</span></div>`;
   }).join('');
@@ -15989,7 +16067,7 @@ function wtab(which){
                    vcodec:'vcodecPane', acodec:'acodecPane',
                    alang:'alangPane', cache:'cachePane',
                    whisper:'whisperPane', plex:'plexPane',
-                   subocr:'subocrPane', paddle:'paddlePane',
+                   ocr:'ocrPane',
                    updates:'updPane'};
   const isPane = Object.prototype.hasOwnProperty.call(PANE_OF, which);
   const set = document.getElementById('wSettings');
@@ -16036,14 +16114,9 @@ function wtab(which){
     loadUpdates(0);      // 0: use the cache. The Check now button forces it.
     return;
   }
-  if(which==='paddle'){
-    if(hint) hint.textContent='· paddleocr';
-    loadPaddle();
-    return;
-  }
-  if(which==='subocr'){
-    if(hint) hint.textContent='· subtitle OCR';
-    loadSubocr();
+  if(which==='ocr'){
+    if(hint) hint.textContent='· ocr engines';
+    loadOcr();
     return;
   }
   if(which==='whisper'){
@@ -17645,227 +17718,190 @@ async function savePlexCfg(btn){
   btn.disabled=false;
 }
 
-// ---- Subtitle OCR ----------------------------------------------------
-let _soc=null;
+// ---- OCR engines -----------------------------------------------------
+// ONE PAGE, TWO ENGINES. They were separate pages, which made the thing you
+// actually want to do - compare them and pick one - a matter of holding two
+// screens in your head. Engine choice is a property of this machine (what is
+// installed, whether there is a card), so it is one switch for the whole
+// install rather than six library-sized copies of the same decision.
+let _soc=null, _pad=null, _ocrEng='tesseract';
 
-async function loadSubocr(){
-  const el=document.getElementById('subocrBody');
+async function loadOcr(){
+  const el=document.getElementById('ocrBody');
   if(!el) return;
-  try{ _soc=await (await fetch('/api/subocr/status')).json(); }
-  catch(e){ el.innerHTML='<div class="dim" style="padding:14px">could not load</div>'; return; }
-  const s=_soc;
-  const inst=s.install||{};
-  const engineLine = s.ready
-    ? `<span style="color:#7fd4a3">ready — Tesseract ${esc(s.tesseract_version)} · pgsrip ${esc(s.pgsrip_version)}</span>`
-    : `<span style="color:#e2b341">${!s.tesseract_version?'Tesseract not found':'pgsrip not installed'} — conversion cannot run</span>`;
-  el.innerHTML=`
+  try{
+    const [a,b,c]=await Promise.all([
+      fetch('/api/subocr/status').then(r=>r.json()),
+      fetch('/api/paddle').then(r=>r.json()),
+      fetch('/api/ocr/measurements').then(r=>r.json())]);
+    _soc=a; _pad=b; _ocrEng=(a.engine||'tesseract');
+    _ocrMeas=c.measurements||{};
+  }catch(e){ el.innerHTML='<div class="dim" style="padding:14px">could not load</div>'; return; }
+  const s=_soc, p=_pad, inst=p.install||{};
+  const padReady=!!p.installed;
+  const eng=_ocrEng;
+
+  // ---- which engine, for everything -----------------------------------
+  const pick=(key,title,note,ok)=>`
+    <label style="display:flex;gap:9px;align-items:flex-start;padding:7px 0;
+                  cursor:${ok?'pointer':'default'};opacity:${ok?1:0.5}">
+      <input type="radio" name="ocrEng" value="${key}" ${eng===key?'checked':''}
+             ${ok?'':'disabled'} onchange="ocrSetEngine('${key}')" style="margin-top:2px">
+      <span><b>${title}</b><div class="dim" style="font-size:11px">${note}</div></span>
+    </label>`;
+  const head=`
     <div class="lkind" style="padding:11px 12px">
-      <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:baseline">
-        <b style="color:#6fb0ff">Engine</b>${engineLine}
-      </div>
-      <div class="dim" style="font-size:11px;margin-top:5px">
-        Tesseract at <span class="mono">${esc(s.tesseract_dir||'(not installed)')}</span>
-        ${s.tesseract_managed?'· nuarr&rsquo;s own copy, refreshed by updates':s.tesseract_dir?'· system install':''}
-      </div>
-      <div style="margin-top:7px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-        ${inst.state==='installing'
-          ? `<span class="dim" style="font-size:11.5px">updating pgsrip…</span>`
-          : `<button onclick="socUpdate(this)">Update pgsrip</button>`}
-        ${inst.state==='error'?`<span style="color:#e0575b;font-size:11px">${esc(inst.error||'')}</span>`:''}
-        ${inst.state==='done'?`<span style="color:#7fd4a3;font-size:11px">updated</span>`:''}
-      </div>
-    </div>
-
-    <div class="lkind"><div class="lkindhead"><b style="color:#6fb0ff">What is installed</b></div>
-      <table style="width:100%;font-size:12px;border-collapse:collapse">
-        ${socRow('Tesseract', s.tesseract_version||'—', 'the OCR engine that reads the pictures')}
-        ${socRow('pgsrip', s.pgsrip_version||'—', 'drives Tesseract over a PGS stream and writes SRT')}
-      </table>
-    </div>
-
-    <div class="lkind" style="margin-top:10px">
-      <div class="lkindhead"><b style="color:#6fb0ff">Where everything is</b>
-        <span class="dim">resolved live — for when OCR stops working and the log does not say why</span></div>
-      <table style="width:100%;font-size:12px;border-collapse:collapse">
-        ${socPath('Tesseract', s.tesseract_dir,
-          s.tesseract_managed?'nuarr&rsquo;s own copy, replaced on every install'
-                              :'a system install of Tesseract')}
-        ${socPath('tessdata', s.tesseract_dir?(s.tesseract_dir+'\\\\tessdata'):'',
-          'the language models Tesseract reads')}
-      </table>
-    </div>
-
-    <div class="lkind" style="padding:11px 12px;margin-top:10px">
-      <b style="color:#6fb0ff">Test it</b>
-      <div class="dim" style="font-size:11px;margin-top:3px">
-        Reads a dozen cues from a real picture-subtitle track in your library
-        and shows what came back. Nothing is written and no file is touched.</div>
-      <div style="margin-top:7px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-        <button onclick="ocrTest('tesseract','cpu','tessTest')">Test Tesseract</button>
-        <span id="tessTestMsg" class="dim" style="font-size:11.5px"></span>
-      </div>
-      <div id="tessTest" style="margin-top:6px"></div>
-    </div>
-
-    <div class="lkind" style="padding:11px 12px;margin-top:10px">
-      <b style="color:#6fb0ff">What uses this</b>
-      <div class="dim" style="font-size:11px;margin-top:4px">
-        Reading image subtitles back as text is a <b>subtitle policy</b>, not a
-        property of the engine — which tracks qualify, and per library which
-        engine reads them, live with the languages and the burn-in rule.
-        <div style="margin-top:7px"><button onclick="wtab('lang')">Open Subtitles settings</button></div>
-      </div>
+      <b style="color:#6fb0ff">Which engine reads the pictures</b>
+      <div class="dim" style="font-size:11px;margin-top:2px">
+        One choice for the whole install. Changing it stops any OCR already
+        running and puts those files straight back on the queue, so the
+        backlog is not finished by the engine you just moved away from.</div>
+      ${pick('tesseract','Tesseract',
+        `Bundled — nothing to install, no GPU needed. ${s.tesseract_version
+          ? 'Installed: '+esc(s.tesseract_version) : '<span style="color:#e0575b">not found</span>'}`,
+        !!s.tesseract_version)}
+      ${pick('paddle','PaddleOCR',
+        padReady
+          ? `Reads italics correctly and keeps each subtitle's position on screen.
+             ${p.cuda?'Using the GPU.':'<span style="color:#e2b341">CPU build — much slower than Tesseract.</span>'}`
+          : 'Not installed yet — install it below to choose it.',
+        padReady)}
+      <div id="ocrEngMsg" class="dim" style="font-size:11.5px;margin-top:4px"></div>
     </div>`;
-  if(inst.state==='installing') setTimeout(loadSubocr, 3000);
-}
-function socRow(k,v,why){
-  return `<tr style="border-top:1px solid var(--line)">
-    <td style="padding:5px 12px;white-space:nowrap">${esc(k)}</td>
-    <td class="mono" style="white-space:nowrap">${esc(String(v))}</td>
-    <td class="dim" style="font-size:11px;padding-right:12px">${why}</td></tr>`;
-}
-function socPath(what,path,note){
-  const ok=!!path;
-  return `<tr style="border-top:1px solid var(--line)">
-    <td style="padding:5px 12px;white-space:nowrap">
-      <span style="color:${ok?'#7fd4a3':'#e0575b'}">${ok?'✓':'✗'}</span> ${esc(what)}</td>
-    <td class="mono" style="font-size:11px;word-break:break-all">${esc(path||'(not installed)')}</td>
-    <td class="dim" style="font-size:11px;padding-right:12px;white-space:nowrap">${note}</td></tr>`;
-}
 
-// (the run-now / count buttons went with the pace box - the requeue system
-//  finds this work on its own, and the Jobs page is where its schedule lives)
-async function socUpdate(btn){
-  btn.disabled=true;
-  try{ await fetch('/api/subocr/update',{method:'POST'}); }catch(e){}
-  loadSubocr();
-}
-
-// ---- PaddleOCR -------------------------------------------------------
-let _pad=null;
-async function loadPaddle(){
-  const el=document.getElementById('paddleBody');
-  if(!el) return;
-  try{ _pad=await (await fetch('/api/paddle')).json(); }
-  catch(e){ el.innerHTML='<div class="dim" style="padding:14px">could not load</div>'; return; }
-  const p=_pad, inst=p.install||{};
-  const head = !p.installed
-    ? `<span style="color:#e2b341">not installed — Tesseract is doing the reading</span>`
-    : p.cuda
-      ? `<span style="color:#7fd4a3">installed, using the GPU</span>`
-      : `<span style="color:#e2b341">installed, CPU build — about 15× slower than Tesseract</span>`;
-  let strip='';
+  // ---- install / engine status ----------------------------------------
+  let padStrip='';
   if(inst.state==='installing'){
-    strip=`<div style="margin-top:8px"><span style="color:#e2b341;font-size:12px">
+    padStrip=`<div style="margin-top:8px"><span style="color:#e2b341;font-size:12px">
       installing (${esc(inst.mode)})… the GPU build is a ~1.5 GB download</span>
       ${inst.log?`<pre class="mono dim" style="font-size:10.5px;margin:6px 0 0;max-height:110px;
-        overflow:auto;white-space:pre-wrap">${esc(inst.log.split('\\n').slice(-5).join('\\n'))}</pre>`:''}</div>`;
-    setTimeout(loadPaddle, 4000);
+        overflow:auto;white-space:pre-wrap">${esc(inst.log.split('\n').slice(-5).join('\n'))}</pre>`:''}</div>`;
+    setTimeout(loadOcr, 4000);
   } else {
     const hasGpu=!!p.gpu_name;
-    strip=`<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-      ${!p.installed||!p.cuda
-        ? `<button onclick="padInstall('gpu')" ${hasGpu?'style="color:var(--acc)"':''}
-             >Install — GPU${hasGpu?` (${esc(p.gpu_name)})`:''}</button>`:''}
-      ${!p.installed
-        ? `<button onclick="padInstall('cpu')">Install — CPU only</button>`:''}
-      ${p.installed?`<button onclick="padInstall('update')">Update</button>`:''}
+    padStrip=`<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      ${(!padReady||!p.cuda)?`<button onclick="padInstall('gpu')" ${hasGpu?'style="color:var(--acc)"':''}
+          >Install — GPU${hasGpu?` (${esc(p.gpu_name)})`:''}</button>`:''}
+      ${!padReady?`<button onclick="padInstall('cpu')">Install — CPU only</button>`:''}
+      ${padReady?`<button onclick="padInstall('update')">Update PaddleOCR</button>`:''}
       ${inst.state==='error'?`<span style="color:#e0575b;font-size:11px">${esc(inst.error||'')}</span>`:''}
       ${inst.state==='done'?`<span style="color:#7fd4a3;font-size:11px">done</span>`:''}
     </div>`;
   }
-  el.innerHTML=`
-    <div class="lkind" style="padding:11px 12px">
-      <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:baseline">
-        <b style="color:#6fb0ff">Engine</b>${head}</div>
-      ${p.installed?'':`<div class="dim" style="font-size:11px;margin-top:5px">
-        Nothing breaks without it — Tesseract is bundled and reads clean
-        subtitle text well. This is the upgrade for italics and for keeping
-        signs where they belong.</div>`}
-      ${strip}
-    </div>
 
+  el.innerHTML=head+`
     <div class="lkind" style="margin-top:10px">
       <div class="lkindhead"><b style="color:#6fb0ff">What is installed</b></div>
       <table style="width:100%;font-size:12px;border-collapse:collapse">
-        ${socRow('paddleocr', p.paddleocr||'—', 'the OCR pipeline: finds the text, then reads it')}
-        ${socRow('paddlepaddle', p.paddlepaddle||'—', 'the framework it runs on')}
-        ${socRow('CUDA build', p.cuda?'yes':'no',
-          p.cuda?'this build can use the GPU'
-                :(p.gpu_name?`a GPU is present (${esc(p.gpu_name)}) but this is the CPU build`
-                            :'no NVIDIA GPU detected — CPU is the only option here'))}
+        ${socRow('Tesseract', s.tesseract_version||'—',
+          s.tesseract_dir?esc(s.tesseract_dir):'not found')}
+        ${socRow('pgsrip', s.pgsrip_version||'—', 'drives Tesseract over a PGS stream')}
+        ${socRow('paddleocr', p.paddleocr||'—', 'finds the text, then reads it')}
+        ${socRow('paddlepaddle', p.paddlepaddle||'—',
+          p.cuda?'GPU build — can use the card'
+                :(p.gpu_name?`CPU build — a GPU is present (${esc(p.gpu_name)}) but unused`
+                            :'CPU build'))}
       </table>
+      <div style="padding:0 12px 11px">${padStrip}</div>
     </div>
 
     <div class="lkind" style="padding:11px 12px;margin-top:10px">
       <b style="color:#6fb0ff">Measured on this library</b>
-      <div class="dim" style="font-size:11px;margin-top:4px">
-        55 real subtitle images from a dialogue track and an anime signs track:
+      <div class="dim" style="font-size:11px;margin-top:3px">
+        Each test reads a dozen cues from a real picture-subtitle track here
+        and records what came back. Nothing is written and no file is touched —
+        run them and compare the text, which is the part that matters.</div>
+      <div style="margin-top:7px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <button onclick="ocrTest('tesseract','cpu')">Test Tesseract</button>
+        ${padReady&&p.cuda?`<button onclick="ocrTest('paddle','gpu')">Test PaddleOCR — GPU</button>`:''}
+        ${padReady?`<button onclick="ocrTest('paddle','cpu')">Test PaddleOCR — CPU</button>`:''}
+        <span id="ocrTestMsg" class="dim" style="font-size:11.5px"></span>
       </div>
-      <table style="width:100%;font-size:12px;border-collapse:collapse;margin-top:6px">
-        ${socRow('Tesseract','~135 ms/cue','2 of 55 wrong — both italics, e.g. “lLlknow ldo.” for “I know I do.”')}
-        ${socRow('PaddleOCR — GPU','~200 ms/cue','read all 55 correctly')}
-        ${socRow('PaddleOCR — CPU','~2000 ms/cue','same answers, fifteen times slower than Tesseract')}
-      </table>
-      <div class="dim" style="font-size:11px;margin-top:6px">
-        Which engine each library uses is set on the <b>Subtitles</b> page.
-        <button style="margin-left:6px" onclick="wtab('lang')">Open Subtitles settings</button>
-      </div>
+      <div id="ocrMeas" style="margin-top:8px">${ocrMeasHtml()}</div>
     </div>
 
-    ${p.installed?`<div class="lkind" style="padding:11px 12px;margin-top:10px">
-      <b style="color:#6fb0ff">Test it on your own subtitles</b>
-      <div class="dim" style="font-size:11px;margin-top:3px">
-        Reads a dozen cues from a real picture-subtitle track in your library.
-        Run both and compare — same track, same images, so the difference you
-        see is the engine. Nothing is written and no file is touched.</div>
-      <div style="margin-top:7px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-        ${p.cuda?`<button onclick="ocrTest('paddle','gpu','padTest')">Test on GPU</button>`
-                :`<button disabled title="this is the CPU build">Test on GPU</button>`}
-        <button onclick="ocrTest('paddle','cpu','padTest')">Test on CPU</button>
-        <button onclick="ocrTest('tesseract','cpu','padTest')">Test Tesseract for comparison</button>
-        <span id="padTestMsg" class="dim" style="font-size:11.5px"></span>
+    <div class="lkind" style="padding:11px 12px;margin-top:10px">
+      <b style="color:#6fb0ff">What gets converted</b>
+      <div class="dim" style="font-size:11px;margin-top:4px">
+        Which tracks qualify — dialogue, SDH, forced — and for which
+        libraries, is a subtitle policy rather than a property of the engine.
+        <div style="margin-top:7px"><button onclick="wtab('lang')">Open Subtitles settings</button></div>
       </div>
-      <div id="padTest" style="margin-top:6px"></div>
-    </div>`:''}`;
+    </div>`;
 }
 
-// Shared by both engine pages: run one test, append the result so two runs
-// sit side by side and can actually be compared.
-async function ocrTest(engine,device,into){
-  const box=document.getElementById(into);
-  const msg=document.getElementById(into+'Msg');
+// THE TABLE IS WHATEVER WAS LAST MEASURED HERE, not a constant. It shipped
+// as numbers from the machine nuarr was written on - the kind of claim that
+// goes stale and cannot be checked.
+let _ocrMeas={};
+function ocrMeasHtml(){
+  const rows=[['tesseract','Tesseract'],['paddle:gpu','PaddleOCR — GPU'],
+              ['paddle:cpu','PaddleOCR — CPU']];
+  const have=rows.filter(([k])=>_ocrMeas[k]);
+  if(!have.length) return `<div class="dim" style="font-size:11.5px">
+    Nothing measured yet — run a test above and the results collect here.</div>`;
+  return `<table style="width:100%;font-size:12px;border-collapse:collapse">`
+    + have.map(([k,label])=>{
+        const m=_ocrMeas[k];
+        const when=m.at?new Date(m.at*1000).toLocaleString():'';
+        return `<tr style="border-top:1px solid var(--line);vertical-align:top">
+          <td style="padding:5px 12px 5px 0;white-space:nowrap"><b>${label}</b>
+            <div class="dim" style="font-size:10.5px">${esc(when)}</div></td>
+          <td class="mono" style="white-space:nowrap;padding-right:12px">
+            ${m.cues} cues · ${m.elapsed}s</td>
+          <td class="dim mono" style="font-size:11px">
+            ${(m.lines||[]).slice(0,3).map(l=>esc(l)).join('<br>')||'(nothing read)'}</td>
+        </tr>`;
+      }).join('')
+    + `</table><div class="dim" style="font-size:10.5px;margin-top:5px">
+       A short sample, so the clock is mostly process start and model load —
+       read the text, not the timing.</div>`;
+}
+
+async function ocrSetEngine(engine){
+  const m=document.getElementById('ocrEngMsg');
+  if(m){ m.style.color=''; m.textContent='switching…'; }
+  try{
+    const r=await (await fetch('/api/ocr/engine?engine='+engine,{method:'POST'})).json();
+    if(!r.ok){ if(m){ m.style.color='#e0575b'; m.textContent=r.error||'failed'; }
+               loadOcr(); return; }
+    if(m){ m.style.color='#7fd4a3';
+      m.textContent = r.cancelled
+        ? `now reading with ${engine} — ${r.cancelled} job(s) stopped and ${r.requeued} requeued`
+        : `now reading with ${engine}`; }
+    _ocrEng=engine;
+  }catch(e){ if(m){ m.style.color='#e0575b'; m.textContent='failed'; } }
+}
+
+async function ocrTest(engine,device){
+  const msg=document.getElementById('ocrTestMsg');
   if(msg){ msg.style.color=''; msg.textContent=
     `reading with ${engine}${engine==='paddle'?' on '+device.toUpperCase():''}… `
-    +`first run loads the model, so give it a moment`; }
+    +`the first run loads the model, so give it a moment`; }
   let r=null;
   try{ r=await (await fetch(`/api/ocr/test?engine=${engine}&device=${device}`,
                             {method:'POST'})).json(); }
   catch(e){ if(msg){ msg.style.color='#e0575b'; msg.textContent='test failed'; } return; }
+  if(!r.ok){ if(msg){ msg.style.color='#e2b341'; msg.textContent=r.error||'failed'; } return; }
   if(msg) msg.textContent='';
-  const name = engine==='paddle' ? `PaddleOCR · ${device.toUpperCase()}` : 'Tesseract';
-  if(!r.ok){
-    if(box) box.insertAdjacentHTML('afterbegin',
-      `<div class="lkind" style="padding:8px 10px;margin-top:6px">
-         <b>${esc(name)}</b> <span style="color:#e0575b">— ${esc(r.error||'failed')}</span></div>`);
-    return;
-  }
-  if(box) box.insertAdjacentHTML('afterbegin',`
-    <div class="lkind" style="padding:8px 10px;margin-top:6px">
-      <div><b>${esc(name)}</b>
-        <span class="dim">— ${r.cues} cue(s) from “${esc(r.title||'a file')}” in
-        ${r.elapsed}s
-        <span style="font-size:10.5px">· a short sample, so most of that is
-        starting the process and loading the model — read the TEXT below, not
-        the clock</span></span></div>
-      <div class="mono dim" style="font-size:11px;margin-top:5px;max-height:150px;overflow:auto">
-        ${(r.lines||[]).map(l=>esc(l)).join('<br>')||'(nothing read)'}</div>
-    </div>`);
+  try{
+    const c=await (await fetch('/api/ocr/measurements')).json();
+    _ocrMeas=c.measurements||{};
+  }catch(e){}
+  const box=document.getElementById('ocrMeas');
+  if(box) box.innerHTML=ocrMeasHtml();
 }
 
 async function padInstall(mode){
   try{ await fetch('/api/paddle/install?mode='+mode,{method:'POST'}); }catch(e){}
-  loadPaddle();
+  loadOcr();
+}
+
+function socRow(k,v,why){
+  return `<tr style="border-top:1px solid var(--line)">
+    <td style="padding:5px 12px;white-space:nowrap">${esc(k)}</td>
+    <td class="mono" style="white-space:nowrap">${esc(String(v))}</td>
+    <td class="dim" style="font-size:11px;padding-right:12px;word-break:break-all">${why}</td></tr>`;
 }
 
 // ---- Whisper ---------------------------------------------------------
@@ -20341,8 +20377,7 @@ _SETTINGS_NAV = [
     ("Tools",      [("ffmpeg",  "ffmpeg",          "film"),
                     ("mkv",     "MKVToolNix",      "tool"),
                     ("whisper", "Whisper",         "language"),
-                    ("subocr",  "Tesseract",       "language"),
-                    ("paddle",  "PaddleOCR",       "language")]),
+                    ("ocr",     "OCR engines",     "language")]),
     ("Integrations", [("arrs", "Arrs",             "link"),
                       ("plex", "Plex",             "play"),
                       ("meta", "Metadata",         "globe")]),
@@ -20526,9 +20561,9 @@ _SETTINGS_CSS = """
    here - the sections rendered as bare text with no card around them. Repeated
    rather than re-scoped, because widening the language selectors would change
    that page too, and it is not the one being edited. */
-#vcodecPane .lkind,#acodecPane .lkind,#alangPane .lkind,#cachePane .lkind,#whisperPane .lkind,#subocrPane .lkind,#paddlePane .lkind{border:1px solid var(--line);
+#vcodecPane .lkind,#acodecPane .lkind,#alangPane .lkind,#cachePane .lkind,#whisperPane .lkind,#ocrPane .lkind{border:1px solid var(--line);
   border-radius:8px;margin-top:10px}
-#vcodecPane .lkindhead,#acodecPane .lkindhead,#alangPane .lkindhead,#cachePane .lkindhead,#whisperPane .lkindhead,#subocrPane .lkindhead,#paddlePane .lkindhead{padding:7px 12px;
+#vcodecPane .lkindhead,#acodecPane .lkindhead,#alangPane .lkindhead,#cachePane .lkindhead,#whisperPane .lkindhead,#ocrPane .lkindhead{padding:7px 12px;
   border-bottom:1px solid var(--line);background:rgba(255,255,255,.02);
   font-weight:500;font-size:12.5px;display:flex;gap:10px;align-items:baseline;
   border-radius:8px 8px 0 0}
