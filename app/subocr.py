@@ -387,8 +387,10 @@ def select_targets(probe: dict) -> list[dict]:
         role = _role(s)
         if role in have_text:
             continue                 # this role is already readable as text
+        convert_all = bool(_s("subocr_all", False))
         # SDH is its own switch: some people want the plain track only.
-        if role == "sdh" and not bool(_s("subocr_sdh", True)):
+        if role == "sdh" and not convert_all \
+                and not bool(_s("subocr_sdh", True)):
             continue
         # Signs stay pictures: they are burned into the video by the encode
         # rules, and OCR of typeset signs is worthless anyway. SDH and full
@@ -406,17 +408,26 @@ def select_targets(probe: dict) -> list[dict]:
         # text equivalent to offer, Plex paints it on the CPU, which is a full
         # 2160p HDR re-encode. Converting it costs seconds of OCR on 37 cues.
         signs, why = is_signs(s, mins)
-        if signs and not never_burned:
-            continue
-        # Signs & Songs keeps its OWN switch, because it runs on its own
-        # logic: the learned title patterns and the density model above decide
-        # WHAT is signs, and this decides whether an unburnable signs track
-        # (HDR - see John Wick below) is worth converting at all.
-        if signs and not bool(_s("subocr_signs_unburned", True)):
-            continue
-        if signs:
-            why = (f"{why} - converted anyway because nothing will burn it "
-                   f"into this file")
+        if convert_all:
+            # THE OVERRIDE: every kept English PGS becomes text, signs
+            # included, even ones the encoder will also burn. The person
+            # asked for everything; the classification stands down and only
+            # grades the OCR result, never the decision.
+            if signs:
+                why = f"{why} - converted because 'all kept PGS subs' is on"
+        else:
+            if signs and not never_burned:
+                continue
+            # Signs & Songs keeps its OWN switch (it lives on the Subtitles
+            # page, with the burn-in policy it belongs to): the learned title
+            # patterns and the density model decide WHAT is signs, and this
+            # decides whether an unburnable signs track (HDR - see John Wick
+            # below) is worth converting at all.
+            if signs and not bool(_s("subocr_signs_unburned", True)):
+                continue
+            if signs:
+                why = (f"{why} - converted anyway because nothing will burn "
+                       f"it into this file")
         t = dict(s)
         t["rel"] = rel
         t["cues"] = cues(s)
@@ -966,6 +977,7 @@ def status() -> dict:
         "libraries": list(_s("subocr_libraries", []) or []),
         "all_libraries": [l.name for l in (SETTINGS.libraries or [])],
         "sdh": bool(_s("subocr_sdh", True)),
+        "all": bool(_s("subocr_all", False)),
         "signs_unburned": bool(_s("subocr_signs_unburned", True)),
         "signs_max_cpm": signs_max_cpm(),
         "dialogue_min_cues": dialogue_min_cues(),

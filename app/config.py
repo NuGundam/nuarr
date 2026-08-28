@@ -280,6 +280,7 @@ class Settings:
     subocr_batch: int = 20               # files queued per sweep
     subocr_libraries: list = field(default_factory=list)   # empty = all
     subocr_sdh: bool = True              # convert SDH image subs too
+    subocr_all: bool = False             # override: OCR every kept PGS track
     subocr_signs_unburned: bool = True   # convert signs when nothing burns them
     subocr_signs_max_cpm: float = 6.0    # below this density = signs
     subocr_dialogue_min_cues: int = 500  # above this = dialogue, no debate

@@ -3975,6 +3975,7 @@ async def api_subocr_config(body: dict = Body(...)):
         "subocr_batch": lambda v: max(1, min(500, int(v))),
         "subocr_libraries": lambda v: [str(x) for x in (v or [])],
         "subocr_sdh": lambda v: bool(v),
+        "subocr_all": lambda v: bool(v),
         "subocr_signs_unburned": lambda v: bool(v),
         "subocr_signs_max_cpm": lambda v: max(0.5, min(30.0, float(v))),
         "subocr_dialogue_min_cues": lambda v: max(50, min(5000, int(v))),
@@ -16966,7 +16967,50 @@ async function loadLangTab(){
         <span id="langMsg" class="dim" style="font-size:11.5px">${
           _langDirty?'unsaved changes':'the planner is using this now'}</span>
        </div>
-       <div id="langImpact" style="margin-top:8px"></div>`;
+       <div id="langImpact" style="margin-top:8px"></div>
+       <div id="langSigns"></div>`;
+  langSignsLoad();
+}
+
+// Signs & songs live HERE, with the subtitle policy - they are typeset art
+// the encoder burns into the picture, not standard subtitles OCR can be
+// trusted with, so the OCR page is the wrong home for their switch.
+async function langSignsLoad(){
+  const el=document.getElementById('langSigns');
+  if(!el) return;
+  let s=null;
+  try{ s=await (await fetch('/api/subocr/status')).json(); }catch(e){ return; }
+  el.innerHTML=`
+    <div class="lkind" style="padding:11px 12px;margin-top:12px">
+      <b style="color:#6fb0ff">Signs &amp; songs</b>
+      <div class="dim" style="font-size:11px;margin-top:3px">
+        Typeset signs and song captions are art, not standard subtitles: the
+        encoder <b>burns them into the picture</b> during a rebuild so they
+        render perfectly everywhere. Which tracks count as signs is decided by
+        patterns <b>learned from this library</b> (title tokens scored by
+        log-odds over 6,271 labelled tracks — 100% precision on holdout) plus
+        a cue-density model — logic that keeps growing.</div>
+      <label style="display:flex;gap:9px;align-items:flex-start;padding:8px 0 0;cursor:pointer">
+        <input type="checkbox" id="lsUnburned" ${s.signs_unburned?'checked':''}
+          onchange="langSignsSave(this)" style="margin-top:2px">
+        <span><b>When nothing will ever burn them, convert to text instead</b>
+        <div class="dim" style="font-size:11px">
+          On files nuarr never re-encodes (HDR), burn-in never happens — and
+          Plex would paint the pictures on the CPU at every play, a full
+          re-encode of a 4K film. This OCRs those few tracks so a text
+          version exists. Off: they stay pictures everywhere.</div></span>
+      </label>
+      <span id="lsMsg" class="dim" style="font-size:11px"></span>
+    </div>`;
+}
+async function langSignsSave(box){
+  const m=document.getElementById('lsMsg');
+  try{
+    const r=await (await fetch('/api/subocr/config',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({subocr_signs_unburned:box.checked})})).json();
+    if(m){ m.style.color=r.ok?'#7fd4a3':'#e0575b'; m.textContent=r.ok?'saved':'failed'; }
+  }catch(e){ if(m){ m.style.color='#e0575b'; m.textContent='failed'; } }
 }
 // ---- Video / audio codec settings, per library ---------------------------
 // ONE RENDERER FOR BOTH TABS, and one that is GENERATED from the schema the
@@ -17283,21 +17327,8 @@ async function loadSubocr(){
       <b style="color:#6fb0ff">What gets converted</b>
       ${chk('socSdh',s.sdh,'SDH tracks',
         'Subtitles for the deaf and hard-of-hearing. Converted independently of the plain dialogue track — SDH is the one you want in a noisy room.')}
-      <div style="padding-left:0">
-        <label style="display:flex;gap:9px;align-items:flex-start;padding:8px 0;cursor:pointer">
-          <input type="checkbox" id="socSigns" ${s.signs_unburned?'checked':''} style="margin-top:2px">
-          <span><b>Signs &amp; songs — when nothing will burn them</b>
-          <div class="dim" style="font-size:11px">
-            Signs normally stay pictures because the encoder paints them into the
-            video. On files nuarr never re-encodes (HDR), that premise is false and
-            Plex would paint them on the CPU at every play — a full re-encode of a
-            4K film. This converts those. <b>Its own switch on purpose:</b> what
-            counts as signs is decided by patterns <b>learned from this library</b>
-            (title tokens scored by log-odds over 6,271 labelled tracks — 100%
-            precision on holdout) plus a cue-density model, not a hand-written
-            guess, and that logic keeps growing.</div></span>
-        </label>
-      </div>
+      ${chk('socAll',s.all,'All kept PGS subs',
+        'The override: every English PGS track that survives the subtitle policy is OCR&rsquo;d — dialogue, SDH and signs alike, whatever the classification below says. The result is still validated; only the decision stands down. Signs &amp; songs handling itself lives on the <b>Subtitles</b> page, with the burn-in policy it belongs to.')}
       <div style="display:flex;gap:18px;flex-wrap:wrap;align-items:center;font-size:12px;margin-top:2px">
         <span title="Tracks below this density read as signs">signs below
           <input id="socCpm" type="number" min="0.5" max="30" step="0.5" value="${s.signs_max_cpm}"
@@ -17332,7 +17363,7 @@ async function socSave(btn){
       subocr_batch:parseInt(document.getElementById('socBatch').value)||20,
       subocr_libraries:[...document.querySelectorAll('.socLib:checked')].map(c=>c.value),
       subocr_sdh:document.getElementById('socSdh').checked,
-      subocr_signs_unburned:document.getElementById('socSigns').checked,
+      subocr_all:document.getElementById('socAll').checked,
       subocr_signs_max_cpm:parseFloat(document.getElementById('socCpm').value)||6,
       subocr_dialogue_min_cues:parseInt(document.getElementById('socMinCues').value)||500};
     const r=await (await fetch('/api/subocr/config',{method:'POST',
