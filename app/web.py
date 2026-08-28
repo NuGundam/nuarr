@@ -516,6 +516,9 @@ async def _startup() -> None:
     asyncio.create_task(system.sampler())
     # Reports only - never installs on its own. See ffmpeg_update.watch().
     asyncio.create_task(audiolang.watch())
+    # Queues OCR conversions a batch at a time - see subocr.watch().
+    from . import subocr as _subocr
+    asyncio.create_task(_subocr.watch())
     asyncio.create_task(arrhealth.watch())
     asyncio.create_task(ffmpeg_update.watch())
     # Silent and request-free until a repo is configured - see updates.watch.
@@ -3953,6 +3956,60 @@ def api_unmanaged_adopt_status():
 async def api_unmanaged_adopt_run():
     """Run an adoption pass now instead of waiting for the timer."""
     return await adopter.sweep()
+
+
+@app.get("/api/subocr/status")
+def api_subocr_status():
+    """The OCR tool page: engine versions, switches, thresholds."""
+    from . import subocr
+    return subocr.status()
+
+
+@app.post("/api/subocr/config")
+async def api_subocr_config(body: dict = Body(...)):
+    """Save the OCR switches - config.yml, and SETTINGS in place."""
+    import yaml
+    allowed = {
+        "subocr_auto": lambda v: bool(v),
+        "subocr_every_h": lambda v: max(1, min(168, int(v))),
+        "subocr_batch": lambda v: max(1, min(500, int(v))),
+        "subocr_libraries": lambda v: [str(x) for x in (v or [])],
+        "subocr_sdh": lambda v: bool(v),
+        "subocr_signs_unburned": lambda v: bool(v),
+        "subocr_signs_max_cpm": lambda v: max(0.5, min(30.0, float(v))),
+        "subocr_dialogue_min_cues": lambda v: max(50, min(5000, int(v))),
+    }
+    changes = {}
+    for k, cast in allowed.items():
+        if k in body:
+            try:
+                changes[k] = cast(body[k])
+            except (TypeError, ValueError):
+                return {"ok": False, "error": f"bad value for {k}"}
+    if not changes:
+        return {"ok": False, "error": "nothing to save"}
+    p = _config_path()
+    raw = {}
+    if p.exists():
+        try:
+            raw = yaml.safe_load(p.read_text(encoding="utf-8-sig")) or {}
+        except Exception:                                # noqa: BLE001
+            raw = {}
+    raw.update(changes)
+    p.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True),
+                 encoding="utf-8")
+    for k, v in changes.items():
+        setattr(SETTINGS, k, v)
+    joblog.log("subtitle OCR settings saved", "ok")
+    from . import subocr
+    return {"ok": True, **subocr.status()}
+
+
+@app.post("/api/subocr/update")
+def api_subocr_update():
+    """pip-update pgsrip from the page; /api/subocr/status carries the state."""
+    from . import subocr
+    return subocr.pip_update_start()
 
 
 @app.get("/api/subocr/preview")
@@ -15730,6 +15787,7 @@ function wtab(which){
                    vcodec:'vcodecPane', acodec:'acodecPane',
                    alang:'alangPane', cache:'cachePane',
                    whisper:'whisperPane', plex:'plexPane',
+                   subocr:'subocrPane',
                    updates:'updPane'};
   const isPane = Object.prototype.hasOwnProperty.call(PANE_OF, which);
   const set = document.getElementById('wSettings');
@@ -15774,6 +15832,11 @@ function wtab(which){
   if(which==='updates'){
     if(hint) hint.textContent='· updates';
     loadUpdates(0);      // 0: use the cache. The Check now button forces it.
+    return;
+  }
+  if(which==='subocr'){
+    if(hint) hint.textContent='· subtitle OCR';
+    loadSubocr();
     return;
   }
   if(which==='whisper'){
@@ -17153,6 +17216,157 @@ async function savePlexCfg(btn){
     }
   }catch(e){ if(m){ m.style.color='#e2b341'; m.textContent='failed'; } }
   btn.disabled=false;
+}
+
+// ---- Subtitle OCR ----------------------------------------------------
+let _soc=null;
+
+async function loadSubocr(){
+  const el=document.getElementById('subocrBody');
+  if(!el) return;
+  try{ _soc=await (await fetch('/api/subocr/status')).json(); }
+  catch(e){ el.innerHTML='<div class="dim" style="padding:14px">could not load</div>'; return; }
+  const s=_soc;
+  const inst=s.install||{};
+  const engineLine = s.ready
+    ? `<span style="color:#7fd4a3">ready — Tesseract ${esc(s.tesseract_version)} · pgsrip ${esc(s.pgsrip_version)}</span>`
+    : `<span style="color:#e2b341">${!s.tesseract_version?'Tesseract not found':'pgsrip not installed'} — conversion cannot run</span>`;
+  const chk=(id,on,label,why)=>`
+    <label style="display:flex;gap:9px;align-items:flex-start;padding:8px 0;cursor:pointer">
+      <input type="checkbox" id="${id}" ${on?'checked':''} style="margin-top:2px">
+      <span><b>${label}</b><div class="dim" style="font-size:11px">${why}</div></span>
+    </label>`;
+  el.innerHTML=`
+    <div class="lkind" style="padding:11px 12px">
+      <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:baseline">
+        <b style="color:#6fb0ff">Engine</b>${engineLine}
+      </div>
+      <div class="dim" style="font-size:11px;margin-top:5px">
+        Tesseract at <span class="mono">${esc(s.tesseract_dir||'(not installed)')}</span>
+        ${s.tesseract_managed?'· nuarr&rsquo;s own copy, refreshed by updates':s.tesseract_dir?'· system install':''}
+      </div>
+      <div style="margin-top:7px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        ${inst.state==='installing'
+          ? `<span class="dim" style="font-size:11.5px">updating pgsrip…</span>`
+          : `<button onclick="socUpdate(this)">Update pgsrip</button>`}
+        ${inst.state==='error'?`<span style="color:#e0575b;font-size:11px">${esc(inst.error||'')}</span>`:''}
+        ${inst.state==='done'?`<span style="color:#7fd4a3;font-size:11px">updated</span>`:''}
+      </div>
+    </div>
+
+    <div class="lkind" style="padding:11px 12px">
+      <b style="color:#6fb0ff">When it runs</b>
+      ${chk('socAuto',s.auto,'Convert automatically',
+        'A modest batch on a schedule, queued through the same job system as everything else — the gate still holds for viewers, and slow-and-continuous beats all-at-once on a system built to not be noticed.')}
+      <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;font-size:12px;padding-left:26px">
+        <span>every <input id="socEvery" type="number" min="1" max="168" value="${s.every_h}"
+          style="width:56px;font-family:var(--mono,monospace)"> h</span>
+        <span><input id="socBatch" type="number" min="1" max="500" value="${s.batch}"
+          style="width:64px;font-family:var(--mono,monospace)"> files per pass</span>
+        <button onclick="socRunNow(this)">Run a pass now</button>
+      </div>
+    </div>
+
+    <div class="lkind" style="padding:11px 12px">
+      <b style="color:#6fb0ff">Libraries</b>
+      <div class="dim" style="font-size:11px;margin-top:3px">Nothing ticked means every library.</div>
+      <div style="display:flex;gap:14px;flex-wrap:wrap;margin-top:6px">
+        ${(s.all_libraries||[]).map(n=>`
+          <label style="display:flex;gap:6px;align-items:center;font-size:12px;cursor:pointer">
+            <input type="checkbox" class="socLib" value="${esc(n)}"
+              ${(s.libraries||[]).indexOf(n)>=0?'checked':''}>${esc(n)}</label>`).join('')
+          || '<span class="dim" style="font-size:11.5px">no libraries configured yet</span>'}
+      </div>
+    </div>
+
+    <div class="lkind" style="padding:11px 12px">
+      <b style="color:#6fb0ff">What gets converted</b>
+      ${chk('socSdh',s.sdh,'SDH tracks',
+        'Subtitles for the deaf and hard-of-hearing. Converted independently of the plain dialogue track — SDH is the one you want in a noisy room.')}
+      <div style="padding-left:0">
+        <label style="display:flex;gap:9px;align-items:flex-start;padding:8px 0;cursor:pointer">
+          <input type="checkbox" id="socSigns" ${s.signs_unburned?'checked':''} style="margin-top:2px">
+          <span><b>Signs &amp; songs — when nothing will burn them</b>
+          <div class="dim" style="font-size:11px">
+            Signs normally stay pictures because the encoder paints them into the
+            video. On files nuarr never re-encodes (HDR), that premise is false and
+            Plex would paint them on the CPU at every play — a full re-encode of a
+            4K film. This converts those. <b>Its own switch on purpose:</b> what
+            counts as signs is decided by patterns <b>learned from this library</b>
+            (title tokens scored by log-odds over 6,271 labelled tracks — 100%
+            precision on holdout) plus a cue-density model, not a hand-written
+            guess, and that logic keeps growing.</div></span>
+        </label>
+      </div>
+      <div style="display:flex;gap:18px;flex-wrap:wrap;align-items:center;font-size:12px;margin-top:2px">
+        <span title="Tracks below this density read as signs">signs below
+          <input id="socCpm" type="number" min="0.5" max="30" step="0.5" value="${s.signs_max_cpm}"
+            style="width:60px;font-family:var(--mono,monospace)"> cues/min</span>
+        <span title="Tracks above this many cues are dialogue whatever their title says">dialogue above
+          <input id="socMinCues" type="number" min="50" max="5000" value="${s.dialogue_min_cues}"
+            style="width:70px;font-family:var(--mono,monospace)"> cues</span>
+      </div>
+      <div class="dim" style="font-size:11px;margin-top:6px">
+        Defaults are measured on this library, not guessed — the gap between
+        signs (p90 ≈ 3.7 cues/min) and dialogue (p10 ≈ 9.6) is where the line
+        sits. Skipping is always the safe error: a skipped track stays exactly
+        as it is today.
+      </div>
+    </div>
+
+    <div style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <button onclick="socSave(this)">Save</button>
+      <button onclick="socCount(this)">Count what qualifies</button>
+      <span id="socMsg" class="dim" style="font-size:11.5px"></span>
+    </div>`;
+  if(inst.state==='installing') setTimeout(loadSubocr, 3000);
+}
+
+async function socSave(btn){
+  const m=document.getElementById('socMsg');
+  btn.disabled=true;
+  try{
+    const body={
+      subocr_auto:document.getElementById('socAuto').checked,
+      subocr_every_h:parseInt(document.getElementById('socEvery').value)||6,
+      subocr_batch:parseInt(document.getElementById('socBatch').value)||20,
+      subocr_libraries:[...document.querySelectorAll('.socLib:checked')].map(c=>c.value),
+      subocr_sdh:document.getElementById('socSdh').checked,
+      subocr_signs_unburned:document.getElementById('socSigns').checked,
+      subocr_signs_max_cpm:parseFloat(document.getElementById('socCpm').value)||6,
+      subocr_dialogue_min_cues:parseInt(document.getElementById('socMinCues').value)||500};
+    const r=await (await fetch('/api/subocr/config',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
+    if(m){ m.style.color=r.ok?'#7fd4a3':'#e0575b';
+           m.textContent=r.ok?'saved':(r.error||'failed'); }
+  }catch(e){ if(m){ m.style.color='#e0575b'; m.textContent='failed'; } }
+  btn.disabled=false;
+}
+async function socRunNow(btn){
+  const m=document.getElementById('socMsg');
+  btn.disabled=true; const old=btn.textContent; btn.textContent='queueing…';
+  try{
+    const n=parseInt(document.getElementById('socBatch').value)||20;
+    const r=await (await fetch('/api/subocr/queue?limit='+n,{method:'POST'})).json();
+    if(m){ m.style.color='#7fd4a3';
+      m.textContent=`queued ${r.queued??r.would_queue??0} file(s) — watch them on the dashboard`; }
+  }catch(e){ if(m){ m.style.color='#e0575b'; m.textContent='queue failed'; } }
+  btn.disabled=false; btn.textContent=old;
+}
+async function socCount(btn){
+  const m=document.getElementById('socMsg');
+  btn.disabled=true; const old=btn.textContent; btn.textContent='counting… (walks every probe, ~30s)';
+  try{
+    const r=await (await fetch('/api/subocr/preview?limit=3')).json();
+    if(m){ m.style.color='';
+      m.textContent=`${r.files} file(s) / ${r.tracks} track(s) currently qualify`; }
+  }catch(e){ if(m){ m.style.color='#e0575b'; m.textContent='count failed'; } }
+  btn.disabled=false; btn.textContent=old;
+}
+async function socUpdate(btn){
+  btn.disabled=true;
+  try{ await fetch('/api/subocr/update',{method:'POST'}); }catch(e){}
+  loadSubocr();
 }
 
 // ---- Whisper ---------------------------------------------------------
@@ -19627,7 +19841,8 @@ _SETTINGS_NAV = [
                     ("rules",  "Rules",            "list")]),
     ("Tools",      [("ffmpeg",  "ffmpeg",          "film"),
                     ("mkv",     "MKVToolNix",      "tool"),
-                    ("whisper", "Whisper",         "language")]),
+                    ("whisper", "Whisper",         "language"),
+                    ("subocr",  "Subtitle OCR",    "language")]),
     ("Integrations", [("arrs", "Arrs",             "link"),
                       ("plex", "Plex",             "play"),
                       ("meta", "Metadata",         "globe")]),
@@ -19811,9 +20026,9 @@ _SETTINGS_CSS = """
    here - the sections rendered as bare text with no card around them. Repeated
    rather than re-scoped, because widening the language selectors would change
    that page too, and it is not the one being edited. */
-#vcodecPane .lkind,#acodecPane .lkind,#alangPane .lkind,#cachePane .lkind,#whisperPane .lkind{border:1px solid var(--line);
+#vcodecPane .lkind,#acodecPane .lkind,#alangPane .lkind,#cachePane .lkind,#whisperPane .lkind,#subocrPane .lkind{border:1px solid var(--line);
   border-radius:8px;margin-top:10px}
-#vcodecPane .lkindhead,#acodecPane .lkindhead,#alangPane .lkindhead,#cachePane .lkindhead,#whisperPane .lkindhead{padding:7px 12px;
+#vcodecPane .lkindhead,#acodecPane .lkindhead,#alangPane .lkindhead,#cachePane .lkindhead,#whisperPane .lkindhead,#subocrPane .lkindhead{padding:7px 12px;
   border-bottom:1px solid var(--line);background:rgba(255,255,255,.02);
   font-weight:500;font-size:12.5px;display:flex;gap:10px;align-items:baseline;
   border-radius:8px 8px 0 0}

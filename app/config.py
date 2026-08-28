@@ -273,6 +273,17 @@ class Settings:
     #           never the software's call.
     update_mode: str = "manual"
 
+    # SUBTITLE OCR - the switches behind Settings -> Subtitle OCR. Defaults
+    # match the measured thresholds in subocr.py; the page can move them.
+    subocr_auto: bool = True             # queue conversions on a schedule
+    subocr_every_h: int = 6              # hours between sweeps
+    subocr_batch: int = 20               # files queued per sweep
+    subocr_libraries: list = field(default_factory=list)   # empty = all
+    subocr_sdh: bool = True              # convert SDH image subs too
+    subocr_signs_unburned: bool = True   # convert signs when nothing burns them
+    subocr_signs_max_cpm: float = 6.0    # below this density = signs
+    subocr_dialogue_min_cues: int = 500  # above this = dialogue, no debate
+
     # Tautulli - used to hold jobs while Plex is busy. Key is read from
     # Tautulli's own config so it is not duplicated here.
     tautulli_url: str = "http://localhost:8181"

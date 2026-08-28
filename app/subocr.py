@@ -154,6 +154,44 @@ MIN_CUES = 40
 TESSERACT_DIR = r"C:\Program Files\Tesseract-OCR"
 
 
+def tesseract_dir() -> str:
+    """nuarr's own copy first, the system install second.
+
+    DataDir\\tesseract is where the installer lands the bundled build and
+    where a self-update can refresh it - the same arrangement as ffmpeg. The
+    Program Files path is the dev box's hand-installed copy and any machine
+    where someone installed Tesseract themselves.
+    """
+    from .config import DATA_DIR
+    own = os.path.join(str(DATA_DIR), "tesseract")
+    if os.path.exists(os.path.join(own, "tesseract.exe")):
+        return own
+    return TESSERACT_DIR
+
+
+# ------------------------------------------------------- settings-driven ----
+# Every threshold above is the MEASURED default; these accessors let the OCR
+# settings page override them without touching the reasoning that set them.
+
+def _s(key: str, default):
+    v = getattr(SETTINGS, key, None)
+    return default if v is None else v
+
+
+def signs_max_cpm() -> float:
+    return float(_s("subocr_signs_max_cpm", SIGNS_MAX_CPM))
+
+
+def dialogue_min_cues() -> int:
+    return int(_s("subocr_dialogue_min_cues", DIALOGUE_MIN_CUES))
+
+
+def enabled_for(library: str | None) -> bool:
+    """Per-library opt-out. An empty list means every library."""
+    libs = list(_s("subocr_libraries", []) or [])
+    return (not libs) or (library in libs)
+
+
 def _tags(s: dict) -> dict:
     return s.get("tags") or {}
 
@@ -224,7 +262,7 @@ def is_signs(s: dict, minutes: float | None = None) -> tuple[bool, str]:
     # a 4K HDR film. That is the most expensive thing this system exists to
     # prevent, and it was reachable through a rounding error on cues per minute.
     n_now = cues(s)
-    if n_now is not None and (n_now / FRAMES_PER_CUE) >= DIALOGUE_MIN_CUES:
+    if n_now is not None and (n_now / FRAMES_PER_CUE) >= dialogue_min_cues():
         return False, (f"{int(n_now / FRAMES_PER_CUE)} cues - far too many to be "
                        f"signs, whatever the title says")
     if SIGNS_RE.search(_title(s)):
@@ -248,9 +286,9 @@ def is_signs(s: dict, minutes: float | None = None) -> tuple[bool, str]:
         return False, "cue count unknown - will be confirmed after OCR"
     if minutes and minutes > 0:
         cpm = (n / FRAMES_PER_CUE) / minutes
-        if cpm < SIGNS_MAX_CPM:
+        if cpm < signs_max_cpm():
             return True, (f"{cpm:.1f} cues/min over {minutes:.0f} min - below "
-                          f"the {SIGNS_MAX_CPM} dialogue floor")
+                          f"the {signs_max_cpm()} dialogue floor")
         return False, f"{n} display sets, {cpm:.1f} cues/min"
     # No duration: density cannot be computed, so fall back to the absolute
     # floor. Weaker, and the reason the floor is kept at all.
@@ -349,6 +387,9 @@ def select_targets(probe: dict) -> list[dict]:
         role = _role(s)
         if role in have_text:
             continue                 # this role is already readable as text
+        # SDH is its own switch: some people want the plain track only.
+        if role == "sdh" and not bool(_s("subocr_sdh", True)):
+            continue
         # Signs stay pictures: they are burned into the video by the encode
         # rules, and OCR of typeset signs is worthless anyway. SDH and full
         # dialogue are the ones worth reading back.
@@ -366,6 +407,12 @@ def select_targets(probe: dict) -> list[dict]:
         # 2160p HDR re-encode. Converting it costs seconds of OCR on 37 cues.
         signs, why = is_signs(s, mins)
         if signs and not never_burned:
+            continue
+        # Signs & Songs keeps its OWN switch, because it runs on its own
+        # logic: the learned title patterns and the density model above decide
+        # WHAT is signs, and this decides whether an unburnable signs track
+        # (HDR - see John Wick below) is worth converting at all.
+        if signs and not bool(_s("subocr_signs_unburned", True)):
             continue
         if signs:
             why = (f"{why} - converted anyway because nothing will burn it "
@@ -397,9 +444,10 @@ def _env() -> dict:
     passed while the thing it checked for could not be reached.
     """
     env = dict(os.environ)
-    if os.path.isdir(TESSERACT_DIR):
-        env["PATH"] = TESSERACT_DIR + os.pathsep + env.get("PATH", "")
-        td = os.path.join(TESSERACT_DIR, "tessdata")
+    tdir = tesseract_dir()
+    if os.path.isdir(tdir):
+        env["PATH"] = tdir + os.pathsep + env.get("PATH", "")
+        td = os.path.join(tdir, "tessdata")
         if os.path.isdir(td):
             env.setdefault("TESSDATA_PREFIX", td)
     return env
@@ -886,3 +934,169 @@ def run_one(path: str, probe: dict, work_root: str | None = None,
     except Exception as e:
         shutil.rmtree(work, ignore_errors=True)
         return {"ok": False, "why": f"{type(e).__name__}: {e}", "notes": notes}
+
+
+# ------------------------------------------------------------ the tool page --
+
+def status() -> dict:
+    """Everything the OCR settings page needs, without OCR'ing anything."""
+    tdir = tesseract_dir()
+    exe = os.path.join(tdir, "tesseract.exe")
+    tver = ""
+    if os.path.exists(exe):
+        rc, out = _run([exe, "--version"], timeout=20)
+        m = re.search(r"tesseract\s+v?([\w.\-]+)", out or "")
+        tver = m.group(1) if m else ""
+    pg = ""
+    try:
+        from importlib import metadata
+        pg = metadata.version("pgsrip")
+    except Exception:                                    # noqa: BLE001
+        pass
+    from .config import DATA_DIR
+    return {
+        "tesseract_dir": tdir if os.path.exists(exe) else "",
+        "tesseract_version": tver,
+        "tesseract_managed": tdir.startswith(str(DATA_DIR)),
+        "pgsrip_version": pg,
+        "ready": bool(tver and pg),
+        "auto": bool(_s("subocr_auto", True)),
+        "every_h": int(_s("subocr_every_h", 6)),
+        "batch": int(_s("subocr_batch", 20)),
+        "libraries": list(_s("subocr_libraries", []) or []),
+        "all_libraries": [l.name for l in (SETTINGS.libraries or [])],
+        "sdh": bool(_s("subocr_sdh", True)),
+        "signs_unburned": bool(_s("subocr_signs_unburned", True)),
+        "signs_max_cpm": signs_max_cpm(),
+        "dialogue_min_cues": dialogue_min_cues(),
+        "install": dict(_INSTALL),
+    }
+
+
+_INSTALL = {"state": "idle", "log": "", "error": ""}
+
+
+def pip_update_start() -> dict:
+    """Update pgsrip from the page - the Whisper pattern, for the OCR rip."""
+    import threading as _t
+    if _INSTALL["state"] == "installing":
+        return {"ok": False, "error": "already installing"}
+    _INSTALL.update(state="installing", log="", error="")
+
+    def _work():
+        import sys
+        from collections import deque
+        tail: deque = deque(maxlen=30)
+        try:
+            p = subprocess.Popen(
+                [sys.executable, "-m", "pip", "install", "--upgrade",
+                 "--prefer-binary", "--no-warn-script-location", "pgsrip"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                creationflags=NO_WINDOW)
+            for line in p.stdout:
+                if line.strip():
+                    tail.append(line.rstrip())
+                    _INSTALL["log"] = "\n".join(tail)
+            if p.wait() != 0:
+                raise RuntimeError(f"pip exited {p.returncode}")
+            import importlib
+            importlib.invalidate_caches()
+            _INSTALL.update(state="done")
+        except Exception as e:                           # noqa: BLE001
+            _INSTALL.update(state="error",
+                            error=f"{type(e).__name__}: {str(e)[:140]}")
+    _t.Thread(target=_work, name="pgsrip-update", daemon=True).start()
+    return {"ok": True}
+
+
+# --------------------------------------------------------------- the sweep --
+# WHY THIS EXISTS: OCR used to run only when a person pressed the queue
+# button, and 2,335 files sat convertible for weeks - including the episode
+# whose signs got burned in while its dialogue PGS stayed pictures. The rules
+# knew what to do; nothing ever asked them to do it.
+
+_SWEEP = {"last": 0.0, "queued_total": 0}
+
+
+def sweep_pick(limit: int) -> list[dict]:
+    """The next `limit` convertible files, respecting every switch."""
+    from .db import cursor
+    picked: list[dict] = []
+    with cursor() as cur:
+        rows = cur.execute(
+            "SELECT p.file_id, p.json, f.path, f.title, f.library "
+            "FROM file_probes p JOIN files f ON f.id=p.file_id "
+            "WHERE f.state NOT IN ('deleted','duplicate') "
+            "AND f.arr_file_id IS NOT NULL "
+            "AND COALESCE(f.subocr_state,'') != 'rejected' "
+            "AND f.id NOT IN (SELECT file_id FROM jobs WHERE file_id IS "
+            "NOT NULL AND state IN ('queued','running'))")
+        for r in rows:
+            if len(picked) >= limit:
+                break
+            if not enabled_for(r["library"]):
+                continue
+            try:
+                d = json.loads(r["json"])
+            except Exception:                            # noqa: BLE001
+                continue
+            if select_targets(d):
+                picked.append({"file_id": r["file_id"], "path": r["path"],
+                               "title": r["title"] or ""})
+    return picked
+
+
+async def watch() -> None:
+    """Queue OCR work on a schedule, like every other recurring job.
+
+    QUEUES, never converts inline: the jobs system owns pacing, the gate owns
+    viewers, and an OCR pass through it behaves exactly like one queued by
+    hand. The batch is deliberately modest per pass - this rewrites library
+    files, and 'slow and continuous' beats 'all 2,335 at once' on a system
+    whose whole point is not being noticed.
+    """
+    import asyncio
+
+    from . import joblog as _log, jobs, schedules
+    schedules.register(
+        "subocr", "Subtitle OCR", "Library",
+        max(1, int(_s("subocr_every_h", 6))) * 3600,
+        what="Converts image subtitles (PGS) to embedded SRT by OCR, a batch "
+             "at a time, so Plex can hand clients text instead of burning "
+             "pictures into the video. Which tracks qualify - dialogue, SDH, "
+             "signs & songs - is set per library on the Subtitle OCR page.")
+    await asyncio.sleep(240)             # let the first scan settle
+    while True:
+        try:
+            if bool(_s("subocr_auto", True)):
+                every = max(1, int(_s("subocr_every_h", 6))) * 3600
+                if time.time() - _SWEEP["last"] >= every:
+                    picked = await asyncio.to_thread(
+                        sweep_pick, int(_s("subocr_batch", 20)))
+                    n = 0
+                    for p in picked:
+                        try:
+                            j = await jobs.enqueue(p["file_id"], p["path"],
+                                                   p["title"], kind="sub_ocr",
+                                                   priority=90)
+                            if j:
+                                n += 1
+                        except Exception:                # noqa: BLE001
+                            continue
+                    _SWEEP["last"] = time.time()
+                    _SWEEP["queued_total"] += n
+                    schedules.beat("subocr",
+                                   f"queued {n} file(s)" if n
+                                   else "nothing to convert")
+                    if n:
+                        _log.log(f"subtitle OCR sweep queued {n} file(s)",
+                                 "info")
+        except Exception as e:                           # noqa: BLE001
+            joblog_mod = None
+            try:
+                from . import joblog as joblog_mod
+                joblog_mod.log(f"subtitle OCR sweep: {type(e).__name__}: {e}",
+                               "warn")
+            except Exception:                            # noqa: BLE001
+                pass
+        await asyncio.sleep(600)
