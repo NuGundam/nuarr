@@ -11135,7 +11135,7 @@ function gpuPanel(s){
     + '<table class="gputab">'
     + g('encoder (NVENC)', G.encoder_pct,
         'The engine that does the encoding. This is the one that limits how '
-        +'many encode workers are worth running — the A5000 has one.')
+        +'many encode workers are worth running — this card has one.')
     + g('decoder (NVDEC)', G.decoder_pct,
         'ffmpeg runs with -hwaccel cuda, so a re-encode decodes on the GPU '
         +'too. This is what explains a burn-in being slower than a plain '

@@ -151,8 +151,34 @@ LIMITS = {
     "audit_every_h": (1, 168, 24),
 }
 
+def _encode_hint() -> str:
+    """Named for the machine it is running on, not the one it was written on.
+
+    This string shipped saying "the A5000" to every install, because that is
+    the dev box's card - on a laptop with an RTX 3060, or a CPU-only server,
+    it read as someone else's notes. Asked from the encoder probe at serve
+    time (cached there), so it names whatever is actually doing the work.
+    """
+    try:
+        from . import encoders
+        fam = encoders.resolve("auto")[0]
+        dev = encoders.devices()
+        if fam == "nvenc":
+            gpu = dev.get("gpu_name") or "the NVIDIA GPU"
+            return (f"NVENC-bound. One encode engine on {gpu}; "
+                    f"~4 saturates it at 1080p.")
+        if fam == "cpu":
+            cpu = dev.get("cpu_name") or "the CPU"
+            return (f"CPU-bound - encoding runs on {cpu}. Every worker "
+                    f"uses several cores; raise this cautiously.")
+        label = (encoders.probe().get(fam) or {}).get("label", fam)
+        return f"Bound by {label} - one hardware encode engine, ~4 at 1080p."
+    except Exception:                                    # noqa: BLE001
+        return "Bound by the hardware encoder; ~4 saturates one engine at 1080p."
+
+
 HINTS = {
-    "encode_workers": "NVENC-bound. One engine on the A5000; ~4 saturates it at 1080p.",
+    "encode_workers": "",   # built live by _encode_hint() - see as_dict()
     "passthrough_workers": "Remux/copy only, no GPU. Limited by pool disk I/O.",
     "subocr_workers": ("Subtitle OCR. CPU-bound and single-threaded per file, "
                        "so this scales with cores, not the GPU. The commit "
@@ -275,7 +301,8 @@ class WorkerConfig:
                 "min": LIMITS[k][0],
                 "max": LIMITS[k][1],
                 "default": LIMITS[k][2],
-                "hint": HINTS[k],
+                "hint": (_encode_hint() if k == "encode_workers"
+                         else HINTS[k]),
                 "timing": k in TIMING_KEYS,
             }
             for k in LIMITS if k not in HIDDEN_KEYS
