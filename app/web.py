@@ -2768,7 +2768,7 @@ async def api_queue_eae_audio(dry_run: bool = True, limit: int = Query(200, le=3
 
     def _find():
         out = []
-        for r in _rows("SELECT p.file_id, p.json, f.path, f.title FROM file_probes p "
+        for r in _rows("SELECT p.file_id, p.json, f.path, f.title, f.library FROM file_probes p "
                        "JOIN files f ON f.id=p.file_id WHERE f.state='done' "
                        "AND f.arr_file_id IS NOT NULL"):
             if len(out) >= limit:
@@ -3973,9 +3973,9 @@ async def api_subocr_config(body: dict = Body(...)):
         "subocr_auto": lambda v: bool(v),
         "subocr_every_h": lambda v: max(1, min(168, int(v))),
         "subocr_batch": lambda v: max(1, min(500, int(v))),
-        "subocr_libraries": lambda v: [str(x) for x in (v or [])],
         "subocr_sdh": lambda v: bool(v),
         "subocr_all": lambda v: bool(v),
+        "subocr_remove_image": lambda v: bool(v),
         "subocr_signs_unburned": lambda v: bool(v),
         "subocr_signs_max_cpm": lambda v: max(0.5, min(30.0, float(v))),
         "subocr_dialogue_min_cues": lambda v: max(50, min(5000, int(v))),
@@ -3987,6 +3987,16 @@ async def api_subocr_config(body: dict = Body(...)):
                 changes[k] = cast(body[k])
             except (TypeError, ValueError):
                 return {"ok": False, "error": f"bad value for {k}"}
+    # PER LIBRARY. {"library": "Anime Shows", "subocr_sdh": false} writes into
+    # subocr_libs rather than the global default, so one shelf can differ
+    # without every other shelf freezing a copy of today's default.
+    lib = str(body.get("library") or "").strip()
+    if lib:
+        per = dict(getattr(SETTINGS, "subocr_libs", None) or {})
+        cur = dict(per.get(lib) or {})
+        cur.update(changes)
+        per[lib] = cur
+        changes = {"subocr_libs": per}
     if not changes:
         return {"ok": False, "error": "nothing to save"}
     p = _config_path()
@@ -4018,14 +4028,14 @@ def api_subocr_preview(limit: int = 25):
     """Which files the subtitle converter would take, and why. Read-only."""
     from . import subocr
     rows, files, tracks, byt = [], 0, 0, 0
-    for r in _rows("SELECT p.file_id, p.json, f.path, f.title, f.size "
+    for r in _rows("SELECT p.file_id, p.json, f.path, f.title, f.size, f.library "
                    "FROM file_probes p JOIN files f ON f.id=p.file_id "
                    "WHERE f.state NOT IN ('deleted','duplicate')"):
         try:
             d = json.loads(r["json"])
         except Exception:
             continue
-        t = subocr.select_targets(d)
+        t = subocr.select_targets(d, r["library"])
         if not t:
             continue
         files += 1
@@ -4066,7 +4076,7 @@ async def api_subocr_queue(limit: int = Query(10, le=6000), dry: int = 0,
              "AND f.id NOT IN (SELECT file_id FROM jobs WHERE file_id IS NOT "
              "NULL AND state IN ('queued','running'))")
     args = (file_id,) if file_id else ()
-    for r in _rows("SELECT p.file_id, p.json, f.path, f.title FROM file_probes p "
+    for r in _rows("SELECT p.file_id, p.json, f.path, f.title, f.library FROM file_probes p "
                    "JOIN files f ON f.id=p.file_id "
                    "WHERE f.state NOT IN ('deleted','duplicate') " + where, args):
         if len(picked) >= limit:
@@ -4075,7 +4085,7 @@ async def api_subocr_queue(limit: int = Query(10, le=6000), dry: int = 0,
             d = json.loads(r["json"])
         except Exception:
             continue
-        if subocr.select_targets(d):
+        if subocr.select_targets(d, r["library"]):
             picked.append(r)
     if dry:
         return {"dry": True, "would_queue": len(picked),
@@ -16979,7 +16989,8 @@ async function loadLangTab(){
           fmt(Object.values(((_lang.present||{})[L.name]||{}).audio||{})
               .reduce((a,b)=>a+b,0))} audio tracks scanned</span></div>
       ${open?`<div class="lcols">${block(L.name,'audio','Audio')}
-                         ${block(L.name,'subs','Subtitles')}</div>`:''}
+                         ${block(L.name,'subs','Subtitles')}</div>
+              <div id="soc_${cssId(L.name)}" class="socbox"></div>`:''}
     </div>`;}).join('')
     : '<div class="dim">no libraries configured</div>')
     + `<div style="margin-top:12px;display:flex;align-items:center;gap:10px">
@@ -16988,94 +16999,142 @@ async function loadLangTab(){
           _langDirty?'unsaved changes':'the planner is using this now'}</span>
        </div>
        <div id="langImpact" style="margin-top:8px"></div>
-       <div id="langSigns"></div>`;
+       <div class="lkind" style="padding:10px 12px;margin-top:12px">
+         <b style="color:#6fb0ff">Reading picture subtitles — when it runs</b>
+         <div class="dim" style="font-size:11px;margin:3px 0 7px">
+           Which tracks get read is set per library above. This is the pace:
+           a batch at a time, queued like any other job, so it never competes
+           with someone watching.</div>
+         <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;font-size:12px">
+           <span>every <input id="socEvery" type="number" min="1" max="168" value="6"
+             style="width:56px;font-family:var(--mono,monospace)"> h</span>
+           <span><input id="socBatch" type="number" min="1" max="500" value="20"
+             style="width:64px;font-family:var(--mono,monospace)"> files per pass</span>
+           <button onclick="socSavePace(this)">Save</button>
+           <button onclick="socRunNow(this)">Run a pass now</button>
+           <button onclick="socCount(this)">Count what qualifies</button>
+           <span id="socMsg" class="dim" style="font-size:11.5px"></span>
+         </div>
+       </div>`;
   langSignsLoad();
 }
 
-// EVERY SUBTITLE DECISION LIVES ON THIS PAGE. Reading image subs back as
-// text is a subtitle policy, not a property of the OCR engine - the engine
-// page is a tool page like MKVToolNix, and answers only "is it installed and
-// working". So the schedule, the per-library switches and the classification
-// thresholds are all here, beside the languages and the burn-in rule they
-// interact with.
-async function langSignsLoad(){
-  const el=document.getElementById('langSigns');
-  if(!el) return;
-  let s=null;
-  try{ s=await (await fetch('/api/subocr/status')).json(); }catch(e){ return; }
-  const chk=(id,on,label,why)=>`
-    <label style="display:flex;gap:9px;align-items:flex-start;padding:7px 0;cursor:pointer">
-      <input type="checkbox" id="${id}" ${on?'checked':''} style="margin-top:2px">
-      <span><b>${label}</b><div class="dim" style="font-size:11px">${why}</div></span>
-    </label>`;
-  el.innerHTML=`
-    <div class="lkind" style="padding:11px 12px;margin-top:14px">
-      <b style="color:#6fb0ff">Signs &amp; songs</b>
-      <div class="dim" style="font-size:11px;margin-top:3px">
-        Typeset signs and song captions are art, not standard subtitles: the
-        encoder <b>burns them into the picture</b> during a rebuild so they
-        render perfectly everywhere, positioning included. Which tracks count
-        as signs is decided by patterns <b>learned from this library</b>
-        (title tokens scored by log-odds over 6,271 labelled tracks — 100%
-        precision on holdout) plus a cue-density model — logic that keeps
-        growing.</div>
-      ${chk('socSigns',s.signs_unburned,
-        'When nothing will ever burn them, read them as text instead',
-        'A safety net, not the normal path: if burn-in is switched off for a library, this converts the signs track so a text version exists rather than leaving Plex to paint pictures on the CPU at playback.')}
-      <span id="lsMsg" class="dim" style="font-size:11px"></span>
-    </div>
+// EVERY SUBTITLE DECISION LIVES ON THIS PAGE, AND PER LIBRARY. Reading image
+// subs back as text is a subtitle policy, not a property of the OCR engine -
+// so it sits inside the library block it applies to, beside that library's
+// languages, exactly like the codec pages. A switch is greyed out when the
+// library contains nothing it could act on: an option that can never do
+// anything reads as a decision, and leaves you wondering why it changed
+// nothing.
+function cssId(s){ return s.replace(/[^A-Za-z0-9]/g,'_'); }
+let _socAll=null;
 
-    <div class="lkind" style="padding:11px 12px;margin-top:10px">
-      <b style="color:#6fb0ff">Image subtitles → text (OCR)</b>
-      <div class="dim" style="font-size:11px;margin-top:3px">
-        PGS tracks read back into real text and embedded as SRT, so Plex hands
-        clients text instead of painting pictures into the video. The original
-        picture track is kept, just demoted. The engine itself lives under
-        <b>Tools → Subtitle OCR</b>${s.ready?'':' — <span style="color:#e2b341">not installed yet, so nothing can be converted</span>'}.</div>
-      ${chk('socAuto',s.auto,'Convert automatically',
-        'A modest batch on a schedule, queued through the same job system as everything else — the gate still holds for viewers, and slow-and-continuous beats all-at-once on a system built to not be noticed.')}
-      <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;font-size:12px;padding-left:26px">
-        <span>every <input id="socEvery" type="number" min="1" max="168" value="${s.every_h}"
-          style="width:56px;font-family:var(--mono,monospace)"> h</span>
-        <span><input id="socBatch" type="number" min="1" max="500" value="${s.batch}"
-          style="width:64px;font-family:var(--mono,monospace)"> files per pass</span>
-        <button onclick="socRunNow(this)">Run a pass now</button>
-      </div>
-      ${chk('socSdh',s.sdh,'SDH tracks',
-        'Subtitles for the deaf and hard-of-hearing. Converted independently of the plain dialogue track — SDH is the one you want in a noisy room.')}
-      ${chk('socAll',s.all,'All kept PGS subs',
-        'The override: every English PGS track that survives the language policy above is OCR&rsquo;d — dialogue, SDH and signs alike, whatever the classification says. The result is still validated; only the decision stands down.')}
-      <div style="display:flex;gap:18px;flex-wrap:wrap;align-items:center;font-size:12px;margin:4px 0 6px">
-        <span title="Tracks below this density read as signs">signs below
-          <input id="socCpm" type="number" min="0.5" max="30" step="0.5" value="${s.signs_max_cpm}"
-            style="width:60px;font-family:var(--mono,monospace)"> cues/min</span>
-        <span title="Tracks above this many cues are dialogue whatever their title says">dialogue above
-          <input id="socMinCues" type="number" min="50" max="5000" value="${s.dialogue_min_cues}"
-            style="width:70px;font-family:var(--mono,monospace)"> cues</span>
-      </div>
-      <div class="dim" style="font-size:11px">
-        Defaults are measured on this library, not guessed — the gap between
-        signs (p90 ≈ 3.7 cues/min) and dialogue (p10 ≈ 9.6) is where the line
-        sits. Skipping is always the safe error: a skipped track stays exactly
-        as it is today.
-      </div>
-      <div style="margin-top:8px">
-        <b style="font-size:12px">Libraries</b>
-        <span class="dim" style="font-size:11px">— nothing ticked means every library</span>
-        <div style="display:flex;gap:14px;flex-wrap:wrap;margin-top:5px">
-          ${(s.all_libraries||[]).map(n=>`
-            <label style="display:flex;gap:6px;align-items:center;font-size:12px;cursor:pointer">
-              <input type="checkbox" class="socLib" value="${esc(n)}"
-                ${(s.libraries||[]).indexOf(n)>=0?'checked':''}>${esc(n)}</label>`).join('')
-            || '<span class="dim" style="font-size:11.5px">no libraries configured yet</span>'}
-        </div>
-      </div>
-      <div style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-        <button onclick="socSave(this)">Save subtitle conversion</button>
-        <button onclick="socCount(this)">Count what qualifies</button>
-        <span id="socMsg" class="dim" style="font-size:11.5px"></span>
+async function langSignsLoad(){
+  try{ _socAll=await (await fetch('/api/subocr/status')).json(); }catch(e){ return; }
+  const e=document.getElementById('socEvery'), b=document.getElementById('socBatch');
+  if(e) e.value=_socAll.every_h; if(b) b.value=_socAll.batch;
+  for(const lib of Object.keys(_socAll.libraries||{})) socPaint(lib);
+}
+async function socSavePace(btn){
+  const m=document.getElementById('socMsg');
+  btn.disabled=true;
+  try{
+    const r=await (await fetch('/api/subocr/config',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({
+        subocr_every_h:parseInt(document.getElementById('socEvery').value)||6,
+        subocr_batch:parseInt(document.getElementById('socBatch').value)||20})})).json();
+    if(m){ m.style.color=r.ok?'#7fd4a3':'#e0575b'; m.textContent=r.ok?'saved':(r.error||'failed'); }
+  }catch(e){ if(m){ m.style.color='#e0575b'; m.textContent='failed'; } }
+  btn.disabled=false;
+}
+
+function socPaint(lib){
+  const host=document.getElementById('soc_'+cssId(lib));
+  if(!host||!_socAll) return;
+  const s=_socAll.libraries[lib]; if(!s) return;
+  const has=s.has||{};
+  const id=(k)=>'soc_'+cssId(lib)+'_'+k;
+  // off  = the library has none of these, so the switch can do nothing
+  const chk=(k,on,label,why,off)=>`
+    <label style="display:flex;gap:9px;align-items:flex-start;padding:6px 0;
+                  cursor:${off?'default':'pointer'};opacity:${off?0.45:1}"
+           ${off?`title="this library has none"`:''}>
+      <input type="checkbox" id="${id(k)}" ${on?'checked':''} ${off?'disabled':''}
+             onchange="socSaveLib('${esc(lib)}')" style="margin-top:2px">
+      <span><b>${label}</b>${off?' <span class="dim">— none in this library</span>':''}
+        <div class="dim" style="font-size:11px">${why}</div></span>
+    </label>`;
+  host.innerHTML=`
+    <div class="socinner">
+      <div class="sochead">Subtitle handling
+        <span class="dim">${has.image?`${fmt(has.image)} picture subtitle track(s) here —
+          ${fmt(has.dialogue)} dialogue, ${fmt(has.signs)} signs, ${fmt(has.forced)} forced`
+          :'no picture subtitle tracks in this library'}</span></div>
+
+      ${chk('auto',s.auto,'Read picture subtitles as text',
+        'PGS tracks are pictures, so Plex has to paint them into the video while you watch — which is a transcode. nuarr reads them with OCR and adds a real text version, which every client just displays. The picture track stays.',
+        !has.image)}
+
+      ${chk('sdh',s.sdh,'Also read SDH tracks',
+        'The version with speaker names and sound effects, for watching without sound. Read separately from the plain track, since they are not the same subtitles.',
+        !has.image)}
+
+      ${chk('all',s.all,'Read every picture track, not just dialogue',
+        'Ignores the sorting below and converts every English picture track kept by the language rules. The result is still checked before it is used.',
+        !has.image)}
+
+      ${chk('remove_image',s.remove_image,'Delete the picture track once text exists',
+        'Off: the picture track is kept but switched off, so it can never trigger a transcode and you can still pick it by hand. On: it is removed from the file — tidier and smaller, but it cannot be undone.',
+        !has.image)}
+
+      ${chk('signs_unburned',s.signs_unburned,'Signs &amp; songs: read as text if they cannot be burned in',
+        'Signs and song captions are artwork placed on top of the picture, so they are normally <b>painted permanently into the video</b> during a rebuild — that is the only way they look right. This is the fallback for files that are never rebuilt: read them as plain text so at least something exists, rather than leaving Plex to paint them live every time.',
+        !has.signs)}
+
+      ${has.forced?`<div style="padding:6px 0;font-size:12px">
+          <b>Forced subtitles</b> <span class="dim">— ${fmt(has.forced)} in this library</span>
+          <div class="dim" style="font-size:11px">The lines that translate a
+          scene spoken in another language. Handled exactly like signs: painted
+          into the picture when the video is rebuilt, so they always show on
+          every client. The switch above covers the files that are never
+          rebuilt.</div></div>`
+        :`<div style="padding:6px 0;font-size:12px;opacity:.45">
+          <b>Forced subtitles</b> <span class="dim">— none in this library</span></div>`}
+
+      <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;
+                  font-size:12px;margin-top:4px;${has.image?'':'opacity:.45'}">
+        <span title="Fewer captions per minute than this and a track is treated as signs">
+          signs below <input id="${id('cpm')}" type="number" min="0.5" max="30" step="0.5"
+            value="${s.signs_max_cpm}" ${has.image?'':'disabled'}
+            onchange="socSaveLib('${esc(lib)}')"
+            style="width:58px;font-family:var(--mono,monospace)"> captions/min</span>
+        <span title="More captions than this and a track is dialogue whatever it is called">
+          dialogue above <input id="${id('cues')}" type="number" min="50" max="5000"
+            value="${s.dialogue_min_cues}" ${has.image?'':'disabled'}
+            onchange="socSaveLib('${esc(lib)}')"
+            style="width:68px;font-family:var(--mono,monospace)"> captions</span>
+        <span id="${id('msg')}" class="dim" style="font-size:11px"></span>
       </div>
     </div>`;
+}
+
+async function socSaveLib(lib){
+  const id=(k)=>document.getElementById('soc_'+cssId(lib)+'_'+k);
+  const m=id('msg');
+  const body={library:lib,
+    subocr_auto:id('auto').checked,
+    subocr_sdh:id('sdh').checked,
+    subocr_all:id('all').checked,
+    subocr_remove_image:id('remove_image').checked,
+    subocr_signs_unburned:id('signs_unburned').checked,
+    subocr_signs_max_cpm:parseFloat(id('cpm').value)||6,
+    subocr_dialogue_min_cues:parseInt(id('cues').value)||500};
+  try{
+    const r=await (await fetch('/api/subocr/config',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
+    if(m){ m.style.color=r.ok?'#7fd4a3':'#e0575b'; m.textContent=r.ok?'saved':(r.error||'failed'); }
+    if(r.ok && r.libraries){ _socAll=r; }
+  }catch(e){ if(m){ m.style.color='#e0575b'; m.textContent='failed'; } }
 }
 // ---- Video / audio codec settings, per library ---------------------------
 // ONE RENDERER FOR BOTH TABS, and one that is GENERATED from the schema the
@@ -17403,27 +17462,6 @@ function socPath(what,path,note){
     <td class="dim" style="font-size:11px;padding-right:12px;white-space:nowrap">${note}</td></tr>`;
 }
 
-async function socSave(btn){
-  const m=document.getElementById('socMsg');
-  btn.disabled=true;
-  try{
-    const body={
-      subocr_auto:document.getElementById('socAuto').checked,
-      subocr_every_h:parseInt(document.getElementById('socEvery').value)||6,
-      subocr_batch:parseInt(document.getElementById('socBatch').value)||20,
-      subocr_libraries:[...document.querySelectorAll('.socLib:checked')].map(c=>c.value),
-      subocr_sdh:document.getElementById('socSdh').checked,
-      subocr_all:document.getElementById('socAll').checked,
-      subocr_signs_unburned:document.getElementById('socSigns').checked,
-      subocr_signs_max_cpm:parseFloat(document.getElementById('socCpm').value)||6,
-      subocr_dialogue_min_cues:parseInt(document.getElementById('socMinCues').value)||500};
-    const r=await (await fetch('/api/subocr/config',{method:'POST',
-      headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
-    if(m){ m.style.color=r.ok?'#7fd4a3':'#e0575b';
-           m.textContent=r.ok?'saved':(r.error||'failed'); }
-  }catch(e){ if(m){ m.style.color='#e0575b'; m.textContent='failed'; } }
-  btn.disabled=false;
-}
 async function socRunNow(btn){
   const m=document.getElementById('socMsg');
   btn.disabled=true; const old=btn.textContent; btn.textContent='queueing…';
@@ -20164,6 +20202,12 @@ _SETTINGS_CSS = """
 .ckhead a{color:var(--dim)}
 .ckhead a:hover{color:var(--acc)}
 /* Square off the header's bottom corners once a body is showing under it. */
+/* The per-library subtitle-handling block, inside the expanded library. */
+.socbox{border-top:1px solid var(--line)}
+.socinner{padding:10px 14px 12px}
+.sochead{font-weight:600;font-size:12.5px;color:#6fb0ff;margin-bottom:2px;
+  display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
+.sochead .dim{font-weight:400;font-size:11px}
 .lkind.lopen>.lkindhead{border-radius:8px 8px 0 0}
 .lkind:not(.lopen)>.lkindhead{border-bottom:0;border-radius:8px}
 /* The impact box. Deliberately the same shape as the language page's: two

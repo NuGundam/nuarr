@@ -278,7 +278,12 @@ class Settings:
     subocr_auto: bool = True             # queue conversions on a schedule
     subocr_every_h: int = 6              # hours between sweeps
     subocr_batch: int = 20               # files queued per sweep
-    subocr_libraries: list = field(default_factory=list)   # empty = all
+    # Per-library overrides, keyed by library name; anything absent follows
+    # the defaults above. See subocr._s().
+    subocr_libs: dict = field(default_factory=dict)
+    # Image subs whose text version now exists: demote them (default, and
+    # reversible) or drop them from the file entirely.
+    subocr_remove_image: bool = False
     subocr_sdh: bool = True              # convert SDH image subs too
     subocr_all: bool = False             # override: OCR every kept PGS track
     subocr_signs_unburned: bool = True   # convert signs when nothing burns them

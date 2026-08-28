@@ -661,6 +661,42 @@ def _title(s: dict) -> str:
     return (s.get("tags") or {}).get("title") or ""
 
 
+def _remove_image_subs(library: str | None) -> bool:
+    """Drop covered picture subs rather than demote them? Per library.
+
+    Read from subocr so there is ONE place this setting lives - the page that
+    offers it and the planner that acts on it cannot disagree. Imported
+    lazily: subocr imports rules for the burn mirror, and a module-level
+    import here would close the cycle.
+    """
+    try:
+        from . import subocr
+        return bool(subocr._s("subocr_remove_image", False, library))
+    except Exception:                                    # noqa: BLE001
+        return False
+
+
+def _has_text_twin(img: dict, subs: list) -> bool:
+    """Is this picture sub's job already done by a text track in the file?
+
+    Deliberately counts nuarr's OWN OCR output, unlike the redundancy rule
+    above it: that rule asks "did a human already typeset this, so is the
+    OCR pass wasted", where our own output is not independent evidence. This
+    one answers a different question - "does a readable version exist yet" -
+    for someone who has explicitly asked for the picture copy to be removed
+    once it does. Removing before the text exists would delete the only
+    subtitles in the file.
+    """
+    key = (_lang(img) or "und")[:2]
+    for s in subs:
+        if (s.get("codec_name") or "").lower() not in TEXT_SUB_CODECS:
+            continue
+        k = (_lang(s) or "und")[:2]
+        if k == key or key == "un" or k == "un":
+            return True
+    return False
+
+
 def _short(t: str, n: int = 80) -> str:
     """A track title fit to sit inside a sentence.
 
@@ -1558,14 +1594,29 @@ def decide(probe: dict, *, anime: bool = False, filename: str = "",
             unwanted.append(lang or "und")
         if keep:
             p.keep_subs.append(i)
-            if CONFIG["neutralizeKeptImageSubFlags"] and \
-               (s.get("codec_name") or "").lower() in IMAGE_SUB_CODECS and \
-               (_disp(s, "default") or _disp(s, "forced")):
-                p.clear_flags.append(i)
-                p.add("subtitle",
-                      f"stop picture subtitle {i}{_tag(lang)} switching itself on",
-                      "picture subtitles set to auto-show make Plex redraw the video "
-                      "while you watch; it stays in the list to pick")
+            if (s.get("codec_name") or "").lower() in IMAGE_SUB_CODECS:
+                # TWO WAYS TO STOP A PICTURE SUB CAUSING A TRANSCODE, and the
+                # choice is the user's. Demoting clears default/forced so Plex
+                # stops auto-showing it - safe, reversible, and the track is
+                # still there to pick by hand. Removing takes it out of the
+                # file: smaller, tidier, and irreversible, which is why it is
+                # off by default and only ever applies once the text version
+                # exists.
+                if _remove_image_subs(library) and _has_text_twin(s, subs):
+                    if i in p.keep_subs:
+                        p.keep_subs.remove(i)
+                    p.add("subtitle",
+                          f"remove picture subtitle {i}{_tag(lang)}",
+                          "the same subtitles are here as text now, and you "
+                          "asked for the picture copy to be dropped rather "
+                          "than just switched off")
+                elif CONFIG["neutralizeKeptImageSubFlags"] and \
+                        (_disp(s, "default") or _disp(s, "forced")):
+                    p.clear_flags.append(i)
+                    p.add("subtitle",
+                          f"stop picture subtitle {i}{_tag(lang)} switching itself on",
+                          "picture subtitles set to auto-show make Plex redraw the video "
+                          "while you watch; it stays in the list to pick")
 
     # DROPPING A TRACK IS WORK, AND HAS TO SAY SO.
     #

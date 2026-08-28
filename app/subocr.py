@@ -173,23 +173,87 @@ def tesseract_dir() -> str:
 # Every threshold above is the MEASURED default; these accessors let the OCR
 # settings page override them without touching the reasoning that set them.
 
-def _s(key: str, default):
+def _s(key: str, default, library: str | None = None):
+    r"""A setting, per library, falling back to the global default.
+
+    PER LIBRARY BECAUSE THE ANSWER IS. An anime shelf is the case these
+    thresholds were measured on - dense typeset signs, untitled tracks,
+    dual-audio releases - and a live-action film library shares almost none
+    of that. The overrides live in one dict keyed by library name so a
+    library that has said nothing keeps following the global default rather
+    than freezing a copy of it.
+    """
+    if library:
+        per = getattr(SETTINGS, "subocr_libs", None) or {}
+        lib = per.get(library) or {}
+        if key in lib and lib[key] is not None:
+            return lib[key]
     v = getattr(SETTINGS, key, None)
     return default if v is None else v
 
 
-def signs_max_cpm() -> float:
-    return float(_s("subocr_signs_max_cpm", SIGNS_MAX_CPM))
+# ---------------------------------------------------- what each library HAS --
+# Signs and forced switches must not be offered to a library that contains
+# neither: an option that can never do anything reads as a decision, and the
+# person is left wondering why it changes nothing. Counting them means
+# walking the probes, which is the 188 MB parse the language page was
+# rewritten to avoid - so it is done once and cached, off the request path.
+
+_KINDS: dict = {"at": 0.0, "data": {}}
+_KINDS_TTL = 900.0
 
 
-def dialogue_min_cues() -> int:
-    return int(_s("subocr_dialogue_min_cues", DIALOGUE_MIN_CUES))
+def library_track_kinds(force: bool = False) -> dict:
+    """Per library: how many image, signs, forced and dialogue subs exist."""
+    now = time.time()
+    if not force and _KINDS["data"] and (now - _KINDS["at"]) < _KINDS_TTL:
+        return dict(_KINDS["data"])
+    out: dict = {}
+    try:
+        from .db import cursor
+        with cursor() as cur:
+            rows = cur.execute(
+                "SELECT f.library, p.json FROM file_probes p "
+                "JOIN files f ON f.id=p.file_id "
+                "WHERE f.library IS NOT NULL AND f.state NOT IN "
+                "('deleted','duplicate')").fetchall()
+        for r in rows:
+            slot = out.setdefault(r["library"], {"image": 0, "signs": 0,
+                                                 "forced": 0, "dialogue": 0,
+                                                 "files": 0})
+            try:
+                d = json.loads(r["json"])
+            except Exception:                            # noqa: BLE001
+                continue
+            slot["files"] += 1
+            subs = [s for s in (d.get("streams") or [])
+                    if s.get("codec_type") == "subtitle"]
+            mins = duration_min(d)
+            for s in subs:
+                if (s.get("codec_name") or "").lower() not in IMG_CODECS:
+                    continue
+                slot["image"] += 1
+                if (s.get("disposition") or {}).get("forced"):
+                    slot["forced"] += 1
+                sg, _ = is_signs(s, mins)
+                slot["signs" if sg else "dialogue"] += 1
+    except Exception:                                    # noqa: BLE001
+        pass
+    _KINDS.update(at=now, data=out)
+    return dict(out)
+
+
+def signs_max_cpm(library: str | None = None) -> float:
+    return float(_s("subocr_signs_max_cpm", SIGNS_MAX_CPM, library))
+
+
+def dialogue_min_cues(library: str | None = None) -> int:
+    return int(_s("subocr_dialogue_min_cues", DIALOGUE_MIN_CUES, library))
 
 
 def enabled_for(library: str | None) -> bool:
-    """Per-library opt-out. An empty list means every library."""
-    libs = list(_s("subocr_libraries", []) or [])
-    return (not libs) or (library in libs)
+    """Is conversion switched on for this library at all?"""
+    return bool(_s("subocr_auto", True, library))
 
 
 def _tags(s: dict) -> dict:
@@ -231,7 +295,8 @@ def duration_min(probe: dict) -> float | None:
     return d / 60.0 if d > 0 else None
 
 
-def is_signs(s: dict, minutes: float | None = None) -> tuple[bool, str]:
+def is_signs(s: dict, minutes: float | None = None,
+             library: str | None = None) -> tuple[bool, str]:
     """Signs/songs by title OR by being too sparse to be dialogue.
 
     An unknown cue count is treated as signs - i.e. skipped. A track that
@@ -262,7 +327,7 @@ def is_signs(s: dict, minutes: float | None = None) -> tuple[bool, str]:
     # a 4K HDR film. That is the most expensive thing this system exists to
     # prevent, and it was reachable through a rounding error on cues per minute.
     n_now = cues(s)
-    if n_now is not None and (n_now / FRAMES_PER_CUE) >= dialogue_min_cues():
+    if n_now is not None and (n_now / FRAMES_PER_CUE) >= dialogue_min_cues(library):
         return False, (f"{int(n_now / FRAMES_PER_CUE)} cues - far too many to be "
                        f"signs, whatever the title says")
     if SIGNS_RE.search(_title(s)):
@@ -286,9 +351,9 @@ def is_signs(s: dict, minutes: float | None = None) -> tuple[bool, str]:
         return False, "cue count unknown - will be confirmed after OCR"
     if minutes and minutes > 0:
         cpm = (n / FRAMES_PER_CUE) / minutes
-        if cpm < signs_max_cpm():
+        if cpm < signs_max_cpm(library):
             return True, (f"{cpm:.1f} cues/min over {minutes:.0f} min - below "
-                          f"the {signs_max_cpm()} dialogue floor")
+                          f"the {signs_max_cpm(library)} dialogue floor")
         return False, f"{n} display sets, {cpm:.1f} cues/min"
     # No duration: density cannot be computed, so fall back to the absolute
     # floor. Weaker, and the reason the floor is kept at all.
@@ -334,7 +399,7 @@ def _never_burned(probe: dict) -> bool:
     return False
 
 
-def select_targets(probe: dict) -> list[dict]:
+def select_targets(probe: dict, library: str | None = None) -> list[dict]:
     """Every English image sub worth converting, in stream order.
 
     Returns each stream annotated with `rel`, its index AMONG SUBTITLE
@@ -387,10 +452,10 @@ def select_targets(probe: dict) -> list[dict]:
         role = _role(s)
         if role in have_text:
             continue                 # this role is already readable as text
-        convert_all = bool(_s("subocr_all", False))
+        convert_all = bool(_s("subocr_all", False, library))
         # SDH is its own switch: some people want the plain track only.
         if role == "sdh" and not convert_all \
-                and not bool(_s("subocr_sdh", True)):
+                and not bool(_s("subocr_sdh", True, library)):
             continue
         # Signs stay pictures: they are burned into the video by the encode
         # rules, and OCR of typeset signs is worthless anyway. SDH and full
@@ -407,7 +472,7 @@ def select_targets(probe: dict) -> list[dict]:
         # PGS track Plex selects by name whatever its disposition says. With no
         # text equivalent to offer, Plex paints it on the CPU, which is a full
         # 2160p HDR re-encode. Converting it costs seconds of OCR on 37 cues.
-        signs, why = is_signs(s, mins)
+        signs, why = is_signs(s, mins, library)
         if convert_all:
             # THE OVERRIDE: every kept English PGS becomes text, signs
             # included, even ones the encoder will also burn. The person
@@ -423,7 +488,7 @@ def select_targets(probe: dict) -> list[dict]:
             # patterns and the density model decide WHAT is signs, and this
             # decides whether an unburnable signs track (HDR - see John Wick
             # below) is worth converting at all.
-            if signs and not bool(_s("subocr_signs_unburned", True)):
+            if signs and not bool(_s("subocr_signs_unburned", True, library)):
                 continue
             if signs:
                 why = (f"{why} - converted anyway because nothing will burn "
@@ -971,17 +1036,26 @@ def status() -> dict:
         "tesseract_managed": tdir.startswith(str(DATA_DIR)),
         "pgsrip_version": pg,
         "ready": bool(tver and pg),
-        "auto": bool(_s("subocr_auto", True)),
+        "install": dict(_INSTALL),
         "every_h": int(_s("subocr_every_h", 6)),
         "batch": int(_s("subocr_batch", 20)),
-        "libraries": list(_s("subocr_libraries", []) or []),
-        "all_libraries": [l.name for l in (SETTINGS.libraries or [])],
-        "sdh": bool(_s("subocr_sdh", True)),
-        "all": bool(_s("subocr_all", False)),
-        "signs_unburned": bool(_s("subocr_signs_unburned", True)),
-        "signs_max_cpm": signs_max_cpm(),
-        "dialogue_min_cues": dialogue_min_cues(),
-        "install": dict(_INSTALL),
+        # Per library: the effective settings, plus what that library
+        # actually CONTAINS, so the page can grey out a switch that could
+        # never do anything there.
+        "libraries": {
+            l.name: {
+                "auto": bool(_s("subocr_auto", True, l.name)),
+                "sdh": bool(_s("subocr_sdh", True, l.name)),
+                "all": bool(_s("subocr_all", False, l.name)),
+                "signs_unburned": bool(_s("subocr_signs_unburned", True, l.name)),
+                "remove_image": bool(_s("subocr_remove_image", False, l.name)),
+                "signs_max_cpm": signs_max_cpm(l.name),
+                "dialogue_min_cues": dialogue_min_cues(l.name),
+                "has": (library_track_kinds().get(l.name)
+                        or {"image": 0, "signs": 0, "forced": 0,
+                            "dialogue": 0, "files": 0}),
+            } for l in (SETTINGS.libraries or [])
+        },
     }
 
 
@@ -1052,7 +1126,7 @@ def sweep_pick(limit: int) -> list[dict]:
                 d = json.loads(r["json"])
             except Exception:                            # noqa: BLE001
                 continue
-            if select_targets(d):
+            if select_targets(d, r["library"]):
                 picked.append({"file_id": r["file_id"], "path": r["path"],
                                "title": r["title"] or ""})
     return picked
