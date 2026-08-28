@@ -16888,6 +16888,12 @@ async function libRemove(n64,files){
 
 // ---- Languages: which tracks survive, per library ------------------------
 let _lang=null, _langDirty=false, _langLoading=false;
+const _langOpen = new Set();
+function langToggle_open(lib){
+  _langOpen.has(lib) ? _langOpen.delete(lib) : _langOpen.add(lib);
+  loadLangTab();
+}
+
 async function loadLangTab(){
   const el=document.getElementById('langBody');
   if(!el) return;
@@ -16951,16 +16957,30 @@ async function loadLangTab(){
   };
 
   const libs=_lang.libraries||[];
-  el.innerHTML = (libs.length ? libs.map(L=>`
-    <div class="lkind">
-      <div class="lkindhead">${esc(L.name)}
+  // COLLAPSED BY DEFAULT, like the codec pages. Six libraries of language
+  // chips is a wall; the header carries the summary and you open the one you
+  // came for. _langOpen lives outside _lang so reloading the data does not
+  // close what you opened.
+  el.innerHTML = (libs.length ? libs.map(L=>{
+    const open=_langOpen.has(L.name);
+    const kept=(side)=>{
+      const c=((pol[L.name]||{})[side])||{};
+      const n=(c.langs||[]).length;
+      return n + (c.keep_original?' + original':'');
+    };
+    return `<div class="lkind${open?' lopen':''}">
+      <div class="lkindhead ckhead" onclick="langToggle_open('${esc(L.name)}')"
+           title="${open?'collapse':'expand'} ${esc(L.name)}">
+        <span class="ccaret">${open?'▾':'▸'}</span>
+        <span class="clib">${esc(L.name)}</span>
         <span class="dim">defaults for ${esc(L.kind_label.toLowerCase())}</span>
-        <span class="dim" style="margin-left:auto">${
+        <span class="dim" style="margin-left:auto">audio ${kept('audio')} ·
+          subtitles ${kept('subs')} · ${
           fmt(Object.values(((_lang.present||{})[L.name]||{}).audio||{})
               .reduce((a,b)=>a+b,0))} audio tracks scanned</span></div>
-      <div class="lcols">${block(L.name,'audio','Audio')}
-                         ${block(L.name,'subs','Subtitles')}</div>
-    </div>`).join('')
+      ${open?`<div class="lcols">${block(L.name,'audio','Audio')}
+                         ${block(L.name,'subs','Subtitles')}</div>`:''}
+    </div>`;}).join('')
     : '<div class="dim">no libraries configured</div>')
     + `<div style="margin-top:12px;display:flex;align-items:center;gap:10px">
         <button onclick="langSave()">Save policy</button>
@@ -16972,45 +16992,90 @@ async function loadLangTab(){
   langSignsLoad();
 }
 
-// Signs & songs live HERE, with the subtitle policy - they are typeset art
-// the encoder burns into the picture, not standard subtitles OCR can be
-// trusted with, so the OCR page is the wrong home for their switch.
+// EVERY SUBTITLE DECISION LIVES ON THIS PAGE. Reading image subs back as
+// text is a subtitle policy, not a property of the OCR engine - the engine
+// page is a tool page like MKVToolNix, and answers only "is it installed and
+// working". So the schedule, the per-library switches and the classification
+// thresholds are all here, beside the languages and the burn-in rule they
+// interact with.
 async function langSignsLoad(){
   const el=document.getElementById('langSigns');
   if(!el) return;
   let s=null;
   try{ s=await (await fetch('/api/subocr/status')).json(); }catch(e){ return; }
+  const chk=(id,on,label,why)=>`
+    <label style="display:flex;gap:9px;align-items:flex-start;padding:7px 0;cursor:pointer">
+      <input type="checkbox" id="${id}" ${on?'checked':''} style="margin-top:2px">
+      <span><b>${label}</b><div class="dim" style="font-size:11px">${why}</div></span>
+    </label>`;
   el.innerHTML=`
-    <div class="lkind" style="padding:11px 12px;margin-top:12px">
+    <div class="lkind" style="padding:11px 12px;margin-top:14px">
       <b style="color:#6fb0ff">Signs &amp; songs</b>
       <div class="dim" style="font-size:11px;margin-top:3px">
         Typeset signs and song captions are art, not standard subtitles: the
         encoder <b>burns them into the picture</b> during a rebuild so they
-        render perfectly everywhere. Which tracks count as signs is decided by
-        patterns <b>learned from this library</b> (title tokens scored by
-        log-odds over 6,271 labelled tracks — 100% precision on holdout) plus
-        a cue-density model — logic that keeps growing.</div>
-      <label style="display:flex;gap:9px;align-items:flex-start;padding:8px 0 0;cursor:pointer">
-        <input type="checkbox" id="lsUnburned" ${s.signs_unburned?'checked':''}
-          onchange="langSignsSave(this)" style="margin-top:2px">
-        <span><b>When nothing will ever burn them, convert to text instead</b>
-        <div class="dim" style="font-size:11px">
-          On files nuarr never re-encodes (HDR), burn-in never happens — and
-          Plex would paint the pictures on the CPU at every play, a full
-          re-encode of a 4K film. This OCRs those few tracks so a text
-          version exists. Off: they stay pictures everywhere.</div></span>
-      </label>
+        render perfectly everywhere, positioning included. Which tracks count
+        as signs is decided by patterns <b>learned from this library</b>
+        (title tokens scored by log-odds over 6,271 labelled tracks — 100%
+        precision on holdout) plus a cue-density model — logic that keeps
+        growing.</div>
+      ${chk('socSigns',s.signs_unburned,
+        'When nothing will ever burn them, read them as text instead',
+        'A safety net, not the normal path: if burn-in is switched off for a library, this converts the signs track so a text version exists rather than leaving Plex to paint pictures on the CPU at playback.')}
       <span id="lsMsg" class="dim" style="font-size:11px"></span>
+    </div>
+
+    <div class="lkind" style="padding:11px 12px;margin-top:10px">
+      <b style="color:#6fb0ff">Image subtitles → text (OCR)</b>
+      <div class="dim" style="font-size:11px;margin-top:3px">
+        PGS tracks read back into real text and embedded as SRT, so Plex hands
+        clients text instead of painting pictures into the video. The original
+        picture track is kept, just demoted. The engine itself lives under
+        <b>Tools → Subtitle OCR</b>${s.ready?'':' — <span style="color:#e2b341">not installed yet, so nothing can be converted</span>'}.</div>
+      ${chk('socAuto',s.auto,'Convert automatically',
+        'A modest batch on a schedule, queued through the same job system as everything else — the gate still holds for viewers, and slow-and-continuous beats all-at-once on a system built to not be noticed.')}
+      <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;font-size:12px;padding-left:26px">
+        <span>every <input id="socEvery" type="number" min="1" max="168" value="${s.every_h}"
+          style="width:56px;font-family:var(--mono,monospace)"> h</span>
+        <span><input id="socBatch" type="number" min="1" max="500" value="${s.batch}"
+          style="width:64px;font-family:var(--mono,monospace)"> files per pass</span>
+        <button onclick="socRunNow(this)">Run a pass now</button>
+      </div>
+      ${chk('socSdh',s.sdh,'SDH tracks',
+        'Subtitles for the deaf and hard-of-hearing. Converted independently of the plain dialogue track — SDH is the one you want in a noisy room.')}
+      ${chk('socAll',s.all,'All kept PGS subs',
+        'The override: every English PGS track that survives the language policy above is OCR&rsquo;d — dialogue, SDH and signs alike, whatever the classification says. The result is still validated; only the decision stands down.')}
+      <div style="display:flex;gap:18px;flex-wrap:wrap;align-items:center;font-size:12px;margin:4px 0 6px">
+        <span title="Tracks below this density read as signs">signs below
+          <input id="socCpm" type="number" min="0.5" max="30" step="0.5" value="${s.signs_max_cpm}"
+            style="width:60px;font-family:var(--mono,monospace)"> cues/min</span>
+        <span title="Tracks above this many cues are dialogue whatever their title says">dialogue above
+          <input id="socMinCues" type="number" min="50" max="5000" value="${s.dialogue_min_cues}"
+            style="width:70px;font-family:var(--mono,monospace)"> cues</span>
+      </div>
+      <div class="dim" style="font-size:11px">
+        Defaults are measured on this library, not guessed — the gap between
+        signs (p90 ≈ 3.7 cues/min) and dialogue (p10 ≈ 9.6) is where the line
+        sits. Skipping is always the safe error: a skipped track stays exactly
+        as it is today.
+      </div>
+      <div style="margin-top:8px">
+        <b style="font-size:12px">Libraries</b>
+        <span class="dim" style="font-size:11px">— nothing ticked means every library</span>
+        <div style="display:flex;gap:14px;flex-wrap:wrap;margin-top:5px">
+          ${(s.all_libraries||[]).map(n=>`
+            <label style="display:flex;gap:6px;align-items:center;font-size:12px;cursor:pointer">
+              <input type="checkbox" class="socLib" value="${esc(n)}"
+                ${(s.libraries||[]).indexOf(n)>=0?'checked':''}>${esc(n)}</label>`).join('')
+            || '<span class="dim" style="font-size:11.5px">no libraries configured yet</span>'}
+        </div>
+      </div>
+      <div style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <button onclick="socSave(this)">Save subtitle conversion</button>
+        <button onclick="socCount(this)">Count what qualifies</button>
+        <span id="socMsg" class="dim" style="font-size:11.5px"></span>
+      </div>
     </div>`;
-}
-async function langSignsSave(box){
-  const m=document.getElementById('lsMsg');
-  try{
-    const r=await (await fetch('/api/subocr/config',{method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({subocr_signs_unburned:box.checked})})).json();
-    if(m){ m.style.color=r.ok?'#7fd4a3':'#e0575b'; m.textContent=r.ok?'saved':'failed'; }
-  }catch(e){ if(m){ m.style.color='#e0575b'; m.textContent='failed'; } }
 }
 // ---- Video / audio codec settings, per library ---------------------------
 // ONE RENDERER FOR BOTH TABS, and one that is GENERATED from the schema the
@@ -17275,11 +17340,6 @@ async function loadSubocr(){
   const engineLine = s.ready
     ? `<span style="color:#7fd4a3">ready — Tesseract ${esc(s.tesseract_version)} · pgsrip ${esc(s.pgsrip_version)}</span>`
     : `<span style="color:#e2b341">${!s.tesseract_version?'Tesseract not found':'pgsrip not installed'} — conversion cannot run</span>`;
-  const chk=(id,on,label,why)=>`
-    <label style="display:flex;gap:9px;align-items:flex-start;padding:8px 0;cursor:pointer">
-      <input type="checkbox" id="${id}" ${on?'checked':''} style="margin-top:2px">
-      <span><b>${label}</b><div class="dim" style="font-size:11px">${why}</div></span>
-    </label>`;
   el.innerHTML=`
     <div class="lkind" style="padding:11px 12px">
       <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:baseline">
@@ -17298,59 +17358,49 @@ async function loadSubocr(){
       </div>
     </div>
 
-    <div class="lkind" style="padding:11px 12px">
-      <b style="color:#6fb0ff">When it runs</b>
-      ${chk('socAuto',s.auto,'Convert automatically',
-        'A modest batch on a schedule, queued through the same job system as everything else — the gate still holds for viewers, and slow-and-continuous beats all-at-once on a system built to not be noticed.')}
-      <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;font-size:12px;padding-left:26px">
-        <span>every <input id="socEvery" type="number" min="1" max="168" value="${s.every_h}"
-          style="width:56px;font-family:var(--mono,monospace)"> h</span>
-        <span><input id="socBatch" type="number" min="1" max="500" value="${s.batch}"
-          style="width:64px;font-family:var(--mono,monospace)"> files per pass</span>
-        <button onclick="socRunNow(this)">Run a pass now</button>
-      </div>
+    <div class="lkind"><div class="lkindhead"><b style="color:#6fb0ff">What is installed</b></div>
+      <table style="width:100%;font-size:12px;border-collapse:collapse">
+        ${socRow('Tesseract', s.tesseract_version||'—', 'the OCR engine that reads the pictures')}
+        ${socRow('pgsrip', s.pgsrip_version||'—', 'drives Tesseract over a PGS stream and writes SRT')}
+      </table>
     </div>
 
-    <div class="lkind" style="padding:11px 12px">
-      <b style="color:#6fb0ff">Libraries</b>
-      <div class="dim" style="font-size:11px;margin-top:3px">Nothing ticked means every library.</div>
-      <div style="display:flex;gap:14px;flex-wrap:wrap;margin-top:6px">
-        ${(s.all_libraries||[]).map(n=>`
-          <label style="display:flex;gap:6px;align-items:center;font-size:12px;cursor:pointer">
-            <input type="checkbox" class="socLib" value="${esc(n)}"
-              ${(s.libraries||[]).indexOf(n)>=0?'checked':''}>${esc(n)}</label>`).join('')
-          || '<span class="dim" style="font-size:11.5px">no libraries configured yet</span>'}
-      </div>
+    <div class="lkind" style="margin-top:10px">
+      <div class="lkindhead"><b style="color:#6fb0ff">Where everything is</b>
+        <span class="dim">resolved live — for when OCR stops working and the log does not say why</span></div>
+      <table style="width:100%;font-size:12px;border-collapse:collapse">
+        ${socPath('Tesseract', s.tesseract_dir,
+          s.tesseract_managed?'nuarr&rsquo;s own copy, replaced on every install'
+                              :'a system install of Tesseract')}
+        ${socPath('tessdata', s.tesseract_dir?(s.tesseract_dir+'\\\\tessdata'):'',
+          'the language models Tesseract reads')}
+      </table>
     </div>
 
-    <div class="lkind" style="padding:11px 12px">
-      <b style="color:#6fb0ff">What gets converted</b>
-      ${chk('socSdh',s.sdh,'SDH tracks',
-        'Subtitles for the deaf and hard-of-hearing. Converted independently of the plain dialogue track — SDH is the one you want in a noisy room.')}
-      ${chk('socAll',s.all,'All kept PGS subs',
-        'The override: every English PGS track that survives the subtitle policy is OCR&rsquo;d — dialogue, SDH and signs alike, whatever the classification below says. The result is still validated; only the decision stands down. Signs &amp; songs handling itself lives on the <b>Subtitles</b> page, with the burn-in policy it belongs to.')}
-      <div style="display:flex;gap:18px;flex-wrap:wrap;align-items:center;font-size:12px;margin-top:2px">
-        <span title="Tracks below this density read as signs">signs below
-          <input id="socCpm" type="number" min="0.5" max="30" step="0.5" value="${s.signs_max_cpm}"
-            style="width:60px;font-family:var(--mono,monospace)"> cues/min</span>
-        <span title="Tracks above this many cues are dialogue whatever their title says">dialogue above
-          <input id="socMinCues" type="number" min="50" max="5000" value="${s.dialogue_min_cues}"
-            style="width:70px;font-family:var(--mono,monospace)"> cues</span>
+    <div class="lkind" style="padding:11px 12px;margin-top:10px">
+      <b style="color:#6fb0ff">What uses this</b>
+      <div class="dim" style="font-size:11px;margin-top:4px">
+        Reading image subtitles back as text is a <b>subtitle policy</b>, not a
+        property of the engine — which tracks qualify, per library, on what
+        schedule, all live with the languages and the burn-in rule.
+        <div style="margin-top:7px"><button onclick="wtab('lang')">Open Subtitles settings</button></div>
       </div>
-      <div class="dim" style="font-size:11px;margin-top:6px">
-        Defaults are measured on this library, not guessed — the gap between
-        signs (p90 ≈ 3.7 cues/min) and dialogue (p10 ≈ 9.6) is where the line
-        sits. Skipping is always the safe error: a skipped track stays exactly
-        as it is today.
-      </div>
-    </div>
-
-    <div style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-      <button onclick="socSave(this)">Save</button>
-      <button onclick="socCount(this)">Count what qualifies</button>
-      <span id="socMsg" class="dim" style="font-size:11.5px"></span>
     </div>`;
   if(inst.state==='installing') setTimeout(loadSubocr, 3000);
+}
+function socRow(k,v,why){
+  return `<tr style="border-top:1px solid var(--line)">
+    <td style="padding:5px 12px;white-space:nowrap">${esc(k)}</td>
+    <td class="mono" style="white-space:nowrap">${esc(String(v))}</td>
+    <td class="dim" style="font-size:11px;padding-right:12px">${why}</td></tr>`;
+}
+function socPath(what,path,note){
+  const ok=!!path;
+  return `<tr style="border-top:1px solid var(--line)">
+    <td style="padding:5px 12px;white-space:nowrap">
+      <span style="color:${ok?'#7fd4a3':'#e0575b'}">${ok?'✓':'✗'}</span> ${esc(what)}</td>
+    <td class="mono" style="font-size:11px;word-break:break-all">${esc(path||'(not installed)')}</td>
+    <td class="dim" style="font-size:11px;padding-right:12px;white-space:nowrap">${note}</td></tr>`;
 }
 
 async function socSave(btn){
@@ -17364,6 +17414,7 @@ async function socSave(btn){
       subocr_libraries:[...document.querySelectorAll('.socLib:checked')].map(c=>c.value),
       subocr_sdh:document.getElementById('socSdh').checked,
       subocr_all:document.getElementById('socAll').checked,
+      subocr_signs_unburned:document.getElementById('socSigns').checked,
       subocr_signs_max_cpm:parseFloat(document.getElementById('socCpm').value)||6,
       subocr_dialogue_min_cues:parseInt(document.getElementById('socMinCues').value)||500};
     const r=await (await fetch('/api/subocr/config',{method:'POST',

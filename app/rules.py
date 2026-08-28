@@ -131,7 +131,24 @@ CONFIG: dict[str, Any] = {
     "keepUndeterminedSubs": True,
     "burnEnabled": True,
     "removeBurnedSub": True,
-    "burnOnHDR": False,
+    # WAS False, ON A PREMISE THAT WAS NEVER TRUE. The reasoning was
+    # "burning forces a re-encode and re-encoding destroys HDR" - but an
+    # encode only loses HDR when nobody tells it not to. nuarr now states the
+    # colour tags explicitly and re-emits the mastering-display and
+    # content-light metadata (encoders.hdr_args), so an HDR burn comes out
+    # tagged PQ/BT.2020 with its HDR10 blocks intact.
+    #
+    # What that false premise COST: on an HDR file nothing was ever burned,
+    # so the signs track stayed pictures - and because subocr skipped signs
+    # on the grounds that "the encoder will burn them", no text version was
+    # made either. Plex then painted the pictures on the CPU at playback,
+    # which is a full 4K HDR transcode: the single most expensive outcome
+    # this system exists to prevent, reached by trying to protect HDR.
+    #
+    # Dolby Vision is the real exception and is handled separately: its RPU
+    # cannot survive any re-encode, so a DV file burns as its HDR10 base
+    # layer - the same thing the strip-DV rule produces on purpose.
+    "burnOnHDR": True,
     # Burning redraws pixels -> forces a full re-encode. With this ON, signs are
     # burned only when the video is being re-encoded anyway.
     "burnOnlyWhenEncoding": True,
@@ -885,7 +902,11 @@ def describe() -> dict:
                 "work burned in. Skipped entirely when an English text sub "
                 "already exists"},
             {"k": "burn on HDR", "both": yn(C["burnOnHDR"])
-                + " - burning forces a re-encode and HDR must not be re-encoded"},
+                + " - the colour tags and the HDR10 mastering-display and "
+                  "content-light metadata are re-stated on the output, so the "
+                  "re-encode keeps its HDR. Dolby Vision's per-frame layer "
+                  "cannot survive any encode, so a DV file burns as its HDR10 "
+                  "base layer - what the strip-DV rule produces anyway"},
         ],
         "safety": [
             {"k": "output duration", "both":
@@ -1669,8 +1690,8 @@ def decide(probe: dict, *, anime: bool = False, filename: str = "",
                        or not CONFIG["burnOnlyWhenEncoding"])
             if hdr and not CONFIG["burnOnHDR"]:
                 p.add("subtitle", f"leave the signs on subtitle {real} as they are",
-                      "painting subtitles in means rebuilding the picture, which would "
-                      "spoil the HDR")
+                      "burning is switched off for HDR files here, so the signs "
+                      "stay a separate track")
             elif allowed:
                 p.burn_index = real
                 p.burn_image = is_image

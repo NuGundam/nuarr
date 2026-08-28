@@ -236,6 +236,95 @@ def video_args(family: str, target: str, cq: int, preset: str,
     return a
 
 
+def _rational(v, scale: float) -> int | None:
+    """ffprobe writes these as '34000/50000'. Return them in x265's units."""
+    try:
+        s = str(v)
+        if "/" in s:
+            a, b = s.split("/", 1)
+            f = float(a) / float(b)
+        else:
+            f = float(s)
+        return int(round(f * scale))
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
+def hdr_args(vstream: dict, family: str) -> list[str]:
+    r"""Carry HDR through a re-encode, instead of assuming it cannot survive.
+
+    WHY THIS EXISTS. nuarr refused to burn subtitles into HDR video on the
+    grounds that "re-encoding HDR loses the metadata". That is only true of an
+    encode that says nothing about colour: ffmpeg tags the output from the
+    DECODER's frames, and any filter in the chain - overlay, subtitles, a
+    format conversion - can hand the encoder frames whose tags have been
+    normalised away. The result is a picture whose pixels are still PQ but
+    whose container says BT.709, which a player renders as washed-out grey.
+    That is the failure everyone means by "it lost the HDR", and it is a
+    missing flag, not a law of physics.
+
+    So: the colour tags are stated EXPLICITLY on the output, and the two
+    static HDR10 metadata blocks - mastering display and content light - are
+    re-stated for libx265, which will not write them otherwise. NVENC takes
+    them from frame side data itself once the tags are right.
+
+    WHAT IS STILL LOST is the Dolby Vision RPU: it is a per-frame enhancement
+    layer no encoder here can regenerate. nuarr already strips DV to HDR10 on
+    copy for exactly that reason, and a DV file that gets burned comes out as
+    the HDR10 base layer - which is what its own strip_dv rule would have
+    produced anyway.
+    """
+    trc = (vstream.get("color_transfer") or "").lower()
+    if trc not in ("smpte2084", "arib-std-b67"):
+        return []
+    a: list[str] = []
+    for flag, key in (("-color_primaries", "color_primaries"),
+                      ("-color_trc", "color_transfer"),
+                      ("-colorspace", "color_space")):
+        val = vstream.get(key)
+        if val:
+            a += [flag, str(val)]
+    rng = vstream.get("color_range")
+    if rng:
+        a += ["-color_range", str(rng)]
+    if family != "cpu":
+        # NVENC/QSV/AMF write the HDR10 SEI from the frame's own side data;
+        # the tags above are what they were missing.
+        return a
+    # libx265 needs it spelled out, in its own units: chromaticities in
+    # 0.00002 steps, luminance in 0.0001 cd/m2.
+    md = cll = ""
+    for sd in (vstream.get("side_data_list") or []):
+        t = (sd.get("side_data_type") or "").lower()
+        if "mastering display" in t:
+            g = (_rational(sd.get("green_x"), 50000),
+                 _rational(sd.get("green_y"), 50000))
+            b = (_rational(sd.get("blue_x"), 50000),
+                 _rational(sd.get("blue_y"), 50000))
+            r = (_rational(sd.get("red_x"), 50000),
+                 _rational(sd.get("red_y"), 50000))
+            w = (_rational(sd.get("white_point_x"), 50000),
+                 _rational(sd.get("white_point_y"), 50000))
+            lmax = _rational(sd.get("max_luminance"), 10000)
+            lmin = _rational(sd.get("min_luminance"), 10000)
+            if all(x is not None for x in g + b + r + w) \
+                    and lmax is not None and lmin is not None:
+                md = (f"G({g[0]},{g[1]})B({b[0]},{b[1]})R({r[0]},{r[1]})"
+                      f"WP({w[0]},{w[1]})L({lmax},{lmin})")
+        elif "content light" in t:
+            try:
+                cll = f"{int(sd['max_content'])},{int(sd['max_average'])}"
+            except (KeyError, TypeError, ValueError):
+                pass
+    params = ["hdr-opt=1", "repeat-headers=1"]
+    if md:
+        params.append(f"master-display={md}")
+    if cll:
+        params.append(f"max-cll={cll}")
+    a += ["-x265-params", ":".join(params)]
+    return a
+
+
 def decode_args(family: str, want_hw: bool) -> list[str]:
     r"""Input-side hardware decode flags.
 

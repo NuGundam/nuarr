@@ -3046,7 +3046,7 @@ async def _transcode(w: Worker, probe_data: dict) -> None:
                    f"{type(e).__name__}: {e}", "warn", job.id)
         _sub_task = None
 
-    cmd = build_ffmpeg(job.path, out, job.plan, w.duration)
+    cmd = build_ffmpeg(job.path, out, job.plan, w.duration, probe_data)
     joblog.log("ffmpeg " + " ".join(shlex.quote(c) for c in cmd[1:]), "debug", job.id)
 
     proc = await asyncio.create_subprocess_exec(
@@ -4116,7 +4116,8 @@ def _mkv_sub_tracks(src: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------- ffmpeg ---
-def build_ffmpeg(src: str, dst: str, plan, duration: float) -> list[str]:
+def build_ffmpeg(src: str, dst: str, plan, duration: float,
+                 probe: dict | None = None) -> list[str]:
     """Translate a plan into an ffmpeg command.
 
     Deliberately explicit rather than clever: the exact command is written to
@@ -4210,6 +4211,18 @@ def build_ffmpeg(src: str, dst: str, plan, duration: float) -> list[str]:
                   "-rc", "vbr", "-cq", str(tgt["cq"])]
             if ten:
                 a += ["-pix_fmt", "p010le", "-profile:v", "main10"]
+        # HDR SURVIVES THE ENCODE - it just has to be told to. Without these
+        # the output carries PQ pixels under BT.709 tags and every player
+        # renders it washed out, which is what "re-encoding loses the HDR"
+        # always actually meant. See encoders.hdr_args.
+        try:
+            from . import encoders as _enc2
+            vs = next((s for s in (probe or {}).get("streams", [])
+                       if s.get("codec_type") == "video"), None)
+            if vs:
+                a += _enc2.hdr_args(vs, _fam)
+        except Exception:                                # noqa: BLE001
+            pass
         # CAP THE BITRATE AGAINST THE SOURCE.
         # The plugin does this and I had omitted it: a CQ encode of an already
         # efficient source balloons, because NVENC needs more bits than x264 for
