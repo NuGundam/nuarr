@@ -905,8 +905,19 @@ async def scan(full: bool = True, probe_orphans: bool = True,
                 n = os.path.normcase(os.path.normpath(p))
                 return any(n.startswith(b + os.sep) for b in scope)
 
+            # THE LIBRARIES ARE THE BOUNDARY. An arr usually manages more
+            # roots than nuarr was given - a one-library install against a
+            # ten-root Sonarr used to inherit all ten as "(outside configured
+            # libraries)" rows, and the dashboard read like nuarr managed the
+            # lot. Files outside every configured root are counted and
+            # logged, never inserted: adding the library is the way to opt
+            # its files in.
+            outside_n = 0
             for af in arr_files:
                 if not af.path or not in_scope(af.path) or is_excluded(af.path):
+                    continue
+                if _library_of(af.path) == OUTSIDE:
+                    outside_n += 1
                     continue
                 key = os.path.normcase(af.path)
                 matched_paths.add(key)
@@ -1138,6 +1149,26 @@ async def scan(full: bool = True, probe_orphans: bool = True,
                                       for a in enabled)
             trustworthy = full and arrs_ok and rep.disks > 0 and rep.on_disk > 0
 
+            # Rows from before the library boundary existed - arr files
+            # outside every configured root, inherited by older databases.
+            # Bookkeeping rows only, so deleting them touches no media; left
+            # in place they would all flip to "missing" the moment the sweep
+            # below runs, which is a worse lie than absence.
+            stale_outside = [r["id"] for r in rows
+                             if r["id"] not in seen_ids
+                             and r["path"]
+                             and _library_of(r["path"]) == OUTSIDE]
+            if stale_outside:
+                cur.executemany("DELETE FROM files WHERE id=?",
+                                [(i,) for i in stale_outside])
+            if outside_n or stale_outside:
+                joblog.log(
+                    f"outside configured libraries: {outside_n} arr file(s) "
+                    f"not managed"
+                    + (f", {len(stale_outside)} old row(s) cleaned up"
+                       if stale_outside else "")
+                    + " - add the library to opt them in", "info")
+
             if full and not trustworthy:
                 rep.sweep_skipped = (
                     f"missing-sweep skipped: arrs_ok={bool(arrs_ok)} "
@@ -1145,7 +1176,8 @@ async def scan(full: bool = True, probe_orphans: bool = True,
                 )
 
             if trustworthy:
-                gone = {r["id"] for r in rows} - seen_ids
+                gone = ({r["id"] for r in rows} - seen_ids
+                        - set(stale_outside))
 
                 # SUPERSEDED, NOT MISSING.
                 # When an arr re-imports a file it issues a NEW file id. Identity is

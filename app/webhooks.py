@@ -298,6 +298,12 @@ async def _sync_file(cfg, file_id: int, parent_id: int | None, why: str,
         if scanner.is_excluded(path):
             joblog.log(f"webhook ignored (excluded path): {path}", "debug")
             return
+        # Same boundary the scan enforces: an arr managing roots nuarr was
+        # never given must not grow the database through the webhook door.
+        if scanner._library_of(path) == scanner.OUTSIDE:
+            joblog.log(f"webhook ignored (outside configured libraries): "
+                       f"{path}", "debug")
+            return
         size = rec.get("size") or 0
         # Coerce by TYPE at each level. Neither .get(k, {}) nor `or {}` is a
         # guard here: the first only substitutes when the key is missing, the
