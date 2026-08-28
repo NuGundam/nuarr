@@ -190,7 +190,13 @@ def _subocr_hint() -> str:
         libs = {l.name for l in (SETTINGS.libraries or [])}
         engines = {subocr.engine(n) for n in libs} or {"tesseract"}
         if engines == {"paddle"}:
-            dev = "GPU" if subocr.paddle_info().get("cuda") else "CPU"
+            # CACHED ONLY. paddle_info() starts a Python and imports several
+            # hundred megabytes of native code to answer honestly - fine on
+            # the OCR page, wrong here: this hint is built on every /api/
+            # workers poll, so a cold cache meant spawning that process every
+            # few seconds behind the dashboard.
+            cached = subocr._PADDLE_CACHE.get("data") or {}
+            dev = "GPU" if cached.get("cuda") else "CPU"
             if dev == "GPU":
                 return ("Subtitle OCR, reading with PaddleOCR on the GPU. "
                         "Bound by the card, not by cores - a couple of workers "

@@ -11111,7 +11111,15 @@ function renderSelfUse(s){
   const busyElsewhere=!onCard && (G.encoder_pct>=1 || (G.procs||[]).length>0);
   const gb2=document.querySelector('#suGpuBtn b');
   if(gb2){
-    const e = G.name==null ? null : (onCard ? (G.encoder_pct||0) : 0);
+    // NVENC IS NO LONGER THE ONLY WAY NUARR USES THIS CARD. When the encoder
+    // was the sole reason to be on the GPU, reporting encoder_pct was the
+    // honest number. PaddleOCR and Whisper run on the CUDA cores instead, so
+    // that rule started printing "0% gpu" beside a card sitting at 30% doing
+    // nuarr's own OCR. With a nuarr process on the card the chip now reports
+    // the busiest engine nuarr could be driving; with none, it still reports
+    // zero and shows the dot for whatever else is running.
+    const e = G.name==null ? null
+            : (onCard ? Math.max(G.encoder_pct||0, G.gpu_pct||0) : 0);
     gb2.firstChild.nodeValue = (e==null?'—':Math.round(e)+'%');
     gb2.style.color = e==null ? ''
       : (e>=90?'var(--bad)':e>=50?'var(--warn)':'var(--ok)');
@@ -11122,8 +11130,10 @@ function renderSelfUse(s){
     gbtn.title = busyElsewhere
       ? `nuarr is not using the GPU — something else is (encoder ${
           Math.round(G.encoder_pct||0)}%). Click for what.`
-      : (onCard ? 'nuarr\'s GPU use — click for the card\'s engines'
-                : 'nuarr\'s GPU use, and what else is on the card');
+      : (onCard
+          ? `nuarr on the GPU — encoder ${Math.round(G.encoder_pct||0)}%, `
+            + `cores ${Math.round(G.gpu_pct||0)}%. Click for the card's engines.`
+          : 'nuarr\'s GPU use, and what else is on the card');
   }
   const gw=document.getElementById('suGpuWrap');
   // No card, no chip - and unlike the process chip this one really can be
@@ -11444,13 +11454,26 @@ function gpuPanel(s){
            not report it — so with something else also encoding the two would
            share this number.</div>`
         : (busyCard
-            ? `<div class="pf">nuarr has no encode running, so <b>the load
-               below is something else</b> — most likely Plex transcoding.
-               ${perProc?'':`This driver does not report which process owns a
-               video session, so it cannot be named here.`}</div>`
-            : `<div class="pf">Nothing is encoding. nuarr only uses the GPU for
-               a rebuild; a remux copies the picture untouched and never
-               touches it.</div>`))
+            ? (onCard
+                // NUARR IS ON THE CARD WITHOUT AN ENCODE JOB. That used to be
+                // impossible, so this said "something else, most likely Plex"
+                // whenever the encoder was idle. It is now the normal state
+                // for subtitle OCR on PaddleOCR and for a Whisper listen -
+                // both of which use the CUDA cores, never NVENC - and calling
+                // nuarr's own work somebody else's was simply wrong.
+                ? `<div class="pf">No encode is running, but nuarr <b>is</b> on
+                   this card — subtitle OCR and audio-language detection use
+                   the CUDA cores rather than the encoder, which is why NVENC
+                   reads zero while <b>cores (SM)</b> below does not.</div>`
+                : `<div class="pf">nuarr is not on this card at all, so <b>the
+                   load below is something else</b> — most likely Plex
+                   transcoding.
+                   ${perProc?'':`This driver does not report which process owns
+                   a video session, so it cannot be named here.`}</div>`)
+            : `<div class="pf">Nothing is running on the card. nuarr uses it
+               for a rebuild, for subtitle OCR when PaddleOCR is the engine,
+               and for audio-language detection; a remux copies the picture
+               untouched and never touches it.</div>`))
     + `<div class="ph" style="margin-top:11px">${esc(G.name)}${
         G.temp_c!=null?` <span class="mult">${G.temp_c.toFixed(0)}°C</span>`:''}</div>`
     + '<table class="gputab">'

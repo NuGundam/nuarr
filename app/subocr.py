@@ -580,10 +580,31 @@ import threading
 _TLS = threading.local()
 
 
+def _hidden() -> "subprocess.STARTUPINFO | None":
+    r"""A STARTUPINFO that hides the window - for the GRANDCHILDREN.
+
+    CREATE_NO_WINDOW keeps OUR child off the screen, and that has always
+    been set. It does not govern what that child then spawns: pgsrip calls
+    mkvextract through a bare `subprocess.check_output`, with no flags at
+    all, so every OCR job briefly threw a console onto the desktop - which
+    is the "cmd windows popping up when a task starts" nobody could place.
+    A hidden STARTUPINFO is inherited, so anything further down the chain
+    that asks for a window gets one it cannot show. Same technique
+    pytesseract uses on itself, applied one level up.
+    """
+    if os.name != "nt":
+        return None
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = subprocess.SW_HIDE
+    return si
+
+
 def _run(args: list[str], timeout: float = 3600) -> tuple[int, str]:
     p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                          text=True, errors="replace",
-                         creationflags=NO_WINDOW, env=_env())
+                         creationflags=NO_WINDOW, startupinfo=_hidden(),
+                         env=_env())
     hook = getattr(_TLS, "on_child", None)
     if hook:
         try:
@@ -1421,7 +1442,7 @@ def _run_progress(args: list[str], tick, base: float, span: float,
     p = subprocess.Popen(args, stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, text=True,
                          errors="replace", creationflags=NO_WINDOW,
-                         env=_env())
+                         startupinfo=_hidden(), env=_env())
     hook = getattr(_TLS, "on_child", None)
     if hook:
         try:
