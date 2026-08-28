@@ -4252,6 +4252,51 @@ def api_paddle_install(mode: str = Query("gpu")):
     return _so.paddle_install_start(mode)
 
 
+@app.post("/api/tesseract/check")
+async def api_tesseract_check():
+    """Is there a newer Tesseract build than the installed one.
+
+    CHECKS, NEVER INSTALLS. The Windows builds ship as an interactive
+    installer from UB Mannheim, not a package a service can apply - so this
+    reports and links, the same contract the ffmpeg page started with. A
+    managed copy (DataDir) is refreshed by nuarr's own releases instead.
+    """
+    from . import subocr as _so
+
+    def _work():
+        import re as _re
+        import urllib.request
+        cur = ""
+        st = _so.status()
+        cur = st.get("tesseract_version") or ""
+        try:
+            req = urllib.request.Request(
+                "https://api.github.com/repos/UB-Mannheim/tesseract/tags",
+                headers={"User-Agent": f"nuarr/{version.VERSION}",
+                         "Accept": "application/vnd.github+json"})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                tags = json.loads(r.read().decode("utf-8"))
+            best = ""
+            for t in tags or []:
+                m = _re.match(r"v?(\d+\.\d+\.\d+(?:\.\d+)?)$",
+                              str(t.get("name") or ""))
+                if m and (not best or m.group(1) > best):
+                    best = m.group(1)
+            if not best:
+                return {"ok": False, "installed": cur,
+                        "detail": "no version tags found upstream"}
+            # Numeric-dotted strings compare correctly enough here because
+            # both sides share the same shape (5.4.0.20240606).
+            newer = bool(cur) and best.split(".") > cur.split(".")
+            return {"ok": True, "installed": cur, "latest": best,
+                    "newer": newer,
+                    "url": "https://github.com/UB-Mannheim/tesseract/wiki"}
+        except Exception as e:                           # noqa: BLE001
+            return {"ok": False, "installed": cur,
+                    "detail": f"{type(e).__name__}: {str(e)[:120]}"}
+    return await asyncio.to_thread(_work)
+
+
 @app.post("/api/subocr/update")
 def api_subocr_update():
     """pip-update pgsrip from the page; /api/subocr/status carries the state."""
@@ -17836,7 +17881,20 @@ async function loadOcr(){
                 :(p.gpu_name?`CPU build — a GPU is present (${esc(p.gpu_name)}) but unused`
                             :'CPU build'))}
       </table>
-      <div style="padding:0 12px 11px">${padStrip}</div>
+      <div style="padding:0 12px 11px">${padStrip}
+        <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+          ${(s.install||{}).state==='installing'
+            ? `<span class="dim" style="font-size:11.5px">updating pgsrip…</span>`
+            : `<button onclick="socUpdate(this)">Update pgsrip</button>`}
+          <button onclick="tessCheck(this)">Check Tesseract for updates</button>
+          <span id="tessChkMsg" class="dim" style="font-size:11.5px">${
+            s.tesseract_managed
+              ? 'nuarr&rsquo;s own Tesseract is refreshed by nuarr updates'
+              : ''}</span>
+        </div>
+        ${(s.install||{}).state==='error'?`<div style="color:#e0575b;font-size:11px;margin-top:4px">${esc((s.install||{}).error||'')}</div>`:''}
+        ${(s.install||{}).state==='done'?`<div style="color:#7fd4a3;font-size:11px;margin-top:4px">pgsrip updated</div>`:''}
+      </div>
     </div>
 
     <div class="lkind" style="padding:11px 12px;margin-top:10px">
@@ -17929,6 +17987,33 @@ async function ocrTest(engine,device){
 async function padInstall(mode){
   try{ await fetch('/api/paddle/install?mode='+mode,{method:'POST'}); }catch(e){}
   loadOcr();
+}
+async function socUpdate(btn){
+  btn.disabled=true;
+  try{ await fetch('/api/subocr/update',{method:'POST'}); }catch(e){}
+  loadOcr();   // repaints as "updating pgsrip…" from install state
+  setTimeout(loadOcr, 4000);
+}
+async function tessCheck(btn){
+  const m=document.getElementById('tessChkMsg');
+  btn.disabled=true; const old=btn.textContent; btn.textContent='checking…';
+  try{
+    const r=await (await fetch('/api/tesseract/check',{method:'POST'})).json();
+    if(m){
+      if(!r.ok){ m.style.color='#e2b341'; m.textContent=r.detail||'could not check'; }
+      else if(r.newer){
+        m.style.color='#e2b341';
+        // The Windows build is an interactive installer, so this reports and
+        // links rather than pretending a service can run it.
+        m.innerHTML=`<b>${esc(r.latest)}</b> is available — you have ${esc(r.installed)}.
+          <a href="${esc(r.url)}" target="_blank" rel="noopener">Get it from UB Mannheim</a>`;
+      }else{
+        m.style.color='#7fd4a3';
+        m.textContent=`up to date — ${r.installed||'?'} is current`;
+      }
+    }
+  }catch(e){ if(m){ m.style.color='#e2b341'; m.textContent='check failed'; } }
+  btn.disabled=false; btn.textContent=old;
 }
 
 function socRow(k,v,why){
