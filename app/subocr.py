@@ -423,8 +423,18 @@ def select_targets(probe: dict, library: str | None = None) -> list[dict]:
         t = _title(s)
         if re.search(r"\bsdh\b|hearing.?impaired|\bcc\b", t, re.I):
             return "sdh"
-        if SIGNS_RE.search(t) or (s.get("disposition") or {}).get("forced"):
+        # FORCED IS NOT SIGNS, and lumping them together cost the forced
+        # tracks their own decision. Typeset signs are ARTWORK - positioned,
+        # styled, sometimes rotated to match a shop front - and OCR cannot
+        # recover any of that, which is why they are burned in and never
+        # converted. A forced track is ordinary dialogue: the lines spoken in
+        # another language, plain text at the bottom of the screen, which
+        # reads back perfectly. Same disposition bit, completely different
+        # content.
+        if SIGNS_RE.search(t):
             return "signs"
+        if (s.get("disposition") or {}).get("forced"):
+            return "forced"
         return "dialogue"
 
     have_text = {_role(s) for s in subs
@@ -432,7 +442,8 @@ def select_targets(probe: dict, library: str | None = None) -> list[dict]:
                  and _english(s)}
 
     mins = duration_min(probe)
-    never_burned = _never_burned(probe)
+    # (_never_burned is kept for callers/diagnostics; signs are no longer
+    # converted on the strength of it - see the signs branch below.)
     out = []
     for rel, s in enumerate(subs):
         if (s.get("codec_name") or "").lower() not in IMG_CODECS:
@@ -457,42 +468,34 @@ def select_targets(probe: dict, library: str | None = None) -> list[dict]:
         if role == "sdh" and not convert_all \
                 and not bool(_s("subocr_sdh", True, library)):
             continue
-        # Signs stay pictures: they are burned into the video by the encode
-        # rules, and OCR of typeset signs is worthless anyway. SDH and full
-        # dialogue are the ones worth reading back.
-        #
-        # UNLESS NOTHING IS EVER GOING TO BURN THEM. That sentence is a
-        # premise, not a fact, and on an HDR file it is false: burnOnHDR is
-        # off, deliberately, because painting subtitles into HDR means
-        # re-encoding it and losing the metadata. So the signs track is skipped
-        # here on the grounds that the encoder will handle it, and the encoder
-        # never touches it. It stays pictures forever.
-        #
-        # Caught on John Wick: Chapter 2 - a 4K HDR film whose 'forced only'
-        # PGS track Plex selects by name whatever its disposition says. With no
-        # text equivalent to offer, Plex paints it on the CPU, which is a full
-        # 2160p HDR re-encode. Converting it costs seconds of OCR on 37 cues.
+        # FORCED TRACKS ARE THEIR OWN CHOICE. They are burned into the picture
+        # when the video is rebuilt, which is the best outcome - but a file
+        # that never gets rebuilt keeps its forced lines as pictures, and Plex
+        # paints those on the CPU at playback. Converting gives it a text
+        # version to reach for instead. Off by default: burning is still the
+        # better answer whenever it happens.
+        if role == "forced" and not convert_all \
+                and not bool(_s("subocr_forced", False, library)):
+            continue
         signs, why = is_signs(s, mins, library)
-        if convert_all:
-            # THE OVERRIDE: every kept English PGS becomes text, signs
-            # included, even ones the encoder will also burn. The person
-            # asked for everything; the classification stands down and only
-            # grades the OCR result, never the decision.
-            if signs:
-                why = f"{why} - converted because 'all kept PGS subs' is on"
-        else:
-            if signs and not never_burned:
-                continue
-            # Signs & Songs keeps its OWN switch (it lives on the Subtitles
-            # page, with the burn-in policy it belongs to): the learned title
-            # patterns and the density model decide WHAT is signs, and this
-            # decides whether an unburnable signs track (HDR - see John Wick
-            # below) is worth converting at all.
-            if signs and not bool(_s("subocr_signs_unburned", True, library)):
-                continue
-            if signs:
-                why = (f"{why} - converted anyway because nothing will burn "
-                       f"it into this file")
+        # SIGNS ARE NEVER CONVERTED, and there is no switch for it.
+        #
+        # There was one, briefly, for the case where nothing would ever burn
+        # them. It was wrong: typeset signs are ARTWORK - positioned over a
+        # shop sign, angled to match a letter on screen, styled per line - and
+        # OCR returns a flat list of centred text with none of that. The
+        # result is not a worse version of the signs, it is a wrong one:
+        # captions floating over the middle of the picture, unreadable and
+        # covering the thing they were describing. Burning them in is the only
+        # rendering that works, so a signs track that cannot be burned is left
+        # exactly as it is.
+        #
+        # The 'convert everything' override still reaches them, because that
+        # switch says explicitly that the classification stands down.
+        if signs and not convert_all:
+            continue
+        if signs:
+            why = f"{why} - converted because 'convert every picture track' is on"
         t = dict(s)
         t["rel"] = rel
         t["cues"] = cues(s)
@@ -1046,17 +1049,113 @@ def status() -> dict:
             l.name: {
                 "auto": bool(_s("subocr_auto", True, l.name)),
                 "sdh": bool(_s("subocr_sdh", True, l.name)),
+                "forced": bool(_s("subocr_forced", False, l.name)),
                 "all": bool(_s("subocr_all", False, l.name)),
-                "signs_unburned": bool(_s("subocr_signs_unburned", True, l.name)),
                 "remove_image": bool(_s("subocr_remove_image", False, l.name)),
                 "signs_max_cpm": signs_max_cpm(l.name),
                 "dialogue_min_cues": dialogue_min_cues(l.name),
                 "has": (library_track_kinds().get(l.name)
                         or {"image": 0, "signs": 0, "forced": 0,
                             "dialogue": 0, "files": 0}),
+                # The subtitle RULES for this library, each on its own switch.
+                "rules": sub_rules(l.name),
             } for l in (SETTINGS.libraries or [])
         },
+        "rule_meta": RULE_META,
     }
+
+
+# ------------------------------------------------------- the subtitle rules --
+# These were constants in rules.CONFIG - one answer for every library, only
+# changeable by editing the file. They are decisions about how subtitles are
+# handled, so they belong beside the languages, per library, with a plain
+# description of what each one does.
+
+RULE_META = [
+    {"key": "burn", "label": "Paint signs and forced lines into the picture",
+     "what": "The only way typeset signs and song captions render correctly - "
+             "OCR cannot recover where they sit on screen. It needs the video "
+             "to be rebuilt, so it happens when a rebuild is happening anyway.",
+     "default": True},
+    {"key": "burn_image_always",
+     "label": "Rebuild the video just to paint in a picture track",
+     "what": "Without this, a file that needs no other work keeps its picture "
+             "subtitles - and Plex paints them on the CPU at playback instead, "
+             "which is a transcode, and an expensive one at 4K.",
+     "default": True},
+    {"key": "drop_covered",
+     "label": "Drop a picture track the release already covers in text",
+     "what": "When the release ships its own SRT or ASS doing the same job in "
+             "the same language, the picture copy adds nothing - and a human "
+             "typed that text, so it beats anything OCR would produce. "
+             "Matched per role, so an SDH track is never dropped for a plain "
+             "dialogue one.",
+     "default": True},
+    {"key": "clear_flags",
+     "label": "Stop kept picture tracks switching themselves on",
+     "what": "A picture track flagged default or forced makes Plex paint it "
+             "at playback. Clearing the flags leaves it selectable by hand "
+             "but never automatic.",
+     "default": True},
+    {"key": "remove_burned",
+     "label": "Remove a track once it is painted into the picture",
+     "what": "It is part of the video now; keeping the separate track means "
+             "the same subtitles can be shown twice, on top of each other.",
+     "default": True},
+    {"key": "burn_lang_guard",
+     "label": "Only paint in a track that is English or untagged",
+     "what": "Stops a German or French forced track being painted permanently "
+             "into a picture you wanted in English.",
+     "default": True},
+    {"key": "force_eng_sub",
+     "label": "Turn on English subtitles when no English audio survives",
+     "what": "For a subtitled release, so it plays with subtitles without "
+             "anyone reaching for the menu. Always a text track, never a "
+             "picture one, and never the signs track.",
+     "default": True},
+    {"key": "burn_hdr", "label": "Allow painting into HDR video",
+     "what": "The colour tags and the HDR10 metadata are re-stated on the "
+             "output, so the rebuild keeps its HDR. Dolby Vision's per-frame "
+             "layer cannot survive any rebuild, so a DV file comes out as "
+             "HDR10 - the same thing the Dolby Vision rule produces.",
+     "default": True},
+]
+
+# Which rules.CONFIG constant each switch stands for.
+_RULE_CFG = {
+    "burn": "burnEnabled",
+    "burn_image_always": "alwaysBurnImageSubs",
+    "drop_covered": "dropRedundantImageSubs",
+    "clear_flags": "neutralizeKeptImageSubFlags",
+    "remove_burned": "removeBurnedSub",
+    "burn_lang_guard": "burnLangGuard",
+    "force_eng_sub": "forceEngSubWhenNoEngAudio",
+    "burn_hdr": "burnOnHDR",
+}
+
+
+def sub_rules(library: str | None = None) -> dict:
+    """Every subtitle rule switch for one library, resolved."""
+    try:
+        from . import rules
+        C = rules.CONFIG
+    except Exception:                                    # noqa: BLE001
+        C = {}
+    out = {}
+    for m in RULE_META:
+        base = C.get(_RULE_CFG[m["key"]], m["default"])
+        out[m["key"]] = bool(_s("subrule_" + m["key"], base, library))
+    return out
+
+
+def sub_rule(key: str, library: str | None = None) -> bool:
+    """One rule, for the planner. Falls back to the global constant."""
+    try:
+        from . import rules
+        base = rules.CONFIG.get(_RULE_CFG.get(key, ""), True)
+    except Exception:                                    # noqa: BLE001
+        base = True
+    return bool(_s("subrule_" + key, base, library))
 
 
 _INSTALL = {"state": "idle", "log": "", "error": ""}

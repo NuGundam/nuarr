@@ -724,8 +724,15 @@ def _short(t: str, n: int = 80) -> str:
     return t if len(t) <= n else t[:n - 1].rstrip() + "…"
 
 
-def pick_burn_target(subs: list[dict]) -> tuple[int | None, str]:
-    """First subtitle matching an enabled signs/forced variant, by priority."""
+def pick_burn_target(subs: list[dict],
+                     lang_guard: bool | None = None) -> tuple[int | None, str]:
+    """First subtitle matching an enabled signs/forced variant, by priority.
+
+    `lang_guard` lets the caller pass the per-library switch; None keeps the
+    global constant, so every other caller behaves exactly as before.
+    """
+    if lang_guard is None:
+        lang_guard = CONFIG["burnLangGuard"]
     for variant in SIGNS_VARIANTS:
         if not variant["enabled"]:
             continue
@@ -746,7 +753,7 @@ def pick_burn_target(subs: list[dict]) -> tuple[int | None, str]:
             # there is a title to judge.
             if variant.get("flags") == ["default"] and not title.strip():
                 continue
-            if CONFIG["burnLangGuard"]:
+            if lang_guard:
                 ok = (lang in ENGLISH_ISH or lang in ("jpn", "ja")
                       or re.search(r"english", title, re.I))
                 if not ok:
@@ -1170,6 +1177,33 @@ def decide(probe: dict, *, anime: bool = False, filename: str = "",
     def _v(key, fallback):
         val = VP.get(key)
         return fallback if val is None else val
+
+    # SUBTITLE RULES, PER LIBRARY. Each of these was a constant with one
+    # answer for the whole install; they are decisions about how subtitles
+    # are handled, so they follow the library like the codec settings do.
+    # Resolved once per plan - subocr reads SETTINGS and rules.CONFIG, and
+    # doing that eight times inside a loop is eight dict walks for an answer
+    # that cannot change mid-file.
+    try:
+        from . import subocr as _so_rules
+        SR = _so_rules.sub_rules(library)
+    except Exception:                                    # noqa: BLE001
+        SR = {}
+
+    def _sr(key):
+        val = SR.get(key)
+        if val is not None:
+            return bool(val)
+        return bool(CONFIG.get({
+            "burn": "burnEnabled",
+            "burn_image_always": "alwaysBurnImageSubs",
+            "drop_covered": "dropRedundantImageSubs",
+            "clear_flags": "neutralizeKeptImageSubFlags",
+            "remove_burned": "removeBurnedSub",
+            "burn_lang_guard": "burnLangGuard",
+            "force_eng_sub": "forceEngSubWhenNoEngAudio",
+            "burn_hdr": "burnOnHDR",
+        }.get(key, ""), True))
 
     def _a(key, fallback):
         val = AP.get(key)
@@ -1610,7 +1644,7 @@ def decide(probe: dict, *, anime: bool = False, filename: str = "",
                           "the same subtitles are here as text now, and you "
                           "asked for the picture copy to be dropped rather "
                           "than just switched off")
-                elif CONFIG["neutralizeKeptImageSubFlags"] and \
+                elif _sr("clear_flags") and \
                         (_disp(s, "default") or _disp(s, "forced")):
                     p.clear_flags.append(i)
                     p.add("subtitle",
@@ -1649,7 +1683,7 @@ def decide(probe: dict, *, anime: bool = False, filename: str = "",
     # burn target becomes the ASS signs track, which renders through libass
     # instead of overlaying a bitmap - sharper, correctly scaled, and it is the
     # typesetting the release group actually authored.
-    if CONFIG["dropRedundantImageSubs"] and p.keep_subs:
+    if _sr("drop_covered") and p.keep_subs:
         def _role(s: dict) -> str:
             # THREE roles, not two. The first draft had signs/dialogue only,
             # and the library immediately showed why that is not enough:
@@ -1732,14 +1766,16 @@ def decide(probe: dict, *, anime: bool = False, filename: str = "",
                    "searchable and easier on playback than a picture"),
                   "text subtitles are searchable, styleable and direct-play")
 
-    if anime and CONFIG["burnEnabled"]:
-        bi, variant = pick_burn_target([subs[i] for i in p.keep_subs] if p.keep_subs else subs)
+    if anime and _sr("burn"):
+        bi, variant = pick_burn_target(
+            [subs[i] for i in p.keep_subs] if p.keep_subs else subs,
+            _sr("burn_lang_guard"))
         if bi is not None:
             real = p.keep_subs[bi] if p.keep_subs else bi
             is_image = (subs[real].get("codec_name") or "").lower() in IMAGE_SUB_CODECS
-            allowed = (p.encode or (CONFIG["alwaysBurnImageSubs"] and is_image)
+            allowed = (p.encode or (_sr("burn_image_always") and is_image)
                        or not CONFIG["burnOnlyWhenEncoding"])
-            if hdr and not CONFIG["burnOnHDR"]:
+            if hdr and not _sr("burn_hdr"):
                 p.add("subtitle", f"leave the signs on subtitle {real} as they are",
                       "burning is switched off for HDR files here, so the signs "
                       "stay a separate track")
@@ -1761,7 +1797,7 @@ def decide(probe: dict, *, anime: bool = False, filename: str = "",
                        "costs nothing extra")
                 p.add("subtitle", f"paint the {variant.lower()} into the picture (track {real})", why,
                       "scale PGS to video" if (is_image and CONFIG["scalePgsToVideo"]) else "")
-                if CONFIG["removeBurnedSub"]:
+                if _sr("remove_burned"):
                     p.add("subtitle", f"remove subtitle {real}, now part of the picture",
                           "it is part of the picture now, so the separate track is not needed")
             else:
@@ -1774,7 +1810,7 @@ def decide(probe: dict, *, anime: bool = False, filename: str = "",
                                f"copy-eligible and burning would force a "
                                f"needless re-encode")
 
-    if CONFIG["forceEngSubWhenNoEngAudio"] and not has_eng_audio:
+    if _sr("force_eng_sub") and not has_eng_audio:
         for i in p.keep_subs:
             s = subs[i]
             if (s.get("codec_name") or "").lower() in TEXT_SUB_CODECS \

@@ -3974,12 +3974,15 @@ async def api_subocr_config(body: dict = Body(...)):
         "subocr_every_h": lambda v: max(1, min(168, int(v))),
         "subocr_batch": lambda v: max(1, min(500, int(v))),
         "subocr_sdh": lambda v: bool(v),
+        "subocr_forced": lambda v: bool(v),
         "subocr_all": lambda v: bool(v),
         "subocr_remove_image": lambda v: bool(v),
-        "subocr_signs_unburned": lambda v: bool(v),
         "subocr_signs_max_cpm": lambda v: max(0.5, min(30.0, float(v))),
         "subocr_dialogue_min_cues": lambda v: max(50, min(5000, int(v))),
     }
+    from . import subocr as _so_cfg
+    for m in _so_cfg.RULE_META:
+        allowed["subrule_" + m["key"]] = lambda v: bool(v)
     changes = {}
     for k, cast in allowed.items():
         if k in body:
@@ -16999,23 +17002,7 @@ async function loadLangTab(){
           _langDirty?'unsaved changes':'the planner is using this now'}</span>
        </div>
        <div id="langImpact" style="margin-top:8px"></div>
-       <div class="lkind" style="padding:10px 12px;margin-top:12px">
-         <b style="color:#6fb0ff">Reading picture subtitles — when it runs</b>
-         <div class="dim" style="font-size:11px;margin:3px 0 7px">
-           Which tracks get read is set per library above. This is the pace:
-           a batch at a time, queued like any other job, so it never competes
-           with someone watching.</div>
-         <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;font-size:12px">
-           <span>every <input id="socEvery" type="number" min="1" max="168" value="6"
-             style="width:56px;font-family:var(--mono,monospace)"> h</span>
-           <span><input id="socBatch" type="number" min="1" max="500" value="20"
-             style="width:64px;font-family:var(--mono,monospace)"> files per pass</span>
-           <button onclick="socSavePace(this)">Save</button>
-           <button onclick="socRunNow(this)">Run a pass now</button>
-           <button onclick="socCount(this)">Count what qualifies</button>
-           <span id="socMsg" class="dim" style="font-size:11.5px"></span>
-         </div>
-       </div>`;
+       `;
   langSignsLoad();
 }
 
@@ -17031,21 +17018,7 @@ let _socAll=null;
 
 async function langSignsLoad(){
   try{ _socAll=await (await fetch('/api/subocr/status')).json(); }catch(e){ return; }
-  const e=document.getElementById('socEvery'), b=document.getElementById('socBatch');
-  if(e) e.value=_socAll.every_h; if(b) b.value=_socAll.batch;
   for(const lib of Object.keys(_socAll.libraries||{})) socPaint(lib);
-}
-async function socSavePace(btn){
-  const m=document.getElementById('socMsg');
-  btn.disabled=true;
-  try{
-    const r=await (await fetch('/api/subocr/config',{method:'POST',
-      headers:{'Content-Type':'application/json'},body:JSON.stringify({
-        subocr_every_h:parseInt(document.getElementById('socEvery').value)||6,
-        subocr_batch:parseInt(document.getElementById('socBatch').value)||20})})).json();
-    if(m){ m.style.color=r.ok?'#7fd4a3':'#e0575b'; m.textContent=r.ok?'saved':(r.error||'failed'); }
-  }catch(e){ if(m){ m.style.color='#e0575b'; m.textContent='failed'; } }
-  btn.disabled=false;
 }
 
 function socPaint(lib){
@@ -17064,45 +17037,42 @@ function socPaint(lib){
       <span><b>${label}</b>${off?' <span class="dim">— none in this library</span>':''}
         <div class="dim" style="font-size:11px">${why}</div></span>
     </label>`;
+  const rules=s.rules||{};
+  const rchk=(k,on,label,why)=>`
+    <label style="display:flex;gap:9px;align-items:flex-start;padding:6px 0;cursor:pointer">
+      <input type="checkbox" id="${id('r_'+k)}" ${on?'checked':''}
+             onchange="socSaveLib('${esc(lib)}')" style="margin-top:2px">
+      <span><b>${label}</b><div class="dim" style="font-size:11px">${why}</div></span>
+    </label>`;
   host.innerHTML=`
     <div class="socinner">
-      <div class="sochead">Subtitle handling
+      <div class="sochead">Subtitle handling with OCR
         <span class="dim">${has.image?`${fmt(has.image)} picture subtitle track(s) here —
           ${fmt(has.dialogue)} dialogue, ${fmt(has.signs)} signs, ${fmt(has.forced)} forced`
           :'no picture subtitle tracks in this library'}</span></div>
 
-      ${chk('auto',s.auto,'Read picture subtitles as text',
-        'PGS tracks are pictures, so Plex has to paint them into the video while you watch — which is a transcode. nuarr reads them with OCR and adds a real text version, which every client just displays. The picture track stays.',
+      ${chk('auto',s.auto,'Convert picture subtitles to text',
+        'PGS tracks are pictures, so Plex has to paint them into the video while you watch — which is a transcode. nuarr converts them with OCR and adds a real text version, which every client just displays. The picture track stays.',
         !has.image)}
 
-      ${chk('sdh',s.sdh,'Also read SDH tracks',
-        'The version with speaker names and sound effects, for watching without sound. Read separately from the plain track, since they are not the same subtitles.',
+      ${chk('sdh',s.sdh,'Also convert SDH tracks',
+        'The version with speaker names and sound effects, for watching without sound. Converted separately from the plain track, since they are not the same subtitles.',
         !has.image)}
 
-      ${chk('all',s.all,'Read every picture track, not just dialogue',
-        'Ignores the sorting below and converts every English picture track kept by the language rules. The result is still checked before it is used.',
+      ${chk('forced',s.forced,'Also convert forced subtitles',
+        'The lines that translate a scene spoken in another language. Normally painted into the picture when the video is rebuilt, which is the better result — this converts them to text as well, so files that are never rebuilt still have something Plex can display without painting.',
+        !has.forced)}
+
+      ${chk('all',s.all,'Convert every picture track, not just dialogue',
+        'Ignores the sorting below and converts every English picture track kept by the language rules — signs included, even though OCR cannot place them correctly. The result is still checked before it is used.',
         !has.image)}
 
       ${chk('remove_image',s.remove_image,'Delete the picture track once text exists',
         'Off: the picture track is kept but switched off, so it can never trigger a transcode and you can still pick it by hand. On: it is removed from the file — tidier and smaller, but it cannot be undone.',
         !has.image)}
 
-      ${chk('signs_unburned',s.signs_unburned,'Signs &amp; songs: read as text if they cannot be burned in',
-        'Signs and song captions are artwork placed on top of the picture, so they are normally <b>painted permanently into the video</b> during a rebuild — that is the only way they look right. This is the fallback for files that are never rebuilt: read them as plain text so at least something exists, rather than leaving Plex to paint them live every time.',
-        !has.signs)}
-
-      ${has.forced?`<div style="padding:6px 0;font-size:12px">
-          <b>Forced subtitles</b> <span class="dim">— ${fmt(has.forced)} in this library</span>
-          <div class="dim" style="font-size:11px">The lines that translate a
-          scene spoken in another language. Handled exactly like signs: painted
-          into the picture when the video is rebuilt, so they always show on
-          every client. The switch above covers the files that are never
-          rebuilt.</div></div>`
-        :`<div style="padding:6px 0;font-size:12px;opacity:.45">
-          <b>Forced subtitles</b> <span class="dim">— none in this library</span></div>`}
-
       <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;
-                  font-size:12px;margin-top:4px;${has.image?'':'opacity:.45'}">
+                  font-size:12px;margin:6px 0 2px;${has.image?'':'opacity:.45'}">
         <span title="Fewer captions per minute than this and a track is treated as signs">
           signs below <input id="${id('cpm')}" type="number" min="0.5" max="30" step="0.5"
             value="${s.signs_max_cpm}" ${has.image?'':'disabled'}
@@ -17115,6 +17085,10 @@ function socPaint(lib){
             style="width:68px;font-family:var(--mono,monospace)"> captions</span>
         <span id="${id('msg')}" class="dim" style="font-size:11px"></span>
       </div>
+
+      <div class="sochead" style="margin-top:12px">Subtitle rules
+        <span class="dim">what happens to subtitles when this library is rebuilt</span></div>
+      ${(_socAll.rule_meta||[]).map(m=>rchk(m.key,rules[m.key],m.label,m.what)).join('')}
     </div>`;
 }
 
@@ -17124,11 +17098,14 @@ async function socSaveLib(lib){
   const body={library:lib,
     subocr_auto:id('auto').checked,
     subocr_sdh:id('sdh').checked,
+    subocr_forced:id('forced').checked,
     subocr_all:id('all').checked,
     subocr_remove_image:id('remove_image').checked,
-    subocr_signs_unburned:id('signs_unburned').checked,
     subocr_signs_max_cpm:parseFloat(id('cpm').value)||6,
     subocr_dialogue_min_cues:parseInt(id('cues').value)||500};
+  for(const m of (_socAll.rule_meta||[])){
+    const b=id('r_'+m.key); if(b) body['subrule_'+m.key]=b.checked;
+  }
   try{
     const r=await (await fetch('/api/subocr/config',{method:'POST',
       headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
@@ -17462,27 +17439,8 @@ function socPath(what,path,note){
     <td class="dim" style="font-size:11px;padding-right:12px;white-space:nowrap">${note}</td></tr>`;
 }
 
-async function socRunNow(btn){
-  const m=document.getElementById('socMsg');
-  btn.disabled=true; const old=btn.textContent; btn.textContent='queueing…';
-  try{
-    const n=parseInt(document.getElementById('socBatch').value)||20;
-    const r=await (await fetch('/api/subocr/queue?limit='+n,{method:'POST'})).json();
-    if(m){ m.style.color='#7fd4a3';
-      m.textContent=`queued ${r.queued??r.would_queue??0} file(s) — watch them on the dashboard`; }
-  }catch(e){ if(m){ m.style.color='#e0575b'; m.textContent='queue failed'; } }
-  btn.disabled=false; btn.textContent=old;
-}
-async function socCount(btn){
-  const m=document.getElementById('socMsg');
-  btn.disabled=true; const old=btn.textContent; btn.textContent='counting… (walks every probe, ~30s)';
-  try{
-    const r=await (await fetch('/api/subocr/preview?limit=3')).json();
-    if(m){ m.style.color='';
-      m.textContent=`${r.files} file(s) / ${r.tracks} track(s) currently qualify`; }
-  }catch(e){ if(m){ m.style.color='#e0575b'; m.textContent='count failed'; } }
-  btn.disabled=false; btn.textContent=old;
-}
+// (the run-now / count buttons went with the pace box - the requeue system
+//  finds this work on its own, and the Jobs page is where its schedule lives)
 async function socUpdate(btn){
   btn.disabled=true;
   try{ await fetch('/api/subocr/update',{method:'POST'}); }catch(e){}
