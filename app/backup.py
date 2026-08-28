@@ -52,7 +52,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from . import joblog
-from .config import DATA_DIR, DB_PATH, ROOT
+from .config import DATA_DIR, DB_PATH, NO_WINDOW, ROOT
 from . import schedules
 from .db import cursor, kv_get, kv_set
 
@@ -238,8 +238,16 @@ def _write_bundle(dest: Path) -> dict:
     req = dest / "requirements.txt"
     failed: list[str] = []
     try:
+        # NO_WINDOW ON EVERY ONE OF THESE. Without it each pip call opens a
+        # console on the desktop - and the fallback loop below runs one per
+        # package, so a bundle rebuild flashed dozens of windows at whoever
+        # happened to be logged in. Every other child process in nuarr passes
+        # this flag; these three were missed, and they only surface when the
+        # source hash changes and the bundle is rewritten, which is why it
+        # looked intermittent.
         frozen = subprocess.run([sys.executable, "-m", "pip", "freeze"],
-                                capture_output=True, text=True, timeout=120)
+                                capture_output=True, text=True, timeout=120,
+                                creationflags=NO_WINDOW)
         req.write_text(frozen.stdout, encoding="utf-8")
         pkgs = [l.strip() for l in frozen.stdout.splitlines()
                 if l.strip() and not l.startswith(("#", "-e "))]
@@ -255,7 +263,8 @@ def _write_bundle(dest: Path) -> dict:
         rc = subprocess.run([sys.executable, "-m", "pip", "download",
                              "-r", str(req), "-d", str(wheels),
                              "--prefer-binary"],
-                            capture_output=True, text=True, timeout=1800)
+                            capture_output=True, text=True, timeout=1800,
+                            creationflags=NO_WINDOW)
         if rc.returncode != 0:
             # And if the batch still fails, fall back to ONE AT A TIME so a
             # single unavailable package costs one package, not all of them.
@@ -263,7 +272,8 @@ def _write_bundle(dest: Path) -> dict:
                 r1 = subprocess.run([sys.executable, "-m", "pip", "download", p,
                                      "-d", str(wheels), "--prefer-binary",
                                      "--no-deps"],
-                                    capture_output=True, text=True, timeout=180)
+                                    capture_output=True, text=True, timeout=180,
+                                    creationflags=NO_WINDOW)
                 if r1.returncode != 0:
                     failed.append(p)
     except Exception as e:
