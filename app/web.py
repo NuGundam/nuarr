@@ -3977,6 +3977,9 @@ async def api_subocr_config(body: dict = Body(...)):
         "subocr_forced": lambda v: bool(v),
         "subocr_all": lambda v: bool(v),
         "subocr_remove_image": lambda v: bool(v),
+        "subocr_engine": lambda v: (str(v).lower()
+                                    if str(v).lower() in ("tesseract", "paddle")
+                                    else "tesseract"),
         "subocr_signs_max_cpm": lambda v: max(0.5, min(30.0, float(v))),
         "subocr_dialogue_min_cues": lambda v: max(50, min(5000, int(v))),
     }
@@ -4145,6 +4148,20 @@ async def api_subocr_requeue():
         await jobs.start()
     joblog.log(f"subtitle rules: queued {queued} file(s) to be replanned", "ok")
     return {"queued": queued, "considered": len(ids)}
+
+
+@app.get("/api/paddle")
+async def api_paddle():
+    """What PaddleOCR is on this machine, and whether it can see the card."""
+    from . import subocr as _so
+    return await asyncio.to_thread(_so.paddle_info)
+
+
+@app.post("/api/paddle/install")
+def api_paddle_install(mode: str = Query("gpu")):
+    """Install or update PaddleOCR - gpu, cpu, or update."""
+    from . import subocr as _so
+    return _so.paddle_install_start(mode)
 
 
 @app.post("/api/subocr/update")
@@ -15962,7 +15979,7 @@ function wtab(which){
                    vcodec:'vcodecPane', acodec:'acodecPane',
                    alang:'alangPane', cache:'cachePane',
                    whisper:'whisperPane', plex:'plexPane',
-                   subocr:'subocrPane',
+                   subocr:'subocrPane', paddle:'paddlePane',
                    updates:'updPane'};
   const isPane = Object.prototype.hasOwnProperty.call(PANE_OF, which);
   const set = document.getElementById('wSettings');
@@ -16007,6 +16024,11 @@ function wtab(which){
   if(which==='updates'){
     if(hint) hint.textContent='· updates';
     loadUpdates(0);      // 0: use the cache. The Check now button forces it.
+    return;
+  }
+  if(which==='paddle'){
+    if(hint) hint.textContent='· paddleocr';
+    loadPaddle();
     return;
   }
   if(which==='subocr'){
@@ -17236,8 +17258,17 @@ function socPaint(lib){
         'Off: the picture track is kept but switched off, so it can never trigger a transcode and you can still pick it by hand. On: it is removed from the file — tidier and smaller, but it cannot be undone.',
         !has.image)}
 
-      <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;
+      <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;
                   font-size:12px;margin:6px 0 2px;${has.image?'':'opacity:.45'}">
+        <span>read them with
+          <select id="${id('eng')}" ${has.image?'':'disabled'}
+                  onchange="socSaveLib('${esc(lib)}')">
+            <option value="tesseract"${s.engine==='tesseract'?' selected':''}>Tesseract — bundled, fast anywhere</option>
+            <option value="paddle"${s.engine==='paddle'?' selected':''}>PaddleOCR — better on italics, wants a GPU</option>
+          </select></span>
+      </div>
+      <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;
+                  font-size:12px;margin:2px 0;${has.image?'':'opacity:.45'}">
         <span title="Fewer captions per minute than this and a track is treated as signs">
           signs below <input id="${id('cpm')}" type="number" min="0.5" max="30" step="0.5"
             value="${s.signs_max_cpm}" ${has.image?'':'disabled'}
@@ -17337,6 +17368,7 @@ async function socSaveLib(lib){
     subocr_forced:id('forced').checked,
     subocr_all:id('all').checked,
     subocr_remove_image:id('remove_image').checked,
+    subocr_engine:(id('eng')||{}).value||'tesseract',
     subocr_signs_max_cpm:parseFloat(id('cpm').value)||6,
     subocr_dialogue_min_cues:parseInt(id('cues').value)||500};
   try{
@@ -17678,6 +17710,83 @@ async function socUpdate(btn){
   btn.disabled=true;
   try{ await fetch('/api/subocr/update',{method:'POST'}); }catch(e){}
   loadSubocr();
+}
+
+// ---- PaddleOCR -------------------------------------------------------
+let _pad=null;
+async function loadPaddle(){
+  const el=document.getElementById('paddleBody');
+  if(!el) return;
+  try{ _pad=await (await fetch('/api/paddle')).json(); }
+  catch(e){ el.innerHTML='<div class="dim" style="padding:14px">could not load</div>'; return; }
+  const p=_pad, inst=p.install||{};
+  const head = !p.installed
+    ? `<span style="color:#e2b341">not installed — Tesseract is doing the reading</span>`
+    : p.cuda
+      ? `<span style="color:#7fd4a3">installed, using the GPU</span>`
+      : `<span style="color:#e2b341">installed, CPU build — about 15× slower than Tesseract</span>`;
+  let strip='';
+  if(inst.state==='installing'){
+    strip=`<div style="margin-top:8px"><span style="color:#e2b341;font-size:12px">
+      installing (${esc(inst.mode)})… the GPU build is a ~1.5 GB download</span>
+      ${inst.log?`<pre class="mono dim" style="font-size:10.5px;margin:6px 0 0;max-height:110px;
+        overflow:auto;white-space:pre-wrap">${esc(inst.log.split('\\n').slice(-5).join('\\n'))}</pre>`:''}</div>`;
+    setTimeout(loadPaddle, 4000);
+  } else {
+    const hasGpu=!!p.gpu_name;
+    strip=`<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      ${!p.installed||!p.cuda
+        ? `<button onclick="padInstall('gpu')" ${hasGpu?'style="color:var(--acc)"':''}
+             >Install — GPU${hasGpu?` (${esc(p.gpu_name)})`:''}</button>`:''}
+      ${!p.installed
+        ? `<button onclick="padInstall('cpu')">Install — CPU only</button>`:''}
+      ${p.installed?`<button onclick="padInstall('update')">Update</button>`:''}
+      ${inst.state==='error'?`<span style="color:#e0575b;font-size:11px">${esc(inst.error||'')}</span>`:''}
+      ${inst.state==='done'?`<span style="color:#7fd4a3;font-size:11px">done</span>`:''}
+    </div>`;
+  }
+  el.innerHTML=`
+    <div class="lkind" style="padding:11px 12px">
+      <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:baseline">
+        <b style="color:#6fb0ff">Engine</b>${head}</div>
+      ${p.installed?'':`<div class="dim" style="font-size:11px;margin-top:5px">
+        Nothing breaks without it — Tesseract is bundled and reads clean
+        subtitle text well. This is the upgrade for italics and for keeping
+        signs where they belong.</div>`}
+      ${strip}
+    </div>
+
+    <div class="lkind" style="margin-top:10px">
+      <div class="lkindhead"><b style="color:#6fb0ff">What is installed</b></div>
+      <table style="width:100%;font-size:12px;border-collapse:collapse">
+        ${socRow('paddleocr', p.paddleocr||'—', 'the OCR pipeline: finds the text, then reads it')}
+        ${socRow('paddlepaddle', p.paddlepaddle||'—', 'the framework it runs on')}
+        ${socRow('CUDA build', p.cuda?'yes':'no',
+          p.cuda?'this build can use the GPU'
+                :(p.gpu_name?`a GPU is present (${esc(p.gpu_name)}) but this is the CPU build`
+                            :'no NVIDIA GPU detected — CPU is the only option here'))}
+      </table>
+    </div>
+
+    <div class="lkind" style="padding:11px 12px;margin-top:10px">
+      <b style="color:#6fb0ff">Measured on this library</b>
+      <div class="dim" style="font-size:11px;margin-top:4px">
+        55 real subtitle images from a dialogue track and an anime signs track:
+      </div>
+      <table style="width:100%;font-size:12px;border-collapse:collapse;margin-top:6px">
+        ${socRow('Tesseract','~135 ms/cue','2 of 55 wrong — both italics, e.g. “lLlknow ldo.” for “I know I do.”')}
+        ${socRow('PaddleOCR — GPU','~200 ms/cue','read all 55 correctly')}
+        ${socRow('PaddleOCR — CPU','~2000 ms/cue','same answers, fifteen times slower than Tesseract')}
+      </table>
+      <div class="dim" style="font-size:11px;margin-top:6px">
+        Which engine each library uses is set on the <b>Subtitles</b> page.
+        <button style="margin-left:6px" onclick="wtab('lang')">Open Subtitles settings</button>
+      </div>
+    </div>`;
+}
+async function padInstall(mode){
+  try{ await fetch('/api/paddle/install?mode='+mode,{method:'POST'}); }catch(e){}
+  loadPaddle();
 }
 
 // ---- Whisper ---------------------------------------------------------
@@ -20153,7 +20262,8 @@ _SETTINGS_NAV = [
     ("Tools",      [("ffmpeg",  "ffmpeg",          "film"),
                     ("mkv",     "MKVToolNix",      "tool"),
                     ("whisper", "Whisper",         "language"),
-                    ("subocr",  "Subtitle OCR",    "language")]),
+                    ("subocr",  "Subtitle OCR",    "language"),
+                    ("paddle",  "PaddleOCR",       "language")]),
     ("Integrations", [("arrs", "Arrs",             "link"),
                       ("plex", "Plex",             "play"),
                       ("meta", "Metadata",         "globe")]),
@@ -20337,9 +20447,9 @@ _SETTINGS_CSS = """
    here - the sections rendered as bare text with no card around them. Repeated
    rather than re-scoped, because widening the language selectors would change
    that page too, and it is not the one being edited. */
-#vcodecPane .lkind,#acodecPane .lkind,#alangPane .lkind,#cachePane .lkind,#whisperPane .lkind,#subocrPane .lkind{border:1px solid var(--line);
+#vcodecPane .lkind,#acodecPane .lkind,#alangPane .lkind,#cachePane .lkind,#whisperPane .lkind,#subocrPane .lkind,#paddlePane .lkind{border:1px solid var(--line);
   border-radius:8px;margin-top:10px}
-#vcodecPane .lkindhead,#acodecPane .lkindhead,#alangPane .lkindhead,#cachePane .lkindhead,#whisperPane .lkindhead,#subocrPane .lkindhead{padding:7px 12px;
+#vcodecPane .lkindhead,#acodecPane .lkindhead,#alangPane .lkindhead,#cachePane .lkindhead,#whisperPane .lkindhead,#subocrPane .lkindhead,#paddlePane .lkindhead{padding:7px 12px;
   border-bottom:1px solid var(--line);background:rgba(255,255,255,.02);
   font-weight:500;font-size:12.5px;display:flex;gap:10px;align-items:baseline;
   border-radius:8px 8px 0 0}

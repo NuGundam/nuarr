@@ -933,7 +933,7 @@ def ffmpeg_sub_args(src_probe: dict, pend: list[dict],
 
 
 def produce(path: str, probe: dict, file_id: int, work_root: str | None = None,
-            on_progress=None) -> dict:
+            on_progress=None, library: str | None = None) -> dict:
     """OCR only. Writes SRTs to the pending area and mNothing else.
 
     Split out from run_one so the expensive half can happen once, up front,
@@ -942,7 +942,8 @@ def produce(path: str, probe: dict, file_id: int, work_root: str | None = None,
     subtitle job itself. Rewriting a file twice to do one thing was the waste
     worth removing.
     """
-    res = run_one(path, probe, work_root, on_progress, mux=False)
+    res = run_one(path, probe, work_root, on_progress, mux=False,
+                  library=library)
     if not res.get("ok"):
         return res
     d = pending_dir(file_id, work_root)
@@ -961,13 +962,14 @@ def produce(path: str, probe: dict, file_id: int, work_root: str | None = None,
 
 
 def run_one(path: str, probe: dict, work_root: str | None = None,
-            on_progress=None, mux: bool = True, on_child=None) -> dict:
+            on_progress=None, mux: bool = True, on_child=None,
+            library: str | None = None) -> dict:
     """Convert every eligible track and produce a new file. Replaces nothing.
 
     The caller commits, so this inherits the Plex gate, the disk pacing and
     the DrivePool-aware move rather than reimplementing them badly.
     """
-    targets = select_targets(probe)
+    targets = select_targets(probe, library)
     if not targets:
         return {"ok": False, "why": "no English non-signs image sub to convert"}
     _TLS.on_child = on_child          # this thread's children only; see _TLS
@@ -1017,7 +1019,14 @@ def run_one(path: str, probe: dict, work_root: str | None = None,
                 sup = extract_sup(path, t["rel"], work, tag)
                 tick(base + span * 0.1, f"OCR track {i+1}/{n}{who}")
                 # ocr() moves the bar itself while it grinds - see its ticker.
-                srt = ocr(sup, tick, base + span * 0.1, span * 0.8, who)
+                # WHICHEVER ENGINE THIS LIBRARY CHOSE. Tesseract goes through
+                # pgsrip as it always has; PaddleOCR runs in its own process,
+                # reads italics far better, and can keep each cue's position.
+                if engine(library) == "paddle":
+                    srt = ocr_paddle(sup, tick, base + span * 0.1,
+                                     span * 0.8, who)
+                else:
+                    srt = ocr(sup, tick, base + span * 0.1, span * 0.8, who)
                 tick(base + span * 0.9, f"OCR track {i+1}/{n}{who} done")
             except Exception as e:
                 notes.append(f"rel {t['rel']}: {e}")
@@ -1093,6 +1102,7 @@ def status() -> dict:
                 "forced": bool(_s("subocr_forced", False, l.name)),
                 "all": bool(_s("subocr_all", False, l.name)),
                 "remove_image": bool(_s("subocr_remove_image", False, l.name)),
+                "engine": engine(l.name),
                 "signs_max_cpm": signs_max_cpm(l.name),
                 "dialogue_min_cues": dialogue_min_cues(l.name),
                 "has": (kinds.get(l.name)
@@ -1201,6 +1211,148 @@ def sub_rule(key: str, library: str | None = None) -> bool:
 
 
 _INSTALL = {"state": "idle", "log": "", "error": ""}
+
+
+# ------------------------------------------------------------- PaddleOCR ----
+# A SECOND ENGINE, NOT A REPLACEMENT. Measured on this library - 55 real PGS
+# cues from a dialogue track and an anime signs track:
+#
+#     engine              speed             disagreements   who was right
+#     Tesseract           ~135 ms/cue       2 of 55         Paddle, both times
+#     PaddleOCR (CPU)     ~2000 ms/cue      "
+#     PaddleOCR (GPU)     ~200 ms/cue       "
+#
+# Both of Tesseract's misses were ITALICS - "lLlknow ldo." for "I know I do."
+# - which is its known weakness and common in subtitles. So Paddle is the
+# more accurate reader, and on a GPU it costs nothing for that; on CPU it is
+# fifteen times slower, which is why Tesseract stays the default and remains
+# the right answer on a machine with no card.
+
+PADDLE_INSTALL = {"state": "idle", "mode": "", "log": "", "error": ""}
+# The GPU build is not on PyPI; it comes from Paddle's own index. TWO
+# SEPARATE pip RUNS, because `-i` REPLACES the index rather than adding to it -
+# asking Paddle's server for `paddleocr` returns "from versions: none", which
+# is what the first attempt did. So each package is fetched from the index
+# that actually has it.
+_PADDLE_GPU_INDEX = "https://www.paddlepaddle.org.cn/packages/stable/cu126/"
+_PADDLE_STEPS = {
+    "gpu": [["paddlepaddle-gpu==3.3.1", "-i", _PADDLE_GPU_INDEX],
+            ["paddleocr"]],
+    "cpu": [["paddlepaddle"], ["paddleocr"]],
+    "update": [["--upgrade", "paddleocr"]],
+}
+
+
+def paddle_info() -> dict:
+    """Which Paddle is installed, and can it see the card."""
+    import subprocess as _sp
+    import sys as _sys
+    out = {"installed": False, "paddleocr": "", "paddlepaddle": "",
+           "cuda": False, "gpu_name": "", "install": dict(PADDLE_INSTALL)}
+    code = (
+        "import json\n"
+        "d={}\n"
+        "try:\n"
+        "    import paddleocr; d['paddleocr']=getattr(paddleocr,'__version__','?')\n"
+        "except Exception: pass\n"
+        "try:\n"
+        "    import paddle; d['paddlepaddle']=paddle.__version__\n"
+        "    d['cuda']=bool(paddle.device.is_compiled_with_cuda())\n"
+        "except Exception: pass\n"
+        "print(json.dumps(d))\n")
+    try:
+        # ASKED IN A CHILD, ALWAYS. Importing paddle into the server process
+        # just to learn whether paddle exists would pull hundreds of MB of
+        # native code nuarr otherwise never touches - and would let a broken
+        # wheel kill the web server on a settings page load.
+        r = _sp.run([_sys.executable, "-c", code], capture_output=True,
+                    text=True, timeout=120, creationflags=NO_WINDOW)
+        lines = [l for l in (r.stdout or "").strip().splitlines() if l.strip()]
+        if lines:
+            d = json.loads(lines[-1])
+            out.update(paddleocr=d.get("paddleocr", ""),
+                       paddlepaddle=d.get("paddlepaddle", ""),
+                       cuda=bool(d.get("cuda")))
+            out["installed"] = bool(out["paddleocr"] and out["paddlepaddle"])
+    except Exception:                                    # noqa: BLE001
+        pass
+    try:
+        from . import encoders
+        out["gpu_name"] = encoders.devices().get("gpu_name", "")
+    except Exception:                                    # noqa: BLE001
+        pass
+    return out
+
+
+def paddle_install_start(mode: str) -> dict:
+    """Install PaddleOCR from the page - the Whisper pattern, second engine."""
+    import threading as _t
+    if mode not in _PADDLE_STEPS:
+        return {"ok": False, "error": f"unknown mode {mode!r}"}
+    if PADDLE_INSTALL["state"] == "installing":
+        return {"ok": False, "error": "an install is already running"}
+    PADDLE_INSTALL.update(state="installing", mode=mode, log="", error="")
+
+    def _work():
+        import subprocess as _sp
+        import sys as _sys
+        from collections import deque
+        tail: deque = deque(maxlen=40)
+        try:
+            for step in _PADDLE_STEPS[mode]:
+                cmd = [_sys.executable, "-m", "pip", "install",
+                       "--prefer-binary", "--no-warn-script-location"] + step
+                tail.append(f"$ pip install {' '.join(step)}")
+                p = _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.STDOUT,
+                              text=True, creationflags=NO_WINDOW)
+                for line in p.stdout:
+                    if line.strip():
+                        tail.append(line.rstrip())
+                        PADDLE_INSTALL["log"] = "\n".join(tail)
+                if p.wait() != 0:
+                    raise RuntimeError(f"pip exited {p.returncode} on "
+                                       f"{step[0]}")
+            PADDLE_INSTALL.update(state="done")
+            from . import joblog as _jl
+            _jl.log(f"PaddleOCR installed ({mode})", "ok")
+        except Exception as e:                           # noqa: BLE001
+            PADDLE_INSTALL.update(state="error",
+                                  error=f"{type(e).__name__}: {str(e)[:160]}")
+    _t.Thread(target=_work, name="paddle-install", daemon=True).start()
+    return {"ok": True, "mode": mode}
+
+
+def engine(library: str | None = None) -> str:
+    """Which OCR engine this library uses. Tesseract unless told otherwise."""
+    e = str(_s("subocr_engine", "tesseract", library) or "tesseract").lower()
+    return e if e in ("tesseract", "paddle") else "tesseract"
+
+
+def ocr_paddle(sup: str, tick=None, base: float = 0.0, span: float = 1.0,
+               who: str = "", ass: bool = False, device: str = "") -> str:
+    r"""Read a .sup with PaddleOCR, in its own process.
+
+    Returns the path it produced - .srt normally, .ass when `ass` is set,
+    which is the mode that keeps each cue's position on screen.
+    """
+    import sys as _sys
+    dev = device or ("gpu" if paddle_info().get("cuda") else "cpu")
+    out = os.path.splitext(sup)[0] + (".ass" if ass else ".srt")
+    args = [_sys.executable,
+            os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "paddle_worker.py"),
+            sup, "--out", out, "--device", dev, "--progress"]
+    if ass:
+        args.append("--ass")
+    if tick:
+        tick(base, f"OCR{who} (PaddleOCR, {dev})")
+    rc, err = _run(args, timeout=7200)
+    if not os.path.exists(out):
+        raise RuntimeError(f"PaddleOCR produced nothing (rc={rc}): "
+                           f"{err.strip()[:300]}")
+    if tick:
+        tick(base + span, f"OCR{who} done")
+    return out
 
 
 def pip_update_start() -> dict:

@@ -284,6 +284,9 @@ class Settings:
     # Image subs whose text version now exists: demote them (default, and
     # reversible) or drop them from the file entirely.
     subocr_remove_image: bool = False
+    # Which OCR engine reads the pictures: "tesseract" (bundled, fast on any
+    # CPU) or "paddle" (more accurate on italics, wants a GPU).
+    subocr_engine: str = "tesseract"
     subocr_sdh: bool = True              # convert SDH image subs too
     subocr_all: bool = False             # override: OCR every kept PGS track
     subocr_signs_unburned: bool = True   # convert signs when nothing burns them

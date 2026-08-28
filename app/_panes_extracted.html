@@ -247,6 +247,19 @@
           <div class="dim" style="padding:14px">loading&hellip;</div>
         </div>
       </div>
+      <div id="paddlePane" style="display:none">
+        <div class="dim" style="padding:9px 14px;font-size:11px">
+          A second OCR engine, and the more accurate one. Tesseract is bundled
+          and works on any machine; PaddleOCR is a modern neural reader that
+          gets italics right &mdash; the case Tesseract reliably mangles &mdash;
+          and, because it decodes each subtitle image itself, it can keep
+          <b>where on screen</b> that subtitle belonged. It wants a GPU: on
+          CPU it is roughly fifteen times slower than Tesseract.
+        </div>
+        <div id="paddleBody" style="padding:0 14px 14px">
+          <div class="dim" style="padding:14px">loading&hellip;</div>
+        </div>
+      </div>
       <div id="updPane" style="display:none">
   <div class="dim" style="padding:9px 14px;font-size:11px">
     Which nuarr this is, and whether there is a newer one. Checking is

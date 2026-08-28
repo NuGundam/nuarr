@@ -2877,7 +2877,7 @@ async def _sub_ocr(w: Worker, probe_data: dict) -> None:
                        "rewriting here", "info", job.id)
             res = await asyncio.to_thread(subocr.produce, job.path, probe_data,
                                           job.file_id, SETTINGS.cache_dir,
-                                          _prog)
+                                          _prog, _library_of_file(job.file_id))
             for n in res.get("notes", []):
                 joblog.log(n, "info", job.id)
             if res.get("ok"):
@@ -2895,7 +2895,8 @@ async def _sub_ocr(w: Worker, probe_data: dict) -> None:
 
         res = await asyncio.to_thread(subocr.run_one, job.path, probe_data,
                                       SETTINGS.cache_dir, _prog, True,
-                                      lambda p: setattr(w, "proc", p))
+                                      lambda p: setattr(w, "proc", p),
+                                      _library_of_file(job.file_id))
         w.proc = None
     for n in res.get("notes", []):
         joblog.log(n, "info", job.id)
@@ -3040,7 +3041,8 @@ async def _transcode(w: Worker, probe_data: dict) -> None:
                 w.sub_ocr_active = True      # claims a subocr slot from here
                 _sub_task = asyncio.create_task(asyncio.to_thread(
                     _so_pre.produce, job.path, probe_data, job.file_id,
-                    SETTINGS.cache_dir, _sub_tick))
+                    SETTINGS.cache_dir, _sub_tick,
+                    _library_of_file(job.file_id)))
     except Exception as e:
         joblog.log(f"could not start the side OCR (continuing without): "
                    f"{type(e).__name__}: {e}", "warn", job.id)
@@ -4113,6 +4115,24 @@ def _mkv_sub_tracks(src: str) -> list[dict]:
         out.append({"id": t.get("id"), "lang": p.get("language") or "",
                     "name": p.get("track_name") or ""})
     return out
+
+
+def _library_of_file(file_id: int) -> str | None:
+    """Which library a job's file belongs to.
+
+    The subtitle settings are per library and the job row does not carry the
+    name, so it is looked up once per OCR job - a single indexed read against
+    a decision that then governs the whole pass.
+    """
+    if not file_id:
+        return None
+    try:
+        with cursor() as cur:
+            r = cur.execute("SELECT library FROM files WHERE id=?",
+                            (file_id,)).fetchone()
+        return (r["library"] if r else None) or None
+    except Exception:                                    # noqa: BLE001
+        return None
 
 
 # ---------------------------------------------------------------- ffmpeg ---
