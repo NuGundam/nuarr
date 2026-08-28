@@ -250,7 +250,13 @@ def stage(force: bool = False) -> dict:
     import os
     import shutil
     import zipfile
-    st = check()
+    # FRESH METADATA, ALWAYS. The daily check's cache can be hours old, and a
+    # release asset can be replaced in that window - which happened: the cached
+    # size described the old exe, the URL served the new one, and the byte
+    # count refused a perfectly good download 527 bytes away from its stale
+    # expectation. The size check only means something when the size and the
+    # download come from the same moment.
+    st = check(force=True)
     latest = st.get("latest") or ""
     if not latest or not version.is_newer(latest):
         return {"ok": False, "error": "no newer release to stage"}
