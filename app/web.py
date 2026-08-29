@@ -9430,6 +9430,25 @@ function followBtn(id){
             onclick="resumeFollow('${id}')">↓ resume auto-scroll</button>`;
 }
 
+// A CONTROL THAT CANNOT WORK HERE SHOULD NOT LOOK CLICKABLE.
+// Every "Install — GPU" button was offered on machines with no NVIDIA card:
+// pressing it downloaded a CUDA build that could only ever fall back to the
+// CPU, or failed outright. Greying it is not enough on its own either - a
+// disabled control with no explanation reads as a bug - so this pairs the
+// disable with the reason, in the tooltip and beside the button.
+//   gate(cond, why, html)  -> html, or the same html disabled and explained.
+function gate(ok, why, html){
+  if(ok) return html;
+  return html
+    .replace(/<button/g, `<button disabled title="${esc(why)}"`)
+    .replace(/<select/g, `<select disabled title="${esc(why)}"`)
+    .replace(/<input/g,  `<input disabled title="${esc(why)}"`);
+}
+// The line that says why, for putting next to whatever was just gated.
+function gateWhy(ok, why){
+  return ok ? '' : `<span class="dim" style="font-size:11px">${esc(why)}</span>`;
+}
+
 // THE SAME "do not move while I am reading" RULE, for a TOP-anchored panel.
 // paint() above is for feeds that grow downward and auto-scroll to the
 // bottom. The rule check and the Plex playback table are lists sorted
@@ -18134,9 +18153,15 @@ async function loadOcr(){
   } else {
     const hasGpu=!!p.gpu_name;
     padStrip=`<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-      ${(!padReady||!p.cuda)?`<button onclick="padInstall('gpu')" ${hasGpu?'style="color:var(--acc)"':''}
-          >Install — GPU${hasGpu?` (${esc(p.gpu_name)})`:''}</button>`:''}
+      ${(!padReady||!p.cuda)
+        ? gate(hasGpu,
+            'no NVIDIA GPU was detected here — the GPU build needs one, and '
+            + 'would fall back to the CPU anyway. Install the CPU build instead.',
+            `<button onclick="padInstall('gpu')" ${hasGpu?'style="color:var(--acc)"':''}
+              >Install — GPU${hasGpu?` (${esc(p.gpu_name)})`:''}</button>`)
+        : ''}
       ${!padReady?`<button onclick="padInstall('cpu')">Install — CPU only</button>`:''}
+      ${(!padReady||!p.cuda)?gateWhy(hasGpu,'no NVIDIA GPU detected'):''}
       ${inst.state==='error'?`<span style="color:#e0575b;font-size:11px">${esc(inst.error||'')}</span>`:''}
       ${inst.state==='done'?`<span style="color:#7fd4a3;font-size:11px">done</span>`:''}
     </div>`;
@@ -18402,11 +18427,18 @@ async function loadWhisper(){
   } else {
     let btns='';
     if(!w.installed){
+      // Same gate as the OCR page: the GPU install is offered only where a
+      // GPU exists. Previously both buttons were live on every machine, with
+      // the order swapped as the only hint - which is not a hint, it is a
+      // trap that downloads ~2 GB of CUDA onto a box that cannot use it.
       btns = (w.nvidia_present
         ? `<button onclick="whisInstall('gpu')">Install — NVIDIA GPU</button>
            <button onclick="whisInstall('cpu')">Install — CPU only</button>`
-        : `<button onclick="whisInstall('cpu')">Install — CPU</button>
-           <button onclick="whisInstall('gpu')">Install — NVIDIA GPU</button>`);
+        : `<button onclick="whisInstall('cpu')">Install — CPU</button>`
+          + gate(false,
+              'no NVIDIA GPU was detected here — this downloads about 2 GB of '
+              + 'CUDA runtime that could not be used.',
+              `<button onclick="whisInstall('gpu')">Install — NVIDIA GPU</button>`));
       strip=`<div style="margin-top:8px;font-size:11.5px" class="dim">
         Without it, nuarr still names untagged audio by <b>inference</b>
         (original language from TMDB/TheTVDB when the file's shape makes that
