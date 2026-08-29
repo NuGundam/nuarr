@@ -11993,10 +11993,18 @@ function idleSlots(j, ghosts){
 function sizeDoneBox(){
   const box=document.getElementById('doneBox');
   if(!box) return;
+  // SIZED TO THE WINDOW, not to 460 fixed pixels. The feed is the panel people
+  // actually read, and a third of a tall screen was being left empty below it
+  // while the list scrolled inside a letterbox. Floor of 460 so it never gets
+  // smaller than it used to be on a short window; cap so it stays a panel
+  // rather than swallowing the page.
   box.style.height = openLogId
-    ? Math.min(Math.round(window.innerHeight*0.72), 900)+'px'
-    : '460px';
+    ? Math.min(Math.round(window.innerHeight*0.78), 1100)+'px'
+    : Math.max(460, Math.min(Math.round(window.innerHeight*0.66), 900))+'px';
 }
+// Re-size on window resize: the height is a function of innerHeight, so a
+// resized window otherwise keeps whatever height it had when it was painted.
+addEventListener('resize', ()=>{ try{ sizeDoneBox(); }catch(e){} });
 
 function hms(s){ if(s==null) return '—';
   s=Math.max(0,Math.round(s)); const h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;
@@ -15304,9 +15312,29 @@ function renderDone(j){
     host.innerHTML=html;
     watchScrollTop('doneBox');
     sizeDoneBox();
-    // an open drop-down means you are reading; keep your place
+    // PUT THE SCROLL BACK ON EVERY FORCED REPAINT - the same rule paintTop
+    // uses for the Plex and Rule-check panels, and for the same reason.
+    //
+    // This used to restore only while something was open (_actOpen.size ||
+    // openLogId). Opening a row was therefore fine, and CLOSING the last one
+    // took the condition to false: the scroll was not restored, the box
+    // snapped to the top, and the entry you had just collapsed vanished
+    // upward. Clicking a row is a reason to keep your place whether the
+    // result is open or shut.
     const nb=document.getElementById('doneBox');
-    if(nb && (_actOpen.size||openLogId)) nb.scrollTop=keep;
+    if(nb && (forced || _actOpen.size || openLogId)) nb.scrollTop=keep;
+    // If the row that was just toggled still ended up outside the box -
+    // expanding it can push its own body past the bottom edge - bring the
+    // whole entry into view rather than leaving it half off-screen.
+    if(nb && _actJustToggled!=null){
+      const r=nb.querySelector('.actrow.rowopen');
+      if(r && r.getBoundingClientRect){
+        const rb=r.getBoundingClientRect(), bb=nb.getBoundingClientRect();
+        if(rb.top < bb.top || rb.bottom > bb.bottom)
+          nb.scrollTop += (rb.top - bb.top) - 8;
+      }
+      _actJustToggled=null;
+    }
     _pending['doneBox']=0;
     const rb=document.getElementById('doneBoxResume');
     if(rb) rb.style.display='none';
@@ -15324,10 +15352,13 @@ function renderDone(j){
 let _actKeys=[];
 const _actOpen=new Set();
 let _actChangedAt=Date.now();     // when the feed's content last changed
+let _actJustToggled=null;        // set by a click, consumed by the repaint
+
 function actToggle(i){
   const t=_actKeys[i];
   if(t==null) return;
   if(_actOpen.has(t)) _actOpen.delete(t); else _actOpen.add(t);
+  _actJustToggled=t;
   doneForce=true; lastListSig=null;
   renderDone(lastJobs);
 }
