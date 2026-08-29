@@ -554,7 +554,21 @@ function Load-Detected {
   $S.DetPlexTok = $tok
   $rPlex.Status.Text = if ($tok) { 'Token found on the local Plex server - leave blank to use it' } else { 'No local Plex server - paste a token if you have one' }
   # whisper
-  if ($S.Gpu) {
+  # CANNOT BEATS WOULD-BE-SLOW. Below, a machine with no GPU is still offered
+  # CPU inference, deliberately - it works, and the box should not forbid what
+  # merely costs time. A CPU without AVX2 is a different answer entirely: the
+  # model does not run slowly there, it terminates the process. Checked first,
+  # so "this machine cannot" wins over "this machine would be slower".
+  if (-not (Test-Avx2)) {
+    $chkWhisper.Enabled = $false
+    $chkWhisper.Checked = $false
+    $S.Whisper = $false
+    $lblWhy.Text = "This CPU does not support AVX2, which the language identifier requires." + [Environment]::NewLine +
+                   "It cannot run here - not on the CPU, and not on a GPU either, because the" + [Environment]::NewLine +
+                   "same library does the loading. Everything else in nuarr works; untagged" + [Environment]::NewLine +
+                   "audio is named by inference instead."
+  }
+  elseif ($S.Gpu) {
     $chkWhisper.Enabled = $true
     $lblWhy.Text = "Downloads about 2 GB (faster-whisper and the CUDA runtime) plus a 464 MB model.`nWithout it nuarr works normally; the audio-language feature simply stays off.`nDetected: $($S.Gpu)"
   } else {

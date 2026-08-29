@@ -12821,9 +12821,49 @@ async function ffNvenc(){
   try{ d=await (await fetch('/api/ffmpeg/nvenc')).json(); }
   catch(_){ el.innerHTML=''; return; }
   const u=d.upgrade||{};
+  // NVIDIA IS NOT THE ONLY GPU, AND "NO GPU" IS NOT A FAULT.
+  //
+  // This block was written when NVENC was the only hardware path, so it
+  // reported every machine against NVIDIA: a box with an Intel iGPU, or no
+  // GPU at all, got "GPU encode UNAVAILABLE", a red "no NVIDIA driver", and a
+  // table of NVIDIA driver requirements it could never satisfy. All true, all
+  // irrelevant, and it reads as breakage on a machine that is working exactly
+  // as intended.
+  //
+  // The encoder probe already tests NVENC, QuickSync and AMF by running each
+  // one; that answer is what this panel should be showing.
+  // The probe result lives on the codec page's payload, which is only loaded
+  // when that page has been opened - so ask for it directly here rather than
+  // silently reporting nothing on a fresh visit to this tab. Cached for the
+  // session: running three test encodes is not something to repeat per poll.
+  let fam = {};
+  try{ fam = ((_cod && _cod.encoders && _cod.encoders.families) || {}); }catch(e){}
+  if(!Object.keys(fam).length){
+    if(!window._encFam){
+      try{ window._encFam = (await (await fetch('/api/encoders')).json()).families || {}; }
+      catch(e){ window._encFam = {}; }
+    }
+    fam = window._encFam;
+  }
+  const hw = ['nvenc','qsv','amf'].filter(k=>fam[k]);
+  const hwOk = hw.filter(k=>fam[k].ok);
+  const anyGpuPresent = d.ok || d.driver || hwOk.length ||
+                        (d.cause && d.cause.reason && !/no NVIDIA/i.test(d.cause.reason));
   const test = d.ok
     ? `<span class="pill p-ok">GPU encode OK</span>`
-    : `<span class="pill p-bad">GPU encode UNAVAILABLE</span>`;
+    : hwOk.length
+      ? `<span class="pill p-ok">GPU encode OK — ${esc(fam[hwOk[0]].label)}</span>`
+      : anyGpuPresent
+        ? `<span class="pill p-bad">GPU encode UNAVAILABLE</span>`
+        : `<span class="pill p-warn">CPU mode only</span>`;
+  // Per-vendor line, so the answer is about THIS machine rather than about
+  // one vendor's absence.
+  const hwLine = !hw.length ? '' :
+    `<div class="dim" style="margin-top:4px;font-size:11px">`
+    + hw.map(k=>`${esc(fam[k].label)}: ${fam[k].ok
+        ? '<span style="color:#7fd4a3">works</span>'
+        : '<span class="dim">not available</span>'}`).join(' &nbsp;·&nbsp; ')
+    + ` &nbsp;·&nbsp; CPU (x264/x265): <span style="color:#7fd4a3">always</span></div>`;
   const drv = d.driver ? `<span class="dim">NVIDIA driver ${esc(d.driver)}</span>` : '';
   let advice='';
   if(u.known && d.update_available){
@@ -12842,7 +12882,10 @@ async function ffNvenc(){
   // keep the raw ffmpeg text underneath so an unrecognised cause still shows
   // everything we know rather than being swallowed by a friendly summary.
   const c = d.cause || {};
-  const why = d.ok ? '' :
+  // Only explain the NVENC failure on a machine that has something to fail.
+  // "no NVIDIA driver" is not a diagnosis on a box with an AMD card or no
+  // card at all - it is a description of the hardware it does not have.
+  const why = (d.ok || !anyGpuPresent) ? '' :
       `<div style="margin-top:4px;font-size:11px">`
     + `<b class="err">${esc(c.reason||'unknown')}</b>`
     + (c.meaning?` <span class="dim">— ${esc(c.meaning)}</span>`:'')
@@ -12850,14 +12893,29 @@ async function ffNvenc(){
     + `</div>`
     + (d.error?`<div class="mono dim" style="margin-top:3px;font-size:10px;
          overflow-wrap:anywhere">ffmpeg said: ${esc(d.error)}</div>`:'');
+  const cpuNote = anyGpuPresent ? '' :
+    `<div class="dim" style="margin-top:4px;font-size:11px">
+       No hardware encoder was found, so encodes use the CPU (x264/x265).
+       That is slower per file and produces smaller files at the same quality
+       — nothing is broken, and nuarr plans exactly the same way.</div>`;
   el.innerHTML = `<div style="display:flex;gap:9px;align-items:center;flex-wrap:wrap">`
-    + test + drv + advice + `</div>` + why + pinned;
+    + test + drv + advice + `</div>` + hwLine + why + cpuNote + pinned;
   // Let the header bubble reflect it too. The upgrade verdict exists ONLY on
   // this endpoint - /api/ffmpeg/check knows a newer build is out but not
   // whether this driver could run it - which is why ffCheck() on its own could
   // never paint the blocked state, and why the bubble kept saying "available".
-  ffDriver();          // cached six hours server-side, so this is cheap
+  // IS THERE AN NVIDIA CARD HERE AT ALL - which is not the same question as
+  // "does NVENC work". A card with a broken or old driver still wants the
+  // requirements table; a machine with no card never does. `d.driver` is the
+  // driver version nvidia-smi reported, so its presence is the evidence.
+  window._ffNvidiaSeen = !!(d.ok || d.driver ||
+      (c.reason && !/no NVIDIA/i.test(c.reason) && /driver|cuda|nvenc/i.test(c.reason)));
+  // SET THE VERDICT BEFORE ANYTHING READS IT. These two lines used to sit
+  // AFTER the ffDriver() call, so the driver table decided whether to show
+  // itself using the PREVIOUS result - which is invisible on a machine whose
+  // answer never changes, and wrong the moment it does.
   _ffNvencOk = d.ok; _ffNvencWhy = d.ok ? '' : (c.reason||'GPU encode blocked');
+  ffDriver();          // cached six hours server-side, so this is cheap
   _ffUp = {
     blocked: !!(d.update_available && u.known && u.safe === false),
     latest:  short(u.latest || d.latest || ''),
@@ -12871,6 +12929,16 @@ async function ffNvenc(){
 async function ffDriver(force){
   const el=document.getElementById('ffDriver');
   if(!el) return;
+  // A TABLE OF NVIDIA DRIVER REQUIREMENTS IS ONLY NEWS TO AN NVIDIA MACHINE.
+  // On a box with an Intel iGPU, an AMD card, or nothing, three rows of
+  // "no driver available yet" in red described a card it does not have and
+  // will never need - the most alarming thing on the page, about nothing.
+  let hasNvidia = _ffNvencOk || !!window._ffNvidiaSeen;
+  try{
+    const f = ((_cod && _cod.encoders && _cod.encoders.families) || {});
+    hasNvidia = hasNvidia || (f.nvenc && f.nvenc.ok);
+  }catch(e){}
+  if(!hasNvidia && !force){ el.innerHTML=''; return; }
   if(!el.innerHTML || force)
     el.innerHTML='<div class="skel"><i style="width:38%"></i>'
                 +'<i style="width:58%"></i></div>';

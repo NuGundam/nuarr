@@ -64,6 +64,35 @@ function Invoke-Native {
   try { & $Body } finally { $ErrorActionPreference = $old }
 }
 
+function Test-Avx2 {
+  <#  Can this CPU run the language identifier at all?
+
+      faster-whisper runs on CTranslate2, which is compiled for AVX2. On a CPU
+      without it the model does not fail to load - it executes an illegal
+      instruction and Windows kills the process (0xC000001D). 1.5.0 made the
+      app survive that by probing in a child; 1.5.1 made Setup check before
+      downloading the model. Both happen AFTER the box is ticked, which is too
+      late to be useful: the honest place to say "this machine cannot" is the
+      checkbox itself.
+
+      IsProcessorFeaturePresent is a kernel32 call with no dependencies, so
+      this works on the Options page before Python or pip exist. 40 is
+      PF_AVX2_INSTRUCTIONS_AVAILABLE. #>
+  try {
+    if (-not ('NuarrCpu.Feat' -as [type])) {
+      Add-Type -Namespace NuarrCpu -Name Feat -MemberDefinition @"
+[System.Runtime.InteropServices.DllImport("kernel32.dll")]
+public static extern bool IsProcessorFeaturePresent(uint feature);
+"@
+    }
+    return [bool][NuarrCpu.Feat]::IsProcessorFeaturePresent(40)
+  } catch {
+    # UNKNOWN IS NOT NO. If the probe itself cannot run, do not disable a
+    # feature that probably works - the install-time check still guards it.
+    return $true
+  }
+}
+
 function Find-Python {
   <#  The newest CPython 3.11+ we can find, preferring the py launcher.
       Returns @{Exe;Version} or $null. #>
