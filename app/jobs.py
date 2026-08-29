@@ -58,7 +58,106 @@ MIN_SAVING = 0.05
 # already capped at maxrateFactor (1.5) x the source bitrate, so a healthy
 # conversion lands at or below ~150%; measured AV1 -> HEVC came in at 100-140%.
 # This ceiling is not a size policy, it is a "the encode went wrong" detector.
+#
+# KEPT ONLY AS THE FALLBACK for plans stored before src_height / src_vcodec
+# existed. Live decisions use growth_allowance() below, because a flat ratio
+# is the wrong instrument - see the comment there.
 MAX_GROWTH = 1.75
+
+# HOW MUCH A CONVERSION MAY GROW, AND WHY A RATIO ALONE CANNOT SAY.
+#
+# A DVD-era Swat Kats episode was converted mpeg4 -> h264 for compatibility.
+# It came out at 175% (175 MB -> 306 MB) and was discarded as "the encode
+# looks wrong". It was not wrong. The output was 480p at 1.6 Mbps - a
+# perfectly ordinary bitrate for standard definition. The file then stayed in
+# the codec the conversion existed to remove, got re-flagged by the rule
+# check, re-encoded, re-discarded, forever.
+#
+# Two things the flat ceiling could not know:
+#
+#   1. OLD CODECS GROW ON PURPOSE. A quality-targeted encode has to reproduce
+#      what it is given, and a low-bitrate mpeg4/VC-1/RealVideo source is
+#      full of blocking and mosquito noise. Those artefacts are high-frequency
+#      detail and cost real bits to preserve. Growth is the expected outcome
+#      of converting a bad old encode faithfully, not evidence of a fault.
+#
+#   2. RATIO IS RELATIVE TO A NUMBER THAT MAY ITSELF BE TINY. Doubling
+#      0.8 Mbps is unremarkable; doubling 20 Mbps is not. The same "175%"
+#      describes both.
+#
+# So the question is asked the way a person would ask it: IS THE OUTPUT
+# BITRATE SANE FOR THIS RESOLUTION? That reuses the per-tier Mbps ceilings the
+# space-saver already exposes in Settings, so the numbers stay ones you set
+# and can see - no new hidden constants. And because
+#     output_mbps = ratio x source_mbps
+# it needs no duration lookup and no second probe.
+#
+# Generation numbers below are "how efficient is the codec this came from",
+# which is what decides whether growth is expected.
+_CODEC_GEN = {
+    # pre-h264: inefficient, and in practice always low-bitrate sources
+    "mpeg1video": 1, "mpeg2video": 1, "mpeg4": 1, "msmpeg4": 1,
+    "msmpeg4v1": 1, "msmpeg4v2": 1, "msmpeg4v3": 1, "wmv1": 1, "wmv2": 1,
+    "wmv3": 1, "vc1": 1, "h263": 1, "h263p": 1, "flv1": 1, "theora": 1,
+    "rv10": 1, "rv20": 1, "rv30": 1, "rv40": 1, "svq1": 1, "svq3": 1,
+    "cinepak": 1, "indeo3": 1, "indeo4": 1, "indeo5": 1, "dvvideo": 1,
+    # the h264 era
+    "h264": 2, "avc": 2, "vp8": 2,
+    # modern, more efficient than the usual targets - converting DOWN from
+    # these grows by design (the AV1 -> HEVC case this gate first learned on)
+    "hevc": 3, "h265": 3, "vp9": 3, "av1": 3,
+}
+# Ratio headroom by source generation: proportionate growth that needs no
+# further justification. Old codecs get more because converting them
+# faithfully costs bits (see above).
+_GEN_GROWTH = {1: 3.0, 2: 1.75, 3: 1.75}
+# The absolute stop. Past this the output is not "larger", it is wrong, and no
+# bitrate argument rescues it. Old sources get more room for the same reason
+# they get more ratio.
+_GEN_HARD_CAP = {1: 4.0, 2: 2.5, 3: 2.5}
+
+
+def growth_allowance(plan, size_before: int = 0) -> tuple[float, str]:
+    """(max acceptable ratio, how it was decided) for a compatibility encode.
+
+    Returns a RATIO so the caller's arithmetic stays unchanged, but the number
+    comes from an absolute bitrate judgement:
+
+        allow the LARGER of
+            proportionate growth for this codec generation, and
+            whatever this RESOLUTION comfortably needs
+        but never past the hard cap.
+
+    The middle term is what rescues the DVD case: 3 Mbps is unremarkable for
+    standard definition whatever the source happened to be, so an 0.9 Mbps
+    mpeg4 may triple and still be ordinary. The hard cap is what stops that
+    reasoning being abused - it was tried without one, and a 4 Mbps AV1 file
+    could have ballooned 5.5x to 22 Mbps and still passed as "fine for 1080p".
+    """
+    src_mbps = float(getattr(plan, "source_mbps", 0) or 0)
+    height = int(getattr(plan, "src_height", 0) or 0)
+    vcodec = (getattr(plan, "src_vcodec", "") or "").lower()
+    gen = _CODEC_GEN.get(vcodec, 2)
+    gen_ratio = _GEN_GROWTH.get(gen, MAX_GROWTH)
+    hard = _GEN_HARD_CAP.get(gen, 2.5)
+    if not src_mbps or not height:
+        # Plan predates the fields, or the probe gave nothing to reason from.
+        return gen_ratio, "no source bitrate on the plan - flat ceiling"
+    try:
+        from . import rules
+        tier = rules._res_tier(height)
+        # HALF the space-saver ceiling. That ceiling is "above this we would
+        # shrink it" - an upper bound of tolerable, not a target. Half of it
+        # is comfortably normal for the resolution, which is the question
+        # being asked here.
+        comfy = float(rules.CONFIG["spaceSaver"]["maxMbps"][tier]) / 2.0
+    except Exception:                                        # noqa: BLE001
+        return gen_ratio, "resolution ceiling unavailable - codec ceiling only"
+    allowed = min(max(gen_ratio, comfy / src_mbps), hard)
+    return (allowed,
+            f"up to {allowed * src_mbps:.1f} Mbps is normal for {tier} "
+            f"(source {src_mbps:.1f} Mbps {vcodec or 'unknown codec'}, "
+            f"{comfy:.1f} Mbps is unremarkable at this resolution)")
 
 REFRESH_DEBOUNCE_S = 120.0
 _LAST_REFRESH: dict[tuple[str, int], float] = {}
@@ -3328,15 +3427,21 @@ async def _transcode(w: Worker, probe_data: dict) -> None:
     # maxrateFactor x source, so a healthy conversion lands near that; anything
     # far beyond it means something went wrong and is still discarded.
     grow_ok = bool(getattr(job.plan, "grow_ok", False))
-    limit = MAX_GROWTH if grow_ok else (1.0 - MIN_SAVING)
+    if grow_ok:
+        limit, how = growth_allowance(job.plan, size_before)
+    else:
+        limit, how = (1.0 - MIN_SAVING), "a shrink has to shrink"
     if job.plan.encode and ratio > limit:
         await asyncio.to_thread(_rm, out)
         if grow_ok:
+            src_mbps = float(getattr(job.plan, "source_mbps", 0) or 0)
+            out_mbps = ratio * src_mbps
             msg = (f"discarded: re-encode produced {ratio*100:.0f}% of the "
                    f"original ({size_before/1024**2:.0f} MB -> "
-                   f"{size_after/1024**2:.0f} MB), past the "
-                   f"{MAX_GROWTH*100:.0f}% ceiling for a compatibility "
-                   f"conversion - the encode looks wrong, not merely larger")
+                   f"{size_after/1024**2:.0f} MB)"
+                   + (f" — {out_mbps:.1f} Mbps, and {how}"
+                      if src_mbps else f", past the {limit*100:.0f}% ceiling")
+                   + " - the encode looks wrong, not merely larger")
             reason = "compatibility re-encode grew beyond the ceiling"
         else:
             msg = (f"discarded: re-encode produced {ratio*100:.0f}% of the "

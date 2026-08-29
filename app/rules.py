@@ -442,6 +442,14 @@ class Plan:
     # mismatch. Zero means "unknown" (plans stored before the field existed)
     # and disables the check rather than failing it.
     src_size: int = 0
+    # Source picture height and codec, carried so the SIZE GATE can judge the
+    # output the way a person would: is the resulting BITRATE sane for this
+    # resolution, and was the source a codec generation that grows on
+    # conversion. Both were known at decide() time and thrown away, which left
+    # the gate with nothing but a blanket ratio. Zero / "" means a plan stored
+    # before these existed, and the gate falls back to the old flat ceiling.
+    src_height: int = 0
+    src_vcodec: str = ""
     # Index of the subtitle that should carry forced+default: the one track
     # allowed to appear without being asked for. See autoShowForcedOnly.
     forced_sub: int | None = None
@@ -470,6 +478,7 @@ class Plan:
             "burn_image": self.burn_image, "default_sub": self.default_sub,
             "clear_flags": self.clear_flags, "ten_bit": self.ten_bit,
             "grow_ok": self.grow_ok, "src_size": self.src_size,
+            "src_height": self.src_height, "src_vcodec": self.src_vcodec,
             "forced_sub": self.forced_sub, "sub_disps": self.sub_disps,
             "venc": self.venc, "audio_lang_tags": self.audio_lang_tags,
             "actions": [{"kind": a.kind, "what": a.what, "why": a.why,
@@ -512,6 +521,8 @@ def plan_from_dict(d: dict) -> Plan:
              ten_bit=bool(d.get("ten_bit")),
              grow_ok=bool(d.get("grow_ok")),
              src_size=int(d.get("src_size") or 0),
+             src_height=int(d.get("src_height") or 0),
+             src_vcodec=str(d.get("src_vcodec") or ""),
              forced_sub=d.get("forced_sub"),
              # plans stored before this field existed load as [] and the
              # executor falls back to the old behaviour for them
@@ -1379,6 +1390,9 @@ def decide(probe: dict, *, anime: bool = False, filename: str = "",
         (size_bytes * 8 / duration / 1_000_000) if duration and size_bytes else 0)
 
     p.source_mbps = overall_mbps
+    # What the size gate needs to judge the OUTPUT rather than just its ratio.
+    p.src_height = height
+    p.src_vcodec = vcodec
 
     # ---- container -------------------------------------------------------
     fname = (fmt.get("format_name") or "")
