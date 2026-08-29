@@ -20565,13 +20565,54 @@ async function loadRules(){
          }).join('')}</table>
      </div>`;
 
-  el.innerHTML =
-    `<div class="rprofbox">
-       <div><span class="rprof anime">anime</span>
-            <span class="mono dim">${esc(d.profiles.anime)}</span></div>
-       <div><span class="rprof other">live action</span>
-            <span class="mono dim">${esc(d.profiles.other)}</span></div>
-     </div>` + variesBox
+  // HOW A TITLE IS CLASSIFIED, which is the first thing to understand and was
+  // the thing this box got wrong: it described a folder-name test that stopped
+  // being the whole answer when nuarr started reading genres from the arrs.
+  const KCLS = {anime:'anime', animation:'other', live:'other'};
+  const kinds = d.kinds || {};
+  const kindBox = `
+    <div class="lkind" style="padding:10px 12px;margin-bottom:10px">
+      <b style="color:#6fb0ff">What nuarr decides a title is</b>
+      <div class="dim" style="font-size:11px;margin-top:3px">
+        Read from Sonarr and Radarr — genres, original language, series type —
+        and re-read every 12 hours. The folder name is a <b>floor</b>, not the
+        verdict: a folder called Anime* makes a title anime on its own, and
+        metadata can only ever promote a title <i>to</i> anime, never demote
+        one out of it. That asymmetry is deliberate: demoting would strip the
+        Japanese audio from a subtitled release that a metadata provider had
+        simply mistagged.</div>
+      <table class="rtab" style="margin-top:7px">${
+        Object.keys(kinds).map(k=>`
+          <tr><td class="rk" style="white-space:nowrap">
+                <span class="rprof ${KCLS[k]||'other'}">${esc(kinds[k].label)}</span></td>
+              <td class="rv">${esc(kinds[k].how)}
+                ${kinds[k].audio_default?`<div class="dim" style="font-size:11px;margin-top:2px">
+                  audio kept by default: <span class="mono">${esc(kinds[k].audio_default)}</span></div>`:''}</td>
+          </tr>`).join('')}</table>
+    </div>`;
+
+  // THE WAY BACK. Every default here was measured on a real library; once a
+  // number is edited the original is nowhere on screen, and "what was it
+  // before I changed it" becomes a question only the source can answer.
+  const ch = d.changed || {};
+  const ck2 = Object.keys(ch);
+  const changedBox = !ck2.length
+    ? `<div class="dim" style="font-size:11.5px;margin-bottom:10px">
+         Everything below is at nuarr's recommended defaults.</div>`
+    : `<div class="lkind" style="padding:10px 12px;margin-bottom:10px">
+         <b style="color:#e2b341">Changed from the recommended defaults</b>
+         <div class="dim" style="font-size:11px;margin-top:3px">
+           The rules below describe what is in force. These are the ones you
+           have moved, with the value nuarr recommends beside them.</div>
+         <table class="rtab" style="margin-top:6px">${
+           ck2.map(k=>`<tr><td class="rk">${esc(ch[k].setting)}</td>
+             <td class="rv"><b>${esc(String(ch[k].now))}</b>
+               <span class="dim">— recommended
+                 <span class="mono">${esc(String(ch[k].recommended))}</span></span></td></tr>`).join('')}
+         </table>
+       </div>`;
+
+  el.innerHTML = kindBox + changedBox + variesBox
     + sect('Which pool a file goes to', d.pool)
     + sect('Video', d.video, 'Identical for both profiles.')
     + sect('Audio', d.audio,

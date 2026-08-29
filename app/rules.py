@@ -789,6 +789,23 @@ _POLICY_OF: dict[str, tuple[str, str]] = {
     # and break the row instead of correcting it.
 }
 
+# THE POLICY AND CONFIG DO NOT ALWAYS STORE THE SAME SHAPE, and reading one
+# as the other puts a wrong number on the page rather than a missing one.
+# Measured the moment this was wired up: maxrate is a PERCENT in the policy
+# (150) and a FACTOR in CONFIG (1.5), so the bitrate-cap row went from
+# "1.5x the source bitrate" to "150x" - a hundred-fold error, stated with
+# total confidence. Channels are a string in one and an int in the other, and
+# comparing those reported a change that had not happened.
+#
+# Each entry converts the POLICY value into CONFIG's shape and units.
+_NORM = {
+    "maxrateFactor":       lambda v: round(float(v) / 100.0, 3),
+    "surroundMaxChannels": lambda v: int(v),
+    "stripDVProfiles":     lambda v: [str(x) for x in v],
+    "copySurroundIfCodec": lambda v: [str(x) for x in v],
+    "copyStereoIfCodec":   lambda v: [str(x) for x in v],
+}
+
 # Rendered by joining, so a divergence marker has to arrive as a list - a bare
 # string would be joined character by character into "v, a, r, i, e, s".
 _LIST_KEYS = {"copySurroundIfCodec", "copyStereoIfCodec", "stripDVProfiles"}
@@ -806,6 +823,12 @@ class _Eff:
 
     def __init__(self) -> None:
         self.varies: dict[str, dict] = {}
+        # WHAT HAS BEEN MOVED OFF THE RECOMMENDED VALUE, so the page can show
+        # the way back. Every number in CONFIG is a default that was chosen
+        # for a reason and measured on a real library; once it is edited the
+        # original is nowhere on screen, and "what was it before I touched
+        # it" becomes a question only the source code can answer.
+        self.changed: dict[str, dict] = {}
         try:
             from . import codecpolicy as _cp
             self._pol = _cp.load() or {}
@@ -817,18 +840,33 @@ class _Eff:
         if not target or not self._pol:
             return CONFIG[key]
         side, pkey = target
+        norm = _NORM.get(key)
         seen: dict = {}
         for lib, sides in self._pol.items():
-            v = ((sides or {}).get(side) or {}).get(pkey, CONFIG[key])
+            raw = ((sides or {}).get(side) or {}).get(pkey)
+            if raw is None:
+                v = CONFIG[key]
+            else:
+                try:
+                    v = norm(raw) if norm else raw
+                except Exception:                        # noqa: BLE001
+                    v = CONFIG[key]      # unreadable value: quote the default
             seen.setdefault(_key_of(v), (v, []))[1].append(lib)
         if not seen:
             return CONFIG[key]
         if len(seen) == 1:
-            return next(iter(seen.values()))[0]
+            only = next(iter(seen.values()))[0]
+            if _cmp(only) != _cmp(CONFIG[key]):
+                self.changed[key] = {"setting": f"{side}/{pkey}",
+                                     "now": only,
+                                     "recommended": CONFIG[key],
+                                     "libraries": []}
+            return only
         # Libraries disagree. Say so rather than picking one and being wrong
         # for everybody else; the breakdown rides along for the page.
         self.varies[key] = {
             "setting": f"{side}/{pkey}",
+            "recommended": CONFIG[key],
             "values": [{"value": v, "libraries": libs}
                        for v, libs in seen.values()],
         }
@@ -844,6 +882,26 @@ def _key_of(v):
     return tuple(v) if isinstance(v, list) else v
 
 
+def _cmp(v):
+    """Canonical form for ASKING "is this still the default", never for display.
+
+    ['7','8'] and [7,8] are the same profiles written twice; '6' and 6 are the
+    same channel count. Comparing them raw reported settings as changed that
+    nobody had touched, which would have sent someone looking for an edit they
+    never made.
+    """
+    if isinstance(v, (list, tuple)):
+        return tuple(str(x).strip() for x in v)
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip()
+    try:
+        f = float(s)
+        return int(f) if f == int(f) else f
+    except ValueError:
+        return s.lower()
+
+
 def _u(v, unit: str) -> str:
     """'640 kbps', but 'varies by library' without a stray unit after it.
 
@@ -857,6 +915,51 @@ def _u(v, unit: str) -> str:
 def _effective_config() -> tuple[_Eff, dict]:
     e = _Eff()
     return e, e.varies
+
+
+def _profiles() -> dict:
+    """The three content kinds, described the way they are ACTUALLY decided.
+
+    This block used to say anime meant "any path under a folder starting with
+    'Anime'", which stopped being true when contentkind started asking the
+    arrs. On this library that description was wrong about 409 files in both
+    directions at once: 282 titles in Animated Shows are anime by metadata,
+    and 127 in Anime Shows carry no animation genre at all. A page describing
+    a rule the engine no longer follows is worse than no page.
+
+    Built from langpolicy.KIND_LABELS so a fourth kind cannot be added to the
+    engine and forgotten here.
+    """
+    try:
+        from . import langpolicy as _lp
+        labels = dict(_lp.KIND_LABELS)
+        defaults = dict(_lp.KIND_DEFAULTS)
+    except Exception:                                    # noqa: BLE001
+        labels, defaults = {"anime": "Anime", "animation": "Animation",
+                            "live": "Live action"}, {}
+    how = {
+        "anime": "genre Anime, or Sonarr's seriesType, or an animation genre "
+                 "with a Japanese/Chinese/Korean original language. A folder "
+                 "named Anime* also counts on its own - the folder is a FLOOR, "
+                 "not the whole answer, and metadata can only ever promote a "
+                 "title TO anime, never demote one out of it.",
+        "animation": "an animation genre without an Asian original language - "
+                     "western animation. Same rules as live action today, but "
+                     "its own defaults, so it can diverge without touching "
+                     "either neighbour.",
+        "live": "everything with no animation genre - including a Japanese "
+                "title, which is a J-drama rather than anime.",
+    }
+    out = {}
+    for k, label in labels.items():
+        d = (defaults.get(k) or {})
+        aud = (d.get("audio") or {}).get("langs") or []
+        out[k] = {
+            "label": label,
+            "how": how.get(k, ""),
+            "audio_default": ", ".join(aud),
+        }
+    return out
 
 
 def describe() -> dict:
@@ -895,10 +998,19 @@ def describe() -> dict:
         # Filled while the rows below are built (same dict object), so it
         # lists exactly the settings this page could not state as one number.
         "varies": varies,
+        # Settings moved off the value nuarr recommends, with the original, so
+        # the page can offer a way back rather than only a way forward.
+        "changed": C.changed,
+        # THREE KINDS, decided by metadata - see _profiles().
+        "kinds": _profiles(),
+        # Kept for older callers; the rows still speak of anime vs everything
+        # else, because that is where the RULES differ even though there are
+        # three kinds.
         "profiles": {
-            "anime": r"any path under a folder starting with 'Anime' "
-                     r"(P:\Anime Shows, P:\Anime Movies)",
-            "other": "everything else - live action and western animation",
+            "anime": "titles the metadata calls anime (or a folder named "
+                     "Anime*, which sets a floor)",
+            "other": "animation and live action - same rules, different "
+                     "defaults",
         },
         "pool": [
             {"k": "passthrough (stream copy)", "both":
