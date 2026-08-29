@@ -538,6 +538,9 @@ async def _startup() -> None:
     asyncio.create_task(_subocr.updates_watch())
     asyncio.create_task(arrhealth.watch())
     asyncio.create_task(ffmpeg_update.watch())
+    # Notices a GPU driver swap, re-measures NVENC, and hands in-flight encodes
+    # back to the queue - see ffmpeg_update.watch_driver().
+    asyncio.create_task(ffmpeg_update.watch_driver())
     # Silent and request-free until a repo is configured - see updates.watch.
     asyncio.create_task(updates.watch())
     # Stored network shares reconnect at boot: `net use` grants access per
@@ -5763,6 +5766,36 @@ async def api_ffmpeg_repair(confirm: bool = False, background: bool = True):
     asyncio.create_task(ffmpeg_update.repair(confirm=True))
     return {"ok": True, "started": True,
             "message": "re-downloading in the background - watch progress"}
+
+
+# ---- the encoder test bench -------------------------------------------------
+# Measured verdicts only: no driver-branch numbers anywhere on this surface.
+# See enctest.py's module docstring for the rule it enforces.
+
+@app.get("/api/enctest")
+async def api_enctest_state():
+    """Live progress plus the last saved results for both builds."""
+    from . import enctest
+    return enctest.state()
+
+
+@app.post("/api/enctest/run")
+async def api_enctest_run(target: str = "installed"):
+    """Start a test run in the background; poll /api/enctest to watch it."""
+    from . import enctest
+    if target not in ("installed", "latest"):
+        raise HTTPException(400, "target must be 'installed' or 'latest'")
+    if enctest.STATE.get("active"):
+        return {"ok": False, "error": "a test run is already in progress"}
+    asyncio.create_task(enctest.run(target))
+    return {"ok": True, "started": True, "target": target}
+
+
+@app.post("/api/enctest/adopt")
+async def api_enctest_adopt():
+    """Stage the tested build - refused if it would lose a working encoder."""
+    from . import enctest
+    return await enctest.adopt()
 
 
 @app.get("/api/ffmpeg/driver")
@@ -12973,32 +13006,66 @@ async function ffDriver(force){
   catch(_){ el.innerHTML='<div class="dim" style="font-size:11px">'
                         +'driver check unavailable</div>'; return; }
   const L=d.latest||{};
-  const rows=(d.generations||[]).map(g=>{
-    const now = g.works_now
+  const A=d.nvenc_api||{};
+  // Consecutive generations with IDENTICAL requirements are one fact, not
+  // two. Listing "8.x needs 13.1 / 9.x needs 13.1" as separate rows padded
+  // the table with a repetition and made two unmet requirements look like
+  // more distinct problems than there are.
+  const groups=[];
+  (d.generations||[]).forEach(g=>{
+    const key=g.nvenc+'|'+g.needs;
+    const last=groups[groups.length-1];
+    if(last && last.key===key) last.gens.push(g);
+    else groups.push({key,gens:[g],nvenc:g.nvenc,needs:g.needs,
+                      works_now:g.works_now,measured:g.measured,
+                      works_after_update:g.works_after_update});
+  });
+  const rows=groups.map(G=>{
+    const names = G.gens.length>1
+      ? `${G.gens[0].ffmpeg}–${G.gens[G.gens.length-1].ffmpeg}`
+      : G.gens[0].ffmpeg;
+    // "no driver available yet" read as "your card is unsupported". It is not
+    // about the card: when the required branch has not been published at all,
+    // no GPU anywhere can run that build. Say which branch is missing, and do
+    // not colour it as an error - nothing is broken.
+    const now = G.works_now
       ? '<span class="ok">works now</span>'
-      : (g.works_after_update
+      : (G.works_after_update
           ? '<span class="warn">needs a driver update</span>'
-          : '<span class="err">no driver available yet</span>');
-    return `<tr><td class="mono">ffmpeg ${esc(g.ffmpeg)}</td>
-      <td class="dim">NVENC ${esc(g.nvenc)}</td>
-      <td class="num dim">${g.needs.toFixed(2)}+</td>
-      <td>${now}</td></tr>`;
+          : `<span class="dim">R${Math.floor(G.needs)} not released yet</span>`);
+    // The requirement is the API version; the driver number is how you get it.
+    return `<tr><td class="mono" style="padding-right:14px">ffmpeg ${esc(names)}</td>
+      <td style="padding-right:14px">needs <b>NVENC ${esc(G.nvenc)}</b></td>
+      <td class="dim" style="padding-right:14px;white-space:nowrap">driver ${G.needs.toFixed(2)}+</td>
+      <td style="white-space:nowrap">${now}${G.works_now&&!G.measured
+            ?' <span class="dim" title="inferred from the driver version">?</span>':''}</td></tr>`;
   }).join('');
-  // Provenance matters here: the endpoint NVIDIA exposes cannot be pinned to
-  // the RTX A-series branch, so the panel says which branch the number came
-  // from rather than implying it is the exact build for this card.
+  // Provenance matters here: the lookup is pinned to this card AND this
+  // Windows edition (the osID it matched is reported back), so the panel can
+  // name the package rather than hedging about which branch it came from.
+  const num = v => { const p=String(v||'').split('.');
+                     return p.length>1 ? parseFloat(p[0]+'.'+p[1]) : 0; };
+  const behind = (L.ok && !L.stale && num(L.version) > num(d.installed));
   const prov = (L.ok && !L.stale)
     ? `<span class="dim">newest published: </span><b>${esc(L.version)}</b>
-       <span class="dim">— ${esc(L.name)}${L.released?', '+esc(L.released):''}</span>`
+       ${behind?'<span class="warn">update available</span>':'<span class="ok">up to date</span>'}
+       <span class="dim">— ${esc(L.branch||L.name)}${L.released?', '+esc(L.released):''}</span>`
     : `<a href="${esc(L.url||'https://www.nvidia.com/en-us/drivers/')}"
           target="_blank" rel="noreferrer">check NVIDIA for your card →</a>`;
   el.innerHTML=`
     <div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;font-size:11px">
       <span><span class="dim">installed driver: </span><b>${esc(d.installed||'?')}</b></span>
+      ${A.ok?`<span><span class="dim">provides </span><b>NVENC ${esc(A.version)}</b></span>`
+            :`<span class="dim" title="${esc(A.error||'')}">NVENC API unreadable</span>`}
       <span>${prov}</span>
       <button style="font-size:10px;padding:1px 7px" onclick="ffDriver(true)">Re-check</button>
     </div>
-    <table style="margin-top:6px;font-size:11px">${rows}</table>
+    ${A.ok?`<div class="dim" style="margin-top:3px;font-size:10px">
+       NVENC ${esc(A.version)} is what the driver reports to ffmpeg — the
+       version number above only matters because of what API it ships.</div>`:''}
+    ${(L.ok && !L.stale && L.name) ? `<div class="dim" style="margin-top:3px;font-size:10px">
+       ${esc(L.name)}${L.edition?' &middot; matched for '+esc(L.edition):''}</div>`:''}
+    <table style="margin-top:6px;font-size:11px;width:auto">${rows}</table>
     <div style="margin-top:5px;font-size:11px" class="${
         (d.would_unlock||[]).length?'warn':'dim'}">${esc(d.verdict||'')}</div>
     ${L.stale ? `<div class="dim" style="margin-top:4px;font-size:10px">
@@ -16560,7 +16627,7 @@ function wtab(which){
                    alang:'alangPane', cache:'cachePane',
                    whisper:'whisperPane', plex:'plexPane',
                    ocr:'ocrPane', plexwork:'plexworkPane', ruleschk:'ruleschkPane',
-                   updates:'updPane'};
+                   updates:'updPane', enctest:'enctestPane'};
   const isPane = Object.prototype.hasOwnProperty.call(PANE_OF, which);
   const set = document.getElementById('wSettings');
   if(set) set.style.display = isPane ? 'none' : '';
@@ -16637,6 +16704,11 @@ function wtab(which){
   if(which==='whisper'){
     if(hint) hint.textContent='· whisper';
     loadWhisper();
+    return;
+  }
+  if(which==='enctest'){
+    if(hint) hint.textContent='· encoder tests';
+    loadEnctest();
     return;
   }
   if(which==='plex'){
@@ -18583,6 +18655,153 @@ function socRow(k,v,why){
 
 // ---- Whisper ---------------------------------------------------------
 let _whis=null;
+
+// ---- Encoder tests -------------------------------------------------------
+// The whole page repaints from ONE state object served by /api/enctest, so
+// the live view and the finished view cannot disagree: same data, same
+// renderer, polled at 700ms only while a run is active.
+let _etTimer=null;
+
+async function loadEnctest(){
+  const el=document.getElementById('enctestBody');
+  if(!el) return;
+  let d;
+  try{ d=await (await fetch('/api/enctest')).json(); }
+  catch(e){ el.innerHTML='<div class="dim" style="padding:14px">could not load</div>'; return; }
+  etPaint(el,d);
+  if(_etTimer){ clearTimeout(_etTimer); _etTimer=null; }
+  if(d.active) _etTimer=setTimeout(loadEnctest,700);
+}
+
+let _etMsg='';                       // one inline message slot, like ffSay
+
+async function etRun(target){
+  _etMsg='';
+  try{
+    const r=await (await fetch('/api/enctest/run?target='+target,{method:'POST'})).json();
+    if(!r.ok && r.error) _etMsg='<span class="warn">'+esc(r.error)+'</span>';
+  }catch(e){ _etMsg='<span class="warn">could not start the test</span>'; }
+  loadEnctest();
+}
+
+async function etAdopt(){
+  let r;
+  try{ r=await (await fetch('/api/enctest/adopt',{method:'POST'})).json(); }
+  catch(e){ _etMsg='<span class="warn">adopt failed</span>'; loadEnctest(); return; }
+  _etMsg = r.ok
+    ? '<span style="color:#7fd4a3">staged '+esc(r.staged||'')+' — applies automatically when the queue is idle</span>'
+    : '<span class="warn">'+esc(r.error||'refused')+'</span>';
+  loadEnctest();
+}
+
+function etBar(pct,phase){
+  // One bar for the whole journey - download, verify, unpack, twelve encoder
+  // tests - so "how far along is it" is always one glance. The stripe
+  // animation runs on the FILLED part only; a bar that shimmers while parked
+  // at 0% reads as progress that is not happening.
+  return `<div style="margin:8px 0 4px">
+    <div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:3px">
+      <span>${esc(phase||'')}</span><span class="dim">${(pct||0).toFixed(0)}%</span>
+    </div>
+    <div style="height:8px;border:1px solid var(--line);border-radius:5px;overflow:hidden;background:rgba(255,255,255,.03)">
+      <div style="height:100%;width:${Math.max(1,pct||0)}%;border-radius:4px;
+        background:repeating-linear-gradient(-45deg,#3d7dd8,#3d7dd8 8px,#5b96e8 8px,#5b96e8 16px);
+        background-size:23px 23px;animation:etslide 1s linear infinite;
+        transition:width .5s ease"></div>
+    </div></div>
+    <style>@keyframes etslide{from{background-position:0 0}to{background-position:23px 0}}</style>`;
+}
+
+function etMB(n){ return n>=1<<30 ? (n/(1<<30)).toFixed(2)+' GB' : (n/(1<<20)).toFixed(0)+' MB'; }
+
+function etVerdict(t){
+  if(t.status==='supported')
+    return '<span style="color:#7fd4a3;font-weight:600">supported</span>';
+  if(t.status==='testing')
+    return '<span class="warn">testing…</span>';
+  if(t.status==='pending')
+    return '<span class="dim">waiting</span>';
+  return '<span style="color:#e2b341;font-weight:600">not supported</span>';
+}
+
+function etTable(res,title){
+  if(!res || !(res.tests||[]).length) return '';
+  const when = res.at ? new Date(res.at*1000).toLocaleString() : '';
+  let rows='', lastFam='';
+  for(const t of res.tests){
+    if(t.family!==lastFam){
+      lastFam=t.family;
+      rows+=`<tr><td colspan="3" style="padding-top:8px;font-weight:600">${esc(t.family_label)}</td></tr>`;
+    }
+    // Plain words first; the raw ffmpeg line kept underneath in mono for
+    // anyone who wants the evidence.
+    const why = t.status==='not supported'
+      ? `<div style="font-size:11px">${esc(t.why||'')}</div>
+         <div class="dim" style="font-size:11px">${esc(t.meaning||'')}</div>
+         ${t.detail?`<div class="mono dim" style="font-size:10px;margin-top:2px">${esc(t.detail)}</div>`:''}`
+      : (t.status==='supported'
+          ? `<span class="dim" style="font-size:11px">${t.seconds?t.seconds.toFixed(1)+'s':''}</span>`:'');
+    rows+=`<tr>
+      <td class="mono" style="padding:2px 14px 2px 12px;white-space:nowrap">${esc(t.encoder)}</td>
+      <td style="padding:2px 14px 2px 0;white-space:nowrap">${etVerdict(t)}</td>
+      <td style="padding:2px 0">${why}</td></tr>`;
+  }
+  const okn=res.tests.filter(t=>t.status==='supported').length;
+  return `<div class="lkind" style="margin-top:10px">
+    <div class="lkindhead" style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap">
+      <b>${esc(title)}</b>
+      <span class="mono">${esc(res.version||'')}</span>
+      <span class="dim" style="font-size:11px">${okn}/${res.tests.length} supported${when?' · tested '+esc(when):''}</span>
+    </div>
+    <table style="width:auto;font-size:12px;margin:4px 0 10px">${rows}</table>
+  </div>`;
+}
+
+function etPaint(el,d){
+  const R=d.results||{};
+  let h='';
+  // buttons - disabled while a run is active so the state machine stays simple
+  const dis = d.active?'disabled':'';
+  h+=`<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
+    <button ${dis} onclick="etRun('installed')">Test installed build</button>
+    <button ${dis} onclick="etRun('latest')">Download &amp; test latest</button>
+    ${R.latest?`<button ${dis} onclick="etAdopt()">Adopt tested build</button>`:''}
+  </div>`;
+  if(_etMsg) h+=`<div style="font-size:12px;margin-top:8px">${_etMsg}</div>`;
+  if(d.active || d.phase==='failed'){
+    h+=etBar(d.pct,d.phase);
+    const dl=d.download||{};
+    if(d.target==='latest' && dl.total){
+      h+=`<div class="dim" style="font-size:11px">
+        ${etMB(dl.bytes)} of ${etMB(dl.total)}
+        ${dl.bps?` · ${etMB(dl.bps)}/s`:''}
+        ${dl.recoveries?` · <span class="warn">network dropped ${dl.recoveries}× — resumed automatically</span>`:''}
+      </div>`;
+    }
+    if(d.error) h+=`<div style="color:#e0575b;font-size:12px;margin-top:6px">${esc(d.error)}</div>`;
+    // live view of the matrix as it fills in
+    if((d.tests||[]).length){
+      h+=etTable({version:d.version,tests:d.tests,at:0},
+                 d.target==='latest'?'Testing the latest build':'Testing the installed build');
+    }
+  }
+  if(!d.active){
+    h+=etTable(R.installed,'Installed build');
+    h+=etTable(R.latest,'Latest build');
+    if(R.installed && R.latest){
+      const iok=new Set(R.installed.tests.filter(t=>t.status==='supported').map(t=>t.encoder));
+      const lost=R.latest.tests.filter(t=>iok.has(t.encoder)&&t.status!=='supported');
+      h+= lost.length
+        ? `<div style="color:#e2b341;font-size:12px;margin-top:8px">⚠ adopting the latest build would lose: `
+          +lost.map(t=>`<b class="mono">${esc(t.encoder)}</b> (${esc(t.why||'fails')})`).join(', ')
+          +` — the Adopt button will refuse it</div>`
+        : `<div style="color:#7fd4a3;font-size:12px;margin-top:8px">everything that works today also works on the latest build — safe to adopt</div>`;
+    }
+    if(!R.installed && !R.latest)
+      h+='<div class="dim" style="padding:10px 0">no results yet — run a test above</div>';
+  }
+  el.innerHTML=h;
+}
 
 async function loadWhisper(){
   const el=document.getElementById('whisperBody');
@@ -21201,6 +21420,7 @@ _SETTINGS_NAV = [
                     ("ruleschk", "Rule check",     "list"),
                     ("plexwork", "Plex playback",  "play")]),
     ("Tools",      [("ffmpeg",  "ffmpeg",          "film"),
+                    ("enctest", "Encoder tests",   "film"),
                     ("mkv",     "MKVToolNix",      "tool"),
                     ("whisper", "Whisper",         "language"),
                     ("ocr",     "OCR engines",     "language")]),

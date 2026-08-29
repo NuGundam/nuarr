@@ -223,6 +223,19 @@
           <div class="dim" style="padding:14px">loading&hellip;</div>
         </div>
       </div>
+      <div id="enctestPane" style="display:none">
+        <div class="dim" style="padding:9px 14px;font-size:11px">
+          Which encoders <b>actually work on this machine</b>, measured by
+          encoding two seconds of test video through every one of them &mdash;
+          no driver version numbers, no predictions. Test the newest published
+          ffmpeg here <b>before</b> adopting it: the download resumes itself
+          across network drops, every encoder is tried against the new binary,
+          and adopting is refused if anything that works today would break.
+        </div>
+        <div id="enctestBody" style="padding:0 14px 14px">
+          <div class="dim" style="padding:14px">loading&hellip;</div>
+        </div>
+      </div>
       <div id="whisperPane" style="display:none">
         <div class="dim" style="padding:9px 14px;font-size:11px">
           The language identifier behind the <b>Audio language</b> page. It is

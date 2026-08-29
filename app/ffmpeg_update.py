@@ -37,6 +37,7 @@ import asyncio
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -132,7 +133,15 @@ def installed_paths() -> tuple[str, str]:
 # --- NVENC self-test --------------------------------------------------------
 # Cached because it spawns a process; refreshed whenever the binary changes.
 NVENC: dict = {"checked_at": 0.0, "ok": None, "error": "", "exe": "",
-               "driver": "", "cause": {}}
+               "driver": "", "cause": {}, "api": "", "required_api": "",
+               "found_api": ""}
+# ffmpeg names both versions when it refuses to open the encoder:
+#   "Driver does not support the required nvenc API version. Required: 13.1
+#    Found: 13.0"
+# That is the single most authoritative line available - it is THIS build
+# talking about THIS driver - so it is parsed out rather than paraphrased.
+_NVENC_VER_RE = re.compile(
+    r"Required:\s*(\d+\.\d+).*?Found:\s*(\d+\.\d+)", re.I | re.S)
 
 
 # --- what driver is available, not just what is installed -------------------
@@ -141,16 +150,24 @@ NVENC: dict = {"checked_at": 0.0, "ok": None, "error": "", "exe": "",
 # your driver" and "wait, there is nothing to update to".
 #
 # NVIDIA's only usable endpoint here is the undocumented AjaxDriverService the
-# driver-download page calls. Its product ids are not published and the
-# enumeration functions it used to expose now 404, so the RTX A-series branch
-# cannot be selected reliably - every id combination tried fell back to the
-# consumer branch. Rather than guess and report a number for the wrong card,
-# this reports WHICH BRANCH it actually got and lets the UI say so.
+# driver-download page calls. Two query parameters decide whether the answer is
+# current or two years stale, and both were wrong here:
 #
-# That is still the useful half: NVENC requirements are expressed as driver
-# VERSION numbers, and the consumer and professional branches share one
-# numbering space, so "610.88 exists" is real evidence that the 610 series has
-# shipped - even when the exact professional build cannot be confirmed here.
+#   dch    0 (the default when omitted) asks for the LEGACY "Standard" package.
+#          For the RTX A-series that line stopped at Release 470 - 475.14, July
+#          2024 - which is why this used to report a driver older than the one
+#          already installed. dch=1 asks for the DCH package NVIDIA has shipped
+#          exclusively since, and returns R595 U8 (597.06, Aug 2026).
+#
+#   osID   the professional driver is published per Windows edition, and Server
+#          is not Windows 10. osID 57 (Windows 10 64-bit) returns the desktop
+#          package; Server 2022 is 134 and returns "NVIDIA RTX Server Driver".
+#          Asking with the wrong one is how a Server box was told to install a
+#          desktop driver. The ids are enumerated from getMenuArrays and are
+#          listed in _NV_OSIDS below.
+#
+# The staleness guard is kept as a backstop: if the service ever returns a
+# version older than the installed one again, that is reported rather than used.
 _NV_LOOKUP = ("https://gfwsl.geforce.com/services_toolkit/services/com/nvidia/"
               "services/AjaxDriverService.php")
 # Product ids read off NVIDIA's own driver picker (the selects are
@@ -158,10 +175,65 @@ _NV_LOOKUP = ("https://gfwsl.geforce.com/services_toolkit/services/com/nvidia/"
 # series 122 = "NVIDIA RTX Series", product 943 = "NVIDIA RTX A5000".
 NV_PSID = 122
 NV_PFID = 943
-NV_OSID = 57                       # Windows 10/11 64-bit
+NV_OSID = 57                       # fallback only; _nv_osids() picks the real one
 NV_RESULTS_URL = "https://www.nvidia.com/en-us/drivers/"
+# osID values NVIDIA lists for this card, keyed by how Windows identifies itself.
+# (build number -> id for Server; ProductName carries the edition name.)
+_NV_OSIDS = {
+    "server 2025": 153, "server 2022": 134, "server 2019": 119,
+    "server 2016": 74, "server 2012": 44,
+    "11": 135, "10": 57,
+}
 _LATEST_DRV: dict = {"at": 0.0, "data": None}
 _LATEST_TTL = 6 * 3600
+
+
+def _windows_edition() -> str:
+    """ProductName from the registry, e.g. 'Windows Server 2022 Standard'.
+
+    Read in-process with winreg - no PowerShell, no console window.
+    """
+    try:
+        import winreg
+        with winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"SOFTWARE\Microsoft\Windows NT\CurrentVersion") as k:
+            return str(winreg.QueryValueEx(k, "ProductName")[0] or "")
+    except Exception:
+        return ""
+
+
+def _nv_osids() -> list:
+    """osIDs to try, best guess first, then sensible fallbacks.
+
+    Never returns an empty list: if the edition cannot be read, the desktop
+    ids are still tried, which is what the old hard-coded behaviour did.
+    """
+    name = _windows_edition().lower()
+    order = []
+    if "server" in name:
+        for key in ("server 2025", "server 2022", "server 2019",
+                    "server 2016", "server 2012"):
+            if key.split()[-1] in name:
+                order.append(_NV_OSIDS[key])
+                break
+        else:
+            # A Server edition this map does not name - build number decides.
+            try:
+                build = int(platform.win32_ver()[1].split(".")[-1])
+            except Exception:
+                build = 0
+            order.append(_NV_OSIDS["server 2025"] if build >= 26100
+                         else _NV_OSIDS["server 2022"])
+        order += [_NV_OSIDS["server 2022"], _NV_OSIDS["11"]]
+    else:
+        order += [_NV_OSIDS["11" if "11" in name else "10"], _NV_OSIDS["10"]]
+    seen, out = set(), []
+    for i in order:
+        if i not in seen:
+            seen.add(i)
+            out.append(i)
+    return out
 
 
 def latest_driver(force: bool = False) -> dict:
@@ -185,23 +257,37 @@ def latest_driver(force: bool = False) -> dict:
             and time.time() - _LATEST_DRV["at"] < _LATEST_TTL):
         return dict(_LATEST_DRV["data"])
     out: dict = {"ok": False, "version": "", "name": "", "released": "",
+                 "branch": "", "osid": 0, "edition": _windows_edition(),
                  "stale": False, "error": "", "checked_at": time.time(),
                  "url": NV_RESULTS_URL}
     try:
         import httpx
-        r = httpx.get(_NV_LOOKUP, params={
-            "func": "DriverManualLookup",
-            "psid": NV_PSID, "pfid": NV_PFID, "osID": NV_OSID,
-            "languageCode": 1033, "numberOfResults": 1}, timeout=20)
-        r.raise_for_status()
-        ids = (r.json() or {}).get("IDS") or []
-        if not ids:
+        d, used = {}, 0
+        # dch=1 first (the current package); dch=0 only as a last resort, and
+        # only for editions where the legacy line was ever published.
+        for osid in _nv_osids():
+            for dch in (1, 0):
+                r = httpx.get(_NV_LOOKUP, params={
+                    "func": "DriverManualLookup",
+                    "psid": NV_PSID, "pfid": NV_PFID, "osID": osid,
+                    "dch": dch, "languageCode": 1033,
+                    "numberOfResults": 1}, timeout=20)
+                r.raise_for_status()
+                ids = (r.json() or {}).get("IDS") or []
+                cand = (ids[0].get("downloadInfo") or {}) if ids else {}
+                if str(cand.get("Success") or "") == "1" and cand.get("Version"):
+                    d, used = cand, osid
+                    break
+            if d:
+                break
+        if not d:
             out["error"] = "no driver returned for this card"
         else:
-            d = ids[0].get("downloadInfo") or {}
-            out.update(ok=True,
+            out.update(ok=True, osid=used,
                        version=str(d.get("Version") or ""),
                        name=urllib.parse.unquote(d.get("Name") or ""),
+                       branch=urllib.parse.unquote(
+                           d.get("DisplayVersion") or ""),
                        released=str(d.get("ReleaseDateTime") or ""))
             try:
                 have = float(".".join((_driver_version() or "0").split(".")[:2]))
@@ -226,9 +312,22 @@ def driver_outlook() -> dict:
 
     Answers the question the ffmpeg tab could not: "if I update my driver,
     which ffmpeg builds become usable?"
+
+    "works_now" and "works_after_update" are NOT decided the same way, and the
+    asymmetry is the point:
+
+      works_now           measured. The driver on this machine is asked which
+                          NVENC API it implements, which is the exact condition
+                          ffmpeg tests. No inference, no table lookup.
+      works_after_update  inferred. A driver that is not installed cannot be
+                          asked anything, so this falls back to comparing
+                          version numbers against _NVENC_REQ. It is a
+                          prediction, and is labelled as one.
     """
     have = _driver_version()
     latest = latest_driver()
+    api = nvenc_api()
+    have_api = (api["major"], api["minor"]) if api.get("ok") else None
 
     def as_f(v):
         try:
@@ -240,20 +339,33 @@ def driver_outlook() -> dict:
     usable = latest.get("ok") and not latest.get("stale")
     have_f = as_f(have)
     new_f = as_f(latest.get("version")) if usable else 0.0
-    # _NVENC_REQ is a list of (major, nvenc_api, min_driver) tuples, newest
-    # first. Sorted ascending here so the table reads oldest-to-newest.
+    # _NVENC_REQ is a list of (major, (api_major, api_minor), min_driver)
+    # tuples, newest first. Sorted ascending here so the table reads
+    # oldest-to-newest.
+    # Requirement numbers come from NVIDIA's own SDK Read Me when reachable,
+    # and from the compiled-in table when not.
+    try:
+        reqs = sdk_driver_reqs()
+    except Exception:
+        reqs = _default_reqs()
     gens = []
     for major, nvenc, need in sorted(_NVENC_REQ):
-        need = float(need)
+        need = float(reqs.get(f"{nvenc[0]}.{nvenc[1]}", need))
         gens.append({
-            "ffmpeg": f"{major}.x", "nvenc": nvenc, "needs": need,
-            "works_now": bool(have_f and have_f >= need),
+            "ffmpeg": f"{major}.x", "nvenc": f"{nvenc[0]}.{nvenc[1]}",
+            "needs": need,
+            # The driver's own answer when we have it; the version number only
+            # as a fallback for machines where the DLL could not be read.
+            "works_now": (have_api >= nvenc if have_api
+                          else bool(have_f and have_f >= need)),
+            "measured": bool(have_api),
             "works_after_update": bool(new_f and new_f >= need),
         })
     blocked = [g for g in gens if not g["works_now"]]
     unlocked = [g for g in blocked if g["works_after_update"]]
     return {
         "installed": have, "installed_f": have_f,
+        "nvenc_api": api,
         "latest": latest,
         "generations": gens,
         "would_unlock": [g["ffmpeg"] for g in unlocked],
@@ -268,8 +380,11 @@ def driver_outlook() -> dict:
             (f"ffmpeg {', '.join(g['ffmpeg'] for g in blocked)} needs driver "
              f"{min(g['needs'] for g in blocked):.2f}+ — check NVIDIA for a "
              f"build that meets it" if not usable else
-             f"no published driver yet meets the "
-             f"{min(g['needs'] for g in blocked):.2f} requirement")),
+             # Not a fault of this card: the branch simply does not exist yet.
+             f"ffmpeg {', '.join(g['ffmpeg'] for g in blocked)} needs NVENC "
+             f"{blocked[0]['nvenc']}, which arrives with driver branch "
+             f"R{int(min(g['needs'] for g in blocked))} — NVIDIA has not "
+             f"released it for any GPU yet, so there is nothing to update to")),
     }
 
 
@@ -374,7 +489,27 @@ def nvenc_check(force: bool = False) -> dict:
     if (not force and NVENC["ok"] is not None and NVENC["exe"] == exe
             and time.time() - NVENC["checked_at"] < 3600):
         return dict(NVENC)
+    res = probe_nvenc(exe)
+    NVENC.update(checked_at=time.time(), ok=res["ok"], error=res["error"],
+                 exe=exe, driver=_driver_version(),
+                 api=nvenc_api().get("version", ""),
+                 required_api=res["required_api"],
+                 found_api=res["found_api"],
+                 cause=({} if res["ok"] else classify_nvenc(res["error"])))
+    return dict(NVENC)
+
+
+def probe_nvenc(exe: str) -> dict:
+    """Try to open hevc_nvenc with a SPECIFIC ffmpeg binary.
+
+    Takes the path as an argument rather than reading the installed one,
+    because the most valuable moment to ask this question is BEFORE a
+    downloaded build is adopted - see stage(). A build that cannot encode on
+    this driver is exactly what the driver-number table was trying to predict,
+    and the staged binary can simply be asked instead.
+    """
     err, ok = "", False
+    req_api = found_api = ""
     try:
         r = subprocess.run(
             [exe, "-hide_banner", "-nostdin", "-v", "error",
@@ -388,15 +523,17 @@ def nvenc_check(force: bool = False) -> dict:
             capture_output=True, timeout=60, creationflags=NO_WINDOW)
         ok = r.returncode == 0
         if not ok:
-            msg = r.stderr.decode("utf-8", "replace").strip().splitlines()
+            raw = r.stderr.decode("utf-8", "replace").strip()
+            msg = raw.splitlines()
             err = next((l for l in msg if "nvenc" in l.lower()), msg[0] if msg else
                        f"exit {r.returncode}")
+            m = _NVENC_VER_RE.search(raw)
+            if m:
+                req_api, found_api = m.group(1), m.group(2)
     except Exception as e:
         err = f"{type(e).__name__}: {e}"
-    NVENC.update(checked_at=time.time(), ok=ok, error=err, exe=exe,
-                 driver=_driver_version(),
-                 cause=({} if ok else classify_nvenc(err)))
-    return dict(NVENC)
+    return {"ok": ok, "error": err, "exe": exe,
+            "required_api": req_api, "found_api": found_api}
 
 
 # The NVENC API each ffmpeg generation is built against, and the NVIDIA driver
@@ -404,7 +541,194 @@ def nvenc_check(force: bool = False) -> dict:
 # downloading 160 MB and breaking every encode.
 #   ffmpeg 8.x/9.x -> NVENC 13.1 -> driver 610.00+
 #   ffmpeg 7.x     -> NVENC 13.0 -> driver 570.00+
-_NVENC_REQ = [(9, "13.1", 610.0), (8, "13.1", 610.0), (7, "13.0", 570.0)]
+# The API version is the REQUIREMENT; the driver number is only the vehicle
+# that delivers it. See nvenc_api() for why that distinction is load-bearing.
+_NVENC_REQ = [(9, (13, 1), 610.0), (8, (13, 1), 610.0), (7, (13, 0), 570.0)]
+
+_NVENC_API: dict = {"at": 0.0, "data": None}
+_NVENC_API_TTL = 3600.0
+
+# NVIDIA states the requirement in each SDK's Read Me as a bare line:
+#     Windows
+#       * Driver version 610 and above
+# Parsed from there rather than hardcoded, so a new SDK does not need a code
+# change - the built-in _NVENC_REQ numbers stay as the offline fallback.
+_SDK_README = ("https://docs.nvidia.com/video-technologies/video-codec-sdk/"
+               "{ver}/read-me/index.html")
+_SDK_DRV_RE = re.compile(r"Driver version\s+(\d+)\s+and above", re.I)
+_SDK_REQ_TTL = 7 * 24 * 3600
+
+
+def sdk_driver_reqs(force: bool = False) -> dict:
+    """{'13.0': 570, '13.1': 610, ...} - the driver BRANCH each SDK needs.
+
+    A NOTE ON WHAT THESE NUMBERS ARE, because it is easy to over-trust them.
+    They are BRANCH numbers, not version numbers, and NVIDIA's branches do not
+    number their releases after themselves:
+
+        RTX Enterprise  R570 -> 572.16 .. 573.96
+                        R580 -> 580.88 .. 582.78
+                        R595 -> 595.71 .. 597.06
+        Data Center     R580 -> 580.178.04 (Linux) but 582.78 (Windows)
+
+    So "installed >= 610" is a reasonable reading of "branch R610 or later"
+    WITHIN ONE PRODUCT LINE, and meaningless across lines. That is why this
+    only ever feeds the advisory "a newer driver would unlock X" text, and
+    never overrides nvenc_api(), which measures the real answer locally.
+    """
+    cached = kv_get("nvenc.sdk_reqs")
+    stamp = float(kv_get("nvenc.sdk_reqs_at") or 0)
+    if cached and not force and time.time() - stamp < _SDK_REQ_TTL:
+        try:
+            return {**_default_reqs(), **json.loads(cached)}
+        except Exception:
+            pass
+    found: dict = {}
+    # Ask about the SDKs referenced by _NVENC_REQ plus the next few, so a
+    # newly published SDK is picked up without editing this file.
+    want = {f"{a}.{b}" for _, (a, b), _ in _NVENC_REQ}
+    want |= {"13.2", "14.0", "14.1"}
+    for ver in sorted(want):
+        try:
+            r = httpx.get(_SDK_README.format(ver=ver), timeout=20,
+                          follow_redirects=True)
+            if r.status_code != 200:
+                continue
+            m = _SDK_DRV_RE.search(r.text)
+            if m:
+                found[ver] = int(m.group(1))
+        except Exception:
+            continue
+    if found:
+        kv_set("nvenc.sdk_reqs", json.dumps(found))
+        kv_set("nvenc.sdk_reqs_at", str(time.time()))
+    return {**_default_reqs(), **found}
+
+
+def _default_reqs() -> dict:
+    """The offline fallback: whatever is compiled into _NVENC_REQ."""
+    return {f"{a}.{b}": float(need) for _, (a, b), need in _NVENC_REQ}
+
+
+def _forget_gpu_caches() -> None:
+    """Drop every cached answer about the GPU. Called when the driver moves."""
+    _DRIVER.update(at=0.0, v="")
+    _NVENC_API.update(at=0.0, data=None)
+    _LATEST_DRV.update(at=0.0, data=None)
+    NVENC.update(checked_at=0.0, ok=None)
+
+
+async def watch_driver(interval_s: float = 300.0) -> None:
+    """Notice a GPU driver change and react to it.
+
+    A driver install swaps the encoder out from under a process that is already
+    holding it open, and nuarr had no idea it had happened: every cached answer
+    about the GPU - installed version, NVENC API, whether hevc_nvenc opens -
+    has an hour-long TTL or longer, so the dashboard kept reporting the old
+    driver, and any encode running at the time carried on talking to a driver
+    that had been replaced.
+
+    So: poll the version, and when it changes, forget everything cached about
+    the GPU, re-measure the API, and hand any in-flight work back to the queue
+    (see jobs.cancel_and_requeue - it spares jobs already past the encode).
+
+    The poll costs one nvidia-smi (about a second, NO_WINDOW so nothing
+    flashes) every five minutes, which is why the interval is minutes rather
+    than seconds. It is deliberately NOT driven off the cached reader: the
+    whole point is to look past the cache and see the real value.
+    """
+    from . import jobs
+
+    await asyncio.sleep(60)
+    while True:
+        try:
+            now = _driver_version(max_age_s=0.0)
+            seen = kv_get("nvenc.driver_seen") or ""
+            if now and now != seen:
+                _forget_gpu_caches()
+                api = nvenc_api(force=True)
+                kv_set("nvenc.driver_seen", now)
+                prev_api = kv_get("nvenc.api_seen") or ""
+                kv_set("nvenc.api_seen", api.get("version") or "")
+                if not seen:
+                    # First run on this install - record the baseline quietly
+                    # rather than announcing a change that did not happen.
+                    joblog.log(f"GPU driver {now} (NVENC "
+                               f"{api.get('version') or '?'})", "debug")
+                else:
+                    moved = (api.get("version") or "") != prev_api
+                    joblog.log(
+                        f"NVIDIA driver changed: {seen} -> {now}. NVENC API "
+                        + (f"{prev_api} -> {api.get('version')}" if moved
+                           else f"unchanged at {api.get('version') or '?'}"),
+                        "warn")
+                    if not moved and prev_api:
+                        # Worth saying plainly: a driver update that does not
+                        # move the API unlocks no new ffmpeg build.
+                        joblog.log(
+                            "the driver moved but the NVENC API did not, so "
+                            "the same ffmpeg builds are supported as before",
+                            "info")
+                    # Re-probe the encoder before anything is requeued, so the
+                    # replanned jobs are planned against the new reality.
+                    res = nvenc_check(force=True)
+                    if not res.get("ok"):
+                        joblog.log(
+                            f"GPU encoding is NOT working after the driver "
+                            f"change: {res.get('error') or 'unknown'}",
+                            "error")
+                    try:
+                        await jobs.cancel_and_requeue(
+                            f"NVIDIA driver changed to {now}")
+                    except Exception as e:                      # noqa: BLE001
+                        joblog.log(f"driver-change requeue failed: "
+                                   f"{type(e).__name__}: {e}", "error")
+        except Exception as e:                                  # noqa: BLE001
+            joblog.log(f"driver watch: {type(e).__name__}: {e}", "debug")
+        await asyncio.sleep(interval_s)
+
+
+def nvenc_api(force: bool = False) -> dict:
+    """The NVENC API version THE DRIVER ACTUALLY EXPOSES. Measured, not inferred.
+
+    This is the check that matters, and it was missing. ffmpeg does not refuse
+    to open hevc_nvenc because a driver number is low - it refuses because the
+    API version the build was compiled against is newer than the one the driver
+    implements, and it says so in exactly those terms:
+
+        Driver does not support the required nvenc API version.
+        Required: 13.1 Found: 13.0
+
+    Driver numbers were only ever a proxy for that, and a lossy one: NVIDIA
+    ships several branches at once, so "596.86 < 610.00" is a guess about what
+    596.86 implements, while the driver itself will simply tell you. It exports
+    NvEncodeAPIGetMaxSupportedVersion from nvEncodeAPI64.dll, which returns the
+    version packed as (major << 4) | minor - 208 means 13.0.
+
+    Reading it costs one LoadLibrary of a DLL the driver installed, so a card
+    with no NVIDIA driver fails cleanly at the load rather than misreporting.
+    """
+    if (not force and _NVENC_API["data"]
+            and time.time() - _NVENC_API["at"] < _NVENC_API_TTL):
+        return dict(_NVENC_API["data"])
+    out = {"ok": False, "major": 0, "minor": 0, "version": "", "error": ""}
+    try:
+        import ctypes
+        dll = ctypes.WinDLL("nvEncodeAPI64.dll")
+        raw = ctypes.c_uint32(0)
+        st = dll.NvEncodeAPIGetMaxSupportedVersion(ctypes.byref(raw))
+        if st != 0:
+            out["error"] = f"NvEncodeAPIGetMaxSupportedVersion returned {st}"
+        else:
+            major, minor = raw.value >> 4, raw.value & 0xF
+            out.update(ok=True, major=major, minor=minor,
+                       version=f"{major}.{minor}")
+    except OSError:
+        out["error"] = "no NVIDIA encoder driver on this machine"
+    except Exception as e:                                    # noqa: BLE001
+        out["error"] = f"{type(e).__name__}: {e}"
+    _NVENC_API.update(at=time.time(), data=out)
+    return dict(out)
 
 
 def upgrade_safety(latest: str) -> dict:
@@ -413,6 +737,10 @@ def upgrade_safety(latest: str) -> dict:
     nuarr had no opinion on this, so the only way to find out was to install it
     and wait for the first re-encode to fail - which on a queue full of stream
     copies took thirty hours to notice.
+
+    Decided on the NVENC API the driver reports, with the driver number used
+    only when that cannot be read. Asking the driver what it implements beats
+    inferring it from a version number against a table that goes out of date.
     """
     drv = _driver_version()
     try:
@@ -424,12 +752,26 @@ def upgrade_safety(latest: str) -> dict:
     if m:
         major = int(m.group(1))
     req = next((r for r in _NVENC_REQ if r[0] == major), None)
-    if not req or not drv_f:
+    if not req:
         return {"known": False, "driver": drv, "latest": latest}
     _, api, need = req
+    have = nvenc_api()
+    api_s = f"{api[0]}.{api[1]}"
+    if have.get("ok"):
+        safe = (have["major"], have["minor"]) >= api
+        return {"known": True, "driver": drv, "latest": latest,
+                "needs_driver": need, "nvenc_api": api_s,
+                "have_api": have["version"], "measured": True, "safe": safe,
+                "why": (f"ffmpeg {major}.x needs NVENC {api_s}; this driver "
+                        f"({drv or '?'}) implements {have['version']}"
+                        + ("" if safe else f" - driver {need:.2f}+ provides it"))}
+    if not drv_f:
+        return {"known": False, "driver": drv, "latest": latest,
+                "why": have.get("error") or "NVENC API version unreadable"}
     return {"known": True, "driver": drv, "latest": latest,
-            "needs_driver": need, "nvenc_api": api, "safe": drv_f >= need,
-            "why": (f"ffmpeg {major}.x needs NVENC {api} (driver {need:.2f}+); "
+            "needs_driver": need, "nvenc_api": api_s, "measured": False,
+            "safe": drv_f >= need,
+            "why": (f"ffmpeg {major}.x needs NVENC {api_s} (driver {need:.2f}+); "
                     f"this machine has {drv}")}
 
 
@@ -635,13 +977,46 @@ async def stage(confirm: bool = False, force: bool = False) -> dict:
                   finished=time.time())
             return {"ok": False, "error": "the downloaded ffmpeg did not run"}
 
+        # ASK THE BUILD, DO NOT PREDICT IT.
+        #
+        # Whether a new ffmpeg can still use the GPU was previously inferred
+        # from a table of driver numbers - and driver numbers are a poor proxy,
+        # because NVIDIA's version numbering is per-branch and per-product-line
+        # (the RTX Enterprise R570 branch ships as 572.16-573.96; the Data
+        # Center R580 branch is 580.178.04 on Linux but 582.78 on Windows).
+        # Comparing a raw number against a threshold only works by luck.
+        #
+        # The staged binary is sitting on disk and is the exact thing that
+        # would run, so it is simply asked to open hevc_nvenc. If it cannot,
+        # ffmpeg names both API versions itself and that is recorded verbatim.
+        _prog(phase="checking GPU encoding")
+        gpu = probe_nvenc(os.path.join(new_bin, "ffmpeg.exe"))
+        kv_set("ffmpeg.staged_nvenc_ok", "1" if gpu["ok"] else "0")
+        kv_set("ffmpeg.staged_nvenc_why", gpu["error"] or "")
+        kv_set("ffmpeg.staged_nvenc_req", gpu["required_api"] or "")
+
         kv_set("ffmpeg.staged_version", ver)
         kv_set("ffmpeg.staged_bin", new_bin)
+        if not gpu["ok"]:
+            detail = (f"it needs NVENC {gpu['required_api']} and this driver "
+                      f"provides {gpu['found_api']}"
+                      if gpu["required_api"] else gpu["error"])
+            _prog(active=False, phase="staged - GPU encoding would break",
+                  version=ver, ready=True, finished=time.time(), eta_s=None)
+            joblog.log(f"ffmpeg {ver} staged, but GPU ENCODING WOULD BREAK: "
+                       f"{detail}. It has NOT been applied - every re-encode "
+                       f"would fall back or fail.", "error")
+            return {"ok": True, "staged": ver, "bin": new_bin,
+                    "nvenc_ok": False, "nvenc_why": detail,
+                    "requires_api": gpu["required_api"],
+                    "have_api": gpu["found_api"] or nvenc_api().get("version"),
+                    "message": f"downloaded and verified, but GPU encoding "
+                               f"fails on this driver - {detail}"}
         _prog(active=False, phase="ready to apply", version=ver, ready=True,
               finished=time.time(), eta_s=None)
-        joblog.log(f"ffmpeg {ver} staged and verified - will be applied when "
-                   f"the queue is idle", "ok")
-        return {"ok": True, "staged": ver, "bin": new_bin,
+        joblog.log(f"ffmpeg {ver} staged and verified, GPU encoding confirmed "
+                   f"working - will be applied when the queue is idle", "ok")
+        return {"ok": True, "staged": ver, "bin": new_bin, "nvenc_ok": True,
                 "message": "verified and waiting; applies when no job is running"}
     except Exception as e:
         _prog(active=False, phase="failed", error=f"{type(e).__name__}: {e}",
@@ -795,12 +1170,25 @@ def staged() -> dict:
             "bin": kv_get("ffmpeg.staged_bin") or ""}
 
 
-def apply_staged() -> dict:
+def apply_staged(force: bool = False) -> dict:
     """Swap a staged build in. Fast, and only safe when nothing is running.
 
     A move of two directories - seconds - but it must not happen underneath a
     job that is about to spawn ffmpeg, so the caller checks for idle first.
+
+    Refuses a build that FAILED the staged NVENC probe. stage() already tried
+    to open hevc_nvenc with that exact binary; installing it anyway is choosing
+    to break GPU encoding on a known-bad result. `force` is there because
+    "CPU-only but newer" is a legitimate choice - just not a silent one.
     """
+    if not force and kv_get("ffmpeg.staged_nvenc_ok") == "0":
+        why = kv_get("ffmpeg.staged_nvenc_why") or "the GPU encoder would not open"
+        return {"ok": False, "blocked": True,
+                "error": f"not applied - GPU encoding fails with this build: "
+                         f"{why}",
+                "requires_api": kv_get("ffmpeg.staged_nvenc_req") or "",
+                "message": "pass force=true to install it anyway (encodes "
+                           "would fall back to CPU or fail)"}
     st = staged()
     new_bin = st["bin"]
     if not new_bin or not os.path.isdir(new_bin):
@@ -846,6 +1234,11 @@ async def apply_when_idle() -> None:
                     if res.get("ok"):
                         joblog.log("ffmpeg swap complete while the queue was "
                                    "idle - no job was interrupted", "ok")
+                    elif res.get("blocked"):
+                        # Known-bad for GPU encoding. Leave it staged so the
+                        # UI can offer the choice, but never adopt it here -
+                        # and do not log every 30s about it.
+                        pass
                     elif res.get("noop"):
                         # nothing staged - the pointer was stale, not broken.
                         # Logging this as an error put a red line in the log
@@ -880,6 +1273,17 @@ async def install(confirm: bool = False) -> dict:
     if not confirm or not res.get("ok"):
         return res
 
+    # Downloaded fine, but the staged binary could not open the GPU encoder on
+    # this driver. Stop here rather than swapping it in - this is the failure
+    # that previously took thirty hours to notice, and it is now known before
+    # anything is adopted.
+    if res.get("nvenc_ok") is False:
+        return {"ok": True, "staged": res.get("staged"), "applied": False,
+                "nvenc_ok": False, "nvenc_why": res.get("nvenc_why"),
+                "requires_api": res.get("requires_api"),
+                "have_api": res.get("have_api"),
+                "message": res.get("message")}
+
     if jobs.RUNNING:
         return {"ok": True, "staged": res.get("staged") or res.get("version"),
                 "applied": False, "running_jobs": len(jobs.RUNNING),
@@ -890,8 +1294,10 @@ async def install(confirm: bool = False) -> dict:
     if not applied.get("ok"):
         return {"ok": True, "staged": res.get("staged") or res.get("version"),
                 "applied": False, "error": applied.get("error"),
-                "message": "staged, but the swap failed - it will be retried "
-                           "when the queue is idle"}
+                "blocked": applied.get("blocked", False),
+                "message": (applied.get("message") if applied.get("blocked")
+                            else "staged, but the swap failed - it will be "
+                                 "retried when the queue is idle")}
     return {"ok": True, "applied": True, "installed": applied.get("installed"),
             "path": applied.get("path"), "previous_kept": str(BACKUP_DIR)}
 

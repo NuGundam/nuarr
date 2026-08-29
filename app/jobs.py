@@ -3972,6 +3972,100 @@ def _finish(job: Job, state: str, before: int, after: int,
               label=job.title)
 
 
+async def cancel_and_requeue(reason: str, timeout_s: float = 90.0) -> dict:
+    """Stop everything in flight and put the work back on the queue.
+
+    For the case where the MACHINE changed underneath a running encode - a GPU
+    driver swap being the one that prompted this. ffmpeg holds the encoder open
+    for the life of the process, so a job that started on the old driver is
+    still talking to it: at best the encode finishes against a driver nothing
+    else is using any more, at worst it dies mid-stream and lands in `error`
+    with a message that blames the file rather than the driver.
+
+    Two things it deliberately does NOT do:
+
+      * It does not touch a job past the encode. `_DONE_ENCODING` stages mean
+        the expensive part is finished and the output is sitting in the cache
+        waiting to be moved into place - killing that throws away hours of
+        real work to redo it identically. Same reasoning as
+        recover_interrupted(), which is the sibling of this function for the
+        restart case.
+
+      * It does not mark anything `error`. The files go back to `eligible` and
+        are re-planned from scratch, because a plan made under the old driver
+        may have chosen an encoder that no longer exists.
+    """
+    victims = [(jid, w) for jid, w in list(RUNNING.items())
+               if (w.stage or "") not in _DONE_ENCODING]
+    spared = len(RUNNING) - len(victims)
+    if not victims:
+        return {"cancelled": 0, "requeued": 0, "spared": spared,
+                "message": "nothing was running that needed interrupting"}
+
+    joblog.log(f"{reason}: stopping {len(victims)} running "
+               f"{'job' if len(victims) == 1 else 'jobs'} and requeuing them"
+               + (f" ({spared} already past the encode, left alone)"
+                  if spared else ""), "warn")
+
+    # Take path/title from the Job we already hold rather than re-reading the
+    # files table: the row is about to be rewritten, and these are the exact
+    # values the job was running with.
+    work = [(w.job.file_id, w.job.path, w.job.title or "")
+            for _, w in victims if getattr(w.job, "file_id", None)]
+    file_ids = [f for f, _p, _t in work]
+    for jid, _w in victims:
+        try:
+            await cancel(jid)
+        except Exception as e:                                  # noqa: BLE001
+            joblog.log(f"could not cancel {jid}: {type(e).__name__}: {e}",
+                       "debug")
+
+    # Let the workers notice the kill and run their own cleanup - temp files,
+    # the cache entry, the `cancelled` row. Requeuing before that finishes
+    # would race the _finish() write and leave the job row in the wrong state.
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if not any(jid in RUNNING for jid, _ in victims):
+            break
+        await asyncio.sleep(0.5)
+
+    def _reset() -> int:
+        if not file_ids:
+            return 0
+        ph = ",".join("?" * len(file_ids))
+        with cursor() as cur:
+            # Drop any queued plan for these files too: it was made under the
+            # old conditions, which is the whole reason we are here.
+            cur.execute(f"DELETE FROM jobs WHERE state='queued' "
+                        f"AND file_id IN ({ph})", tuple(file_ids))
+            cur.execute(
+                f"UPDATE files SET state='eligible', state_reason=? "
+                f"WHERE id IN ({ph}) AND state!='deleted'",
+                (f"requeued: {reason}", *file_ids))
+            return cur.rowcount or 0
+
+    await asyncio.to_thread(_reset)
+
+    requeued = 0
+    for fid, path, title in work:
+        try:
+            await enqueue(fid, path, title, source="driver-change")
+            requeued += 1
+        except NothingToDo:
+            # Re-planned and found nothing to do - a legitimate outcome, not a
+            # failure. The file stays where the planner put it.
+            pass
+        except ValueError:
+            # "already queued or running" - something beat us to it.
+            pass
+        except Exception as e:                                  # noqa: BLE001
+            joblog.log(f"requeue failed for {path}: "
+                       f"{type(e).__name__}: {e}", "debug")
+
+    joblog.log(f"{len(victims)} stopped, {requeued} requeued", "ok")
+    return {"cancelled": len(victims), "requeued": requeued, "spared": spared}
+
+
 async def cancel(job_id: str) -> bool:
     w = RUNNING.get(job_id)
     if not w:
