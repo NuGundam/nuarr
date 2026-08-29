@@ -571,7 +571,7 @@ function Load-Detected {
   #      real VM, where the CPU advertises AVX2 and the model still dies
   $blocked = Get-WhisperBlock -DataDir $S.DataDir
   if (-not $blocked) {
-    $blocked = Test-WhisperLoads -Python $S.Python -Target $S.Target -DataDir $S.DataDir
+    $blocked = Test-WhisperLoads -Python $S.Python -Target $S.Target -DataDir $S.DataDir -Bundle $S.Bundle
     if ($blocked) { Set-WhisperBlock -DataDir $S.DataDir -Reason $blocked }
   }
   if (-not $blocked -and -not (Test-Avx2)) {

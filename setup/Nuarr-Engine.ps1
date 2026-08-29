@@ -145,15 +145,30 @@ function Test-WhisperLoads {
 
       Returns '' when it loaded or could not be tested, or the reason when
       loading killed the process. #>
-  param([string]$Python, [string]$Target, [string]$DataDir)
+  param([string]$Python, [string]$Target, [string]$DataDir, [string]$Bundle)
   if (-not $Python -or -not (Test-Path -LiteralPath $Python)) { return '' }
-  $probe = Join-Path $Target 'app\whisper_probe.py'
-  if (-not (Test-Path -LiteralPath $probe)) { return '' }
+  # THE BUNDLE FIRST, BECAUSE THE TARGET DOES NOT EXIST YET. This is called
+  # from the Options page, where the program has not been copied - so looking
+  # only in $Target found nothing on every fresh machine and the check
+  # silently did nothing, which is exactly what it looked like in testing:
+  # the box stayed enabled with no explanation. The bundle is right here.
+  $probe = ''
+  foreach ($cand in @(
+      $(if ($Bundle) { Join-Path $Bundle 'program\app\whisper_probe.py' }),
+      $(if ($Target) { Join-Path $Target 'app\whisper_probe.py' }))) {
+    if ($cand -and (Test-Path -LiteralPath $cand)) { $probe = $cand; break }
+  }
+  if (-not $probe) { return '' }
   # Only worth doing when the package is already there - otherwise the probe
   # just reports "not installed", which we knew.
-  $have = ''
-  Invoke-Native {
-    $have = & $Python -c "import importlib.util as u; print('yes' if u.find_spec('faster_whisper') else 'no')" 2>&1 | Select-Object -Last 1
+  # RETURN it, do not assign inside the scriptblock. `& $Body` runs in a CHILD
+  # scope, so `$have = ...` in there sets a variable that dies with the block -
+  # the caller kept seeing '' and this check bailed out instantly on every
+  # machine, including ones where the answer was two seconds away. It looked
+  # exactly like "the check does nothing", because it did nothing.
+  $have = Invoke-Native {
+    & $Python -c "import importlib.util as u; print('yes' if u.find_spec('faster_whisper') else 'no')" 2>&1 |
+      Select-Object -Last 1
   }
   if ("$have".Trim() -ne 'yes') { return '' }
   $model = Join-Path $DataDir 'whisper'
