@@ -43,13 +43,43 @@ _CONTENT = [
     (r"non-monotonous dts|invalid timestamp", "the timestamps are broken"),
 ]
 
+# MOMENTARY FAULTS. Nothing is wrong with the file, the library or the rules -
+# something was busy for a second. These are the ones worth RETRYING rather
+# than reporting, and they are checked before everything else.
+#
+# "database is locked" is why this category exists. It is SQLite saying two
+# writers collided; it says nothing about the media file at all. The policy
+# list below matches the bare word "locked", so it was being read as "the file
+# is locked or unreadable - free it and requeue" - a diagnosis about the wrong
+# object entirely, offering a remedy that could not work. One such error sat in
+# the Errors tile for 24 days waiting for a human to free a file that was never
+# held.
+_TRANSIENT = [
+    (r"database is locked|database table is locked|database is busy",
+     "the database was busy for a moment - nothing is wrong with the file"),
+    (r"\bdisk i/?o error\b", "a disk read faltered"),
+    (r"temporarily unavailable|resource busy|try again",
+     "something was busy for a moment"),
+    (r"the network (path|name) .*not found|network path was not found|"
+     r"semaphore timeout|the specified network name is no longer available",
+     "the share dropped for a moment"),
+]
+
 # Reasons where the file is fine and a replacement provably cannot help. These
 # are listed explicitly rather than left to the default so the UI can say what
 # WOULD fix them instead of just refusing.
 _POLICY = [
     (r"path is \d+ chars|too long", "shorten the naming format in Profilarr - "
                                     "a replacement lands at the same path"),
-    (r"permission|access is denied|sharing violation|locked",
+    # "locked" is qualified now: a FILE lock, not any sentence containing the
+    # word. See _TRANSIENT above for the one that taught this lesson - but
+    # note the first alternative here, because tightening this pattern the
+    # obvious way dropped Windows' OWN wording for a file lock ("cannot access
+    # the file because it is being used by another process"), which does not
+    # contain "locked" at all and had been landing on "permission" by luck.
+    (r"being used by another process|cannot access the file|"
+     r"permission|access is denied|sharing violation|"
+     r"file is (currently )?(in use|locked)|\block(ed)? by another",
      "the file is locked or unreadable - free it and requeue"),
     (r"disk full|no space", "free space on the destination and requeue"),
     (r"collision|already exists", "resolve the destination collision and requeue"),
@@ -59,15 +89,23 @@ _POLICY = [
 
 
 def classify(reason: str | None) -> tuple[str, str]:
-    """-> ("content"|"policy"|"unknown", human explanation).
+    """-> ("transient"|"content"|"policy"|"unknown", human explanation).
 
-    Order matters: policy is checked FIRST. "ffprobe returned nothing because
-    access is denied" is a lock, not a corrupt file, and the lock reading is
-    the safe one to act on.
+    Order matters. TRANSIENT is checked first, because those strings contain
+    words the other lists match on - "database is locked" is the whole reason
+    the category exists - and a momentary fault must never be reported as a
+    fault of the file.
+
+    Policy is checked before content for the same reason at one remove:
+    "ffprobe returned nothing because access is denied" is a lock, not a
+    corrupt file, and the lock reading is the safe one to act on.
     """
     r = (reason or "").lower().strip()
     if not r:
         return "unknown", "no reason was recorded"
+    for pat, why in _TRANSIENT:
+        if re.search(pat, r):
+            return "transient", why
     for pat, why in _POLICY:
         if re.search(pat, r):
             return "policy", why

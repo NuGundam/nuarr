@@ -541,6 +541,10 @@ async def _startup() -> None:
     # Notices a GPU driver swap, re-measures NVENC, and hands in-flight encodes
     # back to the queue - see ffmpeg_update.watch_driver().
     asyncio.create_task(ffmpeg_update.watch_driver())
+    # Retries files that failed for a MOMENTARY reason, on the rename queue's
+    # backoff - see errorretry.watch().
+    from . import errorretry as _errorretry
+    asyncio.create_task(_errorretry.watch())
     # Silent and request-free until a repo is configured - see updates.watch.
     asyncio.create_task(updates.watch())
     # Stored network shares reconnect at boot: `net use` grants access per

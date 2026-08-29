@@ -4063,6 +4063,18 @@ def _finish(job: Job, state: str, before: int, after: int,
         elif state == "skipped":
             cur.execute("UPDATE files SET state='done', state_reason='no work needed' "
                         "WHERE id=?", (job.file_id,))
+    # A MOMENTARY FAILURE SHOULD TRY AGAIN BY ITSELF. Outside the cursor block
+    # above so a bookkeeping error here can never roll back the job's own
+    # result - the outcome is recorded, the retry is a bonus on top.
+    try:
+        from . import errorretry
+        if state == "failed":
+            errorretry.note_failure(job.file_id, error)
+        elif state in ("done", "skipped"):
+            errorretry.forget(job.file_id)   # it worked; clear any backoff
+    except Exception as e:                                    # noqa: BLE001
+        joblog.log(f"error-retry bookkeeping: {type(e).__name__}: {e}",
+                   "debug", job.id)
     # `note` gives plan-less jobs a real detail line. A transcode's Finished
     # entry says what it did ("remux (stream copy): track 0: aac -> E-AC3");
     # a sub_ocr job has no plan, so its entry said nothing at all and the
