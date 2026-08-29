@@ -93,14 +93,29 @@ async def _boot_recover() -> None:
 
 
 async def _boot_arrs() -> None:
-    """Confirm at least one arr answers, so 'ready' means ready to work."""
+    """Confirm at least one arr answers, so 'ready' means ready to work.
+
+    NOT CONFIGURED IS NOT A FAULT. A fresh install has no arr set up yet, and
+    reporting that as a warning met every new user with "ready, 1 warning" and
+    a red-flagged step about a thing they had not been asked for yet. A
+    warning should mean something is wrong; "you have not connected Sonarr"
+    is a next step, and it belongs in the setup guidance rather than in the
+    boot report's fault column. Configured-but-unreachable stays a warning -
+    that one IS broken, and is exactly what this check exists to catch.
+    """
     try:
+        configured = [a for a in (SETTINGS.arrs or [])
+                      if getattr(a, "url", "") and getattr(a, "api_key", "")]
+        if not configured:
+            _boot("arrs", "ok", "none connected yet — add one in Settings")
+            return
         st = await api_arrs()          # the same check the header pills use
         ok = [n for n, v in (st or {}).items() if v.get("ok")]
         if ok:
             _boot("arrs", "ok", ", ".join(ok))
         else:
-            _boot("arrs", "warn", "no arr reachable")
+            names = ", ".join(getattr(a, "name", "?") for a in configured)
+            _boot("arrs", "warn", f"configured but not answering: {names}")
     except Exception as e:
         _boot("arrs", "warn", f"{type(e).__name__}")
 
@@ -18104,8 +18119,15 @@ async function loadOcr(){
   // ---- install / engine status ----------------------------------------
   let padStrip='';
   if(inst.state==='installing'){
+    // SAY THE SIZE OF THE THING BEING DOWNLOADED. This line quoted the GPU
+    // build's ~1.5 GB whatever was actually installing, so a CPU-only machine
+    // was told to expect 1.5 GB while pip pulled a 105 MB wheel - a number
+    // that belonged to the option NOT chosen.
+    const size = inst.mode==='gpu'  ? ' — the GPU build is about 1.5 GB, so this takes a while'
+               : inst.mode==='cpu'  ? ' — the CPU build is about 150 MB'
+               : '';
     padStrip=`<div style="margin-top:8px"><span style="color:#e2b341;font-size:12px">
-      installing (${esc(inst.mode)})… the GPU build is a ~1.5 GB download</span>
+      installing (${esc(inst.mode)})…${size}</span>
       ${inst.log?`<pre class="mono dim" style="font-size:10.5px;margin:6px 0 0;max-height:110px;
         overflow:auto;white-space:pre-wrap">${esc(inst.log.split('\n').slice(-5).join('\n'))}</pre>`:''}</div>`;
     setTimeout(loadOcr, 4000);
