@@ -54,6 +54,9 @@ $S = [ordered]@{
   StartNow  = $true
   Shortcut  = $true
   RestoreFrom = ''
+  PlexCid   = ''
+  NetShares = @()
+  Upgrade   = $false
   Failed    = $false
 }
 
@@ -165,8 +168,12 @@ $p0chk.Left=0; $p0chk.Top=104; $p0chk.Width=690; $p0chk.Height=230
 $p0chk.BackColor=$C.Panel
 $p0.Controls.Add($p0chk)
 $p0.Controls.Add((New-Label "Setup writes a full log to your TEMP folder; the path is shown at the end." 0 348 680 20 $FontSub $C.Dim))
-$lblPre = New-Label '' 16 12 650 200 $FontMono
+$lblPre = New-Label '' 16 12 650 190 $FontMono
 $p0chk.Controls.Add($lblPre)
+# Shown only when an existing install is found: the alternative to upgrading.
+$chkFresh = New-Check 'Start fresh instead - remove the old install, its settings, database and cache first' 16 202 640 $false
+$chkFresh.Visible = $false
+$p0chk.Controls.Add($chkFresh)
 
 # ============================================================ page 1 ======
 $p1 = New-Object Windows.Forms.Panel; $p1.Dock='Fill'; $p1.BackColor=$C.Bg
@@ -236,8 +243,99 @@ $p3.Controls.Add((New-Label 'Detected automatically where possible. Blank means 
 $rSon  = Add-ArrRow $p3 'Sonarr    (URL / API key)' 26 ''
 $rRad  = Add-ArrRow $p3 'Radarr    (URL / API key)' 108 ''
 $rPlex = Add-ArrRow $p3 'Plex      (URL / token)'   190 ''
-$p3.Controls.Add((New-Label 'A local Plex server keeps its own token in the registry - Setup reads it there.' 0 262 660 18 $FontSub $C.Dim))
-$p3.Controls.Add((New-Label 'nuarr also reads Plex''s transcoder throttle live, which its pacing depends on.' 0 280 660 18 $FontSub $C.Dim))
+# ONE BUTTON. Signing in IS the test: it proves the account, discovers the
+# server, and ends with the same connection check Test ran - so a separate
+# Test button was a second way to do less.
+$rPlex.Key.Width = 180
+$rPlex.Btn.Left = 496; $rPlex.Btn.Width = 130
+$rPlex.Btn.Text = 'Sign in with Plex'
+$p3.Controls.Add((New-Label 'Sign in with Plex opens a small plex.tv page: sign in there and Setup receives a' 0 262 660 18 $FontSub $C.Dim))
+$p3.Controls.Add((New-Label 'token and finds the server itself - URL included. A local Plex''s saved token is' 0 280 660 18 $FontSub $C.Dim))
+$p3.Controls.Add((New-Label 'also read automatically; pasting one by hand still works.' 0 298 660 18 $FontSub $C.Dim))
+
+function Invoke-PlexLink {
+  <#  The Tautulli-style sign-in. A plex.tv PIN is created, the system browser
+      opens the auth page, and Setup polls until the account approves it. The
+      password goes to plex.tv, never through Setup; the token lands in
+      $S.DetPlexTok - USED, NEVER SHOWN, same rule as the detected arr keys.
+      Then plex.tv's resource list names the account's servers, and the first
+      connection that answers /identity from THIS machine becomes the URL -
+      the list is plex.tv's opinion, not a fact about this network. #>
+  $st = $rPlex.Status
+  $rPlex.Btn.Enabled = $false
+  try {
+    if (-not $S.PlexCid) { $S.PlexCid = [guid]::NewGuid().ToString() }
+    $h = @{ 'Accept'='application/json'; 'X-Plex-Product'='nuarr'
+             'X-Plex-Client-Identifier'=$S.PlexCid; 'X-Plex-Device-Name'='nuarr' }
+    $pin = Invoke-RestMethod -Uri 'https://plex.tv/api/v2/pins?strong=true' -Method Post -Headers $h -TimeoutSec 15
+    Start-Process ("https://app.plex.tv/auth#?clientID=$($S.PlexCid)&code=$($pin.code)&context%5Bdevice%5D%5Bproduct%5D=nuarr")
+    $st.ForeColor = $C.Dim
+    $st.Text = 'A Plex sign-in page opened in your browser - sign in there; this side finishes on its own.'
+    $deadline = (Get-Date).AddMinutes(3); $tok = ''
+    while ((Get-Date) -lt $deadline) {
+      # pumped so the window stays alive while we wait
+      for ($i=0; $i -lt 10; $i++) { Start-Sleep -Milliseconds 200; [Windows.Forms.Application]::DoEvents() }
+      try { $p = Invoke-RestMethod -Uri ("https://plex.tv/api/v2/pins/$($pin.id)") -Headers $h -TimeoutSec 15 } catch { continue }
+      if ($p.authToken) { $tok = $p.authToken; break }
+    }
+    if (-not $tok) {
+      $st.ForeColor = $C.Warn
+      $st.Text = 'The sign-in timed out - click Sign in with Plex to try again.'
+      return
+    }
+    $S.DetPlexTok = $tok
+    # INTO THE BOX, AS DOTS. The field is masked like the arr keys, so this
+    # leaks nothing - and an empty box after a successful sign-in reads as
+    # "nothing happened", which is exactly the wrong message.
+    $rPlex.Key.Text = $tok
+    $st.Text = 'Signed in - finding your Plex server...'
+    [Windows.Forms.Application]::DoEvents()
+    $best = ''; $name = ''
+    try {
+      $ht = @{}; foreach($k in $h.Keys){ $ht[$k]=$h[$k] }; $ht['X-Plex-Token']=$tok
+      $res = Invoke-RestMethod -Uri 'https://plex.tv/api/v2/resources?includeHttps=1&includeRelay=0' -Headers $ht -TimeoutSec 20
+      foreach ($srv in (@($res) | Where-Object { "$($_.provides)" -match 'server' } | Sort-Object { -not $_.owned })) {
+        # $conn, NEVER $c - PowerShell variable names are case-insensitive,
+        # so a loop variable called $c SHADOWED the $C colour table for the
+        # rest of this function, and the first $C.Ok after the loop crashed
+        # with "property 'Ok' cannot be found" on a Plex connection object.
+        # Same species as the $s/$S lesson in Load-Detected.
+        foreach ($conn in (@($srv.connections) | Where-Object { -not $_.relay } | Sort-Object { -not $_.local })) {
+          $cands = @()
+          if ($conn.local -and $conn.address) { $cands += "http://$($conn.address):$($conn.port)" }
+          if ($conn.uri) { $cands += $conn.uri }
+          foreach ($u in $cands) {
+            try {
+              # token in a HEADER, never the query string - it ends up in logs otherwise
+              [void](Invoke-RestMethod -Uri ($u.TrimEnd('/') + '/identity') -Headers @{ 'X-Plex-Token'=$tok; 'Accept'='application/json' } -TimeoutSec 4)
+              $best = $u.TrimEnd('/'); $name = $srv.name; break
+            } catch {}
+          }
+          if ($best) { break }
+        }
+        if ($best) { break }
+      }
+    } catch {}
+    if ($best) {
+      $rPlex.Url.Text = $best
+      $st.Text = "Signed in - found $name at $best. Testing the connection..."
+      [Windows.Forms.Application]::DoEvents()
+      $tr = Test-PlexConnection -Url $best -Token $tok
+      $st.ForeColor = if ($tr.Ok) { $C.Ok } else { $C.Bad }
+      # ONE LINE OF LABEL. The first version repeated the server name twice
+      # and appended a build hash, and the useful end of the sentence fell
+      # off the edge of the form.
+      $st.Text = if ($tr.Ok) { "Signed in - connected to $name at $best. Token filled in (hidden)." }
+                  else { "Signed in, but the connection test failed: $($tr.Detail)" }
+    } else {
+      $st.ForeColor = $C.Warn
+      $st.Text = 'Signed in - token captured, but no server answered from this machine; set the URL yourself.'
+    }
+  } catch {
+    $st.ForeColor = $C.Bad
+    $st.Text = "Sign-in failed: $($_.Exception.Message)"
+  } finally { $rPlex.Btn.Enabled = $true }
+}
 
 # ============================================================ page 4 ======
 $p4 = New-Object Windows.Forms.Panel; $p4.Dock='Fill'; $p4.BackColor=$C.Bg
@@ -366,12 +464,48 @@ function Refresh-Prereqs {
   $mkv = Join-Path $Root 'mkvtoolnix'
   $mkn = if (Test-Path -LiteralPath $mkv) { (Get-ChildItem $mkv -Filter *.exe).Count } else { 0 }
   [void]$sb.AppendLine(("  Bundled MKV     {0}" -f $(if($mkn){"mkvmerge, mkvpropedit, mkvextract"}else{"none"})))
+
+  # THE OCR ENGINE WAS IN THE BOX AND NOT ON THE LIST. The bundle has carried
+  # Tesseract since picture subtitles became text, and this page named ffmpeg,
+  # MKVToolNix and the wheels but not the third tool it also installs - so the
+  # one component a new machine most needs reassuring about (no download, no
+  # system install, it is right here) was the one it never mentioned. Version
+  # read from the binary rather than written down, for the same reason every
+  # other line here is measured: a hard-coded version is a lie waiting to age.
+  $tess = Join-Path $Root 'tesseract'
+  $tExe = Join-Path $tess 'tesseract.exe'
+  if (Test-Path -LiteralPath $tExe) {
+    $tv = ''
+    try {
+      $tv = (& $tExe --version 2>&1 | Select-Object -First 1) -replace '^tesseract\s+v?',''
+    } catch { $tv = '' }
+    $langs = @(Get-ChildItem (Join-Path $tess 'tessdata') -Filter *.traineddata `
+                 -ErrorAction SilentlyContinue | ForEach-Object { $_.BaseName })
+    $lang = if ($langs.Count) { " ({0})" -f ($langs -join ', ') } else { '' }
+    [void]$sb.AppendLine(("  Bundled OCR     Tesseract {0}{1}" -f $(if($tv){$tv.Trim()}else{'included'}), $lang))
+  } else {
+    [void]$sb.AppendLine("  Bundled OCR     none - picture subtitles will need an engine installed later")
+  }
+  # PaddleOCR is deliberately NOT in the box: the GPU build is a ~1.5 GB
+  # download that only pays off on a CUDA card, so it is offered from the OCR
+  # engines page after install rather than carried by every copy of Setup.
+  [void]$sb.AppendLine(("  Optional OCR    PaddleOCR - better on italics, installs from Settings{0}" -f $(if($gpu){' (this GPU can run it)'}else{' (wants an NVIDIA GPU)'})))
+
   [void]$sb.AppendLine("  Administrator   yes")
   [void]$sb.AppendLine("")
   $existing = Test-Path -LiteralPath (Join-Path $S.Target 'launch.py')
+  $S.Upgrade = [bool]$existing
   if ($existing) {
     [void]$sb.AppendLine("  An existing install was found at $($S.Target).")
-    [void]$sb.AppendLine("  Setup will upgrade it in place and keep your database.")
+    [void]$sb.AppendLine("  Setup will upgrade it in place. Your database, settings and")
+    [void]$sb.AppendLine("  configuration are kept - nothing needs to be asked again.")
+    # THE WIZARD PAGES THAT WOULD COLLECT THE PORT ARE SKIPPED on an upgrade,
+    # so read it from the config that already exists instead of assuming 8770.
+    $cfgFile = Join-Path $S.Target 'config.yml'
+    if (Test-Path -LiteralPath $cfgFile) {
+      $pm = Select-String -LiteralPath $cfgFile -Pattern '^\s*port\s*:\s*(\d+)' | Select-Object -First 1
+      if ($pm) { $S.Port = [int]$pm.Matches[0].Groups[1].Value }
+    }
   } else {
     [void]$sb.AppendLine("  No existing install found - this will be a fresh one.")
   }
@@ -380,6 +514,11 @@ function Refresh-Prereqs {
   # with no Python AND no bundled installer is genuinely stuck.
   $btnNext.Enabled = [bool]$py -or [bool](Get-ChildItem (Join-Path $Root 'python') `
       -Filter 'python-*.exe' -ErrorAction SilentlyContinue)
+  $btnNext.Text = if ($S.Upgrade) { 'Upgrade >' } else { 'Next >' }
+  $chkFresh.Visible = [bool]$S.Upgrade
+  # Show-Page painted "Step 1 of 7" BEFORE this function learned it is an
+  # upgrade, so the label is corrected here, where the knowledge exists.
+  $lblStep.Text = if ($S.Upgrade) { 'Step 1 of 3' } else { 'Step 1 of 5' }
 }
 
 function Load-Detected {
@@ -403,10 +542,10 @@ function Load-Detected {
   # DETECTED CREDENTIALS ARE USED, NOT SHOWN - they ride in $S and apply
   # silently when the field is left blank; typing a key still overrides.
   $rSon.Url.Text = $son.Url; $S.DetSonKey = $son.ApiKey
-  $rSon.Status.Text = if ($son.Found) { 'API key found in Sonarr''s config.xml - leave blank to use it' } else { 'Not found locally - paste the URL and key if you have them' }
+  $rSon.Status.Text = if ($son.Found) { 'API key found in Sonarr''s config.xml - leave blank to use it' } else { 'Not found locally - at least one arr is REQUIRED; paste its URL and key' }
   $rad = Find-ArrConfig -Kind radarr
   $rRad.Url.Text = $rad.Url; $S.DetRadKey = $rad.ApiKey
-  $rRad.Status.Text = if ($rad.Found) { 'API key found in Radarr''s config.xml - leave blank to use it' } else { 'Not found locally - paste the URL and key if you have them' }
+  $rRad.Status.Text = if ($rad.Found) { 'API key found in Radarr''s config.xml - leave blank to use it' } else { 'Not found locally - at least one arr is REQUIRED; paste its URL and key' }
   $tok = Find-PlexToken
   $rPlex.Url.Text = 'http://localhost:32400'
   $S.DetPlexTok = $tok
@@ -416,8 +555,12 @@ function Load-Detected {
     $chkWhisper.Enabled = $true
     $lblWhy.Text = "Downloads about 2 GB (faster-whisper and the CUDA runtime) plus a 464 MB model.`nWithout it nuarr works normally; the audio-language feature simply stays off.`nDetected: $($S.Gpu)"
   } else {
-    $chkWhisper.Enabled = $false; $chkWhisper.Checked = $false
-    $lblWhy.Text = "No NVIDIA GPU detected, so language detection would run on the CPU at a`ncrawl. Left off. nuarr works normally without it."
+    # STILL A CHOICE. This used to grey the box out entirely - but CPU
+    # inference works (newer CPUs with AI engines do fine), the model loader
+    # already falls back to int8 on CPU, and the Whisper page can install it
+    # later anyway. Off by default; never forbidden.
+    $chkWhisper.Enabled = $true; $chkWhisper.Checked = $false
+    $lblWhy.Text = "No NVIDIA GPU - detection runs on the CPU instead: slower per track, but it`nworks, and newer CPUs with AI engines handle it well. Adds faster-whisper`nplus a 464 MB model. Also installable later from Settings -> Whisper."
   }
   # cache free space
   $free = Get-FreeGB $S.CacheDir
@@ -465,6 +608,51 @@ function Collect-Page3 {
   $rk = $rRad.Key.Text.Trim(); if (-not $rk) { $rk = "$($S.DetRadKey)".Trim() }
   if ($sk -and $rSon.Url.Text.Trim()) { $arrs += [pscustomobject]@{Name='Sonarr';Kind='sonarr';Url=$rSon.Url.Text.Trim();ApiKey=$sk} }
   if ($rk -and $rRad.Url.Text.Trim()) { $arrs += [pscustomobject]@{Name='Radarr';Kind='radarr';Url=$rRad.Url.Text.Trim();ApiKey=$rk} }
+  if ($arrs.Count -eq 0) {
+    # MANDATORY, as of 1.0.6. nuarr's imports, renames and library
+    # bookkeeping all run through an arr; installed without one it looks
+    # fine and then quietly cannot keep the library consistent.
+    [Windows.Forms.MessageBox]::Show(
+      "nuarr needs Sonarr or Radarr to work correctly.`n`n" +
+      "Imports, renames and library bookkeeping run through them - without " +
+      "at least one, nuarr cannot keep your library consistent.`n`n" +
+      "Enter a URL and API key for at least one of them. The key can stay " +
+      "blank when one was detected on this machine.",
+      'nuarr Setup','OK','Warning') | Out-Null
+    return $false
+  }
+  # Configured is not reachable - prove at least one actually answers.
+  # WITH FEEDBACK, because each test can take seconds against a dead URL and
+  # a frozen page followed by a surprise dialog reads as a hang: the row
+  # being tested says so the moment Next is clicked, the cursor spins, and
+  # every result lands on its own row before any dialog appears.
+  $alive = $false
+  $form.Cursor = [Windows.Forms.Cursors]::WaitCursor
+  try {
+    foreach ($a in $arrs) {
+      $row = if ($a.Kind -eq 'sonarr') { $rSon } else { $rRad }
+      $row.Status.Text = "Checking $($a.Name)..."
+      $row.Status.ForeColor = $C.Dim
+      [Windows.Forms.Application]::DoEvents()
+      try {
+        $tr = Test-ArrConnection -Url $a.Url -ApiKey $a.ApiKey -Kind $a.Kind
+        $row.Status.Text = $tr.Detail
+        $row.Status.ForeColor = if ($tr.Ok) { $C.Ok } else { $C.Bad }
+        if ($tr.Ok) { $alive = $true }
+      } catch {
+        $row.Status.Text = "Test failed: $($_.Exception.Message)"
+        $row.Status.ForeColor = $C.Bad
+      }
+      [Windows.Forms.Application]::DoEvents()
+    }
+  } finally { $form.Cursor = [Windows.Forms.Cursors]::Default }
+  if (-not $alive) {
+    $ans = [Windows.Forms.MessageBox]::Show(
+      "Neither arr answered just now.`n`nnuarr can install anyway and keep " +
+      "retrying once it is running - carry on with the details as entered?",
+      'nuarr Setup','YesNo','Warning')
+    if ($ans -ne 'Yes') { return $false }
+  }
   $S.Arrs = $arrs
   $S.PlexUrl = $rPlex.Url.Text.Trim()
   $pt = $rPlex.Key.Text.Trim(); if (-not $pt) { $pt = "$($S.DetPlexTok)".Trim() }
@@ -488,7 +676,13 @@ function Show-Page {
   $pages[$i].Visible = $true
   $lblTitle.Text = $titles[$i][0]
   $lblSub.Text   = $titles[$i][1]
-  $lblStep.Text  = "Step $($i+1) of $($pages.Count)"
+  # The upgrade path visits three of these pages, and the count says so
+  # rather than announcing "Step 6 of 7" on the second screen anyone sees.
+  $umap = @{ 0 = 1; 5 = 2; 6 = 3 }
+  $fmap = @{ 0 = 1; 1 = 2; 4 = 3; 5 = 4; 6 = 5 }
+  $lblStep.Text = if ($S.Upgrade -and $umap.ContainsKey($i)) { "Step $($umap[$i]) of 3" }
+                  elseif ($fmap.ContainsKey($i)) { "Step $($fmap[$i]) of 5" }
+                  else { "Step $($i+1) of $($pages.Count)" }
   $btnBack.Enabled = ($i -gt 0 -and $i -lt 5)
   switch ($i) {
     0 { $btnNext.Text='Next >';    $btnNext.Enabled=$true; Refresh-Prereqs }
@@ -510,7 +704,7 @@ function Show-Page {
 
 # ------------------------------------------------------------ the work ----
 function Run-Install {
-  $steps = 9
+  $steps = if ($S.Upgrade) { 8 } else { 10 }   # +1: Tesseract
   $n = 0
   function Tick { param($what)
     if ($script:CancelInstall) { throw 'CANCELLED' }
@@ -520,11 +714,30 @@ function Run-Install {
     Write-Step "Setup log: $script:LogPath"
     Write-Step ("Target {0} | Data {1} | Cache {2} | Port {3}" -f $S.Target,$S.DataDir,$S.CacheDir,$S.Port)
 
+    # WHAT WAS HERE BEFORE THE FIRST CHANGE. A failed fresh install must be
+    # able to put the machine back - and "back" means removing only what THIS
+    # run created: a data folder that predates Setup holds a kept database,
+    # and deleting it in a rollback would destroy the one thing the
+    # uninstaller went out of its way to preserve.
+    [void](Invoke-SchTasks @('/Query','/TN','nuarr'))
+    $script:Pre = @{
+      Task   = ($LASTEXITCODE -eq 0)
+      Target = (Test-Path -LiteralPath (Join-Path $S.Target 'launch.py'))
+      Data   = (Test-Path -LiteralPath $S.DataDir)
+      Cache  = (Test-Path -LiteralPath $S.CacheDir)
+      Lnk    = (Test-Path -LiteralPath (Join-Path ([Environment]::GetFolderPath('CommonDesktopDirectory')) 'nuarr.lnk'))
+      Arp    = (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\nuarr')
+    }
+
     [void](Invoke-SchTasks @('/Query','/TN','nuarr'))
     if ($LASTEXITCODE -eq 0) { Write-Step "Stopping the running nuarr"; [void](Invoke-SchTasks @('/End','/TN','nuarr')); Start-Sleep 3 }
 
     Tick "Creating folders"
-    foreach ($d in @($S.Target,$S.DataDir,$S.CacheDir)) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+    # An upgrade never saw the cache page, so $S.CacheDir is the DEFAULT - the
+    # real one lives in config.yml. Creating the default would plant an unused
+    # C:\nuarr-cache on machines that put their cache somewhere else.
+    $dirs = if ($S.Upgrade) { @($S.Target,$S.DataDir) } else { @($S.Target,$S.DataDir,$S.CacheDir) }
+    foreach ($d in $dirs) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
     Write-Step "Folders ready" 'ok'
 
     Tick "Copying the program"
@@ -545,28 +758,74 @@ function Run-Install {
     Tick "Installing the MKVToolNix tools"
     Install-MkvTools -Bundle $S.Bundle
 
-    Tick "Writing the configuration"
-    Write-NuarrConfig -Target $S.Target -Cfg @{
-      Libraries=$S.Libraries; Arrs=$S.Arrs; CacheDir=$S.CacheDir
-      PlexUrl=$S.PlexUrl; PlexToken=$S.PlexToken
+    Tick "Installing Tesseract (subtitle OCR)"
+    Install-Tesseract -Bundle $S.Bundle -DataDir $S.DataDir
+
+    if ($S.Upgrade) {
+      # The whole point of the short path: the config the user built is
+      # truth, and a wizard that never asked has nothing to write over it.
+      Write-Step "Keeping your existing configuration" 'ok'
+    } else {
+      Tick "Writing the configuration"
+      Write-NuarrConfig -Target $S.Target -Cfg @{
+        Libraries=$S.Libraries; Arrs=$S.Arrs; CacheDir=$S.CacheDir
+        PlexUrl=$S.PlexUrl; PlexToken=$S.PlexToken
+        NetShares=$S.NetShares
+      }
     }
 
-    Tick "Restoring the database"
-    if ($S.RestoreFrom) { Restore-Database -From $S.RestoreFrom -DataDir $S.DataDir -Target $S.Target }
-    else { Write-Step "Fresh install - nuarr will build its own database on first scan" }
-    Test-DatabaseHealth -Python $S.Python -DataDir $S.DataDir
+    if ($S.Upgrade) {
+      Write-Step "Keeping your existing database"
+      Test-DatabaseHealth -Python $S.Python -DataDir $S.DataDir
+    } else {
+      Tick "Restoring the database"
+      if ($S.RestoreFrom) { Restore-Database -From $S.RestoreFrom -DataDir $S.DataDir -Target $S.Target }
+      else {
+        # A FRESH INSTALL MEANS A FRESH DATABASE. A leftover nuarr.db - from
+        # an uninstall that kept it, or an earlier attempt - used to be
+        # adopted silently, and the new install came up showing 39,000 files
+        # from somebody's previous life. Set aside with a dated name, never
+        # deleted: the Restore box (or renaming it back) undoes this.
+        $oldDb = Join-Path $S.DataDir 'nuarr.db'
+        if (Test-Path -LiteralPath $oldDb) {
+          $stamp = Get-Date -f 'yyyyMMdd-HHmmss'
+          foreach ($suffix in '','-wal','-shm') {
+            $f = "$oldDb$suffix"
+            if (Test-Path -LiteralPath $f) {
+              Move-Item -LiteralPath $f -Destination "$f.previous-$stamp" -Force
+            }
+          }
+          Write-Step "A database from an earlier install was set aside as nuarr.db.previous-$stamp" 'warn'
+        }
+        Write-Step "Fresh install - nuarr will build its own database on first scan"
+      }
+      Test-DatabaseHealth -Python $S.Python -DataDir $S.DataDir
+    }
 
-    Tick "Audio language detection"
-    if ($S.Whisper) { [void](Install-Whisper -Python $S.Python -DataDir $S.DataDir) }
-    else { Write-Step "Whisper not selected - audio language detection stays off" }
+    if (-not $S.Upgrade) {
+      Tick "Audio language detection"
+      if ($S.Whisper) { [void](Install-Whisper -Python $S.Python -DataDir $S.DataDir -Gpu:([bool]$S.Gpu)) }
+      else { Write-Step "Whisper not selected - audio language detection stays off" }
+    }
 
     Tick "Registering the scheduled task"
-    if ($S.AtBoot) { New-NuarrTask -Python $S.Python -Target $S.Target -AtBoot }
+    [void](Invoke-SchTasks @('/Query','/TN','nuarr'))
+    if ($S.Upgrade -and $LASTEXITCODE -eq 0) {
+      # It exists with whatever trigger was chosen at install time;
+      # re-registering would silently reset that choice to the default.
+      Write-Step "Scheduled task already registered - left as it is"
+    } elseif ($S.AtBoot) { New-NuarrTask -Python $S.Python -Target $S.Target -AtBoot }
     else { New-NuarrTask -Python $S.Python -Target $S.Target }
     $bv = '0.0.0'
     try { $bv = (Get-Content (Join-Path $Root 'bundle.json') -Raw | ConvertFrom-Json).version } catch {}
     Install-Uninstaller -Target $S.Target -DataDir $S.DataDir -Version $bv -Port $S.Port
     if ($S.Shortcut) { New-Shortcuts -Target $S.Target -Port $S.Port }
+    elseif ($S.Upgrade) {
+      # An upgrade never asks about shortcuts - but a missing one usually
+      # means an uninstall or a failed run took it; put it back.
+      $lnkPath = Join-Path ([Environment]::GetFolderPath('CommonDesktopDirectory')) 'nuarr.lnk'
+      if (-not (Test-Path -LiteralPath $lnkPath)) { New-Shortcuts -Target $S.Target -Port $S.Port }
+    }
 
     Tick "Starting nuarr"
     if ($S.StartNow) {
@@ -579,7 +838,35 @@ function Run-Install {
   } catch {
     $S.Failed = $true
     Write-Step ("FAILED: " + $_.Exception.Message) 'err'
-    Write-Step "Nothing was removed. Fix the problem and run Setup again." 'err'
+    if ($S.Upgrade -or $script:CancelInstall) {
+      # An upgrade failure leaves the existing install strictly alone, and a
+      # cancel keeps its existing promise: things stop, nothing is removed.
+      Write-Step "Nothing was removed. Fix the problem and run Setup again." 'err'
+    } else {
+      # A FAILED FRESH INSTALL LEAVES NOTHING BEHIND. Half an install is
+      # worse than none: the next Setup run sees launch.py, decides this is
+      # an upgrade, and inherits every half-written thing - which is exactly
+      # how one broken run turned into three confusing ones. Only what this
+      # run created goes; anything that predates it stays.
+      Write-Step "Rolling back - removing what this run put in place" 'warn'
+      try {
+        [void](Invoke-SchTasks @('/End','/TN','nuarr'))
+        if (-not $script:Pre.Task) { [void](Invoke-SchTasks @('/Delete','/TN','nuarr','/F')) }
+        Start-Sleep 2
+        if (-not $script:Pre.Target) { Remove-Item -LiteralPath $S.Target  -Recurse -Force -ErrorAction SilentlyContinue }
+        if (-not $script:Pre.Data)   { Remove-Item -LiteralPath $S.DataDir -Recurse -Force -ErrorAction SilentlyContinue }
+        if (-not $script:Pre.Cache)  { Remove-Item -LiteralPath $S.CacheDir -Recurse -Force -ErrorAction SilentlyContinue }
+        if (-not $script:Pre.Lnk) {
+          Remove-Item (Join-Path ([Environment]::GetFolderPath('CommonDesktopDirectory')) 'nuarr.lnk') -Force -ErrorAction SilentlyContinue
+        }
+        if (-not $script:Pre.Arp) {
+          Remove-Item 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\nuarr' -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        Write-Step "Rolled back - the machine is as it was before Setup ran" 'warn'
+      } catch {
+        Write-Step ("Rollback incomplete: " + $_.Exception.Message) 'warn'
+      }
+    }
   }
 }
 
@@ -592,9 +879,116 @@ $btnCache.Add_Click({
 })
 $btnRestore.Add_Click({ $p = Pick-Folder $txtRestore.Text 'Pick a nuarr-YYYYMMDD-HHMMSS backup folder'; if ($p) { $txtRestore.Text=$p } })
 
+function Resolve-NetworkPath {
+  <#  A mapped drive letter belongs to the login session that mapped it; the
+      nuarr service cannot see it AT ALL. The picker happily returns P:\ though,
+      because the picker runs in that session - so the letter is translated to
+      the UNC path it stands for before it goes anywhere near the config. #>
+  param([string]$Path)
+  if ($Path -match '^([A-Za-z]):') {
+    $root = ''
+    try { $root = [string](Get-PSDrive -Name $Matches[1] -ErrorAction Stop).DisplayRoot } catch {}
+    if ($root -and $root -like '\\*') {
+      $unc = $root.TrimEnd('\') + $Path.Substring(2)
+      [void][Windows.Forms.MessageBox]::Show(
+        "$($Path.Substring(0,2)) is a mapped network drive - your login session can see it, but the nuarr service cannot see drive letters at all.`n`nUsing the real path instead:`n$unc",
+        'nuarr Setup','OK','Information')
+      return $unc
+    }
+  }
+  return $Path
+}
+
+function Get-ShareCredential {
+  param([string]$Server)
+  $f = New-Object Windows.Forms.Form
+  $f.Text = "Connect to \\$Server"
+  $f.ClientSize = New-Object Drawing.Size(400,168)
+  $f.StartPosition = 'CenterParent'; $f.FormBorderStyle='FixedDialog'
+  $f.MaximizeBox = $false; $f.MinimizeBox = $false
+  $f.BackColor = $C.Bg
+  $l1 = New-Label 'Username   (SERVER\user, or just the user name)' 14 12 370 18; $f.Controls.Add($l1)
+  $u = New-Box '' 14 32 370; $f.Controls.Add($u)
+  $l2 = New-Label 'Password' 14 64 370 18; $f.Controls.Add($l2)
+  $pw = New-Box '' 14 84 370; $pw.UseSystemPasswordChar = $true; $f.Controls.Add($pw)
+  $ok = New-Btn 'Connect' 196 122 90; $ok.DialogResult='OK'; $f.Controls.Add($ok)
+  $no = New-Btn 'Cancel' 294 122 90; $no.DialogResult='Cancel'; $f.Controls.Add($no)
+  $f.AcceptButton = $ok; $f.CancelButton = $no
+  if ($f.ShowDialog() -eq 'OK' -and $u.Text.Trim()) {
+    return @{ Username = $u.Text.Trim(); Password = $pw.Text }
+  }
+  return $null
+}
+
+function Ensure-ShareCredential {
+  <#  A UNC library is only usable by the SERVICE if the service can sign in
+      to the server itself - the wizard's own access came from the login
+      session and does not transfer. Asks once per server, PROVES the
+      credentials with a live connection before keeping them, and stores
+      them for config.yml so nuarr reconnects at every boot. #>
+  param([string]$Path)
+  if ($Path -notmatch '^\\\\([^\\]+)') { return $true }
+  $server = $Matches[1]
+  foreach ($ns in @($S.NetShares)) { if ($ns.Server -eq $server) { return $true } }
+  [void][Windows.Forms.MessageBox]::Show(
+    "That folder lives on \\$server.`n`nnuarr runs as a service, and a service has none of your login session's access to network shares - it needs credentials of its own, which nuarr stores and uses to reconnect at every boot.",
+    'nuarr Setup','OK','Information')
+  for ($try = 0; $try -lt 3; $try++) {
+    $cred = Get-ShareCredential -Server $server
+    if (-not $cred) {
+      $a = [Windows.Forms.MessageBox]::Show(
+        "Without credentials the service cannot read \\$server, and this library will show as missing.`n`nAdd it anyway?",
+        'nuarr Setup','YesNo','Warning')
+      return ($a -eq 'Yes')
+    }
+    # PROVE THEM NOW - a typo discovered here costs a retry; discovered after
+    # install it costs a library that silently indexes nothing. net use talks
+    # on stderr, which the script-wide EAP would turn fatal, so it is relaxed
+    # around the call and the exit code is what gets judged.
+    $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    # CLEAR EVERY EXISTING CONNECTION TO THIS SERVER FIRST. Windows allows one
+    # set of credentials per server per session, and the folder picker a
+    # moment ago quietly opened a connection under YOUR account - so testing
+    # the service's credentials answered error 1219 ("multiple connections
+    # not allowed") and looked like a wrong password when it was neither.
+    foreach ($ln in @(net use 2>&1)) {
+      $mUse = [regex]::Match("$ln", '(\\\\' + [regex]::Escape($server) + '\\[^ ]+)')
+      if ($mUse.Success) { $null = net use $mUse.Groups[1].Value /delete /y 2>&1 }
+    }
+    $out = net use "\\$server\IPC$" "$($cred.Password)" /user:"$($cred.Username)" 2>&1
+    $rc = $LASTEXITCODE
+    $null = net use "\\$server\IPC$" /delete /y 2>&1
+    $ErrorActionPreference = $eap
+    if ($rc -eq 0) {
+      $S.NetShares = @($S.NetShares) + @(@{ Server=$server; Username=$cred.Username; Password=$cred.Password })
+      [void][Windows.Forms.MessageBox]::Show(
+        "Connected. nuarr will sign in to \\$server as $($cred.Username) whenever it starts.",
+        'nuarr Setup','OK','Information')
+      return $true
+    }
+    # net use SPEAKS IN TWO LINES ("System error 1326 has occurred." / "The
+    # user name or password is incorrect.") and the first version showed
+    # neither - an ErrorRecord interpolates as its exception TYPE, so the
+    # dialog said 'System.Management.Automation.RemoteException' and nothing
+    # useful. Coerce every line to text and keep the human ones.
+    $msg = ((@($out) | ForEach-Object { "$_" } |
+              Where-Object { $_ -match '\S' -and $_ -notmatch 'RemoteException|NativeCommandError|CategoryInfo|FullyQualifiedErrorId|^At line|^\+' } |
+              Select-Object -First 3) -join ' ').Trim()
+    if (-not $msg) { $msg = "net use exited with code $rc and no message" }
+    [void][Windows.Forms.MessageBox]::Show(
+      "\\$server did not accept that sign-in:`n`n$msg",
+      'nuarr Setup','OK','Warning')
+  }
+  return $true
+}
+
 $btnLibAdd.Add_Click({
   $p = Pick-Folder 'C:\' 'Pick a media folder'
   if (-not $p) { return }
+  $p = Resolve-NetworkPath $p
+  if ($p -match '^\\\\') {
+    if (-not (Ensure-ShareCredential $p)) { return }
+  }
   $name = Split-Path $p -Leaf
   $kind = if ($name -match 'movie|film') { 'movie' } else { 'tv' }
   $it = New-Object Windows.Forms.ListViewItem($name)
@@ -619,12 +1013,20 @@ $rRad.Btn.Add_Click({
   $rRad.Status.Text = $r.Detail; $rRad.Status.ForeColor = if($r.Ok){$C.Ok}else{$C.Bad}
 })
 $rPlex.Btn.Add_Click({
-  $rPlex.Status.Text='Testing...'; $rPlex.Status.ForeColor=$C.Dim
-  $r = Test-PlexConnection -Url $rPlex.Url.Text -Token $(if($rPlex.Key.Text.Trim()){$rPlex.Key.Text}else{$S.DetPlexTok})
-  $rPlex.Status.Text = $r.Detail; $rPlex.Status.ForeColor = if($r.Ok){$C.Ok}else{$C.Bad}
+  # A HAND-PASTED TOKEN IS RESPECTED: with text in the field this is a plain
+  # test of what was typed. Empty field - the normal case - runs the sign-in,
+  # which proves account, server and token in one go.
+  if ($rPlex.Key.Text.Trim()) {
+    $rPlex.Status.Text='Testing the pasted token...'; $rPlex.Status.ForeColor=$C.Dim
+    $r = Test-PlexConnection -Url $rPlex.Url.Text -Token $rPlex.Key.Text
+    $rPlex.Status.Text = $r.Detail; $rPlex.Status.ForeColor = if($r.Ok){$C.Ok}else{$C.Bad}
+  } else { Invoke-PlexLink }
 })
 
-$btnBack.Add_Click({ if ($script:Page -gt 0) { Show-Page ($script:Page-1) } })
+$btnBack.Add_Click({
+  if ($script:Page -eq 4) { Show-Page 1 }
+  elseif ($script:Page -gt 0) { Show-Page ($script:Page-1) }
+})
 $script:CancelInstall = $false
 $btnCancel.Add_Click({
   # TWO DIFFERENT PROMISES. Before the install, quitting genuinely changes
@@ -661,55 +1063,75 @@ $btnNext.Add_Click({
   }
 })
 
+function Remove-OldInstall {
+  <#  The uninstaller's job, done inline so a fresh install is genuinely
+      fresh. Deliberately more careful with the cache than with anything
+      else: a cache folder that CONTAINS VIDEO is one that was misconfigured
+      onto real media, and the answer there is to leave it alone. #>
+  $form.Cursor = [Windows.Forms.Cursors]::WaitCursor
+  try {
+    [void](Invoke-SchTasks @('/End','/TN','nuarr')); Start-Sleep 2
+    [void](Invoke-SchTasks @('/Delete','/TN','nuarr','/F'))
+    $cache = ''
+    $cfg = Join-Path $S.Target 'config.yml'
+    if (Test-Path -LiteralPath $cfg) {
+      $m = Select-String -LiteralPath $cfg -Pattern '^\s*cache_dir\s*:\s*(.+)$' | Select-Object -First 1
+      if ($m) { $cache = $m.Matches[0].Groups[1].Value.Trim().Trim('"').Trim([char]39) }
+    }
+    foreach ($d in @($S.Target, $S.DataDir)) {
+      if ($d -and (Test-Path -LiteralPath $d)) {
+        Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue
+      }
+    }
+    if ($cache -and (Test-Path -LiteralPath $cache)) {
+      $vid = Get-ChildItem -LiteralPath $cache -Recurse -File -ErrorAction SilentlyContinue |
+              Where-Object { $_.Extension -match '^\.(mkv|mp4|avi|m2ts|ts|mov|wmv)$' } |
+              Select-Object -First 1
+      if (-not $vid) { Remove-Item -LiteralPath $cache -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+    Remove-Item (Join-Path ([Environment]::GetFolderPath('CommonDesktopDirectory')) 'nuarr.lnk') -Force -ErrorAction SilentlyContinue
+    Remove-Item 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\nuarr' -Recurse -Force -ErrorAction SilentlyContinue
+  } finally { $form.Cursor = [Windows.Forms.Cursors]::Default }
+}
+
 function Advance-Wizard {
   switch ($script:Page) {
-    0 { Load-Detected; Show-Page 1 }
-    1 { if (Collect-Page1) { Show-Page 2 } }
+    0 {
+        if ($S.Upgrade -and $chkFresh.Checked) {
+          $a = [Windows.Forms.MessageBox]::Show(
+            "Remove the existing nuarr first?`n`nThis deletes the program at $($S.Target), its settings, its DATABASE and its transcode cache, then walks the full install from the beginning. Media files are never touched.`n`nThis cannot be undone.",
+            'nuarr Setup','YesNo','Warning')
+          if ($a -ne 'Yes') { return }
+          Remove-OldInstall
+          $S.Upgrade = $false
+          $chkFresh.Checked = $false; $chkFresh.Visible = $false
+          $btnNext.Text = 'Next >'
+          Load-Detected; Show-Page 1
+          return
+        }
+        if ($S.Upgrade) {
+          # AN UPGRADE ASKS NOTHING. Folders, port, libraries and credentials
+          # were answered the first time and live in config.yml and the
+          # database; re-asking just invites retyping one of them wrong.
+          $S.StartNow = $true; $S.Shortcut = $false
+          $S.Whisper = $false; $S.RestoreFrom = ''
+          Show-Page 5
+          Run-Install
+          Finish-Install
+        } else { Load-Detected; Show-Page 1 }
+      }
+    # PAGES 2 AND 3 ARE RETIRED. Libraries, arrs and Plex configure better in
+    # the running app - live tests, Sign in with Plex, a share-aware picker -
+    # than in a wizard that runs before nuarr exists. The dashboard walks a
+    # fresh install through all three on first load.
+    1 { if (Collect-Page1) { Show-Page 4 } }
     2 { if (Collect-Page2) { Show-Page 3 } }
     3 { if (Collect-Page3) { Show-Page 4 } }
     4 {
         if (-not (Collect-Page4)) { return }
         Show-Page 5
         Run-Install
-        if ($S.Failed -and $script:CancelInstall) {
-          # A cancel is not a failure, and the failure text lied about it -
-          # "the machine is as it was" stops being true once files have landed.
-          $lblDone.Text = 'Setup was stopped'
-          $lblDone.ForeColor = $C.Warn
-          $lblDoneSub.Text = "Stopped between steps, at your request.`n`nAnything already put in place is still at $($S.Target).`nRun Setup again to finish the job, or Uninstall.cmd to clear it away.`n`nSetup log:`n$script:LogPath"
-          $chkOpenUI.Checked = $false; $chkOpenUI.Enabled = $false
-          $chkReadme.Checked = $false; $chkReadme.Enabled = $false
-          $chkShowLog.Checked = $false
-        } elseif ($S.Failed) {
-          $lblDone.Text = 'Setup did not finish'
-          $lblDone.ForeColor = $C.Bad
-          $lblDoneSub.Text = "Something went wrong and Setup stopped.`n`nThe log has the exact error:`n`n$script:LogPath"
-          $chkOpenUI.Checked = $false; $chkOpenUI.Enabled = $false
-          $chkReadme.Checked = $false; $chkReadme.Enabled = $false
-          $chkShowLog.Checked = $true    # on failure the log is the point
-        } else {
-          $lblDone.Text = 'nuarr is installed'
-          $lblDone.ForeColor = $C.Ok
-          $libn = $S.Libraries.Count
-          $arrn = $S.Arrs.Count
-          $lblDoneSub.Text = @"
-Dashboard    http://127.0.0.1:$($S.Port)/
-Program      $($S.Target)
-Data         $($S.DataDir)
-Cache        $($S.CacheDir)
-
-Libraries    $libn managed
-Integrations $arrn arr(s)$(if($S.PlexToken){' + Plex'}else{''})
-Whisper      $(if($S.Whisper){'installed'}else{'not installed'})
-Autostart    $(if($S.AtBoot){'yes, at boot'}else{'at logon'})
-
-The first scan takes a while on a large library. Watch it happen
-on the dashboard - nothing is modified until you let it.
-
-Setup log    $script:LogPath
-"@
-        }
-        Show-Page 6
+        Finish-Install
       }
     6 {
         # FINISH DOES THE THINGS THAT WERE TICKED. Ordered deliberately: the
@@ -732,6 +1154,64 @@ Setup log    $script:LogPath
         $form.Close()
       }
   }
+}
+
+function Finish-Install {
+        if ($S.Failed -and $script:CancelInstall) {
+          # A cancel is not a failure, and the failure text lied about it -
+          # "the machine is as it was" stops being true once files have landed.
+          $lblDone.Text = 'Setup was stopped'
+          $lblDone.ForeColor = $C.Warn
+          $lblDoneSub.Text = "Stopped between steps, at your request.`n`nAnything already put in place is still at $($S.Target).`nRun Setup again to finish the job, or Uninstall.cmd to clear it away.`n`nSetup log:`n$script:LogPath"
+          $chkOpenUI.Checked = $false; $chkOpenUI.Enabled = $false
+          $chkReadme.Checked = $false; $chkReadme.Enabled = $false
+          $chkShowLog.Checked = $false
+        } elseif ($S.Failed) {
+          $lblDone.Text = 'Setup did not finish'
+          $lblDone.ForeColor = $C.Bad
+          $lblDoneSub.Text = if ($S.Upgrade) {
+            "Something went wrong and Setup stopped.`n`nYour existing install was not removed.`n`nThe log has the exact error:`n`n$script:LogPath"
+          } else {
+            "Something went wrong and Setup stopped.`n`nEverything this run put in place was rolled back - the machine is as it`nwas, and running Setup again starts clean.`n`nThe log has the exact error:`n`n$script:LogPath"
+          }
+          $chkOpenUI.Checked = $false; $chkOpenUI.Enabled = $false
+          $chkReadme.Checked = $false; $chkReadme.Enabled = $false
+          $chkShowLog.Checked = $true    # on failure the log is the point
+        } else {
+          $lblDone.Text = if ($S.Upgrade) { 'nuarr is upgraded' } else { 'nuarr is installed' }
+          $lblDone.ForeColor = $C.Ok
+          if ($S.Upgrade) {
+            $lblDoneSub.Text = @"
+Dashboard    http://127.0.0.1:$($S.Port)/
+Program      $($S.Target)
+
+Your database, settings and configuration were kept.
+nuarr has been restarted and picks up where it left off.
+
+Setup log    $script:LogPath
+"@
+            Show-Page 6
+            return
+          }
+          $libn = $S.Libraries.Count
+          $arrn = $S.Arrs.Count
+          $lblDoneSub.Text = @"
+Dashboard    http://127.0.0.1:$($S.Port)/
+Program      $($S.Target)
+Data         $($S.DataDir)
+Cache        $($S.CacheDir)
+
+Whisper      $(if($S.Whisper){'installed'}else{'not installed'})
+Autostart    $(if($S.AtBoot){'yes, at boot'}else{'at logon'})
+
+Libraries, Sonarr / Radarr and Plex are set up on the dashboard -
+open it and nuarr walks you through all three. Each page tests
+the connection before it saves, so nothing fails silently later.
+
+Setup log    $script:LogPath
+"@
+        }
+        Show-Page 6
 }
 
 Show-Page 0
