@@ -2410,17 +2410,32 @@ def _summary_impl():
         attention.append({"what": "file errors", "n": int(errors["n"]),
                           "goto": "errors"})
     try:
-        arow = _rows("SELECT pending FROM audit_runs "
-                     "ORDER BY at DESC LIMIT 1")
-        if arow and arow[0]["pending"]:
-            attention.append({"what": "rule check", "n": int(arow[0]["pending"]),
+        # OUTSTANDING, NOT EVER-FOUND. audit_runs.pending is the count AT THE
+        # MOMENT that run finished; the self-healer then queues, fixes and
+        # re-verifies each one. Reading the snapshot made the tile say
+        # "rule check 3" while the page itself said "3 found, all since
+        # fixed" - a number that could only ever go up. The heal rows carry
+        # the live state, so a fixed finding leaves the tile the moment it
+        # is fixed.
+        arow = _rows("SELECT COUNT(*) n FROM audit_heals "
+                     "WHERE state != 'fixed'")
+        if arow and arow[0]["n"]:
+            attention.append({"what": "rule check", "n": int(arow[0]["n"]),
                               "note": "still breaking a rule",
                               "goto": "/settings#ruleschk"})
     except Exception:                                    # noqa: BLE001
         pass
     try:
-        al = _rows("SELECT COUNT(*) n FROM audio_lang "
-                   "WHERE COALESCE(code,'')=''")
+        # A track listened to and refused is only outstanding while it is
+        # STILL untagged - once the tag is written (by nuarr or by hand) the
+        # row is history, not work.
+        al = _rows("SELECT COUNT(*) n FROM audio_lang a "
+                   "JOIN files f ON f.id = a.file_id "
+                   " WHERE COALESCE(a.code,'') = '' "
+                   "   AND f.state NOT IN ('deleted','duplicate') "
+                   "   AND (f.audio_langs = '-' OR f.audio_langs LIKE '-,%' "
+                   "        OR f.audio_langs LIKE '%,-' "
+                   "        OR f.audio_langs LIKE '%,-,%')")
         if al and al[0]["n"]:
             attention.append({"what": "audio language", "n": int(al[0]["n"]),
                               "note": "listened, no confident answer",
@@ -9223,15 +9238,19 @@ input[type=time]::-webkit-calendar-picker-indicator{filter:invert(.75);cursor:po
   <div class="panel" id="pbPanel" style="display:none">
     <h2 style="color:#f778ba">What Plex had to work at
         <span id="pbCount" class="dim"></span>
-        <span style="float:right;font-weight:400">
+        <span style="float:right;font-weight:400;display:flex;gap:8px;align-items:center">
+          <button id="pbFresh" class="resume" style="display:none"
+            onclick="document.getElementById('pb').scrollTop=0">↑ back to top</button>
           <button onclick="pbPoll()">Check now</button></span></h2>
-    <div id="pb"><div class="dim" style="padding:14px">loading…</div></div>
+    <div id="pb" class="fullpane"><div class="dim" style="padding:14px">loading…</div></div>
   </div>
   <div class="panel" id="auPanel" style="display:none">
     <h2 style="color:#39d3c3">Rule check <span id="auCount" class="dim"></span>
-        <span style="float:right;font-weight:400">
+        <span style="float:right;font-weight:400;display:flex;gap:8px;align-items:center">
+          <button id="auFresh" class="resume" style="display:none"
+            onclick="document.getElementById('au').scrollTop=0">↑ back to top</button>
           <button onclick="auRun()">Run now</button></span></h2>
-    <div id="au"><div class="dim" style="padding:14px">loading…</div></div>
+    <div id="au" class="fullpane"><div class="dim" style="padding:14px">loading…</div></div>
   </div>
   <!-- THE ONE FEED. Finished jobs and file events used to live in two panels
        a screenful apart, so following one file meant scrolling between "the
@@ -9353,6 +9372,48 @@ function resumeFollow(id){
 function followBtn(id){
   return `<button id="${id}Resume" style="display:none" class="resume"
             onclick="resumeFollow('${id}')">↓ resume auto-scroll</button>`;
+}
+
+// THE SAME "do not move while I am reading" RULE, for a TOP-anchored panel.
+// paint() above is for feeds that grow downward and auto-scroll to the
+// bottom. The rule check and the Plex playback table are lists sorted
+// newest-first: nothing to follow, but replacing innerHTML still throws you
+// back to the top mid-read, which is the same injury from the other
+// direction. Scrolled away from the top means frozen, with a button that
+// says how many refreshes are waiting.
+const _topFrozen={};
+function paintTop(id, html){
+  const el=document.getElementById(id);
+  if(!el) return false;
+  if(!el._topWatch){
+    el._topWatch=true;
+    el.addEventListener('scroll', ()=>{
+      if(el.scrollTop<=8 && _topFrozen[id]){
+        _topFrozen[id]=0;
+        const b=document.getElementById(id+'Fresh');
+        if(b) b.style.display='none';
+        if(el._pendingHtml){ el.innerHTML=el._pendingHtml; el._pendingHtml=null; }
+      }
+    }, {passive:true});
+  }
+  if(el.scrollTop>8){
+    el._pendingHtml=html;
+    _topFrozen[id]=(_topFrozen[id]||0)+1;
+    const b=document.getElementById(id+'Fresh');
+    if(b){ b.style.display='';
+           b.textContent=`↑ ${_topFrozen[id]} update${_topFrozen[id]===1?'':'s'} — back to top`; }
+    return false;
+  }
+  _topFrozen[id]=0; el._pendingHtml=null;
+  el.innerHTML=html;
+  const b=document.getElementById(id+'Fresh');
+  if(b) b.style.display='none';
+  return true;
+}
+function topFreshBtn(id){
+  return `<button id="${id}Fresh" class="resume" style="display:none"
+     onclick="(function(){const e=document.getElementById('${id}');
+       if(e){e.scrollTop=0;}})()">↑ back to top</button>`;
 }
 
 // Keep a filter dropdown stocked with the values that actually appear, with a
@@ -11978,7 +12039,7 @@ function renderPlayback(){
   const th=(c,label,cls,w)=>`<th class="${cls||''}" style="cursor:pointer${
       w?';width:'+w:''}" title="sort by ${label.toLowerCase()}"
       onclick="sortPb('${c}')">${label}${arrow(c)}</th>`;
-  setHTML(el, `<div style="padding:8px 14px;border-bottom:1px solid var(--line)">
+  paintTop('pb', `<div style="padding:8px 14px;border-bottom:1px solid var(--line)">
       <div class="dim" style="font-size:11px;margin-bottom:5px">what caused it</div>
       ${causes}
       ${clients?`<div class="dim" style="font-size:11px;margin-top:7px">clients: ${clients}</div>`:''}
@@ -12324,7 +12385,7 @@ click to read this run's findings"
       ${st.heal_current?' · '+esc(st.heal_current):''}</span></span>`;
   }
 
-  setHTML(el, `<div style="padding:9px 14px;border-bottom:1px solid var(--line)">
+  paintTop('au', `<div style="padding:9px 14px;border-bottom:1px solid var(--line)">
       ${err?`<div class="err" style="margin-bottom:7px">${esc(err)}</div>`:''}
       <div class="auscore">${score}
         <span class="dim" style="margin-left:auto;font-size:11px;text-align:right">
@@ -16743,9 +16804,20 @@ function pxDetail(s){
 // transcoding and why, who is buffered how far - and comparing means seeing
 // them side by side, not clicking three cards in a row. Any card toggles the
 // whole set.
-let _pxOpenAll = false;
+// REMEMBERED, and openable by URL. Expanded is a reading mode, not a
+// gesture: someone comparing four streams wants it to survive the refresh
+// they are about to trigger, and `?cards=open` makes the expanded view
+// linkable - which is also how the documentation screenshots are taken
+// rather than by hand-editing a screenshot.
+let _pxOpenAll = (() => {
+  try{
+    if(new URLSearchParams(location.search).get('cards')==='open') return true;
+    return localStorage.getItem('nuarrCards')==='open';
+  }catch(e){ return false; }
+})();
 function pxToggle(){
   _pxOpenAll = !_pxOpenAll;
+  try{ localStorage.setItem('nuarrCards', _pxOpenAll?'open':'shut'); }catch(e){}
   pxRender(_pxRows);
 }
 
@@ -20903,6 +20975,17 @@ _SETTINGS_CSS = """
 .ckhead a{color:var(--dim)}
 .ckhead a:hover{color:var(--acc)}
 /* Square off the header's bottom corners once a body is showing under it. */
+/* THE ADOPTED PANELS FILL THEIR PAGE. On the dashboard these sat in a grid
+   cell and were as tall as their content; as settings pages of their own,
+   content-height meant a 60-row table pushing the whole window down and the
+   header scrolling away from the rows it describes. Full width, and tall
+   enough to use the window, with the scrolling inside the panel so the
+   header and the freeze button stay put. */
+#plexworkPane .panel, #ruleschkPane .panel{margin:0;border:0}
+#plexworkPane .fullpane, #ruleschkPane .fullpane{
+  max-height:calc(100vh - 210px);overflow:auto;overflow-x:hidden}
+#plexworkPane table, #ruleschkPane table{width:100%}
+
 /* The per-library subtitle-handling block, inside the expanded library. */
 .socbox{border-top:1px solid var(--line)}
 .socinner{padding:10px 14px 12px}

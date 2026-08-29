@@ -46,6 +46,12 @@ four seconds ahead, and nuarr treats them differently.
 
 ![The job gate](docs/screenshots/job-gate.png)
 
+Click any session card and all of them open: what Plex did to every track and
+why, what the file actually is, how far ahead the viewer is buffered, and —
+per disk — the speed nuarr is allowed while they watch.
+
+![Every stream, in full](docs/screenshots/playing-expanded.png)
+
 ### It yields the exact spindle being read
 
 Per-disk, not per-pool. One viewer occupies one of twelve disks; work continues
