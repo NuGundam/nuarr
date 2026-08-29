@@ -9712,7 +9712,23 @@ async function loadAll(){
   const attTop=att.length
     ? esc(att.map(a=>`${a.what} ${fmt(a.n)}`).join(' · ')).slice(0,64)
     : 'nothing needs attention';
-  add('Attention',fmt(attN),attTop,{errors:1,t:'Needs attention'});
+  // GO WHERE THE WORK IS. The tile always opened the file-ERRORS list, no
+  // matter what it was counting - so "Attention 2" from the rule check
+  // opened an empty errors panel saying "nothing matches". The count and the
+  // destination disagreed, which reads as the number being wrong.
+  //
+  // Each entry already carries its own `goto` from the server. With one
+  // source, follow it. With several, the errors list is still the only
+  // in-page panel that can show a mixture, so it stays the landing spot -
+  // but only when there really are file errors to show.
+  if(!att.length){
+    add('Attention','0','nothing needs attention',null);
+  }else if(att.length===1 && att[0].goto && att[0].goto!=='errors'){
+    window._attGoto = att[0].goto;
+    add('Attention',fmt(attN),attTop,{attgo:1,t:'Needs attention'});
+  }else{
+    add('Attention',fmt(attN),attTop,{errors:1,t:'Needs attention'});
+  }
   const ua = s.unmanaged_adopt || {checking:0, no_folder:0};
   add('Unmanaged &gt;'+s.extras_cutoff_mb+'MB',fmt(s.orphans.n),
       sweepNote(s.unmanaged_sweep, ua.checking,
@@ -10321,6 +10337,14 @@ function drillUrl(extra){
   return '/api/files?'+p.toString();
 }
 async function drill(q){
+  // A tile whose work lives on ANOTHER PAGE navigates there instead of
+  // opening a file list that cannot show it. Kept on `window` rather than a
+  // `let`: the tile painter assigns it from a line ABOVE this one, and a
+  // block-scoped binding would be in its temporal dead zone there.
+  if(q && q.attgo){
+    if(window._attGoto) location.href=window._attGoto;
+    return;
+  }
   const p=document.getElementById('drillPanel');
   // clicking the same tile again closes the panel - a toggle, not a one-way door
   const same = drillQuery && JSON.stringify(drillQuery)===JSON.stringify(q);
