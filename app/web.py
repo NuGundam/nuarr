@@ -4308,8 +4308,21 @@ async def api_ocr_test(engine: str = Query("tesseract"),
                        device: str = Query("cpu")):
     """Read a dozen real cues with one engine. Writes nothing to the library."""
     from . import subocr as _so
+    from . import heavy
     if engine not in ("tesseract", "paddle"):
         return {"ok": False, "error": "unknown engine"}
+    # ONE HEAVY THING AT A TIME. A test loads a model; so does an install.
+    # Both at once on a small machine is how the server ran out of memory
+    # and died mid-test.
+    lane = heavy.Lane(f"{engine} test")
+    with lane:
+        if not lane.got:
+            return {"ok": False,
+                    "error": f"{lane.holder} is running — engine work is done "
+                             "one at a time so a small machine cannot be "
+                             "asked to load two models at once. Try again "
+                             "when it finishes."}
+        return await asyncio.to_thread(_so.engine_test, engine, device)
     return await asyncio.to_thread(_so.engine_test, engine, device)
 
 

@@ -390,10 +390,22 @@ def install_status() -> dict:
 
 def install_start(mode: str) -> dict:
     """Kick off a pip install on a worker thread; the page polls the state."""
+    from . import heavy
     if mode not in _INSTALL_PKGS:
         return {"ok": False, "error": f"unknown install mode {mode!r}"}
+    # ONE HEAVY OPERATION AT A TIME across all the engines, not just this
+    # one. The old check only stopped a SECOND Whisper install; starting
+    # this while a PaddleOCR test had a model loaded was allowed, and on a
+    # small machine that pair is enough to run it out of memory.
+    got, holder = heavy.claim("Whisper install")
+    if not got:
+        return {"ok": False,
+                "error": f"{holder} is running — engine work is done one at "
+                         "a time so a small machine is never asked to load "
+                         "two models at once. Try again when it finishes."}
     with _INSTALL_LOCK:
         if INSTALL["state"] == "installing":
+            heavy.release("Whisper install")
             return {"ok": False, "error": "an install is already running"}
         INSTALL.update(state="installing", mode=mode, log="", error="",
                        started_at=time.time(), finished_at=0.0)
@@ -447,6 +459,15 @@ def _install_worker(mode: str) -> None:
         INSTALL.update(state="error", finished_at=time.time(),
                        error=f"{type(e).__name__}: {str(e)[:160]}")
         joblog.log(f"whisper install failed: {e}", "warn", system="audiolang")
+    finally:
+        # The lane is claimed in install_start() and belongs to this thread
+        # until it ends, whichever way it ends. Released here rather than at
+        # the end of the happy path so a failed install cannot hold it.
+        try:
+            from . import heavy
+            heavy.release("Whisper install")
+        except Exception:                                # noqa: BLE001
+            pass
 
 
 def _model():

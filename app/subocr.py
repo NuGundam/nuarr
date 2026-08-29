@@ -1370,10 +1370,20 @@ def paddle_info(force: bool = False) -> dict:
 def paddle_install_start(mode: str) -> dict:
     """Install PaddleOCR from the page - the Whisper pattern, second engine."""
     import threading as _t
+    from . import heavy
     if mode not in _PADDLE_STEPS:
         return {"ok": False, "error": f"unknown mode {mode!r}"}
     if PADDLE_INSTALL["state"] == "installing":
         return {"ok": False, "error": "an install is already running"}
+    # Shares one lane with the Whisper install and both engine tests - see
+    # app/heavy.py. Two model-sized operations at once is what took the
+    # server down on a small VM.
+    got, holder = heavy.claim("PaddleOCR install")
+    if not got:
+        return {"ok": False,
+                "error": f"{holder} is running — engine work is done one at "
+                         "a time so a small machine is never asked to load "
+                         "two models at once. Try again when it finishes."}
     PADDLE_INSTALL.update(state="installing", mode=mode, log="", error="")
 
     def _work():
@@ -1402,6 +1412,13 @@ def paddle_install_start(mode: str) -> dict:
         except Exception as e:                           # noqa: BLE001
             PADDLE_INSTALL.update(state="error",
                                   error=f"{type(e).__name__}: {str(e)[:160]}")
+        finally:
+            # Claimed in paddle_install_start(); released here so a failed
+            # install cannot hold the lane shut.
+            try:
+                heavy.release("PaddleOCR install")
+            except Exception:                            # noqa: BLE001
+                pass
     _t.Thread(target=_work, name="paddle-install", daemon=True).start()
     return {"ok": True, "mode": mode}
 
