@@ -13,7 +13,14 @@ $script:LogPath = Join-Path $env:TEMP ("nuarr-setup-{0}.log" -f (Get-Date -f 'yy
 $script:LogSink = $null      # the wizard sets this to a scriptblock
 
 function Write-Step {
-  param([string]$Text, [ValidateSet('info','ok','warn','err')][string]$Level='info')
+  # NO ValidateSet. A logging call must never be the thing that ends an
+  # install: seven callers passed 'bad', which was never in the set, and each
+  # one sat on an ERROR path - so the first real problem reported itself as
+  # "Cannot validate argument on parameter 'Level'" and Setup rolled back a
+  # working machine while hiding the actual cause. An unknown level is now
+  # treated as an error and shown, which is the worst it should ever cost.
+  param([string]$Text, [string]$Level='info')
+  if ($Level -notin @('info','ok','warn','err')) { $Level = 'err' }
   $line = "{0}  {1}" -f (Get-Date -f 'HH:mm:ss'), $Text
   try { Add-Content -Path $script:LogPath -Value $line -Encoding UTF8 } catch {}
   if ($script:LogSink) { & $script:LogSink $Text $Level }
@@ -113,14 +120,14 @@ function Install-Python {
   param([string]$Bundle)
   $inst = Get-ChildItem (Join-Path $Bundle 'python') -Filter 'python-*.exe' `
             -ErrorAction SilentlyContinue | Select-Object -First 1
-  if (-not $inst) { Write-Step "no bundled Python installer found" 'bad'; return $null }
+  if (-not $inst) { Write-Step "no bundled Python installer found" 'err'; return $null }
   # Refuse an unsigned or tampered binary outright. This file came out of a
   # zip that has travelled who knows where; two seconds of verification
   # against the PSF's signature is cheap insurance on the thing that is about
   # to run elevated.
   $sig = Get-AuthenticodeSignature $inst.FullName
   if ($sig.Status -ne 'Valid') {
-    Write-Step "bundled Python installer failed signature check ($($sig.Status)) - not running it" 'bad'
+    Write-Step "bundled Python installer failed signature check ($($sig.Status)) - not running it" 'err'
     return $null
   }
   Write-Step "Installing $($inst.BaseName) (bundled, silent)..."
@@ -128,7 +135,7 @@ function Install-Python {
         '/quiet','InstallAllUsers=1','PrependPath=1','Include_test=0','Include_doc=0' `
         -Wait -PassThru
   if ($p.ExitCode -ne 0) {
-    Write-Step "Python installer exited $($p.ExitCode)" 'bad'; return $null
+    Write-Step "Python installer exited $($p.ExitCode)" 'err'; return $null
   }
   # The PATH change lands in the registry, not in this process. Pull the
   # machine PATH fresh so Find-Python can see what was just installed
@@ -361,7 +368,7 @@ function Install-Ffmpeg {
     $v = (& $ff -version 2>$null | Select-Object -First 1)
     Write-Step ("ffmpeg at {0} ({1})" -f $ff, ($v -replace '^ffmpeg version (\S+).*','$1')) 'ok'
   } else {
-    Write-Step "ffmpeg/ffprobe did not land in bin - encodes will not work" 'bad'
+    Write-Step "ffmpeg/ffprobe did not land in bin - encodes will not work" 'err'
   }
 }
 
@@ -399,7 +406,7 @@ function Install-MkvTools {
   Copy-Item (Join-Path $src '*') $dst -Force
   $v = & (Join-Path $dst 'mkvmerge.exe') --version 2>$null | Select-Object -First 1
   if ($v) { Write-Step ("{0} at {1}" -f $v, $dst) 'ok' }
-  else { Write-Step "mkvmerge did not answer after the copy" 'bad' }
+  else { Write-Step "mkvmerge did not answer after the copy" 'err' }
 }
 
 function Write-NuarrConfig {
@@ -567,9 +574,9 @@ function Install-Whisper {
       if ($prc -ne 0 -and $prc -ne 1) {
         $hex = '{0:X8}' -f ($prc -band 0xFFFFFFFF)
         if ($hex -eq 'C000001D') {
-          Write-Step "This CPU is missing AVX2, which the language identifier requires - it cannot run on this machine" 'bad'
+          Write-Step "This CPU is missing AVX2, which the language identifier requires - it cannot run on this machine" 'err'
         } else {
-          Write-Step "Loading the language model crashes on this machine (exit 0x$hex)" 'bad'
+          Write-Step "Loading the language model crashes on this machine (exit 0x$hex)" 'err'
         }
         Write-Step "Skipping the model download. Everything else in nuarr works; untagged audio is named by inference instead." 'warn'
         return $false

@@ -10647,6 +10647,32 @@ async function loadLibs(){
       if(p.files) facts.push(`<b>${fmt(p.files)}</b> files seen`);
       if(p.rate)  facts.push(`<b>${fmt(Math.round(p.rate))}</b>/s`);
       if(p.detail) facts.push(`<span class="dim">${esc(p.detail)}</span>`);
+      // REBUILD ONLY WHEN THE SHAPE CHANGES.
+      //
+      // This panel repaints every 750 ms and used to replace its whole
+      // innerHTML each time. That restarted the CSS animations added in
+      // 1.4.4 on every poll: the phase name re-ran its 0.3s fade and the
+      // progress stripe jumped back to the start of its cycle - so text that
+      // was not changing appeared to flash in and out. The animations were
+      // right; running them four times a second was not.
+      //
+      // Structure (which phase, which steps, which facts exist) is rebuilt.
+      // The numbers inside it are written in place, where they update
+      // without interrupting anything.
+      const sig = [p.phase_key||'', phases.length, facts.length, !!p.disk,
+                   p.eta_s!=null, p.overrun_s!=null].join('|');
+      if(sp.dataset.sig === sig && sp.firstElementChild){
+        const set=(sel,html)=>{ const e=sp.querySelector(sel);
+                                if(e && e.innerHTML!==html) e.innerHTML=html; };
+        const bar = sp.querySelector('.bar.big > i');
+        if(bar) bar.style.width = pct.toFixed(1)+'%';
+        set('.scanpctnum', pct.toFixed(0)+'%');
+        set('.scanelapsed', el!=null ? '· '+hms(el)+' elapsed' : '');
+        set('.scanfacts', facts.join('<span class="dim"> · </span>'));
+        set('.scanlist', list);
+        return;
+      }
+      sp.dataset.sig = sig;
       sp.innerHTML=
         `<div style="padding:10px 14px;border-bottom:1px solid var(--line)">
            <div style="display:flex;justify-content:space-between;align-items:baseline;
@@ -10655,7 +10681,7 @@ async function loadLibs(){
                    key="${esc(p.phase_key||'')}">${esc(phase)}</b>
                <span class="dim">· step ${p.phase_i||0} of ${phases.length||7}</span></span>
              <span style="font-size:13px">
-               <b>${pct.toFixed(0)}%</b>
+               <b class="scanpctnum">${pct.toFixed(0)}%</b>
                ${p.eta_s!=null?`<span class="dim">· ~${hms(p.eta_s)} left</span>`
                  : p.overrun_s!=null
                    // NOT "~1s left". The estimate is the thing that turned out
@@ -10664,7 +10690,7 @@ async function loadLibs(){
                    // phase ran twelve minutes over.
                    ? `<span class="warn">· over the ${hms(p.overrun_s)} estimate</span>`
                    : ''}
-               ${el!=null?`<span class="dim">· ${hms(el)} elapsed</span>`:''}
+               <span class="dim scanelapsed">${el!=null?`· ${hms(el)} elapsed`:''}</span>
              </span>
            </div>
            <div class="bar big"><i class="scanbar-live"
