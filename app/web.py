@@ -21012,18 +21012,30 @@ _SETTINGS_CSS = """
    fill the page; many rows scroll inside it with the heading and buttons
    staying put. min-height:0 on every level because a flex child defaults to
    min-content and would otherwise refuse to shrink. */
-/* SIZED TO THE VIEWPORT, NOT THE HOST - the same calc the Logs page uses.
-   height:100% filled the settings host, but the host has a min-height of its
-   own (882px), so on a shorter window the panel ran below the fold, and on a
-   taller one it stopped short of the bottom. 100vh is the window itself:
-   the list's bottom edge lands where Logs' does, whatever the screen. */
+/* SIZED TO THE SETTINGS PANEL, WITH A BOX YOU CAN SEE. Two attempts missed
+   what was actually being asked. The flex-fill and the viewport calc both
+   made the scroll area TALL - but everything here is the same black, so a
+   short list looked identical either way: seven rows, then nothing, and no
+   way to tell whether the box beneath them reached the panel or stopped at
+   the last row. The viewport calc also chased the window while the panel
+   is sized by the settings host, so the two bottoms could never agree.
+   height:100% ties the pane to the panel it lives in - flush bottom on any
+   screen - and the frame below makes the fit visible instead of takeable
+   on faith. */
 #plexworkPane, #ruleschkPane{display:flex;flex-direction:column;
-  height:calc(100vh - 190px);min-height:420px}
+  height:100%;min-height:420px}
 #plexworkBody, #ruleschkBody{flex:1;display:flex;flex-direction:column;
   min-height:0;padding-bottom:0}
 #plexworkBody > h2, #ruleschkBody > h2{flex:0 0 auto}
 #plexworkPane .fullpane, #ruleschkPane .fullpane{
-  flex:1 1 auto;min-height:220px;overflow:auto;overflow-x:hidden}
+  flex:1 1 auto;min-height:220px;overflow:auto;overflow-x:hidden;
+  /* THE VISIBLE FRAME. First cut used var(--line) on a background four RGB
+     points off the page - applied, measured, and invisible, which defeats
+     a frame whose whole job is to show that the box spans the panel. The
+     border is the scrollbar-thumb colour (already established as "chrome"
+     here), the fill is genuinely darker than the page. */
+  border:1px solid #2b3340;border-radius:8px;background:#090c10;
+  margin-bottom:12px}
 #plexworkPane table, #ruleschkPane table{width:100%}
 
 /* The per-library subtitle-handling block, inside the expanded library. */
