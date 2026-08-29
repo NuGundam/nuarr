@@ -1045,6 +1045,16 @@ def notify_arrs(file_ids) -> int:
         joblog.log(f"could not queue rename after tagging: {str(e)[:90]}", "warn", system="audiolang")
 
     now = time.time()
+    # DROP THE DEAD ENTRIES FIRST. This map exists only to answer "did we tell
+    # this arr about this series in the last two minutes"; an entry older than
+    # the window can never say anything but yes-go-ahead, so keeping it is
+    # keeping garbage. Nothing pruned it, so it held one entry per series ever
+    # touched for as long as the process lived. Small - but unbounded in the
+    # only direction that matters, and the sweep is one comprehension.
+    if len(_ARR_TOLD) > 256:
+        for k in [k for k, t in _ARR_TOLD.items()
+                  if now - t > ARR_DEBOUNCE_S]:
+            _ARR_TOLD.pop(k, None)
     todo = []
     for r in rows:
         key = (r["arr_name"], r["arr_parent_id"])

@@ -6795,7 +6795,12 @@ def api_logs(level: str | None = None, limit: int = Query(200, le=2000),
             "bytes": size, "has_more": offset + len(rows) < total,
             "systems": [{"key": k, "n": v, "label": labels.get(k, k)}
                         for k, v in sorted(seen.items(), key=lambda kv: -kv[1])],
-            "system": system or ""}
+            "system": system or "",
+            # Writes are queued and the queue drops rather than stall a
+            # transcode. That is the right trade, but it was made silently:
+            # nothing read the counter, so a log with holes in it looked
+            # exactly like a log without.
+            "queue": joblog.queue_health()}
 
 
 @app.get("/api/logs/jobs")
@@ -15591,9 +15596,16 @@ function renderLogs(keepAnchor){
   const cnt=document.getElementById('logCount');
   const sz=(_logBytes==null) ? ''
     : ` <span class="dim">· ${logSize(_logBytes)}</span>`;
+  // Dropped lines, when there are any. Silent by design, but not unknowable:
+  // if the writer queue overflowed, this log has holes and you should be told
+  // so before you go looking for an event that was never written.
+  const q=_logQueue||{};
+  const drop = q.dropped
+    ? ` <span style="color:#e2b341" title="the log writer queue filled up and threw lines away rather than stall a transcode - so this log has gaps">· ${fmt(q.dropped)} line${q.dropped==1?'':'s'} dropped</span>`
+    : '';
   cnt.innerHTML=
     logRows.length+' line'+(logRows.length==1?'':'s')
-    +(logMore?' (more above)':'')+sz;
+    +(logMore?' (more above)':'')+sz+drop;
   const lw=document.getElementById('logsResumeWrap');
   if(lw && !lw.innerHTML) lw.innerHTML=followBtn('logs');
   watchScroll('logs');
@@ -15632,6 +15644,7 @@ async function loadLogs(reset){
                                  +(sys?'&system='+encodeURIComponent(sys):''))).json();
       logMore=j.has_more;
       _logBytes=j.bytes;                    // size of nuarr.log itself
+      _logQueue=j.queue||null;              // and whether any lines were lost
       // Keep the picker in step with what the log actually contains, so it
       // never offers a filter that would return nothing.
       if(sysEl && j.systems){
@@ -15664,6 +15677,9 @@ async function loadOlder(){
 // Size of whatever the log view is currently showing: nuarr.log for "all
 // activity", or the selected transcript. Filled by loadLogs().
 let _logBytes=null;
+// Writer-queue health from the same response: depth, capacity and the count
+// of lines thrown away when the queue was full.
+let _logQueue=null;
 const _logJobBytes={};
 // KB up to a megabyte, then MB - two decimals either way. A 70 MB main log
 // printed as "71680.00 KB" is technically the same number and useless.

@@ -149,7 +149,7 @@ def media_roots() -> dict[str, str]:
 
     The obvious version of this - take a file path out of the database and use
     that - is wrong here, and wrong in an instructive way. Every path stored is
-    a POOL path (P:\...), because that is where the file is opened from. P: is
+    a POOL path (on P:), because that is where the file is opened from. P: is
     a virtual volume: disk_usage() on it returns the whole pool, and the
     volume-to-physical-disk lookup resolves it to nothing, because no single
     spindle backs it. All twelve labels collapsed into one entry that way.

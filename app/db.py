@@ -96,7 +96,8 @@ CREATE INDEX IF NOT EXISTS ix_files_lib   ON files(library);
 CREATE INDEX IF NOT EXISTS ix_files_size  ON files(size DESC);
 -- NOCASE, and that is the whole point.
 --
--- The browser asks "everything under this folder" as `path LIKE 'P:\Lib\Show\%'`.
+-- The browser asks "everything under this folder" as a prefix LIKE against the
+-- stored path (P: backslash Lib backslash Show backslash %).
 -- SQLite can turn a prefix LIKE into an index range scan, but only against an
 -- index whose collation matches the comparison - and LIKE is case-INSENSITIVE
 -- by default, so the plain BINARY ix_files_path above never qualified. Every
@@ -134,6 +135,13 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 CREATE INDEX IF NOT EXISTS ix_jobs_state ON jobs(state, priority, created_at);
 CREATE INDEX IF NOT EXISTS ix_jobs_file  ON jobs(file_id);
+-- THE FINISHED FEED'S OWN ORDER. Every dashboard poll asks for the newest 60
+-- finished jobs; with only ix_jobs_state to work from, SQLite matched all six
+-- finished states and then sorted the whole set in a temp B-tree to take 60
+-- off the top. At 62k job rows that measured 158 ms - three times a second,
+-- forever, growing with the table. Indexing the sort column lets it walk the
+-- newest rows and stop: the same query measures 0.2 ms.
+CREATE INDEX IF NOT EXISTS ix_jobs_finished ON jobs(finished_at DESC);
 
 -- -------------------------------------------------------------- history ----
 CREATE TABLE IF NOT EXISTS history (
@@ -482,6 +490,53 @@ def init_db() -> None:
                     "AND state IN ('queued','running')")
         cur.execute("CREATE INDEX IF NOT EXISTS ix_jobs_claim "
                     "ON jobs(state, pool, priority, created_at)")
+        # Also here, not only in the schema above: an install that already
+        # exists never re-runs the CREATE TABLE block, and this index is
+        # worth more to a long-lived database (62k rows and climbing) than
+        # to a fresh one. Costs ~100 ms to build, once.
+        # Ask FIRST, so we know whether we are the one creating it: a brand
+        # new index needs the planner's statistics rebuilt in the same breath
+        # (see below), and CREATE INDEX IF NOT EXISTS cannot tell us after
+        # the fact whether it did anything.
+        fresh_index = not cur.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' "
+            "AND name='ix_jobs_finished'").fetchone()
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_jobs_finished "
+                    "ON jobs(finished_at DESC)")
+        # AN INDEX NOBODY IS TOLD ABOUT IS AN INDEX NOBODY USES. This database
+        # had no sqlite_stat1 at all, so the planner was working from built-in
+        # guesses - and kept choosing the state index plus a temp B-tree sort
+        # over the new one, leaving the query at 150 ms with the fix already
+        # in place. ANALYZE is what makes the choice informed: measured here,
+        # 135 ms to run and 150 ms -> 0.2 ms on the query it decides.
+        #
+        # Re-run when stats are missing or the table has grown a lot since:
+        # the shape that matters (which index wins) does not drift often, and
+        # the point of PRAGMA optimize is to make this judgement automatic.
+        try:
+            # NOTE the name. `have` is live in this function (it holds a set of
+            # column names, read a hundred lines further down) and binding it
+            # here shadowed it with an int - which took the server down at
+            # startup with "argument of type 'int' is not iterable". A long
+            # migration function is exactly where a short generic name gets
+            # reused, so this one says what it holds.
+            stats_rows = cur.execute(
+                "SELECT COUNT(*) n FROM sqlite_master "
+                "WHERE name='sqlite_stat1'").fetchone()[0]
+            # PRAGMA optimize IS NOT ENOUGH WHEN STALE STATS ALREADY EXIST.
+            # Measured on this database: optimize left ix_jobs_state described
+            # by numbers from an older shape of the table, and the planner
+            # went on choosing it plus a temp B-tree sort - the new index sat
+            # there unused and the query stayed at ~180 ms. A full ANALYZE
+            # replaced those numbers and the plan flipped to the new index
+            # immediately. 137 ms to run, once.
+            if fresh_index or not stats_rows:
+                cur.execute("ANALYZE")
+            else:
+                cur.execute("PRAGMA optimize")
+        except Exception:                                # noqa: BLE001
+            pass                          # stats are an optimisation, never a
+            #                               reason to fail to open the database
         # History rows for pool-wide work (pool_map, repairs) have no file to
         # join a title from, so they rendered as "(untitled)". Carry the name
         # on the event itself.

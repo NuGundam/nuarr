@@ -3677,7 +3677,15 @@ async def _post_commit(job: Job) -> None:
     # drove 6,249 folder scans a day here before.
     pkey = (cfg.name, row["arr_parent_id"])
     async with _refresh_lock:
-        age = time.time() - _LAST_REFRESH.get(pkey, 0.0)
+        now = time.time()
+        # Same dead-entry sweep as audiolang's _ARR_TOLD: past the debounce
+        # window an entry cannot change any answer, so it is pure residue.
+        # Done under the lock that already serialises this map.
+        if len(_LAST_REFRESH) > 256:
+            for k in [k for k, t in _LAST_REFRESH.items()
+                      if now - t > REFRESH_DEBOUNCE_S]:
+                _LAST_REFRESH.pop(k, None)
+        age = now - _LAST_REFRESH.get(pkey, 0.0)
         due = age >= REFRESH_DEBOUNCE_S
         if due:
             _LAST_REFRESH[pkey] = time.time()

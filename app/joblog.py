@@ -85,8 +85,20 @@ _WRITEQ: "queue.Queue[tuple | None]" = queue.Queue(maxsize=20000)
 DROPPED = 0
 
 
+def queue_health() -> dict:
+    """Depth, capacity and how many lines were dropped.
+
+    DROPPED was counted from the day the queue was written and read by
+    nothing - so the one event it exists to record, log lines thrown away
+    under load, was invisible in exactly the situation where the log matters
+    most. Surfaced on the Logs page now: silent by design is fine, unknowable
+    is not.
+    """
+    return {"queued": _WRITEQ.qsize(), "capacity": _WRITEQ.maxsize,
+            "dropped": DROPPED}
+
+
 def _writer_loop() -> None:
-    global DROPPED
     while True:
         item = _WRITEQ.get()
         if item is None:
