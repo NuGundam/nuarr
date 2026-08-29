@@ -523,7 +523,7 @@ function Install-Tesseract {
 }
 
 function Install-Whisper {
-  param([string]$Python, [string]$DataDir, [switch]$Gpu)
+  param([string]$Python, [string]$DataDir, [string]$Target, [switch]$Gpu)
   # The CUDA runtime wheels are ~2 GB that a CPU-only machine can never use;
   # a GPU added later gets them in one click from Settings -> Whisper.
   $pkgs = @('faster-whisper')
@@ -545,6 +545,42 @@ function Install-Whisper {
     }
     $model = Join-Path $DataDir 'whisper'
     New-Item -ItemType Directory -Force -Path $model | Out-Null
+
+    # CAN THIS CPU ACTUALLY RUN IT? Ask before spending 464 MB finding out.
+    #
+    # faster-whisper runs on CTranslate2, which is native code built for a
+    # baseline instruction set. On a CPU without it - typically a VM whose
+    # host does not pass AVX2 through - loading the model does not raise. It
+    # executes an illegal instruction and Windows kills the process. Inside
+    # the running server that meant the whole of nuarr disappeared mid-click;
+    # here it would mean a silent, unexplained Setup failure.
+    #
+    # The program tree ships the same probe the app uses (app/whisper_probe.py)
+    # and it is already in place by this point, so this is the app's own check,
+    # run once at install time: exit 0 is fine, exit 1 is an ordinary failure,
+    # anything else is the process being killed.
+    $probe = Join-Path $Target 'app\whisper_probe.py'
+    if (Test-Path -LiteralPath $probe) {
+      Write-Step "Checking this CPU can run the language identifier"
+      Invoke-Native { & $Python $probe --device cpu --compute int8 --root $model 2>&1 | Out-Null }
+      $prc = $LASTEXITCODE
+      if ($prc -ne 0 -and $prc -ne 1) {
+        $hex = '{0:X8}' -f ($prc -band 0xFFFFFFFF)
+        if ($hex -eq 'C000001D') {
+          Write-Step "This CPU is missing AVX2, which the language identifier requires - it cannot run on this machine" 'bad'
+        } else {
+          Write-Step "Loading the language model crashes on this machine (exit 0x$hex)" 'bad'
+        }
+        Write-Step "Skipping the model download. Everything else in nuarr works; untagged audio is named by inference instead." 'warn'
+        return $false
+      }
+      if ($prc -eq 1) {
+        Write-Step "The language identifier did not load - detection stays off, nothing else is affected" 'warn'
+        return $false
+      }
+      Write-Step "CPU check passed" 'ok'
+    }
+
     Write-Step "Fetching the 'small' model into $model"
     $code = @"
 import os

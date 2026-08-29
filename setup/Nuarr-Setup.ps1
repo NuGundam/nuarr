@@ -807,7 +807,7 @@ function Run-Install {
 
     if (-not $S.Upgrade) {
       Tick "Audio language detection"
-      if ($S.Whisper) { [void](Install-Whisper -Python $S.Python -DataDir $S.DataDir -Gpu:([bool]$S.Gpu)) }
+      if ($S.Whisper) { [void](Install-Whisper -Python $S.Python -DataDir $S.DataDir -Target $S.Target -Gpu:([bool]$S.Gpu)) }
       else { Write-Step "Whisper not selected - audio language detection stays off" }
     }
 

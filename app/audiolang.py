@@ -317,7 +317,33 @@ def info() -> dict:
         # the page say "you have an NVIDIA card, the GPU install applies to you"
         # before anything is installed.
         "nvidia_present": _nvidia_present(),
+        # CAN THIS MACHINE RUN IT AT ALL. Reported from the cached probe, and
+        # only when the probe has actually been run - `None` means "not yet
+        # asked", which the page must not present as "no". The installer runs
+        # the same check, so a machine that failed it there arrives here
+        # already knowing.
+        "cpu_ok": _cpu_verdict()[0],
+        "cpu_why": _cpu_verdict()[1],
     }
+
+
+def _cpu_verdict() -> tuple[bool | None, str]:
+    """The probe's answer for the CPU path, without triggering a probe.
+
+    Reading only what is cached is deliberate: this is called by the status
+    endpoint the page polls, and probing there would launch a process (and a
+    model load) on every poll.
+    """
+    v = _PROBE.get(("cpu", "int8"))
+    if v is None:
+        return None, ""
+    return v[0], v[1]
+
+
+def probe_now() -> dict:
+    """Run the load probe on demand and report it. For the page's button."""
+    ok, why = _load_probe("cpu", "int8")
+    return {"ok": ok, "why": why}
 
 
 def _nvidia_present() -> bool:
@@ -393,6 +419,13 @@ def install_start(mode: str) -> dict:
     from . import heavy
     if mode not in _INSTALL_PKGS:
         return {"ok": False, "error": f"unknown install mode {mode!r}"}
+    # A GREYED BUTTON IS NOT A CHECK. If the probe has already established
+    # that loading the model kills this machine, refuse here too - the page
+    # can be old, the endpoint can be called directly, and the cost of
+    # getting this wrong is the server going down on first use.
+    verdict = _PROBE.get(("cpu", "int8"))
+    if verdict is not None and not verdict[0]:
+        return {"ok": False, "error": verdict[1]}
     # ONE HEAVY OPERATION AT A TIME across all the engines, not just this
     # one. The old check only stopped a SECOND Whisper install; starting
     # this while a PaddleOCR test had a model loaded was allowed, and on a

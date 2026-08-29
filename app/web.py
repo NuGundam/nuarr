@@ -18502,7 +18502,21 @@ async function loadWhisper(){
               'no NVIDIA GPU was detected here — this downloads about 2 GB of '
               + 'CUDA runtime that could not be used.',
               `<button onclick="whisInstall('gpu')">Install — NVIDIA GPU</button>`));
+      // AND NOT AT ALL WHEN THE CPU CANNOT RUN IT. cpu_ok===false means the
+      // load probe was killed here - CTranslate2 needs AVX2, and without it
+      // there is no device this can run on. Installing would download the
+      // packages and then take the server down on first use, which is exactly
+      // what happened before the probe existed. false, not falsy: null means
+      // "not asked yet" and must stay clickable.
+      if(w.cpu_ok === false){
+        btns = gate(false, w.cpu_why || 'this CPU cannot run the language identifier', btns);
+      }
       strip=`<div style="margin-top:8px;font-size:11.5px" class="dim">
+        ${w.cpu_ok === false ? `<div style="color:#e0575b;margin-bottom:6px">
+          <b>This machine cannot run it.</b> ${esc(w.cpu_why)}. Checked by
+          loading the model in a separate process, so finding this out costs
+          nothing — nuarr keeps naming untagged audio by inference instead.
+        </div>` : ''}
         Without it, nuarr still names untagged audio by <b>inference</b>
         (original language from TMDB/TheTVDB when the file's shape makes that
         safe) — installing upgrades the answer to what the audio actually
