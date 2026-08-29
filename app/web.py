@@ -10910,9 +10910,15 @@ function renderBrowse(d){
   // rules care about and the one thing about a title you cannot learn by
   // looking at the file - worth showing next to the link it came from.
   const m = d.meta || {};
+  // NEUTRAL ON PURPOSE, and it did not used to be. This chip was teal - which
+  // is now the colour of the ANIMATION kind everywhere else - so a live-action
+  // show displayed a teal pill an inch from its grey kind pill, saying nothing
+  // about animation at all. Colour on this row belongs to the verdict; the
+  // language is one of the inputs that verdict was reached from, like the
+  // genre list beside it, and inputs are shown plainly.
   const langChip = m.orig_lang
-    ? `<span class="pill" style="color:#39d3c3;border-color:#1e5a55"
-         title="the language this was made in — from ${esc(m.provider||'the metadata provider')}, not from the file"
+    ? `<span class="pill" style="color:var(--dim);border-color:var(--line)"
+         title="the language this was made in — from ${esc(m.provider||'the metadata provider')}, not from the file. One of the inputs to the kind shown beside it"
          >original: ${esc(m.orig_lang)}</span>` : '';
   const idLink = (m.url && m.provider)
     ? `<a class="crumb" href="${esc(m.url)}" target="_blank" rel="noopener"
@@ -16742,8 +16748,11 @@ async function loadMetaTab(){
 function langSyncCard(n, arrNames){
   const st=(n&&n.stats)||{};
   const pct = n && n.total ? Math.round(n.tagged/n.total*100) : 0;
+  // Neutral for the same reason as the browse row's language chip: teal is
+  // the ANIMATION kind's colour now, and a row of teal language pills reads
+  // as a claim about content kind that it is not making.
   const langs=((n&&n.by_language)||[]).map(l=>
-    `<span class="pill" style="color:#39d3c3;border-color:#1e5a55">${
+    `<span class="pill" style="color:var(--dim);border-color:var(--line)">${
       esc(l.lang)} ${fmt(l.n)}</span>`).join('');
   return `
     <div class="metarow">
@@ -21362,7 +21371,13 @@ _SETTINGS_CSS = """
   font-variant-numeric:tabular-nums}
 .k-anime{color:#d2a8ff;border-color:#4b3a63;background:rgba(210,168,255,.07)}
 .k-animation{color:#39d3c3;border-color:#2b5a55;background:rgba(57,211,195,.07)}
-.k-live{color:#8b98a6;border-color:var(--line)}
+/* A FILL, so the verdict is still a verdict beside a grey input. Live action
+   is deliberately the neutral colour, and the language chip next to it is
+   deliberately dim - which left two near-identical greys sitting together,
+   one a decision and one the evidence for it. anime and animation already
+   carry a tint; this gives live action the same treatment so all three read
+   as the same KIND of thing, and an outline-only pill means "input". */
+.k-live{color:#8b98a6;border-color:#3a424d;background:rgba(139,152,166,.10)}
 /* The genre list in the folder header. Deliberately plain text rather than a
    chip each: they are the EVIDENCE behind the verdict beside them, and six
    more pills would compete with the one that matters. */
