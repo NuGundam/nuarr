@@ -289,8 +289,30 @@ FIELDS: dict[str, list[dict]] = {
                  "states a language is never overwritten, because a dub "
                  "correctly tagged English must stay that way. Metadata only "
                  "— the audio is stream-copied, so this never costs an "
-                 "encode."},
+                 "encode.",
+         # THE SAME SETTING, DESCRIBED FOR THE MACHINE IT IS ON. Half the text
+         # above is about a component that may not be installed, and on a
+         # machine that cannot run it that half is not background reading, it
+         # is instructions for something that will never happen. The feature
+         # itself still works - inference needs nothing - so the setting stays
+         # and only the explanation narrows.
+         "what_no_whisper":
+             "A track with no language tag is not neutral — Sonarr and "
+             "Radarr fill in English for it, and so do most players. That is "
+             "where a Japanese episode ends up described as English audio, "
+             "and from there the language rules on the Subtitles page are "
+             "working from a false premise. nuarr fills the blank by "
+             "INFERENCE, which needs nothing installed: one audio track, no "
+             "tag, and full dialogue subtitles means the title's original "
+             "language from TMDB/TheTVDB. Only ever fills in a blank; a "
+             "track that already states a language is never overwritten, "
+             "because a dub correctly tagged English must stay that way. "
+             "Metadata only — the audio is stream-copied, so this never "
+             "costs an encode."},
         {"parent": "tag_untagged_audio", "key": "tag_untagged_min_conf",
+         # Whisper-only: it grades how sure the LISTENER has to be. With no
+         # listener there is nothing for it to govern, so it is not shown.
+         "needs": "whisper",
          "label": "Minimum confidence to trust what was heard (%)",
          "type": "int", "default": 60, "min": 50, "max": 99,
          "what": "How sure the detector has to be before its answer is used. "
@@ -521,8 +543,34 @@ def describe() -> dict:
         }
     except Exception:                                    # noqa: BLE001
         pass
+    # THE SCHEMA, NARROWED TO THIS MACHINE. A field marked `needs` describes a
+    # component that may not be here; showing it anyway means a control that
+    # governs nothing, under an explanation of a thing that cannot happen.
+    # Done here rather than in the page because the page is generated from
+    # this - one filter, and every renderer agrees.
+    whisper_ok = True
+    try:
+        from . import audiolang as _al
+        whisper_ok = _al.usable()
+    except Exception:                                    # noqa: BLE001
+        pass
+    # FIELDS is {"video": [...], "audio": [...]}, not a flat list - filtering
+    # it as one cost a 500 on the whole codec page until the traceback said so.
+    fields: dict = {}
+    for side, items in FIELDS.items():
+        kept = []
+        for f in items:
+            if f.get("needs") == "whisper" and not whisper_ok:
+                continue
+            g = dict(f)
+            if not whisper_ok and g.get("what_no_whisper"):
+                g["what"] = g["what_no_whisper"]
+            g.pop("what_no_whisper", None)
+            kept.append(g)
+        fields[side] = kept
     return {
-        "fields": FIELDS,
+        "fields": fields,
+        "whisper_ok": whisper_ok,
         "policy": load(),
         "defaults": {n: defaults_for(n) for n in libs},
         "encoders": enc,

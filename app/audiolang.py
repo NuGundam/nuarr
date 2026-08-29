@@ -388,6 +388,24 @@ def available() -> bool:
         return False
 
 
+def usable() -> bool:
+    """Installed AND able to run here.
+
+    `available()` answers "is the package present", which was the only
+    question worth asking while the only failure mode was "not installed".
+    It is not enough on a machine whose CPU cannot execute CTranslate2: the
+    package imports perfectly and loading the model kills the process. Pages
+    that decide whether to OFFER listening should ask this instead, so a
+    machine that can never listen is not shown the machinery for it.
+    """
+    if not available():
+        return False
+    v = _PROBE.get(("cpu", "int8"))
+    # CTranslate2 is one binary for both devices, so a CPU that cannot run it
+    # cannot run it on the GPU either - the CPU verdict settles both.
+    return not (v is not None and not v[0])
+
+
 # ------------------------------------------------------------- installing ---
 # INSTALLABLE FROM THE PAGE, not only from the setup wizard. The wizard offers
 # Whisper exactly once, at install time, gated on a GPU being present that day.

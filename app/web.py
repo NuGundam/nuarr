@@ -3063,7 +3063,12 @@ async def api_audiolang(limit: int = Query(400, le=3000)):
         # Still blank AND never resolved - the honest backlog.
         openq = [r for r in rows if r["blank"] and not r["ok"]]
         return {
-            "available": audiolang.available(),
+            # USABLE, not merely importable. A package that is present and
+            # cannot execute here is not an available feature, and the page
+            # that decides what to offer must not be told otherwise.
+            "available": audiolang.usable(),
+            "installed": audiolang.available(),
+            "cannot_run_why": audiolang._cpu_verdict()[1],
             "model": audiolang.MODEL_SIZE,
             "min_prob": audiolang.MIN_PROB,
             "progress": audiolang.progress(),
@@ -18962,23 +18967,48 @@ function renderAlang(){
     const v=n*100/d;
     return (n<d && v>99.9 ? '99.9' : v.toFixed(1))+'%';
   };
-  const TABS=[['sum','Coverage'],
-              ['wait','Waiting ('+(_al.waiting_total||0)+')'],
-              ['odd','Disagreements ('+(_al.contradictions||[]).length+')'],
-              ['open','Unresolved ('+(_al.open||[]).length+')'],
-              ['all','Everything checked']];
+  // WHAT THIS MACHINE CAN ACTUALLY DO decides what this page offers.
+  // Waiting, Disagreements, Unresolved and Everything checked are all views
+  // of LISTENING - queues for it, arguments with it, its record. Without a
+  // usable listener they are four empty tabs describing a thing that will
+  // never run, so the page narrows to what remains true: coverage, and what
+  // inference has named.
+  const canHear = !!_al.available;
+  const TABS = canHear
+    ? [['sum','Coverage'],
+       ['wait','Waiting ('+(_al.waiting_total||0)+')'],
+       ['odd','Disagreements ('+(_al.contradictions||[]).length+')'],
+       ['open','Unresolved ('+(_al.open||[]).length+')'],
+       ['all','Everything checked']]
+    : [['sum','Coverage']];
+  if(!canHear && _alTab!=='sum') _alTab='sum';
   let h='';
 
-  if(!_al.available){
+  if(!canHear){
+    // TWO DIFFERENT SITUATIONS, and only one of them has an action. Not
+    // installed is an invitation; cannot run here is a fact, and offering an
+    // install button next to it would be a trap - so that case gets the
+    // reason instead, and the Whisper page stays reachable for the day the
+    // machine changes.
+    const blocked = !!_al.cannot_run_why;
     h+=`<div class="lkind" style="padding:10px 12px;margin-bottom:10px">
-        <b style="color:#e2b341">Listening is not installed &mdash; inference is doing the work.</b>
+        <b style="color:#e2b341">${blocked
+          ? 'Listening cannot run on this machine &mdash; inference is doing the work.'
+          : 'Listening is not installed &mdash; inference is doing the work.'}</b>
         <div class="dim" style="font-size:11px;margin-top:4px">
+        ${blocked?`${esc(_al.cannot_run_why)}.<br>`:''}
         Untagged audio is still being named by inference (the title's original
         language, where the file's shape makes that safe), which works without
         anything installed &mdash; but it cannot tell a raw from a dub, and it
-        must skip files with no subtitles. Installing the language identifier
-        upgrades the answer to what the audio actually contains.
-        <button style="margin-left:8px" onclick="wtab('whisper')">Install it &mdash; Settings &rarr; Whisper</button></div></div>`;
+        must skip files with no subtitles.
+        ${blocked
+          ? `Everything below reflects what inference has named. The
+             <a href="#" onclick="wtab('whisper');return false">Whisper page</a>
+             stays available in case this machine changes.`
+          : `Installing the language identifier upgrades the answer to what
+             the audio actually contains.
+             <button style="margin-left:8px" onclick="wtab('whisper')">Install it &mdash; Settings &rarr; Whisper</button>`}
+        </div></div>`;
   }
 
   h+=`<div style="display:flex;gap:7px;margin:10px 0 12px;flex-wrap:wrap">`+
@@ -18999,6 +19029,10 @@ function renderAlang(){
         every player, so these are not neutral &mdash; they are wrong by
         default.</div></div>`;
 
+    // LISTENING'S OWN REPORT CARD, and the schedule that drives it. Both
+    // are only meaningful when there is a listener; on a machine without one
+    // they read as zeros with no explanation of why.
+    if(canHear){
     h+=`<div class="lkind" style="padding:11px 12px;margin-bottom:10px">
       <div><b style="color:#6fb0ff">What nuarr listened to</b></div>
       <div class="dim" style="font-size:11px;margin-top:5px">
@@ -19044,6 +19078,7 @@ function renderAlang(){
     setTimeout(alSchedTick, 30);
     if(_al.progress && _al.progress.state!=='idle' && _al.progress.state!=='error')
       setTimeout(alStartPoll, 50);
+    }   // end canHear
 
     h+=`<div class="lkind"><div class="lkindhead"><b style="color:#6fb0ff">By library</b></div>
         <table style="width:100%;font-size:12px;border-collapse:collapse">
