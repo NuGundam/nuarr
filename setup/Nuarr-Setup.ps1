@@ -766,8 +766,11 @@ function Run-Install {
       Arp    = (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\nuarr')
     }
 
-    [void](Invoke-SchTasks @('/Query','/TN','nuarr'))
-    if ($LASTEXITCODE -eq 0) { Write-Step "Stopping the running nuarr"; [void](Invoke-SchTasks @('/End','/TN','nuarr')); Start-Sleep 3 }
+    # ALWAYS, and by process as well as by task - see Stop-Nuarr. A rolled-back
+    # install leaves no task but can leave a running nuarr, and that nuarr
+    # holds the database this run is about to move.
+    $stopped = Stop-Nuarr -Target $S.Target
+    if ($stopped.Count) { Write-Step "Stopped the running nuarr ($($stopped -join ', '))" }
 
     Tick "Creating folders"
     # An upgrade never saw the cache page, so $S.CacheDir is the DEFAULT - the
@@ -826,13 +829,28 @@ function Run-Install {
         $oldDb = Join-Path $S.DataDir 'nuarr.db'
         if (Test-Path -LiteralPath $oldDb) {
           $stamp = Get-Date -f 'yyyyMMdd-HHmmss'
+          # OPTIONAL WORK MUST NOT FAIL THE INSTALL. This is tidiness - moving
+          # a leftover database out of the way so a fresh install starts fresh.
+          # When the file was locked it threw, and a complete, working install
+          # was rolled back over it. Now it is attempted, and if something
+          # still holds the file the install continues and says so.
+          $moved = $true
           foreach ($suffix in '','-wal','-shm') {
             $f = "$oldDb$suffix"
             if (Test-Path -LiteralPath $f) {
-              Move-Item -LiteralPath $f -Destination "$f.previous-$stamp" -Force
+              try { Move-Item -LiteralPath $f -Destination "$f.previous-$stamp" -Force -ErrorAction Stop }
+              catch {
+                $moved = $false
+                $by = Test-FileLockedBy -Path $f
+                Write-Step ("Could not set aside $(Split-Path $f -Leaf) - it is open" +
+                            $(if ($by) { " by $by" } else { " by another process" }) +
+                            ". Leaving it in place; nuarr will use it.") 'warn'
+              }
             }
           }
-          Write-Step "A database from an earlier install was set aside as nuarr.db.previous-$stamp" 'warn'
+          if ($moved) {
+            Write-Step "A database from an earlier install was set aside as nuarr.db.previous-$stamp" 'warn'
+          }
         }
         Write-Step "Fresh install - nuarr will build its own database on first scan"
       }

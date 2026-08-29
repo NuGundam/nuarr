@@ -185,6 +185,68 @@ function Test-WhisperLoads {
   return "loading the model crashes here (exit 0x$hex)"
 }
 
+function Stop-Nuarr {
+  <#  Stop everything that could be holding the database, by PROCESS as well
+      as by task.
+
+      Setup used to end the scheduled task and only when that task existed:
+
+          schtasks /Query /TN nuarr ; if ($LASTEXITCODE -eq 0) { ...end it... }
+
+      On a machine where an install has been rolled back the task is gone but
+      a nuarr from an earlier attempt can still be running - and it still has
+      nuarr.db open. The set-aside then failed with "the process cannot access
+      the file because it is being used by another process", which named no
+      process and was the last thing Setup said before undoing a good install.
+
+      Returns the names it stopped, for the log. #>
+  param([string]$Target)
+  $stopped = @()
+  [void](Invoke-SchTasks @('/Query','/TN','nuarr'))
+  if ($LASTEXITCODE -eq 0) {
+    [void](Invoke-SchTasks @('/End','/TN','nuarr'))
+    $stopped += 'scheduled task'
+  }
+  # Anything still running launch.py, whatever started it. Matched on the
+  # command line rather than the image name, because the image is python.exe
+  # and killing every python on the box would be indefensible.
+  try {
+    # MATCH THE COMMAND LINE, NOT THE IMAGE NAME. nuarr runs under a RENAMED
+    # copy of the interpreter - Nuarr.exe - so that the process list says what
+    # it is instead of "pythonw". Filtering on python.exe/pythonw.exe found
+    # nothing on a machine where nuarr was running under its own name, which
+    # is every machine. launch.py is the thing worth matching: it is nuarr's
+    # entry point and nothing else on the box runs it.
+    $procs = Get-CimInstance Win32_Process -ErrorAction Stop |
+      Where-Object {
+        $c = "$($_.CommandLine)"
+        $c -and ($c -match 'launch\.py' -or
+                 ($Target -and $c -like "*$Target\launch.py*"))
+      }
+    foreach ($p in $procs) {
+      try {
+        Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop
+        $stopped += "pid $($p.ProcessId)"
+      } catch { }
+    }
+  } catch { }
+  if ($stopped.Count) { Start-Sleep 3 }   # let the handles close
+  return ,$stopped
+}
+
+function Test-FileLockedBy {
+  <#  Which process has this file open - so the message can name it.
+      Uses openfiles/handle if present, else returns ''. Best effort: this
+      exists to make an error actionable, never to gate anything. #>
+  param([string]$Path)
+  try {
+    $hits = Get-CimInstance Win32_Process -ErrorAction Stop |
+      Where-Object { "$($_.CommandLine)" -match 'launch\.py' }
+    if ($hits) { return (($hits | ForEach-Object { "$($_.Name) (pid $($_.ProcessId))" }) -join ', ') }
+  } catch { }
+  return ''
+}
+
 function Find-Python {
   <#  The newest CPython 3.11+ we can find, preferring the py launcher.
       Returns @{Exe;Version} or $null. #>
