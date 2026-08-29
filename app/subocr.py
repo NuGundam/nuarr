@@ -1167,6 +1167,12 @@ def status() -> dict:
             } for l in (SETTINGS.libraries or [])
         },
         "rule_meta": RULE_META,
+        # The install-wide engine, named for the per-library panel to show as
+        # a fact rather than offer as a choice. The choice lives on the OCR
+        # engines page; a second control for the same setting can only ever
+        # disagree with it.
+        "engine_label": ("PaddleOCR" if engine("") == "paddle"
+                         else "Tesseract"),
     }
 
 

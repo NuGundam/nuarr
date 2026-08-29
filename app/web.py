@@ -17576,33 +17576,49 @@ function socPaint(lib){
           :'no picture subtitle tracks in this library'}</span></div>
 
       ${chk('auto',s.auto,'Convert picture subtitles to text',
-        'PGS tracks are pictures, so Plex has to paint them into the video while you watch — which is a transcode. nuarr converts them with OCR and adds a real text version, which every client just displays. The picture track stays.',
+        'The master switch. PGS tracks are pictures, so Plex has to paint them into the video while you watch — which is a transcode. nuarr converts them with OCR and adds a real text version, which every client just displays. The picture track stays. <b>Everything below only applies when this is on</b>, and decides WHICH picture tracks get read.',
         !has.image)}
 
-      ${chk('sdh',s.sdh,'Also convert SDH tracks',
-        'The version with speaker names and sound effects, for watching without sound. Converted separately from the plain track, since they are not the same subtitles.',
-        !has.image)}
+      <!-- A TREE, BECAUSE THESE ARE NOT PEERS. Five checkboxes in a flat
+           column read as five independent choices, which is why "convert
+           picture subtitles to text" and "convert every picture track"
+           looked like the same setting twice. They are a master switch and,
+           under it, a choice of scope: EVERYTHING, or dialogue plus the two
+           roles you opt into. The indent and the guide line say that; the
+           sub-branch greys out when the override above it makes it moot,
+           so the screen can no longer show an active-looking tick that is
+           being ignored. -->
+      <div class="soctree ${s.auto?'':'socoff'}">
+        ${chk('all',s.all,'Convert every picture track, not just dialogue',
+          'The widest setting: converts every English picture track the language rules keep — dialogue, SDH and forced alike, whatever they are titled — and ignores the sorting numbers below. <b>Never signs or songs:</b> those are artwork placed at a particular spot on the screen, like an ASS track, and OCR keeps the words but loses the position — so they are always burned into the picture instead, never converted.',
+          !has.image)}
 
-      ${chk('forced',s.forced,'Also convert forced subtitles',
-        'The lines that translate a scene spoken in another language. Normally painted into the picture when the video is rebuilt, which is the better result — this converts them to text as well, so files that are never rebuilt still have something Plex can display without painting.',
-        !has.forced)}
+        <div class="socbranch ${s.all?'socmoot':''}">
+          <div class="dim socbranchtop">
+            ${s.all
+              ? 'covered by <b>every picture track</b> above — these two do nothing while it is on'
+              : 'dialogue is always converted. Add the other roles here:'}
+          </div>
+          ${chk('sdh',s.sdh,'Also convert SDH tracks',
+            'The version with speaker names and sound effects, for watching without sound. Converted separately from the plain track, since they are not the same subtitles.',
+            !has.image)}
 
-      ${chk('all',s.all,'Convert every picture track, not just dialogue',
-        'Ignores the sorting below and converts every English picture track kept by the language rules — dialogue, SDH and forced alike, whatever they are titled. <b>Never signs or songs:</b> those are artwork placed at a particular spot on the screen, like an ASS track, and OCR keeps the words but loses the position — so they are always burned into the picture instead, never converted.',
-        !has.image)}
+          ${chk('forced',s.forced,'Also convert forced subtitles',
+            'The lines that translate a scene spoken in another language. Normally painted into the picture when the video is rebuilt, which is the better result — this converts them to text as well, so files that are never rebuilt still have something Plex can display without painting.',
+            !has.forced)}
+        </div>
 
-      ${chk('remove_image',s.remove_image,'Delete the picture track once text exists',
-        'Off: the picture track is kept but switched off, so it can never trigger a transcode and you can still pick it by hand. On: it is removed from the file — tidier and smaller, but it cannot be undone.',
-        !has.image)}
+        ${chk('remove_image',s.remove_image,'Delete the picture track once text exists',
+          'Off: the picture track is kept but switched off, so it can never trigger a transcode and you can still pick it by hand. On: it is removed from the file — tidier and smaller, but it cannot be undone.',
+          !has.image)}
+      </div>
 
-      <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;
-                  font-size:12px;margin:6px 0 2px;${has.image?'':'opacity:.45'}">
-        <span>read them with
-          <select id="${id('eng')}" ${has.image?'':'disabled'}
-                  onchange="socSaveLib('${esc(lib)}')">
-            <option value="tesseract"${s.engine==='tesseract'?' selected':''}>Tesseract — bundled, fast anywhere</option>
-            <option value="paddle"${s.engine==='paddle'?' selected':''}>PaddleOCR — better on italics, wants a GPU</option>
-          </select></span>
+      <!-- The engine used to be chosen here, per library. It is one install-wide
+           setting now (Tools → OCR engines), so a per-library copy of it could
+           only ever disagree with the real one. -->
+      <div class="dim" style="font-size:11px;margin:7px 0 2px">
+        Read with <b>${esc((_socAll.engine_label)||'the engine set under OCR engines')}</b>
+        — <a href="#" onclick="showPane('ocr');return false">change it for the whole install</a>
       </div>
       <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;
                   font-size:12px;margin:2px 0;${has.image?'':'opacity:.45'}">
@@ -17712,14 +17728,26 @@ async function socSaveLib(lib){
   put('subocr_forced',      id('forced'),      e=>e.checked);
   put('subocr_all',         id('all'),         e=>e.checked);
   put('subocr_remove_image',id('remove_image'),e=>e.checked);
-  put('subocr_engine',      id('eng'),         e=>e.value||'tesseract');
+  // subocr_engine is deliberately NOT sent from here any more: the engine is
+  // one install-wide setting on the OCR engines page. put() only sends keys
+  // whose control exists, so removing the dropdown removes the write - which
+  // is exactly the guard that stopped this panel silently overwriting every
+  // library's engine with a default once before.
   put('subocr_signs_max_cpm',    id('cpm'),  e=>parseFloat(e.value)||6);
   put('subocr_dialogue_min_cues',id('cues'), e=>parseInt(e.value)||500);
   try{
     const r=await (await fetch('/api/subocr/config',{method:'POST',
       headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
     if(m){ m.style.color=r.ok?'#7fd4a3':'#e0575b'; m.textContent=r.ok?'saved':(r.error||'failed'); }
-    if(r.ok && r.libraries){ _socAll=r; }
+    if(r.ok && r.libraries){
+      _socAll=r;
+      // REPAINT, so the tree matches what was just saved. The master switch
+      // greys its branch and the override strikes through the two roles it
+      // subsumes - both are read from state at paint time, so without this
+      // the structure only caught up on the next full load and the screen
+      // showed a tick that was already being ignored.
+      socPaint(lib);
+    }
   }catch(e){ if(m){ m.style.color='#e0575b'; m.textContent='failed'; } }
 }
 // ---- Video / audio codec settings, per library ---------------------------
@@ -21051,6 +21079,19 @@ _SETTINGS_CSS = """
   display:flex;flex-direction:column}
 #plexworkPane .fullpane .scrollbox.auto, #ruleschkPane .fullpane .scrollbox.auto{
   flex:1 1 auto;max-height:none;min-height:0}
+
+/* THE OCR SCOPE TREE. Guide lines rather than indentation alone: a checkbox
+   nudged 18px right still reads as a sibling, a line drawn from its parent
+   does not. .socmoot greys the branch that the override above has taken over
+   - the ticks stay visible and keep their values, they just stop pretending
+   to matter. */
+.soctree{margin-left:9px;padding-left:15px;border-left:2px solid var(--line)}
+.soctree.socoff{opacity:.45}
+.socbranch{margin-left:9px;padding-left:15px;border-left:2px solid var(--line)}
+.socbranchtop{font-size:11px;padding:5px 0 1px}
+.socbranch.socmoot{opacity:.5}
+.socbranch.socmoot label{text-decoration:line-through;
+  text-decoration-color:rgba(255,255,255,.25)}
 
 /* The per-library subtitle-handling block, inside the expanded library. */
 .socbox{border-top:1px solid var(--line)}
