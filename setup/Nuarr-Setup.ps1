@@ -477,7 +477,10 @@ function Refresh-Prereqs {
   if (Test-Path -LiteralPath $tExe) {
     $tv = ''
     try {
-      $tv = (& $tExe --version 2>&1 | Select-Object -First 1) -replace '^tesseract\s+v?',''
+      # tesseract writes its version banner to stderr on some builds, and
+      # the wizard runs under ErrorActionPreference = Stop - so read it
+      # with stderr demoted to text, like every other native call here.
+      $tv = (Invoke-Native { & $tExe --version 2>&1 } | Select-Object -First 1) -replace '^tesseract\s+v?',''
     } catch { $tv = '' }
     $langs = @(Get-ChildItem (Join-Path $tess 'tessdata') -Filter *.traineddata `
                  -ErrorAction SilentlyContinue | ForEach-Object { $_.BaseName })

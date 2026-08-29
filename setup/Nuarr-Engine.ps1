@@ -40,6 +40,23 @@ function Invoke-SchTasks {
   finally { $ErrorActionPreference = $old }
 }
 
+function Invoke-Native {
+  <#  Run a scriptblock with native stderr treated as TEXT, not an emergency.
+
+      Same reasoning as Invoke-SchTasks above, generalised after it bit the
+      installer a second time: under ErrorActionPreference = Stop, `2>&1` on
+      a native command turns anything it writes to stderr into a terminating
+      error. Python writes SyntaxWarnings there. pip writes its
+      dependency-resolver notice there, prefixed "ERROR:", while still
+      exiting 0. Neither is a failure, and neither should end an install.
+
+      The exit code is the verdict; stderr is commentary. #>
+  param([scriptblock]$Body)
+  $old = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try { & $Body } finally { $ErrorActionPreference = $old }
+}
+
 function Find-Python {
   <#  The newest CPython 3.11+ we can find, preferring the py launcher.
       Returns @{Exe;Version} or $null. #>
@@ -266,8 +283,15 @@ function Install-Program {
   $src = Join-Path $Bundle 'program'
   if (-not (Test-Path -LiteralPath $src)) { throw "No program folder in the bundle: $src" }
   New-Item -ItemType Directory -Force -Path $Target | Out-Null
+  # NEVER LAY THE TEMPLATE OVER A REAL CONFIG. The bundle's program tree
+  # carries a placeholder config.yml for fresh installs; on an upgrade the
+  # target already holds the user's actual one, and copying the template over
+  # it silently wiped every library, arr and token - discovered when a
+  # re-run install came up knowing nothing it had been told an hour before.
+  $xf = @()
+  if (Test-Path -LiteralPath (Join-Path $Target 'config.yml')) { $xf = @('/XF','config.yml') }
   # /NJH /NJS quiet header+summary, /NP no per-file percentage
-  $r = robocopy $src $Target /E /NFL /NDL /NJH /NJS /NP /R:1 /W:1
+  $r = robocopy $src $Target /E /NFL /NDL /NJH /NJS /NP /R:1 /W:1 @xf
   if ($LASTEXITCODE -ge 8) { throw "robocopy failed with code $LASTEXITCODE" }
   $n = (Get-ChildItem -LiteralPath $Target -Recurse -File).Count
   Write-Step "Program in place - $n files" 'ok'
@@ -278,17 +302,35 @@ function Install-Packages {
   $wheels = Join-Path $Bundle 'wheels'
   $req    = Join-Path $Bundle 'requirements.txt'
   if (-not (Test-Path -LiteralPath $req)) { throw "No requirements.txt in the bundle" }
+  # PIP'S STDERR IS COMMENTARY, NOT AN EMERGENCY - the same trap Invoke-SchTasks
+  # was written for, in the function next door. The wizard runs under
+  # ErrorActionPreference = Stop, and `2>&1` turns anything pip writes to stderr
+  # into an ErrorRecord, which Stop escalates into a terminating error. pip
+  # writes its dependency-resolver notice to stderr, prefixed "ERROR:", AND
+  # STILL EXITS 0 - it is a warning about packages it did not install, not a
+  # failure of the ones it did. So a perfectly successful upgrade died with
+  # "FAILED: ERROR: pip's dependency resolver does not currently take into
+  # account all the packages that are installed", and rolled itself back.
+  #
+  # The exit code is the verdict. Everything on stderr is printed and ignored.
   Write-Step "Installing Python packages (offline first)"
-  & $Python -m pip install --disable-pip-version-check --no-input `
-      --no-index --find-links $wheels -r $req 2>&1 |
-    ForEach-Object { if ($_ -match 'Successfully|ERROR|error:') { Write-Step "  $_" } }
-  if ($LASTEXITCODE -ne 0) {
-    Write-Step "Offline install incomplete - retrying with the network" 'warn'
+  $oldEAP = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
     & $Python -m pip install --disable-pip-version-check --no-input `
-        --find-links $wheels -r $req 2>&1 |
+        --no-index --find-links $wheels -r $req 2>&1 |
       ForEach-Object { if ($_ -match 'Successfully|ERROR|error:') { Write-Step "  $_" } }
-    if ($LASTEXITCODE -ne 0) { throw "pip could not install the requirements" }
+    $rc = $LASTEXITCODE
+    if ($rc -ne 0) {
+      Write-Step "Offline install incomplete - retrying with the network" 'warn'
+      & $Python -m pip install --disable-pip-version-check --no-input `
+          --find-links $wheels -r $req 2>&1 |
+        ForEach-Object { if ($_ -match 'Successfully|ERROR|error:') { Write-Step "  $_" } }
+      $rc = $LASTEXITCODE
+      if ($rc -ne 0) { throw "pip could not install the requirements (exit $rc)" }
+    }
   }
+  finally { $ErrorActionPreference = $oldEAP }
   Write-Step "Packages installed" 'ok'
 }
 
@@ -409,6 +451,17 @@ function Write-NuarrConfig {
   [void]$sb.AppendLine("cache_min_free_gb: 100")
   if ($Cfg.PlexUrl)   { [void]$sb.AppendLine("plex_url: $($Cfg.PlexUrl)") }
   if ($Cfg.PlexToken) { [void]$sb.AppendLine("plex_token: $($Cfg.PlexToken)") }
+  # Stored share credentials, so the SERVICE can reach UNC libraries: the
+  # wizard ran in a login session that had its own access, and the scheduled
+  # task has none of it. nuarr reads these and reconnects at every boot.
+  if ($Cfg.ContainsKey('NetShares') -and @($Cfg.NetShares).Count -gt 0) {
+    [void]$sb.AppendLine("net_shares:")
+    foreach ($ns in $Cfg.NetShares) {
+      [void]$sb.AppendLine("- server: $($ns.Server)")
+      [void]$sb.AppendLine("  username: $($ns.Username)")
+      [void]$sb.AppendLine("  password: $($ns.Password)")
+    }
+  }
   $path = Join-Path $Target 'config.yml'
   if (Test-Path -LiteralPath $path) {
     $bak = "$path.replaced-$(Get-Date -f 'yyyyMMdd-HHmmss')"
@@ -445,37 +498,74 @@ function Test-DatabaseHealth {
   param([string]$Python, [string]$DataDir)
   $db = Join-Path $DataDir 'nuarr.db'
   if (-not (Test-Path -LiteralPath $db)) { return }
-  $out = & $Python -c "import sqlite3,sys;print(sqlite3.connect(sys.argv[1]).execute('PRAGMA integrity_check').fetchone()[0])" $db 2>&1
+  $out = Invoke-Native { & $Python -c "import sqlite3,sys;print(sqlite3.connect(sys.argv[1]).execute('PRAGMA integrity_check').fetchone()[0])" $db 2>&1 }
   if ("$out".Trim() -eq 'ok') { Write-Step "Database integrity check: ok" 'ok' }
   else { Write-Step "Database integrity check said: $out" 'warn' }
 }
 
-function Install-Whisper {
-  param([string]$Python, [string]$DataDir)
-  Write-Step "Installing the Whisper language-ID stack (this is the slow one)"
-  & $Python -m pip install --disable-pip-version-check --no-input `
-      faster-whisper nvidia-cublas-cu12 nvidia-cudnn-cu12 2>&1 |
-    ForEach-Object { if ($_ -match 'Successfully|ERROR|error:') { Write-Step "  $_" } }
-  if ($LASTEXITCODE -ne 0) {
-    Write-Step "Whisper install failed - audio language detection stays off" 'warn'
-    return $false
+function Install-Tesseract {
+  <#  The OCR engine, landed in DataDir the same way ffmpeg is: nuarr's copy,
+      on a path nuarr controls, refreshed by reinstalls. A system install at
+      C:\Program Files\Tesseract-OCR is honoured by the app as a fallback,
+      but the bundle stops subtitle OCR being the one feature that only ever
+      worked on the machine it was written on. #>
+  param([string]$Bundle, [string]$DataDir)
+  $src = Join-Path $Bundle 'tesseract'
+  if (-not (Test-Path -LiteralPath (Join-Path $src 'tesseract.exe'))) {
+    Write-Step "No Tesseract in the bundle - subtitle OCR will need a system install" 'warn'
+    return
   }
-  $model = Join-Path $DataDir 'whisper'
-  New-Item -ItemType Directory -Force -Path $model | Out-Null
-  Write-Step "Fetching the 'small' model into $model"
-  $code = @"
+  $dst = Join-Path $DataDir 'tesseract'
+  Write-Step "Installing Tesseract OCR to $dst"
+  $null = robocopy $src $dst /E /NFL /NDL /NJH /NJS /NP /R:1 /W:1
+  if ($LASTEXITCODE -ge 8) { Write-Step "Tesseract copy failed ($LASTEXITCODE)" 'warn'; return }
+  Write-Step "Tesseract in place" 'ok'
+}
+
+function Install-Whisper {
+  param([string]$Python, [string]$DataDir, [switch]$Gpu)
+  # The CUDA runtime wheels are ~2 GB that a CPU-only machine can never use;
+  # a GPU added later gets them in one click from Settings -> Whisper.
+  $pkgs = @('faster-whisper')
+  if ($Gpu) { $pkgs += 'nvidia-cublas-cu12','nvidia-cudnn-cu12' }
+  Write-Step ("Installing the Whisper language-ID stack ({0})" -f $(if($Gpu){'GPU - this is the slow one'}else{'CPU'}))
+  # STDERR IS NOT AN ERROR HERE. Setup runs under EAP Stop, where anything a
+  # native command writes to stderr becomes a fatal exception - the schtasks
+  # lesson, relearned: huggingface prints its download PROGRESS to stderr,
+  # so a working model fetch killed the whole install with an empty
+  # "FAILED:". Both native calls run with EAP relaxed and are judged by
+  # their exit codes, which is what exit codes are for.
+  $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+  try {
+    & $Python -m pip install --disable-pip-version-check --no-input @pkgs 2>&1 |
+      ForEach-Object { if ("$_" -match 'Successfully|ERROR|error:') { Write-Step "  $_" } }
+    if ($LASTEXITCODE -ne 0) {
+      Write-Step "Whisper install failed - audio language detection stays off" 'warn'
+      return $false
+    }
+    $model = Join-Path $DataDir 'whisper'
+    New-Item -ItemType Directory -Force -Path $model | Out-Null
+    Write-Step "Fetching the 'small' model into $model"
+    $code = @"
 import os
 os.environ['HF_HOME'] = r'$model'
 from huggingface_hub import snapshot_download
 snapshot_download('Systran/faster-whisper-small', cache_dir=r'$model')
 print('model ready')
 "@
-  $tmp = Join-Path $env:TEMP 'nuarr_whisper_fetch.py'
-  [System.IO.File]::WriteAllText($tmp, $code, (New-Object System.Text.UTF8Encoding($false)))
-  & $Python $tmp 2>&1 | ForEach-Object { Write-Step "  $_" }
-  Remove-Item $tmp -Force -ErrorAction SilentlyContinue
-  Write-Step "Whisper ready" 'ok'
-  return $true
+    $tmp = Join-Path $env:TEMP 'nuarr_whisper_fetch.py'
+    [System.IO.File]::WriteAllText($tmp, $code, (New-Object System.Text.UTF8Encoding($false)))
+    Invoke-Native { & $Python $tmp 2>&1 | Select-Object -Last 3 | ForEach-Object { Write-Step "  $_" } }
+    $fetchRc = $LASTEXITCODE
+    Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+    if ($fetchRc -ne 0) {
+      # BEST-EFFORT BY DESIGN: nuarr fetches the model on first use anyway,
+      # so a failed pre-download costs a slower first pass, not the install.
+      Write-Step "Model pre-download did not finish - nuarr fetches it on first use instead" 'warn'
+    }
+    Write-Step "Whisper ready" 'ok'
+    return $true
+  } finally { $ErrorActionPreference = $eap }
 }
 
 function New-NuarrTask {
