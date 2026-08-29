@@ -17893,6 +17893,7 @@ async function socSaveLib(lib){
     if(m){ m.style.color=r.ok?'#7fd4a3':'#e0575b'; m.textContent=r.ok?'saved':(r.error||'failed'); }
     if(r.ok && r.libraries){
       _socAll=r;
+      rulesStale();        // the Rules page quotes the subtitle policy too
       // REPAINT, so the tree matches what was just saved. The master switch
       // greys its branch and the override strikes through the two roles it
       // subsumes - both are read from state at paint time, so without this
@@ -20034,6 +20035,11 @@ async function codecCommit(){
       body:JSON.stringify(_cod.policy||{})})).json();
     if(r&&r.policy) _cod.policy=r.policy;
     _codDirty=false;
+    // THE RULES PAGE IS NOW OUT OF DATE. It caches for the session ("static
+    // until the config changes") and nothing was telling it the config had
+    // just changed - so the page whose whole job is to state what the engine
+    // will do kept showing the previous answer until a reload.
+    rulesStale();
     paintCodecTab();
     const m2=document.getElementById('codMsg');
     // NOT "saved". Saved is about this page; what matters is that the queue
@@ -20123,6 +20129,8 @@ async function langCommit(){
     +'<span class="step">saving…</span></span>';
   let r;
   try{
+    // language policy feeds the Rules page's audio/subtitle rows
+    setTimeout(rulesStale, 0);
     r=await (await fetch('/api/langpolicy',{method:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify(_lang.policy)})).json();
@@ -20474,6 +20482,15 @@ mkvPillBoot();
 
 // ---- rules ---------------------------------------------------------------
 let _rulesLoaded=false;
+// Called by every save that the rules page describes - codec policy, subtitle
+// policy, language policy. One function so a new settings page has one thing
+// to remember, rather than a flag to find.
+function rulesStale(){
+  _rulesLoaded=false;
+  const el=document.getElementById('rulesBody');
+  // Repaint immediately if the reader is looking at it right now.
+  if(el && el.offsetParent!==null) loadRules();
+}
 async function loadRules(){
   const el=document.getElementById('rulesBody');
   if(!el) return;
@@ -20503,13 +20520,32 @@ async function loadRules(){
     +(note?`<div class="dim" style="font-size:11.5px;margin:-2px 0 6px">${esc(note)}</div>`:'')
     +`<table class="rtab">${rows.map(row).join('')}</table>`;
 
+  // WHERE ONE SENTENCE CANNOT BE TRUE FOR EVERY LIBRARY. These rows read
+  // "varies by library" rather than quoting one library's number as if it
+  // applied everywhere; this box is where the actual values live.
+  const vk = Object.keys(d.varies||{});
+  const variesBox = !vk.length ? '' :
+    `<div class="lkind" style="padding:10px 12px;margin:10px 0">
+       <b style="color:#e2b341">Some settings differ between libraries</b>
+       <div class="dim" style="font-size:11px;margin-top:3px">
+         The rows below say <i>varies by library</i> where that is the case.
+         What each library is actually set to:</div>
+       <table class="rtab" style="margin-top:6px">${
+         vk.map(k=>{
+           const v=d.varies[k];
+           return `<tr><td class="rk">${esc(v.setting)}</td><td class="rv">${
+             v.values.map(e=>`<b>${esc(String(e.value))}</b> <span class="dim">— ${
+               esc(e.libraries.join(', '))}</span>`).join('<br>')}</td></tr>`;
+         }).join('')}</table>
+     </div>`;
+
   el.innerHTML =
     `<div class="rprofbox">
        <div><span class="rprof anime">anime</span>
             <span class="mono dim">${esc(d.profiles.anime)}</span></div>
        <div><span class="rprof other">live action</span>
             <span class="mono dim">${esc(d.profiles.other)}</span></div>
-     </div>`
+     </div>` + variesBox
     + sect('Which pool a file goes to', d.pool)
     + sect('Video', d.video, 'Identical for both profiles.')
     + sect('Audio', d.audio,

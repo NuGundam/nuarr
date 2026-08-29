@@ -762,21 +762,129 @@ def pick_burn_target(subs: list[dict],
     return None, ""
 
 
+# CONFIG key -> (side, per-library policy key). Only the settings a person can
+# actually change appear here; everything else in CONFIG is a constant and
+# resolves to itself. Kept explicit rather than derived from a naming
+# convention, because a silent mismatch here would put the wrong number on the
+# page that exists to be trusted.
+_POLICY_OF: dict[str, tuple[str, str]] = {
+    "surroundBitrate":      ("audio", "surround_bitrate"),
+    "stereoBitrate":        ("audio", "stereo_bitrate"),
+    "surroundMaxChannels":  ("audio", "surround_max_channels"),
+    "eac3MaxBitrateK":      ("audio", "eac3_max_bitrate_k"),
+    "copySurroundIfCodec":  ("audio", "copy_surround_if"),
+    "copyStereoIfCodec":    ("audio", "copy_stereo_if"),
+    "dedupeAudioPerLang":   ("audio", "dedupe_per_lang"),
+    "convertAv1":           ("video", "convert_av1"),
+    "routeToH265On10bit":   ("video", "route_10bit"),
+    "routeToH265OnHDR":     ("video", "route_hdr"),
+    "routeToH265OnAv1":     ("video", "route_av1"),
+    "maxrateFactor":        ("video", "maxrate_factor"),
+    "maxrateFloorMbps":     ("video", "maxrate_floor_mbps"),
+    "stripDV":              ("video", "strip_dv"),
+    "stripDVProfiles":      ("video", "strip_dv_profiles"),
+    # spaceSaver is deliberately absent: in CONFIG it is a nested dict that
+    # this page subscripts (["enabled"], ["maxMbps"]), while the policy splits
+    # it across several flat fields. Mapping it would swap a dict for a bool
+    # and break the row instead of correcting it.
+}
+
+# Rendered by joining, so a divergence marker has to arrive as a list - a bare
+# string would be joined character by character into "v, a, r, i, e, s".
+_LIST_KEYS = {"copySurroundIfCodec", "copyStereoIfCodec", "stripDVProfiles"}
+
+# Read as a branch (`if C["stripDV"] else ...`). There is no marker that can be
+# put here honestly: any object is either truthy or falsy and would silently
+# pick a side. So when libraries disagree these keep the default for the
+# sentence and the disagreement is reported in `varies`, which the page shows.
+_BOOL_KEYS = {"convertAv1", "routeToH265On10bit", "routeToH265OnHDR",
+              "routeToH265OnAv1", "dedupeAudioPerLang", "stripDV"}
+
+
+class _Eff:
+    """CONFIG, resolved against what each library is actually set to."""
+
+    def __init__(self) -> None:
+        self.varies: dict[str, dict] = {}
+        try:
+            from . import codecpolicy as _cp
+            self._pol = _cp.load() or {}
+        except Exception:                                # noqa: BLE001
+            self._pol = {}
+
+    def __getitem__(self, key):
+        target = _POLICY_OF.get(key)
+        if not target or not self._pol:
+            return CONFIG[key]
+        side, pkey = target
+        seen: dict = {}
+        for lib, sides in self._pol.items():
+            v = ((sides or {}).get(side) or {}).get(pkey, CONFIG[key])
+            seen.setdefault(_key_of(v), (v, []))[1].append(lib)
+        if not seen:
+            return CONFIG[key]
+        if len(seen) == 1:
+            return next(iter(seen.values()))[0]
+        # Libraries disagree. Say so rather than picking one and being wrong
+        # for everybody else; the breakdown rides along for the page.
+        self.varies[key] = {
+            "setting": f"{side}/{pkey}",
+            "values": [{"value": v, "libraries": libs}
+                       for v, libs in seen.values()],
+        }
+        if key in _BOOL_KEYS:
+            return CONFIG[key]            # see _BOOL_KEYS
+        if key in _LIST_KEYS:
+            return ["varies by library"]
+        return "varies by library"
+
+
+def _key_of(v):
+    """Hashable stand-in, so list-valued settings can be grouped."""
+    return tuple(v) if isinstance(v, list) else v
+
+
+def _u(v, unit: str) -> str:
+    """'640 kbps', but 'varies by library' without a stray unit after it.
+
+    "E-AC3 at varies by library kbps" is what happens when a divergence
+    marker is dropped into a sentence that assumed a number.
+    """
+    s = str(v)
+    return f"{s} {unit}" if s.replace(".", "", 1).isdigit() else s
+
+
+def _effective_config() -> tuple[_Eff, dict]:
+    e = _Eff()
+    return e, e.varies
+
+
 def describe() -> dict:
     r"""The live rules, as data, for the dashboard.
 
-    GENERATED FROM CONFIG, never hand-written. A rules page typed out by hand
-    is wrong the first time anyone edits a number and nobody notices - and this
-    is exactly the page someone would trust when deciding why a file was
-    treated the way it was. Every value below is read from CONFIG at call time,
-    so the page cannot disagree with the engine.
+    GENERATED FROM THE EFFECTIVE SETTINGS, never hand-written. A rules page
+    typed out by hand is wrong the first time anyone edits a number and nobody
+    notices - and this is exactly the page someone would trust when deciding
+    why a file was treated the way it was.
+
+    IT USED TO READ CONFIG ALONE, WHICH MADE THAT PROMISE FALSE. CONFIG holds
+    the built-in defaults; the planner reads the per-library policy and only
+    falls back to CONFIG. So a library set to 448 kbps surround was encoded at
+    448 while this page went on saying 640 - measured, not theorised: setting
+    448/512/8 on one library left the page reporting 640/960/6. The page that
+    exists to explain the engine was describing a different engine.
+
+    `C` is now a resolver, not the defaults dict. C["surroundBitrate"] returns
+    the value every library agrees on, or - when they differ - the phrase
+    "varies by library" with the breakdown carried in `varies` for the page to
+    show. Same subscript syntax, so every row below reads as it did.
 
     Rows carry `anime` and `other` where the two profiles differ, and a single
     `both` where they do not. The anime/live-action split is smaller than it
     looks: it is entirely audio language selection and subtitle handling. Video
     is identical for both.
     """
-    C = CONFIG
+    C, varies = _effective_config()
     t = C["videoTargets"]
     burn_names = [v["name"] for v in SIGNS_VARIANTS if v.get("enabled")]
 
@@ -784,6 +892,9 @@ def describe() -> dict:
         return "yes" if v else "no"
 
     return {
+        # Filled while the rows below are built (same dict object), so it
+        # lists exactly the settings this page could not state as one number.
+        "varies": varies,
         "profiles": {
             "anime": r"any path under a folder starting with 'Anime' "
                      r"(P:\Anime Shows, P:\Anime Movies)",
@@ -823,7 +934,7 @@ def describe() -> dict:
                 "including through a subtitle burn-in"},
             {"k": "bitrate cap", "both":
                 f"{C['maxrateFactor']}x the source bitrate, floor "
-                f"{C['maxrateFloorMbps']} Mbps - stops a CQ encode ballooning "
+                f"{_u(C['maxrateFloorMbps'],'Mbps')} - stops a CQ encode ballooning "
                 f"past the original"},
             {"k": "shrink by bitrate", "both":
                 "DISABLED. Re-encoding purely because a file is large came out "
@@ -874,19 +985,19 @@ def describe() -> dict:
             {"k": "commentary", "both": "dropped - dead weight for direct play"},
             {"k": "stereo", "both":
                 f"copied when already {'/'.join(C['copyStereoIfCodec'])}, "
-                f"otherwise AAC at {C['stereoBitrate']} kbps"},
+                f"otherwise AAC at {_u(C['stereoBitrate'],'kbps')}"},
             {"k": "surround", "both":
                 f"copied when already {'/'.join(C['copySurroundIfCodec'])}, "
-                f"otherwise E-AC3 at {C['surroundBitrate']} kbps"},
+                f"otherwise E-AC3 at {_u(C['surroundBitrate'],'kbps')}"},
             {"k": "high-bitrate E-AC3", "both":
-                f"re-encoded down to {C['surroundBitrate']} kbps when above "
-                f"{C['eac3MaxBitrateK']} kbps, even though the codec is "
+                f"re-encoded down to {_u(C['surroundBitrate'],'kbps')} when above "
+                f"{_u(C['eac3MaxBitrateK'],'kbps')}, even though the codec is "
                 f"already right - Plex's EAE decoder rejects high-rate E-AC3 "
                 f"frames outright and loops instead of playing. Verified on "
                 f"this library: every 1536k track failed the web player, "
                 f"every 640k track played"},
             {"k": "more than 5.1", "both":
-                f"downmixed to {C['surroundMaxChannels']} channels so Plex "
+                f"downmixed to {_u(C['surroundMaxChannels'],'channels')} so Plex "
                 f"direct-plays"},
         ],
         "subs": [
