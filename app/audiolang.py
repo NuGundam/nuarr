@@ -585,17 +585,46 @@ def _load_probe(dev: str, ct: str) -> tuple[bool, str]:
     out = ((r.stdout or "") + (r.stderr or "")).strip()
     if r.returncode == 0 and out.startswith("OK"):
         _PROBE[key] = (True, "")
-    elif r.returncode < 0 or r.returncode > 1:
-        # KILLED, not failed. 0xC000001D is "illegal instruction" - the
-        # CTranslate2-on-an-old-CPU case this whole mechanism exists for.
+    elif r.returncode == 2:
+        # ARGPARSE, NOT A CRASH. Python's argparse exits 2 on a usage error,
+        # and "anything that is not 0 or 1" used to be read as "the process
+        # was killed" - so a mistyped flag would have been reported to the
+        # user as "this machine cannot run the model", which is a lie about
+        # their hardware. Could-not-ask is not the same as no.
+        _PROBE[key] = (True, "")
+        joblog.log("whisper load probe: bad arguments (exit 2) — not treating "
+                   "this as a hardware failure", "warn", system="audiolang")
+        return _PROBE[key]
+    elif r.returncode < 0 or r.returncode > 2:
+        # KILLED. NAME THE CODE, DO NOT GUESS THE CAUSE.
+        #
+        # This used to assert "your CPU is missing AVX2" for one exit code and
+        # imply it for the rest. Debugged on a real VM that crashes here: the
+        # CPU is an i9-9900X reporting AVX, AVX2 AND AVX512, CTranslate2
+        # imports fine and lists its CPU compute types, and the model
+        # constructor still dies - with 0xC0000005, an access violation, not
+        # 0xC000001D. Forcing a lower instruction set, reinstalling the wheel
+        # and loading the smallest model all reproduce it. So AVX2 is claimed
+        # ONLY when the code actually says illegal instruction, and every
+        # other code is reported as what it is.
         code = r.returncode & 0xFFFFFFFF
-        why = (f"loading the model on {dev} crashes this machine "
-               f"(exit 0x{code:08X})")
+        names = {0xC000001D: "illegal instruction",
+                 0xC0000005: "access violation",
+                 0xC0000409: "stack buffer overrun",
+                 0xC0000135: "a required DLL was not found",
+                 0xC000007B: "a DLL is the wrong architecture"}
+        named = names.get(code, "")
+        why = (f"loading the model on {dev} crashed this machine "
+               f"(exit 0x{code:08X}{' — ' + named if named else ''})")
         if code == 0xC000001D:
             why = ("this CPU is missing an instruction set that the language "
                    "identifier requires (CTranslate2 needs AVX2) — it cannot "
                    "run here, on the GPU or the CPU. Common on virtual "
                    "machines whose host does not pass AVX2 through")
+        elif code == 0xC0000005:
+            why += (" — the library loads but cannot build a model here. "
+                    "Seen on virtual machines; a page file of zero and little "
+                    "free memory make it more likely")
         _PROBE[key] = (False, why)
         joblog.log(f"whisper load probe: {why}", "warn", system="audiolang")
         # TELL THE INSTALLER TOO. Setup reads this file to grey its Whisper

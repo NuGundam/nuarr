@@ -564,7 +564,16 @@ function Load-Detected {
   # AVX2 present, the box stayed enabled, and the model still terminated the
   # process on install. The recorded verdict from any previous probe - Setup's
   # or the app's - is the actual evidence, so it is checked first.
+  # THREE SOURCES, STRONGEST FIRST.
+  #   1. what a previous run PROVED (recorded verdict)
+  #   2. what this run can prove RIGHT NOW, when the package is already here
+  #   3. the AVX2 flag, which is only a proxy - and was measured wrong on a
+  #      real VM, where the CPU advertises AVX2 and the model still dies
   $blocked = Get-WhisperBlock -DataDir $S.DataDir
+  if (-not $blocked) {
+    $blocked = Test-WhisperLoads -Python $S.Python -Target $S.Target -DataDir $S.DataDir
+    if ($blocked) { Set-WhisperBlock -DataDir $S.DataDir -Reason $blocked }
+  }
   if (-not $blocked -and -not (Test-Avx2)) {
     $blocked = "this CPU does not support AVX2, which the language identifier requires"
   }

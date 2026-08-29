@@ -134,6 +134,42 @@ function Clear-WhisperBlock {
   try { Remove-Item -LiteralPath (Join-Path $DataDir $script:WhisperBlockFile) -Force -ErrorAction SilentlyContinue } catch { }
 }
 
+function Test-WhisperLoads {
+  <#  Run the real probe NOW, if the pieces to run it already exist.
+
+      The recorded verdict only helps from the SECOND run onward, and
+      Test-Avx2 is a proxy that was measured wrong on a real VM - the CPU
+      advertises AVX2 and the model still dies. But on a machine where
+      faster-whisper is already installed (a repair, an upgrade, or a retry
+      after a rollback) the actual answer is two seconds away. Ask it.
+
+      Returns '' when it loaded or could not be tested, or the reason when
+      loading killed the process. #>
+  param([string]$Python, [string]$Target, [string]$DataDir)
+  if (-not $Python -or -not (Test-Path -LiteralPath $Python)) { return '' }
+  $probe = Join-Path $Target 'app\whisper_probe.py'
+  if (-not (Test-Path -LiteralPath $probe)) { return '' }
+  # Only worth doing when the package is already there - otherwise the probe
+  # just reports "not installed", which we knew.
+  $have = ''
+  Invoke-Native {
+    $have = & $Python -c "import importlib.util as u; print('yes' if u.find_spec('faster_whisper') else 'no')" 2>&1 | Select-Object -Last 1
+  }
+  if ("$have".Trim() -ne 'yes') { return '' }
+  $model = Join-Path $DataDir 'whisper'
+  Invoke-Native { & $Python $probe --device cpu --compute int8 --root $model 2>&1 | Out-Null }
+  $rc = $LASTEXITCODE
+  if ($rc -eq 0 -or $rc -eq 1 -or $rc -eq 2) { return '' }
+  $hex = '{0:X8}' -f ($rc -band 0xFFFFFFFF)
+  if ($hex -eq 'C000001D') {
+    return "this CPU cannot run it - loading the model executes an unsupported instruction (0xC000001D, missing AVX2)"
+  }
+  if ($hex -eq 'C0000005') {
+    return "loading the model crashes here (0xC0000005, access violation) - the library loads but cannot build a model on this machine"
+  }
+  return "loading the model crashes here (exit 0x$hex)"
+}
+
 function Find-Python {
   <#  The newest CPython 3.11+ we can find, preferring the py launcher.
       Returns @{Exe;Version} or $null. #>
@@ -641,12 +677,34 @@ function Install-Whisper {
       Write-Step "Checking this CPU can run the language identifier"
       Invoke-Native { & $Python $probe --device cpu --compute int8 --root $model 2>&1 | Out-Null }
       $prc = $LASTEXITCODE
+      # 2 IS ARGPARSE, NOT A CRASH. Python exits 2 on a usage error, and
+      # "not 0 and not 1" used to mean "killed" - so a mistyped flag here
+      # would have told somebody their hardware cannot run the model.
+      if ($prc -eq 2) {
+        Write-Step "The capability check could not run (bad arguments) - continuing without it" 'warn'
+        $prc = 0
+      }
       if ($prc -ne 0 -and $prc -ne 1) {
         $hex = '{0:X8}' -f ($prc -band 0xFFFFFFFF)
+        # NAME THE CODE, DO NOT GUESS THE CAUSE. Debugged on a VM that fails
+        # here: the CPU reports AVX, AVX2 and AVX512, CTranslate2 imports and
+        # lists its compute types, and the model constructor still dies with
+        # 0xC0000005 - an access violation, not an illegal instruction. So
+        # AVX2 is only ever claimed when the code actually says so.
+        $named = switch ($hex) {
+          'C000001D' { 'illegal instruction' }
+          'C0000005' { 'access violation' }
+          'C0000409' { 'stack buffer overrun' }
+          'C0000135' { 'a required DLL was not found' }
+          'C000007B' { 'a DLL is the wrong architecture' }
+          default    { '' }
+        }
         $reason = if ($hex -eq 'C000001D') {
-          "this CPU cannot run the language identifier - loading the model executes an unsupported instruction (0xC000001D)"
+          "this CPU cannot run the language identifier - loading the model executes an unsupported instruction (0xC000001D, missing AVX2)"
+        } elseif ($hex -eq 'C0000005') {
+          "loading the language model crashes on this machine (0xC0000005, access violation) - the library loads but cannot build a model here"
         } else {
-          "loading the language model crashes on this machine (exit 0x$hex)"
+          "loading the language model crashes on this machine (exit 0x$hex$(if($named){" - $named"}))"
         }
         Write-Step $reason 'err'
         # REMEMBERED, so the next run can grey the checkbox instead of
