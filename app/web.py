@@ -15947,13 +15947,19 @@ async function ctlUpdate(){
 // After an apply the server goes away on purpose. Poll until it answers,
 // then reload - the returning page is the new version.
 function pollUntilBack(){
-  let tries = 0;
+  let tries = 0, okRun = 0;
   const t = setInterval(async ()=>{
     tries++;
     try{
       const r = await fetch('/api/version',{cache:'no-store'});
-      if(r.ok){ clearInterval(t); location.reload(); }
-    }catch(e){}
+      // TWO consecutive answers before reloading, not one. The very first
+      // response can arrive while the rest of the app is still waking, and
+      // a page that loads into a half-started server greets the new version
+      // with an error banner. One extra second buys a server that is
+      // actually listening, not merely alive.
+      if(r.ok){ okRun++; if(okRun>=2){ clearInterval(t); location.reload(); } }
+      else okRun=0;
+    }catch(e){ okRun=0; }
     if(tries > 120) clearInterval(t);      // two minutes, then give up quietly
   }, 1000);
 }
@@ -18488,13 +18494,26 @@ async function loadUpdates(force){
         +'or clear the field to return to the official releases - to turn '
         +'checking back on.';
   } else if(!u.ok){
-    head='Could not check'; colour='#e0575b';
-    note=esc(u.error||'unknown error');
+    // RIGHT AFTER A RESTART THIS IS ALMOST ALWAYS TRANSIENT - the check
+    // raced the network stack coming back up. Retry quietly a few times
+    // before wearing the red banner; a human pressing Check now was the
+    // fix every time, so press it for them.
+    window._updRetries=(window._updRetries||0)+1;
+    if(window._updRetries<=3){
+      head='Checking…'; colour='var(--dim)';
+      note='The last check did not get through - retrying automatically.';
+      setTimeout(()=>loadUpdates(true), 4000);
+    } else {
+      head='Could not check'; colour='#e0575b';
+      note=esc(u.error||'unknown error');
+    }
   } else if(u.update_available){
+    window._updRetries=0;
     head=`Version ${esc(u.latest)} is available`; colour='#e2b341';
     note=`You are running ${esc(u.current)}.`
         +(u.latest_at?` Released ${esc(u.latest_at)}.`:'');
   } else if(u.latest){
+    window._updRetries=0;
     head='Up to date'; colour='#7fd4a3';
     note=`${esc(u.current)} is the newest release.`;
   } else {
@@ -20993,8 +21012,13 @@ _SETTINGS_CSS = """
    fill the page; many rows scroll inside it with the heading and buttons
    staying put. min-height:0 on every level because a flex child defaults to
    min-content and would otherwise refuse to shrink. */
+/* SIZED TO THE VIEWPORT, NOT THE HOST - the same calc the Logs page uses.
+   height:100% filled the settings host, but the host has a min-height of its
+   own (882px), so on a shorter window the panel ran below the fold, and on a
+   taller one it stopped short of the bottom. 100vh is the window itself:
+   the list's bottom edge lands where Logs' does, whatever the screen. */
 #plexworkPane, #ruleschkPane{display:flex;flex-direction:column;
-  height:100%;min-height:0}
+  height:calc(100vh - 190px);min-height:420px}
 #plexworkBody, #ruleschkBody{flex:1;display:flex;flex-direction:column;
   min-height:0;padding-bottom:0}
 #plexworkBody > h2, #ruleschkBody > h2{flex:0 0 auto}

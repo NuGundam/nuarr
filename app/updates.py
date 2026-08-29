@@ -128,7 +128,15 @@ def check(force: bool = False) -> dict:
             return dict(_STATE)
     now = time.time()
     with _LOCK:
-        fresh = _STATE["checked_at"] and (now - _STATE["checked_at"]) < CHECK_EVERY_S
+        # A FAILURE IS NOT WORTH CACHING FOR SIX HOURS. The first check after
+        # a restart - which is exactly when the page reloads to greet the new
+        # version - can lose the race with the network stack coming back up.
+        # Caching that loss for the full interval meant the Updates page said
+        # "Could not check" until a human pressed Check now, every single
+        # update. A success keeps the long interval; a failure goes stale in
+        # a minute, so the next page load simply tries again.
+        ttl = CHECK_EVERY_S if _STATE["ok"] else 60
+        fresh = _STATE["checked_at"] and (now - _STATE["checked_at"]) < ttl
         if fresh and not force:
             return dict(_STATE)
     try:
