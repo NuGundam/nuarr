@@ -767,8 +767,10 @@ def self_test() -> dict:
         return _done({"ok": False, "ran": False,
                       "why": f"could not read the library: {str(e)[:120]}"})
     pick = graded = fallback = None
+    missing = 0
     for r in rows:
         if not os.path.exists(r["path"]):
+            missing += 1
             continue
         if fallback is None:
             fallback = (r, 0)      # ungraded, but still a real run
@@ -782,9 +784,25 @@ def self_test() -> dict:
     if pick is None:
         pick = fallback
     if not pick:
-        return _done({"ok": False, "ran": False,
-                      "why": "no reachable media file to test with - "
-                             "scan a library first"})
+        # SAME DISTINCTION AS THE OCR TEST. "scan a library first" is only
+        # right when there is nothing indexed; when rows exist but every one
+        # of them fails os.path.exists, the library is indexed and the files
+        # are out of reach - which on a UNC path usually means the service
+        # account cannot see the share, not that anything needs scanning.
+        if not rows:
+            why = ("nothing indexed yet - scan a library first")
+        elif missing == len(rows):
+            why = (f"all {len(rows)} indexed file(s) are unreadable from "
+                   "here. If this library lives on a network share, "
+                   "remember nuarr runs as a service: SYSTEM reaches the "
+                   "network as the machine account, not as you, so a share "
+                   "that opens fine in Explorer can still be invisible to "
+                   "it. A local path, or granting the computer account "
+                   "access to the share, resolves it")
+        else:
+            why = "no file with an audio track to test with"
+        return _done({"ok": False, "ran": False, "why": why,
+                      "candidates": len(rows), "unreachable": missing})
     r, track = pick
     res = detect(r["path"], track)
     heard = res.get("code") or ""

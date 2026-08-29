@@ -1489,6 +1489,53 @@ def _run_progress(args: list[str], tick, base: float, span: float,
 _TEST_SUP: dict = {"path": "", "cues": 0, "title": ""}
 
 
+def _probe_a_few(limit: int = 25) -> dict | None:
+    """Probe a few unprobed files looking for one picture subtitle track.
+
+    Only reached when the probe cache holds nothing at all - a fresh install
+    that has indexed files but not yet run any job. Bounded on purpose: this
+    runs behind a button press, so it may cost a second or two and must not
+    turn into a library-wide scan.
+    """
+    import asyncio as _aio
+    from .db import cursor
+    from .config import DATA_DIR
+    from . import jobs as _jobs
+    work = os.path.join(str(DATA_DIR), "ocrtest")
+    os.makedirs(work, exist_ok=True)
+    with cursor() as cur:
+        rows = cur.execute(
+            "SELECT f.id, f.path, f.title FROM files f "
+            " LEFT JOIN file_probes p ON p.file_id = f.id "
+            " WHERE f.state NOT IN ('deleted','duplicate') AND p.file_id IS NULL"
+            " LIMIT ?", (limit,)).fetchall()
+    for r in rows:
+        if not os.path.exists(r["path"]):
+            continue
+        try:
+            data = _aio.run(_jobs.probe(r["path"]))
+        except Exception:                                # noqa: BLE001
+            continue
+        if not data:
+            continue
+        try:
+            _jobs.cache_probe(r["id"], data)             # keep what we learned
+        except Exception:                                # noqa: BLE001
+            pass
+        subs = [s for s in (data.get("streams") or [])
+                if s.get("codec_type") == "subtitle"]
+        for rel, s in enumerate(subs):
+            if (s.get("codec_name") or "").lower() not in IMG_CODECS:
+                continue
+            try:
+                sup = extract_sup(r["path"], rel, work, "sample")
+            except Exception:                            # noqa: BLE001
+                continue
+            _TEST_SUP.update(path=sup, cues=0, title=r["title"] or "")
+            return dict(_TEST_SUP)
+    return None
+
+
 def _test_sample() -> dict:
     """A real .sup from the library, cached, for the engine tests.
 
@@ -1510,8 +1557,20 @@ def _test_sample() -> dict:
             "WHERE f.state NOT IN ('deleted','duplicate') "
             "AND (p.json LIKE '%hdmv_pgs_subtitle%' OR p.json LIKE '%pgssub%') "
             "LIMIT 400").fetchall()
+    # WHY IT FAILED, NOT JUST THAT IT DID. "no reachable file to test with"
+    # was one message for three unrelated situations: nothing has been probed
+    # yet, nothing here HAS a picture subtitle, or the files are known but
+    # cannot be opened - which is what a library on a network share looks like
+    # to a service running as SYSTEM, since that account reaches the network
+    # as the machine, not as you. Counting each case separately turns a dead
+    # end into an instruction.
+    missing = 0
+    seen = 0
+    extract_err = ""
     for r in rows:
+        seen += 1
         if not os.path.exists(r["path"]):
+            missing += 1
             continue
         try:
             d = json.loads(r["json"])
@@ -1524,11 +1583,37 @@ def _test_sample() -> dict:
                 continue
             try:
                 sup = extract_sup(r["path"], rel, work, "sample")
-            except Exception:                            # noqa: BLE001
+            except Exception as e:                       # noqa: BLE001
+                extract_err = f"{type(e).__name__}: {str(e)[:90]}"
                 continue
             _TEST_SUP.update(path=sup, cues=0, title=r["title"] or "")
             return dict(_TEST_SUP)
-    return {"path": "", "cues": 0, "title": ""}
+    if not seen:
+        # NOTHING PROBED YET IS THE NORMAL STATE OF A NEW INSTALL, and it is
+        # not something the person can fix by scanning: a scan indexes paths,
+        # only a job reads a file's streams. So the test button could not
+        # work until unrelated work happened to run - on a fresh machine,
+        # possibly for hours. Probe a handful here instead: ffprobe on a few
+        # files costs a second and is exactly what the button is asking for.
+        sample = _probe_a_few()
+        if sample:
+            return sample
+        why = ("no file here has a picture subtitle track — "
+               "probed a sample and found none")
+    elif missing == seen:
+        why = (f"all {seen} candidate file(s) are indexed but cannot be "
+               "opened from here. If this library is a network share, note "
+               "that nuarr runs as a service: SYSTEM reaches the network as "
+               "the machine account, not as you, so a share that works in "
+               "Explorer can still be unreadable to it. A local path, or a "
+               "share that grants the computer account access, fixes it")
+    elif extract_err:
+        why = f"found a picture subtitle track but could not extract it — {extract_err}"
+    else:
+        why = (f"{seen} file(s) checked, none carried a picture subtitle "
+               "track to test with")
+    return {"path": "", "cues": 0, "title": "", "why": why,
+            "candidates": seen, "unreachable": missing}
 
 
 def measurements() -> dict:
@@ -1573,8 +1658,9 @@ def engine_test(which: str = "tesseract", device: str = "cpu",
     t0 = time.time()
     samp = _test_sample()
     if not samp["path"]:
-        return {"ok": False, "error": "no reachable file with a picture "
-                                      "subtitle track to test with"}
+        return {"ok": False,
+                "error": samp.get("why") or "no file with a picture subtitle "
+                                            "track to test with"}
     out = os.path.join(os.path.dirname(samp["path"]),
                        f"test_{which}_{device}.srt")
     args = [_sys.executable,
