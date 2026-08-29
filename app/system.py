@@ -222,6 +222,27 @@ def _owner(name: str, cmd: list) -> tuple[str, str]:
         return "Handler script", (m.group(1) if m else "running a handler")
     if "tesseract" in low:
         return "Subtitle OCR", (f"reading {what}" if what else "reading subtitles")
+    # THE OTHER OCR ENGINE, which was invisible here.
+    #
+    # This function names processes by their EXECUTABLE, and Tesseract is an
+    # exe - so it got a row. PaddleOCR is a Python module driven by a worker
+    # script, so the process is "python.exe" and it fell through to "not
+    # recognised": a CPU-bound PaddleOCR run showed up in the total for
+    # "nuarr and its children" but was named nowhere, which is exactly the
+    # confusing half-answer the panel exists to avoid. Match on the script
+    # nuarr launches, since that is what identifies the work.
+    if "paddle_worker.py" in jl:
+        dev = ("GPU" if "--device gpu" in jl
+               else "CPU" if "--device cpu" in jl else "")
+        eng = "Tesseract" if "--engine tesseract" in jl else "PaddleOCR"
+        lead = f"{eng}{' on the ' + dev if dev else ''}"
+        return "Subtitle OCR", (f"{lead} reading {what}" if what
+                                else f"{lead} reading subtitles")
+    # The Tesseract path runs through a wrapper that hides its console; the
+    # wrapper itself is the process the panel sees while pgsrip works.
+    if "pgsrip_hidden.py" in jl or "pgsrip" in jl:
+        return "Subtitle OCR", (f"Tesseract reading {what}" if what
+                                else "Tesseract reading subtitles")
     if low.startswith("conhost"):
         return "", "console host for another process"
     return "", ""
@@ -356,12 +377,20 @@ def _cache_disk_key() -> str | None:
         letter = letter.rstrip(":")
         if not letter:
             return None
-        r = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             f"(Get-Partition -DriveLetter {letter}).DiskNumber"],
-            capture_output=True, text=True, timeout=25,
-            creationflags=NO_WINDOW)
-        n = r.stdout.strip().splitlines()[0].strip()
+        # Ask WMI directly rather than through a shell - diskload already
+        # holds the partition map and the in-process query that builds it,
+        # so this is a lookup rather than another process.
+        from . import diskload as _dl
+        n = _dl.disk_number_for(f"{letter}:\\")
+        if not n:
+            rows = _dl.wmi_query(
+                f"SELECT DiskNumber FROM MSFT_Partition WHERE DriveLetter='{letter}'",
+                "root\\Microsoft\\Windows\\Storage")
+            if rows:
+                try:
+                    n = str(int(rows[0].DiskNumber))
+                except (TypeError, ValueError):
+                    n = ""
         if n.isdigit():
             _CACHE_DISK = f"PhysicalDrive{n}"
     except Exception:

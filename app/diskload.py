@@ -87,11 +87,17 @@ _ERR: dict = {"at": 0.0, "msg": ""}
 _com = threading.local()
 
 
-def _wmi_service():
-    """A cached SWbemServices for this thread, or None if COM is unusable."""
-    svc = getattr(_com, "svc", None)
-    if svc is not None:
-        return svc
+def _wmi_service(namespace: str = "root\\cimv2"):
+    """A cached SWbemServices for this thread, or None if COM is unusable.
+
+    Cached per (thread, namespace): binding to the service is the expensive
+    part, and the storage namespace is a different bind from cimv2.
+    """
+    cache = getattr(_com, "svcs", None)
+    if cache is None:
+        cache = _com.svcs = {}
+    if namespace in cache:
+        return cache[namespace]
     if getattr(_com, "failed", False):
         return None
     try:
@@ -99,11 +105,39 @@ def _wmi_service():
         import win32com.client
         pythoncom.CoInitializeEx(pythoncom.COINIT_MULTITHREADED)
         loc = win32com.client.Dispatch("WbemScripting.SWbemLocator")
-        _com.svc = loc.ConnectServer(".", "root\\cimv2")
-        return _com.svc
+        cache[namespace] = loc.ConnectServer(".", namespace)
+        return cache[namespace]
     except Exception:                                    # noqa: BLE001
         _com.failed = True                # do not retry per sample
         return None
+
+
+def wmi_query(wql: str, namespace: str = "root\\cimv2"):
+    """Run one WQL query in-process. [] when WMI is not usable here.
+
+    Shared so that nothing in nuarr has to launch powershell.exe to ask
+    Windows a question it can ask directly - see the note above _wmi_service.
+    """
+    svc = _wmi_service(namespace)
+    if svc is None:
+        return []
+    try:
+        return list(svc.ExecQuery(wql))
+    except Exception:                                    # noqa: BLE001
+        cache = getattr(_com, "svcs", None) or {}
+        cache.pop(namespace, None)        # drop a stale binding, retry later
+        return []
+
+
+def disk_number_for(path: str) -> str:
+    """'0' for a path on PhysicalDrive0, or '' when it cannot be resolved."""
+    if not path:
+        return ""
+    p = path.lower()
+    for access, num in _load_map().items():
+        if p.startswith(access):
+            return num
+    return ""
 
 
 def _read_counters_wmi() -> dict[str, dict] | None:
@@ -314,6 +348,36 @@ def _load_map() -> dict[str, str]:
     if _MAP_DONE:
         return _MAP
     _MAP_DONE = True
+    # IN-PROCESS, like the counters above. This ran once per start, so it was
+    # never the repeat offender - but it is the same question asked the same
+    # expensive way, and one PowerShell launch at startup is still a console
+    # process on a box where nuarr runs interactively.
+    try:
+        rows = wmi_query("SELECT DiskNumber, AccessPaths FROM MSFT_Partition",
+                         "root\\Microsoft\\Windows\\Storage")
+        for r in rows:
+            try:
+                num = str(int(r.DiskNumber))
+            except (TypeError, ValueError):
+                continue
+            for p in (r.AccessPaths or []):
+                p = str(p or "").strip()
+                if p:
+                    _MAP[p.lower()] = num
+    except Exception as e:                               # noqa: BLE001
+        _ERR.update(at=time.time(), msg=f"map: {type(e).__name__}: {e}")
+    if not _MAP:
+        _load_map_shell()
+    return _MAP
+
+
+def _load_map_shell() -> None:
+    """The original PowerShell mapper, kept only as a fallback.
+
+    Reached when COM is unavailable or the storage namespace refuses the
+    query. Losing the partition map costs the per-disk attribution, so it is
+    worth one shell launch to keep it - once, at startup, never in a loop.
+    """
     ps = (
         "Get-CimInstance -Namespace root\\Microsoft\\Windows\\Storage "
         "-ClassName MSFT_Partition | ForEach-Object { $d=$_.DiskNumber; "
@@ -332,9 +396,8 @@ def _load_map() -> dict[str, str]:
             if not num.isdigit() or not path:
                 continue
             _MAP[path.lower()] = num
-    except Exception as e:
-        _ERR.update(at=time.time(), msg=f"map: {type(e).__name__}: {e}")
-    return _MAP
+    except Exception as e:                               # noqa: BLE001
+        _ERR.update(at=time.time(), msg=f"map(shell): {type(e).__name__}: {e}")
 
 
 def _counter_key(disk_num: str, rows: dict[str, dict]) -> str | None:
