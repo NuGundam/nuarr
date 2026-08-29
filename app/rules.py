@@ -1492,11 +1492,26 @@ def decide(probe: dict, *, anime: bool = False, filename: str = "",
         # encoders.py unavailable or the probe blew up: keep the old constant,
         # which is what every plan used before this existed.
         pass
+    # THE PRESET THAT WILL ACTUALLY BE USED, not the one that was asked for.
+    #
+    # video_args() already refuses a preset from another family - "p5" means
+    # nothing to libx265 - and quietly substitutes that family's default. The
+    # plan stored the REQUESTED value, so a job that fell back to the CPU
+    # advertised itself as "libx265 preset p5 cq 22": a combination that has
+    # never been run and could not be. The encode was correct; the sentence
+    # describing it was not.
+    _preset = str(_v(f"{target}_preset", _tg["preset"]))
+    try:
+        _spec = _enc.FAMILIES.get(_fam) or {}
+        if _preset not in (_spec.get("presets") or []):
+            _preset = _spec.get("default_preset", _preset)
+    except Exception:                                    # noqa: BLE001
+        pass
     p.venc = {
         "family": _fam,
         "family_why": _why,
         "encoder": _encname,
-        "preset": str(_v(f"{target}_preset", _tg["preset"])),
+        "preset": _preset,
         "cq": int(_v(f"{target}_cq", _tg["cq"])),
         # Stored as a percentage in the settings, used as a multiplier here -
         # "150%" reads better in a box than "1.5" and cannot be mistaken for a

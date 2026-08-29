@@ -103,8 +103,12 @@ def encoder_for(family: str, target: str) -> str:
 
 # ------------------------------------------------------------- the probe ----
 
-_CACHE: dict = {"at": 0.0, "result": {}}
+_CACHE: dict = {"at": 0.0, "result": {}, "ttl": 3600.0}
 _TTL = 3600.0
+# How long a "nothing works here" answer is trusted. Short, because that
+# answer sends every job to the CPU and is the one most likely to be wrong -
+# see probe().
+_FAIL_TTL = 60.0
 
 
 def _ff() -> str:
@@ -115,7 +119,7 @@ def _ff() -> str:
         return shutil.which("ffmpeg") or "ffmpeg"
 
 
-def _try_family(fam: str, timeout: float = 25.0) -> dict:
+def _try_family(fam: str, timeout: float = 25.0, attempts: int = 2) -> dict:
     r"""Encode two seconds of colour bars. Anything else is a guess.
 
     Uses lavfi rather than a real file so the test costs nothing and cannot be
@@ -125,35 +129,72 @@ def _try_family(fam: str, timeout: float = 25.0) -> dict:
     """
     spec = FAMILIES[fam]
     enc = spec["hevc"]
-    out = os.path.join(tempfile.gettempdir(), f"nuarr_encprobe_{fam}.mkv")
-    cmd = [_ff(), "-hide_banner", "-loglevel", "error", "-y",
-           "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=24:duration=2"]
-    cmd += ["-c:v", enc, "-preset", spec["default_preset"]]
-    cmd += _quality_args(fam, 28)
-    cmd += ["-t", "2", out]
     t0 = time.time()
-    try:
-        p = subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=timeout, creationflags=NO_WINDOW)
-        ok = p.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 1024
-        err = "" if ok else (p.stderr or "").strip().splitlines()[-1:] or [""]
-        return {"ok": ok, "detail": "" if ok else (err[0] if err else "failed"),
-                "seconds": round(time.time() - t0, 2)}
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "detail": "timed out", "seconds": timeout}
-    except Exception as e:                               # noqa: BLE001
-        return {"ok": False, "detail": f"{type(e).__name__}: {e}", "seconds": 0}
-    finally:
+    last = {"ok": False, "detail": "failed", "seconds": 0.0}
+    for attempt in range(max(1, attempts)):
+        # A NAME PER RUN, NOT PER FAMILY. This used to be a fixed path -
+        # nuarr_encprobe_cpu.mkv - so two probes running at once (the settings
+        # page and a planner, or two browser tabs) shared one file: the first
+        # finished, the second's `finally` deleted it, and the first then found
+        # its own output missing and recorded a PASS as a failure.
+        out = os.path.join(
+            tempfile.gettempdir(),
+            f"nuarr_encprobe_{fam}_{os.getpid()}_{int(time.time() * 1000)}.mkv")
+        cmd = [_ff(), "-hide_banner", "-loglevel", "error", "-y",
+               "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=24:duration=2"]
+        cmd += ["-c:v", enc, "-preset", spec["default_preset"]]
+        cmd += _quality_args(fam, 28)
+        cmd += ["-t", "2", out]
         try:
-            os.remove(out)
-        except OSError:
-            pass
+            p = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=timeout, creationflags=NO_WINDOW)
+            ok = (p.returncode == 0 and os.path.exists(out)
+                  and os.path.getsize(out) > 1024)
+            err = "" if ok else (p.stderr or "").strip().splitlines()[-1:] or [""]
+            last = {"ok": ok,
+                    "detail": "" if ok else (err[0] if err else "failed"),
+                    "seconds": round(time.time() - t0, 2)}
+        except subprocess.TimeoutExpired:
+            last = {"ok": False, "detail": "timed out", "seconds": timeout}
+        except Exception as e:                           # noqa: BLE001
+            last = {"ok": False, "detail": f"{type(e).__name__}: {e}",
+                    "seconds": round(time.time() - t0, 2)}
+        finally:
+            try:
+                os.remove(out)
+            except OSError:
+                pass
+        if last["ok"]:
+            return last
+        # ONE RETRY, BECAUSE THIS RUNS ON A BUSY MACHINE. The probe is a real
+        # encode competing with every job in flight; on a box with seven
+        # running it can lose the race and fail for reasons that have nothing
+        # to do with the encoder. A single transient failure used to be
+        # recorded as "this hardware does not work" and cached for an hour.
+        if attempt + 1 < attempts:
+            time.sleep(1.5)
+    return last
 
 
 def probe(force: bool = False) -> dict:
-    """{family: {ok, detail, seconds, label, note}} - cached for an hour."""
+    """{family: {ok, detail, seconds, label, note}} - cached.
+
+    A GOOD ANSWER KEEPS FOR AN HOUR; A TOTAL FAILURE KEEPS FOR A MINUTE.
+
+    Encoders do not come and go, so caching a working answer for an hour is
+    free. Caching "nothing works" for an hour is not: every job planned in
+    that window is planned for the CPU, and on this machine that is the
+    difference between 200 fps on the card and 10 fps on the processor. It
+    happened - a probe under heavy load failed, and an hour of encodes were
+    routed to software while the ffmpeg page went on correctly reporting that
+    NVENC was fine.
+
+    So a result with nothing usable is treated as provisional and re-checked
+    a minute later, rather than believed until teatime.
+    """
     now = time.time()
-    if not force and _CACHE["result"] and now - _CACHE["at"] < _TTL:
+    ttl = float(_CACHE.get("ttl") or _TTL)
+    if not force and _CACHE["result"] and now - _CACHE["at"] < ttl:
         return _CACHE["result"]
     out = {}
     for fam in ORDER:
@@ -162,7 +203,9 @@ def probe(force: bool = False) -> dict:
         r["note"] = FAMILIES[fam]["note"]
         r["presets"] = FAMILIES[fam]["presets"]
         out[fam] = r
+    any_ok = any(v.get("ok") for v in out.values())
     _CACHE["result"], _CACHE["at"] = out, now
+    _CACHE["ttl"] = _TTL if any_ok else _FAIL_TTL
     return out
 
 
