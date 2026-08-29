@@ -156,6 +156,29 @@ def _queued_work() -> tuple[dict, float]:
     return per_pool, typical
 
 
+def _ocr_device_of(w) -> str:
+    """'gpu' | 'cpu' | '' for the OCR running on this worker.
+
+    Tesseract is CPU-only, so it answers itself. PaddleOCR is whatever the
+    install is set up for, and the probe cache is the only honest source -
+    reading it rather than calling paddle_info() because this runs inside the
+    job snapshot, which the dashboard polls, and a probe spawns a process.
+    An empty cache means no claim, not a guess.
+    """
+    if not (w.pool == "subocr" or getattr(w, "sub_ocr_active", False)):
+        return ""
+    try:
+        from . import subocr as _so
+        if _so.engine("") != "paddle":
+            return "cpu"                     # Tesseract, always
+        data = (_so._PADDLE_CACHE.get("data") or {})
+        if not data:
+            return ""
+        return "gpu" if data.get("cuda") else "cpu"
+    except Exception:                                        # noqa: BLE001
+        return ""
+
+
 def _overall(queued: int, workers: list["Worker"]) -> dict:
     running = len(workers)
     total = BATCH["done"] + running + queued
@@ -559,6 +582,13 @@ class Worker:
             # cannot say - this is a passthrough job doing OCR work, not a
             # member of the subocr pool.
             "sub_ocr_active": bool(self.sub_ocr_active),
+            # WHICH PROCESSOR THE OCR IS ON, for the same reason `venc` is
+            # here: the card should report what is running, not what the
+            # settings imply. The stage line already carries it as text
+            # ("PaddleOCR - GPU"), but text meant for reading is a poor
+            # thing to parse, and the card was flatly calling GPU work CPU
+            # work because the label predated there being a choice.
+            "ocr_device": _ocr_device_of(self),
             "sub_fix_frac": round(self.sub_fix_frac, 4),
             "sub_fix_stage": self.sub_fix_stage,
             "by_bytes": self.by_bytes,

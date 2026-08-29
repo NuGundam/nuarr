@@ -13314,9 +13314,17 @@ I/O priority and the viewer's reads overtake it">very low I/O · viewer on ${
   if(w.write_bps)
     bits.push(`<span class="m-lbl">write</span> `
              +`<span class="m-write">${mbps(w.write_bps)}</span>`);
-  if((w.pool==='subocr' || w.sub_ocr_active) && !w.read_bps && !w.write_bps)
-    bits.push(`<span class="dim" title="the OCR phase is pure CPU - disk rates
-appear during extract, mux and commit">no disk I/O (OCR is CPU work)</span>`);
+  if((w.pool==='subocr' || w.sub_ocr_active) && !w.read_bps && !w.write_bps){
+    // WHICH PROCESSOR, read from the job rather than assumed. This line was
+    // written when Tesseract was the only engine and said "OCR is CPU work"
+    // as a flat fact - so a PaddleOCR job sitting at 43% on the GPU was
+    // labelled CPU work on the same card that was reporting its GPU load.
+    // The claim worth making here is about the DISK being idle; the
+    // processor is whatever the running engine actually uses.
+    const dev = (w.ocr_device||'').toLowerCase();
+    const on  = dev==='gpu' ? 'the GPU' : dev==='cpu' ? 'the CPU' : 'the processor';
+    bits.push(`<span class="dim" title="reading pictures into text moves no bytes on or off the pool - disk rates appear during extract, mux and commit">no disk I/O (OCR runs on ${on})</span>`);
+  }
   // SIZE FOR AS LONG AS IT IS KNOWN, not only while encoding.
   //
   // Gated on stage==='encoding', the figures vanished the moment the video
@@ -17618,7 +17626,7 @@ function socPaint(lib){
            only ever disagree with the real one. -->
       <div class="dim" style="font-size:11px;margin:7px 0 2px">
         Read with <b>${esc((_socAll.engine_label)||'the engine set under OCR engines')}</b>
-        — <a href="#" onclick="showPane('ocr');return false">change it for the whole install</a>
+        — <a href="#" onclick="wtab('ocr');return false">change it for the whole install</a>
       </div>
       <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;
                   font-size:12px;margin:2px 0;${has.image?'':'opacity:.45'}">
