@@ -68,6 +68,84 @@ _ERR: dict = {"at": 0.0, "msg": ""}
 
 
 # --------------------------------------------------------------- sampling ---
+# THE SAME COUNTERS, WITHOUT LAUNCHING A SHELL TO READ THEM.
+#
+# This module used to answer "how busy are the disks" by running powershell.exe
+# once per sample. It worked, and it cost a process launch every few seconds
+# for the life of the server - measured at 513 ms of wall time per sample on
+# this machine, roughly one PowerShell start every 3.5 s, forever. Watching
+# process creation for 45 seconds caught thirteen of them.
+#
+# The counters are WMI; PowerShell was only ever the messenger. pywin32 is
+# already a dependency, so the same query runs in-process against the same
+# provider - no child process, no console (hidden or otherwise), no shell
+# startup. The connection is cached per thread because binding to the CIM
+# service is the expensive part and the sampler runs from a worker thread.
+#
+# The PowerShell path is KEPT as a fallback: if COM is unavailable for any
+# reason this is a monitoring feature that must degrade, not fail.
+_com = threading.local()
+
+
+def _wmi_service():
+    """A cached SWbemServices for this thread, or None if COM is unusable."""
+    svc = getattr(_com, "svc", None)
+    if svc is not None:
+        return svc
+    if getattr(_com, "failed", False):
+        return None
+    try:
+        import pythoncom
+        import win32com.client
+        pythoncom.CoInitializeEx(pythoncom.COINIT_MULTITHREADED)
+        loc = win32com.client.Dispatch("WbemScripting.SWbemLocator")
+        _com.svc = loc.ConnectServer(".", "root\\cimv2")
+        return _com.svc
+    except Exception:                                    # noqa: BLE001
+        _com.failed = True                # do not retry per sample
+        return None
+
+
+def _read_counters_wmi() -> dict[str, dict] | None:
+    """The counters straight from WMI. None means 'could not', not 'idle'."""
+    svc = _wmi_service()
+    if svc is None:
+        return None
+    try:
+        rows = svc.ExecQuery(
+            "SELECT Name, PercentIdleTime, CurrentDiskQueueLength, "
+            "DiskReadBytesPerSec, DiskWriteBytesPerSec "
+            "FROM Win32_PerfFormattedData_PerfDisk_PhysicalDisk")
+        out: dict[str, dict] = {}
+        for r in rows:
+            name = str(r.Name or "").strip()
+            if not name or name == "_Total":
+                continue
+            try:
+                idle = float(r.PercentIdleTime or 100)
+                queue = float(r.CurrentDiskQueueLength or 0)
+                rd = float(r.DiskReadBytesPerSec or 0)
+                wr = float(r.DiskWriteBytesPerSec or 0)
+            except (TypeError, ValueError):
+                continue
+            out[name] = {
+                "name": name,
+                "busy": max(0.0, min(100.0, 100.0 - idle)),
+                "queue": queue,
+                "bps": rd + wr,
+                "read_bps": rd,
+                "write_bps": wr,
+            }
+        return out or None
+    except Exception as e:                               # noqa: BLE001
+        # A failure here is worth one retry through a fresh connection - a
+        # stale service object survives a WMI restart as a live COM pointer
+        # that raises on use.
+        _com.svc = None
+        _ERR.update(at=time.time(), msg=f"wmi: {type(e).__name__}: {e}"[:200])
+        return None
+
+
 def _read_counters() -> dict[str, dict]:
     """Per-physical-disk load. {} when the counters cannot be read.
 
@@ -75,6 +153,10 @@ def _read_counters() -> dict[str, dict]:
     Windows - only cumulative bytes, which cannot answer "is this disk at its
     limit" for a spinning disk whose limit is seeks, not bytes.
     """
+    fast = _read_counters_wmi()
+    if fast is not None:
+        return fast
+    # ---- fallback: the original shell path, unchanged ----
     ps = (
         "Get-CimInstance Win32_PerfFormattedData_PerfDisk_PhysicalDisk | "
         "Where-Object { $_.Name -ne '_Total' } | "

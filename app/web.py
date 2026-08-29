@@ -7119,8 +7119,48 @@ tr.logdrop td{padding:0 0 8px 0;background:#1c2129;border-bottom:1px solid var(-
 .scanwrap{display:inline-flex;align-items:center;gap:9px;margin-left:10px;
           vertical-align:middle}
 .scanpct{font-variant-numeric:tabular-nums;font-weight:600;min-width:34px}
-.scansteps{display:inline-flex;gap:3px;font-size:10px;letter-spacing:1px}
-.scanstep{line-height:1}
+.scansteps{display:inline-flex;gap:5px;align-items:center}
+.scanstep{line-height:1;display:inline-flex;align-items:center}
+
+/* THE STEP MARKERS, DRAWN RATHER THAN TYPED.
+   These were three Unicode glyphs - filled, ringed and hollow circles - and
+   they had been sitting in the source as mojibake since a PowerShell edit
+   re-encoded the file: what reached the screen was "a—" where a sphere
+   should be. Shapes made of CSS cannot be corrupted by an encoding, so the
+   same bug cannot come back, and unlike a glyph they can move: the running
+   step breathes, so the strip shows at a glance that work is happening
+   rather than only what has happened. */
+.sdot{width:9px;height:9px;border-radius:50%;display:inline-block;
+      box-sizing:border-box;background:transparent;
+      border:2px solid currentColor;transition:all .25s ease}
+.sdot-done{background:currentColor;border-color:currentColor}
+.sdot-todo{opacity:.42}
+.sdot-now{border-color:currentColor;background:transparent;
+          animation:sdotpulse 1.25s ease-in-out infinite}
+@keyframes sdotpulse{
+  0%,100%{box-shadow:0 0 0 0 rgba(88,166,255,.55);transform:scale(1)}
+  50%    {box-shadow:0 0 0 4px rgba(88,166,255,0);transform:scale(1.22)}
+}
+/* The named list uses the same marker, sized to sit on the text baseline. */
+.scanmark .sdot{width:8px;height:8px;vertical-align:middle}
+/* The row that is running gets its label lifted out of the dim wash. */
+.scanrow{display:inline-flex;align-items:center;gap:5px}
+
+/* A BAR THAT LOOKS ALIVE WHILE IT IS STOPPED. Several phases report no
+   incremental progress - the Sonarr fetch sits at one percentage for a
+   couple of minutes - and a static bar there reads as a hang. The stripe
+   travels whenever a scan is running, so "waiting on something" and
+   "frozen" stop looking identical. */
+@keyframes scanflow{from{background-position:0 0}to{background-position:34px 0}}
+.scanbar-live{background-image:linear-gradient(115deg,
+   rgba(255,255,255,.16) 25%, transparent 25%, transparent 50%,
+   rgba(255,255,255,.16) 50%, rgba(255,255,255,.16) 75%,
+   transparent 75%, transparent);
+  background-size:34px 34px;animation:scanflow .85s linear infinite}
+/* Phase name changes are a step forward, so they arrive rather than cut. */
+@keyframes scanfade{from{opacity:0;transform:translateY(-2px)}
+                    to{opacity:1;transform:none}}
+.scanphase-in{animation:scanfade .3s ease}
 
 /* ---- queue panel ---- */
 /* NOT scroll-behavior:smooth. Auto-scroll advances by a few pixels every tick,
@@ -10465,7 +10505,7 @@ async function loadLibs(){
     const t = (p.timings||{})[f.key];
     return `<span class="scanstep" style="color:${col}"
              title="${esc(f.label)}${t?` — took ${t}s`:''}">${
-             state==='done'?'â—':(state==='now'?'â—‰':'â—‹')}</span>`;
+             ''}<i class="sdot sdot-${state}"></i></span>`;
   }).join('');
 
   const pct = Math.max(0, Math.min(100, p.pct||0));
@@ -10490,7 +10530,7 @@ async function loadLibs(){
         const st = ci<0 ? 'todo' : (i<ci?'done':(i===ci?'now':'todo'));
         const t=(p.timings||{})[f.key];
         const col = st==='done'?'var(--ok)':(st==='now'?'var(--acc)':'var(--dim)');
-        const mark = st==='done'?'â—':(st==='now'?'â—‰':'â—‹');
+        const mark = `<i class="sdot sdot-${st}"></i>`;
         return `<span class="scanrow" style="color:${col}">`
               +`<span class="scanmark">${mark}</span>${esc(f.label)}`
               +(t?`<span class="dim scant">${t}s</span>`
@@ -10509,7 +10549,8 @@ async function loadLibs(){
         `<div style="padding:10px 14px;border-bottom:1px solid var(--line)">
            <div style="display:flex;justify-content:space-between;align-items:baseline;
                        gap:12px;flex-wrap:wrap;margin-bottom:6px">
-             <span style="font-size:14px"><b>${esc(phase)}</b>
+             <span style="font-size:14px"><b class="scanphase-in"
+                   key="${esc(p.phase_key||'')}">${esc(phase)}</b>
                <span class="dim">· step ${p.phase_i||0} of ${phases.length||7}</span></span>
              <span style="font-size:13px">
                <b>${pct.toFixed(0)}%</b>
@@ -10524,7 +10565,8 @@ async function loadLibs(){
                ${el!=null?`<span class="dim">· ${hms(el)} elapsed</span>`:''}
              </span>
            </div>
-           <div class="bar big"><i style="width:${pct.toFixed(1)}%"></i></div>
+           <div class="bar big"><i class="scanbar-live"
+                style="width:${pct.toFixed(1)}%;transition:width .45s ease"></i></div>
            ${facts.length?`<div class="scanfacts">${facts.join('<span class="dim"> · </span>')}</div>`:''}
            <div class="scanlist">${list}</div>
          </div>`;
