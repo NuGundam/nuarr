@@ -384,6 +384,26 @@ async def run(target: str = "installed") -> dict:
                                  attempt=0)
         try:
             if target == "latest":
+                # BASELINE FIRST, AUTOMATICALLY. Adoption is a comparison
+                # ("does anything that works today break?"), and a comparison
+                # needs both sides. Asking the user to press a separate
+                # "test installed" button first was a workflow with a
+                # mandatory step disguised as an optional one.
+                try:
+                    have_base = bool((json.loads(
+                        kv_get("enctest.results") or "{}")
+                        .get("installed") or {}).get("tests"))
+                except Exception:
+                    have_base = False
+                off = 0.0                # pct consumed by the baseline pass
+                if not have_base:
+                    exe0 = fu.installed_paths()[0]
+                    _st(version=fu.local_version(exe0), exe=exe0,
+                        phase="first, testing the installed build")
+                    base = await _run_matrix(exe0, 0.0, 20.0)
+                    _save_results("installed", fu.local_version(exe0),
+                                  exe0, base)
+                    off = 20.0
                 info = await fu.check()
                 if info.get("error"):
                     raise RuntimeError(info["error"])
@@ -398,7 +418,7 @@ async def run(target: str = "installed") -> dict:
                     shutil.rmtree(tdir, ignore_errors=True)
                     tdir.mkdir(parents=True, exist_ok=True)
                     zip_path = str(tdir / "download.zip")
-                    await _fetch_zip(zip_path, 2.0, 55.0)
+                    await _fetch_zip(zip_path, off + 2.0, 55.0)
                     _st(phase="unpacking", pct=57.0)
                     await asyncio.to_thread(fu._unpack, zip_path, str(tdir))
                     os.remove(zip_path)
@@ -489,9 +509,12 @@ async def adopt() -> dict:
     bin_dir = os.path.dirname(exe)
     kv_set("ffmpeg.staged_version", ver)
     kv_set("ffmpeg.staged_bin", bin_dir)
-    kv_set("ffmpeg.staged_nvenc_ok", "1" if any(
-        t["encoder"].endswith("_nvenc") and t["status"] == "supported"
-        for t in cand.get("tests", [])) else "0")
+    # The bench just proved something STRONGER than the nvenc-only guard in
+    # apply_staged(): no encoder that works today regresses. Marking this "0"
+    # on a machine where NVENC never worked (CPU-only box) would make the
+    # guard refuse a build the bench had passed - the guard is for builds
+    # that BYPASSED the bench, not ones it approved.
+    kv_set("ffmpeg.staged_nvenc_ok", "1")
     joblog.log(f"ffmpeg {ver} passed the encoder bench and is staged - "
                f"applies when the queue is idle", "ok")
     return {"ok": True, "staged": ver,

@@ -111,12 +111,59 @@ def set_pin(path: str | None) -> dict:
     return {"ok": True, "pinned": d, "version": local_version(ff)}
 
 
+def retire_pin() -> None:
+    """One-time migration: the pin becomes THE install, then stops existing.
+
+    The pin was a workaround for the era when "newest" could be adopted
+    blindly: BIN_DIR held a 9.x build that could not open the GPU encoder on
+    this driver, and the pin was the only thing routing jobs to a build that
+    worked. Now that nothing is adopted without passing the encoder bench,
+    that situation cannot recur - a build that fails is never applied - so
+    the pin is a second pointer with no reason to exist, and a second pointer
+    is a place for the truth to fork.
+
+    So on startup, if a pin exists: the pinned build (the one actually doing
+    the work) is moved into BIN_DIR, whatever unusable build sat there is
+    kept as 'previous', and the pin is cleared. Refuses to run while jobs
+    are in flight and just tries again next boot.
+    """
+    pin = pinned_dir()
+    if not pin or not os.path.isdir(pin):
+        if pin:
+            kv_set("ffmpeg.pinned_dir", "")
+        return
+    try:
+        from . import jobs
+        if jobs.RUNNING:
+            return                       # not while a job holds the binary
+        ff = os.path.join(pin, "ffmpeg.exe")
+        if not os.path.exists(ff) or not local_version(ff):
+            joblog.log(f"pinned ffmpeg at {pin} does not run - pin cleared, "
+                       f"using the installed build", "warn")
+            kv_set("ffmpeg.pinned_dir", "")
+            return
+        ver = local_version(ff)
+        if BIN_DIR.exists():
+            shutil.rmtree(BACKUP_DIR, ignore_errors=True)
+            shutil.move(str(BIN_DIR), str(BACKUP_DIR))
+        BIN_DIR.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(pin, str(BIN_DIR))
+        kv_set("ffmpeg.pinned_dir", "")
+        kv_set("ffmpeg.installed_version", ver)
+        joblog.log(f"ffmpeg {ver} (previously pinned) is now the installed "
+                   f"build - the pin is retired; updates must pass the "
+                   f"encoder tests before they can replace it", "ok")
+    except Exception as e:                                    # noqa: BLE001
+        joblog.log(f"pin migration failed (will retry next start): "
+                   f"{type(e).__name__}: {e}", "warn")
+
+
 def installed_paths() -> tuple[str, str]:
     """The ffmpeg/ffprobe nuarr should use.
 
     Order: an explicit pin, then our own downloaded build, then the configured
-    fallback. The pin comes first deliberately - it is the answer to "the newest
-    build does not work on this box".
+    fallback. (The pin is legacy - retire_pin() migrates it into BIN_DIR at
+    startup - but honouring one mid-migration costs nothing and fails safe.)
     """
     pin = pinned_dir()
     if pin:
@@ -777,6 +824,7 @@ def upgrade_safety(latest: str) -> dict:
 
 def nvenc_startup_check() -> None:
     """Run the probe once at startup and say so, loudly if it failed."""
+    retire_pin()                # before the probe, so it tests the real build
     res = nvenc_check(force=True)
     if res["ok"]:
         joblog.log(f"NVENC ready — hevc_nvenc opens on {os.path.basename(res['exe'])}"

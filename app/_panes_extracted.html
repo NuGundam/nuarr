@@ -99,35 +99,45 @@
         </div>
         <div style="padding:0 14px 10px">
           <span id="ffState" class="dim"></span>
+          <!-- Three buttons, one pipeline: check finds a new build, download
+               fetches it AND runs every encoder through it automatically, and
+               Apply is allowed only when those tests pass. Repair/Rollback
+               are gone from here - with nothing adoptable that has not passed
+               the tests, the situations they existed for cannot arise from
+               this page. -->
           <div style="margin-top:6px">
             <button onclick="ffCheck()">Check for update</button>
+            <button onclick="ffDlTest()" title="Downloads the newest build and tests every encoder with it before anything can be applied">Download &amp; test</button>
+            <!-- Disabled until a downloaded build has PASSED the encoder
+                 tests. A button that is pressable but refuses teaches people
+                 the page lies; grey says the truth before the click. -->
+            <button id="ffApplyBtn" onclick="ffApply()" disabled
+                    title="Run Download &amp; test first — Apply unlocks when the new build passes">Apply now</button>
             <button onclick="ffLog()">Changelog</button>
-            <button onclick="ffStage()">Download &amp; verify</button>
-            <button onclick="ffApply()">Apply now</button>
-            <button onclick="ffRepair()" title="Re-download the current release and overwrite the install">Repair</button>
-            <button onclick="ffRollback()" title="Restore the previous build">Rollback</button>
           </div>
           <!-- Three separate slots. These used to share one element, so the
                version/path line and the download status overwrote each other
                every poll - which read as flashing. -->
           <div id="ffBar" class="bar" style="display:none;margin-top:6px"><i></i></div>
           <div id="ffMsg" class="dim" style="margin-top:6px;font-size:11px"></div>
-          <div id="ffPath" class="mono dim" style="margin-top:4px;font-size:11px"></div>
-    <!-- Does the GPU encoder actually open, and is the next release safe to
-         take on THIS driver. Both were previously unanswerable without
-         installing an update and waiting for a job to fail. -->
-    <div id="ffNvenc" style="margin-top:8px"></div>
-    <!-- Installed driver vs what NVIDIA is publishing. upgrade_safety() could
-         say "9.x needs 610 and you have 596", but not whether a 610 driver
-         exists yet - the difference between "go update" and "nothing to update
-         to". -->
-    <div id="ffDriver" style="margin-top:10px"></div>
-          <!-- Who actually launches ffmpeg, and does it get the right one.
-               An install can succeed and still be ignored by every job. -->
-          <div id="ffUsers" style="margin-top:10px"></div>
+          <!-- The changelog opens HERE, under the button that opens it. It
+               used to render at the bottom of the pane, below two tables -
+               pressing the button appeared to do nothing at all. -->
           <pre id="ffChangelog" class="mono" style="display:none;max-height:220px;
                overflow:auto;font-size:11px;background:#0b0e12;padding:8px;
                border-radius:4px;margin-top:6px;white-space:pre-wrap"></pre>
+          <div id="ffPath" class="mono dim" style="margin-top:4px;font-size:11px"></div>
+    <!-- Does the GPU encoder actually open. -->
+    <div id="ffNvenc" style="margin-top:8px"></div>
+    <!-- Basic driver facts only: installed vs newest published. -->
+    <div id="ffDriver" style="margin-top:10px"></div>
+    <!-- Encoder support, measured: the at-a-glance family line, the test
+         progress when a run is live, and the plain-terms verdict on the
+         newest build. -->
+    <div id="enctestBody"></div>
+          <!-- Who actually launches ffmpeg, and does it get the right one.
+               An install can succeed and still be ignored by every job. -->
+          <div id="ffUsers" style="margin-top:10px"></div>
         </div>
       </div>
       <div id="logsPane" style="display:none">
@@ -220,19 +230,6 @@
           stream. So the settings here are tested before they are saved.
         </div>
         <div id="plexBody" style="padding:0 14px 14px">
-          <div class="dim" style="padding:14px">loading&hellip;</div>
-        </div>
-      </div>
-      <div id="enctestPane" style="display:none">
-        <div class="dim" style="padding:9px 14px;font-size:11px">
-          Which encoders <b>actually work on this machine</b>, measured by
-          encoding two seconds of test video through every one of them &mdash;
-          no driver version numbers, no predictions. Test the newest published
-          ffmpeg here <b>before</b> adopting it: the download resumes itself
-          across network drops, every encoder is tried against the new binary,
-          and adopting is refused if anything that works today would break.
-        </div>
-        <div id="enctestBody" style="padding:0 14px 14px">
           <div class="dim" style="padding:14px">loading&hellip;</div>
         </div>
       </div>

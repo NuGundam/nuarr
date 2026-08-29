@@ -424,6 +424,21 @@ robocopy "{src}" "{root}" /E /XF config.yml /NFL /NDL /NJH /NJS /NP /R:2 /W:2
 if ($LASTEXITCODE -ge 8) {{
   Write-Output "robocopy failed with $LASTEXITCODE - old install left in place"
 }} else {{
+  # HOUSECLEANING, and why it runs only after a good copy: robocopy /E adds
+  # and overwrites but never deletes, so a module removed upstream stayed on
+  # disk forever - still importable, still greppable, quietly diverging from
+  # the release it claimed to be. The staged tree is the complete list of
+  # what this version contains, so any module not in it is an orphan.
+  # Stale __pycache__ goes too; bytecode for deleted modules is just litter.
+  $want = Get-ChildItem "{src}\\app" -Filter *.py -Name -ErrorAction SilentlyContinue
+  Get-ChildItem "{root}\\app" -Filter *.py -Name -ErrorAction SilentlyContinue |
+    Where-Object {{ $_ -notin $want }} |
+    ForEach-Object {{
+      Write-Output "removing orphaned module app\\$_"
+      Remove-Item "{root}\\app\\$_" -Force -ErrorAction SilentlyContinue
+    }}
+  Get-ChildItem "{root}" -Recurse -Directory -Filter __pycache__ -ErrorAction SilentlyContinue |
+    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
   Remove-Item "{base / 'staged'}" -Recurse -Force -ErrorAction SilentlyContinue
 }}
 {relaunch}

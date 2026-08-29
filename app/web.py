@@ -12915,28 +12915,18 @@ async function ffNvenc(){
       : anyGpuPresent
         ? `<span class="pill p-bad">GPU encode UNAVAILABLE</span>`
         : `<span class="pill p-warn">CPU mode only</span>`;
-  // Per-vendor line, so the answer is about THIS machine rather than about
-  // one vendor's absence.
-  const hwLine = !hw.length ? '' :
-    `<div class="dim" style="margin-top:4px;font-size:11px">`
-    + hw.map(k=>`${esc(fam[k].label)}: ${fam[k].ok
-        ? '<span style="color:#7fd4a3">works</span>'
-        : '<span class="dim">not available</span>'}`).join(' &nbsp;·&nbsp; ')
-    + ` &nbsp;·&nbsp; CPU (x264/x265): <span style="color:#7fd4a3">always</span></div>`;
+  // The per-vendor "works / not available" strip is GONE, deliberately. It
+  // was fed by the hour-cached family probe, so it could sit there saying
+  // "NVIDIA NVENC: not available" directly under a fresh "GPU encode OK"
+  // pill - two answers to one question, the stale one in charge. The encoder
+  // bench below answers per-encoder from a real run on this page; one source
+  // of truth, no strip to disagree with it.
   const drv = d.driver ? `<span class="dim">NVIDIA driver ${esc(d.driver)}</span>` : '';
-  let advice='';
-  if(u.known && d.update_available){
-    advice = u.safe
-      ? `<span class="pill p-ok">${esc(u.latest)} is safe to install</span>`
-      : `<span class="pill p-bad">do NOT install ${esc(u.latest)}</span>`
-        +` <span class="dim">${esc(u.why||'')}</span>`;
-  }else if(u.known && !d.update_available){
-    advice=`<span class="dim">on the newest build</span>`;
-  }
-  const pinned = d.pinned
-    ? `<div class="dim" style="margin-top:4px;font-size:11px">pinned to `
-      +`<span class="mono">${esc(d.pinned)}</span> — the updater still checks, `
-      +`jobs use this. <button onclick="ffUnpin()">Unpin</button></div>` : '';
+  // No upgrade-advice pill here any more: whether a new build is usable is
+  // MEASURED by the encoder tests and the verdict is written, in plain terms,
+  // in the section below. The pin display is gone with the pin itself -
+  // retire_pin() migrated it into the install at startup.
+  const pinned = '';
   // When it fails, lead with the CLASSIFIED reason and what to do about it;
   // keep the raw ffmpeg text underneath so an unrecognised cause still shows
   // everything we know rather than being swallowed by a friendly summary.
@@ -12958,7 +12948,7 @@ async function ffNvenc(){
        That is slower per file and produces smaller files at the same quality
        — nothing is broken, and nuarr plans exactly the same way.</div>`;
   el.innerHTML = `<div style="display:flex;gap:9px;align-items:center;flex-wrap:wrap">`
-    + test + drv + advice + `</div>` + hwLine + why + cpuNote + pinned;
+    + test + drv + `</div>` + why + cpuNote + pinned;
   // Let the header bubble reflect it too. The upgrade verdict exists ONLY on
   // this endpoint - /api/ffmpeg/check knows a newer build is out but not
   // whether this driver could run it - which is why ffCheck() on its own could
@@ -13006,81 +12996,34 @@ async function ffDriver(force){
   catch(_){ el.innerHTML='<div class="dim" style="font-size:11px">'
                         +'driver check unavailable</div>'; return; }
   const L=d.latest||{};
-  const A=d.nvenc_api||{};
-  // Consecutive generations with IDENTICAL requirements are one fact, not
-  // two. Listing "8.x needs 13.1 / 9.x needs 13.1" as separate rows padded
-  // the table with a repetition and made two unmet requirements look like
-  // more distinct problems than there are.
-  const groups=[];
-  (d.generations||[]).forEach(g=>{
-    const key=g.nvenc+'|'+g.needs;
-    const last=groups[groups.length-1];
-    if(last && last.key===key) last.gens.push(g);
-    else groups.push({key,gens:[g],nvenc:g.nvenc,needs:g.needs,
-                      works_now:g.works_now,measured:g.measured,
-                      works_after_update:g.works_after_update});
-  });
-  const rows=groups.map(G=>{
-    const names = G.gens.length>1
-      ? `${G.gens[0].ffmpeg}–${G.gens[G.gens.length-1].ffmpeg}`
-      : G.gens[0].ffmpeg;
-    // "no driver available yet" read as "your card is unsupported". It is not
-    // about the card: when the required branch has not been published at all,
-    // no GPU anywhere can run that build. Say which branch is missing, and do
-    // not colour it as an error - nothing is broken.
-    const now = G.works_now
-      ? '<span class="ok">works now</span>'
-      : (G.works_after_update
-          ? '<span class="warn">needs a driver update</span>'
-          : `<span class="dim">R${Math.floor(G.needs)} not released yet</span>`);
-    // The requirement is the API version; the driver number is how you get it.
-    return `<tr><td class="mono" style="padding-right:14px">ffmpeg ${esc(names)}</td>
-      <td style="padding-right:14px">needs <b>NVENC ${esc(G.nvenc)}</b></td>
-      <td class="dim" style="padding-right:14px;white-space:nowrap">driver ${G.needs.toFixed(2)}+</td>
-      <td style="white-space:nowrap">${now}${G.works_now&&!G.measured
-            ?' <span class="dim" title="inferred from the driver version">?</span>':''}</td></tr>`;
-  }).join('');
-  // Provenance matters here: the lookup is pinned to this card AND this
-  // Windows edition (the osID it matched is reported back), so the panel can
-  // name the package rather than hedging about which branch it came from.
+  // BASIC FACTS ONLY: installed driver, newest published, and whether they
+  // differ. The NVENC API chips and the ffmpeg-generation requirements table
+  // that used to live here are gone - "which ffmpeg works" is now answered
+  // by the encoder tests below, measured on the real binaries, and stating
+  // it twice in different vocabularies was the confusion, not the help.
   const num = v => { const p=String(v||'').split('.');
                      return p.length>1 ? parseFloat(p[0]+'.'+p[1]) : 0; };
   const behind = (L.ok && !L.stale && num(L.version) > num(d.installed));
   const prov = (L.ok && !L.stale)
     ? `<span class="dim">newest published: </span><b>${esc(L.version)}</b>
        ${behind?'<span class="warn">update available</span>':'<span class="ok">up to date</span>'}
-       <span class="dim">— ${esc(L.branch||L.name)}${L.released?', '+esc(L.released):''}</span>`
+       ${L.released?`<span class="dim">— ${esc(L.released)}</span>`:''}`
     : `<a href="${esc(L.url||'https://www.nvidia.com/en-us/drivers/')}"
           target="_blank" rel="noreferrer">check NVIDIA for your card →</a>`;
   el.innerHTML=`
     <div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;font-size:11px">
-      <span><span class="dim">installed driver: </span><b>${esc(d.installed||'?')}</b></span>
-      ${A.ok?`<span><span class="dim">provides </span><b>NVENC ${esc(A.version)}</b></span>`
-            :`<span class="dim" title="${esc(A.error||'')}">NVENC API unreadable</span>`}
+      <span><span class="dim">NVIDIA driver: </span><b>${esc(d.installed||'?')}</b></span>
       <span>${prov}</span>
       <button style="font-size:10px;padding:1px 7px" onclick="ffDriver(true)">Re-check</button>
     </div>
-    ${A.ok?`<div class="dim" style="margin-top:3px;font-size:10px">
-       NVENC ${esc(A.version)} is what the driver reports to ffmpeg — the
-       version number above only matters because of what API it ships.</div>`:''}
     ${(L.ok && !L.stale && L.name) ? `<div class="dim" style="margin-top:3px;font-size:10px">
-       ${esc(L.name)}${L.edition?' &middot; matched for '+esc(L.edition):''}</div>`:''}
-    <table style="margin-top:6px;font-size:11px;width:auto">${rows}</table>
-    <div style="margin-top:5px;font-size:11px" class="${
-        (d.would_unlock||[]).length?'warn':'dim'}">${esc(d.verdict||'')}</div>
-    ${L.stale ? `<div class="dim" style="margin-top:4px;font-size:10px">
-       ${esc(L.error||'')}. The installed version and the requirement above are
-       read locally and are accurate; only the "newest available" figure is
-       unavailable automatically.</div>`:''}`;
+       ${esc(L.name)}${L.edition?' &middot; matched for '+esc(L.edition):''}</div>`:''}`;
 }
 
-async function ffUnpin(){
-  if(!confirm('Unpin ffmpeg?\n\nJobs will use nuarr\'s own downloaded build '
-    +'again. If that build needs a newer NVIDIA driver than this machine has, '
-    +'every re-encode will fail.')) return;
-  await fetch('/api/ffmpeg/pin',{method:'POST'});
-  ffCheck();
-}
+// ffUnpin / ffRepair / ffRollback are gone with their buttons. The pin was
+// migrated into the install by retire_pin(); repair and rollback existed for
+// bad builds reaching the install, which the Apply gate now prevents. The
+// API endpoints remain for emergencies (curl-able), just not as furniture.
 async function ffCheck(){
   if(_ffChecking) return;
   _ffChecking=true;
@@ -13149,16 +13092,20 @@ async function ffLog(){
     p.textContent=`ffmpeg ${d.version}\n\n${d.changelog}`;
   }catch(e){ p.textContent='changelog unavailable'; }
 }
-async function ffStage(){
-  if(!confirm('Download ~160 MB from gyan.dev and verify its SHA-256?\n\n'
-    +'Nothing is swapped now — running jobs are untouched. The new build is '
-    +'applied automatically once the queue is idle.')) return;
+async function ffDlTest(){
+  // ONE pipeline: download the newest build, verify its SHA-256, then run
+  // every encoder through it - automatically, as a single action. There is
+  // no separate "test" button because a download whose tests have not run
+  // is not a state this page allows you to act on.
+  if(!confirm('Download the newest ffmpeg (~160 MB) and test every encoder '
+    +'with it?\n\nNothing is installed by this - running jobs are untouched. '
+    +'Apply is only allowed if the tests pass.')) return;
   try{
-    const d=await (await fetch('/api/ffmpeg/stage?confirm=true',{method:'POST'})).json();
-    if(!d.ok){ ffSay(ffResult(d, ()=>'', 'download failed')); return; }
-    ffSay('starting…');
-    ffPoll(true);
-  }catch(e){ ffSay(`<span class="err">download failed: ${esc(e.message||e)}</span>`); }
+    const d=await (await fetch('/api/enctest/run?target=latest',{method:'POST'})).json();
+    if(!d.ok && d.error){ ffSay(`<span class="warn">${esc(d.error)}</span>`); return; }
+    ffSay('downloading and testing — progress below');
+  }catch(e){ ffSay(`<span class="err">could not start: ${esc(e.message||e)}</span>`); }
+  loadEnctest();
 }
 // Poll only while something is happening. A 160 MB download plus a checksum of
 // the same 160 MB is a minute of apparent silence otherwise, and silence reads
@@ -13248,40 +13195,26 @@ async function ffUsers(){
        fallback if nuarr has no build: <span class="mono">${esc(d.fallback_ffmpeg||'')}</span>
      </div>`;
 }
-async function ffRepair(){
-  // Lead with what is actually wrong. If the install is fine this is a
-  // 160 MB download for nothing, and the dialog should say so.
-  let h={};
-  try{ h=await (await fetch('/api/ffmpeg/verify')).json(); }catch(_){}
-  const state = h.healthy
-    ? `The current install looks HEALTHY (${h.ffmpeg_version||'?'}).`
-    : `Problem detected: ${h.problem||'unknown'}.`;
-  if(!confirm(`Repair ffmpeg?\n\n${state}\n\n`
-    +'This re-downloads ~160 MB of the current release, verifies its SHA-256 '
-    +'and overwrites the installed build. The swap still waits for the queue '
-    +'to be idle.')) return;
-  try{
-    const d=await (await fetch('/api/ffmpeg/repair?confirm=true',{method:'POST'})).json();
-    if(!d.ok){ ffSay(ffResult(d, ()=>'', 'repair failed')); return; }
-    ffSay('starting repair…');
-    ffPoll(true);
-  }catch(e){ ffSay(`<span class="err">repair failed: ${esc(e.message||e)}</span>`); }
-}
-async function ffRollback(){
-  if(!confirm('Restore the previous ffmpeg build?\n\n'
-    +'Use this if a new version misbehaves. The current build is kept as '
-    +'"broken" so nothing is lost.')) return;
-  try{
-    const d=await (await fetch('/api/ffmpeg/rollback',{method:'POST'})).json();
-    ffSay(ffResult(d,
-      x=>`<span class="pill p-warn">rolled back to ${esc(x.version)}</span>`,
-      'rollback failed'));
-  }catch(e){ ffSay(`<span class="err">rollback failed: ${esc(e.message||e)}</span>`); }
-  ffCheck();
-}
 function ffSay(html){                    // single writer for #ffMsg
   const m=document.getElementById('ffMsg');
   if(html!==_ffLastHtml){ m.innerHTML=html; _ffLastHtml=html; }
+}
+// A TRANSIENT refusal, not a new state. "Apply is blocked" is worth five
+// seconds of attention, then the line the panel was showing comes back -
+// leaving the refusal up forever made it read like the page was stuck on an
+// error, and the durable explanation already lives in the verdict below.
+let _ffFadeT=null;
+function ffSayFade(html, ms){
+  const m=document.getElementById('ffMsg');
+  if(!m) return;
+  const prev=_ffLastHtml||'';
+  if(_ffFadeT){ clearTimeout(_ffFadeT); _ffFadeT=null; }
+  m.style.transition='opacity .6s'; m.style.opacity='1';
+  ffSay(html);
+  _ffFadeT=setTimeout(()=>{
+    m.style.opacity='0';
+    setTimeout(()=>{ ffSay(prev); m.style.opacity='1'; }, 650);
+  }, ms||5000);
 }
 // NOT EVERY ok:false IS A FAILURE.
 // "nothing staged", "already installed", "no previous build", "jobs are
@@ -13294,7 +13227,16 @@ function ffResult(d, okHtml, fallback){
   return `<span class="err">${esc((d&&d.error)||fallback)}</span>`;
 }
 async function ffApply(){
+  // THE GATE LIVES HERE. Apply first asks the bench to adopt the tested
+  // build; adopt refuses when the tests failed (or were never run), and
+  // that refusal - with its reason - is the whole answer. Only a build
+  // that passed reaches the actual swap.
   try{
+    const a=await (await fetch('/api/enctest/adopt',{method:'POST'})).json();
+    if(!a.ok){
+      ffSayFade(`<span class="warn">${esc(a.error||'blocked')}</span>`);
+      return;
+    }
     const d=await (await fetch('/api/ffmpeg/apply',{method:'POST'})).json();
     if(d.waiting) ffSay(`<span class="dim">${d.running_jobs} job(s) running — `
                         +`${esc(d.message)}</span>`);
@@ -16627,7 +16569,7 @@ function wtab(which){
                    alang:'alangPane', cache:'cachePane',
                    whisper:'whisperPane', plex:'plexPane',
                    ocr:'ocrPane', plexwork:'plexworkPane', ruleschk:'ruleschkPane',
-                   updates:'updPane', enctest:'enctestPane'};
+                   updates:'updPane'};
   const isPane = Object.prototype.hasOwnProperty.call(PANE_OF, which);
   const set = document.getElementById('wSettings');
   if(set) set.style.display = isPane ? 'none' : '';
@@ -16706,11 +16648,6 @@ function wtab(which){
     loadWhisper();
     return;
   }
-  if(which==='enctest'){
-    if(hint) hint.textContent='· encoder tests';
-    loadEnctest();
-    return;
-  }
   if(which==='plex'){
     if(hint) hint.textContent='· plex';
     loadPlexCfg();
@@ -16745,6 +16682,7 @@ function wtab(which){
   if(isFf){
     if(hint) hint.textContent='· ffmpeg';
     ffCheck(); ffUsers();            // refresh on open, not on a timer
+    loadEnctest();                   // the encoder bench lives on this page
     return;
   }
   if(isBk){
@@ -18668,31 +18606,21 @@ async function loadEnctest(){
   let d;
   try{ d=await (await fetch('/api/enctest')).json(); }
   catch(e){ el.innerHTML='<div class="dim" style="padding:14px">could not load</div>'; return; }
+  // FIRST VISIT, NO MEASUREMENTS: start the installed-build test on our own
+  // rather than showing an empty section with instructions. It runs once
+  // (~40s), the results persist, and the family line appears for good.
+  if(!d.active && !(d.results&&d.results.installed) && !window._etAutoRan){
+    window._etAutoRan=true;
+    try{ await fetch('/api/enctest/run?target=installed',{method:'POST'}); }catch(e){}
+    d.active=true; d.phase='testing the installed build'; d.pct=0;
+  }
   etPaint(el,d);
   if(_etTimer){ clearTimeout(_etTimer); _etTimer=null; }
   if(d.active) _etTimer=setTimeout(loadEnctest,700);
 }
 
-let _etMsg='';                       // one inline message slot, like ffSay
-
-async function etRun(target){
-  _etMsg='';
-  try{
-    const r=await (await fetch('/api/enctest/run?target='+target,{method:'POST'})).json();
-    if(!r.ok && r.error) _etMsg='<span class="warn">'+esc(r.error)+'</span>';
-  }catch(e){ _etMsg='<span class="warn">could not start the test</span>'; }
-  loadEnctest();
-}
-
-async function etAdopt(){
-  let r;
-  try{ r=await (await fetch('/api/enctest/adopt',{method:'POST'})).json(); }
-  catch(e){ _etMsg='<span class="warn">adopt failed</span>'; loadEnctest(); return; }
-  _etMsg = r.ok
-    ? '<span style="color:#7fd4a3">staged '+esc(r.staged||'')+' — applies automatically when the queue is idle</span>'
-    : '<span class="warn">'+esc(r.error||'refused')+'</span>';
-  loadEnctest();
-}
+// No buttons of its own: Download & test and Apply live in the main button
+// row above, because they ARE the update pipeline, not a separate tool.
 
 function etBar(pct,phase){
   // One bar for the whole journey - download, verify, unpack, twelve encoder
@@ -18757,17 +18685,106 @@ function etTable(res,title){
   </div>`;
 }
 
+function etFamLine(res){
+  // THE AT-A-GLANCE LINE: one entry per encoder family, green or red, from
+  // MEASURED results. This is the honest replacement for the old strip that
+  // could contradict the pill - same look, but fed by a real encode of each
+  // family on this page, so it cannot say "not available" about an encoder
+  // that just worked.
+  if(!res || !(res.tests||[]).length) return '';
+  const fams=[];
+  for(const t of res.tests){
+    let f=fams.find(x=>x.label===t.family_label);
+    if(!f){ f={label:t.family_label, ok:0, n:0}; fams.push(f); }
+    f.n++; if(t.status==='supported') f.ok++;
+  }
+  return `<div style="margin-top:8px;font-size:12px;display:flex;gap:14px;flex-wrap:wrap">`
+    + fams.map(f=>{
+        const good=f.ok>0;
+        return `<span><b>${esc(f.label)}</b>: <span style="color:${
+          good?'#7fd4a3':'#e0575b'};font-weight:600">${
+          good?'supported':'not supported'}</span>${
+          (good&&f.ok<f.n)?`<span class="dim" style="font-size:11px"> (${f.ok} of ${f.n} codecs)</span>`:''
+        }</span>`;
+      }).join('')
+    + `</div>`;
+}
+
+function etVer(v){
+  // "9.0.1-essentials_build-www.gyan.dev" earns its length nowhere in a
+  // sentence. First dash and everything after it goes.
+  return String(v||'').split('-')[0];
+}
+
+function etWhyNot(R){
+  // THE DYNAMIC VERDICT, in one plain sentence. Built from the measured diff
+  // between the installed build and the newest one - not from a version
+  // table - so when a future release fails for a brand-new reason, this line
+  // simply says that reason. Grouped by cause and phrased for a person: the
+  // raw ffmpeg lines ("[vost#0:0 @ 0000...] Unknown encoder") belong in the
+  // per-encoder details, not in the summary.
+  if(!R.installed || !R.latest) return '';
+  const iok=new Set(R.installed.tests.filter(t=>t.status==='supported').map(t=>t.encoder));
+  const lost=R.latest.tests.filter(t=>iok.has(t.encoder)&&t.status!=='supported');
+  const v=etVer(R.latest.version), cur=etVer(R.installed.version);
+  if(!lost.length)
+    return `<div style="color:#7fd4a3;font-size:12px;margin-top:8px">
+      ffmpeg ${esc(v)} passed every test — press Apply now to install it.</div>`;
+  // One phrase per CAUSE (t.why is already the plain-words verdict from the
+  // cause table), naming the family when a whole family failed together and
+  // the encoders only when it did not.
+  const byWhy={};
+  for(const t of lost){
+    const k=t.why||'fails';
+    (byWhy[k]=byWhy[k]||[]).push(t);
+  }
+  const PHRASE={
+    'driver too old for this build':'needs a newer NVIDIA driver for GPU encoding',
+    'not in this build':'is missing from that build',
+    'timed out':'timed out during the test',
+  };
+  const parts=Object.entries(byWhy).map(([why,ts])=>{
+    const fams=[...new Set(ts.map(t=>t.family_label))];
+    const who = (fams.length===1 && ts.length>1)
+      ? `its ${fams[0]} encoders`
+      : ts.map(t=>t.encoder).join(', ');
+    const what = PHRASE[why] ? (ts.length>1&&fams.length===1
+        ? PHRASE[why].replace('is missing','are missing').replace('needs','need')
+        : PHRASE[why]) : why;
+    return `${who} ${what}`;
+  });
+  return `<div style="font-size:12px;margin-top:8px;color:#e2b341">
+    ffmpeg ${esc(v)} can&rsquo;t be used: ${esc(parts.join(', and '))}.
+    Staying on ${esc(cur)}.</div>`;
+}
+
+function etApplyGate(d){
+  // The Apply button's disabled state IS the verdict, kept in lockstep with
+  // the same data the section renders from. Grey by default; it unlocks only
+  // when a tested newest build lost nothing - the exact condition the server
+  // enforces in adopt(), so the button can never promise what the server
+  // would refuse.
+  const b=document.getElementById('ffApplyBtn');
+  if(!b) return;
+  const R=d.results||{};
+  let ok=false,
+      why='Run Download & test first — Apply unlocks when the new build passes';
+  if(d.active){ why='tests are running…'; }
+  else if(R.installed && R.latest){
+    const iok=new Set(R.installed.tests.filter(t=>t.status==='supported').map(t=>t.encoder));
+    const lost=R.latest.tests.filter(t=>iok.has(t.encoder)&&t.status!=='supported');
+    if(!lost.length){ ok=true; why='installs ffmpeg '+(R.latest.version||''); }
+    else why='blocked — '+lost.map(t=>t.encoder).join(', ')+' would break (see the verdict below)';
+  }
+  b.disabled=!ok;
+  b.title=why;
+  b.style.opacity = ok?'':'0.45';
+}
+
 function etPaint(el,d){
+  etApplyGate(d);
   const R=d.results||{};
   let h='';
-  // buttons - disabled while a run is active so the state machine stays simple
-  const dis = d.active?'disabled':'';
-  h+=`<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
-    <button ${dis} onclick="etRun('installed')">Test installed build</button>
-    <button ${dis} onclick="etRun('latest')">Download &amp; test latest</button>
-    ${R.latest?`<button ${dis} onclick="etAdopt()">Adopt tested build</button>`:''}
-  </div>`;
-  if(_etMsg) h+=`<div style="font-size:12px;margin-top:8px">${_etMsg}</div>`;
   if(d.active || d.phase==='failed'){
     h+=etBar(d.pct,d.phase);
     const dl=d.download||{};
@@ -18782,23 +18799,22 @@ function etPaint(el,d){
     // live view of the matrix as it fills in
     if((d.tests||[]).length){
       h+=etTable({version:d.version,tests:d.tests,at:0},
-                 d.target==='latest'?'Testing the latest build':'Testing the installed build');
+                 d.target==='latest'?'Testing the newest build':'Testing the installed build');
     }
   }
   if(!d.active){
-    h+=etTable(R.installed,'Installed build');
-    h+=etTable(R.latest,'Latest build');
-    if(R.installed && R.latest){
-      const iok=new Set(R.installed.tests.filter(t=>t.status==='supported').map(t=>t.encoder));
-      const lost=R.latest.tests.filter(t=>iok.has(t.encoder)&&t.status!=='supported');
-      h+= lost.length
-        ? `<div style="color:#e2b341;font-size:12px;margin-top:8px">⚠ adopting the latest build would lose: `
-          +lost.map(t=>`<b class="mono">${esc(t.encoder)}</b> (${esc(t.why||'fails')})`).join(', ')
-          +` — the Adopt button will refuse it</div>`
-        : `<div style="color:#7fd4a3;font-size:12px;margin-top:8px">everything that works today also works on the latest build — safe to adopt</div>`;
+    h+=etFamLine(R.installed);
+    h+=etWhyNot(R);
+    // Full per-encoder evidence, folded by default: the family line and the
+    // verdict are the summary; the tables are for when you want the receipts.
+    if(R.installed||R.latest){
+      h+=`<details style="margin-top:8px"><summary class="dim" style="cursor:pointer;font-size:11px">per-encoder details</summary>`
+        + etTable(R.installed,'Installed build')
+        + etTable(R.latest,'Newest build')
+        + `</details>`;
+    } else {
+      h+='<div class="dim" style="padding:8px 0;font-size:11px">encoder support has not been measured yet — press Download &amp; test</div>';
     }
-    if(!R.installed && !R.latest)
-      h+='<div class="dim" style="padding:10px 0">no results yet — run a test above</div>';
   }
   el.innerHTML=h;
 }
@@ -21365,8 +21381,8 @@ autoBusy([
   'rescan','loadAll','loadRenames','loadOlder',
   // queue + job actions
   'cancelJob','cancelAll','qMove','retryRenames','retryCommits',
-  // ffmpeg tab - ffStage downloads ~160 MB, ffRollback rewrites the install
-  'ffCheck','ffStage','ffApply','ffRollback','ffRepair','ffUnpin','ffLog',
+  // ffmpeg tab - ffDlTest downloads ~160 MB and runs the encoder bench
+  'ffCheck','ffDlTest','ffApply','ffLog',
   // settings / control
   'registerHooks','resetWorkers','bump','ctl','ctlCancel',
   // drill-downs and log views
@@ -21420,7 +21436,6 @@ _SETTINGS_NAV = [
                     ("ruleschk", "Rule check",     "list"),
                     ("plexwork", "Plex playback",  "play")]),
     ("Tools",      [("ffmpeg",  "ffmpeg",          "film"),
-                    ("enctest", "Encoder tests",   "film"),
                     ("mkv",     "MKVToolNix",      "tool"),
                     ("whisper", "Whisper",         "language"),
                     ("ocr",     "OCR engines",     "language")]),
