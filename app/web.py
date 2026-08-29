@@ -5772,6 +5772,99 @@ async def api_ffmpeg_repair(confirm: bool = False, background: bool = True):
 # Measured verdicts only: no driver-branch numbers anywhere on this surface.
 # See enctest.py's module docstring for the rule it enforces.
 
+_ACT_COUNT: dict = {}          # {search term: (when, group count)}
+
+
+@app.get("/api/activity")
+def api_activity(q: str = "", page: int = 1, page_size: int = 50):
+    """PAGED ACTIVITY OVER THE WHOLE HISTORY, grouped one row per title.
+
+    The Activity panel reads the live poll, which carries the newest ~60 jobs -
+    fine for "what is happening" and useless for "what happened to this show in
+    June". There are 62,000 finished jobs; slicing a 60-row window client-side
+    was never going to reach them.
+
+    So this pages SERVER-side over jobs + history together, grouped by title
+    and ordered by most recent activity, and returns the page's rows in the
+    exact {ts, job} / {ts, ev} shape the panel already renders - the grouping,
+    pill and drop-down code downstream is untouched.
+
+    It is deliberately NOT what the 2 s poll calls: a GROUP BY across both
+    tables is far too heavy to run every two seconds to answer a question
+    ("has anything new happened") the cheap poll already answers. The panel
+    uses this only once you search or page.
+    """
+    page = max(1, int(page or 1))
+    page_size = max(1, min(int(page_size or 50), 200))
+    off = (page - 1) * page_size
+    like = f"%{(q or '').strip()}%"
+    has_q = bool((q or '').strip())
+
+    # One combined title index across both tables, so a file whose only recent
+    # activity was a rename still appears.
+    base = ("SELECT COALESCE(NULLIF(j.title,''),'-') t, j.finished_at ts "
+            "  FROM jobs j WHERE j.finished_at IS NOT NULL "
+            "UNION ALL "
+            "SELECT COALESCE(NULLIF(h.label,''),'-') t, h.at ts FROM history h")
+    where = "WHERE t LIKE ?" if has_q else ""
+    args: list = [like] if has_q else []
+
+    # COUNTING THE GROUPS IS THE EXPENSIVE HALF and its answer barely moves:
+    # it is "how many distinct titles have ever been touched", which changes
+    # when a new file is processed, not when you turn a page. Cached briefly so
+    # paging and typing do not re-scan both tables for a number that is only
+    # there to size the pager.
+    ck = (q or "").strip().lower()
+    hit = _ACT_COUNT.get(ck)
+    if hit and time.time() - hit[0] < 60:
+        total = hit[1]
+    else:
+        total = _rows(f"SELECT COUNT(*) n FROM (SELECT t FROM ({base}) {where} "
+                      f"GROUP BY t)", tuple(args))[0]["n"]
+        _ACT_COUNT[ck] = (time.time(), total)
+        if len(_ACT_COUNT) > 64:                 # keep the cache from growing
+            for k in list(_ACT_COUNT)[:32]:
+                _ACT_COUNT.pop(k, None)
+    grp = _rows(f"SELECT t, MAX(ts) last FROM ({base}) {where} "
+                f"GROUP BY t ORDER BY last DESC LIMIT ? OFFSET ?",
+                tuple(args + [page_size, off]))
+    titles = [r["t"] for r in grp]
+    items: list[dict] = []
+    if titles:
+        ph = ",".join("?" * len(titles))
+        # PER TITLE, NOT PER PAGE. A flat LIMIT returned 4,000 rows for ten
+        # groups - a handful of much-reprocessed files ate the whole budget and
+        # the rest of the page came back empty. ROW_NUMBER caps each file's
+        # story at the newest 60 entries, so every group on the page gets its
+        # own share and the payload stays proportional to the page size.
+        for r in _rows(
+                f"SELECT * FROM (SELECT job_id, file_id, title, path, kind, "
+                f"       pool, state, size_before, size_after, error, "
+                f"       finished_at, plan_json, result_json, "
+                f"       ROW_NUMBER() OVER (PARTITION BY title "
+                f"           ORDER BY finished_at DESC) rn "
+                f"  FROM jobs WHERE finished_at IS NOT NULL "
+                f"   AND COALESCE(NULLIF(title,''),'-') IN ({ph})) "
+                f" WHERE rn <= 60", tuple(titles)):
+            d = dict(r)
+            d.pop("rn", None)
+            d["file_size"] = d.get("size_after") or d.get("size_before") or 0
+            items.append({"ts": d.get("finished_at") or 0, "job": d})
+        for r in _rows(
+                f"SELECT * FROM (SELECT id, file_id, event, detail, at, label, "
+                f"       ROW_NUMBER() OVER (PARTITION BY label "
+                f"           ORDER BY at DESC) rn FROM history "
+                f" WHERE COALESCE(NULLIF(label,''),'-') IN ({ph})) "
+                f" WHERE rn <= 60", tuple(titles)):
+            d = dict(r)
+            d.pop("rn", None)
+            items.append({"ts": d.get("at") or 0, "ev": d})
+    items.sort(key=lambda x: x["ts"])
+    pages = max(1, (total + page_size - 1) // page_size)
+    return {"items": items, "total": total, "page": min(page, pages),
+            "pages": pages, "page_size": page_size, "q": q}
+
+
 @app.get("/api/attention")
 def api_attention(limit: int = 400):
     """THE ACTUAL FILES behind the Attention tile, not just the counts.
@@ -9525,11 +9618,23 @@ input[type=time]::-webkit-calendar-picker-indicator{filter:invert(.75);cursor:po
     <h2>Activity<span class="live"><span class="dot"></span>live</span>
         <span id="doneCount" class="live"></span>
         <span style="float:right;font-weight:400;display:flex;gap:8px;align-items:center">
+          <!-- Typing here leaves the live feed and pages the WHOLE history
+               server-side; the live poll only ever holds the newest ~60. -->
+          <input id="doneQ" placeholder="search titles" style="width:150px"
+                 oninput="actSearch()">
+          <select id="doneSize" onchange="actSize()" title="rows per page">
+            <option value="10">10</option>
+            <option value="50" selected>50</option>
+            <option value="100">100</option>
+          </select>
           <select id="doneFilter" onchange="applyDoneFilter()">
             <option value="">everything</option>
           </select>
           <button id="doneBoxResume" style="display:none" class="resume"
                   onclick="resumeFollow('doneBox')">↑ back to newest</button></span></h2>
+    <div id="donePager" style="display:none;padding:6px 14px;
+         border-bottom:1px solid var(--line);font-size:11px;
+         gap:8px;align-items:center;flex-wrap:wrap"></div>
     <div id="jobsDone"><div class="skel" style="padding:14px">
       <i style="width:84%"></i><i style="width:76%"></i><i style="width:88%"></i></div></div>
   </div>
@@ -15214,6 +15319,75 @@ setInterval(tickProgress, 120);
 // while a log is expanded. Rebuilding it every 2 seconds tore the open log out
 // of the DOM mid-read and reset its scroll - unreadable.
 let lastJobs=null, lastListSig=null, lastOpenId=null;
+// HISTORY MODE. null = the live feed (newest ~60 from the 2 s poll). Set to a
+// server page once you search or page, because the whole history is 62,000
+// jobs and no client-side slice of a 60-row window can reach it.
+let _actHist=null, _actQ='', _actPage=1, _actSize=50, _actQT=null;
+
+async function actLoad(){
+  const b=document.getElementById('doneBox');
+  if(b) b.style.opacity='0.55';
+  try{
+    _actHist=await (await fetch(`/api/activity?q=${encodeURIComponent(_actQ)}`
+      +`&page=${_actPage}&page_size=${_actSize}`)).json();
+    _actPage=_actHist.page||1;
+  }catch(e){ _actHist=null; }
+  if(b) b.style.opacity='';
+  doneForce=true; lastListSig=null;
+  renderDone(lastJobs);
+}
+
+function actSearch(){
+  const v=(document.getElementById('doneQ')||{}).value||'';
+  _actQ=v; _actPage=1;
+  // Debounced: each keystroke is a group-by across both tables.
+  if(_actQT) clearTimeout(_actQT);
+  _actQT=setTimeout(()=>{
+    if(!_actQ && _actSize===50){ actLive(); return; }   // emptied: back to live
+    actLoad();
+  }, 300);
+}
+
+function actSize(){
+  _actSize=parseInt((document.getElementById('doneSize')||{}).value||'50',10);
+  _actPage=1;
+  if(!_actQ && _actSize===50){ actLive(); return; }
+  actLoad();
+}
+
+function actPage(n){
+  if(!_actHist) return;
+  _actPage=Math.max(1, Math.min(n, _actHist.pages||1));
+  actLoad();
+}
+
+function actLive(){
+  _actHist=null; _actQ=''; _actPage=1;
+  const q=document.getElementById('doneQ'); if(q) q.value='';
+  doneForce=true; lastListSig=null;
+  renderDone(lastJobs);
+}
+
+function actPagerPaint(){
+  const el=document.getElementById('donePager');
+  if(!el) return;
+  if(!_actHist){ el.style.display='none'; return; }
+  el.style.display='flex';
+  const p=_actHist.page||1, n=_actHist.pages||1;
+  // A window of pages around the current one - 3,937 numbered links would be
+  // the whole panel.
+  const near=[];
+  for(let i=Math.max(1,p-2); i<=Math.min(n,p+2); i++) near.push(i);
+  el.innerHTML=
+     `<span class="dim">${fmt(_actHist.total)} titles`
+    +`${_actQ?` matching “${esc(_actQ)}”`:''} · page ${p} of ${fmt(n)}</span>`
+    +`<button ${p<=1?'disabled':''} onclick="actPage(1)">« first</button>`
+    +`<button ${p<=1?'disabled':''} onclick="actPage(${p-1})">‹ prev</button>`
+    + near.map(i=>`<button class="${i===p?'on':''}" onclick="actPage(${i})">${i}</button>`).join('')
+    +`<button ${p>=n?'disabled':''} onclick="actPage(${p+1})">next ›</button>`
+    +`<button ${p>=n?'disabled':''} onclick="actPage(${n})">last »</button>`
+    +`<button onclick="actLive()" title="back to the live feed">↺ live</button>`;
+}
 // Events fetched by loadHistory, newest first. Module state rather than an
 // argument because the two sources refresh on different clocks - jobs on the
 // fast poll, events on their own - and either arrival repaints the one feed.
@@ -15256,7 +15430,12 @@ function renderDone(j){
 
   // Merged oldest -> newest: inside a file's drop-down the entries read as a
   // story, top to bottom.
-  const items=[
+  //
+  // IN HISTORY MODE the rows come from /api/activity instead: the live poll
+  // carries the newest ~60 jobs and cannot answer "what happened in June".
+  // The server hands back the same {ts, job} / {ts, ev} shape, so everything
+  // below - grouping, pills, drop-downs, the size column - is unchanged.
+  const items = _actHist ? _actHist.items.slice().sort((x,y)=>x.ts-y.ts) : [
     ...all.map(r=>({ts:r.finished_at||0, job:r})),
     ...events.map(e=>({ts:e.at||0, ev:e})),
   ].sort((x,y)=>x.ts-y.ts);
@@ -15316,9 +15495,11 @@ function renderDone(j){
   const dc=document.getElementById('doneCount');
   if(dc) dc.textContent=`${fmt(glist.length)} files · ${fmt(shown)} entries`
         +(want?` (filtered)`:'')
-        +` · updated ${ago(_actChangedAt/1000)}`
+        +(_actHist?` · browsing history`
+                  :` · updated ${ago(_actChangedAt/1000)}`)
         +(openLogId?' · paused while you read':'')
-        +((!openLogId && !follows('doneBox'))?' · paused (scrolled down)':'');
+        +((!_actHist && !openLogId && !follows('doneBox'))?' · paused (scrolled down)':'');
+  actPagerPaint();
   if(!listChanged && !openChanged) return;              // nothing to do
   if(openLogId && listChanged && !openChanged) return;  // defer: you're reading
   lastListSig=listSig; lastOpenId=openLogId;
@@ -15407,8 +15588,10 @@ function renderDone(j){
       +'<tr><th>Title</th>'
       +'<th style="width:34%">What happened</th>'
       +'<th class="num nb" style="width:52px" title="entries for this file">Times</th>'
-      +'<th class="num nb" style="width:150px">Size</th>'
-      +'<th class="nb" style="width:74px">Last</th></tr>';
+      // Size gets breathing room and Last gets enough width for "just now":
+      // at 150/74 with no gap the two ran together as "-10.2%just now".
+      +'<th class="num nb" style="width:150px;padding-right:18px">Size</th>'
+      +'<th class="nb" style="width:96px;padding-left:6px">Last</th></tr>';
     html+=glist.map((g,gi)=>{
       const open=_actOpen.has(g.title);
       const pills=[...g.labels.entries()].map(([l,n])=>pillFor(l,n)).join(' ');
@@ -15435,8 +15618,9 @@ function renderDone(j){
         <td class="wrap"><div><span class="actcaret">${open?'▾':'▸'}</span><b>${esc(g.title)}</b></div></td>
         <td><div class="actpills">${pills}</div></td>
         <td class="num dim nb">${g.entries.length}</td>
-        <td class="num dim nb">${sz}</td>
-        <td class="dim nb" title="${esc(new Date(g.last*1000).toLocaleString())}"
+        <td class="num dim nb" style="padding-right:18px">${sz}</td>
+        <td class="dim nb" style="padding-left:6px"
+            title="${esc(new Date(g.last*1000).toLocaleString())}"
           >${ago(g.last)}</td></tr>`;
       return head+(open
         ? g.entries.map(it=> it.ev ? evRow(it.ev) : jobRow(it.job)).join('')

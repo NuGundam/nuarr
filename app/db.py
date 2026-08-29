@@ -503,6 +503,18 @@ def init_db() -> None:
             "AND name='ix_jobs_finished'").fetchone()
         cur.execute("CREATE INDEX IF NOT EXISTS ix_jobs_finished "
                     "ON jobs(finished_at DESC)")
+        # GROUPING BY TITLE needs its own index, on both tables the Activity
+        # history pages over. Without them the paged view scanned all 62,000
+        # finished jobs plus every history row to build one page of ten:
+        # 1.9 s per keystroke of the search box. With them, the group-by walks
+        # an ordered index instead of building a temp B-tree.
+        fresh_index = fresh_index or not cur.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' "
+            "AND name='ix_jobs_title'").fetchone()
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_jobs_title "
+                    "ON jobs(title, finished_at DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_history_label "
+                    "ON history(label, at DESC)")
         # AN INDEX NOBODY IS TOLD ABOUT IS AN INDEX NOBODY USES. This database
         # had no sqlite_stat1 at all, so the planner was working from built-in
         # guesses - and kept choosing the state index plus a temp B-tree sort
