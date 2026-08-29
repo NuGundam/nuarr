@@ -347,15 +347,15 @@ $p4.Controls.AddRange(@($chkBoot,$chkStart,$chkLnk))
 $p4.Controls.Add((New-Label 'Audio language detection' 0 102 400 20))
 $chkWhisper = New-Check 'Install Whisper so nuarr can identify audio by listening' 0 124 620 $false
 $p4.Controls.Add($chkWhisper)
-$lblWhy = New-Label '' 18 148 660 54 $FontSub $C.Dim
+$lblWhy = New-Label '' 18 148 660 90 $FontSub $C.Dim
 $p4.Controls.Add($lblWhy)
 
-$p4.Controls.Add((New-Label 'Restore a database (optional)' 0 214 400 20))
-$txtRestore = New-Box '' 0 236 520
-$btnRestore = New-Btn 'Browse...' 530 235 100
+$p4.Controls.Add((New-Label 'Restore a database (optional)' 0 248 400 20))
+$txtRestore = New-Box '' 0 270 520
+$btnRestore = New-Btn 'Browse...' 530 269 100
 $p4.Controls.AddRange(@($txtRestore,$btnRestore))
-$p4.Controls.Add((New-Label 'Point at a nuarr-YYYYMMDD-HHMMSS folder to bring a library back with its history.' 0 260 680 18 $FontSub $C.Dim))
-$p4.Controls.Add((New-Label 'Leave blank for a fresh start - nuarr will scan the libraries itself.' 0 278 680 18 $FontSub $C.Dim))
+$p4.Controls.Add((New-Label 'Point at a nuarr-YYYYMMDD-HHMMSS folder to bring a library back with its history.' 0 294 680 18 $FontSub $C.Dim))
+$p4.Controls.Add((New-Label 'Leave blank for a fresh start - nuarr will scan the libraries itself.' 0 312 680 18 $FontSub $C.Dim))
 
 # ============================================================ page 5 ======
 $p5 = New-Object Windows.Forms.Panel; $p5.Dock='Fill'; $p5.BackColor=$C.Bg
@@ -581,10 +581,12 @@ function Load-Detected {
     $chkWhisper.Enabled = $false
     $chkWhisper.Checked = $false
     $S.Whisper = $false
+    # SHORT ENOUGH TO READ, LONG ENOUGH TO ACT ON. The reason string carries
+    # the exit code and what it means; these two lines say what it costs and
+    # what still works, and nothing repeats what the reason already said.
     $lblWhy.Text = ("Cannot run here - " + $blocked + ".") + [Environment]::NewLine +
-                   "Not on the CPU, and not on a GPU either: the same library does the" + [Environment]::NewLine +
-                   "loading. Everything else in nuarr works; untagged audio is named by" + [Environment]::NewLine +
-                   "inference instead."
+                   "The same library loads on the CPU and the GPU, so neither will work." + [Environment]::NewLine +
+                   "Everything else in nuarr works; untagged audio is named by inference instead."
   }
   elseif ($S.Gpu) {
     $chkWhisper.Enabled = $true
