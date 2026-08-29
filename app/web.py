@@ -9238,17 +9238,13 @@ input[type=time]::-webkit-calendar-picker-indicator{filter:invert(.75);cursor:po
   <div class="panel" id="pbPanel" style="display:none">
     <h2 style="color:#f778ba">What Plex had to work at
         <span id="pbCount" class="dim"></span>
-        <span style="float:right;font-weight:400;display:flex;gap:8px;align-items:center">
-          <button id="pbFresh" class="resume" style="display:none"
-            onclick="document.getElementById('pb').scrollTop=0">↑ back to top</button>
+        <span style="float:right;font-weight:400">
           <button onclick="pbPoll()">Check now</button></span></h2>
     <div id="pb" class="fullpane"><div class="dim" style="padding:14px">loading…</div></div>
   </div>
   <div class="panel" id="auPanel" style="display:none">
     <h2 style="color:#39d3c3">Rule check <span id="auCount" class="dim"></span>
-        <span style="float:right;font-weight:400;display:flex;gap:8px;align-items:center">
-          <button id="auFresh" class="resume" style="display:none"
-            onclick="document.getElementById('au').scrollTop=0">↑ back to top</button>
+        <span style="float:right;font-weight:400">
           <button onclick="auRun()">Run now</button></span></h2>
     <div id="au" class="fullpane"><div class="dim" style="padding:14px">loading…</div></div>
   </div>
@@ -9381,39 +9377,25 @@ function followBtn(id){
 // back to the top mid-read, which is the same injury from the other
 // direction. Scrolled away from the top means frozen, with a button that
 // says how many refreshes are waiting.
-const _topFrozen={};
 function paintTop(id, html){
+  // PRESERVE THE SCROLL, DO NOT FREEZE. The first version of this froze the
+  // panel while you were scrolled away - which was right for the Activity
+  // feed it was copied from, and wrong here, because clicking an entry in
+  // these lists triggers a repaint too: the click read as "frozen", or the
+  // repaint reset the inner scrollbox to the top and the entry you had just
+  // opened sailed off the screen. Repainting in place and putting the
+  // scroll position back afterwards serves both cases: reading stays where
+  // it is (the sort is stable on purpose), and an opened entry stays under
+  // the cursor that opened it.
   const el=document.getElementById(id);
   if(!el) return false;
-  if(!el._topWatch){
-    el._topWatch=true;
-    el.addEventListener('scroll', ()=>{
-      if(el.scrollTop<=8 && _topFrozen[id]){
-        _topFrozen[id]=0;
-        const b=document.getElementById(id+'Fresh');
-        if(b) b.style.display='none';
-        if(el._pendingHtml){ el.innerHTML=el._pendingHtml; el._pendingHtml=null; }
-      }
-    }, {passive:true});
-  }
-  if(el.scrollTop>8){
-    el._pendingHtml=html;
-    _topFrozen[id]=(_topFrozen[id]||0)+1;
-    const b=document.getElementById(id+'Fresh');
-    if(b){ b.style.display='';
-           b.textContent=`↑ ${_topFrozen[id]} update${_topFrozen[id]===1?'':'s'} — back to top`; }
-    return false;
-  }
-  _topFrozen[id]=0; el._pendingHtml=null;
+  const before=el.querySelector('.scrollbox');
+  const keep=before?before.scrollTop:el.scrollTop;
   el.innerHTML=html;
-  const b=document.getElementById(id+'Fresh');
-  if(b) b.style.display='none';
+  const after=el.querySelector('.scrollbox');
+  if(after) after.scrollTop=keep;
+  else el.scrollTop=keep;
   return true;
-}
-function topFreshBtn(id){
-  return `<button id="${id}Fresh" class="resume" style="display:none"
-     onclick="(function(){const e=document.getElementById('${id}');
-       if(e){e.scrollTop=0;}})()">↑ back to top</button>`;
 }
 
 // Keep a filter dropdown stocked with the values that actually appear, with a
@@ -21035,8 +21017,24 @@ _SETTINGS_CSS = """
      border is the scrollbar-thumb colour (already established as "chrome"
      here), the fill is genuinely darker than the page. */
   border:1px solid #2b3340;border-radius:8px;background:#090c10;
-  margin-bottom:12px}
+  margin-bottom:12px;
+  /* BACKSTOP: when the flex chain cannot resolve a height (narrow single-
+     column layouts leave every ancestor at auto), an unclamped inner list
+     makes this box the height of its content - sixteen thousand pixels on
+     a long day. The flex fill wins when the chain resolves; this cap only
+     exists for when it does not. */
+  max-height:calc(100vh - 230px)}
 #plexworkPane table, #ruleschkPane table{width:100%}
+/* THE INNER CLAMP. The renderers wrap their tables in .scrollbox.auto,
+   which carries max-height:340px from its life as a dashboard grid cell.
+   So the framed pane stretched, and the list inside it stopped at 340px -
+   a quarter of the panel, with the frame's empty bottom three-quarters
+   making it look like the box was the problem. On these pages the frame
+   is the size; the inner box fills it and does the scrolling. */
+#plexworkPane .fullpane, #ruleschkPane .fullpane{
+  display:flex;flex-direction:column}
+#plexworkPane .fullpane .scrollbox.auto, #ruleschkPane .fullpane .scrollbox.auto{
+  flex:1 1 auto;max-height:none;min-height:0}
 
 /* The per-library subtitle-handling block, inside the expanded library. */
 .socbox{border-top:1px solid var(--line)}
