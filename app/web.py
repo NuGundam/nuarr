@@ -5772,6 +5772,76 @@ async def api_ffmpeg_repair(confirm: bool = False, background: bool = True):
 # Measured verdicts only: no driver-branch numbers anywhere on this surface.
 # See enctest.py's module docstring for the rule it enforces.
 
+@app.get("/api/attention")
+def api_attention(limit: int = 400):
+    """THE ACTUAL FILES behind the Attention tile, not just the counts.
+
+    The tile could say "3" and send you to a panel that listed none of them:
+    file errors, rule-check findings and unresolved audio languages live in
+    three different tables and only the first had a list view. A number you
+    cannot open is a number you learn to ignore, so this returns the rows
+    themselves - each already carrying the page that can act on it.
+    """
+    out: list[dict] = []
+
+    def rows(sql, args=()):
+        try:
+            return _rows(sql, args)
+        except Exception:                                    # noqa: BLE001
+            return []
+
+    for r in rows(
+            "SELECT id, path, title, state_reason FROM files "
+            "WHERE state='error' ORDER BY COALESCE(processed_at,0) DESC "
+            "LIMIT ?", (limit,)):
+        out.append({"source": "file errors", "id": r["id"],
+                    "title": r["title"] or os.path.basename(r["path"] or ""),
+                    "path": r["path"] or "",
+                    "detail": r["state_reason"] or "the job failed",
+                    "goto": "", "act": "errors"})
+
+    for r in rows(
+            "SELECT h.file_id, h.rule, h.detail, h.state, h.attempts, h.path, "
+            "       f.title FROM audit_heals h "
+            "  LEFT JOIN files f ON f.id = h.file_id "
+            " WHERE h.state != 'fixed' ORDER BY h.last_at DESC LIMIT ?",
+            (limit,)):
+        out.append({"source": "rule check", "id": r["file_id"],
+                    "title": r["title"] or os.path.basename(r["path"] or ""),
+                    "path": r["path"] or "",
+                    "detail": f"breaks {r['rule']} — {r['detail'] or ''}".strip(" —"),
+                    "goto": "/settings#ruleschk", "act": ""})
+
+    for r in rows(
+            "SELECT a.file_id, f.path, f.title, f.audio_langs FROM audio_lang a "
+            "  JOIN files f ON f.id = a.file_id "
+            " WHERE COALESCE(a.code,'') = '' "
+            "   AND f.state NOT IN ('deleted','duplicate') "
+            "   AND (f.audio_langs = '-' OR f.audio_langs LIKE '-,%' "
+            "        OR f.audio_langs LIKE '%,-' OR f.audio_langs LIKE '%,-,%') "
+            " LIMIT ?", (limit,)):
+        out.append({"source": "audio language", "id": r["file_id"],
+                    "title": r["title"] or os.path.basename(r["path"] or ""),
+                    "path": r["path"] or "",
+                    "detail": "an audio track has no language and listening "
+                              "gave no confident answer",
+                    "goto": "/settings#alang", "act": ""})
+
+    try:
+        st = arrhealth.STATE
+        for w in (st.get("warning_list") or [])[:limit]:
+            out.append({"source": "arr health", "id": 0, "title": str(w)[:120],
+                        "path": "", "detail": "", "goto": "/settings#arrs",
+                        "act": ""})
+    except Exception:                                        # noqa: BLE001
+        pass
+
+    by_source: dict[str, int] = {}
+    for o in out:
+        by_source[o["source"]] = by_source.get(o["source"], 0) + 1
+    return {"items": out, "n": len(out), "by_source": by_source}
+
+
 @app.get("/api/enctest")
 async def api_enctest_state():
     """Live progress plus the last saved results for both builds."""
@@ -9161,6 +9231,22 @@ input[type=time]::-webkit-calendar-picker-indicator{filter:invert(.75);cursor:po
     </div>
     <div id="drillBody" class="scrollbox nohz" style="height:420px"></div>
   </div>
+  <!-- NEEDS ATTENTION, with the files in it. The tile used to open the file
+       ERRORS list, which could show only one of the three kinds it counts;
+       rule-check findings and unresolved audio languages live in other
+       tables and simply never appeared. Each row here names the file, says
+       what is wrong in words, and links to the page that can fix it. -->
+  <div class="panel" id="attnPanel" style="display:none">
+    <h2><span>Needs attention</span>
+        <span class="live"><a href="#" onclick="document.getElementById('attnPanel').style.display='none';return false">close</a></span></h2>
+    <div style="padding:9px 14px;border-bottom:1px solid var(--line)">
+      <input id="attnQ" placeholder="filter by title or path" style="width:280px"
+             oninput="attnPaint()">
+      <span id="attnCount" class="dim" style="margin-left:8px"></span>
+      <button onclick="loadAttention(true)" style="margin-left:8px">Refresh</button>
+    </div>
+    <div id="attnBody" class="scrollbox nohz" style="height:420px"></div>
+  </div>
   <div class="two">
     <!-- The key belongs in the header, not repeated on every row. Three
          colours carry the whole activity line, and without naming them once
@@ -9712,23 +9798,13 @@ async function loadAll(){
   const attTop=att.length
     ? esc(att.map(a=>`${a.what} ${fmt(a.n)}`).join(' · ')).slice(0,64)
     : 'nothing needs attention';
-  // GO WHERE THE WORK IS. The tile always opened the file-ERRORS list, no
-  // matter what it was counting - so "Attention 2" from the rule check
-  // opened an empty errors panel saying "nothing matches". The count and the
-  // destination disagreed, which reads as the number being wrong.
-  //
-  // Each entry already carries its own `goto` from the server. With one
-  // source, follow it. With several, the errors list is still the only
-  // in-page panel that can show a mixture, so it stays the landing spot -
-  // but only when there really are file errors to show.
-  if(!att.length){
-    add('Attention','0','nothing needs attention',null);
-  }else if(att.length===1 && att[0].goto && att[0].goto!=='errors'){
-    window._attGoto = att[0].goto;
-    add('Attention',fmt(attN),attTop,{attgo:1,t:'Needs attention'});
-  }else{
-    add('Attention',fmt(attN),attTop,{errors:1,t:'Needs attention'});
-  }
+  // GO WHERE THE WORK IS. The tile used to open the file-ERRORS list whatever
+  // it was counting, so rule-check findings and unresolved audio languages -
+  // which live in other tables entirely - produced a number and then an empty
+  // panel saying "nothing matches". It now opens a panel that can show all of
+  // them, each row linking to the page that can act on it.
+  add('Attention', fmt(attN), attTop,
+      attN ? {attn:1, t:'Needs attention'} : null);
   const ua = s.unmanaged_adopt || {checking:0, no_folder:0};
   add('Unmanaged &gt;'+s.extras_cutoff_mb+'MB',fmt(s.orphans.n),
       sweepNote(s.unmanaged_sweep, ua.checking,
@@ -10336,13 +10412,81 @@ function drillUrl(extra){
   p.set('limit', extra || q.limit || 500);
   return '/api/files?'+p.toString();
 }
+// ---- Needs attention -----------------------------------------------------
+// One panel for every source that can want a human: file errors, rule-check
+// findings, unresolved audio languages, arr warnings. Each row carries its
+// own destination, because "go to the page that can fix this" differs per
+// source and a single landing spot could only ever serve one of them.
+let _attn={items:[],by_source:{}};
+
+async function loadAttention(force){
+  const p=document.getElementById('attnPanel');
+  if(p) p.style.display='';
+  const b=document.getElementById('attnBody');
+  if(b && (force || !_attn.items.length))
+    b.innerHTML='<div class="skel" style="padding:12px"><i style="width:60%"></i>'
+               +'<i style="width:44%"></i><i style="width:52%"></i></div>';
+  try{ _attn=await (await fetch('/api/attention')).json(); }
+  catch(e){ if(b) b.innerHTML='<div class="dim" style="padding:14px">could not load</div>'; return; }
+  attnPaint();
+}
+
+const ATTN_STYLE={
+  'file errors':    ['#e0575b','the job failed'],
+  'rule check':     ['#e2b341','the file still breaks a rule'],
+  'audio language': ['#5b9ce8','a track has no language'],
+  'arr health':     ['#e2b341','Sonarr / Radarr warning'],
+};
+
+function attnPaint(){
+  const b=document.getElementById('attnBody');
+  if(!b) return;
+  const q=(document.getElementById('attnQ')||{}).value||'';
+  const ql=q.toLowerCase();
+  const items=(_attn.items||[]).filter(it=>!ql
+    || (it.title||'').toLowerCase().includes(ql)
+    || (it.path||'').toLowerCase().includes(ql));
+  const cnt=document.getElementById('attnCount');
+  if(cnt) cnt.textContent=`${items.length} shown of ${(_attn.items||[]).length}`;
+  if(!items.length){
+    b.innerHTML=`<div class="dim" style="padding:14px">${
+      (_attn.items||[]).length ? 'nothing matches that filter'
+                               : 'nothing needs attention'}</div>`;
+    return;
+  }
+  // Grouped by source so the fix for a whole group is one click, and the
+  // list reads as "here are the three kinds of thing" rather than a mixed pile.
+  const groups={};
+  for(const it of items) (groups[it.source]=groups[it.source]||[]).push(it);
+  let h='';
+  for(const src of Object.keys(groups)){
+    const [col,blurb]=ATTN_STYLE[src]||['var(--dim)',''];
+    const list=groups[src];
+    const go=list.find(x=>x.goto)||{};
+    h+=`<div style="padding:9px 14px 4px;border-top:1px solid var(--line);
+          display:flex;gap:10px;align-items:baseline;flex-wrap:wrap">
+        <b style="color:${col}">${esc(src)}</b>
+        <span class="dim" style="font-size:11px">${list.length} · ${esc(blurb)}</span>
+        ${go.goto?`<a href="${esc(go.goto)}" style="font-size:11px">open the ${esc(src)} page →</a>`
+                 :`<a href="#" style="font-size:11px" onclick="document.getElementById('attnPanel').style.display='none';drill({errors:1,t:'Errors'});return false">open the errors list →</a>`}
+      </div>`;
+    for(const it of list){
+      h+=`<div style="padding:3px 14px 6px 26px">
+        <div style="font-size:12px">${esc(it.title||it.path||'(unnamed)')}</div>
+        ${it.detail?`<div class="dim" style="font-size:11px">${esc(it.detail)}</div>`:''}
+        ${it.path?`<div class="mono dim" style="font-size:10px;overflow-wrap:anywhere">${esc(it.path)}</div>`:''}
+      </div>`;
+    }
+  }
+  b.innerHTML=h;
+}
+
 async function drill(q){
-  // A tile whose work lives on ANOTHER PAGE navigates there instead of
-  // opening a file list that cannot show it. Kept on `window` rather than a
-  // `let`: the tile painter assigns it from a line ABOVE this one, and a
-  // block-scoped binding would be in its temporal dead zone there.
-  if(q && q.attgo){
-    if(window._attGoto) location.href=window._attGoto;
+  if(q && q.attn){
+    const p=document.getElementById('attnPanel');
+    // toggle, like the drill panel
+    if(p && p.style.display!=='none'){ p.style.display='none'; return; }
+    loadAttention(true);
     return;
   }
   const p=document.getElementById('drillPanel');
