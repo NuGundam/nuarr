@@ -3103,7 +3103,13 @@ async def api_audiolang(limit: int = Query(400, le=3000)):
 @app.post("/api/audiolang/check")
 async def api_audiolang_check(file_id: int, track: int = 0,
                               refresh: bool = True):
-    """Listen to one track on demand, from the file's own row in the UI."""
+    """Listen to one track on demand, from the file's own row in the UI.
+
+    Also in the heavy lane: it loads the same model as the test button, so
+    the same "not while something else has a model open" rule applies.
+    """
+    from . import heavy
+
     def _work():
         from . import audiolang
         with cursor() as cur:
@@ -3114,7 +3120,12 @@ async def api_audiolang_check(file_id: int, track: int = 0,
         res = audiolang.check(file_id, r["path"], track, refresh=refresh)
         res["path"] = r["path"]
         return res
-    return await asyncio.to_thread(_work)
+    lane = heavy.Lane("Whisper listen")
+    with lane:
+        if not lane.got:
+            return {"error": f"{lane.holder} is running — engine work is done "
+                             "one at a time. Try again when it finishes."}
+        return await asyncio.to_thread(_work)
 
 
 def _local_addresses() -> set[str]:
@@ -3678,12 +3689,51 @@ def api_audiolang_progress():
     return _al.progress()
 
 
+@app.get("/api/heavy")
+def api_heavy():
+    """What holds the one-at-a-time engine lane, if anything.
+
+    Exists because the alternative is an invisible stuck state: a cancelled
+    request left the lane claimed with no process behind it, every engine
+    button said "something else is running", and nothing anywhere could name
+    what. A lane you cannot see is worse than no lane.
+    """
+    from . import heavy
+    return heavy.state()
+
+
+@app.post("/api/heavy/clear")
+def api_heavy_clear():
+    """Force the engine lane open. For the case above."""
+    from . import heavy
+    was = heavy.clear()
+    if was:
+        joblog.log(f"engine lane force-cleared (was held by {was})", "warn")
+    return {"ok": True, "was": was}
+
+
 @app.post("/api/audiolang/test")
 async def api_audiolang_test():
     """One graded detection on a random already-tagged file - the codec
-    page's test-encode, for ears. Reads and listens only; writes nothing."""
+    page's test-encode, for ears. Reads and listens only; writes nothing.
+
+    IN THE HEAVY LANE, because this is the button that actually took a small
+    machine down: 1.4.9 put the OCR test and both installs behind the lane
+    and missed this one, which is the very path that was pressed - "Test
+    detection now" loads the Whisper model, and a PaddleOCR test holding its
+    own model at the same time is the pair that ran the VM out of memory.
+    """
     from . import audiolang as _al
-    return await asyncio.to_thread(_al.self_test)
+    from . import heavy
+    lane = heavy.Lane("Whisper detection test")
+    with lane:
+        if not lane.got:
+            return {"ok": False, "ran": False,
+                    "why": f"{lane.holder} is running — engine work is done "
+                           "one at a time so a small machine is never asked "
+                           "to load two models at once. Try again when it "
+                           "finishes."}
+        return await asyncio.to_thread(_al.self_test)
 
 
 @app.post("/api/audiolang/run")
