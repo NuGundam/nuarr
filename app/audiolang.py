@@ -470,6 +470,66 @@ def _install_worker(mode: str) -> None:
             pass
 
 
+# The probe's verdict, per (device, compute). Cached because the answer is a
+# property of this machine and this wheel, not of the moment - and because the
+# probe costs a process start and a model load.
+_PROBE: dict[tuple, tuple[bool, str]] = {}
+PROBE_TIMEOUT_S = 300.0
+
+
+def probe_reset() -> None:
+    """Forget the verdicts - after an install, or a hardware change."""
+    _PROBE.clear()
+
+
+def _load_probe(dev: str, ct: str) -> tuple[bool, str]:
+    """(safe_to_load_here, why_not). See app/whisper_probe.py."""
+    key = (dev, ct)
+    if key in _PROBE:
+        return _PROBE[key]
+    import sys as _sys
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "whisper_probe.py")
+    if not os.path.exists(script):
+        _PROBE[key] = (True, "")          # no probe shipped: behave as before
+        return _PROBE[key]
+    try:
+        r = subprocess.run(
+            [_sys.executable, script, "--device", dev, "--compute", ct,
+             "--root", str(MODEL_DIR), "--size", MODEL_SIZE],
+            capture_output=True, text=True, timeout=PROBE_TIMEOUT_S,
+            creationflags=NO_WINDOW)
+    except subprocess.TimeoutExpired:
+        _PROBE[key] = (False, f"loading the model on {dev} did not finish in "
+                              f"{int(PROBE_TIMEOUT_S)}s")
+        return _PROBE[key]
+    except Exception:                                    # noqa: BLE001
+        # COULD NOT ASK IS NOT THE SAME AS NO. If the probe itself fails to
+        # start, fall through to the old behaviour rather than disabling a
+        # feature that may work perfectly well.
+        _PROBE[key] = (True, "")
+        return _PROBE[key]
+    out = ((r.stdout or "") + (r.stderr or "")).strip()
+    if r.returncode == 0 and out.startswith("OK"):
+        _PROBE[key] = (True, "")
+    elif r.returncode < 0 or r.returncode > 1:
+        # KILLED, not failed. 0xC000001D is "illegal instruction" - the
+        # CTranslate2-on-an-old-CPU case this whole mechanism exists for.
+        code = r.returncode & 0xFFFFFFFF
+        why = (f"loading the model on {dev} crashes this machine "
+               f"(exit 0x{code:08X})")
+        if code == 0xC000001D:
+            why = ("this CPU is missing an instruction set that the language "
+                   "identifier requires (CTranslate2 needs AVX2) — it cannot "
+                   "run here, on the GPU or the CPU. Common on virtual "
+                   "machines whose host does not pass AVX2 through")
+        _PROBE[key] = (False, why)
+        joblog.log(f"whisper load probe: {why}", "warn", system="audiolang")
+    else:
+        _PROBE[key] = (False, out[:200] or f"exit {r.returncode}")
+    return _PROBE[key]
+
+
 def _model():
     """Load once, share across calls.
 
@@ -494,6 +554,18 @@ def _model():
         # and a slow answer beats no answer on a machine without a usable CUDA
         # runtime.
         for dev, ct in (("cuda", "float16"), ("cpu", "int8")):
+            # ASK A CHILD FIRST. Constructing this model is native code, and on
+            # a CPU without the instruction set CTranslate2 was built for it
+            # does not raise - it executes an illegal instruction and Windows
+            # kills the process. That is not a failure this function can catch:
+            # pressing "Test detection now" on such a machine took the whole
+            # server down, with WerFault.exe in the process list and "Failed to
+            # fetch" on the page. The probe finds out in a process we can
+            # afford to lose.
+            ok, why = _load_probe(dev, ct)
+            if not ok:
+                last = RuntimeError(why)
+                continue
             try:
                 _MODEL = WhisperModel(MODEL_SIZE, device=dev, compute_type=ct,
                                       download_root=str(MODEL_DIR))
