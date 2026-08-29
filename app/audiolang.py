@@ -533,10 +533,32 @@ def probe_reset() -> None:
     _PROBE.clear()
 
 
+def _blocked_on_disk() -> str:
+    """The recorded 'this machine cannot' verdict, or ''.
+
+    Written by whichever side found out first - Setup during an install, or
+    this module the first time something tried to listen. Read before probing
+    so a machine that has already proved it cannot run the model does not
+    spend a process discovering it again after every restart.
+    """
+    try:
+        p = os.path.join(str(DATA_DIR), "whisper-cannot-run.txt")
+        if os.path.exists(p):
+            with open(p, encoding="utf-8") as fh:
+                return fh.read().strip() or "recorded as unable to run here"
+    except Exception:                                    # noqa: BLE001
+        pass
+    return ""
+
+
 def _load_probe(dev: str, ct: str) -> tuple[bool, str]:
     """(safe_to_load_here, why_not). See app/whisper_probe.py."""
     key = (dev, ct)
     if key in _PROBE:
+        return _PROBE[key]
+    known = _blocked_on_disk()
+    if known:
+        _PROBE[key] = (False, known)
         return _PROBE[key]
     import sys as _sys
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -576,6 +598,16 @@ def _load_probe(dev: str, ct: str) -> tuple[bool, str]:
                    "machines whose host does not pass AVX2 through")
         _PROBE[key] = (False, why)
         joblog.log(f"whisper load probe: {why}", "warn", system="audiolang")
+        # TELL THE INSTALLER TOO. Setup reads this file to grey its Whisper
+        # checkbox, so a machine that discovers the problem here is not
+        # offered the same install again on the next upgrade. Same filename
+        # the installer writes, in the data directory both of them share.
+        try:
+            with open(os.path.join(str(DATA_DIR), "whisper-cannot-run.txt"),
+                      "w", encoding="utf-8") as fh:
+                fh.write(why)
+        except Exception:                                # noqa: BLE001
+            pass
     else:
         _PROBE[key] = (False, out[:200] or f"exit {r.returncode}")
     return _PROBE[key]

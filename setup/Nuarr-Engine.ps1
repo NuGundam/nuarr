@@ -93,6 +93,47 @@ public static extern bool IsProcessorFeaturePresent(uint feature);
   }
 }
 
+# --------------------------------------------------- whisper capability ------
+# THE PROBE IS THE ONLY GROUND TRUTH, SO ITS ANSWER IS REMEMBERED.
+#
+# Test-Avx2 below asks Windows whether the CPU advertises AVX2, and that is a
+# PROXY. Measured on a real VM: the API reported AVX2 present, the box was
+# offered, and loading the model still terminated the process - a hypervisor
+# can advertise a feature set the guest cannot actually rely on, and
+# CTranslate2 may need more than AVX2 anyway. A proxy that says "fine" on a
+# machine that dies is worse than no check.
+#
+# So the crash verdict is written down where it belongs - beside the data, not
+# beside the program - and every later run reads it. The CPU does not change
+# between installs; the answer does not need discovering twice.
+$script:WhisperBlockFile = 'whisper-cannot-run.txt'
+
+function Get-WhisperBlock {
+  param([string]$DataDir)
+  if (-not $DataDir) { return '' }
+  $f = Join-Path $DataDir $script:WhisperBlockFile
+  if (Test-Path -LiteralPath $f) {
+    try { return ((Get-Content -LiteralPath $f -Raw -ErrorAction Stop).Trim()) } catch { return 'a previous run found the language model cannot load here' }
+  }
+  return ''
+}
+
+function Set-WhisperBlock {
+  param([string]$DataDir, [string]$Reason)
+  if (-not $DataDir) { return }
+  try {
+    New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $DataDir $script:WhisperBlockFile),
+                                   $Reason, (New-Object System.Text.UTF8Encoding($false)))
+  } catch { }
+}
+
+function Clear-WhisperBlock {
+  param([string]$DataDir)
+  if (-not $DataDir) { return }
+  try { Remove-Item -LiteralPath (Join-Path $DataDir $script:WhisperBlockFile) -Force -ErrorAction SilentlyContinue } catch { }
+}
+
 function Find-Python {
   <#  The newest CPython 3.11+ we can find, preferring the py launcher.
       Returns @{Exe;Version} or $null. #>
@@ -602,11 +643,15 @@ function Install-Whisper {
       $prc = $LASTEXITCODE
       if ($prc -ne 0 -and $prc -ne 1) {
         $hex = '{0:X8}' -f ($prc -band 0xFFFFFFFF)
-        if ($hex -eq 'C000001D') {
-          Write-Step "This CPU is missing AVX2, which the language identifier requires - it cannot run on this machine" 'err'
+        $reason = if ($hex -eq 'C000001D') {
+          "this CPU cannot run the language identifier - loading the model executes an unsupported instruction (0xC000001D)"
         } else {
-          Write-Step "Loading the language model crashes on this machine (exit 0x$hex)" 'err'
+          "loading the language model crashes on this machine (exit 0x$hex)"
         }
+        Write-Step $reason 'err'
+        # REMEMBERED, so the next run can grey the checkbox instead of
+        # offering something this machine has already proved it cannot do.
+        Set-WhisperBlock -DataDir $DataDir -Reason $reason
         Write-Step "Skipping the model download. Everything else in nuarr works; untagged audio is named by inference instead." 'warn'
         return $false
       }
@@ -615,6 +660,7 @@ function Install-Whisper {
         return $false
       }
       Write-Step "CPU check passed" 'ok'
+      Clear-WhisperBlock -DataDir $DataDir
     }
 
     Write-Step "Fetching the 'small' model into $model"

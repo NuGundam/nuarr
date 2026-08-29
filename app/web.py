@@ -8948,6 +8948,18 @@ tr.logrow td{background:#1c2129;border-bottom:1px solid var(--acc);padding:0 12p
 .rk{width:210px;color:var(--fg);font-weight:600}
 .rv{color:var(--dim);line-height:1.5}
 .rdiff{width:calc((100% - 210px)/2);padding-right:14px}
+/* ONE COLUMN, NOT THREE RAGGED EDGES. "Anime", "Animation" and "Live action"
+   are different lengths, so as inline pills their right edges landed in three
+   different places and the descriptions beside them started at three
+   different points - the eye reads that as three unrelated rows rather than
+   one list. A shared minimum width and centred text makes them a column. */
+.rkindcell{width:104px;vertical-align:top}
+/* margin:0 matters. .rprof.live carries a left margin for the row badges,
+   where it sits second and needs separating from animation. Inherited here it
+   pushed the third bubble 8px right of the other two - measured, not guessed,
+   which is the only way an 8px difference gets noticed at all. */
+.rkindcell .rprof{display:inline-block;min-width:78px;text-align:center;
+  box-sizing:border-box;margin:0}
 .rprof{display:inline-block;font-size:10px;padding:1px 6px;border-radius:9px;
        border:1px solid;margin-right:6px;vertical-align:1px;white-space:nowrap}
 /* ONE COLOUR PER KIND, EVERYWHERE. These matched nothing: the Libraries page
@@ -20666,7 +20678,7 @@ async function loadRules(){
         simply mistagged.</div>
       <table class="rtab" style="margin-top:7px">${
         Object.keys(kinds).map(k=>`
-          <tr><td class="rk" style="white-space:nowrap">
+          <tr><td class="rk rkindcell">
                 <span class="rprof ${KCLS[k]||'other'}">${esc(kinds[k].label)}</span></td>
               <td class="rv">${esc(kinds[k].how)}
                 ${kinds[k].audio_default?`<div class="dim" style="font-size:11px;margin-top:2px">

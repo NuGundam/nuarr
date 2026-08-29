@@ -559,14 +559,23 @@ function Load-Detected {
   # merely costs time. A CPU without AVX2 is a different answer entirely: the
   # model does not run slowly there, it terminates the process. Checked first,
   # so "this machine cannot" wins over "this machine would be slower".
-  if (-not (Test-Avx2)) {
+  # WHAT THIS MACHINE HAS ALREADY PROVED beats what it advertises. The AVX2
+  # flag is a proxy and it was measured wrong on a real VM: Windows reported
+  # AVX2 present, the box stayed enabled, and the model still terminated the
+  # process on install. The recorded verdict from any previous probe - Setup's
+  # or the app's - is the actual evidence, so it is checked first.
+  $blocked = Get-WhisperBlock -DataDir $S.DataDir
+  if (-not $blocked -and -not (Test-Avx2)) {
+    $blocked = "this CPU does not support AVX2, which the language identifier requires"
+  }
+  if ($blocked) {
     $chkWhisper.Enabled = $false
     $chkWhisper.Checked = $false
     $S.Whisper = $false
-    $lblWhy.Text = "This CPU does not support AVX2, which the language identifier requires." + [Environment]::NewLine +
-                   "It cannot run here - not on the CPU, and not on a GPU either, because the" + [Environment]::NewLine +
-                   "same library does the loading. Everything else in nuarr works; untagged" + [Environment]::NewLine +
-                   "audio is named by inference instead."
+    $lblWhy.Text = ("Cannot run here - " + $blocked + ".") + [Environment]::NewLine +
+                   "Not on the CPU, and not on a GPU either: the same library does the" + [Environment]::NewLine +
+                   "loading. Everything else in nuarr works; untagged audio is named by" + [Environment]::NewLine +
+                   "inference instead."
   }
   elseif ($S.Gpu) {
     $chkWhisper.Enabled = $true
