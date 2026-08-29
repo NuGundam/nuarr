@@ -20981,9 +20981,25 @@ _SETTINGS_CSS = """
    header scrolling away from the rows it describes. Full width, and tall
    enough to use the window, with the scrolling inside the panel so the
    header and the freeze button stay put. */
-#plexworkPane .panel, #ruleschkPane .panel{margin:0;border:0}
+/* A FLEX COLUMN, NOT A max-height. The first attempt styled
+   `#plexworkPane .panel` - and the adoption moves the panel's CHILDREN into
+   the pane, so there is no .panel inside it and the rule matched nothing.
+   Worse, `max-height` only constrains: with seven rows the table stayed its
+   own small height and left most of the page empty, which is what "not
+   fitting the whole page" looks like.
+
+   So the chain is told to fill: pane, body and the list each take the height
+   they are given, and the list is the one part that scrolls. Few rows still
+   fill the page; many rows scroll inside it with the heading and buttons
+   staying put. min-height:0 on every level because a flex child defaults to
+   min-content and would otherwise refuse to shrink. */
+#plexworkPane, #ruleschkPane{display:flex;flex-direction:column;
+  height:100%;min-height:0}
+#plexworkBody, #ruleschkBody{flex:1;display:flex;flex-direction:column;
+  min-height:0;padding-bottom:0}
+#plexworkBody > h2, #ruleschkBody > h2{flex:0 0 auto}
 #plexworkPane .fullpane, #ruleschkPane .fullpane{
-  max-height:calc(100vh - 210px);overflow:auto;overflow-x:hidden}
+  flex:1 1 auto;min-height:220px;overflow:auto;overflow-x:hidden}
 #plexworkPane table, #ruleschkPane table{width:100%}
 
 /* The per-library subtitle-handling block, inside the expanded library. */
