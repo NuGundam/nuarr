@@ -8950,8 +8950,16 @@ tr.logrow td{background:#1c2129;border-bottom:1px solid var(--acc);padding:0 12p
 .rdiff{width:calc((100% - 210px)/2);padding-right:14px}
 .rprof{display:inline-block;font-size:10px;padding:1px 6px;border-radius:9px;
        border:1px solid;margin-right:6px;vertical-align:1px;white-space:nowrap}
+/* ONE COLOUR PER KIND, EVERYWHERE. These matched nothing: the Libraries page
+   has been colouring anime violet, animation teal and live action grey for as
+   long as the kinds have existed, while this page had two classes and painted
+   animation with live action's green - so the same word meant a different
+   colour on two screens, which is worse than having no colour at all. Values
+   copied from .k-anime / .k-animation / .k-live rather than re-picked. */
 .rprof.anime{color:#d2a8ff;border-color:#d2a8ff;background:rgba(210,168,255,.10)}
-.rprof.other{color:var(--ok);border-color:var(--ok);background:rgba(63,185,80,.10)}
+.rprof.animation{color:#39d3c3;border-color:#39d3c3;background:rgba(57,211,195,.10)}
+.rprof.live,
+.rprof.other{color:#8b98a6;border-color:#8b98a6;background:rgba(139,152,166,.10)}
 .rprofbox{display:flex;gap:22px;flex-wrap:wrap;padding:9px 0 2px;font-size:12px}
 @media(max-width:900px){.rtab,.rtab tbody,.rtab tr,.rtab td{display:block;width:auto}
   .rk{width:auto} .rdiff{width:auto;padding-right:0}}
@@ -10947,7 +10955,7 @@ function renderBrowse(d){
            f.pct>=100?'var(--ok)':'var(--acc)'}"></i></span>
          <span class="${f.pct>=100?'ok':'dim'}">${f.done}/${f.files}</span>`;
     return `<div class="brow bdir" onclick="bgo('${L}','${b64e(f.path)}')">
-        <span class="bname">ðŸ“ ${esc(f.name)}</span>
+        <span class="bname">\u{1F4C1} ${esc(f.name)}</span>
         <span class="bmeta">${bar}</span>
         <span class="bsize dim">${f.bytes?gb(f.bytes):''}</span></div>`;
   }).join('');
@@ -20603,10 +20611,17 @@ async function loadRules(){
     // Where the profiles differ, show them SIDE BY SIDE. Stacked, the reader
     // has to hold one in their head to compare it with the other, which is the
     // whole question this tab exists to answer.
+    // BOTH KINDS THAT SHARE THIS COLUMN GET THEIR BADGE. The column is
+    // labelled "live action" because the rules are live action's, but
+    // animation follows exactly the same ones - and a reader looking for
+    // what happens to their western animation found no answer here at all.
+    // Naming only one of two kinds that a rule applies to is a gap, not
+    // tidiness; the duplication is the point.
     return `<tr><td class="rk">${esc(r.k)}</td>
             <td class="rv rdiff"><span class="rprof anime">anime</span>
                 ${esc(r.anime||'')}</td>
-            <td class="rv rdiff"><span class="rprof other">live action</span>
+            <td class="rv rdiff"><span class="rprof animation">animation</span
+                ><span class="rprof live" style="margin-left:4px">live action</span>
                 ${esc(r.other||'')}</td></tr>`;
   };
   const sect=(title, rows, note)=>
@@ -20636,7 +20651,7 @@ async function loadRules(){
   // HOW A TITLE IS CLASSIFIED, which is the first thing to understand and was
   // the thing this box got wrong: it described a folder-name test that stopped
   // being the whole answer when nuarr started reading genres from the arrs.
-  const KCLS = {anime:'anime', animation:'other', live:'other'};
+  const KCLS = {anime:'anime', animation:'animation', live:'live'};
   const kinds = d.kinds || {};
   const kindBox = `
     <div class="lkind" style="padding:10px 12px;margin-bottom:10px">

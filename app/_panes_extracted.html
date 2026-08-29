@@ -11,9 +11,12 @@
         <div class="dim" style="padding:9px 14px;font-size:11px">
           Read live from the rules engine, so this always matches what is
           actually being applied. Rows marked
-          <span class="rprof anime">anime</span> and
-          <span class="rprof other">live action</span> are where the two
-          profiles differ — everything else applies to both.
+          <span class="rprof anime">anime</span> against
+          <span class="rprof animation">animation</span><span
+            class="rprof live" style="margin-left:4px">live action</span>
+          are where the rules differ — everything else applies to all three.
+          Animation and live action follow the same rules and are shown
+          together; they keep separate defaults.
         </div>
         <div id="rulesBody" style="padding:0 14px 14px"></div>
       </div>
