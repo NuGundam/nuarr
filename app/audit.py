@@ -699,6 +699,40 @@ async def heal(viol: list[dict]) -> dict:
 REVERIFY_S = 30
 
 
+def retire_gone() -> int:
+    r"""Retire findings whose file no longer exists. Returns how many.
+
+    A finding is a statement about a FILE, and the arrs replace files. A DVD
+    rip of Swat Kats S01E01 was flagged for its container, then Sonarr
+    upgraded the episode: the old file was deleted, a 1080p release took its
+    place under a new id, and the finding was left pointing at a row that no
+    longer exists.
+
+    Nothing could ever clear it. _reverify_queued() joins audit_heals to
+    files, so a finding whose file row is gone is not merely unfixable - it is
+    invisible to the re-check, and sits at 'queued' forever. It kept the
+    Attention tile at 1 for a file that had not existed for hours, which is
+    how a number stops being believed.
+
+    Marked 'gone' rather than deleted: the run that found it is a record and
+    keeps it. It simply stops counting as outstanding work, because it is not.
+
+    Deliberately decided from nuarr's OWN bookkeeping - the files row is
+    absent, or says deleted - and not from a disk check. A pool disk that
+    blinks out for a moment must not be able to retire real findings.
+    """
+    with cursor() as cur:
+        cur.execute(
+            "UPDATE audit_heals SET state='gone', "
+            "       detail='the file was replaced or removed - this finding "
+            "was about a file that no longer exists', "
+            "       last_at=? "
+            " WHERE state NOT IN ('fixed','gone') "
+            "   AND file_id NOT IN (SELECT id FROM files "
+            "                        WHERE state != 'deleted')", (time.time(),))
+        return cur.rowcount or 0
+
+
 async def _reverify_queued() -> int:
     def _due() -> list[dict]:
         with cursor() as cur:
@@ -753,6 +787,13 @@ async def reverify_watch() -> None:
     await asyncio.sleep(120)             # boot scan first; this is bookkeeping
     while True:
         try:
+            # Retire first: a finding about a file that has been replaced is
+            # not work, and re-verifying it is impossible anyway - the join
+            # that drives the re-check cannot see it.
+            n = await asyncio.to_thread(retire_gone)
+            if n:
+                joblog.log(f"rule check: {n} finding(s) retired - their files "
+                           f"were replaced or removed", "info")
             await _reverify_queued()
         except Exception as e:
             joblog.log(f"audit reverify: {type(e).__name__}: {e}", "error")

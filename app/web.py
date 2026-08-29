@@ -2435,8 +2435,10 @@ def _summary_impl():
         # fixed" - a number that could only ever go up. The heal rows carry
         # the live state, so a fixed finding leaves the tile the moment it
         # is fixed.
+        # 'gone' is retired, not outstanding: the file it described was
+        # replaced by the arr - see audit.retire_gone().
         arow = _rows("SELECT COUNT(*) n FROM audit_heals "
-                     "WHERE state != 'fixed'")
+                     "WHERE state NOT IN ('fixed','gone')")
         if arow and arow[0]["n"]:
             attention.append({"what": "rule check", "n": int(arow[0]["n"]),
                               "note": "still breaking a rule",
@@ -5897,7 +5899,8 @@ def api_attention(limit: int = 400):
             "SELECT h.file_id, h.rule, h.detail, h.state, h.attempts, h.path, "
             "       f.title FROM audit_heals h "
             "  LEFT JOIN files f ON f.id = h.file_id "
-            " WHERE h.state != 'fixed' ORDER BY h.last_at DESC LIMIT ?",
+            " WHERE h.state NOT IN ('fixed','gone') "
+            " ORDER BY h.last_at DESC LIMIT ?",
             (limit,)):
         out.append({"source": "rule check", "id": r["file_id"],
                     "title": r["title"] or os.path.basename(r["path"] or ""),
@@ -9620,7 +9623,11 @@ input[type=time]::-webkit-calendar-picker-indicator{filter:invert(.75);cursor:po
         <span style="float:right;font-weight:400;display:flex;gap:8px;align-items:center">
           <!-- Typing here leaves the live feed and pages the WHOLE history
                server-side; the live poll only ever holds the newest ~60. -->
-          <input id="doneQ" placeholder="search titles" style="width:150px"
+          <!-- Wide enough for a real title: "Swat Kats: The Radical Squadron"
+               is 30 characters before you reach an episode name, and a box
+               that shows eight of them cannot be checked against what you
+               typed. -->
+          <input id="doneQ" placeholder="search titles" style="width:300px"
                  oninput="actSearch()">
           <select id="doneSize" onchange="actSize()" title="rows per page">
             <option value="10">10</option>
