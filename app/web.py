@@ -4188,6 +4188,18 @@ def api_subocr_status():
     return subocr.status()
 
 
+@app.get("/api/subocr/shapes")
+def api_subocr_shapes(limit: int = 60):
+    """What the picture-subtitle measurement has found, and what it is doing.
+
+    One call feeds the whole panel - the counts, the rows and the live line -
+    because they are read together and three endpoints polling in step would
+    disagree with each other at exactly the moment someone is watching.
+    """
+    from . import subocr
+    return subocr.shape_rows(max(1, min(int(limit), 400)))
+
+
 @app.post("/api/subocr/config")
 async def api_subocr_config(body: dict = Body(...)):
     """Save the OCR switches - config.yml, and SETTINGS in place."""
@@ -18898,6 +18910,18 @@ async function loadOcr(){
     </div>
 
     <div class="lkind" style="padding:11px 12px;margin-top:10px">
+      <b style="color:#6fb0ff">Signs or dialogue — what the check found</b>
+      <div class="dim" style="font-size:11px;margin-top:2px">
+        Before a file is queued for OCR its picture subtitles are measured, so
+        typeset signs are burned into the video instead of being flattened into
+        text at the bottom of the screen. Reading a track means demuxing the
+        whole file, so it happens once per file and only for files the sweep is
+        about to convert.</div>
+      <div id="shapeBody" style="margin-top:8px"><span class="dim"
+           style="font-size:11.5px">loading…</span></div>
+    </div>
+
+    <div class="lkind" style="padding:11px 12px;margin-top:10px">
       <b style="color:#6fb0ff">What gets converted</b>
       <div class="dim" style="font-size:11px;margin-top:4px">
         Which tracks qualify — dialogue, SDH, forced — and for which
@@ -18906,6 +18930,67 @@ async function loadOcr(){
       </div>
     </div>`;
   ocrUpdLoad();
+  shapeLoad();
+}
+
+// ---- the measurement panel ---------------------------------------------
+// POLLS ONLY WHILE THE PAGE IS OPEN, and only fast while something is being
+// read. A file takes ten to twenty seconds to demux, so a panel that just
+// listed finished rows would be indistinguishable from one that had hung -
+// hence the live line, which names the file currently being read.
+let _shapeTimer=null;
+async function shapeLoad(){
+  const el=document.getElementById('shapeBody');
+  if(!el){ if(_shapeTimer) clearTimeout(_shapeTimer); _shapeTimer=null; return; }
+  let d;
+  try{ d=await fetch('/api/subocr/shapes?limit=60').then(r=>r.json()); }
+  catch(e){ el.innerHTML='<span class="dim" style="font-size:11.5px">could not load</span>'; return; }
+  const s=d.summary||{}, live=d.live||{}, rows=d.rows||[];
+  const busy=!!live.now;
+  const head = busy
+    ? `<div style="display:flex;gap:8px;align-items:center;font-size:11.5px">
+         <span class="spin" style="width:11px;height:11px"></span>
+         <span>reading <b>${esc(live.now)}</b>
+           <span class="dim">— ${(live.busy_s||0).toFixed(0)}s</span></span>
+       </div>`
+    : `<div class="dim" style="font-size:11.5px">not reading anything right now</div>`;
+  const counts = `
+    <div style="display:flex;gap:14px;flex-wrap:wrap;margin:7px 0 4px;font-size:11.5px">
+      <span><b>${s.files||0}</b> <span class="dim">files measured</span></span>
+      <span style="color:#e2b341"><b>${s.typeset||0}</b> <span class="dim">typeset — burned in</span></span>
+      <span style="color:#6fd08c"><b>${s.dialogue||0}</b> <span class="dim">dialogue — read as text</span></span>
+    </div>`;
+  if(!rows.length){
+    el.innerHTML=head+counts+`<div class="dim" style="font-size:11.5px">
+      Nothing measured yet — the first files get read when the next OCR sweep
+      picks them up.</div>`;
+  }else{
+    // The numbers are shown, not just the verdict: a wrong call is only
+    // arguable-with if you can see how close to the line it was.
+    const tr=rows.map(r=>{
+      const ts=r.typeset;
+      return `<tr>
+        <td style="padding:2px 8px 2px 0">${esc(r.title||('file '+r.file_id))}</td>
+        <td class="dim" style="padding:2px 8px 2px 0;white-space:nowrap">track ${r.rel}</td>
+        <td style="padding:2px 8px 2px 0;white-space:nowrap;color:${ts?'#e2b341':'#6fd08c'}">
+          ${ts?'typeset signs':'dialogue'}</td>
+        <td class="dim" style="padding:2px 8px 2px 0;white-space:nowrap">
+          ${Math.round((r.tall_share||0)*100)}% tall</td>
+        <td class="dim" style="padding:2px 8px 2px 0;white-space:nowrap">
+          median ${Math.round((r.median_h||0)*100)}%</td>
+        <td class="dim" style="padding:2px 0;white-space:nowrap">${ago(r.at)}</td>
+      </tr>`;}).join('');
+    el.innerHTML=head+counts+
+      `<div style="max-height:260px;overflow:auto;margin-top:4px">
+         <table style="width:100%;font-size:11.5px;border-collapse:collapse">${tr}</table>
+       </div>
+       <div class="dim" style="font-size:11px;margin-top:6px">
+         A track counts as typeset when more than 20% of its cues use a bitmap
+         taller than 30% of the frame — tall bitmaps are signs and song
+         captions laid over the picture, not lines of dialogue.</div>`;
+  }
+  if(_shapeTimer) clearTimeout(_shapeTimer);
+  _shapeTimer=setTimeout(shapeLoad, busy?1500:15000);
 }
 
 // THE TABLE IS WHATEVER WAS LAST MEASURED HERE, not a constant. It shipped

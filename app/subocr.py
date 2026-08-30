@@ -737,6 +737,24 @@ def has_shapes(file_id: int) -> bool:
         return False
 
 
+def shapes_for(file_id: int) -> dict:
+    """Every recorded verdict for one file, keyed by track. For explaining."""
+    if not file_id:
+        return {}
+    try:
+        from .db import cursor
+        with cursor() as cur:
+            return {r["rel"]: {"typeset": bool(r["typeset"]),
+                               "median_h": r["median_h"] or 0.0,
+                               "tall_share": r["tall_share"] or 0.0}
+                    for r in cur.execute(
+                        "SELECT rel, typeset, median_h, tall_share "
+                        "FROM sub_shape WHERE file_id=? ORDER BY rel",
+                        (int(file_id),))}
+    except Exception:                                        # noqa: BLE001
+        return {}
+
+
 def typeset_rels(file_id: int) -> set:
     """Subtitle indices this file is known to carry as typeset pictures."""
     if not file_id:
@@ -2426,6 +2444,50 @@ def sweep_pick(limit: int) -> list[dict]:
     return picked
 
 
+_SCREEN = {"now": "", "file_id": 0, "started": 0.0, "seen": 0, "typeset": 0,
+           "measured": 0, "last": 0.0}
+
+
+def screen_state() -> dict:
+    r"""What the screener is doing this second. For the UI; never blocks.
+
+    `now` is the file being demuxed right now, or "" when idle. It exists
+    because the read takes ten to twenty seconds and a panel that only shows
+    finished rows looks identical to one that has hung.
+    """
+    st = dict(_SCREEN)
+    st["busy_s"] = round(time.time() - st["started"], 1) if st["now"] else 0.0
+    return st
+
+
+def shape_rows(limit: int = 60) -> dict:
+    """Recorded verdicts, newest first, with the numbers behind each one."""
+    from .db import cursor
+    rows, summary = [], {"files": 0, "typeset": 0, "dialogue": 0}
+    try:
+        with cursor() as cur:
+            summary["files"] = cur.execute(
+                "SELECT COUNT(DISTINCT file_id) n FROM sub_shape"
+            ).fetchone()["n"]
+            summary["typeset"] = cur.execute(
+                "SELECT COUNT(*) n FROM sub_shape WHERE typeset=1"
+            ).fetchone()["n"]
+            summary["dialogue"] = cur.execute(
+                "SELECT COUNT(*) n FROM sub_shape WHERE typeset=0"
+            ).fetchone()["n"]
+            for r in cur.execute(
+                    "SELECT s.file_id, s.rel, s.typeset, s.median_h, "
+                    "       s.tall_share, s.at, f.title, f.library "
+                    "FROM sub_shape s LEFT JOIN files f ON f.id = s.file_id "
+                    "ORDER BY s.at DESC LIMIT ?", (int(limit),)):
+                d = dict(r)
+                d["typeset"] = bool(d["typeset"])
+                rows.append(d)
+    except Exception:                                        # noqa: BLE001
+        pass
+    return {"summary": summary, "rows": rows, "live": screen_state()}
+
+
 def screen_for_typeset(pick: dict) -> dict:
     r"""Measure one candidate before it becomes an OCR job.
 
@@ -2448,12 +2510,38 @@ def screen_for_typeset(pick: dict) -> dict:
     """
     out = dict(pick, typeset_only=False, measured=0)
     fid, probe = pick.get("file_id"), pick.get("probe") or {}
+    from . import joblog as _jl
+    title = pick.get("title") or f"file {fid}"
     try:
         # has_shapes(), not typeset_rels(): an all-dialogue file has rows but
         # no typeset ones, and asking the wrong question re-reads it forever.
         if not has_shapes(fid):
-            out["measured"] = measure_file(fid, pick["path"], probe,
-                                           SETTINGS.cache_dir)
+            _SCREEN.update(now=title, file_id=fid, started=time.time())
+            t0 = time.time()
+            try:
+                out["measured"] = measure_file(fid, pick["path"], probe,
+                                               SETTINGS.cache_dir)
+            finally:
+                _SCREEN.update(now="", file_id=0, last=time.time())
+            el = time.time() - t0
+            _SCREEN["seen"] += 1
+            _SCREEN["measured"] += out["measured"]
+            if out["measured"]:
+                # SAY THE NUMBERS, not just the verdict. "typeset" on its own
+                # is unarguable-with; the share and the median are what let
+                # someone look at a wrong call and see which way it was wrong.
+                for rel, shp in shapes_for(fid).items():
+                    _jl.log(
+                        f"measured picture subtitles: {title} track {rel} - "
+                        f"{shp['tall_share']:.0%} of cues taller than "
+                        f"{TYPESET_TALL_FRAC:.0%} of frame "
+                        f"(median {shp['median_h']:.0%}) -> "
+                        + ("typeset signs" if shp["typeset"] else "dialogue")
+                        + f" [{el:.1f}s]", "info")
+            else:
+                _jl.log(f"could not measure the picture subtitles on {title} "
+                        f"- leaving it for the OCR to decide [{el:.1f}s]",
+                        "warn")
         known = typeset_rels(fid)
         if not known:
             return out
