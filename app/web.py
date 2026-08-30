@@ -10316,7 +10316,10 @@ async function hostIoLoad(){
   // local this answers "local: true" once and then stops for good, rather than
   // asking a question with a known answer every few seconds forever.
   if(_hostIoTimer) clearTimeout(_hostIoTimer);
-  if(_hostIo && !_hostIo.local) _hostIoTimer=setTimeout(hostIoLoad, 5000);
+  // The far side now samples about once a second, so asking every five threw
+  // four readings in five away and showed the fifth. Matched to the sampler:
+  // faster than this would poll for numbers that have not changed.
+  if(_hostIo && !_hostIo.local) _hostIoTimer=setTimeout(hostIoLoad, 1000);
 }
 // THE SAME TABLE, NOT A DIFFERENT ONE. A share collapses twelve spindles into
 // one row, and a strip of percentages above it is a second way of reading the

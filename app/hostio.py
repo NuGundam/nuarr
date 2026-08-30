@@ -37,6 +37,14 @@ from .config import NO_WINDOW, SETTINGS
 # One sample is a round trip to another machine; the panel repaints far more
 # often than that. TTL is generous because spindle load is not a millisecond
 # quantity, and a stale-but-labelled number beats a blank column.
+# How often the far side takes a reading. A spindle's load is a real-time
+# quantity and the panel repaints every second; sampling slower than that shows
+# you where the array was, not where it is.
+EVERY_S = 1.0
+# How long one sampler lives before the reader starts a fresh one. Long enough
+# that restarts are rare, short enough that a credential change, a host reboot
+# or a moved library is picked up without anyone restarting nuarr.
+LIFE_S = 300.0
 TTL_S = 6.0
 # A DCOM handshake to a busy server is not always quick, and 25s was being hit:
 # the panel then replaced twelve live rows with "timed out", which is a worse
@@ -53,6 +61,11 @@ _INFLIGHT: set = set()
 
 _PS = r"""
 $ErrorActionPreference = 'Stop'
+# HOW OFTEN TO SAMPLE, AND FOR HOW LONG. Set by the caller; a run that lives
+# forever would outlive a settings change and a run that lives for one reading
+# pays the handshake every time.
+$every = [double]($env:NUARR_HOSTIO_EVERY); if (-not $every) { $every = 1.0 }
+$until = [double]($env:NUARR_HOSTIO_LIFE);  if (-not $until) { $until = 300.0 }
 # SERVER AND USER COME THROUGH THE ENVIRONMENT, not as arguments: with
 # powershell -Command <script>, a trailing -args is swallowed into the command
 # string and $args arrives empty, which fails as "ComputerName is null" and
@@ -133,25 +146,41 @@ try {
       }
     }
   }
-  $perf = Get-CimInstance -CimSession $s -ClassName Win32_PerfFormattedData_PerfDisk_PhysicalDisk |
-          Where-Object { $_.Name -ne '_Total' }
-  $out = @{}
-  foreach ($d in $perf) {
-    $idx = ($d.Name -split '\s+')[0]
-    $label = $map[$idx]
-    if (-not $label) { continue }
-    $c = $capByDisk[$idx]
-    $out[$label] = @{
-      busy  = [math]::Round(100 - [double]$d.PercentIdleTime, 1)
-      read  = [double]$d.DiskReadBytesPersec
-      write = [double]$d.DiskWriteBytesPersec
-      queue = [double]$d.CurrentDiskQueueLength
-      size  = if ($c) { $c.size } else { 0 }
-      free  = if ($c) { $c.free } else { 0 }
+  # SAMPLE IN A LOOP DOWN ONE SESSION. Spawning PowerShell and shaking hands
+  # with the host for every reading cost a second or more before a number was
+  # even asked for, which is why the panel moved in five-second steps. The
+  # session, the volume list and the disk map are all worked out once; only the
+  # counters are re-read, so a reading costs about as much as the wire does.
+  #
+  # Capacity is not re-read every second either - free space does not move at
+  # that speed, and it is two more queries per tick to say so.
+  $t0 = [Diagnostics.Stopwatch]::StartNew()
+  while ($t0.Elapsed.TotalSeconds -lt $until) {
+    $perf = Get-CimInstance -CimSession $s -ClassName Win32_PerfFormattedData_PerfDisk_PhysicalDisk |
+            Where-Object { $_.Name -ne '_Total' }
+    $out = @{}
+    foreach ($d in $perf) {
+      $idx = ($d.Name -split '\s+')[0]
+      $label = $map[$idx]
+      if (-not $label) { continue }
+      $c = $capByDisk[$idx]
+      $out[$label] = @{
+        busy  = [math]::Round(100 - [double]$d.PercentIdleTime, 1)
+        read  = [double]$d.DiskReadBytesPersec
+        write = [double]$d.DiskWriteBytesPersec
+        queue = [double]$d.CurrentDiskQueueLength
+        size  = if ($c) { $c.size } else { 0 }
+        free  = if ($c) { $c.free } else { 0 }
+      }
     }
+    # One JSON object per line, flushed, so the reader sees each tick as it
+    # happens rather than when the pipe buffer decides.
+    $line = @{ ok = $true; via = $via; disks = $out } | ConvertTo-Json -Depth 5 -Compress
+    [Console]::Out.WriteLine($line)
+    [Console]::Out.Flush()
+    Start-Sleep -Milliseconds ([int]($every * 1000))
   }
   Remove-CimSession $s
-  @{ ok = $true; via = $via; disks = $out } | ConvertTo-Json -Depth 5 -Compress
 } catch {
   @{ ok = $false; why = $_.Exception.Message } | ConvertTo-Json -Compress
 }
@@ -198,12 +227,101 @@ def _creds_for(server: str) -> tuple:
     return "", ""
 
 
-def _sample(server: str) -> dict:
-    """One round trip. Blocking; callers use refresh() instead."""
+def _parse(line: str) -> dict:
+    """One JSON tick from the sampler into the shape the panel wants."""
+    try:
+        d = json.loads(line)
+    except Exception:                                        # noqa: BLE001
+        return {}
+    if not d.get("ok"):
+        return {"ok": False, "why": str(d.get("why") or "")[:200]}
+    disks = {}
+    for label, v in (d.get("disks") or {}).items():
+        try:
+            disks[label] = {"busy": float(v.get("busy") or 0),
+                            "read_bps": float(v.get("read") or 0),
+                            "write_bps": float(v.get("write") or 0),
+                            "queue": float(v.get("queue") or 0),
+                            "size": float(v.get("size") or 0),
+                            "free": float(v.get("free") or 0)}
+        except Exception:                                    # noqa: BLE001
+            continue
+    return {"ok": True, "disks": disks, "via": str(d.get("via") or "")}
+
+
+def _stream(server: str) -> None:
+    r"""Keep one sampler alive and take its readings as they arrive.
+
+    The old shape was a process per reading: spawn PowerShell, authenticate,
+    enumerate volumes, map disks, read counters, exit - a second or more of
+    setup to produce one number, which is why the panel moved in five-second
+    steps and every step was already stale. Now the setup happens once and the
+    loop on the far side only re-reads counters, so a tick costs about what the
+    wire costs.
+
+    Runs for LIFE_S and is restarted by the reader. A sampler that lived
+    forever would outlive a credential change, a reboot of the host, or the
+    library being pointed somewhere else.
+    """
     user, pwd = _creds_for(server)
     env = dict(os.environ)
     env["NUARR_HOSTIO_SERVER"] = server
     env["NUARR_HOSTIO_USER"] = user or ""
+    env["NUARR_HOSTIO_EVERY"] = str(EVERY_S)
+    env["NUARR_HOSTIO_LIFE"] = str(LIFE_S)
+    p = None
+    try:
+        p = subprocess.Popen(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", _PS],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, creationflags=NO_WINDOW,
+            env=env)
+        p.stdin.write((pwd or "") + "\n")
+        p.stdin.flush()
+        started = time.time()
+        got = False
+        for line in p.stdout:
+            line = (line or "").strip()
+            if not line.startswith("{"):
+                continue
+            res = _parse(line)
+            if not res:
+                continue
+            got = True
+            _store(server, res)
+        # The stream ended. If it never produced a reading, say why - the
+        # first stderr line, never the whole thing, which can quote the
+        # command back.
+        if not got:
+            err = ""
+            try:
+                err = (p.stderr.read() or "").strip().splitlines()
+                err = err[0][:200] if err else ""
+            except Exception:                                # noqa: BLE001
+                pass
+            if not err and time.time() - started >= TIMEOUT_S:
+                err = f"no answer within {TIMEOUT_S:.0f}s"
+            _store(server, {"ok": False, "why": err or "no answer"})
+    except Exception as e:                                   # noqa: BLE001
+        _store(server, {"ok": False, "why": f"{type(e).__name__}: {e}"})
+    finally:
+        try:
+            if p:
+                p.kill()
+        except Exception:                                    # noqa: BLE001
+            pass
+        with _LOCK:
+            _INFLIGHT.discard(server)
+
+
+def _sample(server: str) -> dict:
+    """One reading, synchronously. Kept for tests and one-off checks."""
+    user, pwd = _creds_for(server)
+    env = dict(os.environ)
+    env["NUARR_HOSTIO_SERVER"] = server
+    env["NUARR_HOSTIO_USER"] = user or ""
+    env["NUARR_HOSTIO_EVERY"] = "0"
+    env["NUARR_HOSTIO_LIFE"] = "0.001"      # one pass through the loop
     try:
         p = subprocess.Popen(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", _PS],
@@ -224,64 +342,44 @@ def _sample(server: str) -> dict:
         if ln.strip().startswith("{"):
             line = ln.strip()
     if not line:
-        # NEVER echo `err` wholesale - it can quote the command line back. The
-        # first line is the message; the rest is a PowerShell stack trace that
-        # helps nobody reading a settings page.
         why = (err or "").strip().splitlines()
         return {"ok": False, "why": (why[0][:200] if why else "no answer")}
-    try:
-        d = json.loads(line)
-    except Exception:                                        # noqa: BLE001
-        return {"ok": False, "why": "unreadable answer"}
-    if not d.get("ok"):
-        return {"ok": False, "why": str(d.get("why") or "")[:200]}
-    disks = {}
-    for label, v in (d.get("disks") or {}).items():
-        try:
-            disks[label] = {"busy": float(v.get("busy") or 0),
-                            "read_bps": float(v.get("read") or 0),
-                            "write_bps": float(v.get("write") or 0),
-                            "queue": float(v.get("queue") or 0),
-                            "size": float(v.get("size") or 0),
-                            "free": float(v.get("free") or 0)}
-        except Exception:                                    # noqa: BLE001
-            continue
-    return {"ok": True, "disks": disks, "via": str(d.get("via") or "")}
+    return _parse(line) or {"ok": False, "why": "unreadable answer"}
+
+
+def _store(server: str, res: dict) -> None:
+    """Take one reading into the cache, keeping the last good one on failure."""
+    now = time.time()
+    with _LOCK:
+        prev = _CACHE.get(server) or {}
+        if res.get("ok"):
+            _CACHE[server] = {"at": now, "good_at": now,
+                              "disks": res.get("disks") or {},
+                              "ok": True, "via": res.get("via") or "",
+                              "why": ""}
+        else:
+            # KEEP THE LAST GOOD READING. One slow handshake used to wipe
+            # twelve live rows and leave "timed out" in their place, which says
+            # less than numbers a few seconds old would have. The row ages
+            # visibly and disappears on its own once it is history.
+            good_at = prev.get("good_at") or 0
+            keep = bool(prev.get("disks")) and (now - good_at) < STALE_S
+            _CACHE[server] = {
+                "at": now, "good_at": good_at,
+                "disks": prev.get("disks") if keep else {},
+                "ok": bool(keep), "stale": bool(keep),
+                "via": prev.get("via") or "",
+                "why": res.get("why") or ""}
 
 
 def refresh(server: str) -> None:
-    """Sample in the background. One in flight per host, never two."""
+    """Make sure a sampler is running for this host. One, never two."""
     with _LOCK:
         if server in _INFLIGHT:
             return
         _INFLIGHT.add(server)
-
-    def run():
-        res = _sample(server)
-        now = time.time()
-        with _LOCK:
-            prev = _CACHE.get(server) or {}
-            if res.get("ok"):
-                _CACHE[server] = {"at": now, "good_at": now,
-                                  "disks": res.get("disks") or {},
-                                  "ok": True, "via": res.get("via") or "",
-                                  "why": ""}
-            else:
-                # KEEP THE LAST GOOD READING. One slow handshake used to wipe
-                # twelve live rows and leave "timed out" in their place, which
-                # says less than numbers a few seconds old would have. The row
-                # ages visibly and disappears on its own once it is history.
-                good_at = prev.get("good_at") or 0
-                keep = bool(prev.get("disks")) and (now - good_at) < STALE_S
-                _CACHE[server] = {
-                    "at": now, "good_at": good_at,
-                    "disks": prev.get("disks") if keep else {},
-                    "ok": bool(keep), "stale": bool(keep),
-                    "via": prev.get("via") or "",
-                    "why": res.get("why") or ""}
-            _INFLIGHT.discard(server)
-
-    threading.Thread(target=run, name=f"hostio-{server}", daemon=True).start()
+    threading.Thread(target=_stream, args=(server,),
+                     name=f"hostio-{server}", daemon=True).start()
 
 
 def disks(server: str = "") -> dict:
@@ -299,7 +397,10 @@ def disks(server: str = "") -> dict:
         server = srv[0]
     with _LOCK:
         hit = _CACHE.get(server)
-    if not hit or time.time() - hit["at"] > TTL_S:
+        running = server in _INFLIGHT
+    # The sampler pushes readings in on its own, so the only thing to check is
+    # that one is alive - not whether the last number is old.
+    if not running:
         refresh(server)
     return dict(hit or {})
 
