@@ -18873,14 +18873,24 @@ async function loadOcr(){
     <div class="lkind" style="margin-top:10px">
       <div class="lkindhead"><b style="color:#6fb0ff">What is installed</b></div>
       <table style="width:100%;font-size:12px;border-collapse:collapse">
-        ${socRow('Tesseract', s.tesseract_version||'—',
-          s.tesseract_dir?esc(s.tesseract_dir):'not found')}
-        ${socRow('pgsrip', s.pgsrip_version||'—', 'drives Tesseract over a PGS stream')}
-        ${socRow('paddleocr', p.paddleocr||'—', 'finds the text, then reads it')}
-        ${socRow('paddlepaddle', p.paddlepaddle||'—',
+        <thead><tr class="dim" style="font-size:10.5px">
+          <th style="text-align:left;padding:0 12px 4px">Component</th>
+          <th style="text-align:left;padding:0 12px 4px 0">Version</th>
+          <th style="text-align:left;padding:0 12px 4px 0">Installed at</th>
+          <th style="text-align:left;padding:0 12px 4px 0">What it does</th>
+        </tr></thead>
+        ${socRow('Tesseract', s.tesseract_version||'—', s.tesseract_dir,
+          'reads the pictures'+(s.tesseract_managed?' — installed by nuarr':''))}
+        ${socRow('pgsrip', s.pgsrip_version||'—', s.pgsrip_dir,
+          'drives Tesseract over a PGS stream')}
+        ${socRow('paddleocr', p.paddleocr||'—', p.paddleocr_dir,
+          'finds the text, then reads it')}
+        ${socRow('paddlepaddle', p.paddlepaddle||'—', p.paddlepaddle_dir,
           p.cuda?'GPU build — can use the card'
                 :(p.gpu_name?`CPU build — a GPU is present (${esc(p.gpu_name)}) but unused`
                             :'CPU build'))}
+        ${p.python?socRow('Python', '', p.python,
+          'the interpreter the two paddle packages live in'):''}
       </table>
       <div style="padding:0 12px 11px">${padStrip}</div>
     </div>
@@ -19400,10 +19410,17 @@ async function ocrUpdRun(which){
   ocrUpdLoad();
 }
 
-function socRow(k,v,why){
+// WHERE, for every row and not just Tesseract. Three of the four lived inside
+// a Python environment whose location the page never mentioned, so "paddleocr
+// 3.7.0" gave no way to find it, check it, or tell which interpreter was
+// carrying it on a machine with more than one.
+function socRow(k,v,where,why){
   return `<tr style="border-top:1px solid var(--line)">
     <td style="padding:5px 12px;white-space:nowrap">${esc(k)}</td>
-    <td class="mono" style="white-space:nowrap">${esc(String(v))}</td>
+    <td class="mono" style="white-space:nowrap;padding-right:12px">${esc(String(v))}</td>
+    <td class="mono dim" style="font-size:10.5px;padding-right:12px;
+        word-break:break-all">${where?esc(where)
+          :'<span style="font-family:inherit">not found</span>'}</td>
     <td class="dim" style="font-size:11px;padding-right:12px;word-break:break-all">${why}</td></tr>`;
 }
 

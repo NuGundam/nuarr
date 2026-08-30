@@ -1596,10 +1596,18 @@ def status() -> dict:
         rc, out = _run([exe, "--version"], timeout=20)
         m = re.search(r"tesseract\s+v?([\w.\-]+)", out or "")
         tver = m.group(1) if m else ""
-    pg = ""
+    pg, pgdir = "", ""
     try:
         from importlib import metadata
         pg = metadata.version("pgsrip")
+        # WITHOUT IMPORTING IT. find_spec() reads the module's location from
+        # the finder; importing pgsrip here to read __file__ would drag its
+        # dependencies into the web server on every settings page load, to
+        # print a string.
+        from importlib.util import find_spec
+        spec = find_spec("pgsrip")
+        if spec and spec.origin:
+            pgdir = os.path.dirname(spec.origin)
     except Exception:                                    # noqa: BLE001
         pass
     from .config import DATA_DIR
@@ -1609,6 +1617,7 @@ def status() -> dict:
         "tesseract_version": tver,
         "tesseract_managed": tdir.startswith(str(DATA_DIR)),
         "pgsrip_version": pg,
+        "pgsrip_dir": pgdir,
         "ready": bool(tver and pg),
         "install": dict(_INSTALL),
         # The install-wide engine, for the OCR engines page.
@@ -1799,15 +1808,24 @@ def paddle_info(force: bool = False) -> dict:
     import subprocess as _sp
     import sys as _sys
     out = {"installed": False, "paddleocr": "", "paddlepaddle": "",
-           "cuda": False, "gpu_name": "", "install": dict(PADDLE_INSTALL)}
+           "cuda": False, "gpu_name": "", "install": dict(PADDLE_INSTALL),
+           "paddleocr_dir": "", "paddlepaddle_dir": "", "python": ""}
+    # ASK FOR THE PATH WHILE WE ARE IN THERE. The child already imports both
+    # modules to read their versions; __file__ is sitting right next to
+    # __version__ and costs nothing extra. Reporting the package directory
+    # rather than the file, since "where is it installed" means the folder -
+    # and the interpreter too, because on a machine with several Pythons the
+    # version alone does not tell you WHICH one is carrying it.
     code = (
-        "import json\n"
-        "d={}\n"
+        "import json, os, sys\n"
+        "d={'python': sys.executable}\n"
         "try:\n"
         "    import paddleocr; d['paddleocr']=getattr(paddleocr,'__version__','?')\n"
+        "    d['paddleocr_dir']=os.path.dirname(getattr(paddleocr,'__file__','') or '')\n"
         "except Exception: pass\n"
         "try:\n"
         "    import paddle; d['paddlepaddle']=paddle.__version__\n"
+        "    d['paddlepaddle_dir']=os.path.dirname(getattr(paddle,'__file__','') or '')\n"
         "    d['cuda']=bool(paddle.device.is_compiled_with_cuda())\n"
         "except Exception: pass\n"
         "print(json.dumps(d))\n")
@@ -1829,7 +1847,10 @@ def paddle_info(force: bool = False) -> dict:
             d = json.loads(lines[-1])
             out.update(paddleocr=d.get("paddleocr", ""),
                        paddlepaddle=d.get("paddlepaddle", ""),
-                       cuda=bool(d.get("cuda")))
+                       cuda=bool(d.get("cuda")),
+                       paddleocr_dir=d.get("paddleocr_dir", ""),
+                       paddlepaddle_dir=d.get("paddlepaddle_dir", ""),
+                       python=d.get("python", ""))
             out["installed"] = bool(out["paddleocr"] and out["paddlepaddle"])
     except Exception:                                    # noqa: BLE001
         pass
