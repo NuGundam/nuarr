@@ -53,6 +53,7 @@ import os
 import time
 
 from . import joblog
+from . import pathmap
 from .config import SETTINGS
 from . import schedules
 from .db import cursor
@@ -114,15 +115,21 @@ def _owning_parent(items: list, path: str):
     Matched on the FOLDER, not the title: the title in a filename is whatever
     the release group typed, while the folder is what the arr itself created.
     """
-    want = os.path.normcase(os.path.dirname(path))
+    # THROUGH pathmap, NOT A RAW PREFIX TEST. nuarr and the arr can reach the
+    # same folder by different roads - P:\Anime Movies where the arr runs,
+    # \\192.168.0.176\P\Anime Movies here - and a string compare then reports
+    # "no arr manages this folder" about a folder an arr manages perfectly
+    # well. Where the two agree, pathmap.under() is the same comparison as
+    # before; where they do not, it is the only one that works.
+    want = os.path.dirname(path)
     best = None
     for it in items or []:
-        p = os.path.normcase(it.get("path") or "")
+        p = it.get("path") or ""
         if not p:
             continue
-        if want == p or want.startswith(p + os.sep):
+        if pathmap.under(want, p):
             # longest match wins - a season folder sits inside a series folder
-            if best is None or len(p) > len(os.path.normcase(best.get("path") or "")):
+            if best is None or len(p) > len(best.get("path") or ""):
                 best = it
     return best
 
@@ -178,7 +185,6 @@ async def _adopt_one(row: dict) -> tuple[str, str]:
 
             kind = "episodefile" if cfg.kind == "sonarr" else "moviefile"
             files = await c._get(f"/{kind}", **{key: pid})
-            want = os.path.normcase(path)
 
             # IS THE EPISODE ALREADY SATISFIED?
             #
@@ -194,7 +200,7 @@ async def _adopt_one(row: dict) -> tuple[str, str]:
                 return "duplicate", already
 
             for f in files or []:
-                if os.path.normcase(f.get("path") or "") == want:
+                if pathmap.same(f.get("path") or "", path):
                     with cursor() as cur:
                         cur.execute(
                             "UPDATE files SET arr_name=?, arr_file_id=?, "
@@ -244,14 +250,16 @@ def _episode_already_has_file(files: list, path: str) -> str | None:
     want = _key(os.path.basename(path))
     if not want:
         return None
-    mine = os.path.normcase(path)
     for f in files or []:
         p = f.get("path") or ""
-        if os.path.normcase(p) == mine:
+        if pathmap.same(p, path):
             continue                       # that is this very file
         if _key(os.path.basename(p)) != want:
             continue
-        if not os.path.exists(p):
+        # os.path.exists on the ARR's spelling would be false on a machine that
+        # reaches the file by another road, and a "missing" duplicate is one
+        # that gets reported as not-a-duplicate.
+        if not os.path.exists(pathmap.to_local(p)):
             continue                       # the arr's copy is gone; not a dupe
         gb = (f.get("size") or 0) / 1024 ** 3
         which = (f"S{want[1]:02d}E{want[2]:02d}" if want[0] == "se"
@@ -417,8 +425,7 @@ async def _still_duplicate(path: str) -> str | None:
             key = "seriesId" if cfg.kind == "sonarr" else "movieId"
             kind = "episodefile" if cfg.kind == "sonarr" else "moviefile"
             files = await c._get(f"/{kind}", **{key: parent.get("id")})
-            mine = os.path.normcase(path)
-            if any(os.path.normcase(f.get("path") or "") == mine
+            if any(pathmap.same(f.get("path") or "", path)
                    for f in files or []):
                 return None      # the arr adopted it since - not a leftover
             return _episode_already_has_file(files, path)
@@ -455,17 +462,19 @@ async def _untracked_sibling(path: str) -> str | None:
             key = "seriesId" if cfg.kind == "sonarr" else "movieId"
             kind = "episodefile" if cfg.kind == "sonarr" else "moviefile"
             files = await c._get(f"/{kind}", **{key: parent.get("id")})
-            tracked = {os.path.normcase(f.get("path") or "")
+            # Normalised to the LOCAL spelling once, here, so the membership
+            # test below stays a set lookup rather than an n-by-m compare.
+            tracked = {pathmap._norm(pathmap.to_local(f.get("path") or ""))
                        for f in files or []}
             folder = os.path.dirname(path)
             for name in os.listdir(folder):
                 cand = os.path.join(folder, name)
-                if os.path.normcase(cand) == os.path.normcase(path):
+                if pathmap.same(cand, path):
                     continue
                 fm = re.search(r"S(\d+)E(\d+)", name, re.I)
                 if not fm or fm.groups() != m.groups():
                     continue
-                if os.path.normcase(cand) in tracked:
+                if pathmap._norm(cand) in tracked:
                     continue
                 if os.path.isfile(cand):
                     return cand

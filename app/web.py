@@ -2565,23 +2565,6 @@ def _summary_impl():
                               "goto": "/settings#arrs"})
     except Exception:                                    # noqa: BLE001
         pass
-    try:
-        # STUCK FILES ARE ATTENTION. The tile sums everything that wants a
-        # human, and a file whose last attempt failed and which nothing has
-        # since put right is the plainest example there is - it was the one
-        # source the tile did not count, so "nothing needs attention" could sit
-        # above thirteen files that had been stuck for weeks.
-        nl = _rows("SELECT COUNT(*) n FROM files f "
-                   " WHERE f.state NOT IN ('deleted','duplicate') "
-                   "   AND (SELECT j.state FROM jobs j WHERE j.file_id = f.id "
-                   "         ORDER BY j.id DESC LIMIT 1) "
-                   "       IN ('failed','blocked')")
-        if nl and nl[0]["n"]:
-            attention.append({"what": "still not landed", "n": int(nl[0]["n"]),
-                              "note": "last attempt failed, nothing fixed it",
-                              "goto": "/settings#notland"})
-    except Exception:                                    # noqa: BLE001
-        pass
     return {"states": states, "disks": disks, "libraries": libs,
             "saved": saved, "attention": attention,
             "errors": errors, "error_kinds": err_kinds,
@@ -4203,6 +4186,13 @@ def api_subocr_status():
     """The OCR tool page: engine versions, switches, thresholds."""
     from . import subocr
     return subocr.status()
+
+
+@app.get("/api/pathmap")
+def api_pathmap():
+    """How nuarr's paths line up with the arrs' - and where they do not."""
+    from . import pathmap
+    return pathmap.describe()
 
 
 @app.get("/api/pipeline")
@@ -22248,10 +22238,66 @@ async function arrForget(kind){
   }catch(e){ m.textContent='✗ '+e.message; m.className='arrmsg err'; }
 }
 
+// ---- how nuarr's paths line up with the arrs' -------------------------
+// SHOWN BECAUSE IT IS A GUESS. The mapping is inferred from folder names, and
+// an inference that quietly sends files to the wrong series is worse than one
+// that admits it could not decide. This panel is where a wrong guess becomes
+// visible; on an install where both sides agree it says so in one line and
+// takes up almost no room.
+async function loadPathMap(){
+  const el=document.getElementById('pmapBody');
+  if(!el) return;
+  let d;
+  try{ d=await (await fetch('/api/pathmap')).json(); }
+  catch(e){ el.innerHTML='<div class="dim">could not load</div>'; return; }
+  const pairs=d.pairs||[], bad=d.unmatched||[], xl=d.translating||[];
+  if(!d.learned || !pairs.length){
+    el.innerHTML=`<div class="dim" style="font-size:11.5px">
+      Not worked out yet — this fills in after the next scan reads the arrs'
+      file lists. Until then nothing is translated, which is the same
+      behaviour as before.</div>`;
+    return;
+  }
+  if(!xl.length && !bad.length){
+    el.innerHTML=`<div style="font-size:11.5px;color:var(--ok)">
+      nuarr and the arrs use the same paths — nothing is being translated.</div>`;
+    return;
+  }
+  const row=p=>`<tr style="border-top:1px solid var(--line)">
+    <td class="mono" style="padding:3px 10px 3px 0;font-size:10.5px;
+        word-break:break-all">${esc(p.local||'')}</td>
+    <td style="padding:3px 8px 3px 0;color:var(--dim)">${p.ok?'↔':'✕'}</td>
+    <td class="mono" style="padding:3px 10px 3px 0;font-size:10.5px;
+        word-break:break-all;${p.ok?'':'color:var(--warn)'}"
+        >${p.arr?esc(p.arr):'—'}</td>
+    <td class="dim" style="padding:3px 0;font-size:10.5px">${esc(p.why||'')}</td>
+  </tr>`;
+  el.innerHTML=`
+    <div class="dim" style="font-size:11px;margin-bottom:5px">
+      Worked out by matching folder names, because the arrs and nuarr can reach
+      the same files by different roads. Anything listed as unmatched is not
+      translated at all — files under it will look like they belong to no arr.
+    </div>
+    <table style="width:100%;border-collapse:collapse;font-size:11.5px">
+      <thead><tr class="dim" style="font-size:10.5px">
+        <th style="text-align:left;padding:0 10px 3px 0">nuarr sees</th>
+        <th></th>
+        <th style="text-align:left;padding:0 10px 3px 0">the arr calls it</th>
+        <th style="text-align:left;padding:0 0 3px 0">how it was decided</th>
+      </tr></thead>
+      <tbody>${pairs.map(row).join('')}</tbody>
+    </table>
+    ${bad.length?`<div style="color:var(--warn);font-size:11px;margin-top:6px">
+      ${bad.length} librar${bad.length===1?'y is':'ies are'} unmatched — files
+      there cannot be linked to an arr until the folder names line up or a
+      mapping is set by hand.</div>`:''}`;
+}
+
 async function loadArrsTab(){
   loadArrConns();
   loadArrHealth();
   loadLangSync();
+  loadPathMap();
   const el=document.getElementById('arrsBody');
   if(!el) return;
   let d;

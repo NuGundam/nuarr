@@ -1563,8 +1563,23 @@ def _verify_unmanaged_sync(arr_files, status) -> dict:
     in hundreds of milliseconds does not belong on the loop when the cost of
     moving it off is one to_thread.
     """
-    by_path = {os.path.normcase(a.path): a for a in arr_files if a.path}
-    known_dirs = {os.path.normcase(os.path.dirname(a.path))
+    # LEARN THE MAPPING HERE, because this is the one place that holds both
+    # the arr's paths and nuarr's in the same breath. Anywhere else would have
+    # to re-fetch the arr's file list purely to work out a prefix.
+    from . import pathmap
+    try:
+        pathmap.learn([a.path for a in arr_files if a.path])
+    except Exception:                                        # noqa: BLE001
+        pass
+
+    # Everything below compares in the LOCAL spelling: the arr's paths are
+    # translated once, here, so the lookups stay dictionary hits rather than
+    # a translate-and-compare for every row against every arr file.
+    def _loc(p):
+        return pathmap._norm(pathmap.to_local(p or ""))
+
+    by_path = {_loc(a.path): a for a in arr_files if a.path}
+    known_dirs = {os.path.dirname(_loc(a.path))
                   for a in arr_files if a.path}
     # a series folder is the PARENT of a season folder - match either level
     known_parents = {os.path.dirname(d) for d in known_dirs}
@@ -1580,7 +1595,7 @@ def _verify_unmanaged_sync(arr_files, status) -> dict:
             "AND state NOT IN ('duplicate','deleted') AND COALESCE(size,0)>=?",
             (cut,))]
         for r in rows:
-            p = os.path.normcase(r["path"] or "")
+            p = pathmap._norm(r["path"] or "")
             hit = by_path.get(p)
             if hit:
                 # ADOPT it - the arr does track this file, we simply had not
@@ -1616,7 +1631,7 @@ def _verify_unmanaged_sync(arr_files, status) -> dict:
                     (hit.arr_name, hit.file_id, hit.parent_id, now, r["id"]))
                 linked += 1
                 continue
-            d = os.path.normcase(os.path.dirname(r["path"] or ""))
+            d = os.path.dirname(pathmap._norm(r["path"] or ""))
             if d in known_dirs or d in known_parents or os.path.dirname(d) in known_parents:
                 orphan_in_known.append(r["id"])
             else:

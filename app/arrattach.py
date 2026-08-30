@@ -39,6 +39,7 @@ from .arr import shared_client
 from .config import SETTINGS
 from .db import cursor
 from . import joblog
+from . import pathmap
 
 STATS: dict = {"checked": 0, "reattached": 0, "unmatched": 0, "last_run": 0.0}
 
@@ -59,16 +60,19 @@ async def arr_has_file(cfg, parent_id: int, path: str) -> bool:
                                                   movieId=int(parent_id))
     except Exception:
         return True          # cannot tell - assume fine rather than act on noise
-    want = os.path.normcase(os.path.normpath(path))
-    return any(os.path.normcase(os.path.normpath(f.get("path") or "")) == want
+    return any(pathmap.same(f.get("path") or "", path)
                for f in files or [])
 
 
 async def reattach(cfg, parent_id: int, path: str) -> tuple[bool, str]:
     """Attach an existing file to its episode via ManualImport."""
     c = shared_client(cfg)
-    folder = os.path.dirname(path)
-    want = os.path.normcase(os.path.normpath(path))
+    # THE ARR HAS TO BE ASKED IN ITS OWN SPELLING. This folder goes over the
+    # wire to the arr, which will look for it on its own filesystem - handing
+    # it a UNC path it cannot resolve returns an empty candidate list and the
+    # honest-looking message "the arr does not offer this file", which sent us
+    # looking at import rules rather than at the path.
+    folder = pathmap.to_arr(os.path.dirname(path))
     try:
         if cfg.kind == "sonarr":
             cands = await c._get("/manualimport", folder=folder,
@@ -82,8 +86,7 @@ async def reattach(cfg, parent_id: int, path: str) -> tuple[bool, str]:
         return False, f"could not list import candidates: {type(e).__name__}"
 
     me = next((x for x in (cands or [])
-               if os.path.normcase(os.path.normpath(x.get("path") or "")) == want),
-              None)
+               if pathmap.same(x.get("path") or "", path)), None)
     if not me:
         return False, "the arr does not offer this file as an import candidate"
 
