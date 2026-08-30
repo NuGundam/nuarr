@@ -19911,6 +19911,13 @@ const _PIPE_GAP=_PIPE_GX-_PIPE_W;
 function pipeXY(n){
   return {x:_PIPE_PAD+n.col*_PIPE_GX, y:_PIPE_PAD+n.row*_PIPE_GY};
 }
+// The drawn width of a graph, so the wrapper can be given a definite size.
+// An inline-block sized by a child's max-width collapses instead of measuring,
+// which is how the centred pair ended up squeezed into a column.
+function pipeWidth(g){
+  const maxCol=Math.max(...(g.nodes||[{col:0}]).map(n=>n.col));
+  return _PIPE_PAD*2+maxCol*_PIPE_GX+_PIPE_W;
+}
 function pipeNodeColor(n){
   if(n.kind==='pool')  return poolColor(n.pool||'');
   if(n.kind==='bad')   return 'var(--bad)';
@@ -19993,20 +20000,33 @@ function pipeDraw(){
   const el=document.getElementById('processBody');
   if(!el||!_pipe) return;
   const r=_pipeRoute;
+  // THE TRACE BOX ALWAYS OCCUPIES THE SAME SPACE. Its height varies with the
+  // number of steps - four for a file that went straight through, nine for one
+  // that took the subtitle branch - and the auto tour changes files every ten
+  // seconds. Letting it size to its content made the diagram beneath it jump
+  // up and down while you were looking at it. So the box is a fixed height and
+  // the empty state lives inside it rather than collapsing it to nothing.
   const trace = r && r.found ? `
-    <div class="lkind" style="padding:9px 12px;margin-bottom:10px">
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
         <b style="color:#6fb0ff">${esc(r.title||'')}</b>
         <span class="dim" style="font-size:11px">${esc(r.library||'')}</span>
         <button style="margin-left:auto;font-size:11px;padding:2px 8px"
           onclick="pipeClear()">Clear trace</button>
       </div>
-      <div style="margin-top:6px;font-size:11.5px">
+      <div style="margin-top:6px;font-size:11.5px;overflow:auto;
+                  max-height:132px">
         ${(r.steps||[]).map(s=>`<div style="padding:1px 0">
            <span class="dim" style="display:inline-block;min-width:96px">
              ${esc(s[0])}</span> ${esc(s[1])}</div>`).join('')}
-      </div>
-    </div>` : '';
+      </div>`
+    : `<div class="dim" style="font-size:11.5px;display:flex;
+             align-items:center;height:100%">
+         ${_pipeCycle
+           ? 'Touring real files — a different one every ten seconds. '
+             +'Search a title, or pause the tour, to hold one still.'
+           : 'Search a title above to trace one file, or start the tour to '
+             +'watch real ones go through.'}
+       </div>`;
   el.innerHTML=`
     <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px;
                 flex-wrap:wrap">
@@ -20023,12 +20043,21 @@ function pipeDraw(){
           (_pipe.libraries||[]).length===1?'y':'ies'}</span>
     </div>
     <div id="pipeHits"></div>
-    ${trace}
-    <div style="overflow-x:auto">${pipeSvg(_pipe, r?r.path:null, 'a')}</div>
-    <div class="lkindhead" style="margin:14px 0 6px"><b style="color:#6fb0ff">
-      Picture subtitles — the branch with a measurement behind it</b></div>
-    <div style="overflow-x:auto">${
-      pipeSvg(_pipe.sub, r?r.sub_path:null, 'b')}</div>`;
+    <div class="lkind" style="padding:9px 12px;margin-bottom:10px;
+                              height:170px;box-sizing:border-box;
+                              overflow:hidden">${trace}</div>
+    <!-- Centred AS A PAIR, not one each. The subtitle graph is narrower, so
+         centring it on its own would slide its columns out of line with the
+         main one directly above it - and the two reading as one picture is
+         most of why they are on the same page. -->
+    <div style="overflow-x:auto;display:flex;justify-content:center">
+      <div style="width:${pipeWidth(_pipe)}px;max-width:100%;flex:0 0 auto">
+        ${pipeSvg(_pipe, r?r.path:null, 'a')}
+        <div class="lkindhead" style="margin:14px 0 6px"><b style="color:#6fb0ff">
+          Picture subtitles — the branch with a measurement behind it</b></div>
+        ${pipeSvg(_pipe.sub, r?r.sub_path:null, 'b')}
+      </div>
+    </div>`;
 }
 function pipeClear(){ _pipeRoute=null; _pipeQ=''; pipeDraw(); }
 let _pipeFindT=null;
