@@ -30,7 +30,7 @@ import time
 from ctypes import wintypes
 from dataclasses import dataclass, field
 
-from . import fileops, joblog
+from . import fileops, joblog, pathmap
 from .arr import ArrFile, gather_arr_files
 from .config import SETTINGS
 from .db import cursor, kv_get, kv_set, log_event
@@ -1575,7 +1575,6 @@ def _verify_unmanaged_sync(arr_files, status) -> dict:
     # LEARN THE MAPPING HERE, because this is the one place that holds both
     # the arr's paths and nuarr's in the same breath. Anywhere else would have
     # to re-fetch the arr's file list purely to work out a prefix.
-    from . import pathmap
     try:
         pathmap.learn([a.path for a in arr_files if a.path])
     except Exception:                                        # noqa: BLE001
@@ -1684,12 +1683,34 @@ def _verify_unmanaged_sync(arr_files, status) -> dict:
                     "   AND COALESCE(adopt_state,'')='no_folder'")
         stale_cleared = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
 
+        # A LINKED FILE SHOULD KNOW ITS NAME. Rows linked before the title was
+        # carried across stayed "(untitled)" everywhere they appeared - the
+        # queue, the activity list, every log line - and would have stayed that
+        # way until each file happened to be re-linked, which for an already
+        # linked file is never. The arr's answer is in hand right now, so the
+        # blanks are filled from it. Only blanks: a title we already have is
+        # not the arr's to overwrite.
+        named = 0
+        for a in arr_files:
+            if not a.title:
+                continue
+            cur.execute(
+                "UPDATE files SET title=?, season=COALESCE(season,?), "
+                "  episode=COALESCE(episode,?) "
+                " WHERE arr_name=? AND arr_file_id=? "
+                "   AND COALESCE(title,'')=''",
+                (a.title, a.season, a.episode, a.arr_name, a.file_id))
+            named += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
     if stale_cleared:
         joblog.log(f"cleared a stale 'cannot be adopted' note from "
                    f"{stale_cleared} file(s) the arr does in fact manage",
                    "info")
+    if named:
+        joblog.log(f"took the title from the arr for {named} file(s) that had "
+                   f"none", "info")
     return {"checked": len(rows), "linked_to_arr": linked,
-            "stale_adopt_cleared": stale_cleared,
+            "stale_adopt_cleared": stale_cleared, "titles_filled": named,
             "merged_duplicate_rows": merged,
             "arr_knows_folder_not_file": len(orphan_in_known),
             "not_in_any_arr": len(orphan_unknown), "status": status}
