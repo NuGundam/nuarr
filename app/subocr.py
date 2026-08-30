@@ -671,6 +671,43 @@ def forget_shapes(file_id: int) -> None:
         pass
 
 
+def _probe_duration(probe: dict) -> float:
+    r"""Runtime in seconds, from wherever this probe happens to keep it.
+
+    format.duration is missing often enough to matter - some MKVs carry it
+    only on the streams - and without it the progress bar has no denominator
+    and falls back to a barber's pole. That was the difference between a
+    Fist of the North Star episode showing a real percentage and showing
+    twenty-one seconds of stripes.
+    """
+    try:
+        d = float((probe.get("format") or {}).get("duration") or 0)
+        if d > 0:
+            return d
+    except (TypeError, ValueError):
+        pass
+    best = 0.0
+    for s in (probe.get("streams") or []):
+        for key in ("duration",):
+            try:
+                v = float(s.get(key) or 0)
+            except (TypeError, ValueError):
+                continue
+            best = max(best, v)
+        # Matroska hangs the runtime off a tag rather than the stream.
+        tags = s.get("tags") or {}
+        for key in ("DURATION", "duration"):
+            t = tags.get(key)
+            if not t:
+                continue
+            try:
+                h, m, sec = str(t).split(":")
+                best = max(best, int(h) * 3600 + int(m) * 60 + float(sec))
+            except (ValueError, TypeError):
+                continue
+    return best
+
+
 def _extract_sup_watched(path: str, rel: int, work: str, tag: str,
                          duration: float, on_frac=None) -> str:
     r"""extract_sup(), but reporting how far through the container it is.
@@ -756,11 +793,7 @@ def measure_file(file_id: int, path: str, probe: dict,
             if work is None:
                 work = tempfile.mkdtemp(prefix="shape_", dir=work_root or None)
             try:
-                dur = 0.0
-                try:
-                    dur = float((probe.get("format") or {}).get("duration") or 0)
-                except (TypeError, ValueError):
-                    dur = 0.0
+                dur = _probe_duration(probe)
                 _SCREEN["track"] = rel
                 _SCREEN["frac"] = 0.0
                 sup = _extract_sup_watched(
@@ -1809,7 +1842,8 @@ def paddle_info(force: bool = False) -> dict:
     import sys as _sys
     out = {"installed": False, "paddleocr": "", "paddlepaddle": "",
            "cuda": False, "gpu_name": "", "install": dict(PADDLE_INSTALL),
-           "paddleocr_dir": "", "paddlepaddle_dir": "", "python": ""}
+           "paddleocr_dir": "", "paddlepaddle_dir": "", "python": "",
+           "python_version": ""}
     # ASK FOR THE PATH WHILE WE ARE IN THERE. The child already imports both
     # modules to read their versions; __file__ is sitting right next to
     # __version__ and costs nothing extra. Reporting the package directory
@@ -1817,8 +1851,8 @@ def paddle_info(force: bool = False) -> dict:
     # and the interpreter too, because on a machine with several Pythons the
     # version alone does not tell you WHICH one is carrying it.
     code = (
-        "import json, os, sys\n"
-        "d={'python': sys.executable}\n"
+        "import json, os, sys, platform\n"
+        "d={'python': sys.executable, 'python_version': platform.python_version()}\n"
         "try:\n"
         "    import paddleocr; d['paddleocr']=getattr(paddleocr,'__version__','?')\n"
         "    d['paddleocr_dir']=os.path.dirname(getattr(paddleocr,'__file__','') or '')\n"
@@ -1850,7 +1884,8 @@ def paddle_info(force: bool = False) -> dict:
                        cuda=bool(d.get("cuda")),
                        paddleocr_dir=d.get("paddleocr_dir", ""),
                        paddlepaddle_dir=d.get("paddlepaddle_dir", ""),
-                       python=d.get("python", ""))
+                       python=d.get("python", ""),
+                       python_version=d.get("python_version", ""))
             out["installed"] = bool(out["paddleocr"] and out["paddlepaddle"])
     except Exception:                                    # noqa: BLE001
         pass

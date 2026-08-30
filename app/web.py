@@ -18889,7 +18889,7 @@ async function loadOcr(){
           p.cuda?'GPU build — can use the card'
                 :(p.gpu_name?`CPU build — a GPU is present (${esc(p.gpu_name)}) but unused`
                             :'CPU build'))}
-        ${p.python?socRow('Python', '', p.python,
+        ${p.python?socRow('Python', p.python_version||'—', p.python,
           'the interpreter the two paddle packages live in'):''}
       </table>
       <div style="padding:0 12px 11px">${padStrip}</div>
@@ -19067,6 +19067,13 @@ async function shapeLoad(){
   // file it has demuxed, so this is the fraction actually read - which is the
   // whole cost of the check. A striped indeterminate bar stands in only for the
   // moment before the first reading arrives, rather than faking a number.
+  //
+  // SMOOTHNESS IS THE TRANSITION MATCHING THE POLL, not a faster poll. The bar
+  // moved in visible steps because it was given .4s to travel a distance that
+  // arrived every 1.5s, so it lurched and then sat still for a second. The
+  // poll is now 900ms and the transition 1.05s - very slightly longer than the
+  // gap, so each glide is still running when the next reading lands and the
+  // movement never stops.
   const pct=Math.round((live.frac||0)*100);
   const gb=live.size?(live.size/1e9).toFixed(1)+' GB':'';
   const head = busy
@@ -19078,16 +19085,18 @@ async function shapeLoad(){
              <span class="dim">track ${live.track||0}${gb?' · '+gb:''}
                · ${(live.busy_s||0).toFixed(0)}s</span></span>
            <span class="dim" style="margin-left:auto;white-space:nowrap">
-             ${live.frac?pct+'%':''}</span>
+             ${live.frac?pct+'%':'opening the file…'}</span>
          </div>
          <div style="height:5px;border-radius:3px;background:#1e242c;margin-top:5px;
                      overflow:hidden">
-           <div style="height:100%;border-radius:3px;
+           <div id="shapeBar" style="height:100%;border-radius:3px;
                        ${live.frac
-                         ? `width:${pct}%;background:#6fb0ff;transition:width .4s linear`
+                         ? `width:${pct}%;background:#6fb0ff;
+                            transition:width 1.05s linear`
                          : `width:100%;background:repeating-linear-gradient(90deg,
                               #6fb0ff33 0 10px,#6fb0ff11 10px 20px);
-                            animation:shapeCrawl 1s linear infinite`}"></div>
+                            background-size:20px 100%;
+                            animation:shapeCrawl .9s linear infinite`}"></div>
          </div>
        </div>`
     : `<div class="dim" style="font-size:11.5px">not reading anything right now</div>`;
@@ -19119,7 +19128,7 @@ async function shapeLoad(){
     if(!held) shapeRender();
   }
   if(_shapeTimer) clearTimeout(_shapeTimer);
-  _shapeTimer=setTimeout(shapeLoad, busy?1500:15000);
+  _shapeTimer=setTimeout(shapeLoad, busy?900:15000);
 }
 
 // ---- what each engine can actually do, on THIS install ------------------
