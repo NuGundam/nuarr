@@ -21159,15 +21159,24 @@ async function loadArrsTab(){
   catch(e){ el.innerHTML=`<div class="err">could not load: ${esc(String(e))}</div>`; return; }
   const g=d.stats.guard||{}, t=d.stats.trash||{};
   // `ed` is optional: {label, kind, names:{radarr:[],sonarr:[]}, empty}
+  // min-width:0 on the input is what stops the Pick button being pushed off
+  // the edge: a flex item's default minimum is its CONTENT width, so a long
+  // comma-separated value refused to shrink and shoved the button out of the
+  // panel. flex:none on the button keeps it its natural size either way.
   const nameRow=(ed,arr)=>{
     const list=(ed.names[arr]||[]);
-    return `<div style="display:flex;gap:6px;align-items:flex-start;margin-top:4px">
-      <span class="dim" style="width:52px;flex:none;font-size:11px;padding-top:5px">${arr}</span>
-      <input id="nm-${ed.kind}-${arr}" style="flex:1;font-size:11px"
-             placeholder="comma-separated names — leave empty for none"
-             value="${esc(list.join(', '))}">
-      <button style="font-size:10px;padding:2px 7px"
-              onclick="arrsPick('${ed.kind}','${arr}')">Pick…</button>
+    return `<div style="margin-top:4px">
+      <div style="display:flex;gap:6px;align-items:center">
+        <span class="dim" style="width:52px;flex:none;font-size:11px">${arr}</span>
+        <input id="nm-${ed.kind}-${arr}" style="flex:1;min-width:0;font-size:11px"
+               placeholder="comma-separated names — leave empty for none"
+               value="${esc(list.join(', '))}">
+        <button style="font-size:10px;padding:2px 9px;flex:none"
+                onclick="arrsPick('${ed.kind}','${arr}')">Pick…</button>
+      </div>
+      <div id="pick-${ed.kind}-${arr}" style="display:none;margin:5px 0 0 58px;
+           border:1px solid var(--line);border-radius:6px;max-height:210px;
+           overflow:auto;background:rgba(255,255,255,.02)"></div>
     </div>`;
   };
   const editor=ed=>!ed?'':`
@@ -21289,23 +21298,59 @@ async function arrsResetNames(kind){
 }
 // THE NAMES HAVE TO MATCH EXACTLY or the job silently protects nothing, so
 // offer what the arr actually has rather than trusting anyone to type it.
+//
+// This was a prompt() asking for numbers typed comma-separated, which is a
+// worse version of the box it was meant to help you fill in: you still type
+// a list by hand, only now it is indices you have to count. It is a checkbox
+// list in the page, and ticking a box edits the field straight away.
 async function arrsPick(kind, arr){
-  arrsSay(kind, 'reading '+arr+'…');
+  const panel=document.getElementById(`pick-${kind}-${arr}`);
+  if(!panel) return;
+  if(panel.style.display!=='none'){ panel.style.display='none'; return; }
+  panel.style.display='';
+  panel.innerHTML='<div class="dim" style="padding:8px;font-size:11px">reading '+esc(arr)+'…</div>';
   let d;
   try{ d=await (await fetch(`/api/arrguard/choices?job=${kind}`)).json(); }
-  catch(e){ arrsSay(kind,'<span class="err">could not read '+arr+'</span>'); return; }
+  catch(e){ panel.innerHTML='<div class="err" style="padding:8px;font-size:11px">could not read '+esc(arr)+'</div>'; return; }
   const opts=(d[arr]||[]);
-  if(!opts.length){ arrsSay(kind,`<span class="warn">${arr} returned nothing to choose from</span>`); return; }
+  if(!opts.length){
+    panel.innerHTML='<div class="warn" style="padding:8px;font-size:11px">'
+      +esc(arr)+' has nothing to choose from'
+      +((d.errors&&d.errors.length)?' — '+esc(d.errors.join('; ')):'')+'</div>';
+    return;
+  }
   const box=document.getElementById(`nm-${kind}-${arr}`);
   const cur=new Set(box.value.split(',').map(x=>x.trim()).filter(Boolean));
-  const pick=prompt(`${arr}: type the numbers to include, comma-separated.\n\n`
-    + opts.map((o,i)=>`${i+1}. ${cur.has(o)?'[x] ':'[ ] '}${o}`).join('\n'),
-    opts.map((o,i)=>cur.has(o)?String(i+1):'').filter(Boolean).join(','));
-  if(pick===null){ arrsSay(kind,''); return; }
-  const chosen=pick.split(',').map(x=>parseInt(x.trim(),10))
-    .filter(n=>n>=1&&n<=opts.length).map(n=>opts[n-1]);
-  box.value=chosen.join(', ');
-  arrsSay(kind,`<span class="dim">${chosen.length} chosen — press Save</span>`);
+  panel.innerHTML=
+    `<div style="display:flex;gap:10px;padding:6px 9px;border-bottom:1px solid var(--line)">
+       <a href="#" style="font-size:11px" onclick="arrsPickAll('${kind}','${arr}',1);return false">all</a>
+       <a href="#" style="font-size:11px" onclick="arrsPickAll('${kind}','${arr}',0);return false">none</a>
+       <span class="dim" style="font-size:11px;margin-left:auto">${opts.length} available</span>
+     </div>`
+    + opts.map(o=>`<label style="display:flex;gap:8px;align-items:center;
+         padding:4px 9px;font-size:11px;cursor:pointer">
+       <input type="checkbox" data-pick="${esc(kind)}|${esc(arr)}" value="${esc(o)}"
+              ${cur.has(o)?'checked':''} onchange="arrsPickSync('${kind}','${arr}')">
+       <span>${esc(o)}</span></label>`).join('');
+  // Anything already typed that this arr does not have is a name that can
+  // never match - say so rather than letting it sit there looking valid.
+  const unknown=[...cur].filter(x=>!opts.includes(x));
+  if(unknown.length)
+    panel.insertAdjacentHTML('beforeend',
+      `<div class="warn" style="padding:6px 9px;font-size:11px;border-top:1px solid var(--line)">
+         not in ${esc(arr)}: ${esc(unknown.join(', '))}</div>`);
+}
+function arrsPickSync(kind, arr){
+  const box=document.getElementById(`nm-${kind}-${arr}`);
+  const on=[...document.querySelectorAll(`[data-pick="${kind}|${arr}"]`)]
+    .filter(c=>c.checked).map(c=>c.value);
+  box.value=on.join(', ');
+  arrsSay(kind, `<span class="dim">${on.length} selected — press Save</span>`);
+}
+function arrsPickAll(kind, arr, on){
+  document.querySelectorAll(`[data-pick="${kind}|${arr}"]`)
+    .forEach(c=>{ c.checked=!!on; });
+  arrsPickSync(kind, arr);
 }
 
 // ---- MKVToolNix ----------------------------------------------------------
