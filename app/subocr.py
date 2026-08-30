@@ -1145,8 +1145,9 @@ def run_one(path: str, probe: dict, work_root: str | None = None,
                 shape = track_shape(sup)
                 if shape.get("typeset"):
                     notes.append(f"rel {t['rel']}: not OCR'd - {shape['why']}")
-                    joblog.log(f"subtitle OCR: leaving track {t['rel']} as "
-                               f"pictures - {shape['why']}", "info")
+                    from . import joblog as _jl      # imported where used,
+                    _jl.log(f"subtitle OCR: leaving track {t['rel']} as "     # as elsewhere in this module
+                            f"pictures - {shape['why']}", "info")
                     typeset.append({"rel": t["rel"], **shape})
                     continue
                 tick(base + span * 0.1, f"OCR track {i+1}/{n}{who}")
