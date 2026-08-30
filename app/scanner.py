@@ -1624,8 +1624,16 @@ def _verify_unmanaged_sync(arr_files, status) -> dict:
                     cur.execute("DELETE FROM files WHERE id=?", (r["id"],))
                     merged += 1
                     continue
+                # CLEAR THE ADOPTION VERDICT, which has just been disproved.
+                # adopt_state='no_folder' means "no arr manages this folder",
+                # and the row now carries the id of the arr file that does. It
+                # was left standing, so a linked file went on displaying "it
+                # cannot be adopted automatically" underneath "linked by
+                # unmanaged verify" - the record of a failure sitting next to
+                # the success that ended it.
                 cur.execute(
                     "UPDATE files SET arr_name=?, arr_file_id=?, arr_parent_id=?,"
+                    " adopt_state=NULL, adopt_attempts=0, adopt_last_at=NULL,"
                     " state_reason='linked by unmanaged verify', updated_at=? "
                     "WHERE id=?",
                     (hit.arr_name, hit.file_id, hit.parent_id, now, r["id"]))
@@ -1648,7 +1656,23 @@ def _verify_unmanaged_sync(arr_files, status) -> dict:
                         f"show/movie is not added' WHERE id IN ({qs})",
                         orphan_unknown)
 
+        # A LINKED FILE CANNOT BE UN-ADOPTABLE. 'no_folder' means no arr
+        # manages this folder; a row carrying an arr file id is proof that one
+        # does. Rows linked before this rule existed kept the old verdict and
+        # went on saying "it cannot be adopted automatically" underneath the
+        # line announcing that it had been - so the contradiction is swept up
+        # here rather than left waiting for each file to be touched again.
+        cur.execute("UPDATE files SET adopt_state=NULL, adopt_attempts=0 "
+                    " WHERE arr_file_id IS NOT NULL "
+                    "   AND COALESCE(adopt_state,'')='no_folder'")
+        stale_cleared = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+    if stale_cleared:
+        joblog.log(f"cleared a stale 'cannot be adopted' note from "
+                   f"{stale_cleared} file(s) the arr does in fact manage",
+                   "info")
     return {"checked": len(rows), "linked_to_arr": linked,
+            "stale_adopt_cleared": stale_cleared,
             "merged_duplicate_rows": merged,
             "arr_knows_folder_not_file": len(orphan_in_known),
             "not_in_any_arr": len(orphan_unknown), "status": status}
