@@ -1,6 +1,7 @@
 r"""Keep the arr-side configuration the way it was decided, automatically.
 
-Three watch jobs, each with its own on/off toggle:
+Two watch jobs, each with its own on/off toggle. Both take their profile
+names from Settings -> Arrs rather than hard-coding them:
 
 PROFILE GUARD (arrs.profile_guard)
     The 2160p quality profiles were split into ordered groups - resolution
@@ -9,17 +10,6 @@ PROFILE GUARD (arrs.profile_guard)
     sync rebuilds them flat. Rather than hoping nobody clicks Sync, this
     checks the live profiles on a timer and re-applies the split when it
     finds the merged shape, logging that it did.
-
-SCORE GUARD (arrs.score_guard)
-    The two English-audio custom formats were scored +3000 directly in Radarr,
-    because Radarr is where they were created. Profilarr owns per-profile
-    format scores and pushes its own complete set on a sync, which sets
-    anything it does not know about to 0. This re-asserts those scores.
-
-    It is deliberately separate from the profile guard: same failure cause,
-    but different blast radius. The profile guard rewrites the shape of a
-    profile; this only touches two named scores. Anyone should be able to
-    switch one off without losing the other.
 
 TRASH ANIME SYNC (arrs.trash_anime)
     The anime custom formats came from the TRaSH guides and drift as the
@@ -47,10 +37,62 @@ from . import joblog
 POLL_S = 6 * 3600            # guard cadence; TRaSH is further limited below
 TRASH_MIN_GAP_S = 20 * 3600  # at most daily - it is someone else's bandwidth
 
-TARGET_2160 = {"radarr": ["Nu 2160p Quality", "Nu 2160p Animation"],
-               "sonarr": ["Nu 2160p Efficient", "Nu 2160p Animation"]}
-ANIME_PROFILES = {"sonarr": ["Anime", "[Anime] Dual-Audio"],
-                  "radarr": ["Anime"]}
+# DEFAULTS, not the setting. Both lists are editable in Settings -> Arrs, and
+# the stored value wins - see targets_2160() / anime_profiles(). They shipped
+# hard-coded to this machine's profile names, which made a guard that is
+# supposed to protect ANY install into one that silently did nothing on
+# somebody else's.
+DEFAULT_TARGET_2160 = {"radarr": ["Nu 2160p Quality", "Nu 2160p Animation"],
+                       "sonarr": ["Nu 2160p Efficient", "Nu 2160p Animation"]}
+# WHICH TRaSH FORMATS TO KEEP IN SYNC, per arr. Empty list = every anime
+# format the guides publish that ALREADY exists in that arr, which is the
+# original behaviour and stays the default.
+#
+# Note this is a FORMAT list, not a profile list. The old constant was named
+# for profiles and keyed by arr, but the code only ever tested the KEY - the
+# names inside were never read, so "which profiles" was never a thing this
+# job could do. Editing formats is what it actually does, so that is what is
+# editable.
+DEFAULT_ANIME_FORMATS = {"sonarr": [], "radarr": []}
+
+
+def _load_names(key: str, fallback: dict) -> dict:
+    """{'radarr': [...], 'sonarr': [...]} from settings, or the default."""
+    from .db import kv_get
+    raw = kv_get(key)
+    if not raw:
+        return {k: list(v) for k, v in fallback.items()}
+    try:
+        got = json.loads(raw)
+    except Exception:                                        # noqa: BLE001
+        return {k: list(v) for k, v in fallback.items()}
+    out = {}
+    for kind in ("radarr", "sonarr"):
+        vals = got.get(kind)
+        # An empty list is a REAL choice - "do not guard this arr" - and must
+        # not fall back to the default, or turning a guard off for one app
+        # would be impossible.
+        out[kind] = [str(x).strip() for x in vals if str(x).strip()] \
+            if isinstance(vals, list) else list(fallback.get(kind, []))
+    return out
+
+
+def _save_names(key: str, value: dict) -> dict:
+    from .db import kv_set
+    clean = {k: [str(x).strip() for x in (value.get(k) or []) if str(x).strip()]
+             for k in ("radarr", "sonarr")}
+    kv_set(key, json.dumps(clean))
+    return clean
+
+
+def targets_2160() -> dict:
+    return _load_names("arrs.split_profiles", DEFAULT_TARGET_2160)
+
+
+def anime_formats() -> dict:
+    return _load_names("arrs.anime_formats", DEFAULT_ANIME_FORMATS)
+
+
 _TRASH_RAW = ("https://raw.githubusercontent.com/TRaSH-Guides/Guides/master/"
               "docs/json/{kind}/cf/{fname}")
 _TRASH_DIR = ("https://api.github.com/repos/TRaSH-Guides/Guides/contents/"
@@ -58,8 +100,6 @@ _TRASH_DIR = ("https://api.github.com/repos/TRaSH-Guides/Guides/contents/"
 
 STATS: dict = {
     "guard": {"last_run": 0.0, "last_result": "", "fixed": 0, "next_run": 0.0},
-    "score": {"last_run": 0.0, "last_result": "", "fixed": 0, "next_run": 0.0,
-              "detail": []},
     "trash": {"last_run": 0.0, "last_result": "", "updated": 0,
               "new_formats": [], "next_run": 0.0},
     "running": "",
@@ -105,78 +145,21 @@ def _apply_split(profile: dict) -> dict:
     return profile
 
 
-# Custom-format scores that are OURS, not Profilarr's, and which a profile
-# sync therefore erases. Profilarr owns per-profile format scores - 1,721 of
-# the user ops in its database are exactly that - and it pushes its own
-# complete set when it syncs, so anything added directly in Radarr goes to 0.
-# Nothing syncs automatically today (should_sync=0, trigger=manual), so this is
-# a backstop against a button press, not a running battle.
-GUARDED_SCORES = {
-    "Language: English": 3000,
-    "English Audio (Dual/Dubbed)": 3000,
-}
-SCORE_PROFILES = {
-    "radarr": ["Nu 1080p Quality HDR", "Nu 2160p Quality", "Nu 2160p Animation",
-               "Nu 1080p Quality HDR Animation", "Nu 1080p Remux Animation"],
-}
+# The English-audio SCORE GUARD lived here and is gone. Its job was to
+# re-assert two Radarr format scores that a Profilarr sync would zero,
+# because Profilarr did not know those formats existed. It now does:
+# "Language: English" and "English Audio (Dual/Dubbed)" were created in
+# Profilarr and scored +3000 on the five Nu profiles, so Profilarr pushes
+# them itself and there is nothing left to restore. A guard that can only
+# ever report "intact" is noise on the page.
 
-
-async def run_score_guard() -> str:
-    """Re-assert the English-audio scores if something reset them."""
-    fixed, absent, errs, checked = [], [], [], 0
-    for cfg in SETTINGS.arrs:
-        if not cfg.enabled or cfg.kind not in SCORE_PROFILES:
-            continue
-        c = shared_client(cfg)
-        try:
-            profs = await c._get("/qualityprofile")
-        except Exception as e:
-            errs.append(f"{cfg.name}: {type(e).__name__}")
-            continue
-        for p in profs:
-            if p["name"] not in SCORE_PROFILES[cfg.kind]:
-                continue
-            checked += 1
-            dirty = False
-            for name, want in GUARDED_SCORES.items():
-                item = next((x for x in p.get("formatItems", [])
-                             if x.get("name") == name), None)
-                if item is None:
-                    absent.append(f"{p['name']}/{name}")
-                    continue
-                if item.get("score") == want:
-                    continue
-                item["score"] = want
-                dirty = True
-                fixed.append(f"{p['name']}/{name}")
-            if not dirty:
-                continue
-            try:
-                await c._client.put(f"/qualityprofile/{p['id']}", json=p)
-                joblog.log(f"score guard: restored English-audio scores on "
-                           f"{cfg.name}/{p['name']} — a sync had cleared them",
-                           "warn")
-            except Exception as e:
-                errs.append(f"{p['name']}: {type(e).__name__}")
-    # A profile that does not carry the format at all is not "intact" - it is
-    # a gap this guard cannot close, because adding a format to a profile is a
-    # bigger decision than restoring a number. Say so rather than counting it.
-    msg = (f"restored {len(fixed)}: {', '.join(fixed[:4])}" if fixed
-           else f"{checked} profile(s) intact, {len(GUARDED_SCORES)} score(s) "
-                f"each")
-    if absent:
-        msg += f"; not on {len(absent)}: {', '.join(absent[:3])}"
-    if errs:
-        msg += f"; errors: {', '.join(errs[:3])}"
-    STATS["score"].update(last_run=time.time(), fixed=len(fixed),
-                          last_result=msg, detail=(fixed or absent)[:20])
-    return msg
 
 
 async def run_guard() -> str:
+    targets = targets_2160()
     fixed, ok, errs = [], [], []
     for cfg in SETTINGS.arrs:
-        if not cfg.enabled or cfg.kind not in TARGET_2160:
+        if not cfg.enabled or cfg.kind not in targets:
             continue
         c = shared_client(cfg)
         try:
@@ -185,7 +168,7 @@ async def run_guard() -> str:
             errs.append(f"{cfg.name}: {type(e).__name__}")
             continue
         for p in profs:
-            if p["name"] not in TARGET_2160[cfg.kind]:
+            if p["name"] not in targets[cfg.kind]:
                 continue
             if _split_needed(p):
                 try:
@@ -243,10 +226,12 @@ def _spec_key(cf: dict):
 
 
 async def run_trash() -> str:
+    only = anime_formats()
     updated, new_fmts, errs = [], [], []
     for cfg in SETTINGS.arrs:
-        if not cfg.enabled or cfg.kind not in ANIME_PROFILES:
+        if not cfg.enabled or cfg.kind not in only:
             continue
+        keep = set(only[cfg.kind])          # empty = no filter, sync them all
         try:
             trash = await _trash_fetch(cfg.kind)
         except Exception as e:
@@ -259,6 +244,8 @@ async def run_trash() -> str:
             errs.append(f"{cfg.name}: {type(e).__name__}")
             continue
         for name, tcf in trash.items():
+            if keep and name not in keep:
+                continue
             if name not in mine:
                 new_fmts.append(f"{cfg.kind}: {name}")
                 continue
@@ -289,17 +276,29 @@ async def run_trash() -> str:
 
 
 def ensure_defaults() -> None:
-    """First sight of the new toggle: inherit the profile guard's setting.
+    """Tidy up after the score guard, which no longer exists.
 
-    The score guard shipped inside the profile guard, so it was already
-    running for anyone who had that on. Defaulting a split-out job to OFF
-    would silently switch off protection somebody already had - a refactor
-    should not change behaviour. After this one write the two are independent.
+    Its toggle is deleted rather than left behind: a stored setting for a job
+    that is gone is a thing that reads as broken next time somebody greps for
+    it. The two English-audio formats it protected now live in Profilarr with
+    their +3000 scores, so Profilarr pushes them itself.
     """
-    from .gate import kv_get, kv_set, get_toggle
+    from .db import cursor, kv_get
     if kv_get("arrs.score_guard") is None:
-        kv_set("arrs.score_guard",
-               "1" if get_toggle("arrs.profile_guard") else "0")
+        return
+    # DELETE the row - kv_set(key, None) would store a NULL, which is still a
+    # setting, just an unreadable one.
+    with cursor() as cur:
+        cur.execute("DELETE FROM kv WHERE k=?", ("arrs.score_guard",))
+    try:
+        from . import db as _db
+        with _db._kv_lock:                       # keep the in-memory cache true
+            if _db._KV is not None:
+                _db._KV.pop("arrs.score_guard", None)
+    except Exception:                                        # noqa: BLE001
+        pass
+    joblog.log("the English-audio score guard has been retired - Profilarr now "
+               "owns those two formats and their scores", "info")
 
 
 async def watch() -> None:
@@ -316,10 +315,6 @@ async def watch() -> None:
                 STATS["running"] = "profile guard"
                 await run_guard()
             STATS["guard"]["next_run"] = time.time() + POLL_S
-            if get_toggle("arrs.score_guard"):
-                STATS["running"] = "score guard"
-                await run_score_guard()
-            STATS["score"]["next_run"] = time.time() + POLL_S
             if get_toggle("arrs.trash_anime") and \
                     time.time() - STATS["trash"]["last_run"] > TRASH_MIN_GAP_S:
                 STATS["running"] = "TRaSH anime sync"

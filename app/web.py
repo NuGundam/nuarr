@@ -2157,12 +2157,77 @@ def api_arrguard():
         pass
     return {"stats": arrguard.STATS,
             "toggles": {"profile_guard": gate.get_toggle("arrs.profile_guard"),
-                        "score_guard": gate.get_toggle("arrs.score_guard"),
                         "trash_anime": gate.get_toggle("arrs.trash_anime"),
-                        }}
+                        },
+            # The names each job works on, so the page can show and edit them
+            # instead of shipping one machine's profile names as a constant.
+            "split_profiles": arrguard.targets_2160(),
+            "anime_formats": arrguard.anime_formats(),
+            "defaults": {"split_profiles": arrguard.DEFAULT_TARGET_2160,
+                         "anime_formats": arrguard.DEFAULT_ANIME_FORMATS}}
 
 
-_ARR_JOBS = ("profile_guard", "score_guard", "trash_anime")
+@app.post("/api/arrguard/names")
+async def api_arrguard_names(job: str, body: dict = Body(...)):
+    """Save the profile / format names a guard works on.
+
+    Takes {"radarr": [...], "sonarr": [...]}. An EMPTY list is kept, not
+    replaced by the default: "guard nothing on this arr" has to be sayable.
+    """
+    from . import arrguard
+    keys = {"profile_guard": "arrs.split_profiles",
+            "trash_anime": "arrs.anime_formats"}
+    if job not in keys:
+        raise HTTPException(400, f"job must be one of {', '.join(keys)}")
+    saved = arrguard._save_names(keys[job], body or {})
+    joblog.log(f"arr guard: {job} names updated — "
+               f"radarr {len(saved['radarr'])}, sonarr {len(saved['sonarr'])}",
+               "info")
+    return {"job": job, "saved": saved}
+
+
+@app.get("/api/arrguard/choices")
+async def api_arrguard_choices(job: str):
+    """What this arr actually HAS, so the editor offers real names.
+
+    Typing a profile name from memory is how a guard ends up silently
+    protecting nothing - the name has to match exactly. This lists the live
+    quality profiles (split guard) or anime custom formats (TRaSH sync) from
+    each connected arr.
+    """
+    from . import arrguard
+    from .arr import shared_client
+    out: dict = {"radarr": [], "sonarr": []}
+    for cfg in SETTINGS.arrs:
+        if not cfg.enabled or cfg.kind not in out:
+            continue
+        c = shared_client(cfg)
+        try:
+            if job == "profile_guard":
+                rows = await c._get("/qualityprofile")
+                out[cfg.kind] = sorted({r["name"] for r in rows})
+            elif job == "trash_anime":
+                rows = await c._get("/customformat")
+                names = {r["name"] for r in rows}
+                try:
+                    trash = set(await arrguard._trash_fetch(cfg.kind))
+                except Exception:                            # noqa: BLE001
+                    trash = set()
+                # Only the ones this job could actually act on: present in the
+                # arr AND published by the guides.
+                out[cfg.kind] = sorted(names & trash) if trash else sorted(names)
+            else:
+                raise HTTPException(400, "unknown job")
+        except HTTPException:
+            raise
+        except Exception as e:                               # noqa: BLE001
+            out[cfg.kind] = []
+            out.setdefault("errors", []).append(
+                f"{cfg.name}: {type(e).__name__}")
+    return out
+
+
+_ARR_JOBS = ("profile_guard", "trash_anime")
 
 
 @app.post("/api/arrguard/toggle")
@@ -2180,8 +2245,6 @@ async def api_arrguard_run(job: str):
     from . import arrguard
     if job == "profile_guard":
         return {"result": await arrguard.run_guard()}
-    if job == "score_guard":
-        return {"result": await arrguard.run_score_guard()}
     if job == "trash_anime":
         return {"result": await arrguard.run_trash()}
     raise HTTPException(400, f"job must be one of {', '.join(_ARR_JOBS)}")
@@ -21094,8 +21157,32 @@ async function loadArrsTab(){
   let d;
   try{ d=await (await fetch('/api/arrguard')).json(); }
   catch(e){ el.innerHTML=`<div class="err">could not load: ${esc(String(e))}</div>`; return; }
-  const g=d.stats.guard||{}, s=d.stats.score||{}, t=d.stats.trash||{};
-  const job=(id,title,desc,on,st)=>`
+  const g=d.stats.guard||{}, t=d.stats.trash||{};
+  // `ed` is optional: {label, kind, names:{radarr:[],sonarr:[]}, empty}
+  const nameRow=(ed,arr)=>{
+    const list=(ed.names[arr]||[]);
+    return `<div style="display:flex;gap:6px;align-items:flex-start;margin-top:4px">
+      <span class="dim" style="width:52px;flex:none;font-size:11px;padding-top:5px">${arr}</span>
+      <input id="nm-${ed.kind}-${arr}" style="flex:1;font-size:11px"
+             placeholder="comma-separated names — leave empty for none"
+             value="${esc(list.join(', '))}">
+      <button style="font-size:10px;padding:2px 7px"
+              onclick="arrsPick('${ed.kind}','${arr}')">Pick…</button>
+    </div>`;
+  };
+  const editor=ed=>!ed?'':`
+    <div style="margin-top:8px;border-top:1px solid var(--line);padding-top:8px">
+      <div style="font-size:11px;font-weight:600">${esc(ed.label)}</div>
+      ${nameRow(ed,'radarr')}${nameRow(ed,'sonarr')}
+      <div style="display:flex;gap:8px;align-items:center;margin-top:6px">
+        <button style="font-size:11px" onclick="arrsSaveNames('${ed.kind}')">Save</button>
+        <button style="font-size:11px" onclick="arrsResetNames('${ed.kind}')">Reset to defaults</button>
+        <span id="nmmsg-${ed.kind}" class="dim" style="font-size:11px"></span>
+      </div>
+      ${(!(ed.names.radarr||[]).length && !(ed.names.sonarr||[]).length)
+        ? `<div class="warn" style="font-size:11px;margin-top:4px">${esc(ed.empty)}</div>`:''}
+    </div>`;
+  const job=(id,title,desc,on,st,ed)=>`
     <div style="border:1px solid var(--line);border-radius:8px;padding:10px 14px;margin-bottom:10px">
       <div style="display:flex;align-items:center;gap:10px">
         <b>${title}</b>
@@ -21112,29 +21199,14 @@ async function loadArrsTab(){
         ${(st.new_formats&&st.new_formats.length)?`<div class="dim" style="margin-top:4px">new in the guides: ${esc(st.new_formats.join(', '))}</div>`:''}
         ${(st.detail&&st.detail.length)?`<div class="dim" style="margin-top:4px">${st.detail.map(x=>esc(x)).join('<br>')}</div>`:''}
       </div>
+      ${editor(ed)}
     </div>`;
+  // WEBHOOKS FIRST, GUARDS LAST. Webhooks are how nuarr hears about the arrs
+  // at all - if they are broken nothing else on this page matters. The guards
+  // are optional scripts that fix a specific annoyance, so they sit at the
+  // bottom under their own heading rather than in front of the plumbing.
   el.innerHTML =
     (d.stats.running?`<div class="dim" style="margin-bottom:8px">running: ${esc(d.stats.running)}…</div>`:'')
-    + job('profile_guard','2160p profile split guard',
-        'Verifies the Nu 2160p profiles still rank resolution first (two ordered '
-        +'quality groups, upgrade-until on the 2160p group) and re-applies the split '
-        +'if a Profilarr sync has flattened them back to one merged group.',
-        d.toggles.profile_guard, g)
-    + job('score_guard','English-audio score guard',
-        'Radarr prefers English audio through two custom formats scored +3000: '
-        +'<b>Language: English</b> and <b>English Audio (Dual/Dubbed)</b>, across the '
-        +'five Nu profiles. Profilarr owns per-profile format scores and pushes its own '
-        +'complete set when it syncs, which sets anything it does not know about back to '
-        +'0 — silently, since a wrong score looks exactly like a right one. This re-asserts '
-        +'both scores and says which profile it had to fix. The profile Language field is '
-        +'never touched: that one is a hard filter, and setting it to English would stop '
-        +'foreign films downloading at all.',
-        d.toggles.score_guard, s)
-    + job('trash_anime','TRaSH anime format sync',
-        'Fetches the current anime custom formats from the TRaSH guides repo and '
-        +'updates existing formats whose matching rules drifted. Never deletes, never '
-        +'adds formats to profiles by itself — new ones are listed here for you.',
-        d.toggles.trash_anime, t)
     + `<div style="border:1px solid var(--line);border-radius:8px;padding:10px 14px">
         <div style="display:flex;align-items:center;gap:10px">
           <b>Webhooks</b>
@@ -21146,7 +21218,31 @@ async function loadArrsTab(){
           holding, because a stale hook produces silence, not an error.</div>
         <span id="hookmsg" class="dim" style="font-size:11px"></span>
         <div id="hookstate" class="dim" style="margin-top:5px;font-size:11px"></div>
-      </div>`;
+      </div>`
+    + `<div style="margin:22px 0 10px;padding-top:14px;border-top:2px solid var(--line)">
+        <div style="font-size:15px;font-weight:600">Custom arrs scripts</div>
+        <div class="dim" style="font-size:11px;margin-top:3px;max-width:70ch">
+          Optional jobs that keep something in Radarr/Sonarr the way you decided
+          it, against a tool that would otherwise overwrite it. Each is off until
+          you turn it on, and each works only on the names you list — nothing
+          here touches a profile or format you have not named.
+        </div>
+      </div>`
+    + job('profile_guard','2160p profile split guard',
+        'Verifies the listed profiles still rank resolution first (two ordered '
+        +'quality groups, upgrade-until on the 2160p group) and re-applies the split '
+        +'if a Profilarr sync has flattened them back to one merged group.',
+        d.toggles.profile_guard, g,
+        {label:'Profiles to keep split', kind:'profile_guard',
+         names:d.split_profiles||{}, empty:'no profiles listed — this guard does nothing'})
+    + job('trash_anime','TRaSH anime format sync',
+        'Fetches the current anime custom formats from the TRaSH guides repo and '
+        +'updates existing formats whose matching rules drifted. Never deletes, never '
+        +'adds formats to profiles by itself — new ones are listed here for you.',
+        d.toggles.trash_anime, t,
+        {label:'Formats to keep in sync', kind:'trash_anime',
+         names:d.anime_formats||{},
+         empty:'none listed — every anime format the guides publish that already exists in the arr'});
   loadHookState();
 }
 async function arrsToggle(job,on){
@@ -21158,6 +21254,58 @@ async function arrsRun(job){
   if(el) el.insertAdjacentHTML('afterbegin','<div class="dim" id="arrsBusy">running…</div>');
   try{ await fetch(`/api/arrguard/run?job=${job}`,{method:'POST'}); }catch(e){}
   loadArrsTab();
+}
+function arrsSay(kind,html){
+  const m=document.getElementById('nmmsg-'+kind);
+  if(m) m.innerHTML=html;
+}
+function arrsNamesFrom(kind){
+  const grab=a=>{
+    const e=document.getElementById(`nm-${kind}-${a}`);
+    return e ? e.value.split(',').map(x=>x.trim()).filter(Boolean) : [];
+  };
+  return {radarr:grab('radarr'), sonarr:grab('sonarr')};
+}
+async function arrsSaveNames(kind){
+  const body=arrsNamesFrom(kind);
+  try{
+    const r=await (await fetch(`/api/arrguard/names?job=${kind}`,{method:'POST',
+      headers:{'content-type':'application/json'}, body:JSON.stringify(body)})).json();
+    const n=(r.saved.radarr||[]).length+(r.saved.sonarr||[]).length;
+    arrsSay(kind, `<span class="ok">saved — ${n} name(s)</span>`);
+  }catch(e){ arrsSay(kind, '<span class="err">could not save</span>'); return; }
+  setTimeout(loadArrsTab, 600);
+}
+async function arrsResetNames(kind){
+  if(!confirm('Put this job back to the names nuarr ships with?')) return;
+  let d;
+  try{ d=await (await fetch('/api/arrguard')).json(); }catch(e){ return; }
+  const def=(d.defaults||{})[kind==='profile_guard'?'split_profiles':'anime_formats']||{};
+  for(const a of ['radarr','sonarr']){
+    const e=document.getElementById(`nm-${kind}-${a}`);
+    if(e) e.value=(def[a]||[]).join(', ');
+  }
+  arrsSay(kind,'<span class="dim">defaults filled in — press Save to keep them</span>');
+}
+// THE NAMES HAVE TO MATCH EXACTLY or the job silently protects nothing, so
+// offer what the arr actually has rather than trusting anyone to type it.
+async function arrsPick(kind, arr){
+  arrsSay(kind, 'reading '+arr+'…');
+  let d;
+  try{ d=await (await fetch(`/api/arrguard/choices?job=${kind}`)).json(); }
+  catch(e){ arrsSay(kind,'<span class="err">could not read '+arr+'</span>'); return; }
+  const opts=(d[arr]||[]);
+  if(!opts.length){ arrsSay(kind,`<span class="warn">${arr} returned nothing to choose from</span>`); return; }
+  const box=document.getElementById(`nm-${kind}-${arr}`);
+  const cur=new Set(box.value.split(',').map(x=>x.trim()).filter(Boolean));
+  const pick=prompt(`${arr}: type the numbers to include, comma-separated.\n\n`
+    + opts.map((o,i)=>`${i+1}. ${cur.has(o)?'[x] ':'[ ] '}${o}`).join('\n'),
+    opts.map((o,i)=>cur.has(o)?String(i+1):'').filter(Boolean).join(','));
+  if(pick===null){ arrsSay(kind,''); return; }
+  const chosen=pick.split(',').map(x=>parseInt(x.trim(),10))
+    .filter(n=>n>=1&&n<=opts.length).map(n=>opts[n-1]);
+  box.value=chosen.join(', ');
+  arrsSay(kind,`<span class="dim">${chosen.length} chosen — press Save</span>`);
 }
 
 // ---- MKVToolNix ----------------------------------------------------------
