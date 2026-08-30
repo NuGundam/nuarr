@@ -434,6 +434,72 @@ def _never_burned(probe: dict) -> bool:
     return False
 
 
+# A TYPESET TRACK IS NOT A DIALOGUE TRACK, and OCR is the wrong tool for it.
+#
+# Some PGS tracks carry dialogue AND typeset signs in one stream: a title card
+# across the top, a name label placed over the Japanese one, karaoke with its
+# translation. OCR turns all of that into lines of text at the bottom of the
+# screen. Position tags recover roughly where a sign belonged, but never its
+# styling, and never two blocks that belong in two places. Burning those into
+# the picture keeps what the typesetter drew; OCR discards it.
+#
+# The tell is the BITMAP SIZE, not its position, and it is readable without
+# OCR at all - decoding the PGS gives geometry for free. Measured on two real
+# tracks:
+#
+#   Detective Conan, hybrid   median bitmap 47% of frame height, 54% of cues
+#                             taller than 30% - full-frame canvases with the
+#                             sign placed inside them
+#   Bleach, plain dialogue    median bitmap 5% of frame height, 0% of cues
+#                             taller than 30% - one or two lines, nothing else
+#
+# Position turned out to be a poor discriminator (15% vs 8% of cues away from
+# the bottom); height separates them by a factor of nine.
+TYPESET_TALL_FRAC = 0.30      # a bitmap this tall is a canvas, not a line
+TYPESET_SHARE = 0.20          # this many such cues means the track is typeset
+
+
+def track_shape(sup: str, sample: int = 400) -> dict:
+    """Geometry of a PGS track - is it dialogue, or typeset signs?
+
+    Cheap on purpose: decodes the display sets and measures them, no OCR and
+    no GPU, so a planner can ask before committing to an approach.
+    """
+    out = {"cues": 0, "median_h": 0.0, "tall_share": 0.0,
+           "typeset": False, "why": ""}
+    try:
+        import importlib.util as _il
+        import statistics as _st
+        here = os.path.dirname(os.path.abspath(__file__))
+        spec = _il.spec_from_file_location(
+            "_pw_shape", os.path.join(here, "paddle_worker.py"))
+        pw = _il.module_from_spec(spec)
+        spec.loader.exec_module(pw)
+        cues = pw.read_sup(sup)
+    except Exception as e:                                   # noqa: BLE001
+        out["why"] = f"could not decode the track: {type(e).__name__}: {e}"
+        return out
+    if not cues:
+        out["why"] = "no cues decoded"
+        return out
+    if sample and len(cues) > sample:
+        step = len(cues) // sample or 1
+        cues = cues[::step]
+    vh = cues[0][6] or 1
+    heights = [c[0].shape[0] / vh for c in cues]
+    tall = sum(1 for h in heights if h > TYPESET_TALL_FRAC)
+    out["cues"] = len(cues)
+    out["median_h"] = round(_st.median(heights), 3)
+    out["tall_share"] = round(tall / len(cues), 3)
+    out["typeset"] = out["tall_share"] >= TYPESET_SHARE
+    out["why"] = (
+        f"{out['tall_share']:.0%} of cues use a bitmap taller than "
+        f"{TYPESET_TALL_FRAC:.0%} of the frame (median {out['median_h']:.0%}) - "
+        + ("typeset signs, which OCR would flatten into text at the bottom"
+           if out["typeset"] else "ordinary dialogue lines"))
+    return out
+
+
 def select_targets(probe: dict, library: str | None = None) -> list[dict]:
     """Every English image sub worth converting, in stream order.
 
@@ -1029,6 +1095,9 @@ def run_one(path: str, probe: dict, work_root: str | None = None,
                             dir=work_root or getattr(SETTINGS, "cache_dir", None))
     made: list[tuple[str, str]] = []
     notes: list[str] = []
+    # Tracks left as pictures because they are typeset, not dialogue.
+    # Reported so the caller (and the planner) can act on them.
+    typeset: list[dict] = []
 
     # Progress is reported in coarse phases rather than not at all. OCR has no
     # usable inner percentage - pgsrip emits nothing per cue - so the honest
@@ -1069,6 +1138,17 @@ def run_one(path: str, probe: dict, work_root: str | None = None,
             try:
                 tick(base, f"extracting track {i+1}/{n}{who}")
                 sup = extract_sup(path, t["rel"], work, tag)
+                # ASK WHAT KIND OF TRACK THIS IS before OCR'ing it. A typeset
+                # track is not dialogue and OCR is the wrong tool - see
+                # track_shape(). Skipping here leaves the PGS in place, which
+                # is what the burn path wants anyway.
+                shape = track_shape(sup)
+                if shape.get("typeset"):
+                    notes.append(f"rel {t['rel']}: not OCR'd - {shape['why']}")
+                    joblog.log(f"subtitle OCR: leaving track {t['rel']} as "
+                               f"pictures - {shape['why']}", "info")
+                    typeset.append({"rel": t["rel"], **shape})
+                    continue
                 tick(base + span * 0.1, f"OCR track {i+1}/{n}{who}")
                 # ocr() moves the bar itself while it grinds - see its ticker.
                 # WHICHEVER ENGINE THIS LIBRARY CHOSE. Tesseract goes through
@@ -1097,23 +1177,27 @@ def run_one(path: str, probe: dict, work_root: str | None = None,
             notes.append(f"rel {t['rel']} -> {why}")
         if not made:
             shutil.rmtree(work, ignore_errors=True)
-            return {"ok": False, "why": "; ".join(notes) or "nothing converted"}
+            return {"ok": False, "why": "; ".join(notes) or "nothing converted",
+                    "typeset": typeset}
         if not mux:
             # Caller only wanted the subtitles. Whoever rewrites the file next
             # will carry them in, so no mux and no commit happens here.
             return {"ok": True, "made": made, "work": work, "notes": notes,
+                    "typeset": typeset,
                     "tracks": len(made)}
         tick(0.82, "muxing")
         out = os.path.join(work, "out.mkv")
         embed(path, made, out)
         tick(0.90, "muxed")
         return {"ok": True, "out": out, "work": work, "notes": notes,
+                "typeset": typeset,
                 "tracks": len(made),
                 "size_before": os.path.getsize(path),
                 "size_after": os.path.getsize(out)}
     except Exception as e:
         shutil.rmtree(work, ignore_errors=True)
-        return {"ok": False, "why": f"{type(e).__name__}: {e}", "notes": notes}
+        return {"ok": False, "why": f"{type(e).__name__}: {e}", "notes": notes,
+                "typeset": typeset}
 
 
 # ------------------------------------------------------------ the tool page --
