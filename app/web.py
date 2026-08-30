@@ -18898,21 +18898,6 @@ async function loadOcr(){
     </div>
 
     <div class="lkind" style="padding:11px 12px;margin-top:10px">
-      <b style="color:#6fb0ff">Measured on this library</b>
-      <div class="dim" style="font-size:11px;margin-top:3px">
-        Each test reads a dozen cues from a real picture-subtitle track here
-        and records what came back. Nothing is written and no file is touched —
-        run them and compare the text, which is the part that matters.</div>
-      <div style="margin-top:7px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-        <button onclick="ocrTest('tesseract','cpu')">Test Tesseract</button>
-        ${padReady&&p.cuda?`<button onclick="ocrTest('paddle','gpu')">Test PaddleOCR — GPU</button>`:''}
-        ${padReady?`<button onclick="ocrTest('paddle','cpu')">Test PaddleOCR — CPU</button>`:''}
-        <span id="ocrTestMsg" class="dim" style="font-size:11.5px"></span>
-      </div>
-      <div id="ocrMeas" style="margin-top:8px">${ocrMeasHtml()}</div>
-    </div>
-
-    <div class="lkind" style="padding:11px 12px;margin-top:10px">
       <b style="color:#6fb0ff">Signs or dialogue — what the check found</b>
       <div class="dim" style="font-size:11px;margin-top:2px">
         Before a file is queued for OCR its picture subtitles are measured, so
@@ -19112,74 +19097,125 @@ async function shapeLoad(){
 //
 // Scoped to what this system does with subtitles. Whether an engine is better
 // at scanned invoices is true and irrelevant on this page.
+// ONE PANEL, ONE SET OF COLUMNS. What an engine can do and what it measured
+// were two panels with two different shapes, so comparing "PaddleOCR on the
+// GPU" against "Tesseract" meant reading a capability out of one table and a
+// timing out of another and lining them up by hand. They are the same
+// comparison, so they are now the same columns: every engine-and-device this
+// machine can actually run gets a column, and every question is a row down it.
+//
+// PADDLE GETS TWO COLUMNS, not one. GPU and CPU are the same install but not
+// remotely the same proposition - the earlier version showed only whichever
+// device was configured, which hid exactly the number someone weighing the
+// install would want.
+function ocrCols(s,p){
+  const cols=[{key:'tesseract', name:'Tesseract', ver:s.tesseract_version,
+               ok:!!s.tesseract_version, engine:'tesseract', device:'cpu',
+               gpu:false}];
+  if(p.installed && p.cuda)
+    cols.push({key:'paddle:gpu', name:'PaddleOCR — GPU', ver:p.paddleocr,
+               ok:true, engine:'paddle', device:'gpu', gpu:true});
+  cols.push({key:'paddle:cpu', name:'PaddleOCR — CPU', ver:p.paddleocr,
+             ok:!!p.installed, engine:'paddle', device:'cpu', gpu:false});
+  return cols;
+}
 function ocrCompareHtml(s,p){
-  const tOK=!!s.tesseract_version, pOK=!!p.installed;
+  const cols=ocrCols(s,p);
   const yes=t=>`<span style="color:var(--ok)" title="${esc(t||'')}">yes</span>`;
   const no =t=>`<span class="dim" title="${esc(t||'')}">no</span>`;
-  const na =t=>`<span class="dim" title="${esc(t||'')}">—</span>`;
-  const ms=k=>{const m=_ocrMeas[k]; return m&&m.per_cue_ms?m.per_cue_ms:0;};
-  const speed=k=>{
-    const v=ms(k);
-    if(!v) return `<span class="dim">not measured yet</span>`;
-    return `${(v/1000).toFixed(1)}s <span class="dim">a cue</span>`;
-  };
-  // Paddle is measured per device, so prefer the one it would actually use.
-  const padKey = p.cuda ? 'paddle:gpu' : 'paddle:cpu';
+  const na =t=>`<span class="dim" title="not installed">—</span>`;
+  const paddle=c=>c.engine==='paddle';
   const rows=[
     ['Reads picture subtitles into text',
-     tOK?yes():na('not installed'), pOK?yes():na('not installed')],
+     c=>c.ok?yes():na()],
     ['Spots typeset signs and burns them in instead',
-     yes('the check reads the PGS bitmaps before either engine runs, so it '
-        +'behaves the same whichever you pick'),
-     yes('same check, same result - it happens before the engine is chosen')],
+     c=>yes('the check measures the PGS bitmaps before any engine runs, so '
+           +'every column here gives the same answer')],
     ['Keeps each subtitle where it sat on screen',
-     no('pgsrip returns lines with no coordinates, so OCR\'d text lands at '
-       +'the bottom'),
-     pOK?yes('per-cue boxes become {\\an8} tags, so signs at the top stay at '
-            +'the top'):na('not installed')],
+     c=>!c.ok?na():paddle(c)
+       ?yes('per-cue boxes become {\\an8} tags, so a sign at the top stays '
+           +'at the top')
+       :no('pgsrip returns lines with no coordinates, so text lands at the '
+          +'bottom')],
     ['Reads italics correctly',
-     no('italics come back garbled or dropped'),
-     pOK?yes():na('not installed')],
+     c=>!c.ok?na():paddle(c)?yes():no('italics come back garbled or dropped')],
     ['Uses the graphics card',
-     no('CPU only, always'),
-     pOK?(p.cuda?yes(esc(p.gpu_name||''))
-                :no('the installed build is CPU-only'))
-        :na('not installed')],
+     c=>!c.ok?na():c.gpu?yes(p.gpu_name||''):no(paddle(c)
+        ?'this column is the CPU device':'CPU only, always')],
     ['Ready without installing anything',
-     yes('bundled with nuarr'),
-     pOK?yes('already installed'):no('needs a download first')],
-    ['Speed on this machine', speed('tesseract'), speed(padKey)],
+     c=>c.engine==='tesseract'?yes('bundled with nuarr')
+        :(p.installed?yes('already installed'):no('needs a download first'))],
   ];
-  const cell=v=>`<td style="padding:4px 10px 4px 0;white-space:nowrap">${v}</td>`;
+  const th=cols.map(c=>`<th style="text-align:left;padding:0 10px 6px 0">
+      <b${_ocrEng===c.engine?' style="color:#6fb0ff"':''}>${esc(c.name)}</b>
+      <div class="dim" style="font-weight:400">${c.ver?esc(c.ver):'not installed'}</div>
+    </th>`).join('');
   const body=rows.map(r=>`<tr style="border-top:1px solid var(--line)">
       <td style="padding:4px 12px 4px 0">${r[0]}</td>
-      ${cell(r[1])}${cell(r[2])}</tr>`).join('');
-  const ver=(label,v,on)=>`<b${on?' style="color:#6fb0ff"':''}>${label}</b>
-      <span class="dim">${v?esc(v):'not installed'}</span>`;
+      ${cols.map(c=>`<td style="padding:4px 10px 4px 0;white-space:nowrap">
+         ${r[1](c)}</td>`).join('')}
+    </tr>`).join('');
+  // The measured rows sit in the same columns as the capabilities, which is
+  // the entire reason for merging the two panels.
+  const speed=c=>{
+    const m=_ocrMeas[c.key];
+    if(!c.ok) return `<span class="dim">—</span>`;
+    if(!m||!m.per_cue_ms) return `<span class="dim">not measured</span>`;
+    return `<b>${(m.per_cue_ms/1000).toFixed(1)}s</b>
+            <span class="dim">a cue</span>`;
+  };
+  const when=c=>{
+    const m=_ocrMeas[c.key];
+    if(!m||!m.at) return `<span class="dim">—</span>`;
+    return `<span class="dim">${ago(m.at)}</span>`;
+  };
+  const sample=c=>{
+    const m=_ocrMeas[c.key];
+    if(!m||!(m.lines||[]).length)
+      return `<span class="dim">—</span>`;
+    return `<span class="mono dim" style="font-size:10.5px">
+      ${m.lines.slice(0,3).map(l=>esc(l)).join('<br>')}</span>`;
+  };
+  const mrow=(label,fn,va)=>`<tr style="border-top:1px solid var(--line)">
+      <td style="padding:4px 12px 4px 0;vertical-align:${va||'baseline'}">${label}</td>
+      ${cols.map(c=>`<td style="padding:4px 10px 4px 0;vertical-align:${va||'baseline'};
+         ${va?'':'white-space:nowrap'}">${fn(c)}</td>`).join('')}
+    </tr>`;
+  const btn=c=>c.ok?`<button onclick="ocrTest('${c.engine}','${c.device}')"
+      style="font-size:11px;padding:2px 8px">Test ${esc(c.name)}</button>`:'';
+  const untested=cols.filter(c=>c.ok&&!(_ocrMeas[c.key]||{}).per_cue_ms).length;
   return `
-    <div class="lkind" style="padding:11px 12px;margin-top:10px">
+    <div id="ocrCompare" class="lkind" style="padding:11px 12px;margin-top:10px">
       <b style="color:#6fb0ff">What each engine can do here</b>
       <div class="dim" style="font-size:11px;margin-top:2px">
         For picture subtitles specifically, on the versions installed right
-        now. Hover a cell for the reason.</div>
+        now. Hover a cell for the reason. The measured rows come from the
+        tests below — a dozen cues off a real track in your library, nothing
+        written and no file touched.</div>
       <table style="width:100%;font-size:11.5px;border-collapse:collapse;
-                    margin-top:7px;table-layout:fixed">
-        <colgroup><col style="width:52%"><col style="width:24%"><col style="width:24%"></colgroup>
-        <thead><tr>
-          <th style="text-align:left;padding:0 12px 5px 0"></th>
-          <th style="text-align:left;padding:0 10px 5px 0">
-            ${ver('Tesseract ', s.tesseract_version, _ocrEng==='tesseract')}</th>
-          <th style="text-align:left;padding:0 10px 5px 0">
-            ${ver('PaddleOCR ', p.paddleocr, _ocrEng==='paddle')}</th>
-        </tr></thead>
-        <tbody>${body}</tbody>
+                    margin-top:8px;table-layout:fixed">
+        <colgroup><col style="width:${cols.length>2?40:52}%">
+          ${cols.map(()=>`<col style="width:${cols.length>2?20:24}%">`).join('')}
+        </colgroup>
+        <thead><tr><th style="padding:0 12px 6px 0"></th>${th}</tr></thead>
+        <tbody>
+          ${body}
+          ${mrow('Speed on this machine', speed)}
+          ${mrow('Last tested', when)}
+          ${mrow('What it read', sample, 'top')}
+        </tbody>
       </table>
+      <div style="margin-top:9px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        ${cols.map(btn).join('')}
+        <span id="ocrTestMsg" class="dim" style="font-size:11.5px"></span>
+      </div>
       <div class="dim" style="font-size:11px;margin-top:7px">
-        The signs-or-dialogue check is the same either way — it measures the
-        pictures before any OCR starts, so switching engines never changes
+        The signs-or-dialogue check is the same in every column — it measures
+        the pictures before any OCR starts, so switching engines never changes
         which tracks get burned in.
-        ${(!ms('tesseract')||!ms(padKey))
-          ? ' Run the tests below to fill in the speeds.' : ''}</div>
+        ${untested?` Speeds fill in as you run the tests (${untested} to go);
+          a short sample means the clock includes model load, so read the text
+          as well as the timing.`:''}</div>
     </div>`;
 }
 
@@ -19187,29 +19223,6 @@ function ocrCompareHtml(s,p){
 // as numbers from the machine nuarr was written on - the kind of claim that
 // goes stale and cannot be checked.
 let _ocrMeas={};
-function ocrMeasHtml(){
-  const rows=[['tesseract','Tesseract'],['paddle:gpu','PaddleOCR — GPU'],
-              ['paddle:cpu','PaddleOCR — CPU']];
-  const have=rows.filter(([k])=>_ocrMeas[k]);
-  if(!have.length) return `<div class="dim" style="font-size:11.5px">
-    Nothing measured yet — run a test above and the results collect here.</div>`;
-  return `<table style="width:100%;font-size:12px;border-collapse:collapse">`
-    + have.map(([k,label])=>{
-        const m=_ocrMeas[k];
-        const when=m.at?new Date(m.at*1000).toLocaleString():'';
-        return `<tr style="border-top:1px solid var(--line);vertical-align:top">
-          <td style="padding:5px 12px 5px 0;white-space:nowrap"><b>${label}</b>
-            <div class="dim" style="font-size:10.5px">${esc(when)}</div></td>
-          <td class="mono" style="white-space:nowrap;padding-right:12px">
-            ${m.cues} cues · ${m.elapsed}s</td>
-          <td class="dim mono" style="font-size:11px">
-            ${(m.lines||[]).slice(0,3).map(l=>esc(l)).join('<br>')||'(nothing read)'}</td>
-        </tr>`;
-      }).join('')
-    + `</table><div class="dim" style="font-size:10.5px;margin-top:5px">
-       A short sample, so the clock is mostly process start and model load —
-       read the text, not the timing.</div>`;
-}
 
 async function ocrSetEngine(engine){
   const m=document.getElementById('ocrEngMsg');
@@ -19241,8 +19254,14 @@ async function ocrTest(engine,device){
     const c=await (await fetch('/api/ocr/measurements')).json();
     _ocrMeas=c.measurements||{};
   }catch(e){}
-  const box=document.getElementById('ocrMeas');
-  if(box) box.innerHTML=ocrMeasHtml();
+  // REDRAW THE WHOLE COMPARISON, not just a results box. The speeds live in
+  // the same table as the capabilities now, so a finished test has to reach
+  // the row it belongs to - the old code repainted a panel that no longer
+  // exists and left the speed reading "not measured" beside a test that had
+  // just run.
+  const box=document.getElementById('ocrCompare');
+  if(box && _soc && _pad) box.outerHTML=ocrCompareHtml(_soc,_pad);
+  else loadOcr();
 }
 
 async function padInstall(mode){
