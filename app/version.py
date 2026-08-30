@@ -1,4 +1,4 @@
-﻿r"""The one place nuarr's version is written down.
+r"""The one place nuarr's version is written down.
 
 WHY A MODULE AND NOT A STRING IN THREE FILES. The version has to appear in the
 UI header, in the settings panel, in the installer's bundle.json, in the
@@ -22,7 +22,7 @@ import re
 #         setting that moved, anything that could surprise an existing install)
 # minor - a new capability
 # patch - a fix to something that was already meant to work
-VERSION = "1.10.0"
+VERSION = "1.10.1"
 
 # Filled in when a bundle is built, so a running install can say not just what
 # it is but when it was made. Left empty in a source checkout on purpose - an

@@ -513,8 +513,14 @@ def init_db() -> None:
             "AND name='ix_jobs_title'").fetchone()
         cur.execute("CREATE INDEX IF NOT EXISTS ix_jobs_title "
                     "ON jobs(title, finished_at DESC)")
-        cur.execute("CREATE INDEX IF NOT EXISTS ix_history_label "
-                    "ON history(label, at DESC)")
+        # ix_history_label is NOT created here. history.label is added by a
+        # migration further down this function, so indexing it at this point
+        # raises "no such column: label" on any database that has not had that
+        # migration yet - which is every FRESH INSTALL. init_db() then throws,
+        # the service dies, the scheduled task restarts it, and the machine
+        # sits in a boot loop. It shipped in 1.10.0 and bricked a clean VM;
+        # this box only survived because its database already had the column.
+        # The index is created immediately after the ALTER instead.
         # AN INDEX NOBODY IS TOLD ABOUT IS AN INDEX NOBODY USES. This database
         # had no sqlite_stat1 at all, so the planner was working from built-in
         # guesses - and kept choosing the state index plus a temp B-tree sort
@@ -555,6 +561,11 @@ def init_db() -> None:
         hcols = {r["name"] for r in cur.execute("PRAGMA table_info(history)")}
         if "label" not in hcols:
             cur.execute("ALTER TABLE history ADD COLUMN label TEXT")
+        # Now the column exists, it can be indexed - the Activity history pages
+        # group by it. See the note above for why this cannot live with the
+        # other index creations.
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_history_label "
+                    "ON history(label, at DESC)")
 
         # --- files.probe_json -> file_probes ---------------------------------
         # One-way migration, run once. The blob is moved rather than dropped so
