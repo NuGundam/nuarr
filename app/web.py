@@ -4188,6 +4188,35 @@ def api_subocr_status():
     return subocr.status()
 
 
+@app.get("/api/pipeline")
+def api_pipeline(file_id: int = 0):
+    """The pipeline diagram: the graph, and optionally one file's route."""
+    from . import pipeline
+    out = pipeline.graph()
+    if file_id:
+        out["route"] = pipeline.route(file_id)
+    return out
+
+
+@app.get("/api/pipeline/find")
+def api_pipeline_find(q: str = "", limit: int = 12):
+    """Files matching a title fragment, for the trace picker."""
+    q = (q or "").strip()
+    if len(q) < 2:
+        return {"rows": []}
+    from .db import cursor
+    from . import subocr
+    with cursor() as cur:
+        rows = [dict(r) for r in cur.execute(
+            "SELECT id, title, season, episode, library FROM files "
+            "WHERE state NOT IN ('deleted','duplicate') AND title LIKE ? "
+            "ORDER BY title, season, episode LIMIT ?",
+            (f"%{q}%", max(1, min(int(limit), 50))))]
+    for r in rows:
+        r["ep"] = subocr.ep_label(r.pop("season", None), r.pop("episode", None))
+    return {"rows": rows}
+
+
 @app.get("/api/subocr/shapes")
 def api_subocr_shapes(limit: int = 60):
     """What the picture-subtitle measurement has found, and what it is doing.
@@ -17069,6 +17098,7 @@ function wtab(which){
                    alang:'alangPane', cache:'cachePane',
                    whisper:'whisperPane', plex:'plexPane',
                    ocr:'ocrPane', plexwork:'plexworkPane', ruleschk:'ruleschkPane',
+                   process:'processPane',
                    updates:'updPane'};
   const isPane = Object.prototype.hasOwnProperty.call(PANE_OF, which);
   const set = document.getElementById('wSettings');
@@ -17141,6 +17171,11 @@ function wtab(which){
   if(which==='ocr'){
     if(hint) hint.textContent='· ocr engines';
     loadOcr();
+    return;
+  }
+  if(which==='process'){
+    if(hint) hint.textContent='· how files flow';
+    loadProcess();
     return;
   }
   if(which==='whisper'){
@@ -19431,6 +19466,178 @@ function socRow(k,v,where,why){
         word-break:break-all">${where?esc(where)
           :'<span style="font-family:inherit">not found</span>'}</td>
     <td class="dim" style="font-size:11px;padding-right:12px;word-break:break-all">${why}</td></tr>`;
+}
+
+// ---- How files flow ----------------------------------------------------
+// THE SERVER OWNS THE GRAPH. Nodes, edges, labels and counts all arrive from
+// /api/pipeline, which builds them from the same settings the pipeline itself
+// reads. This function knows nothing about subtitles or codecs; it draws
+// whatever it is handed. That is the only way a diagram stays true after
+// someone changes a threshold.
+let _pipe=null, _pipeRoute=null, _pipeTimer=null, _pipeFlow=null;
+
+async function loadProcess(){
+  const el=document.getElementById('processBody');
+  if(!el) return;
+  try{ _pipe=await fetch('/api/pipeline').then(r=>r.json()); }
+  catch(e){ el.innerHTML='<div class="dim">could not load</div>'; return; }
+  pipeDraw();
+  if(_pipeTimer) clearInterval(_pipeTimer);
+  // Counts move slowly; the animation is CSS and does not need the poll.
+  _pipeTimer=setInterval(async()=>{
+    const box=document.getElementById('processBody');
+    if(!box || box.offsetParent===null){ clearInterval(_pipeTimer); _pipeTimer=null; return; }
+    try{
+      const keep=_pipeRoute;
+      _pipe=await fetch('/api/pipeline').then(r=>r.json());
+      _pipeRoute=keep;
+      pipeDraw();
+    }catch(e){}
+  }, 8000);
+}
+
+// Grid -> pixels. Kept here rather than in the payload so the layout can be
+// retuned without the server having an opinion about pixel geometry.
+const _PIPE_W=190, _PIPE_H=54, _PIPE_GX=248, _PIPE_GY=86, _PIPE_PAD=14;
+function pipeXY(n){
+  return {x:_PIPE_PAD+n.col*_PIPE_GX, y:_PIPE_PAD+n.row*_PIPE_GY};
+}
+function pipeNodeColor(n){
+  if(n.kind==='pool')  return poolColor(n.pool||'');
+  if(n.kind==='bad')   return 'var(--bad)';
+  if(n.kind==='gate')  return 'var(--warn)';
+  if(n.kind==='idle')  return 'var(--dim)';
+  if(n.kind==='source')return '#6fb0ff';
+  return 'var(--ok)';
+}
+function pipeSvg(g, route, idPrefix){
+  const nodes=g.nodes, edges=g.edges;
+  const byId={}; nodes.forEach(n=>byId[n.id]=n);
+  const maxCol=Math.max(...nodes.map(n=>n.col));
+  const maxRow=Math.max(...nodes.map(n=>n.row));
+  const W=_PIPE_PAD*2+maxCol*_PIPE_GX+_PIPE_W;
+  const H=_PIPE_PAD*2+maxRow*_PIPE_GY+_PIPE_H;
+  const on=new Set(route||[]);
+  const lit=(a,b)=>{
+    if(!route||!route.length) return false;
+    const i=route.indexOf(a), j=route.indexOf(b);
+    return i>=0&&j>=0&&j===i+1;
+  };
+  // Edges first so boxes sit on top of the lines.
+  let svg='';
+  edges.forEach((e,i)=>{
+    const A=byId[e.a], B=byId[e.b];
+    if(!A||!B) return;
+    const p=pipeXY(A), q=pipeXY(B);
+    const x1=p.x+_PIPE_W, y1=p.y+_PIPE_H/2, x2=q.x, y2=q.y+_PIPE_H/2;
+    const mx=(x1+x2)/2;
+    const d=`M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}`;
+    const isLit=lit(e.a,e.b);
+    const dim=e.muted&&!isLit;
+    svg+=`<path id="${idPrefix}p${i}" d="${d}" fill="none"
+       stroke="${isLit?'#6fb0ff':(dim?'#2a313a':'#39424e')}"
+       stroke-width="${isLit?2.4:1.4}"
+       ${isLit?'':'stroke-dasharray="'+(dim?'3 4':'0')+'"'}/>`;
+    if(e.label){
+      svg+=`<text x="${mx}" y="${(y1+y2)/2-6}" text-anchor="middle"
+         font-size="10" fill="${isLit?'#6fb0ff':'var(--dim)'}"
+         style="pointer-events:none">${esc(e.label).slice(0,46)}</text>`;
+    }
+    // AMBIENT FLOW. A dot per edge, its speed set by how much traffic the
+    // edge carries - so a busy path visibly runs faster than a quiet one
+    // rather than everything moving at one meaningless rate.
+    const vol=Math.max(0, e.n||0);
+    if(vol>0 && !dim){
+      const dur=Math.max(1.6, 6.5-Math.log10(vol+1)*1.4);
+      svg+=`<circle r="${isLit?3.4:2.4}"
+         fill="${isLit?'#8ec5ff':'#5b6675'}" opacity="${isLit?0.95:0.5}">
+         <animateMotion dur="${dur.toFixed(1)}s" repeatCount="indefinite"
+            keyPoints="0;1" keyTimes="0;1" calcMode="linear">
+           <mpath href="#${idPrefix}p${i}"/></animateMotion></circle>`;
+    }
+  });
+  nodes.forEach(n=>{
+    const p=pipeXY(n), c=pipeNodeColor(n);
+    const isOn=on.has(n.id);
+    svg+=`<g class="pipeNode" style="cursor:help">
+      <title>${esc(n.note||'')}</title>
+      <rect x="${p.x}" y="${p.y}" width="${_PIPE_W}" height="${_PIPE_H}" rx="9"
+        fill="${isOn?'#16324e':'#141922'}"
+        stroke="${isOn?'#6fb0ff':c}" stroke-width="${isOn?2:1.1}"
+        opacity="${n.kind==='idle'&&!isOn?0.55:1}"/>
+      <text x="${p.x+12}" y="${p.y+22}" font-size="12" font-weight="600"
+        fill="${isOn?'#cfe6ff':c}">${esc(n.label)}</text>
+      ${n.count===null||n.count===undefined?'':
+        `<text x="${p.x+12}" y="${p.y+40}" font-size="11.5"
+           fill="var(--dim)">${fmt(n.count)}</text>`}
+    </g>`;
+  });
+  return `<svg viewBox="0 0 ${W} ${H}" width="100%"
+     style="max-width:${W}px;height:auto;overflow:visible">${svg}</svg>`;
+}
+function pipeDraw(){
+  const el=document.getElementById('processBody');
+  if(!el||!_pipe) return;
+  const r=_pipeRoute;
+  const trace = r && r.found ? `
+    <div class="lkind" style="padding:9px 12px;margin-bottom:10px">
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <b style="color:#6fb0ff">${esc(r.title||'')}</b>
+        <span class="dim" style="font-size:11px">${esc(r.library||'')}</span>
+        <button style="margin-left:auto;font-size:11px;padding:2px 8px"
+          onclick="pipeClear()">Clear trace</button>
+      </div>
+      <div style="margin-top:6px;font-size:11.5px">
+        ${(r.steps||[]).map(s=>`<div style="padding:1px 0">
+           <span class="dim" style="display:inline-block;min-width:96px">
+             ${esc(s[0])}</span> ${esc(s[1])}</div>`).join('')}
+      </div>
+    </div>` : '';
+  el.innerHTML=`
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px;
+                flex-wrap:wrap">
+      <input id="pipeQ" placeholder="trace a file — type part of a title"
+        oninput="pipeFind()" style="flex:1;min-width:220px;max-width:420px"/>
+      <span class="dim" style="font-size:11px">${esc(_pipe.engine||'')} ·
+        OCR on ${(_pipe.libraries||[]).length} librar${
+          (_pipe.libraries||[]).length===1?'y':'ies'}</span>
+    </div>
+    <div id="pipeHits"></div>
+    ${trace}
+    <div style="overflow-x:auto">${pipeSvg(_pipe, r?r.path:null, 'a')}</div>
+    <div class="lkindhead" style="margin:14px 0 6px"><b style="color:#6fb0ff">
+      Picture subtitles — the branch with a measurement behind it</b></div>
+    <div style="overflow-x:auto">${
+      pipeSvg(_pipe.sub, r?r.sub_path:null, 'b')}</div>`;
+}
+function pipeClear(){ _pipeRoute=null; pipeDraw(); }
+let _pipeFindT=null;
+function pipeFind(){
+  clearTimeout(_pipeFindT);
+  _pipeFindT=setTimeout(async()=>{
+    const q=(document.getElementById('pipeQ')||{}).value||'';
+    const box=document.getElementById('pipeHits');
+    if(!box) return;
+    if(q.trim().length<2){ box.innerHTML=''; return; }
+    let d;
+    try{ d=await fetch('/api/pipeline/find?q='+encodeURIComponent(q)).then(r=>r.json()); }
+    catch(e){ return; }
+    box.innerHTML=(d.rows||[]).length
+      ? `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">`
+        + d.rows.map(x=>`<button style="font-size:11px;padding:2px 8px"
+            onclick="pipeTrace(${x.id})">${esc(x.title)}${
+              x.ep?' <span class="dim">'+esc(x.ep)+'</span>':''}</button>`).join('')
+        + `</div>`
+      : `<div class="dim" style="font-size:11px;margin-bottom:10px">no match</div>`;
+  }, 250);
+}
+async function pipeTrace(id){
+  try{
+    const d=await fetch('/api/pipeline?file_id='+id).then(r=>r.json());
+    _pipe=d; _pipeRoute=d.route||null;
+    pipeDraw();
+    const box=document.getElementById('pipeHits'); if(box) box.innerHTML='';
+  }catch(e){}
 }
 
 // ---- Whisper ---------------------------------------------------------
@@ -22473,6 +22680,7 @@ _SETTINGS_NAV = [
                     ("alang",  "Audio language",   "language"),
                     ("rules",  "Rules",            "list"),
                     ("ruleschk", "Rule check",     "list"),
+                    ("process", "How files flow",  "list"),
                     ("plexwork", "Plex playback",  "play")]),
     ("Tools",      [("ffmpeg",  "ffmpeg",          "film"),
                     ("mkv",     "MKVToolNix",      "tool"),
