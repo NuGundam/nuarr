@@ -500,6 +500,51 @@ def track_shape(sup: str, sample: int = 400) -> dict:
     return out
 
 
+def record_shape(file_id: int, rel: int, shape: dict) -> None:
+    """Remember what a track turned out to be, so the planner can ask cheaply.
+
+    track_shape() needs the track EXTRACTED, which is far too expensive to do
+    while planning 39,000 files. The OCR pass already pays that cost, so what
+    it learned is written down here and decide() reads it for free. A file
+    nobody has looked at yet simply has no answer, and nothing changes.
+    """
+    if not file_id:
+        return
+    try:
+        from .db import cursor
+        with cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS sub_shape(
+                    file_id  INTEGER NOT NULL,
+                    rel      INTEGER NOT NULL,
+                    typeset  INTEGER NOT NULL DEFAULT 0,
+                    median_h REAL, tall_share REAL, at REAL,
+                    PRIMARY KEY (file_id, rel))""")
+            cur.execute(
+                "INSERT INTO sub_shape(file_id,rel,typeset,median_h,tall_share,at)"
+                " VALUES(?,?,?,?,?,?) ON CONFLICT(file_id,rel) DO UPDATE SET "
+                " typeset=excluded.typeset, median_h=excluded.median_h,"
+                " tall_share=excluded.tall_share, at=excluded.at",
+                (int(file_id), int(rel), 1 if shape.get("typeset") else 0,
+                 shape.get("median_h"), shape.get("tall_share"), time.time()))
+    except Exception:                                        # noqa: BLE001
+        pass                       # bookkeeping must never fail a conversion
+
+
+def typeset_rels(file_id: int) -> set:
+    """Subtitle indices this file is known to carry as typeset pictures."""
+    if not file_id:
+        return set()
+    try:
+        from .db import cursor
+        with cursor() as cur:
+            return {r["rel"] for r in cur.execute(
+                "SELECT rel FROM sub_shape WHERE file_id=? AND typeset=1",
+                (int(file_id),))}
+    except Exception:                                        # noqa: BLE001
+        return set()
+
+
 def select_targets(probe: dict, library: str | None = None) -> list[dict]:
     """Every English image sub worth converting, in stream order.
 
@@ -889,7 +934,32 @@ def validate(srt_path: str, expected: int | None,
     return True, f"{got} cues", got
 
 
-def embed(src: str, subs: list[tuple[str, str]], dst: str) -> None:
+# TRACKS THIS PROGRAM MADE, so they can be replaced instead of piling up.
+#
+# Every OCR pass used to APPEND. Re-running one - because the engine changed
+# from Tesseract to PaddleOCR, or because the output got better - left the old
+# flat track sitting above the new one, and the first entry in Plex's list is
+# the one people pick. Two English tracks, and the stale one wins.
+#
+# Matching is deliberately narrow: the title must end in nuarr's own marker.
+# A hand-made "English (OCR by me)" is not touched, because being wrong here
+# deletes somebody's work.
+_OCR_TITLE = re.compile(r"\(OCR(?:[^)]*)\)\s*$", re.I)
+
+
+def is_ocr_track(track: dict) -> bool:
+    """True for a text subtitle this program produced by OCR."""
+    if track.get("type") != "subtitles":
+        return False
+    p = track.get("properties") or {}
+    codec = str(p.get("codec_id") or "").upper()
+    if "PGS" in codec or "VOBSUB" in codec or "DVBSUB" in codec:
+        return False                      # an image track is never our output
+    return bool(_OCR_TITLE.search(str(p.get("track_name") or "")))
+
+
+def embed(src: str, subs: list[tuple[str, str]], dst: str,
+          drop_old_ocr: bool = True) -> None:
     """Mux the SRTs in, demote every image sub, and put text subs FIRST.
 
     One pass, not a merge followed by an mkvpropedit: a second tool touching
@@ -912,8 +982,17 @@ def embed(src: str, subs: list[tuple[str, str]], dst: str) -> None:
         return "PGS" in c or "VOBSUB" in c or "DVBSUB" in c
 
     args = [_mkvmerge(), "--quiet", "-o", dst]
+    # REPLACE, DO NOT ACCUMULATE. Anything this program OCR'd before is
+    # dropped so the pass about to run is the only one in the file - see
+    # is_ocr_track(). The picture track it came from is untouched, so the
+    # conversion can always be done again.
+    stale = [t["id"] for t in src_tracks if is_ocr_track(t)] if drop_old_ocr else []
+    if stale:
+        args += ["-s", "!" + ",".join(str(i) for i in stale)]
     for t in src_tracks:
         tid = t["id"]
+        if tid in stale:
+            continue
         p = t.get("properties") or {}
         if t.get("type") == "subtitles" and is_image(t):
             # Demoted, not dropped: this is what stops Plex choosing the image
@@ -1061,6 +1140,7 @@ def produce(path: str, probe: dict, file_id: int, work_root: str | None = None,
     worth removing.
     """
     res = run_one(path, probe, work_root, on_progress, mux=False,
+                  file_id=file_id,
                   library=library)
     if not res.get("ok"):
         return res
@@ -1081,7 +1161,7 @@ def produce(path: str, probe: dict, file_id: int, work_root: str | None = None,
 
 def run_one(path: str, probe: dict, work_root: str | None = None,
             on_progress=None, mux: bool = True, on_child=None,
-            library: str | None = None) -> dict:
+            library: str | None = None, file_id: int = 0) -> dict:
     """Convert every eligible track and produce a new file. Replaces nothing.
 
     The caller commits, so this inherits the Plex gate, the disk pacing and
@@ -1143,6 +1223,7 @@ def run_one(path: str, probe: dict, work_root: str | None = None,
                 # track_shape(). Skipping here leaves the PGS in place, which
                 # is what the burn path wants anyway.
                 shape = track_shape(sup)
+                record_shape(file_id, t["rel"], shape)
                 if shape.get("typeset"):
                     notes.append(f"rel {t['rel']}: not OCR'd - {shape['why']}")
                     from . import joblog as _jl      # imported where used,

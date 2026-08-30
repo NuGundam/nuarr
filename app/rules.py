@@ -334,8 +334,11 @@ SIGNS_TITLE_RE = re.compile(
     r"sign|song|s\s*&\s*s|s\s*/\s*s|typeset|caption|forced|foreign|\btitles\b", re.I)
 
 # Tracks this system created by OCR'ing an image sub - see subocr.embed(),
-# which names them "<label> (OCR)".
-OCR_MADE_RE = re.compile(r"\(OCR\)", re.I)
+# which names them "<label> (OCR)". The suffix carries detail now - the
+# positioned variant is "(OCR, positioned)" - so the pattern allows anything
+# inside the brackets after OCR. Anchored at the end, because a hand-made
+# "(OCR by me) rev2" is somebody else's track and must not be swept up.
+OCR_MADE_RE = re.compile(r"\(OCR[^)]*\)\s*$", re.I)
 
 def _ch_name(n: int) -> str:
     """Speaker layouts by the name people use for them.
@@ -2025,9 +2028,34 @@ def decide(probe: dict, *, anime: bool = False, filename: str = "",
                   "text subtitles are searchable, styleable and direct-play")
 
     if anime and _sr("burn"):
-        bi, variant = pick_burn_target(
-            [subs[i] for i in p.keep_subs] if p.keep_subs else subs,
-            _sr("burn_lang_guard"))
+        pool = [subs[i] for i in p.keep_subs] if p.keep_subs else subs
+        # MEASUREMENT BEATS A TITLE, so it is asked FIRST.
+        #
+        # pick_burn_target reads titles and disposition flags, which is the
+        # only evidence most files offer - and on a hybrid track it gets the
+        # answer wrong twice over. Detective Conan carries dialogue and typeset
+        # signs in one untitled PGS: no signs variant matches it, and the
+        # default-flag rule instead selected the OCR'd TEXT track beside it,
+        # which is not something anyone wants burned into a picture.
+        #
+        # The OCR pass measures these tracks and writes down what it found
+        # (see subocr.record_shape). "54% of this track's cues are full-frame
+        # canvases" is a fact about the pictures; "the track has no name" is
+        # the absence of one.
+        bi, variant = None, ""
+        try:
+            from . import subocr as _so
+            known = _so.typeset_rels(file_id)
+        except Exception:                                    # noqa: BLE001
+            known = set()
+        if known:
+            for n, i in enumerate(p.keep_subs or range(len(subs))):
+                if i in known and (subs[i].get("codec_name") or "").lower() \
+                        in IMAGE_SUB_CODECS:
+                    bi, variant = n, "typeset pictures"
+                    break
+        if bi is None:
+            bi, variant = pick_burn_target(pool, _sr("burn_lang_guard"))
         if bi is not None:
             real = p.keep_subs[bi] if p.keep_subs else bi
             is_image = (subs[real].get("codec_name") or "").lower() in IMAGE_SUB_CODECS
@@ -2041,6 +2069,26 @@ def decide(probe: dict, *, anime: bool = False, filename: str = "",
                 p.burn_index = real
                 p.burn_image = is_image
                 p.encode = True
+                # A BURNED TRACK'S OCR COPY IS NOW A DUPLICATE, and the worse
+                # of the two. Once the pictures are painted into the video,
+                # the text this program OCR'd from those same pictures says
+                # the same words with the typesetting thrown away - a sign
+                # that belonged over a name card reduced to a line at the
+                # bottom, on top of the burned-in one. Drop it with the track
+                # it came from.
+                if is_image:
+                    for j in list(p.keep_subs):
+                        t = subs[j]
+                        if j == real:
+                            continue
+                        if (t.get("codec_name") or "").lower() in TEXT_SUB_CODECS \
+                                and OCR_MADE_RE.search(_title(t)):
+                            p.keep_subs.remove(j)
+                            p.add("subtitle",
+                                  f"remove OCR subtitle {j}{_tag(_lang(t))}",
+                                  "its pictures are being burned into the "
+                                  "video, so the OCR'd copy would repeat the "
+                                  "same words underneath with the layout lost")
                 # A burn is a compatibility encode, not a shrink: its payoff is
                 # signs painted into the picture, and an efficient x265 source
                 # re-encoded at cq22 routinely lands a few percent LARGER. The
