@@ -124,6 +124,11 @@ class ArrClient:
         r.raise_for_status()
         return r.json() if r.content else {}
 
+    async def _put(self, path: str, payload: dict):
+        r = await self._client.put(path, json=payload)
+        r.raise_for_status()
+        return r.json() if r.content else {}
+
     async def _delete(self, path: str, **params):
         r = await self._client.delete(path, params=params or None)
         r.raise_for_status()

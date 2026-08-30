@@ -4188,6 +4188,25 @@ def api_subocr_status():
     return subocr.status()
 
 
+@app.get("/api/arrlang")
+async def api_arrlang(limit: int = 400):
+    """Arr records whose language field disagrees with the file. Read-only."""
+    from . import arrlang
+    out = await arrlang.scan(limit=max(1, min(int(limit), 5000)))
+    out["rows"] = out["rows"][:200]        # the page shows a sample
+    return out
+
+
+@app.post("/api/arrlang/fix")
+async def api_arrlang_fix():
+    """Set every mismatched record's languages to what its file contains."""
+    from . import arrlang
+    found = await arrlang.scan()
+    res = await arrlang.fix(found["rows"])
+    res["found"] = len(found["rows"])
+    return res
+
+
 @app.get("/api/hostio")
 def api_hostio():
     """Disk activity from the machine that actually holds the pool."""
