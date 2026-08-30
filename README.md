@@ -101,6 +101,54 @@ check self-heals: a finding is queued, fixed, and re-verified.
 
 ---
 
+## Custom arrs scripts
+
+Optional jobs under **Settings → Arrs** that keep something in Radarr or Sonarr
+the way you decided it. Each is off until you turn it on, and each works only
+on names you list — nothing here touches a profile or format you have not
+named.
+
+### TRaSH anime format sync
+
+The anime custom formats most people run come from the
+[TRaSH Guides](https://trash-guides.info/), and they drift: a regex gets
+tightened, a release group is re-tiered, a new fansub group appears. The
+guides update; your Radarr does not. Nothing tells you, because a format that
+has silently stopped matching looks exactly like one that matches nothing this
+week.
+
+This reads the current anime formats from the guides and compares them with
+what your arrs actually have:
+
+- **Formats you already run are kept current.** If the guides changed a
+  format's matching rules, nuarr updates yours to match and names it in the
+  log. It never deletes, and it never edits a quality profile.
+- **Formats you do not have are reported**, arr by arr — "in the guides, not
+  in your arrs". You can tick the ones you want and press **Add ticked to the
+  arrs**, or turn on **auto-add** and let each sync bring them in.
+- **Added formats carry no score and join no profile.** An unscored custom
+  format changes nothing about what gets downloaded until you score it
+  yourself, which is what makes adding one safe to automate at all. The
+  guides' own recommended scores are deliberately not applied — what a release
+  is worth to *your* library is your decision, not theirs.
+- **You choose the scope.** Leave the list empty to keep every anime format
+  you already have in step with the guides, or name specific formats to track
+  just those. Either way you still get told what is new.
+
+It runs at most once a day. That is a limit on someone else's bandwidth, not a
+performance trade.
+
+### 2160p profile split guard
+
+If you have built a 2160p profile as two ordered quality groups — resolution
+first, custom-format score second — and something rebuilds it flat, this puts
+it back and says so. Written for Profilarr, whose profile sync legitimately
+owns the shape of a profile and will overwrite yours with its own. List the
+profiles to protect per arr; it checks them on a timer and only acts on the
+merged shape.
+
+---
+
 ## Requirements
 
 - Windows 10 / 11 / Server 2019+
