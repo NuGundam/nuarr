@@ -19157,12 +19157,23 @@ function ocrCompareHtml(s,p){
     </tr>`).join('');
   // The measured rows sit in the same columns as the capabilities, which is
   // the entire reason for merging the two panels.
+  // SAY WHICH WAY IS GOOD. "4.0s a cue" against "0.4s a cue" only reads as a
+  // result if you already know the unit is time per cue rather than cues per
+  // second - and the two are inverses, so a reader who guesses wrong reads the
+  // table exactly backwards. The fastest measured column is marked for the
+  // same reason, but only once there are two to compare.
+  const best=Math.min(...cols.filter(c=>c.ok&&(_ocrMeas[c.key]||{}).per_cue_ms)
+                            .map(c=>_ocrMeas[c.key].per_cue_ms), Infinity);
+  const rated=cols.filter(c=>(_ocrMeas[c.key]||{}).per_cue_ms).length;
   const speed=c=>{
     const m=_ocrMeas[c.key];
     if(!c.ok) return `<span class="dim">—</span>`;
     if(!m||!m.per_cue_ms) return `<span class="dim">not measured</span>`;
-    return `<b>${(m.per_cue_ms/1000).toFixed(1)}s</b>
-            <span class="dim">a cue</span>`;
+    const win=rated>1 && m.per_cue_ms===best;
+    return `<b${win?' style="color:var(--ok)"':''}>${(m.per_cue_ms/1000).toFixed(1)}s</b>
+            <span class="dim">a cue</span>
+            ${win?'<span style="color:var(--ok)" title="fastest of the engines'
+                 +' measured here">· fastest</span>':''}`;
   };
   const when=c=>{
     const m=_ocrMeas[c.key];
@@ -19200,7 +19211,9 @@ function ocrCompareHtml(s,p){
         <thead><tr><th style="padding:0 12px 6px 0"></th>${th}</tr></thead>
         <tbody>
           ${body}
-          ${mrow('Speed on this machine', speed)}
+          ${mrow('Speed on this machine <span class="dim" '
+                 +'style="font-size:10.5px">— seconds per subtitle, '
+                 +'lower is better</span>', speed)}
           ${mrow('Last tested', when)}
           ${mrow('What it read', sample, 'top')}
         </tbody>
