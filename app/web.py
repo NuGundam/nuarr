@@ -4223,10 +4223,19 @@ async def api_arrsync_run():
 
 @app.post("/api/arrsync/fix")
 async def api_arrsync_fix(kinds: str = ""):
-    """Correct what nuarr knows, and ask the arrs to re-read the rest."""
+    """Start a correction. Minutes, so the card polls rather than waits.
+
+    Was a blocking call, which meant the browser sat on one request for the
+    whole run and the panel could not show a thing until it was over - the
+    exact reason the scan was made pollable.
+    """
     from . import arrsync
+    import asyncio as _a
+    if (arrsync._CACHE.get("fixing") or {}).get("running"):
+        return {"ok": False, "error": "already running"}
     want = [k.strip() for k in kinds.split(",") if k.strip()] or None
-    return await arrsync.fix(want)
+    _a.create_task(arrsync.fix(want))
+    return {"ok": True, "started": True}
 
 
 @app.post("/api/arrsync/mode")
@@ -22718,8 +22727,12 @@ async function loadArrSync(){
   catch(e){ el.innerHTML='<span class="dim">could not load</span>'; return; }
   arrSyncPaint();
   if(_arrSyncTimer) clearTimeout(_arrSyncTimer);
-  // Faster while it is working, so the bar moves rather than stepping.
-  if(_arrSync && _arrSync.running) _arrSyncTimer=setTimeout(loadArrSync, 1200);
+  // Faster while it is working, so the bar moves rather than stepping. A
+  // correction is polled too, and for the same reason: the count falling is
+  // the whole point, and a count only falls if something goes and looks.
+  const busy = _arrSync && (_arrSync.running
+                            || (_arrSync.fixing && _arrSync.fixing.running));
+  if(busy) _arrSyncTimer=setTimeout(loadArrSync, 1200);
 }
 function arrSyncPaint(){
   const el=document.getElementById('arrSyncBody');
@@ -22788,6 +22801,43 @@ function arrSyncPaint(){
           esc(f.why||'')}</div>`).join('')}
     </div>` : '';
 
+  // PUT RIGHT IS MINUTES OF WORK, so it reports like the scan does. The count
+  // above and the list below shrink as records are confirmed, so the bar is
+  // not the only evidence anything is happening - the number coming down IS
+  // the progress, and it is the number you were worried about.
+  const fx=d.fixing||{}, fixing=!!fx.running;
+  const fxDone=fx.done||0, fxTot=fx.total||0;
+  const fxPct=fxTot?Math.min(100,Math.round(fxDone/fxTot*100)):0;
+  const fixBox = fixing ? `
+    <div style="border:1px solid var(--acc);border-radius:6px;padding:7px 10px;
+                margin-bottom:7px;font-size:11.5px">
+      <div style="display:flex;gap:8px;align-items:center">
+        <span class="spin" style="width:11px;height:11px"></span>
+        <b>Putting it right</b>
+        <span class="dim">${esc(fx.where||'')}</span>
+        <span class="dim" style="margin-left:auto;white-space:nowrap">${
+          fmt(fxDone)} of ${fmt(fxTot)} · ${fxPct}%</span>
+      </div>
+      <div style="height:5px;border-radius:3px;background:#1e242c;margin-top:5px;
+                  overflow:hidden">
+        <div style="height:100%;border-radius:3px;background:var(--acc);
+                    width:${fxPct}%;transition:width 1s linear"></div>
+      </div>
+      <div class="dim" style="font-size:10.5px;margin-top:4px">
+        ${fmt(fx.fixed||0)} confirmed${fx.failed?` · <span
+          style="color:var(--warn)">${fmt(fx.failed)} refused</span>`:''} —
+        the count above falls as each one lands. Sending the corrections is
+        quick; the arrs then re-read on their own schedule, so Check again in
+        a few minutes is what proves it stuck.
+      </div>
+    </div>`
+    : (d.last_fix ? `<div class="dim" style="font-size:11px;margin-bottom:6px">
+        Last correction: ${fmt(d.last_fix.fixed||0)} language record(s) set,
+        ${fmt(d.last_fix.refreshed||0)} file(s) sent for re-reading${
+        d.last_fix.failed?` · <span style="color:var(--warn)">${
+          fmt(d.last_fix.failed)} refused</span>`:''}.
+        The arrs re-read in their own time, so a Check again a few minutes
+        later is what confirms it.</div>` : '');
   const mode=d.mode||'manual', auto=mode==='auto';
   // THE MODE IS THE ANSWER TO "WILL THIS FIX ITSELF", so it belongs beside the
   // button it governs, not on some other page.
@@ -22823,12 +22873,14 @@ function arrSyncPaint(){
          Anything that refuses a correction still gets raised.`
       : `Checked every ${d.every_h||12}h and left for you to apply. While
          records disagree the Attention tile carries the count.`}</div>
+    ${fixBox}
     <div style="display:flex;gap:6px;margin-bottom:7px">
-      <button onclick="arrSyncRun()" style="font-size:11px;padding:2px 9px"
-        >Check again</button>
-      ${total?`<button onclick="arrSyncFix()" style="font-size:11px;padding:2px 9px"
-        title="Sets the languages nuarr knows, and asks the arrs to re-read the files for the rest">Put right ${
-          auto?'now':''}</button>`:''}
+      <button onclick="arrSyncRun()" ${fixing?'disabled':''}
+        style="font-size:11px;padding:2px 9px">Check again</button>
+      ${total?`<button onclick="arrSyncFix()" ${fixing?'disabled':''}
+        style="font-size:11px;padding:2px 9px"
+        title="Sets the languages nuarr knows, and asks the arrs to re-read the files for the rest">${
+          fixing?'Putting it right…':'Put right'+(auto?' now':'')}</button>`:''}
     </div>
     <table style="width:100%;border-collapse:collapse;font-size:11.5px">${rows}</table>
     <div id="arrSyncList" style="margin-top:8px"></div>
@@ -22915,9 +22967,11 @@ function arrSyncListPaint(force){
       const d=r.delta||0, s=d<0?'smaller':'larger';
       return `<b style="color:${d<0?'var(--warn)':'var(--acc)'}">${
         mbytes(Math.abs(d))} ${s}</b> <span class="dim">than the arr thinks (${
-        gb(r.arr)} → ${gb(r.disk)})</span>`;
+        gb(r.was)} → ${gb(r.disk)})</span>`;
     }
-    return `<span class="dim">${esc(String(r.arr||''))}</span> → <b>${
+    // 'was' is what the arr believed; 'arr' is which arr. They shared a key
+    // once and it cost every size and video correction - see arrsync.scan().
+    return `<span class="dim">${esc(String(r.was||''))}</span> → <b>${
       esc(String(r.actual||''))}</b>`;
   };
   // SHUT BY DEFAULT. A thousand rows is the answer to "which ones", which is a
@@ -22979,15 +23033,15 @@ async function arrSyncRun(){
 }
 async function arrSyncFix(){
   const m=document.getElementById('arrSyncMsg');
-  if(m) m.textContent='putting it right — this rewrites arr records and asks '
-    +'for re-reads, so it takes a few minutes…';
+  if(m) m.textContent='';
   try{
+    // Returns as soon as it has STARTED - the run itself is minutes, and the
+    // panel now watches it rather than holding one request open for the whole
+    // thing and showing nothing until it ends.
     const r=await (await fetch('/api/arrsync/fix',{method:'POST'})).json();
-    if(m) m.textContent=`corrected ${r.fixed||0} language record(s), asked the `
-      +`arrs to re-read ${r.refreshed||0} file(s)`
-      +(r.failed?`, ${r.failed} failed`:'');
-  }catch(e){ if(m) m.textContent='failed'; }
-  setTimeout(loadArrSync, 1500);
+    if(r && r.error){ if(m) m.textContent=r.error; return; }
+  }catch(e){ if(m) m.textContent='could not start'; return; }
+  loadArrSync();                       // picks up fixing:{running:true}, polls on
 }
 
 async function loadArrsTab(){

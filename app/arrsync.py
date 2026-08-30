@@ -37,9 +37,44 @@ _CACHE: dict = {"at": 0.0, "data": None, "running": False,
                 # that survived a correction attempt is not: something is
                 # wrong that no amount of waiting will fix, and it is the one
                 # case where the mode does not matter.
-                "failures": [], "fixed_at": 0.0, "last_fix": None}
+                "failures": [], "fixed_at": 0.0, "last_fix": None,
+                # Put right is minutes of work, so it reports like the scan
+                # does rather than sitting behind one unmoving sentence.
+                "fixing": None}
 TTL_S = 1800.0
 EVERY_S = 12 * 3600.0
+
+
+def _retire(check: str, ids: set) -> None:
+    r"""Drop rows that have just been corrected out of the live answer.
+
+    THE NUMBER HAS TO COME DOWN WHILE YOU WATCH. Put right takes minutes, and
+    a count that sits at 1,136 for all of them tells you nothing about whether
+    it is working - you cannot tell progress from a stall. Retiring each row
+    the moment its correction is CONFIRMED means the count falls, the list
+    empties, and what is left at the end is exactly what did not work.
+
+    Deliberately driven by confirmations rather than by attempts: a row that
+    was tried and refused must stay on screen, because it is the part that
+    still needs a person.
+    """
+    d = _CACHE.get("data")
+    if not d or not ids:
+        return
+    keep = [r for r in (d.get("list") or [])
+            if not (r.get("check") == check and r.get("file_id") in ids)]
+    gone = len(d.get("list") or []) - len(keep)
+    if not gone:
+        return
+    d["list"] = keep
+    counts = dict(d.get("counts") or {})
+    counts[check] = max(0, int(counts.get(check, 0)) - gone)
+    d["counts"] = counts
+    d["total"] = max(0, int(d.get("total", 0)) - gone)
+    rows = dict(d.get("rows") or {})
+    if check in rows:
+        rows[check] = [r for r in rows[check] if r.get("file_id") not in ids]
+        d["rows"] = rows
 
 CHECKS = {
     "languages": {
@@ -125,6 +160,14 @@ async def scan() -> dict:
                 if not mine:
                     continue
                 checked += 1
+                # 'arr' IS THE ARR'S NAME AND NOTHING ELSE. The size and video
+                # rows below used to add arr=<the value the arr believed>,
+                # which overwrote it - so a size row carried arr=1332586482
+                # where the name should be, fix() could not match that to any
+                # configured arr, and every one of them was skipped. It logged
+                # "asked the arrs to re-read 0 file(s)" and the panel called
+                # that success. The believed value is 'was' now; the two are
+                # never the same key again.
                 row = {"arr": cfg.name, "kind": cfg.kind,
                        "file_id": rec.get("id"),
                        "parent_id": mine.get("arr_parent_id"),
@@ -161,7 +204,7 @@ async def scan() -> dict:
                         # 1.2 -> 1.2 looks like a bug in the check rather than
                         # an 8.6 MB drift.
                         found["size"].append(
-                            dict(row, arr=arr_size, disk=disk,
+                            dict(row, was=arr_size, disk=disk,
                                  delta=disk - arr_size))
 
                 # --- video codec / height ---------------------------------
@@ -172,10 +215,10 @@ async def scan() -> dict:
                 m_h = int(mine.get("height") or 0)
                 if m_codec and a_codec and not _codec_same(a_codec, m_codec):
                     found["video"].append(
-                        dict(row, arr=a_codec, actual=m_codec, field="codec"))
+                        dict(row, was=a_codec, actual=m_codec, field="codec"))
                 elif m_h and a_h and abs(a_h - m_h) > 8:
                     found["video"].append(
-                        dict(row, arr=f"{a_h}p", actual=f"{m_h}p",
+                        dict(row, was=f"{a_h}p", actual=f"{m_h}p",
                              field="height"))
 
     # ONE FLAT LIST for the panel, so it can be sorted and scrolled like any
@@ -187,9 +230,14 @@ async def scan() -> dict:
         for r in rows:
             flat.append(dict(r, check=k))
     flat.sort(key=lambda r: (r["check"], r.get("path") or ""))
+    # ROWS ARE KEPT WHOLE. They used to be truncated to 200 per check here,
+    # which was fine for the panel and wrong for everything else: fix() works
+    # off rows, so pressing Put right on 1,136 records corrected the first 200
+    # and reported success. The cap belongs on the way OUT to the browser, not
+    # on the answer itself - see cached().
     return {"checked": checked, "at": time.time(),
             "counts": {k: len(v) for k, v in found.items()},
-            "rows": {k: v[:200] for k, v in found.items()},
+            "rows": found,
             "list": flat[:2000],
             "total": sum(len(v) for v in found.values())}
 
@@ -211,6 +259,26 @@ def _codec_same(a: str, b: str) -> bool:
 
 
 async def fix(kinds: list | None = None) -> dict:
+    r"""Run a correction, and never leave the panel thinking one is running.
+
+    A wrapper only, so that a fault anywhere in the work below cannot strand
+    the progress bar at "running" forever - a spinner that never stops is
+    worse than an error, because it invites you to keep waiting.
+    """
+    if (_CACHE.get("fixing") or {}).get("running"):
+        return {"fixed": 0, "refreshed": 0, "failed": 0,
+                "error": "a correction is already running"}
+    try:
+        return await _fix(kinds)
+    except Exception as e:                                   # noqa: BLE001
+        joblog.log(f"arr sync fix: {type(e).__name__}: {e}", "warn")
+        raise
+    finally:
+        if _CACHE.get("fixing"):
+            _CACHE["fixing"]["running"] = False
+
+
+async def _fix(kinds: list | None = None) -> dict:
     r"""Put right what can be put right, leaving the rest visible.
 
     Languages are set directly, because nuarr knows the answer. Size and video
@@ -222,13 +290,34 @@ async def fix(kinds: list | None = None) -> dict:
     from .arr import shared_client
     from . import arrlang
 
-    data = await scan()
+    # THE ANSWER ON SCREEN IS THE ONE TO ACT ON. This used to re-scan first,
+    # which meant pressing Put right spent minutes recomputing the very list
+    # you were looking at before it corrected anything - and then corrected a
+    # set that no longer matched what you had read. The cached scan is used
+    # when there is one; a scan only happens when there is nothing to work
+    # from.
+    data = _CACHE.get("data") or await scan()
     kinds = kinds or list(CHECKS)
     out = {"fixed": 0, "refreshed": 0, "failed": 0}
     failures: list = []
 
+    total = sum(len(data["rows"].get(k) or []) for k in kinds)
+    _CACHE["fixing"] = {"running": True, "done": 0, "total": total,
+                        "where": "", "fixed": 0, "failed": 0}
+    prog = _CACHE["fixing"]
+
     if "languages" in kinds and data["rows"]["languages"]:
-        res = await arrlang.fix(data["rows"]["languages"])
+        prog["where"] = "language records"
+
+        def _lang_done(file_ids, ok):
+            prog["done"] += len(file_ids)
+            if ok:
+                prog["fixed"] += len(file_ids)
+                _retire("languages", set(file_ids))
+            else:
+                prog["failed"] += len(file_ids)
+
+        res = await arrlang.fix(data["rows"]["languages"], on_chunk=_lang_done)
         out["fixed"] += res.get("fixed", 0)
         out["failed"] += res.get("failed", 0)
         if res.get("failed"):
@@ -238,15 +327,20 @@ async def fix(kinds: list | None = None) -> dict:
 
     # One refresh per PARENT, not per file: a series with forty stale episodes
     # is one rescan, and forty would be forty times the work for one answer.
-    parents = {}
+    # Which rows each parent covers, so a confirmed re-read can retire exactly
+    # the files it accounted for and nothing else.
+    parents: dict = {}
     for k in ("size", "video"):
         if k not in kinds:
             continue
         for r in data["rows"][k]:
             if r.get("parent_id"):
-                parents.setdefault((r["arr"], r["parent_id"]), 0)
-                parents[(r["arr"], r["parent_id"])] += 1
-    for (arr_name, pid), n in parents.items():
+                parents.setdefault((r["arr"], r["parent_id"]), []).append(
+                    (k, r.get("file_id")))
+    if parents:
+        prog["where"] = "asking the arrs to re-read"
+    for (arr_name, pid), members in parents.items():
+        n = len(members)
         cfg = next((a for a in (SETTINGS.arrs or [])
                     if a.name == arr_name), None)
         if not cfg:
@@ -254,12 +348,18 @@ async def fix(kinds: list | None = None) -> dict:
         try:
             await shared_client(cfg).notify_file_changed(int(pid))
             out["refreshed"] += n
+            prog["fixed"] += n
+            for k in ("size", "video"):
+                _retire(k, {fid for kk, fid in members if kk == k})
         except Exception as e:                               # noqa: BLE001
             out["failed"] += n
+            prog["failed"] += n
             failures.append({"check": "rescan", "n": n, "arr": arr_name,
                              "parent_id": pid,
                              "why": f"{arr_name} refused the re-read request: "
                                     f"{type(e).__name__}"})
+        prog["done"] += n
+        prog["where"] = f"{arr_name} — re-reading"
 
     # THE FAILURES ARE THE POINT, not the successes. Whatever was corrected is
     # gone from the next scan and needs no memory; what could not be corrected
@@ -267,6 +367,8 @@ async def fix(kinds: list | None = None) -> dict:
     _CACHE["failures"] = failures[:200]
     _CACHE["fixed_at"] = time.time()
     _CACHE["last_fix"] = dict(out)
+    if _CACHE.get("fixing"):
+        _CACHE["fixing"]["running"] = False
     if out["fixed"] or out["refreshed"]:
         joblog.log(f"arr sync: corrected {out['fixed']} language record(s) and "
                    f"asked the arrs to re-read {out['refreshed']} file(s)",
@@ -370,14 +472,20 @@ def cached() -> dict:
             "every_h": int(getattr(SETTINGS, "arrsync_every_h", 12) or 12),
             "failures": _CACHE.get("failures") or [],
             "last_fix": _CACHE.get("last_fix"),
+            "fixing": _CACHE.get("fixing"),
             "progress": {"done": done, "total": total,
                          "where": _CACHE.get("where", ""),
                          # Total grows as each arr is reached, so a fraction
                          # would jump backwards. Reported only once both arrs
                          # have been counted, and as a plain count until then.
                          "frac": (done / total) if total else 0.0},
-            **(d or {"checked": 0, "counts": {}, "rows": {}, "list": [],
-                     "total": 0})}
+            # THE CAP LIVES HERE, on the way to the browser, not on the answer
+            # itself. The panel reads 'list'; sending 1,136 full rows a second
+            # time under 'rows' is a payload nobody asked for.
+            **({**d, "rows": {k: v[:200]
+                              for k, v in (d.get("rows") or {}).items()}}
+               if d else {"checked": 0, "counts": {}, "rows": {}, "list": [],
+                          "total": 0})}
 
 
 async def refresh() -> dict:

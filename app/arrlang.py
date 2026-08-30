@@ -216,11 +216,18 @@ async def fix_one(cfg, arr_file_id: int, file_id: int) -> bool:
     return True
 
 
-async def fix(rows: list) -> dict:
+async def fix(rows: list, on_chunk=None) -> dict:
     r"""Set each record's languages to what the file actually contains.
 
     Batched through the arr's bulk editor, which is the only route that
     applies a language change - the per-file PUT accepts it and does nothing.
+
+    on_chunk(file_ids, ok) is called after each batch is ACCEPTED OR REFUSED,
+    so a caller can report progress and retire the corrected rows while the
+    run is still going. Reported per batch rather than per file because the
+    batch is the unit the arr actually confirms - claiming a file was
+    corrected before the call that corrects it has returned would be a
+    progress bar that lies.
     """
     from .arr import shared_client
     done, failed = 0, 0
@@ -250,16 +257,27 @@ async def fix(rows: list) -> dict:
                     langs.append({"id": ent["id"], "name": ent["name"]})
             if not langs:
                 failed += len(ids)
+                if on_chunk:
+                    on_chunk(ids, False)
                 continue
             for i in range(0, len(ids), 100):
                 chunk = ids[i:i + 100]
+                ok = True
                 try:
                     await client._put(path, {idkey: chunk, "languages": langs})
                     done += len(chunk)
                 except Exception as e:                       # noqa: BLE001
+                    ok = False
                     failed += len(chunk)
                     joblog.log(f"language fix on {arr_name}: "
                                f"{type(e).__name__}: {str(e)[:120]}", "warn")
+                if on_chunk:
+                    # Never let a reporting callback take down a correction
+                    # that has already been applied.
+                    try:
+                        on_chunk(chunk, ok)
+                    except Exception:                        # noqa: BLE001
+                        pass
     if done or failed:
         joblog.log(f"corrected the language on {done} arr record(s) to match "
                    f"the file" + (f", {failed} failed" if failed else ""),
