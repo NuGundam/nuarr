@@ -10386,9 +10386,17 @@ function renderDisks(){
   // Remote disks REPLACE the single share row rather than joining it: the
   // share and the spindles behind it are the same storage counted twice, and
   // showing both would double the pool totals at the foot of the table.
+  //
+  // NAMED APART FROM lastDisks ON PURPOSE. Declaring `const lastDisks` here
+  // shadowed the module-level `let lastDisks` for the whole function, and the
+  // fallback read window.lastDisks - which does not exist, because a `let` at
+  // top level is not a property of window. So every LOCAL pool fell through to
+  // an empty array and the panel emptied itself: twelve disks became one POOL
+  // row of zeroes. Shadowing a name and then reaching for the shadowed value
+  // through a different route is the whole bug in one line.
   const _remote=hostIoRows();
-  const lastDisks=_remote || window.lastDisks || [];
-  const rows=lastDisks.slice().sort((a,b)=>{
+  const _srcDisks=_remote || lastDisks || [];
+  const rows=_srcDisks.slice().sort((a,b)=>{
     let x=a[key], y=b[key];
     if(key==='pool_disk'){
       // natural order so NU-DRIVE-2 sorts before NU-DRIVE-10
