@@ -18869,7 +18869,7 @@ async function loadOcr(){
     </div>`;
   }
 
-  el.innerHTML=head+`
+  el.innerHTML=head+ocrCompareHtml(s,p)+`
     <div class="lkind" style="margin-top:10px">
       <div class="lkindhead"><b style="color:#6fb0ff">What is installed</b></div>
       <table style="width:100%;font-size:12px;border-collapse:collapse">
@@ -19101,6 +19101,86 @@ async function shapeLoad(){
   }
   if(_shapeTimer) clearTimeout(_shapeTimer);
   _shapeTimer=setTimeout(shapeLoad, busy?1500:15000);
+}
+
+// ---- what each engine can actually do, on THIS install ------------------
+// EVERY ROW IS READ FROM THE LIVE STATE, not written down here. "PaddleOCR
+// uses the GPU" is false on a CPU build, and "Tesseract is slower" is a claim
+// about a machine rather than a fact - so the speed row shows what was
+// measured on this box, or says plainly that nothing has been measured yet
+// rather than quoting a number from somewhere else.
+//
+// Scoped to what this system does with subtitles. Whether an engine is better
+// at scanned invoices is true and irrelevant on this page.
+function ocrCompareHtml(s,p){
+  const tOK=!!s.tesseract_version, pOK=!!p.installed;
+  const yes=t=>`<span style="color:var(--ok)" title="${esc(t||'')}">yes</span>`;
+  const no =t=>`<span class="dim" title="${esc(t||'')}">no</span>`;
+  const na =t=>`<span class="dim" title="${esc(t||'')}">—</span>`;
+  const ms=k=>{const m=_ocrMeas[k]; return m&&m.per_cue_ms?m.per_cue_ms:0;};
+  const speed=k=>{
+    const v=ms(k);
+    if(!v) return `<span class="dim">not measured yet</span>`;
+    return `${(v/1000).toFixed(1)}s <span class="dim">a cue</span>`;
+  };
+  // Paddle is measured per device, so prefer the one it would actually use.
+  const padKey = p.cuda ? 'paddle:gpu' : 'paddle:cpu';
+  const rows=[
+    ['Reads picture subtitles into text',
+     tOK?yes():na('not installed'), pOK?yes():na('not installed')],
+    ['Spots typeset signs and burns them in instead',
+     yes('the check reads the PGS bitmaps before either engine runs, so it '
+        +'behaves the same whichever you pick'),
+     yes('same check, same result - it happens before the engine is chosen')],
+    ['Keeps each subtitle where it sat on screen',
+     no('pgsrip returns lines with no coordinates, so OCR\'d text lands at '
+       +'the bottom'),
+     pOK?yes('per-cue boxes become {\\an8} tags, so signs at the top stay at '
+            +'the top'):na('not installed')],
+    ['Reads italics correctly',
+     no('italics come back garbled or dropped'),
+     pOK?yes():na('not installed')],
+    ['Uses the graphics card',
+     no('CPU only, always'),
+     pOK?(p.cuda?yes(esc(p.gpu_name||''))
+                :no('the installed build is CPU-only'))
+        :na('not installed')],
+    ['Ready without installing anything',
+     yes('bundled with nuarr'),
+     pOK?yes('already installed'):no('needs a download first')],
+    ['Speed on this machine', speed('tesseract'), speed(padKey)],
+  ];
+  const cell=v=>`<td style="padding:4px 10px 4px 0;white-space:nowrap">${v}</td>`;
+  const body=rows.map(r=>`<tr style="border-top:1px solid var(--line)">
+      <td style="padding:4px 12px 4px 0">${r[0]}</td>
+      ${cell(r[1])}${cell(r[2])}</tr>`).join('');
+  const ver=(label,v,on)=>`<b${on?' style="color:#6fb0ff"':''}>${label}</b>
+      <span class="dim">${v?esc(v):'not installed'}</span>`;
+  return `
+    <div class="lkind" style="padding:11px 12px;margin-top:10px">
+      <b style="color:#6fb0ff">What each engine can do here</b>
+      <div class="dim" style="font-size:11px;margin-top:2px">
+        For picture subtitles specifically, on the versions installed right
+        now. Hover a cell for the reason.</div>
+      <table style="width:100%;font-size:11.5px;border-collapse:collapse;
+                    margin-top:7px;table-layout:fixed">
+        <colgroup><col style="width:52%"><col style="width:24%"><col style="width:24%"></colgroup>
+        <thead><tr>
+          <th style="text-align:left;padding:0 12px 5px 0"></th>
+          <th style="text-align:left;padding:0 10px 5px 0">
+            ${ver('Tesseract ', s.tesseract_version, _ocrEng==='tesseract')}</th>
+          <th style="text-align:left;padding:0 10px 5px 0">
+            ${ver('PaddleOCR ', p.paddleocr, _ocrEng==='paddle')}</th>
+        </tr></thead>
+        <tbody>${body}</tbody>
+      </table>
+      <div class="dim" style="font-size:11px;margin-top:7px">
+        The signs-or-dialogue check is the same either way — it measures the
+        pictures before any OCR starts, so switching engines never changes
+        which tracks get burned in.
+        ${(!ms('tesseract')||!ms(padKey))
+          ? ' Run the tests below to fill in the speeds.' : ''}</div>
+    </div>`;
 }
 
 // THE TABLE IS WHATEVER WAS LAST MEASURED HERE, not a constant. It shipped
