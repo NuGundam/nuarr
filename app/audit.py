@@ -648,13 +648,28 @@ async def heal(viol: list[dict]) -> dict:
             attempts += 1
             queued += 1
         except jobs.NothingToDo:
-            # Still broken on disk (checked above) and the planner has no work
-            # for it. That is the real gap, and now it can only mean that.
-            new_state = "unfixable"
-            detail = (f"still breaking {', '.join(broken or [rule])} when "
-                      f"re-read from disk, and the planner has no work for "
-                      f"it - the check is right and the rules have a gap")
-            unfixable += 1
+            # THE ONE GAP THE PLANNER CANNOT CLOSE BY DESIGN. container/name
+            # means Matroska content wearing another extension - nuarr's own
+            # commit writes over the original path and so keeps its name. The
+            # streams are already right, so decide() has nothing to do, and the
+            # finding sat as "no rule fixes this" forever. The remedy is a
+            # rename, which is not stream work and never will be.
+            done, why = await _fix_container_name(v, rule, broken)
+            if done:
+                new_state, detail = "fixed", why
+                fixed += 1
+            elif why:
+                # A collision, and worth naming: telling someone "no rule fixes
+                # this" when the actual situation is two copies of one episode
+                # sends them looking at the rules instead of at their disk.
+                new_state, detail = "unfixable", why
+                unfixable += 1
+            else:
+                new_state = "unfixable"
+                detail = (f"still breaking {', '.join(broken or [rule])} when "
+                          f"re-read from disk, and the planner has no work for "
+                          f"it - the check is right and the rules have a gap")
+                unfixable += 1
         except ValueError:
             # already queued or running - the fix is already on its way
             new_state, detail = "queued", "a job for this file is already queued"
@@ -697,6 +712,80 @@ async def heal(viol: list[dict]) -> dict:
 # nothing at all in the common case, so the 30 s cadence costs a single cheap
 # SELECT; the ffprobes only happen in the moments after a healed job lands.
 REVERIFY_S = 30
+
+
+async def _fix_container_name(v: dict, rule: str, broken) -> tuple:
+    r"""Rename Matroska content to .mkv. -> (fixed, why).
+
+    ONLY WHEN THE NAME IS FREE. The obvious case is a lone file that nuarr
+    remuxed in place: the content became Matroska, the path did not change, and
+    so the extension stayed whatever it was. Renaming it is the whole fix, and
+    the arr is told so its record follows.
+
+    The interesting case is when `foo.mkv` already exists beside `foo.mp4`.
+    That is not a naming problem at all - it is two copies of one episode, and
+    which to keep is a judgement about 6 GB of disk that nothing here should
+    make on its own. So it is reported AS that, rather than as "no rule fixes
+    this", which is true and sends the reader to look at the rules when the
+    answer is on their disk.
+
+    Returns ("", "") when this is not a container/name finding at all, so the
+    caller falls through to the general message.
+    """
+    if rule != "container/name" and "container/name" not in (broken or ()):
+        return False, ""
+    src = v.get("path") or ""
+    if not src or not os.path.exists(src):
+        return False, ""
+    stem, ext = os.path.splitext(src)
+    if ext.lower() == ".mkv":
+        return False, ""
+    dst = stem + ".mkv"
+    if os.path.exists(dst):
+        try:
+            a, b = os.path.getsize(src), os.path.getsize(dst)
+        except OSError:
+            a = b = 0
+        near = a and b and abs(a - b) < max(a, b) * 0.01
+        return False, (
+            f"a file with the correct name already sits beside this one"
+            f"{' and is within 1% of the same size' if near else ''} - "
+            f"{os.path.basename(dst)}. This is two copies of one episode "
+            f"rather than a naming mistake, so nothing renames it: keeping "
+            f"one and removing the other is a decision about "
+            f"{max(a, b) / 1e9:.1f} GB")
+    try:
+        from . import fileops
+        r = fileops.safe_rename(src, dst)
+        if not getattr(r, "ok", False):
+            # OpResult carries `detail`, not `error` - reading the wrong field
+            # would have reported every failure as the literal word "None".
+            return False, (f"could not rename to .mkv: "
+                           f"{getattr(r, 'detail', '') or 'rename failed'}"[:180])
+    except Exception as e:                                   # noqa: BLE001
+        return False, f"could not rename to .mkv: {type(e).__name__}: {e}"[:180]
+    fid = v.get("file_id")
+    try:
+        with cursor() as cur:
+            cur.execute("UPDATE files SET path=?, updated_at=? WHERE id=?",
+                        (dst, time.time(), fid))
+    except Exception:                                        # noqa: BLE001
+        pass
+    # The arr still believes the old name. Its own rename pass is what puts
+    # that right, and it is already the thing that owns naming.
+    try:
+        from . import renamequeue
+        with cursor() as cur:
+            row = cur.execute("SELECT arr_name, arr_parent_id FROM files "
+                              "WHERE id=?", (fid,)).fetchone()
+        if row and row["arr_name"]:
+            renamequeue.enqueue(fid, row["arr_name"], row["arr_parent_id"],
+                                dst, why="renamed to .mkv to match its content")
+    except Exception:                                        # noqa: BLE001
+        pass
+    joblog.log(f"renamed to match its content: {os.path.basename(dst)} "
+               f"(was {ext})", "ok")
+    return True, "renamed to .mkv - the content was already Matroska"
 
 
 def retire_gone() -> int:
