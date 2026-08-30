@@ -671,6 +671,66 @@ def forget_shapes(file_id: int) -> None:
         pass
 
 
+def _extract_sup_watched(path: str, rel: int, work: str, tag: str,
+                         duration: float, on_frac=None) -> str:
+    r"""extract_sup(), but reporting how far through the container it is.
+
+    REAL PROGRESS, NOT A GUESS. ffmpeg's -progress stream emits out_time_ms,
+    which for a stream copy is the position in the INPUT timeline it has
+    demuxed to - so against the file's duration it is genuinely "how much of
+    this file have we read". That matters here because the read is the whole
+    cost (ten to twenty seconds on a cold 2 GB episode) and a spinner alone
+    cannot tell a slow disk from a stuck one.
+
+    Falls back to the plain extract when the duration is unknown, rather than
+    inventing a denominator.
+    """
+    sup = os.path.join(work, f"{tag}.en.sup")
+    args = [_ffmpeg(), "-y", "-v", "error", "-nostats",
+            "-progress", "pipe:1", "-i", path,
+            "-map", f"0:s:{rel}", "-c:s", "copy", sup]
+    p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         text=True, errors="replace",
+                         creationflags=NO_WINDOW, startupinfo=_hidden(),
+                         env=_env())
+    hook = getattr(_TLS, "on_child", None)
+    if hook:
+        try:
+            hook(p)
+        except Exception:                                    # noqa: BLE001
+            pass
+    try:
+        for line in p.stdout or []:
+            if not line.startswith("out_time_ms=") or not on_frac:
+                continue
+            try:
+                us = int(line.split("=", 1)[1].strip())
+            except ValueError:
+                continue                      # ffmpeg emits N/A before it starts
+            if duration > 0:
+                on_frac(max(0.0, min(1.0, (us / 1e6) / duration)))
+        p.wait(timeout=3600)
+    except Exception:                                        # noqa: BLE001
+        try:
+            p.kill()
+        except Exception:                                    # noqa: BLE001
+            pass
+    finally:
+        if hook:
+            try:
+                hook(None)
+            except Exception:                                # noqa: BLE001
+                pass
+        try:
+            if p.stderr:
+                p.stderr.read()
+        except Exception:                                    # noqa: BLE001
+            pass
+    if not os.path.exists(sup) or os.path.getsize(sup) < 1024:
+        raise RuntimeError("sup extraction produced nothing")
+    return sup
+
+
 def measure_file(file_id: int, path: str, probe: dict,
                  work_root: str | None = None) -> int:
     r"""Measure every image sub in one file and write the verdicts down.
@@ -696,7 +756,17 @@ def measure_file(file_id: int, path: str, probe: dict,
             if work is None:
                 work = tempfile.mkdtemp(prefix="shape_", dir=work_root or None)
             try:
-                sup = extract_sup(path, rel, work, f"m{file_id}_{rel}")
+                dur = 0.0
+                try:
+                    dur = float((probe.get("format") or {}).get("duration") or 0)
+                except (TypeError, ValueError):
+                    dur = 0.0
+                _SCREEN["track"] = rel
+                _SCREEN["frac"] = 0.0
+                sup = _extract_sup_watched(
+                    path, rel, work, f"m{file_id}_{rel}", dur,
+                    lambda f: _SCREEN.__setitem__("frac", f))
+                _SCREEN["frac"] = 1.0
             except Exception:                                # noqa: BLE001
                 continue           # not demuxable - no verdict, no complaint
             try:
@@ -2421,7 +2491,8 @@ def sweep_pick(limit: int) -> list[dict]:
     picked: list[dict] = []
     with cursor() as cur:
         rows = cur.execute(
-            "SELECT p.file_id, p.json, f.path, f.title, f.library "
+            "SELECT p.file_id, p.json, f.path, f.title, f.library, "
+            "       f.season, f.episode "
             "FROM file_probes p JOIN files f ON f.id=p.file_id "
             "WHERE f.state NOT IN ('deleted','duplicate') "
             "AND f.arr_file_id IS NOT NULL "
@@ -2438,14 +2509,28 @@ def sweep_pick(limit: int) -> list[dict]:
             except Exception:                            # noqa: BLE001
                 continue
             if select_targets(d, r["library"]):
+                ep = ep_label(r["season"], r["episode"])
                 picked.append({"file_id": r["file_id"], "path": r["path"],
-                               "title": r["title"] or "",
+                               "title": r["title"] or "", "ep": ep,
                                "library": r["library"], "probe": d})
     return picked
 
 
 _SCREEN = {"now": "", "file_id": 0, "started": 0.0, "seen": 0, "typeset": 0,
-           "measured": 0, "last": 0.0}
+           "measured": 0, "last": 0.0, "frac": 0.0, "track": 0, "size": 0}
+
+
+def ep_label(season, episode) -> str:
+    """'S01E02' from the two columns, or '' when this is not an episode.
+
+    Movies have neither, and a bare 'S00E00' on a film is worse than nothing.
+    """
+    try:
+        if season is None or episode in (None, ""):
+            return ""
+        return f"S{int(season):02d}E{int(str(episode).split('-')[0]):02d}"
+    except (TypeError, ValueError):
+        return ""
 
 
 def screen_state() -> dict:
@@ -2477,11 +2562,13 @@ def shape_rows(limit: int = 60) -> dict:
             ).fetchone()["n"]
             for r in cur.execute(
                     "SELECT s.file_id, s.rel, s.typeset, s.median_h, "
-                    "       s.tall_share, s.at, f.title, f.library "
+                    "       s.tall_share, s.at, f.title, f.library, "
+                    "       f.season, f.episode "
                     "FROM sub_shape s LEFT JOIN files f ON f.id = s.file_id "
                     "ORDER BY s.at DESC LIMIT ?", (int(limit),)):
                 d = dict(r)
                 d["typeset"] = bool(d["typeset"])
+                d["ep"] = ep_label(d.pop("season", None), d.pop("episode", None))
                 rows.append(d)
     except Exception:                                        # noqa: BLE001
         pass
@@ -2512,17 +2599,27 @@ def screen_for_typeset(pick: dict) -> dict:
     fid, probe = pick.get("file_id"), pick.get("probe") or {}
     from . import joblog as _jl
     title = pick.get("title") or f"file {fid}"
+    if pick.get("ep"):
+        # WITHOUT THE EPISODE these lines are twelve identical "Fairy Tail"s
+        # and there is no way to tell which one a verdict belongs to.
+        title = f"{title} - {pick['ep']}"
     try:
         # has_shapes(), not typeset_rels(): an all-dialogue file has rows but
         # no typeset ones, and asking the wrong question re-reads it forever.
         if not has_shapes(fid):
-            _SCREEN.update(now=title, file_id=fid, started=time.time())
+            try:
+                sz = os.path.getsize(pick["path"])
+            except OSError:
+                sz = 0
+            _SCREEN.update(now=title, file_id=fid, started=time.time(),
+                           frac=0.0, track=0, size=sz)
             t0 = time.time()
             try:
                 out["measured"] = measure_file(fid, pick["path"], probe,
                                                SETTINGS.cache_dir)
             finally:
-                _SCREEN.update(now="", file_id=0, last=time.time())
+                _SCREEN.update(now="", file_id=0, last=time.time(),
+                               frac=0.0, size=0)
             el = time.time() - t0
             _SCREEN["seen"] += 1
             _SCREEN["measured"] += out["measured"]

@@ -7541,6 +7541,9 @@ tr.logdrop td{padding:0 0 8px 0;background:#1c2129;border-bottom:1px solid var(-
    travels whenever a scan is running, so "waiting on something" and
    "frozen" stop looking identical. */
 @keyframes scanflow{from{background-position:0 0}to{background-position:34px 0}}
+/* The measurement bar before ffmpeg's first reading lands: motion that says
+   "working" without implying a fraction we do not have yet. */
+@keyframes shapeCrawl{from{background-position:0 0}to{background-position:20px 0}}
 .scanbar-live{background-image:linear-gradient(115deg,
    rgba(255,255,255,.16) 25%, transparent 25%, transparent 50%,
    rgba(255,255,255,.16) 50%, rgba(255,255,255,.16) 75%,
@@ -18978,36 +18981,40 @@ function shapeRender(){
   const rows=_shapeRows.slice().sort(shapeCmp);
   const arrow=k=>_shapeSort.key===k?(_shapeSort.dir>0?' ▲':' ▼'):'';
   const th=(k,label,extra)=>`<th onclick="shapeSortBy('${k}')"
-      style="text-align:left;font-weight:600;cursor:pointer;user-select:none;
-             padding:3px 8px 5px 0;position:sticky;top:0;background:var(--bg2,#12161c);
-             ${extra||''}" title="sort by ${label.toLowerCase()}"
+      style="font-weight:600;cursor:pointer;user-select:none;
+             padding:3px 10px 5px 0;position:sticky;top:0;background:var(--bg2,#12161c);
+             text-align:left;${extra||''}" title="sort by ${label.toLowerCase()}"
       >${label}<span class="dim">${arrow(k)}</span></th>`;
   const tr=rows.map(r=>{
     const ts=r.typeset;
     return `<tr>
-      <td style="padding:2px 8px 2px 0;overflow:hidden;text-overflow:ellipsis;
-                 white-space:nowrap;max-width:0">${esc(r.title||('file '+r.file_id))}</td>
-      <td class="dim" style="padding:2px 8px 2px 0;white-space:nowrap">${r.rel}</td>
-      <td style="padding:2px 8px 2px 0;white-space:nowrap;color:${ts?'#e2b341':'#6fd08c'}">
+      <td style="padding:2px 10px 2px 0;overflow:hidden;text-overflow:ellipsis;
+                 white-space:nowrap">${esc(r.title||('file '+r.file_id))}</td>
+      <td class="dim" style="padding:2px 10px 2px 0;white-space:nowrap">${esc(r.ep||'—')}</td>
+      <td class="dim" style="padding:2px 10px 2px 0;white-space:nowrap">${r.rel}</td>
+      <td style="padding:2px 10px 2px 0;white-space:nowrap;color:${ts?'#e2b341':'#6fd08c'}">
         ${ts?'typeset signs':'dialogue'}</td>
-      <td class="dim" style="padding:2px 8px 2px 0;white-space:nowrap;text-align:right">
+      <td class="dim" style="padding:2px 10px 2px 0;white-space:nowrap">
         ${Math.round((r.tall_share||0)*100)}%</td>
-      <td class="dim" style="padding:2px 8px 2px 0;white-space:nowrap;text-align:right">
+      <td class="dim" style="padding:2px 10px 2px 0;white-space:nowrap">
         ${Math.round((r.median_h||0)*100)}%</td>
       <td class="dim" style="padding:2px 0;white-space:nowrap">${ago(r.at)}</td>
     </tr>`;}).join('');
-  // width:auto on the columns that hold a number or a word, so the title takes
-  // the slack instead of every column stretching to fill the panel.
+  // PERCENTAGE WIDTHS, NOT PIXELS. Fixed pixel columns left every short field
+  // bunched against the right edge of a wide panel with a runway of empty
+  // space before them; percentages share the width out instead, and the title
+  // still gets the largest share because it is the only variable-length one.
   el.innerHTML=`
     <div id="shapeScroll" style="max-height:260px;overflow:auto;margin-top:4px"
          onmouseenter="_shapeHover=true" onmouseleave="_shapeHover=false">
       <table style="width:100%;font-size:11.5px;border-collapse:collapse;table-layout:fixed">
-        <colgroup><col><col style="width:52px"><col style="width:104px">
-          <col style="width:62px"><col style="width:74px"><col style="width:78px"></colgroup>
+        <colgroup><col style="width:34%"><col style="width:10%"><col style="width:8%">
+          <col style="width:16%"><col style="width:9%"><col style="width:11%">
+          <col style="width:12%"></colgroup>
         <thead><tr>
-          ${th('title','Title')}${th('rel','Track')}${th('verdict','Verdict')}
-          ${th('tall_share','Tall','text-align:right')}
-          ${th('median_h','Median','text-align:right')}${th('at','When')}
+          ${th('title','Title')}${th('ep','Episode')}${th('rel','Track')}
+          ${th('verdict','Verdict')}${th('tall_share','Tall')}
+          ${th('median_h','Median')}${th('at','When')}
         </tr></thead>
         <tbody>${tr}</tbody>
       </table>
@@ -19023,11 +19030,32 @@ async function shapeLoad(){
   catch(e){ el.innerHTML='<span class="dim" style="font-size:11.5px">could not load</span>'; return; }
   const s=d.summary||{}, live=d.live||{}, rows=d.rows||[];
   const busy=!!live.now, held=shapePaused();
+  // THE BAR IS REAL, NOT A SPINNER PRETENDING. ffmpeg reports how far into the
+  // file it has demuxed, so this is the fraction actually read - which is the
+  // whole cost of the check. A striped indeterminate bar stands in only for the
+  // moment before the first reading arrives, rather than faking a number.
+  const pct=Math.round((live.frac||0)*100);
+  const gb=live.size?(live.size/1e9).toFixed(1)+' GB':'';
   const head = busy
-    ? `<div style="display:flex;gap:8px;align-items:center;font-size:11.5px">
-         <span class="spin" style="width:11px;height:11px"></span>
-         <span>reading <b>${esc(live.now)}</b>
-           <span class="dim">— ${(live.busy_s||0).toFixed(0)}s</span></span>
+    ? `<div style="font-size:11.5px">
+         <div style="display:flex;gap:8px;align-items:center">
+           <span class="spin" style="width:11px;height:11px"></span>
+           <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+             reading <b>${esc(live.now)}</b>
+             <span class="dim">track ${live.track||0}${gb?' · '+gb:''}
+               · ${(live.busy_s||0).toFixed(0)}s</span></span>
+           <span class="dim" style="margin-left:auto;white-space:nowrap">
+             ${live.frac?pct+'%':''}</span>
+         </div>
+         <div style="height:5px;border-radius:3px;background:#1e242c;margin-top:5px;
+                     overflow:hidden">
+           <div style="height:100%;border-radius:3px;
+                       ${live.frac
+                         ? `width:${pct}%;background:#6fb0ff;transition:width .4s linear`
+                         : `width:100%;background:repeating-linear-gradient(90deg,
+                              #6fb0ff33 0 10px,#6fb0ff11 10px 20px);
+                            animation:shapeCrawl 1s linear infinite`}"></div>
+         </div>
        </div>`
     : `<div class="dim" style="font-size:11.5px">not reading anything right now</div>`;
   const counts = `
