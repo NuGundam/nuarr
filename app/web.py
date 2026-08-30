@@ -17571,6 +17571,93 @@ function commitNum(key, el){
   el.value=v;
   bump(key,v);
 }
+// ---- settings panes: one table, one guarded loader -----------------------
+// HOISTED OUT OF wtab() so the loader guard below can use the same table the
+// switcher uses. Two copies of this map would be two things to keep in step,
+// and the bug this was written after was precisely a map that disagreed with
+// itself.
+const PANE_OF = {ffmpeg:'ffPane', backup:'bkPane',  rules:'rulesPane',
+                 mkv:'mkvPane',   arrs:'arrsPane',  meta:'metaPane',
+                 gate:'gatePane', logs:'logsPane', jobs:'jobsPane',
+                 lang:'langPane', libs:'libPane',
+                 vcodec:'vcodecPane', acodec:'acodecPane',
+                 alang:'alangPane', cache:'cachePane',
+                 whisper:'whisperPane', plex:'plexPane',
+                 ocr:'ocrPane', plexwork:'plexworkPane', ruleschk:'ruleschkPane',
+                 process:'processPane', notland:'notlandPane',
+                 updates:'updPane'};
+// DEEP LINKS ARE ALIASES, NOT PANES. Adding 'arrsync' to the table above as a
+// second key for 'arrsPane' blanked the Arrs page: the switcher assigned
+// display per KEY, so the second key's 'none' landed after the first key's ''
+// and hid the pane it had just shown. Nothing threw and nothing logged - you
+// clicked Arrs and got an empty page. An alias names a pane plus an intent;
+// it never claims an element of its own.
+const ALIAS_OF = {arrsync:'arrs'};
+
+// A BLANK PANE IS THE WORST FAILURE MODE THERE IS, because it looks like an
+// empty page rather than a broken one - there is nothing to read, nothing to
+// retry, and no reason to suspect the software rather than your own data. Every
+// pane loader goes through here so that cannot happen quietly:
+//
+//   - a loader that THROWS says so in the pane, with the error and a Retry,
+//     instead of leaving whatever was there before;
+//   - a loader that REJECTS is caught too - most of these are async, and an
+//     unhandled rejection is invisible outside the console;
+//   - a pane that simply comes up EMPTY, with no error at all, is called out
+//     after a moment. That is the case that has actually bitten twice now, and
+//     it is the one no try/catch can see.
+//
+// It never replaces the pane's own markup - the notice is prepended - so a
+// partial load still shows whatever did arrive.
+function paneNotice(paneId, html){
+  const p = document.getElementById(paneId);
+  if(!p) return;
+  let n = document.getElementById('note-'+paneId);
+  if(!n){
+    n = document.createElement('div');
+    n.id = 'note-'+paneId;
+    p.insertBefore(n, p.firstChild);
+  }
+  n.innerHTML = html;
+}
+function paneNoticeClear(paneId){
+  const n = document.getElementById('note-'+paneId);
+  if(n) n.remove();
+}
+async function paneLoad(key, fn, ...args){
+  const paneId = PANE_OF[key];
+  if(!paneId || typeof fn !== 'function'){ try{ fn && fn(...args); }catch(_){}; return; }
+  paneNoticeClear(paneId);
+  try{
+    await fn(...args);              // await covers async loaders too
+  }catch(e){
+    paneNotice(paneId, `<div class="err" style="margin:10px 14px;padding:8px 11px;
+      border:1px solid var(--warn);border-radius:6px;font-size:12px">
+      <b>This page did not load.</b>
+      <div class="dim" style="margin-top:3px">${esc(String(e && e.message || e))}</div>
+      <button onclick="wtab('${key}')" style="margin-top:6px;font-size:11px;
+        padding:2px 9px">Try again</button></div>`);
+    return;
+  }
+  // THE SILENT CASE. Nothing threw, and the pane is still blank - which is
+  // exactly what a display bug or a loader that returned early looks like.
+  setTimeout(()=>{
+    const p = document.getElementById(paneId);
+    if(!p || p.style.display === 'none') return;      // switched away since
+    const txt = (p.textContent || '').replace(/\s+/g,'').length;
+    if(txt > 2) return;                                // something rendered
+    paneNotice(paneId, `<div style="margin:10px 14px;padding:8px 11px;
+      border:1px solid var(--line);border-radius:6px;font-size:12px">
+      <b>This page came up empty.</b>
+      <div class="dim" style="margin-top:3px">No error was reported, so this is
+        either a page with genuinely nothing on it or a fault in nuarr. If
+        trying again does not help, the browser console will have the
+        detail.</div>
+      <button onclick="wtab('${key}')" style="margin-top:6px;font-size:11px;
+        padding:2px 9px">Try again</button></div>`);
+  }, 2500);
+}
+
 let _wtab='counts', _wdata=null;
 function wtab(which){
   _wtab=which;
@@ -17585,63 +17672,54 @@ function wtab(which){
   // pane touched the function in five places. Adding the seventh (gate) was
   // the point at which that stopped being a style preference: one table, one
   // loop, and a new pane is one line.
-  const PANE_OF = {ffmpeg:'ffPane', backup:'bkPane',  rules:'rulesPane',
-                   mkv:'mkvPane',   arrs:'arrsPane',  meta:'metaPane',
-                   gate:'gatePane', logs:'logsPane', jobs:'jobsPane',
-                   lang:'langPane', libs:'libPane',
-                   vcodec:'vcodecPane', acodec:'acodecPane',
-                   alang:'alangPane', cache:'cachePane',
-                   whisper:'whisperPane', plex:'plexPane',
-                   ocr:'ocrPane', plexwork:'plexworkPane', ruleschk:'ruleschkPane',
-                   process:'processPane', notland:'notlandPane',
-                   // The agreement check lives on the Arrs pane rather than
-                   // one of its own, but the Attention tile has to land ON it
-                   // and not merely near it - a tile that opens a long page
-                   // and leaves you hunting is barely better than no link.
-                   arrsync:'arrsPane',
-                   updates:'updPane'};
+  const intent = which;                     // what was asked for, for the tail
+  which = ALIAS_OF[which] || which;
   const isPane = Object.prototype.hasOwnProperty.call(PANE_OF, which);
   const set = document.getElementById('wSettings');
   if(set) set.style.display = isPane ? 'none' : '';
-  for(const k in PANE_OF){
-    const e = document.getElementById(PANE_OF[k]);
-    if(e) e.style.display = (k===which) ? '' : 'none';
+  // KEYED ON THE ELEMENT, not the map key. An element is shown if the name
+  // being asked for points at it, so two names for one pane can no longer
+  // fight over its display - which is the bug that blanked this page.
+  const wantEl = PANE_OF[which] || '';
+  for(const id of new Set(Object.values(PANE_OF))){
+    const e = document.getElementById(id);
+    if(e) e.style.display = (id===wantEl) ? '' : 'none';
   }
   const isFf = which==='ffmpeg', isBk = which==='backup', isRu = which==='rules';
   const isMk = which==='mkv', isAr = which==='arrs', isMe = which==='meta';
   const hint=document.getElementById('wtabhint');
   if(which==='gate'){
     if(hint) hint.textContent='· job gate';
-    loadGate();                        // repaints #gateCfg wherever it lives
+    paneLoad('gate', loadGate);        // repaints #gateCfg wherever it lives
     return;
   }
   if(which==='logs'){
     if(hint) hint.textContent='· logs';
-    loadLogJobs(); loadLogs(true);     // job filter first, then the lines
+    paneLoad('logs', async()=>{ await loadLogJobs(); await loadLogs(true); });
     return;
   }
   if(which==='jobs'){
     if(hint) hint.textContent='· jobs';
-    loadJobsTab();
+    paneLoad('jobs', loadJobsTab);
     return;
   }
   if(which==='lang'){
     if(hint) hint.textContent='· subtitles';
-    loadLangTab();
+    paneLoad('lang', loadLangTab);
     return;
   }
   if(which==='alang'){
     if(hint) hint.textContent='· audio language';
-    loadAlang();
+    paneLoad('alang', loadAlang);
     return;
   }
-  if(which==='arrsync'){
+  if(intent==='arrsync'){
     // Arrived from the Attention tile: same pane as 'arrs', but put the card
     // it was counting in front of you and open its list, because the tile's
     // number was "which files" and that is the answer.
     if(hint) hint.textContent='· arr agreement';
     _asOpen=true;               // set BEFORE the load, which paints when it lands
-    loadArrsTab();              // already pulls the agreement card
+    paneLoad('arrs', loadArrsTab);
     setTimeout(()=>{
       const c=document.getElementById('arrSyncBody');
       if(!c) return;
@@ -17655,12 +17733,12 @@ function wtab(which){
   }
   if(which==='cache'){
     if(hint) hint.textContent='· cache folder';
-    loadCacheCfg();
+    paneLoad('cache', loadCacheCfg);
     return;
   }
   if(which==='updates'){
     if(hint) hint.textContent='· updates';
-    loadUpdates(0);      // 0: use the cache. The Check now button forces it.
+    paneLoad('updates', loadUpdates, 0);  // 0: use the cache; Check now forces it
     return;
   }
   if(which==='plexwork'){
@@ -17673,7 +17751,7 @@ function wtab(which){
     if(host&&panel&&panel.firstElementChild){
       while(panel.firstChild) host.appendChild(panel.firstChild);
     }
-    loadPlayback();
+    paneLoad('plexwork', loadPlayback);
     return;
   }
   if(which==='ruleschk'){
@@ -17683,74 +17761,76 @@ function wtab(which){
     if(host&&panel&&panel.firstElementChild){
       while(panel.firstChild) host.appendChild(panel.firstChild);
     }
-    loadAudit();
+    paneLoad('ruleschk', loadAudit);
     return;
   }
   if(which==='ocr'){
     if(hint) hint.textContent='· ocr engines';
-    loadOcr();
+    paneLoad('ocr', loadOcr);
     return;
   }
   if(which==='process'){
     if(hint) hint.textContent='· how files flow';
-    loadProcess();
+    paneLoad('process', loadProcess);
     return;
   }
   if(which==='notland'){
     if(hint) hint.textContent='· still not landed';
-    loadNotLanded();
+    paneLoad('notland', loadNotLanded);
     return;
   }
   if(which==='whisper'){
     if(hint) hint.textContent='· whisper';
-    loadWhisper();
+    paneLoad('whisper', loadWhisper);
     return;
   }
   if(which==='plex'){
     if(hint) hint.textContent='· plex';
-    loadPlexCfg();
+    paneLoad('plex', loadPlexCfg);
     return;
   }
   if(which==='vcodec' || which==='acodec'){
     const side = which==='vcodec' ? 'video' : 'audio';
     if(hint) hint.textContent = '· '+(side==='video'?'video':'audio')+' codec';
-    loadCodecTab(side);
+    paneLoad(which, loadCodecTab, side);
     return;
   }
   if(which==='libs'){
     if(hint) hint.textContent='· libraries';
-    loadLibsTab();
+    paneLoad('libs', loadLibsTab);
     return;
   }
   if(isMe){
     if(hint) hint.textContent='· metadata';
-    loadMetaTab();
+    paneLoad('meta', loadMetaTab);
     return;
   }
   if(isAr){
     if(hint) hint.textContent='· arrs';
-    loadArrsTab();
+    paneLoad('arrs', loadArrsTab);
     return;
   }
   if(isMk){
     if(hint) hint.textContent='· MKVToolNix';
-    loadMkv(true);
+    paneLoad('mkv', loadMkv, true);
     return;
   }
   if(isFf){
     if(hint) hint.textContent='· ffmpeg';
-    ffCheck(); ffUsers();            // refresh on open, not on a timer
-    loadEnctest();                   // the encoder bench lives on this page
+    paneLoad('ffmpeg', async()=>{    // refresh on open, not on a timer
+      await ffCheck(); await ffUsers();
+      await loadEnctest();           // the encoder bench lives on this page
+    });
     return;
   }
   if(isBk){
     if(hint) hint.textContent='· backup';
-    loadBackup(true);
+    paneLoad('backup', loadBackup, true);
     return;
   }
   if(isRu){
     if(hint) hint.textContent='· rules';
-    loadRules();
+    paneLoad('rules', loadRules);
     return;
   }
   if(_wdata) paintWorkers();
