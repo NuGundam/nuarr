@@ -38,7 +38,14 @@ from .config import NO_WINDOW, SETTINGS
 # often than that. TTL is generous because spindle load is not a millisecond
 # quantity, and a stale-but-labelled number beats a blank column.
 TTL_S = 6.0
-TIMEOUT_S = 25.0
+# A DCOM handshake to a busy server is not always quick, and 25s was being hit:
+# the panel then replaced twelve live rows with "timed out", which is a worse
+# answer than slightly old numbers. Longer ceiling, and a failure now keeps the
+# last good sample rather than erasing it - see refresh().
+TIMEOUT_S = 45.0
+# How long a kept sample stays worth showing once it stops refreshing. Past
+# this it is history, not telemetry.
+STALE_S = 120.0
 
 _LOCK = threading.Lock()
 _CACHE: dict = {}          # server -> {"at": float, "disks": {...}, "why": str}
@@ -82,8 +89,17 @@ try {
   & $mk (New-CimSessionOption -Protocol Wsman) 'WinRM'
   if (-not $s) { & $mk (New-CimSessionOption -Protocol Dcom) 'DCOM' }
   if (-not $s) { throw "could not open a CIM session over WinRM or DCOM" }
+  # Capacity comes from the same call that gives the label, so the table can
+  # be the same table: size, used and free per spindle, not just "busy".
   $vols  = Get-CimInstance -CimSession $s -Namespace root/Microsoft/Windows/Storage `
              -ClassName MSFT_Volume | Where-Object { $_.FileSystemLabel }
+  $cap = @{}
+  foreach ($v in $vols) {
+    if ($v.Size) {
+      $cap[$v.FileSystemLabel] = @{ size = [double]$v.Size
+                                    free = [double]$v.SizeRemaining }
+    }
+  }
   $parts = Get-CimInstance -CimSession $s -Namespace root/Microsoft/Windows/Storage `
              -ClassName MSFT_Partition
   $map = @{}
@@ -100,11 +116,14 @@ try {
     $idx = ($d.Name -split '\s+')[0]
     $label = $map[$idx]
     if (-not $label) { continue }
+    $c = $cap[$label]
     $out[$label] = @{
       busy  = [math]::Round(100 - [double]$d.PercentIdleTime, 1)
       read  = [double]$d.DiskReadBytesPersec
       write = [double]$d.DiskWriteBytesPersec
       queue = [double]$d.CurrentDiskQueueLength
+      size  = if ($c) { $c.size } else { 0 }
+      free  = if ($c) { $c.free } else { 0 }
     }
   }
   Remove-CimSession $s
@@ -198,7 +217,9 @@ def _sample(server: str) -> dict:
             disks[label] = {"busy": float(v.get("busy") or 0),
                             "read_bps": float(v.get("read") or 0),
                             "write_bps": float(v.get("write") or 0),
-                            "queue": float(v.get("queue") or 0)}
+                            "queue": float(v.get("queue") or 0),
+                            "size": float(v.get("size") or 0),
+                            "free": float(v.get("free") or 0)}
         except Exception:                                    # noqa: BLE001
             continue
     return {"ok": True, "disks": disks, "via": str(d.get("via") or "")}
@@ -213,12 +234,27 @@ def refresh(server: str) -> None:
 
     def run():
         res = _sample(server)
+        now = time.time()
         with _LOCK:
-            _CACHE[server] = {"at": time.time(),
-                              "disks": res.get("disks") or {},
-                              "ok": bool(res.get("ok")),
-                              "via": res.get("via") or "",
-                              "why": res.get("why") or ""}
+            prev = _CACHE.get(server) or {}
+            if res.get("ok"):
+                _CACHE[server] = {"at": now, "good_at": now,
+                                  "disks": res.get("disks") or {},
+                                  "ok": True, "via": res.get("via") or "",
+                                  "why": ""}
+            else:
+                # KEEP THE LAST GOOD READING. One slow handshake used to wipe
+                # twelve live rows and leave "timed out" in their place, which
+                # says less than numbers a few seconds old would have. The row
+                # ages visibly and disappears on its own once it is history.
+                good_at = prev.get("good_at") or 0
+                keep = bool(prev.get("disks")) and (now - good_at) < STALE_S
+                _CACHE[server] = {
+                    "at": now, "good_at": good_at,
+                    "disks": prev.get("disks") if keep else {},
+                    "ok": bool(keep), "stale": bool(keep),
+                    "via": prev.get("via") or "",
+                    "why": res.get("why") or ""}
             _INFLIGHT.discard(server)
 
     threading.Thread(target=run, name=f"hostio-{server}", daemon=True).start()
@@ -257,7 +293,9 @@ def state() -> dict:
             "ok": bool(d.get("ok")),
             "via": d.get("via") or "",
             "why": d.get("why") or "",
-            "age_s": round(time.time() - d["at"], 1) if d.get("at") else None,
+            "stale": bool(d.get("stale")),
+            "age_s": (round(time.time() - d["good_at"], 1)
+                      if d.get("good_at") else None),
             "disks": d.get("disks") or {},
         })
     return out

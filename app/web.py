@@ -10318,48 +10318,58 @@ async function hostIoLoad(){
   if(_hostIoTimer) clearTimeout(_hostIoTimer);
   if(_hostIo && !_hostIo.local) _hostIoTimer=setTimeout(hostIoLoad, 5000);
 }
+// THE SAME TABLE, NOT A DIFFERENT ONE. A share collapses twelve spindles into
+// one row, and a strip of percentages above it is a second way of reading the
+// same panel. The host knows each disk's label, size, free space and load, so
+// the rows are built in the shape renderDisks() already draws and the layout
+// stops depending on where the media happens to live.
+//
+// The one column that cannot be filled is Files: DrivePool decides which
+// spindle a file lands on, and over a share nuarr never sees that placement.
+// It says so rather than guessing or leaving a suspicious blank.
+function hostIoRows(){
+  if(!_hostIo || _hostIo.local) return null;
+  const h=(_hostIo.hosts||[])[0];
+  if(!h || !h.ok) return null;
+  const ds=h.disks||{};
+  const rows=Object.keys(ds).filter(n=>/^NU-DRIVE/i.test(n)).map(n=>{
+    const d=ds[n], size=d.size||0, free=d.free||0;
+    return {pool_disk:n, n:null, remote:true,
+            total:size, used:Math.max(0,size-free), free:free,
+            pct_used: size ? (size-free)/size*100 : 0,
+            busy:d.busy||0, io_bps:(d.read_bps||0)+(d.write_bps||0),
+            read_bps:d.read_bps||0, write_bps:d.write_bps||0,
+            queue:d.queue||0};
+  });
+  return rows.length ? rows : null;
+}
 function hostIoHtml(){
   if(!_hostIo || _hostIo.local || !(_hostIo.hosts||[]).length) return '';
-  return _hostIo.hosts.map(h=>{
-    const ds=h.disks||{};
-    const names=Object.keys(ds).filter(n=>/^NU-DRIVE/i.test(n))
-      .sort((a,b)=>(parseInt(a.replace(/\D+/g,''),10)||0)
-                  -(parseInt(b.replace(/\D+/g,''),10)||0));
-    if(!h.ok){
-      return `<div class="xfer"><span class="xlbl">on ${esc(h.server)}</span>
-        <span class="dim" style="font-size:11px">${
-          h.have_creds ? esc(h.why||'could not read the host\'s disks')
-                       : 'no credentials stored for this host — add them under '
-                         +'Libraries to see its disks'}</span></div>`;
-    }
-    if(!names.length) return '';
-    const cell=n=>{
-      const d=ds[n], b=Math.round(d.busy);
-      const io=(d.read_bps||0)+(d.write_bps||0);
-      const col = b>=85?'var(--bad)':b>=40?'var(--warn)':'var(--ok)';
-      return `<span class="xpair" title="${esc(n)} on ${esc(h.server)} — ${b}% busy${
-        io?', '+mbps(io):''}${d.queue?', queue '+Math.round(d.queue):''}">
-        <span class="dim">${esc(n.replace(/^NU-DRIVE-?/i,''))}</span>
-        <b style="color:${col}">${b}%</b>${io?` <span class="dim">${mbps(io)}</span>`:''}
-      </span>`;
-    };
-    return `<div class="xfer">
-      <span class="xlbl" title="Read from ${esc(h.server)} over ${
-        esc(h.via||'CIM')} — the host's own disk counters, the same numbers it
-would show locally.${h.via==='DCOM'
-          ? ' WinRM refused, which is normal for a server that is not domain-joined; DCOM needs no TrustedHosts entry.'
-          : ''}">on ${esc(h.server)}${
-        h.via?` <span class="dim">${esc(h.via)}</span>`:''}</span>${
-        names.map(cell).join('')}
-      <span class="dim" style="font-size:10.5px;margin-left:6px"
-        title="From outside, a busy spindle is just busy: only the machine
-running the jobs knows which bytes are its own and which are a viewer.">busy
-        only — no viewer/nuarr split from here</span></div>`;
-  }).join('');
+  const h=_hostIo.hosts[0];
+  const note = (txt, col) => `<div class="xfer"><span class="xlbl">on ${
+    esc(h.server)}${h.via?` <span class="dim">${esc(h.via)}</span>`:''}</span>
+    <span style="font-size:11px;color:${col||'var(--dim)'}">${txt}</span></div>`;
+  if(!h.ok){
+    return note(h.have_creds
+      ? esc(h.why||"could not read the host's disks")
+      : 'no credentials stored for this host — add them under Libraries to see '
+        +'its disks', 'var(--warn)');
+  }
+  const stale = h.stale
+    ? ` <span style="color:var(--warn)">· last answer ${
+        h.age_s!=null?Math.round(h.age_s)+'s':''} ago, retrying</span>` : '';
+  return note(`disks read from the host — file counts are not visible over a `
+    + `share, and a busy spindle cannot be split into viewer, nuarr and `
+    + `system from outside${stale}`);
 }
 
 function renderDisks(){
   const key=diskSort;
+  // Remote disks REPLACE the single share row rather than joining it: the
+  // share and the spindles behind it are the same storage counted twice, and
+  // showing both would double the pool totals at the foot of the table.
+  const _remote=hostIoRows();
+  const lastDisks=_remote || window.lastDisks || [];
   const rows=lastDisks.slice().sort((a,b)=>{
     let x=a[key], y=b[key];
     if(key==='pool_disk'){
@@ -10448,6 +10458,19 @@ function renderDisks(){
   // idle, which is exactly when you most want to see it.
   const dl = {};
   ((_diskLoad.disks)||[]).forEach(x=>{ dl[x.disk]=x; });
+  // Remote spindles arrive in the same shape, so every chip below renders
+  // unchanged. mine_bps is ZERO ON PURPOSE and not a placeholder: nuarr knows
+  // which bytes are its own by having started them, and over a share it starts
+  // none on any particular spindle - DrivePool chooses. So all of it is
+  // "everything else", which is exactly what the bar will say.
+  if(_remote){
+    _remote.forEach(r=>{
+      dl[r.pool_disk] = {disk:r.pool_disk, busy:r.busy, mine_bps:0,
+                         ext_bps:r.io_bps, ext_read_bps:r.read_bps,
+                         ext_write_bps:r.write_bps, queue:r.queue,
+                         bps:r.io_bps, hot:r.busy>=85, remote:true};
+    });
+  }
 
   // COLUMNS THAT DROP IN A CHOSEN ORDER, rather than whichever one runs out of
   // room. Six columns plus a progress bar in a half-width panel does not fit
@@ -10738,7 +10761,9 @@ The bar splits it by share of bytes moved — nuarr ${share(mine)}%, everything 
       return `<tbody class="dgrp${hot?' dhot':''}${watched?' dwatch':''}${
                        moving?' dwork':''}" style="--dcol:${dc}">
         <tr><td class="mono" style="color:${dc}">${esc(d.pool_disk)}</td>
-        <td class="num">${fmt(d.n)}</td>
+        <td class="num">${d.n==null
+          ? `<span class="dim" title="DrivePool decides which spindle a file lands on, and over a share that placement is not visible — the host knows how full each disk is, not which of nuarr's files are on it.">—</span>`
+          : fmt(d.n)}</td>
         <td class="num dim dcol-size">${gb(d.total)}</td>
         <td class="num dim dcol-used">${gb(d.used!=null?d.used:d.bytes)}</td>
         <td class="dcol-bar"><div class="bar"><i style="width:${pct}%;background:${col}"></i></div>
