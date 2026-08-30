@@ -4198,6 +4198,99 @@ def api_pipeline(file_id: int = 0):
     return out
 
 
+@app.get("/api/notlanded")
+def api_not_landed():
+    """Files whose last attempt failed and nothing has put right since."""
+    from . import pipeline
+    rows = pipeline.not_landed()
+    by = {}
+    for r in rows:
+        by[r["cause"]] = by.get(r["cause"], 0) + 1
+    return {"rows": rows, "total": len(rows), "by_cause": by}
+
+
+@app.post("/api/notlanded/{file_id}/retry")
+async def api_not_landed_retry(file_id: int):
+    r"""Re-plan one stuck file and record what the answer is NOW.
+
+    THE INTERESTING CASE IS "NOTHING TO DO". Retrying a Big Hero 6 episode
+    blocked under an old path-length limit returns exactly that - the file is
+    already correct. The old code left it on the list anyway, because the list
+    keys on the most recent job and that was still the blocked tombstone: a
+    file provably fine, shown as stuck, with a retry button that appeared to do
+    nothing every time it was pressed.
+
+    So the re-check writes its verdict down. A skipped row records that we
+    looked and found nothing, which is true and is what makes the file leave
+    the list; the blocked state on the row goes with it, since it has just been
+    disproved.
+    """
+    rows = _rows("SELECT path,title,season,episode,state FROM files "
+                 "WHERE id=?", (file_id,))
+    if not rows:
+        raise HTTPException(404, "file not found")
+    label = display_label(rows[0]["title"], rows[0]["season"],
+                          rows[0]["episode"])
+    path = rows[0]["path"]
+    try:
+        j = await jobs.enqueue(file_id, path, label, source="manual")
+    except jobs.NothingToDo:
+        import uuid as _uuid
+        now = time.time()
+        with cursor() as cur:
+            cur.execute(
+                "INSERT INTO jobs(job_id,file_id,kind,state,priority,pool,"
+                "path,title,error,created_at,finished_at,source) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (_uuid.uuid4().hex[:12], file_id, "transcode", "skipped", 100,
+                 "none", path, label,
+                 "re-checked by hand - nothing to change", now, now, "manual"))
+            if (rows[0]["state"] or "") == "blocked":
+                cur.execute("UPDATE files SET state='done', state_reason=NULL "
+                            "WHERE id=?", (file_id,))
+        try:
+            from . import errorretry
+            errorretry.forget(file_id)
+        except Exception:                                # noqa: BLE001
+            pass
+        return {"ok": True, "queued": False, "cleared": True,
+                "reason": "already correct - nothing to change"}
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    await jobs.start()
+    return {"ok": True, "queued": True, "job_id": j.id, "label": label}
+
+
+@app.post("/api/notlanded/{file_id}/rescan")
+async def api_not_landed_rescan(file_id: int):
+    r"""Re-probe one file and forget its backoff. Touches nothing on disk.
+
+    NOT refetch, which blocklists the release and goes looking for another.
+    Most of these are stale rather than broken: the file was renamed, or the
+    thing holding it let go. Reading it again and clearing the retry clock is
+    the cheapest thing that can possibly help, and it cannot make anything
+    worse - which is what makes it safe to offer as a button.
+    """
+    rows = _rows("SELECT path FROM files WHERE id=?", (file_id,))
+    if not rows:
+        raise HTTPException(404, "file not found")
+    path = rows[0]["path"]
+    if not os.path.exists(path):
+        return {"ok": False, "why": "the file is not on disk at that path"}
+    data = await jobs.probe(path)
+    if not data:
+        return {"ok": False, "why": "ffprobe could not read it"}
+    jobs.cache_probe(file_id, data)
+    try:
+        from . import errorretry
+        errorretry.forget(file_id)
+    except Exception:                                    # noqa: BLE001
+        pass
+    return {"ok": True, "rescanned": True,
+            "path_len": len(path),
+            "streams": len(data.get("streams") or [])}
+
+
 @app.get("/api/pipeline/random")
 def api_pipeline_random():
     r"""One file for the auto tour, biased toward interesting journeys.
@@ -17226,7 +17319,7 @@ function wtab(which){
                    alang:'alangPane', cache:'cachePane',
                    whisper:'whisperPane', plex:'plexPane',
                    ocr:'ocrPane', plexwork:'plexworkPane', ruleschk:'ruleschkPane',
-                   process:'processPane',
+                   process:'processPane', notland:'notlandPane',
                    updates:'updPane'};
   const isPane = Object.prototype.hasOwnProperty.call(PANE_OF, which);
   const set = document.getElementById('wSettings');
@@ -17304,6 +17397,11 @@ function wtab(which){
   if(which==='process'){
     if(hint) hint.textContent='· how files flow';
     loadProcess();
+    return;
+  }
+  if(which==='notland'){
+    if(hint) hint.textContent='· still not landed';
+    loadNotLanded();
     return;
   }
   if(which==='whisper'){
@@ -19594,6 +19692,148 @@ function socRow(k,v,where,why){
         word-break:break-all">${where?esc(where)
           :'<span style="font-family:inherit">not found</span>'}</td>
     <td class="dim" style="font-size:11px;padding-right:12px;word-break:break-all">${why}</td></tr>`;
+}
+
+// ---- Still not landed ---------------------------------------------------
+// THE BUTTONS OFFERED DEPEND ON WHAT WENT WRONG. Retry is real for a lock or
+// a full disk and pointless for a path over the length limit or a corrupt
+// download - offering it everywhere would teach you to click it everywhere and
+// learn nothing. Where nuarr cannot fix a thing it says what a person has to
+// do instead, rather than showing a button that will fail politely.
+let _nl=null, _nlBusy={};
+async function loadNotLanded(){
+  const el=document.getElementById('notlandBody');
+  if(!el) return;
+  try{ _nl=await fetch('/api/notlanded').then(r=>r.json()); }
+  catch(e){ el.innerHTML='<div class="dim">could not load</div>'; return; }
+  nlPaint();
+}
+function nlPaint(){
+  const el=document.getElementById('notlandBody');
+  if(!el||!_nl) return;
+  const rows=_nl.rows||[];
+  if(!rows.length){
+    el.innerHTML=`<div class="lkind" style="padding:14px">
+      <b style="color:var(--ok)">Nothing is stuck.</b>
+      <div class="dim" style="font-size:11.5px;margin-top:3px">
+        Every file's most recent attempt either succeeded or is still to
+        come.</div></div>`;
+    return;
+  }
+  const CAUSE={
+    path_too_long:['Path too long','var(--warn)'],
+    locked:['Was in use','#b48bf2'],
+    bad_data:['Damaged source','var(--bad)'],
+    space:['Out of space','var(--warn)'],
+    other:['Unknown','var(--dim)']};
+  // A row whose original condition no longer holds is not a problem, it is a
+  // leftover - and saying so is the difference between "go fix your naming
+  // format" and "press retry".
+  const stale=rows.filter(r=>r.stale).length;
+  const by=_nl.by_cause||{};
+  const chips=Object.keys(by).map(k=>{
+    const c=(CAUSE[k]||CAUSE.other);
+    return `<span class="pill" style="color:${c[1]};border-color:${c[1]};
+      background:${c[1]}14;font-size:10.5px;padding:1px 8px"
+      >${c[0]} ${by[k]}</span>`;}).join(' ');
+  const rowHtml=r=>{
+    const c=(CAUSE[r.cause]||CAUSE.other);
+    const busy=_nlBusy[r.id]||'';
+    const btn=(fn,label,title,warn)=>`<button onclick="${fn}"
+       ${busy?'disabled':''} title="${esc(title)}"
+       style="font-size:11px;padding:2px 8px${warn?';opacity:.75':''}"
+       >${label}</button>`;
+    // Retry is only offered where retrying could actually change the outcome.
+    const retry = r.retryable
+      ? btn(`nlAct(${r.id},'requeue')`,'Retry now',
+            'queue this file again straight away')
+      : `<span class="dim" style="font-size:11px">retrying will not help</span>`;
+    return `<div style="padding:9px 0;border-top:1px solid var(--line)">
+      <div style="display:flex;gap:8px;align-items:baseline;flex-wrap:wrap">
+        <b style="font-size:12px">${esc(r.title||'')}</b>
+        <span class="dim" style="font-size:11px">${esc(r.ep||'')} ·
+          ${esc(r.library||'')}</span>
+        <span class="pill" style="color:${c[1]};border-color:${c[1]};
+          background:${c[1]}14;font-size:10.5px;padding:1px 8px">${c[0]}</span>
+        ${r.stale?`<span class="pill" style="color:var(--ok);
+          border-color:var(--ok);background:var(--ok)14;font-size:10.5px;
+          padding:1px 8px" title="the condition that caused this no longer
+          holds">no longer applies</span>`:''}
+        <span class="dim" style="font-size:10.5px">${r.jstate} ·
+          ${r.attempts} attempt${r.attempts===1?'':'s'}${
+          r.cause==='path_too_long'?` · path ${r.path_len} chars`:''}</span>
+        <span style="margin-left:auto;display:flex;gap:6px;align-items:center">
+          ${busy?`<span class="dim" style="font-size:11px">${esc(busy)}</span>`:''}
+          ${retry}
+          ${btn(`nlAct(${r.id},'rescan')`,'Rescan',
+                'read the file again and clear its retry clock - nothing on '
+                +'disk is touched')}
+        </span>
+      </div>
+      <div class="dim mono" style="font-size:10.5px;margin-top:3px;
+           word-break:break-all">${esc(r.error||'')}</div>
+      <div class="dim" style="font-size:11px;margin-top:3px">
+        ${esc(r.what||'')} <span style="color:#8fb4d9">${esc(r.advice||'')}</span></div>
+    </div>`;
+  };
+  el.innerHTML=`
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;
+                margin-bottom:8px">
+      <b style="font-size:12.5px">${rows.length} file${rows.length===1?'':'s'}</b>
+      ${chips}
+      ${stale?`<span class="dim" style="font-size:11px">· ${stale} recorded
+        under a setting that has since changed — retrying should clear
+        ${stale===1?'it':'them'}</span>`:''}
+      <span style="margin-left:auto;display:flex;gap:6px">
+        <button onclick="nlAll('rescan')" style="font-size:11px;padding:2px 9px"
+          title="rescan every file listed">Rescan all</button>
+        <button onclick="nlAll('requeue')" style="font-size:11px;padding:2px 9px"
+          title="retry only the ones where retrying can help">Retry the retryable</button>
+        <button onclick="loadNotLanded()" style="font-size:11px;padding:2px 9px">Refresh</button>
+      </span>
+    </div>
+    <div id="nlMsg" class="dim" style="font-size:11.5px;margin-bottom:4px"></div>
+    ${rows.map(rowHtml).join('')}`;
+}
+async function nlAct(id, what){
+  _nlBusy[id] = what==='rescan' ? 'rescanning…' : 'queueing…';
+  nlPaint();
+  let msg='';
+  try{
+    const url = what==='rescan' ? `/api/notlanded/${id}/rescan`
+                                : `/api/notlanded/${id}/retry`;
+    const r=await fetch(url,{method:'POST'});
+    const j=await r.json().catch(()=>({}));
+    msg = j.ok===false ? (j.why||j.reason||'no change')
+        : (what==='rescan' ? 'rescanned'
+           : j.cleared ? 'already correct — cleared from the list'
+           : 'queued');
+    if(!r.ok && j.detail) msg=j.detail;
+  }catch(e){ msg='failed'; }
+  delete _nlBusy[id];
+  await loadNotLanded();
+  const m=document.getElementById('nlMsg'); if(m) m.textContent=msg;
+}
+async function nlAll(what){
+  const rows=(_nl&&_nl.rows)||[];
+  const targets = what==='requeue' ? rows.filter(r=>r.retryable) : rows;
+  const m=document.getElementById('nlMsg');
+  if(!targets.length){ if(m) m.textContent='nothing to do'; return; }
+  let ok=0;
+  for(const r of targets){
+    if(m) m.textContent=`${what==='rescan'?'rescanning':'queueing'} ${ok+1}/${targets.length}…`;
+    try{
+      const url = what==='rescan' ? `/api/notlanded/${r.id}/rescan`
+                                  : `/api/notlanded/${r.id}/retry`;
+      const res=await fetch(url,{method:'POST'});
+      const j=await res.json().catch(()=>({}));
+      if(j.ok!==false) ok++;
+    }catch(e){}
+  }
+  await loadNotLanded();
+  const m2=document.getElementById('nlMsg');
+  if(m2) m2.textContent=`${ok} of ${targets.length} ${
+    what==='rescan'?'rescanned':'queued'}`;
 }
 
 // ---- How files flow ----------------------------------------------------
@@ -22865,6 +23105,7 @@ _SETTINGS_NAV = [
                     ("rules",  "Rules",            "list"),
                     ("ruleschk", "Rule check",     "list"),
                     ("process", "How files flow",  "list"),
+                    ("notland", "Still not landed", "list"),
                     ("plexwork", "Plex playback",  "play")]),
     ("Tools",      [("ffmpeg",  "ffmpeg",          "film"),
                     ("mkv",     "MKVToolNix",      "tool"),

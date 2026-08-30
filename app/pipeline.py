@@ -245,6 +245,125 @@ def graph() -> dict:
             "engine": eng, "libraries": libs, "at": time.time()}
 
 
+# What nuarr can actually do about each kind of failure. The point of naming
+# these is that two of them have a real remedy and one does not, and offering a
+# "Fix" button that cannot fix anything is worse than saying so plainly.
+_CAUSES = [
+    ("path_too_long", ("over the 255", "path is", "filename too long"),
+     "The full path is longer than Windows allows, so the rewritten file "
+     "cannot be written next to the original.",
+     "nuarr cannot shorten it safely on its own - the name comes from the "
+     "arr. Shorten that series' naming format in Sonarr or Radarr, let it "
+     "rename, then Rescan here.",
+     False),
+    ("locked", ("database is locked", "being used by another process",
+                "cannot access the file", "sharing violation"),
+     "Something else held the file or the database at that moment.",
+     "Nothing is wrong with the file - retrying is the whole fix.",
+     True),
+    ("bad_data", ("invalid data found", "moov atom", "corrupt"),
+     "ffmpeg could not read the source. Usually a damaged download.",
+     "Retrying will fail the same way. Replace the release, or blocklist it "
+     "and let the arr fetch another.",
+     False),
+    ("space", ("no space left", "disk full"),
+     "The cache or destination disk ran out of room.",
+     "Free space, then retry.",
+     True),
+]
+
+
+def classify(err: str) -> dict:
+    """What went wrong, in words, and whether retrying could possibly help."""
+    e = (err or "").lower()
+    for key, marks, what, advice, retryable in _CAUSES:
+        if any(m in e for m in marks):
+            return {"cause": key, "what": what, "advice": advice,
+                    "retryable": retryable}
+    return {"cause": "other", "what": "",
+            "advice": "No known pattern - retrying is worth one attempt.",
+            "retryable": True}
+
+
+def not_landed() -> list:
+    r"""Files whose most recent attempt failed and nothing has since fixed.
+
+    The same definition the flow page counts, so the list and the number can
+    never disagree - one query, one meaning of "still wrong".
+    """
+    out = []
+    with cursor() as cur:
+        rows = [dict(r) for r in cur.execute("""
+            SELECT f.id, f.title, f.season, f.episode, f.library, f.path,
+                   f.size, f.state,
+                   j.id AS job_id, j.state AS jstate, j.error, j.kind,
+                   j.pool, j.finished_at, j.created_at
+              FROM files f
+              JOIN jobs j ON j.id = (SELECT j2.id FROM jobs j2
+                                      WHERE j2.file_id = f.id
+                                      ORDER BY j2.id DESC LIMIT 1)
+             WHERE f.state NOT IN ('deleted','duplicate')
+               AND j.state IN ('failed','blocked')
+             ORDER BY f.title, f.season, f.episode""")]
+    try:
+        from .subocr import ep_label
+    except Exception:                                        # noqa: BLE001
+        def ep_label(a, b):
+            return ""
+    # RE-TEST THE CONDITION, DO NOT TRUST THE OLD MESSAGE. An error is a
+    # record of what was true when it was written, and settings move under it.
+    # Every one of the nine path-length blocks here was recorded against a
+    # 255-char limit that is now 259 with long paths enabled - none of them
+    # would be blocked today, and telling someone to go and shorten their
+    # naming format would have sent them off to fix a problem that no longer
+    # exists. Where the original condition can be re-evaluated cheaply, it is.
+    try:
+        from . import fileops
+        from .config import SETTINGS
+    except Exception:                                        # noqa: BLE001
+        fileops = SETTINGS = None
+    for r in rows:
+        r["ep"] = ep_label(r.pop("season", None), r.pop("episode", None))
+        r.update(classify(r.get("error")))
+        r["attempts"] = 0
+        r["path_len"] = len(r.get("path") or "")
+        r["stale"] = False
+        if r["cause"] == "path_too_long" and fileops and SETTINGS:
+            try:
+                still = (fileops.path_too_long(r["path"],
+                                               SETTINGS.max_path_length)
+                         and not SETTINGS.allow_long_paths)
+            except Exception:                                # noqa: BLE001
+                still = True
+            if not still:
+                r["stale"] = True
+                r["retryable"] = True
+                r["what"] = ("The path was too long for the limit in force "
+                             "when this was recorded.")
+                r["advice"] = (
+                    f"That limit has since moved to "
+                    f"{SETTINGS.max_path_length}"
+                    + (" with long paths enabled" if SETTINGS.allow_long_paths
+                       else "")
+                    + f", and this path is {r['path_len']} chars - it would "
+                      "not be blocked today. Retrying should simply work.")
+        out.append(r)
+    if out:
+        ids = [r["id"] for r in out]
+        marks = ",".join("?" * len(ids))
+        with cursor() as cur:
+            for a in cur.execute(
+                    f"SELECT file_id, COUNT(*) n FROM jobs "
+                    f"WHERE file_id IN ({marks}) "
+                    f"  AND state IN ('failed','blocked') "
+                    f"GROUP BY file_id", ids):
+                d = dict(a)
+                for r in out:
+                    if r["id"] == d["file_id"]:
+                        r["attempts"] = d["n"]
+    return out
+
+
 def route(file_id: int) -> dict:
     r"""The path ONE file actually took, as node ids to light up.
 
