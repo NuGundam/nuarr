@@ -165,6 +165,57 @@ async def scan(limit: int = 0) -> dict:
     return {"checked": checked, "rows": rows, "truncated": False}
 
 
+async def fix_one(cfg, arr_file_id: int, file_id: int) -> bool:
+    r"""Correct one file's languages, straight after the job that changed it.
+
+    THE SWEEP IS THE BACKSTOP, NOT THE MECHANISM. Correcting drift once a day
+    means a day of records describing tracks that are gone, and a sweep that
+    grows with the library. The job that dropped the track knows which file and
+    knows what is left; doing it here costs one API call on a rewrite that has
+    already spent minutes, and the sweep then only ever finds what this missed.
+
+    Quiet on every failure: an arr that will not take a metadata correction is
+    not a reason to mark a finished, committed, verified rewrite as failed.
+    """
+    if not arr_file_id or not file_id:
+        return False
+    with cursor() as c:
+        row = c.execute("SELECT audio_langs FROM files WHERE id=?",
+                        (file_id,)).fetchone()
+    actual = _canon(_iso_set(row["audio_langs"] if row else ""))
+    if not actual:
+        return False
+    from .arr import shared_client
+    client = shared_client(cfg)
+    ep = cfg.kind == "sonarr"
+    try:
+        rec = await client._get(
+            f"/{'episodefile' if ep else 'moviefile'}/{int(arr_file_id)}")
+    except Exception:                                        # noqa: BLE001
+        return False
+    claimed = _canon(_claimed_iso(rec))
+    # Only narrow, and only when there is something to narrow - the same rule
+    # the sweep follows, for the same reason.
+    if not claimed or not claimed > actual:
+        return False
+    table = await _lang_table(client)
+    langs = [{"id": table[n]["id"], "name": table[n]["name"]}
+             for n in sorted(actual) if n in table]
+    if not langs:
+        return False
+    try:
+        await client._put(
+            "/episodefile/editor" if ep else "/moviefile/editor",
+            {("episodeFileIds" if ep else "movieFileIds"): [int(arr_file_id)],
+             "languages": langs})
+    except Exception:                                        # noqa: BLE001
+        return False
+    joblog.log(f"corrected the arr's language field to "
+               f"{', '.join(sorted(actual))} - it still listed "
+               f"{', '.join(sorted(claimed))}", "info")
+    return True
+
+
 async def fix(rows: list) -> dict:
     r"""Set each record's languages to what the file actually contains.
 

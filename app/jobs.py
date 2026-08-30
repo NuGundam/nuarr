@@ -3888,6 +3888,17 @@ async def _post_commit(job: Job) -> None:
                            "debug", job.id)
             finally:
                 await client.close()
+            # A RESCAN DOES NOT FIX THE LANGUAGE FIELD. It re-reads mediaInfo,
+            # but `languages` is set at import and left alone forever after -
+            # which is how 1,127 records came to list audio tracks this very
+            # code had removed. The job that drops a track is the one that
+            # knows, so it says so, and the drift never accumulates again.
+            try:
+                from . import arrlang
+                await arrlang.fix_one(cfg, row.get("arr_file_id"), job.file_id)
+            except Exception as e:                           # noqa: BLE001
+                joblog.log(f"could not correct the arr's language field: "
+                           f"{type(e).__name__}", "debug", job.id)
         asyncio.create_task(_kick())
         joblog.log(f"asked {cfg.name} to re-read this file; rename handled by "
                    f"the retry queue", "info", job.id)

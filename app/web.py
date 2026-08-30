@@ -4188,6 +4188,30 @@ def api_subocr_status():
     return subocr.status()
 
 
+@app.get("/api/arrsync")
+def api_arrsync():
+    """The last agreement check between nuarr and the arrs. Never blocks."""
+    from . import arrsync
+    return arrsync.cached()
+
+
+@app.post("/api/arrsync/run")
+async def api_arrsync_run():
+    """Re-run the comparison. Minutes, so the card polls rather than waits."""
+    from . import arrsync
+    import asyncio as _a
+    _a.create_task(arrsync.refresh())
+    return {"ok": True, "started": True}
+
+
+@app.post("/api/arrsync/fix")
+async def api_arrsync_fix(kinds: str = ""):
+    """Correct what nuarr knows, and ask the arrs to re-read the rest."""
+    from . import arrsync
+    want = [k.strip() for k in kinds.split(",") if k.strip()] or None
+    return await arrsync.fix(want)
+
+
 @app.get("/api/arrlang")
 async def api_arrlang(limit: int = 400):
     """Arr records whose language field disagrees with the file. Read-only."""
@@ -22487,11 +22511,115 @@ async function loadPathMap(){
       mapping is set by hand.</div>`:''}`;
 }
 
+// ---- do nuarr and the arrs still agree? --------------------------------
+// THE LANGUAGE DRIFT WAS FOUND BY ACCIDENT. A glance at a Sonarr import screen
+// showed one file tagged English beside siblings tagged Multi-Languages, and
+// that thread ended at 1,246 records describing audio tracks nuarr had removed
+// months before. Nothing was broken enough to complain, so nothing did.
+//
+// That is the shape of drift between two systems that each own a copy of the
+// truth: no error, no failure, two answers. The remedy is not more care, it is
+// asking on a schedule and putting the number where it is seen.
+let _arrSync=null, _arrSyncTimer=null;
+async function loadArrSync(){
+  const el=document.getElementById('arrSyncBody');
+  if(!el){ if(_arrSyncTimer) clearTimeout(_arrSyncTimer); return; }
+  try{ _arrSync=await (await fetch('/api/arrsync')).json(); }
+  catch(e){ el.innerHTML='<span class="dim">could not load</span>'; return; }
+  arrSyncPaint();
+  if(_arrSyncTimer) clearTimeout(_arrSyncTimer);
+  if(_arrSync && _arrSync.running) _arrSyncTimer=setTimeout(loadArrSync, 3000);
+}
+function arrSyncPaint(){
+  const el=document.getElementById('arrSyncBody');
+  if(!el||!_arrSync) return;
+  const d=_arrSync, C=d.checks||{}, n=d.counts||{};
+  if(d.running){
+    el.innerHTML=`<div style="display:flex;gap:8px;align-items:center;font-size:11.5px">
+      <span class="spin" style="width:11px;height:11px"></span>
+      <span class="dim">comparing every arr record against the file on disk —
+        this walks the whole library, so give it a few minutes</span></div>`;
+    return;
+  }
+  if(!d.have){
+    el.innerHTML=`<div class="dim" style="font-size:11.5px">Not checked yet.
+      <button onclick="arrSyncRun()" style="font-size:11px;padding:2px 9px;
+        margin-left:6px">Check now</button></div>`;
+    return;
+  }
+  const total=d.total||0;
+  const head = total
+    ? `<span style="color:var(--warn)"><b>${fmt(total)}</b> record(s) disagree
+       with the file on disk</span>`
+    : `<span style="color:var(--ok)">every arr record matches the file on
+       disk</span>`;
+  const rows=Object.keys(C).map(k=>{
+    const c=n[k]||0, meta=C[k];
+    return `<tr style="border-top:1px solid var(--line)">
+      <td style="padding:4px 12px 4px 0;white-space:nowrap">${esc(meta.label)}</td>
+      <td style="padding:4px 12px 4px 0;text-align:right;
+                 color:${c?'var(--warn)':'var(--ok)'}"><b>${fmt(c)}</b></td>
+      <td class="dim" style="padding:4px 0;font-size:11px">${esc(meta.what)}
+        <span style="color:#8fb4d9">${esc(meta.why)}</span></td></tr>`;
+  }).join('');
+  // A sample, because a count invites the question "which ones".
+  const sample=[];
+  for(const k of Object.keys(C)){
+    for(const r of ((d.rows||{})[k]||[]).slice(0,2)){
+      const was = r.claimed ? r.claimed.join(', ')
+                : r.arr!=null && r.disk!=null ? gb(r.arr)
+                : String(r.arr||'');
+      const now = r.actual ? (Array.isArray(r.actual)?r.actual.join(', ')
+                                                     :r.actual)
+                : r.disk!=null ? gb(r.disk) : '';
+      sample.push(`<div style="padding:1px 0"><span class="dim"
+        style="display:inline-block;min-width:74px">${esc(C[k].label)}</span>
+        ${esc((r.path||'').split('\\').pop().slice(0,52))}
+        <span class="dim"> — arr ${esc(was)} → file ${esc(now)}</span></div>`);
+    }
+  }
+  el.innerHTML=`
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;
+                font-size:11.5px;margin-bottom:6px">
+      ${head}
+      <span class="dim">of ${fmt(d.checked||0)} checked${
+        d.age_s!=null?` · ${ago(Date.now()/1000-d.age_s)}`:''}</span>
+      <span style="margin-left:auto;display:flex;gap:6px">
+        <button onclick="arrSyncRun()" style="font-size:11px;padding:2px 9px"
+          >Check again</button>
+        ${total?`<button onclick="arrSyncFix()" style="font-size:11px;padding:2px 9px"
+          title="Sets the languages nuarr knows, and asks the arrs to re-read the files for the rest">Put right</button>`:''}
+      </span>
+    </div>
+    <table style="width:100%;border-collapse:collapse;font-size:11.5px">${rows}</table>
+    ${sample.length?`<div class="dim" style="font-size:11px;margin-top:7px">${
+      sample.join('')}</div>`:''}
+    <div id="arrSyncMsg" class="dim" style="font-size:11.5px;margin-top:5px"></div>`;
+}
+async function arrSyncRun(){
+  const m=document.getElementById('arrSyncMsg'); if(m) m.textContent='starting…';
+  try{ await fetch('/api/arrsync/run',{method:'POST'}); }catch(e){}
+  setTimeout(loadArrSync, 700);
+}
+async function arrSyncFix(){
+  const m=document.getElementById('arrSyncMsg');
+  if(m) m.textContent='putting it right — this rewrites arr records and asks '
+    +'for re-reads, so it takes a few minutes…';
+  try{
+    const r=await (await fetch('/api/arrsync/fix',{method:'POST'})).json();
+    if(m) m.textContent=`corrected ${r.fixed||0} language record(s), asked the `
+      +`arrs to re-read ${r.refreshed||0} file(s)`
+      +(r.failed?`, ${r.failed} failed`:'');
+  }catch(e){ if(m) m.textContent='failed'; }
+  setTimeout(loadArrSync, 1500);
+}
+
 async function loadArrsTab(){
   loadArrConns();
   loadArrHealth();
   loadLangSync();
   loadPathMap();
+  loadArrSync();
   const el=document.getElementById('arrsBody');
   if(!el) return;
   let d;
