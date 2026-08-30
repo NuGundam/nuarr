@@ -126,6 +126,9 @@ def main() -> None:
     ap.add_argument("--lang", default="en")
     ap.add_argument("--ass", action="store_true",
                     help="write positioned ASS instead of flat SRT")
+    ap.add_argument("--an8", action="store_true",
+                    help="SRT, but tag top and middle cues with {\\an8}/{\\an5} "
+                         "so signs keep their place without leaving SRT")
     ap.add_argument("--progress", action="store_true")
     ap.add_argument("--engine", default="paddle",
                     choices=("paddle", "tesseract"))
@@ -168,10 +171,28 @@ def main() -> None:
             # complaining about it.
             if pic.ndim == 2:
                 pic = np.stack([pic] * 3, axis=-1)
-            texts = []
+            if pic.shape[2] == 4:
+                pic = pic[:, :, :3]
+            texts, ys = [], []
             for r in ocr.predict(pic):
-                texts += list(r.get("rec_texts") or [])
-            return texts
+                got = list(r.get("rec_texts") or [])
+                texts += got
+                # WHERE THE WORDS ARE, not where the bitmap is. A PGS display
+                # set gives the position of the whole BITMAP, and for a sign
+                # that bitmap is often most of the frame with the text in one
+                # corner - measured on Detective Conan, the same top sign read
+                # 0.12 of frame height from its text box while its bitmap
+                # centre wandered from 0.12 to 0.27 as the bitmap grew. The
+                # text box is the honest answer; the bitmap box is a canvas.
+                polys = r.get("rec_polys")
+                if polys is None:
+                    polys = r.get("dt_polys")
+                if polys is not None and len(polys):
+                    for p in polys:
+                        arr = np.asarray(p, dtype=float)
+                        if arr.ndim == 2 and arr.shape[1] >= 2:
+                            ys.append(float(arr[:, 1].mean()))
+            return texts, (sum(ys) / len(ys) if ys else None)
     else:
         try:
             import pytesseract
@@ -185,20 +206,25 @@ def main() -> None:
         def read(pic):
             txt = pytesseract.image_to_string(
                 Image.fromarray(pic).convert("L"), lang="eng", config="--psm 6")
-            return [l for l in txt.splitlines() if l.strip()]
+            # No box from this path, so callers fall back to the bitmap.
+            return [l for l in txt.splitlines() if l.strip()], None
 
     rows = []
     n = len(cues)
     for i, (img, start, end, x, y, vw, vh) in enumerate(cues):
         try:
-            texts = read(img)
+            texts, ty = read(img)
         except Exception:                                # noqa: BLE001
             continue
         txt = "\n".join(t.strip() for t in texts if t and t.strip())
         if not txt:
             continue
+        # Text centre in FRAME coordinates: the bitmap's offset plus where the
+        # words sat inside it. Falls back to the bitmap's own centre when the
+        # engine gave no boxes (Tesseract).
+        cy = y + (ty if ty is not None else img.shape[0] / 2)
         rows.append({"start": start, "end": max(end, start + 500), "text": txt,
-                     "x": x, "y": y, "vw": vw, "vh": vh,
+                     "x": x, "y": y, "vw": vw, "vh": vh, "cy": cy,
                      "h": int(img.shape[0]), "w": int(img.shape[1])})
         # EVERY CUE, NOT EVERY TENTH: this is the only true progress signal
         # either engine emits, and nuarr's bar reads it directly. The old
@@ -228,19 +254,42 @@ def main() -> None:
                 "MarginR, MarginV, Effect, Text\n")
         body = []
         for r in rows:
-            # The centre of where the bitmap sat, which is where the words
-            # were - alignment 5 means "centred on this point".
+            # Alignment 5 means "centred on this point". Horizontally the
+            # bitmap centre is the best available guess; vertically we now
+            # know where the WORDS were - see the note in read().
             cx = int(r["x"] + r["w"] / 2)
-            cy = int(r["y"] + r["h"] / 2)
+            cy = int(r["cy"])
             t = r["text"].replace("\n", r"\N")
             body.append(f"Dialogue: 0,{_ass_ts(r['start'])},{_ass_ts(r['end'])},"
                         f"Default,,0,0,0,,{{\\pos({cx},{cy})}}{t}")
         open(a.out, "w", encoding="utf-8").write(head + "\n".join(body) + "\n")
     else:
+        # POSITION IN PLAIN SRT, via the alignment tags libass understands.
+        #
+        # SRT has no positioning of its own, but {\an8} and {\an5} pass
+        # straight through ffmpeg's subrip decoder into the ASS it hands the
+        # renderer - verified, the tag survives verbatim - and a player that
+        # does not understand them simply shows the text where it always did.
+        # So a sign at the top stays at the top without giving up direct play.
+        #
+        # Three bands, measured against where cues actually land. On a real
+        # episode the bottom dialogue clusters at 0.89-0.93 of frame height,
+        # top signs at 0.10-0.12, and mid-screen karaoke near 0.50, so the
+        # cuts sit in the empty space between those groups rather than on a
+        # round number.
         parts = []
         for i, r in enumerate(rows, 1):
+            tag = ""
+            if a.an8:
+                frac = r["cy"] / r["vh"] if r.get("vh") else 1.0
+                if frac < 0.35:
+                    tag = r"{\an8}"          # top
+                elif frac < 0.70:
+                    tag = r"{\an5}"          # middle
+                # below that is ordinary dialogue: leave it un-tagged so it
+                # renders exactly as it does today.
             parts.append(f"{i}\n{_ts(r['start'])} --> {_ts(r['end'])}\n"
-                         f"{r['text']}\n")
+                         f"{tag}{r['text']}\n")
         open(a.out, "w", encoding="utf-8").write("\n".join(parts))
     print(f"OK {len(rows)} cues -> {os.path.basename(a.out)}")
 
