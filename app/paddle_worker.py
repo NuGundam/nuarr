@@ -192,7 +192,15 @@ def main() -> None:
                         arr = np.asarray(p, dtype=float)
                         if arr.ndim == 2 and arr.shape[1] >= 2:
                             ys.append(float(arr[:, 1].mean()))
-            return texts, (sum(ys) / len(ys) if ys else None)
+            # Mean AND spread. One bitmap often carries two blocks that belong
+            # in different places - a sign across the top and the dialogue
+            # under it, or karaoke romaji with its translation. Averaging those
+            # lands in the middle and moves BOTH somewhere neither belongs; on
+            # a real episode that was 324 of 681 cues. The caller uses the
+            # spread to refuse to guess.
+            if not ys:
+                return texts, None, None
+            return texts, sum(ys) / len(ys), (max(ys) - min(ys))
     else:
         try:
             import pytesseract
@@ -207,13 +215,13 @@ def main() -> None:
             txt = pytesseract.image_to_string(
                 Image.fromarray(pic).convert("L"), lang="eng", config="--psm 6")
             # No box from this path, so callers fall back to the bitmap.
-            return [l for l in txt.splitlines() if l.strip()], None
+            return [l for l in txt.splitlines() if l.strip()], None, None
 
     rows = []
     n = len(cues)
     for i, (img, start, end, x, y, vw, vh) in enumerate(cues):
         try:
-            texts, ty = read(img)
+            texts, ty, spread = read(img)
         except Exception:                                # noqa: BLE001
             continue
         txt = "\n".join(t.strip() for t in texts if t and t.strip())
@@ -225,6 +233,7 @@ def main() -> None:
         cy = y + (ty if ty is not None else img.shape[0] / 2)
         rows.append({"start": start, "end": max(end, start + 500), "text": txt,
                      "x": x, "y": y, "vw": vw, "vh": vh, "cy": cy,
+                     "spread": spread,
                      "h": int(img.shape[0]), "w": int(img.shape[1])})
         # EVERY CUE, NOT EVERY TENTH: this is the only true progress signal
         # either engine emits, and nuarr's bar reads it directly. The old
@@ -281,13 +290,19 @@ def main() -> None:
         for i, r in enumerate(rows, 1):
             tag = ""
             if a.an8:
-                frac = r["cy"] / r["vh"] if r.get("vh") else 1.0
-                if frac < 0.35:
-                    tag = r"{\an8}"          # top
-                elif frac < 0.70:
-                    tag = r"{\an5}"          # middle
-                # below that is ordinary dialogue: leave it un-tagged so it
-                # renders exactly as it does today.
+                vh = r.get("vh") or 1
+                frac = r["cy"] / vh
+                spread = r.get("spread")
+                # ONE TAG CANNOT DESCRIBE TWO PLACES. When a cue's text is
+                # spread down the frame it is two blocks that belong apart -
+                # a sign and the dialogue beneath it - and the average is a
+                # position neither of them wants. Leave those exactly as they
+                # render today rather than moving both somewhere wrong.
+                split = spread is not None and spread > 0.25 * vh
+                if not split and frac < 0.35:
+                    tag = r"{\an8}"          # top, and only text at the top
+                # Everything else - ordinary dialogue, and any cue we cannot
+                # describe with a single anchor - is left un-tagged.
             parts.append(f"{i}\n{_ts(r['start'])} --> {_ts(r['end'])}\n"
                          f"{tag}{r['text']}\n")
         open(a.out, "w", encoding="utf-8").write("\n".join(parts))

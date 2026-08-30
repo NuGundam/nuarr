@@ -1347,8 +1347,14 @@ def paddle_info(force: bool = False) -> dict:
         # just to learn whether paddle exists would pull hundreds of MB of
         # native code nuarr otherwise never touches - and would let a broken
         # wheel kill the web server on a settings page load.
+        # startupinfo AS WELL AS the flag - see _hidden(). NO_WINDOW governs
+        # this child only, and this child imports paddle, which probes the GPU
+        # by spawning console programs of its own. Those grandchildren each
+        # got a console: one flash on the OCR engines page, first load after a
+        # restart, because paddle_info() is cached after that.
         r = _sp.run([_sys.executable, "-c", code], capture_output=True,
-                    text=True, timeout=120, creationflags=NO_WINDOW)
+                    text=True, timeout=120, creationflags=NO_WINDOW,
+                    startupinfo=_hidden())
         lines = [l for l in (r.stdout or "").strip().splitlines() if l.strip()]
         if lines:
             d = json.loads(lines[-1])
@@ -1396,8 +1402,12 @@ def paddle_install_start(mode: str) -> dict:
                 cmd = [_sys.executable, "-m", "pip", "install",
                        "--prefer-binary", "--no-warn-script-location"] + step
                 tail.append(f"$ pip install {' '.join(step)}")
+                # pip spawns compilers and helper scripts of its own, so the
+                # hidden STARTUPINFO has to be inherited too - same reason as
+                # the probe above.
                 p = _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.STDOUT,
-                              text=True, creationflags=NO_WINDOW)
+                              text=True, creationflags=NO_WINDOW,
+                              startupinfo=_hidden())
                 for line in p.stdout:
                     if line.strip():
                         tail.append(line.rstrip())
@@ -1734,9 +1744,11 @@ TESS_INSTALL = {"state": "idle", "error": "", "version": ""}
 def _pip_latest(pkg: str) -> str:
     import sys as _sys
     try:
+        # pip is not a leaf: it shells out while resolving. Inherit the hidden
+        # STARTUPINFO so nothing it starts can put a console on the desktop.
         r = subprocess.run([_sys.executable, "-m", "pip", "index", "versions",
                             pkg], capture_output=True, text=True, timeout=90,
-                           creationflags=NO_WINDOW)
+                           creationflags=NO_WINDOW, startupinfo=_hidden())
         m = re.search(r"LATEST:\s*([0-9][\w.\-]*)",
                       (r.stdout or "") + (r.stderr or ""))
         return m.group(1) if m else ""
