@@ -22,12 +22,12 @@ import re
 #         setting that moved, anything that could surprise an existing install)
 # minor - a new capability
 # patch - a fix to something that was already meant to work
-VERSION = "1.7.4"
+VERSION = "1.10.0"
 
 # Filled in when a bundle is built, so a running install can say not just what
 # it is but when it was made. Left empty in a source checkout on purpose - an
 # invented date would be worse than a blank.
-BUILD_DATE = "2026-08-28"
+BUILD_DATE = "2026-08-29"
 
 # Where to look for newer versions. Owner/name only, no URL, because the API
 # path and the browse path differ and building both from one field is less to
