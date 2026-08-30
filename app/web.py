@@ -4188,6 +4188,13 @@ def api_subocr_status():
     return subocr.status()
 
 
+@app.get("/api/hostio")
+def api_hostio():
+    """Disk activity from the machine that actually holds the pool."""
+    from . import hostio
+    return hostio.state()
+
+
 @app.get("/api/pathmap")
 def api_pathmap():
     """How nuarr's paths line up with the arrs' - and where they do not."""
@@ -10230,6 +10237,8 @@ async function loadAll(){
   // Bars scale to each disk's real capacity, so the fill level means
   // "how full is this disk" rather than "how many files does it happen to hold".
   lastDisks=s.disks; renderDisks();
+  // Asked once; hostIoLoad reschedules itself only if there IS a remote host.
+  if(_hostIo===null) hostIoLoad();
 
   loadLibs();
 
@@ -10289,6 +10298,62 @@ function sortDisks(col){
   if(diskSort===col) diskDir=-diskDir; else { diskSort=col; diskDir=1; }
   renderDisks();
 }
+// ---- the spindles behind a network share --------------------------------
+// WHEN THE MEDIA IS ON ANOTHER MACHINE this table has one row - the share -
+// and can say nothing about which of twelve disks is busy, because the
+// counters describe the client's hardware. The host's counters are asked for
+// over CIM instead and shown here.
+//
+// DELIBERATELY A SEPARATE STRIP, not extra rows in the table above. Those rows
+// carry file counts, capacity, and a viewer/nuarr/system split that only the
+// host can know; presenting a remote busy figure in the same shape would imply
+// the same confidence. This says what it is and what it cannot tell you.
+let _hostIo=null, _hostIoTimer=null;
+async function hostIoLoad(){
+  try{ _hostIo = await fetch('/api/hostio').then(r=>r.json()); }catch(e){ return; }
+  if(_hostIo && !_hostIo.local) renderDisks();
+  // POLL ONLY WHERE THERE IS SOMETHING TO POLL. On an install whose pool is
+  // local this answers "local: true" once and then stops for good, rather than
+  // asking a question with a known answer every few seconds forever.
+  if(_hostIoTimer) clearTimeout(_hostIoTimer);
+  if(_hostIo && !_hostIo.local) _hostIoTimer=setTimeout(hostIoLoad, 5000);
+}
+function hostIoHtml(){
+  if(!_hostIo || _hostIo.local || !(_hostIo.hosts||[]).length) return '';
+  return _hostIo.hosts.map(h=>{
+    const ds=h.disks||{};
+    const names=Object.keys(ds).filter(n=>/^NU-DRIVE/i.test(n))
+      .sort((a,b)=>(parseInt(a.replace(/\D+/g,''),10)||0)
+                  -(parseInt(b.replace(/\D+/g,''),10)||0));
+    if(!h.ok){
+      return `<div class="xfer"><span class="xlbl">on ${esc(h.server)}</span>
+        <span class="dim" style="font-size:11px">${
+          h.have_creds ? esc(h.why||'could not read the host\'s disks')
+                       : 'no credentials stored for this host — add them under '
+                         +'Libraries to see its disks'}</span></div>`;
+    }
+    if(!names.length) return '';
+    const cell=n=>{
+      const d=ds[n], b=Math.round(d.busy);
+      const io=(d.read_bps||0)+(d.write_bps||0);
+      const col = b>=85?'var(--bad)':b>=40?'var(--warn)':'var(--ok)';
+      return `<span class="xpair" title="${esc(n)} on ${esc(h.server)} — ${b}% busy${
+        io?', '+mbps(io):''}${d.queue?', queue '+Math.round(d.queue):''}">
+        <span class="dim">${esc(n.replace(/^NU-DRIVE-?/i,''))}</span>
+        <b style="color:${col}">${b}%</b>${io?` <span class="dim">${mbps(io)}</span>`:''}
+      </span>`;
+    };
+    return `<div class="xfer">
+      <span class="xlbl" title="Read from ${esc(h.server)} over CIM. These are
+the host's own disk counters — the same numbers it would show locally.">on
+        ${esc(h.server)}</span>${names.map(cell).join('')}
+      <span class="dim" style="font-size:10.5px;margin-left:6px"
+        title="From outside, a busy spindle is just busy: only the machine
+running the jobs knows which bytes are its own and which are a viewer.">busy
+        only — no viewer/nuarr split from here</span></div>`;
+  }).join('');
+}
+
 function renderDisks(){
   const key=diskSort;
   const rows=lastDisks.slice().sort((a,b)=>{
@@ -10429,7 +10494,7 @@ a plain file copy alike. With several moves at once the pairing is a best
 guess.">looks like data moving</span>${other.slice(0,3).map(m=>pair(m,'')).join('')}` : '')
       + '</div>';
   }
-  document.getElementById('disks').innerHTML = moveLine
+  document.getElementById('disks').innerHTML = moveLine + hostIoHtml()
     + '<table class="disktab"><thead><tr>'
     +th('pool_disk','Disk')+th('n','Files','num')
     +th('total','Size','num dcol-size')+th('used','Used','num dcol-used')
