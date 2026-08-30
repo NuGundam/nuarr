@@ -199,6 +199,63 @@ def adopt_existing() -> int:
     return n
 
 
+def adopt_not_landed() -> int:
+    r"""Schedule retries for files stuck on a FAILED OR BLOCKED job.
+
+    THE GAP THIS CLOSES. adopt_existing() looks at files.state='error', but a
+    job that is blocked writes state='blocked' and a job that fails may leave
+    the file untouched entirely - so thirteen files sat stuck for weeks with no
+    retry row between them, waiting for somebody to notice and press a button.
+    The renamer never had this problem because its queue retries on its own.
+
+    RETRYABILITY IS ASKED FRESH, not read off the old message. pipeline
+    re-tests conditions that settings can change - nine of those thirteen were
+    blocked under a path-length limit that has since moved, so they are
+    retryable now and were not when the message was written. Deciding from the
+    stored text would keep them out of the queue forever.
+    """
+    try:
+        from . import pipeline
+        rows = pipeline.not_landed()
+    except Exception:                                        # noqa: BLE001
+        return 0
+    if not rows:
+        return 0
+    try:
+        with cursor() as cur:
+            known = {r[0] for r in cur.execute(
+                "SELECT file_id FROM error_retry")}
+    except Exception:                                        # noqa: BLE001
+        known = set()
+    n = 0
+    now = time.time()
+    for r in rows:
+        if r["id"] in known or not r.get("retryable"):
+            continue
+        # Straight into the ladder rather than through note_failure(), which
+        # would ask refetch.classify() and get "not transient" for a stale
+        # path-length block - the very rows this exists to rescue.
+        try:
+            with cursor() as cur:
+                cur.execute(
+                    "INSERT INTO error_retry(file_id, attempts, first_at, "
+                    "next_at, reason, state) VALUES(?,?,?,?,?,'waiting') "
+                    "ON CONFLICT(file_id) DO NOTHING",
+                    (r["id"], 0, now, now + BACKOFF[0],
+                     (r.get("error") or "")[:300]))
+            n += 1
+        except Exception as e:                               # noqa: BLE001
+            # NOT SILENT. The first version wrote last_at, which is not a
+            # column here, so every insert raised and was swallowed by a bare
+            # continue - the sweep reported "0 scheduled" and looked like it
+            # had simply found nothing to do. A scheduler that cannot schedule
+            # has to say so.
+            joblog.log(f"could not put file {r['id']} on the retry ladder: "
+                       f"{type(e).__name__}: {e}", "warn")
+            continue
+    return n
+
+
 async def watch() -> None:
     """Adopt what is already stuck, then retry what comes due."""
     await asyncio.sleep(45)
@@ -211,9 +268,24 @@ async def watch() -> None:
                        "info")
     except Exception as e:                                   # noqa: BLE001
         joblog.log(f"error-retry init: {type(e).__name__}: {e}", "error")
+    # RE-SWEEP, not once at boot. A file becomes retryable long after startup:
+    # a job fails at three in the morning, or a setting changes and unblocks
+    # nine files that were parked. Adopting only at boot means the queue is
+    # correct exactly once and drifts from then on.
+    last_sweep = 0.0
     while True:
         try:
             await _run_due()
         except Exception as e:                               # noqa: BLE001
             joblog.log(f"error-retry: {type(e).__name__}: {e}", "debug")
+        if time.time() - last_sweep > 900:
+            last_sweep = time.time()
+            try:
+                n = await asyncio.to_thread(adopt_not_landed)
+                if n:
+                    joblog.log(f"{n} file(s) stuck on a failed or blocked job "
+                               f"are now on the retry ladder", "info")
+            except Exception as e:                           # noqa: BLE001
+                joblog.log(f"error-retry sweep: {type(e).__name__}: {e}",
+                           "debug")
         await asyncio.sleep(POLL_S)

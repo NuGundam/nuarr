@@ -19700,13 +19700,42 @@ function socRow(k,v,where,why){
 // download - offering it everywhere would teach you to click it everywhere and
 // learn nothing. Where nuarr cannot fix a thing it says what a person has to
 // do instead, rather than showing a button that will fail politely.
-let _nl=null, _nlBusy={};
+let _nl=null, _nlBusy={}, _nlTimer=null, _nlBulk=false;
+
+// SAY THAT SOMETHING IS ALREADY COMING. A row reading only "blocked" looks
+// abandoned, so a person presses a button the retry ladder was going to press
+// for them in eight minutes - and if it fails again they conclude the button
+// is broken. The ladder is the renamer's: 3m, 10m, 30m, 1h, 3h, 6h, then it
+// stops and says so rather than hammering a file that is never going to work.
+function nlRetryLine(r){
+  if(r.retry_state==='gave_up')
+    return `<div style="font-size:11px;margin-top:3px;color:var(--warn)">
+      Automatic retries gave up after ${r.retry_attempts} attempts — this one
+      needs a person.</div>`;
+  if(r.retry_state==='waiting'){
+    const when=r.retry_in_s>1?`in ${hms(r.retry_in_s)}`:'due now';
+    return `<div class="dim" style="font-size:11px;margin-top:3px">
+      Retrying automatically — attempt ${(r.retry_attempts||0)+1} of
+      ${r.retry_max}, ${when}.</div>`;
+  }
+  if(r.retryable)
+    return `<div class="dim" style="font-size:11px;margin-top:3px">
+      Will be picked up by the retry sweep within 15 minutes.</div>`;
+  return '';
+}
 async function loadNotLanded(){
   const el=document.getElementById('notlandBody');
   if(!el) return;
   try{ _nl=await fetch('/api/notlanded').then(r=>r.json()); }
   catch(e){ el.innerHTML='<div class="dim">could not load</div>'; return; }
   nlPaint();
+  // The countdowns tick and the ladder fires on its own, so the page keeps
+  // itself current - only while it is the visible pane.
+  if(_nlTimer) clearTimeout(_nlTimer);
+  _nlTimer=setTimeout(()=>{
+    const box=document.getElementById('notlandBody');
+    if(box && box.offsetParent!==null) loadNotLanded();
+  }, 20000);
 }
 function nlPaint(){
   const el=document.getElementById('notlandBody');
@@ -19763,7 +19792,8 @@ function nlPaint(){
           ${r.attempts} attempt${r.attempts===1?'':'s'}${
           r.cause==='path_too_long'?` · path ${r.path_len} chars`:''}</span>
         <span style="margin-left:auto;display:flex;gap:6px;align-items:center">
-          ${busy?`<span class="dim" style="font-size:11px">${esc(busy)}</span>`:''}
+          ${busy?`<span class="spin" style="width:11px;height:11px"></span>
+                  <span class="dim" style="font-size:11px">${esc(busy)}</span>`:''}
           ${retry}
           ${btn(`nlAct(${r.id},'rescan')`,'Rescan',
                 'read the file again and clear its retry clock - nothing on '
@@ -19774,6 +19804,7 @@ function nlPaint(){
            word-break:break-all">${esc(r.error||'')}</div>
       <div class="dim" style="font-size:11px;margin-top:3px">
         ${esc(r.what||'')} <span style="color:#8fb4d9">${esc(r.advice||'')}</span></div>
+      ${nlRetryLine(r)}
     </div>`;
   };
   el.innerHTML=`
@@ -19784,12 +19815,16 @@ function nlPaint(){
       ${stale?`<span class="dim" style="font-size:11px">· ${stale} recorded
         under a setting that has since changed — retrying should clear
         ${stale===1?'it':'them'}</span>`:''}
-      <span style="margin-left:auto;display:flex;gap:6px">
-        <button onclick="nlAll('rescan')" style="font-size:11px;padding:2px 9px"
+      <span style="margin-left:auto;display:flex;gap:6px;align-items:center">
+        ${_nlBulk?`<span class="spin" style="width:12px;height:12px"></span>`:''}
+        <button onclick="nlAll('rescan')" ${_nlBulk?'disabled':''}
+          style="font-size:11px;padding:2px 9px"
           title="rescan every file listed">Rescan all</button>
-        <button onclick="nlAll('requeue')" style="font-size:11px;padding:2px 9px"
+        <button onclick="nlAll('requeue')" ${_nlBulk?'disabled':''}
+          style="font-size:11px;padding:2px 9px"
           title="retry only the ones where retrying can help">Retry the retryable</button>
-        <button onclick="loadNotLanded()" style="font-size:11px;padding:2px 9px">Refresh</button>
+        <button onclick="loadNotLanded()" ${_nlBulk?'disabled':''}
+          style="font-size:11px;padding:2px 9px">Refresh</button>
       </span>
     </div>
     <div id="nlMsg" class="dim" style="font-size:11.5px;margin-bottom:4px"></div>
@@ -19819,8 +19854,10 @@ async function nlAll(what){
   const targets = what==='requeue' ? rows.filter(r=>r.retryable) : rows;
   const m=document.getElementById('nlMsg');
   if(!targets.length){ if(m) m.textContent='nothing to do'; return; }
+  _nlBulk=true; nlPaint();
   let ok=0;
   for(const r of targets){
+    const m=document.getElementById('nlMsg');
     if(m) m.textContent=`${what==='rescan'?'rescanning':'queueing'} ${ok+1}/${targets.length}…`;
     try{
       const url = what==='rescan' ? `/api/notlanded/${r.id}/rescan`
@@ -19830,6 +19867,7 @@ async function nlAll(what){
       if(j.ok!==false) ok++;
     }catch(e){}
   }
+  _nlBulk=false;
   await loadNotLanded();
   const m2=document.getElementById('nlMsg');
   if(m2) m2.textContent=`${ok} of ${targets.length} ${

@@ -361,6 +361,31 @@ def not_landed() -> list:
                 for r in out:
                     if r["id"] == d["file_id"]:
                         r["attempts"] = d["n"]
+            # WHETHER ANYTHING IS COMING FOR IT. A row that says only "blocked"
+            # reads as abandoned, and someone will press a button that the
+            # retry ladder was going to press for them in eight minutes.
+            try:
+                for a in cur.execute(
+                        f"SELECT file_id, attempts, next_at, state "
+                        f"FROM error_retry WHERE file_id IN ({marks})", ids):
+                    d = dict(a)
+                    for r in out:
+                        if r["id"] == d["file_id"]:
+                            r["retry_state"] = d["state"]
+                            r["retry_attempts"] = d["attempts"] or 0
+                            r["retry_in_s"] = max(
+                                0, (d["next_at"] or 0) - time.time())
+            except Exception:                                # noqa: BLE001
+                pass
+    try:
+        from .errorretry import MAX_ATTEMPTS
+    except Exception:                                        # noqa: BLE001
+        MAX_ATTEMPTS = 0
+    for r in out:
+        r.setdefault("retry_state", "")
+        r.setdefault("retry_attempts", 0)
+        r.setdefault("retry_in_s", 0)
+        r["retry_max"] = MAX_ATTEMPTS
     return out
 
 
