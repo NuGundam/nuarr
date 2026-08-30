@@ -84,15 +84,47 @@ def graph() -> dict:
                          "AND pool='passthrough'")
         r_sub = _n(cur, "SELECT COUNT(*) FROM jobs WHERE state='running' "
                         "AND pool='subocr'")
-        blocked = _n(cur, "SELECT COUNT(*) FROM jobs WHERE state='blocked'")
-        failed = _n(cur, "SELECT COUNT(*) FROM jobs WHERE state='failed'")
+        # OUTSTANDING, NOT HISTORICAL. Counting every row that ever failed
+        # answered a question nobody asked: of 33 such rows here, 4 were fixed
+        # by a later pass and 14 belong to files that have since been deleted
+        # or replaced. Reporting 33 as if 33 things were broken is the way a
+        # number stops being believed. A file counts when it is still in the
+        # library AND its most recent job failed or was blocked - i.e. nothing
+        # has put it right since.
+        bad_now = _n(cur, """
+            SELECT COUNT(*) FROM files f
+            WHERE f.state NOT IN ('deleted','duplicate')
+              AND (SELECT j.state FROM jobs j
+                    WHERE j.file_id = f.id
+                    ORDER BY j.id DESC LIMIT 1) IN ('failed','blocked')""")
+        bad_ever = _n(cur, "SELECT COUNT(*) FROM jobs "
+                           "WHERE state IN ('failed','blocked')")
+        # THESE COUNT FILES, NOT JOBS. A file rewritten three times is one
+        # file, and putting 48,530 commits beside a library of 39,581 invites
+        # the reader to compare two numbers that do not belong on the same
+        # scale. The job totals are throughput and are kept for the edges,
+        # where "how much has flowed down this path" is the right question.
         d_enc = _n(cur, "SELECT COUNT(*) FROM jobs WHERE state='done' "
                         "AND pool='encode'")
         d_pass = _n(cur, "SELECT COUNT(*) FROM jobs WHERE state='done' "
                          "AND pool='passthrough'")
         d_sub = _n(cur, "SELECT COUNT(*) FROM jobs WHERE state='done' "
                         "AND pool='subocr'")
-        skipped = _n(cur, "SELECT COUNT(*) FROM jobs WHERE state='skipped'")
+        jobs_done = d_enc + d_pass + d_sub
+        files_done = _n(cur, """
+            SELECT COUNT(DISTINCT j.file_id) FROM jobs j JOIN files f
+              ON f.id = j.file_id
+             WHERE j.state='done'
+               AND f.state NOT IN ('deleted','duplicate')""")
+        # "Nothing to do" is a population too: files sitting there correct,
+        # not the number of times we have concluded that.
+        skipped = _n(cur, """
+            SELECT COUNT(*) FROM files f
+             WHERE f.state NOT IN ('deleted','duplicate')
+               AND (SELECT j.state FROM jobs j WHERE j.file_id = f.id
+                     ORDER BY j.id DESC LIMIT 1) = 'skipped'""")
+        skipped_ever = _n(cur, "SELECT COUNT(*) FROM jobs "
+                               "WHERE state='skipped'")
         # The subtitle branch, which is the part with a measurement behind it.
         shaped = _n(cur, "SELECT COUNT(DISTINCT file_id) FROM sub_shape")
         typeset = _n(cur, "SELECT COUNT(DISTINCT file_id) FROM sub_shape "
@@ -121,7 +153,11 @@ def graph() -> dict:
                   "audio, which subtitles, and therefore which pool"),
         dict(id="nothing", col=2, row=2, label="Nothing to do",
              count=skipped, kind="idle",
-             note="already matches the policy - no rewrite would change it"),
+             note=("files whose last look found nothing worth changing - they "
+                   "already match the policy. "
+                   f"{skipped_ever:,} such conclusions have been reached in "
+                   "total, since a file is re-examined whenever the rules or "
+                   "the file change.")),
         dict(id="gate", col=3, row=1, label="Job gate",
              count=q_enc + q_sub, kind="gate",
              note="holds work while someone is watching, while a disk is "
@@ -137,13 +173,20 @@ def graph() -> dict:
              note=f"picture subtitles read into text with {eng}, "
                   f"for {libtxt}"),
         dict(id="commit", col=5, row=1, label="Committed",
-             count=d_enc + d_pass + d_sub, kind="stage",
-             note="written back over the original, paced so a viewer never "
-                  "feels it"),
-        dict(id="failed", col=5, row=2, label="Failed or blocked",
-             count=failed + blocked, kind="bad",
-             note="retried on a backoff; blocked means the file could not be "
-                  "opened exclusively"),
+             count=files_done, kind="stage",
+             note=("files that have been rewritten at least once and written "
+                   "back over the original, paced so a viewer never feels it. "
+                   f"{jobs_done:,} commits in total - a file is rewritten "
+                   "again whenever the policy changes under it.")),
+        dict(id="failed", col=5, row=2, label="Still not landed",
+             count=bad_now, kind="bad",
+             note=("files whose most recent attempt failed or was blocked, "
+                   "and which nothing has put right since. Retried on a "
+                   "backoff; blocked usually means the file could not be "
+                   "opened exclusively, or its path is too long. "
+                   f"{bad_ever} failures have been recorded in total - the "
+                   "rest were fixed by a later pass or belong to files since "
+                   "deleted or replaced.")),
     ]
     edges = [
         dict(a="found", b="probe", label="scan reads it", n=probed),
@@ -161,7 +204,7 @@ def graph() -> dict:
         dict(a="encode", b="commit", label="", n=d_enc),
         dict(a="passthrough", b="commit", label="", n=d_pass),
         dict(a="subocr", b="commit", label="", n=d_sub),
-        dict(a="encode", b="failed", label="", n=failed + blocked, muted=True),
+        dict(a="encode", b="failed", label="", n=bad_now, muted=True),
     ]
     # The subtitle decision, drawn as its own small graph under the main one -
     # it is the one branch with a measurement rather than a setting behind it.
