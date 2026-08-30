@@ -2545,6 +2545,74 @@ def screen_state() -> dict:
     return st
 
 
+def _annotate_status(cur, rows: list) -> None:
+    r"""Add where each measured file stands: held, eligible, queued, done...
+
+    ONE QUERY FOR THE WHOLE PAGE, not one per row. Sixty rows asking the jobs
+    table about themselves individually is sixty round trips to answer a
+    question one IN clause covers.
+
+    The verdict decides which job KIND counts as finished: a dialogue track is
+    done when its OCR is done, a typeset one when the burn - a transcode - has
+    run. A `skipped` sub_ocr on a typeset file is not done; it is the OCR
+    correctly declining, and the burn is still ahead of it.
+    """
+    if not rows:
+        return
+    ids = sorted({int(r["file_id"]) for r in rows if r.get("file_id")})
+    if not ids:
+        return
+    marks = ",".join("?" * len(ids))
+    live, last_done, rejected = {}, {}, set()
+    try:
+        for j in cur.execute(
+                f"SELECT file_id, kind, state FROM jobs "
+                f"WHERE file_id IN ({marks}) "
+                f"  AND state IN ('running','queued') ", ids):
+            d = dict(j)
+            # Running beats queued when a file somehow has both.
+            if d["state"] == "running" or d["file_id"] not in live:
+                live[d["file_id"]] = d
+        for j in cur.execute(
+                f"SELECT file_id, kind, MAX(finished_at) fa FROM jobs "
+                f"WHERE file_id IN ({marks}) AND state='done' "
+                f"GROUP BY file_id, kind", ids):
+            d = dict(j)
+            last_done.setdefault(d["file_id"], set()).add(d["kind"])
+        for j in cur.execute(
+                f"SELECT id FROM files WHERE id IN ({marks}) "
+                f"  AND COALESCE(subocr_state,'') = 'rejected'", ids):
+            rejected.add(dict(j)["id"])
+    except Exception:                                        # noqa: BLE001
+        return
+    for r in rows:
+        fid = r.get("file_id")
+        want = "transcode" if r.get("typeset") else "sub_ocr"
+        cur_job = live.get(fid)
+        if cur_job and cur_job["state"] == "running":
+            r["status"], r["status_why"] = "processing", \
+                f"a {cur_job['kind']} job is running now"
+        elif cur_job:
+            r["status"], r["status_why"] = "queued", \
+                f"a {cur_job['kind']} job is waiting its turn"
+        elif want in last_done.get(fid, ()):
+            r["status"], r["status_why"] = "done", (
+                "the signs have been burned into the picture"
+                if r.get("typeset") else "the subtitles have been read to text")
+        elif fid in rejected and not r.get("typeset"):
+            # Rejection is an OCR verdict. It does not stop a burn, so it is
+            # only a hold on the files whose next step was the OCR.
+            r["status"], r["status_why"] = "held", \
+                "subtitle OCR was rejected for this file"
+        elif not enabled_for(r.get("library")):
+            r["status"], r["status_why"] = "held", \
+                f"subtitle OCR is switched off for {r.get('library') or 'this library'}"
+        else:
+            r["status"], r["status_why"] = "eligible", \
+                ("waiting for a burn to be planned" if r.get("typeset")
+                 else "waiting for the next OCR sweep")
+
+
 def shape_rows(limit: int = 60) -> dict:
     """Recorded verdicts, newest first, with the numbers behind each one."""
     from .db import cursor
@@ -2570,6 +2638,7 @@ def shape_rows(limit: int = 60) -> dict:
                 d["typeset"] = bool(d["typeset"])
                 d["ep"] = ep_label(d.pop("season", None), d.pop("episode", None))
                 rows.append(d)
+            _annotate_status(cur, rows)
     except Exception:                                        # noqa: BLE001
         pass
     return {"summary": summary, "rows": rows, "live": screen_state()}

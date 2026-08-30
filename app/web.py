@@ -18947,11 +18947,17 @@ function shapeSortBy(key){
   else _shapeSort={key, dir:(key==='title')?1:-1};
   shapeRender();
 }
+// Status sorts by how far along the work is, not by spelling - "done, held,
+// processing, queued" is alphabetical and tells you nothing, whereas grouping
+// the finished at one end and the stuck at the other is the reason to sort by
+// it at all.
+const _SHAPE_STAGE={held:0, eligible:1, queued:2, processing:3, done:4};
 function shapeCmp(a,b){
   const k=_shapeSort.key, d=_shapeSort.dir;
   let x,y;
   if(k==='title'){ x=(a.title||'').toLowerCase(); y=(b.title||'').toLowerCase(); }
   else if(k==='verdict'){ x=a.typeset?1:0; y=b.typeset?1:0; }
+  else if(k==='status'){ x=_SHAPE_STAGE[a.status]??1; y=_SHAPE_STAGE[b.status]??1; }
   else { x=a[k]||0; y=b[k]||0; }
   if(x<y) return -1*d;
   if(x>y) return 1*d;
@@ -18970,6 +18976,22 @@ function shapePoolPill(typeset){
             title="${typeset
               ? 'the signs get burned into the picture, which is an encode'
               : 'the dialogue gets read into text by the OCR'}">${pool}</span>`;
+}
+// WHERE THIS FILE STANDS. Four outcomes, four colours, and the reason on
+// hover - "held" without a why is just a shrug. Deliberately the same family
+// of greens and ambers the rest of the app uses for the same meanings, so a
+// green here means what a green means anywhere else on the page.
+function shapeStatus(r){
+  const st=r.status||'eligible';
+  const c = st==='done'       ? 'var(--ok)'
+          : st==='processing' ? 'var(--acc)'
+          : st==='queued'     ? '#b48bf2'
+          : st==='held'       ? 'var(--warn)'
+          : 'var(--dim)';
+  const dot=`<span style="display:inline-block;width:6px;height:6px;
+     border-radius:50%;background:${c};margin-right:5px;vertical-align:middle
+     ${st==='processing'?';animation:sdotpulse 1.2s ease-in-out infinite':''}"></span>`;
+  return `<span style="color:${c}" title="${esc(r.status_why||'')}">${dot}${st}</span>`;
 }
 function shapeRender(){
   const el=document.getElementById('shapeTblWrap');
@@ -18993,6 +19015,7 @@ function shapeRender(){
       <td style="padding:2px 10px 2px 0;white-space:nowrap;color:${ts?'#e2b341':'#6fd08c'}">
         ${ts?'typeset signs':'dialogue'}</td>
       <td style="padding:2px 10px 2px 0;white-space:nowrap">${shapePoolPill(ts)}</td>
+      <td style="padding:2px 10px 2px 0;white-space:nowrap">${shapeStatus(r)}</td>
       <td class="dim" style="padding:2px 10px 2px 0;white-space:nowrap">
         ${Math.round((r.tall_share||0)*100)}%</td>
       <td class="dim" style="padding:2px 10px 2px 0;white-space:nowrap">
@@ -19007,12 +19030,13 @@ function shapeRender(){
     <div id="shapeScroll" style="max-height:260px;overflow:auto;margin-top:4px"
          onmouseenter="_shapeHover=true" onmouseleave="_shapeHover=false">
       <table style="width:100%;font-size:11.5px;border-collapse:collapse;table-layout:fixed">
-        <colgroup><col style="width:28%"><col style="width:9%"><col style="width:7%">
-          <col style="width:14%"><col style="width:11%"><col style="width:8%">
-          <col style="width:10%"><col style="width:13%"></colgroup>
+        <colgroup><col style="width:23%"><col style="width:8%"><col style="width:6%">
+          <col style="width:12%"><col style="width:10%"><col style="width:12%">
+          <col style="width:7%"><col style="width:9%"><col style="width:13%"></colgroup>
         <thead><tr>
           ${th('title','Title')}${th('ep','Episode')}${th('rel','Track')}
           ${th('verdict','Verdict')}${th('verdict','Goes to')}
+          ${th('status','Status')}
           ${th('tall_share','Tall')}${th('median_h','Median')}${th('at','When')}
         </tr></thead>
         <tbody>${tr}</tbody>
