@@ -537,6 +537,12 @@ async def _startup() -> None:
     # Once a day: are there newer OCR engine builds - see updates_watch().
     asyncio.create_task(_subocr.updates_watch())
     asyncio.create_task(arrhealth.watch())
+    # Twice a day: do nuarr and the arrs still describe the same files? The
+    # check existed before this line did, which meant it only ever ran when
+    # someone opened the page and pressed a button - a thing to remember to
+    # do, for a problem whose whole nature is that it is silent.
+    from . import arrsync as _arrsync
+    asyncio.create_task(_arrsync.watch())
     asyncio.create_task(ffmpeg_update.watch())
     # Notices a GPU driver swap, re-measures NVENC, and hands in-flight encodes
     # back to the queue - see ffmpeg_update.watch_driver().
@@ -2565,6 +2571,17 @@ def _summary_impl():
                               "goto": "/settings#arrs"})
     except Exception:                                    # noqa: BLE001
         pass
+    try:
+        # Records that disagree with the file on disk. Whether this is work
+        # for a person depends on the mode and on whether a correction has
+        # already been refused, so the decision lives in one place next to
+        # the data - see arrsync.attention().
+        from . import arrsync as _as
+        _row = _as.attention()
+        if _row:
+            attention.append(_row)
+    except Exception:                                    # noqa: BLE001
+        pass
     return {"states": states, "disks": disks, "libraries": libs,
             "saved": saved, "attention": attention,
             "errors": errors, "error_kinds": err_kinds,
@@ -4210,6 +4227,33 @@ async def api_arrsync_fix(kinds: str = ""):
     from . import arrsync
     want = [k.strip() for k in kinds.split(",") if k.strip()] or None
     return await arrsync.fix(want)
+
+
+@app.post("/api/arrsync/mode")
+async def api_arrsync_mode(mode: str):
+    """manual waits for Put right; auto corrects on the twice-daily sweep."""
+    import yaml
+    from .config import SETTINGS
+    from . import arrsync
+    mode = (mode or "").strip().lower()
+    if mode not in ("auto", "manual"):
+        raise HTTPException(400, "mode must be auto or manual")
+    p = _config_path()
+    raw = {}
+    if p.exists():
+        try:
+            raw = yaml.safe_load(p.read_text(encoding="utf-8-sig")) or {}
+        except Exception:                                    # noqa: BLE001
+            raw = {}
+    raw["arrsync_mode"] = mode
+    p.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True),
+                 encoding="utf-8")
+    SETTINGS.arrsync_mode = mode
+    joblog.log(f"arr agreement mode set to {mode}"
+               + (" - drift will be corrected as it is found"
+                  if mode == "auto" else
+                  " - drift will be listed and wait for you"), "info")
+    return arrsync.cached()
 
 
 @app.get("/api/arrlang")
@@ -6251,6 +6295,31 @@ def api_attention(limit: int = 400):
             out.append({"source": "arr health", "id": 0, "title": str(w)[:120],
                         "path": "", "detail": "", "goto": "/settings#arrs",
                         "act": ""})
+    except Exception:                                        # noqa: BLE001
+        pass
+    try:
+        # THE SAME TEST THE TILE USED, not a second one that might disagree.
+        # Asking arrsync.attention() first means the panel can never list rows
+        # the tile is not counting, or stay empty while the tile says three.
+        from . import arrsync as _as
+        if _as.attention():
+            fails = _as._CACHE.get("failures") or []
+            for f in fails[:limit]:
+                out.append({"source": "arr disagreement", "id": 0,
+                            "title": f"{f.get('n', 0)} × "
+                                     f"{f.get('check', '')} could not be "
+                                     f"corrected",
+                            "path": "", "detail": f.get("why", ""),
+                            "goto": "/settings#arrsync", "act": ""})
+            if not fails:
+                for r in ((_as._CACHE.get("data") or {})
+                          .get("list") or [])[:limit]:
+                    out.append({"source": "arr disagreement", "id": 0,
+                                "title": os.path.basename(r.get("path") or ""),
+                                "path": r.get("path") or "",
+                                "detail": f"{r.get('check', '')}: the arr's "
+                                          f"record does not match the file",
+                                "goto": "/settings#arrsync", "act": ""})
     except Exception:                                        # noqa: BLE001
         pass
 
@@ -17525,6 +17594,11 @@ function wtab(which){
                    whisper:'whisperPane', plex:'plexPane',
                    ocr:'ocrPane', plexwork:'plexworkPane', ruleschk:'ruleschkPane',
                    process:'processPane', notland:'notlandPane',
+                   // The agreement check lives on the Arrs pane rather than
+                   // one of its own, but the Attention tile has to land ON it
+                   // and not merely near it - a tile that opens a long page
+                   // and leaves you hunting is barely better than no link.
+                   arrsync:'arrsPane',
                    updates:'updPane'};
   const isPane = Object.prototype.hasOwnProperty.call(PANE_OF, which);
   const set = document.getElementById('wSettings');
@@ -17559,6 +17633,24 @@ function wtab(which){
   if(which==='alang'){
     if(hint) hint.textContent='· audio language';
     loadAlang();
+    return;
+  }
+  if(which==='arrsync'){
+    // Arrived from the Attention tile: same pane as 'arrs', but put the card
+    // it was counting in front of you and open its list, because the tile's
+    // number was "which files" and that is the answer.
+    if(hint) hint.textContent='· arr agreement';
+    _asOpen=true;               // set BEFORE the load, which paints when it lands
+    loadArrsTab();              // already pulls the agreement card
+    setTimeout(()=>{
+      const c=document.getElementById('arrSyncBody');
+      if(!c) return;
+      c.scrollIntoView({behavior:'smooth', block:'center'});
+      const box=c.parentElement||c;
+      box.style.transition='box-shadow .4s';
+      box.style.boxShadow='0 0 0 2px var(--acc)';
+      setTimeout(()=>{ box.style.boxShadow=''; }, 1600);
+    }, 120);
     return;
   }
   if(which==='cache'){
@@ -22600,23 +22692,78 @@ function arrSyncPaint(){
       <td class="dim" style="padding:4px 0;font-size:11px">${esc(meta.what)}
         <span style="color:#8fb4d9">${esc(meta.why)}</span></td></tr>`;
   }).join('');
+  // WHAT WOULD NOT GO RIGHT, above everything else. A record that disagrees is
+  // routine; one that refused a correction is not, and burying it under a
+  // thousand routine rows is how it gets missed.
+  const fails=d.failures||[];
+  const nFail=fails.reduce((a,f)=>a+(f.n||0),0);
+  const failBox = nFail ? `
+    <div style="border:1px solid var(--warn);border-radius:5px;padding:6px 9px;
+                margin-bottom:7px;font-size:11.5px;background:#2a1d1233">
+      <b style="color:var(--warn)">${fmt(nFail)} could not be put right</b>
+      <span class="dim"> — these will not clear on their own, in either
+        mode</span>
+      ${fails.map(f=>`<div class="dim" style="font-size:11px;margin-top:2px">
+        ${fmt(f.n||0)} × ${esc((C[f.check]||{}).label||f.check)} — ${
+          esc(f.why||'')}</div>`).join('')}
+    </div>` : '';
+
+  const mode=d.mode||'manual', auto=mode==='auto';
+  // THE MODE IS THE ANSWER TO "WILL THIS FIX ITSELF", so it belongs beside the
+  // button it governs, not on some other page.
+  const modeBox=`
+    <div style="display:flex;gap:7px;align-items:center;font-size:11px;
+                margin-left:auto">
+      <span class="dim">when drift is found</span>
+      <span style="display:inline-flex;border:1px solid var(--line);
+                   border-radius:5px;overflow:hidden">
+        ${['manual','auto'].map(m=>`<button onclick="arrSyncMode('${m}')"
+          title="${m==='auto'
+            ?'Corrections are applied on the twice-daily check. The Attention tile stays quiet about drift, because it is already being handled.'
+            :'Drift is found and listed, and waits for your click. The Attention tile carries the count.'}"
+          style="font-size:11px;padding:2px 10px;border:0;cursor:pointer;
+            background:${mode===m?'var(--acc)':'transparent'};
+            color:${mode===m?'#0b0e13':'var(--dim,#8a97a6)'};
+            font-weight:${mode===m?'600':'400'}">${m}</button>`).join('')}
+      </span>
+    </div>`;
+
   el.innerHTML=`
+    ${failBox}
     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;
                 font-size:11.5px;margin-bottom:6px">
       ${head}
       <span class="dim">of ${fmt(d.checked||0)} files checked${
         d.age_s!=null?` · ${ago(Date.now()/1000-d.age_s)}`:''}</span>
-      <span style="margin-left:auto;display:flex;gap:6px">
-        <button onclick="arrSyncRun()" style="font-size:11px;padding:2px 9px"
-          >Check again</button>
-        ${total?`<button onclick="arrSyncFix()" style="font-size:11px;padding:2px 9px"
-          title="Sets the languages nuarr knows, and asks the arrs to re-read the files for the rest">Put right</button>`:''}
-      </span>
+      ${modeBox}
+    </div>
+    <div class="dim" style="font-size:11px;margin-bottom:6px">${auto
+      ? `Checked every ${d.every_h||12}h and corrected automatically — nothing
+         here is waiting on you, so the Attention tile stays quiet about it.
+         Anything that refuses a correction still gets raised.`
+      : `Checked every ${d.every_h||12}h and left for you to apply. While
+         records disagree the Attention tile carries the count.`}</div>
+    <div style="display:flex;gap:6px;margin-bottom:7px">
+      <button onclick="arrSyncRun()" style="font-size:11px;padding:2px 9px"
+        >Check again</button>
+      ${total?`<button onclick="arrSyncFix()" style="font-size:11px;padding:2px 9px"
+        title="Sets the languages nuarr knows, and asks the arrs to re-read the files for the rest">Put right ${
+          auto?'now':''}</button>`:''}
     </div>
     <table style="width:100%;border-collapse:collapse;font-size:11.5px">${rows}</table>
     <div id="arrSyncList" style="margin-top:8px"></div>
     <div id="arrSyncMsg" class="dim" style="font-size:11.5px;margin-top:5px"></div>`;
   arrSyncListPaint();
+}
+
+async function arrSyncMode(m){
+  const el=document.getElementById('arrSyncMsg');
+  if(el) el.textContent='saving…';
+  try{
+    _arrSync=await (await fetch('/api/arrsync/mode?mode='+encodeURIComponent(m),
+                                {method:'POST'})).json();
+    arrSyncPaint();
+  }catch(e){ if(el) el.textContent='could not change the mode'; }
 }
 
 // ---- the files behind the count ----------------------------------------
@@ -22632,7 +22779,14 @@ const mbytes=b=>{
   if(b>=1048576)    return (b/1048576).toFixed(1)+' MB';
   return (b/1024).toFixed(0)+' KB';
 };
-let _asSort={key:'check', dir:1}, _asHover=false;
+let _asSort={key:'check', dir:1}, _asHover=false, _asOpen=false;
+function arrSyncToggle(){
+  _asOpen=!_asOpen;
+  // Collapsing removes the scroll box without firing mouseleave, which would
+  // leave the pause flag stuck on and freeze the list next time it is opened.
+  _asHover=false;
+  arrSyncListPaint(true);
+}
 function arrSyncSort(k){
   if(_asSort.key===k) _asSort.dir*=-1;
   else _asSort={key:k, dir:(k==='delta')?-1:1};
@@ -22647,7 +22801,9 @@ function arrSyncListPaint(force){
   if(!el||!_arrSync) return;
   const all=(_arrSync.list)||[];
   if(!all.length){ el.innerHTML=''; return; }
-  if(!force && arrSyncPaused()) return;
+  // Only a list being READ can hold up a repaint; a shut one has nothing to
+  // disturb.
+  if(!force && _asOpen && arrSyncPaused()) return;
   const keep=document.getElementById('arrSyncScroll');
   const top=keep?keep.scrollTop:0;
   const C=_arrSync.checks||{};
@@ -22684,30 +22840,54 @@ function arrSyncListPaint(force){
     return `<span class="dim">${esc(String(r.arr||''))}</span> → <b>${
       esc(String(r.actual||''))}</b>`;
   };
+  // SHUT BY DEFAULT. A thousand rows is the answer to "which ones", which is a
+  // question you only sometimes have - and left open it buries the counts, the
+  // mode and the buttons, which are what the card is actually for.
+  const bar=`<div onclick="arrSyncToggle()" style="display:flex;gap:7px;
+      align-items:center;cursor:pointer;user-select:none;padding:4px 8px;
+      font-size:11.5px;background:#161b22;
+      border-bottom:${_asOpen?'1px solid var(--line)':'0'}">
+      <span class="dim" style="display:inline-block;width:9px;
+        transform:rotate(${_asOpen?90:0}deg);transition:transform .15s"
+        >▶</span>
+      <b>${_asOpen?'Hide':'Show'} the ${fmt(all.length)} file${
+        all.length===1?'':'s'}</b>
+      <span class="dim">${_asOpen?'':'— which files, and what changed on each'}</span>
+      ${_asOpen&&arrSyncPaused()?`<span class="dim" style="margin-left:auto">
+        paused while you read — scroll back up to resume</span>`:''}
+    </div>`;
+  if(!_asOpen){
+    el.innerHTML=`<div style="border:1px solid var(--line);border-radius:6px;
+      overflow:hidden">${bar}</div>`;
+    return;
+  }
   el.innerHTML=`
-    <div id="arrSyncScroll" style="max-height:240px;overflow:auto"
-         onmouseenter="_asHover=true" onmouseleave="_asHover=false">
-      <table style="width:100%;font-size:11.5px;border-collapse:collapse;
-                    table-layout:fixed">
-        <colgroup><col style="width:12%"><col style="width:40%">
-          <col style="width:48%"></colgroup>
-        <thead><tr>${th('check','Check')}${th('file','File')}
-          ${th('delta','What changed')}</tr></thead>
-        <tbody>${rows.map(r=>`<tr>
-          <td style="padding:2px 10px 2px 0;white-space:nowrap;color:${
-            r.check==='languages'?'#b48bf2':r.check==='size'?'var(--warn)'
-            :'var(--acc)'}">${esc((C[r.check]||{}).label||r.check)}</td>
-          <td style="padding:2px 10px 2px 0;overflow:hidden;
-                     text-overflow:ellipsis;white-space:nowrap"
-              title="${esc(r.path||'')}">${
-            esc((r.path||'').split('\\').pop())}</td>
-          <td style="padding:2px 0">${changed(r)}</td></tr>`).join('')}</tbody>
-      </table>
-    </div>
-    <div class="dim" style="font-size:10.5px;margin-top:4px">
-      ${fmt(rows.length)} shown${_arrSync.total>rows.length
-        ?` of ${fmt(_arrSync.total)}`:''}${
-        arrSyncPaused()?' · paused while you read — scroll back up to resume':''}
+    <div style="border:1px solid var(--line);border-radius:6px;overflow:hidden">
+      ${bar}
+      <div id="arrSyncScroll" style="max-height:260px;overflow:auto;padding:0 8px"
+           onmouseenter="_asHover=true" onmouseleave="_asHover=false">
+        <table style="width:100%;font-size:11.5px;border-collapse:collapse;
+                      table-layout:fixed">
+          <colgroup><col style="width:12%"><col style="width:40%">
+            <col style="width:48%"></colgroup>
+          <thead><tr>${th('check','Check')}${th('file','File')}
+            ${th('delta','What changed')}</tr></thead>
+          <tbody>${rows.map(r=>`<tr>
+            <td style="padding:2px 10px 2px 0;white-space:nowrap;color:${
+              r.check==='languages'?'#b48bf2':r.check==='size'?'var(--warn)'
+              :'var(--acc)'}">${esc((C[r.check]||{}).label||r.check)}</td>
+            <td style="padding:2px 10px 2px 0;overflow:hidden;
+                       text-overflow:ellipsis;white-space:nowrap"
+                title="${esc(r.path||'')}">${
+              esc((r.path||'').split('\\').pop())}</td>
+            <td style="padding:2px 0">${changed(r)}</td></tr>`).join('')}</tbody>
+        </table>
+      </div>
+      <div class="dim" style="font-size:10.5px;padding:3px 8px 4px;
+                              border-top:1px solid var(--line)">
+        ${fmt(rows.length)} shown${_arrSync.total>rows.length
+          ?` of ${fmt(_arrSync.total)}`:''}
+      </div>
     </div>`;
   const sc=document.getElementById('arrSyncScroll');
   if(sc && top) sc.scrollTop=top;

@@ -273,6 +273,19 @@ class Settings:
     #           never the software's call.
     update_mode: str = "manual"
 
+    # DO NUARR AND THE ARRS STILL AGREE - how the answer gets acted on.
+    # "manual": the drift is found and listed, and Put right waits for you.
+    #           The Attention tile carries the count, because a list nobody
+    #           is told about is a list nobody reads.
+    # "auto":   the same corrections are applied as they are found, and the
+    #           tile stays quiet about them - being told about work that is
+    #           already being done is how a tile stops being believed.
+    # Either way, anything nuarr TRIED and could not fix raises attention:
+    # that is the case where the mode is irrelevant, because no amount of
+    # waiting will clear it.
+    arrsync_mode: str = "manual"
+    arrsync_every_h: int = 12            # hours between agreement checks
+
     # SUBTITLE OCR - the switches behind Settings -> Subtitle OCR. Defaults
     # match the measured thresholds in subocr.py; the page can move them.
     subocr_auto: bool = True             # queue conversions on a schedule

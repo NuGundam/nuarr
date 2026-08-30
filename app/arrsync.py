@@ -30,8 +30,16 @@ from . import joblog
 # Recomputing this walks every arr record: minutes, not milliseconds. The card
 # reads the last answer and asks for a new one on its own schedule.
 _CACHE: dict = {"at": 0.0, "data": None, "running": False,
-                "done": 0, "total": 0, "where": ""}
+                "done": 0, "total": 0, "where": "",
+                # WHAT WAS TRIED AND DID NOT WORK, kept separately from what
+                # was merely found. A disagreement is normal and expected -
+                # nuarr rewrites files, the arrs notice later. A disagreement
+                # that survived a correction attempt is not: something is
+                # wrong that no amount of waiting will fix, and it is the one
+                # case where the mode does not matter.
+                "failures": [], "fixed_at": 0.0, "last_fix": None}
 TTL_S = 1800.0
+EVERY_S = 12 * 3600.0
 
 CHECKS = {
     "languages": {
@@ -217,11 +225,16 @@ async def fix(kinds: list | None = None) -> dict:
     data = await scan()
     kinds = kinds or list(CHECKS)
     out = {"fixed": 0, "refreshed": 0, "failed": 0}
+    failures: list = []
 
     if "languages" in kinds and data["rows"]["languages"]:
         res = await arrlang.fix(data["rows"]["languages"])
         out["fixed"] += res.get("fixed", 0)
         out["failed"] += res.get("failed", 0)
+        if res.get("failed"):
+            failures.append({"check": "languages", "n": res["failed"],
+                             "why": "the arr would not take the language "
+                                    "correction"})
 
     # One refresh per PARENT, not per file: a series with forty stale episodes
     # is one rescan, and forty would be forty times the work for one answer.
@@ -241,14 +254,109 @@ async def fix(kinds: list | None = None) -> dict:
         try:
             await shared_client(cfg).notify_file_changed(int(pid))
             out["refreshed"] += n
-        except Exception:                                    # noqa: BLE001
+        except Exception as e:                               # noqa: BLE001
             out["failed"] += n
+            failures.append({"check": "rescan", "n": n, "arr": arr_name,
+                             "parent_id": pid,
+                             "why": f"{arr_name} refused the re-read request: "
+                                    f"{type(e).__name__}"})
 
+    # THE FAILURES ARE THE POINT, not the successes. Whatever was corrected is
+    # gone from the next scan and needs no memory; what could not be corrected
+    # is the only part a person has to act on, so it is what is kept.
+    _CACHE["failures"] = failures[:200]
+    _CACHE["fixed_at"] = time.time()
+    _CACHE["last_fix"] = dict(out)
     if out["fixed"] or out["refreshed"]:
         joblog.log(f"arr sync: corrected {out['fixed']} language record(s) and "
                    f"asked the arrs to re-read {out['refreshed']} file(s)",
                    "ok")
+    if out["failed"]:
+        joblog.log(f"arr sync: {out['failed']} record(s) could not be put "
+                   f"right - these need a look, they will not clear on their "
+                   f"own", "warn")
     return out
+
+
+def mode() -> str:
+    """"manual" or "auto". Anything unrecognised is manual - never auto."""
+    m = str(getattr(SETTINGS, "arrsync_mode", "manual") or "manual").lower()
+    return "auto" if m == "auto" else "manual"
+
+
+def attention() -> dict | None:
+    r"""What the Attention tile should say about this, or nothing at all.
+
+    THE TILE HAS TO EARN ITS NUMBER. It is read as "things that need you", so
+    every entry has to be something a person can actually do something about,
+    or the number is noise and the tile stops being looked at.
+
+    That splits three ways, and the mode only matters for one of them:
+
+      - Anything nuarr TRIED to correct and could not. A human is needed here
+        whatever the mode, because nothing left running will clear it. Always
+        raised, and raised first - it is the more serious of the two.
+      - Disagreements in MANUAL mode. Real work, waiting on a click. Raised,
+        because a list nobody is told about is a list nobody reads.
+      - Disagreements in AUTO mode. Not raised. They are already being dealt
+        with on the next sweep, and being told about work that is already in
+        hand is exactly how a tile stops being believed - the same mistake as
+        counting findings that had already been fixed.
+    """
+    fails = _CACHE.get("failures") or []
+    n_fail = sum(int(f.get("n") or 0) for f in fails)
+    if n_fail:
+        return {"what": "arr disagreement", "n": n_fail,
+                "note": "could not be put right - needs a look",
+                "goto": "/settings#arrsync"}
+    d = _CACHE.get("data") or {}
+    n = int(d.get("total") or 0)
+    if n and mode() == "manual":
+        return {"what": "arr disagreement", "n": n,
+                "note": "waiting on Put right", "goto": "/settings#arrsync"}
+    return None
+
+
+async def watch() -> None:
+    r"""Re-ask the question on a schedule, and in auto mode act on the answer.
+
+    THE CHECK EXISTED BUT NOTHING RAN IT. It only happened when someone opened
+    the page and pressed a button, which makes it a thing you have to remember
+    to do - and the whole argument for this check is that drift is silent and
+    nobody remembers to look. A question worth asking is worth asking on a
+    timer.
+    """
+    import asyncio
+
+    from . import schedules
+    schedules.register(
+        "arrsync", "Arr agreement check", "Arrs", EVERY_S,
+        what="Compares every arr record against the file nuarr probed, and "
+             "reports where they have drifted apart. In auto mode it also "
+             "corrects what it finds; in manual mode it waits for Put right.")
+    # Not on boot. A start-up already has a scan, the arr clients and the
+    # probe cache to get through, and this walks every title in the library.
+    await asyncio.sleep(600)
+    while True:
+        try:
+            every = max(1.0, float(getattr(SETTINGS, "arrsync_every_h", 12)))
+            await refresh()
+            d = _CACHE.get("data") or {}
+            n = int(d.get("total") or 0)
+            schedules.beat("arrsync",
+                           f"{n} record(s) disagree" if n else "all agreed")
+            if n and mode() == "auto":
+                joblog.log(f"arr sync: {n} record(s) disagree with the file on "
+                           f"disk - correcting them (auto mode)", "info")
+                await fix()
+                # Re-ask straight after, so the panel and the tile show what
+                # the correction actually achieved rather than what it found
+                # before it ran.
+                await refresh()
+        except Exception as e:                               # noqa: BLE001
+            joblog.log(f"arr agreement check: {type(e).__name__}: {e}", "warn")
+            every = 12.0
+        await asyncio.sleep(every * 3600.0)
 
 
 def cached() -> dict:
@@ -258,7 +366,10 @@ def cached() -> dict:
     return {"have": bool(d), "running": bool(_CACHE.get("running")),
             "age_s": (round(time.time() - _CACHE["at"], 1)
                       if _CACHE.get("at") else None),
-            "checks": CHECKS,
+            "checks": CHECKS, "mode": mode(),
+            "every_h": int(getattr(SETTINGS, "arrsync_every_h", 12) or 12),
+            "failures": _CACHE.get("failures") or [],
+            "last_fix": _CACHE.get("last_fix"),
             "progress": {"done": done, "total": total,
                          "where": _CACHE.get("where", ""),
                          # Total grows as each arr is reached, so a fraction
@@ -277,6 +388,15 @@ async def refresh() -> dict:
     try:
         d = await scan()
         _CACHE.update(data=d, at=time.time())
+        # A CLEAN SCAN RETIRES THE FAILURES. They are a record of records that
+        # would not take a correction; if a later scan finds nothing to
+        # correct, whatever they described has resolved - by hand, by the arr
+        # re-reading on its own, or because the file was replaced. Keeping
+        # them would leave the Attention tile holding a number for work that
+        # no longer exists, which is the failure mode this whole tile has
+        # already been fixed for once.
+        if not d.get("total"):
+            _CACHE["failures"] = []
     except Exception as e:                                   # noqa: BLE001
         joblog.log(f"arr sync check: {type(e).__name__}: {e}", "warn")
     finally:
