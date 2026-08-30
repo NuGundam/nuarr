@@ -203,6 +203,14 @@ _KINDS: dict = {"at": 0.0, "data": {}}
 _KINDS_TTL = 900.0
 
 
+# NO LIBRARY-WIDE BACKFILL, DELIBERATELY. Measuring every file that owns an
+# image sub means 5,947 of them here, and the measurement cannot be had without
+# demuxing each container end to end - ~15s for a 2 GB episode read cold, ~25
+# hours for the set. (Warm re-reads finish in under a second, which is exactly
+# how the cost got underestimated the first time: every "fast" sample was a
+# file read moments earlier.) The verdict is only ever consulted for files the
+# OCR sweep is about to act on, so it is measured there, a batch at a time, and
+# the other five thousand are never read at all.
 def warm_caches() -> None:
     """Fill the settings-page caches once, at startup, off the request path.
 
@@ -485,14 +493,87 @@ TYPESET_TALL_FRAC = 0.30      # a bitmap this tall is a canvas, not a line
 TYPESET_SHARE = 0.20          # this many such cues means the track is typeset
 
 
+def _shape_from_headers(sup: str, sample: int = 400) -> dict | None:
+    r"""Bitmap heights straight out of the PGS segment headers. No decode.
+
+    WHY THIS EXISTS. The measurement below asked read_sup() for the display
+    sets and then used nothing but `.shape[0]` off each one - it RLE-decoded
+    megabytes of pixel data to read a number the format writes down in plain
+    bytes. Measured on two Detective Conan tracks: 24.0s and 27.9s to decode,
+    0.01s to parse the headers, identical verdicts. At ~27s a file the check
+    could only ever live inside the OCR job; at 0.01s it can live in the probe,
+    which is the whole point - a typeset file should never enter the OCR queue
+    to begin with.
+
+    A .sup is a flat run of segments:
+        "PG" | PTS(4) | DTS(4) | type(1) | length(2) | payload(length)
+    Two types carry what we need:
+        0x16 PCS - opens with video_width(2), video_height(2)
+        0x15 ODS - object_id(2) version(1) seq_flag(1) data_len(3)
+                   then, when seq_flag has 0x80 set (this is the FIRST packet
+                   of the object), width(2) height(2). Continuation packets
+                   carry no dimensions, which is why the flag is checked -
+                   counting them would score one tall sign as several.
+
+    Returns None rather than a verdict when the file yields nothing parseable,
+    so the caller can fall back to the decoder instead of trusting a guess.
+    """
+    try:
+        import statistics as _st
+        import struct as _sk
+        with open(sup, "rb") as fh:
+            buf = fh.read()
+    except Exception:                                        # noqa: BLE001
+        return None
+    heights, vh, i, n = [], 0, 0, len(buf)
+    while i + 13 <= n:
+        if buf[i:i + 2] != b"PG":
+            # Not a segment boundary. Walking forward a byte at a time is the
+            # honest response to a truncated or padded file - the alternative
+            # is trusting a length field that just proved unreliable.
+            i += 1
+            continue
+        stype = buf[i + 10]
+        slen = _sk.unpack(">H", buf[i + 11:i + 13])[0]
+        p = i + 13
+        if p + slen > n:
+            break                                  # truncated tail, stop here
+        if stype == 0x16 and slen >= 4 and not vh:
+            vh = _sk.unpack(">H", buf[p + 2:p + 4])[0]
+        elif stype == 0x15 and slen >= 11 and buf[p + 3] & 0x80:
+            heights.append(_sk.unpack(">H", buf[p + 9:p + 11])[0])
+        i = p + slen
+    if not heights or not vh:
+        return None
+    hs = [h / vh for h in heights]
+    if sample and len(hs) > sample:
+        hs = hs[::len(hs) // sample or 1]
+    tall = sum(1 for h in hs if h > TYPESET_TALL_FRAC)
+    return {"cues": len(hs), "median_h": round(_st.median(hs), 3),
+            "tall_share": round(tall / len(hs), 3)}
+
+
 def track_shape(sup: str, sample: int = 400) -> dict:
     """Geometry of a PGS track - is it dialogue, or typeset signs?
 
-    Cheap on purpose: decodes the display sets and measures them, no OCR and
-    no GPU, so a planner can ask before committing to an approach.
+    Cheap on purpose: measures the display sets, no OCR and no GPU, so a
+    planner can ask before committing to an approach. The headers answer this
+    on their own; the decoder below is the fallback for a track they cannot
+    describe.
     """
     out = {"cues": 0, "median_h": 0.0, "tall_share": 0.0,
            "typeset": False, "why": ""}
+    fast = _shape_from_headers(sup, sample)
+    if fast:
+        out.update(fast)
+        out["typeset"] = out["tall_share"] >= TYPESET_SHARE
+        out["why"] = (
+            f"{out['tall_share']:.0%} of cues use a bitmap taller than "
+            f"{TYPESET_TALL_FRAC:.0%} of the frame "
+            f"(median {out['median_h']:.0%}) - "
+            + ("typeset signs, which OCR would flatten into text at the bottom"
+               if out["typeset"] else "ordinary dialogue lines"))
+        return out
     try:
         import importlib.util as _il
         import statistics as _st
@@ -567,6 +648,93 @@ def record_shape(file_id: int, rel: int, shape: dict) -> None:
                  shape.get("median_h"), shape.get("tall_share"), time.time()))
     except Exception:                                        # noqa: BLE001
         pass                       # bookkeeping must never fail a conversion
+
+
+def forget_shapes(file_id: int) -> None:
+    r"""Drop this file's shape verdicts. Called when the file has been rewritten.
+
+    THE SAME TRAP audiolang.invalidate() EXISTS FOR. A verdict is recorded
+    against a track NUMBER, and track numbers slide when tracks are dropped -
+    burn a typeset track out of a file and "rel 0 is typeset" now describes
+    whatever moved up into that slot. Left in place it would send a dialogue
+    track to the burner on the next pass. Cheaper to measure again than to
+    reason about which of the old numbers survived.
+    """
+    if not file_id:
+        return
+    try:
+        from .db import cursor
+        with cursor() as cur:
+            cur.execute("DELETE FROM sub_shape WHERE file_id=?",
+                        (int(file_id),))
+    except Exception:                                        # noqa: BLE001
+        pass
+
+
+def measure_file(file_id: int, path: str, probe: dict,
+                 work_root: str | None = None) -> int:
+    r"""Measure every image sub in one file and write the verdicts down.
+
+    This is the probe-time entry point. It costs an extract (~0.3s, a stream
+    copy of one small track) plus a header parse (~0.01s) per image sub, which
+    is what makes it affordable here rather than inside the OCR job - and
+    measuring here is what keeps a typeset file out of the OCR queue entirely.
+
+    Returns how many tracks it measured. Never raises: a file that will not
+    demux is a file with no verdict, which is the same state it was in before.
+    """
+    from .rules import IMAGE_SUB_CODECS       # imported where used, as above
+
+    subs = [s for s in (probe.get("streams") or [])
+            if s.get("codec_type") == "subtitle"]
+    n = 0
+    work = None
+    try:
+        for rel, s in enumerate(subs):
+            if (s.get("codec_name") or "").lower() not in IMAGE_SUB_CODECS:
+                continue
+            if work is None:
+                work = tempfile.mkdtemp(prefix="shape_", dir=work_root or None)
+            try:
+                sup = extract_sup(path, rel, work, f"m{file_id}_{rel}")
+            except Exception:                                # noqa: BLE001
+                continue           # not demuxable - no verdict, no complaint
+            try:
+                record_shape(file_id, rel, track_shape(sup))
+                n += 1
+            finally:
+                try:
+                    os.remove(sup)
+                except OSError:
+                    pass
+    except Exception:                                        # noqa: BLE001
+        pass
+    finally:
+        if work:
+            shutil.rmtree(work, ignore_errors=True)
+    return n
+
+
+def has_shapes(file_id: int) -> bool:
+    r"""Has this file been measured at all? Not the same as "is it typeset".
+
+    typeset_rels() answers with the typeset tracks, so an empty set means
+    EITHER "measured, all dialogue" OR "never looked". Screening treated those
+    as the same thing and re-demuxed every dialogue file on every sweep -
+    fifteen seconds of disk each, every six hours, to re-derive a row that was
+    already sitting in the table. The distinction is the whole difference
+    between measuring once and measuring forever.
+    """
+    if not file_id:
+        return False
+    try:
+        from .db import cursor
+        with cursor() as cur:
+            return cur.execute(
+                "SELECT 1 FROM sub_shape WHERE file_id=? LIMIT 1",
+                (int(file_id),)).fetchone() is not None
+    except Exception:                                        # noqa: BLE001
+        return False
 
 
 def typeset_rels(file_id: int) -> set:
@@ -2253,8 +2421,51 @@ def sweep_pick(limit: int) -> list[dict]:
                 continue
             if select_targets(d, r["library"]):
                 picked.append({"file_id": r["file_id"], "path": r["path"],
-                               "title": r["title"] or ""})
+                               "title": r["title"] or "",
+                               "library": r["library"], "probe": d})
     return picked
+
+
+def screen_for_typeset(pick: dict) -> dict:
+    r"""Measure one candidate before it becomes an OCR job.
+
+    THIS IS THE WHOLE POINT OF MEASURING EARLY. Without it a typeset file takes
+    a slot in the OCR queue, extracts its track, discovers it is signs, and
+    skips - so the panel showed OCR work that was never going to produce an
+    SRT. Asking here means the queue only ever holds files that will convert,
+    and the typeset ones go to the planner, which burns them.
+
+    Bounded by the caller on purpose: the extract has to read the whole
+    container to demux one track (~15s for a 2 GB episode, cold, and no
+    parsing trick avoids the read - a seeked window was tried and changed a
+    verdict, because signs cluster around title cards). At one batch per sweep
+    that is minutes; across the library it would be a day of grinding, which is
+    why this is not a backfill.
+
+    Returns the pick annotated with `typeset_only`, meaning every track that
+    would have been OCR'd is signs. Never raises - an unmeasurable file is
+    simply one we know nothing new about, and it proceeds as before.
+    """
+    out = dict(pick, typeset_only=False, measured=0)
+    fid, probe = pick.get("file_id"), pick.get("probe") or {}
+    try:
+        # has_shapes(), not typeset_rels(): an all-dialogue file has rows but
+        # no typeset ones, and asking the wrong question re-reads it forever.
+        if not has_shapes(fid):
+            out["measured"] = measure_file(fid, pick["path"], probe,
+                                           SETTINGS.cache_dir)
+        known = typeset_rels(fid)
+        if not known:
+            return out
+        # select_targets() returns the tracks OCR would convert, each carrying
+        # its subtitle-relative index. Typeset-only means there is nothing left
+        # for the OCR to do once the signs are set aside.
+        tg = select_targets(probe, pick.get("library")) or []
+        out["typeset_only"] = bool(tg) and all(
+            t.get("rel") in known for t in tg)
+    except Exception:                                        # noqa: BLE001
+        pass
+    return out
 
 
 async def watch() -> None:
@@ -2291,9 +2502,21 @@ async def watch() -> None:
                 if time.time() - _SWEEP["last"] >= every:
                     picked = await asyncio.to_thread(
                         sweep_pick, int(_s("subocr_batch", 20)))
-                    n = 0
+                    n, signs = 0, 0
                     for p in picked:
                         try:
+                            # MEASURE BEFORE QUEUEING, not inside the job. A
+                            # typeset file that reaches the queue only gets
+                            # there to find out it should have been burned.
+                            p = await asyncio.to_thread(screen_for_typeset, p)
+                            if p.get("typeset_only"):
+                                signs += 1
+                                _log.log(
+                                    f"not queueing OCR for {p['title']} - its "
+                                    f"picture subtitles are typeset signs; the "
+                                    f"planner will burn them in instead",
+                                    "info")
+                                continue
                             j = await jobs.enqueue(p["file_id"], p["path"],
                                                    p["title"], kind="sub_ocr",
                                                    priority=90)
@@ -2304,11 +2527,13 @@ async def watch() -> None:
                     _SWEEP["last"] = time.time()
                     _SWEEP["queued_total"] += n
                     schedules.beat("subocr",
-                                   f"queued {n} file(s)" if n
-                                   else "nothing to convert")
-                    if n:
-                        _log.log(f"subtitle OCR sweep queued {n} file(s)",
-                                 "info")
+                                   f"queued {n} file(s)"
+                                   + (f", {signs} for burning" if signs else "")
+                                   if (n or signs) else "nothing to convert")
+                    if n or signs:
+                        _log.log(f"subtitle OCR sweep queued {n} file(s)"
+                                 + (f" and set {signs} aside as typeset signs"
+                                    if signs else ""), "info")
         except Exception as e:                           # noqa: BLE001
             joblog_mod = None
             try:

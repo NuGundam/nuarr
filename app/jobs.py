@@ -788,6 +788,25 @@ def cache_probe(file_id: int, data: dict) -> None:
     except Exception:                                    # noqa: BLE001
         pass
 
+    # THE SUBTITLE SHAPE VERDICTS GO STALE FOR EXACTLY THE SAME REASON.
+    # "rel 0 is typeset" describes a slot, not a track, so a rewrite that drops
+    # a track makes it a lie - and a lie in this direction sends a dialogue
+    # track to the burner. Dropped here; measured again only if this file is
+    # ever picked for OCR.
+    #
+    # THE MEASURING DELIBERATELY DOES NOT HAPPEN HERE. It needs the track
+    # demuxed, which means reading the whole container - ~15s for a 2 GB
+    # episode off a cold spindle - and this runs once per file in the scan
+    # loop. Paying it inline would put a day of reading on the critical path of
+    # a full rescan to answer a question about five thousand files that nothing
+    # will ask. subocr.screen_for_typeset() asks it for the handful of files
+    # the OCR sweep is actually about to queue.
+    try:
+        from . import subocr as _so_probe
+        _so_probe.forget_shapes(file_id)
+    except Exception:                                    # noqa: BLE001
+        pass
+
 
 # ------------------------------------------------------------ dispatch -----
 def track_langs(d: dict, kind: str) -> str:
