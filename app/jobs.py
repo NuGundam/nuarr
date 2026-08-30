@@ -3022,10 +3022,16 @@ async def _sub_ocr(w: Worker, probe_data: dict) -> None:
                         note=f"subtitle OCR skipped: {res.get('why')}"[:300])
             return
 
+        # file_id LAST AND NOT OPTIONAL IN PRACTICE. run_one() defaults it to 0
+        # so the CLI can call it on a loose path, but a job always knows which
+        # row it is working on, and record_shape() writes nothing without it -
+        # omit it here and every typeset verdict this run measures is thrown
+        # away silently, which is exactly what happened the first time.
         res = await asyncio.to_thread(subocr.run_one, job.path, probe_data,
                                       SETTINGS.cache_dir, _prog, True,
                                       lambda p: setattr(w, "proc", p),
-                                      _library_of_file(job.file_id))
+                                      _library_of_file(job.file_id),
+                                      job.file_id)
         w.proc = None
     for n in res.get("notes", []):
         joblog.log(n, "info", job.id)

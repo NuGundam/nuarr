@@ -545,6 +545,9 @@ async def _startup() -> None:
     # backoff - see errorretry.watch().
     from . import errorretry as _errorretry
     asyncio.create_task(_errorretry.watch())
+    # Fill the subtitle/OCR settings caches now rather than making whichever
+    # page is opened first pay for them - see subocr.warm_caches().
+    asyncio.create_task(asyncio.to_thread(_subocr.warm_caches))
     # Silent and request-free until a repo is configured - see updates.watch.
     asyncio.create_task(updates.watch())
     # Stored network shares reconnect at boot: `net use` grants access per

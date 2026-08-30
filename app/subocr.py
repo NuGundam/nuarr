@@ -203,6 +203,32 @@ _KINDS: dict = {"at": 0.0, "data": {}}
 _KINDS_TTL = 900.0
 
 
+def warm_caches() -> None:
+    """Fill the settings-page caches once, at startup, off the request path.
+
+    Both of these are computed lazily by whichever page asks first, and the
+    page that does NOT ask first shows a blank where the numbers belong. The
+    subtitle panel on the codec page appeared empty - "no picture subtitle
+    tracks" on a library with 4,243 of them - until the OCR engines page had
+    been opened, because that page happened to be the one that warmed the
+    cache. Same data, different door, and the door you came through decided
+    whether you saw it.
+
+    Doing it at boot means the first page load of the day is the correct one.
+    Deliberately quiet: a failure here costs a cold cache, nothing more.
+    """
+    try:
+        library_track_kinds(force=True)
+    except Exception:                                        # noqa: BLE001
+        pass
+    try:
+        # The engine probe spawns a child and imports paddle in it; the OCR
+        # page waits on that too.
+        paddle_info()
+    except Exception:                                        # noqa: BLE001
+        pass
+
+
 def library_track_kinds(force: bool = False, blocking: bool = True) -> dict:
     """Per library: how many image, signs, forced and dialogue subs exist.
 
@@ -507,8 +533,20 @@ def record_shape(file_id: int, rel: int, shape: dict) -> None:
     while planning 39,000 files. The OCR pass already pays that cost, so what
     it learned is written down here and decide() reads it for free. A file
     nobody has looked at yet simply has no answer, and nothing changes.
+
+    FILE_ID 0 IS A CALLER BUG, NOT A CASE. There is no row to hang the answer
+    on, so there is nothing to do but return - but returning quietly is how a
+    whole run's worth of measurements went into the bin unnoticed when the
+    subtitle worker forgot to pass job.file_id. Say so, once, loudly enough to
+    find, and let the conversion carry on regardless.
     """
     if not file_id:
+        try:
+            from . import joblog as _jl
+            _jl.log(f"internal: track shape for rel {rel} measured but not "
+                    f"saved - the caller passed no file id", "warn")
+        except Exception:                                    # noqa: BLE001
+            pass
         return
     try:
         from .db import cursor
