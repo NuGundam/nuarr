@@ -405,6 +405,61 @@ def disks(server: str = "") -> dict:
     return dict(hit or {})
 
 
+def infer_viewers(disks: dict) -> dict:
+    r"""Guess which spindle each viewer is reading from. A GUESS, and labelled.
+
+    WHY IT CANNOT BE KNOWN. DrivePool presents a virtual volume and reports its
+    own serial through the share: the same file opened via P:\, via the share
+    and via its PoolPart copy gives 092120B4, 092120B4 and 68F9900E. Two of
+    those are the pool. So nothing the filesystem returns over a share names
+    the disk - it is hidden by design, not by permission.
+
+    WHAT CAN BE SAID. Plex reports what each session is playing and at what
+    bitrate. A stream at 15,784 kbps is about 2.0 MB/s off a disk, and if one
+    spindle is reading at about that rate while that stream plays, it is very
+    probably the one. That is inference, so it is reported as inference - the
+    same footing as the panel's "looks like data moving" pairing.
+
+    Deliberately conservative: a disk must be reading within a wide band of the
+    expected rate, and one disk is claimed per session, best match first. Plex
+    reads ahead in bursts, so the band is generous upward and tight downward -
+    a disk reading far LESS than the stream needs cannot be feeding it.
+    """
+    out = {}
+    try:
+        from . import gate
+        live = [s for s in (gate.plex_live() or [])
+                if float(s.get("kbps") or 0) > 0]
+    except Exception:                                        # noqa: BLE001
+        return out
+    if not live or not disks:
+        return out
+    cands = {k: float(v.get("read_bps") or 0) for k, v in disks.items()}
+    taken = set()
+    # Biggest stream first: it has the strongest signal and the most to lose
+    # from being assigned a disk that a smaller one explains better.
+    for s in sorted(live, key=lambda x: -float(x.get("kbps") or 0)):
+        want = float(s["kbps"]) * 1000.0 / 8.0          # kbps -> bytes/sec
+        best, best_err = None, None
+        for label, rd in cands.items():
+            if label in taken or rd <= 0:
+                continue
+            if rd < want * 0.6 or rd > want * 8.0:
+                continue
+            err = abs(rd - want) / want
+            if best_err is None or err < best_err:
+                best, best_err = label, err
+        if best:
+            taken.add(best)
+            out[best] = {"kbps": float(s["kbps"]),
+                         "bps": cands[best],
+                         "user": str(s.get("user") or ""),
+                         "title": str(s.get("title") or ""),
+                         "err": round(best_err, 3),
+                         "inferred": True}
+    return out
+
+
 def state() -> dict:
     """Everything the UI needs, for every host a library lives on."""
     out = {"hosts": [], "local": True}
@@ -422,5 +477,6 @@ def state() -> dict:
             "age_s": (round(time.time() - d["good_at"], 1)
                       if d.get("good_at") else None),
             "disks": d.get("disks") or {},
+            "viewers": infer_viewers(d.get("disks") or {}),
         })
     return out

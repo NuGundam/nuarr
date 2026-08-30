@@ -10334,12 +10334,12 @@ function hostIoRows(){
   if(!_hostIo || _hostIo.local) return null;
   const h=(_hostIo.hosts||[])[0];
   if(!h || !h.ok) return null;
-  const ds=h.disks||{};
+  const ds=h.disks||{}, vw=h.viewers||{};
   // NO NAME FILTER. The host already decided what belongs here by handing back
   // only its letterless volumes; matching on "NU-DRIVE" would have been one
   // person's labelling baked into everyone's install.
   const rows=Object.keys(ds).map(n=>{
-    const d=ds[n], size=d.size||0, free=d.free||0;
+    const d=ds[n], size=d.size||0, free=d.free||0, v=vw[n];
     return {pool_disk:n, n:null, remote:true,
             total:size, used:Math.max(0,size-free), free:free,
             // Rounded here, like the server rounds its own: the raw quotient
@@ -10348,7 +10348,7 @@ function hostIoRows(){
             pct_used: size ? Math.round((size-free)/size*1000)/10 : 0,
             busy:d.busy||0, io_bps:(d.read_bps||0)+(d.write_bps||0),
             read_bps:d.read_bps||0, write_bps:d.write_bps||0,
-            queue:d.queue||0};
+            queue:d.queue||0, viewer:v||null};
   });
   return rows.length ? rows : null;
 }
@@ -10482,11 +10482,17 @@ function renderDisks(){
   //
   // ONE LIST, used by the rows and by the totals under them. Two lists is how
   // the footer ended up averaging a set the rows were not drawn from.
+  //
+  // view_bps is the INFERRED share: a stream's own bitrate, on the disk whose
+  // read rate best matches it. Carried separately from ext_bps so the chip can
+  // say "about" and the tooltip can say how it was arrived at.
   const _dlList = _remote
     ? _remote.map(r=>({disk:r.pool_disk, busy:r.busy, mine_bps:0,
                        ext_bps:r.io_bps, ext_read_bps:r.read_bps,
                        ext_write_bps:r.write_bps, queue:r.queue,
-                       bps:r.io_bps, hot:r.busy>=85, remote:true}))
+                       bps:r.io_bps, hot:r.busy>=85, remote:true,
+                       view_bps: r.viewer ? r.viewer.kbps*1000/8 : 0,
+                       view_guess: r.viewer || null}))
     : ((_diskLoad.disks)||[]);
   const dl = {};
   _dlList.forEach(x=>{ dl[x.disk]=x; });
@@ -10629,7 +10635,29 @@ guess.">looks like data moving</span>${other.slice(0,3).map(m=>pair(m,'')).join(
       // rather than broken.
       const W = (_plexDetail||{})[d.pool_disk];
       let viewGrp='';
-      if(W && W.viewers){
+      // INFERRED, AND SAID SO. Over a share Plex reports which FILE is playing
+      // but nothing reports which spindle holds it - DrivePool answers with the
+      // pool's own volume serial, so the disk is hidden by design rather than
+      // by permission. What can be done is match the stream's bitrate against
+      // each disk's read rate. The chip carries a tilde and the tooltip leads
+      // with the word "probably", because this is the same kind of claim as the
+      // panel's "looks like data moving" and deserves the same hedging.
+      const VG = L && L.view_guess;
+      if(VG){
+        const bps=(VG.kbps||0)*125;
+        viewGrp = `<span class="io-grp io-view" title="${esc(
+          `probably this disk — ${VG.user||'someone'} is playing `
+          + `${VG.title||'something'} at ${(VG.kbps/1000).toFixed(1)} Mbps, `
+          + `and this spindle is reading ${mbps(VG.bps)}, the closest match of `
+          + `the ${Object.keys((_hostIo.hosts[0]||{}).disks||{}).length} disks.`
+          + `\n\nInferred, not measured: over a share nothing reports which `
+          + `disk a file is on, so this is the bitrate fitting the read rate.`)}"
+          ><span class="io-gl">viewer</span>`
+          + (bps>=1000 ? `<b class="m-view io-v">~${mbps(bps)}</b>`
+                       : '<span class="io-idle">paused</span>')
+          + '</span>';
+      }
+      else if(W && W.viewers){
         // BYTES PER SECOND, not megabits. Plex reports kilobits, and this
         // group sits beside nuarr's and the system's figures which are both
         // bytes off the disk - printing 7.2 next to 0.9 for the same traffic
