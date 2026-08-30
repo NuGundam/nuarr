@@ -18973,6 +18973,19 @@ function shapeCmp(a,b){
   // Stable tiebreak on time, so equal rows do not shuffle between refreshes.
   return ((a.at||0)-(b.at||0))*-1;
 }
+// WHICH POOL THIS VERDICT SENDS THE FILE TO. Colours come from poolColor(),
+// never from a hex typed in here - the comment on that function records that a
+// third hand-rolled copy of these colours is exactly why it exists, and a
+// subocr row that is purple everywhere else must not be purple-ish here.
+function shapePoolPill(typeset){
+  const pool = typeset ? 'encode' : 'subocr';
+  const c = poolColor(pool);
+  return `<span class="pill" style="color:${c};border-color:${c};
+            background:${c}14;font-size:10.5px;padding:1px 8px"
+            title="${typeset
+              ? 'the signs get burned into the picture, which is an encode'
+              : 'the dialogue gets read into text by the OCR'}">${pool}</span>`;
+}
 function shapeRender(){
   const el=document.getElementById('shapeTblWrap');
   if(!el) return;
@@ -18994,6 +19007,7 @@ function shapeRender(){
       <td class="dim" style="padding:2px 10px 2px 0;white-space:nowrap">${r.rel}</td>
       <td style="padding:2px 10px 2px 0;white-space:nowrap;color:${ts?'#e2b341':'#6fd08c'}">
         ${ts?'typeset signs':'dialogue'}</td>
+      <td style="padding:2px 10px 2px 0;white-space:nowrap">${shapePoolPill(ts)}</td>
       <td class="dim" style="padding:2px 10px 2px 0;white-space:nowrap">
         ${Math.round((r.tall_share||0)*100)}%</td>
       <td class="dim" style="padding:2px 10px 2px 0;white-space:nowrap">
@@ -19008,13 +19022,13 @@ function shapeRender(){
     <div id="shapeScroll" style="max-height:260px;overflow:auto;margin-top:4px"
          onmouseenter="_shapeHover=true" onmouseleave="_shapeHover=false">
       <table style="width:100%;font-size:11.5px;border-collapse:collapse;table-layout:fixed">
-        <colgroup><col style="width:34%"><col style="width:10%"><col style="width:8%">
-          <col style="width:16%"><col style="width:9%"><col style="width:11%">
-          <col style="width:12%"></colgroup>
+        <colgroup><col style="width:28%"><col style="width:9%"><col style="width:7%">
+          <col style="width:14%"><col style="width:11%"><col style="width:8%">
+          <col style="width:10%"><col style="width:13%"></colgroup>
         <thead><tr>
           ${th('title','Title')}${th('ep','Episode')}${th('rel','Track')}
-          ${th('verdict','Verdict')}${th('tall_share','Tall')}
-          ${th('median_h','Median')}${th('at','When')}
+          ${th('verdict','Verdict')}${th('verdict','Goes to')}
+          ${th('tall_share','Tall')}${th('median_h','Median')}${th('at','When')}
         </tr></thead>
         <tbody>${tr}</tbody>
       </table>
