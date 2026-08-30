@@ -18938,15 +18938,91 @@ async function loadOcr(){
 // read. A file takes ten to twenty seconds to demux, so a panel that just
 // listed finished rows would be indistinguishable from one that had hung -
 // hence the live line, which names the file currently being read.
-let _shapeTimer=null;
+//
+// THE TABLE HOLDS STILL WHILE YOU ARE READING IT. A 1.5s refresh that rebuilds
+// the rows throws away the scroll position and can reorder what is under the
+// cursor mid-sentence. Scrolling down or hovering pauses the row rebuild; the
+// live line and the counts keep updating regardless, because those are the
+// parts you leave running in the corner of your eye.
+let _shapeTimer=null, _shapeRows=[], _shapeHover=false;
+let _shapeSort={key:'at', dir:-1};
+
+function shapePaused(){
+  const b=document.getElementById('shapeScroll');
+  return _shapeHover || (b && b.scrollTop>4);
+}
+function shapeSortBy(key){
+  // Same column twice reverses it. New column starts descending for the
+  // numbers and the clock (biggest/newest first is the useful end) and
+  // ascending for names, where A-Z is what anyone means by sorted.
+  if(_shapeSort.key===key) _shapeSort.dir*=-1;
+  else _shapeSort={key, dir:(key==='title')?1:-1};
+  shapeRender();
+}
+function shapeCmp(a,b){
+  const k=_shapeSort.key, d=_shapeSort.dir;
+  let x,y;
+  if(k==='title'){ x=(a.title||'').toLowerCase(); y=(b.title||'').toLowerCase(); }
+  else if(k==='verdict'){ x=a.typeset?1:0; y=b.typeset?1:0; }
+  else { x=a[k]||0; y=b[k]||0; }
+  if(x<y) return -1*d;
+  if(x>y) return 1*d;
+  // Stable tiebreak on time, so equal rows do not shuffle between refreshes.
+  return ((a.at||0)-(b.at||0))*-1;
+}
+function shapeRender(){
+  const el=document.getElementById('shapeTblWrap');
+  if(!el) return;
+  const keep=document.getElementById('shapeScroll');
+  const top=keep?keep.scrollTop:0;
+  const rows=_shapeRows.slice().sort(shapeCmp);
+  const arrow=k=>_shapeSort.key===k?(_shapeSort.dir>0?' ▲':' ▼'):'';
+  const th=(k,label,extra)=>`<th onclick="shapeSortBy('${k}')"
+      style="text-align:left;font-weight:600;cursor:pointer;user-select:none;
+             padding:3px 8px 5px 0;position:sticky;top:0;background:var(--bg2,#12161c);
+             ${extra||''}" title="sort by ${label.toLowerCase()}"
+      >${label}<span class="dim">${arrow(k)}</span></th>`;
+  const tr=rows.map(r=>{
+    const ts=r.typeset;
+    return `<tr>
+      <td style="padding:2px 8px 2px 0;overflow:hidden;text-overflow:ellipsis;
+                 white-space:nowrap;max-width:0">${esc(r.title||('file '+r.file_id))}</td>
+      <td class="dim" style="padding:2px 8px 2px 0;white-space:nowrap">${r.rel}</td>
+      <td style="padding:2px 8px 2px 0;white-space:nowrap;color:${ts?'#e2b341':'#6fd08c'}">
+        ${ts?'typeset signs':'dialogue'}</td>
+      <td class="dim" style="padding:2px 8px 2px 0;white-space:nowrap;text-align:right">
+        ${Math.round((r.tall_share||0)*100)}%</td>
+      <td class="dim" style="padding:2px 8px 2px 0;white-space:nowrap;text-align:right">
+        ${Math.round((r.median_h||0)*100)}%</td>
+      <td class="dim" style="padding:2px 0;white-space:nowrap">${ago(r.at)}</td>
+    </tr>`;}).join('');
+  // width:auto on the columns that hold a number or a word, so the title takes
+  // the slack instead of every column stretching to fill the panel.
+  el.innerHTML=`
+    <div id="shapeScroll" style="max-height:260px;overflow:auto;margin-top:4px"
+         onmouseenter="_shapeHover=true" onmouseleave="_shapeHover=false">
+      <table style="width:100%;font-size:11.5px;border-collapse:collapse;table-layout:fixed">
+        <colgroup><col><col style="width:52px"><col style="width:104px">
+          <col style="width:62px"><col style="width:74px"><col style="width:78px"></colgroup>
+        <thead><tr>
+          ${th('title','Title')}${th('rel','Track')}${th('verdict','Verdict')}
+          ${th('tall_share','Tall','text-align:right')}
+          ${th('median_h','Median','text-align:right')}${th('at','When')}
+        </tr></thead>
+        <tbody>${tr}</tbody>
+      </table>
+    </div>`;
+  const sc=document.getElementById('shapeScroll');
+  if(sc && top) sc.scrollTop=top;
+}
 async function shapeLoad(){
   const el=document.getElementById('shapeBody');
   if(!el){ if(_shapeTimer) clearTimeout(_shapeTimer); _shapeTimer=null; return; }
   let d;
-  try{ d=await fetch('/api/subocr/shapes?limit=60').then(r=>r.json()); }
+  try{ d=await fetch('/api/subocr/shapes?limit=200').then(r=>r.json()); }
   catch(e){ el.innerHTML='<span class="dim" style="font-size:11.5px">could not load</span>'; return; }
   const s=d.summary||{}, live=d.live||{}, rows=d.rows||[];
-  const busy=!!live.now;
+  const busy=!!live.now, held=shapePaused();
   const head = busy
     ? `<div style="display:flex;gap:8px;align-items:center;font-size:11.5px">
          <span class="spin" style="width:11px;height:11px"></span>
@@ -18955,39 +19031,31 @@ async function shapeLoad(){
        </div>`
     : `<div class="dim" style="font-size:11.5px">not reading anything right now</div>`;
   const counts = `
-    <div style="display:flex;gap:14px;flex-wrap:wrap;margin:7px 0 4px;font-size:11.5px">
+    <div style="display:flex;gap:14px;flex-wrap:wrap;margin:7px 0 4px;font-size:11.5px;
+                align-items:center">
       <span><b>${s.files||0}</b> <span class="dim">files measured</span></span>
       <span style="color:#e2b341"><b>${s.typeset||0}</b> <span class="dim">typeset — burned in</span></span>
       <span style="color:#6fd08c"><b>${s.dialogue||0}</b> <span class="dim">dialogue — read as text</span></span>
+      <span id="shapeHold" class="dim" style="font-size:11px;${held?'':'display:none'}">
+        · paused while you read — scroll back to the top to resume</span>
     </div>`;
+  // First build, or the row area is missing: lay the panel out. After that
+  // only the head and counts are rewritten, so the table keeps its scroll.
+  if(!document.getElementById('shapeTblWrap')){
+    el.innerHTML=`<div id="shapeHead"></div><div id="shapeTblWrap"></div>
+      <div class="dim" style="font-size:11px;margin-top:6px">
+        A track counts as typeset when more than 20% of its cues use a bitmap
+        taller than 30% of the frame — tall bitmaps are signs and song
+        captions laid over the picture, not lines of dialogue.</div>`;
+  }
+  document.getElementById('shapeHead').innerHTML=head+counts;
   if(!rows.length){
-    el.innerHTML=head+counts+`<div class="dim" style="font-size:11.5px">
-      Nothing measured yet — the first files get read when the next OCR sweep
-      picks them up.</div>`;
+    document.getElementById('shapeTblWrap').innerHTML=
+      `<div class="dim" style="font-size:11.5px">Nothing measured yet — the
+       first files get read when the next OCR sweep picks them up.</div>`;
   }else{
-    // The numbers are shown, not just the verdict: a wrong call is only
-    // arguable-with if you can see how close to the line it was.
-    const tr=rows.map(r=>{
-      const ts=r.typeset;
-      return `<tr>
-        <td style="padding:2px 8px 2px 0">${esc(r.title||('file '+r.file_id))}</td>
-        <td class="dim" style="padding:2px 8px 2px 0;white-space:nowrap">track ${r.rel}</td>
-        <td style="padding:2px 8px 2px 0;white-space:nowrap;color:${ts?'#e2b341':'#6fd08c'}">
-          ${ts?'typeset signs':'dialogue'}</td>
-        <td class="dim" style="padding:2px 8px 2px 0;white-space:nowrap">
-          ${Math.round((r.tall_share||0)*100)}% tall</td>
-        <td class="dim" style="padding:2px 8px 2px 0;white-space:nowrap">
-          median ${Math.round((r.median_h||0)*100)}%</td>
-        <td class="dim" style="padding:2px 0;white-space:nowrap">${ago(r.at)}</td>
-      </tr>`;}).join('');
-    el.innerHTML=head+counts+
-      `<div style="max-height:260px;overflow:auto;margin-top:4px">
-         <table style="width:100%;font-size:11.5px;border-collapse:collapse">${tr}</table>
-       </div>
-       <div class="dim" style="font-size:11px;margin-top:6px">
-         A track counts as typeset when more than 20% of its cues use a bitmap
-         taller than 30% of the frame — tall bitmaps are signs and song
-         captions laid over the picture, not lines of dialogue.</div>`;
+    _shapeRows=rows;
+    if(!held) shapeRender();
   }
   if(_shapeTimer) clearTimeout(_shapeTimer);
   _shapeTimer=setTimeout(shapeLoad, busy?1500:15000);
