@@ -2163,6 +2163,7 @@ def api_arrguard():
             # instead of shipping one machine's profile names as a constant.
             "split_profiles": arrguard.targets_2160(),
             "anime_formats": arrguard.anime_formats(),
+            "trash_autoadd": gate.get_toggle("arrs.trash_autoadd"),
             "defaults": {"split_profiles": arrguard.DEFAULT_TARGET_2160,
                          "anime_formats": arrguard.DEFAULT_ANIME_FORMATS}}
 
@@ -2184,6 +2185,30 @@ async def api_arrguard_names(job: str, body: dict = Body(...)):
                f"radarr {len(saved['radarr'])}, sonarr {len(saved['sonarr'])}",
                "info")
     return {"job": job, "saved": saved}
+
+
+@app.post("/api/arrguard/trash/add")
+async def api_arrguard_trash_add(body: dict = Body(None)):
+    """Create the listed new anime formats in the arrs. Empty body = all new.
+
+    Adds the FORMAT only, with no score and no profile membership, so nothing
+    downloads differently until you score it.
+    """
+    from . import arrguard
+    names = None
+    if body and (body.get("radarr") or body.get("sonarr")):
+        names = {"radarr": list(body.get("radarr") or []),
+                 "sonarr": list(body.get("sonarr") or [])}
+    return {"result": await arrguard.add_formats(names)}
+
+
+@app.post("/api/arrguard/trash/autoadd")
+def api_arrguard_trash_autoadd(on: int = 1):
+    """Let the sync add new guide formats by itself. Off by default."""
+    gate.set_toggle("arrs.trash_autoadd", bool(on))
+    joblog.log(f"TRaSH anime sync: auto-add turned {'ON' if on else 'off'}",
+               "info")
+    return {"on": bool(on)}
 
 
 @app.get("/api/arrguard/choices")
@@ -21190,7 +21215,47 @@ async function loadArrsTab(){
       </div>
       ${(!(ed.names.radarr||[]).length && !(ed.names.sonarr||[]).length)
         ? `<div class="warn" style="font-size:11px;margin-top:4px">${esc(ed.empty)}</div>`:''}
+      ${ed.adder||''}
     </div>`;
+  // NEW FORMATS THE GUIDES HAVE AND YOUR ARR DOES NOT. The sync only ever
+  // listed these, which was the right default and also meant adding fifteen
+  // of them was fifteen trips through the arr's own UI. Ticked list + one
+  // button, or the auto pill to stop being asked.
+  const newFmts=(st)=>{
+    const list=(st.new_formats||[]);
+    const autoOn=!!d.trash_autoadd;
+    const pill=`<span class="pill ${autoOn?'p-ok':'p-dim'}" style="cursor:pointer"
+        title="${autoOn?'new formats are added automatically on each sync'
+                      :'new formats are only listed; you add them'}"
+        onclick="arrsAutoAdd(${autoOn?0:1})">auto-add ${autoOn?'ON':'off'}</span>`;
+    if(!list.length)
+      return `<div style="margin-top:8px;border-top:1px solid var(--line);padding-top:8px;
+           display:flex;gap:10px;align-items:center">
+        <span class="dim" style="font-size:11px">nothing in the guides that your arrs are missing</span>
+        <span style="margin-left:auto">${pill}</span></div>`;
+    return `<div style="margin-top:8px;border-top:1px solid var(--line);padding-top:8px">
+      <div style="display:flex;gap:10px;align-items:center">
+        <span style="font-size:11px;font-weight:600">In the guides, not in your arrs (${list.length})</span>
+        <span style="margin-left:auto">${pill}</span>
+      </div>
+      <div class="dim" style="font-size:11px;margin:3px 0 5px">
+        Adds the format only — no score, no profile — so nothing downloads
+        differently until you score it yourself.</div>
+      <div style="max-height:150px;overflow:auto;border:1px solid var(--line);border-radius:6px">
+        ${list.map(x=>{
+          const p=String(x).split(': '); const arr=p[0], nm=p.slice(1).join(': ');
+          return `<label style="display:flex;gap:8px;align-items:center;padding:3px 9px;
+              font-size:11px;cursor:pointer">
+            <input type="checkbox" data-newfmt="${esc(arr)}" value="${esc(nm)}" checked>
+            <span class="dim" style="width:46px;flex:none">${esc(arr)}</span>
+            <span>${esc(nm)}</span></label>`;}).join('')}
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;margin-top:6px">
+        <button style="font-size:11px" onclick="arrsAddNew()">Add ticked to the arrs</button>
+        <span id="addmsg" class="dim" style="font-size:11px"></span>
+      </div>
+    </div>`;
+  };
   const job=(id,title,desc,on,st,ed)=>`
     <div style="border:1px solid var(--line);border-radius:8px;padding:10px 14px;margin-bottom:10px">
       <div style="display:flex;align-items:center;gap:10px">
@@ -21205,7 +21270,7 @@ async function loadArrsTab(){
         ${st.last_run?`last run ${new Date(st.last_run*1000).toLocaleString()} — ${esc(st.last_result||'')}`
                      :'<span class="dim">has not run yet</span>'}
         ${on&&st.next_run?`<div class="dim">next ~${new Date(st.next_run*1000).toLocaleTimeString()}</div>`:''}
-        ${(st.new_formats&&st.new_formats.length)?`<div class="dim" style="margin-top:4px">new in the guides: ${esc(st.new_formats.join(', '))}</div>`:''}
+        ${(st.new_formats&&st.new_formats.length&&!ed)?`<div class="dim" style="margin-top:4px">new in the guides: ${esc(st.new_formats.join(', '))}</div>`:''}
         ${(st.detail&&st.detail.length)?`<div class="dim" style="margin-top:4px">${st.detail.map(x=>esc(x)).join('<br>')}</div>`:''}
       </div>
       ${editor(ed)}
@@ -21251,7 +21316,8 @@ async function loadArrsTab(){
         d.toggles.trash_anime, t,
         {label:'Formats to keep in sync', kind:'trash_anime',
          names:d.anime_formats||{},
-         empty:'none listed — every anime format the guides publish that already exists in the arr'});
+         empty:'none listed — every anime format the guides publish that already exists in the arr',
+         adder:newFmts(t)});
   loadHookState();
 }
 async function arrsToggle(job,on){
@@ -21351,6 +21417,32 @@ function arrsPickAll(kind, arr, on){
   document.querySelectorAll(`[data-pick="${kind}|${arr}"]`)
     .forEach(c=>{ c.checked=!!on; });
   arrsPickSync(kind, arr);
+}
+async function arrsAutoAdd(on){
+  if(on && !confirm('Let the TRaSH sync add new anime formats to Radarr and '
+    +'Sonarr by itself?\n\nIt adds the format only — no score, no profile — so '
+    +'nothing downloads differently until you score it. You can turn this off '
+    +'again at any time.')) return;
+  try{ await fetch(`/api/arrguard/trash/autoadd?on=${on?1:0}`,{method:'POST'}); }
+  catch(e){}
+  loadArrsTab();
+}
+async function arrsAddNew(){
+  const body={radarr:[], sonarr:[]};
+  document.querySelectorAll('[data-newfmt]').forEach(c=>{
+    if(c.checked && body[c.dataset.newfmt]) body[c.dataset.newfmt].push(c.value);
+  });
+  const n=body.radarr.length+body.sonarr.length;
+  if(!n){ const m=document.getElementById('addmsg');
+          if(m) m.innerHTML='<span class="warn">nothing ticked</span>'; return; }
+  const m=document.getElementById('addmsg');
+  if(m) m.textContent=`adding ${n}…`;
+  try{
+    const r=await (await fetch('/api/arrguard/trash/add',{method:'POST',
+      headers:{'content-type':'application/json'}, body:JSON.stringify(body)})).json();
+    if(m) m.innerHTML=`<span class="ok">${esc(r.result||'done')}</span>`;
+  }catch(e){ if(m) m.innerHTML='<span class="err">could not add</span>'; return; }
+  setTimeout(()=>arrsRun('trash_anime'), 900);   // re-list so the panel clears
 }
 
 // ---- MKVToolNix ----------------------------------------------------------

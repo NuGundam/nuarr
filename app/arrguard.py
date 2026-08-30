@@ -210,6 +210,93 @@ async def _trash_fetch(kind: str) -> dict[str, dict]:
         return out
 
 
+def _norm_specs(specs: list) -> list:
+    r"""TRaSH's spec shape -> the arr's.
+
+    The guides publish a specification's fields as an OBJECT:
+
+        "fields": {"value": "\\b(Anime[ .-]?Heart)\\b"}
+
+    Radarr and Sonarr want a LIST of named fields:
+
+        "fields": [{"name": "value", "value": "\\b(Anime[ .-]?Heart)\\b"}]
+
+    Posting the guides' shape straight through returns a 400 naming the exact
+    conversion it could not do, which is how this was found. Normalising here
+    rather than at each call site because the update path sends the same
+    payload and would hit the same wall the first time a spec had to change.
+    """
+    out = []
+    for s in specs or []:
+        s = dict(s)
+        f = s.get("fields")
+        if isinstance(f, dict):
+            s["fields"] = [{"name": k, "value": v} for k, v in f.items()]
+        out.append(s)
+    return out
+
+
+async def add_formats(names: dict | None = None) -> str:
+    """CREATE anime formats the guides publish but this arr does not have.
+
+    The sync deliberately never invented formats: updating a rule you already
+    chose to run is a different act from adding one you have never seen, and
+    doing the second silently would mean the guides could change what your
+    library downloads without anyone deciding to let them. So new ones were
+    only ever LISTED - which is right, and also meant adding fifteen of them
+    was fifteen trips through the arr's own UI.
+
+    This adds them on request. Two ways in, both explicit:
+      * the button, with the names ticked (names={"radarr": [...], ...})
+      * the auto toggle, which passes names=None to mean "everything new"
+
+    It creates the FORMAT only, never touches a quality profile, and never
+    gives it a score. A format with no score changes nothing about what gets
+    downloaded until somebody scores it - so this is reversible by ignoring
+    it, which is the property that makes automating it defensible at all.
+    """
+    added, errs = [], []
+    for cfg in SETTINGS.arrs:
+        if not cfg.enabled or cfg.kind not in ("radarr", "sonarr"):
+            continue
+        want = None if names is None else set(names.get(cfg.kind) or [])
+        if want is not None and not want:
+            continue
+        try:
+            trash = await _trash_fetch(cfg.kind)
+        except Exception as e:                               # noqa: BLE001
+            errs.append(f"TRaSH fetch ({cfg.kind}): {type(e).__name__}")
+            continue
+        c = shared_client(cfg)
+        try:
+            mine = {f["name"] for f in await c._get("/customformat")}
+        except Exception as e:                               # noqa: BLE001
+            errs.append(f"{cfg.name}: {type(e).__name__}")
+            continue
+        for name, tcf in trash.items():
+            if name in mine:
+                continue                      # already there: not this job
+            if want is not None and name not in want:
+                continue
+            body = {"name": name,
+                    "includeCustomFormatWhenRenaming": False,
+                    "specifications": _norm_specs(
+                        tcf.get("specifications") or [])}
+            try:
+                await c._post("/customformat", body)
+                added.append(f"{cfg.name}/{name}")
+                joblog.log(f"TRaSH anime sync: added custom format {name!r} to "
+                           f"{cfg.name} (no score - it does nothing until you "
+                           f"give it one)", "info")
+            except Exception as e:                           # noqa: BLE001
+                errs.append(f"{name}: {type(e).__name__}")
+    msg = (f"added {len(added)}: {', '.join(added[:6])}" if added
+           else "nothing to add")
+    if errs:
+        msg += f"; errors: {', '.join(errs[:3])}"
+    return msg
+
+
 def _spec_key(cf: dict):
     """Comparable shape of a format's matching rules, order-insensitive."""
     out = []
@@ -244,16 +331,22 @@ async def run_trash() -> str:
             errs.append(f"{cfg.name}: {type(e).__name__}")
             continue
         for name, tcf in trash.items():
-            if keep and name not in keep:
-                continue
             if name not in mine:
+                # DISCOVERY IS NOT FILTERED, on purpose. The keep-list says
+                # which formats to keep UPDATED; applying it here as well
+                # meant that naming any formats silently switched off the
+                # "new in the guides" report - a filter quietly disabling a
+                # different feature. You still get told what exists; whether
+                # to add it stays your call.
                 new_fmts.append(f"{cfg.kind}: {name}")
                 continue
+            if keep and name not in keep:
+                continue                      # not one you asked to track
             cur = mine[name]
             if _spec_key(cur) == _spec_key(tcf):
                 continue
             body = dict(cur)
-            body["specifications"] = tcf["specifications"]
+            body["specifications"] = _norm_specs(tcf["specifications"])
             body["includeCustomFormatWhenRenaming"] = cur.get(
                 "includeCustomFormatWhenRenaming", False)
             try:
@@ -263,12 +356,25 @@ async def run_trash() -> str:
                            f"{name!r} on {cfg.name}", "info")
             except Exception as e:
                 errs.append(f"{name}: {type(e).__name__}")
+    # AUTO-ADD, if it has been switched on. Off by default and separate from
+    # the sync's own toggle: keeping an existing format current is a much
+    # smaller decision than letting the guides add formats to your arr.
+    auto_msg = ""
+    if new_fmts:
+        from .gate import get_toggle
+        if get_toggle("arrs.trash_autoadd"):
+            try:
+                auto_msg = "; auto-add: " + await add_formats(None)
+                new_fmts = []               # they exist now, not "new"
+            except Exception as e:                           # noqa: BLE001
+                auto_msg = f"; auto-add failed: {type(e).__name__}"
     STATS["trash"].update(last_run=time.time(), updated=len(updated),
                           new_formats=sorted(set(new_fmts))[:20])
     msg = (f"updated {len(updated)}: {', '.join(updated[:6])}" if updated
            else "all anime formats match the guides")
     if new_fmts:
         msg += f"; {len(set(new_fmts))} new in the guides (not auto-added)"
+    msg += auto_msg
     if errs:
         msg += f"; errors: {', '.join(errs[:4])}"
     STATS["trash"]["last_result"] = msg
