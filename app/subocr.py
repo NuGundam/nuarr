@@ -1168,7 +1168,8 @@ def ffmpeg_sub_args(src_probe: dict, pend: list[dict],
 
 
 def produce(path: str, probe: dict, file_id: int, work_root: str | None = None,
-            on_progress=None, library: str | None = None) -> dict:
+            on_progress=None, library: str | None = None,
+            skip_rels: set | None = None) -> dict:
     """OCR only. Writes SRTs to the pending area and mNothing else.
 
     Split out from run_one so the expensive half can happen once, up front,
@@ -1179,7 +1180,7 @@ def produce(path: str, probe: dict, file_id: int, work_root: str | None = None,
     """
     res = run_one(path, probe, work_root, on_progress, mux=False,
                   file_id=file_id,
-                  library=library)
+                  library=library, skip_rels=skip_rels)
     if not res.get("ok"):
         return res
     d = pending_dir(file_id, work_root)
@@ -1199,13 +1200,21 @@ def produce(path: str, probe: dict, file_id: int, work_root: str | None = None,
 
 def run_one(path: str, probe: dict, work_root: str | None = None,
             on_progress=None, mux: bool = True, on_child=None,
-            library: str | None = None, file_id: int = 0) -> dict:
+            library: str | None = None, file_id: int = 0,
+            skip_rels: set | None = None) -> dict:
     """Convert every eligible track and produce a new file. Replaces nothing.
 
     The caller commits, so this inherits the Plex gate, the disk pacing and
     the DrivePool-aware move rather than reimplementing them badly.
+
+    `skip_rels` is for tracks the CALLER already knows the fate of - in
+    practice the one a burn is about to fold into the picture. Filtering here
+    rather than at the call site matters because this function re-selects its
+    own targets, so a caller that filtered its copy of the list would watch
+    this one pick the track straight back up.
     """
-    targets = select_targets(probe, library)
+    targets = [t for t in (select_targets(probe, library) or [])
+               if not skip_rels or t.get("rel") not in skip_rels]
     if not targets:
         return {"ok": False, "why": "no English non-signs image sub to convert"}
     _TLS.on_child = on_child          # this thread's children only; see _TLS

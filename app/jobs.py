@@ -3157,10 +3157,30 @@ async def _transcode(w: Worker, probe_data: dict) -> None:
         if stage:
             w.sub_ocr_stage = stage
 
+    # DO NOT OCR THE TRACK THIS JOB IS BURNING IN. When the plan burns a
+    # typeset track, that track is about to become part of the picture and its
+    # separate copy is dropped - so reading it into text produces an SRT with
+    # nowhere to go. The waste is not free either: produce() still extracts the
+    # whole PGS and measures it before track_shape() says "typeset, skip", so
+    # every burn encode was paying for an extraction it could never use.
+    _burn_rel = None
+    try:
+        _ks = list(job.plan.keep_subs or [])
+        if job.plan.burn_image and job.plan.burn_index is not None and _ks:
+            _burn_rel = _ks[job.plan.burn_index]
+    except Exception:                                        # noqa: BLE001
+        _burn_rel = None
+
     try:
         from . import subocr as _so_pre
+        _targets = [t for t in (_so_pre.select_targets(probe_data) or [])
+                    if _burn_rel is None or t.get("rel") != _burn_rel]
+        if _burn_rel is not None and not _targets:
+            joblog.log(f"not reading subtitle track {_burn_rel} into text - "
+                       f"this job is burning it into the picture", "info",
+                       job.id)
         if (not _so_pre.pending_for(job.file_id, SETTINGS.cache_dir)
-                and _so_pre.select_targets(probe_data)):
+                and _targets):
             if not _side_ocr_allowed():
                 # Not a failure and not worth queueing behind: the subtitle
                 # backlog already owns this file and will reach it. Better a
@@ -3177,7 +3197,8 @@ async def _transcode(w: Worker, probe_data: dict) -> None:
                 _sub_task = asyncio.create_task(asyncio.to_thread(
                     _so_pre.produce, job.path, probe_data, job.file_id,
                     SETTINGS.cache_dir, _sub_tick,
-                    _library_of_file(job.file_id)))
+                    _library_of_file(job.file_id),
+                    {_burn_rel} if _burn_rel is not None else None))
     except Exception as e:
         joblog.log(f"could not start the side OCR (continuing without): "
                    f"{type(e).__name__}: {e}", "warn", job.id)
