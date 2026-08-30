@@ -91,22 +91,46 @@ try {
   if (-not $s) { throw "could not open a CIM session over WinRM or DCOM" }
   # Capacity comes from the same call that gives the label, so the table can
   # be the same table: size, used and free per spindle, not just "busy".
+  # WHICH VOLUMES ARE POOL MEMBERS. Not "the ones called NU-DRIVE" - that is
+  # one person's labelling and would show nothing on anyone else's machine.
+  # A pooled disk is mounted WITHOUT a drive letter; the pool itself, the
+  # system disk and any ordinary volume all have one. So: letterless, and with
+  # a size. On this host that is exactly the twelve, and excludes C, D, E, F
+  # and the P: pool volume without naming any of them.
   $vols  = Get-CimInstance -CimSession $s -Namespace root/Microsoft/Windows/Storage `
-             -ClassName MSFT_Volume | Where-Object { $_.FileSystemLabel }
+             -ClassName MSFT_Volume |
+           Where-Object { -not $_.DriveLetter -and [double]$_.Size -gt 0 }
   $cap = @{}
   foreach ($v in $vols) {
-    if ($v.Size) {
-      $cap[$v.FileSystemLabel] = @{ size = [double]$v.Size
-                                    free = [double]$v.SizeRemaining }
-    }
+    $cap[$v.Path] = @{ size  = [double]$v.Size
+                       free  = [double]$v.SizeRemaining
+                       label = $v.FileSystemLabel }
   }
+  # DATA PARTITIONS ONLY. Letterless is the right test for "pooled", but it
+  # also catches the EFI system partition and the reserved/recovery ones -
+  # every disk has them, they are letterless and unlabelled, and they would
+  # have appeared as "Disk 12" at 85% busy holding no space. Windows already
+  # marks them: IsSystem for EFI, IsHidden for reserved. A size threshold would
+  # have worked here and broken on a small pool disk somewhere else.
   $parts = Get-CimInstance -CimSession $s -Namespace root/Microsoft/Windows/Storage `
-             -ClassName MSFT_Partition
-  $map = @{}
+             -ClassName MSFT_Partition |
+           Where-Object { -not $_.IsSystem -and -not $_.IsBoot -and -not $_.IsHidden }
+  # disk number -> the name to show. The volume's own label when it has one,
+  # otherwise "Disk N" from the number Windows gives it, so an unlabelled pool
+  # still lists twelve distinguishable disks rather than twelve blanks.
+  $map = @{}; $capByDisk = @{}
   foreach ($p in $parts) {
     foreach ($ap in @($p.AccessPaths)) {
-      $v = $vols | Where-Object { $_.Path -eq $ap }
-      if ($v) { $map[[string]$p.DiskNumber] = $v.FileSystemLabel }
+      # A partition can report a null access path - a recovery partition, or
+      # one Windows has not surfaced. ContainsKey($null) throws rather than
+      # returning false, which failed the whole sample over a disk nobody
+      # asked about.
+      if ($ap -and $cap.ContainsKey($ap)) {
+        $c = $cap[$ap]
+        $name = if ($c.label) { $c.label } else { "Disk $($p.DiskNumber)" }
+        $map[[string]$p.DiskNumber] = $name
+        $capByDisk[[string]$p.DiskNumber] = $c
+      }
     }
   }
   $perf = Get-CimInstance -CimSession $s -ClassName Win32_PerfFormattedData_PerfDisk_PhysicalDisk |
@@ -116,7 +140,7 @@ try {
     $idx = ($d.Name -split '\s+')[0]
     $label = $map[$idx]
     if (-not $label) { continue }
-    $c = $cap[$label]
+    $c = $capByDisk[$idx]
     $out[$label] = @{
       busy  = [math]::Round(100 - [double]$d.PercentIdleTime, 1)
       read  = [double]$d.DiskReadBytesPersec

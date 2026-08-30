@@ -10332,11 +10332,17 @@ function hostIoRows(){
   const h=(_hostIo.hosts||[])[0];
   if(!h || !h.ok) return null;
   const ds=h.disks||{};
-  const rows=Object.keys(ds).filter(n=>/^NU-DRIVE/i.test(n)).map(n=>{
+  // NO NAME FILTER. The host already decided what belongs here by handing back
+  // only its letterless volumes; matching on "NU-DRIVE" would have been one
+  // person's labelling baked into everyone's install.
+  const rows=Object.keys(ds).map(n=>{
     const d=ds[n], size=d.size||0, free=d.free||0;
     return {pool_disk:n, n:null, remote:true,
             total:size, used:Math.max(0,size-free), free:free,
-            pct_used: size ? (size-free)/size*100 : 0,
+            // Rounded here, like the server rounds its own: the raw quotient
+            // printed as "53.68304107847117% full", which is a number pretending
+            // to a precision the disk does not have.
+            pct_used: size ? Math.round((size-free)/size*1000)/10 : 0,
             busy:d.busy||0, io_bps:(d.read_bps||0)+(d.write_bps||0),
             read_bps:d.read_bps||0, write_bps:d.write_bps||0,
             queue:d.queue||0};
@@ -10350,6 +10356,15 @@ function hostIoHtml(){
     esc(h.server)}${h.via?` <span class="dim">${esc(h.via)}</span>`:''}</span>
     <span style="font-size:11px;color:${col||'var(--dim)'}">${txt}</span></div>`;
   if(!h.ok){
+    // A FIRST LOOK IS NOT A FAILURE. The opening fetch returns before any
+    // sample exists, so the panel announced "could not read the host's disks"
+    // about a host it had not finished asking - and then contradicted itself a
+    // second later with twelve rows. No answer yet is its own state.
+    if(!h.why && h.have_creds){
+      return note(`<span class="spin" style="width:10px;height:10px;`
+        +`display:inline-block;vertical-align:-1px;margin-right:5px"></span>`
+        +`checking the host's disks…`);
+    }
     return note(h.have_creds
       ? esc(h.why||"could not read the host's disks")
       : 'no credentials stored for this host — add them under Libraries to see '
@@ -10456,21 +10471,22 @@ function renderDisks(){
   // how busy is the spindle, including everything nuarr is not doing. Our own
   // counters show a disk under a 4K direct play or a backup as completely
   // idle, which is exactly when you most want to see it.
-  const dl = {};
-  ((_diskLoad.disks)||[]).forEach(x=>{ dl[x.disk]=x; });
   // Remote spindles arrive in the same shape, so every chip below renders
   // unchanged. mine_bps is ZERO ON PURPOSE and not a placeholder: nuarr knows
   // which bytes are its own by having started them, and over a share it starts
   // none on any particular spindle - DrivePool chooses. So all of it is
   // "everything else", which is exactly what the bar will say.
-  if(_remote){
-    _remote.forEach(r=>{
-      dl[r.pool_disk] = {disk:r.pool_disk, busy:r.busy, mine_bps:0,
-                         ext_bps:r.io_bps, ext_read_bps:r.read_bps,
-                         ext_write_bps:r.write_bps, queue:r.queue,
-                         bps:r.io_bps, hot:r.busy>=85, remote:true};
-    });
-  }
+  //
+  // ONE LIST, used by the rows and by the totals under them. Two lists is how
+  // the footer ended up averaging a set the rows were not drawn from.
+  const _dlList = _remote
+    ? _remote.map(r=>({disk:r.pool_disk, busy:r.busy, mine_bps:0,
+                       ext_bps:r.io_bps, ext_read_bps:r.read_bps,
+                       ext_write_bps:r.write_bps, queue:r.queue,
+                       bps:r.io_bps, hot:r.busy>=85, remote:true}))
+    : ((_diskLoad.disks)||[]);
+  const dl = {};
+  _dlList.forEach(x=>{ dl[x.disk]=x; });
 
   // COLUMNS THAT DROP IN A CHOSEN ORDER, rather than whichever one runs out of
   // room. Six columns plus a progress bar in a half-width panel does not fit
@@ -10787,8 +10803,10 @@ The bar splits it by share of bytes moved — nuarr ${share(mine)}%, everything 
     // pool totals, so you can see the whole array at a glance
     +`<tbody class="dgrp dpool">
       <tr>
-        <td class="mono"><b>POOL</b></td><td class="num"><b>${fmt(
-          rows.reduce((a,d)=>a+(d.n||0),0))}</b></td>
+        <td class="mono"><b>POOL</b></td><td class="num"><b>${
+          rows.length && rows.every(d=>d.n==null)
+            ? '<span class="dim">—</span>'
+            : fmt(rows.reduce((a,d)=>a+(d.n||0),0))}</b></td>
         <td class="num dcol-size"><b>${gb(tot)}</b></td>
         <td class="num dcol-used"><b>${gb(usd)}</b></td>
         <td class="dcol-bar"><div class="bar"><i style="width:${tot?(usd/tot*100).toFixed(1):0}%;
@@ -10800,7 +10818,11 @@ The bar splits it by share of bytes moved — nuarr ${share(mine)}%, everything 
         <td class="num dcol-free"><b>${gb(fre)}</b></td></tr>
       <tr class="iorow"><td colspan="6"><div class="diskio">${(()=>{
             const r=(_lastIo||{}).read_bps||0, w=(_lastIo||{}).write_bps||0;
-            const L=(_diskLoad.disks)||[];
+            // The totals row summarises the column above it, so it has to read
+            // the SAME list the rows did. It was reading _diskLoad directly,
+            // which on a networked pool is empty - twelve busy percentages
+            // above a blank average.
+            const L=_dlList;
             const nh=L.filter(x=>x.hot).length;
             const ext=L.reduce((a,x)=>a+(x.ext_bps||0),0);
             const jobs=((_lastIo||{}).by_disk||[])
