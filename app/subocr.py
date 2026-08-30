@@ -2601,6 +2601,77 @@ def screen_state() -> dict:
     return st
 
 
+def _status_of(typeset: bool, library, live, done_kinds, rejected: bool):
+    r"""Where one measured file stands. THE ONLY definition of that.
+
+    Extracted because the panel shows this per row and the summary counts it
+    across the whole library, and two copies of a rule like this drift - the
+    header would end up disagreeing with the rows directly beneath it.
+    """
+    want = "transcode" if typeset else "sub_ocr"
+    if live and live.get("state") == "running":
+        return "processing", f"a {live.get('kind')} job is running now"
+    if live:
+        return "queued", f"a {live.get('kind')} job is waiting its turn"
+    if want in (done_kinds or ()):
+        return "done", ("the signs have been burned into the picture"
+                        if typeset else "the subtitles have been read to text")
+    if rejected and not typeset:
+        # Rejection is an OCR verdict. It does not stop a burn, so it is only
+        # a hold on the files whose next step was the OCR.
+        return "held", "subtitle OCR was rejected for this file"
+    if not enabled_for(library):
+        return "held", (f"subtitle OCR is switched off for "
+                        f"{library or 'this library'}")
+    return "eligible", ("waiting for a burn to be planned" if typeset
+                        else "waiting for the next OCR sweep")
+
+
+def status_counts(cur) -> dict:
+    r"""How every measured file stands, not just the page being shown.
+
+    The rows on screen are the newest sixty; counting their statuses would
+    describe the window rather than the work. One file counts once - a file
+    with a typeset track and a dialogue track is one file, and it is counted
+    by the track that still has something to do.
+    """
+    out = {"processing": 0, "queued": 0, "done": 0, "eligible": 0, "held": 0}
+    try:
+        rows = [dict(r) for r in cur.execute(
+            "SELECT s.file_id, MAX(s.typeset) AS ts, f.library, "
+            "       COALESCE(f.subocr_state,'') AS sst "
+            "  FROM sub_shape s JOIN files f ON f.id = s.file_id "
+            " WHERE f.state NOT IN ('deleted','duplicate') "
+            " GROUP BY s.file_id")]
+        if not rows:
+            return out
+        ids = [r["file_id"] for r in rows]
+        marks = ",".join("?" * len(ids))
+        live, done = {}, {}
+        for j in cur.execute(
+                f"SELECT file_id, kind, state FROM jobs "
+                f"WHERE file_id IN ({marks}) "
+                f"  AND state IN ('running','queued')", ids):
+            d = dict(j)
+            if d["state"] == "running" or d["file_id"] not in live:
+                live[d["file_id"]] = d
+        for j in cur.execute(
+                f"SELECT DISTINCT file_id, kind FROM jobs "
+                f"WHERE file_id IN ({marks}) AND state='done'", ids):
+            d = dict(j)
+            done.setdefault(d["file_id"], set()).add(d["kind"])
+        for r in rows:
+            st, _ = _status_of(
+                typeset=bool(r["ts"]), library=r["library"],
+                live=live.get(r["file_id"]),
+                done_kinds=done.get(r["file_id"], ()),
+                rejected=r["sst"] == "rejected")
+            out[st] = out.get(st, 0) + 1
+    except Exception:                                        # noqa: BLE001
+        pass
+    return out
+
+
 def _annotate_status(cur, rows: list) -> None:
     r"""Add where each measured file stands: held, eligible, queued, done...
 
@@ -2642,31 +2713,11 @@ def _annotate_status(cur, rows: list) -> None:
     except Exception:                                        # noqa: BLE001
         return
     for r in rows:
-        fid = r.get("file_id")
-        want = "transcode" if r.get("typeset") else "sub_ocr"
-        cur_job = live.get(fid)
-        if cur_job and cur_job["state"] == "running":
-            r["status"], r["status_why"] = "processing", \
-                f"a {cur_job['kind']} job is running now"
-        elif cur_job:
-            r["status"], r["status_why"] = "queued", \
-                f"a {cur_job['kind']} job is waiting its turn"
-        elif want in last_done.get(fid, ()):
-            r["status"], r["status_why"] = "done", (
-                "the signs have been burned into the picture"
-                if r.get("typeset") else "the subtitles have been read to text")
-        elif fid in rejected and not r.get("typeset"):
-            # Rejection is an OCR verdict. It does not stop a burn, so it is
-            # only a hold on the files whose next step was the OCR.
-            r["status"], r["status_why"] = "held", \
-                "subtitle OCR was rejected for this file"
-        elif not enabled_for(r.get("library")):
-            r["status"], r["status_why"] = "held", \
-                f"subtitle OCR is switched off for {r.get('library') or 'this library'}"
-        else:
-            r["status"], r["status_why"] = "eligible", \
-                ("waiting for a burn to be planned" if r.get("typeset")
-                 else "waiting for the next OCR sweep")
+        r["status"], r["status_why"] = _status_of(
+            typeset=bool(r.get("typeset")), library=r.get("library"),
+            live=live.get(r.get("file_id")),
+            done_kinds=last_done.get(r.get("file_id"), ()),
+            rejected=r.get("file_id") in rejected)
 
 
 def shape_rows(limit: int = 60) -> dict:
@@ -2678,12 +2729,26 @@ def shape_rows(limit: int = 60) -> dict:
             summary["files"] = cur.execute(
                 "SELECT COUNT(DISTINCT file_id) n FROM sub_shape"
             ).fetchone()["n"]
+            # FILES, LIKE EVERY OTHER NUMBER ON THIS LINE. These counted rows -
+            # tracks - while "files measured" and the status counts beside them
+            # count files. They agree today only because every measured file
+            # happens to have exactly one picture-subtitle track; a file with
+            # two would put two different scales in one sentence. Partitioned
+            # the same way status_counts() groups, so the three totals always
+            # add up: a file with any typeset track is a typeset file.
             summary["typeset"] = cur.execute(
-                "SELECT COUNT(*) n FROM sub_shape WHERE typeset=1"
+                "SELECT COUNT(*) n FROM (SELECT file_id FROM sub_shape "
+                " GROUP BY file_id HAVING MAX(typeset)=1)"
             ).fetchone()["n"]
             summary["dialogue"] = cur.execute(
-                "SELECT COUNT(*) n FROM sub_shape WHERE typeset=0"
+                "SELECT COUNT(*) n FROM (SELECT file_id FROM sub_shape "
+                " GROUP BY file_id HAVING MAX(typeset)=0)"
             ).fetchone()["n"]
+            summary["status"] = status_counts(cur)
+            # When the newest verdict was written - "measured 85 files" says
+            # nothing about whether that was five minutes or five weeks ago.
+            r = cur.execute("SELECT MAX(at) a FROM sub_shape").fetchone()
+            summary["last_at"] = (r["a"] or 0) if r else 0
             for r in cur.execute(
                     "SELECT s.file_id, s.rel, s.typeset, s.median_h, "
                     "       s.tall_share, s.at, f.title, f.library, "

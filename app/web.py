@@ -19368,15 +19368,35 @@ async function shapeLoad(){
          </div>
        </div>`
     : `<div class="dim" style="font-size:11.5px">not reading anything right now</div>`;
+  // COUNTED ACROSS EVERYTHING MEASURED, not across the rows on screen - the
+  // table shows the newest sixty, and counting those would describe the
+  // window rather than the work.
+  const st=s.status||{};
+  const done=st.done||0, tot=s.files||0;
+  const stChip=(k,label,col)=>(st[k]
+    ? `<span style="color:${col}"><b>${fmt(st[k])}</b>
+         <span class="dim">${label}</span></span>` : '');
   const counts = `
     <div style="display:flex;gap:14px;flex-wrap:wrap;margin:7px 0 4px;font-size:11.5px;
                 align-items:center">
-      <span><b>${s.files||0}</b> <span class="dim">files measured</span></span>
-      <span style="color:#e2b341"><b>${s.typeset||0}</b> <span class="dim">typeset — burned in</span></span>
-      <span style="color:#6fd08c"><b>${s.dialogue||0}</b> <span class="dim">dialogue — read as text</span></span>
+      <span><b>${fmt(tot)}</b> <span class="dim">files measured</span></span>
+      <span style="color:#e2b341"><b>${fmt(s.typeset||0)}</b> <span class="dim">typeset — burned in</span></span>
+      <span style="color:#6fd08c"><b>${fmt(s.dialogue||0)}</b> <span class="dim">dialogue — read as text</span></span>
+      <span class="dim">·</span>
+      <span style="color:var(--ok)"><b>${fmt(done)}</b>
+        <span class="dim">of ${fmt(tot)} done${
+          tot?` (${Math.round(done/tot*100)}%)`:''}</span></span>
+      ${stChip('processing','processing','var(--acc)')}
+      ${stChip('queued','queued','#b48bf2')}
+      ${stChip('eligible','waiting','var(--dim)')}
+      ${stChip('held','held','var(--warn)')}
       <span id="shapeHold" class="dim" style="font-size:11px;${held?'':'display:none'}">
         · paused while you read — scroll back to the top to resume</span>
-    </div>`;
+    </div>
+    <div class="dim" style="font-size:10.5px;margin:-1px 0 4px">
+      ${s.last_at?`newest verdict ${ago(s.last_at)}`
+                 :'nothing measured yet'}${
+        live.last?` · last read finished ${ago(live.last)}`:''}</div>`;
   // First build, or the row area is missing: lay the panel out. After that
   // only the head and counts are rewritten, so the table keeps its scroll.
   if(!document.getElementById('shapeTblWrap')){
