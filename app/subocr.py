@@ -2892,9 +2892,16 @@ async def watch() -> None:
                                     f"planner will burn them in instead",
                                     "info")
                                 continue
+                            # SAY WHO ASKED. enqueue() defaults source to
+                            # "manual", so every file this sweep queued was
+                            # labelled as though a person had clicked it -
+                            # wrong in the queue's Source column, and wrong
+                            # under "clear all queued", where clearing the
+                            # automatic work would leave the sweep's own jobs
+                            # behind as if they were hand-picked.
                             j = await jobs.enqueue(p["file_id"], p["path"],
                                                    p["title"], kind="sub_ocr",
-                                                   priority=90)
+                                                   priority=90, source="auto")
                             if j:
                                 n += 1
                         except Exception:                # noqa: BLE001
