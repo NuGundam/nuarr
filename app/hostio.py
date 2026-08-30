@@ -55,13 +55,33 @@ $server = $env:NUARR_HOSTIO_SERVER
 $user   = $env:NUARR_HOSTIO_USER
 $pw = [Console]::In.ReadLine()
 try {
+  $cred = $null
   if ($user) {
     $sec  = ConvertTo-SecureString $pw -AsPlainText -Force
     $cred = New-Object System.Management.Automation.PSCredential($user, $sec)
-    $s = New-CimSession -ComputerName $server -Credential $cred -OperationTimeoutSec 20
-  } else {
-    $s = New-CimSession -ComputerName $server -OperationTimeoutSec 20
   }
+  # WSMAN FIRST, DCOM WHEN IT REFUSES. WinRM will not carry NTLM to a machine
+  # that is not domain-joined unless TrustedHosts names it or the transport is
+  # HTTPS - the exact refusal a workgroup server gives, and not something worth
+  # loosening a security setting to satisfy. CIM speaks DCOM as well, which
+  # needs neither, so the modern transport is tried and the older one catches
+  # the case it cannot serve. Which one answered is reported, because "it
+  # works" and "it works over DCOM" are different facts about a network.
+  $s = $null; $via = ''
+  $mk = {
+    param($opt, $name)
+    try {
+      $sess = if ($cred) {
+        New-CimSession -ComputerName $server -Credential $cred -SessionOption $opt -OperationTimeoutSec 15 -ErrorAction Stop
+      } else {
+        New-CimSession -ComputerName $server -SessionOption $opt -OperationTimeoutSec 15 -ErrorAction Stop
+      }
+      $script:s = $sess; $script:via = $name
+    } catch { }
+  }
+  & $mk (New-CimSessionOption -Protocol Wsman) 'WinRM'
+  if (-not $s) { & $mk (New-CimSessionOption -Protocol Dcom) 'DCOM' }
+  if (-not $s) { throw "could not open a CIM session over WinRM or DCOM" }
   $vols  = Get-CimInstance -CimSession $s -Namespace root/Microsoft/Windows/Storage `
              -ClassName MSFT_Volume | Where-Object { $_.FileSystemLabel }
   $parts = Get-CimInstance -CimSession $s -Namespace root/Microsoft/Windows/Storage `
@@ -88,7 +108,7 @@ try {
     }
   }
   Remove-CimSession $s
-  @{ ok = $true; disks = $out } | ConvertTo-Json -Depth 5 -Compress
+  @{ ok = $true; via = $via; disks = $out } | ConvertTo-Json -Depth 5 -Compress
 } catch {
   @{ ok = $false; why = $_.Exception.Message } | ConvertTo-Json -Compress
 }
@@ -181,7 +201,7 @@ def _sample(server: str) -> dict:
                             "queue": float(v.get("queue") or 0)}
         except Exception:                                    # noqa: BLE001
             continue
-    return {"ok": True, "disks": disks}
+    return {"ok": True, "disks": disks, "via": str(d.get("via") or "")}
 
 
 def refresh(server: str) -> None:
@@ -197,6 +217,7 @@ def refresh(server: str) -> None:
             _CACHE[server] = {"at": time.time(),
                               "disks": res.get("disks") or {},
                               "ok": bool(res.get("ok")),
+                              "via": res.get("via") or "",
                               "why": res.get("why") or ""}
             _INFLIGHT.discard(server)
 
@@ -234,6 +255,7 @@ def state() -> dict:
             "server": s,
             "have_creds": bool(user),
             "ok": bool(d.get("ok")),
+            "via": d.get("via") or "",
             "why": d.get("why") or "",
             "age_s": round(time.time() - d["at"], 1) if d.get("at") else None,
             "disks": d.get("disks") or {},

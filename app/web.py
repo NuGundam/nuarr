@@ -10344,9 +10344,13 @@ function hostIoHtml(){
       </span>`;
     };
     return `<div class="xfer">
-      <span class="xlbl" title="Read from ${esc(h.server)} over CIM. These are
-the host's own disk counters — the same numbers it would show locally.">on
-        ${esc(h.server)}</span>${names.map(cell).join('')}
+      <span class="xlbl" title="Read from ${esc(h.server)} over ${
+        esc(h.via||'CIM')} — the host's own disk counters, the same numbers it
+would show locally.${h.via==='DCOM'
+          ? ' WinRM refused, which is normal for a server that is not domain-joined; DCOM needs no TrustedHosts entry.'
+          : ''}">on ${esc(h.server)}${
+        h.via?` <span class="dim">${esc(h.via)}</span>`:''}</span>${
+        names.map(cell).join('')}
       <span class="dim" style="font-size:10.5px;margin-left:6px"
         title="From outside, a busy spindle is just busy: only the machine
 running the jobs knows which bytes are its own and which are a viewer.">busy
