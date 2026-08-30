@@ -1481,13 +1481,22 @@ def _verify_missing_sync(arr_files, status, on_disk=None) -> dict:
         for a in arr_files:
             if not a.path:
                 continue
-            if on_disk is not None and os.path.normcase(a.path) in on_disk:
+            # ASK ABOUT THE PATH WE CAN REACH. a.path is the arr's spelling,
+            # and on a machine that reaches the library by another road it
+            # names nothing: the walk set is keyed on what nuarr walked, and
+            # os.path.exists() on P:\... is False when the drive letter only
+            # exists where Sonarr runs. Both tests then said "missing" about
+            # 243 files that were plainly there, the healer found them on the
+            # row's own path and healed them, and the pair flip-flopped every
+            # couple of minutes. Translate once, ask both questions properly.
+            probe_path = pathmap.to_local(a.path)
+            if on_disk is not None and pathmap._norm(probe_path) in on_disk:
                 continue
             # Either there is no walk set, or the set says this path is absent.
             # Both cases need the filesystem's answer before anything is marked
             # missing, because that is what starts the healer.
             stats_done += 1
-            if os.path.exists(a.path):
+            if os.path.exists(probe_path):
                 continue
             row = by_key.get((a.arr_name, a.file_id))
             if row:
@@ -1631,12 +1640,20 @@ def _verify_unmanaged_sync(arr_files, status) -> dict:
                 # cannot be adopted automatically" underneath "linked by
                 # unmanaged verify" - the record of a failure sitting next to
                 # the success that ended it.
+                # TAKE THE TITLE TOO. Linking copied the ids and nothing else,
+                # so 243 freshly-linked files stayed "(untitled)" - in the
+                # activity list, in the queue, and in every log line about
+                # them, which made a working pipeline unreadable. The arr knows
+                # what they are called; this is the moment it is being asked.
                 cur.execute(
                     "UPDATE files SET arr_name=?, arr_file_id=?, arr_parent_id=?,"
+                    " title=COALESCE(NULLIF(?,''), title),"
+                    " season=COALESCE(?, season), episode=COALESCE(?, episode),"
                     " adopt_state=NULL, adopt_attempts=0, adopt_last_at=NULL,"
                     " state_reason='linked by unmanaged verify', updated_at=? "
                     "WHERE id=?",
-                    (hit.arr_name, hit.file_id, hit.parent_id, now, r["id"]))
+                    (hit.arr_name, hit.file_id, hit.parent_id,
+                     hit.title or "", hit.season, hit.episode, now, r["id"]))
                 linked += 1
                 continue
             d = os.path.dirname(pathmap._norm(r["path"] or ""))
