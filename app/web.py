@@ -19379,13 +19379,13 @@ async function shapeLoad(){
   const counts = `
     <div style="display:flex;gap:14px;flex-wrap:wrap;margin:7px 0 4px;font-size:11.5px;
                 align-items:center">
-      <span><b>${fmt(tot)}</b> <span class="dim">files measured</span></span>
-      <span style="color:#e2b341"><b>${fmt(s.typeset||0)}</b> <span class="dim">typeset — burned in</span></span>
-      <span style="color:#6fd08c"><b>${fmt(s.dialogue||0)}</b> <span class="dim">dialogue — read as text</span></span>
-      <span class="dim">·</span>
       <span style="color:var(--ok)"><b>${fmt(done)}</b>
         <span class="dim">of ${fmt(tot)} done${
           tot?` (${Math.round(done/tot*100)}%)`:''}</span></span>
+      <span class="dim">·</span>
+      <span><b>${fmt(tot)}</b> <span class="dim">files measured</span></span>
+      <span style="color:#e2b341"><b>${fmt(s.typeset||0)}</b> <span class="dim">typeset — burned in</span></span>
+      <span style="color:#6fd08c"><b>${fmt(s.dialogue||0)}</b> <span class="dim">dialogue — read as text</span></span>
       ${stChip('processing','processing','var(--acc)')}
       ${stChip('queued','queued','#b48bf2')}
       ${stChip('eligible','waiting','var(--dim)')}
