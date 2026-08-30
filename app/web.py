@@ -2565,6 +2565,23 @@ def _summary_impl():
                               "goto": "/settings#arrs"})
     except Exception:                                    # noqa: BLE001
         pass
+    try:
+        # STUCK FILES ARE ATTENTION. The tile sums everything that wants a
+        # human, and a file whose last attempt failed and which nothing has
+        # since put right is the plainest example there is - it was the one
+        # source the tile did not count, so "nothing needs attention" could sit
+        # above thirteen files that had been stuck for weeks.
+        nl = _rows("SELECT COUNT(*) n FROM files f "
+                   " WHERE f.state NOT IN ('deleted','duplicate') "
+                   "   AND (SELECT j.state FROM jobs j WHERE j.file_id = f.id "
+                   "         ORDER BY j.id DESC LIMIT 1) "
+                   "       IN ('failed','blocked')")
+        if nl and nl[0]["n"]:
+            attention.append({"what": "still not landed", "n": int(nl[0]["n"]),
+                              "note": "last attempt failed, nothing fixed it",
+                              "goto": "/settings#notland"})
+    except Exception:                                    # noqa: BLE001
+        pass
     return {"states": states, "disks": disks, "libraries": libs,
             "saved": saved, "attention": attention,
             "errors": errors, "error_kinds": err_kinds,
