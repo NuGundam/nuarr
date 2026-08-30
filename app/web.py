@@ -4198,6 +4198,42 @@ def api_pipeline(file_id: int = 0):
     return out
 
 
+@app.get("/api/pipeline/random")
+def api_pipeline_random():
+    r"""One file for the auto tour, biased toward interesting journeys.
+
+    A uniform pick over 39,000 files would show the same shape every time -
+    the overwhelming majority went straight through with nothing to do, which
+    is true and dull. Preferring files that actually have a job history, and
+    now and then one with a subtitle measurement, means the tour demonstrates
+    the branches rather than the trunk.
+    """
+    import random
+    from .db import cursor
+    with cursor() as cur:
+        pool = []
+        try:
+            if random.random() < 0.45:
+                pool = [r[0] for r in cur.execute(
+                    "SELECT file_id FROM sub_shape "
+                    "ORDER BY RANDOM() LIMIT 1")]
+            if not pool:
+                pool = [r[0] for r in cur.execute(
+                    "SELECT j.file_id FROM jobs j JOIN files f "
+                    "ON f.id=j.file_id "
+                    "WHERE f.state NOT IN ('deleted','duplicate') "
+                    "  AND j.state IN ('done','failed','blocked') "
+                    "ORDER BY RANDOM() LIMIT 1")]
+            if not pool:
+                pool = [r[0] for r in cur.execute(
+                    "SELECT id FROM files "
+                    "WHERE state NOT IN ('deleted','duplicate') "
+                    "ORDER BY RANDOM() LIMIT 1")]
+        except Exception:                                    # noqa: BLE001
+            pool = []
+    return {"file_id": pool[0] if pool else 0}
+
+
 @app.get("/api/pipeline/find")
 def api_pipeline_find(q: str = "", limit: int = 12):
     """Files matching a title fragment, for the trace picker."""
@@ -9471,6 +9507,15 @@ input[type=time]::-webkit-calendar-picker-indicator{filter:invert(.75);cursor:po
        rule-check findings and unresolved audio languages live in other
        tables and simply never appeared. Each row here names the file, says
        what is wrong in words, and links to the page that can fix it. -->
+  <!-- WHAT IS HAPPENING RIGHT NOW. Every other tile counts things at rest;
+       this one counts things in motion, so it carries a percentage and an ETA
+       rather than a total. It reads /api/jobs/live, the same feed the worker
+       cards use, so the tile and the cards cannot disagree. -->
+  <div class="panel" id="runPanel" style="display:none">
+    <h2><span>Being processed now</span>
+        <span class="live"><a href="#" onclick="document.getElementById('runPanel').style.display='none';return false">close</a></span></h2>
+    <div id="runBody" class="scrollbox nohz" style="max-height:420px"></div>
+  </div>
   <div class="panel" id="attnPanel" style="display:none">
     <h2><span>Needs attention</span>
         <span class="live"><a href="#" onclick="document.getElementById('attnPanel').style.display='none';return false">close</a></span></h2>
@@ -10065,7 +10110,14 @@ async function loadAll(){
       {unmanaged:1,t:'Unmanaged'});
   add('Extras (kept)',fmt(s.extras.n),gb(s.extras.bytes)+' OP/ED, specials, bonus',
       {extras:1,t:'Extras'});
+  // PROCESSING NOW. Placed last because it is the only tile about motion
+  // rather than a standing total, and it is filled from the live feed a beat
+  // later - loadAll() has not fetched it yet, and blocking the whole tile row
+  // on a second request to show one card would be the wrong trade.
+  add('Processing now', _runN===null?'—':fmt(_runN),
+      _runSub||'nothing running', {running:1, t:'Being processed now'});
   document.getElementById('cards').innerHTML=c.join('');
+  runTilePaint();
   // pulse only the tiles whose number moved
   [['Total files',s.totals.n],['Eligible',(byState.eligible||{}).n||0],
    ['Held (new)',(byState.new||{}).n||0],
@@ -10732,7 +10784,79 @@ function attnPaint(){
   b.innerHTML=h;
 }
 
+// ---- the "processing now" tile -----------------------------------------
+// Fed by the same /api/jobs/live payload the worker cards already poll, so
+// there is no second request and no way for the tile to disagree with the
+// cards below it. paintRunning() hands the payload here - both the fast poll
+// and the full one land there, so the tile keeps up at 750ms without adding
+// a request of its own.
+let _runN=null, _runSub='', _runJobs=[];
+function runTileFeed(live){
+  const rows=(live&&live.running)||[];
+  _runJobs=rows;
+  _runN=rows.length;
+  if(!rows.length){ _runSub='nothing running'; runTilePaint(); return; }
+  // Name the furthest along, since that is the one about to change.
+  const lead=rows.slice().sort((a,b)=>(b.progress||0)-(a.progress||0))[0];
+  const pct=Math.round((lead.progress||0)*100);
+  const eta=lead.eta_s?` · ${hms(lead.eta_s)} left`:'';
+  _runSub=`${esc(lead.pool||lead.kind||'job')} ${pct}%${eta}`;
+  runTilePaint();
+}
+function runTilePaint(){
+  const card=document.querySelector('.card[data-k="Processing now"]');
+  if(card){
+    const v=card.querySelector('.v'), s=card.querySelector('.s');
+    if(v) v.textContent=_runN===null?'—':fmt(_runN);
+    if(s) s.innerHTML=_runSub||'nothing running';
+  }
+  const p=document.getElementById('runPanel');
+  if(p && p.style.display!=='none') runPanelPaint();
+}
+function runPanelPaint(){
+  const b=document.getElementById('runBody');
+  if(!b) return;
+  if(!_runJobs.length){
+    b.innerHTML='<div class="dim" style="padding:14px">nothing running right now</div>';
+    return;
+  }
+  b.innerHTML=_runJobs.map(w=>{
+    const c=poolColor(w.pool||'');
+    const pct=Math.round((w.progress||0)*100);
+    // Two clocks, deliberately. eta_s is the encoder's own estimate and is
+    // absent early on; elapsed always exists. Showing only the first leaves a
+    // fresh job looking stalled.
+    const eta=w.eta_s?`${hms(w.eta_s)} left`:'estimating…';
+    const sub=(w.sub_ocr_active||w.pool==='subocr')&&w.sub_ocr_stage
+      ? `<div class="dim" style="font-size:10.5px">${esc(w.sub_ocr_stage)}</div>`:'';
+    return `<div style="padding:8px 14px;border-bottom:1px solid var(--line)">
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <span class="pill" style="color:${c};border-color:${c};background:${c}14;
+          font-size:10.5px;padding:1px 8px">${esc(w.pool||w.kind||'')}</span>
+        <b style="font-size:12px">${esc(w.title||'')}</b>
+        <span class="dim" style="font-size:11px;margin-left:auto;white-space:nowrap">
+          ${pct}% · ${esc(eta)}</span>
+      </div>
+      <div style="height:4px;border-radius:2px;background:#1e242c;margin-top:5px;
+                  overflow:hidden">
+        <div style="height:100%;width:${pct}%;background:${c};
+                    border-radius:2px;transition:width 1.05s linear"></div>
+      </div>
+      <div class="dim" style="font-size:10.5px;margin-top:3px">
+        ${esc(w.stage||'')}${w.disk?' · '+esc(w.disk):''}</div>
+      ${sub}
+    </div>`;
+  }).join('');
+}
+
 async function drill(q){
+  if(q && q.running){
+    const p=document.getElementById('runPanel');
+    if(p && p.style.display!=='none'){ p.style.display='none'; return; }
+    if(p) p.style.display='';
+    runPanelPaint();
+    return;
+  }
   if(q && q.attn){
     const p=document.getElementById('attnPanel');
     // toggle, like the drill panel
@@ -15048,6 +15172,10 @@ resolved to a pool disk, so the per-spindle avoidance cannot apply">unknown disk
 // two are why the panel ran at 2 s: they are large and they rarely change,
 // while the thing you actually watch - the bar - changes continuously.
 function paintRunning(j){
+  // The Processing-now tile and its panel ride this payload rather than
+  // fetching their own - both polls land here, so the tile can never show a
+  // different set of jobs from the cards directly below it.
+  try{ runTileFeed(j); }catch(_){ }
   _lastIo = j.io || null;
   if(j.disk_load && j.disk_load.disks) _diskLoad = j.disk_load;
   // IS NUARR ON THE GPU? ASK NUARR, NOT THE DRIVER.
@@ -19474,7 +19602,41 @@ function socRow(k,v,where,why){
 // reads. This function knows nothing about subtitles or codecs; it draws
 // whatever it is handed. That is the only way a diagram stays true after
 // someone changes a threshold.
-let _pipe=null, _pipeRoute=null, _pipeTimer=null, _pipeFlow=null;
+let _pipe=null, _pipeRoute=null, _pipeTimer=null;
+let _pipeQ='', _pipeCycle=true, _pipeCycleT=null;
+
+// THE TOUR. An empty diagram teaches the shape but not that anything travels
+// it, so with no file chosen it walks real ones, ten seconds apart. It stops
+// the moment you type or click a result - a demo that keeps interrupting the
+// thing you asked for is worse than no demo - and the button says which state
+// it is in rather than what it will do.
+function pipeCycleToggle(){
+  _pipeCycle=!_pipeCycle;
+  if(_pipeCycle) pipeCycleTick(true); else clearTimeout(_pipeCycleT);
+  pipeDraw();
+}
+function pipeCycleStop(){
+  _pipeCycle=false;
+  clearTimeout(_pipeCycleT);
+  _pipeCycleT=null;
+}
+async function pipeCycleTick(now){
+  clearTimeout(_pipeCycleT);
+  if(!_pipeCycle) return;
+  const box=document.getElementById('processBody');
+  if(!box || box.offsetParent===null) return;      // page not visible - stop
+  if(now!==true){
+    try{
+      const d=await fetch('/api/pipeline/random').then(r=>r.json());
+      if(d && d.file_id){
+        const g=await fetch('/api/pipeline?file_id='+d.file_id).then(r=>r.json());
+        // A late arrival must not stomp a file the user has since chosen.
+        if(_pipeCycle){ _pipe=g; _pipeRoute=g.route||null; pipeDraw(); }
+      }
+    }catch(e){}
+  }
+  _pipeCycleT=setTimeout(()=>pipeCycleTick(false), 10000);
+}
 
 async function loadProcess(){
   const el=document.getElementById('processBody');
@@ -19482,6 +19644,7 @@ async function loadProcess(){
   try{ _pipe=await fetch('/api/pipeline').then(r=>r.json()); }
   catch(e){ el.innerHTML='<div class="dim">could not load</div>'; return; }
   pipeDraw();
+  pipeCycleTick(false);
   if(_pipeTimer) clearInterval(_pipeTimer);
   // Counts move slowly; the animation is CSS and does not need the poll.
   _pipeTimer=setInterval(async()=>{
@@ -19498,7 +19661,13 @@ async function loadProcess(){
 
 // Grid -> pixels. Kept here rather than in the payload so the layout can be
 // retuned without the server having an opinion about pixel geometry.
-const _PIPE_W=190, _PIPE_H=54, _PIPE_GX=248, _PIPE_GY=86, _PIPE_PAD=14;
+// GAP BEFORE WIDTH. The first pass gave the columns 248px on 190px boxes,
+// leaving 58px for edge labels like "picture must be rebuilt" - so the text
+// overhung the boxes on both sides and the diagram read as broken. The gap is
+// what the labels live in, so it is sized first (150px), and the label is
+// truncated to what actually fits rather than trusted to be short.
+const _PIPE_W=196, _PIPE_H=56, _PIPE_GX=346, _PIPE_GY=104, _PIPE_PAD=16;
+const _PIPE_GAP=_PIPE_GX-_PIPE_W;
 function pipeXY(n){
   return {x:_PIPE_PAD+n.col*_PIPE_GX, y:_PIPE_PAD+n.row*_PIPE_GY};
 }
@@ -19539,9 +19708,14 @@ function pipeSvg(g, route, idPrefix){
        stroke-width="${isLit?2.4:1.4}"
        ${isLit?'':'stroke-dasharray="'+(dim?'3 4':'0')+'"'}/>`;
     if(e.label){
-      svg+=`<text x="${mx}" y="${(y1+y2)/2-6}" text-anchor="middle"
-         font-size="10" fill="${isLit?'#6fb0ff':'var(--dim)'}"
-         style="pointer-events:none">${esc(e.label).slice(0,46)}</text>`;
+      // ~5.1px per character at 9.5px in this face; clip to the gap so a long
+      // condition never reaches out over the boxes either side of it.
+      const room=Math.max(8, Math.floor(_PIPE_GAP/5.1));
+      const txt=e.label.length>room ? e.label.slice(0,room-1)+'…' : e.label;
+      svg+=`<text x="${mx}" y="${(y1+y2)/2-7}" text-anchor="middle"
+         font-size="9.5" fill="${isLit?'#6fb0ff':'var(--dim)'}"
+         style="pointer-events:none"><title>${esc(e.label)}</title>${
+         esc(txt)}</text>`;
     }
     // AMBIENT FLOW. A dot per edge, its speed set by how much traffic the
     // edge carries - so a busy path visibly runs faster than a quiet one
@@ -19597,7 +19771,13 @@ function pipeDraw(){
     <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px;
                 flex-wrap:wrap">
       <input id="pipeQ" placeholder="trace a file — type part of a title"
-        oninput="pipeFind()" style="flex:1;min-width:220px;max-width:420px"/>
+        oninput="pipeFind()" value="${esc(_pipeQ||'')}"
+        style="flex:1;min-width:220px;max-width:360px"/>
+      <button onclick="pipeCycleToggle()" style="font-size:11px;padding:2px 9px"
+        title="${_pipeCycle
+          ? 'stop picking a new file every ten seconds'
+          : 'show a different real file every ten seconds'}"
+        >${_pipeCycle?'⏸ Pause tour':'▶ Auto tour'}</button>
       <span class="dim" style="font-size:11px">${esc(_pipe.engine||'')} ·
         OCR on ${(_pipe.libraries||[]).length} librar${
           (_pipe.libraries||[]).length===1?'y':'ies'}</span>
@@ -19610,12 +19790,15 @@ function pipeDraw(){
     <div style="overflow-x:auto">${
       pipeSvg(_pipe.sub, r?r.sub_path:null, 'b')}</div>`;
 }
-function pipeClear(){ _pipeRoute=null; pipeDraw(); }
+function pipeClear(){ _pipeRoute=null; _pipeQ=''; pipeDraw(); }
 let _pipeFindT=null;
 function pipeFind(){
+  // Typing is an explicit ask; the tour steps aside for it.
+  _pipeQ=(document.getElementById('pipeQ')||{}).value||'';
+  if(_pipeQ.trim()) pipeCycleStop();
   clearTimeout(_pipeFindT);
   _pipeFindT=setTimeout(async()=>{
-    const q=(document.getElementById('pipeQ')||{}).value||'';
+    const q=_pipeQ;
     const box=document.getElementById('pipeHits');
     if(!box) return;
     if(q.trim().length<2){ box.innerHTML=''; return; }
@@ -19632,6 +19815,7 @@ function pipeFind(){
   }, 250);
 }
 async function pipeTrace(id){
+  pipeCycleStop();
   try{
     const d=await fetch('/api/pipeline?file_id='+id).then(r=>r.json());
     _pipe=d; _pipeRoute=d.route||null;

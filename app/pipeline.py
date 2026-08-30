@@ -235,32 +235,45 @@ def route(file_id: int) -> dict:
             "SELECT rel, typeset, median_h, tall_share FROM sub_shape "
             "WHERE file_id=? ORDER BY rel", (int(file_id),))]
 
-    path, steps = ["found"], []
-    steps.append(("found", "the arrs told nuarr about this file"))
+    # THE SUBTITLE BRANCH IS COMPUTED FIRST because the main path has several
+    # early returns and this used to sit after all of them. A typeset file
+    # whose OCR correctly skipped leaves every job in state 'skipped', which
+    # takes the "nothing to do" exit - so the one case where the subtitle
+    # branch is the whole story was the one case that returned without it.
+    sub_path, sub_steps = _sub_route(shapes, jobs)
+    out["sub_path"] = sub_path
+
+    path = ["found"]
+    steps = [("found", "the arrs told nuarr about this file")]
+
+    def finish():
+        # The subtitle notes belong AFTER the journey, not spliced into the
+        # middle of it - they explain a branch, and a reader meets the branch
+        # once they have followed the trunk.
+        out["path"] = path
+        out["steps"] = [list(s) for s in steps + sub_steps]
+        return out
     if probed:
         path.append("probe")
         steps.append(("probe", "ffprobe read its streams"))
     else:
         path.append("unprobed")
         steps.append(("unprobed", "not probed yet"))
-        out["path"], out["steps"] = path, [list(s) for s in steps]
-        return out
+        return finish()
 
     path.append("plan")
     steps.append(("plan", "the rules turned that probe into a plan"))
     if not jobs:
         path.append("nothing")
         steps.append(("nothing", "no work was ever queued for it"))
-        out["path"], out["steps"] = path, [list(s) for s in steps]
-        return out
+        return finish()
 
     last = jobs[-1]
     if all(j["state"] == "skipped" for j in jobs):
         path.append("nothing")
         steps.append(("nothing", f"{len(jobs)} job(s), all skipped - "
                                  f"{last.get('error') or 'nothing to change'}"))
-        out["path"], out["steps"] = path, [list(s) for s in steps]
-        return out
+        return finish()
 
     path.append("gate")
     steps.append(("gate", "queued, and released by the gate"))
@@ -287,35 +300,37 @@ def route(file_id: int) -> dict:
         path.append("failed")
         steps.append(("failed", last.get("error") or "did not land"))
 
-    sub_path = []
-    if not shapes and any(j["kind"] == "sub_ocr" for j in jobs):
-        # EXPLAIN THE BLANK. A file that has been through the subtitle path and
-        # shows no measurement looks like the measurement never ran. It did -
-        # and then the file was rewritten, which moves track numbers and so
-        # deletes the verdicts on purpose (see subocr.forget_shapes). Saying
-        # nothing here invites the conclusion that the check is broken.
-        steps.append(("s_meas", "no current measurement - the verdicts are "
-                                "cleared whenever the file is rewritten, "
-                                "because track numbers move"))
-    if shapes:
-        sub_path = ["s_img", "s_meas"]
-        ts = [s for s in shapes if s["typeset"]]
-        if ts:
-            sub_path += ["s_type"]
-            steps.append(("s_type", "track %s: %d%% of cues are tall bitmaps"
-                          % (ts[0]["rel"], round((ts[0]["tall_share"] or 0) * 100))))
-            if any(j["pool"] == "encode" and j["state"] == "done"
-                   for j in jobs):
-                sub_path.append("s_burn")
-        if len(ts) < len(shapes):
-            d = [s for s in shapes if not s["typeset"]][0]
-            sub_path += ["s_dial"]
-            steps.append(("s_dial", "track %s: %d%% tall, ordinary dialogue"
-                          % (d["rel"], round((d["tall_share"] or 0) * 100))))
-            if any(j["kind"] == "sub_ocr" and j["state"] == "done"
-                   for j in jobs):
-                sub_path.append("s_ocr")
-    out["path"] = path
-    out["sub_path"] = sub_path
-    out["steps"] = [list(s) for s in steps]
-    return out
+    return finish()
+
+
+def _sub_route(shapes: list, jobs: list) -> tuple:
+    """The picture-subtitle branch for one file: nodes to light, and why."""
+    sub_path, steps = [], []
+    if not shapes:
+        if any(j["kind"] == "sub_ocr" for j in jobs):
+            # EXPLAIN THE BLANK. A file that has been through the subtitle path
+            # and shows no measurement looks like the measurement never ran. It
+            # did - and then the file was rewritten, which moves track numbers
+            # and so deletes the verdicts on purpose (subocr.forget_shapes).
+            # Saying nothing invites the conclusion that the check is broken.
+            steps.append(("s_meas", "no current measurement - the verdicts are "
+                                    "cleared whenever the file is rewritten, "
+                                    "because track numbers move"))
+        return sub_path, steps
+    sub_path = ["s_img", "s_meas"]
+    ts = [s for s in shapes if s["typeset"]]
+    if ts:
+        sub_path.append("s_type")
+        steps.append(("s_type", "track %s: %d%% of cues are tall bitmaps - "
+                                "signs, so they get burned in"
+                      % (ts[0]["rel"], round((ts[0]["tall_share"] or 0) * 100))))
+        if any(j["pool"] == "encode" and j["state"] == "done" for j in jobs):
+            sub_path.append("s_burn")
+    if len(ts) < len(shapes):
+        d = [s for s in shapes if not s["typeset"]][0]
+        sub_path.append("s_dial")
+        steps.append(("s_dial", "track %s: %d%% tall, ordinary dialogue"
+                      % (d["rel"], round((d["tall_share"] or 0) * 100))))
+        if any(j["kind"] == "sub_ocr" and j["state"] == "done" for j in jobs):
+            sub_path.append("s_ocr")
+    return sub_path, steps
