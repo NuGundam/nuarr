@@ -29,7 +29,8 @@ from . import joblog
 
 # Recomputing this walks every arr record: minutes, not milliseconds. The card
 # reads the last answer and asks for a new one on its own schedule.
-_CACHE: dict = {"at": 0.0, "data": None, "running": False}
+_CACHE: dict = {"at": 0.0, "data": None, "running": False,
+                "done": 0, "total": 0, "where": ""}
 TTL_S = 1800.0
 
 CHECKS = {
@@ -99,7 +100,14 @@ async def scan() -> dict:
             joblog.log(f"arr sync check: cannot list {cfg.name}: "
                        f"{type(e).__name__}", "warn")
             continue
+        # A WALK THIS LONG HAS TO SAY WHERE IT IS. Several minutes behind an
+        # unmoving spinner is indistinguishable from several minutes hung, and
+        # the honest signal - one arr, so many titles of so many - is already
+        # in hand here.
+        _CACHE["total"] = _CACHE.get("total", 0) + len(parents)
         for pid in parents:
+            _CACHE["done"] = _CACHE.get("done", 0) + 1
+            _CACHE["where"] = cfg.name
             try:
                 raw = await client._get(f"/{kind}", **{key: pid})
             except Exception:                                # noqa: BLE001
@@ -140,8 +148,13 @@ async def scan() -> dict:
                 if arr_size and my_size and abs(my_size - arr_size) > 1_000_000:
                     disk = _size_on_disk(mine.get("path") or "")
                     if disk and abs(disk - arr_size) > 1_000_000:
+                        # The DIFFERENCE, carried explicitly. Both numbers
+                        # round to "1.2 GB" on a panel, so a row showing
+                        # 1.2 -> 1.2 looks like a bug in the check rather than
+                        # an 8.6 MB drift.
                         found["size"].append(
-                            dict(row, arr=arr_size, disk=disk))
+                            dict(row, arr=arr_size, disk=disk,
+                                 delta=disk - arr_size))
 
                 # --- video codec / height ---------------------------------
                 mi = rec.get("mediaInfo") or {}
@@ -157,9 +170,19 @@ async def scan() -> dict:
                         dict(row, arr=f"{a_h}p", actual=f"{m_h}p",
                              field="height"))
 
+    # ONE FLAT LIST for the panel, so it can be sorted and scrolled like any
+    # other table. Keeping them in per-check buckets meant the page could show
+    # a count and two examples and nothing in between - a number with no way to
+    # ask which files it means.
+    flat = []
+    for k, rows in found.items():
+        for r in rows:
+            flat.append(dict(r, check=k))
+    flat.sort(key=lambda r: (r["check"], r.get("path") or ""))
     return {"checked": checked, "at": time.time(),
             "counts": {k: len(v) for k, v in found.items()},
             "rows": {k: v[:200] for k, v in found.items()},
+            "list": flat[:2000],
             "total": sum(len(v) for v in found.values())}
 
 
@@ -231,18 +254,26 @@ async def fix(kinds: list | None = None) -> dict:
 def cached() -> dict:
     """The last answer, for the card. Never blocks; never runs a scan."""
     d = _CACHE.get("data")
+    done, total = _CACHE.get("done", 0), _CACHE.get("total", 0)
     return {"have": bool(d), "running": bool(_CACHE.get("running")),
             "age_s": (round(time.time() - _CACHE["at"], 1)
                       if _CACHE.get("at") else None),
             "checks": CHECKS,
-            **(d or {"checked": 0, "counts": {}, "rows": {}, "total": 0})}
+            "progress": {"done": done, "total": total,
+                         "where": _CACHE.get("where", ""),
+                         # Total grows as each arr is reached, so a fraction
+                         # would jump backwards. Reported only once both arrs
+                         # have been counted, and as a plain count until then.
+                         "frac": (done / total) if total else 0.0},
+            **(d or {"checked": 0, "counts": {}, "rows": {}, "list": [],
+                     "total": 0})}
 
 
 async def refresh() -> dict:
     """Run a scan and keep it. One at a time."""
     if _CACHE.get("running"):
         return cached()
-    _CACHE["running"] = True
+    _CACHE.update(running=True, done=0, total=0, where="")
     try:
         d = await scan()
         _CACHE.update(data=d, at=time.time())

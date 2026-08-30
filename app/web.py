@@ -22469,16 +22469,34 @@ async function loadPathMap(){
   try{ d=await (await fetch('/api/pathmap')).json(); }
   catch(e){ el.innerHTML='<div class="dim">could not load</div>'; return; }
   const pairs=d.pairs||[], bad=d.unmatched||[], xl=d.translating||[];
+  const explain = `<div class="dim" style="font-size:11px;margin-top:5px">
+    nuarr and an arr can reach the same file by different roads. Sonarr might
+    know it as <span class="mono">P:\\TV Shows\\…</span> because that is how the
+    drive is mapped where Sonarr runs, while nuarr on another machine reaches
+    the same bytes at <span class="mono">\\\\server\\P\\TV Shows\\…</span>. Both
+    are correct and they share no common prefix, so comparing them as text
+    says "no arr manages this folder" about a folder an arr manages perfectly
+    well — and that comparison decides whether a file can be adopted, renamed,
+    matched to its record, or counted as an orphan.
+    <div style="margin-top:4px">The pairing is worked out by matching trailing
+    folder names against the libraries nuarr scanned, and it is shown here
+    because it is an inference: an ambiguous root is refused and reported
+    rather than guessed at, since guessing wrong files something under the
+    wrong series.</div></div>`;
   if(!d.learned || !pairs.length){
     el.innerHTML=`<div class="dim" style="font-size:11.5px">
       Not worked out yet — this fills in after the next scan reads the arrs'
       file lists. Until then nothing is translated, which is the same
-      behaviour as before.</div>`;
+      behaviour as before.</div>${explain}`;
     return;
   }
   if(!xl.length && !bad.length){
     el.innerHTML=`<div style="font-size:11.5px;color:var(--ok)">
-      nuarr and the arrs use the same paths — nothing is being translated.</div>`;
+      nuarr and the arrs use the same paths — nothing is being translated.
+      </div>${explain}
+      <div class="dim" style="font-size:11px;margin-top:4px">
+        ${pairs.length} librar${pairs.length===1?'y':'ies'} checked:
+        ${pairs.map(p=>esc((p.local||'').split('\\').pop())).join(', ')}</div>`;
     return;
   }
   const row=p=>`<tr style="border-top:1px solid var(--line)">
@@ -22528,17 +22546,37 @@ async function loadArrSync(){
   catch(e){ el.innerHTML='<span class="dim">could not load</span>'; return; }
   arrSyncPaint();
   if(_arrSyncTimer) clearTimeout(_arrSyncTimer);
-  if(_arrSync && _arrSync.running) _arrSyncTimer=setTimeout(loadArrSync, 3000);
+  // Faster while it is working, so the bar moves rather than stepping.
+  if(_arrSync && _arrSync.running) _arrSyncTimer=setTimeout(loadArrSync, 1200);
 }
 function arrSyncPaint(){
   const el=document.getElementById('arrSyncBody');
   if(!el||!_arrSync) return;
   const d=_arrSync, C=d.checks||{}, n=d.counts||{};
   if(d.running){
-    el.innerHTML=`<div style="display:flex;gap:8px;align-items:center;font-size:11.5px">
-      <span class="spin" style="width:11px;height:11px"></span>
-      <span class="dim">comparing every arr record against the file on disk —
-        this walks the whole library, so give it a few minutes</span></div>`;
+    // SAY WHERE IT IS. Several minutes behind a spinner that never moves is
+    // indistinguishable from several minutes hung.
+    const p=d.progress||{}, done=p.done||0, tot=p.total||0;
+    const pct=tot?Math.min(100,Math.round(done/tot*100)):0;
+    el.innerHTML=`
+      <div style="font-size:11.5px">
+        <div style="display:flex;gap:8px;align-items:center">
+          <span class="spin" style="width:11px;height:11px"></span>
+          <span class="dim">comparing every arr record against the file on
+            disk${p.where?` — ${esc(p.where)}`:''}</span>
+          <span class="dim" style="margin-left:auto;white-space:nowrap">${
+            tot?`${fmt(done)} of ${fmt(tot)} titles`:`${fmt(done)} titles`}</span>
+        </div>
+        <div style="height:5px;border-radius:3px;background:#1e242c;margin-top:5px;
+                    overflow:hidden">
+          <div style="height:100%;border-radius:3px;background:#6fb0ff;
+                      width:${tot?pct:100}%;
+                      transition:width 1.2s linear${tot?'':`;
+                      background:repeating-linear-gradient(90deg,#6fb0ff33 0 10px,
+                        #6fb0ff11 10px 20px);animation:shapeCrawl .9s linear infinite`}"
+          ></div>
+        </div>
+      </div>`;
     return;
   }
   if(!d.have){
@@ -22562,27 +22600,11 @@ function arrSyncPaint(){
       <td class="dim" style="padding:4px 0;font-size:11px">${esc(meta.what)}
         <span style="color:#8fb4d9">${esc(meta.why)}</span></td></tr>`;
   }).join('');
-  // A sample, because a count invites the question "which ones".
-  const sample=[];
-  for(const k of Object.keys(C)){
-    for(const r of ((d.rows||{})[k]||[]).slice(0,2)){
-      const was = r.claimed ? r.claimed.join(', ')
-                : r.arr!=null && r.disk!=null ? gb(r.arr)
-                : String(r.arr||'');
-      const now = r.actual ? (Array.isArray(r.actual)?r.actual.join(', ')
-                                                     :r.actual)
-                : r.disk!=null ? gb(r.disk) : '';
-      sample.push(`<div style="padding:1px 0"><span class="dim"
-        style="display:inline-block;min-width:74px">${esc(C[k].label)}</span>
-        ${esc((r.path||'').split('\\').pop().slice(0,52))}
-        <span class="dim"> — arr ${esc(was)} → file ${esc(now)}</span></div>`);
-    }
-  }
   el.innerHTML=`
     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;
                 font-size:11.5px;margin-bottom:6px">
       ${head}
-      <span class="dim">of ${fmt(d.checked||0)} checked${
+      <span class="dim">of ${fmt(d.checked||0)} files checked${
         d.age_s!=null?` · ${ago(Date.now()/1000-d.age_s)}`:''}</span>
       <span style="margin-left:auto;display:flex;gap:6px">
         <button onclick="arrSyncRun()" style="font-size:11px;padding:2px 9px"
@@ -22592,9 +22614,103 @@ function arrSyncPaint(){
       </span>
     </div>
     <table style="width:100%;border-collapse:collapse;font-size:11.5px">${rows}</table>
-    ${sample.length?`<div class="dim" style="font-size:11px;margin-top:7px">${
-      sample.join('')}</div>`:''}
+    <div id="arrSyncList" style="margin-top:8px"></div>
     <div id="arrSyncMsg" class="dim" style="font-size:11.5px;margin-top:5px"></div>`;
+  arrSyncListPaint();
+}
+
+// ---- the files behind the count ----------------------------------------
+// A COUNT INVITES THE QUESTION "WHICH ONES", and two examples is not an
+// answer. Same treatment as the subtitle table: sortable columns, and the rows
+// hold still while they are being read rather than being rebuilt underneath
+// the cursor.
+// gb() drops to two decimals of a gigabyte, which renders an 8.6 MB drift as
+// "0.01 GB" - technically right and useless. Differences get their own scale.
+const mbytes=b=>{
+  b=Math.abs(b||0);
+  if(b>=1073741824) return (b/1073741824).toFixed(2)+' GB';
+  if(b>=1048576)    return (b/1048576).toFixed(1)+' MB';
+  return (b/1024).toFixed(0)+' KB';
+};
+let _asSort={key:'check', dir:1}, _asHover=false;
+function arrSyncSort(k){
+  if(_asSort.key===k) _asSort.dir*=-1;
+  else _asSort={key:k, dir:(k==='delta')?-1:1};
+  arrSyncListPaint();
+}
+function arrSyncPaused(){
+  const b=document.getElementById('arrSyncScroll');
+  return _asHover || (b && b.scrollTop>4);
+}
+function arrSyncListPaint(force){
+  const el=document.getElementById('arrSyncList');
+  if(!el||!_arrSync) return;
+  const all=(_arrSync.list)||[];
+  if(!all.length){ el.innerHTML=''; return; }
+  if(!force && arrSyncPaused()) return;
+  const keep=document.getElementById('arrSyncScroll');
+  const top=keep?keep.scrollTop:0;
+  const C=_arrSync.checks||{};
+  const val=(r,k)=>{
+    if(k==='check') return r.check||'';
+    if(k==='file')  return (r.path||'').split('\\').pop().toLowerCase();
+    if(k==='delta') return Math.abs(r.delta||0);
+    return '';
+  };
+  const rows=all.slice().sort((a,b)=>{
+    const x=val(a,_asSort.key), y=val(b,_asSort.key);
+    if(x<y) return -1*_asSort.dir;
+    if(x>y) return 1*_asSort.dir;
+    return (a.path||'').localeCompare(b.path||'');
+  });
+  const arrow=k=>_asSort.key===k?(_asSort.dir>0?' ▲':' ▼'):'';
+  const th=(k,l)=>`<th onclick="arrSyncSort('${k}')" style="text-align:left;
+      cursor:pointer;user-select:none;font-weight:600;padding:3px 10px 5px 0;
+      position:sticky;top:0;background:var(--bg2,#12161c)"
+      >${l}<span class="dim">${arrow(k)}</span></th>`;
+  // WHAT CHANGED, not two numbers that round to the same thing. "1.2 GB ->
+  // 1.2 GB" was the old row for an 8.6 MB difference, which reads as a bug in
+  // the check rather than as drift.
+  const changed=r=>{
+    if(r.check==='languages')
+      return `<span class="dim">${esc((r.claimed||[]).join(', '))}</span>`
+           + ` → <b>${esc((r.actual||[]).join(', '))}</b>`;
+    if(r.check==='size'){
+      const d=r.delta||0, s=d<0?'smaller':'larger';
+      return `<b style="color:${d<0?'var(--warn)':'var(--acc)'}">${
+        mbytes(Math.abs(d))} ${s}</b> <span class="dim">than the arr thinks (${
+        gb(r.arr)} → ${gb(r.disk)})</span>`;
+    }
+    return `<span class="dim">${esc(String(r.arr||''))}</span> → <b>${
+      esc(String(r.actual||''))}</b>`;
+  };
+  el.innerHTML=`
+    <div id="arrSyncScroll" style="max-height:240px;overflow:auto"
+         onmouseenter="_asHover=true" onmouseleave="_asHover=false">
+      <table style="width:100%;font-size:11.5px;border-collapse:collapse;
+                    table-layout:fixed">
+        <colgroup><col style="width:12%"><col style="width:40%">
+          <col style="width:48%"></colgroup>
+        <thead><tr>${th('check','Check')}${th('file','File')}
+          ${th('delta','What changed')}</tr></thead>
+        <tbody>${rows.map(r=>`<tr>
+          <td style="padding:2px 10px 2px 0;white-space:nowrap;color:${
+            r.check==='languages'?'#b48bf2':r.check==='size'?'var(--warn)'
+            :'var(--acc)'}">${esc((C[r.check]||{}).label||r.check)}</td>
+          <td style="padding:2px 10px 2px 0;overflow:hidden;
+                     text-overflow:ellipsis;white-space:nowrap"
+              title="${esc(r.path||'')}">${
+            esc((r.path||'').split('\\').pop())}</td>
+          <td style="padding:2px 0">${changed(r)}</td></tr>`).join('')}</tbody>
+      </table>
+    </div>
+    <div class="dim" style="font-size:10.5px;margin-top:4px">
+      ${fmt(rows.length)} shown${_arrSync.total>rows.length
+        ?` of ${fmt(_arrSync.total)}`:''}${
+        arrSyncPaused()?' · paused while you read — scroll back up to resume':''}
+    </div>`;
+  const sc=document.getElementById('arrSyncScroll');
+  if(sc && top) sc.scrollTop=top;
 }
 async function arrSyncRun(){
   const m=document.getElementById('arrSyncMsg'); if(m) m.textContent='starting…';

@@ -810,6 +810,42 @@ def retire_gone() -> int:
     absent, or says deleted - and not from a disk check. A pool disk that
     blinks out for a moment must not be able to retire real findings.
     """
+    # RESOLVED IS NOT THE SAME AS VANISHED, and reporting one as the other
+    # loses the only interesting part. A container/name finding says "Matroska
+    # content named .mp4"; delete that file and keep the .mkv beside it and the
+    # rule is satisfied - the library is now correct BECAUSE of what the check
+    # said. Calling that "gone" reads as the finding having escaped rather than
+    # been answered. So the ones whose complaint no longer applies are marked
+    # fixed, and only the genuinely disappeared are marked gone.
+    now = time.time()
+    fixed_now = 0
+    # 'gone' IS RECONSIDERED, not just the queued ones. Rows retired before
+    # this distinction existed are sitting at 'gone' with the wrong story, and
+    # a rule that only ever looks forward leaves them lying there. There are a
+    # handful of these and the test is one os.path.exists, so it is re-asked
+    # every sweep rather than fixed once by hand and forgotten.
+    with cursor() as cur:
+        stale = [dict(r) for r in cur.execute(
+            "SELECT file_id, rule, path FROM audit_heals "
+            " WHERE state != 'fixed' "
+            "   AND file_id NOT IN (SELECT id FROM files "
+            "                        WHERE state != 'deleted')")]
+    for s in stale:
+        if s.get("rule") != "container/name":
+            continue
+        p = s.get("path") or ""
+        stem, ext = os.path.splitext(p)
+        # The complaint was the extension. If the file is gone and a correctly
+        # named one now sits where it was, the complaint was met.
+        if ext.lower() != ".mkv" and stem and os.path.exists(stem + ".mkv"):
+            with cursor() as cur:
+                cur.execute(
+                    "UPDATE audit_heals SET state='fixed', last_at=?, "
+                    "       detail='the misnamed copy is gone and the .mkv "
+                    "beside it remains - the rule is satisfied' "
+                    " WHERE file_id=? AND rule=?",
+                    (now, s["file_id"], s["rule"]))
+            fixed_now += 1
     with cursor() as cur:
         cur.execute(
             "UPDATE audit_heals SET state='gone', "
@@ -818,8 +854,13 @@ def retire_gone() -> int:
             "       last_at=? "
             " WHERE state NOT IN ('fixed','gone') "
             "   AND file_id NOT IN (SELECT id FROM files "
-            "                        WHERE state != 'deleted')", (time.time(),))
-        return cur.rowcount or 0
+            "                        WHERE state != 'deleted')", (now,))
+        n = cur.rowcount or 0
+    if fixed_now:
+        joblog.log(f"{fixed_now} finding(s) turned out to have been answered "
+                   f"rather than lost - the file the check complained about is "
+                   f"gone and a correctly named one is in its place", "ok")
+    return n + fixed_now
 
 
 async def _reverify_queued() -> int:
