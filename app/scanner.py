@@ -238,7 +238,10 @@ def _register_with_storage() -> None:
     """
     try:
         from . import storage
-        storage.register_member_finder(lambda p: disk_of(p))
+        # The RAW walk, not disk_of() - see the note there. Registering the
+        # public function would make storage call back into the thing that
+        # called it.
+        storage.register_member_finder(_disk_of_poolpart)
     except Exception:                                        # noqa: BLE001
         pass
 
@@ -313,11 +316,40 @@ def strip_extended_prefix(p: str) -> str:
 
 
 def disk_of(pooled_path: str, pool_root: str = "P:\\") -> str | None:
-    r"""Which physical pool disk holds this P:\ path.
+    r"""Which device holds this file. Works on any storage, not just a pool.
+
+    THE PUBLIC ANSWER, and it no longer assumes DrivePool. It asks storage.py,
+    which decides what kind of volume the path is on and only falls back to the
+    PoolPart walk below when the volume turns out to be virtual. On a plain
+    disk, an external drive, a RAID set or a mount point the walk is not merely
+    skipped - it is never reached, because the path already names its device.
+
+    KEPT SEPARATE FROM _disk_of_poolpart() ON PURPOSE. That function is what
+    gets registered with storage.py as a member finder, so if this one were the
+    registered callable it would call storage, storage would call it back, and
+    the two would recurse until the stack ran out. Two names, one direction.
+    """
+    try:
+        from . import storage
+        label, _how = storage.device_of(pooled_path)
+        if label:
+            return label
+    except Exception:                                        # noqa: BLE001
+        pass
+    # storage.py could not answer - no Windows storage API, or a path it does
+    # not recognise. The pool walk is still the best guess available.
+    return _disk_of_poolpart(pooled_path, pool_root)
+
+
+def _disk_of_poolpart(pooled_path: str, pool_root: str = "P:\\") -> str | None:
+    r"""Which PoolPart holds this path - the DrivePool-specific probe.
 
     A single file lives in exactly one PoolPart, so we just ask each one whether
     it has the file - 12 stat calls, far cheaper than re-walking the pool. Used
     by the webhook path, where one file changed and a full scan is absurd.
+
+    Registered with storage.py rather than called directly, so it runs only for
+    a volume that has been identified as virtual.
     """
     global _DISK_CACHE
     if not _DISK_CACHE:
@@ -338,6 +370,15 @@ def disk_of(pooled_path: str, pool_root: str = "P:\\") -> str | None:
         if os.path.exists(os.path.join(part, rel)):
             return label
     return None
+
+
+
+# REGISTERED AT IMPORT, not from a start-up hook. This was defined and never
+# called, so storage.device_of() had no way to identify a pool member and would
+# have fallen back to naming the whole pool volume - correct-looking output,
+# silently coarser than before. Importing scanner is what makes the PoolPart
+# probe available, and everything that needs it imports scanner already.
+_register_with_storage()
 
 
 # ------------------------------------------------------------------ scan ----

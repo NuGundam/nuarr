@@ -166,6 +166,40 @@ $res | ConvertTo-Json -Depth 4 -Compress
     return out
 
 
+# WHICH LETTERS ARE MAPPED DRIVES, asked once for all of them rather than once
+# per lookup. The first version ran a PowerShell query per call, which made
+# every disk_of() cost 270 ms warm - against the few milliseconds of the stat
+# walk it replaced, on a function the job gate consults constantly. Measured,
+# not guessed: it is exactly the kind of regression that hides behind a correct
+# answer.
+_NET_CACHE: dict = {"at": 0.0, "map": None}
+
+
+def _net_letters() -> dict:
+    """letter -> server, for every mapped network drive. One query, cached."""
+    now = time.time()
+    if _NET_CACHE["map"] is not None and now - _NET_CACHE["at"] < _TTL:
+        return _NET_CACHE["map"]
+    out = {}
+    js = _ps("Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=4' | "
+             "Select-Object DeviceID,ProviderName | ConvertTo-Json -Compress",
+             timeout=45)
+    try:
+        import json
+        data = json.loads(js or "[]")
+        if isinstance(data, dict):
+            data = [data]
+        for d in data:
+            dev = (d.get("DeviceID") or "").strip().rstrip(":").upper()
+            prov = (d.get("ProviderName") or "").replace("/", "\\")
+            if dev and prov:
+                out[dev] = prov.lstrip("\\").split("\\", 1)[0]
+    except Exception:                                        # noqa: BLE001
+        out = {}
+    _NET_CACHE.update(map=out, at=now)
+    return out
+
+
 def _is_remote(path: str) -> tuple[bool, str]:
     r"""Is this path on another machine, and which one?
 
@@ -178,11 +212,8 @@ def _is_remote(path: str) -> tuple[bool, str]:
         host = p[2:].split("\\", 1)[0]
         return True, host
     if os.name == "nt" and len(p) > 1 and p[1] == ":":
-        letter = p[0].upper()
-        out = _ps(f"(Get-CimInstance Win32_LogicalDisk -Filter "
-                  f"\"DeviceID='{letter}:'\").ProviderName", timeout=30).strip()
-        if out:
-            host = out.replace("/", "\\").lstrip("\\").split("\\", 1)[0]
+        host = _net_letters().get(p[0].upper())
+        if host:
             return True, host
     return False, ""
 
@@ -279,8 +310,13 @@ _MEMBER_FINDERS: list = []
 
 
 def register_member_finder(fn) -> None:
-    """fn(path) -> device label, or None. Consulted only for VIRTUAL volumes."""
-    _MEMBER_FINDERS.append(fn)
+    """fn(path) -> device label, or None. Consulted only for VIRTUAL volumes.
+
+    Idempotent: registering the same function twice would run the same probe
+    twice for every lookup, and a module imported from two places is normal.
+    """
+    if fn not in _MEMBER_FINDERS:
+        _MEMBER_FINDERS.append(fn)
 
 
 def device_of(path: str) -> tuple[str | None, str]:
@@ -322,6 +358,21 @@ def device_of(path: str) -> tuple[str | None, str]:
         # just a coarse one - better than None, which reads as "no storage".
         return (d["device"] or None), "volume"
     return None, ""
+
+
+def warm() -> None:
+    r"""Fill the caches before anybody asks, off the request path.
+
+    The two queries behind this cost about twenty seconds together on a
+    twelve-disk box, and warm they cost nothing measurable. That difference has
+    to be paid somewhere, and paying it during start-up - where a few seconds
+    is invisible - is better than making one unlucky job wait for it.
+    """
+    try:
+        volumes()
+        _net_letters()
+    except Exception:                                        # noqa: BLE001
+        pass
 
 
 def roots_report(paths: list) -> list:

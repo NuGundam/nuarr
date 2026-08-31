@@ -565,6 +565,11 @@ async def _startup() -> None:
     # somebody to sit and watch for it.
     from . import consolewatch as _cw
     asyncio.create_task(_cw.watch())
+    # Learn what kind of storage backs each library before anything asks. Cold
+    # it is a twenty-second pair of queries; warm it is unmeasurable, and the
+    # gate consults it constantly.
+    from . import storage as _storage
+    asyncio.create_task(asyncio.to_thread(_storage.warm))
     # Silent and request-free until a repo is configured - see updates.watch.
     asyncio.create_task(updates.watch())
     # Stored network shares reconnect at boot: `net use` grants access per
