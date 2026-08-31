@@ -228,6 +228,21 @@ def media_roots() -> dict[str, str]:
     return _ROOTS_CACHE
 
 
+def _register_with_storage() -> None:
+    r"""Offer the PoolPart walk to storage.py as one way among several.
+
+    THE VENDOR KNOWLEDGE STAYS HERE, and storage.py only learns that some
+    function can identify a member of a virtual volume. It is consulted for a
+    VIRTUAL volume and never otherwise, so on a plain disk or a RAID set this
+    code is not merely skipped - it is never reached.
+    """
+    try:
+        from . import storage
+        storage.register_member_finder(lambda p: disk_of(p))
+    except Exception:                                        # noqa: BLE001
+        pass
+
+
 def pool_disks() -> dict[str, str]:
     """label -> path of that disk's PoolPart folder (DrivePool-specific).
 
