@@ -139,6 +139,34 @@ try {
       }
     }
   }
+  # WHICH LETTERED VOLUMES ARE ACTUALLY SERVING MEDIA. Selecting every real
+  # volume was too broad: it added the host's transcode drive, staging drive
+  # and general storage to a panel that exists to show where the LIBRARY lives.
+  # Those are real disks doing real work and none of them hold a file Plex or
+  # an arr will ever ask for.
+  #
+  # A shared path is the honest test for "this machine serves media from here",
+  # and it is what makes the rule work on setups that are not pools: a server
+  # sharing a plain D: and E: has no letterless volumes at all, and those two
+  # are exactly what should appear.
+  # THE SHARES NUARR'S LIBRARIES ACTUALLY COME THROUGH, passed in by the
+  # caller - not "anything shared", which was the first attempt and is wrong
+  # twice over. Every Windows machine publishes admin shares (C$, D$, P$), so
+  # "is it shared" was true of every lettered volume including the OS drive;
+  # and a machine can share plenty that has no media on it. The libraries name
+  # the shares they use, so those are the only ones that count.
+  $wantShares = @{}
+  foreach ($n in ($env:NUARR_HOSTIO_SHARES -split '\|')) {
+    if ($n) { $wantShares[$n.Trim().ToUpper()] = $true }
+  }
+  $sharedRoots = @{}
+  foreach ($sh in (Get-CimInstance -CimSession $s -ClassName Win32_Share |
+                   Where-Object { $_.Path -and $_.Path -match '^[A-Za-z]:' -and
+                                  $_.Name -notmatch '\$$' })) {
+    if ($wantShares.Count -eq 0 -or $wantShares.ContainsKey($sh.Name.ToUpper())) {
+      $sharedRoots[$sh.Path.Substring(0,2).ToUpper()] = $true
+    }
+  }
   $vols = @()
   foreach ($v in $allVols) {
     $sum = 0.0
@@ -148,7 +176,15 @@ try {
     # Virtual when the volume claims more than its disks hold. Also skipped
     # when nothing backs it at all, which is the same situation reported a
     # different way.
-    if ($sum -gt 0 -and [double]$v.Size -le ($sum * 1.05)) { $vols += $v }
+    if (-not ($sum -gt 0 -and [double]$v.Size -le ($sum * 1.05))) { continue }
+    if ($v.DriveLetter) {
+      # Lettered: only if this machine shares it. A pool's members carry no
+      # letter and are kept regardless, which is what makes the members show
+      # while the pool volume itself does not.
+      $dl = ([string]$v.DriveLetter).ToUpper() + ':'
+      if (-not $sharedRoots.ContainsKey($dl)) { continue }
+    }
+    $vols += $v
   }
   $cap = @{}
   foreach ($v in $vols) {
@@ -233,6 +269,31 @@ def server_of(path: str) -> str:
     return m.group(1) if m else ""
 
 
+def shares_on(server: str) -> list:
+    r"""The share names this machine's libraries come through, for one server.
+
+    The remote sampler uses these to decide which of the host's lettered
+    volumes are serving media. Without them it would have to guess, and the two
+    obvious guesses are both wrong: "anything shared" catches the admin shares
+    every Windows box publishes, and "anything with a letter" catches the OS.
+    """
+    out = []
+    try:
+        for lib in (SETTINGS.libraries or []):
+            p = (lib.get("path") if isinstance(lib, dict)
+                 else getattr(lib, "path", None)) or ""
+            if server_of(p) != server:
+                continue
+            q = p.replace("/", "\\")
+            if q.startswith("\\\\"):
+                bits = q[2:].split("\\")
+                if len(bits) > 1 and bits[1] and bits[1] not in out:
+                    out.append(bits[1])
+    except Exception:                                        # noqa: BLE001
+        pass
+    return out
+
+
 def servers() -> list:
     """Every host nuarr reaches a library through, deduplicated."""
     out = []
@@ -304,6 +365,7 @@ def _stream(server: str) -> None:
     env = dict(os.environ)
     env["NUARR_HOSTIO_SERVER"] = server
     env["NUARR_HOSTIO_USER"] = user or ""
+    env["NUARR_HOSTIO_SHARES"] = "|".join(shares_on(server))
     env["NUARR_HOSTIO_EVERY"] = str(EVERY_S)
     env["NUARR_HOSTIO_LIFE"] = str(LIFE_S)
     p = None
@@ -358,6 +420,7 @@ def _sample(server: str) -> dict:
     env = dict(os.environ)
     env["NUARR_HOSTIO_SERVER"] = server
     env["NUARR_HOSTIO_USER"] = user or ""
+    env["NUARR_HOSTIO_SHARES"] = "|".join(shares_on(server))
     env["NUARR_HOSTIO_EVERY"] = "0"
     env["NUARR_HOSTIO_LIFE"] = "0.001"      # one pass through the loop
     try:
