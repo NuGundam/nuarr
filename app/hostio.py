@@ -106,13 +106,50 @@ try {
   # be the same table: size, used and free per spindle, not just "busy".
   # WHICH VOLUMES ARE POOL MEMBERS. Not "the ones called NU-DRIVE" - that is
   # one person's labelling and would show nothing on anyone else's machine.
-  # A pooled disk is mounted WITHOUT a drive letter; the pool itself, the
-  # system disk and any ordinary volume all have one. So: letterless, and with
-  # a size. On this host that is exactly the twelve, and excludes C, D, E, F
-  # and the P: pool volume without naming any of them.
-  $vols  = Get-CimInstance -CimSession $s -Namespace root/Microsoft/Windows/Storage `
-             -ClassName MSFT_Volume |
-           Where-Object { -not $_.DriveLetter -and [double]$_.Size -gt 0 }
+  # WHICH VOLUMES ARE REAL DEVICES - decided by physics, not by lettering.
+  #
+  # This used to select letterless volumes, on the reasoning that a pooled disk
+  # has no drive letter while the pool, the system disk and ordinary volumes
+  # do. True on a StableBit host and useless anywhere else: a server sharing a
+  # plain JBOD, a RAID volume or a pair of lettered data drives has no
+  # letterless volumes at all, so the panel would have shown nothing.
+  #
+  # The general test is the one storage.py uses locally: A VOLUME CANNOT BE
+  # LARGER THAN THE HARDWARE BEHIND IT. A pool reports far more space than the
+  # disk it presents itself through; a real volume matches its disks. So take
+  # every volume that is NOT bigger than its backing hardware - that is the set
+  # of things with actual spindles, whether they carry a letter or not.
+  $diskSize = @{}
+  foreach ($d in (Get-CimInstance -CimSession $s -Namespace root/Microsoft/Windows/Storage -ClassName MSFT_Disk)) {
+    $diskSize[[string]$d.Number] = [double]$d.Size
+  }
+  $allVols = Get-CimInstance -CimSession $s -Namespace root/Microsoft/Windows/Storage `
+               -ClassName MSFT_Volume |
+             Where-Object { [double]$_.Size -gt 0 }
+  $allParts = Get-CimInstance -CimSession $s -Namespace root/Microsoft/Windows/Storage `
+                -ClassName MSFT_Partition
+  # volume access path -> the disks under it, so each volume can be measured
+  # against its own hardware rather than against a guess.
+  $backing = @{}
+  foreach ($p in $allParts) {
+    foreach ($ap in @($p.AccessPaths)) {
+      if ($ap) {
+        if (-not $backing.ContainsKey($ap)) { $backing[$ap] = @{} }
+        $backing[$ap][[string]$p.DiskNumber] = $true
+      }
+    }
+  }
+  $vols = @()
+  foreach ($v in $allVols) {
+    $sum = 0.0
+    if ($v.Path -and $backing.ContainsKey($v.Path)) {
+      foreach ($dn in $backing[$v.Path].Keys) { $sum += [double]$diskSize[$dn] }
+    }
+    # Virtual when the volume claims more than its disks hold. Also skipped
+    # when nothing backs it at all, which is the same situation reported a
+    # different way.
+    if ($sum -gt 0 -and [double]$v.Size -le ($sum * 1.05)) { $vols += $v }
+  }
   $cap = @{}
   foreach ($v in $vols) {
     $cap[$v.Path] = @{ size  = [double]$v.Size
