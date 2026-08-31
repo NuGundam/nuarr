@@ -138,7 +138,8 @@ def _rows_from_probe(path: str, probe: dict) -> list:
 def scan(limit: int = 0) -> dict:
     r"""Every stale audio title in the library, from stored probes alone."""
     rows, checked = [], 0
-    _CACHE.update(running=True, done=0, total=0)
+    _CACHE.update(running=True, done=0, total=0, now="", files=0,
+                  t0=time.time(), t1=0.0)
     try:
         with cursor() as c:
             todo = list(c.execute(
@@ -153,6 +154,12 @@ def scan(limit: int = 0) -> dict:
             if not (r["path"] or "").lower().endswith(".mkv"):
                 continue
             checked += 1
+            _CACHE["files"] = checked
+            # Every 25th, not every one: this loop runs thousands of times a
+            # second, and a name that changes faster than the eye can read is
+            # a blur rather than information.
+            if checked % 25 == 0:
+                _CACHE["now"] = os.path.basename(r["path"] or "")
             try:
                 probe = json.loads(r["json"] or "{}")
             except Exception:                                # noqa: BLE001
@@ -164,6 +171,7 @@ def scan(limit: int = 0) -> dict:
                 break
     finally:
         _CACHE["running"] = False
+        _CACHE["t1"] = time.time()          # freeze the rate at what it was
     files = len({r["file_id"] for r in rows})
     return {"checked": checked, "at": time.time(), "rows": rows[:4000],
             "total": len(rows), "files": files}
@@ -304,6 +312,30 @@ def _restamp(file_id: int, path: str, edits: list) -> None:
                    "warn")
 
 
+def _rate() -> float:
+    r"""Files per second over the run.
+
+    Measured against the END of the run once it has finished, not against a
+    clock that keeps going: dividing by wall time after the work stopped made
+    the reported rate fall away second by second, which describes nothing at
+    all and looks like the machine slowing down.
+    """
+    t0 = _CACHE.get("t0") or 0.0
+    n = _CACHE.get("files", 0)
+    el = (_CACHE.get("t1") or time.time()) - t0
+    return round(n / el, 1) if (t0 and el > 0.5 and n) else 0.0
+
+
+def _eta() -> float:
+    """Seconds left at the current rate. 0 until it means anything."""
+    t0 = _CACHE.get("t0") or 0.0
+    done, total = _CACHE.get("done", 0), _CACHE.get("total", 0)
+    el = time.time() - t0
+    if not (t0 and total and done > 50 and el > 1.0):
+        return 0.0
+    return round((total - done) * (el / done), 0)
+
+
 def mode() -> str:
     """"manual" or "auto". Anything unrecognised is manual - never auto."""
     m = str(getattr(SETTINGS, "audiotitle_mode", "manual") or "manual").lower()
@@ -380,7 +412,10 @@ def cached() -> dict:
             "mode": mode(),
             "every_h": int(getattr(SETTINGS, "audiotitle_every_h", 24) or 24),
             "progress": {"done": _CACHE.get("done", 0),
-                         "total": _CACHE.get("total", 0)},
+                         "total": _CACHE.get("total", 0),
+                         "now": _CACHE.get("now", ""),
+                         "files": _CACHE.get("files", 0),
+                         "rate": _rate(), "eta_s": _eta()},
             "fixing": _CACHE.get("fixing"),
             "last_fix": _CACHE.get("last_fix"),
             "failures": _CACHE.get("failures") or [],

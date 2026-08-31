@@ -160,6 +160,12 @@ async def scan() -> dict:
                 if not mine:
                     continue
                 checked += 1
+                # NAME WHAT IS UNDER THE NEEDLE. A bar that only moves is
+                # evidence of motion; a bar that also says which file it is on
+                # is evidence of PROGRESS, and it is the difference between
+                # watching a spinner and watching work.
+                _CACHE["now"] = os.path.basename(mine.get("path") or "")
+                _CACHE["files"] = checked
                 # 'arr' IS THE ARR'S NAME AND NOTHING ELSE. The size and video
                 # rows below used to add arr=<the value the arr believed>,
                 # which overwrote it - so a size row carried arr=1332586482
@@ -380,6 +386,33 @@ async def _fix(kinds: list | None = None) -> dict:
     return out
 
 
+def _rate() -> float:
+    r"""Files per second over the run. 0 when there is nothing to say.
+
+    Against the END of the run once finished, not a clock that keeps going -
+    otherwise the reported rate decays second by second after the work stops,
+    which describes nothing and reads as the machine slowing down.
+    """
+    t0 = _CACHE.get("t0") or 0.0
+    n = _CACHE.get("files", 0)
+    el = (_CACHE.get("t1") or time.time()) - t0
+    return round(n / el, 1) if (t0 and el > 1.0 and n) else 0.0
+
+
+def _eta(done: int, total: int) -> float:
+    """Seconds left, from the rate of TITLES rather than files.
+
+    Deliberately absent until the totals have settled: both arrs are counted
+    as they are reached, so an estimate made against a growing total would
+    shrink and grow for no reason a person could see.
+    """
+    t0 = _CACHE.get("t0") or 0.0
+    el = time.time() - t0
+    if not (t0 and total and done > 20 and el > 3.0):
+        return 0.0
+    return round((total - done) * (el / done), 0)
+
+
 def mode() -> str:
     """"manual" or "auto". Anything unrecognised is manual - never auto."""
     m = str(getattr(SETTINGS, "arrsync_mode", "manual") or "manual").lower()
@@ -475,6 +508,14 @@ def cached() -> dict:
             "fixing": _CACHE.get("fixing"),
             "progress": {"done": done, "total": total,
                          "where": _CACHE.get("where", ""),
+                         "now": _CACHE.get("now", ""),
+                         "files": _CACHE.get("files", 0),
+                         # A RATE ANSWERS THE QUESTION THE BAR RAISES. "How
+                         # long is this going to take" is what a person wants
+                         # from a progress bar, and a percentage alone cannot
+                         # say - measured over the run rather than guessed.
+                         "rate": _rate(),
+                         "eta_s": _eta(done, total),
                          # Total grows as each arr is reached, so a fraction
                          # would jump backwards. Reported only once both arrs
                          # have been counted, and as a plain count until then.
@@ -492,7 +533,8 @@ async def refresh() -> dict:
     """Run a scan and keep it. One at a time."""
     if _CACHE.get("running"):
         return cached()
-    _CACHE.update(running=True, done=0, total=0, where="")
+    _CACHE.update(running=True, done=0, total=0, where="", now="", files=0,
+                  t0=time.time(), t1=0.0)
     try:
         d = await scan()
         _CACHE.update(data=d, at=time.time())
@@ -509,4 +551,5 @@ async def refresh() -> dict:
         joblog.log(f"arr sync check: {type(e).__name__}: {e}", "warn")
     finally:
         _CACHE["running"] = False
+        _CACHE["t1"] = time.time()          # freeze the rate at what it was
     return cached()

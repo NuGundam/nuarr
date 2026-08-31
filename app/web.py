@@ -7901,6 +7901,11 @@ tr.logdrop td{padding:0 0 8px 0;background:#1c2129;border-bottom:1px solid var(-
 /* The measurement bar before ffmpeg's first reading lands: motion that says
    "working" without implying a fraction we do not have yet. */
 @keyframes shapeCrawl{from{background-position:0 0}to{background-position:20px 0}}
+/* A bright sweep across the whole bar, not a faint texture crawling inside it.
+   The old indeterminate style layered #6fb0ff33 over #6fb0ff11 - 20% and 7%
+   alpha - which on this background read as a dashed border rather than a
+   running process, so a working check looked like a broken one. */
+@keyframes barSweep{from{background-position:120% 0}to{background-position:-20% 0}}
 .scanbar-live{background-image:linear-gradient(115deg,
    rgba(255,255,255,.16) 25%, transparent 25%, transparent 50%,
    rgba(255,255,255,.16) 50%, rgba(255,255,255,.16) 75%,
@@ -22827,26 +22832,15 @@ function arrSyncPaint(){
   if(d.running){
     // SAY WHERE IT IS. Several minutes behind a spinner that never moves is
     // indistinguishable from several minutes hung.
-    const p=d.progress||{}, done=p.done||0, tot=p.total||0;
-    const pct=tot?Math.min(100,Math.round(done/tot*100)):0;
+    const p=d.progress||{};
     el.innerHTML=`
       <div style="font-size:11.5px">
         <div style="display:flex;gap:8px;align-items:center">
           <span class="spin" style="width:11px;height:11px"></span>
-          <span class="dim">comparing every arr record against the file on
-            disk${p.where?` — ${esc(p.where)}`:''}</span>
-          <span class="dim" style="margin-left:auto;white-space:nowrap">${
-            tot?`${fmt(done)} of ${fmt(tot)} titles`:`${fmt(done)} titles`}</span>
+          <span>comparing every arr record against the file on disk</span>
+          ${p.where?`<span class="dim">· ${esc(p.where)}</span>`:''}
         </div>
-        <div style="height:5px;border-radius:3px;background:#1e242c;margin-top:5px;
-                    overflow:hidden">
-          <div style="height:100%;border-radius:3px;background:#6fb0ff;
-                      width:${tot?pct:100}%;
-                      transition:width 1.2s linear${tot?'':`;
-                      background:repeating-linear-gradient(90deg,#6fb0ff33 0 10px,
-                        #6fb0ff11 10px 20px);animation:shapeCrawl .9s linear infinite`}"
-          ></div>
-        </div>
+        ${progressBar(p, 'titles')}
       </div>`;
     return;
   }
@@ -22893,22 +22887,14 @@ function arrSyncPaint(){
   // the progress, and it is the number you were worried about.
   const fx=d.fixing||{}, fixing=!!fx.running;
   const fxDone=fx.done||0, fxTot=fx.total||0;
-  const fxPct=fxTot?Math.min(100,Math.round(fxDone/fxTot*100)):0;
   const fixBox = fixing ? `
     <div style="border:1px solid var(--acc);border-radius:6px;padding:7px 10px;
                 margin-bottom:7px;font-size:11.5px">
       <div style="display:flex;gap:8px;align-items:center">
         <span class="spin" style="width:11px;height:11px"></span>
         <b>Putting it right</b>
-        <span class="dim">${esc(fx.where||'')}</span>
-        <span class="dim" style="margin-left:auto;white-space:nowrap">${
-          fmt(fxDone)} of ${fmt(fxTot)} · ${fxPct}%</span>
       </div>
-      <div style="height:5px;border-radius:3px;background:#1e242c;margin-top:5px;
-                  overflow:hidden">
-        <div style="height:100%;border-radius:3px;background:var(--acc);
-                    width:${fxPct}%;transition:width 1s linear"></div>
-      </div>
+      ${progressBar({done:fxDone, total:fxTot, now:fx.where}, 'titles')}
       <div class="dim" style="font-size:10.5px;margin-top:4px">
         ${fmt(fx.fixed||0)} confirmed${fx.failed?` · <span
           style="color:var(--warn)">${fmt(fx.failed)} refused</span>`:''} —
@@ -22974,6 +22960,54 @@ function arrSyncPaint(){
   arrSyncListPaint();
 }
 
+// ---- one progress bar, used by every long check --------------------------
+// WRITTEN ONCE BECAUSE IT WAS WRONG ONCE. The indeterminate state was drawn
+// with #6fb0ff33 over #6fb0ff11 - twenty and seven per cent alpha - which on
+// this background renders as a row of faint dashes that could as easily be a
+// border as a bar. It looked broken, and something that looks broken while it
+// works is worse than no indicator at all.
+//
+// A percentage alone also does not answer the question a bar raises, which is
+// "how long". So the rate and the estimate ride along with it, and so does the
+// name of the thing under the needle: a bar that moves proves motion, a bar
+// that names a file proves progress.
+function etaText(s){
+  s = Math.round(s||0);
+  if(!s) return '';
+  if(s < 90) return `about ${s}s left`;
+  if(s < 5400) return `about ${Math.round(s/60)} min left`;
+  return `about ${(s/3600).toFixed(1)} h left`;
+}
+function progressBar(p, unit){
+  p = p || {};
+  const done=p.done||0, tot=p.total||0;
+  const pct = tot ? Math.min(100, Math.round(done/tot*100)) : 0;
+  const bits = [];
+  if(tot) bits.push(`<b>${pct}%</b>`);
+  bits.push(`${fmt(done)}${tot?` of ${fmt(tot)}`:''} ${unit||''}`);
+  if(p.rate) bits.push(`${p.rate}/s`);
+  const eta = etaText(p.eta_s);
+  if(eta) bits.push(eta);
+  return `
+    <div style="display:flex;gap:8px;align-items:baseline;font-size:11px;
+                margin-top:2px">
+      <span class="dim" style="flex:1;overflow:hidden;text-overflow:ellipsis;
+        white-space:nowrap">${p.now?esc(p.now):(p.where?esc(p.where):'')}</span>
+      <span class="dim" style="white-space:nowrap">${bits.join(' · ')}</span>
+    </div>
+    <div style="height:6px;border-radius:3px;background:#1b212a;margin-top:4px;
+                overflow:hidden;position:relative">
+      ${tot
+        ? `<div style="height:100%;border-radius:3px;background:#6fb0ff;
+             width:${pct}%;transition:width 1s linear"></div>`
+        : `<div style="position:absolute;inset:0;
+             background:linear-gradient(90deg,#1b212a 0%,#6fb0ff 45%,
+                                        #9fd0ff 50%,#6fb0ff 55%,#1b212a 100%);
+             background-size:220% 100%;animation:barSweep 1.15s linear infinite"
+           ></div>`}
+    </div>`;
+}
+
 // ---- audio titles that contradict the stream -----------------------------
 let _at=null, _atTimer=null, _atOpen=false;
 async function loadAudioTitle(){
@@ -22992,28 +23026,26 @@ function atPaint(){
   if(!el||!_at) return;
   const d=_at;
   if(d.running){
-    const p=d.progress||{}, pct=p.total?Math.round(p.done/p.total*100):0;
-    el.innerHTML=`<div style="font-size:11.5px;display:flex;gap:8px;align-items:center">
-      <span class="spin" style="width:11px;height:11px"></span>
-      <span class="dim">reading what nuarr already knows about every file —
-        ${fmt(p.done||0)} of ${fmt(p.total||0)} (${pct}%)</span></div>`;
+    el.innerHTML=`
+      <div style="font-size:11.5px">
+        <div style="display:flex;gap:8px;align-items:center">
+          <span class="spin" style="width:11px;height:11px"></span>
+          <span>checking every audio title against the stream under it</span>
+          <span class="dim">· from stored probes, no disk</span>
+        </div>
+        ${progressBar(d.progress, 'files')}
+      </div>`;
     return;
   }
   const fx=d.fixing||{};
   if(fx.running){
-    const pct=fx.total?Math.round(fx.done/fx.total*100):0;
     el.innerHTML=`
       <div style="font-size:11.5px">
         <div style="display:flex;gap:8px;align-items:center">
           <span class="spin" style="width:11px;height:11px"></span>
           <b>Correcting titles</b>
-          <span class="dim">${esc(fx.where||'')}</span>
-          <span class="dim" style="margin-left:auto">${fmt(fx.done)} of ${
-            fmt(fx.total)} files · ${pct}%</span>
         </div>
-        <div style="height:5px;border-radius:3px;background:#1e242c;margin-top:5px;
-                    overflow:hidden"><div style="height:100%;border-radius:3px;
-          background:var(--acc);width:${pct}%;transition:width 1s linear"></div></div>
+        ${progressBar({done:fx.done, total:fx.total, now:fx.where}, 'files')}
         <div class="dim" style="font-size:10.5px;margin-top:4px">
           ${fmt(fx.fixed||0)} corrected${fx.failed?` · <span
             style="color:var(--warn)">${fmt(fx.failed)} refused</span>`:''} —
