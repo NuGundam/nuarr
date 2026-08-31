@@ -336,6 +336,18 @@ class Settings:
     subocr_remove_image: bool = False
     # Which OCR engine reads the pictures: "tesseract" (bundled, fast on any
     # CPU) or "paddle" (more accurate on italics, wants a GPU).
+    # HOW MANY MAY BE ON THE CARD AT ONCE, which is a different question from
+    # how many jobs may be in flight. A subtitle OCR job is three phases -
+    # demux the picture track off the pool, read it on the GPU, mux the text
+    # back - and only the middle one touches the card. Capping the whole job
+    # at "what the GPU can take" meant the extra workers queued behind the
+    # card doing nothing, while the disk sat idle through every OCR pass.
+    #
+    # So the JOB cap (subocr_workers) governs how many files are being worked
+    # on, and this governs how many of those may be on the GPU at any moment.
+    # Raise subocr_workers to fill the disk; leave this near what the card
+    # actually saturates at.
+    subocr_gpu_lanes: int = 2
     subocr_engine: str = "tesseract"
     subocr_sdh: bool = True              # convert SDH image subs too
     subocr_all: bool = False             # override: OCR every kept PGS track

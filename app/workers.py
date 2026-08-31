@@ -32,6 +32,13 @@ LIMITS = {
     # spindle contention on the commit is the real limit, and disk_wait_pct
     # already guards that.
     "subocr_workers": (0, 10, 4),
+    # HOW MANY MAY BE ON THE CARD, as against how many files are in flight.
+    # Only the OCR pass touches the GPU; the demux and the mux either side of
+    # it are pool I/O. Capping the whole job at what the card can take left the
+    # extra workers queued behind it and the disk idle through every read.
+    # Turn subocr_workers up to keep the disk busy and leave this near what the
+    # GPU actually saturates at - measured, two lanes reaches the floor.
+    "subocr_gpu_lanes": (1, 6, 2),
     # ffprobe is cheap but still a pool read each.
     "probe_workers": (0, 16, 4),
     # Health/rename checks against the arrs.
@@ -198,10 +205,18 @@ def _subocr_hint() -> str:
             cached = subocr._PADDLE_CACHE.get("data") or {}
             dev = "GPU" if cached.get("cuda") else "CPU"
             if dev == "GPU":
-                return ("Subtitle OCR, reading with PaddleOCR on the GPU. "
-                        "Bound by the card, not by cores - a couple of workers "
-                        "saturate it and more mostly queue behind each other. "
-                        "The commit half is disk I/O, capped by disk_wait_pct.")
+                # This used to end "more mostly queue behind each other",
+                # which was true and is no longer: only the OCR pass takes a
+                # GPU lane, so extra workers now demux and mux while the card
+                # is busy instead of waiting on it. Turning this up is useful
+                # again - subocr_gpu_lanes is what limits the card itself.
+                return ("Subtitle OCR. Each file is demuxed off the pool, read "
+                        "on the GPU, then muxed back - and only the middle "
+                        "part touches the card. This is how many files are in "
+                        "flight, so raise it to keep the disk busy; "
+                        "subocr_gpu_lanes caps how many may be on the GPU at "
+                        "once. The commit half is disk I/O, capped by "
+                        "disk_wait_pct.")
             return ("Subtitle OCR, reading with PaddleOCR on the CPU. "
                     "Heavier per cue than Tesseract - scales with cores, but "
                     "each file costs far more. The commit half is disk I/O, "
@@ -222,6 +237,12 @@ HINTS = {
     "encode_workers": "",   # built live by _encode_hint() - see as_dict()
     "passthrough_workers": "Remux/copy only, no GPU. Limited by pool disk I/O.",
     "subocr_workers": "",   # engine-dependent; see _subocr_hint()
+    "subocr_gpu_lanes":
+        "How many subtitle OCR passes may be on the GPU at the same moment. "
+        "The demux and mux either side of the read are pool I/O and are not "
+        "counted here, so workers above this number stay useful - they read "
+        "and write while the card is busy. Measured on this box, two lanes "
+        "already reach the GPU's floor; more only queues.",
     "probe_workers": "ffprobe scans. Cheap CPU, one pool read each.",
     "arr_concurrency": "Parallel Sonarr/Radarr API calls during scans.",
     "hold_minutes": "MINUTES a file must sit untouched before it can be "
@@ -312,6 +333,7 @@ class WorkerConfig:
     encode_workers: int
     passthrough_workers: int
     subocr_workers: int
+    subocr_gpu_lanes: int
     probe_workers: int
     arr_concurrency: int
     hold_minutes: int

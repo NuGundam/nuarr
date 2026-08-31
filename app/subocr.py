@@ -44,8 +44,10 @@ what actually stops the transcode; deleting it would only save ~19 MB a file
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import threading
 import time
 import re
 import shutil
@@ -1014,8 +1016,7 @@ def _env() -> dict:
 # job row can show real R/W rates the way a transcode does. Thread-LOCAL, not
 # module-global: four workers run run_one() concurrently on separate threads,
 # and a shared hook would attribute one job's ffmpeg to another job's row.
-import threading
-_TLS = threading.local()
+_TLS = threading.local()          # threading is imported at module scope now
 
 
 def _hidden() -> "subprocess.STARTUPINFO | None":
@@ -1487,6 +1488,126 @@ def produce(path: str, probe: dict, file_id: int, work_root: str | None = None,
             "notes": res.get("notes", [])}
 
 
+# How long to let a reader linger after it has closed its output. Generous:
+# the pipe is already shut, so this only covers a tidy exit.
+OCR_EXIT_GRACE_S = 30.0
+
+
+def reap_orphans() -> int:
+    r"""Kill OCR readers left behind by a previous run of nuarr.
+
+    WHY THIS IS NEEDED AT ALL. ocr_paddle() used to p.wait() with no timeout,
+    so a reader that stopped without exiting was waited on forever - and when
+    nuarr restarted, the child was simply inherited by the system and kept
+    running. Measured on this box: six readers against a lane limit of two,
+    five of them orphans, the oldest 58 hours and four of them blocked on
+    cache files that had already been cleaned up.
+
+    The timeout above stops new ones being stranded. This clears the ones that
+    already were, at start-up, because nothing else ever will - they are not in
+    any job table and no code holds a handle to them.
+
+    Identified narrowly: our own interpreter, running our own worker script.
+    Nothing else matches, so nothing else can be hit by it.
+    """
+    if os.name != "nt":
+        return 0
+    import sys
+    me = os.getpid()
+    exe = os.path.basename(sys.executable).lower()
+    killed = 0
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-CimInstance Win32_Process | Select-Object ProcessId,"
+             "ParentProcessId,Name,CommandLine | ConvertTo-Json -Depth 3"],
+            capture_output=True, text=True, timeout=90,
+            creationflags=NO_WINDOW, startupinfo=_hidden()).stdout
+        procs = json.loads(out or "[]")
+        if isinstance(procs, dict):
+            procs = [procs]
+    except Exception:                                        # noqa: BLE001
+        return 0
+    live = {p.get("ProcessId") for p in procs}
+    for p in procs:
+        cl = p.get("CommandLine") or ""
+        if "paddle_worker.py" not in cl:
+            continue
+        if (p.get("Name") or "").lower() != exe:
+            continue
+        pid, parent = p.get("ProcessId"), p.get("ParentProcessId")
+        # Ours, or a live sibling's, if the parent is still around. Only the
+        # ones whose parent is gone are orphans.
+        if pid == me or parent == me or parent in live:
+            continue
+        try:
+            subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                           capture_output=True, timeout=30,
+                           creationflags=NO_WINDOW, startupinfo=_hidden())
+            killed += 1
+        except Exception:                                    # noqa: BLE001
+            pass
+    if killed:
+        from . import joblog as _jl
+        _jl.log(f"subtitle OCR: cleared {killed} reader(s) left behind by an "
+                f"earlier run - each was holding memory and a GPU context",
+                "ok")
+    return killed
+
+
+# ---- the GPU lane ---------------------------------------------------------
+# One semaphore, rebuilt when the setting changes, guarding only the OCR pass.
+# threading, not asyncio: run_one() executes inside asyncio.to_thread, so the
+# thing being held back is a worker thread, not a coroutine.
+_GPU_LOCK = threading.Lock()
+_GPU_SEM: threading.Semaphore | None = None
+_GPU_N = 0
+# Live, so the panel can say "2 of 2 lanes busy" rather than leaving a waiting
+# job looking stalled.
+GPU_STATE: dict = {"lanes": 0, "busy": 0, "waiting": 0}
+
+
+def _gpu_sem() -> threading.Semaphore:
+    global _GPU_SEM, _GPU_N
+    want = max(1, int(getattr(SETTINGS, "subocr_gpu_lanes", 2) or 2))
+    with _GPU_LOCK:
+        if _GPU_SEM is None or want != _GPU_N:
+            # Rebuilt rather than resized because a Semaphore cannot shrink
+            # safely while held. Anything already inside keeps the OLD one and
+            # finishes normally; only new arrivals meet the new limit, so a
+            # settings change never interrupts work in progress.
+            _GPU_SEM = threading.Semaphore(want)
+            _GPU_N = want
+            GPU_STATE["lanes"] = want
+        return _GPU_SEM
+
+
+@contextlib.contextmanager
+def _gpu_lane(tick=None, frac: float = 0.0, what: str = ""):
+    r"""Hold one GPU lane for the duration of an OCR pass.
+
+    SAYS SO WHILE IT WAITS. A worker blocked on the card with a silent progress
+    bar is indistinguishable from one that has hung, and this is a queue people
+    are meant to be able to turn up - so the stage line names the wait rather
+    than freezing on the last thing that happened.
+    """
+    sem = _gpu_sem()
+    if not sem.acquire(blocking=False):
+        GPU_STATE["waiting"] = GPU_STATE.get("waiting", 0) + 1
+        try:
+            if tick:
+                tick(frac, f"{what} — waiting for the GPU")
+            sem.acquire()
+        finally:
+            GPU_STATE["waiting"] = max(0, GPU_STATE.get("waiting", 1) - 1)
+    GPU_STATE["busy"] = GPU_STATE.get("busy", 0) + 1
+    try:
+        yield
+    finally:
+        GPU_STATE["busy"] = max(0, GPU_STATE.get("busy", 1) - 1)
+        sem.release()
+
+
 def run_one(path: str, probe: dict, work_root: str | None = None,
             on_progress=None, mux: bool = True, on_child=None,
             library: str | None = None, file_id: int = 0,
@@ -1567,16 +1688,29 @@ def run_one(path: str, probe: dict, work_root: str | None = None,
                             f"pictures - {shape['why']}", "info")
                     typeset.append({"rel": t["rel"], **shape})
                     continue
-                tick(base + span * 0.1, f"OCR track {i+1}/{n}{who}")
-                # ocr() moves the bar itself while it grinds - see its ticker.
-                # WHICHEVER ENGINE THIS LIBRARY CHOSE. Tesseract goes through
-                # pgsrip as it always has; PaddleOCR runs in its own process,
-                # reads italics far better, and can keep each cue's position.
-                if engine(library) == "paddle":
-                    srt = ocr_paddle(sup, tick, base + span * 0.1,
-                                     span * 0.8, who)
-                else:
-                    srt = ocr(sup, tick, base + span * 0.1, span * 0.8, who)
+                # THE CARD IS THE NARROW PART, AND ONLY THIS PART USES IT.
+                # The extract above and the mux below are pool I/O; this is the
+                # only phase that touches the GPU. Holding a job slot across
+                # all three meant a worker that had finished reading sat on the
+                # disk's slot while it waited for the card, and the disk did
+                # nothing for the whole OCR pass.
+                #
+                # Taking the lane HERE, and only here, means the other workers
+                # are free to be extracting and muxing while this one reads -
+                # the phases interleave instead of taking turns.
+                with _gpu_lane(tick, base + span * 0.1,
+                               f"OCR track {i+1}/{n}{who}"):
+                    tick(base + span * 0.1, f"OCR track {i+1}/{n}{who}")
+                    # ocr() moves the bar itself while it grinds - see its
+                    # ticker. WHICHEVER ENGINE THIS LIBRARY CHOSE. Tesseract
+                    # goes through pgsrip as it always has; PaddleOCR runs in
+                    # its own process, reads italics far better, and can keep
+                    # each cue's position.
+                    if engine(library) == "paddle":
+                        srt = ocr_paddle(sup, tick, base + span * 0.1,
+                                         span * 0.8, who)
+                    else:
+                        srt = ocr(sup, tick, base + span * 0.1, span * 0.8, who)
                 tick(base + span * 0.9, f"OCR track {i+1}/{n}{who} done")
             except Exception as e:
                 notes.append(f"rel {t['rel']}: {e}")
@@ -2028,7 +2162,25 @@ def _run_progress(args: list[str], tick, base: float, span: float,
                     pass
             else:
                 tail.append(line)
-        rc = p.wait()
+        # A WAIT WITH NO TIMEOUT IS A PROCESS THAT CAN OUTLIVE THE PROGRAM.
+        # Found by counting OCR processes: six were running against a lane
+        # limit of two, and five of them were orphans - one 58 hours old,
+        # four waiting on cache files that had long since been cleaned up.
+        # Each had done ten or twenty seconds of work and then stopped, held
+        # 65 MB and a GPU context, and survived every restart since, because
+        # nothing ever stopped waiting for them.
+        #
+        # The stdout loop above ends when the pipe closes, so reaching here
+        # means the child has finished writing. Anything beyond a few seconds
+        # after that is a child that is not going to exit on its own.
+        try:
+            rc = p.wait(timeout=OCR_EXIT_GRACE_S)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            rc = p.wait(timeout=10)
+            from . import joblog as _jl
+            _jl.log(f"subtitle OCR: the reader stopped responding after "
+                    f"closing its output and was killed{who}", "warn")
     finally:
         if hook:
             try:
