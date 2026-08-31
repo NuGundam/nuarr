@@ -2875,6 +2875,27 @@ def _annotate_status(cur, rows: list) -> None:
             rejected=r.get("file_id") in rejected)
 
 
+# MEASURED, BECAUSE IT IS NOT FREE. sweep_pick over the whole library takes
+# 2.3 seconds, and the panel behind it polls every 2.5 while work is moving -
+# so computing this per poll would have the page spending most of its life
+# asking the same question. The answer only changes when the sweep queues
+# something or a scan finds new files, neither of which happens on that scale.
+_BACKLOG: dict = {"at": 0.0, "n": None}
+_BACKLOG_TTL = 120.0
+
+
+def _backlog():
+    """How many files across the library still need OCR. Cached."""
+    now = time.time()
+    if _BACKLOG["n"] is not None and now - _BACKLOG["at"] < _BACKLOG_TTL:
+        return _BACKLOG["n"]
+    try:
+        _BACKLOG.update(n=len(sweep_pick(100000)), at=now)
+    except Exception:                                        # noqa: BLE001
+        _BACKLOG.update(at=now)
+    return _BACKLOG["n"]
+
+
 def shape_rows(limit: int = 60) -> dict:
     """Recorded verdicts, newest first, with the numbers behind each one."""
     from .db import cursor
@@ -2900,6 +2921,14 @@ def shape_rows(limit: int = 60) -> dict:
                 " GROUP BY file_id HAVING MAX(typeset)=0)"
             ).fetchone()["n"]
             summary["status"] = status_counts(cur)
+            # HOW MUCH WORK IS ACTUALLY LEFT, which is not what the numbers
+            # above describe and was being read as if it were. "53 of 97 done"
+            # looks like a task 55% finished; 97 is only how many files have
+            # been MEASURED so far, and measuring happens as the sweep goes -
+            # so the denominator grows and the bar can never arrive. The real
+            # remaining count is the library-wide one, and without it the
+            # panel invites exactly the question "why has this not finished".
+            summary["backlog"] = _backlog()
             # When the newest verdict was written - "measured 85 files" says
             # nothing about whether that was five minutes or five weeks ago.
             r = cur.execute("SELECT MAX(at) a FROM sub_shape").fetchone()

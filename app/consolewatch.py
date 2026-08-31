@@ -321,9 +321,18 @@ def _is_ours(chain: list) -> bool:
 
 
 def _record(pid: int, owner_pid: int, procs: dict, title: str,
-            visible: int = 1) -> None:
-    ent = procs.get(owner_pid) or ("?", 0)
-    chain = _ancestry(owner_pid, procs)
+            visible: int = 1, prev: dict | None = None) -> None:
+    # THE PREVIOUS SNAPSHOT IS THE ONLY RECORD OF A PROCESS THAT HAS GONE, and
+    # the ones that go fastest are precisely the flashes worth catching. The
+    # first version looked the owner up in the CURRENT list only, so every
+    # fast console produced a row reading "?" with no command and no parents -
+    # thirteen of them on this machine, which is worse than not logging at all
+    # because it looks like the watcher is broken rather than the process
+    # being quick. Merged so the dead are still identifiable.
+    look = dict(prev or {})
+    look.update(procs)
+    ent = look.get(owner_pid) or ("?", 0)
+    chain = _ancestry(owner_pid, look)
     ours = _is_ours(chain)
     # WHAT it was running, not just what it was called. The command line is
     # read while the process is still alive; a moment later it is unavailable
@@ -375,14 +384,18 @@ def sample(prev: dict) -> dict:
         # cmd.exe". Checking conhost caught nothing at all.
         vis, title = _visible_window(ppid)
         if vis:
-            _record(pid, ppid, procs, title, visible=1)
+            _record(pid, ppid, procs, title, visible=1, prev=prev)
             continue
         # Owner already gone. A console that opened and closed inside one
         # sampling gap is EXACTLY the flash being hunted, so it is recorded
         # with the visibility marked unknown rather than dropped - the whole
         # point is to catch the ones nobody manages to look at in time.
-        if ppid not in procs:
-            _record(pid, ppid, procs, "", visible=-1)
+        #
+        # Only worth a row if the previous snapshot can still name it. An
+        # unidentifiable "?" tells nobody anything and, repeated, reads as a
+        # broken watcher.
+        if ppid not in procs and ppid in (prev or {}):
+            _record(pid, ppid, procs, "", visible=-1, prev=prev)
     return procs
 
 

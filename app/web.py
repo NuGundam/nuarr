@@ -19888,16 +19888,14 @@ async function shapeLoad(){
     <div style="display:flex;gap:14px;flex-wrap:wrap;margin:7px 0 4px;font-size:11.5px;
                 align-items:center">
       <span style="color:var(--ok)"><b>${fmt(done)}</b>
-        <span class="dim">of ${fmt(tot)} done${
+        <span class="dim">of ${fmt(tot)} measured${
           tot?` (${Math.round(done/tot*100)}%)`:''}</span></span>
-      <span class="dim">·</span>
-      <span><b>${fmt(tot)}</b> <span class="dim">files measured</span></span>
       <span style="color:#e2b341"><b>${fmt(s.typeset||0)}</b> <span class="dim">typeset — burned in</span></span>
       <span style="color:#6fd08c"><b>${fmt(s.dialogue||0)}</b> <span class="dim">dialogue — read as text</span></span>
-      ${stChip('processing','processing','var(--acc)')}
+      ${stChip('processing','being read now','var(--acc)')}
       ${stChip('queued','queued','#b48bf2')}
-      ${stChip('eligible','waiting','var(--dim)')}
-      ${stChip('held','held','var(--warn)')}
+      ${stChip('eligible','due on a later sweep','var(--dim)')}
+      ${stChip('held','not converting — rejected or switched off','var(--warn)')}
       <span id="shapeHold" class="dim" style="font-size:11px;${held?'':'display:none'}">
         · paused while you read — scroll back to the top to resume</span>
     </div>
@@ -19934,11 +19932,20 @@ async function shapeLoad(){
     <div class="dim" style="font-size:10.5px;margin:-1px 0 4px">
       ${s.last_at?`newest verdict ${ago(s.last_at)}`
                  :'nothing measured yet'}${
-        live.last?` · last read finished ${ago(live.last)}`:''}${
-        (st.processing||st.queued||st.eligible)
-          ? ` · <span style="color:var(--acc)">${fmt((st.processing||0)+
-              (st.queued||0)+(st.eligible||0))} still to do</span>`
-          : ' · <span style="color:var(--ok)">nothing left to measure</span>'}</div>`;
+        live.last?` · last read finished ${ago(live.last)}`:''}
+      ${s.backlog!=null
+        // THE NUMBER THAT WAS MISSING, and its absence is why this panel read
+        // as a stalled task. The counts above describe the files MEASURED so
+        // far; measuring happens as the sweep goes, so that total climbs and
+        // "53 of 97" can never arrive at 97. What a person wants to know is
+        // how much is left in the library, which is this.
+        ? (s.backlog
+            ? ` · <span style="color:var(--acc)">${fmt(s.backlog)} file${
+                s.backlog===1?'':'s'} in the library still to convert</span>,
+                a batch at a time`
+            : ' · <span style="color:var(--ok)">every file in the library has'
+              + ' been converted</span>')
+        : ''}</div>`;
   // First build, or the row area is missing: lay the panel out. After that
   // only the head and counts are rewritten, so the table keeps its scroll.
   if(!document.getElementById('shapeTblWrap')){
@@ -23216,6 +23223,12 @@ function cwPaint(){
         ? `· watching since ${ago(d.since)} · ${fmt(d.consoles_seen||0)} console(s)
            created, most correctly hidden`
         : '· not watching'}</span>
+      <span class="dim" style="font-size:10.5px;flex-basis:100%">
+        Checked every two seconds, so a console that opens and closes faster
+        than that can be missed entirely — an empty list means nothing has been
+        <i>caught</i>, not that nothing has happened. Anything that recurs will
+        be seen sooner or later, which is what makes the counts worth reading.
+      </span>
       ${n?`<button onclick="cwForget()" style="font-size:11px;padding:2px 9px;
         margin-left:auto" title="Clear the record - do this after a fix, so the next entry means something">Clear</button>`:''}
     </div>
