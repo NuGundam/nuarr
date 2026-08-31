@@ -58,7 +58,7 @@ from . import joblog
 # NO_WINDOW is CREATE_NO_WINDOW. EVERY child process nuarr spawns must pass it
 # or Windows hands it a console of its own - which is what put a flickering
 # ffmpeg window on screen for each of the ~1,700 samples a full pass takes.
-from .config import NO_WINDOW, SETTINGS
+from .config import NO_WINDOW, SETTINGS, hidden_si
 from .db import cursor
 
 # ---------------------------------------------------------------- CUDA setup
@@ -350,7 +350,8 @@ def _nvidia_present() -> bool:
     """Is there an NVIDIA GPU at all - asked of the driver, not of CUDA."""
     try:
         r = subprocess.run(["nvidia-smi", "-L"], capture_output=True,
-                           text=True, timeout=10, creationflags=NO_WINDOW)
+                           text=True, timeout=10, creationflags=NO_WINDOW,
+                startupinfo=hidden_si())
         return r.returncode == 0 and "GPU" in (r.stdout or "")
     except Exception:                                    # noqa: BLE001
         return False
@@ -368,7 +369,8 @@ def latest_version(pkg: str = "faster-whisper") -> dict:
         r = subprocess.run(
             [_sys.executable, "-m", "pip", "index", "versions", pkg],
             capture_output=True, text=True, timeout=90,
-            creationflags=NO_WINDOW)
+            creationflags=NO_WINDOW,
+            startupinfo=hidden_si())
         out = (r.stdout or "") + (r.stderr or "")
         m = re.search(r"LATEST:\s*([0-9][\w.\-]*)", out)
         if not m:
@@ -474,7 +476,8 @@ def _install_worker(mode: str) -> None:
     try:
         p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, text=True,
-                             creationflags=NO_WINDOW)
+                             creationflags=NO_WINDOW,
+            startupinfo=hidden_si())
         for line in p.stdout:                      # live tail for the page
             line = line.rstrip()
             if line:
@@ -571,7 +574,8 @@ def _load_probe(dev: str, ct: str) -> tuple[bool, str]:
             [_sys.executable, script, "--device", dev, "--compute", ct,
              "--root", str(MODEL_DIR), "--size", MODEL_SIZE],
             capture_output=True, text=True, timeout=PROBE_TIMEOUT_S,
-            creationflags=NO_WINDOW)
+            creationflags=NO_WINDOW,
+            startupinfo=hidden_si())
     except subprocess.TimeoutExpired:
         _PROBE[key] = (False, f"loading the model on {dev} did not finish in "
                               f"{int(PROBE_TIMEOUT_S)}s")
@@ -733,7 +737,8 @@ def _duration(path: str) -> float:
             [fp, "-v", "quiet", "-show_entries", "format=duration",
              "-of", "csv=p=0", path],
             capture_output=True, text=True, timeout=60,
-            creationflags=NO_WINDOW)
+            creationflags=NO_WINDOW,
+            startupinfo=hidden_si())
         return float((p.stdout or "0").strip() or 0)
     except Exception:                                    # noqa: BLE001
         return 0.0
@@ -1197,7 +1202,8 @@ def apply_tags(path: str, tags: dict[int, str]) -> tuple[bool, str]:
         cmd += ["--edit", f"track:a{int(track) + 1}", "--set", f"language={code}"]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=600,
-                           creationflags=NO_WINDOW)
+                           creationflags=NO_WINDOW,
+            startupinfo=hidden_si())
     except Exception as e:                               # noqa: BLE001
         return False, str(e)[:160]
     if r.returncode != 0:
@@ -1516,7 +1522,8 @@ def _reprobe_quiet(file_id: int, path: str) -> None:
         q = subprocess.run([fp, "-v", "quiet", "-print_format", "json",
                             "-show_streams", "-show_format", path],
                            capture_output=True, text=True, timeout=120,
-                           creationflags=NO_WINDOW)
+                           creationflags=NO_WINDOW,
+            startupinfo=hidden_si())
         if q.returncode == 0 and q.stdout:
             import json as _json
             with cursor() as cur:

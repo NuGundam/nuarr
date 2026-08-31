@@ -20,6 +20,7 @@ import urllib.error
 import urllib.request
 
 from . import joblog, version
+from .config import hidden_si
 
 # GitHub's unauthenticated limit is 60 requests an hour per IP, shared with
 # anything else on this network. A check every 6 hours costs 4 of them a day
@@ -464,7 +465,8 @@ Stop-Transcript | Out-Null
         r = subprocess.run(
             ["powershell", "-NoProfile", "-Command", spawn],
             creationflags=0x08000000, capture_output=True, text=True,
-            timeout=60)
+            timeout=60,
+            startupinfo=hidden_si())
         if r.stdout.strip().splitlines()[-1:] != ["0"]:
             raise RuntimeError(f"WMI create returned {r.stdout.strip()!r} "
                                f"{r.stderr.strip()!r}")

@@ -67,6 +67,8 @@ from __future__ import annotations
 import os
 import zlib
 
+from .config import hidden_si
+
 # The Tracks header lives well inside the first MiB on every file produced by
 # ffmpeg or mkvmerge. Reading more would be pointless I/O on a 19 GB file.
 HEAD = 1 << 20
@@ -306,7 +308,8 @@ def has_rpu(path: str, ffmpeg: str, seconds: int = 20) -> bool | None:
         r = subprocess.run(
             [ffmpeg, "-y", "-v", "error", "-t", str(seconds), "-i", path,
              "-map", "0:v:0", "-c:v", "copy", "-f", "hevc", tmp],
-            capture_output=True, timeout=900, creationflags=NO_WINDOW)
+            capture_output=True, timeout=900, creationflags=NO_WINDOW,
+            startupinfo=hidden_si())
         if r.returncode != 0 or not os.path.exists(tmp):
             return None
         data = open(tmp, "rb").read()

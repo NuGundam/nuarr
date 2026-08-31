@@ -26,6 +26,14 @@ if os.name == "nt":
     def _hidden_init(self, *args, **kwargs):
         kwargs["creationflags"] = (kwargs.get("creationflags") or 0) \
             | _CREATE_NO_WINDOW
+        # The flag alone is not enough - some console-subsystem binaries
+        # allocate a console regardless, and SW_HIDE is what stops the one
+        # they take from being drawn. See paddle_worker.py.
+        if not kwargs.get("startupinfo"):
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            si.wShowWindow = 0                  # SW_HIDE
+            kwargs["startupinfo"] = si
         _orig_init(self, *args, **kwargs)
 
     subprocess.Popen.__init__ = _hidden_init

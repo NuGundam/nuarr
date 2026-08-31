@@ -46,7 +46,7 @@ import zipfile
 
 import httpx
 
-from .config import DATA_DIR, NO_WINDOW, SETTINGS
+from .config import DATA_DIR, NO_WINDOW, SETTINGS, hidden_si
 from . import schedules
 from .db import kv_get, kv_set
 from . import joblog
@@ -452,7 +452,8 @@ def _driver_version(max_age_s: float = 3600.0) -> str:
     try:
         r = subprocess.run(["nvidia-smi", "--query-gpu=driver_version",
                             "--format=csv,noheader"], capture_output=True,
-                           timeout=10, creationflags=NO_WINDOW)
+                           timeout=10, creationflags=NO_WINDOW,
+                startupinfo=hidden_si())
         v = r.stdout.decode("utf-8", "replace").strip().splitlines()[0]
     except Exception:
         v = ""
@@ -567,7 +568,8 @@ def probe_nvenc(exe: str) -> dict:
              # that cries wolf is worse than none.
              "-f", "lavfi", "-i", "color=c=black:s=640x360:d=0.1",
              "-c:v", "hevc_nvenc", "-f", "null", "-"],
-            capture_output=True, timeout=60, creationflags=NO_WINDOW)
+            capture_output=True, timeout=60, creationflags=NO_WINDOW,
+                startupinfo=hidden_si())
         ok = r.returncode == 0
         if not ok:
             raw = r.stderr.decode("utf-8", "replace").strip()
@@ -865,7 +867,8 @@ def local_version(exe: str | None = None) -> str:
         return _VER_CACHE[key]
     try:
         r = subprocess.run([exe, "-version"], capture_output=True, timeout=15,
-                           creationflags=NO_WINDOW)
+                           creationflags=NO_WINDOW,
+                startupinfo=hidden_si())
         m = _VER_RE.search(r.stdout.decode("utf-8", "replace"))
         v = m.group(1) if m else ""
     except Exception:
@@ -1099,7 +1102,8 @@ def verify_install() -> dict:
     if out["ffprobe_exists"]:
         try:
             r = subprocess.run([fp, "-version"], capture_output=True, timeout=15,
-                               creationflags=NO_WINDOW)
+                               creationflags=NO_WINDOW,
+            startupinfo=hidden_si())
             out["ffprobe_runs"] = r.returncode == 0
         except Exception:
             out["ffprobe_runs"] = False

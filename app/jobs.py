@@ -34,7 +34,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 from . import dvfix, fileops, gate, joblog, rules, workers  # noqa: F401  (rules used in snapshot)
-from .config import NO_WINDOW, SETTINGS
+from .config import NO_WINDOW, SETTINGS, hidden_si
 from .db import cursor, log_event
 
 # ---------------------------------------------------------------- state ----
@@ -4306,7 +4306,8 @@ def _mkvextract_progress(cmd: list[str], on_frac) -> None:
     """
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                          text=True, errors="replace", creationflags=NO_WINDOW,
-                         bufsize=1)
+                         bufsize=1,
+            startupinfo=hidden_si())
     tail: collections.deque[str] = collections.deque(maxlen=8)
     try:
         for line in p.stdout or ():
@@ -4378,7 +4379,8 @@ def rescue_subs(src: str, plan, workdir: str, job_id: str = "",
             subprocess.run([_ffmpeg_exe(), "-hide_banner", "-y", "-nostdin",
                             "-i", vtt, "-c:s", "srt", srt],
                            capture_output=True, timeout=600,
-                           creationflags=NO_WINDOW, check=True)
+                           creationflags=NO_WINDOW, check=True,
+            startupinfo=hidden_si())
             _report(n, 1.0, f"converting the {lang} subtitle to SRT")
             if os.path.getsize(srt) > 0:
                 out.append({"srt": srt, "name": label, "lang": lang})
@@ -4409,7 +4411,8 @@ def _mkv_sub_tracks(src: str) -> list[dict]:
     try:
         pr = subprocess.run([_mkvextract_exe().replace("mkvextract", "mkvmerge"),
                              "-J", src], capture_output=True, text=True,
-                            timeout=120, creationflags=NO_WINDOW, errors="replace")
+                            timeout=120, creationflags=NO_WINDOW, errors="replace",
+            startupinfo=hidden_si())
         tracks = json.loads(pr.stdout).get("tracks") or []
     except Exception:
         return []

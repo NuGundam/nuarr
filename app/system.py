@@ -17,7 +17,7 @@ import time
 
 import psutil
 
-from .config import NO_WINDOW, SETTINGS
+from .config import NO_WINDOW, SETTINGS, hidden_si
 
 _GPU_CACHE: tuple[float, dict] = (0.0, {})
 _GPU_TTL = 2.0          # nvidia-smi costs ~100ms; do not run it per poll
@@ -49,7 +49,8 @@ def _gpu() -> dict:
                       "memory.used,memory.total,temperature.gpu,"
                       "utilization.decoder",
                  "--format=csv,noheader,nounits"],
-                capture_output=True, timeout=8, creationflags=NO_WINDOW)
+                capture_output=True, timeout=8, creationflags=NO_WINDOW,
+                startupinfo=hidden_si())
             line = r.stdout.decode("utf-8", "replace").strip().splitlines()[0]
             parts = [p.strip() for p in line.split(",")]
             out = {
@@ -84,7 +85,8 @@ def _gpu() -> dict:
                 r = subprocess.run(
                     [exe, "--query-compute-apps=pid,used_memory",
                      "--format=csv,noheader,nounits"],
-                    capture_output=True, timeout=8, creationflags=NO_WINDOW)
+                    capture_output=True, timeout=8, creationflags=NO_WINDOW,
+                startupinfo=hidden_si())
                 apps: list[dict] = []
                 per_proc_vram = False
                 for line in r.stdout.decode("utf-8", "replace").splitlines():

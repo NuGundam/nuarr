@@ -32,11 +32,27 @@ import sys
 # on the desktop. Patch Popen before the heavy imports - it underlies run,
 # call and check_output, so one patch covers whatever paddle or pytesseract
 # decide to launch. See pgsrip_hidden.py for the full story.
+#
+# BOTH HALVES, NOT JUST THE FLAG. This patched creationflags only, and that was
+# not enough: sampling every process at 4 Hz while OCR ran caught nvidia-smi
+# and ffmpeg launches from inside these workers, each with a conhost.exe of its
+# own - one console window apiece. CREATE_NO_WINDOW asks for no console; some
+# console-subsystem binaries take one anyway. STARTF_USESHOWWINDOW with SW_HIDE
+# says how to show a window if one is created, so a console that does get
+# allocated is never mapped to the screen.
+#
+# It scaled with the worker count, which is what made it visible: one OCR
+# worker flickered rarely enough to miss, six flickered constantly.
 if os.name == "nt":
     _orig_popen_init = _sp.Popen.__init__
 
     def _hidden_popen_init(self, *a, **k):
         k["creationflags"] = (k.get("creationflags") or 0) | 0x08000000
+        if not k.get("startupinfo"):
+            si = _sp.STARTUPINFO()
+            si.dwFlags |= _sp.STARTF_USESHOWWINDOW
+            si.wShowWindow = 0                  # SW_HIDE
+            k["startupinfo"] = si
         _orig_popen_init(self, *a, **k)
 
     _sp.Popen.__init__ = _hidden_popen_init

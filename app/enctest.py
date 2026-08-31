@@ -48,7 +48,7 @@ import subprocess
 import tempfile
 import time
 
-from .config import NO_WINDOW
+from .config import NO_WINDOW, hidden_si
 from .db import kv_get, kv_set
 from . import joblog
 
@@ -230,7 +230,8 @@ def _probe_one(exe: str, fam: str, encoder: str, timeout: float = 45.0) -> dict:
         t0 = time.time()
         try:
             p = subprocess.run(cmd, capture_output=True, text=True,
-                               timeout=timeout, creationflags=NO_WINDOW)
+                               timeout=timeout, creationflags=NO_WINDOW,
+            startupinfo=hidden_si())
             ok = (p.returncode == 0 and os.path.exists(out)
                   and os.path.getsize(out) > 1024)
             raw = "" if ok else (p.stderr or "").strip()

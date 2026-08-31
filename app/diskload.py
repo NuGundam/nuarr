@@ -51,6 +51,8 @@ from __future__ import annotations
 import os
 import subprocess
 import threading
+
+from .config import hidden_si
 import time
 
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -201,7 +203,8 @@ def _read_counters() -> dict[str, dict]:
         r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive",
                             "-Command", ps],
                            capture_output=True, text=True, timeout=20,
-                           creationflags=NO_WINDOW)
+                           creationflags=NO_WINDOW,
+            startupinfo=hidden_si())
         out: dict[str, dict] = {}
         for line in (r.stdout or "").splitlines():
             parts = line.strip().split("|")
@@ -387,7 +390,8 @@ def _load_map_shell() -> None:
         r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive",
                             "-Command", ps],
                            capture_output=True, text=True, timeout=30,
-                           creationflags=NO_WINDOW)
+                           creationflags=NO_WINDOW,
+            startupinfo=hidden_si())
         for line in (r.stdout or "").splitlines():
             parts = line.strip().split("|", 1)
             if len(parts) != 2:

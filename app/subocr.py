@@ -52,7 +52,7 @@ import shutil
 import subprocess
 import tempfile
 
-from .config import NO_WINDOW, SETTINGS
+from .config import NO_WINDOW, SETTINGS, hidden_si
 
 # PGS ONLY, because pgsrip is PGS-rip. Including VOBSUB/DVB here was a bug
 # caught on the first real batch: `-c:s copy` into a .sup container is invalid
@@ -2392,12 +2392,14 @@ def tesseract_update_start(target_version: str = "") -> dict:
             # has no spaces because DATA_DIR does not). Popen rather than
             # run, so a hang can be killed with its whole tree.
             p = subprocess.Popen([exe, "/S", f"/D={dst}"],
-                                 creationflags=NO_WINDOW)
+                                 creationflags=NO_WINDOW,
+            startupinfo=hidden_si())
             try:
                 rc = p.wait(timeout=600)
             except subprocess.TimeoutExpired:
                 subprocess.run(["taskkill", "/T", "/F", "/PID", str(p.pid)],
-                               capture_output=True, creationflags=NO_WINDOW)
+                               capture_output=True, creationflags=NO_WINDOW,
+            startupinfo=hidden_si())
                 raise RuntimeError("the installer hung and was stopped - "
                                    "nothing was changed")
             if rc != 0:
@@ -2515,7 +2517,8 @@ def pip_update_start() -> dict:
                 [sys.executable, "-m", "pip", "install", "--upgrade",
                  "--prefer-binary", "--no-warn-script-location", "pgsrip"],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                creationflags=NO_WINDOW)
+                creationflags=NO_WINDOW,
+            startupinfo=hidden_si())
             for line in p.stdout:
                 if line.strip():
                     tail.append(line.rstrip())

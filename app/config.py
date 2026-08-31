@@ -16,6 +16,7 @@ from __future__ import annotations
 import sys
 
 import os
+import subprocess
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -42,6 +43,35 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 # ffmpeg's -progress output from. CREATE_NO_WINDOW keeps stdout/stderr
 # redirectable and only suppresses the window, which is exactly what we want.
 NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+
+# CREATE_NO_WINDOW IS NOT ALWAYS ENOUGH ON ITS OWN, which is why the flicker
+# came back the moment the subtitle OCR workers were turned up. Measured rather
+# than assumed: sampling every running process at 4 Hz while OCR ran caught five
+# nvidia-smi launches, each with a conhost.exe of its own as its child - one
+# console window apiece. The flag says "do not give this process a console";
+# some console-subsystem binaries allocate one anyway, and conhost is the proof.
+#
+# STARTF_USESHOWWINDOW with SW_HIDE closes that gap: it tells Windows how to
+# show the window if one is created at all, so a console that gets allocated is
+# never mapped to the screen. subocr passes both and has always been silent;
+# the GPU poll passed only the flag and flashed. The pair belongs together, so
+# it lives here as one call rather than as two things to remember separately.
+def hidden_si():
+    """STARTUPINFO that hides a window even if one gets created."""
+    if os.name != "nt":
+        return None
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = 0                       # SW_HIDE
+    return si
+
+
+def quiet_run(cmd, **kw):
+    """subprocess.run with both halves of the console suppression applied."""
+    kw.setdefault("creationflags", NO_WINDOW)
+    if os.name == "nt":
+        kw.setdefault("startupinfo", hidden_si())
+    return subprocess.run(cmd, **kw)
 
 DB_PATH = DATA_DIR / "nuarr.db"
 LOG_PATH = DATA_DIR / "nuarr.log"

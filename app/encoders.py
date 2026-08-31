@@ -30,7 +30,7 @@ import subprocess
 import tempfile
 import time
 
-from .config import NO_WINDOW
+from .config import NO_WINDOW, hidden_si
 
 # ---------------------------------------------------------------- families --
 
@@ -147,7 +147,8 @@ def _try_family(fam: str, timeout: float = 25.0, attempts: int = 2) -> dict:
         cmd += ["-t", "2", out]
         try:
             p = subprocess.run(cmd, capture_output=True, text=True,
-                               timeout=timeout, creationflags=NO_WINDOW)
+                               timeout=timeout, creationflags=NO_WINDOW,
+            startupinfo=hidden_si())
             ok = (p.returncode == 0 and os.path.exists(out)
                   and os.path.getsize(out) > 1024)
             err = "" if ok else (p.stderr or "").strip().splitlines()[-1:] or [""]
@@ -400,7 +401,8 @@ def devices() -> dict:
     try:
         r = subprocess.run(["nvidia-smi", "--query-gpu=name",
                             "--format=csv,noheader"], capture_output=True,
-                           text=True, timeout=10, creationflags=NO_WINDOW)
+                           text=True, timeout=10, creationflags=NO_WINDOW,
+                startupinfo=hidden_si())
         if r.returncode == 0:
             gpu = (r.stdout or "").strip().splitlines()[0].strip()
     except Exception:                                    # noqa: BLE001

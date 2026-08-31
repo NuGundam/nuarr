@@ -38,7 +38,7 @@ import subprocess
 import time
 
 from . import joblog, rules
-from .config import SETTINGS
+from .config import SETTINGS, hidden_si
 from . import schedules
 from .db import cursor
 
@@ -190,7 +190,8 @@ def probe(path: str) -> dict | None:
             [_ffprobe(), "-v", "error", "-show_streams", "-show_format",
              "-of", "json", path],
             capture_output=True, text=True, timeout=180,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            startupinfo=hidden_si()).stdout
         return json.loads(out) if out.strip() else None
     except Exception:
         return None

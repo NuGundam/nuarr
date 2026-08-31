@@ -34,7 +34,7 @@ from . import (arrhealth, audiolang, autoqueue, backup, commitqueue,
                refetch, renamequeue, renamer, rules, scanner, system, updates,
                version, webhooks, workers)
 from .arr import ArrClient
-from .config import DB_PATH, NO_WINDOW, SETTINGS
+from .config import DB_PATH, NO_WINDOW, SETTINGS, hidden_si
 from .db import ON_LOOP as db_on_loop
 from .db import cursor, display_label, init_db
 
@@ -1249,7 +1249,8 @@ def _net_use(server: str, user: str, pwd: str) -> tuple[bool, str]:
     r = subprocess.run(
         ["net", "use", f"\\\\{server}\\IPC$", pwd, f"/user:{user}",
          "/persistent:no"],
-        capture_output=True, text=True, timeout=25, creationflags=NO_WINDOW)
+        capture_output=True, text=True, timeout=25, creationflags=NO_WINDOW,
+            startupinfo=hidden_si())
     if r.returncode == 0:
         return True, ""
     err = (r.stderr or r.stdout or "").strip().splitlines()
@@ -1261,12 +1262,14 @@ def _net_use(server: str, user: str, pwd: str) -> tuple[bool, str]:
     if "1219" in msg:
         subprocess.run(["net", "use", f"\\\\{server}", "/delete", "/y"],
                        capture_output=True, text=True, timeout=15,
-                       creationflags=NO_WINDOW)
+                       creationflags=NO_WINDOW,
+            startupinfo=hidden_si())
         r = subprocess.run(
             ["net", "use", f"\\\\{server}\\IPC$", pwd, f"/user:{user}",
              "/persistent:no"],
             capture_output=True, text=True, timeout=25,
-            creationflags=NO_WINDOW)
+            creationflags=NO_WINDOW,
+            startupinfo=hidden_si())
         if r.returncode == 0:
             return True, ""
         err = (r.stderr or r.stdout or "").strip().splitlines()
@@ -1278,7 +1281,8 @@ def _net_share_names(server: str) -> list[str]:
     """The shares `server` offers, minus the administrative ones."""
     import subprocess
     r = subprocess.run(["net", "view", f"\\\\{server}"], capture_output=True,
-                       text=True, timeout=25, creationflags=NO_WINDOW)
+                       text=True, timeout=25, creationflags=NO_WINDOW,
+            startupinfo=hidden_si())
     if r.returncode != 0:
         return []
     out, in_table = [], False
@@ -1385,7 +1389,8 @@ def api_net_forget(server: str):
         raise HTTPException(404, f"no stored connection for {server}")
     subprocess.run(["net", "use", f"\\\\{server}", "/delete", "/y"],
                    capture_output=True, text=True, timeout=15,
-                   creationflags=NO_WINDOW)
+                   creationflags=NO_WINDOW,
+            startupinfo=hidden_si())
     p = _config_path()
     raw = {}
     if p.exists():
@@ -1880,7 +1885,8 @@ async def api_codecpolicy_test(body: dict = Body(...)):
         t0 = time.time()
         try:
             p = subprocess.run(cmd, capture_output=True, text=True,
-                               timeout=90, creationflags=NO_WINDOW)
+                               timeout=90, creationflags=NO_WINDOW,
+            startupinfo=hidden_si())
             took = time.time() - t0
             ok = p.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 1024
             size = os.path.getsize(out) if os.path.exists(out) else 0
@@ -4032,7 +4038,8 @@ def _reprobe(file_id: int, path: str) -> None:
         q = subprocess.run([fp, "-v", "quiet", "-print_format", "json",
                             "-show_streams", "-show_format", path],
                            capture_output=True, text=True, timeout=120,
-                           creationflags=NO_WINDOW)
+                           creationflags=NO_WINDOW,
+            startupinfo=hidden_si())
         if q.returncode == 0 and q.stdout:
             with cursor() as cur:
                 cur.execute("UPDATE file_probes SET json=? WHERE file_id=?",
@@ -6040,7 +6047,8 @@ async def api_mkvtool(check: int = 0):
         try:
             out = subprocess.run([exe, "--version"], capture_output=True,
                                  text=True, timeout=15,
-                                 creationflags=NO_WINDOW).stdout or ""
+                                 creationflags=NO_WINDOW,
+            startupinfo=hidden_si()).stdout or ""
             m = re.search(r"v(\d+(?:\.\d+)*)\s*\('([^']*)'\)", out)
             return {"ok": True, "version": m.group(1) if m else out.strip()[:40],
                     "codename": m.group(2) if m else "", "path": exe}
@@ -7343,7 +7351,8 @@ def api_browse(path: str):
         # app, so its window still opens. The flag is here so the "every spawn
         # passes NO_WINDOW" rule has no exceptions to remember.
         subprocess.Popen(["explorer.exe", os.path.normpath(path)],
-                         creationflags=NO_WINDOW)
+                         creationflags=NO_WINDOW,
+            startupinfo=hidden_si())
     except OSError as e:
         raise HTTPException(500, str(e))
     return {"ok": True, "opened": path}

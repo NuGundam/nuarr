@@ -52,7 +52,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from . import joblog
-from .config import DATA_DIR, DB_PATH, NO_WINDOW, ROOT
+from .config import DATA_DIR, DB_PATH, NO_WINDOW, ROOT, hidden_si
 from . import schedules
 from .db import cursor, kv_get, kv_set
 
@@ -247,7 +247,8 @@ def _write_bundle(dest: Path) -> dict:
         # looked intermittent.
         frozen = subprocess.run([sys.executable, "-m", "pip", "freeze"],
                                 capture_output=True, text=True, timeout=120,
-                                creationflags=NO_WINDOW)
+                                creationflags=NO_WINDOW,
+            startupinfo=hidden_si())
         req.write_text(frozen.stdout, encoding="utf-8")
         pkgs = [l.strip() for l in frozen.stdout.splitlines()
                 if l.strip() and not l.startswith(("#", "-e "))]
@@ -264,7 +265,8 @@ def _write_bundle(dest: Path) -> dict:
                              "-r", str(req), "-d", str(wheels),
                              "--prefer-binary"],
                             capture_output=True, text=True, timeout=1800,
-                            creationflags=NO_WINDOW)
+                            creationflags=NO_WINDOW,
+            startupinfo=hidden_si())
         if rc.returncode != 0:
             # And if the batch still fails, fall back to ONE AT A TIME so a
             # single unavailable package costs one package, not all of them.
@@ -273,7 +275,8 @@ def _write_bundle(dest: Path) -> dict:
                                      "-d", str(wheels), "--prefer-binary",
                                      "--no-deps"],
                                     capture_output=True, text=True, timeout=180,
-                                    creationflags=NO_WINDOW)
+                                    creationflags=NO_WINDOW,
+            startupinfo=hidden_si())
                 if r1.returncode != 0:
                     failed.append(p)
     except Exception as e:

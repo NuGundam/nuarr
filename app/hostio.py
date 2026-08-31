@@ -32,7 +32,7 @@ import subprocess
 import threading
 import time
 
-from .config import NO_WINDOW, SETTINGS
+from .config import NO_WINDOW, SETTINGS, hidden_si
 
 # One sample is a round trip to another machine; the panel repaints far more
 # often than that. TTL is generous because spindle load is not a millisecond
@@ -275,7 +275,8 @@ def _stream(server: str) -> None:
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", _PS],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, creationflags=NO_WINDOW,
-            env=env)
+            env=env,
+            startupinfo=hidden_si())
         p.stdin.write((pwd or "") + "\n")
         p.stdin.flush()
         started = time.time()
@@ -327,7 +328,8 @@ def _sample(server: str) -> dict:
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", _PS],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, creationflags=NO_WINDOW,
-            env=env)
+            env=env,
+            startupinfo=hidden_si())
         out, err = p.communicate(input=(pwd or "") + "\n", timeout=TIMEOUT_S)
     except subprocess.TimeoutExpired:
         try:

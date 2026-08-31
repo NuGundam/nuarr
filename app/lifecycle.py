@@ -25,7 +25,7 @@ import sys
 import time
 
 from . import joblog
-from .config import NO_WINDOW
+from .config import NO_WINDOW, hidden_si
 from . import schedules
 
 # Set when a stop has been requested, so the UI can show it and the dispatcher
@@ -129,7 +129,8 @@ def _spawn_replacement() -> None:
                 getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200) | \
                 NO_WINDOW
     subprocess.Popen([sys.executable, "-c", waiter], cwd=root,
-                     creationflags=flags, close_fds=True)
+                     creationflags=flags, close_fds=True,
+            startupinfo=hidden_si())
 
 
 async def watch() -> None:
