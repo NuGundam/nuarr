@@ -29,7 +29,7 @@ import os
 import subprocess
 import time
 
-from .config import SETTINGS
+from .config import SETTINGS, NO_WINDOW
 from .db import cursor
 from . import joblog
 from .rules import audio_title, _title_is_only_format
@@ -38,6 +38,23 @@ _CACHE: dict = {"at": 0.0, "data": None, "running": False,
                 "done": 0, "total": 0,
                 "fixing": None, "failures": [], "last_fix": None}
 EVERY_S = 24 * 3600.0
+
+
+# A CONSOLE WINDOW PER FILE IS 1,799 CONSOLE WINDOWS. Windows gives every
+# console subprocess a window of its own unless told otherwise, so correcting a
+# library of titles strobed the desktop for the length of the run. config.py
+# has said "EVERY child process nuarr spawns must pass this" since long before
+# this module existed, and every other module does - this one was written
+# without it, which is exactly the kind of thing a house rule exists to catch.
+def _quiet_run(cmd, **kw):
+    """subprocess.run that never flashes a console window."""
+    if os.name == "nt":
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = 0                      # SW_HIDE
+        kw.setdefault("startupinfo", si)
+    kw.setdefault("creationflags", NO_WINDOW)
+    return subprocess.run(cmd, **kw)
 
 
 def _mkvpropedit() -> str:
@@ -204,7 +221,7 @@ def _fix_file(path: str, edits: list) -> tuple[bool, str]:
     for e in edits:
         cmd += ["--edit", f"track:a{e['track']}", "--set", f"name={e['new']}"]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        r = _quiet_run(cmd, capture_output=True, text=True, timeout=300)
     except Exception as e:                                   # noqa: BLE001
         return False, f"{type(e).__name__}"
     if r.returncode != 0:

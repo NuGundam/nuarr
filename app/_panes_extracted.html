@@ -23,7 +23,7 @@
       <div id="bkPane" style="display:none">
         <div class="dim" style="padding:9px 14px;font-size:11px">
           The database is copied with <span class="mono">VACUUM INTO</span>, which
-          takes a consistent snapshot while nuarr keeps running — a plain file copy
+          takes a consistent snapshot while Nuarr keeps running — a plain file copy
           of a live SQLite database is torn. Every copy is opened and integrity
           checked before it counts as a backup.
         </div>
@@ -71,7 +71,7 @@
       </div>
       <div id="arrsPane" style="display:none">
         <div class="dim" style="padding:9px 14px 0;font-size:11px">
-          Where Sonarr and Radarr are, and what nuarr is allowed to change on
+          Where Sonarr and Radarr are, and what Nuarr is allowed to change on
           them. The connection details come first because nothing below works
           without them &mdash; every rename, every import check and every
           language lookup goes through these two.
@@ -80,9 +80,9 @@
         <div id="arrHealth" style="padding:4px 14px 0"></div>
         <div style="padding:10px 14px 0">
           <div class="lkind" style="padding:9px 12px">
-            <b style="color:#6fb0ff">Do nuarr and the arrs still agree?</b>
+            <b style="color:#6fb0ff">Do Nuarr and the arrs still agree?</b>
             <div class="dim" style="font-size:11px;margin-top:2px">
-              nuarr rewrites files; the arrs remember what they imported. Where
+              Nuarr rewrites files; the arrs remember what they imported. Where
               those two drift apart nothing breaks and nothing complains, so
               the difference is counted here rather than left to be noticed.
             </div>
@@ -108,7 +108,7 @@
       </div>
       <div id="mkvPane" style="display:none">
         <div class="dim" style="padding:9px 14px;font-size:11px">
-          The muxer behind subtitle embedding and every header edit. nuarr
+          The muxer behind subtitle embedding and every header edit. Nuarr
           reports its version and checks for updates; installing a new build
           is a normal Windows install from mkvtoolnix.download.
         </div>
@@ -116,7 +116,7 @@
       </div>
       <div id="ffPane" style="display:none">
         <div class="dim" style="padding:9px 14px;font-size:11px">
-          nuarr's own ffmpeg. Downloads are verified by SHA-256 and applied
+          Nuarr's own ffmpeg. Downloads are verified by SHA-256 and applied
           only when the queue is idle, so running jobs are never disturbed.
         </div>
         <div style="padding:0 14px 10px">
@@ -172,7 +172,7 @@
       </select>
       <select id="logJob" onchange="loadLogs(true)"><option value="">all activity</option></select>
       <select id="logSys" onchange="loadLogs(true)" title="Only lines from one
-        of nuarr's background loops"><option value="">all system jobs</option></select>
+        of Nuarr's background loops"><option value="">all system jobs</option></select>
       <select id="logSort" onchange="renderLogs()" title="Newest first is the
         default; oldest first reads a single pass in the order it happened">
         <option value="new">newest first</option>
@@ -193,7 +193,7 @@
       </div>
       <div id="jobsPane" style="display:none">
         <div class="dim" style="padding:9px 14px;font-size:11px">
-          Every recurring job nuarr runs, and when it next runs. &ldquo;Last run&rdquo;
+          Every recurring job Nuarr runs, and when it next runs. &ldquo;Last run&rdquo;
           is observed &mdash; each loop reports as it starts a pass &mdash; so a job that
           is stuck or held shows the truth rather than what its schedule
           predicts. &ldquo;Next&rdquo; is the only estimate here.
@@ -236,7 +236,7 @@
             <b style="color:#6fb0ff">Does the audio picker tell the truth?</b>
             <div class="dim" style="font-size:11px;margin-top:2px">
               A track's title is written by whoever made the release, and it
-              describes the source. Once nuarr converts the stream the title
+              describes the source. Once Nuarr converts the stream the title
               outlives the thing it described — so Plex offers you
               <span class="mono">TrueHD 5.1</span> for a track that is now
               E-AC3, or <span class="mono">English FLAC 5.1</span> for one that
@@ -265,8 +265,8 @@
       <div id="plexPane" style="display:none">
         <div class="dim" style="padding:9px 14px;font-size:11px">
           Plex is the integration the job gate leans on hardest: it is what
-          tells nuarr somebody is watching. When the connection is wrong there
-          is <b>no error</b> &mdash; nuarr simply never sees a viewer and
+          tells Nuarr somebody is watching. When the connection is wrong there
+          is <b>no error</b> &mdash; Nuarr simply never sees a viewer and
           encodes over the top of them, and the first sign is a stuttering
           stream. So the settings here are tested before they are saved.
         </div>
@@ -280,7 +280,7 @@
           not a transcriber here &mdash; only the model&rsquo;s language head is
           used, which is one forward pass rather than a decode, and why a
           30-second window costs about a fifth of a second on the card.
-          Unlike ffmpeg, nuarr does not manage updates for this: it is a Python
+          Unlike ffmpeg, Nuarr does not manage updates for this: it is a Python
           package, so a new version is a deliberate install, and this page tells
           you when one exists rather than acting on it.
         </div>
@@ -327,7 +327,7 @@
       <div id="processPane" style="display:none">
         <div class="dim" style="padding:9px 14px;font-size:11px">
           Every branch label and every number here is read from the running
-          configuration, so this cannot drift from what nuarr actually does.
+          configuration, so this cannot drift from what Nuarr actually does.
           Hover a box for what it means; search a file to watch the route it
           really took.
         </div>
@@ -347,8 +347,8 @@
       </div>
       <div id="updPane" style="display:none">
   <div class="dim" style="padding:9px 14px;font-size:11px">
-    Which nuarr this is, and whether there is a newer one. Checking is
-    automatic once a repository is set; <b>installing never is</b>. nuarr is
+    Which Nuarr this is, and whether there is a newer one. Checking is
+    automatic once a repository is set; <b>installing never is</b>. Nuarr is
     usually part-way through an encode or a commit, and swapping its own files
     under a running ffmpeg would leave a half-written file in the library
     &mdash; the one outcome the whole system exists to prevent. So this page
@@ -363,7 +363,7 @@
           &mdash; and it must <b>not</b> be on the pool. Writing output to the
           same spindles being read from turns one sequential read into a read
           and a write on the same disk, which is the easiest way to make Plex
-          stutter while nuarr works. Nothing is moved when you change this:
+          stutter while Nuarr works. Nothing is moved when you change this:
           anything mid-flight finishes against the old folder, and the next job
           starts using the new one.
         </div>
@@ -373,7 +373,7 @@
       </div>
       <div id="alangPane" style="display:none">
         <div class="dim" style="padding:9px 14px;font-size:11px">
-          A language tag is the one thing about a file nuarr cannot take on
+          A language tag is the one thing about a file Nuarr cannot take on
           trust and cannot work out from anything else. An empty tag is not
           neutral &mdash; Sonarr, Radarr and every player read a blank as
           <b>English</b> &mdash; and a wrong tag looks exactly like a right one.
@@ -381,7 +381,7 @@
           the file, through Whisper&rsquo;s language identifier, and the
           confident windows have to agree. This page shows what was heard,
           what the files claim, and &mdash; deliberately &mdash; every case
-          where nuarr refused to answer.
+          where Nuarr refused to answer.
         </div>
         <div id="alangBody" style="padding:0 14px 14px">
           <div class="dim" style="padding:14px">loading&hellip;</div>
@@ -389,9 +389,9 @@
       </div>
       <div id="libPane" style="display:none">
         <div class="dim" style="padding:9px 14px;font-size:11px">
-          The media folders nuarr manages. Adding one starts indexing it on the
-          next scan; removing one stops nuarr looking at it. <b>Nothing here ever
-          deletes media</b> &mdash; these are nuarr&rsquo;s own bookkeeping entries, and the
+          The media folders Nuarr manages. Adding one starts indexing it on the
+          next scan; removing one stops Nuarr looking at it. <b>Nothing here ever
+          deletes media</b> &mdash; these are Nuarr&rsquo;s own bookkeeping entries, and the
           files on the pool are untouched either way.
         </div>
         <div id="libBody" style="padding:0 14px 14px"></div>

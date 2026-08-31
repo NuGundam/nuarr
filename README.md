@@ -1,5 +1,11 @@
 # nuarr
 
+[![release](https://img.shields.io/github/v/release/NuGundam/nuarr?label=release&color=6fb0ff)](https://github.com/NuGundam/nuarr/releases/latest)
+[![released](https://img.shields.io/github/release-date/NuGundam/nuarr?label=released&color=6fb0ff)](https://github.com/NuGundam/nuarr/releases/latest)
+[![downloads](https://img.shields.io/github/downloads/NuGundam/nuarr/total?label=downloads&color=6fb0ff)](https://github.com/NuGundam/nuarr/releases)
+[![last commit](https://img.shields.io/github/last-commit/NuGundam/nuarr?label=last%20commit&color=6fb0ff)](https://github.com/NuGundam/nuarr/commits)
+[![licence](https://img.shields.io/github/license/NuGundam/nuarr?label=licence&color=6fb0ff)](LICENSE)
+
 **Standardise a media library so Plex plays it without transcoding.**
 
 nuarr watches a Plex library, works out which files will make Plex re-encode on
@@ -9,7 +15,11 @@ of anyone actually watching.
 Native Windows. Python and FastAPI, one scheduled task, a web UI on port 8770.
 No Docker, no Node, no service wrapper.
 
-Running against a 12-disk pool: **39,556 files, 59.97 TB, 2.36 TB saved.**
+<!-- nuarr:stats -->
+Running against a 12-disk pool: **39,590 files, 60.69 TB, 2.49 TB saved (3.4%).**
+
+<sub>Figures from the 1.10.1 build. The badges above come straight from GitHub and are always current.</sub>
+<!-- /nuarr:stats -->
 
 **[▶ Interactive presentation](https://nugundam.github.io/nuarr/presentation.html)** —
 a guided tour of the whole system with animated session cards and live-styled
@@ -252,13 +262,16 @@ different build, or type `off` and it never contacts GitHub.
 
 ## Status
 
-Version 1.0.6. Built for one library and one server, then hardened by
+Built for one library and one server, then hardened by
 installing it somewhere else: the installer and app have been through repeated
 clean-VM installs, which is where most of the sharp edges listed in the commit
 history were found and filed off. The primary deployment remains a 12-disk
 StableBit pool with Plex, Sonarr and Radarr on the same machine; interfaces it
 depends on — Plex's session fields, DrivePool's placement — are read
 defensively, but a setup unlike that one may still find edges.
+
+The version above is whatever GitHub last published — this page does not
+carry a copy of it, because a copy is only right until the next release.
 
 Bug reports with the relevant lines from `Settings → Logs` are welcome.
 

@@ -8164,7 +8164,7 @@ button.on{border-color:var(--ok);color:var(--ok)}
 #disks tbody.dgrp:hover > tr > td{background:#1c2129}
 /* A drive under load earns a tinted box; the row tint alone only marked half
    of it and made the group look like it had come apart. */
-/* A drive nuarr is working on. This tint used to live on .iorow.io-busy, so it
+/* A drive Nuarr is working on. This tint used to live on .iorow.io-busy, so it
    coloured the activity row and not the capacity row above it - which split
    the drive down the middle and undid the grouping on exactly the drives you
    are watching. It belongs to the whole box. */
@@ -8196,7 +8196,7 @@ button.on{border-color:var(--ok);color:var(--ok)}
    re-finding each label on every row. And every chip resized as its own value
    changed, so the whole run shuffled sideways twice a second.
 
-   Each of the four now owns a fixed-width slot in a fixed order - busy, nuarr,
+   Each of the four now owns a fixed-width slot in a fixed order - busy, Nuarr,
    system, viewer - present or not. An absent group leaves its slot empty
    rather than closing the gap, which is what makes a column readable: the
    viewer figures are always in the viewer place, and a disk with nothing to
@@ -8207,7 +8207,7 @@ button.on{border-color:var(--ok);color:var(--ok)}
    obvious why: zooming in does not enlarge the CSS pixel, it SHRINKS the
    viewport measured in CSS pixels, so a 1920px screen at 150% reports about
    1280 and trips the max-width:1300px breakpoint. The slots duly narrowed to
-   240px - and the font did not, because 11px is still 11px. "nuarr READ 18.3
+   240px - and the font did not, because 11px is still 11px. "Nuarr READ 18.3
    MB/s WRITE 13.0 MB/s" needs more than that, and with white-space:nowrap and
    a hard width it had nowhere to go but on top of the system and viewer
    groups next to it.
@@ -8255,7 +8255,7 @@ button.on{border-color:var(--ok);color:var(--ok)}
    The number alone made twelve rows a column of percentages you had to read
    one at a time; the bar alone loses the value. Together the column can be
    scanned and any single row still says exactly what it means.
-   The bar is SPLIT: accent for load nuarr is causing, warn for everything
+   The bar is SPLIT: accent for load Nuarr is causing, warn for everything
    else. Total width is the busy percentage, so a half-full bar is a
    half-busy disk however the two parts divide it. */
 .diskio .io-busyp .io-v{min-width:34px}
@@ -8296,7 +8296,7 @@ button.on{border-color:var(--ok);color:var(--ok)}
 /* TWO OWNERS, TWO BOXES.
    The chips are all the same shape, so a run of five of them read as one
    measurement in five parts - "Busy 50% · Other 710 KB/s · Read 2.2 MB/s ·
-   Write 9.7 MB/s · 1 job" gives no clue that three of those are nuarr and one
+   Write 9.7 MB/s · 1 job" gives no clue that three of those are Nuarr and one
    is not. Grouping them behind a name is the whole fix; the tint and the rule
    down the left edge are what stop the two groups merging back together at a
    glance.
@@ -8618,7 +8618,7 @@ button[disabled]{opacity:.5;cursor:default}
 @keyframes bootpulse{0%,100%{opacity:.3}50%{opacity:1}}
 @media (prefers-reduced-motion:reduce){.boot.go .dot{animation:none}}
 
-/* nuarr's own load, in the header beside the arr pills */
+/* Nuarr's own load, in the header beside the arr pills */
 .selfuse{display:inline-flex;gap:6px;align-items:center;margin-right:10px}
 .selfuse .su{font-size:11px;color:var(--dim);background:var(--chip,#161b22);
   border:1px solid var(--line);border-radius:11px;padding:2px 8px;white-space:nowrap}
@@ -8665,11 +8665,11 @@ button[disabled]{opacity:.5;cursor:default}
 #suProcBtn{min-width:104px}
 #suProcBtn b{min-width:18px}
 /* The process chip is always present. It used to be display:none whenever
-   nuarr had no child processes, so the moment the last encode finished the
+   Nuarr had no child processes, so the moment the last encode finished the
    whole chip vanished and the two beside it slid right - the disappearing act
    this is fixing. "1 process" is a true and stable answer; there is simply
    nothing to open. */
-/* A dot on the gpu chip when the CARD is busy but nuarr is not the one using
+/* A dot on the gpu chip when the CARD is busy but Nuarr is not the one using
    it. Without this, "0% gpu" beside a saturated encoder reads as "nothing is
    happening" - which is the opposite of the truth and the one case where you
    most want to look. */
@@ -8745,7 +8745,7 @@ button[disabled]{opacity:.5;cursor:default}
    looks the same everywhere. */
 .card .swrun{display:inline-flex;align-items:center;gap:6px;color:var(--acc)}
 .card .swrun .spin i{width:3px;height:3px}
-/* nuarr's share of the machine, drawn rather than stated. The whole reason
+/* Nuarr's share of the machine, drawn rather than stated. The whole reason
    these panels exist is that a bare "24% cpu" is a fraction of something the
    header never showed. */
 .surow{display:flex;justify-content:space-between;align-items:baseline;
@@ -9140,7 +9140,7 @@ button[disabled]{opacity:.5;cursor:default}
 /* EXPANDED: the bar becomes the diagram.
    At 8px the buffered band is a sliver and the threshold is invisible, so the
    open card gets a bar tall enough to carry marks and a label. This is the one
-   place that answers "how close is this viewer to the line where nuarr stops
+   place that answers "how close is this viewer to the line where Nuarr stops
    working their disk", which is otherwise only knowable from the settings page
    and a stopwatch. */
 .pxopen .pxbar{height:26px;border-radius:5px}
@@ -9162,13 +9162,13 @@ button[disabled]{opacity:.5;cursor:default}
 .pxopen .pxfoot .pxbar{order:4;flex:1 0 100%}
 /* THE PAUSE LINE. Where the playhead would be after viewer_pause_lead_s of
    playback - i.e. if the buffered edge is left of this mark, the viewer has
-   less than the floor and nuarr suspends work on their spindle. */
+   less than the floor and Nuarr suspends work on their spindle. */
 .pxbar u{position:absolute;top:0;height:100%;width:0;border-left:3px dashed #f0c14b;
   opacity:0;z-index:3;pointer-events:none;transition:left .4s linear;
   filter:drop-shadow(0 0 2px rgba(0,0,0,.95))}
 .pxopen .pxbar u{opacity:.85}
 /* Buffer safely past the line: the band edge goes green rather than accent, so
-   "nuarr may work here" is readable at a glance without reading the number. */
+   "Nuarr may work here" is readable at a glance without reading the number. */
 .pxopen.px-safe .pxbar b{border-right-color:#3fb950}
 /* Under the line - work on this spindle is paused. Amber, matching the pill on
    the worker card, so the two read as the same event. */
@@ -9192,7 +9192,7 @@ button[disabled]{opacity:.5;cursor:default}
   background:var(--acc);opacity:.55;transition:width .4s linear}
 .px-safe .pxrun i{background:#3fb950}
 .px-starved .pxrun i{background:#e2b341}
-/* THREE LINES, because nuarr does three different things. The axis runs to
+/* THREE LINES, because Nuarr does three different things. The axis runs to
    3.6x the floor so the last of them has somewhere to sit: below 1x it stops,
    between 1x and 3x it throttles by a sliding amount, and past 3x it gets out
    of the way completely. */
@@ -9206,7 +9206,7 @@ button[disabled]{opacity:.5;cursor:default}
   border-left:3px dashed #4ad463;opacity:.9;z-index:2;pointer-events:none;
   filter:drop-shadow(0 0 2px rgba(0,0,0,.95))}
 /* THE FULL SPEED LINE at 3x the floor. Past here the viewer cannot be hurt by
-   anything nuarr does to the spindle, so nuarr stops holding back at all -
+   anything Nuarr does to the spindle, so Nuarr stops holding back at all -
    the thing the old flat quarter-speed rule never allowed for. */
 .pxrun s{position:absolute;left:83.333%;top:0;height:100%;display:block;
   text-decoration:none;border-left:3px dashed #58a6ff;z-index:2;
@@ -9525,7 +9525,7 @@ tr.logrow td{background:#1c2129;border-bottom:1px solid var(--acc);padding:0 12p
 .xpair{display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
 .xpair b{color:var(--warn);font-variant-numeric:tabular-nums}
 .xarrow{color:var(--warn);font-weight:600}
-/* nuarr's own moves in the accent, matching the NUARR bubbles below - so the
+/* Nuarr's own moves in the accent, matching the NUARR bubbles below - so the
    half of this line that is us is the same colour as us everywhere else. */
 .xlbl-mine{color:var(--acc)}
 .xmine b,.xmine .xarrow{color:var(--acc)}
@@ -9690,7 +9690,7 @@ input[type=time]::-webkit-calendar-picker-indicator{filter:invert(.75);cursor:po
            alt="" width="22" height="22"
            style="vertical-align:-4px;margin-right:8px;border-radius:5px">Nuarr</a><!--
     THE VERSION BELONGS WHERE THE NAME IS. It was written down nowhere at all -
-    not in the UI, not in the bundle, not in a constant - so "which nuarr is
+    not in the UI, not in the bundle, not in a constant - so "which Nuarr is
     this" could only be answered by diffing source against a backup. Next to
     the brand it costs no space and answers the first question anyone asks
     about a running install, including the person who built it.
@@ -9698,13 +9698,13 @@ input[type=time]::-webkit-calendar-picker-indicator{filter:invert(.75);cursor:po
        title="Version - click for updates"></a><span
        id="sub">loading…</span></h1>
   <div class="right">
-    <!-- nuarr's own live load. In the HEADER rather than the system panel
+    <!-- Nuarr's own live load. In the HEADER rather than the system panel
          further down the page: that panel reports the MACHINE, and it is
-         2,000px below the fold, so "what is nuarr costing me right now" was
+         2,000px below the fold, so "what is Nuarr costing me right now" was
          only answerable by scrolling or by opening Task Manager. -->
     <!-- Startup progress, then a brief "ready", then it gets out of the way. -->
     <span id="bootPill"></span>
-    <span id="selfUse" class="selfuse" title="nuarr's own CPU and memory, including ffmpeg and script children"></span>
+    <span id="selfUse" class="selfuse" title="Nuarr's own CPU and memory, including ffmpeg and script children"></span>
     <span id="arrs" class="dim"></span>
     <!-- ffmpeg health sits beside the arr pills: it is the third external
          thing every job depends on, and a stale or broken build is exactly as
@@ -9830,7 +9830,7 @@ input[type=time]::-webkit-calendar-picker-indicator{filter:invert(.75);cursor:po
          the reader has to infer them from a chip they may never see lit. -->
     <div class="panel"><h2>Files per pool disk<span class="dkey">
       <span class="dk dk-view">viewer</span>
-      <span class="dk dk-ours">nuarr</span>
+      <span class="dk dk-ours">Nuarr</span>
       <span class="dk dk-sys">system</span></span></h2>
       <div id="disks"><div class="skel" style="padding:14px">
       <i style="width:88%"></i><i style="width:82%"></i><i style="width:90%"></i>
@@ -9876,8 +9876,8 @@ input[type=time]::-webkit-calendar-picker-indicator{filter:invert(.75);cursor:po
       </div>
       <!-- Arrs tab: standing guards over arr-side configuration, plus the
            webhook plumbing that used to live in the events panel header. -->
-      <!-- Metadata tab. nuarr does NOT talk to TMDB or TheTVDB - the arrs do,
-           and nuarr copies one field from them. The panel is laid out as that
+      <!-- Metadata tab. Nuarr does NOT talk to TMDB or TheTVDB - the arrs do,
+           and Nuarr copies one field from them. The panel is laid out as that
            chain on purpose, because "TMDB: connected" would be a lie and would
            send someone looking in the wrong place when a title's language is
            wrong. -->
@@ -9885,7 +9885,7 @@ input[type=time]::-webkit-calendar-picker-indicator{filter:invert(.75);cursor:po
            verifies; it does NOT auto-install, because MKVToolNix ships as a
            system installer rather than a droppable binary, and pretending
            otherwise would be the ffmpeg tab's clothes on a different tool. -->
-      <!-- ffmpeg tab: nuarr's own copy, so it stops depending on Tdarr's -->
+      <!-- ffmpeg tab: Nuarr's own copy, so it stops depending on Tdarr's -->
     </div>
     <div class="panel">
       <h2>Live arr events</h2>
@@ -10036,7 +10036,7 @@ input[type=time]::-webkit-calendar-picker-indicator{filter:invert(.75);cursor:po
       <button onclick="loadRenames()">Check renames</button>
       <button onclick="retryRenames()">Retry all now</button>
       <span id="renqMsg" class="dim" style="margin-left:8px">every processed file
-        passes through here — nuarr waits for the arr to re-read it, then asks
+        passes through here — Nuarr waits for the arr to re-read it, then asks
         for the rename. "Check renames" is read-only.</span>
     </div>
     <!-- The retry queue is what actually performs renames now that the commit
@@ -10322,7 +10322,7 @@ async function loadAll(){
   if(net > 0){
     const pct = sv.before_b ? (net/sv.before_b*100) : 0;
     svTxt = ` · <b class="hdrsave" title="Across ${fmt(sv.n||0)} finished jobs `
-      + `nuarr has written ${gb(sv.after_b)} where the sources were `
+      + `Nuarr has written ${gb(sv.after_b)} where the sources were `
       + `${gb(sv.before_b)}.\n\n`
       + `${gb(sv.shrank)} came off files that shrank; ${gb(sv.grew)} went back `
       + `on ones that grew — a conversion away from AV1 costs size on purpose, `
@@ -10518,7 +10518,7 @@ async function hostIoLoad(){
 // stops depending on where the media happens to live.
 //
 // The one column that cannot be filled is Files: DrivePool decides which
-// spindle a file lands on, and over a share nuarr never sees that placement.
+// spindle a file lands on, and over a share Nuarr never sees that placement.
 // It says so rather than guessing or leaving a suspicious blank.
 function hostIoRows(){
   if(!_hostIo || _hostIo.local) return null;
@@ -10567,7 +10567,7 @@ function hostIoHtml(){
     ? ` <span style="color:var(--warn)">· last answer ${
         h.age_s!=null?Math.round(h.age_s)+'s':''} ago, retrying</span>` : '';
   return note(`disks read from the host — file counts are not visible over a `
-    + `share, and a busy spindle cannot be split into viewer, nuarr and `
+    + `share, and a busy spindle cannot be split into viewer, Nuarr and `
     + `system from outside${stale}`);
 }
 
@@ -10605,7 +10605,7 @@ function renderDisks(){
   const fre=rows.reduce((a,d)=>a+(d.free||0),0);
   // Live I/O, keyed by disk, from the SAME per-job measurements the worker
   // cards show - so a rate here and a rate on a card mean the same thing and
-  // use the same colours. NOTE: this is nuarr's own traffic, not the whole
+  // use the same colours. NOTE: this is Nuarr's own traffic, not the whole
   // physical disk; a Plex stream on an otherwise idle disk reads as 0 here.
   // _lastIo is the whole io object - {read_bps, write_bps, by_disk:[...]} -
   // not a bare list. Iterating it directly silently produced nothing.
@@ -10669,11 +10669,11 @@ function renderDisks(){
     return Math.sqrt(Math.max(0, Math.min(1, (d-OUT_FLOOR)/(OUT_FULL-OUT_FLOOR))));
   };
   // PHYSICAL disk load, which answers the question the block above cannot:
-  // how busy is the spindle, including everything nuarr is not doing. Our own
+  // how busy is the spindle, including everything Nuarr is not doing. Our own
   // counters show a disk under a 4K direct play or a backup as completely
   // idle, which is exactly when you most want to see it.
   // Remote spindles arrive in the same shape, so every chip below renders
-  // unchanged. mine_bps is ZERO ON PURPOSE and not a placeholder: nuarr knows
+  // unchanged. mine_bps is ZERO ON PURPOSE and not a placeholder: Nuarr knows
   // which bytes are its own by having started them, and over a share it starts
   // none on any particular spindle - DrivePool chooses. So all of it is
   // "everything else", which is exactly what the bar will say.
@@ -10712,12 +10712,12 @@ function renderDisks(){
   // that overstates its evidence is worse than one that shows less.
   // TWO KINDS OF MOVE, AND THE DIFFERENCE MATTERS.
   //
-  //   ours     nuarr finished a file and the pool placed the rebuilt copy on a
+  //   ours     Nuarr finished a file and the pool placed the rebuilt copy on a
   //            different disk than the original. Known exactly - the job says
   //            where it read from and where it is writing to - and it is a
-  //            thing nuarr chose to do.
+  //            thing Nuarr chose to do.
   //   external something else is shifting bytes between spindles. Inferred
-  //            from the counters, so hedged, and not something nuarr controls.
+  //            from the counters, so hedged, and not something Nuarr controls.
   //
   // Same line, because the reader's first question is "is a file changing
   // disks"; different colour and wording, because the second question is
@@ -10733,10 +10733,10 @@ function renderDisks(){
   let moveLine='';
   if(mine.length||other.length){
     moveLine = '<div class="xfer">'
-      + (mine.length ? `<span class="xlbl xlbl-mine" title="nuarr rebuilt these
+      + (mine.length ? `<span class="xlbl xlbl-mine" title="Nuarr rebuilt these
 files and the pool placed the finished copy on a different disk than the
 original — so the file has changed drives. Exact, not inferred: the job knows
-both ends.">nuarr moving</span>${mine.slice(0,3).map(m=>pair(m,'xmine')).join('')}` : '')
+both ends.">Nuarr moving</span>${mine.slice(0,3).map(m=>pair(m,'xmine')).join('')}` : '')
       + (other.length ? `<span class="xlbl" title="Inferred from the read/write
 split on each disk — one spindle reading at the same rate another is writing. No
 product is asked, so this works for a pool balance, a parity rebuild, a backup or
@@ -10805,7 +10805,7 @@ guess.">looks like data moving</span>${other.slice(0,3).map(m=>pair(m,'')).join(
       // different programs.
       //
       // They are also acted on differently, which is the real reason to
-      // separate them. Load nuarr is causing is load nuarr can stop - it is
+      // separate them. Load Nuarr is causing is load Nuarr can stop - it is
       // doing what it was asked. Load from anything else is a reason to steer
       // work elsewhere, and it is the only half the gate reacts to.
       //
@@ -10817,7 +10817,7 @@ guess.">looks like data moving</span>${other.slice(0,3).map(m=>pair(m,'')).join(
       const grp = (cls,label,body) =>
         `<span class="io-grp ${cls}"><span class="io-gl">${label}</span>${body}</span>`;
       // A VIEWER IS THE THIRD SOURCE OF LOAD, and the one that outranks the
-      // other two: nuarr's own work can be slowed down and the system's cannot
+      // other two: Nuarr's own work can be slowed down and the system's cannot
       // be helped, but a viewer is the reason this whole panel exists.
       //
       // Built OUTSIDE the "is this disk measurably busy" branch below, because
@@ -10857,7 +10857,7 @@ guess.">looks like data moving</span>${other.slice(0,3).map(m=>pair(m,'')).join(
       }
       else if(W && W.viewers){
         // BYTES PER SECOND, not megabits. Plex reports kilobits, and this
-        // group sits beside nuarr's and the system's figures which are both
+        // group sits beside Nuarr's and the system's figures which are both
         // bytes off the disk - printing 7.2 next to 0.9 for the same traffic
         // would make a viewer look eight times heavier than they are. Same
         // unit or no comparison: kbps * 1000 / 8.
@@ -10922,24 +10922,24 @@ guess.">looks like data moving</span>${other.slice(0,3).map(m=>pair(m,'')).join(
         sBusy = `<span class="io-p io-busyp" title="${
                  b.toFixed(0)}% busy over the last ${_diskLoad.window_s||20}s${
                  L.queue?' · queue '+L.queue:''}
-The bar splits it by share of bytes moved — nuarr ${share(mine)}%, everything else ${share(ext)}%. That is an approximation: busy time is not proportional to bytes, because a seek costs time and moves none. The throughput figures beside it are exact.${
-                 L.hot?'\nHeld above '+(_diskLoad.thresh||85)+'% by something other than nuarr, so new jobs go elsewhere.':''}"
+The bar splits it by share of bytes moved — Nuarr ${share(mine)}%, everything else ${share(ext)}%. That is an approximation: busy time is not proportional to bytes, because a seek costs time and moves none. The throughput figures beside it are exact.${
+                 L.hot?'\nHeld above '+(_diskLoad.thresh||85)+'% by something other than Nuarr, so new jobs go elsewhere.':''}"
                style="opacity:${bo}"
                ><span class="io-l"><span class="lg">Busy</span><span class="sm">B</span></span>
                 <b class="io-v" style="color:${bc}">${b.toFixed(0)}%</b>
                 <span class="iobar">${seg(mine,'var(--acc)')}${seg(ext,'var(--warn)')}</span></span>`;
-        // nuarr's own half. Read and Write separately when we know them from
+        // Nuarr's own half. Read and Write separately when we know them from
         // the job counters, a single total when the disk figures say we are
         // moving bytes but no worker claims them yet.
         if(moving){
-          sOurs = grp('io-ours','nuarr',
+          sOurs = grp('io-ours','Nuarr',
                       pair('m-read','Read','R',mbps(a.read_bps))
                       + pair('m-write','Write','W',mbps(a.write_bps)) + jobTag);
         }else if(a){
-          sOurs = grp('io-ours','nuarr',
+          sOurs = grp('io-ours','Nuarr',
                       '<span class="io-idle">starting</span>' + jobTag);
         }else if(mine>0){
-          sOurs = grp('io-ours','nuarr', `<b class="m-read io-v">${mbps(mine)}</b>`);
+          sOurs = grp('io-ours','Nuarr', `<b class="m-read io-v">${mbps(mine)}</b>`);
         }
         // Everything else on the spindle. Named "system" rather than "other"
         // because "other" only means anything once you already know what the
@@ -10966,11 +10966,11 @@ The bar splits it by share of bytes moved — nuarr ${share(mine)}%, everything 
         // Counters unavailable for this disk, but our own jobs are running on
         // it. Still label the group - a lone pair of figures with no owner is
         // exactly the ambiguity this is fixing.
-        sOurs = grp('io-ours','nuarr',
+        sOurs = grp('io-ours','Nuarr',
                     pair('m-read','Read','R',mbps(a.read_bps))
                     + pair('m-write','Write','W',mbps(a.write_bps)) + jobTag);
       }else if(a){
-        sOurs = grp('io-ours','nuarr',
+        sOurs = grp('io-ours','Nuarr',
                     '<span class="io-idle">starting</span>' + jobTag);
       }
       // Fill the blanks, then assemble in one fixed order. A disk doing
@@ -10979,7 +10979,7 @@ The bar splits it by share of bytes moved — nuarr ${share(mine)}%, everything 
         + ' title="no reading for this disk — the counters did not report it">'
         + '<span class="io-l"><span class="lg">Busy</span><span class="sm">B</span></span>'
         + '<b class="io-v io-off">—</b><span class="iobar"></span></span>';
-      if(!sOurs) sOurs = offGrp('io-ours','nuarr','no jobs here');
+      if(!sOurs) sOurs = offGrp('io-ours','Nuarr','no jobs here');
       if(!sSys)  sSys  = offGrp('io-sys','system');
       if(!viewGrp) viewGrp = offGrp('io-view','viewer');
       act = slot('sl-busy', sBusy) + slot('sl-ours', sOurs)
@@ -10988,7 +10988,7 @@ The bar splits it by share of bytes moved — nuarr ${share(mine)}%, everything 
       const hot = L && L.hot;
       // `out` computed up top, where the bar colour needs it too.
       // NO PILLS BESIDE THE NAME. "busy" and "watching" were added when the
-      // activity row could not say either thing - it showed nuarr's own bytes
+      // activity row could not say either thing - it showed Nuarr's own bytes
       // and nothing else, so a disk under a viewer or a backup looked idle and
       // needed a badge to contradict it. The row says both now, in colour and
       // with figures, and the badges had become a second, vaguer copy sitting
@@ -11007,7 +11007,7 @@ The bar splits it by share of bytes moved — nuarr ${share(mine)}%, everything 
                        moving?' dwork':''}" style="--dcol:${dc}">
         <tr><td class="mono" style="color:${dc}">${esc(d.pool_disk)}</td>
         <td class="num">${d.n==null
-          ? `<span class="dim" title="DrivePool decides which spindle a file lands on, and over a share that placement is not visible — the host knows how full each disk is, not which of nuarr's files are on it.">—</span>`
+          ? `<span class="dim" title="DrivePool decides which spindle a file lands on, and over a share that placement is not visible — the host knows how full each disk is, not which of Nuarr's files are on it.">—</span>`
           : fmt(d.n)}</td>
         <td class="num dim dcol-size">${gb(d.total)}</td>
         <td class="num dim dcol-used">${gb(d.used!=null?d.used:d.bytes)}</td>
@@ -11092,7 +11092,7 @@ The bar splits it by share of bytes moved — nuarr ${share(mine)}%, everything 
               ? `<span class="io-p io-busyp" title="Mean busy across all ${
                    L.length} pool disks over the last ${_diskLoad.window_s||20}s.
 ${nh?nh+' of '+L.length+' held above '+(_diskLoad.thresh||85)
-     +'% by something other than nuarr — new jobs are steered to the rest.'
+     +'% by something other than Nuarr — new jobs are steered to the rest.'
    :'No disk is under sustained load from anything but nuarr.'}
 An average hides a single pinned spindle, so read it with the rows above rather than instead of them."
                  ><span class="io-l"><span class="lg">Busy avg</span><span class="sm">B</span></span>
@@ -11532,7 +11532,7 @@ async function drillLog(id){
 // The rule is now one sentence: the file must be openable exclusively, and
 // must have STAYED that way for 30 s. So there is a countdown only while the
 // file is free and the clock is running. A locked file has no deadline at all
-// - the clock has not started, and nuarr cannot know when Plex will stop
+// - the clock has not started, and Nuarr cannot know when Plex will stop
 // playing. Printing a number there would be inventing one.
 function settleCell(r){
   const L=r.lock;
@@ -12005,7 +12005,7 @@ function renderBrowse(d){
              : f.state==='error' ? ['error','err']
              : f.state==='eligible' ? ['to do','warn']
              : [f.state,'dim'];
-    // Media info comes from the stored probe. A file nuarr has not probed says
+    // Media info comes from the stored probe. A file Nuarr has not probed says
     // so rather than showing a row of blanks.
     const info = f.probed
       ? `${esc(f.video||'?')}${f.height?' '+f.height+'p':''}`
@@ -12037,7 +12037,7 @@ function renderBrowse(d){
 
 // ---- per-file media info -------------------------------------------------
 // Expands under the file row it belongs to. Served from the stored probe, so
-// for anything nuarr has processed this is a database read rather than an
+// for anything Nuarr has processed this is a database read rather than an
 // ffprobe against a pool disk that the encoders are already using.
 let openFile=null, openFileHtml='';
 async function fileInfo(key){
@@ -12199,7 +12199,7 @@ let _bootDone=false, _bootTimer=null, _bootFade=null, _bootStarted=0,
     _bootHidden=false, _bootMs=0;
 
 // Fast while something is happening, lazy once it is not. The lazy poll is not
-// optional: this dashboard is left open for days across nuarr restarts, and if
+// optional: this dashboard is left open for days across Nuarr restarts, and if
 // polling simply stopped at ready, a restart would show a stale green "ready"
 // from the PREVIOUS process while the new one was still booting - the exact
 // misreading this pill exists to prevent. A changed start time means a new
@@ -12384,7 +12384,7 @@ async function loadBoot(){
   }
 }
 
-// nuarr's own footprint, in the header. Deliberately terse - it sits beside the
+// Nuarr's own footprint, in the header. Deliberately terse - it sits beside the
 // arr pills and must not push them off a narrow window.
 // BUILT ONCE, THEN UPDATED IN PLACE.
 //
@@ -12420,10 +12420,10 @@ function renderSelfUse(s){
   if(!_suBuilt){
     // ALL THREE ARE BUTTONS NOW.
     //
-    // cpu and ram were plain pills with a title= tooltip, which said what nuarr
+    // cpu and ram were plain pills with a title= tooltip, which said what Nuarr
     // was using and nothing about what that was a share OF. "24% cpu" reads
     // completely differently on a machine at 30% than on one at 95%, and the
-    // header could not tell you which. Each opens a panel comparing nuarr
+    // header could not tell you which. Each opens a panel comparing Nuarr
     // against the whole box, and naming who has the rest.
     //
     // The <b>s are seeded with a placeholder so each one owns a TEXT NODE from
@@ -12438,10 +12438,10 @@ function renderSelfUse(s){
     +           '<span class="caret" id="suCpuCaret">▸</span></button>'
     +   '<div class="procpop" id="suCpuPop" onclick="event.stopPropagation()"></div>'
     + '</span>'
-    // ORDER: cpu, gpu, ram - the three things nuarr consumes, and all three
+    // ORDER: cpu, gpu, ram - the three things Nuarr consumes, and all three
     // read as NUARR'S OWN share rather than the machine's. The gpu chip sat
     // after ram and reported the whole card, which made it the odd one out in
-    // a row that otherwise answers one question: what is nuarr costing me.
+    // a row that otherwise answers one question: what is Nuarr costing me.
     + '<span class="suwrap" id="suGpuWrap">'
     +   '<button class="procbtn" id="suGpuBtn" title="nuarr\'s GPU use, and what else is on the card"'
     +           ' onclick="toggleSu(event,\'gpu\')"><b>—</b> gpu'
@@ -12455,7 +12455,7 @@ function renderSelfUse(s){
     +   '<div class="procpop" id="suRamPop" onclick="event.stopPropagation()"></div>'
     + '</span>'
     + '<span class="suwrap" id="suWrap">'
-    +   '<button class="procbtn" id="suProcBtn" title="what nuarr is running"'
+    +   '<button class="procbtn" id="suProcBtn" title="what Nuarr is running"'
     +           ' onclick="toggleProcs(event)"><b>—</b>'
     +           ' <span>process<span id="suProcPl">es</span></span>'
     +           '<span class="caret" id="suProcCaret">▸</span></button>'
@@ -12465,7 +12465,7 @@ function renderSelfUse(s){
   }
   const ram = n.ram_mb>=1024 ? (Math.round(n.ram_mb/102.4)/10)+' GB'
                              : Math.round(n.ram_mb)+' MB';
-  // Colour on nuarr's SHARE OF THE MACHINE, not the raw per-core number: 100%
+  // Colour on Nuarr's SHARE OF THE MACHINE, not the raw per-core number: 100%
   // of one core is unremarkable on 20 threads and should not read as hot.
   const c = n.cpu_pct>=60 ? 'var(--bad)' : n.cpu_pct>=25 ? 'var(--warn)' : 'var(--ok)';
   const cb=document.querySelector('#suCpuBtn b');
@@ -12476,14 +12476,14 @@ function renderSelfUse(s){
   // THE GPU CHIP IS NUARR'S, LIKE THE OTHER TWO.
   //
   // It reported the whole card, which made it the one chip in the row that was
-  // not about nuarr - "0% gpu" while nuarr encodes nothing and Plex saturates
+  // not about Nuarr - "0% gpu" while Nuarr encodes nothing and Plex saturates
   // NVENC is a true statement about the wrong subject.
   //
   // Attribution is only possible one way round, and the code has to be honest
   // about that. nvidia-smi CANNOT split engine utilisation per process; it can
-  // only say which pids hold VRAM. So: when nuarr has a process on the card,
-  // the encoder figure is nuarr's, because nuarr's only reason to be there is
-  // an encode. When it does not, nuarr's use is zero however busy the card is,
+  // only say which pids hold VRAM. So: when Nuarr has a process on the card,
+  // the encoder figure is Nuarr's, because Nuarr's only reason to be there is
+  // an encode. When it does not, Nuarr's use is zero however busy the card is,
   // and the chip says zero - with a dot to show the card is not idle, so the
   // number cannot be mistaken for "nothing is happening".
   //
@@ -12504,8 +12504,8 @@ function renderSelfUse(s){
     // was the sole reason to be on the GPU, reporting encoder_pct was the
     // honest number. PaddleOCR and Whisper run on the CUDA cores instead, so
     // that rule started printing "0% gpu" beside a card sitting at 30% doing
-    // nuarr's own OCR. With a nuarr process on the card the chip now reports
-    // the busiest engine nuarr could be driving; with none, it still reports
+    // Nuarr's own OCR. With a Nuarr process on the card the chip now reports
+    // the busiest engine Nuarr could be driving; with none, it still reports
     // zero and shows the dot for whatever else is running.
     const e = G.name==null ? null
             : (onCard ? Math.max(G.encoder_pct||0, G.gpu_pct||0) : 0);
@@ -12517,10 +12517,10 @@ function renderSelfUse(s){
   if(gbtn){
     gbtn.classList.toggle('otherbusy', busyElsewhere);
     gbtn.title = busyElsewhere
-      ? `nuarr is not using the GPU — something else is (encoder ${
+      ? `Nuarr is not using the GPU — something else is (encoder ${
           Math.round(G.encoder_pct||0)}%). Click for what.`
       : (onCard
-          ? `nuarr on the GPU — encoder ${Math.round(G.encoder_pct||0)}%, `
+          ? `Nuarr on the GPU — encoder ${Math.round(G.encoder_pct||0)}%, `
             + `cores ${Math.round(G.gpu_pct||0)}%. Click for the card's engines.`
           : 'nuarr\'s GPU use, and what else is on the card');
   }
@@ -12535,10 +12535,10 @@ function renderSelfUse(s){
 
   // ALWAYS PRESENT AND ALWAYS OPENABLE.
   //
-  // This was first hidden when nuarr had no children, then merely disabled -
-  // both wrong for the same reason. The panel does not only list what nuarr
+  // This was first hidden when Nuarr had no children, then merely disabled -
+  // both wrong for the same reason. The panel does not only list what Nuarr
   // spawned; it is where the GPU lives, and the GPU is at its most interesting
-  // when nuarr is doing NOTHING. An idle encoder at 60% means something else
+  // when Nuarr is doing NOTHING. An idle encoder at 60% means something else
   // on this box is using it, which is exactly the thing you would open a panel
   // to find out - and until now the panel refused to open in precisely that
   // situation.
@@ -12546,14 +12546,14 @@ function renderSelfUse(s){
   paintProcBtn(n);
   if(btn){
     btn.disabled=false;
-    btn.title='what nuarr is running';
+    btn.title='what Nuarr is running';
   }
   // The pill above reads as a share of the WHOLE machine, and so does Task
   // Manager. Leaving the panel on raw psutil per-core numbers put "300%" next
   // to "18.7% cpu" for the same instant, which reads as a contradiction rather
   // than as two units.
   _cpuCores = s.cpu_cores || _cpuCores;
-  // The WHOLE sample, not just the nuarr block. The panel now shows the GPU
+  // The WHOLE sample, not just the Nuarr block. The panel now shows the GPU
   // too, and that lives on s.gpu - keeping only s.nuarr meant reopening the
   // panel from a stale click had no GPU to draw.
   _procLast=s;
@@ -12605,7 +12605,7 @@ function paintSu(which, s){
   const others=(s.others||[]).slice();
   const mb=v=>v>=1024 ? (Math.round(v/102.4)/10)+' GB' : Math.round(v)+' MB';
 
-  // A share-of-the-machine bar. The point of the whole panel is that nuarr's
+  // A share-of-the-machine bar. The point of the whole panel is that Nuarr's
   // number is a FRACTION of something, so it gets drawn as one.
   const bar=(pct,col)=>`<div class="subar"><i style="width:${
       Math.max(0,Math.min(100,pct)).toFixed(1)}%;background:${col}"></i></div>`;
@@ -12618,12 +12618,12 @@ function paintSu(which, s){
       + `<div class="surow"><span>Whole machine</span>`
       +   `<b class="suv">${machine.toFixed(1)}%</b></div>`
       + bar(machine, machine>=85?'var(--bad)':machine>=60?'var(--warn)':'var(--acc)')
-      + `<div class="surow"><span class="me">nuarr and its children</span>`
+      + `<div class="surow"><span class="me">Nuarr and its children</span>`
       +   `<b class="suv me">${mine.toFixed(1)}%</b></div>`
       + bar(mine, 'var(--acc)')
       + `<div class="surow"><span class="mult">everything else</span>`
       +   `<b class="suv mult">${rest.toFixed(1)}%</b></div>`
-      + `<div class="pf">nuarr is <b>${pctOf(mine, machine)}</b>`
+      + `<div class="pf">Nuarr is <b>${pctOf(mine, machine)}</b>`
       + ` of the load on this box. Its raw figure is ${n.cpu_pct_raw||0}% of a`
       + ` single core, which is why it can exceed 100 before this division.</div>`;
     others.sort((a,b)=>b.cpu_pct-a.cpu_pct);
@@ -12638,7 +12638,7 @@ function paintSu(which, s){
       +   `<b class="suv">${used.toFixed(1)} GB</b></div>`
       + bar(s.ram_pct||0, (s.ram_pct||0)>=90?'var(--bad)'
                           :(s.ram_pct||0)>=75?'var(--warn)':'var(--acc)')
-      + `<div class="surow"><span class="me">nuarr and its children</span>`
+      + `<div class="surow"><span class="me">Nuarr and its children</span>`
       +   `<b class="suv me">${mb(n.ram_mb||0)}</b></div>`
       + bar(total>0?mineGb/total*100:0, 'var(--acc)')
       + `<div class="surow"><span class="mult">everything else</span>`
@@ -12646,7 +12646,7 @@ function paintSu(which, s){
       // A share under 1% must not round to "0%" - on a server using 149 MB of
       // 30 GB that reads as a broken measurement rather than as the good news
       // it actually is.
-      + `<div class="pf">nuarr is <b>${pctOf(mineGb, used)}</b>`
+      + `<div class="pf">Nuarr is <b>${pctOf(mineGb, used)}</b>`
       + ` of what is in use, and <b>${pctOf(mineGb, total)}</b>`
       + ` of the installed ${total.toFixed(1)} GB.</div>`;
     others.sort((a,b)=>b.ram_mb-a.ram_mb);
@@ -12654,7 +12654,7 @@ function paintSu(which, s){
       `<tr><td>${esc(o.name)}${o.n>1?`<span class="mult"> ×${o.n}</span>`:''}</td>`
       +`<td class="v">${mb(o.ram_mb)}</td></tr>`).join('');
   }
-  if(rows) html += `<div class="ph" style="margin-top:9px">Biggest outside nuarr</div>`
+  if(rows) html += `<div class="ph" style="margin-top:9px">Biggest outside Nuarr</div>`
                  + `<table>${rows}</table>`;
   setHTML(pop, html);
 }
@@ -12709,17 +12709,17 @@ document.addEventListener('click', ()=>closeProcs());
 function paintProcs(s){
   const pop=document.getElementById('procPop');
   if(!pop) return;
-  // Accepts the whole sample now; older callers passed just the nuarr block.
+  // Accepts the whole sample now; older callers passed just the Nuarr block.
   const n=(s&&s.nuarr)||s||{};
   const list=n.proc_list||[];
   const mb=v=>v>=1024 ? (Math.round(v/102.4)/10)+' GB' : Math.round(v)+' MB';
   // GROUP BY WHAT IT IS DOING, not by which executable it is.
   //
   // "ffprobe.exe" and "conhost.exe" are true and useless: they say a process
-  // exists, not what nuarr is doing with it. The server names each child from
+  // exists, not what Nuarr is doing with it. The server names each child from
   // its own arguments, so a row can say "Audio language — listening to
   // Blue Gender S01E06" instead. Anything unrecognised falls back to its
-  // executable name, which is worth seeing on its own: nuarr should not be
+  // executable name, which is worth seeing on its own: Nuarr should not be
   // spawning things it cannot account for.
   const by=new Map();
   for(const p of list){
@@ -12761,7 +12761,7 @@ function paintProcs(s){
            + `<td class="v" title="share of all ${_cpuCores||'?'} threads, `
            + `the same scale as the pill and Task Manager">cpu</td>`
            + `<td class="v">up</td></tr>${rows}</table>`
-           + `<div class="pf">Everything nuarr has spawned, named by the work `
+           + `<div class="pf">Everything Nuarr has spawned, named by the work `
            + `it is doing rather than by the executable. Anything other than `
            + `the server sitting here for more than ten minutes is a straggler.</div>`;
 
@@ -12809,7 +12809,7 @@ function gpuPanel(s){
   // is exact where the driver was empty, and it is the question being asked.
   const perProc = !!G.per_proc_vram;
   const ourJobs = _nuarrEnc||[];
-  // Declared GPU work counts too - PaddleOCR and Whisper are nuarr on the
+  // Declared GPU work counts too - PaddleOCR and Whisper are Nuarr on the
   // card without any encode job existing. See _gpu_work() server-side.
   const onCard = ourJobs.length > 0
               || (((s&&s.gpu_work)||[]).some(w=>w.n>0))
@@ -12820,22 +12820,22 @@ function gpuPanel(s){
   // can be attributed, and it is what stops the panel claiming an idle card.
   const busyCard = (G.encoder_pct||0) >= 1 || (G.decoder_pct||0) >= 1
                 || (G.gpu_pct||0) >= 5;
-  // NUARR FIRST, THE CARD SECOND. The chip is about nuarr, so the panel behind
-  // it opens with the same subject rather than making you find nuarr's share
+  // NUARR FIRST, THE CARD SECOND. The chip is about Nuarr, so the panel behind
+  // it opens with the same subject rather than making you find Nuarr's share
   // inside a table about the whole GPU.
   //
   // And it says plainly which half can be attributed. VRAM can: nvidia-smi
   // reports it per pid. Engine utilisation cannot - there is no per-process
-  // NVENC figure at all - so claiming "nuarr is using 40% of the encoder"
+  // NVENC figure at all - so claiming "Nuarr is using 40% of the encoder"
   // would be a number nothing measured.
-  let html = '<div class="ph">nuarr on this GPU</div>'
+  let html = '<div class="ph">Nuarr on this GPU</div>'
     + '<table><tr><td>encoder</td><td class="v" style="color:'
     + (onCard?hue(G.encoder_pct||0):'var(--dim)') + '">'
     + (onCard ? Math.round(G.encoder_pct||0)+'%' : 'not encoding') + '</td></tr>'
     + `<tr><td>encode jobs</td><td class="v">${
         ourJobs.length ? ourJobs.length : '<span class="dim">none</span>'}</td></tr>`
     // GPU WORK THAT IS NOT AN ENCODE. PaddleOCR and Whisper run on the CUDA
-    // cores, so "encoder: not encoding" can be true while nuarr is the thing
+    // cores, so "encoder: not encoding" can be true while Nuarr is the thing
     // loading the card - these rows are what stop that reading as Plex.
     + ((s&&s.gpu_work)||[]).map(wk=>`<tr><td>${esc(wk.label)}</td>
         <td class="v">${wk.n>1?wk.n:(wk.n===1?'running':'<span class="dim">idle</span>')}</td></tr>`).join('')
@@ -12847,7 +12847,7 @@ function gpuPanel(s){
     + (ourJobs.length
         ? `<div class="pf">${ourJobs.length} encode job${
             ourJobs.length===1?'':'s'} running, so the encoder figure above is
-           nuarr's. Engine load cannot be split per program — the driver does
+           Nuarr's. Engine load cannot be split per program — the driver does
            not report it — so with something else also encoding the two would
            share this number.</div>`
         : (busyCard
@@ -12857,17 +12857,17 @@ function gpuPanel(s){
                 // whenever the encoder was idle. It is now the normal state
                 // for subtitle OCR on PaddleOCR and for a Whisper listen -
                 // both of which use the CUDA cores, never NVENC - and calling
-                // nuarr's own work somebody else's was simply wrong.
-                ? `<div class="pf">No encode is running, but nuarr <b>is</b> on
+                // Nuarr's own work somebody else's was simply wrong.
+                ? `<div class="pf">No encode is running, but Nuarr <b>is</b> on
                    this card — subtitle OCR and audio-language detection use
                    the CUDA cores rather than the encoder, which is why NVENC
                    reads zero while <b>cores (SM)</b> below does not.</div>`
-                : `<div class="pf">nuarr is not on this card at all, so <b>the
+                : `<div class="pf">Nuarr is not on this card at all, so <b>the
                    load below is something else</b> — most likely Plex
                    transcoding.
                    ${perProc?'':`This driver does not report which process owns
                    a video session, so it cannot be named here.`}</div>`)
-            : `<div class="pf">Nothing is running on the card. nuarr uses it
+            : `<div class="pf">Nothing is running on the card. Nuarr uses it
                for a rebuild, for subtitle OCR when PaddleOCR is the engine,
                and for audio-language detection; a remux copies the picture
                untouched and never touches it.</div>`))
@@ -12891,7 +12891,7 @@ function gpuPanel(s){
     + `<td style="width:74px">${bar(vr,hue(vr))}</td></tr>`
     + '</table>';
   // WHO IS ON THE CARD. The utilisation figures say it is busy; they cannot
-  // say whether that is nuarr or Plex, and on this box the two compete for one
+  // say whether that is Nuarr or Plex, and on this box the two compete for one
   // NVENC engine. Those two answers call for opposite responses, so the panel
   // has to distinguish them.
   // ONLY LIST PROCESSES WHEN THE LIST MEANS SOMETHING.
@@ -12908,7 +12908,7 @@ function gpuPanel(s){
           + apps.slice(0,8).map(a=>{
               const ours=mine.has(a.pid);
               return `<tr><td class="${ours?'me':''}">${esc(a.name)}`
-                   + `${ours?' <span class="mult">(nuarr)</span>':''}</td>`
+                   + `${ours?' <span class="mult">(Nuarr)</span>':''}</td>`
                    + `<td class="v">${a.vram_mb!=null?mb(a.vram_mb):'—'}</td></tr>`;
             }).join('')
           + '</table>';
@@ -13312,7 +13312,7 @@ async function pbDetail(p64){
         <span>${esc(started.toLocaleDateString())} · ${span}</span>
         <span class="dim">${esc(s.product||'')}${s.client?' · '+esc(s.client):''}${
           s.user?' · '+esc(s.user):''}</span>
-        ${s.legacy?'<span class="dim" title="recorded before nuarr tracked session ids, so these were grouped by viewer, device and start time">grouped by time</span>':''}
+        ${s.legacy?'<span class="dim" title="recorded before Nuarr tracked session ids, so these were grouped by viewer, device and start time">grouped by time</span>':''}
       </div>
       <div class="pbdet3">
         <span class="h">Track</span><span class="h">Sent as</span><span class="h">Why</span>
@@ -13624,7 +13624,7 @@ click to read this run's findings"
       <div style="margin-top:6px">${covers}</div>
       <div style="margin-top:7px"><b style="color:var(--bad)">Breaking a rule</b>
         means the file contradicts what the rules promise — either a rule is not
-        doing its job, or something wrote the file after nuarr did.
+        doing its job, or something wrote the file after Nuarr did.
         <b>Waiting to be reprocessed</b> is not a fault: the file predates a rule
         and its job has not run yet.</div>
       <div style="margin-top:7px"><b>Self-heal</b> offers every flagged file to
@@ -13665,7 +13665,7 @@ async function auClearHeal(fid){
 // flagged subs/order - came back with the planner saying "already set up
 // correctly", because nothing in the rules reorders subtitle tracks. A button
 // that queued a job, showed a spinner and left the finding standing would have
-// looked like nuarr failing to fix its own file. Saying so is the feature.
+// looked like Nuarr failing to fix its own file. Saying so is the feature.
 // The answer is kept per file, because loadAudit() repaints this panel every
 // 60 seconds and rebuilds the rows from scratch. The first version wrote
 // straight into the div and the reply vanished at the next repaint - you
@@ -13942,7 +13942,7 @@ async function ffNvenc(){
     `<div class="dim" style="margin-top:4px;font-size:11px">
        No hardware encoder was found, so encodes use the CPU (x264/x265).
        That is slower per file and produces smaller files at the same quality
-       — nothing is broken, and nuarr plans exactly the same way.</div>`;
+       — nothing is broken, and Nuarr plans exactly the same way.</div>`;
   el.innerHTML = `<div style="display:flex;gap:9px;align-items:center;flex-wrap:wrap">`
     + test + drv + `</div>` + why + cpuNote + pinned;
   // Let the header bubble reflect it too. The upgrade verdict exists ONLY on
@@ -14149,7 +14149,7 @@ async function ffProgress(){
             : `<span class="dim">queue is idle — press Apply now</span>`);
     else if(p.phase==='applied')
       html=`<span class="pill p-ok">installed ${esc(p.version)}</span> `
-        +`<span class="dim">restart nuarr so new jobs use it</span>`;
+        +`<span class="dim">restart Nuarr so new jobs use it</span>`;
     // Refresh the version line ONCE, on the transition out of active - not on
     // every poll. Calling it each tick had ffCheck and ffProgress writing the
     // same element in turn, which is what flashed.
@@ -14188,7 +14188,7 @@ async function ffUsers(){
        <th class="nb" style="width:70px">Tool</th><th>Resolved path</th>
        <th class="nb" style="width:130px"></th></tr>${rows}</table>
      <div class="dim" style="font-size:11px;margin-top:4px">
-       fallback if nuarr has no build: <span class="mono">${esc(d.fallback_ffmpeg||'')}</span>
+       fallback if Nuarr has no build: <span class="mono">${esc(d.fallback_ffmpeg||'')}</span>
      </div>`;
 }
 function ffSay(html){                    // single writer for #ffMsg
@@ -14246,7 +14246,7 @@ async function ffApply(){
 // ---- restart / shutdown -------------------------------------------------
 async function ctl(action, waitIdle){
   const verb = waitIdle ? `${action} when the queue is idle` : `${action} NOW`;
-  if(!confirm(`${action==='restart'?'Restart':'Shut down'} nuarr — ${verb}?\n\n`
+  if(!confirm(`${action==='restart'?'Restart':'Shut down'} Nuarr — ${verb}?\n\n`
     +(waitIdle ? 'New jobs stop immediately; running jobs finish first.'
                : 'Running jobs are interrupted and requeued on next start.'))) return;
   const d=await (await fetch(`/api/control/${action}?wait_for_idle=${waitIdle?'true':'false'}`,
@@ -14781,7 +14781,7 @@ function renderOverall(o){
           ? 'A Plex client is streaming from this spindle. Jobs stay off it '
             +'until playback stops, so a viewer never competes with a copy.'
           : 'Starting a second job on this spindle makes both crawl - 63 MB/s '
-            +'shared versus 997 MB/s spread. nuarr waits for the job already '
+            +'shared versus 997 MB/s spread. Nuarr waits for the job already '
             +'on it to finish rather than interleaving.'}">`
         +`<span class="ovl-k">waiting</span>`
         +`<span class="ovl-v">${diskTag(w.disk)}</span>`
@@ -14879,7 +14879,7 @@ async function loadAuto(){
           +`<button class="aqx" title="clear the ${t[0]} jobs from the queue"
                     onclick="clearQueue('${k}')">×</button></span>`;
   };
-  // Library-wide progress. The bar is DONE out of everything nuarr manages,
+  // Library-wide progress. The bar is DONE out of everything Nuarr manages,
   // which is the only figure that answers "how far through are we" - the
   // queue depth answers a completely different question and was the only
   // number on the page before.
@@ -17122,7 +17122,7 @@ const GATE_META={
     off:'Any playback holds, including direct play. Safer on a busy server, since even a direct play competes for pool reads.'},
   'gate.plex_encode_only':{
     label:'Only hold GPU encodes, not stream copies', under:'gate.plex',
-    what:'Decides which of nuarr’s own pools the hold applies to.',
+    what:'Decides which of Nuarr’s own pools the hold applies to.',
     on:'Encodes wait (they want the same GPU Plex does); stream copies keep running, because they use no GPU at all. Copies still avoid the one spindle being watched.',
     off:'Both pools wait. Simpler, and idles hardware nothing is competing for.'},
   'gate.plex_ignore_throttled':{
@@ -17133,21 +17133,21 @@ const GATE_META={
     note:'Measured here: throttled=1, speed 0.0, transcode 69% against a viewer at 28% — zero GPU in use while the encode queue was held anyway. The lead requirement is what keeps this safe; a session throttled with only a little in hand is about to wake up and want the GPU back.'},
   'gate.plex_io_throttle':{
     label:'Yield disk priority while anyone is watching',
-    what:'Lowers the disk priority of nuarr’s jobs so a viewer’s reads go first. Independent of the hold — this never stops work, it only decides who yields.',
+    what:'Lowers the disk priority of Nuarr’s jobs so a viewer’s reads go first. Independent of the hold — this never stops work, it only decides who yields.',
     on:'Jobs touching the spindle a viewer is reading from run at lowered I/O priority, and a commit writing to that disk is paced back to about a quarter speed. Jobs on other disks are untouched.',
     off:'Everything runs at normal priority. A viewer on the same disk as a job may see the stream stutter.',
     note:'Applies per spindle. One viewer occupies one of twelve disks, so demoting jobs elsewhere would cost throughput for nobody’s benefit.'},
   'gate.disk_busy':{
     label:'Steer away from disks something else is already hammering',
     what:'Measures how busy each physical disk is and keeps new work off the loaded ones. It names no product and asks no API, so it covers a pool balance, a parity check, a backup, a rebuild, a big copy, or another app entirely.',
-    on:'A disk held busy for a sustained stretch by something other than nuarr stops receiving new jobs; work goes to the quiet spindles instead. Only when every relevant disk is busy does the queue hold outright.',
+    on:'A disk held busy for a sustained stretch by something other than Nuarr stops receiving new jobs; work goes to the quiet spindles instead. Only when every relevant disk is busy does the queue hold outright.',
     off:'Jobs start regardless of what else is using the disks, and compete with it.',
-    note:'Reads % Idle Time per physical disk, not % Disk Time — measured here, % Disk Time returned 145, because it sums across queued requests and cannot be compared to a threshold. Physical disks, not volumes: P:\\ reported 100% idle while its member disk sat at 0% idle and 51 MB/s. nuarr’s own throughput is subtracted first, otherwise our encodes would pause us.'},
+    note:'Reads % Idle Time per physical disk, not % Disk Time — measured here, % Disk Time returned 145, because it sums across queued requests and cannot be compared to a threshold. Physical disks, not volumes: P:\\ reported 100% idle while its member disk sat at 0% idle and 51 MB/s. Nuarr’s own throughput is subtracted first, otherwise our encodes would pause us.'},
   'gate.arrs':{
     label:'Hold while Sonarr or Radarr is renaming or importing',
     what:'Waits while an arr is moving files around.',
     on:'No job starts while an arr reports itself busy. Touching a file mid-rename is the original cause of the ENOENT/EBUSY failures this pipeline was built to avoid.',
-    off:'Jobs may start while an arr is moving files. nuarr still checks the individual file is unlocked before touching it.'},
+    off:'Jobs may start while an arr is moving files. Nuarr still checks the individual file is unlocked before touching it.'},
   'gate.manual_pause':{
     label:'Manual pause',
     what:'The stop switch. Nothing to do with what Plex or the arrs are doing.',
@@ -17172,7 +17172,7 @@ async function loadVersion(){
       el.classList.add('vertag-ready');
       el.textContent = `${ap.staged_version} ready to install`;
       el.title = `Update ${ap.staged_version} is downloaded and verified. `
-        + `Install it from the power menu (top right) - nuarr restarts briefly.`;
+        + `Install it from the power menu (top right) - Nuarr restarts briefly.`;
     } else if(ap.state === 'downloading'){
       el.classList.add('vertag-new');
       el.textContent = `downloading ${u.latest} · ${Math.round((ap.progress||0)*100)}%`;
@@ -17181,7 +17181,7 @@ async function loadVersion(){
     } else if(ap.state === 'applying'){
       el.classList.add('vertag-ready');
       el.textContent = 'installing…';
-      el.title = 'nuarr is restarting into the new version.';
+      el.title = 'Nuarr is restarting into the new version.';
       pollUntilBack();
     } else if(u.update_available){
       el.classList.add('vertag-new');
@@ -17208,7 +17208,7 @@ setInterval(loadVersion, 300000);
 // A fresh install knows nothing: the installer only asks for folders and a
 // port now, because libraries, arrs and Plex all configure better HERE -
 // with live tests and a sign-in button - than in a wizard that runs before
-// nuarr exists. So the dashboard notices the blank slate and walks through it.
+// Nuarr exists. So the dashboard notices the blank slate and walks through it.
 // IT HAS TO SURVIVE THE NAVIGATION IT ASKS FOR. The first version was a
 // modal that sent you to a settings page and then vanished - so the moment
 // you did what it asked, the thing keeping track of where you were in the
@@ -17218,11 +17218,11 @@ setInterval(loadVersion, 300000);
 // what is left.
 const FR_STEPS=[
   {k:'arrs', n:'Connect Sonarr or Radarr', hash:'#arrs', btn:'Open Arrs',
-   what:'Either one on its own is enough — nuarr keeps names and imports in step with whichever you use.'},
+   what:'Either one on its own is enough — Nuarr keeps names and imports in step with whichever you use.'},
   {k:'plex', n:'Sign in with Plex', hash:'#plex', btn:'Open Plex',
-   what:'One click: a plex.tv window opens, nuarr gets a token and finds your server itself.'},
+   what:'One click: a plex.tv window opens, Nuarr gets a token and finds your server itself.'},
   {k:'libraries', n:'Add your libraries', hash:'#libs', btn:'Open Libraries',
-   what:'The folders nuarr manages. Network shares can be connected right in the picker.'}];
+   what:'The folders Nuarr manages. Network shares can be connected right in the picker.'}];
 
 async function firstRun(){
   let s=null;
@@ -17258,7 +17258,7 @@ async function firstRun(){
                 padding:${onSettings?'13px 15px':'20px 22px'};
                 box-shadow:0 6px 26px rgba(0,0,0,.45)">
       <div style="display:flex;align-items:baseline;gap:8px">
-        <b style="font-size:${onSettings?'13px':'17px'}">Setting up nuarr</b>
+        <b style="font-size:${onSettings?'13px':'17px'}">Setting up Nuarr</b>
         <span class="dim" style="font-size:11px;margin-left:auto">${3-left} of 3 done</span>
       </div>
       ${onSettings?'':`<div class="dim" style="font-size:12px;margin:4px 0 8px">
@@ -17979,8 +17979,8 @@ async function loadMetaTab(){
   }).join('');
   el.innerHTML = `
     <div class="dim" style="font-size:11.5px;margin-bottom:10px;line-height:1.5">
-      nuarr does not talk to TMDB or TheTVDB itself — the arrs do. This page is
-      about those providers and the arrs' own metadata health. What nuarr then
+      Nuarr does not talk to TMDB or TheTVDB itself — the arrs do. This page is
+      about those providers and the arrs' own metadata health. What Nuarr then
       copies OUT of the arrs — original language — lives with the arrs
       themselves, under <b>Integrations &rarr; Arrs</b>.
     </div>
@@ -18006,7 +18006,7 @@ function langSyncCard(n, arrNames){
     <div class="metarow">
       <div class="metahead">
         <b>${esc(arrNames || 'the arrs')}</b>
-        <span class="metato">→</span><b>nuarr</b>
+        <span class="metato">→</span><b>Nuarr</b>
         <span class="pill ${pct>=99?'p-ok':(pct>0?'p-warn':'p-bad')}">${pct}% tagged</span>
       </div>
       <div class="dim" style="font-size:11px;margin:4px 0 6px">
@@ -18232,7 +18232,7 @@ function pxDetail(s){
   // WHAT NUARR IS ALLOWED TO DO ON THIS VIEWER'S DISK, in the same card as the
   // bar that shows why. Two settings decide it and both were previously only
   // findable on the settings page, which meant the bar could show a viewer
-  // running dry with nothing on screen connecting that to nuarr's behaviour.
+  // running dry with nothing on screen connecting that to Nuarr's behaviour.
   // THE FLOOR THAT GOVERNS *THIS* SESSION. floor_s is computed per stream -
   // 0 when it is buffered to the end, scaled by its bitrate, capped under
   // Plex's throttle buffer when it is a transcode - so the global setting is
@@ -18253,11 +18253,11 @@ function pxDetail(s){
     // SUMMARISED, WITH THE ESSAY ON HOVER. Both of these paragraphs were
     // worth writing once and are not worth reading on three cards at a time:
     // together they ran longer than the stream details above them and pushed
-    // the bar off the bottom of the card. The line now states what nuarr does
+    // the bar off the bottom of the card. The line now states what Nuarr does
     // and at what numbers; the reasoning moves to the tooltip, where it costs
     // nothing until it is wanted.
     const fsp = Math.round(fl * Number(window._pxFullMult || 3));
-    const tip = `Above ${fsp}s of buffer nuarr does not hold back at all - you `
+    const tip = `Above ${fsp}s of buffer Nuarr does not hold back at all - you `
       + `are too far ahead for anything it does to this disk to reach you. `
       + `Between ${fsp}s and ${fl}s it slows down by a sliding amount, hardest `
       + `at the bottom. Under ${fl}s it stops completely, and does not start `
@@ -18322,9 +18322,9 @@ function pxDetail(s){
     + runway
     + (fl?`<div class="pxlegend">
         <s class="pos">watched</s><s class="buf">buffered ahead</s>
-        <s class="thr">${fl}s — nuarr stops</s>
-        <s class="rsm">${rs}s — nuarr starts again</s>
-        <s class="fsp">${Math.round(fl*Number(window._pxFullMult||3))}s — nuarr at full speed</s></div>`:'')
+        <s class="thr">${fl}s — Nuarr stops</s>
+        <s class="rsm">${rs}s — Nuarr starts again</s>
+        <s class="fsp">${Math.round(fl*Number(window._pxFullMult||3))}s — Nuarr at full speed</s></div>`:'')
     + `</div>`;
 }
 // ONE CLICK OPENS THEM ALL. The expanded views are for comparing - who is
@@ -18425,20 +18425,20 @@ function pxLead(s, leadNow){
       return `<span class="dim" title="Read from the server's own file position for this stream — Plex's handle sits at the furthest byte it has served the client, which is exactly the player's buffered-to point.">
         ${t} buffered <span style="opacity:.7">(measured)</span></span>`;
     // A FLOOR IS NOT AN ESTIMATE. When the session was already running before
-    // nuarr saw it, the integral can only measure growth since we started
+    // Nuarr saw it, the integral can only measure growth since we started
     // watching - a client sitting on a full buffer fetches at exactly 1x, so
     // the number freezes far below the truth. Say which kind of number this
     // is rather than dressing a floor up as a measurement.
     if(L < 5 && !s.lead_full)
       return `<span class="dim">measuring client buffer\u2026</span>`;
     if(s.lead_floor)
-      return `<span class="dim" title="This session was already playing when nuarr started, so its buffer can only be measured from now on \u2014 the real figure is larger. It corrects itself on the next seek, or when this client has been measured from the start once.">
+      return `<span class="dim" title="This session was already playing when Nuarr started, so its buffer can only be measured from now on \u2014 the real figure is larger. It corrects itself on the next seek, or when this client has been measured from the start once.">
         \u2265${t} buffered <span style="opacity:.7">(at least)</span></span>`;
     if(s.lead_learned)
-      return `<span class="dim" title="Taken from this client's buffer size, measured on an earlier session that nuarr watched from the start.">
+      return `<span class="dim" title="Taken from this client's buffer size, measured on an earlier session that Nuarr watched from the start.">
         \u2248${t} buffered <span style="opacity:.7">(typical for this client)</span></span>`;
     if(s.lead_proven)
-      return `<span class="dim" title="Proven from playback: the client played this far without fetching a single byte, so it must have held it. Measured across a resume, so it does not depend on when nuarr started watching.">
+      return `<span class="dim" title="Proven from playback: the client played this far without fetching a single byte, so it must have held it. Measured across a resume, so it does not depend on when Nuarr started watching.">
         ${t} buffered <span style="opacity:.7">(proven)</span></span>`;
     return `<span class="dim" title="Estimated from the bytes Plex has delivered to this client against the file's bitrate. Less certain than the other readings \u2014 it cannot see what the player did with them.">
         ${t} buffered <span style="opacity:.7">(${
@@ -18494,7 +18494,7 @@ function pxTick(){
     // THE PAUSE LINE, drawn where the playhead will be after `floor` seconds.
     // Putting it on the same axis as the buffered edge is what makes it
     // readable: if the band's bright edge is LEFT of the dashes, this viewer
-    // has less runway than the floor and nuarr has stopped work on their disk.
+    // has less runway than the floor and Nuarr has stopped work on their disk.
     // Both marks move with the playhead, so the gap between them is the margin.
     const thr = c.querySelector('.pxbar u');
     const lbl = c.querySelector('.pxblbl');
@@ -18509,7 +18509,7 @@ function pxTick(){
     // when the spindle it sits on is held for somebody else. Neither is one
     // whose player is PAUSED: it is not spending its buffer, and the gate
     // builds its floors from playing sessions only, so a paused card showing
-    // "nuarr paused" was claiming a hold that was not happening.
+    // "Nuarr paused" was claiming a hold that was not happening.
     const starved = s.floor_s !== 0 && s.state !== 'paused'
       && (!!(window._pxHeld||{})[s.disk]
           || (floor > 0 && leadNow != null && leadNow < floor));
@@ -18547,7 +18547,7 @@ function pxTick(){
         : s.state === 'paused' ? `${upto} — player paused`
         : !floor ? ''
         : leadNow == null ? 'buffer not measured'
-        : starved ? `${upto} · ${Math.round(leadNow)}s ahead — nuarr paused`
+        : starved ? `${upto} · ${Math.round(leadNow)}s ahead — Nuarr paused`
         : `${upto} · ${Math.round(leadNow)}s ahead — clear`;
     }
     // The runway gauge, on its own axis: 0 .. 3x the floor, in seconds. Past
@@ -18590,23 +18590,23 @@ function pxTick(){
       // statement about a mechanism that is not running.
       const pacedHere = (window._pxPaced || new Set()).has(s.disk);
       const speed = (eff == null || !pacedHere) ? ''
-        : ` — nuarr at ${Math.round(100/(1+eff))}% speed`;
+        : ` — Nuarr at ${Math.round(100/(1+eff))}% speed`;
       // The same "where does it reach" the bar label now leads with, so the two
       // lines describe one edge rather than two unrelated quantities.
       const at2 = pxTime(n.off + (leadNow||0)*1000);
       const to2 = at2 ? ` (to ${at2})` : '';
-      // Nothing of nuarr's is copying here, so there is no speed to quote - but
+      // Nothing of Nuarr's is copying here, so there is no speed to quote - but
       // silence would read as an omission. Say which it is.
-      const idleHere = !pacedHere ? ' — nuarr idle here' : '';
+      const idleHere = !pacedHere ? ' — Nuarr idle here' : '';
       if(rl) rl.textContent = leadNow == null ? 'buffer not measured'
         : hs ? (leadNow < rsm
                  ? `${Math.round(leadNow)}s${to2} — paused until ${rsm}s`
                  : `${Math.round(leadNow)}s${to2} — recovering, resumes in ${
                      Math.ceil(Math.max(hs.hold_left_s, hs.recover_left_s||0))}s`)
-        // Under its own floor but nuarr has nothing on that spindle to stop -
+        // Under its own floor but Nuarr has nothing on that spindle to stop -
         // saying "of runway" here contradicted the bar directly above it.
         : starved ? `${Math.round(leadNow)}s${to2} — under the ${floor}s it needs`
-        : leadNow >= fsAt ? `${Math.round(leadNow)}s${to2} — nuarr at full speed`
+        : leadNow >= fsAt ? `${Math.round(leadNow)}s${to2} — Nuarr at full speed`
         : `${Math.round(leadNow)}s of runway${to2}${speed || idleHere}`;
     }
     // the expanded card's ETA rides the same clock as the bar, so "ends at"
@@ -18681,7 +18681,7 @@ document.addEventListener('visibilitychange', pxSchedule);
 setInterval(pxTick, 250);
 pxSchedule();
 
-// ---- Libraries: the media folders nuarr manages --------------------------
+// ---- Libraries: the media folders Nuarr manages --------------------------
 async function loadLibsTab(){
   const el=document.getElementById('libBody');
   if(!el) return;
@@ -18761,7 +18761,7 @@ async function loadLibsTab(){
         empty library.</div>
     </div>
     <div class="dim" style="margin-top:10px;font-size:11px;line-height:1.55">
-      <b>How nuarr decides what something is.</b> Genres and original language
+      <b>How Nuarr decides what something is.</b> Genres and original language
       come from Sonarr and Radarr, which get them from TheTVDB and TMDB, and
       are re-read every 12 hours. That verdict is combined with the folder name
       and <b>the higher of the two wins</b> — anime over animation over live
@@ -18773,7 +18773,7 @@ async function loadLibsTab(){
     </div>`;
 }
 // Folder picker. Browses the SERVER's disks through /api/fs/folders rather
-// than opening a native dialog: nuarr runs as a scheduled task, so an Explorer
+// than opening a native dialog: Nuarr runs as a scheduled task, so an Explorer
 // window would open on a different desktop session - or on the console while
 // you are looking at a phone. This works from anywhere the page does.
 //
@@ -18852,7 +18852,7 @@ async function libPickAt(path){
     <div class="picklist">${items||'<div class="dim" style="padding:10px 12px">no sub-folders here</div>'}</div>
     ${!d.path?`
     <div class="pickhead" style="border-top:1px solid var(--line);gap:6px;flex-wrap:wrap">
-      <span class="dim" style="font-size:11px" title="nuarr runs as a service, which cannot see drive letters mapped in your login session - it connects to shares itself, with credentials it keeps. Stored in nuarr's config like the arr keys.">Connect a network share:</span>
+      <span class="dim" style="font-size:11px" title="Nuarr runs as a service, which cannot see drive letters mapped in your login session - it connects to shares itself, with credentials it keeps. Stored in Nuarr's config like the arr keys.">Connect a network share:</span>
       <input id="netSrv"  class="inp mono" style="width:130px" placeholder="server or IP">
       <input id="netUser" class="inp mono" style="width:110px" placeholder="username">
       <input id="netPass" class="inp mono" style="width:110px" type="password" placeholder="password">
@@ -18926,11 +18926,11 @@ async function libRemove(n64,files){
   const name=b64d(n64);
   // Two decisions, asked separately, because they have different consequences
   // and lumping them into one OK button would hide the second.
-  if(!confirm(`Remove "${name}" from nuarr?\n\nnuarr stops scanning and managing `
+  if(!confirm(`Remove "${name}" from Nuarr?\n\nnuarr stops scanning and managing `
     +`this folder. The media on disk is NOT touched.`)) return;
   let purge=0;
   if(files){
-    purge = confirm(`Also forget the ${files.toLocaleString()} file(s) nuarr has `
+    purge = confirm(`Also forget the ${files.toLocaleString()} file(s) Nuarr has `
       +`indexed for "${name}"?\n\nOK   — drop them from the index (recommended)\n`
       +`Cancel — keep them, and they will start showing as MISSING because nothing `
       +`scans that folder any more.`) ? 1 : 0;
@@ -19099,7 +19099,7 @@ function socPaint(lib){
           :'no picture subtitle tracks in this library'}</span></div>
 
       ${chk('auto',s.auto,'Convert picture subtitles to text',
-        'The master switch. PGS tracks are pictures, so Plex has to paint them into the video while you watch — which is a transcode. nuarr converts them with OCR and adds a real text version, which every client just displays. The picture track stays. <b>Everything below only applies when this is on</b>, and decides WHICH picture tracks get read.',
+        'The master switch. PGS tracks are pictures, so Plex has to paint them into the video while you watch — which is a transcode. Nuarr converts them with OCR and adds a real text version, which every client just displays. The picture track stays. <b>Everything below only applies when this is on</b>, and decides WHICH picture tracks get read.',
         !has.image)}
 
       <!-- A TREE, BECAUSE THESE ARE NOT PEERS. Five checkboxes in a flat
@@ -19385,7 +19385,7 @@ async function loadPlexCfg(){
     </div>
 
     <div class="lkind" style="padding:11px 12px;margin-bottom:10px">
-      <b style="color:#6fb0ff">Where nuarr reads sessions from</b>
+      <b style="color:#6fb0ff">Where Nuarr reads sessions from</b>
       <div class="dim" style="font-size:11px;margin-top:4px">
         Plex answers <span class="mono">/status/sessions</span> locally in tens
         of milliseconds. Tautulli's <span class="mono">get_activity</span> takes
@@ -19413,13 +19413,13 @@ async function loadPlexCfg(){
                placeholder="${c.plex_token_set?'token saved — leave blank to keep':'X-Plex-Token'}"
                style="flex:1;min-width:210px;font-family:var(--mono,monospace);font-size:12px">
         <button onclick="plexLink(this)" style="color:var(--acc)"
-          title="Opens a small plex.tv window; nuarr never sees your password">Sign in with Plex</button>
+          title="Opens a small plex.tv window; Nuarr never sees your password">Sign in with Plex</button>
         <button onclick="plexDetect(this)"
           title="Read the token this machine's Plex has already saved">Detect</button>
       </div>
       <div class="dim" style="font-size:11px;margin-top:5px">
         <b>Sign in with Plex</b> is the easy path: a small plex.tv window opens,
-        you sign in there, and nuarr receives a token and finds the server on
+        you sign in there, and Nuarr receives a token and finds the server on
         its own — URL included. Your password goes to plex.tv, never to nuarr.
         <b>Detect</b> reads the token a local Plex has already saved, and
         pasting one by hand (any library item &rarr; <b>Get Info</b> &rarr;
@@ -19620,7 +19620,7 @@ async function loadOcr(){
           <th style="text-align:left;padding:0 12px 4px 0">What it does</th>
         </tr></thead>
         ${socRow('Tesseract', s.tesseract_version||'—', s.tesseract_dir,
-          'reads the pictures'+(s.tesseract_managed?' — installed by nuarr':''))}
+          'reads the pictures'+(s.tesseract_managed?' — installed by Nuarr':''))}
         ${socRow('pgsrip', s.pgsrip_version||'—', s.pgsrip_dir,
           'drives Tesseract over a PGS stream')}
         ${socRow('paddleocr', p.paddleocr||'—', p.paddleocr_dir,
@@ -19946,7 +19946,7 @@ function ocrCompareHtml(s,p){
      c=>!c.ok?na():c.gpu?yes(p.gpu_name||''):no(paddle(c)
         ?'this column is the CPU device':'CPU only, always')],
     ['Ready without installing anything',
-     c=>c.engine==='tesseract'?yes('bundled with nuarr')
+     c=>c.engine==='tesseract'?yes('bundled with Nuarr')
         :(p.installed?yes('already installed'):no('needs a download first'))],
   ];
   const th=cols.map(c=>`<th style="text-align:left;padding:0 10px 6px 0">
@@ -20036,7 +20036,7 @@ function ocrCompareHtml(s,p){
 }
 
 // THE TABLE IS WHATEVER WAS LAST MEASURED HERE, not a constant. It shipped
-// as numbers from the machine nuarr was written on - the kind of claim that
+// as numbers from the machine Nuarr was written on - the kind of claim that
 // goes stale and cannot be checked.
 let _ocrMeas={};
 
@@ -20087,7 +20087,7 @@ async function padInstall(mode){
 // ---- the Updates card: one row per piece, one uniform Update button ------
 // Every one of the three is installed BY NUARR when its button is pressed:
 // pgsrip and paddleocr through pip in place, Tesseract by downloading the
-// UB Mannheim build and running it silently into nuarr's own folder - which
+// UB Mannheim build and running it silently into Nuarr's own folder - which
 // the resolver already prefers, so a hand-installed system copy is never
 // touched.
 async function ocrUpdLoad(){
@@ -20197,7 +20197,7 @@ function socRow(k,v,where,why){
 // THE BUTTONS OFFERED DEPEND ON WHAT WENT WRONG. Retry is real for a lock or
 // a full disk and pointless for a path over the length limit or a corrupt
 // download - offering it everywhere would teach you to click it everywhere and
-// learn nothing. Where nuarr cannot fix a thing it says what a person has to
+// learn nothing. Where Nuarr cannot fix a thing it says what a person has to
 // do instead, rather than showing a button that will fail politely.
 let _nl=null, _nlBusy={}, _nlTimer=null, _nlBulk=false;
 
@@ -20918,9 +20918,9 @@ async function loadWhisper(){
         ${w.cpu_ok === false ? `<div style="color:#e0575b;margin-bottom:6px">
           <b>This machine cannot run it.</b> ${esc(w.cpu_why)}. Checked by
           loading the model in a separate process, so finding this out costs
-          nothing — nuarr keeps naming untagged audio by inference instead.
+          nothing — Nuarr keeps naming untagged audio by inference instead.
         </div>` : ''}
-        Without it, nuarr still names untagged audio by <b>inference</b>
+        Without it, Nuarr still names untagged audio by <b>inference</b>
         (original language from TMDB/TheTVDB when the file's shape makes that
         safe) — installing upgrades the answer to what the audio actually
         contains. ${w.nvidia_present
@@ -20988,8 +20988,8 @@ async function loadWhisper(){
         ${row('size', w.model, 'bigger models are slower and were not more accurate here')}
         ${row('downloaded', mc.size_mb? (mc.size_mb>=1024?(mc.size_mb/1024).toFixed(1)+' GB'
                                                          :mc.size_mb+' MB') : 'not yet',
-              !mc.path ? 'fetched on first use, into nuarr&rsquo;s own folder'
-              : mc.managed ? 'kept with nuarr&rsquo;s other managed files'
+              !mc.path ? 'fetched on first use, into Nuarr&rsquo;s own folder'
+              : mc.managed ? 'kept with Nuarr&rsquo;s other managed files'
               : '<span style="color:#e2b341">still in the old user cache — '
                 +'it moves the next time the model loads</span>')}
         ${row('loaded now', w.loaded?'yes':'no',
@@ -21078,7 +21078,7 @@ async function whisInstall(mode){
 // CURRENT, LATEST, PREVIOUS - and nothing that installs anything. Checking is
 // automatic, applying is a click, and the click is deliberately a link out to
 // the release rather than a button that swaps files under a running encode.
-// nuarr is usually mid-transcode or mid-commit; a self-update that replaced
+// Nuarr is usually mid-transcode or mid-commit; a self-update that replaced
 // app/ while ffmpeg held an output open would leave a half-written file in the
 // library, which is the exact outcome the whole system exists to prevent.
 let _upd=null;
@@ -21100,7 +21100,7 @@ async function loadUpdates(force){
     // the person typing `off` - so say that back to them rather than
     // pretending the feature was never set up.
     head='Update checks are off'; colour='var(--dim)';
-    note='You asked nuarr not to contact GitHub. Save a repository below - '
+    note='You asked Nuarr not to contact GitHub. Save a repository below - '
         +'or clear the field to return to the official releases - to turn '
         +'checking back on.';
   } else if(!u.ok){
@@ -21128,7 +21128,7 @@ async function loadUpdates(force){
     note=`${esc(u.current)} is the newest release.`;
   } else {
     head='No releases published yet'; colour='var(--dim)';
-    note='The repository is reachable but has no tagged releases. nuarr only '
+    note='The repository is reachable but has no tagged releases. Nuarr only '
         +'offers releases, not tags - a tag is a commit somebody labelled, a '
         +'release is a statement that it is meant to be installed.';
   }
@@ -21167,7 +21167,7 @@ async function loadUpdates(force){
                     align-items:center;flex-wrap:wrap">
           ${(u.apply||{}).state==='ready'
             ? `<button class="btn" onclick="ctlUpdate()">Install ${esc(u.apply.staged_version)} now</button>
-               <span class="dim" style="font-size:11.5px">downloaded and verified - nuarr restarts briefly to apply it</span>`
+               <span class="dim" style="font-size:11.5px">downloaded and verified - Nuarr restarts briefly to apply it</span>`
             : (u.apply||{}).state==='downloading'
             ? `<span class="dim">downloading… ${Math.round(((u.apply||{}).progress||0)*100)}%</span>`
             : `<button class="btn" onclick="updStage()">Download &amp; verify</button>
@@ -21179,10 +21179,10 @@ async function loadUpdates(force){
     <div class="lkind" style="padding:11px 12px;margin-top:10px">
       <b style="color:#6fb0ff">How updates arrive</b>
       <div class="dim" style="font-size:11.5px;margin:4px 0 8px">
-        <b>Manual</b> - nuarr tells you and waits. <b>Auto</b> - nuarr also
+        <b>Manual</b> - Nuarr tells you and waits. <b>Auto</b> - Nuarr also
         downloads and verifies the update during a quiet stretch (no jobs, no
         viewers, for ten unbroken minutes), so installing is instant when you
-        choose it. Installing always restarts nuarr, and is always your click
+        choose it. Installing always restarts Nuarr, and is always your click
         - from here or the power menu.
       </div>
       <div style="display:flex;gap:7px">
@@ -21195,11 +21195,11 @@ async function loadUpdates(force){
     <div class="lkind" style="padding:11px 12px">
       <b style="color:#6fb0ff">Update source</b>
       <div class="dim" style="font-size:11.5px;margin:4px 0 8px">
-        Follows the official nuarr releases
+        Follows the official Nuarr releases
         (<span class="mono">NuGundam/nuarr</span>) out of the box. Point it at
         a fork as <span class="mono">owner/name</span> to follow a different
-        build of nuarr — pasting the full GitHub address works too. Type
-        <span class="mono">off</span> to stop nuarr contacting GitHub at all.
+        build of Nuarr — pasting the full GitHub address works too. Type
+        <span class="mono">off</span> to stop Nuarr contacting GitHub at all.
       </div>
       <div style="display:flex;gap:7px;flex-wrap:wrap">
         <input id="updRepo" class="inp mono" style="flex:1 1 260px"
@@ -21324,7 +21324,7 @@ async function saveCacheCfg(btn){
 // ---- Audio language --------------------------------------------------
 // Three questions, in the order someone actually asks them: how much of the
 // library has been checked, where the files and the audio DISAGREE, and what
-// nuarr refused to answer. The refusals are on the page on purpose - a
+// Nuarr refused to answer. The refusals are on the page on purpose - a
 // detector that only shows its successes is asking to be trusted blindly.
 let _al=null, _alTab='sum';
 
@@ -21432,7 +21432,7 @@ function renderAlang(){
     // they read as zeros with no explanation of why.
     if(canHear){
     h+=`<div class="lkind" style="padding:11px 12px;margin-bottom:10px">
-      <div><b style="color:#6fb0ff">What nuarr listened to</b></div>
+      <div><b style="color:#6fb0ff">What Nuarr listened to</b></div>
       <div class="dim" style="font-size:11px;margin-top:5px">
         <b style="color:#7fd4a3">${t.heard}</b> tracks answered confidently
         &nbsp;·&nbsp; <b style="color:#e2b341">${t.refused}</b> refused
@@ -21545,7 +21545,7 @@ function renderAlang(){
     const rows=_al.contradictions||[];
     h+=`<div class="dim" style="font-size:11px;margin-bottom:9px">
         The file states one language; the audio is demonstrably another.
-        <b>nuarr does not touch these automatically</b> &mdash; never
+        <b>Nuarr does not touch these automatically</b> &mdash; never
         overwriting a stated tag is the only thing keeping it from
         re-labelling every English dub in the library. Correcting one is a
         deliberate act, so it is a button, not a rule.</div>`;
@@ -21573,7 +21573,7 @@ function renderAlang(){
   if(_alTab==='open'){
     const rows=_al.open||[];
     h+=`<div class="dim" style="font-size:11px;margin-bottom:9px">
-        Still blank, and nuarr would not guess. Each one says why. These are
+        Still blank, and Nuarr would not guess. Each one says why. These are
         left alone on purpose: a wrong tag is worse than a missing one,
         because a missing one at least looks unfinished.
         <b>If you know what it is, set it</b> &mdash; a person who can listen
@@ -22135,7 +22135,7 @@ function paintCodecTab(){
     <b>Which encoder does the work</b>
     <p><b>auto</b> uses the best encoder this machine can actually run, in the
        order <span class="mono">NVENC → QuickSync → AMF → CPU</span>. That list
-       is not a guess: on startup nuarr encodes a couple of seconds with each
+       is not a guess: on startup Nuarr encodes a couple of seconds with each
        one and keeps only the ones that really produced a file — being listed
        by ffmpeg only means it was compiled in, not that the hardware is here.</p>
     <p>Pick a specific encoder to override that for this library — a bulk
@@ -22625,7 +22625,7 @@ async function loadJobsTab(){
 
 // ---- the connections themselves -----------------------------------------
 //
-// nuarr picked these up by reading Sonarr's and Radarr's own config.xml off
+// Nuarr picked these up by reading Sonarr's and Radarr's own config.xml off
 // C:\ProgramData at first run, which works on the one machine they share and
 // nowhere else - a remote arr, a container, a moved install or a rotated API
 // key all left the only fix as hand-editing config.yml. This is the same
@@ -22666,7 +22666,7 @@ async function loadArrConns(){
         <button onclick="arrTest('${a.kind}')">Test</button>
         <button onclick="arrSave('${a.kind}')">Save</button>
         ${a.has_key?`<button onclick="arrForget('${a.kind}')"
-          title="Remove this connection entirely - URL and API key are deleted from nuarr's config. The ${esc(a.kind)} server itself is untouched."
+          title="Remove this connection entirely - URL and API key are deleted from Nuarr's config. The ${esc(a.kind)} server itself is untouched."
           style="color:var(--warn)">Forget</button>`:''}
         <span class="arrmsg dim" style="font-size:11.5px"></span>
       </div>
@@ -22703,7 +22703,7 @@ async function arrSave(kind){
                            api_key:b.querySelector('.arrkey').value})});
     const r=await res.json();
     if(!res.ok) throw new Error(r.detail||'failed');
-    m.textContent='saved — nuarr is using this now';
+    m.textContent='saved — Nuarr is using this now';
     m.className='arrmsg ok';
     b.querySelector('.arrkey').value='';
     loadArrConns();                      // repaint the configured/not-set pill
@@ -22715,7 +22715,7 @@ async function arrForget(kind){
   // A held credential the holder cannot release is the worst kind. Confirm,
   // because unlike Save this is not re-typeable from memory - the key field
   // has to be fetched from the arr again.
-  if(!confirm(`Forget the ${kind} connection?\n\nThe URL and API key are removed from nuarr's config. `
+  if(!confirm(`Forget the ${kind} connection?\n\nThe URL and API key are removed from Nuarr's config. `
       +`The ${kind} server itself is untouched. Reconnecting later means re-entering the key.`)) return;
   const b=_arrBox(kind), m=b.querySelector('.arrmsg');
   m.textContent='forgetting…'; m.className='arrmsg dim';
@@ -22730,7 +22730,7 @@ async function arrForget(kind){
   }catch(e){ m.textContent='✗ '+e.message; m.className='arrmsg err'; }
 }
 
-// ---- how nuarr's paths line up with the arrs' -------------------------
+// ---- how Nuarr's paths line up with the arrs' -------------------------
 // SHOWN BECAUSE IT IS A GUESS. The mapping is inferred from folder names, and
 // an inference that quietly sends files to the wrong series is worse than one
 // that admits it could not decide. This panel is where a wrong guess becomes
@@ -22744,16 +22744,16 @@ async function loadPathMap(){
   catch(e){ el.innerHTML='<div class="dim">could not load</div>'; return; }
   const pairs=d.pairs||[], bad=d.unmatched||[], xl=d.translating||[];
   const explain = `<div class="dim" style="font-size:11px;margin-top:5px">
-    nuarr and an arr can reach the same file by different roads. Sonarr might
+    Nuarr and an arr can reach the same file by different roads. Sonarr might
     know it as <span class="mono">P:\\TV Shows\\…</span> because that is how the
-    drive is mapped where Sonarr runs, while nuarr on another machine reaches
+    drive is mapped where Sonarr runs, while Nuarr on another machine reaches
     the same bytes at <span class="mono">\\\\server\\P\\TV Shows\\…</span>. Both
     are correct and they share no common prefix, so comparing them as text
     says "no arr manages this folder" about a folder an arr manages perfectly
     well — and that comparison decides whether a file can be adopted, renamed,
     matched to its record, or counted as an orphan.
     <div style="margin-top:4px">The pairing is worked out by matching trailing
-    folder names against the libraries nuarr scanned, and it is shown here
+    folder names against the libraries Nuarr scanned, and it is shown here
     because it is an inference: an ambiguous root is refused and reported
     rather than guessed at, since guessing wrong files something under the
     wrong series.</div></div>`;
@@ -22766,7 +22766,7 @@ async function loadPathMap(){
   }
   if(!xl.length && !bad.length){
     el.innerHTML=`<div style="font-size:11.5px;color:var(--ok)">
-      nuarr and the arrs use the same paths — nothing is being translated.
+      Nuarr and the arrs use the same paths — nothing is being translated.
       </div>${explain}
       <div class="dim" style="font-size:11px;margin-top:4px">
         ${pairs.length} librar${pairs.length===1?'y':'ies'} checked:
@@ -22784,13 +22784,13 @@ async function loadPathMap(){
   </tr>`;
   el.innerHTML=`
     <div class="dim" style="font-size:11px;margin-bottom:5px">
-      Worked out by matching folder names, because the arrs and nuarr can reach
+      Worked out by matching folder names, because the arrs and Nuarr can reach
       the same files by different roads. Anything listed as unmatched is not
       translated at all — files under it will look like they belong to no arr.
     </div>
     <table style="width:100%;border-collapse:collapse;font-size:11.5px">
       <thead><tr class="dim" style="font-size:10.5px">
-        <th style="text-align:left;padding:0 10px 3px 0">nuarr sees</th>
+        <th style="text-align:left;padding:0 10px 3px 0">Nuarr sees</th>
         <th></th>
         <th style="text-align:left;padding:0 10px 3px 0">the arr calls it</th>
         <th style="text-align:left;padding:0 0 3px 0">how it was decided</th>
@@ -22803,10 +22803,10 @@ async function loadPathMap(){
       mapping is set by hand.</div>`:''}`;
 }
 
-// ---- do nuarr and the arrs still agree? --------------------------------
+// ---- do Nuarr and the arrs still agree? --------------------------------
 // THE LANGUAGE DRIFT WAS FOUND BY ACCIDENT. A glance at a Sonarr import screen
 // showed one file tagged English beside siblings tagged Multi-Languages, and
-// that thread ended at 1,246 records describing audio tracks nuarr had removed
+// that thread ended at 1,246 records describing audio tracks Nuarr had removed
 // months before. Nothing was broken enough to complain, so nothing did.
 //
 // That is the shape of drift between two systems that each own a copy of the
@@ -22955,7 +22955,7 @@ function arrSyncPaint(){
         style="font-size:11px;padding:2px 9px">Check again</button>
       ${total?`<button onclick="arrSyncFix()" ${fixing?'disabled':''}
         style="font-size:11px;padding:2px 9px"
-        title="Sets the languages nuarr knows, and asks the arrs to re-read the files for the rest">${
+        title="Sets the languages Nuarr knows, and asks the arrs to re-read the files for the rest">${
           fixing?'Putting it right…':'Put right'+(auto?' now':'')}</button>`:''}
     </div>
     <table style="width:100%;border-collapse:collapse;font-size:11.5px">${rows}</table>
@@ -22966,7 +22966,7 @@ function arrSyncPaint(){
 
 // ---- which arr is which, at a glance -------------------------------------
 // COLOUR CARRIES THE IDENTITY, so two bars running at once can be told apart
-// without reading either label. These are nuarr's own marks rather than the
+// without reading either label. These are Nuarr's own marks rather than the
 // projects' logos - a rounded badge and a letter - so nothing is reproduced
 // that belongs to someone else, while the colours are the ones those projects
 // are recognised by and the association is immediate.
@@ -23115,11 +23115,13 @@ function atPaint(){
         </div>
         ${progressBar({done:fx.done, total:fx.total, now:fx.where}, 'files')}
         <div class="dim" style="font-size:10.5px;margin-top:4px">
-          ${fmt(fx.fixed||0)} corrected${fx.failed?` · <span
-            style="color:var(--warn)">${fmt(fx.failed)} refused</span>`:''} —
-          the count above falls as each one lands. The title is a string in the
-          container header, so each file is edited in place in a fraction of a
-          second and not one byte of audio or video is rewritten.</div>
+          <b>${fmt(fx.fixed||0)} titles</b> corrected in <b>${fmt(fx.done||0)}
+          files</b>${fx.failed?` · <span style="color:var(--warn)">${
+            fmt(fx.failed)} refused</span>`:''} — more titles than files
+          because a file can carry a wrong one on both tracks. The count above
+          falls as each lands. The title is a string in the container header,
+          so each file is edited in place in a fraction of a second and not one
+          byte of audio or video is rewritten.</div>
       </div>`;
     return;
   }
@@ -23131,9 +23133,9 @@ function atPaint(){
   }
   const n=d.total||0;
   const head = n
-    ? `<span style="color:var(--warn)"><b>${fmt(n)}</b> track title(s) name a
-       format the file does not have</span> <span class="dim">in ${
-       fmt(d.files||0)} files</span>`
+    ? `<span style="color:var(--warn)"><b>${fmt(n)}</b> title${n===1?'':'s'}
+       name a format the file does not have</span> <span class="dim">across ${
+       fmt(d.files||0)} file${(d.files||0)===1?'':'s'}</span>`
     : `<span style="color:var(--ok)">every audio title matches the stream it
        describes</span>`;
   const rows=(d.rows||[]);
@@ -23526,7 +23528,7 @@ async function loadArrsTab(){
       </div>
       ${editor(ed)}
     </div>`;
-  // WEBHOOKS FIRST, GUARDS LAST. Webhooks are how nuarr hears about the arrs
+  // WEBHOOKS FIRST, GUARDS LAST. Webhooks are how Nuarr hears about the arrs
   // at all - if they are broken nothing else on this page matters. The guards
   // are optional scripts that fix a specific annoyance, so they sit at the
   // bottom under their own heading rather than in front of the plumbing.
@@ -23538,7 +23540,7 @@ async function loadArrsTab(){
           <button style="margin-left:auto" onclick="registerHooks()">Re-register now</button>
         </div>
         <div class="dim" style="font-size:11px;margin:6px 0 4px">
-          How nuarr hears about imports, upgrades, renames and deletes the moment
+          How Nuarr hears about imports, upgrades, renames and deletes the moment
           they happen. Registration is automatic; this shows whether it is actually
           holding, because a stale hook produces silence, not an error.</div>
         <span id="hookmsg" class="dim" style="font-size:11px"></span>
@@ -23603,7 +23605,7 @@ async function arrsSaveNames(kind){
   setTimeout(loadArrsTab, 600);
 }
 async function arrsResetNames(kind){
-  if(!confirm('Put this job back to the names nuarr ships with?')) return;
+  if(!confirm('Put this job back to the names Nuarr ships with?')) return;
   let d;
   try{ d=await (await fetch('/api/arrguard')).json(); }catch(e){ return; }
   const def=(d.defaults||{})[kind==='profile_guard'?'split_profiles':'anime_formats']||{};
@@ -23699,7 +23701,7 @@ async function arrsAddNew(){
 // ---- MKVToolNix ----------------------------------------------------------
 // Mirrors the ffmpeg tab's shape: version up top, who-uses-it underneath.
 // The one honest difference: no Apply button, because MKVToolNix installs
-// via a system installer and nuarr will not pretend to drive one.
+// via a system installer and Nuarr will not pretend to drive one.
 async function loadMkv(check){
   const el=document.getElementById('mkvBody');
   if(!el) return;
@@ -23715,7 +23717,7 @@ async function loadMkv(check){
     : `<span class="pill p-bad">mkvmerge missing</span> <span class="err">${esc(m.error||'')}</span>`;
   if(d.latest){
     head += upd
-      ? ` <span class="pill p-warn" title="download and run the installer from mkvtoolnix.download — nuarr does not auto-install this one">v${esc(d.latest)} available</span>`
+      ? ` <span class="pill p-warn" title="download and run the installer from mkvtoolnix.download — Nuarr does not auto-install this one">v${esc(d.latest)} available</span>`
       : ` <span class="pill p-ok">up to date</span>`;
   }else if(d.check_error){
     head += ` <span class="dim" title="${esc(d.check_error)}">version check failed</span>`;
@@ -23836,12 +23838,12 @@ async function loadRules(){
 
   // HOW A TITLE IS CLASSIFIED, which is the first thing to understand and was
   // the thing this box got wrong: it described a folder-name test that stopped
-  // being the whole answer when nuarr started reading genres from the arrs.
+  // being the whole answer when Nuarr started reading genres from the arrs.
   const KCLS = {anime:'anime', animation:'animation', live:'live'};
   const kinds = d.kinds || {};
   const kindBox = `
     <div class="lkind" style="padding:10px 12px;margin-bottom:10px">
-      <b style="color:#6fb0ff">What nuarr decides a title is</b>
+      <b style="color:#6fb0ff">What Nuarr decides a title is</b>
       <div class="dim" style="font-size:11px;margin-top:3px">
         Read from Sonarr and Radarr — genres, original language, series type —
         and re-read every 12 hours. The folder name is a <b>floor</b>, not the
@@ -23867,12 +23869,12 @@ async function loadRules(){
   const ck2 = Object.keys(ch);
   const changedBox = !ck2.length
     ? `<div class="dim" style="font-size:11.5px;margin-bottom:10px">
-         Everything below is at nuarr's recommended defaults.</div>`
+         Everything below is at Nuarr's recommended defaults.</div>`
     : `<div class="lkind" style="padding:10px 12px;margin-bottom:10px">
          <b style="color:#e2b341">Changed from the recommended defaults</b>
          <div class="dim" style="font-size:11px;margin-top:3px">
            The rules below describe what is in force. These are the ones you
-           have moved, with the value nuarr recommends beside them.</div>
+           have moved, with the value Nuarr recommends beside them.</div>
          <table class="rtab" style="margin-top:6px">${
            ck2.map(k=>`<tr><td class="rk">${esc(ch[k].setting)}</td>
              <td class="rv"><b>${esc(String(ch[k].now))}</b>
@@ -23952,7 +23954,7 @@ async function loadBackup(showSkeleton){
       dest.parentNode.insertBefore(warn, dest);
     }
     warn.innerHTML = `<b>Restore staged from ${esc(pr.from||'')}</b> — the live `
-      +`database is unchanged until nuarr restarts. `
+      +`database is unchanged until Nuarr restarts. `
       +`<button onclick="bkCancelRestore()" style="margin-left:8px">Cancel it</button>`;
   } else if(warn){ warn.remove(); }
 
@@ -24056,7 +24058,7 @@ async function bkRestore(name){
   // Two-step on purpose. Nothing changes until the restart, but this is still
   // the button that decides which database you come back with.
   if(!confirm('Restore '+name+'?\n\nThe backup is staged now and swapped in the '
-              +'next time nuarr starts — the live database is not touched until '
+              +'next time Nuarr starts — the live database is not touched until '
               +'then, and you can cancel before restarting. A safety copy of the '
               +'current database is taken either way.')) return;
   const m=document.getElementById('bkMsg');
@@ -24163,7 +24165,7 @@ async function registerHooks(){
   loadHooks(); loadHookState();
 }
 
-// Registration health. nuarr re-checks on a timer and repairs drift itself, so
+// Registration health. Nuarr re-checks on a timer and repairs drift itself, so
 // this is a read-out, not something to act on - unless it stays red.
 async function loadHookState(){
   const el=document.getElementById('hookstate');
