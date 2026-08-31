@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import re
 import time
 from ctypes import wintypes
 
@@ -86,6 +87,14 @@ def init() -> None:
                 title       TEXT)""")
         cur.execute("CREATE INDEX IF NOT EXISTS ix_cw_at "
                     "ON console_windows(at DESC)")
+        # Added after the first version shipped rows that named the process
+        # but not what it was running. Migrated rather than rebuilt, so
+        # anything already caught is kept.
+        for col in ("cmdline", "root"):
+            try:
+                cur.execute(f"ALTER TABLE console_windows ADD COLUMN {col} TEXT")
+            except Exception:                                # noqa: BLE001
+                pass                                         # already there
 
 
 def _snapshot() -> dict:
@@ -127,6 +136,112 @@ def _image_path(pid: int) -> str:
     return ""
 
 
+class _UNICODE_STRING(ctypes.Structure):
+    _fields_ = [("Length", wintypes.USHORT),
+                ("MaximumLength", wintypes.USHORT),
+                ("Buffer", ctypes.c_void_p)]
+
+
+class _PROCESS_BASIC_INFORMATION(ctypes.Structure):
+    _fields_ = [("Reserved1", ctypes.c_void_p),
+                ("PebBaseAddress", ctypes.c_void_p),
+                ("Reserved2", ctypes.c_void_p * 2),
+                ("UniqueProcessId", ctypes.c_void_p),
+                ("Reserved3", ctypes.c_void_p)]
+
+
+def _command_line(pid: int) -> str:
+    r"""The arguments a process was started with, read from its own memory.
+
+    "python.exe" identifies nothing - it is the command line that says which
+    script, and that is the whole answer to "where did this come from". There
+    is no Win32 call for another process's command line, so it is read out of
+    the PEB: ProcessParameters -> CommandLine, two pointer hops and a string.
+
+    WMI would answer this in one query and is not used, because a query means
+    spawning a process, and a watcher that spawns processes creates exactly the
+    thing it is watching for. This runs only when a console has already been
+    detected, so it is rare and its cost does not matter.
+
+    Best effort throughout: a protected or already-dead process simply returns
+    nothing, and the row is still worth having without it.
+    """
+    if not _IS_WIN:
+        return ""
+    try:
+        k32, ntdll = ctypes.windll.kernel32, ctypes.windll.ntdll
+        # QUERY_INFORMATION | VM_READ - needed to walk the PEB.
+        h = k32.OpenProcess(0x0400 | 0x0010, False, pid)
+        if not h:
+            return ""
+        try:
+            pbi = _PROCESS_BASIC_INFORMATION()
+            if ntdll.NtQueryInformationProcess(
+                    h, 0, ctypes.byref(pbi), ctypes.sizeof(pbi), None) != 0:
+                return ""
+            if not pbi.PebBaseAddress:
+                return ""
+
+            def read(addr, size):
+                buf = ctypes.create_string_buffer(size)
+                got = ctypes.c_size_t(0)
+                if not k32.ReadProcessMemory(h, ctypes.c_void_p(addr), buf,
+                                             size, ctypes.byref(got)):
+                    return None
+                return buf.raw[:got.value]
+
+            ptr = ctypes.sizeof(ctypes.c_void_p)
+            # PEB->ProcessParameters sits at 0x20 on x64, 0x10 on x86.
+            off = 0x20 if ptr == 8 else 0x10
+            raw = read(pbi.PebBaseAddress + off, ptr)
+            if not raw:
+                return ""
+            params = int.from_bytes(raw, "little")
+            # RTL_USER_PROCESS_PARAMETERS->CommandLine: 0x70 on x64, 0x40 x86.
+            coff = 0x70 if ptr == 8 else 0x40
+            raw = read(params + coff, ctypes.sizeof(_UNICODE_STRING))
+            if not raw:
+                return ""
+            us = _UNICODE_STRING.from_buffer_copy(raw)
+            if not us.Length or not us.Buffer:
+                return ""
+            data = read(us.Buffer, min(us.Length, 4096))
+            if not data:
+                return ""
+            return data.decode("utf-16-le", "replace").strip()
+        finally:
+            k32.CloseHandle(h)
+    except Exception:                                        # noqa: BLE001
+        return ""
+
+
+def _tidy(cmd: str, exe: str = "") -> str:
+    r"""The part of a command line worth reading.
+
+    A full command line is mostly a path to an interpreter followed by the
+    thing that actually matters. "C:\...\Python313\python.exe C:\nuarr\app\
+    paddle_worker.py E:\cache\t0.en.sup --out ..." says paddle_worker, and
+    everything before it is noise repeated on every row.
+    """
+    if not cmd:
+        return ""
+    out = cmd.strip()
+    # Drop a leading quoted or bare executable path - it is already the name.
+    if out.startswith('"'):
+        end = out.find('"', 1)
+        if end > 0:
+            out = out[end + 1:].strip()
+    elif exe and out.lower().startswith(exe.lower()):
+        out = out[len(exe):].strip()
+    else:
+        first = out.split(" ", 1)
+        if "\\" in first[0] and first[0].lower().endswith(".exe"):
+            out = first[1].strip() if len(first) > 1 else ""
+    # Long absolute paths inside the arguments carry little here either.
+    out = re.sub(r"[A-Za-z]:\\[^\s\"]*\\([^\\\s\"]+)", r"\1", out)
+    return out[:150]
+
+
 def _visible_window(pid: int) -> tuple[bool, str]:
     r"""Does this pid own a window that is actually on screen?
 
@@ -160,8 +275,8 @@ def _visible_window(pid: int) -> tuple[bool, str]:
     return found["vis"], found["title"]
 
 
-def _ancestry(pid: int, procs: dict, depth: int = 6) -> list:
-    """Names up the parent chain, so 'where did it come from' has an answer."""
+def _ancestry(pid: int, procs: dict, depth: int = 8) -> list:
+    """Names up the parent chain, oldest last."""
     out, seen = [], set()
     cur_pid = pid
     while cur_pid and cur_pid not in seen and len(out) < depth:
@@ -169,9 +284,33 @@ def _ancestry(pid: int, procs: dict, depth: int = 6) -> list:
         ent = procs.get(cur_pid)
         if not ent:
             break
-        out.append(f"{ent[0]}({cur_pid})")
+        out.append(ent[0])
         cur_pid = ent[1]
     return out
+
+
+def _readable(chain: list) -> str:
+    r"""The chain as something a person can scan.
+
+    PIDs ARE NOISE HERE. They were in the first version and they are the least
+    useful thing on the row: by the time anybody reads it the process is gone,
+    so the number identifies nothing and cannot be looked up. What matters is
+    the shape - who owns the console and who is ultimately behind it.
+
+    Consecutive repeats collapse too. "python.exe <- python.exe <- python.exe"
+    is one fact, not three, and spelling it out three times pushed the part
+    that identifies the culprit off the end of the row.
+    """
+    if not chain:
+        return ""
+    parts, i = [], 0
+    while i < len(chain):
+        n = 1
+        while i + n < len(chain) and chain[i + n] == chain[i]:
+            n += 1
+        parts.append(chain[i] if n == 1 else f"{chain[i]} ×{n}")
+        i += n
+    return " ← ".join(parts)
 
 
 def _is_ours(chain: list) -> bool:
@@ -186,14 +325,22 @@ def _record(pid: int, owner_pid: int, procs: dict, title: str,
     ent = procs.get(owner_pid) or ("?", 0)
     chain = _ancestry(owner_pid, procs)
     ours = _is_ours(chain)
+    # WHAT it was running, not just what it was called. The command line is
+    # read while the process is still alive; a moment later it is unavailable
+    # at any price.
+    cmd = _tidy(_command_line(owner_pid), ent[0])
+    # The oldest ancestor still traceable - the application ultimately behind
+    # this, which is what a person actually wants to know first.
+    root = chain[-1] if len(chain) > 1 else ""
     row = (time.time(), pid, owner_pid, ent[0], _image_path(owner_pid),
-           " <- ".join(chain), int(ours), int(visible), title[:160])
+           _readable(chain), int(ours), int(visible), title[:160],
+           cmd, root)
     try:
         with cursor() as cur:
             cur.execute(
                 "INSERT INTO console_windows(at,pid,owner_pid,owner,"
-                "owner_path,ancestry,ours,visible,title) "
-                "VALUES(?,?,?,?,?,?,?,?,?)", row)
+                "owner_path,ancestry,ours,visible,title,cmdline,root) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)", row)
     except Exception:                                        # noqa: BLE001
         return
     STATE["visible"] += 1
@@ -279,8 +426,8 @@ def recent(limit: int = 200, ours_only: bool = False) -> dict:
     """What has been caught, newest first, with a summary by source."""
     try:
         with cursor() as cur:
-            q = ("SELECT at,pid,owner_pid,owner,owner_path,ancestry,ours,title "
-                 "FROM console_windows ")
+            q = ("SELECT at,pid,owner_pid,owner,owner_path,ancestry,ours,"
+                 "title,cmdline,root FROM console_windows ")
             if ours_only:
                 q += "WHERE ours=1 "
             q += "ORDER BY at DESC LIMIT ?"
@@ -288,9 +435,13 @@ def recent(limit: int = 200, ours_only: bool = False) -> dict:
             tot = cur.execute(
                 "SELECT COUNT(*) n, SUM(ours) ours FROM console_windows"
             ).fetchone()
+            # Grouped by WHO IS BEHIND IT, not by what got the console. Ten
+            # rows of "cmd.exe" says nothing; "cmd.exe, from windows-mcp" and
+            # "cmd.exe, from Plex" are two different problems.
             by = [dict(r) for r in cur.execute(
-                "SELECT owner, ours, COUNT(*) n, MAX(at) last_at "
-                "FROM console_windows GROUP BY owner, ours "
+                "SELECT owner, COALESCE(root,'') root, ours, COUNT(*) n, "
+                "       MAX(at) last_at "
+                "FROM console_windows GROUP BY owner, root, ours "
                 "ORDER BY n DESC LIMIT 30")]
     except Exception as e:                                   # noqa: BLE001
         return {"rows": [], "by_source": [], "total": 0, "ours": 0,

@@ -23176,21 +23176,38 @@ function cwPaint(){
              :`<span style="color:var(--ok)">· none from Nuarr</span>`}`
     : `<span style="color:var(--ok)">no console window has appeared since
        watching began</span>`;
+  // GROUPED BY WHO IS BEHIND IT. Ten rows of "cmd.exe" is not a summary;
+  // "cmd.exe, from windows-mcp" and "cmd.exe, from Plex" are two different
+  // problems and only one of them might be yours to fix.
   const by=(d.by_source||[]).slice(0,10).map(s=>`
     <tr><td style="padding:2px 10px 2px 0;white-space:nowrap;color:${
       s.ours?'var(--warn)':'inherit'}">${esc(s.owner||'?')}${
-      s.ours?' <span class="dim">(Nuarr)</span>':''}</td>
+      s.root?`<span class="dim"> from ${esc(s.root)}</span>`:''}${
+      s.ours?' <span style="color:var(--warn)">· Nuarr</span>':''}</td>
       <td style="padding:2px 10px 2px 0;text-align:right"><b>${fmt(s.n)}</b></td>
-      <td class="dim" style="padding:2px 0">${s.last_at?ago(s.last_at):''}</td>
+      <td class="dim" style="padding:2px 0;white-space:nowrap">${
+        s.last_at?ago(s.last_at):''}</td>
     </tr>`).join('');
+  // TWO LINES, BECAUSE THERE ARE TWO QUESTIONS. What got the console and what
+  // it was running answers "what is this"; the chain answers "who started
+  // it". Both on one line, with PIDs, was neither.
   const rows=(d.rows||[]).slice(0,120).map(r=>`
-    <tr><td class="dim" style="padding:2px 10px 2px 0;white-space:nowrap">${
-      ago(r.at)}</td>
-      <td style="padding:2px 10px 2px 0;white-space:nowrap;color:${
-        r.ours?'var(--warn)':'inherit'}">${esc(r.owner||'?')}</td>
-      <td class="dim" style="padding:2px 0;overflow:hidden;
-          text-overflow:ellipsis;white-space:nowrap"
-          title="${esc(r.owner_path||'')}">${esc(r.ancestry||'')}</td></tr>`).join('');
+    <div style="padding:4px 0;border-top:1px solid var(--line)">
+      <div style="display:flex;gap:8px;align-items:baseline;font-size:11.5px">
+        <span class="dim" style="white-space:nowrap;min-width:58px">${ago(r.at)}</span>
+        <b style="color:${r.ours?'var(--warn)':'inherit'};white-space:nowrap"
+           >${esc(r.owner||'?')}</b>
+        <span class="mono dim" style="flex:1;overflow:hidden;
+              text-overflow:ellipsis;white-space:nowrap"
+              title="${esc(r.owner_path||'')}">${esc(r.cmdline||'')}</span>
+        ${r.ours?'<span style="color:var(--warn);font-size:10.5px">Nuarr</span>':''}
+      </div>
+      <div class="dim" style="font-size:10.5px;margin-left:66px;overflow:hidden;
+           text-overflow:ellipsis;white-space:nowrap">
+        ${r.root?`started by <b>${esc(r.root)}</b>`:''}${
+          r.ancestry?` <span style="opacity:.65">· ${esc(r.ancestry)}</span>`:''}
+      </div>
+    </div>`).join('');
   el.innerHTML=`
     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;
                 font-size:11.5px;margin-bottom:6px">
@@ -23208,12 +23225,9 @@ function cwPaint(){
         <div class="dim" style="font-size:10.5px;margin-bottom:2px">by source</div>
         <table style="font-size:11.5px;border-collapse:collapse">${by}</table>
       </div>
-      <div style="flex:1;min-width:320px">
+      <div style="flex:1;min-width:340px">
         <div class="dim" style="font-size:10.5px;margin-bottom:2px">most recent</div>
-        <div style="max-height:190px;overflow:auto">
-          <table style="width:100%;font-size:11.5px;border-collapse:collapse;
-                        table-layout:fixed">${rows}</table>
-        </div>
+        <div style="max-height:220px;overflow:auto">${rows}</div>
       </div>
     </div>`:''}`;
 }
