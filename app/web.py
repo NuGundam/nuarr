@@ -19836,16 +19836,19 @@ async function shapeLoad(){
            <span class="dim" style="margin-left:auto;white-space:nowrap">
              ${live.frac?pct+'%':'opening the file…'}</span>
          </div>
-         <div style="height:5px;border-radius:3px;background:#1e242c;margin-top:5px;
-                     overflow:hidden">
-           <div id="shapeBar" style="height:100%;border-radius:3px;
-                       ${live.frac
-                         ? `width:${pct}%;background:#6fb0ff;
-                            transition:width 1.05s linear`
-                         : `width:100%;background:repeating-linear-gradient(90deg,
-                              #6fb0ff33 0 10px,#6fb0ff11 10px 20px);
-                            background-size:20px 100%;
-                            animation:shapeCrawl .9s linear infinite`}"></div>
+         <div style="height:6px;border-radius:3px;background:#1b212a;margin-top:5px;
+                     overflow:hidden;position:relative">
+           ${live.frac
+             ? `<div id="shapeBar" style="height:100%;border-radius:3px;
+                  width:${pct}%;background:#6fb0ff;transition:width 1.05s linear"
+                ></div>`
+             // Same bright sweep as every other check. The old style layered
+             // two near-transparent blues and read as a dashed border rather
+             // than a running process.
+             : `<div style="position:absolute;inset:0;background:linear-gradient(
+                  90deg,#1b212a 0%,#6fb0ff 45%,#9fd0ff 50%,#6fb0ff 55%,
+                  #1b212a 100%);background-size:220% 100%;
+                  animation:barSweep 1.15s linear infinite"></div>`}
          </div>
        </div>`
     : `<div class="dim" style="font-size:11.5px">not reading anything right now</div>`;
@@ -19874,10 +19877,38 @@ async function shapeLoad(){
       <span id="shapeHold" class="dim" style="font-size:11px;${held?'':'display:none'}">
         · paused while you read — scroll back to the top to resume</span>
     </div>
+    ${(() => {
+      // THE SWEEP'S OWN PROGRESS, as a bar rather than a percentage buried in
+      // a row of chips. "72 of 116 (62%)" is the number this panel exists to
+      // report, and it was the one thing here without a picture.
+      //
+      // Outstanding work is what is still moving: anything queued, running or
+      // waiting. When that is zero the bar is finished rather than stalled,
+      // and it says so instead of animating forever.
+      const left = (st.processing||0)+(st.queued||0)+(st.eligible||0);
+      if(!tot) return '';
+      const pc = Math.round(done/tot*100);
+      return `
+        <div style="height:6px;border-radius:3px;background:#1b212a;
+                    margin:2px 0 5px;overflow:hidden;position:relative">
+          <div style="height:100%;border-radius:3px;width:${pc}%;
+                      background:${left?'#6fb0ff':'var(--ok)'};
+                      transition:width 1.05s linear"></div>
+          ${left?`<div style="position:absolute;inset:0;
+             background:linear-gradient(90deg,transparent 0%,#ffffff22 50%,
+                                        transparent 100%);
+             background-size:220% 100%;
+             animation:barSweep 1.6s linear infinite"></div>`:''}
+        </div>`;
+    })()}
     <div class="dim" style="font-size:10.5px;margin:-1px 0 4px">
       ${s.last_at?`newest verdict ${ago(s.last_at)}`
                  :'nothing measured yet'}${
-        live.last?` · last read finished ${ago(live.last)}`:''}</div>`;
+        live.last?` · last read finished ${ago(live.last)}`:''}${
+        (st.processing||st.queued||st.eligible)
+          ? ` · <span style="color:var(--acc)">${fmt((st.processing||0)+
+              (st.queued||0)+(st.eligible||0))} still to do</span>`
+          : ' · <span style="color:var(--ok)">nothing left to measure</span>'}</div>`;
   // First build, or the row area is missing: lay the panel out. After that
   // only the head and counts are rewritten, so the table keeps its scroll.
   if(!document.getElementById('shapeTblWrap')){
@@ -19897,7 +19928,17 @@ async function shapeLoad(){
     if(!held) shapeRender();
   }
   if(_shapeTimer) clearTimeout(_shapeTimer);
-  _shapeTimer=setTimeout(shapeLoad, busy?900:15000);
+  // THREE SPEEDS, NOT TWO. 'busy' is true only while a file is actually open,
+  // so the moment one read finished the panel dropped to a 15-second poll -
+  // and the whole gap between two reads, which is most of a sweep, went by
+  // with the counts frozen. That is what made a working panel look dead.
+  //
+  // Outstanding work is the honest middle case: something is queued, running
+  // or eligible, so the numbers are going to move and it is worth looking.
+  // Idle stays slow, because nothing is going to change until the next sweep.
+  const _st = (s.status||{});
+  const _left = (_st.processing||0)+(_st.queued||0)+(_st.eligible||0);
+  _shapeTimer=setTimeout(shapeLoad, busy ? 900 : (_left ? 2500 : 15000));
 }
 
 // ---- what each engine can actually do, on THIS install ------------------
