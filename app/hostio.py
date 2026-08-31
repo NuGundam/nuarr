@@ -528,14 +528,37 @@ def infer_viewers(disks: dict) -> dict:
     a disk reading far LESS than the stream needs cannot be feeding it.
     """
     out = {}
+
+    def _rate(s: dict) -> float:
+        r"""A session's read rate in kbps, from the fields that carry it.
+
+        THIS IS WHERE THE FUNCTION WAS BROKEN, from the day it was written.
+        It filtered on s["kbps"], and no session has ever had a "kbps" key -
+        that name belongs to the AGGREGATED per-disk figure, not to a session.
+        Every session therefore failed the filter, the list was always empty,
+        and infer_viewers() returned {} on every machine, always. It looked
+        like a sandbox problem and was a typo with a plausible name.
+
+        The real fields are the ones _disk_rates() has always used: Plex's
+        reserved bandwidth, falling back to the file's own bitrate, which is
+        what a direct play actually reads off the disk.
+        """
+        try:
+            v = float(s.get("bandwidth") or 0)
+            if v > 0:
+                return v
+            return float((s.get("detail") or {}).get("src_bitrate") or 0)
+        except Exception:                                    # noqa: BLE001
+            return 0.0
+
     try:
         from . import gate
-        live = [s for s in (gate.plex_live() or [])
-                if float(s.get("kbps") or 0) > 0]
+        sessions = list(gate.plex_live() or [])
     except Exception:                                        # noqa: BLE001
         return out
-    if not live or not disks:
+    if not sessions or not disks:
         return out
+    live = [dict(s, kbps=_rate(s)) for s in sessions]
     cands = {k: float(v.get("read_bps") or 0) for k, v in disks.items()}
     taken = set()
 
@@ -581,7 +604,32 @@ def infer_viewers(disks: dict) -> dict:
             live.remove(s)
     # Biggest stream first: it has the strongest signal and the most to lose
     # from being assigned a disk that a smaller one explains better.
+    # ONE STREAM AND ONE BUSY DISK NEEDS NO ARITHMETIC. Measured on the
+    # sandbox: a single session playing, NU-DRIVE-0 reading 9.98 MB/s and the
+    # other eleven at zero. There is nothing to correlate - the only thing
+    # reading is feeding the only thing watching - yet the rate-matching below
+    # would refuse it outright if the session reported no bitrate, which is
+    # exactly the case that produced no viewers at all.
+    #
+    # Deliberately narrow: one session left to place, one disk above a floor
+    # that idle chatter cannot reach, and nothing else moving. Any ambiguity
+    # and it falls through to the matching below.
+    if len(live) == 1:
+        busy = [(k, v) for k, v in cands.items()
+                if k not in taken and v > 400_000]
+        if len(busy) == 1:
+            label, rd = busy[0]
+            s = live[0]
+            out[label] = {"kbps": float(s.get("kbps") or 0), "bps": rd,
+                          "user": str(s.get("user") or ""),
+                          "title": str(s.get("title") or ""),
+                          "inferred": True, "only": True,
+                          "why": "the only disk reading, and the only stream"}
+            return out
+
     for s in sorted(live, key=lambda x: -float(x.get("kbps") or 0)):
+        if float(s.get("kbps") or 0) <= 0:
+            continue                       # nothing to match a rate against
         want = float(s["kbps"]) * 1000.0 / 8.0          # kbps -> bytes/sec
         best, best_err = None, None
         for label, rd in cands.items():
