@@ -475,6 +475,47 @@ def infer_viewers(disks: dict) -> dict:
         return out
     cands = {k: float(v.get("read_bps") or 0) for k, v in disks.items()}
     taken = set()
+
+    # ASK BEFORE GUESSING. The docstring above explains why the disk cannot be
+    # read back through a share, and that is still true - but it is an argument
+    # about the FILESYSTEM, and the filesystem is not the only thing that knows.
+    # Where nuarr can resolve the session's own path to a device, that is the
+    # answer, and correlating bitrates to arrive at it anyway would be choosing
+    # a guess over a fact.
+    #
+    # This is the local case and it is the common one: a machine with the pool
+    # attached resolves every session exactly. The correlation below is for the
+    # case it was written for - a machine watching a pool it only reaches over
+    # the wire - and it now runs on what is left rather than on everything.
+    for s in list(live):
+        # THE GATE HAS ALREADY DONE THIS, and doing it again would be slower
+        # and no more correct: gate.plex_live() resolves each session's file to
+        # a device through the same storage layer and caches it per path, so
+        # the answer is sitting on the session already. Falling back to
+        # resolving it here covers a session the gate could not place.
+        label, how = (s.get("disk") or "").strip(), "member"
+        if not label:
+            f = (s.get("file") or "").strip()
+            if not f:
+                continue
+            try:
+                from . import storage
+                label, how = storage.device_of(f)
+            except Exception:                                # noqa: BLE001
+                label, how = None, ""
+        # KEYED BY DISK, like the inferred rows below it. The two halves feed
+        # one table and one gate decision, so a different shape here would mean
+        # every consumer had to know which half produced a row.
+        if label and label in disks and how in ("member", "volume"):
+            out[label] = {"kbps": float(s.get("kbps") or 0),
+                          "bps": float((disks.get(label) or {}).get(
+                              "read_bps") or 0),
+                          "user": str(s.get("user") or ""),
+                          "title": str(s.get("title") or ""),
+                          "inferred": False, "exact": True,
+                          "why": "the file's own location says so"}
+            taken.add(label)
+            live.remove(s)
     # Biggest stream first: it has the strongest signal and the most to lose
     # from being assigned a disk that a smaller one explains better.
     for s in sorted(live, key=lambda x: -float(x.get("kbps") or 0)):
