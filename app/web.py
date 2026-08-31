@@ -11348,7 +11348,8 @@ function runPanelPaint(){
     // fresh job looking stalled.
     const eta=w.eta_s?`${hms(w.eta_s)} left`:'estimating…';
     const sub=(w.sub_ocr_active||w.pool==='subocr')&&w.sub_ocr_stage
-      ? `<div class="dim" style="font-size:10.5px">${esc(w.sub_ocr_stage)}</div>`:'';
+      ? `<div class="dim" style="font-size:10.5px">${
+           stageMarkup(w.sub_ocr_stage)}</div>`:'';
     return `<div style="padding:8px 14px;border-bottom:1px solid var(--line)">
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
         <span class="pill" style="color:${c};border-color:${c};background:${c}14;
@@ -14667,7 +14668,7 @@ I/O priority and the viewer's reads overtake it">very low I/O · viewer on ${
     // processor is whatever the running engine actually uses.
     const dev = (w.ocr_device||'').toLowerCase();
     const on  = dev==='gpu' ? 'the GPU' : dev==='cpu' ? 'the CPU' : 'the processor';
-    bits.push(`<span class="dim" title="reading pictures into text moves no bytes on or off the pool - disk rates appear during extract, mux and commit">no disk I/O (OCR runs on ${on})</span>`);
+    bits.push(`<span class="dim" title="reading pictures into text moves no bytes on or off the pool - disk rates appear during extract, mux and commit">no disk I/O (OCR runs on ${devChip(dev)})</span>`);
   }
   // SIZE FOR AS LONG AS IT IS KNOWN, not only while encoding.
   //
@@ -14773,7 +14774,8 @@ function stageCell(w){
   }
   const lbl = STAGE_LABEL[w.stage] || w.stage || '';
   // once past the encode the elapsed time in THIS stage is the useful number
-  return `<span class="dim">${esc(lbl)}${w.stage_s?` ${hms(w.stage_s)}`:''}</span>`;
+  return `<span class="dim">${stageMarkup(lbl)}${
+    w.stage_s?` ${hms(w.stage_s)}`:''}</span>`;
 }
 
 // Whole-run progress bar + ETA.
@@ -23163,6 +23165,37 @@ function arrSyncPaint(){
     <div id="arrSyncList" style="margin-top:8px"></div>
     <div id="arrSyncMsg" class="dim" style="font-size:11.5px;margin-top:5px"></div>`;
   arrSyncListPaint();
+}
+
+// ---- which processor a job is on, at a glance ----------------------------
+// TWO JOBS RUNNING SIDE BY SIDE LOOK IDENTICAL until you read them, and the
+// difference that matters most is which piece of hardware each is holding.
+// One OCR on the GPU and one waiting for a lane are in completely different
+// states, and the words for that were plain grey text in the middle of a
+// sentence. Colour and weight carry it now, so the answer to "which worker is
+// actually running" is available without reading anything.
+//
+// Green for the GPU because that is where the OCR work happens, amber for the
+// CPU, and the waiting state is deliberately the WARNING colour - a job
+// holding a slot without holding the hardware is the one worth noticing.
+const DEV_LOOK = {gpu:{c:'#6fd08c', t:'GPU'}, cpu:{c:'#e2b341', t:'CPU'},
+                  wait:{c:'#e2b341', t:'waiting'}};
+function devChip(dev, label){
+  const k=(dev||'').toLowerCase();
+  const L=DEV_LOOK[k];
+  if(!L) return esc(label||dev||'the processor');
+  return `<b style="color:${L.c};letter-spacing:.02em">${esc(label||L.t)}</b>`;
+}
+// Marks up a stage line so the hardware words stand out inside it, without
+// rewriting the sentence the rest of the code composed.
+function stageMarkup(text){
+  let s = esc(text||'');
+  s = s.replace(/\bwaiting for the GPU\b/g,
+        `<b style="color:${DEV_LOOK.wait.c}">waiting for the GPU</b>`);
+  s = s.replace(/(?<!for the )\bGPU\b(?!<\/b>)/g,
+        `<b style="color:${DEV_LOOK.gpu.c}">GPU</b>`);
+  s = s.replace(/\bCPU\b/g, `<b style="color:${DEV_LOOK.cpu.c}">CPU</b>`);
+  return s;
 }
 
 // ---- which arr is which, at a glance -------------------------------------
