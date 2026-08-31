@@ -127,13 +127,28 @@ async def scan() -> dict:
     from .arr import shared_client
     from . import arrlang
 
+    import asyncio
+
     probe = _probe_rows()
     found = {k: [] for k in CHECKS}
-    checked = 0
+    counts = {"checked": 0}
 
-    for cfg in (SETTINGS.arrs or []):
-        if not getattr(cfg, "enabled", True):
-            continue
+    async def one_arr(cfg) -> None:
+        r"""One arr's whole pass, with its own progress.
+
+        RUN CONCURRENTLY, NOT ONE AFTER THE OTHER. This walk is almost entirely
+        waiting: a request goes to the arr, and nothing happens on this machine
+        until it answers. Doing Sonarr's 1,100 titles and then Radarr's 3,142 in
+        sequence spends the whole of each arr's latency twice over for no
+        reason - they are separate services on separate ports that know nothing
+        of each other.
+
+        Each keeps its OWN counters rather than sharing one pair. Two arrs
+        advancing a single total produced a number that could not be read: it
+        moved at the sum of two rates, past a total that grew whenever either
+        was still counting, and said nothing about which one was slow.
+        """
+        st = _CACHE["arrs"][cfg.name]
         client = shared_client(cfg)
         kind = "episodefile" if cfg.kind == "sonarr" else "moviefile"
         key = "seriesId" if cfg.kind == "sonarr" else "movieId"
@@ -142,15 +157,12 @@ async def scan() -> dict:
         except Exception as e:                               # noqa: BLE001
             joblog.log(f"arr sync check: cannot list {cfg.name}: "
                        f"{type(e).__name__}", "warn")
-            continue
-        # A WALK THIS LONG HAS TO SAY WHERE IT IS. Several minutes behind an
-        # unmoving spinner is indistinguishable from several minutes hung, and
-        # the honest signal - one arr, so many titles of so many - is already
-        # in hand here.
-        _CACHE["total"] = _CACHE.get("total", 0) + len(parents)
+            st.update(done=0, total=0, running=False, t1=time.time(),
+                      error=type(e).__name__)
+            return
+        st["total"] = len(parents)
         for pid in parents:
-            _CACHE["done"] = _CACHE.get("done", 0) + 1
-            _CACHE["where"] = cfg.name
+            st["done"] += 1
             try:
                 raw = await client._get(f"/{kind}", **{key: pid})
             except Exception:                                # noqa: BLE001
@@ -159,13 +171,13 @@ async def scan() -> dict:
                 mine = probe.get((cfg.name, rec.get("id")))
                 if not mine:
                     continue
-                checked += 1
+                counts["checked"] += 1
+                st["files"] += 1
                 # NAME WHAT IS UNDER THE NEEDLE. A bar that only moves is
                 # evidence of motion; a bar that also says which file it is on
                 # is evidence of PROGRESS, and it is the difference between
                 # watching a spinner and watching work.
-                _CACHE["now"] = os.path.basename(mine.get("path") or "")
-                _CACHE["files"] = checked
+                st["now"] = os.path.basename(mine.get("path") or "")
                 # 'arr' IS THE ARR'S NAME AND NOTHING ELSE. The size and video
                 # rows below used to add arr=<the value the arr believed>,
                 # which overwrote it - so a size row carried arr=1332586482
@@ -226,6 +238,30 @@ async def scan() -> dict:
                     found["video"].append(
                         dict(row, was=f"{a_h}p", actual=f"{m_h}p",
                              field="height"))
+        st["running"] = False
+        st["t1"] = time.time()
+
+    live = [c for c in (SETTINGS.arrs or []) if getattr(c, "enabled", True)]
+    now = time.time()
+    _CACHE["arrs"] = {
+        c.name: {"name": c.name, "kind": c.kind, "done": 0, "total": 0,
+                 "files": 0, "now": "", "running": True, "t0": now, "t1": 0.0,
+                 "error": ""}
+        for c in live}
+    # gather, not a loop of awaits. return_exceptions so one arr falling over
+    # cannot take the other's results down with it - a half answer from a
+    # reachable arr is worth more than no answer at all.
+    results = await asyncio.gather(*(one_arr(c) for c in live),
+                                   return_exceptions=True)
+    for c, r in zip(live, results):
+        if isinstance(r, Exception):
+            joblog.log(f"arr sync check: {c.name} failed: "
+                       f"{type(r).__name__}: {r}", "warn")
+            st = _CACHE["arrs"].get(c.name)
+            if st:
+                st.update(running=False, t1=time.time(),
+                          error=type(r).__name__)
+    checked = counts["checked"]
 
     # ONE FLAT LIST for the panel, so it can be sorted and scrolled like any
     # other table. Keeping them in per-check buckets meant the page could show
@@ -386,31 +422,25 @@ async def _fix(kinds: list | None = None) -> dict:
     return out
 
 
-def _rate() -> float:
-    r"""Files per second over the run. 0 when there is nothing to say.
+def _rate(arrs: list) -> float:
+    r"""Combined files per second, summed from the arrs actually running.
 
-    Against the END of the run once finished, not a clock that keeps going -
-    otherwise the reported rate decays second by second after the work stops,
-    which describes nothing and reads as the machine slowing down.
+    Built from the per-arr rows rather than a second set of counters. Two
+    concurrent walks with one shared pair of totals produced a headline that
+    could not be reconciled with the bars beneath it, and when two numbers on
+    one screen disagree the screen is what stops being trusted.
     """
-    t0 = _CACHE.get("t0") or 0.0
-    n = _CACHE.get("files", 0)
-    el = (_CACHE.get("t1") or time.time()) - t0
-    return round(n / el, 1) if (t0 and el > 1.0 and n) else 0.0
+    return round(sum(a["rate"] for a in arrs), 1)
 
 
-def _eta(done: int, total: int) -> float:
-    """Seconds left, from the rate of TITLES rather than files.
+def _eta(arrs: list) -> float:
+    r"""Seconds until the LAST arr finishes - they run at the same time.
 
-    Deliberately absent until the totals have settled: both arrs are counted
-    as they are reached, so an estimate made against a growing total would
-    shrink and grow for no reason a person could see.
+    The slowest one decides, not the sum: adding the two estimates together
+    would describe a sequence that is not happening.
     """
-    t0 = _CACHE.get("t0") or 0.0
-    el = time.time() - t0
-    if not (t0 and total and done > 20 and el > 3.0):
-        return 0.0
-    return round((total - done) * (el / done), 0)
+    live = [a["eta_s"] for a in arrs if a["running"] and a["eta_s"]]
+    return max(live) if live else 0.0
 
 
 def mode() -> str:
@@ -494,10 +524,43 @@ async def watch() -> None:
         await asyncio.sleep(every * 3600.0)
 
 
+def _arr_progress() -> list:
+    r"""One progress row per arr, because they now run at the same time.
+
+    A single pair of counters could not describe two concurrent walks: the
+    number moved at the sum of two rates, past a total that grew whenever
+    either arr was still counting its titles, and said nothing about which one
+    was holding things up. Each gets its own row, its own rate and its own
+    estimate.
+    """
+    out = []
+    for name, st in (_CACHE.get("arrs") or {}).items():
+        t0, t1 = st.get("t0") or 0.0, st.get("t1") or 0.0
+        el = (t1 or time.time()) - t0
+        done, total = st.get("done", 0), st.get("total", 0)
+        rate = round(st.get("files", 0) / el, 1) if (t0 and el > 1.0) else 0.0
+        eta = 0.0
+        if t0 and total and done > 10 and el > 3.0 and not t1:
+            eta = round((total - done) * (el / done), 0)
+        out.append({"name": name, "kind": st.get("kind", ""),
+                    "done": done, "total": total, "files": st.get("files", 0),
+                    "now": st.get("now", ""), "running": bool(st.get("running")),
+                    "error": st.get("error", ""),
+                    "rate": rate, "eta_s": eta,
+                    "frac": (done / total) if total else 0.0})
+    out.sort(key=lambda r: r["name"])
+    return out
+
+
 def cached() -> dict:
     """The last answer, for the card. Never blocks; never runs a scan."""
     d = _CACHE.get("data")
-    done, total = _CACHE.get("done", 0), _CACHE.get("total", 0)
+    arrs = _arr_progress()
+    # The aggregate is still reported, because it is what a single headline
+    # number should say, but it is now the SUM of the per-arr rows rather than
+    # its own set of counters that could drift from them.
+    done = sum(a["done"] for a in arrs) or _CACHE.get("done", 0)
+    total = sum(a["total"] for a in arrs) or _CACHE.get("total", 0)
     return {"have": bool(d), "running": bool(_CACHE.get("running")),
             "age_s": (round(time.time() - _CACHE["at"], 1)
                       if _CACHE.get("at") else None),
@@ -507,15 +570,16 @@ def cached() -> dict:
             "last_fix": _CACHE.get("last_fix"),
             "fixing": _CACHE.get("fixing"),
             "progress": {"done": done, "total": total,
+                         "arrs": arrs,
                          "where": _CACHE.get("where", ""),
                          "now": _CACHE.get("now", ""),
-                         "files": _CACHE.get("files", 0),
+                         "files": sum(a["files"] for a in arrs),
                          # A RATE ANSWERS THE QUESTION THE BAR RAISES. "How
                          # long is this going to take" is what a person wants
                          # from a progress bar, and a percentage alone cannot
                          # say - measured over the run rather than guessed.
-                         "rate": _rate(),
-                         "eta_s": _eta(done, total),
+                         "rate": _rate(arrs),
+                         "eta_s": _eta(arrs),
                          # Total grows as each arr is reached, so a fraction
                          # would jump backwards. Reported only once both arrs
                          # have been counted, and as a plain count until then.

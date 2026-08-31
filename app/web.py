@@ -19319,7 +19319,9 @@ async function loadArrHealth(force){
         log by <b>Arr health</b>.</span>
     </div>` + rows.map(a=>{
     const bad=(a.health||[]).filter(h=>String(h.type||'').toLowerCase()!=='ok');
-    const head=`<b>${esc(a.arr)}</b>`
+    // The badge before the name, so two cards are told apart by colour at a
+    // glance rather than by reading them.
+    const head=`${arrIcon(a.kind||a.arr, 15)} <b>${esc(a.arr)}</b>`
       + (a.ok?`<span class="pill p-ok">reachable</span>`
              :`<span class="pill p-bad">unreachable${a.error?' — '+esc(a.error):''}</span>`)
       + (a.version?`<span class="dim mono" style="font-size:10.5px">v${esc(a.version)}</span>`:'')
@@ -22639,7 +22641,7 @@ async function loadArrConns(){
   window._arrNames=(_arrCfg.arrs||[]).map(a=>a.name);
   el.innerHTML=(_arrCfg.arrs||[]).map(a=>`
     <div class="arrconn" data-kind="${a.kind}">
-      <div class="arrhead"><b>${esc(a.name)}</b>
+      <div class="arrhead">${arrIcon(a.kind, 15)} <b>${esc(a.name)}</b>
         <span class="pill ${a.has_key&&a.url?'p-ok':'p-dim'}">${
           a.has_key&&a.url?'configured':'not set up'}</span>
         <span class="dim" style="font-size:11px">${
@@ -22832,15 +22834,17 @@ function arrSyncPaint(){
   if(d.running){
     // SAY WHERE IT IS. Several minutes behind a spinner that never moves is
     // indistinguishable from several minutes hung.
-    const p=d.progress||{};
+    const p=d.progress||{}, per=p.arrs||[];
     el.innerHTML=`
       <div style="font-size:11.5px">
         <div style="display:flex;gap:8px;align-items:center">
           <span class="spin" style="width:11px;height:11px"></span>
           <span>comparing every arr record against the file on disk</span>
-          ${p.where?`<span class="dim">· ${esc(p.where)}</span>`:''}
+          <span class="dim">· ${per.length>1?'both arrs at once':'one arr'}</span>
+          ${p.eta_s?`<span class="dim" style="margin-left:auto">${
+            esc(etaText(p.eta_s))}</span>`:''}
         </div>
-        ${progressBar(p, 'titles')}
+        ${per.length ? arrBars(per, 'titles') : progressBar(p, 'titles')}
       </div>`;
     return;
   }
@@ -22960,6 +22964,31 @@ function arrSyncPaint(){
   arrSyncListPaint();
 }
 
+// ---- which arr is which, at a glance -------------------------------------
+// COLOUR CARRIES THE IDENTITY, so two bars running at once can be told apart
+// without reading either label. These are nuarr's own marks rather than the
+// projects' logos - a rounded badge and a letter - so nothing is reproduced
+// that belongs to someone else, while the colours are the ones those projects
+// are recognised by and the association is immediate.
+const ARR_LOOK = {
+  sonarr: {c:'#35c5f4', dim:'#35c5f433', ch:'S'},   // Sonarr blue
+  radarr: {c:'#ffc230', dim:'#ffc23033', ch:'R'},   // Radarr amber
+  lidarr: {c:'#00a65a', dim:'#00a65a33', ch:'L'},
+  readarr:{c:'#ff5f5f', dim:'#ff5f5f33', ch:'B'},
+};
+function arrLook(kind){
+  return ARR_LOOK[(kind||'').toLowerCase()]
+      || {c:'#8fb4d9', dim:'#8fb4d933', ch:(kind||'?').slice(0,1).toUpperCase()};
+}
+function arrIcon(kind, size){
+  const L=arrLook(kind), s=size||14;
+  return `<span title="${esc(kind||'')}" style="display:inline-flex;
+    align-items:center;justify-content:center;width:${s}px;height:${s}px;
+    border-radius:${Math.round(s*0.28)}px;background:${L.c};color:#0b0e13;
+    font-size:${Math.round(s*0.66)}px;font-weight:700;line-height:1;
+    flex:0 0 auto;vertical-align:-2px">${L.ch}</span>`;
+}
+
 // ---- one progress bar, used by every long check --------------------------
 // WRITTEN ONCE BECAUSE IT WAS WRONG ONCE. The indeterminate state was drawn
 // with #6fb0ff33 over #6fb0ff11 - twenty and seven per cent alpha - which on
@@ -22977,6 +23006,45 @@ function etaText(s){
   if(s < 90) return `about ${s}s left`;
   if(s < 5400) return `about ${Math.round(s/60)} min left`;
   return `about ${(s/3600).toFixed(1)} h left`;
+}
+// One bar per arr, in that arr's colour, because they now run at the same
+// time. A single bar advancing at the sum of two rates past a total that grows
+// whenever either is still counting is a number nobody can read.
+function arrBars(arrs, unit){
+  if(!arrs || !arrs.length) return '';
+  return arrs.map(a=>{
+    const L=arrLook(a.kind);
+    const pct = a.total ? Math.min(100, Math.round(a.done/a.total*100)) : 0;
+    const bits=[];
+    if(a.total) bits.push(`<b>${pct}%</b>`);
+    bits.push(`${fmt(a.done)}${a.total?` of ${fmt(a.total)}`:''} ${unit||''}`);
+    if(a.rate) bits.push(`${a.rate}/s`);
+    const eta=etaText(a.eta_s); if(eta) bits.push(eta);
+    return `
+      <div style="margin-top:6px">
+        <div style="display:flex;gap:6px;align-items:baseline;font-size:11px">
+          ${arrIcon(a.kind, 13)}
+          <span style="color:${L.c};font-weight:600">${esc(a.name)}</span>
+          <span class="dim" style="flex:1;overflow:hidden;
+            text-overflow:ellipsis;white-space:nowrap">${
+              a.error ? `<span style="color:var(--warn)">could not be reached — ${
+                esc(a.error)}</span>`
+                      : (a.running ? esc(a.now||'') : 'done')}</span>
+          <span class="dim" style="white-space:nowrap">${bits.join(' · ')}</span>
+        </div>
+        <div style="height:6px;border-radius:3px;background:${L.dim};
+                    margin-top:3px;overflow:hidden;position:relative">
+          ${a.total
+            ? `<div style="height:100%;border-radius:3px;background:${L.c};
+                 width:${pct}%;transition:width 1s linear;opacity:${
+                 a.running?1:0.55}"></div>`
+            : `<div style="position:absolute;inset:0;background:linear-gradient(
+                 90deg,transparent 0%,${L.c} 45%,#fff 50%,${L.c} 55%,
+                 transparent 100%);background-size:220% 100%;
+                 animation:barSweep 1.15s linear infinite"></div>`}
+        </div>
+      </div>`;
+  }).join('');
 }
 function progressBar(p, unit){
   p = p || {};
@@ -23322,7 +23390,7 @@ function arrSyncListPaint(force){
               :'var(--acc)'}">${esc((C[r.check]||{}).label||r.check)}</td>
             <td style="padding:2px 10px 2px 0;overflow:hidden;
                        text-overflow:ellipsis;white-space:nowrap"
-                title="${esc(r.path||'')}">${
+                title="${esc(r.path||'')}">${arrIcon(r.kind, 11)} ${
               esc((r.path||'').split('\\').pop())}</td>
             <td style="padding:2px 0">${changed(r)}</td></tr>`).join('')}</tbody>
         </table>
