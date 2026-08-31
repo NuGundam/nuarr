@@ -543,6 +543,9 @@ async def _startup() -> None:
     # do, for a problem whose whole nature is that it is silent.
     from . import arrsync as _arrsync
     asyncio.create_task(_arrsync.watch())
+    # Once a day: does every audio title still describe the stream under it?
+    from . import audiotitle as _audiotitle
+    asyncio.create_task(_audiotitle.watch())
     asyncio.create_task(ffmpeg_update.watch())
     # Notices a GPU driver swap, re-measures NVENC, and hands in-flight encodes
     # back to the queue - see ffmpeg_update.watch_driver().
@@ -2582,6 +2585,16 @@ def _summary_impl():
             attention.append(_row)
     except Exception:                                    # noqa: BLE001
         pass
+    try:
+        # Titles that name a format the file does not have. Same rule as
+        # above: raised when a person has to act, silent when auto mode is
+        # already handling it - see audiotitle.attention().
+        from . import audiotitle as _at
+        _row = _at.attention()
+        if _row:
+            attention.append(_row)
+    except Exception:                                    # noqa: BLE001
+        pass
     return {"states": states, "disks": disks, "libraries": libs,
             "saved": saved, "attention": attention,
             "errors": errors, "error_kinds": err_kinds,
@@ -4260,6 +4273,33 @@ async def api_audiotitle_fix():
         return {"ok": False, "error": "already running"}
     asyncio.create_task(asyncio.to_thread(audiotitle.fix))
     return {"ok": True, "started": True}
+
+
+@app.post("/api/audiotitle/mode")
+async def api_audiotitle_mode(mode: str):
+    """manual waits for Put right; auto corrects on the daily check."""
+    import yaml
+    from .config import SETTINGS
+    from . import audiotitle
+    mode = (mode or "").strip().lower()
+    if mode not in ("auto", "manual"):
+        raise HTTPException(400, "mode must be auto or manual")
+    p = _config_path()
+    raw = {}
+    if p.exists():
+        try:
+            raw = yaml.safe_load(p.read_text(encoding="utf-8-sig")) or {}
+        except Exception:                                    # noqa: BLE001
+            raw = {}
+    raw["audiotitle_mode"] = mode
+    p.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True),
+                 encoding="utf-8")
+    SETTINGS.audiotitle_mode = mode
+    joblog.log(f"audio title mode set to {mode}"
+               + (" - wrong titles will be corrected as they are found"
+                  if mode == "auto" else
+                  " - wrong titles will be listed and wait for you"), "info")
+    return audiotitle.cached()
 
 
 @app.post("/api/arrsync/mode")
@@ -17625,7 +17665,7 @@ const PANE_OF = {ffmpeg:'ffPane', backup:'bkPane',  rules:'rulesPane',
 // and hid the pane it had just shown. Nothing threw and nothing logged - you
 // clicked Arrs and got an empty page. An alias names a pane plus an intent;
 // it never claims an element of its own.
-const ALIAS_OF = {arrsync:'arrs'};
+const ALIAS_OF = {arrsync:'arrs', audiotitle:'acodec'};
 
 // A BLANK PANE IS THE WORST FAILURE MODE THERE IS, because it looks like an
 // empty page rather than a broken one - there is nothing to read, nothing to
@@ -17820,6 +17860,24 @@ function wtab(which){
   if(which==='plex'){
     if(hint) hint.textContent='· plex';
     paneLoad('plex', loadPlexCfg);
+    return;
+  }
+  if(intent==='audiotitle'){
+    // Arrived from the Attention tile: same pane as the audio codec settings,
+    // but put the card it was counting in front of you with its list open.
+    if(hint) hint.textContent='· audio titles';
+    _atOpen=true;
+    paneLoad('acodec', loadCodecTab, 'audio');
+    loadAudioTitle();
+    setTimeout(()=>{
+      const c=document.getElementById('atBody');
+      if(!c) return;
+      c.scrollIntoView({behavior:'smooth', block:'center'});
+      const box=c.parentElement||c;
+      box.style.transition='box-shadow .4s';
+      box.style.boxShadow='0 0 0 2px var(--acc)';
+      setTimeout(()=>{ box.style.boxShadow=''; }, 1600);
+    }, 120);
     return;
   }
   if(which==='vcodec' || which==='acodec'){
@@ -22957,9 +23015,11 @@ function atPaint(){
                     overflow:hidden"><div style="height:100%;border-radius:3px;
           background:var(--acc);width:${pct}%;transition:width 1s linear"></div></div>
         <div class="dim" style="font-size:10.5px;margin-top:4px">
-          ${fmt(fx.fixed||0)} corrected — the title is a string in the container
-          header, so each file is edited in place in a fraction of a second and
-          not one byte of audio or video is rewritten.</div>
+          ${fmt(fx.fixed||0)} corrected${fx.failed?` · <span
+            style="color:var(--warn)">${fmt(fx.failed)} refused</span>`:''} —
+          the count above falls as each one lands. The title is a string in the
+          container header, so each file is edited in place in a fraction of a
+          second and not one byte of audio or video is rewritten.</div>
       </div>`;
     return;
   }
@@ -22977,21 +23037,75 @@ function atPaint(){
     : `<span style="color:var(--ok)">every audio title matches the stream it
        describes</span>`;
   const rows=(d.rows||[]);
+  const fails=d.failures||[];
+  const failBox = fails.length ? `
+    <div style="border:1px solid var(--warn);border-radius:5px;padding:6px 9px;
+                margin-bottom:7px;font-size:11.5px;background:#2a1d1233">
+      <b style="color:var(--warn)">${fmt(fails.length)} could not be
+        corrected</b>
+      <span class="dim"> — these will not clear on their own, in either
+        mode</span>
+      ${fails.slice(0,6).map(f=>`<div class="dim" style="font-size:11px;
+        margin-top:2px">${esc((f.path||'').split('\\').pop())} — ${
+        esc(f.why||'')}</div>`).join('')}
+    </div>` : '';
+  const mode=d.mode||'manual', auto=mode==='auto';
+  const modeBox=`
+    <div style="display:flex;gap:7px;align-items:center;font-size:11px;
+                margin-left:auto">
+      <span class="dim">when a wrong title is found</span>
+      <span style="display:inline-flex;border:1px solid var(--line);
+                   border-radius:5px;overflow:hidden">
+        ${['manual','auto'].map(m=>`<button onclick="atMode('${m}')"
+          title="${m==='auto'
+            ?'Titles are corrected on the daily check. The Attention tile stays quiet about them, because they are already being handled.'
+            :'Wrong titles are listed and wait for your click. The Attention tile carries the count.'}"
+          style="font-size:11px;padding:2px 10px;border:0;cursor:pointer;
+            background:${mode===m?'var(--acc)':'transparent'};
+            color:${mode===m?'#0b0e13':'var(--dim,#8a97a6)'};
+            font-weight:${mode===m?'600':'400'}">${m}</button>`).join('')}
+      </span>
+    </div>`;
   el.innerHTML=`
+    ${failBox}
     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;
                 font-size:11.5px;margin-bottom:6px">
       ${head}
-      <span class="dim">of ${fmt(d.checked||0)} checked</span>
-      <span style="margin-left:auto;display:flex;gap:6px">
-        <button onclick="atRun()" style="font-size:11px;padding:2px 9px"
-          >Check again</button>
-        ${n?`<button onclick="atFix()" style="font-size:11px;padding:2px 9px"
-          title="Rewrites the title in the container header only - no re-encode">Put right</button>`:''}
-      </span>
+      <span class="dim">of ${fmt(d.checked||0)} files checked${
+        d.age_s!=null?` · ${ago(Date.now()/1000-d.age_s)}`:''}</span>
+      ${modeBox}
+    </div>
+    <div class="dim" style="font-size:11px;margin-bottom:6px">${auto
+      ? `Checked every ${d.every_h||24}h and corrected automatically — nothing
+         here is waiting on you, so the Attention tile stays quiet about it.
+         Anything mkvpropedit refuses still gets raised.`
+      : `Checked every ${d.every_h||24}h and left for you to apply. While
+         titles are wrong the Attention tile carries the count.`}</div>
+    ${d.last_fix ? `<div class="dim" style="font-size:11px;margin-bottom:6px">
+       Last correction: ${fmt(d.last_fix.fixed||0)} title(s) across ${
+       fmt(d.last_fix.files||0)} file(s)${d.last_fix.failed
+       ?` · <span style="color:var(--warn)">${fmt(d.last_fix.failed)} refused</span>`
+       :''}.</div>` : ''}
+    <div style="display:flex;gap:6px;margin-bottom:7px">
+      <button onclick="atRun()" style="font-size:11px;padding:2px 9px"
+        >Check again</button>
+      ${n?`<button onclick="atFix()" style="font-size:11px;padding:2px 9px"
+        title="Rewrites the title in the container header only - no re-encode, no rewrite">Put right${
+          auto?' now':''}</button>`:''}
     </div>
     ${n?`<div id="atList"></div>`:''}
     <div id="atMsg" class="dim" style="font-size:11.5px;margin-top:5px"></div>`;
   if(n) atList(rows);
+}
+
+async function atMode(m){
+  const el=document.getElementById('atMsg');
+  if(el) el.textContent='saving…';
+  try{
+    _at=await (await fetch('/api/audiotitle/mode?mode='+encodeURIComponent(m),
+                           {method:'POST'})).json();
+    atPaint();
+  }catch(e){ if(el) el.textContent='could not change the mode'; }
 }
 function atList(rows){
   const el=document.getElementById('atList');

@@ -286,6 +286,13 @@ class Settings:
     arrsync_mode: str = "manual"
     arrsync_every_h: int = 12            # hours between agreement checks
 
+    # DOES THE AUDIO PICKER TELL THE TRUTH - the same bargain as above, for the
+    # same reason. A title that names a codec the file does not have is drift
+    # like any other, it is found by a check nobody remembers to run, and the
+    # question of whether to fix it automatically is the user's, not nuarr's.
+    audiotitle_mode: str = "manual"
+    audiotitle_every_h: int = 24         # hours between title checks
+
     # SUBTITLE OCR - the switches behind Settings -> Subtitle OCR. Defaults
     # match the measured thresholds in subocr.py; the page can move them.
     subocr_auto: bool = True             # queue conversions on a schedule

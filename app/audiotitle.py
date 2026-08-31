@@ -36,7 +36,8 @@ from .rules import audio_title, _title_is_only_format
 
 _CACHE: dict = {"at": 0.0, "data": None, "running": False,
                 "done": 0, "total": 0,
-                "fixing": None, "failures": []}
+                "fixing": None, "failures": [], "last_fix": None}
+EVERY_S = 24 * 3600.0
 
 
 def _mkvpropedit() -> str:
@@ -168,6 +169,27 @@ def scan(limit: int = 0) -> dict:
             "total": len(rows), "files": files}
 
 
+def _retire(file_id: int, tracks: set) -> None:
+    r"""Drop rows that have just been corrected out of the live answer.
+
+    THE NUMBER HAS TO COME DOWN WHILE YOU WATCH, for the same reason it does on
+    the arr agreement check: a count frozen at 2,339 for the length of the run
+    cannot be told apart from a stall. Driven by confirmations, never by
+    attempts, so a file mkvpropedit refused stays on screen where it belongs.
+    """
+    d = _CACHE.get("data")
+    if not d or not tracks:
+        return
+    keep = [r for r in (d.get("rows") or [])
+            if not (r.get("file_id") == file_id and r.get("track") in tracks)]
+    gone = len(d.get("rows") or []) - len(keep)
+    if not gone:
+        return
+    d["rows"] = keep
+    d["total"] = max(0, int(d.get("total", 0)) - gone)
+    d["files"] = len({r["file_id"] for r in keep})
+
+
 def _fix_file(path: str, edits: list) -> tuple[bool, str]:
     """One mkvpropedit call per file, however many tracks it corrects."""
     cmd = [_mkvpropedit(), path]
@@ -214,6 +236,7 @@ def fix(rows: list | None = None) -> dict:
                 out["files"] += 1
                 prog["fixed"] += len(edits)
                 _restamp(fid, path, edits)
+                _retire(fid, {e["track"] for e in edits})
             else:
                 out["failed"] += len(edits)
                 prog["failed"] += len(edits)
@@ -221,7 +244,11 @@ def fix(rows: list | None = None) -> dict:
             prog["done"] += 1
     finally:
         prog["running"] = False
+        # THE FAILURES ARE THE POINT, not the successes. What was corrected is
+        # gone from the next scan and needs no memory; what refused is the only
+        # part a person has to act on.
         _CACHE["failures"] = failures[:200]
+        _CACHE["last_fix"] = dict(out)
     if out["fixed"]:
         joblog.log(f"audio titles: corrected {out['fixed']} track title(s) "
                    f"across {out['files']} file(s) - the picker now names the "
@@ -277,14 +304,85 @@ def _restamp(file_id: int, path: str, edits: list) -> None:
                    "warn")
 
 
+def mode() -> str:
+    """"manual" or "auto". Anything unrecognised is manual - never auto."""
+    m = str(getattr(SETTINGS, "audiotitle_mode", "manual") or "manual").lower()
+    return "auto" if m == "auto" else "manual"
+
+
+def attention() -> dict | None:
+    r"""What the Attention tile should say about this, or nothing at all.
+
+    THE SAME THREE-WAY SPLIT AS THE ARR AGREEMENT CHECK, and for the same
+    reason: the tile means "things that need you", so anything already being
+    handled must not appear on it.
+
+      - Titles nuarr TRIED to correct and could not need a person in either
+        mode, and are raised first.
+      - Wrong titles in MANUAL mode are work waiting on a click, so raised.
+      - Wrong titles in AUTO mode are not raised: the next sweep has them.
+    """
+    fails = _CACHE.get("failures") or []
+    if fails:
+        return {"what": "audio titles", "n": len(fails),
+                "note": "could not be corrected - needs a look",
+                "goto": "/settings#audiotitle"}
+    d = _CACHE.get("data") or {}
+    n = int(d.get("total") or 0)
+    if n and mode() == "manual":
+        return {"what": "audio titles", "n": n,
+                "note": "name a format the file does not have",
+                "goto": "/settings#audiotitle"}
+    return None
+
+
+async def watch() -> None:
+    r"""Re-ask on a schedule, and in auto mode act on the answer.
+
+    Cheap enough to run often - the check reads stored probes, so it costs a
+    query rather than an hour of disk - but the titles only go wrong when a
+    file is rewritten, so once a day is plenty.
+    """
+    import asyncio
+
+    from . import schedules
+    schedules.register(
+        "audiotitle", "Audio title check", "Audio", EVERY_S,
+        what="Compares every audio track's title against the stream it "
+             "describes, and lists the ones naming a codec or channel count "
+             "the file does not have. In auto mode it corrects them in place "
+             "with mkvpropedit; in manual mode it waits for Put right.")
+    await asyncio.sleep(900)          # let a start-up finish its own work first
+    while True:
+        every = 24.0
+        try:
+            every = max(1.0, float(getattr(SETTINGS, "audiotitle_every_h", 24)))
+            await asyncio.to_thread(refresh)
+            n = int((_CACHE.get("data") or {}).get("total") or 0)
+            schedules.beat("audiotitle",
+                           f"{n} title(s) wrong" if n else "all titles match")
+            if n and mode() == "auto":
+                joblog.log(f"audio titles: {n} title(s) name a format the file "
+                           f"does not have - correcting them (auto mode)",
+                           "info")
+                await asyncio.to_thread(fix)
+                await asyncio.to_thread(refresh)
+        except Exception as e:                               # noqa: BLE001
+            joblog.log(f"audio title check: {type(e).__name__}: {e}", "warn")
+        await asyncio.sleep(every * 3600.0)
+
+
 def cached() -> dict:
     d = _CACHE.get("data")
     return {"have": bool(d), "running": bool(_CACHE.get("running")),
             "age_s": (round(time.time() - _CACHE["at"], 1)
                       if _CACHE.get("at") else None),
+            "mode": mode(),
+            "every_h": int(getattr(SETTINGS, "audiotitle_every_h", 24) or 24),
             "progress": {"done": _CACHE.get("done", 0),
                          "total": _CACHE.get("total", 0)},
             "fixing": _CACHE.get("fixing"),
+            "last_fix": _CACHE.get("last_fix"),
             "failures": _CACHE.get("failures") or [],
             **(d or {"checked": 0, "rows": [], "total": 0, "files": 0})}
 
@@ -293,7 +391,13 @@ def refresh() -> dict:
     if _CACHE.get("running"):
         return cached()
     try:
-        _CACHE.update(data=scan(), at=time.time())
+        d = scan()
+        _CACHE.update(data=d, at=time.time())
+        # A CLEAN SCAN RETIRES THE FAILURES, so the tile cannot hold a number
+        # for work that has since resolved - by hand, or because the file was
+        # replaced. Same rule as the arr agreement check.
+        if not d.get("total"):
+            _CACHE["failures"] = []
     except Exception as e:                                   # noqa: BLE001
         joblog.log(f"audio title check: {type(e).__name__}: {e}", "warn")
     return cached()
