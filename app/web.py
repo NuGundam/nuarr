@@ -570,6 +570,11 @@ async def _startup() -> None:
     # gate consults it constantly.
     from . import storage as _storage
     asyncio.create_task(asyncio.to_thread(_storage.warm))
+    # On network storage, ask the arrs how big the library is - walking a share
+    # to count forty thousand files takes hours and they answer in seconds.
+    # Silent on a machine with the disks attached.
+    from . import arrtotals as _arrtotals
+    asyncio.create_task(_arrtotals.watch())
     # Silent and request-free until a repo is configured - see updates.watch.
     asyncio.create_task(updates.watch())
     # Stored network shares reconnect at boot: `net use` grants access per
@@ -2495,6 +2500,27 @@ def _summary_impl():
                  "WHERE state!='deleted' GROUP BY library ORDER BY n DESC")
     totals = _rows("SELECT COUNT(*) n, SUM(size) bytes FROM files "
                    "WHERE state!='deleted'")[0]
+    # THE HEADLINE HAS TO BE THE WHOLE LIBRARY, not the part walked so far.
+    # On a machine reaching the media over SMB the scan is slow enough that
+    # "251 files - 1.13 TB" sits in the header for hours against a library of
+    # forty thousand. It is an honest report of what has been scanned and a
+    # badly misleading total, and the arrs already hold the real answer.
+    #
+    # Only when the local count is clearly still filling in - a fifth of what
+    # the arrs report - and only on remote storage, where walking is the slow
+    # path. A settled library differs from the arrs by a rounding error and
+    # keeps its own number, which is the one that knows about unmanaged files.
+    try:
+        from . import arrtotals, hostio
+        at = arrtotals.cached()
+        if at.get("n") and hostio.servers():
+            mine = int(totals["n"] or 0)
+            if mine < at["n"] * 0.8:
+                totals = {"n": at["n"], "bytes": at["bytes"],
+                          "from_arrs": True, "scanned": mine,
+                          "age_s": at.get("age_s")}
+    except Exception:                                    # noqa: BLE001
+        pass
     # Split unmanaged files by size. Small ones are extras (OP/ED, AMVs,
     # specials, bonus features) and are normal; large ones usually mean a failed
     # or never-completed import, which is the thing worth acting on.
@@ -10411,8 +10437,18 @@ async function loadAll(){
       + `twice counts twice, and one deleted since still counts.">`
       + `${gb(net)} saved</b> <span class="dim">(${pct.toFixed(1)}%)</span>`;
   }
+  // SAY WHERE THE NUMBER CAME FROM when it is not nuarr's own count. On
+  // network storage the headline is the arrs' total, because walking the share
+  // to count would leave "251 files" in the header for hours - but a number
+  // quietly sourced from somewhere else is worse than a slow one, so it says
+  // so, and says how much has been walked locally.
+  const tf = s.totals.from_arrs
+    ? ` <span class="dim" title="Counted by Sonarr and Radarr, which already`
+      + ` have it indexed - walking the share would take hours. nuarr has`
+      + ` walked ${fmt(s.totals.scanned||0)} of them so far.">(from the arrs)</span>`
+    : '';
   setHTML(document.getElementById('sub'),
-    fmt(s.totals.n)+' files · '+gb(s.totals.bytes)+' · '
+    fmt(s.totals.n)+' files'+tf+' · '+gb(s.totals.bytes)+' · '
     + s.disks.length+' pool disks' + svTxt);
 
   const byState=Object.fromEntries(s.states.map(x=>[x.state,x]));
