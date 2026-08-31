@@ -2929,6 +2929,10 @@ def shape_rows(limit: int = 60) -> dict:
             # remaining count is the library-wide one, and without it the
             # panel invites exactly the question "why has this not finished".
             summary["backlog"] = _backlog()
+            summary["mode"] = mode()
+            summary["every_h"] = int(_s("subocr_every_h", 6) or 6)
+            summary["batch"] = int(_s("subocr_batch", 0) or 0)
+            summary["sweep"] = dict(SWEEP_STATE)
             # When the newest verdict was written - "measured 85 files" says
             # nothing about whether that was five minutes or five weeks ago.
             r = cur.execute("SELECT MAX(at) a FROM sub_shape").fetchone()
@@ -3027,6 +3031,97 @@ def screen_for_typeset(pick: dict) -> dict:
     return out
 
 
+def mode() -> str:
+    """"manual" or "auto". Anything unrecognised is manual - never auto."""
+    return "auto" if bool(_s("subocr_auto", True)) else "manual"
+
+
+# Live state for the panel, so a run that takes minutes is watchable rather
+# than a button that goes quiet.
+SWEEP_STATE: dict = {"running": False, "done": 0, "total": 0, "queued": 0,
+                     "signs": 0, "now": "", "at": 0.0, "source": ""}
+
+
+async def run_sweep(source: str = "manual", limit: int | None = None) -> dict:
+    r"""Hand every convertible file to the queue.
+
+    NO BATCH BY DEFAULT, WHICH IS A REVERSAL. This used to queue twenty per
+    pass and wait six hours, on the reasoning that "slow and continuous beats
+    all at once on a system whose whole point is not being noticed". The
+    caution was right and the place was wrong: the QUEUE is what paces this.
+    It runs a fixed number of workers, the gate stops it when someone is
+    watching, and disk_wait_pct holds it back from the spindles. None of that
+    cares whether the queue holds twenty items or two hundred and sixty-six.
+
+    So the batch limited nothing except how fast the backlog cleared - twenty
+    every six hours is eighty a day against a backlog that grows whenever new
+    files land. It could lose ground indefinitely while every throttle that
+    actually protects the machine sat idle.
+
+    sweep_pick() already excludes anything queued or running, so handing it
+    everything cannot double-queue. A limit is still honoured if one is asked
+    for; it is simply not imposed by default.
+    """
+    import asyncio
+
+    from . import joblog as _log, jobs, schedules
+
+    if SWEEP_STATE["running"]:
+        return {"ok": False, "error": "a sweep is already running"}
+    cap = int(limit if limit is not None else _s("subocr_batch", 0) or 0)
+    SWEEP_STATE.update(running=True, done=0, total=0, queued=0, signs=0,
+                       now="", at=time.time(), source=source)
+    n = signs = 0
+    try:
+        picked = await asyncio.to_thread(sweep_pick, cap if cap > 0 else 100000)
+        SWEEP_STATE["total"] = len(picked)
+        for p in picked:
+            SWEEP_STATE["done"] += 1
+            SWEEP_STATE["now"] = (p.get("title") or "")[:60]
+            try:
+                # MEASURE BEFORE QUEUEING, not inside the job. A typeset file
+                # that reaches the queue only gets there to find out it should
+                # have been burned.
+                p = await asyncio.to_thread(screen_for_typeset, p)
+                if p.get("typeset_only"):
+                    signs += 1
+                    SWEEP_STATE["signs"] = signs
+                    _log.log(f"not queueing OCR for {p['title']} - its picture "
+                             f"subtitles are typeset signs; the planner will "
+                             f"burn them in instead", "info")
+                    continue
+                # SAY WHO ASKED. enqueue() defaults source to "manual", so
+                # every file this sweep queued was labelled as though a person
+                # had clicked it - wrong in the queue's Source column, and
+                # wrong under "clear all queued", where clearing the automatic
+                # work would leave the sweep's own jobs behind as if they were
+                # hand-picked.
+                j = await jobs.enqueue(p["file_id"], p["path"], p["title"],
+                                       kind="sub_ocr", priority=90,
+                                       source=source)
+                if j:
+                    n += 1
+                    SWEEP_STATE["queued"] = n
+            except Exception:                            # noqa: BLE001
+                continue
+        _SWEEP["last"] = time.time()
+        _SWEEP["queued_total"] += n
+        _BACKLOG["n"] = None                 # it just changed; do not serve it
+        schedules.beat("subocr",
+                       (f"queued {n} file(s)"
+                        + (f", {signs} for burning" if signs else ""))
+                       if (n or signs) else "nothing to convert")
+        if n or signs:
+            _log.log(f"subtitle OCR sweep queued {n} file(s)"
+                     + (f" and set {signs} aside as typeset signs"
+                        if signs else ""), "info")
+    finally:
+        SWEEP_STATE["running"] = False
+        SWEEP_STATE["now"] = ""
+    return {"ok": True, "queued": n, "signs": signs,
+            "considered": SWEEP_STATE["total"]}
+
+
 async def watch() -> None:
     """Queue OCR work on a schedule, like every other recurring job.
 
@@ -3038,7 +3133,7 @@ async def watch() -> None:
     """
     import asyncio
 
-    from . import joblog as _log, jobs, schedules
+    from . import schedules
     schedules.register(
         "subocr", "Subtitle OCR", "Library",
         max(1, int(_s("subocr_every_h", 6))) * 3600,
@@ -3056,50 +3151,10 @@ async def watch() -> None:
     await asyncio.sleep(195)             # let the first scan settle
     while True:
         try:
-            if bool(_s("subocr_auto", True)):
+            if mode() == "auto":
                 every = max(1, int(_s("subocr_every_h", 6))) * 3600
                 if time.time() - _SWEEP["last"] >= every:
-                    picked = await asyncio.to_thread(
-                        sweep_pick, int(_s("subocr_batch", 20)))
-                    n, signs = 0, 0
-                    for p in picked:
-                        try:
-                            # MEASURE BEFORE QUEUEING, not inside the job. A
-                            # typeset file that reaches the queue only gets
-                            # there to find out it should have been burned.
-                            p = await asyncio.to_thread(screen_for_typeset, p)
-                            if p.get("typeset_only"):
-                                signs += 1
-                                _log.log(
-                                    f"not queueing OCR for {p['title']} - its "
-                                    f"picture subtitles are typeset signs; the "
-                                    f"planner will burn them in instead",
-                                    "info")
-                                continue
-                            # SAY WHO ASKED. enqueue() defaults source to
-                            # "manual", so every file this sweep queued was
-                            # labelled as though a person had clicked it -
-                            # wrong in the queue's Source column, and wrong
-                            # under "clear all queued", where clearing the
-                            # automatic work would leave the sweep's own jobs
-                            # behind as if they were hand-picked.
-                            j = await jobs.enqueue(p["file_id"], p["path"],
-                                                   p["title"], kind="sub_ocr",
-                                                   priority=90, source="auto")
-                            if j:
-                                n += 1
-                        except Exception:                # noqa: BLE001
-                            continue
-                    _SWEEP["last"] = time.time()
-                    _SWEEP["queued_total"] += n
-                    schedules.beat("subocr",
-                                   f"queued {n} file(s)"
-                                   + (f", {signs} for burning" if signs else "")
-                                   if (n or signs) else "nothing to convert")
-                    if n or signs:
-                        _log.log(f"subtitle OCR sweep queued {n} file(s)"
-                                 + (f" and set {signs} aside as typeset signs"
-                                    if signs else ""), "info")
+                    await run_sweep(source="auto")
         except Exception as e:                           # noqa: BLE001
             joblog_mod = None
             try:

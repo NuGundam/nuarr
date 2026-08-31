@@ -4551,7 +4551,7 @@ def api_pipeline_find(q: str = "", limit: int = 12):
 
 
 @app.get("/api/subocr/shapes")
-def api_subocr_shapes(limit: int = 60):
+def api_subocr_shapes(limit: int = 60, fresh: int = 0):
     """What the picture-subtitle measurement has found, and what it is doing.
 
     One call feeds the whole panel - the counts, the rows and the live line -
@@ -4559,7 +4559,50 @@ def api_subocr_shapes(limit: int = 60):
     disagree with each other at exactly the moment someone is watching.
     """
     from . import subocr
+    if fresh:
+        # Check now means COUNT AGAIN, not read the cached count - otherwise
+        # the button appears to do nothing for up to two minutes, which reads
+        # as broken rather than as cached.
+        subocr._BACKLOG["n"] = None
     return subocr.shape_rows(max(1, min(int(limit), 400)))
+
+
+@app.post("/api/subocr/sweep")
+async def api_subocr_sweep():
+    """Queue every convertible file now. Minutes, so the card polls."""
+    from . import subocr
+    import asyncio as _a
+    if subocr.SWEEP_STATE.get("running"):
+        return {"ok": False, "error": "already running"}
+    _a.create_task(subocr.run_sweep(source="manual"))
+    return {"ok": True, "started": True}
+
+
+@app.post("/api/subocr/mode")
+async def api_subocr_mode(mode: str):
+    """auto sweeps on its own schedule; manual waits for Convert now."""
+    import yaml
+    from .config import SETTINGS
+    from . import subocr
+    mode = (mode or "").strip().lower()
+    if mode not in ("auto", "manual"):
+        raise HTTPException(400, "mode must be auto or manual")
+    p = _config_path()
+    raw = {}
+    if p.exists():
+        try:
+            raw = yaml.safe_load(p.read_text(encoding="utf-8-sig")) or {}
+        except Exception:                                    # noqa: BLE001
+            raw = {}
+    raw["subocr_auto"] = (mode == "auto")
+    p.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True),
+                 encoding="utf-8")
+    SETTINGS.subocr_auto = (mode == "auto")
+    joblog.log(f"subtitle OCR mode set to {mode}"
+               + (" - the sweep queues what it finds"
+                  if mode == "auto" else
+                  " - the sweep will list work and wait for you"), "info")
+    return {"ok": True, "mode": subocr.mode()}
 
 
 @app.post("/api/subocr/config")
@@ -19828,6 +19871,31 @@ function shapeRender(){
   const sc=document.getElementById('shapeScroll');
   if(sc && top) sc.scrollTop=top;
 }
+async function shapeMode(m){
+  const el=document.getElementById('shapeMsg');
+  if(el) el.textContent=' saving…';
+  try{ await fetch('/api/subocr/mode?mode='+encodeURIComponent(m),{method:'POST'}); }
+  catch(e){ if(el) el.textContent=' could not change the mode'; return; }
+  shapeLoad();
+}
+async function shapeCheck(){
+  const el=document.getElementById('shapeMsg');
+  if(el) el.textContent=' counting…';
+  // Nothing is queued by this - it re-reads what is left, which is the
+  // question "Check now" actually asks.
+  try{ await fetch('/api/subocr/shapes?limit=1&fresh=1'); }catch(e){}
+  shapeLoad();
+  if(el) setTimeout(()=>{ el.textContent=''; }, 2500);
+}
+async function shapeRun(){
+  const el=document.getElementById('shapeMsg');
+  if(el) el.textContent='';
+  try{
+    const r=await (await fetch('/api/subocr/sweep',{method:'POST'})).json();
+    if(r && r.error){ if(el) el.textContent=' '+r.error; return; }
+  }catch(e){ if(el) el.textContent=' could not start'; return; }
+  shapeLoad();
+}
 async function shapeLoad(){
   const el=document.getElementById('shapeBody');
   if(!el){ if(_shapeTimer) clearTimeout(_shapeTimer); _shapeTimer=null; return; }
@@ -19884,7 +19952,51 @@ async function shapeLoad(){
   const stChip=(k,label,col)=>(st[k]
     ? `<span style="color:${col}"><b>${fmt(st[k])}</b>
          <span class="dim">${label}</span></span>` : '');
+  // MODE AND BUTTONS, the same shape as every other check on the settings
+  // pages. This one had neither: it swept on its own schedule with no way to
+  // say "not automatically" and no way to say "now".
+  const sw=s.sweep||{}, sweeping=!!sw.running;
+  const smode=s.mode||'auto', sauto=smode==='auto';
+  const ctl = `
+    <div style="display:flex;gap:7px;align-items:center;font-size:11px;
+                margin:6px 0 2px;flex-wrap:wrap">
+      <span class="dim">when files need converting</span>
+      <span style="display:inline-flex;border:1px solid var(--line);
+                   border-radius:5px;overflow:hidden">
+        ${['manual','auto'].map(m=>`<button onclick="shapeMode('${m}')"
+          title="${m==='auto'
+            ?'The sweep queues what it finds, every '+(s.every_h||6)+' hours.'
+            :'The sweep finds the work and leaves it for you to start.'}"
+          style="font-size:11px;padding:2px 10px;border:0;cursor:pointer;
+            background:${smode===m?'var(--acc)':'transparent'};
+            color:${smode===m?'#0b0e13':'var(--dim,#8a97a6)'};
+            font-weight:${smode===m?'600':'400'}">${m}</button>`).join('')}
+      </span>
+      <button onclick="shapeCheck()" ${sweeping?'disabled':''}
+        style="font-size:11px;padding:2px 9px"
+        title="Re-count what is left without queueing anything">Check now</button>
+      <button onclick="shapeRun()" ${sweeping?'disabled':''}
+        style="font-size:11px;padding:2px 9px"
+        title="Hand every convertible file to the queue - the queue paces itself">${
+        sweeping?'Queueing…':'Convert all now'}</button>
+      <span class="dim">${sauto
+        ? `checked every ${s.every_h||6}h`
+        : 'nothing is queued automatically'}${
+        s.batch ? ` · capped at ${fmt(s.batch)} per sweep` : ''}</span>
+      <span id="shapeMsg" class="dim"></span>
+    </div>
+    ${sweeping?`<div style="font-size:11px;margin-bottom:4px">
+       <div style="display:flex;gap:8px;align-items:center">
+         <span class="spin" style="width:10px;height:10px"></span>
+         <span class="dim" style="flex:1;overflow:hidden;text-overflow:ellipsis;
+           white-space:nowrap">measuring and queueing — ${esc(sw.now||'')}</span>
+         <span class="dim">${fmt(sw.queued||0)} queued${
+           sw.signs?` · ${fmt(sw.signs)} for burning`:''}</span>
+       </div>
+       ${progressBar({done:sw.done, total:sw.total, now:''}, 'files')}
+     </div>`:''}`;
   const counts = `
+    ${ctl}
     <div style="display:flex;gap:14px;flex-wrap:wrap;margin:7px 0 4px;font-size:11.5px;
                 align-items:center">
       <span style="color:var(--ok)"><b>${fmt(done)}</b>
@@ -19975,7 +20087,9 @@ async function shapeLoad(){
   // Idle stays slow, because nothing is going to change until the next sweep.
   const _st = (s.status||{});
   const _left = (_st.processing||0)+(_st.queued||0)+(_st.eligible||0);
-  _shapeTimer=setTimeout(shapeLoad, busy ? 900 : (_left ? 2500 : 15000));
+  const _sweeping = !!((s.sweep||{}).running);
+  _shapeTimer=setTimeout(shapeLoad,
+    (busy || _sweeping) ? 900 : (_left ? 2500 : 15000));
 }
 
 // ---- what each engine can actually do, on THIS install ------------------

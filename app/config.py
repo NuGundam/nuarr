@@ -327,7 +327,14 @@ class Settings:
     # match the measured thresholds in subocr.py; the page can move them.
     subocr_auto: bool = True             # queue conversions on a schedule
     subocr_every_h: int = 6              # hours between sweeps
-    subocr_batch: int = 20               # files queued per sweep
+    # 0 = HAND THE WHOLE BACKLOG TO THE QUEUE, which is the default now. The
+    # old 20-per-sweep throttled the wrong stage: the queue already paces this
+    # with its worker count, the gate stops it when someone is watching, and
+    # disk_wait_pct holds it off the spindles - none of which care how many
+    # items are waiting. Twenty every six hours is eighty a day against a
+    # backlog that grows whenever new files land, so it could lose ground while
+    # every real throttle sat idle. Set a number here to cap it anyway.
+    subocr_batch: int = 0                # 0 = every eligible file
     # Per-library overrides, keyed by library name; anything absent follows
     # the defaults above. See subocr._s().
     subocr_libs: dict = field(default_factory=dict)
