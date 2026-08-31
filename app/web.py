@@ -560,6 +560,11 @@ async def _startup() -> None:
     # Clear OCR readers stranded by an earlier run. Nothing else ever will -
     # they are in no job table and no code holds a handle to them.
     asyncio.create_task(asyncio.to_thread(_subocr.reap_orphans))
+    # Notices console windows that actually appear, and writes down what
+    # opened them - so the next flash has an answer waiting instead of needing
+    # somebody to sit and watch for it.
+    from . import consolewatch as _cw
+    asyncio.create_task(_cw.watch())
     # Silent and request-free until a repo is configured - see updates.watch.
     asyncio.create_task(updates.watch())
     # Stored network shares reconnect at boot: `net use` grants access per
@@ -4259,6 +4264,21 @@ async def api_arrsync_fix(kinds: str = ""):
     want = [k.strip() for k in kinds.split(",") if k.strip()] or None
     _a.create_task(arrsync.fix(want))
     return {"ok": True, "started": True}
+
+
+@app.get("/api/consolewindows")
+def api_console_windows(limit: int = 200, ours: int = 0):
+    """Console windows that appeared, and what opened them."""
+    from . import consolewatch
+    return consolewatch.recent(limit=max(1, min(int(limit), 2000)),
+                               ours_only=bool(ours))
+
+
+@app.post("/api/consolewindows/forget")
+def api_console_windows_forget():
+    """Clear the record - after a fix, so the next entry means something."""
+    from . import consolewatch
+    return {"ok": True, "cleared": consolewatch.forget()}
 
 
 @app.get("/api/audiotitle")
@@ -17786,6 +17806,7 @@ function wtab(which){
   if(which==='logs'){
     if(hint) hint.textContent='· logs';
     paneLoad('logs', async()=>{ await loadLogJobs(); await loadLogs(true); });
+    loadConsoleWin();
     return;
   }
   if(which==='jobs'){
@@ -23133,6 +23154,72 @@ function progressBar(p, unit){
              background-size:220% 100%;animation:barSweep 1.15s linear infinite"
            ></div>`}
     </div>`;
+}
+
+// ---- console windows that appeared ---------------------------------------
+let _cw=null;
+async function loadConsoleWin(){
+  const el=document.getElementById('cwBody');
+  if(!el) return;
+  try{ _cw=await (await fetch('/api/consolewindows?limit=200')).json(); }
+  catch(e){ el.innerHTML='<span class="dim">could not load</span>'; return; }
+  cwPaint();
+}
+function cwPaint(){
+  const el=document.getElementById('cwBody');
+  if(!el||!_cw) return;
+  const d=_cw, n=d.total||0, ours=d.ours||0;
+  const head = n
+    ? `<span style="color:${ours?'var(--warn)':'var(--dim)'}">
+         <b>${fmt(n)}</b> console window${n===1?'':'s'} seen</span>
+       ${ours?`<span style="color:var(--warn)">· <b>${fmt(ours)}</b> from Nuarr</span>`
+             :`<span style="color:var(--ok)">· none from Nuarr</span>`}`
+    : `<span style="color:var(--ok)">no console window has appeared since
+       watching began</span>`;
+  const by=(d.by_source||[]).slice(0,10).map(s=>`
+    <tr><td style="padding:2px 10px 2px 0;white-space:nowrap;color:${
+      s.ours?'var(--warn)':'inherit'}">${esc(s.owner||'?')}${
+      s.ours?' <span class="dim">(Nuarr)</span>':''}</td>
+      <td style="padding:2px 10px 2px 0;text-align:right"><b>${fmt(s.n)}</b></td>
+      <td class="dim" style="padding:2px 0">${s.last_at?ago(s.last_at):''}</td>
+    </tr>`).join('');
+  const rows=(d.rows||[]).slice(0,120).map(r=>`
+    <tr><td class="dim" style="padding:2px 10px 2px 0;white-space:nowrap">${
+      ago(r.at)}</td>
+      <td style="padding:2px 10px 2px 0;white-space:nowrap;color:${
+        r.ours?'var(--warn)':'inherit'}">${esc(r.owner||'?')}</td>
+      <td class="dim" style="padding:2px 0;overflow:hidden;
+          text-overflow:ellipsis;white-space:nowrap"
+          title="${esc(r.owner_path||'')}">${esc(r.ancestry||'')}</td></tr>`).join('');
+  el.innerHTML=`
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;
+                font-size:11.5px;margin-bottom:6px">
+      ${head}
+      <span class="dim">${d.watching
+        ? `· watching since ${ago(d.since)} · ${fmt(d.consoles_seen||0)} console(s)
+           created, most correctly hidden`
+        : '· not watching'}</span>
+      ${n?`<button onclick="cwForget()" style="font-size:11px;padding:2px 9px;
+        margin-left:auto" title="Clear the record - do this after a fix, so the next entry means something">Clear</button>`:''}
+    </div>
+    ${d.error?`<div class="err" style="font-size:11px">${esc(d.error)}</div>`:''}
+    ${n?`<div style="display:flex;gap:18px;flex-wrap:wrap">
+      <div style="min-width:240px">
+        <div class="dim" style="font-size:10.5px;margin-bottom:2px">by source</div>
+        <table style="font-size:11.5px;border-collapse:collapse">${by}</table>
+      </div>
+      <div style="flex:1;min-width:320px">
+        <div class="dim" style="font-size:10.5px;margin-bottom:2px">most recent</div>
+        <div style="max-height:190px;overflow:auto">
+          <table style="width:100%;font-size:11.5px;border-collapse:collapse;
+                        table-layout:fixed">${rows}</table>
+        </div>
+      </div>
+    </div>`:''}`;
+}
+async function cwForget(){
+  try{ await fetch('/api/consolewindows/forget',{method:'POST'}); }catch(e){}
+  loadConsoleWin();
 }
 
 // ---- audio titles that contradict the stream -----------------------------
