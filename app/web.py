@@ -19885,19 +19885,25 @@ async function shapeLoad(){
       // a row of chips. "72 of 116 (62%)" is the number this panel exists to
       // report, and it was the one thing here without a picture.
       //
-      // Outstanding work is what is still moving: anything queued, running or
-      // waiting. When that is zero the bar is finished rather than stalled,
-      // and it says so instead of animating forever.
-      const left = (st.processing||0)+(st.queued||0)+(st.eligible||0);
+      // COLOURED BY WHETHER IT IS MOVING, not by whether work remains. Those
+      // are different questions and the first was answering the second: with
+      // 24 files still to do and nothing being read, the bar was blue and
+      // sweeping while the line above it said "not reading anything right
+      // now". A bar that animates when nothing is happening is the same lie
+      // as a spinner that never stops - it teaches you to ignore it.
+      //
+      // So: blue and sweeping only while a file is actually being read, grey
+      // and still otherwise. The backlog is reported in words next to it,
+      // which is where a number that is not moving belongs.
       if(!tot) return '';
       const pc = Math.round(done/tot*100);
       return `
         <div style="height:6px;border-radius:3px;background:#1b212a;
                     margin:2px 0 5px;overflow:hidden;position:relative">
           <div style="height:100%;border-radius:3px;width:${pc}%;
-                      background:${left?'#6fb0ff':'var(--ok)'};
-                      transition:width 1.05s linear"></div>
-          ${left?`<div style="position:absolute;inset:0;
+                      background:${busy?'#6fb0ff':'#46505d'};
+                      transition:width 1.05s linear,background .4s"></div>
+          ${busy?`<div style="position:absolute;inset:0;
              background:linear-gradient(90deg,transparent 0%,#ffffff22 50%,
                                         transparent 100%);
              background-size:220% 100%;
