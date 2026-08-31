@@ -340,6 +340,85 @@ SIGNS_TITLE_RE = re.compile(
 # "(OCR by me) rev2" is somebody else's track and must not be swept up.
 OCR_MADE_RE = re.compile(r"\(OCR[^)]*\)\s*$", re.I)
 
+# Track titles are what Plex shows in its audio picker, and they describe the
+# SOURCE format because that is what the release group wrote. Once nuarr
+# re-encodes the stream the title outlives the thing it described: an Overlord
+# season 1 track still reads "TrueHD / 5.1 / 2076 kbps" while being E-AC3 at
+# 640k, and season 3 offers "English FLAC 5.1" for a stereo AAC track that has
+# no centre channel at all. The picker is then actively misleading about the
+# one thing it exists to tell you.
+_FORMAT_WORDS = {
+    # codecs and the many names for them
+    "flac", "aac", "ac3", "eac3", "e-ac3", "ac-3", "dd", "dd+", "ddp", "ddplus",
+    "truehd", "thd", "dts", "dtshd", "dts-hd", "hd", "ma", "es", "opus", "mp3",
+    "mp2", "pcm", "lpcm", "wav", "vorbis", "atmos", "dolby", "digital", "plus",
+    "master", "audio", "lossless", "core",
+    # layouts and the words for them
+    "mono", "stereo", "surround", "downmix", "2.0", "1.0", "5.1", "7.1", "6.1",
+    "5.0", "channel", "channels", "ch",
+    # rates and depths
+    "kbps", "kb/s", "kbit", "bit", "bits", "khz", "hz", "vbr", "cbr",
+    # languages, since titles routinely lead with one
+    "english", "japanese", "spanish", "french", "german", "italian",
+    "portuguese", "russian", "korean", "chinese", "mandarin", "cantonese",
+    "dutch", "polish", "arabic", "hindi", "swedish", "danish", "norwegian",
+    "finnish", "turkish", "czech", "hungarian", "thai", "vietnamese",
+    "original", "dual", "eng", "jpn", "jap",
+}
+_TOKENS = __import__("re").compile(r"[a-z0-9][a-z0-9.+/-]*")
+
+
+def _title_is_only_format(title: str) -> bool:
+    r"""Is this title purely a description of the format, and nothing else?
+
+    THE TEST IS CONSERVATIVE ON PURPOSE. A title carrying any word this does
+    not recognise - "Commentary", "Director", "Descriptive", a fansub group -
+    is information nuarr did not put there and cannot regenerate, so it is left
+    exactly as it is. Only titles that say nothing except what the stream
+    already reports are replaced, because those are the only ones where the
+    replacement loses nothing and fixes something.
+    """
+    t = (title or "").strip().lower()
+    if not t:
+        return False
+    words = _TOKENS.findall(t)
+    if not words:
+        return False
+    return all(w in _FORMAT_WORDS or w.replace(".", "").isdigit()
+               for w in words)
+
+
+_LANG_NAME = {
+    "eng": "English", "jpn": "Japanese", "spa": "Spanish", "fre": "French",
+    "fra": "French", "ger": "German", "deu": "German", "ita": "Italian",
+    "por": "Portuguese", "rus": "Russian", "kor": "Korean", "chi": "Chinese",
+    "zho": "Chinese", "dut": "Dutch", "nld": "Dutch", "pol": "Polish",
+    "ara": "Arabic", "hin": "Hindi", "swe": "Swedish", "dan": "Danish",
+    "nor": "Norwegian", "fin": "Finnish", "tur": "Turkish", "cze": "Czech",
+    "ces": "Czech", "hun": "Hungarian", "tha": "Thai", "vie": "Vietnamese",
+}
+_CODEC_NAME = {"eac3": "E-AC3", "aac": "AAC", "ac3": "AC3", "flac": "FLAC",
+               "truehd": "TrueHD", "dts": "DTS", "opus": "Opus", "mp3": "MP3"}
+
+
+def audio_title(lang: str, codec: str, ch: int) -> str:
+    r"""What the track will actually be, in the shape these titles already take.
+
+    The layout is written numerically - 2.0, not "stereo" - because that is the
+    form every release group already uses in these titles ("English FLAC 5.1"),
+    and a picker listing "English E-AC3 5.1" beside "Japanese AAC stereo" reads
+    like two different systems wrote it. _ch_name() stays prose because it is
+    used in sentences, where "down to stereo" is the natural phrasing.
+    """
+    n = int(ch or 2)
+    layout = {1: "1.0", 2: "2.0", 6: "5.1", 8: "7.1"}.get(n, f"{n}ch")
+    name = _LANG_NAME.get((lang or "").lower())
+    parts = [name] if name else []
+    parts.append(_CODEC_NAME.get((codec or "").lower(), (codec or "").upper()))
+    parts.append(layout)
+    return " ".join(p for p in parts if p)
+
+
 def _ch_name(n: int) -> str:
     """Speaker layouts by the name people use for them.
 
@@ -1851,6 +1930,31 @@ def decide(probe: dict, *, anime: bool = False, filename: str = "",
                       f"{surr_br} kbps")
         else:
             p.audio_ops.append({"idx": i, "to": "copy"})
+
+    # ---- retitle what we are about to change -----------------------------
+    # THE TITLE OUTLIVES THE FORMAT IT DESCRIBED. Every op above rewrites a
+    # stream while the container goes on advertising the source's codec, so
+    # Plex's audio picker offers "TrueHD / 5.1 / 2076 kbps" for a 640k E-AC3
+    # track, and "English FLAC 5.1" for a stereo AAC one with no centre channel
+    # at all. The picker's whole job is to tell you what you are choosing.
+    #
+    # Done in one pass rather than in each branch above so that any op added
+    # later is covered by construction, and skipped entirely for titles that
+    # say anything a stream cannot report - see _title_is_only_format().
+    for _op in p.audio_ops:
+        if _op.get("to") in (None, "copy"):
+            continue
+        _i = _op.get("idx")
+        if _i is None or _i >= len(audio):
+            continue
+        _a_st = audio[_i]
+        _old = ((_a_st.get("tags") or {}).get("title") or "").strip()
+        if _old and not _title_is_only_format(_old):
+            continue                      # carries meaning nuarr cannot rebuild
+        _new = audio_title(_lang_guess(_a_st) or "",
+                           _op["to"], _op.get("ch") or _a_st.get("channels") or 2)
+        if _new and _new != _old:
+            _op["title"] = _new
 
     if _a("dedupe_per_lang", CONFIG["dedupeAudioPerLang"]):
         p.keep_audio = sorted(i for i, _ in best_per_lang.values())

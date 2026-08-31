@@ -4596,6 +4596,13 @@ def build_ffmpeg(src: str, dst: str, plan, duration: float,
         else:
             a += [f"-c:a:{out_i}", "eac3" if op["to"] == "eac3" else "aac",
                   f"-b:a:{out_i}", f"{op.get('br', 640)}k"]
+            # SAY WHAT THE TRACK BECOMES, not what it was. The planner works
+            # out the wording and refuses to touch a title carrying anything
+            # it cannot regenerate - see rules.audio_title(). Container
+            # metadata, so it costs nothing on a job already rewriting this
+            # stream.
+            if op.get("title"):
+                a += [f"-metadata:s:a:{out_i}", f"title={op['title']}"]
             if op.get("ch"):
                 # -ac:a:N, NOT -ac:N. This one character destroyed surround
                 # audio, silently, on every re-encode that kept a 5.1 track.

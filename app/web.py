@@ -4238,6 +4238,30 @@ async def api_arrsync_fix(kinds: str = ""):
     return {"ok": True, "started": True}
 
 
+@app.get("/api/audiotitle")
+def api_audiotitle():
+    """Audio titles that contradict the stream they describe."""
+    from . import audiotitle
+    return audiotitle.cached()
+
+
+@app.post("/api/audiotitle/run")
+async def api_audiotitle_run():
+    """Re-check. Reads stored probes only, so it costs no disk."""
+    from . import audiotitle
+    return await asyncio.to_thread(audiotitle.refresh)
+
+
+@app.post("/api/audiotitle/fix")
+async def api_audiotitle_fix():
+    """Correct them in place with mkvpropedit - no re-encode, no rewrite."""
+    from . import audiotitle
+    if (audiotitle._CACHE.get("fixing") or {}).get("running"):
+        return {"ok": False, "error": "already running"}
+    asyncio.create_task(asyncio.to_thread(audiotitle.fix))
+    return {"ok": True, "started": True}
+
+
 @app.post("/api/arrsync/mode")
 async def api_arrsync_mode(mode: str):
     """manual waits for Put right; auto corrects on the twice-daily sweep."""
@@ -17802,6 +17826,10 @@ function wtab(which){
     const side = which==='vcodec' ? 'video' : 'audio';
     if(hint) hint.textContent = '· '+(side==='video'?'video':'audio')+' codec';
     paneLoad(which, loadCodecTab, side);
+    // The title check belongs beside the settings that caused the mismatch:
+    // this page decides what tracks are converted TO, and the title is what
+    // the picker will then claim they are.
+    if(side==='audio') loadAudioTitle();
     return;
   }
   if(which==='libs'){
@@ -22886,6 +22914,142 @@ function arrSyncPaint(){
     <div id="arrSyncList" style="margin-top:8px"></div>
     <div id="arrSyncMsg" class="dim" style="font-size:11.5px;margin-top:5px"></div>`;
   arrSyncListPaint();
+}
+
+// ---- audio titles that contradict the stream -----------------------------
+let _at=null, _atTimer=null, _atOpen=false;
+async function loadAudioTitle(){
+  const el=document.getElementById('atBody');
+  if(!el){ if(_atTimer) clearTimeout(_atTimer); return; }
+  try{ _at=await (await fetch('/api/audiotitle')).json(); }
+  catch(e){ el.innerHTML='<span class="dim">could not load</span>'; return; }
+  atPaint();
+  if(_atTimer) clearTimeout(_atTimer);
+  const busy=_at && (_at.running || (_at.fixing && _at.fixing.running));
+  if(busy) _atTimer=setTimeout(loadAudioTitle, 1000);
+}
+function atToggle(){ _atOpen=!_atOpen; atPaint(); }
+function atPaint(){
+  const el=document.getElementById('atBody');
+  if(!el||!_at) return;
+  const d=_at;
+  if(d.running){
+    const p=d.progress||{}, pct=p.total?Math.round(p.done/p.total*100):0;
+    el.innerHTML=`<div style="font-size:11.5px;display:flex;gap:8px;align-items:center">
+      <span class="spin" style="width:11px;height:11px"></span>
+      <span class="dim">reading what nuarr already knows about every file —
+        ${fmt(p.done||0)} of ${fmt(p.total||0)} (${pct}%)</span></div>`;
+    return;
+  }
+  const fx=d.fixing||{};
+  if(fx.running){
+    const pct=fx.total?Math.round(fx.done/fx.total*100):0;
+    el.innerHTML=`
+      <div style="font-size:11.5px">
+        <div style="display:flex;gap:8px;align-items:center">
+          <span class="spin" style="width:11px;height:11px"></span>
+          <b>Correcting titles</b>
+          <span class="dim">${esc(fx.where||'')}</span>
+          <span class="dim" style="margin-left:auto">${fmt(fx.done)} of ${
+            fmt(fx.total)} files · ${pct}%</span>
+        </div>
+        <div style="height:5px;border-radius:3px;background:#1e242c;margin-top:5px;
+                    overflow:hidden"><div style="height:100%;border-radius:3px;
+          background:var(--acc);width:${pct}%;transition:width 1s linear"></div></div>
+        <div class="dim" style="font-size:10.5px;margin-top:4px">
+          ${fmt(fx.fixed||0)} corrected — the title is a string in the container
+          header, so each file is edited in place in a fraction of a second and
+          not one byte of audio or video is rewritten.</div>
+      </div>`;
+    return;
+  }
+  if(!d.have){
+    el.innerHTML=`<div class="dim" style="font-size:11.5px">Not checked yet.
+      <button onclick="atRun()" style="font-size:11px;padding:2px 9px;
+        margin-left:6px">Check now</button></div>`;
+    return;
+  }
+  const n=d.total||0;
+  const head = n
+    ? `<span style="color:var(--warn)"><b>${fmt(n)}</b> track title(s) name a
+       format the file does not have</span> <span class="dim">in ${
+       fmt(d.files||0)} files</span>`
+    : `<span style="color:var(--ok)">every audio title matches the stream it
+       describes</span>`;
+  const rows=(d.rows||[]);
+  el.innerHTML=`
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;
+                font-size:11.5px;margin-bottom:6px">
+      ${head}
+      <span class="dim">of ${fmt(d.checked||0)} checked</span>
+      <span style="margin-left:auto;display:flex;gap:6px">
+        <button onclick="atRun()" style="font-size:11px;padding:2px 9px"
+          >Check again</button>
+        ${n?`<button onclick="atFix()" style="font-size:11px;padding:2px 9px"
+          title="Rewrites the title in the container header only - no re-encode">Put right</button>`:''}
+      </span>
+    </div>
+    ${n?`<div id="atList"></div>`:''}
+    <div id="atMsg" class="dim" style="font-size:11.5px;margin-top:5px"></div>`;
+  if(n) atList(rows);
+}
+function atList(rows){
+  const el=document.getElementById('atList');
+  if(!el) return;
+  const bar=`<div onclick="atToggle()" style="display:flex;gap:7px;
+      align-items:center;cursor:pointer;user-select:none;padding:4px 8px;
+      font-size:11.5px;background:#161b22;
+      border-bottom:${_atOpen?'1px solid var(--line)':'0'}">
+      <span class="dim" style="display:inline-block;width:9px;
+        transform:rotate(${_atOpen?90:0}deg);transition:transform .15s">▶</span>
+      <b>${_atOpen?'Hide':'Show'} the ${fmt(rows.length)} title${
+        rows.length===1?'':'s'}</b>
+      <span class="dim">${_atOpen?'':'— what each one claims, and what is really there'}</span>
+    </div>`;
+  if(!_atOpen){
+    el.innerHTML=`<div style="border:1px solid var(--line);border-radius:6px;
+      overflow:hidden">${bar}</div>`;
+    return;
+  }
+  el.innerHTML=`
+    <div style="border:1px solid var(--line);border-radius:6px;overflow:hidden">
+      ${bar}
+      <div style="max-height:260px;overflow:auto;padding:0 8px">
+        <table style="width:100%;font-size:11.5px;border-collapse:collapse;
+                      table-layout:fixed">
+          <colgroup><col style="width:34%"><col style="width:22%">
+            <col style="width:22%"><col style="width:22%"></colgroup>
+          <thead><tr>${['File','Title now','Should read','What is wrong']
+            .map(h=>`<th style="text-align:left;font-weight:600;padding:3px 8px 5px 0;
+              position:sticky;top:0;background:var(--bg2,#12161c)">${h}</th>`).join('')}
+          </tr></thead>
+          <tbody>${rows.slice(0,600).map(r=>`<tr>
+            <td style="padding:2px 8px 2px 0;overflow:hidden;text-overflow:ellipsis;
+                       white-space:nowrap" title="${esc(r.path||'')}">${
+              esc((r.path||'').split('\\').pop())}</td>
+            <td style="padding:2px 8px 2px 0;color:var(--warn)">${esc(r.old||'')}</td>
+            <td style="padding:2px 8px 2px 0;color:var(--ok)">${esc(r.new||'')}</td>
+            <td style="padding:2px 0" class="dim">${esc(r.why||'')}</td></tr>`).join('')}
+          </tbody>
+        </table>
+      </div>
+      <div class="dim" style="font-size:10.5px;padding:3px 8px 4px;
+        border-top:1px solid var(--line)">showing ${
+        fmt(Math.min(600, rows.length))} of ${fmt(rows.length)}</div>
+    </div>`;
+}
+async function atRun(){
+  const m=document.getElementById('atMsg'); if(m) m.textContent='checking…';
+  try{ _at=await (await fetch('/api/audiotitle/run',{method:'POST'})).json(); atPaint(); }
+  catch(e){ if(m) m.textContent='failed'; }
+}
+async function atFix(){
+  const m=document.getElementById('atMsg'); if(m) m.textContent='';
+  try{
+    const r=await (await fetch('/api/audiotitle/fix',{method:'POST'})).json();
+    if(r&&r.error){ if(m) m.textContent=r.error; return; }
+  }catch(e){ if(m) m.textContent='could not start'; return; }
+  loadAudioTitle();
 }
 
 async function arrSyncMode(m){
