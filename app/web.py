@@ -4654,7 +4654,10 @@ def api_health():
         with cursor() as cur:
             st = _so.status_counts(cur)
         n = st.get("eligible", 0)
-        add("shapes", "Signs or dialogue - picture subtitles", "lang", n,
+        # THE CARD'S OWN NAME, because a row that is a shortcut to a card
+        # should be findable by the name on the card - and the link lands ON
+        # it, not merely on the page it lives in.
+        add("shapes", "Signs or dialogue - what the check found", "shapes", n,
             (f"{n} waiting to be queued" if n else
              f"{st.get('queued', 0)} queued, {st.get('processing', 0)} running"
              if (st.get("queued") or st.get("processing")) else
@@ -4662,7 +4665,7 @@ def api_health():
             mode=_so.mode(),
             running=bool(_so.SWEEP_STATE.get("running")))
     except Exception as e:                                   # noqa: BLE001
-        add("shapes", "Signs or dialogue - picture subtitles", "lang", 0,
+        add("shapes", "Signs or dialogue - what the check found", "shapes", 0,
             f"check unavailable: {type(e).__name__}", warn=True)
 
     try:
@@ -18708,7 +18711,8 @@ const PANE_OF = {ffmpeg:'ffPane', backup:'bkPane',  rules:'rulesPane',
 // and hid the pane it had just shown. Nothing threw and nothing logged - you
 // clicked Arrs and got an empty page. An alias names a pane plus an intent;
 // it never claims an element of its own.
-const ALIAS_OF = {arrsync:'arrs', audiotitle:'acodec', arrgap:'libs'};
+const ALIAS_OF = {arrsync:'arrs', audiotitle:'acodec', arrgap:'libs',
+                  shapes:'ocr'};
 
 // A BLANK PANE IS THE WORST FAILURE MODE THERE IS, because it looks like an
 // empty page rather than a broken one - there is nothing to read, nothing to
@@ -18889,6 +18893,18 @@ function wtab(which){
   if(which==='ocr'){
     if(hint) hint.textContent='· ocr engines';
     paneLoad('ocr', loadOcr);
+    // Arrived from the health page: put the Signs-or-dialogue card in front
+    // of you rather than leaving it below the fold. The first version of this
+    // landing pointed at the SUBTITLES pane, which sounded right and was
+    // wrong - the card lives here, beside the OCR engines it feeds.
+    if(intent==='shapes') setTimeout(()=>{
+      const c=document.getElementById('shapeCard');
+      if(!c) return;
+      c.scrollIntoView({behavior:'smooth', block:'center'});
+      c.style.transition='box-shadow .4s';
+      c.style.boxShadow='0 0 0 2px var(--acc)';
+      setTimeout(()=>{ c.style.boxShadow=''; }, 1600);
+    }, 500);
     return;
   }
   if(which==='process'){
@@ -21324,7 +21340,7 @@ async function loadOcr(){
       </div>
     </div>
 
-    <div class="lkind" style="padding:11px 12px;margin-top:10px">
+    <div class="lkind" id="shapeCard" style="padding:11px 12px;margin-top:10px">
       <b style="color:#6fb0ff">Signs or dialogue — what the check found</b>
       <div class="dim" style="font-size:11px;margin-top:2px">
         Before a file is queued for OCR its picture subtitles are measured, so
@@ -26329,7 +26345,7 @@ _SETTINGS_SHIM = """
   // front of me". They are deliberately absent from the sidebar - there is no
   // menu entry for a card - so they have to be admitted here by name. wtab()
   // already knows what to do with each of them; it was simply never asked.
-  const DEEP = ['arrgap','arrsync','audiotitle'];
+  const DEEP = ['arrgap','arrsync','audiotitle','shapes'];
   const VALID = KEYS.concat(DEEP);
 
   document.title = 'nuarr settings';
@@ -26375,7 +26391,8 @@ _SETTINGS_SHIM = """
   // not one. Same mapping wtab() uses; repeated here because this shim runs in
   // its own closure and reaching into the page's ALIAS_OF would tie the two
   // together for one lookup.
-  const DEEP_PANE = {arrgap:'libs', arrsync:'arrs', audiotitle:'acodec'};
+  const DEEP_PANE = {arrgap:'libs', arrsync:'arrs', audiotitle:'acodec',
+                     shapes:'ocr'};
   function go(key, push){
     if(VALID.indexOf(key) < 0) key = KEYS[0];
     wtab(key);
