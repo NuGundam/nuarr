@@ -4580,6 +4580,218 @@ async def api_arrgap_mode(mode: str):
     return arrgap.cached()
 
 
+@app.get("/api/health")
+def api_health():
+    r"""Every self-check nuarr runs, on one page - what found what, and where.
+
+    WHY A HUB. The checks grew one at a time, each with its own card in
+    whichever settings pane it related to: the arr agreement check under Arrs,
+    the audio-title check under Audio codec, the not-walked check under
+    Libraries, the signs check under Subtitles, Still-not-landed on its own
+    page. Correct filing, terrible for the question a person actually asks -
+    "is everything all right?" - which required a tour of six pages to answer.
+    This asks each system for its one-line verdict and leaves the detail where
+    it lives, one click away.
+    """
+    checks = []
+
+    def add(key, label, goto, n, note, mode=None, running=False, warn=None):
+        checks.append({"key": key, "label": label, "goto": goto,
+                       "n": int(n or 0), "note": note, "mode": mode,
+                       "running": bool(running),
+                       "warn": bool(warn if warn is not None else n)})
+
+    try:
+        from . import arrsync as _as
+        d = _as.cached()
+        fails = len(d.get("failures") or [])
+        add("arrsync", "Do Nuarr and the arrs still agree?", "arrsync",
+            (d.get("total") or 0) + fails,
+            (f"{fails} could not be corrected" if fails else
+             f"{d.get('total') or 0} record(s) disagree" if d.get("total") else
+             "records and files agree" if d.get("have") else "not checked yet"),
+            mode=d.get("mode"), running=d.get("running"))
+    except Exception as e:                                   # noqa: BLE001
+        add("arrsync", "Do Nuarr and the arrs still agree?", "arrsync", 0,
+            f"check unavailable: {type(e).__name__}", warn=True)
+
+    try:
+        from . import audiotitle as _at
+        d = _at.cached()
+        fails = len(d.get("failures") or [])
+        add("audiotitle", "Does the audio picker tell the truth?", "audiotitle",
+            (d.get("total") or 0) + fails,
+            (f"{fails} refused correction" if fails else
+             f"{d.get('total') or 0} title(s) name a format the file does not have"
+             if d.get("total") else
+             "every title matches its stream" if d.get("have") else
+             "not checked yet"),
+            mode=d.get("mode"), running=d.get("running"))
+    except Exception as e:                                   # noqa: BLE001
+        add("audiotitle", "Does the audio picker tell the truth?", "audiotitle",
+            0, f"check unavailable: {type(e).__name__}", warn=True)
+
+    try:
+        from . import arrgap as _ag
+        d = _ag.cached()
+        errs = len(d.get("errors") or {})
+        add("arrgap", "Files the arrs manage that Nuarr has no entry for",
+            "arrgap", d.get("fixable") or 0,
+            ("an arr did not answer - counts are a floor" if errs else
+             f"{d.get('fixable') or 0} to put right, "
+             f"{(d.get('total') or 0) - (d.get('fixable') or 0)} accounted for"
+             if d.get("total") else
+             "every file the arrs manage is here" if d.get("have") else
+             "not checked yet"),
+            mode=d.get("mode"), running=d.get("running"),
+            warn=bool((d.get("fixable") or 0) or errs))
+    except Exception as e:                                   # noqa: BLE001
+        add("arrgap", "Files the arrs manage that Nuarr has no entry for",
+            "arrgap", 0, f"check unavailable: {type(e).__name__}", warn=True)
+
+    try:
+        from . import subocr as _so
+        with cursor() as cur:
+            st = _so.status_counts(cur)
+        n = st.get("eligible", 0)
+        add("shapes", "Signs or dialogue - picture subtitles", "lang", n,
+            (f"{n} waiting to be queued" if n else
+             f"{st.get('queued', 0)} queued, {st.get('processing', 0)} running"
+             if (st.get("queued") or st.get("processing")) else
+             "everything measured is handled"),
+            mode=_so.mode(),
+            running=bool(_so.SWEEP_STATE.get("running")))
+    except Exception as e:                                   # noqa: BLE001
+        add("shapes", "Signs or dialogue - picture subtitles", "lang", 0,
+            f"check unavailable: {type(e).__name__}", warn=True)
+
+    try:
+        nl = _rows("SELECT COUNT(*) n FROM files f WHERE f.state IN "
+                   "('error','blocked')")[0]["n"]
+        add("notland", "Still not landed", "notland", nl,
+            f"{nl} file(s) whose last attempt failed or was blocked"
+            if nl else "every attempted file has since landed")
+    except Exception as e:                                   # noqa: BLE001
+        add("notland", "Still not landed", "notland", 0,
+            f"check unavailable: {type(e).__name__}", warn=True)
+
+    try:
+        miss = _rows("SELECT COUNT(*) n FROM files WHERE state='missing'"
+                     )[0]["n"]
+        add("missing", "Missing from disk", "libs", miss,
+            f"{miss} file(s) the arrs track that nuarr cannot find"
+            if miss else "nothing is missing")
+        cut = SETTINGS.min_orphan_size_mb * 1024 * 1024
+        orph = _rows("SELECT COUNT(*) n FROM files WHERE arr_file_id IS NULL "
+                     "AND state NOT IN ('duplicate','deleted') "
+                     "AND COALESCE(size,0) >= ?", (cut,))[0]["n"]
+        add("unmanaged", "Unmanaged files over the size floor", "libs", orph,
+            f"{orph} large file(s) no arr tracks - usually failed imports"
+            if orph else "no stray large files")
+    except Exception as e:                                   # noqa: BLE001
+        add("missing", "Missing from disk", "libs", 0,
+            f"check unavailable: {type(e).__name__}", warn=True)
+
+    try:
+        from . import arrhealth
+        w = int((arrhealth.STATE or {}).get("warnings") or 0)
+        add("arrhealth", "Sonarr and Radarr's own health", "arrs", w,
+            f"{w} warning(s) the arrs report about themselves"
+            if w else "the arrs report no problems")
+    except Exception:                                        # noqa: BLE001
+        add("arrhealth", "Sonarr and Radarr's own health", "arrs", 0,
+            "check unavailable", warn=False)
+
+    try:
+        # recent() returns the whole report, not a list - rows carry each
+        # sighting and "ours" is already counted. The first version iterated
+        # the dict and fell into its own except branch, so the row said
+        # "watcher unavailable" about a watcher that was running fine.
+        from . import consolewatch
+        rep = consolewatch.recent() or {}
+        ours = int(rep.get("ours") or 0)
+        add("consoles", "Console windows nuarr let slip", "logs", ours,
+            f"{ours} visible console(s) traced back to nuarr"
+            if ours else "nothing nuarr spawned has shown a window")
+    except Exception:                                        # noqa: BLE001
+        add("consoles", "Console windows nuarr let slip", "logs", 0,
+            "watcher unavailable", warn=False)
+
+    try:
+        from . import observer as _ob
+        st = _ob.state()
+        add("observer", "Observer mode", "counts", 0,
+            st.get("why") or "", mode=st.get("mode"),
+            warn=bool(st.get("mode") == "full" and st.get("peer_nuarr")))
+    except Exception:                                        # noqa: BLE001
+        pass
+
+    warn = sum(1 for c in checks if c["warn"])
+    return {"checks": checks, "warnings": warn,
+            "all_clear": warn == 0}
+
+
+@app.post("/api/health/run")
+async def api_health_run():
+    r"""Ask every check to re-look, without waiting for any of them.
+
+    Fire-and-forget on purpose: the arr agreement pass alone is half a minute
+    of API calls, and holding this request open for the slowest check would
+    repeat the mistake the not-walked button made. The hub polls and each row
+    reports itself running.
+    """
+    from . import arrsync as _as, audiotitle as _at, arrgap as _ag
+    started = []
+    if not _as.cached().get("running"):
+        asyncio.create_task(_as.refresh())
+        started.append("arrsync")
+    if not _at.cached().get("running"):
+        asyncio.create_task(asyncio.to_thread(_at.refresh))
+        started.append("audiotitle")
+    if not _ag._CACHE.get("running"):
+        asyncio.create_task(_ag.scan())
+        started.append("arrgap")
+    return {"ok": True, "started": started}
+
+
+@app.post("/api/health/mode")
+async def api_health_mode(mode: str):
+    r"""One switch for every correction system - the combining Erik asked for.
+
+    arrsync, audiotitle, arrgap and the OCR sweep each grew their own
+    auto/manual toggle, which is four copies of the same decision: "when nuarr
+    finds something wrong that it can fix, may it?" Someone who answers yes
+    answers yes to all of them, and hunting down four switches on four pages to
+    say so is how one gets missed. The individual switches remain - a person
+    can still hold one system manual - but this sets the policy in one place.
+    """
+    import yaml
+    from .config import SETTINGS
+    mode = (mode or "").strip().lower()
+    if mode not in ("auto", "manual"):
+        raise HTTPException(400, "mode must be auto or manual")
+    p = _config_path()
+    raw = {}
+    if p.exists():
+        try:
+            raw = yaml.safe_load(p.read_text(encoding="utf-8-sig")) or {}
+        except Exception:                                    # noqa: BLE001
+            raw = {}
+    raw["arrsync_mode"] = mode
+    raw["audiotitle_mode"] = mode
+    raw["arrgap_mode"] = mode
+    raw["subocr_auto"] = (mode == "auto")
+    p.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True),
+                 encoding="utf-8")
+    SETTINGS.arrsync_mode = mode
+    SETTINGS.audiotitle_mode = mode
+    SETTINGS.arrgap_mode = mode
+    SETTINGS.subocr_auto = (mode == "auto")
+    joblog.log(f"all correction systems set to {mode} from the health page",
+               "info")
+    return api_health()
+
+
 @app.get("/api/observer")
 def api_observer():
     """Whether this machine changes files or only watches them, and why."""
@@ -18482,6 +18694,7 @@ function commitNum(key, el){
 const PANE_OF = {ffmpeg:'ffPane', backup:'bkPane',  rules:'rulesPane',
                  mkv:'mkvPane',   arrs:'arrsPane',  meta:'metaPane',
                  gate:'gatePane', logs:'logsPane', jobs:'jobsPane',
+                 health:'healthPane',
                  lang:'langPane', libs:'libPane',
                  vcodec:'vcodecPane', acodec:'acodecPane',
                  alang:'alangPane', cache:'cachePane',
@@ -18605,6 +18818,11 @@ function wtab(which){
   if(which==='jobs'){
     if(hint) hint.textContent='· jobs';
     paneLoad('jobs', loadJobsTab);
+    return;
+  }
+  if(which==='health'){
+    if(hint) hint.textContent='· health';
+    paneLoad('health', loadHealth);
     return;
   }
   if(which==='lang'){
@@ -19752,6 +19970,95 @@ function kdRows(){
     </div>`).join('')
     + (rows.length>800?`<div class="dim" style="padding:4px 10px;font-size:10.5px"
        >showing 800 of ${fmt(rows.length)} — narrow it with the search box</div>`:'');
+}
+
+// ---- health: every self-check on one page --------------------------------
+let _hl=null, _hlTimer=null;
+async function loadHealth(){
+  const el=document.getElementById('healthBody');
+  if(!el){ if(_hlTimer) clearTimeout(_hlTimer); _hlTimer=null; return; }
+  try{ _hl=await (await fetch('/api/health')).json(); }
+  catch(e){ el.innerHTML='<span class="dim">could not load</span>'; return; }
+  hlPaint();
+  if(_hlTimer) clearTimeout(_hlTimer);
+  // Faster while anything is re-checking, so the running rows move.
+  const busy=(_hl.checks||[]).some(c=>c.running);
+  _hlTimer=setTimeout(loadHealth, busy?2000:10000);
+}
+function hlPaint(){
+  const el=document.getElementById('healthBody');
+  if(!el||!_hl) return;
+  const cs=_hl.checks||[];
+  const modes=cs.filter(c=>c.mode==='auto'||c.mode==='manual').map(c=>c.mode);
+  const allAuto=modes.length&&modes.every(m=>m==='auto');
+  const allMan=modes.length&&modes.every(m=>m==='manual');
+  const head=`
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;
+                font-size:12px;margin-bottom:8px">
+      <b style="color:${_hl.all_clear?'var(--ok)':'var(--warn)'}">
+        ${_hl.all_clear?'everything checks out'
+          :fmt(_hl.warnings)+' check'+(_hl.warnings===1?'':'s')+' found something'}</b>
+      <button onclick="hlRun()" style="font-size:11px;padding:2px 9px"
+        title="Ask every check to look again. They run in the background and each row reports itself.">Check everything now</button>
+      <span style="display:inline-flex;border:1px solid var(--line);
+                   border-radius:5px;overflow:hidden;margin-left:auto">
+        ${['manual','auto'].map(m=>`<button onclick="hlMode('${m}')"
+          title="${m==='auto'
+            ?'Every correction system fixes what it finds on its own schedule. One answer to one question: when nuarr can fix something, may it?'
+            :'Every correction system lists what it finds and waits for your click.'}"
+          style="font-size:11px;padding:2px 10px;border:0;cursor:pointer;
+            background:${(m==='auto'?allAuto:allMan)?'var(--acc)':'transparent'};
+            color:${(m==='auto'?allAuto:allMan)?'#0b0e13':'var(--dim,#8a97a6)'};
+            font-weight:${(m==='auto'?allAuto:allMan)?'600':'400'}">all ${m}</button>`).join('')}
+      </span>
+      <span id="hlMsg" class="dim" style="font-size:11px"></span>
+    </div>
+    ${(!allAuto&&!allMan&&modes.length)?`<div class="dim"
+       style="font-size:11px;margin-bottom:7px">correction systems are split
+       between auto and manual — each row says which; the buttons above set
+       them all at once</div>`:''}`;
+  const row=c=>`
+    <div style="display:flex;gap:10px;align-items:center;padding:7px 10px;
+                border:1px solid var(--line);border-radius:6px;margin-bottom:5px;
+                font-size:11.5px;cursor:pointer"
+         onclick="location.hash='${esc(c.goto)}'"
+         title="open the full card">
+      <span style="width:9px;height:9px;border-radius:50%;flex:none;
+        background:${c.running?'var(--acc)':(c.warn?'var(--warn)':'var(--ok)')}"></span>
+      <b style="flex:none;min-width:290px">${esc(c.label)}</b>
+      <span class="${c.warn?'warn':'dim'}" style="flex:1;overflow:hidden;
+        text-overflow:ellipsis;white-space:nowrap">
+        ${c.running?'checking now… ':''}${esc(c.note||'')}</span>
+      ${c.mode?`<span class="dim" style="flex:none;font-size:10.5px;
+        border:1px solid var(--line);border-radius:9px;padding:0 7px"
+        title="this system's own auto/manual switch, on its card">${esc(c.mode)}</span>`:''}
+      <span class="dim" style="flex:none">›</span>
+    </div>`;
+  // WHAT NEEDS YOU FIRST. All-clear rows still show - a health page that
+  // hides the healthy teaches you nothing about what is being watched - but
+  // they queue behind anything that found something.
+  const sorted=[...cs].sort((a,b)=>(b.warn?1:0)-(a.warn?1:0));
+  el.innerHTML=head+sorted.map(row).join('')
+    +`<div class="dim" style="font-size:10.5px;margin-top:6px">Each row is a
+      shortcut: the full card - list, buttons, its own switch - lives where it
+      always did, one click away.</div>`;
+}
+async function hlRun(){
+  const m=document.getElementById('hlMsg'); if(m) m.textContent='starting…';
+  try{
+    const r=await (await fetch('/api/health/run',{method:'POST'})).json();
+    if(m) m.textContent=(r.started||[]).length
+      ? 'checking: '+r.started.join(', ') : 'everything was already running';
+  }catch(e){ if(m) m.textContent='could not start'; }
+  loadHealth();
+}
+async function hlMode(mode){
+  const m=document.getElementById('hlMsg'); if(m) m.textContent='saving…';
+  try{
+    _hl=await (await fetch('/api/health/mode?mode='+mode,{method:'POST'})).json();
+    if(m) m.textContent='';
+    hlPaint();
+  }catch(e){ if(m) m.textContent='could not change it'; }
 }
 
 // ---- observer mode: does this machine change files, or only watch? -------
@@ -25993,7 +26300,8 @@ _SETTINGS_NAV = [
     ("Integrations", [("arrs", "Arrs",             "link"),
                       ("plex", "Plex",             "play"),
                       ("meta", "Metadata",         "globe")]),
-    ("System",     [("libs",   "Libraries",         "folder"),
+    ("System",     [("health", "Health checks",     "shield"),
+                    ("libs",   "Libraries",         "folder"),
                     # Not a tool - it is where nuarr keeps its working files,
                     # which puts it with Libraries and Backup rather than
                     # beside ffmpeg.
