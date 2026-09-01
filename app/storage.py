@@ -220,6 +220,7 @@ def _is_remote(path: str) -> tuple[bool, str]:
 
 def volume_for(path: str) -> dict | None:
     """The volume a path sits on, by letter or by mount point."""
+    path = _deprefix(path)
     p = os.path.abspath(path or "")
     vols = volumes()
     if os.name == "nt" and len(p) > 1 and p[1] == ":":
@@ -277,6 +278,32 @@ def _kind_of(v: dict) -> str:
     return VIRTUAL
 
 
+def _deprefix(path: str) -> str:
+    r"""Take the \\?\ extended-length armour off a path before reasoning
+    about it.
+
+    WHY A VIEWER'S DISK BECAME A QUESTION MARK. Plex reported a session's file
+    as \\?\P:\Anime Shows\... - the prefix Windows uses to lift the 260-char
+    path limit, which tools attach and never remove. To _is_remote() that
+    starts with two backslashes, so it parsed as a UNC path whose server is the
+    text between slash two and slash three: a machine named "?". The card then
+    said disk ?, the gate could not cost the session, and the pool panel
+    dropped the viewer - on the HOST, with the disks attached, where this is
+    never supposed to be possible.
+
+    The prefix is transport dressing, not meaning: \\?\P:\x is P:\x, and
+    \\?\UNC\srv\share is \\srv\share. Both forms are unwrapped here, at
+    the one door every question about a path comes through.
+    """
+    p = (path or "").replace("/", "\\")
+    if p.startswith("\\\\?\\") or p.startswith("\\\\.\\"):
+        rest = p[4:]
+        if rest[:4].upper() == "UNC\\":
+            return "\\\\" + rest[4:]
+        return rest
+    return p
+
+
 def describe(path: str) -> dict:
     r"""What kind of storage backs this path, and what is the device called?
 
@@ -285,6 +312,7 @@ def describe(path: str) -> dict:
     whether the answer came from DrivePool, from a RAID controller or from a
     machine in another room.
     """
+    path = _deprefix(path)
     remote, host = _is_remote(path)
     if remote:
         return {"kind": REMOTE, "device": host or "a network server",
