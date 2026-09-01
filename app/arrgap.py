@@ -177,14 +177,34 @@ async def scan() -> dict:
             st = _CACHE["arrs"].setdefault(
                 cfg.name, {"kind": cfg.kind, "done": 0, "total": 0,
                            "missing": 0, "error": ""})
+            # SAY WHAT IT IS DOING WHILE IT DOES IT. This step is a single
+            # request that takes 27 seconds against 37,539 records, and for
+            # every one of those seconds the card said "Not checked yet" -
+            # indistinguishable from a button that had not worked. There is no
+            # count to report yet, so it reports the only thing it knows.
+            _CACHE["now"] = f"asking {cfg.name} for its file list"
+            st["state"] = "asking"
             try:
                 files = await shared_client(cfg).list_files()
                 answered += 1
             except Exception as e:                           # noqa: BLE001
-                st["error"] = type(e).__name__
+                # THE TYPE ALONE IS NOT AN ANSWER. "ConnectError" tells you
+                # nothing you can act on; the host and port that refused, or
+                # the status the arr returned, tells you whether the service is
+                # down, the key is wrong or the URL has a typo.
+                # AND WHERE IT WAS TRYING. httpx says "ConnectError: All
+                # connection attempts failed" and never names the address, so
+                # the one thing you need in order to act - is this the right
+                # host and port? - is the one thing missing. The base URL is
+                # safe to show; the key is not, and is never in this string.
+                where = str(getattr(cfg, "url", "") or "").rstrip("/")
+                st["error"] = (f"{type(e).__name__}: {e}"
+                               + (f" (at {where})" if where else ""))[:220]
+                st["state"] = "failed"
                 joblog.log(f"not-walked check: {cfg.name} did not answer: "
-                           f"{type(e).__name__}", "warn")
+                           f"{type(e).__name__}: {e}", "warn")
                 continue
+            st["state"] = "comparing"
             # STATE, NOT JUST PRESENCE. Asking only "is there a row" would have
             # reported the fourteen written-off files as fully accounted for,
             # which is how they stayed hidden in the first place; asking only
@@ -197,6 +217,7 @@ async def scan() -> dict:
                             "SELECT arr_file_id, state, state_reason FROM files "
                             "WHERE arr_name=? AND arr_file_id IS NOT NULL",
                             (cfg.name,)).fetchall()}
+            _CACHE["now"] = f"comparing {cfg.name} against nuarr's index"
             st["total"] = len(files)
             _CACHE["total"] = _CACHE.get("total", 0) + len(files)
             for f in files:
@@ -211,7 +232,7 @@ async def scan() -> dict:
                 if fid in have and state != "deleted":
                     continue                      # nuarr has it and counts it
                 path = getattr(f, "path", "") or ""
-                _CACHE["now"] = os.path.basename(path)
+                _CACHE["now"] = os.path.basename(path) or _CACHE["now"]
                 st["missing"] += 1
                 rows.append({
                     "arr": cfg.name, "kind": cfg.kind, "file_id": fid,
@@ -249,6 +270,13 @@ async def scan() -> dict:
             "fixable": sum(1 for r in rows if r["why"] in FIXABLE),
             "asked": asked, "answered": answered,
             "partial": answered != asked,
+            # A CHECK ONE ARR DID NOT ANSWER IS NOT A CLEAN CHECK. Its files
+            # are simply absent from the comparison, so the gap comes back
+            # smaller than it is and looks like good news. The card has to be
+            # able to say so, which means the reason has to leave this
+            # function.
+            "errors": {n: st["error"] for n, st in _CACHE["arrs"].items()
+                       if st.get("error")},
         }
         _CACHE["at"] = time.time()
     finally:

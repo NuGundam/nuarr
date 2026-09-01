@@ -4485,11 +4485,21 @@ def api_arrgap():
 
 @app.post("/api/arrgap/run")
 async def api_arrgap_run():
-    """Re-ask the arrs and re-compare. Two list calls, no disk walk."""
+    r"""Start the check. Returns at once; the card follows it live.
+
+    IT USED TO HOLD THE REQUEST OPEN FOR THIRTY SECONDS. One list call against
+    37,539 records takes 27s, and for all of it the browser sat on a pending
+    POST while the card still read "Not checked yet" - identical to a button
+    that had done nothing. Anything interrupting those thirty seconds - a
+    restart, a proxy timeout, a sleeping laptop - surfaced as the bare word
+    "failed" with no cause attached, because the failure was the WAIT and not
+    the work. The work itself succeeded every time it was measured.
+    """
     from . import arrgap
     if arrgap._CACHE.get("running"):
-        return {"ok": False, "error": "already running"}
-    return await arrgap.scan()
+        return {"ok": False, "error": "a check is already running"}
+    asyncio.create_task(arrgap.scan())
+    return {"ok": True, "started": True}
 
 
 @app.post("/api/arrgap/fix")
@@ -19601,14 +19611,30 @@ function agPaint(){
   if(!el||!_ag) return;
   const d=_ag;
   if(d.running){
+    // The first half-minute has no count to show - the arr is still building
+    // its answer - so the phase IS the progress. A bar frozen at zero for
+    // thirty seconds reads as broken; "asking Sonarr for its file list" reads
+    // as working.
+    const where=(d.progress||{}).now||'asking the arrs what they manage';
+    // A BAR WITH NO TOTAL IS NOT A BAR. Until the arr answers there is nothing
+    // to be a fraction of, and drawing "0 records" under a sentence that
+    // already says what is happening said the same thing twice - once
+    // usefully and once as an empty measurement.
+    const per=Object.entries(d.arrs||{}).map(([n,a])=>
+      `${esc(n)} <span class="dim">${a.error?'failed':(a.state||'waiting')}${
+        a.total?` · ${fmt(a.done||0)}/${fmt(a.total)}`:''}</span>`).join(
+      '<span class="dim"> · </span>');
     el.innerHTML=`
       <div style="font-size:11.5px">
         <div style="display:flex;gap:8px;align-items:center">
           <span class="spin" style="width:11px;height:11px"></span>
-          <span>asking the arrs what they manage</span>
-          <span class="dim">· one list per arr, no disk walk</span>
+          <span>${esc(where)}</span>
         </div>
-        ${progressBar(d.progress, 'records')}
+        ${per?`<div class="dim" style="font-size:10.5px;margin-top:3px">${per}</div>`:''}
+        ${(d.progress&&d.progress.total)?progressBar(d.progress, 'records'):''}
+        <div class="dim" style="font-size:10.5px;margin-top:3px">Each arr
+          answers with its whole file table in one request — about 30 seconds
+          for 37,500 records here, and no disk is touched.</div>
       </div>`;
     return;
   }
@@ -19643,6 +19669,25 @@ function agPaint(){
   const rows=d.rows||[], n=d.total||0, fixable=d.fixable||0;
   const mode=d.mode||'manual', auto=mode==='auto';
   const fails=d.failures||[];
+  // AN ARR THAT DID NOT ANSWER MAKES THE GOOD NEWS FAKE. Its files are simply
+  // absent from the comparison, so the gap comes back smaller than it is and
+  // the card would report "nothing to put right" about a library it had only
+  // half looked at. Louder than the failure list below, because this one
+  // invalidates the number rather than adding to it.
+  const arrErrs=Object.entries(d.errors||{});
+  const partialBox = arrErrs.length ? `
+    <div style="border:1px solid var(--bad,#f85149);border-radius:6px;
+                padding:6px 8px;margin-bottom:7px;font-size:11.5px">
+      <b style="color:var(--bad,#f85149)">${arrErrs.length===1
+        ? esc(arrErrs[0][0])+' did not answer'
+        : fmt(arrErrs.length)+' arrs did not answer'}</b> — everything they
+      manage is missing from this comparison, so the counts below are a floor
+      and not a total.
+      <div class="dim" style="margin-top:3px">${arrErrs.map(([nm,e])=>
+        `<div><b>${esc(nm)}</b>: ${esc(e)}</div>`).join('')}</div>
+      <div class="dim" style="margin-top:3px">Check the arr is running, and its
+        URL and key under Settings → Arrs, then press Check now.</div>
+    </div>` : '';
   const failBox = fails.length ? `
     <div style="border:1px solid var(--warn);border-radius:6px;padding:6px 8px;
                 margin-bottom:7px;font-size:11.5px">
@@ -19671,8 +19716,10 @@ function agPaint(){
   const head = fixable
     ? `<b style="color:var(--warn)">${fmt(fixable)} file${fixable===1?'':'s'}
        Nuarr can put right</b>`
-    : (n ? `<b style="color:var(--ok)">nothing to put right</b>`
-         : `<b style="color:var(--ok)">every file the arrs manage is here</b>`);
+    : (arrErrs.length
+       ? `<b style="color:var(--bad,#f85149)">nothing found in what did answer</b>`
+       : (n ? `<b style="color:var(--ok)">nothing to put right</b>`
+            : `<b style="color:var(--ok)">every file the arrs manage is here</b>`));
   const byWhy=d.by_why||{};
   const chips=AG_ORDER.filter(k=>byWhy[k]).map(k=>{
     const hot = k==='written off, but on disk' || k==='not walked yet';
@@ -19683,6 +19730,7 @@ function agPaint(){
       fmt(byWhy[k].n)} ${esc(k)}</span>`;
   }).join(' ');
   el.innerHTML=`
+    ${partialBox}
     ${failBox}
     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;
                 font-size:11.5px;margin-bottom:6px">
@@ -19777,9 +19825,39 @@ function agList(rows){
     </div>`;
 }
 async function agRun(){
-  const m=document.getElementById('agMsg'); if(m) m.textContent='asking the arrs…';
-  try{ _ag=await (await fetch('/api/arrgap/run',{method:'POST'})).json(); agPaint(); }
-  catch(e){ if(m) m.textContent='failed'; }
+  const m=document.getElementById('agMsg');
+  if(m) m.textContent='starting…';
+  // WHAT WENT WRONG, NOT THAT SOMETHING DID. "failed" is the least useful
+  // string a program can print: it rules nothing out, suggests nothing to try,
+  // and is indistinguishable from a bug in the button itself. Each branch here
+  // names the step and quotes what the other end actually said.
+  try{
+    const r=await fetch('/api/arrgap/run',{method:'POST'});
+    if(!r.ok){
+      let detail='';
+      try{ const j=await r.json(); detail=j.detail||j.error||''; }
+      catch(e){ try{ detail=(await r.text()).slice(0,200); }catch(e2){} }
+      if(m) m.innerHTML=`<span class="err">could not start the check — Nuarr `
+        + `answered ${r.status}${r.statusText?' '+esc(r.statusText):''}`
+        + `${detail?': '+esc(detail):''}</span>`;
+      return;
+    }
+    const j=await r.json();
+    if(j && j.error){
+      if(m) m.innerHTML=`<span class="warn">${esc(j.error)}</span>`;
+      loadArrGap();
+      return;
+    }
+    if(m) m.textContent='';
+  }catch(e){
+    // A thrown fetch means the browser never got an answer at all: Nuarr
+    // restarting, the tab offline, the machine asleep. A different fault from
+    // a server error, and it points somewhere else entirely.
+    if(m) m.innerHTML='<span class="err">could not reach Nuarr — it may be '
+      + 'restarting. Try again in a moment.</span>';
+    return;
+  }
+  loadArrGap();          // follows it live from here
   agSyncHeader();
 }
 // THE HEADER READS THE SAME CACHE, but on its own timer - so for up to fifteen
