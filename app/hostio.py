@@ -551,6 +551,46 @@ def peer_counts(server: str) -> dict:
     return counts
 
 
+# ONE ANSWER PER SESSION, HELD UNTIL THE SESSION ENDS.
+#
+# WHY A CORRECT ANSWER KEPT DISAPPEARING. The rate match is a photograph of one
+# instant, and Plex does not read continuously - it pulls thirty seconds of
+# video and goes quiet. Sampled during a lull the disk reads nothing, the match
+# finds nothing, and a viewer that was placed a second ago becomes "playing,
+# but nothing here says which disk". Measured on the sandbox with two streams
+# running: one sample had every disk under 200 KB/s and both viewers unplaced;
+# six seconds later NU-DRIVE-7 was reading 3.14 MB/s and NU-DRIVE-1 2.09 MB/s,
+# which is exactly the two streams. The evidence comes and goes; the fact does
+# not.
+#
+# A PAUSED STREAM IS THE SAME PROBLEM MADE PERMANENT. It reads nothing at all,
+# so there is no rate to match for as long as it stays paused - which is
+# precisely when you most want the row to say who is holding that disk. Without
+# a memory, "paused" is indistinguishable from "gone".
+#
+# So the first placement is kept and reused for the life of the Plex session,
+# and re-derived only when the session's FILE changes - the session key
+# survives moving to the next episode, and the next episode can be on another
+# spindle.
+_VIEWER_LOCK: dict = {}
+_LOCK_MAX_ERR = 0.5      # a loose guess is not worth freezing for an hour
+
+
+def _session_id(s: dict) -> str:
+    """Plex's own session key, which lasts exactly as long as the session."""
+    k = str(s.get("key") or "").strip()
+    if k:
+        return k
+    # No key is not a reason to give up on continuity: user plus file is stable
+    # for the same reasons and only collides if one person plays one file twice.
+    return f"{s.get('user') or ''}|{s.get('file') or s.get('title') or ''}"
+
+
+def viewer_locks() -> dict:
+    """What is currently pinned, for anything that wants to explain itself."""
+    return {k: dict(v) for k, v in _VIEWER_LOCK.items()}
+
+
 def infer_viewers(disks: dict) -> dict:
     r"""Which spindle is each viewer reading from, and how many of them.
 
@@ -650,6 +690,31 @@ def infer_viewers(disks: dict) -> dict:
         return out
     live = [dict(s, kbps=_rate(s)) for s in sessions]
     cands = {k: float(v.get("read_bps") or 0) for k, v in disks.items()}
+    # THE LOCK LASTS AS LONG AS THE SESSION AND NOT ONE PASS LONGER. Plex stops
+    # reporting a session the moment it ends, so the set of live keys IS the
+    # lifetime - no timeout to tune, and no chance of a finished stream holding
+    # a disk on the panel.
+    ids = {_session_id(s) for s in sessions}
+    for gone in [k for k in _VIEWER_LOCK if k not in ids]:
+        _VIEWER_LOCK.pop(gone, None)
+
+    def _remember(sess: dict, label: str, how: str, err=None) -> None:
+        _VIEWER_LOCK[_session_id(sess)] = {
+            "disk": label, "file": (sess.get("file") or "").strip(),
+            "how": how, "err": err, "at": time.time()}
+
+    def _locked(sess: dict):
+        """The disk this session was placed on, if that answer still applies."""
+        ent = _VIEWER_LOCK.get(_session_id(sess))
+        if not ent:
+            return None
+        # THE SESSION SURVIVES THE FILE CHANGING, and the file is what decides
+        # the disk. Playing the next episode keeps the same session key and can
+        # land on any of twelve spindles, so a lock that ignored the path would
+        # confidently pin the wrong one for the rest of the evening.
+        if (sess.get("file") or "").strip() != ent.get("file", ""):
+            return None
+        return ent if ent.get("disk") in disks else None
     # How much of each disk's read rate is already spoken for. This replaces
     # the old all-or-nothing "taken" set: a disk reading 5.6 MB/s while feeding
     # a 2.2 MB/s stream still has 3.4 MB/s that something else is doing, and
@@ -680,10 +745,32 @@ def infer_viewers(disks: dict) -> dict:
                 label, how = None, ""
         if label and label in disks and how in ("member", "volume"):
             _place(label, s, True, "the file's own location says so")
+            # A FACT OUTRANKS A LOCK AND REPLACES IT. If the storage layer can
+            # name the device, that answer is better than whatever was inferred
+            # earlier, so it is written back rather than merely used.
+            _remember(s, label, "exact")
             if not _paused(s):
                 spent[label] = spent.get(label, 0.0) + \
                     float(s.get("kbps") or 0) * 1000.0 / 8.0
             live.remove(s)
+
+    # ---- then anything already placed, before guessing again ----------------
+    for s in list(live):
+        ent = _locked(s)
+        if not ent:
+            continue
+        label = ent["disk"]
+        d = _place(label, s, False,
+                   "held from when this session was first placed"
+                   + (f" ({ent['how']})" if ent.get("how") else ""))
+        d["held"] = True
+        # A PAUSED STREAM SPENDS NOTHING. It holds its place on the disk and
+        # reads nothing at all, so counting its bitrate against the disk's rate
+        # would starve a stream that really is reading.
+        if not _paused(s):
+            spent[label] = spent.get(label, 0.0) + \
+                float(s.get("kbps") or 0) * 1000.0 / 8.0
+        live.remove(s)
 
     # ONE STREAM AND ONE BUSY DISK NEEDS NO ARITHMETIC. Measured on the
     # sandbox: a single session playing, NU-DRIVE-0 reading 9.98 MB/s and the
@@ -712,6 +799,7 @@ def infer_viewers(disks: dict) -> dict:
             d = _place(label, live[0], False,
                        "the only disk reading, and the only stream")
             d["only"] = True
+            _remember(live[0], label, "only one reading")
             return out
 
     # Biggest stream first: it has the strongest signal and the most to lose
@@ -739,6 +827,12 @@ def infer_viewers(disks: dict) -> dict:
             spent[best] = spent.get(best, 0.0) + want
             _place(best, s, False, "its rate matches what this disk is reading",
                    best_err)
+            # ONLY A CLOSE MATCH IS WORTH KEEPING. Anything looser is a
+            # best-of-a-bad-lot answer that happened to be the least wrong in
+            # one sample; freezing that for the length of a film would turn a
+            # shrug into a claim.
+            if best_err is not None and best_err <= _LOCK_MAX_ERR:
+                _remember(s, best, "rate", round(best_err, 3))
 
     # A VIEWER NUARR CANNOT PLACE IS STILL A VIEWER. Dropping it silently is
     # how two people watching came to be reported as one; the panel would

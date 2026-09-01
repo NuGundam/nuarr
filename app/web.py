@@ -11426,17 +11426,48 @@ guess.">looks like data moving</span>${other.slice(0,3).map(m=>pair(m,'')).join(
       // panel's "looks like data moving" and deserves the same hedging.
       const VG = L && L.view_guess;
       if(VG){
-        const bps=(VG.kbps||0)*125;
-        viewGrp = `<span class="io-grp io-view" title="${esc(
-          `probably this disk — ${VG.user||'someone'} is playing `
-          + `${VG.title||'something'} at ${(VG.kbps/1000).toFixed(1)} Mbps, `
-          + `and this spindle is reading ${mbps(VG.bps)}, the closest match of `
-          + `the ${Object.keys((_hostIo.hosts[0]||{}).disks||{}).length} disks.`
-          + `\n\nInferred, not measured: over a share nothing reports which `
-          + `disk a file is on, so this is the bitrate fitting the read rate.`)}"
-          ><span class="io-gl">viewer</span>`
-          + (bps>=1000 ? `<b class="m-view io-v">~${mbps(bps)}</b>`
-                       : '<span class="io-idle">paused</span>')
+        // SAME SHAPE, SAME RENDERER. The remote path now returns exactly what
+        // the local one does - a count, a paused count and who - so this reads
+        // it the same way instead of assuming one viewer and printing a rate
+        // for a stream that is paused and moving nothing.
+        const vN=VG.viewers||1, pN=VG.paused||0, playing=vN-pN;
+        // THE RATE IS WHAT IS BEING READ, NOT WHAT IS BEING WATCHED. kbps is
+        // the sum of every session on this disk, and a paused one contributes
+        // its full bitrate to that sum while contributing nothing to the
+        // spindle: one playing at 18 Mbps beside one paused at 10.5 read as
+        // 3.4 MB/s off a disk doing 2.26. Sum only what is playing.
+        const bps=(VG.who&&VG.who.length
+          ? VG.who.filter(w=>w.state!=='paused')
+                  .reduce((t,w)=>t+(w.kbps||0),0)
+          : (pN?0:(VG.kbps||0)))*125;
+        const who=(VG.who||[]).map(w=>
+            `${w.state==='paused'?'paused':'playing'} · ${w.user||'someone'}`
+            + ` · ${w.title||''}`
+            + (w.kbps?` · ${(w.kbps/1000).toFixed(1)} Mbps`:'')).join('\n');
+        const how = VG.held
+          ? `Held: this session was placed on this disk when it started, and `
+            + `that answer is kept until the session ends. Plex reads in `
+            + `bursts and a paused stream reads nothing at all, so re-deciding `
+            + `every few seconds would lose a viewer that is still there.`
+          : `Inferred, not measured: over a share nothing reports which disk a `
+            + `file is on, so this is the bitrate fitting the read rate — `
+            + `this spindle is reading ${mbps(VG.bps)}, the closest match of `
+            + `the ${Object.keys((_hostIo.hosts[0]||{}).disks||{}).length} `
+            + `disks.`;
+        viewGrp = `<span class="io-grp io-view" title="${esc(who + '\n\n' + how
+            + (pN?`\n\n${pN} paused — counted, but adding nothing to the rate,`
+                 + ` because a paused stream is not reading.`:''))}"
+          ><span class="io-gl">${
+            (vN>1 ? vN+' viewers' : 'viewer')
+            + (pN ? (vN>1 ? ' \u00b7 '+pN+' paused' : ' \u00b7 paused') : '')
+          }</span>`
+          // A PAUSED STREAM HAS A BITRATE AND IS NOT USING IT. Printing
+          // "~2.3 MB/s" beside the word paused states two contradictory things
+          // at once; the rate belongs to whoever is still playing.
+          + (playing>0 && bps>=1000
+               ? `<b class="m-view io-v">${VG.held?'':'~'}${mbps(bps)}</b>`
+               : '<span class="io-idle" title="a paused stream keeps its place'
+                 + ' on this disk but reads nothing">holding</span>')
           + '</span>';
       }
       else if(W && W.viewers){
@@ -11445,7 +11476,13 @@ guess.">looks like data moving</span>${other.slice(0,3).map(m=>pair(m,'')).join(
         // bytes off the disk - printing 7.2 next to 0.9 for the same traffic
         // would make a viewer look eight times heavier than they are. Same
         // unit or no comparison: kbps * 1000 / 8.
-        const bps=(W.kbps||0)*125;
+        // Same correction as the remote chip above: a paused session keeps its
+        // place on the disk and reads nothing, so it must not be added into
+        // the rate the disk is shown as delivering.
+        const bps=((W.who&&W.who.length
+          ? W.who.filter(w=>w.state!=='paused')
+                 .reduce((t,w)=>t+(w.kbps||0),0)
+          : (W.paused?0:(W.kbps||0)))||0)*125;
         const tip = (W.who||[]).map(w=>
             `${w.state==='paused'?'paused':'playing'} · ${w.user||'someone'}`
             + ` · ${w.title||''}`
