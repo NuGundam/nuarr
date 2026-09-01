@@ -112,6 +112,18 @@ CREATE INDEX IF NOT EXISTS ix_files_size  ON files(size DESC);
 -- folder, where the range is a few dozen rows instead of the whole table.
 CREATE INDEX IF NOT EXISTS ix_files_path_nc ON files(path COLLATE NOCASE);
 
+-- COVERING, which is the whole point of it. The Libraries settings page asks
+-- what kind of thing each library holds by joining every live file row to its
+-- parent's genre, and that read every one of ~39,000 rows off the table to
+-- collect four columns:
+--     SCAN f USING INDEX ix_files_lib    54.8 ms measured
+-- The four columns fit in an index, so the table is never touched:
+--     SCAN f USING COVERING INDEX ix_files_lib_kind    30.9 ms
+-- state is in there only to be covering - the query filters on it, and without
+-- it the plan goes back to the table for that one value per row.
+CREATE INDEX IF NOT EXISTS ix_files_lib_kind
+    ON files(library, arr_name, arr_parent_id, state);
+
 -- ----------------------------------------------------------------- jobs ----
 CREATE TABLE IF NOT EXISTS jobs (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,

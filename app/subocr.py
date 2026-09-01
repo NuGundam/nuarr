@@ -1984,7 +1984,11 @@ def paddle_info(force: bool = False) -> dict:
     # rather than the file, since "where is it installed" means the folder -
     # and the interpreter too, because on a machine with several Pythons the
     # version alone does not tell you WHICH one is carrying it.
+    from .config import CHILD_HIDE_PREAMBLE
     code = (
+        # FIRST, before paddle is imported and gets the chance. See
+        # CHILD_HIDE_PREAMBLE: this child is hidden, its grandchildren were not.
+        CHILD_HIDE_PREAMBLE +
         "import json, os, sys, platform\n"
         "d={'python': sys.executable, 'python_version': platform.python_version()}\n"
         "try:\n"

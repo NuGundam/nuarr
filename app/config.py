@@ -73,6 +73,37 @@ def quiet_run(cmd, **kw):
         kw.setdefault("startupinfo", hidden_si())
     return subprocess.run(cmd, **kw)
 
+
+# HIDING A CHILD DOES NOT HIDE ITS CHILDREN, and that gap is what put a
+# console window on Erik's desktop. CREATE_NO_WINDOW and SW_HIDE apply to the
+# process being started; a console-less child that then spawns a
+# console-subsystem program gets Windows to allocate a BRAND NEW console for
+# it, and that one is visible.
+#
+# Caught by nuarr's own console watcher: "where ccache", parented to a Nuarr.exe
+# that was itself parented to Nuarr.exe. That is paddle - subprocess.check_output
+# (['where','ccache']) in paddle/utils/cpp_extension/extension_utils.py - run
+# from the short -c probe that asks whether paddleocr is installed. The probe was
+# started hidden and correctly so; nothing was passed on to what IT started.
+#
+# The three worker SCRIPTS each patch Popen at the top of themselves. A -c
+# string has no top to put it in, so it gets this. Kept here rather than inline
+# so the four copies cannot drift apart.
+CHILD_HIDE_PREAMBLE = (
+    "import os as _o, subprocess as _s\n"
+    "if _o.name=='nt':\n"
+    "    _op=_s.Popen.__init__\n"
+    "    def _hp(self,*a,**k):\n"
+    "        k['creationflags']=(k.get('creationflags') or 0)|0x08000000\n"
+    "        if not k.get('startupinfo'):\n"
+    "            _i=_s.STARTUPINFO()\n"
+    "            _i.dwFlags|=_s.STARTF_USESHOWWINDOW\n"
+    "            _i.wShowWindow=0\n"
+    "            k['startupinfo']=_i\n"
+    "        _op(self,*a,**k)\n"
+    "    _s.Popen.__init__=_hp\n"
+)
+
 DB_PATH = DATA_DIR / "nuarr.db"
 LOG_PATH = DATA_DIR / "nuarr.log"
 
