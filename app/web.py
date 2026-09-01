@@ -9695,11 +9695,64 @@ tr.logrow td{background:#1c2129;border-bottom:1px solid var(--acc);padding:0 12p
    tall enough for the activity chips beneath it, so nothing moves to make
    room. Small and quiet: it is a caption on the name, not a fifth chip. */
 .xmvs{margin-top:3px;display:flex;flex-direction:column;gap:1px}
-.xmv{font-size:10px;line-height:1.45;letter-spacing:.2px;color:var(--warn);
-     white-space:nowrap;cursor:help}
+/* gap, not spaces. A flex container turns the whitespace between children
+   into anonymous items and strips it, so "NU-DRIVE-10 12.0 MB/s" rendered as
+   "NU-DRIVE-1012.0 MB/s" - the disk name and the rate ran together into
+   something that read like one wrong number. */
+.xmv{font-size:10.5px;line-height:1.5;letter-spacing:.2px;color:var(--warn);
+     white-space:nowrap;cursor:help;display:flex;align-items:center;gap:4px}
 .xmv.xmine{color:var(--acc)}
 .xmv b{font-weight:600}
 .xmv .xarrow{opacity:.75;padding-right:1px}
+/* DIRECTION YOU CAN SEE WITHOUT READING IT. A 10px arrow glyph is a SHAPE, and
+   a shape has to be looked at and decoded - at this size, next to a disk name
+   in the same colour, it was doing neither job well. Movement is different:
+   the eye reports it whether or not it was looking, and it cannot be confused
+   for the other direction the way a small -> and <- can be.
+   The chevrons travel the way the bytes do, and they travel FASTER when the
+   transfer is faster, so the caption states the rate twice - once as a figure
+   you can quote and once as a motion you cannot misread. */
+.xflow{display:inline-flex;align-items:center;gap:1px;vertical-align:-1px;
+       line-height:1}
+/* backwards fill so the delayed chevrons sit at the animation's own floor
+   while they wait, not at the base opacity - without it the second and third
+   start a step darker than they ever go again, and the first cycle looks
+   different from every one after it. */
+.xflow b{font-size:11px;font-weight:700;opacity:.25;
+         animation:xflowpulse var(--dur,1.1s) linear infinite backwards}
+.xflow b:nth-child(2){animation-delay:calc(var(--dur,1.1s) * .18)}
+.xflow b:nth-child(3){animation-delay:calc(var(--dur,1.1s) * .36)}
+/* Mirrored rather than given its own set of delays: flipping the box reverses
+   both the glyphs and the order they light up in, so one animation describes
+   both directions and the two can never drift apart. */
+.xflow.xin{transform:scaleX(-1)}
+@keyframes xflowpulse{
+  0%{opacity:.18}
+  35%{opacity:1}
+  70%{opacity:.18}
+  100%{opacity:.18}}
+/* REDUCED, NOT REMOVED - AND THIS MACHINE IS THE REASON THE DISTINCTION
+   MATTERS. Windows here has "animate controls and elements inside windows"
+   switched off (SPI_GETCLIENTAREAANIMATION reports false, MinAnimate is 0), so
+   Chrome correctly reports prefers-reduced-motion:reduce, and the first
+   version of this - animation:none under that query - meant the person who
+   ASKED for the animation would have been the one person who never saw it.
+
+   Killing it outright is also the wrong reading of the preference. The setting
+   asks for no gratuitous motion; this motion is the message - it is carrying
+   direction and rate, and a still version of it is a worse arrow, not a calmer
+   one. So under reduce it keeps moving and stops shouting: a little over twice
+   as slow, and a gentle fade between .45 and 1 instead of near-invisible to
+   full. Enough to read the direction from, not enough to pull the eye. */
+@media (prefers-reduced-motion:reduce){
+  .xflow b{animation-name:xflowcalm;
+           animation-duration:calc(var(--dur,1.1s) * 2.2)}
+}
+@keyframes xflowcalm{
+  0%{opacity:.45}
+  35%{opacity:1}
+  70%{opacity:.45}
+  100%{opacity:.45}}
 @media(max-width:900px){.dkey{display:none}}
 .disktab{width:100%;table-layout:fixed}
 .disktab th,.disktab td{overflow:hidden;text-overflow:ellipsis}
@@ -11284,9 +11337,18 @@ The bar splits it by share of bytes moved — Nuarr ${share(mine)}%, everything 
                 + `so a pool balance, a parity rebuild, a backup and a plain `
                 + `copy all look the same. With several moves at once the `
                 + `pairing is a best guess.`;
+            // Faster transfer, faster chevrons. Logarithmic, because the
+            // range here is three orders of magnitude and a linear map would
+            // make everything below 20 MB/s look identically slow: 1 MB/s
+            // reads at 1.38s a cycle, 10 at 0.88s, 100 at 0.60s.
+            const mb = (x.bps||0)/1e6;
+            const dur = Math.max(0.45, Math.min(1.8,
+                          1.8/(1+Math.log10(1+mb)))).toFixed(2);
             return `<span class="xmv${x.mine?' xmine':''}" title="${esc(tip)}"
-              ><span class="xarrow">${x.dir==='out'?'\u2192':'\u2190'}</span> ${
-              x.other?esc(x.other):'elsewhere'} <b>${mbps(x.bps)}</b></span>`;
+              ><span class="xflow${x.dir==='out'?'':' xin'}"
+                 style="--dur:${dur}s"><b>\u203a</b><b>\u203a</b><b>\u203a</b></span
+              ><span>${x.other?esc(x.other):'elsewhere'}</span
+              ><b>${mbps(x.bps)}</b></span>`;
           }).join('');
           const more = mv.length>2
             ? `<span class="xmv" title="${esc(mv.slice(2).map(x=>
