@@ -552,26 +552,40 @@ def peer_counts(server: str) -> dict:
 
 
 def infer_viewers(disks: dict) -> dict:
-    r"""Guess which spindle each viewer is reading from. A GUESS, and labelled.
+    r"""Which spindle is each viewer reading from, and how many of them.
 
-    WHY IT CANNOT BE KNOWN. DrivePool presents a virtual volume and reports its
-    own serial through the share: the same file opened via P:\, via the share
-    and via its PoolPart copy gives 092120B4, 092120B4 and 68F9900E. Two of
-    those are the pool. So nothing the filesystem returns over a share names
-    the disk - it is hidden by design, not by permission.
+    WHY IT CANNOT SIMPLY BE READ. DrivePool presents a virtual volume and
+    reports its own serial through the share: the same file opened via P:\, via
+    the share and via its PoolPart copy gives 092120B4, 092120B4 and 68F9900E.
+    Two of those are the pool. Nothing the filesystem returns over a share
+    names the disk - it is hidden by design, not by permission.
 
-    WHAT CAN BE SAID. Plex reports what each session is playing and at what
-    bitrate. A stream at 15,784 kbps is about 2.0 MB/s off a disk, and if one
-    spindle is reading at about that rate while that stream plays, it is very
-    probably the one. That is inference, so it is reported as inference - the
-    same footing as the panel's "looks like data moving" pairing.
+    SO ASK FIRST, GUESS SECOND. Where nuarr can resolve a session's own file to
+    a device it does, and that is a fact. What is left over is matched by rate:
+    a stream at 15,784 kbps is about 2.0 MB/s off a disk, and a spindle reading
+    about that much while that stream plays is very probably the one. That half
+    is labelled inference, on the same footing as the panel's "looks like data
+    moving" pairing.
 
-    Deliberately conservative: a disk must be reading within a wide band of the
-    expected rate, and one disk is claimed per session, best match first. Plex
-    reads ahead in bursts, so the band is generous upward and tight downward -
-    a disk reading far LESS than the stream needs cannot be feeding it.
+    A DISK CAN HAVE MORE THAN ONE VIEWER, AND THIS DENIED IT TWICE OVER. Erik
+    had two people watching and saw one. Both were real, both were on
+    NU-DRIVE-1, and the old code could not represent that: it claimed one disk
+    per session, so the second viewer found NU-DRIVE-1 already taken and was
+    dropped - and even had it matched, the row was a single dict per disk, so
+    it would have overwritten the first. Two people on one spindle is not an
+    exotic case in a twelve-disk pool; it is roughly a one-in-twelve coincidence
+    per pair, and it happens constantly on a box where a season lives together.
+
+    Each disk now carries a count, a paused count, the summed rate and who is
+    on it - the same shape the local path already published as
+    plex_disk_detail, so the panel sees one shape wherever the pool is.
+
+    A PAUSED STREAM IS NEVER RATE-MATCHED. It holds its place on the disk and
+    reads nothing, so it has no rate to match and would only steal a disk from
+    a stream that does. It is placed when its file names a device, and
+    otherwise counted but not located.
     """
-    out = {}
+    out: dict = {}
 
     def _rate(s: dict) -> float:
         r"""A session's read rate in kbps, from the fields that carry it.
@@ -595,6 +609,38 @@ def infer_viewers(disks: dict) -> dict:
         except Exception:                                    # noqa: BLE001
             return 0.0
 
+    def _paused(s: dict) -> bool:
+        return str(s.get("state") or "").strip().lower() == "paused"
+
+    def _place(label: str, s: dict, exact: bool, why: str,
+               err: float | None = None) -> dict:
+        """Add one viewer to a disk, creating the row if it is the first."""
+        d = out.get(label)
+        if d is None:
+            d = out[label] = {
+                "viewers": 0, "paused": 0, "kbps": 0.0,
+                "bps": float((disks.get(label) or {}).get("read_bps") or 0),
+                "who": [], "user": "", "title": "",
+                "inferred": not exact, "exact": exact, "why": why}
+        k = float(s.get("kbps") or 0)
+        d["viewers"] += 1
+        d["paused"] += 1 if _paused(s) else 0
+        d["kbps"] += k
+        d["who"].append({"user": str(s.get("user") or ""),
+                         "title": str(s.get("title") or ""),
+                         "state": "paused" if _paused(s) else "playing",
+                         "kbps": k})
+        if not exact:
+            d["inferred"], d["exact"] = True, False
+        if err is not None:
+            d["err"] = round(err, 3)
+        # THE LOUDEST STREAM NAMES THE ROW. A disk with one viewer then reads
+        # exactly as it always did, so nothing downstream had to change to keep
+        # working; a disk with two says so through the count.
+        top = max(d["who"], key=lambda w: w["kbps"])
+        d["user"], d["title"] = top["user"], top["title"]
+        return d
+
     try:
         from . import gate
         sessions = list(gate.plex_live() or [])
@@ -604,7 +650,11 @@ def infer_viewers(disks: dict) -> dict:
         return out
     live = [dict(s, kbps=_rate(s)) for s in sessions]
     cands = {k: float(v.get("read_bps") or 0) for k, v in disks.items()}
-    taken = set()
+    # How much of each disk's read rate is already spoken for. This replaces
+    # the old all-or-nothing "taken" set: a disk reading 5.6 MB/s while feeding
+    # a 2.2 MB/s stream still has 3.4 MB/s that something else is doing, and
+    # that remainder is exactly what the next stream should be matched against.
+    spent: dict = {}
 
     # ASK BEFORE GUESSING. The docstring above explains why the disk cannot be
     # read back through a share, and that is still true - but it is an argument
@@ -612,11 +662,6 @@ def infer_viewers(disks: dict) -> dict:
     # Where nuarr can resolve the session's own path to a device, that is the
     # answer, and correlating bitrates to arrive at it anyway would be choosing
     # a guess over a fact.
-    #
-    # This is the local case and it is the common one: a machine with the pool
-    # attached resolves every session exactly. The correlation below is for the
-    # case it was written for - a machine watching a pool it only reaches over
-    # the wire - and it now runs on what is left rather than on everything.
     for s in list(live):
         # THE GATE HAS ALREADY DONE THIS, and doing it again would be slower
         # and no more correct: gate.plex_live() resolves each session's file to
@@ -633,32 +678,21 @@ def infer_viewers(disks: dict) -> dict:
                 label, how = storage.device_of(f)
             except Exception:                                # noqa: BLE001
                 label, how = None, ""
-        # KEYED BY DISK, like the inferred rows below it. The two halves feed
-        # one table and one gate decision, so a different shape here would mean
-        # every consumer had to know which half produced a row.
         if label and label in disks and how in ("member", "volume"):
-            out[label] = {"kbps": float(s.get("kbps") or 0),
-                          "bps": float((disks.get(label) or {}).get(
-                              "read_bps") or 0),
-                          "user": str(s.get("user") or ""),
-                          "title": str(s.get("title") or ""),
-                          "inferred": False, "exact": True,
-                          "why": "the file's own location says so"}
-            taken.add(label)
+            _place(label, s, True, "the file's own location says so")
+            if not _paused(s):
+                spent[label] = spent.get(label, 0.0) + \
+                    float(s.get("kbps") or 0) * 1000.0 / 8.0
             live.remove(s)
-    # Biggest stream first: it has the strongest signal and the most to lose
-    # from being assigned a disk that a smaller one explains better.
+
     # ONE STREAM AND ONE BUSY DISK NEEDS NO ARITHMETIC. Measured on the
     # sandbox: a single session playing, NU-DRIVE-0 reading 9.98 MB/s and the
     # other eleven at zero. There is nothing to correlate - the only thing
     # reading is feeding the only thing watching - yet the rate-matching below
     # would refuse it outright if the session reported no bitrate, which is
     # exactly the case that produced no viewers at all.
-    #
-    # Deliberately narrow: one session left to place, one disk above a floor
-    # that idle chatter cannot reach, and nothing else moving. Any ambiguity
-    # and it falls through to the matching below.
-    if len(live) == 1 and float(live[0].get("kbps") or 0) <= 0:
+    if len(live) == 1 and float(live[0].get("kbps") or 0) <= 0 \
+            and not _paused(live[0]):
         # ONLY WHEN THERE IS NOTHING BETTER TO GO ON. The first version of this
         # skipped the rate check entirely, and comparing the two machines
         # showed what that costs: the host resolved a stream to NU-DRIVE-4 from
@@ -672,40 +706,61 @@ def infer_viewers(disks: dict) -> dict:
         # bitrate the band below is strictly better information. A confident
         # wrong answer is worse than none, and this produced one.
         busy = [(k, v) for k, v in cands.items()
-                if k not in taken and v > 400_000]
+                if v - spent.get(k, 0.0) > 400_000]
         if len(busy) == 1:
             label, rd = busy[0]
-            s = live[0]
-            out[label] = {"kbps": float(s.get("kbps") or 0), "bps": rd,
-                          "user": str(s.get("user") or ""),
-                          "title": str(s.get("title") or ""),
-                          "inferred": True, "only": True,
-                          "why": "the only disk reading, and the only stream"}
+            d = _place(label, live[0], False,
+                       "the only disk reading, and the only stream")
+            d["only"] = True
             return out
 
+    # Biggest stream first: it has the strongest signal and the most to lose
+    # from being assigned a disk that a smaller one explains better.
     for s in sorted(live, key=lambda x: -float(x.get("kbps") or 0)):
+        if _paused(s):
+            continue                       # holds its place, reads nothing
         if float(s.get("kbps") or 0) <= 0:
             continue                       # nothing to match a rate against
         want = float(s["kbps"]) * 1000.0 / 8.0          # kbps -> bytes/sec
         best, best_err = None, None
         for label, rd in cands.items():
-            if label in taken or rd <= 0:
+            left = rd - spent.get(label, 0.0)
+            if left <= 0:
                 continue
-            if rd < want * 0.6 or rd > want * 8.0:
+            # Plex reads ahead in bursts, so the band is generous upward and
+            # tight downward - a disk with less rate left than the stream needs
+            # cannot be the one feeding it.
+            if left < want * 0.6 or left > want * 8.0:
                 continue
-            err = abs(rd - want) / want
+            err = abs(left - want) / want
             if best_err is None or err < best_err:
                 best, best_err = label, err
         if best:
-            taken.add(best)
-            out[best] = {"kbps": float(s["kbps"]),
-                         "bps": cands[best],
-                         "user": str(s.get("user") or ""),
-                         "title": str(s.get("title") or ""),
-                         "err": round(best_err, 3),
-                         "inferred": True}
-    return out
+            spent[best] = spent.get(best, 0.0) + want
+            _place(best, s, False, "its rate matches what this disk is reading",
+                   best_err)
 
+    # A VIEWER NUARR CANNOT PLACE IS STILL A VIEWER. Dropping it silently is
+    # how two people watching came to be reported as one; the panel would
+    # rather say "somewhere on the pool" than quietly lose someone.
+    lost = [s for s in live
+            if not any(w.get("user") == str(s.get("user") or "")
+                       and w.get("title") == str(s.get("title") or "")
+                       for d in out.values() for w in d["who"])]
+    if lost:
+        out["_unplaced"] = {
+            "viewers": len(lost),
+            "paused": sum(1 for s in lost if _paused(s)),
+            "kbps": sum(float(s.get("kbps") or 0) for s in lost),
+            "bps": 0.0, "inferred": True, "exact": False,
+            "user": str(lost[0].get("user") or ""),
+            "title": str(lost[0].get("title") or ""),
+            "why": "playing, but nothing here says which disk",
+            "who": [{"user": str(s.get("user") or ""),
+                     "title": str(s.get("title") or ""),
+                     "state": "paused" if _paused(s) else "playing",
+                     "kbps": float(s.get("kbps") or 0)} for s in lost]}
+    return out
 
 def state() -> dict:
     """Everything the UI needs, for every host a library lives on."""

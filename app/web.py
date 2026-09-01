@@ -10650,7 +10650,9 @@ function hostIoRows(){
   // only its letterless volumes; matching on "NU-DRIVE" would have been one
   // person's labelling baked into everyone's install.
   const rows=Object.keys(ds).map(n=>{
-    const d=ds[n], size=d.size||0, free=d.free||0, v=vw[n];
+    // _unplaced is a viewer nuarr could not pin to a spindle, not a disk, so
+    // it never becomes a row - hostIoHtml says it out loud instead.
+    const d=ds[n], size=d.size||0, free=d.free||0, v=(n[0]==='_'?null:vw[n]);
     return {pool_disk:n, n:(fc[n]!=null?fc[n]:null), remote:true,
             total:size, used:Math.max(0,size-free), free:free,
             // Rounded here, like the server rounds its own: the raw quotient
@@ -10687,9 +10689,22 @@ function hostIoHtml(){
   const stale = h.stale
     ? ` <span style="color:var(--warn)">· last answer ${
         h.age_s!=null?Math.round(h.age_s)+'s':''} ago, retrying</span>` : '';
-  return note(`disks read from the host — file counts are not visible over a `
-    + `share, and a busy spindle cannot be split into viewer, Nuarr and `
-    + `system from outside${stale}`);
+  // SAY WHICH IT IS. This line used to state flatly that file counts are not
+  // visible over a share, which is true of the share and false of the host -
+  // and once the host started answering, the panel was showing twelve counts
+  // underneath a sentence saying it could not.
+  const nCounted = Object.keys(h.file_counts||{}).length;
+  const up = (h.viewers||{})._unplaced;
+  const lost = up ? ` · <span style="color:var(--warn)">${up.viewers} `
+    + `${up.viewers>1?'viewers are':'viewer is'} playing from this pool but `
+    + `nothing says which disk</span>` : '';
+  return note((nCounted
+      ? `disks read from the host, file counts asked of the Nuarr running `
+        + `there — a busy spindle still cannot be split into viewer, Nuarr `
+        + `and system from outside`
+      : `disks read from the host — file counts are not visible over a `
+        + `share, and a busy spindle cannot be split into viewer, Nuarr and `
+        + `system from outside`) + stale + lost);
 }
 
 function renderDisks(){
