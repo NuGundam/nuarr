@@ -1476,15 +1476,27 @@ def api_libraries_config():
     # between dual audio and English-only, and until now nothing on any page
     # said it.
     kinds: dict[str, dict] = {}
+    # TITLES, NOT FILES. The kind is a property of the SERIES or the FILM - it
+    # comes from the arr's genres - so counting files answered a question
+    # nobody asked: "anime 22,344" is an episode count wearing the label of a
+    # genre. One long-running show could out-count fifty films and make a
+    # library look overwhelmingly one thing when it holds a handful of titles.
+    # The file count is kept alongside, because "12 series, 300 episodes" is
+    # worth knowing - it just belongs in the tooltip rather than the chip.
+    files_by: dict[str, dict] = {}
     try:
         for r in _rows(
-                "SELECT f.library, k.kind, COUNT(*) n FROM files f "
+                "SELECT f.library, k.kind, "
+                "       COUNT(DISTINCT f.arr_parent_id) n, COUNT(*) files "
+                "  FROM files f "
                 "  JOIN parent_kind k ON k.arr_name=f.arr_name "
                 "   AND k.parent_id=f.arr_parent_id "
                 " WHERE f.state!='deleted' GROUP BY f.library, k.kind"):
             kinds.setdefault(r["library"] or "", {})[r["kind"]] = r["n"]
+            files_by.setdefault(r["library"] or "", {})[r["kind"]] = r["files"]
     except Exception:
         kinds = {}
+        files_by = {}
     out = []
     for l in SETTINGS.libraries:
         # Does the folder exist ON THE POOL? A library pointing at a path that
@@ -1505,7 +1517,9 @@ def api_libraries_config():
                     "files": total,
                     "bytes": sizes.get(l.name, 0),
                     "seen": seen,
+                    "seen_files": files_by.get(l.name, {}),
                     "seen_total": sum(seen.values()),
+                    "seen_files_total": sum(files_by.get(l.name, {}).values()),
                     "folder_kind": guess})
     # The per-library half of the not-walked check, so each row can say what
     # is missing from IT rather than making you read a total and work out
@@ -2587,6 +2601,16 @@ def _summary_impl():
                              "fixable": _g.get("fixable") or 0,
                              "by_why": _g.get("by_why") or {},
                              "age_s": _g.get("age_s")}
+            # ONE PASS, ONE PAIR OF NUMBERS. The count of arr records and the
+            # count of ones nuarr is missing have to come from the same look at
+            # the arrs, or the header can state a total from six hours ago
+            # beside a gap from thirty seconds ago and quietly contradict the
+            # card that produced the gap.
+            if _g.get("checked"):
+                totals["arrs"] = int(_g["checked"])
+                totals["arrs_age_s"] = _g.get("age_s")
+                if _g.get("arr_bytes"):
+                    totals["arr_bytes"] = int(_g["arr_bytes"])
         # nuarr's own count, split the same way the arrs split theirs, so the
         # two columns in Libraries are the same question asked twice and not
         # two different questions printed side by side.
@@ -9837,6 +9861,9 @@ tr.logrow td{background:#1c2129;border-bottom:1px solid var(--acc);padding:0 12p
    a different channel: a tag rather than a colour. */
 .xmv .xowner{font-size:9px;letter-spacing:.4px;text-transform:uppercase;
   opacity:.8;border:1px solid currentColor;border-radius:3px;padding:0 3px}
+/* Lowercase and quiet: it is a preposition, not a label, and it should read as
+   part of the sentence rather than compete with the disk name. */
+.xmv .xdir{opacity:.7}
 .xmv b{font-weight:600}
 .xmv .xarrow{opacity:.75;padding-right:1px}
 /* DIRECTION YOU CAN SEE WITHOUT READING IT. A 10px arrow glyph is a SHAPE, and
@@ -9857,12 +9884,15 @@ tr.logrow td{background:#1c2129;border-bottom:1px solid var(--acc);padding:0 12p
          animation:xflowpulse var(--dur,1.1s) linear infinite backwards}
 .xflow b:nth-child(2){animation-delay:calc(var(--dur,1.1s) * .18)}
 .xflow b:nth-child(3){animation-delay:calc(var(--dur,1.1s) * .36)}
-/* Mirrored rather than given its own set of delays: flipping the box reverses
-   both the glyphs and the order they light up in, so one animation describes
-   both directions and the two can never drift apart. Named xrev, not xin -
-   .xin now means "this disk is receiving" on the caption, and one class
-   holding two unrelated meanings is how a stylesheet starts lying. */
-.xflow.xrev{transform:scaleX(-1)}
+/* IT ALWAYS FLOWS THE WAY YOU READ, and the mirrored version is gone.
+   Reversing the chevrons for a receiving disk was correct about the physics
+   and wrong on the screen: the caption is "<<< NU-DRIVE-1", so the arrows sat
+   immediately to the LEFT of the source's name and appeared to point back at
+   the disk sending the file. The one thing the animation had to say - which
+   way the bytes are going - was the one thing it got misread on.
+   Direction is now carried by the two things that cannot be read backwards:
+   the words to and from, and the read/write colours. The motion says only
+   "this is live", which is what motion is good at. */
 /* A chip you can open should look like one. Same shape as before, plus the
    affordance - without it the only way to discover the list is to click a
    thing that has never been clickable. */
@@ -10751,6 +10781,11 @@ async function loadAll(){
         const rest=Object.entries(g.by_why||{})
           .filter(([k])=>k!=='not walked yet' && k!=='written off, but on disk')
           .reduce((n,[,v])=>n+(v.n||0),0);
+        if(!g.total)
+          return `<span class="dim lnk"`
+            + ` onclick="event.stopPropagation();location.href='/settings#arrgap'"`
+            + ` title="every file Sonarr and Radarr manage has an entry here">`
+            + `arrs manage ${fmt(a)} · all present</span>`;
         return `<span class="dim">arrs manage ${fmt(a)} · </span>`
           + (fix ? `<span class="warn lnk" onclick="event.stopPropagation();location.href='/settings#arrgap'"`
                  + ` title="nuarr has no usable entry for these and it can fix`
@@ -10777,8 +10812,14 @@ async function loadAll(){
     if(gap<0)
       return `<span class="dim">arrs manage ${fmt(a)} · ${fmt(-gap)} here that`
         + ` no arr tracks</span>`;
-    return `<span class="dim" title="nuarr's walk and the arrs' index agree`
-      + ` exactly">arrs manage ${fmt(a)} · in step</span>`;
+    // EVEN "in step" LEADS SOMEWHERE. It is the one state where nothing is
+    // wrong, which is exactly when a person wants to see what was checked and
+    // when - and a phrase that is a link in three states and dead in the
+    // fourth teaches you not to try it.
+    return `<span class="dim lnk"`
+      + ` onclick="event.stopPropagation();location.href='/settings#arrgap'"`
+      + ` title="nuarr's index and the arrs' agree exactly — click for the`
+      + ` check that says so">arrs manage ${fmt(a)} · in step</span>`;
   };
   const gapTxt = arrGap(s.totals);
   setHTML(document.getElementById('sub'),
@@ -11541,8 +11582,9 @@ The bar splits it by share of bytes moved — Nuarr ${share(mine)}%, everything 
             return `<span class="xmv ${x.dir==='out'?'xout':'xin'}"
                  title="${esc(tip)}"
               >${x.mine?'<span class="xowner">Nuarr</span>':''}<span
-                 class="xflow${x.dir==='out'?'':' xrev'}"
-                 style="--dur:${dur}s"><b>\u203a</b><b>\u203a</b><b>\u203a</b></span
+                 class="xflow" style="--dur:${dur}s"
+                 ><b>\u203a</b><b>\u203a</b><b>\u203a</b></span
+              ><span class="xdir">${x.dir==='out'?'to':'from'}</span
               ><span>${x.other?esc(x.other):'elsewhere'}</span
               ><b>${mbps(x.bps)}</b></span>`;
           }).join('');
@@ -19299,11 +19341,19 @@ async function loadLibsTab(){
   const KL={anime:'anime', animation:'animation', live:'live action'};
   const kindLine=l=>{
     const seen=l.seen||{}, tot=l.seen_total||0;
+    const sf=l.seen_files||{};
+    // A library of season folders holds series; a movie library holds films.
+    // Saying "titles" for both would be accurate and vague, and this page
+    // already knows which kind of library it is looking at.
+    const unit = (n) => (l.kind==='movie' ? (n===1?'movie':'movies')
+                                          : (n===1?'series':'series'));
     if(!tot) return '<div class="dim sub">no metadata yet — the arrs have not '
                   + 'been read, or nothing here is tracked by them</div>';
     const parts=['anime','animation','live'].filter(k=>seen[k])
       .map(k=>`<span class="kchip k-${k} kclick" role="button" tabindex="0"
-         title="show the titles counted as ${KL[k]} here"
+         title="${fmt(seen[k])} ${unit(seen[k])} counted as ${KL[k]}${
+           sf[k]?`, ${fmt(sf[k])} file${sf[k]===1?'':'s'} between them`:''
+         } — click to list them"
          onclick="kdOpen('${b64e(l.name)}','${k}')"
          onkeydown="if(event.key==='Enter')kdOpen('${b64e(l.name)}','${k}')"
         >${KL[k]} ${fmt(seen[k])}</span>`);
@@ -19321,8 +19371,8 @@ async function loadLibsTab(){
       .sort((a,b)=>(RANK[b[0]]||0)-(RANK[a[0]]||0));
     const upN=up.reduce((t,[,n])=>t+n,0);
     return `<div class="kchips">${parts.join('')}</div>`
-         + (upN?`<div class="dim sub">${fmt(upN)} of ${fmt(tot)} treated as ${
-              up.map(([k,n])=>esc(KL[k])).join(' or ')} rather than ${
+         + (upN?`<div class="dim sub">${fmt(upN)} of ${fmt(tot)} ${unit(tot)}
+              treated as ${up.map(([k,n])=>esc(KL[k])).join(' or ')} rather than ${
               esc(KL[l.folder_kind]||l.folder_kind)}, because the metadata says
               so and the folder name only sets a floor</div>`:'');
   };
@@ -19500,7 +19550,7 @@ function kdRows(){
 // THE LIST BEHIND THE NUMBER. The header can say "14 to put right"; this is
 // where you find out that they are fourteen episodes of See (2019), that they
 // are all on disk, and that Nuarr had them marked deleted since 20 August.
-let _ag=null, _agTimer=null, _agOpen=false;
+let _ag=null, _agTimer=null, _agOpen=false, _agWasBusy=false;
 // The five reasons, in the order a person cares about them: what Nuarr can fix
 // first, then what is somebody else's, then what is deliberate.
 const AG_ORDER=['written off, but on disk','not walked yet',
@@ -19537,6 +19587,8 @@ async function loadArrGap(){
   if(_agTimer) clearTimeout(_agTimer);
   const busy=_ag && (_ag.running || (_ag.fixing && _ag.fixing.running));
   if(busy) _agTimer=setTimeout(loadArrGap, 1000);
+  else if(_agWasBusy) agSyncHeader();     // it has just finished - resync once
+  _agWasBusy = !!busy;
 }
 function agToggle(){ _agOpen=!_agOpen; agPaint(); }
 function agPaint(){
@@ -19723,6 +19775,15 @@ async function agRun(){
   const m=document.getElementById('agMsg'); if(m) m.textContent='asking the arrs…';
   try{ _ag=await (await fetch('/api/arrgap/run',{method:'POST'})).json(); agPaint(); }
   catch(e){ if(m) m.textContent='failed'; }
+  agSyncHeader();
+}
+// THE HEADER READS THE SAME CACHE, but on its own timer - so for up to fifteen
+// seconds after a check it could still be quoting the previous answer directly
+// above the card that had just replaced it. Two numbers from one source
+// disagreeing on screen is worse than either being briefly stale, because it
+// makes the reader doubt both.
+function agSyncHeader(){
+  try{ if(typeof load==='function') load(); }catch(e){}
 }
 async function agFix(){
   const m=document.getElementById('agMsg'); if(m) m.textContent='';
@@ -19731,6 +19792,7 @@ async function agFix(){
     if(r&&r.error){ if(m) m.textContent=r.error; return; }
   }catch(e){ if(m) m.textContent='could not start'; return; }
   loadArrGap();
+  agSyncHeader();
 }
 async function agMode(m){
   const el=document.getElementById('agMsg');

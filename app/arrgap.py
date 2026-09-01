@@ -168,6 +168,7 @@ async def scan() -> dict:
                   t0=time.time(), t1=0.0, arrs={})
     rows: list = []
     checked = asked = answered = 0
+    arr_bytes = 0
     try:
         for cfg in (SETTINGS.arrs or []):
             if not getattr(cfg, "enabled", True):
@@ -202,6 +203,7 @@ async def scan() -> dict:
                 st["done"] += 1
                 _CACHE["done"] += 1
                 checked += 1
+                arr_bytes += int(getattr(f, "size", 0) or 0)
                 fid = getattr(f, "file_id", None)
                 if fid is None:
                     continue
@@ -233,8 +235,16 @@ async def scan() -> dict:
             b = by_why.setdefault(r["why"], {"n": 0, "bytes": 0})
             b["n"] += 1
             b["bytes"] += r["size"]
+        # WHAT THE ARRS HOLD, FROM THE SAME PASS THAT FOUND THE GAP. The header
+        # used to take this number from arrtotals and the gap from here, which
+        # are two different snapshots of one question - and locally arrtotals
+        # only refreshes every six hours, so the header could say "39,608
+        # records, 12 unaccounted for" while this card, having just re-asked,
+        # said everything was present. Neither was wrong; they were answers
+        # about different moments wearing one sentence.
         _CACHE["data"] = {
-            "checked": checked, "rows": rows, "total": len(rows),
+            "checked": checked, "arr_bytes": arr_bytes,
+            "rows": rows, "total": len(rows),
             "by_why": by_why,
             "fixable": sum(1 for r in rows if r["why"] in FIXABLE),
             "asked": asked, "answered": answered,
