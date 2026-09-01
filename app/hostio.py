@@ -568,7 +568,7 @@ def peer_sessions(server: str) -> dict:
             d = json.load(r)
         rows = d.get("sessions") if isinstance(d, dict) else d
         for s in (rows or []):
-            k = str(s.get("key") or "").strip()
+            k = session_key(s)
             disk = str(s.get("disk") or "").strip()
             if k and disk:
                 out[k] = disk
@@ -625,11 +625,34 @@ def peer_counts(server: str) -> dict:
 # spindle.
 _VIEWER_LOCK: dict = {}
 _LOCK_MAX_ERR = 0.5      # a loose guess is not worth freezing for an hour
+# Five passes at roughly five seconds apart, so about half a minute of a
+# playing stream's disk showing nothing before the guess is thrown away. Long
+# enough to ride out the gaps between Plex's read-ahead bursts, which is the
+# whole reason the lock exists; short enough that a wrong answer does not
+# survive a film.
+_LOCK_MAX_MISS = 5
+
+
+def session_key(s: dict) -> str:
+    r"""Plex's session key, under whichever of its two names this row uses.
+
+    IT IS RENAMED AT THE API BOUNDARY, and that quietly killed two features.
+    gate.panel_sessions() returns rows carrying "session_key"; the /api/plex/
+    sessions endpoint renames it to "key" on the way out. Code written against
+    the endpoint's shape - the peer lookup below, and the card's disk fill -
+    read s["key"], got None on every internal row, and matched nothing. It
+    looked like it worked when tested on the host only because the host can
+    resolve the path itself and never reached the lookup.
+
+    One reader for both spellings, so the next thing that joins on a session
+    cannot pick the wrong one.
+    """
+    return (str(s.get("key") or s.get("session_key") or "").strip())
 
 
 def _session_id(s: dict) -> str:
-    """Plex's own session key, which lasts exactly as long as the session."""
-    k = str(s.get("key") or "").strip()
+    """A stable identity for one Plex session, for as long as it lasts."""
+    k = session_key(s)
     if k:
         return k
     # No key is not a reason to give up on continuity: user plus file is stable
@@ -734,9 +757,23 @@ def infer_viewers(disks: dict) -> dict:
 
     try:
         from . import gate
-        sessions = list(gate.plex_live() or [])
+        # THE PANEL LIST, NOT THE GATE'S. plex_live() is the gate's own cached
+        # view and it updates on the gate's cycle, so the viewers dict could
+        # report "playing" for a session the sessions endpoint - reading the
+        # shared cache - already showed as paused. Two parts of one page
+        # disagreeing about whether somebody had pressed pause.
+        #
+        # panel_sessions() is explicitly the read-only feed for exactly this,
+        # and it arrives with the host's disk already filled in where this
+        # machine cannot resolve one. Falling back to plex_live() keeps the old
+        # behaviour if the panel feed is unavailable.
+        sessions = list(gate.panel_sessions() or [])
     except Exception:                                        # noqa: BLE001
-        return out
+        try:
+            from . import gate as _g
+            sessions = list(_g.plex_live() or [])
+        except Exception:                                    # noqa: BLE001
+            return out
     if not sessions or not disks:
         return out
     live = [dict(s, kbps=_rate(s)) for s in sessions]
@@ -795,10 +832,11 @@ def infer_viewers(disks: dict) -> dict:
         # the answer is sitting on the session already. Falling back to
         # resolving it here covers a session the gate could not place.
         label, how = (s.get("disk") or "").strip(), "member"
+        from_peer = False
         if not label:
-            told = peer.get(str(s.get("key") or "").strip())
+            told = peer.get(session_key(s))
             if told:
-                label, how = told, "volume"
+                label, how, from_peer = told, "volume", True
         if not label:
             f = (s.get("file") or "").strip()
             if not f:
@@ -809,25 +847,56 @@ def infer_viewers(disks: dict) -> dict:
             except Exception:                                # noqa: BLE001
                 label, how = None, ""
         if label and label in disks and how in ("member", "volume"):
+            # SAY WHICH MACHINE ANSWERED. The first version claimed "the host
+            # resolved it" whenever the row arrived without a disk - including
+            # when this machine had just resolved it itself from the path,
+            # which is most of the time. A provenance note that is wrong is
+            # worse than none.
             _place(label, s, True,
-                   "the file's own location says so"
-                   if (s.get("disk") or "").strip()
-                   else "the host resolved it from the file itself")
+                   "the host resolved it from the file itself" if from_peer
+                   else "the file's own location says so")
             # A FACT OUTRANKS A LOCK AND REPLACES IT. If the storage layer can
             # name the device, that answer is better than whatever was inferred
             # earlier, so it is written back rather than merely used.
-            _remember(s, label, "exact")
+            _remember(s, label, "host" if from_peer else "exact")
             if not _paused(s):
                 spent[label] = spent.get(label, 0.0) + \
                     float(s.get("kbps") or 0) * 1000.0 / 8.0
             live.remove(s)
 
     # ---- then anything already placed, before guessing again ----------------
-    for s in list(live):
+    #
+    # A LOCK HAS TO BE ABLE TO NOTICE IT WAS WRONG, and the test has to account
+    # for the disk being SHARED. The first version asked only "is my disk
+    # reading enough for me?", which the second stream on a wrongly-shared disk
+    # always passes - the disk really is reading that much, for somebody else.
+    # That is exactly how Erik's two viewers both sat on NU-DRIVE-10 while the
+    # host had them on NU-DRIVE-10 and NU-DRIVE-0, and why the check as first
+    # written never fired once.
+    #
+    # Biggest first, spending the disk down as we go, so the second stream on a
+    # disk is judged on what is LEFT. Miss that often enough in a row and the
+    # lock is dropped and re-derived from what is true now.
+    #
+    # An exact lock is never questioned - it came from the file's own location
+    # rather than from arithmetic - and neither is a paused stream, because
+    # reading nothing is precisely what it should be doing.
+    for s in sorted(list(live), key=lambda x: -float(x.get("kbps") or 0)):
         ent = _locked(s)
         if not ent:
             continue
         label = ent["disk"]
+        firm = ent.get("how") in ("exact", "host") or _paused(s)
+        if not firm:
+            want = float(s.get("kbps") or 0) * 1000.0 / 8.0
+            left = (float((disks.get(label) or {}).get("read_bps") or 0)
+                    - spent.get(label, 0.0))
+            if want > 0 and left < want * 0.25:
+                ent["miss"] = int(ent.get("miss") or 0) + 1
+                if ent["miss"] >= _LOCK_MAX_MISS:
+                    _VIEWER_LOCK.pop(_session_id(s), None)
+                continue                 # leave it for the matching below
+            ent["miss"] = 0
         d = _place(label, s, False,
                    "held from when this session was first placed"
                    + (f" ({ent['how']})" if ent.get("how") else ""))
@@ -889,9 +958,20 @@ def infer_viewers(disks: dict) -> dict:
             if left < want * 0.6 or left > want * 8.0:
                 continue
             err = abs(left - want) / want
-            if best_err is None or err < best_err:
-                best, best_err = label, err
+            # A FRESH SPINDLE BEATS A CROWDED ONE ON A TIE, and this is what
+            # stacked both of Erik's viewers onto NU-DRIVE-10. The upward band
+            # is generous on purpose - Plex reads ahead in bursts - which also
+            # means one disk reading 10 MB/s can "explain" every stream in the
+            # house, and being matched first makes it the answer for all of
+            # them. With twelve spindles, two people watching different things
+            # are usually on two different disks, so piling onto one should
+            # have to be clearly the better fit rather than merely an allowed
+            # one.
+            score = err + (0.35 if spent.get(label) else 0.0)
+            if best_err is None or score < best_err:
+                best, best_err = label, score
         if best:
+            best_err = abs((cands[best] - spent.get(best, 0.0)) - want) / want
             spent[best] = spent.get(best, 0.0) + want
             _place(best, s, False, "its rate matches what this disk is reading",
                    best_err)

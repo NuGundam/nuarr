@@ -1692,7 +1692,10 @@ def _peer_disk(rows: list[dict]) -> list[dict]:
         out = []
         for s in rows:
             if not (s.get("disk") or "").strip():
-                told = peer.get(str(s.get("key") or "").strip())
+                # BOTH SPELLINGS. These rows carry session_key; the endpoint
+                # that publishes them renames it to key. Reading only one of
+                # the two matched nothing at all - see hostio.session_key().
+                told = peer.get(hostio.session_key(s))
                 if told:
                     s = dict(s, disk=told, disk_from="host")
             out.append(s)
