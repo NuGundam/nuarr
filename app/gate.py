@@ -563,6 +563,16 @@ def session_floor(s: dict, base: float) -> float:
         tb = throttle_buffer_s()
         if tb and tb > 0:
             floor = min(floor, tb * THROTTLE_FRACTION)
+    # A FLOOR TALLER THAN THE REST OF THE FILE CAN NEVER BE MET. With 34
+    # seconds of episode left, demanding 49 banked - and 74 to resume - is a
+    # sentence, not a threshold: Erik's card read "0s ahead - Nuarr paused
+    # until 72s" through the entire final minute, waiting for a buffer the
+    # credits made impossible. The most a client can ever hold is what has
+    # not been played yet, so the floor shrinks with the file and reaches
+    # zero as the end arrives - which also makes the buffered-to-the-end
+    # test above a limit this line approaches rather than a separate cliff.
+    if dur:
+        floor = min(floor, max(0.0, dur - off - FULLY_BUFFERED_SLOP_S))
     # Whole seconds. A floor of 35.3 is false precision - the measurement it is
     # compared against is worth a second or two at best - and it propagates
     # into the axis labels as 105.89999999999999.
@@ -1189,6 +1199,58 @@ _CLIENT_CAP_BYTES: dict[str, float] = {}
 # The peak LEAD actually observed is the right estimate of capacity, because
 # it is the buffer level itself rather than a floor on it.
 _CLIENT_PEAK_BYTES: dict[str, float] = {}
+
+# WHAT WAS LEARNED SURVIVES A RESTART, because a restart is when it is needed
+# most. Everything above is measured patiently - a coast takes minutes to
+# prove itself - and it all lived in memory, so every nuarr restart (and this
+# machine restarts on every update) threw the education away. The next poll
+# then found sessions "already running when nuarr started": unanchored, no
+# capacity on record, so the card fell back to "measuring client buffer" and
+# the full scaled floor - and the queue got paused on behalf of a client that
+# had demonstrated three minutes of headroom an hour earlier. Erik's laptop
+# hit exactly this: a healthy direct play read "0s ahead - Nuarr paused"
+# because the restart had erased everything the client had ever proven.
+#
+# Written through the kv table on every learn event - they are rare, a few per
+# session at most - and read back once at import. The maps stay authoritative
+# in memory; the kv copy is only the memory of them.
+def _caps_save() -> None:
+    try:
+        from .db import kv_set
+        kv_set("plex_client_caps", json.dumps({
+            "cap": _CLIENT_CAP, "cap_bytes": _CLIENT_CAP_BYTES,
+            "peak_bytes": _CLIENT_PEAK_BYTES}))
+    except Exception:                                        # noqa: BLE001
+        pass
+
+
+def _caps_load() -> None:
+    try:
+        from .db import kv_get
+        d = json.loads(kv_get("plex_client_caps") or "{}")
+        for src, dst in (("cap", _CLIENT_CAP),
+                         ("cap_bytes", _CLIENT_CAP_BYTES),
+                         ("peak_bytes", _CLIENT_PEAK_BYTES)):
+            for k, v in (d.get(src) or {}).items():
+                try:
+                    dst[k] = max(dst.get(k, 0.0), float(v))
+                except (TypeError, ValueError):
+                    continue
+        if _CLIENT_CAP or _CLIENT_PEAK_BYTES:
+            joblog.log(f"plex: remembered buffer capacities for "
+                       f"{len(set(_CLIENT_CAP) | set(_CLIENT_PEAK_BYTES))} "
+                       f"client(s) from before the restart", "debug")
+    except Exception:                                        # noqa: BLE001
+        pass
+
+
+# The last peak per client that reached the kv copy, so a 2% wobble does not
+# cost a write per poll. Not persisted itself - it is bookkeeping about
+# persistence.
+_PEAK_SAVED: dict[str, float] = {}
+
+_caps_load()
+
 # Below this the peak is still filling and says nothing about the ceiling.
 PEAK_MIN_BYTES = 32 * 1024 * 1024
 # And no cap may reduce the floor below this, whatever it thinks it has seen.
@@ -1419,6 +1481,7 @@ def _estimate_client_leads(sessions: list[dict]) -> None:
             ran = st["last_off"] - st["coast_off"]
             if ran >= COAST_TEACH_MIN_S and ran > _CLIENT_CAP.get(client, 0.0):
                 _CLIENT_CAP[client] = ran
+                _caps_save()
                 joblog.log(f"plex: learned {client} buffers about "
                            f"{ran/60:.1f} min ahead (played that far without "
                            f"fetching)", "debug")
@@ -1436,6 +1499,7 @@ def _estimate_client_leads(sessions: list[dict]) -> None:
                 by = ran * float(br) * 1000.0 / 8.0
                 if by > _CLIENT_CAP_BYTES.get(client, 0.0):
                     _CLIENT_CAP_BYTES[client] = by
+                    _caps_save()
                     joblog.log(f"plex: {client} held about {by/1048576:.0f} MB "
                                f"({ran:.0f}s at {float(br)/1000:.1f} Mbps)",
                                "debug")
@@ -1495,6 +1559,7 @@ def _estimate_client_leads(sessions: list[dict]) -> None:
                     _CLIENT_CAP_BYTES[client] = max(
                         _CLIENT_CAP_BYTES.get(client, 0.0),
                         coasted * float(br) * 1000.0 / 8.0)
+                _caps_save()
                 s["lead_outlasted"] = 1
             else:
                 lead = max(0.0, cap - coasted)
@@ -1949,6 +2014,11 @@ def check_plex() -> Reason:
             _by = _ld * _br * 1000.0 / 8.0
             if _by > _CLIENT_PEAK_BYTES.get(_cl, 0.0):
                 _CLIENT_PEAK_BYTES[_cl] = _by
+                # Every reading can nudge this; persist only meaningful jumps,
+                # or the kv write would run on most polls for nothing.
+                if _by > _PEAK_SAVED.get(_cl, 0.0) * 1.25:
+                    _PEAK_SAVED[_cl] = _by
+                    _caps_save()
 
     worst: dict[str, tuple[float, float, float]] = {}
     for s in active:
