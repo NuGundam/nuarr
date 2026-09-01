@@ -10640,13 +10640,18 @@ function hostIoRows(){
   if(!_hostIo || _hostIo.local) return null;
   const h=(_hostIo.hosts||[])[0];
   if(!h || !h.ok) return null;
-  const ds=h.disks||{}, vw=h.viewers||{};
+  // FILE COUNTS, IF THE HOST WILL SAY. Blank on a share because counting means
+  // walking, and walking one of these disks reached 114,894 entries in 25
+  // seconds without finishing - locally. The machine holding them has already
+  // done that work, so it is asked rather than repeated. Empty when the host
+  // is not running nuarr, which leaves the column exactly as it is today.
+  const ds=h.disks||{}, vw=h.viewers||{}, fc=h.file_counts||{};
   // NO NAME FILTER. The host already decided what belongs here by handing back
   // only its letterless volumes; matching on "NU-DRIVE" would have been one
   // person's labelling baked into everyone's install.
   const rows=Object.keys(ds).map(n=>{
     const d=ds[n], size=d.size||0, free=d.free||0, v=vw[n];
-    return {pool_disk:n, n:null, remote:true,
+    return {pool_disk:n, n:(fc[n]!=null?fc[n]:null), remote:true,
             total:size, used:Math.max(0,size-free), free:free,
             // Rounded here, like the server rounds its own: the raw quotient
             // printed as "53.68304107847117% full", which is a number pretending

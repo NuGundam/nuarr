@@ -507,6 +507,50 @@ def disks(server: str = "") -> dict:
     return dict(hit or {})
 
 
+# FILE COUNTS PER DISK, ASKED RATHER THAN WALKED.
+#
+# The panel's FILES column is blank on a machine that reaches the pool over a
+# share, and it cannot be filled the obvious way: counting means walking, and
+# walking one of these disks locally reached 114,894 entries in 25 seconds
+# without finishing. Over SMB that is the same walk the remote scan is already
+# stuck doing - it is why the header said 252 files.
+#
+# But the machine with the disks attached has already done that work. If it is
+# also running nuarr it will answer with a count per disk in one request, and
+# the numbers are the same numbers by construction because they come from the
+# same scan the panel would have been showing locally.
+#
+# Entirely optional. No nuarr at the other end, or a different port, and the
+# column stays as blank as it is today - nothing else changes and nothing
+# waits on it.
+_PEER: dict = {}          # server -> {"at": float, "counts": {disk: n}}
+_PEER_TTL = 300.0
+
+
+def peer_counts(server: str) -> dict:
+    """disk -> file count, from a nuarr running on the machine that has them."""
+    now = time.time()
+    ent = _PEER.get(server)
+    if ent and now - ent["at"] < _PEER_TTL:
+        return ent["counts"]
+    counts: dict = {}
+    try:
+        import urllib.request
+        url = f"http://{server}:8770/api/summary"
+        with urllib.request.urlopen(url, timeout=20) as r:
+            d = json.load(r)
+        for row in (d.get("disks") or []):
+            lbl = row.get("pool_disk") or row.get("disk")
+            if lbl and row.get("n") is not None:
+                counts[lbl] = int(row["n"] or 0)
+    except Exception:                                        # noqa: BLE001
+        # Silent: a host that is not running nuarr is the normal case, not a
+        # fault, and logging it every five minutes would be noise.
+        counts = {}
+    _PEER[server] = {"at": now, "counts": counts}
+    return counts
+
+
 def infer_viewers(disks: dict) -> dict:
     r"""Guess which spindle each viewer is reading from. A GUESS, and labelled.
 
@@ -681,5 +725,7 @@ def state() -> dict:
                       if d.get("good_at") else None),
             "disks": d.get("disks") or {},
             "viewers": infer_viewers(d.get("disks") or {}),
+            # Blank unless the host is also running nuarr - see peer_counts().
+            "file_counts": peer_counts(s),
         })
     return out

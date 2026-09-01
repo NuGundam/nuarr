@@ -33,8 +33,24 @@ TTL_S = 1800.0
 _CACHE: dict = {"at": 0.0, "n": 0, "bytes": 0, "by_arr": {}, "running": False}
 
 
+def _arr_set() -> tuple:
+    """Which arrs are enabled right now, as a comparable key."""
+    return tuple(sorted(
+        c.name for c in (SETTINGS.arrs or []) if getattr(c, "enabled", True)))
+
+
 def cached() -> dict:
-    """The last answer, without asking. Never blocks."""
+    r"""The last answer, without asking. Never blocks.
+
+    AN ANSWER ABOUT A DIFFERENT SET OF ARRS IS NOT AN OLD ANSWER, IT IS A
+    WRONG ONE. Erik added Sonarr to a machine that had only Radarr, and the
+    header went on reporting 2,042 files as authoritative for another
+    twenty-five minutes - the cache was inside its half-hour TTL and had no
+    idea the question had changed underneath it. Time is the wrong test for
+    that; the set of arrs is.
+    """
+    if _CACHE["n"] and _CACHE.get("arrs") != _arr_set():
+        _CACHE.update(n=0, bytes=0, by_arr={}, at=0.0)
     return {"n": _CACHE["n"], "bytes": _CACHE["bytes"],
             "by_arr": dict(_CACHE["by_arr"]),
             "age_s": (round(time.time() - _CACHE["at"], 1)
@@ -81,7 +97,7 @@ async def refresh() -> dict:
         # the local count, which at least knows what it does not know.
         if n and answered == asked and asked:
             _CACHE.update(n=n, bytes=b, by_arr=by, at=time.time(),
-                          asked=asked, answered=answered)
+                          asked=asked, answered=answered, arrs=_arr_set())
         elif n:
             joblog.log(f"library total: only {answered} of {asked} arr(s) "
                        f"answered, so the total would be short - keeping the "
