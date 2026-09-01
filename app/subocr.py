@@ -3090,9 +3090,46 @@ async def run_sweep(source: str = "manual", limit: int | None = None) -> dict:
                 if p.get("typeset_only"):
                     signs += 1
                     SWEEP_STATE["signs"] = signs
-                    _log.log(f"not queueing OCR for {p['title']} - its picture "
-                             f"subtitles are typeset signs; the planner will "
-                             f"burn them in instead", "info")
+                    # QUEUE THE BURN, do not just predict it. This line used to
+                    # say "the planner will burn them in instead" and stop -
+                    # and the planner only sees a file when something sends it
+                    # through the pipeline, which for a file already at state
+                    # 'done' is never. Measured on Erik's library: twenty-four
+                    # typeset files sat at "waiting for a burn to be planned"
+                    # across every six-hour sweep, each one re-screened, set
+                    # aside, and left - a bucket with no drain, refilled on
+                    # schedule.
+                    #
+                    # The plan builder already does the right thing on its own:
+                    # rules honours typeset_rels(), picks the measured track,
+                    # sets burn_index and forces the encode. All it ever needed
+                    # was a job. Skipped only when a transcode has ALREADY
+                    # completed since the verdict - the same test _status_of
+                    # uses to call a file done - so this cannot re-burn.
+                    try:
+                        from .db import cursor as _cur
+                        with _cur() as c:
+                            burned = c.execute(
+                                "SELECT 1 FROM jobs WHERE file_id=? AND "
+                                "kind='transcode' AND state='done' LIMIT 1",
+                                (p["file_id"],)).fetchone()
+                        if not burned:
+                            j = await jobs.enqueue(
+                                p["file_id"], p["path"], p["title"],
+                                kind="transcode", priority=95, source=source)
+                            if j:
+                                n += 1
+                                SWEEP_STATE["queued"] = n
+                                _log.log(
+                                    f"queueing a burn for {p['title']} - its "
+                                    f"picture subtitles are typeset signs, so "
+                                    f"the encode will paint them into the "
+                                    f"video", "info")
+                    except ValueError:
+                        pass          # already queued or running - already fine
+                    except Exception as e:                   # noqa: BLE001
+                        _log.log(f"could not queue the burn for {p['title']}: "
+                                 f"{type(e).__name__}: {e}", "warn")
                     continue
                 # SAY WHO ASKED. enqueue() defaults source to "manual", so
                 # every file this sweep queued was labelled as though a person
@@ -3108,6 +3145,117 @@ async def run_sweep(source: str = "manual", limit: int | None = None) -> dict:
                     SWEEP_STATE["queued"] = n
             except Exception:                            # noqa: BLE001
                 continue
+        # ---- BURNS FIRST, MEASURING SECOND. The burn phase runs on what is
+        # already known, so it belongs before the slow backfill above ever
+        # did: with the order reversed, twenty-four ready burns sat behind
+        # seven hours of measuring. Queue what is provable now; let the
+        # backfill grow the provable set for the next sweep. ----
+        #
+        # sweep_pick() selects files that still need OCR, and a typeset file
+        # whose OCR correctly skipped is not one of them - so the twenty-four
+        # files stuck at "waiting for a burn to be planned" were invisible to
+        # the loop above no matter how often it ran. The first attempt at this
+        # fix queued burns inside that loop and cleared exactly none of them,
+        # measured: the sweep picked 5 dialogue files and the backlog of 24
+        # stayed 24.
+        #
+        # This asks the question directly: every measured typeset file with no
+        # transcode done, queued or running, and no hold on it. That is the
+        # same set _status_of() paints as "eligible", by the same tests, so
+        # the panel's count and this queue drain together.
+        try:
+            from .db import cursor as _cur
+            with _cur() as c:
+                burnable = [dict(r) for r in c.execute(
+                    "SELECT s.file_id, f.path, f.title, f.library "
+                    "  FROM sub_shape s JOIN files f ON f.id = s.file_id "
+                    " WHERE f.state NOT IN ('deleted','duplicate') "
+                    " GROUP BY s.file_id HAVING MAX(s.typeset)=1")]
+                for b in list(burnable):
+                    fid = b["file_id"]
+                    if not enabled_for(b.get("library")):
+                        continue
+                    busy_or_done = c.execute(
+                        "SELECT 1 FROM jobs WHERE file_id=? AND ("
+                        "  state IN ('queued','running') "
+                        "  OR (kind='transcode' AND state='done')) LIMIT 1",
+                        (fid,)).fetchone()
+                    if busy_or_done:
+                        continue
+                    if cap > 0 and n >= cap:
+                        break
+                    try:
+                        j = await jobs.enqueue(fid, b["path"],
+                                               b.get("title") or "",
+                                               kind="transcode", priority=95,
+                                               source=source)
+                        if j:
+                            n += 1
+                            signs += 1
+                            SWEEP_STATE["queued"] = n
+                            SWEEP_STATE["signs"] = signs
+                    except ValueError:
+                        continue     # raced into the queue - already fine
+                    except Exception as e:                   # noqa: BLE001
+                        _log.log(f"could not queue a burn for file {fid}: "
+                                 f"{type(e).__name__}: {e}", "warn")
+        except Exception as e:                               # noqa: BLE001
+            _log.log(f"burn phase failed: {type(e).__name__}: {e}", "warn")
+
+        # ---- MEASURE THE REJECTED, WHICH THE PICK ALSO NEVER SURFACES. ----
+        #
+        # A file whose OCR was rejected for content usually got rejected
+        # BECAUSE its pictures are signs - which is precisely the file that
+        # needs a burn. But sweep_pick() excludes rejected files (correctly:
+        # re-running the OCR would reach the same verdict), so a rejected file
+        # with no shape measurement can never acquire one, and without a
+        # measurement the burn phase below cannot see it. The Conan set proved
+        # it: rejected, verdicts lost, and invisible to every pass forever.
+        #
+        # So rejected files with picture subtitles and no measurement get
+        # measured here - measured only, never queued for OCR. ~15s each, once
+        # per file for the life of the file.
+        try:
+            from .db import cursor as _cur
+            with _cur() as c:
+                unmeasured = [dict(r) for r in c.execute(
+                    "SELECT p.file_id, p.json, f.path, f.title, f.library, "
+                    "       f.season, f.episode "
+                    "  FROM file_probes p JOIN files f ON f.id = p.file_id "
+                    " WHERE COALESCE(f.subocr_state,'')='rejected' "
+                    "   AND f.state NOT IN ('deleted','duplicate') "
+                    "   AND NOT EXISTS (SELECT 1 FROM sub_shape s "
+                    "                    WHERE s.file_id = f.id)")]
+            # BOUNDED PER SWEEP, measured before it was capped: 774 rejected
+            # files carried no measurement, at ~38 seconds each - seven hours
+            # in one pass, with the sweep buttons disabled throughout and the
+            # burns queueing only at the end. Fifty a sweep is about half an
+            # hour of background reading, and the burn phase above has already
+            # queued everything measurable, so nothing waits on this backfill
+            # except more backfill.
+            measured_now = 0
+            for r in unmeasured:
+                if measured_now >= 50:
+                    break
+                if not enabled_for(r.get("library")):
+                    continue
+                try:
+                    d = json.loads(r["json"])
+                except Exception:                            # noqa: BLE001
+                    continue
+                if not select_targets(d, r.get("library")):
+                    continue
+                SWEEP_STATE["now"] = (r.get("title") or "")[:60]
+                pk = {"file_id": r["file_id"], "path": r["path"],
+                      "title": r.get("title") or "", "probe": d,
+                      "library": r.get("library"),
+                      "ep": ep_label(r.get("season"), r.get("episode"))}
+                await asyncio.to_thread(screen_for_typeset, pk)
+                measured_now += 1
+        except Exception as e:                               # noqa: BLE001
+            _log.log(f"rejected-measure phase failed: "
+                     f"{type(e).__name__}: {e}", "warn")
+
         _SWEEP["last"] = time.time()
         _SWEEP["queued_total"] += n
         _BACKLOG["n"] = None                 # it just changed; do not serve it

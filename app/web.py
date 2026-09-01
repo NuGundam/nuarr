@@ -21300,7 +21300,7 @@ async function shapeLoad(){
       <span style="color:#6fd08c"><b>${fmt(s.dialogue||0)}</b> <span class="dim">dialogue — read as text</span></span>
       ${stChip('processing','being read now','var(--acc)')}
       ${stChip('queued','queued','#b48bf2')}
-      ${stChip('eligible','due on a later sweep','var(--dim)')}
+      ${stChip('eligible','waiting to be queued','var(--dim)')}
       ${stChip('held','not converting — rejected or switched off','var(--warn)')}
       <span id="shapeHold" class="dim" style="font-size:11px;${held?'':'display:none'}">
         · paused while you read — scroll back to the top to resume</span>

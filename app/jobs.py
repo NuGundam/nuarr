@@ -761,6 +761,35 @@ def cache_probe(file_id: int, data: dict) -> None:
               if s.get("codec_type") == "video"), {})
     fmt = data.get("format", {})
     now = time.time()
+    # SAME LAYOUT, SAME VERDICTS. The invalidations below exist because a
+    # REWRITE moves track numbers, and a verdict like "rel 0 is typeset"
+    # describes a slot. But this function runs on every probe, and most probes
+    # are of unchanged bytes - enqueue() probes before planning, the CLI
+    # probes, a requeue probes. Wiping the measurements each time destroyed
+    # exactly the evidence the plan was about to use: queueing a burn for a
+    # typeset file probed it, the probe erased the typeset verdicts, the
+    # planner then found no typeset tracks and concluded there was nothing to
+    # do - and twenty-four files were marked done with their verdicts gone,
+    # by the very code that meant to fix them.
+    #
+    # So the layout is compared first: the ordered list of (codec_type,
+    # codec_name) per stream. Identical layout means the slots still mean what
+    # they meant, and the verdicts stand. Any difference - a track dropped,
+    # added, or transcoded - and both sets of verdicts are dropped exactly as
+    # before. No old probe stored counts as changed, because there is nothing
+    # to compare against and stale verdicts are the worse failure.
+    def _layout(d: dict) -> list:
+        return [(s.get("codec_type") or "", s.get("codec_name") or "")
+                for s in (d.get("streams") or [])]
+    layout_changed = True
+    with cursor() as cur:
+        old_row = cur.execute("SELECT json FROM file_probes WHERE file_id=?",
+                              (file_id,)).fetchone()
+    if old_row and old_row["json"]:
+        try:
+            layout_changed = _layout(json.loads(old_row["json"])) != _layout(data)
+        except Exception:                                    # noqa: BLE001
+            layout_changed = True
     with cursor() as cur:
         cur.execute(
             "UPDATE files SET probed_at=?, video_codec=?, height=?, "
@@ -782,6 +811,8 @@ def cache_probe(file_id: int, data: dict) -> None:
     # at a different track, so it is deleted rather than left to rot: seven
     # TaleSpin episodes were reported as mislabelled because a "track 0 is
     # Chinese" result survived a remux that removed sixteen tracks.
+    if not layout_changed:
+        return
     try:
         from . import audiolang
         audiolang.invalidate(file_id)
