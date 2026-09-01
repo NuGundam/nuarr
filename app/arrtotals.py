@@ -30,7 +30,23 @@ from . import joblog
 # 28 seconds of API calls, and the answer moves when an import lands. Half an
 # hour is far longer than an import cycle and far shorter than a scan.
 TTL_S = 1800.0
+# ON A MACHINE THAT CAN SEE THE DISKS, THIS IS A COMPARISON AND NOT THE ANSWER.
+# There the local walk is the truth and the arr total exists only to say how far
+# apart the two are - a number that moves when an import lands, which is hours,
+# not half-hours. Measured cost of one pass on Erik's box: Sonarr 27.0s, Radarr
+# 1.0s. Paying that every thirty minutes to refresh a comparison would be twenty
+# minutes of API traffic a day for a figure nobody is waiting on.
+LOCAL_TTL_S = 21600.0
 _CACHE: dict = {"at": 0.0, "n": 0, "bytes": 0, "by_arr": {}, "running": False}
+
+
+def _ttl() -> float:
+    """How long an answer stays good, which depends on who is asking."""
+    try:
+        from . import hostio
+        return TTL_S if hostio.servers() else LOCAL_TTL_S
+    except Exception:                                        # noqa: BLE001
+        return TTL_S
 
 
 def _arr_set() -> tuple:
@@ -56,7 +72,7 @@ def cached() -> dict:
             "age_s": (round(time.time() - _CACHE["at"], 1)
                       if _CACHE["at"] else None),
             "fresh": bool(_CACHE["at"] and
-                          time.time() - _CACHE["at"] < TTL_S)}
+                          time.time() - _CACHE["at"] < _ttl())}
 
 
 async def refresh() -> dict:
@@ -111,27 +127,38 @@ async def refresh() -> dict:
 async def watch() -> None:
     r"""Keep the total current, but only where it is needed.
 
-    A machine with the storage attached counts faster by walking it, so this
-    stays quiet there rather than making API calls nobody will read.
+    WHY IT NOW RUNS EVERYWHERE. It used to return immediately on a machine with
+    the storage attached, on the reasoning that the local walk is faster and
+    truer - which is right about the HEADLINE and wrong about the question
+    underneath it. "How many files do the arrs manage, and how many of those has
+    nuarr got hold of?" cannot be answered by a machine that only ever asks
+    itself, and on the attached pool that gap is the more interesting number:
+    Erik's box was 39,634 to 39,596, and the 38 turned out to be two series
+    imported minutes earlier and not yet walked. A library that is quietly one
+    series behind looks identical to one that is not, unless something asks.
+
+    It asks far less often there, though - see LOCAL_TTL_S. Where the walk is
+    the headline this is a footnote, and footnotes do not need refreshing every
+    half hour.
     """
     import asyncio
 
-    from . import hostio, schedules
+    from . import schedules
     # Give the first scan a chance; if it turns out to be fast, this is never
     # needed and never runs.
     await asyncio.sleep(120)
-    if not hostio.servers():
-        return                       # local storage - the scan is the truth
     schedules.register(
-        "arrtotals", "Library total from the arrs", "Library", TTL_S,
+        "arrtotals", "Library total from the arrs", "Library", _ttl(),
         what="Asks Sonarr and Radarr how many files the library holds and how "
-             "much space they take. Used only when the library is reached over "
-             "the network, where walking the share to count is far slower than "
-             "asking the service that already knows.")
+             "much space they take. On network storage this is the headline "
+             "total, because walking the share to count is far slower than "
+             "asking the service that already knows. On local storage it is the "
+             "comparison against nuarr's own walk, so it runs every six hours "
+             "rather than every thirty minutes.")
     while True:
         try:
             d = await refresh()
             schedules.beat("arrtotals", f"{d['n']:,} files")
         except Exception as e:                               # noqa: BLE001
             joblog.log(f"library total: {type(e).__name__}: {e}", "warn")
-        await asyncio.sleep(TTL_S)
+        await asyncio.sleep(_ttl())

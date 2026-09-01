@@ -2510,15 +2510,35 @@ def _summary_impl():
     # the arrs report - and only on remote storage, where walking is the slow
     # path. A settled library differs from the arrs by a rounding error and
     # keeps its own number, which is the one that knows about unmanaged files.
+    #
+    # BOTH NUMBERS SURVIVE NOW, whichever one gets to be the headline. The
+    # substitution above used to be the whole story, and it threw away the more
+    # interesting half: what the arrs manage and what nuarr has actually got
+    # hold of are different questions, and the DIFFERENCE is the answer to
+    # "is anything not being looked after?". On the attached pool it was 38 -
+    # two series imported minutes earlier and not yet walked. Nothing was
+    # wrong, but nothing could have told you that either.
+    mine = int(totals["n"] or 0)
+    totals["mine"] = mine
+    totals["mine_bytes"] = int(totals["bytes"] or 0)
     try:
         from . import arrtotals, hostio
         at = arrtotals.cached()
-        if at.get("n") and hostio.servers():
-            mine = int(totals["n"] or 0)
-            if mine < at["n"] * 0.8:
-                totals = {"n": at["n"], "bytes": at["bytes"],
-                          "from_arrs": True, "scanned": mine,
-                          "age_s": at.get("age_s")}
+        totals["arrs"] = int(at.get("n") or 0)
+        totals["arr_bytes"] = int(at.get("bytes") or 0)
+        totals["by_arr"] = at.get("by_arr") or {}
+        totals["arrs_age_s"] = at.get("age_s")
+        # nuarr's own count, split the same way the arrs split theirs, so the
+        # two columns in Libraries are the same question asked twice and not
+        # two different questions printed side by side.
+        totals["mine_by_arr"] = {
+            r["arr_name"]: {"n": int(r["n"] or 0), "bytes": int(r["bytes"] or 0)}
+            for r in _rows("SELECT arr_name, COUNT(*) n, SUM(size) bytes "
+                           "FROM files WHERE state!='deleted' AND arr_name IS "
+                           "NOT NULL GROUP BY arr_name")}
+        if at.get("n") and hostio.servers() and mine < at["n"] * 0.8:
+            totals.update(n=at["n"], bytes=at["bytes"], from_arrs=True,
+                          scanned=mine, age_s=at.get("age_s"))
     except Exception:                                    # noqa: BLE001
         pass
     # Split unmanaged files by size. Small ones are extras (OP/ED, AMVs,
@@ -7031,9 +7051,42 @@ def _libraries_impl():
     nxt = None
     if every > 0:
         nxt = (STATE["scan"].get("last") or time.time()) + every * 60
+    # THE SAME QUESTION ASKED TWICE, side by side. The table below counts what
+    # nuarr holds; this counts what the arrs hold. Printing only the first left
+    # the obvious follow-up - "and is that all of them?" - with nowhere to go
+    # but a different page.
+    arrs = {}
+    try:
+        from . import arrtotals
+        at = arrtotals.cached()
+        mine = {r["arr_name"]: {"n": int(r["n"] or 0),
+                                "bytes": int(r["bytes"] or 0)}
+                for r in _rows("SELECT arr_name, COUNT(*) n, SUM(size) bytes "
+                               "FROM files WHERE state!='deleted' AND arr_name "
+                               "IS NOT NULL GROUP BY arr_name")}
+        for name, d in (at.get("by_arr") or {}).items():
+            m = mine.get(name) or {"n": 0, "bytes": 0}
+            arrs[name] = {"arr_n": int(d.get("n") or 0),
+                          "arr_bytes": int(d.get("bytes") or 0),
+                          "mine_n": m["n"], "mine_bytes": m["bytes"]}
+        # AN ARR THAT HAS NOT BEEN ASKED YET IS NOT AN ARR THAT FAILED. The
+        # totals loop deliberately waits two minutes after start-up so the
+        # first scan gets a clear run, and during that window every arr looks
+        # exactly like one that refused to answer. Only fill in the missing
+        # ones once there has been a real answer to compare against; before
+        # that the whole comparison stays off the page, which is honest about
+        # having nothing to say rather than inventing a failure.
+        if at.get("age_s") is not None:
+            for name, m in mine.items():
+                arrs.setdefault(name, {"arr_n": 0, "arr_bytes": 0,
+                                       "mine_n": m["n"],
+                                       "mine_bytes": m["bytes"]})
+    except Exception:                                        # noqa: BLE001
+        arrs = {}
     return {"libraries": out, "scan": STATE["scan"],
             "progress": scanner.progress(),   # refreshes pct/eta as it is read
             "phases": [{"key": k, "label": v} for k, v in scanner.PHASES],
+            "arrs": arrs, "arrs_age_s": (at.get("age_s") if arrs else None),
             "scan_every_min": every, "next_scan_at": nxt}
 
 
@@ -10447,8 +10500,33 @@ async function loadAll(){
       + ` have it indexed - walking the share would take hours. nuarr has`
       + ` walked ${fmt(s.totals.scanned||0)} of them so far.">(from the arrs)</span>`
     : '';
+  // TWO NUMBERS, AND THE ONE THAT MATTERS IS THE DIFFERENCE. "What the arrs
+  // manage" and "what nuarr has hold of" are separate questions and the header
+  // could only ever answer whichever one it had picked as the headline. Said
+  // as a sentence, the gap needs no arithmetic from the reader: 39,634 against
+  // 39,596 is 38 files imported and not yet walked, and that is a fact about
+  // the library rather than a subtraction the reader has to notice.
+  window.arrGap = function(t){
+    const a=t.arrs||0, m=t.mine||0, gap=a-m;
+    if(!a) return '';
+    if(t.from_arrs)
+      return `<span class="dim" title="nuarr is still walking the share; the`
+        + ` arrs already have it indexed">nuarr has walked ${fmt(m)}</span>`;
+    if(gap>0)
+      return `<span class="dim">arrs manage ${fmt(a)} · </span>`
+        + `<span class="warn" title="tracked by an arr but not in nuarr's index`
+        + ` yet - normally a recent import waiting for the next scan">`
+        + `${fmt(gap)} not walked yet</span>`;
+    if(gap<0)
+      return `<span class="dim">arrs manage ${fmt(a)} · ${fmt(-gap)} here that`
+        + ` no arr tracks</span>`;
+    return `<span class="dim" title="nuarr's walk and the arrs' index agree`
+      + ` exactly">arrs manage ${fmt(a)} · in step</span>`;
+  };
+  const gapTxt = arrGap(s.totals);
   setHTML(document.getElementById('sub'),
     fmt(s.totals.n)+' files'+tf+' · '+gb(s.totals.bytes)+' · '
+    + (gapTxt ? gapTxt+' · ' : '')
     + s.disks.length+' pool disks' + svTxt);
 
   const byState=Object.fromEntries(s.states.map(x=>[x.state,x]));
@@ -10483,7 +10561,12 @@ async function loadAll(){
        ${q?`onclick='drill(${JSON.stringify(q)})'`:''}
        data-k="${esc(k)}"><div class="k">${k}</div>
       <div class="v">${v}</div><div class="s">${sub||''}</div></div>`);
-  add('Total files',fmt(s.totals.n),gb(s.totals.bytes),{t:'All files'});
+  // The tile keeps the headline as its big number - on a share that is the
+  // arrs' total, because "252 files" sat in this slot for hours - and carries
+  // the other half underneath rather than in a tooltip nobody hovers.
+  add('Total files',fmt(s.totals.n),
+      gb(s.totals.bytes) + (gapTxt ? ' · '+gapTxt : ''),
+      {t:'All files'});
   add('Eligible',fmt((byState.eligible||{}).n||0),'past hold, ready to process',
       {state:'eligible',t:'Eligible'});
   add('Held (new)',fmt((byState.new||{}).n||0),'still settling',{state:'new',t:'Held'});
@@ -11932,7 +12015,39 @@ async function loadLibs(){
         <button onclick="browse('${esc(l.name)}')"
               title="list this library's folders and files, with what has been processed"
               >Browse</button>
-      </td></tr>`).join('')+'</table>';
+      </td></tr>`).join('')+'</table>'
+    // WHAT THE ARRS MANAGE, UNDER WHAT NUARR HAS. The table above is nuarr's
+    // own index broken down by library, which is a complete answer to "what am
+    // I looking after" and no answer at all to "is that everything?". The arrs
+    // are the other half, and they are the half that knows about a file
+    // imported four minutes ago.
+    //
+    // Per arr rather than per library: nuarr's libraries are its own folders
+    // and mean nothing to Sonarr, but every row nuarr holds carries the arr it
+    // came from, so keying on that compares like with like instead of putting
+    // two different questions in adjacent columns.
+    + (Object.keys(d.arrs||{}).length ? `<div class="dim"
+        style="font-size:11px;margin-top:8px;line-height:1.7">`
+      + Object.keys(d.arrs).sort().map(k=>{
+          const a=d.arrs[k], gap=(a.arr_n||0)-(a.mine_n||0);
+          if(!a.arr_n)
+            return `<div><b>${esc(k)}</b> · <span class="warn">did not answer`
+              + `</span> · nuarr holds ${fmt(a.mine_n)} from it</div>`;
+          const tail = gap>0
+            ? ` · <span class="warn" title="tracked by ${esc(k)} but not in`
+              + ` nuarr's index yet - normally a recent import waiting for the`
+              + ` next scan">${fmt(gap)} not walked yet</span>`
+            : (gap<0
+               ? ` · ${fmt(-gap)} here that ${esc(k)} no longer tracks`
+               : ' · <span title="every file this arr manages is in nuarr\'s'
+                 + ' index">in step</span>');
+          return `<div><b>${esc(k)}</b> manages ${fmt(a.arr_n)} files`
+            + ` <span class="dim">(${gb(a.arr_bytes)})</span>`
+            + ` · nuarr has ${fmt(a.mine_n)}${tail}</div>`;
+        }).join('')
+      + (d.arrs_age_s!=null && d.arrs_age_s>90
+          ? `<div class="dim">asked ${hms(d.arrs_age_s)} ago</div>` : '')
+      + `</div>` : '');
   // Put an open browser back after the table is rebuilt, or it vanishes every
   // 15 s - and every 2 s during a scan, which is exactly when you are most
   // likely to be watching a folder fill up.
