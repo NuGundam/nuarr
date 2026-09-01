@@ -4580,6 +4580,39 @@ async def api_arrgap_mode(mode: str):
     return arrgap.cached()
 
 
+@app.get("/api/observer")
+def api_observer():
+    """Whether this machine changes files or only watches them, and why."""
+    from . import observer
+    return observer.state()
+
+
+@app.post("/api/observer/mode")
+async def api_observer_mode(mode: str):
+    """auto detects; observe never queues; full is the real-mode test switch."""
+    import yaml
+    from .config import SETTINGS
+    from . import observer
+    mode = (mode or "").strip().lower()
+    if mode not in ("auto", "observe", "full"):
+        raise HTTPException(400, "mode must be auto, observe or full")
+    p = _config_path()
+    raw = {}
+    if p.exists():
+        try:
+            raw = yaml.safe_load(p.read_text(encoding="utf-8-sig")) or {}
+        except Exception:                                    # noqa: BLE001
+            raw = {}
+    raw["observer_mode"] = mode
+    p.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True),
+                 encoding="utf-8")
+    SETTINGS.observer_mode = mode
+    st = observer.state()
+    joblog.log(f"observer mode set to {mode} - " + st["why"],
+               "warn" if (mode == "full" and st.get("peer_nuarr")) else "info")
+    return st
+
+
 @app.post("/api/arrsync/mode")
 async def api_arrsync_mode(mode: str):
     """manual waits for Put right; auto corrects on the twice-daily sweep."""
@@ -10339,6 +10372,8 @@ input[type=time]::-webkit-calendar-picker-indicator{filter:invert(.75);cursor:po
       <h2>Workers <span id="wtabhint" class="dim" style="font-weight:400"></span></h2>
 <!--SETTINGSPANES-->
       <div id="wSettings">
+        <div id="obsBox" style="display:none;padding:8px 14px;
+             border-bottom:1px solid var(--line);font-size:11.5px"></div>
         <div id="workers"></div>
         <div style="padding:9px 14px;border-top:1px solid var(--line)">
           <button onclick="resetWorkers()"
@@ -19711,6 +19746,57 @@ function kdRows(){
        >showing 800 of ${fmt(rows.length)} — narrow it with the search box</div>`:'');
 }
 
+// ---- observer mode: does this machine change files, or only watch? -------
+//
+// Shown ONLY when it has something to say: on a normal install - the library
+// is this machine's own - the box stays hidden, because a switch nobody
+// should touch is clutter. It appears when the library is another nuarr's
+// pool (the sandbox case), or when a mode has been forced by hand.
+let _obs=null;
+async function loadObserver(){
+  const el=document.getElementById('obsBox');
+  if(!el) return;
+  try{ _obs=await (await fetch('/api/observer')).json(); }
+  catch(e){ return; }
+  obsPaint();
+}
+function obsPaint(){
+  const el=document.getElementById('obsBox');
+  if(!el||!_obs) return;
+  const d=_obs;
+  const interesting = d.peer_nuarr || d.mode!=='auto';
+  el.style.display = interesting ? '' : 'none';
+  if(!interesting) return;
+  const danger = d.mode==='full' && d.peer_nuarr;
+  const seg=['auto','observe','full'].map(m=>`<button onclick="obsMode('${m}')"
+    title="${m==='auto'
+      ?'Observe when the library belongs to another Nuarr; process normally everywhere else.'
+      :m==='observe'
+      ?'Never change files on this machine, whatever is detected.'
+      :'REAL MODE: queue and run jobs even on another Nuarr\u2019s pool. For testing the whole system - both machines can then process the same files, so watch what it does.'}"
+    style="font-size:11px;padding:2px 10px;border:0;cursor:pointer;
+      background:${d.mode===m?(m==='full'&&d.peer_nuarr?'var(--bad,#f85149)':'var(--acc)'):'transparent'};
+      color:${d.mode===m?'#0b0e13':'var(--dim,#8a97a6)'};
+      font-weight:${d.mode===m?'600':'400'}">${m==='full'?'full (real mode)':m}</button>`).join('');
+  el.innerHTML=`
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <b style="color:${danger?'var(--bad,#f85149)':(d.observing?'#79c0ff':'var(--ok)')}">
+        ${danger?'\u26a0 REAL MODE':(d.observing?'observing':'processing')}</b>
+      <span class="dim">${esc(d.why)}</span>
+      <span style="display:inline-flex;border:1px solid var(--line);
+                   border-radius:5px;overflow:hidden;margin-left:auto">${seg}</span>
+      <span id="obsMsg" class="dim"></span>
+    </div>`;
+}
+async function obsMode(m){
+  const g=document.getElementById('obsMsg'); if(g) g.textContent='saving\u2026';
+  try{
+    _obs=await (await fetch('/api/observer/mode?mode='+encodeURIComponent(m),
+                            {method:'POST'})).json();
+    obsPaint();
+  }catch(e){ if(g) g.textContent='could not change it'; }
+}
+
 // ---- files the arrs manage that Nuarr has no entry for -------------------
 //
 // THE LIST BEHIND THE NUMBER. The header can say "14 to put right"; this is
@@ -25765,6 +25851,11 @@ loadJobs();
 setInterval(loadLogJobs,15000);
 loadLogs(); loadLogJobs();
 loadAll();
+// Once at boot and then slowly: the mode changes when a person changes it or
+// when nuarr appears/vanishes on the file server, neither of which is a
+// per-second event.
+loadObserver();
+setInterval(loadObserver, 60000);
 // ---- portal-wide button feedback -----------------------------------------
 // Preview, Queue, Stop, Requeue and the pool handlers each got a spinner and a
 // clock by hand. There are ~25 more buttons that fire a request and say

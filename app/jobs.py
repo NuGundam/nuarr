@@ -1666,6 +1666,20 @@ async def pump() -> None:
                 await asyncio.sleep(3)
                 continue
 
+            # OBSERVER MODE HOLDS THE QUEUE HERE, at the one door every job
+            # leaves through. Jobs are still discovered and listed - the panels
+            # keep describing what WOULD run - but nothing is claimed. Found
+            # the hard way: a sandbox nuarr on the host's pool had queued five
+            # transcodes and seven OCRs against files the host had already
+            # processed. See observer.py for the whole argument.
+            from . import observer
+            if observer.observing():
+                st_o = observer.state()
+                PAUSED_REASON = ("observing - " + st_o["why"]
+                                 + f" · {queue_depth()} job(s) would run")
+                await asyncio.sleep(10)
+                continue
+
             if queue_depth():
                 st = await gate.status()
                 PAUSED_REASON = None if st.open else st.why()

@@ -367,6 +367,14 @@ class Settings:
     arrgap_mode: str = "manual"
     arrgap_every_h: int = 6              # hours between not-walked checks
 
+    # OBSERVER MODE - whether this machine may CHANGE files, or only watch.
+    # "auto" observes when the library lives on another machine that is itself
+    # running nuarr, and processes normally everywhere else; "observe" and
+    # "full" force it either way. Full on another nuarr's pool is the sandbox's
+    # real-mode test switch, and the UI says loudly when it is on - two
+    # machines processing one library is safe only while somebody watches.
+    observer_mode: str = "auto"
+
     # SUBTITLE OCR - the switches behind Settings -> Subtitle OCR. Defaults
     # match the measured thresholds in subocr.py; the page can move them.
     subocr_auto: bool = True             # queue conversions on a schedule

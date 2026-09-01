@@ -2386,6 +2386,10 @@ def disk_report() -> dict:
     """
     from . import diskload
     rows = diskload.sustained()
+    # Rates from the newest tick, steering from the median - see
+    # diskload.latest() for why the panel and the gate stopped sharing one
+    # number.
+    now = diskload.latest()
     thresh = _tune("disk_busy_pct")
     if not rows:
         return {"disks": [], "thresh": thresh, "window_s": diskload.WINDOW_S,
@@ -2400,27 +2404,31 @@ def disk_report() -> dict:
         if not d:
             continue
         mine = ours.get(k, 0.0)
-        ext = max(0.0, d["bps"] - mine)
+        live = now.get(k) or d
+        ext = max(0.0, live["bps"] - mine)
         busy = d["busy"]
         mr, mw = rw.get(k, (0.0, 0.0))
         out.append({
             "disk": label,
             "busy": round(busy, 1),
-            "bps": d["bps"],
+            "bps": live["bps"],
             "mine_bps": mine,
             "ext_bps": ext,
             # The external half, split. Which way a disk's traffic is going is
             # what says whether it is being read FROM or written TO, and that
             # is the difference between "something is copying off this disk"
             # and "something is filling it".
-            "ext_read_bps": max(0.0, (d.get("read_bps") or 0) - mr),
-            "ext_write_bps": max(0.0, (d.get("write_bps") or 0) - mw),
+            "ext_read_bps": max(0.0, (live.get("read_bps") or 0) - mr),
+            "ext_write_bps": max(0.0, (live.get("write_bps") or 0) - mw),
             "queue": round(d["queue"], 1),
             # HOT means "someone else has this disk", which is the only kind of
             # busy that changes what nuarr does. Same test the gate applies, so
             # a disk flagged here is exactly a disk being steered around.
+            # Judged on the MEDIAN on purpose - hot is a steering decision,
+            # and a one-tick burst must not paint a disk as contended.
             "hot": bool(thresh > 0 and busy >= thresh
-                        and (d["bps"] <= 0 or ext >= d["bps"] * 0.35)),
+                        and (d["bps"] <= 0
+                             or max(0.0, d["bps"] - mine) >= d["bps"] * 0.35)),
             "samples": d.get("samples", 0),
         })
     out.sort(key=lambda d: d["disk"])

@@ -294,6 +294,31 @@ def _median(vals: list[float]) -> float:
     return v[n // 2] if n % 2 else (v[n // 2 - 1] + v[n // 2]) / 2.0
 
 
+def latest() -> dict[str, dict]:
+    r"""The newest sample, raw - what the disks are doing RIGHT NOW.
+
+    WHY THE SANDBOX LOOKED MORE ALIVE THAN THE HOST. Erik noticed the remote
+    panel reacting faster than the local one, and he was right: the sandbox
+    shows per-second deltas straight off the host's counters over DCOM, while
+    the host's own panel showed the 20-second MEDIAN - the shape the gate
+    wants, because one read-ahead burst must not flip a steering decision. A
+    median is deliberately slow to believe anything, which is the right
+    temperament for a gate and the wrong one for a dashboard: an encode
+    finishing showed rates dying over ten seconds instead of now.
+
+    So the two consumers stop sharing one number. The gate keeps sustained();
+    the panel's rate figures come from here, the last tick, at most TICK_S
+    stale. Busy%% stays median on the panel too - it drives the "hot" flag and
+    the steering colour, and those ARE gate decisions shown to a person.
+    """
+    start()
+    with _lock:
+        if not _hist:
+            return {}
+        _at, rows = _hist[-1]
+        return {k: dict(v) for k, v in rows.items()}
+
+
 def sustained() -> dict[str, dict]:
     """Median load per disk across the window - the shape the gate reads.
 
