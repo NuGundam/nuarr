@@ -1429,6 +1429,37 @@ def api_net_forget(server: str):
     return {"ok": True}
 
 
+@app.get("/api/libraries/kind")
+def api_libraries_kind(library: str, kind: str):
+    r"""The titles in one library that carry one content kind.
+
+    THE CHIP WAS A DEAD END. "anime 22,332" is a fact you can read and not a
+    fact you can check - and the interesting half is always WHICH ones, because
+    the number only matters when it disagrees with the folder name. Clicking it
+    now opens the list it was counting.
+
+    Grouped by TITLE rather than by file, because the kind is a property of the
+    series or the film - it comes from the arr's genres - and 22,332 rows of
+    episode filenames would be a list nobody could read. The file count comes
+    along so a title that is one episode looks different from one that is six
+    seasons.
+    """
+    rows = _rows(
+        "SELECT COALESCE(NULLIF(f.title,''), '(untitled)') title, "
+        "       f.arr_name arr, f.arr_parent_id pid, "
+        "       COUNT(*) n, SUM(f.size) bytes, MIN(f.path) path "
+        "  FROM files f "
+        "  JOIN parent_kind k ON k.arr_name=f.arr_name "
+        "   AND k.parent_id=f.arr_parent_id "
+        " WHERE f.state!='deleted' AND f.library=? AND k.kind=? "
+        " GROUP BY f.arr_name, f.arr_parent_id "
+        " ORDER BY n DESC, title", (library, kind))
+    return {"library": library, "kind": kind, "rows": rows,
+            "titles": len(rows),
+            "files": sum(int(r["n"] or 0) for r in rows),
+            "bytes": sum(int(r["bytes"] or 0) for r in rows)}
+
+
 @app.get("/api/libraries/config")
 def api_libraries_config():
     """The configured libraries, with what nuarr actually knows about each."""
@@ -9791,9 +9822,21 @@ tr.logrow td{background:#1c2129;border-bottom:1px solid var(--acc);padding:0 12p
    into anonymous items and strips it, so "NU-DRIVE-10 12.0 MB/s" rendered as
    "NU-DRIVE-1012.0 MB/s" - the disk name and the rate ran together into
    something that read like one wrong number. */
-.xmv{font-size:10.5px;line-height:1.5;letter-spacing:.2px;color:var(--warn);
+/* THE SAME TWO COLOURS THE ROW ALREADY USES. Read is #58a6ff and write is
+   #e3b341 everywhere else in this panel, and a transfer is exactly a read on
+   one disk and a write on another - so the caption on the sending disk is the
+   read colour and the caption on the receiving disk is the write colour, and
+   they match the Nuarr and system figures sitting directly underneath them.
+   One amber for both directions made the two ends of a transfer look like the
+   same event happening twice. */
+.xmv{font-size:10.5px;line-height:1.5;letter-spacing:.2px;
      white-space:nowrap;cursor:help;display:flex;align-items:center;gap:4px}
-.xmv.xmine{color:var(--acc)}
+.xmv.xout{color:#58a6ff}
+.xmv.xin{color:#e3b341}
+/* Whose move it is is a different question from which way it goes, so it gets
+   a different channel: a tag rather than a colour. */
+.xmv .xowner{font-size:9px;letter-spacing:.4px;text-transform:uppercase;
+  opacity:.8;border:1px solid currentColor;border-radius:3px;padding:0 3px}
 .xmv b{font-weight:600}
 .xmv .xarrow{opacity:.75;padding-right:1px}
 /* DIRECTION YOU CAN SEE WITHOUT READING IT. A 10px arrow glyph is a SHAPE, and
@@ -9816,8 +9859,37 @@ tr.logrow td{background:#1c2129;border-bottom:1px solid var(--acc);padding:0 12p
 .xflow b:nth-child(3){animation-delay:calc(var(--dur,1.1s) * .36)}
 /* Mirrored rather than given its own set of delays: flipping the box reverses
    both the glyphs and the order they light up in, so one animation describes
-   both directions and the two can never drift apart. */
-.xflow.xin{transform:scaleX(-1)}
+   both directions and the two can never drift apart. Named xrev, not xin -
+   .xin now means "this disk is receiving" on the caption, and one class
+   holding two unrelated meanings is how a stylesheet starts lying. */
+.xflow.xrev{transform:scaleX(-1)}
+/* A chip you can open should look like one. Same shape as before, plus the
+   affordance - without it the only way to discover the list is to click a
+   thing that has never been clickable. */
+.kchip.kclick{cursor:pointer;user-select:none}
+.kchip.kclick:hover{filter:brightness(1.35)}
+.kdrop{margin-top:6px}
+.kdbox{border:1px solid var(--line);border-radius:6px;overflow:hidden;
+       background:#0f1319;max-width:760px}
+.kdhead{display:flex;gap:8px;align-items:center;padding:5px 8px;
+        background:#161b22;border-bottom:1px solid var(--line);font-size:11.5px;
+        flex-wrap:wrap}
+.kdhead input{flex:1;min-width:120px;font-size:11.5px;padding:2px 6px}
+.kdhead select{font-size:11.5px;padding:1px 4px}
+.kdhead button{font-size:12px;line-height:1;padding:2px 7px}
+/* SCROLLS, and stops well short of the page height. A drawer that grows to
+   1,100 rows pushes every library below it off the screen and turns one row's
+   detail into the whole page. */
+.kdlist{max-height:260px;overflow:auto}
+.kdrow{display:flex;gap:8px;align-items:baseline;padding:2px 10px;
+       font-size:11.5px;border-bottom:1px solid rgba(255,255,255,.04)}
+.kdrow:hover{background:rgba(255,255,255,.03)}
+.kdrow .kdt{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.kdrow .kda{width:52px;flex:none}
+.kdrow .kdn{width:54px;flex:none;text-align:right;
+            font-variant-numeric:tabular-nums}
+.kdrow .kdb{width:66px;flex:none;text-align:right;
+            font-variant-numeric:tabular-nums}
 @keyframes xflowpulse{
   0%{opacity:.18}
   35%{opacity:1}
@@ -10680,19 +10752,27 @@ async function loadAll(){
           .filter(([k])=>k!=='not walked yet' && k!=='written off, but on disk')
           .reduce((n,[,v])=>n+(v.n||0),0);
         return `<span class="dim">arrs manage ${fmt(a)} · </span>`
-          + (fix ? `<span class="warn lnk" onclick="location.href='/settings#arrgap'"`
+          + (fix ? `<span class="warn lnk" onclick="event.stopPropagation();location.href='/settings#arrgap'"`
                  + ` title="nuarr has no usable entry for these and it can fix`
                  + ` that - click to see them">${fmt(fix)} to put right</span>`
                  + (rest?`<span class="dim"> · ${fmt(rest)} accounted for</span>`:'')
-                 : `<span class="dim lnk" onclick="location.href='/settings#arrgap'"`
+                 : `<span class="dim lnk" onclick="event.stopPropagation();location.href='/settings#arrgap'"`
                  + ` title="every one of these is explained - excluded, outside`
                  + ` the libraries, or gone from disk and still in the arr">${
                      fmt(g.total)} accounted for</span>`);
       }
+      // Every one of these links lives inside the Total files tile, which is
+      // itself clickable - so each stops the click from reaching the card, or
+      // the card's own drill runs too and wins the navigation.
+      // THE FALLBACK LEADS TO THE SAME PLACE. It is the same question with a
+        // worse answer - a subtraction rather than a diagnosis - and sending
+        // the reader nowhere because the check has not run yet would be
+        // withholding the one page that can run it.
       return `<span class="dim">arrs manage ${fmt(a)} · </span>`
-        + `<span class="warn" title="tracked by an arr but not in nuarr's index`
-        + ` - the not-walked check has not run yet, so this is the raw`
-        + ` difference rather than a diagnosis">${fmt(gap)} unaccounted for</span>`;
+        + `<span class="warn lnk" onclick="event.stopPropagation();location.href='/settings#arrgap'"`
+        + ` title="tracked by an arr but not in nuarr's index - the check has`
+        + ` not run yet, so this is the raw difference rather than a diagnosis.`
+        + ` Click to open it and press Check now.">${fmt(gap)} unaccounted for</span>`;
     }
     if(gap<0)
       return `<span class="dim">arrs manage ${fmt(a)} · ${fmt(-gap)} here that`
@@ -11458,8 +11538,10 @@ The bar splits it by share of bytes moved — Nuarr ${share(mine)}%, everything 
             const mb = (x.bps||0)/1e6;
             const dur = Math.max(0.45, Math.min(1.8,
                           1.8/(1+Math.log10(1+mb)))).toFixed(2);
-            return `<span class="xmv${x.mine?' xmine':''}" title="${esc(tip)}"
-              ><span class="xflow${x.dir==='out'?'':' xin'}"
+            return `<span class="xmv ${x.dir==='out'?'xout':'xin'}"
+                 title="${esc(tip)}"
+              >${x.mine?'<span class="xowner">Nuarr</span>':''}<span
+                 class="xflow${x.dir==='out'?'':' xrev'}"
                  style="--dur:${dur}s"><b>\u203a</b><b>\u203a</b><b>\u203a</b></span
               ><span>${x.other?esc(x.other):'elsewhere'}</span
               ><b>${mbps(x.bps)}</b></span>`;
@@ -11498,7 +11580,7 @@ The bar splits it by share of bytes moved — Nuarr ${share(mine)}%, everything 
     +`<tbody class="dgrp dpool">
       <tr>
         <td class="mono"><b>POOL</b>${moves.length
-          ? `<div class="xmvs"><span class="xmv${moves.every(m=>m.mine)?' xmine':''}"
+          ? `<div class="xmvs"><span class="xmv" style="color:var(--warn)"
               title="${esc(moves.map(m=>(m.from||'elsewhere')+' \u2192 '
                 +(m.to||'elsewhere')+'  '+mbps(m.bps)
                 +(m.mine?'  (Nuarr)':'')).join('\n'))}">${moves.length} file${
@@ -18175,7 +18257,7 @@ const PANE_OF = {ffmpeg:'ffPane', backup:'bkPane',  rules:'rulesPane',
 // and hid the pane it had just shown. Nothing threw and nothing logged - you
 // clicked Arrs and got an empty page. An alias names a pane plus an intent;
 // it never claims an element of its own.
-const ALIAS_OF = {arrsync:'arrs', audiotitle:'acodec'};
+const ALIAS_OF = {arrsync:'arrs', audiotitle:'acodec', arrgap:'libs'};
 
 // A BLANK PANE IS THE WORST FAILURE MODE THERE IS, because it looks like an
 // empty page rather than a broken one - there is nothing to read, nothing to
@@ -19220,7 +19302,11 @@ async function loadLibsTab(){
     if(!tot) return '<div class="dim sub">no metadata yet — the arrs have not '
                   + 'been read, or nothing here is tracked by them</div>';
     const parts=['anime','animation','live'].filter(k=>seen[k])
-      .map(k=>`<span class="kchip k-${k}">${KL[k]} ${fmt(seen[k])}</span>`);
+      .map(k=>`<span class="kchip k-${k} kclick" role="button" tabindex="0"
+         title="show the titles counted as ${KL[k]} here"
+         onclick="kdOpen('${b64e(l.name)}','${k}')"
+         onkeydown="if(event.key==='Enter')kdOpen('${b64e(l.name)}','${k}')"
+        >${KL[k]} ${fmt(seen[k])}</span>`);
     // ONLY PROMOTIONS ARE WORTH A NOTE, because only promotions change what
     // happens. The first version counted every file whose metadata differed
     // from the folder, which on Anime Shows read "427 of 22,685 not anime" -
@@ -19261,6 +19347,7 @@ async function loadLibsTab(){
       <div class="dim sub mono">${esc(l.path)}</div>
       ${kindLine(l)}
       ${gapLine(l.name)}
+      <div class="kdrop" data-lib="${b64e(l.name)}" style="display:none"></div>
       ${l.exists?'':'<div class="err sub">this folder does not exist — nothing here is being indexed</div>'}</td>
     <td class="dim nb">${esc(l.kind==='movie'?'movies':'shows')}</td>
     <td class="num nb">${fmt(l.files)}</td>
@@ -19313,6 +19400,101 @@ async function loadLibsTab(){
     </div>`;
   loadArrGap();
 }
+// ---- what is behind a kind chip ------------------------------------------
+//
+// THE CHIP WAS A DEAD END. "anime 22,332" is a fact you can read and not one
+// you can check, and the interesting half is always WHICH ones - the number
+// only matters when it disagrees with the folder name. Clicking it now opens
+// the list it was counting, with a search box and a sort, because a list of
+// 1,100 titles you cannot search is a different way of saying nothing.
+let _kd = {lib:null, kind:null, rows:null, q:'', sort:'files', busy:false};
+const KD_LABEL={anime:'anime', animation:'animation', live:'live action'};
+async function kdOpen(libB64, kind){
+  const lib = b64d(libB64);
+  // Clicking the open chip closes it. A chip that only ever opens leaves the
+  // reader hunting for the way back.
+  if(_kd.lib===lib && _kd.kind===kind){ kdClose(); return; }
+  _kd = {lib:lib, kind:kind, rows:null, q:'', sort:'files', busy:true};
+  kdPaint();
+  try{
+    const r = await fetch('/api/libraries/kind?library='+encodeURIComponent(lib)
+                          +'&kind='+encodeURIComponent(kind));
+    const d = await r.json();
+    if(_kd.lib!==lib || _kd.kind!==kind) return;   // clicked elsewhere meanwhile
+    _kd.rows = d.rows||[]; _kd.busy=false;
+  }catch(e){ _kd.rows=[]; _kd.busy=false; _kd.err=String(e); }
+  kdPaint();
+}
+function kdClose(){ _kd={lib:null,kind:null,rows:null,q:'',sort:'files',busy:false};
+                    kdPaint(); }
+function kdSort(v){ _kd.sort=v; kdPaint(true); }
+function kdSearch(v){
+  _kd.q=v;
+  // Repaint the LIST only. Rebuilding the whole panel would recreate the input
+  // and take the caret with it, so every second keystroke landed at the start.
+  kdRows();
+}
+function kdPaint(keepFocus){
+  document.querySelectorAll('.kdrop').forEach(el=>{
+    const lib=b64d(el.dataset.lib||'');
+    if(lib!==_kd.lib){ el.style.display='none'; el.innerHTML=''; return; }
+    el.style.display='';
+    if(_kd.busy){
+      el.innerHTML='<div class="dim" style="padding:6px 2px;font-size:11.5px">'
+        +'<span class="spin" style="width:10px;height:10px;display:inline-block;'
+        +'vertical-align:-1px;margin-right:6px"></span>reading the index…</div>';
+      return;
+    }
+    const rows=_kd.rows||[];
+    el.innerHTML=`
+      <div class="kdbox">
+        <div class="kdhead">
+          <b>${fmt(rows.length)} title${rows.length===1?'':'s'}</b>
+          <span class="dim">counted as ${esc(KD_LABEL[_kd.kind]||_kd.kind)} in
+            ${esc(_kd.lib)}</span>
+          <input id="kdQ" placeholder="search titles…" value="${esc(_kd.q||'')}"
+                 oninput="kdSearch(this.value)" spellcheck="false">
+          <select onchange="kdSort(this.value)">
+            ${[['files','most files'],['title','title A–Z'],
+               ['size','largest first']].map(([v,t])=>
+              `<option value="${v}"${_kd.sort===v?' selected':''}>${t}</option>`).join('')}
+          </select>
+          <button onclick="kdClose()" title="close">×</button>
+        </div>
+        <div class="kdlist" id="kdList"></div>
+      </div>`;
+    kdRows();
+    if(!keepFocus){
+      const q=document.getElementById('kdQ');
+      if(q && _kd.q) q.setSelectionRange(q.value.length, q.value.length);
+    }
+  });
+}
+function kdRows(){
+  const el=document.getElementById('kdList');
+  if(!el) return;
+  const q=(_kd.q||'').trim().toLowerCase();
+  let rows=(_kd.rows||[]).filter(r=>!q || (r.title||'').toLowerCase().includes(q));
+  if(_kd.sort==='title') rows=rows.slice().sort((a,b)=>
+    (a.title||'').localeCompare(b.title||''));
+  else if(_kd.sort==='size') rows=rows.slice().sort((a,b)=>(b.bytes||0)-(a.bytes||0));
+  else rows=rows.slice().sort((a,b)=>(b.n||0)-(a.n||0));
+  if(!rows.length){
+    el.innerHTML='<div class="dim" style="padding:8px 10px;font-size:11.5px">'
+      + (q?'nothing matches that':'nothing here') + '</div>';
+    return;
+  }
+  el.innerHTML=rows.slice(0,800).map(r=>`
+    <div class="kdrow" title="${esc(r.path||'')}">
+      <span class="kdt">${esc(r.title||'')}</span>
+      <span class="dim kda">${esc(r.arr||'')}</span>
+      <span class="kdn">${fmt(r.n||0)}</span>
+      <span class="dim kdb">${gb(r.bytes||0)}</span>
+    </div>`).join('')
+    + (rows.length>800?`<div class="dim" style="padding:4px 10px;font-size:10.5px"
+       >showing 800 of ${fmt(rows.length)} — narrow it with the search box</div>`:'');
+}
+
 // ---- files the arrs manage that Nuarr has no entry for -------------------
 //
 // THE LIST BEHIND THE NUMBER. The header can say "14 to put right"; this is
@@ -25434,6 +25616,18 @@ _SETTINGS_SHIM = """
 (function(){
   const NAV = %NAV%;
   const KEYS = NAV.reduce((a,g)=>a.concat(g.items.map(i=>i.key)), []);
+  // DEEP LINKS ARE NOT NAV ITEMS, and this sidebar was the reason they never
+  // worked. go() rejects any hash that is not in KEYS and silently falls back
+  // to the first entry, so /settings#arrgap landed on Concurrency and rewrote
+  // the URL to #counts on the way - a link that appeared to work, went
+  // somewhere else, and left no trace of having been redirected.
+  //
+  // These are the hashes that mean "open a pane and put a particular card in
+  // front of me". They are deliberately absent from the sidebar - there is no
+  // menu entry for a card - so they have to be admitted here by name. wtab()
+  // already knows what to do with each of them; it was simply never asked.
+  const DEEP = ['arrgap','arrsync','audiotitle'];
+  const VALID = KEYS.concat(DEEP);
 
   document.title = 'nuarr settings';
 
@@ -25474,11 +25668,17 @@ _SETTINGS_SHIM = """
   host.style.flex   = '1';
   host.style.minWidth = '0';
 
+  // Which sidebar entry a deep link should light up, since the link itself is
+  // not one. Same mapping wtab() uses; repeated here because this shim runs in
+  // its own closure and reaching into the page's ALIAS_OF would tie the two
+  // together for one lookup.
+  const DEEP_PANE = {arrgap:'libs', arrsync:'arrs', audiotitle:'acodec'};
   function go(key, push){
-    if(KEYS.indexOf(key) < 0) key = KEYS[0];
+    if(VALID.indexOf(key) < 0) key = KEYS[0];
     wtab(key);
+    const lit = DEEP_PANE[key] || key;
     for(const a of side.querySelectorAll('.setlink[data-k]')){
-      a.className = 'setlink' + (a.dataset.k===key ? ' on' : '');
+      a.className = 'setlink' + (a.dataset.k===lit ? ' on' : '');
     }
     if(push && location.hash !== '#'+key) history.replaceState(null,'','#'+key);
   }
