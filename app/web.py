@@ -10781,20 +10781,27 @@ async function loadAll(){
         const rest=Object.entries(g.by_why||{})
           .filter(([k])=>k!=='not walked yet' && k!=='written off, but on disk')
           .reduce((n,[,v])=>n+(v.n||0),0);
-        if(!g.total)
-          return `<span class="dim lnk"`
+        // NOTHING TO REPORT IS REPORTED BY SAYING NOTHING. "0 accounted for"
+        // is a count of an empty list taking up room in the one line that has
+        // to stay readable, and a status that is present in every state stops
+        // being read in any of them. The arr total stays - that is the
+        // comparison this line exists for - and the verdict appears only when
+        // there is a verdict.
+        const tail = fix
+          ? `<span class="warn lnk"`
             + ` onclick="event.stopPropagation();location.href='/settings#arrgap'"`
-            + ` title="every file Sonarr and Radarr manage has an entry here">`
-            + `arrs manage ${fmt(a)} · all present</span>`;
-        return `<span class="dim">arrs manage ${fmt(a)} · </span>`
-          + (fix ? `<span class="warn lnk" onclick="event.stopPropagation();location.href='/settings#arrgap'"`
-                 + ` title="nuarr has no usable entry for these and it can fix`
-                 + ` that - click to see them">${fmt(fix)} to put right</span>`
-                 + (rest?`<span class="dim"> · ${fmt(rest)} accounted for</span>`:'')
-                 : `<span class="dim lnk" onclick="event.stopPropagation();location.href='/settings#arrgap'"`
-                 + ` title="every one of these is explained - excluded, outside`
-                 + ` the libraries, or gone from disk and still in the arr">${
-                     fmt(g.total)} accounted for</span>`);
+            + ` title="nuarr has no usable entry for these and it can fix that`
+            + ` - click to see them">${fmt(fix)} to put right</span>`
+            + (rest?`<span class="dim"> · ${fmt(rest)} accounted for</span>`:'')
+          : (rest
+             ? `<span class="dim lnk"`
+               + ` onclick="event.stopPropagation();location.href='/settings#arrgap'"`
+               + ` title="every one of these is explained - excluded, outside`
+               + ` the libraries, or gone from disk and still in the arr">${
+                   fmt(rest)} accounted for</span>`
+             : '');
+        return `<span class="dim">arrs manage ${fmt(a)}${tail?' · ':''}</span>`
+             + tail;
       }
       // Every one of these links lives inside the Total files tile, which is
       // itself clickable - so each stops the click from reaching the card, or
@@ -10812,14 +10819,12 @@ async function loadAll(){
     if(gap<0)
       return `<span class="dim">arrs manage ${fmt(a)} · ${fmt(-gap)} here that`
         + ` no arr tracks</span>`;
-    // EVEN "in step" LEADS SOMEWHERE. It is the one state where nothing is
-    // wrong, which is exactly when a person wants to see what was checked and
-    // when - and a phrase that is a link in three states and dead in the
-    // fourth teaches you not to try it.
-    return `<span class="dim lnk"`
-      + ` onclick="event.stopPropagation();location.href='/settings#arrgap'"`
-      + ` title="nuarr's index and the arrs' agree exactly — click for the`
-      + ` check that says so">arrs manage ${fmt(a)} · in step</span>`;
+    // Agreement is the normal case, and the normal case does not need a word
+    // for itself. The total still shows, because that is the comparison; the
+    // "in step" that followed it was only ever telling you that nothing had
+    // happened.
+    return `<span class="dim" title="nuarr's index and the arrs' agree exactly`
+      + `">arrs manage ${fmt(a)}</span>`;
   };
   const gapTxt = arrGap(s.totals);
   setHTML(document.getElementById('sub'),
