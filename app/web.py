@@ -2660,8 +2660,22 @@ def _summary_impl():
     extras = _rows("SELECT COUNT(*) n, SUM(size) bytes FROM files "
                    "WHERE arr_file_id IS NULL AND state NOT IN ('duplicate','deleted') "
                    "AND COALESCE(size,0) < ?", (cut,))[0]
+    # FILES NO ARR TRACKS, COUNTED RATHER THAN INFERRED. The header used to
+    # derive this by subtracting the arrs' total from nuarr's own - which made
+    # it a fact about two numbers taken at different moments rather than about
+    # any file. The arr total refreshes every six hours on a machine with the
+    # disks attached, so a file nuarr indexed a minute ago made the line appear
+    # and then kept it on screen for the rest of the afternoon, long after the
+    # arr had picked the file up.
+    #
+    # The database already knows, exactly and instantly: a row with no
+    # arr_file_id. It is the same pair of counts the Unmanaged and Extras tiles
+    # are built from, so the sentence and the tiles can no longer disagree, and
+    # it goes stale in fifteen seconds like everything else on the page.
     dupes = _rows("SELECT COUNT(*) n, SUM(size) bytes FROM files "
                   "WHERE state='duplicate'")[0]
+    totals["no_arr"] = int(orphans["n"] or 0) + int(extras["n"] or 0)
+    totals["no_arr_big"] = int(orphans["n"] or 0)
     cache = _rows("SELECT COUNT(*) n, SUM(size) bytes FROM files "
                   "WHERE path LIKE '%TdarrCacheFile%' AND state!='deleted'")[0]
     # Anything that needs a human: failed processing, or blocked before it began
@@ -10811,6 +10825,37 @@ async function loadAll(){
     if(t.from_arrs)
       return `<span class="dim" title="nuarr is still walking the share; the`
         + ` arrs already have it indexed">nuarr has walked ${fmt(m)}</span>`;
+    // FILES NO ARR TRACKS - COUNTED, NOT SUBTRACTED, and said in every state
+    // rather than only when the arithmetic happened to come out negative.
+    //
+    // It used to be derived from arrs-minus-mine, which made it a fact about
+    // two numbers taken at different moments rather than about any file: the
+    // arr total refreshes every six hours here, so one file nuarr indexed a
+    // minute ago put the line up and left it there for the afternoon. The
+    // database knows exactly and instantly - a row with no arr_file_id - and
+    // it is the same count the Unmanaged and Extras tiles are built from, so
+    // the sentence and the tiles can no longer disagree.
+    //
+    // It is also the one part of this line about specific files somebody may
+    // want to look at, and it was the dimmest thing on it. Same weight as a
+    // warning now, and it opens the list rather than announcing that a list
+    // exists. Every link here stops the click reaching the Total files tile,
+    // which is itself clickable and would otherwise win the navigation.
+    const na = t.no_arr || 0;
+    const naBit = na
+      ? `<b class="lnk" style="color:#79c0ff"`
+        + ` onclick="event.stopPropagation();drill({unmanaged:1,`
+        + `t:'Files no arr tracks'})"`
+        + ` title="Files nuarr has indexed that neither Sonarr nor Radarr has a`
+        + ` record for — usually a failed or half-finished import, sometimes`
+        + ` an extra that was never meant to be managed. Click to see them.">`
+        + `${fmt(na)} here that no arr tracks</b>`
+      : '';
+    const join = bits => {
+      const keep = bits.filter(Boolean);
+      return `<span class="dim">arrs manage ${fmt(a)}${keep.length?' · ':''}</span>`
+           + keep.join('<span class="dim"> · </span>');
+    };
     if(gap>0){
       // THE CHECK'S ANSWER BEATS THE SUBTRACTION whenever there is one. A file
       // an arr manages and nuarr does not is FIVE different situations, and
@@ -10825,48 +10870,34 @@ async function loadAll(){
           .reduce((n,[,v])=>n+(v.n||0),0);
         // NOTHING TO REPORT IS REPORTED BY SAYING NOTHING. "0 accounted for"
         // is a count of an empty list taking up room in the one line that has
-        // to stay readable, and a status that is present in every state stops
-        // being read in any of them. The arr total stays - that is the
-        // comparison this line exists for - and the verdict appears only when
-        // there is a verdict.
-        const tail = fix
-          ? `<span class="warn lnk"`
-            + ` onclick="event.stopPropagation();location.href='/settings#arrgap'"`
-            + ` title="nuarr has no usable entry for these and it can fix that`
-            + ` - click to see them">${fmt(fix)} to put right</span>`
-            + (rest?`<span class="dim"> · ${fmt(rest)} accounted for</span>`:'')
-          : (rest
-             ? `<span class="dim lnk"`
-               + ` onclick="event.stopPropagation();location.href='/settings#arrgap'"`
-               + ` title="every one of these is explained - excluded, outside`
-               + ` the libraries, or gone from disk and still in the arr">${
-                   fmt(rest)} accounted for</span>`
-             : '');
-        return `<span class="dim">arrs manage ${fmt(a)}${tail?' · ':''}</span>`
-             + tail;
+        // to stay readable, and a status present in every state stops being
+        // read in any of them.
+        return join([
+          fix ? `<span class="warn lnk"`
+                + ` onclick="event.stopPropagation();location.href='/settings#arrgap'"`
+                + ` title="nuarr has no usable entry for these and it can fix`
+                + ` that - click to see them">${fmt(fix)} to put right</span>` : '',
+          rest ? `<span class="dim lnk"`
+                 + ` onclick="event.stopPropagation();location.href='/settings#arrgap'"`
+                 + ` title="every one of these is explained - excluded, outside`
+                 + ` the libraries, or gone from disk and still in the arr">${
+                     fmt(rest)} accounted for</span>` : '',
+          naBit]);
       }
-      // Every one of these links lives inside the Total files tile, which is
-      // itself clickable - so each stops the click from reaching the card, or
-      // the card's own drill runs too and wins the navigation.
       // THE FALLBACK LEADS TO THE SAME PLACE. It is the same question with a
-        // worse answer - a subtraction rather than a diagnosis - and sending
-        // the reader nowhere because the check has not run yet would be
-        // withholding the one page that can run it.
-      return `<span class="dim">arrs manage ${fmt(a)} · </span>`
-        + `<span class="warn lnk" onclick="event.stopPropagation();location.href='/settings#arrgap'"`
+      // worse answer - a subtraction rather than a diagnosis - and sending the
+      // reader nowhere because the check has not run yet would be withholding
+      // the one page that can run it.
+      return join([
+        `<span class="warn lnk" onclick="event.stopPropagation();location.href='/settings#arrgap'"`
         + ` title="tracked by an arr but not in nuarr's index - the check has`
         + ` not run yet, so this is the raw difference rather than a diagnosis.`
-        + ` Click to open it and press Check now.">${fmt(gap)} unaccounted for</span>`;
+        + ` Click to open it and press Check now.">${fmt(gap)} unaccounted for</span>`,
+        naBit]);
     }
-    if(gap<0)
-      return `<span class="dim">arrs manage ${fmt(a)} · ${fmt(-gap)} here that`
-        + ` no arr tracks</span>`;
     // Agreement is the normal case, and the normal case does not need a word
-    // for itself. The total still shows, because that is the comparison; the
-    // "in step" that followed it was only ever telling you that nothing had
-    // happened.
-    return `<span class="dim" title="nuarr's index and the arrs' agree exactly`
-      + `">arrs manage ${fmt(a)}</span>`;
+    // for itself. The total still shows, because that is the comparison.
+    return join([naBit]);
   };
   const gapTxt = arrGap(s.totals);
   setHTML(document.getElementById('sub'),
