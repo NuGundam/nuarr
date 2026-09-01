@@ -614,7 +614,19 @@ def infer_viewers(disks: dict) -> dict:
     # Deliberately narrow: one session left to place, one disk above a floor
     # that idle chatter cannot reach, and nothing else moving. Any ambiguity
     # and it falls through to the matching below.
-    if len(live) == 1:
+    if len(live) == 1 and float(live[0].get("kbps") or 0) <= 0:
+        # ONLY WHEN THERE IS NOTHING BETTER TO GO ON. The first version of this
+        # skipped the rate check entirely, and comparing the two machines
+        # showed what that costs: the host resolved a stream to NU-DRIVE-4 from
+        # the file itself, while the sandbox confidently reported NU-DRIVE-1 -
+        # which was reading 16.7 MB/s because nuarr's own OCR was working on
+        # it. The stream was 1,971 kbps, about 0.25 MB/s. A sixty-eight-fold
+        # mismatch, claimed as an answer.
+        #
+        # So the shortcut is now the last resort it should always have been: it
+        # fires only when the session reports no bitrate at all, because with a
+        # bitrate the band below is strictly better information. A confident
+        # wrong answer is worse than none, and this produced one.
         busy = [(k, v) for k, v in cands.items()
                 if k not in taken and v > 400_000]
         if len(busy) == 1:

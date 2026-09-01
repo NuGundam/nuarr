@@ -52,12 +52,15 @@ async def refresh() -> dict:
     _CACHE["running"] = True
     n = b = 0
     by: dict = {}
+    asked = answered = 0
     try:
         for cfg in (SETTINGS.arrs or []):
             if not getattr(cfg, "enabled", True):
                 continue
+            asked += 1
             try:
                 files = await shared_client(cfg).list_files()
+                answered += 1
             except Exception as e:                           # noqa: BLE001
                 joblog.log(f"library total: {cfg.name} did not answer: "
                            f"{type(e).__name__}", "warn")
@@ -67,11 +70,23 @@ async def refresh() -> dict:
             by[cfg.name] = {"n": cn, "bytes": cb}
             n += cn
             b += cb
-        # ONLY OVERWRITE ON A REAL ANSWER. Every arr failing would otherwise
-        # replace a good total with zero, which reads as an empty library
-        # rather than as a failed lookup.
-        if n:
-            _CACHE.update(n=n, bytes=b, by_arr=by, at=time.time())
+        # EVERY ARR, OR NONE OF THEM. A partial answer is the dangerous case
+        # and it is the one that actually happened: on the sandbox, Radarr
+        # replied and Sonarr did not, so the total came back as 2,042 files
+        # against a library of nearly forty thousand - and was published as
+        # authoritative, complete with "(from the arrs)". Five per cent of the
+        # truth wearing the label of the whole.
+        #
+        # A missing arr is a missing LIBRARY, not a smaller one. Better to keep
+        # the local count, which at least knows what it does not know.
+        if n and answered == asked and asked:
+            _CACHE.update(n=n, bytes=b, by_arr=by, at=time.time(),
+                          asked=asked, answered=answered)
+        elif n:
+            joblog.log(f"library total: only {answered} of {asked} arr(s) "
+                       f"answered, so the total would be short - keeping the "
+                       f"local count instead", "warn")
+            _CACHE.update(partial=True, asked=asked, answered=answered)
     finally:
         _CACHE["running"] = False
     return cached()
