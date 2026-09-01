@@ -9690,6 +9690,16 @@ tr.logrow td{background:#1c2129;border-bottom:1px solid var(--acc);padding:0 12p
 .xmine b,.xmine .xarrow{color:var(--acc)}
 /* The strip carries both kinds now, so it cannot be tinted for one of them. */
 .xfer{background:rgba(255,255,255,.025)}
+/* A TRANSFER BELONGS TO A ROW, so it is drawn in one. This sits in the space
+   under the disk name that the name itself does not use - the row is already
+   tall enough for the activity chips beneath it, so nothing moves to make
+   room. Small and quiet: it is a caption on the name, not a fifth chip. */
+.xmvs{margin-top:3px;display:flex;flex-direction:column;gap:1px}
+.xmv{font-size:10px;line-height:1.45;letter-spacing:.2px;color:var(--warn);
+     white-space:nowrap;cursor:help}
+.xmv.xmine{color:var(--acc)}
+.xmv b{font-weight:600}
+.xmv .xarrow{opacity:.75;padding-right:1px}
 @media(max-width:900px){.dkey{display:none}}
 .disktab{width:100%;table-layout:fixed}
 .disktab th,.disktab td{overflow:hidden;text-overflow:ellipsis}
@@ -10949,8 +10959,28 @@ function renderDisks(){
       class="xarrow">→</span> ${
       m.to?diskTag(m.to):'<span class="dim">elsewhere</span>'} <b>${
       mbps(m.bps)}</b></span>`;
+  // ONE TRANSFER, TWO ROWS THAT CARE ABOUT IT. A move is a fact about a PAIR
+  // of disks, and the panel used to state it once at the top - "NU-DRIVE-1 ->
+  // NU-DRIVE-10 10.0 MB/s" - which meant the two rows it was actually about
+  // said nothing, and you matched name to name by eye down a list of twelve.
+  // Each end now carries its own half of the sentence, in the row it belongs
+  // to: the source says where the bytes are going, the destination says where
+  // they came from.
+  const moveOf={};
+  const noteMove=(disk,other_end,dir,m)=>{
+    if(!disk) return;
+    (moveOf[disk]=moveOf[disk]||[]).push(
+      {other:other_end, dir:dir, bps:m.bps, mine:!!m.mine, what:m.what});
+  };
+  moves.forEach(m=>{ noteMove(m.from,m.to,'out',m); noteMove(m.to,m.from,'in',m); });
   let moveLine='';
-  if(mine.length||other.length){
+  // Only what could not be attached to a row keeps the old line at the top. A
+  // move with neither end in this table is real and has nowhere else to go;
+  // dropping it to tidy the header would be losing information to save space.
+  const _seen=new Set(rows.map(r=>r.pool_disk));
+  const orphanMoves=moves.filter(m=>!_seen.has(m.from) && !_seen.has(m.to));
+  if(orphanMoves.length){
+    const mine=orphanMoves.filter(m=>m.mine), other=orphanMoves.filter(m=>!m.mine);
     moveLine = '<div class="xfer">'
       + (mine.length ? `<span class="xlbl xlbl-mine" title="Nuarr rebuilt these
 files and the pool placed the finished copy on a different disk than the
@@ -11237,7 +11267,34 @@ The bar splits it by share of bytes moved — Nuarr ${share(mine)}%, everything 
       // the box to the name at the top of it.
       return `<tbody class="dgrp${hot?' dhot':''}${watched?' dwatch':''}${
                        moving?' dwork':''}" style="--dcol:${dc}">
-        <tr><td class="mono" style="color:${dc}">${esc(d.pool_disk)}</td>
+        <tr><td class="mono" style="color:${dc}">${esc(d.pool_disk)}${(()=>{
+          const mv=(moveOf[d.pool_disk]||[]);
+          if(!mv.length) return '';
+          // Two at most. A disk feeding four others is real, but a name cell
+          // four lines tall stops being a name cell.
+          const shown=mv.slice(0,2).map(x=>{
+            const tip = x.mine
+              ? `Nuarr rebuilt a file and the pool placed the finished copy on `
+                + `a different disk than the original, so the file has changed `
+                + `drives. Exact, not inferred: the job knows both ends.`
+              : `Inferred from the read/write split — this spindle is `
+                + (x.dir==='out'?`reading`:`writing`) + ` at about the rate `
+                + `${x.other||'another disk'} is `
+                + (x.dir==='out'?`writing`:`reading`) + `. No product is asked, `
+                + `so a pool balance, a parity rebuild, a backup and a plain `
+                + `copy all look the same. With several moves at once the `
+                + `pairing is a best guess.`;
+            return `<span class="xmv${x.mine?' xmine':''}" title="${esc(tip)}"
+              ><span class="xarrow">${x.dir==='out'?'\u2192':'\u2190'}</span> ${
+              x.other?esc(x.other):'elsewhere'} <b>${mbps(x.bps)}</b></span>`;
+          }).join('');
+          const more = mv.length>2
+            ? `<span class="xmv" title="${esc(mv.slice(2).map(x=>
+                 (x.dir==='out'?'to ':'from ')+(x.other||'elsewhere')
+                 +' '+mbps(x.bps)).join('\n'))}">+${mv.length-2} more</span>`
+            : '';
+          return `<div class="xmvs">${shown}${more}</div>`;
+        })()}</td>
         <td class="num">${d.n==null
           ? `<span class="dim" title="DrivePool decides which spindle a file lands on, and over a share that placement is not visible — the host knows how full each disk is, not which of Nuarr's files are on it.">—</span>`
           : fmt(d.n)}</td>
@@ -11264,7 +11321,13 @@ The bar splits it by share of bytes moved — Nuarr ${share(mine)}%, everything 
     // pool totals, so you can see the whole array at a glance
     +`<tbody class="dgrp dpool">
       <tr>
-        <td class="mono"><b>POOL</b></td><td class="num"><b>${
+        <td class="mono"><b>POOL</b>${moves.length
+          ? `<div class="xmvs"><span class="xmv${moves.every(m=>m.mine)?' xmine':''}"
+              title="${esc(moves.map(m=>(m.from||'elsewhere')+' \u2192 '
+                +(m.to||'elsewhere')+'  '+mbps(m.bps)
+                +(m.mine?'  (Nuarr)':'')).join('\n'))}">${moves.length} file${
+              moves.length>1?'s':''} changing disk</span></div>`
+          : ''}</td><td class="num"><b>${
           rows.length && rows.every(d=>d.n==null)
             ? '<span class="dim">—</span>'
             : fmt(rows.reduce((a,d)=>a+(d.n||0),0))}</b></td>
