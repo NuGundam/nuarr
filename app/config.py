@@ -323,6 +323,19 @@ class Settings:
     audiotitle_mode: str = "manual"
     audiotitle_every_h: int = 24         # hours between title checks
 
+    # FILES THE ARRS MANAGE THAT NUARR HAS NEVER WALKED - the third of the same
+    # bargain, and the one where "auto" is least alarming: indexing a file the
+    # arrs already track changes nothing on disk, it only stops nuarr being
+    # ignorant of it. It still defaults to manual, because the point of these
+    # three switches is that the choice is the user's and a safe-looking
+    # default is still a default somebody did not pick.
+    #
+    # Six hours rather than twelve: this looks for files that arrived MINUTES
+    # ago, so a long interval would mostly measure how long ago the last scan
+    # ran. It costs two list calls and no disk walk.
+    arrgap_mode: str = "manual"
+    arrgap_every_h: int = 6              # hours between not-walked checks
+
     # SUBTITLE OCR - the switches behind Settings -> Subtitle OCR. Defaults
     # match the measured thresholds in subocr.py; the page can move them.
     subocr_auto: bool = True             # queue conversions on a schedule

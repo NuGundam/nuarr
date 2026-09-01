@@ -930,7 +930,7 @@ async def scan(full: bool = True, probe_orphans: bool = True,
         with cursor() as cur:
             rows = cur.execute(
                 "SELECT id, arr_name, arr_file_id, content_sig, path, size, mtime, "
-                "pool_disk, state FROM files"
+                "pool_disk, state, state_reason FROM files"
             ).fetchall()
 
             by_arr = {(r["arr_name"], r["arr_file_id"]): r for r in rows
@@ -995,7 +995,22 @@ async def scan(full: bool = True, probe_orphans: bool = True,
 
                 seen_ids.add(prev["id"])
                 state = prev["state"]
-                reason = None
+                # THE REASON IS THE AUDIT TRAIL FOR EXACTLY TWO STATES, and this
+                # was wiping it on every pass. A row parked at 'deleted' by a
+                # refetch carries "rejected and re-searched: blocklisted <x>,
+                # asked Sonarr to search again" - the entire record of a
+                # decision nuarr made on your behalf. The next scan re-found the
+                # file, wrote the state back unchanged, and set the reason to
+                # NULL, leaving fourteen rows that said 'deleted' and could not
+                # say why.
+                #
+                # Found by the not-walked check: it could see the files were
+                # written off and had nothing left to tell it whether that was
+                # deliberate. Clearing the reason is right for the ordinary
+                # states, where it describes a condition that has passed; for
+                # 'deleted' and 'error' it describes a verdict that has not.
+                reason = (prev["state_reason"]
+                          if state in ("deleted", "error") else None)
 
                 # A RENAME. The row keeps its identity and simply learns a new path -
                 # this is the single behaviour that stops a rename resetting work.
@@ -1105,7 +1120,12 @@ async def scan(full: bool = True, probe_orphans: bool = True,
                                        f"{prev['path']} -> {df.path}", now))
                     updates.append((
                         None, df.path, df.library, None, None, None, df.size, df.mtime,
-                        df.disk, prev["state"], None, now, now, prev["id"],
+                        df.disk, prev["state"],
+                        # Same rule as the arr-keyed branch above: a verdict
+                        # keeps its explanation, a passing condition does not.
+                        (prev["state_reason"]
+                         if prev["state"] in ("deleted", "error") else None),
+                        now, now, prev["id"],
                     ))
 
             # UPSERT, not a bare INSERT. A plain INSERT aborts the whole pass the

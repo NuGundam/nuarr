@@ -546,6 +546,11 @@ async def _startup() -> None:
     # Once a day: does every audio title still describe the stream under it?
     from . import audiotitle as _audiotitle
     asyncio.create_task(_audiotitle.watch())
+    # Asks the arrs what they manage and compares it to what nuarr has indexed.
+    # Two list calls every six hours - no disk walk - so it is cheap enough to
+    # run on any machine, attached pool or share.
+    from . import arrgap as _arrgap
+    asyncio.create_task(_arrgap.watch())
     asyncio.create_task(ffmpeg_update.watch())
     # Notices a GPU driver swap, re-measures NVENC, and hands in-flight encodes
     # back to the queue - see ffmpeg_update.watch_driver().
@@ -1471,7 +1476,17 @@ def api_libraries_config():
                     "seen": seen,
                     "seen_total": sum(seen.values()),
                     "folder_kind": guess})
-    return {"libraries": out, "pool_root": getattr(SETTINGS, "pool_root", "P:\\")}
+    # The per-library half of the not-walked check, so each row can say what
+    # is missing from IT rather than making you read a total and work out
+    # which library it belongs to.
+    gap = {}
+    try:
+        from . import arrgap
+        gap = arrgap.by_library()
+    except Exception:                                        # noqa: BLE001
+        gap = {}
+    return {"libraries": out, "gap": gap,
+            "pool_root": getattr(SETTINGS, "pool_root", "P:\\")}
 
 
 @app.get("/api/arrs/config")
@@ -2528,6 +2543,19 @@ def _summary_impl():
         totals["arr_bytes"] = int(at.get("bytes") or 0)
         totals["by_arr"] = at.get("by_arr") or {}
         totals["arrs_age_s"] = at.get("age_s")
+        # WHY THE HEADER CANNOT JUST SUBTRACT. arrs minus mine was 38 here, and
+        # 24 of those were a folder deliberately excluded from scanning - a
+        # number that can never reach zero and would have sat in the header
+        # forever calling itself "not walked yet". The check knows which is
+        # which; the header should say what the check found, not what the
+        # subtraction implies.
+        from . import arrgap as _ag
+        _g = _ag.cached()
+        if _g.get("have"):
+            totals["gap"] = {"total": _g.get("total") or 0,
+                             "fixable": _g.get("fixable") or 0,
+                             "by_why": _g.get("by_why") or {},
+                             "age_s": _g.get("age_s")}
         # nuarr's own count, split the same way the arrs split theirs, so the
         # two columns in Libraries are the same question asked twice and not
         # two different questions printed side by side.
@@ -2656,6 +2684,16 @@ def _summary_impl():
         # already handling it - see audiotitle.attention().
         from . import audiotitle as _at
         _row = _at.attention()
+        if _row:
+            attention.append(_row)
+    except Exception:                                    # noqa: BLE001
+        pass
+    try:
+        # Files an arr manages that nuarr has no row for. Same rule again:
+        # raised when a person has to act, silent when auto mode has it - see
+        # arrgap.attention().
+        from . import arrgap as _ag
+        _row = _ag.attention()
         if _row:
             attention.append(_row)
     except Exception:                                    # noqa: BLE001
@@ -4381,6 +4419,60 @@ async def api_audiotitle_mode(mode: str):
                   if mode == "auto" else
                   " - wrong titles will be listed and wait for you"), "info")
     return audiotitle.cached()
+
+
+@app.get("/api/arrgap")
+def api_arrgap():
+    """Files the arrs manage that nuarr has no entry for."""
+    from . import arrgap
+    return arrgap.cached()
+
+
+@app.post("/api/arrgap/run")
+async def api_arrgap_run():
+    """Re-ask the arrs and re-compare. Two list calls, no disk walk."""
+    from . import arrgap
+    if arrgap._CACHE.get("running"):
+        return {"ok": False, "error": "already running"}
+    return await arrgap.scan()
+
+
+@app.post("/api/arrgap/fix")
+async def api_arrgap_fix():
+    """Index just the files nobody has walked yet - not a pool scan."""
+    from . import arrgap
+    if (arrgap._CACHE.get("fixing") or {}).get("running"):
+        return {"ok": False, "error": "already running"}
+    asyncio.create_task(arrgap.fix())
+    return {"ok": True, "started": True}
+
+
+@app.post("/api/arrgap/mode")
+async def api_arrgap_mode(mode: str):
+    """manual lists them and waits; auto walks them on the six-hourly check."""
+    import yaml
+    from .config import SETTINGS
+    from . import arrgap
+    mode = (mode or "").strip().lower()
+    if mode not in ("auto", "manual"):
+        raise HTTPException(400, "mode must be auto or manual")
+    p = _config_path()
+    raw = {}
+    if p.exists():
+        try:
+            raw = yaml.safe_load(p.read_text(encoding="utf-8-sig")) or {}
+        except Exception:                                    # noqa: BLE001
+            raw = {}
+    raw["arrgap_mode"] = mode
+    p.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True),
+                 encoding="utf-8")
+    SETTINGS.arrgap_mode = mode
+    joblog.log(f"not-walked mode set to {mode}"
+               + (" - files the arrs track will be indexed as they are found"
+                  if mode == "auto" else
+                  " - files not walked will be listed and wait for you"),
+               "info")
+    return arrgap.cached()
 
 
 @app.post("/api/arrsync/mode")
@@ -10575,11 +10667,33 @@ async function loadAll(){
     if(t.from_arrs)
       return `<span class="dim" title="nuarr is still walking the share; the`
         + ` arrs already have it indexed">nuarr has walked ${fmt(m)}</span>`;
-    if(gap>0)
+    if(gap>0){
+      // THE CHECK'S ANSWER BEATS THE SUBTRACTION whenever there is one. A file
+      // an arr manages and nuarr does not is FIVE different situations, and
+      // only some of them are anybody's problem - saying "38 not walked yet"
+      // when 24 of them are a deliberately excluded folder is a number that
+      // never goes down and stops meaning anything.
+      const g=t.gap;
+      if(g && g.total!=null){
+        const fix=g.fixable||0;
+        const rest=Object.entries(g.by_why||{})
+          .filter(([k])=>k!=='not walked yet' && k!=='written off, but on disk')
+          .reduce((n,[,v])=>n+(v.n||0),0);
+        return `<span class="dim">arrs manage ${fmt(a)} · </span>`
+          + (fix ? `<span class="warn lnk" onclick="location.href='/settings#arrgap'"`
+                 + ` title="nuarr has no usable entry for these and it can fix`
+                 + ` that - click to see them">${fmt(fix)} to put right</span>`
+                 + (rest?`<span class="dim"> · ${fmt(rest)} accounted for</span>`:'')
+                 : `<span class="dim lnk" onclick="location.href='/settings#arrgap'"`
+                 + ` title="every one of these is explained - excluded, outside`
+                 + ` the libraries, or gone from disk and still in the arr">${
+                     fmt(g.total)} accounted for</span>`);
+      }
       return `<span class="dim">arrs manage ${fmt(a)} · </span>`
         + `<span class="warn" title="tracked by an arr but not in nuarr's index`
-        + ` yet - normally a recent import waiting for the next scan">`
-        + `${fmt(gap)} not walked yet</span>`;
+        + ` - the not-walked check has not run yet, so this is the raw`
+        + ` difference rather than a diagnosis">${fmt(gap)} unaccounted for</span>`;
+    }
     if(gap<0)
       return `<span class="dim">arrs manage ${fmt(a)} · ${fmt(-gap)} here that`
         + ` no arr tracks</span>`;
@@ -18287,9 +18401,20 @@ function wtab(which){
     if(side==='audio') loadAudioTitle();
     return;
   }
-  if(which==='libs'){
+  if(which==='libs' || intent==='arrgap'){
     if(hint) hint.textContent='· libraries';
+    // Arrived from the Attention tile: same page, but with the list already
+    // open and the card put in front of you rather than left to be found.
+    if(intent==='arrgap') _agOpen=true;
     paneLoad('libs', loadLibsTab);
+    if(intent==='arrgap') setTimeout(()=>{
+      const c=document.getElementById('agCard');
+      if(!c) return;
+      c.scrollIntoView({behavior:'smooth', block:'center'});
+      c.style.transition='box-shadow .4s';
+      c.style.boxShadow='0 0 0 2px var(--acc)';
+      setTimeout(()=>{ c.style.boxShadow=''; }, 1600);
+    }, 200);
     return;
   }
   if(isMe){
@@ -19115,10 +19240,27 @@ async function loadLibsTab(){
               esc(KL[l.folder_kind]||l.folder_kind)}, because the metadata says
               so and the folder name only sets a floor</div>`:'');
   };
+  // WHAT THIS LIBRARY IS MISSING, on the library's own row. The card below
+  // holds the whole list and the reasons; this is the one number a person
+  // wants while reading the table - and only when it is not zero, because a
+  // row of "0 missing" on six libraries is six lines of nothing.
+  const gapLine=name=>{
+    const g=(d.gap||{})[name];
+    if(!g||!g.n) return '';
+    return `<div class="sub" style="color:${g.fixable?'var(--warn)':'var(--dim,#8a97a6)'}">`
+      + `${fmt(g.n)} file${g.n===1?'':'s'} the arrs manage that Nuarr has no `
+      + `entry for`
+      + (g.fixable?` · <span class="lnk" onclick="document.getElementById('agCard')`
+        + `.scrollIntoView({behavior:'smooth',block:'center'})">${fmt(g.fixable)} `
+        + `it can put right</span>`
+        : ' · all accounted for')
+      + `</div>`;
+  };
   const rows=(d.libraries||[]).map(l=>`<tr>
     <td><b>${esc(l.name)}</b>
       <div class="dim sub mono">${esc(l.path)}</div>
       ${kindLine(l)}
+      ${gapLine(l.name)}
       ${l.exists?'':'<div class="err sub">this folder does not exist — nothing here is being indexed</div>'}</td>
     <td class="dim nb">${esc(l.kind==='movie'?'movies':'shows')}</td>
     <td class="num nb">${fmt(l.files)}</td>
@@ -19152,6 +19294,12 @@ async function loadLibsTab(){
         not there scans clean and indexes nothing, which looks exactly like an
         empty library.</div>
     </div>
+    <div class="lkind" id="agCard" style="margin-top:12px">
+      <div class="lkindhead">Files the arrs manage that Nuarr has no entry for</div>
+      <div id="agBody" style="padding:10px 12px">
+        <div class="skel"><i style="width:60%"></i><i style="width:40%"></i></div>
+      </div>
+    </div>
     <div class="dim" style="margin-top:10px;font-size:11px;line-height:1.55">
       <b>How Nuarr decides what something is.</b> Genres and original language
       come from Sonarr and Radarr, which get them from TheTVDB and TMDB, and
@@ -19163,7 +19311,265 @@ async function loadLibsTab(){
       metadata outright would have handed them the live-action policy and
       dropped their Japanese audio.
     </div>`;
+  loadArrGap();
 }
+// ---- files the arrs manage that Nuarr has no entry for -------------------
+//
+// THE LIST BEHIND THE NUMBER. The header can say "14 to put right"; this is
+// where you find out that they are fourteen episodes of See (2019), that they
+// are all on disk, and that Nuarr had them marked deleted since 20 August.
+let _ag=null, _agTimer=null, _agOpen=false;
+// The five reasons, in the order a person cares about them: what Nuarr can fix
+// first, then what is somebody else's, then what is deliberate.
+const AG_ORDER=['written off, but on disk','not walked yet',
+                'rejected, waiting for a replacement','gone from disk',
+                'excluded by a rule',"outside nuarr's libraries"];
+const AG_NOTE={
+  'written off, but on disk':
+    'Nuarr has a row for these and it says deleted, while the file is on disk '
+    + 'and the arr still tracks it. Nothing queues a deleted row, so these are '
+    + 'invisible to every part of Nuarr until the verdict is withdrawn.',
+  'not walked yet':
+    'On disk, tracked by the arr, and Nuarr simply has no row yet - normally a '
+    + 'recent import waiting for the next scan.',
+  'rejected, waiting for a replacement':
+    'Nuarr rejected this file, blocklisted the release and asked the arr to '
+    + 'search again. The old file stays on disk until the replacement lands, '
+    + 'so this is the system working - not something to put right. If it has '
+    + 'been sitting here for weeks, the arr never found a replacement.',
+  'gone from disk':
+    'The arr tracks a file that is not there. Nuarr is right and the arr is '
+    + 'stale; this one is fixed in Sonarr or Radarr, not here.',
+  'excluded by a rule':
+    'A path in your own exclusion list. Absent on purpose - there is nothing '
+    + 'to correct, and this count will never reach zero.',
+  "outside nuarr's libraries":
+    'The arr manages a root that was never given to Nuarr. Also deliberate; '
+    + 'the fix is to add the library above, not to scan.'};
+async function loadArrGap(){
+  const el=document.getElementById('agBody');
+  if(!el){ if(_agTimer) clearTimeout(_agTimer); return; }
+  try{ _ag=await (await fetch('/api/arrgap')).json(); }
+  catch(e){ el.innerHTML='<span class="dim">could not load</span>'; return; }
+  agPaint();
+  if(_agTimer) clearTimeout(_agTimer);
+  const busy=_ag && (_ag.running || (_ag.fixing && _ag.fixing.running));
+  if(busy) _agTimer=setTimeout(loadArrGap, 1000);
+}
+function agToggle(){ _agOpen=!_agOpen; agPaint(); }
+function agPaint(){
+  const el=document.getElementById('agBody');
+  if(!el||!_ag) return;
+  const d=_ag;
+  if(d.running){
+    el.innerHTML=`
+      <div style="font-size:11.5px">
+        <div style="display:flex;gap:8px;align-items:center">
+          <span class="spin" style="width:11px;height:11px"></span>
+          <span>asking the arrs what they manage</span>
+          <span class="dim">· one list per arr, no disk walk</span>
+        </div>
+        ${progressBar(d.progress, 'records')}
+      </div>`;
+    return;
+  }
+  const fx=d.fixing||{};
+  if(fx.running){
+    el.innerHTML=`
+      <div style="font-size:11.5px">
+        <div style="display:flex;gap:8px;align-items:center">
+          <span class="spin" style="width:11px;height:11px"></span>
+          <b>Putting them right</b>
+        </div>
+        ${progressBar({done:fx.done, total:fx.total, now:fx.where}, 'files')}
+        <div class="dim" style="font-size:10.5px;margin-top:4px">
+          <b>${fmt(fx.walked||0)}</b> put right${fx.failed?` · <span
+            style="color:var(--warn)">${fmt(fx.failed)} refused</span>`:''} —
+          each file is re-read from the arr and written through the same door an
+          import comes through. No pool walk, so this is requests rather than
+          hours.</div>
+      </div>`;
+    return;
+  }
+  if(!d.have){
+    el.innerHTML=`<div style="font-size:11.5px" class="dim">Not checked yet —
+      it runs a few minutes after start-up and every ${d.every_h||6} hours
+      after that, or press Check now.</div>
+      <div style="display:flex;gap:6px;margin-top:7px">
+        <button onclick="agRun()" style="font-size:11px;padding:2px 9px"
+          >Check now</button></div>
+      <div id="agMsg" class="dim" style="font-size:11.5px;margin-top:5px"></div>`;
+    return;
+  }
+  const rows=d.rows||[], n=d.total||0, fixable=d.fixable||0;
+  const mode=d.mode||'manual', auto=mode==='auto';
+  const fails=d.failures||[];
+  const failBox = fails.length ? `
+    <div style="border:1px solid var(--warn);border-radius:6px;padding:6px 8px;
+                margin-bottom:7px;font-size:11.5px">
+      <b style="color:var(--warn)">${fmt(fails.length)} could not be put
+      right</b> — these need a look in either mode.
+      <div class="dim" style="margin-top:3px;max-height:90px;overflow:auto">${
+        fails.slice(0,20).map(f=>`<div>${esc((f.name||'').slice(0,70))} — ${
+          esc(f.why||'')}</div>`).join('')}</div>
+    </div>` : '';
+  const modeBox=`
+    <div style="display:flex;gap:7px;align-items:center;font-size:11px;
+                margin-left:auto">
+      <span class="dim">when Nuarr finds one it can fix</span>
+      <span style="display:inline-flex;border:1px solid var(--line);
+                   border-radius:5px;overflow:hidden">
+        ${['manual','auto'].map(m=>`<button onclick="agMode('${m}')"
+          title="${m==='auto'
+            ?'Put right on the six-hourly check. The Attention tile stays quiet about them, because they are already being handled.'
+            :'Listed here and left for your click. The Attention tile carries the count.'}"
+          style="font-size:11px;padding:2px 10px;border:0;cursor:pointer;
+            background:${mode===m?'var(--acc)':'transparent'};
+            color:${mode===m?'#0b0e13':'var(--dim,#8a97a6)'};
+            font-weight:${mode===m?'600':'400'}">${m}</button>`).join('')}
+      </span>
+    </div>`;
+  const head = fixable
+    ? `<b style="color:var(--warn)">${fmt(fixable)} file${fixable===1?'':'s'}
+       Nuarr can put right</b>`
+    : (n ? `<b style="color:var(--ok)">nothing to put right</b>`
+         : `<b style="color:var(--ok)">every file the arrs manage is here</b>`);
+  const byWhy=d.by_why||{};
+  const chips=AG_ORDER.filter(k=>byWhy[k]).map(k=>{
+    const hot = k==='written off, but on disk' || k==='not walked yet';
+    return `<span title="${esc(AG_NOTE[k]||'')}" style="font-size:10.5px;
+      padding:1px 7px;border-radius:9px;cursor:help;
+      border:1px solid ${hot?'var(--warn)':'var(--line)'};
+      color:${hot?'var(--warn)':'var(--dim,#8a97a6)'}">${
+      fmt(byWhy[k].n)} ${esc(k)}</span>`;
+  }).join(' ');
+  el.innerHTML=`
+    ${failBox}
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;
+                font-size:11.5px;margin-bottom:6px">
+      ${head}
+      <span class="dim">of ${fmt(d.checked||0)} records the arrs hold${
+        d.age_s!=null?` · ${ago(Date.now()/1000-d.age_s)}`:''}</span>
+      ${modeBox}
+    </div>
+    ${chips?`<div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:7px"
+      >${chips}</div>`:''}
+    <div class="dim" style="font-size:11px;margin-bottom:6px">${auto
+      ? `Checked every ${d.every_h||6}h and put right automatically — nothing
+         here is waiting on you, so the Attention tile stays quiet about it.
+         Anything it cannot put right still gets raised.`
+      : `Checked every ${d.every_h||6}h and left for you to apply. While there
+         is something to put right the Attention tile carries the count.`}</div>
+    ${d.last_fix ? `<div class="dim" style="font-size:11px;margin-bottom:6px">
+       Last run: ${fmt(d.last_fix.walked||0)} put right${d.last_fix.failed
+       ?` · <span style="color:var(--warn)">${fmt(d.last_fix.failed)} refused</span>`
+       :''}.</div>` : ''}
+    <div style="display:flex;gap:6px;margin-bottom:7px;flex-wrap:wrap">
+      <button onclick="agRun()" style="font-size:11px;padding:2px 9px"
+        >Check now</button>
+      ${fixable?`<button onclick="agFix()" style="font-size:11px;padding:2px 9px"
+        title="Re-reads each one from the arr and writes it through the same path an import uses. Seconds, not a pool walk.">Put right${
+          auto?' now':''}</button>`:''}
+      <button onclick="agRescan()" style="font-size:11px;padding:2px 9px"
+        title="The thorough way: walk every library from scratch. Minutes on an attached pool and far longer over a share - worth it only when the targeted fix above keeps failing."
+        >Rescan everything</button>
+    </div>
+    ${n?`<div id="agList"></div>`:''}
+    <div id="agMsg" class="dim" style="font-size:11.5px;margin-top:5px"></div>`;
+  if(n) agList(rows);
+}
+function agList(rows){
+  const el=document.getElementById('agList');
+  if(!el) return;
+  const bar=`<div onclick="agToggle()" style="display:flex;gap:7px;
+      align-items:center;cursor:pointer;user-select:none;padding:4px 8px;
+      font-size:11.5px;background:#161b22;
+      border-bottom:${_agOpen?'1px solid var(--line)':'0'}">
+      <span class="dim" style="display:inline-block;width:9px;
+        transform:rotate(${_agOpen?90:0}deg);transition:transform .15s">▶</span>
+      <b>${_agOpen?'Hide':'Show'} the ${fmt(rows.length)} file${
+        rows.length===1?'':'s'}</b>
+      <span class="dim">${_agOpen?'':'— which title, and why each one is missing'}</span>
+    </div>`;
+  if(!_agOpen){
+    el.innerHTML=`<div style="border:1px solid var(--line);border-radius:6px;
+      overflow:hidden">${bar}</div>`;
+    return;
+  }
+  // GROUPED BY TITLE, because twelve rows of episode filenames all begin with
+  // the same forty characters and the thing you want to recognise is the show.
+  const byG={};
+  rows.forEach(r=>{ (byG[r.group||'?']=byG[r.group||'?']||[]).push(r); });
+  const groups=Object.keys(byG).sort((a,b)=>byG[b].length-byG[a].length);
+  el.innerHTML=`
+    <div style="border:1px solid var(--line);border-radius:6px;overflow:hidden">
+      ${bar}
+      <div style="max-height:280px;overflow:auto;padding:0 8px">
+        <table style="width:100%;font-size:11.5px;border-collapse:collapse;
+                      table-layout:fixed">
+          <colgroup><col style="width:44%"><col style="width:12%">
+            <col style="width:14%"><col style="width:30%"></colgroup>
+          <thead><tr>${['Title / file','Arr','Library','Why it is missing']
+            .map(h=>`<th style="text-align:left;font-weight:600;padding:3px 8px 5px 0;
+              position:sticky;top:0;background:var(--bg2,#12161c)">${h}</th>`).join('')}
+          </tr></thead>
+          <tbody>${groups.slice(0,60).map(g=>{
+            const rs=byG[g], r0=rs[0];
+            const hot = r0.why==='written off, but on disk'
+                     || r0.why==='not walked yet';
+            return `<tr>
+              <td style="padding:3px 8px 3px 0;overflow:hidden;
+                         text-overflow:ellipsis;white-space:nowrap"
+                  title="${esc(rs.map(x=>x.name).slice(0,20).join(' | '))}"
+                ><b>${esc(g)}</b> <span class="dim">${
+                  rs.length>1?`${fmt(rs.length)} files`:esc(r0.name||'')}</span></td>
+              <td style="padding:3px 8px 3px 0" class="dim">${esc(r0.arr||'')}</td>
+              <td style="padding:3px 8px 3px 0" class="dim">${esc(r0.library||'')}</td>
+              <td style="padding:3px 0;color:${hot?'var(--warn)':'var(--dim,#8a97a6)'}"
+                  title="${esc(AG_NOTE[r0.why]||'')}">${esc(r0.why||'')}</td>
+            </tr>`;}).join('')}
+          </tbody>
+        </table>
+      </div>
+      <div class="dim" style="font-size:10.5px;padding:3px 8px 4px;
+        border-top:1px solid var(--line)">${fmt(groups.length)} title${
+        groups.length===1?'':'s'} · ${fmt(rows.length)} file${
+        rows.length===1?'':'s'}</div>
+    </div>`;
+}
+async function agRun(){
+  const m=document.getElementById('agMsg'); if(m) m.textContent='asking the arrs…';
+  try{ _ag=await (await fetch('/api/arrgap/run',{method:'POST'})).json(); agPaint(); }
+  catch(e){ if(m) m.textContent='failed'; }
+}
+async function agFix(){
+  const m=document.getElementById('agMsg'); if(m) m.textContent='';
+  try{
+    const r=await (await fetch('/api/arrgap/fix',{method:'POST'})).json();
+    if(r&&r.error){ if(m) m.textContent=r.error; return; }
+  }catch(e){ if(m) m.textContent='could not start'; return; }
+  loadArrGap();
+}
+async function agMode(m){
+  const el=document.getElementById('agMsg');
+  if(el) el.textContent='saving…';
+  try{
+    _ag=await (await fetch('/api/arrgap/mode?mode='+encodeURIComponent(m),
+                           {method:'POST'})).json();
+    agPaint();
+  }catch(e){ if(el) el.textContent='could not change the mode'; }
+}
+async function agRescan(){
+  const m=document.getElementById('agMsg');
+  if(m) m.textContent='starting a full scan…';
+  try{
+    const r=await fetch('/api/libraries/rescan',{method:'POST'});
+    if(!r.ok){ const j=await r.json();
+      if(m) m.textContent=j.detail||'a scan is already running'; return; }
+    if(m) m.innerHTML='scanning — watch it on the <a href="/">dashboard</a>';
+  }catch(e){ if(m) m.textContent='could not start'; }
+}
+
 // Folder picker. Browses the SERVER's disks through /api/fs/folders rather
 // than opening a native dialog: Nuarr runs as a scheduled task, so an Explorer
 // window would open on a different desktop session - or on the console while
