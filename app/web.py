@@ -19057,6 +19057,19 @@ function pxDetail(s){
       ><span class="rs">${rs}s</span><span class="fs">${fs}s</span
       ><span class="mx">${Math.round(fl*3.6)}s+</span></div></div>`;
   }
+  // WHICH SPINDLE IT IS COMING OFF, next to the path it is coming from. The
+  // card knew the file and not the disk, which is the half that decides
+  // whether Nuarr's next job is allowed to run - and on a machine reaching the
+  // pool over a share the field was blank on every card, because a path
+  // resolves to the pool's own serial and not to a member. It is filled from
+  // the host now, and says which of the two it is: measured here, or taken
+  // from the machine that has the disks attached.
+  if(s.disk) rows.push(['disk', `<b class="mono">${esc(s.disk)}</b>`
+    + (s.disk_from === 'host'
+        ? ` <span class="dim" title="This machine reaches the pool over a share,`
+          + ` where nothing reports which disk holds a file. The host has them`
+          + ` attached and resolved it from the file itself.">· from the host</span>`
+        : '')]);
   if(s.file) rows.push(['file', `<span class="mono dim" style="overflow-wrap:anywhere">${esc(s.file)}</span>`]);
   return `<div class="pxmore">`+rows.map(([k,v])=>
     `<div class="pxrow"><span class="pxk">${k}</span><span class="pxv">${v}</span></div>`).join('')

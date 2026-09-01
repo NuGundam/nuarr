@@ -527,6 +527,57 @@ _PEER: dict = {}          # server -> {"at": float, "counts": {disk: n}}
 _PEER_TTL = 300.0
 
 
+_PEER_SESS: dict = {}
+_PEER_SESS_TTL = 8.0
+
+
+def peer_sessions(server: str) -> dict:
+    r"""session key -> disk, from the nuarr that can actually see the files.
+
+    THE SAME ARGUMENT AS THE FILE COUNTS, APPLIED TO A HARDER QUESTION. Over a
+    share nothing reports which spindle holds a file, so this machine can only
+    correlate bitrates against read rates - and that is a guess with two failure
+    modes seen on Erik's box within one evening:
+
+      A PAUSED STREAM READS NOTHING, so there is nothing to correlate and it is
+      never placed at all. Measured: the host had erikh11 paused on NU-DRIVE-6;
+      the sandbox reported "playing, but nothing here says which disk".
+
+      A BUSY DISK LOOKS LIKE A VIEWER. A rebalance reading 1.3 MB/s off
+      NU-DRIVE-1 is indistinguishable, by rate alone, from someone watching at
+      1.3 MB/s - so the sandbox put a viewer on NU-DRIVE-1 while the host,
+      reading the file's own location, said NU-DRIVE-6.
+
+    The host resolves every session exactly, through the storage layer, and it
+    is already answering /api/plex/sessions. One request replaces the whole
+    correlation with a fact. Silent and absent when there is no nuarr at the
+    other end - the guess is still there as the fallback.
+
+    Eight seconds, because unlike a file count this changes when somebody
+    presses pause.
+    """
+    now = time.time()
+    ent = _PEER_SESS.get(server)
+    if ent and now - ent["at"] < _PEER_SESS_TTL:
+        return ent["map"]
+    out: dict = {}
+    try:
+        import urllib.request
+        url = f"http://{server}:8770/api/plex/sessions"
+        with urllib.request.urlopen(url, timeout=8) as r:
+            d = json.load(r)
+        rows = d.get("sessions") if isinstance(d, dict) else d
+        for s in (rows or []):
+            k = str(s.get("key") or "").strip()
+            disk = str(s.get("disk") or "").strip()
+            if k and disk:
+                out[k] = disk
+    except Exception:                                        # noqa: BLE001
+        out = {}
+    _PEER_SESS[server] = {"at": now, "map": out}
+    return out
+
+
 def peer_counts(server: str) -> dict:
     """disk -> file count, from a nuarr running on the machine that has them."""
     now = time.time()
@@ -727,6 +778,16 @@ def infer_viewers(disks: dict) -> dict:
     # Where nuarr can resolve the session's own path to a device, that is the
     # answer, and correlating bitrates to arrive at it anyway would be choosing
     # a guess over a fact.
+    # WHAT THE HOST KNOWS, BEFORE ANYTHING IS GUESSED. On a machine with the
+    # pool attached this is empty and costs nothing; over a share it is the
+    # difference between a fact and a correlation - see peer_sessions().
+    peer: dict = {}
+    try:
+        for srv in servers():
+            peer.update(peer_sessions(srv))
+    except Exception:                                        # noqa: BLE001
+        peer = {}
+
     for s in list(live):
         # THE GATE HAS ALREADY DONE THIS, and doing it again would be slower
         # and no more correct: gate.plex_live() resolves each session's file to
@@ -734,6 +795,10 @@ def infer_viewers(disks: dict) -> dict:
         # the answer is sitting on the session already. Falling back to
         # resolving it here covers a session the gate could not place.
         label, how = (s.get("disk") or "").strip(), "member"
+        if not label:
+            told = peer.get(str(s.get("key") or "").strip())
+            if told:
+                label, how = told, "volume"
         if not label:
             f = (s.get("file") or "").strip()
             if not f:
@@ -744,7 +809,10 @@ def infer_viewers(disks: dict) -> dict:
             except Exception:                                # noqa: BLE001
                 label, how = None, ""
         if label and label in disks and how in ("member", "volume"):
-            _place(label, s, True, "the file's own location says so")
+            _place(label, s, True,
+                   "the file's own location says so"
+                   if (s.get("disk") or "").strip()
+                   else "the host resolved it from the file itself")
             # A FACT OUTRANKS A LOCK AND REPLACES IT. If the storage layer can
             # name the device, that answer is better than whatever was inferred
             # earlier, so it is written back rather than merely used.

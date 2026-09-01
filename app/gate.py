@@ -1666,6 +1666,41 @@ def _refresh_sessions() -> tuple[list[dict] | None, str]:
 # --------------------------------------------------- live panel feed ----
 # READ-ONLY. This never writes _PLEX_LIVE, _PLEX_DISKS or _LAST_BUSY, so
 # nothing a viewer does to the dashboard can change a gate decision.
+def _peer_disk(rows: list[dict]) -> list[dict]:
+    r"""Fill in the disk from the host, for a machine that cannot see the files.
+
+    WHY THE CARD HAD NO DRIVE ON THE SANDBOX. _disk_for() resolves a path
+    through the storage layer, and over a share there is nothing to resolve:
+    DrivePool answers with the pool's own serial, so every session came back
+    with disk="" and the playback card simply had nothing to show. The host has
+    the pool attached and resolves all of them exactly - so ask it, rather than
+    leaving the field blank on one machine and full on the other.
+
+    Costs nothing where it is not needed: hostio.servers() is empty when the
+    storage is local, and this returns the rows untouched.
+    """
+    try:
+        from . import hostio
+        srvs = hostio.servers()
+        if not srvs:
+            return rows
+        peer: dict = {}
+        for srv in srvs:
+            peer.update(hostio.peer_sessions(srv))
+        if not peer:
+            return rows
+        out = []
+        for s in rows:
+            if not (s.get("disk") or "").strip():
+                told = peer.get(str(s.get("key") or "").strip())
+                if told:
+                    s = dict(s, disk=told, disk_from="host")
+            out.append(s)
+        return out
+    except Exception:                                        # noqa: BLE001
+        return rows
+
+
 def panel_sessions() -> list[dict]:
     """Near-live sessions for the dashboard. Never influences the gate.
 
@@ -1673,13 +1708,14 @@ def panel_sessions() -> list[dict]:
     cards themselves can never describe two different moments.
     """
     if not (SETTINGS.plex_direct and SETTINGS.plex_url and SETTINGS.plex_token):
-        return plex_live()
+        return _peer_disk(plex_live())
     rows, _src = _sessions_shared()
     if rows is None:
         # Cannot reach Plex. The gate's last known list is a better answer than
         # an empty one, which would read as "everybody stopped".
-        return plex_live()
-    return [dict(s, disk=_disk_for(s.get("file") or "") or "") for s in rows]
+        return _peer_disk(plex_live())
+    return _peer_disk(
+        [dict(s, disk=_disk_for(s.get("file") or "") or "") for s in rows])
 
 
 def _tautulli_sessions() -> list[dict] | None:
