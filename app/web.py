@@ -11802,13 +11802,35 @@ An average hides a single pinned spindle, so read it with the rows above rather 
             // Counted across DISKS rather than sessions, so two viewers on the
             // same spindle are one entry in the sum and two in the count, the
             // same arithmetic the rows above use.
-            const V=Object.values(_plexDetail||{});
+            // WHICHEVER MAP IS IN PLAY, which is the bit this had wrong. It
+            // read _plexDetail, and that is the LOCAL resolution - on a
+            // machine reaching the pool over a share it is always empty, so
+            // the totals row showed no viewers at all while the rows directly
+            // above it each showed one. The per-disk rows already take their
+            // viewer from _hostIo when remote; the total has to read the same
+            // place or it is summing a different table from the one on screen.
+            const VM = (_remote && _hostIo && (_hostIo.hosts||[])[0]
+                        && (_hostIo.hosts[0].viewers||{}))
+                     || _plexDetail || {};
+            const V=Object.values(VM);
             const vN=V.reduce((t,x)=>t+(x.viewers||0),0);
-            const vB=V.reduce((t,x)=>t+(x.kbps||0),0)*125;
+            const vP=V.reduce((t,x)=>t+(x.paused||0),0);
+            // Only what is READING, same correction as the per-disk chips: a
+            // paused stream keeps its place and moves nothing, so adding its
+            // bitrate here would have the pool row claim throughput no disk is
+            // delivering.
+            const vB=V.reduce((t,x)=>t + ((x.who&&x.who.length)
+                ? x.who.filter(w=>w.state!=='paused')
+                       .reduce((a,w)=>a+(w.kbps||0),0)
+                : (x.paused?0:(x.kbps||0))), 0)*125;
             const view = vN
-              ? gp('io-view', vN>1?vN+' viewers':'viewer',
-                   vB>=1000 ? `<b class="m-view io-v">${mbps(vB)}</b>`
-                            : '<span class="io-idle">paused</span>')
+              ? gp('io-view',
+                   (vN>1?vN+' viewers':'viewer')
+                   + (vP ? (vN>1?' \u00b7 '+vP+' paused':' \u00b7 paused') : ''),
+                   (vN-vP)>0 && vB>=1000
+                     ? `<b class="m-view io-v">${mbps(vB)}</b>`
+                     : '<span class="io-idle" title="a paused stream keeps its'
+                       + ' place on the pool but reads nothing">holding</span>')
               : '';
             // SAME FOUR SLOTS as the rows above, so the totals sit directly
             // under the columns they total rather than in their own
