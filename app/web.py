@@ -9930,7 +9930,15 @@ tr.logrow td{background:#1c2129;border-bottom:1px solid var(--acc);padding:0 12p
    under the disk name that the name itself does not use - the row is already
    tall enough for the activity chips beneath it, so nothing moves to make
    room. Small and quiet: it is a caption on the name, not a fifth chip. */
-.xmvs{margin-top:3px;display:flex;flex-direction:column;gap:1px}
+/* ZERO LAYOUT HEIGHT, ON PURPOSE. A transfer appearing used to make its row
+   - and with it the whole panel - grow, then shrink again when it finished,
+   so the table breathed in and out while you tried to read it. The caption
+   draws in the empty space that already exists under the disk name (the row
+   is sized by the capacity bar and the activity chips, not by the name), so
+   it needs no room of its own: height 0, overflow visible, and the row's
+   height is identical whether or not anything is moving. */
+.xmvs{margin-top:2px;display:flex;flex-direction:column;gap:1px;
+      height:0;overflow:visible;position:relative;z-index:2}
 /* gap, not spaces. A flex container turns the whitespace between children
    into anonymous items and strips it, so "NU-DRIVE-10 12.0 MB/s" rendered as
    "NU-DRIVE-1012.0 MB/s" - the disk name and the rate ran together into
