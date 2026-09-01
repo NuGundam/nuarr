@@ -970,6 +970,16 @@ def recover_interrupted_commits(roots: list[str],
     started = time.time()
     dirs = files_seen = 0
     last_ping = 0.0
+    # ONE THREAD PER ROOT, for the same reason the probe above has one per
+    # volume: these are separate spindles and the walk is seek-bound, so
+    # walking them in turn leaves eleven idle while the twelfth works. The
+    # probe was parallel and the repair it leads to was not, which is the wrong
+    # way round - the repair is the slow half.
+    #
+    # The shared counters are touched under a lock, but only every 200
+    # directories: taking it per directory would serialise the twelve threads
+    # on the one thing they all touch and undo the whole point.
+    lock = threading.Lock()
 
     def ping(root: str, where: str, force: bool = False) -> None:
         # Time-based, not count-based. Folders vary from one file to hundreds,
@@ -988,13 +998,20 @@ def recover_interrupted_commits(roots: list[str],
             except Exception:
                 pass
 
-    for root in roots:
+    def _one_root(root: str) -> None:
+        nonlocal dirs, files_seen
+        local_d = local_f = 0
         if not os.path.isdir(root):
-            continue
+            return
         ping(root, "", force=True)
         for dirpath, _d, filenames in os.walk(root):
-            dirs += 1
-            files_seen += len(filenames)
+            local_d += 1
+            local_f += len(filenames)
+            if local_d % 200 == 0:
+                with lock:
+                    dirs += local_d
+                    files_seen += local_f
+                    local_d = local_f = 0
             # The folder name relative to the root, so the caller can show
             # "TV Shows › Watchmen" rather than a 200-character path.
             try:
@@ -1022,7 +1039,16 @@ def recover_interrupted_commits(roots: list[str],
                     ping(root, rel, force=True)       # a find is worth saying
                 except OSError:
                     continue
+        with lock:
+            dirs += local_d
+            files_seen += local_f
         ping(root, "", force=True)
+
+    if roots:
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(16, len(roots)),
+                thread_name_prefix="bakfix") as ex:
+            list(ex.map(_one_root, roots))
     return fixed
 
 

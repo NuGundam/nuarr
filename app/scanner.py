@@ -25,6 +25,8 @@ import asyncio
 import ctypes
 import json
 import os
+import threading
+import concurrent.futures
 import re
 import time
 from ctypes import wintypes
@@ -616,6 +618,30 @@ def _watched_disks() -> set:
         return set()
 
 
+# HOW LONG TO STAND OFF A BUSY SPINDLE, and what counts as busy.
+#
+# 60% is the figure the job gate already treats as contended, so the scan and
+# the queue agree about what a busy disk is rather than each carrying its own.
+#
+# THE WAIT IS SHORT BECAUSE THE WALK IS SHORT, and that was measured rather than
+# guessed. With one thread per disk, eleven spindles finished in about two
+# seconds; the twelfth was 86% busy under a 200 MB/s write and was waited on for
+# the full two minutes the first version allowed. So a two-minute stand-off was
+# buying politeness for a two-second job and turning a twenty-second scan into a
+# two-minute one - the wait had become the entire cost of the pass.
+#
+# Thirty seconds covers what is actually worth waiting for: a commit or a remux
+# finishing. Past that the disk is busy for a reason that is not going away - a
+# Plex refresh, a rebalance, another program entirely - and the answer is not
+# more patience but the same one a viewer's disk gets: walk it at Very Low I/O
+# priority, where the other program's reads overtake ours. Metadata is cheap
+# enough that this is genuinely unobtrusive.
+#
+# A viewer is never waited out at all. They can watch for two hours.
+SCAN_BUSY_PCT = 60.0
+SCAN_WAIT_S = 30.0
+
+
 def scan_pool(pool_root: str = "P:\\", libraries: list[str] | None = None
               ) -> dict[str, DiskFile]:
     r"""Walk every pool disk. Returns normcased P:\ path -> DiskFile.
@@ -673,29 +699,103 @@ def scan_pool(pool_root: str = "P:\\", libraries: list[str] | None = None
         keys = {lbl: 0.0 for lbl in disks}
     # A viewer outranks any amount of measured load: 40% busy from a remux is
     # something to work around, a person watching is something to stay off.
+    # STILL ORDERED, THOUGH IT MATTERS LESS NOW. With one thread per disk the
+    # queue drains all at once, so "last" no longer means "in several minutes";
+    # what the order buys is which disks the first threads pick up when there
+    # are more spindles than workers, and a sensible order to report them in.
+    # The real deferral is the wait inside each worker.
     order = sorted(disks, key=lambda l: (1 if l in watched else 0, keys.get(l, 0.0)))
     if order != list(disks):
         head, tail = order[0], order[-1]
         joblog.log(
-            f"scan order: starting on {head} ({keys.get(head, 0):.0f}% busy), "
-            f"leaving {tail} until last"
+            f"scan order: {head} first ({keys.get(head, 0):.0f}% busy), "
+            f"{tail} last"
             + (f" — someone is watching from {', '.join(sorted(watched))}"
                if watched else f" ({keys.get(tail, 0):.0f}% busy)"), "debug")
         disks = {l: disks[l] for l in order}
 
     from .fileops import _BackgroundIO
-    bg = _BackgroundIO()
     _progress_reset(len(disks))
-    try:
-        for i, (label, part) in enumerate(disks.items(), 1):
-            # Re-read per disk: viewers start and stop during a pass.
-            bg.set(label in _watched_disks())
-            PROGRESS.update(disk=label, disk_i=i)
+    # ONE THREAD PER SPINDLE. These are twelve independent disks and the walk is
+    # pure seek latency, so taking turns wastes eleven of them: the same
+    # asymmetry measured elsewhere in this project, where four streams sharing
+    # one disk managed 63 MB/s and the same work spread over four ran at 997.
+    # The interrupted-commit probe was already parallel for exactly this reason;
+    # the scan, which does far more per disk, was still going one at a time.
+    #
+    # Merged at the end rather than into one shared dict. Each worker fills its
+    # own and the keys are full paths, so they cannot collide - and no lock is
+    # taken on the hot path, which is the thing that would have quietly
+    # serialised twelve threads again.
+    #
+    # WAITING IS PART OF THE WORK, NOT AN INTERRUPTION OF IT. The old ordering -
+    # quietest disk first, a viewer's disk last - only worked because the walk
+    # was serial: "last" meant "in several minutes". Started together, last
+    # means nothing, so the deferral has to become an actual wait. A worker that
+    # picks up a busy spindle stands off until it goes quiet, up to a bounded
+    # time, and then walks it in background I/O mode so a viewer's reads
+    # overtake ours. Eleven idle disks are scanned while it waits.
+    per: dict = {}
+    lock = threading.Lock()
+
+    def _busy_now(label: str) -> float:
+        try:
+            from . import diskload
+            k = diskload.key_for_path(disks[label])
+            if not k:
+                return 0.0
+            row = (diskload.sustained() or {}).get(k) or {}
+            return float(row.get("busy") or 0.0)
+        except Exception:                                    # noqa: BLE001
+            return 0.0
+
+    def _wait_for_quiet(label: str) -> str:
+        r"""Stand off a busy spindle. Returns why we stopped waiting.
+
+        A viewer is never waited out - they can watch for an hour, and the
+        answer there is to walk gently rather than to not walk at all. Machine
+        load is different: an encode or a commit finishes, and arriving after it
+        costs nothing but patience.
+        """
+        if label in _watched_disks():
+            return "someone is watching - walking in background I/O"
+        deadline = time.time() + SCAN_WAIT_S
+        waited = 0.0
+        while time.time() < deadline:
+            b = _busy_now(label)
+            if b < SCAN_BUSY_PCT:
+                return f"waited {waited:.0f}s for it to go quiet" if waited else ""
+            with lock:
+                per.setdefault(label, {})["state"] = f"waiting ({b:.0f}% busy)"
+            time.sleep(2.0)
+            waited += 2.0
+        return (f"still busy after {SCAN_WAIT_S:.0f}s - walking it in "
+                f"background I/O")
+
+    def _one(label: str) -> dict:
+        part = disks[label]
+        mine: dict[str, DiskFile] = {}
+        with lock:
+            per[label] = {"files": 0, "state": "starting", "note": ""}
+        note = _wait_for_quiet(label)
+        # Per THREAD, which is what this class does - each worker sets its own
+        # priority and nothing else in the process is affected.
+        bg = _BackgroundIO()
+        try:
+            # BACKGROUND I/O FOR A VIEWER, AND FOR A DISK THAT STAYED BUSY.
+            # Giving up after the wait and then walking at normal priority
+            # would be the worst of both - the delay AND the contention. If it
+            # is still busy, that is precisely when the walk should be the one
+            # that yields.
+            bg.set(label in _watched_disks() or "background I/O" in note)
+            with lock:
+                per[label].update(state="walking", note=note)
             for lib_dir in os.listdir(part) if os.path.isdir(part) else []:
                 real_lib = lib_lookup.get(lib_dir.lower())
                 if not real_lib:
                     continue
-                PROGRESS["library"] = real_lib
+                with lock:
+                    per[label]["library"] = real_lib
                 base = os.path.join(part, lib_dir)
                 for dirpath, _dirs, files in os.walk(base):
                     for fn in files:
@@ -712,16 +812,52 @@ def scan_pool(pool_root: str = "P:\\", libraries: list[str] | None = None
                             st = os.stat(real)
                         except OSError:
                             continue
-                        found[os.path.normcase(pooled)] = DiskFile(
+                        mine[os.path.normcase(pooled)] = DiskFile(
                             path=pooled, real_path=real, disk=label,
                             library=real_lib,
                             size=st.st_size, mtime=_sane_mtime(st, walk_now),
                         )
-                        PROGRESS["files"] = len(found)
-    finally:
-        # Hand the pooled thread back at normal priority, or whatever runs on
-        # it next inherits Very Low I/O for the life of the process.
-        bg.set(False)
+                    # Cheap and often enough to watch: the counter is this
+                    # worker's own, and only the totals need the lock.
+                    if len(mine) % 250 == 0:
+                        with lock:
+                            per[label]["files"] = len(mine)
+                            PROGRESS["files"] = (
+                                len(found) + sum(p.get("files", 0)
+                                                 for p in per.values()))
+        finally:
+            # Hand the thread back at normal priority, or whatever runs on it
+            # next inherits Very Low I/O for the life of the process.
+            bg.set(False)
+        with lock:
+            per[label].update(files=len(mine), state="done")
+        return mine
+
+    if disks:
+        # Bounded, but the bound is the disk count - there is no gain in more
+        # threads than spindles, and a machine with one drive gets one thread
+        # and behaves exactly as it did before.
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(16, len(disks)),
+                thread_name_prefix="scanwalk") as ex:
+            futures = {ex.submit(_one, lbl): lbl for lbl in disks}
+            done_n = 0
+            for fut in concurrent.futures.as_completed(futures):
+                lbl = futures[fut]
+                done_n += 1
+                try:
+                    found.update(fut.result())
+                except Exception as e:                       # noqa: BLE001
+                    joblog.log(f"scan: {lbl} failed: "
+                               f"{type(e).__name__}: {e}", "warn")
+                with lock:
+                    PROGRESS.update(disk=lbl, disk_i=done_n,
+                                    files=len(found),
+                                    per={k: dict(v) for k, v in per.items()})
+        waited = [f"{k} {v['note']}" for k, v in sorted(per.items())
+                  if v.get("note")]
+        if waited:
+            joblog.log("scan: " + "; ".join(waited), "debug")
 
     # ---- LIBRARIES THAT ARE NOT ON THE POOL AT ALL -------------------------
     # Everything above walks DrivePool's PoolPart folders, which is right for

@@ -12304,7 +12304,23 @@ async function loadLibs(){
     // The disk counter only means anything DURING the walk. Leaving it up
     // afterwards showed a frozen 12/12 and looked like a hang.
     if(walking && p.disks){
-      if(p.disk) bits.push(`disk ${p.disk_i}/${p.disks} (${esc(p.disk)})`);
+      // ALL OF THEM AT ONCE NOW, so "disk 7 of 12" is the wrong sentence -
+      // it described a queue that no longer exists. What is worth saying is
+      // how many have finished and how many are still going, and which one is
+      // standing off a spindle somebody else is using.
+      const per=p.per||{};
+      const names=Object.keys(per);
+      if(names.length){
+        const done=names.filter(n=>per[n].state==='done').length;
+        const waiting=names.filter(n=>String(per[n].state||'').startsWith('waiting'));
+        bits.push(`${done}/${names.length} disks done`);
+        if(waiting.length)
+          bits.push(`<span class="warn" title="${esc(waiting.map(n=>
+            n+' — '+per[n].state).join('\n'))}">${waiting.length} waiting for `
+            + `a busy disk</span>`);
+      } else if(p.disk){
+        bits.push(`disk ${p.disk_i}/${p.disks} (${esc(p.disk)})`);
+      }
       if(p.library) bits.push(esc(p.library));
     }
     if(p.files) bits.push(`${fmt(p.files)} files`
