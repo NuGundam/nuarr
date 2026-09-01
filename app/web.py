@@ -10986,9 +10986,22 @@ guess.">looks like data moving</span>${other.slice(0,3).map(m=>pair(m,'')).join(
           + (W.paused?`\n\n${W.paused} paused — counted, but adding nothing to `
                      +`the rate, because a paused stream is not reading.`:'');
         viewGrp = `<span class="io-grp io-view" title="${esc(tip)}"
-          ><span class="io-gl">${W.viewers>1?W.viewers+' viewers':'viewer'}</span>`
+          ><span class="io-gl">${(() => {
+            // A PAUSED VIEWER IS STILL A VIEWER, and this made it look
+            // like neither: a bare grey "paused" where the rate goes, so
+            // a disk holding a paused stream read as an idle disk. That
+            // is why two people watching looked like one. Measured here:
+            // NU-DRIVE-4 playing at 1,971 kbps and NU-DRIVE-1 holding a
+            // paused OVERLORD, and only the first looked occupied.
+            const vN=W.viewers||0, pN=W.paused||0;
+            return (vN>1 ? vN+' viewers' : 'viewer')
+                 + (pN ? (vN>1 ? ' \u00b7 '+pN+' paused' : ' \u00b7 paused') : '');
+          })()}</span>`
           + (bps>=1000 ? `<b class="m-view io-v">${mbps(bps)}</b>`
-                       : '<span class="io-idle">paused</span>')
+               // Paused holds the spindle without reading from it, so
+               // there is no rate - but say it is holding, not absent.
+               : '<span class="io-idle" title="a paused stream keeps its'
+                 + ' place on this disk but reads nothing">holding</span>')
           + '</span>';
       }
       // FOUR BUBBLES, ALWAYS PRESENT, ALWAYS THE SAME SIZE.
