@@ -374,6 +374,10 @@ class Settings:
     # real-mode test switch, and the UI says loudly when it is on - two
     # machines processing one library is safe only while somebody watches.
     observer_mode: str = "auto"
+    # "manual" (default) or "auto". Auto lets the rule check blocklist and
+    # re-search a release whose audio is in no language its library keeps -
+    # the only irreversible thing the audit can do, hence opt-in.
+    audit_mode: str = "manual"
 
     # SUBTITLE OCR - the switches behind Settings -> Subtitle OCR. Defaults
     # match the measured thresholds in subocr.py; the page can move them.

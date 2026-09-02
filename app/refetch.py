@@ -139,7 +139,7 @@ def _arr_for(library: str):
                  if c.enabled and c.api_key and c.kind == want), None)
 
 
-async def plan(file_id: int) -> dict:
+async def plan(file_id: int, reason: str = "") -> dict:
     """What WOULD happen. Never changes anything.
 
     The UI calls this before showing a confirmation, so every refusal reason
@@ -148,7 +148,17 @@ async def plan(file_id: int) -> dict:
     row = _file_row(file_id)
     if not row:
         return {"ok": False, "why": "no such file"}
-    kind, why = classify(row.get("state_reason"))
+    # A CALLER MAY BRING ITS OWN REASON. classify() reads state_reason, which
+    # is how the pipeline records a FAILURE - and a file the rule check flags
+    # has not failed anything: it imported cleanly, plays fine, and is simply
+    # the wrong release. Its state_reason is empty, so classify returned
+    # "unrecognised error" and the panel was told re-downloading cannot fix a
+    # file for which re-downloading is the only fix. The audit passes its rule
+    # here instead; nothing else about the flow changes.
+    if reason:
+        kind, why = "content", reason
+    else:
+        kind, why = classify(row.get("state_reason"))
     out = {"ok": False, "file_id": file_id, "title": row.get("title"),
            "path": row.get("path"), "size": row.get("size"),
            "state": row.get("state"), "reason": row.get("state_reason"),
@@ -202,14 +212,15 @@ async def plan(file_id: int) -> dict:
     return out
 
 
-async def run(file_id: int, delete_file: bool = True) -> dict:
+async def run(file_id: int, delete_file: bool = True,
+              reason: str = "") -> dict:
     """Blocklist the release and search for a replacement. Destructive.
 
     Re-plans rather than trusting whatever the caller was shown: the panel may
     have been open for a while, and the file may have been fixed or removed in
     the meantime.
     """
-    p = await plan(file_id)
+    p = await plan(file_id, reason=reason)
     if not p.get("ok") and not p.get("can_search"):
         return p
     row = _file_row(file_id)

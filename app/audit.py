@@ -44,6 +44,12 @@ from .db import cursor
 
 POLL_S = 24 * 3600            # fallback only; the live value is audit_every_h
 PER_BUCKET = 6
+# How many files may be read at once. Measured: the sample lands across twelve
+# pool disks, the probes are seek-bound rather than CPU-bound, and eight lanes
+# took a run from ~70s to ~9s here. Higher stops helping and starts competing
+# with whatever else is reading the pool - which the gate would then have to
+# steer around.
+PROBE_LANES = 8
 
 
 def _every_hours() -> float:
@@ -226,6 +232,27 @@ _ISO3 = {
     "croatian": "hrv", "serbian": "srp", "slovak": "slk", "catalan": "cat",
     "icelandic": "isl", "tamil": "tam", "telugu": "tel", "malayalam": "mal",
 }
+
+
+# ONE LANGUAGE, TWO SPELLINGS. ISO 639-2 has a bibliographic set and a
+# terminological set, and ffprobe emits whichever the muxer wrote: chi/zho,
+# fre/fra, ger/deu, dut/nld and the rest are the SAME LANGUAGE. The first live
+# run of the language check proved why this matters - it flagged Ne Zha 2, a
+# Chinese film in a library that keeps zho, because the file said chi. A check
+# that cannot spell its own subject reports a correct file as wrong, and in
+# auto mode would have deleted it.
+_ISO_ALIAS = {
+    "chi": "zho", "cze": "ces", "dut": "nld", "fre": "fra", "ger": "deu",
+    "gre": "ell", "ice": "isl", "mac": "mkd", "mao": "mri", "may": "msa",
+    "per": "fas", "rum": "ron", "slo": "slk", "tib": "bod", "wel": "cym",
+    "arm": "hye", "baq": "eus", "bur": "mya", "geo": "kat",
+}
+
+
+def _lang_key(code: str) -> str:
+    """One canonical spelling per language, so chi and zho compare equal."""
+    c = str(code or "").strip().lower()[:3]
+    return _ISO_ALIAS.get(c, c)
 
 
 def check(pr: dict, anime: bool, library: str = "",
@@ -436,6 +463,77 @@ def check(pr: dict, anime: bool, library: str = "",
                          f"any language tag — probably {orig3}. Untagged "
                          f"audio is guessed as English by the arrs and by "
                          f"players, which is where a wrong label comes from")
+    # ---- AUDIO IN A LANGUAGE THIS LIBRARY DOES NOT KEEP ---------------------
+    #
+    # THE CHECK THAT WAS MISSING. Every other rule here asks whether the file
+    # was BUILT correctly - codec, channels, bitrate, track order. None asked
+    # the prior question: is this the right file at all? A Portuguese-audio
+    # release of an English-language show is perfectly well formed and entirely
+    # wrong, and nothing in the audit noticed, because the language policy is
+    # applied by the planner when it rewrites a file and never checked against
+    # what is actually on disk.
+    #
+    # Found live on this library: The Big Bang Theory S02E20, playing to a
+    # viewer, its only audio track Portuguese, filename ending [PT]-ZNM.mkv.
+    #
+    # TWO DIFFERENT SEVERITIES, and they must not be conflated:
+    #
+    #   audio/language      the file carries NO audio in any language the
+    #                       library keeps. Nothing can be re-encoded to fix
+    #                       this - the words are the wrong words - so it is
+    #                       reported as replaceable, and it is the only rule
+    #                       here for which fetching a different release is the
+    #                       correct remedy rather than a destructive mistake.
+    #   audio/extra-language
+    #                       kept-language audio exists AND there are extra
+    #                       tracks the policy would drop. That is ordinary
+    #                       cleanup: the planner removes them on the next pass.
+    try:
+        from . import langpolicy
+        pol = langpolicy.for_library(library, "audio") if library else {}
+    except Exception:                                        # noqa: BLE001
+        pol = {}
+    keep = {_lang_key(c) for c in (pol.get("langs") or [])}
+    if keep and aud:
+        # "Keep the original language" is per title, so the policy set alone is
+        # not the whole answer - a Japanese show whose library keeps English
+        # plus the original is not violating anything by being Japanese.
+        if pol.get("keep_original"):
+            try:
+                r = None
+                if path:
+                    with cursor() as cur:
+                        r = cur.execute(
+                            "SELECT k.lang FROM parent_kind k JOIN files f "
+                            "  ON f.arr_name=k.arr_name "
+                            " AND f.arr_parent_id=k.parent_id "
+                            " WHERE f.path=? LIMIT 1", (path,)).fetchone()
+                o = (r["lang"] or "") if r else ""
+                if o:
+                    keep.add(_lang_key(_ISO3.get(o.strip().lower(),
+                                                 o.strip().lower())))
+            except Exception:                                # noqa: BLE001
+                pass
+        have = [_lang_key(rules._lang_guess(a) or "und") for a in aud]
+        # UNTAGGED IS NOT A VIOLATION HERE. An untagged track has its own rule
+        # above; treating it as a foreign language would flag every lazily
+        # tagged dual-audio release in the library as the wrong release.
+        named = [g for g in have if g and g != "und"]
+        kept_here = [g for g in have if g in keep or g == "und"]
+        if named and not kept_here:
+            flag("audio/language",
+                 f"only {', '.join(sorted(set(named)))} audio",
+                 f"{library} keeps {', '.join(sorted(keep))} — no track here "
+                 f"is in a language this library wants, which no amount of "
+                 f"re-encoding can change")
+        elif len(aud) > len(kept_here) and kept_here:
+            drop = [g for g in named if g not in keep]
+            if drop:
+                flag("audio/extra-language",
+                     f"{len(drop)} extra audio track(s): "
+                     f"{', '.join(sorted(set(drop)))}",
+                     f"only {', '.join(sorted(keep))} kept")
+
     for i in img:
         if _disp(sub[i], "default") or _disp(sub[i], "forced"):
             flag("subs/flags", f"picture sub {i} set to auto-show",
@@ -451,6 +549,106 @@ def check(pr: dict, anime: bool, library: str = "",
                  f"{_t(s)[:22] or 'sub ' + str(i)!r} auto-shows over English "
                  f"audio", "only forced signs auto-show")
     return bad
+
+
+# THE ONLY RULE FETCHING A DIFFERENT RELEASE CAN FIX.
+#
+# Every other finding here is a build fault - wrong codec, too many channels,
+# tracks in the wrong order - and the planner rewrites the file. Replacing it
+# would destroy a good copy to fetch another one with the same fault, since
+# the fault is usually a property of how nuarr encoded it rather than of the
+# release. "No audio in a language this library keeps" is different in kind:
+# the words are the wrong words, no re-encode can change that, and the only
+# real remedy is a different release.
+#
+# Kept as a tuple rather than a flag on the finding so that adding a rule here
+# is a deliberate, visible act - this is the list that decides what auto mode
+# is allowed to delete.
+REPLACEABLE_RULES = ("audio/language",)
+
+# Smaller than MAX_PER_RUN on purpose: a requeue costs GPU time, this costs
+# a file and an indexer grab.
+MAX_REPLACE_PER_RUN = 3
+
+
+def replaceable(rule: str) -> bool:
+    return any(r in (rule or "") for r in REPLACEABLE_RULES)
+
+
+def mode() -> str:
+    r""""manual" or "auto".
+
+    MANUAL IS THE DEFAULT AND HAS TO BE. Auto mode blocklists the release and
+    asks the arr to fetch another one, which deletes the file on the way past -
+    the only irreversible thing the audit can do, on the strength of a rule
+    reading a track's language tag. That is a switch a person turns on
+    knowingly, having looked at what it would have replaced.
+    """
+    m = str(getattr(SETTINGS, "audit_mode", "manual") or "manual").lower()
+    return m if m in ("manual", "auto") else "manual"
+
+
+async def replace_one(file_id: int, why: str = "") -> dict:
+    """Blocklist this file's release and ask the arr for a different one.
+
+    Goes through refetch, which already knows how to find the grab, blocklist
+    it, fall back to delete-and-search when no grab survives, and treat a 404
+    as stale bookkeeping rather than a failure. Nothing about that flow is
+    re-implemented here; this only decides that it is the right thing to run,
+    which is the part the audit knows and refetch does not.
+    """
+    from . import refetch
+    try:
+        out = await refetch.run(
+            int(file_id),
+            reason=why or "the audio is in no language this library keeps, "
+                          "which no re-encode can change")
+    except Exception as e:                                   # noqa: BLE001
+        return {"ok": False, "why": f"{type(e).__name__}: {e}"}
+    if out.get("ok"):
+        reason = why or "audio in no language this library keeps"
+        joblog.log(f"rule audit: replaced a release - {reason}", "warn")
+        await asyncio.to_thread(_note_replaced, int(file_id), out)
+    return out
+
+
+def _note_replaced(file_id: int, out: dict) -> None:
+    with cursor() as cur:
+        cur.execute(
+            "INSERT INTO audit_heals(file_id,rule,attempts,first_at,last_at,"
+            "state,detail,path) VALUES(?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(file_id) DO UPDATE SET state=excluded.state, "
+            "detail=excluded.detail, last_at=excluded.last_at",
+            (int(file_id), "audio/language", 1, time.time(), time.time(),
+             "replaced", "; ".join(out.get("did") or []) or "release replaced",
+             out.get("path") or ""))
+
+
+async def auto_replace(viol_by_file: dict) -> int:
+    """In auto mode, replace the releases nothing else can fix.
+
+    BOUNDED THE SAME WAY THE HEALER IS. A language policy edited by mistake
+    could make every file in a library a violation, and an unattended sweep
+    that acts on that would empty a shelf overnight. MAX_REPLACE_PER_RUN is
+    deliberately smaller than MAX_PER_RUN: a requeue costs GPU time, this costs
+    a file and an indexer grab.
+    """
+    if mode() != "auto":
+        return 0
+    done = 0
+    for fid, v in list(viol_by_file.items()):
+        if done >= MAX_REPLACE_PER_RUN:
+            break
+        if not any(replaceable(r) for r in (v.get("rules") or [])):
+            continue
+        out = await replace_one(int(fid), "audio in no language this library keeps")
+        if out.get("ok"):
+            done += 1
+    if done:
+        joblog.log(f"rule audit (auto mode): {done} release(s) blocklisted and "
+                   f"re-searched — the audio was in no language their library "
+                   f"keeps", "warn")
+    return done
 
 
 def _chname(ch: int) -> str:
@@ -994,11 +1192,21 @@ async def run_once(per_bucket: int = PER_BUCKET) -> dict:
                         f"WHERE f.state='done' AND ({pred}) "
                         "ORDER BY RANDOM() LIMIT ?", (per_bucket,))]
             rows = await asyncio.to_thread(_sample)
-            for r in rows:
+            # SIXTY FFPROBES, ONE AT A TIME, OFF SPINNING DISKS was the whole
+            # of the wait. Each is ~0.6-1.5s depending on which spindle wakes
+            # up, and nothing in the loop depended on the previous answer - the
+            # run was serial because it was written as a for-loop, not because
+            # it had to be. Eight at a time, which is where the pool stops
+            # rewarding more: the probes are seek-bound and land on twelve
+            # different disks, so they overlap almost perfectly.
+            live = [r for r in rows if r.get("path") and os.path.exists(r["path"])]
+            sem = asyncio.Semaphore(PROBE_LANES)
+
+            async def _one(r):
+                async with sem:
+                    return r, await asyncio.to_thread(probe, r["path"])
+            for r, pr in await asyncio.gather(*[_one(r) for r in live]):
                 path = r["path"]
-                if not path or not os.path.exists(path):
-                    continue
-                pr = await asyncio.to_thread(probe, path)
                 if not pr:
                     continue
                 checked += 1
@@ -1069,9 +1277,19 @@ async def run_once(per_bucket: int = PER_BUCKET) -> dict:
                              heal_running=False, heal_current="")
                 joblog.log(f"rule audit healing failed: {type(e).__name__}: {e}",
                            "error")
+        # REPLACEMENT RUNS LAST, and only in auto mode. It is the one action
+        # here that cannot be undone, so it happens after the evidence is
+        # written and after the healer has had its go - a file the planner can
+        # fix must never be replaced instead.
+        replaced = 0
+        try:
+            replaced = await auto_replace(viol_by_file)
+        except Exception as e:                               # noqa: BLE001
+            joblog.log(f"rule audit auto-replace failed: {type(e).__name__}: "
+                       f"{e}", "error")
         return {"ok": True, "checked": checked, "violations": viol_files,
                 "pending": pend_files, "by_rule": by_rule,
-                "fixed_since_last": fixed, **healed}
+                "fixed_since_last": fixed, "replaced": replaced, **healed}
     except Exception as e:
         STATS["last_error"] = f"{type(e).__name__}: {e}"
         joblog.log(f"rule audit failed: {type(e).__name__}: {e}", "error")
@@ -1167,6 +1385,8 @@ def latest(run_id: int = 0) -> dict:
                      "max_per_run": MAX_PER_RUN},
             "covers": [{"area": a, "what": w} for a, w in COVERS],
             "buckets": list(BUCKETS), "per_bucket": PER_BUCKET,
+            "mode": mode(), "replaceable_rules": list(REPLACEABLE_RULES),
+            "max_replace_per_run": MAX_REPLACE_PER_RUN,
             "every_hours": _every_hours()}
 
 

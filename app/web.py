@@ -6638,6 +6638,74 @@ async def api_audit_run(per_bucket: int = Query(6, le=40)):
     return await audit.run_once(per_bucket=per_bucket)
 
 
+@app.post("/api/audit/mode")
+def api_audit_mode(mode: str):
+    """manual or auto. Auto is the only setting here that deletes anything."""
+    from . import audit
+    m = (mode or "").lower()
+    if m not in ("manual", "auto"):
+        return {"ok": False, "error": "mode must be manual or auto"}
+    import yaml
+    from .config import SETTINGS as _S
+    cp = _config_path()
+    raw = {}
+    if cp.exists():
+        try:
+            raw = yaml.safe_load(cp.read_text(encoding="utf-8-sig")) or {}
+        except Exception:                                    # noqa: BLE001
+            raw = {}
+    raw["audit_mode"] = m
+    cp.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True),
+                  encoding="utf-8")
+    _S.audit_mode = m
+    joblog.log(f"rule check set to {m} mode"
+               + (" - releases with no kept-language audio will be blocklisted "
+                  "and re-downloaded without asking" if m == "auto" else ""),
+               "warn" if m == "auto" else "info")
+    return {"ok": True, "mode": audit.mode()}
+
+
+@app.get("/api/audit/file")
+async def api_audit_file(file_id: int):
+    """Everything behind one finding, fetched when its row is opened.
+
+    Includes the refetch PLAN - what blocklisting would actually do, which
+    release it would reject, whether a grab even survives - because a button
+    that deletes a file should say what it is about to delete before it is
+    pressed, not after.
+    """
+    from . import audit, refetch
+    out = {"file_id": int(file_id), "findings": [], "heal": {}, "file": {}}
+    rows = _rows("SELECT id,path,title,library,state,state_reason "
+                 "FROM files WHERE id=?", (int(file_id),))
+    out["file"] = dict(rows[0]) if rows else {}
+    out["findings"] = [dict(r) for r in _rows(
+        "SELECT rule,found,want,detail,at,bucket FROM audit_findings "
+        "WHERE file_id=? ORDER BY at DESC LIMIT 8", (int(file_id),))]
+    h = _rows("SELECT rule,state,detail,attempts,last_at FROM audit_heals "
+              "WHERE file_id=?", (int(file_id),))
+    out["heal"] = dict(h[0]) if h else {}
+    out["replaceable"] = any(audit.replaceable(f.get("rule") or "")
+                             for f in out["findings"])
+    if out["replaceable"]:
+        try:
+            p = await refetch.plan(
+                int(file_id),
+                reason="the rule check found audio in no language this "
+                       "library keeps")
+            out["replace_plan"] = p
+        except Exception as e:                               # noqa: BLE001
+            out["replace_plan"] = {"why": f"{type(e).__name__}: {e}"}
+    return out
+
+
+@app.post("/api/audit/replace")
+async def api_audit_replace(file_id: int):
+    """Blocklist this file's release and ask for another. Destructive."""
+    from . import audit
+    return await audit.replace_one(int(file_id), "asked for from the rule check")
+
+
 @app.post("/api/audit/heal/clear")
 def api_audit_heal_clear(file_id: int):
     """Drop a terminal heal verdict, so the next run may try the file again."""
@@ -14543,6 +14611,112 @@ function auHealCell(h){
 // and whichever request happened to finish last won regardless of which run
 // was actually asked for last.
 let _auSeq=0, _auBusy=false;
+// ---- the rule check's own drop-down, mode strip and replace action --------
+// Modelled on the Signs-or-dialogue card, which Erik asked for by name: a
+// mode strip that says what the check does unattended, a table of what it
+// found, and the full story of one row on click rather than three stacked
+// lines in every row.
+let _auOpen=null, _auDetailHtml='', _auMode='manual';
+
+// Which rules a different release can fix. Kept in step with audit.py's
+// REPLACEABLE_RULES by being sent with the payload rather than re-listed here;
+// this is only the fallback for an older server.
+let _auReplaceable=['audio/language'];
+function audit_replaceable(rule){
+  return _auReplaceable.some(r => String(rule||'').includes(r));
+}
+
+async function auMode(m){
+  const el=document.getElementById('auModeMsg');
+  if(el) el.textContent=' saving…';
+  try{ await fetch('/api/audit/mode?mode='+encodeURIComponent(m),{method:'POST'}); }
+  catch(e){ if(el) el.textContent=' could not change the mode'; return; }
+  _auMode=m;
+  if(el) el.textContent='';
+  loadAudit();
+}
+
+async function auDetail(id){
+  if(_auOpen===id){ _auOpen=null; _auDetailHtml=''; loadAudit(); return; }
+  _auOpen=id; _auDetailHtml=''; loadAudit();
+  let d;
+  try{ d=await (await fetch('/api/audit/file?file_id='+encodeURIComponent(id))).json(); }
+  catch(e){ _auDetailHtml='<div class="dim" style="padding:8px">could not load</div>';
+            loadAudit(); return; }
+  if(_auOpen!==id) return;
+  const f=d.file||{}, h=d.heal||{}, hist=(d.findings||[]);
+  const found=hist.map(x=>`<div class="sdrow">
+      <span class="sdk">${esc(x.rule||'')}</span>
+      <span class="sdv">${x.found?esc(x.found)+' <span class="dim">→ '
+        +esc(x.want||'')+'</span>':esc(x.detail||'')}</span>
+      <span class="sdt">${ago(x.at)}</span></div>`).join('');
+  const tried = h.state
+    ? `<div class="sdrow"><span class="sdk">${esc(h.state)}</span>
+        <span class="sdv">${esc(h.detail||'')}</span>
+        <span class="sdt">${ago(h.last_at)}</span></div>`
+    : '<div class="sdrow dim">nothing has been attempted on this file yet</div>';
+  // WHAT CAN BE DONE, AND WHAT IT COSTS - stated before the button, because
+  // one of these two buttons deletes a file.
+  const canReplace = d.replaceable;
+  const rp = d.replace_plan || {};
+  _auDetailHtml=`
+    <div class="sdrop">
+      <div style="margin-bottom:8px;font-size:13px">
+        <b style="color:#6fb0ff">${esc(h.state||'still broken')}</b>
+        <span class="dim"> — ${esc(h.detail||'the check found this and nothing has acted on it yet')}</span>
+      </div>
+      <div class="sdh">What the check found</div>
+      ${found||'<div class="sdrow dim">no stored findings</div>'}
+      <div class="sdh" style="margin-top:9px">What has been attempted</div>
+      ${tried}
+      <div class="sdh" style="margin-top:9px">What can be done</div>
+      <div class="sdrow">
+        <span class="sdk">re-encode</span>
+        <span class="sdv">Plan this file again under the current rules and queue
+          it if the planner has work. Fixes build faults; cannot change what
+          language the words are in.</span>
+        <span class="sdt"><button onclick="auRequeue(${f.id})">Requeue</button></span>
+      </div>
+      ${canReplace?`<div class="sdrow">
+        <span class="sdk">replace</span>
+        <span class="sdv">Blocklist the release and ask
+          ${esc(rp.arr||'the arr')} for a different one.
+          <b style="color:var(--bad)">This deletes the file.</b>
+          ${rp.release?`Release: <span class="mono">${esc(rp.release)}</span>.`:''}
+          ${rp.why?`<span class="dim"> ${esc(rp.why)}</span>`:''}
+          ${rp.warning?`<div style="color:var(--warn);margin-top:2px">${esc(rp.warning)}</div>`:''}</span>
+        <span class="sdt"><button onclick="auReplace(${f.id})"
+          ${rp.ok||rp.can_search?'':'disabled'}>Blocklist and re-download</button></span>
+      </div>`:`<div class="sdrow dim">
+        <span class="sdk">replace</span>
+        <span class="sdv">not offered for this rule — a different release would
+          have the same fault, so it would destroy a file for nothing</span></div>`}
+      <div class="dim" style="margin-top:9px;font-size:11px">
+        <div class="mono" style="opacity:.65;word-break:break-all">${esc(f.path||'')}</div>
+      </div>
+      <div class="dim" id="auact${f.id}" style="margin-top:6px"></div>
+    </div>`;
+  loadAudit();
+}
+
+async function auReplace(id){
+  if(!confirm('Blocklist this release and ask the arr for a different one?\\n\\n'
+    +'The file is deleted as part of this. It is the right fix only when the '
+    +'audio is in a language this library does not keep - no re-encode can '
+    +'change what language the words are in.')) return;
+  const box=document.getElementById('auact'+id);
+  if(box) box.innerHTML='<span class="busy"><span class="sp"></span>'
+    +'<span class="step">blocklisting and searching…</span></span>';
+  try{
+    const r=await (await fetch('/api/audit/replace?file_id='+encodeURIComponent(id),
+      {method:'POST'})).json();
+    if(box) box.innerHTML = r.ok
+      ? '<span style="color:var(--ok)">'+esc((r.did||[]).join('; '))+'</span>'
+      : '<span class="err">'+esc(r.why||'failed')+'</span>';
+  }catch(e){ if(box) box.textContent='failed'; }
+  setTimeout(loadAudit, 1200);
+}
+
 async function loadAudit(){
   const el=document.getElementById('au'), cnt=document.getElementById('auCount');
   if(!el) return;
@@ -14672,22 +14846,38 @@ click to read this run's findings"
     ? `<span class="auis${done?' fixed':''}">${esc(f.found)}</span>
        <span class="auarr">→</span><span class="auwant">${esc(f.want||'')}</span>`
     : `<span class="${done?'dim':'err'}">${esc(f.detail||'')}</span>`;
-  const rows=(d.findings||[]).map(f=>{
-    const h=hmap[f.file_id], st=(h||{}).state;
+  // ONE TABLE, SHAPED LIKE THE SIGNS-OR-DIALOGUE ONE. The findings were a
+  // four-column grid whose second cell held a filename, a diff and a status
+  // line stacked on top of each other, with a button column beside it - so
+  // every row was three lines tall and nothing lined up down the page. Same
+  // anatomy as the other check card now: a fixed row per finding, sortable
+  // columns, and the whole story on click rather than crammed into the row.
+  const auRows=(d.findings||[]).map(f=>{
+    const h=hmap[f.file_id]||{}, st=h.state||'';
     const done=st==='fixed', stuckRow=(st==='unfixable'||st==='gave-up');
-    let act='';
-    if(f.file_id && !done) act = stuckRow
-      ? `<button onclick="auRequeue(${f.file_id})"
-           title="No rule currently fixes this. Worth pressing after you have changed a rule that was meant to.">Try again</button>`
-      : `<button onclick="auRequeue(${f.file_id})"
-           title="Plan this file again under the current rules and queue it if there is work to do">Requeue</button>`;
-    return `<tr class="${done?'aufixed':''}">
-      <td class="nb"><span class="pill ${done?'p-ok':'p-bad'}">${esc(f.rule)}</span></td>
-      <td class="wrap"><div title="from the ${esc(f.bucket)} sample">${esc(String(f.path||'').split('\\').pop())}</div>
-        <div class="auiw">${auIsWant(f,done)}</div>
-        <div class="dim sub" id="aufix${f.file_id}">${_auFix[f.file_id]||''}</div></td>
-      <td class="nb">${auHealCell(h)}</td>
-      <td class="nb">${act}</td></tr>`;
+    const repl=st==='replaced';
+    const label=String(f.path||'').split('\\').pop();
+    const scol=done?'#6fd08c':repl?'#6fb0ff':stuckRow?'#e0575b':st==='queued'?'#e2b341':'var(--dim)';
+    const sword=done?'fixed':repl?'replaced':stuckRow?'no rule fixes it'
+               :st==='queued'?'queued':'still broken';
+    const open=_auOpen===f.file_id;
+    return `<tr class="${open?'rowopen':''}${done?' aufixed':''}">
+      <td style="padding:3px 10px 3px 0;white-space:nowrap">
+        <span class="pill ${done?'p-ok':'p-bad'}">${esc(f.rule)}</span></td>
+      <td style="padding:3px 10px 3px 0;overflow:hidden;text-overflow:ellipsis;
+                 white-space:nowrap"><span class="tl"
+          onclick="auDetail(${f.file_id})"
+          title="click for what was found, what has been tried, and what can be done"
+          >${esc(label)}</span></td>
+      <td style="padding:3px 10px 3px 0;overflow:hidden;text-overflow:ellipsis;
+                 white-space:nowrap">${auIsWant(f,done)}</td>
+      <td style="padding:3px 10px 3px 0;white-space:nowrap;color:${scol}"
+        >${sword}${audit_replaceable(f.rule)&&!done&&!repl
+          ?' <span class="dim" title="A different release is the only fix for this rule">· replaceable</span>':''}</td>
+      <td class="dim" style="padding:3px 0;white-space:nowrap">${ago(f.at||r.at)}</td>
+    </tr>` + (open ? `<tr class="logdrop"><td colspan="5">${
+      _auDetailHtml||'<div class="dim" style="padding:10px 14px">loading…</div>'
+    }</td></tr>` : '');
   }).join('');
 
   // STANDING GAPS. Files the healer has concluded no rule will fix, carried
@@ -14713,6 +14903,8 @@ click to read this run's findings"
         title="Plan this file again. Worth pressing after you have changed a rule that was meant to fix this.">Try again</button></td>
     </tr>`).join('');
 
+  if(d.mode) _auMode=d.mode;
+  if(d.replaceable_rules) _auReplaceable=d.replaceable_rules;
   const t=d.heal_tally||{}, hc=d.heal||{};
   const st=d.stats||{};
   const next = st.next_run
@@ -14802,7 +14994,29 @@ click to read this run's findings"
         cannot be fixed by any current rule and is listed below rather than
         retried forever.</div>
     </div></details>
-    ${rows?`<div class="scrollbox auto nohz"><table class="fixed vtop">${rows}</table></div>`
+    <div style="padding:7px 14px 0;display:flex;gap:8px;align-items:center;
+                flex-wrap:wrap;font-size:11.5px">
+      <span class="dim">when a file's audio is in no language you keep</span>
+      <span class="segbtn"><button onclick="auMode('manual')"
+        class="${_auMode==='manual'?'on':''}"
+        title="Report it and leave the decision to you">manual</button
+      ><button onclick="auMode('auto')" class="${_auMode==='auto'?'on':''}"
+        title="Blocklist the release and re-download it, unattended, up to 3 per run. This deletes files.">auto</button></span>
+      <button onclick="auRun()">Run now</button>
+      <span class="dim" id="auModeMsg"></span>
+      <span class="dim" style="margin-left:auto">${_auMode==='auto'
+        ? '<b style="color:var(--warn)">auto — releases are replaced without asking</b>'
+        : 'nothing is replaced without you pressing the button'}</span>
+    </div>
+    ${auRows?`<div id="auScroll" style="max-height:min(52vh,560px);overflow:auto;
+        margin:6px 14px 0"><table style="width:100%;font-size:11.5px;
+        border-collapse:collapse;table-layout:fixed">
+        <colgroup><col style="width:17%"><col style="width:33%">
+          <col style="width:30%"><col style="width:12%"><col style="width:8%"></colgroup>
+        <thead><tr>${['Rule','File','Found → should be','Status','When'].map(h=>
+          `<th style="text-align:left;font-weight:600;padding:3px 10px 5px 0;
+             position:sticky;top:0;background:var(--bg2,#12161c)">${h}</th>`).join('')}
+        </tr></thead><tbody>${auRows}</tbody></table></div>`
           :`<div class="dim" style="padding:12px 14px">Nothing to report — this
              run's sample matched every rule.</div>`}
     ${stuckRows?`<div class="auhead">No rule fixes these
@@ -14814,7 +15028,11 @@ click to read this run's findings"
   // the moment their jobs land and the colour flips deserve to be seen close
   // to when the Transcoding panel shows the job finishing; a lazy minute when
   // there is nothing in flight anywhere.
-  auSchedule((st.running||st.heal_running) ? 2500
+  // An open drop-down pins the panel, the same rule the signs table follows:
+  // reading the story of one finding while the table repaints under it is the
+  // problem the poll is supposed to solve, not cause.
+  auSchedule(_auOpen!==null ? 60000
+             : (st.running||st.heal_running) ? 2500
              : (t.queued>0) ? 10000 : 60000);
 }
 // Jump the panel to one run's findings. 0 restores follow-the-latest.
@@ -19386,14 +19604,30 @@ function pxSignature(ss){
 // thing worth seeing - a subtitle switched on in the client that never reached
 // the server looks identical to one that was never switched on, unless the
 // card says which side the number came from.
+// Plex hands paths over with the extended-length prefix attached
+// (\\?\P:\Anime Shows\...). It means "do not parse this path" to Windows and
+// nothing at all to a person, and it left one card's file line starting four
+// characters further along than its neighbour's.
+function pxPath(p){
+  let x = String(p||'').replace(/\//g,'\\');
+  if(x.startsWith('\\\\?\\') || x.startsWith('\\\\.\\')){
+    const rest = x.slice(4);
+    x = rest.slice(0,4).toUpperCase()==='UNC\\' ? '\\\\'+rest.slice(4) : rest;
+  }
+  return x;
+}
 function pxNoSub(s){
+  // ONE LINE. The long version explained the whole mechanism in the middle of
+  // a card whose other rows are four words each - the count says everything
+  // the sentence did, and the title carries the rest for anyone who wonders.
   const n = s.file_subs;
-  if(n === undefined || n === null)
-    return '<span class="dim">none — Plex reports no subtitle for this session</span>';
-  if(!n)
-    return '<span class="dim">none — and this file has no subtitle tracks</span>';
-  return '<span class="dim">none selected — the file has <b>' + n + '</b> subtitle '
-       + 'track' + (n===1?'':'s') + ', so Plex has not been told to show one</span>';
+  const why = (n===undefined||n===null)
+    ? 'Plex reports no subtitle stream for this session'
+    : (n ? `the file has ${n} subtitle track${n===1?'':'s'}; Plex has not been `
+         + `told to show one, so nothing switched on in the player has reached `
+         + `the server` : 'this file has no subtitle tracks');
+  return `<span class="dim" title="${esc(why)}">none selected${
+    n ? ` <span style="opacity:.7">(${n} in the file)</span>` : ''}</span>`;
 }
 function pxDetail(s){
   const d = s.detail || {};
@@ -19558,13 +19792,13 @@ function pxDetail(s){
   // resolves to the pool's own serial and not to a member. It is filled from
   // the host now, and says which of the two it is: measured here, or taken
   // from the machine that has the disks attached.
-  if(s.disk) rows.push(['disk', `<b class="mono">${esc(s.disk)}</b>`
-    + (s.disk_from === 'host'
-        ? ` <span class="dim" title="This machine reaches the pool over a share,`
-          + ` where nothing reports which disk holds a file. The host has them`
-          + ` attached and resolved it from the file itself.">· from the host</span>`
-        : '')]);
-  if(s.file) rows.push(['file', `<span class="mono dim" style="overflow-wrap:anywhere">${esc(s.file)}</span>`]);
+  if(s.disk && s.disk_from === 'host')
+    rows.push(['resolved by', `<span class="dim" title="This machine reaches the`
+      + ` pool over a share, where nothing reports which disk holds a file. The`
+      + ` host has them attached and resolved it from the file itself."`
+      + `>the host — this machine reaches the pool over a share</span>`]);
+  if(s.file) rows.push(['file', `<span class="mono dim"
+    style="overflow-wrap:anywhere">${esc(pxPath(s.file))}</span>`]);
   return `<div class="pxmore">`+rows.map(([k,v])=>
     `<div class="pxrow"><span class="pxk">${k}</span><span class="pxv">${v}</span></div>`).join('')
     + runway
@@ -26861,6 +27095,12 @@ _SETTINGS_CSS = """
   font-size:12.5px;cursor:pointer;border-bottom:1px solid var(--line)}
 .pickrow:last-child{border-bottom:0}
 .pickrow:hover{background:rgba(88,166,255,.10)}
+/* Two-state mode control, shared with the signs card's manual/auto strip. */
+.segbtn{display:inline-flex;border:1px solid var(--line);border-radius:999px;
+  overflow:hidden}
+.segbtn button{border:0;border-radius:0;background:transparent;padding:2px 11px;
+  font-size:11px;cursor:pointer;color:inherit;opacity:.65}
+.segbtn button.on{background:rgba(88,166,255,.18);color:#58a6ff;opacity:1}
 /* Signs-or-dialogue drop-down: bigger than the table it hangs under, because
    it is prose you read rather than a grid you scan, and a fixed label column
    so the lines actually line up with each other. */
