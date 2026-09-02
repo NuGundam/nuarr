@@ -18875,6 +18875,14 @@ function wtab(which){
   // the point at which that stopped being a style preference: one table, one
   // loop, and a new pane is one line.
   const intent = which;                     // what was asked for, for the tail
+  // THE SIDEBAR HAS TO FOLLOW. Every in-page cross-link calls wtab() directly,
+  // which swapped the pane and left the sidebar lit on the page you came FROM
+  // and the URL pointing at it - so "Audio language" from the Subtitles page
+  // showed audio content under a highlighted Subtitles entry, and a refresh
+  // went back to Subtitles. The settings shim registers _setLit; it only
+  // highlights and rewrites the hash, so there is no way back into wtab and
+  // no recursion to guard against.
+  if(window._setLit) window._setLit(intent);
   which = ALIAS_OF[which] || which;
   const isPane = Object.prototype.hasOwnProperty.call(PANE_OF, which);
   const set = document.getElementById('wSettings');
@@ -26603,14 +26611,22 @@ _SETTINGS_SHIM = """
   // together for one lookup.
   const DEEP_PANE = {arrgap:'libs', arrsync:'arrs', audiotitle:'acodec',
                      shapes:'ocr'};
+  // Highlight and URL only - no navigation. wtab() calls this after it has
+  // already switched panes, which is how a link inside a pane ends up lighting
+  // the right sidebar entry and leaving a hash you can refresh onto.
+  function lit(key){
+    if(VALID.indexOf(key) < 0) return;
+    const k = DEEP_PANE[key] || key;
+    for(const a of side.querySelectorAll('.setlink[data-k]')){
+      a.className = 'setlink' + (a.dataset.k===k ? ' on' : '');
+    }
+    if(location.hash !== '#'+key) history.replaceState(null,'','#'+key);
+  }
+  window._setLit = lit;
   function go(key, push){
     if(VALID.indexOf(key) < 0) key = KEYS[0];
-    wtab(key);
-    const lit = DEEP_PANE[key] || key;
-    for(const a of side.querySelectorAll('.setlink[data-k]')){
-      a.className = 'setlink' + (a.dataset.k===lit ? ' on' : '');
-    }
-    if(push && location.hash !== '#'+key) history.replaceState(null,'','#'+key);
+    wtab(key);                 // which calls lit() on the way through
+    if(push) lit(key);
   }
   // The URL is the point of the exercise: /settings#arrs survives a refresh,
   // can be bookmarked, and can be linked to from anywhere.
