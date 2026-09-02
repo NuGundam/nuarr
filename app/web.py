@@ -986,6 +986,41 @@ def _numish(*vals) -> float:
     return 0.0
 
 
+def _file_sub_count(path: str):
+    """Subtitle tracks in a file, from the stored probe. None if unknown.
+
+    Memoised for a minute: the sessions endpoint is polled every couple of
+    seconds and a file's track list does not change while it is being watched -
+    and when it does, the rewrite invalidates the probe anyway.
+    """
+    if not path:
+        return None
+
+    def _work():
+        import json as _j
+        # PLEX SPELLS IT ITS OWN WAY. The session path arrives with the
+        # extended-length prefix on it (\\?\P:\Anime Shows\...) while the
+        # database holds the plain one, so an exact match found nothing and the
+        # card fell back to "Plex reports no subtitle" - true, but missing the
+        # more useful half. Strip the prefix, and compare case-insensitively
+        # because Windows does.
+        from .storage import _deprefix
+        want = _deprefix(path)
+        rows = _rows("SELECT fp.json FROM files f "
+                     "JOIN file_probes fp ON fp.file_id=f.id "
+                     "WHERE f.path=? COLLATE NOCASE LIMIT 1", (want,))
+        if not rows:
+            return None
+        try:
+            d = _j.loads(rows[0]["json"])
+        except Exception:                                    # noqa: BLE001
+            return None
+        return sum(1 for st in (d.get("streams") or [])
+                   if st.get("codec_type") == "subtitle")
+
+    return _memo("subcount:" + path, 60.0, _work)
+
+
 @app.get("/api/plex/sessions")
 def api_plex_sessions():
     """Who is watching what, for the Job gate panel."""
@@ -1061,6 +1096,11 @@ def api_plex_sessions():
             "floor_s": gate.session_floor(s, _base),
             # the working behind that number, so the card can justify it
             "floor_why": gate.floor_reason(s, _base),
+            # HOW MANY SUBTITLE TRACKS ARE IN THE FILE, from nuarr's own probe.
+            # Plex reports the SELECTED subtitle and nothing else, so a session
+            # with none looks identical whether the file has ten tracks or
+            # zero. This is what lets the card say which.
+            "file_subs": _file_sub_count(s.get("file") or ""),
         })
     return {"sessions": out}
 
@@ -19339,6 +19379,22 @@ function pxSignature(ss){
 // which codec is being rebuilt into which, what is merely copied, whether a
 // subtitle is being burned into the picture (the usual hidden culprit), and
 // whether the GPU or the CPU is paying for it.
+// PLEX REPORTS THE SELECTED SUBTITLE AND NOTHING ELSE. When a session carries
+// none, the honest line is not silence: it is that the server says none is on.
+// Where nuarr has probed the file it also knows how many are IN it, and the
+// gap between "the file has two" and "Plex has none selected" is exactly the
+// thing worth seeing - a subtitle switched on in the client that never reached
+// the server looks identical to one that was never switched on, unless the
+// card says which side the number came from.
+function pxNoSub(s){
+  const n = s.file_subs;
+  if(n === undefined || n === null)
+    return '<span class="dim">none — Plex reports no subtitle for this session</span>';
+  if(!n)
+    return '<span class="dim">none — and this file has no subtitle tracks</span>';
+  return '<span class="dim">none selected — the file has <b>' + n + '</b> subtitle '
+       + 'track' + (n===1?'':'s') + ', so Plex has not been told to show one</span>';
+}
 function pxDetail(s){
   const d = s.detail || {};
   const rows = [];
@@ -19367,20 +19423,30 @@ function pxDetail(s){
       rows.push(['audio', `${d.audio_decision?dec(d.audio_decision)
           :'<span class="dim">played untouched</span>'} ${esc(d.audio_title||'')}`
         + (d.audio_decision==='transcode' && s.audio ? ` <span class="mono">${pair(s.audio)}</span>` : '')]);
-    if(d.sub_title || d.sub_decision)
-      rows.push(['subtitle', d.sub_burn
-        ? `<span class="pxwarn">burning into the picture</span> ${esc(d.sub_title||'')}`
-          + ' <span class="dim">\u2014 this alone forces the video to be re-encoded</span>'
-        : `${dec(d.sub_decision)||'<span class="dim">shown</span>'} ${esc(d.sub_title||'')}`]);
+    rows.push(['subtitle', (d.sub_title || d.sub_decision)
+      ? (d.sub_burn
+          ? `<span class="pxwarn">burning into the picture</span> ${esc(d.sub_title||'')}`
+            + ' <span class="dim">\u2014 this alone forces the video to be re-encoded</span>'
+          : `${dec(d.sub_decision)||'<span class="dim">shown</span>'} ${esc(d.sub_title||'')}`)
+      : pxNoSub(s)]);
     if(d.src_container || d.dst_container)
       rows.push(['container', d.dst_container && d.src_container!==d.dst_container
         ? `<span class="mono">${esc(d.src_container)} \u2192 ${esc(d.dst_container)}</span>`
         : `<span class="mono">${esc(d.src_container||d.dst_container)}</span>`]);
   } else {
     // a direct play still deserves to say what is inside the file
-    if(d.video_title) rows.push(['video', `<span class="dim">played untouched</span> ${esc(d.video_title)}`]);
-    if(d.audio_title) rows.push(['audio', `<span class="dim">played untouched</span> ${esc(d.audio_title)}`]);
-    if(d.sub_title)   rows.push(['subtitle', esc(d.sub_title)]);
+    // EVERY CARD, THE SAME ROWS, IN THE SAME ORDER. They were conditional, so
+    // a session with no subtitle simply had no subtitle line - and one card's
+    // "source" sat where its neighbour's "ends" was. A row with nothing to
+    // report says so; that is information too, and it is the line Erik went
+    // looking for when he had turned subtitles on and found nothing.
+    rows.push(['video', d.video_title
+      ? `<span class="dim">played untouched</span> ${esc(d.video_title)}`
+      : '<span class="dim">not reported</span>']);
+    rows.push(['audio', d.audio_title
+      ? `<span class="dim">played untouched</span> ${esc(d.audio_title)}`
+      : '<span class="dim">not reported</span>']);
+    rows.push(['subtitle', d.sub_title ? esc(d.sub_title) : pxNoSub(s)]);
   }
   if(d.src_bitrate)
     // "streaming at 52.9 Mbps" was wrong, and confusingly so on a direct play
@@ -19559,9 +19625,14 @@ function pxRender(ss){
             : st==='paused'  ? '<span class="pill p-warn">paused</span>'
                              : '<span class="pill p-ok pxlive">playing</span>'}
           <b>${esc(s.user||'?')}</b>
-          <span class="dim">${esc(s.player||s.product||'')}</span>
         </div>
-        <div class="dim pxsub">${bits.join(' \u00b7 ')}</div>
+        <!-- THE DEVICE GETS ITS OWN LINE. It sat at the end of the pill row,
+             so a long player name pushed the row to two lines on one card and
+             not on its neighbour, and nothing below lined up between the two.
+             Three fixed lines now - verdict, device, where it reads from -
+             present on every card whether or not they have anything to say. -->
+        <div class="dim pxsub">${esc(s.player||s.product||'unknown device')}</div>
+        <div class="dim pxsub">${bits.join(' \u00b7 ')||'&nbsp;'}</div>
         <div class="pxsub pxlead"></div>
         ${open?pxDetail(s):''}
         <div class="pxfoot">
