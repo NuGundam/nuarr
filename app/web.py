@@ -3250,6 +3250,20 @@ def _sched_row(key: str) -> dict:
     return {}
 
 
+def _iso_names(codes: set) -> dict:
+    """code -> language name, for the codes given.
+
+    Only the codes actually present: the full ISO table is 20 KB to answer a
+    question about twenty chips.
+    """
+    from . import langpolicy
+    try:
+        return {x["c"]: (x.get("n") or x["c"])
+                for x in langpolicy.iso_languages() if x["c"] in codes}
+    except Exception:                                        # noqa: BLE001
+        return {}
+
+
 @app.get("/api/audiolang")
 async def api_audiolang(limit: int = Query(400, le=3000)):
     r"""What nuarr has HEARD, versus what the files claim.
@@ -3450,6 +3464,10 @@ async def api_audiolang(limit: int = Query(400, le=3000)):
                        "heard": heard, "refused": refused,
                        "checked": len(det), "stale": stale},
             "languages": dict(sorted(langs.items(), key=lambda kv: -kv[1])),
+            # THE CHIPS SAY "kan 1" AND NOBODY KNOWS WHAT kan IS. Only the
+            # codes actually present are shipped - the full ISO table is 20 KB
+            # to answer a question about twenty chips.
+            "lang_names": _iso_names(set(langs)),
             "by_library": sorted(by_lib.values(), key=lambda x: -x["tracks"]),
             "contradictions": sorted(odd, key=lambda x: -x["confidence"])[:200],
             "open": openq[:200],
@@ -23564,9 +23582,13 @@ function renderAlang(){
     h+=`<div class="lkind" style="margin-top:10px"><div class="lkindhead">
         <b style="color:#6fb0ff">Languages now named on disk</b></div>
         <div class="lchips" style="padding:9px 12px">`;
-    for(const k of Object.keys(L).slice(0,24))
-      h+=`<span class="lchip on"><span class="mono">${esc(k)}</span>
+    const N=_al.lang_names||{};
+    for(const k of Object.keys(L).slice(0,24)){
+      const nm=N[k]||k;
+      h+=`<span class="lchip on" title="${esc(nm)} — ${fmt(L[k])} track(s)">
+           <span class="mono">${esc(k)}</span>
            <span class="dim" style="margin-left:5px">${L[k]}</span></span>`;
+    }
     h+=`</div></div>`;
   }
 

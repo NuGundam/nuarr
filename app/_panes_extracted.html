@@ -219,15 +219,23 @@
         <div id="jobsBody" style="padding:0 14px 14px"></div>
       </div>
       <div id="langPane" style="display:none">
-        <div class="dim" style="padding:9px 14px;font-size:11px">
-          Which audio and subtitle languages survive, per kind of content. The
-          queue and the transcoder read this directly &mdash; it is the same policy
-          the planner applies, not a copy of it.
-          <b>Keep the original language</b> is a tick rather than an entry in the
-          list because it differs per title: Japanese for one show, Korean for
-          the next, resolved from TMDB/TheTVDB. When that lookup fails there is
-          nothing for it to act on, and the planner keeps every track rather
-          than guessing.
+        <div style="padding:6px 14px 4px">
+          <div class="lkind" style="padding:11px 12px">
+            <b style="color:#6fb0ff">Which subtitle tracks survive, per library</b>
+            <div class="dim" style="font-size:11px;margin-top:2px">
+              And what becomes of the picture ones. The queue and the
+              transcoder read this directly &mdash; it is the same policy the
+              planner applies, not a copy of it.
+              <b>Keep the original language</b> is a tick rather than an entry
+              in the list because it differs per title: Japanese for one show,
+              Korean for the next, resolved from TMDB/TheTVDB. When that lookup
+              fails there is nothing for it to act on, and the planner keeps
+              every track rather than guessing.
+              Audio languages live on
+              <a href="#" onclick="wtab('alang');return false">Audio
+              language</a>, beside the measurements that name them.
+            </div>
+          </div>
         </div>
         <div id="langBody" style="padding:0 14px 14px"></div>
       </div>
@@ -268,15 +276,20 @@
             </div>
           </div>
         </div>
-        <div class="dim" style="padding:9px 14px;font-size:11px">
-          What happens to each audio track that survives the language policy,
-          per library. Which tracks are KEPT is decided on the
-          <b>Languages</b> page; this decides what they are converted to.
-          The goal throughout is a track Plex hands to the client untouched:
-          a format it direct-plays, at a bitrate its decoder accepts, with a
-          channel count the client already has speakers for. Anything else and
-          Plex remixes or re-encodes on the fly, which is the cost this whole
-          system exists to avoid.
+        <div style="padding:6px 14px 4px">
+          <div class="lkind" style="padding:11px 12px">
+            <b style="color:#6fb0ff">What each surviving track is converted to</b>
+            <div class="dim" style="font-size:11px;margin-top:2px">
+              Per library. Which tracks are KEPT is decided on
+              <a href="#" onclick="wtab('alang');return false">Audio
+              language</a>; this decides what they are converted to. The goal
+              throughout is a track Plex hands to the client untouched: a
+              format it direct-plays, at a bitrate its decoder accepts, with a
+              channel count the client already has speakers for. Anything else
+              and Plex remixes or re-encodes on the fly, which is the cost this
+              whole system exists to avoid.
+            </div>
+          </div>
         </div>
         <div id="acodecBody" style="padding:0 14px 14px"></div>
       </div>
@@ -400,17 +413,6 @@
         </div>
       </div>
       <div id="alangPane" style="display:none">
-        <div class="dim" style="padding:9px 14px;font-size:11px">
-          A language tag is the one thing about a file Nuarr cannot take on
-          trust and cannot work out from anything else. An empty tag is not
-          neutral &mdash; Sonarr, Radarr and every player read a blank as
-          <b>English</b> &mdash; and a wrong tag looks exactly like a right one.
-          So it is <b>measured</b>: three 30-second windows from the middle of
-          the file, through Whisper&rsquo;s language identifier, and the
-          confident windows have to agree. This page shows what was heard,
-          what the files claim, and &mdash; deliberately &mdash; every case
-          where Nuarr refused to answer.
-        </div>
         <div style="padding:0 14px 4px">
           <div class="lkind" id="alpolCard" style="padding:11px 12px">
             <b style="color:#6fb0ff">Which audio languages survive, per library</b>
@@ -421,6 +423,22 @@
             </div>
             <div id="alpolBody" style="margin-top:6px">
               <span class="dim" style="font-size:11.5px">loading&hellip;</span>
+            </div>
+          </div>
+        </div>
+        <div style="padding:6px 14px 4px">
+          <div class="lkind" style="padding:11px 12px">
+            <b style="color:#6fb0ff">What each track was measured to be</b>
+            <div class="dim" style="font-size:11px;margin-top:2px">
+              A language tag is the one thing about a file Nuarr cannot take on
+              trust and cannot work out from anything else. An empty tag is not
+              neutral &mdash; Sonarr, Radarr and every player read a blank as
+              <b>English</b> &mdash; and a wrong tag looks exactly like a right
+              one. So it is <b>measured</b>: three 30-second windows from the
+              middle of the file, through Whisper&rsquo;s language identifier,
+              and the confident windows have to agree. Below is what was heard,
+              what the files claim, and &mdash; deliberately &mdash; every case
+              where Nuarr refused to answer.
             </div>
           </div>
         </div>
