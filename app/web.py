@@ -4659,7 +4659,7 @@ def api_health():
         # it, not merely on the page it lives in.
         held_bits = []
         if st.get("held_off"):
-            held_bits.append(f"{st['held_off']} switched off by you")
+            held_bits.append(f"{st['held_off']} with OCR off for their library")
         if st.get("held_rejected"):
             held_bits.append(f"{st['held_rejected']} rejected by the OCR")
         add("shapes", "Signs or dialogue - what the check found", "shapes", n,
@@ -21440,7 +21440,16 @@ function shapeStatus(r){
   const dot=`<span style="display:inline-block;width:6px;height:6px;
      border-radius:50%;background:${c};margin-right:5px;vertical-align:middle
      ${st==='processing'?';animation:sdotpulse 1.2s ease-in-out infinite':''}"></span>`;
-  return `<span style="color:${c}" title="${esc(r.status_why||'')}">${dot}${st}</span>`;
+  // "held" ALONE IS A SHRUG IN THE CELL TOO, not just in the tooltip. Erik
+  // read a column of identical ambers and had to ask which hold each one was
+  // - the answer was sitting in the hover text nobody hovers. The two holds
+  // get their own words: your switch, or the OCR's verdict.
+  let label=st;
+  if(st==='held'){
+    const w=r.status_why||'';
+    label = /switched off/.test(w) ? 'OCR off' : 'rejected';
+  }
+  return `<span style="color:${c}" title="${esc(r.status_why||'')}">${dot}${label}</span>`;
 }
 function shapeRender(){
   const el=document.getElementById('shapeTblWrap');
@@ -21639,7 +21648,7 @@ async function shapeLoad(){
           switched off for these files' libraries in your own settings
           (Settings → Subtitles). Working as asked — flip the library's switch
           if you want them converted."><b>${fmt(off)}</b>
-          <span class="dim">switched off by you</span></span>`:'')
+          <span class="dim">OCR off for their library</span></span>`:'')
         + (both?' ':'')
         + (rej?`<span style="color:var(--warn)" title="The OCR read these
           tracks and declined them — too sparse to be dialogue, or otherwise

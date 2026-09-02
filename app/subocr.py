@@ -2705,6 +2705,21 @@ def sweep_pick(limit: int) -> list[dict]:
     from .db import cursor
     picked: list[dict] = []
     with cursor() as cur:
+        # A COMPLETED PASS IS REMEMBERED, THE SAME WAY A REJECTION IS. The
+        # rejection column exists because "the cheap filter cannot know the OCR
+        # will decline" - and the mirror case was left open: a file whose OCR
+        # ran to completion but changed nothing visible to the filter was
+        # picked again on every sweep. Parasyte proved it: two PGS tracks, one
+        # OCR'd into an SDH text twin, the other's output deduped against it -
+        # so select_targets kept returning the second track and the same
+        # twenty-four episodes were read again every sweep, eight identical
+        # "done" jobs per file in one day, each a full demux of the file.
+        #
+        # The memory is the jobs table it already writes: a sub_ocr that
+        # finished 'done' AFTER the current probe was recorded means this exact
+        # layout has been through the OCR and whatever could be produced was.
+        # A real rewrite refreshes the probe timestamp, which reopens the file
+        # for exactly one more look - which is the correct amount.
         rows = cur.execute(
             "SELECT p.file_id, p.json, f.path, f.title, f.library, "
             "       f.season, f.episode "
@@ -2713,7 +2728,10 @@ def sweep_pick(limit: int) -> list[dict]:
             "AND f.arr_file_id IS NOT NULL "
             "AND COALESCE(f.subocr_state,'') != 'rejected' "
             "AND f.id NOT IN (SELECT file_id FROM jobs WHERE file_id IS "
-            "NOT NULL AND state IN ('queued','running'))")
+            "NOT NULL AND state IN ('queued','running')) "
+            "AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.file_id=f.id "
+            "  AND j.kind='sub_ocr' AND j.state='done' "
+            "  AND COALESCE(j.finished_at,0) >= p.at)")
         for r in rows:
             if len(picked) >= limit:
                 break
