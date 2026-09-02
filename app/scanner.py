@@ -2101,6 +2101,106 @@ def lock_note(file_id: int) -> dict | None:
             "needs_s": LOCK_QUIET_S, "at": st["at"]}
 
 
+
+# How many settling files may be read at once, and how many per pass. A pass
+# runs every 60 seconds; a big import arrives faster than that, so the cap is
+# what stops a thousand-file season pack turning one promotion pass into a
+# thousand ffprobes. The rest are simply checked on the next pass, which is
+# exactly what "settling" already means.
+LANG_GATE_MAX = 24
+LANG_GATE_LANES = 6
+
+
+def _language_gate(ids: list[int], cur) -> tuple[list[int], list[dict]]:
+    r"""Split files about to be promoted into (may proceed, wrong language).
+
+    BOUNDED, because each check is an ffprobe against a pool disk and takes the
+    better part of a second. LANG_GATE_MAX per pass is what stops a
+    thousand-file season pack turning one promotion into a thousand reads; the
+    rest are checked on the next pass, which is exactly what settling means.
+
+    A file that fails is NOT promoted. It stays in 'new' with a reason naming
+    the language, so nothing spends GPU time on a release that is about to be
+    replaced, and a finding is written so it appears in the rule check where a
+    person - or auto mode - can act on it.
+    """
+    from . import audit
+    ok: list[int] = []
+    failed: list[dict] = []
+    rows: list[dict] = []
+    qs = ",".join("?" * len(ids[:LANG_GATE_MAX]))
+    rows = [dict(r) for r in cur.execute(
+        f"SELECT id, path, library FROM files WHERE id IN ({qs})",
+        tuple(ids[:LANG_GATE_MAX]))]
+    # SAY WHAT IS HAPPENING WHILE IT HAPPENS. Without this the file sits in
+    # Held with no reason for as long as the read takes, which reads as a file
+    # that is stuck rather than one being looked at.
+    if rows:
+        cur.execute(
+            f"UPDATE files SET state_reason='settling — checking the audio "
+            f"language' WHERE id IN ({qs}) AND state='new'",
+            tuple(r["id"] for r in rows))
+    carried = [i for i in ids[LANG_GATE_MAX:]]       # next pass gets these
+
+    def _one(r: dict):
+        try:
+            return r, audit.language_verdict(r["path"], r.get("library") or "")
+        except Exception:                                    # noqa: BLE001
+            return r, None          # never let a check failure hold a file up
+
+    from concurrent.futures import ThreadPoolExecutor as _TPE
+    with _TPE(max_workers=LANG_GATE_LANES) as pool:
+        for r, bad in pool.map(_one, rows):
+            if bad:
+                failed.append({**r, "found": bad[0], "want": bad[1]})
+            else:
+                ok.append(r["id"])
+    return ok + carried, failed
+
+
+def _language_hold(failed: list[dict], cur) -> None:
+    """Record the failures where the rule check will show them, and hold."""
+    if not failed:
+        return
+    now = time.time()
+    if True:
+        for f in failed:
+            cur.execute(
+                "UPDATE files SET state_reason=? WHERE id=? AND state='new'",
+                (f"held — {f['found']}, which this library does not keep. "
+                 f"Waiting for you (or auto mode) to replace it.", f["id"]))
+        # The finding is written against run_id 0: it did not come from a
+        # sampled run, it came from the file arriving. The rule check reads
+        # findings by file as well as by run, so it shows up either way, and
+        # keeping it out of a run's numbers stops a settling file from
+        # distorting "60 files read, 1 breaking a rule".
+        cur.executemany(
+            "INSERT INTO audit_findings(run_id,at,file_id,bucket,path,rule,"
+            "detail,found,want) VALUES(0,?,?,?,?,?,?,?,?)",
+            [(now, f["id"], "settling", f["path"], "audio/language",
+              f"{f['found']} — should be {f['want']}", f["found"], f["want"])
+             for f in failed])
+        cur.executemany(
+            "INSERT INTO audit_heals(file_id,rule,attempts,first_at,last_at,"
+            "state,detail,path) VALUES(?,?,0,?,?,?,?,?) "
+            "ON CONFLICT(file_id) DO UPDATE SET state=excluded.state, "
+            "detail=excluded.detail, last_at=excluded.last_at",
+            [(f["id"], "audio/language", now, now, "unfixable",
+              f"caught while settling: {f['found']} — {f['want']}", f["path"])
+             for f in failed])
+    for f in failed:
+        joblog.log(f"held before processing: {os.path.basename(f['path'])} — "
+                   f"{f['found']}, which {f.get('library') or 'this library'} "
+                   f"does not keep", "warn")
+    # AUTO MODE DOES NOT ACT FROM HERE. This runs on a scanner thread, and the
+    # replacement is an async, destructive, arr-facing operation - dispatching
+    # it across the loop boundary from a promotion pass would put the one
+    # irreversible action in the codebase in the hardest place to reason about.
+    # The rule check's own cycle picks these up: it already runs every ten
+    # minutes, it already holds the mode, and it is the single place that
+    # decides to replace anything.
+
+
 def mark_eligible() -> int:
     """Promote quiet files to 'eligible'.
 
@@ -2135,6 +2235,7 @@ def mark_eligible() -> int:
             "SELECT id, path FROM files WHERE state='new' "
             "ORDER BY COALESCE(first_seen, 0) LIMIT ?", (LOCK_PROBE_MAX,))]
         ok_ids, blocked = [], 0
+        gate_failed: list[dict] = []
         for r in due:
             p = r["path"] or ""
             if not p or not os.path.exists(p):
@@ -2162,6 +2263,20 @@ def mark_eligible() -> int:
                             (reason, r["id"]))
         promoted = 0
         if ok_ids:
+            # THE AUDIO LANGUAGE GATE, BEFORE ANY GPU TIME IS SPENT. A file
+            # whose audio is in no language its library keeps is the wrong
+            # file, and no amount of processing makes it the right one -
+            # finding that out afterwards, which is what the nightly rule check
+            # did, means the encoder has already spent twenty minutes on a
+            # release that is going to be thrown away. One ffprobe, on a file
+            # that has just landed, at the one moment nothing has been invested
+            # in it yet. The check is the audit's own rather than a second copy
+            # of the rule: this one decides what gets processed and that one
+            # decides what gets reported, and a library where those disagree is
+            # one where files appear and vanish from the rule check for no
+            # visible reason.
+            ok_ids, gate_failed = _language_gate(ok_ids, cur)
+        if ok_ids:
             qs = ",".join("?" * len(ok_ids))
             cur.execute(
                 "UPDATE files SET state='eligible', updated_at=?, "
@@ -2174,6 +2289,8 @@ def mark_eligible() -> int:
             promoted = cur.rowcount
             for i in ok_ids:
                 _LOCK_WATCH.pop(i, None)
+        if gate_failed:
+            _language_hold(gate_failed, cur)
         if blocked:
             joblog.log(f"{blocked} settled file(s) still open in another "
                        f"program — held until they are released", "debug")

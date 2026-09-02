@@ -357,7 +357,11 @@ HINTS = {
 # still decided something, and turning it up would only delay a check that is
 # already correct. The value stays in LIMITS so the dataclass, the default and
 # every reader keep working.
-HIDDEN_KEYS = ("hold_minutes",)
+# audit_every_h joined it when the rule check moved to a fixed ten-minute
+# cycle with a busy check in front of it. The value stays in LIMITS so the
+# dataclass and every reader keep working; what changed is that nothing reads
+# it any more, and a knob that decides nothing is worse than no knob.
+HIDDEN_KEYS = ("hold_minutes", "audit_every_h")
 
 # Which tab each setting belongs to in the UI.
 TIMING_KEYS = ("hold_minutes", "scan_every_min", "ffmpeg_check_h",

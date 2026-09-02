@@ -9864,6 +9864,15 @@ button[disabled]{opacity:.5;cursor:default}
 .pxcard{display:flex;gap:10px;border:1px solid var(--line);border-radius:8px;
   padding:8px;min-width:0;background:rgba(255,255,255,.02);cursor:pointer}
 .pxcard:hover{border-color:#3a4150}
+/* THE BARS LINE UP ACROSS EVERY CARD. Card height follows its content - a long
+   Windows path wraps to eight lines, a short one to three - so the progress bar
+   sat at a different height on each card and the eye had to hunt for it. The
+   cards stretch to the tallest in the row, the detail block absorbs the slack,
+   and .pxfoot's margin-top:auto then puts every bar on the same line. */
+#plexCards{align-items:stretch}
+.pxcard{height:100%}
+.pxbody{height:100%}
+.pxmore{flex:1 1 auto}
 .pxcaret{font-size:10px;margin-left:5px}
 /* the expanded story: label column + value, tight lines, quiet background so
    it reads as the card's footnotes rather than a second card */
@@ -14852,7 +14861,16 @@ click to read this run's findings"
   // every row was three lines tall and nothing lined up down the page. Same
   // anatomy as the other check card now: a fixed row per finding, sortable
   // columns, and the whole story on click rather than crammed into the row.
-  const auRows=(d.findings||[]).map(f=>{
+  // ONLY BROKEN AND FIXED. Everything else on this table was bookkeeping about
+  // the middle of a process: a row that is queued or has just been re-read
+  // says only that the machine is working, which the live line above already
+  // says better. What a person comes here for is what is wrong and what has
+  // been put right.
+  const auShown=(d.findings||[]).filter(f=>{
+    const st=((hmap[f.file_id]||{}).state)||'';
+    return st!=='queued';
+  });
+  const auRows=auShown.map(f=>{
     const h=hmap[f.file_id]||{}, st=h.state||'';
     const done=st==='fixed', stuckRow=(st==='unfixable'||st==='gave-up');
     const repl=st==='replaced';
@@ -14962,7 +14980,8 @@ click to read this run's findings"
       <div class="auscore">${score}
         <span class="dim" style="margin-left:auto;font-size:11px;text-align:right">
           ${esc(new Date(r.at*1000).toLocaleString())}<br>
-          ${isLatest?`runs every ${d.every_hours||24}h, ${esc(next)}`
+          ${isLatest?`runs every ${Math.round((d.cycle_s||600)/60)} min unless the
+             pool is busy, ${esc(next)}`
                     :`<button onclick="auShowRun(0)">back to the latest</button>`}</span>
       </div>
       ${live?`<div style="margin-top:7px">${live}</div>`:''}
@@ -14994,19 +15013,19 @@ click to read this run's findings"
         cannot be fixed by any current rule and is listed below rather than
         retried forever.</div>
     </div></details>
-    <div style="padding:7px 14px 0;display:flex;gap:8px;align-items:center;
+    <div style="padding:7px 14px 0;display:flex;gap:10px;align-items:center;
                 flex-wrap:wrap;font-size:11.5px">
-      <span class="dim">when a file's audio is in no language you keep</span>
-      <span class="segbtn"><button onclick="auMode('manual')"
-        class="${_auMode==='manual'?'on':''}"
-        title="Report it and leave the decision to you">manual</button
-      ><button onclick="auMode('auto')" class="${_auMode==='auto'?'on':''}"
-        title="Blocklist the release and re-download it, unattended, up to 3 per run. This deletes files.">auto</button></span>
+      <label style="display:flex;gap:7px;align-items:center;cursor:pointer"
+        title="Only ever applies to audio/language findings — the one rule a different release can fix. Up to 3 per run. This deletes files.">
+        <input type="checkbox" id="auAutoBox" ${_auMode==='auto'?'checked':''}
+               onchange="auMode(this.checked?'auto':'manual')">
+        <span>Replace wrong-language releases automatically</span></label>
       <button onclick="auRun()">Run now</button>
       <span class="dim" id="auModeMsg"></span>
       <span class="dim" style="margin-left:auto">${_auMode==='auto'
-        ? '<b style="color:var(--warn)">auto — releases are replaced without asking</b>'
-        : 'nothing is replaced without you pressing the button'}</span>
+        ? '<b style="color:var(--warn)">on — a release with no audio you keep is '
+          +'blocklisted and re-downloaded without asking</b>'
+        : 'off — nothing is replaced unless you press the button'}</span>
     </div>
     ${auRows?`<div id="auScroll" style="max-height:min(52vh,560px);overflow:auto;
         margin:6px 14px 0"><table style="width:100%;font-size:11.5px;

@@ -52,6 +52,40 @@ PER_BUCKET = 6
 PROBE_LANES = 8
 
 
+# The cycle, and what counts as too busy to spend sixty reads on.
+CYCLE_S = 600
+
+
+async def _too_busy() -> bool:
+    """True when the pool has more urgent work than a conformance sample.
+
+    Deliberately the gate's own opinion, not a second definition: somebody
+    watching, or a disk already saturated, is exactly what the gate exists to
+    notice, and the audit has no business being the one component that decides
+    it differently.
+    """
+    try:
+        from . import gate
+        st = await gate.check_plex()
+        if st and st.get("blocked"):
+            return True
+    except Exception:                                        # noqa: BLE001
+        pass
+    try:
+        from . import jobs
+        live = jobs.live_snapshot() or {}
+        # A full house of workers means the disks are already carrying
+        # everything they can. One or two running is not busy - that is the
+        # normal state of this box.
+        running = len([w for w in (live.get("workers") or [])
+                       if (w or {}).get("state") == "running"])
+        if running >= 4:
+            return True
+    except Exception:                                        # noqa: BLE001
+        pass
+    return False
+
+
 def _every_hours() -> float:
     from . import workers
     try:
@@ -624,6 +658,59 @@ def _note_replaced(file_id: int, out: dict) -> None:
              out.get("path") or ""))
 
 
+def language_verdict(path: str, library: str) -> tuple[str, str] | None:
+    r"""(found, want) when this file's audio is in no language the library
+    keeps, else None.
+
+    THE SAME RULE THE NIGHTLY CHECK USES, not a second copy of it. The settling
+    gate decides what gets processed and the rule check decides what gets
+    reported; two implementations of one rule would eventually disagree, and a
+    library where a file is blocked by one and absent from the other is
+    unexplainable from the outside.
+    """
+    if not path or not library:
+        return None
+    pr = probe(path)
+    if not pr:
+        return None                 # unreadable is somebody else's problem
+    try:
+        for rule, found, want in check(pr, rules.is_anime(path), library, path):
+            if rule == "audio/language":
+                return found, want
+    except Exception:                                        # noqa: BLE001
+        return None
+    return None
+
+
+def pending_replacements(limit: int = 50) -> list[dict]:
+    """Files standing at an audio/language verdict, oldest first.
+
+    Includes the ones the settling gate caught, which never belonged to a
+    sampled run - so auto mode acts on a file that arrived wrong within ten
+    minutes rather than whenever the random sample happens to pick it up.
+    """
+    try:
+        with cursor() as cur:
+            return [dict(r) for r in cur.execute(
+                "SELECT h.file_id, h.path, h.detail FROM audit_heals h "
+                "JOIN files f ON f.id = h.file_id "
+                "WHERE h.rule LIKE '%audio/language%' "
+                "  AND h.state NOT IN ('fixed','replaced') "
+                "  AND f.state NOT IN ('deleted','duplicate') "
+                "ORDER BY h.first_at LIMIT ?", (int(limit),))]
+    except Exception:                                        # noqa: BLE001
+        return []
+
+
+async def replace_many(ids: list[int], why: str = "") -> int:
+    done = 0
+    for fid in ids[:MAX_REPLACE_PER_RUN]:
+        out = await replace_one(int(fid), why)
+        if out.get("ok"):
+            done += 1
+    return done
+
+
 async def auto_replace(viol_by_file: dict) -> int:
     """In auto mode, replace the releases nothing else can fix.
 
@@ -636,6 +723,16 @@ async def auto_replace(viol_by_file: dict) -> int:
     if mode() != "auto":
         return 0
     done = 0
+    # THE SETTLING GATE'S CATCHES COME FIRST. They are the freshest - the file
+    # arrived minutes ago, nothing has been spent on it, and the arr's grab
+    # record is as current as it will ever be - and they are the ones a person
+    # would want dealt with before the encoder ever looks at them.
+    for row in pending_replacements(MAX_REPLACE_PER_RUN):
+        if done >= MAX_REPLACE_PER_RUN:
+            break
+        out = await replace_one(int(row["file_id"]), "caught while settling")
+        if out.get("ok"):
+            done += 1
     for fid, v in list(viol_by_file.items()):
         if done >= MAX_REPLACE_PER_RUN:
             break
@@ -1297,7 +1394,7 @@ async def run_once(per_bucket: int = PER_BUCKET) -> dict:
     finally:
         from . import workers
         STATS.update(running=False,
-                     next_run=time.time() + workers.tune("audit_every_h") * 3600)
+                     next_run=time.time() + CYCLE_S)
 
 
 # What the panel tells a reader this check actually covers. Kept next to the
@@ -1387,7 +1484,8 @@ def latest(run_id: int = 0) -> dict:
             "buckets": list(BUCKETS), "per_bucket": PER_BUCKET,
             "mode": mode(), "replaceable_rules": list(REPLACEABLE_RULES),
             "max_replace_per_run": MAX_REPLACE_PER_RUN,
-            "every_hours": _every_hours()}
+            "every_hours": _every_hours(),
+            "cycle_s": CYCLE_S}
 
 
 def clear_heal(file_id: int) -> bool:
@@ -1418,16 +1516,21 @@ async def watch() -> None:
         return
     while True:
         schedules.beat('audit')
+        # TEN MINUTES, UNLESS THE MACHINE IS ACTUALLY BUSY. A run is 60 reads
+        # and now takes six seconds, so the daily cadence was costing a day of
+        # latency to save six seconds of disk - a file that arrived wrong could
+        # sit unreported until tomorrow. Ten minutes is close enough to
+        # continuous to be useful and far enough apart to be invisible.
+        #
+        # "Busy" is asked of the same gate everything else here defers to,
+        # rather than of a load average: if the queue is working or somebody is
+        # watching, the audit's sixty reads are the least important I/O on the
+        # box and it waits a cycle. Nothing is skipped, only deferred.
+        if await _too_busy():
+            await asyncio.sleep(CYCLE_S)
+            continue
         try:
             await run_once()
         except Exception as e:
             joblog.log(f"audit loop: {type(e).__name__}: {e}", "error")
-        # Re-read each cycle AND nap in slices, so shortening a 24 h cadence
-        # on the settings page does not have to wait out a sleep started
-        # under the old value.
-        from . import workers
-        end = time.time() + workers.tune("audit_every_h") * 3600
-        while time.time() < end:
-            await asyncio.sleep(min(300, max(1, end - time.time())))
-            end = min(end, time.time()
-                      + workers.tune("audit_every_h") * 3600)
+        await asyncio.sleep(CYCLE_S)
