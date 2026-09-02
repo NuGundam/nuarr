@@ -2928,8 +2928,20 @@ def _backlog():
     return _BACKLOG["n"]
 
 
-def shape_rows(limit: int = 60) -> dict:
-    """Recorded verdicts, newest first, with the numbers behind each one."""
+def shape_rows(limit: int = 60, include_done: bool = True) -> dict:
+    r"""Recorded verdicts, newest first, with the numbers behind each one.
+
+    include_done=False DROPS THE FINISHED ROWS, which is what the panel shows
+    by default now - the same rule every other check card follows. A verdict
+    whose work is done is history, and history was crowding out the working
+    set: on Erik's library the newest-60 window was mostly green "done" rows
+    while the held ones a person might act on sat below the fold. The counts
+    above the table still include everything; only the LISTING narrows, and
+    the panel says how many finished rows it is not showing.
+
+    Filtering happens after annotation, so it uses the same _status_of verdict
+    the rows display - not a second definition that could drift.
+    """
     from .db import cursor
     rows, summary = [], {"files": 0, "typeset": 0, "dialogue": 0}
     try:
@@ -2969,17 +2981,26 @@ def shape_rows(limit: int = 60) -> dict:
             # nothing about whether that was five minutes or five weeks ago.
             r = cur.execute("SELECT MAX(at) a FROM sub_shape").fetchone()
             summary["last_at"] = (r["a"] or 0) if r else 0
+            # Over-fetch when the finished are being hidden: a window of the
+            # newest N can be entirely 'done' rows while actionable ones sit
+            # just past it, and filtering an already-cut window would show an
+            # empty table over a non-empty backlog.
+            fetch = int(limit) if include_done else max(int(limit), 400)
             for r in cur.execute(
                     "SELECT s.file_id, s.rel, s.typeset, s.median_h, "
                     "       s.tall_share, s.at, f.title, f.library, "
                     "       f.season, f.episode "
                     "FROM sub_shape s LEFT JOIN files f ON f.id = s.file_id "
-                    "ORDER BY s.at DESC LIMIT ?", (int(limit),)):
+                    "ORDER BY s.at DESC LIMIT ?", (fetch,)):
                 d = dict(r)
                 d["typeset"] = bool(d["typeset"])
                 d["ep"] = ep_label(d.pop("season", None), d.pop("episode", None))
                 rows.append(d)
             _annotate_status(cur, rows)
+            if not include_done:
+                shown = [r for r in rows if r.get("status") != "done"]
+                summary["done_hidden"] = len(rows) - len(shown)
+                rows = shown[:int(limit)]
     except Exception:                                        # noqa: BLE001
         pass
     return {"summary": summary, "rows": rows, "live": screen_state()}

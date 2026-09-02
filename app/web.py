@@ -5067,7 +5067,7 @@ def api_pipeline_find(q: str = "", limit: int = 12):
 
 
 @app.get("/api/subocr/shapes")
-def api_subocr_shapes(limit: int = 60, fresh: int = 0):
+def api_subocr_shapes(limit: int = 60, fresh: int = 0, done: int = 1):
     """What the picture-subtitle measurement has found, and what it is doing.
 
     One call feeds the whole panel - the counts, the rows and the live line -
@@ -5080,7 +5080,8 @@ def api_subocr_shapes(limit: int = 60, fresh: int = 0):
         # the button appears to do nothing for up to two minutes, which reads
         # as broken rather than as cached.
         subocr._BACKLOG["n"] = None
-    return subocr.shape_rows(max(1, min(int(limit), 400)))
+    return subocr.shape_rows(max(1, min(int(limit), 400)),
+                             include_done=bool(int(done)))
 
 
 @app.post("/api/subocr/sweep")
@@ -21408,7 +21409,8 @@ async function loadOcr(){
 // cursor mid-sentence. Scrolling down or hovering pauses the row rebuild; the
 // live line and the counts keep updating regardless, because those are the
 // parts you leave running in the corner of your eye.
-let _shapeTimer=null, _shapeRows=[], _shapeHover=false;
+let _shapeTimer=null, _shapeRows=[], _shapeHover=false, _shapeDone=false,
+    _shapeDoneHidden=0;
 let _shapeSort={key:'at', dir:-1};
 
 function shapePaused(){
@@ -21559,9 +21561,11 @@ async function shapeLoad(){
   const el=document.getElementById('shapeBody');
   if(!el){ if(_shapeTimer) clearTimeout(_shapeTimer); _shapeTimer=null; return; }
   let d;
-  try{ d=await fetch('/api/subocr/shapes?limit=200').then(r=>r.json()); }
+  try{ d=await fetch('/api/subocr/shapes?limit=200&done='+(_shapeDone?1:0))
+         .then(r=>r.json()); }
   catch(e){ el.innerHTML='<span class="dim" style="font-size:11.5px">could not load</span>'; return; }
   const s=d.summary||{}, live=d.live||{}, rows=d.rows||[];
+  _shapeDoneHidden=s.done_hidden||0;
   const busy=!!live.now, held=shapePaused();
   // THE BAR IS REAL, NOT A SPINNER PRETENDING. ffmpeg reports how far into the
   // file it has demuxed, so this is the fraction actually read - which is the
@@ -21744,14 +21748,33 @@ async function shapeLoad(){
         taller than 30% of the frame — tall bitmaps are signs and song
         captions laid over the picture, not lines of dialogue.</div>`;
   }
+  // DONE ROWS ARE HIDDEN BY DEFAULT, the same rule as every other check
+  // card: a verdict whose work is finished is history, and the newest-60
+  // window here was mostly green while the held rows a person might act on
+  // sat below the fold. The counts above still include everything; only the
+  // listing narrows, and this line says what it is not showing.
+  const doneToggle = (_shapeDone || _shapeDoneHidden)
+    ? `<div class="dim" style="font-size:11px;margin-top:4px">${_shapeDone
+        ? `showing finished rows too · <span class="lnk"
+             onclick="_shapeDone=false;shapeLoad()">hide them</span>`
+        : `${fmt(_shapeDoneHidden)} finished row${_shapeDoneHidden===1?'':'s'}
+           hidden · <span class="lnk"
+             onclick="_shapeDone=true;shapeLoad()">show them</span>`}</div>`
+    : '';
   document.getElementById('shapeHead').innerHTML=head+counts;
   if(!rows.length){
     document.getElementById('shapeTblWrap').innerHTML=
-      `<div class="dim" style="font-size:11.5px">Nothing measured yet — the
-       first files get read when the next OCR sweep picks them up.</div>`;
+      (_shapeDoneHidden
+        ? `<div class="dim" style="font-size:11.5px">Nothing outstanding —
+           every measured file is handled.</div>`
+        : `<div class="dim" style="font-size:11.5px">Nothing measured yet — the
+           first files get read when the next OCR sweep picks them up.</div>`)
+      + doneToggle;
   }else{
     _shapeRows=rows;
     if(!held) shapeRender();
+    const w=document.getElementById('shapeTblWrap');
+    if(w && doneToggle) w.insertAdjacentHTML('beforeend', doneToggle);
   }
   if(_shapeTimer) clearTimeout(_shapeTimer);
   // THREE SPEEDS, NOT TWO. 'busy' is true only while a file is actually open,
