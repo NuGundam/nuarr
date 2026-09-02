@@ -19238,6 +19238,7 @@ async function loadHistory(){
   if(key===lastHistKey) return;          // nothing new; don't repaint
   lastHistKey=key;
   _histRows=h.rows||[];
+  ocrPaceFrom(_histRows);
   lastListSig=null;
   renderDone(lastJobs);
 }
@@ -22470,12 +22471,17 @@ async function shapeLoad(force){
     ? `<div style="font-size:11.5px">
          <div style="display:flex;gap:8px;align-items:center">
            <span class="spin" style="width:11px;height:11px"></span>
+           <span style="color:#6fb0ff;font-weight:600;white-space:nowrap">reading</span>
            <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
-             reading <b>${esc(live.now)}</b>
+             <b>${esc(live.now)}</b>
              <span class="dim">track ${live.track||0}${gb?' · '+gb:''}
                · ${(live.busy_s||0).toFixed(0)}s</span></span>
            <span class="dim" style="margin-left:auto;white-space:nowrap">
-             ${live.frac?pct+'%':'opening the file…'}</span>
+             ${live.frac?`<b style="color:#6fb0ff">${pct}%</b>`
+                         + (live.busy_s>2 && live.frac>0.05
+                            ? ' · ' + hms(Math.round(live.busy_s*(1-live.frac)/live.frac)) + ' left'
+                            : '')
+                       :'opening the file…'}</span>
          </div>
          <div style="height:6px;border-radius:3px;background:#1b212a;margin-top:5px;
                      overflow:hidden;position:relative">
@@ -22597,25 +22603,24 @@ async function shapeLoad(force){
         s.batch ? ` · capped at ${fmt(s.batch)} per sweep` : ''}</span>
       <span id="shapeMsg" class="dim"></span>
     </div>
-    ${measuring?`<div style="font-size:11px;margin-bottom:4px">
-       <div style="display:flex;gap:8px;align-items:center">
-         <span class="spin" style="width:10px;height:10px"></span>
-         <span class="dim" style="flex:1;overflow:hidden;text-overflow:ellipsis;
-           white-space:nowrap">measuring — ${esc(mz.now||'')}</span>
-         <span class="dim">${fmt(mz.done||0)} of ${fmt(mz.total||0)}${
-           mz.typeset?` · ${fmt(mz.typeset)} typeset`:''}</span>
-       </div>
-       ${progressBar({done:mz.done, total:mz.total, now:''}, 'files')}
+    ${measuring?`<div style="font-size:11px;margin:3px 0 5px">
+       ${progressBar({done:mz.done, total:mz.total, now:mz.now||''}, 'files',
+         {kind:'measure', label:'measuring', eta_s:paceEta(mz)})}
+       ${mz.typeset?`<div class="dim" style="font-size:10.5px;margin-top:2px">
+         ${fmt(mz.typeset)} typeset so far — those go to the encoder to be
+         burned in, not to the OCR</div>`:''}
      </div>`:''}
-    ${sweeping?`<div style="font-size:11px;margin-bottom:4px">
-       <div style="display:flex;gap:8px;align-items:center">
-         <span class="spin" style="width:10px;height:10px"></span>
-         <span class="dim" style="flex:1;overflow:hidden;text-overflow:ellipsis;
-           white-space:nowrap">measuring and queueing — ${esc(sw.now||'')}</span>
-         <span class="dim">${fmt(sw.queued||0)} queued${
-           sw.signs?` · ${fmt(sw.signs)} for burning`:''}</span>
-       </div>
-       ${progressBar({done:sw.done, total:sw.total, now:''}, 'files')}
+    ${sweeping?`<div style="font-size:11px;margin:3px 0 5px">
+       ${progressBar({done:sw.done, total:sw.total, now:sw.now||''}, 'files',
+         {kind:'queue', label:'queueing', eta_s:paceEta(sw)})}
+       <div class="dim" style="font-size:10.5px;margin-top:2px">
+         ${fmt(sw.queued||0)} queued for the OCR${
+         sw.signs?` · ${fmt(sw.signs)} for burning`:''}${
+         // WHEN THE QUEUE WILL REACH THEM, which is the question a queued
+         // count invites. The OCR pool's own pace, from the jobs panel, is
+         // the honest source - this panel only knows how many it added.
+         _liveOcrPace ? ` · the queue is finishing one about every ${
+           hms(Math.round(_liveOcrPace))}` : ''}</div>
      </div>`:''}`;
 
   const counts = `
@@ -25887,19 +25892,37 @@ function arrBars(arrs, unit){
       </div>`;
   }).join('');
 }
-function progressBar(p, unit){
-  p = p || {};
+// THREE BARS, THREE JOBS, THREE COLOURS. This page can show a file being
+// read, a measuring pass and a queueing sweep at the same moment, and all
+// three were the same blue - so which bar was which had to be worked out from
+// the sentence above it. Each carries its own colour, its own label and its
+// own count now: blue for reading one file, amber for measuring a batch,
+// violet for handing work to the queue. The sheen only animates while
+// something is actually moving, which is the rule the sweep bar already had.
+const BARCOL = {read:'#6fb0ff', measure:'#f2c94c', queue:'#b48bf2',
+                ok:'#7fe0a0'};
+
+function progressBar(p, unit, opt){
+  p = p || {}; opt = opt || {};
   const done=p.done||0, tot=p.total||0;
+  const col = BARCOL[opt.kind] || BARCOL.read;
   const pct = tot ? Math.min(100, Math.round(done/tot*100)) : 0;
   const bits = [];
-  if(tot) bits.push(`<b>${pct}%</b>`);
+  if(tot) bits.push(`<b style="color:${col}">${pct}%</b>`);
   bits.push(`${fmt(done)}${tot?` of ${fmt(tot)}`:''} ${unit||''}`);
+  // HOW MANY ARE LEFT IN THIS SESSION, which is the number a person watching a
+  // batch actually wants and the one a percentage hides: "12 of 50" needs
+  // arithmetic, "38 left" does not.
+  if(tot && tot-done > 0) bits.push(`<b>${fmt(tot-done)}</b> left`);
   if(p.rate) bits.push(`${p.rate}/s`);
-  const eta = etaText(p.eta_s);
+  const eta = etaText(p.eta_s!=null ? p.eta_s : opt.eta_s);
   if(eta) bits.push(eta);
+  const moving = opt.moving !== false;
   return `
     <div style="display:flex;gap:8px;align-items:baseline;font-size:11px;
                 margin-top:2px">
+      ${opt.label?`<span style="color:${col};font-weight:600;white-space:nowrap"
+        >${esc(opt.label)}</span>`:''}
       <span class="dim" style="flex:1;overflow:hidden;text-overflow:ellipsis;
         white-space:nowrap">${p.now?esc(p.now):(p.where?esc(p.where):'')}</span>
       <span class="dim" style="white-space:nowrap">${bits.join(' · ')}</span>
@@ -25907,14 +25930,43 @@ function progressBar(p, unit){
     <div style="height:6px;border-radius:3px;background:#1b212a;margin-top:4px;
                 overflow:hidden;position:relative">
       ${tot
-        ? `<div style="height:100%;border-radius:3px;background:#6fb0ff;
-             width:${pct}%;transition:width 1s linear"></div>`
+        ? `<div style="height:100%;border-radius:3px;background:${col};
+             width:${pct}%;transition:width 1s linear"></div>
+           ${moving?`<div style="position:absolute;inset:0;
+             background:linear-gradient(90deg,transparent 0%,#ffffff26 50%,
+                                        transparent 100%);
+             background-size:220% 100%;
+             animation:barSweep 1.6s linear infinite"></div>`:''}`
         : `<div style="position:absolute;inset:0;
-             background:linear-gradient(90deg,#1b212a 0%,#6fb0ff 45%,
-                                        #9fd0ff 50%,#6fb0ff 55%,#1b212a 100%);
+             background:linear-gradient(90deg,#1b212a 0%,${col} 45%,
+                                        #ffffffcc 50%,${col} 55%,#1b212a 100%);
              background-size:220% 100%;animation:barSweep 1.15s linear infinite"
            ></div>`}
     </div>`;
+}
+
+// HOW LONG THE OCR POOL IS TAKING PER FILE, from the last few finished jobs.
+// Filled by loadJobs() when the Finished list arrives; null until then, and
+// the panel simply says nothing rather than inventing a number.
+let _liveOcrPace = null;
+function ocrPaceFrom(rows){
+  const r=(rows||[]).filter(j=>j.kind==='sub_ocr' && j.started_at && j.finished_at)
+                    .slice(0, 8);
+  if(r.length < 2) return;
+  const avg=r.reduce((t,j)=>t+(j.finished_at-j.started_at),0)/r.length;
+  if(avg>0 && avg<7200) _liveOcrPace=avg;
+}
+
+// SECONDS PER FILE, FROM THIS SESSION, so the estimate is about this library
+// on this machine rather than an average of somebody else's. Needs a start
+// time and one finished file; before that it says nothing rather than
+// guessing.
+function paceEta(st){
+  const done=(st||{}).done||0, tot=(st||{}).total||0, at=(st||{}).at||0;
+  if(!at || done<1 || tot<=done) return null;
+  const per=(Date.now()/1000 - at)/done;
+  if(!(per>0) || per>600) return null;
+  return Math.round(per*(tot-done));
 }
 
 // ---- console windows that appeared ---------------------------------------
