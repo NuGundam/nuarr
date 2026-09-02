@@ -9724,6 +9724,9 @@ button[disabled]{opacity:.5;cursor:default}
 /* The explainer is four paragraphs of prose above the thing you came to read.
    Folded away by default; the findings are the panel. */
 .auwhat{border-bottom:1px solid var(--line)}
+/* It is a plain block now rather than a <details>, so the disclosure caret and
+   the summary's pointer have nothing to attach to. */
+.auwhat>summary{display:none}
 .auwhat>summary{padding:8px 14px;cursor:pointer;color:var(--dim);font-size:11.5px;
   list-style:none}
 .auwhat>summary::-webkit-details-marker{display:none}
@@ -15005,8 +15008,14 @@ click to read this run's findings"
            RUNS had found something - true, and not what anyone opens this page
            to learn. The list of files below is. -->
     </div>
-    <details class="auwhat"><summary>What this check reads, and what the words mean</summary>
-    <div class="dim" style="padding:2px 14px 10px;font-size:11.5px">
+    <!-- OPEN, NOT A DISCLOSURE TRIANGLE. It explains what the numbers above it
+         mean, and a reader who has to ask for that has already been left
+         guessing once. Same shape as the codec pages' explanation block: a
+         titled paragraph that is simply there. -->
+    <div class="auwhat">
+    <div style="padding:8px 14px 3px;font-size:12px"><b style="color:#6fb0ff"
+      >What this check reads, and what the words mean</b></div>
+    <div class="dim" style="padding:0 14px 10px;font-size:11.5px">
       Takes ${d.per_bucket||6} random finished files from each of
       ${(d.buckets||[]).length} kinds of file — ${esc((d.buckets||[]).join(', '))}
       — and reads the real streams back off the pool with ffprobe rather than
@@ -15023,7 +15032,7 @@ click to read this run's findings"
         more than ${hc.max_per_run||20} files per run). If it does not, the file
         cannot be fixed by any current rule and is listed below rather than
         retried forever.</div>
-    </div></details>
+    </div></div>
     <div style="padding:7px 14px 0;display:flex;gap:10px;align-items:center;
                 flex-wrap:wrap;font-size:11.5px">
       <label style="display:flex;gap:7px;align-items:center;cursor:pointer"
@@ -27154,6 +27163,15 @@ _SETTINGS_CSS = """
 .sdk{min-width:96px;flex:0 0 auto;opacity:.7}
 .sdv{flex:1;min-width:0;word-break:break-word}
 .sdt{flex:0 0 auto;opacity:.55;white-space:nowrap}
+/* THE RULE CHECK'S LIST, given the signs table's own rhythm: a hairline under
+   each row so the eye tracks across twenty of them, and a hover that says
+   which one it is on. Twenty rows of identical unseparated text was the
+   "hard to read" Erik reported - not the size, the lack of anything to follow. */
+#auScroll tbody tr:not(.logdrop){border-bottom:1px solid rgba(255,255,255,.05)}
+#auScroll tbody tr:not(.logdrop):hover{background:rgba(88,166,255,.06)}
+#auScroll tbody tr.rowopen{background:rgba(88,166,255,.10)}
+#auScroll td{padding-top:4px;padding-bottom:4px}
+#auScroll th{border-bottom:1px solid var(--line)}
 /* Languages pane */
 #langPane .lkind{border:1px solid var(--line);border-radius:8px;margin-top:10px}
 #langPane .lkindhead{padding:7px 12px;border-bottom:1px solid var(--line);
@@ -27324,7 +27342,7 @@ _SETTINGS_CSS = """
      a frame whose whole job is to show that the box spans the panel. The
      border is the scrollbar-thumb colour (already established as "chrome"
      here), the fill is genuinely darker than the page. */
-  border:1px solid #2b3340;border-radius:8px;background:#090c10;
+  border:1px solid #2b3340;border-radius:8px;
   margin-bottom:12px;
   /* BACKSTOP: when the flex chain cannot resolve a height (narrow single-
      column layouts leave every ancestor at auto), an unclamped inner list
@@ -27332,6 +27350,13 @@ _SETTINGS_CSS = """
      a long day. The flex fill wins when the chain resolves; this cap only
      exists for when it does not. */
   max-height:calc(100vh - 230px)}
+/* THE DARK FILL IS THE LOG'S, and only the log's. It reads as "a terminal" -
+   right for a scrolling log, wrong for a list of files you are meant to read
+   and act on, which is why the rule check looked like a console dump while the
+   signs table beside it looked like part of the page. Plex playback keeps the
+   fill because it is a feed; the rule check now sits on the panel like every
+   other card. */
+#plexworkPane .fullpane{background:#090c10}
 #plexworkPane table, #ruleschkPane table{width:100%}
 /* THE INNER CLAMP. The renderers wrap their tables in .scrollbox.auto,
    which carries max-height:340px from its life as a dashboard grid cell.
