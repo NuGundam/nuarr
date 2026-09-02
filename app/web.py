@@ -5176,7 +5176,26 @@ async def api_subocr_config(body: dict = Body(...)):
         setattr(SETTINGS, k, v)
     joblog.log("subtitle OCR settings saved", "ok")
     from . import subocr
-    return {"ok": True, **subocr.status()}
+    out = {"ok": True, **subocr.status()}
+    # SAY WHAT THE TICK JUST DID. Erik switched OCR on for a library, and the
+    # only confirmations on screen were a bare "saved" and - worse - a
+    # language-policy preview reporting "nothing will change", which is true
+    # of the language policy and reads as the verdict on his click. The save
+    # now answers with the number that matters: how many measured files in
+    # this library the next sweep will pick up because of it.
+    if lib and changes.get("subocr_auto"):
+        try:
+            out["unlocked"] = _rows(
+                "SELECT COUNT(DISTINCT s.file_id) n FROM sub_shape s "
+                "JOIN files f ON f.id = s.file_id "
+                "WHERE f.library=? AND f.state NOT IN ('deleted','duplicate') "
+                "AND COALESCE(f.subocr_state,'') != 'rejected' "
+                "AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.file_id=f.id "
+                "  AND j.kind='sub_ocr' AND j.state='done')",
+                (lib,))[0]["n"]
+        except Exception:                                    # noqa: BLE001
+            pass
+    return out
 
 
 @app.post("/api/subocr/preview")
@@ -20823,7 +20842,11 @@ function socPaint(lib){
       <div class="sochead">Subtitle handling with OCR
         <span class="dim">${has.image?`${fmt(has.image)} picture subtitle track(s) here —
           ${fmt(has.dialogue)} dialogue, ${fmt(has.signs)} signs, ${fmt(has.forced)} forced`
-          :'no picture subtitle tracks in this library'}</span></div>
+          :'no picture subtitle tracks in this library'}</span>
+        <span class="dim" style="font-size:10.5px;display:block;margin-top:1px"
+          title="They only govern which tracks future sweeps read, so there is nothing to preview - unlike the language rules above, which rewrite plans and go through preview-then-commit.">
+          these switches save the moment you click them — the Save policy and
+          Cancel buttons above belong to the language rules only</span></div>
 
       ${chk('auto',s.auto,'Convert picture subtitles to text',
         'The master switch. PGS tracks are pictures, so Plex has to paint them into the video while you watch — which is a transcode. Nuarr converts them with OCR and adds a real text version, which every client just displays. The picture track stays. <b>Everything below only applies when this is on</b>, and decides WHICH picture tracks get read.',
@@ -20988,7 +21011,6 @@ async function socSaveLib(lib){
   try{
     const r=await (await fetch('/api/subocr/config',{method:'POST',
       headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
-    if(m){ m.style.color=r.ok?'#7fd4a3':'#e0575b'; m.textContent=r.ok?'saved':(r.error||'failed'); }
     if(r.ok && r.libraries){
       _socAll=r;
       rulesStale();        // the Rules page quotes the subtitle policy too
@@ -20998,6 +21020,19 @@ async function socSaveLib(lib){
       // the structure only caught up on the next full load and the screen
       // showed a tick that was already being ignored.
       socPaint(lib);
+    }
+    // AFTER the repaint, never before: socPaint rebuilds the block's
+    // innerHTML, so a message written first was erased in the same tick - a
+    // "saved" nobody ever saw, which is precisely how these switches came to
+    // feel unconfirmed and the Save-policy button above got the credit.
+    const m2=id('msg');
+    if(m2){
+      m2.style.color=r.ok?'#7fd4a3':'#e0575b';
+      m2.textContent = !r.ok ? (r.error||'failed')
+        : (r.unlocked
+            ? `saved — ${fmt(r.unlocked)} measured file(s) here become `
+              + `convertible on the next sweep`
+            : 'saved — takes effect on the next sweep');
     }
   }catch(e){ if(m){ m.style.color='#e0575b'; m.textContent='failed'; } }
 }
@@ -24409,11 +24444,17 @@ async function langSave(){
   }catch(e){ if(m) m.textContent='could not check'; return; }
   if(m) m.textContent='nothing saved yet';
   if(!box) return;
+  // NAMED SCOPE, because this preview sits on a page with a second, instant-
+  // save block below it. "Nothing will change" with no subject read as the
+  // verdict on whatever the person touched last - including an OCR switch
+  // this preview knows nothing about.
   const head = r.affected
-    ? `<b>${fmt(r.affected)}</b> existing file(s) would be planned differently
+    ? `Language rules: <b>${fmt(r.affected)}</b> existing file(s) would be
+       planned differently
        <span class="dim">(of ${fmt(r.checked)} checked)</span>`
-    : `<b>No existing file</b> would be planned differently
-       <span class="dim">(of ${fmt(r.checked)} checked)</span>`;
+    : `Language rules: <b>no existing file</b> would be planned differently
+       <span class="dim">(of ${fmt(r.checked)} checked — the OCR switches
+       below save separately, on click)</span>`;
   box.innerHTML=`<div class="pinhead">${head}
       <button style="margin-left:10px" onclick="langCommit()">Continue — save this policy</button>
       <button style="margin-left:6px" onclick="langCancel()">Cancel</button>
