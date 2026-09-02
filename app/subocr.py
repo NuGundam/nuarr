@@ -832,6 +832,9 @@ def measure_file(file_id: int, path: str, probe: dict,
                 dur = _probe_duration(probe)
                 _SCREEN["track"] = rel
                 _SCREEN["frac"] = 0.0
+                _SCREEN["cues"] = cues(s) or 0
+                _SCREEN["verdict"] = ""
+                _SCREEN["tall_share"] = _SCREEN["median_h"] = None
                 sup = _extract_sup_watched(
                     path, rel, work, f"m{file_id}_{rel}", dur,
                     lambda f: _SCREEN.__setitem__("frac", f))
@@ -839,7 +842,15 @@ def measure_file(file_id: int, path: str, probe: dict,
             except Exception:                                # noqa: BLE001
                 continue           # not demuxable - no verdict, no complaint
             try:
-                record_shape(file_id, rel, track_shape(sup))
+                shp = track_shape(sup)
+                # The verdict, the moment it exists, so the line that has been
+                # saying "reading" for thirty seconds can say what it found
+                # before the next file replaces it.
+                _SCREEN["verdict"] = ("typeset signs" if shp.get("typeset")
+                                      else "dialogue")
+                _SCREEN["tall_share"] = shp.get("tall_share")
+                _SCREEN["median_h"] = shp.get("median_h")
+                record_shape(file_id, rel, shp)
                 n += 1
             finally:
                 try:
@@ -2820,7 +2831,14 @@ def sweep_pick(limit: int) -> list[dict]:
 
 
 _SCREEN = {"now": "", "file_id": 0, "started": 0.0, "seen": 0, "typeset": 0,
-           "measured": 0, "last": 0.0, "frac": 0.0, "track": 0, "size": 0}
+           "measured": 0, "last": 0.0, "frac": 0.0, "track": 0, "size": 0,
+           # WHAT THE READ IS ABOUT TO BE JUDGED ON. A progress bar with a
+           # percentage tells you it is working; these tell you what it is
+           # working out. `cues` is the container's own count for the track
+           # being read - no decoding needed - and the two thresholds are the
+           # test the verdict is made against, so the answer is legible before
+           # it arrives rather than only afterwards.
+           "cues": 0, "verdict": "", "tall_share": None, "median_h": None}
 
 
 def ep_label(season, episode) -> str:
@@ -2845,6 +2863,10 @@ def screen_state() -> dict:
     """
     st = dict(_SCREEN)
     st["busy_s"] = round(time.time() - st["started"], 1) if st["now"] else 0.0
+    # Sent rather than hardcoded in the page: one definition of the test, and
+    # a page that cannot describe a threshold it does not have.
+    st["tall_frac"] = TYPESET_TALL_FRAC
+    st["typeset_share"] = TYPESET_SHARE
     return st
 
 
@@ -3105,7 +3127,7 @@ def _backlog():
     return _BACKLOG["n"]
 
 
-_FUNNEL: dict = {"at": 0.0, "d": None}
+_FUNNEL: dict = {"at": 0.0, "d": None, "busy": False}
 _FUNNEL_TTL = 120.0
 # Both spellings ffprobe uses for a picture subtitle, as a SQL fragment. The
 # same test the sweep uses, so the number on the page and the number the sweep
@@ -3142,9 +3164,24 @@ def funnel() -> dict:
     Memoised for two minutes. The LIKE over the probe blobs is ~0.8 s and none
     of these numbers moves faster than a scan.
     """
+    # NEVER ON THE REQUEST PATH. Two LIKE scans over 37,000 probe blobs plus
+    # eight counts is ~5 seconds cold, and this panel polls - so every time the
+    # cache expired, one poll took five seconds and the page sat there. Same
+    # treatment as the backlog: serve what is cached, refresh behind it. The
+    # very first call returns {} and the funnel row simply does not draw yet,
+    # which is a beat of nothing rather than five seconds of waiting.
     now = time.time()
-    if _FUNNEL["d"] is not None and now - _FUNNEL["at"] < _FUNNEL_TTL:
-        return _FUNNEL["d"]
+    fresh = _FUNNEL["d"] is not None and now - _FUNNEL["at"] < _FUNNEL_TTL
+    if not fresh and not _FUNNEL.get("busy"):
+        _FUNNEL["busy"] = True
+        import threading
+        threading.Thread(target=_funnel_compute, name="subocr-funnel",
+                         daemon=True).start()
+    return _FUNNEL["d"] or {}
+
+
+def _funnel_compute() -> dict:
+    """The counting itself. Runs on a thread; see funnel()."""
     from .db import cursor
     d = {}
     try:
@@ -3181,6 +3218,7 @@ def funnel() -> dict:
                 f"ON f.id=j.file_id WHERE {live} AND j.kind='sub_ocr' "
                 "AND j.state IN ('queued','running')")
     except Exception:                                        # noqa: BLE001
+        _FUNNEL["busy"] = False
         return _FUNNEL["d"] or {}
     # COUNTED THE SAME WAY THE PICKER PICKS, so the number on the page is the
     # number Check now would work through. Subtracting measured from
@@ -3194,7 +3232,7 @@ def funnel() -> dict:
                 f"AND {_IMG_SQL} {_UNMEASURED_SQL}").fetchone()[0] or 0)
     except Exception:                                        # noqa: BLE001
         d["to_measure"] = max(0, d["with_picture"] - d["measured"])
-    _FUNNEL.update(at=now, d=d)
+    _FUNNEL.update(at=time.time(), d=d, busy=False)
     return d
 
 

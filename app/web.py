@@ -1143,6 +1143,12 @@ def api_plex_art(key: str):
 
 @app.get("/api/queue/blockers")
 async def api_queue_blockers():
+    """Served from the last answer while the next one is prepared - see
+    _amemo_bg(). This endpoint explains a decision; it does not make one."""
+    return await _amemo_bg("blockers", 5.0, _queue_blockers_impl)
+
+
+async def _queue_blockers_impl():
     r"""Why is the queue not moving? Answered per file, not in general.
 
     The panel said "a worker and their spindles are free" from a static string
@@ -2585,6 +2591,39 @@ _MEMO: dict = {}
 # business reaching, and it is hard-capped after that.
 _MEMO_SWEEP_AT = 512
 _MEMO_MAX = 2048
+
+
+# ASK-AND-SERVE-THE-LAST-ANSWER, for an endpoint that EXPLAINS rather than
+# decides. Measured on the live server, /api/queue/blockers ranged from 33 ms
+# to 5.7 seconds depending on whether the gate's Plex probe happened to be
+# cold - and the dashboard polls it every six seconds, so every so often a
+# page sat waiting five seconds to be told why a queue was idle. The gate
+# refreshes on its own cadence for its own purposes; a panel describing that
+# decision does not need to force one. So: the cached answer goes back
+# immediately, and a refresh runs behind it. The first caller after startup
+# waits once; nobody waits after that.
+_AMEMO: dict = {}
+
+
+async def _amemo_bg(key: str, ttl: float, fn):
+    import asyncio as _a
+    v = _AMEMO.get(key)
+    now = time.time()
+    if v and not v.get("busy") and now - v["at"] >= ttl:
+        v["busy"] = True
+
+        async def _refresh():
+            try:
+                r = await fn()
+                _AMEMO[key] = {"at": time.time(), "v": r, "busy": False}
+            except Exception:                                # noqa: BLE001
+                _AMEMO[key]["busy"] = False
+        _a.create_task(_refresh())
+    if v:
+        return v["v"]
+    r = await fn()
+    _AMEMO[key] = {"at": time.time(), "v": r, "busy": False}
+    return r
 
 
 def _memo(key: str, ttl: float, fn):
@@ -7695,12 +7734,18 @@ def _libraries_impl():
     for r in _rows(
             "SELECT f.library lib, j.state st, COUNT(DISTINCT f.id) n "
             "FROM jobs j JOIN files f ON f.id = j.file_id "
-            "JOIN (SELECT file_id, MAX(COALESCE(finished_at, started_at, "
-            "             created_at)) AS t "
-            "      FROM jobs WHERE file_id IS NOT NULL GROUP BY file_id) last "
-            "  ON last.file_id = j.file_id "
-            " AND COALESCE(j.finished_at, j.started_at, j.created_at) = last.t "
             "WHERE j.state IN ('cancelled','failed') "
+            # ASKED FROM THE TWO STATES OUTWARDS, not from the whole
+            # table inwards. This built `last` as a GROUP BY over every
+            # one of 64,000 job rows and then threw away everything that
+            # was not cancelled or failed: 230 ms, and the slowest thing
+            # on a page that is polled. Starting from the handful of
+            # rows in those two states lets SQLite walk ix_jobs_file per
+            # candidate - 9 ms, and verified to return the same rows.
+            "  AND COALESCE(j.finished_at, j.started_at, j.created_at) = "
+            "      (SELECT MAX(COALESCE(k.finished_at, k.started_at, "
+            "                           k.created_at)) "
+            "         FROM jobs k WHERE k.file_id = j.file_id) "
             # ...and the file still has work outstanding. A done file is done
             # however its last attempt ended.
             "  AND f.state NOT IN ('done','deleted') "
@@ -22203,6 +22248,20 @@ function shapeShowDone(on){
   _shapeHover=false;
   shapeLoad(true);
 }
+// The gate's own words for why the OCR pool is not moving. Cached between
+// polls: the endpoint runs a Plex probe and a disk read, and the answer does
+// not change between two 2.5-second frames.
+let _shapeWhy='', _shapeWhyAt=0;
+async function shapeWhyLoad(){
+  if(Date.now()-_shapeWhyAt < 8000) return;
+  _shapeWhyAt=Date.now();
+  try{
+    const d=await (await fetch('/api/queue/blockers')).json();
+    const r=(d.rows||[]).find(x=>x.pool==='subocr' && (x.short||x.why));
+    _shapeWhy = r ? ('the queue is holding them: '+(r.short||r.why))
+                  : (d.headline || '');
+  }catch(e){ _shapeWhy=''; }
+}
 function shapePaused(){
   const b=document.getElementById('shapeScroll');
   // AN OPEN ROW PINS THE LIST. Reading a drop-down while the rows under it
@@ -22453,6 +22512,10 @@ async function shapeLoad(force){
   catch(e){ el.innerHTML='<span class="dim" style="font-size:11.5px">could not load</span>'; return; }
   const s=d.summary||{}, live=d.live||{}, rows=d.rows||[];
   _shapeDoneHidden=s.done_hidden||0;
+  // Only asked for when something is actually queued and held - there is no
+  // point costing a gate probe to explain an empty queue.
+  if((s.status||{}).queued) shapeWhyLoad();
+  else _shapeWhy='';
   const busy=!!live.now, held=shapePaused();
   // THE BAR IS REAL, NOT A SPINNER PRETENDING. ffmpeg reports how far into the
   // file it has demuxed, so this is the fraction actually read - which is the
@@ -22482,6 +22545,20 @@ async function shapeLoad(force){
                             ? ' · ' + hms(Math.round(live.busy_s*(1-live.frac)/live.frac)) + ' left'
                             : '')
                        :'opening the file…'}</span>
+         </div>
+         <!-- THE TEST, WHILE IT IS BEING APPLIED. A percentage says the read is
+              working; these say what it is working out. The cue count is the
+              container's own, so it costs nothing, and the two thresholds are
+              the rule the verdict is made against - sent by the server so the
+              page cannot quote a threshold the check no longer uses. -->
+         <div class="dim" style="font-size:10.5px;margin-top:2px">
+           ${live.cues?`<b>${fmt(live.cues)}</b> cues · `:''}typeset if more than
+           <b>${Math.round((live.typeset_share||0.2)*100)}%</b> of them use a bitmap
+           taller than <b>${Math.round((live.tall_frac||0.3)*100)}%</b> of the frame${
+           live.verdict?` · <b style="color:${live.verdict==='dialogue'?'#6fd08c':'#e2b341'}"
+             >${esc(live.verdict)}</b>${live.tall_share!=null
+               ? ` — ${Math.round(live.tall_share*100)}% tall, median ${
+                   Math.round((live.median_h||0)*100)}%` : ''}`:''}
          </div>
          <div style="height:6px;border-radius:3px;background:#1b212a;margin-top:5px;
                      overflow:hidden;position:relative">
@@ -22633,6 +22710,26 @@ async function shapeLoad(force){
       ${stChip('processing','being read now','var(--acc)')}
       ${stChip('queued','queued','#b48bf2')}
       ${stChip('eligible','waiting to be queued','var(--dim)')}
+      ${(() => {
+        // WHY THEY ARE STILL WAITING, which a count on its own invites and
+        // never answers. Two different waits with two different reasons:
+        //   eligible - nothing has offered them to the queue yet, and in auto
+        //              mode that is the sweep's schedule, not a fault.
+        //   queued   - the queue HAS them and the gate is holding them; the
+        //              blockers endpoint knows exactly which rule, and it is
+        //              the same function the dispatcher uses, so it cannot
+        //              drift from the behaviour it explains.
+        const bits=[];
+        if(st.eligible) bits.push(sauto
+          ? `waiting for the sweep${s.next_sweep_in_s!=null
+              ? ` — next in ${hms(Math.round(s.next_sweep_in_s))}` : ''}`
+            + `, or press Convert all now`
+          : 'nothing queues them automatically in manual mode — press Convert all now');
+        if(st.queued && _shapeWhy) bits.push(_shapeWhy);
+        return bits.length
+          ? `<span class="dim" style="flex:1 0 100%;font-size:11px;margin-top:1px"
+             >${bits.join(' · ')}</span>` : '';
+      })()}
       ${(() => {
         // TWO HOLDS, TWO SENTENCES. "rejected or switched off" made a person
         // ask which - and one of the two is their own setting doing its job.
