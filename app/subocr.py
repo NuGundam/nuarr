@@ -2794,7 +2794,14 @@ def status_counts(cur) -> dict:
     with a typeset track and a dialogue track is one file, and it is counted
     by the track that still has something to do.
     """
-    out = {"processing": 0, "queued": 0, "done": 0, "eligible": 0, "held": 0}
+    # HELD IS TWO DIFFERENT FACTS, and one of them is the user's own doing.
+    # Erik read 32 rows of "held - rejected or switched off" and asked why,
+    # which is the question the label invited: it lumped "you switched OCR off
+    # for Animated Shows" (a setting, working as asked) together with "the OCR
+    # looked at this track and declined it" (a verdict about content). Counted
+    # apart so each can be said plainly.
+    out = {"processing": 0, "queued": 0, "done": 0, "eligible": 0, "held": 0,
+           "held_off": 0, "held_rejected": 0}
     try:
         rows = [dict(r) for r in cur.execute(
             "SELECT s.file_id, MAX(s.typeset) AS ts, f.library, "
@@ -2820,12 +2827,15 @@ def status_counts(cur) -> dict:
             d = dict(j)
             done.setdefault(d["file_id"], set()).add(d["kind"])
         for r in rows:
-            st, _ = _status_of(
+            st, why = _status_of(
                 typeset=bool(r["ts"]), library=r["library"],
                 live=live.get(r["file_id"]),
                 done_kinds=done.get(r["file_id"], ()),
                 rejected=r["sst"] == "rejected")
             out[st] = out.get(st, 0) + 1
+            if st == "held":
+                out["held_off" if "switched off" in why
+                    else "held_rejected"] += 1
     except Exception:                                        # noqa: BLE001
         pass
     return out

@@ -4657,11 +4657,17 @@ def api_health():
         # THE CARD'S OWN NAME, because a row that is a shortcut to a card
         # should be findable by the name on the card - and the link lands ON
         # it, not merely on the page it lives in.
+        held_bits = []
+        if st.get("held_off"):
+            held_bits.append(f"{st['held_off']} switched off by you")
+        if st.get("held_rejected"):
+            held_bits.append(f"{st['held_rejected']} rejected by the OCR")
         add("shapes", "Signs or dialogue - what the check found", "shapes", n,
             (f"{n} waiting to be queued" if n else
              f"{st.get('queued', 0)} queued, {st.get('processing', 0)} running"
              if (st.get("queued") or st.get("processing")) else
-             "everything measured is handled"),
+             ("everything measured is handled"
+              + (" · " + ", ".join(held_bits) if held_bits else ""))),
             mode=_so.mode(),
             running=bool(_so.SWEEP_STATE.get("running")))
     except Exception as e:                                   # noqa: BLE001
@@ -21624,7 +21630,25 @@ async function shapeLoad(){
       ${stChip('processing','being read now','var(--acc)')}
       ${stChip('queued','queued','#b48bf2')}
       ${stChip('eligible','waiting to be queued','var(--dim)')}
-      ${stChip('held','not converting — rejected or switched off','var(--warn)')}
+      ${(() => {
+        // TWO HOLDS, TWO SENTENCES. "rejected or switched off" made a person
+        // ask which - and one of the two is their own setting doing its job.
+        const off=st.held_off||0, rej=st.held_rejected||0;
+        const both=off&&rej, lump=(st.held||0)-(off+rej);
+        return (off?`<span style="color:var(--warn)" title="Subtitle OCR is
+          switched off for these files' libraries in your own settings
+          (Settings → Subtitles). Working as asked — flip the library's switch
+          if you want them converted."><b>${fmt(off)}</b>
+          <span class="dim">switched off by you</span></span>`:'')
+        + (both?' ':'')
+        + (rej?`<span style="color:var(--warn)" title="The OCR read these
+          tracks and declined them — too sparse to be dialogue, or otherwise
+          not convertible. A verdict about the content, remembered so the same
+          file is not re-read every sweep. Each row's status says why."><b>${
+          fmt(rej)}</b> <span class="dim">rejected by the OCR</span></span>`:'')
+        + (lump>0?` <span style="color:var(--warn)"><b>${fmt(lump)}</b>
+          <span class="dim">held</span></span>`:'');
+      })()}
       <span id="shapeHold" class="dim" style="font-size:11px;${held?'':'display:none'}">
         · paused while you read — scroll back to the top to resume</span>
     </div>

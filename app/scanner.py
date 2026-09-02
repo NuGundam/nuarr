@@ -1145,8 +1145,17 @@ async def scan(full: bool = True, probe_orphans: bool = True,
                 # deliberate. Clearing the reason is right for the ordinary
                 # states, where it describes a condition that has passed; for
                 # 'deleted' and 'error' it describes a verdict that has not.
+                # ...AND SO IS AN OCR REJECTION ON A DONE FILE. subocr_state
+                # says 'rejected' in its own column, but the WHY - "the OCR was
+                # too sparse to be dialogue", the whole explanation - lived in
+                # state_reason on a row whose state is plain 'done', and this
+                # nulling erased it on the next pass. Erik's held files all
+                # read reason: None; the verdicts survived, anonymised.
                 reason = (prev["state_reason"]
-                          if state in ("deleted", "error") else None)
+                          if (state in ("deleted", "error")
+                              or str(prev["state_reason"] or "")
+                              .startswith("subtitle OCR"))
+                          else None)
 
                 # A RENAME. The row keeps its identity and simply learns a new path -
                 # this is the single behaviour that stops a rename resetting work.
@@ -1260,7 +1269,10 @@ async def scan(full: bool = True, probe_orphans: bool = True,
                         # Same rule as the arr-keyed branch above: a verdict
                         # keeps its explanation, a passing condition does not.
                         (prev["state_reason"]
-                         if prev["state"] in ("deleted", "error") else None),
+                         if (prev["state"] in ("deleted", "error")
+                             or str(prev["state_reason"] or "")
+                             .startswith("subtitle OCR"))
+                         else None),
                         now, now, prev["id"],
                     ))
 
