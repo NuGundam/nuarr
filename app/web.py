@@ -5182,6 +5182,37 @@ def api_subocr_shape(file_id: int):
     return subocr.shape_detail(int(file_id))
 
 
+@app.post("/api/subocr/measure")
+async def api_subocr_measure(limit: int = -1):
+    """Read the shape of files that have never been measured.
+
+    This is what Check now does now. limit -1 means "use the configured
+    batch"; 0 means every unmeasured file in the library.
+    """
+    from . import subocr
+    return await subocr.measure_sweep(None if limit < 0 else limit)
+
+
+@app.post("/api/subocr/measure/batch")
+def api_subocr_measure_batch(n: int):
+    """How many files one Check-now pass reads. 0 = all of them."""
+    import yaml
+    from .config import SETTINGS as _S
+    n = max(0, min(100000, int(n)))
+    cp = _config_path()
+    raw = {}
+    if cp.exists():
+        try:
+            raw = yaml.safe_load(cp.read_text(encoding="utf-8-sig")) or {}
+        except Exception:                                    # noqa: BLE001
+            raw = {}
+    raw["subocr_measure_batch"] = n
+    cp.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True),
+                  encoding="utf-8")
+    _S.subocr_measure_batch = n
+    return {"ok": True, "n": n}
+
+
 @app.post("/api/subocr/sweep")
 async def api_subocr_sweep():
     """Queue every convertible file now. Minutes, so the card polls."""
@@ -5274,6 +5305,8 @@ async def api_subocr_config(body: dict = Body(...)):
         setattr(SETTINGS, k, v)
     joblog.log("subtitle OCR settings saved", "ok")
     from . import subocr
+    subocr._BACKLOG["n"] = None          # recounted on the next poll, off-thread
+    subocr._FUNNEL["d"] = None
     out = {"ok": True, **subocr.status()}
     # "TAKES EFFECT ON THE NEXT SWEEP" INVITES THE QUESTION "WHEN IS THAT".
     # Erik asked it. The schedule registry already knows; ship the answer with
@@ -21320,6 +21353,24 @@ async function loadLangTab(){
     </div>`;}).join('')
     : '<div class="dim">no libraries configured</div>')
     ;
+
+  // THE CHECK LIVES WITH THE SETTINGS THAT DRIVE IT. It was on the OCR engines
+  // page, beside Tesseract and PaddleOCR - which is where the READER is
+  // configured, not where the decision about what to read is made. Erik asked
+  // for it here, under the per-library switches whose every change alters what
+  // it reports.
+  el.innerHTML += `<div class="lkind" id="shapeCard" style="padding:11px 12px;margin-top:12px">
+      <b style="color:#6fb0ff">Picture subtitles — what has been measured</b>
+      <div class="dim" style="font-size:11px;margin-top:2px">
+        A picture subtitle is a bitmap, so Plex paints it into the video as you
+        watch. Measuring one tells us which kind it is: dialogue is read into
+        text by the OCR, typeset signs are burned in by the encoder instead.
+        Reading a track means demuxing the whole file, so it happens once per
+        file.</div>
+      <div id="shapeBody" style="margin-top:8px"><span class="dim"
+           style="font-size:11.5px">loading…</span></div>
+    </div>`;
+  shapeLoad();
   langSignsLoad();
 }
 
@@ -21715,6 +21766,10 @@ async function socSaveLib(lib){
       // the structure only caught up on the next full load and the screen
       // showed a tick that was already being ignored.
       socPaint(lib);
+      // The switches above decide which tracks the sweep may read, so the
+      // funnel and the Convert-all count below are now wrong. Erik asked for
+      // exactly this: change a switch, watch the button change.
+      if(document.getElementById('shapeBody')) shapeLoad(true);
     }
     // AFTER the repaint, never before: socPaint rebuilds the block's
     // innerHTML, so a message written first was erased in the same tick - a
@@ -22110,25 +22165,13 @@ async function loadOcr(){
       </div>
     </div>
 
-    <div class="lkind" id="shapeCard" style="padding:11px 12px;margin-top:10px">
-      <b style="color:#6fb0ff">Signs or dialogue — what the check found</b>
-      <div class="dim" style="font-size:11px;margin-top:2px">
-        Before a file is queued for OCR its picture subtitles are measured, so
-        typeset signs are burned into the video instead of being flattened into
-        text at the bottom of the screen. Reading a track means demuxing the
-        whole file, so it happens once per file and only for files the sweep is
-        about to convert.</div>
-      <div id="shapeBody" style="margin-top:8px"><span class="dim"
-           style="font-size:11.5px">loading…</span></div>
-    </div>
-
     <div class="dim" style="font-size:11px;margin-top:10px">
-      Which tracks qualify — dialogue, SDH, forced — and for which libraries is
-      a subtitle policy rather than a property of the engine:
-      <a href="#" onclick="wtab('lang');return false">Subtitles</a>.
+      Which tracks qualify — dialogue, SDH, forced — for which libraries, and
+      what the check has measured so far, are all on
+      <a href="#" onclick="wtab('lang');return false">Subtitles</a>: this page
+      is only about the reader itself.
     </div>`;
   ocrUpdLoad();
-  shapeLoad();
 }
 
 // ---- the measurement panel ---------------------------------------------
@@ -22373,12 +22416,23 @@ async function shapeMode(m){
 }
 async function shapeCheck(){
   const el=document.getElementById('shapeMsg');
-  if(el) el.textContent=' counting…';
-  // Nothing is queued by this - it re-reads what is left, which is the
-  // question "Check now" actually asks.
-  try{ await fetch('/api/subocr/shapes?limit=1&fresh=1'); }catch(e){}
-  shapeLoad();
+  if(el) el.textContent=' measuring…';
+  // MEASURES, rather than re-counting. Each file is one demux of a single
+  // subtitle track; the batch size beside the button decides how many.
+  // Nothing is queued and no file is changed - this only finds out what is
+  // in them.
+  shapeLoad(true);                       // show the progress bar immediately
+  try{ await fetch('/api/subocr/measure',{method:'POST'}); }catch(e){}
+  shapeLoad(true);
   if(el) setTimeout(()=>{ el.textContent=''; }, 2500);
+}
+async function shapeBatch(n){
+  const el=document.getElementById('shapeMsg');
+  if(el) el.textContent=' saving…';
+  try{ await fetch('/api/subocr/measure/batch?n='+encodeURIComponent(n),
+                   {method:'POST'}); }catch(e){}
+  if(el) el.textContent='';
+  shapeLoad(true);
 }
 async function shapeRun(){
   const el=document.getElementById('shapeMsg');
@@ -22452,6 +22506,51 @@ async function shapeLoad(force){
   // say "not automatically" and no way to say "now".
   const sw=s.sweep||{}, sweeping=!!sw.running;
   const smode=s.mode||'auto', sauto=smode==='auto';
+  // ---- THE FUNNEL ---------------------------------------------------------
+  //
+  // The panel could only ever say "76 of 164 measured", which is a fraction of
+  // a number nobody had been shown: 164 is what this check happens to have
+  // read, not how many files have picture subtitles at all. Erik asked for the
+  // real population, and it is the only honest way to report a backlog - four
+  // steps, each one a count you would otherwise have to take on faith.
+  const fn = s.funnel || {};
+  const step = (n, label, col) => `<span style="white-space:nowrap"><b style="${
+      col?`color:${col}`:''}">${fmt(n||0)}</b>
+    <span class="dim">${label}</span></span>`;
+  const arrow = '<span class="dim" style="opacity:.5">›</span>';
+  const funnelRow = fn.managed ? `
+    <div style="display:flex;gap:9px;flex-wrap:wrap;align-items:baseline;
+                font-size:12px;margin:6px 0 3px">
+      ${step(fn.managed, 'files managed')} ${arrow}
+      ${step(fn.with_picture, 'have picture subtitles', '#6fb0ff')} ${arrow}
+      ${step(fn.measured, 'measured by this check', '#7fe0a0')}
+      ${fn.to_measure ? `${arrow} ${step(fn.to_measure, 'still to measure', '#f2c94c')}` : ''}
+    </div>` : '';
+
+  // WHERE THE MEASURED ONES GO. Two destinations and two dead ends, which is
+  // the question "how many are subocr vs encode" asked properly: a dialogue
+  // track is read into text by the OCR, a typeset one is burned into the
+  // picture by the encoder, and the rest are either already done or declined.
+  const whereRow = fn.measured ? `
+    <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:baseline;
+                font-size:11.5px;margin:0 0 5px">
+      <span class="dim">of those measured:</span>
+      <span style="color:#6fd08c"><b>${fmt(fn.dialogue_files)}</b>
+        <span class="dim">dialogue → subtitle OCR</span></span>
+      <span style="color:#e2b341"><b>${fmt(fn.typeset_files)}</b>
+        <span class="dim">typeset → burned in by the encoder</span></span>
+      ${fn.queued?`<span style="color:#b48bf2"><b>${fmt(fn.queued)}</b>
+        <span class="dim">queued now</span></span>`:''}
+      <span style="color:var(--fx-ok,#7fe0a0)"><b>${fmt(fn.converted)}</b>
+        <span class="dim">already converted</span></span>
+      ${fn.rejected?`<span style="color:var(--warn)"
+        title="The reader ran and declined these - too little usable text. A verdict about the content, remembered so the same file is not read again every sweep."
+        ><b>${fmt(fn.rejected)}</b>
+        <span class="dim">rejected by the OCR</span></span>`:''}
+    </div>` : '';
+
+  const mb = s.measure_batch;
+  const mz = s.measuring || {}, measuring = !!mz.running;
   const ctl = `
     <div style="display:flex;gap:7px;align-items:center;font-size:11px;
                 margin:6px 0 2px;flex-wrap:wrap">
@@ -22467,19 +22566,47 @@ async function shapeLoad(force){
             color:${smode===m?'#0b0e13':'var(--dim,#8a97a6)'};
             font-weight:${smode===m?'600':'400'}">${m}</button>`).join('')}
       </span>
-      <button onclick="shapeCheck()" ${sweeping?'disabled':''}
+      <!-- CHECK NOW MEASURES. It used to re-count the backlog, which is a
+           reasonable thing for a button to do and not what its label says: the
+           check IS the measurement. It reads from the known picture-subtitle
+           list, and how many it takes in one pass is settable, because each
+           file costs one demux and somebody may want to leave it running
+           through the lot. -->
+      <button onclick="shapeCheck()" ${measuring||sweeping?'disabled':''}
         style="font-size:11px;padding:2px 9px"
-        title="Re-count what is left without queueing anything">Check now</button>
-      <button onclick="shapeRun()" ${sweeping?'disabled':''}
+        title="Measure files that have picture subtitles and have never been read. Nothing is queued or changed.">${
+        measuring?'Measuring…':'Check now'}</button>
+      <span class="dim">measure</span>
+      <select onchange="shapeBatch(this.value)" ${measuring?'disabled':''}
+        style="font-size:11px;padding:1px 4px">
+        ${[10,25,50,100,250,500,0].map(n=>`<option value="${n}" ${
+          n===mb?'selected':''}>${n?fmt(n):'all '+fmt(fn.to_measure||0)}</option>`).join('')}
+      </select>
+      <span class="dim">per check</span>
+      <button onclick="shapeRun()" ${sweeping||measuring?'disabled':''}
         style="font-size:11px;padding:2px 9px"
         title="Hand every convertible file to the queue - the queue paces itself">${
-        sweeping?'Queueing…':'Convert all now'}</button>
+        sweeping?'Queueing…'
+        : s.backlog==null ? 'Convert all now <span class="dim">(counting…)</span>'
+        : s.backlog ? `Convert all now (${fmt(s.backlog)})`
+        : 'Convert all now'}</button>
       <span class="dim">${sauto
-        ? `checked every ${s.every_h||6}h`
+        ? `sweeps every ${s.every_h||6}h${s.next_sweep_in_s!=null
+            ? ` · next in ${hms(Math.round(s.next_sweep_in_s))}` : ''}`
         : 'nothing is queued automatically'}${
         s.batch ? ` · capped at ${fmt(s.batch)} per sweep` : ''}</span>
       <span id="shapeMsg" class="dim"></span>
     </div>
+    ${measuring?`<div style="font-size:11px;margin-bottom:4px">
+       <div style="display:flex;gap:8px;align-items:center">
+         <span class="spin" style="width:10px;height:10px"></span>
+         <span class="dim" style="flex:1;overflow:hidden;text-overflow:ellipsis;
+           white-space:nowrap">measuring — ${esc(mz.now||'')}</span>
+         <span class="dim">${fmt(mz.done||0)} of ${fmt(mz.total||0)}${
+           mz.typeset?` · ${fmt(mz.typeset)} typeset`:''}</span>
+       </div>
+       ${progressBar({done:mz.done, total:mz.total, now:''}, 'files')}
+     </div>`:''}
     ${sweeping?`<div style="font-size:11px;margin-bottom:4px">
        <div style="display:flex;gap:8px;align-items:center">
          <span class="spin" style="width:10px;height:10px"></span>
@@ -22490,15 +22617,14 @@ async function shapeLoad(force){
        </div>
        ${progressBar({done:sw.done, total:sw.total, now:''}, 'files')}
      </div>`:''}`;
+
   const counts = `
+    ${funnelRow}
+    ${whereRow}
     ${ctl}
     <div style="display:flex;gap:14px;flex-wrap:wrap;margin:7px 0 4px;font-size:11.5px;
                 align-items:center">
-      <span style="color:var(--ok)"><b>${fmt(done)}</b>
-        <span class="dim">of ${fmt(tot)} measured${
-          tot?` (${Math.round(done/tot*100)}%)`:''}</span></span>
-      <span style="color:#e2b341"><b>${fmt(s.typeset||0)}</b> <span class="dim">typeset — burned in</span></span>
-      <span style="color:#6fd08c"><b>${fmt(s.dialogue||0)}</b> <span class="dim">dialogue — read as text</span></span>
+      <span class="dim">right now:</span>
       ${stChip('processing','being read now','var(--acc)')}
       ${stChip('queued','queued','#b48bf2')}
       ${stChip('eligible','waiting to be queued','var(--dim)')}

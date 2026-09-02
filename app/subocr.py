@@ -770,6 +770,22 @@ def _extract_sup_watched(path: str, rel: int, work: str, tag: str,
     return sup
 
 
+def _probe_streams(path: str) -> dict | None:
+    """ffprobe this file's streams right now. None when it cannot be read."""
+    exe = os.path.join(os.path.dirname(_ffmpeg()), "ffprobe.exe")
+    if not os.path.exists(exe):
+        exe = "ffprobe"
+    try:
+        p = subprocess.run(
+            [exe, "-v", "error", "-show_streams", "-show_format",
+             "-of", "json", path],
+            capture_output=True, text=True, errors="replace", timeout=120,
+            creationflags=NO_WINDOW, startupinfo=_hidden())
+        return json.loads(p.stdout or "{}") or None
+    except Exception:                                        # noqa: BLE001
+        return None
+
+
 def measure_file(file_id: int, path: str, probe: dict,
                  work_root: str | None = None) -> int:
     r"""Measure every image sub in one file and write the verdicts down.
@@ -784,6 +800,24 @@ def measure_file(file_id: int, path: str, probe: dict,
     """
     from .rules import IMAGE_SUB_CODECS       # imported where used, as above
 
+    # READ THE FILE, NOT THE DATABASE, BEFORE MAPPING A TRACK NUMBER.
+    #
+    # `rel` is an index among the file's subtitle streams, and those slide
+    # every time the file is rewritten. The stored probe for The Big Bang
+    # Theory S01E03 listed one subtitle - the PGS at rel 0 - while the file on
+    # disk had two, because nuarr had already OCR'd it and put the text track
+    # first. So `-map 0:s:0` extracted the SRT into a .sup, ffmpeg wrote
+    # nothing, and every one of these files came back "could not measure the
+    # picture subtitles - leaving it for the OCR to decide". Ten out of ten in
+    # the first measured batch: the check was reading a file that no longer
+    # existed in that shape.
+    #
+    # One ffprobe against a demux is free, and it also settles the other half:
+    # a file whose picture subtitle has already been converted has nothing to
+    # measure, and the fresh layout says so where the stale one could not.
+    fresh = _probe_streams(path)
+    if fresh is not None:
+        probe = fresh
     subs = [s for s in (probe.get("streams") or [])
             if s.get("codec_type") == "subtitle"]
     n = 0
@@ -3071,6 +3105,191 @@ def _backlog():
     return _BACKLOG["n"]
 
 
+_FUNNEL: dict = {"at": 0.0, "d": None}
+_FUNNEL_TTL = 120.0
+# Both spellings ffprobe uses for a picture subtitle, as a SQL fragment. The
+# same test the sweep uses, so the number on the page and the number the sweep
+# works from can never disagree.
+_IMG_SQL = "(p.json LIKE '%hdmv_pgs_subtitle%' OR p.json LIKE '%pgssub%')"
+# Never measured AND still worth measuring. A file whose OCR has already run is
+# not unknown - whatever its stored probe still says, the picture track it had
+# has been dealt with, and re-reading it costs a demux to learn nothing. Same
+# for one the reader has already declined.
+_UNMEASURED_SQL = (
+    "AND NOT EXISTS (SELECT 1 FROM sub_shape s WHERE s.file_id=f.id) "
+    "AND COALESCE(f.subocr_state,'') != 'rejected' "
+    "AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.file_id=f.id "
+    "                AND j.kind='sub_ocr' AND j.state='done')")
+
+
+def funnel() -> dict:
+    r"""The whole picture-subtitle population, in the order a person asks.
+
+    THE PANEL COULD ONLY EVER SAY "76 of 164 measured", which is a fraction of
+    a number nobody had been shown: 164 was the files this system happens to
+    have measured, not the files that have picture subtitles. The honest shape
+    is a funnel, and every step of it is a count somebody would otherwise have
+    to take on faith:
+
+        39,612 files managed
+         5,451 carry a picture subtitle          <- the real population
+           164 have been measured                <- what this check has read
+         5,287 still to measure
+
+    and, of what has been measured, where each file is going: OCR, a burn, or
+    nowhere because the reader declined it.
+
+    Memoised for two minutes. The LIKE over the probe blobs is ~0.8 s and none
+    of these numbers moves faster than a scan.
+    """
+    now = time.time()
+    if _FUNNEL["d"] is not None and now - _FUNNEL["at"] < _FUNNEL_TTL:
+        return _FUNNEL["d"]
+    from .db import cursor
+    d = {}
+    try:
+        with cursor() as cur:
+            def one(sql, args=()):
+                return int(cur.execute(sql, args).fetchone()[0] or 0)
+            live = "f.state NOT IN ('deleted','duplicate')"
+            d["managed"] = one(f"SELECT COUNT(*) FROM files f WHERE {live}")
+            d["probed"] = one(
+                "SELECT COUNT(*) FROM file_probes p JOIN files f ON f.id=p.file_id "
+                f"WHERE {live}")
+            d["with_picture"] = one(
+                "SELECT COUNT(*) FROM file_probes p JOIN files f ON f.id=p.file_id "
+                f"WHERE {live} AND {_IMG_SQL}")
+            d["measured"] = one(
+                "SELECT COUNT(DISTINCT s.file_id) FROM sub_shape s "
+                f"JOIN files f ON f.id=s.file_id WHERE {live}")
+            d["typeset_files"] = one(
+                "SELECT COUNT(DISTINCT s.file_id) FROM sub_shape s "
+                f"JOIN files f ON f.id=s.file_id WHERE {live} AND s.typeset=1")
+            d["dialogue_files"] = one(
+                "SELECT COUNT(DISTINCT s.file_id) FROM sub_shape s "
+                f"JOIN files f ON f.id=s.file_id WHERE {live} AND s.typeset=0 "
+                "AND s.file_id NOT IN (SELECT file_id FROM sub_shape WHERE typeset=1)")
+            d["rejected"] = one(
+                "SELECT COUNT(*) FROM files f "
+                f"WHERE {live} AND COALESCE(f.subocr_state,'')='rejected'")
+            d["converted"] = one(
+                "SELECT COUNT(DISTINCT j.file_id) FROM jobs j JOIN files f "
+                f"ON f.id=j.file_id WHERE {live} AND j.kind='sub_ocr' "
+                "AND j.state='done'")
+            d["queued"] = one(
+                "SELECT COUNT(DISTINCT j.file_id) FROM jobs j JOIN files f "
+                f"ON f.id=j.file_id WHERE {live} AND j.kind='sub_ocr' "
+                "AND j.state IN ('queued','running')")
+    except Exception:                                        # noqa: BLE001
+        return _FUNNEL["d"] or {}
+    # COUNTED THE SAME WAY THE PICKER PICKS, so the number on the page is the
+    # number Check now would work through. Subtracting measured from
+    # with_picture looked equivalent and was not: it counted every already
+    # converted file as outstanding.
+    try:
+        with cursor() as cur:
+            d["to_measure"] = int(cur.execute(
+                "SELECT COUNT(*) FROM file_probes p JOIN files f ON f.id=p.file_id "
+                "WHERE f.state NOT IN ('deleted','duplicate') "
+                f"AND {_IMG_SQL} {_UNMEASURED_SQL}").fetchone()[0] or 0)
+    except Exception:                                        # noqa: BLE001
+        d["to_measure"] = max(0, d["with_picture"] - d["measured"])
+    _FUNNEL.update(at=now, d=d)
+    return d
+
+
+def measure_batch() -> int:
+    """How many files one Check-now pass reads. 0 means every one of them."""
+    try:
+        return max(0, int(_s("subocr_measure_batch", 50) or 0))
+    except (TypeError, ValueError):
+        return 50
+
+
+MEASURE_STATE: dict = {"running": False, "done": 0, "total": 0, "now": "",
+                       "typeset": 0, "at": 0.0}
+
+
+def measure_pick(limit: int) -> list[dict]:
+    r"""Files that HAVE a picture subtitle and have never been measured.
+
+    Deliberately not sweep_pick(): that answers "what would convert under the
+    current switches", which is the queue's question. This one answers "what do
+    we not know about yet", which is the check's - a library with OCR switched
+    off for a shelf still benefits from knowing what is on it.
+    """
+    from .db import cursor
+    out = []
+    with cursor() as cur:
+        rows = cur.execute(
+            "SELECT p.file_id, p.json, f.path, f.title, f.library, "
+            "       f.season, f.episode "
+            "FROM file_probes p JOIN files f ON f.id=p.file_id "
+            "WHERE f.state NOT IN ('deleted','duplicate') "
+            f"  AND {_IMG_SQL} "
+            f"  {_UNMEASURED_SQL} "
+            "ORDER BY f.updated_at DESC")
+        for r in rows:
+            if limit and len(out) >= limit:
+                break
+            try:
+                d = json.loads(r["json"])
+            except Exception:                                # noqa: BLE001
+                continue
+            # NO select_targets() FILTER HERE, on purpose. That function
+            # answers "would the OCR convert this under the current switches",
+            # which is the queue's question; this one is "what is actually on
+            # it", which is the check's. Filtering by it made the picker
+            # disagree with the count beside the button - 688 to measure, and
+            # a pass that measured none of them - and it meant a library with
+            # OCR switched off could never be surveyed at all.
+            out.append({"file_id": r["file_id"], "path": r["path"],
+                        "title": r["title"] or "",
+                        "ep": ep_label(r["season"], r["episode"]),
+                        "library": r["library"], "probe": d})
+    return out
+
+
+async def measure_sweep(limit: int | None = None) -> dict:
+    r"""Read the shape of files we have never measured. Changes nothing else.
+
+    This is what Check now does. It used to re-count the backlog, which is a
+    reasonable thing for a button to do and not what its label promised - the
+    check is the MEASUREMENT, and it had no way to be asked for. Each file
+    costs one demux of a single subtitle track, so the batch is bounded and
+    settable: 50 by default, 0 for the whole backlog when somebody wants to
+    leave it running.
+    """
+    import asyncio
+    if MEASURE_STATE["running"]:
+        return {"ok": False, "error": "a measurement pass is already running"}
+    cap = measure_batch() if limit is None else max(0, int(limit))
+    MEASURE_STATE.update(running=True, done=0, total=0, now="", typeset=0,
+                         at=time.time())
+    n = ts = 0
+    try:
+        picked = await asyncio.to_thread(measure_pick, cap)
+        MEASURE_STATE["total"] = len(picked)
+        for p in picked:
+            MEASURE_STATE["done"] += 1
+            MEASURE_STATE["now"] = (p.get("title") or "")[:60]
+            try:
+                r = await asyncio.to_thread(screen_for_typeset, p)
+                n += 1
+                if r.get("typeset_only"):
+                    ts += 1
+                    MEASURE_STATE["typeset"] = ts
+            except Exception:                                # noqa: BLE001
+                continue
+    finally:
+        MEASURE_STATE.update(running=False, now="")
+        _FUNNEL["d"] = None                  # the numbers just changed
+    from . import joblog as _log
+    _log.log(f"picture-subtitle check: measured {n} file(s), {ts} typeset",
+             "ok" if n else "info")
+    return {"ok": True, "measured": n, "typeset": ts}
+
+
 def shape_rows(limit: int = 60, include_done: bool = True) -> dict:
     r"""Recorded verdicts, newest first, with the numbers behind each one.
 
@@ -3119,6 +3338,23 @@ def shape_rows(limit: int = 60, include_done: bool = True) -> dict:
             summary["mode"] = mode()
             summary["every_h"] = int(_s("subocr_every_h", 6) or 6)
             summary["batch"] = int(_s("subocr_batch", 0) or 0)
+            summary["funnel"] = funnel()
+            # WHEN, not "on the next sweep". The registry has the answer once
+            # the loop has beaten once; before that the cadence still does.
+            try:
+                from . import schedules as _sch
+                row = next((r for r in _sch.snapshot().get("rows", [])
+                            if r.get("key") == "subocr"), None)
+                if row and row.get("next_run"):
+                    summary["next_sweep_in_s"] = max(
+                        0.0, float(row["next_run"]) - time.time())
+                else:
+                    summary["next_sweep_in_s"] = \
+                        float(_s("subocr_every_h", 6) or 6) * 3600
+            except Exception:                                # noqa: BLE001
+                pass
+            summary["measure_batch"] = measure_batch()
+            summary["measuring"] = dict(MEASURE_STATE)
             summary["sweep"] = dict(SWEEP_STATE)
             # When the newest verdict was written - "measured 85 files" says
             # nothing about whether that was five minutes or five weeks ago.

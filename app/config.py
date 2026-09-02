@@ -378,6 +378,10 @@ class Settings:
     # re-search a release whose audio is in no language its library keeps -
     # the only irreversible thing the audit can do, hence opt-in.
     audit_mode: str = "manual"
+    # How many unmeasured picture-subtitle files one "Check now" pass reads.
+    # 0 means the whole backlog - each file costs one demux, so it is bounded
+    # by default and unbounded on request.
+    subocr_measure_batch: int = 50
 
     # SUBTITLE OCR - the switches behind Settings -> Subtitle OCR. Defaults
     # match the measured thresholds in subocr.py; the page can move them.
