@@ -18901,6 +18901,7 @@ function wtab(which){
   if(which==='alang'){
     if(hint) hint.textContent='· audio language';
     paneLoad('alang', loadAlang);
+    langAudioPolicy();          // the policy card above the measurements
     return;
   }
   if(intent==='arrsync'){
@@ -18997,7 +18998,7 @@ function wtab(which){
     if(hint) hint.textContent='· audio titles';
     _atOpen=true;
     paneLoad('acodec', loadCodecTab, 'audio');
-    loadAudioTitle(); langAudioLoad();
+    loadAudioTitle();
     setTimeout(()=>{
       const c=document.getElementById('atBody');
       if(!c) return;
@@ -19016,7 +19017,7 @@ function wtab(which){
     // The title check belongs beside the settings that caused the mismatch:
     // this page decides what tracks are converted TO, and the title is what
     // the picker will then claim they are.
-    if(side==='audio'){ loadAudioTitle(); langAudioLoad(); }
+    if(side==='audio') loadAudioTitle();
     return;
   }
   if(which==='libs' || intent==='arrgap'){
@@ -20756,11 +20757,7 @@ async function loadLangTab(){
               <div id="soc_${cssId(L.name)}" class="socbox"></div>`:''}
     </div>`;}).join('')
     : '<div class="dim">no libraries configured</div>')
-    + `<div class="dim" style="margin-top:12px;font-size:11px">
-        Each library saves itself — the Save policy button inside a block
-        previews and commits that library. Audio language rules moved to
-        <a href="#" onclick="wtab('acodec');return false">Settings →
-        Audio codec</a>, beside the codecs they travel with.</div>`;
+    ;
   langSignsLoad();
 }
 
@@ -20880,7 +20877,7 @@ async function langLibCancel(lib64, side){
   // Throw away the edits and re-read what is stored, so Cancel means "as it
   // is on the server" rather than "as I last rendered it".
   _lang=null; _langDirty=false;
-  if(side==='audio'){ await langAudioLoad(); }
+  if(side==='audio'){ await langAudioPolicy(); }
   else { const box=document.getElementById('lip_'+cssId(b64d(lib64))+'_'+side);
          if(box) box.innerHTML=''; await loadLangTab(); }
 }
@@ -20896,13 +20893,13 @@ async function langRequeue(boxId){
 }
 
 // ---- the audio half, now living on the Audio codec page --------------------
-const _alangOpen = new Set();
-function alangToggle_open(lib){
-  _alangOpen.has(lib) ? _alangOpen.delete(lib) : _alangOpen.add(lib);
-  langAudioLoad();
+const _alpolOpen = new Set();
+function alpolToggle_open(lib){
+  _alpolOpen.has(lib) ? _alpolOpen.delete(lib) : _alpolOpen.add(lib);
+  langAudioPolicy();
 }
-async function langAudioLoad(){
-  const el=document.getElementById('alangBody');
+async function langAudioPolicy(){
+  const el=document.getElementById('alpolBody');
   if(!el) return;
   if(!_lang){
     el.innerHTML='<div class="skel" style="padding:4px 0"><i style="width:44%"></i>'
@@ -20912,13 +20909,13 @@ async function langAudioLoad(){
   }
   const pol=_lang.policy||{}, libs=_lang.libraries||[];
   el.innerHTML = libs.length ? libs.map(L=>{
-    const open=_alangOpen.has(L.name);
+    const open=_alpolOpen.has(L.name);
     const c=((pol[L.name]||{}).audio)||{};
     const kept=(c.langs||[]).length + (c.keep_original?' + original':'');
     const scanned=fmt(Object.values(((_lang.present||{})[L.name]||{}).audio||{})
         .reduce((a,b)=>a+b,0));
     return `<div class="lkind${open?' lopen':''}">
-      <div class="lkindhead ckhead" onclick="alangToggle_open('${esc(L.name)}')"
+      <div class="lkindhead ckhead" onclick="alpolToggle_open('${esc(L.name)}')"
            title="${open?'collapse':'expand'} ${esc(L.name)}">
         <span class="ccaret">${open?'▾':'▸'}</span>
         <span class="clib">${esc(L.name)}</span>
@@ -24545,7 +24542,7 @@ function langToggle(lib,side,code,on){
   // Re-render whichever surface hosts this block - the subtitle page, the
   // audio card on the codec page, or both if both are somehow alive.
   if(document.getElementById('langBody')) loadLangTab();
-  if(document.getElementById('alangBody')) langAudioLoad();
+  if(document.getElementById('alpolBody')) langAudioPolicy();
 }
 // LOOK, THEN DECIDE, THEN ACT.
 //
