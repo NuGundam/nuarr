@@ -14701,6 +14701,10 @@ function auSortBy(k){
   loadAudit();
 }
 function auCmp(a,b){
+  // Outstanding rows always sort above settled ones - the work first, the
+  // record after - whatever column the arrow is on.
+  const settled=x=>(x.state==='fixed'||x.state==='replaced')?1:0;
+  if(settled(a)!==settled(b)) return settled(a)-settled(b);
   const k=_auSort.key, d=_auSort.dir;
   if(k==='at') return ((a.at||0)-(b.at||0))*d;
   const x=String((k==='path'?String(a.path||'').split('\\').pop():a[k])||'');
@@ -14951,10 +14955,12 @@ click to read this run's findings"
   // opened for. A finding from the sample three hours ago and one the settling
   // gate wrote thirty seconds ago belong in the same list, which a per-run view
   // could never do - a file caught while settling belongs to no run at all.
+  // EVERY ROW, ALWAYS. The hide/show toggle meant the page opened on an empty
+  // box most days - the check mostly finds things and fixes them - and the
+  // fifty fixed rows that prove it is working were one click away. Outstanding
+  // rows sort to the top by status, so they are still the first thing seen.
   const auAll=(d.standing||[]);
-  const auSettled=auAll.filter(f=>f.state==='fixed'||f.state==='replaced');
-  const auShown=_auDone ? auAll : auAll.filter(f=>
-    f.state!=='fixed' && f.state!=='replaced');
+  const auShown=auAll;
   const auHasAct=auShown.some(f=>f.state!=='fixed' && f.state!=='replaced');
   const auRows=auShown.slice().sort(auCmp).map(f=>{
     const st=f.state||'', done=st==='fixed', repl=st==='replaced';
@@ -15127,12 +15133,8 @@ click to read this run's findings"
         planner fixes by rewriting the file.
       </span>
       <span class="dim" id="auModeMsg"></span>
-      <span class="dim" style="margin-left:auto">${_auMode==='auto'
-        ? '<b style="color:var(--warn)">on — a release with no audio you keep is '
-          +'blocklisted and re-downloaded without asking</b>'
-        : 'off — nothing is replaced unless you press the button'}</span>
     </div>
-    ${auRows?`<div id="auScroll" style="overflow:auto;margin:6px 14px 0"
+    <div id="auScroll" style="overflow:auto;margin:6px 14px 0"
         onmouseenter="_auHover=true" onmouseleave="_auHover=false"><table style="width:100%;font-size:11.5px;
         border-collapse:collapse;table-layout:fixed">
         <!-- THE SLACK GOES TO THE FINDING, not the file. It did go to the file
@@ -15163,18 +15165,9 @@ click to read this run's findings"
              background:var(--bg2,#12161c);${k?'cursor:pointer;user-select:none':''}"
              ${k?`title="sort by ${h.toLowerCase()}"`:''}
              >${h}${k&&_auSort.key===k?(_auSort.dir>0?' ▲':' ▼'):''}</th>`).join('')}
-        </tr></thead><tbody>${auRows}</tbody></table></div>`
-          :`<div class="dim" style="padding:12px 14px">${_auDone
-             ? 'Nothing recorded yet.'
-             : 'Nothing outstanding — every file the check has flagged has been '
-               +'dealt with.'}</div>`}
-    ${auSettled.length?`<div class="dim" style="padding:5px 14px 0;font-size:11px">${
-      _auDone
-        ? `showing fixed and replaced files too · <span class="lnk"
-             onclick="auShowDone(false)">hide them</span>`
-        : `${fmt(auSettled.length)} settled file${auSettled.length===1?'':'s'}
-           hidden <span class="dim">(fixed or replaced)</span> ·
-           <span class="lnk" onclick="auShowDone(true)">show them</span>`}</div>`:''}
+        </tr></thead><tbody>${auRows||`<tr><td colspan="6" class="dim"
+          style="padding:12px 4px">Nothing recorded yet — the first check runs
+          on its own within ten minutes.</td></tr>`}</tbody></table></div>
     ${stuckRows?`<div class="auhead">No rule fixes these
         <span class="dim" style="font-weight:400">— the check is right and the
         rules have a gap. Requeuing will not clear them; a rule change will.</span></div>
