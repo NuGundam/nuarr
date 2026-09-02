@@ -1482,10 +1482,63 @@ def latest(run_id: int = 0) -> dict:
                      "max_per_run": MAX_PER_RUN},
             "covers": [{"area": a, "what": w} for a, w in COVERS],
             "buckets": list(BUCKETS), "per_bucket": PER_BUCKET,
+            "standing": standing(),
             "mode": mode(), "replaceable_rules": list(REPLACEABLE_RULES),
             "max_replace_per_run": MAX_REPLACE_PER_RUN,
             "every_hours": _every_hours(),
             "cycle_s": CYCLE_S}
+
+
+def standing(limit: int = 300) -> list[dict]:
+    r"""What is wrong NOW, one row per file, newest first.
+
+    THE TIMELINE ANSWERED THE WRONG QUESTION. Thirty coloured blocks told you
+    which RUNS had found something, which matters once - when you are asking
+    whether a regression is new - and never again. The thing a person opens
+    this page for is the list of files: what is broken, what has been put
+    right, and a button on each. A run is a sampling accident; a file is the
+    fact.
+
+    So this crosses runs. A finding from the sample three hours ago and one
+    the settling gate wrote thirty seconds ago are the same kind of thing and
+    belong in the same list, which the per-run view could never show - a file
+    caught while settling belongs to no run at all.
+
+    One row per file, carrying its latest finding and its heal verdict.
+    """
+    try:
+        with cursor() as cur:
+            rows = [dict(r) for r in cur.execute(
+                "SELECT a.file_id, a.rule, a.found, a.want, a.detail, a.at, "
+                "       a.path, a.bucket, h.state, h.detail AS heal_detail, "
+                "       h.last_at AS heal_at, f.library, f.state AS fstate "
+                "  FROM audit_findings a "
+                "  LEFT JOIN audit_heals h ON h.file_id = a.file_id "
+                "  LEFT JOIN files f ON f.id = a.file_id "
+                " WHERE a.at = (SELECT MAX(b.at) FROM audit_findings b "
+                "               WHERE b.file_id = a.file_id) "
+                " ORDER BY a.at DESC LIMIT ?", (int(limit),))]
+    except Exception:                                        # noqa: BLE001
+        return []
+    out = []
+    seen = set()
+    for r in rows:
+        if r["file_id"] in seen:
+            continue                    # a file with two rules: newest wins
+        seen.add(r["file_id"])
+        # A FILE THAT NO LONGER EXISTS IS NOT AN OUTSTANDING PROBLEM. Replaced
+        # releases, deleted files and the healer's own 'gone' verdict would
+        # otherwise sit here forever looking like work - the Swat Kats row was
+        # exactly that: a four-day-old finding about a file that had been
+        # replaced the same day, still offering a Requeue button.
+        if (r.get("state") or "") == "gone":
+            continue
+        if (r.get("fstate") or "") in ("deleted", "duplicate"):
+            if (r.get("state") or "") != "replaced":
+                continue
+        r["replaceable"] = replaceable(r.get("rule") or "")
+        out.append(r)
+    return out
 
 
 def clear_heal(file_id: int) -> bool:

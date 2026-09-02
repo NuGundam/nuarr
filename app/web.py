@@ -14625,7 +14625,8 @@ let _auSeq=0, _auBusy=false;
 // mode strip that says what the check does unattended, a table of what it
 // found, and the full story of one row on click rather than three stacked
 // lines in every row.
-let _auOpen=null, _auDetailHtml='', _auMode='manual';
+let _auOpen=null, _auDetailHtml='', _auMode='manual', _auDone=false;
+function auShowDone(on){ _auDone=!!on; _auOpen=null; _auDetailHtml=''; loadAudit(); }
 
 // Which rules a different release can fix. Kept in step with audit.py's
 // REPLACEABLE_RULES by being sent with the payload rather than re-listed here;
@@ -14686,6 +14687,9 @@ async function auDetail(id){
           language the words are in.</span>
         <span class="sdt"><button onclick="auRequeue(${f.id})">Requeue</button></span>
       </div>
+      <!-- the same two actions are on the row itself; they are repeated here
+           with their consequences spelled out, which is what the row cannot
+           do in a button label -->
       ${canReplace?`<div class="sdrow">
         <span class="sdk">replace</span>
         <span class="sdv">Blocklist the release and ask
@@ -14861,27 +14865,38 @@ click to read this run's findings"
   // every row was three lines tall and nothing lined up down the page. Same
   // anatomy as the other check card now: a fixed row per finding, sortable
   // columns, and the whole story on click rather than crammed into the row.
-  // ONLY BROKEN AND FIXED. Everything else on this table was bookkeeping about
-  // the middle of a process: a row that is queued or has just been re-read
-  // says only that the machine is working, which the live line above already
-  // says better. What a person comes here for is what is wrong and what has
-  // been put right.
-  const auShown=(d.findings||[]).filter(f=>{
-    const st=((hmap[f.file_id]||{}).state)||'';
-    return st!=='queued';
-  });
+  // ONE ROW PER FILE, ACROSS RUNS - the same anatomy as the signs table.
+  // The timeline of runs it replaces answered "which runs found something",
+  // which matters once and never again; the list of files is what the page is
+  // opened for. A finding from the sample three hours ago and one the settling
+  // gate wrote thirty seconds ago belong in the same list, which a per-run view
+  // could never do - a file caught while settling belongs to no run at all.
+  const auAll=(d.standing||[]);
+  const auSettled=auAll.filter(f=>f.state==='fixed'||f.state==='replaced');
+  const auShown=_auDone ? auAll : auAll.filter(f=>
+    f.state!=='fixed' && f.state!=='replaced');
   const auRows=auShown.map(f=>{
-    const h=hmap[f.file_id]||{}, st=h.state||'';
-    const done=st==='fixed', stuckRow=(st==='unfixable'||st==='gave-up');
-    const repl=st==='replaced';
+    const st=f.state||'', done=st==='fixed', repl=st==='replaced';
+    const stuckRow=(st==='unfixable'||st==='gave-up');
     const label=String(f.path||'').split('\\').pop();
-    const scol=done?'#6fd08c':repl?'#6fb0ff':stuckRow?'#e0575b':st==='queued'?'#e2b341':'var(--dim)';
+    const scol=done?'#6fd08c':repl?'#6fb0ff':stuckRow?'#e0575b'
+              :st==='queued'?'#e2b341':'var(--dim)';
     const sword=done?'fixed':repl?'replaced':stuckRow?'no rule fixes it'
                :st==='queued'?'queued':'still broken';
     const open=_auOpen===f.file_id;
+    // THE BUTTONS ARE ON THE ROW. They were inside the drop-down, which meant
+    // two clicks to do the obvious thing to an obvious problem. Replace is
+    // only ever offered for the one rule a different release can fix.
+    const act = (done||repl) ? '' :
+      `<button onclick="event.stopPropagation();auRequeue(${f.file_id})"
+         title="Plan this file again under the current rules and queue it if the planner has work">Requeue</button>`
+      + (f.replaceable
+        ? ` <button onclick="event.stopPropagation();auReplace(${f.file_id})"
+             title="Blocklist the release and ask the arr for a different one. This deletes the file."
+             style="color:var(--bad)">Blocklist &amp; re-download</button>` : '');
     return `<tr class="${open?'rowopen':''}${done?' aufixed':''}">
       <td style="padding:3px 10px 3px 0;white-space:nowrap">
-        <span class="pill ${done?'p-ok':'p-bad'}">${esc(f.rule)}</span></td>
+        <span class="pill ${done||repl?'p-ok':'p-bad'}">${esc(f.rule||'')}</span></td>
       <td style="padding:3px 10px 3px 0;overflow:hidden;text-overflow:ellipsis;
                  white-space:nowrap"><span class="tl"
           onclick="auDetail(${f.file_id})"
@@ -14890,10 +14905,10 @@ click to read this run's findings"
       <td style="padding:3px 10px 3px 0;overflow:hidden;text-overflow:ellipsis;
                  white-space:nowrap">${auIsWant(f,done)}</td>
       <td style="padding:3px 10px 3px 0;white-space:nowrap;color:${scol}"
-        >${sword}${audit_replaceable(f.rule)&&!done&&!repl
-          ?' <span class="dim" title="A different release is the only fix for this rule">· replaceable</span>':''}</td>
-      <td class="dim" style="padding:3px 0;white-space:nowrap">${ago(f.at||r.at)}</td>
-    </tr>` + (open ? `<tr class="logdrop"><td colspan="5">${
+        >${sword}</td>
+      <td class="dim" style="padding:3px 0;white-space:nowrap">${ago(f.at)}</td>
+      <td style="padding:3px 0;white-space:nowrap;text-align:right">${act}</td>
+    </tr>` + (open ? `<tr class="logdrop"><td colspan="6">${
       _auDetailHtml||'<div class="dim" style="padding:10px 14px">loading…</div>'
     }</td></tr>` : '');
   }).join('');
@@ -14986,13 +15001,9 @@ click to read this run's findings"
       </div>
       ${live?`<div style="margin-top:7px">${live}</div>`:''}
       <div style="margin-top:8px">${pills}</div>
-      ${bars?`<div class="aubars"><span class="dim"
-        style="font-size:11px;margin-right:7px">every run</span>${bars}
-        <span class="dim" style="font-size:10.5px;margin-left:7px">oldest → newest ·
-        <span style="color:var(--bad)">■</span> still broken
-        <span style="color:var(--auheal,#39d3c3)">■</span> since fixed
-        <span style="color:var(--ok)">■</span> clean ·
-        click one to read it</span></div>`:''}
+      <!-- The run timeline lived here. Thirty coloured blocks told you which
+           RUNS had found something - true, and not what anyone opens this page
+           to learn. The list of files below is. -->
     </div>
     <details class="auwhat"><summary>What this check reads, and what the words mean</summary>
     <div class="dim" style="padding:2px 14px 10px;font-size:11.5px">
@@ -15030,14 +15041,24 @@ click to read this run's findings"
     ${auRows?`<div id="auScroll" style="max-height:min(52vh,560px);overflow:auto;
         margin:6px 14px 0"><table style="width:100%;font-size:11.5px;
         border-collapse:collapse;table-layout:fixed">
-        <colgroup><col style="width:17%"><col style="width:33%">
-          <col style="width:30%"><col style="width:12%"><col style="width:8%"></colgroup>
-        <thead><tr>${['Rule','File','Found → should be','Status','When'].map(h=>
+        <colgroup><col style="width:15%"><col style="width:26%">
+          <col style="width:27%"><col style="width:11%"><col style="width:7%">
+          <col style="width:14%"></colgroup>
+        <thead><tr>${['Rule','File','Found → should be','Status','When',''].map(h=>
           `<th style="text-align:left;font-weight:600;padding:3px 10px 5px 0;
              position:sticky;top:0;background:var(--bg2,#12161c)">${h}</th>`).join('')}
         </tr></thead><tbody>${auRows}</tbody></table></div>`
-          :`<div class="dim" style="padding:12px 14px">Nothing to report — this
-             run's sample matched every rule.</div>`}
+          :`<div class="dim" style="padding:12px 14px">${_auDone
+             ? 'Nothing recorded yet.'
+             : 'Nothing outstanding — every file the check has flagged has been '
+               +'dealt with.'}</div>`}
+    ${auSettled.length?`<div class="dim" style="padding:5px 14px 0;font-size:11px">${
+      _auDone
+        ? `showing fixed and replaced files too · <span class="lnk"
+             onclick="auShowDone(false)">hide them</span>`
+        : `${fmt(auSettled.length)} settled file${auSettled.length===1?'':'s'}
+           hidden <span class="dim">(fixed or replaced)</span> ·
+           <span class="lnk" onclick="auShowDone(true)">show them</span>`}</div>`:''}
     ${stuckRows?`<div class="auhead">No rule fixes these
         <span class="dim" style="font-weight:400">— the check is right and the
         rules have a gap. Requeuing will not clear them; a rule change will.</span></div>
