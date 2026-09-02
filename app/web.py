@@ -21306,7 +21306,8 @@ async function loadPlexCfg(){
     </div>
 
     <div class="lkind" style="padding:11px 12px;margin-bottom:10px">
-      <b style="color:#6fb0ff">Where Nuarr reads sessions from</b>
+      <b style="color:#6fb0ff">Session source</b>
+      <div style="font-size:11.5px;margin-top:2px;opacity:.85">Where Nuarr asks who is watching right now.</div>
       <div class="dim" style="font-size:11px;margin-top:4px">
         Plex answers <span class="mono">/status/sessions</span> locally in tens
         of milliseconds. Tautulli's <span class="mono">get_activity</span> takes
@@ -21480,7 +21481,8 @@ async function loadOcr(){
     </label>`;
   const head=`
     <div class="lkind" style="padding:11px 12px">
-      <b style="color:#6fb0ff">Which engine reads the pictures</b>
+      <b style="color:#6fb0ff">OCR engine</b>
+      <div style="font-size:11.5px;margin-top:2px;opacity:.85">The reader that turns picture subtitles into text. One choice for the whole install.</div>
       <div class="dim" style="font-size:11px;margin-top:2px">
         One choice for the whole install. Changing it stops any OCR already
         running and puts those files straight back on the queue, so the
@@ -21581,7 +21583,8 @@ async function loadOcr(){
     </div>
 
     <div class="lkind" style="padding:11px 12px;margin-top:10px">
-      <b style="color:#6fb0ff">What gets converted</b>
+      <b style="color:#6fb0ff">Conversion scope</b>
+      <div style="font-size:11.5px;margin-top:2px;opacity:.85">Which subtitle tracks the reader is allowed to pick up.</div>
       <div class="dim" style="font-size:11px;margin-top:4px">
         Which tracks qualify — dialogue, SDH, forced — and for which
         libraries, is a subtitle policy rather than a property of the engine.
@@ -22095,7 +22098,8 @@ function ocrCompareHtml(s,p){
   const untested=cols.filter(c=>c.ok&&!(_ocrMeas[c.key]||{}).per_cue_ms).length;
   return `
     <div id="ocrCompare" class="lkind" style="padding:11px 12px;margin-top:10px">
-      <b style="color:#6fb0ff">What each engine can do here</b>
+      <b style="color:#6fb0ff">Engine comparison</b>
+      <div style="font-size:11.5px;margin-top:2px;opacity:.85">What each reader manages on your files, measured rather than claimed.</div>
       <div class="dim" style="font-size:11px;margin-top:2px">
         For picture subtitles specifically, on the versions installed right
         now. Hover a cell for the reason. The measured rows come from the
@@ -23511,7 +23515,8 @@ function renderAlang(){
   if(_alTab==='sum'){
     h+=`<div class="lkind" style="padding:11px 12px;margin-bottom:10px">
       <div style="display:flex;justify-content:space-between;align-items:baseline">
-        <b style="color:#6fb0ff">Every audio track in the library</b>
+        <b style="color:#6fb0ff">Coverage</b>
+      <div style="font-size:11.5px;margin-top:2px;opacity:.85">How much of the library has a language named on it.</div>
         <span class="mono dim" style="font-size:11px">${t.tracks} tracks</span></div>`;
     h+=alBar([{n:t.tagged,c:'#2f6f4f',label:'named'},
               {n:t.untagged,c:'#8a5a2b',label:'still blank'}]);
@@ -23527,7 +23532,8 @@ function renderAlang(){
     // they read as zeros with no explanation of why.
     if(canHear){
     h+=`<div class="lkind" style="padding:11px 12px;margin-bottom:10px">
-      <div><b style="color:#6fb0ff">What Nuarr listened to</b></div>
+      <div><b style="color:#6fb0ff">Detection results</b>
+      <div style="font-size:11.5px;margin-top:2px;opacity:.85">What the listener answered, refused, and skipped.</div></div>
       <div class="dim" style="font-size:11px;margin-top:5px">
         <b style="color:#7fd4a3">${t.heard}</b> tracks answered confidently
         &nbsp;·&nbsp; <b style="color:#e2b341">${t.refused}</b> refused
@@ -23548,7 +23554,8 @@ function renderAlang(){
     h+=`<div class="lkind" style="padding:11px 12px;margin-bottom:10px">
       <div style="display:flex;justify-content:space-between;align-items:center;
                   gap:12px;flex-wrap:wrap">
-        <b style="color:#6fb0ff">When this runs</b>
+        <b style="color:#6fb0ff">Schedule</b>
+      <div style="font-size:11.5px;margin-top:2px;opacity:.85">When the listener goes looking, and what it costs.</div>
         <span style="display:flex;gap:8px;flex-wrap:wrap">
           ${_al.available?`<button onclick="alTest(this)">Test detection now</button>`:''}
           <button id="alRunBtn" onclick="alRun(this)">Listen to anything outstanding</button>
@@ -25996,7 +26003,8 @@ async function loadRules(){
   const kinds = d.kinds || {};
   const kindBox = `
     <div class="lkind" style="padding:10px 12px;margin-bottom:10px">
-      <b style="color:#6fb0ff">What Nuarr decides a title is</b>
+      <b style="color:#6fb0ff">Content kind</b>
+      <div style="font-size:11.5px;margin-top:2px;opacity:.85">Whether a title counts as anime, animation or live action - which picks its rules.</div>
       <div class="dim" style="font-size:11px;margin-top:3px">
         Read from Sonarr and Radarr — genres, original language, series type —
         and re-read every 12 hours. The folder name is a <b>floor</b>, not the
