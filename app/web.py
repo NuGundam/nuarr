@@ -18745,7 +18745,7 @@ function workerRow(k,v){
   // the raw number is what the min/max are quoted in. The unit label sits next
   // to it so "1800" is still readable as 30 h.
   return `<tr>
-    <td><div>${esc(k.replace(/_/g,' '))}</div>
+    <td><div>${esc(v.label || k.replace(/_/g,' '))}</div>
         <div class="dim" style="font-size:11px">${esc(v.hint)}</div></td>
     <td style="width:250px;text-align:right;white-space:nowrap">
       <button onclick="bump('${k}',${Math.max(v.min,v.value-st)})"

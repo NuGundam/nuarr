@@ -233,77 +233,118 @@ def _subocr_hint() -> str:
             "disk_wait_pct.")
 
 
+# A PLAIN NAME AND A PLAIN SENTENCE. These read as variable names with the
+# underscores taken out - "ffmpeg check h", "disk wait pct", "hold grace s" -
+# which tells you nothing unless you already know what the setting does, and
+# abbreviates the unit into a letter on top of that. LABELS gives each one a
+# name a person would say out loud, with the unit spelled out; the hints below
+# lead with the plain answer and keep the detail after it.
+LABELS = {
+    "encode_workers": "Encodes at once",
+    "passthrough_workers": "Remuxes at once",
+    "subocr_workers": "Subtitle reads at once",
+    "subocr_gpu_lanes": "Subtitle reads on the GPU at once",
+    "probe_workers": "File scans at once",
+    "arr_concurrency": "Sonarr/Radarr calls at once",
+    "hold_minutes": "Settle time (minutes)",
+    "scan_every_min": "Scan the library every (minutes)",
+    "ffmpeg_check_h": "Check for an ffmpeg update every (hours)",
+    "control_poll_s": "Check for restart or shutdown every (seconds)",
+    "disk_wait_pct": "Wait before a second job on the same disk (percent done)",
+    "hold_grace_s": "Keep waiting after Plex stops (seconds)",
+    "throttle_lead_pct": "How far ahead a paused Plex transcode must be (percent)",
+    "gate_recheck_s": "Re-check while work is held (seconds)",
+    "gate_cache_s": "Reuse the last check for (seconds)",
+    "disk_busy_pct": "Steer work away from a disk busier than (percent)",
+    "viewer_pause_lead_s": "Pause when a viewer's buffer drops below (seconds)",
+    "viewer_share_pct": "Share a viewer's disk until it is busier than (percent)",
+    "commit_retry_s": "Retry a blocked file swap every (seconds)",
+    "rename_poll_s": "Retry blocked renames every (seconds)",
+    "autoqueue_poll_s": "Look for new work every (seconds)",
+    "missing_poll_s": "Look for missing files every (seconds)",
+    "audit_every_h": "Run the rule check every (hours)",
+}
+
 HINTS = {
     "encode_workers": "",   # built live by _encode_hint() - see as_dict()
-    "passthrough_workers": "Remux/copy only, no GPU. Limited by pool disk I/O.",
+    "passthrough_workers": "How many files may be repacked at once. No GPU "
+                           "involved - the limit is how fast the pool disks "
+                           "can read and write.",
     "subocr_workers": "",   # engine-dependent; see _subocr_hint()
     "subocr_gpu_lanes":
-        "How many subtitle OCR passes may be on the GPU at the same moment. "
-        "The demux and mux either side of the read are pool I/O and are not "
-        "counted here, so workers above this number stay useful - they read "
-        "and write while the card is busy. Measured on this box, two lanes "
-        "already reach the GPU's floor; more only queues.",
-    "probe_workers": "ffprobe scans. Cheap CPU, one pool read each.",
-    "arr_concurrency": "Parallel Sonarr/Radarr API calls during scans.",
-    "hold_minutes": "MINUTES a file must sit untouched before it can be "
-                    "processed — the 'Held (new)' tile. Lower it to start "
-                    "sooner; too low and you may transcode a file Sonarr is "
+        "How many subtitle reads may use the graphics card at the same moment. "
+        "The unpacking and repacking either side of the read are disk work and "
+        "are not counted here, so workers above this number still help - they "
+        "read and write while the card is busy. Measured on this box, two "
+        "lanes already reach the card's floor; more only queues.",
+    "probe_workers": "How many files may be inspected at once. Cheap on the "
+                     "processor, one disk read each.",
+    "arr_concurrency": "How many questions Nuarr may ask Sonarr and Radarr at "
+                       "the same time during a scan.",
+    "hold_minutes": "How long a file must sit untouched before Nuarr will "
+                    "touch it - the 'Held (new)' tile. Lower it to start "
+                    "sooner; too low and you may convert a file Sonarr is "
                     "still importing or renaming.",
-    "scan_every_min": "MINUTES between automatic library scans. Files only "
-                      "become eligible during a scan. 0 turns auto-scan off.",
-    "ffmpeg_check_h": "HOURS between ffmpeg update checks. Reports only — it "
-                      "never installs on its own. 0 disables the check.",
-    "control_poll_s": "SECONDS between restart/shutdown status checks when "
-                      "idle. Drops to 3s automatically while a stop is pending.",
-    "disk_wait_pct": "How far a disk-heavy job must get before another starts "
-                     "on the SAME pool disk. Stops two stream copies thrashing "
-                     "one spindle. 0 = start immediately.",
-    "hold_grace_s": "Keep holding this long after the last Plex stream stops. "
-                    "0 resumes immediately.",
-    "throttle_lead_pct": "PERCENTAGE POINTS a throttled Plex transcode must be "
-                         "ahead of the viewer before it stops holding encodes. "
-                         "Throttled means Plex has buffered ahead and parked "
-                         "the encoder, so the GPU is free. Lower reclaims more "
-                         "idle time; higher is more cautious. 0 = ignore any "
-                         "throttled session.",
-    "gate_recheck_s": "SECONDS between re-checks of Plex and the disks while "
-                      "jobs are held. Shorter means the queue resumes sooner "
-                      "after the coast clears; longer means less API chatter "
-                      "while someone is watching.",
-    "gate_cache_s": "SECONDS a gate probe result is reused before asking Plex "
-                    "or the disks again. Saves repeated API calls when several "
-                    "things check the gate in the same moment; far shorter "
-                    "than the grace period, so it cannot delay a hold.",
-    "disk_busy_pct": "PERCENT busy a physical disk must be, sustained, before "
-                     "new work is steered away from it. It measures the disks "
-                     "rather than asking one product what it is doing, so it "
+    "scan_every_min": "How often Nuarr looks through the library for new "
+                      "files. Nothing becomes eligible for work except during "
+                      "a scan. 0 turns automatic scanning off.",
+    "ffmpeg_check_h": "How often Nuarr checks whether a newer ffmpeg exists. "
+                      "It only reports - it never installs on its own. "
+                      "0 disables the check.",
+    "control_poll_s": "How often Nuarr checks whether you have asked it to "
+                      "restart or stop, while it is idle. Speeds up to every "
+                      "3 seconds on its own once a stop is pending.",
+    "disk_wait_pct": "How far one disk-heavy job must get before a second may "
+                     "start on the SAME pool disk. Stops two big copies "
+                     "fighting over one drive. 0 starts them together.",
+    "hold_grace_s": "How long Nuarr keeps waiting after the last Plex stream "
+                    "ends, in case someone is between episodes. 0 resumes "
+                    "immediately.",
+    "throttle_lead_pct": "How far ahead of the viewer a paused Plex conversion "
+                         "must be before Nuarr stops waiting for it. Plex "
+                         "buffers ahead and then parks its encoder, which "
+                         "frees the graphics card. Lower reclaims more idle "
+                         "time; higher is more cautious. 0 ignores these "
+                         "sessions entirely.",
+    "gate_recheck_s": "How often Nuarr re-checks Plex and the disks while work "
+                      "is held. Shorter resumes the queue sooner once the "
+                      "coast is clear; longer means less chatter at Plex while "
+                      "someone is watching.",
+    "gate_cache_s": "How long one check of Plex and the disks is reused before "
+                    "asking again. Saves repeat questions when several things "
+                    "check at the same moment. Far shorter than the waiting "
+                    "period, so it cannot delay a hold.",
+    "disk_busy_pct": "How busy a physical disk must be, and stay, before Nuarr "
+                     "steers new work away from it. It watches the disks "
+                     "themselves rather than asking any one program, so it "
                      "covers a pool balance, a SnapRAID sync, a Storage Spaces "
-                     "rebuild, a backup or another app entirely. Load nuarr is "
-                     "causing itself is subtracted first. 0 turns it off.",
-    "viewer_pause_lead_s": "SECONDS of buffer a viewer must have before nuarr "
-                           "will merely slow down rather than STOP. Below this, "
-                           "commits onto that spindle pause and any encode "
+                     "rebuild, a backup, or another app entirely. Load Nuarr "
+                     "is causing itself is subtracted first. 0 turns it off.",
+    "viewer_pause_lead_s": "How little buffer a viewer must have left before "
+                           "Nuarr stops rather than merely slows down. Below "
+                           "this, writes to that disk pause and any conversion "
                            "reading it is suspended, resuming within half a "
-                           "second of the buffer recovering. Throttling treats "
-                           "a viewer with four minutes banked the same as one "
-                           "with twenty seconds; this does not. 0 disables the "
-                           "pause and leaves throttling alone.",
-    "viewer_share_pct": "PERCENT busy a viewer's own spindle may already be "
-                        "before nuarr refuses to share it. One direct play "
-                        "pulls about 1.1 MB/s off a disk that does 150+, so an "
-                        "outright veto left eleven disks carrying the queue "
-                        "and one sitting idle. Work below this threshold runs "
-                        "at Very Low I/O priority so the viewer's reads "
-                        "overtake it. 0 restores the old veto exactly.",
-    "commit_retry_s": "SECONDS between commit-queue retries. A finished encode "
-                      "whose file swap hit a lock — usually Plex playing it — "
-                      "waits here and tries again.",
-    "rename_poll_s": "SECONDS between rename-queue sweeps, re-checking arr "
-                     "renames that were blocked.",
-    "autoqueue_poll_s": "SECONDS between auto-queue passes looking for "
-                        "eligible work to enqueue.",
-    "missing_poll_s": "SECONDS between missing-file healer sweeps.",
-    "audit_every_h": "HOURS between rule-check audit runs.",
+                           "second of the buffer recovering. Slowing down "
+                           "treats a viewer with four minutes banked the same "
+                           "as one with twenty seconds; this does not. "
+                           "0 disables the pause and leaves slowing alone.",
+    "viewer_share_pct": "How busy a viewer's own disk may already be before "
+                        "Nuarr refuses to share it at all. One direct play "
+                        "pulls about 1.1 MB/s off a disk that can do 150+, so "
+                        "refusing outright left eleven disks carrying the "
+                        "queue and one sitting idle. Work under this threshold "
+                        "runs at the lowest disk priority, so the viewer's "
+                        "reads always overtake it. 0 restores the old refusal.",
+    "commit_retry_s": "How often Nuarr retries putting a finished file back "
+                      "when the swap was blocked - usually because Plex is "
+                      "playing it.",
+    "rename_poll_s": "How often Nuarr retries renames that Sonarr or Radarr "
+                     "refused earlier.",
+    "autoqueue_poll_s": "How often Nuarr looks for eligible files to queue.",
+    "missing_poll_s": "How often Nuarr looks for files that have gone missing "
+                      "and tries to put them right.",
+    "audit_every_h": "How often the rule check re-reads the library to confirm "
+                     "it still matches its own rules.",
 }
 
 # NOT SHOWN ON THE SETTINGS PAGE, but still live.
@@ -364,6 +405,7 @@ class WorkerConfig:
                 "hint": (_encode_hint() if k == "encode_workers"
                          else _subocr_hint() if k == "subocr_workers"
                          else HINTS[k]),
+                "label": LABELS.get(k, k.replace("_", " ")),
                 "timing": k in TIMING_KEYS,
             }
             for k in LIMITS if k not in HIDDEN_KEYS
