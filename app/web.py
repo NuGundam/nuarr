@@ -2793,7 +2793,21 @@ def _summary_impl():
             attention.append(_row)
     except Exception:                                    # noqa: BLE001
         pass
+    # THE HEALTH VERDICT RIDES ALONG, so the dashboard can carry a tile
+    # without a second request. api_health() is a handful of counted queries
+    # and cached module reads, and this whole summary is memoised for 5s, so
+    # the cost lands once per poll window rather than per caller.
+    health = {"warnings": 0, "top": ""}
+    try:
+        hc = api_health()
+        health["warnings"] = int(hc.get("warnings") or 0)
+        top = next((c for c in hc.get("checks") or [] if c.get("warn")), None)
+        if top:
+            health["top"] = top.get("label") or ""
+    except Exception:                                        # noqa: BLE001
+        pass
     return {"states": states, "disks": disks, "libraries": libs,
+            "health": health,
             "saved": saved, "attention": attention,
             "errors": errors, "error_kinds": err_kinds,
             "totals": totals, "orphans": orphans, "extras": extras,
@@ -11237,6 +11251,16 @@ async function loadAll(){
   // them, each row linking to the page that can act on it.
   add('Attention', fmt(attN), attTop,
       attN ? {attn:1, t:'Needs attention'} : null);
+  // MIRRORS THE OTHERS: a count, a one-line verdict, and a click-through. The
+  // count is checks-that-found-something rather than items, because "3" here
+  // means three SYSTEMS want a look - the items are counted on their own
+  // cards, and summing apples with titles would make the number meaningless.
+  const hl = s.health || {warnings:0, top:''};
+  add('Health checks', fmt(hl.warnings),
+      hl.warnings
+        ? (hl.top ? esc(hl.top) : 'checks found something')
+        : 'everything checks out',
+      {href:'/settings#health'});
   const ua = s.unmanaged_adopt || {checking:0, no_folder:0};
   add('Unmanaged &gt;'+s.extras_cutoff_mb+'MB',fmt(s.orphans.n),
       sweepNote(s.unmanaged_sweep, ua.checking,
@@ -12292,6 +12316,9 @@ function runPanelPaint(){
 }
 
 async function drill(q){
+  // A tile that lives on another page navigates rather than opening a panel -
+  // the health tile is a doorway to Settings, not a filter over files.
+  if(q && q.href){ location.href=q.href; return; }
   if(q && q.running){
     const p=document.getElementById('runPanel');
     if(p && p.style.display!=='none'){ p.style.display='none'; return; }
