@@ -555,11 +555,14 @@ def check(pr: dict, anime: bool, library: str = "",
         named = [g for g in have if g and g != "und"]
         kept_here = [g for g in have if g in keep or g == "und"]
         if named and not kept_here:
+            # SHORT ENOUGH FOR THE ROW IT LIVES IN. The full argument - that no
+            # re-encode can change what language the words are in - belongs in
+            # the drop-down where there is room for it; the cell needs the
+            # comparison and nothing else, or every row in the table is two
+            # lines tall to accommodate one.
             flag("audio/language",
                  f"only {', '.join(sorted(set(named)))} audio",
-                 f"{library} keeps {', '.join(sorted(keep))} — no track here "
-                 f"is in a language this library wants, which no amount of "
-                 f"re-encoding can change")
+                 f"{', '.join(sorted(keep))} — none of them present")
         elif len(aud) > len(kept_here) and kept_here:
             drop = [g for g in named if g not in keep]
             if drop:

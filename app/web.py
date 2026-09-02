@@ -9763,21 +9763,52 @@ button[disabled]{opacity:.5;cursor:default}
    rules want in green, monospaced so two values read as values. */
 .auiw{margin-top:3px;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;
   font-size:11.5px}
+/* THE RULE CHECK'S PALETTE, named because Erik asked for this panel to be the
+   template: body text you can actually read, one step down for secondary, and
+   greens and reds bright enough to carry a whole sentence rather than a
+   five-letter pill. Anything restyled after this should pull these rather
+   than re-deriving them. */
+:root{
+  --fx-fg:#e6edf3;      /* body text in a list you are meant to read */
+  --fx-dim:#c9d4e3;     /* secondary - still legible, not decoration */
+  --fx-ok:#7fe0a0;      /* was --ok, lifted for prose */
+  --fx-bad:#ff8b8b;
+  --fx-info:#8ec6ff;
+  --fx-warn:#f2c94c;
+  --fx-okline:#2f6b40;  /* pill borders */
+  --fx-badline:#7a3034;
+}
 /* READABLE AT A GLANCE, which --dim was not on this table. Grey is right for
    a line you are meant to skip past; every cell here is one you are meant to
    read, and a whole column of it just made the page look switched off. The
    greens are lifted for the same reason: --ok is tuned for a small pill on a
    dark card, not for a sentence. */
-.auis{color:#ff8b8b}
-.auis.fixed{color:#c9d4e3;text-decoration:line-through}
-.auarr{color:#c9d4e3;margin:0 7px}
-.auwant{color:#7fe0a0}
-#auScroll td{color:#e6edf3;vertical-align:top}
-.auwrap{padding:3px 10px 3px 0;white-space:normal;overflow-wrap:anywhere;
-  line-height:1.4}
-#auScroll .pill.p-ok{color:#7fe0a0;border-color:#2f6b40}
-#auScroll .pill.p-bad{color:#ff8b8b;border-color:#7a3034}
-#auScroll .dim{color:#c9d4e3;opacity:.85}
+.auis{color:var(--fx-bad)}
+.auis.fixed{color:var(--fx-dim);text-decoration:line-through}
+.auarr{color:var(--fx-dim);margin:0 7px}
+.auwant{color:var(--fx-ok)}
+/* THE LIST IS THE PAGE, so it takes the height the page has rather than a
+   fixed slice of the viewport. #au is already a flex column that fills the
+   pane; the scroller claims the rest of it, which means the table ends where
+   the panel ends instead of stopping half way down with empty frame below. */
+#ruleschkPane #au{display:flex;flex-direction:column}
+#ruleschkPane #auScroll{flex:1 1 auto;min-height:180px}
+/* The 100vh-230px cap is a backstop for layouts where the flex chain cannot
+   resolve a height. This one can - #ruleschkBody is a resolved flex column -
+   so the cap was simply stopping the box 150px short of the panel it lives in.
+   Off here; every other pane keeps it. */
+#ruleschkPane .fullpane{max-height:none}
+#auScroll td{color:var(--fx-fg);vertical-align:top}
+/* ONE LINE PER ROW. With the language finding shortened at the source, the
+   only cell that still ran over was the file name - and a release name is
+   longer than any column can be at any width, so it ends in an ellipsis with
+   the full name on hover and in the drop-down. Fifty rows of one line each
+   scan; twenty-five rows of two do not. */
+.auwrap{padding:3px 10px 3px 0;white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis;line-height:1.4}
+#auScroll .pill.p-ok{color:var(--fx-ok);border-color:var(--fx-okline)}
+#auScroll .pill.p-bad{color:var(--fx-bad);border-color:var(--fx-badline)}
+#auScroll .dim{color:var(--fx-dim);opacity:.85}
 /* A fixed row is history, not a whisper: it keeps full contrast and says so
    with the strike-through and the green word, rather than by fading out. */
 .aufixed td{opacity:1}
@@ -9790,7 +9821,6 @@ button[disabled]{opacity:.5;cursor:default}
    strike-through, all of which say "done" without making the text hard to
    read. This is the rule the td override above was fighting and losing to. */
 .aufixed{opacity:1}
-.aufixed td:first-child{box-shadow:inset 2px 0 0 #7fe0a0}
 /* Section heading INSIDE a panel, for the standing-gaps list. */
 .auhead{padding:9px 14px;font-weight:600;font-size:12.5px;
   border-top:1px solid var(--line);border-bottom:1px solid var(--line);
@@ -10001,7 +10031,7 @@ button[disabled]{opacity:.5;cursor:default}
    Which also means the bar is never covered by the text describing it, and
    both bars can run the full width of what contains them. */
 .pxblbl{display:none;font-style:normal;font-size:11px;font-weight:600;
-  color:#e6edf3;letter-spacing:.1px;font-variant-numeric:tabular-nums}
+  color:var(--fx-fg);letter-spacing:.1px;font-variant-numeric:tabular-nums}
 .pxopen .pxblbl{display:block}
 /* The starved label used to go amber. It is white like every other bar label
    now - the state is already carried by the needle and the threshold dashes,
@@ -10048,7 +10078,7 @@ button[disabled]{opacity:.5;cursor:default}
    card and the two line up rather than being inset from each other by 9px. */
 .pxrunwrap{margin:9px -9px 0;padding-bottom:2px}
 .pxrunlbl{display:block;font-style:normal;font-size:11px;font-weight:600;
-  color:#e6edf3;letter-spacing:.1px;margin-bottom:3px;
+  color:var(--fx-fg);letter-spacing:.1px;margin-bottom:3px;
   font-variant-numeric:tabular-nums}
 .pxrunax{position:relative;height:14px;font-size:10.5px;color:#8b98a5;margin-top:4px;
   font-variant-numeric:tabular-nums}
@@ -14647,6 +14677,21 @@ let _auSeq=0, _auBusy=false;
 // lines in every row.
 let _auOpen=null, _auDetailHtml='', _auMode='manual', _auDone=false;
 function auShowDone(on){ _auDone=!!on; _auOpen=null; _auDetailHtml=''; loadAudit(); }
+// SORTING, the same shape the signs table uses: same column twice reverses it,
+// a new column starts newest/worst-first for the clock and A-Z for names.
+let _auSort={key:'at', dir:-1};
+function auSortBy(k){
+  if(_auSort.key===k) _auSort.dir*=-1;
+  else _auSort={key:k, dir:(k==='at')?-1:1};
+  loadAudit();
+}
+function auCmp(a,b){
+  const k=_auSort.key, d=_auSort.dir;
+  if(k==='at') return ((a.at||0)-(b.at||0))*d;
+  const x=String((k==='path'?String(a.path||'').split('\\').pop():a[k])||'');
+  const y=String((k==='path'?String(b.path||'').split('\\').pop():b[k])||'');
+  return x.localeCompare(y)*d;
+}
 
 // Which rules a different release can fix. Kept in step with audit.py's
 // REPLACEABLE_RULES by being sent with the payload rather than re-listed here;
@@ -14895,7 +14940,7 @@ click to read this run's findings"
   const auSettled=auAll.filter(f=>f.state==='fixed'||f.state==='replaced');
   const auShown=_auDone ? auAll : auAll.filter(f=>
     f.state!=='fixed' && f.state!=='replaced');
-  const auRows=auShown.map(f=>{
+  const auRows=auShown.slice().sort(auCmp).map(f=>{
     const st=f.state||'', done=st==='fixed', repl=st==='replaced';
     const stuckRow=(st==='unfixable'||st==='gave-up');
     const label=String(f.path||'').split('\\').pop();
@@ -14920,12 +14965,13 @@ click to read this run's findings"
           >${esc(label)}</span></td>
       <td style="padding:3px 10px 3px 0;white-space:nowrap">
         <span class="pill ${done||repl?'p-ok':'p-bad'}">${esc(f.rule||'')}</span></td>
-      <td class="auwrap">${auIsWant(f,done)}</td>
+      <td class="auwrap" title="${esc((f.found||'')+' → '+(f.want||f.detail||''))}"
+        >${auIsWant(f,done)}</td>
       <td style="padding:3px 10px 3px 0;white-space:nowrap;color:${scol}"
         >${sword}</td>
-      <td style="padding:3px 8px 3px 0;white-space:nowrap;color:#c9d4e3"
+      <td style="padding:3px 8px 3px 0;white-space:nowrap">${act}</td>
+      <td style="padding:3px 0;white-space:nowrap;color:var(--fx-dim);text-align:right"
         >${ago(f.at)}</td>
-      <td style="padding:3px 0;white-space:nowrap;text-align:right">${act}</td>
     </tr>` + (open ? `<tr class="logdrop"><td colspan="6">${
       _auDetailHtml||'<div class="dim" style="padding:10px 14px">loading…</div>'
     }</td></tr>` : '');
@@ -15055,25 +15101,25 @@ click to read this run's findings"
         <input type="checkbox" id="auAutoBox" ${_auMode==='auto'?'checked':''}
                onchange="auMode(this.checked?'auto':'manual')">
         <span>Replace wrong-language releases automatically</span></label>
-      <button onclick="auRun()">Run now</button>
       <span class="dim" id="auModeMsg"></span>
       <span class="dim" style="margin-left:auto">${_auMode==='auto'
         ? '<b style="color:var(--warn)">on — a release with no audio you keep is '
           +'blocklisted and re-downloaded without asking</b>'
         : 'off — nothing is replaced unless you press the button'}</span>
     </div>
-    ${auRows?`<div id="auScroll" style="max-height:min(52vh,560px);overflow:auto;
-        margin:6px 14px 0"><table style="width:100%;font-size:11.5px;
+    ${auRows?`<div id="auScroll" style="overflow:auto;margin:6px 14px 0"><table style="width:100%;font-size:11.5px;
         border-collapse:collapse;table-layout:fixed">
-        <!-- Sized to the content, not evenly: the file name is the only cell
-             whose length really varies and it was the one being cut off, while
-             Status and When were holding empty space open beside it. -->
-        <colgroup><col style="width:32%"><col style="width:11%">
-          <col style="width:29%"><col style="width:8%"><col style="width:6%">
-          <col style="width:14%"></colgroup>
-        <thead><tr>${['File','Rule','Found → should be','Status','When',''].map(h=>
-          `<th style="text-align:left;font-weight:600;padding:3px 10px 5px 0;
-             position:sticky;top:0;background:var(--bg2,#12161c)">${h}</th>`).join('')}
+        <colgroup><col style="width:34%"><col style="width:10%">
+          <col style="width:27%"><col style="width:8%"><col style="width:13%">
+          <col style="width:8%"></colgroup>
+        <thead><tr>${[['path','File'],['rule','Rule'],['found','Found → should be'],
+                      ['state','Status'],['',''],['at','When']].map(([k,h])=>
+          `<th onclick="${k?`auSortBy('${k}')`:''}"
+             style="text-align:${k==='at'?'right':'left'};font-weight:600;
+             padding:3px 10px 5px 0;position:sticky;top:0;
+             background:var(--bg2,#12161c);${k?'cursor:pointer;user-select:none':''}"
+             ${k?`title="sort by ${h.toLowerCase()}"`:''}
+             >${h}${k&&_auSort.key===k?(_auSort.dir>0?' ▲':' ▼'):''}</th>`).join('')}
         </tr></thead><tbody>${auRows}</tbody></table></div>`
           :`<div class="dim" style="padding:12px 14px">${_auDone
              ? 'Nothing recorded yet.'
