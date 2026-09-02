@@ -2577,14 +2577,31 @@ def _rows(sql: str, params: tuple = ()) -> list[dict]:
 # per caller. 5 s is a third of the 15 s poll, so nothing meaningful is ever
 # served stale.
 _MEMO: dict = {}
+# The memo grew a per-PATH key (subtitle counts for the viewer cards), which
+# is the first key here that is not one of a handful of fixed names. Unbounded,
+# it would hold one entry per file ever watched for the life of the process.
+# Small entries, but "small and unbounded" is the shape of every slow leak, so
+# the store is swept: expired entries go whenever it passes a size it has no
+# business reaching, and it is hard-capped after that.
+_MEMO_SWEEP_AT = 512
+_MEMO_MAX = 2048
 
 
 def _memo(key: str, ttl: float, fn):
+    now = time.time()
     v = _MEMO.get(key)
-    if v and time.time() - v[0] < ttl:
+    if v and now - v[0] < ttl:
         return v[1]
     r = fn()
-    _MEMO[key] = (time.time(), r)
+    _MEMO[key] = (now, r)
+    if len(_MEMO) > _MEMO_SWEEP_AT:
+        # Anything older than the longest TTL in use is dead weight. 120 s is
+        # generous - the longest memo here is 60 s.
+        for k in [k for k, (t, _) in _MEMO.items() if now - t > 120]:
+            _MEMO.pop(k, None)
+        if len(_MEMO) > _MEMO_MAX:
+            for k in sorted(_MEMO, key=lambda k: _MEMO[k][0])[:len(_MEMO) - _MEMO_MAX]:
+                _MEMO.pop(k, None)
     return r
 
 
@@ -4981,7 +4998,12 @@ def api_pathmap():
 def api_pipeline(file_id: int = 0):
     """The pipeline diagram: the graph, and optionally one file's route."""
     from . import pipeline
-    out = pipeline.graph()
+    # Seventeen COUNT(*) queries, ~0.5 s, polled while the page is open. The
+    # counts describe a library that changes on the scale of minutes; ten
+    # seconds of memo makes the poll free and nothing on the diagram late.
+    # Copied, because the route below is written into the same dict and a
+    # memoised object must not be mutated by one caller for the next.
+    out = dict(_memo("pipeline", 10.0, pipeline.graph))
     if file_id:
         out["route"] = pipeline.route(file_id)
     return out
@@ -11112,6 +11134,40 @@ const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;',
 const stateClass=s=>'e-'+String(s||'').replace(/[^a-z_]/gi,'');
 // Relative time for row timestamps - "2h ago" answers the panel's question;
 // the exact datetime lives in the tooltip for when it matters.
+// ---- POLL ONLY WHAT CAN BE SEEN ------------------------------------------
+// Twenty-odd setIntervals start at page load and never stop: job list every
+// 3s, live bars every 750ms, queue every 2.5s, logs every 3s, system every
+// second, and so on. On the dashboard that is the point. On /settings every
+// one of those panels is display:none - the shim hides them - and the page
+// still fired the whole set, some fifteen requests every few seconds to paint
+// things nobody could see. A backgrounded tab did the same at whatever rate
+// the browser throttled it to. Measured on the settings page: ~11 requests a
+// second, none of them for anything on screen.
+//
+// gated(fn, id) wraps a poller so it runs only while the document is visible
+// AND the element it paints is actually rendered (offsetParent is null for
+// anything inside a display:none ancestor). Nothing is unsubscribed, so the
+// moment the panel is shown again the next tick paints it - and visibility
+// coming back triggers one immediate pass so a tab left overnight does not
+// show a stale frame for its first few seconds.
+function gated(fn, id){
+  return function(){
+    if(document.hidden) return;
+    if(id){ const e=document.getElementById(id); if(!e || e.offsetParent===null) return; }
+    return fn.apply(this, arguments);
+  };
+}
+const _gatedOnShow=[];
+document.addEventListener('visibilitychange', ()=>{
+  if(document.hidden) return;
+  for(const f of _gatedOnShow){ try{ f(); }catch(_){ } }
+});
+function poll(fn, ms, id){
+  const g=gated(fn, id);
+  _gatedOnShow.push(g);
+  return setInterval(g, ms);
+}
+
 function ago(ts){
   const s=Math.max(0, Date.now()/1000-ts);
   if(s<90) return 'just now';
@@ -14409,7 +14465,7 @@ async function retryCommits(){
   }catch(e){ m.textContent='retry failed'; }
   loadCmq();
 }
-setInterval(loadCmq, 8000);
+poll(loadCmq, 8000, 'cmq');
 
 // ---- pending OCR subtitles ----------------------------------------------
 async function loadSocrPending(){
@@ -14629,7 +14685,7 @@ async function pbDetail(p64){
       time means that device is.</div>`;
   loadPlayback();
 }
-setInterval(loadPlayback, 30000);
+poll(loadPlayback, 30000, 'pb');
 
 // ---- nightly rule check ---------------------------------------------------
 // WHICH RUN THE PANEL IS SHOWING. 0 means "whatever is newest", which is what
@@ -15276,7 +15332,7 @@ async function socrpClear(id){
   loadSocrPending();
 }
 loadSocrPending();
-setInterval(loadSocrPending, 10000);
+poll(loadSocrPending, 10000, 'socrp');
 
 async function retryRenames(){
   const m=document.getElementById('renqMsg');
@@ -15288,7 +15344,7 @@ async function retryRenames(){
   }catch(e){ m.textContent='retry failed'; }
   loadRenq();
 }
-setInterval(loadRenq, 8000);
+poll(loadRenq, 8000, 'renq');
 
 // ---- ffmpeg -------------------------------------------------------------
 // Writes ONLY to #ffState and #ffPath. It must never touch #ffMsg, which
@@ -15858,7 +15914,7 @@ async function loadSys(){
   catch(_){ }
   finally{ _sysBusy=false; }
 }
-loadSys(); setInterval(loadSys, 1000);
+loadSys(); poll(loadSys, 1000);
 
 // A STABLE COLOUR PER SPINDLE.
 // Twelve near-identical "NU-DRIVE-n 264.1 MB/s" strings on one line is a wall
@@ -17569,7 +17625,7 @@ function tickProgress(){
     }
   }
 }
-setInterval(tickProgress, 120);
+poll(tickProgress, 120, 'jobCap');
 
 // The finished table is rendered SEPARATELY and deliberately not repainted
 // while a log is expanded. Rebuilding it every 2 seconds tore the open log out
@@ -18739,7 +18795,7 @@ async function loadVersion(){
   }
 }
 loadVersion();
-setInterval(loadVersion, 300000);
+poll(loadVersion, 300000);
 
 // ---- first-run walkthrough ----------------------------------------------
 // A fresh install knows nothing: the installer only asks for folders and a
@@ -19636,7 +19692,7 @@ async function loadQueueWhy(){
     _qWhy = m; _qHead = d.headline || '';
   }catch(_){ }
 }
-setInterval(loadQueueWhy, 6000);
+poll(loadQueueWhy, 6000, 'qfPool');
 loadQueueWhy();
 
 // ---- who is watching, with the artwork -----------------------------------
@@ -20302,7 +20358,7 @@ function pxSchedule(){
   // fetch on visibility left it showing nothing at all until it was focused.
   loadPlexCards();
   if(document.hidden) return;
-  _pxPollTimer = setInterval(loadPlexCards, _pxRate);
+  _pxPollTimer = setInterval(gated(loadPlexCards, 'plexCards'), _pxRate);
 }
 function pxRate(n){
   // 1500 matches the server's own session-cache TTL - polling faster than
@@ -20312,10 +20368,10 @@ function pxRate(n){
   if(want === _pxRate || document.hidden) { _pxRate = want; return; }
   _pxRate = want;
   clearInterval(_pxPollTimer);
-  _pxPollTimer = setInterval(loadPlexCards, _pxRate);
+  _pxPollTimer = setInterval(gated(loadPlexCards, 'plexCards'), _pxRate);
 }
 document.addEventListener('visibilitychange', pxSchedule);
-setInterval(pxTick, 250);
+poll(pxTick, 250, 'plexCards');
 pxSchedule();
 
 // ---- Libraries: the media folders Nuarr manages --------------------------
@@ -26911,14 +26967,14 @@ async function loadHookState(){
   }catch(_){ el.textContent=''; }
 }
 loadPlayback(); loadAudit();
-setInterval(loadHooks,10000);
-loadHookState(); setInterval(loadHookState,60000);
-setInterval(loadHistory,5000);
-setInterval(loadGate,6000);
+poll(loadHooks,10000,'hooks');
+loadHookState(); poll(loadHookState,60000,'hookstate');
+poll(loadHistory,5000,'jobCap');
+poll(loadGate,6000,'gate');
 loadHandlerBtns();
 // The FULL poll stays at 2 s - it carries the Finished list and the queue
 // preview, neither of which moves between frames.
-setInterval(loadJobs,3000);
+poll(loadJobs,3000,'jobCap');
 // The MOVING half runs four times as often against the cheap endpoint. Paused
 // when the tab is hidden: a backgrounded dashboard polling a busy encode box
 // four times a second is rude, and browsers throttle it into bursts anyway.
@@ -26954,28 +27010,28 @@ async function loadLive(){
   }catch(_){ }
   finally{ _liveBusy=false; }
 }
-setInterval(loadLive, 750);
+poll(loadLive, 750, 'jobCap');
 document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) loadLive(); });
 // 700 ms was only ever to drive the auto-scroll smoothly. With that gone the
 // list just needs to stay current, and a 300-row query every 0.7 s is wasted
 // work on a 2,000-file queue.
-loadQueue(); setInterval(loadQueue,2500);
+loadQueue(); poll(loadQueue,2500,'qfPool');
 // Slower than the queue: the numbers here are library-wide totals that move in
 // minutes, not seconds, and each read counts rows across the whole files table.
-loadAuto(); setInterval(loadAuto,6000);
+loadAuto(); poll(loadAuto,6000,'aqState');
 // Tiles and library counts change as jobs finish, so refresh them too. Slower
 // than the job poll because the summary also stats every pool disk.
-setInterval(loadAll,15000);
-setInterval(loadLogs,3000);
+poll(loadAll,15000,'cards');
+poll(loadLogs,3000,'logs');
 loadJobs();
-setInterval(loadLogJobs,15000);
+poll(loadLogJobs,15000,'logJob');
 loadLogs(); loadLogJobs();
 loadAll();
 // Once at boot and then slowly: the mode changes when a person changes it or
 // when nuarr appears/vanishes on the file server, neither of which is a
 // per-second event.
 loadObserver();
-setInterval(loadObserver, 60000);
+poll(loadObserver, 60000, 'obsBox');
 // ---- portal-wide button feedback -----------------------------------------
 // Preview, Queue, Stop, Requeue and the pool handlers each got a spinner and a
 // clock by hand. There are ~25 more buttons that fire a request and say

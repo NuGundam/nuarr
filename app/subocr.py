@@ -2752,8 +2752,19 @@ def sweep_pick(limit: int) -> list[dict]:
             "WHERE f.state NOT IN ('deleted','duplicate') "
             "AND f.arr_file_id IS NOT NULL "
             "AND COALESCE(f.subocr_state,'') != 'rejected' "
+            # ONLY FILES THAT HAVE A PICTURE SUBTITLE AT ALL. Measured: 5,839
+            # of 37,022 probes carry one, and this loop was json.loads()-ing
+            # every one of the 37,022 to find out - 2.5 s of decoding to reject
+            # 31,000 files that select_targets would have skipped on the first
+            # line. A LIKE over the blob is 0.8 s and cuts the decode to a
+            # sixth. Both spellings ffprobe uses for the codec are covered.
+            "AND (p.json LIKE '%hdmv_pgs_subtitle%' OR p.json LIKE '%pgssub%') "
             "AND f.id NOT IN (SELECT file_id FROM jobs WHERE file_id IS "
             "NOT NULL AND state IN ('queued','running')) "
+            # This clause CANNOT FIRE and is kept only for the record: a done
+            # job rewrites the file, the rewrite refreshes the probe, and so the
+            # probe is always newer than the job that caused it. The loop it
+            # was written against was closed in embed() - see the note there.
             "AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.file_id=f.id "
             "  AND j.kind='sub_ocr' AND j.state='done' "
             "  AND COALESCE(j.finished_at,0) >= p.at)")
@@ -3019,19 +3030,44 @@ def _annotate_status(cur, rows: list) -> None:
 # so computing this per poll would have the page spending most of its life
 # asking the same question. The answer only changes when the sweep queues
 # something or a scan finds new files, neither of which happens on that scale.
-_BACKLOG: dict = {"at": 0.0, "n": None}
-_BACKLOG_TTL = 120.0
+_BACKLOG: dict = {"at": 0.0, "n": None, "busy": False}
+_BACKLOG_TTL = 600.0
 
 
 def _backlog():
-    """How many files across the library still need OCR. Cached."""
+    """How many files across the library still need OCR. Never blocks.
+
+    MEASURED AT 5-7 SECONDS, in the request. sweep_pick() decodes every
+    stored probe that carries a picture subtitle - 36,229 of them on this
+    library - and runs select_targets on each. Doing that inside the shapes
+    endpoint meant that every time the cache expired, one poll of the panel
+    took seven seconds and held a database connection for all of it, with the
+    page sitting on a spinner. The number it produces changes when the sweep
+    queues something or a scan finds files, neither of which happens on a
+    two-minute scale.
+
+    So: the request returns whatever is cached, and when the cache is stale it
+    starts ONE recount on a thread and returns immediately. The first caller
+    after startup sees None - the panel prints "counting" - and every caller
+    after that sees a number that is at most ten minutes old. The sweep itself
+    still calls sweep_pick directly; it wants the list, not the count.
+    """
     now = time.time()
-    if _BACKLOG["n"] is not None and now - _BACKLOG["at"] < _BACKLOG_TTL:
-        return _BACKLOG["n"]
-    try:
-        _BACKLOG.update(n=len(sweep_pick(100000)), at=now)
-    except Exception:                                        # noqa: BLE001
-        _BACKLOG.update(at=now)
+    fresh = _BACKLOG["n"] is not None and now - _BACKLOG["at"] < _BACKLOG_TTL
+    if not fresh and not _BACKLOG["busy"]:
+        _BACKLOG["busy"] = True
+
+        def _count():
+            try:
+                n = len(sweep_pick(100000))
+                _BACKLOG.update(n=n, at=time.time())
+            except Exception:                                # noqa: BLE001
+                _BACKLOG.update(at=time.time())
+            finally:
+                _BACKLOG["busy"] = False
+        import threading
+        threading.Thread(target=_count, name="subocr-backlog",
+                         daemon=True).start()
     return _BACKLOG["n"]
 
 
