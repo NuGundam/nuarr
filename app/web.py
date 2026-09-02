@@ -5275,6 +5275,24 @@ async def api_subocr_config(body: dict = Body(...)):
     joblog.log("subtitle OCR settings saved", "ok")
     from . import subocr
     out = {"ok": True, **subocr.status()}
+    # "TAKES EFFECT ON THE NEXT SWEEP" INVITES THE QUESTION "WHEN IS THAT".
+    # Erik asked it. The schedule registry already knows; ship the answer with
+    # the save so the confirmation can say "in 5h 58m" rather than make the
+    # reader go and find the Jobs page.
+    try:
+        from . import schedules
+        row = next((r for r in schedules.snapshot().get("rows", [])
+                    if r.get("key") == "subocr"), None)
+        if row and row.get("next_run"):
+            out["next_sweep_in_s"] = max(0.0, float(row["next_run"]) - time.time())
+        else:
+            # Before the first sweep of this process has beaten the registry
+            # there is no row yet; the cadence is still known, and "within 6h"
+            # is a truer answer than silence.
+            out["next_sweep_in_s"] = float(subocr._s("subocr_every_h", 6) or 6) * 3600
+            out["next_sweep_approx"] = True
+    except Exception:                                        # noqa: BLE001
+        pass
     # SAY WHAT THE TICK JUST DID. Erik switched OCR on for a library, and the
     # only confirmations on screen were a bare "saved" and - worse - a
     # language-policy preview reporting "nothing will change", which is true
@@ -21705,11 +21723,15 @@ async function socSaveLib(lib){
     const m2=id('msg');
     if(m2){
       m2.style.color=r.ok?'#7fd4a3':'#e0575b';
+      // Say WHEN. "On the next sweep" is a promise with no date on it.
+      const when = (r.next_sweep_in_s!=null)
+        ? `next sweep ${r.next_sweep_approx?'within':'in'} ${hms(Math.round(r.next_sweep_in_s))}`
+          + ` — or press Convert all now on the OCR engines page`
+        : 'next sweep — every 6 hours, or Convert all now on the OCR engines page';
       m2.textContent = !r.ok ? (r.error||'failed')
         : (r.unlocked
-            ? `saved — ${fmt(r.unlocked)} measured file(s) here become `
-              + `convertible on the next sweep`
-            : 'saved — takes effect on the next sweep');
+            ? `saved — ${fmt(r.unlocked)} measured file(s) here become convertible at the ${when}`
+            : `saved — takes effect at the ${when}`);
     }
   }catch(e){ if(m){ m.style.color='#e0575b'; m.textContent='failed'; } }
 }
