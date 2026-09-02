@@ -9763,17 +9763,34 @@ button[disabled]{opacity:.5;cursor:default}
    rules want in green, monospaced so two values read as values. */
 .auiw{margin-top:3px;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;
   font-size:11.5px}
-.auis{color:var(--bad)}
-.auis.fixed{color:var(--dim);text-decoration:line-through}
-.auarr{color:var(--dim);margin:0 7px}
-.auwant{color:var(--ok)}
+/* READABLE AT A GLANCE, which --dim was not on this table. Grey is right for
+   a line you are meant to skip past; every cell here is one you are meant to
+   read, and a whole column of it just made the page look switched off. The
+   greens are lifted for the same reason: --ok is tuned for a small pill on a
+   dark card, not for a sentence. */
+.auis{color:#ff8b8b}
+.auis.fixed{color:#c9d4e3;text-decoration:line-through}
+.auarr{color:#c9d4e3;margin:0 7px}
+.auwant{color:#7fe0a0}
+#auScroll td{color:#e6edf3;vertical-align:top}
+.auwrap{padding:3px 10px 3px 0;white-space:normal;overflow-wrap:anywhere;
+  line-height:1.4}
+#auScroll .pill.p-ok{color:#7fe0a0;border-color:#2f6b40}
+#auScroll .pill.p-bad{color:#ff8b8b;border-color:#7a3034}
+#auScroll .dim{color:#c9d4e3;opacity:.85}
+/* A fixed row is history, not a whisper: it keeps full contrast and says so
+   with the strike-through and the green word, rather than by fading out. */
+.aufixed td{opacity:1}
 /* A finding whose file has since been re-checked and passes. Held back rather
    than hidden - the run it was found on is a record and must keep it - but it
    is no longer competing for attention with the rows that still need doing.
    The green edge is the same signal .p-ok carries, read down the whole row. */
-.aufixed{opacity:.62}
-.aufixed td:first-child{box-shadow:inset 2px 0 0 var(--ok)}
-.aufixed:hover{opacity:1}
+/* .62 was the whole reason the table read as grey. A fixed row is history, not
+   a whisper - it is marked by the green edge, the green word and the
+   strike-through, all of which say "done" without making the text hard to
+   read. This is the rule the td override above was fighting and losing to. */
+.aufixed{opacity:1}
+.aufixed td:first-child{box-shadow:inset 2px 0 0 #7fe0a0}
 /* Section heading INSIDE a panel, for the standing-gaps list. */
 .auhead{padding:9px 14px;font-weight:600;font-size:12.5px;
   border-top:1px solid var(--line);border-bottom:1px solid var(--line);
@@ -14882,8 +14899,8 @@ click to read this run's findings"
     const st=f.state||'', done=st==='fixed', repl=st==='replaced';
     const stuckRow=(st==='unfixable'||st==='gave-up');
     const label=String(f.path||'').split('\\').pop();
-    const scol=done?'#6fd08c':repl?'#6fb0ff':stuckRow?'#e0575b'
-              :st==='queued'?'#e2b341':'var(--dim)';
+    const scol=done?'#7fe0a0':repl?'#8ec6ff':stuckRow?'#ff8b8b'
+              :st==='queued'?'#f2c94c':'#c9d4e3';
     const sword=done?'fixed':repl?'replaced':stuckRow?'no rule fixes it'
                :st==='queued'?'queued':'still broken';
     const open=_auOpen===f.file_id;
@@ -14898,18 +14915,16 @@ click to read this run's findings"
              title="Blocklist the release and ask the arr for a different one. This deletes the file."
              style="color:var(--bad)">Blocklist &amp; re-download</button>` : '');
     return `<tr class="${open?'rowopen':''}${done?' aufixed':''}">
+      <td class="auwrap" title="${esc(label)}"><span class="tl"
+          onclick="auDetail(${f.file_id})"
+          >${esc(label)}</span></td>
       <td style="padding:3px 10px 3px 0;white-space:nowrap">
         <span class="pill ${done||repl?'p-ok':'p-bad'}">${esc(f.rule||'')}</span></td>
-      <td style="padding:3px 10px 3px 0;overflow:hidden;text-overflow:ellipsis;
-                 white-space:nowrap"><span class="tl"
-          onclick="auDetail(${f.file_id})"
-          title="click for what was found, what has been tried, and what can be done"
-          >${esc(label)}</span></td>
-      <td style="padding:3px 10px 3px 0;overflow:hidden;text-overflow:ellipsis;
-                 white-space:nowrap">${auIsWant(f,done)}</td>
+      <td class="auwrap">${auIsWant(f,done)}</td>
       <td style="padding:3px 10px 3px 0;white-space:nowrap;color:${scol}"
         >${sword}</td>
-      <td class="dim" style="padding:3px 0;white-space:nowrap">${ago(f.at)}</td>
+      <td style="padding:3px 8px 3px 0;white-space:nowrap;color:#c9d4e3"
+        >${ago(f.at)}</td>
       <td style="padding:3px 0;white-space:nowrap;text-align:right">${act}</td>
     </tr>` + (open ? `<tr class="logdrop"><td colspan="6">${
       _auDetailHtml||'<div class="dim" style="padding:10px 14px">loading…</div>'
@@ -15050,10 +15065,13 @@ click to read this run's findings"
     ${auRows?`<div id="auScroll" style="max-height:min(52vh,560px);overflow:auto;
         margin:6px 14px 0"><table style="width:100%;font-size:11.5px;
         border-collapse:collapse;table-layout:fixed">
-        <colgroup><col style="width:15%"><col style="width:26%">
-          <col style="width:27%"><col style="width:11%"><col style="width:7%">
+        <!-- Sized to the content, not evenly: the file name is the only cell
+             whose length really varies and it was the one being cut off, while
+             Status and When were holding empty space open beside it. -->
+        <colgroup><col style="width:32%"><col style="width:11%">
+          <col style="width:29%"><col style="width:8%"><col style="width:6%">
           <col style="width:14%"></colgroup>
-        <thead><tr>${['Rule','File','Found → should be','Status','When',''].map(h=>
+        <thead><tr>${['File','Rule','Found → should be','Status','When',''].map(h=>
           `<th style="text-align:left;font-weight:600;padding:3px 10px 5px 0;
              position:sticky;top:0;background:var(--bg2,#12161c)">${h}</th>`).join('')}
         </tr></thead><tbody>${auRows}</tbody></table></div>`
