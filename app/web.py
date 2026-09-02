@@ -14677,6 +14677,16 @@ let _auSeq=0, _auBusy=false;
 // lines in every row.
 let _auOpen=null, _auDetailHtml='', _auMode='manual', _auDone=false;
 function auShowDone(on){ _auDone=!!on; _auOpen=null; _auDetailHtml=''; loadAudit(); }
+// THE LIST HOLDS STILL WHILE YOU ARE IN IT - the same three signals the signs
+// table uses. An open row, a cursor resting on the table, or a list scrolled
+// down from the top all mean "I am reading this", and a repaint that re-sorts
+// under a reader is the problem the poll is meant to solve, not cause. A
+// paused poll still fires, just a minute apart, so nothing is ever missed.
+let _auHover=false;
+function auPaused(){
+  const b=document.getElementById('auScroll');
+  return _auOpen!==null || _auHover || (b && b.scrollTop>4);
+}
 // SORTING, the same shape the signs table uses: same column twice reverses it,
 // a new column starts newest/worst-first for the clock and A-Z for names.
 let _auSort={key:'at', dir:-1};
@@ -14940,6 +14950,7 @@ click to read this run's findings"
   const auSettled=auAll.filter(f=>f.state==='fixed'||f.state==='replaced');
   const auShown=_auDone ? auAll : auAll.filter(f=>
     f.state!=='fixed' && f.state!=='replaced');
+  const auHasAct=auShown.some(f=>f.state!=='fixed' && f.state!=='replaced');
   const auRows=auShown.slice().sort(auCmp).map(f=>{
     const st=f.state||'', done=st==='fixed', repl=st==='replaced';
     const stuckRow=(st==='unfixable'||st==='gave-up');
@@ -15054,6 +15065,8 @@ click to read this run's findings"
       ${st.heal_current?' · '+esc(st.heal_current):''}</span></span>`;
   }
 
+  const _auKeep=document.getElementById('auScroll');
+  const _auTop=_auKeep?_auKeep.scrollTop:0;
   paintTop('au', `<div style="padding:9px 14px;border-bottom:1px solid var(--line)">
       ${err?`<div class="err" style="margin-bottom:7px">${esc(err)}</div>`:''}
       <div class="auscore">${score}
@@ -15101,14 +15114,12 @@ click to read this run's findings"
         <input type="checkbox" id="auAutoBox" ${_auMode==='auto'?'checked':''}
                onchange="auMode(this.checked?'auto':'manual')">
         <span>Replace wrong-language releases automatically</span></label>
-      <span class="dim" style="flex:1 0 100%;font-size:11px;margin:1px 0 0 24px">
-        When a file's audio is in <b>no language its library keeps</b>, nothing
-        can be re-encoded to fix it — the words are the wrong words — so the
-        only real remedy is a different release. With this on, Nuarr blocklists
-        that release and asks the arr for another one on its own, at most three
-        per cycle. It applies to that one rule and no other: every other
-        finding here is a build fault the planner can rewrite, and replacing
-        those would destroy a good file to fetch one with the same fault.
+      <span class="dim" style="flex:1 0 100%;font-size:11px;margin-top:1px;
+                               white-space:normal;padding-left:24px;box-sizing:border-box">
+        If a file's audio is in no language its library keeps, no re-encode can
+        fix it — so Nuarr blocklists that release and asks the arr for another
+        one, up to three per cycle. Only that rule; everything else here the
+        planner fixes by rewriting the file.
       </span>
       <span class="dim" id="auModeMsg"></span>
       <span class="dim" style="margin-left:auto">${_auMode==='auto'
@@ -15116,7 +15127,8 @@ click to read this run's findings"
           +'blocklisted and re-downloaded without asking</b>'
         : 'off — nothing is replaced unless you press the button'}</span>
     </div>
-    ${auRows?`<div id="auScroll" style="overflow:auto;margin:6px 14px 0"><table style="width:100%;font-size:11.5px;
+    ${auRows?`<div id="auScroll" style="overflow:auto;margin:6px 14px 0"
+        onmouseenter="_auHover=true" onmouseleave="_auHover=false"><table style="width:100%;font-size:11.5px;
         border-collapse:collapse;table-layout:fixed">
         <!-- THE SLACK GOES TO THE FINDING, not the file. It did go to the file
              while that column held a release name; now it holds "The Lego
@@ -15124,10 +15136,14 @@ click to read this run's findings"
              comparison - the one cell whose whole job is to be read - was the
              one being cut off. Everything else is a fixed, narrow fact packed
              against the right edge, so Status sits beside When. -->
-        <colgroup><col style="width:330px"><col style="width:124px"><col>
-          <col style="width:96px"><col style="width:210px">
-          <col style="width:76px"></colgroup>
-        <thead><tr>${[['path','File'],['rule','Rule'],['found','Found → should be'],
+        <!-- The action column is 200px of buttons on an outstanding row and
+             200px of nothing on a fixed one - which, on a list that is mostly
+             fixed rows, was the hole between Status and When. It is only laid
+             out when a shown row actually has a button in it. -->
+        <colgroup><col style="width:300px"><col style="width:120px"><col>
+          <col style="width:90px"><col style="width:${auHasAct?200:0}px">
+          <col style="width:72px"></colgroup>
+        <thead><tr>${[['path','Title'],['rule','Rule'],['found','Found → should be'],
                       ['state','Status'],['',''],['at','When']].map(([k,h])=>
           `<th onclick="${k?`auSortBy('${k}')`:''}"
              style="text-align:${(k==='at'||k==='state')?'right':'left'};
@@ -15157,10 +15173,11 @@ click to read this run's findings"
   // the moment their jobs land and the colour flips deserve to be seen close
   // to when the Transcoding panel shows the job finishing; a lazy minute when
   // there is nothing in flight anywhere.
+  { const sc=document.getElementById('auScroll'); if(sc && _auTop) sc.scrollTop=_auTop; }
   // An open drop-down pins the panel, the same rule the signs table follows:
   // reading the story of one finding while the table repaints under it is the
   // problem the poll is supposed to solve, not cause.
-  auSchedule(_auOpen!==null ? 60000
+  auSchedule(auPaused() ? 60000
              : (st.running||st.heal_running) ? 2500
              : (t.queued>0) ? 10000 : 60000);
 }

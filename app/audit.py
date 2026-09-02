@@ -1504,7 +1504,14 @@ def _readable(path: str) -> str:
     import re as _re
     name = os.path.splitext(os.path.basename(path or ""))[0]
     cut = _re.split(r"\s*[\[\{]", name, 1)[0].strip(" -_.")
-    return cut or name
+    # "Show (1993) - S02E06 - Episode Name" -> "Show · S02E06"; a daily show
+    # keeps its date as the episode. The year and the episode NAME are what
+    # the title column exists to leave out.
+    m = _re.match(r"^(.*?)(?:\s*\(\d{4}\))?\s*-\s*(S\d+E\d+|\d{4}-\d{2}-\d{2})\b",
+                  cut)
+    if m:
+        return f"{m.group(1).strip()} \u00b7 {m.group(2)}"
+    return _re.sub(r"\s*\(\d{4}\)\s*$", "", cut) or name
 
 
 def standing(limit: int = 300) -> list[dict]:
