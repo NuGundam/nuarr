@@ -1492,6 +1492,21 @@ def latest(run_id: int = 0) -> dict:
             "cycle_s": CYCLE_S}
 
 
+def _readable(path: str) -> str:
+    """A filename with the release tags taken off, for rows with no title.
+
+    Two files in the library have no title recorded - an old WWE rip and a
+    Swat Kats DVD - and they were the only rows still showing ninety
+    characters of scene tags. Everything from the first bracket onwards is
+    provenance, not identity: it belongs in the tooltip and the drop-down,
+    both of which still carry the whole name.
+    """
+    import re as _re
+    name = os.path.splitext(os.path.basename(path or ""))[0]
+    cut = _re.split(r"\s*[\[\{]", name, 1)[0].strip(" -_.")
+    return cut or name
+
+
 def standing(limit: int = 300) -> list[dict]:
     r"""What is wrong NOW, one row per file, newest first.
 
@@ -1514,7 +1529,8 @@ def standing(limit: int = 300) -> list[dict]:
             rows = [dict(r) for r in cur.execute(
                 "SELECT a.file_id, a.rule, a.found, a.want, a.detail, a.at, "
                 "       a.path, a.bucket, h.state, h.detail AS heal_detail, "
-                "       h.last_at AS heal_at, f.library, f.state AS fstate "
+                "       h.last_at AS heal_at, f.library, f.state AS fstate, "
+                "       f.title, f.season, f.episode "
                 "  FROM audit_findings a "
                 "  LEFT JOIN audit_heals h ON h.file_id = a.file_id "
                 "  LEFT JOIN files f ON f.id = a.file_id "
@@ -1540,6 +1556,14 @@ def standing(limit: int = 300) -> list[dict]:
             if (r.get("state") or "") != "replaced":
                 continue
         r["replaceable"] = replaceable(r.get("rule") or "")
+        # THE TITLE, NOT THE FILENAME. "The Lego Movie (2014) {tmdb-137106}
+        # [DSNP][WEBDL-1080p][EAC3 5.1][x264].mkv" is ninety characters of
+        # which six answer "which film is this". The release name is one line
+        # down in the drop-down for anyone who needs it.
+        from .subocr import ep_label as _ep
+        ep = _ep(r.pop("season", None), r.pop("episode", None))
+        r["label"] = (((r.get("title") or "") + (" \u00b7 " + ep if ep else ""))
+                      or _readable(r.get("path") or ""))
         out.append(r)
     return out
 

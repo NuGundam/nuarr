@@ -14943,7 +14943,7 @@ click to read this run's findings"
   const auRows=auShown.slice().sort(auCmp).map(f=>{
     const st=f.state||'', done=st==='fixed', repl=st==='replaced';
     const stuckRow=(st==='unfixable'||st==='gave-up');
-    const label=String(f.path||'').split('\\').pop();
+    const label=f.label||String(f.path||'').split('\\').pop();
     const scol=done?'#7fe0a0':repl?'#8ec6ff':stuckRow?'#ff8b8b'
               :st==='queued'?'#f2c94c':'#c9d4e3';
     const sword=done?'fixed':repl?'replaced':stuckRow?'no rule fixes it'
@@ -14960,15 +14960,15 @@ click to read this run's findings"
              title="Blocklist the release and ask the arr for a different one. This deletes the file."
              style="color:var(--bad)">Blocklist &amp; re-download</button>` : '');
     return `<tr class="${open?'rowopen':''}${done?' aufixed':''}">
-      <td class="auwrap" title="${esc(label)}"><span class="tl"
-          onclick="auDetail(${f.file_id})"
+      <td class="auwrap" title="${esc(String(f.path||'').split('\\').pop())}"
+        ><span class="tl" onclick="auDetail(${f.file_id})"
           >${esc(label)}</span></td>
       <td style="padding:3px 10px 3px 0;white-space:nowrap">
         <span class="pill ${done||repl?'p-ok':'p-bad'}">${esc(f.rule||'')}</span></td>
       <td class="auwrap" title="${esc((f.found||'')+' → '+(f.want||f.detail||''))}"
         >${auIsWant(f,done)}</td>
-      <td style="padding:3px 10px 3px 0;white-space:nowrap;color:${scol}"
-        >${sword}</td>
+      <td style="padding:3px 10px 3px 0;white-space:nowrap;text-align:right;
+                 color:${scol}">${sword}</td>
       <td style="padding:3px 8px 3px 0;white-space:nowrap">${act}</td>
       <td style="padding:3px 0;white-space:nowrap;color:var(--fx-dim);text-align:right"
         >${ago(f.at)}</td>
@@ -15101,6 +15101,15 @@ click to read this run's findings"
         <input type="checkbox" id="auAutoBox" ${_auMode==='auto'?'checked':''}
                onchange="auMode(this.checked?'auto':'manual')">
         <span>Replace wrong-language releases automatically</span></label>
+      <span class="dim" style="flex:1 0 100%;font-size:11px;margin:1px 0 0 24px">
+        When a file's audio is in <b>no language its library keeps</b>, nothing
+        can be re-encoded to fix it — the words are the wrong words — so the
+        only real remedy is a different release. With this on, Nuarr blocklists
+        that release and asks the arr for another one on its own, at most three
+        per cycle. It applies to that one rule and no other: every other
+        finding here is a build fault the planner can rewrite, and replacing
+        those would destroy a good file to fetch one with the same fault.
+      </span>
       <span class="dim" id="auModeMsg"></span>
       <span class="dim" style="margin-left:auto">${_auMode==='auto'
         ? '<b style="color:var(--warn)">on — a release with no audio you keep is '
@@ -15109,13 +15118,20 @@ click to read this run's findings"
     </div>
     ${auRows?`<div id="auScroll" style="overflow:auto;margin:6px 14px 0"><table style="width:100%;font-size:11.5px;
         border-collapse:collapse;table-layout:fixed">
-        <colgroup><col style="width:34%"><col style="width:10%">
-          <col style="width:27%"><col style="width:8%"><col style="width:13%">
-          <col style="width:8%"></colgroup>
+        <!-- THE SLACK GOES TO THE FINDING, not the file. It did go to the file
+             while that column held a release name; now it holds "The Lego
+             Movie" the slack became a hand's width of empty table, and the
+             comparison - the one cell whose whole job is to be read - was the
+             one being cut off. Everything else is a fixed, narrow fact packed
+             against the right edge, so Status sits beside When. -->
+        <colgroup><col style="width:330px"><col style="width:124px"><col>
+          <col style="width:96px"><col style="width:210px">
+          <col style="width:76px"></colgroup>
         <thead><tr>${[['path','File'],['rule','Rule'],['found','Found → should be'],
                       ['state','Status'],['',''],['at','When']].map(([k,h])=>
           `<th onclick="${k?`auSortBy('${k}')`:''}"
-             style="text-align:${k==='at'?'right':'left'};font-weight:600;
+             style="text-align:${(k==='at'||k==='state')?'right':'left'};
+             font-weight:600;
              padding:3px 10px 5px 0;position:sticky;top:0;
              background:var(--bg2,#12161c);${k?'cursor:pointer;user-select:none':''}"
              ${k?`title="sort by ${h.toLowerCase()}"`:''}
