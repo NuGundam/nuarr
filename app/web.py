@@ -21589,14 +21589,10 @@ async function loadOcr(){
            style="font-size:11.5px">loading…</span></div>
     </div>
 
-    <div class="lkind" style="padding:11px 12px;margin-top:10px">
-      <b style="color:#6fb0ff">Conversion scope</b>
-      <div style="font-size:11.5px;margin-top:2px;opacity:.85">Which subtitle tracks the reader is allowed to pick up.</div>
-      <div class="dim" style="font-size:11px;margin-top:4px">
-        Which tracks qualify — dialogue, SDH, forced — and for which
-        libraries, is a subtitle policy rather than a property of the engine.
-        <div style="margin-top:7px"><button onclick="wtab('lang')">Open Subtitles settings</button></div>
-      </div>
+    <div class="dim" style="font-size:11px;margin-top:10px">
+      Which tracks qualify — dialogue, SDH, forced — and for which libraries is
+      a subtitle policy rather than a property of the engine:
+      <a href="#" onclick="wtab('lang');return false">Subtitles</a>.
     </div>`;
   ocrUpdLoad();
   shapeLoad();
@@ -21619,7 +21615,11 @@ let _shapeSort={key:'at', dir:-1};
 
 function shapePaused(){
   const b=document.getElementById('shapeScroll');
-  return _shapeHover || (b && b.scrollTop>4);
+  // AN OPEN ROW PINS THE LIST. Reading a drop-down while the rows under it
+  // re-sort on every poll is the same problem the hover guard exists for, and
+  // hovering is not what you are doing while you read - the cursor is often
+  // nowhere near the table. A selected row means "I am looking at this one".
+  return _shapeOpen!==null || _shapeHover || (b && b.scrollTop>4);
 }
 function shapeSortBy(key){
   // Same column twice reverses it. New column starts descending for the
@@ -21701,35 +21701,40 @@ async function shapeDetail(id){
             shapeRender(); return; }
   if(_shapeOpen!==id) return;                 // another row was opened meanwhile
   const th=d.thresholds||{}, f=d.file||{};
+  // LABELLED LINES, NOT A TABLE. The first version used width:100% tables, so
+  // four short cells were stretched across the whole panel with a runway of
+  // empty space between them and a rule underneath - which is exactly the
+  // "line up" problem: nothing to line up WITH, because the columns had no
+  // relation to the columns of the table above. These are definition rows: a
+  // fixed label column, the value beside it, and the time on the right.
   const tracks=(d.tracks||[]).map(t=>{
-    const tall=(t.tall_share||0), verdict=t.typeset?'typeset signs':'dialogue';
-    return `<tr>
-      <td class="dim" style="padding:2px 12px 2px 0">track ${t.rel}</td>
-      <td style="padding:2px 12px 2px 0;color:${t.typeset?'#e2b341':'#6fd08c'}"
-        >${verdict}</td>
-      <td class="dim" style="padding:2px 12px 2px 0">${shapePct(tall)} of cues are
-        tall <span style="opacity:.6">(typeset at ${shapePct(th.tall_share)})</span></td>
-      <td class="dim" style="padding:2px 12px 2px 0">median height
-        ${shapePct(t.median_h)} <span style="opacity:.6">(tall means over
-        ${shapePct(th.tall_frac)})</span></td>
-      <td class="dim" style="padding:2px 0">${ago(t.at)}</td></tr>`;}).join('');
+    const tall=(t.tall_share||0);
+    return `<div class="sdrow">
+      <span class="sdk">track ${t.rel}</span>
+      <span style="color:${t.typeset?'#e2b341':'#6fd08c'};min-width:104px;
+                   display:inline-block">${t.typeset?'typeset signs':'dialogue'}</span>
+      <span class="sdv">${shapePct(tall)} of its cues are tall
+        <span class="dim">(typeset at ${shapePct(th.tall_share)})</span>
+        &nbsp;·&nbsp; median height ${shapePct(t.median_h)}
+        <span class="dim">(tall means over ${shapePct(th.tall_frac)})</span></span>
+      <span class="sdt">${ago(t.at)}</span></div>`;}).join('');
   const jobs=(d.jobs||[]).map(j=>{
     const when=j.finished_at||j.started_at||j.created_at;
     const col=j.state==='done'?'#6fd08c':j.state==='error'?'#e0575b'
              :j.state==='running'?'#6fb0ff':'var(--dim)';
-    return `<tr>
-      <td class="mono" style="padding:2px 12px 2px 0">${esc(j.kind||'')}</td>
-      <td style="padding:2px 12px 2px 0;color:${col}">${esc(j.state||'')}</td>
-      <td class="dim wrap" style="padding:2px 12px 2px 0">${esc(j.note||'—')}</td>
-      <td class="dim" style="padding:2px 0;white-space:nowrap">${ago(when)}</td>
-    </tr>`;}).join('');
+    return `<div class="sdrow">
+      <span class="sdk mono">${esc(j.kind||'')}</span>
+      <span style="color:${col};min-width:104px;display:inline-block"
+        >${esc(j.state||'')}</span>
+      <span class="sdv">${esc(j.note||'—')}</span>
+      <span class="sdt">${ago(when)}</span></div>`;}).join('');
   // WHY, IN THE ORDER A PERSON ASKS IT: what is true now, then what was
   // measured, then what has been tried. A rejection with no attempts behind it
   // means the OCR declined before running, which is a different fault from one
   // that ran and failed - and the table alone cannot say which.
   _shapeDetailHtml=`
-    <div style="padding:8px 10px;font-size:11.5px">
-      <div style="margin-bottom:6px">
+    <div class="sdrop">
+      <div style="margin-bottom:8px;font-size:13px">
         <b style="color:#6fb0ff">${esc(d.status||'')}</b>
         <span class="dim"> — ${esc(d.why||'')}</span>
         ${th.enabled===false?`<span class="pill p-warn" style="margin-left:8px"
@@ -21737,20 +21742,19 @@ async function shapeDetail(id){
         ${f.subocr_state==='rejected'?`<span class="pill p-warn"
           style="margin-left:8px">the reader returned too little usable text</span>`:''}
       </div>
-      ${f.state_reason?`<div class="dim" style="margin-bottom:6px">last note:
+      ${f.state_reason?`<div class="dim" style="margin-bottom:9px">last note:
         ${esc(f.state_reason)}</div>`:''}
-      <div class="dim" style="margin-bottom:3px">what was measured</div>
-      <table style="width:100%;font-size:11px;border-collapse:collapse;
-                    margin-bottom:8px">${tracks||
-        '<tr><td class="dim">nothing measured on this file</td></tr>'}</table>
-      <div class="dim" style="margin-bottom:3px">what has been attempted</div>
-      <table style="width:100%;font-size:11px;border-collapse:collapse">${jobs||
-        `<tr><td class="dim">nothing has been attempted yet — which is itself the
-         answer when a file looks stuck</td></tr>`}</table>
-      <div class="dim" style="margin-top:7px;font-size:10.5px;opacity:.7">
-        Signs are converted below ${th.signs_max_cpm} captions/min; a track with
-        ${th.dialogue_min_cues}+ cues counts as dialogue whatever it is called.
-        ${esc(f.path||'')}
+      <div class="sdh">What was measured</div>
+      ${tracks||'<div class="sdrow dim">nothing measured on this file</div>'}
+      <div class="sdh" style="margin-top:9px">What has been attempted</div>
+      ${jobs||`<div class="sdrow dim">nothing has been attempted yet — which is
+        itself the answer when a file looks stuck</div>`}
+      <div class="dim" style="margin-top:10px;font-size:11px">
+        Signs are converted below ${th.signs_max_cpm} captions per minute; a
+        track with ${th.dialogue_min_cues}+ cues counts as dialogue whatever it
+        is called.
+        <div class="mono" style="margin-top:3px;opacity:.65;word-break:break-all"
+          >${esc(f.path||'')}</div>
       </div>
     </div>`;
   shapeRender();
@@ -21796,7 +21800,7 @@ function shapeRender(){
   // space before them; percentages share the width out instead, and the title
   // still gets the largest share because it is the only variable-length one.
   el.innerHTML=`
-    <div id="shapeScroll" style="max-height:260px;overflow:auto;margin-top:4px"
+    <div id="shapeScroll" style="max-height:min(58vh,620px);overflow:auto;margin-top:4px"
          onmouseenter="_shapeHover=true" onmouseleave="_shapeHover=false">
       <table style="width:100%;font-size:11.5px;border-collapse:collapse;table-layout:fixed">
         <colgroup><col style="width:23%"><col style="width:8%"><col style="width:6%">
@@ -26772,6 +26776,19 @@ _SETTINGS_CSS = """
   font-size:12.5px;cursor:pointer;border-bottom:1px solid var(--line)}
 .pickrow:last-child{border-bottom:0}
 .pickrow:hover{background:rgba(88,166,255,.10)}
+/* Signs-or-dialogue drop-down: bigger than the table it hangs under, because
+   it is prose you read rather than a grid you scan, and a fixed label column
+   so the lines actually line up with each other. */
+.sdrop{padding:11px 13px;font-size:12.5px;line-height:1.55;
+  background:rgba(255,255,255,.02);border-left:2px solid #6fb0ff}
+.sdh{font-size:10.5px;text-transform:uppercase;letter-spacing:.07em;
+  opacity:.55;margin-bottom:3px}
+.sdrow{padding:3px 0;display:flex;gap:10px;align-items:baseline;
+  border-bottom:1px solid rgba(255,255,255,.05)}
+.sdrow:last-child{border-bottom:0}
+.sdk{min-width:96px;flex:0 0 auto;opacity:.7}
+.sdv{flex:1;min-width:0;word-break:break-word}
+.sdt{flex:0 0 auto;opacity:.55;white-space:nowrap}
 /* Languages pane */
 #langPane .lkind{border:1px solid var(--line);border-radius:8px;margin-top:10px}
 #langPane .lkindhead{padding:7px 12px;border-bottom:1px solid var(--line);
