@@ -9806,6 +9806,11 @@ button[disabled]{opacity:.5;cursor:default}
    scan; twenty-five rows of two do not. */
 .auwrap{padding:3px 10px 3px 0;white-space:nowrap;overflow:hidden;
   text-overflow:ellipsis;line-height:1.4}
+/* The title is the one thing that may run past its share, and cutting a title
+   off is worse than a second line: "The Strongest Magician in the Demon
+   Lord's Army Was..." tells you nothing an ellipsis was hiding. It wraps; the
+   finding beside it does not need to, having been shortened at the source. */
+#auScroll td.auwrap:first-child{white-space:normal;overflow-wrap:anywhere}
 #auScroll .pill.p-ok{color:var(--fx-ok);border-color:var(--fx-okline)}
 #auScroll .pill.p-bad{color:var(--fx-bad);border-color:var(--fx-badline)}
 #auScroll .dim{color:var(--fx-dim);opacity:.85}
@@ -15140,9 +15145,15 @@ click to read this run's findings"
              200px of nothing on a fixed one - which, on a list that is mostly
              fixed rows, was the hole between Status and When. It is only laid
              out when a shown row actually has a button in it. -->
-        <colgroup><col style="width:300px"><col style="width:120px"><col>
-          <col style="width:90px"><col style="width:${auHasAct?200:0}px">
-          <col style="width:72px"></colgroup>
+        <!-- SHARES OF THE WIDTH, NOT PIXELS. Fixed pixels left the finding
+             column with everything the others did not take, which on a wide
+             panel was a runway of empty space, while a 300px title column cut
+             the longest show names. Title gets the biggest share because it is
+             the only cell whose length really varies; the rest are sized to
+             the longest thing that actually appears in them. -->
+        <colgroup><col style="width:${auHasAct?'27%':'32%'}"><col style="width:9%">
+          <col style="width:${auHasAct?'38%':'44%'}"><col style="width:7%">
+          <col style="width:${auHasAct?'12%':'0'}"><col style="width:7%"></colgroup>
         <thead><tr>${[['path','Title'],['rule','Rule'],['found','Found → should be'],
                       ['state','Status'],['',''],['at','When']].map(([k,h])=>
           `<th onclick="${k?`auSortBy('${k}')`:''}"
