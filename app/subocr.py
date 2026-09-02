@@ -874,6 +874,23 @@ def typeset_rels(file_id: int) -> set:
         return set()
 
 
+def role_of(title: str, forced: bool = False) -> str:
+    """dialogue / sdh / signs / forced, from a track title.
+
+    ONE DEFINITION, used by the picker that decides what to read and by the
+    muxer that decides what to replace. They had separate copies, and the gap
+    between them is the loop described at embed().
+    """
+    t = title or ""
+    if re.search(r"\bsdh\b|hearing.?impaired|\bcc\b", t, re.I):
+        return "sdh"
+    if SIGNS_RE.search(t):
+        return "signs"
+    if forced:
+        return "forced"
+    return "dialogue"
+
+
 def select_targets(probe: dict, library: str | None = None) -> list[dict]:
     """Every English image sub worth converting, in stream order.
 
@@ -895,9 +912,6 @@ def select_targets(probe: dict, library: str | None = None) -> list[dict]:
     # actually want in a noisy room. Roles are converted independently, so each
     # one is compared only against text of its OWN role.
     def _role(s: dict) -> str:
-        t = _title(s)
-        if re.search(r"\bsdh\b|hearing.?impaired|\bcc\b", t, re.I):
-            return "sdh"
         # FORCED IS NOT SIGNS, and lumping them together cost the forced
         # tracks their own decision. Typeset signs are ARTWORK - positioned,
         # styled, sometimes rotated to match a shop front - and OCR cannot
@@ -905,12 +919,8 @@ def select_targets(probe: dict, library: str | None = None) -> list[dict]:
         # converted. A forced track is ordinary dialogue: the lines spoken in
         # another language, plain text at the bottom of the screen, which
         # reads back perfectly. Same disposition bit, completely different
-        # content.
-        if SIGNS_RE.search(t):
-            return "signs"
-        if (s.get("disposition") or {}).get("forced"):
-            return "forced"
-        return "dialogue"
+        # content. (The classifier itself is role_of(), shared with embed().)
+        return role_of(_title(s), bool((s.get("disposition") or {}).get("forced")))
 
     have_text = {_role(s) for s in subs
                  if (s.get("codec_name") or "").lower() in TEXT_CODECS
@@ -1310,11 +1320,26 @@ def embed(src: str, subs: list[tuple[str, str]], dst: str,
         return "PGS" in c or "VOBSUB" in c or "DVBSUB" in c
 
     args = [_mkvmerge(), "--quiet", "-o", dst]
-    # REPLACE, DO NOT ACCUMULATE. Anything this program OCR'd before is
-    # dropped so the pass about to run is the only one in the file - see
-    # is_ocr_track(). The picture track it came from is untouched, so the
-    # conversion can always be done again.
-    stale = [t["id"] for t in src_tracks if is_ocr_track(t)] if drop_old_ocr else []
+    # REPLACE THE SAME ROLE, KEEP THE OTHERS. This dropped EVERY earlier OCR
+    # track, on the reasoning that the pass about to run should be the only
+    # one in the file - and that reasoning built a loop that ran twelve times
+    # on one episode of Parasyte in a night:
+    #
+    #   pass 1  reads the Dialogue PGS       -> "Dialogue (OCR)" embedded
+    #   sweep   dialogue has text, SDH does not -> reads the SDH PGS
+    #   pass 2  embeds "Dialogue (SDH) (OCR)"  AND DROPS "Dialogue (OCR)"
+    #   sweep   SDH has text, dialogue does not -> reads the Dialogue PGS
+    #   pass 3  embeds it AND DROPS THE SDH ONE  ... forever
+    #
+    # The picker was right every time - a role genuinely lacked text - and
+    # the muxer undid the previous pass every time. Each earlier OCR track is
+    # now dropped only if THIS pass carries a replacement for its role;
+    # one it does not replace is exactly the work the last pass did, and stays.
+    new_roles = {role_of(name) for _srt, name in subs}
+    stale = [t["id"] for t in src_tracks
+             if is_ocr_track(t)
+             and role_of(str((t.get("properties") or {}).get("track_name") or ""))
+             in new_roles] if drop_old_ocr else []
     if stale:
         args += ["-s", "!" + ",".join(str(i) for i in stale)]
     for t in src_tracks:
