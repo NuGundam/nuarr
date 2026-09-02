@@ -21613,6 +21613,19 @@ let _shapeTimer=null, _shapeRows=[], _shapeHover=false, _shapeDone=false,
     _shapeDoneHidden=0;
 let _shapeSort={key:'at', dir:-1};
 
+// AN EXPLICIT ACTION OUTRANKS THE PAUSE. This used to be
+// `_shapeDone=false;shapeLoad()`, and shapeLoad only repaints when the panel
+// is not held - so with a row open, or the list scrolled down, or the cursor
+// resting on the table, "hide them" fetched the right rows and drew nothing.
+// Clicking a link is a statement that you want the list to change under you.
+function shapeShowDone(on){
+  _shapeDone=!!on;
+  _shapeOpen=null; _shapeDetailHtml='';   // the open row may be one being hidden
+  const b=document.getElementById('shapeScroll');
+  if(b) b.scrollTop=0;
+  _shapeHover=false;
+  shapeLoad(true);
+}
 function shapePaused(){
   const b=document.getElementById('shapeScroll');
   // AN OPEN ROW PINS THE LIST. Reading a drop-down while the rows under it
@@ -21843,7 +21856,7 @@ async function shapeRun(){
   }catch(e){ if(el) el.textContent=' could not start'; return; }
   shapeLoad();
 }
-async function shapeLoad(){
+async function shapeLoad(force){
   const el=document.getElementById('shapeBody');
   if(!el){ if(_shapeTimer) clearTimeout(_shapeTimer); _shapeTimer=null; return; }
   let d;
@@ -22041,11 +22054,12 @@ async function shapeLoad(){
   // listing narrows, and this line says what it is not showing.
   const doneToggle = (_shapeDone || _shapeDoneHidden)
     ? `<div class="dim" style="font-size:11px;margin-top:4px">${_shapeDone
-        ? `showing finished rows too · <span class="lnk"
-             onclick="_shapeDone=false;shapeLoad()">hide them</span>`
-        : `${fmt(_shapeDoneHidden)} finished row${_shapeDoneHidden===1?'':'s'}
-           hidden · <span class="lnk"
-             onclick="_shapeDone=true;shapeLoad()">show them</span>`}</div>`
+        ? `showing settled rows too · <span class="lnk"
+             onclick="shapeShowDone(false)">hide them</span>`
+        : `${fmt(_shapeDoneHidden)} settled row${_shapeDoneHidden===1?'':'s'}
+           hidden <span class="dim">(converted or rejected)</span> ·
+           <span class="lnk"
+             onclick="shapeShowDone(true)">show them</span>`}</div>`
     : '';
   document.getElementById('shapeHead').innerHTML=head+counts;
   if(!rows.length){
@@ -22058,7 +22072,7 @@ async function shapeLoad(){
       + `<div id="shapeDoneLine">${doneToggle}</div>`;
   }else{
     _shapeRows=rows;
-    if(!held) shapeRender();
+    if(force || !held) shapeRender();
     let t=document.getElementById('shapeDoneLine');
     if(!t && doneToggle){
       t=document.createElement('div'); t.id='shapeDoneLine';

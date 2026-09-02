@@ -3080,7 +3080,19 @@ def shape_rows(limit: int = 60, include_done: bool = True) -> dict:
                 rows.append(d)
             _annotate_status(cur, rows)
             if not include_done:
-                shown = [r for r in rows if r.get("status") != "done"]
+                # SETTLED, NOT MERELY FINISHED. A rejection is as finished as a
+                # success - the reader ran, gave its verdict, and nothing will
+                # revisit the file until something changes. Hiding only 'done'
+                # left 68 rejected rows filling the window, which is the same
+                # complaint one step along: the list should hold what still
+                # wants an answer. Both kinds are counted together, because
+                # they are one pile from where the reader stands.
+                def _settled(r) -> bool:
+                    if r.get("status") == "done":
+                        return True
+                    return (r.get("status") == "held"
+                            and "rejected" in (r.get("status_why") or ""))
+                shown = [r for r in rows if not _settled(r)]
                 summary["done_hidden"] = len(rows) - len(shown)
                 rows = shown[:int(limit)]
     except Exception:                                        # noqa: BLE001
