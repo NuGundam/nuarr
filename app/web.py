@@ -2089,7 +2089,8 @@ def api_codecpolicy_reset(library: str = "", side: str = "", key: str = ""):
     return {"ok": True, "policy": pol}
 
 
-def _langpolicy_impact(old: dict, new: dict) -> dict:
+def _langpolicy_impact(old: dict, new: dict,
+                       only_library: str | None = None) -> dict:
     """Files whose KEPT TRACKS differ between two policies.
 
     A DIFF, not a census. The first version of this counted every file whose
@@ -2109,13 +2110,20 @@ def _langpolicy_impact(old: dict, new: dict) -> dict:
     listed: list[dict] = []
     checked = 0
     with cursor() as cur:
-        rows = cur.execute(
-            "SELECT f.id,f.path,f.title,f.season,f.episode,f.library,f.size,"
-            "       p.lang,fp.json "
-            "  FROM files f JOIN file_probes fp ON fp.file_id=f.id "
-            "  LEFT JOIN parent_lang p ON p.parent_id=f.arr_parent_id "
-            "       AND p.arr_name=f.arr_name "
-            " WHERE f.state='done'").fetchall()
+        # SCOPED WHEN ASKED. The Save button lives inside each library block
+        # now, and a preview that counted the whole pool under a heading naming
+        # one library would be the same mismatch that page just escaped.
+        q = ("SELECT f.id,f.path,f.title,f.season,f.episode,f.library,f.size,"
+             "       p.lang,fp.json "
+             "  FROM files f JOIN file_probes fp ON fp.file_id=f.id "
+             "  LEFT JOIN parent_lang p ON p.parent_id=f.arr_parent_id "
+             "       AND p.arr_name=f.arr_name "
+             " WHERE f.state='done'")
+        args: tuple = ()
+        if only_library:
+            q += " AND f.library=?"
+            args = (only_library,)
+        rows = cur.execute(q, args).fetchall()
 
     def _langs(info: dict, kind: str, idxs) -> list[str]:
         want = "audio" if kind == "audio" else "subtitle"
@@ -2181,7 +2189,7 @@ _LANG_LAST_IMPACT: dict = {"ids": [], "at": 0.0}
 
 
 @app.post("/api/langpolicy/preview")
-async def api_langpolicy_preview(body: dict = Body(...)):
+async def api_langpolicy_preview(body: dict = Body(...), library: str = ""):
     r"""What this policy WOULD change. Stores nothing.
 
     Split out from the save so the sequence is look, then decide, then act.
@@ -2195,12 +2203,13 @@ async def api_langpolicy_preview(body: dict = Body(...)):
     # is of the thing that would actually be stored rather than of raw form
     # input. "ENG " and "eng" must not preview differently from each other.
     proposed = langpolicy.normalise(body or {}, base=before)
-    impact = await asyncio.to_thread(_langpolicy_impact, before, proposed)
+    impact = await asyncio.to_thread(_langpolicy_impact, before, proposed,
+                                     library.strip() or None)
     return {"policy": proposed, **impact}
 
 
 @app.post("/api/langpolicy")
-async def api_langpolicy_save(body: dict = Body(...)):
+async def api_langpolicy_save(body: dict = Body(...), library: str = ""):
     from . import langpolicy
     before = langpolicy.load()          # what the planner used until now
     saved = langpolicy.save(body or {})
@@ -2213,9 +2222,11 @@ async def api_langpolicy_save(body: dict = Body(...)):
                    f"{'+orig ' if sides['audio']['keep_original'] else ''}"
                    f"{','.join(sides['audio']['langs']) or 'none'}"
                    for name, sides in saved.items()), "info")
-    impact = await asyncio.to_thread(_langpolicy_impact, before, saved)
+    impact = await asyncio.to_thread(_langpolicy_impact, before, saved,
+                                     library.strip() or None)
     # Held so the Queue button acts on the SET THAT WAS SHOWN, not on a fresh
-    # scan that might differ if something changed in between.
+    # scan that might differ if something changed in between - and scoped the
+    # same way the counts were, so a per-library save queues that library.
     _LANG_LAST_IMPACT.update(ids=impact.pop("ids", []), at=time.time())
     return {"policy": saved, **impact}
 
@@ -18986,7 +18997,7 @@ function wtab(which){
     if(hint) hint.textContent='· audio titles';
     _atOpen=true;
     paneLoad('acodec', loadCodecTab, 'audio');
-    loadAudioTitle();
+    loadAudioTitle(); langAudioLoad();
     setTimeout(()=>{
       const c=document.getElementById('atBody');
       if(!c) return;
@@ -19005,7 +19016,7 @@ function wtab(which){
     // The title check belongs beside the settings that caused the mismatch:
     // this page decides what tracks are converted TO, and the title is what
     // the picker will then claim they are.
-    if(side==='audio') loadAudioTitle();
+    if(side==='audio'){ loadAudioTitle(); langAudioLoad(); }
     return;
   }
   if(which==='libs' || intent==='arrgap'){
@@ -20715,48 +20726,9 @@ async function loadLangTab(){
       el.innerHTML=`<div class="err">could not load: ${esc(String(e))}</div>`; return; }
     _langLoading=false;
   }
-  const iso=_lang.iso||[], pol=_lang.policy||{};
-  const name=c=>{ const h=iso.find(x=>x.c===c); return h?h.n:c; };
-
-  const block=(lib,side,sideLabel)=>{
-    const cfg=(pol[lib]||{})[side]||{};
-    const chosen=new Set(cfg.langs||[]);
-    // Counts are for THIS library, not the whole pool: a Japanese total driven
-    // by the anime shelf is noise when you are looking at Movies.
-    const here=Object.entries(((_lang.present||{})[lib]||{})[side]||{})
-      .sort((a,b)=>b[1]-a[1]).filter(([c])=>c!=='und').slice(0,12);
-    const chips=here.map(([c,n])=>`
-      <label class="lchip${chosen.has(c)?' on':''}">
-        <input type="checkbox" ${chosen.has(c)?'checked':''}
-               onchange="langToggle('${esc(lib)}','${side}','${c}',this.checked)">
-        ${esc(name(c))} <span class="dim">${fmt(n)}</span></label>`).join('');
-    const extra=[...chosen].filter(c=>!here.some(([cc])=>cc===c));
-    return `<div class="lblock">
-      <div class="lhead">${esc(sideLabel)}</div>
-      <label class="lorig">
-        <input type="checkbox" ${cfg.keep_original?'checked':''}
-               onchange="langToggle('${esc(lib)}','${side}','__orig__',this.checked)">
-        <b>Keep the original language</b>
-        <span class="dim">— whatever this title was made in, per TMDB/TheTVDB</span>
-      </label>
-      ${side==='subs'?`<label class="lorig">
-        <input type="checkbox" ${cfg.keep_untagged?'checked':''}
-               onchange="langToggle('${esc(lib)}','${side}','__untagged__',this.checked)">
-        Keep untagged tracks
-        <span class="dim">— many releases leave subs unlabelled</span></label>`:''}
-      <div class="lchips">${chips||'<span class="dim" style="font-size:11px">no '
-        +esc(sideLabel.toLowerCase())+' tracks scanned in this library yet</span>'}</div>
-      ${extra.length?`<div class="dim" style="font-size:11px;margin-top:5px">also kept:
-        ${extra.map(c=>`<span class="lchip on" onclick="langToggle('${esc(lib)}','${side}','${c}',false)"
-          title="click to remove">${esc(name(c))} ×</span>`).join(' ')}</div>`:''}
-      <div style="margin-top:6px">
-        <select onchange="if(this.value){langToggle('${esc(lib)}','${side}',this.value,true);this.value='';}">
-          <option value="">add another language…</option>
-          ${iso.map(x=>`<option value="${x.c}">${esc(x.n)} (${x.c})</option>`).join('')}
-        </select>
-      </div>
-    </div>`;
-  };
+  const pol=_lang.policy||{};
+  /* the block renderer moved to langBlockHtml(), shared with the Audio codec
+     page - see the note on that function */
 
   const libs=_lang.libraries||[];
   // COLLAPSED BY DEFAULT, like the codec pages. Six libraries of language
@@ -20776,23 +20748,187 @@ async function loadLangTab(){
         <span class="ccaret">${open?'▾':'▸'}</span>
         <span class="clib">${esc(L.name)}</span>
         <span class="dim">defaults for ${esc(L.kind_label.toLowerCase())}</span>
-        <span class="dim" style="margin-left:auto">audio ${kept('audio')} ·
-          subtitles ${kept('subs')} · ${
-          fmt(Object.values(((_lang.present||{})[L.name]||{}).audio||{})
-              .reduce((a,b)=>a+b,0))} audio tracks scanned</span></div>
-      ${open?`<div class="lcols">${block(L.name,'audio','Audio')}
-                         ${block(L.name,'subs','Subtitles')}</div>
+        <span class="dim" style="margin-left:auto">subtitles ${kept('subs')} · ${
+          fmt(Object.values(((_lang.present||{})[L.name]||{}).subs||{})
+              .reduce((a,b)=>a+b,0))} subtitle tracks scanned</span></div>
+      ${open?`<div class="lcols">${langBlockHtml(L.name,'subs','Subtitles')}</div>
+              ${langStripHtml(L.name,'subs')}
               <div id="soc_${cssId(L.name)}" class="socbox"></div>`:''}
     </div>`;}).join('')
     : '<div class="dim">no libraries configured</div>')
-    + `<div style="margin-top:12px;display:flex;align-items:center;gap:10px">
-        <button onclick="langSave()">Save policy</button>
-        <span id="langMsg" class="dim" style="font-size:11.5px">${
-          _langDirty?'unsaved changes':'the planner is using this now'}</span>
-       </div>
-       <div id="langImpact" style="margin-top:8px"></div>
-       `;
+    + `<div class="dim" style="margin-top:12px;font-size:11px">
+        Each library saves itself — the Save policy button inside a block
+        previews and commits that library. Audio language rules moved to
+        <a href="#" onclick="wtab('acodec');return false">Settings →
+        Audio codec</a>, beside the codecs they travel with.</div>`;
   langSignsLoad();
+}
+
+// EXTRACTED so two pages can draw the same block: the Subtitles page draws
+// side='subs', the Audio codec page draws side='audio'. One renderer, one
+// toggle handler, one save flow - the alternative was two copies that drift.
+function langBlockHtml(lib, side, sideLabel){
+  const iso=_lang.iso||[], pol=_lang.policy||{};
+  const name=c=>{ const h=iso.find(x=>x.c===c); return h?h.n:c; };
+  const cfg=(pol[lib]||{})[side]||{};
+  const chosen=new Set(cfg.langs||[]);
+  // Counts are for THIS library, not the whole pool: a Japanese total driven
+  // by the anime shelf is noise when you are looking at Movies.
+  const here=Object.entries(((_lang.present||{})[lib]||{})[side]||{})
+    .sort((a,b)=>b[1]-a[1]).filter(([c])=>c!=='und').slice(0,12);
+  const chips=here.map(([c,n])=>`
+    <label class="lchip${chosen.has(c)?' on':''}">
+      <input type="checkbox" ${chosen.has(c)?'checked':''}
+             onchange="langToggle('${esc(lib)}','${side}','${c}',this.checked)">
+      ${esc(name(c))} <span class="dim">${fmt(n)}</span></label>`).join('');
+  const extra=[...chosen].filter(c=>!here.some(([cc])=>cc===c));
+  return `<div class="lblock">
+    <div class="lhead">${esc(sideLabel)}</div>
+    <label class="lorig">
+      <input type="checkbox" ${cfg.keep_original?'checked':''}
+             onchange="langToggle('${esc(lib)}','${side}','__orig__',this.checked)">
+      <b>Keep the original language</b>
+      <span class="dim">— whatever this title was made in, per TMDB/TheTVDB</span>
+    </label>
+    ${side==='subs'?`<label class="lorig">
+      <input type="checkbox" ${cfg.keep_untagged?'checked':''}
+             onchange="langToggle('${esc(lib)}','${side}','__untagged__',this.checked)">
+      Keep untagged tracks
+      <span class="dim">— many releases leave subs unlabelled</span></label>`:''}
+    <div class="lchips">${chips||'<span class="dim" style="font-size:11px">no '
+      +esc(sideLabel.toLowerCase())+' tracks scanned in this library yet</span>'}</div>
+    ${extra.length?`<div class="dim" style="font-size:11px;margin-top:5px">also kept:
+      ${extra.map(c=>`<span class="lchip on" onclick="langToggle('${esc(lib)}','${side}','${c}',false)"
+        title="click to remove">${esc(name(c))} ×</span>`).join(' ')}</div>`:''}
+    <div style="margin-top:6px">
+      <select onchange="if(this.value){langToggle('${esc(lib)}','${side}',this.value,true);this.value='';}">
+        <option value="">add another language…</option>
+        ${iso.map(x=>`<option value="${x.c}">${esc(x.n)} (${x.c})</option>`).join('')}
+      </select>
+    </div>
+  </div>`;
+}
+
+// THE SAVE LIVES WITH THE THING IT SAVES. One global "Save policy" at the foot
+// of six library blocks was the confusion Erik reported twice over: it sat
+// beside switches it did not govern, and its preview counted the whole pool
+// under no heading. Each block carries its own strip now, scoped to itself.
+function langStripHtml(lib, side){
+  const k=cssId(lib)+'_'+side;
+  return `<div style="margin-top:8px;display:flex;gap:8px;align-items:center">
+      <button onclick="langLibSave('${b64e(lib)}','${side}')">Save policy</button>
+      <span id="lmsg_${k}" class="dim" style="font-size:11.5px">${
+        _langDirty?'unsaved changes':'the planner is using this now'}</span>
+    </div>
+    <div id="lip_${k}" style="margin-top:6px"></div>`;
+}
+async function langLibSave(lib64, side){
+  const lib=b64d(lib64), k=cssId(lib)+'_'+side;
+  const m=document.getElementById('lmsg_'+k), box=document.getElementById('lip_'+k);
+  if(m) m.innerHTML='<span class="busy"><span class="sp"></span>'
+    +'<span class="step">checking what this would change…</span></span>';
+  let r;
+  try{
+    r=await (await fetch('/api/langpolicy/preview?library='+encodeURIComponent(lib),
+      {method:'POST', headers:{'Content-Type':'application/json'},
+       body:JSON.stringify(_lang.policy)})).json();
+  }catch(e){ if(m) m.textContent='could not check'; return; }
+  if(m) m.textContent='nothing saved yet';
+  if(!box) return;
+  const head = r.affected
+    ? `<b>${fmt(r.affected)}</b> file(s) in ${esc(lib)} would be planned
+       differently <span class="dim">(of ${fmt(r.checked)} checked here)</span>`
+    : `<b>No file in ${esc(lib)}</b> would be planned differently
+       <span class="dim">(of ${fmt(r.checked)} checked here)</span>`;
+  box.innerHTML=`<div class="pinhead">${head}
+      <button style="margin-left:10px" onclick="langLibCommit('${lib64}','${side}')"
+        >Continue — save this policy</button>
+      <button style="margin-left:6px" onclick="langLibCancel('${lib64}','${side}')">Cancel</button>
+      <div class="dim" style="font-size:11px;margin-top:4px">Nothing has been
+        saved. Saving stores the whole language policy - if you have unsaved
+        edits open in another library, they go with it. Counted from stored
+        probes, so a file rewritten since its last scan may differ.</div>
+      </div>${langImpactList(r)}`;
+}
+async function langLibCommit(lib64, side){
+  const lib=b64d(lib64), k=cssId(lib)+'_'+side;
+  const m=document.getElementById('lmsg_'+k), box=document.getElementById('lip_'+k);
+  if(m) m.innerHTML='<span class="busy"><span class="sp"></span>'
+    +'<span class="step">saving…</span></span>';
+  let r;
+  try{
+    setTimeout(rulesStale, 0);   // the Rules page quotes these rows
+    r=await (await fetch('/api/langpolicy?library='+encodeURIComponent(lib),
+      {method:'POST', headers:{'Content-Type':'application/json'},
+       body:JSON.stringify(_lang.policy)})).json();
+  }catch(e){ if(m) m.textContent='save failed'; return; }
+  _lang.policy=r.policy; _langDirty=false;
+  if(m) m.textContent='saved — the planner is using this now';
+  if(!box) return;
+  box.innerHTML = r.affected
+    ? `<div class="pinhead">Saved. <b>${fmt(r.affected)}</b> file(s) in
+         ${esc(lib)} are now planned differently
+         <button style="margin-left:10px" onclick="langRequeue('lip_${k}')">Queue them</button>
+         <div class="dim" style="font-size:11px;margin-top:4px">They keep their
+           current tracks until they are reprocessed. Anything the queue picks
+           up for another reason will already use this policy.</div></div>`
+       + langImpactList(r)
+    : `<div class="dim" style="font-size:11.5px">Saved. No file in ${esc(lib)}
+         plans differently under this policy.</div>`;
+}
+async function langLibCancel(lib64, side){
+  // Throw away the edits and re-read what is stored, so Cancel means "as it
+  // is on the server" rather than "as I last rendered it".
+  _lang=null; _langDirty=false;
+  if(side==='audio'){ await langAudioLoad(); }
+  else { const box=document.getElementById('lip_'+cssId(b64d(lib64))+'_'+side);
+         if(box) box.innerHTML=''; await loadLangTab(); }
+}
+async function langRequeue(boxId){
+  const box=document.getElementById(boxId||'');
+  if(box) box.innerHTML='<span class="busy"><span class="sp"></span>'
+    +'<span class="step">queueing…</span></span>';
+  try{
+    const r=await (await fetch('/api/langpolicy/requeue',{method:'POST'})).json();
+    if(box) box.innerHTML=`<div class="pinhead">queued <b>${fmt(r.queued)}</b>
+      of ${fmt(r.considered)} file(s)</div>`;
+  }catch(e){ if(box) box.textContent='requeue failed'; }
+}
+
+// ---- the audio half, now living on the Audio codec page --------------------
+const _alangOpen = new Set();
+function alangToggle_open(lib){
+  _alangOpen.has(lib) ? _alangOpen.delete(lib) : _alangOpen.add(lib);
+  langAudioLoad();
+}
+async function langAudioLoad(){
+  const el=document.getElementById('alangBody');
+  if(!el) return;
+  if(!_lang){
+    el.innerHTML='<div class="skel" style="padding:4px 0"><i style="width:44%"></i>'
+      +'<i style="width:82%"></i><i style="width:60%"></i></div>';
+    try{ _lang=await (await fetch('/api/langpolicy')).json(); }
+    catch(e){ el.innerHTML='<div class="dim">could not load</div>'; return; }
+  }
+  const pol=_lang.policy||{}, libs=_lang.libraries||[];
+  el.innerHTML = libs.length ? libs.map(L=>{
+    const open=_alangOpen.has(L.name);
+    const c=((pol[L.name]||{}).audio)||{};
+    const kept=(c.langs||[]).length + (c.keep_original?' + original':'');
+    const scanned=fmt(Object.values(((_lang.present||{})[L.name]||{}).audio||{})
+        .reduce((a,b)=>a+b,0));
+    return `<div class="lkind${open?' lopen':''}">
+      <div class="lkindhead ckhead" onclick="alangToggle_open('${esc(L.name)}')"
+           title="${open?'collapse':'expand'} ${esc(L.name)}">
+        <span class="ccaret">${open?'▾':'▸'}</span>
+        <span class="clib">${esc(L.name)}</span>
+        <span class="dim">defaults for ${esc(L.kind_label.toLowerCase())}</span>
+        <span class="dim" style="margin-left:auto">audio ${kept} ·
+          ${scanned} audio tracks scanned</span></div>
+      ${open?`<div class="lcols">${langBlockHtml(L.name,'audio','Audio')}</div>
+              ${langStripHtml(L.name,'audio')}`:''}
+    </div>`;}).join('')
+    : '<div class="dim">no libraries configured</div>';
 }
 
 // EVERY SUBTITLE DECISION LIVES ON THIS PAGE, AND PER LIBRARY. Reading image
@@ -24406,7 +24542,10 @@ function langToggle(lib,side,code,on){
     cfg.langs=[...s].sort();
   }
   _langDirty=true;
-  loadLangTab();
+  // Re-render whichever surface hosts this block - the subtitle page, the
+  // audio card on the codec page, or both if both are somehow alive.
+  if(document.getElementById('langBody')) loadLangTab();
+  if(document.getElementById('alangBody')) langAudioLoad();
 }
 // LOOK, THEN DECIDE, THEN ACT.
 //
@@ -24432,79 +24571,7 @@ function langImpactList(r){
     ${r.affected>shown?`<div class="dim" style="font-size:11px;margin-top:4px">
         showing the first ${fmt(shown)} of ${fmt(r.affected)}</div>`:''}`;
 }
-async function langSave(){
-  const m=document.getElementById('langMsg'), box=document.getElementById('langImpact');
-  if(m) m.innerHTML='<span class="busy"><span class="sp"></span>'
-    +'<span class="step">checking what this would change…</span></span>';
-  let r;
-  try{
-    r=await (await fetch('/api/langpolicy/preview',{method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify(_lang.policy)})).json();
-  }catch(e){ if(m) m.textContent='could not check'; return; }
-  if(m) m.textContent='nothing saved yet';
-  if(!box) return;
-  // NAMED SCOPE, because this preview sits on a page with a second, instant-
-  // save block below it. "Nothing will change" with no subject read as the
-  // verdict on whatever the person touched last - including an OCR switch
-  // this preview knows nothing about.
-  const head = r.affected
-    ? `Language rules: <b>${fmt(r.affected)}</b> existing file(s) would be
-       planned differently
-       <span class="dim">(of ${fmt(r.checked)} checked)</span>`
-    : `Language rules: <b>no existing file</b> would be planned differently
-       <span class="dim">(of ${fmt(r.checked)} checked — the OCR switches
-       below save separately, on click)</span>`;
-  box.innerHTML=`<div class="pinhead">${head}
-      <button style="margin-left:10px" onclick="langCommit()">Continue — save this policy</button>
-      <button style="margin-left:6px" onclick="langCancel()">Cancel</button>
-      <div class="dim" style="font-size:11px;margin-top:4px">Nothing has been saved.
-        Counted from stored probes, so a file rewritten since its last scan may
-        differ.</div></div>${langImpactList(r)}`;
-}
-async function langCommit(){
-  const m=document.getElementById('langMsg'), box=document.getElementById('langImpact');
-  if(m) m.innerHTML='<span class="busy"><span class="sp"></span>'
-    +'<span class="step">saving…</span></span>';
-  let r;
-  try{
-    // language policy feeds the Rules page's audio/subtitle rows
-    setTimeout(rulesStale, 0);
-    r=await (await fetch('/api/langpolicy',{method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify(_lang.policy)})).json();
-  }catch(e){ if(m) m.textContent='save failed'; return; }
-  _lang.policy=r.policy; _langDirty=false;
-  if(m) m.textContent='saved — the planner is using this now';
-  if(!box) return;
-  box.innerHTML = r.affected
-    ? `<div class="pinhead">Saved. <b>${fmt(r.affected)}</b> existing file(s) are
-         now planned differently
-         <button style="margin-left:10px" onclick="langRequeue()">Queue them</button>
-         <div class="dim" style="font-size:11px;margin-top:4px">They keep their
-           current tracks until they are reprocessed. Anything the queue picks up
-           for another reason will already use this policy.</div></div>`
-       + langImpactList(r)
-    : `<div class="dim" style="font-size:11.5px">Saved. No existing file plans
-         differently under this policy.</div>`;
-}
-async function langCancel(){
-  // Throw away the edits and re-read what is actually stored, so Cancel means
-  // "as it is on the server" rather than "as I last rendered it".
-  _lang=null; _langDirty=false;
-  const box=document.getElementById('langImpact'); if(box) box.innerHTML='';
-  await loadLangTab();
-}
-async function langRequeue(){
-  const box=document.getElementById('langImpact');
-  if(box) box.innerHTML='<span class="busy"><span class="sp"></span>'
-    +'<span class="step">queueing…</span></span>';
-  try{
-    const r=await (await fetch('/api/langpolicy/requeue',{method:'POST'})).json();
-    if(box) box.innerHTML=`<div class="pinhead">queued <b>${fmt(r.queued)}</b>
-      of ${fmt(r.considered)} file(s)</div>`;
-  }catch(e){ if(box) box.textContent='requeue failed'; }
-}
+
 
 // ---- Jobs: every recurring loop, one table -------------------------------
 let _jobsTimer=null;
