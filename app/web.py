@@ -5113,6 +5113,13 @@ def api_subocr_shapes(limit: int = 60, fresh: int = 0, done: int = 1):
                              include_done=bool(int(done)))
 
 
+@app.get("/api/subocr/shape")
+def api_subocr_shape(file_id: int):
+    """One row's evidence, fetched only when that row is opened."""
+    from . import subocr
+    return subocr.shape_detail(int(file_id))
+
+
 @app.post("/api/subocr/sweep")
 async def api_subocr_sweep():
     """Queue every convertible file now. Minutes, so the card polls."""
@@ -21677,6 +21684,78 @@ function shapeStatus(r){
   }
   return `<span style="color:${c}" title="${esc(r.status_why||'')}">${dot}${label}</span>`;
 }
+// THE ROW SAYS "rejected" AND STOPS THERE. Clicking a title opens the rest of
+// it under that row, the same way the Plex playback table opens a file: what
+// each track measured, which thresholds those numbers were judged against, and
+// every attempt made on the file. "Rejected" is a verdict; the attempts are a
+// history, and only one of them fits in a cell.
+let _shapeOpen=null, _shapeDetailHtml='';
+function shapePct(x){ return Math.round((x||0)*100)+'%'; }
+async function shapeDetail(id){
+  if(_shapeOpen===id){ _shapeOpen=null; _shapeDetailHtml=''; shapeRender(); return; }
+  _shapeOpen=id; _shapeDetailHtml=''; shapeRender();
+  let d;
+  try{ d=await (await fetch('/api/subocr/shape?file_id='+encodeURIComponent(id)))
+        .json(); }
+  catch(e){ _shapeDetailHtml='<div class="dim" style="padding:8px">could not load</div>';
+            shapeRender(); return; }
+  if(_shapeOpen!==id) return;                 // another row was opened meanwhile
+  const th=d.thresholds||{}, f=d.file||{};
+  const tracks=(d.tracks||[]).map(t=>{
+    const tall=(t.tall_share||0), verdict=t.typeset?'typeset signs':'dialogue';
+    return `<tr>
+      <td class="dim" style="padding:2px 12px 2px 0">track ${t.rel}</td>
+      <td style="padding:2px 12px 2px 0;color:${t.typeset?'#e2b341':'#6fd08c'}"
+        >${verdict}</td>
+      <td class="dim" style="padding:2px 12px 2px 0">${shapePct(tall)} of cues are
+        tall <span style="opacity:.6">(typeset at ${shapePct(th.tall_share)})</span></td>
+      <td class="dim" style="padding:2px 12px 2px 0">median height
+        ${shapePct(t.median_h)} <span style="opacity:.6">(tall means over
+        ${shapePct(th.tall_frac)})</span></td>
+      <td class="dim" style="padding:2px 0">${ago(t.at)}</td></tr>`;}).join('');
+  const jobs=(d.jobs||[]).map(j=>{
+    const when=j.finished_at||j.started_at||j.created_at;
+    const col=j.state==='done'?'#6fd08c':j.state==='error'?'#e0575b'
+             :j.state==='running'?'#6fb0ff':'var(--dim)';
+    return `<tr>
+      <td class="mono" style="padding:2px 12px 2px 0">${esc(j.kind||'')}</td>
+      <td style="padding:2px 12px 2px 0;color:${col}">${esc(j.state||'')}</td>
+      <td class="dim wrap" style="padding:2px 12px 2px 0">${esc(j.note||'—')}</td>
+      <td class="dim" style="padding:2px 0;white-space:nowrap">${ago(when)}</td>
+    </tr>`;}).join('');
+  // WHY, IN THE ORDER A PERSON ASKS IT: what is true now, then what was
+  // measured, then what has been tried. A rejection with no attempts behind it
+  // means the OCR declined before running, which is a different fault from one
+  // that ran and failed - and the table alone cannot say which.
+  _shapeDetailHtml=`
+    <div style="padding:8px 10px;font-size:11.5px">
+      <div style="margin-bottom:6px">
+        <b style="color:#6fb0ff">${esc(d.status||'')}</b>
+        <span class="dim"> — ${esc(d.why||'')}</span>
+        ${th.enabled===false?`<span class="pill p-warn" style="margin-left:8px"
+          >OCR is off for ${esc(f.library||'this library')}</span>`:''}
+        ${f.subocr_state==='rejected'?`<span class="pill p-warn"
+          style="margin-left:8px">the reader returned too little usable text</span>`:''}
+      </div>
+      ${f.state_reason?`<div class="dim" style="margin-bottom:6px">last note:
+        ${esc(f.state_reason)}</div>`:''}
+      <div class="dim" style="margin-bottom:3px">what was measured</div>
+      <table style="width:100%;font-size:11px;border-collapse:collapse;
+                    margin-bottom:8px">${tracks||
+        '<tr><td class="dim">nothing measured on this file</td></tr>'}</table>
+      <div class="dim" style="margin-bottom:3px">what has been attempted</div>
+      <table style="width:100%;font-size:11px;border-collapse:collapse">${jobs||
+        `<tr><td class="dim">nothing has been attempted yet — which is itself the
+         answer when a file looks stuck</td></tr>`}</table>
+      <div class="dim" style="margin-top:7px;font-size:10.5px;opacity:.7">
+        Signs are converted below ${th.signs_max_cpm} captions/min; a track with
+        ${th.dialogue_min_cues}+ cues counts as dialogue whatever it is called.
+        ${esc(f.path||'')}
+      </div>
+    </div>`;
+  shapeRender();
+}
+
 function shapeRender(){
   const el=document.getElementById('shapeTblWrap');
   if(!el) return;
@@ -21691,9 +21770,13 @@ function shapeRender(){
       >${label}<span class="dim">${arrow(k)}</span></th>`;
   const tr=rows.map(r=>{
     const ts=r.typeset;
-    return `<tr>
+    const open=_shapeOpen===r.file_id;
+    return `<tr class="${open?'rowopen':''}">
       <td style="padding:2px 10px 2px 0;overflow:hidden;text-overflow:ellipsis;
-                 white-space:nowrap">${esc(r.title||('file '+r.file_id))}</td>
+                 white-space:nowrap"><span class="tl"
+            onclick="shapeDetail(${r.file_id})"
+            title="click for what was measured and what has been tried"
+            >${esc(r.title||('file '+r.file_id))}</span></td>
       <td class="dim" style="padding:2px 10px 2px 0;white-space:nowrap">${esc(r.ep||'—')}</td>
       <td class="dim" style="padding:2px 10px 2px 0;white-space:nowrap">${r.rel}</td>
       <td style="padding:2px 10px 2px 0;white-space:nowrap;color:${ts?'#e2b341':'#6fd08c'}">
@@ -21705,7 +21788,9 @@ function shapeRender(){
       <td class="dim" style="padding:2px 10px 2px 0;white-space:nowrap">
         ${Math.round((r.median_h||0)*100)}%</td>
       <td class="dim" style="padding:2px 0;white-space:nowrap">${ago(r.at)}</td>
-    </tr>`;}).join('');
+    </tr>` + (open ? `<tr class="logdrop"><td colspan="9">${
+      _shapeDetailHtml||'<div class="dim" style="padding:10px 14px">loading…</div>'
+    }</td></tr>` : '');}).join('');
   // PERCENTAGE WIDTHS, NOT PIXELS. Fixed pixel columns left every short field
   // bunched against the right edge of a wide panel with a runway of empty
   // space before them; percentages share the width out instead, and the title
@@ -21966,12 +22051,17 @@ async function shapeLoad(){
            every measured file is handled.</div>`
         : `<div class="dim" style="font-size:11.5px">Nothing measured yet — the
            first files get read when the next OCR sweep picks them up.</div>`)
-      + doneToggle;
+      + `<div id="shapeDoneLine">${doneToggle}</div>`;
   }else{
     _shapeRows=rows;
     if(!held) shapeRender();
-    const w=document.getElementById('shapeTblWrap');
-    if(w && doneToggle) w.insertAdjacentHTML('beforeend', doneToggle);
+    let t=document.getElementById('shapeDoneLine');
+    if(!t && doneToggle){
+      t=document.createElement('div'); t.id='shapeDoneLine';
+      const w=document.getElementById('shapeTblWrap');
+      if(w) w.parentNode.insertBefore(t, w.nextSibling);
+    }
+    if(t) t.innerHTML=doneToggle;
   }
   if(_shapeTimer) clearTimeout(_shapeTimer);
   // THREE SPEEDS, NOT TWO. 'busy' is true only while a file is actually open,

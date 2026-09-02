@@ -2804,6 +2804,88 @@ def _status_of(typeset: bool, library, live, done_kinds, rejected: bool):
                         else "waiting for the next OCR sweep")
 
 
+def shape_detail(file_id: int) -> dict:
+    r"""Everything behind one row of the Signs-or-dialogue table.
+
+    THE TABLE SAYS "rejected" AND STOPS. That is the moment a person wants the
+    rest of it: which tracks the file has, what each was measured at, which
+    thresholds those numbers were compared against, and what has actually been
+    attempted - because "rejected" describes a verdict, not a history, and the
+    two are easy to confuse when only one of them is on screen.
+
+    Everything here is already stored. Nothing is measured, no file is opened,
+    and it is one row's worth of queries - so it can hang off a click without
+    the table paying for it on every poll.
+    """
+    from .db import cursor
+    out: dict = {"file_id": int(file_id), "tracks": [], "jobs": [],
+                 "file": {}, "thresholds": {}, "why": ""}
+    try:
+        with cursor() as cur:
+            f = cur.execute(
+                "SELECT id,path,title,season,episode,library,state,"
+                "       state_reason,subocr_state FROM files WHERE id=?",
+                (int(file_id),)).fetchone()
+            if not f:
+                return out
+            f = dict(f)
+            out["file"] = {
+                "title": f.get("title") or "", "library": f.get("library") or "",
+                "ep": ep_label(f.get("season"), f.get("episode")),
+                "path": f.get("path") or "", "state": f.get("state") or "",
+                "state_reason": f.get("state_reason") or "",
+                "subocr_state": f.get("subocr_state") or "",
+            }
+            lib = f.get("library")
+            out["thresholds"] = {
+                "tall_share": TYPESET_SHARE, "tall_frac": TYPESET_TALL_FRAC,
+                "signs_max_cpm": signs_max_cpm(lib),
+                "dialogue_min_cues": dialogue_min_cues(lib),
+                "enabled": enabled_for(lib),
+            }
+            for r in cur.execute(
+                    "SELECT rel,typeset,median_h,tall_share,at "
+                    "FROM sub_shape WHERE file_id=? ORDER BY rel", (int(file_id),)):
+                d = dict(r)
+                d["typeset"] = bool(d["typeset"])
+                out["tracks"].append(d)
+            # EVERY ATTEMPT, NEWEST FIRST - including the skipped and the
+            # failed. A file that has been through OCR four times and declined
+            # four times is a different story from one that has never been
+            # tried, and the status chip cannot tell them apart.
+            for j in cur.execute(
+                    "SELECT kind,state,error,result_json,"
+                    "       created_at,started_at,finished_at "
+                    "FROM jobs WHERE file_id=? AND kind IN ('sub_ocr','transcode') "
+                    "ORDER BY COALESCE(finished_at,started_at,created_at) DESC "
+                    "LIMIT 12", (int(file_id),)):
+                d = dict(j)
+                note = d.pop("error", "") or ""
+                raw = d.pop("result_json", "") or ""
+                if not note and raw:
+                    try:
+                        r = json.loads(raw)
+                        note = str(r.get("reason") or r.get("note")
+                                   or r.get("summary") or "")
+                    except Exception:                        # noqa: BLE001
+                        note = ""
+                d["note"] = note
+                out["jobs"].append(d)
+    except Exception as e:                                   # noqa: BLE001
+        out["error"] = str(e)
+        return out
+    # The same sentence the row's status chip is built from, so the drop-down
+    # cannot contradict the line that opened it.
+    ts = any(t["typeset"] for t in out["tracks"])
+    live = next((j for j in out["jobs"] if j["state"] in ("running", "queued")), None)
+    done = {j["kind"] for j in out["jobs"] if j["state"] == "done"}
+    out["status"], out["why"] = _status_of(
+        typeset=ts, library=out["file"].get("library"),
+        live=live, done_kinds=done,
+        rejected=(out["file"].get("subocr_state") == "rejected"))
+    return out
+
+
 def status_counts(cur) -> dict:
     r"""How every measured file stands, not just the page being shown.
 
