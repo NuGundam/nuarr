@@ -22757,8 +22757,13 @@ async function shapeLoad(force){
          burned in, not to the OCR</div>`:''}
      </div>`:''}
     ${sweeping?`<div style="font-size:11px;margin:3px 0 5px">
+       <!-- THE LABEL FOLLOWS THE PHASE. It said "queueing" for the whole pass,
+            including the minutes spent READING files before anything could be
+            queued - so a minute of "queueing" with nothing reaching Transcoding
+            looked broken and was simply mislabelled. -->
        ${progressBar({done:sw.done, total:sw.total, now:sw.now||''}, 'files',
-         {kind:'queue', label:'queueing', eta_s:paceEta(sw)})}
+         {kind: (sw.phase||'').startsWith('measur') ? 'measure' : 'queue',
+          label: sw.phase || 'working', eta_s:paceEta(sw)})}
        <div class="dim" style="font-size:10.5px;margin-top:2px">
          ${fmt(sw.queued||0)} queued for the OCR${
          sw.signs?` · ${fmt(sw.signs)} for burning`:''}${

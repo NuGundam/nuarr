@@ -1749,8 +1749,24 @@ def run_one(path: str, probe: dict, work_root: str | None = None,
                 # track is not dialogue and OCR is the wrong tool - see
                 # track_shape(). Skipping here leaves the PGS in place, which
                 # is what the burn path wants anyway.
-                shape = track_shape(sup)
-                record_shape(file_id, t["rel"], shape)
+                #
+                # THE STORED VERDICT WINS WHEN THERE IS ONE. Measuring again
+                # costs 15 ms on a sup that is already open, so this is not
+                # about speed - it is about one answer. The check's verdict is
+                # what the panel shows, what the burn decision was made on and
+                # what a person read; re-deriving it here means a file could
+                # be listed as dialogue and then quietly treated as typeset by
+                # a second opinion nobody saw. The demux itself cannot be
+                # avoided - the OCR needs the actual bitmaps - but the JUDGEMENT
+                # is made once.
+                known = shapes_for(file_id).get(t["rel"])
+                if known:
+                    shape = dict(known)
+                    shape.setdefault("why", "measured earlier by the picture-"
+                                            "subtitle check")
+                else:
+                    shape = track_shape(sup)
+                    record_shape(file_id, t["rel"], shape)
                 if shape.get("typeset"):
                     notes.append(f"rel {t['rel']}: not OCR'd - {shape['why']}")
                     from . import joblog as _jl      # imported where used,
@@ -3687,7 +3703,7 @@ async def run_sweep(source: str = "manual", limit: int | None = None,
     # to the behaviour this has always had.
     want_queue = autoqueue() if queue is None else bool(queue)
     SWEEP_STATE.update(running=True, done=0, total=0, queued=0, signs=0,
-                       now="", at=time.time(), source=source)
+                       now="", at=time.time(), source=source, phase="picking")
     n = signs = 0
     try:
         picked = await asyncio.to_thread(sweep_pick, cap if cap > 0 else 100000)
@@ -3695,6 +3711,13 @@ async def run_sweep(source: str = "manual", limit: int | None = None,
         for p in picked:
             SWEEP_STATE["done"] += 1
             SWEEP_STATE["now"] = (p.get("title") or "")[:60]
+            # WHICH HALF OF THE WORK THIS IS. The bar was labelled "queueing"
+            # for the whole pass, including the minutes it spends MEASURING
+            # before it queues anything - so Erik watched "queueing" run for a
+            # minute, saw nothing reach Transcoding, and was right to wonder.
+            # Nothing was being queued: it was reading files.
+            SWEEP_STATE["phase"] = ("measuring" if not has_shapes(p["file_id"])
+                                    else "queueing")
             try:
                 # MEASURE BEFORE QUEUEING, not inside the job. A typeset file
                 # that reaches the queue only gets there to find out it should
@@ -3779,6 +3802,7 @@ async def run_sweep(source: str = "manual", limit: int | None = None,
         try:
             from .db import cursor as _cur
             with _cur() as c:
+                SWEEP_STATE["phase"] = "queueing burns"
                 burnable = [dict(r) for r in c.execute(
                     "SELECT s.file_id, f.path, f.title, f.library "
                     "  FROM sub_shape s JOIN files f ON f.id = s.file_id "
@@ -3847,6 +3871,7 @@ async def run_sweep(source: str = "manual", limit: int | None = None,
             # queued everything measurable, so nothing waits on this backfill
             # except more backfill.
             measured_now = 0
+            SWEEP_STATE["phase"] = "measuring rejected files"
             for r in unmeasured:
                 if measured_now >= 50:
                     break
@@ -3880,9 +3905,18 @@ async def run_sweep(source: str = "manual", limit: int | None = None,
             _log.log(f"subtitle OCR sweep queued {n} file(s)"
                      + (f" and set {signs} aside as typeset signs"
                         if signs else ""), "info")
+        else:
+            # A SWEEP THAT QUEUES NOTHING IS A RESULT, and it was silent -
+            # which is how a minute of "queueing" with nothing appearing in
+            # Transcoding became a mystery. It reads files first; when they all
+            # turn out to be handled already, the honest report is that.
+            _log.log(f"subtitle OCR sweep: read {SWEEP_STATE['total']} file(s) "
+                     f"and queued nothing — everything measured is already "
+                     f"converted or has no picture subtitle left", "info")
     finally:
         SWEEP_STATE["running"] = False
         SWEEP_STATE["now"] = ""
+        SWEEP_STATE["phase"] = ""
     return {"ok": True, "queued": n, "signs": signs,
             "considered": SWEEP_STATE["total"]}
 
