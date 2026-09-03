@@ -22562,6 +22562,22 @@ async function shapeLoad(force){
   catch(e){ el.innerHTML='<span class="dim" style="font-size:11.5px">could not load</span>'; return; }
   const s=d.summary||{}, live=d.live||{}, rows=d.rows||[];
   _shapeDoneHidden=s.done_hidden||0;
+  // THE FIRST FRAME HAS NO FUNNEL. Those counts are computed on a thread so
+  // the request never waits for two LIKE scans over 37,000 probes, which means
+  // the first payload after a restart genuinely has nothing in it - and the
+  // card drew its whole header around numbers that were not there yet: a row
+  // of blanks that looked like a broken panel rather than a loading one.
+  if(!(s.funnel||{}).managed){
+    el.innerHTML=`<div class="skel" style="padding:2px 0">
+        <i style="width:62%"></i><i style="width:44%"></i><i style="width:78%"></i>
+      </div>
+      <div class="dim" style="font-size:11px;margin-top:6px">
+        <span class="busy"><span class="sp"></span><span class="step">counting
+        the library's picture subtitles…</span></span></div>`;
+    if(_shapeTimer) clearTimeout(_shapeTimer);
+    _shapeTimer=setTimeout(shapeLoad, 1200);
+    return;
+  }
   // Only asked for when something is actually queued and held - there is no
   // point costing a gate probe to explain an empty queue.
   if((s.status||{}).queued) shapeWhyLoad();
@@ -22798,8 +22814,29 @@ async function shapeLoad(force){
       ${stChip('processing','being read now','var(--acc)')}
       ${stChip('queued','queued for the OCR','#b48bf2')}
       ${stChip('eligible','ready to queue','var(--dim)')}
-      ${((st.processing||0)+(st.queued||0)+(st.eligible||0))?''
-        :'<span class="dim">nothing being read, queued or waiting</span>'}
+      ${(() => {
+        // IT SAID "NOTHING BEING READ" WHILE IT WAS READING AQUAMAN. The chips
+        // come from status_counts, which counts measured files by their JOB
+        // state - and a measuring pass has no job: it demuxes a track outside
+        // the queue entirely. So the one thing visibly happening on the card,
+        // two lines above, was the one thing this line could not see.
+        //
+        // In flight means everything happening now, whatever owns it: the
+        // read, the pass driving it, and the queue.
+        const bits=[];
+        if(live.now) bits.push(`<span style="color:#6fb0ff">reading <b>${
+          esc(live.now)}</b></span>`);
+        const mz2=s.measuring||{}, sw2=s.sweep||{};
+        if(mz2.running) bits.push(`<span style="color:#f2c94c">measuring <b>${
+          fmt(mz2.done||0)}</b> of ${fmt(mz2.total||0)}</span>`);
+        if(sw2.running) bits.push(`<span style="color:${
+          /measur/.test(sw2.phase||'')?'#f2c94c':'#b48bf2'}">${
+          esc(sw2.phase||'sweeping')}${sw2.total?` <b>${fmt(sw2.done||0)}</b> of ${
+          fmt(sw2.total)}`:''}</span>`);
+        if(bits.length) return bits.join(' · ');
+        return ((st.processing||0)+(st.queued||0)+(st.eligible||0))
+          ? '' : '<span class="dim">nothing being read, queued or waiting</span>';
+      })()}
       ${(() => {
         // WHY THEY ARE STILL WAITING, which a count on its own invites and
         // never answers. Two different waits with two different reasons:
