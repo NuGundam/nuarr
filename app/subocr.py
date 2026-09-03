@@ -3461,6 +3461,16 @@ async def measure_sweep(limit: int | None = None) -> dict:
                 if r.get("typeset_only"):
                     ts += 1
                     MEASURE_STATE["typeset"] = ts
+                # THE HEADLINE HAS TO MOVE WITH THE BAR. The funnel is cached
+                # for two minutes and recomputed off-thread, so "555 measured ·
+                # 649 still to measure" sat frozen while the bar underneath
+                # counted to 26 - two numbers about the same work disagreeing
+                # on screen. Dropping the cache every few files lets the
+                # background recount catch up without making the request path
+                # wait for it. Every five, because the recount is ~1 s and the
+                # bar moves about that often.
+                if n % 5 == 0:
+                    _FUNNEL["at"] = 0.0
             except Exception:                                # noqa: BLE001
                 continue
     finally:
@@ -3871,8 +3881,15 @@ async def run_sweep(source: str = "manual", limit: int | None = None,
             # queued everything measurable, so nothing waits on this backfill
             # except more backfill.
             measured_now = 0
-            SWEEP_STATE["phase"] = "measuring rejected files"
-            for r in unmeasured:
+            # A PHASE WITH NO NUMBERS IS A SPINNER. This ran with the sweep's
+            # own done/total, which belong to the phase BEFORE it, so the bar
+            # showed "0 files" and swept forever while real work happened -
+            # the least informative thing a progress bar can do. It counts
+            # itself now, against its own cap.
+            todo = [r for r in unmeasured if enabled_for(r.get("library"))][:50]
+            SWEEP_STATE.update(phase="re-measuring files the OCR rejected",
+                               done=0, total=len(todo), now="")
+            for r in todo:
                 if measured_now >= 50:
                     break
                 if not enabled_for(r.get("library")):
@@ -3890,6 +3907,9 @@ async def run_sweep(source: str = "manual", limit: int | None = None,
                       "ep": ep_label(r.get("season"), r.get("episode"))}
                 await asyncio.to_thread(screen_for_typeset, pk)
                 measured_now += 1
+                SWEEP_STATE["done"] = measured_now
+                if measured_now % 5 == 0:
+                    _FUNNEL["at"] = 0.0          # keep the headline honest
         except Exception as e:                               # noqa: BLE001
             _log.log(f"rejected-measure phase failed: "
                      f"{type(e).__name__}: {e}", "warn")

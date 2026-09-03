@@ -22658,6 +22658,9 @@ async function shapeLoad(force){
       ${step(fn.with_picture, 'have picture subtitles', '#6fb0ff')} ${arrow}
       ${step(fn.measured, 'measured by this check', '#7fe0a0')}
       ${fn.to_measure ? `${arrow} ${step(fn.to_measure, 'still to measure', '#f2c94c')}` : ''}
+      ${(s.measuring||{}).running || (s.sweep||{}).running
+        ? '<span class="dim" style="font-size:10.5px">· counting up as the pass reads</span>'
+        : ''}
     </div>` : '';
 
   // WHERE THE MEASURED ONES GO. Two destinations and two dead ends, which is
@@ -22680,6 +22683,10 @@ async function shapeLoad(force){
         title="The reader ran and declined these - too little usable text. A verdict about the content, remembered so the same file is not read again every sweep."
         ><b>${fmt(fn.rejected)}</b>
         <span class="dim">rejected by the OCR</span></span>`:''}
+      ${(s.status||{}).unscanned?`<span style="color:var(--warn)"
+        title="No stored probe, so nothing can be planned from them until a scan reads them again. Not a fault and not a queue - they simply cannot be acted on yet."
+        ><b>${fmt(s.status.unscanned)}</b>
+        <span class="dim">waiting on a rescan</span></span>`:''}
     </div>` : '';
 
   const mb = s.measure_batch;
@@ -22762,7 +22769,7 @@ async function shapeLoad(force){
             queued - so a minute of "queueing" with nothing reaching Transcoding
             looked broken and was simply mislabelled. -->
        ${progressBar({done:sw.done, total:sw.total, now:sw.now||''}, 'files',
-         {kind: (sw.phase||'').startsWith('measur') ? 'measure' : 'queue',
+         {kind: (sw.phase||'').indexOf('measur')>=0 ? 'measure' : 'queue',
           label: sw.phase || 'working', eta_s:paceEta(sw)})}
        <div class="dim" style="font-size:10.5px;margin-top:2px">
          ${fmt(sw.queued||0)} queued for the OCR${
@@ -22778,13 +22785,21 @@ async function shapeLoad(force){
     ${funnelRow}
     ${whereRow}
     ${ctl}
+    <!-- "RIGHT NOW" WAS NOT RIGHT NOW. It carried whatever chips happened to be
+         non-zero, and on a quiet library that is two standing facts - 20 files
+         with no probe, 68 the reader declined - neither of which is happening
+         now or ever changes on its own. A line labelled "right now" listing
+         two permanent conditions is worse than no line: it invites you to wait
+         for something. Live states only, and it says so when there are none;
+         the standing ones moved up into the funnel where the other totals are. -->
     <div style="display:flex;gap:14px;flex-wrap:wrap;margin:7px 0 4px;font-size:11.5px;
                 align-items:center">
-      <span class="dim">right now:</span>
+      <span class="dim">in flight:</span>
       ${stChip('processing','being read now','var(--acc)')}
-      ${stChip('queued','queued','#b48bf2')}
+      ${stChip('queued','queued for the OCR','#b48bf2')}
       ${stChip('eligible','ready to queue','var(--dim)')}
-      ${stChip('unscanned','not scanned since they were written','var(--warn)')}
+      ${((st.processing||0)+(st.queued||0)+(st.eligible||0))?''
+        :'<span class="dim">nothing being read, queued or waiting</span>'}
       ${(() => {
         // WHY THEY ARE STILL WAITING, which a count on its own invites and
         // never answers. Two different waits with two different reasons:
@@ -22805,25 +22820,11 @@ async function shapeLoad(force){
           ? `<span class="dim" style="flex:1 0 100%;font-size:11px;margin-top:1px"
              >${bits.join(' · ')}</span>` : '';
       })()}
-      ${(() => {
-        // TWO HOLDS, TWO SENTENCES. "rejected or switched off" made a person
-        // ask which - and one of the two is their own setting doing its job.
-        const off=st.held_off||0, rej=st.held_rejected||0;
-        const both=off&&rej, lump=(st.held||0)-(off+rej);
-        return (off?`<span style="color:var(--warn)" title="Subtitle OCR is
-          switched off for these files' libraries in your own settings
-          (Settings → Subtitles). Working as asked — flip the library's switch
-          if you want them converted."><b>${fmt(off)}</b>
-          <span class="dim">OCR off for their library</span></span>`:'')
-        + (both?' ':'')
-        + (rej?`<span style="color:var(--warn)" title="The OCR read these
-          tracks and declined them — too sparse to be dialogue, or otherwise
-          not convertible. A verdict about the content, remembered so the same
-          file is not re-read every sweep. Each row's status says why."><b>${
-          fmt(rej)}</b> <span class="dim">rejected by the OCR</span></span>`:'')
-        + (lump>0?` <span style="color:var(--warn)"><b>${fmt(lump)}</b>
-          <span class="dim">held</span></span>`:'');
-      })()}
+      ${(st.held_off||0)?`<span style="color:var(--warn)" title="Subtitle OCR is
+        switched off for these files' libraries in your own settings. Working as
+        asked — flip the library's switch above if you want them converted."
+        ><b>${fmt(st.held_off)}</b>
+        <span class="dim">OCR off for their library</span></span>`:''}
       <span id="shapeHold" class="dim" style="font-size:11px;${held?'':'display:none'}">
         · paused while you read — scroll back to the top to resume</span>
     </div>
