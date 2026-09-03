@@ -11124,7 +11124,7 @@ input[type=time]::-webkit-calendar-picker-indicator{filter:invert(.75);cursor:po
     </div>
     <div id="queueList" class="qbox"></div>
   </div>
-  <div class="panel">
+  <div class="panel" id="transcoding">
     <h2>Transcoding<span class="live"><span class="dot"></span>live</span>
         <span class="live"><button onclick="cancelAll()"
           title="cancel every running job — the queue is left alone"
@@ -22878,7 +22878,8 @@ async function shapeLoad(force){
         taller than 30% of the frame — tall bitmaps are signs and song
         captions laid over the picture, not lines of dialogue.
         <div style="margin-top:4px">Anything queued from here joins the ordinary
-        work queue and runs under <a href="/">Transcoding on the dashboard</a> —
+        work queue and runs under
+        <a href="/#transcoding">Transcoding on the dashboard</a> —
         the same gate, the same disk rules, the same order. Nothing here starts
         a job on its own outside that queue.</div></div>`;
   }
@@ -27409,6 +27410,30 @@ loadAll();
 // per-second event.
 loadObserver();
 poll(loadObserver, 60000, 'obsBox');
+// ARRIVING AT A PANEL, not just at the page. /#transcoding used to load the
+// dashboard and leave you at the top of it, which for a link that says "runs
+// under Transcoding on the dashboard" is most of the way to useless - the
+// panel is four screens down on a busy day. The dashboard has no router, and
+// does not need one: an id on the panel and a scroll on arrival is the whole
+// mechanism, and it works for any panel that grows an id later.
+//
+// Deferred a beat because the panels paint from their first poll; scrolling
+// before that lands on a page that is still growing and drifts as it fills.
+function dashGoToHash(){
+  const id=(location.hash||'').slice(1);
+  if(!id) return;
+  const el=document.getElementById(id);
+  if(!el) return;
+  el.scrollIntoView({behavior:'smooth', block:'start'});
+  // A moment of edge so it is obvious WHICH panel the link meant, then gone -
+  // a permanent highlight would still be there tomorrow saying nothing.
+  el.style.transition='box-shadow .4s';
+  el.style.boxShadow='0 0 0 2px var(--acc)';
+  setTimeout(()=>{ el.style.boxShadow=''; }, 1800);
+}
+setTimeout(dashGoToHash, 700);
+window.addEventListener('hashchange', dashGoToHash);
+
 // ---- portal-wide button feedback -----------------------------------------
 // Preview, Queue, Stop, Requeue and the pool handlers each got a spinner and a
 // clock by hand. There are ~25 more buttons that fire a request and say
