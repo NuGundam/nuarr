@@ -22876,7 +22876,11 @@ async function shapeLoad(force){
       <div class="dim" style="font-size:11px;margin-top:6px">
         A track counts as typeset when more than 20% of its cues use a bitmap
         taller than 30% of the frame — tall bitmaps are signs and song
-        captions laid over the picture, not lines of dialogue.</div>`;
+        captions laid over the picture, not lines of dialogue.
+        <div style="margin-top:4px">Anything queued from here joins the ordinary
+        work queue and runs under <a href="/">Transcoding on the dashboard</a> —
+        the same gate, the same disk rules, the same order. Nothing here starts
+        a job on its own outside that queue.</div></div>`;
   }
   // DONE ROWS ARE HIDDEN BY DEFAULT, the same rule as every other check
   // card: a verdict whose work is finished is history, and the newest-60
@@ -22899,13 +22903,19 @@ async function shapeLoad(force){
         ? `<div class="dim" style="font-size:11.5px">Nothing outstanding —
            every measured file is handled.</div>`
         : `<div class="dim" style="font-size:11.5px">Nothing measured yet — the
-           first files get read when the next OCR sweep picks them up.</div>`)
-      + `<div id="shapeDoneLine">${doneToggle}</div>`;
+           first files get read when the next OCR sweep picks them up.</div>`);
   }else{
     _shapeRows=rows;
     if(force || !held) shapeRender();
+  }
+  // ONE LINE, ONE ID, OUTSIDE THE TABLE. Both branches used to draw it - the
+  // empty one inside #shapeTblWrap and the other after it - so on the way from
+  // "showing" back to "hidden" (200 rows to none) both existed at once.
+  // getElementById found the one inside the wrap and rewrote that; the one
+  // under the cursor kept its old text. The link worked and looked dead.
+  {
     let t=document.getElementById('shapeDoneLine');
-    if(!t && doneToggle){
+    if(!t){
       t=document.createElement('div'); t.id='shapeDoneLine';
       const w=document.getElementById('shapeTblWrap');
       if(w) w.parentNode.insertBefore(t, w.nextSibling);
