@@ -2770,6 +2770,59 @@ def pip_update_start() -> dict:
 _SWEEP = {"last": 0.0, "queued_total": 0}
 
 
+def autoqueue() -> bool:
+    r"""Does the sweep QUEUE what it finds, or only find it?
+
+    THESE WERE ONE SWITCH AND ARE TWO QUESTIONS. "auto" meant both "check on a
+    schedule" and "queue whatever the check turns up", so anyone who wanted the
+    survey without the work had to turn the survey off. Checking costs one
+    demux per file, once ever; queueing spends the GPU and rewrites files,
+    which is the half a person actually wants a say in.
+
+    Defaults to on - exactly what auto has always done - so nothing changes for
+    anyone who does not touch it.
+    """
+    v = _s("subocr_autoqueue", True)
+    return True if v is None else bool(v)
+
+
+def ready_to_queue(limit: int = 100000) -> list[dict]:
+    """Files that would convert right now, without measuring anything first.
+
+    run_sweep() measures before it queues, which is right for files nobody has
+    looked at and pure delay for files already measured. This is what the
+    Queue-these button acts on.
+    """
+    return sweep_pick(limit)
+
+
+async def queue_ready(limit: int | None = None) -> dict:
+    """Queue the already-known convertible files. Measures nothing."""
+    import asyncio
+    from . import jobs, joblog as _log
+    picked = await asyncio.to_thread(ready_to_queue, limit or 100000)
+    n = 0
+    for p in picked:
+        label = (p.get("title") or "") + (f" - {p['ep']}" if p.get("ep") else "")
+        try:
+            # KIND AND PRIORITY, the same as the sweep passes. Without them
+            # enqueue() plans whatever the file needs generally - which for an
+            # already-standardised file is nothing - and the button reported
+            # "considered 1, queued 0" while a hand-written enqueue with
+            # kind='sub_ocr' queued it fine.
+            if await jobs.enqueue(p["file_id"], p["path"], label or "",
+                                  kind="sub_ocr", priority=90,
+                                  source="subtitle OCR (queued by hand)"):
+                n += 1
+        except Exception:                                    # noqa: BLE001
+            continue
+    if n:
+        await jobs.start()
+        _BACKLOG["n"] = None
+        _log.log(f"subtitle OCR: queued {n} already-measured file(s)", "ok")
+    return {"ok": True, "queued": n, "considered": len(picked)}
+
+
 def sweep_pick(limit: int) -> list[dict]:
     """The next `limit` convertible files, respecting every switch."""
     from .db import cursor
@@ -2870,7 +2923,8 @@ def screen_state() -> dict:
     return st
 
 
-def _status_of(typeset: bool, library, live, done_kinds, rejected: bool):
+def _status_of(typeset: bool, library, live, done_kinds, rejected: bool,
+               convertible: bool = True, probed: bool = True):
     r"""Where one measured file stands. THE ONLY definition of that.
 
     Extracted because the panel shows this per row and the summary counts it
@@ -2892,6 +2946,24 @@ def _status_of(typeset: bool, library, live, done_kinds, rejected: bool):
     if not enabled_for(library):
         return "held", (f"subtitle OCR is switched off for "
                         f"{library or 'this library'}")
+    # NOTHING LEFT TO CONVERT IS NOT "WAITING". Erik pressed Convert all now,
+    # watched it measure a few files and queue nothing, and asked why - and the
+    # panel had told him 36 files were waiting for exactly that button. They
+    # were not: every one already had a text track covering the role, so
+    # select_targets returns nothing for them and the sweep has never had any
+    # reason to pick them. The status was reporting the absence of a job as
+    # though it were the presence of work.
+    # NO STORED PROBE, NO PLAN. Twenty measured files had no probe row at all -
+    # scanned away, or written since - and with nothing to read, select_targets
+    # cannot be asked and the sweep skips them silently. Counting them as
+    # "waiting to be queued" is how the headline came to promise twenty files
+    # to a button that would never find them.
+    if not probed:
+        return "unscanned", ("no stored probe — nothing can be planned from "
+                             "this until the next scan reads it")
+    if not typeset and not convertible:
+        return "done", ("a text track already covers this — there is nothing "
+                        "left to convert")
     return "eligible", ("waiting for a burn to be planned" if typeset
                         else "waiting for the next OCR sweep")
 
@@ -2993,7 +3065,7 @@ def status_counts(cur) -> dict:
     # looked at this track and declined it" (a verdict about content). Counted
     # apart so each can be said plainly.
     out = {"processing": 0, "queued": 0, "done": 0, "eligible": 0, "held": 0,
-           "held_off": 0, "held_rejected": 0}
+           "held_off": 0, "held_rejected": 0, "unscanned": 0}
     try:
         rows = [dict(r) for r in cur.execute(
             "SELECT s.file_id, MAX(s.typeset) AS ts, f.library, "
@@ -3018,12 +3090,40 @@ def status_counts(cur) -> dict:
                 f"WHERE file_id IN ({marks}) AND state='done'", ids):
             d = dict(j)
             done.setdefault(d["file_id"], set()).add(d["kind"])
+        # THE SAME CONVERTIBILITY TEST THE ROWS USE. Without it the headline
+        # kept saying "36 waiting to be queued" while every row underneath had
+        # been corrected to "nothing left to convert" - the two numbers on one
+        # card disagreeing about the same files, which is worse than either
+        # being wrong alone. Only the files that would otherwise count as
+        # eligible are parsed, so this costs a handful of probe reads rather
+        # than the whole table.
+        probed_ids = {dict(j)["file_id"] for j in cur.execute(
+            f"SELECT file_id FROM file_probes WHERE file_id IN ({marks})", ids)}
+        maybe = [r["file_id"] for r in rows
+                 if not r["ts"] and r["sst"] != "rejected"
+                 and r["file_id"] not in live
+                 and "sub_ocr" not in done.get(r["file_id"], ())]
+        conv = {}
+        if maybe:
+            m2 = ",".join("?" * len(maybe))
+            libs = {r["file_id"]: r["library"] for r in rows}
+            for j in cur.execute(
+                    f"SELECT file_id, json FROM file_probes "
+                    f"WHERE file_id IN ({m2})", maybe):
+                d = dict(j)
+                try:
+                    conv[d["file_id"]] = bool(select_targets(
+                        json.loads(d["json"]), libs.get(d["file_id"])))
+                except Exception:                            # noqa: BLE001
+                    conv[d["file_id"]] = True
         for r in rows:
             st, why = _status_of(
                 typeset=bool(r["ts"]), library=r["library"],
                 live=live.get(r["file_id"]),
                 done_kinds=done.get(r["file_id"], ()),
-                rejected=r["sst"] == "rejected")
+                rejected=r["sst"] == "rejected",
+                convertible=conv.get(r["file_id"], True),
+                probed=r["file_id"] in probed_ids)
             out[st] = out.get(st, 0) + 1
             if st == "held":
                 out["held_off" if "switched off" in why
@@ -3073,12 +3173,40 @@ def _annotate_status(cur, rows: list) -> None:
             rejected.add(dict(j)["id"])
     except Exception:                                        # noqa: BLE001
         return
+    # IS THERE ANYTHING LEFT TO CONVERT, per row. One stored probe parsed per
+    # file on screen - measured at about 0.07 ms each, so ~30 ms for a full
+    # 400-row window - and it is the only way to answer honestly: the question
+    # is what select_targets() says, and there is no cheaper oracle for that.
+    convertible: dict = {}
+    try:
+        probes = {}
+        for j in cur.execute(
+                f"SELECT file_id, json FROM file_probes WHERE file_id IN ({marks})",
+                ids):
+            probes[dict(j)["file_id"]] = dict(j)["json"]
+        for r in rows:
+            fid = r.get("file_id")
+            if fid in convertible:
+                continue
+            raw = probes.get(fid)
+            if not raw:
+                convertible[fid] = True      # unknown: do not claim it is done
+                continue
+            try:
+                convertible[fid] = bool(select_targets(json.loads(raw),
+                                                       r.get("library")))
+            except Exception:                                # noqa: BLE001
+                convertible[fid] = True
+    except Exception:                                        # noqa: BLE001
+        convertible = {}
     for r in rows:
         r["status"], r["status_why"] = _status_of(
             typeset=bool(r.get("typeset")), library=r.get("library"),
             live=live.get(r.get("file_id")),
             done_kinds=last_done.get(r.get("file_id"), ()),
-            rejected=r.get("file_id") in rejected)
+            rejected=r.get("file_id") in rejected,
+            convertible=convertible.get(r.get("file_id"), True),
+            probed=r.get("file_id") in probes)
 
 
 # MEASURED, BECAUSE IT IS NOT FREE. sweep_pick over the whole library takes
@@ -3392,6 +3520,8 @@ def shape_rows(limit: int = 60, include_done: bool = True) -> dict:
             except Exception:                                # noqa: BLE001
                 pass
             summary["measure_batch"] = measure_batch()
+            summary["autoqueue"] = autoqueue()
+            summary["ready"] = _BACKLOG["n"]
             summary["measuring"] = dict(MEASURE_STATE)
             summary["sweep"] = dict(SWEEP_STATE)
             # When the newest verdict was written - "measured 85 files" says
@@ -3524,7 +3654,8 @@ SWEEP_STATE: dict = {"running": False, "done": 0, "total": 0, "queued": 0,
                      "signs": 0, "now": "", "at": 0.0, "source": ""}
 
 
-async def run_sweep(source: str = "manual", limit: int | None = None) -> dict:
+async def run_sweep(source: str = "manual", limit: int | None = None,
+                    queue: bool | None = None) -> dict:
     r"""Hand every convertible file to the queue.
 
     NO BATCH BY DEFAULT, WHICH IS A REVERSAL. This used to queue twenty per
@@ -3551,6 +3682,10 @@ async def run_sweep(source: str = "manual", limit: int | None = None) -> dict:
     if SWEEP_STATE["running"]:
         return {"ok": False, "error": "a sweep is already running"}
     cap = int(limit if limit is not None else _s("subocr_batch", 0) or 0)
+    # MEASURING AND QUEUEING ARE TWO DECISIONS. A caller can ask for one
+    # without the other; unasked, the setting decides, and the setting defaults
+    # to the behaviour this has always had.
+    want_queue = autoqueue() if queue is None else bool(queue)
     SWEEP_STATE.update(running=True, done=0, total=0, queued=0, signs=0,
                        now="", at=time.time(), source=source)
     n = signs = 0
@@ -3591,7 +3726,7 @@ async def run_sweep(source: str = "manual", limit: int | None = None) -> dict:
                                 "SELECT 1 FROM jobs WHERE file_id=? AND "
                                 "kind='transcode' AND state='done' LIMIT 1",
                                 (p["file_id"],)).fetchone()
-                        if not burned:
+                        if not burned and want_queue:
                             j = await jobs.enqueue(
                                 p["file_id"], p["path"], p["title"],
                                 kind="transcode", priority=95, source=source)
@@ -3615,9 +3750,9 @@ async def run_sweep(source: str = "manual", limit: int | None = None) -> dict:
                 # wrong under "clear all queued", where clearing the automatic
                 # work would leave the sweep's own jobs behind as if they were
                 # hand-picked.
-                j = await jobs.enqueue(p["file_id"], p["path"], p["title"],
-                                       kind="sub_ocr", priority=90,
-                                       source=source)
+                j = (await jobs.enqueue(p["file_id"], p["path"], p["title"],
+                                        kind="sub_ocr", priority=90,
+                                        source=source)) if want_queue else None
                 if j:
                     n += 1
                     SWEEP_STATE["queued"] = n

@@ -5221,6 +5221,36 @@ def api_subocr_shape(file_id: int):
     return subocr.shape_detail(int(file_id))
 
 
+@app.post("/api/subocr/queue_ready")
+async def api_subocr_queue_ready():
+    """Queue the files already known to be convertible. Measures nothing."""
+    from . import subocr
+    return await subocr.queue_ready()
+
+
+@app.post("/api/subocr/autoqueue")
+def api_subocr_autoqueue(on: int):
+    """Whether the sweep queues what it finds, or only finds it."""
+    import yaml
+    from .config import SETTINGS as _S
+    v = bool(int(on))
+    cp = _config_path()
+    raw = {}
+    if cp.exists():
+        try:
+            raw = yaml.safe_load(cp.read_text(encoding="utf-8-sig")) or {}
+        except Exception:                                    # noqa: BLE001
+            raw = {}
+    raw["subocr_autoqueue"] = v
+    cp.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True),
+                  encoding="utf-8")
+    _S.subocr_autoqueue = v
+    joblog.log("subtitle OCR: the check will "
+               + ("queue what it finds" if v else "find work but not queue it"),
+               "info")
+    return {"ok": True, "on": v}
+
+
 @app.post("/api/subocr/measure")
 async def api_subocr_measure(limit: int = -1):
     """Read the shape of files that have never been measured.
@@ -22486,6 +22516,26 @@ async function shapeCheck(){
   shapeLoad(true);
   if(el) setTimeout(()=>{ el.textContent=''; }, 2500);
 }
+async function shapeQueueReady(){
+  const el=document.getElementById('shapeMsg');
+  if(el) el.textContent=' queueing…';
+  try{
+    const r=await (await fetch('/api/subocr/queue_ready',{method:'POST'})).json();
+    if(el) el.textContent = r.queued
+      ? ` queued ${r.queued} file(s)`
+      : ' nothing was ready to queue';
+  }catch(e){ if(el) el.textContent=' failed'; }
+  shapeLoad(true);
+  if(el) setTimeout(()=>{ el.textContent=''; }, 4000);
+}
+async function shapeAutoQueue(on){
+  const el=document.getElementById('shapeMsg');
+  if(el) el.textContent=' saving…';
+  try{ await fetch('/api/subocr/autoqueue?on='+(on?1:0),{method:'POST'}); }
+  catch(e){ if(el) el.textContent=' could not save'; return; }
+  if(el) el.textContent='';
+  shapeLoad(true);
+}
 async function shapeBatch(n){
   const el=document.getElementById('shapeMsg');
   if(el) el.textContent=' saving…';
@@ -22637,18 +22687,28 @@ async function shapeLoad(force){
   const ctl = `
     <div style="display:flex;gap:7px;align-items:center;font-size:11px;
                 margin:6px 0 2px;flex-wrap:wrap">
-      <span class="dim">when files need converting</span>
+      <!-- CHECKING AND QUEUEING, SPELLED APART. This switch said "when files
+           need converting", which sounded like it governed the conversion and
+           in fact governed the CHECK - so somebody who wanted the survey
+           without the work had to turn the survey off. It says what it does
+           now, and the queueing half is the checkbox beside it. -->
+      <span class="dim">check for files to convert</span>
       <span style="display:inline-flex;border:1px solid var(--line);
                    border-radius:5px;overflow:hidden">
         ${['manual','auto'].map(m=>`<button onclick="shapeMode('${m}')"
           title="${m==='auto'
-            ?'The sweep queues what it finds, every '+(s.every_h||6)+' hours.'
-            :'The sweep finds the work and leaves it for you to start.'}"
+            ?'Look for files to convert every '+(s.every_h||6)+' hours. Checking only - whether it QUEUES what it finds is the box beside this.'
+            :'Only look when you press a button here.'}"
           style="font-size:11px;padding:2px 10px;border:0;cursor:pointer;
             background:${smode===m?'var(--acc)':'transparent'};
             color:${smode===m?'#0b0e13':'var(--dim,#8a97a6)'};
             font-weight:${smode===m?'600':'400'}">${m}</button>`).join('')}
       </span>
+      <label style="display:flex;gap:5px;align-items:center;cursor:pointer"
+        title="On: the check hands what it finds straight to the OCR queue - which is what auto has always done. Off: it finds the work and leaves it for you to queue with the button.">
+        <input type="checkbox" ${s.autoqueue!==false?'checked':''}
+               onchange="shapeAutoQueue(this.checked)">
+        <span>queue what it finds</span></label>
       <!-- CHECK NOW MEASURES. It used to re-count the backlog, which is a
            reasonable thing for a button to do and not what its label says: the
            check IS the measurement. It reads from the known picture-subtitle
@@ -22666,17 +22726,26 @@ async function shapeLoad(force){
           n===mb?'selected':''}>${n?fmt(n):'all '+fmt(fn.to_measure||0)}</option>`).join('')}
       </select>
       <span class="dim">per check</span>
+      <!-- TWO DIFFERENT BUTTONS, because they were one and it misled. Convert
+           all now MEASURES first and then queues, which on a library with
+           nothing left to measure looks exactly like "it only scanned more
+           files" - which is what Erik saw. Queue these acts on what is
+           already known and measures nothing. -->
+      <button onclick="shapeQueueReady()" ${sweeping||measuring?'disabled':''}
+        style="font-size:11px;padding:2px 9px"
+        title="Queue the files already measured and known to be convertible. Measures nothing.">${
+        s.ready==null ? 'Queue what is ready <span class="dim">(counting…)</span>'
+        : s.ready ? `Queue what is ready (${fmt(s.ready)})`
+        : 'Queue what is ready (0)'}</button>
       <button onclick="shapeRun()" ${sweeping||measuring?'disabled':''}
         style="font-size:11px;padding:2px 9px"
-        title="Hand every convertible file to the queue - the queue paces itself">${
-        sweeping?'Queueing…'
-        : s.backlog==null ? 'Convert all now <span class="dim">(counting…)</span>'
-        : s.backlog ? `Convert all now (${fmt(s.backlog)})`
-        : 'Convert all now'}</button>
+        title="Measure anything unmeasured, then queue everything convertible. Slower: it reads files first.">${
+        sweeping?'Measuring and queueing…':'Measure, then convert all'}</button>
       <span class="dim">${sauto
-        ? `sweeps every ${s.every_h||6}h${s.next_sweep_in_s!=null
+        ? `checks every ${s.every_h||6}h${s.next_sweep_in_s!=null
             ? ` · next in ${hms(Math.round(s.next_sweep_in_s))}` : ''}`
-        : 'nothing is queued automatically'}${
+            + (s.autoqueue===false ? ' · found work waits for you' : '')
+        : 'only checks when you press a button'}${
         s.batch ? ` · capped at ${fmt(s.batch)} per sweep` : ''}</span>
       <span id="shapeMsg" class="dim"></span>
     </div>
@@ -22709,7 +22778,8 @@ async function shapeLoad(force){
       <span class="dim">right now:</span>
       ${stChip('processing','being read now','var(--acc)')}
       ${stChip('queued','queued','#b48bf2')}
-      ${stChip('eligible','waiting to be queued','var(--dim)')}
+      ${stChip('eligible','ready to queue','var(--dim)')}
+      ${stChip('unscanned','not scanned since they were written','var(--warn)')}
       ${(() => {
         // WHY THEY ARE STILL WAITING, which a count on its own invites and
         // never answers. Two different waits with two different reasons:

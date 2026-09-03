@@ -382,6 +382,9 @@ class Settings:
     # 0 means the whole backlog - each file costs one demux, so it is bounded
     # by default and unbounded on request.
     subocr_measure_batch: int = 50
+    # Does the check QUEUE what it finds, or only find it? Separate from the
+    # manual/auto switch, which is about how often it LOOKS.
+    subocr_autoqueue: bool = True
 
     # SUBTITLE OCR - the switches behind Settings -> Subtitle OCR. Defaults
     # match the measured thresholds in subocr.py; the page can move them.
