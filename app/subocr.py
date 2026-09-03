@@ -2939,8 +2939,26 @@ def screen_state() -> dict:
     return st
 
 
+def _has_our_text(probe: dict) -> bool:
+    """Does this file carry a text subtitle THIS system produced by OCR?
+
+    The same title marker embed() writes and is_ocr_track() reads, asked of a
+    stored probe rather than of an mkvmerge listing - one definition of "we
+    made this", so the panel and the muxer cannot disagree about it.
+    """
+    for st in (probe.get("streams") or []):
+        if st.get("codec_type") != "subtitle":
+            continue
+        if (st.get("codec_name") or "").lower() in IMG_CODECS:
+            continue
+        if _OCR_TITLE.search(str((st.get("tags") or {}).get("title") or "")):
+            return True
+    return False
+
+
 def _status_of(typeset: bool, library, live, done_kinds, rejected: bool,
-               convertible: bool = True, probed: bool = True):
+               convertible: bool = True, probed: bool = True,
+               ours: bool = False):
     r"""Where one measured file stands. THE ONLY definition of that.
 
     Extracted because the panel shows this per row and the summary counts it
@@ -2955,6 +2973,17 @@ def _status_of(typeset: bool, library, live, done_kinds, rejected: bool,
     if want in (done_kinds or ()):
         return "done", ("the signs have been burned into the picture"
                         if typeset else "the subtitles have been read to text")
+    # ASK THE FILE, NOT THE JOB TABLE. Erik asked whether "done" meant measured
+    # or actually replaced, and the answer was "either" - which is no answer.
+    # Worse, the job table gets it wrong in both directions: five of six films
+    # checked carry a text track this system made and have NO finished sub_ocr
+    # row, because the OCR was handed to a transcode and delivered there; and
+    # Aquaman has a finished sub_ocr row and no text track at all, because the
+    # read was rejected. The file itself is the only witness that cannot be
+    # out of date: either it now carries a text track we made, or it does not.
+    if not typeset and not convertible and ours:
+        return "converted", ("the picture subtitles have been read into a text "
+                             "track in this file")
     if rejected and not typeset:
         # Rejection is an OCR verdict. It does not stop a burn, so it is only
         # a hold on the files whose next step was the OCR.
@@ -2978,8 +3007,8 @@ def _status_of(typeset: bool, library, live, done_kinds, rejected: bool,
         return "unscanned", ("no stored probe — nothing can be planned from "
                              "this until the next scan reads it")
     if not typeset and not convertible:
-        return "done", ("a text track already covers this — there is nothing "
-                        "left to convert")
+        return "covered", ("the release already ships a text track for this "
+                           "role — nothing was converted and nothing needs to be")
     return "eligible", ("waiting for a burn to be planned" if typeset
                         else "waiting for the next OCR sweep")
 
@@ -3081,7 +3110,8 @@ def status_counts(cur) -> dict:
     # looked at this track and declined it" (a verdict about content). Counted
     # apart so each can be said plainly.
     out = {"processing": 0, "queued": 0, "done": 0, "eligible": 0, "held": 0,
-           "held_off": 0, "held_rejected": 0, "unscanned": 0}
+           "held_off": 0, "held_rejected": 0, "unscanned": 0,
+           "converted": 0, "covered": 0}
     try:
         rows = [dict(r) for r in cur.execute(
             "SELECT s.file_id, MAX(s.typeset) AS ts, f.library, "
@@ -3119,7 +3149,7 @@ def status_counts(cur) -> dict:
                  if not r["ts"] and r["sst"] != "rejected"
                  and r["file_id"] not in live
                  and "sub_ocr" not in done.get(r["file_id"], ())]
-        conv = {}
+        conv, ours_c = {}, {}
         if maybe:
             m2 = ",".join("?" * len(maybe))
             libs = {r["file_id"]: r["library"] for r in rows}
@@ -3128,8 +3158,10 @@ def status_counts(cur) -> dict:
                     f"WHERE file_id IN ({m2})", maybe):
                 d = dict(j)
                 try:
+                    pj = json.loads(d["json"])
                     conv[d["file_id"]] = bool(select_targets(
-                        json.loads(d["json"]), libs.get(d["file_id"])))
+                        pj, libs.get(d["file_id"])))
+                    ours_c[d["file_id"]] = _has_our_text(pj)
                 except Exception:                            # noqa: BLE001
                     conv[d["file_id"]] = True
         for r in rows:
@@ -3139,7 +3171,8 @@ def status_counts(cur) -> dict:
                 done_kinds=done.get(r["file_id"], ()),
                 rejected=r["sst"] == "rejected",
                 convertible=conv.get(r["file_id"], True),
-                probed=r["file_id"] in probed_ids)
+                probed=r["file_id"] in probed_ids,
+                ours=ours_c.get(r["file_id"], False))
             out[st] = out.get(st, 0) + 1
             if st == "held":
                 out["held_off" if "switched off" in why
@@ -3194,6 +3227,7 @@ def _annotate_status(cur, rows: list) -> None:
     # 400-row window - and it is the only way to answer honestly: the question
     # is what select_targets() says, and there is no cheaper oracle for that.
     convertible: dict = {}
+    ours_map: dict = {}
     try:
         probes = {}
         for j in cur.execute(
@@ -3209,8 +3243,9 @@ def _annotate_status(cur, rows: list) -> None:
                 convertible[fid] = True      # unknown: do not claim it is done
                 continue
             try:
-                convertible[fid] = bool(select_targets(json.loads(raw),
-                                                       r.get("library")))
+                d = json.loads(raw)
+                convertible[fid] = bool(select_targets(d, r.get("library")))
+                ours_map[fid] = _has_our_text(d)
             except Exception:                                # noqa: BLE001
                 convertible[fid] = True
     except Exception:                                        # noqa: BLE001
@@ -3222,7 +3257,8 @@ def _annotate_status(cur, rows: list) -> None:
             done_kinds=last_done.get(r.get("file_id"), ()),
             rejected=r.get("file_id") in rejected,
             convertible=convertible.get(r.get("file_id"), True),
-            probed=r.get("file_id") in probes)
+            probed=r.get("file_id") in probes,
+            ours=ours_map.get(r.get("file_id"), False))
 
 
 # MEASURED, BECAUSE IT IS NOT FREE. sweep_pick over the whole library takes

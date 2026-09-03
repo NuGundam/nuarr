@@ -22344,7 +22344,8 @@ function shapePoolPill(typeset){
 // green here means what a green means anywhere else on the page.
 function shapeStatus(r){
   const st=r.status||'eligible';
-  const c = st==='done'       ? 'var(--ok)'
+  const c = (st==='done'||st==='converted') ? 'var(--fx-ok,#7fe0a0)'
+          : st==='covered'    ? 'var(--dim)'
           : st==='processing' ? 'var(--acc)'
           : st==='queued'     ? '#b48bf2'
           : st==='held'       ? 'var(--warn)'
@@ -22357,7 +22358,13 @@ function shapeStatus(r){
   // - the answer was sitting in the hover text nobody hovers. The two holds
   // get their own words: your switch, or the OCR's verdict.
   let label=st;
-  if(st==='held'){
+  // CONVERTED vs COVERED vs DONE, because "done" was answering two questions
+  // with one word: nuarr read the pictures into text, OR the release already
+  // had text and nothing was ever converted. Same outcome for playback, very
+  // different fact about what this system did.
+  if(st==='converted') label='converted';
+  else if(st==='covered') label='already had text';
+  else if(st==='held'){
     const w=r.status_why||'';
     label = /switched off/.test(w) ? 'OCR off' : 'rejected';
   }
@@ -22693,8 +22700,19 @@ async function shapeLoad(force){
         <span class="dim">typeset → burned in by the encoder</span></span>
       ${fn.queued?`<span style="color:#b48bf2"><b>${fmt(fn.queued)}</b>
         <span class="dim">queued now</span></span>`:''}
-      <span style="color:var(--fx-ok,#7fe0a0)"><b>${fmt(fn.converted)}</b>
-        <span class="dim">already converted</span></span>
+      <!-- COUNTED FROM THE FILES, not from finished jobs. A job row says an
+           attempt happened; the file says whether a text track is in it. Five
+           of six films checked carry a track this system made and have no
+           sub_ocr row at all, because the OCR was handed to a transcode and
+           delivered there - and one has the row and no track, because the read
+           was rejected. -->
+      <span style="color:var(--fx-ok,#7fe0a0)"
+        title="This system read the picture subtitles into a text track in the file."
+        ><b>${fmt((s.status||{}).converted || fn.converted)}</b>
+        <span class="dim">converted by nuarr</span></span>
+      ${(s.status||{}).covered?`<span class="dim"
+        title="The release already shipped its own text subtitles for that role, so nothing was converted and nothing needs to be."
+        ><b>${fmt(s.status.covered)}</b> already had text</span>`:''}
       ${fn.rejected?`<span style="color:var(--warn)"
         title="The reader ran and declined these - too little usable text. A verdict about the content, remembered so the same file is not read again every sweep."
         ><b>${fmt(fn.rejected)}</b>
