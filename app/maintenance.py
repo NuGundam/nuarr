@@ -214,6 +214,25 @@ def prune(dry_run: bool = False) -> dict:
                      f" LIMIT {CHUNK})", (rd_cut, rg_cut))
         except Exception:
             out["renames_deleted"] = 0
+        # SHAPE VERDICTS OUTLIVE THEIR FILES. sub_shape has no foreign key -
+        # it is written by the OCR check against a file id and nothing removes
+        # a row when that file leaves the library. forget_shapes() covers the
+        # case that matters (the file was REWRITTEN, so the track numbers
+        # slid), and pruning file_probes above quietly created a second one:
+        # a verdict whose probe is gone can never be re-checked or re-used.
+        #
+        # None outstanding when this was written - the check is young - which
+        # is the moment to add the sweep rather than the moment it is 40,000
+        # rows deep.
+        try:
+            out["shapes_deleted"] = _delete_chunked(
+                cur, "DELETE FROM sub_shape WHERE file_id IN "
+                     "(SELECT s.file_id FROM sub_shape s "
+                     "   LEFT JOIN files f ON f.id = s.file_id "
+                     "  WHERE f.id IS NULL OR f.state IN ('deleted','duplicate') "
+                     f" LIMIT {CHUNK})", ())
+        except Exception:
+            out["shapes_deleted"] = 0
 
     STATS.update(history_deleted=out.get("history_deleted", 0),
                  jobs_deleted=out.get("jobs_deleted", 0),
@@ -226,7 +245,7 @@ SUBOCR_WORK_HOURS = 6
 
 
 def prune_subocr_work(dry_run: bool = False) -> dict:
-    r"""Remove abandoned subocr_* scratch directories from the cache.
+    r"""Remove abandoned subocr_* and shape_* scratch directories from the cache.
 
     THE THIRD PLACE THINGS ACCUMULATE. run_one() creates a temp dir per job for
     the .sup dumps, the .srt output and (on the mux path) the whole rebuilt
@@ -272,7 +291,14 @@ def prune_subocr_work(dry_run: bool = False) -> dict:
         return out
     freed = 0
     for name in os.listdir(root):
-        if not name.startswith("subocr_"):
+        # shape_ AS WELL AS subocr_. measure_file() creates its own scratch dir
+        # for the .sup it reads, deletes it in a finally - and a finally does
+        # not run when the process is stopped mid-read, which on this machine
+        # is every restart during a measuring pass. Found 52 of them holding
+        # 345 MB of .sup, none younger than the cutoff, none known to anything.
+        # Same class of directory, same owner, same rules: this sweep already
+        # had the reasoning, it was only looking for one prefix.
+        if not (name.startswith("subocr_") or name.startswith("shape_")):
             continue
         d = os.path.join(root, name)
         if not os.path.isdir(d):
