@@ -16,9 +16,9 @@ Native Windows. Python and FastAPI, one scheduled task, a web UI on port 8770.
 No Docker, no Node, no service wrapper.
 
 <!-- nuarr:stats -->
-Running against a 12-disk pool: **39,591 files, 60.68 TB, 2.49 TB saved (3.4%).**
+Running against a 12-disk pool: **39,622 files, 61.38 TB, 2.57 TB saved (3.1%).**
 
-<sub>Figures from the 1.10.1 build. The badges above come straight from GitHub and are always current.</sub>
+<sub>Figures from the 1.11.2 build. The badges above come straight from GitHub and are always current.</sub>
 <!-- /nuarr:stats -->
 
 **[▶ Interactive presentation](https://nugundam.github.io/nuarr/presentation.html)** —
