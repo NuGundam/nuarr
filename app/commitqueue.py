@@ -166,6 +166,16 @@ async def run_due(limit: int = 10) -> dict:
                 pass
             joblog.log(f"commit retry OK: {os.path.basename(row['target'])} "
                        f"— {detail}", "ok", row["job_id"])
+            # PLEX TOO, FOR THE SAME REASON. A deferred commit is a file
+            # change like any other - it just happened minutes or hours after
+            # the encode, because the file was locked at the time. It never
+            # went through _post_commit(), so nothing here had ever told Plex.
+            try:
+                from . import plexqueue
+                plexqueue.enqueue(row["file_id"], row["target"],
+                                  why="a deferred commit landed")
+            except Exception:                                # noqa: BLE001
+                pass
             # the file changed, so the arr still needs telling
             try:
                 from . import renamequeue

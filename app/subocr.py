@@ -2802,43 +2802,6 @@ def autoqueue() -> bool:
     return True if v is None else bool(v)
 
 
-def ready_to_queue(limit: int = 100000) -> list[dict]:
-    """Files that would convert right now, without measuring anything first.
-
-    run_sweep() measures before it queues, which is right for files nobody has
-    looked at and pure delay for files already measured. This is what the
-    Queue-these button acts on.
-    """
-    return sweep_pick(limit)
-
-
-async def queue_ready(limit: int | None = None) -> dict:
-    """Queue the already-known convertible files. Measures nothing."""
-    import asyncio
-    from . import jobs, joblog as _log
-    picked = await asyncio.to_thread(ready_to_queue, limit or 100000)
-    n = 0
-    for p in picked:
-        label = (p.get("title") or "") + (f" - {p['ep']}" if p.get("ep") else "")
-        try:
-            # KIND AND PRIORITY, the same as the sweep passes. Without them
-            # enqueue() plans whatever the file needs generally - which for an
-            # already-standardised file is nothing - and the button reported
-            # "considered 1, queued 0" while a hand-written enqueue with
-            # kind='sub_ocr' queued it fine.
-            if await jobs.enqueue(p["file_id"], p["path"], label or "",
-                                  kind="sub_ocr", priority=90,
-                                  source="subtitle OCR (queued by hand)"):
-                n += 1
-        except Exception:                                    # noqa: BLE001
-            continue
-    if n:
-        await jobs.start()
-        _BACKLOG["n"] = None
-        _log.log(f"subtitle OCR: queued {n} already-measured file(s)", "ok")
-    return {"ok": True, "queued": n, "considered": len(picked)}
-
-
 def sweep_pick(limit: int) -> list[dict]:
     """The next `limit` convertible files, respecting every switch."""
     from .db import cursor
@@ -2923,22 +2886,6 @@ def ep_label(season, episode) -> str:
         return ""
 
 
-def screen_state() -> dict:
-    r"""What the screener is doing this second. For the UI; never blocks.
-
-    `now` is the file being demuxed right now, or "" when idle. It exists
-    because the read takes ten to twenty seconds and a panel that only shows
-    finished rows looks identical to one that has hung.
-    """
-    st = dict(_SCREEN)
-    st["busy_s"] = round(time.time() - st["started"], 1) if st["now"] else 0.0
-    # Sent rather than hardcoded in the page: one definition of the test, and
-    # a page that cannot describe a threshold it does not have.
-    st["tall_frac"] = TYPESET_TALL_FRAC
-    st["typeset_share"] = TYPESET_SHARE
-    return st
-
-
 def _has_our_text(probe: dict) -> bool:
     """Does this file carry a text subtitle THIS system produced by OCR?
 
@@ -2956,316 +2903,6 @@ def _has_our_text(probe: dict) -> bool:
     return False
 
 
-def _status_of(typeset: bool, library, live, done_kinds, rejected: bool,
-               convertible: bool = True, probed: bool = True,
-               ours: bool = False):
-    r"""Where one measured file stands. THE ONLY definition of that.
-
-    Extracted because the panel shows this per row and the summary counts it
-    across the whole library, and two copies of a rule like this drift - the
-    header would end up disagreeing with the rows directly beneath it.
-    """
-    want = "transcode" if typeset else "sub_ocr"
-    if live and live.get("state") == "running":
-        return "processing", f"a {live.get('kind')} job is running now"
-    if live:
-        return "queued", f"a {live.get('kind')} job is waiting its turn"
-    if want in (done_kinds or ()):
-        return "done", ("the signs have been burned into the picture"
-                        if typeset else "the subtitles have been read to text")
-    # ASK THE FILE, NOT THE JOB TABLE. Erik asked whether "done" meant measured
-    # or actually replaced, and the answer was "either" - which is no answer.
-    # Worse, the job table gets it wrong in both directions: five of six films
-    # checked carry a text track this system made and have NO finished sub_ocr
-    # row, because the OCR was handed to a transcode and delivered there; and
-    # Aquaman has a finished sub_ocr row and no text track at all, because the
-    # read was rejected. The file itself is the only witness that cannot be
-    # out of date: either it now carries a text track we made, or it does not.
-    if not typeset and not convertible and ours:
-        return "converted", ("the picture subtitles have been read into a text "
-                             "track in this file")
-    if rejected and not typeset:
-        # Rejection is an OCR verdict. It does not stop a burn, so it is only
-        # a hold on the files whose next step was the OCR.
-        return "held", "subtitle OCR was rejected for this file"
-    if not enabled_for(library):
-        return "held", (f"subtitle OCR is switched off for "
-                        f"{library or 'this library'}")
-    # NOTHING LEFT TO CONVERT IS NOT "WAITING". Erik pressed Convert all now,
-    # watched it measure a few files and queue nothing, and asked why - and the
-    # panel had told him 36 files were waiting for exactly that button. They
-    # were not: every one already had a text track covering the role, so
-    # select_targets returns nothing for them and the sweep has never had any
-    # reason to pick them. The status was reporting the absence of a job as
-    # though it were the presence of work.
-    # NO STORED PROBE, NO PLAN. Twenty measured files had no probe row at all -
-    # scanned away, or written since - and with nothing to read, select_targets
-    # cannot be asked and the sweep skips them silently. Counting them as
-    # "waiting to be queued" is how the headline came to promise twenty files
-    # to a button that would never find them.
-    if not probed:
-        return "unscanned", ("no stored probe — nothing can be planned from "
-                             "this until the next scan reads it")
-    if not typeset and not convertible:
-        return "covered", ("the release already ships a text track for this "
-                           "role — nothing was converted and nothing needs to be")
-    return "eligible", ("waiting for a burn to be planned" if typeset
-                        else "waiting for the next OCR sweep")
-
-
-def shape_detail(file_id: int) -> dict:
-    r"""Everything behind one row of the Signs-or-dialogue table.
-
-    THE TABLE SAYS "rejected" AND STOPS. That is the moment a person wants the
-    rest of it: which tracks the file has, what each was measured at, which
-    thresholds those numbers were compared against, and what has actually been
-    attempted - because "rejected" describes a verdict, not a history, and the
-    two are easy to confuse when only one of them is on screen.
-
-    Everything here is already stored. Nothing is measured, no file is opened,
-    and it is one row's worth of queries - so it can hang off a click without
-    the table paying for it on every poll.
-    """
-    from .db import cursor
-    out: dict = {"file_id": int(file_id), "tracks": [], "jobs": [],
-                 "file": {}, "thresholds": {}, "why": ""}
-    try:
-        with cursor() as cur:
-            f = cur.execute(
-                "SELECT id,path,title,season,episode,library,state,"
-                "       state_reason,subocr_state FROM files WHERE id=?",
-                (int(file_id),)).fetchone()
-            if not f:
-                return out
-            f = dict(f)
-            out["file"] = {
-                "title": f.get("title") or "", "library": f.get("library") or "",
-                "ep": ep_label(f.get("season"), f.get("episode")),
-                "path": f.get("path") or "", "state": f.get("state") or "",
-                "state_reason": f.get("state_reason") or "",
-                "subocr_state": f.get("subocr_state") or "",
-            }
-            lib = f.get("library")
-            out["thresholds"] = {
-                "tall_share": TYPESET_SHARE, "tall_frac": TYPESET_TALL_FRAC,
-                "signs_max_cpm": signs_max_cpm(lib),
-                "dialogue_min_cues": dialogue_min_cues(lib),
-                "enabled": enabled_for(lib),
-            }
-            for r in cur.execute(
-                    "SELECT rel,typeset,median_h,tall_share,at "
-                    "FROM sub_shape WHERE file_id=? ORDER BY rel", (int(file_id),)):
-                d = dict(r)
-                d["typeset"] = bool(d["typeset"])
-                out["tracks"].append(d)
-            # EVERY ATTEMPT, NEWEST FIRST - including the skipped and the
-            # failed. A file that has been through OCR four times and declined
-            # four times is a different story from one that has never been
-            # tried, and the status chip cannot tell them apart.
-            for j in cur.execute(
-                    "SELECT kind,state,error,result_json,"
-                    "       created_at,started_at,finished_at "
-                    "FROM jobs WHERE file_id=? AND kind IN ('sub_ocr','transcode') "
-                    "ORDER BY COALESCE(finished_at,started_at,created_at) DESC "
-                    "LIMIT 12", (int(file_id),)):
-                d = dict(j)
-                note = d.pop("error", "") or ""
-                raw = d.pop("result_json", "") or ""
-                if not note and raw:
-                    try:
-                        r = json.loads(raw)
-                        note = str(r.get("reason") or r.get("note")
-                                   or r.get("summary") or "")
-                    except Exception:                        # noqa: BLE001
-                        note = ""
-                d["note"] = note
-                out["jobs"].append(d)
-    except Exception as e:                                   # noqa: BLE001
-        out["error"] = str(e)
-        return out
-    # The same sentence the row's status chip is built from, so the drop-down
-    # cannot contradict the line that opened it.
-    ts = any(t["typeset"] for t in out["tracks"])
-    live = next((j for j in out["jobs"] if j["state"] in ("running", "queued")), None)
-    done = {j["kind"] for j in out["jobs"] if j["state"] == "done"}
-    out["status"], out["why"] = _status_of(
-        typeset=ts, library=out["file"].get("library"),
-        live=live, done_kinds=done,
-        rejected=(out["file"].get("subocr_state") == "rejected"))
-    return out
-
-
-def status_counts(cur) -> dict:
-    r"""How every measured file stands, not just the page being shown.
-
-    The rows on screen are the newest sixty; counting their statuses would
-    describe the window rather than the work. One file counts once - a file
-    with a typeset track and a dialogue track is one file, and it is counted
-    by the track that still has something to do.
-    """
-    # HELD IS TWO DIFFERENT FACTS, and one of them is the user's own doing.
-    # Erik read 32 rows of "held - rejected or switched off" and asked why,
-    # which is the question the label invited: it lumped "you switched OCR off
-    # for Animated Shows" (a setting, working as asked) together with "the OCR
-    # looked at this track and declined it" (a verdict about content). Counted
-    # apart so each can be said plainly.
-    out = {"processing": 0, "queued": 0, "done": 0, "eligible": 0, "held": 0,
-           "held_off": 0, "held_rejected": 0, "unscanned": 0,
-           "converted": 0, "covered": 0}
-    try:
-        rows = [dict(r) for r in cur.execute(
-            "SELECT s.file_id, MAX(s.typeset) AS ts, f.library, "
-            "       COALESCE(f.subocr_state,'') AS sst "
-            "  FROM sub_shape s JOIN files f ON f.id = s.file_id "
-            " WHERE f.state NOT IN ('deleted','duplicate') "
-            " GROUP BY s.file_id")]
-        if not rows:
-            return out
-        ids = [r["file_id"] for r in rows]
-        marks = ",".join("?" * len(ids))
-        live, done = {}, {}
-        for j in cur.execute(
-                f"SELECT file_id, kind, state FROM jobs "
-                f"WHERE file_id IN ({marks}) "
-                f"  AND state IN ('running','queued')", ids):
-            d = dict(j)
-            if d["state"] == "running" or d["file_id"] not in live:
-                live[d["file_id"]] = d
-        for j in cur.execute(
-                f"SELECT DISTINCT file_id, kind FROM jobs "
-                f"WHERE file_id IN ({marks}) AND state='done'", ids):
-            d = dict(j)
-            done.setdefault(d["file_id"], set()).add(d["kind"])
-        # THE SAME CONVERTIBILITY TEST THE ROWS USE. Without it the headline
-        # kept saying "36 waiting to be queued" while every row underneath had
-        # been corrected to "nothing left to convert" - the two numbers on one
-        # card disagreeing about the same files, which is worse than either
-        # being wrong alone. Only the files that would otherwise count as
-        # eligible are parsed, so this costs a handful of probe reads rather
-        # than the whole table.
-        probed_ids = {dict(j)["file_id"] for j in cur.execute(
-            f"SELECT file_id FROM file_probes WHERE file_id IN ({marks})", ids)}
-        maybe = [r["file_id"] for r in rows
-                 if not r["ts"] and r["sst"] != "rejected"
-                 and r["file_id"] not in live
-                 and "sub_ocr" not in done.get(r["file_id"], ())]
-        conv, ours_c = {}, {}
-        if maybe:
-            m2 = ",".join("?" * len(maybe))
-            libs = {r["file_id"]: r["library"] for r in rows}
-            for j in cur.execute(
-                    f"SELECT file_id, json FROM file_probes "
-                    f"WHERE file_id IN ({m2})", maybe):
-                d = dict(j)
-                try:
-                    pj = json.loads(d["json"])
-                    conv[d["file_id"]] = bool(select_targets(
-                        pj, libs.get(d["file_id"])))
-                    ours_c[d["file_id"]] = _has_our_text(pj)
-                except Exception:                            # noqa: BLE001
-                    conv[d["file_id"]] = True
-        for r in rows:
-            st, why = _status_of(
-                typeset=bool(r["ts"]), library=r["library"],
-                live=live.get(r["file_id"]),
-                done_kinds=done.get(r["file_id"], ()),
-                rejected=r["sst"] == "rejected",
-                convertible=conv.get(r["file_id"], True),
-                probed=r["file_id"] in probed_ids,
-                ours=ours_c.get(r["file_id"], False))
-            out[st] = out.get(st, 0) + 1
-            if st == "held":
-                out["held_off" if "switched off" in why
-                    else "held_rejected"] += 1
-    except Exception:                                        # noqa: BLE001
-        pass
-    return out
-
-
-def _annotate_status(cur, rows: list) -> None:
-    r"""Add where each measured file stands: held, eligible, queued, done...
-
-    ONE QUERY FOR THE WHOLE PAGE, not one per row. Sixty rows asking the jobs
-    table about themselves individually is sixty round trips to answer a
-    question one IN clause covers.
-
-    The verdict decides which job KIND counts as finished: a dialogue track is
-    done when its OCR is done, a typeset one when the burn - a transcode - has
-    run. A `skipped` sub_ocr on a typeset file is not done; it is the OCR
-    correctly declining, and the burn is still ahead of it.
-    """
-    if not rows:
-        return
-    ids = sorted({int(r["file_id"]) for r in rows if r.get("file_id")})
-    if not ids:
-        return
-    marks = ",".join("?" * len(ids))
-    live, last_done, rejected = {}, {}, set()
-    try:
-        for j in cur.execute(
-                f"SELECT file_id, kind, state FROM jobs "
-                f"WHERE file_id IN ({marks}) "
-                f"  AND state IN ('running','queued') ", ids):
-            d = dict(j)
-            # Running beats queued when a file somehow has both.
-            if d["state"] == "running" or d["file_id"] not in live:
-                live[d["file_id"]] = d
-        for j in cur.execute(
-                f"SELECT file_id, kind, MAX(finished_at) fa FROM jobs "
-                f"WHERE file_id IN ({marks}) AND state='done' "
-                f"GROUP BY file_id, kind", ids):
-            d = dict(j)
-            last_done.setdefault(d["file_id"], set()).add(d["kind"])
-        for j in cur.execute(
-                f"SELECT id FROM files WHERE id IN ({marks}) "
-                f"  AND COALESCE(subocr_state,'') = 'rejected'", ids):
-            rejected.add(dict(j)["id"])
-    except Exception:                                        # noqa: BLE001
-        return
-    # IS THERE ANYTHING LEFT TO CONVERT, per row. One stored probe parsed per
-    # file on screen - measured at about 0.07 ms each, so ~30 ms for a full
-    # 400-row window - and it is the only way to answer honestly: the question
-    # is what select_targets() says, and there is no cheaper oracle for that.
-    convertible: dict = {}
-    ours_map: dict = {}
-    try:
-        probes = {}
-        for j in cur.execute(
-                f"SELECT file_id, json FROM file_probes WHERE file_id IN ({marks})",
-                ids):
-            probes[dict(j)["file_id"]] = dict(j)["json"]
-        for r in rows:
-            fid = r.get("file_id")
-            if fid in convertible:
-                continue
-            raw = probes.get(fid)
-            if not raw:
-                convertible[fid] = True      # unknown: do not claim it is done
-                continue
-            try:
-                d = json.loads(raw)
-                convertible[fid] = bool(select_targets(d, r.get("library")))
-                ours_map[fid] = _has_our_text(d)
-            except Exception:                                # noqa: BLE001
-                convertible[fid] = True
-    except Exception:                                        # noqa: BLE001
-        convertible = {}
-    for r in rows:
-        r["status"], r["status_why"] = _status_of(
-            typeset=bool(r.get("typeset")), library=r.get("library"),
-            live=live.get(r.get("file_id")),
-            done_kinds=last_done.get(r.get("file_id"), ()),
-            rejected=r.get("file_id") in rejected,
-            convertible=convertible.get(r.get("file_id"), True),
-            probed=r.get("file_id") in probes,
-            ours=ours_map.get(r.get("file_id"), False))
-
-
-# MEASURED, BECAUSE IT IS NOT FREE. sweep_pick over the whole library takes
-# 2.3 seconds, and the panel behind it polls every 2.5 while work is moving -
-# so computing this per poll would have the page spending most of its life
-# asking the same question. The answer only changes when the sweep queues
-# something or a scan finds new files, neither of which happens on that scale.
 _BACKLOG: dict = {"at": 0.0, "n": None, "busy": False}
 _BACKLOG_TTL = 600.0
 
@@ -3307,324 +2944,578 @@ def _backlog():
     return _BACKLOG["n"]
 
 
-_FUNNEL: dict = {"at": 0.0, "d": None, "busy": False}
-_FUNNEL_TTL = 120.0
-# Both spellings ffprobe uses for a picture subtitle, as a SQL fragment. The
-# same test the sweep uses, so the number on the page and the number the sweep
-# works from can never disagree.
-_IMG_SQL = "(p.json LIKE '%hdmv_pgs_subtitle%' OR p.json LIKE '%pgssub%')"
-# Never measured AND still worth measuring. A file whose OCR has already run is
-# not unknown - whatever its stored probe still says, the picture track it had
-# has been dealt with, and re-reading it costs a demux to learn nothing. Same
-# for one the reader has already declined.
-_UNMEASURED_SQL = (
-    "AND NOT EXISTS (SELECT 1 FROM sub_shape s WHERE s.file_id=f.id) "
-    "AND COALESCE(f.subocr_state,'') != 'rejected' "
-    "AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.file_id=f.id "
-    "                AND j.kind='sub_ocr' AND j.state='done')")
+_RULES_GAP: dict = {"at": 0.0, "d": None, "busy": False}
+# WHICH FILES, not just how many. The counts go to the page; these go to the
+# drain, so it can top the queue up without re-deriving the whole answer every
+# minute. (file_id, library) pairs only - a few hundred KB at five thousand
+# rows, against the ~25 s and 200 MB a fresh walk costs.
+_GAP_IDS: list = []
+# AND ENOUGH TO SHOW A PERSON. The counts answer "how many"; a row on the page
+# has to answer "which, and what is wrong with it", and re-deriving that per
+# click would mean planning five thousand files again. Capped per library -
+# the list is scrollable, nobody reads past a couple of hundred, and the cap is
+# what keeps this a few hundred KB rather than a copy of the library.
+_GAP_FILES: dict = {}
+_GAP_PER_LIB = 200
+# WHAT THE WALK IS DOING RIGHT NOW. Separate from the cached answer because
+# they have different lifetimes: the answer survives for five minutes, this is
+# true for the thirty seconds a pass takes and meaningless after. `started` is
+# sent rather than a rate, so the page divides by its own clock - a rate
+# computed here and read a second later is a rate for a moment that has passed.
+GAP_STATE: dict = {"running": False, "done": 0, "total": 0, "found": 0,
+                   "started": 0.0}
+_RULES_GAP_TTL = 300.0
 
 
-def funnel() -> dict:
-    r"""The whole picture-subtitle population, in the order a person asks.
+def _kept_subs(probe: dict, row, _rules) -> list:
+    """The subtitle tracks the plan KEEPS, in the file's own words.
 
-    THE PANEL COULD ONLY EVER SAY "76 of 164 measured", which is a fraction of
-    a number nobody had been shown: 164 was the files this system happens to
-    have measured, not the files that have picture subtitles. The honest shape
-    is a funnel, and every step of it is a count somebody would otherwise have
-    to take on faith:
-
-        39,612 files managed
-         5,451 carry a picture subtitle          <- the real population
-           164 have been measured                <- what this check has read
-         5,287 still to measure
-
-    and, of what has been measured, where each file is going: OCR, a burn, or
-    nowhere because the reader declined it.
-
-    Memoised for two minutes. The LIKE over the probe blobs is ~0.8 s and none
-    of these numbers moves faster than a scan.
+    The change lines say what goes; this says what is left, which is the half
+    of the sentence a person actually wants - "remove picture subtitle 1" is
+    only reassuring once you can see that a text track survives it.
     """
-    # NEVER ON THE REQUEST PATH. Two LIKE scans over 37,000 probe blobs plus
-    # eight counts is ~5 seconds cold, and this panel polls - so every time the
-    # cache expired, one poll took five seconds and the page sat there. Same
-    # treatment as the backlog: serve what is cached, refresh behind it. The
-    # very first call returns {} and the funnel row simply does not draw yet,
-    # which is a beat of nothing rather than five seconds of waiting.
-    now = time.time()
-    fresh = _FUNNEL["d"] is not None and now - _FUNNEL["at"] < _FUNNEL_TTL
-    if not fresh and not _FUNNEL.get("busy"):
-        _FUNNEL["busy"] = True
-        import threading
-        threading.Thread(target=_funnel_compute, name="subocr-funnel",
-                         daemon=True).start()
-    return _FUNNEL["d"] or {}
-
-
-def _funnel_compute() -> dict:
-    """The counting itself. Runs on a thread; see funnel()."""
-    from .db import cursor
-    d = {}
     try:
-        with cursor() as cur:
-            def one(sql, args=()):
-                return int(cur.execute(sql, args).fetchone()[0] or 0)
-            live = "f.state NOT IN ('deleted','duplicate')"
-            d["managed"] = one(f"SELECT COUNT(*) FROM files f WHERE {live}")
-            d["probed"] = one(
-                "SELECT COUNT(*) FROM file_probes p JOIN files f ON f.id=p.file_id "
-                f"WHERE {live}")
-            d["with_picture"] = one(
-                "SELECT COUNT(*) FROM file_probes p JOIN files f ON f.id=p.file_id "
-                f"WHERE {live} AND {_IMG_SQL}")
-            d["measured"] = one(
-                "SELECT COUNT(DISTINCT s.file_id) FROM sub_shape s "
-                f"JOIN files f ON f.id=s.file_id WHERE {live}")
-            d["typeset_files"] = one(
-                "SELECT COUNT(DISTINCT s.file_id) FROM sub_shape s "
-                f"JOIN files f ON f.id=s.file_id WHERE {live} AND s.typeset=1")
-            d["dialogue_files"] = one(
-                "SELECT COUNT(DISTINCT s.file_id) FROM sub_shape s "
-                f"JOIN files f ON f.id=s.file_id WHERE {live} AND s.typeset=0 "
-                "AND s.file_id NOT IN (SELECT file_id FROM sub_shape WHERE typeset=1)")
-            d["rejected"] = one(
-                "SELECT COUNT(*) FROM files f "
-                f"WHERE {live} AND COALESCE(f.subocr_state,'')='rejected'")
-            d["converted"] = one(
-                "SELECT COUNT(DISTINCT j.file_id) FROM jobs j JOIN files f "
-                f"ON f.id=j.file_id WHERE {live} AND j.kind='sub_ocr' "
-                "AND j.state='done'")
-            d["queued"] = one(
-                "SELECT COUNT(DISTINCT j.file_id) FROM jobs j JOIN files f "
-                f"ON f.id=j.file_id WHERE {live} AND j.kind='sub_ocr' "
-                "AND j.state IN ('queued','running')")
+        kw = dict(anime=_rules.is_anime(row["path"] or ""),
+                  filename=row["path"] or "", size_bytes=row["size"] or 0,
+                  library=row["library"] or "", file_id=row["id"])
+        plan = _rules.decide(probe, **kw)
+        keep = set(getattr(plan, "keep_subs", None) or [])
+        out = []
+        for i, st in enumerate(s for s in (probe.get("streams") or [])
+                               if s.get("codec_type") == "subtitle"):
+            if i in keep:
+                lang = ((st.get("tags") or {}).get("language") or "und")
+                out.append(f"{st.get('codec_name') or '?'} ({lang})")
+        return out
     except Exception:                                        # noqa: BLE001
-        _FUNNEL["busy"] = False
-        return _FUNNEL["d"] or {}
-    # COUNTED THE SAME WAY THE PICKER PICKS, so the number on the page is the
-    # number Check now would work through. Subtracting measured from
-    # with_picture looked equivalent and was not: it counted every already
-    # converted file as outstanding.
+        return []
+
+
+def _sub_actions(row, probe: dict, _rules) -> list:
+    r"""The SUBTITLE work the planner would do to this file, or nothing.
+
+    Two traps, both hit on the way here:
+
+    plan.needed IS NOT THE ANSWER. It is true for a great many settled files -
+    it covers the whole plan, container and metadata included - so counting it
+    reports most of the library as out of date. plan.actions is the itemised
+    list, and each action names its own kind, which is what makes "subtitle
+    work only" expressible at all.
+
+    plan.reasons IS NOT THE EXPLANATION. It is empty on a normal plan; the
+    sentence a person would recognise lives in action.what / action.why. The
+    first version of this check filtered on reasons, matched nothing, and
+    therefore reported a clean library with total confidence - the worst way
+    for a check to fail, because it looks exactly like good news.
+    """
+    kw = dict(anime=_rules.is_anime(row["path"] or ""),
+              filename=row["path"] or "", size_bytes=row["size"] or 0,
+              library=row["library"] or "", file_id=row["id"])
     try:
-        with cursor() as cur:
-            d["to_measure"] = int(cur.execute(
-                "SELECT COUNT(*) FROM file_probes p JOIN files f ON f.id=p.file_id "
-                "WHERE f.state NOT IN ('deleted','duplicate') "
-                f"AND {_IMG_SQL} {_UNMEASURED_SQL}").fetchone()[0] or 0)
+        plan = _rules.decide(probe, **kw)
+    except TypeError:                    # older signature: no library/file_id
+        kw.pop("library", None)
+        kw.pop("file_id", None)
+        try:
+            plan = _rules.decide(probe, **kw)
+        except Exception:                                    # noqa: BLE001
+            return []
     except Exception:                                        # noqa: BLE001
-        d["to_measure"] = max(0, d["with_picture"] - d["measured"])
-    _FUNNEL.update(at=time.time(), d=d, busy=False)
-    return d
+        return []
+    return [a for a in (getattr(plan, "actions", None) or [])
+            if getattr(a, "kind", "") == "subtitle"]
 
 
-def measure_batch() -> int:
-    """How many files one Check-now pass reads. 0 means every one of them."""
-    try:
-        return max(0, int(_s("subocr_measure_batch", 50) or 0))
-    except (TypeError, ValueError):
-        return 50
+def _rules_gap_compute() -> dict:
+    r"""Files whose subtitles do not match the rules as they stand today.
 
+    WHY THIS REPLACED A PANEL. The picture-subtitle check grew into a page of
+    its own - a funnel, a measure batch, two queue buttons, three progress bars
+    - to answer a question the pipeline already answers: does this file match
+    the rules, and if not, requeue it. Every one of those buttons was a second
+    way to start work the planner starts anyway, and each needed its own
+    counts, its own phases and its own explanations for why a number here
+    disagreed with a number there.
 
-MEASURE_STATE: dict = {"running": False, "done": 0, "total": 0, "now": "",
-                       "typeset": 0, "at": 0.0}
+    So the measuring stays where it belongs - inside the OCR job, which has to
+    demux the track regardless - and what is left is the one thing a settings
+    page owes you after you change a rule: WHICH FILES NO LONGER MATCH IT.
 
-
-def measure_pick(limit: int) -> list[dict]:
-    r"""Files that HAVE a picture subtitle and have never been measured.
-
-    Deliberately not sweep_pick(): that answers "what would convert under the
-    current switches", which is the queue's question. This one answers "what do
-    we not know about yet", which is the check's - a library with OCR switched
-    off for a shelf still benefits from knowing what is on it.
+    Asked of the planner, not of a private opinion: decide() is the same code
+    the queue uses, so a file listed here is a file the queue would act on. The
+    walk is bounded to files with subtitle work outstanding, and the answer is
+    cached for five minutes and computed off the request path, because it reads
+    every stored probe in the libraries it covers.
     """
     from .db import cursor
-    out = []
-    with cursor() as cur:
-        rows = cur.execute(
-            "SELECT p.file_id, p.json, f.path, f.title, f.library, "
-            "       f.season, f.episode "
-            "FROM file_probes p JOIN files f ON f.id=p.file_id "
-            "WHERE f.state NOT IN ('deleted','duplicate') "
-            f"  AND {_IMG_SQL} "
-            f"  {_UNMEASURED_SQL} "
-            "ORDER BY f.updated_at DESC")
-        for r in rows:
-            if limit and len(out) >= limit:
-                break
+    from . import rules as _rules
+    out: dict = {"total": 0, "by_library": {}, "reasons": {},
+                 "at": time.time()}
+    # IDS FIRST, PROBES IN CHUNKS. The first version fetched every row with its
+    # probe JSON in one go: 39,000 rows at ~4.6 KB of JSON each is close to
+    # 200 MB held for the whole walk, inside a process that also runs the
+    # encoder. Fetching the ids costs a few hundred KB, gives the progress bar
+    # a real denominator before any work starts, and lets the probes arrive
+    # 400 at a time and be dropped as soon as they are read.
+    try:
+        with cursor() as cur:
+            ids = [r["id"] for r in cur.execute(
+                "SELECT f.id FROM files f JOIN file_probes p "
+                "       ON p.file_id = f.id "
+                " WHERE f.state = 'done' "
+                "   AND f.id NOT IN (SELECT file_id FROM jobs WHERE file_id "
+                "                    IS NOT NULL AND state IN ('queued','running'))"
+            )]
+    except Exception:                                        # noqa: BLE001
+        GAP_STATE.update(running=False)
+        _RULES_GAP["busy"] = False
+        return _RULES_GAP["d"] or out
+    GAP_STATE.update(running=True, done=0, total=len(ids), found=0,
+                     started=time.time())
+    found: list = []
+    files_by_lib: dict = {}
+    CHUNK = 400
+    try:
+        for i in range(0, len(ids), CHUNK):
+            batch = ids[i:i + CHUNK]
+            qs = ",".join("?" * len(batch))
             try:
-                d = json.loads(r["json"])
+                with cursor() as cur:
+                    rows = cur.execute(
+                        f"SELECT f.id, f.path, f.library, f.size, f.title, "
+                        f"       f.season, f.episode, f.pool_disk, p.json "
+                        f"  FROM files f JOIN file_probes p ON p.file_id = f.id "
+                        f" WHERE f.id IN ({qs})", batch).fetchall()
             except Exception:                                # noqa: BLE001
+                GAP_STATE["done"] += len(batch)
                 continue
-            # NO select_targets() FILTER HERE, on purpose. That function
-            # answers "would the OCR convert this under the current switches",
-            # which is the queue's question; this one is "what is actually on
-            # it", which is the check's. Filtering by it made the picker
-            # disagree with the count beside the button - 688 to measure, and
-            # a pass that measured none of them - and it meant a library with
-            # OCR switched off could never be surveyed at all.
-            out.append({"file_id": r["file_id"], "path": r["path"],
-                        "title": r["title"] or "",
-                        "ep": ep_label(r["season"], r["episode"]),
-                        "library": r["library"], "probe": d})
+            for r in rows:
+                try:
+                    probe = json.loads(r["json"])
+                except Exception:                            # noqa: BLE001
+                    continue
+                acts = _sub_actions(r, probe, _rules)
+                if not acts:
+                    continue
+                lib = r["library"] or "(no library)"
+                out["by_library"][lib] = out["by_library"].get(lib, 0) + 1
+                out["total"] += 1
+                found.append((r["id"], lib))
+                bucket = files_by_lib.setdefault(lib, [])
+                if len(bucket) < _GAP_PER_LIB:
+                    bucket.append({
+                        "keeps": _kept_subs(probe, r, _rules),
+                        "file_id": r["id"],
+                        "label": (r["title"] or "")
+                                 + (" · " + ep_label(r["season"], r["episode"])
+                                    if r["season"] is not None else ""),
+                        "path": r["path"],
+                        "disk": r["pool_disk"] or "",
+                        "changes": [a.what for a in acts[:3]]})
+                # WHAT THE PLANNER WANTS DONE, in its own words, counted. "31
+                # files do not match" is a number to be taken on trust; "31
+                # files still carry a picture track whose text has already been
+                # made" is a claim that can be checked, one file at a time.
+                for a in acts[:2]:
+                    k = re.sub(r"\b\d+\b", "n", (a.what or "").strip())[:80]
+                    out["reasons"][k] = out["reasons"].get(k, 0) + 1
+            GAP_STATE["done"] += len(batch)
+            GAP_STATE["found"] = out["total"]
+    finally:
+        GAP_STATE.update(running=False, done=GAP_STATE["total"])
+    _GAP_IDS[:] = found
+    _GAP_FILES.clear()
+    _GAP_FILES.update(files_by_lib)
+    _RULES_GAP.update(at=time.time(), d=out, busy=False)
     return out
 
 
-async def measure_sweep(limit: int | None = None) -> dict:
-    r"""Read the shape of files we have never measured. Changes nothing else.
+def gap_mode() -> str:
+    """auto requeues what the check finds; manual lists it and waits."""
+    m = (getattr(SETTINGS, "rulesgap_mode", "") or "").strip().lower()
+    return m if m in ("auto", "manual") else "manual"
 
-    This is what Check now does. It used to re-count the backlog, which is a
-    reasonable thing for a button to do and not what its label promised - the
-    check is the MEASUREMENT, and it had no way to be asked for. Each file
-    costs one demux of a single subtitle track, so the batch is bounded and
-    settable: 50 by default, 0 for the whole backlog when somebody wants to
-    leave it running.
+
+async def gap_auto() -> None:
+    """In auto, make sure a drain is running when there is drift to clear.
+
+    Auto and the button are the same machine now: this only decides whether to
+    switch it on. It never queues anything itself, so the pacing is identical
+    either way and there is one behaviour to understand rather than two.
     """
-    import asyncio
-    if MEASURE_STATE["running"]:
-        return {"ok": False, "error": "a measurement pass is already running"}
-    cap = measure_batch() if limit is None else max(0, int(limit))
-    MEASURE_STATE.update(running=True, done=0, total=0, now="", typeset=0,
-                         at=time.time())
-    n = ts = 0
-    try:
-        picked = await asyncio.to_thread(measure_pick, cap)
-        MEASURE_STATE["total"] = len(picked)
-        for p in picked:
-            MEASURE_STATE["done"] += 1
-            MEASURE_STATE["now"] = (p.get("title") or "")[:60]
-            try:
-                r = await asyncio.to_thread(screen_for_typeset, p)
-                n += 1
-                if r.get("typeset_only"):
-                    ts += 1
-                    MEASURE_STATE["typeset"] = ts
-                # THE HEADLINE HAS TO MOVE WITH THE BAR. The funnel is cached
-                # for two minutes and recomputed off-thread, so "555 measured ·
-                # 649 still to measure" sat frozen while the bar underneath
-                # counted to 26 - two numbers about the same work disagreeing
-                # on screen. Dropping the cache every few files lets the
-                # background recount catch up without making the request path
-                # wait for it. Every five, because the recount is ~1 s and the
-                # bar moves about that often.
-                if n % 5 == 0:
-                    _FUNNEL["at"] = 0.0
-            except Exception:                                # noqa: BLE001
-                continue
-    finally:
-        MEASURE_STATE.update(running=False, now="")
-        _FUNNEL["d"] = None                  # the numbers just changed
-    from . import joblog as _log
-    _log.log(f"picture-subtitle check: measured {n} file(s), {ts} typeset",
-             "ok" if n else "info")
-    return {"ok": True, "measured": n, "typeset": ts}
+    if gap_mode() != "auto":
+        return
+    d = _RULES_GAP["d"] or {}
+    if (d.get("total") or 0) and not gap_drain()["on"]:
+        set_gap_drain(True, "")
+        from . import joblog as _log
+        _log.log(f"subtitle rules (auto): {d.get('total')} file(s) no longer "
+                 f"match - keeping the transcoding queue topped up with them "
+                 f"until the list is empty", "ok")
 
 
-def shape_rows(limit: int = 60, include_done: bool = True) -> dict:
-    r"""Recorded verdicts, newest first, with the numbers behind each one.
+def gap_drain() -> dict:
+    """Is a drain running, and over what.
 
-    include_done=False DROPS THE FINISHED ROWS, which is what the panel shows
-    by default now - the same rule every other check card follows. A verdict
-    whose work is done is history, and history was crowding out the working
-    set: on Erik's library the newest-60 window was mostly green "done" rows
-    while the held ones a person might act on sat below the fold. The counts
-    above the table still include everything; only the LISTING narrows, and
-    the panel says how many finished rows it is not showing.
+    A DRAIN IS A STANDING INTENT, not a burst. "Requeue all 5,379" used to mean
+    exactly that - five thousand rows into the transcoding queue in one go,
+    which buries the auto-queue's own top-up, makes the Transcoding panel
+    useless as a picture of what is happening now, and commits the whole
+    library to a decision before the first file has finished proving it was the
+    right one. Erik asked for the obvious better thing: keep the queue topped
+    up and feed it as it drains.
 
-    Filtering happens after annotation, so it uses the same _status_of verdict
-    the rows display - not a second definition that could drift.
+    So the button and the switch now do the SAME thing and differ only in what
+    starts them - a press, or the check finding drift while auto is on.
     """
-    from .db import cursor
-    rows, summary = [], {"files": 0, "typeset": 0, "dialogue": 0}
+    from .db import kv_get
     try:
-        with cursor() as cur:
-            summary["files"] = cur.execute(
-                "SELECT COUNT(DISTINCT file_id) n FROM sub_shape"
-            ).fetchone()["n"]
-            # FILES, LIKE EVERY OTHER NUMBER ON THIS LINE. These counted rows -
-            # tracks - while "files measured" and the status counts beside them
-            # count files. They agree today only because every measured file
-            # happens to have exactly one picture-subtitle track; a file with
-            # two would put two different scales in one sentence. Partitioned
-            # the same way status_counts() groups, so the three totals always
-            # add up: a file with any typeset track is a typeset file.
-            summary["typeset"] = cur.execute(
-                "SELECT COUNT(*) n FROM (SELECT file_id FROM sub_shape "
-                " GROUP BY file_id HAVING MAX(typeset)=1)"
-            ).fetchone()["n"]
-            summary["dialogue"] = cur.execute(
-                "SELECT COUNT(*) n FROM (SELECT file_id FROM sub_shape "
-                " GROUP BY file_id HAVING MAX(typeset)=0)"
-            ).fetchone()["n"]
-            summary["status"] = status_counts(cur)
-            # HOW MUCH WORK IS ACTUALLY LEFT, which is not what the numbers
-            # above describe and was being read as if it were. "53 of 97 done"
-            # looks like a task 55% finished; 97 is only how many files have
-            # been MEASURED so far, and measuring happens as the sweep goes -
-            # so the denominator grows and the bar can never arrive. The real
-            # remaining count is the library-wide one, and without it the
-            # panel invites exactly the question "why has this not finished".
-            summary["backlog"] = _backlog()
-            summary["mode"] = mode()
-            summary["every_h"] = int(_s("subocr_every_h", 6) or 6)
-            summary["batch"] = int(_s("subocr_batch", 0) or 0)
-            summary["funnel"] = funnel()
-            # WHEN, not "on the next sweep". The registry has the answer once
-            # the loop has beaten once; before that the cadence still does.
-            try:
-                from . import schedules as _sch
-                row = next((r for r in _sch.snapshot().get("rows", [])
-                            if r.get("key") == "subocr"), None)
-                if row and row.get("next_run"):
-                    summary["next_sweep_in_s"] = max(
-                        0.0, float(row["next_run"]) - time.time())
-                else:
-                    summary["next_sweep_in_s"] = \
-                        float(_s("subocr_every_h", 6) or 6) * 3600
-            except Exception:                                # noqa: BLE001
-                pass
-            summary["measure_batch"] = measure_batch()
-            summary["autoqueue"] = autoqueue()
-            summary["ready"] = _BACKLOG["n"]
-            summary["measuring"] = dict(MEASURE_STATE)
-            summary["sweep"] = dict(SWEEP_STATE)
-            # When the newest verdict was written - "measured 85 files" says
-            # nothing about whether that was five minutes or five weeks ago.
-            r = cur.execute("SELECT MAX(at) a FROM sub_shape").fetchone()
-            summary["last_at"] = (r["a"] or 0) if r else 0
-            # Over-fetch when the finished are being hidden: a window of the
-            # newest N can be entirely 'done' rows while actionable ones sit
-            # just past it, and filtering an already-cut window would show an
-            # empty table over a non-empty backlog.
-            fetch = int(limit) if include_done else max(int(limit), 400)
-            for r in cur.execute(
-                    "SELECT s.file_id, s.rel, s.typeset, s.median_h, "
-                    "       s.tall_share, s.at, f.title, f.library, "
-                    "       f.season, f.episode "
-                    "FROM sub_shape s LEFT JOIN files f ON f.id = s.file_id "
-                    "ORDER BY s.at DESC LIMIT ?", (fetch,)):
-                d = dict(r)
-                d["typeset"] = bool(d["typeset"])
-                d["ep"] = ep_label(d.pop("season", None), d.pop("episode", None))
-                rows.append(d)
-            _annotate_status(cur, rows)
-            if not include_done:
-                # SETTLED, NOT MERELY FINISHED. A rejection is as finished as a
-                # success - the reader ran, gave its verdict, and nothing will
-                # revisit the file until something changes. Hiding only 'done'
-                # left 68 rejected rows filling the window, which is the same
-                # complaint one step along: the list should hold what still
-                # wants an answer. Both kinds are counted together, because
-                # they are one pile from where the reader stands.
-                def _settled(r) -> bool:
-                    if r.get("status") == "done":
-                        return True
-                    return (r.get("status") == "held"
-                            and "rejected" in (r.get("status_why") or ""))
-                shown = [r for r in rows if not _settled(r)]
-                summary["done_hidden"] = len(rows) - len(shown)
-                rows = shown[:int(limit)]
+        return {"on": (kv_get("rulesgap.drain") or "0") == "1",
+                "library": kv_get("rulesgap.drain_lib") or "",
+                "queued": int(kv_get("rulesgap.drain_queued") or 0)}
+    except Exception:                                        # noqa: BLE001
+        return {"on": False, "library": "", "queued": 0}
+
+
+def set_gap_drain(on: bool, library: str = "", reset: bool = True) -> dict:
+    from .db import kv_set
+    try:
+        kv_set("rulesgap.drain", "1" if on else "0")
+        kv_set("rulesgap.drain_lib", library or "")
+        if reset:
+            kv_set("rulesgap.drain_queued", "0")
     except Exception:                                        # noqa: BLE001
         pass
-    return {"summary": summary, "rows": rows, "live": screen_state()}
+    return gap_drain()
+
+
+def gap_keep() -> int:
+    r"""How many of ITS OWN files the drain keeps in the queue at once.
+
+    NOT THE AUTO-QUEUE'S TARGET, which was the first thing tried and is wrong
+    in a way worth writing down. That target is the depth of the WHOLE queue -
+    2,000 on this install - and the auto-queue's whole job is to keep it there.
+    A drain measuring against the same number would find room only in the
+    moments the auto-queue had failed to fill the queue, so it would starve
+    exactly when the system was working properly.
+
+    Measuring its own contribution instead means the two coexist: the drain
+    keeps a hundred of these files moving, the auto-queue fills the rest, and
+    neither has an opinion about the other.
+    """
+    return max(1, int(getattr(SETTINGS, "rulesgap_keep", 100) or 100))
+
+
+def gap_in_flight() -> int:
+    """How many of the drain's own files are queued or running right now."""
+    from .db import cursor
+    try:
+        with cursor() as cur:
+            return cur.execute(
+                "SELECT COUNT(*) n FROM jobs WHERE state IN ('queued','running')"
+                "   AND source = 'subtitle rules changed'").fetchone()["n"]
+    except Exception:                                        # noqa: BLE001
+        return 0
+
+
+def gap_libraries() -> list:
+    """Per-library rows for the card, each with its files and what changes."""
+    d = _RULES_GAP["d"] or {}
+    counts = d.get("by_library") or {}
+    from .db import cursor as _cur
+    queued = {}
+    try:
+        with _cur() as cur:
+            for q in cur.execute(
+                    "SELECT file_id, source, state FROM jobs "
+                    " WHERE state IN ('queued','running')"):
+                queued[q["file_id"]] = q["state"]
+    except Exception:                                        # noqa: BLE001
+        pass
+    out = []
+    for lib in sorted(counts, key=lambda k: -counts[k]):
+        files = list(_GAP_FILES.get(lib) or [])
+        shown = []
+        nxt = 0
+        for f in files:
+            st = queued.get(f["file_id"])
+            is_next = (not st) and nxt < 5
+            if is_next:
+                nxt += 1
+            shown.append({**f, "queued": st or "", "next": is_next})
+        out.append({"library": lib, "n": counts[lib], "files": shown,
+                    "listed": len(shown)})
+    return out
+
+
+def gap_left(library: str = "") -> int:
+    """How many known-drifted files are still waiting to be handed over."""
+    if not _GAP_IDS:
+        return 0
+    if not library:
+        return len(_GAP_IDS)
+    return sum(1 for _fid, lib in _GAP_IDS if lib == library)
+
+
+async def gap_tick() -> dict:
+    r"""Top the transcoding queue up from the out-of-date list. One pass.
+
+    Cheap by construction: a COUNT to see whether there is room, and then only
+    as many files as there is room for. The candidate ids come from the last
+    full check rather than being re-derived, and each is still asked of the
+    planner on the way in - the list can be minutes old and a file may have
+    been put right in the meantime.
+    """
+    from . import jobs, joblog as _log, rules as _rules
+    from .db import cursor, kv_set
+    import asyncio
+    d = gap_drain()
+    if not d["on"]:
+        return {"queued": 0, "off": True}
+    lib = d["library"]
+    if not _GAP_IDS:
+        set_gap_drain(False, "", reset=False)
+        _log.log("subtitle rules: nothing left to requeue"
+                 + (f" in {lib}" if lib else "")
+                 + f" - {d['queued']} file(s) handed over in total", "ok")
+        return {"queued": 0, "finished": True}
+
+    room = gap_keep() - await asyncio.to_thread(gap_in_flight)
+    if room <= 0:
+        return {"queued": 0, "full": True}
+
+    # A WIDER WINDOW THAN THE ROOM, so there is something to choose between.
+    # Taking the next N in list order is taking them in SCAN order, and scan
+    # order follows the disk - the auto-queue learned this the expensive way,
+    # with 864 jobs on two spindles and ten idle. Six times the room is enough
+    # to find every disk represented without planning half the library.
+    want = [fid for fid, l in _GAP_IDS if not lib or l == lib][:room * 6]
+    if not want:
+        set_gap_drain(False, "", reset=False)
+        _log.log(f"subtitle rules: {lib or 'every library'} is done - "
+                 f"{d['queued']} file(s) handed over in total", "ok")
+        return {"queued": 0, "finished": True}
+
+    def _rows(ids):
+        qs = ",".join("?" * len(ids))
+        with cursor() as cur:
+            return [dict(r) for r in cur.execute(
+                f"SELECT f.id, f.path, f.title, f.season, f.episode, f.library,"
+                f"       f.size, f.pool_disk, p.json "
+                f"  FROM files f JOIN file_probes p ON p.file_id = f.id "
+                f" WHERE f.id IN ({qs}) AND f.state='done' "
+                f"   AND f.id NOT IN (SELECT file_id FROM jobs "
+                f"                    WHERE file_id IS NOT NULL "
+                f"                      AND state IN ('queued','running'))", ids)]
+
+    rows = await asyncio.to_thread(_rows, want)
+
+    # PLAN FIRST, THEN DEAL. Everything in the window is asked of the planner
+    # (a few hundred microseconds each), the ones that no longer need work are
+    # dropped from the list, and the survivors are dealt round-robin across
+    # pool disks by the same routine the auto-queue uses - so a batch of a
+    # hundred lands on a hundred files spread over twelve spindles, and twelve
+    # workers can all be reading at once instead of queueing on one.
+    def _plan(rows_):
+        keep, drop = [], set()
+        for r in rows_:
+            try:
+                probe = json.loads(r["json"])
+            except Exception:                                # noqa: BLE001
+                drop.add(r["id"])
+                continue
+            if _sub_actions(r, probe, _rules):
+                keep.append(r)
+            else:
+                drop.add(r["id"])        # put right since the check ran
+        return keep, drop
+
+    planned, dropped = await asyncio.to_thread(_plan, rows)
+    try:
+        from .autoqueue import _deal
+        dealt = _deal(planned, room, key="id")
+    except Exception:                                        # noqa: BLE001
+        dealt = planned[:room]
+    n = 0
+    used: set = set(dropped)
+    for r in dealt:
+        used.add(r["id"])
+        label = (r.get("title") or "") + (
+            f" - {ep_label(r.get('season'), r.get('episode'))}"
+            if r.get("season") is not None else "")
+        try:
+            if await jobs.enqueue(r["id"], r["path"], label.strip(" -"),
+                                  source="subtitle rules changed"):
+                n += 1
+        except Exception:                                    # noqa: BLE001
+            continue
+    # Queued and no-longer-needed both leave the list. The rest of the window
+    # - planned, still wanted, not dealt this round - stays, and is dealt next
+    # tick, so widening the window costs nothing but the planning.
+    if used:
+        _GAP_IDS[:] = [(f, l) for f, l in _GAP_IDS if f not in used]
+    if n:
+        await jobs.start()
+        total = d["queued"] + n
+        try:
+            kv_set("rulesgap.drain_queued", str(total))
+        except Exception:                                    # noqa: BLE001
+            pass
+        disks = sorted({(r.get("pool_disk") or "?") for r in dealt[:n]})
+        _log.log(f"subtitle rules: topped the queue up with {n} out-of-date "
+                 f"file(s){f' from {lib}' if lib else ''} across "
+                 f"{len(disks)} disk(s) - {total} handed over so far, "
+                 f"{gap_left(lib)} still to go", "debug")
+    return {"queued": n, "left": gap_left(lib)}
+
+
+async def gap_watch() -> None:
+    """Keep the queue fed while a drain is on. Idle and free when it is not."""
+    import asyncio
+    await asyncio.sleep(90)
+    while True:
+        try:
+            await gap_tick()
+        except Exception as e:                               # noqa: BLE001
+            from . import joblog as _log
+            _log.log(f"subtitle rules drain: {type(e).__name__}: {e}", "warn")
+        await asyncio.sleep(60)
+
+
+def rules_gap(force: bool = False) -> dict:
+    """Cached, never on the request path - see _rules_gap_compute().
+
+    `force` is the Check-now button. The cache exists so that opening the page
+    is free, not to stop somebody asking again after they have changed a rule -
+    and "it will refresh within five minutes" is not an answer to "did that
+    setting do what I meant".
+    """
+    now = time.time()
+    fresh = (not force and _RULES_GAP["d"] is not None
+             and now - _RULES_GAP["at"] < _RULES_GAP_TTL)
+    if not fresh and not _RULES_GAP["busy"]:
+        _RULES_GAP["busy"] = True
+        # RUNNING THE MOMENT IT IS DECIDED, not when the thread gets around to
+        # it. The walk lists 35,000 ids before its first update, and a page
+        # that polled inside that window saw running=false, concluded there was
+        # nothing to watch and stopped polling - so pressing Check now did
+        # nothing visible at all. The flag belongs to the decision, not to the
+        # thread's progress through it.
+        GAP_STATE.update(running=True, done=0, total=0, found=0,
+                         started=time.time())
+        import threading
+        threading.Thread(target=_rules_gap_compute, name="subocr-rulesgap",
+                         daemon=True).start()
+    return _RULES_GAP["d"] or {"total": None, "by_library": {}}
+
+
+REQUEUE_STATE: dict = {"running": False, "queued": 0, "total": 0,
+                       "library": "", "at": 0.0, "phase": ""}
+
+
+async def requeue_gap(library: str = "", limit: int = 0) -> dict:
+    r"""Queue the files that no longer match the subtitle rules.
+
+    One library, or all of them. The planner decides what each file needs when
+    the job runs - this only puts them in front of it.
+
+    IN THE BACKGROUND, ON PURPOSE. Anime Shows alone is 3,700 files; planning
+    them and enqueueing them one at a time is minutes of work, and a request
+    held open for minutes is a page that looks hung - which is exactly what
+    Erik described the last time a queue button did its work inline ("the
+    queueing was happening for about a min but I didn't see anything"). The
+    endpoint returns the moment the pass starts and the card polls the count,
+    so the number on screen moves while the queue fills.
+    """
+    import asyncio
+    if REQUEUE_STATE["running"]:
+        return {"ok": False, "already": True, **REQUEUE_STATE}
+    REQUEUE_STATE.update(running=True, queued=0, total=0, library=library,
+                         at=time.time(), phase="finding them")
+    # AUTO WAITS, THE BUTTON DOES NOT. A person who pressed Requeue is watching
+    # the row and wants the count; the sweep has nobody waiting and wants the
+    # work done, so it takes the same path but awaits the result.
+    if limit:
+        return await _requeue_gap_run(library, limit)
+    asyncio.create_task(_requeue_gap_run(library))
+    return {"ok": True, "started": True, **REQUEUE_STATE}
+
+
+async def _requeue_gap_run(library: str = "", limit: int = 0) -> dict:
+    """The pass itself; see requeue_gap(). Updates REQUEUE_STATE as it goes."""
+    from . import jobs, joblog as _log
+    from .db import cursor
+    import asyncio
+    picked: list[dict] = []
+
+    def _pick():
+        with cursor() as cur:
+            q = ("SELECT f.id, f.path, f.title, f.season, f.episode, f.library, "
+                 "       f.size, p.json "
+                 "  FROM files f JOIN file_probes p ON p.file_id = f.id "
+                 " WHERE f.state='done' "
+                 "   AND f.id NOT IN (SELECT file_id FROM jobs WHERE file_id "
+                 "                    IS NOT NULL AND state IN ('queued','running'))")
+            args: tuple = ()
+            if library:
+                q += " AND f.library = ?"
+                args = (library,)
+            return [dict(x) for x in cur.execute(q, args)]
+
+    from . import rules as _rules
+
+    # THE SAME QUESTION THE COUNT ASKED, ASKED AGAIN NOW. The list was made up
+    # to five minutes ago and jobs have been finishing the whole time; asking
+    # the planner once more per file is a few hundred microseconds and it is
+    # what keeps the button from queueing work that is already done.
+    def _plan_all(rows):
+        out = []
+        for r in rows:
+            try:
+                probe = json.loads(r["json"])
+            except Exception:                                # noqa: BLE001
+                continue
+            if _sub_actions(r, probe, _rules):
+                out.append(r)
+        return out
+
+    n = 0
+    try:
+        picked = await asyncio.to_thread(_plan_all,
+                                         await asyncio.to_thread(_pick))
+        if limit:
+            picked = picked[:limit]
+        REQUEUE_STATE.update(total=len(picked), phase="queueing")
+        for r in picked:
+            label = (r.get("title") or "") + (
+                f" - {ep_label(r.get('season'), r.get('episode'))}"
+                if r.get("season") is not None else "")
+            try:
+                if await jobs.enqueue(r["id"], r["path"], label.strip(" -"),
+                                      source="subtitle rules changed"):
+                    n += 1
+                    REQUEUE_STATE["queued"] = n
+            except Exception:                                # noqa: BLE001
+                continue
+            # THE QUEUE STARTS WHILE THE PASS IS STILL RUNNING. Waiting until
+            # every last file is in means nothing appears under Transcoding
+            # for the first two minutes, which reads as a button that did
+            # nothing at all.
+            if n == 1 or n % 250 == 0:
+                try:
+                    await jobs.start()
+                except Exception:                            # noqa: BLE001
+                    pass
+        if n:
+            await jobs.start()
+        _RULES_GAP["at"] = 0.0
+        _log.log(f"subtitle rules: queued {n} file(s) that did not match"
+                 + (f" in {library}" if library else " across every library"),
+                 "ok" if n else "info")
+    finally:
+        REQUEUE_STATE.update(running=False, phase="", queued=n,
+                             total=len(picked))
+    return {"ok": True, "queued": n, "considered": len(picked)}
 
 
 def screen_for_typeset(pick: dict) -> dict:
@@ -3786,7 +3677,7 @@ async def run_sweep(source: str = "manual", limit: int | None = None,
                     # rules honours typeset_rels(), picks the measured track,
                     # sets burn_index and forces the encode. All it ever needed
                     # was a job. Skipped only when a transcode has ALREADY
-                    # completed since the verdict - the same test _status_of
+                    # completed since the verdict - the same test the queue
                     # uses to call a file done - so this cannot re-burn.
                     try:
                         from .db import cursor as _cur
@@ -3945,7 +3836,7 @@ async def run_sweep(source: str = "manual", limit: int | None = None,
                 measured_now += 1
                 SWEEP_STATE["done"] = measured_now
                 if measured_now % 5 == 0:
-                    _FUNNEL["at"] = 0.0          # keep the headline honest
+                    _BACKLOG["at"] = 0.0         # keep the headline honest
         except Exception as e:                               # noqa: BLE001
             _log.log(f"rejected-measure phase failed: "
                      f"{type(e).__name__}: {e}", "warn")
@@ -4010,6 +3901,10 @@ async def watch() -> None:
                 every = max(1, int(_s("subocr_every_h", 6))) * 3600
                 if time.time() - _SWEEP["last"] >= every:
                     await run_sweep(source="auto")
+            # The out-of-date check rides the same ten-minute loop. It costs
+            # nothing when the answer is zero or the switch is manual, and the
+            # count it reads is the cached one - this never starts the walk.
+            await gap_auto()
         except Exception as e:                           # noqa: BLE001
             joblog_mod = None
             try:

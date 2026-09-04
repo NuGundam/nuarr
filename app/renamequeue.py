@@ -364,6 +364,23 @@ async def run_due(limit: int = 60) -> dict:
                 asyncio.create_task(arrattach.check_file(row["file_id"]))
             except Exception:
                 pass
+            # AND PLEX, WHICH THE ARR DOES NOT TELL. The arr performs the
+            # rename and knows about it immediately; Plex is still holding the
+            # old path, which means the item plays back as missing until its
+            # own scan catches up - up to a day on this server. Both folders
+            # are scanned when the file crossed one, or the old location keeps
+            # a ghost entry.
+            try:
+                from . import plexqueue
+                with cursor() as cur:
+                    f = cur.execute("SELECT path FROM files WHERE id=?",
+                                    (row["file_id"],)).fetchone()
+                if f and f["path"]:
+                    plexqueue.enqueue(row["file_id"], f["path"],
+                                      old_path=row["path"] or "",
+                                      why="the arr renamed this file")
+            except Exception:                                # noqa: BLE001
+                pass
             continue
 
         attempts = row["attempts"] + 1

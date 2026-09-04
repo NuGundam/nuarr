@@ -281,5 +281,15 @@ async def run(file_id: int, delete_file: bool = True,
                     (f"rejected and re-searched: {'; '.join(did)}",
                      time.time(), file_id))
     joblog.log(f"REFETCH {row.get('title')}: {'; '.join(did)}", "warn")
+    # A DELETED FILE IS A CHANGED FOLDER. The arr removes the release and goes
+    # looking for another; Plex, told nothing, keeps offering an item whose
+    # file is gone until its own scan notices. The replacement announces itself
+    # later through the ordinary commit path.
+    try:
+        from . import plexqueue
+        plexqueue.enqueue(file_id, row.get("path") or "",
+                          why="the release was rejected and deleted")
+    except Exception:                                        # noqa: BLE001
+        pass
     return {"ok": True, "did": did, "title": row.get("title"),
             "release": p.get("release")}

@@ -37,7 +37,7 @@ import re
 import subprocess
 import time
 
-from . import joblog, rules
+from . import joblog, langkey, rules
 from .config import SETTINGS, hidden_si
 from . import schedules
 from .db import cursor
@@ -268,25 +268,13 @@ _ISO3 = {
 }
 
 
-# ONE LANGUAGE, TWO SPELLINGS. ISO 639-2 has a bibliographic set and a
-# terminological set, and ffprobe emits whichever the muxer wrote: chi/zho,
-# fre/fra, ger/deu, dut/nld and the rest are the SAME LANGUAGE. The first live
-# run of the language check proved why this matters - it flagged Ne Zha 2, a
-# Chinese film in a library that keeps zho, because the file said chi. A check
-# that cannot spell its own subject reports a correct file as wrong, and in
-# auto mode would have deleted it.
-_ISO_ALIAS = {
-    "chi": "zho", "cze": "ces", "dut": "nld", "fre": "fra", "ger": "deu",
-    "gre": "ell", "ice": "isl", "mac": "mkd", "mao": "mri", "may": "msa",
-    "per": "fas", "rum": "ron", "slo": "slk", "tib": "bod", "wel": "cym",
-    "arm": "hye", "baq": "eus", "bur": "mya", "geo": "kat",
-}
-
-
+# ONE TABLE, NOT FOUR. The alias list that used to live here is now
+# langkey.py, shared with the planner - see that module for why a check and the
+# planner having separate opinions about whether nob is Norwegian is how a
+# correct file gets reported as broken.
 def _lang_key(code: str) -> str:
     """One canonical spelling per language, so chi and zho compare equal."""
-    c = str(code or "").strip().lower()[:3]
-    return _ISO_ALIAS.get(c, c)
+    return langkey.key(code)
 
 
 def check(pr: dict, anime: bool, library: str = "",
@@ -458,7 +446,9 @@ def check(pr: dict, anime: bool, library: str = "",
         except Exception:
             orig = ""
         claimed = rules._lang_guess(aud[0]) or ""
-        orig3 = _ISO3.get((orig or "").strip().lower(), "")
+        _orig_set = (langkey.names_to_codes(orig)
+                     or ({_ISO3.get((orig or "").strip().lower(), "")} - {""}))
+        orig3 = sorted(_orig_set)[0] if _orig_set else ""
 
         def _dialogue_subs(want: set[str] | None) -> list[str]:
             """Full-dialogue text subtitle languages, signs and SDH excluded."""
@@ -527,7 +517,10 @@ def check(pr: dict, anime: bool, library: str = "",
         pol = langpolicy.for_library(library, "audio") if library else {}
     except Exception:                                        # noqa: BLE001
         pol = {}
-    keep = {_lang_key(c) for c in (pol.get("langs") or [])}
+    # THE KEEP-LIST, PLUS EVERY TAG THAT SATISFIES IT. A set of canonical codes
+    # cannot express "Norwegian includes Bokmal" without also claiming
+    # Cantonese is Mandarin; expand() is the one-way version.
+    keep = langkey.expand(pol.get("langs") or [])
     if keep and aud:
         # "Keep the original language" is per title, so the policy set alone is
         # not the whole answer - a Japanese show whose library keeps English
@@ -544,8 +537,13 @@ def check(pr: dict, anime: bool, library: str = "",
                             " WHERE f.path=? LIMIT 1", (path,)).fetchone()
                 o = (r["lang"] or "") if r else ""
                 if o:
-                    keep.add(_lang_key(_ISO3.get(o.strip().lower(),
-                                                 o.strip().lower())))
+                    # ASK THE TABLE THE PLANNER ASKS. _ISO3 mapped a name to
+                    # ONE code, so "Norwegian" became nor and a nob track was
+                    # a stranger to it; origlang lists every code that counts
+                    # as a name, and it is what decide() keeps tracks by.
+                    got = langkey.names_to_codes(o)
+                    keep |= langkey.expand(got or [_ISO3.get(o.strip().lower(),
+                                                             o.strip().lower())])
             except Exception:                                # noqa: BLE001
                 pass
         have = [_lang_key(rules._lang_guess(a) or "und") for a in aud]
@@ -1327,7 +1325,9 @@ async def run_once(per_bucket: int = PER_BUCKET) -> dict:
                     clean_ids.append(r["id"])
                 try:
                     pl = rules.decide(pr, anime=anime, filename=path,
-                                      size_bytes=r["size"] or 0)
+                                      size_bytes=r["size"] or 0,
+                                      library=r.get("library") or "",
+                                      file_id=r["id"])
                     if pl.needed:
                         pend_files += 1
                 except Exception:
@@ -1387,9 +1387,20 @@ async def run_once(per_bucket: int = PER_BUCKET) -> dict:
         except Exception as e:                               # noqa: BLE001
             joblog.log(f"rule audit auto-replace failed: {type(e).__name__}: "
                        f"{e}", "error")
+        # AND THEN ASK THE OLD FINDINGS AGAIN. Every run reads a fresh sample,
+        # so without this a file flagged months ago is only re-examined if
+        # chance picks it - and a rule change that fixes a whole class of
+        # finding leaves every one of them on the page.
+        retired = {"checked": 0, "cleared": 0}
+        try:
+            retired = await recheck_standing()
+        except Exception as e:                               # noqa: BLE001
+            joblog.log(f"rule audit recheck failed: {type(e).__name__}: {e}",
+                       "warn")
         return {"ok": True, "checked": checked, "violations": viol_files,
                 "pending": pend_files, "by_rule": by_rule,
-                "fixed_since_last": fixed, "replaced": replaced, **healed}
+                "fixed_since_last": fixed, "replaced": replaced,
+                "retired": retired.get("cleared", 0), **healed}
     except Exception as e:
         STATS["last_error"] = f"{type(e).__name__}: {e}"
         joblog.log(f"rule audit failed: {type(e).__name__}: {e}", "error")
@@ -1573,6 +1584,119 @@ def standing(limit: int = 300) -> list[dict]:
                       or _readable(r.get("path") or ""))
         out.append(r)
     return out
+
+
+async def recheck_standing(limit: int = 80) -> dict:
+    r"""Re-test every standing finding against the rules AS THEY ARE NOW.
+
+    WHY A FINDING HAS TO EXPIRE. A finding is a claim about one file measured
+    against one version of the rules, and the second half of that sentence was
+    never written down. "No rule fixes this" is the correct answer right up
+    until somebody changes a rule - and the moment they do, the row is a
+    statement about a rulebook that no longer exists, sitting on the page
+    looking exactly like a current problem.
+
+    Troll is the case. Its audio is tagged nob; the check did not know Bokmal
+    is Norwegian, so it reported an extra audio track, the healer found nothing
+    to fix - correctly, the file was already right - and wrote 'unfixable',
+    which _mark_fixed() deliberately never clears. Teaching the check about
+    macrolanguages fixed every FUTURE file and left that row untouched, because
+    nothing in the system had any reason to go back and ask again.
+
+    So this asks again, on every run. Two stages, cheapest first: re-run the
+    check against the STORED probe, which costs nothing and rules out the rows
+    that are still broken; only for the ones that come back clean go and read
+    the actual file, because a stored probe can be older than the repair. A row
+    clean by both is deleted and its heal marked fixed - the finding is gone,
+    not hidden, since the thing it described is not true any more.
+    """
+    from .db import cursor as _cur
+    out = {"checked": 0, "cleared": 0}
+    try:
+        rows = await asyncio.to_thread(standing, limit)
+    except Exception:                                        # noqa: BLE001
+        return out
+
+    def _probe_of(file_id: int) -> dict:
+        try:
+            with _cur() as cur:
+                r = cur.execute("SELECT json FROM file_probes WHERE file_id=?",
+                                (file_id,)).fetchone()
+            return json.loads(r["json"]) if r else {}
+        except Exception:                                    # noqa: BLE001
+            return {}
+
+    def _clean_by_probe(r: dict) -> bool:
+        pr = _probe_of(r["file_id"])
+        if not pr:
+            return False                 # no evidence either way: leave it
+        try:
+            return not check(pr, rules.is_anime(r.get("path") or ""),
+                             r.get("library") or "", r.get("path") or "")
+        except Exception:                                    # noqa: BLE001
+            return False
+
+    # ONLY ROWS THAT STILL CLAIM SOMETHING IS WRONG. A row whose heal says
+    # 'fixed' is not an outstanding finding, it is the record that healing
+    # worked - the only such record the page has - and retiring it would delete
+    # the evidence to tidy away a problem that is already marked solved. The
+    # first version of this did exactly that: it cleared 41 rows, of which 40
+    # were successful heals and one was the finding it was written for.
+    _OPEN = ("", "queued", "unfixable", "gave-up", "gave_up", "retrying")
+    live = [r for r in rows
+            if str(r.get("state") or "").lower() in _OPEN]
+    candidates = await asyncio.to_thread(
+        lambda: [r for r in live if _clean_by_probe(r)])
+    out["checked"] = len(live)
+    if not candidates:
+        return out
+
+    def _confirm(r: dict):
+        return r, _still_broken(r.get("path") or "", r.get("library") or "")
+
+    cleared: list[dict] = []
+    for r in candidates:
+        _r, still = await asyncio.to_thread(_confirm, r)
+        # None = the file is gone, which standing() already filters; [] = read
+        # and clean. A non-empty list means the stored probe was out of date
+        # and the file really is still broken, so the row stays.
+        if still == []:
+            cleared.append(r)
+    if not cleared:
+        return out
+
+    def _write() -> int:
+        ids = [r["file_id"] for r in cleared]
+        qs = ",".join("?" * len(ids))
+        with _cur() as cur:
+            cur.execute(f"DELETE FROM audit_findings WHERE file_id IN ({qs})",
+                        ids)
+            cur.execute(
+                f"UPDATE audit_heals SET state='fixed', last_at=?, "
+                f"detail='re-checked against the current rules and it now "
+                f"matches every one of them' WHERE file_id IN ({qs})",
+                (time.time(), *ids))
+        return len(ids)
+
+    out["cleared"] = await asyncio.to_thread(_write)
+    for r in cleared[:6]:
+        _log_cleared(r)
+    if out["cleared"] > 6:
+        joblog.log(f"rule check: and {out['cleared'] - 6} other standing "
+                   f"finding(s) cleared by the current rules", "ok")
+    return out
+
+
+def _log_cleared(r: dict) -> None:
+    """One line per retired finding, naming what it used to claim.
+
+    A row vanishing from the table with no trace is indistinguishable from a
+    bug that lost it, so each one says what it was and why it went.
+    """
+    joblog.log(f"rule check: {r.get('label') or _readable(r.get('path') or '')} "
+               f"no longer breaks {r.get('rule') or 'any rule'} — the finding "
+               f"({r.get('found') or ''}) was made under older rules and has "
+               f"been retired", "ok")
 
 
 def clear_heal(file_id: int) -> bool:

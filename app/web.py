@@ -536,6 +536,18 @@ async def _startup() -> None:
     renamequeue.init()
     _boot("renames")
     asyncio.create_task(renamequeue.watch())
+    # The Plex notify queue, beside the rename queue and for the same reasons:
+    # a durable row per file, retried with backoff, verified before it closes.
+    try:
+        from . import plexqueue, plexsync
+        plexqueue.init()
+        _boot("plex")
+        asyncio.create_task(plexqueue.watch())
+        asyncio.create_task(plexsync.watch())
+        from . import subocr as _so
+        asyncio.create_task(_so.gap_watch())
+    except Exception as e:                                   # noqa: BLE001
+        joblog.log(f"Plex queue did not start: {type(e).__name__}: {e}", "warn")
     commitqueue.init()
     _boot("commits")
     # Start the disk-load ticker up front. It costs one CIM query every few
@@ -556,6 +568,8 @@ async def _startup() -> None:
     asyncio.create_task(_subocr.watch())
     # Once a day: are there newer OCR engine builds - see updates_watch().
     asyncio.create_task(_subocr.updates_watch())
+    from . import schedules as _sch
+    _sch.bind_loop(asyncio.get_running_loop())
     asyncio.create_task(arrhealth.watch())
     # Twice a day: do nuarr and the arrs still describe the same files? The
     # check existed before this line did, which meant it only ever ran when
@@ -732,7 +746,7 @@ def _register_schedules() -> None:
     from . import (schedules, adopter, healer, maintenance, lifecycle,
                    commitqueue, renamequeue, autoqueue, backup, audit,
                    playback, origlang, ffmpeg_update, webhooks, arrguard,
-                   contentkind)
+                   contentkind, plexqueue, plexsync)
 
     def poll(mod, default):
         return float(getattr(mod, "POLL_S", default) or default)
@@ -745,6 +759,10 @@ def _register_schedules() -> None:
       "Puts finished encodes back into the library when the disk is quiet.")
     R("renamequeue", "Rename retry queue", "Queue", poll(renamequeue, 45),
       "Retries renames the arrs could not complete.")
+    R("plexqueue", "Plex catch-up queue", "Queue", poll(plexqueue, 25),
+      "Tells Plex about files nuarr changed, and checks that it listened.")
+    R("plexsync", "Plex agreement check", "Library", plexsync.CYCLE_S,
+      "Compares what Plex says each file contains with what it contains.")
     R("lifecycle", "Restart / shutdown watcher", "Queue",
       poll(lifecycle, 3), "Carries out a pending stop once the queue is idle.")
 
@@ -2270,6 +2288,13 @@ async def api_langpolicy_save(body: dict = Body(...), library: str = ""):
                    for name, sides in saved.items()), "info")
     impact = await asyncio.to_thread(_langpolicy_impact, before, saved,
                                      library.strip() or None)
+    # The out-of-sync count was computed against the policy that just stopped
+    # being true; age it out so the card under these switches recounts.
+    try:
+        from . import subocr as _so
+        _so._RULES_GAP["at"] = 0.0
+    except Exception:                                        # noqa: BLE001
+        pass
     # Held so the Queue button acts on the SET THAT WAS SHOWN, not on a fresh
     # scan that might differ if something changed in between - and scoped the
     # same way the counts were, so a per-library save queues that library.
@@ -4734,9 +4759,30 @@ def api_health():
     """
     checks = []
 
-    def add(key, label, goto, n, note, mode=None, running=False, warn=None):
+    # WHERE A ROW GOES, SAID OUT LOUD. Two rows that open the same page read as
+    # a duplicated entry - Erik read them that way - because the row showed the
+    # finding and hid the destination, so "Missing from disk" and "Unmanaged
+    # files" looked like one check listed twice. They are two checks that live
+    # on one page, and naming the page is the whole fix.
+    PAGE = {"arrsync": "Arrs", "audiotitle": "Audio codec", "arrgap": "Libraries",
+            "libs": "Libraries", "arrs": "Arrs", "lang": "Subtitles",
+            "subsync": "Subtitles", "plexsync": "Plex",
+            "notland": "Still not landed", "counts": "Counts", "logs": "Logs",
+            "ocr": "OCR engines", "ruleschk": "Rule check"}
+
+    def add(key, label, goto, n, note, mode=None, running=False, warn=None,
+            when=""):
         checks.append({"key": key, "label": label, "goto": goto,
                        "n": int(n or 0), "note": note, "mode": mode,
+                       "where": PAGE.get(goto.split("#")[0], goto),
+                       # WHAT GOVERNS THIS ROW, in the same slot on every row.
+                       # Five rows carried an auto/manual pill and five carried
+                       # nothing, which reads as five switches that failed to
+                       # load rather than five checks that have no switch to
+                       # begin with. A count of broken files has nothing to
+                       # decide - it is counted live and fixed by the queue -
+                       # and saying so is shorter than leaving a hole.
+                       "when": when or ("counted live" if mode is None else ""),
                        "running": bool(running),
                        "warn": bool(warn if warn is not None else n)})
 
@@ -4790,27 +4836,31 @@ def api_health():
 
     try:
         from . import subocr as _so
-        with cursor() as cur:
-            st = _so.status_counts(cur)
-        n = st.get("eligible", 0)
-        # THE CARD'S OWN NAME, because a row that is a shortcut to a card
-        # should be findable by the name on the card - and the link lands ON
-        # it, not merely on the page it lives in.
-        held_bits = []
-        if st.get("held_off"):
-            held_bits.append(f"{st['held_off']} with OCR off for their library")
-        if st.get("held_rejected"):
-            held_bits.append(f"{st['held_rejected']} rejected by the OCR")
-        add("shapes", "Signs or dialogue - what the check found", "shapes", n,
-            (f"{n} waiting to be queued" if n else
-             f"{st.get('queued', 0)} queued, {st.get('processing', 0)} running"
-             if (st.get("queued") or st.get("processing")) else
-             ("everything measured is handled"
-              + (" · " + ", ".join(held_bits) if held_bits else ""))),
-            mode=_so.mode(),
-            running=bool(_so.SWEEP_STATE.get("running")))
+        d = _so.rules_gap()
+        raw = d.get("total")
+        n = int(raw or 0)
+        walking = bool(_so.GAP_STATE.get("running"))
+        add("subsync", "Files that do not match the subtitle rules", "subsync", n,
+            (f"{n} file(s) were built under different subtitle rules" if n else
+             "every file matches the subtitle rules" if raw is not None else
+             "not checked yet"),
+            mode=_so.gap_mode(), running=walking)
     except Exception as e:                                   # noqa: BLE001
-        add("shapes", "Signs or dialogue - what the check found", "shapes", 0,
+        add("subsync", "Files that do not match the subtitle rules", "subsync",
+            0,
+            f"check unavailable: {type(e).__name__}", warn=True)
+
+    try:
+        from . import plexsync as _ps
+        d = _ps.cached()
+        n = int(d.get("total_bad") or 0)
+        add("plexsync", "Does Plex still agree with the files?", "plexsync", n,
+            (f"{n} item(s) describe a file that has since changed" if n else
+             f"all {d.get('total') or 0} item(s) match the files"
+             if d.get("have") else "not checked yet"),
+            mode=d.get("mode"), running=d.get("running"))
+    except Exception as e:                                   # noqa: BLE001
+        add("plexsync", "Does Plex still agree with the files?", "plexsync", 0,
             f"check unavailable: {type(e).__name__}", warn=True)
 
     try:
@@ -4818,37 +4868,42 @@ def api_health():
                    "('error','blocked')")[0]["n"]
         add("notland", "Still not landed", "notland", nl,
             f"{nl} file(s) whose last attempt failed or was blocked"
-            if nl else "every attempted file has since landed")
+            if nl else "every attempted file has since landed",
+            when="counted live; the queue retries them")
     except Exception as e:                                   # noqa: BLE001
         add("notland", "Still not landed", "notland", 0,
-            f"check unavailable: {type(e).__name__}", warn=True)
+            f"check unavailable: {type(e).__name__}", warn=True, when="counted live; the queue retries them")
 
     try:
         miss = _rows("SELECT COUNT(*) n FROM files WHERE state='missing'"
                      )[0]["n"]
         add("missing", "Missing from disk", "libs", miss,
             f"{miss} file(s) the arrs track that nuarr cannot find"
-            if miss else "nothing is missing")
+            if miss else "nothing is missing",
+            when="counted live")
         cut = SETTINGS.min_orphan_size_mb * 1024 * 1024
         orph = _rows("SELECT COUNT(*) n FROM files WHERE arr_file_id IS NULL "
                      "AND state NOT IN ('duplicate','deleted') "
                      "AND COALESCE(size,0) >= ?", (cut,))[0]["n"]
         add("unmanaged", "Unmanaged files over the size floor", "libs", orph,
             f"{orph} large file(s) no arr tracks - usually failed imports"
-            if orph else "no stray large files")
+            if orph else "no stray large files",
+            when="counted live")
     except Exception as e:                                   # noqa: BLE001
         add("missing", "Missing from disk", "libs", 0,
-            f"check unavailable: {type(e).__name__}", warn=True)
+            f"check unavailable: {type(e).__name__}", warn=True, when="counted live")
 
     try:
         from . import arrhealth
         w = int((arrhealth.STATE or {}).get("warnings") or 0)
         add("arrhealth", "Sonarr and Radarr's own health", "arrs", w,
             f"{w} warning(s) the arrs report about themselves"
-            if w else "the arrs report no problems")
+            if w else "the arrs report no problems",
+            when="the arrs' own report")
     except Exception:                                        # noqa: BLE001
         add("arrhealth", "Sonarr and Radarr's own health", "arrs", 0,
-            "check unavailable", warn=False)
+            "check unavailable", warn=False,
+            when="the arrs' own report")
 
     try:
         # recent() returns the whole report, not a list - rows carry each
@@ -4860,16 +4915,18 @@ def api_health():
         ours = int(rep.get("ours") or 0)
         add("consoles", "Console windows nuarr let slip", "logs", ours,
             f"{ours} visible console(s) traced back to nuarr"
-            if ours else "nothing nuarr spawned has shown a window")
+            if ours else "nothing nuarr spawned has shown a window",
+            when="watched continuously")
     except Exception:                                        # noqa: BLE001
         add("consoles", "Console windows nuarr let slip", "logs", 0,
-            "watcher unavailable", warn=False)
+            "watcher unavailable", warn=False,
+            when="watched continuously")
 
     try:
         from . import observer as _ob
         st = _ob.state()
         add("observer", "Observer mode", "counts", 0,
-            st.get("why") or "", mode=st.get("mode"),
+            st.get("why") or "", when=f"observer mode: {st.get('mode') or '?'}",
             warn=bool(st.get("mode") == "full" and st.get("peer_nuarr")))
     except Exception:                                        # noqa: BLE001
         pass
@@ -4928,12 +4985,18 @@ async def api_health_mode(mode: str):
     raw["arrsync_mode"] = mode
     raw["audiotitle_mode"] = mode
     raw["arrgap_mode"] = mode
+    raw["audit_mode"] = mode
+    raw["plexsync_mode"] = mode
+    raw["rulesgap_mode"] = mode
     raw["subocr_auto"] = (mode == "auto")
     p.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True),
                  encoding="utf-8")
     SETTINGS.arrsync_mode = mode
     SETTINGS.audiotitle_mode = mode
     SETTINGS.arrgap_mode = mode
+    SETTINGS.audit_mode = mode
+    SETTINGS.plexsync_mode = mode
+    SETTINGS.rulesgap_mode = mode
     SETTINGS.subocr_auto = (mode == "auto")
     joblog.log(f"all correction systems set to {mode} from the health page",
                "info")
@@ -5196,44 +5259,73 @@ def api_pipeline_find(q: str = "", limit: int = 12):
     return {"rows": rows}
 
 
-@app.get("/api/subocr/shapes")
-def api_subocr_shapes(limit: int = 60, fresh: int = 0, done: int = 1):
-    """What the picture-subtitle measurement has found, and what it is doing.
+@app.post("/api/audit/recheck")
+async def api_audit_recheck():
+    """Re-test the standing findings against the rules as they are now."""
+    from . import audit
+    return await audit.recheck_standing()
 
-    One call feeds the whole panel - the counts, the rows and the live line -
-    because they are read together and three endpoints polling in step would
-    disagree with each other at exactly the moment someone is watching.
+
+@app.get("/api/plex/queue")
+def api_plex_queue():
+    """What nuarr still owes Plex, for the dashboard panel."""
+    from . import plexqueue
+    return plexqueue.stats()
+
+
+@app.post("/api/plex/queue/retry")
+async def api_plex_queue_retry(all: bool = False):
+    """Run what is due now. all=true drags every pending row forward."""
+    from . import plexqueue
+    if all:
+        with cursor() as cur:
+            cur.execute("UPDATE plex_queue SET next_try_at=? "
+                        "WHERE done_at IS NULL", (time.time(),))
+    return await plexqueue.run_due(limit=200)
+
+
+@app.get("/api/plexsync")
+async def api_plexsync():
+    """Does Plex still agree with the files? The last answer.
+
+    plexsync.cached() starts the first walk itself, so every route in - this
+    card, the health page, the dashboard tile - shows the same thing.
     """
-    from . import subocr
-    if fresh:
-        # Check now means COUNT AGAIN, not read the cached count - otherwise
-        # the button appears to do nothing for up to two minutes, which reads
-        # as broken rather than as cached.
-        subocr._BACKLOG["n"] = None
-    return subocr.shape_rows(max(1, min(int(limit), 400)),
-                             include_done=bool(int(done)))
+    from . import plexsync, plexqueue
+    d = plexsync.cached()
+    # The queue is part of this story: a disagreement handed to it is not
+    # outstanding any more, it is in flight, and a card that showed only the
+    # finding would keep reporting work that is already being done.
+    d["queue"] = plexqueue.stats()
+    return d
 
 
-@app.get("/api/subocr/shape")
-def api_subocr_shape(file_id: int):
-    """One row's evidence, fetched only when that row is opened."""
-    from . import subocr
-    return subocr.shape_detail(int(file_id))
+@app.post("/api/plexsync/run")
+async def api_plexsync_run():
+    """Look again now. Returns at once; the walk reports itself."""
+    from . import plexsync
+    if plexsync.STATE.get("running"):
+        return {"ok": False, "already": True}
+    asyncio.create_task(plexsync.refresh())
+    return {"ok": True, "started": True}
 
 
-@app.post("/api/subocr/queue_ready")
-async def api_subocr_queue_ready():
-    """Queue the files already known to be convertible. Measures nothing."""
-    from . import subocr
-    return await subocr.queue_ready()
+@app.post("/api/plexsync/fix")
+async def api_plexsync_fix(limit: int = 0, library: str = ""):
+    """Hand the disagreements to the Plex catch-up queue, all or one library."""
+    from . import plexsync
+    return await asyncio.to_thread(plexsync.fix, int(limit or 0),
+                                   library.strip())
 
 
-@app.post("/api/subocr/autoqueue")
-def api_subocr_autoqueue(on: int):
-    """Whether the sweep queues what it finds, or only finds it."""
+@app.post("/api/plexsync/mode")
+async def api_plexsync_mode(mode: str):
+    """auto fixes what it finds on its own schedule; manual lists and waits."""
     import yaml
     from .config import SETTINGS as _S
-    v = bool(int(on))
+    mode = (mode or "").strip().lower()
+    if mode not in ("auto", "manual"):
+        raise HTTPException(400, "mode must be auto or manual")
     cp = _config_path()
     raw = {}
     if cp.exists():
@@ -5241,33 +5333,23 @@ def api_subocr_autoqueue(on: int):
             raw = yaml.safe_load(cp.read_text(encoding="utf-8-sig")) or {}
         except Exception:                                    # noqa: BLE001
             raw = {}
-    raw["subocr_autoqueue"] = v
+    raw["plexsync_mode"] = mode
     cp.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True),
                   encoding="utf-8")
-    _S.subocr_autoqueue = v
-    joblog.log("subtitle OCR: the check will "
-               + ("queue what it finds" if v else "find work but not queue it"),
-               "info")
-    return {"ok": True, "on": v}
+    _S.plexsync_mode = mode
+    joblog.log(f"Plex agreement check set to {mode}", "info")
+    from . import plexsync
+    return plexsync.cached()
 
 
-@app.post("/api/subocr/measure")
-async def api_subocr_measure(limit: int = -1):
-    """Read the shape of files that have never been measured.
-
-    This is what Check now does now. limit -1 means "use the configured
-    batch"; 0 means every unmeasured file in the library.
-    """
-    from . import subocr
-    return await subocr.measure_sweep(None if limit < 0 else limit)
-
-
-@app.post("/api/subocr/measure/batch")
-def api_subocr_measure_batch(n: int):
-    """How many files one Check-now pass reads. 0 = all of them."""
+@app.post("/api/subocr/rulesgap/mode")
+async def api_subocr_rulesgap_mode(mode: str):
+    """auto requeues the drifted files a batch at a time; manual waits."""
     import yaml
     from .config import SETTINGS as _S
-    n = max(0, min(100000, int(n)))
+    mode = (mode or "").strip().lower()
+    if mode not in ("auto", "manual"):
+        raise HTTPException(400, "mode must be auto or manual")
     cp = _config_path()
     raw = {}
     if cp.exists():
@@ -5275,11 +5357,73 @@ def api_subocr_measure_batch(n: int):
             raw = yaml.safe_load(cp.read_text(encoding="utf-8-sig")) or {}
         except Exception:                                    # noqa: BLE001
             raw = {}
-    raw["subocr_measure_batch"] = n
+    raw["rulesgap_mode"] = mode
     cp.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True),
                   encoding="utf-8")
-    _S.subocr_measure_batch = n
-    return {"ok": True, "n": n}
+    _S.rulesgap_mode = mode
+    joblog.log("subtitle rules: files that drift will now be "
+               + ("requeued automatically, "
+                  f"{getattr(_S, 'rulesgap_batch', 200)} at a time"
+                  if mode == "auto" else "listed and left for you"), "info")
+    from . import subocr
+    return {"ok": True, "mode": mode}
+
+
+@app.get("/api/subocr/rulesgap")
+def api_subocr_rulesgap(check: int = 0):
+    """Which files no longer match the subtitle rules, per library.
+
+    check=1 is the Check-now button: start a fresh walk rather than serve the
+    cached answer. It returns immediately either way - the walk runs on its own
+    thread and reports itself through `scan`.
+    """
+    from . import subocr
+    d = dict(subocr.rules_gap(force=bool(check)))
+    d["mode"] = subocr.gap_mode()
+    dr = subocr.gap_drain()
+    dr["left"] = subocr.gap_left(dr.get("library") or "")
+    dr["keep"] = subocr.gap_keep()
+    dr["in_flight"] = subocr.gap_in_flight()
+    d["drain"] = dr
+    d["libraries"] = subocr.gap_libraries()
+    # THE WALK, WHILE IT IS WALKING. Same poll as everything else on the card:
+    # a second endpoint for progress would be a second clock to disagree with.
+    d["scan"] = dict(subocr.GAP_STATE)
+    # The requeue pass rides along on the same poll the card already makes -
+    # a second endpoint polling in step is how two numbers on one card end up
+    # disagreeing about the same moment.
+    # REQUEUE_STATE belonged to the burst version and is no longer written;
+    # the drain reports itself under "drain" instead.
+    return d
+
+
+@app.post("/api/subocr/rulesgap/requeue")
+async def api_subocr_rulesgap_requeue(library: str = "", stop: bool = False):
+    r"""Start (or stop) draining the out-of-date list into the queue.
+
+    NOT A BURST ANY MORE. This used to enqueue every drifted file at once -
+    5,379 rows in one press. It now starts a drain that keeps the transcoding
+    queue topped up to the same depth the auto-queue uses and feeds it as jobs
+    finish, which is what the auto switch does too. One machine, two ways to
+    start it.
+    """
+    from . import subocr
+    if stop:
+        d = subocr.set_gap_drain(False, "", reset=False)
+        joblog.log("subtitle rules: stopped requeueing - "
+                   f"{d['queued']} file(s) were handed over", "info")
+        return {"ok": True, "drain": d}
+    subocr.set_gap_drain(True, library.strip())
+    joblog.log("subtitle rules: requeueing "
+               + (f"{library.strip()}" if library.strip() else "every library")
+               + f" - keeping the transcoding queue at {subocr.gap_keep()} "
+               f"jobs and feeding it as they finish", "ok")
+    # One pass now, so the press does something visible immediately rather
+    # than waiting up to a minute for the loop.
+    out = await subocr.gap_tick()
+    return {"ok": True, "started": True, "drain": subocr.gap_drain(),
+            "queued": out.get("queued", 0),
+            "left": subocr.gap_left(library.strip())}
 
 
 @app.post("/api/subocr/sweep")
@@ -5375,7 +5519,11 @@ async def api_subocr_config(body: dict = Body(...)):
     joblog.log("subtitle OCR settings saved", "ok")
     from . import subocr
     subocr._BACKLOG["n"] = None          # recounted on the next poll, off-thread
-    subocr._FUNNEL["d"] = None
+    # A RULE CHANGE IS EXACTLY WHAT PUTS FILES OUT OF DATE, so the out-of-sync
+    # count cannot keep serving the answer it gave under the old rules. Age it
+    # out rather than recompute here: the panel asks within the second and the
+    # count runs on its own thread, so the save still returns immediately.
+    subocr._RULES_GAP["at"] = 0.0
     out = {"ok": True, **subocr.status()}
     # "TAKES EFFECT ON THE NEXT SWEEP" INVITES THE QUESTION "WHEN IS THAT".
     # Erik asked it. The schedule registry already knows; ship the answer with
@@ -8847,6 +8995,129 @@ tr.logdrop td{padding:0 0 8px 0;background:#1c2129;border-bottom:1px solid var(-
    The old indeterminate style layered #6fb0ff33 over #6fb0ff11 - 20% and 7%
    alpha - which on this background read as a dashed border rather than a
    running process, so a working check looked like a broken one. */
+/* THE REQUEUE ROWS. A press has three moments and each needs to be visible:
+   the pass finding its files, the queue accepting them one by one, and the row
+   leaving because it is done. The leaving is a transition rather than a
+   removal so it reads as "this finished" instead of "this disappeared" - a row
+   that vanishes on click is indistinguishable from a list that lost it.
+
+   max-height carries the collapse because the rows have no fixed height and
+   height:auto cannot be transitioned; 60px is comfortably above one row and
+   the easing hides that it is an upper bound rather than the real height. */
+/* max-height is here ONLY so the collapse can animate - a transition needs a
+   number to start from, and height:auto is not one. It was 60px, "comfortably
+   above one row", written when a row WAS one line. Then the rows learned to
+   open, and the 1,080px list inside was clipped to a row and a third: Erik saw
+   one file where there were two hundred, on three browsers, while my check
+   measured the list's own height and reported twenty. The start value has to
+   clear an open row; the collapse still reads fine from here because opacity
+   is doing most of the work. */
+.gaprow{transition:opacity .42s ease, max-height .42s ease, margin .42s ease,
+        padding .42s ease, border-color .42s ease;max-height:1400px;opacity:1}
+.gaprow.gapok{border-color:var(--ok)!important;
+  background:linear-gradient(90deg,rgba(111,208,140,.10),transparent 60%)}
+/* !important throughout, because the row carries its layout as inline styles
+   and an inline padding beats a class rule every time. Without it the row
+   faded to nothing and then left a 14px sliver of its own padding behind,
+   which vanished abruptly when the element was removed - the one frame that
+   makes a considered animation look like a glitch. */
+.gaprow.gapgone{opacity:0!important;max-height:0!important;
+  margin-top:0!important;margin-bottom:0!important;padding-top:0!important;
+  padding-bottom:0!important;border-color:transparent!important;
+  overflow:hidden}
+/* The per-row queue bar. Narrow on purpose - it sits inside a 24px row next to
+   a number that carries the actual information, so it is a sense of movement,
+   not the readout. */
+/* The scan bar. Wider and taller than the per-row queue bar because it IS the
+   readout here - there is no number beside it doing the real work. */
+.gapscanbar,.pxsbar{height:6px;border-radius:3px;background:#1b212a;
+  overflow:hidden}
+.pxsbar > i{display:block;height:100%;border-radius:3px;
+  background:linear-gradient(90deg,#4f8fd6,#6fb0ff);
+  transition:width 1.2s linear}
+.gapscanbar > i{display:block;height:100%;border-radius:3px;
+  background:linear-gradient(90deg,#4f8fd6,#6fb0ff);
+  transition:width .75s linear}
+.gapchk{border:1px solid var(--line);background:transparent;color:var(--dim);
+  border-radius:5px;cursor:pointer}
+.gapchk:hover:not(:disabled){color:var(--fg,#cfd8e3);border-color:var(--acc)}
+.gapchk:disabled{opacity:.55;cursor:default}
+/* TWENTY ENTRIES, BOUNDED BY THE WINDOW. Five was a peephole - the count
+   above it is in the hundreds, and a list you have to drag five rows at a time
+   is a worse way to read two hundred files than no list at all. Twenty rows at
+   the tightened height is ~920px, which is more page than some screens have,
+   so the viewport gets the final say. */
+/* TWENTY ROWS, MEASURED. A row is 54px with the tightened lines, so the box
+   is 1,080px and shows twenty without scrolling inside itself. The earlier
+   70vh clamp meant a 950px window got twelve - the clamp was protecting the
+   viewport from a list the PAGE can simply scroll to, which is the wrong thing
+   to protect. Past twenty the box scrolls; the page scrolls to reach it. */
+/* Ten of the queue panel's rows, which are 27px - so the box is 270. The
+   header sits outside the scroller so it stays put, exactly as the queue's
+   sticky header does. */
+.flist{overflow:auto;max-height:316px;border-top:1px solid var(--line);
+       /* the list is its own scrolling world: painting one row must not
+          re-layout the card around it */
+       contain:content;overscroll-behavior:contain}
+/* content-visibility IS the scroll performance. Two hundred rows of three
+   lines each is six hundred text nodes the browser laid out and painted on
+   every scroll frame, whether or not they were in the 540px window. With
+   this, rows outside the window are skipped entirely - the fixed intrinsic
+   size keeps the scrollbar honest - and a scroll paints the ten you can see
+   plus a little slack. Measured elsewhere at 5-10x fewer layout nodes per
+   frame; here the difference is the list feeling like a list. */
+/* THE HEADER AND THE ROWS SHARE ONE RULE, or they do not line up. The header
+   sits outside .flist so it can stay put while the list scrolls - which meant
+   the row overrides below applied to the rows only, and the labels drifted:
+   "Keeps" ended up above the Disk column while its values sat next to
+   Changes. Scoped to the card instead of to the scroller, so both get them. */
+#gapCard .qrow{padding-left:28px}
+#gapCard .qrow .qwhy{flex:1 1 150px;text-align:left}
+#gapCard .qrow .qsrc{flex:0 0 76px}
+/* The pill was the tallest thing in the row - 20px against 17px of text - so
+   these rows stood 31px where the queue panel's stand 27. Same pill, sized to
+   the line it sits on, and ten rows fit the 270px box exactly. */
+#gapCard .qrow .qsrc .pill{line-height:15px;padding:0 6px;font-size:9px}
+.flist .frow{padding:3px 10px 3px 28px;
+             border-bottom:1px solid rgba(255,255,255,.04);
+             /* the Plex card still uses these three-line rows */
+             /* 42px is the CONTENT height - a title line and two detail lines -
+                and padding and border are added on top of it, which is how a
+                54px guess made every row 61 and "ten rows" show eight. A row
+                that is rendered measures 49; the placeholder for one that is
+                skipped has to say the same, or the scrollbar lies. */
+             content-visibility:auto;contain-intrinsic-size:auto 42px}
+/* NO content-visibility ON A FLEX ROW. contain-intrinsic-size takes one
+   length for BOTH axes, so "auto 21px" told the browser the row was 21px WIDE
+   as well as tall - and the flexible cells collapsed to nothing: a 9px Title
+   and a 6px Would-change beside a 96px Disk. Paging is doing the real work
+   anyway (forty rows in, forty more on scroll), so the rows lay out normally
+   and the one clever line goes. */
+/* The disk a file sits on, in the disk's own palette colour when the page
+   has one - which ties the row to the spindle in the Files-per-pool-disk
+   panel without a legend. */
+.flist .fdisk{font-size:9.5px;letter-spacing:.3px;opacity:.85;flex:none;
+              font-family:ui-monospace,Consolas,monospace}
+/* The status pill was the tallest thing on the title line, so a row with one
+   was 61px and a row without was 54, and "ten rows" meant eight. Same pill,
+   sized to the line it sits in. */
+.flist .frow .pill{padding:0 6px;line-height:1.35;font-size:9.5px}
+.flist .frow > div:first-child{min-height:0;line-height:1.3}
+.flist .frow b{font-size:11px}
+.flist .fline{font-size:10px;line-height:1.35}
+/* WHILE YOU ARE READING IT, IT HOLDS STILL. The card polls every four seconds
+   with a library open, and a full rebuild throws away the scroll position and
+   can reorder what is under the cursor mid-sentence. Hovering the list, or
+   having scrolled into it, keeps the existing rows; the counts above carry on
+   updating, because those are the part you leave running in the corner of your
+   eye. */
+.flist.held{box-shadow:inset 0 0 0 1px rgba(111,176,255,.25)}
+.fhold{font-size:10px;color:var(--acc);opacity:.85;padding:2px 10px 4px 28px}
+.gapbar{display:inline-block;width:82px;height:5px;border-radius:3px;
+  background:#1b212a;overflow:hidden;vertical-align:middle}
+.gapbar > i{display:block;height:100%;border-radius:3px;
+  background:linear-gradient(90deg,#4f8fd6,#6fb0ff);
+  transition:width .9s linear}
 @keyframes barSweep{from{background-position:120% 0}to{background-position:-20% 0}}
 .scanbar-live{background-image:linear-gradient(115deg,
    rgba(255,255,255,.16) 25%, transparent 25%, transparent 50%,
@@ -9344,6 +9615,11 @@ button.on{border-color:var(--ok);color:var(--ok)}
 }
 @container diskpanel (max-width:560px){
   #disks th:nth-child(2),#disks tr:not(.iorow) td:nth-child(2){display:none}   /* Files */
+  /* The transfer caption sheds words before it sheds numbers, and it asks the
+     same question the columns do: how wide is THIS panel. The chevrons already
+     show the direction, so "to"/"from" goes first, and whose transfer it is
+     matters less than how fast it is going. */
+  .xmv .xowner,.xmv .xdir{display:none}
   /* Swap Read/Write for R/W rather than dropping the labels: a bare pair of
      numbers gives no clue which is which. The job count always stays - it is
      what says whether a quiet disk is idle or merely slow. */
@@ -10561,8 +10837,13 @@ tr.logrow td{background:#1c2129;border-bottom:1px solid var(--acc);padding:0 12p
    they match the Nuarr and system figures sitting directly underneath them.
    One amber for both directions made the two ends of a transfer look like the
    same event happening twice. */
+/* align-self, so the caption is as wide as its words. As a stretched flex
+   child it was the width of the name COLUMN - 47px against 154px of text -
+   which was invisible until the cell stopped clipping, and left the cursor:help
+   region covering only the first third of a line that exists to be hovered. */
 .xmv{font-size:10.5px;line-height:1.5;letter-spacing:.2px;
-     white-space:nowrap;cursor:help;display:flex;align-items:center;gap:4px}
+     white-space:nowrap;cursor:help;display:flex;align-items:center;gap:4px;
+     align-self:flex-start}
 .xmv.xout{color:#58a6ff}
 .xmv.xin{color:#e3b341}
 /* Whose move it is is a different question from which way it goes, so it gets
@@ -10658,6 +10939,21 @@ tr.logrow td{background:#1c2129;border-bottom:1px solid var(--acc);padding:0 12p
 @media(max-width:900px){.dkey{display:none}}
 .disktab{width:100%;table-layout:fixed}
 .disktab th,.disktab td{overflow:hidden;text-overflow:ellipsis}
+/* NO SCROLL CONTAINER HERE. #disks is already one, and already a CSS container
+   that sheds columns at 940 / 560 / 420px - so a wrapper with its own
+   overflow-x nests one scroller inside another, and a min-width here fights
+   the deliberate `min-width:0` that the 940px container query sets. The panel
+   had a responsive system; this only had to stop it clipping one caption. */
+/* THE TRANSFER CAPTION IS NOT PART OF THE NAME COLUMN'S WIDTH. It is drawn in
+   the empty space under the disk name - the row is sized by the capacity bar
+   and the activity chips - and that space carries on past the end of the name
+   cell. Clipping it to the cell is what cut "to NU-DRIVE-0 167.5 MB/s" down to
+   "to NU-DRIVE-0 167.5 M".
+   The NAME still has to be clipped, so the ellipsis moves onto the name itself
+   rather than onto the cell that also holds the caption. */
+.disktab td.dcol-name{overflow:visible;position:relative}
+.dcol-name .dname{display:inline-block;max-width:100%;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap;vertical-align:bottom}
 .disktab .dcol-size,.disktab .dcol-used,.disktab .dcol-free{width:82px}
 .disktab .dcol-bar{width:auto;min-width:96px}
 /* The "x of y" restatement inside the bar cell only appears once the Size and
@@ -11189,6 +11485,28 @@ input[type=time]::-webkit-calendar-picker-indicator{filter:invert(.75);cursor:po
     <div id="socrp"></div>
   </div>
 
+  <!-- What nuarr still owes Plex. The counterpart to the rename queue on the
+       other side of the library: the arrs are told a file changed and so is
+       Plex, and both of those can be waiting on a server that is busy. A row
+       here is not a fault - most are delivered on the first look - which is
+       why the heading says catching up rather than failed. -->
+  <div class="panel">
+    <h2 style="color:#e5a00d">Plex catching up <span id="pqCount" class="dim"></span></h2>
+    <div style="padding:9px 14px;border-bottom:1px solid var(--line)">
+      <button onclick="loadPq()">Check queue</button>
+      <button onclick="retryPq()">Retry all now</button>
+      <span id="pqMsg" class="dim" style="margin-left:8px">every file nuarr
+        changes is offered to Plex here — nuarr asks it to re-read the file,
+        then checks that it did. Files with a rename outstanding wait for it:
+        the arr changes the path, so telling Plex first would make it read the
+        file twice. "Check queue" is read-only.</span>
+    </div>
+    <!-- Pinned summary, outside the scrollbox - see the note on #renqHead. -->
+    <div id="pqHead" style="display:none"></div>
+    <div id="pq" class="scrollbox auto nohz"><div class="dim"
+         style="padding:14px">not checked yet</div></div>
+  </div>
+
   <div class="panel">
     <!-- Each pending panel gets its phase's colour: renames gold, replaces
          the commit cyan (same as the commit progress bar), OCR subs the
@@ -11709,7 +12027,7 @@ async function loadAll(){
   if(s.scan.running) setTimeout(loadAll,3000);
 
   loadWorkers(); loadHooks(); loadHistory(); loadGate(); loadRenq();
-ffCheck(); loadCtl(); loadCmq();
+ffCheck(); loadCtl(); loadCmq(); loadPq();
 // A download survives a page reload - pick it back up, and surface a build
 // that finished staging while the page was closed.
 ffProgress();
@@ -12368,7 +12686,8 @@ The bar splits it by share of bytes moved — Nuarr ${share(mine)}%, everything 
       // the box to the name at the top of it.
       return `<tbody class="dgrp${hot?' dhot':''}${watched?' dwatch':''}${
                        moving?' dwork':''}" style="--dcol:${dc}">
-        <tr><td class="mono" style="color:${dc}">${esc(d.pool_disk)}${(()=>{
+        <tr><td class="mono dcol-name" style="color:${dc}"><span class="dname"
+              >${esc(d.pool_disk)}</span>${(()=>{
           const mv=(moveOf[d.pool_disk]||[]);
           if(!mv.length) return '';
           // Two at most. A disk feeding four others is real, but a name cell
@@ -14533,6 +14852,99 @@ async function loadRenq(){
         <th class="nb" style="width:92px">Attempt</th>
         <th class="num nb" style="width:92px">Next try</th></tr>${rows}</table>`:'');
 }
+
+// ---- Plex catching up ----------------------------------------------------
+// The same panel as Renames waiting on the arrs, for the same kind of work:
+// a durable row per file, mostly delivered on the first look, occasionally
+// waiting on a server that is busy. It is a separate panel rather than a line
+// in the Plex settings page because this is where you look when you want to
+// know whether anything is outstanding right now.
+function pqWhy(err){
+  const s=String(err||'');
+  if(!s) return ['queued','p-dim'];
+  if(/^gave up/i.test(s))                       return [s,'p-bad'];
+  if(/could not be reached/i.test(s))           return ['Plex is not answering','p-warn'];
+  if(/has not indexed/i.test(s))                return ['Plex has not indexed it yet','p-warn'];
+  if(/still describing the old file/i.test(s))  return ['Plex was asked and has not caught up','p-warn'];
+  if(/would not accept an analyze/i.test(s))    return ['Plex refused the re-read','p-warn'];
+  if(/could not read the file/i.test(s))        return ['the file could not be read to check against','p-warn'];
+  return [s,'p-warn'];
+}
+
+async function loadPq(){
+  const el=document.getElementById('pq'), head=document.getElementById('pqHead');
+  const cnt=document.getElementById('pqCount');
+  if(!el) return;
+  let q;
+  try{ q=await (await fetch('/api/plex/queue')).json(); }catch(_){ return; }
+  if(cnt) cnt.textContent = q.pending ? `(${fmt(q.pending)})` : '';
+  if(!q.pending && !q.gave_up){
+    if(head) head.style.display='none';
+    el.innerHTML='<div class="dim" style="padding:10px 14px">'
+      +'nothing waiting — Plex has been told about every file nuarr changed'
+      +(q.done?` <span style="opacity:.7">(${fmt(q.done)} confirmed so far)</span>`:'')
+      +'</div>';
+    return;
+  }
+  const rows=(q.rows||[]).map(r=>{
+    let [why,cls]=pqWhy(r.last_error);
+    const wait=Math.max(0,Math.round(r.next_try_at-Date.now()/1000));
+    const retrying=(r.attempts||0)>0;
+    // HELD IS ITS OWN STATE, not a failed attempt. The file is queued for a
+    // rename the arr has not performed yet, and telling Plex about the path it
+    // is about to leave would make it read the file twice.
+    if(r.held){ why='waiting for the arr to rename it first — telling Plex now '
+                  + 'would point it at a path that is about to change';
+                cls='p-dim'; }
+    const pill = r.held
+      ? `<span class="pill p-dim" title="the rename queue has this file; Plex is told once the new name is in place"
+           >after rename</span>`
+      : retrying
+      ? `<span class="pill p-warn" title="an earlier attempt did not land"
+           >retry ${r.attempts}/${q.max_attempts||6}</span>`
+      : `<span class="pill p-ok" title="the normal path: Plex has just been told"
+           >first pass</span>`;
+    return `<tr>
+      <td class="wrap"><div>${esc((r.path||'').split('\\').pop())}</div>
+        <div class="sub ${cls==='p-bad'?'rq-bad':cls==='p-warn'?'rq-warn':'dim'}"
+          >${esc(why)}</div>
+        ${r.why?`<div class="sub dim">${esc(r.why)}</div>`:''}</td>
+      <td class="nb">${pill}</td>
+      <td class="num dim nb">${wait>0?('in '+hms(wait)):'due now'}</td></tr>`;
+  }).join('');
+  if(head){
+    head.style.display=''; head.className='pinhead';
+    const bits=[];
+    if(q.holding)   bits.push(`<b>${fmt(q.holding)}</b> waiting on a rename first`);
+    const onPlex=Math.max(0,(q.first_try||0)-(q.holding||0));
+    if(onPlex)      bits.push(`<b>${fmt(onPlex)}</b> waiting on Plex`);
+    if(q.retrying)  bits.push(`<b class="err">${fmt(q.retrying)}</b> retrying after a miss`);
+    head.innerHTML=(bits.join(' <span class="dim">·</span> ')
+                    || `<b>${fmt(q.pending)}</b> queued`)
+      + ` <span class="dim">· ${fmt(q.due)} due now</span>`
+      + (q.gave_up?`<span class="err"> · ${fmt(q.gave_up)} gave up</span>`:'');
+  }
+  el.innerHTML = rows
+    ? `<table class="fixed vtop"><tr><th>File</th>
+         <th class="nb" style="width:92px">Attempt</th>
+         <th class="num nb" style="width:92px">Next try</th></tr>${rows}</table>`
+    : '';
+}
+
+async function retryPq(){
+  const m=document.getElementById('pqMsg');
+  const t=m?m.textContent:'';
+  if(m) m.textContent='asking Plex again…';
+  try{
+    const r=await (await fetch('/api/plex/queue/retry?all=true',
+                               {method:'POST'})).json();
+    if(m) m.textContent=`${fmt(r.ok||0)} confirmed, ${fmt(r.failed||0)} still `
+      + `waiting${r.gave_up?`, ${fmt(r.gave_up)} gave up`:''}`;
+  }catch(e){ if(m) m.textContent='could not run them'; }
+  loadPq();
+  setTimeout(()=>{ if(m) m.textContent=t; }, 9000);
+}
+
 // ---- pending file replaces ----------------------------------------------
 // A deferred commit means the ENCODE IS DONE and only the swap is outstanding,
 // so the wording avoids "failed": nothing was lost, and the output is being
@@ -14592,6 +15004,9 @@ async function retryCommits(){
   loadCmq();
 }
 poll(loadCmq, 8000, 'cmq');
+// Same cadence as the other two queues, and gated on its own element - so it
+// costs nothing while the dashboard is not being looked at.
+poll(loadPq, 8000, 'pq');
 
 // ---- pending OCR subtitles ----------------------------------------------
 async function loadSocrPending(){
@@ -16229,7 +16644,8 @@ function ioCell(w){
   if(w.disk){
     const moved = w.dest_disk && w.dest_disk!==w.disk;
     // same colour as the header breakdown, so a card and its spindle match
-    bits.push(moved ? `${diskTag(w.disk)} → ${diskTag(w.dest_disk)}`
+    bits.push(moved ? `${w.stage==='committing' && w.stage_device
+                        ? diskTag(w.stage_device) : diskTag(w.disk)} → ${diskTag(w.dest_disk)}`
                     : diskTag(w.disk));
   }
   // read and write get opposite colours - they are the pair you compare, and
@@ -16384,14 +16800,27 @@ function stageCell(w){
     // interesting fact implicit: whether DrivePool moved the file to a
     // different spindle at all, which is what explains a commit that is
     // suddenly slow or that lands somewhere unexpected.
-    const from = w.disk ? diskTag(w.disk) : '<span class="dim">cache</span>';
+    // THE ARROW HAS TO DESCRIBE THE TRANSFER THAT IS HAPPENING. It used to
+    // read "NU-DRIVE-0 -> DrivePool", naming the spindle the ORIGINAL file
+    // sits on as the source - and the original takes no part in this copy.
+    // The encode was written to the cache drive, and the commit reads it
+    // from there and writes it into the pool. Erik spotted it: the left-hand
+    // side should be the staging drive.
+    //
+    // Where the original lived is still worth knowing - it is what makes
+    // "moved" mean anything - so it moves to the end of the line, as context
+    // rather than as a participant in the transfer.
+    const from = w.stage_device ? diskTag(w.stage_device)
+               : (w.disk ? diskTag(w.disk) : '<span class="dim">cache</span>');
     // The destination is now known from the first chunk of the copy, because
     // the staging file already sits at its final pool location. "placing…"
     // should only ever be visible for the instant before that.
     if(!w.dest_disk)
       return `<span>committing <span class="dim">from</span> ${from} `
            + `<span class="dim">→ placing…</span></span>`;
-    const moved = w.dest_disk !== w.disk;
+    // Same question as before - did DrivePool put it somewhere new - but
+    // asked of the two spindles it is actually about.
+    const moved = !!(w.disk && w.dest_disk !== w.disk);
     let live='';
     if(w.commit_phase==='verifying'){
       live = ` <span class="dim">· verifying copy…</span>`;
@@ -16409,8 +16838,12 @@ function stageCell(w){
     }
     return `<span>committing ${from} <span class="arrow">→</span> `
          + `${diskTag(w.dest_disk)}`
-         + (moved ? ` <span class="pill p-warn">moved</span>`
-                  : ` <span class="dim">same disk</span>`)
+         + (w.disk
+            ? (moved
+               ? ` <span class="pill p-warn" title="DrivePool put the new copy on a different spindle than the one the original was on.">moved${
+                   w.stage_device ? ' from '+esc(w.disk) : ''}</span>`
+               : ` <span class="dim">back onto its own spindle</span>`)
+            : '')
          + live
          + `</span>`;
   }
@@ -19392,7 +19825,7 @@ const PANE_OF = {ffmpeg:'ffPane', backup:'bkPane',  rules:'rulesPane',
 // clicked Arrs and got an empty page. An alias names a pane plus an intent;
 // it never claims an element of its own.
 const ALIAS_OF = {arrsync:'arrs', audiotitle:'acodec', arrgap:'libs',
-                  shapes:'ocr'};
+                  subsync:'lang', plexsync:'plex'};
 
 // A BLANK PANE IS THE WORST FAILURE MODE THERE IS, because it looks like an
 // empty page rather than a broken one - there is nothing to read, nothing to
@@ -19520,6 +19953,17 @@ function wtab(which){
   if(which==='lang'){
     if(hint) hint.textContent='· subtitles';
     paneLoad('lang', loadLangTab);
+    // Arrived from the health page: the out-of-sync card is the last thing on
+    // a long pane, so landing at the top of Subtitles and leaving the reader
+    // to find it is the same as not linking at all.
+    if(intent==='subsync') setTimeout(()=>{
+      const c=document.getElementById('gapCard');
+      if(!c) return;
+      c.scrollIntoView({behavior:'smooth', block:'center'});
+      c.style.transition='box-shadow .4s';
+      c.style.boxShadow='0 0 0 2px var(--acc)';
+      setTimeout(()=>{ c.style.boxShadow=''; }, 1600);
+    }, 600);
     return;
   }
   if(which==='alang'){
@@ -19582,18 +20026,6 @@ function wtab(which){
   if(which==='ocr'){
     if(hint) hint.textContent='· ocr engines';
     paneLoad('ocr', loadOcr);
-    // Arrived from the health page: put the Signs-or-dialogue card in front
-    // of you rather than leaving it below the fold. The first version of this
-    // landing pointed at the SUBTITLES pane, which sounded right and was
-    // wrong - the card lives here, beside the OCR engines it feeds.
-    if(intent==='shapes') setTimeout(()=>{
-      const c=document.getElementById('shapeCard');
-      if(!c) return;
-      c.scrollIntoView({behavior:'smooth', block:'center'});
-      c.style.transition='box-shadow .4s';
-      c.style.boxShadow='0 0 0 2px var(--acc)';
-      setTimeout(()=>{ c.style.boxShadow=''; }, 1600);
-    }, 500);
     return;
   }
   if(which==='process'){
@@ -19614,6 +20046,17 @@ function wtab(which){
   if(which==='plex'){
     if(hint) hint.textContent='· plex';
     paneLoad('plex', loadPlexCfg);
+    loadPlexSync();
+    // Arrived from the health page: the agreement card is below the
+    // connection settings, so put it in front of the reader.
+    if(intent==='plexsync') setTimeout(()=>{
+      const c=document.getElementById('pxsCard');
+      if(!c) return;
+      c.scrollIntoView({behavior:'smooth', block:'center'});
+      c.style.transition='box-shadow .4s';
+      c.style.boxShadow='0 0 0 2px var(--acc)';
+      setTimeout(()=>{ c.style.boxShadow=''; }, 1600);
+    }, 500);
     return;
   }
   if(intent==='audiotitle'){
@@ -20781,19 +21224,30 @@ function hlPaint(){
       <span class="${c.warn?'warn':'dim'}" style="flex:1;overflow:hidden;
         text-overflow:ellipsis;white-space:nowrap">
         ${c.running?'checking now… ':''}${esc(c.note||'')}</span>
-      ${c.mode?`<span class="dim" style="flex:none;font-size:10.5px;
-        border:1px solid var(--line);border-radius:9px;padding:0 7px"
-        title="this system's own auto/manual switch, on its card">${esc(c.mode)}</span>`:''}
-      <span class="dim" style="flex:none">›</span>
+      <span class="dim" style="flex:none;font-size:10.5px;min-width:118px;
+        text-align:right" title="${c.mode
+          ? 'this system\'s own auto/manual switch, lives on its card'
+          : 'this row has no switch - it reports a count'}">${
+        c.mode?`<span style="border:1px solid var(--line);border-radius:9px;
+          padding:0 7px">${esc(c.mode)}</span>`:esc(c.when||'')}</span>
+      <span class="dim" style="flex:none;min-width:96px;text-align:right"
+        title="the page this row opens">${esc(c.where||'')} ›</span>
     </div>`;
   // WHAT NEEDS YOU FIRST. All-clear rows still show - a health page that
   // hides the healthy teaches you nothing about what is being watched - but
   // they queue behind anything that found something.
-  const sorted=[...cs].sort((a,b)=>(b.warn?1:0)-(a.warn?1:0));
+  // TWO ROWS, ONE PAGE, DELIBERATELY ADJACENT. Sorting by warning alone
+  // scattered the pair that share a destination to opposite ends of the list,
+  // where the same page name appearing twice looks like a bug rather than like
+  // two checks that happen to be filed together. Warnings still come first;
+  // within that, rows that open the same page sit next to each other.
+  const sorted=[...cs].sort((a,b)=>(b.warn?1:0)-(a.warn?1:0)
+    || (a.where||'').localeCompare(b.where||''));
   el.innerHTML=head+sorted.map(row).join('')
     +`<div class="dim" style="font-size:10.5px;margin-top:6px">Each row is a
-      shortcut: the full card - list, buttons, its own switch - lives where it
-      always did, one click away.</div>`;
+      shortcut: the full card - list, buttons, its own switch - lives on the
+      page named at the end of the row. Several checks share a page; the name
+      is the same because the destination is, not because the row is.</div>`;
 }
 async function hlRun(){
   const m=document.getElementById('hlMsg'); if(m) m.textContent='starting…';
@@ -21435,18 +21889,20 @@ async function loadLangTab(){
   // configured, not where the decision about what to read is made. Erik asked
   // for it here, under the per-library switches whose every change alters what
   // it reports.
-  el.innerHTML += `<div class="lkind" id="shapeCard" style="padding:11px 12px;margin-top:12px">
-      <b style="color:#6fb0ff">Picture subtitles — what has been measured</b>
+  el.innerHTML += `<div class="lkind" id="gapCard" style="padding:11px 12px;margin-top:12px">
+      <b style="color:#6fb0ff">Files built under older subtitle rules</b>
       <div class="dim" style="font-size:11px;margin-top:2px">
-        A picture subtitle is a bitmap, so Plex paints it into the video as you
-        watch. Measuring one tells us which kind it is: dialogue is read into
-        text by the OCR, typeset signs are burned in by the encoder instead.
-        Reading a track means demuxing the whole file, so it happens once per
-        file.</div>
-      <div id="shapeBody" style="margin-top:8px"><span class="dim"
+        Rules apply when a file is built. Files finished before a rule changed
+        still follow the old rule, and nothing on screen says so. This check
+        asks the planner which finished files would come out differently under
+        today's rules, and <b>Requeue</b> sends them back through the normal
+        queue to be rebuilt. In <b>auto</b> that happens by itself, a hundred
+        at a time, so the buttons are switched off; in <b>manual</b> nothing
+        moves until you press one.</div>
+      <div id="gapBody" style="margin-top:8px"><span class="dim"
            style="font-size:11.5px">loading…</span></div>
     </div>`;
-  shapeLoad();
+  gapLoad();
   langSignsLoad();
 }
 
@@ -21845,7 +22301,7 @@ async function socSaveLib(lib){
       // The switches above decide which tracks the sweep may read, so the
       // funnel and the Convert-all count below are now wrong. Erik asked for
       // exactly this: change a switch, watch the button change.
-      if(document.getElementById('shapeBody')) shapeLoad(true);
+      if(document.getElementById('gapBody')){ _gap=null; gapLoad(); }
     }
     // AFTER the repaint, never before: socPaint rebuilds the block's
     // innerHTML, so a message written first was erased in the same tick - a
@@ -22250,754 +22706,1034 @@ async function loadOcr(){
   ocrUpdLoad();
 }
 
-// ---- the measurement panel ---------------------------------------------
-// POLLS ONLY WHILE THE PAGE IS OPEN, and only fast while something is being
-// read. A file takes ten to twenty seconds to demux, so a panel that just
-// listed finished rows would be indistinguishable from one that had hung -
-// hence the live line, which names the file currently being read.
-//
-// THE TABLE HOLDS STILL WHILE YOU ARE READING IT. A 1.5s refresh that rebuilds
-// the rows throws away the scroll position and can reorder what is under the
-// cursor mid-sentence. Scrolling down or hovering pauses the row rebuild; the
-// live line and the counts keep updating regardless, because those are the
-// parts you leave running in the corner of your eye.
-let _shapeTimer=null, _shapeRows=[], _shapeHover=false, _shapeDone=false,
-    _shapeDoneHidden=0;
-let _shapeSort={key:'at', dir:-1};
 
-// AN EXPLICIT ACTION OUTRANKS THE PAUSE. This used to be
-// `_shapeDone=false;shapeLoad()`, and shapeLoad only repaints when the panel
-// is not held - so with a row open, or the list scrolled down, or the cursor
-// resting on the table, "hide them" fetched the right rows and drew nothing.
-// Clicking a link is a statement that you want the list to change under you.
-function shapeShowDone(on){
-  _shapeDone=!!on;
-  _shapeOpen=null; _shapeDetailHtml='';   // the open row may be one being hidden
-  const b=document.getElementById('shapeScroll');
-  if(b) b.scrollTop=0;
-  _shapeHover=false;
-  shapeLoad(true);
+// ---- does Plex still agree with the files? -------------------------------
+// The Plex counterpart of the arr agreement check, and deliberately the same
+// shape: a headline, what it found, a switch, and a button. Two checks that
+// answer "is this integration still telling the truth" should not need two
+// vocabularies to read.
+let _pxs=null, _pxsTimer=null;
+// Rolling rate, measured on the page from consecutive polls - see the
+// note in gapScanTick(). A rate the server computes and the page reads a
+// second later describes a moment that has already passed, and an average
+// since the start hides the fact that Plex answers more slowly the deeper
+// into a section the walk gets. Both matter here: this pass measurably
+// slows from ~500 items/sec to ~100 as it goes.
+let _pxsRate=null, _pxsSeen=null;
+
+async function loadPlexSync(){
+  const el=document.getElementById('pxsBody');
+  if(!el){ if(_pxsTimer) clearTimeout(_pxsTimer); _pxsTimer=null; return; }
+  try{ _pxs=await (await fetch('/api/plexsync')).json(); }
+  catch(e){ el.innerHTML='<span class="dim">could not load</span>'; return; }
+  pxsPaint();
+  if(_pxsTimer) clearTimeout(_pxsTimer);
+  // Fast while it is walking, idle otherwise - the walk is five minutes and
+  // the count does not move between runs.
+  // Fast while EITHER thing is moving - the walk or the queue's pass. The
+  // queue finishes a pass in seconds, and a card that noticed twenty seconds
+  // later would show the progress bar mostly after it had stopped mattering.
+  const busy=_pxs.running || ((_pxs.queue||{}).run||{}).running;
+  // An OPEN library is being read, and its rows carry countdowns and queue
+  // markers that are only as true as the last poll. Twenty seconds is fine for
+  // a closed card and far too slow for one somebody is watching.
+  const watching = _pxsOpen != null;
+  _pxsTimer=setTimeout(loadPlexSync, busy?1500:(watching?4000:20000));
 }
-// The gate's own words for why the OCR pool is not moving. Cached between
-// polls: the endpoint runs a Plex probe and a disk read, and the answer does
-// not change between two 2.5-second frames.
-let _shapeWhy='', _shapeWhyAt=0;
-async function shapeWhyLoad(){
-  if(Date.now()-_shapeWhyAt < 8000) return;
-  _shapeWhyAt=Date.now();
-  try{
-    const d=await (await fetch('/api/queue/blockers')).json();
-    const r=(d.rows||[]).find(x=>x.pool==='subocr' && (x.short||x.why));
-    _shapeWhy = r ? ('the queue is holding them: '+(r.short||r.why))
-                  : (d.headline || '');
-  }catch(e){ _shapeWhy=''; }
-}
-function shapePaused(){
-  const b=document.getElementById('shapeScroll');
-  // AN OPEN ROW PINS THE LIST. Reading a drop-down while the rows under it
-  // re-sort on every poll is the same problem the hover guard exists for, and
-  // hovering is not what you are doing while you read - the cursor is often
-  // nowhere near the table. A selected row means "I am looking at this one".
-  return _shapeOpen!==null || _shapeHover || (b && b.scrollTop>4);
-}
-function shapeSortBy(key){
-  // Same column twice reverses it. New column starts descending for the
-  // numbers and the clock (biggest/newest first is the useful end) and
-  // ascending for names, where A-Z is what anyone means by sorted.
-  if(_shapeSort.key===key) _shapeSort.dir*=-1;
-  else _shapeSort={key, dir:(key==='title')?1:-1};
-  shapeRender();
-}
-// Status sorts by how far along the work is, not by spelling - "done, held,
-// processing, queued" is alphabetical and tells you nothing, whereas grouping
-// the finished at one end and the stuck at the other is the reason to sort by
-// it at all.
-const _SHAPE_STAGE={held:0, eligible:1, queued:2, processing:3, done:4};
-function shapeCmp(a,b){
-  const k=_shapeSort.key, d=_shapeSort.dir;
-  let x,y;
-  if(k==='title'){ x=(a.title||'').toLowerCase(); y=(b.title||'').toLowerCase(); }
-  else if(k==='verdict'){ x=a.typeset?1:0; y=b.typeset?1:0; }
-  else if(k==='status'){ x=_SHAPE_STAGE[a.status]??1; y=_SHAPE_STAGE[b.status]??1; }
-  else { x=a[k]||0; y=b[k]||0; }
-  if(x<y) return -1*d;
-  if(x>y) return 1*d;
-  // Stable tiebreak on time, so equal rows do not shuffle between refreshes.
-  return ((a.at||0)-(b.at||0))*-1;
-}
-// WHICH POOL THIS VERDICT SENDS THE FILE TO. Colours come from poolColor(),
-// never from a hex typed in here - the comment on that function records that a
-// third hand-rolled copy of these colours is exactly why it exists, and a
-// subocr row that is purple everywhere else must not be purple-ish here.
-function shapePoolPill(typeset){
-  const pool = typeset ? 'encode' : 'subocr';
-  const c = poolColor(pool);
-  return `<span class="pill" style="color:${c};border-color:${c};
-            background:${c}14;font-size:10.5px;padding:1px 8px"
-            title="${typeset
-              ? 'the signs get burned into the picture, which is an encode'
-              : 'the dialogue gets read into text by the OCR'}">${pool}</span>`;
-}
-// WHERE THIS FILE STANDS. Four outcomes, four colours, and the reason on
-// hover - "held" without a why is just a shrug. Deliberately the same family
-// of greens and ambers the rest of the app uses for the same meanings, so a
-// green here means what a green means anywhere else on the page.
-function shapeStatus(r){
-  const st=r.status||'eligible';
-  const c = (st==='done'||st==='converted') ? 'var(--fx-ok,#7fe0a0)'
-          : st==='covered'    ? 'var(--dim)'
-          : st==='processing' ? 'var(--acc)'
-          : st==='queued'     ? '#b48bf2'
-          : st==='held'       ? 'var(--warn)'
-          : 'var(--dim)';
-  const dot=`<span style="display:inline-block;width:6px;height:6px;
-     border-radius:50%;background:${c};margin-right:5px;vertical-align:middle
-     ${st==='processing'?';animation:sdotpulse 1.2s ease-in-out infinite':''}"></span>`;
-  // "held" ALONE IS A SHRUG IN THE CELL TOO, not just in the tooltip. Erik
-  // read a column of identical ambers and had to ask which hold each one was
-  // - the answer was sitting in the hover text nobody hovers. The two holds
-  // get their own words: your switch, or the OCR's verdict.
-  let label=st;
-  // CONVERTED vs COVERED vs DONE, because "done" was answering two questions
-  // with one word: nuarr read the pictures into text, OR the release already
-  // had text and nothing was ever converted. Same outcome for playback, very
-  // different fact about what this system did.
-  if(st==='converted') label='converted';
-  else if(st==='covered') label='already had text';
-  else if(st==='held'){
-    const w=r.status_why||'';
-    label = /switched off/.test(w) ? 'OCR off' : 'rejected';
+
+function pxsPaint(){
+  const el=document.getElementById('pxsBody');
+  if(!el||!_pxs) return;
+  const d=_pxs, q=d.queue||{};
+  const bad=d.total_bad||0;
+  if(d.running){
+    const now=Date.now()/1000, done=d.checked||0;
+    if(_pxsSeen && now>_pxsSeen.t+0.4 && done>=_pxsSeen.done){
+      const inst=(done-_pxsSeen.done)/(now-_pxsSeen.t);
+      _pxsRate=_pxsRate==null?inst:(_pxsRate*0.6+inst*0.4);
+    }
+    _pxsSeen={t:now, done:done};
+  } else { _pxsRate=null; _pxsSeen=null; }
+  const left=Math.max(0,(d.total||0)-(d.checked||0));
+  // THE READ IS PART OF THE PASS, so the ETA has to allow for it. When the walk
+  // finishes, whatever candidates it found are settled by reading the files
+  // themselves, and that stage is bounded by a five-minute budget rather than
+  // by the item count - so an estimate that stopped at the last item would
+  // promise "done" several minutes before it is.
+  const etaS=(_pxsRate&&_pxsRate>1)?Math.round(left/_pxsRate):null;
+  const head=d.running
+    ? `<div style="display:flex;gap:9px;align-items:center;font-size:11.5px">
+         <span class="spin" style="width:11px;height:11px"></span>
+         <b style="color:var(--acc)">asking Plex about every item</b>
+         <span class="dim" style="font-variant-numeric:tabular-nums"
+           >${fmt(d.checked||0)} of ${fmt(d.total||0)}</span>
+         <span class="dim">· ${fmt(bad)} out of step so far</span>
+         <span class="dim" style="margin-left:auto;font-variant-numeric:
+           tabular-nums">${_pxsRate?fmt(Math.round(_pxsRate))+' items/sec':'starting…'}${
+           etaS!=null?' · '+hms(etaS)+' left':''}</span></div>
+       <div class="pxsbar" style="margin-top:5px"><i style="width:${
+         d.total?((d.checked||0)/d.total*100).toFixed(1):0}%"></i></div>
+       ${(d.arbitrated||0)?`<div class="dim" style="font-size:10.5px;margin-top:3px"
+         >reading ${fmt(d.arbitrated)} file(s) directly to settle who is out of
+          date${(d.stale_probes||0)?` — ${fmt(d.stale_probes)} so far were
+          nuarr's own record, now refreshed`:''}</div>`:''}`
+    : `<div style="display:flex;gap:9px;align-items:center;font-size:11.5px">
+         <b class="${bad?'warn':''}" style="${bad?'':'color:var(--ok)'}">${
+           !d.have ? 'not checked yet'
+           : bad ? fmt(bad)+' item'+(bad===1?'':'s')+' describe a file that has since changed'
+                 : 'Plex agrees with all '+fmt(d.total||0)+' items'}</b>
+         ${d.age_s!=null?`<span class="dim" style="font-size:10.5px">checked ${
+            ago(Date.now()/1000-d.age_s)}</span>`:''}
+         <button class="gapchk" style="font-size:10.5px;padding:1px 8px"
+           onclick="pxsRun(this)">Check now</button>
+         <span style="margin-left:auto;display:inline-flex;border:1px solid
+               var(--line);border-radius:5px;overflow:hidden">
+           ${['manual','auto'].map(m=>`<button onclick="pxsMode('${m}')"
+             title="${m==='auto'
+               ? 'When the check finds an item out of step, hand it straight to the catch-up queue.'
+               : 'List what it finds and wait for the button.'}"
+             style="font-size:10.5px;padding:1px 9px;border:0;cursor:pointer;
+               background:${d.mode===m?'var(--acc)':'transparent'};
+               color:${d.mode===m?'#0b0e13':'var(--dim,#8a97a6)'}"
+             >${m}</button>`).join('')}
+         </span>
+       </div>`;
+  const note=`<div class="dim" style="font-size:10.5px;margin-top:4px">
+      Plex reads a file once and remembers what was in it. nuarr changes files,
+      so the two drift, and the symptom is a subtitle menu offering tracks that
+      are not there. This compares Plex's idea of every item against the file
+      itself and hands the differences to the
+      <b>Plex catch-up queue</b>, which re-reads them and checks that it worked.
+      ${d.stale_probes?`<br>Last pass also refreshed <b>${fmt(d.stale_probes)}</b>
+        of nuarr's own stored probes that had fallen behind the files.`:''}
+    </div>`;
+  const queue=pxsQueueHtml(q);
+  const held=keepList('pxsFiles', ()=>{
+  el.innerHTML=head+note+queue+pxsLibHtml()
+    + (bad?`<div style="display:flex;gap:9px;align-items:center;margin-top:7px">
+        <button style="font-size:11px;padding:3px 11px" onclick="pxsFix(this)"
+          title="Hand every library's disagreements to the catch-up queue."
+          >Fix all ${fmt(bad)}</button>
+        <span id="pxsMsg" class="dim" style="font-size:11px"></span>
+      </div>`:'')
+    + (d.last_error?`<div class="warn" style="font-size:10.5px;margin-top:5px"
+        >${esc(d.last_error)}</div>`:'');
+  });
+  if(held){
+    const box=document.getElementById('pxsFiles');
+    if(box && !box.nextElementSibling?.classList?.contains('fhold'))
+      box.insertAdjacentHTML('afterend',
+        '<div class="fhold">held while you read it — move the pointer away and '
+        + 'scroll back to the top to let it refresh</div>');
   }
-  return `<span style="color:${c}" title="${esc(r.status_why||'')}">${dot}${label}</span>`;
-}
-// THE ROW SAYS "rejected" AND STOPS THERE. Clicking a title opens the rest of
-// it under that row, the same way the Plex playback table opens a file: what
-// each track measured, which thresholds those numbers were judged against, and
-// every attempt made on the file. "Rejected" is a verdict; the attempts are a
-// history, and only one of them fits in a cell.
-let _shapeOpen=null, _shapeDetailHtml='';
-function shapePct(x){ return Math.round((x||0)*100)+'%'; }
-async function shapeDetail(id){
-  if(_shapeOpen===id){ _shapeOpen=null; _shapeDetailHtml=''; shapeRender(); return; }
-  _shapeOpen=id; _shapeDetailHtml=''; shapeRender();
-  let d;
-  try{ d=await (await fetch('/api/subocr/shape?file_id='+encodeURIComponent(id)))
-        .json(); }
-  catch(e){ _shapeDetailHtml='<div class="dim" style="padding:8px">could not load</div>';
-            shapeRender(); return; }
-  if(_shapeOpen!==id) return;                 // another row was opened meanwhile
-  const th=d.thresholds||{}, f=d.file||{};
-  // LABELLED LINES, NOT A TABLE. The first version used width:100% tables, so
-  // four short cells were stretched across the whole panel with a runway of
-  // empty space between them and a rule underneath - which is exactly the
-  // "line up" problem: nothing to line up WITH, because the columns had no
-  // relation to the columns of the table above. These are definition rows: a
-  // fixed label column, the value beside it, and the time on the right.
-  const tracks=(d.tracks||[]).map(t=>{
-    const tall=(t.tall_share||0);
-    return `<div class="sdrow">
-      <span class="sdk">track ${t.rel}</span>
-      <span style="color:${t.typeset?'#e2b341':'#6fd08c'};min-width:104px;
-                   display:inline-block">${t.typeset?'typeset signs':'dialogue'}</span>
-      <span class="sdv">${shapePct(tall)} of its cues are tall
-        <span class="dim">(typeset at ${shapePct(th.tall_share)})</span>
-        &nbsp;·&nbsp; median height ${shapePct(t.median_h)}
-        <span class="dim">(tall means over ${shapePct(th.tall_frac)})</span></span>
-      <span class="sdt">${ago(t.at)}</span></div>`;}).join('');
-  const jobs=(d.jobs||[]).map(j=>{
-    const when=j.finished_at||j.started_at||j.created_at;
-    const col=j.state==='done'?'#6fd08c':j.state==='error'?'#e0575b'
-             :j.state==='running'?'#6fb0ff':'var(--dim)';
-    return `<div class="sdrow">
-      <span class="sdk mono">${esc(j.kind||'')}</span>
-      <span style="color:${col};min-width:104px;display:inline-block"
-        >${esc(j.state||'')}</span>
-      <span class="sdv">${esc(j.note||'—')}</span>
-      <span class="sdt">${ago(when)}</span></div>`;}).join('');
-  // WHY, IN THE ORDER A PERSON ASKS IT: what is true now, then what was
-  // measured, then what has been tried. A rejection with no attempts behind it
-  // means the OCR declined before running, which is a different fault from one
-  // that ran and failed - and the table alone cannot say which.
-  _shapeDetailHtml=`
-    <div class="sdrop">
-      <div style="margin-bottom:8px;font-size:13px">
-        <b style="color:#6fb0ff">${esc(d.status||'')}</b>
-        <span class="dim"> — ${esc(d.why||'')}</span>
-        ${th.enabled===false?`<span class="pill p-warn" style="margin-left:8px"
-          >OCR is off for ${esc(f.library||'this library')}</span>`:''}
-        ${f.subocr_state==='rejected'?`<span class="pill p-warn"
-          style="margin-left:8px">the reader returned too little usable text</span>`:''}
-      </div>
-      ${f.state_reason?`<div class="dim" style="margin-bottom:9px">last note:
-        ${esc(f.state_reason)}</div>`:''}
-      <div class="sdh">What was measured</div>
-      ${tracks||'<div class="sdrow dim">nothing measured on this file</div>'}
-      <div class="sdh" style="margin-top:9px">What has been attempted</div>
-      ${jobs||`<div class="sdrow dim">nothing has been attempted yet — which is
-        itself the answer when a file looks stuck</div>`}
-      <div class="dim" style="margin-top:10px;font-size:11px">
-        Signs are converted below ${th.signs_max_cpm} captions per minute; a
-        track with ${th.dialogue_min_cues}+ cues counts as dialogue whatever it
-        is called.
-        <div class="mono" style="margin-top:3px;opacity:.65;word-break:break-all"
-          >${esc(f.path||'')}</div>
-      </div>
-    </div>`;
-  shapeRender();
 }
 
-function shapeRender(){
-  const el=document.getElementById('shapeTblWrap');
-  if(!el) return;
-  const keep=document.getElementById('shapeScroll');
-  const top=keep?keep.scrollTop:0;
-  const rows=_shapeRows.slice().sort(shapeCmp);
-  const arrow=k=>_shapeSort.key===k?(_shapeSort.dir>0?' ▲':' ▼'):'';
-  const th=(k,label,extra)=>`<th onclick="shapeSortBy('${k}')"
-      style="font-weight:600;cursor:pointer;user-select:none;
-             padding:3px 10px 5px 0;position:sticky;top:0;background:var(--bg2,#12161c);
-             text-align:left;${extra||''}" title="sort by ${label.toLowerCase()}"
-      >${label}<span class="dim">${arrow(k)}</span></th>`;
-  const tr=rows.map(r=>{
-    const ts=r.typeset;
-    const open=_shapeOpen===r.file_id;
-    return `<tr class="${open?'rowopen':''}">
-      <td style="padding:2px 10px 2px 0;overflow:hidden;text-overflow:ellipsis;
-                 white-space:nowrap"><span class="tl"
-            onclick="shapeDetail(${r.file_id})"
-            title="click for what was measured and what has been tried"
-            >${esc(r.title||('file '+r.file_id))}</span></td>
-      <td class="dim" style="padding:2px 10px 2px 0;white-space:nowrap">${esc(r.ep||'—')}</td>
-      <td class="dim" style="padding:2px 10px 2px 0;white-space:nowrap">${r.rel}</td>
-      <td style="padding:2px 10px 2px 0;white-space:nowrap;color:${ts?'#e2b341':'#6fd08c'}">
-        ${ts?'typeset signs':'dialogue'}</td>
-      <td style="padding:2px 10px 2px 0;white-space:nowrap">${shapePoolPill(ts)}</td>
-      <td style="padding:2px 10px 2px 0;white-space:nowrap">${shapeStatus(r)}</td>
-      <td class="dim" style="padding:2px 10px 2px 0;white-space:nowrap">
-        ${Math.round((r.tall_share||0)*100)}%</td>
-      <td class="dim" style="padding:2px 10px 2px 0;white-space:nowrap">
-        ${Math.round((r.median_h||0)*100)}%</td>
-      <td class="dim" style="padding:2px 0;white-space:nowrap">${ago(r.at)}</td>
-    </tr>` + (open ? `<tr class="logdrop"><td colspan="9">${
-      _shapeDetailHtml||'<div class="dim" style="padding:10px 14px">loading…</div>'
-    }</td></tr>` : '');}).join('');
-  // PERCENTAGE WIDTHS, NOT PIXELS. Fixed pixel columns left every short field
-  // bunched against the right edge of a wide panel with a runway of empty
-  // space before them; percentages share the width out instead, and the title
-  // still gets the largest share because it is the only variable-length one.
-  el.innerHTML=`
-    <div id="shapeScroll" style="max-height:min(58vh,620px);overflow:auto;margin-top:4px"
-         onmouseenter="_shapeHover=true" onmouseleave="_shapeHover=false">
-      <table style="width:100%;font-size:11.5px;border-collapse:collapse;table-layout:fixed">
-        <colgroup><col style="width:23%"><col style="width:8%"><col style="width:6%">
-          <col style="width:12%"><col style="width:10%"><col style="width:12%">
-          <col style="width:7%"><col style="width:9%"><col style="width:13%"></colgroup>
-        <thead><tr>
-          ${th('title','Title')}${th('ep','Episode')}${th('rel','Track')}
-          ${th('verdict','Verdict')}${th('verdict','Goes to')}
-          ${th('status','Status')}
-          ${th('tall_share','Tall')}${th('median_h','Median')}${th('at','When')}
-        </tr></thead>
-        <tbody>${tr}</tbody>
-      </table>
-    </div>`;
-  const sc=document.getElementById('shapeScroll');
-  if(sc && top) sc.scrollTop=top;
+// THE QUEUE, WHILE IT IS WORKING. "22 waiting" is the same sentence whether
+// the queue is chewing through them or has been stuck for an hour, and it was
+// the only thing this said. Three questions decide which of those it is: what
+// is it doing right now, how much is left, and when does the next batch go.
+//
+// The countdown runs off the SERVER's next_due_in, sampled when the poll
+// landed, minus the time since - so it ticks smoothly between four-second
+// polls instead of jumping, and it cannot drift away from the truth because
+// every poll resets it.
+let _pqSeen=null;
+
+function pxsQueueHtml(q){
+  if(!q || (!q.pending && !q.gave_up && !(q.run||{}).running)) return '';
+  const run=q.run||{};
+  _pqSeen={at:Date.now()/1000, due:q.next_due_in, poll:q.poll_s||25};
+  const total=(run.total||0), done=(run.done||0);
+  const frac=total?Math.min(1,done/total):0;
+  // WHAT IS LEFT, SPLIT BY WHAT IT IS WAITING FOR. A row held for a rename is
+  // waiting on the arr, one on its first pass is waiting for Plex to be asked,
+  // and one retrying is waiting out a backoff. Summed into "waiting" they read
+  // as one queue that is not moving.
+  const held=q.holding||0, retry=q.retrying||0;
+  const fresh=Math.max(0,(q.first_try||0)-held);
+  const chips=[
+    fresh?`<span class="dim">${fmt(fresh)} waiting on Plex</span>`:'',
+    held?`<span class="dim">${fmt(held)} held for a rename</span>`:'',
+    retry?`<span class="warn">${fmt(retry)} retrying</span>`:'',
+    q.gave_up?`<span class="warn">${fmt(q.gave_up)} gave up</span>`:'',
+  ].filter(Boolean).join(' <span class="dim">·</span> ');
+  const last=(!run.running && run.at)
+    ? `<span class="dim" style="font-size:10.5px">last pass ${
+        ago(run.at)}: ${fmt(run.corrected||0)} corrected, ${
+        fmt(run.already||0)} already right${
+        run.failed?', '+fmt(run.failed)+' still waiting':''}</span>`
+    : '';
+  return `<div style="border:1px solid ${run.running?'var(--acc)':'var(--line)'};
+              border-radius:6px;padding:6px 9px;margin-top:7px">
+    <div style="display:flex;gap:9px;align-items:center;font-size:11px">
+      ${run.running?`<span class="spin" style="width:11px;height:11px"></span>`:''}
+      <b>catch-up queue</b>
+      ${run.running
+        ? `<span style="color:var(--acc);font-variant-numeric:tabular-nums"
+             >${fmt(done)} of ${fmt(total)}</span>
+           <span class="dim" style="overflow:hidden;text-overflow:ellipsis;
+                 white-space:nowrap;max-width:38%">${esc(run.now||'')}</span>`
+        : `<span class="dim">${fmt(q.pending||0)} waiting</span>`}
+      <span style="margin-left:auto;display:flex;gap:9px;align-items:center">
+        ${chips}
+        <span id="pqDue" class="dim" style="font-variant-numeric:tabular-nums"
+          >${pxsDueText(q)}</span>
+      </span>
+    </div>
+    ${run.running
+      ? `<div class="pxsbar" style="margin-top:5px"><i style="width:${
+           (frac*100).toFixed(1)}%"></i></div>`
+      : ''}
+    <div class="dim" style="font-size:10.5px;margin-top:3px">
+      Each one is re-checked against the file before it is closed, so a row
+      leaves this queue only when Plex is describing what the file actually
+      holds. ${last}</div>
+  </div>`;
 }
-async function shapeMode(m){
-  const el=document.getElementById('shapeMsg');
-  if(el) el.textContent=' saving…';
-  try{ await fetch('/api/subocr/mode?mode='+encodeURIComponent(m),{method:'POST'}); }
-  catch(e){ if(el) el.textContent=' could not change the mode'; return; }
-  shapeLoad();
+
+// "in 12s" / "due now" / "in 4 min", from the last poll plus the clock since.
+function pxsDueText(q){
+  const run=q.run||{};
+  if(run.running) return 'running now';
+  if(q.next_due_in==null) return '';
+  const left=Math.max(0, q.next_due_in - (Date.now()/1000 - (_pqSeen?_pqSeen.at:0)));
+  // DUE IS NOT THE SAME AS IMMINENT. Rows go due the moment their backoff
+  // expires, but the loop only comes round every POLL_S - so "due now" sat on
+  // screen unchanged between passes and read as stuck, when what it meant was
+  // "waiting for the next tick". Say the thing that is actually about to
+  // happen: when the loop next looks.
+  const poll=q.poll_s||25;
+  if(left<=0.5){
+    const since=Math.max(0, Date.now()/1000 - ((run.at||0) || (Date.now()/1000)));
+    const nextIn=Math.max(0, Math.round(poll - (since % poll)));
+    return `next pass in ${hms(nextIn)}`;
+  }
+  return `next batch in ${hms(Math.round(left))}`;
 }
-async function shapeCheck(){
-  const el=document.getElementById('shapeMsg');
-  if(el) el.textContent=' measuring…';
-  // MEASURES, rather than re-counting. Each file is one demux of a single
-  // subtitle track; the batch size beside the button decides how many.
-  // Nothing is queued and no file is changed - this only finds out what is
-  // in them.
-  shapeLoad(true);                       // show the progress bar immediately
-  try{ await fetch('/api/subocr/measure',{method:'POST'}); }catch(e){}
-  shapeLoad(true);
-  if(el) setTimeout(()=>{ el.textContent=''; }, 2500);
-}
-async function shapeQueueReady(){
-  const el=document.getElementById('shapeMsg');
-  if(el) el.textContent=' queueing…';
-  try{
-    const r=await (await fetch('/api/subocr/queue_ready',{method:'POST'})).json();
-    if(el) el.textContent = r.queued
-      ? ` queued ${r.queued} file(s)`
-      : ' nothing was ready to queue';
-  }catch(e){ if(el) el.textContent=' failed'; }
-  shapeLoad(true);
-  if(el) setTimeout(()=>{ el.textContent=''; }, 4000);
-}
-async function shapeAutoQueue(on){
-  const el=document.getElementById('shapeMsg');
-  if(el) el.textContent=' saving…';
-  try{ await fetch('/api/subocr/autoqueue?on='+(on?1:0),{method:'POST'}); }
-  catch(e){ if(el) el.textContent=' could not save'; return; }
-  if(el) el.textContent='';
-  shapeLoad(true);
-}
-async function shapeBatch(n){
-  const el=document.getElementById('shapeMsg');
-  if(el) el.textContent=' saving…';
-  try{ await fetch('/api/subocr/measure/batch?n='+encodeURIComponent(n),
-                   {method:'POST'}); }catch(e){}
-  if(el) el.textContent='';
-  shapeLoad(true);
-}
-async function shapeRun(){
-  const el=document.getElementById('shapeMsg');
-  if(el) el.textContent='';
-  try{
-    const r=await (await fetch('/api/subocr/sweep',{method:'POST'})).json();
-    if(r && r.error){ if(el) el.textContent=' '+r.error; return; }
-  }catch(e){ if(el) el.textContent=' could not start'; return; }
-  shapeLoad();
-}
-async function shapeLoad(force){
-  const el=document.getElementById('shapeBody');
-  if(!el){ if(_shapeTimer) clearTimeout(_shapeTimer); _shapeTimer=null; return; }
-  let d;
-  try{ d=await fetch('/api/subocr/shapes?limit=200&done='+(_shapeDone?1:0))
-         .then(r=>r.json()); }
-  catch(e){ el.innerHTML='<span class="dim" style="font-size:11.5px">could not load</span>'; return; }
-  const s=d.summary||{}, live=d.live||{}, rows=d.rows||[];
-  _shapeDoneHidden=s.done_hidden||0;
-  // THE FIRST FRAME HAS NO FUNNEL. Those counts are computed on a thread so
-  // the request never waits for two LIKE scans over 37,000 probes, which means
-  // the first payload after a restart genuinely has nothing in it - and the
-  // card drew its whole header around numbers that were not there yet: a row
-  // of blanks that looked like a broken panel rather than a loading one.
-  if(!(s.funnel||{}).managed){
-    el.innerHTML=`<div class="skel" style="padding:2px 0">
-        <i style="width:62%"></i><i style="width:44%"></i><i style="width:78%"></i>
+
+// The countdown is its own ticker: the card polls every 20s when idle, and a
+// number that only moves then reads as frozen rather than as counting.
+setInterval(()=>{
+  const el=document.getElementById('pqDue');
+  if(!el||!_pxs||!_pxs.queue) return;
+  el.textContent=pxsDueText(_pxs.queue);
+}, 1000);
+
+// ---- one row per library, the way the Audio codec page does it -----------
+// A LIBRARY THAT IS CORRECT STILL GETS A ROW. Listing only the ones with a
+// problem hides the difference between "checked and fine" and "never looked
+// at", and a folder added yesterday would not appear until something in it
+// broke. The rows come from the configured libraries; the counts are laid over
+// them, so adding or removing a folder changes this page by itself.
+let _pxsOpen = null;                    // which library is expanded
+
+function pxsLibHtml(){
+  const libs=(_pxs&&_pxs.libraries)||[];
+  if(!libs.length) return '';
+  return `<div style="margin-top:8px">${libs.map(L=>{
+    const open=_pxsOpen===L.library;
+    const ok=!L.bad;
+    return `<div class="lkind" style="padding:0;margin-bottom:4px;overflow:hidden">
+      <div onclick="pxsToggle(${JSON.stringify(L.library).replace(/"/g,'&quot;')})"
+           style="display:flex;gap:9px;align-items:center;padding:6px 10px;
+                  cursor:pointer;font-size:11.5px">
+        <span class="dim" style="width:9px">${open?'▾':'▸'}</span>
+        <b style="flex:1;overflow:hidden;text-overflow:ellipsis;
+                  white-space:nowrap">${esc(L.library)}</b>
+        ${L.queued?`<span class="dim" style="font-size:10.5px"
+           title="already handed to the catch-up queue">${fmt(L.queued)} on the way</span>`:''}
+        ${!(_pxs&&_pxs.have)
+          ? `<span class="dim">not checked yet</span>`
+          : ok
+          ? `<span style="color:var(--ok);font-weight:600">correct</span>`
+          : `<span class="warn" style="font-weight:600">${fmt(L.bad)} wrong</span>`}
+        ${(ok||!(_pxs&&_pxs.have))?'':`<button style="font-size:10.5px;padding:1px 9px"
+           onclick="event.stopPropagation();pxsFixLib(${
+             JSON.stringify(L.library).replace(/"/g,'&quot;')},this)"
+           title="Hand this library's disagreements to the catch-up queue."
+           >Fix ${fmt(L.bad)}</button>`}
       </div>
-      <div class="dim" style="font-size:11px;margin-top:6px">
-        <span class="busy"><span class="sp"></span><span class="step">counting
-        the library's picture subtitles…</span></span></div>`;
-    if(_shapeTimer) clearTimeout(_shapeTimer);
-    _shapeTimer=setTimeout(shapeLoad, 1200);
+      ${open?pxsFilesHtml(L):''}
+    </div>`;}).join('')}</div>`;
+}
+
+// WHAT PLEX SAYS AND WHAT THE FILE HOLDS, IN TWO COLOURS. Reading two lines of
+// codec names and spotting the one word that differs is work; the colours do
+// it instead - amber is Plex's idea, green is the file. The queue markers sit
+// on the right because "when does this get fixed" is a different question from
+// "what is wrong with it".
+function pxsFilesHtml(L){
+  const files=L.files||[];
+  if(!files.length) return '';
+  const sig=files.map(f=>f.file_id+':'+(f.queued?'q':'')+(f.retrying?'r':'')
+                          +(f.next?'n':'')).join(',');
+  return `<div class="flist" id="pxsFiles" data-sig="${esc(sig)}">
+    ${files.map(f=>`
+      <div class="frow">
+        <div style="display:flex;gap:8px;align-items:center">
+          <b style="flex:1;overflow:hidden;text-overflow:ellipsis;
+                    white-space:nowrap">${esc(f.label)}</b>
+          ${pxsMark(f)}
+        </div>
+        <div class="fline">
+          <span class="dim">plex</span>
+          <span style="color:var(--warn)">${esc(f.plex)}</span></div>
+        <div class="fline">
+          <span class="dim">file</span>
+          <span style="color:var(--ok)">${esc(f.disk)}</span></div>
+      </div>`).join('')}
+  </div>`;
+}
+
+function pxsMark(f){
+  if(f.retrying)
+    return `<span class="pill p-warn" title="${esc(f.why||'')}"
+      >retrying ${f.attempts}${f.due_in!=null?' · in '+hms(Math.round(f.due_in)):''}</span>`;
+  if(f.queued)
+    return `<span class="pill p-ok" title="${esc(f.why||'waiting its turn')}"
+      >queued${f.due_in!=null?' · in '+hms(Math.round(f.due_in)):''}</span>`;
+  if(f.next)
+    return `<span class="pill p-dim" title="one of the next to be handed over when you press Fix">next</span>`;
+  return '';
+}
+
+function pxsToggle(lib){
+  _pxsOpen = (_pxsOpen===lib) ? null : lib;
+  pxsPaint();
+}
+
+async function pxsFixLib(lib, btn){
+  if(btn){ btn.disabled=true; btn.textContent='queueing…'; }
+  try{
+    await fetch('/api/plexsync/fix?library='+encodeURIComponent(lib),
+                {method:'POST'});
+  }catch(e){}
+  loadPlexSync();
+}
+
+async function pxsRun(btn){
+  if(btn){ btn.disabled=true; btn.textContent='checking…'; }
+  try{ await fetch('/api/plexsync/run',{method:'POST'}); }catch(e){}
+  setTimeout(loadPlexSync, 400);
+}
+
+async function pxsFix(btn){
+  const m=document.getElementById('pxsMsg');
+  if(btn){ btn.disabled=true; btn.textContent='queueing…'; }
+  try{
+    const r=await (await fetch('/api/plexsync/fix',{method:'POST'})).json();
+    if(m) m.textContent=`handed ${fmt(r.queued||0)} to the catch-up queue — `
+      + `each is re-checked against the file before it is closed`;
+  }catch(e){ if(m) m.textContent='could not queue them'; }
+  loadPlexSync();
+}
+
+async function pxsMode(mode){
+  try{ _pxs=await (await fetch('/api/plexsync/mode?mode='+mode,
+                               {method:'POST'})).json(); pxsPaint(); }
+  catch(e){}
+}
+
+// ---- files built under older subtitle rules -------------------------------
+// WHAT REPLACED THE MEASUREMENT PANEL, and why it is a tenth of the size.
+//
+// The old card here reported the picture-subtitle check on itself: how many
+// files it had measured, how many were left, which batch size it would use,
+// whether it would queue what it found, three progress bars and a live line.
+// Every number in it was about the CHECK. None of them answered the question
+// you actually have after changing a rule twelve lines above this card - does
+// anything I already own no longer match? - and several of them contradicted
+// each other, because a count cached two minutes ago and a bar counting the
+// current pass are not the same quantity and never could be.
+//
+// So the measuring went back inside the OCR job, which has to demux the file
+// anyway, and what is left is the one question: WHICH FILES NO LONGER MATCH.
+// Answered by the planner - the same code the queue uses - so a file listed
+// here is a file the queue would act on, and the button hands it to the
+// ordinary pipeline rather than to a private one that lived on this page.
+let _gap=null, _gapPoll=null;
+// WHICH ROWS ARE MID-FLIGHT. Rendering is split in two because of these: a
+// full rebuild replaces the row elements, and an element that gets replaced
+// cannot finish a transition - the fade would restart from scratch on every
+// 1.5s poll and never complete. So while anything is running or animating,
+// the card is UPDATED IN PLACE and never rebuilt.
+let _gapBusy=null;          // library being requeued; '' = all; null = idle
+let _gapFading=false;       // rows are on their way out - hold the rebuild
+let _gapLocal=null;         // rows as the page currently shows them
+let _gapQueued=0;           // files this session put in the queue
+let _gapScanning=false;     // a walk is running - hold the rebuild
+let _gapRate=null, _gapSeen=null;   // rolling files/sec, see gapScanTick
+
+async function gapLoad(){
+  const el=document.getElementById('gapBody');
+  if(!el){ if(_gapPoll) clearTimeout(_gapPoll); _gapPoll=null; return; }
+  let d;
+  try{ d=await (await fetch('/api/subocr/rulesgap')).json(); }
+  catch(e){ if(_gapBusy===null) el.innerHTML='<span class="dim" '
+            + 'style="font-size:11.5px">could not load</span>'; return; }
+  _gap=d;
+  const scanning=!!(d.scan&&d.scan.running);
+  // A WALK IN PROGRESS DOES NOT REBUILD THE CARD. The rows below are the last
+  // answer and stay readable while the next one is being worked out; only the
+  // scan block changes. Rebuilding each poll would also restart the bar's
+  // transition every 700ms, which is how a smooth bar turns into a stutter.
+  if(_gapBusy!==null || _gapFading) gapTick();
+  else if(scanning && _gapScanning) gapScanTick();
+  else gapRender();
+  _gapScanning=scanning;
+  if(_gapPoll) clearTimeout(_gapPoll);
+  // total is null while the first count is still running on its thread. The
+  // walk reads every stored probe, so it takes about half a minute on a
+  // library this size - which is why it is not done on the request.
+  const counting=(d.total===null||d.total===undefined);
+  const queueing=!!(d.drain&&d.drain.on) || _gapBusy!==null;
+  if(counting||queueing||scanning)
+    _gapPoll=setTimeout(()=>{ if(document.getElementById('gapBody')) gapLoad(); },
+                        scanning?700:(queueing?900:4000));
+}
+
+// In auto the check drives the queue itself; the buttons stay visible so the
+// page still says what CAN be done, but greyed, with the reason in the tip.
+function gapAuto(){ return !!(_gap && _gap.mode==='auto'); }
+
+function gapRowId(lib){ return 'gaprow_'+cssId(lib||'__all__'); }
+
+function gapRender(){
+  const el=document.getElementById('gapBody');
+  if(!el||!_gap) return;
+  const d=_gap, tot=d.total;
+  if(tot===null||tot===undefined){
+    // AFTER A REQUEUE THIS IS NOT A COLD START, and saying the same sentence
+    // for both would read as the card forgetting what just happened. A press
+    // ages the count out on purpose - it was computed against a library that
+    // has since changed - so the wait here is a consequence of the button.
+    el.innerHTML=`<div style="display:flex;gap:8px;align-items:center;
+                              font-size:11.5px">
+      <span class="spin" style="width:11px;height:11px"></span>
+      <span class="dim">${_gapQueued
+        ? `recounting after the requeue — the files you queued drop off this
+           list as their jobs finish`
+        : `reading every finished file against the rules as they stand now —
+           about half a minute the first time, then cached`}</span></div>`;
     return;
   }
-  // Only asked for when something is actually queued and held - there is no
-  // point costing a gate probe to explain an empty queue.
-  if((s.status||{}).queued) shapeWhyLoad();
-  else _shapeWhy='';
-  const busy=!!live.now, held=shapePaused();
-  // THE BAR IS REAL, NOT A SPINNER PRETENDING. ffmpeg reports how far into the
-  // file it has demuxed, so this is the fraction actually read - which is the
-  // whole cost of the check. A striped indeterminate bar stands in only for the
-  // moment before the first reading arrives, rather than faking a number.
-  //
-  // SMOOTHNESS IS THE TRANSITION MATCHING THE POLL, not a faster poll. The bar
-  // moved in visible steps because it was given .4s to travel a distance that
-  // arrived every 1.5s, so it lurched and then sat still for a second. The
-  // poll is now 900ms and the transition 1.05s - very slightly longer than the
-  // gap, so each glide is still running when the next reading lands and the
-  // movement never stops.
-  const pct=Math.round((live.frac||0)*100);
-  const gb=live.size?(live.size/1e9).toFixed(1)+' GB':'';
-  const head = busy
-    ? `<div style="font-size:11.5px">
-         <div style="display:flex;gap:8px;align-items:center">
-           <span class="spin" style="width:11px;height:11px"></span>
-           <span style="color:#6fb0ff;font-weight:600;white-space:nowrap">reading</span>
-           <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
-             <b>${esc(live.now)}</b>
-             <span class="dim">track ${live.track||0}${gb?' · '+gb:''}
-               · ${(live.busy_s||0).toFixed(0)}s</span></span>
-           <span class="dim" style="margin-left:auto;white-space:nowrap">
-             ${live.frac?`<b style="color:#6fb0ff">${pct}%</b>`
-                         + (live.busy_s>2 && live.frac>0.05
-                            ? ' · ' + hms(Math.round(live.busy_s*(1-live.frac)/live.frac)) + ' left'
-                            : '')
-                       :'opening the file…'}</span>
-         </div>
-         <!-- THE TEST, WHILE IT IS BEING APPLIED. A percentage says the read is
-              working; these say what it is working out. The cue count is the
-              container's own, so it costs nothing, and the two thresholds are
-              the rule the verdict is made against - sent by the server so the
-              page cannot quote a threshold the check no longer uses. -->
-         <div class="dim" style="font-size:10.5px;margin-top:2px">
-           ${live.cues?`<b>${fmt(live.cues)}</b> cues · `:''}typeset if more than
-           <b>${Math.round((live.typeset_share||0.2)*100)}%</b> of them use a bitmap
-           taller than <b>${Math.round((live.tall_frac||0.3)*100)}%</b> of the frame${
-           live.verdict?` · <b style="color:${live.verdict==='dialogue'?'#6fd08c':'#e2b341'}"
-             >${esc(live.verdict)}</b>${live.tall_share!=null
-               ? ` — ${Math.round(live.tall_share*100)}% tall, median ${
-                   Math.round((live.median_h||0)*100)}%` : ''}`:''}
-         </div>
-         <div style="height:6px;border-radius:3px;background:#1b212a;margin-top:5px;
-                     overflow:hidden;position:relative">
-           ${live.frac
-             ? `<div id="shapeBar" style="height:100%;border-radius:3px;
-                  width:${pct}%;background:#6fb0ff;transition:width 1.05s linear"
-                ></div>`
-             // Same bright sweep as every other check. The old style layered
-             // two near-transparent blues and read as a dashed border rather
-             // than a running process.
-             : `<div style="position:absolute;inset:0;background:linear-gradient(
-                  90deg,#1b212a 0%,#6fb0ff 45%,#9fd0ff 50%,#6fb0ff 55%,
-                  #1b212a 100%);background-size:220% 100%;
-                  animation:barSweep 1.15s linear infinite"></div>`}
-         </div>
-       </div>`
-    : `<div class="dim" style="font-size:11.5px">not reading anything right now</div>`;
-  // COUNTED ACROSS EVERYTHING MEASURED, not across the rows on screen - the
-  // table shows the newest sixty, and counting those would describe the
-  // window rather than the work.
-  const st=s.status||{};
-  const done=st.done||0, tot=s.files||0;
-  const stChip=(k,label,col)=>(st[k]
-    ? `<span style="color:${col}"><b>${fmt(st[k])}</b>
-         <span class="dim">${label}</span></span>` : '');
-  // MODE AND BUTTONS, the same shape as every other check on the settings
-  // pages. This one had neither: it swept on its own schedule with no way to
-  // say "not automatically" and no way to say "now".
-  const sw=s.sweep||{}, sweeping=!!sw.running;
-  const smode=s.mode||'auto', sauto=smode==='auto';
-  // ---- THE FUNNEL ---------------------------------------------------------
-  //
-  // The panel could only ever say "76 of 164 measured", which is a fraction of
-  // a number nobody had been shown: 164 is what this check happens to have
-  // read, not how many files have picture subtitles at all. Erik asked for the
-  // real population, and it is the only honest way to report a backlog - four
-  // steps, each one a count you would otherwise have to take on faith.
-  const fn = s.funnel || {};
-  const step = (n, label, col) => `<span style="white-space:nowrap"><b style="${
-      col?`color:${col}`:''}">${fmt(n||0)}</b>
-    <span class="dim">${label}</span></span>`;
-  const arrow = '<span class="dim" style="opacity:.5">›</span>';
-  const funnelRow = fn.managed ? `
-    <div style="display:flex;gap:9px;flex-wrap:wrap;align-items:baseline;
-                font-size:12px;margin:6px 0 3px">
-      ${step(fn.managed, 'files managed')} ${arrow}
-      ${step(fn.with_picture, 'have picture subtitles', '#6fb0ff')} ${arrow}
-      ${step(fn.measured, 'measured by this check', '#7fe0a0')}
-      ${fn.to_measure ? `${arrow} ${step(fn.to_measure, 'still to measure', '#f2c94c')}` : ''}
-      ${(s.measuring||{}).running || (s.sweep||{}).running
-        ? '<span class="dim" style="font-size:10.5px">· counting up as the pass reads</span>'
-        : ''}
-    </div>` : '';
-
-  // WHERE THE MEASURED ONES GO. Two destinations and two dead ends, which is
-  // the question "how many are subocr vs encode" asked properly: a dialogue
-  // track is read into text by the OCR, a typeset one is burned into the
-  // picture by the encoder, and the rest are either already done or declined.
-  const whereRow = fn.measured ? `
-    <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:baseline;
-                font-size:11.5px;margin:0 0 5px">
-      <span class="dim">of those measured:</span>
-      <span style="color:#6fd08c"><b>${fmt(fn.dialogue_files)}</b>
-        <span class="dim">dialogue → subtitle OCR</span></span>
-      <span style="color:#e2b341"><b>${fmt(fn.typeset_files)}</b>
-        <span class="dim">typeset → burned in by the encoder</span></span>
-      ${fn.queued?`<span style="color:#b48bf2"><b>${fmt(fn.queued)}</b>
-        <span class="dim">queued now</span></span>`:''}
-      <!-- COUNTED FROM THE FILES, not from finished jobs. A job row says an
-           attempt happened; the file says whether a text track is in it. Five
-           of six films checked carry a track this system made and have no
-           sub_ocr row at all, because the OCR was handed to a transcode and
-           delivered there - and one has the row and no track, because the read
-           was rejected. -->
-      <span style="color:var(--fx-ok,#7fe0a0)"
-        title="This system read the picture subtitles into a text track in the file."
-        ><b>${fmt((s.status||{}).converted || fn.converted)}</b>
-        <span class="dim">converted by nuarr</span></span>
-      ${(s.status||{}).covered?`<span class="dim"
-        title="The release already shipped its own text subtitles for that role, so nothing was converted and nothing needs to be."
-        ><b>${fmt(s.status.covered)}</b> already had text</span>`:''}
-      ${fn.rejected?`<span style="color:var(--warn)"
-        title="The reader ran and declined these - too little usable text. A verdict about the content, remembered so the same file is not read again every sweep."
-        ><b>${fmt(fn.rejected)}</b>
-        <span class="dim">rejected by the OCR</span></span>`:''}
-      ${(s.status||{}).unscanned?`<span style="color:var(--warn)"
-        title="No stored probe, so nothing can be planned from them until a scan reads them again. Not a fault and not a queue - they simply cannot be acted on yet."
-        ><b>${fmt(s.status.unscanned)}</b>
-        <span class="dim">waiting on a rescan</span></span>`:''}
-    </div>` : '';
-
-  const mb = s.measure_batch;
-  const mz = s.measuring || {}, measuring = !!mz.running;
-  const ctl = `
-    <div style="display:flex;gap:7px;align-items:center;font-size:11px;
-                margin:6px 0 2px;flex-wrap:wrap">
-      <!-- CHECKING AND QUEUEING, SPELLED APART. This switch said "when files
-           need converting", which sounded like it governed the conversion and
-           in fact governed the CHECK - so somebody who wanted the survey
-           without the work had to turn the survey off. It says what it does
-           now, and the queueing half is the checkbox beside it. -->
-      <span class="dim">check for files to convert</span>
-      <span style="display:inline-flex;border:1px solid var(--line);
-                   border-radius:5px;overflow:hidden">
-        ${['manual','auto'].map(m=>`<button onclick="shapeMode('${m}')"
-          title="${m==='auto'
-            ?'Look for files to convert every '+(s.every_h||6)+' hours. Checking only - whether it QUEUES what it finds is the box beside this.'
-            :'Only look when you press a button here.'}"
-          style="font-size:11px;padding:2px 10px;border:0;cursor:pointer;
-            background:${smode===m?'var(--acc)':'transparent'};
-            color:${smode===m?'#0b0e13':'var(--dim,#8a97a6)'};
-            font-weight:${smode===m?'600':'400'}">${m}</button>`).join('')}
-      </span>
-      <label style="display:flex;gap:5px;align-items:center;cursor:pointer"
-        title="On: the check hands what it finds straight to the OCR queue - which is what auto has always done. Off: it finds the work and leaves it for you to queue with the button.">
-        <input type="checkbox" ${s.autoqueue!==false?'checked':''}
-               onchange="shapeAutoQueue(this.checked)">
-        <span>queue what it finds</span></label>
-      <!-- CHECK NOW MEASURES. It used to re-count the backlog, which is a
-           reasonable thing for a button to do and not what its label says: the
-           check IS the measurement. It reads from the known picture-subtitle
-           list, and how many it takes in one pass is settable, because each
-           file costs one demux and somebody may want to leave it running
-           through the lot. -->
-      <button onclick="shapeCheck()" ${measuring||sweeping?'disabled':''}
-        style="font-size:11px;padding:2px 9px"
-        title="Measure files that have picture subtitles and have never been read. Nothing is queued or changed.">${
-        measuring?'Measuring…':'Check now'}</button>
-      <span class="dim">measure</span>
-      <select onchange="shapeBatch(this.value)" ${measuring?'disabled':''}
-        style="font-size:11px;padding:1px 4px">
-        ${[10,25,50,100,250,500,0].map(n=>`<option value="${n}" ${
-          n===mb?'selected':''}>${n?fmt(n):'all '+fmt(fn.to_measure||0)}</option>`).join('')}
-      </select>
-      <span class="dim">per check</span>
-      <!-- TWO DIFFERENT BUTTONS, because they were one and it misled. Convert
-           all now MEASURES first and then queues, which on a library with
-           nothing left to measure looks exactly like "it only scanned more
-           files" - which is what Erik saw. Queue these acts on what is
-           already known and measures nothing. -->
-      <button onclick="shapeQueueReady()" ${sweeping||measuring?'disabled':''}
-        style="font-size:11px;padding:2px 9px"
-        title="Queue the files already measured and known to be convertible. Measures nothing.">${
-        s.ready==null ? 'Queue what is ready <span class="dim">(counting…)</span>'
-        : s.ready ? `Queue what is ready (${fmt(s.ready)})`
-        : 'Queue what is ready (0)'}</button>
-      <button onclick="shapeRun()" ${sweeping||measuring?'disabled':''}
-        style="font-size:11px;padding:2px 9px"
-        title="Measure anything unmeasured, then queue everything convertible. Slower: it reads files first.">${
-        sweeping?'Measuring and queueing…':'Measure, then convert all'}</button>
-      <span class="dim">${sauto
-        ? `checks every ${s.every_h||6}h${s.next_sweep_in_s!=null
-            ? ` · next in ${hms(Math.round(s.next_sweep_in_s))}` : ''}`
-            + (s.autoqueue===false ? ' · found work waits for you' : '')
-        : 'only checks when you press a button'}${
-        s.batch ? ` · capped at ${fmt(s.batch)} per sweep` : ''}</span>
-      <span id="shapeMsg" class="dim"></span>
-    </div>
-    ${measuring?`<div style="font-size:11px;margin:3px 0 5px">
-       ${progressBar({done:mz.done, total:mz.total, now:mz.now||''}, 'files',
-         {kind:'measure', label:'measuring', eta_s:paceEta(mz)})}
-       ${mz.typeset?`<div class="dim" style="font-size:10.5px;margin-top:2px">
-         ${fmt(mz.typeset)} typeset so far — those go to the encoder to be
-         burned in, not to the OCR</div>`:''}
-     </div>`:''}
-    ${sweeping?`<div style="font-size:11px;margin:3px 0 5px">
-       <!-- THE LABEL FOLLOWS THE PHASE. It said "queueing" for the whole pass,
-            including the minutes spent READING files before anything could be
-            queued - so a minute of "queueing" with nothing reaching Transcoding
-            looked broken and was simply mislabelled. -->
-       ${progressBar({done:sw.done, total:sw.total, now:sw.now||''}, 'files',
-         {kind: (sw.phase||'').indexOf('measur')>=0 ? 'measure' : 'queue',
-          label: sw.phase || 'working', eta_s:paceEta(sw)})}
-       <div class="dim" style="font-size:10.5px;margin-top:2px">
-         ${fmt(sw.queued||0)} queued for the OCR${
-         sw.signs?` · ${fmt(sw.signs)} for burning`:''}${
-         // WHEN THE QUEUE WILL REACH THEM, which is the question a queued
-         // count invites. The OCR pool's own pace, from the jobs panel, is
-         // the honest source - this panel only knows how many it added.
-         _liveOcrPace ? ` · the queue is finishing one about every ${
-           hms(Math.round(_liveOcrPace))}` : ''}</div>
-     </div>`:''}`;
-
-  const counts = `
-    ${funnelRow}
-    ${whereRow}
-    ${ctl}
-    <!-- "RIGHT NOW" WAS NOT RIGHT NOW. It carried whatever chips happened to be
-         non-zero, and on a quiet library that is two standing facts - 20 files
-         with no probe, 68 the reader declined - neither of which is happening
-         now or ever changes on its own. A line labelled "right now" listing
-         two permanent conditions is worse than no line: it invites you to wait
-         for something. Live states only, and it says so when there are none;
-         the standing ones moved up into the funnel where the other totals are. -->
-    <div style="display:flex;gap:14px;flex-wrap:wrap;margin:7px 0 4px;font-size:11.5px;
-                align-items:center">
-      <span class="dim">in flight:</span>
-      ${stChip('processing','being read now','var(--acc)')}
-      ${stChip('queued','queued for the OCR','#b48bf2')}
-      ${stChip('eligible','ready to queue','var(--dim)')}
-      ${(() => {
-        // IT SAID "NOTHING BEING READ" WHILE IT WAS READING AQUAMAN. The chips
-        // come from status_counts, which counts measured files by their JOB
-        // state - and a measuring pass has no job: it demuxes a track outside
-        // the queue entirely. So the one thing visibly happening on the card,
-        // two lines above, was the one thing this line could not see.
-        //
-        // In flight means everything happening now, whatever owns it: the
-        // read, the pass driving it, and the queue.
-        const bits=[];
-        if(live.now) bits.push(`<span style="color:#6fb0ff">reading <b>${
-          esc(live.now)}</b></span>`);
-        const mz2=s.measuring||{}, sw2=s.sweep||{};
-        if(mz2.running) bits.push(`<span style="color:#f2c94c">measuring <b>${
-          fmt(mz2.done||0)}</b> of ${fmt(mz2.total||0)}</span>`);
-        if(sw2.running) bits.push(`<span style="color:${
-          /measur/.test(sw2.phase||'')?'#f2c94c':'#b48bf2'}">${
-          esc(sw2.phase||'sweeping')}${sw2.total?` <b>${fmt(sw2.done||0)}</b> of ${
-          fmt(sw2.total)}`:''}</span>`);
-        if(bits.length) return bits.join(' · ');
-        return ((st.processing||0)+(st.queued||0)+(st.eligible||0))
-          ? '' : '<span class="dim">nothing being read, queued or waiting</span>';
-      })()}
-      ${(() => {
-        // WHY THEY ARE STILL WAITING, which a count on its own invites and
-        // never answers. Two different waits with two different reasons:
-        //   eligible - nothing has offered them to the queue yet, and in auto
-        //              mode that is the sweep's schedule, not a fault.
-        //   queued   - the queue HAS them and the gate is holding them; the
-        //              blockers endpoint knows exactly which rule, and it is
-        //              the same function the dispatcher uses, so it cannot
-        //              drift from the behaviour it explains.
-        const bits=[];
-        if(st.eligible) bits.push(sauto
-          ? `waiting for the sweep${s.next_sweep_in_s!=null
-              ? ` — next in ${hms(Math.round(s.next_sweep_in_s))}` : ''}`
-            + `, or press Convert all now`
-          : 'nothing queues them automatically in manual mode — press Convert all now');
-        if(st.queued && _shapeWhy) bits.push(_shapeWhy);
-        return bits.length
-          ? `<span class="dim" style="flex:1 0 100%;font-size:11px;margin-top:1px"
-             >${bits.join(' · ')}</span>` : '';
-      })()}
-      ${(st.held_off||0)?`<span style="color:var(--warn)" title="Subtitle OCR is
-        switched off for these files' libraries in your own settings. Working as
-        asked — flip the library's switch above if you want them converted."
-        ><b>${fmt(st.held_off)}</b>
-        <span class="dim">OCR off for their library</span></span>`:''}
-      <span id="shapeHold" class="dim" style="font-size:11px;${held?'':'display:none'}">
-        · paused while you read — scroll back to the top to resume</span>
-    </div>
-    ${(() => {
-      // THE SWEEP'S OWN PROGRESS, as a bar rather than a percentage buried in
-      // a row of chips. "72 of 116 (62%)" is the number this panel exists to
-      // report, and it was the one thing here without a picture.
-      //
-      // COLOURED BY WHETHER IT IS MOVING, not by whether work remains. Those
-      // are different questions and the first was answering the second: with
-      // 24 files still to do and nothing being read, the bar was blue and
-      // sweeping while the line above it said "not reading anything right
-      // now". A bar that animates when nothing is happening is the same lie
-      // as a spinner that never stops - it teaches you to ignore it.
-      //
-      // So: blue and sweeping only while a file is actually being read, grey
-      // and still otherwise. The backlog is reported in words next to it,
-      // which is where a number that is not moving belongs.
-      if(!tot) return '';
-      const pc = Math.round(done/tot*100);
-      return `
-        <div style="height:6px;border-radius:3px;background:#1b212a;
-                    margin:2px 0 5px;overflow:hidden;position:relative">
-          <div style="height:100%;border-radius:3px;width:${pc}%;
-                      background:${busy?'#6fb0ff':'#46505d'};
-                      transition:width 1.05s linear,background .4s"></div>
-          ${busy?`<div style="position:absolute;inset:0;
-             background:linear-gradient(90deg,transparent 0%,#ffffff22 50%,
-                                        transparent 100%);
-             background-size:220% 100%;
-             animation:barSweep 1.6s linear infinite"></div>`:''}
-        </div>`;
-    })()}
-    <div class="dim" style="font-size:10.5px;margin:-1px 0 4px">
-      ${s.last_at?`newest verdict ${ago(s.last_at)}`
-                 :'nothing measured yet'}${
-        live.last?` · last read finished ${ago(live.last)}`:''}
-      ${s.backlog!=null
-        // THE NUMBER THAT WAS MISSING, and its absence is why this panel read
-        // as a stalled task. The counts above describe the files MEASURED so
-        // far; measuring happens as the sweep goes, so that total climbs and
-        // "53 of 97" can never arrive at 97. What a person wants to know is
-        // how much is left in the library, which is this.
-        ? (s.backlog
-            ? ` · <span style="color:var(--acc)">${fmt(s.backlog)} file${
-                s.backlog===1?'':'s'} in the library still to convert</span>,
-                a batch at a time`
-            : ' · <span style="color:var(--ok)">every file in the library has'
-              + ' been converted</span>')
-        : ''}</div>`;
-  // First build, or the row area is missing: lay the panel out. After that
-  // only the head and counts are rewritten, so the table keeps its scroll.
-  if(!document.getElementById('shapeTblWrap')){
-    el.innerHTML=`<div id="shapeHead"></div><div id="shapeTblWrap"></div>
-      <div class="dim" style="font-size:11px;margin-top:6px">
-        A track counts as typeset when more than 20% of its cues use a bitmap
-        taller than 30% of the frame — tall bitmaps are signs and song
-        captions laid over the picture, not lines of dialogue.
-        <div style="margin-top:4px">Anything queued from here joins the ordinary
-        work queue and runs under
-        <a href="/#transcoding">Transcoding on the dashboard</a> —
-        the same gate, the same disk rules, the same order. Nothing here starts
-        a job on its own outside that queue.</div></div>`;
+  const when=`${d.at?`<span class="dim" style="font-size:10.5px">checked ${
+    ago(d.at)}</span>`:''}
+    <button class="gapchk" style="font-size:10.5px;padding:1px 8px"
+      onclick="gapCheck(this)"
+      title="Walk every finished file against the rules as they stand right now. About twenty seconds; the list below stays readable while it runs."
+      >Check now</button>
+    <span style="margin-left:auto;display:inline-flex;border:1px solid
+          var(--line);border-radius:5px;overflow:hidden">
+      ${['manual','auto'].map(m=>`<button onclick="gapMode('${m}')"
+        title="${m==='auto'
+          ? 'Start requeueing on its own whenever the check finds drift. It '
+            +'keeps '+((d.drain||{}).keep||100)+' of these files in the queue '
+            +'and feeds it as they finish, so a rule change drains steadily '
+            +'instead of arriving as one library-wide rewrite.'
+          : 'List what drifted and leave the buttons to you.'}"
+        style="font-size:10.5px;padding:1px 9px;border:0;cursor:pointer;
+          background:${d.mode===m?'var(--acc)':'transparent'};
+          color:${d.mode===m?'#0b0e13':'var(--dim,#8a97a6)'}"
+        >${m}</button>`).join('')}
+    </span>`;
+  if(!tot){
+    el.innerHTML=`<div id="gapScan"></div>${gapDrainHtml()}
+      <div style="display:flex;gap:9px;align-items:center;font-size:11.5px;
+                  flex-wrap:wrap">
+      <b style="color:var(--ok)">every file matches the subtitle rules</b>
+      ${when}</div>
+      <div class="dim" style="font-size:10.5px;margin-top:3px">Change a switch
+        above and this will say so within five minutes, or press Check now.</div>`;
+    gapScanTick();
+    return;
   }
-  // DONE ROWS ARE HIDDEN BY DEFAULT, the same rule as every other check
-  // card: a verdict whose work is finished is history, and the newest-60
-  // window here was mostly green while the held rows a person might act on
-  // sat below the fold. The counts above still include everything; only the
-  // listing narrows, and this line says what it is not showing.
-  const doneToggle = (_shapeDone || _shapeDoneHidden)
-    ? `<div class="dim" style="font-size:11px;margin-top:4px">${_shapeDone
-        ? `showing settled rows too · <span class="lnk"
-             onclick="shapeShowDone(false)">hide them</span>`
-        : `${fmt(_shapeDoneHidden)} settled row${_shapeDoneHidden===1?'':'s'}
-           hidden <span class="dim">(converted or rejected)</span> ·
-           <span class="lnk"
-             onclick="shapeShowDone(true)">show them</span>`}</div>`
-    : '';
-  document.getElementById('shapeHead').innerHTML=head+counts;
-  if(!rows.length){
-    document.getElementById('shapeTblWrap').innerHTML=
-      (_shapeDoneHidden
-        ? `<div class="dim" style="font-size:11.5px">Nothing outstanding —
-           every measured file is handled.</div>`
-        : `<div class="dim" style="font-size:11.5px">Nothing measured yet — the
-           first files get read when the next OCR sweep picks them up.</div>`);
-  }else{
-    _shapeRows=rows;
-    if(force || !held) shapeRender();
+  // ONE ROW PER LIBRARY, because that is the unit you would act on. A single
+  // "247 files" with one button is a decision about the whole array; the same
+  // number split three ways is three small ones, and the anime shelf can be
+  // requeued without touching Movies.
+  const libs=Object.entries(d.by_library||{}).sort((a,b)=>b[1]-a[1]);
+  _gapLocal={tot:tot, libs:libs.slice()};
+  // NOTHING IS REBUILT WHILE YOU ARE IN THE LIST. Preserving the list node
+  // and rebuilding the card around it every 900ms while a drain runs still
+  // re-parents two hundred rows into fresh markup on a timer - which is what
+  // "the scroll locks up" felt like. While the list is held, only the small
+  // live numbers are touched, in place, and the card is left alone.
+  if(listHeld('gapFiles')){
+    const tot_=document.getElementById('gapTot');
+    if(tot_ && tot!=null) tot_.textContent=`${fmt(tot)} file${tot===1?'':'s'} would come out differently today`;
+    const dr=d.drain||{};
+    const ban=document.querySelector('#gapBody .gapdrain-n');
+    if(ban && dr.on) ban.textContent=`${fmt(dr.queued||0)} handed over · ${fmt(dr.left||0)} to go`;
+    const box=document.getElementById('gapFiles');
+    if(box) box.classList.add('held');
+    gapScanTick();
+    return;
   }
-  // ONE LINE, ONE ID, OUTSIDE THE TABLE. Both branches used to draw it - the
-  // empty one inside #shapeTblWrap and the other after it - so on the way from
-  // "showing" back to "hidden" (200 rows to none) both existed at once.
-  // getElementById found the one inside the wrap and rewrote that; the one
-  // under the cursor kept its old text. The link worked and looked dead.
-  {
-    let t=document.getElementById('shapeDoneLine');
-    if(!t){
-      t=document.createElement('div'); t.id='shapeDoneLine';
-      const w=document.getElementById('shapeTblWrap');
-      if(w) w.parentNode.insertBefore(t, w.nextSibling);
+  const held=keepList('gapFiles', ()=>{
+  el.innerHTML=`
+    <div id="gapScan"></div>${gapDrainHtml()}
+    <div style="display:flex;gap:9px;align-items:center;font-size:11.5px;
+                flex-wrap:wrap">
+      <b class="warn" id="gapTot">${fmt(tot)} file${tot===1?'':'s'} would come
+        out differently today</b>${when}</div>
+    ${(d.mode==='auto'&&!(d.drain||{}).on)?`<div class="dim"
+      style="font-size:10.5px;margin-top:3px">Auto is on: the next check to
+       find drift starts requeueing by itself.</div>`:''}
+    <div class="dim" style="font-size:10.5px;margin:3px 0 7px">Each job
+      re-reads the rules when it starts. Subtitle-only work is a remux, not a
+      re-encode. Watch them go through
+      <a href="/#transcoding">Transcoding on the dashboard</a>.</div>
+    ${gapWhyHtml()}
+    <div id="gapRows">${(d.libraries&&d.libraries.length)
+      ? gapLibsHtml()
+      : libs.map(([lib,n])=>gapRowHtml(lib,n)).join('')}</div>
+    <div class="gaprow" id="${gapRowId('')}" data-lib=""
+         style="display:flex;gap:9px;align-items:center;margin-top:7px;
+                border:0;padding:0">
+      <button class="gapbtn" style="font-size:11px;padding:3px 11px;flex:none"
+        ${gapAuto()?'disabled':''}
+        onclick="gapRequeue('',this)"
+        title="${gapAuto()
+          ? 'Auto is on: everything here is being requeued by itself, a hundred at a time. Switch to manual to drive it by hand.'
+          : 'Start feeding every library\'s out-of-date files into the queue, a hundred at a time, topping up as they finish. Nothing is queued in one burst.'}"
+        >Requeue all ${fmt(tot)}</button>
+      <span class="gapstat" style="flex:1"></span>
+      <span id="gapMsg" class="dim" style="font-size:11px"></span>
+    </div>`;
+  });
+  // Said out loud, because a list that has stopped updating while everything
+  // around it keeps moving otherwise looks like the list has broken.
+  if(held){
+    const box=document.getElementById('gapFiles');
+    if(box && !box.nextElementSibling?.classList?.contains('fhold'))
+      box.insertAdjacentHTML('afterend',
+        '<div class="fhold">held while you read it — move the pointer away and '
+        + 'scroll back to the top to let it refresh</div>');
+  }
+  gapScanTick();
+}
+
+// THE WALK, WHILE IT WALKS. Twenty seconds of silence after pressing a button
+// is indistinguishable from a button that did nothing, and this one has a real
+// denominator to show - the file list is counted before the first plan is made
+// - so the bar is a true fraction rather than a spinner with delusions.
+//
+// THE RATE IS MEASURED HERE, FROM TWO SAMPLES. The server sends `done` and the
+// time it started; a rate computed there and read a second later describes a
+// moment that has passed. Sampling the delta between polls also means a stall
+// shows up as the rate falling, where an average-since-start would hide it -
+// and on a cold process the first plan can take fifteen seconds while ffmpeg
+// is asked which encoders this machine has, which is exactly the kind of pause
+// an average would smooth away into a lie.
+function gapScanTick(){
+  const box=document.getElementById('gapScan');
+  if(!box) return;
+  const sc=(_gap&&_gap.scan)||{};
+  if(!sc.running){ box.innerHTML=''; _gapRate=null; _gapSeen=null; return; }
+  const now=Date.now()/1000, done=sc.done||0, total=sc.total||0;
+  if(_gapSeen && now>_gapSeen.t+0.25){
+    const inst=(done-_gapSeen.done)/(now-_gapSeen.t);
+    // Smoothed, because a 700ms window over a chunked walk is noisy enough to
+    // make the number flicker between 900 and 3,000 and read as broken.
+    _gapRate=_gapRate==null?inst:(_gapRate*0.6+inst*0.4);
+  }
+  _gapSeen={t:now, done:done};
+  // total is 0 until the id list comes back - a second or two. "0 of 0" with
+  // an empty bar reads as stuck; saying what it is doing does not.
+  if(!total){
+    box.innerHTML=`<div style="border:1px solid var(--acc);border-radius:6px;
+        padding:6px 9px;margin-bottom:8px;display:flex;gap:9px;
+        align-items:center;font-size:11.5px">
+      <span class="spin" style="width:11px;height:11px"></span>
+      <b style="color:var(--acc)">listing the files to check…</b></div>`;
+    return;
+  }
+  const frac=total?Math.min(1,done/total):0;
+  const left=Math.max(0,total-done);
+  const eta=(_gapRate&&_gapRate>1)?hms(Math.round(left/_gapRate)):'';
+  box.innerHTML=`
+    <div style="border:1px solid var(--acc);border-radius:6px;padding:6px 9px;
+                margin-bottom:8px">
+      <div style="display:flex;gap:9px;align-items:center;font-size:11.5px">
+        <span class="spin" style="width:11px;height:11px"></span>
+        <b style="color:var(--acc)">checking every finished file</b>
+        <span class="dim" style="font-variant-numeric:tabular-nums"
+          >${fmt(done)} of ${fmt(total)}</span>
+        <span class="dim" style="margin-left:auto;font-variant-numeric:
+          tabular-nums">${_gapRate?fmt(Math.round(_gapRate))+' files/sec':'starting…'}${
+          eta?' · '+eta+' left':''}</span>
+      </div>
+      <div class="gapscanbar" style="margin-top:5px">
+        <i style="width:${(frac*100).toFixed(1)}%"></i></div>
+      <div class="dim" style="font-size:10.5px;margin-top:3px">
+        ${fmt(sc.found||0)} do not match so far — the list below is the previous
+        answer until this finishes</div>
+    </div>`;
+}
+
+async function gapMode(mode){
+  try{ await fetch('/api/subocr/rulesgap/mode?mode='+mode,{method:'POST'}); }
+  catch(e){ return; }
+  if(_gap) _gap.mode=mode;
+  gapRender();
+}
+
+async function gapCheck(btn){
+  if(_gapScanning) return;
+  if(btn){ btn.disabled=true; btn.textContent='checking…'; }
+  _gapRate=null; _gapSeen=null;
+  try{
+    _gap=await (await fetch('/api/subocr/rulesgap?check=1')).json();
+  }catch(e){ if(btn){ btn.disabled=false; btn.textContent='Check now'; } return; }
+  _gapScanning=true;
+  gapScanTick();
+  gapLoad();
+}
+
+// KEEP THE LIST THAT IS BEING READ. Both cards rebuild their whole body on
+// each poll, which is right for counts and wrong for a list somebody has
+// scrolled into. This swaps the freshly rendered list for the one that was
+// already on screen when it is being read, so the rest of the card updates
+// around it and the rows under the cursor do not move.
+//
+// Held means hovered OR scrolled away from the top - the second matters
+// because reading a long list without the pointer over it is normal, and the
+// scroll position is the evidence.
+// The per-disk palette, when the dashboard's disk panel has defined one;
+// otherwise a stable hash into a small set, so the same disk is always the
+// same colour on this page even if the panel is not loaded.
+function diskColour(name){
+  try{ if(typeof diskColor==='function'){ const c=diskColor(name); if(c) return c; } }
+  catch(e){}
+  const pal=['#58a6ff','#3fb950','#e3b341','#f778ba','#a5d6ff','#ffa657',
+             '#7ee787','#d2a8ff','#79c0ff','#ff7b72','#56d4dd','#e6c07b'];
+  let h=0; for(const ch of String(name||'')) h=(h*31+ch.charCodeAt(0))>>>0;
+  return pal[h%pal.length];
+}
+
+function listHeld(id){
+  const el=document.getElementById(id);
+  if(!el) return false;
+  try{ return el.matches(':hover') || el.scrollTop > 4; }
+  catch(e){ return el.scrollTop > 4; }
+}
+
+function keepList(id, paint){
+  const old=document.getElementById(id);
+  const held=old && listHeld(id);
+  const top=old?old.scrollTop:0;
+  paint();
+  const fresh=document.getElementById(id);
+  if(!old || !fresh || !fresh.parentNode) return false;
+  // UNCHANGED IS NOT REPAINTED EITHER. A poll every four seconds that rebuilds
+  // two hundred rows to show the same two hundred rows is a scroll stutter on
+  // a timer. The list carries a signature of what it shows - ids and queue
+  // state - and if the fresh one matches, the old node stays, scroll position
+  // and all, held or not.
+  const same = old.dataset.sig && old.dataset.sig===fresh.dataset.sig;
+  if(!held && !same) return false;
+  fresh.parentNode.replaceChild(old, fresh);
+  old.scrollTop=top;
+  if(held) old.classList.add('held'); else old.classList.remove('held');
+  return held;
+}
+
+// ---- a library row you can open ------------------------------------------
+// THE COUNT IS NOT THE ANSWER, IT IS THE PROMPT. "513 TV Shows" invites
+// exactly one question - which ones, and what is wrong with them - and the
+// card had no way to answer it. Opening a library lists the files, what the
+// planner would change to each (amber, because it is what goes) and what it
+// keeps (green, because it is what survives), so "remove picture subtitle 1"
+// can be read next to the text track that makes it safe.
+let _gapOpen = null;
+
+function gapLibsHtml(){
+  const libs=(_gap&&_gap.libraries)||[];
+  if(!libs.length) return '';
+  return libs.map(L=>{
+    const open=_gapOpen===L.library;
+    return `<div class="gaprow" id="${gapRowId(L.library)}"
+         data-lib="${esc(L.library)}"
+         style="border:1px solid var(--line);border-radius:6px;
+                margin-bottom:4px;font-size:11.5px;overflow:hidden">
+      <div onclick="gapToggle(${JSON.stringify(L.library).replace(/"/g,'&quot;')})"
+           style="display:flex;gap:9px;align-items:center;padding:5px 8px;
+                  cursor:pointer">
+        <span class="dim" style="width:9px">${open?'▾':'▸'}</span>
+        <b style="flex:1;overflow:hidden;text-overflow:ellipsis;
+                  white-space:nowrap">${esc(L.library)}</b>
+        <span class="gapn warn" style="flex:none">${fmt(L.n)}</span>
+        <span class="gapstat" style="flex:none"></span>
+        <button class="gapbtn" style="font-size:11px;padding:2px 9px;flex:none"
+          ${gapAuto()?'disabled':''}
+          onclick="event.stopPropagation();gapRequeue(${
+            JSON.stringify(L.library).replace(/"/g,'&quot;')},this)"
+          title="${gapAuto()
+            ? 'Auto is on: this library is being requeued by itself, a hundred at a time. Switch to manual to drive it by hand.'
+            : 'Start feeding this library\'s out-of-date files into the queue, a hundred at a time, topping up as they finish.'}"
+          >Requeue</button>
+      </div>
+      ${open?gapFilesHtml(L):''}
+    </div>`;}).join('');
+}
+
+// PAGED IN, NOT DUMPED. Two hundred rows built in one innerHTML is one long
+// synchronous layout the moment the library opens, and the first scroll into
+// the un-rendered part paid for the rest. Forty rows go in, and the next forty
+// are appended when the scroll gets near the bottom - behind a one-line loader
+// so the pause, when there is one, looks like loading rather than locking.
+const GAP_PAGE = 40;
+
+// THE SAME ROW THE QUEUE PANEL USES, class for class. This list had grown its
+// own three-line shape - title, then "would change", then "keeps" - which put
+// the same information in a different language on a page two clicks away from
+// the queue that acts on it. The queue's row is already the house style for
+// "a file, and what is about to happen to it": one line, a fixed cell per
+// question, the disk in its own colour, a pill for state. Reusing .qrow and
+// its cells means a width or a colour changed there moves this too, rather
+// than the two drifting apart the way they just had.
+//
+// The mapping is exact: Planned work is what the planner would change, Keeps
+// is what survives it, and Waiting on becomes the queue state.
+function gapRowHtml_(f, i){
+  const st = f.queued
+    ? `<span class="pill p-ok">${esc(f.queued)}</span>`
+    : (f.next ? `<span class="pill p-dim">next</span>` : '');
+  return `<div class="qrow" data-i="${i}">
+      <span class="qn">${fmt((i||0)+1)}</span>
+      <span class="qt" title="${esc(f.path||'')}">${esc(f.label||'')}</span>
+      <span class="qwork">${esc((f.changes||[]).join('; ') || 'nothing')}</span>
+      <span class="qwhy" style="color:var(--ok)">${esc((f.keeps||[]).join(', ')
+        || 'no subtitle tracks')}</span>
+      <span class="qdisk" style="color:${diskColour(f.disk)}"
+        >${esc(f.disk||'')}</span>
+      <span class="qsrc">${st}</span>
+    </div>`;
+}
+
+function gapRowHtmlOld_(f){
+  return `<div class="frow">
+        <div style="display:flex;gap:8px;align-items:center">
+          <b style="flex:1;overflow:hidden;text-overflow:ellipsis;
+                    white-space:nowrap;font-size:11px">${esc(f.label||'')}</b>
+          ${f.disk?`<span class="fdisk" style="color:${diskColour(f.disk)}"
+             title="the pool disk this file is on">${esc(f.disk)}</span>`:''}
+          ${f.queued
+            ? `<span class="pill p-ok" title="already in the transcoding queue"
+                 >${esc(f.queued)}</span>`
+            : f.next
+            ? `<span class="pill p-dim" title="one of the next handed over when this library is requeued">next</span>`
+            : ''}
+        </div>
+        <div class="fline">
+          <span class="dim">would change</span>
+          <span style="color:var(--warn)">${esc((f.changes||[]).join('; ')
+            || 'nothing')}</span></div>
+        <div class="fline">
+          <span class="dim">keeps</span>
+          <span style="color:var(--ok)">${esc((f.keeps||[]).join(', ')
+            || 'no subtitle tracks')}</span></div>
+      </div>`;
+}
+
+function gapFilesHtml(L){
+  const files=L.files||[];
+  if(!files.length)
+    return `<div class="dim" style="padding:6px 10px 8px 28px;font-size:10.5px;
+      border-top:1px solid var(--line)">the list is rebuilt by the next check
+      — press Check now to see which files these are</div>`;
+  const sig=files.map(f=>f.file_id+':'+(f.queued||'')+(f.next?'n':'')).join(',');
+  const first=files.slice(0,GAP_PAGE);
+  // THE HEADER GOES INSIDE THE SCROLLER, sticky - which is what the queue
+  // panel does and what I should have copied the first time. Outside it, the
+  // header had no scrollbar and the rows did, so every column from Changes
+  // rightwards sat ten pixels left of its label. Inside, they are the same box
+  // and cannot drift.
+  return `<div class="flist" id="gapFiles" data-sig="${esc(sig)}"
+       data-shown="${first.length}" onscroll="gapMore(this)">
+    <div class="qrow qhead">
+      <span class="qn">#</span>
+      <span class="qt">Title</span>
+      <span class="qwork">Changes</span>
+      <span class="qwhy">Should be</span>
+      <span class="qdisk">Disk</span>
+      <span class="qsrc">State</span>
+    </div>
+    ${first.map((f,i)=>gapRowHtml_(f,i)).join('')}
+    ${files.length>first.length
+      ? `<div class="fmore dim" style="padding:6px 10px 6px 28px;font-size:10.5px;
+           display:flex;gap:7px;align-items:center">
+           <span class="spin" style="width:10px;height:10px"></span>
+           ${fmt(files.length-first.length)} more — scroll to load</div>`
+      : (L.n>L.listed?`<div class="dim" style="padding:5px 10px 5px 28px;
+           font-size:10.5px">showing ${fmt(L.listed)} of ${fmt(L.n)}</div>`:'')}
+  </div>`;
+}
+
+function gapMore(box){
+  if(!box || box._loading) return;
+  if(box.scrollTop + box.clientHeight < box.scrollHeight - 320) return;
+  const L=(_gap&&_gap.libraries||[]).find(x=>x.library===_gapOpen);
+  if(!L) return;
+  const files=L.files||[], shown=+box.dataset.shown||0;   // header excluded
+  if(shown>=files.length) return;
+  box._loading=true;
+  const more=box.querySelector('.fmore');
+  // A frame's breathing room, so the loader is actually seen and the append
+  // does not land inside the same scroll event that asked for it.
+  setTimeout(()=>{
+    const next=files.slice(shown, shown+GAP_PAGE);
+    const html=next.map((f,k)=>gapRowHtml_(f, shown+k)).join('');
+    if(more) more.insertAdjacentHTML('beforebegin', html);
+    else box.insertAdjacentHTML('beforeend', html);
+    box.dataset.shown=String(shown+next.length);
+    if(shown+next.length>=files.length){
+      if(more) more.outerHTML = L.n>L.listed
+        ? `<div class="dim" style="padding:5px 10px 5px 28px;font-size:10.5px"
+           >showing ${fmt(L.listed)} of ${fmt(L.n)}</div>` : '';
+    }else if(more){
+      more.lastChild.textContent=` ${fmt(files.length-shown-next.length)} more — scroll to load`;
     }
-    if(t) t.innerHTML=doneToggle;
+    box._loading=false;
+  }, 60);
+}
+
+function gapToggle(lib){
+  _gapOpen = (_gapOpen===lib) ? null : lib;
+  gapRender();
+}
+
+// ONE ROW, THREE STATES, ONE SHAPE. The idle row, the row being queued and the
+// row confirming all occupy the same box and swap only the right-hand cell -
+// so the list does not reflow under the cursor at the moment you are watching
+// the thing you just clicked.
+function gapRowHtml(lib, n){
+  return `<div class="gaprow" id="${gapRowId(lib)}" data-lib="${esc(lib)}"
+       style="display:flex;gap:9px;align-items:center;padding:5px 8px;
+              border:1px solid var(--line);border-radius:6px;
+              margin-bottom:4px;font-size:11.5px">
+    <b style="flex:1;overflow:hidden;text-overflow:ellipsis;
+              white-space:nowrap">${esc(lib)}</b>
+    <span class="gapn warn" style="flex:none">${fmt(n)}</span>
+    <span class="gapstat" style="flex:none"></span>
+    <button class="gapbtn" style="font-size:11px;padding:2px 9px;flex:none"
+      onclick="gapRequeue(${JSON.stringify(lib).replace(/"/g,'&quot;')},this)"
+      title="Start feeding this library's out-of-date files into the queue, a hundred at a time, topping up as they finish. Each job re-reads the rules when it starts."
+      >Requeue</button>
+  </div>`;
+}
+
+// WHAT A DRAIN LOOKS LIKE WHILE IT RUNS. Deliberately not a takeover of the
+// card: the list underneath is still the answer, and hiding it behind a
+// progress line would make the one number people want - how much is left - the
+// only thing they cannot see. The counts here are live; the rows below are
+// from the last check and say so.
+function gapDrainHtml(){
+  const dr=(_gap&&_gap.drain)||{};
+  if(!dr.on) return '';
+  const total=(dr.queued||0)+(dr.left||0);
+  const frac=total?Math.min(1,(dr.queued||0)/total):0;
+  return `<div style="border:1px solid var(--acc);border-radius:6px;
+              padding:6px 9px;margin-bottom:8px">
+    <div style="display:flex;gap:9px;align-items:center;font-size:11.5px">
+      <span class="spin" style="width:11px;height:11px"></span>
+      <b style="color:var(--acc)">requeueing ${dr.library?esc(dr.library)
+        :'every library'}</b>
+      <span class="dim gapdrain-n" style="font-variant-numeric:tabular-nums"
+        >${fmt(dr.queued||0)} handed over${dr.left!=null
+          ? ' · '+fmt(dr.left)+' to go':''}</span>
+      ${(dr.in_flight||0)>=(dr.keep||100)?`<span class="dim"
+        style="font-size:10.5px" title="Nothing is stuck - the queue simply has
+its share already. The next batch goes in as these finish."
+        >· waiting for room (${fmt(dr.in_flight)} of these already queued)</span>`
+        :''}
+      <button style="font-size:10.5px;padding:1px 9px;margin-left:auto"
+        onclick="gapStop(this)"
+        title="Leave what is already queued alone and stop adding more."
+        >Stop</button>
+    </div>
+    <div class="gapscanbar" style="margin-top:5px"><i style="width:${
+      (frac*100).toFixed(1)}%"></i></div>
+    <div class="dim" style="font-size:10.5px;margin-top:3px">
+      <b>${fmt(dr.keep||100)}</b> of these are kept in the transcoding queue and
+      topped up as they finish, so this stays behind everything else nuarr is
+      doing instead of arriving as one library-wide rewrite. Watch it on
+      <a href="/#transcoding">Transcoding on the dashboard</a>.</div>
+  </div>`;
+}
+
+async function gapStop(btn){
+  if(btn){ btn.disabled=true; btn.textContent='stopping…'; }
+  try{ await fetch('/api/subocr/rulesgap/requeue?stop=true',{method:'POST'}); }
+  catch(e){}
+  _gapBusy=null; _gapFading=false;
+  gapLoad();
+}
+
+// WHAT IT WOULD ACTUALLY DO, before you press anything. A bare "5,302 files"
+// is a number you either trust or ignore, and either way it does not tell you
+// whether the fix is dropping a redundant track or rewriting every file in the
+// library. These are the planner's own action lines, counted, with the numbers
+// inside them collapsed so "remove picture subtitle 3" and "remove picture
+// subtitle 1" group instead of listing twice.
+function gapWhyHtml(){
+  const rs=Object.entries((_gap&&_gap.reasons)||{}).sort((a,b)=>b[1]-a[1]);
+  if(!rs.length) return '';
+  // THE NUMBER SITS BESIDE ITS WORDS. Right-aligning the count across the
+  // full width of the card put it a screen away from the sentence it counts,
+  // so the eye had to carry "remove picture subtitle" across 1,500px of
+  // nothing to find its 1,006. A grid with the number first, in a fixed
+  // column, keeps them together - and every change is listed, because "and
+  // 2 other change(s)" is exactly the kind of summary that hides the one
+  // somebody was looking for.
+  const total=rs.reduce((a,b)=>a+b[1],0);
+  return `<div style="border:1px solid var(--line);border-radius:6px;
+                      padding:6px 9px;margin-bottom:7px">
+    <div class="dim" style="font-size:10.5px;margin-bottom:3px">what the
+      planner would change <span style="opacity:.7">· ${fmt(total)} change${
+      total===1?'':'s'} across ${fmt(_gap.total||0)} files</span></div>
+    <div style="display:grid;grid-template-columns:max-content 1fr;
+                column-gap:12px;row-gap:1px;font-size:11px;
+                max-width:760px">
+      ${rs.map(([w,n])=>`<span class="warn" style="text-align:right;
+          font-variant-numeric:tabular-nums">${fmt(n)}</span>
+        <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+          >${esc(w)}</span>`).join('')}
+    </div>
+  </div>`;
+}
+
+// The rows this press is responsible for: one library, or all of them.
+function gapTargets(){
+  if(_gapBusy===null) return [];
+  if(_gapBusy!=='') return [_gapBusy];
+  return ((_gapLocal&&_gapLocal.libs)||[]).map(x=>x[0]);
+}
+
+// LIVE, IN PLACE. Called on every poll while a pass is running; touches only
+// the cells that change.
+function gapTick(){
+  const dr=(_gap&&_gap.drain)||{};
+  const targets=gapTargets();
+  // THE BAR MEASURES THE DRAIN, NOT ONE BURST. A drain has a moving
+  // denominator - handed over plus still to go - so the fraction is of the
+  // work this press signed up for, and it keeps moving between polls because
+  // the queue is being fed as it empties.
+  const total=(dr.queued||0)+(dr.left||0);
+  const frac=total?Math.min(1,(dr.queued||0)/total):0;
+  for(const lib of targets){
+    const row=document.getElementById(gapRowId(lib));
+    if(!row) continue;
+    const cell=row.querySelector('.gapstat');
+    if(!cell) continue;
+    cell.innerHTML = dr.on
+      ? `<span style="display:inline-flex;gap:7px;align-items:center">
+           <span class="gapbar"><i style="width:${Math.round(frac*100)}%"></i></span>
+           <b style="color:var(--acc);font-variant-numeric:tabular-nums"
+             >${fmt(dr.queued||0)}</b>
+           <span class="dim">handed over${dr.left!=null
+             ? ', '+fmt(dr.left)+' to go':''}</span></span>`
+      : `<span style="display:inline-flex;gap:6px;align-items:center">
+           <span class="spin" style="width:10px;height:10px"></span>
+           <span class="dim">starting…</span></span>`;
   }
-  if(_shapeTimer) clearTimeout(_shapeTimer);
-  // THREE SPEEDS, NOT TWO. 'busy' is true only while a file is actually open,
-  // so the moment one read finished the panel dropped to a 15-second poll -
-  // and the whole gap between two reads, which is most of a sweep, went by
-  // with the counts frozen. That is what made a working panel look dead.
-  //
-  // Outstanding work is the honest middle case: something is queued, running
-  // or eligible, so the numbers are going to move and it is worth looking.
-  // Idle stays slow, because nothing is going to change until the next sweep.
-  const _st = (s.status||{});
-  const _left = (_st.processing||0)+(_st.queued||0)+(_st.eligible||0);
-  const _sweeping = !!((s.sweep||{}).running);
-  _shapeTimer=setTimeout(shapeLoad,
-    (busy || _sweeping) ? 900 : (_left ? 2500 : 15000));
+  // THE DRAIN IS OVER WHEN THE SERVER TURNS IT OFF, which it does when the
+  // list is empty - not when a timer says so. Until then the rows stay, because
+  // the files they count are still waiting their turn.
+  if(_gapBusy!==null && !dr.on) gapDone(dr);
+}
+
+// CONFIRM, THEN LEAVE. The row does not vanish at the moment of clicking -
+// that is indistinguishable from a page that lost it - it says what landed,
+// holds that long enough to read, and then collapses out of the list. The
+// queue accepting the files is what the number reports, so the confirmation
+// is evidence rather than optimism.
+function gapDone(dr){
+  const targets=gapTargets(), all=_gapBusy==='';
+  const n=dr.queued||0;
+  _gapQueued+=n;
+  _gapBusy=null; _gapFading=true;
+  const msg=document.getElementById('gapMsg');
+  if(msg) msg.textContent = n
+    ? `handed over ${fmt(n)} — Transcoding is working through them`
+    : 'nothing needed queueing — they were already in the queue or already right';
+  for(const lib of targets){
+    const row=document.getElementById(gapRowId(lib));
+    if(!row) continue;
+    const cell=row.querySelector('.gapstat');
+    const btn=row.querySelector('.gapbtn');
+    if(btn) btn.style.display='none';
+    if(cell) cell.innerHTML=`<b style="color:var(--ok)">✓ ${
+      all?'queued':fmt(n)+' queued'}</b>`;
+    row.classList.add('gapok');
+  }
+  setTimeout(()=>{
+    for(const lib of targets){
+      const row=document.getElementById(gapRowId(lib));
+      if(row) row.classList.add('gapgone');
+    }
+    setTimeout(()=>{
+      for(const lib of targets){
+        const row=document.getElementById(gapRowId(lib));
+        if(row) row.remove();
+        if(_gapLocal) _gapLocal.libs=_gapLocal.libs.filter(x=>x[0]!==lib);
+      }
+      gapAfterFade(n);
+    }, 520);
+  }, 1100);
+}
+
+// WHAT IS LEFT, COUNTED HERE RATHER THAN ASKED FOR. The server's count was
+// aged out by the requeue and takes half a minute to rebuild; asking now would
+// replace a finished, readable card with a spinner as a reward for pressing
+// the button. The remaining rows are known locally, so the total is corrected
+// from them and the authoritative recount lands quietly a little later.
+function gapAfterFade(n){
+  _gapFading=false;
+  const left=((_gapLocal&&_gapLocal.libs)||[]).reduce((a,b)=>a+b[1],0);
+  const tot=document.getElementById('gapTot');
+  if(tot) tot.textContent = left
+    ? `${fmt(left)} file${left===1?'':'s'} would come out differently today`
+    : 'everything listed here has been queued';
+  const allRow=document.getElementById(gapRowId(''));
+  if(allRow && !left){
+    const b=allRow.querySelector('.gapbtn'); if(b) b.style.display='none';
+  } else if(allRow){
+    const b=allRow.querySelector('.gapbtn');
+    if(b){ b.disabled=false; b.textContent='Requeue all '+fmt(left); }
+  }
+  if(_gapPoll) clearTimeout(_gapPoll);
+  _gapPoll=setTimeout(()=>{ if(document.getElementById('gapBody')) gapLoad(); },
+                      35000);
+}
+
+async function gapRequeue(lib, btn){
+  if(_gapBusy!==null || _gapFading) return;     // one pass at a time
+  const msg=document.getElementById('gapMsg');
+  if(msg) msg.textContent='';
+  _gapBusy=lib;
+  // The press is acknowledged before the request comes back, because the
+  // request itself takes a moment and a button that looks unpressed for half a
+  // second gets pressed twice.
+  for(const el of document.querySelectorAll('#gapBody .gapbtn')) el.disabled=true;
+  if(btn) btn.textContent='queueing…';
+  gapTick();
+  let r;
+  try{
+    r=await (await fetch('/api/subocr/rulesgap/requeue?library='
+      + encodeURIComponent(lib||''), {method:'POST'})).json();
+  }catch(e){
+    _gapBusy=null;
+    if(msg) msg.textContent='could not start it';
+    for(const el of document.querySelectorAll('#gapBody .gapbtn')) el.disabled=false;
+    if(btn) btn.textContent = lib?'Requeue':'Requeue all';
+    return;
+  }
+  if(r && r.already && msg) msg.textContent='a requeue is already running';
+  // The row now tracks a drain that may run for hours, so the press hands off
+  // to the poll rather than expecting an answer.
+  gapLoad();
 }
 
 // ---- what each engine can actually do, on THIS install ------------------
@@ -27653,7 +28389,7 @@ _SETTINGS_SHIM = """
   // front of me". They are deliberately absent from the sidebar - there is no
   // menu entry for a card - so they have to be admitted here by name. wtab()
   // already knows what to do with each of them; it was simply never asked.
-  const DEEP = ['arrgap','arrsync','audiotitle','shapes'];
+  const DEEP = ['arrgap','arrsync','audiotitle','subsync','plexsync'];
   const VALID = KEYS.concat(DEEP);
 
   document.title = 'nuarr settings';
@@ -27700,7 +28436,7 @@ _SETTINGS_SHIM = """
   // its own closure and reaching into the page's ALIAS_OF would tie the two
   // together for one lookup.
   const DEEP_PANE = {arrgap:'libs', arrsync:'arrs', audiotitle:'acodec',
-                     shapes:'ocr'};
+                     subsync:'lang', plexsync:'plex'};
   // Highlight and URL only - no navigation. wtab() calls this after it has
   // already switched panes, which is how a link inside a pane ends up lighting
   // the right sidebar entry and leaving a hash you can refresh onto.

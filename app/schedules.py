@@ -166,3 +166,80 @@ def snapshot() -> dict:
                            "error" if r["last_error_at"] > last else "ok"),
             })
     return {"now": now, "rows": rows, "unknown": dict(UNKNOWN)}
+
+
+# ---------------------------------------------------------------- first look --
+_FIRST: set = set()
+_LOOP = None
+
+
+def bind_loop(loop) -> None:
+    """Remember the app's event loop, so first_look never invents one."""
+    global _LOOP
+    _LOOP = loop
+
+
+def first_look(name: str, run, when: bool = True) -> bool:
+    r"""Start a check's first pass, once, the first time anybody asks for it.
+
+    WHY THIS EXISTS
+    ---------------
+    Every "does X still agree?" check keeps its answer in memory and has a loop
+    behind it that refreshes it. A restart empties the memory, and the loops
+    deliberately wait a minute or three before their first sweep so that boot
+    is not a stampede. In that window the health page shows a row saying "not
+    checked yet" next to another row showing a real number, and the difference
+    is not about the two systems at all - it is about which one happened to
+    have somebody call it. Erik hit exactly this on Plex and asked why the
+    subtitle row beside it was right; the subtitle check starts itself.
+
+    So: any check whose answer is empty starts its own first pass when the page
+    asks for it. Once per process - the loop owns every pass after this one -
+    and never blocking, because the caller is rendering a page.
+
+    ON NOT INVENTING AN EVENT LOOP
+    ------------------------------
+    The first version of this ran async scans with asyncio.run() on a private
+    thread, which looked harmless and took the whole app down. arr.py keeps one
+    shared httpx.AsyncClient; a private loop touched it, then closed, and the
+    client stayed bound to a loop that no longer existed, so every later arr
+    call on the real loop raised and the process stopped answering. An async
+    check therefore goes to the app's own loop or it does not run at all.
+    """
+    if not when or name in _FIRST:
+        return False
+
+    started = False
+    try:
+        r = run()
+    except Exception as e:                                       # noqa: BLE001
+        from . import joblog
+        joblog.log(f"first {name} check: {type(e).__name__}: {e}", "warn")
+        return False
+
+    if hasattr(r, "__await__"):                     # a coroutine: the app's loop
+        import asyncio
+        loop = _LOOP
+        if loop is None or loop.is_closed():
+            r.close()                               # never on a loop of our own
+            return False
+        _FIRST.add(name)
+        asyncio.run_coroutine_threadsafe(_guard(name, r), loop)
+        started = True
+    else:
+        _FIRST.add(name)                            # a plain call, already done
+        started = True
+
+    if started:
+        from . import joblog
+        joblog.log(f"{name}: nothing measured since the restart - checking "
+                   "now, because the page asked", "debug")
+    return started
+
+
+async def _guard(name: str, coro) -> None:
+    try:
+        await coro
+    except Exception as e:                                       # noqa: BLE001
+        from . import joblog
+        joblog.log(f"first {name} check: {type(e).__name__}: {e}", "warn")

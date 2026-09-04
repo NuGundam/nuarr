@@ -421,9 +421,29 @@ async def watch() -> None:
         await asyncio.sleep(every * 3600.0)
 
 
+def _thread_scan():
+    """Off the request thread: the walk takes minutes.
+
+    refresh(), not scan() - scan only computes, refresh is what stores the
+    answer and the timestamp the card reads.
+    """
+    def _go():
+        try:
+            refresh()
+        except Exception as e:                                   # noqa: BLE001
+            joblog.log(f"first audio title check: {type(e).__name__}: {e}",
+                       "warn")
+    import threading
+    threading.Thread(target=_go, name="audiotitle-first",
+                     daemon=True).start()
+
+
 def cached() -> dict:
+    from . import schedules as _sch
+    _sch.first_look("audio titles", lambda: _thread_scan(),
+                    not (_CACHE.get("data") or _CACHE.get("running")))
     d = _CACHE.get("data")
-    return {"have": bool(d), "running": bool(_CACHE.get("running")),
+    return {"have": bool(_CACHE.get("at")), "running": bool(_CACHE.get("running")),
             "age_s": (round(time.time() - _CACHE["at"], 1)
                       if _CACHE.get("at") else None),
             "mode": mode(),

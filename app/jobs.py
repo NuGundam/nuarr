@@ -446,6 +446,12 @@ class Worker:
     # the difference between a busy pool and a bottlenecked disk.
     disk: str = ""
     dest_disk: str = ""                # where DrivePool actually put the result
+    # WHERE THE BYTES ARE READ FROM DURING THE COMMIT, which is not where the
+    # original file lives. The encode is written to the cache - a different
+    # physical drive - and the commit copies it from there into the pool. The
+    # panel used to show "NU-DRIVE-0 -> DrivePool", naming the ORIGINAL
+    # file's spindle as the source of a transfer it takes no part in.
+    stage_device: str = ""             # the drive the encode is copied FROM
     # COMMIT PROGRESS. The commit is a full copy of the finished file onto the
     # pool - frequently the longest single step in a job - and it reported
     # nothing at all, so the card sat on "placing…" for minutes. These carry
@@ -666,6 +672,7 @@ class Worker:
             "grow_ok": bool(getattr(p, "grow_ok", False)),
             "disk": self.disk,
             "dest_disk": self.dest_disk,
+            "stage_device": self.stage_device,
             "write_bps": round(self.write_bps),
             "read_bps": round(self.read_bps),
             "io_bps": round(self.write_bps + self.read_bps),
@@ -745,6 +752,36 @@ async def probe(path: str) -> dict | None:
         return json.loads(out.decode("utf-8", "replace"))
     except Exception:
         return None
+
+
+def _library_of(file_id: int) -> str:
+    r"""Which library a file belongs to, for the planner.
+
+    WITHOUT THIS THE SETTINGS PAGE IS DECORATIVE. Every per-library rule -
+    which subtitle languages to keep, whether a covered picture track is
+    removed or merely switched off - is stored against a library name, and
+    rules._policy() falls back to the SHIPPED DEFAULTS when it is not told
+    which library it is planning for. The planner was never told. So a person
+    could turn "remove the picture copy once the text exists" on for all six
+    libraries, watch the page confirm it, and have every job quietly plan
+    against a default of off.
+
+    It surfaced as jobs finishing 'skipped' in the activity feed: the
+    out-of-sync check asks the planner WITH the library and found 5,299 files
+    that did not match, the queue asked WITHOUT it and found nothing to do, and
+    both were faithfully reporting the answer to the question they asked.
+
+    Cheap by construction - one indexed lookup per job, against a queue that
+    spends minutes per file - and failure is the old behaviour, not an
+    exception into the planning path.
+    """
+    try:
+        with cursor() as cur:
+            r = cur.execute("SELECT library FROM files WHERE id=?",
+                            (int(file_id),)).fetchone()
+        return (r["library"] or "") if r else ""
+    except Exception:                                        # noqa: BLE001
+        return ""
 
 
 def cache_probe(file_id: int, data: dict) -> None:
@@ -1036,6 +1073,7 @@ async def enqueue(file_id: int, path: str, title: str = "",
                                     filename=os.path.basename(path),
                                     size_bytes=os.path.getsize(path),
                                     orig_lang=await _orig_lang(file_id),
+                                    library=_library_of(file_id),
                                     file_id=file_id)
                 pool = "encode" if plan.encode else "passthrough"
             except Exception as e:
@@ -2551,6 +2589,7 @@ async def _run(job: Job, pool: str) -> None:
                                     filename=os.path.basename(job.path),
                                     size_bytes=os.path.getsize(job.path),
                                     orig_lang=await _orig_lang(job.file_id),
+                                    library=_library_of(job.file_id),
                                     file_id=job.file_id)
         joblog.log("PIPELINE: probe -> plan -> encode -> commit -> "
                    "arr refresh -> rename", "info", job.id)
@@ -3149,6 +3188,12 @@ async def _sub_ocr(w: Worker, probe_data: dict) -> None:
 
     w.progress = 0.92
     w.set_stage("committing")
+    try:
+        from . import scanner as _sc_stage
+        w.stage_device = await asyncio.to_thread(_sc_stage.disk_of,
+                                                 out) or ""
+    except Exception:                                        # noqa: BLE001
+        w.stage_device = ""
     r = await asyncio.to_thread(fileops.safe_replace, job.path, out,
                                 on_stage=_commit_stage_cb(w),
                                 pace=_commit_pace(w))
@@ -3765,6 +3810,16 @@ async def _transcode(w: Worker, probe_data: dict) -> None:
         except Exception:
             return 0.0
 
+    # One lookup, off the event loop: which drive the encode is about to be
+    # copied from. It is the cache drive on every normal install, but it is
+    # asked rather than assumed - the cache can be moved, and a label that
+    # states the configuration back to you is worth nothing when it is wrong.
+    try:
+        from . import scanner as _sc_stage
+        w.stage_device = await asyncio.to_thread(_sc_stage.disk_of, out) or ""
+    except Exception:                                        # noqa: BLE001
+        w.stage_device = ""
+
     res = await asyncio.to_thread(fileops.safe_replace, job.path, out,
                                   on_stage=_on_stage, pace=_pace)
     w.commit_phase = ""
@@ -3886,8 +3941,28 @@ async def _post_commit(job: Job) -> None:
     """
     from . import renamequeue
 
+    # PLEX FIRST, AND UNCONDITIONALLY. It is told here rather than inside the
+    # arr branch below for two reasons: that branch is debounced per SERIES,
+    # which is the wrong unit for a per-folder scan, and it returns early for a
+    # file no arr manages - a file nuarr has just rewritten and Plex is still
+    # describing from memory. Plex gets its own debounce, per folder, inside.
+    #
+    # This is the gap Erik found on Redline: the remux had dropped both picture
+    # subtitle tracks, ffprobe showed one SRT left, and Plex went on offering
+    # "English (PGS)" twice - because nothing in nuarr had ever asked Plex to
+    # look, and the library sits on a DrivePool volume where Plex's own
+    # filesystem watching cannot be relied on.
+    try:
+        from . import plexqueue
+        plexqueue.enqueue(job.file_id, job.path, why="nuarr rewrote this file")
+    except Exception:                                        # noqa: BLE001
+        pass
+
     with cursor() as cur:
-        row = cur.execute("SELECT arr_name, arr_parent_id FROM files WHERE id=?",
+        # arr_file_id is here for the language correction below. It was not,
+        # and the correction asked for it anyway - see the call site.
+        row = cur.execute("SELECT arr_name, arr_parent_id, arr_file_id "
+                          "  FROM files WHERE id=?",
                           (job.file_id,)).fetchone()
     if not row or not row["arr_name"] or not row["arr_parent_id"]:
         joblog.log("no arr record for this file - skipping refresh/rename",
@@ -3939,11 +4014,27 @@ async def _post_commit(job: Job) -> None:
             # code had removed. The job that drops a track is the one that
             # knows, so it says so, and the drift never accumulates again.
             try:
+                # row["..."], NOT row.get(...): this is a sqlite3.Row, which
+                # has no .get, so the old line raised AttributeError before
+                # fix_one was ever entered - and it asked for a column the
+                # SELECT above did not fetch. The correction has therefore
+                # never run from here since it was written; the daily sweep
+                # has been doing all of it, which is precisely the arrangement
+                # the comment above says it should not have to.
+                #
+                # It surfaced only tonight because a job has to REWRITE a file
+                # to get this far, and until the planner was told which library
+                # a file belongs to, the jobs that would have rewritten these
+                # files all finished as 'skipped'.
                 from . import arrlang
-                await arrlang.fix_one(cfg, row.get("arr_file_id"), job.file_id)
+                await arrlang.fix_one(cfg, row["arr_file_id"], job.file_id)
             except Exception as e:                           # noqa: BLE001
+                # THE MESSAGE, NOT JUST THE CLASS. "AttributeError" names the
+                # kind of mistake and nothing else; the sentence after the
+                # colon is what identifies which one, and leaving it out is
+                # how a line that has been failing every time went unread.
                 joblog.log(f"could not correct the arr's language field: "
-                           f"{type(e).__name__}", "debug", job.id)
+                           f"{type(e).__name__}: {e}", "debug", job.id)
         asyncio.create_task(_kick())
         joblog.log(f"asked {cfg.name} to re-read this file; rename handled by "
                    f"the retry queue", "info", job.id)

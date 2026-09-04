@@ -1326,42 +1326,15 @@ def is_anime(path: str = "", title: str = "") -> bool:
 _KIND_WORD = {"anime": "anime", "animation": "animation",
               "live": "live action"}
 
-# 2- and 3-letter forms of the same language. Probes are inconsistent about
-# which they use - the old constants listed BOTH ("jpn" and "ja", "eng" and
-# "en") for exactly this reason - so a policy naming one form must match the
-# other, or a file tagged "ja" would be silently dropped by a policy that says
-# "jpn".
-_ISO_PAIRS = [
-    ("eng", "en"), ("jpn", "ja"), ("kor", "ko"), ("zho", "zh"), ("chi", "zh"),
-    ("fra", "fr"), ("fre", "fr"), ("deu", "de"), ("ger", "de"), ("spa", "es"),
-    ("ita", "it"), ("por", "pt"), ("rus", "ru"), ("nld", "nl"), ("dut", "nl"),
-    ("swe", "sv"), ("nor", "no"), ("dan", "da"), ("fin", "fi"), ("pol", "pl"),
-    ("ces", "cs"), ("cze", "cs"), ("hun", "hu"), ("tur", "tr"), ("ara", "ar"),
-    ("heb", "he"), ("hin", "hi"), ("tam", "ta"), ("tel", "te"), ("mal", "ml"),
-    ("tha", "th"), ("vie", "vi"), ("ind", "id"), ("ell", "el"), ("gre", "el"),
-    ("ukr", "uk"), ("ron", "ro"), ("rum", "ro"), ("bul", "bg"), ("hrv", "hr"),
-    ("srp", "sr"), ("slk", "sk"), ("slo", "sk"), ("cat", "ca"), ("isl", "is"),
-]
-_ISO_EQ: dict[str, set[str]] = {}
-for _a, _b in _ISO_PAIRS:
-    _ISO_EQ.setdefault(_a, set()).update({_a, _b})
-    _ISO_EQ.setdefault(_b, set()).update({_a, _b})
-# chi/zho and fre/fra style aliases have to reach each other too
-for _a, _b in _ISO_PAIRS:
-    for _c in list(_ISO_EQ[_a]):
-        _ISO_EQ[_a] |= _ISO_EQ.get(_c, set())
-    _ISO_EQ[_b] = _ISO_EQ[_a]
-
-
+# THE SAME TABLE THE CHECK USES. This was a second, independent list of
+# equivalent spellings, and the two drifted: the planner knew a Norwegian keep
+# list should accept nob, the audit did not, and so the audit reported the
+# planner's correct output as a violation. langkey.py is now the only place
+# either of them asks, and it also knows which equivalences are one-way.
 def _expand(codes) -> set[str]:
-    """A keep-list plus every equivalent spelling of each entry."""
-    out: set[str] = set()
-    for c in codes or []:
-        c = str(c).strip().lower()
-        if not c:
-            continue
-        out |= _ISO_EQ.get(c, {c})
-    return out
+    """A keep-list plus every tag that would satisfy it. See langkey.py."""
+    from . import langkey
+    return langkey.expand(codes)
 
 
 def _policy(library: str, side: str, loaded: dict | None = None,

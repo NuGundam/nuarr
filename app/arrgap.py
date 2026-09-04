@@ -410,8 +410,11 @@ def attention() -> dict | None:
 
 
 def cached() -> dict:
+    from . import schedules as _sch
+    _sch.first_look("arr gap", scan,
+                    not (_CACHE.get("data") or _CACHE.get("running")))
     d = _CACHE.get("data")
-    return {"have": bool(d), "running": bool(_CACHE.get("running")),
+    return {"have": bool(_CACHE.get("at")), "running": bool(_CACHE.get("running")),
             "age_s": (round(time.time() - _CACHE["at"], 1)
                       if _CACHE.get("at") else None),
             "mode": mode(), "every_h": int(_every_h()),

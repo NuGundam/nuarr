@@ -553,7 +553,14 @@ def _arr_progress() -> list:
 
 
 def cached() -> dict:
-    """The last answer, for the card. Never blocks; never runs a scan."""
+    """The last answer - and the first one is fetched on demand.
+
+    See schedules.first_look(): an empty answer after a restart used to sit
+    there reading "not checked yet" until the loop woke up.
+    """
+    from . import schedules as _sch
+    _sch.first_look("arr agreement", refresh,
+                    not (_CACHE.get("data") or _CACHE.get("running")))
     d = _CACHE.get("data")
     arrs = _arr_progress()
     # The aggregate is still reported, because it is what a single headline
@@ -561,7 +568,7 @@ def cached() -> dict:
     # its own set of counters that could drift from them.
     done = sum(a["done"] for a in arrs) or _CACHE.get("done", 0)
     total = sum(a["total"] for a in arrs) or _CACHE.get("total", 0)
-    return {"have": bool(d), "running": bool(_CACHE.get("running")),
+    return {"have": bool(_CACHE.get("at")), "running": bool(_CACHE.get("running")),
             "age_s": (round(time.time() - _CACHE["at"], 1)
                       if _CACHE.get("at") else None),
             "checks": CHECKS, "mode": mode(),

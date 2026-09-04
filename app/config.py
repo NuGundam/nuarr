@@ -445,6 +445,16 @@ class Settings:
     # or the token is missing, the old path still answers.
     plex_url: str | None = None
     plex_token: str | None = None
+    # auto: the agreement check fixes what it finds on its own schedule.
+    plexsync_mode: str = "manual"
+    # auto: files that no longer match the subtitle rules are requeued
+    # on their own, a batch at a time. See subocr.gap_mode().
+    rulesgap_mode: str = "manual"
+    # How many of ITS OWN files the drain keeps in the queue at once.
+    # Not the auto-queue's target: that one is the depth of the whole
+    # queue, and matching it would mean the drain only ever found room
+    # when the auto-queue had failed to fill it.
+    rulesgap_keep: int = 100
     plex_direct: bool = True
     # Ask both and log any field they disagree on. Costs the Tautulli call, so
     # it is for proving the change, not for leaving on.
