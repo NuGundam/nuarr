@@ -155,8 +155,41 @@ $zip     = Join-Path $Dist $zipName
 Remove-Item $zip -Force -EA SilentlyContinue
 $sz = 'C:\Program Files\7-Zip\7z.exe'
 if (-not (Test-Path $sz)) { throw "7-Zip not found at $sz" }
-& $sz a -tzip -mx=7 -bso0 -bsp0 $zip (Join-Path $Bundle '*') | Out-Null
+# ONLY THE BASE STACK GOES IN THE INSTALLER. The bundle's requirements.txt
+# and wheels\ are the nightly backup's `pip freeze` of the live venv - which
+# is everything ever installed on this machine, including the on-demand
+# stacks Setup and the settings pages fetch themselves (faster-whisper and
+# the CUDA runtime, PaddleOCR, and whatever else got pip-installed here).
+# 1.12.0 shipped 2.2 GB that way and GitHub refused it: a release asset must
+# be under 2 GiB. The base set is the source tree's requirements.txt -
+# names only; the versions come from the freeze so they match the venv the
+# build was tested against - and only those wheels are packed.
+$baseReq = Join-Path $Source 'requirements.txt'
+$base = @(Get-Content $baseReq -EA SilentlyContinue | ForEach-Object {
+  ($_ -split '==')[0].Trim().ToLower() -replace '[-_.]+','-' } | Where-Object { $_ })
+if ($base.Count -lt 20) { throw "$baseReq is missing or too short to be the base requirement set" }
+$frozen = Get-Content (Join-Path $Bundle 'requirements.txt')
+$W0 = 'C:\nuarrbuild'
+Remove-Item $W0 -Recurse -Force -EA SilentlyContinue
+New-Item -ItemType Directory $W0 -Force | Out-Null
+$keep = $frozen | Where-Object { $_ -match '==' -and $base -contains (($_ -split '==')[0].Trim().ToLower() -replace '[-_.]+','-') }
+$missing = $base | Where-Object { $b=$_; -not ($keep | Where-Object { (($_ -split '==')[0].Trim().ToLower() -replace '[-_.]+','-') -eq $b }) }
+if ($missing) { throw "base requirement(s) not in the venv freeze: $($missing -join ', ')" }
+Set-Content (Join-Path $W0 'requirements.txt') $keep -Encoding ascii
+$wheelDir = Join-Path $Bundle 'wheels'
+$skipped = @(); $packed = 0
+$excl = @()
+foreach ($w in Get-ChildItem $wheelDir -File) {
+  $n = (($w.Name -split '-')[0]).ToLower() -replace '[-_.]+','-'
+  if ($base -contains $n) { $packed++ } else { $skipped += $w.Name; $excl += "-x!wheels\$($w.Name)" }
+}
+$excl += '-x!requirements.txt', '-x!wheels-INCOMPLETE.txt'
+Say ("packing {0} base packages ({1} wheels); leaving out {2} on-demand wheels ({3:N0} MB)" -f `
+  $keep.Count, $packed, $skipped.Count, (($skipped | ForEach-Object { (Get-Item (Join-Path $wheelDir $_)).Length } | Measure-Object -Sum).Sum/1MB))
+& $sz a -tzip -mx=7 -bso0 -bsp0 $zip (Join-Path $Bundle '*') @excl | Out-Null
+& $sz a -tzip -bso0 -bsp0 $zip (Join-Path $W0 'requirements.txt') | Out-Null
 Say ("zip: {0}  ({1:N1} MB)" -f $zipName, ((Get-Item $zip).Length/1MB)) 'ok'
+if ((Get-Item $zip).Length -ge 2GB) { throw "the zip is over GitHub's 2 GiB asset limit - something optional is still in it" }
 
 if ($SkipExe) { Say "skipping the exe (-SkipExe)" 'warn'; return }
 
