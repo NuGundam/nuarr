@@ -307,6 +307,25 @@
   .pxcard{transition:opacity .6s ease}
   .rwbar.hold i{background:var(--gold) !important}
 
+  /* ---------- drivepool balance table ---------- */
+  .dpline{font-size:13px;margin-bottom:6px}
+  .dpflow{font-size:12px;display:flex;gap:10px;margin:2px 0}
+  .dpflow .k{font-weight:700;width:70px}
+  .baltab{margin-top:12px;font-size:11.5px;font-variant-numeric:tabular-nums}
+  .balrow{display:grid;grid-template-columns:86px minmax(120px,1fr) 52px 60px 170px 78px 96px;gap:10px;
+          align-items:center;padding:4px 0;border-bottom:1px solid #141a22}
+  .balrow.head{color:var(--dim);font-size:10px;letter-spacing:.06em;text-transform:uppercase;border-bottom:1px solid var(--line);padding-bottom:8px}
+  .balbar{position:relative;height:12px;border-radius:4px;background:#161d27;overflow:visible}
+  .balbar i{position:absolute;left:0;top:0;bottom:0;border-radius:4px;background:#8b98a6;transition:width 1.2s ease}
+  .balbar u{position:absolute;top:-2px;bottom:-2px;width:1px;background:#c9d1d9;opacity:.5}
+  .balbar s{position:absolute;top:-3px;bottom:-3px;width:2px;background:#fff;opacity:.85}
+  .balrow.in .balbar i{background:var(--warn);box-shadow:0 0 10px rgba(210,153,34,.7)}
+  .balrow.out .balbar i{background:var(--acc);box-shadow:0 0 10px rgba(88,166,255,.7)}
+  .balm{line-height:1.2}.balm small{display:block;color:var(--dim);font-size:10px}
+  .balrow.in .balm{color:var(--warn)}.balrow.out .balm{color:var(--acc)}
+  .baleta{text-align:right;font-weight:700}
+  @media(max-width:760px){.balrow{grid-template-columns:76px 1fr 46px 90px} .balrow>*:nth-child(4),.balrow>*:nth-child(6),.balrow>*:nth-child(7){display:none}}
+
   /* ---------- footer / controls ---------- */
   .navdots{position:fixed;right:16px;top:50%;transform:translateY(-50%);display:flex;
            flex-direction:column;gap:9px;z-index:60}
@@ -320,11 +339,11 @@
 
 <div class="topbar">
   <div class="logo">N</div><b>Nuarr</b>
-  <span class="dim" id="hdrcount">39,729 files · 59.8 TB · 12 pool disks · 2.30 TB saved</span>
+  <span class="dim" id="hdrcount">39,667 files · 62.0 TB · 12 pool disks · 2.65 TB saved</span>
   <div class="pillrow">
     <span class="pill ok">Sonarr ok</span><span class="pill ok">Radarr ok</span>
     <span class="pill acc">encode 4/4</span><span class="pill ok">passthrough 6/6</span>
-    <span class="pill purple">subocr 2/10</span><span class="pill gold">whisper small</span>
+    <span class="pill purple">subocr 2/10</span><span class="pill gold">whisper small</span><span class="pill ok">DrivePool balancing</span>
     <span class="pill">ffmpeg 7.1.4</span>
   </div>
 </div>
@@ -333,16 +352,16 @@
 <section id="hero">
   <div class="kicker rev">NUARR · A MEDIA LIBRARY THAT MAINTAINS ITSELF</div>
   <h1 class="rev">Every file in the library,<br>ready to <span>press play.</span></h1>
-  <p class="lede rev">One engine with one job: standardise a 60&nbsp;TB library so Plex
+  <p class="lede rev">One engine with one job: standardise a 62&nbsp;TB library so Plex
      direct-plays everything — no buffering, no transcoding on the fly, no
      subtitles that force the CPU to paint pictures. It probes, plans, fixes,
      verifies — and when metadata can't be trusted, it <i>listens to the audio</i>
      to find out what language it really is. It never touches a file it can't put back.</p>
   <div class="statrow rev">
-    <div class="stat"><b data-count="39729">0</b><span>files under management</span></div>
-    <div class="stat"><b data-count="59.8" data-dec="1">0</b><span>TB standardised</span></div>
-    <div class="stat"><b data-count="3273">0</b><span>subtitle tracks OCR'd to text</span></div>
-    <div class="stat"><b data-count="578">0</b><span>audio tracks identified by ear</span></div>
+    <div class="stat"><b data-count="39667">0</b><span>files under management</span></div>
+    <div class="stat"><b data-count="62.0" data-dec="1">0</b><span>TB standardised</span></div>
+    <div class="stat"><b data-count="5987">0</b><span>subtitle tracks OCR'd to text</span></div>
+    <div class="stat"><b data-count="641">0</b><span>audio tracks identified by ear</span></div>
   </div>
   <div class="scrollhint">scroll, or press ↓&nbsp;&nbsp;·&nbsp;&nbsp;P = auto-play</div>
 </section>
@@ -387,7 +406,8 @@
       <h3>JOB GATE</h3>
       <div class="gaterow"><span class="lamp" id="l-manual"></span>Manual<span class="why">not paused</span></div>
       <div class="gaterow"><span class="lamp" id="l-plex"></span>Plex<span class="why" id="w-plex">nobody is watching</span></div>
-      <div class="gaterow"><span class="lamp" id="l-disk"></span>Disk load<span class="why">no foreign I/O — measured natively, no vendor tools</span></div>
+      <div class="gaterow"><span class="lamp" id="l-disk"></span>Disk load<span class="why">pressure per spindle — nuarr's share, the viewer's, everything else</span></div>
+      <div class="gaterow"><span class="lamp" id="l-dp"></span>DrivePool<span class="why" id="w-dp">balancing — renames held, replaces paced per chunk</span></div>
       <div class="gaterow"><span class="lamp" id="l-arr"></span>Sonarr / Radarr<span class="why">idle — no import running</span></div>
       <div class="gaterow"><span class="lamp" id="l-health"></span>Arr health<span class="why">watched every 5 min — warnings logged when they appear <i>and</i> clear</span></div>
       <div class="gaterow"><span class="lamp" id="l-lang"></span>Audio language<span class="why">check idle — nothing waiting</span></div>
@@ -586,7 +606,7 @@
   <h2 class="rev">Pictures become text</h2>
   <p class="lede rev">Blu-ray subtitles are pictures (PGS). Plex has to burn them into the
      video on the CPU at playback — a forced transcode. Nuarr OCRs them to real text once,
-     embeds the text track first, and demotes the bitmap. Signs &amp; Songs on anime are
+     embeds the text track first — under the same clean title, marked by a track tag rather than an "(OCR)" suffix — and drops the bitmap it was read from in the same rewrite as the encode. Signs &amp; Songs on anime are
      burned in permanently on the GPU — 10-bit preserved end to end. And when the release
      already ships hand-made text subtitles, the redundant bitmap is simply dropped:
      no OCR spent re-reading what a human already typed. SDH tracks are recognised by
@@ -598,13 +618,13 @@
     </div>
     <div class="rev">
       <table class="tracktbl mono" id="tracktbl">
-        <tr><td>1</td><td>Dialogue (OCR) — SRT</td><td><span class="flag first">text · first</span></td></tr>
-        <tr><td>2</td><td>Dialogue — PGS</td><td><span class="flag">kept · demoted</span></td></tr>
+        <tr><td>1</td><td>English [Full] — SRT <span class="dim" style="font-size:10px">NUARR_OCR=1</span></td><td><span class="flag first">text · first</span></td></tr>
+        <tr><td>2</td><td class="strike">English [Full] — PGS</td><td><span class="flag">dropped in the same mux</span></td></tr>
         <tr><td>3</td><td class="strike">Signs &amp; Songs — PGS</td><td><span class="flag" style="color:var(--purple);border-color:#3d2e5e">burned into picture</span></td></tr>
         <tr><td>4</td><td>English SDH — PGS</td><td><span class="flag" style="color:var(--gold);border-color:#4d3d1a">protected by role</span></td></tr>
       </table>
       <p class="dim" style="font-size:12px;margin-top:12px">Side-OCR runs on the CPU <i>while</i> the GPU encodes —
-      one rewrite of the file carries both changes. 3,273 tracks converted so far.</p>
+      one rewrite of the file carries both changes. 5,987 tracks converted so far.</p>
     </div>
   </div>
 </section>
@@ -648,7 +668,27 @@
      from a disk, work touching that spindle paces itself against their real buffer while
      everything else runs at full speed.</p>
   <div class="diskrow rev" id="diskrow"></div>
-  <p class="dim rev" style="font-size:12px;margin-top:12px"><span style="color:var(--warn)">Amber</span> = a viewer is on this spindle; work there follows the runway ramp. The rest don't slow down.</p>
+  <p class="dim rev" style="font-size:12px;margin-top:12px"><span style="color:var(--warn)">Amber</span> = a viewer is on this spindle; work there follows the runway ramp. The rest don't slow down. Every spindle's busy time is split three ways — nuarr's own, the viewer's, everything else — and the part that is not nuarr's sets the pace: slowing from 40% busy, a quarter speed at 90%, a pause only above 97% sustained.</p>
+</section>
+
+<!-- ======================= DRIVEPOOL ======================= -->
+<section id="drivepool">
+  <div class="kicker rev">IT READS THE BALANCER'S OWN PLAN</div>
+  <h2 class="rev">StableBit DrivePool, from the source <span class="tag">live replica</span></h2>
+  <p class="lede rev">nuarr reads DrivePool's own records — not its log: which balancers are on,
+     how balanced the pool is by DrivePool's measure, and for every disk whether it is filling
+     or emptying, what is left of the plan for it, and where it will stop. The disk being written
+     glows <b style="color:var(--warn)">amber</b>, the one being read glows
+     <b style="color:var(--acc)">blue</b>, and the glow follows the mover. While it runs, renames
+     are held (they race the mover for the same file), file replaces go ahead paced per chunk
+     against the disk they land on, and a disk removal holds everything. Each hold is a switch.</p>
+  <div class="panel rev" style="margin-top:26px;padding:14px 18px">
+    <div class="dpline mono"><span class="pill gold">balancing</span> <b id="dphead">DrivePool is balancing — 78% through this run, moving at 46 MB/s, for 1h 3m</b></div>
+    <div class="dpflow mono"><span class="k" style="color:var(--acc)">Emptying</span><span id="dpout">NU-DRIVE-4 <span class="dim">34.3 GB/h</span></span></div>
+    <div class="dpflow mono"><span class="k" style="color:var(--warn)">Filling</span><span id="dpin">NU-DRIVE-1 <span class="dim">35.0 GB/h</span></span></div>
+    <div class="baltab mono" id="baltab"></div>
+    <div class="dim" style="font-size:11.5px;margin-top:8px">Bars are each disk's fill on a zoomed axis; the white tick is DrivePool's own target. "Left to move" is what remains of DrivePool's plan for the disk — the plan is written once per pass, so the live figure is the plan less what the disk has gained or lost since.</div>
+  </div>
 </section>
 
 <!-- ======================= INTEGRATION ======================= -->
@@ -664,6 +704,9 @@
     <div class="feat rev"><div class="accent" style="background:var(--purple)"></div><div class="ico">🩹</div><b>Self-healing library</b><p>Missing files verified and healed, orphans adopted, duplicates flagged, stale scratch reclaimed, database pruned and checkpointed — all on timers, all filterable in the logs by the system that did it.</p></div>
     <div class="feat rev"><div class="accent" style="background:var(--cyan)"></div><div class="ico">🎞️</div><b>Dolby Vision → HDR10</b><p>DV profiles that break non-DV clients are stripped losslessly — a bitstream operation, no re-encode, so an 85 GB remux keeps every pixel and direct-plays everywhere.</p></div>
     <div class="feat rev"><div class="accent" style="background:var(--lilac)"></div><div class="ico">👂</div><b>Whisper, managed</b><p>The language-ID model lives under nuarr's own data folder with a version-and-update check like every other tool — repo links and file paths one click away for debugging.</p></div>
+    <div class="feat rev"><div class="accent" style="background:var(--acc)"></div><div class="ico">👀</div><b>The library watches itself</b><p>A change watcher on every managed folder — one per PoolPart on a pool. A file that lands or leaves is seen within a minute and only its library is rescanned; while the watchers are healthy the full scan stretches to every twelve hours.</p></div>
+    <div class="feat rev"><div class="accent" style="background:var(--ok)"></div><div class="ico">📥</div><b>Back into the arr</b><p>A file nuarr rewrote that Sonarr or Radarr lost track of is imported straight back from Needs Attention — matched on air date when the parser gives up on a daily-series name, with quality, language and group filled in.</p></div>
+    <div class="feat rev"><div class="accent" style="background:var(--purple)"></div><div class="ico">📱</div><b>Fits a phone</b><p>Sized for a Galaxy Z Fold folded and unfolded, detected from the device rather than the window — so "desktop site" gets the desktop site. Settings collapses to an icon rail that opens as a drawer.</p></div>
     <div class="feat rev"><div class="accent" style="background:var(--gold)"></div><div class="ico">🛡️</div><b>Profile guard</b><p>Quality profiles tuned so a 2160p profile means <i>the best 2160p</i> — and a watcher re-applies the setup if a Profilarr sync flattens it. Download loops: found, fixed, prevented.</p></div>
   </div>
 </section>
@@ -672,13 +715,13 @@
 <section id="settings">
   <div class="kicker rev">EVERY KNOB, EXPLAINED IN PLACE</div>
   <h2 class="rev">Settings that say why they exist</h2>
-  <p class="lede rev">Twenty-one pages across Processing, Tools, Integrations and System —
+  <p class="lede rev">Twenty-eight pages across Processing, Tools, Integrations and System —
      and every control carries its own reasoning, bounds and default inline, so tuning
      never means guessing. The status tiles above check themselves on visible countdowns:
      missing files confirmed after three checks, unmanaged imports re-scanned on a timer.</p>
 
   <div class="stattiles rev">
-    <div class="stt"><div class="h">TOTAL FILES</div><b>39,729</b><span>59.81 TB</span></div>
+    <div class="stt"><div class="h">TOTAL FILES</div><b>39,667</b><span>62.01 TB</span></div>
     <div class="stt"><div class="h">ELIGIBLE</div><b>19</b><span>past hold, ready to process</span></div>
     <div class="stt"><div class="h">HELD (NEW)</div><b>0</b><span>still settling</span></div>
     <div class="stt"><div class="h">MISSING</div><b>0</b><span>next check in <span id="cd1">22</span>s</span></div>
@@ -691,13 +734,14 @@
     <div class="setnav">
       <div class="gh">PROCESSING</div>
       <a class="on">Concurrency</a><a>Holds and timing</a><a>Job gate</a><a>Subtitles</a>
-      <a>Video codec</a><a>Audio codec</a><a>Audio language</a><a>Rules</a>
+      <a>Video codec</a><a>Audio codec</a><a>Audio language</a><a>Rules</a><a>Rule check</a>
+      <a>How files flow</a><a>Still not landed</a><a>Plex playback</a>
       <div class="gh">TOOLS</div>
-      <a>ffmpeg</a><a>MKVToolNix</a><a>Whisper</a>
+      <a>ffmpeg</a><a>MKVToolNix</a><a>Whisper</a><a>OCR engines</a>
       <div class="gh">INTEGRATIONS</div>
-      <a>Arrs</a><a>Plex</a><a>Metadata</a>
+      <a>Arrs</a><a>Plex</a><a>DrivePool</a><a>Metadata</a>
       <div class="gh">SYSTEM</div>
-      <a>Libraries</a><a>Cache folder</a><a>Jobs</a><a>Logs</a><a>Backup and restore</a>
+      <a>Health checks</a><a>Libraries</a><a>Cache folder</a><a>Jobs</a><a>Logs</a><a>Updates</a><a>Backup and restore</a>
     </div>
     <div class="setpane" id="setpane">
       <div class="hint">How much runs at once. Encode is NVENC-bound; passthrough is disk-bound.</div>
@@ -722,12 +766,12 @@
   <div class="kicker rev">WHAT IT ADDS UP TO</div>
   <h2 class="rev">The library, standardised</h2>
   <div class="numstrip">
-    <div class="num rev"><b><em data-count="39729">0</em></b><span>files probed, planned &amp; tracked</span></div>
-    <div class="num rev"><b><em data-count="3273">0</em></b><span>PGS tracks OCR'd to searchable text</span></div>
+    <div class="num rev"><b><em data-count="39667">0</em></b><span>files probed, planned &amp; tracked</span></div>
+    <div class="num rev"><b><em data-count="5987">0</em></b><span>PGS tracks OCR'd to searchable text</span></div>
     <div class="num rev"><b>~<em data-count="2400">0</em></b><span>audio tracks fixed for direct play</span></div>
-    <div class="num rev"><b><em data-count="578">0</em></b><span>audio languages identified by listening</span></div>
-    <div class="num rev"><b><em data-count="269">0</em></b><span>Dolby Vision files repaired losslessly</span></div>
-    <div class="num rev"><b><em data-count="2.30" data-dec="2">0</em> TB</b><span>reclaimed by standardising</span></div>
+    <div class="num rev"><b><em data-count="641">0</em></b><span>audio languages identified by listening</span></div>
+    <div class="num rev"><b><em data-count="12">0</em></b><span>pool disks balanced around, never against</span></div>
+    <div class="num rev"><b><em data-count="2.65" data-dec="2">0</em> TB</b><span>reclaimed by standardising</span></div>
     <div class="num rev"><b><em data-count="0">0</em></b><span>files lost. Ever.</span></div>
   </div>
   <p class="lede rev" style="margin-top:30px">Every rule started as a real playback failure,
@@ -1217,6 +1261,56 @@ setInterval(()=>{
   steps.forEach((s,i)=>{s.classList.toggle('done',i<sIdx);s.classList.toggle('active',i===sIdx);});
   sIdx=(sIdx+1)%(steps.length+2);
 },1100);
+
+/* ---------- drivepool balance table ---------- */
+(()=>{
+  const el=document.getElementById('baltab'); if(!el) return;
+  const DCOL=['#e34c26','#f1e05a','#3572A5','#563d7c','#b07219','#178600',
+              '#00ADD8','#dea584','#c22d40','#ffac45','#41b883','#8993be'];
+  const used=[52.7,52.8,52.7,52.7,52.0,51.8,52.7,52.7,52.7,51.6,52.7,52.7];
+  const stop=[52.7,52.9,52.7,52.7,51.6,51.8,52.7,52.7,52.7,51.6,52.7,52.7];
+  const plan=[5.0,30.8,2.5,2.5,-59.2,2.5,2.5,3.0,3.0,2.5,2.5,2.5];   // GB, DrivePool's plan per disk
+  const done=[5.0,8.7,0,0,18.6,2.5,0,0,0,1.4,0,2.5];
+  const lo=48,hi=56,avg=52.5,X=v=>Math.max(0,Math.min(100,(v-lo)/(hi-lo)*100));
+  const gb=v=>Math.abs(v).toFixed(1)+' GB';
+  const hms=s=>s>=3600?Math.floor(s/3600)+'h '+Math.round(s%3600/60)+'m':s>=60?Math.floor(s/60)+'m '+Math.round(s%60)+'s':Math.round(s)+'s';
+  const head=`<div class="balrow head"><span></span><span style="position:relative;height:12px"><span style="position:absolute;left:0;top:-2px">${lo}%</span><span style="position:absolute;left:${X(avg)}%;top:-2px;transform:translateX(-50%);color:#c9d1d9">avg ${avg}%</span><span style="position:absolute;right:0;top:-2px">${hi}%</span></span><span>used</span><span>stops at</span><span>left to move</span><span>rate</span><span style="text-align:right">ETA</span></div>`;
+  el.innerHTML=head+used.map((u,i)=>`<div class="balrow" id="bal${i}">
+    <span style="color:${DCOL[i]};font-weight:700">NU-DRIVE-${i}</span>
+    <span class="balbar"><i style="width:${X(u)}%"></i><u style="left:${X(avg)}%"></u><s style="left:${X(stop[i])}%"></s></span>
+    <span class="balu">${u.toFixed(1)}%</span><span class="dim">→ ${stop[i].toFixed(1)}%</span>
+    <span class="balm"></span><span class="balr dim">—</span><span class="baleta dim">—</span></div>`).join('');
+  // the mover reads off disk 4 and writes onto disk 1; the "left" figures tick down
+  const t0=Date.now();
+  const tick=()=>{
+    const t=(Date.now()-t0)/1000;
+    const rIn=34.3+Math.sin(t/3)*4, rOut=34.3+Math.cos(t/4)*3;   // GB/h
+    used.forEach((u,i)=>{
+      const row=document.getElementById('bal'+i);
+      const moving=i===1||i===4;
+      const dn=Math.min(Math.abs(plan[i]), done[i]+(moving?(i===1?rIn:rOut)/3600*t*40:0));
+      const left=Math.abs(plan[i])-dn;
+      row.classList.toggle('in',i===1&&left>0.05);row.classList.toggle('out',i===4&&left>0.05);
+      const m=row.querySelector('.balm');
+      if(left<=0.05) m.innerHTML=`<span style="color:var(--ok)">plan met</span><small>plan ${plan[i]>0?'+':'−'}${gb(plan[i])} · ${gb(dn)} done</small>`;
+      else m.innerHTML=`${plan[i]>0?'+':'−'}${gb(left)} ${plan[i]>0?'in':'out'}<small>plan ${plan[i]>0?'+':'−'}${gb(plan[i])} · ${gb(dn)} done · planned 31m ago</small>`;
+      const r=row.querySelector('.balr'), e=row.querySelector('.baleta');
+      if(moving&&left>0.05){
+        const rate=i===1?rIn:rOut;
+        r.innerHTML=`<span style="color:${i===1?'var(--warn)':'var(--acc)'}">${i===1?'▲':'▼'} ${rate.toFixed(1)} GB/h</span>`;
+        e.innerHTML=`<b style="color:var(--fg)">${hms(left/rate*3600)}</b>`;
+        row.querySelector('.balbar i').style.width=X(u+(i===1?1:-1)*dn/180)+'%';
+      } else if(left<=0.05){ r.innerHTML='<span class="dim">—</span>'; e.innerHTML='<b style="color:var(--ok)">done</b>'; }
+      else { r.innerHTML='<span class="dim">—</span>'; e.innerHTML='<span class="dim">not moving yet</span>'; }
+    });
+    const pct=78+Math.min(9,t/12);
+    document.getElementById('dphead').textContent=`DrivePool is balancing — ${pct.toFixed(0)}% through this run, moving at ${(40+Math.sin(t/5)*8).toFixed(0)} MB/s, for 1h ${(3+Math.floor(t/60))}m`;
+    document.getElementById('dpout').innerHTML=`NU-DRIVE-4 <span class="dim">${rOut.toFixed(1)} GB/h</span>`;
+    document.getElementById('dpin').innerHTML=`NU-DRIVE-1 <span class="dim">${rIn.toFixed(1)} GB/h</span>`;
+  };
+  tick(); setInterval(tick,1000);
+  const ldp=document.getElementById('l-dp'); if(ldp) ldp.classList.add('hold');
+})();
 
 /* ---------- disks (per-drive colours, like the real UI) ---------- */
 const dr=document.getElementById('diskrow');

@@ -50,7 +50,7 @@ import re
 import time
 
 from . import joblog
-from .db import cursor, kv_get
+from .db import cursor, kv_get, kv_set
 
 LOG_DIR = r"C:\ProgramData\StableBit DrivePool\Service\Logs\Service"
 EXE = r"C:\Program Files\StableBit\DrivePool\DrivePool.Service.exe"
@@ -470,6 +470,41 @@ foreach ($f in (Get-ChildItem '%(store)s' -File | Where-Object { $_.Name -notmat
 $out | ConvertTo-Json -Depth 2 -Compress
 """
 _TGT: dict = {"at": 0.0, "v": {}, "busy": False, "err": ""}
+_TGT_KV = "drivepool.targets.history"
+
+
+def _disk_used() -> dict[str, int]:
+    """Used bytes per pool disk label, live from the volume."""
+    import shutil
+    out: dict[str, int] = {}
+    try:
+        from . import scanner
+        for label, path in (scanner.media_roots() or {}).items():
+            try:
+                out[label] = shutil.disk_usage(path).used
+            except OSError:
+                pass
+    except Exception:                                        # noqa: BLE001
+        pass
+    return out
+
+
+def _tgt_history_load() -> dict:
+    import json as _j
+    try:
+        return _j.loads(kv_get(_TGT_KV) or "{}") or {}
+    except Exception:                                        # noqa: BLE001
+        return {}
+
+
+def _tgt_history_save(v: dict) -> None:
+    import json as _j
+    keep = {k: {f: t.get(f) for f in ("delta", "plan", "changed_at", "used_at", "first_delta", "prev_delta")}
+            for k, t in v.items()}
+    try:
+        kv_set(_TGT_KV, _j.dumps(keep))
+    except Exception:                                        # noqa: BLE001
+        pass
 
 
 def _read_targets() -> dict:
@@ -520,26 +555,54 @@ def targets(max_age: float | None = None) -> dict:
                 # changed 40 s ago" rather than a number that may or may not
                 # be live. Carried in memory across readings; the first
                 # reading after a restart has no history.
-                old = _TGT["v"] or {}
+                # THE DELTA IS THE PLAN, NOT THE PROGRESS. DrivePool writes
+                # UnprotectedMoveDelta when it plans a pass and leaves it
+                # alone while the mover works - every disk read "changed 38m
+                # ago" through a run that had moved 250 GB. So the moment a
+                # plan changes, the disk's used bytes are recorded beside it
+                # (used_at); what has moved since is used - used_at, and what
+                # is left is delta minus that. The page does that arithmetic
+                # against the live used figure. Kept in the kv store so a
+                # restart mid-run does not forget where the plan started.
+                old = _TGT["v"] or _tgt_history_load()
                 now2 = time.time()
+                used_now = None
+                changed = False
                 for k, t in v.items():
                     o = old.get(k) or {}
                     d_now, d_old = t.get("delta"), o.get("delta")
+                    # both halves of the plan count as "the plan changed"
+                    if d_now is not None:
+                        d_now = d_now + (t.get("prot_delta") or 0)
+                    if d_old is not None and o.get("plan") is not None:
+                        d_old = o["plan"]
+                    t["plan"] = d_now
                     t["read_at"] = now2
                     if d_old is None or d_now is None:
                         t["changed_at"] = o.get("changed_at") or now2
                         t["prev_delta"] = d_old
                         t["delta_bps"] = 0.0
+                        t["used_at"] = o.get("used_at")
+                        if t["used_at"] is None and d_now is not None:
+                            used_now = _disk_used() if used_now is None else used_now
+                            t["used_at"] = used_now.get(k)
+                            changed = True
                     elif abs(d_now - d_old) >= 1:
                         t["changed_at"] = now2
                         t["prev_delta"] = d_old
                         dt = max(1.0, now2 - float(o.get("read_at") or _TGT["at"] or now2))
                         t["delta_bps"] = (d_now - d_old) / dt
+                        used_now = _disk_used() if used_now is None else used_now
+                        t["used_at"] = used_now.get(k)
+                        changed = True
                     else:
                         t["changed_at"] = o.get("changed_at") or now2
                         t["prev_delta"] = o.get("prev_delta", d_old)
                         t["delta_bps"] = 0.0
+                        t["used_at"] = o.get("used_at")
                     t["first_delta"] = o.get("first_delta", d_old if d_old is not None else d_now)
+                if changed or not _TGT["v"]:
+                    _tgt_history_save(v)
                 _TGT.update(v=v, at=time.time(), err="")
             except Exception as e:                           # noqa: BLE001
                 _TGT.update(at=time.time(), err=f"{type(e).__name__}: {e}")

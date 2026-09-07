@@ -12,8 +12,8 @@ nuarr watches a Plex library, works out which files will make Plex re-encode on
 the fly, and rewrites them so it doesn't have to — while getting out of the way
 of anyone actually watching.
 
-Native Windows. Python and FastAPI, one scheduled task, a web UI on port 8770.
-No Docker, no Node, no service wrapper.
+Native Windows. Python and FastAPI, one scheduled task, a web UI on port 8770
+that also fits a phone. No Docker, no Node, no service wrapper.
 
 <!-- nuarr:stats -->
 Running against a 12-disk pool: **39,663 files, 62.03 TB, 2.60 TB saved (2.9%).**
@@ -69,6 +69,36 @@ at full speed on the other eleven. On the disk being read, nuarr lowers its I/O
 priority, paces its file copies, and — below the floor — suspends the encode
 outright and gives the disk back.
 
+### It paces against pressure, not presence
+
+A viewer is not the only thing that reads a disk. Each spindle's busy time is
+split into nuarr's own share, the viewer's, and everything else — a backup, a
+scan, DrivePool's mover — and the part that is not nuarr's sets the pace. From
+40% busy jobs on that disk slow; at 90% they run at a quarter speed; only above
+97% sustained, with something queued behind it, do they pause, and they resume
+under 85%. The disk panel shows the three shares in one bar, and every status
+is a card that says one word and opens on hover with the numbers and the
+trend.
+
+![Files per pool disk](docs/screenshots/disks.png)
+
+### It reads DrivePool's own plan
+
+With StableBit DrivePool, nuarr reads the balancer's own records rather than
+guessing from the log: which balancers are on, how balanced the pool is by
+DrivePool's measure, and for every disk whether it is filling or emptying, how
+many bytes DrivePool still means to move on or off it, and where it will stop.
+One row per disk shows the fill on a zoomed axis with the pool average and
+DrivePool's target tick, what is left of the plan, live read and write, net
+rate and ETA. The disk being written glows amber, the one being read glows
+blue, and the glow follows the mover.
+
+While a balance runs, renames are held (they race the mover for the same
+file), a disk removal holds everything, and file replaces go ahead paced per
+chunk against the disk the file lands on. Each hold is a switch.
+
+![DrivePool](docs/screenshots/drivepool.png)
+
 ### Everything is hysteretic
 
 Pausing an encode is *what makes a viewer's buffer recover*, so a single
@@ -93,7 +123,7 @@ action are not the same problem.
 |---|---|
 | **Video** | Re-encode only when the codec or profile forces a transcode. NVENC / QSV / AMF / CPU, probed by test-encode rather than trusted from `ffmpeg -encoders` |
 | **Audio** | Keep what plays, transcode what doesn't, drop what nobody needs |
-| **Subtitles** | Convert forced PGS to SRT by OCR so it stops forcing a video burn-in |
+| **Subtitles** | Convert forced PGS to SRT by OCR so it stops forcing a video burn-in. The text track keeps the clean title ("English [Full]", not "English (PGS) (OCR)") and carries a `NUARR_OCR` track tag instead; when an encode is queued for a file whose read picture track is still in it, the picture track is dropped in the same mux |
 | **Language tags** | Detect mislabelled audio with Whisper and fix the tag with `mkvpropedit` — metadata only, no re-encode |
 | **Containers** | Remux to a container Plex will seek in |
 
@@ -108,6 +138,34 @@ Every file is checked against the rules it was supposed to satisfy, and the
 check self-heals: a finding is queued, fixed, and re-verified.
 
 ![Rule check](docs/screenshots/settings-rules.png)
+
+---
+
+## It keeps up with the library
+
+nuarr registers a change watcher on every folder it manages — on a pool, one
+per PoolPart. A file that lands or leaves is seen within about a minute and
+only its library is rescanned, at most once per five minutes. While the
+watchers are healthy the full scan stretches to every twelve hours; if one
+overflows, the next full scan is brought forward.
+
+The arrs are kept in step, not just informed. A file nuarr rewrote whose arr
+has lost track of it can be imported straight back from Needs Attention. When
+Sonarr's parser gives up on a daily-series name ("Show - 2026-09-04 - SmackDown
+1411" reads as an absolute episode), the re-attach matches on air date and
+fills in quality, language and release group itself. An `.iso` or other
+non-media file that came down as a "release" gets a blocklist-and-refetch
+button.
+
+## On a phone
+
+The same pages, laid out for a phone and sized for a Galaxy Z Fold folded and
+unfolded. Detection is from the user agent and touch plus the viewport width,
+so a phone that asks for the desktop site gets the desktop site; either can be
+forced from the power menu. Settings collapses to an icon rail that opens as a
+drawer, and on the desktop the same rail can be collapsed to make room.
+
+![Phone layouts](docs/screenshots/mobile.png)
 
 ---
 
@@ -208,7 +266,7 @@ nuarr indexes three kinds of storage, and is honest about what each can do:
 
 | | |
 |---|---|
-| **StableBit DrivePool** | The full experience: files are attributed to the physical spindle they live on, so nuarr yields the exact disk a viewer is reading, orders scans quietest-disk-first, and shows per-disk load |
+| **StableBit DrivePool** | The full experience: files are attributed to the physical spindle they live on, so nuarr yields the exact disk a viewer is reading, orders scans quietest-disk-first, and shows per-disk load. It also reads DrivePool's balancer state — per-disk targets, bytes left to move, which disks are filling and emptying — and holds or paces its own work around a balance, duplication pass or disk removal |
 | **Plain folders** | `C:\Movies` on any machine works — files are tracked per drive, with real capacity and free-space figures |
 | **Network shares** | nuarr connects to SMB shares **as the service**, with credentials you give it once (Browse → "Connect a network share"). It reconnects after reboots. Per-spindle intelligence degrades to per-share, because that is all SMB exposes |
 

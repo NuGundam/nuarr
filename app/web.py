@@ -11854,7 +11854,8 @@ html.mobile .one,html.mobile .setwrap{min-width:0;max-width:100%}
 html.mobile .cards{grid-template-columns:repeat(2,minmax(0,1fr)) !important;gap:8px}
 html.mobile.wide .cards{grid-template-columns:repeat(4,minmax(0,1fr)) !important;gap:10px}
 html.mobile.wide .wrap{padding:14px}
-html.mobile.wide .two{grid-template-columns:1fr 1fr}
+/* unfolded: the tiles go four across, but the disk and library panels
+   stay stacked - 370px is not enough for either table */
 html.mobile.wide header h1{font-size:20px}
 html.mobile .card{padding:10px 11px}
 html.mobile .two{grid-template-columns:1fr}
@@ -21745,14 +21746,32 @@ function dpPaint(disks){
       const v=pct(x), dv=v-avg;
       const col = Math.abs(dv)<=TOL ? '#8b98a6' : (dv>0?'var(--warn)':'#79c0ff');
       const t=TG[x.pool_disk]||null;
-      const moving = t && t.delta!=null && ((t.moving_in&&t.delta>0)||(t.moving_out&&t.delta<0));
-      const stop = moving ? (x.used+t.delta)/x.total*100 : null;
-      const dir = moving ? (t.delta>0?'in':'out') : '';
+      // TWO PLANS PER DISK, ONE NUMBER. DrivePool keeps the un-duplicated
+      // and the duplicated bytes as separate moves (UnprotectedMoveDelta and
+      // ProtectedMoveDelta) and the two can point opposite ways: the disk
+      // it was filling read "-33 GB out" from the first while the second
+      // said "+66 GB in", and the page showed nothing because the sign did
+      // not match the flag. What the disk will actually gain or lose is the
+      // sum, and that is the plan shown.
+      if(t && t.delta!=null){ t.plan=(t.delta||0)+(t.prot_delta||0); }
+      const moving = t && t.plan!=null && (t.moving_in||t.moving_out) && Math.abs(t.plan)>=1e6;
+      // WHAT IS LEFT, NOT WHAT WAS PLANNED. DrivePool's delta is the plan
+      // it wrote when the pass started and it does not tick down; the disk's
+      // used bytes do. used_at is the fill when the plan was written, so
+      // moved = used - used_at and left = plan - moved. The target itself
+      // is fixed: used_at + plan.
+      const base = (moving && t.used_at!=null) ? t.used_at : x.used;
+      const moved = moving ? x.used - base : 0;
+      let left = moving ? t.plan - moved : null;
+      if(left!=null && Math.sign(left)!==Math.sign(t.plan)) left = 0;   // past the plan: done
+      const stop = moving ? (base+t.plan)/x.total*100 : null;
+      const dir = moving ? (t.plan>0?'in':'out') : '';
       const r = dpRate(x, dir);
       const rate = Math.abs(r)>2e6 ? `<span style="color:${r>0?'var(--warn)':'#79c0ff'}">${r>0?'▲':'▼'} ${gb(Math.abs(r)*3600)}/h</span>` : '<span class="dim">—</span>';
       let eta='<span class="dim">—</span>';
-      if(moving){
-        const need=Math.abs(t.delta);
+      if(moving && left===0) eta='<b style="color:var(--ok)">done</b>';
+      else if(moving){
+        const need=Math.abs(left);
         if(dir==='in' && r>2e6) eta=`<b>${dpDur(need/r)}</b>`;
         else if(dir==='out' && r<-2e6) eta=`<b>${dpDur(need/-r)}</b>`;
         else eta='<span class="dim">not moving yet</span>';
@@ -21772,18 +21791,17 @@ function dpPaint(disks){
         <span class="balp" style="color:${col}">${v.toFixed(1)}%</span>
         <span class="bald" style="color:${Math.abs(dv)<=TOL?'#525c6b':col}">${dv>0?'+':''}${dv.toFixed(1)}</span>
         <span class="bals">${stop!=null?`<span class="dim">→</span> ${stop.toFixed(1)}%`:''}</span>
-        <span class="balm" style="color:${dir==='in'?'var(--warn)':dir==='out'?'#79c0ff':'#525c6b'}">${moving?`${dir==='in'?'+':'−'}${gb(Math.abs(t.delta))} ${dir}`:''}${(()=>{
-          // THE NUMBER'S OWN MOTION: what it was, how fast DrivePool is
-          // eating into it, and when it last moved - so a "to move" that
-          // sits still for ten minutes reads as stuck rather than live.
+        <span class="balm" style="color:${dir==='in'?'var(--warn)':dir==='out'?'#79c0ff':'#525c6b'}">${moving?(left===0?'<span style="color:var(--ok)">plan met</span>':`${dir==='in'?'+':'−'}${gb(Math.abs(left))} ${dir}`):''}${(()=>{
+          // THE PLAN BEHIND THE NUMBER: what DrivePool asked for, how much
+          // of it has landed, and when it was written - so a figure that is
+          // not moving reads as "the mover is on another disk" rather than
+          // as a stale reading.
           if(!moving) return '';
           const bits=[];
-          if(t.prev_delta!=null && Math.abs(t.prev_delta-t.delta)>=1) bits.push(`was ${t.prev_delta>0?'+':'−'}${gb(Math.abs(t.prev_delta))}`);
-          if(t.delta_bps && Math.abs(t.delta_bps)>1e5){ const shrinking=(t.delta>0&&t.delta_bps<0)||(t.delta<0&&t.delta_bps>0); bits.push(`<span style="color:${shrinking?'var(--ok)':'var(--warn)'}">${shrinking?'▼':'▲'} ${gb(Math.abs(t.delta_bps)*3600)}/h</span>`); }
-          if(t.first_delta!=null && Math.abs(t.first_delta)>Math.abs(t.delta)+1e8) bits.push(`${gb(Math.abs(t.first_delta)-Math.abs(t.delta))} done since first seen`);
+          bits.push(`plan ${t.plan>0?'+':'−'}${gb(Math.abs(t.plan))}${(t.prot_delta&&Math.abs(t.prot_delta)>=1e6)?` <span class="dim">(${t.delta>0?'+':'−'}${gb(Math.abs(t.delta))} single, ${t.prot_delta>0?'+':'−'}${gb(Math.abs(t.prot_delta))} duplicated)</span>`:''}`);
+          if(t.used_at!=null) bits.push(`<span style="color:${Math.abs(moved)>1e8?'var(--ok)':'#8b98a6'}">${gb(Math.abs(moved))} done</span>`);
           const age=t.changed_at?nowS-t.changed_at:null;
-          const stale=age!=null && age>600;
-          bits.push(`<span style="color:${stale?'var(--warn)':'#8b98a6'}">${age==null?'':(age<60?'changed just now':'changed '+dpDur(age)+' ago')}</span>`);
+          bits.push(`<span style="color:#8b98a6">${age==null?'':(age<60?'planned just now':'planned '+dpDur(age)+' ago')}</span>`);
           return `<div style="font-size:10.5px;color:#8b98a6;line-height:1.2">${bits.join(' · ')}</div>`; })()}</span>
         <span class="balrd m-read" title="${rw.mine?`includes ${mbps(rw.mine)} of Nuarr's own jobs`:'nothing of Nuarr\'s on this disk'}">${rwCell(rw.r)}</span>
         <span class="balwr m-write">${rwCell(rw.w)}</span>
@@ -21793,7 +21811,7 @@ function dpPaint(disks){
     }).join('');
     const svg=`<div class="baltab">
       <div class="balrow balhead"><span class="baln"></span><span class="balbar" style="background:none;border:0"><span class="dim" style="position:absolute;left:0">${lo0}%</span><span style="position:absolute;left:${X(avg).toFixed(2)}%;transform:translateX(-50%);color:#c9d1d9">avg ${avg.toFixed(1)}%</span><span class="dim" style="position:absolute;right:0">${hi0}%</span></span>
-        <span class="balp">used</span><span class="bald">vs avg</span><span class="bals">stops at</span><span class="balm">to move${d.targets_at?` <span class="dim" style="text-transform:none;letter-spacing:0">· read ${dpDur(nowS-d.targets_at)} ago</span>`:''}</span><span class="balrd">read</span><span class="balwr">write</span><span class="balr">rate</span><span class="bale">ETA</span></div>
+        <span class="balp">used</span><span class="bald">vs avg</span><span class="bals">stops at</span><span class="balm">left to move${d.targets_at?` <span class="dim" style="text-transform:none;letter-spacing:0">· plan read ${dpDur(nowS-d.targets_at)} ago</span>`:''}</span><span class="balrd">read</span><span class="balwr">write</span><span class="balr">rate</span><span class="bale">ETA</span></div>
       ${trows}
     </div>`;
     return `<div class="lkind" style="padding:11px 12px;margin-top:10px">
@@ -21801,7 +21819,7 @@ function dpPaint(disks){
       <div style="font-size:13.5px">${verdict}</div>
       ${dpVerdict}
       ${svg}
-      <div class="dim" style="font-size:12px;margin-top:4px">Bars are each disk's fill on a zoomed axis; "vs avg" is its distance from the pool average in points — amber fuller, blue emptier, grey within ${TOL} point. ${Object.keys(TG).length?'The white tick is DrivePool\'s own target for the disk, "stops at" the fill it will reach, "to move" the bytes DrivePool still intends to move on or off it, and the ETA is that at the current rate. ':''}${act.length&&spread>TOL*2?`The run in progress is what closes this gap.`:''}</div>
+      <div class="dim" style="font-size:12px;margin-top:4px">Bars are each disk's fill on a zoomed axis; "vs avg" is its distance from the pool average in points — amber fuller, blue emptier, grey within ${TOL} point. ${Object.keys(TG).length?'The white tick is DrivePool\'s own target for the disk, "stops at" the fill it will reach, "left to move" what remains of DrivePool\'s plan for it — the plan is written once per pass, so the live figure is the plan less what the disk has gained or lost since — and the ETA is that at the current rate. ':''}${act.length&&spread>TOL*2?`The run in progress is what closes this gap.`:''}</div>
     </div>`;
   })();
   const html=head+nowCard+balCard+holdsCard+sw+errCard+hist;
