@@ -53,10 +53,11 @@ class LogLine:
     level: str
     text: str
     job_id: str | None = None
+    system: str | None = None       # the loop it came from, for the viewer
 
     def as_dict(self) -> dict:
         return {"at": self.at, "level": self.level, "text": self.text,
-                "job_id": self.job_id}
+                "job_id": self.job_id, "system": self.system}
 
     def format(self) -> str:
         ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.at))
@@ -160,7 +161,18 @@ def log(text: str, level: str = "info", job_id: str | None = None,
             system = schedules.current() or None
         except Exception:                                # noqa: BLE001
             system = None
-    ln = LogLine(time.time(), level if level in LEVELS else "info", text, job_id)
+    ln = LogLine(time.time(), level if level in LEVELS else "info", text, job_id,
+                 None if job_id else system)
+    # A LOOSE LINE INSIDE A SYSTEM'S PASS BELONGS TO THAT PASS. If the system
+    # has a buffered section open, the line is held and written between the
+    # section's START and END - so the boundary comes first in the file, and
+    # a pass that says nothing leaves nothing. Job lines are never held: a
+    # job has its own banner and its own file.
+    if not job_id and system:
+        sec = _OPEN.get(system)
+        if sec is not None and not sec.eager:
+            sec._held.append(ln)               # its own timestamp, kept
+            return ln
     formatted = ln.format()
     with _lock:
         _RECENT.append(ln)
@@ -521,39 +533,57 @@ def banner(job_id: str, text: str, level: str = "info") -> None:
     log(bar, level, job_id)
 
 
+_OPEN: dict = {}            # system key -> the section currently open for it
+
+
 class section:
-    r"""A start/end block for a SUBSYSTEM run, as opposed to one job.
+    r"""A start/end block for a SUBSYSTEM pass, in the same words a job uses.
 
-    Job work already had banner(); everything else - the rename queue, commit
-    retries, missing healing, the failure tidy - wrote loose lines into the same
-    stream. With four workers logging simultaneously those lines scatter, and
-    there is no way to see where one subsystem's pass began, what it did, or
-    whether it finished. This gives each pass a labelled boundary:
+    Job work has banner(): a rule, START, a rule ... a rule, END, a rule.
+    Everything else - the rename queue, the Plex catch-up, the agreement
+    checks, the auto-queue - wrote loose lines into the same stream, and with
+    four workers logging at once those lines scatter: there was no way to see
+    where one system's pass began, what it did, or whether it finished. This
+    gives every pass the same boundary a job gets:
 
-        ---- rename queue -------------------------------------------------
-          retried 3, 1 still pending
-        ---- rename queue: 3 retried in 4.1s ------------------------------
+        ========================================================================
+        START [rename queue]
+        ========================================================================
+          3 rename(s) due across 2 title(s)
+        ========================================================================
+        END   [rename queue] 3 retried (4.1s)
+        ========================================================================
 
-    Silent by default when nothing happened. A pass that checks and finds no
-    work should leave no trace, or the log fills with heartbeat noise and the
-    banners stop being findable - which is the problem they exist to solve.
+    The lines carry the system's [sys key] suffix like any other, so the
+    viewer can colour the boundary by system and filter on it.
+
+    TWO KINDS OF PASS. A buffered section (the default) holds every line its
+    system logs while it is open and writes them - between START and END -
+    only if there were any: a pass that checks and finds nothing leaves no
+    trace, so a queue polled every 25 seconds does not fill the log with
+    empty boundaries. An eager section writes START at once and END when it
+    closes, for the long walks whose lines you want to watch arrive: the Plex
+    agreement check, the arr agreement check, the library scan.
 
     Usage:
         with joblog.section("rename queue") as s:
             ...
             s.note("retried 3")          # a line inside the block
-            s.result = "3 retried"       # summary on the closing bar
+            s.result = "3 retried"       # summary on the END line
             s.keep()                     # force the block to be written
     """
     WIDTH = 72
 
-    def __init__(self, name: str, level: str = "info"):
+    def __init__(self, name: str, level: str = "info", eager: bool = False):
         self.name = name
         self.level = level
+        self.eager = eager
         self.result: str | None = None
         self._t0 = 0.0
         self._lines: list[tuple[str, str]] = []
+        self._held: list = []                    # LogLines, timestamps kept
         self._keep = False
+        self._system = ""
 
     def note(self, text: str, level: str = "info") -> None:
         self._lines.append((text, level))
@@ -562,26 +592,70 @@ class section:
     def keep(self) -> None:
         self._keep = True
 
+    def _bar(self, level: str) -> None:
+        _write_direct("=" * self.WIDTH, level, self._system)
+
     def __enter__(self) -> "section":
         self._t0 = time.time()
+        try:
+            from . import schedules
+            self._system = schedules.current() or ""
+        except Exception:                                # noqa: BLE001
+            self._system = ""
+        # Only one open section per system; a nested one (a helper that
+        # sections itself inside a wrapped loop) writes through the outer.
+        if self._system and self._system not in _OPEN:
+            _OPEN[self._system] = self
+            self._owner = True
+        else:
+            self._owner = False
+        if self.eager:
+            self._bar(self.level)
+            _write_direct(f"START [{self.name}]", self.level, self._system)
+            self._bar(self.level)
         return self
 
     def __exit__(self, exc_type, exc, tb) -> bool:
         took = time.time() - self._t0
         failed = exc_type is not None
-        if not (self._keep or failed):
-            return False                      # nothing happened; stay quiet
-        head = f"---- {self.name} "
-        log(head + "-" * max(0, self.WIDTH - len(head)), self.level)
-        for text, lvl in self._lines:
-            log("  " + text, lvl)
+        if self._owner:
+            _OPEN.pop(self._system, None)
+        body = list(self._held) + [
+            LogLine(time.time(), l if l in LEVELS else "info", t, None,
+                    self._system or None)
+            for t, l in self._lines]                # lines logged, then notes
+        if not self.eager and not (body or self._keep or failed):
+            return False                          # nothing happened; stay quiet
+        lvl = "error" if failed else self.level
+        if not self.eager:
+            self._bar(self.level)
+            _write_direct(f"START [{self.name}]", self.level, self._system)
+            self._bar(self.level)
+        for ln in body:
+            if not ln.text.startswith("  "):
+                ln.text = "  " + ln.text
+            _emit(ln, self._system)
         if failed:
-            log(f"  FAILED: {exc_type.__name__}: {exc}", "error")
-        tail_txt = self.result or ("failed" if failed else "done")
-        tail = f"---- {self.name}: {tail_txt} in {took:.1f}s "
-        log(tail + "-" * max(0, self.WIDTH - len(tail)),
-            "error" if failed else self.level)
-        return False                          # never swallow the exception
+            _write_direct(f"  FAILED: {exc_type.__name__}: {exc}", "error",
+                          self._system)
+        tail = self.result or ("failed" if failed else "done")
+        self._bar(lvl)
+        _write_direct(f"END   [{self.name}] {tail} ({took:.1f}s)", lvl,
+                      self._system)
+        self._bar(lvl)
+        return False                              # never swallow the exception
+
+
+def _emit(ln, system: str) -> None:
+    """One line straight to the ring and the file, bypassing any open section."""
+    with _lock:
+        _RECENT.append(ln)
+        _write(MAIN_LOG, ln.format() + (f"  [sys {system}]" if system else ""))
+
+
+def _write_direct(text: str, level: str, system: str) -> None:
+    _emit(LogLine(time.time(), level if level in LEVELS else "info", text, None,
+                  system or None), system)
 
 
 def log_plan(job_id: str, plan) -> None:

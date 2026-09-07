@@ -136,11 +136,23 @@ async def scan(limit: int = 0) -> dict:
             joblog.log(f"language check: could not list {cfg.name}: "
                        f"{type(e).__name__}", "warn")
             continue
-        for pid in parents:
-            try:
-                raw = await client._get(f"/{kind}", **{key: pid})
-            except Exception:                                # noqa: BLE001
-                continue
+        # TWELVE AT A TIME, NOT ONE AFTER ANOTHER. One request per series,
+        # awaited in turn, was 1,081 round-trips end to end - past two
+        # minutes on this box, for a page that then showed a sample of 200.
+        # The wait is the arr's, not ours; overlapping it is what the rename
+        # planner already does at 20. Twelve here, because the language
+        # check runs behind a page rather than in front of a job.
+        import asyncio as _a
+        sem = _a.Semaphore(12)
+
+        async def one(pid):
+            async with sem:
+                try:
+                    return await client._get(f"/{kind}", **{key: pid})
+                except Exception:                            # noqa: BLE001
+                    return None
+        batches = await _a.gather(*(one(pid) for pid in parents))
+        for raw in batches:
             for rec in raw or []:
                 hit = probe.get((cfg.name, rec.get("id")))
                 if not hit:

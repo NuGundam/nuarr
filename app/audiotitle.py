@@ -406,8 +406,12 @@ async def watch() -> None:
         every = 24.0
         try:
             every = max(1.0, float(getattr(SETTINGS, "audiotitle_every_h", 24)))
-            await asyncio.to_thread(refresh)
-            n = int((_CACHE.get("data") or {}).get("total") or 0)
+            with joblog.section("Audio title check") as sec:
+                await asyncio.to_thread(refresh)
+                n = int((_CACHE.get("data") or {}).get("total") or 0)
+                if n:
+                    sec.note(f"{n} title(s) name a format the file does not have")
+                    sec.result = f"{n} wrong"
             schedules.beat("audiotitle",
                            f"{n} title(s) wrong" if n else "all titles match")
             if n and mode() == "auto":

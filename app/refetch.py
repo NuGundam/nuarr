@@ -23,6 +23,7 @@ delete button already attached to it.
 """
 from __future__ import annotations
 
+import os
 import re
 import time
 
@@ -88,8 +89,39 @@ _POLICY = [
 ]
 
 
-def classify(reason: str | None) -> tuple[str, str]:
+# NOT A VIDEO FILE AT ALL. A disc image, an archive, an installer - the arr
+# imported it because the release said it was a movie, and no amount of
+# retrying will make ffmpeg read a .iso. The error text is useless here
+# ("ffmpeg exited 4294967262"), so the extension is what classifies it, and
+# it is checked before every other list: nothing in the reason can make a
+# disc image fine.
+NOT_MEDIA = {
+    ".iso", ".img", ".bin", ".cue", ".nrg", ".mdf", ".mds", ".dmg",
+    ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz",
+    ".exe", ".msi", ".apk", ".dll", ".lnk", ".url", ".html", ".htm",
+    ".txt", ".nfo", ".srr", ".sfv", ".par2", ".torrent",
+}
+
+
+def not_media(path: str | None) -> str | None:
+    """The reason a path is not a playable video, or None if it might be."""
+    ext = os.path.splitext(path or "")[1].lower()
+    if ext in NOT_MEDIA:
+        what = ("a disc image" if ext in (".iso", ".img", ".bin", ".cue", ".nrg",
+                                          ".mdf", ".mds", ".dmg")
+                else "an archive" if ext in (".zip", ".rar", ".7z", ".tar",
+                                             ".gz", ".bz2", ".xz")
+                else "not a video file")
+        return (f"this is {what} ({ext}), not a video file - only a different "
+                f"release can fix it")
+    return None
+
+
+def classify(reason: str | None, path: str | None = None) -> tuple[str, str]:
     """-> ("transient"|"content"|"policy"|"unknown", human explanation).
+
+    `path` lets the extension speak first: a .iso is "content" whatever the
+    error text says, because the bytes on disk are the wrong kind of bytes.
 
     Order matters. TRANSIENT is checked first, because those strings contain
     words the other lists match on - "database is locked" is the whole reason
@@ -100,6 +132,9 @@ def classify(reason: str | None) -> tuple[str, str]:
     "ffprobe returned nothing because access is denied" is a lock, not a
     corrupt file, and the lock reading is the safe one to act on.
     """
+    nm = not_media(path)
+    if nm:
+        return "content", nm
     r = (reason or "").lower().strip()
     if not r:
         return "unknown", "no reason was recorded"
@@ -158,7 +193,7 @@ async def plan(file_id: int, reason: str = "") -> dict:
     if reason:
         kind, why = "content", reason
     else:
-        kind, why = classify(row.get("state_reason"))
+        kind, why = classify(row.get("state_reason"), row.get("path"))
     out = {"ok": False, "file_id": file_id, "title": row.get("title"),
            "path": row.get("path"), "size": row.get("size"),
            "state": row.get("state"), "reason": row.get("state_reason"),

@@ -340,6 +340,14 @@ SIGNS_TITLE_RE = re.compile(
 # "(OCR by me) rev2" is somebody else's track and must not be swept up.
 OCR_MADE_RE = re.compile(r"\(OCR[^)]*\)\s*$", re.I)
 
+
+def _ocr_made(s: dict) -> bool:
+    """Did nuarr make this text track? The tag first, the old title suffix second."""
+    tags = s.get("tags") or {}
+    if str(tags.get("NUARR_OCR") or tags.get("nuarr_ocr") or "").strip():
+        return True
+    return bool(OCR_MADE_RE.search(_title(s)))
+
 # Track titles are what Plex shows in its audio picker, and they describe the
 # SOURCE format because that is what the release group wrote. Once nuarr
 # re-encodes the stream the title outlives the thing it described: an Overlord
@@ -2054,7 +2062,7 @@ def decide(probe: dict, *, anime: bool = False, filename: str = "",
         # a new rule should not quietly reverse it on files already committed.
         covered = {(_lkey(subs[i]), _role(subs[i])) for i in p.keep_subs
                    if (subs[i].get("codec_name") or "").lower() in TEXT_SUB_CODECS
-                   and not OCR_MADE_RE.search(_title(subs[i]))}
+                   and not _ocr_made(subs[i])}
 
         # ONE EXCEPTION: AN IMAGE SUB WITH NO LANGUAGE TAG AT ALL.
         #
@@ -2079,7 +2087,7 @@ def decide(probe: dict, *, anime: bool = False, filename: str = "",
         # the 1,800.
         ocr_roles = {_role(subs[i]) for i in p.keep_subs
                      if (subs[i].get("codec_name") or "").lower() in TEXT_SUB_CODECS
-                     and OCR_MADE_RE.search(_title(subs[i]))}
+                     and _ocr_made(subs[i])}
 
         for i in list(p.keep_subs):
             s = subs[i]
@@ -2159,7 +2167,7 @@ def decide(probe: dict, *, anime: bool = False, filename: str = "",
                         if j == real:
                             continue
                         if (t.get("codec_name") or "").lower() in TEXT_SUB_CODECS \
-                                and OCR_MADE_RE.search(_title(t)):
+                                and _ocr_made(t):
                             p.keep_subs.remove(j)
                             p.add("subtitle",
                                   f"remove OCR subtitle {j}{_tag(_lang(t))}",

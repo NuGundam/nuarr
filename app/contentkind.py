@@ -364,7 +364,9 @@ async def watch() -> None:
     await asyncio.sleep(90)          # let the first scan and origlang settle
     while True:
         try:
-            r = await sync()
+            schedules.beat("contentkind")
+            with joblog.section("Content kind sync"):
+                r = await sync()
             invalidate()
             if r.get("titles"):
                 c = r["counts"]

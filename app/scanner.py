@@ -445,6 +445,21 @@ PROGRESS: dict = {"disk": None, "disk_i": 0, "disks": 0, "library": None,
 # A single "scanning…" string could not distinguish a 90-second disk walk from a
 # 130-second Sonarr fetch, so a scan that was progressing normally looked
 # identical to one that had wedged.
+# WHICH DISKS THE SCAN IS ON RIGHT NOW. The gate measures per-disk load and
+# subtracts what nuarr's job workers report, to find load that is somebody
+# else's. The walk was not in that subtraction, and a walk over 190,000
+# directories shows up in the counters as 100+ MB/s of reads - so the gate
+# saw NU-DRIVE-0 "busy with something else", steered new work off it, and
+# demoted the copy already running there to a crawl. The something else was
+# this. Label -> when the walk on it started; the gate reads it.
+WALKING: dict[str, float] = {}
+
+
+def walking_disks() -> set[str]:
+    now = time.time()
+    return {d for d, t in WALKING.items() if now - t < 3600}
+
+
 PHASES: list[tuple[str, str]] = [
     ("walk",      "walking pool disks"),
     ("arrs",      "querying Sonarr/Radarr"),
@@ -781,6 +796,7 @@ def scan_pool(pool_root: str = "P:\\", libraries: list[str] | None = None
         # Per THREAD, which is what this class does - each worker sets its own
         # priority and nothing else in the process is affected.
         bg = _BackgroundIO()
+        WALKING[label] = time.time()
         try:
             # BACKGROUND I/O FOR A VIEWER, AND FOR A DISK THAT STAYED BUSY.
             # Giving up after the wait and then walking at normal priority
@@ -829,6 +845,7 @@ def scan_pool(pool_root: str = "P:\\", libraries: list[str] | None = None
             # Hand the thread back at normal priority, or whatever runs on it
             # next inherits Very Low I/O for the life of the process.
             bg.set(False)
+            WALKING.pop(label, None)
         with lock:
             per[label].update(files=len(mine), state="done")
         return mine

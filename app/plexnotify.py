@@ -373,15 +373,29 @@ def rating_key_for(file_path: str, key: str, kind: int) -> str:
     exactly, and a path Plex does not hold returns "" rather than a neighbour.
     """
     import json
+    import os
     want = norm_path(file_path)
     if not want:
         return ""
-    try:
-        d = json.loads(_get(f"/library/sections/{key}/all?type={kind}&file="
-                            + urllib.parse.quote(file_path), timeout=30))
-        md = (d.get("MediaContainer") or {}).get("Metadata") or []
-    except Exception:                                        # noqa: BLE001
-        return ""
+    # ASK FOR THE FOLDER, NOT THE FILE. Plex filters `?file=` by directory
+    # regardless (see above), and it also decodes the value a second time on
+    # the way in - so a filename holding a percent sign, "Infinite 100%",
+    # arrives as a broken escape and matches nothing. Plex had the file the
+    # whole time; the queue gave up on it six times over ten hours saying
+    # "not indexed", and it showed in Plex and Sonarr both. The folder
+    # carries the same result set without the character in it, and the
+    # exact match on Part.file below is still what decides. The file-path
+    # form is kept as a second try for a folder that is itself the problem.
+    md: list = []
+    for ask in (os.path.dirname(file_path), file_path):
+        try:
+            d = json.loads(_get(f"/library/sections/{key}/all?type={kind}"
+                                "&file=" + urllib.parse.quote(ask), timeout=30))
+            md = (d.get("MediaContainer") or {}).get("Metadata") or []
+        except Exception:                                    # noqa: BLE001
+            return ""
+        if md:
+            break
     for m in md:
         for media in m.get("Media") or []:
             for part in media.get("Part") or []:

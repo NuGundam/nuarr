@@ -1329,6 +1329,30 @@ def validate(srt_path: str, expected: int | None,
 # deletes somebody's work.
 _OCR_TITLE = re.compile(r"\(OCR(?:[^)]*)\)\s*$", re.I)
 
+# THE MARKER MOVES OFF THE TITLE. "(OCR)" on the end of every track name was
+# how nuarr recognised its own work, and it was also the first thing Plex
+# showed in the subtitle picker - "English [Full] (PGS) (OCR)" for what is,
+# to the viewer, simply the English subtitles. Matroska tracks carry tags
+# that no player displays, and both tools nuarr reads with surface them:
+# mkvmerge -J as properties.tag_nuarr_ocr, ffprobe as tags.NUARR_OCR. The
+# title is now the clean label; the tag says who made it. Files written
+# before this still carry the "(OCR)" suffix, and every reader accepts
+# either.
+OCR_TAG = "NUARR_OCR"
+_OCR_TAG_XML = ('<?xml version="1.0"?>\n<!DOCTYPE Tags SYSTEM "matroskatags.dtd">\n'
+                '<Tags><Tag><Simple><Name>NUARR_OCR</Name><String>1</String></Simple></Tag></Tags>\n')
+# Source-format words the release wrote into the picture track's title.
+# They described the PGS; the text track made from it is not a PGS.
+_FORMAT_IN_TITLE = re.compile(r"\s*[\(\[]\s*(?:PGS|SUP|VOBSUB|VOB|DVBSUB|DVB|BITMAP|IMAGE)\s*[\)\]]", re.I)
+
+
+def clean_label(name: str) -> str:
+    """The title a text track should show: no format word, no OCR marker."""
+    t = _OCR_TITLE.sub("", str(name or ""))
+    t = _FORMAT_IN_TITLE.sub("", t)
+    t = re.sub(r"\s{2,}", " ", t).strip(" -·")
+    return t or "English"
+
 
 def is_ocr_track(track: dict) -> bool:
     """True for a text subtitle this program produced by OCR."""
@@ -1338,11 +1362,13 @@ def is_ocr_track(track: dict) -> bool:
     codec = str(p.get("codec_id") or "").upper()
     if "PGS" in codec or "VOBSUB" in codec or "DVBSUB" in codec:
         return False                      # an image track is never our output
+    if str(p.get("tag_nuarr_ocr") or "").strip():
+        return True
     return bool(_OCR_TITLE.search(str(p.get("track_name") or "")))
 
 
 def embed(src: str, subs: list[tuple[str, str]], dst: str,
-          drop_old_ocr: bool = True) -> None:
+          drop_old_ocr: bool = True, drop_image_covered: bool = False) -> None:
     """Mux the SRTs in, demote every image sub, and put text subs FIRST.
 
     One pass, not a merge followed by an mkvpropedit: a second tool touching
@@ -1385,8 +1411,24 @@ def embed(src: str, subs: list[tuple[str, str]], dst: str,
              if is_ocr_track(t)
              and role_of(str((t.get("properties") or {}).get("track_name") or ""))
              in new_roles] if drop_old_ocr else []
+    # THE PICTURE TRACK THIS PASS JUST READ GOES IN THE SAME REWRITE. With
+    # the library's "remove picture subs" switch on, the old flow was: OCR
+    # embeds the text and demotes the PGS, the next scan sees a picture sub
+    # with a text twin, and a SEPARATE passthrough job rewrites the whole
+    # file again just to drop it. One rewrite carries both now: the image
+    # track whose role this pass provides is dropped here, same mux.
+    if drop_image_covered:
+        for t in src_tracks:
+            if t.get("type") != "subtitles" or not is_image(t):
+                continue
+            pp = t.get("properties") or {}
+            lang = str(pp.get("language") or "und").lower()
+            if lang not in ("eng", "en", "und", ""):
+                continue                  # the OCR pass only reads English
+            if role_of(str(pp.get("track_name") or ""), bool(pp.get("forced_track"))) in new_roles:
+                stale.append(t["id"])
     if stale:
-        args += ["-s", "!" + ",".join(str(i) for i in stale)]
+        args += ["-s", "!" + ",".join(str(i) for i in sorted(set(stale)))]
     for t in src_tracks:
         tid = t["id"]
         if tid in stale:
@@ -1417,8 +1459,12 @@ def embed(src: str, subs: list[tuple[str, str]], dst: str,
                      "--forced-display-flag",
                      f"{tid}:{'yes' if p.get('forced_track') else 'no'}"]
     args.append(src)
+    tagxml = os.path.join(os.path.dirname(dst) or ".", "nuarr_ocr_tags.xml")
+    with open(tagxml, "w", encoding="utf-8") as _f:
+        _f.write(_OCR_TAG_XML)
     for i, (srt, name) in enumerate(subs):
-        args += ["--language", "0:eng", "--track-name", f"0:{name}",
+        args += ["--language", "0:eng", "--track-name", f"0:{clean_label(name)}",
+                 "--tags", f"0:{tagxml}",
                  "--forced-display-flag", "0:no",
                  # NOT DEFAULT. This was default=yes on the first track, and it
                  # was a real regression: a default subtitle is ALWAYS ON, so
@@ -1522,7 +1568,8 @@ def ffmpeg_sub_args(src_probe: dict, pend: list[dict],
     for j in range(len(subs)):
         maps += [f"-disposition:s:{len(pend) + j}", "0"]
     for i, it in enumerate(pend):
-        maps += [f"-metadata:s:s:{i}", f"title={it.get('name') or 'English (OCR)'}",
+        maps += [f"-metadata:s:s:{i}", f"title={clean_label(it.get('name') or 'English')}",
+                 f"-metadata:s:s:{i}", f"{OCR_TAG}=1",
                  f"-metadata:s:s:{i}", "language=eng"]
     return inputs, maps
 
@@ -1810,8 +1857,8 @@ def run_one(path: str, probe: dict, work_root: str | None = None,
             if not ok:
                 notes.append(f"rel {t['rel']} rejected: {why}")
                 continue
-            label = _title(t) or "English"
-            made.append((srt, f"{label} (OCR)"))
+            label = clean_label(_title(t) or "English")
+            made.append((srt, label))
             notes.append(f"rel {t['rel']} -> {why}")
         if not made:
             shutil.rmtree(work, ignore_errors=True)
@@ -1825,7 +1872,8 @@ def run_one(path: str, probe: dict, work_root: str | None = None,
                     "tracks": len(made)}
         tick(0.82, "muxing")
         out = os.path.join(work, "out.mkv")
-        embed(path, made, out)
+        embed(path, made, out,
+              drop_image_covered=bool(_s("subocr_remove_image", False, library)))
         tick(0.90, "muxed")
         return {"ok": True, "out": out, "work": work, "notes": notes,
                 "typeset": typeset,
@@ -1840,15 +1888,32 @@ def run_one(path: str, probe: dict, work_root: str | None = None,
 
 # ------------------------------------------------------------ the tool page --
 
+_TVER: dict = {}
+
+
 def status() -> dict:
     """Everything the OCR settings page needs, without OCR'ing anything."""
     tdir = tesseract_dir()
     exe = os.path.join(tdir, "tesseract.exe")
     tver = ""
     if os.path.exists(exe):
-        rc, out = _run([exe, "--version"], timeout=20)
-        m = re.search(r"tesseract\s+v?([\w.\-]+)", out or "")
-        tver = m.group(1) if m else ""
+        # ONE PROCESS SPAWN PER INSTALL, NOT ONE PER POLL. The OCR page asks
+        # for this every four seconds, and each ask ran tesseract --version:
+        # 900 ms the first time, a fresh process every time after. The
+        # answer changes when the exe does, so it is keyed on the exe's
+        # mtime and size and remembered.
+        try:
+            st_ = os.stat(exe)
+            k = (exe, st_.st_mtime, st_.st_size)
+        except OSError:
+            k = (exe, 0, 0)
+        if _TVER.get("k") == k:
+            tver = _TVER["v"]
+        else:
+            rc, out = _run([exe, "--version"], timeout=20)
+            m = re.search(r"tesseract\s+v?([\w.\-]+)", out or "")
+            tver = m.group(1) if m else ""
+            _TVER.update(k=k, v=tver)
     pg, pgdir = "", ""
     try:
         from importlib import metadata
@@ -2898,7 +2963,10 @@ def _has_our_text(probe: dict) -> bool:
             continue
         if (st.get("codec_name") or "").lower() in IMG_CODECS:
             continue
-        if _OCR_TITLE.search(str((st.get("tags") or {}).get("title") or "")):
+        tags = st.get("tags") or {}
+        if str(tags.get(OCR_TAG) or tags.get(OCR_TAG.lower()) or "").strip():
+            return True
+        if _OCR_TITLE.search(str(tags.get("title") or "")):
             return True
     return False
 
@@ -3372,10 +3440,19 @@ async def gap_tick() -> dict:
 async def gap_watch() -> None:
     """Keep the queue fed while a drain is on. Idle and free when it is not."""
     import asyncio
+    from . import schedules
+    schedules.register(
+        "rulesgap", "Subtitle rules drain", "Library", 60,
+        what="In auto mode, tops the queue up with files that were built "
+             "under older subtitle rules, a hundred at a time, dealt across "
+             "disks. In manual mode it only keeps the count current.")
     await asyncio.sleep(90)
     while True:
+        schedules.beat("rulesgap")
         try:
-            await gap_tick()
+            from . import joblog as _jl
+            with _jl.section("Subtitle rules drain"):
+                await gap_tick()
         except Exception as e:                               # noqa: BLE001
             from . import joblog as _log
             _log.log(f"subtitle rules drain: {type(e).__name__}: {e}", "warn")

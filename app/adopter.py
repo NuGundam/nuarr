@@ -199,18 +199,45 @@ async def _adopt_one(row: dict) -> tuple[str, str]:
             if already:
                 return "duplicate", already
 
-            for f in files or []:
-                if pathmap.same(f.get("path") or "", path):
-                    with cursor() as cur:
-                        cur.execute(
-                            "UPDATE files SET arr_name=?, arr_file_id=?, "
-                            "arr_parent_id=?, state_reason='adopted by the arr "
-                            "after a rescan', adopt_state='adopted', "
-                            "updated_at=? WHERE id=?",
-                            (cfg.name, f.get("id"), pid, time.time(),
-                             row["id"]))
-                    return "adopted", f"{cfg.name} imported it into {title}"
-            return "still", f"{cfg.name} knows {title} but has not imported it"
+            def _claimed(files, how):
+                for f in files or []:
+                    if pathmap.same(f.get("path") or "", path):
+                        with cursor() as cur:
+                            cur.execute(
+                                "UPDATE files SET arr_name=?, arr_file_id=?, "
+                                "arr_parent_id=?, state_reason=?, "
+                                "adopt_state='adopted', updated_at=? WHERE id=?",
+                                (cfg.name, f.get("id"), pid,
+                                 f"adopted by the arr after a {how}",
+                                 time.time(), row["id"]))
+                        return f"{cfg.name} imported it into {title} ({how})"
+                return ""
+
+            got = _claimed(files, "rescan")
+            if got:
+                return "adopted", got
+            # THE RESCAN DID NOT TAKE IT. That is the arr's parser giving up
+            # on the name - the same thing that stranded SmackDown 1411 - and
+            # a rescan will never do better than the last one. A manual
+            # import can: it asks the arr for its own candidate list for the
+            # folder and, for an air-by-date series, matches by the date in
+            # the name. arrattach owns that logic; reuse it rather than
+            # rebuild it here.
+            try:
+                from . import arrattach
+                season = row.get("season") if isinstance(row, dict) else None
+                ok, why = await arrattach.reattach(cfg, int(pid), path, season,
+                                                   row.get("audio_langs") if isinstance(row, dict) else None)
+            except Exception as e:                           # noqa: BLE001
+                ok, why = False, f"manual import failed: {type(e).__name__}: {e}"
+            if ok:
+                await asyncio.sleep(4)
+                files = await c._get(f"/{kind}", **{key: pid})
+                got = _claimed(files, "manual import")
+                if got:
+                    return "adopted", got
+                return "still", f"{cfg.name} accepted the manual import for {title} but has not listed the file yet"
+            return "still", f"{cfg.name} knows {title} but has not imported it - {why}"
         except Exception as e:
             return "error", f"{cfg.name}: {type(e).__name__}: {e}"
 
@@ -268,6 +295,31 @@ def _episode_already_has_file(files: list, path: str) -> str | None:
                 f"{os.path.basename(p)[:60]} ({gb:.2f} GB). This file is a "
                 f"leftover copy, not a failed import.")
     return None
+
+
+async def adopt_now(file_id: int) -> tuple[str, str]:
+    """The button: try this one file right now, whatever its attempt count."""
+    with cursor() as cur:
+        r = cur.execute("SELECT id, path, title, season, audio_langs, adopt_attempts "
+                        "FROM files WHERE id=?", (file_id,)).fetchone()
+    if not r:
+        return "error", "no such file"
+    row = dict(r)
+    _RESCANNED.clear()               # a click is a request for a fresh look
+    outcome, detail = await _adopt_one(row)
+    now = time.time()
+    with cursor() as cur:
+        if outcome == "adopted":
+            cur.execute("UPDATE files SET adopt_attempts=0 WHERE id=?", (file_id,))
+        elif outcome in ("duplicate", "no_folder"):
+            cur.execute("UPDATE files SET adopt_state=?, state_reason=?, adopt_last_at=? "
+                        "WHERE id=?", (outcome, detail, now, file_id))
+        else:
+            cur.execute("UPDATE files SET state_reason=?, adopt_last_at=? WHERE id=?",
+                        (detail, now, file_id))
+    joblog.log(f"adopt (asked from the dashboard): {row.get('title') or os.path.basename(row['path'])} "
+               f"- {outcome}: {detail}", "info" if outcome == "adopted" else "warn")
+    return outcome, detail
 
 
 def _due(limit: int = 25) -> list[dict]:

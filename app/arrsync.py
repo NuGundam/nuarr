@@ -505,15 +505,19 @@ async def watch() -> None:
     while True:
         try:
             every = max(1.0, float(getattr(SETTINGS, "arrsync_every_h", 12)))
-            await refresh()
-            d = _CACHE.get("data") or {}
-            n = int(d.get("total") or 0)
+            with joblog.section("Arr agreement check", eager=True) as sec:
+                await refresh()
+                d = _CACHE.get("data") or {}
+                n = int(d.get("total") or 0)
+                sec.result = f"{n} record(s) disagree" if n else "all agreed"
             schedules.beat("arrsync",
                            f"{n} record(s) disagree" if n else "all agreed")
             if n and mode() == "auto":
-                joblog.log(f"arr sync: {n} record(s) disagree with the file on "
-                           f"disk - correcting them (auto mode)", "info")
-                await fix()
+                with joblog.section("Arr agreement fix", eager=True):
+                    joblog.log(f"arr sync: {n} record(s) disagree with the "
+                               f"file on disk - correcting them (auto mode)",
+                               "info")
+                    await fix()
                 # Re-ask straight after, so the panel and the tile show what
                 # the correction actually achieved rather than what it found
                 # before it ran.

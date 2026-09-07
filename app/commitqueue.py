@@ -136,6 +136,16 @@ async def _attempt(row: dict) -> tuple[bool, str]:
     return True, res.detail
 
 
+_HOLD_SAID = {"at": 0.0}
+
+
+def _note_hold(text: str) -> None:
+    """Say it once every ten minutes, not every pass."""
+    if time.time() - _HOLD_SAID["at"] >= 600:
+        _HOLD_SAID["at"] = time.time()
+        joblog.log(text, "info")
+
+
 async def run_due(limit: int = 10) -> dict:
     now = time.time()
     with cursor() as cur:
@@ -144,6 +154,16 @@ async def run_due(limit: int = 10) -> dict:
             "ORDER BY next_try_at LIMIT ?", (now, limit))]
     if not rows:
         return {"tried": 0, "ok": 0, "failed": 0, "gave_up": 0}
+    # A DEFERRED COMMIT IS STILL A FILE REPLACE, and it waits for the same
+    # reason the live one does: DrivePool may be mid-move on the very file.
+    try:
+        from . import drivepool as _dp
+        held, why = _dp.hold_active("commits")
+    except Exception:                                    # noqa: BLE001
+        held, why = False, ""
+    if held:
+        _note_hold(f"{len(rows)} deferred commit(s) waiting - {why}")
+        return {"tried": 0, "ok": 0, "failed": 0, "gave_up": 0, "held": why}
 
     ok = failed = gave_up = 0
     sec = joblog.section("file replaces")

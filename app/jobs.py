@@ -653,6 +653,9 @@ class Worker:
             # A frozen progress bar with no explanation reads as a hang, and
             # this one is deliberate - so it has to say so on the card.
             "paused_for_viewer": bool(getattr(self, "paused_for_viewer", False)),
+            "paused_for_load": bool(getattr(self, "paused_for_load", False)),
+            "pace_factor": float(getattr(self, "pace_factor", 0.0) or 0.0),
+            "pace_why": getattr(self, "pace_why", "") or "",
             # Only report an ETA while ffmpeg is actually running. Carrying the
             # last value into the commit/rename stages produced a stuck
             # "ETA 0s" that looked like a hang.
@@ -1352,6 +1355,81 @@ def disk_load(running=None) -> dict[str, int]:
     return load
 
 
+_PLACEMENT_AT: dict[str, float] = {}
+
+
+def _refresh_placement(cur, pool: str, hot: set, limit: int = 30) -> int:
+    """Re-resolve the disk of queued files the table puts on a hot spindle.
+
+    Returns how many turned out to have moved. The table is corrected so
+    the panel and the next claim agree, and the move is logged once.
+    """
+    now = time.time()
+    if now - _PLACEMENT_AT.get(pool, 0.0) < 60:
+        return 0
+    _PLACEMENT_AT[pool] = now
+    try:
+        from . import scanner
+        qs = ",".join("?" * len(hot))
+        rows = cur.execute(
+            f"SELECT f.id, f.path, f.pool_disk FROM jobs j JOIN files f ON f.id=j.file_id "
+            f" WHERE j.state='queued' AND j.pool=? AND f.pool_disk IN ({qs}) "
+            f" ORDER BY j.priority DESC, j.id LIMIT ?",
+            (pool, *sorted(hot), limit)).fetchall()
+        moved = 0
+        where: dict[str, int] = {}
+        for r in rows:
+            real = scanner.disk_of(r["path"])
+            if real and real != r["pool_disk"]:
+                cur.execute("UPDATE files SET pool_disk=? WHERE id=?", (real, r["id"]))
+                moved += 1
+                where[real] = where.get(real, 0) + 1
+        if moved:
+            joblog.log(f"{moved} queued file(s) have moved off "
+                       f"{', '.join(sorted(hot))} since the last scan - "
+                       f"following them to {', '.join(f'{d} ({n})' for d, n in sorted(where.items()))}",
+                       "info")
+        return moved
+    except Exception:                                    # noqa: BLE001
+        return 0
+
+
+DRIVEPOOL_WAIT_MAX_S = 3 * 3600
+
+
+async def _wait_for_drivepool(w, job) -> None:
+    """Hold a commit while DrivePool is moving data, if that hold is on."""
+    try:
+        from . import drivepool as _dp
+    except Exception:                                    # noqa: BLE001
+        return
+    t0 = time.time()
+    said = False
+    while True:
+        try:
+            held, why = _dp.hold_active("commits")
+        except Exception:                                # noqa: BLE001
+            return
+        if not held:
+            if said:
+                joblog.log(f"committing now - {why or 'DrivePool finished'} "
+                           f"(waited {int(time.time()-t0)}s)", "info", job.id)
+            elif why:
+                joblog.log(f"DrivePool is moving data but {why.split(' - ', 1)[-1]}",
+                           "debug", job.id)
+            return
+        if time.time() - t0 >= DRIVEPOOL_WAIT_MAX_S:
+            joblog.log(f"waited {DRIVEPOOL_WAIT_MAX_S//3600}h for DrivePool "
+                       f"and it is still moving - committing anyway", "warn",
+                       job.id)
+            return
+        if not said:
+            said = True
+            w.set_stage("waiting for DrivePool")
+            joblog.log(f"holding the commit - {why}", "info", job.id)
+        await asyncio.sleep(10)
+    
+
 def _claim(pool: str) -> Job | None:
     """Atomically take the next queued job for a pool.
 
@@ -1515,6 +1593,18 @@ def _claim(pool: str) -> Job | None:
                                tuple(params)).fetchone()
 
         row = _pick(watched | hot)
+        if row is None and hot:
+            # BEFORE SETTLING FOR A HOT DISK, ASK WHERE THE FILES ARE NOW.
+            # The placement in the table is from the last scan. The thing
+            # making a disk hot is very often DrivePool moving files off it
+            # - measured: NU-DRIVE-0 emptying at 200 GB/h under a 240 MB/s
+            # balance - so the queued file the table puts on the hot disk
+            # may already be sitting on a quiet one. Following it there is
+            # a copy at full speed instead of one that crawls behind the
+            # balance. Bounded and rate-limited: a few dozen lookups, no
+            # more than once a minute.
+            if _refresh_placement(cur, pool, hot):
+                row = _pick(watched | hot)
         if row is None and hot:
             # Nothing left off the hot disks. Busy is a PREFERENCE, not a
             # veto: if every remaining candidate lives on a loaded spindle,
@@ -2329,9 +2419,25 @@ async def io_priority_watch() -> None:
                 busy = set(gate.busy_disks())
             except Exception:
                 pass
-            watched |= busy
+            # A VIEWER YIELDS THE DISK. OTHER ACTIVITY SHARES IT.
+            #
+            # Both used to demote to Very Low I/O, and on this box Very Low
+            # under a sustained load does not share - it starves. Measured:
+            # two passthroughs on NU-DRIVE-0, demoted because a balancer was
+            # pushing 103 MB/s through the same spindle, read at 441 KB/s -
+            # the copy could never reach the 85% hand-off, and sixty-six
+            # files queued behind it for as long as the balance ran. That is
+            # the right trade for a viewer, whose stutter is the worst thing
+            # nuarr can cause. It is the wrong trade for a balance or a
+            # backup, which merely slows a little if nuarr competes at normal
+            # priority - and DrivePool will finish either way. So only the
+            # viewer's disks are demoted; the busy ones are steered around by
+            # the dispatcher (which already prefers quiet spindles) and, when
+            # they are all that is left, worked at normal priority.
+            yielded = set(watched)                  # viewers, live and held
+            watched |= busy                         # for the reason text
 
-            want = bool(watched)
+            want = bool(yielded)
             # NAME THE REASONS SEPARATELY. They are all "yield the disk", but
             # they answer different questions when you are reading the log
             # afterwards trying to work out why a job ran slowly - and "a
@@ -2347,8 +2453,10 @@ async def io_priority_watch() -> None:
                     bits.append(f"next episode is on {', '.join(sorted(nxt & watched))}")
                 if held:
                     bits.append(f"still yielding {', '.join(sorted(held))}")
-                if busy:
-                    bits.append(f"other activity is on {', '.join(sorted(busy))}")
+                if busy - yielded:
+                    bits.append(f"other activity is on "
+                                f"{', '.join(sorted(busy - yielded))} - "
+                                f"jobs there run at normal priority and share")
                 reason = "; ".join(bits)
             else:
                 reason = ""
@@ -2373,7 +2481,7 @@ async def io_priority_watch() -> None:
             changed = (IO_THROTTLED["on"] != want
                        or IO_THROTTLED.get("disks") != sorted(watched))
             if want or changed:
-                n = await asyncio.to_thread(_set_io_priority, watched, False)
+                n = await asyncio.to_thread(_set_io_priority, yielded, False)
                 IO_THROTTLED["procs"] = n
                 if changed:
                     IO_THROTTLED.update(on=want, disks=sorted(watched),
@@ -2924,6 +3032,45 @@ def viewer_pace(disks) -> float:
         return VIEWER_THROTTLE_MAX
 
 
+def disk_pace(w) -> float:
+    r"""The one number a copy consults per chunk: -1 pause, 0 full, up to 3.
+
+    Two ramps, combined by taking the harder of the two:
+      viewer_pace  - how thin a viewer's buffer is on the spindles touched
+      gate.load_pace - how hard anyone else is using them (DrivePool, a
+                       backup, a scan), measured from the disk counters
+    A pause from either pauses. The reason is kept on the worker so the card
+    and the log can say which it was.
+    """
+    dest = getattr(w, "dest_disk", "") or ""
+    src_disk = getattr(w, "disk", "") or ""
+    mine = ({dest, src_disk} - {""})
+    fv, fl, why_v, why_l = 0.0, 0.0, "", ""
+    try:
+        if get_toggle_safe("gate.plex_io_throttle"):
+            watched = _plex_disks_safe()
+            hit = mine & watched if watched else set()
+            if hit:
+                fv = viewer_pace(hit)
+                why_v = ("a viewer is short of buffer on " if fv < 0 else "a viewer is on ") + ", ".join(sorted(hit))
+    except Exception:                                    # noqa: BLE001
+        fv = 0.0
+    try:
+        from . import gate as _g
+        fl, why_l = _g.load_pace(mine)
+    except Exception:                                    # noqa: BLE001
+        fl = 0.0
+    w.paused_for_viewer = (fv < 0)
+    w.paused_for_load = (fl < 0)
+    if fv < 0 or fl < 0:
+        f = -1.0
+    else:
+        f = max(fv, fl)
+    w.pace_why = (why_v if (fv < 0 or (fv >= fl and fv > 0)) else why_l) if f else ""
+    w.pace_factor = f
+    return f
+
+
 def _commit_pace(w: Worker):
     r"""Shared throttle for any commit that copies a library file.
 
@@ -2934,23 +3081,7 @@ def _commit_pace(w: Worker):
     """
     def pace():
         try:
-            if not get_toggle_safe("gate.plex_io_throttle"):
-                return 0.0
-            dest = getattr(w, "dest_disk", "") or ""
-            src_disk = getattr(w, "disk", "") or ""
-            watched = _plex_disks_safe()
-            mine = ({dest, src_disk} - {""})
-            hit = mine & watched if watched else set()
-            if not hit:
-                return 0.0
-            # HOW THIN IS THE VIEWER'S BUFFER on the spindle being touched.
-            # A quarter of a 150 MB/s commit is still 37 MB/s competing with a
-            # viewer who has seconds in hand; below the floor the only useful
-            # thing this copy can do is stop. -1 pauses; 0 means the viewer is
-            # far enough ahead that there is nothing to protect them from.
-            f = viewer_pace(hit)
-            w.paused_for_viewer = (f < 0)
-            return f
+            return disk_pace(w)
         except Exception:
             return 0.0
     return pace
@@ -3073,8 +3204,11 @@ async def _sub_ocr(w: Worker, probe_data: dict) -> None:
             wk = tempfile.mkdtemp(prefix="subocr_", dir=SETTINGS.cache_dir)
             o = os.path.join(wk, "out.mkv")
             subocr.embed(job.path,
-                         [(p["srt"], p.get("name") or "English (OCR)")
-                          for p in pend], o)
+                         [(p["srt"], p.get("name") or "English")
+                          for p in pend], o,
+                         drop_image_covered=bool(subocr._s(
+                             "subocr_remove_image", False,
+                             _library_of_file(job.file_id))))
             return wk, o
         try:
             wk, o = await asyncio.to_thread(_mux_pend)
@@ -3226,6 +3360,35 @@ async def _sub_ocr(w: Worker, probe_data: dict) -> None:
             note=f"subtitle OCR: {res['tracks']} PGS track(s) -> SRT, "
                  f"embedded first; image subs kept, demoted",
             event="subtitled")
+
+
+# WHAT FFMPEG'S STDERR ACTUALLY MEANS. Its stream is three things braided
+# together: the banner and stream maps (information), timestamp and buffer
+# grumbles on a stream copy (warnings - the job still succeeds), and the
+# lines that name a real fault. The old rule was "any line with the word
+# invalid is an error", which made "Invalid DTS ... replacing by guess" the
+# most common ERROR in the log on a day when nothing failed.
+_FF_META = re.compile(r"^\s*[\w\-/ ]+?\s{2,}:\s")      # "title           : ..."
+_FF_WARN = re.compile(
+    r"invalid (dts|pts)|replacing by guess|non-monoton|increasing reorder buffer|"
+    r"deprecated|guessed channel layout|timestamps are unset|queue input is backward|"
+    r"past duration|application provided invalid|\bwarning\b", re.I)
+_FF_ERR = re.compile(
+    r"\berror\b|\bfailed\b|\bunable\b|could not|no such file|permission denied|"
+    r"invalid data found|not supported|conversion failed|\bcannot\b|\bcorrupt|"
+    r"decode block|invalid argument|error while decoding", re.I)
+
+
+def _ffmpeg_level(line: str) -> str:
+    # A metadata line is context whatever words the title happens to contain:
+    # "title : Terrorist Bombing" was an ERROR under the substring rule.
+    if _FF_META.match(line):
+        return "debug"
+    if _FF_WARN.search(line):
+        return "warn"
+    if _FF_ERR.search(line):
+        return "error"
+    return "debug"
 
 
 async def _transcode(w: Worker, probe_data: dict) -> None:
@@ -3488,9 +3651,7 @@ async def _transcode(w: Worker, probe_data: dict) -> None:
             if not line:
                 continue
             tail.append(line)
-            if any(k in line.lower()
-                   for k in ("error", "invalid", "failed", "unable")):
-                joblog.log(line, "error", job.id)
+            joblog.log(line, _ffmpeg_level(line), job.id)
 
     await asyncio.gather(read_progress(), read_errors())
     rc = await proc.wait()
@@ -3499,8 +3660,15 @@ async def _transcode(w: Worker, probe_data: dict) -> None:
         raise asyncio.CancelledError()
     if rc != 0:
         await asyncio.to_thread(_rm, out)
+        # THE TAIL IS EVIDENCE, NOT TWELVE ERRORS. It was written at ERROR
+        # line for line - "Stream mapping:", "Input #0, matroska", the
+        # title metadata - so one failed job put a dozen ERROR rows in the
+        # log and the count stopped meaning anything. The lines that say
+        # what went wrong keep their level; the rest go in as the context
+        # they are, and the FAILED line below is the one to search for.
         for line in tail:
-            joblog.log(line, "error", job.id)
+            lvl = _ffmpeg_level(line)
+            joblog.log(line, lvl if lvl != "debug" else "info", job.id)
         # The most specific line ffmpeg produced, next to nuarr's reading of
         # the exit code, so the stored error is self-explanatory.
         why = next((l for l in reversed(tail)
@@ -3687,8 +3855,11 @@ async def _transcode(w: Worker, probe_data: dict) -> None:
             # <job_id>.mkv, and a differently-named output would be invisible
             # to them.
             tmp = out + ".subs"
-            _so.embed(out, [(p["srt"], p.get("name") or "English (OCR)")
-                            for p in _pend], tmp)
+            _so.embed(out, [(p["srt"], p.get("name") or "English")
+                            for p in _pend], tmp,
+                      drop_image_covered=bool(_so._s(
+                          "subocr_remove_image", False,
+                          _library_of_file(job.file_id))))
             os.remove(out)
             os.replace(tmp, out)
         try:
@@ -3772,6 +3943,12 @@ async def _transcode(w: Worker, probe_data: dict) -> None:
     except Exception:
         pass
     w.set_stage("committing")
+    # NOT WHILE DRIVEPOOL IS MOVING FILES. The encode is done and safe in the
+    # cache; the only thing at risk is the swap into the pool landing on a
+    # file the balancer is mid-move. Waiting costs a worker slot for the
+    # length of the move; not waiting is how a file goes missing. Bounded,
+    # so a balance that runs all night cannot pin a worker forever.
+    await _wait_for_drivepool(w, job)
     joblog.log("committing to the library...", "info", job.id)
 
     # Shared with _sub_ocr - see _commit_stage_cb for why one copy exists.
@@ -3790,23 +3967,7 @@ async def _transcode(w: Worker, probe_data: dict) -> None:
         job. Returns 0 - full speed - whenever nothing is competing.
         """
         try:
-            if not get_toggle_safe("gate.plex_io_throttle"):
-                return 0.0
-            dest = getattr(w, "dest_disk", "") or ""
-            src_disk = getattr(w, "disk", "") or ""
-            watched = _plex_disks_safe()
-            mine = ({dest, src_disk} - {""})
-            hit = mine & watched if watched else set()
-            if not hit:
-                return 0.0
-            # HOW THIN IS THE VIEWER'S BUFFER on the spindle being touched.
-            # A quarter of a 150 MB/s commit is still 37 MB/s competing with a
-            # viewer who has seconds in hand; below the floor the only useful
-            # thing this copy can do is stop. -1 pauses; 0 means the viewer is
-            # far enough ahead that there is nothing to protect them from.
-            f = viewer_pace(hit)
-            w.paused_for_viewer = (f < 0)
-            return f
+            return disk_pace(w)
         except Exception:
             return 0.0
 
@@ -4855,6 +5016,31 @@ def _io_by_disk(workers: list["Worker"]) -> list[dict]:
         e["jobs"] += 1
         e["read_bps"] += w.read_bps
         e["write_bps"] += w.write_bps
+        # WHAT EACH JOB IS DOING, for the disk row's hover. A count says a
+        # spindle has a job; it does not say the job has been waiting on
+        # DrivePool for half an hour, which is the thing worth knowing.
+        e.setdefault("jobs_detail", []).append({
+            "job_id": w.job.id,
+            "title": w.job.title or os.path.basename(w.job.path),
+            "file": os.path.basename(w.job.path),
+            "pool": w.pool, "stage": w.stage,
+            "stage_s": round(time.time() - w.stage_at) if w.stage_at else 0,
+            "elapsed_s": round(time.time() - w.started_at),
+            "progress": round(w.progress or 0.0, 3),
+            "paused_for_viewer": bool(getattr(w, "paused_for_viewer", False)),
+            "paused_for_load": bool(getattr(w, "paused_for_load", False)),
+            "pace_factor": float(getattr(w, "pace_factor", 0.0) or 0.0),
+            "pace_why": getattr(w, "pace_why", "") or "",
+            "dest_disk": w.dest_disk, "stage_device": w.stage_device,
+            "read_bps": round(w.read_bps), "write_bps": round(w.write_bps),
+            "fps": round(w.fps, 1), "speed": round(w.speed, 2),
+            "eta_s": (round(w.eta_s) if w.eta_s and w.stage == "encoding" else None),
+            "src_bytes": w.src_bytes, "out_bytes": w.out_bytes,
+            "est_out_bytes": w.est_out_bytes,
+            "commit_bytes": w.commit_bytes,
+            "commit_total": getattr(w, "commit_total", None),
+            "plan": w.job.plan.summary() if w.job.plan else "",
+        })
     out = []
     for e in agg.values():
         e["total_bps"] = round(e["read_bps"] + e["write_bps"])

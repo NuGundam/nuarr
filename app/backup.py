@@ -659,7 +659,8 @@ async def watch() -> None:
                 prev = due - _period_seconds(s)
                 if prev > last and time.time() >= prev:
                     async with _LOCK:
-                        await asyncio.to_thread(run_backup)
+                        with joblog.section("Backup", eager=True):
+                            await asyncio.to_thread(run_backup)
         except Exception as e:
             joblog.log(f"backup scheduler error: {type(e).__name__}: {e}", "warn")
         await asyncio.sleep(300)

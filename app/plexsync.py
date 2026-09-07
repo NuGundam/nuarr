@@ -388,9 +388,14 @@ async def watch() -> None:
             url, token = plexnotify._plex()
             fresh = time.time() - float(STATE.get("at") or 0)
             if url and token and fresh > CYCLE_S - 120:
-                await asyncio.to_thread(scan)
+                with joblog.section("Plex agreement check", eager=True) as sec:
+                    await asyncio.to_thread(scan)
+                    n = len(STATE.get("rows") or [])
+                    sec.result = (f"{n} out of step" if n
+                                  else f"all {STATE.get('total', 0):,} agree")
             if url and token and mode() == "auto" and STATE.get("rows"):
-                await asyncio.to_thread(fix)
+                with joblog.section("Plex agreement fix", eager=True):
+                    await asyncio.to_thread(fix)
         except Exception as e:                               # noqa: BLE001
             joblog.log(f"Plex agreement loop error: {type(e).__name__}: {e}",
                        "error")

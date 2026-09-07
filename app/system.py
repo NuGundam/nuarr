@@ -615,3 +615,58 @@ try:
     psutil.cpu_percent(interval=None)
 except Exception:
     pass
+
+
+# ---------------------------------------------------- working-set trim ----
+# WHERE THE RAM WENT. Audited on this box with nuarr idle: 623 MB resident
+# and 90,000 Python objects - the objects account for tens of MB. Handing
+# every untouched page back to the OS dropped it to 11 MB, and a minute
+# later it had settled at 140-250 MB: THAT is what nuarr actually touches.
+# The other ~400 MB was the high-water mark of a library scan - two arrs'
+# JSON for 39,000 files parsed into dicts, plus the walk and the reconcile
+# snapshot, all alive at once for a few seconds - which the allocator keeps
+# mapped afterwards, resident but never read again.
+#
+# So the scan gives it back when it finishes. The pages are not lost:
+# anything touched again is faulted back in from the standby list in
+# microseconds. What changes is that the memory is available to Plex and
+# the OS file cache instead of sitting in nuarr's column of Task Manager.
+_TRIM = {"at": 0.0, "from_mb": 0.0, "to_mb": 0.0, "n": 0}
+
+
+def trim_working_set(reason: str = "") -> dict:
+    """Release untouched pages to the OS; returns before/after in MB."""
+    import ctypes
+    import gc
+    try:
+        import psutil
+        p = psutil.Process()
+        before = p.memory_info().rss
+        gc.collect()
+        ctypes.windll.psapi.EmptyWorkingSet(ctypes.c_void_p(-1))
+        after = p.memory_info().rss
+    except Exception as e:                                   # noqa: BLE001
+        return {"ok": False, "why": f"{type(e).__name__}: {e}"}
+    _TRIM.update(at=time.time(), from_mb=before / 2**20, to_mb=after / 2**20,
+                 n=_TRIM["n"] + 1)
+    try:
+        from . import joblog
+        joblog.log(f"memory: released {(before - after) / 2**20:.0f} MB of untouched "
+                   f"pages{' after ' + reason if reason else ''} - {before / 2**20:.0f} MB "
+                   f"resident before, working set rebuilds to what is in use", "debug")
+    except Exception:                                        # noqa: BLE001
+        pass
+    return {"ok": True, "from_mb": round(before / 2**20, 1), "to_mb": round(after / 2**20, 1)}
+
+
+def trim_if_bloated(threshold_mb: float = 400.0, min_gap_s: float = 1800.0,
+                    reason: str = "") -> dict | None:
+    """Trim only when resident memory has climbed well past what is in use."""
+    try:
+        import psutil
+        rss = psutil.Process().memory_info().rss / 2**20
+    except Exception:                                        # noqa: BLE001
+        return None
+    if rss < threshold_mb or time.time() - _TRIM["at"] < min_gap_s:
+        return None
+    return trim_working_set(reason)

@@ -744,6 +744,16 @@ def _duration(path: str) -> float:
         return 0.0
 
 
+# A HEALTHY WINDOW TAKES ONE TO FIVE SECONDS. Warehouse 13 S01E10 took 240
+# on every window, three times over, and the verdict was "extract failed"
+# after twelve minutes of a thread doing nothing: ffmpeg had read the header
+# and then sat in a page-in wait on the pool - the disk not answering for
+# that region of the file - with all twenty threads idle. Sixty seconds is
+# twelve times the honest worst case and still short enough to be a report
+# rather than an outage.
+PCM_TIMEOUT_S = 60
+
+
 def _pcm(path: str, track: int, start: float, secs: int):
     """One mono 16 kHz float32 window, straight out of ffmpeg into memory.
 
@@ -756,8 +766,8 @@ def _pcm(path: str, track: int, start: float, secs: int):
     p = subprocess.run(
         [ff, "-nostdin", "-y", "-v", "quiet", "-ss", str(int(start)), "-i", path,
          "-map", f"0:a:{track}", "-t", str(secs), "-ac", "1", "-ar", "16000",
-         "-f", "f32le", "-"], capture_output=True, timeout=240,
-        creationflags=NO_WINDOW)
+         "-f", "f32le", "-"], capture_output=True, timeout=PCM_TIMEOUT_S,
+        creationflags=NO_WINDOW, startupinfo=hidden_si())
     return np.frombuffer(p.stdout, dtype=np.float32).copy()
 
 
@@ -841,18 +851,104 @@ def aggregate(dists: list) -> list:
     return out[:8]
 
 
+SECOND_LOOK = (0.20, 0.40, 0.60)   # where the second three windows come from
+OUTLIER_MAX = 0.80                 # a lone dissenter under this is not a second language
+
+
+def _extract_why(e: Exception) -> str:
+    """A cause, not the first 80 characters of a command line."""
+    if isinstance(e, subprocess.TimeoutExpired):
+        return (f"ffmpeg took over {int(e.timeout)}s to pull one 30s window - "
+                "the disk was probably saturated; it will be tried again")
+    msg = str(e)
+    # str(CalledProcessError) is the whole argv; the useful part is the end
+    return f"extract failed: {msg[-100:]}" if len(msg) > 100 else f"extract failed: {msg}"
+
+
+def _judge(votes: list, strong_floor: float = MIN_PROB) -> dict:
+    r"""The verdict for a set of windows, and whether it is worth a second look.
+
+    Returns {code2, confidence, ok, why, retry}. `retry` says the outcome was
+    the model being unsure rather than the file being unreadable - the only
+    case where more windows could change the answer.
+    """
+    out = {"code2": "", "confidence": 0.0, "ok": False, "why": "", "retry": False}
+    if not votes:
+        out["retry"] = True
+        return out
+    # A WINDOW THAT IS NOT CONFIDENT IS NOT EVIDENCE, so it does not get a vote.
+    #
+    # This filter used to run AFTER the agreement check, which let noise veto a
+    # near-certain result. Blassreiter S01E05 scored [zh 0.36, ja 0.985,
+    # ja 0.994] and was thrown out as "windows disagree" - one junk window
+    # outvoting two that were 99% sure. A 0.36 score is the model saying it
+    # cannot tell, and "cannot tell" is not a dissenting opinion.
+    strong = [v for v in votes if v[1] >= strong_floor]
+    if not strong:
+        best = max(votes, key=lambda v: v[1])
+        out.update(code2=best[0], confidence=best[1], retry=True,
+                   why=(f"best guess {best[0]} at {best[1]:.2f}, below the "
+                        f"{strong_floor:.2f} floor"))
+        return out
+    by: dict[str, list] = {}
+    for l, pr in strong:
+        by.setdefault(l, []).append(pr)
+    if len(by) > 1:
+        # Still deliberately NOT a majority vote. Two CONFIDENT windows that
+        # disagree is the signature of a dual-language track, and the right
+        # answer there is to stop and let a human look.
+        #
+        # ONE EXCEPTION, EARNED BY THE SECOND LOOK. Five windows spread across
+        # the file saying English at 1.00 and one saying Chinese at 0.66 is
+        # not a dual-language track - a real one splits, because the windows
+        # are spread. So a single dissenter, under OUTLIER_MAX, outvoted at
+        # least four to one, is recorded and set aside. Anything closer than
+        # that still stops.
+        lead = max(by, key=lambda k: len(by[k]))
+        others = [(l, pr) for l, prs in by.items() if l != lead for pr in prs]
+        if (len(others) == 1 and others[0][1] < OUTLIER_MAX
+                and len(by[lead]) >= 4):
+            conf = round(min(by[lead]), 3)
+            out.update(code2=lead, confidence=conf, ok=True,
+                       why=(f"{len(by[lead])} window(s) agreed on {lead} at "
+                            f"{conf:.2f}; one window said {others[0][0]} at "
+                            f"{others[0][1]:.2f} and was set aside as an outlier"))
+            return out
+        out.update(retry=True,
+                   why=("windows disagree: " + ", ".join(sorted(by))
+                        + f" (from {len(strong)} confident window(s))"))
+        return out
+    code2 = strong[0][0]
+    conf = round(min(v[1] for v in strong), 3)
+    out.update(code2=code2, confidence=conf, ok=True)
+    if len(strong) < len(votes):
+        out["why"] = (f"{len(votes) - len(strong)} window(s) ignored as "
+                      f"too uncertain to count; ")
+    out["why"] += f"{len(strong)} window(s) agreed on {code2} at {conf:.2f}"
+    return out
+
+
 def detect(path: str, track: int = 0, fracs=(0.30, 0.50, 0.70),
            secs: int = 30) -> dict:
-    """Listen to `track` of `path` and report what language it is in.
+    r"""Listen to `track` of `path` and report what language it is in.
 
     Returns {code, code2, confidence, votes, ok, why}. `code` is ISO 639-2 or
     "" when the answer is not trustworthy - and "not trustworthy" is a real
     outcome here, not a failure. Everything downstream treats "" as "leave it
     alone", which is the safe direction: a blank tag is already the status quo.
+
+    TWO LOOKS BEFORE REFUSING. Three windows from the middle of the file
+    settle most tracks. When they do not - all under the floor, or confident
+    and disagreeing - three MORE windows are taken from other places in the
+    file (SECOND_LOOK) and the verdict is made over all six. A refusal after
+    six windows spread across the file is worth something; a refusal after
+    three that happened to land on a song, a shout or a foreign-language
+    scene was not. Files the model cannot read at all are not retried: the
+    second look is for uncertainty, not for a disk that timed out.
     """
     import numpy as np
     out = {"code": "", "code2": "", "confidence": 0.0, "votes": [],
-           "ok": False, "why": "", "overall": [], "windows": 0}
+           "ok": False, "why": "", "overall": [], "windows": 0, "looks": 0}
     if not os.path.exists(path):
         out["why"] = "file not found"
         return out
@@ -866,79 +962,72 @@ def detect(path: str, track: int = 0, fracs=(0.30, 0.50, 0.70),
     votes: list[tuple[str, float]] = []
     dists: list[list] = []
     silent = 0
-    for fr in fracs:
-        try:
-            a = _pcm(path, track, dur * fr, secs)
-        except Exception as e:                           # noqa: BLE001
-            out["why"] = f"extract failed: {str(e)[:80]}"
-            continue
-        if a.size < 16000:
-            continue
-        # A silent window identifies as whatever the model's prior likes. It is
-        # not a vote, and three silent windows are not a consensus.
-        if float(np.abs(a).mean()) < SILENCE:
-            silent += 1
-            continue
-        try:
-            lang, prob, all_probs = m.detect_language(a)
-        except Exception as e:                           # noqa: BLE001
-            out["why"] = f"detect failed: {str(e)[:80]}"
-            continue
-        votes.append((str(lang), round(float(prob), 3)))
-        # KEEP THE RUNNERS-UP. The model scores every language it knows, and
-        # discarding all but the winner throws away the only thing that tells
-        # a decisive window from a coin flip: "ja 0.97, zh 0.01" and
-        # "ja 0.51, zh 0.48" both reduce to a vote for "ja", and only one of
-        # them is worth acting on.
-        dists.append(_top(all_probs, 8))
+    err = ""
+
+    def listen(where) -> int:
+        """Take one window at each fraction; returns how many were readable."""
+        nonlocal silent, err
+        got = 0
+        for fr in where:
+            try:
+                a = _pcm(path, track, dur * fr, secs)
+            except subprocess.TimeoutExpired as e:
+                # The next window is the same file on the same disk; a
+                # second sixty seconds would only say the same thing.
+                err = _extract_why(e)
+                break
+            except Exception as e:                       # noqa: BLE001
+                err = _extract_why(e)
+                continue
+            if a.size < 16000:
+                continue
+            got += 1
+            # A silent window identifies as whatever the model's prior likes.
+            # It is not a vote, and three silent windows are not a consensus.
+            if float(np.abs(a).mean()) < SILENCE:
+                silent += 1
+                continue
+            try:
+                lang, prob, all_probs = m.detect_language(a)
+            except Exception as e:                       # noqa: BLE001
+                err = f"detect failed: {str(e)[:80]}"
+                continue
+            votes.append((str(lang), round(float(prob), 3)))
+            # KEEP THE RUNNERS-UP. The model scores every language it knows,
+            # and discarding all but the winner throws away the only thing
+            # that tells a decisive window from a coin flip: "ja 0.97, zh
+            # 0.01" and "ja 0.51, zh 0.48" both reduce to a vote for "ja",
+            # and only one of them is worth acting on.
+            dists.append(_top(all_probs, 8))
+        return got
+
+    readable = listen(fracs)
+    out["looks"] = 1
+    v = _judge(votes)
+    if not v["ok"] and v["retry"] and readable:
+        # The file can be read and the model was unsure: look again, elsewhere.
+        listen(SECOND_LOOK)
+        out["looks"] = 2
+        v = _judge(votes)
 
     out["votes"] = votes
     out["overall"] = aggregate(dists)
     out["windows"] = len(votes)
+    second = " (after a second look at three more windows)" if out["looks"] == 2 else ""
     if not votes:
-        out["why"] = out["why"] or (f"{silent} silent window(s), no speech found"
-                                    if silent else "no usable audio")
+        out["why"] = err or (f"{silent} silent window(s), no speech found"
+                             if silent else "no usable audio")
         return out
-
-    # A WINDOW THAT IS NOT CONFIDENT IS NOT EVIDENCE, so it does not get a vote.
-    #
-    # This filter used to run AFTER the agreement check, which let noise veto a
-    # near-certain result. Blassreiter S01E05 scored [zh 0.36, ja 0.985,
-    # ja 0.994] and was thrown out as "windows disagree" - one junk window
-    # outvoting two that were 99% sure. A 0.36 score is the model saying it
-    # cannot tell, and "cannot tell" is not a dissenting opinion.
-    strong = [v for v in votes if v[1] >= MIN_PROB]
-    if not strong:
-        best = max(votes, key=lambda v: v[1])
-        out.update(code2=best[0], confidence=best[1])
-        out["why"] = (f"best guess {best[0]} at {best[1]:.2f}, below the "
-                      f"{MIN_PROB:.2f} floor")
+    out.update(code2=v["code2"], confidence=v["confidence"],
+               code=_TO3.get(v["code2"], "") if v["ok"] else "")
+    if not v["ok"]:
+        out["why"] = v["why"] + second
         return out
-
-    langs = {v[0] for v in strong}
-    if len(langs) > 1:
-        # Still deliberately NOT a majority vote. Two CONFIDENT windows that
-        # disagree is the signature of a dual-language track, and the right
-        # answer there is to stop and let a human look.
-        out["why"] = ("windows disagree: "
-                      + ", ".join(f"{l} " for l in sorted(langs)).strip()
-                      + f" (from {len(strong)} confident window(s))")
-        return out
-
-    code2 = strong[0][0]
-    conf = round(min(v[1] for v in strong), 3)
-    out.update(code2=code2, confidence=conf,
-               code=_TO3.get(code2, ""), ok=False)
-    if len(strong) < len(votes):
-        out["why"] = (f"{len(votes) - len(strong)} window(s) ignored as "
-                      f"too uncertain to count; ")
-    else:
-        out["why"] = ""
     if not out["code"]:
-        out["why"] += f"detected {code2}, which has no ISO 639-2 mapping here"
+        out["why"] = f"detected {v['code2']}, which has no ISO 639-2 mapping here"
         return out
     out["ok"] = True
-    out["why"] += f"{len(strong)} window(s) agreed on {code2} at {conf:.2f}"
+    out["why"] = v["why"] + second
     return out
 
 
@@ -1443,7 +1532,8 @@ async def watch() -> None:
         try:
             schedules.beat("audiolang")
             if available():
-                await asyncio.to_thread(run_once)
+                with joblog.section("Audio language listen"):
+                    await asyncio.to_thread(run_once)
         except Exception as e:                           # noqa: BLE001
             PROGRESS.update(state="error", error=f"{type(e).__name__}: {e}")
             joblog.log(f"audio language: {type(e).__name__}: {e}", "warn", system="audiolang")

@@ -419,12 +419,14 @@ async def watch() -> None:
         try:
             if get_toggle("arrs.profile_guard"):
                 STATS["running"] = "profile guard"
-                await run_guard()
+                with joblog.section("Arr profile guard"):
+                    await run_guard()
             STATS["guard"]["next_run"] = time.time() + POLL_S
             if get_toggle("arrs.trash_anime") and \
                     time.time() - STATS["trash"]["last_run"] > TRASH_MIN_GAP_S:
                 STATS["running"] = "TRaSH anime sync"
-                await run_trash()
+                with joblog.section("TRaSH anime sync"):
+                    await run_trash()
             STATS["trash"]["next_run"] = max(
                 STATS["trash"]["last_run"] + TRASH_MIN_GAP_S,
                 time.time() + POLL_S)

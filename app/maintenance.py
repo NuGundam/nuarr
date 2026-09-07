@@ -103,6 +103,8 @@ CHUNK = 2000
 # Every 6 hours. This work is measured in milliseconds; the interval is about
 # not thrashing the disk, not about keeping up.
 POLL_S = 6 * 3600
+WAL_KEEP_MB = 64            # fold the WAL back once it passes this
+WAL_LOOK_S = 10 * 60        # how often to look
 
 STATS: dict = {"last_run": 0.0, "wal_mb": 0.0, "history_deleted": 0,
                "jobs_deleted": 0, "probes_deleted": 0, "last_error": ""}
@@ -525,14 +527,34 @@ async def watch() -> None:
     # Not at startup: the first minutes are the busiest (recovery, first scan,
     # the arr fetch) and this is never urgent.
     await asyncio.sleep(300)
+    last_sweep = 0.0
     while True:
-        schedules.beat('maintenance')
-        try:
-            await asyncio.to_thread(sweep)
-        except Exception as e:
-            joblog.log(f"database housekeeping failed: {type(e).__name__}: {e}",
-                       "error")
-        await asyncio.sleep(POLL_S)
+        now = time.time()
+        if now - last_sweep >= POLL_S:
+            schedules.beat('maintenance')
+            try:
+                await asyncio.to_thread(sweep)
+            except Exception as e:
+                joblog.log(f"database housekeeping failed: "
+                           f"{type(e).__name__}: {e}", "error")
+            last_sweep = time.time()
+        else:
+            # THE WAL BETWEEN SWEEPS. Six hours is right for pruning and
+            # wrong for the write-ahead log: a library scan with transcodes
+            # committing grew it to 1.2 GB against a 420 MB database, and
+            # every read in that window walked a 300,000-frame index to find
+            # its pages - the summary went from 30 ms to 7 s. Folding it back
+            # whenever it passes 64 MB keeps the index small. busy=1 (a
+            # reader holding a snapshot) is normal; the next look gets it.
+            try:
+                if wal_mb() > WAL_KEEP_MB:
+                    c = await asyncio.to_thread(checkpoint, "TRUNCATE")
+                    if c.get("ok") and not c.get("busy") and c.get("before_mb", 0) > 256:
+                        joblog.log(f"WAL folded back: {c['before_mb']} MB -> "
+                                   f"{c['after_mb']} MB", "debug")
+            except Exception:                                # noqa: BLE001
+                pass
+        await asyncio.sleep(WAL_LOOK_S)
 
 
 # --- memory diagnostics -----------------------------------------------------

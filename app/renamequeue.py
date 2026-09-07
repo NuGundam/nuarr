@@ -316,6 +316,16 @@ async def _attempt_batch(rows: list[dict]) -> list[tuple[dict, bool, str]]:
     return out
 
 
+_HOLD_SAID = {"at": 0.0}
+
+
+def _note_hold(text: str) -> None:
+    """Say it once every ten minutes, not every pass."""
+    if time.time() - _HOLD_SAID["at"] >= 600:
+        _HOLD_SAID["at"] = time.time()
+        joblog.log(text, "info")
+
+
 async def run_due(limit: int = 60) -> dict:
     """Process every due row, batched by parent. Returns a small summary."""
     now = time.time()
@@ -325,6 +335,17 @@ async def run_due(limit: int = 60) -> dict:
             "ORDER BY next_try_at LIMIT ?", (now, limit))]
     if not rows:
         return {"tried": 0, "ok": 0, "failed": 0, "gave_up": 0}
+    # A RENAME MOVES A FILE THE BALANCER MAY BE MOVING TOO. The arr does the
+    # rename, but it is nuarr that asks for it now rather than later, and
+    # later is free: the rows keep their place and their backoff.
+    try:
+        from . import drivepool as _dp
+        held, why = _dp.hold("renames")
+    except Exception:                                    # noqa: BLE001
+        held, why = False, ""
+    if held:
+        _note_hold(f"{len(rows)} rename(s) waiting - {why}")
+        return {"tried": 0, "ok": 0, "failed": 0, "gave_up": 0, "held": why}
 
     # Group by the series/movie they belong to - one rescan serves all of them.
     groups: dict[tuple, list[dict]] = {}

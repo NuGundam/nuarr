@@ -199,6 +199,39 @@ def adopt_existing() -> int:
     return n
 
 
+def retire_superseded() -> int:
+    r"""Close blocked jobs whose file has since been finished by other means.
+
+    A blocked job is a note that says "this cannot be done yet, and here is
+    why". It is never re-read once the file is done: fifteen of them sat for
+    a month - Fate/Grand Order finished by a later job on the 5th, Big Hero 6
+    and TMNT renamed under the length limit by Sonarr - each still counting
+    as a blocked job on the page. The note has served its purpose the moment
+    the file is done and no job is live for it; closing it says so rather
+    than leaving a warning standing over finished work.
+    """
+    try:
+        with cursor() as cur:
+            rows = cur.execute(
+                "SELECT j.id, j.title, j.error FROM jobs j JOIN files f ON f.id=j.file_id "
+                " WHERE j.state='blocked' AND f.state='done' "
+                "   AND NOT EXISTS (SELECT 1 FROM jobs q WHERE q.file_id=j.file_id "
+                "                   AND q.state IN ('queued','running'))").fetchall()
+            for r in rows:
+                cur.execute(
+                    "UPDATE jobs SET state='cancelled', finished_at=?, "
+                    "  error=? WHERE id=?",
+                    (time.time(),
+                     "superseded: the file was finished by a later pass "
+                     f"(was: {(r['error'] or '')[:120]})", r["id"]))
+    except Exception:                                        # noqa: BLE001
+        return 0
+    if rows:
+        joblog.log(f"retired {len(rows)} blocked job(s) whose file has since "
+                   "been finished - the block no longer applied", "info")
+    return len(rows)
+
+
 def adopt_not_landed() -> int:
     r"""Schedule retries for files stuck on a FAILED OR BLOCKED job.
 
@@ -272,15 +305,25 @@ async def watch() -> None:
     # a job fails at three in the morning, or a setting changes and unblocks
     # nine files that were parked. Adopting only at boot means the queue is
     # correct exactly once and drifts from then on.
+    from . import schedules
+    schedules.register(
+        "errorretry", "Stuck-file retry ladder", "Queue", POLL_S,
+        what="Files that failed for a momentary reason are retried on a "
+             "rising ladder - 3m, 10m, 30m, 1h, 3h, 6h - and then handed to "
+             "a person. Every fifteen minutes it also sweeps for files that "
+             "became retryable since boot.")
     last_sweep = 0.0
     while True:
+        schedules.beat("errorretry")
         try:
-            await _run_due()
+            with joblog.section("Stuck-file retry"):
+                await _run_due()
         except Exception as e:                               # noqa: BLE001
             joblog.log(f"error-retry: {type(e).__name__}: {e}", "debug")
         if time.time() - last_sweep > 900:
             last_sweep = time.time()
             try:
+                await asyncio.to_thread(retire_superseded)
                 n = await asyncio.to_thread(adopt_not_landed)
                 if n:
                     joblog.log(f"{n} file(s) stuck on a failed or blocked job "

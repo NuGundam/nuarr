@@ -198,6 +198,17 @@ CREATE TABLE IF NOT EXISTS file_probes (
 );
 CREATE INDEX IF NOT EXISTS ix_probes_at ON file_probes(at);
 
+-- THE DASHBOARD'S FOUR GROUP-BYS, OFF THE TABLE ENTIRELY. Every three
+-- seconds the summary asks files for counts and sizes by state, by disk and
+-- by library, and each was a full scan of the 40,000-row table: 20-30 ms
+-- warm, seconds when the pool is busy and the pages are not in cache. With
+-- a covering index the scan reads the index only - a fifth of the pages -
+-- measured 23 -> 3.5 ms, 33 -> 12 ms, 18 -> 2.7 ms. One per shape, because
+-- the planner picks the index whose first column is the GROUP BY column.
+CREATE INDEX IF NOT EXISTS ix_files_sum_state ON files(state, size);
+CREATE INDEX IF NOT EXISTS ix_files_sum_disk  ON files(pool_disk, state, size);
+CREATE INDEX IF NOT EXISTS ix_files_sum_lib   ON files(library, state, size);
+
 -- ------------------------------------------------------------- settings ----
 CREATE TABLE IF NOT EXISTS kv (
     k  TEXT PRIMARY KEY,

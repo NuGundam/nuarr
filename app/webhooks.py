@@ -804,7 +804,8 @@ async def watch() -> None:
     while True:
         schedules.beat('webhooks')
         try:
-            await ensure_registered()
+            with joblog.section("Webhook registration"):
+                await ensure_registered()
         except Exception as e:
             joblog.log(f"webhook watch failed: {type(e).__name__}: {e}", "error")
         await asyncio.sleep(WATCH_INTERVAL_S)

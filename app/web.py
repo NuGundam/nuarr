@@ -11,7 +11,9 @@ Run:  python -m uvicorn app.web:app --host 0.0.0.0 --port 8770
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import gzip
+import hashlib
 import json
 import collections
 import httpx
@@ -362,6 +364,156 @@ async def api_diag_heap(top: int = 18):
     return await asyncio.to_thread(_work)
 
 
+def _diag_memory_deep(top: int = 25, who: str = ""):
+    r"""Where the process's memory is: RSS, a type histogram of every live
+    Python object, and the deep size of each module-level cache nuarr keeps.
+
+    Run in a thread with a short GC pause; a 40,000-file library is a few
+    hundred thousand objects and the walk takes a second or two.
+    """
+    import gc
+    import sys as _sys
+    from collections import Counter
+
+    def deep(o, seen=None, budget=[2_000_000]):
+        seen = seen if seen is not None else set()
+        oid = id(o)
+        if oid in seen or budget[0] <= 0:
+            return 0
+        seen.add(oid); budget[0] -= 1
+        n = _sys.getsizeof(o)
+        if isinstance(o, dict):
+            for k, v in list(o.items()):
+                n += deep(k, seen, budget) + deep(v, seen, budget)
+        elif isinstance(o, (list, tuple, set, frozenset, deque)):
+            for v in list(o):
+                n += deep(v, seen, budget)
+        elif hasattr(o, "__dict__") and not isinstance(o, type):
+            n += deep(vars(o), seen, budget)
+        elif hasattr(o, "__slots__"):
+            for sl in getattr(o, "__slots__", ()):
+                if hasattr(o, sl):
+                    n += deep(getattr(o, sl), seen, budget)
+        return n
+
+    import psutil
+    proc = psutil.Process()
+    mi = proc.memory_full_info() if hasattr(proc, "memory_full_info") else proc.memory_info()
+    gc.collect()
+    objs = gc.get_objects()
+    hist = Counter(type(o).__name__ for o in objs)
+    # the caches worth naming, by module
+    named = {}
+    def add(name, obj):
+        try:
+            named[name] = deep(obj)
+        except Exception:                                    # noqa: BLE001
+            named[name] = -1
+    try:
+        from . import scanner as _sc, disktrend as _dt, gate as _g, joblog as _jl
+        from . import arrsync as _as, arrgap as _ag, audiotitle as _at, arrlang as _al
+        from . import contentkind as _ck, drivepool as _dp, changewatch as _cw
+        add("scanner.LAST_ARR_FETCH", _sc.LAST_ARR_FETCH)
+        add("scanner.LAST_ON_DISK", _sc.LAST_ON_DISK)
+        add("disktrend._SERIES", _dt._SERIES)
+        add("gate._CACHE", _g._CACHE)
+        add("gate._FILE_BY_KEY", _g._FILE_BY_KEY)
+        add("gate._NEXT_CACHE", _g._NEXT_CACHE)
+        add("gate._PLEX_LIVE", getattr(_g, "_PLEX_LIVE", None))
+        add("joblog._RECENT", _jl._RECENT)
+        add("joblog other", {k: v for k, v in vars(_jl).items() if k.startswith("_") and isinstance(v, (dict, list, deque))})
+        add("arrsync._CACHE", _as._CACHE)
+        add("arrgap._CACHE", _ag._CACHE)
+        add("audiotitle._CACHE", _at._CACHE)
+        add("arrlang._CACHE", _al._CACHE)
+        add("contentkind._CACHE", _ck._CACHE)
+        add("drivepool.STATE+targets", {"s": _dp.STATE, "t": _dp._TGT})
+        add("changewatch.STATE", _cw.STATE)
+        add("web._MEMO", _MEMO)
+        add("web._AMEMO", _AMEMO)
+        add("web._ACT_IDX", _ACT_IDX)
+        add("jobs.RUNNING/FINISHED", {"r": jobs.RUNNING, "f": getattr(jobs, "FINISHED", None)})
+    except Exception as e:                                   # noqa: BLE001
+        named["error"] = str(e)
+    # WHO HOLDS THEM. For a type name, sample a few instances and walk the
+    # referrer chain a few levels up, naming module globals when a chain
+    # reaches one - the answer to "75,000 ArrFile objects are alive after
+    # the scan dropped its fetch; whose list is that".
+    owners = []
+    if who:
+        import types as _types
+        mods = {id(v): f"{m.__name__}.{k}" for m in list(_sys.modules.values()) if m and getattr(m, "__name__", "").startswith("app")
+                for k, v in list(vars(m).items()) if isinstance(v, (dict, list, set, tuple, deque))}
+        samples = [o for o in objs if type(o).__name__ == who][:: max(1, hist.get(who, 1) // 6)][:6]
+        for smp in samples:
+            chain, cur, seen = [], smp, {id(smp)}
+            for _ in range(6):
+                refs = [r for r in gc.get_referrers(cur)
+                        if not isinstance(r, (_types.FrameType, list)) or isinstance(r, list)]
+                refs = [r for r in refs if id(r) not in seen and r is not objs and r is not samples and r is not chain]
+                if not refs:
+                    break
+                r = refs[0]
+                seen.add(id(r))
+                label = mods.get(id(r))
+                desc = type(r).__name__
+                if isinstance(r, dict):
+                    ks = [k for k, v in list(r.items())[:200] if v is cur]
+                    desc += f"[{ks[0]!r}]" if ks else f"(len {len(r)})"
+                elif isinstance(r, (list, tuple, set)):
+                    desc += f"(len {len(r)})"
+                elif hasattr(r, "__name__"):
+                    desc += f":{getattr(r, '__name__', '')}"
+                if getattr(r, "__dict__", None) is cur:
+                    desc = f"{type(r).__name__} instance"
+                chain.append(label or desc)
+                if label:
+                    break
+                cur = r
+            owners.append(" <- ".join(chain))
+    return {
+        "owners": owners,
+        "rss_mb": round(mi.rss / 2**20, 1),
+        "private_mb": round(getattr(mi, "private", getattr(mi, "uss", 0)) / 2**20, 1),
+        "objects": len(objs),
+        "by_type": hist.most_common(top),
+        "caches_mb": {k: (round(v / 2**20, 2) if v >= 0 else None)
+                      for k, v in sorted(named.items(), key=lambda kv: -kv[1])},
+        "threads": proc.num_threads(),
+    }
+
+
+@app.get("/api/diag/tasks")
+async def api_diag_tasks():
+    r"""Every asyncio task and every thread, with where each one is right now.
+
+    The question this answers is "is the dispatcher alive, and if so what is
+    it waiting on" - which nothing else on the box could answer when the queue
+    sat at 67 with four idle workers and no error anywhere. A stack is the
+    only honest evidence for a hang.
+    """
+    import sys
+    import traceback as _tb
+    out = {"tasks": [], "threads": []}
+    for t in asyncio.all_tasks():
+        try:
+            coro = t.get_coro()
+            name = getattr(coro, "__qualname__", None) or getattr(coro, "__name__", "") or repr(coro)[:60]
+            frames = t.get_stack(limit=6)
+            where = [f"{f.f_code.co_filename.rsplit(chr(92), 1)[-1]}:{f.f_lineno} {f.f_code.co_name}"
+                     for f in frames]
+            out["tasks"].append({"name": name, "done": t.done(), "where": where})
+        except Exception as e:                               # noqa: BLE001
+            out["tasks"].append({"name": "?", "error": str(e)})
+    for tid, frame in sys._current_frames().items():
+        try:
+            st = _tb.extract_stack(frame, limit=5)
+            out["threads"].append({"id": tid, "where": [f"{x.filename.rsplit(chr(92), 1)[-1]}:{x.lineno} {x.name}" for x in st]})
+        except Exception:                                    # noqa: BLE001
+            pass
+    return out
+
+
 @app.get("/api/diag/refs")
 async def api_diag_refs(type_name: str = "WindowsPath", sample: int = 40):
     r"""WHAT IS HOLDING THESE OBJECTS. The question a type count cannot answer.
@@ -546,6 +698,23 @@ async def _startup() -> None:
         asyncio.create_task(plexsync.watch())
         from . import subocr as _so
         asyncio.create_task(_so.gap_watch())
+        # Which way each disk is going. One reading a quarter hour; the
+        # panel does the arithmetic.
+        from . import disktrend
+        disktrend.init()
+        asyncio.create_task(disktrend.watch())
+        from . import drivepool
+        drivepool.init()
+        asyncio.create_task(drivepool.watch())
+        # Filesystem change tracking: per-library rescans instead of full
+        # scans every few hours. Hands it the scan runner rather than
+        # importing web from the module (cycle).
+        from . import changewatch
+        changewatch.RESCAN = _run_scan
+        asyncio.create_task(changewatch.watch())
+        asyncio.create_task(_memory_keeper())
+        asyncio.create_task(_renames_warm())
+        asyncio.create_task(_slow_pages_warm())
     except Exception as e:                                   # noqa: BLE001
         joblog.log(f"Plex queue did not start: {type(e).__name__}: {e}", "warn")
     commitqueue.init()
@@ -671,6 +840,33 @@ async def _startup() -> None:
     from . import contentkind
     contentkind.init()
     asyncio.create_task(contentkind.watch())
+    # THE SERVICE ITSELF RUNS AT NORMAL I/O PRIORITY, ON PURPOSE.
+    #
+    # The scheduled task that starts nuarr has Task Scheduler's default
+    # priority of 7, and 7 means below-normal CPU *and* LOW I/O - inherited
+    # by every child. Windows starves low-priority I/O outright behind
+    # normal-priority traffic, and a transcode committing, or Plex streaming,
+    # is normal-priority traffic. Measured: the language listener's ffmpeg
+    # read 376 KB of Warehouse 13 S01E10, then sat in a page-in wait for four
+    # minutes with all twenty threads idle, on a disk a PowerShell window
+    # could read the same bytes from in a second. The same starvation applies
+    # to nuarr's own SQLite reads, ffprobe, the library walk and disk_usage -
+    # everything except the encoders, which jobs.py already raises to Normal
+    # explicitly (and lowers again, deliberately, when a viewer is on the
+    # spindle). This makes the rest of the process match what the encoders
+    # already get; the viewer demotion is unchanged.
+    try:
+        import psutil as _ps
+        _me = _ps.Process()
+        _was = _me.ionice()
+        _me.ionice(_ps.IOPRIO_NORMAL)
+        _me.nice(_ps.NORMAL_PRIORITY_CLASS)
+        if _was != _ps.IOPRIO_NORMAL:
+            joblog.log("service I/O priority raised to normal (the scheduled "
+                       "task started it low; encoders are still lowered "
+                       "around viewers)", "debug")
+    except Exception as e:                                   # noqa: BLE001
+        joblog.log(f"could not set the service's I/O priority: {e}", "warn")
     # Lowers encoder disk priority while anyone is watching, so a direct play
     # on a spindle the queue is also using does not have to compete for it.
     asyncio.create_task(jobs.io_priority_watch())
@@ -763,6 +959,10 @@ def _register_schedules() -> None:
       "Tells Plex about files nuarr changed, and checks that it listened.")
     R("plexsync", "Plex agreement check", "Library", plexsync.CYCLE_S,
       "Compares what Plex says each file contains with what it contains.")
+    from . import disktrend as _dt
+    R("disktrend", "Disk trend sampler", "Library", _dt.SAMPLE_S,
+      "Records how full every disk is, so the panel can say which way "
+      "each one is going.")
     R("lifecycle", "Restart / shutdown watcher", "Queue",
       poll(lifecycle, 3), "Carries out a pending stop once the queue is idle.")
 
@@ -1096,6 +1296,8 @@ def api_plex_sessions():
             "lead_disk": 1 if s.get("lead_disk") else 0,
             "lead_full": 1 if s.get("lead_full") else 0,
             "lead_learned": 1 if s.get("lead_learned") else 0,
+            # the wire: what Plex's own TCP connections to this client say
+            "lead_held": 1 if s.get("lead_held") else 0,
             "speed": s.get("speed"),
             "throttled": 1 if str(s.get("throttled") or "0") in ("1", "True", "true") else 0,
             "disk": s.get("disk") or "",
@@ -1197,6 +1399,14 @@ async def _queue_blockers_impl():
         "  FROM jobs j LEFT JOIN files f ON f.id=j.file_id "
         " WHERE j.state='queued' ORDER BY j.priority DESC, j.id LIMIT 40")
     live_ids = {r.get("job_id") for r in (running.get("running") or [])}
+    # Disks under external load, with how much - from the same measurement
+    # the gate steers by, so the row and the gate cannot disagree.
+    hot_ext: dict[str, float] = {}
+    try:
+        for h in gate._busy_now()[0]:
+            hot_ext[h["label"]] = float(h.get("ext_bps") or 0)
+    except Exception:                                        # noqa: BLE001
+        hot_ext = {}
     out = []
     for r in rows:
         pool, disk = r["pool"], r["disk"] or ""
@@ -1231,8 +1441,61 @@ async def _queue_blockers_impl():
             short = f"all {cap} {pool} workers busy"
         elif disk and load.get(disk, 0) >= jobs.COPY_WEIGHT:
             cls = "disk"
-            what = f"{disk} already has a copy running; waiting for it to clear"
-            short = f"{disk} busy — copy running"
+            # WHICH JOB, HOW FAR ALONG, AND WHEN. "busy - copy running" on
+            # sixty-six rows in a column said the same nothing sixty-six
+            # times. The dispatcher's rule is that the next copy on a spindle
+            # starts when the one running there reaches the hand-off mark,
+            # and every number in that sentence is available: the job, its
+            # progress, the mark, and - from the job's own ETA - how long
+            # until it gets there.
+            on_disk = [x for x in (running.get("running") or [])
+                       if (x.get("disk") or x.get("dest_disk")) == disk]
+            need = float((jobs.DISK_WAIT.get(disk) or {}).get("need") or 85.0)
+            lead = max(on_disk, key=lambda x: float(x.get("progress") or 0),
+                       default=None)
+            ext = hot_ext.get(disk)
+            if lead:
+                pct = float(lead.get("progress") or 0)
+                eta = lead.get("eta_s")
+                secs = None
+                if eta and pct < need and pct < 100:
+                    secs = float(eta) * (need - pct) / max(1.0, 100 - pct)
+                # THE ROW IS A GLANCE; THE HOVER IS THE SENTENCE. Sixty rows
+                # each carrying the full title, the rule and the load came
+                # out as "...behind Legends of Tomorrow - S03E08 at 0% ·
+                # starts at 85% · ~4m 5s ·..." cut off mid-word. The row now
+                # holds what changes between rows - disk, the job in the way
+                # by its shortest name, how far, how long - and the rule and
+                # the reason for the crawl live in the tooltip.
+                title = str(lead.get("title") or "a copy")
+                m = re.search(r"S\d{1,2}E\d{1,3}(?:-E\d{1,3})?", title)
+                tag = m.group(0) if m else (title[:22] + ("…" if len(title) > 22 else ""))
+                when = ("" if secs is None else
+                        " · ~" + (f"{int(round(secs / 60))}m" if secs >= 90 else f"{int(secs)}s"))
+                short = f"{disk} · {tag} {pct:.0f}%{when}"
+                what = (f"{disk} has a copy running — {title}, {pct:.0f}%. The "
+                        f"next copy on a spindle starts when the one there "
+                        f"passes {need:.0f}%, so two full-speed reads never "
+                        f"fight over one set of heads"
+                        + (f" — about {int(secs // 60)}m {int(secs % 60)}s at "
+                           f"the current rate." if secs is not None else "."))
+            else:
+                what = f"{disk} already has a copy running; waiting for it to clear"
+                short = f"{disk} · copy running"
+            if ext:
+                short += f" · {ext/1e6:.0f} MB/s elsewhere"
+                what += (f" {disk} is also carrying {ext/1e6:.0f} MB/s that is "
+                         f"not nuarr's — a DrivePool balance, a backup or "
+                         f"another app — so the copy there is slow, and the "
+                         f"queue follows any file that balance moves elsewhere.")
+        elif disk and disk in hot_ext:
+            cls = "hot"
+            ext = hot_ext[disk]
+            what = (f"{disk} is under {ext/1e6:.0f} MB/s from something else "
+                    f"and every queued file is there. It will run, at whatever "
+                    f"the disk has left; if the load is a balance moving files "
+                    f"off, the queue follows them to the quiet disks.")
+            short = f"{disk} · {ext/1e6:.0f} MB/s elsewhere"
         else:
             cls = "next"
             what = "next in line — a worker and its spindle are free"
@@ -2630,6 +2893,9 @@ _MEMO_MAX = 2048
 _AMEMO: dict = {}
 
 
+_AMEMO_FIRST: dict = {}          # key -> the one in-flight first computation
+
+
 async def _amemo_bg(key: str, ttl: float, fn):
     import asyncio as _a
     v = _AMEMO.get(key)
@@ -2646,9 +2912,35 @@ async def _amemo_bg(key: str, ttl: float, fn):
         _a.create_task(_refresh())
     if v:
         return v["v"]
-    r = await fn()
-    _AMEMO[key] = {"at": time.time(), "v": r, "busy": False}
-    return r
+    # THE FIRST COMPUTATION HAPPENS ONCE, HOWEVER MANY ASK. With nothing
+    # cached yet every caller ran fn() for itself: the boot warmer, the page,
+    # a second tab - three 34-second walks on the same thread pool, each
+    # slower for the others, and none of them stored before the next began.
+    # The first caller starts it; everyone else awaits the same future.
+    fut = _AMEMO_FIRST.get(key)
+    if fut is None:
+        fut = _a.get_running_loop().create_future()
+        _AMEMO_FIRST[key] = fut
+        try:
+            r = await fn()
+            _AMEMO[key] = {"at": time.time(), "v": r, "busy": False}
+            fut.set_result(r)
+        except BaseException as e:
+            fut.set_exception(e)
+            raise
+        finally:
+            _AMEMO_FIRST.pop(key, None)
+        return r
+    return await _a.shield(fut)
+
+
+def _amemo_expire(prefix: str) -> None:
+    """Age every background-memo answer under a prefix, so the next ask
+    refreshes it. The old answer is still served meanwhile - the point is
+    to stop a page showing pre-fix numbers for the rest of the TTL."""
+    for k, v in _AMEMO.items():
+        if k.startswith(prefix) and v:
+            v["at"] = 0.0
 
 
 def _memo(key: str, ttl: float, fn):
@@ -2669,9 +2961,32 @@ def _memo(key: str, ttl: float, fn):
     return r
 
 
+@app.get("/api/disktrend")
+def api_disktrend(disk: str):
+    """The charts behind one disk's trend chip. Fetched when hovered."""
+    from . import disktrend
+    return disktrend.series(disk)
+
+
 @app.get("/api/summary")
-def api_summary():
-    return _memo("summary", 5.0, _summary_impl)
+async def api_summary():
+    r"""The dashboard's heartbeat, polled every three seconds.
+
+    SERVED FROM THE LAST ANSWER, REFRESHED BEHIND IT. This used to compute
+    on the request with a five-second memo, which is fine when the database
+    answers in 30 ms and not fine when it does not: measured at 7.3 s per
+    call during a library scan with transcodes committing, which is most of
+    the time this box is doing anything. The memo had expired before the
+    previous computation finished, so every poll paid the whole price, on a
+    worker thread, and the dashboard sat on a spinner while the pool was
+    busy - exactly when somebody is looking at it.
+
+    Now the caller gets the last answer at once and a refresh runs behind
+    it. Same numbers, three seconds older at worst; the first caller after
+    boot still waits once.
+    """
+    return await _amemo_bg("summary", 3.0,
+                           lambda: asyncio.to_thread(_summary_impl))
 
 
 def _summary_impl():
@@ -2703,6 +3018,19 @@ def _summary_impl():
             except OSError:
                 pass
     except Exception:
+        pass
+    # WHICH WAY EACH DISK IS GOING, from the readings disktrend has been
+    # taking. Cheap: the arithmetic is cached a minute and the rows are
+    # already in memory by the second call.
+    pool_trend = None
+    try:
+        from . import disktrend as _dt
+        _tr = _dt.trends({d["pool_disk"]: (d["used"], d["free"])
+                          for d in disks if d.get("used") is not None})
+        for d in disks:
+            d["trend"] = _tr.get(d["pool_disk"])
+        pool_trend = _tr.get("POOL")
+    except Exception:                                        # noqa: BLE001
         pass
     # 'deleted' IS NOT IN THE LIBRARY. These are rows kept for files that are no
     # longer on the pool, and counting them inflated every headline figure: the
@@ -2938,7 +3266,7 @@ def _summary_impl():
             health["top"] = top.get("label") or ""
     except Exception:                                        # noqa: BLE001
         pass
-    return {"states": states, "disks": disks, "libraries": libs,
+    return {"states": states, "disks": disks, "pool_trend": pool_trend, "libraries": libs,
             "health": health,
             "saved": saved, "attention": attention,
             "errors": errors, "error_kinds": err_kinds,
@@ -3594,7 +3922,15 @@ async def api_audiolang(limit: int = Query(400, le=3000)):
             "open": openq[:200],
             "rows": rows,
         }
-    return await asyncio.to_thread(_work)
+    async def _go():
+        out = await asyncio.to_thread(_work)
+        out["computed_at"] = time.time()
+        return out
+    # SERVED FROM THE LAST WALK. 34 seconds on this box, per page open,
+    # and the page opens with "listening…" for all of it. Five minutes of
+    # shelf life; a run or a confirmation expires it so the numbers move
+    # the moment they should.
+    return await _amemo_bg(f"audiolang:{limit}", 5 * 60, _go)
 
 
 @app.post("/api/audiolang/check")
@@ -3605,6 +3941,7 @@ async def api_audiolang_check(file_id: int, track: int = 0,
     Also in the heavy lane: it loads the same model as the test button, so
     the same "not while something else has a model open" rule applies.
     """
+    _amemo_expire("audiolang:")
     from . import heavy
 
     def _work():
@@ -4236,6 +4573,7 @@ async def api_audiolang_test():
 @app.post("/api/audiolang/run")
 async def api_audiolang_run(limit: int = Query(400, le=5000)):
     """Listen to everything outstanding now, rather than waiting for the timer."""
+    _amemo_expire("audiolang:")
     from . import audiolang as _al
     if not _al.available():
         return {"ok": False, "error": "detection is not installed"}
@@ -4254,6 +4592,7 @@ async def api_audiolang_confirm(file_id: int, track: int, code: str):
     could not settle, and a person who has watched the episode knows something
     the model does not.
     """
+    _amemo_expire("audiolang:")
     def _work():
         from . import audiolang as _al
         with cursor() as cur:
@@ -4283,6 +4622,7 @@ async def api_audiolang_set(file_id: int, track: int, code: str):
     The choice is recorded with confidence 1.0 and a why that names it as
     manual, so the page never presents a human decision as a measurement.
     """
+    _amemo_expire("audiolang:")
     def _work():
         from . import audiolang as _al
         with cursor() as cur:
@@ -4350,6 +4690,7 @@ async def api_audiolang_apply(file_id: int, track: int, code: str,
     overruling it stays a deliberate, per-file act taken by a person who has
     looked at the evidence on screen.
     """
+    _amemo_expire("audiolang:")
     def _work():
         from . import audiolang
         with cursor() as cur:
@@ -4767,6 +5108,7 @@ def api_health():
     PAGE = {"arrsync": "Arrs", "audiotitle": "Audio codec", "arrgap": "Libraries",
             "libs": "Libraries", "arrs": "Arrs", "lang": "Subtitles",
             "subsync": "Subtitles", "plexsync": "Plex",
+            "drivepool": "DrivePool",
             "notland": "Still not landed", "counts": "Counts", "logs": "Logs",
             "ocr": "OCR engines", "ruleschk": "Rule check"}
 
@@ -4848,6 +5190,22 @@ def api_health():
     except Exception as e:                                   # noqa: BLE001
         add("subsync", "Files that do not match the subtitle rules", "subsync",
             0,
+            f"check unavailable: {type(e).__name__}", warn=True)
+
+    try:
+        from . import drivepool as _dp
+        st_dp = _dp.status()
+        if st_dp.get("installed"):
+            acts = list(st_dp.get("active") or {})
+            hold_on = [k for k in ("jobs", "commits", "renames")
+                       if (st_dp.get("holds") or {}).get(k, {}).get("on")]
+            add("drivepool", "Is DrivePool moving data?", "drivepool", 0,
+                ((", ".join(st_dp["active"][a]["text"] for a in acts)
+                  + (" - holding " + ", ".join(hold_on) if hold_on else ""))
+                 if acts else "idle - the pool is not being rearranged"),
+                running=bool(acts), warn=False)
+    except Exception as e:                                   # noqa: BLE001
+        add("drivepool", "Is DrivePool moving data?", "drivepool", 0,
             f"check unavailable: {type(e).__name__}", warn=True)
 
     try:
@@ -5065,16 +5423,29 @@ async def api_arrsync_mode(mode: str):
 
 @app.get("/api/arrlang")
 async def api_arrlang(limit: int = 400):
-    """Arr records whose language field disagrees with the file. Read-only."""
-    from . import arrlang
-    out = await arrlang.scan(limit=max(1, min(int(limit), 5000)))
-    out["rows"] = out["rows"][:200]        # the page shows a sample
-    return out
+    """Arr records whose language field disagrees with the file. Read-only.
+
+    Served from the last pass and refreshed behind the caller: the pass asks
+    the arrs about every record and ran past a minute here, per page open.
+    Fifteen minutes is the same shelf life the rename plan gets, for the
+    same reason - it is a statement about the arrs' library, which changes
+    on the timescale of imports. A fix expires it at once.
+    """
+    limit = max(1, min(int(limit), 5000))
+
+    async def _go():
+        from . import arrlang
+        out = await arrlang.scan(limit=limit)
+        out["rows"] = out["rows"][:200]        # the page shows a sample
+        out["computed_at"] = time.time()
+        return out
+    return await _amemo_bg(f"arrlang:{limit}", 15 * 60, _go)
 
 
 @app.post("/api/arrlang/fix")
 async def api_arrlang_fix():
     """Set every mismatched record's languages to what its file contains."""
+    _amemo_expire("arrlang:")
     from . import arrlang
     found = await arrlang.scan()
     res = await arrlang.fix(found["rows"])
@@ -5282,6 +5653,18 @@ async def api_plex_queue_retry(all: bool = False):
             cur.execute("UPDATE plex_queue SET next_try_at=? "
                         "WHERE done_at IS NULL", (time.time(),))
     return await plexqueue.run_due(limit=200)
+
+
+@app.post("/api/plex/queue/requeue")
+async def api_plex_queue_requeue(file_id: int | None = None,
+                                 stuck: bool = True):
+    """Put a gave-up row (or all of them) back on the ladder, then run."""
+    from . import plexqueue
+    n = plexqueue.requeue(file_id, stuck_only=stuck)
+    joblog.log(f"Plex catch-up: {n} file(s) put back on the ladder by hand",
+               "info")
+    r = await plexqueue.run_due(limit=200)
+    return {"ok": True, "reopened": n, "run": r}
 
 
 @app.get("/api/plexsync")
@@ -5892,7 +6275,16 @@ def api_subocr_update():
 
 @app.get("/api/subocr/preview")
 def api_subocr_preview(limit: int = 25):
-    """Which files the subtitle converter would take, and why. Read-only."""
+    """Which files the subtitle converter would take, and why. Read-only.
+
+    Memoised for a minute: the answer is a walk over every stored probe
+    (4 s here) and the page asks for it on every visit.
+    """
+    return _memo(f"subocr_preview:{limit}", 60.0,
+                 lambda: _subocr_preview_impl(limit))
+
+
+def _subocr_preview_impl(limit: int = 25):
     from . import subocr
     rows, files, tracks, byt = [], 0, 0, 0
     for r in _rows("SELECT p.file_id, p.json, f.path, f.title, f.size, f.library "
@@ -6145,7 +6537,7 @@ def api_files(state: str | None = None, library: str | None = None,
     # call; the arr round trip only happens once the user asks for the plan.
     for r in rows:
         if r.get("state") in ("error", "blocked"):
-            kind, why = refetch.classify(r.get("state_reason"))
+            kind, why = refetch.classify(r.get("state_reason"), r.get("path"))
             r["refetch_kind"] = kind
             r["refetch_why"] = why
 
@@ -6471,6 +6863,13 @@ async def _run_scan_locked(library: str | None = None) -> None:
         joblog.log(f"  found {int(getattr(rep, 'on_disk', 0) or 0):,} files on "
                    f"{int(getattr(rep, 'disks', 0) or 0)} disks; "
                    f"{promoted:,} promoted to eligible", "ok", scan_id)
+        # The scan is the process's memory peak; give the peak back. See
+        # system.trim_working_set for the measurements behind this.
+        if not library:
+            try:
+                await asyncio.to_thread(system.trim_working_set, "the library scan")
+            except Exception:                                # noqa: BLE001
+                pass
     except Exception as e:
         STATE["scan"]["error"] = f"{type(e).__name__}: {e}"
         STATE["scan"]["phase"] = "failed"
@@ -6631,6 +7030,19 @@ SETTLE_POLL_S = 60.0
 SETTLE_FAST_S = 4.0
 
 
+async def _memory_keeper() -> None:
+    """Every half hour: if resident memory has drifted well past what is in
+    use and no job is running, hand the untouched pages back."""
+    await asyncio.sleep(600)
+    while True:
+        try:
+            if not jobs.RUNNING and not STATE["scan"]["running"]:
+                await asyncio.to_thread(system.trim_if_bloated, 400.0, 1800.0, "an idle half hour")
+        except Exception:                                    # noqa: BLE001
+            pass
+        await asyncio.sleep(1800)
+
+
 async def _scan_scheduler() -> None:
     """Run a library scan on a timer.
 
@@ -6648,6 +7060,19 @@ async def _scan_scheduler() -> None:
         if every <= 0:
             await asyncio.sleep(60)   # disabled - re-read in case it changes
             continue
+        # WITH CHANGE TRACKING HEALTHY THE FULL SCAN IS A BACKSTOP. Every
+        # pool disk is watched and each change already triggers a rescan of
+        # its library, so the full pass stretches to changewatch's own
+        # interval (12 h by default). A watcher that died or lost its
+        # backlog drops straight back to the configured cadence.
+        try:
+            from . import changewatch as _cw
+            if _cw.healthy():
+                every = max(every, _cw.full_every_min())
+            elif _cw.STATE.get("overflow_at") and time.time() - _cw.STATE["overflow_at"] < 3600:
+                every = min(every, 30)          # events were lost - look soon
+        except Exception:                                    # noqa: BLE001
+            pass
         last = STATE["scan"].get("last") or 0
         due = last + every * 60
         wait = max(30.0, due - time.time())
@@ -6660,6 +7085,32 @@ async def _scan_scheduler() -> None:
             joblog.log(f"scheduled scan failed: {type(e).__name__}: {e}", "error")
 
 
+@app.get("/api/changewatch")
+def api_changewatch():
+    from . import changewatch
+    return changewatch.status()
+
+
+@app.post("/api/changewatch/toggle")
+def api_changewatch_toggle(on: int = 1, full_every_min: int | None = None):
+    from .db import kv_set
+    from . import changewatch
+    kv_set("changewatch.enabled", "1" if on else "0")
+    if full_every_min is not None:
+        kv_set("changewatch.full_every_min", str(max(60, int(full_every_min))))
+    if on:
+        changewatch.start()
+    return changewatch.status()
+
+
+@app.post("/api/files/{file_id}/adopt")
+async def api_adopt_now(file_id: int):
+    """Ask the arr to take this file now: rescan, then manual import."""
+    from . import adopter
+    outcome, detail = await adopter.adopt_now(file_id)
+    return {"ok": outcome == "adopted", "outcome": outcome, "detail": detail}
+
+
 @app.post("/api/scan")
 async def api_scan():
     if STATE["scan"]["running"]:
@@ -6670,6 +7121,35 @@ async def api_scan():
 
 _RENAMES_CACHE: dict = {"rows": [], "at": 0.0, "running": False, "arr": None}
 _RENAMES_TTL = 900.0          # 15 min; the arrs' own libraries move slower
+
+
+async def _renames_refresh(arr: str | None = None) -> None:
+    """Rebuild the rename plan cache in the background; never raises."""
+    try:
+        await api_renames(arr=arr, limit=None, refresh=True)
+    except Exception as e:                                   # noqa: BLE001
+        joblog.log(f"rename plan refresh: {type(e).__name__}: {e}", "warn")
+    finally:
+        _RENAMES_CACHE["busy"] = False
+
+
+async def _slow_pages_warm() -> None:
+    """Build the two slow read-only pages once after boot, off the request."""
+    await asyncio.sleep(150)
+    for fn in (lambda: asyncio.to_thread(_act_index),
+               lambda: api_audiolang(400), lambda: api_arrlang(400)):
+        try:
+            await fn()
+        except Exception as e:                               # noqa: BLE001
+            joblog.log(f"warming a page: {type(e).__name__}: {e}", "debug")
+        await asyncio.sleep(30)
+
+
+async def _renames_warm() -> None:
+    """Build the first rename plan after boot so nobody pays for it in a page."""
+    await asyncio.sleep(120)
+    _RENAMES_CACHE["busy"] = True
+    await _renames_refresh(None)
 
 
 @app.get("/api/renames")
@@ -6689,11 +7169,24 @@ async def api_renames(arr: str | None = None, limit: int | None = None,
     is live. `refresh=true` forces a fresh pass.
     """
     now = time.time()
-    fresh_enough = (not refresh
-                    and _RENAMES_CACHE["rows"] is not None
-                    and _RENAMES_CACHE["at"]
-                    and _RENAMES_CACHE["arr"] == arr
+    have = (_RENAMES_CACHE["rows"] is not None and _RENAMES_CACHE["at"]
+            and _RENAMES_CACHE["arr"] == arr and limit is None)
+    fresh_enough = (not refresh and have
                     and (now - _RENAMES_CACHE["at"]) < _RENAMES_TTL)
+    # STALE IS SERVED, NOT RECOMPUTED IN FRONT OF THE CALLER. The pass is 88
+    # to 120 seconds of the arrs' API. When the fifteen minutes ran out the
+    # next person to open the page paid for all of it - and after a restart
+    # the first person paid it with nothing to look at. The old plan goes
+    # back immediately with its age on it, and a fresh one is built behind.
+    if have and not fresh_enough and not refresh:
+        if not _RENAMES_CACHE.get("busy"):
+            _RENAMES_CACHE["busy"] = True
+            asyncio.create_task(_renames_refresh(arr))
+        return {"count": len(_RENAMES_CACHE["rows"]),
+                "rows": _RENAMES_CACHE["rows"], "cached": True,
+                "refreshing": True,
+                "age_s": round(now - _RENAMES_CACHE["at"]),
+                "ttl_s": int(_RENAMES_TTL)}
     if fresh_enough:
         return {"count": len(_RENAMES_CACHE["rows"]),
                 "rows": _RENAMES_CACHE["rows"],
@@ -7257,7 +7750,57 @@ async def api_ffmpeg_repair(confirm: bool = False, background: bool = True):
 # Measured verdicts only: no driver-branch numbers anywhere on this surface.
 # See enctest.py's module docstring for the rule it enforces.
 
-_ACT_COUNT: dict = {}          # {search term: (when, group count)}
+
+
+_ACT_IDX: dict = {"at": 0.0, "rows": []}
+
+
+def _act_index() -> list[tuple[str, float]]:
+    r"""Every title ever touched, newest activity first. Cached a minute.
+
+    WHAT WAS SLOW, AND WHY A CACHE IS THE RIGHT SHAPE. The page grouped the
+    whole of jobs and history - 305,000 rows - on every page turn and every
+    keystroke, to produce this list of 39,000 titles and take fifty of them.
+    150 ms idle and 4.7 s with the pool busy, per keystroke.
+
+    The list itself changes when a job finishes or a file is renamed, on the
+    order of once a minute, so it is built once a minute and searched here.
+    A substring search over 39,000 strings is single-digit milliseconds; a
+    page is a slice. The build reads each table's (title, time) index
+    covering-only, so it never touches a row: 84 ms, once, off the request.
+    """
+    now = time.time()
+    have = _ACT_IDX["rows"]
+    if have and now - _ACT_IDX["at"] < 60:
+        return have
+    # REBUILT BEHIND THE CALLER ONCE THERE IS SOMETHING TO SERVE. The rebuild
+    # is 370 ms alone and over a second on the live box, and it landed on
+    # whoever happened to turn a page in the minute it fell due - which read
+    # as the page being slow rather than the clock ticking over.
+    if have:
+        if not _ACT_IDX.get("busy"):
+            _ACT_IDX["busy"] = True
+            import threading
+            threading.Thread(target=_act_index_build, name="act-index",
+                             daemon=True).start()
+        return have
+    return _act_index_build()
+
+
+def _act_index_build() -> list[tuple[str, float]]:
+    try:
+        rows = _rows(
+            "WITH j AS (SELECT title t, MAX(finished_at) last FROM jobs "
+            "           WHERE finished_at IS NOT NULL GROUP BY title), "
+            "     h AS (SELECT label t, MAX(at) last FROM history GROUP BY label), "
+            "     u AS (SELECT COALESCE(NULLIF(t,''),'-') t, last FROM j "
+            "           UNION ALL SELECT COALESCE(NULLIF(t,''),'-') t, last FROM h) "
+            "SELECT t, MAX(last) last FROM u GROUP BY t ORDER BY last DESC, t")
+        out = [(r["t"], r["last"] or 0) for r in rows]
+        _ACT_IDX.update(at=time.time(), rows=out)
+        return out
+    finally:
+        _ACT_IDX["busy"] = False
 
 
 @app.get("/api/activity")
@@ -7274,49 +7817,57 @@ def api_activity(q: str = "", page: int = 1, page_size: int = 50):
     exact {ts, job} / {ts, ev} shape the panel already renders - the grouping,
     pill and drop-down code downstream is untouched.
 
-    It is deliberately NOT what the 2 s poll calls: a GROUP BY across both
-    tables is far too heavy to run every two seconds to answer a question
-    ("has anything new happened") the cheap poll already answers. The panel
-    uses this only once you search or page.
+    The title list comes from _act_index() and the search runs over it in
+    memory; the database is only asked for the fifty titles on the page.
     """
     page = max(1, int(page or 1))
     page_size = max(1, min(int(page_size or 50), 200))
     off = (page - 1) * page_size
-    like = f"%{(q or '').strip()}%"
-    has_q = bool((q or '').strip())
+    needle = (q or "").strip().lower()
 
-    # One combined title index across both tables, so a file whose only recent
-    # activity was a rename still appears.
-    base = ("SELECT COALESCE(NULLIF(j.title,''),'-') t, j.finished_at ts "
-            "  FROM jobs j WHERE j.finished_at IS NOT NULL "
-            "UNION ALL "
-            "SELECT COALESCE(NULLIF(h.label,''),'-') t, h.at ts FROM history h")
-    where = "WHERE t LIKE ?" if has_q else ""
-    args: list = [like] if has_q else []
-
-    # COUNTING THE GROUPS IS THE EXPENSIVE HALF and its answer barely moves:
-    # it is "how many distinct titles have ever been touched", which changes
-    # when a new file is processed, not when you turn a page. Cached briefly so
-    # paging and typing do not re-scan both tables for a number that is only
-    # there to size the pager.
-    ck = (q or "").strip().lower()
-    hit = _ACT_COUNT.get(ck)
-    if hit and time.time() - hit[0] < 60:
-        total = hit[1]
-    else:
-        total = _rows(f"SELECT COUNT(*) n FROM (SELECT t FROM ({base}) {where} "
-                      f"GROUP BY t)", tuple(args))[0]["n"]
-        _ACT_COUNT[ck] = (time.time(), total)
-        if len(_ACT_COUNT) > 64:                 # keep the cache from growing
-            for k in list(_ACT_COUNT)[:32]:
-                _ACT_COUNT.pop(k, None)
-    grp = _rows(f"SELECT t, MAX(ts) last FROM ({base}) {where} "
-                f"GROUP BY t ORDER BY last DESC LIMIT ? OFFSET ?",
-                tuple(args + [page_size, off]))
-    titles = [r["t"] for r in grp]
+    idx = _act_index()
+    if needle:
+        idx = [x for x in idx if needle in x[0].lower()]
+    total = len(idx)
+    titles = [t for t, _ in idx[off:off + page_size]]
     items: list[dict] = []
     if titles:
-        ph = ",".join("?" * len(titles))
+        # RAW COLUMN, SO THE INDEX IS USED. Matching on
+        # COALESCE(NULLIF(title,''),'-') made both of these a full scan with
+        # a window function over it - 305,000 rows to fetch fifty titles.
+        # The '-' group is the untitled rows, asked for as such.
+        named = [t for t in titles if t != "-"]
+        ph = ",".join("?" * len(named))
+        cond_j = f"title IN ({ph})" if named else "0"
+        cond_h = f"label IN ({ph})" if named else "0"
+        # THE UNTITLED GROUP IS TENS OF THOUSANDS OF ROWS, AND ONLY SIXTY
+        # ARE WANTED. Putting it through the window function meant numbering
+        # every one of them to keep the newest sixty - 280 ms on page one,
+        # which is the page everybody opens. Asked for directly, newest
+        # first with a LIMIT, the (label, at) index hands over sixty rows
+        # and stops. Two asks per table because NULL and '' are two index
+        # ranges; merged and trimmed here.
+        if "-" in titles:
+            for cond in ("title IS NULL", "title=''"):
+                for r in _rows(
+                        f"SELECT job_id, file_id, title, path, kind, pool, "
+                        f"       state, size_before, size_after, error, "
+                        f"       finished_at, plan_json, result_json "
+                        f"  FROM jobs WHERE finished_at IS NOT NULL AND {cond} "
+                        f" ORDER BY finished_at DESC LIMIT 60"):
+                    d = dict(r)
+                    d["file_size"] = d.get("size_after") or d.get("size_before") or 0
+                    items.append({"ts": d.get("finished_at") or 0, "job": d})
+            for cond in ("label IS NULL", "label=''"):
+                for r in _rows(
+                        f"SELECT id, file_id, event, detail, at, label FROM history "
+                        f" WHERE {cond} ORDER BY at DESC LIMIT 60"):
+                    items.append({"ts": r["at"] or 0, "ev": dict(r)})
+            untitled = [x for x in items if not ((x.get("job") or x.get("ev") or {}).get("title")
+                                                or (x.get("ev") or {}).get("label"))]
+            untitled.sort(key=lambda x: -x["ts"])
+            keep = set(id(x) for x in untitled[:60])
+            items = [x for x in items if id(x) in keep]
         # PER TITLE, NOT PER PAGE. A flat LIMIT returned 4,000 rows for ten
         # groups - a handful of much-reprocessed files ate the whole budget and
         # the rest of the page came back empty. ROW_NUMBER caps each file's
@@ -7328,9 +7879,8 @@ def api_activity(q: str = "", page: int = 1, page_size: int = 50):
                 f"       finished_at, plan_json, result_json, "
                 f"       ROW_NUMBER() OVER (PARTITION BY title "
                 f"           ORDER BY finished_at DESC) rn "
-                f"  FROM jobs WHERE finished_at IS NOT NULL "
-                f"   AND COALESCE(NULLIF(title,''),'-') IN ({ph})) "
-                f" WHERE rn <= 60", tuple(titles)):
+                f"  FROM jobs WHERE finished_at IS NOT NULL AND ({cond_j})) "
+                f" WHERE rn <= 60", tuple(named)):
             d = dict(r)
             d.pop("rn", None)
             d["file_size"] = d.get("size_after") or d.get("size_before") or 0
@@ -7339,8 +7889,8 @@ def api_activity(q: str = "", page: int = 1, page_size: int = 50):
                 f"SELECT * FROM (SELECT id, file_id, event, detail, at, label, "
                 f"       ROW_NUMBER() OVER (PARTITION BY label "
                 f"           ORDER BY at DESC) rn FROM history "
-                f" WHERE COALESCE(NULLIF(label,''),'-') IN ({ph})) "
-                f" WHERE rn <= 60", tuple(titles)):
+                f" WHERE {cond_h}) "
+                f" WHERE rn <= 60", tuple(named)):
             d = dict(r)
             d.pop("rn", None)
             items.append({"ts": d.get("at") or 0, "ev": d})
@@ -7372,11 +7922,13 @@ def api_attention(limit: int = 400):
             "SELECT id, path, title, state_reason FROM files "
             "WHERE state='error' ORDER BY COALESCE(processed_at,0) DESC "
             "LIMIT ?", (limit,)):
+        kind, why = refetch.classify(r["state_reason"], r["path"])
         out.append({"source": "file errors", "id": r["id"],
                     "title": r["title"] or os.path.basename(r["path"] or ""),
                     "path": r["path"] or "",
                     "detail": r["state_reason"] or "the job failed",
-                    "goto": "", "act": "errors"})
+                    "goto": "", "act": "errors",
+                    "refetch_kind": kind, "refetch_why": why})
 
     for r in rows(
             "SELECT h.file_id, h.rule, h.detail, h.state, h.attempts, h.path, "
@@ -7385,11 +7937,13 @@ def api_attention(limit: int = 400):
             " WHERE h.state NOT IN ('fixed','gone') "
             " ORDER BY h.last_at DESC LIMIT ?",
             (limit,)):
+        nm = refetch.not_media(r["path"])
         out.append({"source": "rule check", "id": r["file_id"],
                     "title": r["title"] or os.path.basename(r["path"] or ""),
                     "path": r["path"] or "",
                     "detail": f"breaks {r['rule']} — {r['detail'] or ''}".strip(" —"),
-                    "goto": "/settings#ruleschk", "act": ""})
+                    "goto": "/settings#ruleschk", "act": "",
+                    "refetch_kind": "content" if nm else "", "refetch_why": nm or ""})
 
     for r in rows(
             "SELECT a.file_id, f.path, f.title, f.audio_langs FROM audio_lang a "
@@ -7399,12 +7953,14 @@ def api_attention(limit: int = 400):
             "   AND (f.audio_langs = '-' OR f.audio_langs LIKE '-,%' "
             "        OR f.audio_langs LIKE '%,-' OR f.audio_langs LIKE '%,-,%') "
             " LIMIT ?", (limit,)):
+        nm = refetch.not_media(r["path"])
         out.append({"source": "audio language", "id": r["file_id"],
                     "title": r["title"] or os.path.basename(r["path"] or ""),
                     "path": r["path"] or "",
-                    "detail": "an audio track has no language and listening "
-                              "gave no confident answer",
-                    "goto": "/settings#alang", "act": ""})
+                    "detail": nm or ("an audio track has no language and "
+                                     "listening gave no confident answer"),
+                    "goto": "/settings#alang", "act": "",
+                    "refetch_kind": "content" if nm else "", "refetch_why": nm or ""})
 
     try:
         st = arrhealth.STATE
@@ -7521,8 +8077,11 @@ def api_ffmpeg_rollback(force: bool = False):
 
 
 @app.get("/api/diag/memory")
-def api_diag_memory():
+def api_diag_memory(deep: int = 0, top: int = 25, who: str = "", trim: int = 0):
     """Sizes of every long-lived in-memory structure, plus process RSS.
+
+    ?deep=1 walks every live object for a type histogram and the deep size
+    of each named cache - a second or two on a 40,000-file library.
 
     A leak in a long-running server is only visible as growth over time, and
     guessing which dict is to blame is how you end up rewriting the wrong one.
@@ -7531,7 +8090,15 @@ def api_diag_memory():
     import gc
     import psutil
 
+    if deep:
+        return _diag_memory_deep(top, who)
     p = psutil.Process()
+    if trim:
+        # EXPERIMENT: hand every page not currently in use back to the OS and
+        # report RSS before/after. Pages that are touched again simply come
+        # back, so a big drop that STAYS low means the memory was a
+        # high-water mark from a scan, not anything alive.
+        return system.trim_working_set("a request from the diagnostics endpoint")
     live = joblog._LIVE
     return {
         "rss_mb": round(p.memory_info().rss / 1024 ** 2, 1),
@@ -8731,6 +9298,24 @@ async def api_gate():
                            "starving_disks": starving}
 
 
+@app.get("/api/drivepool")
+def api_drivepool():
+    """What DrivePool is doing, what nuarr is holding for it, and the switches."""
+    from . import drivepool
+    return drivepool.status()
+
+
+@app.post("/api/drivepool/toggle")
+async def api_drivepool_toggle(key: str, on: bool):
+    from . import drivepool
+    if key not in drivepool.DEFAULTS:
+        raise HTTPException(400, f"unknown DrivePool setting '{key}'")
+    gate.set_toggle(key, on)
+    joblog.log(f"DrivePool: {key.split('.', 1)[1]} "
+               f"{'on' if on else 'off'}", "info")
+    return {"ok": True, "status": drivepool.status()}
+
+
 @app.post("/api/gate/toggle")
 async def api_gate_toggle(key: str, on: bool):
     if key not in gate.DEFAULTS:
@@ -8788,6 +9373,49 @@ INDEX = r"""
      out, so every responsive rule below is measured against a width the device
      does not have and none of them ever fire. -->
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<script>
+/* MOBILE OR DESKTOP - decided before the first paint, so nothing reflows.
+   A phone is a mobile browser (UA says Mobi/Android/iPhone, or the screen
+   has touch points) laid out narrower than 820 CSS px. "Desktop site" in a
+   mobile browser fails both tests on purpose: it sends a desktop UA and lays
+   the page out ~980 px wide, so the desktop layout comes back by itself.
+   A manual choice (the server menu) is kept in localStorage; "auto" forgets it. */
+(function(){
+  function want(){
+    var o=null; try{ o=localStorage.getItem('nuarr.view'); }catch(e){}
+    if(o==='mobile') return true;
+    if(o==='desktop') return false;
+    var ua=navigator.userAgent||'';
+    var mob=/Mobi|Android|iPhone|iPod|Silk|Opera Mini/i.test(ua) || (navigator.maxTouchPoints||0)>1;
+    // The LAYOUT viewport, not innerWidth: when a page overflows sideways a
+    // phone zooms out and innerWidth reports the zoomed width (1240 here on
+    // /settings), which read as a desktop. clientWidth stays at the device
+    // width under the viewport meta - and is ~980 under "Desktop site".
+    var w=(document.documentElement&&document.documentElement.clientWidth)||window.innerWidth||9999;
+    return mob && w<=820;
+  }
+  function apply(){
+    var on=want();
+    document.documentElement.classList.toggle('mobile', on);
+    // wide-mobile: an unfolded Galaxy Z Fold (~742 CSS px), a small tablet -
+    // still touch, still one column of panels, but room for four tiles.
+    var w2=(document.documentElement&&document.documentElement.clientWidth)||window.innerWidth||0;
+    document.documentElement.classList.toggle('wide', on && w2>=640);
+    var b=document.getElementById('viewBtn');
+    if(b){ var o=null; try{ o=localStorage.getItem('nuarr.view'); }catch(e){}
+      b.textContent=(on?'Switch to desktop view':'Switch to mobile view')+(o?' (manual)':''); }
+    var a=document.getElementById('viewAuto'); if(a) a.style.display=(function(){ try{ return localStorage.getItem('nuarr.view')?'':'none'; }catch(e){ return 'none'; } })();
+  }
+  apply();
+  window.addEventListener('resize', apply);
+  window.addEventListener('orientationchange', apply);
+  window.addEventListener('DOMContentLoaded', apply);
+  window.nuarrView=function(mode){
+    try{ if(mode==='auto') localStorage.removeItem('nuarr.view'); else localStorage.setItem('nuarr.view', mode); }catch(e){}
+    apply();
+  };
+})();
+</script>
 <style>
 :root{--bg:#0f1216;--panel:#171b21;--line:#242a33;--fg:#e6e9ef;--dim:#8b95a5;
       --ok:#3fb950;--warn:#d29922;--bad:#f85149;--acc:#58a6ff;
@@ -9030,6 +9658,34 @@ tr.logdrop td{padding:0 0 8px 0;background:#1c2129;border-bottom:1px solid var(-
    not the readout. */
 /* The scan bar. Wider and taller than the per-row queue bar because it IS the
    readout here - there is no number beside it doing the real work. */
+.dplist{margin-top:8px;border:1px solid var(--line);border-radius:6px;padding:2px 9px}
+.baltab{margin-top:8px;font-size:12.5px;font-variant-numeric:tabular-nums}
+.balrow{display:grid;grid-template-columns:104px minmax(180px,1fr) 60px 54px 78px 190px 86px 86px 110px 100px;gap:10px;align-items:center;padding:3px 0}
+.balm{white-space:normal !important}
+.balhead{font-size:10.5px;letter-spacing:.05em;text-transform:uppercase;color:#8b98a6;padding-bottom:4px;border-bottom:1px solid var(--line);margin-bottom:3px}
+.balhead .balbar{height:14px}
+.baln{font-family:ui-monospace,monospace;text-align:right;white-space:nowrap}
+.balbar{position:relative;height:13px;background:#1b212a;border-radius:3px;overflow:visible}
+.balbar i{position:absolute;top:0;bottom:0;display:block}
+.balfill{left:0;border-radius:3px;opacity:.85}
+.balavg{width:0;border-left:1px dashed #c9d1d9;opacity:.8}
+.baltgt{width:2px;margin-left:-1px;top:-3px !important;bottom:-3px !important;background:#e6edf3;border-radius:1px;box-shadow:0 0 0 1px #0d1117}
+.balglow{left:0;right:0;border-radius:3px;pointer-events:none;opacity:.55;animation:balpulse 1.6s ease-in-out infinite}
+.bal-in  .balglow{box-shadow:0 0 6px 2px rgba(210,153,34,.75), inset 0 0 8px rgba(210,153,34,.35)}
+.bal-out .balglow{box-shadow:0 0 6px 2px rgba(121,192,255,.75), inset 0 0 8px rgba(121,192,255,.35)}
+.bal-in  .balfill{background:var(--warn) !important;opacity:.95}
+.bal-out .balfill{background:#79c0ff !important;opacity:.95}
+.bal-in  .baln,.bal-out .baln{font-weight:700}
+@keyframes balpulse{0%,100%{opacity:.35}50%{opacity:.85}}
+@media (prefers-reduced-motion:reduce){.balglow{animation:none;opacity:.6}}
+.balp,.bald,.bals,.balm,.balr,.bale,.balrd,.balwr{white-space:nowrap}
+.balp,.bald,.balrd,.balwr{text-align:right}
+.bale{text-align:right}
+.dprow{display:grid;grid-template-columns:104px 120px 1fr 190px;gap:10px;align-items:baseline;padding:5px 0;font-size:13px;border-top:1px solid var(--line)}
+.dprow:first-child{border-top:0}
+.dprow .dpl{font-size:11px;letter-spacing:.05em;text-transform:uppercase;color:#8b98a6}
+.dprow .dpd{font-weight:700;white-space:nowrap}
+.dprow .dpe{text-align:right;white-space:nowrap}
 .gapscanbar,.pxsbar{height:6px;border-radius:3px;background:#1b212a;
   overflow:hidden}
 .pxsbar > i{display:block;height:100%;border-radius:3px;
@@ -9071,6 +9727,13 @@ tr.logdrop td{padding:0 0 8px 0;background:#1c2129;border-bottom:1px solid var(-
    the row overrides below applied to the rows only, and the labels drifted:
    "Keeps" ended up above the Disk column while its values sat next to
    Changes. Scoped to the card instead of to the scroller, so both get them. */
+#pxsCard .qrow .qact{flex:0 0 66px;text-align:right}
+#pxsCard .qrow .qwork{flex:0 0 58px}
+#pxsCard .qrow .qwhy{flex:1 1 160px;text-align:left;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+#pxsCard .qrow .qsrc{flex:0 0 76px}
+#pxsCard .qrow .qsrc .pill{line-height:15px;padding:0 6px;font-size:9px}
+#pxsCard .flist{border:1px solid var(--line);border-radius:6px}
 #gapCard .qrow{padding-left:28px}
 #gapCard .qrow .qwhy{flex:1 1 150px;text-align:left}
 #gapCard .qrow .qsrc{flex:0 0 76px}
@@ -9464,6 +10127,7 @@ button.on{border-color:var(--ok);color:var(--ok)}
 .diskio .io-j{color:var(--dim);font-size:10px;padding-left:2px}
 /* Eleven idle rows should not shout as loudly as the one that is working. */
 .diskio .io-idle{color:#525c6b;font-size:10.5px;letter-spacing:.4px}
+.diskio .io-hold{color:var(--warn);font-weight:700;font-size:10.5px;letter-spacing:.3px}
 /* HOW BUSY THE SPINDLE IS, as a number and as a bar in the same chip.
    The number alone made twelve rows a column of percentages you had to read
    one at a time; the bar alone loses the value. Together the column can be
@@ -9506,6 +10170,35 @@ button.on{border-color:var(--ok);color:var(--ok)}
   text-decoration:underline dotted;text-underline-offset:2px}
 .fill-hi{color:var(--warn)}
 .fill-lo{color:#79c0ff}
+/* which way the disk is going - same two colours as fuller/emptier */
+.trend{display:inline-flex;align-items:center;gap:5px;font-size:11px;
+  vertical-align:middle;
+  font-weight:500;white-space:nowrap;cursor:help;letter-spacing:.01em}
+.trend.t-up{color:var(--warn)}
+.trend.t-down{color:#79c0ff}
+.trend.t-flat{color:#8b949e}
+.trend.t-none{color:#6e7681;font-weight:400}
+.tpop{position:absolute;z-index:60;width:324px;background:var(--panel,#161b22);
+  border:1px solid var(--line);border-radius:8px;padding:9px 11px 8px;
+  box-shadow:0 8px 24px rgba(0,0,0,.45);font-size:11.5px;line-height:1.5}
+.tpop-h{font-weight:600;margin-bottom:3px}
+.jpop{width:360px}
+.jpop-job{border-top:1px solid var(--line);padding:6px 0 5px}
+.jpop-t{display:flex;gap:6px;align-items:center;overflow:hidden}
+.jpop-t b{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.jpop-plan{font-size:10.5px;line-height:1.3;margin-top:1px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.jpop-l{font-size:11px;font-variant-numeric:tabular-nums}
+.jpop-l.dim2{opacity:.85}
+.tpop-n{margin-bottom:6px;font-variant-numeric:tabular-nums}
+.tpop-chart{margin-top:5px}
+.tpop-lab{display:flex;justify-content:space-between;font-size:10.5px;margin-bottom:1px}
+.tpop-chart svg{display:block;width:100%;height:auto}
+.tpop-chart .line{fill:none;stroke:#c2ccd6;stroke-width:1.4;stroke-linejoin:round}
+.tpop-chart .area{fill:#c2ccd6;opacity:.10}
+.tpop-chart.up .line{stroke:var(--warn)}   .tpop-chart.up .area{fill:var(--warn)}
+.tpop-chart.down .line{stroke:#79c0ff}     .tpop-chart.down .area{fill:#79c0ff}
+.tpop-chart .ax{fill:#8b949e;font-size:9px}
+.tpop-empty{color:#6e7681;font-size:10.5px;padding:6px 0}
 /* TWO OWNERS, TWO BOXES.
    The chips are all the same shape, so a run of five of them read as one
    measurement in five parts - "Busy 50% · Other 710 KB/s · Read 2.2 MB/s ·
@@ -9601,7 +10294,21 @@ button.on{border-color:var(--ok);color:var(--ok)}
   /* Size and Used first - both are implied by Capacity + Free. */
   #disks th:nth-child(3),#disks tr:not(.iorow) td:nth-child(3),
   #disks th:nth-child(4),#disks tr:not(.iorow) td:nth-child(4){display:none}
-  #disks table{min-width:0}
+  /* AUTO LAYOUT ONCE COLUMNS ARE HIDDEN. Fixed layout keeps reserving the
+     hidden columns' width - measured: four visible columns summing to 511
+     px in a 768 px panel, the rest dead space on the right. Auto layout
+     lays out only what is displayed, and the percentages below still
+     shape it. */
+  #disks table{min-width:0;width:100%;table-layout:auto}
+  /* RE-DEAL THE WIDTHS. With table-layout:fixed a hidden column does not
+     give its share to the others - the browser leaves it as dead space on
+     the right, and on a phone the Files/Capacity/Free columns sat in the
+     left 60% of the panel with nothing beside them. Every visible column
+     is given an explicit share again so the row spans the panel. */
+  #disks th:nth-child(1),#disks tr:not(.iorow) td:nth-child(1){width:20%}
+  #disks th:nth-child(2),#disks tr:not(.iorow) td:nth-child(2){width:12%}
+  #disks th:nth-child(5),#disks tr:not(.iorow) td:nth-child(5){width:auto}
+  #disks th:nth-child(6),#disks tr:not(.iorow) td:nth-child(6){width:18%}
   /* Activity needs a bigger SHARE as the table narrows, not a smaller one -
      its content is fixed-width numbers, so a shrinking percentage is what
      made the cell overflow its column and scroll the whole table. */
@@ -9615,6 +10322,8 @@ button.on{border-color:var(--ok);color:var(--ok)}
 }
 @container diskpanel (max-width:560px){
   #disks th:nth-child(2),#disks tr:not(.iorow) td:nth-child(2){display:none}   /* Files */
+  #disks th:nth-child(1),#disks tr:not(.iorow) td:nth-child(1){width:30%}
+  #disks th:nth-child(6),#disks tr:not(.iorow) td:nth-child(6){width:24%}
   /* The transfer caption sheds words before it sheds numbers, and it asks the
      same question the columns do: how wide is THIS panel. The chevrons already
      show the direction, so "to"/"from" goes first, and whose transfer it is
@@ -9732,8 +10441,10 @@ td.when{white-space:nowrap;font-variant-numeric:tabular-nums}
 .l-debug{color:#5d6673}
 .l-info{color:#b9c2cf}
 /* job boundaries: cyan and bold, impossible to miss when scrolling */
-.l-start{color:#2ecfd6;font-weight:700;letter-spacing:.3px}
-.l-end{color:#9d7bff;font-weight:700;letter-spacing:.3px}
+.l-start{color:var(--sc,#2ecfd6);font-weight:700;letter-spacing:.3px}
+.l-end{color:var(--sc,#9d7bff);font-weight:700;letter-spacing:.3px;opacity:.88}
+/* the rules that frame a START or END take its colour; every other rule stays dim */
+.rule.rc,.jg .rule.rc{color:var(--sc);opacity:.75;font-weight:600}
 /* the plan block, so decisions read differently from chatter */
 .l-plan{color:#79c0ff;font-weight:600}
 .l-why{color:#7d8694;font-style:italic}
@@ -10130,6 +10841,13 @@ button[disabled]{opacity:.5;cursor:default}
 .dot{animation:pulse 2s infinite}
 .dim{color:var(--dim)}
 .num{text-align:right;font-variant-numeric:tabular-nums}
+/* the Activity size cell: before | -> | after | change, each a fixed slot */
+.szc{display:inline-flex;align-items:baseline;gap:0;white-space:nowrap;font-variant-numeric:tabular-nums}
+.szc>span:nth-child(1){width:58px;text-align:right}
+.szc>span:nth-child(2){width:16px;text-align:center}
+.szc>span:nth-child(3){width:58px;text-align:right}
+.szc>span:nth-child(4){width:50px;text-align:right}
+.szc.szh>span{font-weight:inherit;text-transform:inherit}
 .pill{display:inline-block;padding:1px 8px;border-radius:20px;font-size:11px;border:1px solid}
 .p-ok{color:var(--ok);border-color:#1f4426}.p-warn{color:var(--warn);border-color:#4a3a12}
 .p-bad{color:var(--bad);border-color:#5a2225}.p-dim{color:var(--dim);border-color:var(--line)}
@@ -10625,6 +11343,10 @@ button[disabled]{opacity:.5;cursor:default}
     rgba(255,255,255,.28) 50%,transparent 65% 100%);
   background-size:220% 100%;animation:barsweep 1.25s linear infinite}
 @keyframes barsweep{from{background-position:120% 0}to{background-position:-120% 0}}
+/* Held by a gate: amber (set inline) under a static hatch. No motion - the
+   job is not doing anything, and the pattern is what tells it from a stall. */
+.bar i.held{animation:none;
+  background-image:repeating-linear-gradient(-45deg,transparent 0 5px,rgba(0,0,0,.28) 5px 10px)}
 /* Reduced motion keeps the GROW. Easing a progress bar between two real
    measurements is not the kind of motion that rule protects against - it is
    strictly gentler than the alternative, which is the fill teleporting every
@@ -10955,6 +11677,7 @@ tr.logrow td{background:#1c2129;border-bottom:1px solid var(--acc);padding:0 12p
 .dcol-name .dname{display:inline-block;max-width:100%;overflow:hidden;
   text-overflow:ellipsis;white-space:nowrap;vertical-align:bottom}
 .disktab .dcol-size,.disktab .dcol-used,.disktab .dcol-free{width:82px}
+.disktab .advsz{font-size:9.5px;color:#525c6b;line-height:1.1;margin-top:1px}
 .disktab .dcol-bar{width:auto;min-width:96px}
 /* The "x of y" restatement inside the bar cell only appears once the Size and
    Used columns have gone, so the numbers are never shown twice. */
@@ -11100,6 +11823,115 @@ input[type=time]::-webkit-calendar-picker-indicator{filter:invert(.75);cursor:po
 /* a count that opens the matching file list - looks clickable, because it is */
 .lnk{cursor:pointer;text-decoration:underline dotted;text-underline-offset:2px}
 .lnk:hover{text-decoration-style:solid}
+/* ---- MOBILE LAYOUT. Switched on by the html.mobile class the head script
+   sets; nothing here applies to a desktop browser, and a mobile browser in
+   "Desktop site" mode does not get it either. One column, bigger touch
+   targets, tables that scroll sideways inside their panel instead of
+   squeezing, and the settings sidebar as a strip across the top. */
+html.mobile body{font-size:15px}
+html.mobile header{padding:10px 12px;flex-wrap:wrap;gap:8px 10px;position:static}
+html.mobile .selfuse{flex-wrap:wrap;max-width:100%}
+html.mobile #sub{display:block;font-size:13px}
+html.mobile header h1{font-size:18px;flex:1 1 auto}
+/* Refresh, the gear and the power button sit top-right beside the name, as
+   on the desktop; the status chips flow underneath. display:contents lifts
+   the .right group's children into the header's own flex row so they can be
+   ordered - the buttons first, the chips after. */
+html.mobile header .right{display:contents}
+html.mobile header h1{order:0;flex:1 1 0;min-width:0;white-space:nowrap}
+/* The file/size/saved summary is what the tiles directly below say; in the
+   header it was the one thing stopping the name and the buttons sharing a
+   row on a phone. */
+html.mobile header #sub{display:none}
+html.mobile header .right > button,html.mobile header .gearbtn,html.mobile header .menu{order:1;flex:0 0 auto}
+html.mobile header #bootPill,html.mobile header #selfUse,html.mobile header #arrs,
+html.mobile header #ffPill,html.mobile header #mkvPill,html.mobile header #ctlPill{order:2}
+html.mobile header #selfUse{flex:1 1 100%}
+html.mobile header .right > button,html.mobile header .gearbtn,html.mobile header .pwrbtn{min-height:36px;min-width:36px}
+html.mobile .wrap{padding:10px;gap:12px;grid-template-columns:minmax(0,1fr)}
+html.mobile .wrap > *{min-width:0;max-width:100%}
+html.mobile .one,html.mobile .setwrap{min-width:0;max-width:100%}
+html.mobile .cards{grid-template-columns:repeat(2,minmax(0,1fr)) !important;gap:8px}
+html.mobile.wide .cards{grid-template-columns:repeat(4,minmax(0,1fr)) !important;gap:10px}
+html.mobile.wide .wrap{padding:14px}
+html.mobile.wide .two{grid-template-columns:1fr 1fr}
+html.mobile.wide header h1{font-size:20px}
+html.mobile .card{padding:10px 11px}
+html.mobile .two{grid-template-columns:1fr}
+html.mobile .panel{overflow-x:auto;-webkit-overflow-scrolling:touch}
+html.mobile .panel > h2{font-size:14px;padding:10px 12px;flex-wrap:wrap;gap:6px 10px}
+html.mobile table{font-size:12.5px}
+/* The disk table keeps its full names and one-line activity row by being
+   wider than the screen and scrolling inside its panel, rather than
+   truncating "NU-DRIVE-10" to "NU-DRIV…" and wrapping the chips. */
+html.mobile .disktab .dname{white-space:nowrap;overflow:visible;max-width:none;text-overflow:clip}
+html.mobile .disktab .dcol-name{white-space:nowrap}
+/* On a phone the activity row shows only the chips that have something to
+   say - an empty "system —" and "viewer —" pushed the live ones onto a
+   second line. Nuarr's chip stays as the row's anchor even when idle. */
+html.mobile .diskio .io-grp.off:not(.io-ours){display:none}
+html.mobile .diskio .io-slot{flex:0 1 auto}
+/* The activity list has fixed column widths that add up to more than a phone
+   is wide; the title column was squeezed to nothing and the rows looked
+   empty. Drop the size and count columns on mobile - the title, what
+   happened and when are the ones read on a phone - and let the rest scroll. */
+html.mobile #doneBox table.fixed{table-layout:auto;min-width:0}
+html.mobile #doneBox th:nth-child(3),html.mobile #doneBox td:nth-child(3),
+html.mobile #doneBox th:nth-child(4),html.mobile #doneBox td:nth-child(4){display:none}
+html.mobile #doneBox th:nth-child(2){width:auto !important}
+html.mobile #doneBox th:nth-child(5){width:64px !important;padding-left:6px !important}
+html.mobile .scrollbox.nohz{overflow-x:auto}
+html.mobile #doneQ{width:100% !important;box-sizing:border-box}
+html.mobile .panel > h2 > span[style*="float:right"]{float:none !important;width:100%;flex-wrap:wrap}
+html.mobile button{min-height:34px;padding:6px 12px;font-size:13px}
+html.mobile input,html.mobile select,html.mobile textarea{font-size:16px;min-height:34px}
+html.mobile #drillQ,html.mobile #attnQ{width:100% !important;box-sizing:border-box;margin-bottom:6px}
+html.mobile .scrollbox{height:auto !important;max-height:65vh}
+html.mobile .wk .wkhead{flex-wrap:wrap;gap:6px}
+html.mobile .wk .right2{width:100%;justify-content:flex-end}
+html.mobile .wkstats{flex-wrap:wrap;gap:6px 12px}
+html.mobile .wkfile{overflow-wrap:anywhere}
+html.mobile .tpop{width:min(324px,calc(100vw - 20px))}
+html.mobile .jpop{width:min(360px,calc(100vw - 20px))}
+html.mobile .menuBox{right:0;left:auto;max-width:calc(100vw - 20px)}
+html.mobile .pinhead{padding:8px 10px;font-size:13px}
+html.mobile .diskio{gap:4px 6px}
+html.mobile .dprow{grid-template-columns:90px 100px 1fr;gap:6px;font-size:12.5px}
+html.mobile .dprow .dpe{grid-column:1 / -1;text-align:left}
+/* balance table on a phone: each disk becomes a short stack of lines
+   instead of one 1100px row. Unfolded (wide) keeps every column over two
+   lines; folded drops "vs avg" and spreads the rest over three. */
+html.mobile .baltab{min-width:0;font-size:12px}
+html.mobile .balrow{gap:4px 6px;padding:5px 0;border-bottom:1px solid var(--line);
+  grid-template-columns:90px minmax(0,1fr) 64px 64px 84px 72px;
+  grid-template-areas:"n b b p d s" "m m rd wr r e"}
+html.mobile .balrow.balhead{border-bottom:0;padding-bottom:0}
+html.mobile .balrow .baln{grid-area:n}html.mobile .balrow .balbar{grid-area:b}
+html.mobile .balrow .balp{grid-area:p}html.mobile .balrow .bald{grid-area:d}
+html.mobile .balrow .bals{grid-area:s}html.mobile .balrow .balm{grid-area:m}
+html.mobile .balrow .balrd{grid-area:rd}html.mobile .balrow .balwr{grid-area:wr}
+html.mobile .balrow .balr{grid-area:r}html.mobile .balrow .bale{grid-area:e}
+/* folded: ~240px of content beside the rail, so every disk is a small
+   card - name and fill, the bar full width, then the figures two to a line */
+html.mobile:not(.wide) .balrow{grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:3px 8px;padding:7px 0;
+  grid-template-areas:"n p" "b b" "m m" "s e" "rd wr" "r r"}
+html.mobile:not(.wide) .balrow .bald,html.mobile:not(.wide) .balhead{display:none}
+html.mobile:not(.wide) .balrow .baln{text-align:left;font-size:13px}
+html.mobile:not(.wide) .balrow .balbar{height:12px;margin:2px 0}
+html.mobile:not(.wide) .balrow .bals,html.mobile:not(.wide) .balrow .balrd,
+html.mobile:not(.wide) .balrow .balr{text-align:left}
+html.mobile:not(.wide) .balrow .balwr,html.mobile:not(.wide) .balrow .bale,
+html.mobile:not(.wide) .balrow .balp{text-align:right}
+html.mobile:not(.wide) .balrow .balrd:before{content:"R ";color:#8b98a6}
+html.mobile:not(.wide) .balrow .balwr:before{content:"W ";color:#8b98a6}
+html.mobile:not(.wide) .balrow .balrd:empty,html.mobile:not(.wide) .balrow .balwr:empty{display:none}
+html.mobile .balhead .balbar{font-size:11px}
+html.mobile .balhead .balbar span{white-space:nowrap}
+/* settings: the rail (see the settings stylesheet) is the phone layout;
+   only the frame tightens here */
+html.mobile .setwrap{margin:8px;min-height:0}
+html.mobile .setmain{padding:10px}
+html.mobile #logsPane{height:auto;min-height:60vh}
 </style></head><body>
 <header>
   <!-- The mark is a link home, which is what every other web app trains you to
@@ -11167,6 +11999,9 @@ input[type=time]::-webkit-calendar-picker-indicator{filter:invert(.75);cursor:po
         <div class="menuSep"></div>
         <button id="ctlCancel" style="display:none"
                 onclick="ctlCancel()">Cancel pending stop</button>
+        <div class="menuSep"></div>
+        <button id="viewBtn" onclick="nuarrView(document.documentElement.classList.contains('mobile')?'desktop':'mobile')">Switch to mobile view</button>
+        <button id="viewAuto" style="display:none" onclick="nuarrView('auto')">View: back to auto-detect</button>
         <div id="ctlMsg" class="dim" style="font-size:11px;padding:4px 8px"></div>
       </div>
     </div>
@@ -12017,7 +12852,7 @@ async function loadAll(){
 
   // Bars scale to each disk's real capacity, so the fill level means
   // "how full is this disk" rather than "how many files does it happen to hold".
-  lastDisks=s.disks; renderDisks();
+  lastDisks=s.disks; _poolTrend=s.pool_trend||null; renderDisks();
   // Asked once; hostIoLoad reschedules itself only if there IS a remote host.
   if(_hostIo===null) hostIoLoad();
 
@@ -12074,7 +12909,7 @@ async function loadRenames(){
 // Pool disks: sorted by disk NAME by default, since that is the stable
 // identity you cross-reference against StableBit Scanner. Every column is
 // clickable; clicking the active column flips direction.
-let lastDisks=[], diskSort='pool_disk', diskDir=1;
+let lastDisks=[], _poolTrend=null, diskSort='pool_disk', diskDir=1;
 function sortDisks(col){
   if(diskSort===col) diskDir=-diskDir; else { diskSort=col; diskDir=1; }
   renderDisks();
@@ -12182,6 +13017,251 @@ function hostIoHtml(){
         + `system from outside`) + stale + lost);
 }
 
+// ---- which way is this disk going ------------------------------------
+// One chip in the caption under the bar: an arrow and the rate RIGHT NOW -
+// the last half hour, ending at the reading the panel just took - so a
+// balancer move or a batch of commits shows up while it is happening, not a
+// day later averaged into nothing. Amber filling, blue emptying, grey steady.
+//
+// NO LINE IN THE ROW. A sparkline of two readings is a slope, and a slope
+// drawn at 54 pixels wide reads as a verdict. The chart lives in the hover
+// card, at a size where it can carry axes and be read honestly, and it is
+// fetched only when somebody asks for it.
+function trendHtml(t, free, disk){
+  const key = ` data-tdisk="${esc(disk||'')}"`;
+  if(!t || !t.n) return `<span class="trend t-none"${key}>measuring…</span>`;
+  const span = sec => sec>=86400*1.5 ? Math.round(sec/86400)+'d'
+             : sec>=3600*1.5 ? Math.round(sec/3600)+'h' : Math.max(1,Math.round(sec/60))+'m';
+  // the live rate, per hour - a balancer at 165 MB/s is 594 GB/h, which is a
+  // number you can check against the activity row beneath it
+  const bps = t.now_bps;
+  if(bps==null){
+    if(t.bpd==null) return `<span class="trend t-none"${key}>measuring · ${span(t.history_s)}</span>`;
+    // no half-hour yet but a day view exists: show that, labelled
+    const up=t.bpd>0, steady=t.steady;
+    return `<span class="trend ${steady?'t-flat':(up?'t-up':'t-down')}"${key}>${
+      steady?'→ steady':(up?'▲ ':'▼ ')+gb(Math.abs(t.bpd))+'/d'}</span>`;
+  }
+  const bph = bps*3600;
+  const steady = Math.abs(bph) < 1e9;                  // under a GB an hour
+  const cls = steady ? 't-flat' : (bph>0 ? 't-up' : 't-down');
+  const txt = steady ? '→ steady' : (bph>0?'▲ ':'▼ ')+gb(Math.abs(bph))+'/h';
+  return `<span class="trend ${cls}"${key}>${txt}</span>`;
+}
+
+// ---- the hover card ----------------------------------------------------
+// One card, moved to whichever chip is under the pointer. Numbers first -
+// now, day, week, days of room - then two charts: the last 24 hours at the
+// sampler's own five-minute grain, and the last week by the hour. Both are
+// baselined at their own minimum so the shape is the change, not the
+// terabytes the disk already held; the axis says what the range is.
+let _tpop=null, _tpopKey='', _tpopCache={};
+function tpopEl(){
+  if(_tpop) return _tpop;
+  _tpop=document.createElement('div'); _tpop.className='tpop'; _tpop.style.display='none';
+  document.body.appendChild(_tpop);
+  _tpop.addEventListener('mouseenter',()=>{ _tpopHover=true; });
+  _tpop.addEventListener('mouseleave',()=>{ _tpopHover=false; tpopHide(); });
+  return _tpop;
+}
+let _tpopHover=false, _tpopTimer=null;
+function tpopHide(){
+  if(_tpopTimer) clearTimeout(_tpopTimer);
+  _tpopTimer=setTimeout(()=>{ if(!_tpopHover && _tpop) _tpop.style.display='none'; }, 120);
+}
+function tpopChart(pts, W, H, label){
+  if(!pts || pts.length<2) return `<div class="tpop-empty">${label}: not enough readings yet</div>`;
+  const xs=pts.map(p=>p[0]), ys=pts.map(p=>p[1]);
+  const x0=Math.min(...xs), x1=Math.max(...xs), y0=Math.min(...ys), y1=Math.max(...ys);
+  const padL=6, padR=6, padT=8, padB=14;
+  const X=v=>padL+(x1===x0?0:(v-x0)/(x1-x0))*(W-padL-padR);
+  const Y=v=>padT+(y1===y0?(H-padT-padB)/2:(1-(v-y0)/(y1-y0))*(H-padT-padB));
+  const d=pts.map((p,i)=>(i?'L':'M')+X(p[0]).toFixed(1)+' '+Y(p[1]).toFixed(1)).join('');
+  const area=d+`L${X(x1).toFixed(1)} ${(H-padB).toFixed(1)}L${X(x0).toFixed(1)} ${(H-padB).toFixed(1)}Z`;
+  const rng=y1-y0;
+  const last=pts[pts.length-1][1], first=pts[0][1];
+  const cls=last>first?'up':(last<first?'down':'flat');
+  const hrs=(x1-x0)/3600;
+  const xl = hrs>=36 ? `${Math.round(hrs/24)} days` : `${Math.round(hrs)} h`;
+  return `<div class="tpop-chart ${cls}">
+    <div class="tpop-lab"><span>${label}</span><span class="dim">range ${gb(rng)}${
+      rng?` · ${(last>=first?'+':'−')+gb(Math.abs(last-first))} over ${xl}`:''}</span></div>
+    <svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}">
+      <path class="area" d="${area}"/><path class="line" d="${d}"/>
+      <text x="${padL}" y="${H-3}" class="ax">${xl} ago</text>
+      <text x="${W-padR}" y="${H-3}" class="ax" text-anchor="end">now</text>
+      <text x="${W-padR}" y="${padT+9}" class="ax" text-anchor="end">${gb(y1)}</text>
+      <text x="${W-padR}" y="${H-padB-2}" class="ax" text-anchor="end">${gb(y0)}</text>
+    </svg></div>`;
+}
+async function tpopShow(chip){
+  const disk=chip.dataset.tdisk||''; if(!disk) return;
+  const el=tpopEl();
+  const row=(disk==='POOL')?null:(lastDisks||[]).find(d=>d.pool_disk===disk);
+  const t=(disk==='POOL')?_poolTrend:(row&&row.trend);
+  const free=(disk==='POOL')?(lastDisks||[]).reduce((a,d)=>a+(d.free||0),0):(row&&row.free);
+  const span = sec => sec>=86400*1.5 ? Math.round(sec/86400)+' days'
+             : sec>=3600*1.5 ? Math.round(sec/3600)+' h' : Math.max(1,Math.round(sec/60))+' min';
+  const sgn = v => (v>0?'+':v<0?'−':'')+gb(Math.abs(v));
+  const lines=[];
+  if(t){
+    if(t.now_bps!=null) lines.push(`<b>right now</b> ${sgn(t.now_bps*3600)}/h <span class="dim">· ${sgn(t.now_delta)} in the last ${span(t.now_span_s)}</span>`);
+    if(t.d24!=null) lines.push(`<b>last ${span(t.span24_s)}</b> ${sgn(t.d24)} <span class="dim">· ${sgn(t.bpd)}/day</span>`);
+    if(t.d7!=null && t.span7_s>t.span24_s*1.5) lines.push(`<b>last ${span(t.span7_s)}</b> ${sgn(t.d7)}`);
+    if(t.bpd>0 && t.days_left!=null) lines.push(`<b>room</b> ${t.days_left>=730?'years at the day rate':`full in ${t.days_left>=2?Math.round(t.days_left)+' days':'under 2 days'} at the day rate`} <span class="dim">· ${gb(free||0)} free</span>`);
+    lines.push(`<span class="dim">${fmt(t.n)} readings over ${span(t.history_s)} · one every 5 min</span>`);
+  } else lines.push('<span class="dim">no readings yet</span>');
+  el.innerHTML=`<div class="tpop-h">${esc(disk)} <span class="dim">— used space</span></div>
+    <div class="tpop-n">${lines.join('<br>')}</div>
+    <div id="tpopCharts"><div class="tpop-empty">loading…</div></div>`;
+  el.style.display='block';
+  // place it beside the chip, kept on screen
+  const r=chip.getBoundingClientRect(), W=el.offsetWidth, H=el.offsetHeight;
+  let x=r.left+window.scrollX, y=r.bottom+window.scrollY+6;
+  if(x+W>window.scrollX+window.innerWidth-8) x=window.scrollX+window.innerWidth-W-8;
+  if(r.bottom+H+6>window.innerHeight) y=r.top+window.scrollY-H-6;
+  el.style.left=x+'px'; el.style.top=y+'px';
+  _tpopKey=disk;
+  let ser=_tpopCache[disk];
+  if(!ser || Date.now()-ser.at>60000){
+    try{ ser={at:Date.now(), d:await (await fetch('/api/disktrend?disk='+encodeURIComponent(disk))).json()}; _tpopCache[disk]=ser; }
+    catch(e){ ser=null; }
+  }
+  if(_tpopKey!==disk) return;                       // moved on while loading
+  const c=document.getElementById('tpopCharts'); if(!c) return;
+  c.innerHTML = ser ? tpopChart(ser.d.day,300,84,'last 24 hours')+tpopChart(ser.d.week,300,84,'last 7 days')
+                    : '<div class="tpop-empty">could not load</div>';
+}
+document.addEventListener('mouseover', e=>{
+  const chip=e.target.closest && e.target.closest('.trend[data-tdisk]');
+  if(chip){ if(_tpopTimer) clearTimeout(_tpopTimer); tpopShow(chip); }
+  const jd=e.target.closest && e.target.closest('[data-jdisk],[data-dpop]');
+  if(jd){ if(_jpopTimer) clearTimeout(_jpopTimer); jpopShow(jd); }
+});
+document.addEventListener('mouseout', e=>{
+  const chip=e.target.closest && e.target.closest('.trend[data-tdisk]');
+  if(chip && !(e.relatedTarget && _tpop && _tpop.contains(e.relatedTarget))) tpopHide();
+  const jd=e.target.closest && e.target.closest('[data-jdisk],[data-dpop]');
+  if(jd && !(e.relatedTarget && _jpop && _jpop.contains(e.relatedTarget))) jpopHide();
+});
+// WHERE THE POINTER IS, for the repaint check below. A row that is rebuilt
+// under the pointer does not fire mouseover again until the mouse moves, and
+// :hover on the new element is not reliable in the same frame - so the
+// question "is the pointer still on this pill" is answered by coordinates.
+let _mx=-1,_my=-1;
+document.addEventListener('mousemove', e=>{ _mx=e.clientX; _my=e.clientY; }, {passive:true});
+function _under(sel){
+  if(_mx<0) return null;
+  const el=document.elementFromPoint(_mx,_my);
+  return el && el.closest ? el.closest(sel) : null;
+}
+
+// ---- the jobs card, for the Nuarr pill -------------------------------------
+// Same shape as the trend card: numbers first, then one block per job with
+// its own bar. Built from the live I/O payload the pill itself is drawn from,
+// so the card and the pill can never disagree; refreshed IN PLACE on every
+// repaint while the pointer stays on the pill, so the figures move without
+// the card ever blinking.
+let _jpop=null, _jpopKey='', _jpopHover=false, _jpopTimer=null;
+const _dtips={};          // disk -> kind -> {text, figs}, filled by renderDisks
+const DPOP_HEAD={busy:'busy — the whole spindle', sys:'system — everything but Nuarr', view:'viewers'};
+const DPOP_HEAD_POOL={busy:'busy — averaged over the array', sys:'system — everything but Nuarr, all disks', view:'viewers — the whole pool'};
+function dpopHtml(kind, disk){
+  const t=((_dtips[disk]||{})[kind])||{text:'',figs:[]};
+  const figs=t.figs.filter(f=>f&&f[1]!=null&&f[1]!=='');
+  return `<div class="tpop-h">${esc(disk)} <span class="dim">— ${(disk==='POOL'?DPOP_HEAD_POOL[kind]:DPOP_HEAD[kind])||kind}</span></div>
+    ${figs.length?`<div class="tpop-n">${figs.map(f=>`<b>${esc(f[0])}</b> ${f[1]}`).join('<br>')}</div>`:''}
+    ${t.text?`<div class="dim jpop-plan" style="-webkit-line-clamp:unset;white-space:pre-line">${esc(t.text)}</div>`:''}`;
+}
+function popKeyOf(a){ return a.dataset.jdisk ? 'jobs:'+a.dataset.jdisk : a.dataset.dpop+':'+a.dataset.ddisk; }
+function popHtmlFor(key){ const i=key.indexOf(':'); const kind=key.slice(0,i), disk=key.slice(i+1); return kind==='jobs' ? jpopHtml(disk) : dpopHtml(kind, disk); }
+function jpopEl(){
+  if(_jpop) return _jpop;
+  _jpop=document.createElement('div'); _jpop.className='tpop jpop'; _jpop.style.display='none';
+  document.body.appendChild(_jpop);
+  _jpop.addEventListener('mouseenter',()=>{ _jpopHover=true; });
+  _jpop.addEventListener('mouseleave',()=>{ _jpopHover=false; jpopHide(); });
+  return _jpop;
+}
+function jpopHide(){
+  if(_jpopTimer) clearTimeout(_jpopTimer);
+  _jpopTimer=setTimeout(()=>{ if(!_jpopHover && _jpop){ _jpop.style.display='none'; _jpopKey=''; } }, 160);
+}
+function jpopHtml(disk){
+  const bd=((_lastIo||{}).by_disk)||[];
+  // The totals row asks for the whole array: every job, tagged with its disk.
+  const e = disk==='POOL'
+    ? {read_bps:(_lastIo||{}).read_bps||0, write_bps:(_lastIo||{}).write_bps||0,
+       jobs_detail: bd.flatMap(x=>(x.jobs_detail||[]).map(w=>Object.assign({_disk:x.disk}, w)))}
+    : bd.find(x=>x.disk===disk);
+  const jd=(e&&e.jobs_detail)||[];
+  if(!jd.length) return `<div class="tpop-h">${esc(disk)} <span class="dim">— Nuarr</span></div><div class="dim">no jobs here now</div>`;
+  const stage=w=>w.paused_for_viewer?'paused for viewer':w.paused_for_load?'paused for disk load':(w.stage||'starting');
+  const held=w=>w.paused_for_viewer||w.paused_for_load||/^waiting/.test(w.stage||'');
+  const head=`<div class="tpop-h">${esc(disk)} <span class="dim">— Nuarr, ${jd.length} job${jd.length===1?'':'s'}</span></div>
+    <div class="tpop-n"><b>reading</b> <span class="m-read">${mbps(e.read_bps)}</span> · <b>writing</b> <span class="m-write">${mbps(e.write_bps)}</span>${
+      jd.some(held)?` · <b style="color:var(--warn)">${jd.filter(held).length} held</b>`:''}</div>`;
+  const blocks=jd.map(w=>{
+    const pc=poolColor(w.pool);
+    const isHeld=held(w);
+    const commit=w.stage==='committing'&&w.commit_total;
+    const pct=commit?Math.min(100,w.commit_bytes/w.commit_total*100):(w.progress||0)*100;
+    const col=isHeld?'var(--warn)':(commit?'#58c8d8':pc);
+    const bits=[];
+    bits.push(`<span style="color:${isHeld?'var(--warn)':'var(--fg,#c9d1d9)'};font-weight:${isHeld?700:500}">${esc(stage(w))}</span>${w.stage_s?` <span class="dim">for ${hms(w.stage_s)}</span>`:''}`);
+    if(w.stage==='encoding'){
+      if(w.fps) bits.push(`<span class="m-fps">${w.fps}</span> <span class="dim">fps</span>`);
+      if(w.speed) bits.push(`<span class="m-fps">${w.speed}×</span>`);
+      if(w.eta_s!=null) bits.push(`<span class="dim">ETA</span> <span class="m-time">${hms(w.eta_s)}</span>`);
+    }
+    if(commit) bits.push(`<span class="m-size">${gb(w.commit_bytes)}</span> <span class="dim">of</span> <span class="m-size">${gb(w.commit_total)}</span>${w.dest_disk?` <span class="dim">→</span> ${diskTag(w.dest_disk)}`:''}`);
+    const io=(w.read_bps||w.write_bps)?`<span class="m-read">${mbps(w.read_bps)}</span> <span class="dim">read</span> · <span class="m-write">${mbps(w.write_bps)}</span> <span class="dim">write</span>`:'';
+    const size=w.src_bytes?`<span class="dim">in</span> <span class="m-size">${gb(w.src_bytes)}</span>${
+      (w.out_bytes||w.est_out_bytes)?` <span class="dim">→</span> <span class="m-size">${gb(w.out_bytes||0)}</span>${w.est_out_bytes?` <span class="dim">of ~${gb(w.est_out_bytes)}</span>`:''}`:''}`:'';
+    return `<div class="jpop-job">
+      <div class="jpop-t"><span class="pill" style="color:${pc};border-color:${pc};font-size:9.5px;padding:0 5px">${esc(w.pool)}</span>${w._disk?` ${diskTag(w._disk)}`:''} <b>${esc(w.title||w.file)}</b></div>
+      ${w.plan?`<div class="dim jpop-plan">${esc(w.plan)}</div>`:''}
+      <div class="bar" style="height:5px;margin:4px 0 3px"><i class="${isHeld?'held':''}" style="width:${pct.toFixed(1)}%;background-color:${col}"></i></div>
+      <div class="jpop-l"><span class="m-pct" style="font-size:11px">${pct.toFixed(1)}%</span> · ${bits.join(' · ')}</div>
+      ${io||size?`<div class="jpop-l dim2">${[io,size].filter(Boolean).join(' · ')}</div>`:''}
+      ${w.pace_why?`<div style="font-size:10.5px;color:var(--warn)">${w.pace_factor>0?`paced to ~${Math.round(100/(1+w.pace_factor))}% — `:''}${esc(w.pace_why)}</div>`:''}
+      <div class="dim" style="font-size:10.5px">running ${hms(w.elapsed_s)}${w.dest_disk&&w.dest_disk!==disk?` · lands on ${esc(w.dest_disk)}`:''}</div>
+    </div>`;
+  }).join('');
+  return head+blocks;
+}
+function jpopPlace(anchor){
+  const el=jpopEl();
+  const r=anchor.getBoundingClientRect(), W=el.offsetWidth, H=el.offsetHeight;
+  let x=r.left+window.scrollX, y=r.bottom+window.scrollY+6;
+  if(x+W>window.scrollX+window.innerWidth-8) x=window.scrollX+window.innerWidth-W-8;
+  if(r.bottom+H+6>window.innerHeight) y=r.top+window.scrollY-H-6;
+  el.style.left=x+'px'; el.style.top=y+'px';
+}
+function jpopShow(anchor){
+  const key=popKeyOf(anchor); if(!key||key.endsWith(':')) return;
+  const el=jpopEl();
+  const same=_jpopKey===key && el.style.display!=='none';
+  el.innerHTML=popHtmlFor(key);
+  el.style.display='block';
+  if(!same) jpopPlace(anchor);
+  _jpopKey=key;
+}
+// AFTER A REPAINT. The pill and the chip under the pointer have just been
+// replaced by new elements; keep whichever card is open, on the new element,
+// with fresh numbers - and close it only if the pointer has really left.
+function popsRefresh(){
+  if(_jpop && _jpop.style.display!=='none' && _jpopKey){
+    const a=_under('[data-jdisk],[data-dpop]');
+    if(_jpopHover || (a && popKeyOf(a)===_jpopKey)){ if(_jpopTimer) clearTimeout(_jpopTimer); _jpop.innerHTML=popHtmlFor(_jpopKey); if(a) jpopPlace(a); }
+    else jpopHide();
+  }
+  if(_tpop && _tpop.style.display!=='none' && _tpopKey){
+    const c=_under('.trend[data-tdisk]');
+    if(_tpopHover || (c && c.dataset.tdisk===_tpopKey)){ if(_tpopTimer) clearTimeout(_tpopTimer); }
+    else tpopHide();
+  }
+}
 function renderDisks(){
   const key=diskSort;
   // Remote disks REPLACE the single share row rather than joining it: the
@@ -12422,6 +13502,38 @@ guess.">looks like data moving</span>${other.slice(0,3).map(m=>pair(m,'')).join(
       const moving = a && (a.read_bps || a.write_bps);
       const jobTag = a ? `<span class="io-j">${a.jobs}<span class="lg"> job${
               a.jobs===1?'':'s'}</span><span class="sm">j</span></span>` : '';
+      // WHAT THE JOBS ARE DOING, in a word, with the detail on hover. The
+      // pill used to say "starting" for any job not yet moving bytes, which
+      // is what a job held by DrivePool for half an hour also looks like.
+      // Now: the stage of the job (or "waiting for DrivePool" in amber when
+      // every job here is held), and the hover lists each job by name with
+      // its stage and how long it has been in it.
+      const jd = (a && a.jobs_detail) || [];
+      const stWord = w => w.paused_for_viewer ? 'paused for viewer' : w.paused_for_load ? 'paused for disk load'
+        : w.stage==='encoding' ? (w.pool==='passthrough'?'copying ':'encoding ')+Math.round((w.progress||0)*100)+'%'
+        : (w.stage||'starting').replace(/^waiting for subtitle OCR.*/,'waiting for OCR');
+      // The hover is a card (jpopShow), not a native title: a title tooltip
+      // dies every time the row repaints, which with jobs running is once a
+      // second - it flashed in and out and could not be read.
+      const ourTip = jd.length ? ` data-jdisk="${esc(d.pool_disk)}"` : '';
+      const jdHeld = jd.filter(w=>w.paused_for_viewer||w.paused_for_load||/^waiting/.test(w.stage||''));
+      // ONE SHORT WORD, IN THE POOL'S COLOUR. The full stage line ("OCR
+      // (English SDH) · PaddleOCR · GPU 97% (2311/2365 cues)") belongs in the
+      // hover, where it already is; the pill only needs "ocr 97%" in subocr's
+      // purple so the row can be read at the speed of the rest of the table.
+      const shortWord = w => {
+        let t = stWord(w);
+        const pct = (t.match(/\b(\d{1,3})%/)||[])[1];
+        t = t.split(/\s[·(]|\s-\s/)[0].trim();          // cut at the first detail
+        if(/^ocr\b/i.test(t)) t = 'ocr';
+        if(pct && !/\d%/.test(t)) t += ' '+pct+'%';
+        return t.length>22 ? t.slice(0,21)+'…' : t;
+      };
+      const ourWord = !jd.length ? '<span class="io-idle">starting</span>'
+        : jdHeld.length===jd.length
+          ? `<span class="io-hold">${esc(jdHeld.length>1?jdHeld.length+' ':'')}${esc(stWord(jdHeld[0]))}</span>`
+          : (()=>{ const w=jd.find(x=>!jdHeld.includes(x))||jd[0];
+                   return `<span class="io-idle" style="color:${poolColor(w.pool)};opacity:.9">${esc(shortWord(w))}</span>`; })();
 
       const L = dl[d.pool_disk];
 
@@ -12445,8 +13557,17 @@ guess.">looks like data moving</span>${other.slice(0,3).map(m=>pair(m,'')).join(
       // by their share of BYTES, because a seek costs time and no bytes. The
       // split bar under it shows the byte ratio as an approximation and says
       // so in the tooltip; the two throughput figures beside it are exact.
-      const grp = (cls,label,body) =>
-        `<span class="io-grp ${cls}"><span class="io-gl">${label}</span>${body}</span>`;
+      const grp = (cls,label,body,attr) =>
+        `<span class="io-grp ${cls}"${attr||''}><span class="io-gl">${label}</span>${body}</span>`;
+      // EVERY PILL GETS A CARD, NOT A TITLE. The text each pill used to carry
+      // as a native tooltip is stored per disk and kind here, at paint time,
+      // and jpopHtml draws it - a title dies on every repaint, the card does
+      // not (see popsRefresh). `figs` are the structured numbers the card
+      // shows above the prose.
+      const dtip=(kind,text,figs)=>{
+        (_dtips[d.pool_disk]=_dtips[d.pool_disk]||{})[kind]={text:text||'',figs:figs||[]};
+        return ` data-dpop="${kind}" data-ddisk="${esc(d.pool_disk)}"`;
+      };
       // A VIEWER IS THE THIRD SOURCE OF LOAD, and the one that outranks the
       // other two: Nuarr's own work can be slowed down and the system's cannot
       // be helped, but a viewer is the reason this whole panel exists.
@@ -12487,10 +13608,6 @@ guess.">looks like data moving</span>${other.slice(0,3).map(m=>pair(m,'')).join(
           ? VG.who.filter(w=>w.state!=='paused')
                   .reduce((t,w)=>t+(w.kbps||0),0)
           : (pN?0:(VG.kbps||0)))*125;
-        const who=(VG.who||[]).map(w=>
-            `${w.state==='paused'?'paused':'playing'} · ${w.user||'someone'}`
-            + ` · ${w.title||''}`
-            + (w.kbps?` · ${(w.kbps/1000).toFixed(1)} Mbps`:'')).join('\n');
         const how = VG.held
           ? `Held: this session was placed on this disk when it started, and `
             + `that answer is kept until the session ends. Plex reads in `
@@ -12501,9 +13618,12 @@ guess.">looks like data moving</span>${other.slice(0,3).map(m=>pair(m,'')).join(
             + `this spindle is reading ${mbps(VG.bps)}, the closest match of `
             + `the ${Object.keys((_hostIo.hosts[0]||{}).disks||{}).length} `
             + `disks.`;
-        viewGrp = `<span class="io-grp io-view" title="${esc(who + '\n\n' + how
+        viewGrp = `<span class="io-grp io-view"${dtip('view', how
             + (pN?`\n\n${pN} paused — counted, but adding nothing to the rate,`
-                 + ` because a paused stream is not reading.`:''))}"
+                 + ` because a paused stream is not reading.`:''),
+            [['viewers', `<b>${vN}</b>${pN?` <span class="dim">· ${pN} paused</span>`:''}`],
+             ['reading', `<span class="m-view">${VG.held?'':'~'}${mbps(bps)}</span> <span class="dim">· ${VG.held?'held to this disk':'inferred from the read rate'}</span>`],
+             ...(VG.who||[]).map(w=>[w.state==='paused'?'paused':'playing', `<b>${esc(w.user||'someone')}</b> <span class="dim">·</span> ${esc(w.title||'')}${w.kbps?` <span class="dim">· ${(w.kbps/1000).toFixed(1)} Mbps</span>`:''}`])])}
           ><span class="io-gl">${
             (vN>1 ? vN+' viewers' : 'viewer')
             + (pN ? (vN>1 ? ' \u00b7 '+pN+' paused' : ' \u00b7 paused') : '')
@@ -12530,14 +13650,12 @@ guess.">looks like data moving</span>${other.slice(0,3).map(m=>pair(m,'')).join(
           ? W.who.filter(w=>w.state!=='paused')
                  .reduce((t,w)=>t+(w.kbps||0),0)
           : (W.paused?0:(W.kbps||0)))||0)*125;
-        const tip = (W.who||[]).map(w=>
-            `${w.state==='paused'?'paused':'playing'} · ${w.user||'someone'}`
-            + ` · ${w.title||''}`
-            + (w.kbps?` · ${(w.kbps/1000).toFixed(1)} Mbps`:'')
-            + (w.local?' · local':' · remote')).join('\n')
-          + (W.paused?`\n\n${W.paused} paused — counted, but adding nothing to `
-                     +`the rate, because a paused stream is not reading.`:'');
-        viewGrp = `<span class="io-grp io-view" title="${esc(tip)}"
+        viewGrp = `<span class="io-grp io-view"${dtip('view',
+            (W.paused?`${W.paused} paused — counted, but adding nothing to the rate, because a paused stream is not reading.\n\n`:'')
+            + 'Exact: Plex names the file and DrivePool says which disk holds it. A disk with a viewer on it is the one Nuarr slows down for first.',
+            [['viewers', `<b>${W.viewers||0}</b>${W.paused?` <span class="dim">· ${W.paused} paused</span>`:''}`],
+             ['reading', `<span class="m-view">${mbps(bps)}</span>`],
+             ...(W.who||[]).map(w=>[w.state==='paused'?'paused':'playing', `<b>${esc(w.user||'someone')}</b> <span class="dim">·</span> ${esc(w.title||'')}${w.kbps?` <span class="dim">· ${(w.kbps/1000).toFixed(1)} Mbps</span>`:''} <span class="dim">· ${w.local?'local':'remote'}</span>`])])}
           ><span class="io-gl">${(() => {
             // A PAUSED VIEWER IS STILL A VIEWER, and this made it look
             // like neither: a bare grey "paused" where the rate goes, so
@@ -12596,29 +13714,50 @@ guess.">looks like data moving</span>${other.slice(0,3).map(m=>pair(m,'')).join(
         // than the fact that the disk is close to saturated.
         const bo = (0.45 + 0.55*Math.min(1, b/60)).toFixed(2);
         const mine = L.mine_bps||0, ext = L.ext_bps||0;
-        const share = v => L.bps ? Math.round(v/L.bps*100) : 0;
+        // THE VIEWER IS PART OF "EVERYTHING ELSE" IN THE COUNTERS, so their
+        // bytes are carved out and drawn in the viewer's green - the bar then
+        // reads Nuarr / viewer / system, the same three the legend names.
+        const viewBps = (()=>{
+          const V = VG || W; if(!V) return 0;
+          const kb = (V.who&&V.who.length)
+            ? V.who.filter(x=>x.state!=='paused').reduce((t,x)=>t+(x.kbps||0),0)
+            : (V.paused?0:(V.kbps||0));
+          return Math.min(ext, (kb||0)*125);
+        })();
+        const extOnly = Math.max(0, ext - viewBps);
+        // Clamped: the job counters and the disk counters are sampled on
+        // different clocks, so Nuarr's bytes can briefly exceed the disk's
+        // total and print as "169% of the bytes".
+        const share = v => L.bps ? Math.max(0, Math.min(100, Math.round(v/L.bps*100))) : 0;
         const seg = (v,c) => `<i style="width:${
             Math.max(0,Math.min(100,(L.bps? v/L.bps*100 : 0)*(b/100)))
           }%;background:${c}"></i>`;
-        sBusy = `<span class="io-p io-busyp" title="${
-                 b.toFixed(0)}% busy over the last ${_diskLoad.window_s||20}s${
-                 L.queue?' · queue '+L.queue:''}
-The bar splits it by share of bytes moved — Nuarr ${share(mine)}%, everything else ${share(ext)}%. That is an approximation: busy time is not proportional to bytes, because a seek costs time and moves none. The throughput figures beside it are exact.${
-                 L.hot?'\nHeld above '+(_diskLoad.thresh||85)+'% by something other than Nuarr, so new jobs go elsewhere.':''}"
+        sBusy = `<span class="io-p io-busyp"${dtip('busy',
+                 `The bar splits busy time by share of bytes moved — Nuarr ${share(mine)}%, everything else ${share(ext)}%. That is an approximation: busy time is not proportional to bytes, because a seek costs time and moves none. The throughput figures are exact.${
+                 L.hot?'\n\nHeld above '+(_diskLoad.thresh||85)+'% by something other than Nuarr, so new jobs go elsewhere.':''}`,
+                 [['busy', `<b style="color:${bc}">${b.toFixed(0)}%</b> <span class="dim">over the last ${_diskLoad.window_s||20}s</span>`],
+                  ['queue', L.queue!=null?String(L.queue):null],
+                  ['Nuarr', `<span class="m-read">${mbps(mine)}</span> <span class="dim">· ${share(mine)}% of the bytes</span>`],
+                  ['viewer', viewBps>0?`<span class="m-view">${mbps(viewBps)}</span> <span class="dim">· ${share(viewBps)}% of the bytes</span>`:null],
+                  ['system', `<span class="m-other">${mbps(extOnly)}</span> <span class="dim">· ${share(extOnly)}% of the bytes${(L.ext_read_bps||L.ext_write_bps)?` · ${mbps(L.ext_read_bps||0)} read, ${mbps(L.ext_write_bps||0)} write`:''}</span>`],
+                  ['pressure', (()=>{ const P=(((_diskLoad||{}).pressure||{})[d.pool_disk]); if(!P) return null;
+                     const eb=P.ext_busy||0; const lvl = P.paused?'<b style="color:var(--bad)">paused</b>' : eb>=90?'<b style="color:var(--warn)">quarter speed</b>' : eb>=40?`<b style="color:var(--warn)">sharing · ~${Math.round(100/(1+3*(eb-40)/50))}% speed</b>` : '<span style="color:var(--ok)">clear · full speed</span>';
+                     return `${lvl} <span class="dim">· ${eb.toFixed(0)}% busy without Nuarr · ${esc(P.who)}</span>`; })()],
+                  ['gate', L.hot?`<b style="color:var(--warn)">hot</b> <span class="dim">— new jobs steer elsewhere</span>`:'<span class="dim">open — new jobs may land here</span>']])}
                style="opacity:${bo}"
                ><span class="io-l"><span class="lg">Busy</span><span class="sm">B</span></span>
                 <b class="io-v" style="color:${bc}">${b.toFixed(0)}%</b>
-                <span class="iobar">${seg(mine,'var(--acc)')}${seg(ext,'var(--warn)')}</span></span>`;
+                <span class="iobar">${seg(mine,'var(--acc)')}${seg(viewBps,'var(--ok)')}${seg(extOnly,'var(--warn)')}</span></span>`;
         // Nuarr's own half. Read and Write separately when we know them from
         // the job counters, a single total when the disk figures say we are
         // moving bytes but no worker claims them yet.
         if(moving){
           sOurs = grp('io-ours','Nuarr',
                       pair('m-read','Read','R',mbps(a.read_bps))
-                      + pair('m-write','Write','W',mbps(a.write_bps)) + jobTag);
+                      + pair('m-write','Write','W',mbps(a.write_bps)) + jobTag
+                      + (jdHeld.length ? ' '+ourWord : ''), ourTip);
         }else if(a){
-          sOurs = grp('io-ours','Nuarr',
-                      '<span class="io-idle">starting</span>' + jobTag);
+          sOurs = grp('io-ours','Nuarr', ourWord + jobTag, ourTip);
         }else if(mine>0){
           sOurs = grp('io-ours','Nuarr', `<b class="m-read io-v">${mbps(mine)}</b>`);
         }
@@ -12641,7 +13780,17 @@ The bar splits it by share of bytes moved — Nuarr ${share(mine)}%, everything 
                     : ew>=er*3 ? '<span class="xarrow" title="being written to — '
                        +'something is copying data onto this disk">↓</span>' : '';
           sSys = grp('io-sys','system',
-                     `${dir}<b class="m-other io-v">${mbps(ext)}</b>`);
+                     `${dir}<b class="m-other io-v">${mbps(ext)}</b>`,
+                     dtip('sys',
+                       (er>=ew*3 ? 'Being read from — something other than Nuarr is copying data off this disk.'
+                        : ew>=er*3 ? 'Being written to — something other than Nuarr is copying data onto this disk.'
+                        : 'Mixed reads and writes — the disk is doing several things at once, so no single direction is claimed.')
+                       + '\n\nThis is everything on the spindle that is not one of Nuarr\'s jobs: a DrivePool balance, a Plex scan, a backup, a copy. It is the half the job gate reacts to.',
+                       [['total', `<b class="m-other">${mbps(ext)}</b>`],
+                        ['disk read', `<span class="m-read">${mbps(er)}</span> <span class="dim">· whole-disk counter, Nuarr included</span>`],
+                        ['disk write', `<span class="m-write">${mbps(ew)}</span>`],
+                        ['direction', er>=ew*3?'↑ off this disk':(ew>=er*3?'↓ onto this disk':'both ways')],
+                        ['moves', (moveOf[d.pool_disk]||[]).filter(m=>!m.mine).map(m=>(m.dir==='out'?'→ ':'← ')+(m.other||'elsewhere')+' '+mbps(m.bps)).join(', ')||null]]));
         }
       }else if(moving){
         // Counters unavailable for this disk, but our own jobs are running on
@@ -12649,10 +13798,10 @@ The bar splits it by share of bytes moved — Nuarr ${share(mine)}%, everything 
         // exactly the ambiguity this is fixing.
         sOurs = grp('io-ours','Nuarr',
                     pair('m-read','Read','R',mbps(a.read_bps))
-                    + pair('m-write','Write','W',mbps(a.write_bps)) + jobTag);
+                    + pair('m-write','Write','W',mbps(a.write_bps)) + jobTag
+                    + (jdHeld.length ? ' '+ourWord : ''), ourTip);
       }else if(a){
-        sOurs = grp('io-ours','Nuarr',
-                    '<span class="io-idle">starting</span>' + jobTag);
+        sOurs = grp('io-ours','Nuarr', ourWord + jobTag, ourTip);
       }
       // Fill the blanks, then assemble in one fixed order. A disk doing
       // nothing is now the same shape as a disk doing everything.
@@ -12730,7 +13879,7 @@ The bar splits it by share of bytes moved — Nuarr ${share(mine)}%, everything 
         <td class="num">${d.n==null
           ? `<span class="dim" title="DrivePool decides which spindle a file lands on, and over a share that placement is not visible — the host knows how full each disk is, not which of Nuarr's files are on it.">—</span>`
           : fmt(d.n)}</td>
-        <td class="num dim dcol-size">${gb(d.total)}</td>
+        <td class="num dim dcol-size">${gb(d.total)}<div class="advsz" title="the size on the box: drive makers count a terabyte as 1,000,000,000,000 bytes, the column above counts 1,099,511,627,776">${advTB(d.total)}</div></td>
         <td class="num dim dcol-used">${gb(d.used!=null?d.used:d.bytes)}</td>
         <td class="dcol-bar"><div class="bar"><i style="width:${pct}%;background:${col}"></i></div>
             <div style="font-size:11px"><span class="fillpct ${
@@ -12745,7 +13894,8 @@ The bar splits it by share of bytes moved — Nuarr ${share(mine)}%, everything 
                   this disk. A gap that keeps growing means the balancer has
                   stopped, or new files are all landing in one place."`:''}>${
                 pct}% full</span><span class="dcol-of dim">
-              · ${gb(d.used!=null?d.used:d.bytes)} of ${gb(d.total)}</span></div></td>
+              · ${gb(d.used!=null?d.used:d.bytes)} of ${gb(d.total)}</span>${
+              d.remote ? '' : '<span class="dim"> · </span>'+trendHtml(d.trend, d.free, d.pool_disk)}</div></td>
         <td class="num dcol-free" style="color:${col}">${d.free!=null?gb(d.free):'—'}</td></tr>
         <tr class="iorow${(moving||hot)?' io-busy':''}"><td colspan="6"
             ><div class="diskio">${act}</div></td></tr></tbody>`;
@@ -12763,14 +13913,16 @@ The bar splits it by share of bytes moved — Nuarr ${share(mine)}%, everything 
           rows.length && rows.every(d=>d.n==null)
             ? '<span class="dim">—</span>'
             : fmt(rows.reduce((a,d)=>a+(d.n||0),0))}</b></td>
-        <td class="num dcol-size"><b>${gb(tot)}</b></td>
+        <td class="num dcol-size"><b>${gb(tot)}</b><div class="advsz" title="the advertised sizes added up">${
+          rows.reduce((a,d)=>a+advNum(d.total),0)} TB</div></td>
         <td class="num dcol-used"><b>${gb(usd)}</b></td>
         <td class="dcol-bar"><div class="bar"><i style="width:${tot?(usd/tot*100).toFixed(1):0}%;
              background:${tot&&usd/tot>=0.9?'var(--bad)':(tot&&usd/tot>=0.75?'var(--warn)':'#c2ccd6')}"></i></div>
             <div class="dim" style="font-size:11px"><span style="color:${
               tot&&usd/tot>=0.9?'var(--bad)':(tot&&usd/tot>=0.75?'var(--warn)':'#c2ccd6')}">${
               tot?(usd/tot*100).toFixed(1):0}% of pool</span><span
-              class="dcol-of"> · ${gb(usd)} of ${gb(tot)}</span></div></td>
+              class="dcol-of"> · ${gb(usd)} of ${gb(tot)}</span>${
+              _remote ? '' : '<span class="dim"> · </span>'+trendHtml(_poolTrend, fre, 'POOL')}</div></td>
         <td class="num dcol-free"><b>${gb(fre)}</b></td></tr>
       <tr class="iorow"><td colspan="6"><div class="diskio">${(()=>{
             const r=(_lastIo||{}).read_bps||0, w=(_lastIo||{}).write_bps||0;
@@ -12807,25 +13959,49 @@ The bar splits it by share of bytes moved — Nuarr ${share(mine)}%, everything 
               `<span class="io-p"><span class="io-l"><span class="lg">${lbl}</span>`
               +`<span class="sm">${short}</span></span>`
               +`<b class="${cls} io-v">${val}</b></span>`;
-            const gp=(cls,label,body)=>
-              `<span class="io-grp ${cls}"><span class="io-gl">${label}</span>${body}</span>`;
+            const gp=(cls,label,body,attr)=>
+              `<span class="io-grp ${cls}"${attr||''}><span class="io-gl">${label}</span>${body}</span>`;
+            const ptip=(kind,text,figs)=>{
+              (_dtips['POOL']=_dtips['POOL']||{})[kind]={text:text||'',figs:figs||[]};
+              return ` data-dpop="${kind}" data-ddisk="POOL"`;
+            };
             // The array-wide version of the per-disk busy chip: same shape,
             // same split bar, averaged instead of measured on one spindle.
             const seg=(v,c)=>`<i style="width:${
                 Math.max(0,Math.min(100,(tb? v/tb*100 : 0)*(avg/100)))
               }%;background:${c}"></i>`;
             const ac = nh ? 'var(--warn)' : (avg>=10 ? 'var(--acc)' : '#8b98a6');
+            const VM = (_remote && _hostIo && (_hostIo.hosts||[])[0]
+                        && (_hostIo.hosts[0].viewers||{}))
+                     || _plexDetail || {};
+            const V=Object.values(VM);
+            const vN=V.reduce((t,x)=>t+(x.viewers||0),0);
+            const vP=V.reduce((t,x)=>t+(x.paused||0),0);
+            // Only what is READING, same correction as the per-disk chips: a
+            // paused stream keeps its place and moves nothing, so adding its
+            // bitrate here would have the pool row claim throughput no disk is
+            // delivering.
+            const vB=V.reduce((t,x)=>t + ((x.who&&x.who.length)
+                ? x.who.filter(w=>w.state!=='paused')
+                       .reduce((a,w)=>a+(w.kbps||0),0)
+                : (x.paused?0:(x.kbps||0))), 0)*125;
+            const hotList=L.filter(x=>x.hot).map(x=>x.disk||x.pool_disk||'?');
+            const busiest=L.slice().sort((a,b)=>(b.busy||0)-(a.busy||0)).slice(0,3);
             const head = L.length
-              ? `<span class="io-p io-busyp" title="Mean busy across all ${
-                   L.length} pool disks over the last ${_diskLoad.window_s||20}s.
-${nh?nh+' of '+L.length+' held above '+(_diskLoad.thresh||85)
-     +'% by something other than Nuarr — new jobs are steered to the rest.'
-   :'No disk is under sustained load from anything but nuarr.'}
-An average hides a single pinned spindle, so read it with the rows above rather than instead of them."
+              ? `<span class="io-p io-busyp"${ptip('busy',
+                   (nh?nh+' of '+L.length+' held above '+(_diskLoad.thresh||85)
+                      +'% by something other than Nuarr — new jobs are steered to the rest.'
+                     :'No disk is under sustained load from anything but Nuarr.')
+                   + '\n\nAn average hides a single pinned spindle, so read it with the rows above rather than instead of them.',
+                   [['busy avg', `<b style="color:${ac}">${avg.toFixed(0)}%</b> <span class="dim">across ${L.length} disks over the last ${_diskLoad.window_s||20}s</span>`],
+                    ['busiest', busiest.map(x=>`${diskTag(x.disk||x.pool_disk||'?')} <span class="dim">${(x.busy||0).toFixed(0)}%</span>`).join(' · ')],
+                    ['hot', hotList.length?hotList.map(diskTag).join(' '):null],
+                    ['Nuarr', `<span class="m-read">${mbps(tm)}</span> <span class="dim">· ${tb?Math.max(0,Math.min(100,Math.round(tm/tb*100))):0}% of the bytes</span>`],
+                    ['everything else', `<span class="m-other">${mbps(Math.max(0,tb-tm))}</span>`]])}
                  ><span class="io-l"><span class="lg">Busy avg</span><span class="sm">B</span></span>
                   <b class="io-v" style="color:${ac}">${avg.toFixed(0)}%</b>
-                  <span class="iobar">${seg(tm,'var(--acc)')}${
-                    seg(tb-tm,'var(--warn)')}</span></span>`
+                  <span class="iobar">${seg(tm,'var(--acc)')}${seg(Math.min(Math.max(0,tb-tm), vB),'var(--ok)')}${
+                    seg(Math.max(0,tb-tm-vB),'var(--warn)')}</span></span>`
               : '';
             // The job count belongs here as much as on the rows - it is the
             // one number that says whether the read/write figures are one
@@ -12836,10 +14012,17 @@ An average hides a single pinned spindle, so read it with the rows above rather 
             const ours = (r||w)
               ? gp('io-ours','nuarr',
                    pr('m-read','Read','R',mbps(r))+pr('m-write','Write','W',mbps(w))
-                   + jobTag)
+                   + jobTag, jobs?' data-jdisk="POOL"':'')
               : '';
+            const sysDisks=L.filter(x=>(x.ext_bps||0)>1e5).sort((a,b)=>(b.ext_bps||0)-(a.ext_bps||0)).slice(0,6);
             const sys = ext>0
-              ? gp('io-sys','system', `<b class="m-other io-v">${mbps(ext)}</b>`)
+              ? gp('io-sys','system', `<b class="m-other io-v">${mbps(ext)}</b>`,
+                   ptip('sys', 'Everything on the array that is not one of Nuarr\'s jobs, added up over every disk: a DrivePool balance, a Plex scan, a backup, a copy. It is the half the job gate reacts to.',
+                     [['total', `<b class="m-other">${mbps(ext)}</b>`],
+                      ['disk read', `<span class="m-read">${mbps(L.reduce((a,x)=>a+(x.ext_read_bps||0),0))}</span> <span class="dim">· whole-disk counters, Nuarr included</span>`],
+                      ['disk write', `<span class="m-write">${mbps(L.reduce((a,x)=>a+(x.ext_write_bps||0),0))}</span>`],
+                      ['where', sysDisks.map(x=>`${diskTag(x.disk||x.pool_disk||'?')} <span class="dim">${mbps(x.ext_bps)}</span>`).join(' · ')||null],
+                      ['moves', moves.filter(m=>!m.mine).slice(0,4).map(m=>(m.from||'elsewhere')+' → '+(m.to||'elsewhere')+' '+mbps(m.bps)).join(', ')||null]]))
               : '';
             // EVERY VIEWER ON THE ARRAY, added up. The per-disk groups answer
             // "is this spindle spoken for"; this answers "how much of the pool
@@ -12857,28 +14040,19 @@ An average hides a single pinned spindle, so read it with the rows above rather 
             // above it each showed one. The per-disk rows already take their
             // viewer from _hostIo when remote; the total has to read the same
             // place or it is summing a different table from the one on screen.
-            const VM = (_remote && _hostIo && (_hostIo.hosts||[])[0]
-                        && (_hostIo.hosts[0].viewers||{}))
-                     || _plexDetail || {};
-            const V=Object.values(VM);
-            const vN=V.reduce((t,x)=>t+(x.viewers||0),0);
-            const vP=V.reduce((t,x)=>t+(x.paused||0),0);
-            // Only what is READING, same correction as the per-disk chips: a
-            // paused stream keeps its place and moves nothing, so adding its
-            // bitrate here would have the pool row claim throughput no disk is
-            // delivering.
-            const vB=V.reduce((t,x)=>t + ((x.who&&x.who.length)
-                ? x.who.filter(w=>w.state!=='paused')
-                       .reduce((a,w)=>a+(w.kbps||0),0)
-                : (x.paused?0:(x.kbps||0))), 0)*125;
+            const whoAll=Object.entries(VM).flatMap(([dk,x])=>(x.who||[]).map(w=>Object.assign({_disk:dk},w)));
             const view = vN
               ? gp('io-view',
                    (vN>1?vN+' viewers':'viewer')
                    + (vP ? (vN>1?' \u00b7 '+vP+' paused':' \u00b7 paused') : ''),
                    (vN-vP)>0 && vB>=1000
                      ? `<b class="m-view io-v">${mbps(vB)}</b>`
-                     : '<span class="io-idle" title="a paused stream keeps its'
-                       + ' place on the pool but reads nothing">holding</span>')
+                     : '<span class="io-idle">holding</span>',
+                   ptip('view', (vP?`${vP} paused — counted, but adding nothing to the rate, because a paused stream is not reading.\n\n`:'')
+                     + 'Every viewer on the array, with the disk each one is reading from. A disk with a viewer on it is the one Nuarr slows down for first.',
+                     [['viewers', `<b>${vN}</b>${vP?` <span class="dim">· ${vP} paused</span>`:''}`],
+                      ['reading', `<span class="m-view">${mbps(vB)}</span>`],
+                      ...whoAll.map(w=>[w.state==='paused'?'paused':'playing', `<b>${esc(w.user||'someone')}</b> <span class="dim">·</span> ${esc(w.title||'')}${w.kbps?` <span class="dim">· ${(w.kbps/1000).toFixed(1)} Mbps</span>`:''} <span class="dim">·</span> ${diskTag(w._disk)}${w.local!=null?` <span class="dim">· ${w.local?'local':'remote'}</span>`:''}`])]))
               : '';
             // SAME FOUR SLOTS as the rows above, so the totals sit directly
             // under the columns they total rather than in their own
@@ -12893,6 +14067,7 @@ An average hides a single pinned spindle, so read it with the rows above rather 
                  + sl('sl-view', view || og('io-view','viewer'));
             })()}</div></td></tr></tbody>`
     +'</table>';
+  popsRefresh();
 }
 
 let drillQuery=null;
@@ -12968,9 +14143,19 @@ function attnPaint(){
                  :`<a href="#" style="font-size:11px" onclick="document.getElementById('attnPanel').style.display='none';drill({errors:1,t:'Errors'});return false">open the errors list →</a>`}
       </div>`;
     for(const it of list){
+      // THE FIX, WHERE THE PROBLEM IS. A .iso that failed its job also shows
+      // up under "audio language" (it has no tracks to have a language), and
+      // both rows are the same answer: the release was never a video file, so
+      // reject it and ask the arr for another. Only rows the server has
+      // classified as a content problem get the button - same rule as the
+      // errors drill, so a naming block never arrives with a delete attached.
+      const act = it.refetch_kind==='content' && it.id
+        ? `<button class="refetch" style="margin-left:10px;font-size:10.5px;padding:1px 7px"
+                   title="${esc(it.refetch_why||'reject the release this came from and ask the arr for another')}"
+                   onclick="refetchAsk(${it.id}, true)">Blocklist &amp; re-download</button>` : '';
       h+=`<div style="padding:3px 14px 6px 26px">
-        <div style="font-size:12px">${esc(it.title||it.path||'(unnamed)')}</div>
-        ${it.detail?`<div class="dim" style="font-size:11px">${esc(it.detail)}</div>`:''}
+        <div style="font-size:12px;display:flex;align-items:center;flex-wrap:wrap">${esc(it.title||it.path||'(unnamed)')}${act}</div>
+        ${it.detail?`<div class="${it.refetch_kind==='content'?'':'dim'}" style="font-size:11px${it.refetch_kind==='content'?';color:var(--warn)':''}">${esc(it.detail)}</div>`:''}
         ${it.path?`<div class="mono dim" style="font-size:10px;overflow-wrap:anywhere">${esc(it.path)}</div>`:''}
       </div>`;
     }
@@ -13208,7 +14393,10 @@ async function drillRefresh(force){
             ? 'adopted by the arr after a rescan'
             : `adoption: ${r.adopt_state}`
               + (r.adopt_attempts?` (attempt ${r.adopt_attempts} of 3)`:'');
-          why += `<div class="warn sub" style="color:var(--warn)">${esc(atext)}</div>`;
+          const fixBtn = (r.adopt_state==='orphan'||r.adopt_state==='checking')
+            ? ` <button class="refetch" style="color:var(--acc);border-color:var(--acc)" title="Ask the arr to take this file now: a rescan of its folder, and if the arr's parser will not match the name, a manual import into the movie or episode the folder belongs to."
+                        onclick="adoptNow(${r.id})">Import into the arr</button>` : '';
+          why += `<div class="warn sub" style="color:var(--warn)">${esc(atext)}${fixBtn}</div>`;
         }
         if(r.subocr_state==='rejected')
           why += `<div class="dim sub">subtitle OCR rejected this file — see reason above</div>`;
@@ -13328,7 +14516,16 @@ function drillRaw(){ window.open(drillUrl(5000).replace('/api/files?','/api/file
 // - about four files in five have no surviving grab record - and that changes
 // the offer from "reject this release" to "delete it and hope", which the
 // person clicking deserves to know before they commit, not after.
-async function refetchAsk(id){
+async function adoptNow(id){
+  const b=event&&event.target; if(b){ b.disabled=true; b.textContent='asking the arr…'; }
+  let r;
+  try{ r=await (await fetch(`/api/files/${id}/adopt`,{method:'POST'})).json(); }
+  catch(e){ alert('could not reach nuarr: '+e); return; }
+  alert((r.ok?'Imported.\n\n':'Not imported.\n\n')+(r.detail||r.outcome||''));
+  drillRefresh(true); loadAll();
+}
+
+async function refetchAsk(id, fromAttn){
   let p;
   try{ p = await (await fetch(`/api/files/${id}/refetch`)).json(); }
   catch(e){ return alert('could not reach the arr: '+e); }
@@ -13357,7 +14554,8 @@ async function refetchAsk(id){
              : 'Failed:\n\n' + (r.why||'unknown')
                + ((r.did&&r.did.length)?'\n\nbut this had already happened:\n  '
                   + r.did.join('\n  '):''));
-  drillRefresh(true);
+  if(fromAttn){ loadAttention(true); }
+  else drillRefresh(true);
   loadAll();                       // the Errors tile count has just changed
 }
 
@@ -14298,7 +15496,20 @@ function renderSelfUse(s){
   // goes per file and can miss a sample, but the job list knows it is there.
   const gpuWork=((s&&s.gpu_work)||[]).some(w=>w.n>0);
   const onCard=ourPids.some(p=>gpids.has(p)) || gpuWork;
-  const busyElsewhere=!onCard && (G.encoder_pct>=1 || (G.procs||[]).length>0);
+  // "SOMETHING ELSE IS USING IT" ONLY WHEN IT USES WHAT NUARR USES. The
+  // old test fired if any process held VRAM, and eighteen do on an idle
+  // desktop - dwm, Chrome, Plex sitting there, the terminal - so the chip
+  // sat highlighted at "encoder 0%" for nothing nuarr would ever contend
+  // with. Nuarr's engines are NVENC and NVDEC for encodes and the CUDA
+  // cores for Whisper and PaddleOCR; the dot and the tooltip now mean one
+  // of those is meaningfully busy, and the tooltip names which.
+  const engEnc=Math.round(G.encoder_pct||0), engDec=Math.round(G.decoder_pct||0),
+        engSm=Math.round(G.gpu_pct||0);
+  const busyEngines=[]
+    .concat(engEnc>=5?[`encoder ${engEnc}%`]:[])
+    .concat(engDec>=5?[`decoder ${engDec}%`]:[])
+    .concat(engSm>=30?[`cores ${engSm}%`]:[]);
+  const busyElsewhere=!onCard && busyEngines.length>0;
   const gb2=document.querySelector('#suGpuBtn b');
   if(gb2){
     // NVENC IS NO LONGER THE ONLY WAY NUARR USES THIS CARD. When the encoder
@@ -14318,8 +15529,7 @@ function renderSelfUse(s){
   if(gbtn){
     gbtn.classList.toggle('otherbusy', busyElsewhere);
     gbtn.title = busyElsewhere
-      ? `Nuarr is not using the GPU — something else is (encoder ${
-          Math.round(G.encoder_pct||0)}%). Click for what.`
+      ? `Nuarr is not using the GPU — something else is (${busyEngines.join(', ')}). Click for what.`
       : (onCard
           ? `Nuarr on the GPU — encoder ${Math.round(G.encoder_pct||0)}%, `
             + `cores ${Math.round(G.gpu_pct||0)}%. Click for the card's engines.`
@@ -16789,6 +17999,8 @@ function stageCell(w){
     return `<span class="pill p-warn" title="A viewer reading this spindle is `
          + `short of buffer, so this job is paused. It resumes on its own `
          + `within a second of the buffer recovering.">paused for viewer</span>`;
+  if(w.paused_for_load)
+    return `<span class="pill p-warn" title="${esc(w.pace_why||'')}">paused for disk load</span>`;
   if(w.stage==='encoding')
     return w.eta_s!=null
       ? `<span class="m-lbl">ETA</span> <span class="m-time">${hms(w.eta_s)}</span>`
@@ -16834,7 +18046,8 @@ function stageCell(w){
         + (w.commit_bps ? ` <span class="m-lbl">at</span> `
                           +`<span class="m-write">${mbps(w.commit_bps)}</span>` : '')
         + (w.commit_eta_s!=null ? ` <span class="m-lbl">ETA</span> `
-                          +`<span class="m-time">${hms(w.commit_eta_s)}</span>` : '');
+                          +`<span class="m-time">${hms(w.commit_eta_s)}</span>` : '')
+        + (w.pace_factor>0 ? ` <span class="pill p-warn" style="font-size:10px" title="${esc(w.pace_why||'')}">paced ${Math.round(100/(1+w.pace_factor))}%</span>` : '');
     }
     return `<span>committing ${from} <span class="arrow">→</span> `
          + `${diskTag(w.dest_disk)}`
@@ -16848,9 +18061,15 @@ function stageCell(w){
          + `</span>`;
   }
   const lbl = STAGE_LABEL[w.stage] || w.stage || '';
+  // A HELD JOB SAYS SO IN AMBER. "waiting for DrivePool 28m 21s" in the same
+  // grey as "probing" read as one more stage going by; it is the opposite -
+  // a gate has stopped the job, and the bar goes the same colour (barState).
+  const held = /^waiting/i.test(lbl);
   // once past the encode the elapsed time in THIS stage is the useful number
-  return `<span class="dim">${stageMarkup(lbl)}${
-    w.stage_s?` ${hms(w.stage_s)}`:''}</span>`;
+  return `<span class="${held?'':'dim'}">${held
+      ? `<b style="color:var(--warn)">${stageMarkup(lbl)}</b>`
+      : stageMarkup(lbl)}${
+    w.stage_s?` <span class="dim">${hms(w.stage_s)}</span>`:''}</span>`;
 }
 
 // Whole-run progress bar + ETA.
@@ -17076,7 +18295,10 @@ async function loadAuto(){
     ${(a.spread||[]).length?`<div class="aqspread">
        <div class="aq-k" style="margin-bottom:4px">queue spread
          <span class="${a.spread_disks>=4?'v-ok':'v-warn'}">${a.spread_disks}</span>
-         <span class="dim">of ${a.source_disks} disks with work · oldest first within each</span>
+         <span class="dim">disk${a.spread_disks===1?'':'s'} in the queue${
+           a.source_disks
+             ? ` · ${a.source_disks} with more to pull, oldest first within each`
+             : ' · nothing left to pull from'}</span>
        </div>
        <div class="aqbars">${(()=>{
          // BY DISK NUMBER, NOT BY COUNT. Sorted by size the bars re-ordered
@@ -17860,8 +19082,8 @@ function paintRunning(j){
            +(w.actions.length>12
               ? `<li class="dim">• …and ${w.actions.length-12} more</li>` : '')
            +`</ul>`:''}
-        <div class="bar big"><i class="${indet?'indet':''}${reset?' nogrow':''}"
-             style="width:${pct.toFixed(1)}%;background:${col}"></i></div>
+        <div class="bar big"><i class="${indet?'indet':''}${bs.held?' held':''}${reset?' nogrow':''}"
+             style="width:${pct.toFixed(1)}%;background-color:${col}"></i></div>
         <div class="wkstats">${wkStatsHtml(w, pct, indet)}</div>
         <div class="socrzone">${subOcrCell(w)}${subFixCell(w)}</div>
         <div class="iozone">${ioCell(w)}</div>
@@ -18089,7 +19311,13 @@ function barState(w, poolCol){
     const phase = w.stage==='committing' ? 'commit' : 'work';
     if(s && s.phase===phase) pct = Math.max(pct, s.disp*100);
   }
-  return {pct, col, indet};
+  // STOPPED BY A GATE, NOT WORKING. A viewer's buffer, DrivePool moving
+  // data, the commit queue, the OCR queue - the bar stops and, in its pool
+  // colour, looks like a stall. Amber with a static hatch says "paused on
+  // purpose"; the sweep is dropped because a sweep means "busy, no ETA".
+  const held = !!(w.paused_for_viewer || w.paused_for_load || /^waiting/.test(w.stage||''));
+  if(held){ col = 'var(--warn)'; if(indet){ indet = false; pct = 100; } }
+  return {pct, col, indet, held};
 }
 
 function wkStatsHtml(w, pct, indet){
@@ -18128,6 +19356,7 @@ function tryPatchCards(j){
     const bar = card.querySelector('.bar.big > i');
     if(bar){
       bar.classList.toggle('indet', bs.indet);
+      bar.classList.toggle('held', !!bs.held);
       // The phase flip (encode -> commit) resets the bar; suppress the ease
       // for that one write, same rule the rebuild path applies via .nogrow.
       const phaseKey = w.job_id+':'+(w.stage||'');
@@ -18136,7 +19365,10 @@ function tryPatchCards(j){
         _barPhase[w.job_id] = phaseKey;
       } else bar.classList.remove('nogrow');
       if(!bs.indet) bar.style.width = bs.pct.toFixed(1)+'%';
-      bar.style.background = bs.col;
+      // background-COLOR, not the shorthand: the shorthand inline resets
+      // background-image and wiped the indet sweep and the held hatch.
+      bar.style.background = '';
+      bar.style.backgroundColor = bs.col;
     }
     const st = card.querySelector('.wkstats');
     if(st) st.innerHTML = wkStatsHtml(w, bs.pct, bs.indet);
@@ -18398,6 +19630,30 @@ function renderDone(j){
   // (Times is 52px); five-cell detail rows inherited those widths and the
   // summary text rendered one letter per line down the Times column. The
   // grid gives detail rows their own geometry inside the file's row.
+  // BEFORE -> AFTER -> CHANGE, in the same three slots everywhere. A job
+  // knows its sizes as numbers; an upgrade from the arr only says them in
+  // its detail line - "WEBDL-1080p h264 AAC 2.0 · 1.05 GB -> Bluray-1080p
+  // x264 DTS 5.1 · 14.25 GB" - so the size column showed a lone current
+  // size for the one event that is most obviously a before-and-after.
+  const SZ_RE=/([\d.]+)\s*(TB|GB|MB|KB)\b/gi;
+  const SZ_MULT={KB:1e3,MB:1e6,GB:1e9,TB:1e12};
+  function upgradeSizes(detail){
+    const t=String(detail||''); const k=t.indexOf('->');
+    if(k<0) return null;
+    const pick=str=>{ let m,last=null; SZ_RE.lastIndex=0;
+      while((m=SZ_RE.exec(str))) last=parseFloat(m[1])*SZ_MULT[m[2].toUpperCase()];
+      return last; };
+    const b=pick(t.slice(0,k)), a=pick(t.slice(k+2));
+    return (b&&a)?{before:b,after:a}:null;
+  }
+  function szCells(b,a,cur){
+    if(b&&a){
+      const d=(a-b)/b*100;
+      return `<span class="szc"><span>${gb(b)}</span><span class="dim">→</span><span>${gb(a)}</span>`
+        +`<span style="color:${d<0?'var(--ok)':(d>0?'var(--warn)':'var(--dim)')}">${d>0?'+':''}${d.toFixed(1)}%</span></span>`;
+    }
+    return `<span class="szc"><span></span><span></span><span class="dim">${cur?gb(cur):'—'}</span><span></span></span>`;
+  }
   const evRow=e=>{
     const ts=e.at||0, nm=evName(e);
     return `<tr class="actsub"><td colspan="5"><div class="subgrid">
@@ -18406,18 +19662,16 @@ function renderDone(j){
       <div class="wrap">${e.detail
         ?`<div class="mono dim detail" style="font-size:11px">${fmtDetail(e.detail)}</div>`
         :`<span class="dim">${esc(nm)}</span>`}</div>
-      <span class="num dim nb">${e.size?gb(e.size):'—'}</span>
+      <span class="num dim nb">${(()=>{ const u=nm==='upgraded'?upgradeSizes(e.detail):null;
+        return u?szCells(u.before,u.after):szCells(0,0,e.size); })()}</span>
       <span></span></div></td></tr>`;
   };
   const jobRow=r=>{
     const b=r.size_before||0, a=r.size_after||0;
-    const delta=(b&&a)?((a-b)/b*100):null;
     // A skipped or cancelled job records no before/after on purpose - nothing
     // was transcoded - but "—" where a size belongs reads as missing data.
     // The file's current size (joined in by the API) is the honest value.
-    const txt=(b&&a)?`${gb(b)} → ${gb(a)} <span style="color:${
-          delta<0?'var(--ok)':'var(--warn)'}">${delta>0?'+':''}${delta.toFixed(1)}%</span>`
-        :(r.file_size?`<span class="dim">${gb(r.file_size)}</span>`:'—');
+    const txt=szCells(b,a,r.file_size);
     const isOpen=openLogId && openLogId===r.job_id;
     const main=`<tr class="actsub ${isOpen?'rowopen':''}"><td colspan="5"><div class="subgrid">
       <span class="dim when nb">${esc(fullTs(r.finished_at))}</span>
@@ -18461,8 +19715,8 @@ function renderDone(j){
       +'<th class="num nb" style="width:52px" title="entries for this file">Times</th>'
       // Size gets breathing room and Last gets enough width for "just now":
       // at 150/74 with no gap the two ran together as "-10.2%just now".
-      +'<th class="num nb" style="width:150px;padding-right:18px">Size</th>'
-      +'<th class="nb" style="width:96px;padding-left:6px">Last</th></tr>';
+      +'<th class="num nb" style="width:206px;padding-right:0"><span class="szc szh"><span>before</span><span></span><span>after</span><span>change</span></span></th>'
+      +'<th class="nb" style="width:84px;padding-left:14px">Last</th></tr>';
     html+=glist.map((g,gi)=>{
       const open=_actOpen.has(g.title);
       const pills=[...g.labels.entries()].map(([l,n])=>pillFor(l,n)).join(' ');
@@ -18471,26 +19725,35 @@ function renderDone(j){
       // the window carried a delta (upgrades, imports, skips), fall back to
       // the file's CURRENT size from the newest entry that knows it - a plain
       // number, dim, so it cannot be misread as a measured change.
-      let sz='—';
+      // THREE FIXED CELLS, NOT ONE STRING. "25.1 GB → 25.1 GB -0.0%" and
+      // "1.0 GB" are different widths, and in a fixed column the long ones
+      // spilled into Last while the short ones floated - nothing lined up
+      // down the column. Before, after and change each get their own slot;
+      // a row with only a current size puts it in the "after" slot so the
+      // numbers still stack.
+      let sz=szCells(0,0,0);
       const js=g.entries.filter(it=>it.job&&it.job.size_before&&it.job.size_after);
+      // Upgrades count as a before-and-after too: an "upgraded x4" row is
+      // the first upgrade's old file against the newest upgrade's new one.
+      const ups=g.entries.filter(it=>it.ev&&evName(it.ev)==='upgraded')
+                         .map(it=>upgradeSizes(it.ev.detail)).filter(Boolean);
       if(js.length){
-        const b=js[0].job.size_before, a=js[js.length-1].job.size_after;
-        const d=(a-b)/b*100;
-        sz=`${gb(b)} → ${gb(a)} <span style="color:${d<0?'var(--ok)':'var(--warn)'}"
-            >${d>0?'+':''}${d.toFixed(1)}%</span>`;
+        sz=szCells(js[0].job.size_before, js[js.length-1].job.size_after);
+      }else if(ups.length){
+        sz=szCells(ups[0].before, ups[ups.length-1].after);
       }else{
         for(let i=g.entries.length-1;i>=0;i--){
           const it=g.entries[i];
           const s=it.job?it.job.file_size:(it.ev.size||0);
-          if(s){ sz=`<span class="dim">${gb(s)}</span>`; break; }
+          if(s){ sz=szCells(0,0,s); break; }
         }
       }
       const head=`<tr class="actrow ${open?'rowopen':''}" onclick="actToggle(${gi})">
         <td class="wrap"><div><span class="actcaret">${open?'▾':'▸'}</span><b>${esc(g.title)}</b></div></td>
         <td><div class="actpills">${pills}</div></td>
         <td class="num dim nb">${g.entries.length}</td>
-        <td class="num dim nb" style="padding-right:18px">${sz}</td>
-        <td class="dim nb" style="padding-left:6px"
+        <td class="num dim nb" style="padding-right:0">${sz}</td>
+        <td class="dim nb" style="padding-left:14px;white-space:nowrap"
             title="${esc(new Date(g.last*1000).toLocaleString())}"
           >${ago(g.last)}</td></tr>`;
       return head+(open
@@ -19046,13 +20309,54 @@ function renameHtml(t){
        + `<span class="r-arrow">→</span>`
        + `<span class="r-new">${esc(newn)}</span>`;
 }
+// ---- one colour per system --------------------------------------------
+// START, END and the rules around them share the colour of the system that
+// wrote them, so a Plex catch-up pass and a rename pass read as two things
+// even when their lines interleave. Jobs are one system among the rest.
+// Fixed hues for the systems that exist, bright enough to carry a 72-char
+// rule on the dark background; anything new hashes to a hue of its own.
+const SYS_HUE={
+  job:186, scan:35, autoqueue:48, commitqueue:22, renamequeue:280, plexqueue:330,
+  plexsync:300, disktrend:200, lifecycle:0, adopter:95, healer:120, origlang:160,
+  contentkind:170, audit:255, webhooks:210, arrguard:240, playback:20, backup:60,
+  maintenance:140, ffmpeg:265, arrhealth:225, arrsync:230, arrgap:215, arrtotals:220,
+  audiolang:15, audiotitle:30, consolewatch:80, errorretry:345, rulesgap:110,
+  subocr:100, ocrupd:105, updates:250};
+function sysColour(key){
+  key=key||'';
+  let h=SYS_HUE[key];
+  if(h==null){ h=0; for(const c of key) h=(h*31+c.charCodeAt(0))%360; }
+  return `hsl(${h} 85% 66%)`;
+}
 function logLine(r){
   const t=String(r.text||'');
-  if(/^[=─]{8,}$/.test(t)) return `<div class="rule">${esc(t)}</div>`;
+  const sc=sysColour(r.system||(r.job_id?(String(r.job_id).startsWith('scan-')?'scan':'job'):''));
+  if(/^[=─]{8,}$/.test(t)){
+    return r._edge
+      ? `<div class="rule rc" style="--sc:${sc}">${esc(t)}</div>`
+      : `<div class="rule">${esc(t)}</div>`;
+  }
   const ts=r.at?new Date(r.at*1000).toLocaleString():'';
   const ren=renameHtml(t);
   if(ren) return `<div class="l-ok"><span class="ts">${ts}</span>${ren}</div>`;
-  return `<div class="${logClass(t,r.level)}"><span class="ts">${ts}</span>${esc(t)}</div>`;
+  const cls=logClass(t,r.level);
+  const st=(cls==='l-start'||cls==='l-end')?` style="--sc:${sc}"`:'';
+  return `<div class="${cls}"${st}><span class="ts">${ts}</span>${esc(t)}</div>`;
+}
+// A rule is coloured when it frames a START or an END - the one before and
+// the one after each. Any other rule stays dim. Done over the rows in file
+// order, before they are grouped, so a system's rules and a job's rules are
+// both found next to the line they belong to.
+function markEdges(rows){
+  const isRule=r=>/^[=─]{8,}$/.test(String(r.text||''));
+  const isEdge=r=>/^(START|END)\s/.test(String(r.text||''));
+  for(let i=0;i<rows.length;i++){
+    if(!isEdge(rows[i])) continue;
+    const own=rows[i].system||rows[i].job_id||null;
+    const same=r=>r && (r.system||r.job_id||null)===own;
+    if(i>0 && isRule(rows[i-1]) && same(rows[i-1])) rows[i-1]._edge=true;
+    if(i+1<rows.length && isRule(rows[i+1]) && same(rows[i+1])) rows[i+1]._edge=true;
+  }
 }
 function renderLogs(keepAnchor){
   const box=document.getElementById('logs');
@@ -19077,6 +20381,7 @@ function renderLogs(keepAnchor){
   const sortEl=document.getElementById('logSort');
   const ordered = (sortEl && sortEl.value==='new')
     ? logRows.slice() : logRows.slice().reverse();
+  markEdges(ordered);
 
   // Group by JOB, not by adjacency. With four workers the lines interleave, so
   // grouping only consecutive lines chopped every job into fragments - START
@@ -19817,7 +21122,7 @@ const PANE_OF = {ffmpeg:'ffPane', backup:'bkPane',  rules:'rulesPane',
                  whisper:'whisperPane', plex:'plexPane',
                  ocr:'ocrPane', plexwork:'plexworkPane', ruleschk:'ruleschkPane',
                  process:'processPane', notland:'notlandPane',
-                 updates:'updPane'};
+                 updates:'updPane', drivepool:'dpPane'};
 // DEEP LINKS ARE ALIASES, NOT PANES. Adding 'arrsync' to the table above as a
 // second key for 'arrsPane' blanked the Arrs page: the switcher assigned
 // display per KEY, so the second key's 'none' landed after the first key's ''
@@ -20108,6 +21413,11 @@ function wtab(which){
     paneLoad('meta', loadMetaTab);
     return;
   }
+  if(which==='drivepool'){
+    if(hint) hint.textContent='· DrivePool';
+    paneLoad('drivepool', loadDrivePool);
+    return;
+  }
   if(isAr){
     if(hint) hint.textContent='· arrs';
     paneLoad('arrs', loadArrsTab);
@@ -20146,6 +21456,361 @@ function wtab(which){
 // ---- Metadata tab ---------------------------------------------------------
 // Laid out as the CHAIN it actually is. Each hop is owned by something
 // different, so each hop gets its own row and its own refresh button.
+// ---- StableBit DrivePool -------------------------------------------------
+let _dp=null, _dpTimer=null;
+async function loadDrivePool(){
+  const el=document.getElementById('dpBody');
+  if(!el){ if(_dpTimer) clearTimeout(_dpTimer); _dpTimer=null; return; }
+  try{ _dp=await (await fetch('/api/drivepool')).json(); }
+  catch(e){ el.innerHTML='<div class="err">could not read the DrivePool status</div>'; return; }
+  // The per-disk direction comes from the disk trend - the same numbers the
+  // pool panel shows - so a balance can say which disk it is emptying.
+  let disks=[];
+  try{ const s=await (await fetch('/api/summary')).json(); disks=(s.disks||[]); }catch(e){}
+  // LIVE RATES, not the half-hour trend. The trend is a fit over 30 minutes
+  // and lags a move by most of that - a disk DrivePool had just switched to
+  // filling still read "emptying 32 GB/h" from the last half hour. The disk
+  // counters are per second: what the system (which here means DrivePool)
+  // is writing onto or reading off each spindle right now.
+  try{ const j=await (await fetch('/api/jobs/live')).json(); _dpLive={}; ((j.disk_load||{}).disks||[]).forEach(x=>{ _dpLive[x.disk]=x; });
+       _dpMine={}; (((j.io||{}).by_disk)||[]).forEach(x=>{ _dpMine[x.disk]=x; }); }catch(e){}
+  dpPaint(disks);
+  if(_dpTimer) clearTimeout(_dpTimer);
+  _dpTimer=setTimeout(loadDrivePool, Object.keys((_dp||{}).active||{}).length?2000:15000);
+}
+let _dpLive={}, _dpMine={};
+// Whole-disk read and write this second: the system counters (DrivePool,
+// Plex, backups - everything that is not Nuarr) plus Nuarr's own jobs on
+// that disk, which the counters had subtracted out.
+function dpRW(disk){
+  const L=_dpLive[disk]||{}, M=_dpMine[disk]||{};
+  return {r:(L.ext_read_bps||0)+(M.read_bps||0), w:(L.ext_write_bps||0)+(M.write_bps||0), mine:(M.read_bps||0)+(M.write_bps||0)};
+}
+// The rate to show for a disk: live counter first, trend as the fallback.
+// +bytes/s filling, −bytes/s emptying. `dir` says which counter to trust
+// when DrivePool has declared the direction.
+function dpRate(x, dir){
+  const L=_dpLive[x.pool_disk];
+  if(L){
+    const w=L.ext_write_bps||0, r=L.ext_read_bps||0;
+    if(dir==='in'  && w>1e6) return w;
+    if(dir==='out' && r>1e6) return -r;
+    if(!dir && Math.max(w,r)>1e6) return w>=r ? w : -r;
+  }
+  return (x.trend&&x.trend.now_bps!=null)?x.trend.now_bps:0;
+}
+function dpMb(b){ return (b/1e6).toFixed(0)+' MB/s'; }
+// THE NUMBER ON THE BOX. Drive makers sell decimal terabytes (10^12 bytes);
+// everything else on the panel is binary (2^40), which is why a "20 TB" disk
+// shows as 18.19 TB. Rounded to a whole number because that is what is
+// printed on the label - 18.19 TiB is 20.00 TB, 9.10 TiB is 10.00 TB.
+function advNum(bytes){ const v=(bytes||0)/1e12; return v>=1?Math.round(v):Math.round(v*10)/10; }
+function advTB(bytes){ return advNum(bytes)+' TB'; }
+function dpDur(s){ s=Math.max(0,Math.round(s)); return s>=3600?`${Math.floor(s/3600)}h ${Math.floor(s%3600/60)}m`:(s>=60?`${Math.floor(s/60)}m ${s%60}s`:`${s}s`); }
+function dpPaint(disks){
+  const el=document.getElementById('dpBody'); const d=_dp; if(!el||!d) return;
+  // KEEP THE SCROLL. The whole body is rebuilt every two seconds during a
+  // move; without this the page jumped to the top on every repaint.
+  const keepY=window.scrollY;
+  setTimeout(()=>{ if(Math.abs(window.scrollY-keepY)>2) window.scrollTo(0,keepY); },0);
+  if(!d.installed){
+    el.innerHTML=`<div class="lkind" style="padding:11px 12px"><b>DrivePool is not installed on this machine</b>
+      <div class="dim" style="font-size:13px;margin-top:3px">Nothing to watch; every hold below is idle. The disk-load check still steers work around busy spindles whatever is causing the load.</div></div>`;
+    return;
+  }
+  const act=Object.entries(d.active||{});
+  const T=d.toggles||{};
+  const en=!!T['drivepool.enabled'];
+  // ---- header: the install and the log ------------------------------
+  const logAge=d.log_at?Math.max(0,Date.now()/1000-d.log_at):null;
+  const head=`<div class="lkind" style="padding:10px 12px;display:flex;gap:14px;align-items:center;flex-wrap:wrap">
+      <b>StableBit DrivePool ${esc(d.version||'')}</b>
+      <span class="pill ${d.running?'p-ok':'p-bad'}">${d.running?'service running':'service not running'}</span>
+      <span class="pill ${d.log_ok?'p-ok':'p-warn'}" title="${esc(d.log_file||'')}">${d.log_ok?'reading its log':'log not readable'}</span>
+      ${logAge!=null?`<span class="dim" style="font-size:12.5px">last entry ${dpDur(logAge)} ago</span>`:''}
+      <label class="gsw" style="margin-left:auto">
+        <input type="checkbox" ${en?'checked':''} onchange="dpToggle('drivepool.enabled',this.checked)">
+        <span class="gname">integration</span><span class="gstate ${en?'on':'off'}">${en?'on':'off'}</span>
+      </label>
+    </div>`;
+  // ---- what it is doing now ------------------------------------------
+  disks.forEach(x=>{ x._r=dpRate(x,''); });
+  const emptying=disks.filter(x=>x._r<-2e6).sort((a,b)=>a._r-b._r).slice(0,3);
+  const filling=disks.filter(x=>x._r>2e6).sort((a,b)=>b._r-a._r).slice(0,3);
+  // WHERE THE DATA IS GOING, AND FOR HOW LONG - FROM DRIVEPOOL'S OWN RULES.
+  // The first version guessed "most free space" and named the disk being
+  // emptied as the next target. drivepool.py decodes the balancer settings
+  // instead. Two rules matter here: the Disk Space Equalizer (by percent)
+  // moves data from disks above the pool average to disks below it until
+  // they meet, and Prevent Drive Overfill drains anything over its empty
+  // line (65%) and never fills past its fill line. On a live run the
+  // equaliser is what decides: a disk at 56% kept draining with the 65%
+  // line far away, because the pool average was 52%. So the finish line
+  // for an emptier is the higher of the two thresholds it is under, the
+  // fill target's ceiling is the lower of the two, and "next" is the next
+  // disk on the wrong side of the average - labelled as a guess, because
+  // DrivePool also weighs file placement rules we cannot see.
+  //
+  // ONE SHAPE PER LINE: what | which disk | the figures | when. Five
+  // different sentences were five things to parse; a column of rows is one.
+  // The whole-run ETA comes from DrivePool's own progress ratio - how much
+  // of the run has gone by since it started, at the pace it has kept.
+  const nowS=Date.now()/1000;
+  const runEta=(()=>{
+    let best=null;
+    for(const [,v] of act){
+      if(v.ratio==null||!v.since) continue;
+      const prog=v.ratio-(v.ratio_from||0), el=nowS-v.since;
+      if(prog>0.003&&el>60){ const e=(1-v.ratio)*el/prog; if(best==null||e>best) best=e; }
+    }
+    return best;
+  })();
+  let target='';
+  const TG=d.targets||{}; const BI=d.balance||{};
+  const haveTG=Object.keys(TG).length>0;
+  if(act.length && (filling.length||emptying.length||haveTG)){
+    const B=d.balancers||{}; const of=B.overfill;
+    const dn=x=>`<span style="color:${diskColour(x.pool_disk||x)}">${esc(x.pool_disk||x)}</span>`;
+    const pctOf=x=>x.total?x.used/x.total*100:null;
+    const sized=disks.filter(x=>x.total&&x.used!=null);
+    const byName={}; sized.forEach(x=>byName[x.pool_disk]=x);
+    const avg=sized.reduce((a,x)=>a+x.used,0)/Math.max(1,sized.reduce((a,x)=>a+x.total,0));
+    const eta=sec=>sec<60?'any moment':'about '+dpDur(sec);
+    const row=(lbl,disk,fig,when)=>`<div class="dprow"><span class="dpl">${lbl}</span><span class="dpd">${disk}</span><span class="dpf dim">${fig}</span><span class="dpe">${when}</span></div>`;
+    const rows=[];
+    const run=act.find(([,v])=>v.ratio!=null);
+    if(run) rows.push(row('this run','<span class="pill p-warn" style="font-size:11.5px">'+esc(run[1].label)+'</span>',
+      `${(run[1].ratio*100).toFixed(1)}% through · running ${dpDur(nowS-run[1].since)}${BI.bytes_to_balance!=null?` · DrivePool says <b>${gb(BI.bytes_to_balance)}</b> left to move`:''}`,
+      runEta!=null?`done in <b>${eta(runEta)}</b>`:'<span class="dim">measuring the pace…</span>'));
+    if(haveTG){
+      // per-disk targets are drawn in the balance card below, one row per disk
+    }else{
+      if(filling.length){
+        const cur=filling[0], rate=cur._r;
+        const ceil=of?Math.min(of.fill,avg):avg;
+        const room=ceil*cur.total-cur.used;
+        rows.push(row('filling now',dn(cur),
+          `<span style="color:var(--warn)">${gb(rate*3600)}/h</span> · ${pctOf(cur).toFixed(1)}% used · ${room>0?`${gb(room)} to the pool average (${(avg*100).toFixed(1)}%)`:`at the pool average (${(avg*100).toFixed(1)}%) now`}`,
+          room>0?`hand-over in <b>${eta(room/rate)}</b>`:'hand-over <b>any moment</b>'));
+      }
+      if(emptying.length){
+        const cur=emptying[0], rate=-cur._r;
+        const over=cur.used-avg*cur.total;
+        rows.push(row('emptying now',dn(cur),
+          `<span style="color:#79c0ff">${gb(rate*3600)}/h</span> · ${pctOf(cur).toFixed(1)}% used · ${over>0?`${gb(over)} to shed`:'at the line'} · down to the pool average (${(avg*100).toFixed(1)}%)`,
+          over>0?`done in <b>${eta(over/rate)}</b>`:'<b>finishing the files in flight</b>'));
+      }
+      rows.push(row('targets','<span class="dim">reading…</span>',`DrivePool's own per-disk targets load a few seconds after the page opens${d.targets_err?` — last attempt failed: ${esc(d.targets_err)}`:''}`,''));
+    }
+    target=`<div class="dplist">${rows.join('')}</div>`;
+  }
+  // BOTH LINES, ALWAYS. Drawn only when a disk was moving, the block grew
+  // and shrank between two-second polls and the whole page hopped with it.
+  // A fixed height with a dash for "nothing" keeps everything below still.
+  const flowLine=(word,col,list,sign)=>`<div style="font-size:13px;margin-top:4px;display:flex;gap:8px;align-items:baseline;min-height:19px">
+        <b style="color:${col};width:76px;flex:none">${word}</b>
+        <span class="dim">${list.length
+          ? list.map(x=>`<span style="color:${diskColour(x.pool_disk)}">${esc(x.pool_disk)}</span> <span style="color:${col}">${gb(sign*x._r*3600)}/h</span>`).join(' · ')
+          : '—'}</span>
+      </div>`;
+  const flow=act.length
+    ? `<div style="margin-top:6px">${flowLine('Emptying','#79c0ff',emptying,-1)}${flowLine('Filling','var(--warn)',filling,1)}</div>`
+    : '';
+  const now=act.length
+    ? act.map(([k,v])=>{
+        const r=v.ratio!=null?Math.max(0,Math.min(1,v.ratio)):null;
+        return `<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+          <span class="pill p-warn" style="font-size:12.5px">${esc(v.label)}</span>
+          <b>${esc(v.text)}</b>
+        </div>
+        ${r!=null?`<div class="pxsbar" style="margin-top:6px;max-width:420px"><i style="width:${(r*100).toFixed(1)}%"></i></div>
+          <div class="dim" style="font-size:12px;margin-top:2px">${(r*100).toFixed(1)}% through this run · <span style="color:#58a6ff">reads ${dpMb(d.read_bps)}</span> · <span style="color:#e3b341">writes ${dpMb(d.write_bps)}</span>${
+            runEta!=null?` · <b style="color:var(--fg,#c9d1d9)">about ${dpDur(runEta)} left</b>`:''}</div>`:''}`;
+      }).join('')
+    : `<div><span class="pill p-ok" style="font-size:12.5px">idle</span> <b>DrivePool is not moving anything</b>
+       ${d.rate_bps>2e6?`<span class="dim" style="font-size:12.5px"> · the service is still doing ${dpMb(d.rate_bps)} of I/O (placement or a measure)</span>`:''}</div>`;
+  const flags=Object.keys(d.flags||{}).filter(f=>f!=='PoolPartBusy');
+  const nowCard=`<div class="lkind" style="padding:11px 12px;margin-top:10px">
+      <div class="dim" style="font-size:12px;letter-spacing:.04em;text-transform:uppercase;margin-bottom:5px">right now</div>
+      ${now}${flow}${target}
+      ${flags.length?`<div class="dim" style="font-size:12.5px;margin-top:6px">also flagged: ${flags.map(esc).join(', ')}</div>`:''}
+    </div>`;
+  // ---- what nuarr is holding -----------------------------------------
+  const H=d.holds||{};
+  const holdRow=(k,label,what)=>{ const h=H[k]||{};
+    return `<div style="display:flex;gap:10px;align-items:baseline;padding:3px 0;font-size:13px">
+      <span style="width:120px;flex:none"><b>${label}</b></span>
+      <span class="pill ${h.on?'p-warn':'p-ok'}" style="flex:none">${h.on?'waiting':'running'}</span>
+      <span class="dim">${h.why?esc(h.why):what}</span></div>`; };
+  const holdsCard=`<div class="lkind" style="padding:11px 12px;margin-top:10px">
+      <div class="dim" style="font-size:12px;letter-spacing:.04em;text-transform:uppercase;margin-bottom:5px">what nuarr is doing about it</div>
+      ${holdRow('jobs','New jobs','starting as normal — the dispatcher steers new work off the busy spindles')}
+      ${holdRow('commits','File replaces','the swap of a finished file into the pool goes ahead')}
+      ${holdRow('renames','Renames','rename requests go to the arrs as they come due')}
+    </div>`;
+  // ---- the switches ---------------------------------------------------
+  const kinds=[['jobs','New jobs','Nothing new starts while this is going on. Running jobs finish. Off by default: the dispatcher already avoids the busy disks, and a balance can run for hours.'],
+               ['commits','File replaces','A finished file is not swapped into the pool until the move is over. The encode sits safely in the cache meanwhile. This is the race that loses files.'],
+               ['renames','Renames','Rename requests wait in their queue rather than asking the arr to move a file the balancer may be moving too.']];
+  const acts=[['balancing','Balancing','DrivePool evening out how full each disk is.'],
+              ['duplicating','Duplicating','Making or repairing the extra copies of duplicated folders.'],
+              ['removing','Removing a disk','Evacuating a disk you are taking out of the pool. Every file on it is on the move.']];
+  const sw=`<div class="lkind" style="padding:11px 12px;margin-top:10px${en?'':';opacity:.55'}">
+      <div class="dim" style="font-size:12px;letter-spacing:.04em;text-transform:uppercase;margin-bottom:5px">while DrivePool is… hold nuarr's…</div>
+      <table class="fixed" style="width:100%;max-width:680px;font-size:13px">
+        <tr><th style="text-align:left"></th>${kinds.map(k=>`<th title="${esc(k[2])}">${k[1]}</th>`).join('')}</tr>
+        ${acts.map(a=>`<tr>
+          <td style="padding:6px 0"><b>${a[1]}</b><div class="dim" style="font-size:12px">${a[2]}</div></td>
+          ${kinds.map(k=>{ const key=`drivepool.${a[0]}.${k[0]}`; const on=!!T[key];
+            return `<td style="text-align:center"><label class="gsw" style="justify-content:center" title="${esc(k[2])}">
+              <input type="checkbox" ${on?'checked':''} ${en?'':'disabled'} onchange="dpToggle('${key}',this.checked)">
+              <span class="gstate ${on?'on':'off'}">${on?'on':'off'}</span></label></td>`; }).join('')}
+        </tr>`).join('')}
+      </table>
+      <div class="dim" style="font-size:12px;margin-top:6px">File replaces go ahead during a balance and are paced per chunk against the disk the file actually lands on — slowed as that disk gets busy, stopped if it is saturated — the same ramp a viewer gets. New jobs are held only while the move has a disk at quarter-speed level or worse (90%+ busy without Nuarr). Renames are held for the whole move, since they race the mover for the same file. Removing a disk holds everything. A held commit waits up to three hours and then goes ahead regardless.</div>
+      ${(()=>{ const P=d.pressure||{}; const rows=Object.entries(P).filter(([,x])=>(x.ext_busy||0)>=10||x.paused).sort((a,b)=>(b[1].ext_busy||0)-(a[1].ext_busy||0));
+        if(!rows.length) return '<div class="dim" style="font-size:12px;margin-top:4px">Right now no disk is under measurable load from anything but Nuarr — every copy runs at full speed.</div>';
+        return `<div style="font-size:12px;margin-top:4px"><span class="dim">Nuarr’s pace right now:</span> ${rows.map(([dk,x])=>{ const eb=x.ext_busy||0; const lvl=x.paused?'<b style="color:var(--bad)">paused</b>':eb>=90?'<b style="color:var(--warn)">quarter speed</b>':eb>=40?`<b style="color:var(--warn)">~${Math.round(100/(1+3*(eb-40)/50))}%</b>`:'<span style="color:var(--ok)">full speed</span>';
+          return `<span style="color:${diskColour(dk)}">${esc(dk)}</span> ${lvl} <span class="dim">(${eb.toFixed(0)}% ${esc(x.who)})</span>`; }).join(' · ')}</div>`; })()}
+    </div>`;
+  // ---- the file mover's errors today -----------------------------------
+  const errs=(d.mover_errors||[]);
+  const errCard=`<div class="lkind" style="padding:11px 12px;margin-top:10px">
+      <div class="dim" style="font-size:12px;letter-spacing:.04em;text-transform:uppercase;margin-bottom:5px">DrivePool's file mover today</div>
+      ${errs.length?`<div style="font-size:13px"><b>${errs.length}</b> move${errs.length>1?'s':''} DrivePool could not make</div>
+        <div class="dim" style="font-size:12.5px;margin:3px 0 6px">"Object Name not found" means the file was gone by the time the mover reached it — almost always one nuarr had just replaced. Harmless: the balancer picks it up again on its next pass. These are the mirror image of the race the holds above prevent.</div>
+        <div class="flist" style="max-height:200px">${errs.slice().reverse().map((e,i)=>`<div class="qrow">
+            <span class="qn">${i+1}</span><span class="qt" title="${esc(e.path)}">${esc(e.path.split('\\').pop())}</span>
+            <span class="qwhy dim" style="flex:0 0 240px;text-align:left">${esc(e.why)}</span>
+            <span class="qsrc dim" style="flex:0 0 70px">${ago(e.at)}</span></div>`).join('')}</div>`
+       :'<div class="dim" style="font-size:13px">no failed moves today</div>'}
+    </div>`;
+  // ---- history ----------------------------------------------------------
+  const ev=(d.events||[]);
+  const hist=`<div class="lkind" style="padding:11px 12px;margin-top:10px">
+      <div class="dim" style="font-size:12px;letter-spacing:.04em;text-transform:uppercase;margin-bottom:5px">recent moves</div>
+      ${ev.length?`<div class="flist" style="max-height:260px"><div class="qrow qhead">
+          <span class="qn">#</span><span class="qt">What</span><span class="qwork" style="flex:0 0 130px">Started</span>
+          <span class="qwhy" style="flex:0 0 80px;text-align:left">Took</span><span class="qdisk" style="flex:0 0 90px" title="average while nuarr was watching">Rate</span>
+          <span class="qsrc" style="flex:0 0 110px" title="how far through the run it got">Progress</span></div>
+        ${ev.map((e,i)=>{ const took=(e.ended_at||Date.now()/1000)-e.started_at;
+          return `<div class="qrow"><span class="qn">${i+1}</span>
+            <span class="qt">${esc((d.labels||{})[e.kind]||e.kind)}${e.ended_at?'':' <span class="pill p-warn" style="font-size:9px">now</span>'}</span>
+            <span class="qwork" style="flex:0 0 130px">${new Date(e.started_at*1000).toLocaleString()}</span>
+            <span class="qwhy dim" style="flex:0 0 80px;text-align:left">${dpDur(took)}</span>
+            <span class="qdisk dim" style="flex:0 0 90px">${e.avg_bps?dpMb(e.avg_bps/2):'—'}</span>
+            <span class="qsrc dim" style="flex:0 0 110px">${e.ratio_to!=null?(e.ratio_to*100).toFixed(0)+'%':(e.ended_at?'—':'')}${e.moved_est>1e9?` · ~${gb(e.moved_est)}`:''}</span></div>`; }).join('')}</div>`
+       :'<div class="dim" style="font-size:13px">nothing recorded yet</div>'}
+    </div>`;
+  // ---- HOW BALANCED IS THE POOL - one picture ------------------------
+  // Every disk's fill as a bar against the pool average, with the two lines
+  // the balancer works to (the equaliser's target and Prevent Drive
+  // Overfill's ceiling). The headline is the spread - fullest minus
+  // emptiest - and how many bytes would have to move to close it, which is
+  // the honest answer to "how far from balanced".
+  const balCard=(()=>{
+    const B=d.balancers||{}; const of=B.overfill;
+    const sized=disks.filter(x=>x.total&&x.used!=null).slice().sort((a,b)=>{
+      const na=parseInt((a.pool_disk.match(/\d+$/)||[0])[0]), nb=parseInt((b.pool_disk.match(/\d+$/)||[0])[0]);
+      return na-nb;});
+    if(sized.length<2) return '';
+    const T=sized.reduce((a,x)=>a+x.total,0), U=sized.reduce((a,x)=>a+x.used,0);
+    const avg=U/T*100;
+    const pct=x=>x.used/x.total*100;
+    const ps=sized.map(pct);
+    const hi=Math.max(...ps), lo=Math.min(...ps), spread=hi-lo;
+    const over=sized.filter(x=>pct(x)>avg).reduce((a,x)=>a+(x.used-avg/100*x.total),0);
+    const TOL=1.0;                                  // within a point is "even"
+    const off=sized.filter(x=>Math.abs(pct(x)-avg)>TOL);
+    const TG=d.targets||{}; const BI=d.balance||{};
+    const overLine = of ? sized.filter(x=>pct(x)>of.empty*100) : [];
+    const overBytes = of ? overLine.reduce((a,x)=>a+(x.used-of.empty*x.total),0) : 0;
+    const dpVerdict = BI.ratio!=null
+      ? `<div style="font-size:13px;margin-top:2px"><span class="dim">DrivePool's own reading:</span> <b style="color:${BI.ratio>=0.999?'var(--ok)':'var(--warn)'}">${(BI.ratio*100).toFixed(2)}% balanced</b>${BI.bytes_to_balance!=null?` <span class="dim">· ${gb(BI.bytes_to_balance)} still to move</span>`:''}${(BI.plugins||[]).some(p=>p.on)?` <span class="dim">· balancers on: ${(BI.plugins||[]).filter(p=>p.on).map(p=>esc(p.name)).join(', ')}</span>`:''}</div>`
+      : '';
+    const verdict = (overLine.length && avg<=of.empty*100)
+      ? `<b style="color:var(--warn)">${overLine.length} disk${overLine.length===1?'':'s'} over the overfill line</b> <span class="dim">— ${overLine.map(x=>x.pool_disk).join(', ')} above ${(of.empty*100).toFixed(0)}%; ${gb(overBytes)} has to come off ${overLine.length===1?'it':'them'} whatever the average says</span>`
+      : spread<=TOL*2
+      ? `<b style="color:var(--ok)">balanced</b> <span class="dim">— every disk within ${TOL} point of the pool average${of&&overLine.length?`; note ${overLine.length} disk${overLine.length===1?' is':'s are'} over the ${(of.empty*100).toFixed(0)}% overfill line, but so is the pool average (${avg.toFixed(1)}%), so that rule cannot be satisfied and the balancer will keep shuffling`:''}</span>`
+      : `<b style="color:var(--warn)">${gb(over)} out of place</b> <span class="dim">— ${off.length} disk${off.length===1?'':'s'} more than ${TOL} point off the average; fullest ${hi.toFixed(1)}%, emptiest ${lo.toFixed(1)}%, a spread of ${spread.toFixed(1)} points</span>`;
+    // THE CHART IS THE LIST. One row per disk: the bar (fill, pool average,
+    // DrivePool's target), then the figures the old rows carried - fill now,
+    // where it stops, bytes still to move, rate, ETA. HTML rather than SVG
+    // so nothing can overlap: every figure has its own column.
+    const stops=of?[of.fill*100, of.empty*100]:[];
+    const lo0=Math.max(0,Math.floor((Math.min(lo,avg,...stops.filter(v=>v>0))-3)/2)*2);
+    const hi0=Math.min(100,Math.ceil((Math.max(hi,avg,...stops)+3)/2)*2);
+    const X=v=>Math.max(0,Math.min(100,(v-lo0)/(hi0-lo0)*100));
+    const trows=sized.map(x=>{
+      const v=pct(x), dv=v-avg;
+      const col = Math.abs(dv)<=TOL ? '#8b98a6' : (dv>0?'var(--warn)':'#79c0ff');
+      const t=TG[x.pool_disk]||null;
+      const moving = t && t.delta!=null && ((t.moving_in&&t.delta>0)||(t.moving_out&&t.delta<0));
+      const stop = moving ? (x.used+t.delta)/x.total*100 : null;
+      const dir = moving ? (t.delta>0?'in':'out') : '';
+      const r = dpRate(x, dir);
+      const rate = Math.abs(r)>2e6 ? `<span style="color:${r>0?'var(--warn)':'#79c0ff'}">${r>0?'▲':'▼'} ${gb(Math.abs(r)*3600)}/h</span>` : '<span class="dim">—</span>';
+      let eta='<span class="dim">—</span>';
+      if(moving){
+        const need=Math.abs(t.delta);
+        if(dir==='in' && r>2e6) eta=`<b>${dpDur(need/r)}</b>`;
+        else if(dir==='out' && r<-2e6) eta=`<b>${dpDur(need/-r)}</b>`;
+        else eta='<span class="dim">not moving yet</span>';
+      }
+      // LIT WHILE IT MOVES. A disk DrivePool is writing onto glows amber, one
+      // it is reading off glows blue - the live counters decide, so the glow
+      // follows the mover within a couple of seconds and goes out when it
+      // switches disks. The bar itself keeps its balance colour underneath.
+      const live = Math.abs(r)>2e6 ? (r>0?'bal-in':'bal-out') : '';
+      const rw=dpRW(x.pool_disk);
+      const rwCell=v=>v>=1e5?mbps(v):'<span class="dim">—</span>';
+      return `<div class="balrow ${live}">
+        <span class="baln" style="color:${diskColour(x.pool_disk)}">${esc(x.pool_disk)}</span>
+        <span class="balbar"><i class="balfill" style="width:${X(v).toFixed(2)}%;background:${col}"></i>${live?`<i class="balglow"></i>`:''}
+          <i class="balavg" style="left:${X(avg).toFixed(2)}%"></i>
+          ${stop!=null?`<i class="baltgt" style="left:${X(stop).toFixed(2)}%" title="DrivePool's target: stops at ${stop.toFixed(1)}%"></i>`:''}</span>
+        <span class="balp" style="color:${col}">${v.toFixed(1)}%</span>
+        <span class="bald" style="color:${Math.abs(dv)<=TOL?'#525c6b':col}">${dv>0?'+':''}${dv.toFixed(1)}</span>
+        <span class="bals">${stop!=null?`<span class="dim">→</span> ${stop.toFixed(1)}%`:''}</span>
+        <span class="balm" style="color:${dir==='in'?'var(--warn)':dir==='out'?'#79c0ff':'#525c6b'}">${moving?`${dir==='in'?'+':'−'}${gb(Math.abs(t.delta))} ${dir}`:''}${(()=>{
+          // THE NUMBER'S OWN MOTION: what it was, how fast DrivePool is
+          // eating into it, and when it last moved - so a "to move" that
+          // sits still for ten minutes reads as stuck rather than live.
+          if(!moving) return '';
+          const bits=[];
+          if(t.prev_delta!=null && Math.abs(t.prev_delta-t.delta)>=1) bits.push(`was ${t.prev_delta>0?'+':'−'}${gb(Math.abs(t.prev_delta))}`);
+          if(t.delta_bps && Math.abs(t.delta_bps)>1e5){ const shrinking=(t.delta>0&&t.delta_bps<0)||(t.delta<0&&t.delta_bps>0); bits.push(`<span style="color:${shrinking?'var(--ok)':'var(--warn)'}">${shrinking?'▼':'▲'} ${gb(Math.abs(t.delta_bps)*3600)}/h</span>`); }
+          if(t.first_delta!=null && Math.abs(t.first_delta)>Math.abs(t.delta)+1e8) bits.push(`${gb(Math.abs(t.first_delta)-Math.abs(t.delta))} done since first seen`);
+          const age=t.changed_at?nowS-t.changed_at:null;
+          const stale=age!=null && age>600;
+          bits.push(`<span style="color:${stale?'var(--warn)':'#8b98a6'}">${age==null?'':(age<60?'changed just now':'changed '+dpDur(age)+' ago')}</span>`);
+          return `<div style="font-size:10.5px;color:#8b98a6;line-height:1.2">${bits.join(' · ')}</div>`; })()}</span>
+        <span class="balrd m-read" title="${rw.mine?`includes ${mbps(rw.mine)} of Nuarr's own jobs`:'nothing of Nuarr\'s on this disk'}">${rwCell(rw.r)}</span>
+        <span class="balwr m-write">${rwCell(rw.w)}</span>
+        <span class="balr">${rate}</span>
+        <span class="bale">${eta}</span>
+      </div>`;
+    }).join('');
+    const svg=`<div class="baltab">
+      <div class="balrow balhead"><span class="baln"></span><span class="balbar" style="background:none;border:0"><span class="dim" style="position:absolute;left:0">${lo0}%</span><span style="position:absolute;left:${X(avg).toFixed(2)}%;transform:translateX(-50%);color:#c9d1d9">avg ${avg.toFixed(1)}%</span><span class="dim" style="position:absolute;right:0">${hi0}%</span></span>
+        <span class="balp">used</span><span class="bald">vs avg</span><span class="bals">stops at</span><span class="balm">to move${d.targets_at?` <span class="dim" style="text-transform:none;letter-spacing:0">· read ${dpDur(nowS-d.targets_at)} ago</span>`:''}</span><span class="balrd">read</span><span class="balwr">write</span><span class="balr">rate</span><span class="bale">ETA</span></div>
+      ${trows}
+    </div>`;
+    return `<div class="lkind" style="padding:11px 12px;margin-top:10px">
+      <div class="dim" style="font-size:12px;letter-spacing:.04em;text-transform:uppercase;margin-bottom:5px">how balanced the pool is</div>
+      <div style="font-size:13.5px">${verdict}</div>
+      ${dpVerdict}
+      ${svg}
+      <div class="dim" style="font-size:12px;margin-top:4px">Bars are each disk's fill on a zoomed axis; "vs avg" is its distance from the pool average in points — amber fuller, blue emptier, grey within ${TOL} point. ${Object.keys(TG).length?'The white tick is DrivePool\'s own target for the disk, "stops at" the fill it will reach, "to move" the bytes DrivePool still intends to move on or off it, and the ETA is that at the current rate. ':''}${act.length&&spread>TOL*2?`The run in progress is what closes this gap.`:''}</div>
+    </div>`;
+  })();
+  const html=head+nowCard+balCard+holdsCard+sw+errCard+hist;
+  if(html!==el._dpKey){ el._dpKey=html; el.innerHTML=html; }
+}
+async function dpToggle(key,on){
+  try{ await fetch('/api/drivepool/toggle?key='+encodeURIComponent(key)+'&on='+(on?'true':'false'),{method:'POST'}); }catch(e){}
+  loadDrivePool();
+}
 async function loadMetaTab(){
   const el=document.getElementById('metaBody');
   if(!el) return;
@@ -20168,7 +21833,7 @@ async function loadMetaTab(){
         <b>${esc(a.arr)}</b>
         ${a.ok ? `<span class="pill p-ok">connected</span>`
                : `<span class="pill p-bad">unreachable${a.error?' — '+esc(a.error):''}</span>`}
-        ${a.version?`<span class="dim mono" style="font-size:10.5px">v${esc(a.version)}</span>`:''}
+        ${a.version?`<span class="dim mono" style="font-size:12px">v${esc(a.version)}</span>`:''}
       </div>
       <div class="metawhen">
         ${a.task
@@ -20181,7 +21846,7 @@ async function loadMetaTab(){
     </div>`;
   }).join('');
   el.innerHTML = `
-    <div class="dim" style="font-size:11.5px;margin-bottom:10px;line-height:1.5">
+    <div class="dim" style="font-size:13px;margin-bottom:10px;line-height:1.5">
       Nuarr does not talk to TMDB or TheTVDB itself — the arrs do. This page is
       about those providers and the arrs' own metadata health. What Nuarr then
       copies OUT of the arrs — original language — lives with the arrs
@@ -20703,6 +22368,9 @@ function pxLead(s, leadNow){
     if(s.lead_proven)
       return `<span class="dim" title="Proven from playback: the client played this far without fetching a single byte, so it must have held it. Measured across a resume, so it does not depend on when Nuarr started watching.">
         ${t} buffered <span style="opacity:.7">(proven)</span></span>`;
+    if(s.lead_held)
+      return `<span class="dim" title="Held from the last reading before the pause — a paused player spends none of its buffer, so what it had then it still has.">
+        ${t} buffered <span style="opacity:.7">(held through the pause)</span></span>`;
     return `<span class="dim" title="Estimated from the bytes Plex has delivered to this client against the file's bitrate. Less certain than the other readings \u2014 it cannot see what the player did with them.">
         ${t} buffered <span style="opacity:.7">(${
           s.lead_full ? 'buffer full' : 'estimated'})</span></span>`;
@@ -22888,7 +24556,94 @@ function pxsQueueHtml(q){
       Each one is re-checked against the file before it is closed, so a row
       leaves this queue only when Plex is describing what the file actually
       holds. ${last}</div>
+    ${pqTroubleHtml(q)}
   </div>`;
+}
+
+// ---- the files that are not going smoothly -------------------------------
+// A count of "1 retrying · 1 gave up" says there is a problem and not which
+// file, and the file is the only thing you can act on. Rows in the queue's
+// own house style: title, how many attempts, what Plex said last time, the
+// disk, and a pill for where it stands. Rows on their first pass are not
+// listed - they are the happy path and would bury the two that matter.
+//
+// MANUAL PUTS A BUTTON ON EVERY ROW; AUTO TAKES THE BUTTON AWAY AND SAYS
+// WHAT IT WILL DO INSTEAD. Same rule as the subtitle-rules card: one switch,
+// and the buttons grey out rather than vanish, so the manual affordance is
+// still visible under the automatic one.
+let _pqOpen = false;
+function pqTroubleHtml(q){
+  const retry=(q.rows||[]).filter(r=>(r.attempts||0)>1 && !r.held);
+  const stuck=q.stuck||[];
+  const n=retry.length+stuck.length;
+  if(!n) return '';
+  const auto = _pxs && _pxs.mode==='auto';
+  const hrs = Math.round((q.revive_s||21600)/3600);
+  const head = `<div onclick="_pqOpen=!_pqOpen;pxsPaint()"
+       style="display:flex;gap:8px;align-items:center;cursor:pointer;
+              margin-top:6px;font-size:11px">
+      <span class="dim" style="width:9px">${_pqOpen?'▾':'▸'}</span>
+      <b>${fmt(n)} not going smoothly</b>
+      ${retry.length?`<span class="warn">${fmt(retry.length)} retrying</span>`:''}
+      ${stuck.length?`<span class="warn">${fmt(stuck.length)} gave up</span>`:''}
+      <span style="margin-left:auto;display:flex;gap:8px;align-items:center">
+        ${auto
+          ? `<span class="dim" style="font-size:10.5px">auto: anything that gave up goes back on the ladder after ${hrs}h</span>`
+          : ''}
+        ${stuck.length?`<button class="gapbtn" style="font-size:11px;padding:2px 9px"
+            ${auto?'disabled':''}
+            onclick="event.stopPropagation();pqRequeue(null,this)"
+            title="${auto
+              ? 'Auto is on: gave-up files are put back by themselves, '+hrs+' hours after giving up. Switch to manual to drive it by hand.'
+              : 'Put every file that gave up back on the ladder, attempts reset, and run the queue now.'}"
+            >Requeue all ${fmt(stuck.length)}</button>`:''}
+      </span>
+    </div>`;
+  if(!_pqOpen) return head;
+  const rows=[...retry.map(r=>({...r,_k:'retry'})), ...stuck.map(r=>({...r,_k:'stuck'}))];
+  return head + `<div class="flist" style="max-height:316px;margin-top:4px">
+      <div class="qrow qhead">
+        <span class="qn">#</span><span class="qt">Title</span>
+        <span class="qwork">Attempts</span><span class="qwhy">Plex said</span>
+        <span class="qdisk">Disk</span><span class="qsrc">State</span>
+        <span class="qact"></span>
+      </div>
+      ${rows.map((r,i)=>pqRowHtml(r,i,q,auto)).join('')}
+    </div>`;
+}
+function pqRowHtml(r,i,q,auto){
+  const max=q.max_attempts||6;
+  const why=String(r.last_error||'').replace(/^gave up after \d+:\s*/,'');
+  let st;
+  if(r._k==='stuck'){
+    st=`<span class="pill p-warn" title="gave up ${ago(r.done_at)} after ${r.attempts} of ${max}">gave up</span>`;
+  } else {
+    const left=Math.max(0,(r.next_try_at||0)-Date.now()/1000);
+    st=`<span class="pill p-dim" title="attempt ${r.attempts} of ${max} missed; next in ${hms(Math.round(left))}">retry ${hms(Math.round(left))}</span>`;
+  }
+  return `<div class="qrow">
+      <span class="qn">${fmt(i+1)}</span>
+      <span class="qt" title="${esc(r.path||'')}">${esc(r.label||r.path||'')}</span>
+      <span class="qwork">${fmt(r.attempts||0)} of ${max}</span>
+      <span class="qwhy dim" title="${esc(why)}">${esc(why||'—')}</span>
+      <span class="qdisk" style="color:${diskColour(r.disk)}">${esc(r.disk||'')}</span>
+      <span class="qsrc">${st}</span>
+      <span class="qact"><button class="gapbtn" style="font-size:10px;padding:1px 7px"
+        ${auto?'disabled':''}
+        onclick="event.stopPropagation();pqRequeue(${r.file_id},this)"
+        title="${auto?'Auto is on - this happens by itself.':(r._k==='stuck'
+          ?'Back on the ladder with attempts reset, and run now.'
+          :'Skip the wait and try it now.')}">${r._k==='stuck'?'Requeue':'Try now'}</button></span>
+    </div>`;
+}
+async function pqRequeue(fileId, btn){
+  if(btn){ btn.disabled=true; btn.textContent='…'; }
+  try{
+    const u='/api/plex/queue/requeue'+(fileId!=null?'?file_id='+fileId:'?stuck=1');
+    await fetch(u,{method:'POST'});
+  }catch(e){}
+  _pqOpen=true;
+  loadPlexSync();
 }
 
 // "in 12s" / "due now" / "in 4 min", from the last poll plus the clock since.
@@ -28359,6 +30114,7 @@ _SETTINGS_NAV = [
                     ("ocr",     "OCR engines",     "language")]),
     ("Integrations", [("arrs", "Arrs",             "link"),
                       ("plex", "Plex",             "play"),
+                      ("drivepool", "DrivePool",   "folder"),
                       ("meta", "Metadata",         "globe")]),
     ("System",     [("health", "Health checks",     "shield"),
                     ("libs",   "Libraries",         "folder"),
@@ -28409,19 +30165,72 @@ _SETTINGS_SHIM = """
   if(gridParent){ gridParent.style.display='block'; }
   const h2 = host.querySelector('h2'); if(h2) h2.style.display='none';
 
+  // ONE ICON PER ENTRY, so the sidebar can collapse to a rail the way Home
+  // Assistant's does and every entry still reads. Simple stroked glyphs,
+  // inline, keyed by the nav item so two entries never share one.
+  const I = (d) => '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'+d+'</svg>';
+  const ICON = {
+    counts:  I('<path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/>'),
+    timing:  I('<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/>'),
+    gate:    I('<path d="M12 3l7 3v5c0 4.5-3 8.5-7 10-4-1.5-7-5.5-7-10V6l7-3z"/>'),
+    lang:    I('<path d="M4 6h9M8.5 4v2M6 9c1 3 3 5.5 6 7.5M11 9c-1 3-3 5.5-6 7.5M13 20l4-9 4 9M14.5 17h5"/>'),
+    vcodec:  I('<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 5v14M17 5v14M3 9h4M3 15h4M17 9h4M17 15h4"/>'),
+    acodec:  I('<path d="M4 12h2M8 8v8M12 5v14M16 9v6M20 11v2"/>'),
+    alang:   I('<rect x="9" y="3" width="6" height="11" rx="3"/><path d="M6 11a6 6 0 0 0 12 0M12 17v4M9 21h6"/>'),
+    rules:   I('<path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01"/>'),
+    ruleschk:I('<path d="M4 12l4 4L20 6"/>'),
+    process: I('<path d="M4 6h5l3 6-3 6H4M12 12h8M17 9l3 3-3 3"/>'),
+    notland: I('<path d="M3 13l3-8h12l3 8v6H3z"/><path d="M3 13h5l1.5 2h5L16 13h5"/>'),
+    plexwork:I('<path d="M6 4l14 8-14 8z"/>'),
+    ffmpeg:  I('<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M3 15h18M8 4v16M16 4v16"/>'),
+    mkv:     I('<path d="M14 6a4 4 0 0 0-5.7 5.7L3 17l4 4 5.3-5.3A4 4 0 0 0 18 10l-2.5 2.5-2-2L16 8z"/>'),
+    whisper: I('<path d="M4 12c2-5 5-7 8-7s6 2 8 7c-2 5-5 7-8 7s-6-2-8-7z"/><circle cx="12" cy="12" r="2.5"/>'),
+    ocr:     I('<path d="M4 8V5h3M17 5h3v3M20 16v3h-3M7 19H4v-3M8 12h8M12 8v8"/>'),
+    arrs:    I('<path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7L11.5 6.8M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1.5-1.5"/>'),
+    plex:    I('<path d="M5 3h5l7 9-7 9H5l7-9z"/>'),
+    drivepool:I('<ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v6c0 1.7 3.6 3 8 3s8-1.3 8-3V6M4 12v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/>'),
+    meta:    I('<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/>'),
+    health:  I('<path d="M3 12h4l2-5 3 10 3-8 2 3h4"/>'),
+    libs:    I('<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>'),
+    cache:   I('<path d="M4 4h16v6H4zM4 14h16v6H4z"/><path d="M8 7h.01M8 17h.01"/>'),
+    jobs:    I('<circle cx="12" cy="12" r="8.5"/><path d="M12 8v4l3 1.5M5 3l-2 2M19 3l2 2"/>'),
+    logs:    I('<path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4M9 12h6M9 16h6"/>'),
+    updates: I('<path d="M12 4v11M7 10l5 5 5-5M4 19h16"/>'),
+    backup:  I('<path d="M12 3v9M8 8l4 4 4-4"/><path d="M4 14v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4"/>'),
+  };
   const wrap = document.createElement('div');
   wrap.className = 'setwrap';
   const side = document.createElement('div');
   side.className = 'setside';
-  let html = '<div class="settitle">Settings</div>';
+  let html = '<div class="settitle"><button class="setcollapse" type="button" title="Collapse or expand the settings menu" aria-label="Collapse or expand the settings menu"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button><span class="slab">Settings</span></div>';
   for(const g of NAV){
-    html += '<div class="setgrp">'+g.group+'</div>';
+    html += '<div class="setgrp"><span class="slab">'+g.group+'</span></div>';
     for(const it of g.items){
-      html += '<a class="setlink" data-k="'+it.key+'" href="#'+it.key+'">'+it.label+'</a>';
+      html += '<a class="setlink" data-k="'+it.key+'" href="#'+it.key+'" title="'+it.label+'"><span class="sico">'+(ICON[it.key]||ICON.rules)+'</span><span class="slab">'+it.label+'</span></a>';
     }
   }
-  html += '<a class="setlink setback" href="/">&larr; Back to dashboard</a>';
+  html += '<a class="setlink setback" href="/" title="Back to dashboard"><span class="sico">'+I('<path d="M11 5l-7 7 7 7M4 12h16"/>')+'</span><span class="slab">Back to dashboard</span></a>';
   side.innerHTML = html;
+
+  // COLLAPSE TO A RAIL. Remembered per browser; a phone starts collapsed
+  // (Home Assistant's default) and, when expanded there, the menu opens over
+  // the content as a drawer and closes itself once an entry is picked.
+  const mobile = () => document.documentElement.classList.contains('mobile');
+  // remembered separately per layout, so collapsing it on the phone does
+  // not collapse it on the desktop (or in desktop-site mode) as well
+  const KEY = mobile() ? 'nuarr.setside.m' : 'nuarr.setside';
+  let pref = null; try{ pref = localStorage.getItem(KEY); }catch(e){}
+  const startRail = pref ? pref==='rail' : mobile();
+  wrap.classList.toggle('rail', startRail);
+  side.querySelector('.setcollapse').addEventListener('click', ()=>{
+    const rail = !wrap.classList.contains('rail');
+    wrap.classList.toggle('rail', rail);
+    try{ localStorage.setItem(KEY, rail ? 'rail' : 'full'); }catch(e){}
+  });
+  side.addEventListener('click', (e)=>{
+    if(mobile() && e.target.closest('.setlink') && !wrap.classList.contains('rail'))
+      wrap.classList.add('rail');
+  });
 
   host.parentNode.insertBefore(wrap, host);
   wrap.appendChild(side);
@@ -28476,6 +30285,27 @@ _SETTINGS_CSS = """
 .setlink:hover{background:rgba(255,255,255,.04)}
 .setlink.on{background:rgba(88,166,255,.12);border-left-color:#58a6ff;color:#58a6ff}
 .setback{margin-top:16px;opacity:.6;font-size:12px}
+/* ---- the collapsible rail ---- */
+.setlink{display:flex;align-items:center;gap:9px}
+.sico{width:18px;height:18px;flex:0 0 18px;display:inline-flex;opacity:.8}
+.sico svg{width:18px;height:18px}
+.setlink.on .sico{opacity:1}
+.settitle{display:flex;align-items:center;gap:8px}
+.setcollapse{background:none;border:0;color:inherit;padding:4px;margin:-4px 0 -4px -6px;cursor:pointer;border-radius:6px;display:inline-flex}
+.setcollapse svg{width:18px;height:18px}
+.setcollapse:hover{background:rgba(255,255,255,.06)}
+.setwrap{position:relative}
+.setwrap.rail .setside{width:54px;flex:0 0 54px;padding:10px 0}
+.setwrap.rail .slab{display:none}
+.setwrap.rail .settitle{justify-content:center;padding:2px 0 10px}
+.setwrap.rail .setcollapse{margin:0}
+.setwrap.rail .setgrp{padding:6px 14px 0;border-top:1px solid var(--line);margin:6px 12px 0;height:0;overflow:hidden}
+.setwrap.rail .setlink{justify-content:center;padding:9px 0;gap:0}
+.setwrap.rail .setback{margin-top:10px}
+/* phones: the expanded menu is a drawer over the content */
+html.mobile .setwrap:not(.rail) .setside{position:absolute;left:0;top:0;bottom:0;z-index:20;width:230px;
+  background:var(--panel,#161b22);box-shadow:8px 0 24px rgba(0,0,0,.5);overflow-y:auto}
+html.mobile .setwrap:not(.rail) .setmain,html.mobile .setwrap:not(.rail) #workersPanel{margin-left:54px}
 /* Fill the window rather than sitting in a short box with the rest of the
    page empty below it. The log is the one pane you read INTO, and 250 lines in
    a 300px window meant scrolling a scrollbox inside a page that also scrolled.
@@ -28800,8 +30630,6 @@ _SETTINGS_CSS = """
   .cfctl{justify-content:flex-start}
   #vcodecPane .lchips,#acodecPane .lchips,#alangPane .lchips{justify-content:flex-start}
 }
-@media(max-width:820px){.setwrap{display:block}.setside{width:auto;flex:none;
-  border-right:0;border-bottom:1px solid var(--line)}}
 </style>
 """
 
@@ -28850,12 +30678,19 @@ def _page(key: str, build, request: Request) -> Response:
         html = build()
         ent = _PAGE_CACHE[key] = (html, gzip.compress(html.encode("utf-8"), 6))
     html, gz = ent
-    # NO-STORE STAYS. The dashboard changes whenever the app is updated, and
-    # Chrome cached it hard enough that a normal reload kept showing an older
-    # build - including buttons that no longer exist. Compression is about the
-    # size of the transfer, not about skipping it.
-    head = {"Cache-Control": "no-store, no-cache, must-revalidate",
-            "Pragma": "no-cache", "Vary": "Accept-Encoding"}
+    # NO-CACHE WITH A VALIDATOR, WHICH IS WHAT NO-STORE WAS REACHING FOR.
+    # The worry was real - Chrome once kept an older build through a normal
+    # reload - but the cure was aimed at storage when the fault was the lack
+    # of a way to check. no-cache means "ask before using", and the ETag is
+    # the thing to ask with: a hash of the bytes, so it changes with every
+    # build and never otherwise. Unchanged page: a 304 and no body, against
+    # 331 KB of gzip on every dashboard-to-settings hop. Updated build: a
+    # different tag, a full 200, the old page gone. Both cases are exact.
+    tag = '"' + hashlib.sha1(gz).hexdigest()[:20] + '"'
+    head = {"Cache-Control": "no-cache, must-revalidate",
+            "Pragma": "no-cache", "Vary": "Accept-Encoding", "ETag": tag}
+    if (request.headers.get("if-none-match") or "").strip() == tag:
+        return Response(status_code=304, headers=head)
     if "gzip" in (request.headers.get("accept-encoding") or "").lower():
         head["Content-Encoding"] = "gzip"
         return Response(gz, media_type="text/html; charset=utf-8", headers=head)

@@ -640,7 +640,8 @@ async def watch() -> None:
     while True:
         schedules.beat('autoqueue')
         try:
-            await top_up()
+            with joblog.section("Auto-queue top-up"):
+                await top_up()
         except Exception as e:
             STATE["last_error"] = f"{type(e).__name__}: {e}"
             joblog.log(f"auto-queue failed: {type(e).__name__}: {e}", "error")

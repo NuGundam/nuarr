@@ -473,9 +473,13 @@ async def watch() -> None:
     await asyncio.sleep(300)
     while True:
         try:
-            await scan()
-            d = _CACHE.get("data") or {}
-            n, fixable = int(d.get("total") or 0), int(d.get("fixable") or 0)
+            with joblog.section("Arr gap check") as sec:
+                await scan()
+                d = _CACHE.get("data") or {}
+                n, fixable = int(d.get("total") or 0), int(d.get("fixable") or 0)
+                if fixable:
+                    sec.note(f"{fixable} file(s) the arrs track are not indexed")
+                    sec.result = f"{fixable} to walk"
             schedules.beat("arrgap",
                            f"{fixable} to walk" if fixable
                            else (f"{n} accounted for" if n else "all walked"))

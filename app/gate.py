@@ -82,6 +82,7 @@ LABELS = {
     "cache": "Cache",
     "arrs": "Sonarr / Radarr",
     "audiolang": "Audio language",
+    "drivepool": "DrivePool",
 }
 
 
@@ -744,16 +745,44 @@ def _disk_for(path: str) -> str | None:
     """
     if not path:
         return None
-    if path in _PLEX_DISK_CACHE:
-        return _PLEX_DISK_CACHE[path]
+    hit = _PLEX_DISK_CACHE.get(path)
+    if hit:
+        return hit
+    # THE LIBRARY ALREADY KNOWS. Every managed file carries its pool disk in
+    # the files table, so the answer is one indexed lookup that touches no
+    # disk at all - and a lookup that cannot be starved is the one to use
+    # while deciding which spindle a viewer needs protecting on. The stat
+    # walk stays as the fallback for a path nuarr does not manage.
+    d = None
     try:
-        from . import scanner
-        d = scanner.disk_of(path)
-    except Exception:
+        from .db import cursor
+        from . import plexnotify
+        want = plexnotify.norm_path(path)
+        with cursor() as cur:
+            r = cur.execute("SELECT pool_disk FROM files WHERE path = ? COLLATE NOCASE "
+                            "AND pool_disk IS NOT NULL LIMIT 1",
+                            (path[4:] if path.startswith("\\\\?\\") else path,)).fetchone()
+            if r is None and want != path.lower():
+                r = cur.execute("SELECT pool_disk FROM files WHERE lower(path) = ? "
+                                "AND pool_disk IS NOT NULL LIMIT 1", (want,)).fetchone()
+        d = r["pool_disk"] if r else None
+    except Exception:                                    # noqa: BLE001
         d = None
-    if len(_PLEX_DISK_CACHE) > 200:
-        _PLEX_DISK_CACHE.clear()
-    _PLEX_DISK_CACHE[path] = d
+    if not d:
+        try:
+            from . import scanner
+            d = scanner.disk_of(path)
+        except Exception:                                # noqa: BLE001
+            d = None
+    # ONLY AN ANSWER IS REMEMBERED. "None" was cached like any other result,
+    # so one failed lookup - twelve stat calls at the old low I/O priority on
+    # a saturated pool - made that file "unknown disk" for the rest of the
+    # session, and an unknown viewer protects nothing. A miss is retried on
+    # the next refresh instead; it is cheap now that the table answers first.
+    if d:
+        if len(_PLEX_DISK_CACHE) > 200:
+            _PLEX_DISK_CACHE.clear()
+        _PLEX_DISK_CACHE[path] = d
     return d
 
 
@@ -1623,6 +1652,19 @@ def _estimate_client_leads(sessions: list[dict]) -> None:
             for t in ("lead_floor", "lead_proven", "lead_learned"):
                 s.pop(t, None)
             s["lead_disk"] = 1
+        # A PAUSE DOES NOT EMPTY THE BUFFER. Every instrument above goes quiet
+        # on a pause - no bytes, no coast, the handle idle - and the estimate
+        # fell from "281 s, at capacity" to "0.1 s" the moment Erik pressed
+        # pause, while his player drew 2 min 25 s of buffer on its bar. What
+        # was held at the last playing poll is still held: the player played
+        # nothing out of it. So the last playing estimate is the floor for as
+        # long as the pause lasts, and a seek (which resets st) clears it.
+        if playing:
+            st["hold_lead"] = lead
+            st.pop("hold_flags", None)
+        elif st.get("hold_lead") is not None and st["hold_lead"] > lead:
+            lead = st["hold_lead"]
+            s["lead_held"] = 1
         if dur_s:
             lead = min(lead, max(0.0, dur_s - off_s))
         s["lead_s"], s["lead_est"] = round(lead, 1), 1
@@ -2413,11 +2455,21 @@ def _busy_now() -> tuple[list[dict], dict]:
         k = diskload.key_for_path(p) if p else None
         if k:
             watch.add(k)
+    # A DISK THE SCAN IS WALKING IS BUSY WITH US. The walk's reads are not
+    # reported by any worker, so without this they counted as external load
+    # and the gate steered work off the very disk nuarr was scanning.
+    try:
+        from . import scanner as _sc
+        walking = {keys[l] for l in _sc.walking_disks() if l in keys}
+    except Exception:                                    # noqa: BLE001
+        walking = set()
     hot = []
     for k, d in rows.items():
         if watch and k not in watch:
             continue
         mine = ours.get(k, 0.0)
+        if k in walking:
+            mine = max(mine, d["bps"])
         ext = max(0.0, d["bps"] - mine)
         # Busy AND not busy because of us. The share test matters more than
         # the absolute: a disk at 100% that is 95% our own encode is a disk
@@ -2427,6 +2479,132 @@ def _busy_now() -> tuple[list[dict], dict]:
                         "busy": round(d["busy"], 1),
                         "ext_bps": ext, "bps": d["bps"], "mine_bps": mine})
     return hot, rows
+
+
+# ---- DISK PRESSURE: one number per spindle for everything that is not nuarr.
+#
+# The gate had three separate answers to "is this disk spoken for" - a viewer
+# (buffer-based), a DrivePool move (a log line, all or nothing) and a busy
+# threshold (steer new work) - and nuarr's own copies only ever slowed down
+# for the first. A balance pushing 100 MB/s through a spindle got a commit
+# landing on it at full speed, and a disk at 100% for a backup got the same.
+#
+# This measures instead: the disk's busy time, times the share of its bytes
+# that are not nuarr's, is how hard SOMEONE ELSE is using it. It does not
+# matter who - DrivePool, a viewer, a backup - though the name is attached
+# when it is known, because "sharing NU-DRIVE-1 with DrivePool balancing" is
+# what you want to read in the log. From that one number:
+#
+#     under LOAD_SHARE_PCT      full speed - nothing to protect
+#     up to LOAD_QUARTER_PCT    ramp down, smoothly, to a quarter speed
+#     LOAD_PAUSE_PCT sustained  stop the copy on that spindle; resume under
+#                               LOAD_RESUME_PCT (a gap, so it cannot flap)
+#
+# "Pause only if it is really high": the pause needs the MEDIAN over the
+# window above the line AND a queue building, not one busy tick.
+LOAD_SHARE_PCT = 40.0
+LOAD_QUARTER_PCT = 90.0
+LOAD_PAUSE_PCT = 97.0
+LOAD_RESUME_PCT = 85.0
+_LOADPAUSE: dict[str, float] = {}          # label -> paused since
+
+
+def pressure() -> dict[str, dict]:
+    """Per managed disk: how hard everything that is not nuarr is using it."""
+    from . import diskload
+    rows = diskload.sustained()
+    if not rows:
+        return {}
+    ours = _our_bps_by_key()
+    keys = _label_keys()
+    try:
+        from . import scanner as _sc
+        walking = {keys[l] for l in _sc.walking_disks() if l in keys}
+    except Exception:                                    # noqa: BLE001
+        walking = set()
+    # WHO. DrivePool when it says it is moving and this disk is carrying
+    # real traffic; a viewer when Plex has a session on it; otherwise just
+    # "other activity" - the number is the same whoever it is.
+    dp_act = ""
+    try:
+        from . import drivepool as _dp
+        acts = _dp.moving()
+        if acts:
+            dp_act = "DrivePool " + ", ".join(_dp.LABEL.get(k, k) for k in acts)
+    except Exception:                                    # noqa: BLE001
+        pass
+    try:
+        viewers = set(plex_disks())
+    except Exception:                                    # noqa: BLE001
+        viewers = set()
+    out: dict[str, dict] = {}
+    for label, k in keys.items():
+        d = rows.get(k)
+        if not d:
+            continue
+        mine = ours.get(k, 0.0)
+        if k in walking:
+            mine = max(mine, d["bps"])
+        bps = d["bps"]
+        ext = max(0.0, bps - mine)
+        share = (ext / bps) if bps > 0 else (1.0 if d["busy"] >= 50 else 0.0)
+        ext_busy = d["busy"] * share
+        who = []
+        if label in viewers:
+            who.append("a viewer")
+        if dp_act and ext >= 5e6:
+            who.append(dp_act)
+        if not who and ext >= 1e6:
+            who.append("other activity")
+        out[label] = {"busy": round(d["busy"], 1), "ext_busy": round(ext_busy, 1),
+                      "ext_bps": ext, "mine_bps": mine, "queue": round(d.get("queue", 0), 1),
+                      "who": " and ".join(who) or "nothing", "paused": label in _LOADPAUSE}
+    return out
+
+
+def load_pace(labels) -> tuple[float, str]:
+    """How hard to hold a copy touching `labels`: -1 pause, 0 full, up to 3.
+
+    Same contract as jobs.viewer_pace - the two are combined per chunk - and
+    the same shape: a ramp, not a switch, with a hysteresis gap on the pause.
+    """
+    if not get_toggle("gate.disk_busy"):
+        return 0.0, ""
+    p = pressure()
+    now = time.time()
+    worst = None
+    for l in labels:
+        x = p.get(l)
+        if not x:
+            continue
+        eb = x["ext_busy"]
+        st = _LOADPAUSE.get(l)
+        if st is None and eb >= LOAD_PAUSE_PCT and x["queue"] >= 1:
+            _LOADPAUSE[l] = now
+            st = now
+        elif st is not None and eb < LOAD_RESUME_PCT:
+            _LOADPAUSE.pop(l, None)
+            st = None
+        if st is not None:
+            return -1.0, (f"{l} is saturated by {x['who']} - {eb:.0f}% busy "
+                          f"without nuarr, queue {x['queue']:.0f} - paused until "
+                          f"it drops under {LOAD_RESUME_PCT:.0f}%")
+        if worst is None or eb > worst[0]:
+            worst = (eb, l, x["who"])
+    if not worst or worst[0] < LOAD_SHARE_PCT:
+        return 0.0, ""
+    frac = min(1.0, (worst[0] - LOAD_SHARE_PCT) / (LOAD_QUARTER_PCT - LOAD_SHARE_PCT))
+    f = round(3.0 * frac, 2)
+    return f, (f"sharing {worst[1]} with {worst[2]} - {worst[0]:.0f}% busy "
+               f"without nuarr, so about {100 / (1 + f):.0f}% speed")
+
+
+def heavy_disks() -> list[str]:
+    """Managed disks someone else is using at quarter-speed level or worse."""
+    try:
+        return sorted(l for l, x in pressure().items() if x["ext_busy"] >= LOAD_QUARTER_PCT)
+    except Exception:                                    # noqa: BLE001
+        return []
 
 
 def busy_disks() -> set[str]:
@@ -2506,8 +2684,12 @@ def disk_report() -> dict:
         moves = transfers()
     except Exception:
         moves = []
+    try:
+        press = pressure()
+    except Exception:                                    # noqa: BLE001
+        press = {}
     return {"disks": out, "thresh": thresh, "window_s": diskload.WINDOW_S,
-            "moves": moves,
+            "moves": moves, "pressure": press,
             "error": "", "enabled": bool(get_toggle("gate.disk_busy"))}
 
 
@@ -2773,6 +2955,47 @@ async def check_arrs() -> Reason:
     return Reason(False, "arrs", "Idle — no rename, import or scan running")
 
 
+def check_drivepool() -> Reason:
+    r"""Is DrivePool moving data - and has the user asked new jobs to wait?
+
+    Reads drivepool.py's view of the service log. Holding NEW JOBS here is
+    off by default: the disk check already steers work off busy spindles,
+    and a balance can run for hours. The holds that matter for the race -
+    file replaces and renames - are applied where those happen, not here,
+    so this row can be "active, not holding" while a commit is waiting.
+    """
+    try:
+        from . import drivepool as _dp
+    except Exception:                                    # noqa: BLE001
+        return Reason(False, "drivepool", "not available")
+    if not _dp.get_toggle("drivepool.enabled"):
+        return Reason(False, "drivepool", "integration switched off")
+    if not _dp.STATE.get("installed"):
+        return Reason(False, "drivepool", "not installed")
+    act = _dp.moving()
+    if not act:
+        return Reason(False, "drivepool", "idle - not moving anything")
+    held, why = _dp.hold_active("jobs")
+    detail = "; ".join(_dp.describe(k, v) for k, v in act.items())
+    waits = [k for k in ("commits", "renames") if _dp.hold_active(k)[0]]
+    extra = []
+    if waits:
+        extra.append("Holding " + " and ".join(
+            {"commits": "file replaces", "renames": "renames"}[k] for k in waits)
+            + " - switchable on the DrivePool page.")
+    heavy = heavy_disks()
+    if heavy:
+        extra.append(f"The move is hitting {', '.join(heavy)} hard; nuarr's copies there run paced or paused.")
+    elif _dp.hold("commits")[0] and "commits" not in waits:
+        extra.append("The disks have headroom, so file replaces go ahead at a measured pace rather than waiting.")
+    if held:
+        return Reason(True, "drivepool", detail, extra=extra,
+                      clears="When DrivePool finishes the move", active=True)
+    return Reason(False, "drivepool", detail, extra=extra,
+                  restricts="new jobs still start; file replaces and renames wait" if waits else "",
+                  active=True)
+
+
 def check_manual() -> Reason:
     if get_toggle("gate.manual_pause"):
         return Reason(True, "manual", "Paused from the dashboard",
@@ -2892,6 +3115,9 @@ async def status() -> GateStatus:
     reasons = [
         check_manual(),
         disks, cache,
+        # DrivePool beside the disks row: the disks row measures the load a
+        # balance causes; this one names the balance and says what waits.
+        check_drivepool(),
         await check_arrs(),
         # Between the arrs and Plex: like Plex it is a live subsystem sharing
         # the hardware, and unlike the checks above it can never hold anything.

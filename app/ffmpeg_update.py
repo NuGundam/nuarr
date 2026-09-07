@@ -1424,6 +1424,9 @@ def rollback(force: bool = False) -> dict:
     return {"ok": True, "version": ver}
 
 
+_NAGGED: dict = {}
+
+
 async def watch() -> None:
     """Check on a timer and say so. NEVER installs on its own.
 
@@ -1447,10 +1450,19 @@ async def watch() -> None:
             continue
         try:
             info = await check()
-            if info.get("update_available"):
+            # ONCE A DAY PER VERSION PAIR. The same sentence 36 times a day
+            # at WARN is not a warning, it is wallpaper - and it buries the
+            # WARNs that are actually news.
+            pair = (info.get("current"), info.get("latest"))
+            if (info.get("update_available")
+                    and (pair != _NAGGED.get("pair")
+                         or time.time() - _NAGGED.get("at", 0) >= 86400)):
+                _NAGGED.update(pair=pair, at=time.time())
                 joblog.log(f"ffmpeg update available: {info['current']} -> "
                            f"{info['latest']} (Settings -> ffmpeg to install)",
                            "warn")
+            elif info.get("update_available"):
+                pass                                  # already said today
             elif info.get("using_tdarr"):
                 joblog.log("ffmpeg is still Tdarr's bundled build - install "
                            "nuarr's own copy to drop that dependency", "warn")

@@ -286,7 +286,8 @@ async def watch() -> None:
     while True:
         schedules.beat('origlang')
         try:
-            await sync()
+            with joblog.section("Original language sync"):
+                await sync()
         except Exception as e:
             STATS["last_error"] = f"{type(e).__name__}: {e}"
             joblog.log(f"original-language sync failed: "

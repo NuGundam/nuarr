@@ -370,17 +370,85 @@ def _pretty(seconds: float) -> str:
     return f"{round(s / 3600)} hours"
 
 
+REVIVE_S = 6 * 3600         # auto: a gave-up row goes back on the ladder after this
+
+
+def requeue(file_id: int | None = None, stuck_only: bool = True) -> int:
+    r"""Put rows back on the ladder. Returns how many were reopened.
+
+    A row that gave up is closed with its reason kept - that is what makes
+    it visible on the panel at all. Reopening it means attempts back to
+    zero, the reason cleared, and due now; the loop then treats it exactly
+    like a fresh commit. A row still retrying is only dragged forward.
+    """
+    now = time.time()
+    with cursor() as cur:
+        if file_id is not None:
+            n = cur.execute(
+                "UPDATE plex_queue SET done_at=NULL, attempts=0, "
+                "       last_error=NULL, next_try_at=? WHERE file_id=?",
+                (now, file_id)).rowcount
+        elif stuck_only:
+            n = cur.execute(
+                "UPDATE plex_queue SET done_at=NULL, attempts=0, "
+                "       last_error=NULL, next_try_at=? "
+                " WHERE done_at IS NOT NULL AND last_error LIKE 'gave up%'",
+                (now,)).rowcount
+        else:
+            n = cur.execute(
+                "UPDATE plex_queue SET next_try_at=? WHERE done_at IS NULL",
+                (now,)).rowcount
+    return int(n or 0)
+
+
+def _revive_if_auto() -> None:
+    r"""In auto, a row that gave up is not the end of the story.
+
+    Six attempts over ten hours is the right budget for "Plex is down right
+    now"; it is the wrong answer for "Plex was down for a day". Manual leaves
+    the row where a person can see it and press the button. Auto - one
+    answer to one question, may nuarr fix what it finds - presses it: every
+    row that gave up at least REVIVE_S ago goes back on the ladder, and the
+    log says so, so a row that keeps giving up is a row that keeps being
+    written about.
+    """
+    from . import plexsync
+    if plexsync.mode() != "auto":
+        return
+    cutoff = time.time() - REVIVE_S
+    with cursor() as cur:
+        n = cur.execute(
+            "UPDATE plex_queue SET done_at=NULL, attempts=0, last_error=NULL, "
+            "       next_try_at=? "
+            " WHERE done_at IS NOT NULL AND done_at <= ? "
+            "   AND last_error LIKE 'gave up%'",
+            (time.time(), cutoff)).rowcount
+    if n:
+        joblog.log(f"Plex catch-up: auto put {n} gave-up file(s) back on the "
+                   f"ladder - each had waited {REVIVE_S // 3600}h since giving "
+                   "up", "info")
+
+
 async def watch() -> None:
     init()
     await asyncio.sleep(60)
     while True:
         schedules.beat("plexqueue")
         try:
+            await asyncio.to_thread(_revive_if_auto)
             await run_due()
         except Exception as e:                               # noqa: BLE001
             joblog.log(f"Plex queue loop error: {type(e).__name__}: {e}",
                        "error")
         await asyncio.sleep(POLL_S)
+
+
+def _label(path: str) -> str:
+    """'Show - S01E02' / 'Movie (2021)' from a path, for a one-line row."""
+    base = os.path.splitext(os.path.basename(path))[0]
+    # strip the release-group tail: everything from the first '[' on
+    cut = base.find(" [")
+    return (base[:cut] if cut > 0 else base) or path
 
 
 def stats() -> dict:
@@ -422,17 +490,22 @@ def stats() -> dict:
                 ).fetchone()["n"]
             rows = [dict(r) for r in cur.execute(
                 "SELECT q.file_id, q.path, q.why, q.attempts, q.last_error, "
-                "       q.next_try_at, "
+                "       q.next_try_at, f.pool_disk AS disk, "
                 "       EXISTS (SELECT 1 FROM rename_queue r "
                 "               WHERE r.file_id = q.file_id "
                 "                 AND r.done_at IS NULL) AS held "
-                "  FROM plex_queue q WHERE q.done_at IS NULL "
+                "  FROM plex_queue q LEFT JOIN files f ON f.id = q.file_id "
+                " WHERE q.done_at IS NULL "
                 " ORDER BY q.next_try_at LIMIT 60")]
             stuck = [dict(r) for r in cur.execute(
-                "SELECT file_id, path, why, attempts, last_error, done_at "
-                "  FROM plex_queue WHERE done_at IS NOT NULL "
-                "   AND last_error LIKE 'gave up%' "
-                " ORDER BY done_at DESC LIMIT 20")]
+                "SELECT q.file_id, q.path, q.why, q.attempts, q.last_error, "
+                "       q.done_at, f.pool_disk AS disk "
+                "  FROM plex_queue q LEFT JOIN files f ON f.id = q.file_id "
+                " WHERE q.done_at IS NOT NULL "
+                "   AND q.last_error LIKE 'gave up%' "
+                " ORDER BY q.done_at DESC LIMIT 60")]
+            for r in rows + stuck:
+                r["label"] = _label(r.get("path") or "")
             # WHEN THE NEXT ONE IS OWED, which is the question "22 waiting"
             # cannot answer. A row on its first pass is due in seconds; one
             # that has missed six times is due in six hours, and those two
@@ -445,6 +518,7 @@ def stats() -> dict:
                 "holding": holding, "rows": rows, "stuck": stuck,
                 "max_attempts": MAX_ATTEMPTS, "poll_s": POLL_S,
                 "next_due_in": (max(0.0, (nxt or 0) - now) if nxt else None),
+                "revive_s": REVIVE_S,
                 "run": dict(RUN_STATE)}
     except Exception:                                        # noqa: BLE001
         return {"pending": 0, "due": 0, "first_try": 0, "retrying": 0,
