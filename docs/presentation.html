@@ -312,7 +312,7 @@
   .dpflow{font-size:12px;display:flex;gap:10px;margin:2px 0}
   .dpflow .k{font-weight:700;width:70px}
   .baltab{margin-top:12px;font-size:11.5px;font-variant-numeric:tabular-nums}
-  .balrow{display:grid;grid-template-columns:86px minmax(120px,1fr) 52px 60px 170px 78px 96px;gap:10px;
+  .balrow{display:grid;grid-template-columns:86px minmax(120px,1fr) 46px 40px 60px 180px 66px 66px 84px 104px;gap:8px;
           align-items:center;padding:4px 0;border-bottom:1px solid #141a22}
   .balrow.head{color:var(--dim);font-size:10px;letter-spacing:.06em;text-transform:uppercase;border-bottom:1px solid var(--line);padding-bottom:8px}
   .balbar{position:relative;height:12px;border-radius:4px;background:#161d27;overflow:visible}
@@ -324,7 +324,71 @@
   .balm{line-height:1.2}.balm small{display:block;color:var(--dim);font-size:10px}
   .balrow.in .balm{color:var(--warn)}.balrow.out .balm{color:var(--acc)}
   .baleta{text-align:right;font-weight:700}
-  @media(max-width:760px){.balrow{grid-template-columns:76px 1fr 46px 90px} .balrow>*:nth-child(4),.balrow>*:nth-child(6),.balrow>*:nth-child(7){display:none}}
+  @media(max-width:900px){.balrow{grid-template-columns:76px 1fr 46px 150px 88px} .balrow>*:nth-child(4),.balrow>*:nth-child(5),.balrow>*:nth-child(7),.balrow>*:nth-child(8),.balrow>*:nth-child(9){display:none}}
+
+  /* ---------- the per-disk panel ---------- */
+  .dpanel{margin-top:22px;padding:0;overflow:hidden}
+  .dphead{display:flex;align-items:center;padding:12px 16px;font-size:12px;letter-spacing:.08em;color:var(--fg);font-weight:700;border-bottom:1px solid var(--line)}
+  .dpleg{margin-left:auto;font-size:10.5px;font-weight:400;letter-spacing:0;color:var(--dim)}
+  .dpleg i{display:inline-block;width:7px;height:7px;border-radius:50%;margin:0 4px 0 8px}
+  .dkrow{display:grid;grid-template-columns:200px 70px 1fr 90px;gap:10px;padding:8px 16px 8px 14px;border-bottom:1px solid #141a22;border-left:3px solid transparent;font-size:12px;font-variant-numeric:tabular-nums}
+  .dkhead{font-size:10px;letter-spacing:.08em;color:var(--dim);border-bottom:1px solid var(--line);padding:8px 16px 8px 14px}
+  .dkrow.pool{background:#0d1117;border-left-color:transparent}
+  .dk-name{font-family:ui-monospace,Menlo,Consolas,monospace;font-weight:700;font-size:12px}
+  .dk-move{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:10.5px;color:var(--warn);margin-top:2px}
+  .dk-files{text-align:right;padding-top:2px}
+  .dk-free{text-align:right;padding-top:2px;color:var(--acc)}
+  .dk-cap{position:relative;height:6px;border-radius:3px;background:#161d27;margin-top:5px;overflow:hidden}
+  .dk-cap i{position:absolute;left:0;top:0;bottom:0;background:#c9d1d9;border-radius:3px}
+  .dk-cap.in i{background:var(--warn)}.dk-cap.out i{background:var(--acc)}
+  .dk-capl{font-size:10.5px;color:var(--dim);margin-top:3px}
+  .dk-cards{grid-column:1 / -1;display:flex;gap:8px;align-items:center;margin-top:6px;flex-wrap:wrap}
+  .dk-busy{display:flex;align-items:center;gap:8px;font-size:10px;letter-spacing:.08em;color:var(--dim);border:1px solid var(--line);border-radius:6px;padding:3px 9px;background:#0b0e12}
+  .dk-busy b{color:var(--fg);font-weight:600;letter-spacing:0}
+  .dk-busybar{width:80px;height:4px;background:#161d27;border-radius:2px;display:flex;overflow:hidden}
+  .dk-busybar i{display:block;height:100%;transition:width .8s ease}
+  .dcard{display:flex;align-items:center;gap:8px;border:1px solid var(--line);border-radius:6px;padding:3px 9px;background:#0b0e12;font-size:10.5px;color:var(--dim)}
+  .dcard .lb{font-size:9.5px;letter-spacing:.1em;color:#5a6470}
+  .dcard.nuarr{border-color:#1f3a5e;color:var(--acc)}.dcard.nuarr .lb{color:var(--acc)}
+  .dcard.sys{border-color:#4d3d1a;color:var(--warn)}.dcard.sys .lb{color:var(--warn)}
+  .dcard.viewer{border-color:#1f4429;color:var(--ok)}.dcard.viewer .lb{color:var(--ok)}
+  .dcard.viewer.paused{color:var(--gold)}.dcard .hold{color:var(--gold);border-left:1px solid var(--line);padding-left:8px}
+  .dcard .pb{width:60px;height:4px;background:#161d27;border-radius:2px;overflow:hidden}.dcard .pb i{display:block;height:100%;background:var(--acc)}
+  @media(max-width:760px){.dkrow{grid-template-columns:120px 60px 1fr 70px;font-size:11px}}
+
+  /* ---------- drivepool extras ---------- */
+  .kick2{font-size:10.5px;letter-spacing:.08em;color:var(--dim);margin-bottom:6px}
+  .dpver{display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:16px;flex-wrap:wrap}
+  .dpprog{height:5px;border-radius:3px;background:#161d27;margin:8px 0 5px;overflow:hidden}
+  .dpprog i{display:block;height:100%;background:var(--acc);transition:width 1s linear}
+  .dpsub{font-size:12px;margin-bottom:6px}
+  .dprun{display:flex;align-items:center;gap:12px;border:1px solid var(--line);border-radius:8px;padding:8px 12px;font-size:12px;margin-top:8px}
+  .dpact{display:grid;grid-template-columns:110px 70px 1fr;gap:12px;align-items:center;font-size:12.5px;padding:3px 0}
+  .dphold{font-size:12px}
+  .dphold .hh,.dphold .hr{display:grid;grid-template-columns:1fr 130px 130px 130px;gap:12px;align-items:center;padding:8px 0;border-bottom:1px solid #141a22}
+  .dphold .hh{font-size:10px;letter-spacing:.08em;color:var(--dim)}
+  .dphold .hr small{display:block;color:var(--dim);font-size:10.5px;max-width:230px;line-height:1.3}
+  .dphold .hr>span{display:flex;align-items:center;gap:12px}.dphold .hr>span:first-child{display:block}
+  .dphold em{font-style:normal;font-size:9.5px;letter-spacing:.06em;border:1px solid var(--line);border-radius:10px;padding:1px 7px;color:var(--dim)}
+  .dphold em.on{color:var(--ok);border-color:#1f4429}
+  @media(max-width:760px){.dphold .hh,.dphold .hr{grid-template-columns:1fr 70px 70px 70px;gap:6px}.dphold em{display:none}}
+
+  /* ---------- settings: the icon rail ---------- */
+  .setwrap{grid-template-columns:210px 1fr;transition:grid-template-columns .25s ease}
+  .setwrap.rail{grid-template-columns:54px 1fr}
+  .setnav .stitle{display:flex;align-items:center;gap:10px;padding:4px 12px 10px;font-weight:700;font-size:14px}
+  .setnav .stitle button{width:30px;height:30px;border:0;background:none;color:var(--fg);cursor:pointer;border-radius:6px;display:grid;place-items:center}
+  .setnav .stitle button:hover{background:rgba(255,255,255,.06)}
+  .setnav .stitle svg{width:18px;height:18px}
+  .setnav a{display:flex;align-items:center;gap:10px;padding:5px 14px;white-space:nowrap;overflow:hidden}
+  .setnav a .sico{width:18px;height:18px;flex:0 0 18px;display:grid;place-items:center;color:#8b98a6}
+  .setnav a .sico svg{width:17px;height:17px}
+  .setnav a.on .sico{color:var(--acc)}
+  .setwrap.rail .slab{display:none}
+  .setwrap.rail .setnav a{justify-content:center;padding:8px 0;gap:0}
+  .setwrap.rail .setnav .gh{height:0;padding:6px 12px 0;overflow:hidden;border-top:1px solid var(--line);margin:6px 12px 0}
+  .setwrap.rail .setnav .stitle{justify-content:center;padding:2px 0 10px}
+  @media(max-width:800px){.setnav{display:block}.setwrap{grid-template-columns:54px 1fr}.setwrap .slab{display:none}.setwrap .setnav a{justify-content:center;padding:8px 0;gap:0}.setwrap .setnav .gh{height:0;padding:0;overflow:hidden;border-top:1px solid var(--line);margin:6px 12px 0}.setwrap .setnav .stitle{justify-content:center}}
 
   /* ---------- footer / controls ---------- */
   .navdots{position:fixed;right:16px;top:50%;transform:translateY(-50%);display:flex;
@@ -667,8 +731,12 @@
      a new disk is picked up and assigned one automatically. When a viewer is streaming
      from a disk, work touching that spindle paces itself against their real buffer while
      everything else runs at full speed.</p>
-  <div class="diskrow rev" id="diskrow"></div>
-  <p class="dim rev" style="font-size:12px;margin-top:12px"><span style="color:var(--warn)">Amber</span> = a viewer is on this spindle; work there follows the runway ramp. The rest don't slow down. Every spindle's busy time is split three ways — nuarr's own, the viewer's, everything else — and the part that is not nuarr's sets the pace: slowing from 40% busy, a quarter speed at 90%, a pause only above 97% sustained.</p>
+  <div class="panel dpanel rev" id="dpanel">
+    <div class="dphead"><span>FILES PER POOL DISK</span><span class="dpleg"><i style="background:var(--ok)"></i>viewer <i style="background:var(--acc)"></i>Nuarr <i style="background:var(--warn)"></i>system</span></div>
+    <div class="dkrow dkhead"><span>DISK ▲</span><span>FILES</span><span>CAPACITY</span><span style="text-align:right">FREE</span></div>
+    <div id="dkrows"></div>
+  </div>
+  <p class="dim rev" style="font-size:12px;margin-top:12px">Every spindle's busy time is split three ways — nuarr's own, the viewer's, everything else — and the part that is not nuarr's sets the pace: slowing from 40% busy, a quarter speed at 90%, a pause only above 97% sustained. Each card says one word; on the real page it opens on hover with the numbers and the trend.</p>
 </section>
 
 <!-- ======================= DRIVEPOOL ======================= -->
@@ -682,12 +750,35 @@
      <b style="color:var(--acc)">blue</b>, and the glow follows the mover. While it runs, renames
      are held (they race the mover for the same file), file replaces go ahead paced per chunk
      against the disk they land on, and a disk removal holds everything. Each hold is a switch.</p>
-  <div class="panel rev" style="margin-top:26px;padding:14px 18px">
+  <div class="panel rev" style="margin-top:26px;padding:16px 20px">
+    <div class="dpver"><b>StableBit DrivePool 2.3.13.1687</b> <span class="pill ok">service running</span> <span class="pill ok">reading its log</span> <span class="dim">last entry <span id="dplast">41s</span> ago</span><span style="margin-left:auto" class="dim"><span class="tog on" style="display:inline-block;vertical-align:middle;margin-right:6px"><i></i></span> integration <span class="pill ok">ON</span></span></div>
+    <div class="kick2">RIGHT NOW</div>
     <div class="dpline mono"><span class="pill gold">balancing</span> <b id="dphead">DrivePool is balancing — 78% through this run, moving at 46 MB/s, for 1h 3m</b></div>
+    <div class="dpprog"><i id="dpbar" style="width:78%"></i></div>
+    <div class="dpsub mono" id="dpsub"><span class="dim">77.6% through this run</span> · <span style="color:var(--acc)">reads 10 MB/s</span> · <span style="color:var(--warn)">writes 10 MB/s</span> · <b>about 18m 33s left</b></div>
     <div class="dpflow mono"><span class="k" style="color:var(--acc)">Emptying</span><span id="dpout">NU-DRIVE-4 <span class="dim">34.3 GB/h</span></span></div>
     <div class="dpflow mono"><span class="k" style="color:var(--warn)">Filling</span><span id="dpin">NU-DRIVE-1 <span class="dim">35.0 GB/h</span></span></div>
+    <div class="dprun mono"><span class="dim">THIS RUN</span><span class="pill gold">balancing</span><span id="dprun">77.6% through · running 1h 4m · DrivePool says <b>92.5 GB</b> left to move</span><span style="margin-left:auto">done in <b id="dpeta">about 18m 33s</b></span></div>
+
+    <div class="kick2" style="margin-top:22px">HOW BALANCED THE POOL IS</div>
+    <div style="font-size:13px"><b style="color:var(--ok)">balanced</b> <span class="dim">— every disk within 1 point of the pool average</span></div>
+    <div style="font-size:12.5px;margin-top:2px"><span class="dim">DrivePool's own reading:</span> <b style="color:var(--ok)">99.87% balanced</b> <span class="dim">· 92.5 GB still to move · balancers on: All In One, StableBit Scanner · plan read <span id="dpread">6s</span> ago</span></div>
     <div class="baltab mono" id="baltab"></div>
-    <div class="dim" style="font-size:11.5px;margin-top:8px">Bars are each disk's fill on a zoomed axis; the white tick is DrivePool's own target. "Left to move" is what remains of DrivePool's plan for the disk — the plan is written once per pass, so the live figure is the plan less what the disk has gained or lost since.</div>
+    <div class="dim" style="font-size:11.5px;margin-top:8px">Bars are each disk's fill on a zoomed axis; "vs avg" is its distance from the pool average in points — amber fuller, blue emptier, grey within 1 point. The white tick is DrivePool's own target for the disk, "stops at" the fill it will reach, "left to move" what remains of DrivePool's plan for it — the plan is written once per pass, so the live figure is the plan less what the disk has gained or lost since — and the ETA is that at the current rate.</div>
+
+    <div class="kick2" style="margin-top:22px">WHAT NUARR IS DOING ABOUT IT</div>
+    <div class="dpact"><b>New jobs</b><span class="pill ok">running</span><span class="dim">starting as normal — the dispatcher steers new work off the busy spindles</span></div>
+    <div class="dpact"><b>File replaces</b><span class="pill ok">running</span><span class="dim">going ahead, paced per chunk against the disk the file lands on</span></div>
+    <div class="dpact"><b>Renames</b><span class="pill gold">waiting</span><span class="dim">held for the whole move — they race the mover for the same file</span></div>
+
+    <div class="kick2" style="margin-top:22px">WHILE DRIVEPOOL IS… HOLD NUARR'S…</div>
+    <div class="dphold mono">
+      <div class="hh"><span></span><span>NEW JOBS</span><span>FILE REPLACES</span><span>RENAMES</span></div>
+      <div class="hr"><span><b>Balancing</b><small>DrivePool evening out how full each disk is.</small></span><span><span class="tog"><i></i></span><em>OFF</em></span><span><span class="tog on"><i></i></span><em class="on">ON</em></span><span><span class="tog on"><i></i></span><em class="on">ON</em></span></div>
+      <div class="hr"><span><b>Duplicating</b><small>Making or repairing the extra copies of duplicated folders.</small></span><span><span class="tog"><i></i></span><em>OFF</em></span><span><span class="tog on"><i></i></span><em class="on">ON</em></span><span><span class="tog on"><i></i></span><em class="on">ON</em></span></div>
+      <div class="hr"><span><b>Removing a disk</b><small>Evacuating a disk you are taking out of the pool. Every file on it is on the move.</small></span><span><span class="tog on"><i></i></span><em class="on">ON</em></span><span><span class="tog on"><i></i></span><em class="on">ON</em></span><span><span class="tog on"><i></i></span><em class="on">ON</em></span></div>
+    </div>
+    <div class="dim" style="font-size:11.5px;margin-top:10px">File replaces go ahead during a balance and are paced per chunk against the disk the file actually lands on — slowed as that disk gets busy, stopped if it is saturated — the same ramp a viewer gets. New jobs are held only while the move has a disk at quarter-speed level or worse. Renames are held for the whole move. Removing a disk holds everything. A held commit waits up to three hours and then goes ahead regardless.</div>
   </div>
 </section>
 
@@ -717,32 +808,24 @@
   <h2 class="rev">Settings that say why they exist</h2>
   <p class="lede rev">Twenty-eight pages across Processing, Tools, Integrations and System —
      and every control carries its own reasoning, bounds and default inline, so tuning
-     never means guessing. The status tiles above check themselves on visible countdowns:
-     missing files confirmed after three checks, unmanaged imports re-scanned on a timer.</p>
+     never means guessing. The status tiles check themselves on visible countdowns:
+     missing files confirmed after three checks, unmanaged imports re-scanned on a timer.
+     The menu collapses to an icon rail — press ≡ — which is how a phone gets it.</p>
 
   <div class="stattiles rev">
-    <div class="stt"><div class="h">TOTAL FILES</div><b>39,667</b><span>62.01 TB</span></div>
-    <div class="stt"><div class="h">ELIGIBLE</div><b>19</b><span>past hold, ready to process</span></div>
-    <div class="stt"><div class="h">HELD (NEW)</div><b>0</b><span>still settling</span></div>
+    <div class="stt"><div class="h">TOTAL FILES</div><b>39,667</b><span>62.01 TB · arrs manage 39,666</span></div>
+    <div class="stt"><div class="h">ELIGIBLE</div><b>0</b><span>past hold, ready to process</span></div>
+    <div class="stt"><div class="h">HELD (NEW)</div><b>1</b><span>still settling</span></div>
     <div class="stt"><div class="h">MISSING</div><b>0</b><span>next check in <span id="cd1">22</span>s</span></div>
-    <div class="stt"><div class="h">ERRORS</div><b>0</b><span>nothing needs attention</span></div>
+    <div class="stt"><div class="h">ATTENTION</div><b>0</b><span>nothing needs attention</span></div>
+    <div class="stt"><div class="h">HEALTH CHECKS</div><b>0</b><span>everything checks out</span></div>
     <div class="stt"><div class="h">UNMANAGED &gt;100MB</div><b>0</b><span>next check in <span id="cd2">52</span>s</span></div>
-    <div class="stt"><div class="h">EXTRAS (KEPT)</div><b>0</b><span>OP/ED, specials, bonus</span></div>
+    <div class="stt"><div class="h">EXTRAS (KEPT)</div><b>0</b><span>0 OP/ED, specials, bonus</span></div>
+    <div class="stt"><div class="h">PROCESSING NOW</div><b>1</b><span>passthrough <span id="cd3">90</span>% · <span id="cd4">4</span>s left</span></div>
   </div>
 
-  <div class="panel setwrap rev">
-    <div class="setnav">
-      <div class="gh">PROCESSING</div>
-      <a class="on">Concurrency</a><a>Holds and timing</a><a>Job gate</a><a>Subtitles</a>
-      <a>Video codec</a><a>Audio codec</a><a>Audio language</a><a>Rules</a><a>Rule check</a>
-      <a>How files flow</a><a>Still not landed</a><a>Plex playback</a>
-      <div class="gh">TOOLS</div>
-      <a>ffmpeg</a><a>MKVToolNix</a><a>Whisper</a><a>OCR engines</a>
-      <div class="gh">INTEGRATIONS</div>
-      <a>Arrs</a><a>Plex</a><a>DrivePool</a><a>Metadata</a>
-      <div class="gh">SYSTEM</div>
-      <a>Health checks</a><a>Libraries</a><a>Cache folder</a><a>Jobs</a><a>Logs</a><a>Updates</a><a>Backup and restore</a>
-    </div>
+  <div class="panel setwrap rev" id="setwrap">
+    <div class="setnav" id="setnav"></div>
     <div class="setpane" id="setpane">
       <div class="hint">How much runs at once. Encode is NVENC-bound; passthrough is disk-bound.</div>
       <div class="srow"><div class="t"><b>encode workers</b><span>NVENC-bound. One engine on the A5000: ~4 saturates it at 1080p.</span></div>
@@ -1111,13 +1194,84 @@ const val=v=>`<span class="val">${v}</span>`;
 const stepper=(v,min,max,def,stp)=>`<div class="stepper" data-min="${min}" data-max="${max}" data-step="${stp||1}">
   <button>−</button><output>${v}</output><button>+</button>
   <span class="rng">min ${min} · max ${max} · default ${def}</span></div>`;
+/* the sidebar, with the same glyphs the real one carries */
+const I=d=>'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'+d+'</svg>';
+const ICON={
+  'Concurrency':I('<path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/>'),
+  'Holds and timing':I('<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/>'),
+  'Job gate':I('<path d="M12 3l7 3v5c0 4.5-3 8.5-7 10-4-1.5-7-5.5-7-10V6l7-3z"/>'),
+  'Subtitles':I('<path d="M4 6h9M8.5 4v2M6 9c1 3 3 5.5 6 7.5M11 9c-1 3-3 5.5-6 7.5M13 20l4-9 4 9M14.5 17h5"/>'),
+  'Video codec':I('<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 5v14M17 5v14M3 9h4M3 15h4M17 9h4M17 15h4"/>'),
+  'Audio codec':I('<path d="M4 12h2M8 8v8M12 5v14M16 9v6M20 11v2"/>'),
+  'Audio language':I('<rect x="9" y="3" width="6" height="11" rx="3"/><path d="M6 11a6 6 0 0 0 12 0M12 17v4M9 21h6"/>'),
+  'Rules':I('<path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01"/>'),
+  'Rule check':I('<path d="M4 12l4 4L20 6"/>'),
+  'How files flow':I('<path d="M4 6h5l3 6-3 6H4M12 12h8M17 9l3 3-3 3"/>'),
+  'Still not landed':I('<path d="M3 13l3-8h12l3 8v6H3z"/><path d="M3 13h5l1.5 2h5L16 13h5"/>'),
+  'Plex playback':I('<path d="M6 4l14 8-14 8z"/>'),
+  'ffmpeg':I('<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M3 15h18M8 4v16M16 4v16"/>'),
+  'MKVToolNix':I('<path d="M14 6a4 4 0 0 0-5.7 5.7L3 17l4 4 5.3-5.3A4 4 0 0 0 18 10l-2.5 2.5-2-2L16 8z"/>'),
+  'Whisper':I('<path d="M4 12c2-5 5-7 8-7s6 2 8 7c-2 5-5 7-8 7s-6-2-8-7z"/><circle cx="12" cy="12" r="2.5"/>'),
+  'OCR engines':I('<path d="M4 8V5h3M17 5h3v3M20 16v3h-3M7 19H4v-3M8 12h8M12 8v8"/>'),
+  'Arrs':I('<path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7L11.5 6.8M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1.5-1.5"/>'),
+  'Plex':I('<path d="M5 3h5l7 9-7 9H5l7-9z"/>'),
+  'DrivePool':I('<ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v6c0 1.7 3.6 3 8 3s8-1.3 8-3V6M4 12v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/>'),
+  'Metadata':I('<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/>'),
+  'Health checks':I('<path d="M3 12h4l2-5 3 10 3-8 2 3h4"/>'),
+  'Libraries':I('<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>'),
+  'Cache folder':I('<path d="M4 4h16v6H4zM4 14h16v6H4z"/><path d="M8 7h.01M8 17h.01"/>'),
+  'Jobs':I('<circle cx="12" cy="12" r="8.5"/><path d="M12 8v4l3 1.5M5 3l-2 2M19 3l2 2"/>'),
+  'Logs':I('<path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4M9 12h6M9 16h6"/>'),
+  'Updates':I('<path d="M12 4v11M7 10l5 5 5-5M4 19h16"/>'),
+  'Backup and restore':I('<path d="M12 3v9M8 8l4 4 4-4"/><path d="M4 14v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4"/>'),
+};
+const NAVG=[['PROCESSING',['Concurrency','Holds and timing','Job gate','Subtitles','Video codec','Audio codec','Audio language','Rules','Rule check','How files flow','Still not landed','Plex playback']],
+  ['TOOLS',['ffmpeg','MKVToolNix','Whisper','OCR engines']],
+  ['INTEGRATIONS',['Arrs','Plex','DrivePool','Metadata']],
+  ['SYSTEM',['Health checks','Libraries','Cache folder','Jobs','Logs','Updates','Backup and restore']]];
+(()=>{
+  const nav=document.getElementById('setnav');
+  let h='<div class="stitle"><button type="button" id="setcollapse" title="Collapse or expand the settings menu">'+I('<path d="M4 7h16M4 12h16M4 17h16"/>')+'</button><span class="slab">Settings</span></div>';
+  for(const [g,items] of NAVG){ h+='<div class="gh"><span class="slab">'+g+'</span></div>'; for(const it of items) h+='<a data-label="'+it+'" title="'+it+'"><span class="sico">'+(ICON[it]||ICON.Rules)+'</span><span class="slab">'+it+'</span></a>'; }
+  h+='<a title="Back to dashboard" style="margin-top:10px"><span class="sico">'+I('<path d="M11 5l-7 7 7 7M4 12h16"/>')+'</span><span class="slab">Back to dashboard</span></a>';
+  nav.innerHTML=h;
+  document.getElementById('setcollapse').addEventListener('click',()=>document.getElementById('setwrap').classList.toggle('rail'));
+})();
 const PANES={
  'Concurrency':{h:'How much runs at once. Encode is NVENC-bound; passthrough is disk-bound.',r:[
-   ['encode workers','NVENC-bound. One engine on the GPU: ~4 saturates it at 1080p.',stepper(4,0,8,4)],
-   ['passthrough workers','Remux/copy only, no GPU. Limited by pool disk I/O.',stepper(4,0,12,4)],
-   ['subocr workers','CPU-bound and single-threaded per file — scales with cores, not the GPU.',stepper(4,0,10,4)],
-   ['probe workers','ffprobe scans. Cheap CPU, one pool read each.',stepper(4,0,16,4)],
-   ['arr concurrency','Parallel Sonarr/Radarr API calls during scans.',stepper(20,1,30,20)]]},
+   ['Encodes at once','NVENC-bound. One encode engine on NVIDIA RTX A5000; ~4 saturates it at 1080p.',stepper(4,0,8,4)],
+   ['Remuxes at once','How many files may be repacked at once. No GPU involved — the limit is how fast the pool disks can read and write.',stepper(4,0,12,4)],
+   ['Subtitle reads at once','Subtitle OCR. Each file is demuxed off the pool, read on the GPU, then muxed back — the demux and the mux are disk work, the read is GPU work. This is how many files are in flight; the GPU lane below caps how many may be on the card at once.',stepper(4,0,10,4)],
+   ['Subtitle reads on the GPU at once','How many subtitle reads may use the graphics card at the same moment. Unpacking and repacking either side are disk work and not counted here. Measured on this box: two lanes already reach the card\u2019s floor; more only queues.',stepper(2,1,6,2)],
+   ['File scans at once','How many files may be inspected at once. Cheap on the processor, one disk read each.',stepper(4,0,16,4)],
+   ['Sonarr/Radarr calls at once','How many questions nuarr may ask Sonarr and Radarr at the same time during a scan.',stepper(20,1,30,20)]]},
+ 'Rule check':{h:'Every file is checked against the rules it was supposed to satisfy, and the check self-heals.',r:[
+   ['findings','queued, fixed, re-verified — the tile counts what is still outstanding',val('0 outstanding')],
+   ['retired','a finding on a file the arr has since replaced is history, not work',tog(1)]]},
+ 'How files flow':{h:'Probe → plan → fix → verify → commit, and what each stage waits on.',r:[
+   ['commit pacing','per chunk, against the disk the file lands on',tog(1)],
+   ['spread across disks','no two heavy jobs share a spindle',tog(1)]]},
+ 'Still not landed':{h:'Files whose arr has not caught up with what nuarr wrote.',r:[
+   ['import into the arr','one button from Needs Attention; daily series matched on air date',val('ready')],
+   ['non-media releases','.iso and friends get blocklist-and-refetch',tog(1)]]},
+ 'Plex playback':{h:'What Plex did to every stream, and why.',r:[
+   ['does Plex still agree?','streams Plex reports vs streams ffprobe found, per library',val('in step')],
+   ['notify queue','durable, retried on the renamer\u2019s ladder — 45s, 3m, 10m, 30m, 2h, 6h',tog(1)]]},
+ 'OCR engines':{h:'Which engine reads picture subtitles, installed on demand like Whisper.',r:[
+   ['engine','Tesseract for Latin scripts; PaddleOCR where it reads better',val('tesseract 5.5')],
+   ['clean titles','"(PGS)", "(SUP)", "(OCR)" come off the track name — the NUARR_OCR tag says who made it',tog(1)]]},
+ 'DrivePool':{h:'What DrivePool is doing to the pool right now, and which of nuarr\u2019s operations wait for it.',r:[
+   ['integration','reads DrivePool\u2019s own records — balancers, per-disk targets, bytes left to move',tog(1)],
+   ['hold renames while balancing','they race the mover for the same file',tog(1)],
+   ['hold new jobs while balancing','only while the move has a disk at quarter-speed level or worse',tog(0)],
+   ['removing a disk','holds everything',tog(1)]]},
+ 'Health checks':{h:'What the dashboard tile counts, and where each one leads.',r:[
+   ['checks','file errors, rule findings, audio language, arr health, arr sync, titles, arr gaps',val('7 sources')],
+   ['change watchers','one per PoolPart — a file that lands or leaves is seen within a minute',val('12 alive')],
+   ['full scan','stretched while the watchers are healthy',val('every 12 h')]]},
+ 'Updates':{h:'Follows this repository\u2019s releases, out of the box.',r:[
+   ['mode','manual tells you and waits; auto downloads after ten idle minutes — installing is always your click',val('manual')],
+   ['repository','point it at a fork, or "off" and it never contacts GitHub',val('NuGundam/nuarr')]]},
  'Holds and timing':{h:'When new files become eligible, and how patient the retries are.',r:[
    ['hold_minutes','MINUTES a file must sit untouched before it can be processed — the “Held (new)” tile',stepper(5,0,10080,5)],
    ['scan_every_min','MINUTES between automatic library scans. Files only become eligible during a scan.',stepper(180,0,10080,180,30)],
@@ -1193,12 +1347,12 @@ const PANES={
    ['last run','verified, rebuilt bundle',val('331 MB · ok')],
    ['retention','keep 4 — only nuarr-* is ever pruned, nothing else is touched',val('4 backups')]]},
 };
-const NAVS=[...document.querySelectorAll('.setnav a')];
+const NAVS=[...document.querySelectorAll('.setnav a[data-label]')];
 const setpane=document.getElementById('setpane');
 let paneIdx=0;
 function showPane(i){
   NAVS.forEach((a,k)=>a.classList.toggle('on',k===i));
-  const p=PANES[NAVS[i].textContent]||{h:'',r:[]};
+  const p=PANES[NAVS[i].dataset.label]||{h:'',r:[]};
   setpane.classList.add('swap');
   setTimeout(()=>{
     setpane.innerHTML=`<div class="hint">${p.h}</div>`+p.r.map(r=>
@@ -1219,11 +1373,11 @@ setpane.addEventListener('click',e=>{
   out.textContent=b.textContent==='−'?Math.max(min,+out.textContent-stp)
                                      :Math.min(max,+out.textContent+stp);
 });
-let cd1=22,cd2=52;
+let cd1=22,cd2=52,cd3=90,cd4=4;
 setInterval(()=>{
-  cd1=cd1>0?cd1-1:180; cd2=cd2>0?cd2-1:300;
-  const a=document.getElementById('cd1'),b=document.getElementById('cd2');
-  if(a)a.textContent=cd1; if(b)b.textContent=cd2;
+  cd1=cd1>0?cd1-1:180; cd2=cd2>0?cd2-1:300; cd4=cd4>0?cd4-1:40; cd3=100-Math.round(cd4/40*100);
+  const a=document.getElementById('cd1'),b=document.getElementById('cd2'),c=document.getElementById('cd3'),d=document.getElementById('cd4');
+  if(a)a.textContent=cd1; if(b)b.textContent=cd2; if(c)c.textContent=cd3; if(d)d.textContent=cd4;
 },1000);
 
 /* ---------- audio waves ---------- */
@@ -1274,12 +1428,12 @@ setInterval(()=>{
   const lo=48,hi=56,avg=52.5,X=v=>Math.max(0,Math.min(100,(v-lo)/(hi-lo)*100));
   const gb=v=>Math.abs(v).toFixed(1)+' GB';
   const hms=s=>s>=3600?Math.floor(s/3600)+'h '+Math.round(s%3600/60)+'m':s>=60?Math.floor(s/60)+'m '+Math.round(s%60)+'s':Math.round(s)+'s';
-  const head=`<div class="balrow head"><span></span><span style="position:relative;height:12px"><span style="position:absolute;left:0;top:-2px">${lo}%</span><span style="position:absolute;left:${X(avg)}%;top:-2px;transform:translateX(-50%);color:#c9d1d9">avg ${avg}%</span><span style="position:absolute;right:0;top:-2px">${hi}%</span></span><span>used</span><span>stops at</span><span>left to move</span><span>rate</span><span style="text-align:right">ETA</span></div>`;
+  const head=`<div class="balrow head"><span></span><span style="position:relative;height:12px"><span style="position:absolute;left:0;top:-2px">${lo}%</span><span style="position:absolute;left:${X(avg)}%;top:-2px;transform:translateX(-50%);color:#c9d1d9">avg ${avg}%</span><span style="position:absolute;right:0;top:-2px">${hi}%</span></span><span>used</span><span>vs avg</span><span>stops at</span><span>left to move</span><span style="text-align:right">read</span><span style="text-align:right">write</span><span>rate</span><span style="text-align:right">ETA</span></div>`;
   el.innerHTML=head+used.map((u,i)=>`<div class="balrow" id="bal${i}">
     <span style="color:${DCOL[i]};font-weight:700">NU-DRIVE-${i}</span>
     <span class="balbar"><i style="width:${X(u)}%"></i><u style="left:${X(avg)}%"></u><s style="left:${X(stop[i])}%"></s></span>
-    <span class="balu">${u.toFixed(1)}%</span><span class="dim">→ ${stop[i].toFixed(1)}%</span>
-    <span class="balm"></span><span class="balr dim">—</span><span class="baleta dim">—</span></div>`).join('');
+    <span class="balu">${u.toFixed(1)}%</span><span class="dim" style="color:${Math.abs(u-avg)<=1?'#525c6b':(u>avg?'var(--warn)':'#79c0ff')}">${u-avg>0?'+':''}${(u-avg).toFixed(1)}</span><span class="dim">→ ${stop[i].toFixed(1)}%</span>
+    <span class="balm"></span><span class="balrd dim" style="text-align:right">—</span><span class="balwr dim" style="text-align:right">—</span><span class="balr dim">—</span><span class="baleta dim">—</span></div>`).join('');
   // the mover reads off disk 4 and writes onto disk 1; the "left" figures tick down
   const t0=Date.now();
   const tick=()=>{
@@ -1295,8 +1449,11 @@ setInterval(()=>{
       if(left<=0.05) m.innerHTML=`<span style="color:var(--ok)">plan met</span><small>plan ${plan[i]>0?'+':'−'}${gb(plan[i])} · ${gb(dn)} done</small>`;
       else m.innerHTML=`${plan[i]>0?'+':'−'}${gb(left)} ${plan[i]>0?'in':'out'}<small>plan ${plan[i]>0?'+':'−'}${gb(plan[i])} · ${gb(dn)} done · planned 31m ago</small>`;
       const r=row.querySelector('.balr'), e=row.querySelector('.baleta');
+      const rd=row.querySelector('.balrd'), wr=row.querySelector('.balwr');
+      rd.innerHTML='<span class="dim">—</span>'; wr.innerHTML='<span class="dim">—</span>';
       if(moving&&left>0.05){
         const rate=i===1?rIn:rOut;
+        if(i===1) wr.innerHTML=`<span style="color:var(--warn)">${(rate/3.6).toFixed(1)} MB/s</span>`; else rd.innerHTML=`<span style="color:var(--acc)">${(rate/3.6).toFixed(1)} MB/s</span>`;
         r.innerHTML=`<span style="color:${i===1?'var(--warn)':'var(--acc)'}">${i===1?'▲':'▼'} ${rate.toFixed(1)} GB/h</span>`;
         e.innerHTML=`<b style="color:var(--fg)">${hms(left/rate*3600)}</b>`;
         row.querySelector('.balbar i').style.width=X(u+(i===1?1:-1)*dn/180)+'%';
@@ -1307,30 +1464,72 @@ setInterval(()=>{
     document.getElementById('dphead').textContent=`DrivePool is balancing — ${pct.toFixed(0)}% through this run, moving at ${(40+Math.sin(t/5)*8).toFixed(0)} MB/s, for 1h ${(3+Math.floor(t/60))}m`;
     document.getElementById('dpout').innerHTML=`NU-DRIVE-4 <span class="dim">${rOut.toFixed(1)} GB/h</span>`;
     document.getElementById('dpin').innerHTML=`NU-DRIVE-1 <span class="dim">${rIn.toFixed(1)} GB/h</span>`;
+    const leftS=Math.max(0,1113-t*1.4), mb=(rIn/3.6).toFixed(0);
+    document.getElementById('dpbar').style.width=pct.toFixed(1)+'%';
+    document.getElementById('dpsub').innerHTML=`<span class="dim">${pct.toFixed(1)}% through this run</span> · <span style="color:var(--acc)">reads ${mb} MB/s</span> · <span style="color:var(--warn)">writes ${mb} MB/s</span> · <b>about ${hms(leftS)} left</b>`;
+    document.getElementById('dprun').innerHTML=`${pct.toFixed(1)}% through · running 1h ${4+Math.floor(t/60)}m · DrivePool says <b>${(92.5-t*0.02).toFixed(1)} GB</b> left to move`;
+    document.getElementById('dpeta').textContent='about '+hms(leftS);
+    document.getElementById('dpread').textContent=(Math.floor(t)%10+1)+'s';
+    document.getElementById('dplast').textContent=(41+Math.floor(t)%60)+'s';
   };
   tick(); setInterval(tick,1000);
   const ldp=document.getElementById('l-dp'); if(ldp) ldp.classList.add('hold');
 })();
 
-/* ---------- disks (per-drive colours, like the real UI) ---------- */
-const dr=document.getElementById('diskrow');
-const fills=[53,53,49,50,51,51,50,50,49,51,50,50];
-const DCOL=['#e34c26','#f1e05a','#3572A5','#563d7c','#b07219','#178600',
-            '#00ADD8','#dea584','#c22d40','#ffac45','#41b883','#8993be'];
-for(let i=0;i<12;i++){
-  const d=document.createElement('div');d.className='disk';
-  d.innerHTML=`<div class="fill"><i style="height:${fills[i]}%"></i></div>
-    <div class="nm" style="color:${DCOL[i]}">NU-DRIVE-${i}</div><div class="io mono">— MB/s</div>`;
-  dr.append(d);
-}
-setInterval(()=>{
-  [...dr.children].forEach((d,i)=>{
-    const hot=i===8&&Math.floor(Date.now()/5200)%2===1;
-    d.classList.toggle('hot',hot);
-    const busy=Math.random()<.5;
-    d.querySelector('.io').textContent=busy?(hot?(2+Math.random()*6).toFixed(0):(20+Math.random()*180).toFixed(0))+' MB/s':'idle';
-  });
-},900);
+/* ---------- disks: the per-disk panel, animated ---------- */
+(()=>{
+  const host=document.getElementById('dkrows'); if(!host) return;
+  const DCOL=['#e34c26','#f1e05a','#3572A5','#563d7c','#b07219','#178600',
+              '#00ADD8','#dea584','#c22d40','#ffac45','#41b883','#8993be'];
+  const files=[6367,7526,2139,2307,3581,2179,2140,2996,2902,2531,2635,2364];
+  const full=[52.7,52.8,52.7,52.7,52.0,51.8,52.7,52.7,52.7,51.6,52.7,52.7];
+  const free=['8.61','8.58','4.31','4.31','4.37','4.39','4.31','5.17','5.17','4.40','4.31','4.30'];
+  const trend=['▲ 9.7 GB/h','▲ 13.9 GB/h','→ steady','→ steady','▼ 34.4 GB/h','▲ 4.9 GB/h','→ steady','→ steady','→ steady','▲ 2.6 GB/h','→ steady','▲ 4.9 GB/h'];
+  const card=(cls,lb,txt,extra='')=>`<span class="dcard ${cls}"><span class="lb">${lb}</span>${txt}${extra}</span>`;
+  host.innerHTML=files.map((n,i)=>`<div class="dkrow" id="dk${i}" style="border-left-color:${DCOL[i]}">
+      <span><div class="dk-name" style="color:${DCOL[i]}">NU-DRIVE-${i}</div><div class="dk-move" id="dkmv${i}"></div></span>
+      <span class="dk-files">${n.toLocaleString()}</span>
+      <span><div class="dk-cap" id="dkcap${i}"><i style="width:${full[i]}%"></i></div><div class="dk-capl">${full[i]}% full · ${trend[i]}</div></span>
+      <span class="dk-free">${free[i]} TB</span>
+      <span class="dk-cards" id="dkc${i}"></span>
+    </div>`).join('')+`<div class="dkrow pool" style="border-left-color:transparent">
+      <span><div class="dk-name">POOL</div><div class="dk-move" id="dkmvP">1 file changing disk</div></span>
+      <span class="dk-files" style="font-weight:700">39,667</span>
+      <span><div class="dk-cap"><i style="width:52.5%"></i></div><div class="dk-capl">52.5% of pool · ▲ 1.6 GB/h</div></span>
+      <span class="dk-free" style="font-weight:700;color:var(--fg)">62.21 TB</span>
+      <span class="dk-cards" id="dkcP"></span></div>`;
+  const busy=(pct,v,n,sy)=>`<span class="dk-busy">BUSY <b>${pct}%</b><span class="dk-busybar"><i style="width:${v}%;background:var(--ok)"></i><i style="width:${n}%;background:var(--acc)"></i><i style="width:${sy}%;background:var(--warn)"></i></span></span>`;
+  const t0=Date.now();
+  const tick=()=>{
+    const t=(Date.now()-t0)/1000;
+    const phase=Math.floor(t/9)%3;              // 0 viewer paused · 1 viewer playing, nuarr paced · 2 buffer thin, nuarr held
+    const enc=Math.min(99,Math.round(31+t*0.9)); // an encode on disk 3
+    const mv=(10+Math.sin(t/2)*1.5).toFixed(1);   // the mover, 1 -> 9
+    for(let i=0;i<12;i++){
+      const c=document.getElementById('dkc'+i), m=document.getElementById('dkmv'+i), cap=document.getElementById('dkcap'+i);
+      let b='', nu=card('','NUARR','no jobs here'), sy=card('','SYSTEM','—'), vw=card('','VIEWER','—');
+      m.textContent=''; cap.className='dk-cap';
+      if(i===0){
+        if(phase===0){ b=busy(1,1,0,0); vw=card('viewer paused','VIEWER · PAUSED','',`<span class="hold">holding</span>`); }
+        else if(phase===1){ b=busy(9,8,0,1); vw=card('viewer','VIEWER · PLAYING','',`<span class="hold" style="color:var(--ok)">3.2 min ahead</span>`); }
+        else { b=busy(14,12,0,2); vw=card('viewer','VIEWER · PLAYING','',`<span class="hold">41s — nuarr held here</span>`); }
+      } else if(i===3){
+        const pace=phase===2?'held':phase===1?'full speed':'full speed';
+        b=busy(phase===2?2:38,0,phase===2?0:36,2);
+        nu=card('nuarr','NUARR',`encode ${enc}%`,`<span class="pb"><i style="width:${enc}%"></i></span><span class="hold" style="color:${phase===2?'var(--gold)':'var(--ok)'}">${phase===2?'waiting for the viewer':'Velvet S03E09'}</span>`);
+      } else if(i===1){
+        b=busy(13,0,0,13); sy=card('sys','SYSTEM',`↑ ${mv} MB/s`); m.innerHTML=`››› to <span style="color:${DCOL[9]}">NU-DRIVE-9</span> ${mv} MB/s`; cap.className='dk-cap out';
+      } else if(i===9){
+        b=busy(88,0,0,88); sy=card('sys','SYSTEM',`↓ ${mv} MB/s`); m.innerHTML=`››› from <span style="color:${DCOL[1]}">NU-DRIVE-1</span> ${mv} MB/s`; cap.className='dk-cap in';
+      } else if(i===7){
+        b=busy(22,0,21,1); nu=card('nuarr','NUARR','passthrough 64%',`<span class="pb"><i style="width:64%"></i></span><span class="hold" style="color:var(--ok)">full speed</span>`);
+      } else { b=busy(1,0,0,1); }
+      c.innerHTML=b+nu+sy+vw;
+    }
+    document.getElementById('dkcP').innerHTML=busy('9',1,5,3).replace('BUSY','BUSY AVG')+card('','NUARR','2 jobs')+card('sys','SYSTEM',`${(2*mv).toFixed(1)} MB/s`)+(phase===0?card('viewer paused','VIEWER · PAUSED','',`<span class="hold">holding</span>`):card('viewer','VIEWER · PLAYING','',`<span class="hold" style="color:var(--ok)">1 stream</span>`));
+  };
+  tick(); setInterval(tick,1000);
+})();
 </script>
 </body>
 </html>
