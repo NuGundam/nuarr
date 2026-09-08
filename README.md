@@ -159,11 +159,11 @@ button.
 
 ## On a phone
 
-The same pages, laid out for a phone and sized for a Galaxy Z Fold folded and
-unfolded. Detection is from the user agent and touch plus the viewport width,
-so a phone that asks for the desktop site gets the desktop site; either can be
-forced from the power menu. Settings collapses to an icon rail that opens as a
-drawer, and on the desktop the same rail can be collapsed to make room.
+The same pages, laid out for phones. Detection is from the user agent and
+touch plus the viewport width, so a phone that asks for the desktop site gets
+the desktop site; either can be forced from the power menu. Settings collapses
+to an icon rail that opens as a drawer, and on the desktop the same rail can be
+collapsed to make room.
 
 ![Phone layouts](docs/screenshots/mobile.png)
 

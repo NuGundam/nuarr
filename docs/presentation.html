@@ -356,6 +356,11 @@
   .dcard .pb{width:60px;height:4px;background:#161d27;border-radius:2px;overflow:hidden}.dcard .pb i{display:block;height:100%;background:var(--acc)}
   @media(max-width:760px){.dkrow{grid-template-columns:120px 60px 1fr 70px;font-size:11px}}
 
+  .dtip{position:absolute;z-index:80;max-width:340px;background:#0d1117;border:1px solid #2a3340;border-radius:8px;padding:9px 12px;font-size:11.5px;line-height:1.45;color:var(--fg);box-shadow:0 8px 24px rgba(0,0,0,.5);opacity:0;pointer-events:none;transition:opacity .15s}
+  .dtip.on{opacity:1}
+  .dtip b{color:#fff}
+  .dcard[data-tip],.dk-busy[data-tip]{cursor:help}
+
   /* ---------- drivepool extras ---------- */
   .kick2{font-size:10.5px;letter-spacing:.08em;color:var(--dim);margin-bottom:6px}
   .dpver{display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:16px;flex-wrap:wrap}
@@ -736,7 +741,7 @@
     <div class="dkrow dkhead"><span>DISK ▲</span><span>FILES</span><span>CAPACITY</span><span style="text-align:right">FREE</span></div>
     <div id="dkrows"></div>
   </div>
-  <p class="dim rev" style="font-size:12px;margin-top:12px">Every spindle's busy time is split three ways — nuarr's own, the viewer's, everything else — and the part that is not nuarr's sets the pace: slowing from 40% busy, a quarter speed at 90%, a pause only above 97% sustained. Each card says one word; on the real page it opens on hover with the numbers and the trend.</p>
+  <p class="dim rev" style="font-size:12px;margin-top:12px">Every spindle's busy time is split three ways — nuarr's own, the viewer's, everything else — and the part that is not nuarr's sets the pace: slowing from 40% busy, a quarter speed at 90%, a pause only above 97% sustained. Each card says one word and opens on hover with the numbers behind it — try it.</p>
 </section>
 
 <!-- ======================= DRIVEPOOL ======================= -->
@@ -797,7 +802,7 @@
     <div class="feat rev"><div class="accent" style="background:var(--lilac)"></div><div class="ico">👂</div><b>Whisper, managed</b><p>The language-ID model lives under nuarr's own data folder with a version-and-update check like every other tool — repo links and file paths one click away for debugging.</p></div>
     <div class="feat rev"><div class="accent" style="background:var(--acc)"></div><div class="ico">👀</div><b>The library watches itself</b><p>A change watcher on every managed folder — one per PoolPart on a pool. A file that lands or leaves is seen within a minute and only its library is rescanned; while the watchers are healthy the full scan stretches to every twelve hours.</p></div>
     <div class="feat rev"><div class="accent" style="background:var(--ok)"></div><div class="ico">📥</div><b>Back into the arr</b><p>A file nuarr rewrote that Sonarr or Radarr lost track of is imported straight back from Needs Attention — matched on air date when the parser gives up on a daily-series name, with quality, language and group filled in.</p></div>
-    <div class="feat rev"><div class="accent" style="background:var(--purple)"></div><div class="ico">📱</div><b>Fits a phone</b><p>Sized for a Galaxy Z Fold folded and unfolded, detected from the device rather than the window — so "desktop site" gets the desktop site. Settings collapses to an icon rail that opens as a drawer.</p></div>
+    <div class="feat rev"><div class="accent" style="background:var(--purple)"></div><div class="ico">📱</div><b>Fits a phone</b><p>The same pages laid out for phones, detected from the device rather than the window — so "desktop site" gets the desktop site. Settings collapses to an icon rail that opens as a drawer.</p></div>
     <div class="feat rev"><div class="accent" style="background:var(--gold)"></div><div class="ico">🛡️</div><b>Profile guard</b><p>Quality profiles tuned so a 2160p profile means <i>the best 2160p</i> — and a watcher re-applies the setup if a Profilarr sync flattens it. Download loops: found, fixed, prevented.</p></div>
   </div>
 </section>
@@ -1485,7 +1490,7 @@ setInterval(()=>{
   const full=[52.7,52.8,52.7,52.7,52.0,51.8,52.7,52.7,52.7,51.6,52.7,52.7];
   const free=['8.61','8.58','4.31','4.31','4.37','4.39','4.31','5.17','5.17','4.40','4.31','4.30'];
   const trend=['▲ 9.7 GB/h','▲ 13.9 GB/h','→ steady','→ steady','▼ 34.4 GB/h','▲ 4.9 GB/h','→ steady','→ steady','→ steady','▲ 2.6 GB/h','→ steady','▲ 4.9 GB/h'];
-  const card=(cls,lb,txt,extra='')=>`<span class="dcard ${cls}"><span class="lb">${lb}</span>${txt}${extra}</span>`;
+  const card=(cls,lb,txt,extra='',tip='')=>`<span class="dcard ${cls}" data-tip="${tip.replace(/"/g,'&quot;')}"><span class="lb">${lb}</span>${txt}${extra}</span>`;
   host.innerHTML=files.map((n,i)=>`<div class="dkrow" id="dk${i}" style="border-left-color:${DCOL[i]}">
       <span><div class="dk-name" style="color:${DCOL[i]}">NU-DRIVE-${i}</div><div class="dk-move" id="dkmv${i}"></div></span>
       <span class="dk-files">${n.toLocaleString()}</span>
@@ -1498,7 +1503,7 @@ setInterval(()=>{
       <span><div class="dk-cap"><i style="width:52.5%"></i></div><div class="dk-capl">52.5% of pool · ▲ 1.6 GB/h</div></span>
       <span class="dk-free" style="font-weight:700;color:var(--fg)">62.21 TB</span>
       <span class="dk-cards" id="dkcP"></span></div>`;
-  const busy=(pct,v,n,sy)=>`<span class="dk-busy">BUSY <b>${pct}%</b><span class="dk-busybar"><i style="width:${v}%;background:var(--ok)"></i><i style="width:${n}%;background:var(--acc)"></i><i style="width:${sy}%;background:var(--warn)"></i></span></span>`;
+  const busy=(pct,v,n,sy)=>`<span class="dk-busy" data-tip="<b>${pct}% busy</b> over the last 30 s<br>viewer ${v}% · nuarr ${n}% · everything else ${sy}%<br><span class='dim'>the part that is not nuarr's sets the pace: ${sy<40?'full speed':sy<90?'slowing':'quarter speed'}${sy>=97?' — paused':''}</span>">BUSY <b>${pct}%</b><span class="dk-busybar"><i style="width:${v}%;background:var(--ok)"></i><i style="width:${n}%;background:var(--acc)"></i><i style="width:${sy}%;background:var(--warn)"></i></span></span>`;
   const t0=Date.now();
   const tick=()=>{
     const t=(Date.now()-t0)/1000;
@@ -1507,28 +1512,43 @@ setInterval(()=>{
     const mv=(10+Math.sin(t/2)*1.5).toFixed(1);   // the mover, 1 -> 9
     for(let i=0;i<12;i++){
       const c=document.getElementById('dkc'+i), m=document.getElementById('dkmv'+i), cap=document.getElementById('dkcap'+i);
-      let b='', nu=card('','NUARR','no jobs here'), sy=card('','SYSTEM','—'), vw=card('','VIEWER','—');
+      let b='', nu=card('','NUARR','no jobs here','','<b>nothing of nuarr\'s on this disk</b><br><span class=\'dim\'>the dispatcher will put work here first: it is one of the quiet spindles</span>'),
+          sy=card('','SYSTEM','—','','<b>no one else is reading or writing</b><br><span class=\'dim\'>system = anything that is not nuarr: DrivePool, a backup, Plex\'s own scans</span>'),
+          vw=card('','VIEWER','—','','<b>nobody is watching from this disk</b>');
       m.textContent=''; cap.className='dk-cap';
       if(i===0){
-        if(phase===0){ b=busy(1,1,0,0); vw=card('viewer paused','VIEWER · PAUSED','',`<span class="hold">holding</span>`); }
-        else if(phase===1){ b=busy(9,8,0,1); vw=card('viewer','VIEWER · PLAYING','',`<span class="hold" style="color:var(--ok)">3.2 min ahead</span>`); }
-        else { b=busy(14,12,0,2); vw=card('viewer','VIEWER · PLAYING','',`<span class="hold">41s — nuarr held here</span>`); }
+        if(phase===0){ b=busy(1,1,0,0); vw=card('viewer paused','VIEWER · PAUSED','',`<span class="hold">holding</span>`,'<b>1 session, paused</b> · Anna Pigeon S01E05 · direct play<br>4.6 min buffered (measured) · floor 30s<br><span class=\'dim\'>a paused stream reads nothing, so it never holds the queue — the lead it had is kept, not recomputed</span>'); }
+        else if(phase===1){ b=busy(9,8,0,1); vw=card('viewer','VIEWER · PLAYING','',`<span class="hold" style="color:var(--ok)">3.2 min ahead</span>`,'<b>1 session, playing</b> · Anna Pigeon S01E05 · direct play · 14.0 Mbps<br>3.2 min buffered · floor 30s · full speed over 90s<br><span class=\'dim\'>nuarr at full speed on this disk: the viewer is well clear of the floor</span>'); }
+        else { b=busy(14,12,0,2); vw=card('viewer','VIEWER · PLAYING','',`<span class="hold">41s — nuarr held here</span>`,'<b>1 session, playing</b> · Anna Pigeon S01E05 · direct play · 14.0 Mbps<br>41s buffered · floor 30s · resumes at 45s<br><span class=\'dim\'>under 45s nuarr stays held on this spindle so the buffer can recover — two thresholds, no flapping</span>'); }
       } else if(i===3){
         const pace=phase===2?'held':phase===1?'full speed':'full speed';
         b=busy(phase===2?2:38,0,phase===2?0:36,2);
-        nu=card('nuarr','NUARR',`encode ${enc}%`,`<span class="pb"><i style="width:${enc}%"></i></span><span class="hold" style="color:${phase===2?'var(--gold)':'var(--ok)'}">${phase===2?'waiting for the viewer':'Velvet S03E09'}</span>`);
+        nu=card('nuarr','NUARR',`encode ${enc}%`,`<span class="pb"><i style="width:${enc}%"></i></span><span class="hold" style="color:${phase===2?'var(--gold)':'var(--ok)'}">${phase===2?'waiting for the viewer':'Velvet S03E09'}</span>`,`<b>encode ${enc}%</b> · Velvet S03E09 · h265 NVENC<br>reading 41 MB/s · writing 12 MB/s to cache · 1h 12m left<br><span class=\'dim\'>${phase===2?'held: the viewer on NU-DRIVE-0 is under 45s of buffer — the encode is frozen mid-frame, not killed':phase===1?'pace: full speed — the viewer on NU-DRIVE-0 is 3.2 min ahead':'pace: full speed — nobody is reading this spindle'}</span>`);
       } else if(i===1){
-        b=busy(13,0,0,13); sy=card('sys','SYSTEM',`↑ ${mv} MB/s`); m.innerHTML=`››› to <span style="color:${DCOL[9]}">NU-DRIVE-9</span> ${mv} MB/s`; cap.className='dk-cap out';
+        b=busy(13,0,0,13); sy=card('sys','SYSTEM',`↑ ${mv} MB/s`,'',`<b>DrivePool's mover</b> reading ${mv} MB/s off this disk<br>balancing · to NU-DRIVE-9 · 13% busy, steady<br><span class=\'dim\'>not nuarr's traffic — file replaces landing here are paced against it</span>`); m.innerHTML=`››› to <span style="color:${DCOL[9]}">NU-DRIVE-9</span> ${mv} MB/s`; cap.className='dk-cap out';
       } else if(i===9){
-        b=busy(88,0,0,88); sy=card('sys','SYSTEM',`↓ ${mv} MB/s`); m.innerHTML=`››› from <span style="color:${DCOL[1]}">NU-DRIVE-1</span> ${mv} MB/s`; cap.className='dk-cap in';
+        b=busy(88,0,0,88); sy=card('sys','SYSTEM',`↓ ${mv} MB/s`,'',`<b>DrivePool's mover</b> writing ${mv} MB/s onto this disk<br>balancing · from NU-DRIVE-1 · 88% busy, ▲ rising<br><span class=\'dim\'>quarter speed for nuarr here; new jobs are steered elsewhere</span>`); m.innerHTML=`››› from <span style="color:${DCOL[1]}">NU-DRIVE-1</span> ${mv} MB/s`; cap.className='dk-cap in';
       } else if(i===7){
-        b=busy(22,0,21,1); nu=card('nuarr','NUARR','passthrough 64%',`<span class="pb"><i style="width:64%"></i></span><span class="hold" style="color:var(--ok)">full speed</span>`);
+        b=busy(22,0,21,1); nu=card('nuarr','NUARR','passthrough 64%',`<span class="pb"><i style="width:64%"></i></span><span class="hold" style="color:var(--ok)">full speed</span>`,'<b>passthrough 64%</b> · Goblin Slayer S01E07 · remux, subtitle drop<br>reading 96 MB/s · 2m 10s left<br><span class=\'dim\'>pace: full speed — nothing else is on this spindle</span>');
       } else { b=busy(1,0,0,1); }
       c.innerHTML=b+nu+sy+vw;
     }
-    document.getElementById('dkcP').innerHTML=busy('9',1,5,3).replace('BUSY','BUSY AVG')+card('','NUARR','2 jobs')+card('sys','SYSTEM',`${(2*mv).toFixed(1)} MB/s`)+(phase===0?card('viewer paused','VIEWER · PAUSED','',`<span class="hold">holding</span>`):card('viewer','VIEWER · PLAYING','',`<span class="hold" style="color:var(--ok)">1 stream</span>`));
+    document.getElementById('dkcP').innerHTML=busy('9',1,5,3).replace('BUSY','BUSY AVG')+card('','NUARR','2 jobs','','<b>2 jobs across the pool</b> · 1 encode, 1 passthrough<br><span class=\'dim\'>on NU-DRIVE-3 and NU-DRIVE-7 — never two heavy jobs on one spindle</span>')+card('sys','SYSTEM',`${(2*mv).toFixed(1)} MB/s`,'',`<b>DrivePool balancing</b> · ${mv} MB/s off NU-DRIVE-1, ${mv} MB/s onto NU-DRIVE-9<br><span class=\'dim\'>78% through this run · about 18m left</span>`)+(phase===0?card('viewer paused','VIEWER · PAUSED','',`<span class="hold">holding</span>`,'<b>1 session, paused</b> · nothing being read<br><span class=\'dim\'>paused streams never hold the queue</span>'):card('viewer','VIEWER · PLAYING','',`<span class="hold" style="color:var(--ok)">1 stream</span>`,'<b>1 session, playing</b> · on NU-DRIVE-0<br><span class=\'dim\'>the other eleven disks run at full speed</span>'));
   };
   tick(); setInterval(tick,1000);
+  // HOVER CARDS, as on the real panel: the word on the card, the numbers behind it
+  const tip=document.createElement('div'); tip.className='dtip'; document.body.append(tip);
+  let over=null;
+  const place=(e)=>{ const r=over.getBoundingClientRect(); tip.style.left=Math.min(innerWidth-tip.offsetWidth-12, Math.max(12, r.left))+'px'; tip.style.top=(r.bottom+8+scrollY)+'px'; };
+  document.getElementById('dpanel').addEventListener('mouseover',e=>{
+    const c=e.target.closest('[data-tip]'); if(!c||c===over) return;
+    over=c; tip.innerHTML=c.dataset.tip; tip.classList.add('on'); place(e);
+  });
+  document.getElementById('dpanel').addEventListener('mouseout',e=>{
+    const c=e.target.closest('[data-tip]'); if(c&&c===over&&!c.contains(e.relatedTarget)){ over=null; tip.classList.remove('on'); }
+  });
+  // the cards repaint every second; keep the open card's text current
+  setInterval(()=>{ if(over&&document.contains(over)) tip.innerHTML=over.dataset.tip; else if(over){ const again=document.querySelector(`[data-tip]:hover`); if(again){ over=again; tip.innerHTML=again.dataset.tip; place(); } else { over=null; tip.classList.remove('on'); } } },1000);
 })();
 </script>
 </body>
