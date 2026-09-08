@@ -326,6 +326,8 @@
   .baleta{text-align:right;font-weight:700}
   @media(max-width:900px){.balrow{grid-template-columns:76px 1fr 46px 150px 88px} .balrow>*:nth-child(4),.balrow>*:nth-child(5),.balrow>*:nth-child(7),.balrow>*:nth-child(8),.balrow>*:nth-child(9){display:none}}
 
+  .uiframe{display:block;width:100%;border:0;border-radius:12px;background:#0d1117;box-shadow:0 0 0 1px var(--line);height:600px}
+
   /* ---------- the per-disk panel ---------- */
   .dpanel{margin-top:22px;padding:0;overflow:hidden}
   .dphead{display:flex;align-items:center;padding:12px 16px;font-size:12px;letter-spacing:.08em;color:var(--fg);font-weight:700;border-bottom:1px solid var(--line)}
@@ -728,7 +730,7 @@
 <!-- ======================= DISKS ======================= -->
 <section id="disks">
   <div class="kicker rev">TWELVE SPINDLES, ONE BRAIN</div>
-  <h2 class="rev">Disk-aware scheduling</h2>
+  <h2 class="rev">Disk-aware scheduling <span class="tag">the real panel, captured live</span></h2>
   <p class="lede rev">The library spans twelve pooled disks, and nuarr watches every one
      natively — no vendor tools, no product-specific checks. It knows which spindle every
      file is on, spreads heavy jobs so no two share a disk, and names the destination as
@@ -736,18 +738,14 @@
      a new disk is picked up and assigned one automatically. When a viewer is streaming
      from a disk, work touching that spindle paces itself against their real buffer while
      everything else runs at full speed.</p>
-  <div class="panel dpanel rev" id="dpanel">
-    <div class="dphead"><span>FILES PER POOL DISK</span><span class="dpleg"><i style="background:var(--ok)"></i>viewer <i style="background:var(--acc)"></i>Nuarr <i style="background:var(--warn)"></i>system</span></div>
-    <div class="dkrow dkhead"><span>DISK ▲</span><span>FILES</span><span>CAPACITY</span><span style="text-align:right">FREE</span></div>
-    <div id="dkrows"></div>
-  </div>
-  <p class="dim rev" style="font-size:12px;margin-top:12px">Every spindle's busy time is split three ways — nuarr's own, the viewer's, everything else — and the part that is not nuarr's sets the pace: slowing from 40% busy, a quarter speed at 90%, a pause only above 97% sustained. Each card says one word and opens on hover with the numbers behind it — try it.</p>
+  <iframe class="uiframe rev" src="ui-disks.html" style="max-width:740px" title="Files per pool disk — the real panel, captured live" scrolling="no"></iframe>
+  <p class="dim rev" style="font-size:12px;margin-top:12px">Every spindle's busy time is split three ways — nuarr's own, the viewer's, everything else — and the part that is not nuarr's sets the pace: slowing from 40% busy, a quarter speed at 90%, a pause only above 97% sustained. Each card says one word and opens on hover with the numbers behind it — try it. This is the real panel, captured from a running nuarr.</p>
 </section>
 
 <!-- ======================= DRIVEPOOL ======================= -->
 <section id="drivepool">
   <div class="kicker rev">IT READS THE BALANCER'S OWN PLAN</div>
-  <h2 class="rev">StableBit DrivePool, from the source <span class="tag">live replica</span></h2>
+  <h2 class="rev">StableBit DrivePool, from the source <span class="tag">the real page, captured live</span></h2>
   <p class="lede rev">nuarr reads DrivePool's own records — not its log: which balancers are on,
      how balanced the pool is by DrivePool's measure, and for every disk whether it is filling
      or emptying, what is left of the plan for it, and where it will stop. The disk being written
@@ -755,36 +753,7 @@
      <b style="color:var(--acc)">blue</b>, and the glow follows the mover. While it runs, renames
      are held (they race the mover for the same file), file replaces go ahead paced per chunk
      against the disk they land on, and a disk removal holds everything. Each hold is a switch.</p>
-  <div class="panel rev" style="margin-top:26px;padding:16px 20px">
-    <div class="dpver"><b>StableBit DrivePool 2.3.13.1687</b> <span class="pill ok">service running</span> <span class="pill ok">reading its log</span> <span class="dim">last entry <span id="dplast">41s</span> ago</span><span style="margin-left:auto" class="dim"><span class="tog on" style="display:inline-block;vertical-align:middle;margin-right:6px"><i></i></span> integration <span class="pill ok">ON</span></span></div>
-    <div class="kick2">RIGHT NOW</div>
-    <div class="dpline mono"><span class="pill gold">balancing</span> <b id="dphead">DrivePool is balancing — 78% through this run, moving at 46 MB/s, for 1h 3m</b></div>
-    <div class="dpprog"><i id="dpbar" style="width:78%"></i></div>
-    <div class="dpsub mono" id="dpsub"><span class="dim">77.6% through this run</span> · <span style="color:var(--acc)">reads 10 MB/s</span> · <span style="color:var(--warn)">writes 10 MB/s</span> · <b>about 18m 33s left</b></div>
-    <div class="dpflow mono"><span class="k" style="color:var(--acc)">Emptying</span><span id="dpout">NU-DRIVE-4 <span class="dim">34.3 GB/h</span></span></div>
-    <div class="dpflow mono"><span class="k" style="color:var(--warn)">Filling</span><span id="dpin">NU-DRIVE-1 <span class="dim">35.0 GB/h</span></span></div>
-    <div class="dprun mono"><span class="dim">THIS RUN</span><span class="pill gold">balancing</span><span id="dprun">77.6% through · running 1h 4m · DrivePool says <b>92.5 GB</b> left to move</span><span style="margin-left:auto">done in <b id="dpeta">about 18m 33s</b></span></div>
-
-    <div class="kick2" style="margin-top:22px">HOW BALANCED THE POOL IS</div>
-    <div style="font-size:13px"><b style="color:var(--ok)">balanced</b> <span class="dim">— every disk within 1 point of the pool average</span></div>
-    <div style="font-size:12.5px;margin-top:2px"><span class="dim">DrivePool's own reading:</span> <b style="color:var(--ok)">99.87% balanced</b> <span class="dim">· 92.5 GB still to move · balancers on: All In One, StableBit Scanner · plan read <span id="dpread">6s</span> ago</span></div>
-    <div class="baltab mono" id="baltab"></div>
-    <div class="dim" style="font-size:11.5px;margin-top:8px">Bars are each disk's fill on a zoomed axis; "vs avg" is its distance from the pool average in points — amber fuller, blue emptier, grey within 1 point. The white tick is DrivePool's own target for the disk, "stops at" the fill it will reach, "left to move" what remains of DrivePool's plan for it — the plan is written once per pass, so the live figure is the plan less what the disk has gained or lost since — and the ETA is that at the current rate.</div>
-
-    <div class="kick2" style="margin-top:22px">WHAT NUARR IS DOING ABOUT IT</div>
-    <div class="dpact"><b>New jobs</b><span class="pill ok">running</span><span class="dim">starting as normal — the dispatcher steers new work off the busy spindles</span></div>
-    <div class="dpact"><b>File replaces</b><span class="pill ok">running</span><span class="dim">going ahead, paced per chunk against the disk the file lands on</span></div>
-    <div class="dpact"><b>Renames</b><span class="pill gold">waiting</span><span class="dim">held for the whole move — they race the mover for the same file</span></div>
-
-    <div class="kick2" style="margin-top:22px">WHILE DRIVEPOOL IS… HOLD NUARR'S…</div>
-    <div class="dphold mono">
-      <div class="hh"><span></span><span>NEW JOBS</span><span>FILE REPLACES</span><span>RENAMES</span></div>
-      <div class="hr"><span><b>Balancing</b><small>DrivePool evening out how full each disk is.</small></span><span><span class="tog"><i></i></span><em>OFF</em></span><span><span class="tog on"><i></i></span><em class="on">ON</em></span><span><span class="tog on"><i></i></span><em class="on">ON</em></span></div>
-      <div class="hr"><span><b>Duplicating</b><small>Making or repairing the extra copies of duplicated folders.</small></span><span><span class="tog"><i></i></span><em>OFF</em></span><span><span class="tog on"><i></i></span><em class="on">ON</em></span><span><span class="tog on"><i></i></span><em class="on">ON</em></span></div>
-      <div class="hr"><span><b>Removing a disk</b><small>Evacuating a disk you are taking out of the pool. Every file on it is on the move.</small></span><span><span class="tog on"><i></i></span><em class="on">ON</em></span><span><span class="tog on"><i></i></span><em class="on">ON</em></span><span><span class="tog on"><i></i></span><em class="on">ON</em></span></div>
-    </div>
-    <div class="dim" style="font-size:11.5px;margin-top:10px">File replaces go ahead during a balance and are paced per chunk against the disk the file actually lands on — slowed as that disk gets busy, stopped if it is saturated — the same ramp a viewer gets. New jobs are held only while the move has a disk at quarter-speed level or worse. Renames are held for the whole move. Removing a disk holds everything. A held commit waits up to three hours and then goes ahead regardless.</div>
-  </div>
+  <iframe class="uiframe rev" src="ui-drivepool.html" title="StableBit DrivePool — the real page, captured live" scrolling="no" style="margin-top:26px"></iframe>
 </section>
 
 <!-- ======================= INTEGRATION ======================= -->
@@ -1480,6 +1449,13 @@ setInterval(()=>{
   tick(); setInterval(tick,1000);
   const ldp=document.getElementById('l-dp'); if(ldp) ldp.classList.add('hold');
 })();
+
+/* ---------- the captured panels size themselves ---------- */
+addEventListener('message',e=>{
+  const d=e.data||{}; if(!d.nuarrFrame) return;
+  for(const f of document.querySelectorAll('iframe.uiframe')) if(f.getAttribute('src')===d.nuarrFrame) f.style.height=(d.h+4)+'px';
+});
+const ldp=document.getElementById('l-dp'); if(ldp) ldp.classList.add('hold');
 
 /* ---------- disks: the per-disk panel, animated ---------- */
 (()=>{
