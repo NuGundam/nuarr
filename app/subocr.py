@@ -3032,7 +3032,14 @@ _GAP_PER_LIB = 200
 # computed here and read a second later is a rate for a moment that has passed.
 GAP_STATE: dict = {"running": False, "done": 0, "total": 0, "found": 0,
                    "started": 0.0}
-_RULES_GAP_TTL = 300.0
+# FIFTEEN MINUTES, NOT FIVE, because the answer no longer has to go stale to
+# get corrected: every file whose probe is rewritten - a job finishing, a
+# rescan the change watchers asked for - is re-asked of the planner on the
+# spot and taken off the list if it now conforms (gap_reconsider). The full
+# walk is the backstop that catches rule CHANGES and the files nothing
+# touched, and it runs on its own clock (gap_watch) rather than waiting for
+# somebody to open the page, so "next check in 4m 12s" is a promise.
+_RULES_GAP_TTL = 900.0
 
 
 def _kept_subs(probe: dict, row, _rules) -> list:
@@ -3196,6 +3203,70 @@ def _rules_gap_compute() -> dict:
     _GAP_FILES.update(files_by_lib)
     _RULES_GAP.update(at=time.time(), d=out, busy=False)
     return out
+
+
+def gap_next_at() -> float:
+    """When the next full walk is due. 0 while one has never run."""
+    at = _RULES_GAP["at"] or 0.0
+    return at + _RULES_GAP_TTL if at else 0.0
+
+
+def gap_reconsider(file_id: int, probe: dict | None = None) -> bool:
+    r"""A file just changed on disk - is it still out of date?
+
+    THE LIST WAS A SNAPSHOT AND JOBS FINISH ALL THE TIME. Erik requeued one
+    file, watched it finish, and the card still named it for the rest of the
+    five minutes the count was cached: nothing on the page said "fixed"
+    because nothing had asked. This is the asking. Called from the one place
+    every new probe passes through (jobs.store_probe), so a file that was
+    rewritten by a job or re-read after a watcher saw it change is planned
+    again against today's rules immediately - a few hundred microseconds -
+    and, if the planner now wants nothing done, comes off the counts and off
+    the rows in place. The full walk is left for what it is good at: rule
+    changes, and the files nothing touched.
+
+    -> True when the file was on the list and is no longer.
+    """
+    d = _RULES_GAP["d"]
+    if not d or not _GAP_IDS:
+        return False
+    hit = next(((f, l) for f, l in _GAP_IDS if f == file_id), None)
+    if not hit:
+        return False
+    from . import rules as _rules
+    from .db import cursor
+    try:
+        with cursor() as cur:
+            r = cur.execute(
+                "SELECT f.id, f.path, f.library, f.size, f.title, f.season, "
+                "       f.episode, f.pool_disk, f.state, p.json "
+                "  FROM files f LEFT JOIN file_probes p ON p.file_id = f.id "
+                " WHERE f.id = ?", (file_id,)).fetchone()
+        if r is None:
+            still = False
+        else:
+            pr = probe
+            if pr is None:
+                pr = json.loads(r["json"]) if r["json"] else None
+            still = bool(pr) and r["state"] == "done" and bool(_sub_actions(r, pr, _rules))
+    except Exception:                                        # noqa: BLE001
+        return False
+    if still:
+        return False
+    lib = hit[1]
+    _GAP_IDS[:] = [(f, l) for f, l in _GAP_IDS if f != file_id]
+    rows = _GAP_FILES.get(lib)
+    if rows:
+        _GAP_FILES[lib] = [x for x in rows if x.get("file_id") != file_id]
+    by = d.get("by_library") or {}
+    if lib in by:
+        by[lib] = by[lib] - 1
+        if by[lib] <= 0:
+            by.pop(lib, None)
+    d["total"] = max(0, (d.get("total") or 0) - 1)
+    d["settled_at"] = time.time()
+    d["settled_n"] = (d.get("settled_n") or 0) + 1
+    return True
 
 
 def gap_mode() -> str:
@@ -3450,13 +3521,21 @@ async def gap_watch() -> None:
     while True:
         schedules.beat("rulesgap")
         try:
+            # THE WALK RUNS ON ITS OWN CLOCK. It used to run only when the
+            # page asked after the cache had aged out, so "next check" was
+            # whenever somebody next looked. Now the count is kept current
+            # whether or not the page is open, and the ETA on the card is
+            # the real one.
+            if (_RULES_GAP["d"] is None or time.time() >= gap_next_at()) \
+                    and not _RULES_GAP["busy"] and not GAP_STATE.get("running"):
+                rules_gap(force=True)
             from . import joblog as _jl
             with _jl.section("Subtitle rules drain"):
                 await gap_tick()
         except Exception as e:                               # noqa: BLE001
             from . import joblog as _log
             _log.log(f"subtitle rules drain: {type(e).__name__}: {e}", "warn")
-        await asyncio.sleep(60)
+        await asyncio.sleep(30)
 
 
 def rules_gap(force: bool = False) -> dict:

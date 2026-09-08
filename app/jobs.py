@@ -846,6 +846,15 @@ def cache_probe(file_id: int, data: dict) -> None:
             "INSERT INTO file_probes(file_id, json, at) VALUES(?,?,?) "
             "ON CONFLICT(file_id) DO UPDATE SET json=excluded.json, at=excluded.at",
             (file_id, json.dumps(data, separators=(",", ":")), now))
+    # A NEW PROBE IS THE MOMENT THE "OLDER SUBTITLE RULES" LIST CAN CHANGE ITS
+    # MIND ABOUT THIS FILE - a job just rewrote it, or a watcher saw it change
+    # and the rescan re-read it. Asked here, once, rather than on the page's
+    # next five-minute cache miss.
+    try:
+        from . import subocr as _so
+        _so.gap_reconsider(file_id, data)
+    except Exception:                                        # noqa: BLE001
+        pass
     # A NEW PROBE MEANS A NEW FILE, AND TRACK NUMBERS MOVE WHEN TRACKS ARE
     # DROPPED. Any language verdict recorded against the old layout now points
     # at a different track, so it is deleted rather than left to rot: seven

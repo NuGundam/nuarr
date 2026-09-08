@@ -5772,6 +5772,11 @@ def api_subocr_rulesgap(check: int = 0):
     # THE WALK, WHILE IT IS WALKING. Same poll as everything else on the card:
     # a second endpoint for progress would be a second clock to disagree with.
     d["scan"] = dict(subocr.GAP_STATE)
+    # WHEN THE NEXT FULL WALK IS DUE, so the card can count down to it. The
+    # walk is proactive now (gap_watch), so this is a time, not a hope.
+    d["next_at"] = subocr.gap_next_at()
+    d["ttl_s"] = subocr._RULES_GAP_TTL
+    d["now"] = time.time()
     # The requeue pass rides along on the same poll the card already makes -
     # a second endpoint polling in step is how two numbers on one card end up
     # disagreeing about the same moment.
@@ -24860,11 +24865,34 @@ async function gapLoad(){
   // library this size - which is why it is not done on the request.
   const counting=(d.total===null||d.total===undefined);
   const queueing=!!(d.drain&&d.drain.on) || _gapBusy!==null;
-  if(counting||queueing||scanning)
-    _gapPoll=setTimeout(()=>{ if(document.getElementById('gapBody')) gapLoad(); },
-                        scanning?700:(queueing?900:4000));
+  // IDLE STILL POLLS, slowly. A file that a job just rewrote is taken off the
+  // list on the server the moment it is read back; a card that only refreshed
+  // on a click would go on naming it. Ten seconds is cheap - the endpoint is
+  // a dict copy - and the list node is kept, so nothing on screen jumps.
+  _gapPoll=setTimeout(()=>{ if(document.getElementById('gapBody')) gapLoad(); },
+                      scanning?700:(queueing?900:(counting?4000:10000)));
+  gapClock();
 }
 
+// THE COUNTDOWN TO THE NEXT WALK, ticking on the page's own clock. `skew` is
+// the server clock minus ours, so a box whose clock is a minute out still
+// counts to the right moment.
+function gapNextTxt(nextAt, skew){
+  const left=Math.round(nextAt-(Date.now()/1000+(skew||0)));
+  if(left<=0) return 'checking again now…';
+  const m=Math.floor(left/60), s=left%60;
+  return 'next check in '+(m?m+'m ':'')+(m<10?s+'s':'');
+}
+let _gapClock=null;
+function gapClock(){
+  if(_gapClock) clearInterval(_gapClock);
+  _gapClock=setInterval(()=>{
+    const n=document.getElementById('gapNext');
+    if(!n){ clearInterval(_gapClock); _gapClock=null; return; }
+    const t=gapNextTxt(+n.dataset.next, +n.dataset.skew);
+    if(n.textContent!==t) n.textContent=t;
+  },1000);
+}
 // In auto the check drives the queue itself; the buttons stay visible so the
 // page still says what CAN be done, but greyed, with the reason in the tip.
 function gapAuto(){ return !!(_gap && _gap.mode==='auto'); }
@@ -24891,7 +24919,8 @@ function gapRender(){
     return;
   }
   const when=`${d.at?`<span class="dim" style="font-size:10.5px">checked ${
-    ago(d.at)}</span>`:''}
+    ago(d.at)}${d.next_at?` · <span id="gapNext" data-next="${d.next_at}" data-skew="${(d.now||0)-Date.now()/1000}">${gapNextTxt(d.next_at,(d.now||0)-Date.now()/1000)}</span>`:''}${
+    d.settled_n?` · <span style="color:var(--ok)" title="files taken off this list the moment their rewrite was read back, without waiting for the next walk">${fmt(d.settled_n)} settled since</span>`:''}</span>`:''}
     <button class="gapchk" style="font-size:10.5px;padding:1px 8px"
       onclick="gapCheck(this)"
       title="Walk every finished file against the rules as they stand right now. About twenty seconds; the list below stays readable while it runs."
@@ -24917,7 +24946,8 @@ function gapRender(){
       <b style="color:var(--ok)">every file matches the subtitle rules</b>
       ${when}</div>
       <div class="dim" style="font-size:10.5px;margin-top:3px">Change a switch
-        above and this will say so within five minutes, or press Check now.</div>`;
+        above and this will say so at the next check, or press Check now. A file
+        a job rewrites is re-read the moment it lands and judged again then.</div>`;
     gapScanTick();
     return;
   }
