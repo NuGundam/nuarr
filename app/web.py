@@ -7653,6 +7653,18 @@ async def api_tautulli_auto(on: bool = True, every_h: float = 0):
     return {"ok": True, **d}
 
 
+@app.post("/api/clientcaps/reset")
+async def api_clientcaps_reset():
+    """Forget the import watermark so the next run re-reads all of history.
+
+    Needed whenever the import learns a new kind of fact: subtitles were added
+    to the query long after the watermark had walked past the last session, so
+    everything already recorded was invisible to it.
+    """
+    from . import clientcaps
+    return clientcaps.reset_import()
+
+
 @app.post("/api/clientcaps/tautulli")
 async def api_clientcaps_tautulli():
     r"""Learn from Tautulli's play history. Minutes, so it returns at once.
@@ -28768,6 +28780,12 @@ function capsShow(on, slot){
   try{ localStorage.setItem(S.store, on?'open':'shut'); }catch(e){}
   if(on && !S.caps) capsLoad(false, slot); else capsPaint(slot);
 }
+async function capsReread(slot, el){
+  if(el){ el.textContent='re-reading…'; el.onclick=null; }
+  try{ await fetch('/api/clientcaps/reset',{method:'POST'});
+       await fetch('/api/clientcaps/tautulli',{method:'POST'}); }catch(e){}
+  capsLoad(true, slot);
+}
 async function capsTaut(btn, slot){
   if(btn) btn.disabled=true;
   try{ await fetch('/api/clientcaps/tautulli',{method:'POST'}); }catch(e){}
@@ -28901,6 +28919,9 @@ function capsPaint(slot){
         ${dev.seen?`<span class="capsseen" title="This server has watched this device play or refuse something. What it saw beats the platform profile.">seen${
             dev.last_at?' '+ago(dev.last_at):''}</span>`
                   :`<span class="capsguess" title="Nothing has played on this device here yet, so the panel is using a typical profile for the platform. One session replaces it with what actually happened.">typical profile</span>`}
+        ${dev.always_burns?`<span class="capsburn" title="${esc(dev.always_burns
+            +". Plex's Burn Subtitles setting is per app and has an Always option; on Always it burns every subtitle whatever the format, which is a setting rather than a limit. Check it in that app before trusting any red below.")
+          }">set to burn?</span>`:''}
         <span class="capsstrip">${strip}</span></div>
       ${open?`<div class="capsopen">
         <div class="capsnote">${esc(dev.note||'')}</div>
@@ -28934,7 +28955,8 @@ function capsPaint(slot){
         (cs.devices)===1?'':'s'} and ${fmt((cs.rows)||0)} codec facts${
         T.imported_to?`, up to session #${fmt(T.imported_to)}`:''} —
         managed on the <a href="#" onclick="wtab('tautulli');return false"
-        >Tautulli page</a>.</span>`;
+        >Tautulli page</a>. <a href="#" onclick="capsReread('${slot}',this);return false"
+        title="Forget how far the import got and read the whole history again. Needed after the import learns a new kind of fact - subtitles were added long after the watermark had walked past every session that carried one.">Re-read it all</a>.</span>`;
   const intro = side==='subtitle'
     ? `A subtitle a client will not render is not skipped — it is painted onto
        the picture, which means the whole video is re-encoded to carry it. So
@@ -31747,6 +31769,11 @@ html.mobile .setwrap:not(.rail) .setmain,html.mobile .setwrap:not(.rail) #worker
 .rmb.bad:hover:not(:disabled){background:rgba(255,110,110,.12)}
 .rmb:disabled{opacity:.42;cursor:help}
 .rmb.spin{opacity:.6;pointer-events:none}
+/* A DEVICE THAT BURNED SOMETHING NOTHING NEEDS BURNING. Not a capability, a
+   preference - and worth saying loudly, because every red cell on that row is
+   suspect until the setting is checked. */
+.capsburn{font-size:10px;border:1px solid #5a4a1a;color:var(--warn);
+  border-radius:9px;padding:0 7px;cursor:help;white-space:nowrap}
 /* A REFRESH THAT SAYS IT IS REFRESHING. Without this the button did nothing
    visible for the second the fetch took, so it got pressed again. */
 .gapchk.spinning{position:relative;color:transparent!important;pointer-events:none}

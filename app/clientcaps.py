@@ -65,6 +65,8 @@ def init() -> None:
                 kind      TEXT NOT NULL,     -- video | audio | subtitle
                 codec     TEXT NOT NULL,
                 ch        INTEGER NOT NULL,  -- audio channels; 0 for video
+                                   -- subtitles: 0 unknown, 1 embedded,
+                                   -- 2 external. See SUB_EMBEDDED below
                 played    INTEGER NOT NULL DEFAULT 0,
                 refused   INTEGER NOT NULL DEFAULT 0,
                 first_at  REAL,
@@ -86,6 +88,36 @@ def init() -> None:
 
 # Best last, so a later source overwrites an earlier one and never the reverse.
 _SRC_RANK = {"": 0, "backfill": 1, "live": 2, "tautulli": 3}
+
+# WHAT QUALIFIES A SUBTITLE FACT, in the column that qualifies an audio one.
+#
+# `ch` exists because "this device refused E-AC3" is not one fact - it is two,
+# and the channel count is what tells them apart. Subtitles have exactly the
+# same problem with a different qualifier: a Bravia that burns an EXTERNAL ass
+# and renders the EMBEDDED one is not a device that cannot read ass, and a
+# table with one row for both would say it was.
+#
+# Reusing the column rather than adding one is deliberate. It is the same role
+# - the thing that makes two otherwise-identical rows different facts - and a
+# fifth primary-key column would need a migration to say something the fourth
+# already says.
+#
+# 0 is not "no qualifier", it is "not recorded": Tautulli's history has no
+# location field at all, so everything learned from it lands here, and only
+# live sightings can be precise.
+SUB_UNKNOWN, SUB_EMBEDDED, SUB_EXTERNAL = 0, 1, 2
+
+
+def sub_where(ch: int) -> str:
+    return {SUB_EMBEDDED: "embedded", SUB_EXTERNAL: "external"}.get(
+        int(ch or 0), "")
+
+
+# Formats nothing has to burn. A client that burned one of these is not a
+# client that cannot draw text - it is a client whose "Burn Subtitles" setting
+# is on Always, which Plex documents as a per-app option. Recording that as a
+# capability would be wrong about every other format it handles too.
+PLAIN_TEXT = {"srt", "subrip", "webvtt", "vtt", "mov_text", "smi"}
 
 
 def note(product: str, client: str, kind: str, codec: str,
@@ -356,8 +388,20 @@ def import_tautulli(walk: int = _TAUT_WALK) -> dict:
                             # device that cannot take a format here is not a
                             # small inefficiency, it is the whole file being
                             # rebuilt to paint words on it.
+                            # THE DECISION IS ON THE OTHER FIELD. Tautulli
+                            # names the source track subtitle_codec but puts
+                            # what HAPPENED to it in stream_subtitle_decision -
+                            # subtitle_decision exists and is null on every row
+                            # this server has. Reading the plausible name meant
+                            # the first full re-import learned 2,986 facts and
+                            # not one of them a subtitle: `dec` was None, so
+                            # the guard two lines down skipped every single
+                            # session. A field that is always empty looks
+                            # exactly like a library where nobody uses
+                            # subtitles.
                             ("subtitle", d.get("subtitle_codec"),
-                             d.get("subtitle_decision"), 0)):
+                             d.get("stream_subtitle_decision")
+                             or d.get("subtitle_decision"), 0)):
                         cod = str(cod or "").strip().lower()
                         dec = str(dec or "").strip().lower()
                         if not cod or not dec:
@@ -373,10 +417,24 @@ def import_tautulli(walk: int = _TAUT_WALK) -> dict:
                         # causes that and no cap excuses it.
                         if kind == "subtitle":
                             if dec == "burn":
-                                note(product, player, kind, cod, ch, ok=False,
-                                     at=at, src="tautulli", cur=cur)
-                                learned += 1
-                                TAUT["learned"] = learned
+                                # AND A CAPPED SESSION'S BURN PROVES NOTHING
+                                # EITHER. Measured on this server: four burns
+                                # examined, all at quality_profile "Original"
+                                # and all with a stream bitrate 2.5-4.6x the
+                                # SOURCE - the signature of a burn driving the
+                                # transcode. But the reverse happens too: when
+                                # a viewer has dialled their quality down, Plex
+                                # is rebuilding the video anyway and paints the
+                                # subtitle on because it is already re-encoding,
+                                # not because the client could not draw it.
+                                # Under-recording is the right way to be wrong,
+                                # exactly as it is for audio above.
+                                if not capped:
+                                    note(product, player, kind, cod, ch,
+                                         ok=False, at=at, src="tautulli",
+                                         cur=cur)
+                                    learned += 1
+                                    TAUT["learned"] = learned
                             elif dec in ("direct play", "copy",
                                          "direct stream", "transcode"):
                                 # TRANSCODE COUNTS AS ACCEPTED HERE, unlike on
@@ -428,6 +486,25 @@ def import_tautulli(walk: int = _TAUT_WALK) -> dict:
     finally:
         TAUT.update(running=False, at=time.time())
     return dict(TAUT)
+
+
+def reset_import() -> dict:
+    r"""Forget how far the import got, so the next run re-reads everything.
+
+    NEEDED THE MOMENT THE IMPORT LEARNS SOMETHING NEW. Subtitles were added to
+    the query long after the watermark had walked past session #63,519, so the
+    sixty-three thousand sessions already in Tautulli - every one of them
+    carrying a subtitle decision - were never going to be read for it. The
+    panel filled with seeded guesses and looked, from the outside, exactly like
+    a panel full of observations.
+
+    Cheap to do and safe to repeat: note() only ever adds to counters and takes
+    the better source, so a second pass over the same history cannot make the
+    table worse, only slower to run.
+    """
+    from .db import kv_set
+    kv_set("clientcaps.taut_row", "0")
+    return {"ok": True, "why": "the next import will re-read the whole history"}
 
 
 def taut_state() -> dict:
@@ -761,6 +838,14 @@ def library_outputs(library: str) -> dict:
             "surround_bitrate": a.get("surround_bitrate")}
 
 
+def _qual(kind: str, ch: int) -> str:
+    """How to name this row's qualifier in a sentence."""
+    if kind == "subtitle":
+        w = sub_where(ch)
+        return f" as an {w} track" if w else ""
+    return f" at {_chan(ch)}" if ch else ""
+
+
 def _verdict(prof: dict, obs: dict, kind: str, codec: str, ch: int) -> dict:
     """One codec against one device. Observation first, profile second."""
     o = ((obs.get(kind) or {}).get(codec) or {})
@@ -779,7 +864,7 @@ def _verdict(prof: dict, obs: dict, kind: str, codec: str, ch: int) -> dict:
     hit = o.get(ch)
     if hit:
         played, refused = hit
-        at = f" at {_chan(ch)}" if ch else ""
+        at = _qual(kind, ch)
         if refused and played:
             return {"state": V,
                     "why": f"played {played}×, transcoded {refused}×{at} here",
@@ -827,6 +912,7 @@ def matrix(side: str = "video") -> dict:
     except Exception:                                        # noqa: BLE001
         pass
     obs = observed()
+    burners = always_burns() if side == "subtitle" else {}
     libs = libraries()
     outs = {L: library_outputs(L) for L in libs}
 
@@ -903,7 +989,9 @@ def matrix(side: str = "video") -> dict:
                 state, txt = "ok", ("streams as text" if burn
                                     else "direct play")
             cells[L] = {"state": state, "text": txt, "codecs": per}
-        rows.append({**d, "cells": cells})
+        rows.append({**d, "cells": cells,
+                     "always_burns": burners.get((d.get("product"),
+                                                  d.get("client")), "")})
 
     return {"side": side, "libraries": libs,
             "outputs": {L: {"video": outs[L]["video"],
@@ -913,6 +1001,44 @@ def matrix(side: str = "video") -> dict:
                         for L in libs},
             "devices": rows,
             "seen_any": any(r["seen"] for r in rows)}
+
+
+def always_burns() -> dict:
+    r"""{(product, client): why} for devices that burned something plain.
+
+    Plex documents a per-app "Burn Subtitles" setting with an ALWAYS option,
+    and a client set that way burns SRT as readily as PGS. That is not a
+    capability and must not be recorded as one: a row saying this device
+    cannot take srt would be wrong about every text format it draws perfectly
+    when the setting is put back.
+
+    Observed on this server: a Bravia burned an embedded SRT in an uncapped
+    session whose audio was COPIED - so the picture was re-encoded for the
+    subtitle alone, on a format nothing needs to burn. Nothing about the file
+    or the decoder explains that. The setting does.
+    """
+    out: dict = {}
+    if not _READY:
+        try:
+            init()
+        except Exception:                                    # noqa: BLE001
+            return out
+    try:
+        with cursor() as cur:
+            qs = ",".join("?" * len(PLAIN_TEXT))
+            for r in cur.execute(
+                    f"SELECT product, client, codec, SUM(refused) n "
+                    f"  FROM client_caps "
+                    f" WHERE kind='subtitle' AND refused > 0 "
+                    f"   AND codec IN ({qs}) "
+                    f" GROUP BY product, client, codec", list(PLAIN_TEXT)):
+                out[(r["product"], r["client"])] = (
+                    f"burned {r['codec']} {r['n']}x - nothing has to burn "
+                    f"{r['codec']}, so this app's Burn Subtitles setting is "
+                    f"probably on Always rather than Automatic")
+    except Exception:                                        # noqa: BLE001
+        pass
+    return out
 
 
 def _chan(ch: int) -> str:

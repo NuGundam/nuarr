@@ -299,6 +299,34 @@ def _record(sess: dict) -> int:
     if src_wh and dst_wh and src_wh == dst_wh:
         src_wh = dst_wh = ""              # no resize; do not imply one
 
+    def _sub_where(st: dict) -> int:
+        r"""1 embedded, 2 external, 0 unknown - for a subtitle Stream.
+
+        THE ONLY PLACE THIS IS KNOWABLE. Tautulli's history has no location
+        field at all, so a burn learned from history can never say which of the
+        two it was; the live session can, and the distinction is the difference
+        between "this device cannot read ass" and "this device cannot be handed
+        a sidecar". Read from three places because Plex has moved it about
+        between versions: `location`, the presence of a `key` (only external
+        streams have a URL to fetch), and the display title it builds, which
+        spells the word out.
+        """
+        from . import clientcaps as _c
+        loc = str(st.get("location") or "").strip().lower()
+        if loc.startswith("ext"):
+            return _c.SUB_EXTERNAL
+        if loc.startswith("emb") or loc.startswith("int"):
+            return _c.SUB_EMBEDDED
+        if st.get("key"):
+            return _c.SUB_EXTERNAL
+        blob = f"{st.get('extendedDisplayTitle') or ''} " \
+               f"{st.get('displayTitle') or ''}".lower()
+        if "external" in blob:
+            return _c.SUB_EXTERNAL
+        if "embedded" in blob or "internal" in blob:
+            return _c.SUB_EMBEDDED
+        return _c.SUB_UNKNOWN
+
     rows = []
     try:
         from . import clientcaps as _cc
@@ -320,6 +348,17 @@ def _record(sess: dict) -> int:
                              str(st.get("codec") or ""),
                              int(st.get("channels") or 0) if k == "audio" else 0,
                              ok=True)
+                elif k == "subtitle":
+                    # A COPIED SUBTITLE IS THE STRONGEST EVIDENCE THERE IS -
+                    # stronger than a copied audio track, because it means the
+                    # client drew the words itself and the server never touched
+                    # the picture. Recorded with WHERE it came from, so the one
+                    # case that matters can be told apart: the same TV renders
+                    # an embedded ass and burns the external one.
+                    _cc.note(player.get("product") or "",
+                             player.get("title") or "", k,
+                             str(st.get("codec") or ""),
+                             _sub_where(st), ok=True)
             continue
         kind = _KIND.get(int(st.get("streamType") or 0), "?")
         # THE STREAM BLOCK DESCRIBES PLEX'S OUTPUT, NOT THE FILE.
@@ -341,6 +380,16 @@ def _record(sess: dict) -> int:
         if kind == "subtitle" and act == "burn":
             detail = ("Plex painted this subtitle into the video on the CPU — "
                       "that alone forces a full re-encode")
+            # THE SAME CAP GUARD THE OTHER TWO STREAMS GET. A session already
+            # being rebuilt to fit a ceiling has the subtitle painted on
+            # because the picture is being re-encoded anyway, not because the
+            # client could not draw it - and recording that would teach this
+            # table that a TV cannot read the subtitles it reads every day.
+            if _cc and not cap:
+                _cc.note(player.get("product") or "",
+                         player.get("title") or "", "subtitle",
+                         src or str(st.get("codec") or ""),
+                         _sub_where(st), ok=False)
         elif kind == "subtitle":
             detail = f"this subtitle was not used ({act})"
         elif kind == "audio":
