@@ -7274,7 +7274,35 @@ def api_jobs(recent: int = Query(60, le=1000)):
     return jobs.snapshot(recent_limit=recent) | {"system": system.snapshot()}
 
 
-_TAUT_PROBE: dict = {"at": 0.0, "d": None}
+_TAUT_PROBE: dict = {"at": 0.0, "d": None, "busy": False}
+
+
+def _taut_probe(base: str, key: str) -> dict:
+    """Ask Tautulli whether it is there. Slow, so never on the request path."""
+    d = {"url": base, "ok": False, "detail": "", "version": "", "history": None}
+    try:
+        import httpx
+        r = httpx.get(base + "/api/v2",
+                      params={"apikey": key, "cmd": "get_history", "length": 1},
+                      timeout=12.0)
+        if r.status_code != 200:
+            d["detail"] = f"Tautulli answered {r.status_code}"
+        else:
+            j = (r.json().get("response") or {}).get("data") or {}
+            d.update(ok=True, detail="connected",
+                     history=j.get("recordsFiltered") or j.get("recordsTotal"))
+            try:
+                v = httpx.get(base + "/api/v2",
+                              params={"apikey": key, "cmd": "get_server_info"},
+                              timeout=8.0).json()
+                d["version"] = str(((v.get("response") or {}).get("data")
+                                    or {}).get("pms_version") or "")
+            except Exception:                                # noqa: BLE001
+                pass
+    except Exception as e:                                   # noqa: BLE001
+        d["detail"] = f"could not reach {base}: {str(e)[:120]}"
+    _TAUT_PROBE.update(at=time.time(), d=d, busy=False)
+    return d
 
 
 @app.get("/api/tautulli")
@@ -7294,9 +7322,7 @@ async def api_tautulli():
         # Reuse a recent probe rather than adding two requests to a queue two
         # thousand deep. 60 s, or for as long as the import is running.
         cached = _TAUT_PROBE["d"]
-        fresh = (cached and cached.get("url") == base
-                 and (clientcaps.TAUT["running"]
-                      or time.time() - _TAUT_PROBE["at"] < 60.0))
+        fresh = cached is not None and cached.get("url") == base
         out = {"url": base, "key_set": bool(key), "ok": False, "detail": "",
                "version": "", "history": None,
                "caps": clientcaps.stats(), "import": clientcaps.taut_state(),
@@ -7328,35 +7354,25 @@ async def api_tautulli():
                              "the codec pages has only what it has watched "
                              "since it was installed.")
             return out
+        # ANY CACHED ANSWER IS SERVED IMMEDIATELY. A stale "connected" that
+        # arrives instantly is a better page than a fresh one that arrives in
+        # a second, and the refresh behind it corrects the rare case where it
+        # went down since. Only the very first read of a given URL waits.
         if fresh:
             out.update(ok=cached["ok"], detail=cached["detail"],
                        version=cached["version"], history=cached["history"])
+            stale = (time.time() - _TAUT_PROBE["at"] > 60.0
+                     and not clientcaps.TAUT["running"]
+                     and not _TAUT_PROBE["busy"])
+            if stale:
+                _TAUT_PROBE["busy"] = True
+                import threading
+                threading.Thread(target=_taut_probe, args=(base, key),
+                                 name="taut-probe", daemon=True).start()
             return out
-        try:
-            import httpx
-            r = httpx.get(base + "/api/v2",
-                          params={"apikey": key, "cmd": "get_history",
-                                  "length": 1}, timeout=12.0)
-            if r.status_code != 200:
-                out["detail"] = f"Tautulli answered {r.status_code}"
-                return out
-            d = (r.json().get("response") or {}).get("data") or {}
-            out["ok"] = True
-            out["history"] = d.get("recordsFiltered") or d.get("recordsTotal")
-            out["detail"] = "connected"
-            try:
-                v = httpx.get(base + "/api/v2",
-                              params={"apikey": key, "cmd": "get_server_info"},
-                              timeout=8.0).json()
-                out["version"] = str(((v.get("response") or {}).get("data")
-                                      or {}).get("pms_version") or "")
-            except Exception:                                # noqa: BLE001
-                pass
-        except Exception as e:                               # noqa: BLE001
-            out["detail"] = f"could not reach {base}: {str(e)[:120]}"
-        _TAUT_PROBE.update(at=time.time(), d={
-            "url": base, "ok": out["ok"], "detail": out["detail"],
-            "version": out["version"], "history": out["history"]})
+        got = _taut_probe(base, key)
+        out.update(ok=got["ok"], detail=got["detail"],
+                   version=got["version"], history=got["history"])
         return out
 
     return await asyncio.to_thread(_work)
@@ -7402,7 +7418,7 @@ async def api_tautulli_config(body: dict = Body(...)):
                  encoding="utf-8")
     SETTINGS.tautulli_url = url
     SETTINGS.tautulli_api_key = key
-    _TAUT_PROBE.update(at=0.0, d=None)          # re-probe on the next read
+    _TAUT_PROBE.update(at=0.0, d=None, busy=False)   # re-probe on the next read
     joblog.log(f"Tautulli connection saved: {url}", "ok")
     return {"ok": True}
 
@@ -7412,7 +7428,7 @@ async def api_tautulli_enabled(on: bool = True):
     """The master switch. Off means every caller behaves as if it were absent."""
     from . import clientcaps
     clientcaps.set_enabled(on)
-    _TAUT_PROBE.update(at=0.0, d=None)
+    _TAUT_PROBE.update(at=0.0, d=None, busy=False)
     joblog.log("Tautulli integration " + ("switched on" if on else
                "switched off - the gate will not use it as a session fallback "
                "and the capability import will not run"), "info")
@@ -24342,15 +24358,14 @@ function tautPaint(){
       <div style="display:flex;justify-content:space-between;align-items:center;
                   flex-wrap:wrap;gap:8px">
         <b style="color:#6fb0ff">Connection</b>
-        <span style="display:flex;align-items:center;gap:9px">
+        <span style="display:flex;align-items:center;gap:12px">
           <span style="color:${col};font-size:12px">${esc(state)}</span>
-          <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer"
+          <label class="gsw"
             title="Off means nuarr behaves as though Tautulli were not installed: the job gate stops using it as a session fallback and the capability import stops running. The URL and key are kept.">
             <input type="checkbox" ${im.enabled?'checked':''}
                    onchange="tautEnable(this.checked)">
-            <span>integration</span>
-            <span class="pill ${im.enabled?'ok':''}"
-              style="font-size:9.5px;padding:0 7px">${im.enabled?'ON':'OFF'}</span>
+            <span class="gname">integration</span>
+            <span class="gstate ${im.enabled?'on':'off'}">${im.enabled?'on':'off'}</span>
           </label>
         </span>
       </div>
@@ -28346,17 +28361,15 @@ function capsPaint(){
     // summary that averaged it away would be worse than no summary.
     const bad=libs.filter(L=>(dev.cells[L]||{}).state==='bad').length;
     const warn=libs.filter(L=>(dev.cells[L]||{}).state==='warn').length;
-    const chip=bad?`<span class="capsx bad">${bad} transcode${bad===1?'':'s'}</span>`
-              :warn?`<span class="capsx warn">${warn} may transcode</span>`
-                   :`<span class="capsx ok">all direct play</span>`;
-    // The per-library verdicts, on the collapsed line. This is the question
-    // the panel exists to answer, so it does not get hidden behind the caret.
-    const strip=libs.map(L=>{
-      const c=dev.cells[L]||{state:'warn',text:'?',codecs:[]};
-      return `<span class="capslib ${c.state}" title="${esc(L+' — '+c.text+'\n'
-        + c.codecs.map(pp=>(pp.codec+(pp.ch?' '+chanTxt(pp.ch):''))+': '+pp.why).join('\n'))}"
-        >${esc(L)}</span>`;
-    }).join('');
+    // THE TALLY, not the roll call. Which libraries is a question for the
+    // opened row; how many is the one you scan a list for.
+    const ok=libs.length-bad-warn;
+    const byState=(n,cls,label)=>n?`<span class="capsn ${cls}"
+      title="${esc(libs.filter(L=>(dev.cells[L]||{}).state===cls)
+        .map(L=>L+' — '+(dev.cells[L]||{}).text).join('\n'))}"
+      ><b>${n}</b> ${esc(label)}</span>`:'';
+    const strip=byState(ok,'ok','direct play')+byState(warn,'warn','may transcode')
+               +byState(bad,'bad',bad===1?'transcodes':'transcode');
     const fmtList=(arr,label)=>!arr||!arr.length?'':`
       <div class="capsfmt"><b>${esc(label)}</b>${arr.map(f=>`
         <span class="capsc ${f.state}" title="${esc(f.why+' — '+f.src)}"
@@ -28371,13 +28384,10 @@ function capsPaint(){
         ${dev.seen?`<span class="capsseen" title="This server has watched this device play or refuse something. What it saw beats the platform profile.">seen${
             dev.last_at?' '+ago(dev.last_at):''}</span>`
                   :`<span class="capsguess" title="Nothing has played on this device here yet, so the panel is using a typical profile for the platform. One session replaces it with what actually happened.">typical profile</span>`}
-        <span class="capsstrip">${strip}</span>
-        <span class="capssum">${chip}</span></div>
+        <span class="capsstrip">${strip}</span></div>
       ${open?`<div class="capsopen">
         <div class="capsnote">${esc(dev.note||'')}</div>
         ${fmtList(K[side],'Plays '+(side==='video'?'video':'audio'))}
-        ${fmtList(K[side==='video'?'audio':'video'],
-                  'Plays '+(side==='video'?'audio':'video')+' (the other tab)')}
         <div class="capswhat">${libs.map(L=>{
           const c=dev.cells[L]||{codecs:[],state:'warn',text:''};
           return `<div class="capscl"><span class="capsdot ${c.state}"></span>
@@ -28432,17 +28442,18 @@ function capsPaint(){
            +'really happened.'}</div>
       <div class="capsout dim">${libs.map(L=>`<span><b>${esc(L)}</b> → ${
         esc(((d.outputs||{})[L]||{})[side].join(', '))}</span>`).join('')}</div>
-      ${rows||'<div class="dim">no libraries configured</div>'}
+      <div class="scrollbox auto capslist">${
+        rows||'<div class="dim">no libraries configured</div>'}</div>
       ${hidden>0?`<div class="capsmore"><a href="#" onclick="_capsAll=true;capsPaint();return false"
         >show ${fmt(hidden)} more device${hidden===1?'':'s'}</a>
         <span class="dim">— everything this server has ever seen, oldest last</span></div>`
         :(_capsAll&&all.length>CAP?`<div class="capsmore"><a href="#"
           onclick="_capsAll=false;capsPaint();return false">show fewer</a></div>`:'')}
-      <div class="capslegend dim"><span class="capslib ok">direct play</span>
-        <span class="capslib warn">may transcode</span>
-        <span class="capslib bad">transcodes</span>
-        <span>— one chip per library; hover for the reason, open a device to
-          see everything it plays</span></div>
+      <div class="capslegend dim"><span class="capsn ok"><b>n</b> direct play</span>
+        <span class="capsn warn"><b>n</b> may transcode</span>
+        <span class="capsn bad"><b>n</b> transcode</span>
+        <span>— how many of the ${libs.length} libraries land each way; hover
+          for which, open a device for everything it plays</span></div>
     </div></div>`;
   if(html===_capsKey) return;             // nothing moved; leave the DOM alone
   _capsKey=html;
@@ -31127,7 +31138,14 @@ html.mobile .setwrap:not(.rail) .setmain,html.mobile .setwrap:not(.rail) #worker
 .capsx.ok{color:var(--ok);border-color:#1f4429}
 .capsx.warn{color:var(--warn);border-color:#4d3d1a}
 .capsx.bad{color:var(--bad);border-color:#5e2b28}
-.capsstrip{display:flex;gap:4px;flex-wrap:wrap;margin-left:auto}
+.capslist{max-height:400px;padding-right:4px}
+.capsstrip{display:flex;gap:5px;flex-wrap:wrap;margin-left:auto;flex:0 0 auto}
+.capsn{font-size:10px;border-radius:9px;padding:1px 9px;border:1px solid var(--line);
+  background:#0b0e12;cursor:help;white-space:nowrap;color:var(--dim)}
+.capsn b{font-variant-numeric:tabular-nums}
+.capsn.ok{color:var(--ok);border-color:#1f4429}
+.capsn.warn{color:var(--warn);border-color:#4d3d1a}
+.capsn.bad{color:var(--bad);border-color:#5e2b28}
 .capslib{font-size:9.5px;letter-spacing:.02em;border-radius:4px;padding:1px 7px;
   border:1px solid var(--line);background:#0b0e12;cursor:help;white-space:nowrap}
 .capslib.ok{color:var(--ok);border-color:#1f4429;background:rgba(63,185,80,.06)}
