@@ -855,6 +855,14 @@ def cache_probe(file_id: int, data: dict) -> None:
         _so.gap_reconsider(file_id, data)
     except Exception:                                        # noqa: BLE001
         pass
+    # AND THE SAME QUESTION FOR THE RULES THAT HAVE A REMEDY. Checked against
+    # this probe now and parked; remedy.watch() acts on it inside a minute,
+    # rather than whenever the nightly sample happens to pick the file.
+    try:
+        from . import remedy as _rm
+        _rm.reconsider(file_id, data)
+    except Exception:                                        # noqa: BLE001
+        pass
     # A NEW PROBE MEANS A NEW FILE, AND TRACK NUMBERS MOVE WHEN TRACKS ARE
     # DROPPED. Any language verdict recorded against the old layout now points
     # at a different track, so it is deleted rather than left to rot: seven

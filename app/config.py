@@ -378,6 +378,13 @@ class Settings:
     # re-search a release whose audio is in no language its library keeps -
     # the only irreversible thing the audit can do, hence opt-in.
     audit_mode: str = "manual"
+    # "manual" (default) or "auto". The integrity sweep decodes a window at
+    # each end of a file to find truncation and stream damage - the one fault
+    # ffprobe cannot see, because the header of a truncated file is intact.
+    # Auto lets it hand what it finds to the shared remedy, which for a file
+    # that will not decode means blocklisting the release. Opt-in for the same
+    # reason audit_mode is.
+    integrity_mode: str = "manual"
     # How many unmeasured picture-subtitle files one "Check now" pass reads.
     # 0 means the whole backlog - each file costs one demux, so it is bounded
     # by default and unbounded on request.

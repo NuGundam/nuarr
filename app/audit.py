@@ -340,12 +340,12 @@ def check(pr: dict, anime: bool, library: str = "",
             flag("container/name", f"Matroska content named {ext}",
                  "named .mkv")
     if not vid:
-        flag("video", "no video stream", "one video stream")
+        flag("video/missing", "no video stream", "one video stream")
         return bad
 
     v = vid[0]
     if (v.get("codec_name") or "").lower() not in ("h264", "hevc", "h265", "av1"):
-        flag("video", f"{v.get('codec_name') or 'unknown'} video",
+        flag("video/codec", f"{v.get('codec_name') or 'unknown'} video",
              "h264, HEVC or AV1")
     for sd in v.get("side_data_list") or []:
         if "dv_profile" in sd and int(sd["dv_profile"]) in dv_profiles:
@@ -356,7 +356,11 @@ def check(pr: dict, anime: bool, library: str = "",
              "10-bit pixels kept 10-bit")
 
     if not aud:
-        flag("audio", "no audio stream", "at least one audio track")
+        # THE FILE HAS NO SOUND. Not a track in the wrong language, not a track
+        # with the wrong codec - no track. Nothing the planner does adds one,
+        # so this is one of the few findings whose only honest remedy is a
+        # different release. remedy.py knows that by this name.
+        flag("audio/missing", "no audio stream", "at least one audio track")
     langs: dict[str, int] = {}
     for a in aud:
         ac = (a.get("codec_name") or "").lower()
@@ -599,7 +603,8 @@ def check(pr: dict, anime: bool, library: str = "",
 # Kept as a tuple rather than a flag on the finding so that adding a rule here
 # is a deliberate, visible act - this is the list that decides what auto mode
 # is allowed to delete.
-REPLACEABLE_RULES = ("audio/language",)
+REPLACEABLE_RULES = ("audio/language", "audio/missing", "video/missing",
+                     "audio/untagged")
 
 # Smaller than MAX_PER_RUN on purpose: a requeue costs GPU time, this costs
 # a file and an indexer grab.
@@ -607,7 +612,17 @@ MAX_REPLACE_PER_RUN = 3
 
 
 def replaceable(rule: str) -> bool:
-    return any(r in (rule or "") for r in REPLACEABLE_RULES)
+    """Would a different release plausibly fix this? remedy.py decides.
+
+    Kept as a function here because four call sites ask it, but it no longer
+    holds an opinion of its own - two lists that answer one question drift, and
+    the drift is only discovered when one of them deletes something.
+    """
+    try:
+        from . import remedy
+        return bool(remedy.policy(rule or "")["replace"])
+    except Exception:                                        # noqa: BLE001
+        return any(r in (rule or "") for r in REPLACEABLE_RULES)
 
 
 def mode() -> str:
@@ -723,30 +738,62 @@ async def auto_replace(viol_by_file: dict) -> int:
     """
     if mode() != "auto":
         return 0
-    done = 0
+    from . import remedy
+
     # THE SETTLING GATE'S CATCHES COME FIRST. They are the freshest - the file
     # arrived minutes ago, nothing has been spent on it, and the arr's grab
     # record is as current as it will ever be - and they are the ones a person
     # would want dealt with before the encoder ever looks at them.
-    for row in pending_replacements(MAX_REPLACE_PER_RUN):
-        if done >= MAX_REPLACE_PER_RUN:
-            break
-        out = await replace_one(int(row["file_id"]), "caught while settling")
-        if out.get("ok"):
-            done += 1
+    todo: list[dict] = [
+        {"file_id": int(r["file_id"]), "kind": "audio/language",
+         "why": "caught while settling"}
+        for r in pending_replacements(MAX_REPLACE_PER_RUN)]
+    seen = {t["file_id"] for t in todo}
+
+    # EVERY REPLACEABLE RULE, NOT THE ONE THIS FUNCTION WAS BORN FOR. A file
+    # with no audio stream at all used to be found here nightly and offered
+    # nothing, because the only rule considered was audio/language. remedy.py
+    # is the thing that now decides which of the rules on a file earns which
+    # remedy - and it tries the reversible one first, so nothing here can
+    # delete a file the planner has not already failed on.
     for fid, v in list(viol_by_file.items()):
-        if done >= MAX_REPLACE_PER_RUN:
-            break
-        if not any(replaceable(r) for r in (v.get("rules") or [])):
+        if int(fid) in seen:
             continue
-        out = await replace_one(int(fid), "audio in no language this library keeps")
-        if out.get("ok"):
-            done += 1
-    if done:
-        joblog.log(f"rule audit (auto mode): {done} release(s) blocklisted and "
-                   f"re-searched — the audio was in no language their library "
-                   f"keeps", "warn")
-    return done
+        for rule in (v.get("rules") or []):
+            if remedy.policy(rule)["auto_replace"]:
+                todo.append({"file_id": int(fid), "kind": rule,
+                             "why": remedy.policy(rule)["why"]})
+                seen.add(int(fid))
+                break
+
+    out = await remedy.auto(todo, "rule audit", True)
+    for fid in {t["file_id"] for t in todo}:
+        try:
+            await asyncio.to_thread(_reflect_remedy, int(fid))
+        except Exception:                                    # noqa: BLE001
+            pass
+    return int(out.get("replaced") or 0)
+
+
+def _reflect_remedy(file_id: int) -> None:
+    """Mark the heal row replaced, so the panel and the ledger agree.
+
+    Without this the audit's own card would keep listing a file whose release
+    has just been blocklisted - one fact, two panels, disagreeing, which is
+    the failure the re-verify watcher was written to end.
+    """
+    from . import remedy
+    a = remedy.attempts(int(file_id))
+    if not a.get(remedy.REPLACE):
+        return
+    with cursor() as cur:
+        cur.execute(
+            "INSERT INTO audit_heals(file_id,rule,attempts,first_at,last_at,"
+            "state,detail,path) VALUES(?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(file_id) DO UPDATE SET state=excluded.state, "
+            "detail=excluded.detail, last_at=excluded.last_at",
+            (int(file_id), "replaced", 1, time.time(), time.time(),
+             "replaced", "the release was blocklisted and re-searched", ""))
 
 
 def _chname(ch: int) -> str:
@@ -942,6 +989,12 @@ async def heal(viol: list[dict]) -> dict:
             await jobs.enqueue(fid, v["path"], label, source="rule audit",
                                priority=60)
             new_state, detail = "queued", f"queued to fix {rule}"
+            try:
+                from . import remedy
+                remedy._note(fid, rule, remedy.REQUEUE, "rule audit",
+                             mode() == "auto", True, detail, v["path"])
+            except Exception:                                # noqa: BLE001
+                pass
             attempts += 1
             queued += 1
         except jobs.NothingToDo:

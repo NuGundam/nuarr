@@ -712,6 +712,19 @@ async def _startup() -> None:
         from . import clientcaps as _cc
         _cc.init()
         asyncio.create_task(_cc.watch())
+        # The remedy ledger. One table, written by both verbs, read by the
+        # caps - so seven checks in auto mode share one hourly budget instead
+        # of seven polite ones that nothing ever added together.
+        from . import remedy as _rm
+        _rm.init()
+        asyncio.create_task(_rm.watch())
+        # DECODE, DON'T JUST PROBE. Truncation is the commonest way a file in
+        # a media library is broken and the only one ffprobe cannot see, so
+        # this reads a window at each end. Bounded, and only while the pool is
+        # otherwise idle.
+        from . import integrity as _ig
+        _ig.init()
+        asyncio.create_task(_ig.watch())
         # Filesystem change tracking: per-library rescans instead of full
         # scans every few hours. Hands it the scan runner rather than
         # importing web from the module (cycle).
@@ -6463,6 +6476,93 @@ def api_subocr_pending_clear(file_id: int):
     subocr.clear_pending(file_id, SETTINGS.cache_dir)
     joblog.log(f"discarded prepared OCR subtitles for file #{file_id}", "info")
     return {"cleared": file_id}
+
+
+@app.get("/api/remedy")
+def api_remedy():
+    """The ledger, the budget and the policy table behind every button."""
+    from . import remedy
+    return {"stats": remedy.stats(), "recent": remedy.recent(80),
+            "kinds": remedy.kinds(), "fresh": remedy.fresh_pending(),
+            "settle_s": remedy.FRESH_SETTLE_S,
+            "limits": {"requeues": remedy.MAX_REQUEUES,
+                       "replaces": remedy.MAX_REPLACES}}
+
+
+@app.get("/api/remedy/offers")
+def api_remedy_offers(kind: str, file_id: int | None = None):
+    """What the two buttons should look like here - including WHY one is off.
+
+    A greyed button that explains itself beats an absent one: the absent one
+    reads as an oversight and somebody goes hunting for the missing feature.
+    """
+    from . import remedy
+    return remedy.offers(kind, file_id)
+
+
+@app.post("/api/remedy/requeue")
+async def api_remedy_requeue(file_id: int, kind: str, source: str = "ui"):
+    from . import remedy
+    return await remedy.requeue(int(file_id), kind, source=source)
+
+
+@app.post("/api/remedy/replace")
+async def api_remedy_replace(file_id: int, kind: str, source: str = "ui",
+                             confirm: str = ""):
+    """Destructive, and behind the same confirm word the refetch button uses.
+
+    NOT because a typo is likely - the UI sends it - but because this endpoint
+    is now reachable from seven cards instead of one, and the confirm is the
+    thing that keeps "reachable from everywhere" from meaning "fires from
+    everywhere".
+    """
+    from . import remedy
+    if confirm != "yes":
+        return {"ok": False, "why": "this deletes the file and asks the arr "
+                                    "for another one - confirm required"}
+    return await remedy.replace(int(file_id), kind, source=source)
+
+
+@app.get("/api/integrity")
+def api_integrity():
+    from . import integrity
+    return {**integrity.stats(), "findings": integrity.findings(200)}
+
+
+@app.post("/api/integrity/run")
+async def api_integrity_run(limit: int = 0, force: bool = True):
+    """Sweep now. `force` skips the idle check, because a person pressing the
+    button has already decided the disks can spare it."""
+    from . import integrity
+    return await integrity.sweep(limit=limit, force=force)
+
+
+@app.post("/api/integrity/mode")
+async def api_integrity_mode(mode: str):
+    """manual finds and lists; auto hands what it finds to the remedy."""
+    import yaml
+    from .config import SETTINGS
+    from . import integrity
+    mode = (mode or "").strip().lower()
+    if mode not in ("auto", "manual"):
+        raise HTTPException(400, "mode must be auto or manual")
+    p = _config_path()
+    raw = {}
+    if p.exists():
+        try:
+            raw = yaml.safe_load(p.read_text(encoding="utf-8-sig")) or {}
+        except Exception:                                    # noqa: BLE001
+            raw = {}
+    raw["integrity_mode"] = mode
+    p.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True),
+                 encoding="utf-8")
+    SETTINGS.integrity_mode = mode
+    joblog.log(f"integrity check set to {mode}"
+               + (" - files that will not decode will have their release "
+                  "blocklisted and re-searched" if mode == "auto" else
+                  " - files that will not decode will be listed and wait "
+                  "for you"), "info")
+    return {"ok": True, "mode": integrity.mode()}
 
 
 @app.get("/api/files/{file_id}/refetch")
@@ -12585,6 +12685,15 @@ html.mobile #logsPane{height:auto;min-height:60vh}
         <span style="float:right;font-weight:400">
           <button onclick="auRun()">Run now</button></span></h2>
     <div id="au" class="fullpane"><div class="dim" style="padding:14px">loading…</div></div>
+    <!-- THE FAULT ffprobe CANNOT SEE. Everything above this reads a file's
+         header and compares it to the rules; a truncated file has a perfect
+         header. This decodes a window at each end, which is the only test
+         that can tell "the container says 24 minutes" from "there are 24
+         minutes of frames in here". -->
+    <div id="igCard" style="margin-top:16px;border-top:1px solid var(--line,#2a3442);
+         padding-top:12px">
+      <div class="dim" style="padding:6px 2px">loading…</div>
+    </div>
   </div>
   <!-- THE ONE FEED. Finished jobs and file events used to live in two panels
        a screenful apart, so following one file meant scrolling between "the
@@ -16837,6 +16946,8 @@ async function auReplace(id){
 }
 
 async function loadAudit(){
+  await rmPolicy();
+  loadIntegrity();
   const el=document.getElementById('au'), cnt=document.getElementById('auCount');
   if(!el) return;
   const seq=++_auSeq;
@@ -16996,13 +17107,13 @@ click to read this run's findings"
     // THE BUTTONS ARE ON THE ROW. They were inside the drop-down, which meant
     // two clicks to do the obvious thing to an obvious problem. Replace is
     // only ever offered for the one rule a different release can fix.
-    const act = (done||repl) ? '' :
-      `<button onclick="event.stopPropagation();auRequeue(${f.file_id})"
-         title="Plan this file again under the current rules and queue it if the planner has work">Requeue</button>`
-      + (f.replaceable
-        ? ` <button onclick="event.stopPropagation();auReplace(${f.file_id})"
-             title="Blocklist the release and ask the arr for a different one. This deletes the file."
-             style="color:var(--bad)">Blocklist &amp; re-download</button>` : '');
+    // THE BUTTON THAT IS NOT THERE IS THE ONE PEOPLE ASK ABOUT. Replace used
+    // to be rendered only when the server said the rule was replaceable, so on
+    // twelve of the thirteen rules it simply did not exist - indistinguishable
+    // from a page that had failed to draw it. Both are always drawn now, and
+    // the refused one carries the reason it is refused.
+    const act = (done||repl) ? '' : remedyBtns(f.file_id, f.rule||'',
+                                               {source:'rule check'});
     return `<tr class="${open?'rowopen':''}${done?' aufixed':''}">
       <td class="auwrap" title="${esc(String(f.path||'').split('\\').pop())}"
         ><span class="tl" onclick="auDetail(${f.file_id})"
@@ -17238,6 +17349,136 @@ async function auClearHeal(fid){
 // repaints with the right colour, the right pill, and the right button - and
 // an unfixable file drops into the standing-gaps list where it belongs.
 const _auFix = {};
+// ---- the two remedies, one control -------------------------------------
+// The POLICY comes from the server once and is cached: which findings may be
+// requeued, which may be replaced, and the sentence explaining each refusal.
+// Rendering from it means a disabled button can say WHY it is disabled without
+// a round trip, and an absent button never has to stand in for an unknown one.
+let _RMPOL=null, _RMLIM={requeues:3,replaces:2};
+async function rmPolicy(){
+  if(_RMPOL) return _RMPOL;
+  try{
+    const d=await (await fetch('/api/remedy')).json();
+    _RMPOL=d.kinds||{}; _RMLIM=d.limits||_RMLIM;
+  }catch(_){ _RMPOL={}; }
+  return _RMPOL;
+}
+// A GREYED BUTTON THAT EXPLAINS ITSELF BEATS AN ABSENT ONE. An absent button
+// reads as an oversight and sends somebody hunting for a feature that was
+// deliberately withheld; a greyed one with the reason in its tooltip answers
+// the question where it was asked.
+function remedyBtns(fid, kind, opts){
+  opts=opts||{};
+  const p=(_RMPOL||{})[kind]||{requeue:true,replace:false,
+    why:'an unrecognised finding - only requeue is offered, because guessing '
+       +'the other one deletes files'};
+  const k=esc(kind||''), src=esc(opts.source||'ui');
+  const rqWhy = p.requeue ? 'Plan this file again under the current rules and '
+      +'queue it if the planner has work' : 'No rule the planner has would '
+      +'change this - '+p.why;
+  const rpWhy = p.replace ? 'Blocklist the release and ask the arr for a '
+      +'different one. This deletes the file. '+p.why
+    : "The file's contents are not the problem - "+p.why;
+  return `<button class="rmb" ${p.requeue?'':'disabled'}
+      title="${esc(rqWhy)}"
+      onclick="event.stopPropagation();rmDo('requeue',${fid},'${k}','${src}',this)"
+      >Requeue</button>
+    <button class="rmb bad" ${p.replace?'':'disabled'}
+      title="${esc(rpWhy)}"
+      onclick="event.stopPropagation();rmDo('replace',${fid},'${k}','${src}',this)"
+      >Blocklist &amp; re-download</button>`;
+}
+async function rmDo(action, fid, kind, source, btn){
+  // THE DESTRUCTIVE ONE ASKS. Not because a misclick is likely on any one
+  // card, but because this control is now on seven of them, and "reachable
+  // everywhere" must not quietly become "fires from everywhere".
+  if(action==='replace'){
+    const p=(_RMPOL||{})[kind]||{};
+    if(!confirm('Blocklist this release and ask the arr for a different one?'
+        +'\n\nThis deletes the file on disk.\n\n'+(p.why||'')))
+      return;
+  }
+  const was=btn?btn.textContent:'';
+  if(btn){ btn.classList.add('spin'); btn.textContent='working…'; }
+  let r={};
+  try{
+    r=await (await fetch(`/api/remedy/${action}?file_id=${fid}`
+      +`&kind=${encodeURIComponent(kind)}&source=${encodeURIComponent(source)}`
+      +(action==='replace'?'&confirm=yes':''),{method:'POST'})).json();
+  }catch(e){ r={ok:false, why:String(e)}; }
+  if(btn){
+    btn.classList.remove('spin');
+    btn.textContent = r.ok ? (action==='replace'?'replaced':'queued') : was;
+    if(r.ok) btn.disabled=true;
+  }
+  if(!r.ok && (r.why||r.error)) alert(r.why||r.error);
+  return r;
+}
+
+// ---- does it actually decode? ------------------------------------------
+let _ig=null;
+async function loadIntegrity(){
+  const el=document.getElementById('igCard'); if(!el) return;
+  try{ _ig=await (await fetch('/api/integrity')).json(); }
+  catch(e){ el.innerHTML='<span class="dim">could not load</span>'; return; }
+  igPaint();
+}
+let _igKey='';
+function igPaint(){
+  const el=document.getElementById('igCard'); if(!el||!_ig) return;
+  const d=_ig, bad=(d.findings||[]);
+  const tested=(d.ok||0)+(d.corrupt||0);
+  const head = `<h2 style="color:#39d3c3;margin:0 0 6px">Does it actually
+      decode?
+      <span class="dim" style="font-weight:400;font-size:12px">
+        ${fmt(tested)} tested · ${fmt(d.untested||0)} still to read${
+        d.corrupt?` · <span style="color:var(--bad)">${fmt(d.corrupt)} that will not decode</span>`:''}</span>
+      <span style="float:right;font-weight:400;display:flex;gap:8px;align-items:center">
+        <span class="gsw" title="Manual finds them and waits. Auto hands what it finds to the remedy - which for a file that will not decode means blocklisting its release.">
+          <button class="${d.mode==='manual'?'on':''}" onclick="igMode('manual')">manual</button
+          ><button class="${d.mode==='auto'?'on':''}" onclick="igMode('auto')">auto</button>
+        </span>
+        <button onclick="igRun(this)" ${d.running?'disabled':''}>${
+          d.running?'reading…':'Check some now'}</button>
+      </span></h2>`;
+  const note = `<div class="dim" style="font-size:11px;margin:2px 0 8px">
+      Decodes the first ${d.head_s}s and the last ${d.tail_s}s of ${d.per_run}
+      files at a time, only while the pool is idle, and only re-reads a file
+      when its bytes change. Two clean windows are not proof of a clean middle
+      and this does not claim they are — it is the difference between finding
+      most of the broken files tonight and finding all of them never.</div>`;
+  const prog = d.running
+    ? `<div class="dim" style="font-size:11px">${esc(d.now||'')} · ${
+        d.done||0}/${d.total||0}</div>` : '';
+  const rows = bad.length ? `<table style="width:100%;font-size:11.5px">
+      <colgroup><col style="width:44%"><col style="width:30%">
+        <col style="width:26%"></colgroup>
+      <tbody>${bad.map(r=>`<tr>
+        <td style="padding:3px 8px 3px 0" title="${esc(r.path||'')}"
+          >${esc(String(r.path||'').split('\\').pop())}</td>
+        <td style="padding:3px 8px 3px 0;color:var(--bad)"
+          >${esc(r.why||'')}</td>
+        <td style="padding:3px 0;white-space:nowrap">${
+          remedyBtns(r.file_id,'file/corrupt',{source:'integrity'})}</td>
+      </tr>`).join('')}</tbody></table>`
+    : `<div class="dim" style="font-size:11.5px">${
+        tested ? 'Every file read so far decoded at both ends.'
+               : 'Nothing read yet.'}</div>`;
+  const html = head + note + prog + rows;
+  if(html===_igKey) return;             // nothing moved; leave the DOM alone
+  _igKey=html; el.innerHTML=html;
+}
+async function igMode(m){
+  try{ await fetch('/api/integrity/mode?mode='+encodeURIComponent(m),
+                   {method:'POST'}); }catch(_){}
+  loadIntegrity();
+}
+async function igRun(btn){
+  if(btn){ btn.disabled=true; btn.textContent='reading…'; }
+  try{ await fetch('/api/integrity/run',{method:'POST'}); }catch(_){}
+  loadIntegrity();
+}
+
 async function auRequeue(fid){
   // Write to BOTH possible homes for this file's reply. The row lives in the
   // findings table or in the standing-gaps table depending on its verdict, and
@@ -23260,6 +23501,7 @@ const AG_NOTE={
 async function loadArrGap(){
   const el=document.getElementById('agBody');
   if(!el){ if(_agTimer) clearTimeout(_agTimer); return; }
+  await rmPolicy();
   try{ _ag=await (await fetch('/api/arrgap')).json(); }
   catch(e){ el.innerHTML='<span class="dim">could not load</span>'; return; }
   agPaint();
@@ -23463,11 +23705,11 @@ function agList(rows){
       <div style="max-height:280px;overflow:auto;padding:0 8px">
         <table style="width:100%;font-size:11.5px;border-collapse:collapse;
                       table-layout:fixed">
-          <colgroup><col style="width:36%"><col style="width:10%">
-            <col style="width:12%"><col style="width:26%">
-            <col style="width:16%"></colgroup>
+          <colgroup><col style="width:30%"><col style="width:8%">
+            <col style="width:10%"><col style="width:20%">
+            <col style="width:13%"><col style="width:19%"></colgroup>
           <thead><tr>${['Title / file','Arr','Library','Why it is missing',
-                        'Since / checks']
+                        'Since / checks','']
             .map(h=>`<th style="text-align:left;font-weight:600;padding:3px 8px 5px 0;
               position:sticky;top:0;background:var(--bg2,#12161c)">${h}</th>`).join('')}
           </tr></thead>
@@ -23500,6 +23742,19 @@ function agList(rows){
                     esc(String(seen))} check${seen===1?'':'s'}. A finding that keeps surviving checks is not one the check can put right."
                   >${esc(ago(first))} <span class="dim">· ${fmt(seen)} check${
                     seen===1?'':'s'}</span></td>`;
+              })()}
+              ${(()=>{
+                // ONE FINDING, ONE REMEDY NAME. The card speaks prose and the
+                // policy speaks keys; translating here keeps the prose free to
+                // change without silently detaching a button from its rule.
+                const AG_KIND={
+                  'not walked yet':'index/not-walked',
+                  'written off, but on disk':'index/wrote-off',
+                  'rejected, waiting for a replacement':'index/rejected'};
+                const k=AG_KIND[r0.why||''];
+                if(!k) return `<td style="padding:3px 0"></td>`;
+                return `<td style="padding:3px 0;white-space:nowrap">${
+                  remedyBtns(r0.file_id, k, {source:'not-walked check'})}</td>`;
               })()}
             </tr>`;}).join('')}
           </tbody>
@@ -31251,6 +31506,18 @@ html.mobile .setwrap:not(.rail) .setmain,html.mobile .setwrap:not(.rail) #worker
 .capsmore{margin-top:9px;font-size:10.5px;display:flex;gap:8px;align-items:center}
 .agold{font-size:10px;border:1px solid #4d3d1a;color:var(--warn);border-radius:9px;
   padding:1px 8px;cursor:help}
+/* THE TWO REMEDIES, WHEREVER A FINDING IS SHOWN. One pair of styles so that a
+   requeue looks like a requeue on all seven cards - the previous arrangement
+   had four different buttons doing one thing and one of them coloured like a
+   delete. */
+.rmb{font:inherit;font-size:10.5px;padding:2px 8px;border-radius:6px;
+  border:1px solid var(--line,#2a3442);background:transparent;color:inherit;
+  cursor:pointer;white-space:nowrap}
+.rmb:hover:not(:disabled){background:rgba(255,255,255,.06)}
+.rmb.bad{color:var(--bad,#ff8b8b);border-color:#5a2b2b}
+.rmb.bad:hover:not(:disabled){background:rgba(255,110,110,.12)}
+.rmb:disabled{opacity:.42;cursor:help}
+.rmb.spin{opacity:.6;pointer-events:none}
 /* A REFRESH THAT SAYS IT IS REFRESHING. Without this the button did nothing
    visible for the second the fetch took, so it got pressed again. */
 .gapchk.spinning{position:relative;color:transparent!important;pointer-events:none}
