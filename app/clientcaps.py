@@ -71,11 +71,26 @@ def init() -> None:
                 last_at   REAL,
                 PRIMARY KEY (product, client, kind, codec, ch)
             )""")
+        # WHERE THE SIGHTING CAME FROM, best-first. Not decoration: the three
+        # sources differ in how much they know. Tautulli's history carries the
+        # exact channel count of the source track, a live sighting carries it
+        # too, and the one-off read of nuarr's own old event rows does not -
+        # those were written before any of this existed and can only say
+        # "eac3 was refused", never "eac3 2.0 was". Knowing which is which is
+        # what lets the precise rows replace the vague ones.
+        have = {r[1] for r in cur.execute("PRAGMA table_info(client_caps)")}
+        if "src" not in have:
+            cur.execute("ALTER TABLE client_caps ADD COLUMN src TEXT")
     _READY = True
 
 
+# Best last, so a later source overwrites an earlier one and never the reverse.
+_SRC_RANK = {"": 0, "backfill": 1, "live": 2, "tautulli": 3}
+
+
 def note(product: str, client: str, kind: str, codec: str,
-         ch: int = 0, ok: bool = True) -> None:
+         ch: int = 0, ok: bool = True, n: int = 1, at: float = 0.0,
+         src: str = "live", cur=None) -> None:
     """Record one sighting. Cheap, and never allowed to break playback watching."""
     codec = (codec or "").strip().lower()
     if not codec or kind not in ("video", "audio"):
@@ -85,17 +100,27 @@ def note(product: str, client: str, kind: str, codec: str,
             init()
         except Exception:                                    # noqa: BLE001
             return
-    now = time.time()
+    now = at or time.time()
     col = "played" if ok else "refused"
+
+    def _go(c):
+        c.execute(
+            f"INSERT INTO client_caps(product,client,kind,codec,ch,{col},"
+            f"                        first_at,last_at,src) VALUES(?,?,?,?,?,?,?,?,?) "
+            f"ON CONFLICT(product,client,kind,codec,ch) DO UPDATE SET "
+            f"  {col}={col}+excluded.{col}, "
+            f"  last_at=MAX(COALESCE(last_at,0),excluded.last_at), "
+            f"  first_at=MIN(COALESCE(first_at,excluded.first_at),excluded.first_at), "
+            f"  src=CASE WHEN ?>? THEN excluded.src ELSE src END",
+            ((product or "?").strip(), (client or "?").strip(),
+             kind, codec, int(ch or 0), int(n), now, now, src,
+             _SRC_RANK.get(src, 0), 0))
     try:
-        with cursor() as cur:
-            cur.execute(
-                f"INSERT INTO client_caps(product,client,kind,codec,ch,{col},"
-                f"                        first_at,last_at) VALUES(?,?,?,?,?,1,?,?) "
-                f"ON CONFLICT(product,client,kind,codec,ch) DO UPDATE SET "
-                f"  {col}={col}+1, last_at=excluded.last_at",
-                ((product or "?").strip(), (client or "?").strip(),
-                 kind, codec, int(ch or 0), now, now))
+        if cur is not None:
+            _go(cur)
+        else:
+            with cursor() as c:
+                _go(c)
     except Exception:                                        # noqa: BLE001
         pass
 
@@ -149,11 +174,207 @@ def backfill() -> int:
                     ((r["product"] or "?"), (r["client"] or "?"),
                      r["stream_kind"], (r["src_codec"] or "").lower(),
                      r["n"], r["a0"], r["a1"]))
+                cur.execute(
+                    "UPDATE client_caps SET src=COALESCE(src,'backfill') "
+                    " WHERE product=? AND client=? AND kind=? AND codec=? AND ch=0",
+                    ((r["product"] or "?"), (r["client"] or "?"),
+                     r["stream_kind"], (r["src_codec"] or "").lower()))
                 n += 1
         kv_set("clientcaps.backfilled", "1")
     except Exception:                                        # noqa: BLE001
         return 0
     return n
+
+
+# ------------------------------------------------------------- Tautulli ----
+# WHY GO TO TAUTULLI AT ALL, when nuarr watches Plex itself.
+#
+# Because nuarr started watching in July and Tautulli started years ago, and
+# because nuarr deliberately records only the sessions that went wrong. This
+# server's Tautulli holds 51,689 plays, each one carrying the source audio
+# codec, THE SOURCE CHANNEL COUNT, and a per-stream decision - which is
+# precisely the evidence the panel wants and precisely the evidence nuarr's own
+# event log cannot supply, because a direct play was never written down and a
+# refusal never recorded how many channels the refused track had.
+#
+# That last one is not a detail. The laptop refused E-AC3 and asked for Opus,
+# and the panel concluded the laptop could not play E-AC3 at all - so every
+# library went red. The track it refused was E-AC3 2.0. Tautulli knew that all
+# along.
+TAUT: dict = {"running": False, "done": 0, "total": 0, "rows": 0, "learned": 0,
+              "at": 0.0, "error": "", "devices": 0}
+
+# HOW MANY ROWS PER DEVICE. The whole history is 50k sessions and one API call
+# each, which is an hour of polling to learn something a few dozen rows per
+# device already say. Capped per device AND per decision so a device that
+# direct-plays everything still contributes its refusals, and one that
+# transcodes everything still contributes its successes.
+_TAUT_PER_DEVICE = 45
+_TAUT_WALK = 8000
+
+
+def _f(v) -> float:
+    """Tautulli returns numbers as strings about half the time."""
+    try:
+        return float(v)
+    except Exception:                                        # noqa: BLE001
+        return 0.0
+
+
+def _taut_cfg() -> tuple[str, str]:
+    from .config import SETTINGS
+    return ((SETTINGS.tautulli_url or "").rstrip("/"),
+            SETTINGS.tautulli_api_key or "")
+
+
+def import_tautulli(walk: int = _TAUT_WALK) -> dict:
+    r"""Learn from Tautulli's history. Runs in a thread; reports through TAUT.
+
+    INCREMENTAL, by row id. Tautulli's history ids only go up, so the highest
+    one consumed is a watermark and a second run reads only what is new. That
+    matters more than it sounds: without it, pressing the button twice would
+    double every count in the table and quietly turn "played 3, refused 1"
+    into a different verdict.
+    """
+    import httpx
+    from .db import kv_get, kv_set
+    base, key = _taut_cfg()
+    if not base or not key:
+        TAUT.update(error="Tautulli is not configured", at=time.time())
+        return dict(TAUT)
+    if TAUT["running"]:
+        return dict(TAUT)
+    if not _READY:
+        init()
+    TAUT.update(running=True, done=0, total=0, rows=0, learned=0, error="",
+                devices=0, at=time.time())
+    seen_max = int(kv_get("clientcaps.taut_row") or 0)
+    high = seen_max
+    learned = 0
+    try:
+        with httpx.Client(timeout=30.0) as cli:
+            def api(cmd, **kw):
+                r = cli.get(f"{base}/api/v2",
+                            params={"apikey": key, "cmd": cmd, **kw})
+                r.raise_for_status()
+                return r.json()["response"]["data"]
+
+            # 1. Walk the history newest-first and pick what to sample.
+            picked: dict = {}
+            start, walked = 0, 0
+            while walked < walk:
+                page = api("get_history", length=500, start=start)
+                rows = page.get("data") or []
+                if not rows:
+                    break
+                for r in rows:
+                    rid = r.get("row_id") or r.get("id")
+                    if not rid:
+                        continue          # a live session; it has no history row yet
+                    rid = int(rid)
+                    high = max(high, rid)
+                    if rid <= seen_max:
+                        rows = []          # caught up with the last import
+                        break
+                    dev = ((r.get("product") or "?"), (r.get("player") or "?"))
+                    dec = str(r.get("transcode_decision") or "").lower()
+                    b = picked.setdefault(dev, {})
+                    lst = b.setdefault(dec, [])
+                    if len(lst) < _TAUT_PER_DEVICE:
+                        lst.append((rid, float(r.get("date") or 0)))
+                walked += len(page.get("data") or [])
+                if not rows:
+                    break
+                start += 500
+            todo = [(d, rid, at) for d, byd in picked.items()
+                    for lst in byd.values() for rid, at in lst]
+            TAUT.update(total=len(todo), rows=walked, devices=len(picked))
+
+            # 2. Ask each sampled row what the streams actually were.
+            with cursor() as cur:
+                for (product, player), rid, at in todo:
+                    TAUT["done"] += 1
+                    try:
+                        d = api("get_stream_data", row_id=rid)
+                    except Exception:                        # noqa: BLE001
+                        continue
+                    if not d:
+                        continue
+                    # A CAPPED SESSION IS ABOUT BANDWIDTH, NOT DECODERS, and
+                    # every refusal read out of one is a lie about the device.
+                    # Proved on this server: the Bravia showed 25 "AAC 2.0
+                    # refusals", and every single one was a session with
+                    # quality_profile "1.5 Mbps 480p" - source 8.2 Mbps rebuilt
+                    # at 1.5, video h264 to h264 downscaled, audio switched to
+                    # Opus because Opus is simply better at low rates. That TV
+                    # plays AAC perfectly. It was being asked not to.
+                    #
+                    # So a capped session contributes its SUCCESSES only: a
+                    # stream that direct-played through a cap really was
+                    # accepted, while a stream that was rebuilt tells us
+                    # nothing about what the decoder would have taken. Under-
+                    # recording is the right way to be wrong here; there are
+                    # thousands of uncapped sessions to learn the rest from.
+                    qp = str(d.get("quality_profile") or "").strip().lower()
+                    br, sbr = _f(d.get("bitrate")), _f(d.get("stream_bitrate"))
+                    capped = bool(qp and qp != "original") or bool(
+                        br and sbr and sbr < br * 0.9)
+                    for kind, cod, dec, ch in (
+                            ("video", d.get("video_codec"),
+                             d.get("video_decision"), 0),
+                            ("audio", d.get("audio_codec"),
+                             d.get("audio_decision"),
+                             int(d.get("audio_channels") or 0))):
+                        cod = str(cod or "").strip().lower()
+                        dec = str(dec or "").strip().lower()
+                        if not cod or not dec:
+                            continue
+                        # DIRECT PLAY AND COPY ARE BOTH "THE DECODER WAS FINE".
+                        # A copy is a remux - the container changed and the
+                        # stream did not - so the client took that codec.
+                        if dec in ("direct play", "copy", "direct stream"):
+                            note(product, player, kind, cod, ch, ok=True,
+                                 at=at, src="tautulli", cur=cur)
+                            learned += 1
+                            TAUT["learned"] = learned
+                        elif dec == "transcode" and not capped:
+                            # A TRANSCODE TO THE SAME CODEC IS NOT A REFUSAL,
+                            # same as in the live path: it is a resize or a
+                            # bandwidth cap, and counting it here would teach
+                            # this table that a device cannot play the codec
+                            # it is at this moment playing.
+                            out = str((d.get(f"stream_{kind}_codec")
+                                       or "")).strip().lower()
+                            if out and out != cod:
+                                note(product, player, kind, cod, ch, ok=False,
+                                     at=at, src="tautulli", cur=cur)
+                                learned += 1
+                                TAUT["learned"] = learned
+        kv_set("clientcaps.taut_row", str(high))
+        # THE VAGUE ROWS GO NOW THAT THERE ARE PRECISE ONES. The one-off read
+        # of nuarr's old events could only say "eac3 was refused" with no
+        # channel count, and leaving those beside Tautulli's exact rows means
+        # every audio answer falls back to "it depends" forever.
+        if learned:
+            try:
+                with cursor() as cur:
+                    cur.execute("DELETE FROM client_caps "
+                                " WHERE src='backfill' AND kind='audio' AND ch=0")
+            except Exception:                                # noqa: BLE001
+                pass
+        TAUT.update(learned=learned, error="")
+    except Exception as e:                                   # noqa: BLE001
+        TAUT.update(error=f"{type(e).__name__}: {e}")
+    finally:
+        TAUT.update(running=False, at=time.time())
+    return dict(TAUT)
+
+
+def taut_state() -> dict:
+    base, key = _taut_cfg()
+    from .db import kv_get
+    return {**TAUT, "configured": bool(base and key), "url": base,
+            "imported_to": int(kv_get("clientcaps.taut_row") or 0)}
 
 
 def observed() -> dict:
@@ -338,28 +559,43 @@ def _verdict(prof: dict, obs: dict, kind: str, codec: str, ch: int) -> dict:
     # the interesting failures live - a device that plays E-AC3 5.1 and balks
     # at E-AC3 2.0 is invisible to a codec-only reading, and that is the exact
     # case this server hit on the Bravia.
+    # THE EXACT CHANNEL COUNT IS THE ONLY DEFINITIVE EVIDENCE, and this is the
+    # whole reason the column exists. Erik's laptop refused E-AC3 and asked for
+    # Opus - but the track it refused was E-AC3 2.0, and the panel read that as
+    # "this device cannot play E-AC3" and marked every 5.1 library red. Stereo
+    # and 5.1 E-AC3 are different questions on the same decoder: a Bravia plays
+    # 5.1 and stumbles on 2.0, a laptop does the reverse. So a sighting at one
+    # channel count never settles another - it only ever softens the platform's
+    # answer to "it depends", which is the truth.
     hit = o.get(ch)
-    src = "seen here"
-    if hit is None and o:
-        played = sum(p for p, _ in o.values())
-        refused = sum(r for _, r in o.values())
-        hit = (played, refused)
-        # 0 is the channel count of a sighting recorded before nuarr kept
-        # them - the backfilled history. Saying "other channel counts" about
-        # those would be inventing a distinction the row never made.
-        src = ("seen here, channel count not recorded" if set(o) == {0}
-               else "seen here, at other channel counts")
     if hit:
         played, refused = hit
+        at = f" at {_chan(ch)}" if ch else ""
         if refused and played:
-            return {"state": V, "why": f"played {played}×, transcoded "
-                                       f"{refused}× on this server",
-                    "src": src}
+            return {"state": V,
+                    "why": f"played {played}×, transcoded {refused}×{at} here",
+                    "src": "seen here"}
         if refused:
-            return {"state": N, "why": f"transcoded {refused}× on this server",
-                    "src": src}
-        return {"state": Y, "why": f"played untouched {played}× here",
-                "src": src}
+            return {"state": N, "why": f"transcoded {refused}×{at} here",
+                    "src": "seen here"}
+        return {"state": Y, "why": f"played untouched {played}×{at} here",
+                "src": "seen here"}
+    if o:
+        played = sum(p for p, _ in o.values())
+        refused = sum(r for _, r in o.values())
+        where = ", ".join(
+            (_chan(c) if c else "channel count not recorded")
+            for c in sorted(o) )
+        if played or refused:
+            bits = []
+            if played:
+                bits.append(f"played {played}×")
+            if refused:
+                bits.append(f"transcoded {refused}×")
+            return {"state": V,
+                    "why": (", ".join(bits) + f" here, but only at {where}"
+                            + (f" — never at {_chan(ch)}" if ch else "")),
+                    "src": "seen here, other channel counts"}
     st = (prof.get(kind) or {}).get(codec, V)
     return {"state": st, "why": {Y: "this platform normally plays it",
                                  N: "this platform does not decode it",

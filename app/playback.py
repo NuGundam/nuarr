@@ -378,7 +378,8 @@ def _record(sess: dict) -> int:
         # fit a bandwidth cap - and recording that as "this device cannot play
         # h264" would poison the capability table with the one failure mode
         # that has nothing to do with the device's decoders.
-        if _cc and kind in ("video", "audio") and src and dst and src != dst:
+        if (_cc and not cap and kind in ("video", "audio")
+                and src and dst and src != dst):
             _cc.note(player.get("product") or "", player.get("title") or "",
                      kind, src,
                      _src_audio_ch(fid, src) if kind == "audio" else 0,

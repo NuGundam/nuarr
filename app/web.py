@@ -7268,6 +7268,22 @@ def api_jobs(recent: int = Query(60, le=1000)):
     return jobs.snapshot(recent_limit=recent) | {"system": system.snapshot()}
 
 
+@app.post("/api/clientcaps/tautulli")
+async def api_clientcaps_tautulli():
+    r"""Learn from Tautulli's play history. Minutes, so it returns at once.
+
+    The panel polls /api/clientcaps for progress the same way every other long
+    job on this server reports itself - a second endpoint polling in step is
+    how two numbers on one card end up disagreeing about the same moment.
+    """
+    from . import clientcaps
+    if clientcaps.TAUT["running"]:
+        return {"ok": False, "already": True, **clientcaps.taut_state()}
+    asyncio.get_running_loop().run_in_executor(None, clientcaps.import_tautulli)
+    await asyncio.sleep(0.4)               # so the first poll sees it running
+    return {"ok": True, "started": True, **clientcaps.taut_state()}
+
+
 @app.get("/api/clientcaps")
 async def api_clientcaps(side: str = "video"):
     r"""Every device this server knows against every library, for one side.
@@ -7277,7 +7293,9 @@ async def api_clientcaps(side: str = "video"):
     to a thread like everything else that touches SQLite.
     """
     from . import clientcaps
-    return await asyncio.to_thread(clientcaps.matrix, side)
+    d = await asyncio.to_thread(clientcaps.matrix, side)
+    d["tautulli"] = clientcaps.taut_state()
+    return d
 
 
 @app.get("/api/playback")
@@ -27886,10 +27904,23 @@ Nothing is saved and no library file is touched.">Test these settings</button>
 // "Surround formats to copy: eac3" is not a fact about E-AC3, it is a claim
 // that every device here direct-plays it - so the claim is checked, per device
 // and per library, against what those devices have actually done.
-let _caps=null, _capsSide='', _capsOpen=new Set();
+let _caps=null, _capsSide='', _capsOpen=new Set(), _capsPoll=null, _capsAll=false;
+function capsShown(){
+  try{ return localStorage.getItem('nuarr.caps')==='open'; }catch(e){ return false; }
+}
+function capsShow(on){
+  try{ localStorage.setItem('nuarr.caps', on?'open':'shut'); }catch(e){}
+  if(on && !_caps) capsLoad(); else capsPaint();
+}
+async function capsTaut(btn){
+  if(btn) btn.disabled=true;
+  try{ await fetch('/api/clientcaps/tautulli',{method:'POST'}); }catch(e){}
+  capsLoad(true);
+}
 async function capsLoad(force){
   const el=document.getElementById('capsPanel');
-  if(!el) return;
+  if(!el){ if(_capsPoll) clearTimeout(_capsPoll); _capsPoll=null; return; }
+  if(!capsShown()&&!force&&!_caps){ capsPaint(); return; }
   if(force||_capsSide!==_codSide||!_caps){
     el.innerHTML='<div class="skel" style="padding:12px"><i style="width:45%"></i>'
                 +'<i style="width:75%"></i></div>';
@@ -27899,14 +27930,48 @@ async function capsLoad(force){
               return; }
   }
   capsPaint();
+  // WHILE THE IMPORT RUNS, keep asking. It walks thousands of history rows and
+  // the count moving is the only sign it is alive.
+  if(_capsPoll) clearTimeout(_capsPoll);
+  if(((_caps||{}).tautulli||{}).running)
+    _capsPoll=setTimeout(()=>{ if(document.getElementById('capsPanel')) capsLoad(true); }, 1200);
 }
 function capsToggle(k){ _capsOpen.has(k)?_capsOpen.delete(k):_capsOpen.add(k); capsPaint(); }
 function capsPaint(){
   const el=document.getElementById('capsPanel');
-  if(!el||!_caps) return;
+  if(!el) return;
+  const open=capsShown();
+  const word=_codSide==='video'?'video':'audio';
+  if(!open||!_caps){
+    // SHUT, IT IS STILL A SENTENCE, not a mystery box. The headline is the
+    // one number worth knowing before you decide to look.
+    const n=_caps?(_caps.devices||[]).filter(x=>Object.values(x.cells||{})
+             .some(c=>c.state==='bad')).length:null;
+    el.innerHTML=`<div class="lkind capswrap">
+      <div class="lkindhead ckhead" onclick="capsShow(true)"
+           title="Check these settings against every device this server knows">
+        <span class="ccaret">▸</span>
+        <span class="clib">Will each device play this?</span>
+        <span class="dim">${esc(word)} — per device, per library</span>
+        <span class="dim" style="margin-left:auto">${
+          n===null?'open to check'
+          :n?`<b class="cchg">${n} device${n===1?'':'s'} would transcode</b>`
+            :'<b style="color:var(--ok)">every device direct-plays it</b>'}</span>
+      </div></div>`;
+    return;
+  }
   const d=_caps, libs=d.libraries||[], side=d.side;
-  const word=side==='video'?'video':'audio';
-  const rows=(d.devices||[]).map((dev,i)=>{
+  const T=d.tautulli||{};
+  // SIXTY-SEVEN DEVICES IS A LIST, NOT AN ANSWER. Tautulli's history reaches
+  // back years and includes every phone every guest has ever used, and a panel
+  // that opens on all of them is one nobody reads to the bottom. The ones that
+  // have played something recently come first; the rest are one click away and
+  // counted so nobody wonders whether they were dropped.
+  const all=(d.devices||[]);
+  const CAP=12;
+  const shown=_capsAll?all:all.slice(0,CAP);
+  const hidden=all.length-shown.length;
+  const rows=shown.map((dev,i)=>{
     const key=dev.label+'|'+i, open=_capsOpen.has(key);
     // THE WORST CELL DECIDES THE ROW. A device that direct-plays five
     // libraries and transcodes the sixth is a device with a problem, and a
@@ -27940,13 +28005,38 @@ function capsPaint(){
         }).join('')}</div>`:''}
     </div>`;
   }).join('');
-  el.innerHTML=`<div class="lkind capswrap">
-    <div class="lkindhead"><span class="clib">Will each device play this?</span>
+  // WHAT TAUTULLI ADDS, said where the decision to use it is made. nuarr has
+  // watched Plex since July and only records the sessions that went wrong;
+  // Tautulli has years of every play, with the source channel count on each -
+  // which is the column that decides whether "this device refused E-AC3" meant
+  // stereo or 5.1.
+  const taut = !T.configured
+    ? `<span class="dim">Tautulli is not configured, so this is built from
+       what nuarr has watched since it was installed.</span>`
+    : T.running
+    ? `<span class="capsbusy"><span class="spin" style="width:10px;height:10px"></span>
+       reading Tautulli — ${fmt(T.done||0)} of ${fmt(T.total||0)} sessions,
+       ${fmt(T.learned||0)} facts learned</span>`
+    : `<button class="gapchk" style="font-size:10.5px;padding:1px 8px"
+        onclick="capsTaut(this)"
+        title="Walks Tautulli's play history and reads the source codec, the source CHANNEL COUNT and the per-stream decision off each session - the evidence nuarr's own log cannot supply, because it never wrote down a direct play and never recorded how many channels a refused track had. Incremental: a second run reads only what is new.">${
+          T.imported_to?'Read Tautulli again':'Read Tautulli history'}</button>
+       <span class="dim">${T.imported_to
+          ? `up to date with session #${fmt(T.imported_to)}${
+              T.learned?` · ${fmt(T.learned)} facts last time`:''}`
+          : `years of plays, with the channel count on every one`}</span>`;
+  el.innerHTML=`<div class="lkind capswrap lopen">
+    <div class="lkindhead ckhead" onclick="capsShow(false)"
+         title="collapse this panel">
+      <span class="ccaret">▾</span>
+      <span class="clib">Will each device play this?</span>
       <span class="dim">${esc(word)} only — the other tab answers the other half</span>
       <span style="margin-left:auto"><button class="gapchk"
-        style="font-size:10.5px;padding:1px 8px" onclick="capsLoad(true)"
+        style="font-size:10.5px;padding:1px 8px"
+        onclick="event.stopPropagation();capsLoad(true)"
         title="Re-read the device list and what this server has observed">Refresh</button></span></div>
     <div class="cfbody">
+      <div class="capstaut">${taut}${T.error?`<span class="capserr">${esc(T.error)}</span>`:''}</div>
       <div class="cfwhat dim" style="margin-bottom:8px">Every setting above is a
         claim about somebody else's hardware. This checks the claim: for each
         device, whether the ${esc(word)} formats these libraries will hand it
@@ -27960,6 +28050,11 @@ function capsPaint(){
       <div class="capsout dim">${libs.map(L=>`<span><b>${esc(L)}</b> → ${
         esc(((d.outputs||{})[L]||{})[side].join(', '))}</span>`).join('')}</div>
       ${rows||'<div class="dim">no libraries configured</div>'}
+      ${hidden>0?`<div class="capsmore"><a href="#" onclick="_capsAll=true;capsPaint();return false"
+        >show ${fmt(hidden)} more device${hidden===1?'':'s'}</a>
+        <span class="dim">— everything this server has ever seen, oldest last</span></div>`
+        :(_capsAll&&all.length>CAP?`<div class="capsmore"><a href="#"
+          onclick="_capsAll=false;capsPaint();return false">show fewer</a></div>`:'')}
       <div class="capslegend dim"><span class="capscell ok">direct play</span>
         <span class="capscell warn">may transcode</span>
         <span class="capscell bad">transcodes</span>
@@ -30664,6 +30759,11 @@ html.mobile .setwrap:not(.rail) .setmain,html.mobile .setwrap:not(.rail) #worker
 .capsc.yes{color:var(--ok);border-color:#1f4429}
 .capsc.no{color:var(--bad);border-color:#5e2b28}
 .capsc.varies{color:var(--warn);border-color:#4d3d1a}
+.capstaut{display:flex;align-items:center;gap:9px;flex-wrap:wrap;font-size:10.5px;
+  margin-bottom:9px;padding-bottom:8px;border-bottom:1px solid var(--line)}
+.capsbusy{display:inline-flex;align-items:center;gap:7px;color:var(--acc)}
+.capserr{color:var(--warn)}
+.capsmore{margin-top:9px;font-size:10.5px;display:flex;gap:8px;align-items:center}
 .capslegend{display:flex;align-items:center;gap:7px;flex-wrap:wrap;
   margin-top:9px;padding-top:8px;border-top:1px solid var(--line);font-size:10px}
 .capslegend .capscell{display:inline-block;cursor:default}
