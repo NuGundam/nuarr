@@ -193,6 +193,10 @@ CONFIG: dict[str, Any] = {
     # Plex burns PGS on the CPU at playback -> heavy buffering at 4K. Burn it
     # here on the GPU once instead.
     "alwaysBurnImageSubs": True,
+    # Pull a sidecar subtitle into the file that owns it. OFF by default - it
+    # rewrites files and recycles others, which no other subtitle rule does.
+    # See subembed.py for the three guards.
+    "embedExternalSubs": False,
     # Only burn a (likely) ENGLISH sub. Prevents burning a German/French forced
     # track from a multi-language release.
     "burnLangGuard": True,

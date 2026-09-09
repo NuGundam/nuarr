@@ -735,6 +735,11 @@ async def _startup() -> None:
         from . import integrity as _ig
         _ig.init()
         asyncio.create_task(_ig.watch())
+        # Sidecar subtitles into the file that owns them. Does nothing at all
+        # until a library turns the rule on.
+        from . import subembed as _se
+        _se.init()
+        asyncio.create_task(_se.watch())
         # Filesystem change tracking: per-library rescans instead of full
         # scans every few hours. Hands it the scan runner rather than
         # importing web from the module (cycle).
@@ -6628,6 +6633,31 @@ async def api_remedy_replace(file_id: int, kind: str, source: str = "ui",
         return {"ok": False, "why": "this deletes the file and asks the arr "
                                     "for another one - confirm required"}
     return await remedy.replace(int(file_id), kind, source=source)
+
+
+@app.get("/api/subembed")
+def api_subembed(preview: int = 12):
+    """What the sidecar-embed rule has done, and what it would do next."""
+    from . import subembed
+    d = subembed.stats()
+    try:
+        d["preview"] = subembed.preview(max(0, min(int(preview), 60)))["files"]
+    except Exception as e:                                   # noqa: BLE001
+        d["preview"], d["preview_error"] = [], f"{type(e).__name__}: {e}"
+    return d
+
+
+@app.post("/api/subembed/run")
+async def api_subembed_run(limit: int = 0):
+    from . import subembed
+    return await subembed.sweep(limit=limit)
+
+
+@app.post("/api/subembed/one")
+async def api_subembed_one(file_id: int):
+    """Do one file now. The panel's per-row button."""
+    from . import subembed
+    return await asyncio.to_thread(subembed.embed_one, int(file_id))
 
 
 @app.get("/api/integrity")
@@ -21898,6 +21928,7 @@ function wtab(which){
   if(which==='lang'){
     if(hint) hint.textContent='· subtitles';
     paneLoad('lang', loadLangTab);
+    loadSubEmbed();
     // Its own slot, its own remembered open/shut state. Sharing the codec
     // pages' one would mean opening the panel here silently opened it there
     // too, about a different question.
@@ -28785,6 +28816,79 @@ function capsShow(on, slot){
   try{ localStorage.setItem(S.store, on?'open':'shut'); }catch(e){}
   if(on && !S.caps) capsLoad(false, slot); else capsPaint(slot);
 }
+// ---- sidecar subtitles waiting to come inside ---------------------------
+let _se=null, _seKey='';
+async function loadSubEmbed(){
+  const el=document.getElementById('sePanel'); if(!el) return;
+  try{ _se=await (await fetch('/api/subembed?preview=12')).json(); }
+  catch(e){ el.innerHTML='<span class="dim">could not load</span>'; return; }
+  sePaint();
+}
+function sePaint(){
+  const el=document.getElementById('sePanel'); if(!el||!_se) return;
+  const d=_se, pv=d.preview||[];
+  const on=Object.entries(d.libraries||{}).filter(([,v])=>v).map(([k])=>k);
+  const takes=pv.reduce((n,f)=>n+(f.take||[]).length,0);
+  // THE NUMBER IS THE HEADLINE AND THE SWITCH IS ELSEWHERE. The rule lives in
+  // the list above with every other subtitle rule; putting a second control
+  // here would be two switches for one setting, which can only disagree.
+  const head=`<b style="color:#6fb0ff">Subtitle files sitting next to a video</b>
+    <span class="dim" style="font-size:11.5px">${
+      on.length?`on for ${esc(on.join(', '))}`
+               :'off everywhere — the rule is in the list above'}${
+      d.embedded?` · ${fmt(d.embedded)} taken in so far`:''}${
+      d.failed?` · <span style="color:var(--bad)">${fmt(d.failed)} failed</span>`:''}</span>`;
+  const warn = !d.have_mkvmerge
+    ? `<div class="err" style="font-size:11px;margin:4px 0">mkvmerge is not
+       installed, so nothing can be embedded. It ships with MKVToolNix — see
+       the MKVToolNix page under Tools.</div>` : '';
+  const rows = pv.length ? `<table style="width:100%;font-size:11.5px;margin-top:4px">
+      <colgroup><col style="width:48%"><col style="width:14%">
+        <col style="width:26%"><col style="width:12%"></colgroup>
+      <tbody>${pv.map(f=>`<tr>
+        <td style="padding:3px 8px 3px 0" title="${esc(f.path||'')}"
+          >${esc(String(f.path||'').split('\\').pop())}</td>
+        <td class="dim" style="padding:3px 8px 3px 0">${esc(f.library||'')}</td>
+        <td style="padding:3px 8px 3px 0">${(f.take||[]).map(t=>
+          `<span class="capsc ok" title="${esc(t.sidecar||'')}">${
+            esc(String(t.sidecar||'').split('.').pop())} ${esc(t.lang||'')}${
+            t.role?' '+esc(t.role):''}</span>`).join('')}${
+          (f.skip||[]).length?`<span class="dim" title="${esc((f.skip||[])
+            .map(x=>x.why).join('\n'))}"> +${(f.skip||[]).length} skipped</span>`:''}</td>
+        <td style="padding:3px 0;white-space:nowrap">${
+          f.on?`<button class="rmb" onclick="seOne(${f.file_id},this)"
+             title="Remux this one now: mkvmerge copies the streams into a new container with the subtitle added, then the sidecar is recycled.">Take it in</button>`
+             :`<span class="dim" title="The rule is off for this library, so this is a preview only.">rule off</span>`}</td>
+      </tr>`).join('')}</tbody></table>`
+    : `<div class="dim" style="font-size:11.5px;margin-top:4px">${
+        d.have_mkvmerge?'No sidecar found that this library would keep and the file does not already have.'
+                       :''}</div>`;
+  const foot = `<div class="dim" style="font-size:11px;margin-top:6px">
+      Taken only when the language passes this library's subtitle rules and the
+      file has no track in that language already. The sidecar is recycled, not
+      deleted, and only after the rebuilt file has been read back and found to
+      contain it.${on.length?` <button class="rmb" onclick="seRun(this)"${
+        d.running?' disabled':''}>${d.running?'working…':'Do a batch now'}</button>`:''}</div>`;
+  const html=`<div class="lkind" style="padding:11px 12px">${head}${warn}${rows}${foot}</div>`;
+  if(html===_seKey) return;
+  _seKey=html; el.innerHTML=html;
+}
+async function seOne(fid, btn){
+  if(btn){ btn.disabled=true; btn.textContent='working…'; }
+  let r={};
+  try{ r=await (await fetch('/api/subembed/one?file_id='+fid,
+                            {method:'POST'})).json(); }
+  catch(e){ r={ok:false, why:String(e)}; }
+  if(btn) btn.textContent = r.ok?'done':'failed';
+  if(!r.ok && r.why) alert(r.why);
+  setTimeout(loadSubEmbed, 800);
+}
+async function seRun(btn){
+  if(btn){ btn.disabled=true; btn.textContent='working…'; }
+  try{ await fetch('/api/subembed/run',{method:'POST'}); }catch(e){}
+  loadSubEmbed();
+}
+
 async function capsReread(slot, el){
   if(el){ el.textContent='re-reading…'; el.onclick=null; }
   try{ await fetch('/api/clientcaps/reset',{method:'POST'});

@@ -2021,6 +2021,23 @@ RULE_META = [
              "anyone reaching for the menu. Always a text track, never a "
              "picture one, and never the signs track.",
      "default": True},
+    {"key": "embed_sidecars",
+     "label": "Take subtitle files sitting next to the video inside it",
+     "what": "A sidecar is one arr rename away from being orphaned - there are "
+             "13,004 of them in Anime Shows - and Plex prefers an external "
+             "subtitle over the embedded one for the same language, so the "
+             "file's own track loses to a loose file. Worse for ASS: an "
+             "external one has to be injected by the server, which means "
+             "painting it onto the picture and re-encoding the whole video to "
+             "carry it. mkvmerge copies the streams into a new container "
+             "instead - nothing is re-encoded. Only taken when the language "
+             "passes this library's subtitle rules AND the file has no track "
+             "in that language already; the sidecar is recycled, not deleted, "
+             "and only after the rebuilt file has been read back and found to "
+             "contain it. Off by default: every other rule here changes what "
+             "a rebuild produces, this one starts one and reaches outside the "
+             "file to do it.",
+     "default": False},
     {"key": "burn_hdr", "label": "Allow burning into HDR video",
      "what": "The colour tags and the HDR10 metadata are re-stated on the "
              "output, so the rebuild keeps its HDR. Dolby Vision's per-frame "
@@ -2039,6 +2056,7 @@ _RULE_CFG = {
     "burn_lang_guard": "burnLangGuard",
     "force_eng_sub": "forceEngSubWhenNoEngAudio",
     "burn_hdr": "burnOnHDR",
+    "embed_sidecars": "embedExternalSubs",
 }
 
 
