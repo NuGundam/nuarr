@@ -53,6 +53,22 @@ from .db import cursor
 
 REQUEUE = "requeue"
 REPLACE = "replace"
+# THE THIRD VERB, WHICH THE FIRST DRAFT OF THIS MODULE DID NOT HAVE.
+#
+# Three of the seven checks do not find faults in files at all. arrsync finds
+# that Sonarr's record disagrees with the file; plexsync finds that Plex's
+# cached analysis is stale; audiotitle finds that a track's TITLE describes a
+# codec the track no longer carries. Every one of those is a string in somebody
+# else's database, and the fix is to write the correct string - a tenth of a
+# second with mkvpropedit, or one API call.
+#
+# Offering those findings a requeue would send 39,000 files through the
+# transcoder to correct a caption, which audiotitle's own docstring calls
+# absurd and is right to. Offering them a replace would delete a perfectly good
+# file because Sonarr's bookkeeping was out of date. So they get a verb of
+# their own rather than a borrowed one, and the cards can say plainly that the
+# other two do not apply and why.
+REPAIR = "repair"
 
 
 # ---------------------------------------------------------------- policy ----
@@ -177,13 +193,113 @@ _FALLBACK = {"requeue": True, "replace": False, "auto_replace": False,
                     "offered, because guessing the other one deletes files"}
 
 
+# Findings whose remedy is neither of the file verbs: a wrong string somewhere,
+# and the check that found it already owns the code that writes the right one.
+# Held apart from _P rather than as a fourth column because it is a different
+# kind of statement - not "what may be done to this file" but "this is not
+# about the file".
+_REPAIR_OF = {
+    "arr/disagree": "arrsync",
+    "plex/disagree": "plexsync",
+    "audio/title": "audiotitle",
+}
+
+
 def policy(kind: str) -> dict:
-    return dict(_P.get((kind or "").strip(), _FALLBACK))
+    k = (kind or "").strip()
+    out = dict(_P.get(k, _FALLBACK))
+    out["repair"] = _REPAIR_OF.get(k, "")
+    return out
 
 
 def kinds() -> dict:
     """The whole table, for the settings page that explains itself."""
-    return {k: dict(v) for k, v in sorted(_P.items())}
+    return {k: policy(k) for k in sorted(_P)}
+
+
+# --------------------------------------------------- the third verb's map ---
+# system -> (what it is called on screen, the settings key that holds its
+# auto/manual switch, the finding kind it produces). One row per check, so
+# adding a check means adding a line here rather than teaching four call sites
+# about it.
+SYSTEMS = {
+    "arrsync":    ("arr agreement check", "arrsync_mode", "arr/disagree"),
+    "plexsync":   ("Plex agreement check", "plexsync_mode", "plex/disagree"),
+    "audiotitle": ("audio picker check", "audiotitle_mode", "audio/title"),
+}
+
+
+async def repair(system: str, source: str = "", auto: bool = False) -> dict:
+    r"""Run a check's own in-place fixer, and write what it did to the ledger.
+
+    THE POINT IS THE LEDGER, NOT THE DISPATCH. Each of these fixers was already
+    reachable from its own card and worked perfectly; what was missing was that
+    nothing counted them. Three checks correcting thousands of records were
+    invisible next to a requeue of one file, so the only page that claims to
+    say what nuarr has been doing to the library was telling less than half of
+    it.
+    """
+    if system not in SYSTEMS:
+        return {"ok": False, "why": f"no such check: {system}"}
+    label, _key, kind = SYSTEMS[system]
+    try:
+        if system == "arrsync":
+            from . import arrsync
+            out = await arrsync.fix()
+        elif system == "plexsync":
+            import asyncio as _a
+            from . import plexsync
+            out = await _a.to_thread(plexsync.fix, 0, "")
+        else:
+            import asyncio as _a
+            from . import audiotitle
+            out = await _a.to_thread(audiotitle.fix)
+    except Exception as e:                                       # noqa: BLE001
+        _note(0, kind, REPAIR, source or system, auto, False,
+              f"{type(e).__name__}: {e}")
+        return {"ok": False, "why": f"{type(e).__name__}: {e}"}
+    out = out if isinstance(out, dict) else {"ok": True}
+    n = int(out.get("fixed") or out.get("done") or out.get("queued") or 0)
+    # file_id 0 on purpose: this is one action over many records, and inventing
+    # a file for it would put a lie in a table whose whole job is evidence.
+    _note(0, kind, REPAIR, source or system, auto, True,
+          f"{label}: corrected {n} record(s)" if n
+          else f"{label}: nothing to correct")
+    return {"ok": True, "fixed": n, **out}
+
+
+# ------------------------------------------ every requeue, wherever it is ---
+# ONE HOOK RATHER THAN EIGHT CALL SITES. jobs.enqueue is the single door every
+# requeue in the app goes through - the subtitle-rules sweep, the OCR sweep,
+# the rule audit, the buttons - so noting it there is the only version of this
+# that cannot drift. A check added next year lands in the ledger by existing.
+#
+# Sources already written by the code that called them are skipped, or the cap
+# would count one requeue twice and spend half the budget on arithmetic.
+_NOTED_ELSEWHERE = ("remedy", "rule audit")
+_SOURCE_KIND = {
+    "subtitle rules changed": ("subs/gap", "rulesgap_mode"),
+    "auto": ("subs/gap", "rulesgap_mode"),
+    "not-walked check": ("index/not-walked", "arrgap_mode"),
+    "found by the not-walked check": ("index/not-walked", "arrgap_mode"),
+    "integrity": ("file/corrupt", "integrity_mode"),
+}
+
+
+def note_enqueue(file_id: int, source: str, path: str = "") -> None:
+    src = (source or "").strip()
+    if not src or any(src.startswith(x) for x in _NOTED_ELSEWHERE):
+        return
+    got = _SOURCE_KIND.get(src)
+    if not got:
+        return
+    kind, key = got
+    # A BUTTON PRESS IS NOT AUTO SPEND. The hourly ceiling exists to bound what
+    # nuarr does when nobody is watching; charging a person's own click against
+    # it would mean the more you supervised it, the less it was allowed to do.
+    auto = str(getattr(SETTINGS, key, "manual") or "manual").lower() == "auto"
+    _note(int(file_id), kind, REQUEUE, src, auto, True,
+          f"queued by the {src}", path or "")
 
 
 # ------------------------------------------------------------- the caps -----

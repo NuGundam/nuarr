@@ -1150,6 +1150,18 @@ async def enqueue(file_id: int, path: str, title: str = "",
               priority=priority, plan=plan)
     joblog.log(f"queued [{pool}]: {title}"
                + (f" - {plan.summary()}" if plan else ""), "info", job_id)
+    # THE ONE DOOR EVERY REQUEUE COMES THROUGH.
+    #
+    # The shared hourly budget can only be honest if it sees every requeue, and
+    # the alternative to noting it here was noting it at eight call sites -
+    # which is the same thing until somebody adds a ninth. A check written next
+    # year is counted because it enqueues, not because anybody remembered.
+    # remedy skips the sources that already wrote their own, richer row.
+    try:
+        from . import remedy as _rm
+        _rm.note_enqueue(file_id, source, path)
+    except Exception:                                        # noqa: BLE001
+        pass
     return job
 
 

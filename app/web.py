@@ -4965,12 +4965,20 @@ async def api_arrsync_fix(kinds: str = ""):
     whole run and the panel could not show a thing until it was over - the
     exact reason the scan was made pollable.
     """
-    from . import arrsync
+    from . import arrsync, remedy
     import asyncio as _a
     if (arrsync._CACHE.get("fixing") or {}).get("running"):
         return {"ok": False, "error": "already running"}
     want = [k.strip() for k in kinds.split(",") if k.strip()] or None
-    _a.create_task(arrsync.fix(want))
+    # A CORRECTION OF EVERYTHING GOES THROUGH THE THING THAT COUNTS IT. Picking
+    # individual kinds is a person narrowing the job by hand and keeps the
+    # direct path: remedy.repair() takes no arguments on purpose, because a
+    # verb that can be scoped is a verb whose ledger row has to carry the scope
+    # to mean anything.
+    if not want:
+        _a.create_task(remedy.repair("arrsync", source="ui"))
+    else:
+        _a.create_task(arrsync.fix(want))
     return {"ok": True, "started": True}
 
 
@@ -5006,10 +5014,10 @@ async def api_audiotitle_run():
 @app.post("/api/audiotitle/fix")
 async def api_audiotitle_fix():
     """Correct them in place with mkvpropedit - no re-encode, no rewrite."""
-    from . import audiotitle
+    from . import audiotitle, remedy
     if (audiotitle._CACHE.get("fixing") or {}).get("running"):
         return {"ok": False, "error": "already running"}
-    asyncio.create_task(asyncio.to_thread(audiotitle.fix))
+    asyncio.create_task(remedy.repair("audiotitle", source="ui"))
     return {"ok": True, "started": True}
 
 
@@ -5131,9 +5139,40 @@ def api_health():
             "notland": "Still not landed", "counts": "Counts", "logs": "Logs",
             "ocr": "OCR engines", "ruleschk": "Rule check"}
 
+    # key -> (what fixes it, the sentence explaining why the others do not)
+    REMEDY = {
+        "arrsync": ("fix in place",
+                    "rewrites the arr's record. Nothing is wrong with the "
+                    "file, so there is nothing to requeue or replace"),
+        "plexsync": ("fix in place",
+                     "asks Plex to re-read the file. Nothing is wrong with "
+                     "the file, so there is nothing to requeue or replace"),
+        "audiotitle": ("fix in place",
+                       "rewrites the track title with mkvpropedit in about a "
+                       "tenth of a second. Sending the file through the "
+                       "transcoder to correct a caption would be absurd"),
+        "subsync": ("requeue",
+                    "the planner rewrites the subtitle tracks. A different "
+                    "release would not help - the rules changed, not the file"),
+        "arrgap": ("requeue, or replace",
+                   "a file the arr tracks and nuarr has no row for is indexed; "
+                   "one already blocklisted and still waiting can be asked "
+                   "for again"),
+        "ruleschk": ("requeue, or replace",
+                     "the planner fixes what it can. Where the bytes "
+                     "themselves are wrong - no audio, no video, will not "
+                     "decode - only a different release can"),
+        "integrity": ("replace",
+                      "a file that will not decode cannot be re-encoded into "
+                      "one that will"),
+    }
+
     def add(key, label, goto, n, note, mode=None, running=False, warn=None,
             when=""):
-        checks.append({"key": key, "label": label, "goto": goto,
+        rem = REMEDY.get(key)
+        checks.append({"remedy": rem[0] if rem else "",
+                       "remedy_why": rem[1] if rem else "",
+                       "key": key, "label": label, "goto": goto,
                        "n": int(n or 0), "note": note, "mode": mode,
                        "where": PAGE.get(goto.split("#")[0], goto),
                        # WHAT GOVERNS THIS ROW, in the same slot on every row.
@@ -5146,6 +5185,19 @@ def api_health():
                        "when": when or ("counted live" if mode is None else ""),
                        "running": bool(running),
                        "warn": bool(warn if warn is not None else n)})
+
+    try:
+        from . import integrity as _ig
+        d = _ig.stats()
+        bad = int(d.get("corrupt") or 0)
+        add("integrity", "Does it actually decode?", "ruleschk", bad,
+            (f"{bad} file(s) will not decode" if bad else
+             f"{int(d.get('ok') or 0):,} read, all decoded"
+             if d.get("ok") else "nothing read yet"),
+            mode=d.get("mode"), running=d.get("running"))
+    except Exception as e:                                   # noqa: BLE001
+        add("integrity", "Does it actually decode?", "ruleschk", 0,
+            f"check unavailable: {type(e).__name__}", warn=True)
 
     try:
         from . import arrsync as _as
@@ -5714,8 +5766,16 @@ async def api_plexsync_run():
 
 @app.post("/api/plexsync/fix")
 async def api_plexsync_fix(limit: int = 0, library: str = ""):
-    """Hand the disagreements to the Plex catch-up queue, all or one library."""
-    from . import plexsync
+    """Hand the disagreements to the Plex catch-up queue, all or one library.
+
+    A whole-library run goes through remedy so the ledger sees it; a limited or
+    single-library run is a person narrowing the job by hand and keeps the
+    direct path, because remedy.repair() deliberately takes no arguments - a
+    verb that can be scoped is a verb that has to be audited per scope.
+    """
+    from . import plexsync, remedy
+    if not limit and not library.strip():
+        return await remedy.repair("plexsync", source="ui")
     return await asyncio.to_thread(plexsync.fix, int(limit or 0),
                                    library.strip())
 
@@ -23371,6 +23431,11 @@ function hlPaint(){
       <span class="${c.warn?'warn':'dim'}" style="flex:1;overflow:hidden;
         text-overflow:ellipsis;white-space:nowrap">
         ${c.running?'checking now… ':''}${esc(c.note||'')}</span>
+      <span class="dim" style="flex:none;font-size:10.5px;min-width:150px;
+        text-align:right" title="${esc(c.remedy_why
+          ? 'What nuarr does about what this row finds. '+c.remedy_why
+          : 'this row reports a count; there is nothing to correct')}">${
+        c.remedy?esc(c.remedy):''}</span>
       <span class="dim" style="flex:none;font-size:10.5px;min-width:118px;
         text-align:right" title="${c.mode
           ? 'this system\'s own auto/manual switch, lives on its card'
