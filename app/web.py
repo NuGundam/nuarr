@@ -28862,7 +28862,7 @@ function capsShow(on, slot){
   if(on && !S.caps) capsLoad(false, slot); else capsPaint(slot);
 }
 // ---- subtitles already painted into the picture -------------------------
-let _hs=null, _hsKey='';
+let _hs=null, _hsKey='', _hsPoll=null;
 const HSW={dialogue:['dialogue','var(--bad)'], hybrid:['dialogue + signs','var(--bad)'],
            signs:['signs or songs','var(--warn)'], none:['none','var(--ok)']};
 async function loadHardsub(){
@@ -28891,8 +28891,47 @@ function hsPaint(){
     best few of those are shown to the OCR: a bright blob is also a lamp or a
     white shirt, so a file is called hardsubbed only when real words come
     back.${d.have_ocr?'':' <span style="color:var(--bad)">Tesseract is not installed, so nothing can be confirmed.</span>'}</div>`;
-  const prog=d.running?`<div class="dim" style="font-size:11px">${esc(d.now||'')} · ${
-    d.done||0}/${d.total||0}</div>`:'';
+  // PROOF OF LIFE IS NOT PROGRESS. A spinner and a filename say the thing is
+  // alive; they do not say how fast, how much is left, or when it ends -
+  // which are the only questions a job with 4,564 files to get through
+  // actually raises. Everything here is measured from the run in flight, and
+  // nothing is shown before there is a measurement to show.
+  const pct = d.total ? Math.min(100, (d.done/d.total)*100) : 0;
+  const prog = d.running ? `
+    <div class="hsbar"><i style="width:${pct.toFixed(1)}%"></i></div>
+    <div style="display:flex;gap:10px;align-items:baseline;font-size:11px;
+                margin:3px 0 6px;flex-wrap:wrap">
+      <span class="busy" style="color:var(--acc)"><span class="sp"></span></span>
+      <b>${fmt(d.done||0)} of ${fmt(d.total||0)}</b>
+      <span class="dim">${esc(d.now||'')}</span>
+      <span style="margin-left:auto;display:flex;gap:10px">
+        ${d.elapsed?`<span class="dim" title="How long this pass has been running">${
+          hsDur(d.elapsed)} in</span>`:''}
+        ${d.rate?`<span class="dim" title="Files finished per second, measured on this run">${
+          d.rate>=1?d.rate.toFixed(1)+'/s':(1/d.rate).toFixed(1)+'s each'}</span>`:''}
+        ${d.eta?`<b style="color:var(--acc)" title="Time left in this pass at the rate above">${
+          hsDur(d.eta)} left</b>`:''}
+      </span>
+    </div>` : '';
+  // AND THE RUN BEFORE THIS ONE, because a job that only exists while it is
+  // running is one you can never check up on.
+  const hist = `<div class="dim" style="font-size:11px;margin:4px 0 2px;
+      display:flex;gap:12px;flex-wrap:wrap">
+    ${d.last_run?`<span title="When the last pass finished, what it got through, and how long it took">
+       last run ${ago(d.last_run)} · ${fmt(d.last_checked||0)} checked${
+       d.last_found?`, <span style="color:var(--bad)">${fmt(d.last_found)} found</span>`:''}${
+       d.last_took?` · took ${hsDur(d.last_took)}`:''}</span>`
+      :'<span>has not run yet</span>'}
+    ${(!d.running&&d.next_run)?`<span title="This runs every ${
+       hsDur(d.cycle_s)}, ${d.per_run} files a pass">next in ${
+       hsDur(Math.max(0,d.next_run-(Date.now()/1000)))}</span>`:''}
+    ${d.runs?`<span title="Completed passes since nuarr started">${fmt(d.runs)} pass${
+       d.runs===1?'':'es'}</span>`:''}
+    ${d.secs_each?`<span title="Average seconds per file, smoothed across passes - what the estimate below is built on">${
+       d.secs_each.toFixed(1)}s a file</span>`:''}
+    ${(d.untested&&d.backlog_eta)?`<span title="How long until every file that reports no subtitle track has been looked at, at this pace and this cadence. Raising the files-per-pass or shortening the cycle is what changes it.">
+       <b>${hsDur(d.backlog_eta)}</b> to finish the backlog</span>`:''}
+  </div>`;
   const table = rows.length ? `<table style="width:100%;font-size:11.5px">
       <colgroup><col style="width:40%"><col style="width:12%"><col style="width:10%">
         <col style="width:24%"><col style="width:14%"></colgroup>
@@ -28915,9 +28954,26 @@ function hsPaint(){
     : `<div class="dim" style="font-size:11.5px">${
         tested?'Nothing checked so far is carrying subtitles in the picture.'
               :'Nothing checked yet.'}</div>`;
-  const html=`<div class="lkind" style="padding:11px 12px">${head}${note}${prog}${table}</div>`;
+  const html=`<div class="lkind" style="padding:11px 12px">${head}${note}${prog}${hist}${table}</div>`;
   if(html===_hsKey) return;
   _hsKey=html; el.innerHTML=html;
+  // WHILE IT RUNS, KEEP ASKING. A progress bar that only moves when somebody
+  // reloads the page is a screenshot.
+  if(d.running){
+    clearTimeout(_hsPoll);
+    _hsPoll=setTimeout(()=>{ if(document.getElementById('hsPanel')) loadHardsub(); }, 1500);
+  }
+}
+// Durations the way a person says them: seconds under a minute, then minutes,
+// then hours and minutes, then days. "18420s to finish" is not an answer.
+function hsDur(s){
+  s=Math.max(0,Math.round(s||0));
+  if(s<60) return s+'s';
+  if(s<3600) return Math.floor(s/60)+'m '+(s%60?(s%60)+'s':'');
+  if(s<86400){ const h=Math.floor(s/3600), m=Math.round((s%3600)/60);
+               return h+'h'+(m?' '+m+'m':''); }
+  const dd=Math.floor(s/86400), hh=Math.round((s%86400)/3600);
+  return dd+'d'+(hh?' '+hh+'h':'');
 }
 async function hsRun(btn){
   if(btn){ btn.disabled=true; btn.textContent='looking…'; }
@@ -32006,6 +32062,12 @@ html.mobile .setwrap:not(.rail) .setmain,html.mobile .setwrap:not(.rail) #worker
    suspect until the setting is checked. */
 .capsburn{font-size:10px;border:1px solid #5a4a1a;color:var(--warn);
   border-radius:9px;padding:0 7px;cursor:help;white-space:nowrap}
+/* A REAL BAR, not a barber pole. The width is the fraction actually done, so
+   a stalled pass looks stalled instead of looking busy forever. */
+.hsbar{height:4px;border-radius:3px;background:#161a20;overflow:hidden;
+  margin:6px 0 0}
+.hsbar i{display:block;height:100%;border-radius:3px;background:var(--acc);
+  transition:width .6s ease}
 /* A REFRESH THAT SAYS IT IS REFRESHING. Without this the button did nothing
    visible for the second the fetch took, so it got pressed again. */
 .gapchk.spinning{position:relative;color:transparent!important;pointer-events:none}

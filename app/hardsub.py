@@ -139,9 +139,25 @@ MIN_TEXT_FRAMES = 2
 PER_RUN = 20
 CYCLE_S = 900
 SETTLE_S = 600
+# The name this job answers to on the Schedules page, so it is counted and
+# timed alongside every other recurring pass rather than being a thing that
+# happens invisibly.
+SCHED_KEY = "hardsub"
 
+# WHAT A LONG JOB OWES THE PERSON WATCHING IT.
+#
+# "looking..." and a filename is not progress, it is proof of life. This one
+# has 4,564 files to get through at roughly ten seconds each, so the only
+# honest thing to show is how fast it is actually going and what that means
+# for the pile - which is a number nobody can work out from a spinner.
+#
+# t0/rate/eta are per RUN; backlog_eta is the whole queue at the pace the last
+# runs actually achieved, which is the figure that decides whether the cadence
+# needs changing.
 STATE: dict = {"running": False, "done": 0, "total": 0, "now": "",
-               "last_run": 0.0, "found": 0, "last_error": ""}
+               "last_run": 0.0, "found": 0, "last_error": "",
+               "t0": 0.0, "last_took": 0.0, "last_checked": 0,
+               "last_found": 0, "runs": 0, "secs_each": 0.0}
 
 _READY = False
 
@@ -505,7 +521,9 @@ async def sweep(limit: int = 0) -> dict:
     if STATE["running"]:
         return {"ok": False, "why": "already running"}
     todo = await asyncio.to_thread(_candidates, int(limit or PER_RUN))
-    STATE.update(running=True, done=0, total=len(todo), now="", found=0)
+    t0 = time.time()
+    STATE.update(running=True, done=0, total=len(todo), now="", found=0,
+                 t0=t0)
     done = found = 0
     try:
         for r in todo:
@@ -520,7 +538,24 @@ async def sweep(limit: int = 0) -> dict:
                 found += 1
                 STATE["found"] = found
     finally:
-        STATE.update(running=False, now="", last_run=time.time(), done=done)
+        took = max(0.001, time.time() - t0)
+        # SECONDS PER FILE, SMOOTHED ACROSS RUNS. One run of twenty files is a
+        # small sample and a single 4K episode on a sleeping disk skews it, so
+        # the figure the backlog estimate uses is the average of what has
+        # happened rather than the last run alone.
+        prev = STATE.get("secs_each") or 0.0
+        this = took / max(1, done)
+        STATE.update(running=False, now="", last_run=time.time(), done=done,
+                     t0=0.0, last_took=took, last_checked=done,
+                     last_found=found, runs=STATE.get("runs", 0) + 1,
+                     secs_each=(this if not prev else prev * 0.7 + this * 0.3))
+        try:
+            from . import schedules
+            schedules.beat(SCHED_KEY,
+                           f"{done} checked, {found} carrying subtitles"
+                           if done else "nothing left to look at")
+        except Exception:                                    # noqa: BLE001
+            pass
     if found:
         joblog.log(f"burned-in subtitle check: {found} of {done} file(s) that "
                    f"report no subtitles are carrying them in the picture",
@@ -532,11 +567,44 @@ async def sweep(limit: int = 0) -> dict:
 def stats() -> dict:
     if not _READY:
         init()
+    left = untested()
+    now = time.time()
+    # THIS RUN: measured, not guessed. Before the first file lands there is no
+    # rate to report and the panel says so rather than dividing by zero and
+    # showing an ETA of infinity.
+    elapsed = (now - STATE["t0"]) if (STATE["running"] and STATE["t0"]) else 0.0
+    rate = (STATE["done"] / elapsed) if (elapsed > 0.5 and STATE["done"]) else 0.0
+    eta = ((STATE["total"] - STATE["done"]) / rate) if rate else 0.0
+    each = STATE.get("secs_each") or 0.0
     out = {"running": STATE["running"], "now": STATE["now"],
            "done": STATE["done"], "total": STATE["total"],
-           "last_run": STATE["last_run"], "untested": untested(),
+           "last_run": STATE["last_run"], "untested": left,
+           "elapsed": round(elapsed, 1), "rate": round(rate, 3),
+           "eta": round(eta), "secs_each": round(each, 2),
+           "last_took": round(STATE.get("last_took") or 0, 1),
+           "last_checked": STATE.get("last_checked") or 0,
+           "last_found": STATE.get("last_found") or 0,
+           "runs": STATE.get("runs") or 0,
+           "per_run": PER_RUN, "cycle_s": CYCLE_S,
+           # THE ONE THAT ACTUALLY DECIDES ANYTHING. Not "how long is this
+           # batch" but "how long until the library is answered", at the pace
+           # this is really going and the cadence it really runs on.
+           "backlog_eta": round(
+               (left / max(1, PER_RUN)) * CYCLE_S
+               + (left * each if each else 0)) if left else 0,
+           "next_run": 0.0,
            "have_ocr": bool(_tesseract()), NONE: 0, SIGNS: 0,
            DIALOGUE: 0, HYBRID: 0, "marked": 0}
+    try:
+        from . import schedules
+        for r in (schedules.snapshot() or {}).get("rows", []):
+            if r.get("key") == SCHED_KEY:
+                out["next_run"] = r.get("next_run") or 0.0
+                out["runs"] = r.get("runs") or out["runs"]
+                out["last_result"] = r.get("last_result") or ""
+                break
+    except Exception:                                        # noqa: BLE001
+        pass
     try:
         with cursor() as cur:
             for r in cur.execute("SELECT state, COUNT(*) n FROM hardsub "
@@ -566,6 +634,17 @@ def found(limit: int = 60) -> list:
 
 
 async def watch() -> None:
+    try:
+        from . import schedules
+        schedules.register(
+            SCHED_KEY, "Subtitles burned into the picture", "Subtitles",
+            CYCLE_S,
+            what=f"Samples {SAMPLES} frames of each file that reports having "
+                 f"no subtitle track, counts the bright pixels low in the "
+                 f"picture, and shows the best few to the OCR. {PER_RUN} "
+                 f"files a pass.")
+    except Exception:                                        # noqa: BLE001
+        pass
     await asyncio.sleep(240)
     while True:
         try:
