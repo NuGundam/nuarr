@@ -62,7 +62,7 @@ def init() -> None:
             CREATE TABLE IF NOT EXISTS client_caps(
                 product   TEXT NOT NULL,
                 client    TEXT NOT NULL,
-                kind      TEXT NOT NULL,     -- video | audio
+                kind      TEXT NOT NULL,     -- video | audio | subtitle
                 codec     TEXT NOT NULL,
                 ch        INTEGER NOT NULL,  -- audio channels; 0 for video
                 played    INTEGER NOT NULL DEFAULT 0,
@@ -93,7 +93,7 @@ def note(product: str, client: str, kind: str, codec: str,
          src: str = "live", cur=None) -> None:
     """Record one sighting. Cheap, and never allowed to break playback watching."""
     codec = (codec or "").strip().lower()
-    if not codec or kind not in ("video", "audio"):
+    if not codec or kind not in ("video", "audio", "subtitle"):
         return
     if not _READY:
         try:
@@ -348,7 +348,16 @@ def import_tautulli(walk: int = _TAUT_WALK) -> dict:
                              d.get("video_decision"), 0),
                             ("audio", d.get("audio_codec"),
                              d.get("audio_decision"),
-                             int(d.get("audio_channels") or 0))):
+                             int(d.get("audio_channels") or 0)),
+                            # SUBTITLES ARE THE THIRD STREAM AND THE ONE THAT
+                            # COSTS THE MOST WHEN IT GOES WRONG. A refused
+                            # audio track is re-encoded; a refused subtitle is
+                            # BURNED, which re-encodes the video with it. So a
+                            # device that cannot take a format here is not a
+                            # small inefficiency, it is the whole file being
+                            # rebuilt to paint words on it.
+                            ("subtitle", d.get("subtitle_codec"),
+                             d.get("subtitle_decision"), 0)):
                         cod = str(cod or "").strip().lower()
                         dec = str(dec or "").strip().lower()
                         if not cod or not dec:
@@ -356,6 +365,32 @@ def import_tautulli(walk: int = _TAUT_WALK) -> dict:
                         # DIRECT PLAY AND COPY ARE BOTH "THE DECODER WAS FINE".
                         # A copy is a remux - the container changed and the
                         # stream did not - so the client took that codec.
+                        # A BURN IS A REFUSAL AND IS NEVER AMBIGUOUS. The
+                        # bandwidth-cap guard below exists because a rebuilt
+                        # video says nothing about the decoder; a burn says
+                        # exactly one thing - the client would not render this
+                        # subtitle, so the server drew it instead. No cap
+                        # causes that and no cap excuses it.
+                        if kind == "subtitle":
+                            if dec == "burn":
+                                note(product, player, kind, cod, ch, ok=False,
+                                     at=at, src="tautulli", cur=cur)
+                                learned += 1
+                                TAUT["learned"] = learned
+                            elif dec in ("direct play", "copy",
+                                         "direct stream", "transcode"):
+                                # TRANSCODE COUNTS AS ACCEPTED HERE, unlike on
+                                # the other two streams. Plex converting SRT to
+                                # WebVTT for a browser is a text-to-text
+                                # rewrite that costs nothing and touches no
+                                # video - the client got readable subtitles
+                                # without the file being rebuilt, which is the
+                                # only thing this panel is trying to predict.
+                                note(product, player, kind, cod, ch, ok=True,
+                                     at=at, src="tautulli", cur=cur)
+                                learned += 1
+                                TAUT["learned"] = learned
+                            continue
                         if dec in ("direct play", "copy", "direct stream"):
                             note(product, player, kind, cod, ch, ok=True,
                                  at=at, src="tautulli", cur=cur)
@@ -547,7 +582,9 @@ KNOWN: list[dict] = [
              "and HEVC only works in Edge and Safari.",
      "video": {"h264": Y, "hevc": V, "vp9": Y, "av1": V, "mpeg4": N, "vc1": N},
      "audio": {"aac": Y, "mp3": Y, "opus": Y, "flac": Y, "vorbis": Y,
-               "ac3": V, "eac3": N, "dts": N, "truehd": N}},
+               "ac3": V, "eac3": N, "dts": N, "truehd": N},
+     "subtitle": {"srt": Y, "webvtt": Y, "mov_text": Y, "ass": N, "ssa": N,
+                  "pgs": N, "vobsub": N}},
     {"id": "windows", "label": "Plex for Windows / macOS (desktop app)",
      "match": r"^plex for (windows|mac)",
      "note": "Uses the OS audio path, so what it accepts depends on the "
@@ -556,21 +593,27 @@ KNOWN: list[dict] = [
              "refuse E-AC3 and ask for Opus instead.",
      "video": {"h264": Y, "hevc": Y, "vp9": Y, "av1": V, "mpeg4": V, "vc1": V},
      "audio": {"aac": Y, "mp3": Y, "opus": Y, "flac": Y,
-               "ac3": V, "eac3": V, "dts": V, "truehd": V}},
+               "ac3": V, "eac3": V, "dts": V, "truehd": V},
+     "subtitle": {"srt": Y, "webvtt": Y, "mov_text": Y, "ass": V, "ssa": V,
+                  "pgs": N, "vobsub": N}},
     {"id": "appletv", "label": "Apple TV",
      "match": r"apple ?tv",
      "note": "A fixed platform, so this list is unusually reliable. Dolby "
              "formats pass through to the receiver over HDMI.",
      "video": {"h264": Y, "hevc": Y, "vp9": N, "av1": V, "mpeg4": V, "vc1": N},
      "audio": {"aac": Y, "mp3": Y, "flac": Y, "ac3": Y, "eac3": Y,
-               "opus": V, "dts": V, "truehd": V}},
+               "opus": V, "dts": V, "truehd": V},
+     "subtitle": {"srt": Y, "webvtt": Y, "mov_text": Y, "ass": N, "ssa": N,
+                  "pgs": N, "vobsub": N}},
     {"id": "roku", "label": "Roku",
      "match": r"roku",
      "note": "Spans ten years of hardware. 4K models decode HEVC; older "
              "sticks do not, and DTS depends on the model.",
      "video": {"h264": Y, "hevc": V, "vp9": V, "av1": V, "mpeg4": V, "vc1": V},
      "audio": {"aac": Y, "mp3": Y, "ac3": Y, "eac3": Y,
-               "flac": V, "opus": V, "dts": V, "truehd": V}},
+               "flac": V, "opus": V, "dts": V, "truehd": V},
+     "subtitle": {"srt": Y, "webvtt": Y, "mov_text": V, "ass": N, "ssa": N,
+                  "pgs": N, "vobsub": N}},
     {"id": "androidtv", "label": "Android TV / Google TV / Sony Bravia",
      "match": r"android \(?tv|google tv|bravia|shield",
      "note": "The codec list comes from the SoC, so it differs between a "
@@ -579,53 +622,69 @@ KNOWN: list[dict] = [
              "restarts the audio transcode on every seek.",
      "video": {"h264": Y, "hevc": Y, "vp9": Y, "av1": V, "mpeg4": V, "vc1": V},
      "audio": {"aac": Y, "mp3": Y, "ac3": Y, "eac3": V,
-               "flac": V, "opus": V, "dts": V, "truehd": V}},
+               "flac": V, "opus": V, "dts": V, "truehd": V},
+     "subtitle": {"srt": Y, "webvtt": Y, "mov_text": V, "ass": N, "ssa": N,
+                  "pgs": N, "vobsub": N}},
     {"id": "samsung", "label": "Samsung TV (Tizen)",
      "match": r"samsung|tizen",
      "note": "Built-in TV app. HEVC and the Dolby formats are usual; DTS was "
              "dropped from many 2018-and-later sets.",
      "video": {"h264": Y, "hevc": Y, "vp9": V, "av1": V, "mpeg4": V, "vc1": V},
      "audio": {"aac": Y, "mp3": Y, "ac3": Y, "eac3": Y,
-               "flac": V, "opus": V, "dts": N, "truehd": V}},
+               "flac": V, "opus": V, "dts": N, "truehd": V},
+     "subtitle": {"srt": Y, "webvtt": V, "mov_text": V, "ass": N, "ssa": N,
+                  "pgs": N, "vobsub": N}},
     {"id": "lg", "label": "LG TV (webOS)",
      "match": r"\blg\b|webos",
      "note": "Built-in TV app, much like the Samsung one.",
      "video": {"h264": Y, "hevc": Y, "vp9": Y, "av1": V, "mpeg4": V, "vc1": V},
      "audio": {"aac": Y, "mp3": Y, "ac3": Y, "eac3": Y,
-               "flac": V, "opus": V, "dts": V, "truehd": V}},
+               "flac": V, "opus": V, "dts": V, "truehd": V},
+     "subtitle": {"srt": Y, "webvtt": V, "mov_text": V, "ass": N, "ssa": N,
+                  "pgs": N, "vobsub": N}},
     {"id": "chromecast", "label": "Chromecast",
      "match": r"chromecast|cast",
      "note": "The dongle, not Google TV. No DTS or TrueHD at all.",
      "video": {"h264": Y, "hevc": V, "vp9": Y, "av1": N, "mpeg4": V, "vc1": N},
      "audio": {"aac": Y, "mp3": Y, "opus": Y, "flac": Y, "ac3": Y, "eac3": Y,
-               "dts": N, "truehd": N}},
+               "dts": N, "truehd": N},
+     "subtitle": {"srt": Y, "webvtt": Y, "mov_text": V, "ass": N, "ssa": N,
+                  "pgs": N, "vobsub": N}},
     {"id": "ios", "label": "Plex for iOS / iPadOS",
      "match": r"plex for (ios|ipad)",
      "note": "Apple's decoder set. Dolby formats decode, but to stereo unless "
              "an external device is attached.",
      "video": {"h264": Y, "hevc": Y, "vp9": N, "av1": N, "mpeg4": V, "vc1": N},
      "audio": {"aac": Y, "mp3": Y, "flac": Y, "ac3": Y, "eac3": Y,
-               "opus": V, "dts": V, "truehd": N}},
+               "opus": V, "dts": V, "truehd": N},
+     "subtitle": {"srt": Y, "webvtt": Y, "mov_text": Y, "ass": V, "ssa": V,
+                  "pgs": N, "vobsub": N}},
     {"id": "android", "label": "Plex for Android (phone / tablet)",
      "match": r"plex for android(?! \(tv)",
      "note": "Whatever the phone's SoC exposes, which on anything recent is a "
              "wide list.",
      "video": {"h264": Y, "hevc": Y, "vp9": Y, "av1": V, "mpeg4": V, "vc1": V},
      "audio": {"aac": Y, "mp3": Y, "flac": Y, "opus": Y, "ac3": V, "eac3": V,
-               "dts": V, "truehd": N}},
+               "dts": V, "truehd": N},
+     "subtitle": {"srt": Y, "webvtt": Y, "mov_text": V, "ass": V, "ssa": V,
+                  "pgs": N, "vobsub": N}},
     {"id": "xbox", "label": "Xbox",
      "match": r"xbox",
      "note": "Dolby formats pass through; DTS needs the paid DTS app on some "
              "generations.",
      "video": {"h264": Y, "hevc": Y, "vp9": Y, "av1": V, "mpeg4": V, "vc1": V},
      "audio": {"aac": Y, "mp3": Y, "ac3": Y, "eac3": Y, "flac": Y,
-               "opus": V, "dts": V, "truehd": V}},
+               "opus": V, "dts": V, "truehd": V},
+     "subtitle": {"srt": Y, "webvtt": Y, "mov_text": V, "ass": N, "ssa": N,
+                  "pgs": N, "vobsub": N}},
     {"id": "playstation", "label": "PlayStation",
      "match": r"playstation|ps[45]",
      "note": "HEVC on PS5; the PS4 app is H.264 only.",
      "video": {"h264": Y, "hevc": V, "vp9": V, "av1": N, "mpeg4": V, "vc1": V},
      "audio": {"aac": Y, "mp3": Y, "ac3": Y, "eac3": Y,
-               "flac": V, "opus": V, "dts": V, "truehd": V}},
+               "flac": V, "opus": V, "dts": V, "truehd": V},
+     "subtitle": {"srt": Y, "webvtt": V, "mov_text": V, "ass": N, "ssa": N,
+                  "pgs": N, "vobsub": N}},
 ]
 
 # What the panel shows when a device matches nothing above. Deliberately
@@ -636,7 +695,9 @@ FALLBACK = {"id": "unknown", "label": "Unrecognised client",
                     "something on it and the real answer replaces this.",
             "video": {"h264": Y, "hevc": V, "vp9": V, "av1": V},
             "audio": {"aac": Y, "mp3": Y, "ac3": V, "eac3": V, "dts": V,
-                      "truehd": V, "flac": V, "opus": V}}
+                      "truehd": V, "flac": V, "opus": V},
+            "subtitle": {"srt": Y, "webvtt": V, "mov_text": V, "ass": V,
+                         "ssa": V, "pgs": N, "vobsub": N}}
 
 
 def profile_for(product: str, client: str = "") -> dict:
@@ -677,7 +738,25 @@ def library_outputs(library: str) -> dict:
         if (c, ch) not in seen:
             seen.add((c, ch))
             uniq.append((c, ch))
-    return {"video": vids, "audio": uniq,
+    # SUBTITLES ARE THE ONE SIDE WHERE NUARR MOSTLY PASSES THINGS THROUGH.
+    #
+    # It CREATES exactly one format - the SRT the OCR writes - and everything
+    # else in a finished file is whatever the release shipped, because the
+    # rules treat every text subtitle as already fine. That is why ass is on
+    # this list: not because a setting asks for it, but because nothing removes
+    # it, and a format nothing removes is a format these libraries emit.
+    # Saying so is the point of the panel.
+    from .rules import CONFIG as _RC
+    subs = ["srt"]
+    if _RC.get("keepUndeterminedSubs", True) or True:
+        # ass/ssa survive untouched: they are in TEXT_SUB_CODECS, which the
+        # planner reads as "streams as text, harmless". For Plex that is only
+        # true of srt.
+        subs += ["ass", "ssa"]
+    if not _RC.get("alwaysBurnImageSubs", True):
+        # Image subs only reach a client when nuarr is NOT burning them here.
+        subs += ["hdmv_pgs_subtitle", "dvd_subtitle"]
+    return {"video": vids, "audio": uniq, "subtitle": subs,
             "stereo_bitrate": a.get("stereo_bitrate"),
             "surround_bitrate": a.get("surround_bitrate")}
 
@@ -742,7 +821,7 @@ def matrix(side: str = "video") -> dict:
     pressed play.
     """
     from .langpolicy import libraries
-    side = "video" if side != "audio" else "audio"
+    side = side if side in ("video", "audio", "subtitle") else "video"
     try:
         backfill()
     except Exception:                                        # noqa: BLE001
@@ -780,8 +859,8 @@ def matrix(side: str = "video") -> dict:
         # what to produce, and you cannot decide that from a list narrowed to
         # what you already decided. Everything observed on the device, plus
         # everything its platform profile claims, both sides of the pipeline.
-        known = {"video": [], "audio": []}
-        for kind in ("video", "audio"):
+        known = {"video": [], "audio": [], "subtitle": []}
+        for kind in ("video", "audio", "subtitle"):
             seen = []
             for codec, chans in (o.get(kind) or {}).items():
                 for ch, (played, refused) in chans.items():
@@ -804,27 +883,31 @@ def matrix(side: str = "video") -> dict:
         cells = {}
         for L in libs:
             out = outs[L]
-            items = ([(c, 0) for c in out["video"]] if side == "video"
-                     else out["audio"])
+            items = (out["audio"] if side == "audio"
+                     else [(c, 0) for c in out[side]])
             per = []
             for codec, ch in items:
                 vd = _verdict(prof, o, side, codec, ch)
                 per.append({"codec": codec, "ch": ch, **vd})
             bad = [p for p in per if p["state"] == N]
             iffy = [p for p in per if p["state"] == V]
+            burn = side == "subtitle"
             if bad:
-                state, txt = "bad", "transcodes " + ", ".join(
-                    _fmt(p) for p in bad)
+                state, txt = "bad", ("burns " if burn else "transcodes ") + \
+                    ", ".join(_fmt(p) for p in bad)
             elif iffy:
-                state, txt = "warn", "may transcode " + ", ".join(
+                state, txt = "warn", ("may burn " if burn
+                                      else "may transcode ") + ", ".join(
                     _fmt(p) for p in iffy)
             else:
-                state, txt = "ok", "direct play"
+                state, txt = "ok", ("streams as text" if burn
+                                    else "direct play")
             cells[L] = {"state": state, "text": txt, "codecs": per}
         rows.append({**d, "cells": cells})
 
     return {"side": side, "libraries": libs,
             "outputs": {L: {"video": outs[L]["video"],
+                            "subtitle": outs[L]["subtitle"],
                             "audio": [f"{c} {_chan(ch)}"
                                       for c, ch in outs[L]["audio"]]}
                         for L in libs},

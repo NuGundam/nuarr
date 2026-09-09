@@ -21881,6 +21881,10 @@ function wtab(which){
   if(which==='lang'){
     if(hint) hint.textContent='· subtitles';
     paneLoad('lang', loadLangTab);
+    // Its own slot, its own remembered open/shut state. Sharing the codec
+    // pages' one would mean opening the panel here silently opened it there
+    // too, about a different question.
+    capsLoad(false, 'sub');
     // Arrived from the health page: the out-of-sync card is the last thing on
     // a long pane, so landing at the top of Subtitles and leaving the reader
     // to find it is the same as not linking at all.
@@ -28509,7 +28513,7 @@ async function alFix(fileId, track, code, btn){
 let _cod=null, _codSide='video', _codDirty=false;
 
 async function loadCodecTab(side){
-  if(side && side!==_codSide){ _caps=null; _capsSide=''; _capsKey=''; }
+  if(side && side!==_codSide){ const S=_cs('cod'); S.caps=null; S.side=''; S.key=''; }
   if(side) _codSide=side;
   const el=document.getElementById(_codSide==='video'?'vcodecBody':'acodecBody');
   if(!el) return;
@@ -28725,64 +28729,90 @@ Nothing is saved and no library file is touched.">Test these settings</button>
 // "Surround formats to copy: eac3" is not a fact about E-AC3, it is a claim
 // that every device here direct-plays it - so the claim is checked, per device
 // and per library, against what those devices have actually done.
-let _caps=null, _capsSide='', _capsOpen=new Set(), _capsPoll=null, _capsAll=false;
-let _capsKey='';
+// ONE PANEL, THREE PAGES. This started as a single instance welded to the
+// codec tab: one module-level `_caps`, one hard-coded #capsPanel, one
+// localStorage key. Subtitles need the same answer to the same question, and
+// two copies of four hundred lines would drift the first time either was
+// touched. So the state moved into a registry keyed by SLOT and every function
+// takes one, defaulting to the codec pages so nothing else had to change.
+const _CAPSS = {
+  cod: {caps:null, side:'', open:new Set(), poll:null, all:false, key:'',
+        panel:'capsPanel', store:'nuarr.caps', btn:'capsRefresh',
+        sideOf:()=>_codSide},
+  sub: {caps:null, side:'', open:new Set(), poll:null, all:false, key:'',
+        panel:'capsSubPanel', store:'nuarr.capsSub', btn:'capsSubRefresh',
+        sideOf:()=>'subtitle'}
+};
+function _cs(slot){ return _CAPSS[slot||'cod']; }
+// THE WORDS DIFFER BECAUSE THE FAILURE DIFFERS. A refused audio track is
+// re-encoded; a refused subtitle is painted onto the picture, which re-encodes
+// the video with it. Calling that "transcodes" would send somebody looking for
+// a subtitle setting when the cost is the whole frame being rebuilt.
+function capsWords(side){
+  return side==='subtitle'
+    ? {ok:'streams as text', warn:'may burn', bad:'burns', bad1:'burns',
+       word:'subtitles', plays:'Handles'}
+    : {ok:'direct play', warn:'may transcode', bad:'transcode',
+       bad1:'transcodes', word:side, plays:'Plays '+side};
+}
 function chanTxt(ch){ return ({2:'2.0',6:'5.1',8:'7.1'}[ch]||ch+'ch'); }
-function capsBusy(on){
-  const b=document.getElementById('capsRefresh');
+function capsBusy(on, slot){
+  const b=document.getElementById(_cs(slot).btn);
   if(b) b.classList.toggle('spinning', !!on);
 }
-function capsShown(){
-  try{ return localStorage.getItem('nuarr.caps')==='open'; }catch(e){ return false; }
+function capsShown(slot){
+  try{ return localStorage.getItem(_cs(slot).store)==='open'; }catch(e){ return false; }
 }
-function capsShow(on){
-  try{ localStorage.setItem('nuarr.caps', on?'open':'shut'); }catch(e){}
-  if(on && !_caps) capsLoad(); else capsPaint();
+function capsShow(on, slot){
+  const S=_cs(slot);
+  try{ localStorage.setItem(S.store, on?'open':'shut'); }catch(e){}
+  if(on && !S.caps) capsLoad(false, slot); else capsPaint(slot);
 }
-async function capsTaut(btn){
+async function capsTaut(btn, slot){
   if(btn) btn.disabled=true;
   try{ await fetch('/api/clientcaps/tautulli',{method:'POST'}); }catch(e){}
-  capsLoad(true);
+  capsLoad(true, slot);
 }
-async function capsLoad(force){
-  const el=document.getElementById('capsPanel');
-  if(!el){ if(_capsPoll) clearTimeout(_capsPoll); _capsPoll=null; return; }
-  if(!capsShown()&&!force&&!_caps){ capsPaint(); return; }
-  if(force||_capsSide!==_codSide||!_caps){
+async function capsLoad(force, slot){
+  const S=_cs(slot), want=S.sideOf();
+  const el=document.getElementById(S.panel);
+  if(!el){ if(S.poll) clearTimeout(S.poll); S.poll=null; return; }
+  if(!capsShown(slot)&&!force&&!S.caps){ capsPaint(slot); return; }
+  if(force||S.side!==want||!S.caps){
     // A SKELETON ONLY WHEN THERE IS NOTHING TO KEEP. Replacing a panel that is
     // already on screen with a grey placeholder every time it refreshes is the
     // flash; when there is something to look at, it stays and the button spins.
-    if(!_caps||_capsSide!==_codSide)
+    if(!S.caps||S.side!==want)
       el.innerHTML='<div class="skel" style="padding:12px"><i style="width:45%"></i>'
                   +'<i style="width:75%"></i></div>';
-    capsBusy(true);
-    try{ _caps=await (await fetch('/api/clientcaps?side='+_codSide)).json();
-         _capsSide=_codSide; }
-    catch(e){ capsBusy(false);
-              if(!_capsKey) el.innerHTML='<div class="dim">could not load the device list</div>';
+    capsBusy(true, slot);
+    try{ S.caps=await (await fetch('/api/clientcaps?side='+want)).json();
+         S.side=want; }
+    catch(e){ capsBusy(false, slot);
+              if(!S.key) el.innerHTML='<div class="dim">could not load the device list</div>';
               return; }
-    capsBusy(false);
+    capsBusy(false, slot);
   }
-  capsPaint();
+  capsPaint(slot);
   // WHILE THE IMPORT RUNS, keep asking. It walks thousands of history rows and
   // the count moving is the only sign it is alive.
-  if(_capsPoll) clearTimeout(_capsPoll);
-  if(((_caps||{}).tautulli||{}).running)
-    _capsPoll=setTimeout(()=>{ if(document.getElementById('capsPanel')) capsLoad(true); }, 1200);
+  if(S.poll) clearTimeout(S.poll);
+  if(((S.caps||{}).tautulli||{}).running)
+    S.poll=setTimeout(()=>{ if(document.getElementById(S.panel)) capsLoad(true, slot); }, 1200);
 }
-function capsToggle(k){
-  const opening=!_capsOpen.has(k);
-  opening ? _capsOpen.add(k) : _capsOpen.delete(k);
-  capsPaint();
-  if(opening) capsReveal(k);
+function capsToggle(k, slot){
+  const S=_cs(slot), opening=!S.open.has(k);
+  opening ? S.open.add(k) : S.open.delete(k);
+  capsPaint(slot);
+  if(opening) capsReveal(k, slot);
 }
 // Bring an opened device to the top of its own box, and the box onto the
 // screen. Measured off getBoundingClientRect rather than offsetTop, because
 // offsetTop is relative to the nearest POSITIONED ancestor and the list has
 // none - it would be right today and wrong the moment anything above it grows
 // a `position`.
-function capsReveal(k){
-  const el=document.getElementById('capsPanel'); if(!el) return;
+function capsReveal(k, slot){
+  const el=document.getElementById(_cs(slot).panel); if(!el) return;
   const box=el.querySelector('.capslist'); if(!box) return;
   const row=[...box.querySelectorAll('.capsrow')].find(x=>x.dataset.k===k);
   if(!row) return;
@@ -28802,31 +28832,35 @@ function capsReveal(k){
       box.scrollIntoView({block:'center', behavior:'smooth'});
   });
 }
-function capsPaint(){
-  const el=document.getElementById('capsPanel');
+function capsPaint(slot){
+  slot=slot||'cod';
+  const S=_cs(slot);
+  const el=document.getElementById(S.panel);
   if(!el) return;
-  const open=capsShown();
-  const word=_codSide==='video'?'video':'audio';
-  if(!open||!_caps){
+  const open=capsShown(slot);
+  const W=capsWords(S.sideOf());
+  const word=W.word;
+  if(!open||!S.caps){
     // SHUT, IT IS STILL A SENTENCE, not a mystery box. The headline is the
     // one number worth knowing before you decide to look.
-    const n=_caps?(_caps.devices||[]).filter(x=>Object.values(x.cells||{})
+    const n=S.caps?(S.caps.devices||[]).filter(x=>Object.values(x.cells||{})
              .some(c=>c.state==='bad')).length:null;
     const shut=`<div class="lkind capswrap">
-      <div class="lkindhead ckhead" onclick="capsShow(true)"
+      <div class="lkindhead ckhead" onclick="capsShow(true,'${slot}')"
            title="Check these settings against every device this server knows">
         <span class="ccaret">▸</span>
         <span class="clib">Will each device play this?</span>
         <span class="dim">${esc(word)} — per device, per library</span>
         <span class="dim" style="margin-left:auto">${
           n===null?'open to check'
-          :n?`<b class="cchg">${n} device${n===1?'':'s'} would transcode</b>`
-            :'<b style="color:var(--ok)">every device direct-plays it</b>'}</span>
+          :n?`<b class="cchg">${n} device${n===1?'':'s'} would ${
+             S.sideOf()==='subtitle'?'burn them in':'transcode'}</b>`
+            :`<b style="color:var(--ok)">every device ${esc(W.ok)}</b>`}</span>
       </div></div>`;
-    if(shut!==_capsKey){ _capsKey=shut; el.innerHTML=shut; }
+    if(shut!==S.key){ S.key=shut; el.innerHTML=shut; }
     return;
   }
-  const d=_caps, libs=d.libraries||[], side=d.side;
+  const d=S.caps, libs=d.libraries||[], side=d.side;
   const T=d.tautulli||{}, cs=d.caps||{};
   // SIXTY-SEVEN DEVICES IS A LIST, NOT AN ANSWER. Tautulli's history reaches
   // back years and includes every phone every guest has ever used, and a panel
@@ -28835,10 +28869,10 @@ function capsPaint(){
   // counted so nobody wonders whether they were dropped.
   const all=(d.devices||[]);
   const CAP=12;
-  const shown=_capsAll?all:all.slice(0,CAP);
+  const shown=S.all?all:all.slice(0,CAP);
   const hidden=all.length-shown.length;
   const rows=shown.map((dev,i)=>{
-    const key=dev.label+'|'+i, open=_capsOpen.has(key);
+    const key=dev.label+'|'+i, open=S.open.has(key);
     // THE WORST CELL DECIDES THE ROW. A device that direct-plays five
     // libraries and transcodes the sixth is a device with a problem, and a
     // summary that averaged it away would be worse than no summary.
@@ -28851,8 +28885,8 @@ function capsPaint(){
       title="${esc(libs.filter(L=>(dev.cells[L]||{}).state===cls)
         .map(L=>L+' — '+(dev.cells[L]||{}).text).join('\n'))}"
       ><b>${n}</b> ${esc(label)}</span>`:'';
-    const strip=byState(ok,'ok','direct play')+byState(warn,'warn','may transcode')
-               +byState(bad,'bad',bad===1?'transcodes':'transcode');
+    const strip=byState(ok,'ok',W.ok)+byState(warn,'warn',W.warn)
+               +byState(bad,'bad',bad===1?W.bad1:W.bad);
     const fmtList=(arr,label)=>!arr||!arr.length?'':`
       <div class="capsfmt"><b>${esc(label)}</b>${arr.map(f=>`
         <span class="capsc ${f.state}" title="${esc(f.why+' — '+f.src)}"
@@ -28861,7 +28895,7 @@ function capsPaint(){
             f.refused?' ✗'+f.refused:''}</em>`:''}</span>`).join('')}</div>`;
     const K=dev.known||{};
     return `<div class="capsrow${open?' open':''}" data-k="${esc(key)}">
-      <div class="capshead" onclick="capsToggle('${esc(key)}')">
+      <div class="capshead" onclick="capsToggle('${esc(key)}','${slot}')">
         <span class="ccaret">${open?'▾':'▸'}</span>
         <b>${esc(dev.label)}</b>
         ${dev.seen?`<span class="capsseen" title="This server has watched this device play or refuse something. What it saw beats the platform profile.">seen${
@@ -28870,7 +28904,7 @@ function capsPaint(){
         <span class="capsstrip">${strip}</span></div>
       ${open?`<div class="capsopen">
         <div class="capsnote">${esc(dev.note||'')}</div>
-        ${fmtList(K[side],'Plays '+(side==='video'?'video':'audio'))}
+        ${fmtList(K[side],W.plays)}
         <div class="capswhat">${libs.map(L=>{
           const c=dev.cells[L]||{codecs:[],state:'warn',text:''};
           return `<div class="capscl"><span class="capsdot ${c.state}"></span>
@@ -28901,22 +28935,31 @@ function capsPaint(){
         T.imported_to?`, up to session #${fmt(T.imported_to)}`:''} —
         managed on the <a href="#" onclick="wtab('tautulli');return false"
         >Tautulli page</a>.</span>`;
+  const intro = side==='subtitle'
+    ? `A subtitle a client will not render is not skipped — it is painted onto
+       the picture, which means the whole video is re-encoded to carry it. So
+       this is the one of the three panels where a wrong answer costs a full
+       transcode rather than a stream. SRT goes to everything; ASS and SSA are
+       styled text that most clients cannot draw, and image subtitles never
+       travel as text at all.`
+    : `Every setting above is a claim about somebody else's hardware. This
+       checks the claim: for each device, whether the ${esc(word)} formats
+       these libraries will hand it after nuarr is finished are ones it plays
+       untouched.`;
   const html=`<div class="lkind capswrap lopen">
-    <div class="lkindhead ckhead" onclick="capsShow(false)"
+    <div class="lkindhead ckhead" onclick="capsShow(false,'${slot}')"
          title="collapse this panel">
       <span class="ccaret">▾</span>
       <span class="clib">Will each device play this?</span>
-      <span class="dim">${esc(word)} only — the other tab answers the other half</span>
-      <span style="margin-left:auto"><button class="gapchk" id="capsRefresh"
+      <span class="dim">${esc(word)}${side==='subtitle'?''
+        :' only — the other tab answers the other half'}</span>
+      <span style="margin-left:auto"><button class="gapchk" id="${S.btn}"
         style="font-size:10.5px;padding:1px 8px"
-        onclick="event.stopPropagation();capsLoad(true)"
+        onclick="event.stopPropagation();capsLoad(true,'${slot}')"
         title="Re-read the device list and what this server has observed">Refresh</button></span></div>
     <div class="cfbody">
       <div class="capstaut">${taut}${T.error?`<span class="capserr">${esc(T.error)}</span>`:''}</div>
-      <div class="cfwhat dim" style="margin-bottom:8px">Every setting above is a
-        claim about somebody else's hardware. This checks the claim: for each
-        device, whether the ${esc(word)} formats these libraries will hand it
-        after nuarr is finished are ones it plays untouched. ${d.seen_any
+      <div class="cfwhat dim" style="margin-bottom:8px">${intro} ${d.seen_any
           ? 'Devices this server has watched come first and their rows are built '
            +'from what actually happened; the rest are typical platform profiles '
            +'until they play something.'
@@ -28924,22 +28967,22 @@ function capsPaint(){
            +'profile. The first session on a device replaces its row with what '
            +'really happened.'}</div>
       <div class="capsout dim">${libs.map(L=>`<span><b>${esc(L)}</b> → ${
-        esc(((d.outputs||{})[L]||{})[side].join(', '))}</span>`).join('')}</div>
+        esc((((d.outputs||{})[L]||{})[side]||[]).join(', '))}</span>`).join('')}</div>
       <div class="scrollbox auto capslist">${
         rows||'<div class="dim">no libraries configured</div>'}</div>
-      ${hidden>0?`<div class="capsmore"><a href="#" onclick="_capsAll=true;capsPaint();return false"
+      ${hidden>0?`<div class="capsmore"><a href="#" onclick="_cs('${slot}').all=true;capsPaint('${slot}');return false"
         >show ${fmt(hidden)} more device${hidden===1?'':'s'}</a>
         <span class="dim">— everything this server has ever seen, oldest last</span></div>`
-        :(_capsAll&&all.length>CAP?`<div class="capsmore"><a href="#"
-          onclick="_capsAll=false;capsPaint();return false">show fewer</a></div>`:'')}
-      <div class="capslegend dim"><span class="capsn ok"><b>n</b> direct play</span>
-        <span class="capsn warn"><b>n</b> may transcode</span>
-        <span class="capsn bad"><b>n</b> transcode</span>
+        :(S.all&&all.length>CAP?`<div class="capsmore"><a href="#"
+          onclick="_cs('${slot}').all=false;capsPaint('${slot}');return false">show fewer</a></div>`:'')}
+      <div class="capslegend dim"><span class="capsn ok"><b>n</b> ${esc(W.ok)}</span>
+        <span class="capsn warn"><b>n</b> ${esc(W.warn)}</span>
+        <span class="capsn bad"><b>n</b> ${esc(W.bad)}</span>
         <span>— how many of the ${libs.length} libraries land each way; hover
           for which, open a device for everything it plays</span></div>
     </div></div>`;
-  if(html===_capsKey) return;             // nothing moved; leave the DOM alone
-  _capsKey=html;
+  if(html===S.key) return;               // nothing moved; leave the DOM alone
+  S.key=html;
   const was=el.querySelector('.capslist');
   const keep=was?was.scrollTop:0;
   el.innerHTML=html;
