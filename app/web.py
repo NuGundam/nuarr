@@ -28318,7 +28318,38 @@ async function capsLoad(force){
   if(((_caps||{}).tautulli||{}).running)
     _capsPoll=setTimeout(()=>{ if(document.getElementById('capsPanel')) capsLoad(true); }, 1200);
 }
-function capsToggle(k){ _capsOpen.has(k)?_capsOpen.delete(k):_capsOpen.add(k); capsPaint(); }
+function capsToggle(k){
+  const opening=!_capsOpen.has(k);
+  opening ? _capsOpen.add(k) : _capsOpen.delete(k);
+  capsPaint();
+  if(opening) capsReveal(k);
+}
+// Bring an opened device to the top of its own box, and the box onto the
+// screen. Measured off getBoundingClientRect rather than offsetTop, because
+// offsetTop is relative to the nearest POSITIONED ancestor and the list has
+// none - it would be right today and wrong the moment anything above it grows
+// a `position`.
+function capsReveal(k){
+  const el=document.getElementById('capsPanel'); if(!el) return;
+  const box=el.querySelector('.capslist'); if(!box) return;
+  const row=[...box.querySelectorAll('.capsrow')].find(x=>x.dataset.k===k);
+  if(!row) return;
+  requestAnimationFrame(()=>{
+    const want=box.scrollTop
+             + (row.getBoundingClientRect().top - box.getBoundingClientRect().top);
+    box.scrollTo({top:Math.max(0,Math.min(want, box.scrollHeight-box.clientHeight)),
+                  behavior:'smooth'});
+    // AND THE BOX ITSELF MAY BE OFF SCREEN. On the audio page the panel sits
+    // under six libraries of settings, so the box can be half below the fold
+    // while its inner scroll is perfectly correct - the row is at the top of a
+    // box you cannot see, which reads as "nothing happened". Judged on the
+    // BOTTOM edge as well as the top: a box whose last hundred pixels are cut
+    // off is a box you would still have to scroll to read.
+    const r=box.getBoundingClientRect();
+    if(r.top < 0 || r.bottom > innerHeight - 8)
+      box.scrollIntoView({block:'center', behavior:'smooth'});
+  });
+}
 function capsPaint(){
   const el=document.getElementById('capsPanel');
   if(!el) return;
@@ -28377,7 +28408,7 @@ function capsPaint(){
           (f.played||f.refused)?`<em>${f.played?'✓'+f.played:''}${
             f.refused?' ✗'+f.refused:''}</em>`:''}</span>`).join('')}</div>`;
     const K=dev.known||{};
-    return `<div class="capsrow${open?' open':''}">
+    return `<div class="capsrow${open?' open':''}" data-k="${esc(key)}">
       <div class="capshead" onclick="capsToggle('${esc(key)}')">
         <span class="ccaret">${open?'▾':'▸'}</span>
         <b>${esc(dev.label)}</b>
@@ -28457,7 +28488,13 @@ function capsPaint(){
     </div></div>`;
   if(html===_capsKey) return;             // nothing moved; leave the DOM alone
   _capsKey=html;
+  const was=el.querySelector('.capslist');
+  const keep=was?was.scrollTop:0;
   el.innerHTML=html;
+  if(keep){
+    const box=el.querySelector('.capslist');
+    if(box) box.scrollTop=keep;
+  }
 }
 
 function codecSet(lib,side,key,val,on){
