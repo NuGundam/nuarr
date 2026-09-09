@@ -162,6 +162,15 @@ LANES = 6
 # somebody watching Plex, are the workers full - and the pass STOPS the moment
 # it goes true. A sweep that yields inside a second is allowed to be greedy
 # while nothing else wants the disks.
+# HOW MANY DISMISSALS IN ONE SERIES BEFORE THE SERIES IS THE ANSWER. Two, not
+# one: a single false positive is a file, and the same false positive twice in
+# the same show is a property of how that show was encoded.
+SERIES_IGNORES = 2
+# And how many separate dismissals a word has to appear in before it is taken
+# as OCR noise rather than language. Also two, for the same reason - one bad
+# read can produce any word at all.
+GARBAGE_MIN = 2
+
 PER_RUN = 90
 CYCLE_S = 300
 SETTLE_S = 600
@@ -207,6 +216,20 @@ def init() -> None:
             )""")
         cur.execute("CREATE INDEX IF NOT EXISTS ix_hardsub_state "
                     "ON hardsub(state)")
+        # WHAT A DISMISSAL IS WORTH KEEPING. Not just "hide this row" - the
+        # words that produced it, and which series it belongs to, because both
+        # are the evidence for not making the same mistake again.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS hardsub_ignored(
+                file_id INTEGER PRIMARY KEY,
+                path    TEXT,
+                series  TEXT,
+                state   TEXT,
+                words   TEXT,
+                at      REAL
+            )""")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_hsig_series "
+                    "ON hardsub_ignored(series)")
     _READY = True
 
 
@@ -359,13 +382,30 @@ def probe_one(file_id: int, samples: int = SAMPLES,
     uniq = sorted(set(words))
     speech = _FUNCTION & set(uniq)
     credits = _CREDITS & set(uniq)
+    # WHAT HAS ALREADY BEEN THROWN AWAY. Both halves: this exact file, and the
+    # show it belongs to once two of its episodes have been dismissed.
+    junk = garbage_words() & set(uniq)
+    seen_before = (int(file_id) in ignored_ids()
+                   or _series_of(path) in ignored_series())
+    # A read that is mostly words somebody has already rejected is that same
+    # read again. Judged as a fraction rather than a flat count, because a long
+    # correct read will always pick up one or two.
+    mostly_junk = bool(uniq) and len(junk) >= max(2, len(uniq) * 0.5)
     confirmed = (text_frames >= MIN_TEXT_FRAMES
                  and sum(len(w) for w in uniq) >= MIN_CHARS
-                 and bool(speech) and not credits)
+                 and bool(speech) and not credits
+                 and not seen_before and not mostly_junk)
 
     if not confirmed:
         state = NONE
-        if credits:
+        if seen_before:
+            why = ("you have marked this one - or two others in this series - "
+                   "as not hardsubbed, so it is left alone")
+        elif mostly_junk:
+            why = (f"most of what was read ({', '.join(sorted(junk)[:4])}) "
+                   f"matches words from findings you threw away, so this is "
+                   f"the same bad read again rather than dialogue")
+        elif credits:
             why = (f"the words read are a credit roll "
                    f"({', '.join(sorted(credits)[:3])}), not speech")
         elif uniq and not speech:
@@ -417,6 +457,121 @@ def _save(d: dict) -> None:
                  ", ".join(d.get("words") or []), d["detail"][:400]))
     except Exception:                                            # noqa: BLE001
         pass
+
+
+def _series_of(path: str) -> str:
+    """The show folder - two up from the file, which is the season's parent."""
+    try:
+        return os.path.basename(os.path.dirname(os.path.dirname(path))) or ""
+    except Exception:                                            # noqa: BLE001
+        return ""
+
+
+def ignore(file_id: int, undo: bool = False) -> dict:
+    r"""Say this finding is wrong, and keep why.
+
+    THE ROW IS THE SMALLEST PART OF WHAT THIS DOES. Dismissing one Dexter's
+    Laboratory episode helps once; the reason it was wrong - an OCR read that
+    produced `bagel, cong, egle, ene, fli, gol, wie` and got past the
+    function-word filter on the strength of "yes" - is true of every episode of
+    that show and of every show encoded like it. So the words are kept and the
+    series is counted, and both feed back into the next verdict.
+    """
+    if not _READY:
+        init()
+    with cursor() as cur:
+        r = cur.execute("SELECT path, state, words FROM hardsub "
+                        "WHERE file_id=?", (int(file_id),)).fetchone()
+        if undo:
+            cur.execute("DELETE FROM hardsub_ignored WHERE file_id=?",
+                        (int(file_id),))
+            return {"ok": True, "why": "no longer ignored"}
+        if not r:
+            return {"ok": False, "why": "no verdict recorded for that file"}
+        cur.execute(
+            "INSERT INTO hardsub_ignored(file_id,path,series,state,words,at) "
+            "VALUES(?,?,?,?,?,?) ON CONFLICT(file_id) DO UPDATE SET "
+            "  words=excluded.words, at=excluded.at",
+            (int(file_id), r["path"], _series_of(r["path"] or ""),
+             r["state"], r["words"] or "", time.time()))
+    n = _series_count(_series_of(r["path"] or ""))
+    return {"ok": True, "series": _series_of(r["path"] or ""),
+            "series_ignores": n,
+            "why": ("ignored" if n < SERIES_IGNORES else
+                    f"ignored - and that is {n} in this series, so the whole "
+                    f"show is now left alone")}
+
+
+def _series_count(series: str) -> int:
+    if not series:
+        return 0
+    try:
+        with cursor() as cur:
+            r = cur.execute("SELECT COUNT(*) n FROM hardsub_ignored "
+                            "WHERE series=?", (series,)).fetchone()
+        return int(r["n"] or 0)
+    except Exception:                                            # noqa: BLE001
+        return 0
+
+
+_GARB: dict = {"at": 0.0, "words": set()}
+_GARB_TTL = 120.0
+
+
+def garbage_words() -> set:
+    r"""Words that have only ever appeared in findings somebody threw away.
+
+    A NEGATIVE DICTIONARY, BUILT FROM BEING WRONG. There is no English word
+    list here to check against - so the next best thing is the list of words
+    this check has produced and been told were not language. A word seen in two
+    separate dismissals and never in a finding that was kept is, on this
+    library, noise.
+    """
+    now = time.time()
+    if now - _GARB["at"] < _GARB_TTL:
+        return _GARB["words"]
+    bad: dict = {}
+    keep: set = set()
+    try:
+        with cursor() as cur:
+            for r in cur.execute("SELECT words FROM hardsub_ignored"):
+                for w in (r["words"] or "").split(","):
+                    w = w.strip().lower()
+                    if w:
+                        bad[w] = bad.get(w, 0) + 1
+            for r in cur.execute(
+                    "SELECT h.words FROM hardsub h "
+                    " WHERE h.state != ? AND NOT EXISTS "
+                    "   (SELECT 1 FROM hardsub_ignored i "
+                    "     WHERE i.file_id = h.file_id)", (NONE,)):
+                for w in (r["words"] or "").split(","):
+                    w = w.strip().lower()
+                    if w:
+                        keep.add(w)
+    except Exception:                                            # noqa: BLE001
+        return _GARB["words"]
+    got = {w for w, n in bad.items() if n >= GARBAGE_MIN and w not in keep}
+    _GARB.update(at=now, words=got)
+    return got
+
+
+def ignored_ids() -> set:
+    try:
+        with cursor() as cur:
+            return {r["file_id"] for r in
+                    cur.execute("SELECT file_id FROM hardsub_ignored")}
+    except Exception:                                            # noqa: BLE001
+        return set()
+
+
+def ignored_series() -> set:
+    try:
+        with cursor() as cur:
+            return {r["series"] for r in cur.execute(
+                "SELECT series FROM hardsub_ignored WHERE series != '' "
+                "GROUP BY series HAVING COUNT(*) >= ?", (SERIES_IGNORES,))}
+    except Exception:                                            # noqa: BLE001
+        return set()
 
 
 def _size(p: str) -> int:
@@ -638,6 +793,9 @@ def stats() -> dict:
     each = STATE.get("secs_each") or 0.0
     out = {"running": STATE["running"], "now": STATE["now"],
            "yielded": STATE.get("yielded") or "",
+           "ignored": len(ignored_ids()),
+           "ignored_series": sorted(ignored_series())[:20],
+           "garbage": len(garbage_words()),
            "done": STATE["done"], "total": STATE["total"],
            "last_run": STATE["last_run"], "untested": left,
            "elapsed": round(elapsed, 1), "rate": round(rate, 3),
@@ -694,6 +852,8 @@ def found(limit: int = 60) -> list:
                 "       h.words, h.detail, h.marked, f.library "
                 "  FROM hardsub h JOIN files f ON f.id = h.file_id "
                 " WHERE h.state != ? AND f.state NOT IN ('deleted','duplicate') "
+                "   AND NOT EXISTS (SELECT 1 FROM hardsub_ignored i "
+                "                    WHERE i.file_id = h.file_id) "
                 " ORDER BY h.at DESC LIMIT ?", (NONE, int(limit)))]
     except Exception:                                            # noqa: BLE001
         return []

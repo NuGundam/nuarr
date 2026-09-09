@@ -6691,6 +6691,34 @@ async def api_audiolang_fix(file_id: int, track: int):
                                    int(track))
 
 
+@app.get("/api/audiolang/backlog")
+def api_audiolang_backlog():
+    """How much has never been listened to, and how long the rest will take.
+
+    Deliberately NOT /progress, which already exists and reports the pass in
+    flight. That one answers "is it moving"; this one answers "how far from
+    done", and on a library where 38,337 tracks have never been read the
+    second is the question that decides whether any of it can be trusted yet.
+    """
+    from . import audiolang
+    left = audiolang.unverified_count()
+    prog = audiolang.progress()
+    each = 0.0
+    try:
+        span = (prog.get("finished_at") or 0) - (prog.get("started_at") or 0)
+        if span > 0 and (prog.get("done") or 0) > 0:
+            each = span / prog["done"]
+    except Exception:                                    # noqa: BLE001
+        each = 0.0
+    return {"progress": prog, "unverified": left,
+            "gaps": audiolang.pending_count(),
+            "queued": audiolang.queue_count(),
+            "secs_each": round(each, 2),
+            "eta": round(left * each) if (left and each) else 0,
+            "mismatches": len(audiolang.mismatches(500)),
+            "usable": audiolang.usable()}
+
+
 @app.get("/api/hardsub")
 def api_hardsub(limit: int = 40):
     """Files whose subtitles are burned into the picture."""
@@ -6714,6 +6742,13 @@ async def api_hardsub_check(file_id: int):
     if d.get("ok"):
         await asyncio.to_thread(hardsub._save, d)
     return d
+
+
+@app.post("/api/hardsub/ignore")
+async def api_hardsub_ignore(file_id: int, undo: int = 0):
+    """Say a finding is wrong - and keep the words that made it wrong."""
+    from . import hardsub
+    return await asyncio.to_thread(hardsub.ignore, int(file_id), bool(undo))
 
 
 @app.post("/api/hardsub/mark")
@@ -22153,6 +22188,7 @@ function wtab(which){
     return;
   }
   if(which==='alang'){
+    loadAlangProg();
     if(hint) hint.textContent='· audio language';
     paneLoad('alang', loadAlang);
     langAudioPolicy();          // the policy card above the measurements
@@ -29022,6 +29058,60 @@ function capsShow(on, slot){
   try{ localStorage.setItem(S.store, on?'open':'shut'); }catch(e){}
   if(on && !S.caps) capsLoad(false, slot); else capsPaint(slot);
 }
+// ---- how far the listening has got --------------------------------------
+let _alp=null, _alpKey='', _alpPoll=null;
+async function loadAlangProg(){
+  const el=document.getElementById('alBacklog'); if(!el) return;
+  try{ _alp=await (await fetch('/api/audiolang/backlog')).json(); }
+  catch(e){ return; }
+  alpPaint();
+}
+function alpPaint(){
+  const el=document.getElementById('alBacklog'); if(!el||!_alp) return;
+  const d=_alp, p=d.progress||{};
+  const running = p.state && p.state!=='idle';
+  const pct = p.total ? Math.min(100,(p.done/p.total)*100) : 0;
+  // THE BACKLOG IS THE HEADLINE, not the batch. 39,161 tracks nobody has
+  // listened to is the fact that decides whether any of this is worth
+  // believing yet; "12 of 400" is only interesting while it is moving.
+  const head=`<b style="color:#6fb0ff">Is the audio what it says it is?</b>
+    <span class="dim" style="font-size:11.5px">${
+      d.unverified?`${fmt(d.unverified)} track${d.unverified===1?'':'s'} carry a
+        tag nobody has checked`:'every tagged track has been listened to'}${
+      d.gaps?` · ${fmt(d.gaps)} with no tag at all`:''}${
+      d.queued?` · <span style="color:var(--acc)" title="Files that landed recently jump the queue - they are the ones somebody is about to watch, and the ones whose release can still usefully be blocklisted.">${
+        fmt(d.queued)} just landed</span>`:''}${
+      d.mismatches?` · <span style="color:var(--bad)">${fmt(d.mismatches)} tagged
+        a language they are not</span>`:''}</span>`;
+  const bar = running ? `
+    <div class="hsbar"><i style="width:${pct.toFixed(1)}%"></i></div>
+    <div style="display:flex;gap:10px;align-items:baseline;font-size:11px;
+                margin:3px 0 4px;flex-wrap:wrap">
+      <span class="busy" style="color:var(--acc);flex:none"><span class="sp"></span></span>
+      <b style="flex:none">${fmt(p.done||0)} of ${fmt(p.total||0)}</b>
+      <span class="dim" style="flex:1 1 auto;min-width:0;overflow:hidden;
+            text-overflow:ellipsis;white-space:nowrap"
+            title="${esc(p.current||'')}">${esc(p.state||'')} ${esc(p.current||'')}</span>
+      <span class="dim" style="flex:none">${fmt(p.found||0)} heard${
+        p.applied?` · ${fmt(p.applied)} tagged`:''}${
+        p.refused?` · ${fmt(p.refused)} unclear`:''}</span>
+    </div>` : '';
+  const foot=`<div class="dim" style="font-size:11px;margin:4px 0 2px;
+      display:flex;gap:12px;flex-wrap:wrap">
+    ${d.usable?'':'<span class="err">Whisper cannot run here, so nothing can be listened to.</span>'}
+    ${d.secs_each?`<span title="Measured on the last completed pass">${
+      d.secs_each.toFixed(1)}s a track</span>`:''}
+    ${(d.unverified&&d.eta)?`<span title="How long until every tagged track has been listened to once, at the pace the last pass achieved. After that it is only new files, which are checked as they land.">
+      <b>${hsDur(d.eta)}</b> to listen to the rest</span>`:''}
+    ${p.finished_at?`<span>last pass ${ago(p.finished_at)}</span>`:''}
+    ${p.error?`<span class="err">${esc(p.error)}</span>`:''}
+  </div>`;
+  const html=`<div class="lkind" style="padding:11px 12px">${head}${bar}${foot}</div>`;
+  if(html!==_alpKey){ _alpKey=html; el.innerHTML=html; }
+  clearTimeout(_alpPoll);
+  if(running) _alpPoll=setTimeout(()=>{ if(document.getElementById('alBacklog')) loadAlangProg(); }, 1500);
+}
+
 // ---- subtitles already painted into the picture -------------------------
 let _hs=null, _hsKey='', _hsPoll=null;
 const HSW={dialogue:['dialogue','var(--bad)'], hybrid:['dialogue + signs','var(--bad)'],
@@ -29042,7 +29132,12 @@ function hsPaint(){
       (d.dialogue||d.hybrid)?` · <span style="color:var(--bad)">${
         fmt((d.dialogue||0)+(d.hybrid||0))} carrying dialogue</span>`:''}${
       d.signs?` · ${fmt(d.signs)} signs only`:''}${
-      d.marked?` · ${fmt(d.marked)} marked`:''}</span>
+      d.marked?` · ${fmt(d.marked)} marked`:''}${
+      d.ignored?` · <span title="Findings you said were not subtitles. The words behind them are now checked against every new read.">${
+        fmt(d.ignored)} ignored${d.garbage?`, ${fmt(d.garbage)} words learned`:''}</span>`:''}${
+      (d.ignored_series&&d.ignored_series.length)?` · <span title="${
+        esc(d.ignored_series.join('\n'))}">${d.ignored_series.length} show${
+        d.ignored_series.length===1?'':'s'} left alone</span>`:''}</span>
     <span style="float:right"><button class="rmb" onclick="hsRun(this)" ${
       d.running?'disabled':''}>${d.running?'looking…':'Check some now'}</button></span>`;
   const note=`<div class="dim" style="font-size:11px;margin:3px 0 6px">
@@ -29114,7 +29209,9 @@ function hsPaint(){
         <td style="padding:3px 0;white-space:nowrap">${r.marked
           ? '<span class="dim" title="This file already carries the blank English track.">marked</span>'
           : `<button class="rmb" onclick="hsMark(${r.file_id},this)"
-              title="Add a blank English subtitle track — one silent cue, default and forced cleared, named so the picker explains itself. Bazarr and Plex then see a subtitle exists and stop asking for one, and nothing is ever drawn over the words already in the picture.">Mark it</button>`}</td>
+              title="Add a blank English subtitle track — one silent cue, default and forced cleared, named so the picker explains itself. Bazarr and Plex then see a subtitle exists and stop asking for one, and nothing is ever drawn over the words already in the picture.">Mark it</button>
+             <button class="rmb" onclick="hsIgnore(${r.file_id},this)"
+              title="This is not a burned-in subtitle. The row goes away, and so does the reason: the words behind it join a list of reads that were wrong, and two dismissals in one series leave that whole show alone. The same mistake stops arriving rather than needing dismissing one file at a time.">Not a subtitle</button>`}</td>
       </tr>`;}).join('')}</tbody></table>`
     : `<div class="dim" style="font-size:11.5px">${
         tested?'Nothing checked so far is carrying subtitles in the picture.'
@@ -29144,6 +29241,21 @@ async function hsRun(btn){
   if(btn){ btn.disabled=true; btn.textContent='looking…'; }
   try{ await fetch('/api/hardsub/run',{method:'POST'}); }catch(e){}
   loadHardsub();
+}
+async function hsIgnore(fid, btn){
+  // NO CONFIRMATION. Nothing is written to a file and nothing is deleted -
+  // it is a verdict being withdrawn, and it can be withdrawn again from the
+  // ignored list. A dialog here would be ceremony around a reversible act.
+  if(btn){ btn.disabled=true; btn.textContent='learning…'; }
+  let r={};
+  try{ r=await (await fetch('/api/hardsub/ignore?file_id='+fid,
+                            {method:'POST'})).json(); }
+  catch(e){ r={ok:false, why:String(e)}; }
+  if(btn){
+    btn.textContent = r.ok?'ignored':'failed';
+    if(r.ok && r.why) btn.title=r.why;
+  }
+  setTimeout(loadHardsub, 1200);
 }
 async function hsMark(fid, btn){
   askInline(btn,

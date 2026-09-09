@@ -1484,6 +1484,100 @@ def pending(limit: int = 5000) -> list[dict]:
     return out
 
 
+# FRESHLY LANDED FILES GO FIRST.
+#
+# unverified() walks the library oldest-id-last and hands back whatever it
+# finds; on a backlog of 39,161 that means a file committed this evening waits
+# behind twenty thousand that have been sitting there for months. The one that
+# just landed is the one somebody is about to watch, and the one whose release
+# is still fresh enough to blocklist usefully.
+#
+# Kept in a table rather than memory because the gap between "landed" and
+# "listened to" spans restarts by design - the sweep runs on its own clock.
+_JUMP_READY = False
+
+
+def _jump_init() -> None:
+    global _JUMP_READY
+    with cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS audio_lang_queue(
+                file_id INTEGER PRIMARY KEY,
+                at      REAL NOT NULL
+            )""")
+    _JUMP_READY = True
+
+
+def queue_check(file_id: int) -> None:
+    """Ask for this file to be listened to next. Cheap; never listens here."""
+    try:
+        if not _JUMP_READY:
+            _jump_init()
+        with cursor() as cur:
+            cur.execute("INSERT INTO audio_lang_queue(file_id,at) VALUES(?,?) "
+                        "ON CONFLICT(file_id) DO UPDATE SET at=excluded.at",
+                        (int(file_id), time.time()))
+    except Exception:                                    # noqa: BLE001
+        pass
+
+
+def queued(limit: int = 200) -> list[dict]:
+    """The jump queue, oldest request first, as pending()-shaped rows."""
+    out: list[dict] = []
+    try:
+        if not _JUMP_READY:
+            _jump_init()
+        ensure_table()
+        with cursor() as cur:
+            have = {(r["file_id"], r["track"]): r for r in
+                    cur.execute("SELECT * FROM audio_lang").fetchall()}
+            rows = cur.execute(
+                "SELECT f.id, f.path, f.title, f.season, f.episode, f.library, "
+                "       f.audio_langs "
+                "  FROM audio_lang_queue q JOIN files f ON f.id = q.file_id "
+                " WHERE f.state = 'done' AND COALESCE(f.audio_langs,'') != '' "
+                " ORDER BY q.at LIMIT ?", (int(limit),)).fetchall()
+    except Exception:                                    # noqa: BLE001
+        return out
+    for r in rows:
+        codes = (r["audio_langs"] or "").split(",")
+        for ai, raw_code in enumerate(codes):
+            prev = have.get((r["id"], ai))
+            if prev is not None and row_fresh(prev, r["path"]):
+                continue
+            out.append({"file_id": r["id"], "path": r["path"], "track": ai,
+                        "title": r["title"] or "", "season": r["season"],
+                        "episode": r["episode"], "library": r["library"] or "",
+                        "tagged": (raw_code or "").strip().strip("-"),
+                        "jumped": True,
+                        "n_audio": len(codes)})
+    return out
+
+
+def unqueue(file_ids) -> None:
+    try:
+        ids = [int(x) for x in file_ids]
+        if not ids:
+            return
+        qs = ",".join("?" * len(ids))
+        with cursor() as cur:
+            cur.execute(f"DELETE FROM audio_lang_queue WHERE file_id IN ({qs})",
+                        ids)
+    except Exception:                                    # noqa: BLE001
+        pass
+
+
+def queue_count() -> int:
+    try:
+        if not _JUMP_READY:
+            _jump_init()
+        with cursor() as cur:
+            r = cur.execute("SELECT COUNT(*) n FROM audio_lang_queue").fetchone()
+        return int(r["n"] or 0)
+    except Exception:                                    # noqa: BLE001
+        return 0
+
+
 def unverified(limit: int = 5000) -> list[dict]:
     r"""Tracks that CARRY a tag nobody has ever checked against the audio.
 
@@ -1821,7 +1915,14 @@ def run_once(limit: int = 400, apply: bool = True,
     """
     from . import joblog
     pending_invalidate()
-    todo = pending(limit)
+    # THREE POPULATIONS NOW, AND FRESH BEATS EVERYTHING. A file that landed an
+    # hour ago is the one somebody is about to watch and the one whose release
+    # can still usefully be blocklisted; a file from March has waited this long
+    # and can wait for the next pass.
+    todo = queued(limit)
+    jumped = len(todo)
+    if len(todo) < limit:
+        todo += pending(limit - len(todo))
     gaps = len(todo)
     if verify and len(todo) < limit:
         todo += unverified(limit - len(todo))
@@ -1833,8 +1934,8 @@ def run_once(limit: int = 400, apply: bool = True,
         return {"checked": 0, "found": 0, "applied": 0}
 
     joblog.log(f"audio language: {len(todo)} track(s) to listen to "
-               f"({gaps} with no tag, {len(todo) - gaps} to verify)",
-               "info", system="audiolang")
+               f"({jumped} just landed, {gaps - jumped} with no tag, "
+               f"{len(todo) - gaps} to verify)", "info", system="audiolang")
     by_file: dict[int, dict] = {}
     for i, t in enumerate(todo, 1):
         # The title, not the release name - this string is shown on the Job
@@ -1883,6 +1984,9 @@ def run_once(limit: int = 400, apply: bool = True,
     if done_ids:
         PROGRESS["state"] = "telling the arrs"
         told = notify_arrs(done_ids)
+    # Whatever was asked for has now been answered, right or wrong - leaving
+    # it queued would mean listening to the same file every pass forever.
+    unqueue({t["file_id"] for t in todo if t.get("jumped")})
     PROGRESS.update(state="idle", finished_at=time.time(), current="")
     pending_invalidate()
     unload()                       # give the VRAM back; the GPU is for encoding

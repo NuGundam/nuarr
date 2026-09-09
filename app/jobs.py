@@ -863,6 +863,17 @@ def cache_probe(file_id: int, data: dict) -> None:
         _rm.reconsider(file_id, data)
     except Exception:                                        # noqa: BLE001
         pass
+    # AND WHETHER THE AUDIO IS WHAT IT SAYS IT IS. Parked, not listened to:
+    # Whisper is seven seconds a track and store_probe is called from inside
+    # the commit path, where seven seconds a file is seven seconds nobody
+    # asked for. audiolang's own sweep drains the queue on its own clock; all
+    # this does is put a freshly-landed file at the front of it, so a lie
+    # arrives with the file rather than whenever a sweep of 39,000 reaches it.
+    try:
+        from . import audiolang as _alg
+        _alg.queue_check(file_id)
+    except Exception:                                        # noqa: BLE001
+        pass
     # A NEW PROBE MEANS A NEW FILE, AND TRACK NUMBERS MOVE WHEN TRACKS ARE
     # DROPPED. Any language verdict recorded against the old layout now points
     # at a different track, so it is deleted rather than left to rot: seven
