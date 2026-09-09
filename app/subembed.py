@@ -519,6 +519,40 @@ def stats() -> dict:
     return out
 
 
+# THE WHOLE LIBRARY, COUNTED ONCE AND REMEMBERED.
+#
+# A panel showing twelve of something and no total is a panel that cannot be
+# acted on: twelve out of what? The full walk is one listdir per file across
+# 20,000 rows - seconds, not minutes, because the folders are already in the
+# OS cache after the first pass - but it is far too slow to do on every poll of
+# a settings page. So it is computed on demand and kept.
+_SUM: dict = {"at": 0.0, "data": None}
+_SUM_TTL = 600.0
+
+
+def summary(force_refresh: bool = False) -> dict:
+    """How many files across the library have a sidecar worth taking."""
+    now = time.time()
+    if (not force_refresh and _SUM["data"] is not None
+            and now - _SUM["at"] < _SUM_TTL):
+        return dict(_SUM["data"])
+    got = candidates(limit=100000, force=True)
+    by_lib: dict = {}
+    files = subs = 0
+    for p in got:
+        lib = p.get("library") or "?"
+        e = by_lib.setdefault(lib, {"files": 0, "subs": 0,
+                                    "on": enabled(lib)})
+        e["files"] += 1
+        e["subs"] += len(p.get("take") or [])
+        files += 1
+        subs += len(p.get("take") or [])
+    d = {"files": files, "subs": subs, "by_library": by_lib,
+         "at": now, "took": round(time.time() - now, 1)}
+    _SUM.update(at=now, data=d)
+    return dict(d)
+
+
 def preview(limit: int = 25, force: bool = True) -> dict:
     """What this would do, without doing any of it. Works while the rule is off."""
     got = candidates(int(limit), force=force)

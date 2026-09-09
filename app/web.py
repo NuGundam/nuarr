@@ -6731,14 +6731,29 @@ async def api_hardsub_mark(file_id: int, confirm: str = ""):
 
 
 @app.get("/api/subembed")
-def api_subembed(preview: int = 12):
-    """What the sidecar-embed rule has done, and what it would do next."""
+def api_subembed(preview: int = 12, full: int = 0, refresh: int = 0):
+    """What the sidecar-embed rule has done, and what it would do next.
+
+    `full` asks for the whole library rather than a sample. The count always
+    comes back - a panel showing twelve of something and no total cannot be
+    acted on - but the rows only when somebody has opened the panel, because
+    the walk is one listdir per file across twenty thousand of them.
+    """
     from . import subembed
     d = subembed.stats()
+    # THE WHOLE LIBRARY MEANS THE WHOLE LIBRARY. 3,878 rows inside a scroll
+    # box is a long list; 600 of 3,878 with no way to see the rest is a
+    # different thing, and the one somebody would have to work around.
+    n = max(0, min(int(preview), 6000 if full else 60))
     try:
-        d["preview"] = subembed.preview(max(0, min(int(preview), 60)))["files"]
+        d["preview"] = subembed.preview(n)["files"]
     except Exception as e:                                   # noqa: BLE001
         d["preview"], d["preview_error"] = [], f"{type(e).__name__}: {e}"
+    try:
+        d["summary"] = subembed.summary(force_refresh=bool(refresh))
+    except Exception as e:                                   # noqa: BLE001
+        d["summary"] = {"files": 0, "subs": 0, "by_library": {},
+                        "error": f"{type(e).__name__}: {e}"}
     return d
 
 
@@ -29052,31 +29067,78 @@ async function hsMark(fid, btn){
 
 // ---- sidecar subtitles waiting to come inside ---------------------------
 let _se=null, _seKey='';
-async function loadSubEmbed(){
+// SHUT BY DEFAULT, LIKE EVERY OTHER LONG LIST ON THIS PAGE. The headline count
+// is the thing worth seeing without asking; thirteen thousand rows are not.
+// Remembered per browser so opening it once does not mean opening it forever.
+function seShown(){
+  try{ return localStorage.getItem('nuarr.subembed')==='open'; }
+  catch(e){ return false; }
+}
+function seShow(on){
+  try{ localStorage.setItem('nuarr.subembed', on?'open':'shut'); }catch(e){}
+  if(on && !(_se&&_se.preview&&_se.preview.length>12)) loadSubEmbed(true);
+  else sePaint();
+}
+async function loadSubEmbed(full){
   const el=document.getElementById('sePanel'); if(!el) return;
-  try{ _se=await (await fetch('/api/subembed?preview=12')).json(); }
+  const want = (full||seShown()) ? '&preview=6000&full=1' : '&preview=12';
+  try{ _se=await (await fetch('/api/subembed?x=1'+want)).json(); }
   catch(e){ el.innerHTML='<span class="dim">could not load</span>'; return; }
   sePaint();
 }
 function sePaint(){
   const el=document.getElementById('sePanel'); if(!el||!_se) return;
   const d=_se, pv=d.preview||[];
+  const sum=d.summary||{files:0,subs:0,by_library:{}};
   const on=Object.entries(d.libraries||{}).filter(([,v])=>v).map(([k])=>k);
+  const open=seShown();
+  if(!open){
+    // SHUT IS STILL A SENTENCE. The count and where it lives, which is the
+    // whole reason to open it.
+    const libs=Object.entries(sum.by_library||{})
+      .sort((a,b)=>b[1].files-a[1].files).slice(0,4)
+      .map(([k,v])=>`${esc(k)} ${fmt(v.files)}`).join(' · ');
+    const shut=`<div class="lkind capswrap">
+      <div class="lkindhead ckhead" onclick="seShow(true)"
+           title="Every file in the library with a subtitle sitting beside it that these rules would take in">
+        <span class="ccaret">▸</span>
+        <span class="clib">Subtitle files sitting next to a video</span>
+        <span class="dim">${on.length?`on for ${esc(on.join(', '))}`
+                                     :'off everywhere'}</span>
+        <span class="dim" style="margin-left:auto">${
+          sum.files?`<b class="cchg">${fmt(sum.files)} file${
+            sum.files===1?'':'s'}</b>${sum.subs!==sum.files?` · ${
+            fmt(sum.subs)} subtitles`:''}${libs?` <span style="opacity:.7">— ${
+            libs}</span>`:''}`
+          :'<b style="color:var(--ok)">no sidecars to take in</b>'}</span>
+      </div></div>`;
+    if(shut!==_seKey){ _seKey=shut; el.innerHTML=shut; }
+    return;
+  }
   const takes=pv.reduce((n,f)=>n+(f.take||[]).length,0);
   // THE NUMBER IS THE HEADLINE AND THE SWITCH IS ELSEWHERE. The rule lives in
   // the list above with every other subtitle rule; putting a second control
   // here would be two switches for one setting, which can only disagree.
-  const head=`<b style="color:#6fb0ff">Subtitle files sitting next to a video</b>
+  const head=`<div class="lkindhead ckhead" onclick="seShow(false)"
+      style="cursor:pointer" title="collapse this panel">
+    <span class="ccaret">▾</span>
+    <b style="color:#6fb0ff">Subtitle files sitting next to a video</b>
     <span class="dim" style="font-size:11.5px">${
       on.length?`on for ${esc(on.join(', '))}`
                :'off everywhere — the rule is in the list above'}${
       d.embedded?` · ${fmt(d.embedded)} taken in so far`:''}${
-      d.failed?` · <span style="color:var(--bad)">${fmt(d.failed)} failed</span>`:''}</span>`;
+      d.failed?` · <span style="color:var(--bad)">${fmt(d.failed)} failed</span>`:''}</span>
+    <span class="dim" style="margin-left:auto">${fmt(sum.files||0)} file${
+      (sum.files||0)===1?'':'s'} · ${fmt(sum.subs||0)} subtitle${
+      (sum.subs||0)===1?'':'s'}${pv.length<(sum.files||0)?` · showing ${
+      fmt(pv.length)}`:''}</span>
+  </div>`;
   const warn = !d.have_mkvmerge
     ? `<div class="err" style="font-size:11px;margin:4px 0">mkvmerge is not
        installed, so nothing can be embedded. It ships with MKVToolNix — see
        the MKVToolNix page under Tools.</div>` : '';
-  const rows = pv.length ? `<table style="width:100%;font-size:11.5px;margin-top:4px">
+  const rows = pv.length ? `<div class="scrollbox auto"><table
+      style="width:100%;font-size:11.5px;margin-top:4px">
       <colgroup><col style="width:48%"><col style="width:14%">
         <col style="width:26%"><col style="width:12%"></colgroup>
       <tbody>${pv.map(f=>`<tr>
@@ -29093,7 +29155,7 @@ function sePaint(){
           f.on?`<button class="rmb" onclick="seOne(${f.file_id},this)"
              title="Remux this one now: mkvmerge copies the streams into a new container with the subtitle added, then the sidecar is recycled.">Take it in</button>`
              :`<span class="dim" title="The rule is off for this library, so this is a preview only.">rule off</span>`}</td>
-      </tr>`).join('')}</tbody></table>`
+      </tr>`).join('')}</tbody></table></div>`
     : `<div class="dim" style="font-size:11.5px;margin-top:4px">${
         d.have_mkvmerge?'No sidecar found that this library would keep and the file does not already have.'
                        :''}</div>`;
