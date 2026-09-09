@@ -14730,6 +14730,13 @@ function attnPaint(){
         ${go.goto?`<a href="${esc(go.goto)}" style="font-size:11px">open the ${esc(src)} page →</a>`
                  :`<a href="#" style="font-size:11px" onclick="document.getElementById('attnPanel').style.display='none';drill({errors:1,t:'Errors'});return false">open the errors list →</a>`}
       </div>`;
+    if(src==='file errors'){
+      // The count and the door. The drill behind it is the view.
+      h+=`<div style="padding:2px 14px 10px 26px" class="dim" style="font-size:11.5px">
+        ${list.length} file${list.length===1?'':'s'} failed — the errors list
+        has the message, the size, the disk, when it happened and a filter.</div>`;
+      continue;
+    }
     for(const it of list){
       // THE FIX, WHERE THE PROBLEM IS. A .iso that failed its job also shows
       // up under "audio language" (it has no tracks to have a language), and
@@ -14740,7 +14747,7 @@ function attnPaint(){
       const act = it.refetch_kind==='content' && it.id
         ? `<button class="refetch" style="margin-left:10px;font-size:10.5px;padding:1px 7px"
                    title="${esc(it.refetch_why||'reject the release this came from and ask the arr for another')}"
-                   onclick="refetchAsk(${it.id}, true)">Blocklist &amp; re-download</button>` : '';
+                   onclick="refetchAsk(${it.id}, true, this)">Blocklist &amp; re-download</button>` : '';
       h+=`<div style="padding:3px 14px 6px 26px">
         <div style="font-size:12px;display:flex;align-items:center;flex-wrap:wrap">${esc(it.title||it.path||'(unnamed)')}${act}</div>
         ${it.detail?`<div class="${it.refetch_kind==='content'?'':'dim'}" style="font-size:11px${it.refetch_kind==='content'?';color:var(--warn)':''}">${esc(it.detail)}</div>`:''}
@@ -14962,7 +14969,7 @@ async function drillRefresh(force){
         const rk = r.refetch_kind;
         const act = rk==='content'
           ? `<button class="refetch" title="reject the release this came from and ask the arr for another"
-                     onclick="refetchAsk(${r.id})">Blocklist &amp; re-download</button>`
+                     onclick="refetchAsk(${r.id}, false, this)">Blocklist &amp; re-download</button>`
           : (rk && r.refetch_why
               ? `<div class="dim sub">fix: ${esc(r.refetch_why)}</div>` : '');
         // WHY, with the class of reason coloured differently: an error is
@@ -15113,38 +15120,71 @@ async function adoptNow(id){
   drillRefresh(true); loadAll();
 }
 
-async function refetchAsk(id, fromAttn){
+async function refetchAsk(id, fromAttn, btn){
+  // THE WHOLE CONVERSATION, IN THE ROW. This asked in three modal steps - one
+  // alert to explain, one confirm to agree, one alert to report - so the most
+  // consequential button in nuarr was also the one whose answer arrived
+  // furthest from where it was pressed. All of it happens here now: the plan,
+  // the question, the spinner and the outcome, in the space the button
+  // occupied.
+  btn = btn || (window.event && window.event.target) || null;
+  const host = btn ? (btn.closest('td, .askhost') || btn.parentElement) : null;
+  const put = html => { if(host) host.innerHTML = html; };
+  if(!host) return;
+  if(host.dataset.asking === '1') return;
+  host.dataset.asking = '1';
+  const prev = host.innerHTML;
+  put('<span class="busy" style="color:var(--acc)"><span class="sp"></span>'
+     +'<span class="step">asking the arr what would happen…</span></span>');
+
   let p;
   try{ p = await (await fetch(`/api/files/${id}/refetch`)).json(); }
-  catch(e){ return alert('could not reach the arr: '+e); }
-
+  catch(err){
+    host.dataset.asking='';
+    return put(`<span class="err" style="font-size:11px">could not reach the arr: ${esc(String(err))}</span>`);
+  }
   if(!p.ok && !p.can_search){
-    return alert(`Cannot re-download this file.\n\n${p.why||''}` +
-                 (p.remedy?`\n\nWhat would fix it:\n${p.remedy}`:''));
+    host.dataset.asking='';
+    return put(`<span class="err" style="font-size:11px">${esc(p.why||'cannot re-download this file')}`
+      + (p.remedy?` — <span class="dim">${esc(p.remedy)}</span>`:'') + '</span>');
   }
+  // WHAT IS ABOUT TO HAPPEN, IN FULL. A modal could only ever be text; this
+  // can carry the release name, the indexer and the size as separate readable
+  // lines, which is what somebody is actually checking before they agree.
   const gb = p.size ? (p.size/1073741824).toFixed(2)+' GB' : 'unknown size';
-  let msg = `${p.title||''}\n${gb}\n\nWhy this is offered:\n  ${p.explain||''}\n\n`;
-  if(p.grab_id){
-    msg += `This will BLOCKLIST the release:\n  ${p.release||'(unnamed)'}\n`
-         + `  via ${p.indexer||'unknown indexer'}\n\n`
-         + `${p.arr} will then search for a replacement.\n`;
-  }else{
-    msg += `There is no grab record to blocklist.\n\n`
-         + `${p.arr} will delete the file and search again.\n`;
-  }
-  if(p.warning) msg += `\nWARNING\n  ${p.warning}\n`;
-  msg += `\nThe file is deleted. This cannot be undone from nuarr.\n\nProceed?`;
-  if(!confirm(msg)) return;
-
-  const r = await (await fetch(`/api/files/${id}/refetch?confirm=${id}`,
-                               {method:'POST'})).json();
-  alert(r.ok ? 'Done:\n\n  ' + (r.did||[]).join('\n  ')
-             : 'Failed:\n\n' + (r.why||'unknown')
-               + ((r.did&&r.did.length)?'\n\nbut this had already happened:\n  '
-                  + r.did.join('\n  '):''));
-  if(fromAttn){ loadAttention(true); }
-  else drillRefresh(true);
-  loadAll();                       // the Errors tile count has just changed
+  const lines = [];
+  if(p.explain) lines.push(esc(p.explain));
+  lines.push(p.grab_id
+    ? `Blocklists <b>${esc(p.release||'(unnamed release)')}</b>`
+      + (p.indexer?` via ${esc(p.indexer)}`:'')
+      + `, then ${esc(p.arr||'the arr')} searches again.`
+    : `No grab record to blocklist — ${esc(p.arr||'the arr')} deletes the file and searches again.`);
+  if(p.warning) lines.push(`<span style="color:var(--warn)">${esc(p.warning)}</span>`);
+  lines.push(`<b>${esc(gb)} is deleted. This cannot be undone from nuarr.</b>`);
+  put(`<span class="askrow">
+      <span class="askmsg">${lines.join('<br>')}</span>
+      <button class="rmb bad" data-y>Yes, blocklist it</button>
+      <button class="rmb" data-n>Cancel</button></span>`);
+  host.querySelector('[data-n]').onclick = ev => {
+    ev.stopPropagation(); host.dataset.asking=''; host.innerHTML = prev;
+  };
+  host.querySelector('[data-y]').onclick = async ev => {
+    ev.stopPropagation();
+    put('<span class="busy" style="color:var(--acc)"><span class="sp"></span>'
+       +'<span class="step">blocklisting and searching…</span></span>');
+    let r = {};
+    try{
+      r = await (await fetch(`/api/files/${id}/refetch?confirm=${id}`,
+                             {method:'POST'})).json();
+    }catch(err){ r = {ok:false, why:String(err)}; }
+    host.dataset.asking='';
+    put(r.ok
+      ? `<span style="color:var(--ok);font-size:11px">${esc((r.did||[]).join('; ')||'done')}</span>`
+      : `<span class="err" style="font-size:11px">${esc(r.why||'failed')}`
+        + ((r.did&&r.did.length)?` <span class="dim">(already done: ${esc(r.did.join('; '))})</span>`:'')
+        + '</span>');
+    setTimeout(()=>{ if(fromAttn) loadAttention(true); else drillRefresh(true); }, 1500);
+  };
 }
 
 async function loadLibs(){
@@ -17192,21 +17232,29 @@ async function auDetail(id){
 }
 
 async function auReplace(id){
-  if(!confirm('Blocklist this release and ask the arr for a different one?\\n\\n'
-    +'The file is deleted as part of this. It is the right fix only when the '
-    +'audio is in a language this library does not keep - no re-encode can '
-    +'change what language the words are in.')) return;
+  // This one already had a box of its own to answer in - it just asked the
+  // question somewhere else. Now both happen in the same place.
   const box=document.getElementById('auact'+id);
-  if(box) box.innerHTML='<span class="busy"><span class="sp"></span>'
-    +'<span class="step">blocklisting and searching…</span></span>';
-  try{
-    const r=await (await fetch('/api/audit/replace?file_id='+encodeURIComponent(id),
-      {method:'POST'})).json();
-    if(box) box.innerHTML = r.ok
-      ? '<span style="color:var(--ok)">'+esc((r.did||[]).join('; '))+'</span>'
-      : '<span class="err">'+esc(r.why||'failed')+'</span>';
-  }catch(e){ if(box) box.textContent='failed'; }
-  setTimeout(loadAudit, 1200);
+  if(!box) return;
+  box.innerHTML=`<span class="askrow">
+    <span class="askmsg">Blocklist the release and delete this file? Right only
+      when the audio is in a language this library does not keep — no re-encode
+      changes what language the words are in.</span>
+    <button class="rmb bad" data-y>Yes, replace it</button>
+    <button class="rmb" data-n>Cancel</button></span>`;
+  box.querySelector('[data-n]').onclick=()=>{ box.innerHTML=''; };
+  box.querySelector('[data-y]').onclick=async ()=>{
+    box.innerHTML='<span class="busy" style="color:var(--acc)"><span class="sp"></span>'
+      +'<span class="step">blocklisting and searching…</span></span>';
+    try{
+      const r=await (await fetch('/api/audit/replace?file_id='+encodeURIComponent(id),
+        {method:'POST'})).json();
+      box.innerHTML = r.ok
+        ? '<span style="color:var(--ok)">'+esc((r.did||[]).join('; '))+'</span>'
+        : '<span class="err">'+esc(r.why||'failed')+'</span>';
+    }catch(e){ box.textContent='failed'; }
+    setTimeout(loadAudit, 1200);
+  };
 }
 
 async function loadAudit(){
@@ -17613,6 +17661,45 @@ async function auClearHeal(fid){
 // repaints with the right colour, the right pill, and the right button - and
 // an unfixable file drops into the standing-gaps list where it belongs.
 const _auFix = {};
+// ---- asking, without leaving the page -----------------------------------
+//
+// A browser confirm() is a modal: it freezes the tab, it cannot show what is
+// about to happen in any more detail than one string, and the answer arrives
+// somewhere the eye is not. Every destructive button here sits in a row that
+// already has space beneath it, so the question is asked THERE - and the
+// progress and the result land in the same place, which is where somebody is
+// already looking.
+//
+// The previous markup is kept and restored on Cancel. It has to be: these
+// buttons carry inline onclick attributes, so putting the HTML back puts the
+// handlers back with it.
+function askInline(btn, msg, yesLabel, run){
+  if(!btn) return;
+  const host=btn.closest('td, .askhost') || btn.parentElement;
+  if(!host || host.dataset.asking==='1') return;
+  const prev=host.innerHTML;
+  host.dataset.asking='1';
+  host.innerHTML=`<span class="askrow">
+    <span class="askmsg">${esc(msg)}</span>
+    <button class="rmb bad" data-y>${esc(yesLabel)}</button>
+    <button class="rmb" data-n>Cancel</button></span>`;
+  const done=html=>{ host.innerHTML=html; };
+  host.querySelector('[data-n]').onclick=e=>{
+    e.stopPropagation(); host.dataset.asking=''; host.innerHTML=prev;
+  };
+  host.querySelector('[data-y]').onclick=async e=>{
+    e.stopPropagation();
+    done('<span class="busy" style="color:var(--acc)"><span class="sp"></span>'
+        +'<span class="step">working…</span></span>');
+    let r={};
+    try{ r=await run(); }catch(err){ r={ok:false, why:String(err)}; }
+    host.dataset.asking='';
+    done(r&&r.ok
+      ? `<span style="color:var(--ok);font-size:11px">${esc(r.why||'done')}</span>`
+      : `<span class="err" style="font-size:11px">${esc((r&&r.why)||'failed')}</span>`);
+  };
+}
+
 // ---- the two remedies, one control -------------------------------------
 // The POLICY comes from the server once and is cached: which findings may be
 // requeued, which may be replaced, and the sentence explaining each refusal.
@@ -17692,31 +17779,39 @@ async function rmRepair(system, btn){
   if(!r.ok && (r.why||r.error)) alert(r.why||r.error);
   return r;
 }
+function rmCall(action, fid, kind, source){
+  return fetch(`/api/remedy/${action}?file_id=${fid}`
+    +`&kind=${encodeURIComponent(kind)}&source=${encodeURIComponent(source)}`
+    +(action==='replace'?'&confirm=yes':''),{method:'POST'})
+      .then(r=>r.json());
+}
 async function rmDo(action, fid, kind, source, btn){
-  // THE DESTRUCTIVE ONE ASKS. Not because a misclick is likely on any one
-  // card, but because this control is now on seven of them, and "reachable
-  // everywhere" must not quietly become "fires from everywhere".
+  // THE DESTRUCTIVE ONE ASKS, IN THE ROW IT LIVES IN. Not because a misclick
+  // is likely on any one card, but because this control is now on seven of
+  // them, and "reachable everywhere" must not quietly become "fires from
+  // everywhere".
   if(action==='replace'){
     const p=(_RMPOL||{})[kind]||{};
-    if(!confirm('Blocklist this release and ask the arr for a different one?'
-        +'\n\nThis deletes the file on disk.\n\n'+(p.why||'')))
-      return;
+    askInline(btn, 'Blocklist the release and delete this file? '+(p.why||''),
+              'Yes, replace it', ()=>rmCall(action, fid, kind, source));
+    return;
   }
   const was=btn?btn.textContent:'';
   if(btn){ btn.classList.add('spin'); btn.textContent='working…'; }
   let r={};
-  try{
-    r=await (await fetch(`/api/remedy/${action}?file_id=${fid}`
-      +`&kind=${encodeURIComponent(kind)}&source=${encodeURIComponent(source)}`
-      +(action==='replace'?'&confirm=yes':''),{method:'POST'})).json();
-  }catch(e){ r={ok:false, why:String(e)}; }
+  try{ r=await rmCall(action, fid, kind, source); }
+  catch(e){ r={ok:false, why:String(e)}; }
   if(btn){
     btn.classList.remove('spin');
     btn.textContent = r.ok
       ? (action==='replace'?'replaced':action==='reask'?'asked':'queued') : was;
     if(r.ok) btn.disabled=true;
+    else if(r.why){ btn.title=r.why;
+      const h=btn.closest('td')||btn.parentElement;
+      if(h) h.insertAdjacentHTML('beforeend',
+        `<div class="err" style="font-size:10.5px;margin-top:2px">${esc(r.why)}</div>`);
+    }
   }
-  if(!r.ok && (r.why||r.error)) alert(r.why||r.error);
   return r;
 }
 
@@ -29051,18 +29146,16 @@ async function hsRun(btn){
   loadHardsub();
 }
 async function hsMark(fid, btn){
-  if(!confirm('Add a blank English subtitle track to this file?\n\nIt is a '
-     +'stream copy, so nothing is re-encoded. The track holds one silent cue '
-     +'and is never selected automatically — it exists so Bazarr and Plex stop '
-     +'reporting the file as having no subtitles.')) return;
-  if(btn){ btn.disabled=true; btn.textContent='working…'; }
-  let r={};
-  try{ r=await (await fetch('/api/hardsub/mark?file_id='+fid+'&confirm=yes',
-                            {method:'POST'})).json(); }
-  catch(e){ r={ok:false, why:String(e)}; }
-  if(btn) btn.textContent = r.ok?'marked':'failed';
-  if(!r.ok && r.why) alert(r.why);
-  setTimeout(loadHardsub, 800);
+  askInline(btn,
+    'Add a blank English track? Stream copy, nothing re-encoded, never '
+    +'auto-selected — it exists so Bazarr and Plex stop reporting no subtitles.',
+    'Yes, mark it',
+    async ()=>{
+      const r=await (await fetch('/api/hardsub/mark?file_id='+fid+'&confirm=yes',
+                                 {method:'POST'})).json();
+      setTimeout(loadHardsub, 1500);
+      return r.ok ? {ok:true, why:'marked'} : r;
+    });
 }
 
 // ---- sidecar subtitles waiting to come inside ---------------------------
@@ -29081,6 +29174,19 @@ function seShow(on){
 }
 async function loadSubEmbed(full){
   const el=document.getElementById('sePanel'); if(!el) return;
+  // A SIXTY-SECOND WALK WITH NO SIGN OF LIFE READS AS A BROKEN PANEL. The
+  // first open has to list every folder in the library, and until it answers
+  // the panel had nothing on it at all. Same skeleton every other slow panel
+  // here uses, and only when there is nothing already drawn to keep.
+  if(!_se) el.innerHTML='<div class="skel" style="padding:12px">'
+    +'<i style="width:52%"></i><i style="width:78%"></i><i style="width:64%"></i></div>';
+  else if(full||seShown()){
+    const h=el.querySelector('.lkindhead');
+    if(h && !h.querySelector('.sp'))
+      h.insertAdjacentHTML('beforeend',
+        '<span class="busy" style="margin-left:8px;color:var(--acc)">'
+       +'<span class="sp"></span></span>');
+  }
   const want = (full||seShown()) ? '&preview=6000&full=1' : '&preview=12';
   try{ _se=await (await fetch('/api/subembed?x=1'+want)).json(); }
   catch(e){ el.innerHTML='<span class="dim">could not load</span>'; return; }
@@ -32181,6 +32287,11 @@ html.mobile .setwrap:not(.rail) .setmain,html.mobile .setwrap:not(.rail) #worker
   border-radius:9px;padding:0 7px;cursor:help;white-space:nowrap}
 /* A REAL BAR, not a barber pole. The width is the fraction actually done, so
    a stalled pass looks stalled instead of looking busy forever. */
+/* THE QUESTION, WHERE THE BUTTON WAS. Wraps rather than clipping, because
+   the explanation is the point and a truncated warning is worse than none. */
+.askrow{display:inline-flex;gap:7px;align-items:center;flex-wrap:wrap;
+  max-width:520px}
+.askmsg{font-size:10.5px;color:var(--warn);line-height:1.35}
 .hsbar{height:4px;border-radius:3px;background:#161a20;overflow:hidden;
   margin:6px 0 0}
 .hsbar i{display:block;height:100%;border-radius:3px;background:var(--acc);

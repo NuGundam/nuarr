@@ -528,6 +528,23 @@ def stats() -> dict:
 # a settings page. So it is computed on demand and kept.
 _SUM: dict = {"at": 0.0, "data": None}
 _SUM_TTL = 600.0
+# ONE WALK, TWO READERS. The count was cached and the ROWS were not, so opening
+# the panel re-walked twenty thousand folders on every poll - sixty seconds a
+# time, which is why the skeleton never cleared. Both come off the same cached
+# list now; the walk happens once and everything else is a slice of it.
+_WALK: dict = {"at": 0.0, "rows": None, "took": 0.0}
+
+
+def walk(force_refresh: bool = False) -> list:
+    """Every file with a sidecar worth taking. Cached - see _SUM_TTL."""
+    now = time.time()
+    if (not force_refresh and _WALK["rows"] is not None
+            and now - _WALK["at"] < _SUM_TTL):
+        return _WALK["rows"]
+    t0 = time.time()
+    rows = candidates(limit=100000, force=True)
+    _WALK.update(at=time.time(), rows=rows, took=round(time.time() - t0, 1))
+    return rows
 
 
 def summary(force_refresh: bool = False) -> dict:
@@ -536,7 +553,7 @@ def summary(force_refresh: bool = False) -> dict:
     if (not force_refresh and _SUM["data"] is not None
             and now - _SUM["at"] < _SUM_TTL):
         return dict(_SUM["data"])
-    got = candidates(limit=100000, force=True)
+    got = walk(force_refresh)
     by_lib: dict = {}
     files = subs = 0
     for p in got:
@@ -548,14 +565,21 @@ def summary(force_refresh: bool = False) -> dict:
         files += 1
         subs += len(p.get("take") or [])
     d = {"files": files, "subs": subs, "by_library": by_lib,
-         "at": now, "took": round(time.time() - now, 1)}
+         "at": now, "took": _WALK.get("took") or 0.0}
     _SUM.update(at=now, data=d)
     return dict(d)
 
 
 def preview(limit: int = 25, force: bool = True) -> dict:
-    """What this would do, without doing any of it. Works while the rule is off."""
-    got = candidates(int(limit), force=force)
+    """What this would do, without doing any of it. Works while the rule is off.
+
+    A SLICE OF THE CACHED WALK, not a walk of its own. `force` is kept for the
+    signature's sake and is what the walk already does - there is no cheaper
+    partial version, because deciding whether a file qualifies means listing
+    its folder either way.
+    """
+    _ = force
+    got = walk()[:max(0, int(limit))]
     return {"ok": True, "files": [
         {"file_id": p["file_id"], "path": p["path"], "library": p["library"],
          "on": enabled(p["library"]),
