@@ -437,7 +437,8 @@ def embed_one(file_id: int) -> dict:
 
 
 # ------------------------------------------------------------- the sweep ----
-def candidates(limit: int = 200, force: bool = False) -> list[dict]:
+def candidates(limit: int = 200, force: bool = False,
+               on_progress=None) -> list[dict]:
     """Files with a sidecar worth taking.
 
     `force` widens it to every library rather than the enabled ones, which is
@@ -461,9 +462,19 @@ def candidates(limit: int = 200, force: bool = False) -> list[dict]:
             f"   AND COALESCE(mtime,0) < ? "
             f" ORDER BY id LIMIT 20000", libs + [cutoff])]
     out = []
-    for r in rows:
+    total = len(rows)
+    for i, r in enumerate(rows, 1):
         if len(out) >= limit:
             break
+        # WHERE THE MINUTE GOES, REPORTED WHILE IT GOES. One listdir per file
+        # across twenty thousand of them is a minute nobody can be asked to
+        # stare at a spinner through - and the loop knows exactly how far it
+        # is, so there is no reason to guess.
+        if on_progress is not None and (i % 25 == 0 or i == total):
+            try:
+                on_progress(i, total, len(out))
+            except Exception:                                # noqa: BLE001
+                pass
         if not sidecars_for(r["path"]):
             continue                       # cheap listdir, no probe, no policy
         p = plan_one(r["id"], force=force)
@@ -532,19 +543,65 @@ _SUM_TTL = 600.0
 # the panel re-walked twenty thousand folders on every poll - sixty seconds a
 # time, which is why the skeleton never cleared. Both come off the same cached
 # list now; the walk happens once and everything else is a slice of it.
-_WALK: dict = {"at": 0.0, "rows": None, "took": 0.0}
+_WALK: dict = {"at": 0.0, "rows": None, "took": 0.0, "running": False,
+               "done": 0, "total": 0, "found": 0, "t0": 0.0}
+_WALK_LOCK = None
+
+
+def _walk_now(force: bool) -> None:
+    """The walk itself, on a thread, updating _WALK as it goes."""
+    t0 = time.time()
+    _WALK.update(running=True, done=0, total=0, found=0, t0=t0)
+
+    def tick(done, total, found):
+        _WALK.update(done=done, total=total, found=found)
+    try:
+        rows = candidates(limit=100000, force=True, on_progress=tick)
+        _WALK.update(at=time.time(), rows=rows,
+                     took=round(time.time() - t0, 1), found=len(rows))
+    except Exception:                                            # noqa: BLE001
+        pass
+    finally:
+        _WALK["running"] = False
 
 
 def walk(force_refresh: bool = False) -> list:
-    """Every file with a sidecar worth taking. Cached - see _SUM_TTL."""
+    r"""Every file with a sidecar worth taking.
+
+    NEVER BLOCKS THE REQUEST. The first walk is a minute of listdir and the
+    panel that wants it polls every couple of seconds; holding the connection
+    open for that is how the skeleton ends up looking like a hang. So the walk
+    happens on a thread, the last good answer is served in the meantime, and
+    walk_state() carries how far it has got so the panel can draw it.
+    """
+    global _WALK_LOCK
     now = time.time()
-    if (not force_refresh and _WALK["rows"] is not None
-            and now - _WALK["at"] < _SUM_TTL):
+    fresh = (_WALK["rows"] is not None and now - _WALK["at"] < _SUM_TTL)
+    if fresh and not force_refresh:
         return _WALK["rows"]
-    t0 = time.time()
-    rows = candidates(limit=100000, force=True)
-    _WALK.update(at=time.time(), rows=rows, took=round(time.time() - t0, 1))
-    return rows
+    if not _WALK["running"]:
+        import threading
+        if _WALK_LOCK is None:
+            _WALK_LOCK = threading.Lock()
+        with _WALK_LOCK:
+            if not _WALK["running"]:
+                _WALK["running"] = True     # claimed before the thread starts
+                threading.Thread(target=_walk_now, args=(force_refresh,),
+                                 daemon=True).start()
+    return _WALK["rows"] or []
+
+
+def walk_state() -> dict:
+    """How far the walk has got, and how long the rest of it will take."""
+    d = dict(_WALK)
+    d.pop("rows", None)
+    el = (time.time() - _WALK["t0"]) if (_WALK["running"] and _WALK["t0"]) else 0
+    rate = (_WALK["done"] / el) if (el > 0.5 and _WALK["done"]) else 0.0
+    d["elapsed"] = round(el, 1)
+    d["rate"] = round(rate, 1)
+    d["eta"] = round((_WALK["total"] - _WALK["done"]) / rate) if rate else 0
+    d["have_rows"] = _WALK["rows"] is not None
+    return d
 
 
 def summary(force_refresh: bool = False) -> dict:
@@ -554,6 +611,12 @@ def summary(force_refresh: bool = False) -> dict:
             and now - _SUM["at"] < _SUM_TTL):
         return dict(_SUM["data"])
     got = walk(force_refresh)
+    if not got and _WALK["running"]:
+        # Nothing to count yet. Say so rather than reporting a zero that reads
+        # as "no sidecars anywhere".
+        d = dict(_SUM["data"] or {"files": 0, "subs": 0, "by_library": {}})
+        d["pending"] = True
+        return d
     by_lib: dict = {}
     files = subs = 0
     for p in got:

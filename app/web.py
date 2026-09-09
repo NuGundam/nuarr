@@ -6789,6 +6789,10 @@ def api_subembed(preview: int = 12, full: int = 0, refresh: int = 0):
     except Exception as e:                                   # noqa: BLE001
         d["summary"] = {"files": 0, "subs": 0, "by_library": {},
                         "error": f"{type(e).__name__}: {e}"}
+    try:
+        d["walk"] = subembed.walk_state()
+    except Exception:                                        # noqa: BLE001
+        d["walk"] = {}
     return d
 
 
@@ -29271,7 +29275,29 @@ async function hsMark(fid, btn){
 }
 
 // ---- sidecar subtitles waiting to come inside ---------------------------
-let _se=null, _seKey='';
+let _se=null, _seKey='', _sePoll=null;
+// The waiting state, with as much of a measurement as exists yet.
+function seWaitHtml(w){
+  w = w || {};
+  const pct = w.total ? Math.min(100,(w.done/w.total)*100) : 0;
+  return `<div class="lkind" style="padding:11px 12px">
+    <b style="color:#6fb0ff">Subtitle files sitting next to a video</b>
+    <span class="dim" style="font-size:11.5px">looking through every folder in
+      the library — one listing per file, so it takes about a minute the first
+      time and is then remembered for ten</span>
+    <div class="hsbar"><i style="width:${pct.toFixed(1)}%"></i></div>
+    <div style="display:flex;gap:10px;align-items:baseline;font-size:11px;
+                margin:4px 0 0;flex-wrap:wrap">
+      <span class="busy" style="color:var(--acc);flex:none"><span class="sp"></span></span>
+      <b style="flex:none">${w.total?`${fmt(w.done||0)} of ${fmt(w.total)}`:'starting…'}</b>
+      ${w.found?`<span class="dim">${fmt(w.found)} found so far</span>`:''}
+      <span style="margin-left:auto;display:flex;gap:10px">
+        ${w.rate?`<span class="dim">${fmt(Math.round(w.rate))} files/s</span>`:''}
+        ${w.eta?`<b style="color:var(--acc)">${hsDur(w.eta)} left</b>`:''}
+      </span>
+    </div>
+  </div>`;
+}
 // SHUT BY DEFAULT, LIKE EVERY OTHER LONG LIST ON THIS PAGE. The headline count
 // is the thing worth seeing without asking; thirteen thousand rows are not.
 // Remembered per browser so opening it once does not mean opening it forever.
@@ -29290,15 +29316,10 @@ async function loadSubEmbed(full){
   // first open has to list every folder in the library, and until it answers
   // the panel had nothing on it at all. Same skeleton every other slow panel
   // here uses, and only when there is nothing already drawn to keep.
-  if(!_se) el.innerHTML='<div class="skel" style="padding:12px">'
-    +'<i style="width:52%"></i><i style="width:78%"></i><i style="width:64%"></i></div>';
-  else if(full||seShown()){
-    const h=el.querySelector('.lkindhead');
-    if(h && !h.querySelector('.sp'))
-      h.insertAdjacentHTML('beforeend',
-        '<span class="busy" style="margin-left:8px;color:var(--acc)">'
-       +'<span class="sp"></span></span>');
-  }
+  // A BAR, NOT A SHRUG. The walk knows how many files it has left to list,
+  // so the wait can be a measured one - and a skeleton that sits for a minute
+  // is indistinguishable from a panel that has died.
+  if(!_se) el.innerHTML=seWaitHtml(null);
   const want = (full||seShown()) ? '&preview=6000&full=1' : '&preview=12';
   try{ _se=await (await fetch('/api/subembed?x=1'+want)).json(); }
   catch(e){ el.innerHTML='<span class="dim">could not load</span>'; return; }
@@ -29307,6 +29328,22 @@ async function loadSubEmbed(full){
 function sePaint(){
   const el=document.getElementById('sePanel'); if(!el||!_se) return;
   const d=_se, pv=d.preview||[];
+  const w=d.walk||{};
+  // WHILE THE FIRST WALK RUNS there is no count to lead with, so the panel is
+  // the progress of the thing that will produce one.
+  if(w.running && !(d.summary&&d.summary.files)){
+    const html=seWaitHtml(w);
+    if(html!==_seKey){ _seKey=html; el.innerHTML=html; }
+    clearTimeout(_sePoll);
+    _sePoll=setTimeout(()=>{ if(document.getElementById('sePanel')) loadSubEmbed(); }, 1500);
+    return;
+  }
+  if(w.running){
+    // A refresh behind an answer that is already on screen: keep the answer,
+    // put the bar in the header.
+    clearTimeout(_sePoll);
+    _sePoll=setTimeout(()=>{ if(document.getElementById('sePanel')) loadSubEmbed(); }, 2000);
+  }
   const sum=d.summary||{files:0,subs:0,by_library:{}};
   const on=Object.entries(d.libraries||{}).filter(([,v])=>v).map(([k])=>k);
   const open=seShown();
