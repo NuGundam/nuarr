@@ -667,12 +667,20 @@ KNOWN: list[dict] = [
      "note": "Uses the OS audio path, so what it accepts depends on the "
              "output device: the same app takes E-AC3 to an HDMI receiver and "
              "refuses it to laptop speakers. This server has watched it "
-             "refuse E-AC3 and ask for Opus instead.",
+             "refuse E-AC3 and ask for Opus instead. Subtitles are the "
+             "opposite story: the desktop app renders through mpv, which has "
+             "libass built in, so it draws ASS, SSA and picture subtitles "
+             "itself rather than asking the server to burn them. Plex's HTPC "
+             "settings page says so sideways - the subtitle styling options "
+             "there explicitly do not affect ASS/SSA or image subtitles, "
+             "because those carry their own styling and the player is the "
+             "thing drawing them. Confirmed here by watching ass, ssa and "
+             "PGS all direct-play on this laptop.",
      "video": {"h264": Y, "hevc": Y, "vp9": Y, "av1": V, "mpeg4": V, "vc1": V},
      "audio": {"aac": Y, "mp3": Y, "opus": Y, "flac": Y,
                "ac3": V, "eac3": V, "dts": V, "truehd": V},
-     "subtitle": {"srt": Y, "webvtt": Y, "mov_text": Y, "ass": V, "ssa": V,
-                  "pgs": N, "vobsub": N}},
+     "subtitle": {"srt": Y, "webvtt": Y, "mov_text": Y, "ass": Y, "ssa": Y,
+                  "pgs": Y, "vobsub": V}},
     {"id": "appletv", "label": "Apple TV",
      "match": r"apple ?tv",
      "note": "A fixed platform, so this list is unusually reliable. Dolby "
@@ -705,17 +713,34 @@ KNOWN: list[dict] = [
     {"id": "samsung", "label": "Samsung TV (Tizen)",
      "match": r"samsung|tizen",
      "note": "Built-in TV app. HEVC and the Dolby formats are usual; DTS was "
-             "dropped from many 2018-and-later sets.",
+             "dropped from many 2018-and-later sets. Plex lists PGS support "
+             "for Tizen 3 and above, but only on UHD sets - so a picture "
+             "subtitle is a maybe here rather than a flat no.",
      "video": {"h264": Y, "hevc": Y, "vp9": V, "av1": V, "mpeg4": V, "vc1": V},
      "audio": {"aac": Y, "mp3": Y, "ac3": Y, "eac3": Y,
                "flac": V, "opus": V, "dts": N, "truehd": V},
      "subtitle": {"srt": Y, "webvtt": V, "mov_text": V, "ass": N, "ssa": N,
-                  "pgs": N, "vobsub": N}},
+                  "pgs": V, "vobsub": N}},
     {"id": "lg", "label": "LG TV (webOS)",
      "match": r"\blg\b|webos",
-     "note": "Built-in TV app, much like the Samsung one.",
+     "note": "Built-in TV app, much like the Samsung one. Plex lists PGS "
+             "support for webOS 4 and above on UHD sets, so picture "
+             "subtitles are a maybe rather than a no.",
      "video": {"h264": Y, "hevc": Y, "vp9": Y, "av1": V, "mpeg4": V, "vc1": V},
      "audio": {"aac": Y, "mp3": Y, "ac3": Y, "eac3": Y,
+               "flac": V, "opus": V, "dts": V, "truehd": V},
+     "subtitle": {"srt": Y, "webvtt": V, "mov_text": V, "ass": N, "ssa": N,
+                  "pgs": V, "vobsub": N}},
+    {"id": "smarttv", "label": "Plex for Smart TVs (the manufacturer's app)",
+     "match": r"smart ?tv",
+     "note": "Plex's own build for televisions that are not Android TV, "
+             "running on whatever decoder the manufacturer exposes. Plex "
+             "describes the baseline as MP4 / H.264 / AAC and says anything "
+             "else is direct-streamed or transcoded, which makes it the most "
+             "limited client on this list. This server has watched one burn "
+             "a plain SRT twice.",
+     "video": {"h264": Y, "hevc": V, "vp9": V, "av1": N, "mpeg4": V, "vc1": V},
+     "audio": {"aac": Y, "mp3": Y, "ac3": V, "eac3": V,
                "flac": V, "opus": V, "dts": V, "truehd": V},
      "subtitle": {"srt": Y, "webvtt": V, "mov_text": V, "ass": N, "ssa": N,
                   "pgs": N, "vobsub": N}},
@@ -756,11 +781,17 @@ KNOWN: list[dict] = [
                   "pgs": N, "vobsub": N}},
     {"id": "playstation", "label": "PlayStation",
      "match": r"playstation|ps[45]",
-     "note": "HEVC on PS5; the PS4 app is H.264 only.",
+     "note": "HEVC on PS5; the PS4 app is H.264 only. Plex's support article "
+             "for this app is unusually blunt about subtitles: \"All "
+             "subtitles types are burned into the video stream for playback "
+             "which requires transcoding\". Not a format question here - "
+             "every subtitle costs a re-encode, whatever it is.",
      "video": {"h264": Y, "hevc": V, "vp9": V, "av1": N, "mpeg4": V, "vc1": V},
      "audio": {"aac": Y, "mp3": Y, "ac3": Y, "eac3": Y,
                "flac": V, "opus": V, "dts": V, "truehd": V},
-     "subtitle": {"srt": Y, "webvtt": V, "mov_text": V, "ass": N, "ssa": N,
+     # EVERY FORMAT, PER PLEX'S OWN DOCUMENTATION. The only profile here
+     # where srt is not `yes`, and the only one that is not a generalisation.
+     "subtitle": {"srt": N, "webvtt": N, "mov_text": N, "ass": N, "ssa": N,
                   "pgs": N, "vobsub": N}},
 ]
 

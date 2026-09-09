@@ -12853,6 +12853,11 @@ html.mobile #logsPane{height:auto;min-height:60vh}
 const fmt=n=>(n||0).toLocaleString();
 const gb=b=>!b?'0':(b/1073741824>=1024?(b/1099511627776).toFixed(2)+' TB':(b/1073741824).toFixed(1)+' GB');
 const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+// FOR TEXT GOING INSIDE A SINGLE-QUOTED JS STRING INSIDE AN HTML ATTRIBUTE.
+// Two escapings, in this order: JavaScript first (backslash, then apostrophe),
+// HTML second. esc() leaves apostrophes alone - correct for an attribute in
+// double quotes, and fatal for a string literal inside one.
+const jsq=s=>esc(String(s==null?'':s).replace(/\\/g,'\\\\').replace(/'/g,"\\'"));
 const stateClass=s=>'e-'+String(s||'').replace(/[^a-z_]/gi,'');
 // Relative time for row timestamps - "2h ago" answers the panel's question;
 // the exact datetime lives in the tooltip for when it matters.
@@ -28913,7 +28918,7 @@ function capsPaint(slot){
             f.refused?' ✗'+f.refused:''}</em>`:''}</span>`).join('')}</div>`;
     const K=dev.known||{};
     return `<div class="capsrow${open?' open':''}" data-k="${esc(key)}">
-      <div class="capshead" onclick="capsToggle('${esc(key)}','${slot}')">
+      <div class="capshead" onclick="capsToggle('${jsq(key)}','${slot}')">
         <span class="ccaret">${open?'▾':'▸'}</span>
         <b>${esc(dev.label)}</b>
         ${dev.seen?`<span class="capsseen" title="This server has watched this device play or refuse something. What it saw beats the platform profile.">seen${
