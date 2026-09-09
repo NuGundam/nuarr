@@ -69,6 +69,11 @@ REPLACE = "replace"
 # their own rather than a borrowed one, and the cards can say plainly that the
 # other two do not apply and why.
 REPAIR = "repair"
+# THE FOURTH, AND THE NARROWEST. Nothing is wrong with anything: a release was
+# rejected, the arr was asked for another, and none has come. Ask again. It
+# touches no file and blocklists nothing - it spends one indexer search, which
+# is why it is rate limited rather than free.
+REASK = "reask"
 
 
 # ---------------------------------------------------------------- policy ----
@@ -151,14 +156,33 @@ _kind("audio/untagged", True, True, False,
       "the label wrong, so this is never replaced unattended")
 
 # -- index and bookkeeping. Nothing about the file is wrong. ------------------
-_kind("index/not-walked", True, False, False,
-      "nuarr has no row for a file the arr tracks - it needs indexing, "
-      "not fixing")
-_kind("index/wrote-off", True, False, False,
-      "nuarr wrote this off but the arr still tracks it and it is on disk")
-_kind("index/rejected", False, True, False,
-      "already blocklisted once and still waiting. Re-asking costs another "
-      "indexer search, so it stays a decision somebody makes")
+# NOT A REQUEUE, AND SAYING SO OUT LOUD BECAUSE IT LOOKED LIKE ONE. The first
+# version offered index/not-walked a requeue, which asks the planner to plan a
+# file by its nuarr row id - and the entire finding is that there IS no nuarr
+# row. It could only ever have answered "no such file". Indexing is the arr gap
+# check's own pass and belongs to it.
+_kind("index/not-walked", False, False, False,
+      "nuarr has no row for a file the arr tracks. There is nothing to "
+      "requeue and nothing wrong with the file - it needs indexing, which is "
+      "this check's own job")
+_kind("index/wrote-off", False, False, False,
+      "nuarr wrote this off, but the arr still tracks it and it is on disk. "
+      "The verdict is what is wrong, not the file - this check withdraws it")
+# REPLACE WAS THE WRONG VERB FOR THIS AND FAILED HONESTLY, WHICH IS HOW IT WAS
+# FOUND. refetch exists to reject a release because the bytes are bad: it
+# blocklists the grab, deletes the file and asks for another. This finding is
+# what that leaves BEHIND - the release is already blocklisted, the row is
+# already marked deleted, and the replacement has simply not arrived. Pointing
+# refetch at it fed its classifier refetch's own output as if it were an error
+# string, and it refused with "this error has not been seen before" - correctly,
+# because it was not an error at all.
+#
+# What is actually wanted is the second half of refetch on its own: ask the arr
+# to search again. That is `reask`, below.
+_kind("index/rejected", False, False, False,
+      "already blocklisted once and still waiting. The release is gone and the "
+      "file is already written off - there is nothing left to reject, only "
+      "another search to ask for")
 _kind("arr/disagree", True, False, False,
       "nuarr and the arr hold different facts about this file")
 _kind("plex/disagree", True, False, False,
@@ -202,13 +226,28 @@ _REPAIR_OF = {
     "arr/disagree": "arrsync",
     "plex/disagree": "plexsync",
     "audio/title": "audiotitle",
+    # Indexing a file the arr tracks, and withdrawing a stale write-off, are
+    # both the arr gap check's own pass. Same shape as the three above: the
+    # file is fine, a record is wrong, and the check that found it owns the
+    # code that puts it right.
+    "index/not-walked": "arrgap",
+    "index/wrote-off": "arrgap",
 }
+
+
+# Findings whose only sensible move is to ask the arr to look again.
+_REASKABLE = {"index/rejected"}
+# One search per file per this long. An indexer that is asked the same question
+# every six hours is being used; one asked every thirty seconds is being
+# abused, and the ban lands on the person who owns the account.
+REASK_COOLDOWN_S = 6 * 3600
 
 
 def policy(kind: str) -> dict:
     k = (kind or "").strip()
     out = dict(_P.get(k, _FALLBACK))
     out["repair"] = _REPAIR_OF.get(k, "")
+    out["reask"] = k in _REASKABLE
     return out
 
 
@@ -226,6 +265,7 @@ SYSTEMS = {
     "arrsync":    ("arr agreement check", "arrsync_mode", "arr/disagree"),
     "plexsync":   ("Plex agreement check", "plexsync_mode", "plex/disagree"),
     "audiotitle": ("audio picker check", "audiotitle_mode", "audio/title"),
+    "arrgap":     ("not-walked check", "arrgap_mode", "index/not-walked"),
 }
 
 
@@ -243,7 +283,10 @@ async def repair(system: str, source: str = "", auto: bool = False) -> dict:
         return {"ok": False, "why": f"no such check: {system}"}
     label, _key, kind = SYSTEMS[system]
     try:
-        if system == "arrsync":
+        if system == "arrgap":
+            from . import arrgap
+            out = await arrgap.fix()
+        elif system == "arrsync":
             from . import arrsync
             out = await arrsync.fix()
         elif system == "plexsync":
@@ -259,7 +302,15 @@ async def repair(system: str, source: str = "", auto: bool = False) -> dict:
               f"{type(e).__name__}: {e}")
         return {"ok": False, "why": f"{type(e).__name__}: {e}"}
     out = out if isinstance(out, dict) else {"ok": True}
-    n = int(out.get("fixed") or out.get("done") or out.get("queued") or 0)
+    if system == "arrgap":
+        # arrgap.fix() answers with its whole cached report - the right thing
+        # for the card that polls it and far too much to echo back here. The
+        # number that matters is how many it actually indexed.
+        from . import arrgap as _ag
+        n = int((_ag._CACHE.get("last_fix") or {}).get("walked") or 0)
+        out = {"ok": True, "walked": n}
+    else:
+        n = int(out.get("fixed") or out.get("done") or out.get("queued") or 0)
     # file_id 0 on purpose: this is one action over many records, and inventing
     # a file for it would put a lie in a table whose whole job is evidence.
     _note(0, kind, REPAIR, source or system, auto, True,
@@ -420,6 +471,13 @@ def offers(kind: str, file_id: int | None = None) -> dict:
     p = policy(kind)
     a = attempts(int(file_id), kind) if file_id else {REQUEUE: 0, REPLACE: 0}
     out = {"kind": kind, "why": p["why"],
+           # The two verbs that are not about the file's bytes. Reported here
+           # as well as in kinds(), so one call answers "what can I do with
+           # this row" completely rather than nearly.
+           REPAIR: {"on": bool(p["repair"]), "system": p["repair"],
+                    "why": p["why"]},
+           REASK: {"on": bool(p["reask"]), "why": p["why"],
+                   "tried": a.get(REASK, 0)},
            REQUEUE: {"on": p["requeue"], "why": p["why"],
                      "tried": a.get(REQUEUE, 0)},
            REPLACE: {"on": p["replace"], "why": p["why"],
@@ -471,7 +529,16 @@ async def requeue(file_id: int, kind: str, source: str = "", why: str = "",
         row = cur.execute("SELECT id,path,title,state FROM files WHERE id=?",
                           (int(file_id),)).fetchone()
     if not row:
-        return {"ok": False, "why": "no such file"}
+        # "no such file" WAS TRUE AND USELESS. It was answered about a file
+        # sitting on the pool, because the caller had handed over the ARR's
+        # file id and this table is keyed by nuarr's. Two id spaces, one field
+        # name. Say which one was expected, so the next person to hit it is
+        # reading about the bug rather than hunting for a missing file.
+        return {"ok": False,
+                "why": f"nuarr has no row with id {int(file_id)}. This wants "
+                       f"nuarr's own file id, not the arr's - if this came "
+                       f"from a card that lists arr records, it is sending "
+                       f"the wrong one"}
     row = dict(row)
     try:
         await jobs.enqueue(int(file_id), row["path"], row.get("title") or "",
@@ -497,6 +564,50 @@ async def requeue(file_id: int, kind: str, source: str = "", why: str = "",
     return {"ok": True, "why": f"queued to fix {kind}"}
 
 
+async def reask(file_id: int, kind: str, source: str = "",
+                auto: bool = False) -> dict:
+    r"""Ask the arr to search for this one again. Touches nothing.
+
+    No blocklist, no delete, no job - one command to Sonarr or Radarr saying
+    "look again for this episode". The whole cost is an indexer search, and the
+    whole risk is asking for it too often, so that is the only thing guarded
+    here.
+    """
+    from .arr import shared_client
+    from .refetch import _arr_for, _file_row
+    if not policy(kind)["reask"]:
+        return {"ok": False, "why": f"asking again is not a remedy for {kind}"}
+    row = _file_row(int(file_id))
+    if not row:
+        return {"ok": False,
+                "why": f"nuarr has no row with id {int(file_id)} - this wants "
+                       f"nuarr's own file id, not the arr's"}
+    if not row.get("arr_parent_id"):
+        return {"ok": False, "why": "no series or film id on this row, so "
+                                    "there is nothing to search for"}
+    a = attempts(file_id, kind)
+    if a.get("last") and (time.time() - a["last"]) < REASK_COOLDOWN_S:
+        left = int((REASK_COOLDOWN_S - (time.time() - a["last"])) / 60)
+        return {"ok": False, "why": f"already asked within the last "
+                                    f"{REASK_COOLDOWN_S // 3600}h - {left}m "
+                                    f"before it is worth asking again"}
+    cfg = _arr_for(row.get("library") or "")
+    if cfg is None:
+        return {"ok": False, "why": f"no arr is configured for the library "
+                                    f"{row.get('library') or '?'}"}
+    try:
+        await shared_client(cfg).search_for(int(row["arr_parent_id"]))
+    except Exception as e:                                       # noqa: BLE001
+        _note(file_id, kind, REASK, source, auto, False,
+              f"{type(e).__name__}: {e}", row.get("path") or "")
+        return {"ok": False, "why": f"{type(e).__name__}: {e}"}
+    _note(file_id, kind, REASK, source, auto, True,
+          f"asked {cfg.name} to search again", row.get("path") or "")
+    joblog.log(f"{source or 'remedy'}: asked {cfg.name} to search again for "
+               f"{row.get('title') or row.get('path') or file_id}", "info")
+    return {"ok": True, "why": f"asked {cfg.name} to search again"}
+
+
 async def replace(file_id: int, kind: str, source: str = "", why: str = "",
                   auto: bool = False) -> dict:
     """Blocklist the release and ask the arr for another one. Destructive.
@@ -513,6 +624,14 @@ async def replace(file_id: int, kind: str, source: str = "", why: str = "",
     if auto and not p["auto_replace"]:
         return {"ok": False, "why": f"{kind} is replaceable, but never "
                                     f"unattended: {p['why']}"}
+    from .refetch import _file_row
+    if not _file_row(int(file_id)):
+        # THE SAME TWO-ID-SPACES TRAP THE REQUEUE PATH HAD. refetch answers
+        # "no such file" from three frames down, which reads as a missing file
+        # rather than a caller handing over the arr's id.
+        return {"ok": False,
+                "why": f"nuarr has no row with id {int(file_id)}. This wants "
+                       f"nuarr's own file id, not the arr's"}
     a = attempts(file_id, kind)
     if a.get(REPLACE, 0) >= MAX_REPLACES:
         return {"ok": False, "why": f"already replaced {a[REPLACE]}x for "

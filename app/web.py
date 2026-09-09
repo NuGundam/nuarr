@@ -6591,6 +6591,22 @@ def api_remedy_offers(kind: str, file_id: int | None = None):
     return remedy.offers(kind, file_id)
 
 
+@app.post("/api/remedy/reask")
+async def api_remedy_reask(file_id: int, kind: str, source: str = "ui"):
+    """Ask the arr to search for this one again. Blocklists nothing, deletes
+    nothing - the whole cost is one indexer search, which is why remedy rate
+    limits it."""
+    from . import remedy
+    return await remedy.reask(int(file_id), kind, source=source)
+
+
+@app.post("/api/remedy/repair")
+async def api_remedy_repair(system: str, source: str = "ui"):
+    """Run a check's own in-place fixer, counted in the shared ledger."""
+    from . import remedy
+    return await remedy.repair(system, source=source)
+
+
 @app.post("/api/remedy/requeue")
 async def api_remedy_requeue(file_id: int, kind: str, source: str = "ui"):
     from . import remedy
@@ -17464,13 +17480,37 @@ function remedyBtns(fid, kind, opts){
     why:'an unrecognised finding - only requeue is offered, because guessing '
        +'the other one deletes files'};
   const k=esc(kind||''), src=esc(opts.source||'ui');
+  // THE THIRD VERB, WHERE THE FINDING HAS ONE. A wrong record is put right by
+  // the check that found it - indexing a file the arr tracks, rewriting a
+  // track title, re-reading a stale Plex analysis. Rendered first because
+  // where it exists it is the correct answer, and the other two are the ones
+  // that need explaining away.
+  const rep = p.repair
+    ? `<button class="rmb" title="${esc('Correct this in place. '+p.why)}"
+        onclick="event.stopPropagation();rmRepair('${esc(p.repair)}',this)"
+        >Fix in place</button> ` : '';
+  // ASK AGAIN. Not destructive and not a job - it spends one indexer search,
+  // so it gets a plain button and a cooldown rather than a confirmation.
+  const ask = (p.reask && (fid || fid===0))
+    ? `<button class="rmb" title="${esc('Ask the arr to search for a '
+        +'replacement again. Nothing is deleted and nothing is blocklisted - '
+        +'the release already was. '+p.why)}"
+        onclick="event.stopPropagation();rmDo('reask',${fid},'${k}','${src}',this)"
+        >Ask again</button> ` : '';
   const rqWhy = p.requeue ? 'Plan this file again under the current rules and '
       +'queue it if the planner has work' : 'No rule the planner has would '
       +'change this - '+p.why;
   const rpWhy = p.replace ? 'Blocklist the release and ask the arr for a '
       +'different one. This deletes the file. '+p.why
     : "The file's contents are not the problem - "+p.why;
-  return `<button class="rmb" ${p.requeue?'':'disabled'}
+  // AND WITHOUT A NUARR ROW THERE IS NOTHING FOR THE FILE VERBS TO ACT ON.
+  // Both of them are addressed by nuarr's own file id; a card listing arr
+  // records that nuarr has never indexed has no such id to give. Offering the
+  // buttons anyway is how "Blocklist & re-download" answered "no such file"
+  // about a file sitting on the pool.
+  if(!fid && fid!==0) return rep || `<span class="dim" style="font-size:10.5px"
+      title="Nuarr has no row for this file, so there is nothing to requeue or replace. Indexing it is this check's own job.">—</span>`;
+  return rep + ask + `<button class="rmb" ${p.requeue?'':'disabled'}
       title="${esc(rqWhy)}"
       onclick="event.stopPropagation();rmDo('requeue',${fid},'${k}','${src}',this)"
       >Requeue</button>
@@ -17478,6 +17518,22 @@ function remedyBtns(fid, kind, opts){
       title="${esc(rpWhy)}"
       onclick="event.stopPropagation();rmDo('replace',${fid},'${k}','${src}',this)"
       >Blocklist &amp; re-download</button>`;
+}
+// The in-place fixers are per-check, not per-file: they correct every record
+// the check is holding. That is how each of them was already written, and it
+// is the honest shape - a title rewrite is a tenth of a second, so scoping it
+// to one row would be ceremony around nothing.
+async function rmRepair(system, btn){
+  const was=btn?btn.textContent:'';
+  if(btn){ btn.classList.add('spin'); btn.textContent='fixing…'; }
+  let r={};
+  try{
+    r=await (await fetch('/api/remedy/repair?system='+encodeURIComponent(system),
+                         {method:'POST'})).json();
+  }catch(e){ r={ok:false, why:String(e)}; }
+  if(btn){ btn.classList.remove('spin'); btn.textContent = r.ok?'started':was; }
+  if(!r.ok && (r.why||r.error)) alert(r.why||r.error);
+  return r;
 }
 async function rmDo(action, fid, kind, source, btn){
   // THE DESTRUCTIVE ONE ASKS. Not because a misclick is likely on any one
@@ -17499,7 +17555,8 @@ async function rmDo(action, fid, kind, source, btn){
   }catch(e){ r={ok:false, why:String(e)}; }
   if(btn){
     btn.classList.remove('spin');
-    btn.textContent = r.ok ? (action==='replace'?'replaced':'queued') : was;
+    btn.textContent = r.ok
+      ? (action==='replace'?'replaced':action==='reask'?'asked':'queued') : was;
     if(r.ok) btn.disabled=true;
   }
   if(!r.ok && (r.why||r.error)) alert(r.why||r.error);
@@ -23867,8 +23924,11 @@ function agList(rows){
                   'rejected, waiting for a replacement':'index/rejected'};
                 const k=AG_KIND[r0.why||''];
                 if(!k) return `<td style="padding:3px 0"></td>`;
+                // r0.file_id IS THE ARR'S ID. The remedy endpoints take
+                // nuarr's, and the row carries that separately as nuarr_id -
+                // null for a not-walked file, which is the finding itself.
                 return `<td style="padding:3px 0;white-space:nowrap">${
-                  remedyBtns(r0.file_id, k, {source:'not-walked check'})}</td>`;
+                  remedyBtns(r0.nuarr_id, k, {source:'not-walked check'})}</td>`;
               })()}
             </tr>`;}).join('')}
           </tbody>

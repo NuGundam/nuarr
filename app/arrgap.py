@@ -291,9 +291,11 @@ async def scan() -> dict:
             # first version of this did and it was wrong in a way that made the
             # fix a no-op. The state is the whole answer, so fetch the state.
             with cursor() as cur:
-                have = {r["arr_file_id"]: (r["state"], r["state_reason"])
+                have = {r["arr_file_id"]: (r["state"], r["state_reason"],
+                                           r["id"])
                         for r in cur.execute(
-                            "SELECT arr_file_id, state, state_reason FROM files "
+                            "SELECT id, arr_file_id, state, state_reason "
+                            "FROM files "
                             "WHERE arr_name=? AND arr_file_id IS NOT NULL",
                             (cfg.name,)).fetchall()}
             _CACHE["now"] = f"comparing {cfg.name} against nuarr's index"
@@ -307,7 +309,7 @@ async def scan() -> dict:
                 fid = getattr(f, "file_id", None)
                 if fid is None:
                     continue
-                state, reason = have.get(fid, ("", None))
+                state, reason, nid = have.get(fid, ("", None, None))
                 if fid in have and state != "deleted":
                     continue                      # nuarr has it and counts it
                 path = getattr(f, "path", "") or ""
@@ -315,6 +317,11 @@ async def scan() -> dict:
                 st["missing"] += 1
                 rows.append({
                     "arr": cfg.name, "kind": cfg.kind, "file_id": fid,
+                    # NUARR'S OWN ROW, WHERE THERE IS ONE. None for a
+                    # not-walked file, because "nuarr has no entry for it" is
+                    # the finding. The card uses this to decide which remedies
+                    # can even be offered.
+                    "nuarr_id": nid,
                     "parent_id": getattr(f, "parent_id", None),
                     "path": path,
                     "name": os.path.basename(path),
