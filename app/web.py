@@ -15279,23 +15279,24 @@ async function refetchAsk(id, fromAttn, btn){
   // the question, the spinner and the outcome, in the space the button
   // occupied.
   btn = btn || (window.event && window.event.target) || null;
-  const host = btn ? (btn.closest('td, .askhost') || btn.parentElement) : null;
-  const put = html => { if(host) host.innerHTML = html; };
-  if(!host) return;
-  if(host.dataset.asking === '1') return;
+  const cell0 = btn ? (btn.closest('td, .askhost') || btn.parentElement) : null;
+  if(!cell0 || cell0.dataset.asking === '1') return;
+  const spot = askSpot(btn);
+  if(!spot) return;
+  const host = spot.host;
+  const put = html => { host.innerHTML = spot.wrap(html); };
   host.dataset.asking = '1';
-  const prev = host.innerHTML;
   put('<span class="busy" style="color:var(--acc)"><span class="sp"></span>'
      +'<span class="step">asking the arr what would happen…</span></span>');
 
   let p;
   try{ p = await (await fetch(`/api/files/${id}/refetch`)).json(); }
   catch(err){
-    host.dataset.asking='';
+    host.dataset.asking=''; spot.release();
     return put(`<span class="err" style="font-size:11px">could not reach the arr: ${esc(String(err))}</span>`);
   }
   if(!p.ok && !p.can_search){
-    host.dataset.asking='';
+    host.dataset.asking=''; spot.release();
     return put(`<span class="err" style="font-size:11px">${esc(p.why||'cannot re-download this file')}`
       + (p.remedy?` — <span class="dim">${esc(p.remedy)}</span>`:'') + '</span>');
   }
@@ -15324,7 +15325,7 @@ async function refetchAsk(id, fromAttn, btn){
       <button class="rmb bad" data-y>Yes, delete and replace it</button>
       <button class="rmb" data-n>Cancel</button></span>`);
   host.querySelector('[data-n]').onclick = ev => {
-    ev.stopPropagation(); host.dataset.asking=''; host.innerHTML = prev;
+    ev.stopPropagation(); host.dataset.asking=''; spot.restore();
   };
   host.querySelector('[data-y]').onclick = async ev => {
     ev.stopPropagation();
@@ -15346,7 +15347,7 @@ async function refetchAsk(id, fromAttn, btn){
     // what was blocklisted could vanish as fast as the question did. The
     // deliberate refresh below is what should replace it, and now it is the
     // only thing that can.
-    setTimeout(()=>{ host.dataset.asking='';
+    setTimeout(()=>{ host.dataset.asking=''; spot.release();
                      if(fromAttn) loadAttention(true); else drillRefresh(true); }, 1500);
   };
 }
@@ -17855,19 +17856,109 @@ function askOpen(scope){
   return !!(el && el.querySelector('[data-asking="1"]'));
 }
 
+// WHERE THERE IS ROOM TO ASK.
+//
+// A confirmation replaces the button that raised it, and that button lives in
+// a column sized for a button - 14% of the table on the hardsub panel, with
+// white-space:nowrap so the button itself never wraps. Put a sentence there
+// and it inherits both: too narrow to fit, forbidden to wrap. It ran off the
+// right-hand edge and what you could read was
+//
+//     "...it exists so Bazarr and Plex stop re"
+//
+// which is the half that says what the button does, missing the half that
+// says what it costs. A truncated question is not a question.
+//
+// So when the button is in a table row, the QUESTION takes the whole row: the
+// same place on screen, at the width the sentence needs. Everywhere else -
+// a .askhost span, a plain div - the host is unchanged, because those were
+// never the problem.
+//
+// The previous markup is kept and put back on cancel. It has to be: these
+// buttons carry inline onclick attributes, so restoring the HTML restores the
+// handlers with it - and now that the row is what gets replaced, that means
+// every button in the row, not just the one that was pressed.
+// MEASURED, NOT ASSUMED. Some cells are perfectly good places to ask: the
+// errors drill asks inside a title column 40% of the table wide, and the
+// sentence wraps there with the size, the disk and the state still readable
+// beside it. Only a cell too narrow for a sentence needs somewhere else to
+// go, and whether it is too narrow is a fact on screen, not a guess about
+// which table this is.
+const ASK_ROOM = 320;
+
+function askSpot(btn){
+  const cell = btn.closest('td, .askhost') || btn.parentElement;
+  if(!cell) return null;
+  const row = (cell.tagName === 'TD') ? cell.parentElement : null;
+  const cramped = !!(row && row.cells && row.cells.length > 1
+                     && cell.offsetWidth < ASK_ROOM);
+  // TWO WAYS TO FINISH, AND THEY ARE NOT THE SAME.
+  //
+  //   restore() - the question was cancelled. Put everything back exactly as
+  //               it was, including the inline onclick handlers, which come
+  //               back with the markup.
+  //   release() - the question was answered, or could not be asked. The
+  //               ANSWER is on screen and has to stay there; all that is let
+  //               go is the lock that stops a second press and freezes the
+  //               panel's poll.
+  //
+  // Collapsing these into one call is how the error paths used to leave a
+  // cramped row with its buttons disabled forever: they cleared the flag on
+  // the row that held the message and never touched the cell that held the
+  // buttons.
+  if(!cramped){
+    const prev = cell.innerHTML;
+    return {host: cell, wrap: h => h,
+            release: () => { cell.dataset.asking=''; },
+            restore: () => { cell.dataset.asking=''; cell.innerHTML = prev; }};
+  }
+  // A ROW OF ITS OWN, DIRECTLY UNDER THE FILE IT IS ABOUT.
+  //
+  // Replacing the narrow cell was the obvious move and the wrong one: the
+  // sentence would wrap into a five-line ribbon pinned to the right edge.
+  // Replacing the whole ROW was the next idea and also wrong - it takes away
+  // the filename, so the question about which file to change no longer says
+  // which file. An inserted row keeps the file where it is and gives the
+  // question the full width of the table underneath it.
+  //
+  // The buttons above stay put and go disabled, so pressing again does
+  // nothing and the thing you pressed is still visibly the thing being asked
+  // about. Both the cell and the new row carry data-asking, so askOpen() sees
+  // an open question wherever it looks.
+  const span = row.cells.length;
+  const extra = document.createElement('tr');
+  extra.className = 'askedrow';
+  extra.dataset.asking = '1';
+  row.insertAdjacentElement('afterend', extra);
+  cell.dataset.asking = '1';
+  const buttons = [...cell.querySelectorAll('button')].map(b => [b, b.disabled]);
+  buttons.forEach(([b]) => { b.disabled = true; });
+  const release = () => {
+    cell.dataset.asking = '';
+    buttons.forEach(([b, was]) => { b.disabled = was; });
+  };
+  return {
+    host: extra,
+    wrap: h => `<td colspan="${span}" style="padding:1px 8px 9px 0">${h}</td>`,
+    release,
+    restore: () => { release(); extra.remove(); }};
+}
+
 function askInline(btn, msg, yesLabel, run){
   if(!btn) return;
-  const host=btn.closest('td, .askhost') || btn.parentElement;
-  if(!host || host.dataset.asking==='1') return;
-  const prev=host.innerHTML;
+  const cell0=btn.closest('td, .askhost') || btn.parentElement;
+  if(!cell0 || cell0.dataset.asking==='1') return;
+  const spot=askSpot(btn);
+  if(!spot) return;
+  const host=spot.host;
   host.dataset.asking='1';
-  host.innerHTML=`<span class="askrow">
+  host.innerHTML=spot.wrap(`<span class="askrow">
     <span class="askmsg">${esc(msg)}</span>
     <button class="rmb bad" data-y>${esc(yesLabel)}</button>
-    <button class="rmb" data-n>Cancel</button></span>`;
-  const done=html=>{ host.innerHTML=html; };
+    <button class="rmb" data-n>Cancel</button></span>`);
+  const done=html=>{ host.innerHTML=spot.wrap(html); };
   host.querySelector('[data-n]').onclick=e=>{
-    e.stopPropagation(); host.dataset.asking=''; host.innerHTML=prev;
+    e.stopPropagation(); host.dataset.asking=''; spot.restore();
   };
   host.querySelector('[data-y]').onclick=async e=>{
     e.stopPropagation();
@@ -17875,7 +17966,7 @@ function askInline(btn, msg, yesLabel, run){
         +'<span class="step">working…</span></span>');
     let r={};
     try{ r=await run(); }catch(err){ r={ok:false, why:String(err)}; }
-    host.dataset.asking='';
+    host.dataset.asking=''; spot.release();
     done(r&&r.ok
       ? `<span style="color:var(--ok);font-size:11px">${esc(r.why||'done')}</span>`
       : `<span class="err" style="font-size:11px">${esc((r&&r.why)||'failed')}</span>`);
@@ -29439,6 +29530,9 @@ function hsPaint(){
         tested?'Nothing checked so far is carrying subtitles in the picture.'
               :'Nothing checked yet.'}</div>`;
   const html=`<div class="lkind" style="padding:11px 12px">${head}${note}${prog}${hist}${table}</div>`;
+  // The same rule the errors drill follows: while a run is going this panel
+  // repaints every 1.5s, and a rebuild would take the question with it.
+  if(askOpen('hsPanel')) return;
   if(html===_hsKey) return;
   _hsKey=html; el.innerHTML=html;
   // WHILE IT RUNS, KEEP ASKING. A progress bar that only moves when somebody
@@ -32656,9 +32750,19 @@ html.mobile .setwrap:not(.rail) .setmain,html.mobile .setwrap:not(.rail) #worker
    a stalled pass looks stalled instead of looking busy forever. */
 /* THE QUESTION, WHERE THE BUTTON WAS. Wraps rather than clipping, because
    the explanation is the point and a truncated warning is worse than none. */
-.askrow{display:inline-flex;gap:7px;align-items:center;flex-wrap:wrap;
-  max-width:520px}
-.askmsg{font-size:10.5px;color:var(--warn);line-height:1.35}
+/* white-space:normal is not redundant. These land inside whatever cell held
+   the button, and an action column is usually nowrap so the button never
+   breaks in half - which then applied to the sentence that replaced it. The
+   question must wrap even where the button must not. */
+/* The row a question is asked in when the button's own cell was too narrow.
+   Tinted so it reads as attached to the row above rather than as one more
+   file in the list. */
+tr.askedrow > td{background:rgba(210,153,34,.06);
+  border-bottom:1px solid var(--line)}
+.askrow{display:inline-flex;gap:7px;align-items:baseline;flex-wrap:wrap;
+  max-width:640px;white-space:normal}
+.askmsg{font-size:10.5px;color:var(--warn);line-height:1.4;white-space:normal;
+  flex:1 1 260px;min-width:0}
 /* The correction-in-progress block, which replaces the button it grew out of.
    min-width so the bar has something to be a proportion OF - dropped into the
    right-aligned action cell of the disagreements table it would otherwise be
