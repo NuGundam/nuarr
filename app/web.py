@@ -7268,6 +7268,18 @@ def api_jobs(recent: int = Query(60, le=1000)):
     return jobs.snapshot(recent_limit=recent) | {"system": system.snapshot()}
 
 
+@app.get("/api/clientcaps")
+async def api_clientcaps(side: str = "video"):
+    r"""Every device this server knows against every library, for one side.
+
+    Cheap enough to serve on the request - a dozen devices by six libraries
+    is a few hundred dictionary lookups - but it reads two tables, so it goes
+    to a thread like everything else that touches SQLite.
+    """
+    from . import clientcaps
+    return await asyncio.to_thread(clientcaps.matrix, side)
+
+
 @app.get("/api/playback")
 def api_playback(days: int = Query(30, le=365)):
     """What Plex had to work at, and which track caused it."""
@@ -27658,6 +27670,7 @@ async function alFix(fileId, track, code, btn){
 let _cod=null, _codSide='video', _codDirty=false;
 
 async function loadCodecTab(side){
+  if(side && side!==_codSide){ _caps=null; _capsSide=''; }
   if(side) _codSide=side;
   const el=document.getElementById(_codSide==='video'?'vcodecBody':'acodecBody');
   if(!el) return;
@@ -27757,6 +27770,7 @@ function codecField(lib,side,f){
       <div class="cfwhat dim">${esc(f.what||'')}</div>
     </div>
     <div class="cfctl">${input}</div>
+    ${f.note?`<div class="cfnote">${esc(f.note)}</div>`:''}
   </div>`;
 }
 
@@ -27861,7 +27875,96 @@ Nothing is saved and no library file is touched.">Test these settings</button>
       <span id="codMsg" class="dim" style="font-size:11.5px">${
         _codDirty?'unsaved changes':'the planner is using this now'}</span>
     </div>
-    <div id="codImpact" style="margin-top:8px"></div>`;
+    <div id="codImpact" style="margin-top:8px"></div>
+    <div id="capsPanel" style="margin-top:14px"></div>`;
+  capsLoad();
+}
+
+// ---- who plays what ---------------------------------------------------------
+// THE SETTINGS ABOVE ARE A BET ABOUT SOMEBODY ELSE'S HARDWARE, and until this
+// panel there was nothing on the page that said whether the bet was good.
+// "Surround formats to copy: eac3" is not a fact about E-AC3, it is a claim
+// that every device here direct-plays it - so the claim is checked, per device
+// and per library, against what those devices have actually done.
+let _caps=null, _capsSide='', _capsOpen=new Set();
+async function capsLoad(force){
+  const el=document.getElementById('capsPanel');
+  if(!el) return;
+  if(force||_capsSide!==_codSide||!_caps){
+    el.innerHTML='<div class="skel" style="padding:12px"><i style="width:45%"></i>'
+                +'<i style="width:75%"></i></div>';
+    try{ _caps=await (await fetch('/api/clientcaps?side='+_codSide)).json();
+         _capsSide=_codSide; }
+    catch(e){ el.innerHTML='<div class="dim">could not load the device list</div>';
+              return; }
+  }
+  capsPaint();
+}
+function capsToggle(k){ _capsOpen.has(k)?_capsOpen.delete(k):_capsOpen.add(k); capsPaint(); }
+function capsPaint(){
+  const el=document.getElementById('capsPanel');
+  if(!el||!_caps) return;
+  const d=_caps, libs=d.libraries||[], side=d.side;
+  const word=side==='video'?'video':'audio';
+  const rows=(d.devices||[]).map((dev,i)=>{
+    const key=dev.label+'|'+i, open=_capsOpen.has(key);
+    // THE WORST CELL DECIDES THE ROW. A device that direct-plays five
+    // libraries and transcodes the sixth is a device with a problem, and a
+    // summary that averaged it away would be worse than no summary.
+    const bad=libs.filter(L=>(dev.cells[L]||{}).state==='bad').length;
+    const warn=libs.filter(L=>(dev.cells[L]||{}).state==='warn').length;
+    const chip=bad?`<span class="capsx bad">${bad} transcode${bad===1?'':'s'}</span>`
+              :warn?`<span class="capsx warn">${warn} may transcode</span>`
+                   :`<span class="capsx ok">all direct play</span>`;
+    return `<div class="capsrow${open?' open':''}">
+      <div class="capshead" onclick="capsToggle('${esc(key)}')">
+        <span class="ccaret">${open?'▾':'▸'}</span>
+        <b>${esc(dev.label)}</b>
+        ${dev.seen?`<span class="capsseen" title="This server has watched this device play or refuse something. What it saw beats the platform profile.">seen here${
+            dev.last_at?' · '+ago(dev.last_at):''}</span>`
+                  :`<span class="capsguess" title="Nothing has played on this device here yet, so the panel is using a typical profile for the platform. One session replaces it with what actually happened.">typical profile</span>`}
+        <span style="margin-left:auto">${chip}</span></div>
+      <div class="capsgrid">${libs.map(L=>{
+        const c=dev.cells[L]||{state:'warn',text:'?',codecs:[]};
+        return `<span class="capscell ${c.state}" title="${esc(
+            c.codecs.map(p=>(p.codec+(p.ch?' '+({2:'2.0',6:'5.1',8:'7.1'}[p.ch]||p.ch+'ch'):''))
+                             +' — '+p.state+': '+p.why+' ('+p.src+')').join('\n'))}"
+          ><i>${esc(L)}</i>${esc(c.text)}</span>`;
+      }).join('')}</div>
+      ${open?`<div class="capsnote">${esc(dev.note||'')}</div>
+        <div class="capscodecs">${libs.map(L=>{
+          const c=dev.cells[L]||{codecs:[]};
+          return `<div class="capscl"><b>${esc(L)}</b>${c.codecs.map(p=>
+            `<span class="capsc ${p.state}" title="${esc(p.why)} — ${esc(p.src)}"
+              >${esc(p.codec)}${p.ch?' '+({2:'2.0',6:'5.1',8:'7.1'}[p.ch]||p.ch+'ch'):''}</span>`).join('')}</div>`;
+        }).join('')}</div>`:''}
+    </div>`;
+  }).join('');
+  el.innerHTML=`<div class="lkind capswrap">
+    <div class="lkindhead"><span class="clib">Will each device play this?</span>
+      <span class="dim">${esc(word)} only — the other tab answers the other half</span>
+      <span style="margin-left:auto"><button class="gapchk"
+        style="font-size:10.5px;padding:1px 8px" onclick="capsLoad(true)"
+        title="Re-read the device list and what this server has observed">Refresh</button></span></div>
+    <div class="cfbody">
+      <div class="cfwhat dim" style="margin-bottom:8px">Every setting above is a
+        claim about somebody else's hardware. This checks the claim: for each
+        device, whether the ${esc(word)} formats these libraries will hand it
+        after nuarr is finished are ones it plays untouched. ${d.seen_any
+          ? 'Devices this server has watched come first and their rows are built '
+           +'from what actually happened; the rest are typical platform profiles '
+           +'until they play something.'
+          : 'Nothing has played here yet, so every row is a typical platform '
+           +'profile. The first session on a device replaces its row with what '
+           +'really happened.'}</div>
+      <div class="capsout dim">${libs.map(L=>`<span><b>${esc(L)}</b> → ${
+        esc(((d.outputs||{})[L]||{})[side].join(', '))}</span>`).join('')}</div>
+      ${rows||'<div class="dim">no libraries configured</div>'}
+      <div class="capslegend dim"><span class="capscell ok">direct play</span>
+        <span class="capscell warn">may transcode</span>
+        <span class="capscell bad">transcodes</span>
+        <span>— hover a cell for the reason, click a device for the detail</span></div>
+    </div></div>`;
 }
 
 function codecSet(lib,side,key,val,on){
@@ -30521,6 +30624,50 @@ html.mobile .setwrap:not(.rail) .setmain,html.mobile .setwrap:not(.rail) #worker
 .cftest.ok{border:1px solid #1f4429;background:rgba(63,185,80,.07)}
 .cftest.bad{border:1px solid #5c2230;background:rgba(248,81,73,.07)}
 .cftest .warn{color:var(--warn)}
+.cfnote{grid-column:1 / -1;margin-top:7px;padding:7px 11px;
+  border-left:2px solid var(--acc);background:rgba(88,166,255,.06);
+  border-radius:0 5px 5px 0;font-size:11px;line-height:1.55;color:#a9b6c4;
+  max-width:104ch}
+.capswrap .cfbody{padding:10px 12px}
+.capsout{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:10.5px;
+  margin-bottom:9px;padding-bottom:8px;border-bottom:1px solid var(--line)}
+.capsout b{color:#c9d1d9;font-weight:600}
+.capsrow{border-top:1px solid #141a22;padding:6px 0}
+.capsrow:first-of-type{border-top:0}
+.capshead{display:flex;align-items:center;gap:8px;cursor:pointer;font-size:12.5px}
+.capshead:hover b{color:var(--acc)}
+.capsseen{font-size:9.5px;letter-spacing:.04em;color:var(--ok);border:1px solid #1f4429;
+  border-radius:9px;padding:0 7px}
+.capsguess{font-size:9.5px;letter-spacing:.04em;color:var(--dim);
+  border:1px solid var(--line);border-radius:9px;padding:0 7px}
+.capsx{font-size:10px;border-radius:9px;padding:1px 8px;border:1px solid var(--line)}
+.capsx.ok{color:var(--ok);border-color:#1f4429}
+.capsx.warn{color:var(--warn);border-color:#4d3d1a}
+.capsx.bad{color:var(--bad);border-color:#5e2b28}
+.capsgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));
+  gap:5px;margin:5px 0 0 18px}
+.capscell{display:block;font-size:10.5px;border-radius:5px;padding:4px 8px;
+  border:1px solid var(--line);background:#0b0e12;cursor:help;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.capscell i{display:block;font-style:normal;font-size:9.5px;letter-spacing:.04em;
+  color:var(--dim);text-transform:uppercase;overflow:hidden;text-overflow:ellipsis}
+.capscell.ok{color:var(--ok);border-color:#1f4429;background:rgba(63,185,80,.05)}
+.capscell.warn{color:var(--warn);border-color:#4d3d1a;background:rgba(210,153,34,.05)}
+.capscell.bad{color:var(--bad);border-color:#5e2b28;background:rgba(248,81,73,.05)}
+.capsnote{margin:7px 0 0 18px;font-size:10.5px;color:var(--dim);line-height:1.45}
+.capscodecs{margin:6px 0 2px 18px;display:flex;flex-wrap:wrap;gap:5px 16px}
+.capscl{font-size:10px}
+.capscl b{display:block;color:var(--dim);font-weight:500;margin-bottom:2px}
+.capsc{display:inline-block;border:1px solid var(--line);border-radius:4px;
+  padding:0 6px;margin:0 3px 3px 0;font-family:ui-monospace,Consolas,monospace;
+  cursor:help}
+.capsc.yes{color:var(--ok);border-color:#1f4429}
+.capsc.no{color:var(--bad);border-color:#5e2b28}
+.capsc.varies{color:var(--warn);border-color:#4d3d1a}
+.capslegend{display:flex;align-items:center;gap:7px;flex-wrap:wrap;
+  margin-top:9px;padding-top:8px;border-top:1px solid var(--line);font-size:10px}
+.capslegend .capscell{display:inline-block;cursor:default}
+@media(max-width:760px){.capsgrid{grid-template-columns:1fr 1fr}}
 #vcodecPane .lchips,#acodecPane .lchips,#alangPane .lchips{display:flex;flex-wrap:wrap;gap:5px;
   justify-content:flex-end}
 .cfbody{padding:2px 0}

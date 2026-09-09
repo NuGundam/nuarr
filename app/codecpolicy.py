@@ -256,7 +256,29 @@ FIELDS: dict[str, list[dict]] = {
          "default": ["aac"],
          "what": "Stereo tracks already in one of these formats are copied "
                  "untouched. AAC stereo is the one format every device plays "
-                 "without help."},
+                 "without help.",
+         # WHY eac3 IS NOT TICKED HERE, written down because it looks like an
+         # omission. It is in the surround list, and a stereo E-AC3 track is
+         # the same codec - so leaving it out reads as an oversight until you
+         # have had the argument, which was had on this server in September.
+         "note": "eac3 is deliberately absent, and stereo is the reason - the "
+                 "same codec is ticked for surround one row up. A stereo E-AC3 "
+                 "track from a streaming service is one of the least portable "
+                 "things a library can hold. Sony's Bravia app advertises "
+                 "E-AC3, then the TV's decoder stumbles on the stereo variant, "
+                 "so Plex falls back to transcoding the audio mid-stream and a "
+                 "skip-intro seek restarts that transcode and times out. Plex "
+                 "for Windows refuses E-AC3 outright on some audio devices and "
+                 "has the server convert it, and Plex's transcoder applies its "
+                 "own loudness handling on the way - which is why the same "
+                 "episode sounds several dB louder as E-AC3 than as AAC. "
+                 "Measured on this library, the conversion costs nothing: a "
+                 "Crunchyroll DDP 2.0 episode and nuarr's AAC of it are both "
+                 "-22.3 LUFS integrated, the same to a tenth of a decibel. "
+                 "What changes is that every client plays the AAC untouched. "
+                 "Tick eac3 here only if every device on this server is known "
+                 "to direct-play stereo E-AC3 - the panel below is the place "
+                 "to check that."},
         {"key": "dedupe_per_lang", "label": "Keep only the best track per language",
          "type": "bool", "default": True,
          "what": "Where a file carries two tracks in the same language, keep "

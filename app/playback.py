@@ -155,6 +155,35 @@ def _file_row(path: str) -> tuple[int | None, str]:
         return r["id"], display_label(r["title"], r["season"], r["episode"])
 
 
+def _src_audio_ch(fid, codec: str) -> int:
+    """The source track's channel count, from nuarr's own probe.
+
+    NOT FROM THE SESSION. On a transcoding session Media/Part/Stream carries
+    the target, so reading channels there records "the client refused eac3 2.0"
+    for a 5.1 track Plex was downmixing - which is the opposite of the truth
+    and would teach the capability table something false about the device.
+    """
+    if not fid or not codec:
+        return 0
+    try:
+        with cursor() as cur:
+            r = cur.execute("SELECT json FROM file_probes WHERE file_id=?",
+                            (fid,)).fetchone()
+        if not r:
+            return 0
+        import json as _j
+        best = 0
+        for st in _j.loads(r["json"]).get("streams", []):
+            if st.get("codec_type") != "audio":
+                continue
+            if str(st.get("codec_name") or "").lower() == codec.lower():
+                return int(st.get("channels") or 0)
+            best = best or int(st.get("channels") or 0)
+        return best
+    except Exception:                                        # noqa: BLE001
+        return 0
+
+
 def _src_height(fid) -> str:
     """The file's real vertical resolution, from nuarr's stored probe.
 
@@ -207,7 +236,28 @@ def _record(sess: dict) -> int:
     # A clean direct play is the expected outcome and there are thousands of
     # them. Recording every one would bury the interesting rows in noise, so
     # only work Plex had to do is written down.
+    #
+    # IT IS STILL EVIDENCE, THOUGH, and of the kind nothing else here collects.
+    # Every event row is a record of a FAILURE, so a table built only from them
+    # can say which codecs a device refuses and never which it accepts - and
+    # "the Apple TV has no complaints on file" and "the Apple TV has never been
+    # used" are indistinguishable in that reading. A direct play is the proof
+    # that the codec was fine, so it is counted, cheaply, per codec rather than
+    # per session.
     if decision == "direct play":
+        try:
+            from . import clientcaps
+            for st in streams:
+                k = _KIND.get(int(st.get("streamType") or 0), "")
+                if k not in ("video", "audio"):
+                    continue
+                clientcaps.note(player.get("product") or "",
+                                player.get("title") or "", k,
+                                str(st.get("codec") or ""),
+                                int(st.get("channels") or 0) if k == "audio" else 0,
+                                ok=True)
+        except Exception:                                    # noqa: BLE001
+            pass
         return 0
 
     fid, title = _file_row(path)
@@ -250,10 +300,27 @@ def _record(sess: dict) -> int:
         src_wh = dst_wh = ""              # no resize; do not imply one
 
     rows = []
+    try:
+        from . import clientcaps as _cc
+    except Exception:                                        # noqa: BLE001
+        _cc = None
     for st in streams:
         act = str(st.get("decision") or "").lower()
         if act in ("", "copy"):
-            continue                       # this stream was fine
+            # THIS STREAM WAS FINE, and that is worth writing down even though
+            # the session as a whole was not: a file that transcoded because of
+            # its video is a clean bill of health for its audio, on this exact
+            # device. Half the useful evidence in this system arrives inside
+            # sessions that failed for some other reason.
+            if _cc and act == "copy":
+                k = _KIND.get(int(st.get("streamType") or 0), "")
+                if k in ("video", "audio"):
+                    _cc.note(player.get("product") or "",
+                             player.get("title") or "", k,
+                             str(st.get("codec") or ""),
+                             int(st.get("channels") or 0) if k == "audio" else 0,
+                             ok=True)
+            continue
         kind = _KIND.get(int(st.get("streamType") or 0), "?")
         # THE STREAM BLOCK DESCRIBES PLEX'S OUTPUT, NOT THE FILE.
         #
@@ -306,6 +373,16 @@ def _record(sess: dict) -> int:
                     detail += f" ({src_wh} → {dst_wh})"
                 elif dst_wh:
                     detail += f" (down to {dst_wh})"
+        # A REFUSAL, BUT ONLY WHEN THE CODEC WAS THE REASON. A stream re-encoded
+        # to the same codec was not rejected - it was resized, or squeezed to
+        # fit a bandwidth cap - and recording that as "this device cannot play
+        # h264" would poison the capability table with the one failure mode
+        # that has nothing to do with the device's decoders.
+        if _cc and kind in ("video", "audio") and src and dst and src != dst:
+            _cc.note(player.get("product") or "", player.get("title") or "",
+                     kind, src,
+                     _src_audio_ch(fid, src) if kind == "audio" else 0,
+                     ok=False)
         # Why the ceiling exists, appended to whichever line applies. This is
         # the part that turns "Plex worked" into "and here is what to change".
         if cap and kind in ("video", "audio") and (not src or src == dst):
@@ -328,11 +405,19 @@ def _record(sess: dict) -> int:
     written = 0
     with cursor() as cur:
         for r in rows:
-            kind, act = r[8], r[9]
+            kind, act, srcc = r[8], r[9], r[10]
+            # THE SOURCE CODEC IS PART OF WHAT MAKES THIS ROW THIS ROW.
+            # Without it, a session carrying two audio tracks - or one where
+            # the viewer switched track half way - folded both into the first
+            # row and then overwrote its detail with the second track's
+            # sentence. That left rows in this table reading src_codec=aac
+            # alongside "the client would not take eac3", which is not a
+            # description of anything that happened.
             hit = cur.execute(
                 "SELECT id, hits FROM playback_events "
                 " WHERE session=? AND stream_kind=? AND stream_act=? "
-                " ORDER BY id DESC LIMIT 1", (sid, kind, act)).fetchone()
+                "   AND COALESCE(src_codec,'')=? "
+                " ORDER BY id DESC LIMIT 1", (sid, kind, act, srcc or "")).fetchone()
             if hit:
                 # Same session, same stream, still being worked on. Move the
                 # end marker and count the sighting; do not add a row.
