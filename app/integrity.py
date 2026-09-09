@@ -46,7 +46,7 @@ import re
 import time
 
 from . import joblog
-from .config import SETTINGS
+from .config import NO_WINDOW, SETTINGS
 from .db import cursor
 
 # How many seconds to decode at each end.
@@ -145,9 +145,18 @@ async def _decode(path: str, ss: float, dur: float) -> tuple[int, str]:
     args += ["-i", path, "-t", f"{dur:.2f}", "-map", "0:v:0?",
              "-f", "null", "-"]
     try:
+        # NO_WINDOW, AND THE CONSOLE WATCHER IS WHY THIS COMMENT EXISTS.
+        #
+        # This spawn shipped without it and the first sweep put nine ffmpeg
+        # console windows on the desktop - caught, named and dated by
+        # consolewatch within the hour, which is the entire reason that watcher
+        # was written. config.py states the rule plainly: every child process
+        # nuarr spawns must pass this flag, because the server runs as a
+        # service and a console-subsystem child with no console of its own gets
+        # given a brand new visible one by Windows.
         proc = await asyncio.create_subprocess_exec(
             *args, stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE)
+            stderr=asyncio.subprocess.PIPE, creationflags=NO_WINDOW)
         _, err = await asyncio.wait_for(proc.communicate(), timeout=240)
         return proc.returncode or 0, (err or b"").decode("utf-8", "replace")
     except asyncio.TimeoutError:
@@ -206,6 +215,18 @@ def _candidates(limit: int) -> list[dict]:
     """
     if not _READY:
         init()
+    # THE FILE'S CLOCK, NOT NUARR'S BOOKKEEPING CLOCK.
+    #
+    # This read files.updated_at, which is when nuarr last touched the ROW -
+    # and the boot recovery walk touches every row it looks at. Measured on
+    # this box straight after a restart: 39,710 of 39,710 files had an
+    # updated_at inside the settling window, so the candidate query returned
+    # nothing at all and the sweep reported "tested 0" while looking perfectly
+    # healthy. A filter meant to skip the handful of files still being written
+    # was excluding the entire library.
+    #
+    # mtime is the filesystem's own answer to "when was this last written",
+    # which is the question that was being asked.
     cutoff = time.time() - SETTLE_S
     with cursor() as cur:
         return [dict(r) for r in cur.execute(
@@ -217,7 +238,7 @@ def _candidates(limit: int) -> list[dict]:
             " WHERE f.state NOT IN ('deleted','duplicate') "
             "   AND COALESCE(f.path,'') != '' "
             "   AND COALESCE(f.size,0) > 0 "
-            "   AND COALESCE(f.updated_at, 0) < ? "
+            "   AND COALESCE(f.mtime, 0) < ? "
             "   AND (i.file_id IS NULL OR i.verdict = '') "
             " ORDER BY f.id LIMIT ?", (cutoff, int(limit)))]
 

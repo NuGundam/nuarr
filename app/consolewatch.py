@@ -45,6 +45,10 @@ from . import joblog
 from .db import cursor
 
 EVERY_S = 2.0
+# How far back "is this happening" reaches. Seven days is long enough that a
+# flash on Sunday is still on the health page on Friday, and short enough that
+# a bug fixed a fortnight ago stops shouting about itself.
+RECENT_S = 7 * 24 * 3600
 # A console that opens and closes inside one sampling gap is missed. Two
 # seconds catches anything a person would notice as a flash while costing
 # nothing; going faster buys very little and starts to be visible in the
@@ -448,6 +452,26 @@ def recent(limit: int = 200, ours_only: bool = False) -> dict:
             tot = cur.execute(
                 "SELECT COUNT(*) n, SUM(ours) ours FROM console_windows"
             ).fetchone()
+            # A HEALTH ROW THAT CANNOT GO GREEN AGAIN STOPS BEING READ.
+            #
+            # The health page warned on the ALL-TIME count, so the moment one
+            # console had ever been caught the row was red for good - the only
+            # way back was to press Forget, which throws away the evidence to
+            # silence the alarm about it. That is the shape of a check people
+            # learn to ignore: it says the same thing after the bug is fixed as
+            # it did while the bug was live.
+            #
+            # A window instead. The log keeps everything, because "has this
+            # ever happened" is a real question; the warning is about whether
+            # it is happening NOW, which is a different one and the only one
+            # that can be acted on.
+            rec = cur.execute(
+                "SELECT COUNT(*) n FROM console_windows "
+                " WHERE ours=1 AND at > ?",
+                (time.time() - RECENT_S,)).fetchone()
+            last = cur.execute(
+                "SELECT MAX(at) m FROM console_windows WHERE ours=1"
+            ).fetchone()
             # Grouped by WHO IS BEHIND IT, not by what got the console. Ten
             # rows of "cmd.exe" says nothing; "cmd.exe, from windows-mcp" and
             # "cmd.exe, from Plex" are two different problems.
@@ -458,8 +482,12 @@ def recent(limit: int = 200, ours_only: bool = False) -> dict:
                 "ORDER BY n DESC LIMIT 30")]
     except Exception as e:                                   # noqa: BLE001
         return {"rows": [], "by_source": [], "total": 0, "ours": 0,
+                "ours_recent": 0, "ours_last_at": 0.0, "recent_s": RECENT_S,
                 "error": f"{type(e).__name__}"}
     return {"rows": rows, "by_source": by,
+            "ours_recent": int(rec["n"] or 0),
+            "ours_last_at": float((last["m"] if last else 0) or 0),
+            "recent_s": RECENT_S,
             "total": int(tot["n"] or 0), "ours": int(tot["ours"] or 0),
             "watching": bool(STATE.get("running")),
             "since": STATE.get("started_at") or 0.0,

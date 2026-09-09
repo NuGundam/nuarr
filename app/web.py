@@ -5334,6 +5334,16 @@ def api_health():
             "check unavailable", warn=False,
             when="the arrs' own report")
 
+    def _ago_words(at: float) -> str:
+        if not at:
+            return "never"
+        d = max(0.0, time.time() - at)
+        if d < 3600:
+            return f"{int(d // 60)}m ago"
+        if d < 86400:
+            return f"{int(d // 3600)}h ago"
+        return f"{int(d // 86400)}d ago"
+
     try:
         # recent() returns the whole report, not a list - rows carry each
         # sighting and "ours" is already counted. The first version iterated
@@ -5342,9 +5352,20 @@ def api_health():
         from . import consolewatch
         rep = consolewatch.recent() or {}
         ours = int(rep.get("ours") or 0)
-        add("consoles", "Console windows nuarr let slip", "logs", ours,
-            f"{ours} visible console(s) traced back to nuarr"
-            if ours else "nothing nuarr spawned has shown a window",
+        # WARN ON WHAT IS HAPPENING, COUNT WHAT HAS HAPPENED. The row used to
+        # warn on the all-time total, so one console ever caught meant a red
+        # row for good and the only way back was Forget - deleting the evidence
+        # to silence the alarm about it. The log still holds everything; the
+        # warning is about the last week, which is the part somebody can act
+        # on. See consolewatch.RECENT_S.
+        recent = int(rep.get("ours_recent") or 0)
+        last = float(rep.get("ours_last_at") or 0)
+        add("consoles", "Console windows nuarr let slip", "logs", recent,
+            (f"{recent} in the last 7 days"
+             + (f", {ours} ever" if ours > recent else "")) if recent
+            else (f"none in the last 7 days ({ours} on record, last "
+                  f"{_ago_words(last)})" if ours
+                  else "nothing nuarr spawned has shown a window"),
             when="watched continuously")
     except Exception:                                        # noqa: BLE001
         add("consoles", "Console windows nuarr let slip", "logs", 0,
