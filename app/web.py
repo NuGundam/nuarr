@@ -14998,16 +14998,37 @@ async function drill(q){
 // back to its first line - mid-read. A finished job's transcript does not
 // change, so there is nothing to gain by repainting it.
 let _drillBusy=false;
+// EVERY FREEZE IS A PAUSE, NOT A STOP. Each of these guards used to return
+// without rescheduling, so whichever timer reached one was the last timer
+// there would ever be: open a transcript, or scroll the list once, and the
+// drill-down stopped refreshing for good - until it was closed and reopened,
+// which is not a fix anybody would think to try, because from the outside the
+// list simply looked correct and quietly went stale. Rescheduling on the way
+// out of every branch is the whole of it.
+//
+// The panel being CLOSED is the one case that still stops the timer, and
+// deliberately: drill() calls drillSchedule() when it opens, so nothing is
+// lost, and a closed panel has no business waking up every five seconds.
 async function drillTick(){
   const p=document.getElementById('drillPanel');
   if(!p || p.style.display==='none' || !drillQuery) return;
-  if(_drillBusy) return;
-  if(_drillLogId) return;                    // frozen: a transcript is open
-  const box=document.getElementById('drillBody');
-  if(box && box.scrollTop>40) return;        // frozen: they are reading it
-  _drillBusy=true;
-  try{ await drillRefresh(true); } finally{ _drillBusy=false; }
-  drillSchedule();
+  try{
+    if(_drillBusy) return;
+    if(_drillLogId) return;                  // frozen: a transcript is open
+    // FROZEN: A QUESTION IS WAITING FOR AN ANSWER. Outranks the refresh -
+    // a stale row is a small wrong, and erasing "5.24 GB is deleted. This
+    // cannot be undone" out from under the person reading it is a large one.
+    if(askOpen('drillBody')){
+      const c=document.getElementById('drillCount');
+      if(c && c.textContent.indexOf('answer') < 0)
+        c.textContent += ' · paused while you answer';
+      return;
+    }
+    const box=document.getElementById('drillBody');
+    if(box && box.scrollTop>40) return;      // frozen: they are reading it
+    _drillBusy=true;
+    try{ await drillRefresh(true); } finally{ _drillBusy=false; }
+  } finally { drillSchedule(); }
 }
 // THE HELD LIST IS A COUNTDOWN, so it needs a countdown's refresh rate. Every
 // other drill-down is a list of facts that change when a job finishes; Held
@@ -15301,13 +15322,19 @@ async function refetchAsk(id, fromAttn, btn){
       r = await (await fetch(`/api/files/${id}/refetch?confirm=${id}`,
                              {method:'POST'})).json();
     }catch(err){ r = {ok:false, why:String(err)}; }
-    host.dataset.asking='';
     put(r.ok
       ? `<span style="color:var(--ok);font-size:11px">${esc((r.did||[]).join('; ')||'done')}</span>`
       : `<span class="err" style="font-size:11px">${esc(r.why||'failed')}`
         + ((r.did&&r.did.length)?` <span class="dim">(already done: ${esc(r.did.join('; '))})</span>`:'')
         + '</span>');
-    setTimeout(()=>{ if(fromAttn) loadAttention(true); else drillRefresh(true); }, 1500);
+    // THE MARK IS RELEASED WITH THE REFRESH, NOT BEFORE IT. Clearing it here
+    // and repainting a second and a half later left a window in which the
+    // free-running poll could wipe the outcome - so the one line telling you
+    // what was blocklisted could vanish as fast as the question did. The
+    // deliberate refresh below is what should replace it, and now it is the
+    // only thing that can.
+    setTimeout(()=>{ host.dataset.asking='';
+                     if(fromAttn) loadAttention(true); else drillRefresh(true); }, 1500);
   };
 }
 
@@ -17797,6 +17824,24 @@ const _auFix = {};
 // The previous markup is kept and restored on Cancel. It has to be: these
 // buttons carry inline onclick attributes, so putting the HTML back puts the
 // handlers back with it.
+// IS SOMEBODY BEING ASKED SOMETHING IN HERE?
+//
+// askInline() and refetchAsk() both mark their host with data-asking while
+// they wait for an answer. Nothing read that mark, so the drill-down's
+// five-second poll rebuilt the whole table underneath the question and took it
+// with it: press "Blocklist & re-download", start reading the two lines saying
+// which release is about to be blocklisted and how many GB are about to be
+// deleted, and the confirmation vanishes before you can answer it.
+//
+// That is worse than a lost click. The question is the only place nuarr states
+// what it is about to destroy, and a question that disappears mid-read trains
+// somebody to press the button twice and agree faster the second time - which
+// is exactly the habit a confirmation exists to prevent.
+function askOpen(scope){
+  const el = (typeof scope === 'string') ? document.getElementById(scope) : scope;
+  return !!(el && el.querySelector('[data-asking="1"]'));
+}
+
 function askInline(btn, msg, yesLabel, run){
   if(!btn) return;
   const host=btn.closest('td, .askhost') || btn.parentElement;
