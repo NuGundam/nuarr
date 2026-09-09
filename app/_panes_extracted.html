@@ -108,6 +108,15 @@
       <div id="metaPane" style="display:none">
         <div id="metaBody" style="padding:10px 14px"></div>
       </div>
+      <div id="dpPane" style="display:none">
+        <div class="dim" style="padding:9px 14px 0;font-size:11px">
+          What StableBit DrivePool is doing to the pool right now &mdash; balancing,
+          duplicating, removing a disk &mdash; read from DrivePool's own service log,
+          and which of Nuarr's operations wait for it to finish. Each hold is a
+          switch, like the arr renaming and import holds.
+        </div>
+        <div id="dpBody" style="padding:10px 14px 12px"></div>
+      </div>
       <div id="mkvPane" style="display:none">
         <div class="dim" style="padding:9px 14px;font-size:11px">
           The muxer behind subtitle embedding and every header edit. Nuarr
@@ -308,6 +317,31 @@
           stream. So the settings here are tested before they are saved.
         </div>
         <div id="plexBody" style="padding:0 14px 14px">
+          <div class="dim" style="padding:14px">loading&hellip;</div>
+        </div>
+        <div class="lkind" id="pxsCard" style="margin:0 14px 14px;padding:11px 12px">
+          <b style="color:#6fb0ff">Does Plex still agree with the files?</b>
+          <div id="pxsBody" style="margin-top:7px">
+            <span class="dim" style="font-size:11.5px">loading&hellip;</span>
+          </div>
+        </div>
+      </div>
+      <div id="tautPane" style="display:none">
+        <div class="dim" style="padding:9px 14px;font-size:11px">
+          Tautulli watches the same Plex server Nuarr does and keeps every play
+          it has ever seen. Nuarr uses it for two things, and neither is
+          required &mdash; without it Nuarr asks Plex directly and learns what
+          devices play from its own watching, which starts from nothing on the
+          day it is installed.
+        </div>
+        <div style="padding:0 14px 6px;display:flex;align-items:center;gap:8px">
+          <button class="gapchk" id="tautRefresh" style="font-size:10.5px;padding:1px 8px"
+            onclick="loadTautulli(true)"
+            title="Re-read the connection and what has been learned">Refresh</button>
+          <span class="dim" style="font-size:10.5px">re-reads the connection
+            and the counts below</span>
+        </div>
+        <div id="tautBody" style="padding:0 14px 14px">
           <div class="dim" style="padding:14px">loading&hellip;</div>
         </div>
       </div>

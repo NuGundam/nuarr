@@ -351,6 +351,7 @@ def import_tautulli(walk: int = _TAUT_WALK) -> dict:
                                 learned += 1
                                 TAUT["learned"] = learned
         kv_set("clientcaps.taut_row", str(high))
+        kv_set("clientcaps.taut_at", str(time.time()))
         # THE VAGUE ROWS GO NOW THAT THERE ARE PRECISE ONES. The one-off read
         # of nuarr's old events could only say "eac3 was refused" with no
         # channel count, and leaving those beside Tautulli's exact rows means
@@ -373,8 +374,107 @@ def import_tautulli(walk: int = _TAUT_WALK) -> dict:
 def taut_state() -> dict:
     base, key = _taut_cfg()
     from .db import kv_get
+    last = float(kv_get("clientcaps.taut_at") or 0)
     return {**TAUT, "configured": bool(base and key), "url": base,
-            "imported_to": int(kv_get("clientcaps.taut_row") or 0)}
+            "imported_to": int(kv_get("clientcaps.taut_row") or 0),
+            "auto": taut_auto(), "every_h": taut_every_h(),
+            "last_ok": last,
+            # No last run means no next one to name - it happens when the
+            # watcher next comes round, and saying so beats printing 1970.
+            "next_at": (last + taut_every_h() * 3600
+                        if (taut_auto() and last) else 0.0)}
+
+
+def taut_auto() -> bool:
+    """Whether the recurring import is on. On by default, because the whole
+    point of a capability table is that it does not go stale."""
+    from .db import kv_get
+    return (kv_get("clientcaps.auto") or "1") == "1"
+
+
+def taut_every_h() -> float:
+    from .db import kv_get
+    try:
+        return max(1.0, float(kv_get("clientcaps.every_h") or 6))
+    except Exception:                                        # noqa: BLE001
+        return 6.0
+
+
+def set_taut_auto(on: bool, every_h: float | None = None) -> dict:
+    from .db import kv_set
+    kv_set("clientcaps.auto", "1" if on else "0")
+    if every_h:
+        kv_set("clientcaps.every_h", str(max(1.0, float(every_h))))
+    return taut_state()
+
+
+def stats() -> dict:
+    """What the table knows, for the Tautulli page's own summary."""
+    out = {"rows": 0, "devices": 0, "played": 0, "refused": 0,
+           "by_src": {}, "newest": 0.0, "oldest": 0.0}
+    try:
+        if not _READY:
+            init()
+        with cursor() as cur:
+            r = cur.execute(
+                "SELECT COUNT(*) n, COUNT(DISTINCT product||'|'||client) d, "
+                "       COALESCE(SUM(played),0) p, COALESCE(SUM(refused),0) x, "
+                "       MAX(last_at) hi, MIN(first_at) lo FROM client_caps"
+            ).fetchone()
+            out.update(rows=r["n"], devices=r["d"], played=r["p"],
+                       refused=r["x"], newest=r["hi"] or 0.0,
+                       oldest=r["lo"] or 0.0)
+            for s in cur.execute("SELECT COALESCE(src,'?') s, COUNT(*) n "
+                                 "  FROM client_caps GROUP BY 1"):
+                out["by_src"][s["s"]] = s["n"]
+    except Exception:                                        # noqa: BLE001
+        pass
+    return out
+
+
+async def watch() -> None:
+    r"""Keep the capability table current, on a timer.
+
+    A CAPABILITY TABLE THAT IS NEVER TOPPED UP IS A TABLE THAT SLOWLY BECOMES
+    A LIE. Devices get firmware, people buy new televisions, an app rewrites
+    its decoder list - and the panel would go on quoting a year-old sighting
+    with total confidence. The import is incremental by row id, so a run that
+    finds nothing new costs one API call.
+    """
+    import asyncio
+    from . import joblog, schedules
+    schedules.register(
+        "clientcaps", "Tautulli capability import", "Library",
+        taut_every_h() * 3600,
+        what="Reads Tautulli's newest play history and records which codecs, "
+             "at which channel counts, each device played untouched or had "
+             "transcoded. Feeds the 'Will each device play this?' panel on "
+             "the codec pages. Incremental - a run with nothing new is one "
+             "API call.",
+        toggle="clientcaps.auto")
+    from .db import kv_get, kv_set
+    kv_set("clientcaps.auto", "1" if taut_auto() else "0")   # so the switch shows
+    await asyncio.sleep(150)          # let the first scan and Plex settle
+    while True:
+        schedules.beat("clientcaps")
+        try:
+            base, key = _taut_cfg()
+            last = float(kv_get("clientcaps.taut_at") or 0)
+            due = time.time() - last >= taut_every_h() * 3600
+            if taut_auto() and base and key and due and not TAUT["running"]:
+                with joblog.section("Tautulli capability import"):
+                    d = await asyncio.to_thread(import_tautulli)
+                    if d.get("error"):
+                        joblog.log(f"Tautulli import: {d['error']}", "warn")
+                    elif d.get("learned"):
+                        joblog.log(
+                            f"Tautulli: read {d.get('done', 0)} session(s) and "
+                            f"learned {d['learned']} fact(s) about what "
+                            f"{d.get('devices', 0)} device(s) will play", "ok")
+        except Exception as e:                               # noqa: BLE001
+            joblog.log(f"Tautulli capability import: "
+                       f"{type(e).__name__}: {e}", "warn")
+        await asyncio.sleep(900)
 
 
 def observed() -> dict:

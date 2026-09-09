@@ -706,6 +706,12 @@ async def _startup() -> None:
         from . import drivepool
         drivepool.init()
         asyncio.create_task(drivepool.watch())
+        # What every device will actually play, topped up from Tautulli's
+        # history on a timer. Incremental, so a run with nothing new is one
+        # API call.
+        from . import clientcaps as _cc
+        _cc.init()
+        asyncio.create_task(_cc.watch())
         # Filesystem change tracking: per-library rescans instead of full
         # scans every few hours. Hands it the scan runner rather than
         # importing web from the module (cycle).
@@ -7268,6 +7274,150 @@ def api_jobs(recent: int = Query(60, le=1000)):
     return jobs.snapshot(recent_limit=recent) | {"system": system.snapshot()}
 
 
+_TAUT_PROBE: dict = {"at": 0.0, "d": None}
+
+
+@app.get("/api/tautulli")
+async def api_tautulli():
+    r"""Everything the Tautulli page draws itself from.
+
+    ONE ENDPOINT, because the page is one question - is it connected, what is
+    nuarr using it for, and how current is what it has learned - and three
+    endpoints polling in step is how three numbers on one page end up
+    disagreeing about the same moment.
+    """
+    from . import clientcaps
+
+    def _work():
+        base = (SETTINGS.tautulli_url or "").rstrip("/")
+        key = SETTINGS.tautulli_api_key or ""
+        # Reuse a recent probe rather than adding two requests to a queue two
+        # thousand deep. 60 s, or for as long as the import is running.
+        cached = _TAUT_PROBE["d"]
+        fresh = (cached and cached.get("url") == base
+                 and (clientcaps.TAUT["running"]
+                      or time.time() - _TAUT_PROBE["at"] < 60.0))
+        out = {"url": base, "key_set": bool(key), "ok": False, "detail": "",
+               "version": "", "history": None,
+               "caps": clientcaps.stats(), "import": clientcaps.taut_state(),
+               # WHAT NUARR ACTUALLY USES IT FOR, listed rather than implied.
+               # Tautulli was a fallback for one thing and is now a source for
+               # two, and the page that owns the connection should be the page
+               # that says so.
+               "uses": [
+                   {"what": "Who is watching right now",
+                    "where": "Job gate", "goto": "plex",
+                    "on": not SETTINGS.plex_direct,
+                    "note": "Only as the fallback when asking Plex directly is "
+                            "off or Plex does not answer. get_activity takes "
+                            "about 2.4 s here against tens of milliseconds "
+                            "from Plex, which is why direct is preferred."},
+                   {"what": "What every device will play untouched",
+                    "where": "Video and Audio codec", "goto": "acodec",
+                    "on": True,
+                    "note": "The play history carries the source codec, the "
+                            "source CHANNEL COUNT and a per-stream decision on "
+                            "every session - the evidence nuarr's own log "
+                            "cannot supply, because it never wrote down a "
+                            "direct play and never recorded how many channels "
+                            "a refused track had."},
+               ]}
+        if not base or not key:
+            out["detail"] = ("Not configured. Without it nuarr still works - "
+                             "it asks Plex directly - but the device panel on "
+                             "the codec pages has only what it has watched "
+                             "since it was installed.")
+            return out
+        if fresh:
+            out.update(ok=cached["ok"], detail=cached["detail"],
+                       version=cached["version"], history=cached["history"])
+            return out
+        try:
+            import httpx
+            r = httpx.get(base + "/api/v2",
+                          params={"apikey": key, "cmd": "get_history",
+                                  "length": 1}, timeout=12.0)
+            if r.status_code != 200:
+                out["detail"] = f"Tautulli answered {r.status_code}"
+                return out
+            d = (r.json().get("response") or {}).get("data") or {}
+            out["ok"] = True
+            out["history"] = d.get("recordsFiltered") or d.get("recordsTotal")
+            out["detail"] = "connected"
+            try:
+                v = httpx.get(base + "/api/v2",
+                              params={"apikey": key, "cmd": "get_server_info"},
+                              timeout=8.0).json()
+                out["version"] = str(((v.get("response") or {}).get("data")
+                                      or {}).get("pms_version") or "")
+            except Exception:                                # noqa: BLE001
+                pass
+        except Exception as e:                               # noqa: BLE001
+            out["detail"] = f"could not reach {base}: {str(e)[:120]}"
+        _TAUT_PROBE.update(at=time.time(), d={
+            "url": base, "ok": out["ok"], "detail": out["detail"],
+            "version": out["version"], "history": out["history"]})
+        return out
+
+    return await asyncio.to_thread(_work)
+
+
+@app.post("/api/tautulli/config")
+async def api_tautulli_config(body: dict = Body(...)):
+    """Save the Tautulli connection, tested first. A blank key keeps the stored one."""
+    import yaml
+    url = str(body.get("url") or "").strip().rstrip("/")
+    key = str(body.get("api_key") or "").strip() or (SETTINGS.tautulli_api_key or "")
+    if not url:
+        return {"ok": False, "error": "a URL is needed"}
+    if not key:
+        return {"ok": False, "error": "an API key is needed"}
+
+    def _test() -> str:
+        try:
+            import httpx
+            r = httpx.get(url + "/api/v2",
+                          params={"apikey": key, "cmd": "get_history",
+                                  "length": 1}, timeout=12.0)
+        except Exception as e:                               # noqa: BLE001
+            return f"could not reach {url}: {str(e)[:110]}"
+        if r.status_code != 200:
+            return f"Tautulli answered {r.status_code}"
+        if not (r.json().get("response") or {}).get("data"):
+            return "Tautulli answered, but rejected the API key"
+        return ""
+
+    err = await asyncio.to_thread(_test)
+    if err:
+        return {"ok": False, "error": err}
+    p = _config_path()
+    raw = {}
+    if p.exists():
+        try:
+            raw = yaml.safe_load(p.read_text(encoding="utf-8-sig")) or {}
+        except Exception:                                    # noqa: BLE001
+            raw = {}
+    raw.update({"tautulli_url": url, "tautulli_api_key": key})
+    p.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True),
+                 encoding="utf-8")
+    SETTINGS.tautulli_url = url
+    SETTINGS.tautulli_api_key = key
+    _TAUT_PROBE.update(at=0.0, d=None)          # re-probe on the next read
+    joblog.log(f"Tautulli connection saved: {url}", "ok")
+    return {"ok": True}
+
+
+@app.post("/api/tautulli/auto")
+async def api_tautulli_auto(on: bool = True, every_h: float = 0):
+    """Turn the recurring capability import on or off, and set its cadence."""
+    from . import clientcaps
+    d = clientcaps.set_taut_auto(on, every_h or None)
+    joblog.log("Tautulli capability import "
+               + (f"runs every {clientcaps.taut_every_h():.0f} h" if on
+                  else "switched off"), "info")
+    return {"ok": True, **d}
+
+
 @app.post("/api/clientcaps/tautulli")
 async def api_clientcaps_tautulli():
     r"""Learn from Tautulli's play history. Minutes, so it returns at once.
@@ -7295,6 +7445,7 @@ async def api_clientcaps(side: str = "video"):
     from . import clientcaps
     d = await asyncio.to_thread(clientcaps.matrix, side)
     d["tautulli"] = clientcaps.taut_state()
+    d["caps"] = clientcaps.stats()
     return d
 
 
@@ -21156,6 +21307,7 @@ const PANE_OF = {ffmpeg:'ffPane', backup:'bkPane',  rules:'rulesPane',
                  vcodec:'vcodecPane', acodec:'acodecPane',
                  alang:'alangPane', cache:'cachePane',
                  whisper:'whisperPane', plex:'plexPane',
+                 tautulli:'tautPane',
                  ocr:'ocrPane', plexwork:'plexworkPane', ruleschk:'ruleschkPane',
                  process:'processPane', notland:'notlandPane',
                  updates:'updPane', drivepool:'dpPane'};
@@ -21452,6 +21604,11 @@ function wtab(which){
   if(which==='drivepool'){
     if(hint) hint.textContent='· DrivePool';
     paneLoad('drivepool', loadDrivePool);
+    return;
+  }
+  if(which==='tautulli'){
+    if(hint) hint.textContent='· Tautulli';
+    paneLoad('tautulli', loadTautulli);
     return;
   }
   if(isAr){
@@ -24129,6 +24286,162 @@ async function loadLangSync(){
 
 // ---- Plex ------------------------------------------------------------
 let _plexCfg=null;
+
+// ---- Tautulli -------------------------------------------------------------
+// THE PAGE THAT OWNS THE CONNECTION OWNS THE JOBS THAT USE IT. The capability
+// import lived at the bottom of both codec pages, which is where its OUTPUT is
+// read and not where it belongs: a button that walks somebody else's database
+// for four minutes is an integration, and burying it under a settings list is
+// how it gets pressed by accident and never found on purpose.
+let _taut=null, _tautKey='', _tautPoll=null;
+async function loadTautulli(force){
+  const el=document.getElementById('tautBody');
+  if(!el){ if(_tautPoll) clearTimeout(_tautPoll); _tautPoll=null; return; }
+  tautBusy(true);
+  try{ _taut=await (await fetch('/api/tautulli')).json(); }
+  catch(e){ el.innerHTML='<div class="dim" style="padding:14px">could not load</div>';
+            tautBusy(false); return; }
+  tautPaint();
+  tautBusy(false);
+  if(_tautPoll) clearTimeout(_tautPoll);
+  if((_taut.import||{}).running)
+    _tautPoll=setTimeout(()=>{ if(document.getElementById('tautBody')) loadTautulli(true); }, 1200);
+}
+function tautBusy(on){
+  const b=document.getElementById('tautRefresh');
+  if(b) b.classList.toggle('spinning', !!on);
+}
+// REPAINTED ONLY WHEN SOMETHING CHANGED. This polls every 1.2 s while an
+// import runs, and rewriting the whole pane on each poll throws away the
+// caret you just opened, the text you were half way through typing in the URL
+// box, and the scroll position - which reads as the page flashing.
+function tautPaint(){
+  const el=document.getElementById('tautBody');
+  if(!el||!_taut) return;
+  const d=_taut, im=d["import"]||{}, cs=d.caps||{};
+  const state = d.ok ? 'connected' : (d.key_set||d.url ? 'not answering' : 'not configured');
+  const col = d.ok ? '#7fd4a3' : (d.url? '#e0575b' : '#8a97a6');
+  const hrs = (t)=>t? ago(t) : 'never';
+  const html=`
+    <div class="lkind" style="padding:11px 12px;margin-bottom:10px">
+      <div style="display:flex;justify-content:space-between;align-items:baseline;
+                  flex-wrap:wrap;gap:8px">
+        <b style="color:#6fb0ff">Connection</b>
+        <span style="color:${col};font-size:12px">${esc(state)}</span>
+      </div>
+      <div class="dim" style="font-size:11px;margin-top:5px">
+        ${esc(d.detail||'')}
+        ${d.history!=null?`<br><b style="color:#c2ccd6">${fmt(d.history)}</b>
+          plays on record${d.version?` · Plex ${esc(d.version)}`:''}`:''}
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:9px;align-items:center">
+        <input id="tuUrl" value="${esc(d.url||'')}" spellcheck="false"
+               placeholder="http://localhost:8181"
+               style="flex:1;min-width:240px;font-family:var(--mono,monospace);font-size:12px">
+        <input id="tuKey" type="password" spellcheck="false"
+               placeholder="${d.key_set?'key saved — leave blank to keep':'API key'}"
+               style="flex:1;min-width:200px;font-family:var(--mono,monospace);font-size:12px">
+        <button onclick="tautSave(this)">Test and save</button>
+        <span id="tuMsg" class="dim" style="font-size:11.5px"></span>
+      </div>
+      <div class="dim" style="font-size:11px;margin-top:5px">
+        The key is in Tautulli under <b>Settings &rarr; Web Interface &rarr; API</b>.
+        Nuarr reads it from Tautulli's own config file when they share a machine,
+        which is why this may already be filled in. It is stored server-side and
+        never sent back to this page.
+      </div>
+    </div>
+
+    <div class="lkind" style="padding:11px 12px;margin-bottom:10px">
+      <b style="color:#6fb0ff">What Nuarr uses it for</b>
+      <div class="tuses">${(d.uses||[]).map(u=>`
+        <div class="tuse">
+          <span class="tuon ${u.on?'y':'n'}">${u.on?'in use':'not in use'}</span>
+          <div><b>${esc(u.what)}</b>
+            <a href="#" onclick="wtab('${esc(u.goto)}');return false"
+               class="dim">${esc(u.where)}</a>
+            <div class="dim">${esc(u.note)}</div></div>
+        </div>`).join('')}</div>
+    </div>
+
+    <div class="lkind" style="padding:11px 12px">
+      <b style="color:#6fb0ff">Learning what each device plays</b>
+      <div style="font-size:11.5px;margin-top:2px;opacity:.85">A recurring job.
+        It reads Tautulli's newest sessions and records which codecs, at which
+        channel counts, every device played untouched or had transcoded.</div>
+      <div class="dim" style="font-size:11px;margin-top:4px">
+        This is evidence Nuarr cannot collect for itself: its own log records
+        only the sessions that went wrong, never a clean direct play, and when
+        it does record a refusal it has no way to know how many channels the
+        refused track had. That channel count is the whole difference between
+        &ldquo;this device cannot play E-AC3&rdquo; and &ldquo;this device
+        cannot play E-AC3 <i>in stereo</i>&rdquo;. Incremental by session id, so
+        a run that finds nothing new costs one request.
+      </div>
+      <div class="turow">
+        <button class="gapchk" ${im.running?'disabled':''}
+          onclick="tautImport(this)">${im.running?'reading…':(im.imported_to?'Read again now':'Read the history')}</button>
+        ${im.running?`<span class="busy" style="color:var(--acc)"><span class="sp"></span>
+            ${fmt(im.done||0)} of ${fmt(im.total||0)} sessions ·
+            ${fmt(im.learned||0)} facts learned</span>`
+          :`<span class="dim">${im.imported_to
+              ? `up to date with session #${fmt(im.imported_to)} · last run ${hrs(im.last_ok)}`
+              : 'never run'}</span>`}
+        ${im.error?`<span class="capserr">${esc(im.error)}</span>`:''}
+      </div>
+      <div class="turow">
+        <label style="display:flex;align-items:center;gap:6px;font-size:12px">
+          <input type="checkbox" id="tuAuto" ${im.auto?'checked':''}
+                 onchange="tautAuto(this.checked)">
+          <span>Keep it current on its own</span></label>
+        <span class="dim" style="font-size:11px">every
+          <input id="tuEvery" type="number" min="1" max="168" value="${im.every_h||6}"
+                 onchange="tautAuto(document.getElementById('tuAuto').checked,this.value)"
+                 style="width:52px;font-size:11px"> hours${
+          im.auto ? (im.next_at ? ` · next ${hrs(im.next_at)}`
+                                : ' · first run shortly after start-up') : ''}</span>
+      </div>
+      <div class="tustats dim">
+        <span><b>${fmt(cs.devices||0)}</b> devices known</span>
+        <span><b>${fmt(cs.rows||0)}</b> codec facts</span>
+        <span><b>${fmt(cs.played||0)}</b> plays untouched</span>
+        <span><b>${fmt(cs.refused||0)}</b> transcodes</span>
+        <span>read on the
+          <a href="#" onclick="wtab('vcodec');return false">Video</a> and
+          <a href="#" onclick="wtab('acodec');return false">Audio codec</a> pages</span>
+      </div>
+    </div>`;
+  if(html===_tautKey) return;            // nothing moved; leave the DOM alone
+  _tautKey=html;
+  el.innerHTML=html;
+}
+async function tautSave(btn){
+  const m=document.getElementById('tuMsg');
+  const old=btn.textContent; btn.disabled=true; btn.textContent='testing…';
+  try{
+    const r=await (await fetch('/api/tautulli/config',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({url:document.getElementById('tuUrl').value,
+                           api_key:document.getElementById('tuKey').value})})).json();
+    if(m){ m.style.color=r.ok?'#7fd4a3':'#e2b341';
+           m.textContent=r.ok?'connected and saved':(r.error||'failed'); }
+    if(r.ok){ _tautKey=''; setTimeout(()=>loadTautulli(true), 700); }
+  }catch(e){ if(m){ m.style.color='#e2b341'; m.textContent='could not save'; } }
+  btn.disabled=false; btn.textContent=old;
+}
+async function tautImport(btn){
+  if(btn){ btn.disabled=true; btn.textContent='starting…'; }
+  try{ await fetch('/api/clientcaps/tautulli',{method:'POST'}); }catch(e){}
+  _tautKey='';
+  loadTautulli(true);
+}
+async function tautAuto(on, every){
+  try{ await fetch('/api/tautulli/auto?on='+(on?'true':'false')
+                   +(every?'&every_h='+encodeURIComponent(every):''),
+                   {method:'POST'}); }catch(e){}
+  _tautKey='';
+  loadTautulli(true);
+}
 
 async function loadPlexCfg(){
   const el=document.getElementById('plexBody');
@@ -27688,7 +28001,7 @@ async function alFix(fileId, track, code, btn){
 let _cod=null, _codSide='video', _codDirty=false;
 
 async function loadCodecTab(side){
-  if(side && side!==_codSide){ _caps=null; _capsSide=''; }
+  if(side && side!==_codSide){ _caps=null; _capsSide=''; _capsKey=''; }
   if(side) _codSide=side;
   const el=document.getElementById(_codSide==='video'?'vcodecBody':'acodecBody');
   if(!el) return;
@@ -27905,6 +28218,11 @@ Nothing is saved and no library file is touched.">Test these settings</button>
 // that every device here direct-plays it - so the claim is checked, per device
 // and per library, against what those devices have actually done.
 let _caps=null, _capsSide='', _capsOpen=new Set(), _capsPoll=null, _capsAll=false;
+let _capsKey='';
+function capsBusy(on){
+  const b=document.getElementById('capsRefresh');
+  if(b) b.classList.toggle('spinning', !!on);
+}
 function capsShown(){
   try{ return localStorage.getItem('nuarr.caps')==='open'; }catch(e){ return false; }
 }
@@ -27922,12 +28240,19 @@ async function capsLoad(force){
   if(!el){ if(_capsPoll) clearTimeout(_capsPoll); _capsPoll=null; return; }
   if(!capsShown()&&!force&&!_caps){ capsPaint(); return; }
   if(force||_capsSide!==_codSide||!_caps){
-    el.innerHTML='<div class="skel" style="padding:12px"><i style="width:45%"></i>'
-                +'<i style="width:75%"></i></div>';
+    // A SKELETON ONLY WHEN THERE IS NOTHING TO KEEP. Replacing a panel that is
+    // already on screen with a grey placeholder every time it refreshes is the
+    // flash; when there is something to look at, it stays and the button spins.
+    if(!_caps||_capsSide!==_codSide)
+      el.innerHTML='<div class="skel" style="padding:12px"><i style="width:45%"></i>'
+                  +'<i style="width:75%"></i></div>';
+    capsBusy(true);
     try{ _caps=await (await fetch('/api/clientcaps?side='+_codSide)).json();
          _capsSide=_codSide; }
-    catch(e){ el.innerHTML='<div class="dim">could not load the device list</div>';
+    catch(e){ capsBusy(false);
+              if(!_capsKey) el.innerHTML='<div class="dim">could not load the device list</div>';
               return; }
+    capsBusy(false);
   }
   capsPaint();
   // WHILE THE IMPORT RUNS, keep asking. It walks thousands of history rows and
@@ -27947,7 +28272,7 @@ function capsPaint(){
     // one number worth knowing before you decide to look.
     const n=_caps?(_caps.devices||[]).filter(x=>Object.values(x.cells||{})
              .some(c=>c.state==='bad')).length:null;
-    el.innerHTML=`<div class="lkind capswrap">
+    const shut=`<div class="lkind capswrap">
       <div class="lkindhead ckhead" onclick="capsShow(true)"
            title="Check these settings against every device this server knows">
         <span class="ccaret">▸</span>
@@ -27958,10 +28283,11 @@ function capsPaint(){
           :n?`<b class="cchg">${n} device${n===1?'':'s'} would transcode</b>`
             :'<b style="color:var(--ok)">every device direct-plays it</b>'}</span>
       </div></div>`;
+    if(shut!==_capsKey){ _capsKey=shut; el.innerHTML=shut; }
     return;
   }
   const d=_caps, libs=d.libraries||[], side=d.side;
-  const T=d.tautulli||{};
+  const T=d.tautulli||{}, cs=d.caps||{};
   // SIXTY-SEVEN DEVICES IS A LIST, NOT AN ANSWER. Tautulli's history reaches
   // back years and includes every phone every guest has ever used, and a panel
   // that opens on all of them is one nobody reads to the bottom. The ones that
@@ -28011,27 +28337,25 @@ function capsPaint(){
   // which is the column that decides whether "this device refused E-AC3" meant
   // stereo or 5.1.
   const taut = !T.configured
-    ? `<span class="dim">Tautulli is not configured, so this is built from
-       what nuarr has watched since it was installed.</span>`
+    ? `<span class="dim">Built from what nuarr has watched since it was
+       installed. <a href="#" onclick="wtab('tautulli');return false">Connect
+       Tautulli</a> and it can read years of play history instead.</span>`
     : T.running
-    ? `<span class="capsbusy"><span class="spin" style="width:10px;height:10px"></span>
+    ? `<span class="busy" style="color:var(--acc)"><span class="sp"></span>
        reading Tautulli — ${fmt(T.done||0)} of ${fmt(T.total||0)} sessions,
        ${fmt(T.learned||0)} facts learned</span>`
-    : `<button class="gapchk" style="font-size:10.5px;padding:1px 8px"
-        onclick="capsTaut(this)"
-        title="Walks Tautulli's play history and reads the source codec, the source CHANNEL COUNT and the per-stream decision off each session - the evidence nuarr's own log cannot supply, because it never wrote down a direct play and never recorded how many channels a refused track had. Incremental: a second run reads only what is new.">${
-          T.imported_to?'Read Tautulli again':'Read Tautulli history'}</button>
-       <span class="dim">${T.imported_to
-          ? `up to date with session #${fmt(T.imported_to)}${
-              T.learned?` · ${fmt(T.learned)} facts last time`:''}`
-          : `years of plays, with the channel count on every one`}</span>`;
-  el.innerHTML=`<div class="lkind capswrap lopen">
+    : `<span class="dim">Learned from ${fmt((cs.devices)||0)} device${
+        (cs.devices)===1?'':'s'} and ${fmt((cs.rows)||0)} codec facts${
+        T.imported_to?`, up to session #${fmt(T.imported_to)}`:''} —
+        managed on the <a href="#" onclick="wtab('tautulli');return false"
+        >Tautulli page</a>.</span>`;
+  const html=`<div class="lkind capswrap lopen">
     <div class="lkindhead ckhead" onclick="capsShow(false)"
          title="collapse this panel">
       <span class="ccaret">▾</span>
       <span class="clib">Will each device play this?</span>
       <span class="dim">${esc(word)} only — the other tab answers the other half</span>
-      <span style="margin-left:auto"><button class="gapchk"
+      <span style="margin-left:auto"><button class="gapchk" id="capsRefresh"
         style="font-size:10.5px;padding:1px 8px"
         onclick="event.stopPropagation();capsLoad(true)"
         title="Re-read the device list and what this server has observed">Refresh</button></span></div>
@@ -28060,6 +28384,9 @@ function capsPaint(){
         <span class="capscell bad">transcodes</span>
         <span>— hover a cell for the reason, click a device for the detail</span></div>
     </div></div>`;
+  if(html===_capsKey) return;             // nothing moved; leave the DOM alone
+  _capsKey=html;
+  el.innerHTML=html;
 }
 
 function codecSet(lib,side,key,val,on){
@@ -30360,6 +30687,7 @@ _SETTINGS_NAV = [
                     ("ocr",     "OCR engines",     "language")]),
     ("Integrations", [("arrs", "Arrs",             "link"),
                       ("plex", "Plex",             "play"),
+                      ("tautulli", "Tautulli",     "health"),
                       ("drivepool", "DrivePool",   "folder"),
                       ("meta", "Metadata",         "globe")]),
     ("System",     [("health", "Health checks",     "shield"),
@@ -30764,6 +31092,25 @@ html.mobile .setwrap:not(.rail) .setmain,html.mobile .setwrap:not(.rail) #worker
 .capsbusy{display:inline-flex;align-items:center;gap:7px;color:var(--acc)}
 .capserr{color:var(--warn)}
 .capsmore{margin-top:9px;font-size:10.5px;display:flex;gap:8px;align-items:center}
+/* A REFRESH THAT SAYS IT IS REFRESHING. Without this the button did nothing
+   visible for the second the fetch took, so it got pressed again. */
+.gapchk.spinning{position:relative;color:transparent!important;pointer-events:none}
+.gapchk.spinning::after{content:"";position:absolute;left:50%;top:50%;width:10px;
+  height:10px;margin:-5px 0 0 -5px;border:1.5px solid var(--line);
+  border-top-color:var(--acc);border-radius:50%;
+  animation:busyspin .7s linear infinite}
+.tuses{display:flex;flex-direction:column;gap:9px;margin-top:8px}
+.tuse{display:flex;gap:9px;align-items:flex-start;font-size:12px}
+.tuse .dim{font-size:11px;line-height:1.45;margin-top:2px}
+.tuse a{margin-left:6px;font-size:11px}
+.tuon{flex:0 0 auto;font-size:9.5px;letter-spacing:.04em;border-radius:9px;
+  padding:1px 8px;border:1px solid var(--line);margin-top:1px}
+.tuon.y{color:var(--ok);border-color:#1f4429}
+.tuon.n{color:var(--dim)}
+.turow{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:9px}
+.tustats{display:flex;flex-wrap:wrap;gap:5px 16px;font-size:10.5px;margin-top:10px;
+  padding-top:9px;border-top:1px solid var(--line)}
+.tustats b{color:#c9d1d9}
 .capslegend{display:flex;align-items:center;gap:7px;flex-wrap:wrap;
   margin-top:9px;padding-top:8px;border-top:1px solid var(--line);font-size:10px}
 .capslegend .capscell{display:inline-block;cursor:default}
