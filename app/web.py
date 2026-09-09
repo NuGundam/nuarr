@@ -8574,6 +8574,33 @@ def api_attention(limit: int = 400):
                     "goto": "/settings#alang", "act": "",
                     "refetch_kind": "content" if nm else "", "refetch_why": nm or ""})
 
+    # A TAG THAT LIES, WHICH THE TILE COUNTED AND THE PANEL COULD NOT SHOW.
+    #
+    # The tile reads /api/summary and the panel reads this endpoint, and the
+    # mislabelled-audio source was only ever added to the first. So the tile
+    # said "attention 5 — file errors 4 · mislabelled audio 1" and the panel
+    # listed four rows, which is exactly the failure this endpoint's own
+    # docstring was written about: a number you cannot open is a number you
+    # learn to ignore.
+    try:
+        from . import audiolang as _alg
+        for m in _alg.mismatches(limit)[:limit]:
+            out.append({
+                "source": "mislabelled audio", "id": m["file_id"],
+                "track": m["track"],
+                "title": m["title"] or os.path.basename(m["path"] or ""),
+                "path": m["path"] or "",
+                "detail": (f"track {m['track']} is tagged {m['tagged']} and is "
+                           f"{m['heard']} ({int(m['confidence'] * 100)}% sure)"
+                           + (" - and the file carries that language twice, so "
+                              "it is not dual audio at all"
+                              if m["fake_dual"] else "")),
+                "goto": "/settings#alang", "act": "",
+                "fix": "audiolang", "fake_dual": m["fake_dual"],
+                "refetch_kind": "", "refetch_why": ""})
+    except Exception:                                        # noqa: BLE001
+        pass
+
     try:
         st = arrhealth.STATE
         for w in (st.get("warning_list") or [])[:limit]:
@@ -14718,6 +14745,19 @@ function drillUrl(extra){
 // source and a single landing spot could only ever serve one of them.
 let _attn={items:[],by_source:{}};
 
+async function alFixTag(fid, track, btn){
+  if(btn){ btn.disabled=true; btn.textContent='correcting…'; }
+  let r={};
+  try{ r=await (await fetch(`/api/audiolang/fix?file_id=${fid}&track=${track}`,
+                            {method:'POST'})).json(); }
+  catch(e){ r={ok:false, why:String(e)}; }
+  if(btn){
+    btn.textContent = r.ok?'corrected':'failed';
+    if(r.why) btn.title = r.why;
+  }
+  setTimeout(()=>loadAttention(true), 1500);
+}
+
 async function loadAttention(force){
   const p=document.getElementById('attnPanel');
   if(p) p.style.display='';
@@ -14734,6 +14774,10 @@ const ATTN_STYLE={
   'file errors':    ['#e0575b','the job failed'],
   'rule check':     ['#e2b341','the file still breaks a rule'],
   'audio language': ['#5b9ce8','a track has no language'],
+  // A GAP AND A LIE ARE DIFFERENT PROBLEMS, so they are different rows. The
+  // one above is a track with no language; this is a track wearing one that
+  // is not its own.
+  'mislabelled audio': ['#e0575b','a track is tagged a language it is not'],
   'arr health':     ['#e2b341','Sonarr / Radarr warning'],
 };
 
@@ -14783,7 +14827,16 @@ function attnPaint(){
       // reject it and ask the arr for another. Only rows the server has
       // classified as a content problem get the button - same rule as the
       // errors drill, so a naming block never arrives with a delete attached.
-      const act = it.refetch_kind==='content' && it.id
+      // THE FIX BELONGS BESIDE THE FINDING. Correcting a tag is safe and in
+      // place, so it gets a plain button; the blocklist that may follow is a
+      // separate decision and stays on the Audio language page with the rest
+      // of the evidence.
+      const act = it.source==='mislabelled audio' && it.id
+        ? `<button class="rmb" style="margin-left:10px"
+             title="Rewrite the language tag to what was actually heard, and its title if the title was only restating the old language. Nothing is re-encoded${
+               it.fake_dual?' — and once the tag is honest, the duplicate track is dropped by the rules on the next rebuild':''}."
+             onclick="alFixTag(${it.id},${it.track||0},this)">Correct the tag</button>`
+        : it.refetch_kind==='content' && it.id
         ? `<button class="refetch" style="margin-left:10px;font-size:10.5px;padding:1px 7px"
                    title="${esc(it.refetch_why||'reject the release this came from and ask the arr for another')}"
                    onclick="refetchAsk(${it.id}, true, this)">Blocklist &amp; re-download</button>` : '';
