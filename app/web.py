@@ -6651,8 +6651,9 @@ def api_hardsub(limit: int = 40):
 
 @app.post("/api/hardsub/run")
 async def api_hardsub_run(limit: int = 0):
+    """Sweep now. Does not yield to the gate - the button IS the decision."""
     from . import hardsub
-    return await hardsub.sweep(limit=limit)
+    return await hardsub.sweep(limit=limit, force=True)
 
 
 @app.post("/api/hardsub/check")
@@ -28902,9 +28903,11 @@ function hsPaint(){
     <div style="display:flex;gap:10px;align-items:baseline;font-size:11px;
                 margin:3px 0 6px;flex-wrap:wrap">
       <span class="busy" style="color:var(--acc)"><span class="sp"></span></span>
-      <b>${fmt(d.done||0)} of ${fmt(d.total||0)}</b>
-      <span class="dim">${esc(d.now||'')}</span>
-      <span style="margin-left:auto;display:flex;gap:10px">
+      <b style="flex:none">${fmt(d.done||0)} of ${fmt(d.total||0)}</b>
+      <span class="dim" style="flex:1 1 auto;min-width:0;overflow:hidden;
+            text-overflow:ellipsis;white-space:nowrap"
+            title="${esc(d.now||'')}">${esc(d.now||'')}</span>
+      <span style="flex:none;margin-left:auto;display:flex;gap:10px">
         ${d.elapsed?`<span class="dim" title="How long this pass has been running">${
           hsDur(d.elapsed)} in</span>`:''}
         ${d.rate?`<span class="dim" title="Files finished per second, measured on this run">${
@@ -28929,6 +28932,8 @@ function hsPaint(){
        d.runs===1?'':'es'}</span>`:''}
     ${d.secs_each?`<span title="Average seconds per file, smoothed across passes - what the estimate below is built on">${
        d.secs_each.toFixed(1)}s a file</span>`:''}
+    ${d.yielded?`<span style="color:var(--warn)" title="This sweep checks the job gate before every file and stops the moment the pool is busy or somebody is watching Plex. It picks up where it left off on the next pass.">${
+       esc(d.yielded)}</span>`:''}
     ${(d.untested&&d.backlog_eta)?`<span title="How long until every file that reports no subtitle track has been looked at, at this pace and this cadence. Raising the files-per-pass or shortening the cycle is what changes it.">
        <b>${hsDur(d.backlog_eta)}</b> to finish the backlog</span>`:''}
   </div>`;

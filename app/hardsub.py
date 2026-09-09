@@ -136,8 +136,34 @@ _CREDITS = {
 # title card; a subtitle track puts words on screen again and again.
 MIN_TEXT_FRAMES = 2
 
-PER_RUN = 20
-CYCLE_S = 900
+# HOW MANY FRAMES ARE PULLED AT ONCE, and why raising the files-per-pass alone
+# was not the answer.
+#
+# One file costs forty-eight ffmpeg seeks - twenty-four timestamps, two bands
+# each - and they were running one after another at about 19 seconds a file.
+# 4,526 files at 19s is a day of wall clock however high the per-pass cap goes,
+# because the cap was never the bottleneck: the seeks were, in single file.
+#
+# They are also almost entirely WAITING. audit.py found the same thing sampling
+# this pool and wrote it down: "the probes are seek-bound rather than
+# CPU-bound, and eight lanes took a run from ~70s to ~9s here". Six lanes here
+# for the same reason, and one lower because this reads two bands per
+# timestamp rather than one file per probe.
+LANES = 6
+
+# THE PACE, AND WHAT IT YIELDS TO.
+#
+# Twenty files every fifteen minutes is eighty an hour, which put 4,554 files
+# three and a half days away - a backlog nobody would watch drain. The limit
+# was never about protecting the disks, though: it was a guess standing in for
+# a gate. So the gate does the work now and the cap is raised to match.
+#
+# Every file is preceded by the same busy check the rule audit uses - is
+# somebody watching Plex, are the workers full - and the pass STOPS the moment
+# it goes true. A sweep that yields inside a second is allowed to be greedy
+# while nothing else wants the disks.
+PER_RUN = 90
+CYCLE_S = 300
 SETTLE_S = 600
 # The name this job answers to on the Schedules page, so it is counted and
 # timed alongside every other recurring pass rather than being a thing that
@@ -284,14 +310,27 @@ def probe_one(file_id: int, samples: int = SAMPLES,
     step = (t1 - t0) / max(1, samples - 1)
     marks = [t0 + step * i for i in range(samples)]
 
+    # ACROSS LANES, NOT ONE AFTER ANOTHER. Each _bright is a subprocess that
+    # spends its life waiting on a spinning disk, so the GIL is free the whole
+    # time and the pool has twelve disks to answer from.
+    from concurrent.futures import ThreadPoolExecutor
     low, high, read = [], [], 0
+    with ThreadPoolExecutor(max_workers=LANES) as ex:
+        futs = {ex.submit(_bright, path, t, b): (t, b)
+                for t in marks for b in (LOW_BAND, HIGH_BAND)}
+        got: dict = {}
+        for f, (t, b) in futs.items():
+            try:
+                got[(t, b)] = f.result()
+            except Exception:                                # noqa: BLE001
+                got[(t, b)] = -1
     for t in marks:
-        c = _bright(path, t, LOW_BAND)
+        c = got.get((t, LOW_BAND), -1)
         if c < 0:
             continue
         read += 1
         low.append((t, c))
-        h = _bright(path, t, HIGH_BAND)
+        h = got.get((t, HIGH_BAND), -1)
         high.append((t, h if h >= 0 else 0))
     if not read:
         return {"ok": False, "why": "could not decode any frame"}
@@ -517,17 +556,37 @@ def _candidates(limit: int) -> list:
             "ORDER BY f.id LIMIT ?", (cutoff, int(limit)))]
 
 
-async def sweep(limit: int = 0) -> dict:
+async def _too_busy() -> bool:
+    """The gate's opinion, not a second one. See audit._too_busy."""
+    try:
+        from .audit import _too_busy as busy
+        return bool(await busy())
+    except Exception:                                        # noqa: BLE001
+        return False
+
+
+async def sweep(limit: int = 0, force: bool = False) -> dict:
+    r"""One pass. `force` is the button: a person who pressed it has already
+    decided the disks can spare it, so it does not yield."""
     if STATE["running"]:
         return {"ok": False, "why": "already running"}
     todo = await asyncio.to_thread(_candidates, int(limit or PER_RUN))
     t0 = time.time()
     STATE.update(running=True, done=0, total=len(todo), now="", found=0,
-                 t0=t0)
+                 t0=t0, yielded="")
     done = found = 0
     try:
         for r in todo:
-            STATE["now"] = os.path.basename(r["path"])[:60]
+            # THE GATE DECIDES, BEFORE EVERY FILE. Not once at the start: a
+            # pass of ninety files runs for half an hour, and somebody
+            # pressing play in minute two should not wait out the other
+            # eighty-eight. Checked per file because a file costs twenty
+            # seconds and the check costs nothing.
+            if not force and await _too_busy():
+                STATE["yielded"] = ("stopped early - the pool is busy or "
+                                    "somebody is watching")
+                break
+            STATE["now"] = os.path.basename(r["path"])
             STATE["done"] = done
             d = await asyncio.to_thread(probe_one, r["file_id"])
             done += 1
@@ -561,6 +620,7 @@ async def sweep(limit: int = 0) -> dict:
                    f"report no subtitles are carrying them in the picture",
                    "warn")
     return {"ok": True, "checked": done, "found": found,
+            "yielded": STATE.get("yielded") or "",
             "remaining": await asyncio.to_thread(untested)}
 
 
@@ -577,6 +637,7 @@ def stats() -> dict:
     eta = ((STATE["total"] - STATE["done"]) / rate) if rate else 0.0
     each = STATE.get("secs_each") or 0.0
     out = {"running": STATE["running"], "now": STATE["now"],
+           "yielded": STATE.get("yielded") or "",
            "done": STATE["done"], "total": STATE["total"],
            "last_run": STATE["last_run"], "untested": left,
            "elapsed": round(elapsed, 1), "rate": round(rate, 3),
@@ -589,9 +650,14 @@ def stats() -> dict:
            # THE ONE THAT ACTUALLY DECIDES ANYTHING. Not "how long is this
            # batch" but "how long until the library is answered", at the pace
            # this is really going and the cadence it really runs on.
-           "backlog_eta": round(
-               (left / max(1, PER_RUN)) * CYCLE_S
-               + (left * each if each else 0)) if left else 0,
+           # AT THE PACE IT REALLY GOES. A pass that yields to the gate
+           # gets through fewer than PER_RUN files, so the cadence alone
+           # overstates it; the measured seconds-per-file is what actually
+           # bounds the answer once the cap is high enough not to be the
+           # limit.
+           "backlog_eta": round(max(
+               (left / max(1, PER_RUN)) * CYCLE_S,
+               left * each if each else 0)) if left else 0,
            "next_run": 0.0,
            "have_ocr": bool(_tesseract()), NONE: 0, SIGNS: 0,
            DIALOGUE: 0, HYBRID: 0, "marked": 0}
