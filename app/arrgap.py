@@ -54,6 +54,85 @@ EVERY_S = 6 * 3600.0
 NOT_WALKED = "not walked yet"
 WROTE_OFF = "written off, but on disk"
 REJECTED = "rejected, waiting for a replacement"
+
+# HOW OLD IS THIS ONE, AND HAS ANYTHING BEEN LOOKING?
+#
+# The card could say "2 files" and "checked 4m ago" and still leave the only
+# question that matters unanswered: is this a thing that appeared this morning,
+# or a thing that has been sitting here since August with forty-eight checks
+# walking past it? Those are opposite situations - the first is the system
+# working, the second is a file that will never come back and wants a human -
+# and nothing on screen could tell them apart, because the scan kept its
+# findings in memory and threw them away on every pass.
+#
+# One row per finding, surviving restarts, counting the checks that saw it.
+_SEEN_READY = False
+
+
+def _seen_init() -> None:
+    global _SEEN_READY
+    with cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS arrgap_seen(
+                arr      TEXT    NOT NULL,
+                file_id  INTEGER NOT NULL,
+                path     TEXT,
+                why      TEXT,
+                first_at REAL,
+                last_at  REAL,
+                seen     INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (arr, file_id)
+            )""")
+    _SEEN_READY = True
+
+
+def _seen_record(rows: list, answered_arrs: set) -> dict:
+    r"""Fold this pass into the history. -> {(arr, file_id): (first_at, seen)}
+
+    PRUNED ONLY FOR ARRS THAT ANSWERED. A Sonarr that timed out contributes no
+    rows, and deleting its history on that basis would reset the age of every
+    finding it holds - so the next screen would report a three-week-old problem
+    as brand new, which is the exact confusion this table exists to end.
+    """
+    if not _SEEN_READY:
+        _seen_init()
+    now = time.time()
+    out: dict = {}
+    try:
+        with cursor() as cur:
+            for r in rows:
+                cur.execute(
+                    "INSERT INTO arrgap_seen(arr,file_id,path,why,first_at,"
+                    "                        last_at,seen) VALUES(?,?,?,?,?,?,1) "
+                    "ON CONFLICT(arr,file_id) DO UPDATE SET "
+                    "  path=excluded.path, why=excluded.why, "
+                    "  last_at=excluded.last_at, seen=seen+1",
+                    (r["arr"], r["file_id"], r.get("path") or "",
+                     r.get("why") or "", now, now))
+            if answered_arrs:
+                qs = ",".join("?" * len(answered_arrs))
+                keep = [(r["arr"], r["file_id"]) for r in rows]
+                cur.execute(
+                    f"DELETE FROM arrgap_seen WHERE arr IN ({qs}) "
+                    f"  AND last_at < ?", list(answered_arrs) + [now])
+                _ = keep
+            for r in cur.execute("SELECT arr, file_id, first_at, seen "
+                                 "  FROM arrgap_seen"):
+                out[(r["arr"], r["file_id"])] = (r["first_at"] or now,
+                                                 r["seen"] or 1)
+    except Exception:                                        # noqa: BLE001
+        pass
+    return out
+
+
+def history() -> dict:
+    """How many checks have run, and since when."""
+    from .db import kv_get
+    try:
+        return {"checks": int(kv_get("arrgap.checks") or 0),
+                "since": float(kv_get("arrgap.since") or 0)}
+    except Exception:                                        # noqa: BLE001
+        return {"checks": 0, "since": 0.0}
 GONE = "gone from disk"
 EXCLUDED = "excluded by a rule"
 OUTSIDE = "outside nuarr's libraries"
@@ -251,6 +330,21 @@ async def scan() -> dict:
                     "note": reason or "",
                     "why": _why(path, state, reason),
                 })
+        # THE HISTORY, BEFORE THE SUMMARY IS BUILT, so every row can carry its
+        # own age. Only arrs that actually answered are pruned against.
+        ok_arrs = {n for n, st in _CACHE["arrs"].items() if not st.get("error")}
+        ages = _seen_record(rows, ok_arrs)
+        for r in rows:
+            f, n = ages.get((r["arr"], r["file_id"]), (time.time(), 1))
+            r["first_at"] = f
+            r["seen"] = n
+        from .db import kv_get as _kg, kv_set as _ks
+        try:
+            _ks("arrgap.checks", str(int(_kg("arrgap.checks") or 0) + 1))
+            if not (_kg("arrgap.since") or ""):
+                _ks("arrgap.since", str(time.time()))
+        except Exception:                                    # noqa: BLE001
+            pass
         by_why: dict = {}
         for r in rows:
             b = by_why.setdefault(r["why"], {"n": 0, "bytes": 0})
@@ -277,6 +371,9 @@ async def scan() -> dict:
             # function.
             "errors": {n: st["error"] for n, st in _CACHE["arrs"].items()
                        if st.get("error")},
+            # THE OLDEST THING HERE, so the headline can lead with it rather
+            # than making somebody open the list and compare six dates.
+            "oldest_at": min((r["first_at"] for r in rows), default=0.0),
         }
         _CACHE["at"] = time.time()
     finally:
@@ -429,6 +526,7 @@ def cached() -> dict:
             "failures": _CACHE.get("failures") or [],
             "kinds": {"not_walked": NOT_WALKED, "gone": GONE,
                       "excluded": EXCLUDED, "outside": OUTSIDE},
+            "history": history(),
             **(d or {"checked": 0, "rows": [], "total": 0, "fixable": 0,
                      "by_why": {}})}
 

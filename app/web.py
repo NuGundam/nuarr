@@ -23400,7 +23400,12 @@ function agPaint(){
                 font-size:11.5px;margin-bottom:6px">
       ${head}
       <span class="dim">of ${fmt(d.checked||0)} records the arrs hold${
-        d.age_s!=null?` · ${ago(Date.now()/1000-d.age_s)}`:''}</span>
+        d.age_s!=null?` · ${ago(Date.now()/1000-d.age_s)}`:''}${
+        (d.history&&d.history.checks)?` · <span title="Every completed pass of this check, counted since nuarr first ran it. A finding that has survived many of them is not waiting on the check - it is waiting on you, or on a release that is never coming."
+          >${fmt(d.history.checks)} check${d.history.checks===1?'':'s'}${
+          d.history.since?` since ${ago(d.history.since)}`:''}</span>`:''}</span>
+      ${d.oldest_at?`<span class="agold" title="How long the longest-standing of these findings has been on the list. It is the number that says whether this is today's news or a standing problem.">oldest ${
+        ago(d.oldest_at)}</span>`:''}
       ${modeBox}
     </div>
     ${chips?`<div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:7px"
@@ -23458,9 +23463,11 @@ function agList(rows){
       <div style="max-height:280px;overflow:auto;padding:0 8px">
         <table style="width:100%;font-size:11.5px;border-collapse:collapse;
                       table-layout:fixed">
-          <colgroup><col style="width:44%"><col style="width:12%">
-            <col style="width:14%"><col style="width:30%"></colgroup>
-          <thead><tr>${['Title / file','Arr','Library','Why it is missing']
+          <colgroup><col style="width:36%"><col style="width:10%">
+            <col style="width:12%"><col style="width:26%">
+            <col style="width:16%"></colgroup>
+          <thead><tr>${['Title / file','Arr','Library','Why it is missing',
+                        'Since / checks']
             .map(h=>`<th style="text-align:left;font-weight:600;padding:3px 8px 5px 0;
               position:sticky;top:0;background:var(--bg2,#12161c)">${h}</th>`).join('')}
           </tr></thead>
@@ -23476,8 +23483,24 @@ function agList(rows){
                   rs.length>1?`${fmt(rs.length)} files`:esc(r0.name||'')}</span></td>
               <td style="padding:3px 8px 3px 0" class="dim">${esc(r0.arr||'')}</td>
               <td style="padding:3px 8px 3px 0" class="dim">${esc(r0.library||'')}</td>
-              <td style="padding:3px 0;color:${hot?'var(--warn)':'var(--dim,#8a97a6)'}"
+              <td style="padding:3px 8px 3px 0;color:${hot?'var(--warn)':'var(--dim,#8a97a6)'}"
                   title="${esc(AG_NOTE[r0.why]||'')}">${esc(r0.why||'')}</td>
+              ${(()=>{
+                // THE AGE OF THE FINDING, not of the check. Grouped rows take
+                // the oldest first-seen and the highest count in the group,
+                // because a show with twelve missing episodes is as old as its
+                // oldest one and it is the worst case you want to see.
+                const first=Math.min(...rs.map(x=>x.first_at||0).filter(Boolean));
+                const seen=Math.max(...rs.map(x=>x.seen||0));
+                if(!first) return `<td class="dim" style="padding:3px 0">—</td>`;
+                const days=(Date.now()/1000-first)/86400;
+                const col=days>=7?'var(--warn)':'var(--dim,#8a97a6)';
+                return `<td style="padding:3px 0;color:${col}"
+                  title="First seen by this check ${esc(ago(first))}, and still here after ${
+                    esc(String(seen))} check${seen===1?'':'s'}. A finding that keeps surviving checks is not one the check can put right."
+                  >${esc(ago(first))} <span class="dim">· ${fmt(seen)} check${
+                    seen===1?'':'s'}</span></td>`;
+              })()}
             </tr>`;}).join('')}
           </tbody>
         </table>
@@ -31226,6 +31249,8 @@ html.mobile .setwrap:not(.rail) .setmain,html.mobile .setwrap:not(.rail) #worker
 .capsbusy{display:inline-flex;align-items:center;gap:7px;color:var(--acc)}
 .capserr{color:var(--warn)}
 .capsmore{margin-top:9px;font-size:10.5px;display:flex;gap:8px;align-items:center}
+.agold{font-size:10px;border:1px solid #4d3d1a;color:var(--warn);border-radius:9px;
+  padding:1px 8px;cursor:help}
 /* A REFRESH THAT SAYS IT IS REFRESHING. Without this the button did nothing
    visible for the second the fetch took, so it got pressed again. */
 .gapchk.spinning{position:relative;color:transparent!important;pointer-events:none}
