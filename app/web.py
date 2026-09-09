@@ -6893,7 +6893,13 @@ async def api_refetch_plan(file_id: int):
     this even offerable, and what would it cost" without any chance of a
     mis-click doing it, and the answer needs a round trip to the arr.
     """
-    return await refetch.plan(file_id)
+    p = await refetch.plan(file_id)
+    # The one sentence explaining why the delete comes before the search. Sent
+    # with the plan so the confirmation can carry it, rather than living only
+    # in a docstring nobody reads at the moment they are deciding.
+    if p.get("ok") or p.get("can_search"):
+        p["order_note"] = refetch.order_note(p.get("arr") or "")
+    return p
 
 
 @app.post("/api/files/{file_id}/refetch")
@@ -15299,16 +15305,23 @@ async function refetchAsk(id, fromAttn, btn){
   const gb = p.size ? (p.size/1073741824).toFixed(2)+' GB' : 'unknown size';
   const lines = [];
   if(p.explain) lines.push(esc(p.explain));
+  // THE ORDER IS PART OF THE ANSWER. This said "Blocklists X, then Sonarr
+  // searches again" - which was the whole truth about what the code did, and
+  // the reason it did not work: the file stayed on disk, the arr scored every
+  // candidate against it, and the search declined its own results. It also
+  // promised a deletion that this path never performed, under a line reading
+  // "5.24 GB is deleted".
   lines.push(p.grab_id
-    ? `Blocklists <b>${esc(p.release||'(unnamed release)')}</b>`
+    ? `<b>Deletes the file</b>, blocklists <b>${esc(p.release||'(unnamed release)')}</b>`
       + (p.indexer?` via ${esc(p.indexer)}`:'')
       + `, then ${esc(p.arr||'the arr')} searches again.`
     : `No grab record to blocklist — ${esc(p.arr||'the arr')} deletes the file and searches again.`);
+  if(p.order_note) lines.push(`<span class="dim">${esc(p.order_note)}</span>`);
   if(p.warning) lines.push(`<span style="color:var(--warn)">${esc(p.warning)}</span>`);
   lines.push(`<b>${esc(gb)} is deleted. This cannot be undone from nuarr.</b>`);
   put(`<span class="askrow">
       <span class="askmsg">${lines.join('<br>')}</span>
-      <button class="rmb bad" data-y>Yes, blocklist it</button>
+      <button class="rmb bad" data-y>Yes, delete and replace it</button>
       <button class="rmb" data-n>Cancel</button></span>`);
   host.querySelector('[data-n]').onclick = ev => {
     ev.stopPropagation(); host.dataset.asking=''; host.innerHTML = prev;

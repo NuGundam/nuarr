@@ -247,13 +247,47 @@ async def plan(file_id: int, reason: str = "") -> dict:
     return out
 
 
+# WHY THE QUESTION MENTIONS THE ORDER. Somebody reading the confirmation is
+# deciding whether to destroy 5 GB; the fact that the delete has to happen
+# before the search is the reason the button works at all, and it is not
+# guessable from the outside.
+def order_note(arr: str = "") -> str:
+    return (f"The file is deleted first: {arr or 'the arr'} scores every "
+            f"candidate against whatever is still on disk, so leaving it there "
+            f"makes the replacement search reject its own results.")
+
+
 async def run(file_id: int, delete_file: bool = True,
               reason: str = "") -> dict:
-    """Blocklist the release and search for a replacement. Destructive.
+    r"""Delete the file, blocklist the release, search for a replacement.
 
     Re-plans rather than trusting whatever the caller was shown: the panel may
     have been open for a while, and the file may have been fixed or removed in
     the meantime.
+
+    THE FILE GOES FIRST, AND THAT ORDER IS THE WHOLE POINT.
+    ------------------------------------------------------
+    This used to blocklist and stop. Blocklisting tells the arr "not that
+    release again"; it does not tell it "and the thing on disk is rubbish". So
+    the automatic search that markFailed queues ran while the corrupt file was
+    still imported, and the arr judged every candidate against it - quality
+    profile cutoff, and in Erik's setup a custom-format score. A 2160p HULU
+    WEB-DL scores high whether or not it decodes, so the replacement search
+    found nothing "better" and quietly declined to grab anything.
+
+    From the outside that is indistinguishable from success: the release IS
+    blocklisted, the search DID run, and nothing arrives. Four episodes of
+    Reasonable Doubt sat like that.
+
+    The arr cannot score a file that is not there, so deleting first is what
+    makes the search able to accept anything at all. It also makes the
+    confirmation honest - it always said "5.24 GB is deleted", and on this
+    path nothing was.
+
+    A DELETE THAT FAILS STOPS THE FLOW, deliberately. If the file is still
+    there the search cannot succeed, so spending an indexer call on it would
+    burn the request and report a lie. Only a 404 passes, and a 404 means the
+    record is already gone - the state the delete was aiming for.
     """
     p = await plan(file_id, reason=reason)
     if not p.get("ok") and not p.get("can_search"):
@@ -282,30 +316,39 @@ async def run(file_id: int, delete_file: bool = True,
                 and e.response.status_code == 404)
 
     try:
-        blocklisted = False
+        # ONE: THE FILE. Removes it from disk and from the arr's database, so
+        # the episode has nothing for a replacement to be measured against.
+        # This is the step that has to come first; see the docstring.
+        if delete_file and row.get("arr_file_id"):
+            try:
+                await client.delete_file(int(row["arr_file_id"]))
+                did.append("deleted the file")
+            except Exception as e:
+                if not _is_404(e):
+                    raise
+                did.append("the arr no longer tracks this file (already "
+                           "replaced or removed) - nothing to delete")
+
+        # TWO: THE RELEASE. markFailed blocklists it AND queues the arr's own
+        # search, which is why the search below is a fallback rather than a
+        # second request - the arr's search is aimed at the right episode,
+        # while search_for() with no episode ids is a whole-series sweep.
+        searched = False
         if p.get("grab_id"):
             try:
                 await client.mark_failed(int(p["grab_id"]))
                 did.append(f"blocklisted {p.get('release')!r} and asked "
                            f"{cfg.name} to search again")
-                blocklisted = True
+                searched = True
             except Exception as e:
                 if not _is_404(e):
                     raise
                 did.append("the grab is no longer in history (the arr has "
                            "moved on) - cannot blocklist it, searching anyway")
-        if not blocklisted:
-            if delete_file and row.get("arr_file_id"):
-                try:
-                    await client.delete_file(int(row["arr_file_id"]))
-                    did.append("deleted the file record")
-                except Exception as e:
-                    if not _is_404(e):
-                        raise
-                    did.append("the arr no longer tracks this file (already "
-                               "replaced or removed) - nothing to delete; the "
-                               "old file on disk will be superseded by the "
-                               "import or flagged by the duplicate sweep")
+
+        # THREE: THE SEARCH, when nothing above asked for one. Either there
+        # was no grab to blocklist, or the grab had aged out of history.
+        if not searched:
             await client.search_for(int(row["arr_parent_id"]))
             did.append(f"asked {cfg.name} to search for a replacement")
     except Exception as e:
