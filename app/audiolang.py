@@ -1320,6 +1320,118 @@ def apply_tags(path: str, tags: dict[int, str]) -> tuple[bool, str]:
     return True, ", ".join(f"a:{k}={v}" for k, v in sorted(tags.items()))
 
 
+# ---- what a correction is doing, while it is doing it -------------------
+# WHY THE STEPS ARE PUBLISHED RATHER THAN ANIMATED. Correcting a tag is not one
+# action, it is several, and they do not cost the same: the header edit is
+# milliseconds, re-reading the file is a full ffprobe of something that may be
+# 40 GB on a spinning disk, and telling the arrs is HTTP to a Sonarr that may
+# already be busy. A spinner over all of that says "busy" and nothing else, so
+# a correction waiting on Sonarr looks exactly like one that has hung - and the
+# button that only said "..." got pressed again.
+#
+# So the work reports where it is and the page reads it. The bar counts STEPS,
+# and is labelled as counting steps: interpolating between steps of unequal
+# cost would be a smoother animation telling a worse lie.
+#
+# Kept in memory, not in the database. This is the state of a request in
+# flight; it has no meaning after a restart and writing it to disk would only
+# create rows that outlive the thing they describe.
+FIX_KEEP_S = 180.0
+
+_FIX_LABEL = {
+    "open":   "checking the file can be edited",
+    "tag":    "writing the language tag",
+    "title":  "correcting the track title",
+    "reread": "re-reading the file",
+    "rules":  "re-checking it against the rules",
+    "arrs":   "telling Sonarr and Radarr",
+}
+_FIXING: dict[str, dict] = {}
+_FIX_LOCK = threading.Lock()
+
+
+def _fix_key(file_id: int, track: int) -> str:
+    return f"{int(file_id)}:{int(track)}"
+
+
+def _sweep_fixes() -> None:
+    """Drop finished corrections nobody came back to read. Lock held."""
+    now = time.time()
+    for k in [k for k, v in _FIXING.items()
+              if v.get("done") and now - v.get("ended", now) > FIX_KEEP_S]:
+        _FIXING.pop(k, None)
+
+
+def fix_begin(file_id: int, track: int, steps) -> str:
+    """Declare the steps this correction will take, and start its clock.
+
+    THE STEPS ARE DECLARED UP FRONT because the two callers do different work -
+    the settings page writes a tag the person picked, the Attention tile also
+    fixes a track title - and a bar that learns its own length as it goes would
+    jump backwards the moment a path turned out to have one more step.
+    """
+    key = _fix_key(file_id, track)
+    with _FIX_LOCK:
+        _sweep_fixes()
+        _FIXING[key] = {"steps": [str(s) for s in steps], "at": time.time(),
+                        "i": 0, "step": "", "label": "starting",
+                        "done": False, "ok": False, "why": "", "ended": 0.0}
+    return key
+
+
+def fix_step(key: str, name: str) -> None:
+    with _FIX_LOCK:
+        st = _FIXING.get(key)
+        if not st or st["done"]:
+            return
+        try:
+            st["i"] = st["steps"].index(name)
+        except ValueError:
+            # A step the caller did not declare. Advance rather than reset:
+            # being one ahead of the plan is better than appearing to restart.
+            st["i"] = min(st["i"] + 1, len(st["steps"]))
+        st["step"] = name
+        st["label"] = _FIX_LABEL.get(name, name)
+
+
+def fix_end(key: str, ok: bool, why: str = "") -> None:
+    """Finish. A FAILURE LEAVES THE BAR WHERE IT STOPPED.
+
+    Filling the bar on the way out would say "all five steps done" about a
+    correction that died on the first one - the shape of the thing on screen
+    contradicting the words next to it. Stopping at a fifth is the more useful
+    fact anyway: it says the file was never opened, not that the arrs refused.
+    """
+    with _FIX_LOCK:
+        st = _FIXING.get(key)
+        if not st:
+            return
+        st.update(done=True, ok=bool(ok), why=str(why or ""), step="",
+                  ended=time.time(),
+                  i=len(st["steps"]) if ok else st["i"],
+                  label="corrected" if ok else "could not correct it")
+
+
+def fix_state(file_id: int, track: int) -> dict:
+    """What the page should draw. Empty when there is nothing to say."""
+    with _FIX_LOCK:
+        _sweep_fixes()
+        st = _FIXING.get(_fix_key(file_id, track))
+        if not st:
+            return {}
+        n = len(st["steps"]) or 1
+        return {"running": not st["done"], "done": bool(st["done"]),
+                "ok": bool(st["ok"]), "why": st["why"], "label": st["label"],
+                # ONE-BASED, AND NEVER ZERO. `i` is the index of the step in
+                # flight, so a running correction is on step i+1. A failed one
+                # is not on a step at all - but "0 of 5" reads as "nothing was
+                # attempted" when in truth the first step is exactly what
+                # failed, so it stays at the step it died on.
+                "step": max(1, min(st["i"] + (0 if st["done"] else 1), n)),
+                "steps": n, "pct": min(100.0, st["i"] / n * 100.0),
+                "elapsed": round(time.time() - st["at"], 1)}
+
+
 def apply_and_restamp(file_id: int, path: str, tags: dict[int, str]) -> tuple[bool, str]:
     """apply_tags, then keep the verdicts that justified it valid."""
     ok, why = apply_tags(path, tags)
@@ -1811,16 +1923,21 @@ def fix_mislabel(file_id: int, track: int) -> dict:
         return {"ok": False, "why": "no confident mismatch recorded for that "
                                     "track - it may have been re-checked"}
     x = m[0]
+    key = fix_begin(int(file_id), int(track), ("open", "tag", "title", "reread"))
     with cursor() as cur:
         r = cur.execute("SELECT path FROM files WHERE id=?",
                         (int(file_id),)).fetchone()
     if not r:
+        fix_end(key, False, "no such file")
         return {"ok": False, "why": "no such file"}
     path = r["path"]
     if not can_fast_path(path):
+        fix_end(key, False, "this container cannot be edited in place")
         return {"ok": False, "why": "this container cannot be edited in place"}
+    fix_step(key, "tag")
     ok, why = apply_and_restamp(int(file_id), path, {int(track): x["heard"]})
     if not ok:
+        fix_end(key, False, why)
         return {"ok": False, "why": why}
     # AND THE THIRD LIE, WHICH NOBODY OWNED. Correcting the language left the
     # file reading `lang=jpn title=English` - a track that now says the right
@@ -1832,6 +1949,7 @@ def fix_mislabel(file_id: int, track: int) -> dict:
     # that titled the track "Japanese Dub 5.1" or "Commentary" is saying
     # something this has no business rewriting.
     retitled = ""
+    fix_step(key, "title")
     try:
         old_name = _LANG_NAME.get(langkey.key(x["tagged"]), "")
         new_name = _LANG_NAME.get(langkey.key(x["heard"]), "")
@@ -1841,6 +1959,7 @@ def fix_mislabel(file_id: int, track: int) -> dict:
                 retitled = f", and its title from {old_name} to {new_name}"
     except Exception:                                    # noqa: BLE001
         pass
+    fix_step(key, "reread")
     _reprobe_quiet(int(file_id), path)
     try:
         from . import joblog
@@ -1850,6 +1969,7 @@ def fix_mislabel(file_id: int, track: int) -> dict:
     except Exception:                                    # noqa: BLE001
         pass
     _ = langkey
+    fix_end(key, True, f"now tagged {x['heard']}")
     return {"ok": True, "tagged": x["tagged"], "heard": x["heard"],
             "fake_dual": x["fake_dual"], "path": path, "retitled": retitled,
             "why": f"tag corrected to {x['heard']}" + retitled

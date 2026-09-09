@@ -4746,33 +4746,67 @@ async def api_audiolang_apply(file_id: int, track: int, code: str,
     _amemo_expire("audiolang:")
     def _work():
         from . import audiolang
-        with cursor() as cur:
-            r = cur.execute("SELECT path FROM files WHERE id=?",
-                            (file_id,)).fetchone()
-        if not r:
-            return {"ok": False, "error": "no such file"}
-        path = r["path"]
-        if not audiolang.can_fast_path(path):
-            return {"ok": False, "error": "not a Matroska file - needs a remux"}
-        if not force:
-            d = audiolang.for_file(file_id, track)
-            if not d or d["code"] != code:
+        # EVERY EXIT REPORTS. The page holds the row open on this key, so a
+        # path that returns without ending the correction leaves a bar
+        # spinning over work that stopped - which is the exact failure the
+        # progress was added to prevent, arrived at from the other side.
+        key = audiolang.fix_begin(file_id, track,
+                                  ("open", "tag", "reread", "rules", "arrs"))
+        try:
+            with cursor() as cur:
+                r = cur.execute("SELECT path FROM files WHERE id=?",
+                                (file_id,)).fetchone()
+            if not r:
+                audiolang.fix_end(key, False, "no such file")
+                return {"ok": False, "error": "no such file"}
+            path = r["path"]
+            if not audiolang.can_fast_path(path):
+                audiolang.fix_end(key, False, "not a Matroska file")
                 return {"ok": False,
-                        "error": "that is not what was heard; pass force=true"}
-        ok, why = audiolang.apply_and_restamp(file_id, path, {track: code})
-        if ok:
-            _reprobe(file_id, path)
-            # _reprobe writes a new probe but must NOT wipe the verdicts here:
-            # a header edit leaves track order alone, so restamp above is the
-            # correct treatment and this row stays valid.
-            audiolang.restamp(file_id, path)
-            # The arrs cache a file's languages; without this they keep showing
-            # the old one and the correction is invisible where it matters.
-            audiolang.notify_arrs([file_id])
-            joblog.log(f"audio language set to {code} on a:{track} of "
-                       f"{os.path.basename(path)}", "ok")
-        return {"ok": ok, "detail": why}
+                        "error": "not a Matroska file - needs a remux"}
+            if not force:
+                d = audiolang.for_file(file_id, track)
+                if not d or d["code"] != code:
+                    audiolang.fix_end(key, False, "that is not what was heard")
+                    return {"ok": False,
+                            "error": "that is not what was heard; pass force=true"}
+            audiolang.fix_step(key, "tag")
+            ok, why = audiolang.apply_and_restamp(file_id, path, {track: code})
+            if ok:
+                audiolang.fix_step(key, "reread")
+                _reprobe(file_id, path)
+                # _reprobe writes a new probe but must NOT wipe the verdicts
+                # here: a header edit leaves track order alone, so restamp
+                # above is the correct treatment and this row stays valid.
+                audiolang.fix_step(key, "rules")
+                audiolang.restamp(file_id, path)
+                # The arrs cache a file's languages; without this they keep
+                # showing the old one and the correction is invisible where it
+                # matters.
+                audiolang.fix_step(key, "arrs")
+                audiolang.notify_arrs([file_id])
+                joblog.log(f"audio language set to {code} on a:{track} of "
+                           f"{os.path.basename(path)}", "ok")
+            audiolang.fix_end(key, ok, (f"now tagged {code}" if ok
+                                        else (why or "the header edit failed")))
+            return {"ok": ok, "detail": why}
+        except Exception as e:                               # noqa: BLE001
+            audiolang.fix_end(key, False, str(e)[:160])
+            raise
     return await asyncio.to_thread(_work)
+
+
+@app.get("/api/audiolang/fixing")
+async def api_audiolang_fixing(file_id: int, track: int = 0):
+    r"""Where one correction has got to. Empty when there is nothing running.
+
+    A READ SO CHEAP IT CAN BE POLLED AT 400ms: one dict lookup under a lock,
+    no database and no disk. That matters because this is polled per row, and
+    a correction of a 40 GB file spends most of its time inside a single
+    ffprobe with nothing else to report.
+    """
+    from . import audiolang
+    return audiolang.fix_state(file_id, track)
 
 
 def _reprobe(file_id: int, path: str) -> None:
@@ -14745,17 +14779,15 @@ function drillUrl(extra){
 // source and a single landing spot could only ever serve one of them.
 let _attn={items:[],by_source:{}};
 
+// Same correction, same reporting. This one does one step more than the
+// settings page - it also puts right a track title left restating the old
+// language - so it declares four steps where that one declares five, and the
+// bar is right in both places because neither of them guesses the length.
 async function alFixTag(fid, track, btn){
-  if(btn){ btn.disabled=true; btn.textContent='correcting…'; }
-  let r={};
-  try{ r=await (await fetch(`/api/audiolang/fix?file_id=${fid}&track=${track}`,
-                            {method:'POST'})).json(); }
-  catch(e){ r={ok:false, why:String(e)}; }
-  if(btn){
-    btn.textContent = r.ok?'corrected':'failed';
-    if(r.why) btn.title = r.why;
-  }
-  setTimeout(()=>loadAttention(true), 1500);
+  return alFixWatch(btn, fid, track,
+    ()=>fetch(`/api/audiolang/fix?file_id=${fid}&track=${track}`,
+              {method:'POST'}).then(x=>x.json()),
+    ()=>loadAttention(true));
 }
 
 async function loadAttention(force){
@@ -14832,10 +14864,10 @@ function attnPaint(){
       // separate decision and stays on the Audio language page with the rest
       // of the evidence.
       const act = it.source==='mislabelled audio' && it.id
-        ? `<button class="rmb" style="margin-left:10px"
+        ? `<span class="askhost"><button class="rmb" style="margin-left:10px"
              title="Rewrite the language tag to what was actually heard, and its title if the title was only restating the old language. Nothing is re-encoded${
                it.fake_dual?' — and once the tag is honest, the duplicate track is dropped by the rules on the next rebuild':''}."
-             onclick="alFixTag(${it.id},${it.track||0},this)">Correct the tag</button>`
+             onclick="alFixTag(${it.id},${it.track||0},this)">Correct the tag</button></span>`
         : it.refetch_kind==='content' && it.id
         ? `<button class="refetch" style="margin-left:10px;font-size:10.5px;padding:1px 7px"
                    title="${esc(it.refetch_why||'reject the release this came from and ask the arr for another')}"
@@ -28846,15 +28878,90 @@ function alStartPoll(){
   }, 1200);
 }
 
+// ---- one correction, reporting itself ----------------------------------
+// A CORRECTION IS NOT INSTANT AND MUST NOT PRETEND TO BE. The button used to
+// say "..." for as long as the work took - a header edit, then a full ffprobe
+// of the file, then a rules pass, then two calls into arrs that may already be
+// busy. Four seconds and forty seconds looked identical, so the only way to
+// tell working from hung was to press it again.
+//
+// So the row shows what the server says it is doing: the step, a bar counting
+// those steps, and a clock. The clock is the part that matters - a number that
+// visibly moves is what separates working from hung, and it keeps moving even
+// during the one long step that has nothing else to report.
+//
+// THE BAR COUNTS STEPS AND SAYS SO. It does not glide between them: the steps
+// cost wildly different amounts, and interpolating would be a smoother
+// animation making a promise about time that nothing here can keep.
+async function alFixWatch(btn, fid, track, run, after){
+  if(!btn) return;
+  const host = btn.closest('td, .askhost') || btn.parentElement;
+  if(!host || host.dataset.fixing==='1') return;
+  host.dataset.fixing='1';
+  const t0=Date.now();
+  const draw=(s)=>{
+    const secs=((Date.now()-t0)/1000).toFixed(1);
+    // A bar that starts at zero reads as "nothing has happened yet"; it has,
+    // the request is out. Four percent is the smallest width that still looks
+    // deliberate.
+    const pct=Math.max(4, (s&&s.pct)||0);
+    host.innerHTML=`<div class="alfix">
+      <div class="hsbar"><i style="width:${pct.toFixed(0)}%"></i></div>
+      <div class="busy" style="font-size:10.5px;margin-top:3px">
+        <span class="sp"></span>
+        <span class="step">${esc((s&&s.label)||'starting')}</span>
+        ${(s&&s.steps)?`<span class="el">${s.step}/${s.steps}</span>`:''}
+        <span class="el">${secs}s</span>
+      </div></div>`;
+  };
+  draw(null);
+  // TWO TIMERS, BECAUSE THEY ANSWER DIFFERENT QUESTIONS. The clock has to move
+  // smoothly or it stops being evidence that anything is alive, and redrawing
+  // it costs nothing. Asking the SERVER where it has got to is a request, and
+  // a correction of a 40 GB file spends thirty seconds inside one ffprobe with
+  // nothing new to say - polling that four times a second would be seventy
+  // requests to hear the same answer.
+  let last=null, live=true;
+  const paint=setInterval(()=>{ if(live) draw(last); }, 250);
+  const ask=async()=>{
+    if(!live) return;
+    try{
+      const s=await (await fetch(
+        `/api/audiolang/fixing?file_id=${fid}&track=${track}`)).json();
+      if(s && s.steps) last=s;
+    }catch(e){}
+  };
+  // ASKED ONCE IMMEDIATELY, then on the interval. Waiting a full second for
+  // the first answer left the row saying "starting" while the server was
+  // already two steps in - the one moment the reader is looking hardest is
+  // the moment right after the click.
+  ask();
+  const tick=setInterval(ask, 1000);
+  let r={};
+  try{ r=await run(); }catch(e){ r={ok:false, why:String(e)}; }
+  live=false; clearInterval(tick); clearInterval(paint);
+  const secs=((Date.now()-t0)/1000).toFixed(1);
+  const ok = !!(r && r.ok);
+  const why = (r&&(r.why||r.detail||r.error))||'';
+  host.dataset.fixing='';
+  // THE RESULT LANDS WHERE THE PROGRESS WAS, and says how long it took. The
+  // row is about to be reloaded out from under it either way, so this is the
+  // only chance to say what happened.
+  host.innerHTML = ok
+    ? `<span style="color:var(--ok);font-size:11px">corrected${
+        why?' — '+esc(why):''} <span class="dim">in ${secs}s</span></span>`
+    : `<span class="err" style="font-size:11px">${esc(why||'failed')}</span>`;
+  if(ok && after) setTimeout(after, 1100);
+  return r;
+}
+
 async function alFix(fileId, track, code, btn){
   if(!fileId){ return; }
-  btn.disabled=true; btn.textContent='...';
-  try{
-    const r=await (await fetch(`/api/audiolang/apply?file_id=${fileId}&track=${track}`+
-      `&code=${encodeURIComponent(code)}&force=true`,{method:'POST'})).json();
-    btn.textContent = r.ok ? 'done' : 'failed';
-    if(r.ok) setTimeout(()=>loadAlang(true), 700);
-  }catch(e){ btn.textContent='failed'; }
+  return alFixWatch(btn, fileId, track,
+    ()=>fetch(`/api/audiolang/apply?file_id=${fileId}&track=${track}`+
+              `&code=${encodeURIComponent(code)}&force=true`,{method:'POST'})
+          .then(x=>x.json()),
+    ()=>loadAlang(true));
 }
 
 let _cod=null, _codSide='video', _codDirty=false;
@@ -32494,6 +32601,14 @@ html.mobile .setwrap:not(.rail) .setmain,html.mobile .setwrap:not(.rail) #worker
 .askrow{display:inline-flex;gap:7px;align-items:center;flex-wrap:wrap;
   max-width:520px}
 .askmsg{font-size:10.5px;color:var(--warn);line-height:1.35}
+/* The correction-in-progress block, which replaces the button it grew out of.
+   min-width so the bar has something to be a proportion OF - dropped into the
+   right-aligned action cell of the disagreements table it would otherwise be
+   as wide as the word "correct" was. text-align:left because a step name and a
+   clock read left-to-right even in a column that does not. */
+.alfix{min-width:196px;text-align:left;display:inline-block}
+.alfix .busy{color:var(--acc)}
+.askhost{display:inline-block}
 .hsbar{height:4px;border-radius:3px;background:#161a20;overflow:hidden;
   margin:6px 0 0}
 .hsbar i{display:block;height:100%;border-radius:3px;background:var(--acc);
