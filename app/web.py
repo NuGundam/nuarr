@@ -7307,14 +7307,14 @@ async def api_tautulli():
                "uses": [
                    {"what": "Who is watching right now",
                     "where": "Job gate", "goto": "plex",
-                    "on": not SETTINGS.plex_direct,
+                    "on": clientcaps.enabled() and not SETTINGS.plex_direct,
                     "note": "Only as the fallback when asking Plex directly is "
                             "off or Plex does not answer. get_activity takes "
                             "about 2.4 s here against tens of milliseconds "
                             "from Plex, which is why direct is preferred."},
                    {"what": "What every device will play untouched",
                     "where": "Video and Audio codec", "goto": "acodec",
-                    "on": True,
+                    "on": clientcaps.enabled(),
                     "note": "The play history carries the source codec, the "
                             "source CHANNEL COUNT and a per-stream decision on "
                             "every session - the evidence nuarr's own log "
@@ -7405,6 +7405,18 @@ async def api_tautulli_config(body: dict = Body(...)):
     _TAUT_PROBE.update(at=0.0, d=None)          # re-probe on the next read
     joblog.log(f"Tautulli connection saved: {url}", "ok")
     return {"ok": True}
+
+
+@app.post("/api/tautulli/enabled")
+async def api_tautulli_enabled(on: bool = True):
+    """The master switch. Off means every caller behaves as if it were absent."""
+    from . import clientcaps
+    clientcaps.set_enabled(on)
+    _TAUT_PROBE.update(at=0.0, d=None)
+    joblog.log("Tautulli integration " + ("switched on" if on else
+               "switched off - the gate will not use it as a session fallback "
+               "and the capability import will not run"), "info")
+    return {"ok": True, **clientcaps.taut_state()}
 
 
 @app.post("/api/tautulli/auto")
@@ -24319,15 +24331,28 @@ function tautPaint(){
   const el=document.getElementById('tautBody');
   if(!el||!_taut) return;
   const d=_taut, im=d["import"]||{}, cs=d.caps||{};
-  const state = d.ok ? 'connected' : (d.key_set||d.url ? 'not answering' : 'not configured');
-  const col = d.ok ? '#7fd4a3' : (d.url? '#e0575b' : '#8a97a6');
+  const state = !im.enabled ? (im.has_conn?'switched off':'switched off, not configured')
+             : d.ok ? 'connected'
+             : (d.key_set||d.url ? 'not answering' : 'not configured');
+  const col = !im.enabled ? '#8a97a6'
+            : d.ok ? '#7fd4a3' : (d.url? '#e0575b' : '#8a97a6');
   const hrs = (t)=>t? ago(t) : 'never';
   const html=`
     <div class="lkind" style="padding:11px 12px;margin-bottom:10px">
-      <div style="display:flex;justify-content:space-between;align-items:baseline;
+      <div style="display:flex;justify-content:space-between;align-items:center;
                   flex-wrap:wrap;gap:8px">
         <b style="color:#6fb0ff">Connection</b>
-        <span style="color:${col};font-size:12px">${esc(state)}</span>
+        <span style="display:flex;align-items:center;gap:9px">
+          <span style="color:${col};font-size:12px">${esc(state)}</span>
+          <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer"
+            title="Off means nuarr behaves as though Tautulli were not installed: the job gate stops using it as a session fallback and the capability import stops running. The URL and key are kept.">
+            <input type="checkbox" ${im.enabled?'checked':''}
+                   onchange="tautEnable(this.checked)">
+            <span>integration</span>
+            <span class="pill ${im.enabled?'ok':''}"
+              style="font-size:9.5px;padding:0 7px">${im.enabled?'ON':'OFF'}</span>
+          </label>
+        </span>
       </div>
       <div class="dim" style="font-size:11px;margin-top:5px">
         ${esc(d.detail||'')}
@@ -24352,7 +24377,16 @@ function tautPaint(){
       </div>
     </div>
 
-    <div class="lkind" style="padding:11px 12px;margin-bottom:10px">
+    ${im.enabled?'':`<div class="lkind" style="padding:11px 12px;margin-bottom:10px;
+        border-color:#4d3d1a">
+      <b style="color:var(--warn)">Switched off</b>
+      <div class="dim" style="font-size:11px;margin-top:3px">Nuarr is behaving
+        as though Tautulli were not installed. The job gate asks Plex and
+        believes the answer; the device panel on the codec pages keeps what it
+        has already learned but stops adding to it from the history. Nothing
+        below runs until this is switched back on.</div></div>`}
+    <div class="lkind" style="padding:11px 12px;margin-bottom:10px${
+        im.enabled?'':';opacity:.5'}">
       <b style="color:#6fb0ff">What Nuarr uses it for</b>
       <div class="tuses">${(d.uses||[]).map(u=>`
         <div class="tuse">
@@ -24364,7 +24398,7 @@ function tautPaint(){
         </div>`).join('')}</div>
     </div>
 
-    <div class="lkind" style="padding:11px 12px">
+    <div class="lkind" style="padding:11px 12px${im.enabled?'':';opacity:.5'}">
       <b style="color:#6fb0ff">Learning what each device plays</b>
       <div style="font-size:11.5px;margin-top:2px;opacity:.85">A recurring job.
         It reads Tautulli's newest sessions and records which codecs, at which
@@ -24379,7 +24413,7 @@ function tautPaint(){
         a run that finds nothing new costs one request.
       </div>
       <div class="turow">
-        <button class="gapchk" ${im.running?'disabled':''}
+        <button class="gapchk" ${(im.running||!im.enabled)?'disabled':''}
           onclick="tautImport(this)">${im.running?'reading…':(im.imported_to?'Read again now':'Read the history')}</button>
         ${im.running?`<span class="busy" style="color:var(--acc)"><span class="sp"></span>
             ${fmt(im.done||0)} of ${fmt(im.total||0)} sessions ·
@@ -24392,6 +24426,7 @@ function tautPaint(){
       <div class="turow">
         <label style="display:flex;align-items:center;gap:6px;font-size:12px">
           <input type="checkbox" id="tuAuto" ${im.auto?'checked':''}
+                 ${im.enabled?'':'disabled'}
                  onchange="tautAuto(this.checked)">
           <span>Keep it current on its own</span></label>
         <span class="dim" style="font-size:11px">every
@@ -24432,6 +24467,12 @@ async function tautSave(btn){
 async function tautImport(btn){
   if(btn){ btn.disabled=true; btn.textContent='starting…'; }
   try{ await fetch('/api/clientcaps/tautulli',{method:'POST'}); }catch(e){}
+  _tautKey='';
+  loadTautulli(true);
+}
+async function tautEnable(on){
+  try{ await fetch('/api/tautulli/enabled?on='+(on?'true':'false'),
+                   {method:'POST'}); }catch(e){}
   _tautKey='';
   loadTautulli(true);
 }
@@ -28219,6 +28260,7 @@ Nothing is saved and no library file is touched.">Test these settings</button>
 // and per library, against what those devices have actually done.
 let _caps=null, _capsSide='', _capsOpen=new Set(), _capsPoll=null, _capsAll=false;
 let _capsKey='';
+function chanTxt(ch){ return ({2:'2.0',6:'5.1',8:'7.1'}[ch]||ch+'ch'); }
 function capsBusy(on){
   const b=document.getElementById('capsRefresh');
   if(b) b.classList.toggle('spinning', !!on);
@@ -28307,30 +28349,47 @@ function capsPaint(){
     const chip=bad?`<span class="capsx bad">${bad} transcode${bad===1?'':'s'}</span>`
               :warn?`<span class="capsx warn">${warn} may transcode</span>`
                    :`<span class="capsx ok">all direct play</span>`;
+    // The per-library verdicts, on the collapsed line. This is the question
+    // the panel exists to answer, so it does not get hidden behind the caret.
+    const strip=libs.map(L=>{
+      const c=dev.cells[L]||{state:'warn',text:'?',codecs:[]};
+      return `<span class="capslib ${c.state}" title="${esc(L+' — '+c.text+'\n'
+        + c.codecs.map(pp=>(pp.codec+(pp.ch?' '+chanTxt(pp.ch):''))+': '+pp.why).join('\n'))}"
+        >${esc(L)}</span>`;
+    }).join('');
+    const fmtList=(arr,label)=>!arr||!arr.length?'':`
+      <div class="capsfmt"><b>${esc(label)}</b>${arr.map(f=>`
+        <span class="capsc ${f.state}" title="${esc(f.why+' — '+f.src)}"
+          >${esc(f.codec)}${f.ch?' '+chanTxt(f.ch):''}${
+          (f.played||f.refused)?`<em>${f.played?'✓'+f.played:''}${
+            f.refused?' ✗'+f.refused:''}</em>`:''}</span>`).join('')}</div>`;
+    const K=dev.known||{};
     return `<div class="capsrow${open?' open':''}">
       <div class="capshead" onclick="capsToggle('${esc(key)}')">
         <span class="ccaret">${open?'▾':'▸'}</span>
         <b>${esc(dev.label)}</b>
-        ${dev.seen?`<span class="capsseen" title="This server has watched this device play or refuse something. What it saw beats the platform profile.">seen here${
-            dev.last_at?' · '+ago(dev.last_at):''}</span>`
+        ${dev.seen?`<span class="capsseen" title="This server has watched this device play or refuse something. What it saw beats the platform profile.">seen${
+            dev.last_at?' '+ago(dev.last_at):''}</span>`
                   :`<span class="capsguess" title="Nothing has played on this device here yet, so the panel is using a typical profile for the platform. One session replaces it with what actually happened.">typical profile</span>`}
-        <span style="margin-left:auto">${chip}</span></div>
-      <div class="capsgrid">${libs.map(L=>{
-        const c=dev.cells[L]||{state:'warn',text:'?',codecs:[]};
-        return `<span class="capscell ${c.state}" title="${esc(
-            c.codecs.map(p=>(p.codec+(p.ch?' '+({2:'2.0',6:'5.1',8:'7.1'}[p.ch]||p.ch+'ch'):''))
-                             +' — '+p.state+': '+p.why+' ('+p.src+')').join('\n'))}"
-          ><i>${esc(L)}</i>${esc(c.text)}</span>`;
-      }).join('')}</div>
-      ${open?`<div class="capsnote">${esc(dev.note||'')}</div>
-        <div class="capscodecs">${libs.map(L=>{
-          const c=dev.cells[L]||{codecs:[]};
-          return `<div class="capscl"><b>${esc(L)}</b>${c.codecs.map(p=>
-            `<span class="capsc ${p.state}" title="${esc(p.why)} — ${esc(p.src)}"
-              >${esc(p.codec)}${p.ch?' '+({2:'2.0',6:'5.1',8:'7.1'}[p.ch]||p.ch+'ch'):''}</span>`).join('')}</div>`;
-        }).join('')}</div>`:''}
+        <span class="capsstrip">${strip}</span>
+        <span class="capssum">${chip}</span></div>
+      ${open?`<div class="capsopen">
+        <div class="capsnote">${esc(dev.note||'')}</div>
+        ${fmtList(K[side],'Plays '+(side==='video'?'video':'audio'))}
+        ${fmtList(K[side==='video'?'audio':'video'],
+                  'Plays '+(side==='video'?'audio':'video')+' (the other tab)')}
+        <div class="capswhat">${libs.map(L=>{
+          const c=dev.cells[L]||{codecs:[],state:'warn',text:''};
+          return `<div class="capscl"><span class="capsdot ${c.state}"></span>
+            <b>${esc(L)}</b> <span class="dim">${esc(c.text)}</span>
+            <div>${c.codecs.map(pp=>`<span class="capsc ${pp.state}"
+              title="${esc(pp.why+' — '+pp.src)}">${esc(pp.codec)}${
+              pp.ch?' '+chanTxt(pp.ch):''}</span>`).join('')}</div></div>`;
+        }).join('')}</div>
+      </div>`:''}
     </div>`;
   }).join('');
+
   // WHAT TAUTULLI ADDS, said where the decision to use it is made. nuarr has
   // watched Plex since July and only records the sessions that went wrong;
   // Tautulli has years of every play, with the source channel count on each -
@@ -28379,10 +28438,11 @@ function capsPaint(){
         <span class="dim">— everything this server has ever seen, oldest last</span></div>`
         :(_capsAll&&all.length>CAP?`<div class="capsmore"><a href="#"
           onclick="_capsAll=false;capsPaint();return false">show fewer</a></div>`:'')}
-      <div class="capslegend dim"><span class="capscell ok">direct play</span>
-        <span class="capscell warn">may transcode</span>
-        <span class="capscell bad">transcodes</span>
-        <span>— hover a cell for the reason, click a device for the detail</span></div>
+      <div class="capslegend dim"><span class="capslib ok">direct play</span>
+        <span class="capslib warn">may transcode</span>
+        <span class="capslib bad">transcodes</span>
+        <span>— one chip per library; hover for the reason, open a device to
+          see everything it plays</span></div>
     </div></div>`;
   if(html===_capsKey) return;             // nothing moved; leave the DOM alone
   _capsKey=html;
@@ -31067,6 +31127,24 @@ html.mobile .setwrap:not(.rail) .setmain,html.mobile .setwrap:not(.rail) #worker
 .capsx.ok{color:var(--ok);border-color:#1f4429}
 .capsx.warn{color:var(--warn);border-color:#4d3d1a}
 .capsx.bad{color:var(--bad);border-color:#5e2b28}
+.capsstrip{display:flex;gap:4px;flex-wrap:wrap;margin-left:auto}
+.capslib{font-size:9.5px;letter-spacing:.02em;border-radius:4px;padding:1px 7px;
+  border:1px solid var(--line);background:#0b0e12;cursor:help;white-space:nowrap}
+.capslib.ok{color:var(--ok);border-color:#1f4429;background:rgba(63,185,80,.06)}
+.capslib.warn{color:var(--warn);border-color:#4d3d1a;background:rgba(210,153,34,.06)}
+.capslib.bad{color:var(--bad);border-color:#5e2b28;background:rgba(248,81,73,.06)}
+.capssum{flex:0 0 auto;margin-left:4px}
+.capsopen{margin:7px 0 4px 18px}
+.capsfmt{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px;margin-top:6px}
+.capsfmt b{font-size:10px;color:var(--dim);font-weight:500;margin-right:4px;
+  min-width:118px}
+.capsc em{font-style:normal;opacity:.55;margin-left:4px;font-size:9px}
+.capswhat{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));
+  gap:7px 16px;margin-top:9px;padding-top:8px;border-top:1px solid #141a22}
+.capsdot{display:inline-block;width:7px;height:7px;border-radius:50%;
+  vertical-align:middle;margin-right:5px}
+.capsdot.ok{background:var(--ok)}.capsdot.warn{background:var(--warn)}
+.capsdot.bad{background:var(--bad)}
 .capsgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));
   gap:5px;margin:5px 0 0 18px}
 .capscell{display:block;font-size:10.5px;border-radius:5px;padding:4px 8px;
@@ -31079,8 +31157,9 @@ html.mobile .setwrap:not(.rail) .setmain,html.mobile .setwrap:not(.rail) #worker
 .capscell.bad{color:var(--bad);border-color:#5e2b28;background:rgba(248,81,73,.05)}
 .capsnote{margin:7px 0 0 18px;font-size:10.5px;color:var(--dim);line-height:1.45}
 .capscodecs{margin:6px 0 2px 18px;display:flex;flex-wrap:wrap;gap:5px 16px}
-.capscl{font-size:10px}
-.capscl b{display:block;color:var(--dim);font-weight:500;margin-bottom:2px}
+.capscl{font-size:10.5px}
+.capscl b{color:#c9d1d9;font-weight:600}
+.capscl>div{margin-top:3px}
 .capsc{display:inline-block;border:1px solid var(--line);border-radius:4px;
   padding:0 6px;margin:0 3px 3px 0;font-family:ui-monospace,Consolas,monospace;
   cursor:help}
@@ -31114,7 +31193,9 @@ html.mobile .setwrap:not(.rail) .setmain,html.mobile .setwrap:not(.rail) #worker
 .capslegend{display:flex;align-items:center;gap:7px;flex-wrap:wrap;
   margin-top:9px;padding-top:8px;border-top:1px solid var(--line);font-size:10px}
 .capslegend .capscell{display:inline-block;cursor:default}
-@media(max-width:760px){.capsgrid{grid-template-columns:1fr 1fr}}
+@media(max-width:900px){.capsgrid{grid-template-columns:1fr 1fr}
+  .capshead{flex-wrap:wrap}.capsstrip{margin-left:22px;width:100%}
+  .capsfmt b{min-width:0;width:100%}}
 #vcodecPane .lchips,#acodecPane .lchips,#alangPane .lchips{display:flex;flex-wrap:wrap;gap:5px;
   justify-content:flex-end}
 .cfbody{padding:2px 0}

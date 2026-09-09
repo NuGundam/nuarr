@@ -221,8 +221,30 @@ def _f(v) -> float:
         return 0.0
 
 
+def enabled() -> bool:
+    r"""Is nuarr allowed to talk to Tautulli at all?
+
+    ON BY DEFAULT, because a configured connection that is silently ignored is
+    worse than no connection. Off means every caller behaves as though Tautulli
+    were not installed: the gate stops using it as a session fallback and the
+    capability import stops running. The credentials stay put - turning an
+    integration off should not make you find your API key again.
+    """
+    from .db import kv_get
+    return (kv_get("tautulli.enabled") or "1") == "1"
+
+
+def set_enabled(on: bool) -> bool:
+    from .db import kv_set
+    kv_set("tautulli.enabled", "1" if on else "0")
+    return enabled()
+
+
 def _taut_cfg() -> tuple[str, str]:
+    """URL and key, or blanks when the integration is switched off."""
     from .config import SETTINGS
+    if not enabled():
+        return "", ""
     return ((SETTINGS.tautulli_url or "").rstrip("/"),
             SETTINGS.tautulli_api_key or "")
 
@@ -240,7 +262,9 @@ def import_tautulli(walk: int = _TAUT_WALK) -> dict:
     from .db import kv_get, kv_set
     base, key = _taut_cfg()
     if not base or not key:
-        TAUT.update(error="Tautulli is not configured", at=time.time())
+        TAUT.update(error=("Tautulli is switched off" if not enabled()
+                           else "Tautulli is not configured"),
+                    at=time.time())
         return dict(TAUT)
     if TAUT["running"]:
         return dict(TAUT)
@@ -372,10 +396,16 @@ def import_tautulli(walk: int = _TAUT_WALK) -> dict:
 
 
 def taut_state() -> dict:
+    from .config import SETTINGS
     base, key = _taut_cfg()
     from .db import kv_get
     last = float(kv_get("clientcaps.taut_at") or 0)
     return {**TAUT, "configured": bool(base and key), "url": base,
+            "enabled": enabled(),
+            # What is stored, regardless of the switch, so the page can offer
+            # to turn it back ON rather than asking for the key again.
+            "has_conn": bool((SETTINGS.tautulli_url or "")
+                             and (SETTINGS.tautulli_api_key or "")),
             "imported_to": int(kv_get("clientcaps.taut_row") or 0),
             "auto": taut_auto(), "every_h": taut_every_h(),
             "last_ok": last,
@@ -745,6 +775,32 @@ def matrix(side: str = "video") -> dict:
     rows = []
     for d in devices:
         prof, o = d.pop("_prof"), d.pop("_obs")
+        # WHAT THIS DEVICE PLAYS, FULL STOP - not just the formats these
+        # libraries happen to produce today. The panel's job is to help decide
+        # what to produce, and you cannot decide that from a list narrowed to
+        # what you already decided. Everything observed on the device, plus
+        # everything its platform profile claims, both sides of the pipeline.
+        known = {"video": [], "audio": []}
+        for kind in ("video", "audio"):
+            seen = []
+            for codec, chans in (o.get(kind) or {}).items():
+                for ch, (played, refused) in chans.items():
+                    vd = _verdict(prof, o, kind, codec, ch)
+                    seen.append({"codec": codec, "ch": ch, "played": played,
+                                 "refused": refused, **vd})
+            # Anything the platform claims that has never been seen here, so a
+            # device with two sightings still shows a usable list.
+            for codec in (prof.get(kind) or {}):
+                if not any(x["codec"] == codec for x in seen):
+                    vd = _verdict(prof, {}, kind, codec, 0)
+                    seen.append({"codec": codec, "ch": 0, "played": 0,
+                                 "refused": 0, **vd})
+            order = {Y: 0, V: 1, N: 2}
+            seen.sort(key=lambda x: (order.get(x["state"], 3),
+                                     -(x["played"] + x["refused"]),
+                                     x["codec"], x["ch"]))
+            known[kind] = seen
+        d["known"] = known
         cells = {}
         for L in libs:
             out = outs[L]

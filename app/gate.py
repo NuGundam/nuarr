@@ -1829,6 +1829,16 @@ def panel_sessions() -> list[dict]:
 
 
 def _tautulli_sessions() -> list[dict] | None:
+    # THE SWITCH IS ASKED HERE TOO. Off means the fallback does not exist, so
+    # the gate behaves exactly as it does on a server with no Tautulli - it
+    # asks Plex and believes the answer - rather than quietly making a 2.4 s
+    # call somebody thought they had disabled.
+    try:
+        from . import clientcaps as _cc
+        if not _cc.enabled():
+            return None
+    except Exception:                                        # noqa: BLE001
+        pass
     url = SETTINGS.tautulli_url
     key = SETTINGS.tautulli_api_key
     if not url or not key:
