@@ -852,7 +852,26 @@ def aggregate(dists: list) -> list:
     return out[:8]
 
 
-SECOND_LOOK = (0.20, 0.40, 0.60)   # where the second three windows come from
+# WHERE THE WINDOWS COME FROM, AND WHY THE MIDDLE WAS THE WRONG PLACE.
+#
+# The first pass took three windows at 0.30, 0.50 and 0.70 - all inside the
+# middle 40% of the file. Invasion (2021) S03E02 is a mostly-English episode
+# with a long Japanese stretch through its middle, so all three landed in the
+# same foreign scene, agreed with each other, and reported Japanese at 92%.
+# Nothing was wrong with the model or the judging: three windows that sit
+# within forty percent of each other are one sample, not three.
+#
+# The same show proves it. Every other episode read English correctly, because
+# their middles happen to be English:
+#     S02E03  [en 0.996, en 0.953, en 0.952]
+#     S02E06  [en 0.990, en 0.986, en 0.771]
+#
+# Five windows now, spread from a tenth in to five sixths through, so a scene
+# of any one language cannot own the whole sample. The second look interleaves
+# with the first rather than sitting inside it - three more windows in the same
+# region would only have confirmed the same scene.
+FIRST_LOOK = (0.10, 0.28, 0.46, 0.64, 0.85)
+SECOND_LOOK = (0.05, 0.19, 0.37, 0.55, 0.73, 0.93)
 OUTLIER_MAX = 0.80                 # a lone dissenter under this is not a second language
 
 
@@ -929,7 +948,7 @@ def _judge(votes: list, strong_floor: float = MIN_PROB) -> dict:
     return out
 
 
-def detect(path: str, track: int = 0, fracs=(0.30, 0.50, 0.70),
+def detect(path: str, track: int = 0, fracs=FIRST_LOOK,
            secs: int = 30) -> dict:
     r"""Listen to `track` of `path` and report what language it is in.
 
@@ -938,14 +957,14 @@ def detect(path: str, track: int = 0, fracs=(0.30, 0.50, 0.70),
     outcome here, not a failure. Everything downstream treats "" as "leave it
     alone", which is the safe direction: a blank tag is already the status quo.
 
-    TWO LOOKS BEFORE REFUSING. Three windows from the middle of the file
-    settle most tracks. When they do not - all under the floor, or confident
-    and disagreeing - three MORE windows are taken from other places in the
-    file (SECOND_LOOK) and the verdict is made over all six. A refusal after
-    six windows spread across the file is worth something; a refusal after
-    three that happened to land on a song, a shout or a foreign-language
-    scene was not. Files the model cannot read at all are not retried: the
-    second look is for uncertainty, not for a disk that timed out.
+    TWO LOOKS BEFORE REFUSING. Five windows spread across the file settle most
+    tracks. When they do not - all under the floor, or confident and
+    disagreeing - six MORE are taken from between them (SECOND_LOOK) and the
+    verdict is made over all eleven. A refusal after eleven windows spread
+    across the file is worth something; a refusal after three that happened to
+    land on a song, a shout or a foreign-language scene was not. Files the
+    model cannot read at all are not retried: the second look is for
+    uncertainty, not for a disk that timed out.
     """
     import numpy as np
     out = {"code": "", "code2": "", "confidence": 0.0, "votes": [],
@@ -1687,6 +1706,23 @@ def mismatches(limit: int = 200) -> list[dict]:
         if same:
             continue
         if float(r["confidence"] or 0) < 0.85:
+            continue
+        # AND THE GUARD THAT INVASION EARNED. A track is only lying if the
+        # language it claims was never heard in it. If ANY confident window
+        # heard the tagged language, the track is mixed - which is a property
+        # of the show, not a fault in the file - and calling that a mislabel
+        # would invite blocklisting a release for being bilingual on purpose.
+        #
+        # Read from the per-window votes rather than the verdict, because the
+        # verdict is the majority and the whole point here is the minority.
+        try:
+            votes = json.loads(r["votes"] or "[]")
+        except Exception:                                # noqa: BLE001
+            votes = []
+        heard_the_tag = any(
+            langkey.same(v[0], tagged) and float(v[1] or 0) >= 0.60
+            for v in votes if isinstance(v, (list, tuple)) and len(v) >= 2)
+        if heard_the_tag:
             continue
         # AND THE ONE THAT MATTERS MOST: is this track a duplicate of another
         # one in the same file, wearing a different label? That is what turns
