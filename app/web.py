@@ -660,6 +660,16 @@ async def api_diag_pool():
 @app.on_event("startup")
 async def _startup() -> None:
     BOOT["started"] = time.time()
+    # FIRST, BEFORE ANYTHING CAN SPAWN. This wraps subprocess.Popen so every
+    # process nuarr starts records the line that started it - and a process
+    # started before the wrapper is in place is one the console watcher can
+    # name only by its parents. The restore check below already runs pip.
+    try:
+        from . import spawntrace
+        spawntrace.install()
+    except Exception as e:                                   # noqa: BLE001
+        joblog.log(f"spawn tracing unavailable: {type(e).__name__}: {e}",
+                   "warn")
     try:
         import anyio.to_thread
         anyio.to_thread.current_default_thread_limiter().total_tokens = DB_THREADS
@@ -20916,6 +20926,8 @@ function renderLogs(keepAnchor){
   // "newest first" flips that for scanning back through history, which is the
   // other thing people do with a log and the one this panel could not do.
   const sortEl=document.getElementById('logSort');
+  // Whole-feed order only; a job block's own lines are put back in sequence
+  // below, because reading one job's progress backwards helps nobody.
   const ordered = (sortEl && sortEl.value==='new')
     ? logRows.slice() : logRows.slice().reverse();
   markEdges(ordered);
@@ -20925,6 +20937,7 @@ function renderLogs(keepAnchor){
   // here, one line there, END somewhere far below. Collect all of a job's lines
   // into one block, ordered by when that job first appeared, so START..END
   // always read together.
+  const newestFirst = !!(sortEl && sortEl.value==='new');
   const byJob=new Map(); const blocks=[];
   for(const r of ordered){
     const jid=r.job_id||null;
@@ -20937,6 +20950,21 @@ function renderLogs(keepAnchor){
     b.rows.push(r);
     b.last=r.at||b.last;
   }
+  // A JOB IS ONE STORY AND STORIES DO NOT RUN BACKWARDS.
+  //
+  // "Newest first" is about where to look for what just happened - it answers
+  // "what is going on right now" by putting the latest thing at the top. It
+  // was being applied INSIDE each job block as well, which answers nothing:
+  // the block opened with its own END line, then counted down through
+  // "verifying unmanaged files", "verifying missing files", "reconciling",
+  // "walking pool disks", and finished at START. A progress sequence read in
+  // reverse is not a summary of the job, it is a job nobody can follow.
+  //
+  // So the BLOCKS stay newest-first - the run that finished a minute ago is
+  // still at the top, which is the whole point of the setting - and the lines
+  // within one block always run oldest to newest. START at the top, its
+  // progress beneath it, END at the bottom, in both sort orders.
+  if(newestFirst) for(const b of blocks) if(b.jid) b.rows.reverse();
   const html =
     (logMore?'<div class="dim" style="padding:4px 0">— scroll up to load older —</div>':
              '<div class="dim" style="padding:4px 0">— start of log —</div>')
@@ -29770,7 +29798,12 @@ function cwPaint(){
   const by=(d.by_source||[]).slice(0,10).map(s=>`
     <tr><td style="padding:2px 10px 2px 0;white-space:nowrap;color:${
       s.ours?'var(--warn)':'inherit'}">${esc(s.owner||'?')}${
-      s.root?`<span class="dim"> from ${esc(s.root)}</span>`:''}${
+      /* THE LINE BEATS THE PARENT. "from wininit.exe" is true of almost
+         everything on a Windows box and narrows nothing; "from
+         integrity.py:148" is the fix. Shown instead of the root when it is
+         known, and the root stays for everything nuarr did not spawn. */
+      s.origin?`<span class="mono" style="opacity:.85"> ${esc(s.origin)}</span>`
+             :(s.root?`<span class="dim"> from ${esc(s.root)}</span>`:'')}${
       s.ours?' <span style="color:var(--warn)">· Nuarr</span>':''}</td>
       <td style="padding:2px 10px 2px 0;text-align:right"><b>${fmt(s.n)}</b></td>
       <td class="dim" style="padding:2px 0;white-space:nowrap">${
@@ -29792,7 +29825,10 @@ function cwPaint(){
       </div>
       <div class="dim" style="font-size:10.5px;margin-left:66px;overflow:hidden;
            text-overflow:ellipsis;white-space:nowrap">
-        ${r.root?`started by <b>${esc(r.root)}</b>`:''}${
+        ${r.origin?`<span class="mono" style="color:var(--acc)"
+           title="The nuarr source line that started this process, captured at the moment of the call. This is the line to fix."
+           >${esc(r.origin)}</span> · `:''}${
+          r.root?`started by <b>${esc(r.root)}</b>`:''}${
           r.ancestry?` <span style="opacity:.65">· ${esc(r.ancestry)}</span>`:''}
       </div>
     </div>`).join('');
@@ -29809,6 +29845,10 @@ function cwPaint(){
         than that can be missed entirely — an empty list means nothing has been
         <i>caught</i>, not that nothing has happened. Anything that recurs will
         be seen sooner or later, which is what makes the counts worth reading.
+        Anything Nuarr started also carries the source file and line that
+        started it, captured at the moment of the call — because knowing it was
+        ffmpeg, from Nuarr, does not tell you which of the places Nuarr runs
+        ffmpeg was the one that forgot to hide its window.
       </span>
       ${n?`<button onclick="cwForget()" style="font-size:11px;padding:2px 9px;
         margin-left:auto" title="Clear the record - do this after a fix, so the next entry means something">Clear</button>`:''}

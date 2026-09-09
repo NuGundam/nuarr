@@ -94,7 +94,11 @@ def init() -> None:
         # Added after the first version shipped rows that named the process
         # but not what it was running. Migrated rather than rebuilt, so
         # anything already caught is kept.
-        for col in ("cmdline", "root"):
+        # origin: the nuarr file and line that spawned the owner, captured by
+        # spawntrace at the moment of the call. "ffmpeg.exe from Nuarr.exe" says
+        # whose fault it is; this says which of the twenty-six places nuarr
+        # starts ffmpeg from was the one that forgot the flag.
+        for col in ("cmdline", "root", "origin"):
             try:
                 cur.execute(f"ALTER TABLE console_windows ADD COLUMN {col} TEXT")
             except Exception:                                # noqa: BLE001
@@ -345,15 +349,26 @@ def _record(pid: int, owner_pid: int, procs: dict, title: str,
     # The oldest ancestor still traceable - the application ultimately behind
     # this, which is what a person actually wants to know first.
     root = chain[-1] if len(chain) > 1 else ""
+    # AND THE LINE THAT DID IT, IF IT WAS ONE OF OURS. spawntrace wrapped
+    # subprocess.Popen at boot and wrote down the innermost nuarr frame for
+    # every process this server has started, so the owner's pid is a key into
+    # the answer. Empty for anything nuarr did not spawn - Plex, an installer,
+    # a scheduled task - which is correct: there is no nuarr line to name.
+    origin = ""
+    try:
+        from . import spawntrace
+        origin = (spawntrace.where(owner_pid) or {}).get("where") or ""
+    except Exception:                                        # noqa: BLE001
+        pass
     row = (time.time(), pid, owner_pid, ent[0], _image_path(owner_pid),
            _readable(chain), int(ours), int(visible), title[:160],
-           cmd, root)
+           cmd, root, origin)
     try:
         with cursor() as cur:
             cur.execute(
                 "INSERT INTO console_windows(at,pid,owner_pid,owner,"
-                "owner_path,ancestry,ours,visible,title,cmdline,root) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?)", row)
+                "owner_path,ancestry,ours,visible,title,cmdline,root,origin) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", row)
     except Exception:                                        # noqa: BLE001
         return
     STATE["visible"] += 1
@@ -364,7 +379,8 @@ def _record(pid: int, owner_pid: int, procs: dict, title: str,
     # console is not nuarr's business to complain about - it is recorded, and
     # that is enough.
     joblog.log(f"a console window appeared ({where}): {ent[0]} "
-               f"— {' <- '.join(chain[:4])}",
+               + (f"from {origin} " if origin else "")
+               + f"— {' <- '.join(chain[:4])}",
                "warn" if ours else "info")
 
 
@@ -439,12 +455,21 @@ async def watch() -> None:
                            f"{STATE['visible']} window(s) recorded")
 
 
+def _spawn_state() -> dict:
+    try:
+        from . import spawntrace
+        return dict(spawntrace.STATE)
+    except Exception:                                        # noqa: BLE001
+        return {}
+
+
 def recent(limit: int = 200, ours_only: bool = False) -> dict:
     """What has been caught, newest first, with a summary by source."""
     try:
         with cursor() as cur:
             q = ("SELECT at,pid,owner_pid,owner,owner_path,ancestry,ours,"
-                 "title,cmdline,root FROM console_windows ")
+                 "title,cmdline,root,COALESCE(origin,'') origin "
+                 "FROM console_windows ")
             if ours_only:
                 q += "WHERE ours=1 "
             q += "ORDER BY at DESC LIMIT ?"
@@ -475,20 +500,31 @@ def recent(limit: int = 200, ours_only: bool = False) -> dict:
             # Grouped by WHO IS BEHIND IT, not by what got the console. Ten
             # rows of "cmd.exe" says nothing; "cmd.exe, from windows-mcp" and
             # "cmd.exe, from Plex" are two different problems.
+            # AND BY THE LINE, WHERE THERE IS ONE. "ffmpeg.exe from Nuarr.exe,
+            # 9 of them" is one row of a bug report; "ffmpeg.exe from
+            # integrity.py:148, 9 of them" is the whole report.
             by = [dict(r) for r in cur.execute(
-                "SELECT owner, COALESCE(root,'') root, ours, COUNT(*) n, "
+                "SELECT owner, COALESCE(root,'') root, "
+                "       COALESCE(origin,'') origin, ours, COUNT(*) n, "
                 "       MAX(at) last_at "
-                "FROM console_windows GROUP BY owner, root, ours "
+                "FROM console_windows GROUP BY owner, root, origin, ours "
                 "ORDER BY n DESC LIMIT 30")]
     except Exception as e:                                   # noqa: BLE001
         return {"rows": [], "by_source": [], "total": 0, "ours": 0,
                 "ours_recent": 0, "ours_last_at": 0.0, "recent_s": RECENT_S,
+                "traced": 0, "tracing": False,
                 "error": f"{type(e).__name__}"}
     return {"rows": rows, "by_source": by,
             "ours_recent": int(rec["n"] or 0),
             "ours_last_at": float((last["m"] if last else 0) or 0),
             "recent_s": RECENT_S,
             "total": int(tot["n"] or 0), "ours": int(tot["ours"] or 0),
+            # HOW MANY SPAWNS THE TRACER HAS SEEN. Worth surfacing because a
+            # zero here changes what an empty console list means: no consoles
+            # caught AND nothing traced is a watcher that is not wired up,
+            # which reads identically to a clean machine and is not one.
+            "traced": int(_spawn_state().get("seen") or 0),
+            "tracing": bool(_spawn_state().get("installed")),
             "watching": bool(STATE.get("running")),
             "since": STATE.get("started_at") or 0.0,
             "consoles_seen": STATE.get("seen", 0),
