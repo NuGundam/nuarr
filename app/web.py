@@ -740,6 +740,12 @@ async def _startup() -> None:
         from . import subembed as _se
         _se.init()
         asyncio.create_task(_se.watch())
+        # The subtitles that are already in the picture. Only ever looks at
+        # files that report having none, so a library with proper tracks costs
+        # it nothing.
+        from . import hardsub as _hs
+        _hs.init()
+        asyncio.create_task(_hs.watch())
         # Filesystem change tracking: per-library rescans instead of full
         # scans every few hours. Hands it the scan runner rather than
         # importing web from the module (cycle).
@@ -6633,6 +6639,44 @@ async def api_remedy_replace(file_id: int, kind: str, source: str = "ui",
         return {"ok": False, "why": "this deletes the file and asks the arr "
                                     "for another one - confirm required"}
     return await remedy.replace(int(file_id), kind, source=source)
+
+
+@app.get("/api/hardsub")
+def api_hardsub(limit: int = 40):
+    """Files whose subtitles are burned into the picture."""
+    from . import hardsub
+    return {**hardsub.stats(), "found": hardsub.found(
+        max(1, min(int(limit), 300)))}
+
+
+@app.post("/api/hardsub/run")
+async def api_hardsub_run(limit: int = 0):
+    from . import hardsub
+    return await hardsub.sweep(limit=limit)
+
+
+@app.post("/api/hardsub/check")
+async def api_hardsub_check(file_id: int):
+    """Look at one file now and keep the answer. Reads only."""
+    from . import hardsub
+    d = await asyncio.to_thread(hardsub.probe_one, int(file_id))
+    if d.get("ok"):
+        await asyncio.to_thread(hardsub._save, d)
+    return d
+
+
+@app.post("/api/hardsub/mark")
+async def api_hardsub_mark(file_id: int, confirm: str = ""):
+    """Add the blank English marker track so Bazarr stops asking.
+
+    Behind a confirm word because it rewrites the file - a stream copy, but a
+    rewrite, and the panel is the place that explains what it is for.
+    """
+    from . import hardsub
+    if confirm != "yes":
+        return {"ok": False, "why": "this rewrites the file to add a blank "
+                                    "subtitle track - confirm required"}
+    return await asyncio.to_thread(hardsub.mark_one, int(file_id))
 
 
 @app.get("/api/subembed")
@@ -21929,6 +21973,7 @@ function wtab(which){
     if(hint) hint.textContent='· subtitles';
     paneLoad('lang', loadLangTab);
     loadSubEmbed();
+    loadHardsub();
     // Its own slot, its own remembered open/shut state. Sharing the codec
     // pages' one would mean opening the panel here silently opened it there
     // too, about a different question.
@@ -28816,6 +28861,84 @@ function capsShow(on, slot){
   try{ localStorage.setItem(S.store, on?'open':'shut'); }catch(e){}
   if(on && !S.caps) capsLoad(false, slot); else capsPaint(slot);
 }
+// ---- subtitles already painted into the picture -------------------------
+let _hs=null, _hsKey='';
+const HSW={dialogue:['dialogue','var(--bad)'], hybrid:['dialogue + signs','var(--bad)'],
+           signs:['signs or songs','var(--warn)'], none:['none','var(--ok)']};
+async function loadHardsub(){
+  const el=document.getElementById('hsPanel'); if(!el) return;
+  try{ _hs=await (await fetch('/api/hardsub?limit=40')).json(); }
+  catch(e){ el.innerHTML='<span class="dim">could not load</span>'; return; }
+  hsPaint();
+}
+function hsPaint(){
+  const el=document.getElementById('hsPanel'); if(!el||!_hs) return;
+  const d=_hs, rows=d.found||[];
+  const tested=(d.none||0)+(d.signs||0)+(d.dialogue||0)+(d.hybrid||0);
+  const head=`<b style="color:#6fb0ff">Subtitles already in the picture</b>
+    <span class="dim" style="font-size:11.5px">${fmt(tested)} checked · ${
+      fmt(d.untested||0)} still to look at${
+      (d.dialogue||d.hybrid)?` · <span style="color:var(--bad)">${
+        fmt((d.dialogue||0)+(d.hybrid||0))} carrying dialogue</span>`:''}${
+      d.signs?` · ${fmt(d.signs)} signs only`:''}${
+      d.marked?` · ${fmt(d.marked)} marked`:''}</span>
+    <span style="float:right"><button class="rmb" onclick="hsRun(this)" ${
+      d.running?'disabled':''}>${d.running?'looking…':'Check some now'}</button></span>`;
+  const note=`<div class="dim" style="font-size:11px;margin:3px 0 6px">
+    Only files that report having NO subtitle track are looked at — one with a
+    track already answers every question this asks. Twenty-four frames are
+    sampled, the bright pixels low in the picture are counted, and only the
+    best few of those are shown to the OCR: a bright blob is also a lamp or a
+    white shirt, so a file is called hardsubbed only when real words come
+    back.${d.have_ocr?'':' <span style="color:var(--bad)">Tesseract is not installed, so nothing can be confirmed.</span>'}</div>`;
+  const prog=d.running?`<div class="dim" style="font-size:11px">${esc(d.now||'')} · ${
+    d.done||0}/${d.total||0}</div>`:'';
+  const table = rows.length ? `<table style="width:100%;font-size:11.5px">
+      <colgroup><col style="width:40%"><col style="width:12%"><col style="width:10%">
+        <col style="width:24%"><col style="width:14%"></colgroup>
+      <tbody>${rows.map(r=>{
+        const [word,col]=HSW[r.state]||[r.state,'var(--dim)'];
+        return `<tr>
+        <td style="padding:3px 8px 3px 0" title="${esc(r.detail||'')}"
+          >${esc(String(r.path||'').split('\\').pop())}</td>
+        <td class="dim" style="padding:3px 8px 3px 0">${esc(r.library||'')}</td>
+        <td style="padding:3px 8px 3px 0;color:${col}">${esc(word)}</td>
+        <td class="dim mono" style="padding:3px 8px 3px 0;overflow:hidden;
+            text-overflow:ellipsis;white-space:nowrap"
+            title="${esc('read from the picture: '+(r.words||''))}"
+          >${esc(r.words||'')}</td>
+        <td style="padding:3px 0;white-space:nowrap">${r.marked
+          ? '<span class="dim" title="This file already carries the blank English track.">marked</span>'
+          : `<button class="rmb" onclick="hsMark(${r.file_id},this)"
+              title="Add a blank English subtitle track — one silent cue, default and forced cleared, named so the picker explains itself. Bazarr and Plex then see a subtitle exists and stop asking for one, and nothing is ever drawn over the words already in the picture.">Mark it</button>`}</td>
+      </tr>`;}).join('')}</tbody></table>`
+    : `<div class="dim" style="font-size:11.5px">${
+        tested?'Nothing checked so far is carrying subtitles in the picture.'
+              :'Nothing checked yet.'}</div>`;
+  const html=`<div class="lkind" style="padding:11px 12px">${head}${note}${prog}${table}</div>`;
+  if(html===_hsKey) return;
+  _hsKey=html; el.innerHTML=html;
+}
+async function hsRun(btn){
+  if(btn){ btn.disabled=true; btn.textContent='looking…'; }
+  try{ await fetch('/api/hardsub/run',{method:'POST'}); }catch(e){}
+  loadHardsub();
+}
+async function hsMark(fid, btn){
+  if(!confirm('Add a blank English subtitle track to this file?\n\nIt is a '
+     +'stream copy, so nothing is re-encoded. The track holds one silent cue '
+     +'and is never selected automatically — it exists so Bazarr and Plex stop '
+     +'reporting the file as having no subtitles.')) return;
+  if(btn){ btn.disabled=true; btn.textContent='working…'; }
+  let r={};
+  try{ r=await (await fetch('/api/hardsub/mark?file_id='+fid+'&confirm=yes',
+                            {method:'POST'})).json(); }
+  catch(e){ r={ok:false, why:String(e)}; }
+  if(btn) btn.textContent = r.ok?'marked':'failed';
+  if(!r.ok && r.why) alert(r.why);
+  setTimeout(loadHardsub, 800);
+}
+
 // ---- sidecar subtitles waiting to come inside ---------------------------
 let _se=null, _seKey='';
 async function loadSubEmbed(){
