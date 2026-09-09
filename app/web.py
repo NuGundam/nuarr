@@ -3284,6 +3284,19 @@ def _summary_impl():
     except Exception:                                    # noqa: BLE001
         pass
     try:
+        # AND THE ONE THAT IS ALWAYS A DECISION. A track tagged a language it
+        # is not can be corrected safely, but a release that shipped one
+        # language twice while claiming two is a blocklist call - and a
+        # blocklist call belongs on the tile that means "this needs you".
+        # There is no auto mode quietly handling these, so unlike the three
+        # above it is raised in every mode.
+        from . import audiolang as _alg
+        _row = _alg.attention()
+        if _row:
+            attention.append(_row)
+    except Exception:                                    # noqa: BLE001
+        pass
+    try:
         # Files an arr manages that nuarr has no row for. Same rule again:
         # raised when a person has to act, silent when auto mode has it - see
         # arrgap.attention().
@@ -6639,6 +6652,43 @@ async def api_remedy_replace(file_id: int, kind: str, source: str = "ui",
         return {"ok": False, "why": "this deletes the file and asks the arr "
                                     "for another one - confirm required"}
     return await remedy.replace(int(file_id), kind, source=source)
+
+
+@app.get("/api/audiolang/mismatch")
+def api_audiolang_mismatch(limit: int = 60):
+    """Tracks tagged a language they are not, and how far the check has got.
+
+    THE BACKLOG IS PART OF THE ANSWER. "no mismatches" means something very
+    different when 21 files have been listened to than when 39,000 have, and a
+    panel that reports the first without the second is inviting the wrong
+    conclusion.
+    """
+    from . import audiolang
+    left = audiolang.unverified_count()
+    prog = audiolang.progress()
+    # Seconds per track, measured off the last completed pass rather than
+    # assumed. ~7s on this box, but it is a GPU and it depends what else wants
+    # it, so it is read rather than hard-coded.
+    each = 0.0
+    try:
+        span = (prog.get("finished_at") or 0) - (prog.get("started_at") or 0)
+        if span > 0 and (prog.get("done") or 0) > 0:
+            each = span / prog["done"]
+    except Exception:                                    # noqa: BLE001
+        each = 0.0
+    return {"rows": audiolang.mismatches(max(1, min(int(limit), 300))),
+            "unverified": left, "gaps": audiolang.pending_count(),
+            "progress": prog, "secs_each": round(each, 2),
+            "eta": round(left * each) if (left and each) else 0,
+            "usable": audiolang.usable()}
+
+
+@app.post("/api/audiolang/fix")
+async def api_audiolang_fix(file_id: int, track: int):
+    """Correct one lying tag. The duplicate it reveals is the rules' problem."""
+    from . import audiolang
+    return await asyncio.to_thread(audiolang.fix_mislabel, int(file_id),
+                                   int(track))
 
 
 @app.get("/api/hardsub")

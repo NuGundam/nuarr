@@ -151,6 +151,18 @@ _kind("container/name", True, False, False,
       "this is a rename, not stream work")
 
 # -- a tag, not a fault. Replaceable by hand, never unattended. ---------------
+# A RELEASE THAT LIED. Both tracks are the same language and one of them is
+# wearing the other's label, so the file is not dual audio and never was. The
+# tag can be corrected and the duplicate dropped - which makes the file honest
+# - but it cannot make the missing language appear. Only a different release
+# can do that, which is what makes this replaceable at all.
+_kind("audio/fake-dual", True, True, False,
+      "the file claims two audio languages and carries one of them twice. "
+      "Correcting the tag and dropping the duplicate makes it honest; only a "
+      "different release makes it dual audio")
+_kind("audio/mislabelled", True, False, False,
+      "a track is tagged a language it is not. The words are fine - the label "
+      "is wrong - so this is a header to rewrite, not a file to replace")
 _kind("audio/untagged", True, True, False,
       "the track carries no language tag. The words may be right and only "
       "the label wrong, so this is never replaced unattended")
@@ -223,6 +235,11 @@ _FALLBACK = {"requeue": True, "replace": False, "auto_replace": False,
 # kind of statement - not "what may be done to this file" but "this is not
 # about the file".
 _REPAIR_OF = {
+    # Correcting the tag is an in-place header rewrite that audiolang already
+    # knows how to do; the duplicate track it reveals is dropped by the rules
+    # that were always there.
+    "audio/mislabelled": "audiolang",
+    "audio/fake-dual": "audiolang",
     "arr/disagree": "arrsync",
     "plex/disagree": "plexsync",
     "audio/title": "audiotitle",

@@ -47,6 +47,7 @@ do with the report, and the user can turn that off per library.
 from __future__ import annotations
 
 import glob
+import json
 import os
 import re
 import site
@@ -1483,6 +1484,274 @@ def pending(limit: int = 5000) -> list[dict]:
     return out
 
 
+def unverified(limit: int = 5000) -> list[dict]:
+    r"""Tracks that CARRY a tag nobody has ever checked against the audio.
+
+    THE HOLE THIS FILLS, AND HOW IT WAS FOUND. pending() returns tracks whose
+    language tag is missing - `audio_langs` holding a "-" - and listens to
+    those. It has been right about every file it looked at and blind to the
+    interesting one:
+
+        Pass the Monster Meat, Milady! S01E12   [JA+EN]
+            track 0   tagged jpn   heard jpn   0.961
+            track 1   tagged eng   heard jpn   0.958
+
+    Both tracks are Japanese. The release said dual audio, the container says
+    dual audio, and the second track is the first one wearing a different
+    label. pending() never offered it to Whisper because the tag was not
+    missing - it was WRONG, which is a different thing and the harder one,
+    because nothing downstream has any reason to doubt it.
+
+    A missing tag is a gap; a wrong tag is a lie, and only listening can tell.
+    So this returns the other population: tagged tracks with no fresh verdict.
+    It is much larger - 16,339 files claim two or more languages and 21 of them
+    had ever been read - so it is drained after pending(), never instead of it.
+    """
+    out: list[dict] = []
+    try:
+        ensure_table()
+        with cursor() as cur:
+            have = {(r["file_id"], r["track"]): r for r in
+                    cur.execute("SELECT * FROM audio_lang").fetchall()}
+            rows = cur.execute(
+                "SELECT id, path, title, season, episode, library, audio_langs "
+                "  FROM files "
+                " WHERE state='done' AND COALESCE(audio_langs,'') != '' "
+                "   AND audio_langs != '-' "
+                " ORDER BY id DESC").fetchall()
+    except Exception:                                    # noqa: BLE001
+        return out
+    for r in rows:
+        if len(out) >= limit:
+            break
+        codes = (r["audio_langs"] or "").split(",")
+        for ai, raw_code in enumerate(codes):
+            raw_code = (raw_code or "").strip()
+            if not raw_code or raw_code == "-":
+                continue                    # pending() owns the untagged ones
+            prev = have.get((r["id"], ai))
+            if prev is not None and row_fresh(prev, r["path"]):
+                continue
+            out.append({"file_id": r["id"], "path": r["path"], "track": ai,
+                        "title": r["title"] or "", "season": r["season"],
+                        "episode": r["episode"], "library": r["library"] or "",
+                        "tagged": raw_code,
+                        "n_audio": len(codes)})
+    return out
+
+
+def unverified_count() -> int:
+    """How many tagged tracks have never been listened to."""
+    try:
+        ensure_table()
+        with cursor() as cur:
+            r = cur.execute(
+                "SELECT COUNT(*) n FROM files f "
+                " WHERE f.state='done' AND COALESCE(f.audio_langs,'') != '' "
+                "   AND f.audio_langs != '-' "
+                "   AND NOT EXISTS (SELECT 1 FROM audio_lang a "
+                "                    WHERE a.file_id = f.id)").fetchone()
+        return int(r["n"] or 0)
+    except Exception:                                    # noqa: BLE001
+        return 0
+
+
+def mismatches(limit: int = 200) -> list[dict]:
+    r"""Tracks where what was heard is not what the tag claims.
+
+    Only confident disagreements. A verdict this acts on gets a file rebuilt
+    and a release blocklisted, so a shaky one has to stay a curiosity rather
+    than become an action.
+    """
+    out: list[dict] = []
+    try:
+        from . import langkey
+        ensure_table()
+        with cursor() as cur:
+            rows = cur.execute(
+                "SELECT a.file_id, a.track, a.code, a.confidence, a.checked_at,"
+                "       f.path, f.library, f.title, f.audio_langs "
+                "  FROM audio_lang a JOIN files f ON f.id = a.file_id "
+                " WHERE a.ok = 1 AND COALESCE(a.code,'') != '' "
+                "   AND f.state = 'done' "
+                " ORDER BY a.checked_at DESC").fetchall()
+    except Exception:                                    # noqa: BLE001
+        return out
+    for r in rows:
+        if len(out) >= limit:
+            break
+        codes = (r["audio_langs"] or "").split(",")
+        if r["track"] >= len(codes):
+            continue
+        tagged = (codes[r["track"]] or "").strip()
+        if not tagged or tagged == "-":
+            continue                        # untagged is a gap, not a lie
+        try:
+            same = langkey.same(tagged, r["code"])
+        except Exception:                                # noqa: BLE001
+            same = tagged[:2].lower() == (r["code"] or "")[:2].lower()
+        if same:
+            continue
+        if float(r["confidence"] or 0) < 0.85:
+            continue
+        # AND THE ONE THAT MATTERS MOST: is this track a duplicate of another
+        # one in the same file, wearing a different label? That is what turns
+        # "a tag is wrong" into "this release lied about being dual audio".
+        heard_twice = sum(1 for i, c in enumerate(codes)
+                          if i != r["track"] and langkey.same(c, r["code"]))
+        out.append({"file_id": r["file_id"], "track": r["track"],
+                    "tagged": tagged, "heard": r["code"],
+                    "confidence": round(float(r["confidence"] or 0), 3),
+                    "path": r["path"], "library": r["library"] or "",
+                    "title": r["title"] or "",
+                    "at": r["checked_at"],
+                    "fake_dual": bool(heard_twice),
+                    "langs": r["audio_langs"] or ""})
+    return out
+
+
+# The handful of names a release actually writes into a track title. Not a
+# full ISO table: this is only ever compared against a title to decide whether
+# the title is merely restating the language, and a name nobody uses would
+# never match anyway.
+_LANG_NAME = {
+    "en": "English", "ja": "Japanese", "zh": "Chinese", "ko": "Korean",
+    "es": "Spanish", "fr": "French", "de": "German", "it": "Italian",
+    "pt": "Portuguese", "ru": "Russian", "ar": "Arabic", "hi": "Hindi",
+    "nl": "Dutch", "pl": "Polish", "sv": "Swedish", "no": "Norwegian",
+    "da": "Danish", "fi": "Finnish", "tr": "Turkish", "th": "Thai",
+    "vi": "Vietnamese", "id": "Indonesian", "he": "Hebrew", "cs": "Czech",
+    "hu": "Hungarian", "el": "Greek", "uk": "Ukrainian", "ro": "Romanian",
+}
+
+
+def _track_title(path: str, track: int) -> str:
+    """The title on one audio track, read from the stored probe."""
+    try:
+        with cursor() as cur:
+            r = cur.execute("SELECT p.json FROM file_probes p "
+                            "JOIN files f ON f.id = p.file_id "
+                            "WHERE f.path = ?", (path,)).fetchone()
+        if not r:
+            return ""
+        auds = [s for s in (json.loads(r["json"]).get("streams") or [])
+                if s.get("codec_type") == "audio"]
+        if track < len(auds):
+            return str((auds[track].get("tags") or {}).get("title") or "")
+    except Exception:                                    # noqa: BLE001
+        pass
+    return ""
+
+
+def _set_track_title(path: str, track: int, title: str) -> bool:
+    """mkvpropedit again - same 1-based audio numbering as apply_tags."""
+    exe = getattr(SETTINGS, "mkvpropedit", "") or \
+        r"C:\Program Files\MKVToolNix\mkvpropedit.exe"
+    if not os.path.exists(exe) or not os.path.exists(path):
+        return False
+    try:
+        r = subprocess.run(
+            [exe, path, "--edit", f"track:a{int(track) + 1}",
+             "--set", f"name={title}"],
+            capture_output=True, text=True, timeout=600,
+            creationflags=NO_WINDOW, startupinfo=hidden_si())
+        return r.returncode == 0
+    except Exception:                                    # noqa: BLE001
+        return False
+
+
+def fix_mislabel(file_id: int, track: int) -> dict:
+    r"""Correct a lying tag, then let the rules deal with what that reveals.
+
+    THE SECOND STEP IS THE ONE THAT COSTS NOTHING. Once the tag says what the
+    audio actually is, a file with two Japanese tracks is a file with two
+    Japanese tracks - and `audio/dedupe` has been in the rule set the whole
+    time, waiting for a file honest enough to trip it. So this writes one
+    header and requeues; nothing here knows how to drop a track, and nothing
+    here should.
+
+    The blocklist is deliberately NOT done here. Retagging is safe and always
+    an improvement; asking the arr for a different release is a decision with a
+    cost, and it belongs to the remedy layer next to every other one.
+    """
+    from . import langkey
+    m = [x for x in mismatches(1000)
+         if x["file_id"] == int(file_id) and x["track"] == int(track)]
+    if not m:
+        return {"ok": False, "why": "no confident mismatch recorded for that "
+                                    "track - it may have been re-checked"}
+    x = m[0]
+    with cursor() as cur:
+        r = cur.execute("SELECT path FROM files WHERE id=?",
+                        (int(file_id),)).fetchone()
+    if not r:
+        return {"ok": False, "why": "no such file"}
+    path = r["path"]
+    if not can_fast_path(path):
+        return {"ok": False, "why": "this container cannot be edited in place"}
+    ok, why = apply_and_restamp(int(file_id), path, {int(track): x["heard"]})
+    if not ok:
+        return {"ok": False, "why": why}
+    # AND THE THIRD LIE, WHICH NOBODY OWNED. Correcting the language left the
+    # file reading `lang=jpn title=English` - a track that now says the right
+    # thing in the field the rules read and the wrong thing in the field a
+    # viewer reads. The audio-title check does not catch it either: it looks
+    # for titles naming a CODEC the file does not have, not a language.
+    #
+    # Only touched when the title is the old language's own name. A release
+    # that titled the track "Japanese Dub 5.1" or "Commentary" is saying
+    # something this has no business rewriting.
+    retitled = ""
+    try:
+        old_name = _LANG_NAME.get(langkey.key(x["tagged"]), "")
+        new_name = _LANG_NAME.get(langkey.key(x["heard"]), "")
+        cur_title = _track_title(path, int(track))
+        if old_name and new_name and cur_title.strip().lower() == old_name.lower():
+            if _set_track_title(path, int(track), new_name):
+                retitled = f", and its title from {old_name} to {new_name}"
+    except Exception:                                    # noqa: BLE001
+        pass
+    _reprobe_quiet(int(file_id), path)
+    try:
+        from . import joblog
+        joblog.log(f"audio language: track {track} of "
+                   f"{os.path.basename(path)} said {x['tagged']} and is "
+                   f"{x['heard']} - tag corrected", "warn", system="audiolang")
+    except Exception:                                    # noqa: BLE001
+        pass
+    _ = langkey
+    return {"ok": True, "tagged": x["tagged"], "heard": x["heard"],
+            "fake_dual": x["fake_dual"], "path": path, "retitled": retitled,
+            "why": f"tag corrected to {x['heard']}" + retitled
+                   + (" - the duplicate track will be dropped on the next "
+                      "rebuild" if x["fake_dual"] else "")}
+
+
+def attention() -> dict | None:
+    r"""What the Attention tile should say, or nothing.
+
+    A LIE IS ALWAYS WORTH RAISING. Unlike the other checks there is no auto
+    mode that quietly handles these: correcting a tag is safe, but the thing
+    that follows - a release blocklisted and re-searched because it claimed
+    dual audio and shipped one language twice - is a decision, and a decision
+    belongs on the tile that means "this needs you".
+    """
+    try:
+        m = mismatches(500)
+    except Exception:                                    # noqa: BLE001
+        return None
+    if not m:
+        return None
+    fake = [x for x in m if x["fake_dual"]]
+    if fake:
+        return {"what": "mislabelled audio", "n": len(fake),
+                "note": "claim dual audio and carry one language twice",
+                "goto": "/settings#alang"}
+    return {"what": "mislabelled audio", "n": len(m),
+            "note": "a track is tagged a language it is not",
+            "goto": "/settings#alang"}
+
+
 _PENDING_CACHE: dict = {"n": 0, "at": 0.0}
 _PENDING_TTL = 20.0
 
@@ -1540,11 +1809,22 @@ async def watch() -> None:
         await asyncio.sleep(1800)
 
 
-def run_once(limit: int = 400, apply: bool = True) -> dict:
-    """One pass: find untagged tracks, listen, and write what was heard."""
+def run_once(limit: int = 400, apply: bool = True,
+             verify: bool = True) -> dict:
+    r"""One pass: listen to what needs listening to, and write what was heard.
+
+    TWO POPULATIONS, IN THIS ORDER. Untagged tracks first, because a missing
+    language actively breaks the planner's rules and is the smaller pile. Then
+    tagged tracks nobody has verified, which is where the lies live and is
+    twenty thousand files deep - so it is only ever the remainder of a pass,
+    never allowed to starve the gaps.
+    """
     from . import joblog
     pending_invalidate()
     todo = pending(limit)
+    gaps = len(todo)
+    if verify and len(todo) < limit:
+        todo += unverified(limit - len(todo))
     PROGRESS.update(state="scanning", done=0, total=len(todo), current="",
                     started_at=time.time(), finished_at=0.0, found=0,
                     applied=0, refused=0, error="")
@@ -1552,7 +1832,8 @@ def run_once(limit: int = 400, apply: bool = True) -> dict:
         PROGRESS.update(state="idle", finished_at=time.time())
         return {"checked": 0, "found": 0, "applied": 0}
 
-    joblog.log(f"audio language: {len(todo)} untagged track(s) to listen to",
+    joblog.log(f"audio language: {len(todo)} track(s) to listen to "
+               f"({gaps} with no tag, {len(todo) - gaps} to verify)",
                "info", system="audiolang")
     by_file: dict[int, dict] = {}
     for i, t in enumerate(todo, 1):
@@ -1571,8 +1852,16 @@ def run_once(limit: int = 400, apply: bool = True) -> dict:
             continue
         if d.get("ok") and d.get("code"):
             PROGRESS["found"] += 1
-            by_file.setdefault(t["file_id"],
-                               {"path": t["path"], "tags": {}})["tags"][t["track"]] = d["code"]
+            # WRITING A TAG AND CORRECTING ONE ARE NOT THE SAME ACT. Filling a
+            # blank is safe and always right. Overwriting a tag that a human or
+            # a release group chose is a correction, it can be wrong, and it
+            # belongs to the remedy that also drops the duplicate track and
+            # asks for a better release - not to a sweep quietly editing
+            # headers. So a verify hit is recorded and surfaced; only a gap is
+            # filled here.
+            if not t.get("tagged"):
+                by_file.setdefault(t["file_id"],
+                                   {"path": t["path"], "tags": {}})["tags"][t["track"]] = d["code"]
         else:
             PROGRESS["refused"] += 1
         PROGRESS["done"] = i
