@@ -134,24 +134,17 @@ def _mkvpropedit() -> str:
 
 
 def mode() -> str:
-    m = str(getattr(SETTINGS, "subtitletitle_mode", "manual") or "manual").lower()
-    return m if m in ("manual", "auto") else "manual"
+    """THE PICTURE CHECK'S SWITCH, not a second one. Both readers answer one
+    question now (see subkind.py), and one question has one switch."""
+    from . import hardsub
+    return hardsub.mode()
 
 
 def sure_at() -> int:
-    """The line auto will not act below.
-
-    AUTO THAT ACTS ON EVERYTHING IT FOUND IS NOT A MODE, IT IS A DARE. The
-    findings run from 55% - a "Signs/Songs" track at 8.2 cues a minute, right
-    on the lower edge of the speech band, which could genuinely be a dense
-    sign sheet - up to the unarguable ones in the middle of the band. Only
-    the second kind belongs to a machine.
-    """
-    try:
-        return max(50, min(100, int(getattr(SETTINGS,
-                                            "subtitletitle_sure_at", 70))))
-    except Exception:                                            # noqa: BLE001
-        return 70
+    """The line auto will not act below - the picture check's mark line, since
+    both readers now sit under one switch and one pair of lines."""
+    from . import hardsub
+    return hardsub.mark_at()
 
 
 def _dur_s(t: str) -> float:

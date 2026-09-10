@@ -103,11 +103,11 @@ _SIMPLE = [
      "decoding the first and last seconds of files"),
     ("audit", "audit", "Rule check", "/settings#rulecheck",
      "re-reading committed files against today's rules"),
-    ("hardsub", "hardsub", "Subtitles in the picture", "/settings#subs",
+    ("hardsub", "hardsub", "Subtitle kinds · picture", "/settings#subs",
      "sampling frames for words burned into the picture"),
     ("subembed", "subembed", "Sidecar subtitles", "/settings#subs",
      "walking folders for subtitles sitting outside their file"),
-    ("subtitletitle", "subtitletitle", "Subtitle titles", "/settings#subs",
+    ("subtitletitle", "subtitletitle", "Subtitle kinds · tracks", "/settings#subs",
      "checking cue counts against what each title claims"),
     ("audiotitle", "audiotitle", "Audio titles", "/settings#alang",
      "checking track titles against the streams they describe"),
@@ -171,7 +171,7 @@ def running() -> dict:
         from . import subtitletitle as _stt
         ins = _stt.INSPECT_STATE or {}
         if ins.get("running"):
-            out.append(_one("subtitletitle:read", "Reading subtitle tracks",
+            out.append(_one("subtitletitle:read", "Subtitle kinds · reading tracks",
                             "/settings#subs", True, now=ins.get("now") or "",
                             done=ins.get("done") or 0,
                             total=ins.get("total") or 0,

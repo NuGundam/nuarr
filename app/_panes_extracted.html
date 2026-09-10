@@ -259,13 +259,11 @@
              on - it rewrites files and recycles others, so the preview is the
              point rather than a decoration. -->
         <div id="sePanel" style="padding:0 14px 6px"></div>
-        <!-- Does the title on a subtitle track describe the track? The
-             subtitle half of the audio-title check, and free for the same
-             reason: the cue count is already in the probe. -->
-        <div id="sttPanel" style="padding:0 14px 6px"></div>
-        <!-- Subtitles that are already in the picture, on files that report
-             having none. -->
-        <div id="hsPanel" style="padding:0 14px 6px"></div>
+        <!-- What subtitles does each file actually carry? One list from two
+             readers: frames of files that report no track (OCR), and the
+             events of tracks whose title looks wrong. Same four kinds, same
+             score, same picker, one switch - see subkind.py. -->
+        <div id="skPanel" style="padding:0 14px 6px"></div>
         <div id="capsSubPanel" style="padding:0 14px 16px"></div>
       </div>
       <div id="vcodecPane" style="display:none">

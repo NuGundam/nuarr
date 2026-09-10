@@ -744,8 +744,7 @@ async def _startup() -> None:
         # files that report having none, so a library with proper tracks costs
         # it nothing.
         from . import hardsub as _hs
-        _hs.init()
-        asyncio.create_task(_hs.watch())
+        _hs.init()          # the reader; its schedule is subkind.watch()
         # Filesystem change tracking: per-library rescans instead of full
         # scans every few hours. Hands it the scan runner rather than
         # importing web from the module (cycle).
@@ -791,8 +790,11 @@ async def _startup() -> None:
     asyncio.create_task(_audiotitle.watch())
     # Its subtitle twin: a query to find candidates, then a bounded, gated
     # read of the ones that look wrong - see subtitletitle.watch().
-    from . import subtitletitle as _subtitletitle
-    asyncio.create_task(_subtitletitle.watch())
+    # ONE SCHEDULE FOR BOTH SUBTITLE READERS. The picture sampler and the
+    # track reader answer the same question - what does this file carry - so
+    # they run as one pass and show as one list. See subkind.py.
+    from . import subkind as _subkind
+    asyncio.create_task(_subkind.watch())
     # Asks the arrs what they manage and compares it to what nuarr has indexed.
     # Two list calls every six hours - no disk walk - so it is cheap enough to
     # run on any machine, attached pool or share.
@@ -6772,6 +6774,74 @@ def api_systems():
     """Every system doing work right now. One dict read each; safe to poll."""
     from . import systems
     return systems.running()
+
+
+@app.get("/api/subkind")
+def api_subkind(limit: int = 300):
+    """What subtitles each file carries - the picture and every text track."""
+    from . import subkind
+    return subkind.findings(max(1, min(int(limit), 600)))
+
+
+def _sk_items(ids: str) -> list:
+    """'12:picture,34:track:2' -> [{file_id, source}]. The source can carry a
+    colon of its own, so only the first one splits."""
+    out = []
+    for tok in (ids or "").split(","):
+        tok = tok.strip()
+        if not tok or ":" not in tok:
+            continue
+        fid, src = tok.split(":", 1)
+        try:
+            out.append({"file_id": int(fid), "source": src})
+        except ValueError:
+            continue
+    return out
+
+
+@app.post("/api/subkind/kind")
+async def api_subkind_kind(file_id: int, source: str, kind: str):
+    from . import subkind
+    return await asyncio.to_thread(subkind.set_kind, int(file_id), source, kind)
+
+
+@app.post("/api/subkind/act")
+async def api_subkind_act(file_id: int, source: str, kind: str = "",
+                          confirm: str = ""):
+    """Mark a picture or retitle a track. Both write to the file."""
+    if confirm != "yes":
+        return {"ok": False, "why": "confirm=yes required"}
+    from . import subkind
+    return await asyncio.to_thread(subkind.act, int(file_id), source, kind)
+
+
+@app.post("/api/subkind/dismiss")
+async def api_subkind_dismiss(file_id: int, source: str):
+    from . import subkind
+    return await asyncio.to_thread(subkind.dismiss, int(file_id), source)
+
+
+@app.post("/api/subkind/act/batch")
+async def api_subkind_act_batch(ids: str = "", confirm: str = "",
+                                force: int = 0, kind: str = ""):
+    if confirm != "yes":
+        return {"ok": False, "why": "confirm=yes required"}
+    from . import subkind
+    return await subkind.act_many(_sk_items(ids), kind=kind, force=bool(force))
+
+
+@app.post("/api/subkind/dismiss/batch")
+async def api_subkind_dismiss_batch(ids: str = ""):
+    from . import subkind
+    return await asyncio.to_thread(subkind.dismiss_many, _sk_items(ids))
+
+
+@app.post("/api/subkind/run")
+async def api_subkind_run():
+    """Both readers, now. The button is the decision, so neither yields."""
+    from . import subkind
+    asyncio.create_task(subkind.run(force=True))
+    return {"ok": True}
 
 
 @app.get("/api/hardsub")
@@ -22861,8 +22931,7 @@ function wtab(which){
     if(hint) hint.textContent='· subtitles';
     paneLoad('lang', loadLangTab);
     loadSubEmbed();
-    loadSubTitle();
-    loadHardsub();
+    loadSubKind();
     // Its own slot, its own remembered open/shut state. Sharing the codec
     // pages' one would mean opening the panel here silently opened it there
     // too, about a different question.
@@ -29905,6 +29974,372 @@ function alpPaint(){
 // when rewritable meant "found wrong"; with nothing actionable until it has
 // been read, that filter left the panel saying "nothing here" over 124 rows
 // waiting for exactly the read the panel offers.
+// ---- what subtitles does each file actually carry? -----------------------
+// ONE LIST FROM TWO READERS. The frame sampler (files that report no track)
+// and the track reader (tracks whose title looks wrong) used to be two panels
+// one above the other, each with the same four kinds, the same 0-100, the same
+// picker and the same switch. A row here is a SOURCE - the picture, or one
+// text track - and what it carries; the answer column is whatever that calls
+// for: a marker track for a picture, a new title for a track.
+let _sk=null, _skKey='', _skPoll=null, _skMark=null, _skMarkPoll=null;
+let _skSel=new Set(), _skLast=null, _skShowDone=false, _skShowUnread=true;
+let _skBatchKind='';
+const SKW={dialogue:['dialogue','var(--bad)'], hybrid:['dialogue + signs','var(--bad)'],
+           signs:['signs or songs','var(--warn)'], none:['none','var(--ok)']};
+function skColor(r){
+  if(r.unread) return 'var(--dim)';
+  if(r.auto==='act') return 'var(--ok)';
+  if(r.auto==='dismiss') return 'var(--dim)';
+  return 'var(--warn)';
+}
+function skRows(){
+  // Only rows a batch can do something with: not done, not unread, and with
+  // an action to take. A "left alone" track has nothing to tick for.
+  return ((_sk&&_sk.rows)||[]).filter(r=>!r.done && !r.unread && r.action);
+}
+function skSelIds(){
+  const live=new Set(skRows().map(r=>r.id));
+  return [..._skSel].filter(id=>live.has(id));
+}
+function skToggle(id, ev){
+  const rows=skRows(), i=rows.findIndex(r=>r.id===id);
+  if(ev && ev.shiftKey && _skLast!==null && i>=0){
+    const a=Math.min(i,_skLast), b=Math.max(i,_skLast);
+    const on=!_skSel.has(id);
+    for(let k=a;k<=b;k++){ if(on) _skSel.add(rows[k].id); else _skSel.delete(rows[k].id); }
+  }else{
+    if(_skSel.has(id)) _skSel.delete(id); else _skSel.add(id);
+  }
+  if(i>=0) _skLast=i;
+  _skKey=''; skPaint();
+}
+function skSelAll(on){
+  if(on) skRows().forEach(r=>_skSel.add(r.id)); else _skSel.clear();
+  _skLast=null; _skKey=''; skPaint();
+}
+function skClearSel(){ _skSel.clear(); _skLast=null; _skKey=''; skPaint(); }
+function skBatchKind(v){ _skBatchKind=v||''; _skKey=''; skPaint(); }
+function skShow(what, on){
+  if(what==='done') _skShowDone=!!on; else _skShowUnread=!!on;
+  _skKey=''; skPaint();
+}
+async function skMode(m){
+  try{ await fetch('/api/hardsub/mode?mode='+encodeURIComponent(m),{method:'POST'}); }catch(e){}
+  _skKey=''; loadSubKind();
+}
+async function skLine(which, val){
+  try{ await fetch(`/api/hardsub/mode?${which}=${encodeURIComponent(val)}`,{method:'POST'}); }catch(e){}
+  _skKey=''; loadSubKind();
+}
+async function skSetKind(id, kind, el){
+  const [fid, src]=skSplit(id);
+  if(el) el.disabled=true;
+  try{ await fetch(`/api/subkind/kind?file_id=${fid}&source=${encodeURIComponent(src)}&kind=${
+      encodeURIComponent(kind)}`,{method:'POST'}); }catch(e){}
+  if(el){ el.disabled=false; el.blur(); }
+  _skKey=''; loadSubKind();
+}
+function skSplit(id){ const i=String(id).indexOf(':'); return [id.slice(0,i), id.slice(i+1)]; }
+function skActWord(r, n){
+  // What the batch will do, said plainly: pictures get a track, tracks get a
+  // title. A mixed selection says both.
+  const pics=r.filter(x=>x.source==='picture').length, trs=r.length-pics;
+  const bits=[];
+  if(pics) bits.push(`add a blank marker track to ${fmt(pics)} file${pics===1?'':'s'}`);
+  if(trs) bits.push(`rewrite ${fmt(trs)} track title${trs===1?'':'s'}`);
+  return bits.join(' and ');
+}
+async function skAct(id, btn){
+  const r=((_sk&&_sk.rows)||[]).find(x=>x.id===id); if(!r) return;
+  const [fid, src]=skSplit(id);
+  const pic = src==='picture';
+  askInline(btn,
+    pic ? 'Add a blank English track? Stream copy, nothing re-encoded, default '
+          +'set so a player picks it, and nothing is ever drawn over the words '
+          +'already in the picture.'
+        : `Rewrite this track title to "${r.title_new||''}"? mkvpropedit edits the `
+          +'header only - the video, the audio and the cues are untouched.',
+    pic ? 'Yes, mark it' : 'Yes, correct it',
+    async ()=>{
+      const x=await (await fetch(`/api/subkind/act?confirm=yes&file_id=${fid}&source=${
+        encodeURIComponent(src)}`,{method:'POST'})).json();
+      setTimeout(()=>{ _skKey=''; loadSubKind(); }, 1500);
+      return x.ok ? {ok:true, why: pic?'marked':(x.why||'corrected')} : x;
+    });
+}
+async function skDismiss(id, btn){
+  // NO CONFIRMATION: nothing is written to a file. For a picture the words
+  // behind it teach the OCR filter; for a track the kind is set to signs.
+  const [fid, src]=skSplit(id);
+  if(btn){ btn.disabled=true; btn.textContent='learning…'; }
+  let x={};
+  try{ x=await (await fetch(`/api/subkind/dismiss?file_id=${fid}&source=${
+      encodeURIComponent(src)}`,{method:'POST'})).json(); }
+  catch(e){ x={ok:false, why:String(e)}; }
+  if(btn){ btn.textContent=x.ok?'dismissed':'failed'; if(x.why) btn.title=x.why; }
+  setTimeout(()=>{ _skKey=''; loadSubKind(); }, 1200);
+}
+async function skActMany(btn){
+  const ids=skSelIds(); if(!ids.length) return;
+  const rows=skRows().filter(r=>ids.includes(r.id));
+  askInline(btn,
+    `Go ahead and ${skActWord(rows)}`
+    + (_skBatchKind?`, all recorded as ${SKW[_skBatchKind]?SKW[_skBatchKind][0]:_skBatchKind}`
+                   :', each keeping the kind its own row shows')
+    + '? Files are stream-copied or header-edited, never re-encoded, and the '
+    + 'pool is asked before every one so it stops if somebody starts watching.',
+    `Yes, do ${fmt(ids.length)}`,
+    async ()=>{
+      const x=await (await fetch('/api/subkind/act/batch?confirm=yes&ids='
+        +encodeURIComponent(ids.join(','))
+        +(_skBatchKind?'&kind='+encodeURIComponent(_skBatchKind):''),
+        {method:'POST'})).json();
+      _skSel.clear(); _skLast=null;
+      if(x.ok) skMarkWatch(); else setTimeout(()=>{ _skKey=''; loadSubKind(); }, 1300);
+      return x;
+    });
+}
+async function skDismissMany(btn){
+  const ids=skSelIds(); if(!ids.length) return;
+  if(btn){ btn.disabled=true; btn.textContent='learning…'; }
+  let x={};
+  try{ x=await (await fetch('/api/subkind/dismiss/batch?ids='
+      +encodeURIComponent(ids.join(',')),{method:'POST'})).json(); }
+  catch(e){ x={ok:false, why:String(e)}; }
+  _skSel.clear(); _skLast=null;
+  if(btn) btn.textContent=x.why||(x.ok?'dismissed':'failed');
+  setTimeout(()=>{ _skKey=''; loadSubKind(); }, 1400);
+}
+function skMarkWatch(){
+  clearTimeout(_skMarkPoll);
+  _skMarkPoll=setTimeout(async ()=>{
+    if(!document.getElementById('skPanel')) return;
+    try{ _skMark=await (await fetch('/api/hardsub/mark/progress')).json(); }
+    catch(e){ return; }
+    _skKey=''; skPaint();
+    if(_skMark && _skMark.running) skMarkWatch(); else loadSubKind();
+  }, 1500);
+}
+async function skRun(btn){
+  if(btn){ btn.disabled=true; btn.textContent='looking…'; }
+  try{ await fetch('/api/subkind/run',{method:'POST'}); }catch(e){}
+  setTimeout(()=>{ _skKey=''; loadSubKind(); }, 800);
+}
+async function loadSubKind(){
+  const el=document.getElementById('skPanel'); if(!el) return;
+  if(!_sk) el.innerHTML='<div class="skel" style="padding:12px">'
+    +'<i style="width:52%"></i><i style="width:70%"></i></div>';
+  try{ _sk=await (await fetch('/api/subkind?limit=300')).json(); }
+  catch(e){ el.innerHTML='<span class="dim">could not load</span>'; return; }
+  try{ _skMark=await (await fetch('/api/hardsub/mark/progress')).json(); }catch(e){}
+  skPaint();
+}
+function skProgBar(p, what, unit){
+  const pct = p.total ? Math.min(100,(p.done/p.total)*100) : 0;
+  return `<div class="hsbar"><i style="width:${pct.toFixed(1)}%"></i></div>
+    <div style="display:flex;gap:10px;align-items:baseline;font-size:11px;
+                margin:3px 0 6px;flex-wrap:wrap">
+      <span class="busy" style="color:var(--acc)"><span class="sp"></span></span>
+      <b style="flex:none">${what} ${fmt(p.done||0)} of ${fmt(p.total||0)}</b>
+      <span class="dim" style="flex:1 1 auto;min-width:0;overflow:hidden;
+            text-overflow:ellipsis;white-space:nowrap" title="${esc(p.now||'')}">${esc(p.now||'')}</span>
+      <span style="flex:none;margin-left:auto;display:flex;gap:10px">
+        ${p.elapsed?`<span class="dim" title="How long this pass has been running">${hsDur(p.elapsed)} in</span>`:''}
+        ${p.rate?`<span class="dim" title="${unit} per second, measured on this run">${
+          p.rate>=1?p.rate.toFixed(1)+'/s':(1/p.rate).toFixed(1)+'s each'}</span>`:''}
+        ${p.eta?`<b style="color:var(--acc)" title="Time left in this pass at the rate above">${hsDur(p.eta)} left</b>`:''}
+        ${p.cleared?`<span style="color:var(--ok)">${fmt(p.cleared)} cleared</span>`:''}
+      </span>
+    </div>`;
+}
+function skPaint(){
+  const el=document.getElementById('skPanel'); if(!el||!_sk) return;
+  const d=_sk, all=d.rows||[], c=d.counts||{}, P=d.picture||{}, T=d.tracks||{}, S=d.state||{};
+  const rows=all.filter(r=>(_skShowDone||!r.done)&&(_skShowUnread||!r.unread));
+  const hiddenDone=_skShowDone?0:all.filter(r=>r.done).length;
+  const hiddenUnread=_skShowUnread?0:all.filter(r=>r.unread).length;
+  const tested=(P.none||0)+(P.signs||0)+(P.dialogue||0)+(P.hybrid||0);
+  const running=!!(P.running||T.running||S.running);
+  const head=`<b style="color:#6fb0ff">What subtitles does each file actually carry?</b>
+    <span class="dim" style="font-size:11.5px">
+      <span title="Files that report no subtitle track, sampled for words in the picture">${
+        fmt(tested)} pictures sampled · ${fmt(P.untested||0)} to go</span>
+      · <span title="Text tracks whose title contradicts their cue rate, and whose events have been read to settle it">${
+        fmt(c.tracks||0)} track${c.tracks===1?'':'s'} in question${
+        c.unread?`, <span style="color:var(--warn)">${fmt(c.unread)} not read yet</span>`:''}</span>${
+      (P.dialogue||P.hybrid)?` · <span style="color:var(--bad)">${fmt((P.dialogue||0)+(P.hybrid||0))} picture${
+        ((P.dialogue||0)+(P.hybrid||0))===1?'':'s'} carrying dialogue</span>`:''}${
+      P.marked?` · ${fmt(P.marked)} marked`:''}${
+      P.ignored?` · <span title="Findings you said were not subtitles. The words behind them are checked against every new read.">${
+        fmt(P.ignored)} dismissed${P.garbage?`, ${fmt(P.garbage)} words learned`:''}</span>`:''}${
+      (P.ignored_series&&P.ignored_series.length)?` · <span title="${esc(P.ignored_series.join('\n'))}">${
+        P.ignored_series.length} show${P.ignored_series.length===1?'':'s'} left alone</span>`:''}
+    </span>
+    <span style="float:right;display:flex;gap:8px;align-items:center">
+      ${modeSeg('when it is sure enough', d.mode, 'skMode', {
+        auto:'Findings above the act line are acted on without asking - a picture gets its marker track, a track gets its honest title - and findings below the dismiss line are thrown away, both on the pass. Everything between the two lines still waits for you.',
+        manual:'Everything is scored and listed, and nothing is acted on. The two lines still colour the rows, so you can see what auto would have done before letting it do it.'})}
+      <button class="rmb" onclick="skRun(this)" ${running?'disabled':''}>${
+        running?'looking…':'Check some now'}</button></span>`;
+  const note=`<div class="dim" style="font-size:11px;margin:3px 0 4px">
+    Two readers, one question. Files that report <b>no subtitle track</b> have
+    twenty-four frames sampled and the bright text low in the picture shown to
+    the OCR, because words burned into the image are still subtitles. Text
+    tracks whose <b>title contradicts their cue rate</b> — "signs only" at the
+    cadence of people talking — have their events read, and are judged on one
+    number: plain dialogue lines a minute, in a style not called sign or op or
+    ed. Both come back as the same four kinds with the same score, and the
+    picker on each row outranks the reading.${
+    P.have_ocr===false?' <span style="color:var(--bad)">Tesseract is not installed, so nothing in the picture can be confirmed.</span>':''}
+    </div>`;
+  const band=`<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;
+        font-size:11px;margin:2px 0 6px">
+      <span class="dim">Sure enough to act on its own</span>
+      <input type="number" min="50" max="100" step="5" value="${d.mark_at||85}"
+        style="width:62px" onchange="skLine('mark_at',this.value)">
+      <span class="dim">%</span>
+      <span class="dim" style="margin-left:8px">Unsure enough to throw away</span>
+      <input type="number" min="0" max="90" step="5" value="${d.dismiss_at||30}"
+        style="width:62px" onchange="skLine('dismiss_at',this.value)">
+      <span class="dim">%</span>
+      <span class="dim" style="margin-left:8px"
+        title="Anything landing between the two lines is what you are asked about. Every answer you give feeds the dictionaries and the kept kinds that produce the next score.">
+        ${fmt(c.band||0)} in between${P.learned_good?` · ${fmt(P.learned_good)} words confirmed`:''}</span>
+      ${(P.auto_marked||P.auto_dropped)?`<span style="color:var(--ok)">last pass: ${
+        fmt(P.auto_marked||0)} marked, ${fmt(P.auto_dropped||0)} dropped</span>`:''}
+    </div>`;
+  const prog = P.running ? skProgBar(P,'sampling','files')
+             : T.running ? skProgBar(T,'reading','tracks') : '';
+  const hist=`<div class="dim" style="font-size:11px;margin:4px 0 2px;display:flex;gap:12px;flex-wrap:wrap">
+    ${S.last_run?`<span title="When the last pass finished and how long it took">last pass ${ago(S.last_run)}${
+       S.last_took?` · took ${hsDur(S.last_took)}`:''}</span>`:'<span>has not run yet</span>'}
+    ${(!running&&S.next_run)?`<span title="Both readers run every ${hsDur(S.cycle_s||300)}: ${P.per_run||90} pictures and ${T.per_run||40} tracks a pass">next in ${
+       hsDur(Math.max(0,S.next_run-(Date.now()/1000)))}</span>`:''}
+    ${S.runs?`<span title="Completed passes since nuarr started">${fmt(S.runs)} pass${S.runs===1?'':'es'}</span>`:''}
+    ${P.secs_each?`<span title="Seconds per picture, smoothed across passes">${P.secs_each.toFixed(1)}s a picture</span>`:''}
+    ${T.secs_each?`<span title="Seconds per track read, smoothed across passes">${T.secs_each.toFixed(1)}s a track</span>`:''}
+    ${(P.yielded||T.yielded)?`<span style="color:var(--warn)" title="Both readers check the job gate before every file and stop the moment the pool is busy or somebody is watching Plex.">${
+       esc(P.yielded||T.yielded)}</span>`:''}
+    ${(P.untested&&P.backlog_eta)?`<span title="Until every file reporting no track has been sampled, at this pace and cadence"><b>${
+       hsDur(P.backlog_eta)}</b> of pictures left</span>`:''}
+    ${(T.unread&&T.backlog_eta)?`<span title="Until every flagged track has been read, at this pace and cadence"><b>${
+       hsDur(T.backlog_eta)}</b> of tracks left</span>`:''}
+    ${(S.last_error||T.last_error)?`<span class="err">${esc(S.last_error||T.last_error)}</span>`:''}
+  </div>`;
+  // ---- the batch marker's own bar, separate from the readers' ------------
+  const mk=_skMark||{}, mkPct=mk.total?Math.min(100,(mk.done/mk.total)*100):0;
+  const markBar=(mk.running||mk.total)?`
+    <div class="lkind" style="padding:7px 10px;margin:6px 0">
+      <div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;font-size:11.5px">
+        ${mk.running?'<span class="busy" style="color:var(--acc);flex:none"><span class="sp"></span></span>':''}
+        <b style="flex:none">${mk.running?'Marking':'Marked'} ${fmt(mk.done||0)} of ${fmt(mk.total||0)}</b>
+        ${mk.running&&mk.now?`<span class="dim" style="flex:1 1 160px;min-width:0;overflow:hidden;
+           text-overflow:ellipsis;white-space:nowrap" title="${esc(mk.now)}">${esc(mk.now)}</span>`:''}
+        ${mk.ok?`<span style="color:var(--ok);flex:none">${fmt(mk.ok)} done</span>`:''}
+        ${mk.failed?`<span class="err" style="flex:none">${fmt(mk.failed)} could not be</span>`:''}
+        ${(mk.running&&mk.eta)?`<span class="dim" style="flex:none">${hsDur(mk.eta)} left${
+           mk.secs_each?` · ${mk.secs_each}s a file`:''}</span>`:''}
+      </div>
+      ${mk.running?`<div class="hsbar"><i style="width:${mkPct.toFixed(1)}%"></i></div>`:''}
+      ${mk.yielded?`<div style="color:var(--warn);font-size:11px;margin-top:4px">${esc(mk.yielded)}</div>`:''}
+      ${(mk.errors&&mk.errors.length)?`<div style="margin-top:4px;font-size:11px">${
+        mk.errors.map(e=>`<div class="err">${esc(e.name||'')} — ${esc(e.why||'')}</div>`).join('')}</div>`:''}
+    </div>`:'';
+  const pick=skRows(), nsel=skSelIds().length, allOn=pick.length>0&&nsel===pick.length;
+  const selBar=nsel?`
+    <div class="askhost" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;
+         padding:6px 8px;margin:6px 0;border-radius:7px;
+         background:rgba(88,166,255,.07);border:1px solid var(--line)">
+      <b style="font-size:11.5px;color:#6fb0ff">${fmt(nsel)} selected</b>
+      <button class="rmb" onclick="skActMany(this)" ${mk.running?'disabled title="a batch is already running"':''}
+        title="Pictures get the blank marker track; tracks get their honest title.">Act on ${fmt(nsel)}</button>
+      <button class="rmb" onclick="skDismissMany(this)"
+        title="Not what it says. Pictures teach the OCR filter; tracks are recorded as signs.">Not dialogue — ${fmt(nsel)}</button>
+      <select class="kindsel" onchange="skBatchKind(this.value)"
+        title="Leave this alone and every row keeps whatever it says it is. Pick one and all of them are recorded as that.">
+        <option value=""${_skBatchKind?'':' selected'}>keep each row's kind</option>
+        ${['dialogue','hybrid','signs'].map(k=>`<option value="${k}"${_skBatchKind===k?' selected':''}>all as ${SKW[k][0]}</option>`).join('')}
+      </select>
+      <button class="rmb" onclick="skClearSel()">Clear</button>
+      <span class="dim" style="font-size:10.5px">shift-click to take a range</span>
+    </div>`:'';
+  const table=rows.length?`${markBar}${selBar}
+      <div class="rowbox scrollbox"><table style="width:100%;font-size:11.5px">
+      <colgroup><col style="width:22px"><col style="width:26%"><col style="width:8%">
+        <col style="width:70px"><col style="width:11%"><col style="width:58px">
+        <col style="width:20%"><col style="width:15%"><col style="width:150px"></colgroup>
+      <thead><tr class="dim" style="font-size:10.5px;text-align:left">
+        <th style="padding:3px 0 4px 2px"><input type="checkbox" ${allOn?'checked':''}
+            title="Select every row with something to do" onclick="skSelAll(this.checked)"></th>
+        <th style="padding:3px 8px 4px 2px">episode</th><th>library</th>
+        <th title="Where the subtitles are: burned into the picture, or in a text track (s:N is the track's ordinal)">where</th>
+        <th title="What the reader says it carries, and a way to say that is wrong. The picker outranks the reading and is what the answer records.">what it carries</th>
+        <th style="text-align:right;padding-right:14px"
+          title="How sure the reading is, 0-100, the same scale for both readers. Above the act line it would be acted on alone; below the dismiss line thrown away; in between is yours to call.">sure</th>
+        <th style="padding-left:4px" title="What the reader saw: words the OCR returned, or the track's cue count and rate">evidence</th>
+        <th title="For a track: what its title says now, and what it would be corrected to">title</th>
+        <th style="text-align:right;padding-right:2px">answer</th>
+      </tr></thead>
+      <tbody>${rows.map(r=>{
+        const [word,col]=SKW[r.kind]||[r.kind||'','var(--dim)'];
+        const on=_skSel.has(r.id), can=!r.done&&!r.unread&&r.action;
+        const pic=r.source==='picture';
+        return `<tr${on?' style="background:rgba(88,166,255,.06)"':''}>
+        <td style="padding:5px 0 5px 2px">${can?`<input type="checkbox" ${on?'checked':''}
+             onclick="skToggle('${r.id}', event)">`:''}</td>
+        <td style="padding:5px 8px 5px 2px" title="${esc(String(r.path||''))}"
+          >${esc(r.label||String(r.path||'').split('\\').pop())}
+          <div class="dim" style="font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+            >${esc(String(r.path||'').split('\\').pop())}</div></td>
+        <td class="dim" style="padding:5px 8px 5px 0">${esc(r.library||'')}</td>
+        <td style="padding:5px 8px 5px 0;white-space:nowrap;font-size:10.5px;color:${pic?'#6fb0ff':'var(--dim)'}"
+          title="${pic?'Words burned into the picture of a file that reports no subtitle track':'A text track inside the file'}">${
+          pic?'picture':'track s:'+r.track}</td>
+        <td style="padding:5px 8px 5px 0">${r.unread
+          ? '<span class="dim" style="font-size:10.5px">not read yet</span>'
+          : `<select class="kindsel" onchange="skSetKind('${r.id}',this.value,this)"
+               title="${esc((r.why||('read as '+word))+'. If that is wrong, set it here - the choice is kept and the next pass will not overwrite it.')}"
+               ${r.done?'disabled':''}>
+               ${(r.kinds||[]).map(k=>`<option value="${esc(k.id)}"${k.id===r.kind?' selected':''}>${esc(k.word)}</option>`).join('')}
+             </select>
+             ${r.chosen?'<div class="dim" style="font-size:9.5px">set by hand</div>'
+                       :`<div style="font-size:9.5px;color:${col}">read as ${esc(word)}</div>`}`}</td>
+        <td class="mono" style="padding:5px 14px 5px 0;text-align:right;font-variant-numeric:tabular-nums;color:${skColor(r)}"
+            title="${esc((r.why||'')+' — '+(r.auto_why||''))}">${r.unread?'':(r.sure+'%')}</td>
+        <td class="dim mono" style="padding:5px 8px 5px 10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+            title="${esc(r.evidence||'')}">${esc(r.evidence||'')}</td>
+        <td class="mono" style="padding:5px 8px 5px 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${pic?'<span class="dim">—</span>'
+          :`<span style="color:var(--warn)" title="${esc(r.title_old||'')}">${esc(r.title_old||'')}</span>${
+             r.action==='retitle'?`<div style="font-size:10px;color:var(--ok)" title="${esc(r.title_new||'')}">→ ${esc(r.title_new||'')}</div>`
+                                 :(r.unread?'':'<div class="dim" style="font-size:10px">left alone</div>')}`}</td>
+        <td style="padding:5px 0;white-space:nowrap;text-align:right" class="askhost">${r.done
+          ? '<span class="dim" title="This file already carries the blank marker track.">marked</span>'
+          : r.unread ? '<span class="dim" style="font-size:10.5px" title="The cue rate flagged this; its events have not been read yet. Nothing is offered until they have.">not read yet</span>'
+          : `${r.action?`<button class="rmb" onclick="skAct('${r.id}',this)" title="${
+                pic?'Add a blank English subtitle track so Bazarr and Plex see one exists and stop asking for it. Nothing is drawn over the picture.'
+                   :'Rewrite the track title to what it actually carries. Header edit only.'}">${esc(r.action_word)}</button>`
+              :'<span class="dim" style="font-size:10.5px" title="The title carries a name nuarr did not write and cannot regenerate, so it is reported and left as it is.">left alone</span>'}
+             <button class="rmb" onclick="skDismiss('${r.id}',this)" title="${
+                pic?'This is not a burned-in subtitle. The words behind it join the list of reads that were wrong, and two dismissals in one series leave that show alone.'
+                   :'This track is signs after all. Recorded as such, and the next read will not overwrite it.'}">Not dialogue</button>`}</td>
+      </tr>`;}).join('')}</tbody></table></div>`
+    : `<div class="dim" style="font-size:11.5px;padding:8px 0">${
+        (tested||c.tracks)?'Nothing checked so far is carrying subtitles it should not, or under a title it should not.':'Nothing checked yet.'}</div>`;
+  const foot=`<div class="dim" style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;font-size:11px;margin-top:6px">
+    <span>${fmt(pick.length)} still to answer · least certain first</span>
+    ${hiddenDone?`<a href="#" onclick="skShow('done',1);return false">also show the ${fmt(hiddenDone)} already marked</a>`:''}${
+      (_skShowDone&&c.done)?`<a href="#" onclick="skShow('done',0);return false">hide the marked ones</a>`:''}
+    ${hiddenUnread?`<a href="#" onclick="skShow('unread',1);return false">also show the ${fmt(hiddenUnread)} not read yet</a>`:''}${
+      (_skShowUnread&&c.unread)?`<a href="#" onclick="skShow('unread',0);return false">only the ones read</a>`:''}
+  </div>`;
+  const html=`<div class="lkind" style="padding:11px 12px">${head}${note}${band}${prog}${hist}${table}${foot}</div>`;
+  if(askOpen('skPanel') || panelBusy('skPanel') || panelScrolled('skPanel')) return;
+  if(html===_skKey) return;
+  _skKey=html; el.innerHTML=html;
+  clearTimeout(_skPoll);
+  if(running) _skPoll=setTimeout(()=>{ if(document.getElementById('skPanel')) loadSubKind(); }, 1500);
+}
+
 let _stt=null, _sttKey='', _sttAll=true, _sttPoll=null;
 // THE SAME SELECTION THE OTHER PANEL HAS, for the same reason: these arrive by
 // show. Seven episodes of That Time I Got Reincarnated as a Slime, all
