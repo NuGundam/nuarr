@@ -6763,6 +6763,13 @@ def api_audiolang_backlog():
             "usable": audiolang.usable()}
 
 
+@app.get("/api/systems")
+def api_systems():
+    """Every system doing work right now. One dict read each; safe to poll."""
+    from . import systems
+    return systems.running()
+
+
 @app.get("/api/hardsub")
 def api_hardsub(limit: int = 40):
     """Files whose subtitles are burned into the picture."""
@@ -11392,6 +11399,26 @@ button[disabled]{opacity:.5;cursor:default}
 /* The pill is now a button inside a positioned wrapper, so its panel can hang
    under it the same way the cpu/gpu/ram panels do. The wrapper carries the
    margin and the fade; the button carries the border and the state colour. */
+/* The running-systems chip and its panel. Hangs under the chip the same way
+   the cpu/gpu/ram panels do, because it answers the same shape of question and
+   should not need a new gesture to learn. */
+.syswrap{position:relative;display:inline-flex;margin-right:10px}
+.syschip{display:inline-flex;align-items:center;gap:6px;font-size:11px;
+  border:1px solid var(--line);border-radius:11px;padding:2px 9px;
+  background:var(--chip,#161b22);white-space:nowrap;font-family:inherit;
+  cursor:pointer;color:inherit}
+.syschip.on{border-color:var(--acc);color:#cfe6ff}
+.syschip i{width:6px;height:6px;border-radius:50%;background:var(--acc);
+  display:inline-block;animation:blk 2.2s ease-in-out infinite}
+@media (prefers-reduced-motion:reduce){.syschip i{animation:none}}
+.syspanel{position:absolute;top:26px;right:0;z-index:60;min-width:360px;
+  max-width:min(560px,92vw);max-height:60vh;overflow:auto;
+  background:#0d1117;border:1px solid var(--line);border-radius:9px;
+  box-shadow:0 10px 30px rgba(0,0,0,.55);padding:6px 0;text-align:left}
+.sysrow{display:block;padding:6px 11px;border-bottom:1px solid var(--line);
+  color:inherit;text-decoration:none}
+.sysrow:last-child{border-bottom:0}
+.sysrow:hover{background:rgba(88,166,255,.09)}
 .bootwrap{position:relative;display:inline-flex;margin-right:10px;
   transition:opacity .6s ease}
 .boot{display:inline-flex;align-items:center;gap:7px;
@@ -12841,6 +12868,14 @@ html.mobile #logsPane{height:auto;min-height:60vh}
          2,000px below the fold, so "what is Nuarr costing me right now" was
          only answerable by scrolling or by opening Task Manager. -->
     <!-- Startup progress, then a brief "ready", then it gets out of the way. -->
+    <!-- WHAT IS HAPPENING, ANYWHERE. Fourteen things do work on their own
+         clocks and each reports itself beautifully on its own page - which is
+         the problem: answering "is anything running?" meant visiting nine
+         pages and knowing which nine. First in the row because it is the
+         question asked most often. -->
+    <span class="syswrap" id="sysWrap" style="display:none"><button
+      class="syschip" id="sysChip" onclick="sysToggle(event)"></button><div
+      class="syspanel" id="sysPanel" style="display:none"></div></span>
     <span id="bootPill"></span>
     <span id="selfUse" class="selfuse" title="Nuarr's own CPU and memory, including ffmpeg and script children"></span>
     <span id="arrs" class="dim"></span>
@@ -18110,6 +18145,89 @@ function modeSeg(label, cur, call, tips){
 // focused is a control somebody is in the middle of. It covers the open
 // select, the half-typed threshold and the caret in a filter box, without
 // needing any of them to announce themselves.
+// ---- what is running, anywhere -----------------------------------------
+// THE CHIP IS THE ANSWER; THE PANEL IS THE DETAIL. A number in the header
+// answers "is anything happening?" without a click, and the list behind it
+// answers "what, and how far through?" with one. Every row is a link to the
+// page that owns that system, because the next question after "the rule check
+// is running" is always "show me".
+//
+// HIDDEN WHEN NOTHING IS RUNNING, rather than showing a zero. A chip reading
+// "0 running" is a permanent piece of furniture saying nothing; one that only
+// appears when there is something to say means its presence is information.
+let _sys=null, _sysOpen=false, _sysTimer=null;
+
+function sysToggle(ev){
+  if(ev) ev.stopPropagation();
+  _sysOpen=!_sysOpen;
+  sysPaint();
+  if(_sysOpen) setTimeout(()=>document.addEventListener('click', sysAway), 0);
+}
+function sysAway(e){
+  const w=document.getElementById('sysWrap');
+  if(w && w.contains(e.target)) return;
+  _sysOpen=false;
+  document.removeEventListener('click', sysAway);
+  sysPaint();
+}
+async function loadSystems(){
+  try{ _sys=await (await fetch('/api/systems')).json(); }
+  catch(e){ return; }
+  sysPaint();
+}
+function sysPaint(){
+  const wrap=document.getElementById('sysWrap');
+  const chip=document.getElementById('sysChip');
+  const panel=document.getElementById('sysPanel');
+  if(!wrap||!chip||!panel) return;
+  const rows=(_sys&&_sys.running)||[];
+  if(!rows.length){
+    wrap.style.display='none'; panel.style.display='none'; _sysOpen=false;
+    return;
+  }
+  wrap.style.display='';
+  chip.className='syschip'+(_sysOpen?' on':'');
+  chip.innerHTML=`<i></i>${fmt(rows.length)} running`;
+  chip.title=rows.map(r=>r.name).join(', ')
+    +' — click for what each one is doing';
+  if(!_sysOpen){ panel.style.display='none'; return; }
+  panel.style.display='';
+  panel.innerHTML=rows.map(r=>{
+    // A BAR ONLY WHERE THERE IS A DENOMINATOR. Half these systems know how
+    // many files they are working through and half are answering one
+    // question; drawing an empty bar for the second kind would invent a
+    // progress that does not exist.
+    const bar = r.total ? `<div class="hsbar" style="margin:4px 0 0"><i
+        style="width:${r.pct.toFixed(1)}%"></i></div>` : '';
+    const el = r.since ? hsDur(Math.max(0,(Date.now()/1000)-r.since)) : '';
+    return `<a class="sysrow" href="${esc(r.goto||'#')}">
+      <div style="display:flex;gap:8px;align-items:baseline;flex-wrap:wrap">
+        <b style="color:#6fb0ff;font-size:11.5px;flex:none">${esc(r.name)}</b>
+        ${r.total?`<span class="mono dim" style="font-size:10.5px;flex:none">${
+          fmt(r.done)} of ${fmt(r.total)}</span>`:''}
+        ${el?`<span class="dim" style="font-size:10.5px;margin-left:auto;flex:none"
+           title="how long this has been going">${esc(el)}</span>`:''}
+      </div>
+      ${r.note?`<div class="dim" style="font-size:10.5px">${esc(r.note)}</div>`:''}
+      ${r.now?`<div class="dim mono" style="font-size:10px;overflow:hidden;
+         text-overflow:ellipsis;white-space:nowrap">${esc(r.now)}</div>`:''}
+      ${bar}</a>`;
+  }).join('');
+}
+function sysStart(){
+  clearInterval(_sysTimer);
+  loadSystems();
+  // Two seconds: fast enough that a job finishing is noticed while you are
+  // looking at it, slow enough that a dozen dict reads never register.
+  _sysTimer=setInterval(loadSystems, 2000);
+}
+// STARTED HERE, NOT AT THE BOOT BLOCK. The first attempt called this beside
+// drillSchedule() 2,600 lines above, which is before the `let` on the timer
+// runs - a temporal dead zone throw that took every top-level statement after
+// it down with it. A starter placed immediately after what it starts cannot
+// drift out of order.
+sysStart();
+
 function panelBusy(id){
   const el = document.getElementById(id);
   if(!el) return false;
