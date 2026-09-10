@@ -30150,11 +30150,11 @@ function skShow(what, on){
 }
 async function skMode(m){
   try{ await fetch('/api/hardsub/mode?mode='+encodeURIComponent(m),{method:'POST'}); }catch(e){}
-  _skKey=''; loadSubKind();
+  _skKey=''; loadSubKind(true);
 }
 async function skLine(which, val){
   try{ await fetch(`/api/hardsub/mode?${which}=${encodeURIComponent(val)}`,{method:'POST'}); }catch(e){}
-  _skKey=''; loadSubKind();
+  _skKey=''; loadSubKind(true);
 }
 async function skSetKind(id, kind, el){
   const [fid, src]=skSplit(id);
@@ -30170,7 +30170,7 @@ async function skSetKind(id, kind, el){
   // and gains "Leave it as it is". Either way the row stays until a button in
   // the answer column is pressed. A control that silently loses rows is worse
   // than one that asks twice.
-  _skKey=''; loadSubKind();
+  _skKey=''; loadSubKind(true);
 }
 function skSplit(id){ const i=String(id).indexOf(':'); return [id.slice(0,i), id.slice(i+1)]; }
 function skActWord(r, n){
@@ -30198,13 +30198,13 @@ function skGoneMany(ids, word, ok=true){
     setTimeout(()=>tr.classList.add('skshut'), 700);
     setTimeout(()=>{ if(tr.parentNode) tr.parentNode.removeChild(tr); }, 1000);
   }, i*35));
-  setTimeout(()=>{ _skKey=''; loadSubKind(); }, 1100 + rows.length*35);
+  setTimeout(()=>{ _skKey=''; loadSubKind(true); }, 1100 + rows.length*35);
 }
 
 function skGone(el, word, ok=true, rowId=''){
   if(ok && rowId){ skAnswered(rowId); skUnpin(rowId); }
   const tr = el && el.closest ? el.closest('tr') : null;
-  if(!tr){ setTimeout(()=>{ _skKey=''; loadSubKind(); }, 900); return; }
+  if(!tr){ setTimeout(()=>{ _skKey=''; loadSubKind(true); }, 900); return; }
   // The open detail row, if this row has one - it leaves with its parent.
   const det = tr.nextElementSibling &&
               String(tr.nextElementSibling.id||'').startsWith('skdet-')
@@ -30216,7 +30216,7 @@ function skGone(el, word, ok=true, rowId=''){
   setTimeout(()=>{
     [tr, det].forEach(x=>{ if(x && x.parentNode) x.parentNode.removeChild(x); });
     // The row is gone from the page; catch the page up with the server.
-    _skKey=''; loadSubKind();
+    _skKey=''; loadSubKind(true);
   }, 1120);
 }
 
@@ -30232,7 +30232,7 @@ async function skAct(id, btn){
         encodeURIComponent(src)}&kind=__leave__`,{method:'POST'})).json(); }
     catch(e){ x={ok:false}; }
     if(x.ok) skGone(btn, 'left as it is', true, id);
-    else { if(btn) btn.disabled=false; _skKey=''; loadSubKind(); }
+    else { if(btn) btn.disabled=false; _skKey=''; loadSubKind(true); }
     return;
   }
   askInline(btn,
@@ -30246,7 +30246,7 @@ async function skAct(id, btn){
       const x=await (await fetch(`/api/subkind/act?confirm=yes&file_id=${fid}&source=${
         encodeURIComponent(src)}`,{method:'POST'})).json();
       if(x.ok) skGone(btn, pic?'marked':'title corrected', true, id);
-      else setTimeout(()=>{ _skKey=''; loadSubKind(); }, 1500);
+      else setTimeout(()=>{ _skKey=''; loadSubKind(true); }, 1500);
       return x.ok ? {ok:true, why: pic?'marked':(x.why||'corrected')} : x;
     });
 }
@@ -30262,7 +30262,7 @@ async function skDismiss(id, btn){
   if(x.ok) skGone(btn, src==='picture'?'not a subtitle':'recorded as signs', true, id);
   else {
     if(btn) btn.textContent='failed';
-    setTimeout(()=>{ _skKey=''; loadSubKind(); }, 1200);
+    setTimeout(()=>{ _skKey=''; loadSubKind(true); }, 1200);
   }
 }
 async function skActMany(btn){
@@ -30281,7 +30281,7 @@ async function skActMany(btn){
         +(_skBatchKind?'&kind='+encodeURIComponent(_skBatchKind):''),
         {method:'POST'})).json();
       if(x.ok) skGoneMany(ids, 'queued');
-      else setTimeout(()=>{ _skKey=''; loadSubKind(); }, 1300);
+      else setTimeout(()=>{ _skKey=''; loadSubKind(true); }, 1300);
       _skSel.clear(); _skLast=null;
       if(x.ok) skMarkWatch();
       return x;
@@ -30295,7 +30295,7 @@ async function skDismissMany(btn){
       +encodeURIComponent(ids.join(',')),{method:'POST'})).json(); }
   catch(e){ x={ok:false, why:String(e)}; }
   if(x.ok) skGoneMany(ids, 'not dialogue');
-  else setTimeout(()=>{ _skKey=''; loadSubKind(); }, 1400);
+  else setTimeout(()=>{ _skKey=''; loadSubKind(true); }, 1400);
   _skSel.clear(); _skLast=null;
   if(btn) btn.textContent=x.why||(x.ok?'dismissed':'failed');
 }
@@ -30312,9 +30312,14 @@ function skMarkWatch(){
 async function skRun(btn){
   if(btn){ btn.disabled=true; btn.textContent='looking…'; }
   try{ await fetch('/api/subkind/run',{method:'POST'}); }catch(e){}
-  setTimeout(()=>{ _skKey=''; loadSubKind(); }, 800);
+  setTimeout(()=>{ _skKey=''; loadSubKind(true); }, 800);
 }
-async function loadSubKind(){
+// `force` means YOU asked for this, so paint it whatever the guards say.
+// The guards exist to stop the 2.5-second poll pulling the rug: they skip a
+// repaint while the box is scrolled or a control has focus. A reload that
+// follows a click of yours is not the poll, and skipping it left the row
+// showing the kind it used to carry - the picker moved and nothing else did.
+async function loadSubKind(force){
   const el=document.getElementById('skPanel'); if(!el) return;
   if(!_sk) el.innerHTML='<div class="skel" style="padding:12px">'
     +'<i style="width:52%"></i><i style="width:70%"></i></div>';
@@ -30324,7 +30329,7 @@ async function loadSubKind(){
   // The rank the server gave each row, kept so "least certain first" can be
   // returned to after sorting by something else.
   (_sk.rows||[]).forEach((r,i)=>{ r._i=i; });
-  skPaint();
+  skPaint(force);
 }
 function skProgBar(p, what, unit){
   const pct = p.total ? Math.min(100,(p.done/p.total)*100) : 0;
