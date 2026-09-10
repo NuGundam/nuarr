@@ -2023,20 +2023,20 @@ RULE_META = [
      "default": True},
     {"key": "embed_sidecars",
      "label": "Take subtitle files sitting next to the video inside it",
-     "what": "A sidecar is one arr rename away from being orphaned - there are "
-             "13,004 of them in Anime Shows - and Plex prefers an external "
-             "subtitle over the embedded one for the same language, so the "
-             "file's own track loses to a loose file. Worse for ASS: an "
-             "external one has to be injected by the server, which means "
-             "painting it onto the picture and re-encoding the whole video to "
-             "carry it. mkvmerge copies the streams into a new container "
-             "instead - nothing is re-encoded. Only taken when the language "
-             "passes this library's subtitle rules AND the file has no track "
-             "in that language already; the sidecar is recycled, not deleted, "
-             "and only after the rebuilt file has been read back and found to "
-             "contain it. Off by default: every other rule here changes what "
-             "a rebuild produces, this one starts one and reaches outside the "
-             "file to do it.",
+     # NO COUNT IN HERE. This said "there are 13,004 of them in Anime Shows",
+     # which was a number about ONE library printed under every library - and
+     # a stale one, since nothing recounted it. A figure in the wrong place is
+     # worse than no figure.
+     "what": "A subtitle file sitting beside the video. It is one arr rename "
+             "away from being orphaned, and Plex prefers it over the file's "
+             "own track in the same language - with ASS, showing it means "
+             "burning it into the picture and re-encoding. Taking it inside "
+             "is a stream copy, so nothing is re-encoded. Only when the "
+             "language passes this library's rules and the file has no track "
+             "in that language already; the sidecar is recycled once the new "
+             "file has been read back and found to carry it. Off by default: "
+             "every other rule changes what a rebuild produces, this one "
+             "starts one.",
      "default": False},
     {"key": "prefer_signs_over_forced",
      "label": "A Signs & Songs track beats whatever carries the forced flag",
