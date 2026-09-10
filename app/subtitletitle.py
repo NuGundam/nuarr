@@ -54,6 +54,7 @@ import json
 import os
 import re
 import subprocess
+import threading
 import time
 
 from .config import NO_WINDOW, SETTINGS
@@ -943,17 +944,46 @@ def _restamp(file_id: int, path: str, edits: list) -> None:
         pass
 
 
+_RESCAN = threading.Lock()
+
+
+def _rescan_behind() -> None:
+    try:
+        scan()
+    except Exception:                                            # noqa: BLE001
+        pass
+    finally:
+        _RESCAN.release()
+
+
 def cached() -> dict:
-    """The last scan, re-running it once a day or when it has never run."""
+    """The last scan - served as it stands, and re-run BEHIND the request.
+
+    THE PAGE MUST NEVER PAY FOR THE SCAN. A scan parses 39,000 stored probes
+    and takes two seconds; the read pass invalidates the cache every few
+    files; and the panel polls every couple of seconds while a pass runs.
+    Put together, that was a 2-second endpoint on a 1.5-second timer. So a
+    stale answer is served at once and one rescan starts behind it - the same
+    rule the audio-language and arr-language panels follow.
+    """
     d = _CACHE.get("data")
     if d and time.time() - _CACHE["at"] < EVERY_S:
         return d
-    return scan()
+    if d:
+        if _RESCAN.acquire(blocking=False):
+            threading.Thread(target=_rescan_behind, daemon=True,
+                             name="subtitletitle-rescan").start()
+        return d
+    with _RESCAN:
+        d = _CACHE.get("data")
+        return d if d else scan()
 
 
 def refresh() -> dict:
+    """A scan now, waited for - the scheduled pass and the buttons."""
     _CACHE["at"] = 0.0
-    return scan()
+    with _RESCAN:
+        return scan()
 
 
 def attention() -> dict | None:

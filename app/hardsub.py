@@ -513,6 +513,10 @@ def ignore(file_id: int, undo: bool = False) -> dict:
             "  words=excluded.words, at=excluded.at",
             (int(file_id), r["path"], _series_of(r["path"] or ""),
              r["state"], r["words"] or "", time.time()))
+    # A dismissal must count at once - the dictionaries and the series list
+    # are memoised, and the next score must see what was just learned.
+    _GARB["at"] = 0.0
+    _SERIES["at"] = 0.0
     n = _series_count(_series_of(r["path"] or ""))
     return {"ok": True, "series": _series_of(r["path"] or ""),
             "series_ignores": n,
@@ -798,7 +802,21 @@ def verdict_for(row) -> dict:
     """What auto WOULD do with this row, whether or not auto is on."""
     d = score_of(row)
     s = d["score"]
-    if s >= mark_at():
+    try:
+        state = str(row["state"] or "") if "state" in row.keys() else ""
+    except Exception:                                            # noqa: BLE001
+        state = ""
+    if s >= mark_at() and state == SIGNS:
+        # SIGNS ARE NOT A REASON TO MARK. The marker track tells Bazarr and
+        # Plex that this file's subtitles are in the picture and need no
+        # other; a burned-in sign or song over a file that still wants a
+        # dialogue track is the opposite of that. Sure or not, a signs-only
+        # reading is the person's call.
+        d["auto"] = "ask"
+        d["auto_why"] = (f"{s}% is past the mark line, but the picture reads "
+                         f"as signs or songs only - whether that deserves the "
+                         f"marker track is your call")
+    elif s >= mark_at():
         d["auto"] = "mark"
         d["auto_why"] = f"{s}% is at or above the {mark_at()}% mark line"
     elif s <= dismiss_at():
@@ -820,14 +838,26 @@ def ignored_ids() -> set:
         return set()
 
 
+_SERIES = {"at": 0.0, "set": set()}
+_SERIES_TTL = 30.0
+
+
 def ignored_series() -> set:
+    """Shows dismissed often enough to leave alone. MEMOISED, because
+    score_of() asks once per row and the list is scored 600 rows at a time on
+    a two-second timer - that was 600 identical queries a poll."""
+    now = time.time()
+    if now - _SERIES["at"] < _SERIES_TTL:
+        return _SERIES["set"]
     try:
         with cursor() as cur:
-            return {r["series"] for r in cur.execute(
+            got = {r["series"] for r in cur.execute(
                 "SELECT series FROM hardsub_ignored WHERE series != '' "
                 "GROUP BY series HAVING COUNT(*) >= ?", (SERIES_IGNORES,))}
     except Exception:                                            # noqa: BLE001
-        return set()
+        return _SERIES["set"]
+    _SERIES.update(at=now, set=got)
+    return got
 
 
 def _size(p: str) -> int:

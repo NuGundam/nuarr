@@ -83,7 +83,10 @@ def _picture_rows(limit: int) -> list:
     for r in hardsub.found(limit):
         kind = r.get("state") or ""
         score = int(r.get("score") or 0)
-        auto, auto_why = _auto_of(score)
+        # THE READER'S OWN VERDICT, not a second one: the sweep and the
+        # backlog act on verdict_for(), and the row must show what they do.
+        auto = {"mark": "act"}.get(r.get("auto") or "", r.get("auto") or "ask")
+        auto_why = r.get("auto_why") or ""
         marked = bool(r.get("marked"))
         out.append({
             "id": f"{r['file_id']}:{PICTURE}",
@@ -113,8 +116,22 @@ def _track_rows(limit: int) -> list:
     for r in (d.get("rows") or [])[:limit]:
         unread = bool(r.get("unread"))
         score = 0 if unread else int(r.get("sure") or 0)
-        auto, auto_why = ("ask", "not read yet") if unread else _auto_of(score)
         rewritable = bool(r.get("rewritable"))
+        if unread:
+            auto, auto_why = "ask", "not read yet"
+        elif not rewritable:
+            # Nothing can act on a title that carries a group's name, however
+            # sure the read - so the row does not pretend auto would.
+            auto, auto_why = "none", ("left alone: the title carries a name "
+                                      "nuarr did not write and cannot regenerate")
+        else:
+            auto, auto_why = _auto_of(score)
+            if auto == "dismiss":
+                # A track is never thrown away - there is nothing to throw. It
+                # stays listed for a person; only the colour says "unsure".
+                auto, auto_why = "ask", (f"{score}% is under the dismiss line; a "
+                                         f"track is never thrown away, so this "
+                                         f"one waits for you")
         out.append({
             "id": f"{r['file_id']}:track:{r['track']}",
             "file_id": r["file_id"], "source": f"track:{r['track']}",
@@ -140,7 +157,7 @@ def _track_rows(limit: int) -> list:
     return out
 
 
-def findings(limit: int = 300) -> dict:
+def findings(limit: int = 600) -> dict:
     """Everything, least certain first, with the counts the header needs."""
     from . import hardsub, subtitletitle as stt
     rows = _picture_rows(limit) + _track_rows(limit)
@@ -237,6 +254,12 @@ async def act_many(items: list, kind: str = "", force: bool = False) -> dict:
             out["why"] = r.get("why") or ""
     if tracks:
         want = {(f, t) for f, t in tracks}
+        if kind:
+            # THE KIND YOU PICKED IS WHAT THE TITLE SAYS. Set it first so the
+            # rescan writes "dialogue + signs" or "dialogue" accordingly.
+            for f, t in tracks:
+                stt.set_kind(f, t, kind)
+            await asyncio.to_thread(stt.refresh)
         rows = [r for r in (stt.cached().get("rows") or [])
                 if (int(r.get("file_id") or 0), int(r.get("track") or 0)) in want
                 and r.get("rewritable")]
@@ -274,19 +297,65 @@ def dismiss_many(items: list) -> dict:
 
 
 # ------------------------------------------------------------- the schedule --
+AUTO_MARKS_PER_PASS = 25
+
+
+async def _auto_backlog() -> dict:
+    """Findings that were already on the list when auto was switched on.
+
+    THE SWEEP ONLY JUDGES WHAT IT JUST READ. Flip the switch with 490 pictures
+    already found under manual and nothing happened to any of them, because
+    auto lived inside the sweep loop and those files were never swept again.
+    So each pass in auto starts by going through the standing list: what is
+    past the mark line is handed to the batch marker (gated, a bounded number
+    a pass, because every mark rewrites a container), and what is under the
+    dismiss line is thrown away the way the sweep would have.
+    """
+    from . import hardsub
+    out = {"marked": 0, "dropped": 0}
+    if mode() != "auto":
+        return out
+    rows = await asyncio.to_thread(hardsub.found, 1000)
+    to_mark = [r["file_id"] for r in rows
+               if not r.get("marked") and r.get("auto") == "mark"]
+    to_drop = [r["file_id"] for r in rows
+               if not r.get("marked") and r.get("auto") == "dismiss"]
+    if to_drop:
+        d = await asyncio.to_thread(hardsub.ignore_many, to_drop)
+        out["dropped"] = int(d.get("done") or 0)
+    if to_mark and not hardsub.MARK_STATE.get("running"):
+        m = await hardsub.mark_many(to_mark[:AUTO_MARKS_PER_PASS])
+        out["marked"] = int(m.get("started") or 0)
+    if out["marked"] or out["dropped"]:
+        joblog.log(f"subtitle kinds: on its own, marking {out['marked']} "
+                   f"file(s) past the {mark_at()}% line and dropping "
+                   f"{out['dropped']} under the {dismiss_at()}% line"
+                   + (f" - {len(to_mark) - out['marked']} more wait for the "
+                      f"next pass" if len(to_mark) > out["marked"] else ""),
+                   "info")
+    return out
+
+
 async def run(force: bool = False) -> dict:
-    """One pass: the picture reader, then the track reader. Both yield."""
+    """One pass: the standing list, the picture reader, then the track reader.
+    Both readers yield to the gate before every file."""
     from . import hardsub, subtitletitle as stt
     if STATE["running"]:
         return {"ok": False, "why": "already running"}
     t0 = time.time()
-    STATE.update(running=True, phase="picture", t0=t0, last_error="")
+    STATE.update(running=True, phase="backlog", t0=t0, last_error="")
     got: dict = {}
     try:
+        got["backlog"] = await _auto_backlog()
+        STATE["phase"] = "picture"
         got["picture"] = await hardsub.sweep(force=force)
         STATE["phase"] = "tracks"
         await asyncio.to_thread(stt.refresh)
         got["tracks"] = await stt.inspect_paced(stt.PER_RUN, force=force)
+        # RE-JUDGE WHAT WAS JUST READ, in this pass. The scan is where auto
+        # corrects titles, so without this a track read now was corrected
+        # five minutes later, and the page showed it as still wrong until then.
+        await asyncio.to_thread(stt.refresh)
     except Exception as e:                                       # noqa: BLE001
         STATE["last_error"] = f"{type(e).__name__}: {e}"
     finally:

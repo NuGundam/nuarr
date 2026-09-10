@@ -6777,10 +6777,11 @@ def api_systems():
 
 
 @app.get("/api/subkind")
-def api_subkind(limit: int = 300):
-    """What subtitles each file carries - the picture and every text track."""
+def api_subkind(limit: int = 600):
+    """What subtitles each file carries - the picture and every text track.
+    600, because "select all" has to mean all of them."""
     from . import subkind
-    return subkind.findings(max(1, min(int(limit), 600)))
+    return subkind.findings(max(1, min(int(limit), 1000)))
 
 
 def _sk_items(ids: str) -> list:
@@ -30029,7 +30030,7 @@ function skDetail(r){
 const SKW={dialogue:['dialogue','var(--bad)'], hybrid:['dialogue + signs','var(--bad)'],
            signs:['signs or songs','var(--warn)'], none:['none','var(--ok)']};
 function skColor(r){
-  if(r.unread) return 'var(--dim)';
+  if(r.unread||r.auto==='none') return 'var(--dim)';
   if(r.auto==='act') return 'var(--ok)';
   if(r.auto==='dismiss') return 'var(--dim)';
   return 'var(--warn)';
@@ -30171,7 +30172,7 @@ async function loadSubKind(){
   const el=document.getElementById('skPanel'); if(!el) return;
   if(!_sk) el.innerHTML='<div class="skel" style="padding:12px">'
     +'<i style="width:52%"></i><i style="width:70%"></i></div>';
-  try{ _sk=await (await fetch('/api/subkind?limit=300')).json(); }
+  try{ _sk=await (await fetch('/api/subkind?limit=600')).json(); }
   catch(e){ el.innerHTML='<span class="dim">could not load</span>'; return; }
   try{ _skMark=await (await fetch('/api/hardsub/mark/progress')).json(); }catch(e){}
   skPaint();
@@ -30384,7 +30385,7 @@ function skPaint(force){
   _skKey=html; el.innerHTML=html;
   const nb=el.querySelector('.rowbox'); if(nb&&keep) nb.scrollTop=keep;
   clearTimeout(_skPoll);
-  if(running) _skPoll=setTimeout(()=>{ if(document.getElementById('skPanel')) loadSubKind(); }, 1500);
+  if(running) _skPoll=setTimeout(()=>{ if(document.getElementById('skPanel')) loadSubKind(); }, 2500);
 }
 
 let _stt=null, _sttKey='', _sttAll=true, _sttPoll=null;
