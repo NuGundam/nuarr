@@ -13452,10 +13452,15 @@ async function loadAll(){
   //   files pending -> how many are still being re-checked
   //   otherwise     -> when it will next look
   // The plain description is the fallback, not the default.
-  const sweepNote = (sw, pending, pendingText, idleText) => {
+  // AND IT SAYS WHOSE SWEEP IT IS. "checking 7 of 9 · Reasonable Doubt" named
+  // a show and nothing else - not what was being checked about it, not which
+  // of nuarr's several background passes was doing it, and not why that show.
+  // A line that appears under a tile reading 0 has to explain itself, or it
+  // reads as an unrelated process that wandered into the wrong card.
+  const sweepNote = (sw, pending, pendingText, idleText, what) => {
     if(sw && sw.running){
       const of = sw.total ? ` ${(sw.done||0)+1} of ${sw.total}` : '';
-      return `<span class="swrun"><span class="spin"><i></i><i></i><i></i></span>`
+      return `<span class="swrun" title="${esc(what||'')}"><span class="spin"><i></i><i></i><i></i></span>`
            + `checking${of}${sw.current?` · ${esc(String(sw.current).slice(0,28))}`:''}</span>`;
     }
     if(pending) return pendingText;
@@ -13490,7 +13495,13 @@ async function loadAll(){
   add('Missing', fmt(mh.confirmed),
       sweepNote(s.missing_sweep, mh.checking,
                 `${fmt(mh.checking)} more being re-checked`,
-                'confirmed after 3 checks'),
+                'confirmed after 3 checks',
+                'The missing-file check. A file the arr stops reporting is '
+               +'usually a stale record rather than a lost file, so each one '
+               +'is looked for again - up to 3 times, with a growing wait - '
+               +'before it counts as missing. A title here has just been '
+               +'deleted, moved or re-imported; the count above only rises '
+               +'if it is still gone after the third look.'),
       {state:'missing',t:'Missing'});
   // ATTENTION, NOT JUST ERRORS. The tile counted file errors and said
   // "nothing needs attention" while the rule check held broken files and the
@@ -13523,7 +13534,10 @@ async function loadAll(){
       sweepNote(s.unmanaged_sweep, ua.checking,
                 `${fmt(ua.checking)} being re-checked`,
                 ua.no_folder ? `${fmt(ua.no_folder)} not in any arr`
-                             : gb(s.orphans.bytes)+' — likely failed imports'),
+                             : gb(s.orphans.bytes)+' — likely failed imports',
+                'The unmanaged check. A file on disk that no arr claims is '
+               +'asked about again before it counts here, because an import '
+               +'still in flight looks exactly like an orphan.'),
       {unmanaged:1,t:'Unmanaged'});
   add('Extras (kept)',fmt(s.extras.n),gb(s.extras.bytes)+' OP/ED, specials, bonus',
       {extras:1,t:'Extras'});
@@ -29392,8 +29406,8 @@ function alpPaint(){
       d.unverified?`${fmt(d.unverified)} track${d.unverified===1?'':'s'} carry a
         tag nobody has checked`:'every tagged track has been listened to'}${
       d.gaps?` · ${fmt(d.gaps)} with no tag at all`:''}${
-      d.queued?` · <span style="color:var(--acc)" title="Files that landed recently jump the queue - they are the ones somebody is about to watch, and the ones whose release can still usefully be blocklisted.">${
-        fmt(d.queued)} just landed</span>`:''}${
+      d.queued?` · <span style="color:var(--acc)" title="Files that landed recently jump the queue - they are the ones somebody is about to watch, and the ones whose release can still usefully be blocklisted. Each one leaves this count as soon as its tracks have been listened to, or if it is deleted before its turn comes.">${
+        fmt(d.queued)} waiting their turn</span>`:''}${
       d.mismatches?` · <span style="color:var(--bad)">${fmt(d.mismatches)} tagged
         a language they are not</span>`:''}</span>`;
   const bar = running ? `

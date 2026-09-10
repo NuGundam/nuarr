@@ -1652,6 +1652,41 @@ def queue_check(file_id: int) -> None:
         pass
 
 
+def _queue_rows(limit: int = 100000) -> list:
+    """Queue rows joined to their file, in whatever state the file is in.
+
+    A LEFT join, unlike the reader below, because the rows this is used to
+    tidy up are exactly the ones an inner join hides.
+    """
+    with cursor() as cur:
+        return cur.execute(
+            "SELECT q.file_id, q.at, f.state, f.path, f.title, f.season, "
+            "       f.episode, f.library, "
+            "       COALESCE(f.audio_langs,'') AS audio_langs "
+            "  FROM audio_lang_queue q LEFT JOIN files f ON f.id = q.file_id "
+            " ORDER BY q.at LIMIT ?", (int(limit),)).fetchall()
+
+
+def _verdicts_for(ids) -> dict:
+    """Stored verdicts for JUST these files, keyed (file_id, track).
+
+    This used to be `SELECT * FROM audio_lang` - 36,966 rows pulled into a
+    dict on every pass to answer a question about twenty-five files.
+    """
+    ids = sorted({int(i) for i in ids})
+    out: dict = {}
+    if not ids:
+        return out
+    with cursor() as cur:
+        for i in range(0, len(ids), 400):
+            chunk = ids[i:i + 400]
+            qs = ",".join("?" * len(chunk))
+            for r in cur.execute(
+                    f"SELECT * FROM audio_lang WHERE file_id IN ({qs})", chunk):
+                out[(r["file_id"], r["track"])] = r
+    return out
+
+
 def queued(limit: int = 200) -> list[dict]:
     """The jump queue, oldest request first, as pending()-shaped rows."""
     out: list[dict] = []
@@ -1659,24 +1694,18 @@ def queued(limit: int = 200) -> list[dict]:
         if not _JUMP_READY:
             _jump_init()
         ensure_table()
-        with cursor() as cur:
-            have = {(r["file_id"], r["track"]): r for r in
-                    cur.execute("SELECT * FROM audio_lang").fetchall()}
-            rows = cur.execute(
-                "SELECT f.id, f.path, f.title, f.season, f.episode, f.library, "
-                "       f.audio_langs "
-                "  FROM audio_lang_queue q JOIN files f ON f.id = q.file_id "
-                " WHERE f.state = 'done' AND COALESCE(f.audio_langs,'') != '' "
-                " ORDER BY q.at LIMIT ?", (int(limit),)).fetchall()
+        rows = [r for r in _queue_rows(limit)
+                if r["state"] == "done" and (r["audio_langs"] or "")]
+        have = _verdicts_for([r["file_id"] for r in rows])
     except Exception:                                    # noqa: BLE001
         return out
     for r in rows:
         codes = (r["audio_langs"] or "").split(",")
         for ai, raw_code in enumerate(codes):
-            prev = have.get((r["id"], ai))
+            prev = have.get((r["file_id"], ai))
             if prev is not None and row_fresh(prev, r["path"]):
                 continue
-            out.append({"file_id": r["id"], "path": r["path"], "track": ai,
+            out.append({"file_id": r["file_id"], "path": r["path"], "track": ai,
                         "title": r["title"] or "", "season": r["season"],
                         "episode": r["episode"], "library": r["library"] or "",
                         "tagged": (raw_code or "").strip().strip("-"),
@@ -1698,10 +1727,82 @@ def unqueue(file_ids) -> None:
         pass
 
 
-def queue_count() -> int:
+# HOW THE QUEUE LEAKED, AND WHY unqueue() ALONE COULD NEVER FIX IT.
+#
+# run_once() unqueues what it was given. What it was given is queued(), which
+# only returns rows that still NEED listening to - it drops any file that is
+# not state='done', and skips any track whose verdict is already fresh. So a
+# row that queued() filtered out was never in `todo`, was never handed to
+# unqueue(), and stayed in the table being counted forever.
+#
+# Measured on this library at 25 rows: 2 had work, 11 were files not in
+# 'done', and 12 were files whose every track had already been judged by some
+# other path. Twenty-three of twenty-five permanent. The tile read "14 just
+# landed" and the number only ever went up.
+#
+# The distinction that matters, and the reason this is not just a DELETE:
+#
+#   state='done', nothing outstanding -> ANSWERED. Drop it.
+#   file gone, or state='deleted'     -> never coming back. Drop it.
+#   any other state                   -> STILL LANDING. Keep its place. This
+#                                        is the whole point of the queue: the
+#                                        file was noticed at import and has
+#                                        not finished being imported yet.
+#
+# Bounded per call, because it stats each file to decide whether a verdict
+# still describes it, and a re-import of five thousand files must not turn a
+# poll into a disk storm. Anything past the cap is tidied on the next call.
+QSYNC_MAX = 500
+QSYNC_TTL = 10.0
+_QSYNC = {"at": 0.0}
+
+
+def queue_sync(limit: int = QSYNC_MAX) -> int:
+    """Drop queue rows with nothing left to answer. Returns the number gone."""
     try:
         if not _JUMP_READY:
             _jump_init()
+        ensure_table()
+        rows = _queue_rows(limit)
+    except Exception:                                    # noqa: BLE001
+        return 0
+    if not rows:
+        return 0
+    have = _verdicts_for([r["file_id"] for r in rows if r["state"] == "done"])
+    drop: list[int] = []
+    for r in rows:
+        st = r["state"]
+        if st is None or st == "deleted":
+            drop.append(r["file_id"])
+            continue
+        if st != "done":
+            continue
+        codes = [c for c in (r["audio_langs"] or "").split(",") if c != ""]
+        outstanding = any(
+            not row_fresh(have.get((r["file_id"], ai)), r["path"])
+            for ai in range(len(codes)))
+        if not outstanding:
+            drop.append(r["file_id"])
+    if drop:
+        unqueue(drop)
+    return len(drop)
+
+
+def queue_count() -> int:
+    """How many files are still waiting their turn.
+
+    The count itself is one cheap COUNT(*); the tidy that makes it TRUE runs
+    on a timer beside it, so the number corrects itself within ten seconds
+    rather than waiting for the next sweep - and a poll every 1.2s does not
+    pay for it every time.
+    """
+    try:
+        if not _JUMP_READY:
+            _jump_init()
+        now = time.time()
+        if now - _QSYNC["at"] >= QSYNC_TTL:
+            _QSYNC["at"] = now
+            queue_sync()
         with cursor() as cur:
             r = cur.execute("SELECT COUNT(*) n FROM audio_lang_queue").fetchone()
         return int(r["n"] or 0)
@@ -2143,6 +2244,11 @@ def run_once(limit: int = 400, apply: bool = True,
     # Whatever was asked for has now been answered, right or wrong - leaving
     # it queued would mean listening to the same file every pass forever.
     unqueue({t["file_id"] for t in todo if t.get("jumped")})
+    # AND THE ONES THAT WERE NEVER HANDED OVER. See queue_sync: a row queued()
+    # filtered out never reached the line above, so the pass that should have
+    # cleared it did not know it existed.
+    _QSYNC["at"] = 0.0
+    queue_sync()
     PROGRESS.update(state="idle", finished_at=time.time(), current="")
     pending_invalidate()
     unload()                       # give the VRAM back; the GPU is for encoding
