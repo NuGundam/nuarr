@@ -30002,6 +30002,28 @@ let _skOpen=new Set();
 // is worse than one that never left. Held for a minute, which is longer than
 // any pass takes to catch up.
 let _skDone=new Map();
+// WHERE A ROW YOU TOUCHED WAS. Saying what a track carries changes its score
+// to a certainty, and the list is ordered by doubt - so the row you just set
+// shot to the far end of five hundred and the button you were about to press
+// went with it. A row is pinned to the place it was in when you touched it
+// and stays there until it leaves; the sort applies to everything else.
+let _skPin=new Map(), _skRows=[];
+function skPinRow(id){
+  const i=_skRows.findIndex(r=>r.id===id);
+  if(i>=0) _skPin.set(id, {i, at:Date.now()});
+}
+function skUnpin(id){ _skPin.delete(id); }
+function skPinned(rows){
+  if(!_skPin.size) return rows;
+  const now=Date.now();
+  for(const [k,v] of _skPin) if(now-v.at > 600000) _skPin.delete(k);
+  const held=rows.filter(r=>_skPin.has(r.id));
+  if(!held.length) return rows;
+  const rest=rows.filter(r=>!_skPin.has(r.id));
+  held.sort((a,b)=>_skPin.get(a.id).i-_skPin.get(b.id).i)
+      .forEach(r=>rest.splice(Math.min(_skPin.get(r.id).i, rest.length), 0, r));
+  return rest;
+}
 function skAnswered(id){ _skDone.set(id, Date.now()); }
 function skIsAnswered(id){
   const t=_skDone.get(id);
@@ -30137,6 +30159,7 @@ async function skLine(which, val){
 async function skSetKind(id, kind, el){
   const [fid, src]=skSplit(id);
   const row=((_sk&&_sk.rows)||[]).find(x=>x.id===id);
+  skPinRow(id);                     // hold its place across the repaint
   if(el) el.disabled=true;
   try{ await fetch(`/api/subkind/kind?file_id=${fid}&source=${encodeURIComponent(src)}&kind=${
       encodeURIComponent(kind)}`,{method:'POST'}); }catch(e){}
@@ -30164,7 +30187,7 @@ function skActWord(r, n){
 // closes over the gap, then reload - by which time the answer is off the
 // server's list too and the reload has nothing to undo.
 function skGoneMany(ids, word, ok=true){
-  if(ok) ids.forEach(skAnswered);
+  if(ok) ids.forEach(id=>{ skAnswered(id); skUnpin(id); });
   const el=document.getElementById('skPanel'); if(!el) return;
   const rows=[...el.querySelectorAll('.sktbl tbody tr')]
     .filter(tr=>ids.some(id=>(tr.innerHTML||'').includes(`'${id}'`)));
@@ -30179,7 +30202,7 @@ function skGoneMany(ids, word, ok=true){
 }
 
 function skGone(el, word, ok=true, rowId=''){
-  if(ok && rowId) skAnswered(rowId);
+  if(ok && rowId){ skAnswered(rowId); skUnpin(rowId); }
   const tr = el && el.closest ? el.closest('tr') : null;
   if(!tr){ setTimeout(()=>{ _skKey=''; loadSubKind(); }, 900); return; }
   // The open detail row, if this row has one - it leaves with its parent.
@@ -30328,9 +30351,12 @@ function skPaint(force){
   // it: the history strip above reads it too, and a `const` further down is a
   // ReferenceError, not a hoist.
   const A=d.auto||{};
-  const rows=all.filter(r=>(_skShowDone||!r.done)&&(_skShowUnread||!r.unread)
-                        && !skIsAnswered(r.id))
-                .sort(skCmp);
+  const rows=skPinned(all.filter(r=>(_skShowDone||!r.done)&&(_skShowUnread||!r.unread)
+                                 && !skIsAnswered(r.id))
+                         .sort(skCmp));
+  // What is on screen, in the order it is on screen - what a pin is measured
+  // against.
+  _skRows=rows;
   const hiddenDone=_skShowDone?0:all.filter(r=>r.done).length;
   const hiddenUnread=_skShowUnread?0:all.filter(r=>r.unread).length;
   const tested=(P.none||0)+(P.signs||0)+(P.dialogue||0)+(P.hybrid||0);
