@@ -6794,14 +6794,22 @@ async def api_subtitletitle_refresh():
 
 
 @app.post("/api/subtitletitle/fix")
-async def api_subtitletitle_fix(file_id: int = 0, confirm: str = ""):
-    """Correct one file's titles, or every safe one when no file is named."""
+async def api_subtitletitle_fix(file_id: int = 0, ids: str = "",
+                                confirm: str = ""):
+    """Correct one file's titles, a chosen few, or every safe one."""
     from . import subtitletitle as stt
     rows = (stt.cached().get("rows") or [])
     if file_id:
         rows = [r for r in rows if int(r.get("file_id") or 0) == int(file_id)]
         if not rows:
             return {"ok": False, "why": "no finding for that file any more"}
+    elif ids:
+        want = set(_id_list(ids))
+        rows = [r for r in rows if int(r.get("file_id") or 0) in want]
+        if not rows:
+            return {"ok": False, "why": "none of those are still listed"}
+        if confirm != "yes":
+            return {"ok": False, "why": "confirm=yes required"}
     elif confirm != "yes":
         # The whole library at once is the one that needs asking about.
         return {"ok": False, "why": "confirm=yes required to correct them all"}
@@ -18075,6 +18083,26 @@ function modeSeg(label, cur, call, tips){
           color:${cur===m?'#0b0e13':'var(--dim,#8a97a6)'};
           font-weight:${cur===m?'600':'400'}">${m}</button>`).join('')}
     </span></span>`;
+}
+
+// A REPAINT MUST NOT REACH INTO WHAT SOMEBODY IS USING.
+//
+// These panels rebuild their innerHTML on a timer - every 1.5 seconds while a
+// sweep runs - and rebuilding it destroys whatever the browser was doing with
+// the old nodes. An open dropdown closes. A number you were half-way through
+// typing goes back to what it was. Both happened here: the kind picker shut
+// itself every time the poll came round, which made it unusable for the exact
+// case it was built for.
+//
+// Focus is the test, and it is the right one: a control the browser considers
+// focused is a control somebody is in the middle of. It covers the open
+// select, the half-typed threshold and the caret in a filter box, without
+// needing any of them to announce themselves.
+function panelBusy(id){
+  const el = document.getElementById(id);
+  if(!el) return false;
+  const a = document.activeElement;
+  return !!(a && a !== document.body && el.contains(a));
 }
 
 function askOpen(scope){
@@ -29673,6 +29701,51 @@ function alpPaint(){
 // from probes nuarr already stored, correct with mkvpropedit in place, and
 // never rewrite a title carrying something nuarr cannot regenerate.
 let _stt=null, _sttKey='', _sttAll=false;
+// THE SAME SELECTION THE OTHER PANEL HAS, for the same reason: these arrive by
+// show. Seven episodes of That Time I Got Reincarnated as a Slime, all
+// "Signs & Songs", all around nine cues a minute - one release group's habit,
+// seven identical decisions. Only the rewritable rows can be selected; the
+// ones carrying a group name have no action to batch.
+let _sttSel=new Set(), _sttLast=null;
+function sttRows(){ return ((_stt&&_stt.rows)||[]).filter(r=>r.rewritable); }
+function sttSelIds(){
+  const live=new Set(sttRows().map(r=>r.file_id));
+  return [..._sttSel].filter(id=>live.has(id));
+}
+function sttToggle(id, ev){
+  const rows=sttRows(), i=rows.findIndex(r=>r.file_id===id);
+  if(ev && ev.shiftKey && _sttLast!==null && i>=0){
+    const a=Math.min(i,_sttLast), b=Math.max(i,_sttLast);
+    const on=!_sttSel.has(id);
+    for(let k=a;k<=b;k++){ if(on) _sttSel.add(rows[k].file_id);
+                           else _sttSel.delete(rows[k].file_id); }
+  }else{
+    if(_sttSel.has(id)) _sttSel.delete(id); else _sttSel.add(id);
+  }
+  if(i>=0) _sttLast=i;
+  _sttKey=''; sttPaint();
+}
+function sttSelAll(on){
+  if(on) sttRows().forEach(r=>_sttSel.add(r.file_id)); else _sttSel.clear();
+  _sttLast=null; _sttKey=''; sttPaint();
+}
+function sttClearSel(){ _sttSel.clear(); _sttLast=null; _sttKey=''; sttPaint(); }
+async function sttFixMany(btn){
+  const ids=sttSelIds();
+  if(!ids.length) return;
+  askInline(btn, `Rewrite ${ids.length} track title${ids.length===1?'':'s'}? `
+    +'Each is a header edit of about a tenth of a second - the video, the '
+    +'audio and the subtitle cues are untouched.',
+    `Yes, correct ${ids.length}`,
+    async ()=>{
+      const r=await (await fetch('/api/subtitletitle/fix?confirm=yes&ids='
+        +ids.join(','), {method:'POST'})).json();
+      _sttSel.clear(); _sttLast=null;
+      setTimeout(()=>{ _stt=null; _sttKey=''; loadSubTitle(); }, 1300);
+      return r.ok ? {ok:true, why:`corrected ${r.fixed}`
+        +(r.failed?`, ${r.failed} failed`:'')} : r;
+    });
+}
 async function loadSubTitle(){
   const el=document.getElementById('sttPanel'); if(!el) return;
   if(!_stt) el.innerHTML='<div class="skel" style="padding:12px">'
@@ -29742,16 +29815,40 @@ function sttPaint(){
     animated typesetting rather than speech, so it is left alone. Nothing is
     re-probed and nothing is re-encoded: the check costs a query and the
     correction is a header edit.</div>`;
-  const table = shown.length ? `<div class="rowbox scrollbox">
+  const pick=sttRows(), nsel=sttSelIds().length;
+  const allOn = pick.length>0 && nsel===pick.length;
+  const selBar = nsel ? `
+    <div class="askhost" style="display:flex;gap:8px;align-items:center;
+         flex-wrap:wrap;padding:6px 8px;margin:6px 0;border-radius:7px;
+         background:rgba(88,166,255,.07);border:1px solid var(--line)">
+      <b style="font-size:11.5px;color:#6fb0ff">${fmt(nsel)} selected</b>
+      <button class="rmb" onclick="sttFixMany(this)">Correct ${fmt(nsel)}</button>
+      <button class="rmb" onclick="sttClearSel()">Clear</button>
+      <span class="dim" style="font-size:10.5px">shift-click to take a range</span>
+    </div>` : '';
+  const table = shown.length ? `${selBar}<div class="rowbox scrollbox">
       <table style="width:100%;font-size:11.5px">
-      <colgroup><col style="width:32%"><col style="width:8%"><col style="width:50px">
-        <col style="width:16%"><col style="width:15%"><col style="width:21%"></colgroup>
+      <colgroup><col style="width:26px"><col style="width:30%"><col style="width:8%">
+        <col style="width:52px"><col style="width:15%"><col style="width:14%">
+        <col style="width:132px"><col style="width:92px"></colgroup>
       <thead><tr class="dim" style="font-size:10.5px;text-align:left">
+        <th style="padding:3px 4px 4px 0">
+          <input type="checkbox" ${allOn?'checked':''}
+            title="Select every title nuarr can rewrite"
+            onclick="sttSelAll(this.checked)"></th>
         <th style="padding:3px 8px 4px 0">episode</th><th>library</th>
-        <th title="How far inside the band where people talk this track's cue rate sits. A track squarely in the middle of that band is unarguable; one on either edge could be a long sparse track or a busy sign sheet.">sure</th>
-        <th>says</th><th>would become</th><th>measured</th>
+        <th style="text-align:right;padding-right:8px"
+          title="How far inside the band where people talk this track's cue rate sits. A track squarely in the middle of that band is unarguable; one on either edge could be a long sparse track or a busy sign sheet.">sure</th>
+        <th>says</th><th>would become</th>
+        <th style="text-align:right;padding-right:10px">measured</th>
+        <th></th>
       </tr></thead>
-      <tbody>${shown.slice(0,400).map(r=>`<tr>
+      <tbody>${shown.slice(0,400).map(r=>{
+        const on=_sttSel.has(r.file_id);
+        return `<tr${on?' style="background:rgba(88,166,255,.06)"':''}>
+        <td style="padding:3px 4px 3px 0">${r.rewritable?
+          `<input type="checkbox" ${on?'checked':''}
+             onclick="sttToggle(${r.file_id}, event)">`:''}</td>
         <td style="padding:3px 8px 3px 0" title="${esc(r.path||'')}"
           >${esc(r.label||r.title||String(r.path||'').split('\\').pop())}
           <div class="dim" style="font-size:10px;overflow:hidden;
@@ -29766,14 +29863,20 @@ function sttPaint(){
         <td class="mono" style="padding:3px 8px 3px 0;color:${
           r.rewritable?'var(--ok)':'var(--dim)'}"
           >${r.rewritable?esc(r.new||''):'—'}</td>
-        <td style="padding:3px 0" class="askhost">
-          <span class="dim" style="font-size:10.5px" title="${esc(r.why||'')}"
-            >${r.cues?fmt(r.cues)+' cues · '+r.cpm+'/min':''}</span>
-          ${r.rewritable?`<button class="rmb" style="margin-left:8px"
+        <!-- RIGHT-ALIGNED AND TABULAR, because it is two numbers per row and
+             the eye compares them down the column. Ragged-left they read as
+             prose that happens to contain digits. -->
+        <td class="mono dim" style="padding:3px 10px 3px 0;text-align:right;
+            white-space:nowrap;font-variant-numeric:tabular-nums"
+            title="${esc(r.why||'')}"
+          >${r.cues?fmt(r.cues)+' cues':''}<div style="font-size:10px"
+            >${r.cpm?r.cpm+'/min':''}</div></td>
+        <td style="padding:3px 0;text-align:right" class="askhost">
+          ${r.rewritable?`<button class="rmb"
              onclick="sttFixOne(${r.file_id},this)">Correct it</button>`
-            :`<span class="dim" style="font-size:10.5px;margin-left:8px"
+            :`<span class="dim" style="font-size:10.5px"
                title="The title carries a name nuarr did not write and cannot regenerate, so it is reported and left exactly as it is.">left alone</span>`}
-        </td></tr>`).join('')}</tbody></table></div>`
+        </td></tr>`;}).join('')}</tbody></table></div>`
     : `<div class="dim" style="font-size:11.5px;padding:8px 0">${
         d.total?'Nothing here nuarr can rewrite safely.'
                :'Every subtitle title agrees with the track behind it.'}</div>`;
@@ -29787,7 +29890,7 @@ function sttPaint(){
                 :`also show the ${fmt(d.total-d.fixable)} left alone`}</a>`:''}
   </div>`;
   const html=`<div class="lkind" style="padding:11px 12px">${head}${note}${table}${foot}</div>`;
-  if(askOpen('sttPanel')) return;
+  if(askOpen('sttPanel') || panelBusy('sttPanel')) return;
   if(html===_sttKey) return;
   _sttKey=html; el.innerHTML=html;
 }
@@ -29869,7 +29972,9 @@ async function hsSetKind(fid, kind, el){
   if(el) el.disabled=true;
   try{ await fetch(`/api/hardsub/kind?file_id=${fid}&kind=${encodeURIComponent(kind)}`,
                    {method:'POST'}); }catch(e){}
-  if(el) el.disabled=false;
+  // Blur before the repaint: panelBusy() would otherwise see the select still
+  // focused and skip the very redraw that shows the choice took.
+  if(el){ el.disabled=false; el.blur(); }
   _hsKey=''; loadHardsub();
 }
 // WHAT THE BATCH IS ABOUT TO CALL THEM. Empty means "leave each row as it is",
@@ -30093,18 +30198,29 @@ function hsPaint(){
       <colgroup><col style="width:26px"><col style="width:35%"><col style="width:10%">
         <col style="width:10%"><col style="width:52px"><col style="width:21%">
         <col style="width:14%"></colgroup>
-      <thead><tr>
-        <th style="padding:2px 4px 4px 0;text-align:left">
+      <thead>
+      <tr><th style="padding:2px 4px 2px 0;text-align:left">
           <input type="checkbox" ${allOn?'checked':''}
             title="Select every finding shown"
             onclick="hsSelAll(this.checked)"></th>
-        <th colspan="6" class="dim" style="padding:2px 0 4px;text-align:left;
+        <th colspan="6" class="dim" style="padding:2px 0 3px;text-align:left;
             font-weight:400;font-size:10.5px">
           ${fmt(pick.length)} still to answer${
             hidden?` · <a href="#" onclick="hsShowMarked(1);return false">show ${
               fmt(hidden)} already marked</a>`:''}${
             (_hsShowMarked&&d.marked)?` · <a href="#" onclick="hsShowMarked(0);return false">hide the marked ones</a>`:''}
-          · least certain first</th>
+          · least certain first</th></tr>
+      <!-- NAMED COLUMNS, because five of the seven are not self-evident. A
+           percentage with no heading beside a dropdown with no heading is two
+           things you have to work out; the other panel names its columns and
+           this one should read the same way. -->
+      <tr class="dim" style="font-size:10.5px;text-align:left">
+        <th></th><th style="padding:1px 8px 4px 0">episode</th><th>library</th>
+        <th title="What the sampler read, and what you say it is. The picker outranks the reading, and what it is set to is what Mark it records.">what it carries</th>
+        <th style="text-align:right;padding-right:8px"
+          title="How sure the reading is, from the shape of what the OCR came back with. Above the mark line it would be marked on its own; below the dismiss line it would be thrown away; in between is yours to call.">sure</th>
+        <th>read from the picture</th>
+        <th style="text-align:right;padding-right:2px">answer</th>
       </tr></thead>
       <tbody>${rows.map(r=>{
         const [word,col]=HSW[r.state]||[r.state,'var(--dim)'];
@@ -30136,13 +30252,14 @@ function hsPaint(){
                     :`<div style="font-size:9.5px;color:${col}">read as ${esc(word)}</div>`}
         </td>
         <td class="mono" style="padding:3px 8px 3px 0;text-align:right;
-            color:${hsScoreColor(r)}" title="${esc((r.why||'')+' — '+(r.auto_why||''))}"
+            font-variant-numeric:tabular-nums;color:${hsScoreColor(r)}"
+            title="${esc((r.why||'')+' — '+(r.auto_why||''))}"
           >${r.score===undefined?'':r.score+'%'}</td>
-        <td class="dim mono" style="padding:3px 8px 3px 0;overflow:hidden;
+        <td class="dim mono" style="padding:3px 8px 3px 10px;overflow:hidden;
             text-overflow:ellipsis;white-space:nowrap"
             title="${esc('read from the picture: '+(r.words||''))}"
           >${esc(r.words||'')}</td>
-        <td style="padding:3px 0;white-space:nowrap">${r.marked
+        <td style="padding:3px 0;white-space:nowrap;text-align:right">${r.marked
           ? '<span class="dim" title="This file already carries the blank English track.">marked</span>'
           : `<button class="rmb" onclick="hsMark(${r.file_id},this)"
               title="Add a blank English subtitle track — one silent cue, default and forced cleared, named so the picker explains itself. Bazarr and Plex then see a subtitle exists and stop asking for one, and nothing is ever drawn over the words already in the picture.">Mark it</button>
@@ -30154,8 +30271,9 @@ function hsPaint(){
               :'Nothing checked yet.'}</div>`;
   const html=`<div class="lkind" style="padding:11px 12px">${head}${note}${band}${prog}${hist}${table}</div>`;
   // The same rule the errors drill follows: while a run is going this panel
-  // repaints every 1.5s, and a rebuild would take the question with it.
-  if(askOpen('hsPanel')) return;
+  // repaints every 1.5s, and a rebuild would take the question with it - or
+  // the dropdown that was open, or the number half-typed into a threshold.
+  if(askOpen('hsPanel') || panelBusy('hsPanel')) return;
   if(html===_hsKey) return;
   _hsKey=html; el.innerHTML=html;
   // WHILE IT RUNS, KEEP ASKING. A progress bar that only moves when somebody
