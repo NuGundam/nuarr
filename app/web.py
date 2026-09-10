@@ -30245,6 +30245,10 @@ function skProgBar(p, what, unit){
 function skPaint(force){
   const el=document.getElementById('skPanel'); if(!el||!_sk) return;
   const d=_sk, all=d.rows||[], c=d.counts||{}, P=d.picture||{}, T=d.tracks||{}, S=d.state||{};
+  // Declared with the rest of the payload, not beside the bar that first drew
+  // it: the history strip above reads it too, and a `const` further down is a
+  // ReferenceError, not a hoist.
+  const A=d.auto||{};
   const rows=all.filter(r=>(_skShowDone||!r.done)&&(_skShowUnread||!r.unread))
                 .sort(skCmp);
   const hiddenDone=_skShowDone?0:all.filter(r=>r.done).length;
@@ -30316,14 +30320,29 @@ function skPaint(force){
     ${(T.unread&&T.backlog_eta)?`<span title="Until every flagged track has been read, at this pace and cadence"><b>${
        hsDur(T.backlog_eta)}</b> of tracks left</span>`:''}
     ${(S.last_error||T.last_error)?`<span class="err">${esc(S.last_error||T.last_error)}</span>`:''}
-  </div>`;
+  </div>
+  ${d.mode==='auto'?`<div style="font-size:11px;margin:2px 0 4px;display:flex;
+       gap:12px;flex-wrap:wrap;align-items:center">
+    <span style="color:var(--ok)">auto</span>
+    ${A.at?`<span class="dim" title="What the last pass through the standing list did">last pass ${
+       ago(A.at)} · ${fmt(A.marked||0)} marked${A.dropped?`, ${fmt(A.dropped)} dropped`:''}</span>`
+      :'<span class="dim">has not acted yet</span>'}
+    ${A.queued?`<span title="Findings already past the ${d.mark_at}% line waiting for a later pass. ${
+       A.per_pass} are taken each pass because every mark rewrites a container."><b>${
+       fmt(A.queued)}</b> still to mark${A.eta?` · <b style="color:var(--acc)">${
+       hsDur(A.eta)}</b> to work through them`:''}</span>`
+      :'<span class="dim">nothing waiting past the line</span>'}
+  </div>`:''}`;
   // ---- the batch marker's own bar, separate from the readers' ------------
-  const mk=_skMark||{}, mkPct=mk.total?Math.min(100,(mk.done/mk.total)*100):0;
+  const mk=d.marking||_skMark||{}, mkPct=mk.total?Math.min(100,(mk.done/mk.total)*100):0;
   const markBar=(mk.running||mk.total)?`
     <div class="lkind" style="padding:7px 10px;margin:6px 0">
       <div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;font-size:11.5px">
         ${mk.running?'<span class="busy" style="color:var(--acc);flex:none"><span class="sp"></span></span>':''}
         <b style="flex:none">${mk.running?'Marking':'Marked'} ${fmt(mk.done||0)} of ${fmt(mk.total||0)}</b>
+        ${(d.mode==='auto')?`<span class="dim" style="flex:none;font-size:10.5px"
+           title="Auto is working through the findings already past the ${d.mark_at}% line, ${
+             A.per_pass||25} a pass, because every mark rewrites a container.">on its own</span>`:''}
         ${mk.running&&mk.now?`<span class="dim" style="flex:1 1 160px;min-width:0;overflow:hidden;
            text-overflow:ellipsis;white-space:nowrap" title="${esc(mk.now)}">${esc(mk.now)}</span>`:''}
         ${mk.ok?`<span style="color:var(--ok);flex:none">${fmt(mk.ok)} done</span>`:''}
@@ -30445,7 +30464,11 @@ function skPaint(force){
   _skKey=html; el.innerHTML=html;
   const nb=el.querySelector('.rowbox'); if(nb&&keep) nb.scrollTop=keep;
   clearTimeout(_skPoll);
-  if(running) _skPoll=setTimeout(()=>{ if(document.getElementById('skPanel')) loadSubKind(); }, 2500);
+  // THE MARKER OUTLIVES THE PASS THAT STARTED IT. mark_many() returns as
+  // soon as the work is queued, so in auto the readers finish and the bar
+  // would freeze mid-batch with nothing polling it. It counts as running.
+  if(running || mk.running) _skPoll=setTimeout(()=>{
+    if(document.getElementById('skPanel')) loadSubKind(); }, 2500);
 }
 
 let _stt=null, _sttKey='', _sttAll=true, _sttPoll=null;

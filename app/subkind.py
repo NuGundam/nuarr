@@ -46,7 +46,14 @@ CYCLE_S = 300.0
 PICTURE = "picture"
 
 STATE: dict = {"running": False, "phase": "", "t0": 0.0, "last_run": 0.0,
-               "runs": 0, "last_took": 0.0, "last_error": ""}
+               "runs": 0, "last_took": 0.0, "last_error": "",
+               # WHAT AUTO DID, AND WHAT IS LEFT FOR IT. A mode that acts on
+               # its own has to be as legible as one that waits: how many it
+               # took last pass, how many are still queued behind the per-pass
+               # cap, and therefore how many passes - how long - until it has
+               # worked through the standing list.
+               "auto_marked": 0, "auto_dropped": 0, "auto_queued": 0,
+               "auto_at": 0.0}
 
 
 # ------------------------------------------------------------ the settings --
@@ -191,6 +198,21 @@ def findings(limit: int = 600) -> dict:
         },
         "picture": hs,
         "tracks": sp,
+        # The batch marker is where auto's marking actually happens, so its
+        # progress is auto's progress and the panel reads it from here rather
+        # than from a second endpoint.
+        "marking": dict(hardsub.MARK_STATE or {}),
+        "auto": {
+            "marked": STATE.get("auto_marked") or 0,
+            "dropped": STATE.get("auto_dropped") or 0,
+            "queued": STATE.get("auto_queued") or 0,
+            "at": STATE.get("auto_at") or 0.0,
+            "per_pass": AUTO_MARKS_PER_PASS,
+            # HOW LONG UNTIL AUTO IS DONE with what it can already see: the
+            # queue over the per-pass cap, at the cadence the pass runs on.
+            "eta": (((STATE.get("auto_queued") or 0) / AUTO_MARKS_PER_PASS)
+                    * CYCLE_S) if STATE.get("auto_queued") else 0.0,
+        },
         "state": {**STATE, "cycle_s": CYCLE_S,
                   "next_run": (STATE["last_run"] + CYCLE_S)
                               if STATE.get("last_run") else 0.0},
@@ -333,6 +355,9 @@ async def _auto_backlog() -> dict:
     if to_mark and not hardsub.MARK_STATE.get("running"):
         m = await hardsub.mark_many(to_mark[:AUTO_MARKS_PER_PASS])
         out["marked"] = int(m.get("started") or 0)
+    out["queued"] = max(0, len(to_mark) - out["marked"])
+    STATE.update(auto_marked=out["marked"], auto_dropped=out["dropped"],
+                 auto_queued=out["queued"], auto_at=time.time())
     if out["marked"] or out["dropped"]:
         joblog.log(f"subtitle kinds: on its own, marking {out['marked']} "
                    f"file(s) past the {mark_at()}% line and dropping "
