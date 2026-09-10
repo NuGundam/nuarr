@@ -6778,6 +6778,54 @@ async def api_hardsub_check(file_id: int):
     return d
 
 
+def _id_list(ids: str) -> list:
+    """"1,2,3" -> [1,2,3], skipping anything that is not a number.
+
+    A comma-separated query rather than a JSON body because every other
+    control on this panel is a GET-shaped POST, and three hundred ids is two
+    kilobytes of URL - well inside what anything here will carry.
+    """
+    out = []
+    for part in (ids or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.append(int(part))
+        except ValueError:
+            continue
+    return out
+
+
+@app.post("/api/hardsub/ignore/batch")
+async def api_hardsub_ignore_batch(ids: str = ""):
+    """Withdraw several findings at once. Nothing on disk changes."""
+    from . import hardsub
+    return await asyncio.to_thread(hardsub.ignore_many, _id_list(ids))
+
+
+@app.post("/api/hardsub/mark/batch")
+async def api_hardsub_mark_batch(ids: str = "", confirm: str = "",
+                                 force: int = 0):
+    """Start marking several files. Returns as soon as the work is queued.
+
+    Behind the same confirm word the single-file button uses, because this
+    rewrites every file in the list - and the list is the whole reason it
+    needs to be harder to reach by accident than one row was.
+    """
+    if confirm != "yes":
+        return {"ok": False, "why": "confirm=yes required"}
+    from . import hardsub
+    return await hardsub.mark_many(_id_list(ids), force=bool(force))
+
+
+@app.get("/api/hardsub/mark/progress")
+def api_hardsub_mark_progress():
+    """Where the batch has got to. One dict read; safe to poll."""
+    from . import hardsub
+    return hardsub.mark_progress()
+
+
 @app.post("/api/hardsub/ignore")
 async def api_hardsub_ignore(file_id: int, undo: int = 0):
     """Say a finding is wrong - and keep the words that made it wrong."""
@@ -29456,13 +29504,100 @@ function alpPaint(){
 }
 
 // ---- subtitles already painted into the picture -------------------------
+// THE FINDINGS ARRIVE BY SHOW, NOT BY FILE. One release group encodes a whole
+// series the same way, so a sweep that finds Beet the Vandel Buster S01E04
+// finds forty-five of its siblings in the same pass. Answering those one row
+// at a time is forty-six presses to say one thing - so the rows can be
+// selected, and the two answers can be given once for the lot.
+//
+// The selection lives here rather than in the DOM because this panel repaints
+// itself every 1.5 seconds while a sweep runs, and a tick that quietly
+// unticked forty boxes would be worse than no checkboxes at all.
 let _hs=null, _hsKey='', _hsPoll=null;
+let _hsSel=new Set(), _hsLast=null, _hsMarkPoll=null;
+
+function hsRows(){ return ((_hs&&_hs.found)||[]).filter(r=>!r.marked); }
+function hsSelIds(){
+  // Only ids still on screen. A selection made before a repaint must not
+  // outlive the row it was about - marking something you can no longer see
+  // is the kind of surprise a batch button must never produce.
+  const live=new Set(hsRows().map(r=>r.file_id));
+  return [..._hsSel].filter(id=>live.has(id));
+}
+function hsToggle(id, ev){
+  const rows=hsRows(), i=rows.findIndex(r=>r.file_id===id);
+  // SHIFT PICKS A RANGE, because the real selection is "this whole season"
+  // and forty individual clicks is the problem, not the solution.
+  if(ev && ev.shiftKey && _hsLast!==null && i>=0){
+    const a=Math.min(i,_hsLast), b=Math.max(i,_hsLast);
+    const on=!_hsSel.has(id);
+    for(let k=a;k<=b;k++){ if(on) _hsSel.add(rows[k].file_id);
+                           else _hsSel.delete(rows[k].file_id); }
+  }else{
+    if(_hsSel.has(id)) _hsSel.delete(id); else _hsSel.add(id);
+  }
+  if(i>=0) _hsLast=i;
+  _hsKey=''; hsPaint();
+}
+function hsSelAll(on){
+  if(on) hsRows().forEach(r=>_hsSel.add(r.file_id)); else _hsSel.clear();
+  _hsLast=null; _hsKey=''; hsPaint();
+}
+function hsClearSel(){ _hsSel.clear(); _hsLast=null; _hsKey=''; hsPaint(); }
+
+async function hsMarkMany(btn){
+  const ids=hsSelIds();
+  if(!ids.length) return;
+  askInline(btn,
+    `Add a blank English track to ${ids.length} file`
+    + (ids.length===1?'':'s')
+    + '? Each one is stream-copied, nothing is re-encoded, and the pool is '
+    + 'asked before every file so it stops if somebody starts watching.',
+    `Yes, mark ${ids.length}`,
+    async ()=>{
+      const r=await (await fetch('/api/hardsub/mark/batch?confirm=yes&ids='
+        +ids.join(','), {method:'POST'})).json();
+      if(r.ok){ _hsSel.clear(); _hsLast=null; hsMarkWatch(); }
+      return r;
+    });
+}
+async function hsIgnoreMany(btn){
+  const ids=hsSelIds();
+  if(!ids.length) return;
+  // NO CONFIRMATION, for the same reason the single row has none: nothing is
+  // written to a file, and it can be taken back from the ignored list.
+  if(btn){ btn.disabled=true; btn.textContent='learning…'; }
+  let r={};
+  try{ r=await (await fetch('/api/hardsub/ignore/batch?ids='+ids.join(','),
+                            {method:'POST'})).json(); }
+  catch(e){ r={ok:false, why:String(e)}; }
+  _hsSel.clear(); _hsLast=null;
+  if(btn){ btn.textContent=r.why||(r.ok?'dismissed':'failed'); }
+  setTimeout(()=>{ _hsKey=''; loadHardsub(); }, 1400);
+}
+function hsMarkWatch(){
+  clearTimeout(_hsMarkPoll);
+  _hsMarkPoll=setTimeout(async ()=>{
+    if(!document.getElementById('hsPanel')) return;
+    try{ _hsMark=await (await fetch('/api/hardsub/mark/progress')).json(); }
+    catch(e){ return; }
+    _hsKey=''; hsPaint();
+    if(_hsMark && _hsMark.running) hsMarkWatch();
+    else loadHardsub();          // the marked rows drop off the list
+  }, 1500);
+}
+let _hsMark=null;
 const HSW={dialogue:['dialogue','var(--bad)'], hybrid:['dialogue + signs','var(--bad)'],
            signs:['signs or songs','var(--warn)'], none:['none','var(--ok)']};
 async function loadHardsub(){
   const el=document.getElementById('hsPanel'); if(!el) return;
-  try{ _hs=await (await fetch('/api/hardsub?limit=40')).json(); }
+  // 300, not 40. The list is now something you act on rather than only read,
+  // and "select all" has to mean all of them - a cap that silently held back
+  // six of forty-six would be a batch button that lies about its scope.
+  try{ _hs=await (await fetch('/api/hardsub?limit=300')).json(); }
   catch(e){ el.innerHTML='<span class="dim">could not load</span>'; return; }
+  try{ _hsMark=await (await fetch('/api/hardsub/mark/progress')).json(); }
+  catch(e){}
   hsPaint();
 }
 function hsPaint(){
@@ -29535,12 +29670,72 @@ function hsPaint(){
     ${(d.untested&&d.backlog_eta)?`<span title="How long until every file that reports no subtitle track has been looked at, at this pace and this cadence. Raising the files-per-pass or shortening the cycle is what changes it.">
        <b>${hsDur(d.backlog_eta)}</b> to finish the backlog</span>`:''}
   </div>`;
-  const table = rows.length ? `<table style="width:100%;font-size:11.5px">
-      <colgroup><col style="width:40%"><col style="width:12%"><col style="width:10%">
-        <col style="width:24%"><col style="width:14%"></colgroup>
+  // ---- what is selected, and the two things to do with it ---------------
+  const pick = hsRows(), nsel = hsSelIds().length;
+  const allOn = pick.length>0 && nsel===pick.length;
+  const mk = _hsMark||{};
+  const mkPct = mk.total ? Math.min(100,(mk.done/mk.total)*100) : 0;
+  // THE BATCH'S OWN PROGRESS, separate from the sweep's. They are different
+  // work at different speeds - the sweep reads frames, this rewrites whole
+  // containers - and one bar standing for both would be a bar that means
+  // nothing.
+  const markBar = (mk.running || mk.total) ? `
+    <div class="lkind" style="padding:7px 10px;margin:6px 0">
+      <div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;
+                  font-size:11.5px">
+        ${mk.running?'<span class="busy" style="color:var(--acc);flex:none"><span class="sp"></span></span>':''}
+        <b style="flex:none">${mk.running?'Marking':'Marked'} ${fmt(mk.done||0)} of ${fmt(mk.total||0)}</b>
+        ${mk.running&&mk.now?`<span class="dim" style="flex:1 1 160px;min-width:0;
+           overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+           title="${esc(mk.now)}">${esc(mk.now)}</span>`:''}
+        ${mk.ok?`<span style="color:var(--ok);flex:none">${fmt(mk.ok)} done</span>`:''}
+        ${mk.failed?`<span class="err" style="flex:none">${fmt(mk.failed)} could not be</span>`:''}
+        ${(mk.running&&mk.eta)?`<span class="dim" style="flex:none">${hsDur(mk.eta)} left${
+           mk.secs_each?` · ${mk.secs_each}s a file`:''}</span>`:''}
+      </div>
+      ${mk.running?`<div class="hsbar"><i style="width:${mkPct.toFixed(1)}%"></i></div>`:''}
+      ${mk.yielded?`<div style="color:var(--warn);font-size:11px;margin-top:4px">${esc(mk.yielded)}</div>`:''}
+      ${(mk.errors&&mk.errors.length)?`<div style="margin-top:4px;font-size:11px">
+        ${mk.errors.map(e=>`<div class="err">${esc(e.name||'')} — ${esc(e.why||'')}</div>`).join('')}
+      </div>`:''}
+    </div>` : '';
+  // The bar only exists when something is selected. An always-present strip of
+  // disabled buttons is furniture; one that appears when it has work to do is
+  // an answer to what you just did.
+  const selBar = nsel ? `
+    <div class="askhost" style="display:flex;gap:8px;align-items:center;
+         flex-wrap:wrap;padding:6px 8px;margin:6px 0;border-radius:7px;
+         background:rgba(88,166,255,.07);border:1px solid var(--line)">
+      <b style="font-size:11.5px;color:#6fb0ff">${fmt(nsel)} selected</b>
+      <button class="rmb" onclick="hsMarkMany(this)"
+        ${mk.running?'disabled title="a batch is already running"':''}
+        >Mark ${fmt(nsel)} as burned in</button>
+      <button class="rmb" onclick="hsIgnoreMany(this)"
+        >Not subtitles</button>
+      <button class="rmb" onclick="hsClearSel()">Clear</button>
+      <span class="dim" style="font-size:10.5px">shift-click to take a range</span>
+    </div>` : '';
+
+  const table = rows.length ? `${markBar}${selBar}
+      <table style="width:100%;font-size:11.5px">
+      <colgroup><col style="width:26px"><col style="width:38%"><col style="width:11%">
+        <col style="width:10%"><col style="width:23%"><col style="width:14%"></colgroup>
+      <thead><tr>
+        <th style="padding:2px 4px 4px 0;text-align:left">
+          <input type="checkbox" ${allOn?'checked':''}
+            title="Select every finding shown"
+            onclick="hsSelAll(this.checked)"></th>
+        <th colspan="5" class="dim" style="padding:2px 0 4px;text-align:left;
+            font-weight:400;font-size:10.5px">
+          ${fmt(pick.length)} still to answer</th>
+      </tr></thead>
       <tbody>${rows.map(r=>{
         const [word,col]=HSW[r.state]||[r.state,'var(--dim)'];
-        return `<tr>
+        const on=_hsSel.has(r.file_id);
+        return `<tr${on?' style="background:rgba(88,166,255,.06)"':''}>
+        <td style="padding:3px 4px 3px 0">${r.marked?'':
+          `<input type="checkbox" ${on?'checked':''}
+             onclick="hsToggle(${r.file_id}, event)">`}</td>
         <td style="padding:3px 8px 3px 0" title="${esc(r.detail||'')}"
           >${esc(String(r.path||'').split('\\').pop())}</td>
         <td class="dim" style="padding:3px 8px 3px 0">${esc(r.library||'')}</td>

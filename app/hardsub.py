@@ -720,6 +720,144 @@ def mark_one(file_id: int) -> dict:
                          "subtitle tracks")}
 
 
+# ------------------------------------------------------- doing a batch ------
+# WHY A BATCH NEEDED WRITING RATHER THAN JUST WIRING UP THE EXISTING BUTTON.
+#
+# The findings arrive by SHOW, not by file. One release group encodes a whole
+# series the same way, so a sweep that finds Beet the Vandel Buster S01E04
+# finds forty-five of its siblings in the same pass. Answering those one row at
+# a time is forty-six presses to say one thing, and the thing being said is
+# identical every time.
+#
+# The two answers are not alike, though, and the code should not pretend they
+# are:
+#
+#   NOT A SUBTITLE  is a verdict withdrawn. Nothing on disk changes, it is
+#                   reversible from the ignored list, and it is one INSERT per
+#                   file. So it happens inside the request and answers at once.
+#
+#   MARK IT         rewrites every one of those files. mkvmerge stream-copies
+#                   the whole container to add one track - no re-encode, but
+#                   minutes of disk per episode, and forty-six of them is an
+#                   hour of the pool. So it runs behind the request, one file
+#                   at a time, and asks the job gate before each one.
+MARK_STATE: dict = {"running": False, "done": 0, "total": 0, "now": "",
+                    "ok": 0, "failed": 0, "t0": 0.0, "finished": 0.0,
+                    "yielded": "", "errors": []}
+
+
+def ignore_many(file_ids) -> dict:
+    """Withdraw a list of findings. Cheap enough to do in the request."""
+    ids = []
+    for x in (file_ids or []):
+        try:
+            ids.append(int(x))
+        except (TypeError, ValueError):
+            continue
+    if not ids:
+        return {"ok": False, "why": "nothing selected"}
+    done = 0
+    series: set = set()
+    for fid in ids:
+        r = ignore(fid)
+        if r.get("ok"):
+            done += 1
+            if r.get("series"):
+                series.add(r["series"])
+    # THE LEARNING IS THE POINT, AND A BATCH IS WHERE IT PAYS. Two dismissals
+    # in one series leave the whole show alone, so dismissing a season teaches
+    # far more than the rows it clears - and saying so is what tells somebody
+    # they will not be asked about that show again.
+    quiet = sorted(s for s in series if _series_count(s) >= SERIES_IGNORES)
+    why = f"dismissed {done} finding" + ("" if done == 1 else "s")
+    if quiet:
+        why += (f" - and {len(quiet)} show" + ("" if len(quiet) == 1 else "s")
+                + " now left alone entirely")
+    return {"ok": True, "done": done, "quiet": quiet, "why": why}
+
+
+async def mark_many(file_ids, force: bool = False) -> dict:
+    """Add the marker track to a list of files, behind the request."""
+    if MARK_STATE["running"]:
+        return {"ok": False, "why": "a batch is already running"}
+    ids = []
+    for x in (file_ids or []):
+        try:
+            ids.append(int(x))
+        except (TypeError, ValueError):
+            continue
+    if not ids:
+        return {"ok": False, "why": "nothing selected"}
+    MARK_STATE.update(running=True, done=0, total=len(ids), now="", ok=0,
+                      failed=0, t0=time.time(), finished=0.0, yielded="",
+                      errors=[])
+    asyncio.get_running_loop().create_task(_mark_batch(ids, force))
+    return {"ok": True, "started": len(ids),
+            "why": f"marking {len(ids)} file" + ("" if len(ids) == 1 else "s")}
+
+
+async def _mark_batch(ids: list, force: bool) -> None:
+    ok = failed = 0
+    try:
+        for fid in ids:
+            # THE GATE DECIDES, BEFORE EVERY FILE - the same rule the sweep
+            # follows, and for the same reason: this runs for an hour, and
+            # somebody pressing play in minute two should not wait it out.
+            # What is already done stays done; the rest can be asked for again.
+            if not force and await _too_busy():
+                MARK_STATE["yielded"] = (
+                    "stopped early - the pool is busy or somebody is "
+                    "watching. What was marked stays marked; select the rest "
+                    "again when it is quiet.")
+                break
+            try:
+                with cursor() as cur:
+                    r = cur.execute("SELECT path FROM files WHERE id=?",
+                                    (fid,)).fetchone()
+                MARK_STATE["now"] = os.path.basename(r["path"]) if r else str(fid)
+            except Exception:                                    # noqa: BLE001
+                MARK_STATE["now"] = str(fid)
+            res = await asyncio.to_thread(mark_one, fid)
+            if res.get("ok"):
+                ok += 1
+            else:
+                failed += 1
+                # Kept per file rather than as one count, because "already has
+                # an English track" and "the file is in use" want different
+                # things done about them and a tally of 6 says neither.
+                if len(MARK_STATE["errors"]) < 40:
+                    MARK_STATE["errors"].append(
+                        {"file_id": fid,
+                         "name": MARK_STATE["now"],
+                         "why": res.get("why") or "failed"})
+            MARK_STATE.update(done=ok + failed, ok=ok, failed=failed)
+    finally:
+        MARK_STATE.update(running=False, now="", finished=time.time(),
+                          done=ok + failed, ok=ok, failed=failed)
+        if ok or failed:
+            joblog.log(
+                f"burned-in subtitles: marked {ok} file(s)"
+                + (f", {failed} could not be marked" if failed else "")
+                + (" - " + MARK_STATE["yielded"] if MARK_STATE["yielded"]
+                   else ""),
+                "warn" if failed else "ok")
+
+
+def mark_progress() -> dict:
+    d = dict(MARK_STATE)
+    el = (time.time() - d["t0"]) if (d["running"] and d["t0"]) else 0.0
+    rate = (d["done"] / el) if (el > 1 and d["done"]) else 0.0
+    d["elapsed"] = round(el, 1)
+    d["secs_each"] = round(1 / rate, 1) if rate else 0.0
+    d["eta"] = round((d["total"] - d["done"]) / rate) if rate else 0
+    # A finished batch is worth reading for a minute and then is noise.
+    if not d["running"] and d["finished"] and time.time() - d["finished"] > 180:
+        return {"running": False, "done": 0, "total": 0, "ok": 0, "failed": 0,
+                "errors": [], "yielded": "", "elapsed": 0.0, "eta": 0,
+                "secs_each": 0.0, "now": "", "finished": 0.0, "t0": 0.0}
+    return d
+
+
 # ------------------------------------------------------------- the sweep ----
 def untested() -> int:
     if not _READY:
