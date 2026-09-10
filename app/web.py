@@ -6781,6 +6781,7 @@ def api_subtitletitle(limit: int = 200):
             "total": len(rows), "fixable": d.get("fixable") or 0,
             "checked": d.get("checked") or 0, "took": d.get("took") or 0,
             "at": d.get("at") or 0, "mode": stt.mode(),
+            "sure_at": stt.sure_at(),
             "speech_lo": stt.SPEECH_LO, "speech_hi": stt.SPEECH_HI,
             "progress": stt.progress()}
 
@@ -6817,14 +6818,16 @@ async def api_subtitletitle_fix(file_id: int = 0, ids: str = "",
 
 
 @app.post("/api/subtitletitle/mode")
-async def api_subtitletitle_mode(mode: str):
-    """manual lists the lies; auto corrects the safe ones on the daily pass."""
+async def api_subtitletitle_mode(mode: str = "", sure_at: int = -1):
+    """manual lists the lies; auto corrects the sure, safe ones on the pass."""
     import yaml
     from .config import SETTINGS
     from . import subtitletitle as stt
     mode = (mode or "").strip().lower()
-    if mode not in ("auto", "manual"):
+    if mode and mode not in ("auto", "manual"):
         raise HTTPException(400, "mode must be auto or manual")
+    if not mode and sure_at < 0:
+        return {"ok": False, "why": "nothing to change"}
     p = _config_path()
     raw = {}
     if p.exists():
@@ -6832,16 +6835,25 @@ async def api_subtitletitle_mode(mode: str):
             raw = yaml.safe_load(p.read_text(encoding="utf-8-sig")) or {}
         except Exception:                                    # noqa: BLE001
             raw = {}
-    raw["subtitletitle_mode"] = mode
+    said = []
+    if mode:
+        raw["subtitletitle_mode"] = mode
+        SETTINGS.subtitletitle_mode = mode
+        said.append(mode)
+    if sure_at >= 0:
+        v = max(50, min(100, int(sure_at)))
+        raw["subtitletitle_sure_at"] = v
+        SETTINGS.subtitletitle_sure_at = v
+        said.append(f"sure at {v}%")
     p.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True),
                  encoding="utf-8")
-    SETTINGS.subtitletitle_mode = mode
-    joblog.log(f"subtitle title check set to {mode}"
-               + (" - titles that contradict their cue count are corrected on "
-                  "the daily pass, where nuarr can write a replacement without "
-                  "losing anything" if mode == "auto" else
+    joblog.log("subtitle title check: " + ", ".join(said)
+               + (f" - titles at or above {stt.sure_at()}% that nuarr can "
+                  f"rewrite without losing anything are corrected on the daily "
+                  f"pass; everything else waits for you"
+                  if stt.mode() == "auto" else
                   " - they are listed and wait for you"), "info")
-    return {"ok": True, "mode": stt.mode()}
+    return {"ok": True, "mode": stt.mode(), "sure_at": stt.sure_at()}
 
 
 @app.post("/api/hardsub/mode")
@@ -18102,7 +18114,38 @@ function panelBusy(id){
   const el = document.getElementById(id);
   if(!el) return false;
   const a = document.activeElement;
-  return !!(a && a !== document.body && el.contains(a));
+  if(!a || a === document.body || !el.contains(a)) return false;
+  // A CLICK IS NOT AN INTERACTION IN FLIGHT, and treating it as one broke
+  // Select all. Ticking the header box focuses it, the repaint that should
+  // have ticked all the others was then skipped as "busy", and the selection
+  // was set with nothing on screen to show for it - a control that looked
+  // dead while working perfectly.
+  //
+  // What must survive a repaint is an interaction the browser is still in the
+  // MIDDLE of: an open dropdown list, a half-typed number, a caret in a text
+  // box. A checkbox or a button has already finished by the time its handler
+  // runs, so there is nothing to protect.
+  const t = (a.tagName || '').toLowerCase();
+  if(t === 'button' || t === 'a') return false;
+  if(t === 'input'){
+    const ty = (a.type || 'text').toLowerCase();
+    if(ty === 'checkbox' || ty === 'radio' || ty === 'button'
+       || ty === 'submit') return false;
+  }
+  return true;
+}
+
+// AND THE OTHER HALF OF THE SAME IDEA: SOMEBODY IS READING IT.
+//
+// The lists are scroll boxes now, and a rebuild puts a scrolled box back at
+// the top. On a panel that repaints every 1.5 seconds while a sweep runs,
+// that means the list snaps back to row one while you are half way down it.
+// Same rule the errors drill has always had, and a PAUSE rather than a stop:
+// scroll back to the top and the panel picks up where it left off.
+function panelScrolled(id){
+  const el = document.getElementById(id);
+  if(!el) return false;
+  return [...el.querySelectorAll('.rowbox')].some(b => b.scrollTop > 8);
 }
 
 function askOpen(scope){
@@ -29764,6 +29807,16 @@ async function sttRefresh(btn){
   try{ await fetch('/api/subtitletitle/refresh',{method:'POST'}); }catch(e){}
   _stt=null; _sttKey=''; loadSubTitle();
 }
+function sttAtOrAbove(){
+  const at=(_stt&&_stt.sure_at)||70;
+  return (((_stt&&_stt.rows)||[])
+    .filter(r=>r.rewritable && (r.sure||0)>=at)).length;
+}
+async function sttLine(v){
+  try{ await fetch('/api/subtitletitle/mode?sure_at='+encodeURIComponent(v),
+                   {method:'POST'}); }catch(e){}
+  _sttKey=''; loadSubTitle();
+}
 async function sttFixOne(fid, btn){
   askInline(btn, 'Rewrite this track title in place? mkvpropedit changes the '
     +'header only - the video, the audio and the subtitle cues are untouched.',
@@ -29807,7 +29860,7 @@ function sttPaint(){
         auto:'The safe ones are corrected on the daily pass. Titles carrying a group name are still only reported, because a replacement would lose what the group wrote.',
         manual:'Everything is listed and waits for your click. The Attention tile carries the count.'})}
       <button class="rmb" onclick="sttRefresh(this)">Read again</button></span>`;
-  const note=`<div class="dim" style="font-size:11px;margin:3px 0 6px">
+  const note=`<div class="dim" style="font-size:11px;margin:3px 0 4px">
     A subtitle title is a claim about what the track contains, and Matroska
     already records how many cues it has. "Signs only" over ${d.speech_lo||8}
     to ${d.speech_hi||45} cues a minute is a claim contradicted by the file
@@ -29815,6 +29868,23 @@ function sttPaint(){
     animated typesetting rather than speech, so it is left alone. Nothing is
     re-probed and nothing is re-encoded: the check costs a query and the
     correction is a header edit.</div>`;
+  // ONE LINE, NOT TWO. The other panel has a mark line and a dismiss line
+  // because it can act in both directions; this one can only ever correct a
+  // title, so there is nothing to throw away and nothing to set a floor for.
+  const band = `<div style="display:flex;gap:10px;align-items:center;
+        flex-wrap:wrap;font-size:11px;margin:2px 0 6px">
+      <span class="dim">Sure enough to correct on its own</span>
+      <input type="number" min="50" max="100" step="5" value="${d.sure_at||70}"
+        style="width:62px" onchange="sttLine(this.value)">
+      <span class="dim">%</span>
+      <span class="dim" style="margin-left:8px"
+        title="How far inside the band where people talk the track's cue rate sits. Auto only rewrites titles at or above this, and only ones carrying nothing nuarr cannot regenerate - so a borderline reading and a fansub group's name are both left for you.">
+        ${fmt(sttAtOrAbove())} at or above it${d.mode==='auto'
+          ?' — corrected on the daily pass'
+          :' — nothing is acted on while this says manual'}</span>
+      ${d.auto_fixed?`<span style="color:var(--ok)">last pass corrected ${
+        fmt(d.auto_fixed)}</span>`:''}
+    </div>`;
   const pick=sttRows(), nsel=sttSelIds().length;
   const allOn = pick.length>0 && nsel===pick.length;
   const selBar = nsel ? `
@@ -29828,16 +29898,16 @@ function sttPaint(){
     </div>` : '';
   const table = shown.length ? `${selBar}<div class="rowbox scrollbox">
       <table style="width:100%;font-size:11.5px">
-      <colgroup><col style="width:26px"><col style="width:30%"><col style="width:8%">
-        <col style="width:52px"><col style="width:15%"><col style="width:14%">
+      <colgroup><col style="width:22px"><col style="width:30%"><col style="width:8%">
+        <col style="width:58px"><col style="width:15%"><col style="width:14%">
         <col style="width:132px"><col style="width:92px"></colgroup>
       <thead><tr class="dim" style="font-size:10.5px;text-align:left">
-        <th style="padding:3px 4px 4px 0">
+        <th style="padding:3px 0 4px 2px">
           <input type="checkbox" ${allOn?'checked':''}
             title="Select every title nuarr can rewrite"
             onclick="sttSelAll(this.checked)"></th>
-        <th style="padding:3px 8px 4px 0">episode</th><th>library</th>
-        <th style="text-align:right;padding-right:8px"
+        <th style="padding:3px 8px 4px 2px">episode</th><th>library</th>
+        <th style="text-align:right;padding-right:14px"
           title="How far inside the band where people talk this track's cue rate sits. A track squarely in the middle of that band is unarguable; one on either edge could be a long sparse track or a busy sign sheet.">sure</th>
         <th>says</th><th>would become</th>
         <th style="text-align:right;padding-right:10px">measured</th>
@@ -29846,19 +29916,20 @@ function sttPaint(){
       <tbody>${shown.slice(0,400).map(r=>{
         const on=_sttSel.has(r.file_id);
         return `<tr${on?' style="background:rgba(88,166,255,.06)"':''}>
-        <td style="padding:3px 4px 3px 0">${r.rewritable?
+        <td style="padding:3px 0 3px 2px">${r.rewritable?
           `<input type="checkbox" ${on?'checked':''}
              onclick="sttToggle(${r.file_id}, event)">`:''}</td>
-        <td style="padding:3px 8px 3px 0" title="${esc(r.path||'')}"
+        <td style="padding:3px 8px 3px 2px" title="${esc(r.path||'')}"
           >${esc(r.label||r.title||String(r.path||'').split('\\').pop())}
           <div class="dim" style="font-size:10px;overflow:hidden;
                text-overflow:ellipsis;white-space:nowrap"
             >${esc(String(r.path||'').split('\\').pop())}</div></td>
         <td class="dim" style="padding:3px 8px 3px 0">${esc(r.library||'')}</td>
-        <td class="mono" style="padding:3px 8px 3px 0;text-align:right;color:${
+        <td class="mono" style="padding:3px 14px 3px 0;text-align:right;
+            font-variant-numeric:tabular-nums;color:${
           (r.sure||0)>=75?'var(--bad)':(r.sure||0)>=55?'var(--warn)':'var(--dim)'}"
           title="${esc(r.why||'')}">${r.sure===undefined?'':r.sure+'%'}</td>
-        <td class="mono" style="padding:3px 8px 3px 0;color:var(--warn)"
+        <td class="mono" style="padding:3px 8px 3px 4px;color:var(--warn)"
           >${esc(r.old||'')}<div class="dim" style="font-size:10px">s:${r.track}</div></td>
         <td class="mono" style="padding:3px 8px 3px 0;color:${
           r.rewritable?'var(--ok)':'var(--dim)'}"
@@ -29880,17 +29951,23 @@ function sttPaint(){
     : `<div class="dim" style="font-size:11.5px;padding:8px 0">${
         d.total?'Nothing here nuarr can rewrite safely.'
                :'Every subtitle title agrees with the track behind it.'}</div>`;
+  // THE BUTTON SAYS WHAT IT WILL DO, NOT WHAT IT COULD. Once boxes are
+  // ticked, "Correct all 82" is a button offering to do something other than
+  // what the ticks describe - and the two are one click apart.
   const foot=`<div style="display:flex;gap:12px;align-items:center;
       flex-wrap:wrap;font-size:11px;margin-top:6px" class="askhost">
-    ${d.fixable?`<button class="rmb" onclick="sttFixAll(this)">Correct all ${
-      fmt(d.fixable)}</button>`:''}
+    ${nsel?`<button class="rmb" onclick="sttFixMany(this)">Correct the ${
+      fmt(nsel)} ticked</button>`
+      :(d.fixable?`<button class="rmb" onclick="sttFixAll(this)">Correct all ${
+      fmt(d.fixable)}</button>`:'')}
     ${(d.total>d.fixable)?`<a href="#" style="font-size:11px"
       onclick="_sttAll=${_sttAll?'false':'true'};_sttKey='';sttPaint();return false"
       >${_sttAll?'only the ones that can be rewritten'
                 :`also show the ${fmt(d.total-d.fixable)} left alone`}</a>`:''}
   </div>`;
-  const html=`<div class="lkind" style="padding:11px 12px">${head}${note}${table}${foot}</div>`;
-  if(askOpen('sttPanel') || panelBusy('sttPanel')) return;
+  const html=`<div class="lkind" style="padding:11px 12px">${head}${note}${band}${table}${foot}</div>`;
+  if(askOpen('sttPanel') || panelBusy('sttPanel')
+     || panelScrolled('sttPanel')) return;
   if(html===_sttKey) return;
   _sttKey=html; el.innerHTML=html;
 }
@@ -30180,7 +30257,7 @@ function hsPaint(){
         ${mk.running?'disabled title="a batch is already running"':''}
         >Mark ${fmt(nsel)} as burned in</button>
       <button class="rmb" onclick="hsIgnoreMany(this)"
-        >Not subtitles</button>
+        >Not subtitles — ${fmt(nsel)}</button>
       <select class="kindsel" onchange="hsBatchKind(this.value)"
         title="Leave this alone and every file keeps whatever its own row says it is. Pick one and all of them are recorded as that - for a whole season the detector read the same way and got wrong.">
         <option value=""${_hsBatchKind?'':' selected'}>keep each row's kind</option>
@@ -30195,11 +30272,11 @@ function hsPaint(){
 
   const table = rows.length ? `${markBar}${selBar}
       <div class="rowbox scrollbox"><table style="width:100%;font-size:11.5px">
-      <colgroup><col style="width:26px"><col style="width:35%"><col style="width:10%">
-        <col style="width:10%"><col style="width:52px"><col style="width:21%">
+      <colgroup><col style="width:22px"><col style="width:34%"><col style="width:10%">
+        <col style="width:11%"><col style="width:58px"><col style="width:21%">
         <col style="width:14%"></colgroup>
       <thead>
-      <tr><th style="padding:2px 4px 2px 0;text-align:left">
+      <tr><th style="padding:2px 0 2px 2px;text-align:left">
           <input type="checkbox" ${allOn?'checked':''}
             title="Select every finding shown"
             onclick="hsSelAll(this.checked)"></th>
@@ -30215,21 +30292,21 @@ function hsPaint(){
            things you have to work out; the other panel names its columns and
            this one should read the same way. -->
       <tr class="dim" style="font-size:10.5px;text-align:left">
-        <th></th><th style="padding:1px 8px 4px 0">episode</th><th>library</th>
+        <th></th><th style="padding:1px 8px 4px 2px">episode</th><th>library</th>
         <th title="What the sampler read, and what you say it is. The picker outranks the reading, and what it is set to is what Mark it records.">what it carries</th>
-        <th style="text-align:right;padding-right:8px"
+        <th style="text-align:right;padding-right:14px"
           title="How sure the reading is, from the shape of what the OCR came back with. Above the mark line it would be marked on its own; below the dismiss line it would be thrown away; in between is yours to call.">sure</th>
-        <th>read from the picture</th>
+        <th style="padding-left:4px">read from the picture</th>
         <th style="text-align:right;padding-right:2px">answer</th>
       </tr></thead>
       <tbody>${rows.map(r=>{
         const [word,col]=HSW[r.state]||[r.state,'var(--dim)'];
         const on=_hsSel.has(r.file_id);
         return `<tr${on?' style="background:rgba(88,166,255,.06)"':''}>
-        <td style="padding:3px 4px 3px 0">${r.marked?'':
+        <td style="padding:3px 0 3px 2px">${r.marked?'':
           `<input type="checkbox" ${on?'checked':''}
              onclick="hsToggle(${r.file_id}, event)">`}</td>
-        <td style="padding:3px 8px 3px 0" title="${esc(String(r.path||''))}"
+        <td style="padding:3px 8px 3px 2px" title="${esc(String(r.path||''))}"
           >${esc(r.label||String(r.path||'').split('\\').pop())}
           <div class="dim" style="font-size:10px;overflow:hidden;
                text-overflow:ellipsis;white-space:nowrap"
@@ -30251,7 +30328,7 @@ function hsPaint(){
           ${r.chosen?'<div class="dim" style="font-size:9.5px">set by hand</div>'
                     :`<div style="font-size:9.5px;color:${col}">read as ${esc(word)}</div>`}
         </td>
-        <td class="mono" style="padding:3px 8px 3px 0;text-align:right;
+        <td class="mono" style="padding:3px 14px 3px 0;text-align:right;
             font-variant-numeric:tabular-nums;color:${hsScoreColor(r)}"
             title="${esc((r.why||'')+' — '+(r.auto_why||''))}"
           >${r.score===undefined?'':r.score+'%'}</td>
@@ -30273,7 +30350,8 @@ function hsPaint(){
   // The same rule the errors drill follows: while a run is going this panel
   // repaints every 1.5s, and a rebuild would take the question with it - or
   // the dropdown that was open, or the number half-typed into a threshold.
-  if(askOpen('hsPanel') || panelBusy('hsPanel')) return;
+  if(askOpen('hsPanel') || panelBusy('hsPanel')
+     || panelScrolled('hsPanel')) return;
   if(html===_hsKey) return;
   _hsKey=html; el.innerHTML=html;
   // WHILE IT RUNS, KEEP ASKING. A progress bar that only moves when somebody

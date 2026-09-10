@@ -138,6 +138,22 @@ def mode() -> str:
     return m if m in ("manual", "auto") else "manual"
 
 
+def sure_at() -> int:
+    """The line auto will not act below.
+
+    AUTO THAT ACTS ON EVERYTHING IT FOUND IS NOT A MODE, IT IS A DARE. The
+    findings run from 55% - a "Signs/Songs" track at 8.2 cues a minute, right
+    on the lower edge of the speech band, which could genuinely be a dense
+    sign sheet - up to the unarguable ones in the middle of the band. Only
+    the second kind belongs to a machine.
+    """
+    try:
+        return max(50, min(100, int(getattr(SETTINGS,
+                                            "subtitletitle_sure_at", 70))))
+    except Exception:                                            # noqa: BLE001
+        return 70
+
+
 def _dur_s(t: str) -> float:
     m = _DUR.match(t or "")
     if not m:
@@ -284,6 +300,22 @@ def scan(limit: int = 0) -> dict:
             "took": round(_CACHE["t1"] - _CACHE["t0"], 1),
             "fixable": sum(1 for r in rows if r["rewritable"])}
     _CACHE.update(at=time.time(), data=data)
+    if mode() == "auto":
+        # ONLY THE SURE ONES, AND ONLY THE SAFE ONES. Two filters, and they
+        # are about different things: `rewritable` is whether a replacement
+        # can be written without losing what a group put there, `sure` is
+        # whether the finding is right at all.
+        want = [r for r in rows
+                if r.get("rewritable") and r.get("sure", 0) >= sure_at()]
+        if want:
+            out = fix(want)
+            data["auto_fixed"] = out.get("fixed") or 0
+            joblog.log(f"subtitle titles: corrected {out.get('fixed') or 0} "
+                       f"title(s) on its own - at or above the {sure_at()}% "
+                       f"line", "info")
+            # fix() invalidates the cache; re-read so the page sees the result
+            # rather than the findings that have just been corrected.
+            _CACHE.update(at=time.time(), data=data)
     return data
 
 

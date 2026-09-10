@@ -395,6 +395,10 @@ class Settings:
     # probe and compares it against what the track's title claims. "auto"
     # corrects the safe ones on the daily pass; manual lists them and waits.
     subtitletitle_mode: str = "manual"
+    # How sure the cue rate has to be before auto rewrites a title by itself.
+    # The same shape as hardsub_mark_at, and for the same reason: "auto" that
+    # acts on everything it found is not a mode, it is a dare.
+    subtitletitle_sure_at: int = 70
     hardsub_mark_at: int = 85
     hardsub_dismiss_at: int = 30
     # How many unmeasured picture-subtitle files one "Check now" pass reads.
