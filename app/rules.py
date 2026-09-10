@@ -363,6 +363,46 @@ SDH_TITLE_RE = re.compile(
     r"closed\s*caption|\bcc\b|\bsdh\b|hearing[\s-]*impaired|\bhi\b", re.I)
 
 
+# AND THE TRACKS THAT SAY, IN WORDS, THAT THEY ARE THE MAIN ONE.
+#
+# BLUE LOCK S02E11 is the case. Its first English track carries the release's
+# forced flag and is titled "English" - and the shape reader counted 615 plain
+# dialogue lines in a single Default style inside it. It is the full script.
+# The flag is the release being careless, which is the whole reason
+# autoShowForcedOnly exists, and the picker was taking the flag at its word:
+# full English dialogue set to appear by itself over English speech.
+#
+# A title that names the language and nothing else - "English", "English
+# Subtitles", "Full Subtitles", "Dialogue" - is the track telling you what it
+# is. That beats a flag, the same way a "Signs & Songs" title beats one. An
+# untitled track with the forced flag is still trusted: no claim, no conflict.
+_LANG_WORD = (r"english|japanese|spanish|french|german|italian|portuguese"
+              r"|russian|chinese|korean|dutch|polish|swedish|norwegian"
+              r"|danish|finnish|turkish|arabic|hindi|thai|vietnamese"
+              r"|indonesian|hebrew|czech|hungarian|greek|ukrainian"
+              r"|romanian|catalan")
+FULL_TITLE_RE = re.compile(
+    r"^\s*(?:"
+    r"full(?:\s+sub(?:title)?s?)?"
+    r"|dialogue(?:\s+sub(?:title)?s?)?"
+    r"|sub(?:title)?s?"
+    r"|(?:" + _LANG_WORD + r")(?:\s+(?:full|dialogue|sub(?:title)?s?))*"
+    r")\s*$", re.I)
+
+
+def is_full_title(title: str) -> bool:
+    """Does this title say, in words, that the track is the main subtitle?
+
+    THE GROUP TAG IS NOT PART OF THE CLAIM. Half this library is titled
+    "Full Subtitles [Crunchyroll]" or "Full Subtitles [sam]" - the bracket
+    says who made it, the words before it say what it is. Stripped before the
+    test, so a release that signs its work is read the same as one that does
+    not.
+    """
+    t = re.sub(r"[\[({][^\[({]*[\])}]\s*$", "", (title or "").strip()).strip()
+    return bool(FULL_TITLE_RE.match(t))
+
+
 def is_signs_title(title: str) -> bool:
     """Signs, songs, forced lines - and never a caption track wearing the word."""
     t = title or ""
@@ -2294,8 +2334,11 @@ def decide(probe: dict, *, anime: bool = False, filename: str = "",
         # What the track IS decides, and only then where it sits.
         #
         #   2  its title says signs or songs, and does not say caption
-        #   1  it carries the release's forced flag and is not a CC/SDH track
+        #   1  it carries the release's forced flag, is not a CC/SDH track,
+        #      and does not name itself as the full dialogue track
         #   -  a CC/SDH track is never the one shown by itself, flagged or not
+        #   -  nor is a track titled "English" or "Full Subtitles", whatever
+        #      flag the release put on it
         prefer_signs = _sr("prefer_signs_over_forced")
         forced_pick, best = None, 0
         for i in p.keep_subs:
@@ -2312,7 +2355,7 @@ def decide(probe: dict, *, anime: bool = False, filename: str = "",
             rank = 0
             if is_signs_title(title):
                 rank = 2 if prefer_signs else 1
-            elif _disp(s, "forced"):
+            elif _disp(s, "forced") and not is_full_title(title):
                 rank = 1
             if rank > best:
                 best, forced_pick = rank, i
