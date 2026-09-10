@@ -29983,7 +29983,10 @@ function alpPaint(){
 // text track - and what it carries; the answer column is whatever that calls
 // for: a marker track for a picture, a new title for a track.
 let _sk=null, _skKey='', _skPoll=null, _skMark=null, _skMarkPoll=null;
-let _skSel=new Set(), _skLast=null, _skShowDone=false, _skShowUnread=true;
+// UNREAD IS HIDDEN BY DEFAULT, like the marked ones and for the same reason:
+// nothing can be pressed on a row whose events have not been read, so it is
+// not a question yet. The count and the way back are in the footer.
+let _skSel=new Set(), _skLast=null, _skShowDone=false, _skShowUnread=false;
 let _skBatchKind='';
 // WHICH ROWS ARE OPEN. The evidence a row rests on - forty OCR words, or the
 // style-by-style shape of a track - is worth reading and far too wide for a
