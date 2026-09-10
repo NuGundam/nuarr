@@ -459,8 +459,15 @@ def candidates(limit: int = 200, force: bool = False,
             f" WHERE library IN ({qs}) "
             f"   AND state NOT IN ('deleted','duplicate') "
             f"   AND COALESCE(path,'') != '' "
+            # NO CAP. This said LIMIT 20000 back when that was the whole
+            # library; it is 39,753 now, so the walk stopped at id 25,979 and
+            # everything imported after that was invisible - not "not yet
+            # done", INVISIBLE, because the sweep reads the same list. The
+            # newest half of the library would never have had a sidecar taken.
+            # The caller's own limit bounds the RESULT; this bounded the
+            # search, which is not the same thing and was never meant to.
             f"   AND COALESCE(mtime,0) < ? "
-            f" ORDER BY id LIMIT 20000", libs + [cutoff])]
+            f" ORDER BY id", libs + [cutoff])]
     out = []
     total = len(rows)
     for i, r in enumerate(rows, 1):
