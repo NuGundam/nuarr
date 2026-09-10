@@ -267,6 +267,15 @@ def findings(limit: int = 600) -> dict:
 
 
 # ------------------------------------------------------------- the actions --
+def _rescan() -> None:
+    """Re-read the track findings now, waiting for the answer."""
+    from . import subtitletitle as stt
+    try:
+        stt.refresh()
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
 def _split(source: str) -> tuple[bool, int]:
     if source == PICTURE:
         return True, 0
@@ -289,8 +298,16 @@ def dismiss(file_id: int, source: str) -> dict:
     almost always is."""
     from . import hardsub, subtitletitle as stt
     pic, track = _split(source)
-    return (hardsub.ignore(int(file_id)) if pic
-            else stt.set_kind(int(file_id), track, stt.SIGNS))
+    if pic:
+        return hardsub.ignore(int(file_id))
+    out = stt.set_kind(int(file_id), track, stt.SIGNS)
+    # THE ANSWER MUST BE TRUE BY THE TIME THIS RETURNS. cached() serves the
+    # last scan and rescans behind the request, which is right for a page
+    # load and wrong for the moment after a write: the page would come back
+    # showing the row you just answered, and drop it ten seconds later when
+    # the background scan landed. A person's click is worth the scan.
+    _rescan()
+    return out
 
 
 def act(file_id: int, source: str, kind: str = "") -> dict:
@@ -308,6 +325,7 @@ def act(file_id: int, source: str, kind: str = "") -> dict:
     if not rows:
         return {"ok": False, "why": "nothing to rewrite on that track"}
     out = stt.fix(rows)
+    _rescan()                       # see dismiss(): true before it returns
     return {"ok": bool(out.get("fixed")), "why":
             f"corrected {out.get('fixed') or 0}" if out.get("fixed")
             else (out.get("failures") or [{}])[0].get("why", "failed")}
@@ -339,6 +357,7 @@ async def act_many(items: list, kind: str = "", force: bool = False) -> dict:
                 and r.get("rewritable")]
         fixed = stt.fix(rows) if rows else {"fixed": 0}
         out["tracks"] = fixed.get("fixed") or 0
+        await asyncio.to_thread(_rescan)
     bits = []
     if out["pictures"]:
         bits.append(f"marking {out['pictures']} picture"
@@ -362,6 +381,8 @@ def dismiss_many(items: list) -> dict:
         f, t = int(i["file_id"]), _split(i["source"])[1]
         if stt.set_kind(f, t, stt.SIGNS).get("ok"):
             n += 1
+    if any(i.get("source") != PICTURE for i in items):
+        _rescan()
     why = f"dismissed {n} finding" + ("" if n == 1 else "s")
     if r.get("quiet"):
         why += (f" - and {len(r['quiet'])} show"

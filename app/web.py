@@ -29995,6 +29995,20 @@ let _skBatchKind='';
 // cell. So the cell shows a clipped line and the row opens under itself with
 // the whole thing wrapped, like the activity list.
 let _skOpen=new Set();
+// ROWS THIS PAGE HAS ALREADY ANSWERED. Belt to the server's braces: an answer
+// is written and the list re-read before the endpoint replies, so a reload
+// should not carry the row back - but a poll already in flight when you
+// pressed can, and a row that reappears for one repaint and then leaves again
+// is worse than one that never left. Held for a minute, which is longer than
+// any pass takes to catch up.
+let _skDone=new Map();
+function skAnswered(id){ _skDone.set(id, Date.now()); }
+function skIsAnswered(id){
+  const t=_skDone.get(id);
+  if(!t) return false;
+  if(Date.now()-t > 60000){ _skDone.delete(id); return false; }
+  return true;
+}
 // HOW THE LIST IS ORDERED. Least certain first is the right default - it puts
 // the calls only a person can make at the top - but it is not the only
 // question anyone asks of this list. "What arrived today" is the other one,
@@ -30143,6 +30157,7 @@ function skActWord(r, n){
 // closes over the gap, then reload - by which time the answer is off the
 // server's list too and the reload has nothing to undo.
 function skGoneMany(ids, word, ok=true){
+  if(ok) ids.forEach(skAnswered);
   const el=document.getElementById('skPanel'); if(!el) return;
   const rows=[...el.querySelectorAll('.sktbl tbody tr')]
     .filter(tr=>ids.some(id=>(tr.innerHTML||'').includes(`'${id}'`)));
@@ -30156,18 +30171,20 @@ function skGoneMany(ids, word, ok=true){
   setTimeout(()=>{ _skKey=''; loadSubKind(); }, 1100 + rows.length*35);
 }
 
-function skGone(el, word, ok=true){
+function skGone(el, word, ok=true, rowId=''){
+  if(ok && rowId) skAnswered(rowId);
   const tr = el && el.closest ? el.closest('tr') : null;
   if(!tr){ setTimeout(()=>{ _skKey=''; loadSubKind(); }, 900); return; }
-  const id = tr.nextElementSibling &&
-             String(tr.nextElementSibling.id||'').startsWith('skdet-')
-             ? tr.nextElementSibling : null;
+  // The open detail row, if this row has one - it leaves with its parent.
+  const det = tr.nextElementSibling &&
+              String(tr.nextElementSibling.id||'').startsWith('skdet-')
+              ? tr.nextElementSibling : null;
   const cell = tr.lastElementChild;
   if(cell) cell.innerHTML = `<span class="skword">${esc(word)}</span>`;
-  [tr, id].forEach(x=>{ if(x){ x.classList.add('skgone'); if(!ok) x.classList.add('skfail'); } });
-  setTimeout(()=>{ [tr, id].forEach(x=>{ if(x) x.classList.add('skshut'); }); }, 800);
+  [tr, det].forEach(x=>{ if(x){ x.classList.add('skgone'); if(!ok) x.classList.add('skfail'); } });
+  setTimeout(()=>{ [tr, det].forEach(x=>{ if(x) x.classList.add('skshut'); }); }, 800);
   setTimeout(()=>{
-    [tr, id].forEach(x=>{ if(x && x.parentNode) x.parentNode.removeChild(x); });
+    [tr, det].forEach(x=>{ if(x && x.parentNode) x.parentNode.removeChild(x); });
     // The row is gone from the page; catch the page up with the server.
     _skKey=''; loadSubKind();
   }, 1120);
@@ -30187,7 +30204,7 @@ async function skAct(id, btn){
     async ()=>{
       const x=await (await fetch(`/api/subkind/act?confirm=yes&file_id=${fid}&source=${
         encodeURIComponent(src)}`,{method:'POST'})).json();
-      if(x.ok) skGone(btn, pic?'marked':'title corrected');
+      if(x.ok) skGone(btn, pic?'marked':'title corrected', true, id);
       else setTimeout(()=>{ _skKey=''; loadSubKind(); }, 1500);
       return x.ok ? {ok:true, why: pic?'marked':(x.why||'corrected')} : x;
     });
@@ -30201,7 +30218,7 @@ async function skDismiss(id, btn){
   try{ x=await (await fetch(`/api/subkind/dismiss?file_id=${fid}&source=${
       encodeURIComponent(src)}`,{method:'POST'})).json(); }
   catch(e){ x={ok:false, why:String(e)}; }
-  if(x.ok) skGone(btn, src==='picture'?'not a subtitle':'recorded as signs');
+  if(x.ok) skGone(btn, src==='picture'?'not a subtitle':'recorded as signs', true, id);
   else {
     if(btn) btn.textContent='failed';
     setTimeout(()=>{ _skKey=''; loadSubKind(); }, 1200);
@@ -30293,7 +30310,8 @@ function skPaint(force){
   // it: the history strip above reads it too, and a `const` further down is a
   // ReferenceError, not a hoist.
   const A=d.auto||{};
-  const rows=all.filter(r=>(_skShowDone||!r.done)&&(_skShowUnread||!r.unread))
+  const rows=all.filter(r=>(_skShowDone||!r.done)&&(_skShowUnread||!r.unread)
+                        && !skIsAnswered(r.id))
                 .sort(skCmp);
   const hiddenDone=_skShowDone?0:all.filter(r=>r.done).length;
   const hiddenUnread=_skShowUnread?0:all.filter(r=>r.unread).length;
