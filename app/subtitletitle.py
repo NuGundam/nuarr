@@ -337,6 +337,14 @@ def _inspect_init() -> None:
                 detail   TEXT,
                 PRIMARY KEY (file_id, track)
             )""")
+        # plain: the count above. chosen: what a person said the track is,
+        # which outranks the reading for good - the same column and the same
+        # reason the hardsub table has one.
+        for col, decl in (("plain", "INTEGER"), ("chosen", "TEXT")):
+            try:
+                cur.execute(f"ALTER TABLE subtitle_shape ADD COLUMN {col} {decl}")
+            except Exception:                                    # noqa: BLE001
+                pass
 
 
 def _read_events(path: str, mkv_track_id: int) -> dict | None:
@@ -369,28 +377,60 @@ def _read_events(path: str, mkv_track_id: int) -> dict | None:
     if not lines:
         # SRT and VTT have no styles and no positioning, so there is nothing
         # here to learn - and nothing to contradict the rate with either.
-        return {"events": 0, "styles": 0, "pos_pct": 0.0, "signish": 0,
-                "detail": "not a styled subtitle, so only the cue rate applies"}
+        # An SRT has no styles and no positioning - every cue is a plain
+        # line, which is exactly what makes an SRT a dialogue format. The
+        # cue count IS the plain count.
+        srt_n = len(re.findall(r"^\d+\s*$", text, re.M))
+        return {"events": srt_n, "styles": 1 if srt_n else 0, "plain": srt_n,
+                "pos_pct": 0.0, "signish": 0,
+                "detail": (f"{srt_n} plain cues, no styling - a text format "
+                           f"that can only be dialogue" if srt_n
+                           else "nothing readable came back")}
+    # THE LINE THAT SEPARATES THEM, MEASURED. Five tracks, read in full:
+    #
+    #   BLUE LOCK  'Forced (Signs only)'  466 events  Default=286 Italics=152
+    #                                     394 plain lines in non-sign styles
+    #   BLUE LOCK  'Dubtitle (SDH)'       615 events  Default=615
+    #                                     615 plain lines
+    #   Grace      'Signs & Songs'        192 events  neo sign / neo op / neo ed
+    #                                     0 plain lines in non-sign styles
+    #   Grace      'Dialogue'             486 events  neo default=294 + the same
+    #                                     294 plain lines   signs/op/ed styles
+    #
+    # Dialogue is lines left where the style puts them, in a style called
+    # Default or Main or Italics. Signs are lines placed by \pos in a style
+    # called sign or op or ed. So the count that matters is PLAIN LINES IN
+    # NON-SIGN STYLES, and a sign sheet has none of them however many events
+    # it carries. Style COUNT does not separate them - BLUE LOCK's dialogue
+    # runs across five styles (Default, Italics, Top, Flashback/Overlap) and
+    # calling that "a typesetter's palette" was the mistake that cleared it.
     styles: dict = {}
-    positioned = 0
+    positioned = plain = 0
     for ln in lines:
         parts = ln.split(",", 9)
         if len(parts) < 10:
             continue
-        styles[parts[3].strip()] = styles.get(parts[3].strip(), 0) + 1
+        st = parts[3].strip()
+        styles[st] = styles.get(st, 0) + 1
         if _POSITIONED.search(parts[9]):
             positioned += 1
+        elif not _STYLE_SIGN.search(st or ""):
+            plain += 1
     n = max(1, len(lines))
     named = sorted(s for s in styles if _STYLE_SIGN.search(s or ""))
+    top = max(styles.items(), key=lambda kv: kv[1]) if styles else ("", 0)
     share = positioned / n
-    bits = []
+    dstyles = len(styles) - len(named)
+    bits = [("no plain dialogue lines" if not plain else
+             f"{plain} plain dialogue line{'' if plain == 1 else 's'} in "
+             f"{dstyles} style{'' if dstyles == 1 else 's'}")]
+    if top[0]:
+        bits.append(f"{top[0]!r} holds {top[1]/n*100:.0f}%")
     if named:
-        bits.append("styles called " + ", ".join(f"{s!r}" for s in named[:3]))
+        bits.append("sign styles " + ", ".join(f"{s!r}" for s in named[:3]))
     if share:
         bits.append(f"{share*100:.0f}% positioned with \\pos or \\move")
-    if len(styles) >= MANY_STYLES:
-        bits.append(f"{len(styles)} different styles")
-    return {"events": len(lines), "styles": len(styles),
+    return {"events": len(lines), "styles": len(styles), "plain": plain,
             "pos_pct": round(share * 100, 1), "signish": len(named),
             "detail": "; ".join(bits)}
 
@@ -404,7 +444,9 @@ def shape_of(file_id: int, path: str, track: int, size: int,
             r = cur.execute(
                 "SELECT * FROM subtitle_shape WHERE file_id=? AND track=? "
                 "  AND size=?", (int(file_id), int(track), int(size))).fetchone()
-        if r:
+        # A row read before `plain` existed is a row that has to be read
+        # again - it cannot answer the question that now decides everything.
+        if r and r["plain"] is not None:
             return dict(r)
     except Exception:                                            # noqa: BLE001
         return None
@@ -415,14 +457,16 @@ def shape_of(file_id: int, path: str, track: int, size: int,
         with cursor() as cur:
             cur.execute(
                 "INSERT INTO subtitle_shape(file_id,track,size,at,events,"
-                "  styles,pos_pct,signish,detail) VALUES(?,?,?,?,?,?,?,?,?) "
+                "  styles,pos_pct,signish,detail,plain) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(file_id,track) DO UPDATE SET size=excluded.size, "
                 "  at=excluded.at, events=excluded.events, "
                 "  styles=excluded.styles, pos_pct=excluded.pos_pct, "
-                "  signish=excluded.signish, detail=excluded.detail",
+                "  signish=excluded.signish, detail=excluded.detail, "
+                "  plain=excluded.plain",
                 (int(file_id), int(track), int(size), time.time(),
                  got["events"], got["styles"], got["pos_pct"], got["signish"],
-                 got["detail"][:300]))
+                 got["detail"][:300], got.get("plain") or 0))
     except Exception:                                            # noqa: BLE001
         pass
     return got
@@ -536,6 +580,11 @@ async def inspect_paced(limit: int = PER_RUN, force: bool = False) -> dict:
             if _is_really_signs(sh):
                 cleared += 1
                 INSPECT_STATE["cleared"] = cleared
+            # LET THE PAGE SEE IT AS IT GOES. The scan is a query and costs
+            # under a second; re-judging every few reads is what turns "40 not
+            # read yet" into a number that visibly falls while you watch.
+            if read % 5 == 0:
+                _CACHE["at"] = 0.0
     finally:
         took = max(0.001, time.time() - t0)
         prev = INSPECT_STATE.get("secs_each") or 0.0
@@ -609,13 +658,87 @@ def inspect_some(limit: int = INSPECT_PER_SCAN) -> dict:
     return {"ok": True, "read": len(rows), "cleared": cleared}
 
 
+# THE SAME FOUR WORDS THE HARDSUB CHECK USES, because they are answering the
+# same question about a different source: what kind of subtitle is this?
+DIALOGUE, HYBRID, SIGNS, NONE = "dialogue", "hybrid", "signs", "none"
+KINDS = (DIALOGUE, HYBRID, SIGNS, NONE)
+KIND_WORDS = {DIALOGUE: "dialogue", HYBRID: "dialogue + signs",
+              SIGNS: "signs or songs", NONE: "empty"}
+# Below this many plain dialogue lines a minute, a "signs" title is telling
+# the truth. Measured: every genuine signs track read so far sits at zero.
+SIGNS_MAX = 2.0
+
+
+def kind_of(sh: dict, minutes: float) -> dict:
+    r"""What this track carries, and how sure, from its shape.
+
+    THE DIALOGUE RATE IS THE WHOLE TEST. Plain lines in non-sign styles per
+    minute: signs tracks have none, dialogue tracks run at the speech band,
+    and a track carrying both is dialogue with sign styles beside it. The
+    score is how far inside the speech band that rate sits - the same idea
+    the cue rate used, on the number that actually means something.
+    """
+    if not sh:
+        return {"kind": "", "rate": 0.0, "score": 0, "why": "not read yet"}
+    if sh.get("chosen"):
+        return {"kind": sh["chosen"], "rate": 0.0, "score": 100,
+                "why": f"set by hand to {KIND_WORDS.get(sh['chosen'], sh['chosen'])}",
+                "chosen": True}
+    plain = int(sh.get("plain") or 0)
+    mins = max(1.0, float(minutes or 0))
+    rate = plain / mins
+    if not sh.get("events"):
+        return {"kind": NONE, "rate": 0.0, "score": 100,
+                "why": "no events at all"}
+    if rate <= SIGNS_MAX:
+        # Sure in proportion to how empty of dialogue it is.
+        score = int(round(100 - (rate / SIGNS_MAX) * 40))
+        return {"kind": SIGNS, "rate": round(rate, 1), "score": score,
+                "why": (f"{plain} plain dialogue line{'' if plain == 1 else 's'} "
+                        f"over {mins:.0f} minutes - a sign sheet")}
+    mid = (SPEECH_LO + SPEECH_HI) / 2.0
+    half = (SPEECH_HI - SPEECH_LO) / 2.0
+    if rate < SPEECH_LO:
+        # Between "no dialogue" and "people talking": unsure, and says so.
+        score = int(round(30 + (rate - SIGNS_MAX) / (SPEECH_LO - SIGNS_MAX) * 30))
+        return {"kind": DIALOGUE if not sh.get("signish") else HYBRID,
+                "rate": round(rate, 1), "score": score,
+                "why": (f"{rate:.1f} plain dialogue lines a minute - too many "
+                        f"for a sign sheet, too few for a whole episode's "
+                        f"speech; a partial or sparse dialogue track")}
+    score = int(round(100 - (abs(rate - mid) / half) * 40))
+    kind = HYBRID if sh.get("signish") else DIALOGUE
+    return {"kind": kind, "rate": round(rate, 1),
+            "score": int(max(0, min(100, score))),
+            "why": (f"{rate:.1f} plain dialogue lines a minute, the cadence "
+                    f"of people talking"
+                    + (" - with sign styles beside them" if kind == HYBRID
+                       else ""))}
+
+
+def set_kind(file_id: int, track: int, kind: str) -> dict:
+    """Record what a person says this track carries. Outranks the reading."""
+    kind = (kind or "").strip().lower()
+    if kind not in KINDS:
+        return {"ok": False, "why": f"{kind!r} is not a kind"}
+    try:
+        _inspect_init()
+        with cursor() as cur:
+            cur.execute(
+                "INSERT INTO subtitle_shape(file_id,track,size,at,chosen) "
+                "VALUES(?,?,0,?,?) ON CONFLICT(file_id,track) DO UPDATE SET "
+                "  chosen=excluded.chosen",
+                (int(file_id), int(track), time.time(), kind))
+    except Exception as e:                                       # noqa: BLE001
+        return {"ok": False, "why": str(e)[:160]}
+    _CACHE["at"] = 0.0
+    return {"ok": True, "kind": kind,
+            "why": f"set to {KIND_WORDS.get(kind, kind)}"}
+
+
 def _is_really_signs(sh: dict) -> bool:
-    """Does the shape contradict the rate? Any one of the three is enough."""
-    if not sh or not sh.get("events"):
-        return False
-    return bool(sh.get("signish")
-                or (sh.get("pos_pct") or 0) >= POS_SHARE * 100
-                or (sh.get("styles") or 0) >= MANY_STYLES)
+    """Kept for the callers that still ask the yes/no form."""
+    return bool(sh) and kind_of(sh, 24.0).get("kind") == SIGNS
 
 
 def scan(limit: int = 0) -> dict:
@@ -673,20 +796,39 @@ def scan(limit: int = 0) -> dict:
     known = _shapes_for([r["file_id"] for r in rows])
     for r in list(rows):
         sh = known.get((r["file_id"], r["track"]))
-        if sh is None:
+        # A row read before `plain` existed is unread for this purpose.
+        if sh is None or (sh.get("plain") is None and not sh.get("chosen")):
             unread += 1
             r["unread"] = True
             r["rewritable"] = False        # nothing to press until it is read
+            r["kind"] = ""
+            r["kinds"] = [{"id": k, "word": KIND_WORDS[k]} for k in KINDS]
             continue
-        if _is_really_signs(sh):
-            r["shape"] = sh.get("detail") or ""
+        v = kind_of(sh, r.get("minutes") or 24.0)
+        r["read"] = True
+        r["kind"] = v["kind"]
+        r["chosen"] = bool(v.get("chosen"))
+        r["rate"] = v["rate"]
+        r["kinds"] = [{"id": k, "word": KIND_WORDS[k]} for k in KINDS]
+        r["shape"] = sh.get("detail") or ""
+        r["kind_why"] = v["why"]
+        # THE SCORE IS THE VERDICT'S, and the sure column shows it: how
+        # certain the read is about what the track carries, in the same
+        # 0-100 the other panel uses and coloured the same way.
+        r["sure"] = int(v["score"])
+        # A signs title over a signs track is not a finding. Anything else the
+        # read settled - dialogue or hybrid under a signs claim - is one, and
+        # only the safe titles among those can be rewritten.
+        if v["kind"] in (SIGNS, NONE):
             dropped.append(r)
             continue
-        r["read"] = True
-        r["shape"] = (f"{sh.get('events') or 0} events in "
-                      f"{sh.get('styles') or 0} style"
-                      f"{'' if sh.get('styles') == 1 else 's'}, "
-                      f"{sh.get('pos_pct') or 0:.0f}% positioned")
+        if v["kind"] == HYBRID:
+            # The honest title for a track carrying both is neither word alone.
+            base = _LANG_NAME.get((r.get("lang") or "").lower(), "")
+            r["new"] = f"{base} (dialogue + signs)" if base else "Dialogue + Signs"
+        r["rewritable"] = (_rewritable(r.get("old") or "")
+                           and bool(r.get("new"))
+                           and (r["new"] or "").lower() != (r.get("old") or "").lower())
     if dropped:
         gone = {id(r) for r in dropped}
         rows = [r for r in rows if id(r) not in gone]

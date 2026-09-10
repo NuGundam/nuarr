@@ -6832,6 +6832,13 @@ async def api_subtitletitle_fix(file_id: int = 0, ids: str = "",
     return await asyncio.to_thread(stt.fix, rows)
 
 
+@app.post("/api/subtitletitle/kind")
+async def api_subtitletitle_kind(file_id: int, track: int, kind: str):
+    """Say what this track actually carries. Outranks the reading, for good."""
+    from . import subtitletitle as stt
+    return await asyncio.to_thread(stt.set_kind, int(file_id), int(track), kind)
+
+
 @app.post("/api/subtitletitle/inspect")
 async def api_subtitletitle_inspect(limit: int = 0):
     """Read the actual events of candidates nobody has read yet."""
@@ -11433,10 +11440,8 @@ button[disabled]{opacity:.5;cursor:default}
 .syschip i{width:6px;height:6px;border-radius:50%;background:var(--acc);
   display:inline-block;animation:blk 2.2s ease-in-out infinite}
 @media (prefers-reduced-motion:reduce){.syschip i{animation:none}}
-.syspanel{position:absolute;top:26px;left:0;z-index:60;min-width:360px;
-  max-width:min(560px,92vw);max-height:60vh;overflow:auto;
-  background:#0d1117;border:1px solid var(--line);border-radius:9px;
-  box-shadow:0 10px 30px rgba(0,0,0,.55);padding:6px 0;text-align:left}
+.sysbox{border:1px solid var(--line);border-radius:7px;margin:2px 0 4px;
+  overflow:hidden}
 .sysrow{display:block;padding:6px 11px;border-bottom:1px solid var(--line);
   color:inherit;text-decoration:none}
 .sysrow:last-child{border-bottom:0}
@@ -11526,6 +11531,7 @@ button[disabled]{opacity:.5;cursor:default}
 #suGpuBtn{min-width:78px}
 #suGpuBtn b{min-width:34px}
 #suProcBtn{min-width:104px}
+#suProcRun:not(:empty){color:var(--acc);opacity:1}
 #suProcBtn b{min-width:18px}
 /* The process chip is always present. It used to be display:none whenever
    Nuarr had no child processes, so the moment the last encode finished the
@@ -12897,12 +12903,8 @@ html.mobile #logsPane{height:auto;min-height:60vh}
          question asked most often. -->
     <span id="bootPill"></span>
     <span id="selfUse" class="selfuse" title="Nuarr's own CPU and memory, including ffmpeg and script children"></span>
-    <!-- AFTER THE LOAD CHIPS, NOT BEFORE. cpu/gpu/ram/processes say how hard
-         the machine is working; this says on what. Reading left to right that
-         is the order the question gets asked in. -->
-    <span class="syswrap" id="sysWrap" style="display:none"><button
-      class="syschip" id="sysChip" onclick="sysToggle(event)"></button><div
-      class="syspanel" id="sysPanel" style="display:none"></div></span>
+    <!-- The running-systems list lives inside the processes chip now - see
+         paintProcs(). One chip about what Nuarr is doing, not two. -->
     <span id="arrs" class="dim"></span>
     <!-- ffmpeg health sits beside the arr pills: it is the third external
          thing every job depends on, and a stale or broken build is exactly as
@@ -16530,6 +16532,7 @@ function renderSelfUse(s){
     +   '<button class="procbtn" id="suProcBtn" title="what Nuarr is running"'
     +           ' onclick="toggleProcs(event)"><b>—</b>'
     +           ' <span>process<span id="suProcPl">es</span></span>'
+    +           '<span id="suProcRun" class="mult"></span>'
     +           '<span class="caret" id="suProcCaret">▸</span></button>'
     +   '<div class="procpop" id="procPop" onclick="event.stopPropagation()"></div>'
     + '</span>';
@@ -16851,7 +16854,11 @@ function paintProcs(s){
            + `<td class="v">${share>=0.5?share.toFixed(share<10?1:0)+'%':'—'}</td>`
            + `<td class="v ${stale?'old':''}">${g.age>=60?hms(g.age):'—'}</td></tr>`;
     }).join('');
-  let html = `<div class="ph">Running right now — ${n.procs} process${
+  // WHAT NUARR IS DOING, THEN WHAT IT HAS SPAWNED. The sweeps and checks
+  // are the answer to "is anything happening"; the process table is the
+  // answer to "what is that costing". Same panel, that order.
+  let html = sysRunningHtml()
+           + `<div class="ph"${_sys&&_sys.n?' style="margin-top:10px"':''}>Processes — ${n.procs} process${
                   n.procs==1?'':'es'}, ${mb(n.ram_mb)} total</div>`
            + `<table><tr><td class="mult">name</td><td class="v">ram</td>`
            + `<td class="v" title="share of all ${_cpuCores||'?'} threads, `
@@ -18195,42 +18202,36 @@ function modeSeg(label, cur, call, tips){
 // appears when there is something to say means its presence is information.
 let _sys=null, _sysOpen=false, _sysTimer=null;
 
-function sysToggle(ev){
-  if(ev) ev.stopPropagation();
-  _sysOpen=!_sysOpen;
-  sysPaint();
-  if(_sysOpen) setTimeout(()=>document.addEventListener('click', sysAway), 0);
-}
-function sysAway(e){
-  const w=document.getElementById('sysWrap');
-  if(w && w.contains(e.target)) return;
-  _sysOpen=false;
-  document.removeEventListener('click', sysAway);
-  sysPaint();
-}
+// The chip that used to open this on its own is gone; the processes chip is
+// the way in now. See toggleProcs().
+function sysToggle(ev){ if(ev) ev.stopPropagation(); toggleProcs(ev); }
 async function loadSystems(){
   try{ _sys=await (await fetch('/api/systems')).json(); }
   catch(e){ return; }
   sysPaint();
 }
+// ONE CHIP, NOT TWO. The running-systems list started life as its own chip
+// beside the processes one, and the two answered the same question from two
+// directions: "processes" is what Nuarr has spawned, "running" is what Nuarr
+// is doing. Side by side they read as a contradiction whenever the numbers
+// differed - "11 processes · 2 running" - and a person cannot be expected to
+// know that one counts executables and the other counts sweeps. So the
+// running list is a section at the top of the processes panel, and the chip
+// carries a small running count when there is one.
 function sysPaint(){
-  const wrap=document.getElementById('sysWrap');
-  const chip=document.getElementById('sysChip');
-  const panel=document.getElementById('sysPanel');
-  if(!wrap||!chip||!panel) return;
   const rows=(_sys&&_sys.running)||[];
-  if(!rows.length){
-    wrap.style.display='none'; panel.style.display='none'; _sysOpen=false;
-    return;
+  const tag=document.getElementById('suProcRun');
+  if(tag){
+    tag.textContent = rows.length ? ` · ${rows.length} running` : '';
+    tag.title = rows.map(r=>r.name).join(', ');
   }
-  wrap.style.display='';
-  chip.className='syschip'+(_sysOpen?' on':'');
-  chip.innerHTML=`<i></i>${fmt(rows.length)} running`;
-  chip.title=rows.map(r=>r.name).join(', ')
-    +' — click for what each one is doing';
-  if(!_sysOpen){ panel.style.display='none'; return; }
-  panel.style.display='';
-  panel.innerHTML=rows.map(r=>{
+  if(_procOpen && _procLast) paintProcs(_procLast);
+}
+function sysRunningHtml(){
+  const rows=(_sys&&_sys.running)||[];
+  if(!rows.length) return '';
+  return '<div class="ph">Working right now</div>'
+    + '<div class="sysbox">' + rows.map(r=>{
     // A BAR ONLY WHERE THERE IS A DENOMINATOR. Half these systems know how
     // many files they are working through and half are answering one
     // question; drawing an empty bar for the second kind would invent a
@@ -18250,7 +18251,7 @@ function sysPaint(){
       ${r.now?`<div class="dim mono" style="font-size:10px;overflow:hidden;
          text-overflow:ellipsis;white-space:nowrap">${esc(r.now)}</div>`:''}
       ${bar}</a>`;
-  }).join('');
+  }).join('') + '</div>';
 }
 function sysStart(){
   clearInterval(_sysTimer);
@@ -29983,6 +29984,13 @@ function sttSureColor(r){
   const at=(_stt&&_stt.sure_at)||70;
   return (r.sure||0)>=at ? 'var(--ok)' : 'var(--warn)';
 }
+async function sttSetKind(fid, track, kind, el){
+  if(el) el.disabled=true;
+  try{ await fetch(`/api/subtitletitle/kind?file_id=${fid}&track=${track}&kind=${
+      encodeURIComponent(kind)}`, {method:'POST'}); }catch(e){}
+  if(el){ el.disabled=false; el.blur(); }
+  _stt=null; _sttKey=''; loadSubTitle();
+}
 function sttAtOrAbove(){
   const at=(_stt&&_stt.sure_at)||70;
   return (((_stt&&_stt.rows)||[])
@@ -30036,10 +30044,11 @@ function sttPaint(){
     people talking — but an opening song is two events per lyric and an
     animated title card is one event per frame, so a genuine signs track
     reaches that rate with no dialogue in it at all. Reading the track settles
-    it: dialogue is one style with nothing positioned, signs are several
-    styles with lines placed by <span class="mono">\pos</span> wherever the
-    thing they label is. <b>Nothing is offered as correctable until it has been
-    read</b>, because the first eighty reads cleared every single candidate.
+    it, on one number: <b>plain dialogue lines a minute</b> — lines left where
+    a style called Default or Italics puts them, not placed by
+    <span class="mono">\pos</span> in a style called sign or op or ed. A sign
+    sheet has none however many events it carries; dialogue runs at the speech
+    band. <b>Nothing is offered as correctable until it has been read.</b>
     </div>`;
   // ONE LINE, NOT TWO. The other panel has a mark line and a dismiss line
   // because it can act in both directions; this one can only ever correct a
@@ -30071,17 +30080,18 @@ function sttPaint(){
     </div>` : '';
   const table = shown.length ? `${selBar}<div class="rowbox scrollbox">
       <table style="width:100%;font-size:11.5px">
-      <colgroup><col style="width:22px"><col style="width:30%"><col style="width:8%">
-        <col style="width:58px"><col style="width:15%"><col style="width:14%">
-        <col style="width:132px"><col style="width:92px"></colgroup>
+      <colgroup><col style="width:22px"><col style="width:27%"><col style="width:8%">
+        <col style="width:11%"><col style="width:58px"><col style="width:13%">
+        <col style="width:12%"><col style="width:132px"><col style="width:92px"></colgroup>
       <thead><tr class="dim" style="font-size:10.5px;text-align:left">
         <th style="padding:3px 0 4px 2px">
           <input type="checkbox" ${allOn?'checked':''}
             title="Select every title nuarr can rewrite"
             onclick="sttSelAll(this.checked)"></th>
         <th style="padding:3px 8px 4px 2px">episode</th><th>library</th>
+        <th title="What reading the track's events says it carries, and a way to say that is wrong. The picker outranks the reading, and what it is set to is what the correction writes.">what it carries</th>
         <th style="text-align:right;padding-right:14px"
-          title="How far inside the band where people talk this track's cue rate sits. A track squarely in the middle of that band is unarguable; one on either edge could be a long sparse track or a busy sign sheet.">sure</th>
+          title="How sure the read is about what the track carries: plain dialogue lines a minute, and how far inside the band where people talk that sits. Unread rows have no number yet.">sure</th>
         <th>says</th><th>would become</th>
         <th style="text-align:right;padding-right:10px">measured</th>
         <th></th>
@@ -30098,12 +30108,21 @@ function sttPaint(){
                text-overflow:ellipsis;white-space:nowrap"
             >${esc(String(r.path||'').split('\\').pop())}</div></td>
         <td class="dim" style="padding:3px 8px 3px 0">${esc(r.library||'')}</td>
+        <td style="padding:3px 8px 3px 0">${r.unread
+          ? '<span class="dim" style="font-size:10.5px">not read yet</span>'
+          : `<select class="kindsel" onchange="sttSetKind(${r.file_id},${r.track},this.value,this)"
+               title="${esc((r.kind_why||'')+'. If that is wrong, set it here - the choice is kept and the next read will not overwrite it.')}">
+               ${(r.kinds||[]).map(k=>`<option value="${esc(k.id)}"${
+                 k.id===r.kind?' selected':''}>${esc(k.word)}</option>`).join('')}
+             </select>
+             ${r.chosen?'<div class="dim" style="font-size:9.5px">set by hand</div>'
+                       :`<div class="dim" style="font-size:9.5px">${esc(r.rate?r.rate+' dialogue lines/min':'')}</div>`}`}</td>
         <td class="mono" style="padding:3px 14px 3px 0;text-align:right;
             font-variant-numeric:tabular-nums;color:${sttSureColor(r)}"
           title="${esc((r.why||'')+' — '+((r.sure||0)>=(d.sure_at||70)
             ?'at or above the line, so auto would correct it once it has been read'
             :'below the line, so this one is yours to call'))}"
-          >${r.sure===undefined?'':r.sure+'%'}</td>
+          >${(r.unread||r.sure===undefined)?'':r.sure+'%'}</td>
         <td class="mono" style="padding:3px 8px 3px 4px;color:var(--warn)"
           >${esc(r.old||'')}<div class="dim" style="font-size:10px">s:${r.track}</div></td>
         <td class="mono" style="padding:3px 8px 3px 0;color:${
