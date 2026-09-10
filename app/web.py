@@ -30546,8 +30546,14 @@ function skPaint(force){
             title="${esc((r.why||'')+' — '+(r.auto_why||''))}">${r.unread?'':(r.sure+'%')}</td>
         <td class="l mono">${pic?'<span class="dim">—</span>'
           :`<span style="color:var(--warn)" title="${esc(r.title_old||'')}">${esc(r.title_old||'')}</span>${
-             r.action==='retitle'?`<div style="font-size:10px;color:var(--ok);overflow:hidden;text-overflow:ellipsis" title="${esc(r.title_new||'')}">→ ${esc(r.title_new||'')}</div>`
-                                 :(r.unread?'':'<div class="dim" style="font-size:10px" title="The title carries a name nuarr did not write and cannot regenerate, so it is reported and left as it is.">left alone</div>')}`}</td>
+             r.action==='retitle'?`<div style="font-size:10px;color:var(--ok);overflow:hidden;text-overflow:ellipsis" title="${
+               esc((r.title_new||'')+(r.unsafe?' — this replaces a title nuarr did not write, because you set the kind by hand':''))}">→ ${
+               esc(r.title_new||'')}${r.unsafe?' <span class="dim">(your call)</span>':''}</div>`
+                                 :(r.unread?''
+                                    :(r.settled
+                                      ? `<div class="dim" style="font-size:10px" title="You said this track carries ${
+                                          esc(SKW[r.kind]?SKW[r.kind][0]:r.kind)}, and its title already says so - there is nothing to correct.">title already agrees</div>`
+                                      : '<div class="dim" style="font-size:10px" title="The title carries a name nuarr did not write and cannot regenerate, so it is reported and left as it is. Set what it carries by hand and the correction is offered anyway - your call outranks the caution.">left alone</div>'))}`}</td>
         <td class="r askhost">${r.done
           ? '<span class="dim" title="This file already carries the blank marker track.">marked</span>'
           : r.unread ? '<span class="dim" style="font-size:10.5px" title="The cue rate flagged this; its events have not been read yet. Nothing is offered until they have.">not read yet</span>'
@@ -30555,7 +30561,9 @@ function skPaint(force){
                 pic?'Add a blank English subtitle track so Bazarr and Plex see one exists and stop asking for it. Nothing is drawn over the picture.'
                    :(r.action==='leave'
                      ?'You have said what this track carries and its title already says so. Nothing is written to the file - this only takes the row off the list, and it stays under "you set by hand".'
-                     :'Rewrite the track title to what it actually carries. Header edit only.')}">${esc(r.action_word)}</button>`:''}
+                     :(r.unsafe
+                       ?'This title carries something nuarr did not write and would not normally replace - but you have set what the track carries by hand, so the correction is yours to make. What it would become is in the title column.'
+                       :'Rewrite the track title to what it actually carries. Header edit only.'))}">${esc(r.action_word)}</button>`:''}
              <button class="rmb" onclick="skDismiss('${r.id}',this)" title="${
                 pic?'This is not a burned-in subtitle. The words behind it join the list of reads that were wrong, and two dismissals in one series leave that show alone.'
                    :'This track is signs after all. Recorded as such, and the next read will not overwrite it.'}">Not dialogue</button>`}</td>

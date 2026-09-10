@@ -214,6 +214,9 @@ def _track_rows(limit: int) -> list:
             # the button takes a row off the list.
             "done": acked, "done_word": "set by hand" if acked else "",
             "settled": settled, "acked": acked,
+            # The title carries something nuarr did not write, and you have
+            # overruled that caution by setting the kind yourself.
+            "unsafe": bool(r.get("unsafe")),
             "detail": r.get("why") or "",
             "added": float(r.get("added") or 0.0),
             "found_at": 0.0,

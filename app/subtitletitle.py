@@ -852,9 +852,16 @@ def scan(limit: int = 0) -> dict:
             # The honest title for a track carrying both is neither word alone.
             base = _LANG_NAME.get((r.get("lang") or "").lower(), "")
             r["new"] = f"{base} (dialogue + signs)" if base else "Dialogue + Signs"
-        r["rewritable"] = (_rewritable(r.get("old") or "")
+        # SAFE, OR SAID BY YOU. The safe-title rule exists because nuarr
+        # cannot regenerate what a fansub group wrote into a title, so a
+        # DETECTOR'S opinion is never allowed to overwrite one. A kind you set
+        # by hand is not the detector's opinion - you have looked and made the
+        # call - so the correction is offered, with exactly what it would
+        # become written in the row for you to approve or not.
+        r["rewritable"] = ((_rewritable(r.get("old") or "") or v.get("chosen"))
                            and bool(r.get("new"))
                            and (r["new"] or "").lower() != (r.get("old") or "").lower())
+        r["unsafe"] = bool(v.get("chosen")) and not _rewritable(r.get("old") or "")
     if dropped:
         gone = {id(r) for r in dropped}
         rows = [r for r in rows if id(r) not in gone]
