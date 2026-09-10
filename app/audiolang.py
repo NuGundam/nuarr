@@ -2014,6 +2014,7 @@ def mismatches(limit: int = 200, floor: float | None = None) -> list[dict]:
         with cursor() as cur:
             rows = cur.execute(
                 "SELECT a.file_id, a.track, a.code, a.confidence, a.checked_at,"
+                "       a.votes, a.overall, "
                 "       f.path, f.library, f.title, f.audio_langs "
                 "  FROM audio_lang a JOIN files f ON f.id = a.file_id "
                 " WHERE a.ok = 1 AND COALESCE(a.code,'') != '' "
@@ -2063,6 +2064,33 @@ def mismatches(limit: int = 200, floor: float | None = None) -> list[dict]:
             for v in votes if isinstance(v, (list, tuple)) and len(v) >= 2)
         if heard_the_tag:
             continue
+        # AND THE WHOLE SAMPLE, NOT ITS LOUDEST MOMENT. A verdict is the most
+        # confident window; `overall` is every window's distribution added up,
+        # and when the two disagree the aggregate is the better evidence.
+        #
+        # Primal is the case that proves it: a show that tells its story
+        # without dialogue, and what little speech it has is invented. One
+        # window of S01E10 came back Arabic at 0.97 while three others heard
+        # English at 0.31-0.57 - too quiet to pass the guard above, but the
+        # aggregate is en 0.30 against ar 0.19. Correcting that tag would say
+        # a show with no English audio, which turns on forced subtitles, and
+        # tells the arr its English release is not English.
+        #
+        # So: if the tagged language leads the aggregate, the tag is not lying,
+        # whatever one window shouted. On this library it drops exactly the two
+        # Primal rows and keeps all thirty-one real ones - the true positives
+        # sit at 0.74-1.00 for the heard language with the tag at 0.00-0.11.
+        try:
+            overall = json.loads(r["overall"] or "[]")
+        except Exception:                                # noqa: BLE001
+            overall = []
+        if overall:
+            top = (overall[0] or [""])[0]
+            try:
+                if top and langkey.same(top, tagged):
+                    continue
+            except Exception:                            # noqa: BLE001
+                pass
         # AND THE ONE THAT MATTERS MOST: is this track a duplicate of another
         # one in the same file, wearing a different label? That is what turns
         # "a tag is wrong" into "this release lied about being dual audio".

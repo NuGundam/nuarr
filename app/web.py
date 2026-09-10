@@ -3830,6 +3830,9 @@ async def api_audiolang(limit: int = Query(400, le=3000)):
         by_lib: dict[str, dict] = {}
         rows: list[dict] = []
         odd: list[dict] = []
+        # Keyed by (file, track) so the ledger can pick the ones it agrees are
+        # findings; the walk is here for the names and the episode label.
+        seen_disagree: dict = {}
         # Probes are opened lazily, and only for rows that will be RETURNED.
         # Keyed by file id so a file with two interesting tracks is read once.
         _probe_cache: dict[int, list] = {}
@@ -3893,12 +3896,17 @@ async def api_audiolang(limit: int = Query(400, le=3000)):
                     d = {"code": "", "code2": "", "confidence": 0.0, "ok": 0,
                          "votes": "[]", "overall": "[]",
                          "why": "not listened to yet", "checked_at": 0.0}
-                # A CONTRADICTION is the interesting row: the file states one
-                # language and the audio is demonstrably another. nuarr does
-                # not act on these - it never overwrites a stated tag - but
-                # refusing to act is not a reason to refuse to mention it.
+                # A CONTRADICTION is the interesting row - but WHICH rows are
+                # contradictions is audiolang.mismatches()'s answer, not this
+                # loop's. This used to decide for itself with `code != tag`
+                # and no guards at all, so the page listed rows the corrector
+                # would refuse and rows the guards had already dismissed:
+                # Primal, a show that tells its story without dialogue, sat
+                # here twice on the strength of one loud window. Two detectors
+                # for one question is one detector too many. All this keeps is
+                # the display detail the list cannot get from the ledger.
                 if d["ok"] and not blank and d["code"] and d["code"] != lg:
-                    odd.append({
+                    seen_disagree[(f["id"], ai)] = {
                         "file_id": f["id"],
                         "path": f["path"],
                         # The series name alone is useless when 200 episodes
@@ -3909,7 +3917,7 @@ async def api_audiolang(limit: int = Query(400, le=3000)):
                         "says": lg, "says_name": NAME.get(lg, lg),
                         "heard": d["code"], "heard_name": NAME.get(d["code"], d["code"]),
                         "confidence": round(float(d["confidence"]), 2),
-                        "n_audio": len(track_tags)})
+                        "n_audio": len(track_tags)}
                 # An OUTSTANDING row is always included, whatever the limit.
                 # `open` is derived from this list, so capping it first would
                 # silently under-report the backlog - the one number on this
@@ -3955,6 +3963,13 @@ async def api_audiolang(limit: int = Query(400, le=3000)):
                         "checked_at": float(
                             (d["checked_at"] if "checked_at" in d.keys()
                              else 0) or 0)})
+        # THE LEDGER DECIDES, THE WALK DECORATES. Only the rows the corrector
+        # would actually act on reach the page, in the corrector's own order.
+        odd = []
+        for _m in audiolang.mismatches(500):
+            _row = seen_disagree.get((_m["file_id"], _m["track"]))
+            if _row:
+                odd.append(_row)
         _waiting = audiolang.pending(limit=100000)
         # Still blank AND never resolved - the honest backlog.
         openq = [r for r in rows if r["blank"] and not r["ok"]]
