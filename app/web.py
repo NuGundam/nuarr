@@ -16710,6 +16710,18 @@ function paintSu(which, s){
       + `<div class="pf">Nuarr is <b>${pctOf(mine, machine)}</b>`
       + ` of the load on this box. Its raw figure is ${n.cpu_pct_raw||0}% of a`
       + ` single core, which is why it can exceed 100 before this division.</div>`;
+    // WORK THAT IS NUARR'S, ON THIS CHIP. The same rows the GPU panel shows
+    // for CUDA work, for the engines that were installed for the CPU instead:
+    // Tesseract always, PaddleOCR's CPU build, Whisper installed without CUDA.
+    // Without these a CPU Whisper listen sat under the GPU panel telling a
+    // card it never touched that it was busy.
+    const cw=(s.cpu_work||[]);
+    if(cw.length){
+      html += '<div class="ph" style="margin-top:9px">Nuarr on this CPU</div><table>'
+        + cw.map(wk=>`<tr><td>${esc(wk.label)}</td><td class="v">${
+            wk.n>1?wk.n:(wk.n===1?'running':'<span class="dim">idle</span>')}</td></tr>`).join('')
+        + '</table>';
+    }
     others.sort((a,b)=>b.cpu_pct-a.cpu_pct);
     rows = others.filter(o=>o.cpu_pct>=0.5).slice(0,6).map(o=>
       `<tr><td>${esc(o.name)}${o.n>1?`<span class="mult"> ×${o.n}</span>`:''}</td>`
@@ -16952,9 +16964,10 @@ function gpuPanel(s){
                    ${perProc?'':`This driver does not report which process owns
                    a video session, so it cannot be named here.`}</div>`)
             : `<div class="pf">Nothing is running on the card. Nuarr uses it
-               for a rebuild, for subtitle OCR when PaddleOCR is the engine,
-               and for audio-language detection; a remux copies the picture
-               untouched and never touches it.</div>`))
+               for a rebuild, and for subtitle OCR and audio-language detection
+               only when those were installed for CUDA — the CPU panel lists
+               them otherwise. A remux copies the picture untouched and never
+               touches it.</div>`))
     + `<div class="ph" style="margin-top:11px">${esc(G.name)}${
         G.temp_c!=null?` <span class="mult">${G.temp_c.toFixed(0)}°C</span>`:''}</div>`
     + '<table class="gputab">'
@@ -29962,6 +29975,14 @@ async function sttRefresh(btn){
   try{ await fetch('/api/subtitletitle/refresh',{method:'POST'}); }catch(e){}
   _stt=null; _sttKey=''; loadSubTitle();
 }
+// THE COLOUR IS THE DECISION, NOT THE NUMBER - same rule as the other panel.
+// Green: at or above the line, auto would act once it is read. Amber: below
+// it, yours to call. Two panels one above the other using two colour scales
+// for the same word is a thing you have to keep re-learning as you scroll.
+function sttSureColor(r){
+  const at=(_stt&&_stt.sure_at)||70;
+  return (r.sure||0)>=at ? 'var(--ok)' : 'var(--warn)';
+}
 function sttAtOrAbove(){
   const at=(_stt&&_stt.sure_at)||70;
   return (((_stt&&_stt.rows)||[])
@@ -30078,9 +30099,11 @@ function sttPaint(){
             >${esc(String(r.path||'').split('\\').pop())}</div></td>
         <td class="dim" style="padding:3px 8px 3px 0">${esc(r.library||'')}</td>
         <td class="mono" style="padding:3px 14px 3px 0;text-align:right;
-            font-variant-numeric:tabular-nums;color:${
-          (r.sure||0)>=75?'var(--bad)':(r.sure||0)>=55?'var(--warn)':'var(--dim)'}"
-          title="${esc(r.why||'')}">${r.sure===undefined?'':r.sure+'%'}</td>
+            font-variant-numeric:tabular-nums;color:${sttSureColor(r)}"
+          title="${esc((r.why||'')+' — '+((r.sure||0)>=(d.sure_at||70)
+            ?'at or above the line, so auto would correct it once it has been read'
+            :'below the line, so this one is yours to call'))}"
+          >${r.sure===undefined?'':r.sure+'%'}</td>
         <td class="mono" style="padding:3px 8px 3px 4px;color:var(--warn)"
           >${esc(r.old||'')}<div class="dim" style="font-size:10px">s:${r.track}</div></td>
         <td class="mono" style="padding:3px 8px 3px 0;color:${

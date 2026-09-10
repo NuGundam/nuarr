@@ -540,7 +540,13 @@ def snapshot() -> dict:
     show empty gauges.
     """
     out = dict(_LATEST or _sample())
-    out["gpu_work"] = _gpu_work()
+    # ONE LIST, SPLIT BY WHERE IT ACTUALLY RUNS. Every entry says which chip
+    # it is on, so the GPU panel gets the CUDA work and the CPU panel gets the
+    # rest - and "audio language: Whisper" stops appearing under the GPU on a
+    # box whose Whisper was installed for the CPU.
+    _work = _gpu_work()
+    out["gpu_work"] = [w for w in _work if w.get("device") == "gpu"]
+    out["cpu_work"] = [w for w in _work if w.get("device") == "cpu"]
     return out
 
 
@@ -555,36 +561,56 @@ def _gpu_work() -> list[dict]:
     state only, no subprocess, because snapshot() serves every dashboard poll.
     """
     work: list[dict] = []
+    # WHICH CHIP, DECIDED BY HOW IT WAS SET UP - not by which panel is asking.
+    # PaddleOCR is a GPU engine only when its CUDA build is the one installed;
+    # Tesseract is always CPU; Whisper is whatever faster-whisper was installed
+    # for. Listing all of it under the GPU because that is where the label used
+    # to live told a CPU-only box that its card was busy with Whisper.
     try:
         from . import subocr
-        if subocr.engine() == "paddle":
-            from . import jobs as _jobs
-            n = sum(1 for w in _jobs.RUNNING.values()
-                    if getattr(getattr(w, "job", None), "kind", "") == "sub_ocr"
-                    or getattr(w, "sub_ocr_active", False))
-            if n:
-                cached = subocr._PADDLE_CACHE.get("data")
-                # An empty cache is "not asked yet", not "no CUDA" - claiming
-                # (CPU) on a GPU build right after boot would be invented.
-                dev = ("" if cached is None
-                       else " (GPU)" if cached.get("cuda") else " (CPU)")
-                work.append({"kind": "subocr",
-                             "label": f"subtitle OCR — PaddleOCR{dev}",
-                             "n": n})
+        from . import jobs as _jobs
+        n = sum(1 for w in _jobs.RUNNING.values()
+                if getattr(getattr(w, "job", None), "kind", "") == "sub_ocr"
+                or getattr(w, "sub_ocr_active", False))
+        eng = subocr.engine()
+        if n and eng == "paddle":
+            cached = subocr._PADDLE_CACHE.get("data")
+            # An empty cache is "not asked yet", not "no CUDA" - claiming
+            # CPU on a GPU build right after boot would be invented, so an
+            # unknown device is reported as gpu (its usual home) and said so.
+            on_gpu = True if cached is None else bool(cached.get("cuda"))
+            work.append({"kind": "subocr",
+                         "label": "subtitle OCR — PaddleOCR"
+                                  + ("" if cached is None else
+                                     (" (CUDA)" if on_gpu else " (CPU build)")),
+                         "n": n, "device": "gpu" if on_gpu else "cpu"})
+        elif n:
+            work.append({"kind": "subocr",
+                         "label": f"subtitle OCR — {eng or 'tesseract'}",
+                         "n": n, "device": "cpu"})
     except Exception:                                    # noqa: BLE001
         pass
     try:
         from . import audiolang
         p = audiolang.progress()
+        # The device the model actually loaded on, once it has; before that,
+        # the one it was installed for. Same rule audiolang.info() applies.
+        dev = (audiolang._MODEL_DEV
+               or ("cuda" if audiolang.info().get("cuda_devices") else "cpu"))
+        on_gpu = str(dev).lower().startswith("cuda")
+        where = "gpu" if on_gpu else "cpu"
         if (p.get("state") or "") == "listening":
             work.append({"kind": "whisper",
-                         "label": "audio language — Whisper",
-                         "n": 1,
+                         "label": "audio language — Whisper"
+                                  + (" (CUDA)" if on_gpu else " (CPU)"),
+                         "n": 1, "device": where,
                          "detail": (p.get("current") or "")[:60]})
         elif audiolang._MODEL is not None:
             work.append({"kind": "whisper",
-                         "label": "Whisper model loaded (idle, holding VRAM)",
-                         "n": 0})
+                         "label": ("Whisper model loaded (idle, holding VRAM)"
+                                   if on_gpu else
+                                   "Whisper model loaded (idle, in memory)"),
+                         "n": 0, "device": where})
     except Exception:                                    # noqa: BLE001
         pass
     return work
