@@ -30160,10 +30160,29 @@ async function skSetKind(id, kind, el){
   const [fid, src]=skSplit(id);
   const row=((_sk&&_sk.rows)||[]).find(x=>x.id===id);
   skPinRow(id);                     // hold its place across the repaint
+  // WHAT IT IS DOING, WHERE YOU ARE LOOKING. The write is quick; re-reading
+  // every track so this row can be judged again is about a second, and the
+  // answer column is the part that changes - so that is where it says so.
+  const tr = el && el.closest ? el.closest('tr') : null;
+  const cell = tr ? tr.lastElementChild : null;
+  const held = cell ? cell.innerHTML : '';
+  if(tr) tr.classList.add('skwait');
+  if(cell) cell.innerHTML =
+    '<span class="busy" style="color:var(--acc);font-size:10.5px">'
+    + '<span class="sp"></span> working out what to do…</span>';
   if(el) el.disabled=true;
-  try{ await fetch(`/api/subkind/kind?file_id=${fid}&source=${encodeURIComponent(src)}&kind=${
-      encodeURIComponent(kind)}`,{method:'POST'}); }catch(e){}
+  let ok=false;
+  try{ ok=(await (await fetch(`/api/subkind/kind?file_id=${fid}&source=${
+      encodeURIComponent(src)}&kind=${encodeURIComponent(kind)}`,
+      {method:'POST'})).json()).ok !== false; }catch(e){}
   if(el){ el.disabled=false; el.blur(); }
+  if(!ok){
+    // Put the row back as it was and say so, rather than repainting over it.
+    if(tr) tr.classList.remove('skwait');
+    if(cell) cell.innerHTML='<span class="err" style="font-size:10.5px">could not set that</span>';
+    setTimeout(()=>{ if(cell) cell.innerHTML=held; }, 2200);
+    return;
+  }
   // THE PICKER NEVER REMOVES A ROW. Saying what a track carries changes what
   // there is to do about it - a track you call dialogue under a "signs" title
   // gains "Correct the title"; one you call signs has nothing left to correct
@@ -34545,6 +34564,21 @@ html.mobile .setwrap:not(.rail) .setmain,html.mobile .setwrap:not(.rail) #worker
   padding-top:0 !important;padding-bottom:0 !important;
   line-height:0;font-size:0;border:0;
   transition:padding .22s ease, line-height .22s ease}
+/* SETTING A KIND IS NOT INSTANT. The choice is written, the whole track list
+   is re-read so the row can be judged again, and that is about a second on a
+   library this size. A second of nothing is a second of wondering whether the
+   click landed - so the row says it is thinking, in the row, and the rest of
+   it goes quiet until it has an answer. */
+/* A LINE THAT MOVES UNDER THE ROW. Dimming the cells was the first idea and
+   it lost to the inline colours every cell carries; a bar under the row wins
+   because nothing else draws there. */
+.sktbl tr.skwait > td{
+  background-image:linear-gradient(90deg,transparent,var(--acc),transparent);
+  background-size:40% 2px;background-repeat:no-repeat;
+  background-position:-40% 100%;
+  animation:skwaitbar 1.1s linear infinite}
+@keyframes skwaitbar{from{background-position:-40% 100%}
+                     to{background-position:140% 100%}}
 .sktbl thead tr.sksort th[onclick]{cursor:pointer;user-select:none}
 .sktbl thead tr.sksort th[onclick]:hover{color:var(--fg)}
 .sktbl th.l:first-child,.sktbl td.l:first-child{padding-left:4px;padding-right:0}
