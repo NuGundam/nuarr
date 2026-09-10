@@ -72,6 +72,24 @@ def dismiss_at() -> int:
     return hardsub.dismiss_at()
 
 
+def _auto_eta() -> float:
+    """How long until auto has worked through everything past the line."""
+    from . import hardsub
+    left = STATE.get("auto_queued") or 0
+    if not left:
+        return 0.0
+    each = float((hardsub.MARK_STATE or {}).get("secs_each") or 0.0)
+    if not each:
+        try:
+            each = float(hardsub.mark_progress().get("secs_each") or 0.0)
+        except Exception:                                        # noqa: BLE001
+            each = 0.0
+    if each:
+        # Plus the pause between batches, which is real time too.
+        return left * each + (left / AUTO_MARKS_PER_PASS) * AUTO_TICK_S
+    return (left / AUTO_MARKS_PER_PASS) * AUTO_TICK_S
+
+
 def _next_run() -> float:
     """When this pass runs again. The scheduler's answer where it has one -
     it knows about the first run after boot, which last_run + cycle cannot."""
@@ -228,14 +246,19 @@ def findings(limit: int = 600) -> dict:
             "at": STATE.get("auto_at") or 0.0,
             "per_pass": AUTO_MARKS_PER_PASS,
             "runs": STATE.get("auto_runs") or 0,
-            # AUTO RUNS AT THE HEAD OF EVERY PASS, so the pass's clock is
-            # auto's clock - one schedule, one next time, no second answer.
-            "next_run": _next_run(),
-            "cycle_s": CYCLE_S,
+            # AUTO HAS ITS OWN CLOCK. It is idle between batches, not waiting
+            # on the readers, so what it is doing right now is the answer:
+            # marking, or free and looking again within the tick.
+            "next_run": STATE.get("auto_due") or 0.0,
+            "cycle_s": AUTO_TICK_S,
+            "marking": bool((hardsub.MARK_STATE or {}).get("running")),
             # HOW LONG UNTIL AUTO IS DONE with what it can already see: the
             # queue over the per-pass cap, at the cadence the pass runs on.
-            "eta": (((STATE.get("auto_queued") or 0) / AUTO_MARKS_PER_PASS)
-                    * CYCLE_S) if STATE.get("auto_queued") else 0.0,
+            # WHAT IT ACTUALLY COSTS, where that has been measured: every
+            # mark is a stream copy of a whole container, and how long that
+            # takes on this pool is the only honest basis for the estimate.
+            # The tick only matters while nothing has been timed yet.
+            "eta": _auto_eta(),
         },
         "state": {**STATE, "cycle_s": CYCLE_S, "next_run": _next_run()},
         "kinds": [{"id": k, "word": hardsub.KIND_WORDS[k]}
@@ -349,6 +372,13 @@ def dismiss_many(items: list) -> dict:
 
 # ------------------------------------------------------------- the schedule --
 AUTO_MARKS_PER_PASS = 25
+# HOW OFTEN AUTO LOOKS FOR WORK. Not the reading cadence - the two are
+# different jobs. Reading a pass of ninety pictures takes half an hour, and
+# tying acting to it meant a batch of twenty-five finished in four minutes and
+# then nothing happened for twenty-six, with 359 findings sitting there
+# already scored and already past the line. Auto has its own clock: whenever
+# the marker is free and something is waiting, it takes the next batch.
+AUTO_TICK_S = 45.0
 
 
 async def _auto_backlog() -> dict:
@@ -401,10 +431,10 @@ async def run(force: bool = False) -> dict:
     if STATE["running"]:
         return {"ok": False, "why": "already running"}
     t0 = time.time()
-    STATE.update(running=True, phase="backlog", t0=t0, last_error="")
+    STATE.update(running=True, phase="picture", t0=t0, last_error="")
     got: dict = {}
     try:
-        got["backlog"] = await _auto_backlog()
+        # Auto has its own loop now (watch_auto); the pass just reads.
         STATE["phase"] = "picture"
         got["picture"] = await hardsub.sweep(force=force)
         STATE["phase"] = "tracks"
@@ -431,6 +461,27 @@ async def run(force: bool = False) -> dict:
         except Exception:                                        # noqa: BLE001
             pass
     return {"ok": True, **got}
+
+
+async def watch_auto() -> None:
+    """Auto's own loop: take the next batch whenever the marker is free.
+
+    SEPARATE FROM THE READERS ON PURPOSE. Reading is disk-bound and paced at
+    ninety pictures every five minutes; acting on what has already been read
+    and scored is a different job with a different rhythm, and hanging it off
+    the reading pass made it stall for the length of a pass. This one is idle
+    unless there is something past the line and nothing already running.
+    """
+    from . import hardsub
+    await asyncio.sleep(90)
+    while True:
+        try:
+            if mode() == "auto" and not (hardsub.MARK_STATE or {}).get("running"):
+                await _auto_backlog()
+            STATE["auto_due"] = time.time() + AUTO_TICK_S
+        except Exception as e:                                   # noqa: BLE001
+            STATE["last_error"] = f"auto: {type(e).__name__}: {e}"
+        await asyncio.sleep(AUTO_TICK_S)
 
 
 async def watch() -> None:

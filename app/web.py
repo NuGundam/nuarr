@@ -795,6 +795,8 @@ async def _startup() -> None:
     # they run as one pass and show as one list. See subkind.py.
     from . import subkind as _subkind
     asyncio.create_task(_subkind.watch())
+    # Acting on what has been read is its own job with its own rhythm.
+    asyncio.create_task(_subkind.watch_auto())
     # Asks the arrs what they manage and compares it to what nuarr has indexed.
     # Two list calls every six hours - no disk walk - so it is cheap enough to
     # run on any machine, attached pool or share.
@@ -30329,9 +30331,12 @@ function skPaint(force){
          ? ` · ${fmt(A.marked||0)} marked${A.dropped?`, ${fmt(A.dropped)} dropped`:''}`
          : ' · nothing to do'}</span>`
       :'<span class="dim" title="Auto acts at the head of every pass. It has not reached one since nuarr started.">has not run yet</span>'}
-    ${A.next_run?`<span class="dim" title="Auto acts at the head of every pass, so this is the pass\'s own clock - it runs every ${
-       hsDur(A.cycle_s||300)}.">next run ${(A.next_run-(Date.now()/1000))<=0
-         ? 'due now' : 'in '+hsDur(A.next_run-(Date.now()/1000))}</span>`:''}
+    ${A.marking
+      ? `<span style="color:var(--acc)" title="Auto is marking a batch right now. The bar below is its progress.">marking now</span>`
+      : (A.next_run?`<span class="dim" title="Auto looks for work every ${
+          hsDur(A.cycle_s||45)}, and takes the next batch whenever the marker is free.">next look ${
+          (A.next_run-(Date.now()/1000))<=1
+            ? 'any moment' : 'in '+hsDur(A.next_run-(Date.now()/1000))}</span>`:'')}
     ${A.queued?`<span title="Findings already past the ${d.mark_at}% line waiting for a later pass. ${
        A.per_pass} are taken each pass because every mark rewrites a container."><b>${
        fmt(A.queued)}</b> still to mark${A.eta?` · <b style="color:var(--acc)">${
