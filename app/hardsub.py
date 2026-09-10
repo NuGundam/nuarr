@@ -63,7 +63,7 @@ import subprocess
 import time
 
 from . import joblog
-from .config import NO_WINDOW, hidden_si
+from .config import NO_WINDOW, SETTINGS, hidden_si
 from .db import cursor
 
 NONE, SIGNS, DIALOGUE, HYBRID = "none", "signs", "dialogue", "hybrid"
@@ -555,6 +555,203 @@ def garbage_words() -> set:
     return got
 
 
+# ------------------------------------------------- how sure is it, and why --
+# A VERDICT WITH NO CONFIDENCE ATTACHED CANNOT BE AUTOMATED.
+#
+# The check already decided yes-or-no. That is enough to make a list for a
+# person and not nearly enough to act without one: "Beet S01E16 read `and,
+# himself, per, sometimes, this`" and "Guardians S03E11 read `bee, birxsctied,
+# eee, ene, eweee`" are the same verdict, and one of them is obviously right
+# while the other is obviously noise. What separates them is not the verdict,
+# it is how much of the read looks like language.
+#
+# So the same evidence is scored 0-100, and the number decides what happens:
+# high enough and it is marked without asking, low enough and it is thrown
+# away without asking, and the band in the middle - where the evidence really
+# is ambiguous - is the only thing a person is shown. Every decision made in
+# that band feeds the dictionaries below, so the band narrows with use.
+#
+# SCORED ON READ, NOT AT PROBE TIME. Every input is already in the row, so a
+# word learned tonight re-scores a finding from March without re-reading a
+# single frame. A score frozen into the table at probe time would be a number
+# that stopped learning the moment it was written.
+GOOD_MIN = 2                    # confirmations before a word counts as real
+_GOOD: dict = {"at": 0.0, "words": set()}
+_GOOD_TTL = 120.0
+
+_VOWELS = set("aeiouy")
+_RUN3 = re.compile(r"(.)\1\1")             # three of the same letter
+_CONS5 = re.compile(r"[bcdfghjklmnpqrstvwxz]{5}")
+
+
+def _word_ok(w: str) -> bool:
+    r"""Does this read like a word, or like OCR falling over?
+
+    NO DICTIONARY, ON PURPOSE. Shipping an English word list would answer this
+    for English and be wrong about every other library on the shelf - and
+    these files are mostly anime, where the correct reading is full of names
+    no word list contains. What is being tested is SHAPE, and the shapes below
+    were taken from the reads this check has actually produced:
+        aonfoodlipurntil, weinaventspent, sendfalbrattysbustergto  -> too long
+        eee, eweee, sss                                            -> a letter
+                                                                      three times
+        birxsctied, tengeki? no - brxsct                           -> five
+                                                                      consonants
+    Everything the shape test gets wrong, the learned dictionaries then fix,
+    which is the right division of labour: rules for what is always true,
+    evidence for what is true here.
+    """
+    w = (w or "").strip().lower()
+    if not (2 <= len(w) <= 13):
+        return False
+    if not any(c in _VOWELS for c in w):
+        return False
+    if _RUN3.search(w):
+        return False
+    if _CONS5.search(w):
+        return False
+    return True
+
+
+def good_words() -> set:
+    r"""Words from findings somebody CONFIRMED. The mirror of garbage_words().
+
+    The negative dictionary has been here since the ignore button; this is the
+    other half, and it is what makes marking a file teach something rather
+    than only doing something. Same bar as its opposite: a word has to turn up
+    in GOOD_MIN separate confirmations before it counts, so one mark cannot
+    enshrine one OCR slip.
+    """
+    now = time.time()
+    if now - _GOOD["at"] < _GOOD_TTL:
+        return _GOOD["words"]
+    seen: dict = {}
+    try:
+        with cursor() as cur:
+            for r in cur.execute("SELECT words FROM hardsub WHERE marked=1"):
+                for w in (r["words"] or "").split(","):
+                    w = w.strip().lower()
+                    if w:
+                        seen[w] = seen.get(w, 0) + 1
+    except Exception:                                            # noqa: BLE001
+        return _GOOD["words"]
+    got = {w for w, n in seen.items() if n >= GOOD_MIN}
+    _GOOD.update(at=now, words=got)
+    return got
+
+
+def score_of(row) -> dict:
+    r"""How sure this finding is, 0-100, and the sentence explaining it.
+
+    Every term is evidence that is already in the row:
+
+      language shape   up to 60   what share of the read looks like words
+      speech           up to 25   function words - the strongest single signal
+                                  there is, because "and/this/have" is what
+                                  dialogue is made of and a sign never is
+      cadence          up to 15   how much of the running time had text low in
+                                  the picture; a subtitle track is relentless
+                                  and a title card is not
+
+    and then the three things that are not doubts but refusals:
+
+      a credit roll            x0.35
+      a show already dismissed x0.25
+      words from dismissals    down to x0.4 by how much of the read they are
+    """
+    words = [w.strip().lower() for w in
+             str((row["words"] if "words" in row.keys() else "") or "").split(",")
+             if w.strip()]
+    if not words:
+        return {"score": 0, "why": "nothing readable came back"}
+    uniq = set(words)
+    good = good_words()
+    junk = garbage_words() & uniq
+    shaped = {w for w in uniq if _word_ok(w) or w in good}
+    good_share = len(shaped - junk) / len(uniq)
+    junk_share = len(junk) / len(uniq)
+    speech = _FUNCTION & uniq
+    credits = _CREDITS & uniq
+    try:
+        samples = int(row["samples"] or 0)
+        lows = int(row["low_hits"] or 0)
+    except Exception:                                            # noqa: BLE001
+        samples = lows = 0
+    ratio = (lows / samples) if samples else 0.0
+
+    s = good_share * 60.0
+    s += min(25.0, len(speech) * 8.0)
+    s += min(15.0, ratio * 30.0)
+    bits = [f"{good_share*100:.0f}% of the read is word-shaped"]
+    if speech:
+        bits.append(f"{len(speech)} function word"
+                    + ("" if len(speech) == 1 else "s")
+                    + f" ({', '.join(sorted(speech)[:3])})")
+    else:
+        bits.append("no function words, so a card or a sign rather than speech")
+    if ratio:
+        bits.append(f"text low in the picture in {ratio*100:.0f}% of samples")
+    if credits:
+        s *= 0.35
+        bits.append(f"reads like a credit roll ({', '.join(sorted(credits)[:2])})")
+    try:
+        if _series_of(str(row["path"] or "")) in ignored_series():
+            s *= 0.25
+            bits.append("this show has already been dismissed twice")
+    except Exception:                                            # noqa: BLE001
+        pass
+    if junk_share:
+        s *= max(0.4, 1.0 - 0.6 * junk_share)
+        bits.append(f"{junk_share*100:.0f}% of it is words from findings you "
+                    f"threw away")
+    return {"score": int(max(0, min(100, round(s)))), "why": "; ".join(bits)}
+
+
+# ------------------------------------------------------- auto, and how sure --
+# TWO THRESHOLDS, NOT ONE. A single line would say "everything above this is
+# hardsubbed and everything below is not", which is the claim the evidence
+# cannot support - the whole reason a person is being asked is that the middle
+# is genuinely undecidable from a dozen OCR'd words. So there is a band, and
+# what lands in it is the only thing that reaches the list.
+def mode() -> str:
+    m = str(getattr(SETTINGS, "hardsub_mode", "manual") or "manual").lower()
+    return m if m in ("manual", "auto") else "manual"
+
+
+def mark_at() -> int:
+    try:
+        return max(50, min(100, int(getattr(SETTINGS, "hardsub_mark_at", 85))))
+    except Exception:                                            # noqa: BLE001
+        return 85
+
+
+def dismiss_at() -> int:
+    try:
+        v = int(getattr(SETTINGS, "hardsub_dismiss_at", 30))
+    except Exception:                                            # noqa: BLE001
+        v = 30
+    # Never allowed to meet the other one. A band of zero width is a single
+    # threshold wearing two names, and nothing would ever be asked about.
+    return max(0, min(mark_at() - 10, v))
+
+
+def verdict_for(row) -> dict:
+    """What auto WOULD do with this row, whether or not auto is on."""
+    d = score_of(row)
+    s = d["score"]
+    if s >= mark_at():
+        d["auto"] = "mark"
+        d["auto_why"] = f"{s}% is at or above the {mark_at()}% mark line"
+    elif s <= dismiss_at():
+        d["auto"] = "dismiss"
+        d["auto_why"] = f"{s}% is at or below the {dismiss_at()}% dismiss line"
+    else:
+        d["auto"] = "ask"
+        d["auto_why"] = (f"{s}% sits between {dismiss_at()}% and {mark_at()}%, "
+                         f"so this one is yours to call")
+    return d
+
+
 def ignored_ids() -> set:
     try:
         with cursor() as cur:
@@ -858,6 +1055,36 @@ def mark_progress() -> dict:
     return d
 
 
+def _auto_one(file_id: int) -> str:
+    """Act on one finding if its score is past either line. -> what was done."""
+    try:
+        with cursor() as cur:
+            r = cur.execute(
+                "SELECT file_id, path, state, low_hits, samples, words, marked "
+                "  FROM hardsub WHERE file_id=?", (int(file_id),)).fetchone()
+        if not r or r["marked"]:
+            return ""
+        d = verdict_for(r)
+    except Exception:                                            # noqa: BLE001
+        return ""
+    if d["auto"] == "mark":
+        res = mark_one(int(file_id))
+        if res.get("ok"):
+            joblog.log(f"burned-in subtitles: marked "
+                       f"{os.path.basename(r['path'] or '')} on its own - "
+                       f"{d['auto_why']} ({d['why']})", "info")
+            return "mark"
+        return ""
+    if d["auto"] == "dismiss":
+        res = ignore(int(file_id))
+        if res.get("ok"):
+            joblog.log(f"burned-in subtitles: threw away the finding for "
+                       f"{os.path.basename(r['path'] or '')} - "
+                       f"{d['auto_why']} ({d['why']})", "info")
+            return "dismiss"
+    return ""
+
+
 # ------------------------------------------------------------- the sweep ----
 def untested() -> int:
     if not _READY:
@@ -916,8 +1143,9 @@ async def sweep(limit: int = 0, force: bool = False) -> dict:
     todo = await asyncio.to_thread(_candidates, int(limit or PER_RUN))
     t0 = time.time()
     STATE.update(running=True, done=0, total=len(todo), now="", found=0,
-                 t0=t0, yielded="")
+                 t0=t0, yielded="", auto_marked=0, auto_dropped=0)
     done = found = 0
+    auto_marked = auto_dropped = 0
     try:
         for r in todo:
             # THE GATE DECIDES, BEFORE EVERY FILE. Not once at the start: a
@@ -939,6 +1167,20 @@ async def sweep(limit: int = 0, force: bool = False) -> dict:
             if d["state"] != NONE:
                 found += 1
                 STATE["found"] = found
+                # AUTO ACTS ONLY WHERE THE EVIDENCE IS NOT IN DOUBT, and the
+                # asymmetry is deliberate: dismissing is a row disappearing
+                # and can be undone from the ignored list, while marking
+                # rewrites a file. Both ends are still gated on the same
+                # score, but the one with consequences sits behind a
+                # threshold a person set on purpose.
+                if mode() == "auto":
+                    acted = await asyncio.to_thread(_auto_one, r["file_id"])
+                    if acted == "mark":
+                        auto_marked += 1
+                        STATE["auto_marked"] = auto_marked
+                    elif acted == "dismiss":
+                        auto_dropped += 1
+                        STATE["auto_dropped"] = auto_dropped
     finally:
         took = max(0.001, time.time() - t0)
         # SECONDS PER FILE, SMOOTHED ACROSS RUNS. One run of twenty files is a
@@ -960,9 +1202,14 @@ async def sweep(limit: int = 0, force: bool = False) -> dict:
             pass
     if found:
         joblog.log(f"burned-in subtitle check: {found} of {done} file(s) that "
-                   f"report no subtitles are carrying them in the picture",
+                   f"report no subtitles are carrying them in the picture"
+                   + (f" - {auto_marked} marked automatically" if auto_marked
+                      else "")
+                   + (f", {auto_dropped} dismissed as noise" if auto_dropped
+                      else ""),
                    "warn")
     return {"ok": True, "checked": done, "found": found,
+            "auto_marked": auto_marked, "auto_dropped": auto_dropped,
             "yielded": STATE.get("yielded") or "",
             "remaining": await asyncio.to_thread(untested)}
 
@@ -993,6 +1240,11 @@ def stats() -> dict:
            "last_found": STATE.get("last_found") or 0,
            "runs": STATE.get("runs") or 0,
            "per_run": PER_RUN, "cycle_s": CYCLE_S,
+           # The two lines and which side of them auto is allowed to act on.
+           "mode": mode(), "mark_at": mark_at(), "dismiss_at": dismiss_at(),
+           "auto_marked": STATE.get("auto_marked") or 0,
+           "auto_dropped": STATE.get("auto_dropped") or 0,
+           "learned_good": len(good_words()),
            # THE ONE THAT ACTUALLY DECIDES ANYTHING. Not "how long is this
            # batch" but "how long until the library is answered", at the pace
            # this is really going and the cadence it really runs on.
@@ -1031,11 +1283,20 @@ def stats() -> dict:
 
 
 def found(limit: int = 60) -> list:
+    """The findings, each with how sure it is and what auto would do.
+
+    SORTED BY DOUBT, NOT BY DATE. The list used to be newest-first, which is
+    the right order for a log and the wrong one for a queue of decisions: the
+    rows worth a person's attention are the ones nearest the middle of the
+    band, and those arrived in no particular order. Least certain first puts
+    the genuinely hard calls at the top and the ones auto would have handled
+    at the bottom.
+    """
     if not _READY:
         init()
     try:
         with cursor() as cur:
-            return [dict(r) for r in cur.execute(
+            rows = [dict(r) for r in cur.execute(
                 "SELECT h.file_id, h.path, h.state, h.low_hits, h.samples, "
                 "       h.words, h.detail, h.marked, f.library "
                 "  FROM hardsub h JOIN files f ON f.id = h.file_id "
@@ -1045,6 +1306,13 @@ def found(limit: int = 60) -> list:
                 " ORDER BY h.at DESC LIMIT ?", (NONE, int(limit)))]
     except Exception:                                            # noqa: BLE001
         return []
+    lo, hi = dismiss_at(), mark_at()
+    mid = (lo + hi) / 2.0
+    for r in rows:
+        r.update(verdict_for(r))
+    rows.sort(key=lambda r: (bool(r.get("marked")),
+                             abs(r.get("score", 0) - mid)))
+    return rows
 
 
 async def watch() -> None:

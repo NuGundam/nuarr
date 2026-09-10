@@ -385,6 +385,14 @@ class Settings:
     # that will not decode means blocklisting the release. Opt-in for the same
     # reason audit_mode is.
     integrity_mode: str = "manual"
+    # The burned-in subtitle check scores every finding 0-100 from the shape of
+    # what the OCR read. In "auto" it acts on the confident ends of that range
+    # by itself - marking above hardsub_mark_at, dismissing below
+    # hardsub_dismiss_at - and only shows a person what falls between. Manual
+    # by default because marking rewrites files.
+    hardsub_mode: str = "manual"
+    hardsub_mark_at: int = 85
+    hardsub_dismiss_at: int = 30
     # How many unmeasured picture-subtitle files one "Check now" pass reads.
     # 0 means the whole backlog - each file costs one demux, so it is bounded
     # by default and unbounded on request.

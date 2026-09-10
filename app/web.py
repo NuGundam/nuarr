@@ -6761,6 +6761,61 @@ def api_hardsub(limit: int = 40):
         max(1, min(int(limit), 300)))}
 
 
+@app.post("/api/hardsub/mode")
+async def api_hardsub_mode(mode: str = "", mark_at: int = -1,
+                           dismiss_at: int = -1):
+    """The switch and the two lines. Any of the three, or all of them.
+
+    ONE ENDPOINT FOR ALL THREE because they are one decision. Turning auto on
+    without saying where the lines are is asking a question with no answer,
+    and moving a line while auto is off is how you find out where you would
+    have wanted it before letting it act.
+    """
+    import yaml
+    from .config import SETTINGS
+    from . import hardsub
+    p = _config_path()
+    raw = {}
+    if p.exists():
+        try:
+            raw = yaml.safe_load(p.read_text(encoding="utf-8-sig")) or {}
+        except Exception:                                    # noqa: BLE001
+            raw = {}
+    said = []
+    m = (mode or "").strip().lower()
+    if m:
+        if m not in ("auto", "manual"):
+            raise HTTPException(400, "mode must be auto or manual")
+        raw["hardsub_mode"] = m
+        SETTINGS.hardsub_mode = m
+        said.append(m)
+    if mark_at >= 0:
+        v = max(50, min(100, int(mark_at)))
+        raw["hardsub_mark_at"] = v
+        SETTINGS.hardsub_mark_at = v
+        said.append(f"mark at {v}%")
+    if dismiss_at >= 0:
+        # Clamped against the OTHER line rather than accepted as given: a band
+        # of zero width is one threshold wearing two names, and nothing would
+        # ever be left for a person to look at.
+        v = max(0, min(hardsub.mark_at() - 10, int(dismiss_at)))
+        raw["hardsub_dismiss_at"] = v
+        SETTINGS.hardsub_dismiss_at = v
+        said.append(f"dismiss at {v}%")
+    if not said:
+        return {"ok": False, "why": "nothing to change"}
+    p.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True),
+                 encoding="utf-8")
+    joblog.log("burned-in subtitle check: " + ", ".join(said)
+               + (" - findings above the mark line are marked without asking, "
+                  "below the dismiss line are thrown away, and the band "
+                  "between is what you are shown"
+                  if hardsub.mode() == "auto" else
+                  " - nothing is acted on automatically"), "info")
+    return {"ok": True, "mode": hardsub.mode(), "mark_at": hardsub.mark_at(),
+            "dismiss_at": hardsub.dismiss_at()}
+
+
 @app.post("/api/hardsub/run")
 async def api_hardsub_run(limit: int = 0):
     """Sweep now. Does not yield to the gate - the button IS the decision."""
@@ -29515,6 +29570,37 @@ function alpPaint(){
 // unticked forty boxes would be worse than no checkboxes at all.
 let _hs=null, _hsKey='', _hsPoll=null;
 let _hsSel=new Set(), _hsLast=null, _hsMarkPoll=null;
+// MARKED IS AN ANSWERED QUESTION, so it does not belong in a list of
+// questions. Hidden by default with the count and a way back, the same shape
+// the sidecar panel and the ignored list use - a row you have dealt with
+// should cost you nothing to scroll past, because you should not have to.
+let _hsShowMarked=false;
+function hsShowMarked(on){ _hsShowMarked=!!on; _hsKey=''; hsPaint(); }
+
+// The colour is the decision, not the number. Above the mark line and below
+// the dismiss line are settled; the band between is the only place a person
+// is needed, so that is the only place that gets the attention colour.
+function hsScoreColor(r){
+  if(r.auto==='mark') return 'var(--ok)';
+  if(r.auto==='dismiss') return 'var(--dim)';
+  return 'var(--warn)';
+}
+function hsBandCount(){
+  return (((_hs&&_hs.found)||[]).filter(r=>!r.marked&&r.auto==='ask')).length;
+}
+async function hsMode(m, btn){
+  if(btn){ btn.disabled=true; btn.textContent='…'; }
+  try{ await fetch('/api/hardsub/mode?mode='+m,{method:'POST'}); }catch(e){}
+  _hsKey=''; loadHardsub();
+}
+async function hsLine(which, val, el){
+  // The server clamps - the dismiss line is never allowed within ten points
+  // of the mark line - so the box is repainted from what it actually took
+  // rather than from what was typed.
+  try{ await fetch(`/api/hardsub/mode?${which}=${encodeURIComponent(val)}`,
+                   {method:'POST'}); }catch(e){}
+  _hsKey=''; loadHardsub();
+}
 
 function hsRows(){ return ((_hs&&_hs.found)||[]).filter(r=>!r.marked); }
 function hsSelIds(){
@@ -29602,7 +29688,9 @@ async function loadHardsub(){
 }
 function hsPaint(){
   const el=document.getElementById('hsPanel'); if(!el||!_hs) return;
-  const d=_hs, rows=d.found||[];
+  const d=_hs, all=d.found||[];
+  const hidden = _hsShowMarked ? 0 : all.filter(r=>r.marked).length;
+  const rows = _hsShowMarked ? all : all.filter(r=>!r.marked);
   const tested=(d.none||0)+(d.signs||0)+(d.dialogue||0)+(d.hybrid||0);
   const head=`<b style="color:#6fb0ff">Subtitles already in the picture</b>
     <span class="dim" style="font-size:11.5px">${fmt(tested)} checked · ${
@@ -29616,8 +29704,35 @@ function hsPaint(){
       (d.ignored_series&&d.ignored_series.length)?` · <span title="${
         esc(d.ignored_series.join('\n'))}">${d.ignored_series.length} show${
         d.ignored_series.length===1?'':'s'} left alone</span>`:''}</span>
-    <span style="float:right"><button class="rmb" onclick="hsRun(this)" ${
+    <span style="float:right;display:flex;gap:8px;align-items:center">
+      <span class="gsw" title="Manual finds them, scores them and waits for you. Auto acts on the two confident ends by itself - marking above the first line, throwing away below the second - and still shows you everything in between, which is the part the evidence cannot settle.">
+        <b style="font-size:11px;color:${d.mode==='auto'?'var(--ok)':'var(--dim)'}">${
+          d.mode==='auto'?'auto':'manual'}</b>
+        <button class="rmb" onclick="hsMode('${d.mode==='auto'?'manual':'auto'}',this)"
+          >${d.mode==='auto'?'hand it back':'let it decide'}</button></span>
+      <button class="rmb" onclick="hsRun(this)" ${
       d.running?'disabled':''}>${d.running?'looking…':'Check some now'}</button></span>`;
+  // ---- the two lines, and what falls between them -----------------------
+  // SHOWN WHETHER OR NOT AUTO IS ON, because where you would put the lines is
+  // a thing to work out BEFORE letting anything act on them - the scores are
+  // on every row already, so the effect of moving a line is visible before it
+  // has consequences.
+  const band = `<div style="display:flex;gap:10px;align-items:center;
+        flex-wrap:wrap;font-size:11px;margin:2px 0 6px">
+      <span class="dim">Sure enough to mark on its own</span>
+      <input type="number" min="50" max="100" step="5" value="${d.mark_at||85}"
+        style="width:62px" onchange="hsLine('mark_at',this.value,this)">
+      <span class="dim">%</span>
+      <span class="dim" style="margin-left:8px">Unsure enough to throw away</span>
+      <input type="number" min="0" max="90" step="5" value="${d.dismiss_at||30}"
+        style="width:62px" onchange="hsLine('dismiss_at',this.value,this)">
+      <span class="dim">%</span>
+      <span class="dim" style="margin-left:8px"
+        title="A finding is scored from the shape of what the OCR read: how much of it is word-shaped, how many function words came back, and how relentless the text was. Anything landing between the two lines is what you are asked about, and every answer you give feeds the dictionaries that produce the next score.">
+        ${fmt(hsBandCount())} in between${d.learned_good?` · ${fmt(d.learned_good)} words confirmed`:''}</span>
+      ${(d.auto_marked||d.auto_dropped)?`<span style="color:var(--ok)">last pass: ${
+        fmt(d.auto_marked||0)} marked, ${fmt(d.auto_dropped||0)} dropped</span>`:''}
+    </div>`;
   const note=`<div class="dim" style="font-size:11px;margin:3px 0 6px">
     Only files that report having NO subtitle track are looked at — one with a
     track already answers every question this asks. Twenty-four frames are
@@ -29718,16 +29833,21 @@ function hsPaint(){
 
   const table = rows.length ? `${markBar}${selBar}
       <table style="width:100%;font-size:11.5px">
-      <colgroup><col style="width:26px"><col style="width:38%"><col style="width:11%">
-        <col style="width:10%"><col style="width:23%"><col style="width:14%"></colgroup>
+      <colgroup><col style="width:26px"><col style="width:35%"><col style="width:10%">
+        <col style="width:10%"><col style="width:52px"><col style="width:21%">
+        <col style="width:14%"></colgroup>
       <thead><tr>
         <th style="padding:2px 4px 4px 0;text-align:left">
           <input type="checkbox" ${allOn?'checked':''}
             title="Select every finding shown"
             onclick="hsSelAll(this.checked)"></th>
-        <th colspan="5" class="dim" style="padding:2px 0 4px;text-align:left;
+        <th colspan="6" class="dim" style="padding:2px 0 4px;text-align:left;
             font-weight:400;font-size:10.5px">
-          ${fmt(pick.length)} still to answer</th>
+          ${fmt(pick.length)} still to answer${
+            hidden?` · <a href="#" onclick="hsShowMarked(1);return false">show ${
+              fmt(hidden)} already marked</a>`:''}${
+            (_hsShowMarked&&d.marked)?` · <a href="#" onclick="hsShowMarked(0);return false">hide the marked ones</a>`:''}
+          · least certain first</th>
       </tr></thead>
       <tbody>${rows.map(r=>{
         const [word,col]=HSW[r.state]||[r.state,'var(--dim)'];
@@ -29740,6 +29860,9 @@ function hsPaint(){
           >${esc(String(r.path||'').split('\\').pop())}</td>
         <td class="dim" style="padding:3px 8px 3px 0">${esc(r.library||'')}</td>
         <td style="padding:3px 8px 3px 0;color:${col}">${esc(word)}</td>
+        <td class="mono" style="padding:3px 8px 3px 0;text-align:right;
+            color:${hsScoreColor(r)}" title="${esc((r.why||'')+' — '+(r.auto_why||''))}"
+          >${r.score===undefined?'':r.score+'%'}</td>
         <td class="dim mono" style="padding:3px 8px 3px 0;overflow:hidden;
             text-overflow:ellipsis;white-space:nowrap"
             title="${esc('read from the picture: '+(r.words||''))}"
@@ -29754,7 +29877,7 @@ function hsPaint(){
     : `<div class="dim" style="font-size:11.5px">${
         tested?'Nothing checked so far is carrying subtitles in the picture.'
               :'Nothing checked yet.'}</div>`;
-  const html=`<div class="lkind" style="padding:11px 12px">${head}${note}${prog}${hist}${table}</div>`;
+  const html=`<div class="lkind" style="padding:11px 12px">${head}${note}${band}${prog}${hist}${table}</div>`;
   // The same rule the errors drill follows: while a run is going this panel
   // repaints every 1.5s, and a rebuild would take the question with it.
   if(askOpen('hsPanel')) return;
