@@ -2067,13 +2067,14 @@ RULE_META = [
           "what": "Taken in, and the track it replaces is dropped from the "
                   "rebuilt file - because Bazarr fetching a subtitle for a "
                   "language you already had usually means it found a better "
-                  "one. Needs the rule above. Also lets a real subtitle "
-                  "replace the blank marker track on a file whose subtitles "
-                  "are burned into the picture."},
+                  "one. Needs the rule above."},
      ],
      "what": "If two tracks of that kind are already inside, nothing is "
              "changed and the file is listed instead - which one the sidecar "
-             "replaces is not something to guess at.",
+             "replaces is not something to guess at. A file whose subtitles "
+             "are burned into the picture is never touched in that language "
+             "at all, whatever this says: a second copy inside it would play "
+             "on top of the words already on screen.",
      "default": "leave"},
     {"key": "prefer_signs_over_forced",
      "label": "A Signs & Songs track beats whatever carries the forced flag",

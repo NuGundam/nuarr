@@ -300,9 +300,10 @@ def _role_class(role: str) -> str:
 # to preserve a placeholder that contains one blank line. That is the worst
 # outcome this feature can produce, and it would have looked like it worked.
 #
-# So a marker is its own kind, it is never a twin of anything, and the only
-# thing that may happen to it is being replaced by the real subtitle it was
-# standing in for.
+# So a marker is its own kind and NOTHING may happen to it. It is not a twin,
+# so nothing is recycled against it - and it is not a placeholder to be
+# upgraded either, because the words it is describing are still painted on the
+# picture. A file wearing one is left alone in that language entirely.
 def _is_marker(title: str) -> bool:
     t = (title or "").strip().lower()
     if not t:
@@ -466,6 +467,29 @@ def plan_one(file_id: int, force: bool = False,
         if _lang_key(name["lang"]) in have:
             twins = _same_kind(inside, name["lang"], name["role"])
             cls = _role_class(name["role"])
+            # THE WORDS ARE ALREADY ON THE SCREEN.
+            #
+            # A marker track means this file's subtitles are PAINTED INTO THE
+            # PICTURE. An earlier version of this treated the marker as a
+            # placeholder worth replacing with a real subtitle, which is
+            # exactly wrong twice over: the file would play the sidecar on top
+            # of the burned-in words - two sets of English at once - and
+            # dropping the marker would tell Bazarr and Plex there is nothing
+            # burned in, so the next pass would fetch another one.
+            #
+            # The marker stops being true only when the words come out of the
+            # picture, and taking them out means inpainting the video frame by
+            # frame and re-encoding it. Nothing here does that. Until
+            # something does, a sidecar in the burned-in language is left
+            # exactly where it is - not embedded, not recycled.
+            if _markers(inside, name["lang"]):
+                out["skip"].append({
+                    "sidecar": side,
+                    "why": f"this file's {name['lang']} subtitles are burned "
+                           f"into the picture, so a second copy inside it "
+                           f"would play on top of them - and nothing can take "
+                           f"them out of the picture without re-encoding it"})
+                continue
             # NOT A DUPLICATE AT ALL, so no answer is needed. The language is
             # inside; a subtitle of this KIND is not. Full dialogue against
             # SDH, or against a signs track - different subtitles, and the
@@ -493,21 +517,6 @@ def plan_one(file_id: int, force: bool = False,
                 # dropped. Only reachable with this switch on, because it
                 # widens what the file is allowed to gain.
                 if not twins:
-                    # THE PLACEHOLDER'S TURN IS OVER. A blank marker track
-                    # exists because there was no real subtitle; one has just
-                    # turned up, so the real one takes its place rather than
-                    # sitting beside it. Only for a full sidecar - a forced or
-                    # SDH file does not answer what the marker was saying.
-                    mk = _markers(inside, name["lang"]) if cls == "full" else []
-                    if len(mk) == 1:
-                        out["take"].append({
-                            "sidecar": side, "lang": name["lang"],
-                            "role": name["role"], "size": _size(side),
-                            "replaces": [mk[0]["ord"]],
-                            "note": "replaces the blank marker track that "
-                                    "said the subtitles are burned into the "
-                                    "picture"})
-                        continue
                     out["take"].append({
                         "sidecar": side, "lang": name["lang"],
                         "role": name["role"], "size": _size(side),
@@ -713,7 +722,7 @@ def embed_one(file_id: int) -> dict:
                 hit = by_ord.get(o)
                 want_cls = _role_class(t.get("role") or "")
                 if hit is None or hit["lang"] != _lang_key(t["lang"]) \
-                        or hit["class"] not in (want_cls, "marker"):
+                        or hit["class"] != want_cls:
                     lost.append(t["lang"])
                 else:
                     ids.append(str(hit["id"]))
