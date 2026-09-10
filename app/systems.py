@@ -129,7 +129,12 @@ def running() -> dict:
     try:
         from . import scanner
         p = scanner.PROGRESS or {}
-        if p.get("started") and not p.get("done_at"):
+        # PROGRESS keeps its last state after a pass ends, so "started" alone
+        # left a finished scan sitting on the list reading 12 of 12 · done.
+        # The phase is what says whether it is over.
+        phase = str(p.get("phase") or "").lower()
+        if (p.get("started") and not p.get("done_at")
+                and phase not in ("done", "idle", "finished", "")):
             out.append(_one("scan", "Library scan", "/#scan", True,
                             now=p.get("library") or p.get("disk") or "",
                             done=p.get("disk_i") or 0, total=p.get("disks") or 0,
@@ -157,6 +162,21 @@ def running() -> dict:
                             done=pr.get("done") or 0, total=pr.get("total") or 0,
                             note=pr.get("state") or "",
                             since=pr.get("started_at") or 0.0))
+    except Exception:                                            # noqa: BLE001
+        pass
+
+    # READING FLAGGED SUBTITLE TRACKS, which is disk rather than a query and
+    # is the one part of that check somebody might be waiting on.
+    try:
+        from . import subtitletitle as _stt
+        ins = _stt.INSPECT_STATE or {}
+        if ins.get("running"):
+            out.append(_one("subtitletitle:read", "Reading subtitle tracks",
+                            "/settings#subs", True, now=ins.get("now") or "",
+                            done=ins.get("done") or 0,
+                            total=ins.get("total") or 0,
+                            note="looking at where the lines actually are",
+                            since=ins.get("t0") or 0.0))
     except Exception:                                            # noqa: BLE001
         pass
 

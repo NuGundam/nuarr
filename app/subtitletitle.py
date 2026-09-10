@@ -240,7 +240,13 @@ def _rows_from_probe(path: str, probe: dict) -> list:
         else:
             # The opposite finding: the further below 3 a minute, the surer.
             sure = 100.0 - (cpm / 3.0) * 40.0
-        out.append({"track": s_i, "old": old, "new": new, "why": why,
+        out.append({"track": s_i,
+                    # mkvextract numbers tracks the way mkvmerge does, which
+                    # for Matroska is ffprobe's stream index - not the s1/s2
+                    # ordinal mkvpropedit wants. Both are carried because both
+                    # are needed and they are not the same number.
+                    "mkv_id": int(s.get("index") or 0),
+                    "old": old, "new": new, "why": why,
                     "sure": int(max(0, min(100, round(sure)))),
                     "cues": cues, "cpm": round(cpm, 1),
                     "minutes": round(dur / 60.0, 1),
@@ -266,6 +272,238 @@ def _label(r) -> str:
         return (r["title"] if "title" in r.keys() else "") or ""
 
 
+# ---------------------------------------- what the cue rate cannot see ------
+# THE CUE RATE IS A FIRST PASS, AND IT HAS A BLIND SPOT.
+#
+# By the Grace of the Gods S01E03 carries a track called "Signs & Songs" at 8.3
+# cues a minute, which is inside the band where people talk, so the first pass
+# called it mislabelled dialogue. It is not. Reading the actual events settles
+# it in one look:
+#
+#     192 events across ELEVEN styles, named
+#         neo sign · neo op enga · neo op roma · neo ed enga · neo ed roma
+#     60% of them positioned with \pos or \move
+#     and the first five are one "Episode 3" title card, animated frame by
+#     frame with \clip - five events for one thing on screen
+#
+# That is a signs-and-karaoke track doing exactly what it says. What inflated
+# its rate was the opening and ending songs: romaji and english lines, two
+# events per lyric, which is a lot of cues and no dialogue at all.
+#
+# So the rate finds candidates and this confirms them, the same two-stage
+# shape the hardsub check uses - bright pixels to find, OCR to confirm. The
+# expensive half only ever runs on what the cheap half flagged.
+#
+# WHAT SEPARATES THEM, in order of how decisive it is:
+#
+#   THE GROUP SAID SO. Style names are written by whoever typeset the release,
+#   and "sign", "op", "ed", "karaoke", "title" are not words that end up on a
+#   dialogue style by accident. This is testimony, not inference.
+#
+#   IT IS POSITIONED. Dialogue sits where its style puts it, along the bottom.
+#   A sign goes where the thing it labels is, which in ASS means \pos or
+#   \move. Measured here: 60% on the signs track.
+#
+#   THERE ARE TOO MANY STYLES. A dialogue track needs one style, or two with
+#   an alternate speaker. Eleven styles is a typesetter's palette.
+POS_SHARE = 0.25         # a quarter positioned is already not dialogue
+MANY_STYLES = 5
+INSPECT_PER_SCAN = 80    # bounded: each is a demux of ~40 KB, not free
+_STYLE_SIGN = re.compile(
+    r"\b(sign|signs|op|ed|oped|karaoke|kara|title|credit|credits|note|"
+    r"caption|typeset|logo|insert)\b", re.I)
+_EVENT = re.compile(r"^Dialogue:\s*(.*)$", re.M)
+_POSITIONED = re.compile(r"\\(?:pos|move)\s*\(", re.I)
+
+
+def _mkvextract() -> str:
+    p = _mkvpropedit()
+    guess = os.path.join(os.path.dirname(p), "mkvextract.exe")
+    return guess if os.path.exists(guess) else "mkvextract"
+
+
+def _inspect_init() -> None:
+    with cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS subtitle_shape(
+                file_id  INTEGER NOT NULL,
+                track    INTEGER NOT NULL,
+                size     INTEGER,
+                at       REAL,
+                events   INTEGER,
+                styles   INTEGER,
+                pos_pct  REAL,
+                signish  INTEGER,
+                detail   TEXT,
+                PRIMARY KEY (file_id, track)
+            )""")
+
+
+def _read_events(path: str, mkv_track_id: int) -> dict | None:
+    r"""Pull one text subtitle track out and describe its SHAPE.
+
+    Never its words - this is about where the lines are and what the styles
+    are called, which is the part the cue count could not see.
+    """
+    if not os.path.exists(path):
+        return None
+    out = os.path.join(os.environ.get("TEMP") or ".",
+                       f".nuarr-shape-{int(time.time()*1000)}.txt")
+    try:
+        r = _quiet_run([_mkvextract(), "tracks", path,
+                        f"{int(mkv_track_id)}:{out}"],
+                       capture_output=True, text=True, timeout=180)
+        if r.returncode >= 2 or not os.path.exists(out):
+            return None
+        with open(out, encoding="utf-8-sig", errors="replace") as fh:
+            text = fh.read()
+    except Exception:                                            # noqa: BLE001
+        return None
+    finally:
+        try:
+            if os.path.exists(out):
+                os.remove(out)
+        except OSError:
+            pass
+    lines = _EVENT.findall(text)
+    if not lines:
+        # SRT and VTT have no styles and no positioning, so there is nothing
+        # here to learn - and nothing to contradict the rate with either.
+        return {"events": 0, "styles": 0, "pos_pct": 0.0, "signish": 0,
+                "detail": "not a styled subtitle, so only the cue rate applies"}
+    styles: dict = {}
+    positioned = 0
+    for ln in lines:
+        parts = ln.split(",", 9)
+        if len(parts) < 10:
+            continue
+        styles[parts[3].strip()] = styles.get(parts[3].strip(), 0) + 1
+        if _POSITIONED.search(parts[9]):
+            positioned += 1
+    n = max(1, len(lines))
+    named = sorted(s for s in styles if _STYLE_SIGN.search(s or ""))
+    share = positioned / n
+    bits = []
+    if named:
+        bits.append("styles called " + ", ".join(f"{s!r}" for s in named[:3]))
+    if share:
+        bits.append(f"{share*100:.0f}% positioned with \\pos or \\move")
+    if len(styles) >= MANY_STYLES:
+        bits.append(f"{len(styles)} different styles")
+    return {"events": len(lines), "styles": len(styles),
+            "pos_pct": round(share * 100, 1), "signish": len(named),
+            "detail": "; ".join(bits)}
+
+
+def shape_of(file_id: int, path: str, track: int, size: int,
+             mkv_track_id: int) -> dict | None:
+    """The cached shape of one track, reading it only when it is not known."""
+    try:
+        _inspect_init()
+        with cursor() as cur:
+            r = cur.execute(
+                "SELECT * FROM subtitle_shape WHERE file_id=? AND track=? "
+                "  AND size=?", (int(file_id), int(track), int(size))).fetchone()
+        if r:
+            return dict(r)
+    except Exception:                                            # noqa: BLE001
+        return None
+    got = _read_events(path, mkv_track_id)
+    if got is None:
+        return None
+    try:
+        with cursor() as cur:
+            cur.execute(
+                "INSERT INTO subtitle_shape(file_id,track,size,at,events,"
+                "  styles,pos_pct,signish,detail) VALUES(?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(file_id,track) DO UPDATE SET size=excluded.size, "
+                "  at=excluded.at, events=excluded.events, "
+                "  styles=excluded.styles, pos_pct=excluded.pos_pct, "
+                "  signish=excluded.signish, detail=excluded.detail",
+                (int(file_id), int(track), int(size), time.time(),
+                 got["events"], got["styles"], got["pos_pct"], got["signish"],
+                 got["detail"][:300]))
+    except Exception:                                            # noqa: BLE001
+        pass
+    return got
+
+
+def _shapes_for(file_ids) -> dict:
+    """Every shape already known for these files, keyed (file_id, track)."""
+    ids = sorted({int(i) for i in (file_ids or [])})
+    out: dict = {}
+    if not ids:
+        return out
+    try:
+        _inspect_init()
+        with cursor() as cur:
+            for i in range(0, len(ids), 400):
+                chunk = ids[i:i + 400]
+                qs = ",".join("?" * len(chunk))
+                for r in cur.execute(
+                        f"SELECT * FROM subtitle_shape "
+                        f" WHERE file_id IN ({qs})", chunk):
+                    out[(r["file_id"], r["track"])] = dict(r)
+    except Exception:                                            # noqa: BLE001
+        return {}
+    return out
+
+
+INSPECT_STATE: dict = {"running": False, "done": 0, "total": 0, "now": "",
+                       "t0": 0.0, "cleared": 0, "last_run": 0.0}
+
+
+def inspect_some(limit: int = INSPECT_PER_SCAN) -> dict:
+    r"""Read the events of candidates nobody has read yet.
+
+    ON ITS OWN CLOCK, because a demux is disk and the page is a query. Each
+    one is small - a subtitle track out of a 184 MB episode - but eighty of
+    them is not something a page load should wait for.
+    """
+    if INSPECT_STATE["running"]:
+        return {"ok": False, "why": "already reading"}
+    d = _CACHE.get("data") or {}
+    rows = [r for r in (d.get("rows") or []) if r.get("unread")
+            and r.get("mkv_id")]
+    if not rows:
+        return {"ok": True, "read": 0, "cleared": 0,
+                "why": "every candidate has been read"}
+    rows = rows[:max(1, int(limit))]
+    INSPECT_STATE.update(running=True, done=0, total=len(rows), now="",
+                         t0=time.time(), cleared=0)
+    cleared = 0
+    try:
+        for i, r in enumerate(rows, 1):
+            INSPECT_STATE.update(done=i - 1,
+                                 now=os.path.basename(r.get("path") or ""))
+            try:
+                sh = shape_of(r["file_id"], r["path"], r["track"],
+                              int(r.get("size") or 0), r["mkv_id"])
+            except Exception:                                    # noqa: BLE001
+                continue
+            if _is_really_signs(sh):
+                cleared += 1
+                INSPECT_STATE["cleared"] = cleared
+    finally:
+        INSPECT_STATE.update(running=False, now="", done=len(rows),
+                             last_run=time.time())
+        _CACHE["at"] = 0.0            # the next read re-judges with what we know
+    if cleared:
+        joblog.log(f"subtitle titles: read {len(rows)} flagged track(s) and "
+                   f"cleared {cleared} - signs, karaoke or typesetting rather "
+                   f"than mislabelled dialogue", "info")
+    return {"ok": True, "read": len(rows), "cleared": cleared}
+
+
+def _is_really_signs(sh: dict) -> bool:
+    """Does the shape contradict the rate? Any one of the three is enough."""
+    if not sh or not sh.get("events"):
+        return False
+    return bool(sh.get("signish")
+                or (sh.get("pos_pct") or 0) >= POS_SHARE * 100
+                or (sh.get("styles") or 0) >= MANY_STYLES)
+
+
 def scan(limit: int = 0) -> dict:
     r"""Every contradicted subtitle title in the library, from stored probes."""
     rows, checked = [], 0
@@ -274,7 +512,7 @@ def scan(limit: int = 0) -> dict:
         with cursor() as cur:
             got = cur.execute(
                 "SELECT f.id, f.path, f.title, f.library, f.season, "
-                "       f.episode, p.json "
+                "       f.episode, f.size, p.json "
                 "  FROM files f JOIN file_probes p ON p.file_id = f.id "
                 " WHERE f.state NOT IN ('deleted','duplicate') "
                 + (" LIMIT ?" if limit else ""),
@@ -291,12 +529,62 @@ def scan(limit: int = 0) -> dict:
             for row in _rows_from_probe(r["path"] or "", probe):
                 row.update(file_id=r["id"], path=r["path"],
                            title=r["title"] or "", library=r["library"] or "",
-                           label=_label(r))
+                           size=r["size"] or 0, label=_label(r))
                 rows.append(row)
     finally:
         _CACHE.update(running=False, done=checked, now="", t1=time.time())
+    # ---- the second pass, consulted but never RUN from here -------------
+    # SCANNING MUST STAY A QUERY. The first version read the events inline and
+    # turned a 0.9-second endpoint into one that did eighty demuxes before it
+    # answered - a page that took minutes to load, which is a worse fault than
+    # the false positive it was fixing. So the shapes are looked up here and
+    # produced by inspect_some() on its own clock; a candidate nobody has read
+    # yet stays listed, marked as unread rather than silently trusted.
+    # A CANDIDATE IS NOT A FINDING UNTIL SOMEBODY HAS READ IT.
+    #
+    # This is not caution, it is what the first eighty reads showed: 45 of 45
+    # candidates cleared, and so did BLUE LOCK S02E11 - the file this check was
+    # built on. Its "Forced (Signs only)" track has 466 events in 5 styles with
+    # 15% of them positioned, while the "Dubtitle (SDH)" track beside it has
+    # 615 events in ONE style with none positioned. That is the difference
+    # between a sign sheet and dialogue, and the cue rate cannot see it: an
+    # opening song is two events per lyric and an animated title card is one
+    # event per frame, so a signs track reaches a talking cadence without a
+    # word of dialogue in it.
+    #
+    # So the rate now produces CANDIDATES, and nothing is offered as
+    # correctable until its events have been read. Leaving them actionable
+    # would have renamed 82 correctly-labelled signs tracks to "English".
+    dropped, unread = [], 0
+    known = _shapes_for([r["file_id"] for r in rows])
+    for r in list(rows):
+        sh = known.get((r["file_id"], r["track"]))
+        if sh is None:
+            unread += 1
+            r["unread"] = True
+            r["rewritable"] = False        # nothing to press until it is read
+            continue
+        if _is_really_signs(sh):
+            r["shape"] = sh.get("detail") or ""
+            dropped.append(r)
+            continue
+        r["read"] = True
+        r["shape"] = (f"{sh.get('events') or 0} events in "
+                      f"{sh.get('styles') or 0} style"
+                      f"{'' if sh.get('styles') == 1 else 's'}, "
+                      f"{sh.get('pos_pct') or 0:.0f}% positioned")
+    if dropped:
+        gone = {id(r) for r in dropped}
+        rows = [r for r in rows if id(r) not in gone]
+    _CACHE["cleared"] = [
+        {"label": r.get("label") or "", "old": r.get("old") or "",
+         "why": r.get("shape") or ""} for r in dropped[:40]]
+    looked = len(rows) + len(dropped) - unread
+
     rows.sort(key=lambda r: (not r.get("rewritable"), r.get("sure", 0)))
     data = {"rows": rows, "checked": checked, "at": time.time(),
+            "cleared": len(dropped), "inspected": looked, "unread": unread,
+            "cleared_rows": _CACHE["cleared"],
             "took": round(_CACHE["t1"] - _CACHE["t0"], 1),
             "fixable": sum(1 for r in rows if r["rewritable"])}
     _CACHE.update(at=time.time(), data=data)
@@ -305,8 +593,11 @@ def scan(limit: int = 0) -> dict:
         # are about different things: `rewritable` is whether a replacement
         # can be written without losing what a group put there, `sure` is
         # whether the finding is right at all.
+        # `rewritable` is False for anything unread, so this cannot reach a
+        # candidate nobody has looked at - which is the whole point.
         want = [r for r in rows
-                if r.get("rewritable") and r.get("sure", 0) >= sure_at()]
+                if r.get("rewritable") and r.get("read")
+                and r.get("sure", 0) >= sure_at()]
         if want:
             out = fix(want)
             data["auto_fixed"] = out.get("fixed") or 0

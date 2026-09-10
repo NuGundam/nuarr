@@ -6786,6 +6786,10 @@ def api_subtitletitle(limit: int = 200):
     rows = d.get("rows") or []
     return {"rows": rows[:max(1, min(int(limit), 600))],
             "total": len(rows), "fixable": d.get("fixable") or 0,
+            "cleared": d.get("cleared") or 0,
+            "unread": d.get("unread") or 0,
+            "inspected": d.get("inspected") or 0,
+            "cleared_rows": d.get("cleared_rows") or [],
             "checked": d.get("checked") or 0, "took": d.get("took") or 0,
             "at": d.get("at") or 0, "mode": stt.mode(),
             "sure_at": stt.sure_at(),
@@ -6822,6 +6826,14 @@ async def api_subtitletitle_fix(file_id: int = 0, ids: str = "",
         # The whole library at once is the one that needs asking about.
         return {"ok": False, "why": "confirm=yes required to correct them all"}
     return await asyncio.to_thread(stt.fix, rows)
+
+
+@app.post("/api/subtitletitle/inspect")
+async def api_subtitletitle_inspect(limit: int = 0):
+    """Read the actual events of candidates nobody has read yet."""
+    from . import subtitletitle as stt
+    return await asyncio.to_thread(
+        stt.inspect_some, int(limit or stt.INSPECT_PER_SCAN))
 
 
 @app.post("/api/subtitletitle/mode")
@@ -29920,6 +29932,15 @@ async function sttMode(m){
                    {method:'POST'}); }catch(e){}
   _sttKey=''; loadSubTitle();
 }
+async function sttInspect(btn){
+  if(btn){ btn.disabled=true; btn.textContent='reading them…'; }
+  let r={};
+  try{ r=await (await fetch('/api/subtitletitle/inspect',
+                            {method:'POST'})).json(); }catch(e){}
+  if(btn) btn.textContent = r.ok
+    ? `read ${r.read}, cleared ${r.cleared}` : 'failed';
+  setTimeout(()=>{ _stt=null; _sttKey=''; loadSubTitle(); }, 1400);
+}
 async function sttRefresh(btn){
   if(btn){ btn.disabled=true; btn.textContent='reading…'; }
   try{ await fetch('/api/subtitletitle/refresh',{method:'POST'}); }catch(e){}
@@ -29970,22 +29991,35 @@ function sttPaint(){
       subtitle?</b>
     <span class="dim" style="font-size:11.5px">${fmt(d.checked||0)} files read
       from stored probes${d.took?` in ${d.took}s`:''} · ${
-      d.total?`<span style="color:var(--warn)">${fmt(d.total)} contradicted</span>`
+      d.total?`<span style="color:var(--warn)">${fmt(d.total)} candidate${
+        d.total===1?'':'s'}</span>`
              :'every title agrees with its track'}${
-      d.fixable?` · ${fmt(d.fixable)} nuarr can rewrite`:''}</span>
+      d.fixable?` · <span style="color:var(--bad)">${fmt(d.fixable)} read and still wrong</span>`:''}${
+      d.unread?` · <span style="color:var(--warn)" title="The cue rate flagged these; nobody has read their actual events yet. Reading one is a demux, so it happens on its own clock rather than while a page loads.">${
+        fmt(d.unread)} not read yet</span>`:''}${
+      d.cleared?` · <span style="color:var(--ok)" title="${esc(
+        'The cue rate flagged these and reading their actual events cleared them: styles called sign or op or ed, lines positioned with \\pos, or a typesetter\'s palette of styles. A karaoke track carries two events per lyric, which is a lot of cues and no dialogue at all.')
+        }">${fmt(d.cleared)} cleared by reading them</span>`:''}</span>
     <span style="float:right;display:flex;gap:8px;align-items:center">
       ${modeSeg('when a title contradicts its track', d.mode, 'sttMode', {
         auto:'The safe ones are corrected on the daily pass. Titles carrying a group name are still only reported, because a replacement would lose what the group wrote.',
         manual:'Everything is listed and waits for your click. The Attention tile carries the count.'})}
+      ${d.unread?`<button class="rmb" onclick="sttInspect(this)"
+        title="Pull the subtitle track out of each flagged file and look at where its lines actually are. Styles called sign or op or ed, lines placed with \\pos, or a typesetter's palette of styles all mean the title was telling the truth.">Read ${
+        fmt(Math.min(d.unread,80))} of them properly</button>`:''}
       <button class="rmb" onclick="sttRefresh(this)">Read again</button></span>`;
   const note=`<div class="dim" style="font-size:11px;margin:3px 0 4px">
-    A subtitle title is a claim about what the track contains, and Matroska
-    already records how many cues it has. "Signs only" over ${d.speech_lo||8}
-    to ${d.speech_hi||45} cues a minute is a claim contradicted by the file
-    itself — that is the cadence of people talking. Above that the density is
-    animated typesetting rather than speech, so it is left alone. Nothing is
-    re-probed and nothing is re-encoded: the check costs a query and the
-    correction is a header edit.</div>`;
+    Two passes, and the first one alone is not enough. The cue count in every
+    stored probe finds tracks whose title claims "signs only" while running at
+    ${d.speech_lo||8}–${d.speech_hi||45} cues a minute, which is the cadence of
+    people talking — but an opening song is two events per lyric and an
+    animated title card is one event per frame, so a genuine signs track
+    reaches that rate with no dialogue in it at all. Reading the track settles
+    it: dialogue is one style with nothing positioned, signs are several
+    styles with lines placed by <span class="mono">\pos</span> wherever the
+    thing they label is. <b>Nothing is offered as correctable until it has been
+    read</b>, because the first eighty reads cleared every single candidate.
+    </div>`;
   // ONE LINE, NOT TWO. The other panel has a mark line and a dismiss line
   // because it can act in both directions; this one can only ever correct a
   // title, so there is nothing to throw away and nothing to set a floor for.
