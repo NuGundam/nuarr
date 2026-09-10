@@ -595,9 +595,35 @@ def _size(p: str) -> int:
 # would appear twice - and the transcription, which costs ten minutes of GPU an
 # episode, is not needed for any of it.
 #
-# default and forced are cleared so no client selects it on its own, and the
-# track NAME says what it is, because a viewer who picks a blank subtitle
-# deserves an explanation rather than a bug report.
+# DEFAULT YES, FORCED NO - AND THE DIFFERENCE BETWEEN THEM IS MEASURED.
+#
+# Both flags were cleared at first, on the reasoning that nothing should pick a
+# blank track. That was backwards. The words ARE in the picture; the viewer
+# sees them whether or not a subtitle is selected, so English subtitles for
+# this file are not optional, they are already on. What the flags decide is
+# which track gets that slot - and leaving both off meant some OTHER track
+# could take it and paint a second copy of the same lines over the first.
+#
+# So default=yes: this is the English subtitle for this file, and nothing else
+# should be chosen over it. It draws a zero-width space, so "selected" costs
+# the viewer nothing and the picture is unchanged.
+#
+# forced stays NO, and this is the part with a number behind it. `forced` is
+# what makes Plex auto-select a track for accounts set to "Shown with foreign
+# audio" - without the viewer asking for anything. This server has watched 4
+# of 66 devices burn a plain SRT (BRAVIA BF1, Chrome, XboxOne, and the generic
+# Smart TV app - all with Burn Subtitles set to Always rather than Automatic),
+# and Plex for Android Mobile burns every subtitle type by design. Burning
+# means re-encoding the whole video. So forced=yes would quietly transcode a
+# 2160p episode, on five clients, to paint a track containing nothing, on a
+# picture that already has the words.
+#
+# With forced off, those clients only transcode if somebody deliberately turns
+# subtitles on - which is exactly what happens today, so nothing gets worse.
+#
+# The track NAME still says what it is, because a viewer who opens the picker
+# and sees a blank subtitle selected deserves an explanation rather than a bug
+# report.
 MARK_NAME = "English (burned into the picture)"
 _MARK_SRT = "1\r\n00:00:00,000 --> 00:00:01,000\r\n​\r\n\r\n"
 
@@ -628,6 +654,21 @@ def mark_one(file_id: int) -> dict:
     if fileops.is_locked(path):
         return {"ok": False, "why": "the file is in use"}
 
+    # ONE DEFAULT SUBTITLE, OR NONE. The sweep only ever looks at files with
+    # no subtitle track at all, so the marker is normally the only one there
+    # is and claiming default is unambiguous. But this can be pressed on a row
+    # the sweep found days ago, and a file can gain a track in between - at
+    # which point setting default here would put TWO defaults in the subtitle
+    # group and leave which one plays up to the client.
+    #
+    # Reading the existing track ids back to clear their flags would be the
+    # thorough answer; declining the flag is the correct one. The marker's job
+    # is to stop something being drawn over the picture, and a file that now
+    # has a real subtitle track has a person's choice in it that this should
+    # not overrule.
+    others = [x for x in (row.get("sub_langs") or "").split(",") if x.strip()]
+    make_default = "no" if others else "yes"
+
     srt = os.path.join(os.path.dirname(path), f".nuarr-mark-{int(time.time())}.srt")
     tmp = os.path.join(os.path.dirname(path), f".nuarr-mark-{int(time.time())}.mkv")
     try:
@@ -636,7 +677,8 @@ def mark_one(file_id: int) -> dict:
         cmd = [_mkvmerge(), "-o", tmp, path,
                "--language", "0:eng",
                "--track-name", f"0:{MARK_NAME}",
-               "--default-track", "0:no", "--forced-track", "0:no",
+               "--default-track", f"0:{make_default}",
+               "--forced-track", "0:no",
                srt]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600,
                            creationflags=NO_WINDOW, startupinfo=hidden_si())
@@ -665,9 +707,17 @@ def mark_one(file_id: int) -> dict:
     except Exception:                                            # noqa: BLE001
         pass
     joblog.log(f"marked {os.path.basename(path)} as carrying burned-in "
-               f"subtitles - blank English track added so Bazarr stops "
-               f"asking", "info")
-    return {"ok": True, "path": path}
+               f"subtitles - blank English track added"
+               + (", set default so nothing is drawn over the words already "
+                  "in the picture" if make_default == "yes"
+                  else " (not set default - the file has other subtitle "
+                       "tracks now)")
+               + ", and Bazarr stops asking", "info")
+    return {"ok": True, "path": path,
+            "why": ("marked - default English, nothing drawn over the picture"
+                    if make_default == "yes"
+                    else "marked - left not-default, this file has other "
+                         "subtitle tracks")}
 
 
 # ------------------------------------------------------------- the sweep ----
