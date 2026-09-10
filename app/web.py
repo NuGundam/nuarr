@@ -30306,41 +30306,43 @@ function skPaint(force){
       <span class="dim" style="font-size:10.5px">shift-click to take a range</span>
     </div>`:'';
   const table=rows.length?`${markBar}${selBar}
-      <div class="rowbox scrollbox"><table style="width:100%;font-size:11.5px;table-layout:fixed">
-      <!-- FIXED LAYOUT, because the evidence column is forty OCR words or a
-           style-by-style shape and an auto-laid table will widen the whole
-           page to fit it. Every cell clips; the row opens for the rest. -->
-      <colgroup><col style="width:22px"><col style="width:auto"><col style="width:11%">
-        <col style="width:66px"><col style="width:132px"><col style="width:58px">
-        <col style="width:22%"><col style="width:158px"></colgroup>
-      <thead><tr class="dim" style="font-size:10.5px;text-align:left">
-        <th style="padding:3px 0 4px 2px"><input type="checkbox" ${allOn?'checked':''}
+      <div class="rowbox scrollbox"><table class="sktbl" style="width:100%;font-size:11.5px;table-layout:fixed">
+      <!-- FIXED LAYOUT, because an auto-laid table widens the whole page to
+           fit its widest cell. Every cell clips; the row opens for the rest.
+           ONE ALIGNMENT PER COLUMN, shared by heading and cells (.sktbl in
+           the stylesheet): the episode reads left, the answer sits right, and
+           everything between - a library name, a word, a picker, a number -
+           is centred under its heading so the eye can run down the column. -->
+      <colgroup><col style="width:24px"><col style="width:auto"><col style="width:112px">
+        <col style="width:82px"><col style="width:150px"><col style="width:64px">
+        <col style="width:22%"><col style="width:214px"></colgroup>
+      <thead><tr class="dim" style="font-size:10.5px">
+        <th class="l"><input type="checkbox" ${allOn?'checked':''}
             title="Select every row with something to do" onclick="skSelAll(this.checked)"></th>
-        <th style="padding:3px 8px 4px 2px">episode</th><th>library</th>
-        <th title="Where the subtitles are: burned into the picture, or in a text track (s:N is the track's ordinal)">where</th>
-        <th title="What the reader says it carries, and a way to say that is wrong. The picker outranks the reading and is what the answer records.">what it carries</th>
-        <th style="text-align:right;padding-right:14px"
-          title="How sure the reading is, 0-100, the same scale for both readers. Above the act line it would be acted on alone; below the dismiss line thrown away; in between is yours to call.">sure</th>
-        <th title="For a track: what its title says now, and what it would be corrected to">title</th>
-        <th style="text-align:right;padding-right:2px">answer</th>
+        <th class="l">episode</th><th class="c">library</th>
+        <th class="c" title="Where the subtitles are: burned into the picture, or in a text track (s:N is the track's ordinal)">where</th>
+        <th class="c" title="What the reader says it carries, and a way to say that is wrong. The picker outranks the reading and is what the answer records.">what it carries</th>
+        <th class="c" title="How sure the reading is, 0-100, the same scale for both readers. Above the act line it would be acted on alone; below the dismiss line thrown away; in between is yours to call.">sure</th>
+        <th class="l" title="For a track: what its title says now, and what it would be corrected to">title</th>
+        <th class="r">answer</th>
       </tr></thead>
       <tbody>${rows.map(r=>{
         const [word,col]=SKW[r.kind]||[r.kind||'','var(--dim)'];
         const on=_skSel.has(r.id), can=!r.done&&!r.unread&&r.action;
         const pic=r.source==='picture', open=_skOpen.has(r.id);
         return `<tr${on?' style="background:rgba(88,166,255,.06)"':''}>
-        <td style="padding:5px 0 5px 2px">${can?`<input type="checkbox" ${on?'checked':''}
+        <td class="l">${can?`<input type="checkbox" ${on?'checked':''}
              onclick="skToggle('${r.id}', event)">`:''}</td>
-        <td style="padding:5px 8px 5px 2px;cursor:pointer;overflow:hidden" title="${esc(String(r.path||''))}"
+        <td class="l" style="cursor:pointer" title="${esc(String(r.path||''))}"
           onclick="skToggleOpen('${r.id}', event)"
           ><span class="actcaret">${open?'▾':'▸'}</span>${esc(r.label||String(r.path||'').split('\\').pop())}
           <div class="dim" style="font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-left:14px"
             >${esc(String(r.path||'').split('\\').pop())}</div></td>
-        <td class="dim" style="padding:5px 8px 5px 0">${esc(r.library||'')}</td>
-        <td style="padding:5px 8px 5px 0;white-space:nowrap;font-size:10.5px;color:${pic?'#6fb0ff':'var(--dim)'}"
+        <td class="c dim">${esc(r.library||'')}</td>
+        <td class="c" style="font-size:10.5px;color:${pic?'#6fb0ff':'var(--dim)'}"
           title="${pic?'Words burned into the picture of a file that reports no subtitle track':'A text track inside the file'}">${
           pic?'picture':'track s:'+r.track}</td>
-        <td style="padding:5px 8px 5px 0">${r.unread
+        <td class="c">${r.unread
           ? '<span class="dim" style="font-size:10.5px">not read yet</span>'
           : `<select class="kindsel" onchange="skSetKind('${r.id}',this.value,this)"
                title="${esc((r.why||('read as '+word))+'. If that is wrong, set it here - the choice is kept and the next pass will not overwrite it.')}"
@@ -30349,19 +30351,18 @@ function skPaint(force){
              </select>
              ${r.chosen?'<div class="dim" style="font-size:9.5px">set by hand</div>'
                        :`<div style="font-size:9.5px;color:${col}">read as ${esc(word)}</div>`}`}</td>
-        <td class="mono" style="padding:5px 14px 5px 0;text-align:right;font-variant-numeric:tabular-nums;color:${skColor(r)}"
+        <td class="c mono" style="font-variant-numeric:tabular-nums;color:${skColor(r)}"
             title="${esc((r.why||'')+' — '+(r.auto_why||''))}">${r.unread?'':(r.sure+'%')}</td>
-        <td class="mono" style="padding:5px 8px 5px 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${pic?'<span class="dim">—</span>'
+        <td class="l mono">${pic?'<span class="dim">—</span>'
           :`<span style="color:var(--warn)" title="${esc(r.title_old||'')}">${esc(r.title_old||'')}</span>${
-             r.action==='retitle'?`<div style="font-size:10px;color:var(--ok)" title="${esc(r.title_new||'')}">→ ${esc(r.title_new||'')}</div>`
-                                 :(r.unread?'':'<div class="dim" style="font-size:10px">left alone</div>')}`}</td>
-        <td style="padding:5px 0;white-space:nowrap;text-align:right" class="askhost">${r.done
+             r.action==='retitle'?`<div style="font-size:10px;color:var(--ok);overflow:hidden;text-overflow:ellipsis" title="${esc(r.title_new||'')}">→ ${esc(r.title_new||'')}</div>`
+                                 :(r.unread?'':'<div class="dim" style="font-size:10px" title="The title carries a name nuarr did not write and cannot regenerate, so it is reported and left as it is.">left alone</div>')}`}</td>
+        <td class="r askhost">${r.done
           ? '<span class="dim" title="This file already carries the blank marker track.">marked</span>'
           : r.unread ? '<span class="dim" style="font-size:10.5px" title="The cue rate flagged this; its events have not been read yet. Nothing is offered until they have.">not read yet</span>'
           : `${r.action?`<button class="rmb" onclick="skAct('${r.id}',this)" title="${
                 pic?'Add a blank English subtitle track so Bazarr and Plex see one exists and stop asking for it. Nothing is drawn over the picture.'
-                   :'Rewrite the track title to what it actually carries. Header edit only.'}">${esc(r.action_word)}</button>`
-              :'<span class="dim" style="font-size:10.5px" title="The title carries a name nuarr did not write and cannot regenerate, so it is reported and left as it is.">left alone</span>'}
+                   :'Rewrite the track title to what it actually carries. Header edit only.'}">${esc(r.action_word)}</button>`:''}
              <button class="rmb" onclick="skDismiss('${r.id}',this)" title="${
                 pic?'This is not a burned-in subtitle. The words behind it join the list of reads that were wrong, and two dismissals in one series leave that show alone.'
                    :'This track is signs after all. Recorded as such, and the next read will not overwrite it.'}">Not dialogue</button>`}</td>
@@ -34304,6 +34305,14 @@ html.mobile .setwrap:not(.rail) .setmain,html.mobile .setwrap:not(.rail) #worker
 .rowbox table{margin:0}
 .rowbox thead th{position:sticky;top:0;z-index:1;background:#11161d;
   box-shadow:0 1px 0 var(--line)}
+/* The subtitle-kinds table: one alignment per column, heading and cells
+   alike, and the same padding everywhere so the columns read as columns. */
+.sktbl th,.sktbl td{padding:5px 8px;overflow:hidden;white-space:nowrap;
+  text-overflow:ellipsis;vertical-align:middle}
+.sktbl th{padding-top:4px;padding-bottom:4px;font-weight:normal}
+.sktbl .l{text-align:left}.sktbl .c{text-align:center}.sktbl .r{text-align:right}
+.sktbl th.l:first-child,.sktbl td.l:first-child{padding-left:4px;padding-right:0}
+.sktbl td.c .kindsel{margin:0 auto;display:block}
 /* The kind picker. Small, quiet, and never wider than the words in it - it is
    a correction, not a headline. */
 .kindsel{font-size:10.5px;padding:1px 4px;max-width:132px}
