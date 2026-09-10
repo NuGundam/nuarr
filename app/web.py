@@ -29984,6 +29984,37 @@ function alpPaint(){
 let _sk=null, _skKey='', _skPoll=null, _skMark=null, _skMarkPoll=null;
 let _skSel=new Set(), _skLast=null, _skShowDone=false, _skShowUnread=true;
 let _skBatchKind='';
+// WHICH ROWS ARE OPEN. The evidence a row rests on - forty OCR words, or the
+// style-by-style shape of a track - is worth reading and far too wide for a
+// cell. So the cell shows a clipped line and the row opens under itself with
+// the whole thing wrapped, like the activity list.
+let _skOpen=new Set();
+function skToggleOpen(id, ev){
+  if(ev) ev.stopPropagation();
+  if(_skOpen.has(id)) _skOpen.delete(id); else _skOpen.add(id);
+  _skKey=''; skPaint(true);
+  // Keep the opened detail on screen inside the scroll box: nearest, so a
+  // row near the bottom scrolls the box up rather than being cut off.
+  if(_skOpen.has(id)){
+    const d=document.getElementById('skdet-'+id);
+    if(d) d.scrollIntoView({block:'nearest'});
+  }
+}
+function skDetail(r){
+  const pic=r.source==='picture';
+  const line=(k,v)=>v?`<div style="display:flex;gap:8px;margin:2px 0"><span class="dim" style="flex:none;width:96px;text-align:right">${k}</span><span style="min-width:0;overflow-wrap:anywhere;white-space:normal">${v}</span></div>`:'';
+  return `<div style="font-size:11px;padding:6px 10px 8px 34px;white-space:normal">
+    ${line('file', `<span class="mono">${esc(r.path||'')}</span>`)}
+    ${line('where', pic?'burned into the picture of a file that reports no subtitle track':`text track s:${r.track} inside the file`)}
+    ${line(pic?'read':'measured', `<span class="mono">${esc(r.evidence||'')}</span>`)}
+    ${line('reading', esc(r.why||''))}
+    ${line('auto would', esc(r.auto_why||''))}
+    ${pic?'':line('title', `<span style="color:var(--warn)">${esc(r.title_old||'')}</span>${
+      r.action==='retitle'?` <span class="dim">→</span> <span style="color:var(--ok)">${esc(r.title_new||'')}</span>`
+      :(r.unread?'':' <span class="dim">— left alone: it carries a name nuarr did not write</span>')}`)}
+    ${(r.detail&&r.detail!==r.why&&r.detail!==r.evidence)?line('detail', esc(r.detail)):''}
+  </div>`;
+}
 const SKW={dialogue:['dialogue','var(--bad)'], hybrid:['dialogue + signs','var(--bad)'],
            signs:['signs or songs','var(--warn)'], none:['none','var(--ok)']};
 function skColor(r){
@@ -30011,13 +30042,13 @@ function skToggle(id, ev){
     if(_skSel.has(id)) _skSel.delete(id); else _skSel.add(id);
   }
   if(i>=0) _skLast=i;
-  _skKey=''; skPaint();
+  _skKey=''; skPaint(true);
 }
 function skSelAll(on){
   if(on) skRows().forEach(r=>_skSel.add(r.id)); else _skSel.clear();
-  _skLast=null; _skKey=''; skPaint();
+  _skLast=null; _skKey=''; skPaint(true);
 }
-function skClearSel(){ _skSel.clear(); _skLast=null; _skKey=''; skPaint(); }
+function skClearSel(){ _skSel.clear(); _skLast=null; _skKey=''; skPaint(true); }
 function skBatchKind(v){ _skBatchKind=v||''; _skKey=''; skPaint(); }
 function skShow(what, on){
   if(what==='done') _skShowDone=!!on; else _skShowUnread=!!on;
@@ -30152,7 +30183,7 @@ function skProgBar(p, what, unit){
       </span>
     </div>`;
 }
-function skPaint(){
+function skPaint(force){
   const el=document.getElementById('skPanel'); if(!el||!_sk) return;
   const d=_sk, all=d.rows||[], c=d.counts||{}, P=d.picture||{}, T=d.tracks||{}, S=d.state||{};
   const rows=all.filter(r=>(_skShowDone||!r.done)&&(_skShowUnread||!r.unread));
@@ -30264,10 +30295,13 @@ function skPaint(){
       <span class="dim" style="font-size:10.5px">shift-click to take a range</span>
     </div>`:'';
   const table=rows.length?`${markBar}${selBar}
-      <div class="rowbox scrollbox"><table style="width:100%;font-size:11.5px">
-      <colgroup><col style="width:22px"><col style="width:26%"><col style="width:8%">
-        <col style="width:70px"><col style="width:11%"><col style="width:58px">
-        <col style="width:20%"><col style="width:15%"><col style="width:150px"></colgroup>
+      <div class="rowbox scrollbox"><table style="width:100%;font-size:11.5px;table-layout:fixed">
+      <!-- FIXED LAYOUT, because the evidence column is forty OCR words or a
+           style-by-style shape and an auto-laid table will widen the whole
+           page to fit it. Every cell clips; the row opens for the rest. -->
+      <colgroup><col style="width:22px"><col style="width:27%"><col style="width:8%">
+        <col style="width:66px"><col style="width:132px"><col style="width:58px">
+        <col style="width:auto"><col style="width:15%"><col style="width:158px"></colgroup>
       <thead><tr class="dim" style="font-size:10.5px;text-align:left">
         <th style="padding:3px 0 4px 2px"><input type="checkbox" ${allOn?'checked':''}
             title="Select every row with something to do" onclick="skSelAll(this.checked)"></th>
@@ -30283,13 +30317,14 @@ function skPaint(){
       <tbody>${rows.map(r=>{
         const [word,col]=SKW[r.kind]||[r.kind||'','var(--dim)'];
         const on=_skSel.has(r.id), can=!r.done&&!r.unread&&r.action;
-        const pic=r.source==='picture';
+        const pic=r.source==='picture', open=_skOpen.has(r.id);
         return `<tr${on?' style="background:rgba(88,166,255,.06)"':''}>
         <td style="padding:5px 0 5px 2px">${can?`<input type="checkbox" ${on?'checked':''}
              onclick="skToggle('${r.id}', event)">`:''}</td>
-        <td style="padding:5px 8px 5px 2px" title="${esc(String(r.path||''))}"
-          >${esc(r.label||String(r.path||'').split('\\').pop())}
-          <div class="dim" style="font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+        <td style="padding:5px 8px 5px 2px;cursor:pointer;overflow:hidden" title="${esc(String(r.path||''))}"
+          onclick="skToggleOpen('${r.id}', event)"
+          ><span class="actcaret">${open?'▾':'▸'}</span>${esc(r.label||String(r.path||'').split('\\').pop())}
+          <div class="dim" style="font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-left:14px"
             >${esc(String(r.path||'').split('\\').pop())}</div></td>
         <td class="dim" style="padding:5px 8px 5px 0">${esc(r.library||'')}</td>
         <td style="padding:5px 8px 5px 0;white-space:nowrap;font-size:10.5px;color:${pic?'#6fb0ff':'var(--dim)'}"
@@ -30322,7 +30357,7 @@ function skPaint(){
              <button class="rmb" onclick="skDismiss('${r.id}',this)" title="${
                 pic?'This is not a burned-in subtitle. The words behind it join the list of reads that were wrong, and two dismissals in one series leave that show alone.'
                    :'This track is signs after all. Recorded as such, and the next read will not overwrite it.'}">Not dialogue</button>`}</td>
-      </tr>`;}).join('')}</tbody></table></div>`
+      </tr>${open?`<tr id="skdet-${esc(r.id)}" style="background:rgba(255,255,255,.025)"><td colspan="9" style="padding:0;border-bottom:1px solid var(--line)">${skDetail(r)}</td></tr>`:''}`;}).join('')}</tbody></table></div>`
     : `<div class="dim" style="font-size:11.5px;padding:8px 0">${
         (tested||c.tracks)?'Nothing checked so far is carrying subtitles it should not, or under a title it should not.':'Nothing checked yet.'}</div>`;
   const foot=`<div class="dim" style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;font-size:11px;margin-top:6px">
@@ -30333,9 +30368,12 @@ function skPaint(){
       (_skShowUnread&&c.unread)?`<a href="#" onclick="skShow('unread',0);return false">only the ones read</a>`:''}
   </div>`;
   const html=`<div class="lkind" style="padding:11px 12px">${head}${note}${band}${prog}${hist}${table}${foot}</div>`;
-  if(askOpen('skPanel') || panelBusy('skPanel') || panelScrolled('skPanel')) return;
+  if(!force && (askOpen('skPanel') || panelBusy('skPanel') || panelScrolled('skPanel'))) return;
   if(html===_skKey) return;
+  // A repaint you asked for keeps your place in the box.
+  const box=el.querySelector('.rowbox'), keep=box?box.scrollTop:0;
   _skKey=html; el.innerHTML=html;
+  const nb=el.querySelector('.rowbox'); if(nb&&keep) nb.scrollTop=keep;
   clearTimeout(_skPoll);
   if(running) _skPoll=setTimeout(()=>{ if(document.getElementById('skPanel')) loadSubKind(); }, 1500);
 }
