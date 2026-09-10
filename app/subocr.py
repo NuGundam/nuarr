@@ -2038,30 +2038,43 @@ RULE_META = [
              "every other rule changes what a rebuild produces, this one "
              "starts one.",
      "default": False},
-    {"key": "sidecar_beats_embedded",
-     "label": "A subtitle file beside the video beats the one already inside "
-              "it",
-     "what": "Only matters when the two are the same language and the same "
-             "kind - a full sidecar against a full track, forced against "
-             "forced. Off, the sidecar is refused and left on disk. On, it is "
-             "taken in and the track it replaces is dropped from the rebuilt "
-             "file, because Bazarr fetching a subtitle for a language you "
-             "already had usually means it found a better one. Needs the rule "
-             "above to be on. If two tracks of that kind are already inside, "
-             "nothing is changed and the file is listed instead - which one "
-             "the sidecar replaces is not something to guess at.",
-     "default": False},
-    {"key": "drop_redundant_sidecar",
-     "label": "Recycle a subtitle file the video already carries",
-     "what": "The opposite answer to the same situation, and nothing is "
-             "rewritten: the file already has that language and kind inside "
-             "it, so the loose copy is doing nothing except waiting to be "
-             "orphaned and to win Plex's picker. The file is read from disk "
-             "first - not from what nuarr last recorded about it - and the "
-             "track has to really be there before the sidecar is recycled. "
-             "Recycled, not deleted. Takes effect on its own; it does not "
-             "need the embed rule.",
-     "default": False},
+    # ONE CHOICE, NOT TWO SWITCHES. "The sidecar wins" and "recycle the
+    # redundant sidecar" are answers to the same question and cancel each
+    # other: both fire on a sidecar whose language AND kind is already inside,
+    # and with both ticked the first one won and the second sat there on and
+    # doing nothing. A switch that can be on and inert is worse than no switch.
+    #
+    # Only a true duplicate is a conflict. A .en.sdh.srt beside a full English
+    # track is a different subtitle, not a second copy of one, and it is taken
+    # in whatever this is set to.
+    {"key": "sidecar_conflict",
+     "label": "When a subtitle file beside the video duplicates a track "
+              "already inside it",
+     "choices": [
+         {"value": "leave", "label": "Leave both alone",
+          "what": "The sidecar is refused and stays on disk, and the file is "
+                  "not touched. What this has always done."},
+         {"value": "inside", "label": "Keep the one inside, recycle the loose "
+                                      "copy",
+          "what": "Nothing is rewritten. The loose copy is doing nothing "
+                  "except waiting to be orphaned and to win Plex's picker, so "
+                  "it goes to the recycle bin - after the file is read from "
+                  "disk, not from what nuarr last recorded, and the track is "
+                  "found to really be there. Works on its own; it does not "
+                  "need the rule above."},
+         {"value": "sidecar", "label": "Keep the loose copy, replace the "
+                                       "track inside",
+          "what": "Taken in, and the track it replaces is dropped from the "
+                  "rebuilt file - because Bazarr fetching a subtitle for a "
+                  "language you already had usually means it found a better "
+                  "one. Needs the rule above. Also lets a real subtitle "
+                  "replace the blank marker track on a file whose subtitles "
+                  "are burned into the picture."},
+     ],
+     "what": "If two tracks of that kind are already inside, nothing is "
+             "changed and the file is listed instead - which one the sidecar "
+             "replaces is not something to guess at.",
+     "default": "leave"},
     {"key": "prefer_signs_over_forced",
      "label": "A Signs & Songs track beats whatever carries the forced flag",
      "what": "Forced means the lines you cannot understand while the audio "
@@ -2094,8 +2107,7 @@ _RULE_CFG = {
     "burn_hdr": "burnOnHDR",
     "embed_sidecars": "embedExternalSubs",
     "prefer_signs_over_forced": "preferSignsOverForcedFlag",
-    "sidecar_beats_embedded": "preferSidecarOverEmbedded",
-    "drop_redundant_sidecar": "dropRedundantSidecar",
+    "sidecar_conflict": "sidecarConflict",
 }
 
 
@@ -2109,18 +2121,21 @@ def sub_rules(library: str | None = None) -> dict:
     out = {}
     for m in RULE_META:
         base = C.get(_RULE_CFG[m["key"]], m["default"])
-        out[m["key"]] = bool(_s("subrule_" + m["key"], base, library))
+        v = _s("subrule_" + m["key"], base, library)
+        # A RULE WITH CHOICES IS NOT A SWITCH. bool() on "leave" is True and
+        # on "" is False, which is how a three-way setting turns itself into a
+        # broken two-way one somewhere downstream.
+        if m.get("choices"):
+            ok = {c["value"] for c in m["choices"]}
+            out[m["key"]] = str(v) if str(v) in ok else m["default"]
+        else:
+            out[m["key"]] = bool(v)
     return out
 
 
-def sub_rule(key: str, library: str | None = None) -> bool:
+def sub_rule(key: str, library: str | None = None):
     """One rule, for the planner. Falls back to the global constant."""
-    try:
-        from . import rules
-        base = rules.CONFIG.get(_RULE_CFG.get(key, ""), True)
-    except Exception:                                    # noqa: BLE001
-        base = True
-    return bool(_s("subrule_" + key, base, library))
+    return sub_rules(library).get(key)
 
 
 _INSTALL = {"state": "idle", "log": "", "error": ""}

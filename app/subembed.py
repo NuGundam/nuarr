@@ -140,7 +140,8 @@ def active(library: str = "", overrides: dict | None = None) -> bool:
     switch that says it acts on its own into one that quietly does not.
     """
     d = rules_of(library, overrides)
-    return bool(d.get("embed_sidecars") or d.get("drop_redundant_sidecar"))
+    return bool(d.get("embed_sidecars")
+                or d.get("sidecar_conflict") == "inside")
 
 
 def _mkvmerge() -> str:
@@ -439,9 +440,17 @@ def plan_one(file_id: int, force: bool = False,
     # The two answers to "that language is already inside", both off by
     # default and both the library's to give.
     take_them = bool(_sr.get("embed_sidecars")) or force
-    beats = bool(_sr.get("sidecar_beats_embedded")) and take_them
-    tidy = bool(_sr.get("drop_redundant_sidecar"))
-    inside = _probe_sub_tracks(int(file_id)) if (beats or tidy) else []
+    # leave / inside / sidecar - what happens when the sidecar is a genuine
+    # second copy of a track that is already there.
+    conflict = str(_sr.get("sidecar_conflict") or "leave")
+    beats = (conflict == "sidecar") and take_them
+    tidy = (conflict == "inside")
+    # ALWAYS READ, NOT ONLY WHEN THERE IS A CONFLICT RULE. Telling a duplicate
+    # from an addition needs the tracks whatever the answer is going to be: a
+    # .en.sdh.srt beside a full English track is not a second copy of it, and
+    # refusing it on the language alone - which is what the old guard did - is
+    # the case this list exists to stop being wrong about.
+    inside = _probe_sub_tracks(int(file_id)) if take_them or tidy else []
     out["drop"] = []
     for side in sidecars_for(path):
         name = read_sidecar_name(path, side)
@@ -457,6 +466,25 @@ def plan_one(file_id: int, force: bool = False,
         if _lang_key(name["lang"]) in have:
             twins = _same_kind(inside, name["lang"], name["role"])
             cls = _role_class(name["role"])
+            # NOT A DUPLICATE AT ALL, so no answer is needed. The language is
+            # inside; a subtitle of this KIND is not. Full dialogue against
+            # SDH, or against a signs track - different subtitles, and the
+            # conflict setting has nothing to say about them.
+            if not twins and not beats:
+                if not take_them:
+                    out["skip"].append({
+                        "sidecar": side,
+                        "why": "this library only recycles sidecars it "
+                               "already has; taking new ones in is a "
+                               "separate rule"})
+                    continue
+                out["take"].append({
+                    "sidecar": side, "lang": name["lang"],
+                    "role": name["role"], "size": _size(side),
+                    "replaces": [],
+                    "note": f"the file has {name['lang']} subtitles but none "
+                            f"of them are {cls}"})
+                continue
             if beats:
                 # NOTHING OF THIS KIND IS ACTUALLY INSIDE. The language is,
                 # but as a different sort of subtitle - "English [Signs]"

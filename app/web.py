@@ -6105,7 +6105,13 @@ async def api_subocr_config(body: dict = Body(...)):
     }
     from . import subocr as _so_cfg
     for m in _so_cfg.RULE_META:
-        allowed["subrule_" + m["key"]] = lambda v: bool(v)
+        if m.get("choices"):
+            ok = tuple(c["value"] for c in m["choices"])
+            allowed["subrule_" + m["key"]] = (
+                lambda v, _ok=ok, _d=m["default"]:
+                str(v) if str(v) in _ok else _d)
+        else:
+            allowed["subrule_" + m["key"]] = lambda v: bool(v)
     changes = {}
     for k, cast in allowed.items():
         if k in body:
@@ -6206,17 +6212,21 @@ async def api_subocr_preview_change(body: dict = Body(...)):
     for m in _so.RULE_META:
         k = "subrule_" + m["key"]
         if k in body:
-            after[m["key"]] = bool(body[k])
+            if m.get("choices"):
+                ok = {c["value"] for c in m["choices"]}
+                after[m["key"]] = (str(body[k]) if str(body[k]) in ok
+                                   else m["default"])
+            else:
+                after[m["key"]] = bool(body[k])
     # THREE RULES THIS PREVIEW CANNOT SEE. rules.decide plans what a REBUILD
     # produces; the sidecar rules act outside it entirely - they start a remux
     # of their own and reach into the folder next to the file. Diffing the
     # planner for them returns "nothing changes, safe to apply" while hundreds
     # of files are about to be rewritten, which is the most dangerous answer a
     # confirmation can give. They are counted properly instead.
-    SIDECAR_KEYS = ("embed_sidecars", "sidecar_beats_embedded",
-                    "drop_redundant_sidecar")
+    SIDECAR_KEYS = ("embed_sidecars", "sidecar_conflict")
     side_changed = {k: after.get(k) for k in SIDECAR_KEYS
-                    if bool(before.get(k)) != bool(after.get(k))}
+                    if before.get(k) != after.get(k)}
 
     def _sidecars() -> dict:
         if not side_changed:
@@ -6224,8 +6234,8 @@ async def api_subocr_preview_change(body: dict = Body(...)):
         from . import subembed
         both = subembed.preview_pair(
             lib,
-            {k: bool(after.get(k)) for k in SIDECAR_KEYS},
-            {k: bool(before.get(k)) for k in SIDECAR_KEYS})
+            {k: after.get(k) for k in SIDECAR_KEYS},
+            {k: before.get(k) for k in SIDECAR_KEYS})
         soon = both["after"]
         return {"changed": list(side_changed.keys()),
                 "before": {k: v for k, v in both["before"].items()
@@ -26085,6 +26095,22 @@ function socPaint(lib){
              onchange="socRuleDirty('${esc(lib)}')" style="margin-top:2px">
       <span><b>${label}</b><div class="dim" style="font-size:11px">${why}</div></span>
     </label>`;
+  // A RULE WITH MORE THAN TWO ANSWERS GETS MORE THAN TWO BUTTONS. Drawn as
+  // one group so the answers are visibly exclusive - which is the whole point
+  // of merging the two switches that used to sit here and cancel each other.
+  const rpick=(m,cur)=>`
+    <div style="padding:7px 0 3px">
+      <b>${m.label}</b>
+      ${m.what?`<div class="dim" style="font-size:11px">${m.what}</div>`:''}
+      <div style="margin:5px 0 0 2px">${(m.choices||[]).map(c=>`
+        <label style="display:flex;gap:9px;align-items:flex-start;padding:3px 0;cursor:pointer">
+          <input type="radio" name="${id('r_'+m.key)}" value="${esc(c.value)}"
+                 ${String(cur)===c.value?'checked':''}
+                 onchange="socRuleDirty('${esc(lib)}')" style="margin-top:2px">
+          <span><b style="font-weight:600">${c.label}</b>
+            <div class="dim" style="font-size:11px">${c.what}</div></span>
+        </label>`).join('')}</div>
+    </div>`;
   host.innerHTML=`
     <div class="socinner">
       <div class="sochead">Subtitle handling with OCR
@@ -26158,7 +26184,9 @@ function socPaint(lib){
 
       <div class="sochead" style="margin-top:12px">Subtitle rules
         <span class="dim">what happens to subtitles when this library is rebuilt</span></div>
-      ${(_socAll.rule_meta||[]).map(m=>rchk(m.key,rules[m.key],m.label,m.what)).join('')}
+      ${(_socAll.rule_meta||[]).map(m=>m.choices
+          ? rpick(m, rules[m.key])
+          : rchk(m.key,rules[m.key],m.label,m.what)).join('')}
       <div id="${id('rulebar')}" style="margin-top:8px;display:flex;gap:8px;
            align-items:center;flex-wrap:wrap;font-size:12px"></div>
       <div id="${id('ruleimp')}" style="margin-top:6px"></div>
@@ -26178,6 +26206,12 @@ function socRuleBody(lib){
   const id=(k)=>document.getElementById('soc_'+cssId(lib)+'_'+k);
   const body={library:lib};
   for(const m of (_socAll.rule_meta||[])){
+    if(m.choices){
+      const r=document.querySelector(
+        `input[name="soc_${cssId(lib)}_r_${m.key}"]:checked`);
+      if(r) body['subrule_'+m.key]=r.value;
+      continue;
+    }
     const b=id('r_'+m.key); if(b) body['subrule_'+m.key]=b.checked;
   }
   return body;
