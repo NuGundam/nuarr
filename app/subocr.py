@@ -2038,6 +2038,18 @@ RULE_META = [
              "a rebuild produces, this one starts one and reaches outside the "
              "file to do it.",
      "default": False},
+    {"key": "prefer_signs_over_forced",
+     "label": "A Signs & Songs track beats whatever carries the forced flag",
+     "what": "Forced means the lines you cannot understand while the audio "
+             "plays - an alien language, a foreign scene, a sign. Closed "
+             "captions and SDH are for the lines you cannot hear, which is "
+             "all of them. Releases regularly put the forced flag on the CC "
+             "track anyway, and then Plex shows full dialogue over English "
+             "speech unasked. With this on, a track whose title says signs or "
+             "songs is the one allowed to appear by itself, whatever the "
+             "release flagged; a CC or SDH track is never that track either "
+             "way. Off: the release's forced flag decides, as it used to.",
+     "default": True},
     {"key": "burn_hdr", "label": "Allow burning into HDR video",
      "what": "The colour tags and the HDR10 metadata are re-stated on the "
              "output, so the rebuild keeps its HDR. Dolby Vision's per-frame "
@@ -2057,6 +2069,7 @@ _RULE_CFG = {
     "force_eng_sub": "forceEngSubWhenNoEngAudio",
     "burn_hdr": "burnOnHDR",
     "embed_sidecars": "embedExternalSubs",
+    "prefer_signs_over_forced": "preferSignsOverForcedFlag",
 }
 
 

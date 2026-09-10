@@ -184,6 +184,12 @@ CONFIG: dict[str, Any] = {
     # file and stay selectable - SDH is the one you want in a noisy room - but
     # neither switches itself on. Turn this off to leave release flags alone.
     "autoShowForcedOnly": True,
+    # When a release's forced flag and a real Signs & Songs track disagree,
+    # the track wins. Releases put the forced flag on whatever they felt like -
+    # most often the closed-caption track - and a title that says "Signs &
+    # Songs" is the release telling you what is in it rather than what it
+    # wanted your player to do.
+    "preferSignsOverForcedFlag": True,
     # Text subtitles are written ahead of picture subtitles. Plex offers tracks
     # in file order and takes the earlier one when nothing else separates them,
     # so a PGS ahead of the SRT gets picked - and a picked picture track is a
@@ -336,6 +342,26 @@ SIGNS_VARIANTS = [
 # signs track is or one will drop what the other was about to burn.
 SIGNS_TITLE_RE = re.compile(
     r"sign|song|s\s*&\s*s|s\s*/\s*s|typeset|caption|forced|foreign|\btitles\b", re.I)
+
+# AND THE ONES THAT ARE NOT SIGNS, HOWEVER THEY READ. "Closed Caption" matches
+# `caption` above, so a CC track - full dialogue plus [door creaks] - was being
+# read as a signs track and given the flag that makes Plex show it unasked.
+# 43 files in this library are in that state, every one of them with a real
+# signs track sitting beside it unflagged.
+#
+# The distinction is not cosmetic. A forced track exists for the lines you
+# CANNOT understand while the audio plays - an alien language, a foreign
+# scene, a sign. CC and SDH exist for the lines you cannot HEAR, which is
+# every line. They are opposite answers to opposite problems, and only the
+# first should ever come on by itself.
+SDH_TITLE_RE = re.compile(
+    r"closed\s*caption|\bcc\b|\bsdh\b|hearing[\s-]*impaired|\bhi\b", re.I)
+
+
+def is_signs_title(title: str) -> bool:
+    """Signs, songs, forced lines - and never a caption track wearing the word."""
+    t = title or ""
+    return bool(SIGNS_TITLE_RE.search(t)) and not SDH_TITLE_RE.search(t)
 
 # Tracks this system created by OCR'ing an image sub - see subocr.embed(),
 # which names them "<label> (OCR)". The suffix carries detail now - the
@@ -1513,6 +1539,7 @@ def decide(probe: dict, *, anime: bool = False, filename: str = "",
             "burn_lang_guard": "burnLangGuard",
             "force_eng_sub": "forceEngSubWhenNoEngAudio",
             "burn_hdr": "burnOnHDR",
+            "prefer_signs_over_forced": "preferSignsOverForcedFlag",
         }.get(key, ""), True))
 
     def _a(key, fallback):
@@ -2255,17 +2282,35 @@ def decide(probe: dict, *, anime: bool = False, filename: str = "",
     #   dialogue and SDH        -> keepers, but silent until chosen. SDH stays
     #        in the file for a noisy room; it just stops being automatic.
     if CONFIG["autoShowForcedOnly"] and has_eng_audio and p.keep_subs:
-        forced_pick = None
+        # RANKED, NOT FIRST-PAST-THE-POST. The old loop kept whichever
+        # candidate came first in track order, so a "Closed Caption" track at
+        # index 1 beat a "Signs & Songs" track at index 2 - twice over, since
+        # the CC one usually carries the release's own forced flag as well.
+        # What the track IS decides, and only then where it sits.
+        #
+        #   2  its title says signs or songs, and does not say caption
+        #   1  it carries the release's forced flag and is not a CC/SDH track
+        #   -  a CC/SDH track is never the one shown by itself, flagged or not
+        prefer_signs = _sr("prefer_signs_over_forced")
+        forced_pick, best = None, 0
         for i in p.keep_subs:
             if i == p.burn_index:
                 continue                    # painted in; it has no flags to set
             s = subs[i]
-            is_forced = (_disp(s, "forced")
-                         or SIGNS_TITLE_RE.search(_title(s)) is not None)
-            # Text beats image for the auto-shown track: a flagged image sub is
-            # the CPU-burn case this whole area exists to avoid.
-            if is_forced and (s.get("codec_name") or "").lower() in TEXT_SUB_CODECS:
-                forced_pick = i if forced_pick is None else forced_pick
+            title = _title(s)
+            if (s.get("codec_name") or "").lower() not in TEXT_SUB_CODECS:
+                continue    # text beats image: a flagged image sub is the
+                            # CPU-burn case this whole area exists to avoid
+            sdh = bool(SDH_TITLE_RE.search(title))
+            if sdh:
+                continue
+            rank = 0
+            if is_signs_title(title):
+                rank = 2 if prefer_signs else 1
+            elif _disp(s, "forced"):
+                rank = 1
+            if rank > best:
+                best, forced_pick = rank, i
         for i in p.keep_subs:
             if i == p.burn_index or i == forced_pick:
                 continue
