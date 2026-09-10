@@ -6890,11 +6890,25 @@ async def api_audiolang_fix_batch(ids: str = "", confirm: str = ""):
 
 @app.post("/api/audiolang/run/auto")
 async def api_audiolang_run_auto():
-    """Work the standing list now, without waiting for the listen pass."""
+    """Work the standing list now, without waiting for the listen pass.
+
+    RETURNS AS SOON AS IT HAS STARTED, like every other batch here. Waiting
+    for twenty header edits meant the button sat disabled for ten seconds
+    with nothing to look at and then the whole list changed at once - the
+    progress this endpoint already publishes was unreachable because the
+    request that would have shown it was the one blocking.
+    """
     from . import audiolang
-    out = await asyncio.to_thread(audiolang.auto_pass)
-    _amemo_expire("audiolang:")
-    return {"ok": True, **out}
+    if audiolang.AUTO_STATE.get("running"):
+        return {"ok": False, "why": "already running"}
+
+    async def _go():
+        try:
+            await asyncio.to_thread(audiolang.auto_pass)
+        finally:
+            _amemo_expire("audiolang:")
+    asyncio.create_task(_go())
+    return {"ok": True, "started": True}
 
 
 @app.get("/api/audiolang/backlog")
@@ -15374,9 +15388,14 @@ async function alAutoTick(){
   let a=null;
   try{ a=await (await fetch('/api/audiolang/auto')).json(); }catch(e){ return; }
   if(!a) return;
+  const was=(_al.auto_state||{}).running;
   _al.auto_state=a;
   if(_alTab==='odd') renderAlang();
-  if(a.running) _alAutoPoll=setTimeout(alAutoTick, 1500);
+  if(a.running){ _alAutoPoll=setTimeout(alAutoTick, 1200); return; }
+  // IT HAS STOPPED. The rows it corrected are gone from the ledger, so the
+  // list is stale by exactly the amount of work that just happened - and the
+  // page was being refreshed by hand to find that out.
+  if(was) setTimeout(()=>loadAlang(true), 400);
 }
 
 function alOddRows(){ return (_al.contradictions||[]).filter(r=>r.auto!=='leave'); }
@@ -15418,7 +15437,13 @@ async function alLine(which, val){
 async function alRunAuto(btn){
   if(btn){ btn.disabled=true; btn.textContent='correcting…'; }
   try{ await fetch('/api/audiolang/run/auto',{method:'POST'}); }catch(e){}
-  loadAlang(true);
+  // THE PASS IS NOW RUNNING BEHIND THE REQUEST, so the strip has something to
+  // report - but only if something asks. Paint the bar immediately from a
+  // first poll rather than waiting for the next repaint to notice.
+  if(_al) _al.auto_state = Object.assign({}, _al.auto_state||{},
+                                         {running:true, done:0, mode:'auto'});
+  renderAlang();
+  alAutoTick();
 }
 // A PERSON'S CHOICE OVERRIDES THE LISTENER. If the picker was touched the
 // language is stated first - written as stated, at confidence 1.0 - and the
@@ -15465,7 +15490,8 @@ async function alFixMany(btn){
       const r=await (await fetch('/api/audiolang/fix/batch?confirm=yes&ids='
         +encodeURIComponent(ids.join(',')), {method:'POST'})).json();
       _alSel.clear(); _alLast=null;
-      setTimeout(()=>loadAlang(true), 1300);
+      // The ledger has already dropped what was corrected; the page has not.
+      setTimeout(()=>loadAlang(true), 600);
       return r;
     });
 }
