@@ -743,7 +743,7 @@ def scan(limit: int = 0) -> dict:
         with cursor() as cur:
             got = cur.execute(
                 "SELECT f.id, f.path, f.title, f.library, f.season, "
-                "       f.episode, f.size, p.json "
+                "       f.episode, f.size, f.first_seen, p.json "
                 "  FROM files f JOIN file_probes p ON p.file_id = f.id "
                 " WHERE f.state NOT IN ('deleted','duplicate') "
                 + (" LIMIT ?" if limit else ""),
@@ -760,7 +760,8 @@ def scan(limit: int = 0) -> dict:
             for row in _rows_from_probe(r["path"] or "", probe):
                 row.update(file_id=r["id"], path=r["path"],
                            title=r["title"] or "", library=r["library"] or "",
-                           size=r["size"] or 0, label=_label(r))
+                           size=r["size"] or 0, label=_label(r),
+                           added=r["first_seen"] or 0.0)
                 rows.append(row)
     finally:
         _CACHE.update(running=False, done=checked, now="", t1=time.time())

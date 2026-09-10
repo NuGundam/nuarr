@@ -1395,8 +1395,8 @@ def found(limit: int = 60) -> list:
         with cursor() as cur:
             rows = [dict(r) for r in cur.execute(
                 "SELECT h.file_id, h.path, h.state, h.low_hits, h.samples, "
-                "       h.words, h.detail, h.marked, h.chosen, "
-                "       f.library, f.title, f.season, f.episode "
+                "       h.words, h.detail, h.marked, h.chosen, h.at, "
+                "       f.library, f.title, f.season, f.episode, f.first_seen "
                 "  FROM hardsub h JOIN files f ON f.id = h.file_id "
                 " WHERE h.state != ? AND f.state NOT IN ('deleted','duplicate') "
                 "   AND NOT EXISTS (SELECT 1 FROM hardsub_ignored i "
@@ -1410,8 +1410,8 @@ def found(limit: int = 60) -> list:
             have = {r["file_id"] for r in rows}
             rows += [dict(r) for r in cur.execute(
                 "SELECT h.file_id, h.path, h.state, h.low_hits, h.samples, "
-                "       h.words, h.detail, h.marked, h.chosen, "
-                "       f.library, f.title, f.season, f.episode "
+                "       h.words, h.detail, h.marked, h.chosen, h.at, "
+                "       f.library, f.title, f.season, f.episode, f.first_seen "
                 "  FROM hardsub h JOIN files f ON f.id = h.file_id "
                 " WHERE h.marked = 1 AND f.state NOT IN ('deleted','duplicate') "
                 " ORDER BY h.at DESC LIMIT 200") if r["file_id"] not in have]

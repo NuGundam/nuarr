@@ -29993,6 +29993,42 @@ let _skBatchKind='';
 // cell. So the cell shows a clipped line and the row opens under itself with
 // the whole thing wrapped, like the activity list.
 let _skOpen=new Set();
+// HOW THE LIST IS ORDERED. Least certain first is the right default - it puts
+// the calls only a person can make at the top - but it is not the only
+// question anyone asks of this list. "What arrived today" is the other one,
+// and it is a different order, so the headings sort.
+let _skSort='doubt', _skDesc=false;
+function skSortBy(key){
+  // Same heading twice turns it around; a new heading starts in the direction
+  // that column is usually read - newest first for a date, biggest first for
+  // a percentage, A-Z for a word.
+  if(_skSort===key){ _skDesc=!_skDesc; }
+  else { _skSort=key; _skDesc=(key==='added'||key==='sure'); }
+  _skKey=''; skPaint(true);
+}
+function skSortMark(key){
+  return _skSort===key
+    ? `<span style="color:var(--acc)">${_skDesc?'▼':'▲'}</span>` : '';
+}
+function skCmp(a, b){
+  const d=_skDesc?-1:1;
+  const txt=(x,y)=>String(x||'').localeCompare(String(y||''))*d;
+  switch(_skSort){
+    case 'added':   return ((a.added||0)-(b.added||0))*d;
+    case 'episode': return txt(a.label||a.path, b.label||b.path);
+    case 'library': return txt(a.library, b.library);
+    case 'where':   return txt(a.source, b.source);
+    case 'kind':    return txt(a.kind, b.kind);
+    case 'sure':    return ((a.sure||0)-(b.sure||0))*d;
+    case 'title':   return txt(a.title_old, b.title_old);
+    case 'answer':  return txt(a.action_word, b.action_word);
+    default: {
+      // THE SERVER ALREADY SORTED BY DOUBT. Re-deriving the band middle here
+      // would be a second copy of the rule; the order it sent is the answer.
+      return ((a._i||0)-(b._i||0))*(_skDesc?-1:1);
+    }
+  }
+}
 function skToggleOpen(id, ev){
   if(ev) ev.stopPropagation();
   if(_skOpen.has(id)) _skOpen.delete(id); else _skOpen.add(id);
@@ -30023,6 +30059,7 @@ function skDetail(r){
   }
   return `<div style="font-size:11px;padding:6px 10px 8px 34px;white-space:normal">
     ${line('file', `<span class="mono">${esc(r.path||'')}</span>`)}
+    ${line('added', r.added?esc(new Date(r.added*1000).toLocaleString()):'')}
     ${line(pic?'OCR read':'measured', ev)}
     ${line('so', esc(r.why||''))}
     ${pic?'':line('title', `<span style="color:var(--warn)">${esc(r.title_old||'')}</span>${
@@ -30182,6 +30219,9 @@ async function loadSubKind(){
   try{ _sk=await (await fetch('/api/subkind?limit=600')).json(); }
   catch(e){ el.innerHTML='<span class="dim">could not load</span>'; return; }
   try{ _skMark=await (await fetch('/api/hardsub/mark/progress')).json(); }catch(e){}
+  // The rank the server gave each row, kept so "least certain first" can be
+  // returned to after sorting by something else.
+  (_sk.rows||[]).forEach((r,i)=>{ r._i=i; });
   skPaint();
 }
 function skProgBar(p, what, unit){
@@ -30205,7 +30245,8 @@ function skProgBar(p, what, unit){
 function skPaint(force){
   const el=document.getElementById('skPanel'); if(!el||!_sk) return;
   const d=_sk, all=d.rows||[], c=d.counts||{}, P=d.picture||{}, T=d.tracks||{}, S=d.state||{};
-  const rows=all.filter(r=>(_skShowDone||!r.done)&&(_skShowUnread||!r.unread));
+  const rows=all.filter(r=>(_skShowDone||!r.done)&&(_skShowUnread||!r.unread))
+                .sort(skCmp);
   const hiddenDone=_skShowDone?0:all.filter(r=>r.done).length;
   const hiddenUnread=_skShowUnread?0:all.filter(r=>r.unread).length;
   const tested=(P.none||0)+(P.signs||0)+(P.dialogue||0)+(P.hybrid||0);
@@ -30321,18 +30362,23 @@ function skPaint(force){
            the stylesheet): the episode reads left, the answer sits right, and
            everything between - a library name, a word, a picker, a number -
            is centred under its heading so the eye can run down the column. -->
-      <colgroup><col style="width:24px"><col style="width:auto"><col style="width:112px">
-        <col style="width:82px"><col style="width:150px"><col style="width:64px">
-        <col style="width:22%"><col style="width:214px"></colgroup>
-      <thead><tr class="dim" style="font-size:10.5px">
+      <colgroup><col style="width:24px"><col style="width:auto"><col style="width:104px">
+        <col style="width:78px"><col style="width:74px"><col style="width:150px">
+        <col style="width:58px"><col style="width:19%"><col style="width:214px"></colgroup>
+      <!-- EVERY HEADING SORTS. Click once for that column's natural order,
+           again to turn it around; "sure" returns to least-certain-first. -->
+      <thead><tr class="dim sksort" style="font-size:10.5px">
         <th class="l"><input type="checkbox" ${allOn?'checked':''}
             title="Select every row with something to do" onclick="skSelAll(this.checked)"></th>
-        <th class="l">episode</th><th class="c">library</th>
-        <th class="c" title="Where the subtitles are: burned into the picture, or in a text track (s:N is the track's ordinal)">where</th>
-        <th class="c" title="What the reader says it carries, and a way to say that is wrong. The picker outranks the reading and is what the answer records.">what it carries</th>
-        <th class="c" title="How sure the reading is, 0-100, the same scale for both readers. Above the act line it would be acted on alone; below the dismiss line thrown away; in between is yours to call.">sure</th>
-        <th class="l" title="For a track: what its title says now, and what it would be corrected to">title</th>
-        <th class="r">answer</th>
+        <th class="l" onclick="skSortBy('episode')" title="Sort by episode">episode ${skSortMark('episode')}</th>
+        <th class="c" onclick="skSortBy('library')" title="Sort by library">library ${skSortMark('library')}</th>
+        <th class="c" onclick="skSortBy('added')"
+          title="When this file first landed in the library. Click to put the newest at the top - a whole season that arrived this morning sorts together.">added ${skSortMark('added')}</th>
+        <th class="c" onclick="skSortBy('where')" title="Where the subtitles are: burned into the picture, or in a text track (s:N is the track's ordinal). Click to group the two.">where ${skSortMark('where')}</th>
+        <th class="c" onclick="skSortBy('kind')" title="What the reader says it carries, and a way to say that is wrong. The picker outranks the reading and is what the answer records. Click to group by kind.">what it carries ${skSortMark('kind')}</th>
+        <th class="c" onclick="skSortBy('sure')" title="How sure the reading is, 0-100, the same scale for both readers. Above the act line it would be acted on alone; below the dismiss line thrown away; in between is yours to call.">sure ${skSortMark('sure')}</th>
+        <th class="l" onclick="skSortBy('title')" title="For a track: what its title says now, and what it would be corrected to">title ${skSortMark('title')}</th>
+        <th class="r" onclick="skSortBy('answer')" title="Sort by what there is to do">answer ${skSortMark('answer')}</th>
       </tr></thead>
       <tbody>${rows.map(r=>{
         const [word,col]=SKW[r.kind]||[r.kind||'','var(--dim)'];
@@ -30347,6 +30393,10 @@ function skPaint(force){
           <div class="dim" style="font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-left:14px"
             >${esc(String(r.path||'').split('\\').pop())}</div></td>
         <td class="c dim">${esc(r.library||'')}</td>
+        <td class="c dim" style="font-size:10.5px" title="${r.added
+          ? esc(new Date(r.added*1000).toLocaleString())
+          : 'nuarr has no record of when this file arrived'}">${
+          r.added?ago(r.added):'—'}</td>
         <td class="c" style="font-size:10.5px;color:${pic?'#6fb0ff':'var(--dim)'}"
           title="${pic?'Words burned into the picture of a file that reports no subtitle track':'A text track inside the file'}">${
           pic?'picture':'track s:'+r.track}</td>
@@ -30374,11 +30424,14 @@ function skPaint(force){
              <button class="rmb" onclick="skDismiss('${r.id}',this)" title="${
                 pic?'This is not a burned-in subtitle. The words behind it join the list of reads that were wrong, and two dismissals in one series leave that show alone.'
                    :'This track is signs after all. Recorded as such, and the next read will not overwrite it.'}">Not dialogue</button>`}</td>
-      </tr>${open?`<tr id="skdet-${esc(r.id)}" style="background:rgba(255,255,255,.025)"><td colspan="8" style="padding:0;border-bottom:1px solid var(--line)">${skDetail(r)}</td></tr>`:''}`;}).join('')}</tbody></table></div>`
+      </tr>${open?`<tr id="skdet-${esc(r.id)}" style="background:rgba(255,255,255,.025)"><td colspan="9" style="padding:0;border-bottom:1px solid var(--line)">${skDetail(r)}</td></tr>`:''}`;}).join('')}</tbody></table></div>`
     : `<div class="dim" style="font-size:11.5px;padding:8px 0">${
         (tested||c.tracks)?'Nothing checked so far is carrying subtitles it should not, or under a title it should not.':'Nothing checked yet.'}</div>`;
   const foot=`<div class="dim" style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;font-size:11px;margin-top:6px">
-    <span>${fmt(pick.length)} still to answer · least certain first</span>
+    <span>${fmt(pick.length)} still to answer · ${_skSort==='doubt'
+      ? 'least certain first'
+      : `sorted by ${esc(_skSort==='kind'?'what it carries':_skSort)}${_skDesc?', highest first':''}`}${
+      _skSort!=='doubt'?` · <a href="#" onclick="_skSort='doubt';_skDesc=false;_skKey='';skPaint(true);return false">back to least certain first</a>`:''}</span>
     ${hiddenDone?`<a href="#" onclick="skShow('done',1);return false">also show the ${fmt(hiddenDone)} already marked</a>`:''}${
       (_skShowDone&&c.done)?`<a href="#" onclick="skShow('done',0);return false">hide the marked ones</a>`:''}
     ${hiddenUnread?`<a href="#" onclick="skShow('unread',1);return false">also show the ${fmt(hiddenUnread)} not read yet</a>`:''}${
@@ -34319,6 +34372,8 @@ html.mobile .setwrap:not(.rail) .setmain,html.mobile .setwrap:not(.rail) #worker
   text-overflow:ellipsis;vertical-align:middle}
 .sktbl th{padding-top:4px;padding-bottom:4px;font-weight:normal}
 .sktbl .l{text-align:left}.sktbl .c{text-align:center}.sktbl .r{text-align:right}
+.sktbl thead tr.sksort th[onclick]{cursor:pointer;user-select:none}
+.sktbl thead tr.sksort th[onclick]:hover{color:var(--fg)}
 .sktbl th.l:first-child,.sktbl td.l:first-child{padding-left:4px;padding-right:0}
 .sktbl td.c .kindsel{margin:0 auto;display:block}
 /* The kind picker. Small, quiet, and never wider than the words in it - it is

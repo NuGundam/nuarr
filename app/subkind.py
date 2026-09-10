@@ -104,6 +104,11 @@ def _picture_rows(limit: int) -> list:
             "action_word": "" if marked else "Mark it",
             "done": marked, "done_word": "marked" if marked else "",
             "detail": r.get("detail") or "",
+            # WHEN THE FILE LANDED, not when it was looked at. A finding you
+            # are deciding about is about a file, and "this arrived an hour
+            # ago" is what tells you whether it is the batch you just grabbed.
+            "added": float(r.get("first_seen") or 0.0),
+            "found_at": float(r.get("at") or 0.0),
         })
     return out
 
@@ -153,6 +158,8 @@ def _track_rows(limit: int) -> list:
                             ("" if unread else "left alone")),
             "done": False, "done_word": "",
             "detail": r.get("why") or "",
+            "added": float(r.get("added") or 0.0),
+            "found_at": 0.0,
         })
     return out
 
