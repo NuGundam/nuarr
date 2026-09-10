@@ -1866,6 +1866,46 @@ def unverified(limit: int = 5000) -> list[dict]:
     return out
 
 
+_PACE = {"at": 0.0, "each": 0.0}
+
+
+def secs_each_seen(sample: int = 400) -> float:
+    """Seconds a track, from what has actually been listened to.
+
+    A RATE THAT SURVIVES A RESTART. The pass in flight is the best evidence
+    there is, and between passes there is none - so the backlog said nothing
+    about how long it would take for most of the day, which is exactly when
+    somebody asks. The verdict table has a timestamp per track: the gaps
+    between consecutive ones ARE the pace, once the gaps that are really
+    "asleep between passes" are dropped.
+    """
+    now = time.time()
+    if now - _PACE["at"] < 300 and _PACE["each"]:
+        return _PACE["each"]
+    gaps: list = []
+    try:
+        ensure_table()
+        with cursor() as cur:
+            rows = [r["checked_at"] for r in cur.execute(
+                "SELECT checked_at FROM audio_lang "
+                " WHERE COALESCE(checked_at,0) > 0 "
+                " ORDER BY checked_at DESC LIMIT ?", (int(sample),))]
+        for a, b in zip(rows, rows[1:]):
+            g = float(a or 0) - float(b or 0)
+            # A gap longer than two minutes is the loop sleeping, not a track
+            # taking two minutes; a zero gap is two tracks of one file.
+            if 0.05 <= g <= 120:
+                gaps.append(g)
+    except Exception:                                            # noqa: BLE001
+        return _PACE["each"]
+    if not gaps:
+        return _PACE["each"]
+    gaps.sort()
+    each = gaps[len(gaps) // 2]          # the median, not the mean: one
+    _PACE.update(at=now, each=each)      # 40 GB outlier should not set the pace
+    return each
+
+
 def unverified_count() -> int:
     """How many tagged tracks have never been listened to."""
     try:
@@ -1880,6 +1920,84 @@ def unverified_count() -> int:
         return int(r["n"] or 0)
     except Exception:                                    # noqa: BLE001
         return 0
+
+
+def _name_of(code: str) -> str:
+    """The display name for a language code, whichever shape it arrives in.
+
+    _LANG_NAME is keyed on two-letter codes and the tags are three-letter, so
+    a single lookup returned "" and a rewrite quietly deleted the word it was
+    supposed to replace - "English E-AC3 5.1" became " E-AC3 5.1". Every
+    shape is tried, and an empty answer means do nothing at all.
+    """
+    from . import langkey
+    c = (code or "").strip().lower()
+    if not c:
+        return ""
+    # CHOICES IS THE THREE-LETTER TABLE and _LANG_NAME the two-letter one;
+    # tags are three-letter, so looking only in the second returned "" for
+    # every code a file actually carries. Both, then the key function.
+    for x in CHOICES:
+        if x.get("code") == c:
+            return x.get("name") or ""
+    for k in (c, c[:2]):
+        if k in _LANG_NAME:
+            return _LANG_NAME[k]
+    try:
+        k = langkey.key(c)
+        if k in _LANG_NAME:
+            return _LANG_NAME[k]
+        for x in CHOICES:
+            if langkey.key(x.get("code") or "") == k:
+                return x.get("name") or ""
+    except Exception:                                            # noqa: BLE001
+        pass
+    return ""
+
+
+def title_lies(file_id: int) -> list[dict]:
+    """Tracks whose TITLE still names a language the track is not.
+
+    The tag and the title are two different fields and only one of them was
+    ever corrected. A file can sit at lang=jpn title="English E-AC3 5.1"
+    forever: the rules read the tag and are content, and the only person who
+    sees the title is the one choosing a track in a player.
+    """
+    from . import langkey
+    out: list[dict] = []
+    try:
+        with cursor() as cur:
+            f = cur.execute("SELECT path, audio_langs FROM files WHERE id=?",
+                            (int(file_id),)).fetchone()
+        if not f:
+            return out
+        codes = [c.strip() for c in (f["audio_langs"] or "").split(",")]
+        for i, code in enumerate(codes):
+            if not code or code == "-":
+                continue
+            title = (_track_title(f["path"], i) or "").strip()
+            if not title:
+                continue
+            for key, name in _LANG_NAME.items():
+                if not re.search(rf"\b{re.escape(name)}\b", title, re.I):
+                    continue
+                try:
+                    if langkey.same(key, code):
+                        continue
+                except Exception:                                # noqa: BLE001
+                    pass
+                want_name = _name_of(code)
+                if not want_name:
+                    break            # no name to put there: leave it alone
+                out.append({"track": i, "title": title, "names": name,
+                            "code": code,
+                            "want": re.sub(rf"\b{re.escape(name)}\b",
+                                           want_name, title,
+                                           flags=re.IGNORECASE)})
+                break
+    except Exception:                                            # noqa: BLE001
+        return out
+    return [x for x in out if x["want"] and x["want"] != x["title"]]
 
 
 def mismatches(limit: int = 200, floor: float | None = None) -> list[dict]:
@@ -1977,18 +2095,47 @@ _LANG_NAME = {
 
 
 def _track_title(path: str, track: int) -> str:
-    """The title on one audio track, read from the stored probe."""
+    """The title on one audio track.
+
+    THE PROBE FIRST, THEN THE FILE. The stored probe is free and usually
+    right, but it is keyed on a path that renaming changes and it is written
+    before a correction rather than after - and when it comes back empty this
+    returned "", which the retitle step read as "no title to fix". That is how
+    a track ended up tagged jpn and titled "English E-AC3 5.1": the lie was
+    never seen, because the only place it was looked for was out of date.
+    """
     try:
         with cursor() as cur:
             r = cur.execute("SELECT p.json FROM file_probes p "
                             "JOIN files f ON f.id = p.file_id "
                             "WHERE f.path = ?", (path,)).fetchone()
-        if not r:
+        if r:
+            auds = [s for s in (json.loads(r["json"]).get("streams") or [])
+                    if s.get("codec_type") == "audio"]
+            if track < len(auds):
+                t = str((auds[track].get("tags") or {}).get("title") or "")
+                if t:
+                    return t
+    except Exception:                                    # noqa: BLE001
+        pass
+    return _track_title_live(path, track)
+
+
+def _track_title_live(path: str, track: int) -> str:
+    """Straight from the container's header. One mkvmerge call, no decode."""
+    try:
+        exe = getattr(SETTINGS, "mkvmerge", "") or \
+            r"C:\Program Files\MKVToolNix\mkvmerge.exe"
+        if not os.path.exists(exe) or not os.path.exists(path):
             return ""
-        auds = [s for s in (json.loads(r["json"]).get("streams") or [])
-                if s.get("codec_type") == "audio"]
+        r = subprocess.run([exe, "-J", path], capture_output=True, text=True,
+                           timeout=120, creationflags=NO_WINDOW,
+                           startupinfo=hidden_si())
+        auds = [t for t in (json.loads(r.stdout or "{}").get("tracks") or [])
+                if t.get("type") == "audio"]
         if track < len(auds):
-            return str((auds[track].get("tags") or {}).get("title") or "")
+            return str((auds[track].get("properties") or {}).get(
+                "track_name") or "")
     except Exception:                                    # noqa: BLE001
         pass
     return ""
@@ -2165,6 +2312,16 @@ def auto_pass() -> dict:
     return out
 
 
+def path_of(file_id: int) -> str:
+    try:
+        with cursor() as cur:
+            r = cur.execute("SELECT path FROM files WHERE id=?",
+                            (int(file_id),)).fetchone()
+        return r["path"] if r else ""
+    except Exception:                                            # noqa: BLE001
+        return ""
+
+
 def fix_mislabel(file_id: int, track: int) -> dict:
     r"""Correct a lying tag, then let the rules deal with what that reveals.
 
@@ -2183,9 +2340,24 @@ def fix_mislabel(file_id: int, track: int) -> dict:
     m = [x for x in mismatches(2000, floor=0.0)
          if x["file_id"] == int(file_id) and x["track"] == int(track)]
     if not m:
-        return {"ok": False, "why": "the tag and the audio agree now - this "
-                                    "track has been listened to again since "
-                                    "the list was drawn"}
+        # ALREADY DONE IS NOT A FAILURE. The row on the page can be a minute
+        # old, and pressing a second time should say the work is behind you -
+        # in the words for it, and with the row leaving.
+        lies = title_lies(int(file_id))
+        if lies:
+            fixed = []
+            for t in lies:
+                if _set_track_title(path_of(int(file_id)), t["track"], t["want"]):
+                    fixed.append(f"track {t['track']}: "
+                                 f"{t['title']!r} -> {t['want']!r}")
+            if fixed:
+                _reprobe_quiet(int(file_id), path_of(int(file_id)))
+                return {"ok": True, "gone": True,
+                        "why": "the tag was already right; corrected the title "
+                               "it still carried - " + "; ".join(fixed)}
+        return {"ok": True, "gone": True,
+                "why": "the tag and the audio already agree - nothing left "
+                       "to correct on this track"}
     x = m[0]
     key = fix_begin(int(file_id), int(track), ("open", "tag", "title", "reread"))
     with cursor() as cur:
@@ -2209,18 +2381,26 @@ def fix_mislabel(file_id: int, track: int) -> dict:
     # viewer reads. The audio-title check does not catch it either: it looks
     # for titles naming a CODEC the file does not have, not a language.
     #
-    # Only touched when the title is the old language's own name. A release
-    # that titled the track "Japanese Dub 5.1" or "Commentary" is saying
-    # something this has no business rewriting.
+    # ONLY THE LANGUAGE WORD, WHEREVER IT SITS. The first version rewrote the
+    # title only when it was exactly the old language's name, which left
+    # "English E-AC3 5.1" on a track now tagged jpn - the codec and the
+    # channels are true and the one word that matters is still a lie. So the
+    # word is replaced in place and everything around it kept: "English E-AC3
+    # 5.1" becomes "Japanese E-AC3 5.1". Whole words only, so "Englishman"
+    # survives, and if the name is not in there nothing is touched - a release
+    # that called it "Commentary" is saying something this has no business
+    # rewriting.
     retitled = ""
     fix_step(key, "title")
     try:
-        old_name = _LANG_NAME.get(langkey.key(x["tagged"]), "")
-        new_name = _LANG_NAME.get(langkey.key(x["heard"]), "")
-        cur_title = _track_title(path, int(track))
-        if old_name and new_name and cur_title.strip().lower() == old_name.lower():
-            if _set_track_title(path, int(track), new_name):
-                retitled = f", and its title from {old_name} to {new_name}"
+        old_name = _name_of(x["tagged"])
+        new_name = _name_of(x["heard"])
+        cur_title = (_track_title(path, int(track)) or "").strip()
+        if old_name and new_name and cur_title:
+            want = re.sub(rf"\b{re.escape(old_name)}\b", new_name, cur_title,
+                          flags=re.IGNORECASE)
+            if want != cur_title and _set_track_title(path, int(track), want):
+                retitled = (f", and its title from {cur_title!r} to {want!r}")
     except Exception:                                    # noqa: BLE001
         pass
     fix_step(key, "reread")

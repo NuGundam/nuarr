@@ -6744,11 +6744,25 @@ def api_audiolang_mismatch(limit: int = 60):
     # it, so it is read rather than hard-coded.
     each = 0.0
     try:
-        span = (prog.get("finished_at") or 0) - (prog.get("started_at") or 0)
-        if span > 0 and (prog.get("done") or 0) > 0:
-            each = span / prog["done"]
+        # THE RUN THAT IS HAPPENING, then the one that finished. Reading only
+        # finished_at meant that during a pass - which is most of the time on
+        # a 27,000-track backlog - there was no rate, so no estimate, so the
+        # one number saying whether this is worth waiting for was blank
+        # exactly while somebody was watching it move.
+        done = int(prog.get("done") or 0)
+        started = float(prog.get("started_at") or 0)
+        ended = float(prog.get("finished_at") or 0)
+        span = (ended - started) if ended else (
+            (time.time() - started) if started else 0)
+        if span > 0 and done > 0:
+            each = span / done
     except Exception:                                    # noqa: BLE001
         each = 0.0
+    if not each:
+        # NO PASS RIGHT NOW, BUT THE LIBRARY REMEMBERS. Between passes the
+        # question "how long until this is done" still has an answer, and it
+        # is written in the timestamps of everything already listened to.
+        each = audiolang.secs_each_seen()
     return {"rows": audiolang.mismatches(max(1, min(int(limit), 300))),
             "unverified": left, "gaps": audiolang.pending_count(),
             "progress": prog, "secs_each": round(each, 2),
@@ -6760,8 +6774,13 @@ def api_audiolang_mismatch(limit: int = 60):
 async def api_audiolang_fix(file_id: int, track: int):
     """Correct one lying tag. The duplicate it reveals is the rules' problem."""
     from . import audiolang
-    return await asyncio.to_thread(audiolang.fix_mislabel, int(file_id),
-                                   int(track))
+    out = await asyncio.to_thread(audiolang.fix_mislabel, int(file_id),
+                                  int(track))
+    # THE WALK IS MEMOISED AND THE CORRECTION JUST INVALIDATED IT. Without
+    # this the row stayed on the page, a second press found nothing to do,
+    # and the panel looked like it had refused the work it had just done.
+    _amemo_expire("audiolang:")
+    return out
 
 
 @app.get("/api/audiolang/auto")
@@ -6877,11 +6896,25 @@ def api_audiolang_backlog():
     prog = audiolang.progress()
     each = 0.0
     try:
-        span = (prog.get("finished_at") or 0) - (prog.get("started_at") or 0)
-        if span > 0 and (prog.get("done") or 0) > 0:
-            each = span / prog["done"]
+        # THE RUN THAT IS HAPPENING, then the one that finished. Reading only
+        # finished_at meant that during a pass - which is most of the time on
+        # a 27,000-track backlog - there was no rate, so no estimate, so the
+        # one number saying whether this is worth waiting for was blank
+        # exactly while somebody was watching it move.
+        done = int(prog.get("done") or 0)
+        started = float(prog.get("started_at") or 0)
+        ended = float(prog.get("finished_at") or 0)
+        span = (ended - started) if ended else (
+            (time.time() - started) if started else 0)
+        if span > 0 and done > 0:
+            each = span / done
     except Exception:                                    # noqa: BLE001
         each = 0.0
+    if not each:
+        # NO PASS RIGHT NOW, BUT THE LIBRARY REMEMBERS. Between passes the
+        # question "how long until this is done" still has an answer, and it
+        # is written in the timestamps of everything already listened to.
+        each = audiolang.secs_each_seen()
     return {"progress": prog, "unverified": left,
             "gaps": audiolang.pending_count(),
             "queued": audiolang.queue_count(),
@@ -15391,8 +15424,12 @@ async function alFixOne(id, btn){
         await fetch(`/api/audiolang/set?file_id=${fid}&track=${track}&code=${
           encodeURIComponent(want)}`, {method:'POST'});
       }
-      return (await fetch(`/api/audiolang/fix?file_id=${fid}&track=${track}`,
-                          {method:'POST'})).json();
+      const r=await (await fetch(
+        `/api/audiolang/fix?file_id=${fid}&track=${track}`,{method:'POST'})).json();
+      // `gone` means the work is behind you - the tag was already right, or a
+      // title it still carried has just been put right. Not a refusal, and
+      // the row should leave saying so.
+      return r;
     }, ()=>loadAlang(true)));
 }
 async function alFixMany(btn){
