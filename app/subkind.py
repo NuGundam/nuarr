@@ -125,8 +125,9 @@ def _track_rows(limit: int) -> list:
             "kind": r.get("kind") or "", "chosen": bool(r.get("chosen")),
             "kinds": r.get("kinds") or [],
             "sure": score, "read": not unread, "unread": unread,
-            "evidence": (f"{r.get('cues') or 0} cues · {r.get('cpm') or 0}/min"
-                         + (f" · {r.get('shape')}" if r.get("shape") else "")),
+            "evidence": f"{r.get('cues') or 0} cues · {r.get('cpm') or 0}/min",
+            "plain_rate": r.get("rate") or 0,
+            "shape": r.get("shape") or "",
             "why": r.get("kind_why") or r.get("why") or "",
             "auto": auto, "auto_why": auto_why,
             "title_old": r.get("old") or "", "title_new": r.get("new") or "",

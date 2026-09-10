@@ -30003,16 +30003,27 @@ function skToggleOpen(id, ev){
 function skDetail(r){
   const pic=r.source==='picture';
   const line=(k,v)=>v?`<div style="display:flex;gap:8px;margin:2px 0"><span class="dim" style="flex:none;width:96px;text-align:right">${k}</span><span style="min-width:0;overflow-wrap:anywhere;white-space:normal">${v}</span></div>`:'';
+  // SIMPLIFIED ON PURPOSE. The OCR returns forty words of which half are
+  // noise; the first dozen say whether it is speech. A track's style-by-style
+  // shape is a paragraph; the one number that decides it is plain dialogue
+  // lines a minute.
+  let ev='';
+  if(pic){
+    const words=String(r.evidence||'').split(/,\s*/).filter(Boolean);
+    ev=`<span class="mono">${esc(words.slice(0,12).join(', '))}</span>${
+      words.length>12?` <span class="dim">… and ${fmt(words.length-12)} more</span>`:''}`;
+  }else if(!r.unread){
+    ev=esc(r.evidence||'');       // the plain-line rate is the "so" line
+  }else{
+    ev=`${esc(r.evidence||'')} <span class="dim">— events not read yet</span>`;
+  }
   return `<div style="font-size:11px;padding:6px 10px 8px 34px;white-space:normal">
     ${line('file', `<span class="mono">${esc(r.path||'')}</span>`)}
-    ${line('where', pic?'burned into the picture of a file that reports no subtitle track':`text track s:${r.track} inside the file`)}
-    ${line(pic?'read':'measured', `<span class="mono">${esc(r.evidence||'')}</span>`)}
-    ${line('reading', esc(r.why||''))}
-    ${line('auto would', esc(r.auto_why||''))}
+    ${line(pic?'OCR read':'measured', ev)}
+    ${line('so', esc(r.why||''))}
     ${pic?'':line('title', `<span style="color:var(--warn)">${esc(r.title_old||'')}</span>${
       r.action==='retitle'?` <span class="dim">→</span> <span style="color:var(--ok)">${esc(r.title_new||'')}</span>`
       :(r.unread?'':' <span class="dim">— left alone: it carries a name nuarr did not write</span>')}`)}
-    ${(r.detail&&r.detail!==r.why&&r.detail!==r.evidence)?line('detail', esc(r.detail)):''}
   </div>`;
 }
 const SKW={dialogue:['dialogue','var(--bad)'], hybrid:['dialogue + signs','var(--bad)'],
@@ -30299,9 +30310,9 @@ function skPaint(force){
       <!-- FIXED LAYOUT, because the evidence column is forty OCR words or a
            style-by-style shape and an auto-laid table will widen the whole
            page to fit it. Every cell clips; the row opens for the rest. -->
-      <colgroup><col style="width:22px"><col style="width:27%"><col style="width:8%">
+      <colgroup><col style="width:22px"><col style="width:auto"><col style="width:11%">
         <col style="width:66px"><col style="width:132px"><col style="width:58px">
-        <col style="width:auto"><col style="width:15%"><col style="width:158px"></colgroup>
+        <col style="width:22%"><col style="width:158px"></colgroup>
       <thead><tr class="dim" style="font-size:10.5px;text-align:left">
         <th style="padding:3px 0 4px 2px"><input type="checkbox" ${allOn?'checked':''}
             title="Select every row with something to do" onclick="skSelAll(this.checked)"></th>
@@ -30310,7 +30321,6 @@ function skPaint(force){
         <th title="What the reader says it carries, and a way to say that is wrong. The picker outranks the reading and is what the answer records.">what it carries</th>
         <th style="text-align:right;padding-right:14px"
           title="How sure the reading is, 0-100, the same scale for both readers. Above the act line it would be acted on alone; below the dismiss line thrown away; in between is yours to call.">sure</th>
-        <th style="padding-left:4px" title="What the reader saw: words the OCR returned, or the track's cue count and rate">evidence</th>
         <th title="For a track: what its title says now, and what it would be corrected to">title</th>
         <th style="text-align:right;padding-right:2px">answer</th>
       </tr></thead>
@@ -30341,8 +30351,6 @@ function skPaint(force){
                        :`<div style="font-size:9.5px;color:${col}">read as ${esc(word)}</div>`}`}</td>
         <td class="mono" style="padding:5px 14px 5px 0;text-align:right;font-variant-numeric:tabular-nums;color:${skColor(r)}"
             title="${esc((r.why||'')+' — '+(r.auto_why||''))}">${r.unread?'':(r.sure+'%')}</td>
-        <td class="dim mono" style="padding:5px 8px 5px 10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
-            title="${esc(r.evidence||'')}">${esc(r.evidence||'')}</td>
         <td class="mono" style="padding:5px 8px 5px 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${pic?'<span class="dim">—</span>'
           :`<span style="color:var(--warn)" title="${esc(r.title_old||'')}">${esc(r.title_old||'')}</span>${
              r.action==='retitle'?`<div style="font-size:10px;color:var(--ok)" title="${esc(r.title_new||'')}">→ ${esc(r.title_new||'')}</div>`
@@ -30357,7 +30365,7 @@ function skPaint(force){
              <button class="rmb" onclick="skDismiss('${r.id}',this)" title="${
                 pic?'This is not a burned-in subtitle. The words behind it join the list of reads that were wrong, and two dismissals in one series leave that show alone.'
                    :'This track is signs after all. Recorded as such, and the next read will not overwrite it.'}">Not dialogue</button>`}</td>
-      </tr>${open?`<tr id="skdet-${esc(r.id)}" style="background:rgba(255,255,255,.025)"><td colspan="9" style="padding:0;border-bottom:1px solid var(--line)">${skDetail(r)}</td></tr>`:''}`;}).join('')}</tbody></table></div>`
+      </tr>${open?`<tr id="skdet-${esc(r.id)}" style="background:rgba(255,255,255,.025)"><td colspan="8" style="padding:0;border-bottom:1px solid var(--line)">${skDetail(r)}</td></tr>`:''}`;}).join('')}</tbody></table></div>`
     : `<div class="dim" style="font-size:11.5px;padding:8px 0">${
         (tested||c.tracks)?'Nothing checked so far is carrying subtitles it should not, or under a title it should not.':'Nothing checked yet.'}</div>`;
   const foot=`<div class="dim" style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;font-size:11px;margin-top:6px">
