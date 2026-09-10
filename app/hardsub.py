@@ -216,6 +216,15 @@ def init() -> None:
             )""")
         cur.execute("CREATE INDEX IF NOT EXISTS ix_hardsub_state "
                     "ON hardsub(state)")
+        # WHOSE VERDICT IS THIS? The detector reads twenty-four frames and
+        # guesses from what came back; a person watches the episode. When they
+        # disagree the person is right, and the row has to remember that or
+        # the next sweep quietly overwrites the correction with the same wrong
+        # guess it made the first time.
+        try:
+            cur.execute("ALTER TABLE hardsub ADD COLUMN chosen TEXT")
+        except Exception:                                        # noqa: BLE001
+            pass
         # WHAT A DISMISSAL IS WORTH KEEPING. Not just "hide this row" - the
         # words that produced it, and which series it belongs to, because both
         # are the evidence for not making the same mistake again.
@@ -444,6 +453,16 @@ def _save(d: dict) -> None:
         init()
     try:
         with cursor() as cur:
+            # A HAND-SET KIND OUTRANKS THE DETECTOR, ALWAYS. Not just this
+            # once - for good. Erik looked at Detective Conan S14E19, which
+            # the sampler called "signs or songs" at 58%, and it is dialogue
+            # with signs over the top. Twenty-four frames landing on the sparse
+            # parts of an episode is exactly how that mistake happens, and it
+            # would happen again on the next pass with the same twenty-four.
+            row = cur.execute("SELECT chosen FROM hardsub WHERE file_id=?",
+                              (int(d["file_id"]),)).fetchone()
+            if row and (row["chosen"] or ""):
+                d = dict(d, state=row["chosen"])
             cur.execute(
                 "INSERT INTO hardsub(file_id,path,size,at,state,low_hits,"
                 "high_hits,samples,words,detail) VALUES(?,?,?,?,?,?,?,?,?,?) "
@@ -553,6 +572,46 @@ def garbage_words() -> set:
     got = {w for w, n in bad.items() if n >= GARBAGE_MIN and w not in keep}
     _GARB.update(at=now, words=got)
     return got
+
+
+KINDS = (DIALOGUE, HYBRID, SIGNS, NONE)
+KIND_WORDS = {DIALOGUE: "dialogue", HYBRID: "dialogue + signs",
+              SIGNS: "signs or songs", NONE: "no subtitles in the picture"}
+
+
+def set_kind(file_id: int, kind: str) -> dict:
+    r"""Record what a person says this file actually carries.
+
+    THE CORRECTION IS WORTH MORE THAN THE ROW IT FIXES. The detector samples
+    twenty-four frames; a person has seen the episode. Storing the answer in
+    its own column rather than overwriting `state` keeps both - what was
+    guessed and what is true - which is the pair a future tuning pass would
+    need, and stops the next sweep undoing the correction.
+    """
+    kind = (kind or "").strip().lower()
+    if kind not in KINDS:
+        return {"ok": False, "why": f"{kind!r} is not a kind"}
+    if not _READY:
+        init()
+    try:
+        with cursor() as cur:
+            r = cur.execute("SELECT state FROM hardsub WHERE file_id=?",
+                            (int(file_id),)).fetchone()
+            if not r:
+                return {"ok": False, "why": "no finding for that file"}
+            was = r["state"] or ""
+            cur.execute("UPDATE hardsub SET chosen=?, state=? WHERE file_id=?",
+                        (kind, kind, int(file_id)))
+    except Exception as e:                                       # noqa: BLE001
+        return {"ok": False, "why": str(e)[:160]}
+    if was and was != kind:
+        joblog.log(f"burned-in subtitles: file {file_id} read as "
+                   f"{KIND_WORDS.get(was, was)} and set by hand to "
+                   f"{KIND_WORDS.get(kind, kind)}", "info")
+    return {"ok": True, "was": was, "kind": kind,
+            "why": (f"set to {KIND_WORDS.get(kind, kind)}"
+                    + (f" (read as {KIND_WORDS.get(was, was)})"
+                       if was and was != kind else ""))}
 
 
 # ------------------------------------------------- how sure is it, and why --
@@ -825,8 +884,16 @@ MARK_NAME = "English (burned into the picture)"
 _MARK_SRT = "1\r\n00:00:00,000 --> 00:00:01,000\r\n​\r\n\r\n"
 
 
-def mark_one(file_id: int) -> dict:
-    """Give a hardsubbed file a blank English subtitle track."""
+def mark_one(file_id: int, kind: str = "") -> dict:
+    """Give a hardsubbed file a blank English subtitle track.
+
+    `kind` is what the person says it carries, set before the track is
+    written so the row records the truth rather than the guess.
+    """
+    if kind:
+        k = set_kind(int(file_id), kind)
+        if not k.get("ok"):
+            return k
     from . import fileops
     from .subembed import _mkvmerge, have_mkvmerge, _probe_langs, _lang_key
     with cursor() as cur:
@@ -973,7 +1040,7 @@ def ignore_many(file_ids) -> dict:
     return {"ok": True, "done": done, "quiet": quiet, "why": why}
 
 
-async def mark_many(file_ids, force: bool = False) -> dict:
+async def mark_many(file_ids, force: bool = False, kind: str = "") -> dict:
     """Add the marker track to a list of files, behind the request."""
     if MARK_STATE["running"]:
         return {"ok": False, "why": "a batch is already running"}
@@ -988,12 +1055,12 @@ async def mark_many(file_ids, force: bool = False) -> dict:
     MARK_STATE.update(running=True, done=0, total=len(ids), now="", ok=0,
                       failed=0, t0=time.time(), finished=0.0, yielded="",
                       errors=[])
-    asyncio.get_running_loop().create_task(_mark_batch(ids, force))
+    asyncio.get_running_loop().create_task(_mark_batch(ids, force, kind))
     return {"ok": True, "started": len(ids),
             "why": f"marking {len(ids)} file" + ("" if len(ids) == 1 else "s")}
 
 
-async def _mark_batch(ids: list, force: bool) -> None:
+async def _mark_batch(ids: list, force: bool, kind: str = "") -> None:
     ok = failed = 0
     try:
         for fid in ids:
@@ -1014,7 +1081,7 @@ async def _mark_batch(ids: list, force: bool) -> None:
                 MARK_STATE["now"] = os.path.basename(r["path"]) if r else str(fid)
             except Exception:                                    # noqa: BLE001
                 MARK_STATE["now"] = str(fid)
-            res = await asyncio.to_thread(mark_one, fid)
+            res = await asyncio.to_thread(mark_one, fid, kind)
             if res.get("ok"):
                 ok += 1
             else:
@@ -1298,7 +1365,8 @@ def found(limit: int = 60) -> list:
         with cursor() as cur:
             rows = [dict(r) for r in cur.execute(
                 "SELECT h.file_id, h.path, h.state, h.low_hits, h.samples, "
-                "       h.words, h.detail, h.marked, f.library "
+                "       h.words, h.detail, h.marked, h.chosen, "
+                "       f.library, f.title, f.season, f.episode "
                 "  FROM hardsub h JOIN files f ON f.id = h.file_id "
                 " WHERE h.state != ? AND f.state NOT IN ('deleted','duplicate') "
                 "   AND NOT EXISTS (SELECT 1 FROM hardsub_ignored i "
@@ -1310,6 +1378,17 @@ def found(limit: int = 60) -> list:
     mid = (lo + hi) / 2.0
     for r in rows:
         r.update(verdict_for(r))
+        # THE EPISODE, NOT THE SHOW. Twenty-six rows all reading "Detective
+        # Conan" is a list you cannot act on: the filename is in the row but
+        # it is 90 characters of release tags, and the part that identifies
+        # the file is four of them.
+        try:
+            from .db import display_label
+            r["label"] = display_label(r.get("title"), r.get("season"),
+                                       r.get("episode"))
+        except Exception:                                        # noqa: BLE001
+            r["label"] = r.get("title") or ""
+        r["kinds"] = [{"id": k, "word": KIND_WORDS[k]} for k in KINDS]
     rows.sort(key=lambda r: (bool(r.get("marked")),
                              abs(r.get("score", 0) - mid)))
     return rows

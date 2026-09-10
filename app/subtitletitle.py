@@ -210,7 +210,22 @@ def _rows_from_probe(path: str, probe: dict) -> list:
             new = (f"{name} (signs only)" if name else "Signs only")
         if not why:
             continue
+        # HOW SURE, FROM THE ONE THING THAT IS MEASURED. This check has no
+        # OCR to be unsure about - it has a cue rate - so the confidence is
+        # simply how far inside the speech band the track sits. A track at 18
+        # a minute is squarely where people talk; one at 8 or at 45 is on the
+        # edge of the band and could be a long sparse track or a busy sign
+        # sheet. Reported so the two panels read the same way round, and so a
+        # borderline row can be recognised as borderline.
+        mid = (SPEECH_LO + SPEECH_HI) / 2.0
+        half = (SPEECH_HI - SPEECH_LO) / 2.0
+        if sparse_claim:
+            sure = 100.0 - (abs(cpm - mid) / half) * 45.0
+        else:
+            # The opposite finding: the further below 3 a minute, the surer.
+            sure = 100.0 - (cpm / 3.0) * 40.0
         out.append({"track": s_i, "old": old, "new": new, "why": why,
+                    "sure": int(max(0, min(100, round(sure)))),
                     "cues": cues, "cpm": round(cpm, 1),
                     "minutes": round(dur / 60.0, 1),
                     "codec": s.get("codec_name") or "",
@@ -221,6 +236,20 @@ def _rows_from_probe(path: str, probe: dict) -> list:
     return out
 
 
+def _label(r) -> str:
+    """'Detective Conan - S14E19', not 'Detective Conan'.
+
+    Twenty-six rows sharing a series name is a list nobody can act on. The
+    filename is in the row already and it is ninety characters of release
+    tags; the four that identify the episode are the ones worth showing.
+    """
+    try:
+        from .db import display_label
+        return display_label(r["title"], r["season"], r["episode"])
+    except Exception:                                            # noqa: BLE001
+        return (r["title"] if "title" in r.keys() else "") or ""
+
+
 def scan(limit: int = 0) -> dict:
     r"""Every contradicted subtitle title in the library, from stored probes."""
     rows, checked = [], 0
@@ -228,7 +257,8 @@ def scan(limit: int = 0) -> dict:
     try:
         with cursor() as cur:
             got = cur.execute(
-                "SELECT f.id, f.path, f.title, f.library, p.json "
+                "SELECT f.id, f.path, f.title, f.library, f.season, "
+                "       f.episode, p.json "
                 "  FROM files f JOIN file_probes p ON p.file_id = f.id "
                 " WHERE f.state NOT IN ('deleted','duplicate') "
                 + (" LIMIT ?" if limit else ""),
@@ -244,10 +274,12 @@ def scan(limit: int = 0) -> dict:
                 continue
             for row in _rows_from_probe(r["path"] or "", probe):
                 row.update(file_id=r["id"], path=r["path"],
-                           title=r["title"] or "", library=r["library"] or "")
+                           title=r["title"] or "", library=r["library"] or "",
+                           label=_label(r))
                 rows.append(row)
     finally:
         _CACHE.update(running=False, done=checked, now="", t1=time.time())
+    rows.sort(key=lambda r: (not r.get("rewritable"), r.get("sure", 0)))
     data = {"rows": rows, "checked": checked, "at": time.time(),
             "took": round(_CACHE["t1"] - _CACHE["t0"], 1),
             "fixable": sum(1 for r in rows if r["rewritable"])}

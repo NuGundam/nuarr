@@ -6927,6 +6927,13 @@ def _id_list(ids: str) -> list:
     return out
 
 
+@app.post("/api/hardsub/kind")
+async def api_hardsub_kind(file_id: int, kind: str):
+    """Say what this file actually carries. Outranks the detector, for good."""
+    from . import hardsub
+    return await asyncio.to_thread(hardsub.set_kind, int(file_id), kind)
+
+
 @app.post("/api/hardsub/ignore/batch")
 async def api_hardsub_ignore_batch(ids: str = ""):
     """Withdraw several findings at once. Nothing on disk changes."""
@@ -6936,7 +6943,7 @@ async def api_hardsub_ignore_batch(ids: str = ""):
 
 @app.post("/api/hardsub/mark/batch")
 async def api_hardsub_mark_batch(ids: str = "", confirm: str = "",
-                                 force: int = 0):
+                                 force: int = 0, kind: str = ""):
     """Start marking several files. Returns as soon as the work is queued.
 
     Behind the same confirm word the single-file button uses, because this
@@ -6946,7 +6953,8 @@ async def api_hardsub_mark_batch(ids: str = "", confirm: str = "",
     if confirm != "yes":
         return {"ok": False, "why": "confirm=yes required"}
     from . import hardsub
-    return await hardsub.mark_many(_id_list(ids), force=bool(force))
+    return await hardsub.mark_many(_id_list(ids), force=bool(force),
+                                   kind=kind)
 
 
 @app.get("/api/hardsub/mark/progress")
@@ -6964,7 +6972,7 @@ async def api_hardsub_ignore(file_id: int, undo: int = 0):
 
 
 @app.post("/api/hardsub/mark")
-async def api_hardsub_mark(file_id: int, confirm: str = ""):
+async def api_hardsub_mark(file_id: int, confirm: str = "", kind: str = ""):
     """Add the blank English marker track so Bazarr stops asking.
 
     Behind a confirm word because it rewrites the file - a stream copy, but a
@@ -6974,7 +6982,7 @@ async def api_hardsub_mark(file_id: int, confirm: str = ""):
     if confirm != "yes":
         return {"ok": False, "why": "this rewrites the file to add a blank "
                                     "subtitle track - confirm required"}
-    return await asyncio.to_thread(hardsub.mark_one, int(file_id))
+    return await asyncio.to_thread(hardsub.mark_one, int(file_id), kind)
 
 
 @app.get("/api/subembed")
@@ -29734,16 +29742,27 @@ function sttPaint(){
     animated typesetting rather than speech, so it is left alone. Nothing is
     re-probed and nothing is re-encoded: the check costs a query and the
     correction is a header edit.</div>`;
-  const table = shown.length ? `<table style="width:100%;font-size:11.5px">
-      <colgroup><col style="width:36%"><col style="width:10%"><col style="width:17%">
-        <col style="width:16%"><col style="width:21%"></colgroup>
-      <tbody>${shown.slice(0,300).map(r=>`<tr>
+  const table = shown.length ? `<div class="rowbox scrollbox">
+      <table style="width:100%;font-size:11.5px">
+      <colgroup><col style="width:32%"><col style="width:8%"><col style="width:50px">
+        <col style="width:16%"><col style="width:15%"><col style="width:21%"></colgroup>
+      <thead><tr class="dim" style="font-size:10.5px;text-align:left">
+        <th style="padding:3px 8px 4px 0">episode</th><th>library</th>
+        <th title="How far inside the band where people talk this track's cue rate sits. A track squarely in the middle of that band is unarguable; one on either edge could be a long sparse track or a busy sign sheet.">sure</th>
+        <th>says</th><th>would become</th><th>measured</th>
+      </tr></thead>
+      <tbody>${shown.slice(0,400).map(r=>`<tr>
         <td style="padding:3px 8px 3px 0" title="${esc(r.path||'')}"
-          >${esc((r.title||String(r.path||'').split('\\').pop()).slice(0,72))}
-          <div class="dim" style="font-size:10px">${esc(r.library||'')}</div></td>
-        <td class="mono dim" style="padding:3px 8px 3px 0">s:${r.track}</td>
+          >${esc(r.label||r.title||String(r.path||'').split('\\').pop())}
+          <div class="dim" style="font-size:10px;overflow:hidden;
+               text-overflow:ellipsis;white-space:nowrap"
+            >${esc(String(r.path||'').split('\\').pop())}</div></td>
+        <td class="dim" style="padding:3px 8px 3px 0">${esc(r.library||'')}</td>
+        <td class="mono" style="padding:3px 8px 3px 0;text-align:right;color:${
+          (r.sure||0)>=75?'var(--bad)':(r.sure||0)>=55?'var(--warn)':'var(--dim)'}"
+          title="${esc(r.why||'')}">${r.sure===undefined?'':r.sure+'%'}</td>
         <td class="mono" style="padding:3px 8px 3px 0;color:var(--warn)"
-          >${esc(r.old||'')}</td>
+          >${esc(r.old||'')}<div class="dim" style="font-size:10px">s:${r.track}</div></td>
         <td class="mono" style="padding:3px 8px 3px 0;color:${
           r.rewritable?'var(--ok)':'var(--dim)'}"
           >${r.rewritable?esc(r.new||''):'—'}</td>
@@ -29754,7 +29773,7 @@ function sttPaint(){
              onclick="sttFixOne(${r.file_id},this)">Correct it</button>`
             :`<span class="dim" style="font-size:10.5px;margin-left:8px"
                title="The title carries a name nuarr did not write and cannot regenerate, so it is reported and left exactly as it is.">left alone</span>`}
-        </td></tr>`).join('')}</tbody></table>`
+        </td></tr>`).join('')}</tbody></table></div>`
     : `<div class="dim" style="font-size:11.5px;padding:8px 0">${
         d.total?'Nothing here nuarr can rewrite safely.'
                :'Every subtitle title agrees with the track behind it.'}</div>`;
@@ -29846,18 +29865,35 @@ function hsSelAll(on){
 }
 function hsClearSel(){ _hsSel.clear(); _hsLast=null; _hsKey=''; hsPaint(); }
 
+async function hsSetKind(fid, kind, el){
+  if(el) el.disabled=true;
+  try{ await fetch(`/api/hardsub/kind?file_id=${fid}&kind=${encodeURIComponent(kind)}`,
+                   {method:'POST'}); }catch(e){}
+  if(el) el.disabled=false;
+  _hsKey=''; loadHardsub();
+}
+// WHAT THE BATCH IS ABOUT TO CALL THEM. Empty means "leave each row as it is",
+// which is the right default: a selection of forty is usually forty rows the
+// detector got right, and forcing one kind onto all of them would throw away
+// the per-file readings to save one dropdown.
+let _hsBatchKind='';
+function hsBatchKind(v){ _hsBatchKind=v||''; _hsKey=''; hsPaint(); }
+
 async function hsMarkMany(btn){
   const ids=hsSelIds();
   if(!ids.length) return;
   askInline(btn,
     `Add a blank English track to ${ids.length} file`
     + (ids.length===1?'':'s')
+    + (_hsBatchKind?`, all recorded as ${_hsBatchKind}`
+                   :', each keeping the kind its own row shows')
     + '? Each one is stream-copied, nothing is re-encoded, and the pool is '
     + 'asked before every file so it stops if somebody starts watching.',
     `Yes, mark ${ids.length}`,
     async ()=>{
       const r=await (await fetch('/api/hardsub/mark/batch?confirm=yes&ids='
-        +ids.join(','), {method:'POST'})).json();
+        +ids.join(',')+(_hsBatchKind?'&kind='+encodeURIComponent(_hsBatchKind):''),
+        {method:'POST'})).json();
       if(r.ok){ _hsSel.clear(); _hsLast=null; hsMarkWatch(); }
       return r;
     });
@@ -30040,12 +30076,20 @@ function hsPaint(){
         >Mark ${fmt(nsel)} as burned in</button>
       <button class="rmb" onclick="hsIgnoreMany(this)"
         >Not subtitles</button>
+      <select class="kindsel" onchange="hsBatchKind(this.value)"
+        title="Leave this alone and every file keeps whatever its own row says it is. Pick one and all of them are recorded as that - for a whole season the detector read the same way and got wrong.">
+        <option value=""${_hsBatchKind?'':' selected'}>keep each row's kind</option>
+        ${['dialogue','hybrid','signs'].map(k=>`<option value="${k}"${
+          _hsBatchKind===k?' selected':''}>all as ${
+          k==='hybrid'?'dialogue + signs':k==='signs'?'signs or songs':'dialogue'
+          }</option>`).join('')}
+      </select>
       <button class="rmb" onclick="hsClearSel()">Clear</button>
       <span class="dim" style="font-size:10.5px">shift-click to take a range</span>
     </div>` : '';
 
   const table = rows.length ? `${markBar}${selBar}
-      <table style="width:100%;font-size:11.5px">
+      <div class="rowbox scrollbox"><table style="width:100%;font-size:11.5px">
       <colgroup><col style="width:26px"><col style="width:35%"><col style="width:10%">
         <col style="width:10%"><col style="width:52px"><col style="width:21%">
         <col style="width:14%"></colgroup>
@@ -30069,10 +30113,28 @@ function hsPaint(){
         <td style="padding:3px 4px 3px 0">${r.marked?'':
           `<input type="checkbox" ${on?'checked':''}
              onclick="hsToggle(${r.file_id}, event)">`}</td>
-        <td style="padding:3px 8px 3px 0" title="${esc(r.detail||'')}"
-          >${esc(String(r.path||'').split('\\').pop())}</td>
+        <td style="padding:3px 8px 3px 0" title="${esc(String(r.path||''))}"
+          >${esc(r.label||String(r.path||'').split('\\').pop())}
+          <div class="dim" style="font-size:10px;overflow:hidden;
+               text-overflow:ellipsis;white-space:nowrap"
+            >${esc(String(r.path||'').split('\\').pop())}</div></td>
         <td class="dim" style="padding:3px 8px 3px 0">${esc(r.library||'')}</td>
-        <td style="padding:3px 8px 3px 0;color:${col}">${esc(word)}</td>
+        <td style="padding:3px 8px 3px 0">
+          <!-- THE DETECTOR'S ANSWER, AND A WAY TO SAY IT IS WRONG.
+               Detective Conan S14E19 came back "signs or songs" at 58% and is
+               dialogue with signs over it - twenty-four frames landing on the
+               sparse parts of an episode is exactly how that happens. The
+               reading stays visible; the picker sits beside it, and what it
+               is set to is what Mark it records. -->
+          <select class="kindsel" onchange="hsSetKind(${r.file_id},this.value,this)"
+            title="${esc('Read as ' + word + '. If that is wrong, set it here before marking - the choice is kept and the next sweep will not overwrite it.')}"
+            ${r.marked?'disabled':''}>
+            ${(r.kinds||[]).map(k=>`<option value="${esc(k.id)}"${
+              k.id===r.state?' selected':''}>${esc(k.word)}</option>`).join('')}
+          </select>
+          ${r.chosen?'<div class="dim" style="font-size:9.5px">set by hand</div>'
+                    :`<div style="font-size:9.5px;color:${col}">read as ${esc(word)}</div>`}
+        </td>
         <td class="mono" style="padding:3px 8px 3px 0;text-align:right;
             color:${hsScoreColor(r)}" title="${esc((r.why||'')+' — '+(r.auto_why||''))}"
           >${r.score===undefined?'':r.score+'%'}</td>
@@ -30086,7 +30148,7 @@ function hsPaint(){
               title="Add a blank English subtitle track — one silent cue, default and forced cleared, named so the picker explains itself. Bazarr and Plex then see a subtitle exists and stop asking for one, and nothing is ever drawn over the words already in the picture.">Mark it</button>
              <button class="rmb" onclick="hsIgnore(${r.file_id},this)"
               title="This is not a burned-in subtitle. The row goes away, and so does the reason: the words behind it join a list of reads that were wrong, and two dismissals in one series leave that whole show alone. The same mistake stops arriving rather than needing dismissing one file at a time.">Not a subtitle</button>`}</td>
-      </tr>`;}).join('')}</tbody></table>`
+      </tr>`;}).join('')}</tbody></table></div>`
     : `<div class="dim" style="font-size:11.5px">${
         tested?'Nothing checked so far is carrying subtitles in the picture.'
               :'Nothing checked yet.'}</div>`;
@@ -33308,6 +33370,20 @@ html.mobile .setwrap:not(.rail) .setmain,html.mobile .setwrap:not(.rail) #worker
 /* The row a question is asked in when the button's own cell was too narrow.
    Tinted so it reads as attached to the row above rather than as one more
    file in the list. */
+/* TEN ROWS, THEN SCROLL. Both of these lists are now hundreds long - 118
+   findings on the hardsub panel alone - and a list that pushes the rest of the
+   page off the bottom of the screen is a list you have to scroll PAST to reach
+   anything else. Ten is about a screenful of decisions, which is as many as
+   anybody makes in one go. The head stays put so the columns still mean
+   something at row ninety. */
+.rowbox{max-height:352px;overflow:auto;border:1px solid var(--line);
+  border-radius:7px;margin-top:4px}
+.rowbox table{margin:0}
+.rowbox thead th{position:sticky;top:0;z-index:1;background:#11161d;
+  box-shadow:0 1px 0 var(--line)}
+/* The kind picker. Small, quiet, and never wider than the words in it - it is
+   a correction, not a headline. */
+.kindsel{font-size:10.5px;padding:1px 4px;max-width:132px}
 tr.askedrow > td{background:rgba(210,153,34,.06);
   border-bottom:1px solid var(--line)}
 .askrow{display:inline-flex;gap:7px;align-items:baseline;flex-wrap:wrap;
