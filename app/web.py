@@ -3969,7 +3969,12 @@ async def api_audiolang(limit: int = Query(400, le=3000)):
         for _m in audiolang.mismatches(500):
             _row = seen_disagree.get((_m["file_id"], _m["track"]))
             if _row:
-                odd.append(_row)
+                # THE LEDGER'S DECISION TRAVELS WITH THE ROW. Whether this
+                # show has already been answered for is not something the walk
+                # above can know, and working it out again here would be the
+                # second detector all over again.
+                odd.append({**_row, "held": bool(_m.get("held")),
+                            "series": _m.get("series") or ""})
         _waiting = audiolang.pending(limit=100000)
         # Still blank AND never resolved - the honest backlog.
         openq = [r for r in rows if r["blank"] and not r["ok"]]
@@ -4022,8 +4027,14 @@ async def api_audiolang(limit: int = Query(400, le=3000)):
             "leave_at": audiolang.leave_at(),
             "auto_state": audiolang.auto_progress(),
             "auto_per_pass": audiolang.AUTO_PER_PASS,
+            # WHICH SHOWS YOU HAVE ANSWERED FOR, so the panel can say so and
+            # let you take it back.
+            "left_shows": audiolang.left_shows(),
+            "leave_min": audiolang.LEAVE_MIN,
+            # verdict_for, not verdict_of: the second knows only a number, and
+            # a number cannot know you have twice said this show is fine.
             "contradictions": sorted(
-                [{**x, **audiolang.verdict_of(x["confidence"])} for x in odd],
+                [{**x, **audiolang.verdict_for(x)} for x in odd],
                 key=lambda x: abs(x["sure"] - (audiolang.fix_at()
                                                + audiolang.leave_at()) / 2))[:200],
             "open": openq[:200],
@@ -6794,6 +6805,63 @@ async def api_audiolang_fix(file_id: int, track: int):
     # THE WALK IS MEMOISED AND THE CORRECTION JUST INVALIDATED IT. Without
     # this the row stayed on the page, a second press found nothing to do,
     # and the panel looked like it had refused the work it had just done.
+    _amemo_expire("audiolang:")
+    return out
+
+
+@app.post("/api/audiolang/leave")
+async def api_audiolang_leave(file_id: int, track: int, on: bool = True):
+    r"""The tag is right and the listener is wrong. Nothing is written.
+
+    THIS IS THE ANSWER THAT TEACHES. Correcting a tag says something about one
+    file; leaving one alone says something about the show, because a show
+    whose audio the model mishears mishears it in every episode. Two of these
+    in one series and the rest of that series stops being asked about below
+    the act line - and keeps being shown above it, because a show being
+    generally fine is not a claim about every file in it.
+    """
+    from . import audiolang
+    out = await asyncio.to_thread(audiolang.leave, int(file_id), int(track),
+                                  bool(on))
+    _amemo_expire("audiolang:")
+    return out
+
+
+@app.post("/api/audiolang/leave/batch")
+async def api_audiolang_leave_batch(ids: str = ""):
+    """The same answer for a selection - usually a season that arrived together."""
+    from . import audiolang
+    pairs = []
+    for tok in (ids or "").split(","):
+        tok = tok.strip()
+        if ":" not in tok:
+            continue
+        a, b = tok.split(":", 1)
+        try:
+            pairs.append((int(a), int(b)))
+        except ValueError:
+            continue
+    if not pairs:
+        return {"ok": False, "why": "nothing selected"}
+
+    def _work():
+        n = 0
+        for fid, trk in pairs:
+            if audiolang.leave(fid, trk, True).get("ok"):
+                n += 1
+        return {"ok": True, "left": n, "shows": audiolang.left_shows()}
+    out = await asyncio.to_thread(_work)
+    _amemo_expire("audiolang:")
+    return out
+
+
+@app.post("/api/audiolang/forget")
+async def api_audiolang_forget(series: str = ""):
+    """Undo, for one show. Every answer for it goes and it is asked again."""
+    from . import audiolang
+    if not series:
+        return {"ok": False, "why": "no show named"}
+    out = await asyncio.to_thread(audiolang.forget_series, series)
     _amemo_expire("audiolang:")
     return out
 
@@ -15398,8 +15466,25 @@ async function alAutoTick(){
   if(was) setTimeout(()=>loadAlang(true), 400);
 }
 
-function alOddRows(){ return (_al.contradictions||[]).filter(r=>r.auto!=='leave'); }
+// Rows answered in this tab, held until the payload catches up. Cleared as
+// soon as a fresh walk agrees they are gone, so this can never hide a row
+// that came back for a reason.
+let _alGone=new Set();
+function alRowsLive(){
+  return (_al.contradictions||[]).filter(r=>!_alGone.has(`${r.file_id||0}:${r.track}`));
+}
+function alGoneAdd(ids){ (ids||[]).forEach(x=>_alGone.add(x)); }
+function alGoneSweep(){
+  if(!_alGone.size) return;
+  const here=new Set((_al.contradictions||[]).map(alIdOf));
+  [..._alGone].forEach(x=>{ if(!here.has(x)) _alGone.delete(x); });
+}
+function alOddRows(){ return alRowsLive().filter(r=>r.auto!=='leave'); }
 function alIdOf(r){ return `${r.file_id||0}:${r.track}`; }
+function _alSeriesOf(id){
+  const r=(_al.contradictions||[]).find(x=>alIdOf(x)===id);
+  return r?(r.series||''):'';
+}
 function alSelIds(){
   const live=new Set(alOddRows().map(alIdOf));
   return [..._alSel].filter(x=>live.has(x));
@@ -15470,7 +15555,87 @@ async function alFixOne(id, btn){
       // title it still carried has just been put right. Not a refusal, and
       // the row should leave saying so.
       return r;
-    }, ()=>loadAlang(true)));
+    }, ()=>{ alGoneAdd([id]); renderAlang(); loadAlang(true); }));
+}
+// THE OTHER ANSWER. Correcting says something about one file; this says
+// something about the show, and it is the only one of the two that teaches.
+async function alLeaveOne(id, btn){
+  const [fid, track]=id.split(':');
+  askInline(btn,
+    'Leave this tag alone? Nothing is written. Two answers like this on one '
+    +'show and the rest of it stops being asked about below the '
+    +(_al.fix_at||95)+'% line - anything above it still shows up.',
+    'Yes, the tag is right',
+    async ()=>{
+      const r=await (await fetch(
+        `/api/audiolang/leave?file_id=${fid}&track=${track}`,
+        {method:'POST'})).json();
+      // Gone now, not in thirty seconds. And when this answer retires the
+      // whole show, its siblings go with it - the ledger has already stopped
+      // listing them, so anything still on screen from this series is stale
+      // by exactly this press.
+      alGoneAdd([id]);
+      if(r&&r.retired){
+        const sib=(_al.contradictions||[]).filter(x=>x.series&&x.series===_alSeriesOf(id));
+        alGoneAdd(sib.filter(x=>(x.sure||0)<(_al.fix_at||95)).map(alIdOf));
+      }
+      renderAlang();
+      setTimeout(()=>loadAlang(true), 350);
+      return r;
+    });
+}
+async function alLeaveMany(btn){
+  const ids=alSelIds();
+  if(!ids.length) return;
+  askInline(btn,
+    `Leave ${ids.length} tag${ids.length===1?'':'s'} alone? Nothing is `
+    +'written to any file. Shows with two or more of these stop being asked '
+    +'about below the '+(_al.fix_at||95)+'% line.',
+    `Yes, leave ${ids.length} alone`,
+    async ()=>{
+      const r=await (await fetch('/api/audiolang/leave/batch?ids='
+        +encodeURIComponent(ids.join(',')), {method:'POST'})).json();
+      alGoneAdd(ids);
+      // Whole shows can retire on a batch, so take their band rows with them.
+      const done=new Set((r&&r.shows||[]).filter(x=>x.retired).map(x=>x.series));
+      if(done.size) alGoneAdd((_al.contradictions||[])
+        .filter(x=>done.has(x.series)&&(x.sure||0)<(_al.fix_at||95)).map(alIdOf));
+      _alSel.clear(); _alLast=null;
+      renderAlang();
+      setTimeout(()=>loadAlang(true), 500);
+      return r;
+    });
+}
+// UNDO, BY POSITION. The key is built from an arr id or a title, and passing
+// either through an onclick attribute is how a show called Bob's Burgers
+// breaks the page.
+async function alForget(i){
+  const x=(_al.left_shows||[])[i];
+  if(!x) return;
+  try{ await fetch('/api/audiolang/forget?series='+encodeURIComponent(x.series),
+                   {method:'POST'}); }catch(e){}
+  loadAlang(true);
+}
+function alLeftStrip(){
+  const L=_al.left_shows||[];
+  if(!L.length) return '';
+  const min=_al.leave_min||2;
+  return `<div style="font-size:11px;margin:0 0 8px;display:flex;gap:6px;
+       flex-wrap:wrap;align-items:baseline">
+    <span class="dim" style="flex:none" title="Shows you have answered for. At ${
+      min} answers the rest of the show stops being listed below the ${
+      _al.fix_at||95}% line; anything at or above that line is still shown, and
+      is never corrected on its own while the show is remembered.">answered for</span>
+    ${L.map((x,i)=>`<span style="flex:none;padding:1px 6px;border-radius:9px;
+       border:1px solid var(--line);background:${x.retired
+         ? 'rgba(63,185,80,.10)' : 'transparent'}"
+       title="${esc(x.label||'')} — ${x.n} answer${x.n===1?'':'s'}${x.retired
+         ? ', so the rest of this show is left alone below the line'
+         : `, ${min-x.n} more and the rest of this show is left alone`}">${
+       esc(x.label||x.series)} <span class="dim">${x.n}${x.retired?'':'/'+min}</span>
+       <a href="#" style="text-decoration:none" onclick="alForget(${i});return false"
+          title="Forget this show — it starts being asked about again">&times;</a></span>`).join('')}
+  </div>`;
 }
 async function alFixMany(btn){
   const ids=alSelIds();
@@ -15489,7 +15654,9 @@ async function alFixMany(btn){
       }
       const r=await (await fetch('/api/audiolang/fix/batch?confirm=yes&ids='
         +encodeURIComponent(ids.join(',')), {method:'POST'})).json();
+      alGoneAdd(ids);
       _alSel.clear(); _alLast=null;
+      renderAlang();
       // The ledger has already dropped what was corrected; the page has not.
       setTimeout(()=>loadAlang(true), 600);
       return r;
@@ -29262,7 +29429,7 @@ async function loadAlang(force){
   // An explicit action (a Save, a tab click) passes force.
   if(!force && alHeld()) return;
   if(!_al) el.innerHTML='<div class="dim" style="padding:14px">listening&hellip;</div>';
-  try{ _al = await (await fetch('/api/audiolang')).json(); }
+  try{ _al = await (await fetch('/api/audiolang')).json(); alGoneSweep(); }
   catch(e){ el.innerHTML='<div class="dim" style="padding:14px">could not load</div>'; return; }
   // Anchor the server's clock to this moment so the counters can tick locally
   // without drifting against it.
@@ -29476,7 +29643,7 @@ function renderAlang(){
   }
 
   if(_alTab==='odd'){
-    const rows=_al.contradictions||[];
+    const rows=alRowsLive();
     const band=rows.filter(r=>r.auto==='ask').length;
     const past=rows.filter(r=>r.auto==='act').length;
     const A=_al.auto_state||{};
@@ -29514,7 +29681,8 @@ function renderAlang(){
         title="Work the standing list now rather than waiting for the next listen pass. ${
           _al.auto_per_pass||20} at a time.">Correct them now</button>`:''}
     </div>
-    ${alAutoStrip(A)}`;
+    ${alAutoStrip(A)}
+    ${alLeftStrip()}`;
     if(!rows.length) h+=`<div class="dim" style="padding:12px">Nothing disagrees.</div>`;
     else{
       const nsel=alSelIds().length;
@@ -29525,19 +29693,26 @@ function renderAlang(){
            background:rgba(88,166,255,.07);border:1px solid var(--line)">
         <b style="font-size:11.5px;color:#6fb0ff">${fmt(nsel)} selected</b>
         <button class="rmb" onclick="alFixMany(this)">Correct ${fmt(nsel)}</button>
+        <button class="rmb" onclick="alLeaveMany(this)"
+          title="The tags are right and the listener is wrong. Nothing is written to any file.">Leave ${fmt(nsel)} alone</button>
         <button class="rmb" onclick="alClearSel()">Clear</button>
-        <span class="dim" style="font-size:10.5px">each one is a header edit and a requeue</span>
+        <span class="dim" style="font-size:10.5px">correcting is a header edit and a requeue; leaving alone writes nothing</span>
       </div>`;
+      // MIN-WIDTH, BECAUSE A FIXED LAYOUT COLLAPSES THE FLEXIBLE COLUMN
+      // RATHER THAN OVERFLOWING. The seven sized columns come to 662px, so in
+      // a narrow window the episode name - the only column that says WHICH
+      // file a row is about - was given nothing at all and vanished. The box
+      // already scrolls; sideways is a far better failure than absent.
       h+=`<div class="rowbox scrollbox"><table class="sktbl"
-          style="width:100%;font-size:11.5px;table-layout:fixed">
+          style="width:100%;min-width:820px;font-size:11.5px;table-layout:fixed">
           <!-- WIDE ENOUGH FOR THE LONGEST THING EACH COLUMN HOLDS. "Norwegian
                Bokmal" is a language name, not an outlier, and 96px cut it to
                "Norwegian B..." - a cell that hides the answer it exists to
                give. Every column is sized to its content and clips with an
                ellipsis and a tooltip rather than silently. -->
           <colgroup><col style="width:24px"><col style="width:auto">
-            <col style="width:112px"><col style="width:62px"><col style="width:132px">
-            <col style="width:158px"><col style="width:54px"><col style="width:104px"></colgroup>
+            <col style="width:96px"><col style="width:62px"><col style="width:124px">
+            <col style="width:150px"><col style="width:54px"><col style="width:152px"></colgroup>
           <thead><tr class="dim" style="font-size:10.5px">
           <th class="l"><input type="checkbox" ${allOn?'checked':''}
               title="Select every row that can be corrected" onclick="alSelAll(this.checked)"></th>
@@ -29572,10 +29747,16 @@ function renderAlang(){
             <div class="dim" style="font-size:9.5px">${alPicked(id)
               ? 'your choice' : 'heard as '+esc(r.heard_name||r.heard||'')}</div></td>
           <td class="c mono" style="font-variant-numeric:tabular-nums;color:${col}"
-              title="${esc(r.why||'')}">${r.sure}%</td>
+              title="${esc(r.why||'')}">${r.sure}%${r.held
+                ? `<div class="dim" style="font-size:9px;font-family:inherit"
+                     title="This show has been answered for, so nothing in it is corrected on its own. Past the line it is still shown, because a show being generally right is not a claim about every file in it.">yours</div>`
+                : ''}</td>
           <td class="r askhost">${can
             ? `<button class="rmb" onclick="alFixOne('${id}',this)"
-                 title="Write the language above into the file's header and requeue it. The duplicate track this may reveal is the rules' problem, not this button's.">correct</button>`
+                 title="Write the language above into the file's header and requeue it. The duplicate track this may reveal is the rules' problem, not this button's.">correct</button>
+               <button class="rmb" onclick="alLeaveOne('${id}',this)"
+                 title="The tag is right and the listener is wrong. Nothing is written. Two of these on one show and the rest of that show stops being asked about below the ${
+                   _al.fix_at||95}% line.">leave it</button>`
             : '<span class="dim" style="font-size:10.5px" title="Below the lower line: too unsure to act on, and shown only so the list is complete.">left alone</span>'}</td>
         </tr>`;
       }

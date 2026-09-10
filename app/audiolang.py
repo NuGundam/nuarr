@@ -1440,114 +1440,25 @@ def apply_and_restamp(file_id: int, path: str, tags: dict[int, str]) -> tuple[bo
     return ok, why
 
 
-_ARR_TOLD: dict[tuple, float] = {}
-ARR_DEBOUNCE_S = 120.0
-
-
 def notify_arrs(file_ids) -> int:
-    r"""Tell Sonarr/Radarr the file changed, so they re-read its languages.
+    r"""Tell Sonarr/Radarr - and Plex - that these files changed.
 
-    WITHOUT THIS THE WHOLE FEATURE IS INVISIBLE TO THE ARRS. Sonarr caches a
-    file's audio languages in its own database and shows them in its UI; a
-    header edit changes the file but not that cache, so a track nuarr just
-    named Japanese would still read as English in Sonarr - which is the exact
-    confusion this feature exists to remove, moved one layer up.
+    ONE PATH NOW, in notify.py, because this was the only system doing the
+    job and it still had a hole. Plex was told solely as a SIDE EFFECT of the
+    rename landing, so a library whose naming format carries no language token
+    told Plex nothing at all - and Plex caches track languages in its own
+    metadata just as Sonarr does. The file said Japanese and Plex went on
+    saying English until its own scan came round, which on this server can be
+    a day.
 
-    A RESCAN, not a refresh: the file on disk changed, the show's metadata did
-    not. Debounced per parent for the same reason the transcode path is - a
-    batch that names 400 tracks across 20 series must not fire 400 rescans.
+    The rename is still asked for: this library's naming format carries "[JA]",
+    so a file imported while its track read English is now named wrongly.
     """
-    ids = [int(i) for i in (file_ids or [])]
-    if not ids:
-        return 0
-    try:
-        from .config import SETTINGS
-        with cursor() as cur:
-            ph = ",".join("?" * len(ids))
-            rows = cur.execute(
-                f"SELECT DISTINCT arr_name, arr_parent_id FROM files "
-                f" WHERE id IN ({ph}) AND arr_name IS NOT NULL "
-                f"   AND arr_parent_id IS NOT NULL", tuple(ids)).fetchall()
-    except Exception:                                    # noqa: BLE001
-        return 0
-
-    # QUEUE A RENAME TOO. Sonarr and Radarr naming formats can include the
-    # audio languages - "[JA]" on this library - so a file that was imported
-    # while its track read as English may now be named wrongly. The rename
-    # queue already knows how to do this safely: it waits for the rescan, backs
-    # off, retries, and refuses to act on a file the arr cannot see. Doing it
-    # here would be a second, worse copy of that.
-    #
-    # Queued per FILE, not per parent, and it is idempotent - a file already
-    # pending keeps its existing back-off.
-    try:
-        from . import renamequeue
-        with cursor() as cur:
-            ph = ",".join("?" * len(ids))
-            frows = cur.execute(
-                f"SELECT id, arr_name, arr_parent_id, path FROM files "
-                f" WHERE id IN ({ph}) AND arr_name IS NOT NULL "
-                f"   AND arr_parent_id IS NOT NULL", tuple(ids)).fetchall()
-        for f in frows:
-            renamequeue.enqueue(f["id"], f["arr_name"], f["arr_parent_id"],
-                                f["path"], why="audio language tag corrected")
-    except Exception as e:                               # noqa: BLE001
-        joblog.log(f"could not queue rename after tagging: {str(e)[:90]}", "warn", system="audiolang")
-
-    now = time.time()
-    # DROP THE DEAD ENTRIES FIRST. This map exists only to answer "did we tell
-    # this arr about this series in the last two minutes"; an entry older than
-    # the window can never say anything but yes-go-ahead, so keeping it is
-    # keeping garbage. Nothing pruned it, so it held one entry per series ever
-    # touched for as long as the process lived. Small - but unbounded in the
-    # only direction that matters, and the sweep is one comprehension.
-    if len(_ARR_TOLD) > 256:
-        for k in [k for k, t in _ARR_TOLD.items()
-                  if now - t > ARR_DEBOUNCE_S]:
-            _ARR_TOLD.pop(k, None)
-    todo = []
-    for r in rows:
-        key = (r["arr_name"], r["arr_parent_id"])
-        if now - _ARR_TOLD.get(key, 0.0) < ARR_DEBOUNCE_S:
-            continue
-        _ARR_TOLD[key] = now
-        todo.append(key)
-    if not todo:
-        return 0
-
-    async def _go() -> int:
-        from .arr import ArrClient
-        n = 0
-        for name, pid in todo:
-            cfg = next((c for c in SETTINGS.arrs if c.name == name), None)
-            if not cfg:
-                continue
-            client = ArrClient(cfg)
-            try:
-                await client.notify_file_changed(pid)
-                n += 1
-            except Exception as e:                       # noqa: BLE001
-                joblog.log(f"could not tell {name} the file changed: "
-                           f"{str(e)[:90]}", "warn", system="audiolang")
-            finally:
-                try:
-                    await client.close()
-                except Exception:                        # noqa: BLE001
-                    pass
-        return n
-
-    try:
-        import asyncio
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            return asyncio.run(_go())        # plain thread: own loop is fine
-        # Already on the event loop - schedule it and do not block the caller.
-        asyncio.create_task(_go())
-        return len(todo)
-    except Exception as e:                               # noqa: BLE001
-        joblog.log(f"arr notify failed: {str(e)[:90]}", "warn", system="audiolang")
-        return 0
+    from . import notify
+    return notify.file_changed(file_ids,
+                               why="audio language tag corrected",
+                               plex=True, arrs=True, rename=True,
+                               system="audiolang")["arrs"]
 
 
 def can_fast_path(path: str) -> bool:
@@ -2000,7 +1911,202 @@ def title_lies(file_id: int) -> list[dict]:
     return [x for x in out if x["want"] and x["want"] != x["title"]]
 
 
-def mismatches(limit: int = 200, floor: float | None = None) -> list[dict]:
+# --------------------------------------------- what you have already said --
+# A DISAGREEMENT IS ALMOST NEVER ABOUT ONE FILE.
+#
+# Primal is the proof. Twenty episodes of a show that tells its story without
+# dialogue, whose few invented lines the model hears as Arabic or Swedish, and
+# every one of those twenty is the same question with the same answer.
+# Answering them one at a time is twenty presses to say one thing, and the
+# thing being said is identical every time.
+#
+# So an answer is remembered, and remembered TWICE IN ONE SERIES means the
+# series. Same bar and the same reasoning as the hardsub ignore list: one
+# answer can be somebody clicking the wrong row, two is a pattern.
+#
+# THE HIGH END IS NOT RETIRED WITH IT. "This show is generally fine" is not
+# the same claim as "every file in it is fine" - a Spanish dub of one episode
+# tagged English at 0.99 is a real fault inside a show you have correctly
+# excused, and it is exactly the thing that would otherwise slip through. So
+# the memory retires the BAND, where the evidence was always ambiguous, and
+# anything at or past the act line still appears.
+#
+# What it stops being is AUTOMATIC. Past the line auto rewrites the header on
+# its own, and doing that inside a show whose tags you have twice said to
+# leave alone is the machine overruling the person who has watched it. It is
+# shown, it says why, and it waits.
+#
+# A MOVIE CAN NEVER REACH TWO, by construction: its series key is its own arr
+# id, so a film's answer covers that film and nothing else. That is right
+# rather than a limitation - two unrelated films sharing a library say nothing
+# about each other.
+LEAVE_MIN = 2
+_LEFT: dict = {"at": 0.0, "series": set(), "pairs": set()}
+_LEFT_TTL = 60.0
+
+
+def ensure_left_table() -> None:
+    with cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS audio_lang_left(
+                file_id  INTEGER NOT NULL,
+                track    INTEGER NOT NULL,
+                series   TEXT    NOT NULL DEFAULT '',
+                label    TEXT    NOT NULL DEFAULT '',
+                tagged   TEXT    NOT NULL DEFAULT '',
+                heard    TEXT    NOT NULL DEFAULT '',
+                at       REAL    NOT NULL DEFAULT 0,
+                PRIMARY KEY(file_id, track))""")
+
+
+def series_key(arr_name, parent_id, library, title) -> str:
+    r"""What counts as "the same show" for the memory.
+
+    The arr's own series id where there is one: it survives a rename, a
+    re-import and a folder move, none of which a title does. The title is the
+    fallback for anything nuarr knows about that no arr owns.
+    """
+    if arr_name and parent_id:
+        return f"{arr_name}#{int(parent_id)}"
+    return f"~{(library or '').strip().lower()}#{(title or '').strip().lower()}"
+
+
+def left_reset() -> None:
+    """An answer must count at once, not in a minute."""
+    _LEFT["at"] = 0.0
+
+
+def _left() -> tuple[set, set]:
+    """(series retired, exact tracks answered). Memoised - read on every row."""
+    now = time.time()
+    if now - _LEFT["at"] < _LEFT_TTL:
+        return _LEFT["series"], _LEFT["pairs"]
+    series, pairs = set(), set()
+    try:
+        ensure_left_table()
+        with cursor() as cur:
+            for r in cur.execute("SELECT file_id, track, series "
+                                 "  FROM audio_lang_left"):
+                pairs.add((int(r["file_id"]), int(r["track"])))
+            for r in cur.execute(
+                    "SELECT series, COUNT(*) n FROM audio_lang_left "
+                    " WHERE COALESCE(series,'') != '' GROUP BY series"):
+                if int(r["n"]) >= LEAVE_MIN:
+                    series.add(r["series"])
+    except Exception:                                            # noqa: BLE001
+        return _LEFT["series"], _LEFT["pairs"]
+    _LEFT.update(at=now, series=series, pairs=pairs)
+    return series, pairs
+
+
+def leave(file_id: int, track: int, on: bool = True) -> dict:
+    r"""Record that the tag on this track is right after all.
+
+    Written whatever the model thinks, and never checked against it: the whole
+    value of this answer is that the person giving it knows something the
+    model does not.
+    """
+    fid, trk = int(file_id), int(track)
+    try:
+        ensure_left_table()
+        with cursor() as cur:
+            r = cur.execute(
+                "SELECT arr_name, arr_parent_id, library, title, season, "
+                "       episode, audio_langs "
+                "  FROM files WHERE id=?", (fid,)).fetchone()
+            if not r:
+                return {"ok": False, "why": "no such file"}
+            key = series_key(r["arr_name"], r["arr_parent_id"],
+                             r["library"], r["title"])
+            if not on:
+                cur.execute("DELETE FROM audio_lang_left "
+                            " WHERE file_id=? AND track=?", (fid, trk))
+            else:
+                codes = (r["audio_langs"] or "").split(",")
+                tagged = (codes[trk] or "").strip() if trk < len(codes) else ""
+                heard = ""
+                h = cur.execute("SELECT code FROM audio_lang "
+                                " WHERE file_id=? AND track=?",
+                                (fid, trk)).fetchone()
+                if h:
+                    heard = h["code"] or ""
+                cur.execute(
+                    "INSERT INTO audio_lang_left"
+                    "(file_id,track,series,label,tagged,heard,at) "
+                    "VALUES(?,?,?,?,?,?,?) "
+                    "ON CONFLICT(file_id,track) DO UPDATE SET "
+                    "  series=excluded.series, label=excluded.label, "
+                    "  tagged=excluded.tagged, heard=excluded.heard, "
+                    "  at=excluded.at",
+                    (fid, trk, key, (r["title"] or ""), tagged, heard,
+                     time.time()))
+            n = int(cur.execute("SELECT COUNT(*) c FROM audio_lang_left "
+                                " WHERE series=?", (key,)).fetchone()["c"])
+    except Exception as e:                                       # noqa: BLE001
+        return {"ok": False, "why": f"{type(e).__name__}: {e}"}
+    left_reset()
+    retired = n >= LEAVE_MIN
+    return {"ok": True, "series": key, "label": r["title"] or "", "n": n,
+            "retired": retired, "need": max(0, LEAVE_MIN - n),
+            "why": (f"{n} answer(s) on this show - the rest of it is left "
+                    f"alone below the {fix_at()}% line" if retired
+                    else "noted. One more answer on this show and the rest "
+                         "of it stops being asked about")}
+
+
+def forget_series(key: str) -> dict:
+    """Undo. Every answer for one show, gone - it starts being asked again."""
+    try:
+        ensure_left_table()
+        with cursor() as cur:
+            cur.execute("DELETE FROM audio_lang_left WHERE series=?", (key,))
+    except Exception as e:                                       # noqa: BLE001
+        return {"ok": False, "why": f"{type(e).__name__}: {e}"}
+    left_reset()
+    return {"ok": True}
+
+
+def left_shows() -> list[dict]:
+    """Which shows are being left alone, and on what evidence."""
+    out: list[dict] = []
+    try:
+        ensure_left_table()
+        with cursor() as cur:
+            for r in cur.execute(
+                    "SELECT series, COUNT(*) n, MAX(at) at, "
+                    "       MAX(label) label FROM audio_lang_left "
+                    " WHERE COALESCE(series,'') != '' "
+                    " GROUP BY series ORDER BY n DESC, at DESC LIMIT 200"):
+                out.append({"series": r["series"], "n": int(r["n"]),
+                            "at": float(r["at"] or 0),
+                            "label": r["label"] or r["series"],
+                            "retired": int(r["n"]) >= LEAVE_MIN})
+    except Exception:                                            # noqa: BLE001
+        return out
+    return out
+
+
+def verdict_for(row) -> dict:
+    r"""verdict_of, plus what this show has already been told about.
+
+    ONE PLACE DECIDES. verdict_of knows only a number, and a number cannot
+    know that you have twice said this show is fine. Every caller that used to
+    ask verdict_of about a ledger row asks this instead, so the panel, the
+    auto pass, the backlog count and the attention tile cannot drift apart -
+    which is the fault that put two different floors on this feature.
+    """
+    d = verdict_of(row.get("confidence"))
+    if row.get("held") and d["auto"] == "act":
+        d["auto"] = "ask"
+        d["held"] = True
+        d["why"] = (f"{d['sure']}% is past the {fix_at()}% line, but you have "
+                    f"already left this show's tags alone {LEAVE_MIN} times - "
+                    f"so it is shown rather than corrected on its own")
+    return d
+
+
+def mismatches(limit: int = 200, floor: float | None = None,
+               respect_answers: bool = True) -> list[dict]:
     r"""Tracks where what was heard is not what the tag claims.
 
     Only confident disagreements. A verdict this acts on gets a file rebuilt
@@ -2015,7 +2121,8 @@ def mismatches(limit: int = 200, floor: float | None = None) -> list[dict]:
             rows = cur.execute(
                 "SELECT a.file_id, a.track, a.code, a.confidence, a.checked_at,"
                 "       a.votes, a.overall, "
-                "       f.path, f.library, f.title, f.audio_langs "
+                "       f.path, f.library, f.title, f.audio_langs, "
+                "       f.arr_name, f.arr_parent_id "
                 "  FROM audio_lang a JOIN files f ON f.id = a.file_id "
                 " WHERE a.ok = 1 AND COALESCE(a.code,'') != '' "
                 "   AND f.state = 'done' "
@@ -2091,6 +2198,26 @@ def mismatches(limit: int = 200, floor: float | None = None) -> list[dict]:
                     continue
             except Exception:                            # noqa: BLE001
                 pass
+        # AND WHAT YOU HAVE ALREADY SAID ABOUT THIS SHOW.
+        #
+        # Last of the guards on purpose: the ones above decide whether this is
+        # a real disagreement, and this one decides whether a real
+        # disagreement is still worth putting in front of you.
+        #
+        # A caller acting on ONE NAMED TRACK passes respect_answers=False, for
+        # the same reason it passes floor=0: these decide what to OFFER, and
+        # somebody pressing a button has already decided.
+        held = False
+        if respect_answers:
+            _series, _pairs = _left()
+            if (r["file_id"], r["track"]) in _pairs:
+                continue            # you answered this exact track yourself
+            _key = series_key(r["arr_name"], r["arr_parent_id"],
+                              r["library"], r["title"])
+            if _key in _series:
+                if int(round(float(r["confidence"] or 0) * 100)) < fix_at():
+                    continue        # the band: retired with the show
+                held = True         # past the line: shown, but never on its own
         # AND THE ONE THAT MATTERS MOST: is this track a duplicate of another
         # one in the same file, wearing a different label? That is what turns
         # "a tag is wrong" into "this release lied about being dual audio".
@@ -2102,6 +2229,9 @@ def mismatches(limit: int = 200, floor: float | None = None) -> list[dict]:
                     "path": r["path"], "library": r["library"] or "",
                     "title": r["title"] or "",
                     "at": r["checked_at"],
+                    "held": held,
+                    "series": series_key(r["arr_name"], r["arr_parent_id"],
+                                         r["library"], r["title"]),
                     "fake_dual": bool(heard_twice),
                     "langs": r["audio_langs"] or ""})
     return out
@@ -2278,7 +2408,7 @@ def auto_progress() -> dict:
     # how long the lot will take at the pace this machine really manages.
     try:
         waiting = sum(1 for r in mismatches(2000)
-                      if verdict_of(r.get("confidence")).get("auto") == "act")
+                      if verdict_for(r).get("auto") == "act")
     except Exception:                                            # noqa: BLE001
         waiting = 0
     d["waiting"] = waiting
@@ -2301,8 +2431,10 @@ def auto_pass() -> dict:
     out = {"fixed": 0, "failed": 0, "queued": 0}
     if mode() != "auto":
         return out
+    # verdict_for, not verdict_of: a show you have twice left alone is
+    # never corrected on its own, however loud one episode of it is.
     rows = [r for r in mismatches(1000)
-            if verdict_of(r.get("confidence")).get("auto") == "act"]
+            if verdict_for(r).get("auto") == "act"]
     rows.sort(key=lambda r: -float(r.get("confidence") or 0))
     out["queued"] = max(0, len(rows) - AUTO_PER_PASS)
     batch = rows[:AUTO_PER_PASS]
@@ -2365,7 +2497,7 @@ def fix_mislabel(file_id: int, track: int) -> dict:
     cost, and it belongs to the remedy layer next to every other one.
     """
     from . import langkey
-    m = [x for x in mismatches(2000, floor=0.0)
+    m = [x for x in mismatches(2000, floor=0.0, respect_answers=False)
          if x["file_id"] == int(file_id) and x["track"] == int(track)]
     if not m:
         # ALREADY DONE IS NOT A FAILURE. The row on the page can be a minute
@@ -2466,7 +2598,7 @@ def attention() -> dict | None:
         m = mismatches(500)
         if mode() == "auto":
             m = [x for x in m
-                 if verdict_of(x.get("confidence")).get("auto") == "ask"]
+                 if verdict_for(x).get("auto") == "ask"]
     except Exception:                                    # noqa: BLE001
         return None
     if not m:

@@ -1000,6 +1000,21 @@ def mark_one(file_id: int, kind: str = "") -> dict:
                         (int(file_id),))
     except Exception:                                            # noqa: BLE001
         pass
+    # AND TELL THE THINGS THAT CACHE WHAT IS IN THIS FILE. mkvmerge has just
+    # stream-copied the whole container to add a track and safe_replace has
+    # put it where the old one was, so every stream list anybody holds for
+    # this path is now wrong. Plex is the one that matters here - a stale
+    # stream list is exactly what makes a player offer a subtitle track that
+    # is not there, or miss the one that is - and telling it is the POINT of
+    # the marker rather than an afterthought to it. No rename: adding a
+    # subtitle track cannot change what the arr calls the file.
+    try:
+        from . import notify
+        notify.file_changed([int(file_id)],
+                            why="nuarr added the burned-in marker track",
+                            rename=False, system="hardsub")
+    except Exception:                                            # noqa: BLE001
+        pass
     joblog.log(f"marked {os.path.basename(path)} as carrying burned-in "
                f"subtitles - blank English track added"
                + (", set default so nothing is drawn over the words already "

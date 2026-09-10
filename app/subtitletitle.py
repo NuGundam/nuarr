@@ -942,6 +942,15 @@ def fix(rows: list | None = None) -> dict:
         if good:
             ok += len(edits)
             _restamp(edits[0]["file_id"], path, edits)
+            # The title a viewer reads has changed. Plex caches it; so does
+            # the arr. Neither was ever told.
+            try:
+                from . import notify
+                notify.file_changed([int(edits[0]["file_id"])],
+                                    why="nuarr corrected a subtitle track title",
+                                    rename=False, system="subtitle titles")
+            except Exception:                                    # noqa: BLE001
+                pass
         else:
             failed += len(edits)
             if len(fails) < 30:

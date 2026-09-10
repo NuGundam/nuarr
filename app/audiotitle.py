@@ -262,6 +262,14 @@ def fix(rows: list | None = None) -> dict:
                 prog["fixed"] += len(edits)
                 _restamp(fid, path, edits)
                 _retire(fid, {e["track"] for e in edits})
+                try:
+                    from . import notify
+                    notify.file_changed(
+                        [int(fid)],
+                        why="nuarr corrected an audio track title",
+                        rename=False, system="audio titles")
+                except Exception:                                # noqa: BLE001
+                    pass
             else:
                 out["failed"] += len(edits)
                 prog["failed"] += len(edits)
