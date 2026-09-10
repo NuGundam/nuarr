@@ -347,11 +347,27 @@ def act(file_id: int, source: str, kind: str = "") -> dict:
     if kind:
         stt.set_kind(int(file_id), track, kind)
         stt.refresh()
-    rows = [r for r in (stt.cached().get("rows") or [])
+    # RE-READ BEFORE ACTING, not only after. The row on the page can be a
+    # minute old; the title may already have been corrected by you, by auto,
+    # or by the batch, and pressing again should say so rather than failing.
+    _rescan()
+    here = [r for r in (stt.cached().get("rows") or [])
             if int(r.get("file_id") or 0) == int(file_id)
-            and int(r.get("track") or 0) == track and r.get("rewritable")]
+            and int(r.get("track") or 0) == track]
+    rows = [r for r in here if r.get("rewritable")]
     if not rows:
-        return {"ok": False, "why": "nothing to rewrite on that track"}
+        if not here:
+            return {"ok": True, "gone": True,
+                    "why": "that title already agrees with the track - "
+                           "nothing left to correct"}
+        r0 = here[0]
+        if r0.get("settled"):
+            return {"ok": True, "gone": True,
+                    "why": f"you set this to "
+                           f"{stt.KIND_WORDS.get(r0.get('kind'), r0.get('kind'))}"
+                           f", and the title already says so"}
+        return {"ok": False, "why": (r0.get("why") or "")
+                or "the title carries a name nuarr did not write"}
     out = stt.fix(rows)
     _rescan()                       # see dismiss(): true before it returns
     return {"ok": bool(out.get("fixed")), "why":

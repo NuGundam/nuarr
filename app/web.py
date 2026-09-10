@@ -30264,7 +30264,10 @@ async function skAct(id, btn){
     async ()=>{
       const x=await (await fetch(`/api/subkind/act?confirm=yes&file_id=${fid}&source=${
         encodeURIComponent(src)}`,{method:'POST'})).json();
-      if(x.ok) skGone(btn, pic?'marked':'title corrected', true, id);
+      // `gone` means there was nothing left to do - already corrected, or
+      // settled by hand. That is not a failure and the row should still leave,
+      // saying which it was rather than "nothing to do".
+      if(x.ok) skGone(btn, pic?'marked':(x.gone?'already right':'title corrected'), true, id);
       else setTimeout(()=>{ _skKey=''; loadSubKind(true); }, 1500);
       return x.ok ? {ok:true, why: pic?'marked':(x.why||'corrected')} : x;
     });
