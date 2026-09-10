@@ -1882,7 +1882,7 @@ def unverified_count() -> int:
         return 0
 
 
-def mismatches(limit: int = 200) -> list[dict]:
+def mismatches(limit: int = 200, floor: float | None = None) -> list[dict]:
     r"""Tracks where what was heard is not what the tag claims.
 
     Only confident disagreements. A verdict this acts on gets a file rebuilt
@@ -1918,7 +1918,15 @@ def mismatches(limit: int = 200) -> list[dict]:
             same = tagged[:2].lower() == (r["code"] or "")[:2].lower()
         if same:
             continue
-        if float(r["confidence"] or 0) < 0.85:
+        # TWO FLOORS THAT DID NOT KNOW ABOUT EACH OTHER. This one was a flat
+        # 0.85 and the panel's is the leave-alone line, so a disagreement at
+        # 82% was listed, offered a button, and then told "no confident
+        # mismatch recorded for that track" - the check refusing to find the
+        # row it had just drawn. The default is the line a person set; a
+        # caller acting on one named track passes 0, because a floor decides
+        # what to OFFER and a person pressing a button has already decided.
+        if float(r["confidence"] or 0) < (leave_at() / 100.0
+                                          if floor is None else floor):
             continue
         # AND THE GUARD THAT INVASION EARNED. A track is only lying if the
         # language it claims was never heard in it. If ANY confident window
@@ -2056,7 +2064,54 @@ def verdict_of(confidence: float) -> dict:
 
 AUTO_PER_PASS = 20
 AUTO_STATE: dict = {"at": 0.0, "fixed": 0, "failed": 0, "queued": 0,
-                    "runs": 0, "running": False, "now": ""}
+                    "runs": 0, "running": False, "now": "",
+                    "done": 0, "total": 0, "t0": 0.0, "secs_each": 0.0,
+                    "last_took": 0.0}
+
+
+def auto_progress() -> dict:
+    """The pass in flight, measured - not guessed.
+
+    Everything here comes from the run that is happening: how many of how
+    many, how long each has really taken, and therefore when it ends. Nothing
+    is reported before there is a measurement to report, because a rate
+    invented from one file is not a rate.
+    """
+    d = dict(AUTO_STATE)
+    now = time.time()
+    el = (now - d["t0"]) if (d["running"] and d["t0"]) else 0.0
+    rate = (d["done"] / el) if (el > 0.5 and d["done"]) else 0.0
+    left = max(0, (d.get("total") or 0) - (d.get("done") or 0))
+    d["elapsed"] = round(el, 1)
+    d["rate"] = round(rate, 3)
+    d["eta"] = round(left / rate) if rate else 0
+    d["secs_each"] = round(d.get("secs_each") or (1 / rate if rate else 0), 2)
+    d["per_pass"] = AUTO_PER_PASS
+    d["mode"] = mode()
+    # WHEN IT RUNS AGAIN. Auto rides the listen pass, so the listener's clock
+    # is its clock - one schedule, one next time.
+    try:
+        from . import schedules
+        for r in (schedules.snapshot() or {}).get("rows", []):
+            if r.get("key") == "audiolang":
+                d["next_run"] = r.get("next_run") or 0.0
+                d["cycle_s"] = r.get("every_s") or 1800
+                break
+    except Exception:                                            # noqa: BLE001
+        pass
+    # AND THE WHOLE QUEUE, not just this pass: how many are past the line and
+    # how long the lot will take at the pace this machine really manages.
+    try:
+        waiting = sum(1 for r in mismatches(2000)
+                      if verdict_of(r.get("confidence")).get("auto") == "act")
+    except Exception:                                            # noqa: BLE001
+        waiting = 0
+    d["waiting"] = waiting
+    each = d["secs_each"] or 0.0
+    d["backlog_eta"] = round(max(
+        (waiting / max(1, AUTO_PER_PASS)) * float(d.get("cycle_s") or 1800),
+        waiting * each if each else 0)) if waiting else 0
+    return d
 
 
 def auto_pass() -> dict:
@@ -2075,9 +2130,12 @@ def auto_pass() -> dict:
             if verdict_of(r.get("confidence")).get("auto") == "act"]
     rows.sort(key=lambda r: -float(r.get("confidence") or 0))
     out["queued"] = max(0, len(rows) - AUTO_PER_PASS)
-    AUTO_STATE.update(running=True, now="", queued=out["queued"])
+    batch = rows[:AUTO_PER_PASS]
+    t0 = time.time()
+    AUTO_STATE.update(running=True, now="", queued=out["queued"],
+                      done=0, total=len(batch), t0=t0)
     try:
-        for r in rows[:AUTO_PER_PASS]:
+        for r in batch:
             AUTO_STATE["now"] = os.path.basename(r.get("path") or "")
             try:
                 res = fix_mislabel(int(r["file_id"]), int(r["track"]))
@@ -2087,9 +2145,16 @@ def auto_pass() -> dict:
                 out["fixed"] += 1
             else:
                 out["failed"] += 1
+            AUTO_STATE["done"] = out["fixed"] + out["failed"]
     finally:
+        took = max(0.001, time.time() - t0)
+        n = max(1, AUTO_STATE.get("done") or 0)
+        prev = AUTO_STATE.get("secs_each") or 0.0
+        this = took / n
         AUTO_STATE.update(running=False, now="", at=time.time(),
                           fixed=out["fixed"], failed=out["failed"],
+                          last_took=round(took, 1), t0=0.0,
+                          secs_each=(this if not prev else prev * .7 + this * .3),
                           runs=(AUTO_STATE.get("runs") or 0) + 1)
     if out["fixed"] or out["failed"]:
         joblog.log(f"audio language: corrected {out['fixed']} tag(s) on its "
@@ -2115,11 +2180,12 @@ def fix_mislabel(file_id: int, track: int) -> dict:
     cost, and it belongs to the remedy layer next to every other one.
     """
     from . import langkey
-    m = [x for x in mismatches(1000)
+    m = [x for x in mismatches(2000, floor=0.0)
          if x["file_id"] == int(file_id) and x["track"] == int(track)]
     if not m:
-        return {"ok": False, "why": "no confident mismatch recorded for that "
-                                    "track - it may have been re-checked"}
+        return {"ok": False, "why": "the tag and the audio agree now - this "
+                                    "track has been listened to again since "
+                                    "the list was drawn"}
     x = m[0]
     key = fix_begin(int(file_id), int(track), ("open", "tag", "title", "reread"))
     with cursor() as cur:
@@ -2178,14 +2244,21 @@ def fix_mislabel(file_id: int, track: int) -> dict:
 def attention() -> dict | None:
     r"""What the Attention tile should say, or nothing.
 
-    A LIE IS ALWAYS WORTH RAISING. Unlike the other checks there is no auto
-    mode that quietly handles these: correcting a tag is safe, but the thing
-    that follows - a release blocklisted and re-searched because it claimed
+    A LIE IS WORTH RAISING WHEN IT IS STILL YOURS. Correcting a tag is safe;
+    what follows - a release blocklisted and re-searched because it claimed
     dual audio and shipped one language twice - is a decision, and a decision
     belongs on the tile that means "this needs you".
+
+    In auto the confident ones are no longer yours: they are queued and will
+    be corrected on the next pass, so counting them here would be the tile
+    asking for a decision that has already been made. What stays is the band
+    between the lines, which is exactly the part auto will not touch.
     """
     try:
         m = mismatches(500)
+        if mode() == "auto":
+            m = [x for x in m
+                 if verdict_of(x.get("confidence")).get("auto") == "ask"]
     except Exception:                                    # noqa: BLE001
         return None
     if not m:

@@ -4005,7 +4005,7 @@ async def api_audiolang(limit: int = Query(400, le=3000)):
             "mode": audiolang.mode(),
             "fix_at": audiolang.fix_at(),
             "leave_at": audiolang.leave_at(),
-            "auto_state": dict(audiolang.AUTO_STATE),
+            "auto_state": audiolang.auto_progress(),
             "auto_per_pass": audiolang.AUTO_PER_PASS,
             "contradictions": sorted(
                 [{**x, **audiolang.verdict_of(x["confidence"])} for x in odd],
@@ -6762,6 +6762,13 @@ async def api_audiolang_fix(file_id: int, track: int):
     from . import audiolang
     return await asyncio.to_thread(audiolang.fix_mislabel, int(file_id),
                                    int(track))
+
+
+@app.get("/api/audiolang/auto")
+def api_audiolang_auto():
+    """The auto pass, measured. Cheap enough to poll while it runs."""
+    from . import audiolang
+    return audiolang.auto_progress()
 
 
 @app.post("/api/audiolang/mode")
@@ -15262,6 +15269,68 @@ let _attn={items:[],by_source:{}};
 // shared with the subtitle one on purpose: the two lists agree about how they
 // look and disagree about what they measure.
 let _alSel=new Set(), _alPick=new Map();
+// WHAT AUTO IS DOING, AND WHEN IT DOES IT AGAIN. The same block the subtitle
+// panel has, from the same kind of measurement: a bar and an ETA while a pass
+// runs, then last/next and what a correction really costs on this machine.
+function alAutoStrip(A){
+  if(!A || A.mode!=='auto') return '';
+  const pct = A.total ? Math.min(100, (A.done/A.total)*100) : 0;
+  const bar = A.running ? `
+    <div class="hsbar"><i style="width:${pct.toFixed(1)}%"></i></div>
+    <div style="display:flex;gap:10px;align-items:baseline;font-size:11px;
+                margin:3px 0 4px;flex-wrap:wrap">
+      <span class="busy" style="color:var(--acc)"><span class="sp"></span></span>
+      <b style="flex:none">${fmt(A.done||0)} of ${fmt(A.total||0)}</b>
+      <span class="dim" style="flex:1 1 auto;min-width:0;overflow:hidden;
+            text-overflow:ellipsis;white-space:nowrap"
+            title="${esc(A.now||'')}">${esc(A.now||'')}</span>
+      <span style="flex:none;margin-left:auto;display:flex;gap:10px">
+        ${A.elapsed?`<span class="dim" title="How long this pass has been running">${
+          hsDur(A.elapsed)} in</span>`:''}
+        ${A.rate?`<span class="dim" title="Tags corrected per second, measured on this run">${
+          A.rate>=1?A.rate.toFixed(1)+'/s':(1/A.rate).toFixed(1)+'s each'}</span>`:''}
+        ${A.eta?`<b style="color:var(--acc)" title="Time left in this pass at the rate above">${
+          hsDur(A.eta)} left</b>`:''}
+      </span>
+    </div>` : '';
+  return `${bar}<div class="dim" style="font-size:11px;margin:2px 0 4px;
+       display:flex;gap:12px;flex-wrap:wrap;align-items:center">
+    <span style="color:var(--ok)">auto</span>
+    ${A.at?`<span title="When auto last went through the standing list, and what it did">last run ${
+       ago(A.at)}${(A.fixed||A.failed)
+         ? ` · ${fmt(A.fixed||0)} corrected${A.failed?`, ${fmt(A.failed)} failed`:''}`
+         : ' · nothing to do'}${A.last_took?` · took ${hsDur(A.last_took)}`:''}</span>`
+      :'<span title="Auto acts at the end of each listen pass. It has not reached one since nuarr started.">has not run yet</span>'}
+    ${(!A.running&&A.next_run)?`<span title="Auto rides the listen pass, so this is the listener's clock - it runs every ${
+       hsDur(A.cycle_s||1800)}.">next run ${(A.next_run-(Date.now()/1000))<=1
+         ? 'any moment' : 'in '+hsDur(A.next_run-(Date.now()/1000))}</span>`:''}
+    ${A.runs?`<span title="Completed passes since nuarr started">${fmt(A.runs)} pass${
+       A.runs===1?'':'es'}</span>`:''}
+    ${A.secs_each?`<span title="Average seconds per correction, smoothed across passes - what the estimate is built on">${
+       A.secs_each.toFixed(1)}s a file</span>`:''}
+    ${A.waiting?`<span title="Disagreements past the line waiting for a pass. ${
+       A.per_pass} are taken each time, because each one is a header edit and a requeue."><b>${
+       fmt(A.waiting)}</b> still to correct${A.backlog_eta?` · <b style="color:var(--acc)">${
+       hsDur(A.backlog_eta)}</b> to work through them`:''}</span>`
+      :'<span>nothing waiting past the line</span>'}
+  </div>`;
+}
+
+// WHILE A PASS RUNS, KEEP ASKING - but only the cheap endpoint. Re-walking
+// 56,000 tracks to move a progress bar would be the panel costing more than
+// the work it is describing.
+let _alAutoPoll=null;
+async function alAutoTick(){
+  clearTimeout(_alAutoPoll);
+  if(!_al || _al.mode!=='auto') return;
+  let a=null;
+  try{ a=await (await fetch('/api/audiolang/auto')).json(); }catch(e){ return; }
+  if(!a) return;
+  _al.auto_state=a;
+  if(_alTab==='odd') renderAlang();
+  if(a.running) _alAutoPoll=setTimeout(alAutoTick, 1500);
+}
+
 function alOddRows(){ return (_al.contradictions||[]).filter(r=>r.auto!=='leave'); }
 function alIdOf(r){ return `${r.file_id||0}:${r.track}`; }
 function alSelIds(){
@@ -15313,16 +15382,18 @@ async function alFixOne(id, btn){
     ? `Write ${esc(want)} into this track's header and requeue the file? Nothing is re-encoded.`
     : 'Write what was heard into the header of this track and requeue the file? Nothing is re-encoded.',
     'Yes, correct it',
-    async ()=>{
+    // THE STAGES, IN THE ROW. alFixWatch already draws them - a bar, the step
+    // the server says it is on, and a clock - and the correction publishes
+    // open/tag/title/reread as it goes. The new button was throwing that away
+    // and showing a bare error line instead.
+    ()=>alFixWatch(btn, fid, track, async ()=>{
       if(want){
         await fetch(`/api/audiolang/set?file_id=${fid}&track=${track}&code=${
           encodeURIComponent(want)}`, {method:'POST'});
       }
-      const r=await (await fetch(`/api/audiolang/fix?file_id=${fid}&track=${track}`,
-                                 {method:'POST'})).json();
-      setTimeout(()=>loadAlang(true), 1200);
-      return r;
-    });
+      return (await fetch(`/api/audiolang/fix?file_id=${fid}&track=${track}`,
+                          {method:'POST'})).json();
+    }, ()=>loadAlang(true)));
 }
 async function alFixMany(btn){
   const ids=alSelIds();
@@ -29364,10 +29435,8 @@ function renderAlang(){
       ${(_al.mode==='auto'&&past)?`<button class="rmb" onclick="alRunAuto(this)"
         title="Work the standing list now rather than waiting for the next listen pass. ${
           _al.auto_per_pass||20} at a time.">Correct them now</button>`:''}
-      ${A.at?`<span class="dim" style="margin-left:4px">last run ${ago(A.at)}${
-        (A.fixed||A.failed)?` · ${fmt(A.fixed||0)} corrected${
-          A.failed?`, ${fmt(A.failed)} failed`:''}`:' · nothing to do'}</span>`:''}
-    </div>`;
+    </div>
+    ${alAutoStrip(A)}`;
     if(!rows.length) h+=`<div class="dim" style="padding:12px">Nothing disagrees.</div>`;
     else{
       const nsel=alSelIds().length;
@@ -29436,6 +29505,7 @@ function renderAlang(){
         <div class="dim" style="font-size:11px;margin-top:6px">${fmt(pick.length)}
           worth answering · least certain first</div>`;
     }
+    if((_al.auto_state||{}).running) setTimeout(alAutoTick, 60);
   }
 
   if(_alTab==='open'){
