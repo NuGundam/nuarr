@@ -166,7 +166,14 @@ def _track_rows(limit: int) -> list:
         unread = bool(r.get("unread"))
         score = 0 if unread else int(r.get("sure") or 0)
         rewritable = bool(r.get("rewritable"))
-        if unread:
+        settled = bool(r.get("settled"))
+        if settled:
+            # You said what it carries and the title already agrees, so there
+            # is nothing to do - but the row still exists so you can change
+            # your mind about it.
+            auto, auto_why = "none", ("you set this by hand, and the title "
+                                      "already says so - nothing to correct")
+        elif unread:
             auto, auto_why = "ask", "not read yet"
         elif not rewritable:
             # Nothing can act on a title that carries a group's name, however
@@ -199,8 +206,10 @@ def _track_rows(limit: int) -> list:
             "title_old": r.get("old") or "", "title_new": r.get("new") or "",
             "action": "retitle" if rewritable else "",
             "action_word": ("Correct the title" if rewritable else
-                            ("" if unread else "left alone")),
-            "done": False, "done_word": "",
+                            ("set by hand" if settled else
+                             ("" if unread else "left alone"))),
+            "done": settled, "done_word": "set by hand" if settled else "",
+            "settled": settled,
             "detail": r.get("why") or "",
             "added": float(r.get("added") or 0.0),
             "found_at": 0.0,
@@ -231,6 +240,7 @@ def findings(limit: int = 600) -> dict:
             "band": sum(1 for r in rows if r["auto"] == "ask"
                         and not r["unread"] and not r["done"]),
             "done": sum(1 for r in rows if r["done"]),
+            "settled": sum(1 for r in rows if r.get("settled")),
             "actionable": sum(1 for r in rows if r["action"] and not r["done"]),
         },
         "picture": hs,

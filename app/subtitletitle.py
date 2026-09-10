@@ -815,6 +815,16 @@ def scan(limit: int = 0) -> dict:
         # read settled - dialogue or hybrid under a signs claim - is one, and
         # only the safe titles among those can be rewritten.
         if v["kind"] in (SIGNS, NONE):
+            # A CHOICE YOU MADE IS NOT A ROW THAT NEVER EXISTED. The reader
+            # deciding a track is signs means there was never a finding, and
+            # the row goes. YOU deciding it is a different thing: the row
+            # leaves the list of questions but the choice has to stay
+            # reachable, or setting a kind by hand is a one-way door with no
+            # handle on the far side. Kept, flagged, hidden behind a count.
+            if v.get("chosen"):
+                r["settled"] = True
+                r["rewritable"] = False
+                continue
             dropped.append(r)
             continue
         if v["kind"] == HYBRID:
@@ -832,7 +842,8 @@ def scan(limit: int = 0) -> dict:
          "why": r.get("shape") or ""} for r in dropped[:40]]
     looked = len(rows) + len(dropped) - unread
 
-    rows.sort(key=lambda r: (not r.get("rewritable"), r.get("sure", 0)))
+    rows.sort(key=lambda r: (bool(r.get("settled")),
+                             not r.get("rewritable"), r.get("sure", 0)))
     data = {"rows": rows, "checked": checked, "at": time.time(),
             "cleared": len(dropped), "inspected": looked, "unread": unread,
             "cleared_rows": _CACHE["cleared"],

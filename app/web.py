@@ -30136,11 +30136,20 @@ async function skLine(which, val){
 }
 async function skSetKind(id, kind, el){
   const [fid, src]=skSplit(id);
+  const row=((_sk&&_sk.rows)||[]).find(x=>x.id===id);
   if(el) el.disabled=true;
   try{ await fetch(`/api/subkind/kind?file_id=${fid}&source=${encodeURIComponent(src)}&kind=${
       encodeURIComponent(kind)}`,{method:'POST'}); }catch(e){}
   if(el){ el.disabled=false; el.blur(); }
-  _skKey=''; loadSubKind();
+  // SAYING WHAT IT CARRIES CAN BE THE ANSWER. On a track whose title already
+  // claims signs, choosing "signs or songs" means the title is true and there
+  // is nothing left to correct - the row has no question in it any more. It
+  // used to vanish on the next repaint with nothing said, which reads as
+  // having lost the row rather than having answered it.
+  const quiet = src!=='picture' && (kind==='signs' || kind==='none')
+                && row && !row.settled;
+  if(quiet) skGone(el, kind==='signs'?'recorded as signs':'recorded as empty', true, id);
+  else { _skKey=''; loadSubKind(); }
 }
 function skSplit(id){ const i=String(id).indexOf(':'); return [id.slice(0,i), id.slice(i+1)]; }
 function skActWord(r, n){
@@ -30525,6 +30534,9 @@ function skPaint(force){
       (_skShowDone&&c.done)?`<a href="#" onclick="skShow('done',0);return false">hide the marked ones</a>`:''}
     ${hiddenUnread?`<a href="#" onclick="skShow('unread',1);return false">also show the ${fmt(hiddenUnread)} not read yet</a>`:''}${
       (_skShowUnread&&c.unread)?`<a href="#" onclick="skShow('unread',0);return false">only the ones read</a>`:''}
+    ${c.settled?`<a href="#" title="Tracks you told nuarr carry signs or nothing. Their titles already say so, so there is nothing to correct - but the choice is yours to change."
+      onclick="skShow('done',${_skShowDone?0:1});return false">${
+        _skShowDone?'hide':'also show'} the ${fmt(c.settled)} you set by hand</a>`:''}
   </div>`;
   const html=`<div class="lkind" style="padding:11px 12px">${head}${note}${band}${prog}${hist}${table}${foot}</div>`;
   if(!force && (askOpen('skPanel') || panelBusy('skPanel') || panelScrolled('skPanel'))) return;
