@@ -30061,10 +30061,14 @@ function skSelAll(on){
   _skLast=null; _skKey=''; skPaint(true);
 }
 function skClearSel(){ _skSel.clear(); _skLast=null; _skKey=''; skPaint(true); }
-function skBatchKind(v){ _skBatchKind=v||''; _skKey=''; skPaint(); }
+function skBatchKind(v){ _skBatchKind=v||''; _skKey=''; skPaint(true); }
 function skShow(what, on){
   if(what==='done') _skShowDone=!!on; else _skShowUnread=!!on;
-  _skKey=''; skPaint();
+  // FORCED. A click on the footer link is a request to repaint now; the
+  // scrolled-box and focused-control guards exist to protect against the
+  // poll, and the box is nearly always scrolled by the time the footer is
+  // reachable - so without this the link did nothing until the next poll.
+  _skKey=''; skPaint(true);
 }
 async function skMode(m){
   try{ await fetch('/api/hardsub/mode?mode='+encodeURIComponent(m),{method:'POST'}); }catch(e){}
