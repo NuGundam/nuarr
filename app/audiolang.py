@@ -2003,6 +2003,103 @@ def _set_track_title(path: str, track: int, title: str) -> bool:
         return False
 
 
+# ---------------------------------------------------------------------------
+# WHEN A DISAGREEMENT IS SETTLED ENOUGH TO ACT ON
+#
+# "Nuarr does not touch these automatically" was the right rule when a
+# disagreement had no number on it. It has one: three windows of audio, each
+# with a probability, aggregated into a confidence. On this library the
+# disagreements run from 0.60 to 0.99, and the two ends are not the same kind
+# of claim - a Spanish drama tagged English at 0.99 is not a judgement call,
+# and a 0.60 is exactly the shaky verdict that rule was written to protect.
+#
+# So it is a band, like every other decision nuarr makes. Above the line it
+# can act on its own; below the lower line it is not worth showing; between
+# them it is yours. The old absolutism survives as the DEFAULT - manual - so
+# nothing changes until somebody moves the switch.
+def mode() -> str:
+    m = str(getattr(SETTINGS, "audiolang_mode", "manual") or "manual").lower()
+    return m if m in ("manual", "auto") else "manual"
+
+
+def fix_at() -> int:
+    try:
+        return max(70, min(100, int(getattr(SETTINGS, "audiolang_fix_at", 95))))
+    except Exception:                                            # noqa: BLE001
+        return 95
+
+
+def leave_at() -> int:
+    """Never allowed to meet the other line: a band of zero width is one
+    threshold wearing two names."""
+    try:
+        v = int(getattr(SETTINGS, "audiolang_leave_at", 60))
+    except Exception:                                            # noqa: BLE001
+        v = 60
+    return max(0, min(fix_at() - 10, v))
+
+
+def verdict_of(confidence: float) -> dict:
+    """What auto WOULD do with this disagreement, whether or not auto is on."""
+    pct = int(round(float(confidence or 0) * 100))
+    if pct >= fix_at():
+        return {"sure": pct, "auto": "act",
+                "why": f"{pct}% is at or above the {fix_at()}% line"}
+    if pct <= leave_at():
+        return {"sure": pct, "auto": "leave",
+                "why": f"{pct}% is at or below the {leave_at()}% line, so the "
+                       f"tag is left alone and the row is not offered"}
+    return {"sure": pct, "auto": "ask",
+            "why": f"{pct}% sits between {leave_at()}% and {fix_at()}%, so "
+                   f"this one is yours to call"}
+
+
+AUTO_PER_PASS = 20
+AUTO_STATE: dict = {"at": 0.0, "fixed": 0, "failed": 0, "queued": 0,
+                    "runs": 0, "running": False, "now": ""}
+
+
+def auto_pass() -> dict:
+    """Correct the disagreements past the line. Bounded, and gated by mode.
+
+    EACH ONE IS A HEADER EDIT AND A REQUEUE, not a re-encode - but it is still
+    a write to a file somebody may be watching, so a pass takes a bounded
+    number and the rest wait. The order is most-confident first: if a pass is
+    going to be interrupted, the ones it got through should be the ones least
+    in doubt.
+    """
+    out = {"fixed": 0, "failed": 0, "queued": 0}
+    if mode() != "auto":
+        return out
+    rows = [r for r in mismatches(1000)
+            if verdict_of(r.get("confidence")).get("auto") == "act"]
+    rows.sort(key=lambda r: -float(r.get("confidence") or 0))
+    out["queued"] = max(0, len(rows) - AUTO_PER_PASS)
+    AUTO_STATE.update(running=True, now="", queued=out["queued"])
+    try:
+        for r in rows[:AUTO_PER_PASS]:
+            AUTO_STATE["now"] = os.path.basename(r.get("path") or "")
+            try:
+                res = fix_mislabel(int(r["file_id"]), int(r["track"]))
+            except Exception as e:                               # noqa: BLE001
+                res = {"ok": False, "why": f"{type(e).__name__}: {e}"}
+            if res.get("ok"):
+                out["fixed"] += 1
+            else:
+                out["failed"] += 1
+    finally:
+        AUTO_STATE.update(running=False, now="", at=time.time(),
+                          fixed=out["fixed"], failed=out["failed"],
+                          runs=(AUTO_STATE.get("runs") or 0) + 1)
+    if out["fixed"] or out["failed"]:
+        joblog.log(f"audio language: corrected {out['fixed']} tag(s) on its "
+                   f"own at or above the {fix_at()}% line"
+                   + (f", {out['failed']} could not be" if out["failed"] else "")
+                   + (f" - {out['queued']} wait for the next pass"
+                      if out["queued"] else ""), "info", system="audiolang")
+    return out
+
+
 def fix_mislabel(file_id: int, track: int) -> dict:
     r"""Correct a lying tag, then let the rules deal with what that reveals.
 
@@ -2154,6 +2251,12 @@ async def watch() -> None:
             if available():
                 with joblog.section("Audio language listen"):
                     await asyncio.to_thread(run_once)
+            # AND THEN ACT ON WHAT IT HEARD. Listening and correcting are the
+            # same job here - unlike the subtitle readers, where reading is
+            # half an hour and acting is seconds, a mislabel is only found by
+            # listening and there is nothing to act on until a pass has run.
+            if mode() == "auto":
+                await asyncio.to_thread(auto_pass)
         except Exception as e:                           # noqa: BLE001
             PROGRESS.update(state="error", error=f"{type(e).__name__}: {e}")
             joblog.log(f"audio language: {type(e).__name__}: {e}", "warn", system="audiolang")

@@ -390,6 +390,14 @@ class Settings:
     # by itself - marking above hardsub_mark_at, dismissing below
     # hardsub_dismiss_at - and only shows a person what falls between. Manual
     # by default because marking rewrites files.
+    # THE AUDIO CHECK'S OWN SWITCH AND ITS OWN TWO LINES. Not the subtitle
+    # ones: a listener's confidence in a language and a reader's certainty
+    # about what a track carries are different measurements, and 85 does not
+    # mean the same thing in both. One number shared between them would be one
+    # number meaning two things.
+    audiolang_mode: str = "manual"
+    audiolang_fix_at: int = 95
+    audiolang_leave_at: int = 60
     hardsub_mode: str = "manual"
     # The subtitle-title check reads the cue count already in every stored
     # probe and compares it against what the track's title claims. "auto"

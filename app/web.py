@@ -3812,10 +3812,19 @@ async def api_audiolang(limit: int = Query(400, le=3000)):
                 "       orig_lang, audio_langs "
                 "FROM files WHERE state!='deleted'").fetchall()
 
+        # THE TWELVE THIS PAGE USED TO KNOW, and then the rest. A row that
+        # reads "heard: ara" is a row asking you to look up a code; the full
+        # ISO table is already loaded for the chips and costs nothing here.
         NAME = {"eng": "English", "jpn": "Japanese", "kor": "Korean",
                 "chi": "Chinese", "spa": "Spanish", "por": "Portuguese",
                 "fre": "French", "ger": "German", "ita": "Italian",
                 "rus": "Russian", "hin": "Hindi", "tha": "Thai"}
+        try:
+            from . import langpolicy
+            for _x in langpolicy.iso_languages():
+                NAME.setdefault(_x["c"], _x.get("n") or _x["c"])
+        except Exception:                                    # noqa: BLE001
+            pass
         tot = tagged = untagged = heard = refused = stale = 0
         langs: dict[str, int] = {}
         by_lib: dict[str, dict] = {}
@@ -3989,7 +3998,19 @@ async def api_audiolang(limit: int = Query(400, le=3000)):
             # to answer a question about twenty chips.
             "lang_names": _iso_names(set(langs)),
             "by_library": sorted(by_lib.values(), key=lambda x: -x["tracks"]),
-            "contradictions": sorted(odd, key=lambda x: -x["confidence"])[:200],
+            # WHAT AUTO WOULD DO WITH EACH ONE, and the switch it obeys.
+            # Sorted least-certain-first like every other decision queue: the
+            # rows a person is actually needed for come first, and the ones
+            # auto would take are at the bottom where they can be skimmed.
+            "mode": audiolang.mode(),
+            "fix_at": audiolang.fix_at(),
+            "leave_at": audiolang.leave_at(),
+            "auto_state": dict(audiolang.AUTO_STATE),
+            "auto_per_pass": audiolang.AUTO_PER_PASS,
+            "contradictions": sorted(
+                [{**x, **audiolang.verdict_of(x["confidence"])} for x in odd],
+                key=lambda x: abs(x["sure"] - (audiolang.fix_at()
+                                               + audiolang.leave_at()) / 2))[:200],
             "open": openq[:200],
             "rows": rows,
         }
@@ -6741,6 +6762,98 @@ async def api_audiolang_fix(file_id: int, track: int):
     from . import audiolang
     return await asyncio.to_thread(audiolang.fix_mislabel, int(file_id),
                                    int(track))
+
+
+@app.post("/api/audiolang/mode")
+async def api_audiolang_mode(mode: str = "", fix_at: int = -1,
+                             leave_at: int = -1):
+    """The switch and the two lines, in one call - they are one decision."""
+    import yaml
+    from .config import SETTINGS
+    from . import audiolang
+    p = _config_path()
+    raw = {}
+    if p.exists():
+        try:
+            raw = yaml.safe_load(p.read_text(encoding="utf-8-sig")) or {}
+        except Exception:                                    # noqa: BLE001
+            raw = {}
+    said = []
+    m = (mode or "").strip().lower()
+    if m:
+        if m not in ("auto", "manual"):
+            raise HTTPException(400, "mode must be auto or manual")
+        raw["audiolang_mode"] = m
+        SETTINGS.audiolang_mode = m
+        said.append(m)
+    if fix_at >= 0:
+        v = max(70, min(100, int(fix_at)))
+        raw["audiolang_fix_at"] = v
+        SETTINGS.audiolang_fix_at = v
+        said.append(f"correct at {v}%")
+    if leave_at >= 0:
+        v = max(0, min(audiolang.fix_at() - 10, int(leave_at)))
+        raw["audiolang_leave_at"] = v
+        SETTINGS.audiolang_leave_at = v
+        said.append(f"leave alone at {v}%")
+    if not said:
+        return {"ok": False, "why": "nothing to change"}
+    p.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True),
+                 encoding="utf-8")
+    _amemo_expire("audiolang:")
+    joblog.log("audio language: " + ", ".join(said)
+               + (" - disagreements above the line are corrected without "
+                  "asking, and the band between the lines is what you are "
+                  "shown" if audiolang.mode() == "auto" else
+                  " - nothing is corrected automatically"), "info")
+    return {"ok": True, "mode": audiolang.mode(),
+            "fix_at": audiolang.fix_at(), "leave_at": audiolang.leave_at()}
+
+
+@app.post("/api/audiolang/fix/batch")
+async def api_audiolang_fix_batch(ids: str = "", confirm: str = ""):
+    """Correct several lying tags. Each is a header edit and a requeue."""
+    if confirm != "yes":
+        return {"ok": False, "why": "confirm=yes required"}
+    from . import audiolang
+    items = []
+    for tok in (ids or "").split(","):
+        tok = tok.strip()
+        if ":" not in tok:
+            continue
+        a, b = tok.split(":", 1)
+        try:
+            items.append((int(a), int(b)))
+        except ValueError:
+            continue
+    if not items:
+        return {"ok": False, "why": "nothing selected"}
+
+    def _work():
+        ok = bad = 0
+        for fid, tr in items:
+            try:
+                r = audiolang.fix_mislabel(fid, tr)
+            except Exception as e:                           # noqa: BLE001
+                r = {"ok": False, "why": f"{type(e).__name__}: {e}"}
+            if r.get("ok"):
+                ok += 1
+            else:
+                bad += 1
+        return ok, bad
+    ok, bad = await asyncio.to_thread(_work)
+    _amemo_expire("audiolang:")
+    return {"ok": True, "fixed": ok, "failed": bad,
+            "why": f"corrected {ok}" + (f", {bad} failed" if bad else "")}
+
+
+@app.post("/api/audiolang/run/auto")
+async def api_audiolang_run_auto():
+    """Work the standing list now, without waiting for the listen pass."""
+    from . import audiolang
+    out = await asyncio.to_thread(audiolang.auto_pass)
+    _amemo_expire("audiolang:")
+    return {"ok": True, **out}
 
 
 @app.get("/api/audiolang/backlog")
@@ -15144,6 +15257,96 @@ let _attn={items:[],by_source:{}};
 // settings page - it also puts right a track title left restating the old
 // language - so it declares four steps where that one declares five, and the
 // bar is right in both places because neither of them guesses the length.
+// THE DISAGREEMENTS QUEUE. Selection, the language a person picked, and the
+// three calls behind the buttons. Kept next to the audio panel rather than
+// shared with the subtitle one on purpose: the two lists agree about how they
+// look and disagree about what they measure.
+let _alSel=new Set(), _alPick=new Map();
+function alOddRows(){ return (_al.contradictions||[]).filter(r=>r.auto!=='leave'); }
+function alIdOf(r){ return `${r.file_id||0}:${r.track}`; }
+function alSelIds(){
+  const live=new Set(alOddRows().map(alIdOf));
+  return [..._alSel].filter(x=>live.has(x));
+}
+function alPicked(id){ return _alPick.get(id)||''; }
+function alPick(id, code){ _alPick.set(id, code); }
+function alToggle(id, ev){
+  const rows=alOddRows(), i=rows.findIndex(r=>alIdOf(r)===id);
+  if(ev && ev.shiftKey && _alLast!==null && i>=0){
+    const a=Math.min(i,_alLast), b=Math.max(i,_alLast), on=!_alSel.has(id);
+    for(let k=a;k<=b;k++){ const x=alIdOf(rows[k]);
+      if(on) _alSel.add(x); else _alSel.delete(x); }
+  }else{
+    if(_alSel.has(id)) _alSel.delete(id); else _alSel.add(id);
+  }
+  if(i>=0) _alLast=i;
+  renderAlang();
+}
+let _alLast=null;
+function alSelAll(on){
+  if(on) alOddRows().forEach(r=>_alSel.add(alIdOf(r))); else _alSel.clear();
+  _alLast=null; renderAlang();
+}
+function alClearSel(){ _alSel.clear(); _alLast=null; renderAlang(); }
+async function alMode(m){
+  try{ await fetch('/api/audiolang/mode?mode='+encodeURIComponent(m),
+                   {method:'POST'}); }catch(e){}
+  loadAlang(true);
+}
+async function alLine(which, val){
+  try{ await fetch(`/api/audiolang/mode?${which}=${encodeURIComponent(val)}`,
+                   {method:'POST'}); }catch(e){}
+  loadAlang(true);
+}
+async function alRunAuto(btn){
+  if(btn){ btn.disabled=true; btn.textContent='correcting…'; }
+  try{ await fetch('/api/audiolang/run/auto',{method:'POST'}); }catch(e){}
+  loadAlang(true);
+}
+// A PERSON'S CHOICE OVERRIDES THE LISTENER. If the picker was touched the
+// language is stated first - written as stated, at confidence 1.0 - and the
+// correction then applies it; otherwise the heard code is what goes in.
+async function alFixOne(id, btn){
+  const [fid, track]=id.split(':');
+  const want=alPicked(id);
+  askInline(btn, want
+    ? `Write ${esc(want)} into this track's header and requeue the file? Nothing is re-encoded.`
+    : 'Write what was heard into the header of this track and requeue the file? Nothing is re-encoded.',
+    'Yes, correct it',
+    async ()=>{
+      if(want){
+        await fetch(`/api/audiolang/set?file_id=${fid}&track=${track}&code=${
+          encodeURIComponent(want)}`, {method:'POST'});
+      }
+      const r=await (await fetch(`/api/audiolang/fix?file_id=${fid}&track=${track}`,
+                                 {method:'POST'})).json();
+      setTimeout(()=>loadAlang(true), 1200);
+      return r;
+    });
+}
+async function alFixMany(btn){
+  const ids=alSelIds();
+  if(!ids.length) return;
+  askInline(btn,
+    `Correct ${ids.length} tag${ids.length===1?'':'s'}? Each one is a header `
+    +'edit and a requeue - the video and the audio are untouched.',
+    `Yes, correct ${ids.length}`,
+    async ()=>{
+      for(const id of ids){
+        const want=alPicked(id);
+        if(!want) continue;
+        const [fid, track]=id.split(':');
+        await fetch(`/api/audiolang/set?file_id=${fid}&track=${track}&code=${
+          encodeURIComponent(want)}`, {method:'POST'});
+      }
+      const r=await (await fetch('/api/audiolang/fix/batch?confirm=yes&ids='
+        +encodeURIComponent(ids.join(',')), {method:'POST'})).json();
+      _alSel.clear(); _alLast=null;
+      setTimeout(()=>loadAlang(true), 1300);
+      return r;
+    });
+}
+
 async function alFixTag(fid, track, btn){
   return alFixWatch(btn, fid, track,
     ()=>fetch(`/api/audiolang/fix?file_id=${fid}&track=${track}`,
@@ -29125,30 +29328,107 @@ function renderAlang(){
 
   if(_alTab==='odd'){
     const rows=_al.contradictions||[];
-    h+=`<div class="dim" style="font-size:11px;margin-bottom:9px">
-        The file states one language; the audio is demonstrably another.
-        <b>Nuarr does not touch these automatically</b> &mdash; never
-        overwriting a stated tag is the only thing keeping it from
-        re-labelling every English dub in the library. Correcting one is a
-        deliberate act, so it is a button, not a rule.</div>`;
+    const band=rows.filter(r=>r.auto==='ask').length;
+    const past=rows.filter(r=>r.auto==='act').length;
+    const A=_al.auto_state||{};
+    h+=`<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;
+         margin-bottom:6px">
+      <b style="color:#6fb0ff">The file states one language; the audio is
+        demonstrably another.</b>
+      <span style="margin-left:auto">${modeSeg('when it is sure enough',
+        _al.mode||'manual', 'alMode', {
+        auto:'Disagreements at or above the correct line are retagged without asking, on the listen pass. What sits between the lines still waits for you - that band is the part the listener cannot settle.',
+        manual:'Everything is scored and listed, and no tag is touched. The two lines still colour the rows, so you can see what auto would have done before letting it do it.'})}</span>
+    </div>
+    <div class="dim" style="font-size:11px;margin-bottom:7px">
+      A tag nobody overwrites is the only thing keeping this from re-labelling
+      every dub in the library &mdash; so it is a band, not a rule. Three
+      windows of audio are heard and aggregated into one confidence; above the
+      first line that is not a judgement call, below the second it is not worth
+      showing, and between them it is yours. Correcting one writes the header
+      and requeues the file; nothing is re-encoded.
+    </div>
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;
+         font-size:11px;margin:2px 0 8px">
+      <span class="dim">Sure enough to correct on its own</span>
+      <input type="number" min="70" max="100" step="5" value="${_al.fix_at||95}"
+        style="width:62px" onchange="alLine('fix_at',this.value)">
+      <span class="dim">%</span>
+      <span class="dim" style="margin-left:8px">Too unsure to bother you</span>
+      <input type="number" min="0" max="90" step="5" value="${_al.leave_at||60}"
+        style="width:62px" onchange="alLine('leave_at',this.value)">
+      <span class="dim">%</span>
+      <span class="dim" style="margin-left:8px"
+        title="Rows landing between the two lines are the ones you are asked about. Above the first line auto would retag them; at or below the second the tag is left alone.">
+        ${fmt(band)} in between${past?` · ${fmt(past)} past the line`:''}</span>
+      ${(_al.mode==='auto'&&past)?`<button class="rmb" onclick="alRunAuto(this)"
+        title="Work the standing list now rather than waiting for the next listen pass. ${
+          _al.auto_per_pass||20} at a time.">Correct them now</button>`:''}
+      ${A.at?`<span class="dim" style="margin-left:4px">last run ${ago(A.at)}${
+        (A.fixed||A.failed)?` · ${fmt(A.fixed||0)} corrected${
+          A.failed?`, ${fmt(A.failed)} failed`:''}`:' · nothing to do'}</span>`:''}
+    </div>`;
     if(!rows.length) h+=`<div class="dim" style="padding:12px">Nothing disagrees.</div>`;
     else{
-      h+=`<table style="width:100%;font-size:12px;border-collapse:collapse">
-          <tr class="dim" style="font-size:11px"><td style="padding:4px 6px">file</td>
-          <td>track</td><td>says</td><td>heard</td><td>sure</td><td></td></tr>`;
+      const nsel=alSelIds().length;
+      const pick=rows.filter(r=>r.auto!=='leave');
+      const allOn=pick.length>0 && nsel===pick.length;
+      if(nsel) h+=`<div class="askhost" style="display:flex;gap:8px;align-items:center;
+           flex-wrap:wrap;padding:6px 8px;margin:6px 0;border-radius:7px;
+           background:rgba(88,166,255,.07);border:1px solid var(--line)">
+        <b style="font-size:11.5px;color:#6fb0ff">${fmt(nsel)} selected</b>
+        <button class="rmb" onclick="alFixMany(this)">Correct ${fmt(nsel)}</button>
+        <button class="rmb" onclick="alClearSel()">Clear</button>
+        <span class="dim" style="font-size:10.5px">each one is a header edit and a requeue</span>
+      </div>`;
+      h+=`<div class="rowbox scrollbox"><table class="sktbl"
+          style="width:100%;font-size:11.5px;table-layout:fixed">
+          <colgroup><col style="width:24px"><col style="width:auto">
+            <col style="width:104px"><col style="width:64px"><col style="width:96px">
+            <col style="width:150px"><col style="width:58px"><col style="width:118px"></colgroup>
+          <thead><tr class="dim" style="font-size:10.5px">
+          <th class="l"><input type="checkbox" ${allOn?'checked':''}
+              title="Select every row that can be corrected" onclick="alSelAll(this.checked)"></th>
+          <th class="l">file</th><th class="c">library</th><th class="c">track</th>
+          <th class="c" title="What the file's tag claims this track is">says</th>
+          <th class="c" title="What was heard, and a way to say it is wrong. Your choice is what the correction writes.">heard</th>
+          <th class="c" title="How confident the listener is, from three windows of audio. Above the correct line auto would retag it; at or below the lower line it is left alone.">sure</th>
+          <th class="r">answer</th></tr></thead><tbody>`;
       for(const r of rows){
-        h+=`<tr style="border-top:1px solid var(--line)">
-          <td style="padding:5px 6px">${esc((r.title||r.path.split('\\\\').pop()).slice(0,66))}
-            <div class="dim" style="font-size:10px">${esc(r.library)}</div></td>
-          <td class="mono dim">a:${r.track}${r.n_audio>1?'/'+r.n_audio:''}</td>
-          <td class="mono" style="color:#e2b341">${esc(r.says_name)}</td>
-          <td class="mono" style="color:#7fd4a3">${esc(r.heard_name)}</td>
-          <td class="mono dim">${(r.confidence*100).toFixed(0)}%</td>
-          <td style="text-align:right;padding-right:6px">
-            <button onclick="alFix(${r.file_id||0},${r.track},'${esc(r.heard)}',this)"
-              title="Overwrite the stated tag with what was heard">correct</button></td></tr>`;
+        const id=`${r.file_id||0}:${r.track}`;
+        const on=_alSel.has(id), can=r.auto!=='leave';
+        const col=r.auto==='act'?'var(--ok)':(r.auto==='leave'?'var(--dim)':'var(--warn)');
+        h+=`<tr${on?' style="background:rgba(88,166,255,.06)"':''}>
+          <td class="l">${can?`<input type="checkbox" ${on?'checked':''}
+               onclick="alToggle('${id}', event)">`:''}</td>
+          <td class="l" title="${esc(r.path||'')}">${esc((r.title||(r.path||'').split('\\').pop()))}
+            <div class="dim" style="font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+              >${esc((r.path||'').split('\\').pop())}</div></td>
+          <td class="c dim">${esc(r.library||'')}</td>
+          <td class="c mono dim">a:${r.track}${r.n_audio>1?'/'+r.n_audio:''}</td>
+          <td class="c mono" style="color:#e2b341">${esc(r.says_name||'')}</td>
+          <td class="c">
+            <!-- THE LISTENER'S ANSWER, AND A WAY TO SAY IT IS WRONG. It hears
+                 the language, not the dialect or the variant, and a Catalan
+                 track heard as Spanish is a correction nobody could make
+                 before: the button wrote exactly what was heard. -->
+            <select class="kindsel" onchange="alPick('${id}',this.value)">
+              ${(_al.choices||[]).map(c=>`<option value="${esc(c.code)}"${
+                (alPicked(id)||r.heard)===c.code?' selected':''}>${esc(c.name)}</option>`).join('')}
+            </select>
+            <div class="dim" style="font-size:9.5px">${alPicked(id)
+              ? 'your choice' : 'heard as '+esc(r.heard_name||r.heard||'')}</div></td>
+          <td class="c mono" style="font-variant-numeric:tabular-nums;color:${col}"
+              title="${esc(r.why||'')}">${r.sure}%</td>
+          <td class="r askhost">${can
+            ? `<button class="rmb" onclick="alFixOne('${id}',this)"
+                 title="Write the language above into the file's header and requeue it. The duplicate track this may reveal is the rules' problem, not this button's.">correct</button>`
+            : '<span class="dim" style="font-size:10.5px" title="Below the lower line: too unsure to act on, and shown only so the list is complete.">left alone</span>'}</td>
+        </tr>`;
       }
-      h+=`</table>`;
+      h+=`</tbody></table></div>
+        <div class="dim" style="font-size:11px;margin-top:6px">${fmt(pick.length)}
+          worth answering · least certain first</div>`;
     }
   }
 
