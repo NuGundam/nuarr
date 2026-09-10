@@ -167,10 +167,11 @@ def _track_rows(limit: int) -> list:
         score = 0 if unread else int(r.get("sure") or 0)
         rewritable = bool(r.get("rewritable"))
         settled = bool(r.get("settled"))
+        acked = bool(r.get("acked"))
         if settled:
             # You said what it carries and the title already agrees, so there
-            # is nothing to do - but the row still exists so you can change
-            # your mind about it.
+            # is nothing to correct - but the row stays until you press
+            # something, and stays reachable after that.
             auto, auto_why = "none", ("you set this by hand, and the title "
                                       "already says so - nothing to correct")
         elif unread:
@@ -204,12 +205,15 @@ def _track_rows(limit: int) -> list:
             "why": r.get("kind_why") or r.get("why") or "",
             "auto": auto, "auto_why": auto_why,
             "title_old": r.get("old") or "", "title_new": r.get("new") or "",
-            "action": "retitle" if rewritable else "",
+            "action": ("retitle" if rewritable else
+                       ("leave" if (settled and not acked) else "")),
             "action_word": ("Correct the title" if rewritable else
-                            ("set by hand" if settled else
-                             ("" if unread else "left alone"))),
-            "done": settled, "done_word": "set by hand" if settled else "",
-            "settled": settled,
+                            ("Leave it as it is" if (settled and not acked)
+                             else ("" if unread else "left alone"))),
+            # DONE MEANS ANSWERED, and setting a kind is not an answer. Only
+            # the button takes a row off the list.
+            "done": acked, "done_word": "set by hand" if acked else "",
+            "settled": settled, "acked": acked,
             "detail": r.get("why") or "",
             "added": float(r.get("added") or 0.0),
             "found_at": 0.0,
@@ -240,7 +244,7 @@ def findings(limit: int = 600) -> dict:
             "band": sum(1 for r in rows if r["auto"] == "ask"
                         and not r["unread"] and not r["done"]),
             "done": sum(1 for r in rows if r["done"]),
-            "settled": sum(1 for r in rows if r.get("settled")),
+            "settled": sum(1 for r in rows if r.get("acked")),
             "actionable": sum(1 for r in rows if r["action"] and not r["done"]),
         },
         "picture": hs,
@@ -298,8 +302,14 @@ def _split(source: str) -> tuple[bool, int]:
 def set_kind(file_id: int, source: str, kind: str) -> dict:
     from . import hardsub, subtitletitle as stt
     pic, track = _split(source)
-    return (hardsub.set_kind(int(file_id), kind) if pic
-            else stt.set_kind(int(file_id), track, kind))
+    if pic:
+        return hardsub.set_kind(int(file_id), kind)
+    out = stt.set_kind(int(file_id), track, kind)
+    # TRUE BEFORE IT RETURNS - see dismiss(). The page repaints the moment
+    # this replies, and a choice that has not been re-read yet comes back
+    # showing the kind you just replaced.
+    _rescan()
+    return out
 
 
 def dismiss(file_id: int, source: str) -> dict:
@@ -321,11 +331,16 @@ def dismiss(file_id: int, source: str) -> dict:
 
 
 def act(file_id: int, source: str, kind: str = "") -> dict:
-    """Do the thing the finding calls for: mark a picture, retitle a track."""
+    """Do the thing the finding calls for: mark a picture, retitle a track,
+    or take a settled row off the list."""
     from . import hardsub, subtitletitle as stt
     pic, track = _split(source)
     if pic:
         return hardsub.mark_one(int(file_id), kind)
+    if kind == "__leave__":
+        out = stt.ack(int(file_id), track, True)
+        _rescan()
+        return out
     if kind:
         stt.set_kind(int(file_id), track, kind)
         stt.refresh()

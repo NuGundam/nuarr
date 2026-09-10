@@ -30141,15 +30141,13 @@ async function skSetKind(id, kind, el){
   try{ await fetch(`/api/subkind/kind?file_id=${fid}&source=${encodeURIComponent(src)}&kind=${
       encodeURIComponent(kind)}`,{method:'POST'}); }catch(e){}
   if(el){ el.disabled=false; el.blur(); }
-  // SAYING WHAT IT CARRIES CAN BE THE ANSWER. On a track whose title already
-  // claims signs, choosing "signs or songs" means the title is true and there
-  // is nothing left to correct - the row has no question in it any more. It
-  // used to vanish on the next repaint with nothing said, which reads as
-  // having lost the row rather than having answered it.
-  const quiet = src!=='picture' && (kind==='signs' || kind==='none')
-                && row && !row.settled;
-  if(quiet) skGone(el, kind==='signs'?'recorded as signs':'recorded as empty', true, id);
-  else { _skKey=''; loadSubKind(); }
+  // THE PICKER NEVER REMOVES A ROW. Saying what a track carries changes what
+  // there is to do about it - a track you call dialogue under a "signs" title
+  // gains "Correct the title"; one you call signs has nothing left to correct
+  // and gains "Leave it as it is". Either way the row stays until a button in
+  // the answer column is pressed. A control that silently loses rows is worse
+  // than one that asks twice.
+  _skKey=''; loadSubKind();
 }
 function skSplit(id){ const i=String(id).indexOf(':'); return [id.slice(0,i), id.slice(i+1)]; }
 function skActWord(r, n){
@@ -30203,6 +30201,17 @@ async function skAct(id, btn){
   const r=((_sk&&_sk.rows)||[]).find(x=>x.id===id); if(!r) return;
   const [fid, src]=skSplit(id);
   const pic = src==='picture';
+  // NOTHING IS WRITTEN, so nothing is asked. It is a row leaving a list.
+  if(r.action==='leave'){
+    if(btn) btn.disabled=true;
+    let x={};
+    try{ x=await (await fetch(`/api/subkind/act?confirm=yes&file_id=${fid}&source=${
+        encodeURIComponent(src)}&kind=__leave__`,{method:'POST'})).json(); }
+    catch(e){ x={ok:false}; }
+    if(x.ok) skGone(btn, 'left as it is', true, id);
+    else { if(btn) btn.disabled=false; _skKey=''; loadSubKind(); }
+    return;
+  }
   askInline(btn,
     pic ? 'Add a blank English track? Stream copy, nothing re-encoded, default '
           +'set so a player picks it, and nothing is ever drawn over the words '
@@ -30518,7 +30527,9 @@ function skPaint(force){
           : r.unread ? '<span class="dim" style="font-size:10.5px" title="The cue rate flagged this; its events have not been read yet. Nothing is offered until they have.">not read yet</span>'
           : `${r.action?`<button class="rmb" onclick="skAct('${r.id}',this)" title="${
                 pic?'Add a blank English subtitle track so Bazarr and Plex see one exists and stop asking for it. Nothing is drawn over the picture.'
-                   :'Rewrite the track title to what it actually carries. Header edit only.'}">${esc(r.action_word)}</button>`:''}
+                   :(r.action==='leave'
+                     ?'You have said what this track carries and its title already says so. Nothing is written to the file - this only takes the row off the list, and it stays under "you set by hand".'
+                     :'Rewrite the track title to what it actually carries. Header edit only.')}">${esc(r.action_word)}</button>`:''}
              <button class="rmb" onclick="skDismiss('${r.id}',this)" title="${
                 pic?'This is not a burned-in subtitle. The words behind it join the list of reads that were wrong, and two dismissals in one series leave that show alone.'
                    :'This track is signs after all. Recorded as such, and the next read will not overwrite it.'}">Not dialogue</button>`}</td>

@@ -334,7 +334,11 @@ def _inspect_init() -> None:
         # plain: the count above. chosen: what a person said the track is,
         # which outranks the reading for good - the same column and the same
         # reason the hardsub table has one.
-        for col, decl in (("plain", "INTEGER"), ("chosen", "TEXT")):
+        # acked: you have seen what your choice did and taken the row off
+        # the list. Setting a kind is not that - the row has to stay until a
+        # button is pressed, or the picker becomes a way to lose rows.
+        for col, decl in (("plain", "INTEGER"), ("chosen", "TEXT"),
+                          ("acked", "INTEGER")):
             try:
                 cur.execute(f"ALTER TABLE subtitle_shape ADD COLUMN {col} {decl}")
             except Exception:                                    # noqa: BLE001
@@ -710,6 +714,22 @@ def kind_of(sh: dict, minutes: float) -> dict:
                        else ""))}
 
 
+def ack(file_id: int, track: int, on: bool = True) -> dict:
+    """Take a settled row off the list, or put it back."""
+    try:
+        _inspect_init()
+        with cursor() as cur:
+            cur.execute(
+                "INSERT INTO subtitle_shape(file_id,track,size,at,acked) "
+                "VALUES(?,?,0,?,?) ON CONFLICT(file_id,track) DO UPDATE SET "
+                "  acked=excluded.acked",
+                (int(file_id), int(track), time.time(), 1 if on else 0))
+    except Exception as e:                                       # noqa: BLE001
+        return {"ok": False, "why": str(e)[:160]}
+    _CACHE["at"] = 0.0
+    return {"ok": True, "why": "left as it is" if on else "back on the list"}
+
+
 def set_kind(file_id: int, track: int, kind: str) -> dict:
     """Record what a person says this track carries. Outranks the reading."""
     kind = (kind or "").strip().lower()
@@ -719,9 +739,9 @@ def set_kind(file_id: int, track: int, kind: str) -> dict:
         _inspect_init()
         with cursor() as cur:
             cur.execute(
-                "INSERT INTO subtitle_shape(file_id,track,size,at,chosen) "
-                "VALUES(?,?,0,?,?) ON CONFLICT(file_id,track) DO UPDATE SET "
-                "  chosen=excluded.chosen",
+                "INSERT INTO subtitle_shape(file_id,track,size,at,chosen,acked) "
+                "VALUES(?,?,0,?,?,0) ON CONFLICT(file_id,track) DO UPDATE SET "
+                "  chosen=excluded.chosen, acked=0",
                 (int(file_id), int(track), time.time(), kind))
     except Exception as e:                                       # noqa: BLE001
         return {"ok": False, "why": str(e)[:160]}
@@ -823,6 +843,7 @@ def scan(limit: int = 0) -> dict:
             # handle on the far side. Kept, flagged, hidden behind a count.
             if v.get("chosen"):
                 r["settled"] = True
+                r["acked"] = bool(sh.get("acked"))
                 r["rewritable"] = False
                 continue
             dropped.append(r)
