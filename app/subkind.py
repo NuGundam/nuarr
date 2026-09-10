@@ -397,10 +397,30 @@ async def act_many(items: list, kind: str = "", force: bool = False) -> dict:
                 stt.set_kind(f, t, kind)
             await asyncio.to_thread(stt.refresh)
         rows = [r for r in (stt.cached().get("rows") or [])
-                if (int(r.get("file_id") or 0), int(r.get("track") or 0)) in want
-                and r.get("rewritable")]
-        fixed = stt.fix(rows) if rows else {"fixed": 0}
+                if (int(r.get("file_id") or 0), int(r.get("track") or 0)) in want]
+        # A SETTLED ROW IS ANSWERED, NOT CORRECTED - and the batch could not
+        # say so.
+        #
+        # A track you set by hand whose title already agrees has nothing to
+        # write. The row is still there because your choice has to stay
+        # reachable, and the only thing it wants is acknowledging. This
+        # filtered on `rewritable`, which is False for exactly those rows, so
+        # they never reached fix(), fix() reported nothing, and all of them
+        # came back on the next paint - Hunter x Hunter S02, seven of them,
+        # acted on and unchanged.
+        #
+        # The single-row button has always known this: act() answers
+        # "__leave__" by acking. The batch is the same answer given seven
+        # times, so it gives the same answer.
+        acked = 0
+        for r in rows:
+            if r.get("settled") and not r.get("acked"):
+                if stt.ack(int(r["file_id"]), int(r["track"]), True).get("ok"):
+                    acked += 1
+        todo = [r for r in rows if r.get("rewritable")]
+        fixed = stt.fix(todo) if todo else {"fixed": 0}
         out["tracks"] = fixed.get("fixed") or 0
+        out["acked"] = acked
         await asyncio.to_thread(_rescan)
     bits = []
     if out["pictures"]:
@@ -409,6 +429,9 @@ async def act_many(items: list, kind: str = "", force: bool = False) -> dict:
     if out["tracks"]:
         bits.append(f"retitled {out['tracks']} track"
                     + ("" if out["tracks"] == 1 else "s"))
+    if out.get("acked"):
+        bits.append(f"took {out['acked']} settled row"
+                    + ("" if out["acked"] == 1 else "s") + " off the list")
     out["why"] = out["why"] or ("; ".join(bits) or "nothing to do")
     return out
 
