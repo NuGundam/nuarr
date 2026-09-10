@@ -1371,7 +1371,20 @@ def found(limit: int = 60) -> list:
                 " WHERE h.state != ? AND f.state NOT IN ('deleted','duplicate') "
                 "   AND NOT EXISTS (SELECT 1 FROM hardsub_ignored i "
                 "                    WHERE i.file_id = h.file_id) "
-                " ORDER BY h.at DESC LIMIT ?", (NONE, int(limit)))]
+                " ORDER BY h.marked ASC, h.at DESC LIMIT ?",
+                (NONE, int(limit)))]
+            # THE MARKED ONES RIDE ALONG WHATEVER THE LIMIT. They are sorted
+            # last on purpose, so at 300 findings and a limit of 300 they were
+            # the ones the LIMIT cut - and the "show 7 already marked" link
+            # had nothing to show. Few enough to always carry.
+            have = {r["file_id"] for r in rows}
+            rows += [dict(r) for r in cur.execute(
+                "SELECT h.file_id, h.path, h.state, h.low_hits, h.samples, "
+                "       h.words, h.detail, h.marked, h.chosen, "
+                "       f.library, f.title, f.season, f.episode "
+                "  FROM hardsub h JOIN files f ON f.id = h.file_id "
+                " WHERE h.marked = 1 AND f.state NOT IN ('deleted','duplicate') "
+                " ORDER BY h.at DESC LIMIT 200") if r["file_id"] not in have]
     except Exception:                                            # noqa: BLE001
         return []
     lo, hi = dismiss_at(), mark_at()

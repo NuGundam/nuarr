@@ -11423,7 +11423,7 @@ button[disabled]{opacity:.5;cursor:default}
 .syschip i{width:6px;height:6px;border-radius:50%;background:var(--acc);
   display:inline-block;animation:blk 2.2s ease-in-out infinite}
 @media (prefers-reduced-motion:reduce){.syschip i{animation:none}}
-.syspanel{position:absolute;top:26px;right:0;z-index:60;min-width:360px;
+.syspanel{position:absolute;top:26px;left:0;z-index:60;min-width:360px;
   max-width:min(560px,92vw);max-height:60vh;overflow:auto;
   background:#0d1117;border:1px solid var(--line);border-radius:9px;
   box-shadow:0 10px 30px rgba(0,0,0,.55);padding:6px 0;text-align:left}
@@ -12885,11 +12885,14 @@ html.mobile #logsPane{height:auto;min-height:60vh}
          the problem: answering "is anything running?" meant visiting nine
          pages and knowing which nine. First in the row because it is the
          question asked most often. -->
+    <span id="bootPill"></span>
+    <span id="selfUse" class="selfuse" title="Nuarr's own CPU and memory, including ffmpeg and script children"></span>
+    <!-- AFTER THE LOAD CHIPS, NOT BEFORE. cpu/gpu/ram/processes say how hard
+         the machine is working; this says on what. Reading left to right that
+         is the order the question gets asked in. -->
     <span class="syswrap" id="sysWrap" style="display:none"><button
       class="syschip" id="sysChip" onclick="sysToggle(event)"></button><div
       class="syspanel" id="sysPanel" style="display:none"></div></span>
-    <span id="bootPill"></span>
-    <span id="selfUse" class="selfuse" title="Nuarr's own CPU and memory, including ffmpeg and script children"></span>
     <span id="arrs" class="dim"></span>
     <!-- ffmpeg health sits beside the arr pills: it is the third external
          thing every job depends on, and a stale or broken build is exactly as
@@ -29873,7 +29876,12 @@ function alpPaint(){
 // The mirror of the audio-title check, and deliberately the same shape: read
 // from probes nuarr already stored, correct with mkvpropedit in place, and
 // never rewrite a title carrying something nuarr cannot regenerate.
-let _stt=null, _sttKey='', _sttAll=false;
+// EVERYTHING BY DEFAULT, now that a candidate is a thing to be read rather
+// than a thing to be corrected. Showing only the rewritable rows made sense
+// when rewritable meant "found wrong"; with nothing actionable until it has
+// been read, that filter left the panel saying "nothing here" over 124 rows
+// waiting for exactly the read the panel offers.
+let _stt=null, _sttKey='', _sttAll=true;
 // THE SAME SELECTION THE OTHER PANEL HAS, for the same reason: these arrive by
 // show. Seven episodes of That Time I Got Reincarnated as a Slime, all
 // "Signs & Songs", all around nine cues a minute - one release group's habit,
@@ -29965,22 +29973,6 @@ async function sttFixOne(fid, btn){
                                  {method:'POST'})).json();
       setTimeout(()=>{ _stt=null; _sttKey=''; loadSubTitle(); }, 1200);
       return r.ok ? {ok:true, why:`corrected ${r.fixed}`} : r;
-    });
-}
-async function sttFixAll(btn){
-  const n=(_stt&&_stt.fixable)||0;
-  if(!n) return;
-  askInline(btn, `Rewrite ${n} track title${n===1?'':'s'} across the library? `
-    +'Each is a header edit of about a tenth of a second; nothing is '
-    +'re-encoded. Titles carrying a group name are not included - nuarr '
-    +'cannot write a replacement that keeps what the group put there.',
-    `Yes, correct ${n}`,
-    async ()=>{
-      const r=await (await fetch('/api/subtitletitle/fix?confirm=yes',
-                                 {method:'POST'})).json();
-      setTimeout(()=>{ _stt=null; _sttKey=''; loadSubTitle(); }, 1500);
-      return r.ok ? {ok:true, why:`corrected ${r.fixed}`
-        +(r.failed?`, ${r.failed} failed`:'')} : r;
     });
 }
 function sttPaint(){
@@ -30097,6 +30089,8 @@ function sttPaint(){
         <td style="padding:3px 0;text-align:right" class="askhost">
           ${r.rewritable?`<button class="rmb"
              onclick="sttFixOne(${r.file_id},this)">Correct it</button>`
+            :r.unread?`<span class="dim" style="font-size:10.5px"
+               title="The cue rate flagged this; its events have not been read yet. Nothing is offered until they have.">not read yet</span>`
             :`<span class="dim" style="font-size:10.5px"
                title="The title carries a name nuarr did not write and cannot regenerate, so it is reported and left exactly as it is.">left alone</span>`}
         </td></tr>`;}).join('')}</tbody></table></div>`
@@ -30109,13 +30103,11 @@ function sttPaint(){
   const foot=`<div style="display:flex;gap:12px;align-items:center;
       flex-wrap:wrap;font-size:11px;margin-top:6px" class="askhost">
     ${nsel?`<button class="rmb" onclick="sttFixMany(this)">Correct the ${
-      fmt(nsel)} ticked</button>`
-      :(d.fixable?`<button class="rmb" onclick="sttFixAll(this)">Correct all ${
-      fmt(d.fixable)}</button>`:'')}
+      fmt(nsel)} ticked</button>`:''}
     ${(d.total>d.fixable)?`<a href="#" style="font-size:11px"
       onclick="_sttAll=${_sttAll?'false':'true'};_sttKey='';sttPaint();return false"
-      >${_sttAll?'only the ones that can be rewritten'
-                :`also show the ${fmt(d.total-d.fixable)} left alone`}</a>`:''}
+      >${_sttAll?`only the ${fmt(d.fixable)} read and still wrong`
+                :`also show the ${fmt(d.total-d.fixable)} unread or left alone`}</a>`:''}
   </div>`;
   const html=`<div class="lkind" style="padding:11px 12px">${head}${note}${band}${table}${foot}</div>`;
   if(askOpen('sttPanel') || panelBusy('sttPanel')
@@ -30428,23 +30420,16 @@ function hsPaint(){
         <col style="width:11%"><col style="width:58px"><col style="width:21%">
         <col style="width:14%"></colgroup>
       <thead>
-      <tr><th style="padding:2px 0 2px 2px;text-align:left">
-          <input type="checkbox" ${allOn?'checked':''}
-            title="Select every finding shown"
-            onclick="hsSelAll(this.checked)"></th>
-        <th colspan="6" class="dim" style="padding:2px 0 3px;text-align:left;
-            font-weight:400;font-size:10.5px">
-          ${fmt(pick.length)} still to answer${
-            hidden?` · <a href="#" onclick="hsShowMarked(1);return false">show ${
-              fmt(hidden)} already marked</a>`:''}${
-            (_hsShowMarked&&d.marked)?` · <a href="#" onclick="hsShowMarked(0);return false">hide the marked ones</a>`:''}
-          · least certain first</th></tr>
       <!-- NAMED COLUMNS, because five of the seven are not self-evident. A
            percentage with no heading beside a dropdown with no heading is two
            things you have to work out; the other panel names its columns and
-           this one should read the same way. -->
+           this one should read the same way. The select-all box lives in the
+           corner cell, the same place the title panel keeps it. -->
       <tr class="dim" style="font-size:10.5px;text-align:left">
-        <th></th><th style="padding:1px 8px 4px 2px">episode</th><th>library</th>
+        <th style="padding:3px 0 4px 2px"><input type="checkbox" ${allOn?'checked':''}
+            title="Select every finding shown"
+            onclick="hsSelAll(this.checked)"></th>
+        <th style="padding:3px 8px 4px 2px">episode</th><th>library</th>
         <th title="What the sampler read, and what you say it is. The picker outranks the reading, and what it is set to is what Mark it records.">what it carries</th>
         <th style="text-align:right;padding-right:14px"
           title="How sure the reading is, from the shape of what the OCR came back with. Above the mark line it would be marked on its own; below the dismiss line it would be thrown away; in between is yours to call.">sure</th>
@@ -30455,16 +30440,16 @@ function hsPaint(){
         const [word,col]=HSW[r.state]||[r.state,'var(--dim)'];
         const on=_hsSel.has(r.file_id);
         return `<tr${on?' style="background:rgba(88,166,255,.06)"':''}>
-        <td style="padding:3px 0 3px 2px">${r.marked?'':
+        <td style="padding:5px 0 5px 2px">${r.marked?'':
           `<input type="checkbox" ${on?'checked':''}
              onclick="hsToggle(${r.file_id}, event)">`}</td>
-        <td style="padding:3px 8px 3px 2px" title="${esc(String(r.path||''))}"
+        <td style="padding:5px 8px 5px 2px" title="${esc(String(r.path||''))}"
           >${esc(r.label||String(r.path||'').split('\\').pop())}
           <div class="dim" style="font-size:10px;overflow:hidden;
                text-overflow:ellipsis;white-space:nowrap"
             >${esc(String(r.path||'').split('\\').pop())}</div></td>
-        <td class="dim" style="padding:3px 8px 3px 0">${esc(r.library||'')}</td>
-        <td style="padding:3px 8px 3px 0">
+        <td class="dim" style="padding:5px 8px 5px 0">${esc(r.library||'')}</td>
+        <td style="padding:5px 8px 5px 0">
           <!-- THE DETECTOR'S ANSWER, AND A WAY TO SAY IT IS WRONG.
                Detective Conan S14E19 came back "signs or songs" at 58% and is
                dialogue with signs over it - twenty-four frames landing on the
@@ -30480,21 +30465,28 @@ function hsPaint(){
           ${r.chosen?'<div class="dim" style="font-size:9.5px">set by hand</div>'
                     :`<div style="font-size:9.5px;color:${col}">read as ${esc(word)}</div>`}
         </td>
-        <td class="mono" style="padding:3px 14px 3px 0;text-align:right;
+        <td class="mono" style="padding:5px 14px 5px 0;text-align:right;
             font-variant-numeric:tabular-nums;color:${hsScoreColor(r)}"
             title="${esc((r.why||'')+' — '+(r.auto_why||''))}"
           >${r.score===undefined?'':r.score+'%'}</td>
-        <td class="dim mono" style="padding:3px 8px 3px 10px;overflow:hidden;
+        <td class="dim mono" style="padding:5px 8px 5px 10px;overflow:hidden;
             text-overflow:ellipsis;white-space:nowrap"
             title="${esc('read from the picture: '+(r.words||''))}"
           >${esc(r.words||'')}</td>
-        <td style="padding:3px 0;white-space:nowrap;text-align:right">${r.marked
+        <td style="padding:5px 0;white-space:nowrap;text-align:right">${r.marked
           ? '<span class="dim" title="This file already carries the blank English track.">marked</span>'
           : `<button class="rmb" onclick="hsMark(${r.file_id},this)"
               title="Add a blank English subtitle track — one silent cue, default and forced cleared, named so the picker explains itself. Bazarr and Plex then see a subtitle exists and stop asking for one, and nothing is ever drawn over the words already in the picture.">Mark it</button>
              <button class="rmb" onclick="hsIgnore(${r.file_id},this)"
               title="This is not a burned-in subtitle. The row goes away, and so does the reason: the words behind it join a list of reads that were wrong, and two dismissals in one series leave that whole show alone. The same mistake stops arriving rather than needing dismissing one file at a time.">Not a subtitle</button>`}</td>
-      </tr>`;}).join('')}</tbody></table></div>`
+      </tr>`;}).join('')}</tbody></table></div>
+      <div class="dim" style="display:flex;gap:12px;align-items:center;
+           flex-wrap:wrap;font-size:11px;margin-top:6px">
+        <span>${fmt(pick.length)} still to answer · least certain first</span>
+        ${hidden?`<a href="#" onclick="hsShowMarked(1);return false">also show the ${
+          fmt(hidden)} already marked</a>`:''}${
+        (_hsShowMarked&&d.marked)?`<a href="#" onclick="hsShowMarked(0);return false">hide the marked ones</a>`:''}
+      </div>`
     : `<div class="dim" style="font-size:11.5px">${
         tested?'Nothing checked so far is carrying subtitles in the picture.'
               :'Nothing checked yet.'}</div>`;
