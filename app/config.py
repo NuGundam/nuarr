@@ -391,6 +391,10 @@ class Settings:
     # hardsub_dismiss_at - and only shows a person what falls between. Manual
     # by default because marking rewrites files.
     hardsub_mode: str = "manual"
+    # The subtitle-title check reads the cue count already in every stored
+    # probe and compares it against what the track's title claims. "auto"
+    # corrects the safe ones on the daily pass; manual lists them and waits.
+    subtitletitle_mode: str = "manual"
     hardsub_mark_at: int = 85
     hardsub_dismiss_at: int = 30
     # How many unmeasured picture-subtitle files one "Check now" pass reads.

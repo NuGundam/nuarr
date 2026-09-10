@@ -3284,6 +3284,16 @@ def _summary_impl():
     except Exception:                                    # noqa: BLE001
         pass
     try:
+        # The subtitle half of the same idea: a track whose title claims signs
+        # only while carrying a full episode of dialogue. Same rule, same
+        # silence in auto - see subtitletitle.attention().
+        from . import subtitletitle as _stt
+        _row = _stt.attention()
+        if _row:
+            attention.append(_row)
+    except Exception:                                    # noqa: BLE001
+        pass
+    try:
         # AND THE ONE THAT IS ALWAYS A DECISION. A track tagged a language it
         # is not can be corrected safely, but a release that shipped one
         # language twice while claiming two is a blocklist call - and a
@@ -6759,6 +6769,71 @@ def api_hardsub(limit: int = 40):
     from . import hardsub
     return {**hardsub.stats(), "found": hardsub.found(
         max(1, min(int(limit), 300)))}
+
+
+@app.get("/api/subtitletitle")
+def api_subtitletitle(limit: int = 200):
+    """Subtitle tracks whose title contradicts their cue rate."""
+    from . import subtitletitle as stt
+    d = stt.cached()
+    rows = d.get("rows") or []
+    return {"rows": rows[:max(1, min(int(limit), 600))],
+            "total": len(rows), "fixable": d.get("fixable") or 0,
+            "checked": d.get("checked") or 0, "took": d.get("took") or 0,
+            "at": d.get("at") or 0, "mode": stt.mode(),
+            "speech_lo": stt.SPEECH_LO, "speech_hi": stt.SPEECH_HI,
+            "progress": stt.progress()}
+
+
+@app.post("/api/subtitletitle/refresh")
+async def api_subtitletitle_refresh():
+    from . import subtitletitle as stt
+    d = await asyncio.to_thread(stt.refresh)
+    return {"ok": True, "total": len(d.get("rows") or []),
+            "checked": d.get("checked") or 0, "took": d.get("took") or 0}
+
+
+@app.post("/api/subtitletitle/fix")
+async def api_subtitletitle_fix(file_id: int = 0, confirm: str = ""):
+    """Correct one file's titles, or every safe one when no file is named."""
+    from . import subtitletitle as stt
+    rows = (stt.cached().get("rows") or [])
+    if file_id:
+        rows = [r for r in rows if int(r.get("file_id") or 0) == int(file_id)]
+        if not rows:
+            return {"ok": False, "why": "no finding for that file any more"}
+    elif confirm != "yes":
+        # The whole library at once is the one that needs asking about.
+        return {"ok": False, "why": "confirm=yes required to correct them all"}
+    return await asyncio.to_thread(stt.fix, rows)
+
+
+@app.post("/api/subtitletitle/mode")
+async def api_subtitletitle_mode(mode: str):
+    """manual lists the lies; auto corrects the safe ones on the daily pass."""
+    import yaml
+    from .config import SETTINGS
+    from . import subtitletitle as stt
+    mode = (mode or "").strip().lower()
+    if mode not in ("auto", "manual"):
+        raise HTTPException(400, "mode must be auto or manual")
+    p = _config_path()
+    raw = {}
+    if p.exists():
+        try:
+            raw = yaml.safe_load(p.read_text(encoding="utf-8-sig")) or {}
+        except Exception:                                    # noqa: BLE001
+            raw = {}
+    raw["subtitletitle_mode"] = mode
+    p.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True),
+                 encoding="utf-8")
+    SETTINGS.subtitletitle_mode = mode
+    joblog.log(f"subtitle title check set to {mode}"
+               + (" - titles that contradict their cue count are corrected on "
+                  "the daily pass, where nuarr can write a replacement without "
+                  "losing anything" if mode == "auto" else
+                  " - they are listed and wait for you"), "info")
+    return {"ok": True, "mode": stt.mode()}
 
 
 @app.post("/api/hardsub/mode")
@@ -17968,6 +18043,32 @@ const _auFix = {};
 // what it is about to destroy, and a question that disappears mid-read trains
 // somebody to press the button twice and agree faster the second time - which
 // is exactly the habit a confirmation exists to prevent.
+// THE SAME SWITCH EVERYWHERE IT MEANS THE SAME THING.
+//
+// Two segments with the live one filled, so the control shows the current
+// state AND both options at once. A single button showing only the ALTERNATIVE
+// makes the reader work out which way round it is - "let it decide" says what
+// pressing does and leaves you to infer what is true now, which is one
+// inference more than a switch should ask for.
+//
+// Lifted out of the audio-title panel, where this shape was first written, so
+// the next check that grows a mode does not invent a third one.
+function modeSeg(label, cur, call, tips){
+  cur = (cur === 'auto') ? 'auto' : 'manual';
+  return `<span style="display:inline-flex;gap:7px;align-items:center;
+                       font-size:11px">
+    ${label?`<span class="dim">${esc(label)}</span>`:''}
+    <span style="display:inline-flex;border:1px solid var(--line);
+                 border-radius:5px;overflow:hidden">
+      ${['manual','auto'].map(m=>`<button onclick="${call}('${m}')"
+        title="${esc((tips||{})[m]||'')}"
+        style="font-size:11px;padding:2px 10px;border:0;cursor:pointer;
+          background:${cur===m?'var(--acc)':'transparent'};
+          color:${cur===m?'#0b0e13':'var(--dim,#8a97a6)'};
+          font-weight:${cur===m?'600':'400'}">${m}</button>`).join('')}
+    </span></span>`;
+}
+
 function askOpen(scope){
   const el = (typeof scope === 'string') ? document.getElementById(scope) : scope;
   return !!(el && el.querySelector('[data-asking="1"]'));
@@ -22524,6 +22625,7 @@ function wtab(which){
     if(hint) hint.textContent='· subtitles';
     paneLoad('lang', loadLangTab);
     loadSubEmbed();
+    loadSubTitle();
     loadHardsub();
     // Its own slot, its own remembered open/shut state. Sharing the codec
     // pages' one would mean opening the panel here silently opened it there
@@ -29558,6 +29660,119 @@ function alpPaint(){
   if(running) _alpPoll=setTimeout(()=>{ if(document.getElementById('alBacklog')) loadAlangProg(); }, 1500);
 }
 
+// ---- does the subtitle title describe the subtitle? ---------------------
+// The mirror of the audio-title check, and deliberately the same shape: read
+// from probes nuarr already stored, correct with mkvpropedit in place, and
+// never rewrite a title carrying something nuarr cannot regenerate.
+let _stt=null, _sttKey='', _sttAll=false;
+async function loadSubTitle(){
+  const el=document.getElementById('sttPanel'); if(!el) return;
+  if(!_stt) el.innerHTML='<div class="skel" style="padding:12px">'
+    +'<i style="width:52%"></i><i style="width:70%"></i></div>';
+  try{ _stt=await (await fetch('/api/subtitletitle?limit=400')).json(); }
+  catch(e){ el.innerHTML='<span class="dim">could not load</span>'; return; }
+  sttPaint();
+}
+async function sttMode(m){
+  try{ await fetch('/api/subtitletitle/mode?mode='+encodeURIComponent(m),
+                   {method:'POST'}); }catch(e){}
+  _sttKey=''; loadSubTitle();
+}
+async function sttRefresh(btn){
+  if(btn){ btn.disabled=true; btn.textContent='reading…'; }
+  try{ await fetch('/api/subtitletitle/refresh',{method:'POST'}); }catch(e){}
+  _stt=null; _sttKey=''; loadSubTitle();
+}
+async function sttFixOne(fid, btn){
+  askInline(btn, 'Rewrite this track title in place? mkvpropedit changes the '
+    +'header only - the video, the audio and the subtitle cues are untouched.',
+    'Yes, correct it',
+    async ()=>{
+      const r=await (await fetch('/api/subtitletitle/fix?file_id='+fid,
+                                 {method:'POST'})).json();
+      setTimeout(()=>{ _stt=null; _sttKey=''; loadSubTitle(); }, 1200);
+      return r.ok ? {ok:true, why:`corrected ${r.fixed}`} : r;
+    });
+}
+async function sttFixAll(btn){
+  const n=(_stt&&_stt.fixable)||0;
+  if(!n) return;
+  askInline(btn, `Rewrite ${n} track title${n===1?'':'s'} across the library? `
+    +'Each is a header edit of about a tenth of a second; nothing is '
+    +'re-encoded. Titles carrying a group name are not included - nuarr '
+    +'cannot write a replacement that keeps what the group put there.',
+    `Yes, correct ${n}`,
+    async ()=>{
+      const r=await (await fetch('/api/subtitletitle/fix?confirm=yes',
+                                 {method:'POST'})).json();
+      setTimeout(()=>{ _stt=null; _sttKey=''; loadSubTitle(); }, 1500);
+      return r.ok ? {ok:true, why:`corrected ${r.fixed}`
+        +(r.failed?`, ${r.failed} failed`:'')} : r;
+    });
+}
+function sttPaint(){
+  const el=document.getElementById('sttPanel'); if(!el||!_stt) return;
+  const d=_stt, rows=d.rows||[];
+  const shown=_sttAll?rows:rows.filter(r=>r.rewritable);
+  const head=`<b style="color:#6fb0ff">Does the subtitle title describe the
+      subtitle?</b>
+    <span class="dim" style="font-size:11.5px">${fmt(d.checked||0)} files read
+      from stored probes${d.took?` in ${d.took}s`:''} · ${
+      d.total?`<span style="color:var(--warn)">${fmt(d.total)} contradicted</span>`
+             :'every title agrees with its track'}${
+      d.fixable?` · ${fmt(d.fixable)} nuarr can rewrite`:''}</span>
+    <span style="float:right;display:flex;gap:8px;align-items:center">
+      ${modeSeg('when a title contradicts its track', d.mode, 'sttMode', {
+        auto:'The safe ones are corrected on the daily pass. Titles carrying a group name are still only reported, because a replacement would lose what the group wrote.',
+        manual:'Everything is listed and waits for your click. The Attention tile carries the count.'})}
+      <button class="rmb" onclick="sttRefresh(this)">Read again</button></span>`;
+  const note=`<div class="dim" style="font-size:11px;margin:3px 0 6px">
+    A subtitle title is a claim about what the track contains, and Matroska
+    already records how many cues it has. "Signs only" over ${d.speech_lo||8}
+    to ${d.speech_hi||45} cues a minute is a claim contradicted by the file
+    itself — that is the cadence of people talking. Above that the density is
+    animated typesetting rather than speech, so it is left alone. Nothing is
+    re-probed and nothing is re-encoded: the check costs a query and the
+    correction is a header edit.</div>`;
+  const table = shown.length ? `<table style="width:100%;font-size:11.5px">
+      <colgroup><col style="width:36%"><col style="width:10%"><col style="width:17%">
+        <col style="width:16%"><col style="width:21%"></colgroup>
+      <tbody>${shown.slice(0,300).map(r=>`<tr>
+        <td style="padding:3px 8px 3px 0" title="${esc(r.path||'')}"
+          >${esc((r.title||String(r.path||'').split('\\').pop()).slice(0,72))}
+          <div class="dim" style="font-size:10px">${esc(r.library||'')}</div></td>
+        <td class="mono dim" style="padding:3px 8px 3px 0">s:${r.track}</td>
+        <td class="mono" style="padding:3px 8px 3px 0;color:var(--warn)"
+          >${esc(r.old||'')}</td>
+        <td class="mono" style="padding:3px 8px 3px 0;color:${
+          r.rewritable?'var(--ok)':'var(--dim)'}"
+          >${r.rewritable?esc(r.new||''):'—'}</td>
+        <td style="padding:3px 0" class="askhost">
+          <span class="dim" style="font-size:10.5px" title="${esc(r.why||'')}"
+            >${r.cues?fmt(r.cues)+' cues · '+r.cpm+'/min':''}</span>
+          ${r.rewritable?`<button class="rmb" style="margin-left:8px"
+             onclick="sttFixOne(${r.file_id},this)">Correct it</button>`
+            :`<span class="dim" style="font-size:10.5px;margin-left:8px"
+               title="The title carries a name nuarr did not write and cannot regenerate, so it is reported and left exactly as it is.">left alone</span>`}
+        </td></tr>`).join('')}</tbody></table>`
+    : `<div class="dim" style="font-size:11.5px;padding:8px 0">${
+        d.total?'Nothing here nuarr can rewrite safely.'
+               :'Every subtitle title agrees with the track behind it.'}</div>`;
+  const foot=`<div style="display:flex;gap:12px;align-items:center;
+      flex-wrap:wrap;font-size:11px;margin-top:6px" class="askhost">
+    ${d.fixable?`<button class="rmb" onclick="sttFixAll(this)">Correct all ${
+      fmt(d.fixable)}</button>`:''}
+    ${(d.total>d.fixable)?`<a href="#" style="font-size:11px"
+      onclick="_sttAll=${_sttAll?'false':'true'};_sttKey='';sttPaint();return false"
+      >${_sttAll?'only the ones that can be rewritten'
+                :`also show the ${fmt(d.total-d.fixable)} left alone`}</a>`:''}
+  </div>`;
+  const html=`<div class="lkind" style="padding:11px 12px">${head}${note}${table}${foot}</div>`;
+  if(askOpen('sttPanel')) return;
+  if(html===_sttKey) return;
+  _sttKey=html; el.innerHTML=html;
+}
+
 // ---- subtitles already painted into the picture -------------------------
 // THE FINDINGS ARRIVE BY SHOW, NOT BY FILE. One release group encodes a whole
 // series the same way, so a sweep that finds Beet the Vandel Buster S01E04
@@ -29588,9 +29803,9 @@ function hsScoreColor(r){
 function hsBandCount(){
   return (((_hs&&_hs.found)||[]).filter(r=>!r.marked&&r.auto==='ask')).length;
 }
-async function hsMode(m, btn){
-  if(btn){ btn.disabled=true; btn.textContent='…'; }
-  try{ await fetch('/api/hardsub/mode?mode='+m,{method:'POST'}); }catch(e){}
+async function hsMode(m){
+  try{ await fetch('/api/hardsub/mode?mode='+encodeURIComponent(m),
+                   {method:'POST'}); }catch(e){}
   _hsKey=''; loadHardsub();
 }
 async function hsLine(which, val, el){
@@ -29705,11 +29920,9 @@ function hsPaint(){
         esc(d.ignored_series.join('\n'))}">${d.ignored_series.length} show${
         d.ignored_series.length===1?'':'s'} left alone</span>`:''}</span>
     <span style="float:right;display:flex;gap:8px;align-items:center">
-      <span class="gsw" title="Manual finds them, scores them and waits for you. Auto acts on the two confident ends by itself - marking above the first line, throwing away below the second - and still shows you everything in between, which is the part the evidence cannot settle.">
-        <b style="font-size:11px;color:${d.mode==='auto'?'var(--ok)':'var(--dim)'}">${
-          d.mode==='auto'?'auto':'manual'}</b>
-        <button class="rmb" onclick="hsMode('${d.mode==='auto'?'manual':'auto'}',this)"
-          >${d.mode==='auto'?'hand it back':'let it decide'}</button></span>
+      ${modeSeg('when it is sure enough', d.mode, 'hsMode', {
+        auto:'Findings above the mark line are marked without asking and findings below the dismiss line are thrown away, both on the sweep. Everything between the two lines still waits for you - that band is the part the evidence cannot settle.',
+        manual:'Everything is scored and listed, and nothing is acted on. The two lines still colour the rows, so you can see what auto would have done before letting it do it.'})}
       <button class="rmb" onclick="hsRun(this)" ${
       d.running?'disabled':''}>${d.running?'looking…':'Check some now'}</button></span>`;
   // ---- the two lines, and what falls between them -----------------------
@@ -31392,20 +31605,10 @@ function atPaint(){
     </div>` : '';
   const mode=d.mode||'manual', auto=mode==='auto';
   const modeBox=`
-    <div style="display:flex;gap:7px;align-items:center;font-size:11px;
-                margin-left:auto">
-      <span class="dim">when a wrong title is found</span>
-      <span style="display:inline-flex;border:1px solid var(--line);
-                   border-radius:5px;overflow:hidden">
-        ${['manual','auto'].map(m=>`<button onclick="atMode('${m}')"
-          title="${m==='auto'
-            ?'Titles are corrected on the daily check. The Attention tile stays quiet about them, because they are already being handled.'
-            :'Wrong titles are listed and wait for your click. The Attention tile carries the count.'}"
-          style="font-size:11px;padding:2px 10px;border:0;cursor:pointer;
-            background:${mode===m?'var(--acc)':'transparent'};
-            color:${mode===m?'#0b0e13':'var(--dim,#8a97a6)'};
-            font-weight:${mode===m?'600':'400'}">${m}</button>`).join('')}
-      </span>
+    <div style="display:flex;align-items:center;margin-left:auto">
+      ${modeSeg('when a wrong title is found', mode, 'atMode', {
+        auto:'Titles are corrected on the daily check. The Attention tile stays quiet about them, because they are already being handled.',
+        manual:'Wrong titles are listed and wait for your click. The Attention tile carries the count.'})}
     </div>`;
   el.innerHTML=`
     ${failBox}
