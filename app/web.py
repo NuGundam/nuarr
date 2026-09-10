@@ -6207,6 +6207,31 @@ async def api_subocr_preview_change(body: dict = Body(...)):
         k = "subrule_" + m["key"]
         if k in body:
             after[m["key"]] = bool(body[k])
+    # THREE RULES THIS PREVIEW CANNOT SEE. rules.decide plans what a REBUILD
+    # produces; the sidecar rules act outside it entirely - they start a remux
+    # of their own and reach into the folder next to the file. Diffing the
+    # planner for them returns "nothing changes, safe to apply" while hundreds
+    # of files are about to be rewritten, which is the most dangerous answer a
+    # confirmation can give. They are counted properly instead.
+    SIDECAR_KEYS = ("embed_sidecars", "sidecar_beats_embedded",
+                    "drop_redundant_sidecar")
+    side_changed = {k: after.get(k) for k in SIDECAR_KEYS
+                    if bool(before.get(k)) != bool(after.get(k))}
+
+    def _sidecars() -> dict:
+        if not side_changed:
+            return {}
+        from . import subembed
+        both = subembed.preview_pair(
+            lib,
+            {k: bool(after.get(k)) for k in SIDECAR_KEYS},
+            {k: bool(before.get(k)) for k in SIDECAR_KEYS})
+        soon = both["after"]
+        return {"changed": list(side_changed.keys()),
+                "before": {k: v for k, v in both["before"].items()
+                           if k != "listed"},
+                "after": {k: v for k, v in soon.items() if k != "listed"},
+                "files": soon.get("listed") or []}
 
     def _work() -> dict:
         import json as _j
@@ -6271,6 +6296,15 @@ async def api_subocr_preview_change(body: dict = Body(...)):
         return {"ok": True, "checked": checked, "affected": changed,
                 "files": listed, "ids": ids[:20000]}
     out = await asyncio.to_thread(_work)
+    # The sidecar rules answer separately, because they are answering a
+    # different question: not "what would the planner decide" but "what would
+    # be taken in, replaced, or recycled".
+    try:
+        side = await asyncio.to_thread(_sidecars)
+        if side:
+            out["sidecars"] = side
+    except Exception as e:                               # noqa: BLE001
+        out["sidecars"] = {"error": f"{type(e).__name__}: {e}"}
     # Remembered so "requeue now" queues EXACTLY what was previewed, rather
     # than re-deriving it from a policy that has since been saved - by then
     # both plans are the same and the diff would be empty.
@@ -26158,7 +26192,34 @@ async function socRulePreview(lib){
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify(socRuleBody(lib))})).json(); }catch(e){}
   if(!r||!r.ok){ if(imp) imp.innerHTML='<div class="err">could not check</div>'; return; }
+  // THE SIDECAR RULES ARE NOT A PLANNING CHANGE, so "0 files planned
+  // differently" is true and useless about them. Counted for real above and
+  // drawn first, because they are the ones that rewrite files.
+  const S=r.sidecars||null, sb=(S&&S.before)||{}, sa=(S&&S.after)||{};
+  const dl=(k)=>((sa[k]||0)-(sb[k]||0));
+  const sBits=[];
+  if(S&&!S.error){
+    const nTake=dl('subs')-dl('replaces'), nRep=dl('replaces'), nDrop=dl('drops');
+    if(nTake) sBits.push(`${nTake>0?'takes in':'stops taking in'} <b>${fmt(Math.abs(nTake))}</b> subtitle file(s)`);
+    if(nRep)  sBits.push(`${nRep>0?'replaces':'stops replacing'} <b>${fmt(Math.abs(nRep))}</b> track(s) already inside`);
+    if(nDrop) sBits.push(`${nDrop>0?'recycles':'stops recycling'} <b>${fmt(Math.abs(nDrop))}</b> loose copy(s)`);
+  }
   if(imp) imp.innerHTML=`
+    ${S?`<div class="lkind" style="padding:9px 11px;margin-bottom:6px;
+       border-left:3px solid ${sBits.length?'#e2b341':'#7fd4a3'}">
+      <b>Subtitle files beside the video</b>
+      ${S.error?`<div class="err">${esc(S.error)}</div>`
+        :(sBits.length
+          ? `<div style="margin-top:3px">This library ${sBits.join(', ')}.</div>
+             <div class="dim" style="font-size:10.5px;margin-top:3px">Each one
+               taken in or replaced rewrites the file as a stream copy — no
+               re-encode. Recycled copies go to the recycle bin, and only after
+               the file is read from disk and the track is found in it.</div>
+             ${(S.files||[]).length?`<div style="max-height:150px;overflow:auto;
+               margin-top:6px;font-size:11px" class="dim">${S.files.map(f=>
+               `<div>${esc(f.label)} — ${esc(f.change)}</div>`).join('')}</div>`:''}`
+          : '<div class="dim" style="margin-top:3px">No file in this library is affected.</div>')}
+    </div>`:''}
     <div class="lkind" style="padding:9px 11px">
       <b style="color:${r.affected?'#e2b341':'#7fd4a3'}">${fmt(r.affected)}</b>
       of ${fmt(r.checked)} file(s) in this library would be planned differently.
@@ -26169,7 +26230,8 @@ async function socRulePreview(lib){
     </div>`;
   if(bar) bar.innerHTML=`<button onclick="socRuleApply('${esc(lib)}')">Apply</button>
     <button onclick="langSignsLoad()">Undo</button>
-    <span class="dim">${fmt(r.affected)} file(s) affected</span>`;
+    <span class="dim">${fmt(r.affected)} file(s) replanned${
+      sBits.length?` · ${fmt(Math.abs(dl('subs'))+Math.abs(dl('drops')))} subtitle file(s) acted on`:''}</span>`;
 }
 async function socRuleApply(lib,skipped){
   const bar=document.getElementById('soc_'+cssId(lib)+'_rulebar');
@@ -32075,7 +32137,11 @@ function sePaint(){
         <span class="dim" style="margin-left:auto">${
           sum.files?`<b class="cchg">${fmt(sum.files)} file${
             sum.files===1?'':'s'}</b>${sum.subs!==sum.files?` · ${
-            fmt(sum.subs)} subtitles`:''}${libs?` <span style="opacity:.7">— ${
+            fmt(sum.subs)} subtitles`:''}${sum.replaces?` · <span
+            title="Sidecars that would replace a track already inside the file, because the library says the loose copy is the keeper">${
+            fmt(sum.replaces)} replacing a track inside</span>`:''}${sum.drops?` · <span
+            title="Loose copies of a subtitle the file already carries. Recycled — nothing is rewritten.">${
+            fmt(sum.drops)} to recycle</span>`:''}${libs?` <span style="opacity:.7">— ${
             libs}</span>`:''}`
           :'<b style="color:var(--ok)">no sidecars to take in</b>'}</span>
       </div></div>`;

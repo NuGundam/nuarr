@@ -2038,6 +2038,30 @@ RULE_META = [
              "every other rule changes what a rebuild produces, this one "
              "starts one.",
      "default": False},
+    {"key": "sidecar_beats_embedded",
+     "label": "A subtitle file beside the video beats the one already inside "
+              "it",
+     "what": "Only matters when the two are the same language and the same "
+             "kind - a full sidecar against a full track, forced against "
+             "forced. Off, the sidecar is refused and left on disk. On, it is "
+             "taken in and the track it replaces is dropped from the rebuilt "
+             "file, because Bazarr fetching a subtitle for a language you "
+             "already had usually means it found a better one. Needs the rule "
+             "above to be on. If two tracks of that kind are already inside, "
+             "nothing is changed and the file is listed instead - which one "
+             "the sidecar replaces is not something to guess at.",
+     "default": False},
+    {"key": "drop_redundant_sidecar",
+     "label": "Recycle a subtitle file the video already carries",
+     "what": "The opposite answer to the same situation, and nothing is "
+             "rewritten: the file already has that language and kind inside "
+             "it, so the loose copy is doing nothing except waiting to be "
+             "orphaned and to win Plex's picker. The file is read from disk "
+             "first - not from what nuarr last recorded about it - and the "
+             "track has to really be there before the sidecar is recycled. "
+             "Recycled, not deleted. Takes effect on its own; it does not "
+             "need the embed rule.",
+     "default": False},
     {"key": "prefer_signs_over_forced",
      "label": "A Signs & Songs track beats whatever carries the forced flag",
      "what": "Forced means the lines you cannot understand while the audio "
@@ -2070,6 +2094,8 @@ _RULE_CFG = {
     "burn_hdr": "burnOnHDR",
     "embed_sidecars": "embedExternalSubs",
     "prefer_signs_over_forced": "preferSignsOverForcedFlag",
+    "sidecar_beats_embedded": "preferSidecarOverEmbedded",
+    "drop_redundant_sidecar": "dropRedundantSidecar",
 }
 
 

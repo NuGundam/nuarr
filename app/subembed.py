@@ -120,6 +120,29 @@ def enabled(library: str = "") -> bool:
         return False
 
 
+def rules_of(library: str = "", overrides: dict | None = None) -> dict:
+    """This library's sidecar rules, with a proposed change laid over them."""
+    try:
+        from . import subocr
+        d = dict(subocr.sub_rules(library))
+    except Exception:                                            # noqa: BLE001
+        d = {}
+    if overrides:
+        d.update(overrides)
+    return d
+
+
+def active(library: str = "", overrides: dict | None = None) -> bool:
+    """Is there ANY sidecar work to do here?
+
+    Recycling a redundant sidecar rewrites nothing, so it does not need the
+    embed rule to be on and must not be gated behind it - that would make a
+    switch that says it acts on its own into one that quietly does not.
+    """
+    d = rules_of(library, overrides)
+    return bool(d.get("embed_sidecars") or d.get("drop_redundant_sidecar"))
+
+
 def _mkvmerge() -> str:
     p = str(getattr(SETTINGS, "mkvmerge", "") or "")
     if p and os.path.exists(p):
@@ -241,8 +264,156 @@ def embedded_langs(file_id: int) -> set:
     return got
 
 
+
+# ------------------------------------------------- same language, and then --
+# TWO SUBTITLES IN ONE LANGUAGE ARE NOT NECESSARILY THE SAME SUBTITLE.
+#
+# A file with "English [Signs]" inside it and a plain .en.srt beside it does
+# not have that subtitle twice - it has a signs track and a dialogue track,
+# which is the same distinction the drop-covered rule and the forced-flag rule
+# already make. Deciding on language alone would either refuse a real addition
+# or recycle a sidecar nothing had replaced, depending on which switch was on,
+# and both are wrong in the same way.
+#
+# So everything below matches on language AND kind. Three kinds, because three
+# is what a subtitle file's name and a track's header can actually tell apart.
+def _role_class(role: str) -> str:
+    """forced / sdh / full, from a sidecar's name."""
+    r = (role or "").lower()
+    if "forced" in r:
+        return "forced"
+    if "sdh" in r or "cc" in r or "hi" in r:
+        return "sdh"
+    return "full"
+
+
+# AND THE FOURTH KIND, WHICH IS NOT A SUBTITLE AT ALL.
+#
+# The hardsub check writes a blank English track titled "English (burned into
+# the picture)" into files whose subtitles are painted on. It carries one empty
+# cue. Its whole job is to tell Bazarr and Plex there is nothing to fetch.
+#
+# The survey caught what that would have done here. On 198 files - Detective
+# Conan, mostly - the marker made the file look like it already had English
+# subtitles, so the recycle rule would have thrown away a REAL English sidecar
+# to preserve a placeholder that contains one blank line. That is the worst
+# outcome this feature can produce, and it would have looked like it worked.
+#
+# So a marker is its own kind, it is never a twin of anything, and the only
+# thing that may happen to it is being replaced by the real subtitle it was
+# standing in for.
+def _is_marker(title: str) -> bool:
+    t = (title or "").strip().lower()
+    if not t:
+        return False
+    try:
+        from . import hardsub as _h
+        if t == _h.MARK_NAME.strip().lower():
+            return True
+    except Exception:                                            # noqa: BLE001
+        pass
+    return "burned into the picture" in t
+
+
+def _track_class(title: str, forced: bool) -> str:
+    """The four kinds an embedded track can be, from its title and flags."""
+    if _is_marker(title):
+        return "marker"
+    try:
+        from . import rules as _r
+        if _r.SDH_TITLE_RE.search(title or ""):
+            return "sdh"
+        if forced or _r.is_signs_title(title or ""):
+            return "forced"
+    except Exception:                                            # noqa: BLE001
+        if forced:
+            return "forced"
+    return "full"
+
+
+def _markers(tracks: list, lang: str) -> list:
+    """Placeholder tracks in this language - never twins, only replaceable."""
+    k = _lang_key(lang)
+    return [t for t in tracks if t["lang"] == k and t["class"] == "marker"]
+
+
+def _probe_sub_tracks(file_id: int) -> list:
+    """Subtitle tracks from the STORED probe: language, kind, ordinal.
+
+    Cheap on purpose - this runs inside the library walk, and a subprocess per
+    file across forty thousand of them is not a walk, it is an outage. The
+    authoritative read happens once, at the moment of the rewrite, where being
+    wrong costs something.
+    """
+    out: list = []
+    try:
+        with cursor() as cur:
+            r = cur.execute("SELECT json FROM file_probes WHERE file_id=?",
+                            (int(file_id),)).fetchone()
+        if not r:
+            return out
+        n = 0
+        for st in (json.loads(r["json"]).get("streams") or []):
+            if st.get("codec_type") != "subtitle":
+                continue
+            tags = st.get("tags") or {}
+            disp = st.get("disposition") or {}
+            out.append({
+                "ord": n,
+                "lang": _lang_key(tags.get("language") or "und"),
+                "title": (tags.get("title") or "").strip(),
+                "class": _track_class(tags.get("title") or "",
+                                      bool(disp.get("forced"))),
+            })
+            n += 1
+    except Exception:                                            # noqa: BLE001
+        return out
+    return out
+
+
+def _live_sub_tracks(path: str) -> list:
+    """The same list, read from the FILE - and with mkvmerge's own track ids.
+
+    mkvmerge numbers its inputs its own way, so an ffprobe stream index cannot
+    be handed to --subtitle-tracks; asking mkvmerge itself is the only way to
+    name a track to mkvmerge. It also means the decision to drop a track is
+    taken against the file as it is now rather than against a probe written
+    before somebody else edited it.
+    """
+    out: list = []
+    try:
+        r = subprocess.run([_mkvmerge(), "-J", path], capture_output=True,
+                           text=True, timeout=180, creationflags=NO_WINDOW,
+                           startupinfo=hidden_si())
+        d = json.loads(r.stdout or "{}")
+    except Exception:                                            # noqa: BLE001
+        return out
+    n = 0
+    for t in (d.get("tracks") or []):
+        if t.get("type") != "subtitles":
+            continue
+        p = t.get("properties") or {}
+        out.append({
+            "id": t.get("id"),
+            "ord": n,
+            "lang": _lang_key(p.get("language") or "und"),
+            "title": (p.get("track_name") or "").strip(),
+            "class": _track_class(p.get("track_name") or "",
+                                  bool(p.get("forced_track"))),
+        })
+        n += 1
+    return out
+
+
+def _same_kind(tracks: list, lang: str, role: str) -> list:
+    """The tracks a sidecar of this language and kind would be a second copy of."""
+    k, cls = _lang_key(lang), _role_class(role)
+    return [t for t in tracks if t["lang"] == k and t["class"] == cls]
+
+
 # ------------------------------------------------------------- the verdict --
-def plan_one(file_id: int, force: bool = False) -> dict:
+def plan_one(file_id: int, force: bool = False,
+             overrides: dict | None = None) -> dict:
     r"""What would happen to this file. Reads only; changes nothing.
 
     Returns {ok, path, library, take: [...], skip: [{sidecar, why}]}. The
@@ -260,10 +431,18 @@ def plan_one(file_id: int, force: bool = False) -> dict:
            "take": [], "skip": []}
     if (row.get("state") or "") in ("deleted", "duplicate"):
         return {**out, "ok": False, "why": "not a live file"}
-    if not enabled(lib) and not force:
+    _sr = rules_of(lib, overrides)
+    if not active(lib, overrides) and not force:
         return {**out, "ok": False,
-                "why": f"the embed rule is off for {lib or 'this library'}"}
+                "why": f"the sidecar rules are off for {lib or 'this library'}"}
     have = embedded_langs(int(file_id))
+    # The two answers to "that language is already inside", both off by
+    # default and both the library's to give.
+    take_them = bool(_sr.get("embed_sidecars")) or force
+    beats = bool(_sr.get("sidecar_beats_embedded")) and take_them
+    tidy = bool(_sr.get("drop_redundant_sidecar"))
+    inside = _probe_sub_tracks(int(file_id)) if (beats or tidy) else []
+    out["drop"] = []
     for side in sidecars_for(path):
         name = read_sidecar_name(path, side)
         if not name["ok"]:
@@ -276,10 +455,74 @@ def plan_one(file_id: int, force: bool = False) -> dict:
         # GUARD TWO, PER LANGUAGE. A file with Japanese subs inside still takes
         # an English sidecar; what this stops is a second English track.
         if _lang_key(name["lang"]) in have:
+            twins = _same_kind(inside, name["lang"], name["role"])
+            cls = _role_class(name["role"])
+            if beats:
+                # NOTHING OF THIS KIND IS ACTUALLY INSIDE. The language is,
+                # but as a different sort of subtitle - "English [Signs]"
+                # against a plain .en.srt. That is not a duplicate, it is the
+                # gap the sidecar fills, so it is taken and nothing is
+                # dropped. Only reachable with this switch on, because it
+                # widens what the file is allowed to gain.
+                if not twins:
+                    # THE PLACEHOLDER'S TURN IS OVER. A blank marker track
+                    # exists because there was no real subtitle; one has just
+                    # turned up, so the real one takes its place rather than
+                    # sitting beside it. Only for a full sidecar - a forced or
+                    # SDH file does not answer what the marker was saying.
+                    mk = _markers(inside, name["lang"]) if cls == "full" else []
+                    if len(mk) == 1:
+                        out["take"].append({
+                            "sidecar": side, "lang": name["lang"],
+                            "role": name["role"], "size": _size(side),
+                            "replaces": [mk[0]["ord"]],
+                            "note": "replaces the blank marker track that "
+                                    "said the subtitles are burned into the "
+                                    "picture"})
+                        continue
+                    out["take"].append({
+                        "sidecar": side, "lang": name["lang"],
+                        "role": name["role"], "size": _size(side),
+                        "replaces": [],
+                        "note": f"the file has {name['lang']} subtitles but "
+                                f"none of them are {cls}"})
+                    continue
+                if len(twins) == 1:
+                    out["take"].append({
+                        "sidecar": side, "lang": name["lang"],
+                        "role": name["role"], "size": _size(side),
+                        "replaces": [twins[0]["ord"]],
+                        "note": f"replaces the {cls} {name['lang']} track "
+                                f"already inside"
+                                + (f" ({twins[0]['title']})"
+                                   if twins[0]["title"] else "")})
+                    continue
+                # AMBIGUOUS IS NOT A REASON TO PICK ONE. Two full English
+                # tracks and one English sidecar: whichever is thrown away is
+                # a guess, and a guess here is a subtitle nobody can get back.
+                out["skip"].append({
+                    "sidecar": side,
+                    "why": f"{len(twins)} {cls} {name['lang']} tracks are "
+                           f"already inside - which one this would replace "
+                           f"is not obvious, so nothing was changed"})
+                continue
+            if tidy and twins:
+                out["drop"].append({
+                    "sidecar": side, "lang": name["lang"],
+                    "role": name["role"], "size": _size(side),
+                    "why": f"the file already carries a {cls} "
+                           f"{name['lang']} subtitle track"})
+                continue
             out["skip"].append({
                 "sidecar": side,
                 "why": f"the file already has a {name['lang']} subtitle track "
                        f"inside it"})
+            continue
+        if not take_them:
+            out["skip"].append({
+                "sidecar": side,
+                "why": "this library only recycles sidecars it already has; "
+                       "taking new ones in is a separate rule"})
             continue
         out["take"].append({"sidecar": side, "lang": name["lang"],
                             "role": name["role"],
@@ -308,6 +551,43 @@ def plan_one(file_id: int, force: bool = False) -> dict:
                        f"being taken instead "
                        f"({os.path.splitext(cur[1]['sidecar'])[1]})"})
     out["take"] = [t for _r, t in best.values()]
+    return out
+
+
+def _recycle_drops(file_id: int, path: str, drops: list) -> dict:
+    r"""Recycle sidecars the file already carries. Nothing is rewritten.
+
+    READ THE FILE, NOT THE RECORD. The plan decided from the stored probe,
+    which is fast and is the right trade for a walk of forty thousand files -
+    but it is also written before an edit rather than after, and a stale probe
+    is how a subtitle would get thrown away because nuarr THOUGHT the track
+    was inside. So every drop is checked against the container one more time,
+    now, and a file that has changed its mind keeps its sidecar.
+    """
+    from . import fileops
+    out = {"dropped": 0, "kept": []}
+    if not drops:
+        return out
+    live = _live_sub_tracks(path)
+    if not live:
+        out["kept"] = [os.path.basename(d["sidecar"]) for d in drops]
+        return out
+    for d in drops:
+        if not _same_kind(live, d["lang"], d["role"]):
+            out["kept"].append(os.path.basename(d["sidecar"]))
+            _note(file_id, path, d["sidecar"], d["lang"], False,
+                  "the track it duplicates is not in the file after all - "
+                  "the sidecar was left alone")
+            continue
+        rr = fileops.recycle(d["sidecar"])
+        if getattr(rr, "ok", False):
+            out["dropped"] += 1
+            _note(file_id, path, d["sidecar"], d["lang"], True,
+                  d.get("why") or "already inside the file - recycled")
+        else:
+            out["kept"].append(os.path.basename(d["sidecar"]))
+            _note(file_id, path, d["sidecar"], d["lang"], False,
+                  f"could not recycle it: {getattr(rr, 'why', '')}"[:200])
     return out
 
 
@@ -360,11 +640,24 @@ def embed_one(file_id: int) -> dict:
     """
     from . import fileops
     p = plan_one(int(file_id))
-    if not p.get("ok") or not p.get("take"):
+    if not p.get("ok"):
+        return {**p, "embedded": 0}
+    takes, drops = (p.get("take") or []), (p.get("drop") or [])
+    if not takes and not drops:
         return {**p, "embedded": 0}
     path = p["path"]
     if not os.path.exists(path):
         return {"ok": False, "why": "the file is not on disk"}
+    # A DROP TOUCHES NO FILE, so it is not gated on any of what follows - not
+    # the container, not mkvmerge, not the lock. It only ever removes a loose
+    # copy of something the file already has.
+    if not takes:
+        d = _recycle_drops(int(file_id), path, drops)
+        if d["dropped"]:
+            joblog.log(f"recycled {d['dropped']} sidecar(s) already inside "
+                       f"{os.path.basename(path)}", "info")
+        return {"ok": True, "embedded": 0, "recycled": d["dropped"],
+                "dropped": d["dropped"], "kept": d["kept"], "path": path}
     if os.path.splitext(path)[1].lower() != ".mkv":
         return {"ok": False, "why": "only Matroska can carry these tracks; "
                                     "this file is not .mkv"}
@@ -375,8 +668,39 @@ def embed_one(file_id: int) -> dict:
                                     "Settings, MKVToolNix"}
     tmp = os.path.join(os.path.dirname(path),
                        f".nuarr-embed-{int(time.time())}.mkv")
-    cmd = [_mkvmerge(), "-o", tmp, path]
-    for t in p["take"]:
+    cmd = [_mkvmerge(), "-o", tmp]
+    # WHAT THE SIDECAR REPLACES, NAMED IN MKVMERGE'S OWN NUMBERS. The plan
+    # counted subtitle tracks in order; mkvmerge numbers every track in the
+    # file in its own way, so the ordinal has to be translated against the
+    # container as it is right now. If the file has changed since the plan was
+    # made, this comes out different and the replace is abandoned rather than
+    # aimed at whatever happens to be in that position.
+    want_drop = [o for t in takes for o in (t.get("replaces") or [])]
+    if want_drop:
+        live = _live_sub_tracks(path)
+        by_ord = {t["ord"]: t for t in live}
+        ids, lost = [], []
+        for t in takes:
+            for o in (t.get("replaces") or []):
+                hit = by_ord.get(o)
+                want_cls = _role_class(t.get("role") or "")
+                if hit is None or hit["lang"] != _lang_key(t["lang"]) \
+                        or hit["class"] not in (want_cls, "marker"):
+                    lost.append(t["lang"])
+                else:
+                    ids.append(str(hit["id"]))
+        if lost or len(ids) != len(want_drop):
+            why = ("the track this would have replaced is not where the plan "
+                   "said it was - the file has changed since it was looked at, "
+                   "so nothing was done")
+            _note(file_id, path, ";".join(t["sidecar"] for t in takes), "",
+                  False, why)
+            return {"ok": False, "why": why}
+        # !ids means "everything except these", which is how mkvmerge spells
+        # a removal: the container is copied without them.
+        cmd += ["--subtitle-tracks", "!" + ",".join(ids)]
+    cmd += [path]
+    for t in takes:
         # The language goes on the TRACK, not just in the filename it came
         # from - a track tagged und is a track the planner will treat as
         # untagged forever after.
@@ -396,14 +720,14 @@ def embed_one(file_id: int) -> dict:
     if r.returncode >= 2 or not os.path.exists(tmp):
         fileops._quiet_remove(tmp)
         why = (r.stderr or r.stdout or "mkvmerge failed").strip()[:300]
-        _note(file_id, path, ";".join(t["sidecar"] for t in p["take"]), "",
+        _note(file_id, path, ";".join(t["sidecar"] for t in takes), "",
               False, why)
         return {"ok": False, "why": why}
 
     # EXIT 0 IS NOT PROOF. Read the result back and require every language to
     # actually be in it before anything is removed or replaced.
     got = _probe_langs(tmp)
-    missing = [t["lang"] for t in p["take"]
+    missing = [t["lang"] for t in takes
                if _lang_key(t["lang"]) not in got]
     if missing:
         fileops._quiet_remove(tmp)
@@ -421,7 +745,7 @@ def embed_one(file_id: int) -> dict:
 
     # AND ONLY NOW THE SIDECARS, one at a time, recycled rather than deleted.
     gone, kept = 0, []
-    for t in p["take"]:
+    for t in takes:
         rr = fileops.recycle(t["sidecar"])
         if getattr(rr, "ok", False):
             gone += 1
@@ -430,9 +754,19 @@ def embed_one(file_id: int) -> dict:
         _note(file_id, path, t["sidecar"], t["lang"], True,
               f"embedded as {t['lang']}"
               + ("" if getattr(rr, "ok", False) else " (sidecar left in place)"))
-    joblog.log(f"embedded {len(p['take'])} sidecar subtitle(s) into "
-               f"{os.path.basename(path)} and recycled {gone}", "info")
-    return {"ok": True, "embedded": len(p["take"]), "recycled": gone,
+    # The redundant ones go in the same visit - the file is already settled
+    # and re-probing it is cheaper than coming back for them.
+    dd = _recycle_drops(int(file_id), path, drops)
+    gone += dd["dropped"]
+    kept += dd["kept"]
+    replaced = sum(len(t.get("replaces") or []) for t in takes)
+    joblog.log(f"embedded {len(takes)} sidecar subtitle(s) into "
+               f"{os.path.basename(path)}"
+               + (f", replacing {replaced} track(s) already inside"
+                  if replaced else "")
+               + f" and recycled {gone}", "info")
+    return {"ok": True, "embedded": len(takes), "recycled": gone,
+            "replaced": replaced, "dropped": dd["dropped"],
             "kept": kept, "path": path}
 
 
@@ -448,7 +782,7 @@ def candidates(limit: int = 200, force: bool = False,
     if not _READY:
         init()
     libs = [l.name for l in (SETTINGS.libraries or [])
-            if force or enabled(l.name)]
+            if force or active(l.name)]
     if not libs:
         return []
     qs = ",".join("?" * len(libs))
@@ -485,7 +819,7 @@ def candidates(limit: int = 200, force: bool = False,
         if not sidecars_for(r["path"]):
             continue                       # cheap listdir, no probe, no policy
         p = plan_one(r["id"], force=force)
-        if p.get("take"):
+        if p.get("take") or p.get("drop"):
             out.append(p)
     return out
 
@@ -625,19 +959,87 @@ def summary(force_refresh: bool = False) -> dict:
         d["pending"] = True
         return d
     by_lib: dict = {}
-    files = subs = 0
+    files = subs = drops = reps = 0
     for p in got:
         lib = p.get("library") or "?"
-        e = by_lib.setdefault(lib, {"files": 0, "subs": 0,
-                                    "on": enabled(lib)})
+        e = by_lib.setdefault(lib, {"files": 0, "subs": 0, "drops": 0,
+                                    "replaces": 0, "on": enabled(lib)})
         e["files"] += 1
         e["subs"] += len(p.get("take") or [])
+        e["drops"] += len(p.get("drop") or [])
+        e["replaces"] += sum(len(t.get("replaces") or [])
+                             for t in (p.get("take") or []))
         files += 1
         subs += len(p.get("take") or [])
-    d = {"files": files, "subs": subs, "by_library": by_lib,
-         "at": now, "took": _WALK.get("took") or 0.0}
+        drops += len(p.get("drop") or [])
+        reps += sum(len(t.get("replaces") or []) for t in (p.get("take") or []))
+    d = {"files": files, "subs": subs, "drops": drops, "replaces": reps,
+         "by_library": by_lib, "at": now, "took": _WALK.get("took") or 0.0}
     _SUM.update(at=now, data=d)
     return dict(d)
+
+
+def preview_counts(library: str, overrides: dict) -> dict:
+    r"""What these rules WOULD do to one library. Plans, changes nothing.
+
+    THE OTHER PREVIEW CANNOT ANSWER THIS. Ticking a subtitle rule shows what
+    the planner would decide differently, by planning every file both ways -
+    and the planner has never heard of sidecars, so all three sidecar rules
+    came back "nothing changes, safe to apply" while in fact hundreds of files
+    were about to be rewritten. A confirmation that is confidently wrong is
+    worse than none at all.
+    """
+    return preview_pair(library, overrides, None)["after"]
+
+
+def preview_pair(library: str, after: dict, before: dict | None) -> dict:
+    r"""Both sides of a proposed change, in ONE walk of the library.
+
+    The listdir is what this costs - the planning either side of it is
+    arithmetic on what the listdir already found. Doing the two states as two
+    calls walked Anime Shows twice for no reason, which on 22,905 files is the
+    difference between a pause and a page that looks broken.
+    """
+    with cursor() as cur:
+        rows = [dict(r) for r in cur.execute(
+            "SELECT id, path FROM files "
+            " WHERE library=? AND state NOT IN ('deleted','duplicate') "
+            "   AND COALESCE(path,'') != '' ORDER BY id", (library,))]
+    tot = {"after": {"files": 0, "subs": 0, "drops": 0, "replaces": 0},
+           "before": {"files": 0, "subs": 0, "drops": 0, "replaces": 0}}
+    listed: list = []
+    for r in rows:
+        if not sidecars_for(r["path"]):
+            continue
+        for side, ov in (("after", after), ("before", before)):
+            if ov is None:
+                continue
+            p = plan_one(r["id"], overrides=ov)
+            if not p.get("ok"):
+                continue
+            t, d = (p.get("take") or []), (p.get("drop") or [])
+            if not t and not d:
+                continue
+            rp = sum(len(x.get("replaces") or []) for x in t)
+            e = tot[side]
+            e["files"] += 1
+            e["subs"] += len(t)
+            e["drops"] += len(d)
+            e["replaces"] += rp
+            if side == "after" and len(listed) < 200:
+                bits = []
+                if len(t) - rp:
+                    bits.append(f"takes in {len(t) - rp} subtitle(s)")
+                if rp:
+                    bits.append(f"replaces {rp} track(s) already inside")
+                if d:
+                    bits.append(f"recycles {len(d)} loose copy(s)")
+                listed.append({"id": r["id"],
+                               "label": os.path.basename(r["path"] or ""),
+                               "change": ", ".join(bits)})
+    tot["after"]["listed"] = listed
+    tot["before"]["listed"] = []
+    return tot
 
 
 def preview(limit: int = 25, force: bool = True) -> dict:
@@ -653,14 +1055,15 @@ def preview(limit: int = 25, force: bool = True) -> dict:
     return {"ok": True, "files": [
         {"file_id": p["file_id"], "path": p["path"], "library": p["library"],
          "on": enabled(p["library"]),
-         "take": p["take"], "skip": p["skip"][:4]} for p in got]}
+         "take": p["take"], "drop": p.get("drop") or [],
+         "skip": p["skip"][:4]} for p in got]}
 
 
 async def watch() -> None:
     await asyncio.sleep(180)
     while True:
         try:
-            if any(enabled(l.name) for l in (SETTINGS.libraries or [])):
+            if any(active(l.name) for l in (SETTINGS.libraries or [])):
                 await sweep()
         except Exception as e:                                   # noqa: BLE001
             STATE["last_error"] = f"{type(e).__name__}: {e}"

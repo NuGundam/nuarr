@@ -190,6 +190,14 @@ CONFIG: dict[str, Any] = {
     # Songs" is the release telling you what is in it rather than what it
     # wanted your player to do.
     "preferSignsOverForcedFlag": True,
+    # When a sidecar and an embedded track are the same language, which one is
+    # the keeper. Off: the embedded one, and the sidecar is refused (what this
+    # feature has always done). On: the sidecar, and the track it replaces is
+    # dropped from the rebuilt file.
+    "preferSidecarOverEmbedded": False,
+    # And the other answer to the same situation - keep the embedded track and
+    # recycle the sidecar, without rewriting anything at all.
+    "dropRedundantSidecar": False,
     # Text subtitles are written ahead of picture subtitles. Plex offers tracks
     # in file order and takes the earlier one when nothing else separates them,
     # so a PGS ahead of the SRT gets picked - and a picked picture track is a
@@ -1540,6 +1548,8 @@ def decide(probe: dict, *, anime: bool = False, filename: str = "",
             "force_eng_sub": "forceEngSubWhenNoEngAudio",
             "burn_hdr": "burnOnHDR",
             "prefer_signs_over_forced": "preferSignsOverForcedFlag",
+            "sidecar_beats_embedded": "preferSidecarOverEmbedded",
+            "drop_redundant_sidecar": "dropRedundantSidecar",
         }.get(key, ""), True))
 
     def _a(key, fallback):
