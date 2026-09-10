@@ -18,6 +18,14 @@ import time
 
 from .db import cursor
 
+# READ FROM remedy, NOT RETYPED. The whole point of this module is that a
+# number on the diagram cannot drift from the number the code uses.
+try:
+    from .remedy import AUTO_REQUEUE_PER_HOUR as REQ_CAP
+    from .remedy import AUTO_REPLACE_PER_HOUR as REP_CAP
+except Exception:                                            # noqa: BLE001
+    REQ_CAP = REP_CAP = 0
+
 # One place for the shape. Positions are a grid the page turns into pixels -
 # column, row - so re-laying-out the diagram does not mean touching the labels.
 _COLS = ["found", "read", "decided", "waiting", "working", "kept"]
@@ -29,6 +37,64 @@ def _n(cur, sql: str, args: tuple = ()) -> int:
         return int(r[0]) if r else 0
     except Exception:                                        # noqa: BLE001
         return 0
+
+
+def _has(cur, table: str) -> bool:
+    """Is this table here yet?
+
+    Every check below was added after some installs were already running, and
+    a table is only created the first time its module is used. A diagram that
+    raises because nobody has switched on the OCR sweep would be a worse bug
+    than the missing box it was trying to avoid.
+    """
+    try:
+        return bool(cur.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (table,)).fetchone())
+    except Exception:                                        # noqa: BLE001
+        return False
+
+
+# EVERY BOX ON THAT ROW COUNTS THE SAME KIND OF THING. The first draft had
+# the audio check showing 3,590 - tracks LISTENED TO - beside neighbours
+# showing 0 and 3, which were findings. Three numbers on one row answering two
+# different questions is how a diagram teaches something false: it reads as
+# "the audio check has three and a half thousand problems".
+#
+# So every count here is what the check is currently holding for a person, and
+# the population it was drawn from goes in the note. For this one that means
+# asking audiolang, which costs about a tenth of a second - memoised, because
+# the diagram polls every eight.
+_LIES = {"at": 0.0, "n": 0}
+_LIES_TTL = 30.0
+
+
+def _mislabelled() -> int:
+    now = time.time()
+    if now - _LIES["at"] < _LIES_TTL:
+        return _LIES["n"]
+    try:
+        from . import audiolang
+        _LIES.update(at=now, n=len(audiolang.mismatches(500)))
+    except Exception:                                        # noqa: BLE001
+        _LIES["at"] = now
+    return _LIES["n"]
+
+
+def _sidecars_cached() -> int | None:
+    """Sidecars waiting, ONLY if somebody has already counted them.
+
+    subembed.summary() walks every folder in the library - a minute of disk -
+    and starts that walk in the background if its answer has gone stale.
+    Opening a diagram must not set that going, and this poll runs every eight
+    seconds, so this reads the cache and accepts None as an answer.
+    """
+    try:
+        from . import subembed
+        d = subembed._SUM.get("data")
+        return int(d["files"]) if d else None
+    except Exception:                                        # noqa: BLE001
+        return None
 
 
 def _settings_labels() -> dict:
@@ -130,6 +196,44 @@ def graph() -> dict:
         typeset = _n(cur, "SELECT COUNT(DISTINCT file_id) FROM sub_shape "
                           "WHERE typeset=1")
         dialogue = max(0, shaped - typeset)
+
+        # ---- the standing checks ---------------------------------------
+        # WHY THESE ARE A THIRD GRAPH AND NOT MORE BOXES ON THE FIRST.
+        #
+        # The pipeline above answers "what is nuarr going to do to this file".
+        # These answer "is this file what it claims to be" - and they run on
+        # their own clocks, over files that have already been committed, long
+        # after the pipeline has finished with them. Drawing them as another
+        # column would say they happen once, in order, on the way past. They
+        # do not: a file committed in March is re-examined tonight.
+        #
+        # What they have in common is where they END. Each used to have its
+        # own idea of what to do about a finding; they now all hand it to one
+        # remedy layer with one policy table and one hourly budget, and that
+        # convergence is the thing this picture exists to show.
+        ck_decode = _n(cur, "SELECT COUNT(*) FROM integrity "
+                            "WHERE verdict='corrupt'")
+        ck_read = _n(cur, "SELECT COUNT(*) FROM integrity")
+        ck_burn = _n(cur, "SELECT COUNT(*) FROM hardsub h "
+                          "WHERE h.state NOT IN ('none','') AND h.marked=0 "
+                          "  AND h.file_id NOT IN "
+                          "      (SELECT file_id FROM hardsub_ignored)")
+        ck_burn_seen = _n(cur, "SELECT COUNT(*) FROM hardsub")
+        ck_marked = _n(cur, "SELECT COUNT(*) FROM hardsub WHERE marked=1")
+        ck_heard = _n(cur, "SELECT COUNT(*) FROM audio_lang")
+        ck_waiting = _n(cur, "SELECT COUNT(*) FROM audio_lang_queue")
+        ck_rule = _n(cur, "SELECT COUNT(*) FROM audit_findings WHERE run_id="
+                          "(SELECT MAX(run_id) FROM audit_findings)")
+        ck_gap = _n(cur, "SELECT COUNT(*) FROM arrgap_seen")
+        # The four verbs, all-time and this hour. The hour is the one that
+        # matters for the caps, and the caps are the reason the layer exists.
+        hour_ago = time.time() - 3600.0
+        acted = {r[0]: r[1] for r in cur.execute(
+            "SELECT action, COUNT(*) FROM remedy_log WHERE ok=1 "
+            "GROUP BY action")} if _has(cur, "remedy_log") else {}
+        acted_h = {r[0]: r[1] for r in cur.execute(
+            "SELECT action, COUNT(*) FROM remedy_log WHERE ok=1 AND at>=? "
+            "GROUP BY action", (hour_ago,))} if _has(cur, "remedy_log") else {}
 
     eng = lab.get("ocr_engine") or "the OCR"
     libs = lab.get("ocr_libraries") or []
@@ -240,8 +344,124 @@ def graph() -> dict:
         dict(a="s_type", b="s_burn", label="", n=typeset),
         dict(a="s_dial", b="s_ocr", label="", n=dialogue),
     ]
+    # ---- the standing checks, and the one place they all end up --------
+    sidecars = _sidecars_cached()
+    ck_lie = _mislabelled()
+    found_now = ck_decode + ck_lie + ck_burn + ck_rule + ck_gap
+    n_req = acted.get("requeue", 0)
+    n_rep = acted.get("replace", 0)
+    n_fix = acted.get("repair", 0)
+    n_ask = acted.get("reask", 0)
+
+    ck_nodes = [
+        dict(id="c_dec", col=0, row=0, label="Does it decode?",
+             count=ck_decode, kind="bad" if ck_decode else "stage",
+             note=(f"{ck_read:,} files have had their first 20 and last 25 "
+                   "seconds actually decoded, not merely probed - a truncated "
+                   "download passes ffprobe and fails halfway through the "
+                   "episode, which is where a viewer finds it. The number "
+                   "shown is how many will not decode.")),
+        dict(id="c_lang", col=0, row=1, label="Is the audio what it says?",
+             count=ck_lie, kind="warn" if ck_lie else "stage",
+             note=(f"{ck_heard:,} tracks have been listened to with Whisper - "
+                   "five 30-second windows spread across the file, and the "
+                   "confident windows have to agree. A blank tag is filled "
+                   "automatically; a tag that is demonstrably wrong is never "
+                   "overwritten without a person, because that restraint is "
+                   "all that stops it re-labelling every English dub. "
+                   f"{ck_waiting:,} freshly imported files are waiting their "
+                   "turn ahead of the backlog. The number shown is how many "
+                   "tracks are tagged a language they demonstrably are not.")),
+        dict(id="c_burn", col=0, row=2, label="Subtitles in the picture",
+             count=ck_burn, kind="warn" if ck_burn else "stage",
+             note=(f"{ck_burn_seen:,} files that report NO subtitle track have "
+                   "been sampled for words burned into the frame - bright "
+                   "pixels counted first, then the best few shown to the OCR. "
+                   f"{ck_marked:,} carry a blank marker track, which exists so "
+                   "Plex and Bazarr stop fetching subtitles for a file that "
+                   "already has them painted on.")),
+        dict(id="c_side", col=0, row=3, label="Sidecars sitting outside",
+             count=sidecars, kind="stage",
+             note=("subtitle files sitting next to the video rather than "
+                   "inside it. One arr rename away from being orphaned, they "
+                   "beat the embedded track in Plex's picker, and an external "
+                   "ASS forces the whole video to be re-encoded to carry it. "
+                   "Off unless a library turns it on. Counted only when the "
+                   "folder walk has already run - this diagram will not start "
+                   "one.")),
+        dict(id="c_rule", col=0, row=4, label="Rule check",
+             count=ck_rule, kind="warn" if ck_rule else "stage",
+             note=("a sample of committed files re-examined against the rules "
+                   "as they are TODAY. This is the check that inspects files "
+                   "nuarr has; the one below finds files it does not.")),
+        dict(id="c_gap", col=0, row=5, label="Missing from the arrs",
+             count=ck_gap, kind="warn" if ck_gap else "stage",
+             note=("files Sonarr and Radarr track that nuarr has never taken "
+                   "in - not walked yet, written off, or rejected and waiting "
+                   "for a replacement. The opposite question to every other "
+                   "box on this page, which is why it is not folded into the "
+                   "rule check.")),
+
+        dict(id="c_found", col=1, row=2, label="Something to put right",
+             count=found_now, kind="gate",
+             note=("every check hands its findings to one remedy layer. Before "
+                   "it existed each check had its own answer and its own "
+                   "polite cap of three an hour - seven checks, twenty-one "
+                   "deletions an hour, and no cap ever exceeded. One table now "
+                   "decides what may be done to each kind of finding, and one "
+                   "budget is shared across all of them.")),
+
+        dict(id="c_req", col=2, row=1, label="Plan it again",
+             count=n_req, kind="pool", pool="passthrough",
+             note=(f"the file is put back through the rules and queued if "
+                   f"there is work. Reversible, cheap, and the default. "
+                   f"{acted_h.get('requeue', 0)} in the last hour, of "
+                   f"{REQ_CAP} allowed automatically.")),
+        dict(id="c_fix", col=2, row=2, label="Fix in place",
+             count=n_fix, kind="pool", pool="subocr",
+             note=("where the record is what is wrong rather than the file - "
+                   "indexing something the arr already tracks, rewriting a "
+                   "track title, re-reading a stale Plex analysis. Nothing is "
+                   "re-encoded.")),
+        dict(id="c_ask", col=2, row=3, label="Ask again",
+             count=n_ask, kind="stage",
+             note=("for a release already blocklisted and still not replaced: "
+                   "one more indexer search. Nothing is deleted, because the "
+                   "deleting was done the first time. Six hours between asks "
+                   "about the same file.")),
+        dict(id="c_rep", col=2, row=4, label="Blocklist and replace",
+             count=n_rep, kind="bad",
+             note=(f"the file is deleted, the release blocklisted, and the arr "
+                   f"searches again - in that order, because the arr scores "
+                   f"candidates against whatever is still on disk. The only "
+                   f"irreversible verb, and the policy table refuses it for "
+                   f"any finding a rebuild could fix. "
+                   f"{acted_h.get('replace', 0)} in the last hour, of "
+                   f"{REP_CAP} allowed automatically.")),
+    ]
+    ck_edges = [
+        dict(a="c_dec", b="c_found", label="will not decode", n=ck_decode,
+             muted=not ck_decode),
+        dict(a="c_lang", b="c_found", label="tag is a lie", n=ck_lie,
+             muted=not ck_lie),
+        dict(a="c_burn", b="c_found", label="words in the frame", n=ck_burn,
+             muted=not ck_burn),
+        dict(a="c_side", b="c_found", label="take it inside",
+             n=sidecars or 0, muted=not sidecars),
+        dict(a="c_rule", b="c_found", label="breaks a rule today", n=ck_rule,
+             muted=not ck_rule),
+        dict(a="c_gap", b="c_found", label="never taken in", n=ck_gap,
+             muted=not ck_gap),
+        dict(a="c_found", b="c_req", label="a rebuild would fix it", n=n_req),
+        dict(a="c_found", b="c_fix", label="the record is wrong", n=n_fix),
+        dict(a="c_found", b="c_ask", label="already blocklisted", n=n_ask),
+        dict(a="c_found", b="c_rep", label="only another release can",
+             n=n_rep),
+    ]
+
     return {"cols": _COLS, "nodes": nodes, "edges": edges,
             "sub": {"nodes": sub_nodes, "edges": sub_edges},
+            "checks": {"nodes": ck_nodes, "edges": ck_edges},
             "engine": eng, "libraries": libs, "at": time.time()}
 
 

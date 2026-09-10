@@ -27504,6 +27504,10 @@ function pipeWidth(g){
 function pipeNodeColor(n){
   if(n.kind==='pool')  return poolColor(n.pool||'');
   if(n.kind==='bad')   return 'var(--bad)';
+  // A check holding findings is amber whatever it is called; a check holding
+  // none is green. Same box, and the colour is the count rather than a
+  // property of the check - which is the point, since all six go quiet.
+  if(n.kind==='warn')  return 'var(--warn)';
   if(n.kind==='gate')  return 'var(--warn)';
   if(n.kind==='idle')  return 'var(--dim)';
   if(n.kind==='source')return '#6fb0ff';
@@ -27634,11 +27638,23 @@ function pipeDraw(){
          main one directly above it - and the two reading as one picture is
          most of why they are on the same page. -->
     <div style="overflow-x:auto;display:flex;justify-content:center">
-      <div style="width:${pipeWidth(_pipe)}px;max-width:100%;flex:0 0 auto">
+      <div style="width:${Math.max(pipeWidth(_pipe),
+                    _pipe.checks?pipeWidth(_pipe.checks):0)}px;max-width:100%;flex:0 0 auto">
         ${pipeSvg(_pipe, r?r.path:null, 'a')}
         <div class="lkindhead" style="margin:14px 0 6px"><b style="color:#6fb0ff">
           Picture subtitles — the branch with a measurement behind it</b></div>
         ${pipeSvg(_pipe.sub, r?r.sub_path:null, 'b')}
+        ${_pipe.checks?`
+        <div class="lkindhead" style="margin:18px 0 2px"><b style="color:#6fb0ff">
+          After it lands — the checks that keep looking</b></div>
+        <div class="dim" style="font-size:11.5px;margin:0 0 8px;max-width:760px">
+          These do not run on the way past. They run on their own clocks over
+          files that were committed weeks ago, because a file can stop being
+          what it claims to be long after nuarr last touched it. What they have
+          in common is where they end: one remedy layer, one policy table
+          deciding what may be done about each kind of finding, and one hourly
+          budget shared between all of them.</div>
+        ${pipeSvg(_pipe.checks, null, 'c')}`:''}
       </div>
     </div>`;
 }
