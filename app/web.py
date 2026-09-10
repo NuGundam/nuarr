@@ -30138,6 +30138,41 @@ function skActWord(r, n){
   if(trs) bits.push(`rewrite ${fmt(trs)} track title${trs===1?'':'s'}`);
   return bits.join(' and ');
 }
+// THE ROW LEAVING, AS ONE THING. Fade the row green (or red) with the word
+// for what it became where its buttons were, then collapse it so the list
+// closes over the gap, then reload - by which time the answer is off the
+// server's list too and the reload has nothing to undo.
+function skGoneMany(ids, word, ok=true){
+  const el=document.getElementById('skPanel'); if(!el) return;
+  const rows=[...el.querySelectorAll('.sktbl tbody tr')]
+    .filter(tr=>ids.some(id=>(tr.innerHTML||'').includes(`'${id}'`)));
+  rows.forEach((tr,i)=>setTimeout(()=>{
+    const cell=tr.lastElementChild;
+    if(cell) cell.innerHTML=`<span class="skword">${esc(word)}</span>`;
+    tr.classList.add('skgone'); if(!ok) tr.classList.add('skfail');
+    setTimeout(()=>tr.classList.add('skshut'), 700);
+    setTimeout(()=>{ if(tr.parentNode) tr.parentNode.removeChild(tr); }, 1000);
+  }, i*35));
+  setTimeout(()=>{ _skKey=''; loadSubKind(); }, 1100 + rows.length*35);
+}
+
+function skGone(el, word, ok=true){
+  const tr = el && el.closest ? el.closest('tr') : null;
+  if(!tr){ setTimeout(()=>{ _skKey=''; loadSubKind(); }, 900); return; }
+  const id = tr.nextElementSibling &&
+             String(tr.nextElementSibling.id||'').startsWith('skdet-')
+             ? tr.nextElementSibling : null;
+  const cell = tr.lastElementChild;
+  if(cell) cell.innerHTML = `<span class="skword">${esc(word)}</span>`;
+  [tr, id].forEach(x=>{ if(x){ x.classList.add('skgone'); if(!ok) x.classList.add('skfail'); } });
+  setTimeout(()=>{ [tr, id].forEach(x=>{ if(x) x.classList.add('skshut'); }); }, 800);
+  setTimeout(()=>{
+    [tr, id].forEach(x=>{ if(x && x.parentNode) x.parentNode.removeChild(x); });
+    // The row is gone from the page; catch the page up with the server.
+    _skKey=''; loadSubKind();
+  }, 1120);
+}
+
 async function skAct(id, btn){
   const r=((_sk&&_sk.rows)||[]).find(x=>x.id===id); if(!r) return;
   const [fid, src]=skSplit(id);
@@ -30152,7 +30187,8 @@ async function skAct(id, btn){
     async ()=>{
       const x=await (await fetch(`/api/subkind/act?confirm=yes&file_id=${fid}&source=${
         encodeURIComponent(src)}`,{method:'POST'})).json();
-      setTimeout(()=>{ _skKey=''; loadSubKind(); }, 1500);
+      if(x.ok) skGone(btn, pic?'marked':'title corrected');
+      else setTimeout(()=>{ _skKey=''; loadSubKind(); }, 1500);
       return x.ok ? {ok:true, why: pic?'marked':(x.why||'corrected')} : x;
     });
 }
@@ -30165,8 +30201,11 @@ async function skDismiss(id, btn){
   try{ x=await (await fetch(`/api/subkind/dismiss?file_id=${fid}&source=${
       encodeURIComponent(src)}`,{method:'POST'})).json(); }
   catch(e){ x={ok:false, why:String(e)}; }
-  if(btn){ btn.textContent=x.ok?'dismissed':'failed'; if(x.why) btn.title=x.why; }
-  setTimeout(()=>{ _skKey=''; loadSubKind(); }, 1200);
+  if(x.ok) skGone(btn, src==='picture'?'not a subtitle':'recorded as signs');
+  else {
+    if(btn) btn.textContent='failed';
+    setTimeout(()=>{ _skKey=''; loadSubKind(); }, 1200);
+  }
 }
 async function skActMany(btn){
   const ids=skSelIds(); if(!ids.length) return;
@@ -30183,8 +30222,10 @@ async function skActMany(btn){
         +encodeURIComponent(ids.join(','))
         +(_skBatchKind?'&kind='+encodeURIComponent(_skBatchKind):''),
         {method:'POST'})).json();
+      if(x.ok) skGoneMany(ids, 'queued');
+      else setTimeout(()=>{ _skKey=''; loadSubKind(); }, 1300);
       _skSel.clear(); _skLast=null;
-      if(x.ok) skMarkWatch(); else setTimeout(()=>{ _skKey=''; loadSubKind(); }, 1300);
+      if(x.ok) skMarkWatch();
       return x;
     });
 }
@@ -30195,9 +30236,10 @@ async function skDismissMany(btn){
   try{ x=await (await fetch('/api/subkind/dismiss/batch?ids='
       +encodeURIComponent(ids.join(',')),{method:'POST'})).json(); }
   catch(e){ x={ok:false, why:String(e)}; }
+  if(x.ok) skGoneMany(ids, 'not dialogue');
+  else setTimeout(()=>{ _skKey=''; loadSubKind(); }, 1400);
   _skSel.clear(); _skLast=null;
   if(btn) btn.textContent=x.why||(x.ok?'dismissed':'failed');
-  setTimeout(()=>{ _skKey=''; loadSubKind(); }, 1400);
 }
 function skMarkWatch(){
   clearTimeout(_skMarkPoll);
@@ -34405,6 +34447,24 @@ html.mobile .setwrap:not(.rail) .setmain,html.mobile .setwrap:not(.rail) #worker
   text-overflow:ellipsis;vertical-align:middle}
 .sktbl th{padding-top:4px;padding-bottom:4px;font-weight:normal}
 .sktbl .l{text-align:left}.sktbl .c{text-align:center}.sktbl .r{text-align:right}
+/* AN ANSWERED ROW LEAVES. Not on the next poll, when the row you pressed has
+   already been replaced by a repaint and something else has slid into its
+   place - now, on the press, so the thing that goes is visibly the thing you
+   answered. It says what it became on the way out. */
+.sktbl tr.skgone > td{
+  background:rgba(63,185,80,.10);
+  transition:opacity .28s ease .5s, background .2s ease;
+  opacity:0}
+.sktbl tr.skgone.skfail > td{background:rgba(248,81,73,.10)}
+.sktbl tr.skgone .skword{
+  color:var(--ok);font-size:10.5px;white-space:nowrap}
+.sktbl tr.skgone.skfail .skword{color:var(--bad)}
+/* Then the row itself collapses, which is what closes the gap it left. */
+.sktbl tr.skshut{transition:opacity .2s ease}
+.sktbl tr.skshut > td{
+  padding-top:0 !important;padding-bottom:0 !important;
+  line-height:0;font-size:0;border:0;
+  transition:padding .22s ease, line-height .22s ease}
 .sktbl thead tr.sksort th[onclick]{cursor:pointer;user-select:none}
 .sktbl thead tr.sksort th[onclick]:hover{color:var(--fg)}
 .sktbl th.l:first-child,.sktbl td.l:first-child{padding-left:4px;padding-right:0}
