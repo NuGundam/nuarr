@@ -30324,9 +30324,14 @@ function skPaint(force){
   ${d.mode==='auto'?`<div style="font-size:11px;margin:2px 0 4px;display:flex;
        gap:12px;flex-wrap:wrap;align-items:center">
     <span style="color:var(--ok)">auto</span>
-    ${A.at?`<span class="dim" title="What the last pass through the standing list did">last pass ${
-       ago(A.at)} · ${fmt(A.marked||0)} marked${A.dropped?`, ${fmt(A.dropped)} dropped`:''}</span>`
-      :'<span class="dim">has not acted yet</span>'}
+    ${A.at?`<span class="dim" title="When auto last went through the standing list, and what it did with it">last run ${
+       ago(A.at)}${(A.marked||A.dropped)
+         ? ` · ${fmt(A.marked||0)} marked${A.dropped?`, ${fmt(A.dropped)} dropped`:''}`
+         : ' · nothing to do'}</span>`
+      :'<span class="dim" title="Auto acts at the head of every pass. It has not reached one since nuarr started.">has not run yet</span>'}
+    ${A.next_run?`<span class="dim" title="Auto acts at the head of every pass, so this is the pass\'s own clock - it runs every ${
+       hsDur(A.cycle_s||300)}.">next run ${(A.next_run-(Date.now()/1000))<=0
+         ? 'due now' : 'in '+hsDur(A.next_run-(Date.now()/1000))}</span>`:''}
     ${A.queued?`<span title="Findings already past the ${d.mark_at}% line waiting for a later pass. ${
        A.per_pass} are taken each pass because every mark rewrites a container."><b>${
        fmt(A.queued)}</b> still to mark${A.eta?` · <b style="color:var(--acc)">${

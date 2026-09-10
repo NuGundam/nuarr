@@ -53,7 +53,7 @@ STATE: dict = {"running": False, "phase": "", "t0": 0.0, "last_run": 0.0,
                # cap, and therefore how many passes - how long - until it has
                # worked through the standing list.
                "auto_marked": 0, "auto_dropped": 0, "auto_queued": 0,
-               "auto_at": 0.0}
+               "auto_at": 0.0, "auto_runs": 0}
 
 
 # ------------------------------------------------------------ the settings --
@@ -70,6 +70,25 @@ def mark_at() -> int:
 def dismiss_at() -> int:
     from . import hardsub
     return hardsub.dismiss_at()
+
+
+def _next_run() -> float:
+    """When this pass runs again. The scheduler's answer where it has one -
+    it knows about the first run after boot, which last_run + cycle cannot."""
+    try:
+        from . import schedules
+        for r in (schedules.snapshot() or {}).get("rows", []):
+            if r.get("key") == SCHED_KEY and r.get("next_run"):
+                return float(r["next_run"])
+    except Exception:                                            # noqa: BLE001
+        pass
+    lr = STATE.get("last_run") or 0.0
+    if lr:
+        return lr + CYCLE_S
+    # BEFORE THE FIRST PASS the scheduler has nothing to report, because
+    # next_run is derived from a last_run that has not happened. The loop
+    # knows when it will wake, so it says so.
+    return float(STATE.get("due_at") or 0.0)
 
 
 def _auto_of(score: int) -> tuple[str, str]:
@@ -208,14 +227,17 @@ def findings(limit: int = 600) -> dict:
             "queued": STATE.get("auto_queued") or 0,
             "at": STATE.get("auto_at") or 0.0,
             "per_pass": AUTO_MARKS_PER_PASS,
+            "runs": STATE.get("auto_runs") or 0,
+            # AUTO RUNS AT THE HEAD OF EVERY PASS, so the pass's clock is
+            # auto's clock - one schedule, one next time, no second answer.
+            "next_run": _next_run(),
+            "cycle_s": CYCLE_S,
             # HOW LONG UNTIL AUTO IS DONE with what it can already see: the
             # queue over the per-pass cap, at the cadence the pass runs on.
             "eta": (((STATE.get("auto_queued") or 0) / AUTO_MARKS_PER_PASS)
                     * CYCLE_S) if STATE.get("auto_queued") else 0.0,
         },
-        "state": {**STATE, "cycle_s": CYCLE_S,
-                  "next_run": (STATE["last_run"] + CYCLE_S)
-                              if STATE.get("last_run") else 0.0},
+        "state": {**STATE, "cycle_s": CYCLE_S, "next_run": _next_run()},
         "kinds": [{"id": k, "word": hardsub.KIND_WORDS[k]}
                   for k in hardsub.KINDS],
     }
@@ -341,7 +363,7 @@ async def _auto_backlog() -> dict:
     dismiss line is thrown away the way the sweep would have.
     """
     from . import hardsub
-    out = {"marked": 0, "dropped": 0}
+    out = {"marked": 0, "dropped": 0, "queued": 0}
     if mode() != "auto":
         return out
     rows = await asyncio.to_thread(hardsub.found, 1000)
@@ -356,8 +378,12 @@ async def _auto_backlog() -> dict:
         m = await hardsub.mark_many(to_mark[:AUTO_MARKS_PER_PASS])
         out["marked"] = int(m.get("started") or 0)
     out["queued"] = max(0, len(to_mark) - out["marked"])
+    # EVERY PASS, NOT ONLY THE ONES THAT DID SOMETHING. "has not acted yet"
+    # and "ran a minute ago and found nothing to do" are different answers,
+    # and only one of them means auto is working.
     STATE.update(auto_marked=out["marked"], auto_dropped=out["dropped"],
-                 auto_queued=out["queued"], auto_at=time.time())
+                 auto_queued=out["queued"], auto_at=time.time(),
+                 auto_runs=(STATE.get("auto_runs") or 0) + 1)
     if out["marked"] or out["dropped"]:
         joblog.log(f"subtitle kinds: on its own, marking {out['marked']} "
                    f"file(s) past the {mark_at()}% line and dropping "
@@ -421,6 +447,7 @@ async def watch() -> None:
                   f"Both yield to the job gate before every file."))
     except Exception:                                            # noqa: BLE001
         pass
+    STATE["due_at"] = time.time() + 240.0
     await asyncio.sleep(240)
     while True:
         try:
