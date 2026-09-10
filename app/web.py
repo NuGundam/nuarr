@@ -29383,9 +29383,14 @@ function renderAlang(){
       </div>`;
       h+=`<div class="rowbox scrollbox"><table class="sktbl"
           style="width:100%;font-size:11.5px;table-layout:fixed">
+          <!-- WIDE ENOUGH FOR THE LONGEST THING EACH COLUMN HOLDS. "Norwegian
+               Bokmal" is a language name, not an outlier, and 96px cut it to
+               "Norwegian B..." - a cell that hides the answer it exists to
+               give. Every column is sized to its content and clips with an
+               ellipsis and a tooltip rather than silently. -->
           <colgroup><col style="width:24px"><col style="width:auto">
-            <col style="width:104px"><col style="width:64px"><col style="width:96px">
-            <col style="width:150px"><col style="width:58px"><col style="width:118px"></colgroup>
+            <col style="width:112px"><col style="width:62px"><col style="width:132px">
+            <col style="width:158px"><col style="width:54px"><col style="width:104px"></colgroup>
           <thead><tr class="dim" style="font-size:10.5px">
           <th class="l"><input type="checkbox" ${allOn?'checked':''}
               title="Select every row that can be corrected" onclick="alSelAll(this.checked)"></th>
@@ -29404,9 +29409,10 @@ function renderAlang(){
           <td class="l" title="${esc(r.path||'')}">${esc((r.title||(r.path||'').split('\\').pop()))}
             <div class="dim" style="font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
               >${esc((r.path||'').split('\\').pop())}</div></td>
-          <td class="c dim">${esc(r.library||'')}</td>
+          <td class="c dim" title="${esc(r.library||'')}">${esc(r.library||'')}</td>
           <td class="c mono dim">a:${r.track}${r.n_audio>1?'/'+r.n_audio:''}</td>
-          <td class="c mono" style="color:#e2b341">${esc(r.says_name||'')}</td>
+          <td class="c mono" style="color:#e2b341" title="${esc(
+            (r.says_name||'')+' — what the file\'s tag claims')}">${esc(r.says_name||'')}</td>
           <td class="c">
             <!-- THE LISTENER'S ANSWER, AND A WAY TO SAY IT IS WRONG. It hears
                  the language, not the dialect or the variant, and a Catalan
