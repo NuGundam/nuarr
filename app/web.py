@@ -789,6 +789,10 @@ async def _startup() -> None:
     # Once a day: does every audio title still describe the stream under it?
     from . import audiotitle as _audiotitle
     asyncio.create_task(_audiotitle.watch())
+    # Its subtitle twin: a query to find candidates, then a bounded, gated
+    # read of the ones that look wrong - see subtitletitle.watch().
+    from . import subtitletitle as _subtitletitle
+    asyncio.create_task(_subtitletitle.watch())
     # Asks the arrs what they manage and compares it to what nuarr has indexed.
     # Two list calls every six hours - no disk walk - so it is cheap enough to
     # run on any machine, attached pool or share.
@@ -6832,8 +6836,14 @@ async def api_subtitletitle_fix(file_id: int = 0, ids: str = "",
 async def api_subtitletitle_inspect(limit: int = 0):
     """Read the actual events of candidates nobody has read yet."""
     from . import subtitletitle as stt
-    return await asyncio.to_thread(
-        stt.inspect_some, int(limit or stt.INSPECT_PER_SCAN))
+    # Started, not awaited: the read yields to the gate and runs for minutes,
+    # and the panel's own bar reports on it. Holding the request open would
+    # only give the browser something to time out on.
+    if stt.INSPECT_STATE.get("running"):
+        return {"ok": False, "why": "already reading"}
+    asyncio.get_running_loop().create_task(
+        stt.inspect_paced(int(limit or stt.PER_RUN), force=True))
+    return {"ok": True, "started": True}
 
 
 @app.post("/api/subtitletitle/mode")
@@ -29881,7 +29891,7 @@ function alpPaint(){
 // when rewritable meant "found wrong"; with nothing actionable until it has
 // been read, that filter left the panel saying "nothing here" over 124 rows
 // waiting for exactly the read the panel offers.
-let _stt=null, _sttKey='', _sttAll=true;
+let _stt=null, _sttKey='', _sttAll=true, _sttPoll=null;
 // THE SAME SELECTION THE OTHER PANEL HAS, for the same reason: these arrive by
 // show. Seven episodes of That Time I Got Reincarnated as a Slime, all
 // "Signs & Songs", all around nine cues a minute - one release group's habit,
@@ -29941,13 +29951,11 @@ async function sttMode(m){
   _sttKey=''; loadSubTitle();
 }
 async function sttInspect(btn){
-  if(btn){ btn.disabled=true; btn.textContent='reading them…'; }
-  let r={};
-  try{ r=await (await fetch('/api/subtitletitle/inspect',
-                            {method:'POST'})).json(); }catch(e){}
-  if(btn) btn.textContent = r.ok
-    ? `read ${r.read}, cleared ${r.cleared}` : 'failed';
-  setTimeout(()=>{ _stt=null; _sttKey=''; loadSubTitle(); }, 1400);
+  if(btn){ btn.disabled=true; btn.textContent='reading…'; }
+  // Fire and poll. The read yields to the gate and runs for minutes; the
+  // bar above the table is what reports on it, not this button.
+  fetch('/api/subtitletitle/inspect',{method:'POST'}).catch(()=>{});
+  setTimeout(()=>{ _sttKey=''; loadSubTitle(); }, 800);
 }
 async function sttRefresh(btn){
   if(btn){ btn.disabled=true; btn.textContent='reading…'; }
@@ -30109,11 +30117,63 @@ function sttPaint(){
       >${_sttAll?`only the ${fmt(d.fixable)} read and still wrong`
                 :`also show the ${fmt(d.total-d.fixable)} unread or left alone`}</a>`:''}
   </div>`;
-  const html=`<div class="lkind" style="padding:11px 12px">${head}${note}${band}${table}${foot}</div>`;
+  // ---- the read pass, measured - the same block the hardsub panel draws --
+  // PROOF OF LIFE IS NOT PROGRESS. A spinner and a filename say the read is
+  // alive; they do not say how fast, how much is left, or when it ends, and
+  // with 124 candidates each costing a demux those are the only questions
+  // worth answering. Everything here is measured from the pass in flight, and
+  // nothing is shown before there is a measurement to show.
+  const p=d.progress||{};
+  const pct = p.total ? Math.min(100,(p.done/p.total)*100) : 0;
+  const prog = p.running ? `
+    <div class="hsbar"><i style="width:${pct.toFixed(1)}%"></i></div>
+    <div style="display:flex;gap:10px;align-items:baseline;font-size:11px;
+                margin:3px 0 6px;flex-wrap:wrap">
+      <span class="busy" style="color:var(--acc)"><span class="sp"></span></span>
+      <b style="flex:none">${fmt(p.done||0)} of ${fmt(p.total||0)}</b>
+      <span class="dim" style="flex:1 1 auto;min-width:0;overflow:hidden;
+            text-overflow:ellipsis;white-space:nowrap"
+            title="${esc(p.now||'')}">${esc(p.now||'')}</span>
+      <span style="flex:none;margin-left:auto;display:flex;gap:10px">
+        ${p.elapsed?`<span class="dim" title="How long this pass has been running">${
+          hsDur(p.elapsed)} in</span>`:''}
+        ${p.rate?`<span class="dim" title="Files read per second, this pass">${
+          (1/p.rate).toFixed(1)}s each</span>`:''}
+        ${p.eta?`<b title="Time left in this pass at the pace it is going">${
+          hsDur(p.eta)} left</b>`:''}
+        ${p.cleared?`<span style="color:var(--ok)">${fmt(p.cleared)} cleared</span>`:''}
+      </span>
+    </div>` : '';
+  const hist = `<div class="dim" style="font-size:11px;margin:4px 0 2px;
+      display:flex;gap:12px;flex-wrap:wrap">
+    ${p.last_run?`<span title="When the last read finished, what it got through, and how long it took">
+       last read ${ago(p.last_run)} · ${fmt(p.last_read||0)} read${
+       p.last_cleared?`, <span style="color:var(--ok)">${fmt(p.last_cleared)} cleared</span>`:''}${
+       p.last_took?` · took ${hsDur(p.last_took)}`:''}</span>`
+      :'<span>has not read any yet</span>'}
+    ${(!p.running&&p.next_run)?`<span title="This reads every ${
+       hsDur(p.cycle_s)}, ${p.per_run} files a pass">next in ${
+       hsDur(Math.max(0,p.next_run-(Date.now()/1000)))}</span>`:''}
+    ${p.runs?`<span title="Completed passes since nuarr started">${fmt(p.runs)} pass${
+       p.runs===1?'':'es'}</span>`:''}
+    ${p.secs_each?`<span title="Average seconds per file, smoothed across passes - what the estimate below is built on">${
+       p.secs_each.toFixed(1)}s a file</span>`:''}
+    ${p.yielded?`<span style="color:var(--warn)" title="This read checks the job gate before every file and stops the moment the pool is busy or somebody is watching Plex. It picks up where it left off next pass.">${
+       esc(p.yielded)}</span>`:''}
+    ${(p.unread&&p.backlog_eta)?`<span title="How long until every candidate has been read, at this pace and this cadence.">
+       <b>${hsDur(p.backlog_eta)}</b> to read the rest</span>`:''}
+    ${p.last_error?`<span class="err">${esc(p.last_error)}</span>`:''}
+  </div>`;
+  const html=`<div class="lkind" style="padding:11px 12px">${head}${note}${band}${prog}${hist}${table}${foot}</div>`;
   if(askOpen('sttPanel') || panelBusy('sttPanel')
      || panelScrolled('sttPanel')) return;
   if(html===_sttKey) return;
   _sttKey=html; el.innerHTML=html;
+  // WHILE IT READS, KEEP ASKING. A progress bar that only moves when somebody
+  // reloads the page is a screenshot.
+  clearTimeout(_sttPoll);
+  if(p.running) _sttPoll=setTimeout(()=>{
+    if(document.getElementById('sttPanel')) loadSubTitle(); }, 1500);
 }
 
 // ---- subtitles already painted into the picture -------------------------
@@ -33737,7 +33797,7 @@ tr.askedrow > td{background:rgba(210,153,34,.06);
    clock read left-to-right even in a column that does not. */
 .alfix{min-width:196px;text-align:left;display:inline-block}
 .alfix .busy{color:var(--acc)}
-.askhost{display:inline-block}
+span.askhost{display:inline-block}
 .hsbar{height:4px;border-radius:3px;background:#161a20;overflow:hidden;
   margin:6px 0 0}
 .hsbar i{display:block;height:100%;border-radius:3px;background:var(--acc);

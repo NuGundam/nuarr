@@ -449,8 +449,122 @@ def _shapes_for(file_ids) -> dict:
     return out
 
 
+# THE READ IS THE JOB. The scan is a query and finishes before anyone notices;
+# the read is a demux per candidate and is the part that takes time, yields to
+# the gate, and needs a clock, a cadence and an estimate like every other
+# sweep on this page. So this is what gets registered with the scheduler.
+SCHED_KEY = "subtitletitle"
+CYCLE_S = 1800.0          # every half hour, a bounded handful of reads
+PER_RUN = 40
 INSPECT_STATE: dict = {"running": False, "done": 0, "total": 0, "now": "",
-                       "t0": 0.0, "cleared": 0, "last_run": 0.0}
+                       "t0": 0.0, "cleared": 0, "last_run": 0.0,
+                       "runs": 0, "secs_each": 0.0, "last_took": 0.0,
+                       "last_read": 0, "last_cleared": 0, "yielded": "",
+                       "last_error": ""}
+
+
+async def _too_busy() -> bool:
+    """The gate's opinion, not a second one. See audit._too_busy."""
+    try:
+        from .audit import _too_busy as busy
+        return bool(await busy())
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+async def watch() -> None:
+    """Re-scan and read a handful, on a schedule, yielding to the gate."""
+    import asyncio
+    try:
+        from . import schedules
+        schedules.register(
+            SCHED_KEY, "Subtitle titles", "Subtitles", CYCLE_S,
+            what=(f"Compares each subtitle title against the cue count in "
+                  f"its stored probe, then reads the actual events of "
+                  f"anything that looks wrong - {PER_RUN} a pass - because "
+                  f"the count alone cannot tell karaoke from dialogue."))
+    except Exception:                                            # noqa: BLE001
+        pass
+    await asyncio.sleep(300)
+    while True:
+        try:
+            await asyncio.to_thread(refresh)
+            await inspect_paced(PER_RUN)
+        except Exception as e:                                   # noqa: BLE001
+            INSPECT_STATE["last_error"] = f"{type(e).__name__}: {e}"
+        await asyncio.sleep(CYCLE_S)
+
+
+async def inspect_paced(limit: int = PER_RUN, force: bool = False) -> dict:
+    """inspect_some(), one file at a time, asking the gate before each.
+
+    THE GATE DECIDES, BEFORE EVERY FILE - not once at the start. A pass of
+    forty reads runs for minutes, and somebody pressing play in minute one
+    should not wait out the other thirty-nine. `force` is the button: a person
+    who pressed it has already decided the disks can spare it.
+    """
+    import asyncio
+    if INSPECT_STATE["running"]:
+        return {"ok": False, "why": "already reading"}
+    d = _CACHE.get("data") or {}
+    rows = [r for r in (d.get("rows") or []) if r.get("unread")
+            and r.get("mkv_id")][:max(1, int(limit))]
+    if not rows:
+        INSPECT_STATE["last_run"] = time.time()
+        _beat("every candidate has been read")
+        return {"ok": True, "read": 0, "cleared": 0}
+    t0 = time.time()
+    INSPECT_STATE.update(running=True, done=0, total=len(rows), now="",
+                         t0=t0, cleared=0, yielded="")
+    cleared = read = 0
+    try:
+        for r in rows:
+            if not force and await _too_busy():
+                INSPECT_STATE["yielded"] = ("stopped early - the pool is busy "
+                                            "or somebody is watching")
+                break
+            INSPECT_STATE.update(done=read,
+                                 now=os.path.basename(r.get("path") or ""))
+            try:
+                sh = await asyncio.to_thread(
+                    shape_of, r["file_id"], r["path"], r["track"],
+                    int(r.get("size") or 0), r["mkv_id"])
+            except Exception:                                    # noqa: BLE001
+                read += 1
+                continue
+            read += 1
+            if _is_really_signs(sh):
+                cleared += 1
+                INSPECT_STATE["cleared"] = cleared
+    finally:
+        took = max(0.001, time.time() - t0)
+        prev = INSPECT_STATE.get("secs_each") or 0.0
+        this = took / max(1, read)
+        INSPECT_STATE.update(
+            running=False, now="", done=read, last_run=time.time(),
+            t0=0.0, last_took=took, last_read=read, last_cleared=cleared,
+            runs=INSPECT_STATE.get("runs", 0) + 1,
+            # Smoothed across passes, like every other sweep: one pass of
+            # forty is a small sample and a single remux on a sleeping disk
+            # skews it.
+            secs_each=(this if not prev else prev * 0.7 + this * 0.3))
+        _CACHE["at"] = 0.0
+        _beat(f"{read} read, {cleared} cleared" if read
+              else "nothing left to read")
+    if cleared:
+        joblog.log(f"subtitle titles: read {read} flagged track(s) and "
+                   f"cleared {cleared} - signs, karaoke or typesetting rather "
+                   f"than mislabelled dialogue", "info")
+    return {"ok": True, "read": read, "cleared": cleared,
+            "yielded": INSPECT_STATE.get("yielded") or ""}
+
+
+def _beat(result: str) -> None:
+    try:
+        from . import schedules
+        schedules.beat(SCHED_KEY, result)
+    except Exception:                                            # noqa: BLE001
+        pass
 
 
 def inspect_some(limit: int = INSPECT_PER_SCAN) -> dict:
@@ -727,6 +841,39 @@ def attention() -> dict | None:
 
 
 def progress() -> dict:
-    d = dict(_CACHE)
-    d.pop("data", None)
-    return d
+    """The read pass, measured. Same fields the hardsub panel draws from."""
+    st = INSPECT_STATE
+    now = time.time()
+    el = (now - st["t0"]) if (st["running"] and st["t0"]) else 0.0
+    rate = (st["done"] / el) if (el > 0.5 and st["done"]) else 0.0
+    eta = ((st["total"] - st["done"]) / rate) if rate else 0.0
+    each = st.get("secs_each") or 0.0
+    d = _CACHE.get("data") or {}
+    unread = int(d.get("unread") or 0)
+    out = {"running": st["running"], "now": st["now"], "done": st["done"],
+           "total": st["total"], "elapsed": round(el, 1),
+           "rate": round(rate, 3), "eta": round(eta),
+           "secs_each": round(each, 2), "cleared": st.get("cleared") or 0,
+           "last_run": st.get("last_run") or 0.0,
+           "last_took": round(st.get("last_took") or 0, 1),
+           "last_read": st.get("last_read") or 0,
+           "last_cleared": st.get("last_cleared") or 0,
+           "runs": st.get("runs") or 0, "yielded": st.get("yielded") or "",
+           "last_error": st.get("last_error") or "",
+           "per_run": PER_RUN, "cycle_s": CYCLE_S, "unread": unread,
+           # How long until every candidate has been read, at the pace the
+           # last passes really achieved and the cadence they really run on.
+           "backlog_eta": round(max((unread / max(1, PER_RUN)) * CYCLE_S,
+                                    unread * each if each else 0))
+                          if unread else 0,
+           "next_run": 0.0}
+    try:
+        from . import schedules
+        for r in (schedules.snapshot() or {}).get("rows", []):
+            if r.get("key") == SCHED_KEY:
+                out["next_run"] = r.get("next_run") or 0.0
+                out["runs"] = r.get("runs") or out["runs"]
+                break
+    except Exception:                                            # noqa: BLE001
+        pass
+    return out
