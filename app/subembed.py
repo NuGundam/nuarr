@@ -726,8 +726,11 @@ def embed_one(file_id: int) -> dict:
     if not have_mkvmerge():
         return {"ok": False, "why": "mkvmerge is not installed - see "
                                     "Settings, MKVToolNix"}
-    tmp = os.path.join(os.path.dirname(path),
-                       f".nuarr-embed-{int(time.time())}.mkv")
+    # ON THE CACHE, NOT BESIDE THE SOURCE. See fileops.cache_temp.
+    ok_room, why_room = fileops.cache_room(_size(path))
+    if not ok_room:
+        return {"ok": False, "why": why_room}
+    tmp = fileops.cache_temp(".mkv", "embed")
     cmd = [_mkvmerge(), "-o", tmp]
     # WHAT THE SIDECAR REPLACES, NAMED IN MKVMERGE'S OWN NUMBERS. The plan
     # counted subtitle tracks in order; mkvmerge numbers every track in the

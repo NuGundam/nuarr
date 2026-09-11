@@ -751,6 +751,21 @@ async def _startup() -> None:
         from . import changewatch
         changewatch.RESCAN = _run_scan
         asyncio.create_task(changewatch.watch())
+        # LEFTOVER WORKING FILES, SWEPT ONCE A DAY. Nothing ever did, and the
+        # first time anybody looked there were 26 of them holding 133 GB, the
+        # oldest from the 8th of August - the residue of commits interrupted
+        # by a restart. Only files older than six hours, and a backup or a
+        # staged copy only once the file it was made from is back.
+        async def _sweep_strays_daily():
+            from . import fileops as _fo
+            await asyncio.sleep(600)
+            while True:
+                try:
+                    await asyncio.to_thread(_fo.sweep_strays)
+                except Exception:                            # noqa: BLE001
+                    pass
+                await asyncio.sleep(24 * 3600)
+        asyncio.create_task(_sweep_strays_daily())
         asyncio.create_task(_memory_keeper())
         asyncio.create_task(_renames_warm())
         asyncio.create_task(_slow_pages_warm())
@@ -7535,6 +7550,18 @@ def api_subembed(preview: int = 12, full: int = 0, refresh: int = 0):
 # ---------------------------------------------- background work, uniformly --
 # ONE SHAPE FOR EVERY SYSTEM THAT FIXES MEDIA QUIETLY. idle.py runs them; this
 # reports them, and the panel renderer that draws one draws all of them.
+@app.post("/api/housekeeping/strays")
+async def api_sweep_strays(dry: int = 1):
+    """Leftover working files no live operation could still want.
+
+    Dry by default: it deletes things, so the count comes first and the
+    deleting is the second press.
+    """
+    from . import fileops
+    return await asyncio.to_thread(fileops.sweep_strays, None,
+                                   fileops.STRAY_AGE_S, bool(dry))
+
+
 @app.get("/api/idle")
 def api_idle(key: str = ""):
     """Where a background fixer has got to, and what it is waiting for."""

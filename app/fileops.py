@@ -1052,6 +1052,196 @@ def recover_interrupted_commits(roots: list[str],
     return fixed
 
 
+# ---------------------------------------------------- what got left behind --
+# WORKING FILES OUTLIVE THE WORK THAT MADE THEM, and nothing ever swept.
+#
+# Found the first time anybody looked: 26 files, 133 GB, the oldest from the
+# 8th of August. Every one is the residue of an operation that was interrupted
+# - a service restart mid-remux, a commit killed between the backup and the
+# delete - and every one had been sitting in a library folder ever since.
+#
+# Two shapes, and they need different rules:
+#
+#   X.nuarr-bak   the ORIGINAL, moved aside during a replace. Safe to remove
+#   X.nuarr-new   a staged copy waiting to be swapped in
+#                 only once X itself is back and non-empty - that is the proof
+#                 the replace finished. If X is missing, this file may be the
+#                 only copy of the episode there is, and it must be left for
+#                 somebody to look at.
+#
+#   .nuarr-embed-*  a half-written remux with no original to compare against.
+#   .nuarr-mark-*   Nothing depends on it and nothing can recover it, so age
+#   .nuarr-shape-*  is the only question: anything older than a few hours
+#                   cannot belong to a live operation.
+STRAY_PREFIX = (".nuarr-embed-", ".nuarr-mark-", ".nuarr-shape-", "embed-",
+                "mark-", "shape-")
+STRAY_SUFFIX = (".nuarr-bak", ".nuarr-new", ".nuarr-mv")
+# No single operation nuarr performs runs for six hours. A 2160p remux is
+# minutes; the longest transcode measured here is under two.
+STRAY_AGE_S = 6 * 3600
+
+
+def _real_is_back(dirpath: str, name: str) -> bool:
+    r"""Is the file this marker was made from sitting beside it, intact?
+
+    TWO SPELLINGS, BECAUSE NUARR HAS USED TWO. The current commit appends:
+    `Show - S01E01.mkv` becomes `Show - S01E01.mkv.nuarr-new`. An older one
+    REPLACED the extension, leaving `Show - S01E01.nuarr-new` - and 24 of the
+    files sitting in this library are that shape, the oldest from August.
+    Stripping the marker gives a name with no extension, which exists nowhere,
+    so a strict test reads "the original is missing" about two dozen episodes
+    that are all perfectly present.
+
+    So the real file is whatever sibling the marker's stem names, with or
+    without an extension put back on the end. Anything longer than a plausible
+    extension is a different file and does not count.
+    """
+    for marker in STRAY_SUFFIX:
+        if not name.endswith(marker):
+            continue
+        base = name[:-len(marker)]
+        if not base:
+            return False
+        cand = [base] if "." in os.path.basename(base) else []
+        try:
+            for sib in os.listdir(dirpath):
+                if sib == name or sib.endswith(STRAY_SUFFIX):
+                    continue
+                if sib == base or (sib.startswith(base)
+                                   and len(sib) - len(base) <= 6
+                                   and sib[len(base):].startswith(".")):
+                    cand.append(sib)
+        except OSError:
+            return False
+        for c in cand:
+            try:
+                q = os.path.join(dirpath, c)
+                if os.path.exists(q) and os.path.getsize(q) > 0:
+                    return True
+            except OSError:
+                continue
+        return False
+    return False
+
+
+def sweep_strays(roots=None, age_s: float = STRAY_AGE_S,
+                 dry: bool = False) -> dict:
+    r"""Remove working files no live operation could still want.
+
+    Reported rather than silent: this deletes things, so it says how many and
+    how much, and a dry run answers the same question without acting.
+    """
+    import time as _t
+    if roots is None:
+        roots = [l.path for l in (SETTINGS.libraries or [])]
+        cache = str(getattr(SETTINGS, "cache_dir", "") or "")
+        if cache:
+            roots = list(roots) + [cache]
+    now = _t.time()
+    out = {"looked": 0, "removed": 0, "bytes": 0, "kept": 0, "files": []}
+    for root in roots:
+        if not root or not os.path.isdir(root):
+            continue
+        for dirpath, _dirs, files in os.walk(root):
+            for f in files:
+                if not (f.startswith(STRAY_PREFIX) or f.endswith(STRAY_SUFFIX)):
+                    continue
+                p = os.path.join(dirpath, f)
+                out["looked"] += 1
+                try:
+                    st = os.stat(p)
+                except OSError:
+                    continue
+                if now - st.st_mtime < age_s:
+                    out["kept"] += 1
+                    continue
+                # A backup or a staged copy is only spare once the real file
+                # is back. Without that proof it is left alone - loudly.
+                if f.endswith(STRAY_SUFFIX):
+                    if not _real_is_back(dirpath, f):
+                        out["kept"] += 1
+                        out["files"].append(
+                            {"path": p, "size": st.st_size,
+                             "why": "left alone - the file it was made from "
+                                    "is not back yet"})
+                        continue
+                if dry:
+                    out["removed"] += 1
+                    out["bytes"] += st.st_size
+                    if len(out["files"]) < 200:
+                        out["files"].append({"path": p, "size": st.st_size})
+                    continue
+                try:
+                    os.remove(long_path(p) if path_too_long(p) else p)
+                except OSError:
+                    out["kept"] += 1
+                    continue
+                out["removed"] += 1
+                out["bytes"] += st.st_size
+                if len(out["files"]) < 200:
+                    out["files"].append({"path": p, "size": st.st_size})
+    if out["removed"] and not dry:
+        from . import joblog
+        joblog.log(f"swept {out['removed']} leftover working file(s) - "
+                   f"{out['bytes'] / 1024 ** 3:.1f} GB that no operation "
+                   f"could still be using", "info", system="housekeeping")
+    return out
+
+
+def cache_temp(suffix: str = "", prefix: str = "nuarr") -> str:
+    r"""A scratch path on the cache drive, never beside the media.
+
+    WHY NOT NEXT TO THE ORIGINAL, WHICH IS WHERE THESE USED TO GO.
+    Three reasons, and the third is the one that bites:
+
+      IT IS THE SAME SPINDLE. A remux beside its source makes one pool disk
+      read and write the same file at once - the slowest shape there is. The
+      cache is an NVMe that is deliberately not in the pool, so the read and
+      the write land on different hardware.
+
+      DRIVEPOOL IS WATCHING THAT FOLDER. A multi-gigabyte file appearing and
+      vanishing inside a library folder is something the balancer has an
+      opinion about, and it is never a useful one.
+
+      AND SO IS PLEX. A half-written `.nuarr-embed-1789...mkv` sitting in a
+      season folder is a file a scanner can pick up, an arr can try to import,
+      and Bazarr can try to fetch subtitles for. Everything downstream of the
+      library has been told that folder holds finished media.
+
+    The commit still ends the same way: safe_replace() already stages a
+    cross-volume copy next to the target and keeps the swap itself atomic, so
+    nothing about the guarantee changes - only where the work happens.
+    """
+    import tempfile
+    d = str(getattr(SETTINGS, "cache_dir", "") or "")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        d = tempfile.gettempdir()
+    fd, p = tempfile.mkstemp(prefix=f"{prefix}-", suffix=suffix, dir=d)
+    os.close(fd)
+    # mkvmerge and mkvextract want to create the file themselves.
+    _quiet_remove(p)
+    return p
+
+
+def cache_room(need_bytes: int = 0) -> tuple[bool, str]:
+    r"""Is there space to write this, with the floor the gate uses still intact?
+
+    ASKED BEFORE THE WORK, NOT AFTER. A remux that fills the cache fails at
+    the last step having spent the whole read, and takes the next job's space
+    with it on the way down.
+    """
+    free = free_space_gb(str(getattr(SETTINGS, "cache_dir", "") or ""))
+    floor = float(getattr(SETTINGS, "cache_min_free_gb", 0) or 0)
+    want = (float(need_bytes) / (1024 ** 3)) + floor
+    if free < want:
+        return False, (f"only {free:.0f} GB free on the cache - this needs "
+                       f"{need_bytes / (1024 ** 3):.1f} GB plus the "
+                       f"{floor:.0f} GB floor")
+    return True, ""
+
+
 def free_space_gb(path: str) -> float:
     try:
         return shutil.disk_usage(path).free / (1024 ** 3)

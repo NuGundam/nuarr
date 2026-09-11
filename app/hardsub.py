@@ -989,8 +989,18 @@ def mark_one(file_id: int, kind: str = "") -> dict:
     others = [x for x in (row.get("sub_langs") or "").split(",") if x.strip()]
     make_default = "no" if others else "yes"
 
-    srt = os.path.join(os.path.dirname(path), f".nuarr-mark-{int(time.time())}.srt")
-    tmp = os.path.join(os.path.dirname(path), f".nuarr-mark-{int(time.time())}.mkv")
+    # ON THE CACHE, NOT BESIDE THE SOURCE. See fileops.cache_temp - and this
+    # one had the extra problem that the stray file it left in a season folder
+    # was a .srt, which is exactly what Plex and Bazarr go looking for there.
+    try:
+        _need = os.path.getsize(path)
+    except OSError:
+        _need = 0
+    ok_room, why_room = fileops.cache_room(_need)
+    if not ok_room:
+        return {"ok": False, "why": why_room}
+    srt = fileops.cache_temp(".srt", "mark")
+    tmp = fileops.cache_temp(".mkv", "mark")
     try:
         with open(srt, "w", encoding="utf-8-sig", newline="") as fh:
             fh.write(_MARK_SRT)

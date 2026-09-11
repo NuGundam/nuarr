@@ -353,8 +353,11 @@ def _read_events(path: str, mkv_track_id: int) -> dict | None:
     """
     if not os.path.exists(path):
         return None
-    out = os.path.join(os.environ.get("TEMP") or ".",
-                       f".nuarr-shape-{int(time.time()*1000)}.txt")
+    # The cache, like every other scratch file - this one was already off the
+    # pool, in the system TEMP, but there is no reason for it to be the one
+    # exception to where nuarr puts working files.
+    from . import fileops
+    out = fileops.cache_temp(".txt", "shape")
     try:
         r = _quiet_run([_mkvextract(), "tracks", path,
                         f"{int(mkv_track_id)}:{out}"],
