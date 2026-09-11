@@ -3431,8 +3431,167 @@ def _ffmpeg_level(line: str) -> str:
     return "debug"
 
 
+# ------------------------------------------------ flags without a rewrite --
+# 106.6 GB QUEUED TO FLIP SOME BITS.
+#
+# "fix track flags" is the label a plan gets when the only thing it changes is
+# which subtitle track carries default and forced. Sixteen of them were sitting
+# in the queue at once - Outlander, 7-8 GB apiece - every one about to copy a
+# whole container through ffmpeg so that a handful of header bytes could come
+# out different at the other end. Each one also had to wait for the viewer to
+# stop watching that spindle, because a full read of an 8 GB file is exactly
+# the thing the gate exists to hold back.
+#
+# mkvpropedit writes those bytes where they are. No copy, no cache, no commit,
+# no second file on the pool - the same tool the subtitle-title and
+# audio-language correctors have always used for the same kind of edit.
+#
+# THE TEST IS DELIBERATELY NARROW. Anything that changes what is IN the file -
+# an encode, a dropped track, a burn, a DV strip, an audio conversion, an OCR
+# handoff - is not this, and falls through to the path that rewrites. Only a
+# plan whose entire effect is disposition bits on tracks that are all being
+# kept qualifies.
+def flags_only(plan, probe: dict) -> bool:
+    """Is every change this plan makes a disposition bit?"""
+    try:
+        if getattr(plan, "encode", False):
+            return False
+        if getattr(plan, "burn_index", None) is not None:
+            return False
+        if getattr(plan, "strip_dv", False) or getattr(plan, "burn_image", False):
+            return False
+        # AN AUDIO OP THAT SAYS "copy" IS NOT WORK. Every kept track gets an
+        # entry in audio_ops whether or not anything happens to it, so the
+        # list being non-empty says nothing - Outlander S02E05 carries
+        # [{'idx': 0, 'to': 'copy'}] and changes no audio at all. What counts
+        # is an op that converts, downmixes or re-rates.
+        for op in (getattr(plan, "audio_ops", None) or []):
+            if str((op or {}).get("to") or "copy").lower() != "copy":
+                return False
+            if (op or {}).get("ch") or (op or {}).get("br"):
+                return False
+        if getattr(plan, "audio_lang_tags", None):
+            return False
+        streams = (probe or {}).get("streams") or []
+        n_aud = len([x for x in streams if x.get("codec_type") == "audio"])
+        n_sub = len([x for x in streams if x.get("codec_type") == "subtitle"])
+        # Every track survives: nothing is being dropped, so nothing needs a
+        # new container.
+        if len(getattr(plan, "keep_audio", []) or []) != n_aud:
+            return False
+        if len(getattr(plan, "keep_subs", []) or []) != n_sub:
+            return False
+        # And there IS a flag change to make.
+        return bool(getattr(plan, "clear_flags", None)
+                    or getattr(plan, "default_sub", None) is not None
+                    or getattr(plan, "forced_sub", None) is not None)
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _flag_edits(plan, probe: dict) -> list:
+    r"""mkvpropedit arguments for exactly the bits this plan wants changed.
+
+    ONE-BASED AND PER TYPE. mkvpropedit addresses `s1`, `s2` ... within the
+    subtitle tracks, which is the same ordinal the plan uses - one higher.
+    Every kept subtitle is stated explicitly rather than left as it is, for the
+    reason build_ffmpeg gives: a flag nobody asserts is a flag some muxer is
+    free to invent.
+    """
+    args: list = []
+    clear = set(getattr(plan, "clear_flags", None) or [])
+    dflt = getattr(plan, "default_sub", None)
+    forced = getattr(plan, "forced_sub", None)
+    for n, i in enumerate(getattr(plan, "keep_subs", []) or [], start=1):
+        if i in clear:
+            d, f = "0", "0"
+        elif i == forced:
+            d, f = "1", "1"
+        elif i == dflt:
+            d, f = "1", "0"
+        else:
+            continue
+        args += ["--edit", f"track:s{n}",
+                 "--set", f"flag-default={d}",
+                 "--set", f"flag-forced={f}"]
+    return args
+
+
+async def _flags_in_place(w: Worker, probe_data: dict) -> bool:
+    """Set the flags with mkvpropedit. True if it did the whole job."""
+    from . import fileops
+    job = w.job
+    edits = _flag_edits(job.plan, probe_data)
+    if not edits:
+        return False
+    exe = str(getattr(SETTINGS, "mkvpropedit", "") or "")
+    if not exe or not os.path.exists(exe):
+        return False
+    w.set_stage("flags")
+    before = os.path.getsize(job.path) if os.path.exists(job.path) else 0
+    if fileops.is_locked(job.path):
+        return False
+    t0 = time.time()
+    try:
+        r = await asyncio.to_thread(
+            subprocess.run, [exe, job.path] + edits,
+            **{"capture_output": True, "text": True, "timeout": 600,
+               "creationflags": NO_WINDOW, "startupinfo": hidden_si()})
+    except Exception as e:                                       # noqa: BLE001
+        joblog.log(f"could not set the flags in place ({type(e).__name__}) - "
+                   f"falling back to a rewrite", "warn", job.id)
+        return False
+    if r.returncode >= 2:
+        joblog.log("mkvpropedit refused this file - falling back to a "
+                   "rewrite: " + (r.stderr or r.stdout or "")[:200],
+                   "warn", job.id)
+        return False
+    after = os.path.getsize(job.path) if os.path.exists(job.path) else 0
+    w.progress = 1.0
+    w.est_out_bytes = after or before
+    joblog.log(f"set the track flags in place - {len(edits) // 5} track(s), "
+               f"{time.time() - t0:.1f}s, nothing copied "
+               f"({before / 1024 ** 3:.1f} GB left where it was)", "ok", job.id)
+
+    # AND THEN THE WHOLE TAIL A COMMIT WOULD HAVE DONE. Skipping the rewrite
+    # is not permission to skip the bookkeeping: the file on disk is different
+    # now, so the probe, the size, the job's own outcome, Plex and the arrs all
+    # have to be told exactly as they would be after a remux. The layout is
+    # unchanged - only bits moved - so cache_probe keeps every reading that was
+    # taken from this file rather than dropping them.
+    try:
+        data = await probe(job.path)
+        if data:
+            cache_probe(job.file_id, data)
+    except Exception:                                            # noqa: BLE001
+        pass
+    try:
+        with cursor() as cur:
+            cur.execute("UPDATE files SET size=?, mtime=?, updated_at=? "
+                        " WHERE id=?",
+                        (after, os.path.getmtime(job.path), time.time(),
+                         job.file_id))
+    except Exception:                                            # noqa: BLE001
+        pass
+    _finish(job, "done", before, after)
+    try:
+        log_event(job.file_id, "transcoded",
+                  "set the track flags in place - nothing was copied")
+    except Exception:                                            # noqa: BLE001
+        pass
+    w.set_stage("arr refresh / rename")
+    await _post_commit(job)
+    w.set_stage("done")
+    return True
+
+
 async def _transcode(w: Worker, probe_data: dict) -> None:
     job = w.job
+    # NOTHING TO COPY IF NOTHING IS CHANGING BUT THE FLAGS.
+    if (os.path.splitext(job.path)[1].lower() == ".mkv"
+            and flags_only(job.plan, probe_data)):
+        if await _flags_in_place(w, probe_data):
+            return
     os.makedirs(SETTINGS.cache_dir, exist_ok=True)
     out = os.path.join(SETTINGS.cache_dir, f"{job.id}.mkv")
     size_before = os.path.getsize(job.path)

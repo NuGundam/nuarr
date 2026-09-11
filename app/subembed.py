@@ -1106,6 +1106,72 @@ def summary(force_refresh: bool = False) -> dict:
     return dict(d)
 
 
+def failures(limit: int = 100) -> list[dict]:
+    r"""What could not be taken in, and why - from the log, not from memory.
+
+    THE PANEL SAID "2 failed" AND OFFERED NOWHERE TO LOOK. A count with no
+    list is a count you can only worry about: it cannot be judged, retried or
+    dismissed. Every attempt has always been written to subembed_log with its
+    reason; nothing read them back.
+
+    ONE ROW PER FILE, the most recent attempt. A file that failed twice and
+    then succeeded is not a failure, and the log holds all three.
+    """
+    if not _READY:
+        init()
+    out: list[dict] = []
+    try:
+        with cursor() as cur:
+            for r in cur.execute(
+                    "SELECT l.file_id, l.path, l.sidecar, l.lang, l.detail, "
+                    "       l.at, f.title, f.season, f.episode, f.library "
+                    "  FROM subembed_log l "
+                    "  LEFT JOIN files f ON f.id = l.file_id "
+                    " WHERE l.id IN (SELECT MAX(id) FROM subembed_log "
+                    "                 GROUP BY file_id) "
+                    "   AND l.ok = 0 "
+                    " ORDER BY l.at DESC LIMIT ?", (int(limit),)):
+                d = dict(r)
+                try:
+                    from .db import display_label
+                    d["label"] = (display_label(d.get("title"),
+                                                d.get("season"),
+                                                d.get("episode"))
+                                  or os.path.basename(d.get("path") or ""))
+                except Exception:                                # noqa: BLE001
+                    d["label"] = os.path.basename(d.get("path") or "")
+                d["sidecar_name"] = os.path.basename(d.get("sidecar") or "")
+                out.append(d)
+    except Exception:                                            # noqa: BLE001
+        return out
+    return out
+
+
+def retry(file_ids) -> dict:
+    r"""Put failures back in the queue by forgetting they failed.
+
+    Nothing is re-run here. The sweep picks its work from what is on disk, so
+    a file only stays out of it because the log says its last attempt failed -
+    clearing that row is the whole of "try again", and it happens on the
+    runner's own schedule under the gate rather than right now on a request.
+    """
+    ids = [int(i) for i in (file_ids or []) if i]
+    if not ids:
+        return {"ok": False, "why": "nothing chosen"}
+    try:
+        if not _READY:
+            init()
+        with cursor() as cur:
+            qs = ",".join("?" * len(ids))
+            cur.execute(f"DELETE FROM subembed_log "
+                        f" WHERE file_id IN ({qs}) AND ok = 0", ids)
+            n = cur.rowcount or 0
+    except Exception as e:                                       # noqa: BLE001
+        return {"ok": False, "why": f"{type(e).__name__}: {e}"}
+    return {"ok": True, "cleared": n,
+            "why": f"{len(ids)} file(s) will be tried again on the next pass"}
+
+
 def preview_counts(library: str, overrides: dict) -> dict:
     r"""What these rules WOULD do to one library. Plans, changes nothing.
 

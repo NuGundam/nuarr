@@ -7596,6 +7596,25 @@ async def api_subembed_run(limit: int = 0):
     return await subembed.sweep(limit=limit)
 
 
+@app.get("/api/subembed/failed")
+def api_subembed_failed(limit: int = 100):
+    """What could not be taken in, and why."""
+    from . import subembed
+    return {"rows": subembed.failures(limit)}
+
+
+@app.post("/api/subembed/retry")
+async def api_subembed_retry(ids: str = ""):
+    """Let the sweep try these again on its next pass."""
+    from . import subembed
+    got = []
+    for tok in (ids or "").split(","):
+        tok = tok.strip()
+        if tok.isdigit():
+            got.append(int(tok))
+    return await asyncio.to_thread(subembed.retry, got)
+
+
 @app.post("/api/subembed/one")
 async def api_subembed_one(file_id: int):
     """Do one file now. The panel's per-row button."""
@@ -32566,7 +32585,29 @@ function ago2(t){
 }
 
 // ---- sidecar subtitles waiting to come inside ---------------------------
-let _se=null, _seKey='', _sePoll=null;
+let _se=null, _seKey='', _sePoll=null, _seFail={rows:[]};
+async function seLoadFailed(){
+  try{ _seFail=await (await fetch('/api/subembed/failed')).json(); }catch(e){}
+}
+async function seRetry(id, btn){
+  if(btn){ btn.disabled=true; btn.textContent='…'; }
+  try{ await fetch('/api/subembed/retry?ids='+encodeURIComponent(id),
+                   {method:'POST'}); }catch(e){}
+  await seLoadFailed(); sePaint(true);
+}
+async function seRetryAll(btn){
+  const ids=(_seFail.rows||[]).map(f=>f.file_id).join(',');
+  if(!ids) return;
+  askInline(btn, `Try ${(_seFail.rows||[]).length} failed file(s) again? `
+    +'Nothing runs now - the record of the failure is cleared and the sweep '
+    +'picks them up on its next pass, under the same gate as everything else.',
+    'Yes, try again', async ()=>{
+      const r=await (await fetch('/api/subembed/retry?ids='
+        +encodeURIComponent(ids), {method:'POST'})).json();
+      await seLoadFailed(); sePaint(true);
+      return r;
+    });
+}
 // The waiting state, with as much of a measurement as exists yet.
 function seWaitHtml(w){
   w = w || {};
@@ -32605,20 +32646,28 @@ function seShow(on){
 // THE RUNNER IS POLLED WHILE IT WORKS. Cheap - a dict read, no walk - so it
 // can tick at two seconds and the bar moves as files land rather than once a
 // minute when the panel happens to reload.
-let _sePoll2=null;
+let _sePoll2=null, _seDone=-1;
 function seIdleTick(){
   clearTimeout(_sePoll2);
   _sePoll2=setTimeout(async ()=>{
     if(!document.getElementById('sePanel')) return;
     await idleLoad('subembed');
-    sePaint();
     const d=_idle['subembed']||{};
+    // THE LIST CHANGED EXACTLY WHEN A FILE FINISHED, so that is when it is
+    // worth the walk - not on a timer, and not on every poll.
+    if(_seDone !== (d.done||0)){
+      _seDone = d.done||0;
+      seLoadFailed();
+      if(!seHold()) loadSubEmbed(false);
+    }
+    sePaint();
     if(d.running||d.paused) seIdleTick();
   }, 2000);
 }
 async function loadSubEmbed(full){
   const el=document.getElementById('sePanel'); if(!el) return;
   idleLoad('subembed').then(()=>{ seIdleTick(); });
+  seLoadFailed();
   // A SIXTY-SECOND WALK WITH NO SIGN OF LIFE READS AS A BROKEN PANEL. The
   // first open has to list every folder in the library, and until it answers
   // the panel had nothing on it at all. Same skeleton every other slow panel
@@ -32632,8 +32681,20 @@ async function loadSubEmbed(full){
   catch(e){ el.innerHTML='<span class="dim">could not load</span>'; return; }
   sePaint();
 }
-function sePaint(){
+// A LIST THAT MOVES UNDER YOUR HAND IS A LIST YOU CANNOT READ.
+//
+// This panel repaints every two seconds while the runner works, and the box
+// under it is four hundred rows you are trying to scroll through. Two rules,
+// the same ones the subtitle-kind panel already follows: never repaint while
+// the box is scrolled away from the top or the pointer is inside it, and when
+// a repaint does happen, put the scroll position back where it was.
+let _seHover=false;
+function seHold(){
+  return _seHover || panelScrolled('sePanel') || askOpen('sePanel');
+}
+function sePaint(force){
   const el=document.getElementById('sePanel'); if(!el||!_se) return;
+  if(!force && seHold()) return;
   const d=_se, pv=d.preview||[];
   const w=d.walk||{};
   // WHILE THE FIRST WALK RUNS there is no count to lead with, so the panel is
@@ -32684,6 +32745,26 @@ function sePaint(){
   const takes=pv.reduce((n,f)=>n+(f.take||[]).length,0);
   const idleBar=idleStrip(_idle['subembed']||{},
                           {title:'Working through them'});
+  // WHAT COULD NOT BE DONE, AND A WAY TO ASK AGAIN. The header has counted
+  // failures since this panel existed and offered nowhere to look at them.
+  const F=(_seFail.rows||[]);
+  const fail=F.length?`<div class="lkind" style="padding:8px 11px;margin:6px 0;
+       border-left:3px solid var(--warn)">
+    <div style="display:flex;gap:8px;align-items:baseline;flex-wrap:wrap">
+      <b style="font-size:11.5px;color:var(--warn)">${fmt(F.length)} could not
+        be taken in</b>
+      <button class="rmb" style="margin-left:auto" onclick="seRetryAll(this)"
+        title="Forget that these failed. The sweep picks its work from what is on disk, so clearing the record IS trying again - it happens on the next pass, under the gate, not right now.">Try them again</button>
+    </div>
+    <div class="rowbox scrollbox" style="max-height:140px;margin-top:5px">
+      <table style="width:100%;font-size:11px">${F.map(f=>`<tr>
+        <td style="padding:3px 6px" title="${esc(f.path||'')}">${esc(f.label||'')}</td>
+        <td class="dim" style="padding:3px 6px">${esc(f.sidecar_name||'')}</td>
+        <td class="dim" style="padding:3px 6px">${esc((f.detail||'').slice(0,90))}</td>
+        <td class="r" style="padding:3px 6px"><button class="rmb"
+          onclick="seRetry('${f.file_id}',this)">again</button></td>
+      </tr>`).join('')}</table>
+    </div></div>`:'';
   // THE NUMBER IS THE HEADLINE AND THE SWITCH IS ELSEWHERE. The rule lives in
   // the list above with every other subtitle rule; putting a second control
   // here would be two switches for one setting, which can only disagree.
@@ -32733,9 +32814,19 @@ function sePaint(){
       deleted, and only after the rebuilt file has been read back and found to
       contain it.${on.length?` <button class="rmb" onclick="seRun(this)"${
         d.running?' disabled':''}>${d.running?'working…':'Do a batch now'}</button>`:''}</div>`;
-  const html=`<div class="lkind" style="padding:11px 12px">${head}${idleBar}${warn}${rows}${foot}</div>`;
+  const html=`<div class="lkind" style="padding:11px 12px">${head}${idleBar}${fail}${warn}${rows}${foot}</div>`;
   if(html===_seKey) return;
+  const box=el.querySelector('.rowbox'), keep=box?box.scrollTop:0;
   _seKey=html; el.innerHTML=html;
+  const nb=el.querySelector('.rowbox');
+  if(nb&&keep) nb.scrollTop=keep;
+  // The pointer test needs somewhere to hang, and innerHTML has just replaced
+  // whatever it was hanging on.
+  const nbox=el.querySelector('.rowbox');
+  if(nbox){
+    nbox.addEventListener('mouseenter',()=>{ _seHover=true; });
+    nbox.addEventListener('mouseleave',()=>{ _seHover=false; });
+  }
 }
 async function seOne(fid, btn){
   if(btn){ btn.disabled=true; btn.textContent='working…'; }
