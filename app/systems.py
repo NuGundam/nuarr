@@ -119,7 +119,9 @@ def _idle_runners() -> list:
         note = (f"{why}{' - ' + det if det else ''}" if paused
                 else (f"up to {lanes} at once, one per disk" if lanes > 1
                       else (d.get("system_name") or key)))
-        if not paused and pr.get("skip_disks"):
+        if not paused and pr.get("waiting_for"):
+            note += " - " + str(pr["waiting_for"])
+        elif not paused and pr.get("skip_disks"):
             note += (" - stepping around "
                      + ", ".join(list(pr["skip_disks"])[:4]))
         out.append(_one(f"idle:{key}", d.get("title") or key,

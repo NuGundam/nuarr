@@ -32833,12 +32833,16 @@ function idleStrip(d, opts){
     : (d.idle_why
        ? `<div class="dim" style="font-size:11px;margin-top:3px">${esc(d.idle_why)}${
            d.next_look?` · looks again ${ago2(d.next_look)}`:''}</div>`
-       : (d.running&&(d.skip_disks||[]).length
+       : (d.waiting_for
+          ? `<div class="dim" style="font-size:11px;margin-top:3px"
+               title="Every background system shares one budget and one claim per spindle, so a disk another system is already reading is a disk this one steps around rather than joins.">waiting
+             — ${esc(d.waiting_for)}</div>`
+          : (d.running&&(d.skip_disks||[]).length
           ? `<div class="dim" style="font-size:11px;margin-top:3px"
                title="Somebody is reading from these, so their files are left for a later pass rather than waited on.">steering
              around ${esc((d.skip_disks||[]).join(', '))} — ${
              fmt(d.skipped||0)} left for later</div>`
-          : ''));
+          : '')));
   const hist=`<div class="dim" style="font-size:11px;margin-top:3px;display:flex;
        gap:12px;flex-wrap:wrap">
     ${d.last_run?`<span title="The last time it worked all the way through what was waiting">last finished ${
@@ -32850,8 +32854,11 @@ function idleStrip(d, opts){
        style="color:var(--ok)">${(d.secs_each||0).toFixed(1)}s</b> a file</span>`:''}
     <span title="Background work waits for anybody watching, a full encoder queue, a busy disk, a DrivePool move, or the machine itself.">${
       esc(d.cpu_line||'')}</span>
-    ${(d.lanes||1)>1?`<span title="At most this many files at a time, and never two that live on the same disk — two rewrites sharing one arm take turns and finish no sooner.">up to ${
+    ${(d.lanes||1)>1?`<span title="At most this many files at a time for THIS system, and never two that live on the same disk — two rewrites sharing one arm take turns and finish no sooner.">up to ${
       fmt(d.lanes)} at once, one per disk</span>`:''}
+    ${d.inflight?`<span title="Every background system counts against one budget and claims one spindle at a time, so four of them cannot quietly become eight readers on a twelve-disk pool.">${
+      fmt(d.inflight.n||0)} of ${fmt(d.inflight.limit||0)} across every system${
+      (d.inflight.disks||[]).length?` · ${esc((d.inflight.disks||[]).join(', '))}`:''}</span>`:''}
     ${d.last_error?`<span class="err">${esc(d.last_error)}</span>`:''}
   </div>`;
   return `<div class="lkind" style="padding:8px 11px;margin:6px 0">

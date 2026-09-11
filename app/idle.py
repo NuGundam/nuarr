@@ -82,6 +82,33 @@ from . import joblog
 # whatever the number is.
 LANES = 2
 
+# AND A CEILING THEY ALL COUNT AGAINST.
+#
+# "Never two on one arm" was written when one system used this, and it means
+# exactly what it says only for that one system: the exclusion was over the
+# lanes of a SINGLE runner. With four systems adopting it, the decode check
+# and the sidecar sweep could each be told they were alone on NU-DRIVE-9 and
+# both be right - two readers on one spindle, each one its own only child.
+#
+# The per-disk gate does not catch it either, and that is worth being precise
+# about: gate._busy_now() flags a disk as hot only when the load is NOT
+# nuarr's (ext >= 35% of the total), because a disk busy with nuarr's own
+# encode is a disk doing what it was asked. Correct for the queue, and it
+# means a sibling system's reading is invisible to the check that would
+# otherwise have stepped around it.
+#
+# Same shape of mistake as the CPU line and the disk column before it: each
+# part of nuarr measuring the world without counting the rest of nuarr. There
+# is already one global registry of in-flight background work - the ledger the
+# disk panel reads - so the exclusion moves there. Two rules, both across
+# every system at once:
+#
+#   one spindle, one reader   - whoever got there first
+#   and a total budget        - because four systems at two lanes each is
+#                               eight concurrent rewrites on a twelve-disk
+#                               pool, and nothing was counting
+LANES_TOTAL = 3
+
 CPU_BUSY_PCT = 80.0
 # And a ceiling on the whole box, nuarr's own work included. The line above
 # deliberately ignores nuarr's share - otherwise a system paces itself against
@@ -395,7 +422,17 @@ async def run(key: str, title: str, pending, do_one, label=None, *,
             while (queue or flight) and not halt:
                 # ---- fill the free lanes ------------------------------------
                 while len(flight) < max(1, int(lanes)) and queue and not halt:
+                    # WHAT EVERY SYSTEM IS HOLDING, not just this one.
+                    others = [t for t in TASKS.values()
+                              if t.id not in _mine_ids(flight)]
+                    if len(TASKS) >= max(1, LANES_TOTAL):
+                        d["waiting_for"] = (
+                            f"{len(TASKS)} background files are already in "
+                            f"flight across every system (the limit is "
+                            f"{LANES_TOTAL})")
+                        break
                     taken = {v["disk"] for v in flight.values() if v["disk"]}
+                    taken |= {t.disk for t in others if t.disk}
                     pick = None
                     for i, it in enumerate(queue):
                         dk = (disk_of(it) if disk_of else "")
@@ -407,7 +444,12 @@ async def run(key: str, title: str, pending, do_one, label=None, *,
                         pick = i
                         break
                     if pick is None:
-                        break                      # only same-disk work left
+                        # Everything left is on a spindle somebody already has.
+                        busy_names = ", ".join(sorted(taken)[:4])
+                        d["waiting_for"] = (
+                            f"everything left is on a disk already being "
+                            f"read ({busy_names})" if busy_names else "")
+                        break
                     it = queue.pop(pick)
                     dk = (disk_of(it) if disk_of else "")
                     b = await busy(dk)
@@ -439,6 +481,7 @@ async def run(key: str, title: str, pending, do_one, label=None, *,
                         halt = True
                         break
 
+                    d["waiting_for"] = ""
                     v = _note_item(it)
 
                     def _report(pct: float, _v=v) -> None:
@@ -501,6 +544,7 @@ async def run(key: str, title: str, pending, do_one, label=None, *,
                 d.update(running=False, now="", item_pct=0.0, flight=[])
             elif not queue:
                 # The list finished rather than being interrupted.
+                d["waiting_for"] = ""
                 d.update(running=False, now="", item_pct=0.0, flight=[],
                          last_run=time.time(), last_done=d["done"],
                          last_took=round(time.time() - d["t0"], 1),
@@ -655,6 +699,24 @@ class Task:
     def __exit__(self, *exc):
         self.close()
         return False
+
+
+def _mine_ids(flight) -> set:
+    """The ledger ids this runner's own in-flight items are holding."""
+    out = set()
+    for v in (flight or {}).values():
+        t = v.get("task") if isinstance(v, dict) else None
+        if t is not None:
+            out.add(t.id)
+    return out
+
+
+def inflight() -> dict:
+    """Across every system: how many background files, and on which disks."""
+    ts = list(TASKS.values())
+    return {"n": len(ts), "limit": LANES_TOTAL,
+            "disks": sorted({t.disk for t in ts if t.disk}),
+            "by": sorted({t.system for t in ts if t.system})}
 
 
 def claim(system, title, now="", disk="", dest_disk="", note="") -> Task:
@@ -829,6 +891,7 @@ def progress(key: str) -> dict:
     d["rate"] = round(rate, 3)
     d["secs_each"] = round(each, 2)
     d["eta"] = round(d["left"] * each) if (d["left"] and each) else 0
+    d["inflight"] = inflight()
     d["cpu_line"] = (f"waits above {CPU_BUSY_PCT:.0f}% CPU from anything else"
                      f" (or {CPU_FULL_PCT:.0f}% in total) or "
                      f"{GPU_BUSY_PCT:.0f}% GPU")
