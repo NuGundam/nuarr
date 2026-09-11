@@ -444,6 +444,14 @@ def plan_one(file_id: int, force: bool = False,
     # leave / inside / sidecar - what happens when the sidecar is a genuine
     # second copy of a track that is already there.
     conflict = str(_sr.get("sidecar_conflict") or "leave")
+    # "KEEP THE LOOSE COPY" IS A WAY OF TAKING IT IN, so with the rule above
+    # off it is not a third answer - it is the first one wearing a different
+    # label. Said here rather than left to be inferred from an empty result:
+    # the library refuses the sidecar either way, and the reason a person is
+    # given should be the real one.
+    if conflict == "sidecar" and not take_them:
+        conflict = "leave"
+        _sr = dict(_sr, sidecar_conflict="leave", _demoted=True)
     beats = (conflict == "sidecar") and take_them
     tidy = (conflict == "inside")
     # ALWAYS READ, NOT ONLY WHEN THERE IS A CONFLICT RULE. Telling a duplicate
@@ -497,10 +505,7 @@ def plan_one(file_id: int, force: bool = False,
             if not twins and not beats:
                 if not take_them:
                     out["skip"].append({
-                        "sidecar": side,
-                        "why": "this library only recycles sidecars it "
-                               "already has; taking new ones in is a "
-                               "separate rule"})
+                        "sidecar": side, "why": _off_why(_sr)})
                     continue
                 out["take"].append({
                     "sidecar": side, "lang": name["lang"],
@@ -556,10 +561,7 @@ def plan_one(file_id: int, force: bool = False,
                        f"inside it"})
             continue
         if not take_them:
-            out["skip"].append({
-                "sidecar": side,
-                "why": "this library only recycles sidecars it already has; "
-                       "taking new ones in is a separate rule"})
+            out["skip"].append({"sidecar": side, "why": _off_why(_sr)})
             continue
         out["take"].append({"sidecar": side, "lang": name["lang"],
                             "role": name["role"],
@@ -589,6 +591,16 @@ def plan_one(file_id: int, force: bool = False,
                        f"({os.path.splitext(cur[1]['sidecar'])[1]})"})
     out["take"] = [t for _r, t in best.values()]
     return out
+
+
+def _off_why(sr: dict) -> str:
+    """Why a sidecar was refused when this library does not take them in."""
+    if sr.get("_demoted"):
+        return ("this library is set to keep the loose copy, but the rule "
+                "that takes subtitle files inside is off - so nothing can be "
+                "taken in and the sidecar is left where it is")
+    return ("this library only recycles sidecars it already has; taking new "
+            "ones in is a separate rule")
 
 
 def _recycle_drops(file_id: int, path: str, drops: list) -> dict:

@@ -2064,6 +2064,11 @@ RULE_META = [
                   "need the rule above."},
          {"value": "sidecar", "label": "Keep the loose copy, replace the "
                                        "track inside",
+          # The only combination on this page that could be set and do
+          # nothing: there is no way to keep a loose copy without taking it
+          # in. Named here so the page can grey it out rather than let it be
+          # chosen and quietly ignored.
+          "needs": "embed_sidecars",
           "what": "Taken in, and the track it replaces is dropped from the "
                   "rebuilt file - because Bazarr fetching a subtitle for a "
                   "language you already had usually means it found a better "

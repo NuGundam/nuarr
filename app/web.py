@@ -26244,9 +26244,11 @@ function socPaint(lib){
       <b>${m.label}</b>
       ${m.what?`<div class="dim" style="font-size:11px">${m.what}</div>`:''}
       <div style="margin:5px 0 0 2px">${(m.choices||[]).map(c=>`
-        <label style="display:flex;gap:9px;align-items:flex-start;padding:3px 0;cursor:pointer">
+        <label style="display:flex;gap:9px;align-items:flex-start;padding:3px 0;cursor:pointer"
+               ${c.needs?`data-needs="${esc(c.needs)}"`:''}>
           <input type="radio" name="${id('r_'+m.key)}" value="${esc(c.value)}"
                  ${String(cur)===c.value?'checked':''}
+                 ${c.needs?`data-needs="${esc(c.needs)}"`:''}
                  onchange="socRuleDirty('${esc(lib)}')" style="margin-top:2px">
           <span><b style="font-weight:600">${c.label}</b>
             <div class="dim" style="font-size:11px">${c.what}</div></span>
@@ -26332,10 +26334,42 @@ function socPaint(lib){
            align-items:center;flex-wrap:wrap;font-size:12px"></div>
       <div id="${id('ruleimp')}" style="margin-top:6px"></div>
     </div>`;
+  socSyncPick(lib);
+}
+
+// ONE COMBINATION ON THIS PAGE COULD BE SET AND DO NOTHING, and only one:
+// "keep the loose copy" is a way of TAKING IT IN, so with the rule that takes
+// subtitle files inside switched off there is no third answer - it is the
+// first one wearing a different label. A choice that can be selected and
+// quietly ignored is the fault this picker was built to remove, so the option
+// is greyed while the thing it needs is off, and says why.
+function socSyncPick(lib){
+  const host=document.getElementById('soc_'+cssId(lib));
+  if(!host) return;
+  host.querySelectorAll('input[type=radio][data-needs]').forEach(r=>{
+    const dep=document.getElementById('soc_'+cssId(lib)+'_r_'+r.dataset.needs);
+    const ok=!dep || dep.checked;
+    r.disabled=!ok;
+    const lab=r.closest('label');
+    if(lab){
+      lab.style.opacity = ok ? '' : '.45';
+      lab.style.cursor  = ok ? 'pointer' : 'not-allowed';
+      lab.title = ok ? '' : 'Needs "Take subtitle files sitting next to the '
+                          +'video inside it" above - there is no way to keep '
+                          +'a loose copy without taking it in.';
+    }
+    // Selected and then disabled by unticking the box above: fall back to the
+    // answer it actually behaves as, rather than leaving a dead dot filled in.
+    if(!ok && r.checked){
+      const first=r.closest('div').querySelector('input[type=radio]');
+      if(first && first!==r) first.checked=true;
+    }
+  });
 }
 
 // Tick a rule -> offer the preview. Nothing is written until "Apply".
 function socRuleDirty(lib){
+  socSyncPick(lib);
   const bar=document.getElementById('soc_'+cssId(lib)+'_rulebar');
   if(!bar) return;
   bar.innerHTML=`<button onclick="socRulePreview('${esc(lib)}')">See what would change</button>
