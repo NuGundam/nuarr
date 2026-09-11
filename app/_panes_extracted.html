@@ -256,6 +256,16 @@
              They are shut until asked for. -->
         <div id="subsTop" style="padding:6px 14px 4px"></div>
 
+        <!-- SUBTITLE USER INPUT, and it is not a detail.
+             Everything above this is nuarr telling you what it is doing.
+             This is the one panel that needs something FROM you - the
+             readings it is not sure enough about to act on, and the two kinds
+             of question nothing can measure - so it sits with the things you
+             look at rather than behind a disclosure you have to remember to
+             open. Drawn by skPaint; see skAskHtml for the questions that have
+             no reading behind them. -->
+        <div id="skPanel" style="padding:0 14px 6px"></div>
+
         <!-- THE POLICY, WHICH IS NOT A SYSTEM. Everything above is nuarr
              acting; this is what it is allowed to aim for. It stays open. -->
         <div style="padding:6px 14px 4px">
@@ -289,13 +299,6 @@
              file, and whether any of it is there twice. Drawn by sdPaint. -->
         <div class="subsd" data-d="dupe" style="display:none">
           <div id="sdPanel" style="padding:0 14px 6px"></div>
-        </div>
-        <!-- What subtitles does each file actually carry? One list from two
-             readers: frames of files that report no track (OCR), and the
-             events of tracks whose title looks wrong. Same four kinds, same
-             score, same picker, one switch - see subkind.py. -->
-        <div class="subsd" data-d="picture" style="display:none">
-          <div id="skPanel" style="padding:0 14px 6px"></div>
         </div>
 
         <!-- CHECK ONE FILE NOW. The readers above are sweeps; this is the

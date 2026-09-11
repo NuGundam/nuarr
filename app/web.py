@@ -7318,35 +7318,116 @@ async def api_subkind_kind(file_id: int, source: str, kind: str):
     return await asyncio.to_thread(subkind.set_kind, int(file_id), source, kind)
 
 
+def _sk_settle(file_id: int, source: str, kind: str, answer: str) -> dict:
+    r"""Record what you said about a file, then hand it to the queue.
+
+    THIS IS WHAT "ACT" MEANS NOW. It used to mark the picture or rewrite the
+    title on the spot, from this panel, on its own - which was a second route
+    to a container rewrite with no gate in front of it and no card to watch.
+    Your answer is the valuable part and it is kept in two places for two
+    reasons: subkind's own tables, because the READING was wrong and should
+    not be re-made; and the subtitle memory, because the next episode of the
+    same show should not ask. Then the file is re-planned and queued, and the
+    work happens where all the other work happens.
+    """
+    from . import subkind, subplan, subqueue
+    out = {"ok": True, "recorded": [], "why": ""}
+    # 1. The reading, corrected where you picked a kind.
+    if kind and kind != "__leave__":
+        try:
+            subkind.set_kind(int(file_id), source, kind)
+            out["recorded"].append("kind")
+        except Exception as e:                               # noqa: BLE001
+            out["why"] = f"{type(e).__name__}: {e}"[:160]
+    if kind == "__leave__":
+        try:
+            subkind.act(int(file_id), source, kind)          # ack only
+            out["recorded"].append("left alone")
+        except Exception:                                    # noqa: BLE001
+            pass
+    # 2. The decision, against the show and the release group.
+    q = "picture" if source == "picture" else "title"
+    r = subqueue.answer(int(file_id), q, answer)
+    out["learned"] = r.get("learned") or []
+    out["queued"] = bool(r.get("queued"))
+    out["plan"] = r.get("now") or ""
+    _ = subplan                                  # imported for the docstring
+    return out
+
+
 @app.post("/api/subkind/act")
 async def api_subkind_act(file_id: int, source: str, kind: str = "",
                           confirm: str = ""):
-    """Mark a picture or retitle a track. Both write to the file."""
+    """Yes, do this one: recorded, remembered, and put on the queue."""
     if confirm != "yes":
         return {"ok": False, "why": "confirm=yes required"}
-    from . import subkind
-    return await asyncio.to_thread(subkind.act, int(file_id), source, kind)
+    r = await asyncio.to_thread(_sk_settle, int(file_id), source, kind,
+                                "mark" if source == "picture" else "retitle")
+    try:
+        from . import subqueue
+        fed = await subqueue.topup()
+        r["queued_now"] = int(fed.get("made") or 0)
+    except Exception:                                        # noqa: BLE001
+        pass
+    return r
 
 
 @app.post("/api/subkind/dismiss")
 async def api_subkind_dismiss(file_id: int, source: str):
+    """No, it is not that: the reader is taught and the file is re-planned."""
     from . import subkind
-    return await asyncio.to_thread(subkind.dismiss, int(file_id), source)
+    out = await asyncio.to_thread(subkind.dismiss, int(file_id), source)
+    try:
+        r = await asyncio.to_thread(_sk_settle, int(file_id), source, "",
+                                    "leave")
+        out["learned"] = r.get("learned") or []
+    except Exception:                                        # noqa: BLE001
+        pass
+    return out
 
 
 @app.post("/api/subkind/act/batch")
 async def api_subkind_act_batch(ids: str = "", confirm: str = "",
                                 force: int = 0, kind: str = ""):
+    """The same answer, for everything selected. Nothing is rewritten here."""
     if confirm != "yes":
         return {"ok": False, "why": "confirm=yes required"}
-    from . import subkind
-    return await subkind.act_many(_sk_items(ids), kind=kind, force=bool(force))
+    _ = force
+    items = _sk_items(ids)
+
+    def _all():
+        n = 0
+        for it in items:
+            try:
+                _sk_settle(int(it["file_id"]), it["source"], kind,
+                           "mark" if it["source"] == "picture" else "retitle")
+                n += 1
+            except Exception:                                # noqa: BLE001
+                pass
+        return n
+    n = await asyncio.to_thread(_all)
+    try:
+        from . import subqueue
+        fed = await subqueue.topup()
+        return {"ok": True, "answered": n, "queued_now": fed.get("made") or 0}
+    except Exception:                                        # noqa: BLE001
+        return {"ok": True, "answered": n}
 
 
 @app.post("/api/subkind/dismiss/batch")
 async def api_subkind_dismiss_batch(ids: str = ""):
     from . import subkind
-    return await asyncio.to_thread(subkind.dismiss_many, _sk_items(ids))
+    items = _sk_items(ids)
+    out = await asyncio.to_thread(subkind.dismiss_many, items)
+
+    def _all():
+        for it in items:
+            try:
+                _sk_settle(int(it["file_id"]), it["source"], "", "leave")
+            except Exception:                                # noqa: BLE001
+                pass
+    await asyncio.to_thread(_all)
+    return out
 
 
 @app.post("/api/subkind/run")
@@ -24131,7 +24212,8 @@ function wtab(which){
     // is looking at. Each opens itself when its row is opened.
     loadSubs(true);
     if(subsOpen('sidecar')) loadSubEmbed();
-    if(subsOpen('picture')) loadSubKind();
+    // Subtitle User Input is always on the page, so it always loads.
+    loadSubKind();
     // Its own slot, its own remembered open/shut state. Sharing the codec
     // pages' one would mean opening the panel here silently opened it there
     // too, about a different question.
@@ -32243,11 +32325,13 @@ async function skAct(id, btn){
     return;
   }
   askInline(btn,
-    pic ? 'Add a blank English track? Stream copy, nothing re-encoded, default '
-          +'set so a player picks it, and nothing is ever drawn over the words '
-          +'already in the picture.'
-        : `Rewrite this track title to "${r.title_new||''}"? mkvpropedit edits the `
-          +'header only - the video, the audio and the cues are untouched.',
+    pic ? 'Add a blank English track? Your answer is remembered for this show '
+          +'and this release group, and the file goes on the queue - a stream '
+          +'copy, nothing re-encoded, and nothing drawn over the words already '
+          +'in the picture.'
+        : `Rewrite this track title to "${r.title_new||''}"? Your answer is `
+          +'remembered for this show and this release group, and the file goes '
+          +'on the queue - mkvpropedit edits the header only.',
     pic ? 'Yes, mark it' : 'Yes, correct it',
     async ()=>{
       const x=await (await fetch(`/api/subkind/act?confirm=yes&file_id=${fid}&source=${
@@ -32255,7 +32339,7 @@ async function skAct(id, btn){
       // `gone` means there was nothing left to do - already corrected, or
       // settled by hand. That is not a failure and the row should still leave,
       // saying which it was rather than "nothing to do".
-      if(x.ok) skGone(btn, pic?'marked':(x.gone?'already right':'title corrected'), true, id);
+      if(x.ok) skGone(btn, 'on the queue', true, id);
       else setTimeout(()=>{ _skKey=''; loadSubKind(true); }, 1500);
       return x.ok ? {ok:true, why: pic?'marked':(x.why||'corrected')} : x;
     });
@@ -32282,15 +32366,16 @@ async function skActMany(btn){
     `Go ahead and ${skActWord(rows)}`
     + (_skBatchKind?`, all recorded as ${SKW[_skBatchKind]?SKW[_skBatchKind][0]:_skBatchKind}`
                    :', each keeping the kind its own row shows')
-    + '? Files are stream-copied or header-edited, never re-encoded, and the '
-    + 'pool is asked before every one so it stops if somebody starts watching.',
+    + '? Nothing is rewritten here - each answer is remembered against its '
+    + 'show and release group, and the files go on the queue, where they are '
+    + 'stream-copied or header-edited under the same gate as everything else.',
     `Yes, do ${fmt(ids.length)}`,
     async ()=>{
       const x=await (await fetch('/api/subkind/act/batch?confirm=yes&ids='
         +encodeURIComponent(ids.join(','))
         +(_skBatchKind?'&kind='+encodeURIComponent(_skBatchKind):''),
         {method:'POST'})).json();
-      if(x.ok) skGoneMany(ids, 'queued');
+      if(x.ok) skGoneMany(ids, 'on the queue');
       else setTimeout(()=>{ _skKey=''; loadSubKind(true); }, 1300);
       _skSel.clear(); _skLast=null;
       if(x.ok) skMarkWatch();
@@ -32359,6 +32444,56 @@ function skProgBar(p, what, unit){
       </span>
     </div>`;
 }
+// THE QUESTIONS WITH NO ROW IN THE TABLE BELOW.
+//
+// Most of what nuarr cannot settle is a READING it is unsure of - a picture
+// at 46%, a title whose cue rate disagrees with it - and every one of those
+// is a row in the table, with its score, its picker and its evidence. Two
+// kinds are not readings at all: a sidecar that would replace one of several
+// identical tracks, and two tracks carrying the same number of lines. Nothing
+// measured those, so there is nothing to score and no row to put it in - but
+// they are the same question being asked of the same person, so they sit at
+// the top of the same panel rather than in a panel of their own.
+function skAskHtml(){
+  const A=((_subq&&_subq.asking)||[]).map(r=>({
+      ...r, asks:(r.asks||[]).filter(a=>a.q!=='picture'&&a.q!=='title')}))
+    .filter(r=>r.asks.length);
+  if(!A.length) return '';
+  return `<div style="margin:8px 0 4px;border-top:1px solid var(--line);
+       border-bottom:1px solid var(--line);padding:6px 0">
+    <div style="display:flex;gap:9px;align-items:baseline;flex-wrap:wrap">
+      <b style="font-size:11.5px;color:#e8a33d">${num(A.length,'you')} nothing
+        measured</b>
+      <span class="dim" style="font-size:10.5px">two copies nuarr cannot tell
+        apart — there is no reading to show you, only the choice</span>
+    </div>
+    <div class="scrollbox" style="max-height:210px;overflow:auto;margin-top:4px">
+    ${A.slice(0,30).map(r=>(r.asks||[]).map(a=>`
+      <div style="padding:5px 0;border-top:1px solid var(--line)">
+        <div style="display:flex;gap:8px;align-items:baseline;font-size:11.5px">
+          <span style="flex:1 1 auto;min-width:0;overflow:hidden;
+            text-overflow:ellipsis;white-space:nowrap"
+            title="${esc(r.path||'')}">${esc(r.name||'')}</span>
+          ${r.disk?`<span style="flex:none;color:${diskColor(r.disk)}">${esc(r.disk)}</span>`:''}
+        </div>
+        <div class="dim" style="font-size:11px;margin-top:2px">${esc(a.asking||'')}</div>
+        <div style="margin-top:4px;display:flex;gap:7px;flex-wrap:wrap;
+             align-items:center">
+          ${(a.options||[]).map(o=>`<button class="rmb"
+             title="${esc(o.what||'')}"
+             onclick="subAnswer(${r.file_id},'${esc(a.q)}','${esc(o.v)}',this)"
+             >${esc(o.label||o.v)}</button>`).join('')}
+          <span class="dim" style="font-size:10px">remembered for the show and
+            the group — <a href="#"
+              title="Answer for this file only; other episodes will still ask"
+              onclick="subAnswer(${r.file_id},'${esc(a.q)}','${
+                esc(((a.options||[])[0]||{}).v||'')}',this,'file');return false"
+              >just this one</a></span>
+        </div>
+      </div>`).join('')).join('')}
+    </div></div>`;
+}
+
 function skPaint(force){
   const el=document.getElementById('skPanel'); if(!el||!_sk) return;
   const d=_sk, all=d.rows||[], c=d.counts||{}, P=d.picture||{}, T=d.tracks||{}, S=d.state||{};
@@ -32376,7 +32511,10 @@ function skPaint(force){
   const hiddenUnread=_skShowUnread?0:all.filter(r=>r.unread).length;
   const tested=(P.none||0)+(P.signs||0)+(P.dialogue||0)+(P.hybrid||0);
   const running=!!(P.running||T.running||S.running);
-  const head=`<b style="color:#6fb0ff">What subtitles does each file actually carry?</b>
+  const head=`<b style="color:#e8a33d">Subtitle User Input</b>
+    <span class="dim" style="font-size:11px;margin-left:6px"
+      title="Every reading nuarr is not sure enough about to act on by itself, in one place. Answering one records the correction, remembers it against the show and the release group, and puts the file on the queue.">what nuarr cannot settle on its own</span>
+    <br>
     <span class="dim" style="font-size:11.5px">
       <span title="Files that report no subtitle track, sampled for words in the picture">${
         num(tested,'done')} pictures sampled · ${
@@ -32498,8 +32636,8 @@ function skPaint(force){
          padding:6px 8px;margin:6px 0;border-radius:7px;
          background:rgba(88,166,255,.07);border:1px solid var(--line)">
       <b style="font-size:11.5px;color:#6fb0ff">${fmt(nsel)} selected</b>
-      <span class="dim" style="font-size:10.5px"
-        title="Marking a picture and correcting a title are steps in a file's instruction now, queued with everything else that file needs so it is opened once.">acting on these happens on the queue</span>
+      <button class="rmb" onclick="skActMany(this)"
+        title="Your answer is recorded, remembered against each show and release group, and every one of these files goes on the queue - where the work happens beside everything else, one rewrite per file.">Yes — queue ${fmt(nsel)}</button>
       <button class="rmb" onclick="skDismissMany(this)"
         title="Not what it says. Pictures teach the OCR filter; tracks are recorded as signs.">Not dialogue — ${fmt(nsel)}</button>
       <select class="kindsel" onchange="skBatchKind(this.value)"
@@ -32606,7 +32744,12 @@ function skPaint(force){
       onclick="skShow('done',${_skShowDone?0:1});return false">${
         _skShowDone?'hide':'also show'} the ${fmt(c.settled)} you set by hand</a>`:''}
   </div>`;
-  const html=`<div class="lkind" style="padding:11px 12px">${head}${note}${key}${band}${prog}${hist}${table}${foot}</div>`;
+  // THE OTHER PANEL'S EDGE, KEPT ON PURPOSE. The orange stripe is what
+  // said "this one is waiting on you" at a glance, and it is the only thing
+  // from "Yours to call" worth carrying over - the list, the pickers and the
+  // sorting here are better than what it had.
+  const html=`<div class="lkind" style="padding:11px 12px;border-left:3px solid #e8a33d">${
+    head}${skAskHtml()}${note}${key}${band}${prog}${hist}${table}${foot}</div>`;
   scPaint('subs');
   if(!force && (askOpen('skPanel') || panelBusy('skPanel') || panelScrolled('skPanel'))) return;
   if(html===_skKey) return;
@@ -33603,6 +33746,18 @@ function subsDetailPaint(){
     w.style.display = subsOpen(w.dataset.d) ? '' : 'none';
 }
 function subsDetail(k){
+  // SUBTITLE USER INPUT IS NOT BEHIND A DISCLOSURE. It is the one panel that
+  // wants something from you, so it is always on the page - which makes its
+  // switchboard link a jump rather than a toggle. Anything with no collapsed
+  // wrapper is treated the same way, so adding a panel here never needs this
+  // function changed.
+  if(!document.querySelector('.subsd[data-d="'+k+'"]')){
+    const id={picture:'skPanel'}[k]||'';
+    const el=id&&document.getElementById(id);
+    if(el){ if(k==='picture') loadSubKind();
+            el.scrollIntoView({behavior:'smooth', block:'start'}); }
+    return;
+  }
   const on=!subsOpen(k);
   try{ localStorage.setItem('nuarr.subs.d.'+k, on?'open':'shut'); }catch(e){}
   subsDetailPaint();
@@ -33702,7 +33857,8 @@ function subsBoardHtml(){
           ${subsSwitchHtml(b)}
           ${b.panel?`<a href="#" onclick="subsDetail('${b.key}');return false"
             title="the full panel for this one - the lists, the buttons and the pickers">${
-            subsOpen(b.key)?'▾ hide the detail':'▸ the detail'}</a>`:''}
+            b.detail_word ? esc(b.detail_word)
+                          : (subsOpen(b.key)?'▾ hide the detail':'▸ the detail')}</a>`:''}
         </div>
       </div>`;
     }).join('')}
@@ -33896,45 +34052,13 @@ function subsProcHtml(){
 // answer here is applied to the file AND written down against the show and
 // the release group, so the next episode does not ask - which is why this
 // list gets shorter as you use it rather than longer.
-function subsAskHtml(){
-  const A=(_subq&&_subq.asking)||[];
-  if(!A.length) return '';
-  return `<div class="lkind capswrap" style="padding:10px 12px;margin-bottom:8px;
-       border-left:3px solid #e8a33d">
-    <div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap">
-      <b style="color:#e8a33d">Yours to call</b>
-      <span class="dim" style="font-size:11.5px">${num(A.length,'you')} file${
-        A.length===1?'':'s'} nuarr will not guess about</span>
-      <span class="dim" style="font-size:10.5px;margin-left:auto">an answer is
-        remembered against the show and the release group, so the next
-        episode does not ask</span>
-    </div>
-    <div class="scrollbox" style="max-height:300px;overflow:auto;margin-top:7px">
-    ${A.slice(0,40).map(r=>(r.asks||[]).map(a=>`
-      <div style="border-top:1px solid var(--line);padding:7px 0">
-        <div style="display:flex;gap:8px;align-items:baseline;font-size:11.5px">
-          <span style="flex:1 1 auto;min-width:0;overflow:hidden;
-            text-overflow:ellipsis;white-space:nowrap"
-            title="${esc(r.path||'')}">${esc(r.name||'')}</span>
-          ${r.disk?`<span style="flex:none;color:${diskColor(r.disk)}">${esc(r.disk)}</span>`:''}
-        </div>
-        <div class="dim" style="font-size:11px;margin-top:2px">${esc(a.asking||'')}</div>
-        ${a.words?`<div class="dim" style="font-size:10px;margin-top:2px;opacity:.7">read: ${esc(String(a.words).slice(0,120))}</div>`:''}
-        <div style="margin-top:5px;display:flex;gap:7px;flex-wrap:wrap;
-             align-items:center">
-          ${(a.options||[]).map(o=>`<button class="btn xs"
-             title="${esc(o.what||'')}"
-             onclick="subAnswer(${r.file_id},'${esc(a.q)}','${esc(o.v)}',this)"
-             >${esc(o.label||o.v)}</button>`).join('')}
-          <span class="dim" style="font-size:10px">applies to this file and is
-            remembered for the show and the group —
-            <a href="#" title="Answer for this file only; other episodes will still ask"
-               onclick="subAnswer(${r.file_id},'${esc(a.q)}','${
-                 esc(((a.options||[])[0]||{}).v||'')}',this,'file');return false">just this one</a></span>
-        </div>
-      </div>`).join('')).join('')}
-    </div></div>`;
-}
+// subsAskHtml used to live here: a panel of its own listing the files the
+// planner would not guess about. It is gone because it was the same activity
+// as the findings list one section down - you, looking at something nuarr is
+// unsure of, and saying what it is - and two panels for one activity is what
+// this page has spent three rounds removing. See skAskHtml and skPaint: the
+// questions that have no reading behind them sit at the top of Subtitle User
+// Input, and the ones that do are rows in its table like any other.
 
 async function subAnswer(fid, q, choice, btn, scope){
   if(btn&&btn.tagName==='BUTTON'){ btn.disabled=true; btn.textContent='…'; }
@@ -33967,8 +34091,10 @@ function subsPaint(){
   // HOLDS STILL UNDER THE POINTER. Same rule the old panel learned: a list
   // being read is a list that must not be rebuilt beneath the reader.
   if(panelScrolled('subsTop')) return;
+  // subsAskHtml is gone: its questions live in Subtitle User Input now,
+  // which is the panel that was already asking you things.
   const html = subsBoardHtml() + subsScanHtml() + subsProcHtml()
-             + subsAskHtml() + subsListHtml();
+             + subsListHtml();
   if(html!==_subsKey){ _subsKey=html; el.innerHTML=html; }
   subsDetailPaint();
 }
