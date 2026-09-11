@@ -219,9 +219,11 @@ def board() -> list:
                         f"dismissed at {subkind.dismiss_at()}%"),
             "waiting": tally[PICTURE] + tally[TITLE],
             "waiting_word": "queued files to mark or retitle",
-            # Its panel is Subtitle User Input, which is always on the page -
-            # so this link jumps to it rather than opening anything.
-            "detail_word": "go to Subtitle User Input",
+            # Its panel is Subtitle User Input, and this row is its handle.
+            # Named rather than left as "the detail", because the panel it
+            # opens has a name and it is not a detail - it is the one thing on
+            # the page that wants an answer.
+            "detail_name": "Subtitle User Input",
             # READ IS NOT THE SAME AS OUTSTANDING, and putting the two
             # numbers side by side without saying so is how "600" ends up
             # looking like a backlog next to "1 waiting". Most of those 600

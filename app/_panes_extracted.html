@@ -236,38 +236,15 @@
         <div id="jobsBody" style="padding:0 14px 14px"></div>
       </div>
       <div id="langPane" style="display:none">
-        <!-- ONE PAGE, ONE QUESTION.
-             This page used to be four panels stacked up, each with its own
-             header, count, progress bar, switch and list. They do genuinely
-             different work - one walks folders for loose subtitle files, one
-             counts the events inside tracks, one reads pixels - but they were
-             all REPORTING the same library in three different vocabularies,
-             and the same episode could appear in three of them with nothing
-             saying it was one episode.
+        <!-- THE ORDER OF THIS PAGE IS THE ORDER OF THE QUESTION.
+             What are the rules? Then: what is nuarr doing about them? Then:
+             what does it need from me? The rules used to be third, under the
+             switchboard and the queue, which put the answer above the
+             question - and the rules are also the one thing on this page that
+             is yours to set rather than nuarr's to report. -->
 
-             So the top of the page is now the switchboard (every subtitle
-             decision and whether it is on), what is in flight, and ONE list
-             whose unit is the file. Drawn by subsPaint from /api/subs.
-
-             NOTHING WAS THROWN AWAY. Each old panel is still here, one behind
-             each switchboard row, because the per-row buttons, the kind
-             pickers, the retry list and the per-library switches live in them
-             and every one of those is still the right place to do that job.
-             They are shut until asked for. -->
-        <div id="subsTop" style="padding:6px 14px 4px"></div>
-
-        <!-- SUBTITLE USER INPUT, and it is not a detail.
-             Everything above this is nuarr telling you what it is doing.
-             This is the one panel that needs something FROM you - the
-             readings it is not sure enough about to act on, and the two kinds
-             of question nothing can measure - so it sits with the things you
-             look at rather than behind a disclosure you have to remember to
-             open. Drawn by skPaint; see skAskHtml for the questions that have
-             no reading behind them. -->
-        <div id="skPanel" style="padding:0 14px 6px"></div>
-
-        <!-- THE POLICY, WHICH IS NOT A SYSTEM. Everything above is nuarr
-             acting; this is what it is allowed to aim for. It stays open. -->
+        <!-- 1. THE POLICY. What a file is allowed to end up carrying, per
+             library, and which finished files no longer match it. -->
         <div style="padding:6px 14px 4px">
           <div class="lkind" style="padding:11px 12px">
             <b style="color:#6fb0ff">Subtitle rules</b>
@@ -289,7 +266,21 @@
         </div>
         <div id="langBody" style="padding:0 14px 14px"></div>
 
-        <!-- What the sidecar rule would do, readable BEFORE it is switched
+        <!-- 2. WHAT NUARR IS DOING ABOUT THEM. The switchboard, the reading's
+             progress, what is being processed, and the file-by-file list. -->
+        <div id="subsTop" style="padding:6px 14px 4px"></div>
+
+        <!-- 3. WHAT IT NEEDS FROM YOU.
+             Collapsible from its own switchboard row above, and open unless
+             you have shut it: it is the one panel that wants something, so it
+             should not have to be found. Drawn by skPaint; see skAskHtml for
+             the questions that have no reading behind them. -->
+        <div class="subsd" data-d="picture">
+          <div id="skPanel" style="padding:0 14px 6px"></div>
+        </div>
+
+        <!-- The evidence behind two of the switchboard rows, shut by default.
+             What the sidecar rule would do, readable BEFORE it is switched
              on - it rewrites files and recycles others, so the preview is the
              point rather than a decoration. -->
         <div class="subsd" data-d="sidecar" style="display:none">

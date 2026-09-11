@@ -24212,8 +24212,7 @@ function wtab(which){
     // is looking at. Each opens itself when its row is opened.
     loadSubs(true);
     if(subsOpen('sidecar')) loadSubEmbed();
-    // Subtitle User Input is always on the page, so it always loads.
-    loadSubKind();
+    if(subsOpen('picture')) loadSubKind();   // open unless you shut it
     // Its own slot, its own remembered open/shut state. Sharing the codec
     // pages' one would mean opening the panel here silently opened it there
     // too, about a different question.
@@ -33737,20 +33736,24 @@ const SUBS_W={sidecar:'sitting beside it', dupe:'twice inside it',
 // one that speaks for it.
 const SUBS_IDLE={sidecar:'subembed', dupe:'subdupe', picture:'hardsub'};
 
+// Shut unless you opened it - EXCEPT Subtitle User Input, which is open
+// unless you shut it. The two evidence panels are there when you go looking;
+// that one is the page asking you a question, and a question nobody sees is a
+// list that only ever grows.
+const SUBS_OPEN_BY_DEFAULT = {picture: true};
 function subsOpen(k){
-  try{ return localStorage.getItem('nuarr.subs.d.'+k)==='open'; }
-  catch(e){ return false; }
+  let v=null;
+  try{ v = localStorage.getItem('nuarr.subs.d.'+k); }catch(e){}
+  if(v===null) return !!SUBS_OPEN_BY_DEFAULT[k];
+  return v==='open';
 }
 function subsDetailPaint(){
   for(const w of document.querySelectorAll('.subsd'))
     w.style.display = subsOpen(w.dataset.d) ? '' : 'none';
 }
 function subsDetail(k){
-  // SUBTITLE USER INPUT IS NOT BEHIND A DISCLOSURE. It is the one panel that
-  // wants something from you, so it is always on the page - which makes its
-  // switchboard link a jump rather than a toggle. Anything with no collapsed
-  // wrapper is treated the same way, so adding a panel here never needs this
-  // function changed.
+  // A panel with no collapsed wrapper is a jump rather than a toggle, so
+  // adding one here never needs this function changed.
   if(!document.querySelector('.subsd[data-d="'+k+'"]')){
     const id={picture:'skPanel'}[k]||'';
     const el=id&&document.getElementById(id);
@@ -33856,9 +33859,11 @@ function subsBoardHtml(){
              font-size:11.5px;flex-wrap:wrap">
           ${subsSwitchHtml(b)}
           ${b.panel?`<a href="#" onclick="subsDetail('${b.key}');return false"
-            title="the full panel for this one - the lists, the buttons and the pickers">${
-            b.detail_word ? esc(b.detail_word)
-                          : (subsOpen(b.key)?'▾ hide the detail':'▸ the detail')}</a>`:''}
+            title="${b.detail_name
+              ? 'Show or hide '+esc(b.detail_name)+', and jump to it'
+              : 'the full panel for this one - the lists, the buttons and the pickers'}">${
+            (subsOpen(b.key)?'▾ hide ':'▸ show ')
+            + esc(b.detail_name || 'the detail')}</a>`:''}
         </div>
       </div>`;
     }).join('')}
