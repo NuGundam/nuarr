@@ -32553,13 +32553,20 @@ async function idleLoad(key){
 // beneath it is drawn in the same colour as that line. The colour carries no
 // meaning by itself; it exists so the eye can join the name to the bar
 // without counting rows.
+// AND THE COLOUR IS THE DISK'S OWN. Every other panel in nuarr already
+// draws NU-DRIVE-7 in one particular colour - diskColor() has spaced twelve
+// spindles round the wheel for exactly this - so inventing a second palette
+// here would mean the same disk was two colours on one screen. Two lanes can
+// never share a disk, so disk colours are guaranteed to differ, and the
+// colour now says something rather than merely separating: the bar, the name
+// and the disk are all that spindle's colour, in the strip and in the table.
 const LANEC=['#6fb0ff','#e8a33d','#7fd18c','#c98cf0'];
 function laneLines(fl, small){
   fl = fl||[];
   if(!fl.length) return '';
   const fs = small ? '10px' : '11px';
   return fl.map((v,i)=>{
-    const c=LANEC[i%LANEC.length];
+    const c=v.disk ? diskColor(v.disk) : LANEC[i%LANEC.length];
     const p=Math.max(0,Math.min(100,v.pct||0));
     return `<div style="display:flex;gap:8px;align-items:baseline;
          font-size:${fs};margin-top:3px">
@@ -32755,7 +32762,9 @@ let _sePoll2=null, _seDone=-1;
 function seIdleTick(ms){
   clearTimeout(_sePoll2);
   _sePoll2=setTimeout(async ()=>{
-    if(!document.getElementById('sePanel')) return;
+   let alive=true;
+   try{
+    if(!document.getElementById('sePanel')){ alive=false; return; }
     await idleLoad('subembed');
     const d=_idle['subembed']||{};
     // THE LIST CHANGED EXACTLY WHEN A FILE FINISHED, so that is when it is
@@ -32763,9 +32772,21 @@ function seIdleTick(ms){
     if(_seDone !== (d.done||0)){
       _seDone = d.done||0;
       seLoadFailed();
-      if(!seHold()) loadSubEmbed(false);
+      // FETCHING IS NOT PAINTING, AND ONLY ONE OF THEM IS RUDE.
+      //
+      // This skipped the whole refresh while the list was held - and the list
+      // counts as held the moment it is scrolled more than eight pixels,
+      // which on five thousand rows is nearly always. So once you scrolled,
+      // the panel stopped learning anything: the header still said how many
+      // had been taken in ten minutes ago, and the only way out was reloading
+      // the page. But holding still is about the NODES under the pointer, not
+      // about the numbers. The answer is fetched every time now; the section
+      // that holds the list is the only thing that declines to redraw, and it
+      // declines down in the paint where it can tell the difference.
+      loadSubEmbed(false);
     }
     sePaint();
+    alive = !!(d.running||d.paused);
     // IT HAS TO KEEP LOOKING TO SEE IT START.
     //
     // This re-armed only while the runner was already working, so the poll
@@ -32777,7 +32798,19 @@ function seIdleTick(ms){
     //
     // So it always comes back; it simply comes back slower when there is
     // nothing happening. The cost either way is one dict read.
-    seIdleTick((d.running||d.paused) ? 2000 : 6000);
+   }catch(e){
+    // AND IT MUST SURVIVE ITS OWN MISTAKES. This chain re-armed on its last
+    // line, so ANY throw anywhere above - a render slip, a fetch the browser
+    // abandoned - ended the poll for good, and the only cure was reloading
+    // the page. That is exactly the shape of the complaint: the process
+    // bubble, which runs on a setInterval that cannot die, stayed live while
+    // this panel sat frozen on a state from minutes ago.
+    //
+    // The next tick is booked in a finally now. A timer that stops on the
+    // first bad second is not a timer.
+   }finally{
+    seIdleTick(alive ? 2000 : 6000);
+   }
   }, ms||2000);
 }
 async function loadSubEmbed(full){
@@ -32794,7 +32827,16 @@ async function loadSubEmbed(full){
   if(!_se) el.innerHTML=seWaitHtml(null);
   const want = (full||seShown()) ? '&preview=6000&full=1' : '&preview=12';
   try{ _se=await (await fetch('/api/subembed?x=1'+want)).json(); }
-  catch(e){ el.innerHTML='<span class="dim">could not load</span>'; return; }
+  catch(e){
+    // WHAT IS ALREADY DRAWN IS BETTER THAN AN APOLOGY. This walk can take a
+    // minute on a cold cache, and a browser that gives up on the request used
+    // to wipe the entire panel - five thousand rows and the live bars with
+    // them - to print three words. The answer on screen is a few seconds old
+    // at worst; the next tick replaces it.
+    if(!_se) el.innerHTML='<span class="dim">could not load — trying again</span>';
+    seIdleTick(3000);
+    return;
+  }
   sePaint();
 }
 // A LIST THAT MOVES UNDER YOUR HAND IS A LIST YOU CANNOT READ.
@@ -32949,7 +32991,8 @@ function sePaint(force){
         return (x<y?-1:x>y?1:0)*_seSort.dir;
       })
     : pv;
-  const _th=(k,t,w)=>`<th style="width:${w};text-align:center;padding:4px 6px;
+  const _th=(k,t,w,al)=>`<th style="width:${w};text-align:${al||'center'};
+      padding:4px 6px 4px ${al==='left'?'10px':'6px'};
       font-size:10px;letter-spacing:.05em;text-transform:uppercase;
       font-weight:600;cursor:pointer;user-select:none;position:sticky;top:0;
       background:var(--panel);border-bottom:1px solid var(--line);
@@ -32961,25 +33004,26 @@ function sePaint(force){
   const rows = pv.length ? `<div class="scrollbox auto"><table
       style="width:100%;font-size:11.5px;margin-top:4px;table-layout:fixed;
              border-collapse:collapse">
-      <thead><tr>${_th('file','File','40%')}${_th('library','Library','16%')}${
+      <thead><tr>${_th('file','File','40%','left')}${
+        _th('library','Library','16%')}${
         _th('disk','Disk','15%')}${_th('subs','Subtitles','19%')}<th
         style="width:10%;position:sticky;top:0;background:var(--panel);
           border-bottom:1px solid var(--line)"></th></tr></thead>
       <tbody>${SORTED.map(f=>`<tr>
-        <td style="padding:3px 6px;text-align:center;overflow:hidden;
+        <td style="padding:3px 6px 3px 10px;text-align:left;overflow:hidden;
             text-overflow:ellipsis;white-space:nowrap"
             title="${esc(f.path||'')}"
           >${esc(String(f.path||'').split('\\').pop())}</td>
         <td class="dim" style="padding:3px 6px;text-align:center;overflow:hidden;
             text-overflow:ellipsis;white-space:nowrap">${esc(f.library||'')}</td>
-        <td class="dim" style="padding:3px 6px;text-align:center;
-            white-space:nowrap"
+        <td style="padding:3px 6px;text-align:center;white-space:nowrap;
+            color:${f.pool_disk?diskColor(f.pool_disk):'var(--dim)'}"
             title="Which disk in the pool this file lives on. Files on a disk somebody is reading from are stepped over rather than waited on."
           >${esc(f.pool_disk||'')}</td>
         <td style="padding:3px 6px;text-align:center">${(f.take||[]).map(t=>
           `<span class="capsc ok" title="${esc(t.sidecar||'')}">${
-            esc(String(t.sidecar||'').split('.').pop())} ${esc(t.lang||'')}${
-            t.role?' '+esc(t.role):''}</span>`).join('')}${
+            esc(t.lang||'')}${t.role?' '+esc(t.role):''} ${
+            esc(String(t.sidecar||'').split('.').pop())}</span>`).join('')}${
           (f.skip||[]).length?`<span class="dim" title="${esc((f.skip||[])
             .map(x=>x.why).join('\n'))}"> +${(f.skip||[]).length} skipped</span>`:''}</td>
         <td style="padding:3px 6px;text-align:center;white-space:nowrap">${
