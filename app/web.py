@@ -7598,6 +7598,55 @@ async def api_hardsub_mark(file_id: int, confirm: str = "", kind: str = ""):
     return await asyncio.to_thread(hardsub.mark_one, int(file_id), kind)
 
 
+@app.get("/api/subdupe")
+def api_subdupe(preview: int = 40):
+    """Files carrying the same subtitle twice, and what would be removed."""
+    from . import subdupe
+    out = subdupe.stats()
+    out["enabled"] = subdupe.enabled()
+    try:
+        got = subdupe.cached()
+    except Exception as e:                                   # noqa: BLE001
+        got, out["error"] = [], f"{type(e).__name__}: {e}"
+    out["waiting"] = len(got)
+    # THE COUNT IS THE DECISION AND THE LIST IS THE EVIDENCE. A switch that
+    # removes tracks from files has to be able to show which files first.
+    by: dict = {}
+    for r in got:
+        parts = (r.get("path") or "").split("\\")
+        show = parts[2] if len(parts) > 2 else (r.get("library") or "?")
+        by[show] = by.get(show, 0) + 1
+    out["by_show"] = sorted(({"show": k, "n": v} for k, v in by.items()),
+                            key=lambda x: -x["n"])[:14]
+    out["preview"] = [
+        {"file_id": r["file_id"], "path": r["path"],
+         "library": r.get("library") or "", "kinds": r.get("kinds") or []}
+        for r in got[:max(0, min(int(preview), 300))]]
+    return out
+
+
+@app.post("/api/subdupe/enable")
+async def api_subdupe_enable(on: int = 0):
+    from . import gate, subdupe, idle
+    gate.set_toggle(subdupe.ENABLED_KEY, bool(on))
+    idle.bump(subdupe.KEY)
+    return {"ok": True, "enabled": subdupe.enabled()}
+
+
+@app.get("/api/subdupe/plan")
+def api_subdupe_plan(file_id: int):
+    """Exactly which tracks would go from one file. Reads only."""
+    from . import subdupe
+    return subdupe.plan_one(int(file_id))
+
+
+@app.post("/api/subdupe/one")
+async def api_subdupe_one(file_id: int):
+    """Tidy one file now, whatever the switch says."""
+    from . import subdupe
+    return await asyncio.to_thread(subdupe.fix_one, int(file_id))
+
+
 @app.get("/api/subembed")
 def api_subembed(preview: int = 12, full: int = 0, refresh: int = 0):
     """What the sidecar-embed rule has done, and what it would do next.
@@ -33469,6 +33518,123 @@ function ago2(t){
   return d>1 ? 'in '+hsDur(d) : ago(t);
 }
 
+// ---- the same subject from the inside: one track per kind ---------------
+//
+// THE OTHER HALF OF THE SIDECAR PANEL. That one is about what is outside a
+// file trying to get in; this is about what is already inside it being there
+// twice. They belong on one page because the answer to "should this sidecar
+// go in" depends on what is already there - and because the duplicates were
+// created by the sweep above, at a time when it could not see what it had
+// already put in.
+let _sd = null, _sdKey = '', _sdOpen = false;
+function sdShown(){
+  try{ return localStorage.getItem('nuarr.subdupe')==='open'; }
+  catch(e){ return false; }
+}
+function sdShow(on){
+  try{ localStorage.setItem('nuarr.subdupe', on?'open':'shut'); }catch(e){}
+  sdPaint();
+}
+async function loadSubdupe(){
+  const el=document.getElementById('sdPanel'); if(!el) return;
+  try{ _sd = await (await fetch('/api/subdupe?preview=60')).json(); }
+  catch(e){ return; }
+  sdPaint();
+  idleLoad('subdupe').then(()=>sdPaint());
+}
+async function sdEnable(on, btn){
+  if(btn) btn.disabled = true;
+  try{ await fetch('/api/subdupe/enable?on='+(on?1:0), {method:'POST'}); }
+  catch(e){}
+  await loadSubdupe();
+}
+async function sdOne(fid, btn){
+  if(btn){ btn.disabled=true; btn.textContent='working…'; }
+  let r={};
+  try{ r = await (await fetch('/api/subdupe/one?file_id='+fid,
+                              {method:'POST'})).json(); }
+  catch(e){ r={ok:false, why:String(e)}; }
+  if(btn) btn.textContent = r.ok ? `removed ${r.removed}` : 'failed';
+  if(!r.ok && r.why) alert(r.why);
+  setTimeout(loadSubdupe, 900);
+}
+function sdPaint(){
+  const el=document.getElementById('sdPanel'); if(!el||!_sd) return;
+  const d=_sd, on=!!d.enabled, open=sdShown();
+  const idle=_idle['subdupe']||{};
+  const head=`<div class="lkindhead ckhead" onclick="sdShow(${open?'false':'true'})"
+      style="cursor:pointer" title="${open?'hide':'show'} the list">
+    <span class="ccaret">${open?'▾':'▸'}</span>
+    <b style="color:#6fb0ff">The same subtitle twice inside one file</b>
+    <span class="dim" style="font-size:11.5px">${
+      d.waiting?`${fmt(d.waiting)} file${d.waiting===1?'':'s'} carry a second
+        copy of a track they already have`
+      :'every file carries one of each'}${
+      d.removed?` · ${fmt(d.removed)} removed from ${fmt(d.files)} so far`:''}</span>
+    <span class="dim" style="margin-left:auto">${on?'on':'off'}</span>
+  </div>`;
+  // THE SWITCH SAYS WHAT IT DOES, NOT WHAT IT IS CALLED. This is the only
+  // background sweep that takes a track OUT of a file, so the sentence beside
+  // it is the one that matters, not the label.
+  const sw=`<div class="lkind" style="padding:9px 12px;margin:6px 0">
+    <div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap">
+      <b style="font-size:11.5px">Remove the extra copy</b>
+      <span class="dim" style="font-size:11px">keeping whichever has the most
+        lines in it</span>
+      <label class="gsw" style="margin-left:auto">
+        <input type="checkbox" ${on?'checked':''}
+          onchange="sdEnable(this.checked,this)">
+        <span class="gname">tidy them in the background</span>
+        <span class="gstate ${on?'on':'off'}">${on?'on':'off'}</span>
+      </label>
+    </div>
+    <div class="dim" style="font-size:11.5px;margin-top:4px;line-height:1.45">
+      A track is removed only when another of the <b>same language and the
+      same kind</b> is still there afterwards &mdash; so an SDH track beside a
+      full one is safe, a signs track beside dialogue is safe, and the blank
+      marker that says the words are painted on is never touched. A language
+      this library does not keep is not touched either; that is the rules'
+      decision, not this one. Every candidate is read and its lines counted
+      before anything goes, the rebuilt file is read back and must still carry
+      one of every language and kind, and every removal is written down.
+      <b>Nuarr put some of these here</b>: the sidecar sweep above used to
+      rewrite a file without re-reading it, so a release shipping three
+      English sidecars got one per pass. That is fixed; this is the repair.
+    </div>
+    ${(d.by_show||[]).length?`<div style="display:flex;gap:6px;flex-wrap:wrap;
+        margin-top:7px">${(d.by_show||[]).map(x=>`<span class="capsc"
+        title="${esc(x.show)}">${esc(String(x.show).split(' {')[0].slice(0,34))}
+        <b style="color:var(--warn)">${fmt(x.n)}</b></span>`).join('')}</div>`:''}
+  </div>`;
+  const bar = (idle.running||idle.paused)
+    ? idleStrip(idle, {title:'Working through them'}) : '';
+  const rows = open && (d.preview||[]).length ? `<div class="scrollbox auto"><table
+      style="width:100%;font-size:11.5px;margin-top:4px;table-layout:fixed">
+      <colgroup><col style="width:auto"><col style="width:15%">
+        <col style="width:22%"><col style="width:11%"></colgroup>
+      <thead><tr class="dim" style="font-size:10px;letter-spacing:.05em">
+        <th class="l" style="text-align:left;padding:3px 6px">FILE</th>
+        <th class="c">LIBRARY</th>
+        <th class="c" title="The language and kind that appears more than once">TWICE OVER</th>
+        <th class="c"></th></tr></thead>
+      <tbody>${(d.preview||[]).map(f=>`<tr>
+        <td style="padding:3px 6px;overflow:hidden;text-overflow:ellipsis;
+            white-space:nowrap" title="${esc(f.path||'')}"
+          >${esc(String(f.path||'').split('\\').pop())}</td>
+        <td class="c dim">${esc(f.library||'')}</td>
+        <td class="c mono" style="color:var(--warn)">${
+          esc((f.kinds||[]).join(', '))}</td>
+        <td class="c"><button class="rmb" onclick="sdOne(${f.file_id},this)"
+          title="Read this one now, count the lines in each copy and remove the shorter ones. One remux, verified before it replaces anything.">Tidy it</button></td>
+      </tr>`).join('')}</tbody></table></div>${
+      d.waiting>(d.preview||[]).length?`<div class="dim" style="font-size:11px;
+        margin-top:4px">showing ${fmt((d.preview||[]).length)} of ${
+        fmt(d.waiting)}</div>`:''}` : '';
+  const html=`<div class="lkind" style="padding:11px 12px">${head}${sw}${bar}${rows}</div>`;
+  if(html===_sdKey) return;
+  _sdKey=html; el.innerHTML=html;
+}
+
 // ---- sidecar subtitles waiting to come inside ---------------------------
 let _se=null, _seKey='', _sePoll=null, _seFail={rows:[]};
 // WHICH COLUMN, AND WHICH WAY. Nothing is remembered across a reload on
@@ -33638,6 +33804,8 @@ async function loadSubEmbed(full){
   // so the wait can be a measured one - and a skeleton that sits for a minute
   // is indistinguishable from a panel that has died.
   if(!_se) el.innerHTML=seWaitHtml(null);
+  // Its companion panel rides the same page load.
+  try{ loadSubdupe(); }catch(_){ }
   const want = (full||seShown()) ? '&preview=6000&full=1' : '&preview=12';
   try{ _se=await (await fetch('/api/subembed?x=1'+want)).json(); }
   catch(e){

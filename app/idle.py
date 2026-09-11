@@ -342,7 +342,8 @@ async def busy(disk: str = "") -> dict:
 async def run(key: str, title: str, pending, do_one, label=None, *,
               empty_s: float = EMPTY_S, pause_s: float = PAUSE_S,
               system_name: str = "", disk_of=None, lanes: int = LANES,
-              goto: str = "", on_pass=None, note_of=None) -> None:
+              goto: str = "", on_pass=None, note_of=None,
+              rank: int = 50) -> None:
     r"""Work through `pending()` for as long as the machine can spare it.
 
     WHAT A CALLER MAY HAND OVER
@@ -367,6 +368,7 @@ async def run(key: str, title: str, pending, do_one, label=None, *,
     who sits down to watch something in the other fifty-nine minutes.
     """
     d = state(key, title)
+    d["rank"] = int(rank)
     if goto:
         d["goto"] = goto
     d["system_name"] = system_name or key
@@ -479,7 +481,24 @@ async def run(key: str, title: str, pending, do_one, label=None, *,
                     # WHAT EVERY SYSTEM IS HOLDING, not just this one.
                     others = [t for t in TASKS.values()
                               if t.id not in _mine_ids(flight)]
-                    if len(TASKS) >= max(1, LANES_TOTAL):
+                    # AND A LANE KEPT BACK FOR ANYTHING MORE IMPORTANT.
+                    #
+                    # "The inside is priority one; the outside fights to come
+                    # in." With one shared budget and no order between the
+                    # systems, whichever happened to look first took the lanes
+                    # - so a sweep that tidies what is already in a file could
+                    # sit behind one that adds more to it, which is the wrong
+                    # way round and was how the duplicates compounded. A
+                    # system ranked below another leaves it a lane whenever
+                    # that one has work waiting and none in flight.
+                    _ahead = _waiting_above(rank, key)
+                    _room = max(1, LANES_TOTAL) - (1 if _ahead else 0)
+                    if len(TASKS) >= max(1, _room):
+                        if _ahead:
+                            d["waiting_for"] = (
+                                f"leaving a lane for {_ahead}, which comes "
+                                f"first")
+                            break
                         d["waiting_for"] = (
                             f"{len(TASKS)} background files are already in "
                             f"flight across every system (the limit is "
@@ -753,6 +772,28 @@ class Task:
     def __exit__(self, *exc):
         self.close()
         return False
+
+
+def _waiting_above(rank: int, me: str) -> str:
+    """A more important system with work waiting and nothing in flight."""
+    try:
+        busy = {t.system for t in TASKS.values()}
+    except Exception:                                            # noqa: BLE001
+        busy = set()
+    for k, d in (STATES or {}).items():
+        if k == me:
+            continue
+        if int(d.get("rank") or 50) >= int(rank):
+            continue
+        if d.get("paused"):
+            continue
+        left = int(d.get("total") or 0) - int(d.get("done") or 0)
+        if left <= 0:
+            continue
+        if (d.get("system_name") or k) in busy:
+            continue            # it already has a lane; it is not being held out
+        return str(d.get("title") or k)
+    return ""
 
 
 def _mine_ids(flight) -> set:

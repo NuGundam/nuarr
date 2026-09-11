@@ -471,4 +471,6 @@ async def watch() -> None:
                    disk_of=lambda r: r.get("pool_disk") or "",
                    note_of=lambda r: "decoding both ends",
                    system_name="Does it decode?",
+                   # Nothing is waiting on the answer, so it goes last.
+                   rank=80,
                    goto="/settings#integrity", on_pass=_after)

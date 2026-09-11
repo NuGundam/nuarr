@@ -316,12 +316,36 @@ def read_sidecar_name(video: str, side: str) -> dict:
         return {"lang": "", "role": "", "ok": False,
                 "why": "no language in the filename, so there is nothing to "
                        "check against the language rules"}
-    parts = [p.strip().lower() for p in rest.split(".") if p.strip()]
+    # A DOT IS NOT THE ONLY SEPARATOR ANYBODY USES.
+    #
+    # This split on dots alone, which is Plex's convention and about half of
+    # what is actually on disk. Measured over a four-hundred-file sample of
+    # this library, the refusals were led by names it could not read rather
+    # than by policy: sixty-four with no language at all, sixty-two ending
+    # ".1", sixty-two ".2", thirteen with "_eng" or "_eng_1". Those last are
+    # plainly English and were being skipped as unreadable - which is not a
+    # careful refusal, it is a parser too narrow for its own library.
+    #
+    # Underscores split too, and a trailing number is an INDEX rather than a
+    # language: Bazarr and several download clients write "name.en.srt",
+    # "name.en.1.srt", "name_eng.srt", "name_eng_1.srt" for the same thing.
+    # The index is kept out of the language hunt and out of the role list,
+    # where it would otherwise be noise.
+    parts = [p.strip().lower()
+             for p in re.split(r"[._\s-]+", rest) if p.strip()]
+    # A bare number is a copy number, not a language and not a role.
+    parts = [p for p in parts if not p.isdigit()]
     roles = [p for p in parts if p in _ROLE]
     langs = [p for p in parts if p not in _ROLE and _LANG_RE.match(p)]
     if not langs:
         return {"lang": "", "role": ",".join(roles), "ok": False,
-                "why": f"{rest!r} is not a language code"}
+                "why": ("this is a second copy with no language on it - "
+                        "only a number, which says nothing about what is in it"
+                        if rest.strip(". _-").isdigit() else
+                        f"{rest!r} is not a language code"
+                        if rest.strip(". _-") else
+                        "no language in the filename, so there is nothing to "
+                        "check against the language rules")}
     return {"lang": langs[0][:3], "role": ",".join(roles), "ok": True,
             "why": ""}
 
@@ -621,6 +645,21 @@ def plan_one(file_id: int, force: bool = False,
                            f"into the picture, so a second copy inside it "
                            f"would play on top of them - and nothing can take "
                            f"them out of the picture without re-encoding it"})
+                continue
+            # THE INSIDE COMES FIRST. A file that already carries two
+            # tracks of this kind is a file with a question outstanding, and
+            # adding a third while it is outstanding is how three English
+            # tracks happened in the first place. The duplicate sweep settles
+            # it, and the sidecar is looked at again afterwards - by which
+            # time there is one track to compare against and the answer is
+            # obvious rather than a guess.
+            if len(twins) > 1:
+                out["skip"].append({
+                    "sidecar": side,
+                    "why": f"this file already has {len(twins)} {cls} "
+                           f"{name['lang']} tracks inside it - the duplicate "
+                           f"sweep settles that first, and this is looked at "
+                           f"again once it has"})
                 continue
             # NOT A DUPLICATE AT ALL, so no answer is needed. The language is
             # inside; a subtitle of this KIND is not. Full dialogue against
@@ -1867,4 +1906,6 @@ async def watch() -> None:
                    disk_of=lambda p: p.get("pool_disk") or "",
                    note_of=lambda p: "taking subtitles in",
                    system_name="Sidecar subtitles",
+                   # The outside earns its way in, behind the tidy-up.
+                   rank=50,
                    goto="/settings#subembed")

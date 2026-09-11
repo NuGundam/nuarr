@@ -98,6 +98,36 @@ def _probe_groups(file_id: int) -> dict:
         return {}
 
 
+# TWENTY SECONDS IS NOT A PAGE LOAD.
+#
+# The walk is cheap per file and there are forty thousand of them, so the
+# first honest measurement of this was 20.7s - fine for a sweep that runs on
+# its own clock and hopeless for a panel that asks on every page open. Same
+# answer as the sidecar walk: compute it once, keep it, and let the runner's
+# own pass refresh it for free.
+_LIST: dict = {"at": 0.0, "rows": None, "running": False}
+_LIST_TTL = 600.0
+
+
+def cached(force: bool = False) -> list[dict]:
+    """The candidate list, computed at most once every ten minutes."""
+    now = time.time()
+    if (not force and _LIST["rows"] is not None
+            and now - _LIST["at"] < _LIST_TTL):
+        return _LIST["rows"]
+    if _LIST["running"]:
+        return _LIST["rows"] or []
+    _LIST["running"] = True
+    try:
+        rows = candidates(100000)
+        _LIST.update(at=time.time(), rows=rows)
+    except Exception:                                            # noqa: BLE001
+        pass
+    finally:
+        _LIST["running"] = False
+    return _LIST["rows"] or []
+
+
 def candidates(limit: int = 100000) -> list[dict]:
     r"""Files whose stored probe shows two subtitle tracks of the same kind.
 
@@ -294,6 +324,15 @@ def fix_one(file_id: int, report=None) -> dict:
         except Exception:                                        # noqa: BLE001
             pass
         _note(int(file_id), path, drop)
+        # OUT OF THE SHARED LIST IMMEDIATELY, so the count on the panel falls
+        # as the work happens rather than at the next walk.
+        try:
+            rows = _LIST.get("rows")
+            if rows:
+                _LIST["rows"] = [r for r in rows
+                                 if int(r.get("file_id") or 0) != int(file_id)]
+        except Exception:                                        # noqa: BLE001
+            pass
         joblog.log(f"removed {len(drop)} duplicate subtitle track(s) from "
                    f"{os.path.basename(path)} - "
                    + "; ".join(t["why"] for t in drop), "info",
@@ -378,7 +417,9 @@ def _pending() -> list:
     if not enabled():
         return []
     try:
-        return candidates(100000)
+        # The runner's walk IS the panel's walk - see subembed.walk_now for
+        # the same arrangement and the same reason.
+        return cached(force=True)
     except Exception:                                            # noqa: BLE001
         return []
 
@@ -396,4 +437,7 @@ async def watch() -> None:
                    disk_of=lambda p: p.get("pool_disk") or "",
                    note_of=lambda p: "removing a duplicate subtitle",
                    system_name="Duplicate subtitles",
+                   # PRIORITY ONE. What is already in the file is settled
+                   # before anything else is allowed to add to it.
+                   rank=10,
                    goto="/settings#lang")
