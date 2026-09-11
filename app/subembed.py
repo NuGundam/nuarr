@@ -1064,6 +1064,61 @@ def _embed_tail(file_id, path, takes, drops, cmd, tmp, report, work=None):
         _note(file_id, path, "", "", False, why)
         return {"ok": False, "why": why}
 
+    # AND THE FILE IS RE-READ, BECAUSE IT IS A DIFFERENT FILE NOW.
+    #
+    # THIS IS THE BUG THAT PUT THREE ENGLISH TRACKS INTO CITY HUNTER S02E60.
+    #
+    # Every guard in plan_one that stops a second copy of a language going in
+    # - embedded_langs() and _probe_sub_tracks() both - reads the STORED
+    # probe. Nothing here refreshed it after the rewrite, so the record went
+    # on describing the file as it had been before: no English inside. A
+    # release that ships three English sidecars (.en.ass, .1.en.ass and
+    # .2.en.ass, which sxales does) therefore got one per pass, each pass
+    # believing it was the first. Three passes, three identical tracks, and
+    # the log reads "embedded as en" three times because every one of them
+    # was true at the moment it was written.
+    #
+    # The per-pass dedupe was working exactly as designed and could not help:
+    # it picks the best format per language and role WITHIN one plan, and the
+    # other two sidecars were still on disk for the next plan to find.
+    #
+    # The transcode queue has always done this after a commit - see
+    # jobs._flags_in_place, which says in as many words that skipping the
+    # rewrite is not permission to skip the bookkeeping. The same applies to a
+    # rewrite that did happen.
+    try:
+        from . import jobs as _jobs
+        # SYNCHRONOUSLY, because this runs on a worker thread. jobs.probe is a
+        # coroutine and spinning up an event loop inside a thread to await one
+        # subprocess is machinery in place of a subprocess; the arguments are
+        # the same ones it uses, so the cached shape is identical.
+        _r = _plain([_jobs._ffprobe_exe(), "-v", "quiet", "-print_format",
+                     "json", "-show_streams", "-show_format", path], 180)
+        _data = json.loads(_r[1] or "{}")
+        if _data.get("streams"):
+            _jobs.cache_probe(int(file_id), _data)
+        else:
+            raise ValueError("ffprobe said nothing about the rebuilt file")
+    except Exception:                                            # noqa: BLE001
+        # A probe that fails is not a reason to leave the sidecars on disk -
+        # the track is verifiably in the file, that was checked above. But the
+        # stale record must not be trusted either, so it is cleared: an absent
+        # probe makes plan_one refuse rather than guess.
+        try:
+            with cursor() as cur:
+                cur.execute("DELETE FROM file_probes WHERE file_id=?",
+                            (int(file_id),))
+        except Exception:                                        # noqa: BLE001
+            pass
+    try:
+        with cursor() as cur:
+            cur.execute("UPDATE files SET size=?, mtime=?, updated_at=? "
+                        " WHERE id=?",
+                        (_size(path), os.path.getmtime(path), time.time(),
+                         int(file_id)))
+    except Exception:                                            # noqa: BLE001
+        pass
+
     # AND ONLY NOW THE SIDECARS, one at a time, recycled rather than deleted.
     gone, kept = 0, []
     for t in takes:
