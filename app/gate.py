@@ -279,6 +279,10 @@ class GateStatus:
 
 # ------------------------------------------------------------- toggles ----
 DEFAULTS = {
+    # REMOVING A TRACK IS NOT LIKE ADDING ONE. This sweep takes a duplicate
+    # subtitle out of a file that had it, so it waits to be asked. See
+    # subdupe.enabled.
+    "subdupe.enabled": "0",
     "gate.plex": "1",
     "gate.plex_transcodes_only": "1",   # matches OnlyTranscodes=$true
     # A Plex transcode competes for the GPU, which is what ENCODE jobs need.

@@ -740,6 +740,10 @@ async def _startup() -> None:
         from . import subembed as _se
         _se.init()
         asyncio.create_task(_se.watch())
+        # AND THE ONE THAT TAKES A DUPLICATE BACK OUT. Off by default; see
+        # subdupe.enabled for why this one waits to be asked.
+        from . import subdupe as _sd
+        asyncio.create_task(_sd.watch())
         # The subtitles that are already in the picture. Only ever looks at
         # files that report having none, so a library with proper tracks costs
         # it nothing.
