@@ -26430,9 +26430,19 @@ async function socRulePreview(lib){
           : '<div class="dim" style="margin-top:3px">No file in this library is affected.</div>')}
     </div>`:''}
     <div class="lkind" style="padding:9px 11px">
+      <!-- "SAFE TO APPLY" IS NOT THIS BLOCK'S TO SAY. It only ever measured
+           the PLANNER, and the sidecar rules act outside it - so a change
+           that rewrites 468 files came up "0 of 4,279 ... nothing changes,
+           safe to apply" with the real number sitting in the block above.
+           Two true sentences that read as one false one. The verdict is
+           scoped now, and the all-clear is only given when both halves agree
+           there is nothing to do. -->
       <b style="color:${r.affected?'#e2b341':'#7fd4a3'}">${fmt(r.affected)}</b>
       of ${fmt(r.checked)} file(s) in this library would be planned differently.
-      ${r.affected?'':'<span class="dim">Nothing changes — safe to apply.</span>'}
+      ${r.affected?'':(sBits.length
+        ? `<span class="dim">Nothing about the REBUILD changes — what changes
+             is above.</span>`
+        : '<span class="dim">Nothing changes — safe to apply.</span>')}
       ${(r.files||[]).length?`<div style="max-height:180px;overflow:auto;margin-top:6px;
         font-size:11px" class="dim">${r.files.map(f=>
         `<div>${esc(f.label)} — ${esc(f.change)}</div>`).join('')}</div>`:''}
