@@ -6246,6 +6246,11 @@ async def api_subocr_config(body: dict = Body(...)):
             _idle.bump(_k)
     except Exception:                                    # noqa: BLE001
         pass
+    try:
+        from . import subs as _subs
+        _subs.bump()
+    except Exception:                                    # noqa: BLE001
+        pass
     out = {"ok": True, **subocr.status()}
     # "TAKES EFFECT ON THE NEXT SWEEP" INVITES THE QUESTION "WHEN IS THAT".
     # Erik asked it. The schedule registry already knows; ship the answer with
@@ -7598,6 +7603,25 @@ async def api_hardsub_mark(file_id: int, confirm: str = "", kind: str = ""):
     return await asyncio.to_thread(hardsub.mark_one, int(file_id), kind)
 
 
+@app.get("/api/subs")
+async def api_subs(limit: int = 400, force: int = 0):
+    r"""The whole Subtitles page in one answer.
+
+    ONE REQUEST, BECAUSE IT IS ONE QUESTION. The page used to poll four
+    endpoints - the sidecar walk, the duplicate list, the findings and the
+    idle strip - each with its own timer, and they arrived in whatever order
+    the network felt like. So the header could say "2,706 waiting" while the
+    list under it showed yesterday's rows, and there was no moment at which
+    what was on screen was all true at once.
+
+    OFF THE EVENT LOOP. The merge reads cached lists, but the first call after
+    a restart can walk; a settings page must not be able to stall the server
+    that is also running four sweeps.
+    """
+    from . import subs
+    return await asyncio.to_thread(subs.overview, int(limit), bool(force))
+
+
 @app.get("/api/subdupe")
 def api_subdupe(preview: int = 40):
     """Files carrying the same subtitle twice, and what would be removed."""
@@ -7627,9 +7651,13 @@ def api_subdupe(preview: int = 40):
 
 @app.post("/api/subdupe/enable")
 async def api_subdupe_enable(on: int = 0):
-    from . import gate, subdupe, idle
+    from . import gate, subdupe, idle, subs
     gate.set_toggle(subdupe.ENABLED_KEY, bool(on))
     idle.bump(subdupe.KEY)
+    # The switchboard shows this switch and the count behind it, and both
+    # just changed. A cached merge that outlives the switch it describes is
+    # the page telling you it is off a second after you turned it on.
+    subs.bump()
     return {"ok": True, "enabled": subdupe.enabled()}
 
 
@@ -8264,6 +8292,8 @@ def _log_scan_report(rep, promoted: int, sw: dict, vm: dict, vu: dict,
         _se._WALK["at"] = 0.0
         _se._SUM["at"] = 0.0
         _idle.bump()
+        from . import subs as _subs
+        _subs.bump()
     except Exception:                                    # noqa: BLE001
         pass
     joblog.log(f"scan complete in {took:.0f}s — {n(rep.on_disk)} files on "
@@ -23980,8 +24010,13 @@ function wtab(which){
   if(which==='lang'){
     if(hint) hint.textContent='· subtitles';
     paneLoad('lang', loadLangTab);
-    loadSubEmbed();
-    loadSubKind();
+    // THE PAGE ITSELF FIRST. The three panels below are the detail behind the
+    // switchboard now, and they are shut unless somebody opened one - so
+    // loading them unconditionally would walk the library for a list nobody
+    // is looking at. Each opens itself when its row is opened.
+    loadSubs(true);
+    if(subsOpen('sidecar')) loadSubEmbed();
+    if(subsOpen('picture')) loadSubKind();
     // Its own slot, its own remembered open/shut state. Sharing the codec
     // pages' one would mean opening the panel here silently opened it there
     // too, about a different question.
@@ -33416,6 +33451,255 @@ async function idleLoad(key){
 // colour now says something rather than merely separating: the bar, the name
 // and the disk are all that spindle's colour, in the strip and in the table.
 const LANEC=['#6fb0ff','#e8a33d','#7fd18c','#c98cf0'];
+// ============ THE SUBTITLES PAGE, ASKED AS ONE QUESTION ====================
+//
+// WHY THIS REPLACED FOUR PANELS. Three sweeps grew up on this page one at a
+// time and each brought its own header, its own count, its own progress bar,
+// its own switch and its own list. Erik's words: "it is getting hard to track
+// what each system does and doesn't do". They were not doing repetitive work -
+// they genuinely do different things - but they were REPORTING repetitively,
+// in three vocabularies, about the same library.
+//
+// So this is the page now: a switchboard saying what every subtitle decision
+// is and whether it is on, one strip of what is in flight, and ONE list whose
+// unit is the FILE. City Hunter S02E60 used to appear in three panels with
+// nothing joining them up; here it is one row saying everything that would
+// happen to it. The old panels are still underneath, one behind each
+// switchboard row, because that is where the per-row buttons and the pickers
+// live and none of that is worth losing.
+let _subs=null, _subsPoll=null, _subsKey='', _subsSort='what', _subsDesc=false;
+// One colour per kind of subtitle trouble, used by the chip in the list and
+// by the dot on the switchboard, so the eye can join a row to its system.
+const SUBS_C={sidecar:'#6fb0ff', dupe:'#c98cf0', picture:'#e8a33d',
+              title:'#7fd18c'};
+const SUBS_W={sidecar:'sitting beside it', dupe:'twice inside it',
+              picture:'burned into the picture', title:'a title that lies'};
+// Which runner's strip belongs to which switchboard row. The picture row
+// covers two readers and they share one schedule, so hardsub's strip is the
+// one that speaks for it.
+const SUBS_IDLE={sidecar:'subembed', dupe:'subdupe', picture:'hardsub'};
+
+function subsOpen(k){
+  try{ return localStorage.getItem('nuarr.subs.d.'+k)==='open'; }
+  catch(e){ return false; }
+}
+function subsDetailPaint(){
+  for(const w of document.querySelectorAll('.subsd'))
+    w.style.display = subsOpen(w.dataset.d) ? '' : 'none';
+}
+function subsDetail(k){
+  const on=!subsOpen(k);
+  try{ localStorage.setItem('nuarr.subs.d.'+k, on?'open':'shut'); }catch(e){}
+  subsDetailPaint();
+  _subsKey=''; subsPaint();
+  if(on){
+    // The detail lives below the list, so opening it without going there is
+    // the same as not opening it.
+    if(k==='sidecar') loadSubEmbed();
+    if(k==='dupe')    loadSubdupe();
+    if(k==='picture') loadSubKind();
+    const w=document.querySelector('.subsd[data-d="'+k+'"]');
+    if(w) setTimeout(()=>w.scrollIntoView({behavior:'smooth',block:'start'}),80);
+  }
+}
+function subsSort(k){
+  if(_subsSort===k) _subsDesc=!_subsDesc; else { _subsSort=k; _subsDesc=false; }
+  _subsKey=''; subsPaint();
+}
+
+async function loadSubs(force){
+  if(!document.getElementById('subsTop')) return;
+  // EVERY PANE LIVES IN ONE DOCUMENT, so "the element exists" is not "the
+  // page is open" - without this the merge would be re-read every five
+  // seconds while somebody sat on the Jobs page. It keeps a slow heartbeat so
+  // that arriving here finds an answer already waiting rather than a skeleton.
+  const pane=document.getElementById('langPane');
+  if(!force && pane && pane.style.display==='none'){
+    clearTimeout(_subsPoll);
+    _subsPoll=setTimeout(()=>loadSubs(), 20000);
+    return;
+  }
+  try{ _subs = await (await fetch('/api/subs?limit=400'+(force?'&force=1':''))).json(); }
+  catch(e){ _subs = _subs || {board:[],rows:[],total:0}; }
+  subsPaint();
+  clearTimeout(_subsPoll);
+  // Five seconds is the live half - what is in flight and what failed. The
+  // merge behind it is cached server-side for twenty, so this costs a dict
+  // read most of the time.
+  _subsPoll=setTimeout(()=>{ if(document.getElementById('subsTop')) loadSubs(); },
+                       5000);
+}
+
+function subsSwitchHtml(b){
+  // THE CONTROL ITSELF WHERE THERE IS ONE, AND HONESTY WHERE THERE IS NOT.
+  // Only the duplicate sweep is a single on/off; the sidecar rules are per
+  // library and the picture check has a mode and two lines, so those say
+  // where their switch is rather than pretending to be one.
+  if(b.key==='dupe')
+    return `<button class="btn" onclick="sdEnable(${b.on?0:1},this);setTimeout(()=>loadSubs(true),900)"
+        title="${b.on?'stop removing duplicate tracks':'start removing duplicate tracks — one per language and kind survives, the one with the most lines'}"
+        >${b.on?'Turn it off':'Turn it on'}</button>`;
+  if(b.key==='sidecar')
+    return `<a href="#" onclick="subsDetail('sidecar');return false"
+        title="the rule is per library, so the switch is in the panel">which libraries</a>`;
+  if(b.key==='picture')
+    return `<a href="#" onclick="subsDetail('picture');return false"
+        title="manual or auto, and the two sureness lines">mode and lines</a>`;
+  return '';
+}
+
+function subsBoardHtml(){
+  const B=(_subs.board||[]);
+  if(!B.length) return '';
+  return `<div class="lkind" style="padding:11px 12px;margin-bottom:8px">
+    <b style="color:#6fb0ff">Every subtitle decision, and what it is set to</b>
+    <div class="dim" style="font-size:11px;margin-top:2px">Four things can be
+      wrong with a file's subtitles. This is all of them, whether nuarr is
+      allowed to act on each, and how many files are waiting on that answer.</div>
+    <div style="margin-top:8px;display:flex;flex-direction:column;gap:6px">
+    ${B.map(b=>{
+      const c=SUBS_C[b.key]||'#6fb0ff';
+      // From /api/subs, not from _idle: the strip has to be there whether or
+      // not the panel that used to fetch it has ever been opened.
+      const idl=((_subs.idle||{})[SUBS_IDLE[b.key]||''])||{};
+      return `<div class="lkind" style="padding:9px 11px;border-left:3px solid ${c}">
+        <div style="display:flex;gap:9px;align-items:baseline;flex-wrap:wrap">
+          <span style="flex:none;color:${b.on?'var(--ok)':'var(--warn)'}"
+            title="${b.on?'nuarr acts on this by itself':'nothing happens until this is switched on'}">${b.on?'●':'○'}</span>
+          <b style="flex:none">${esc(b.name)}</b>
+          <span class="capsc" style="border-color:${c};color:${c}"
+            title="the current setting">${esc(b.setting)}</span>
+          <span style="flex:none;margin-left:auto;white-space:nowrap"
+            title="${esc(b.waiting_word||'')}">${
+              b.counting?'<span class="busy" style="color:var(--acc)"><span class="sp"></span></span> <span class="dim">counting</span>'
+              :(b.waiting?`${num(b.waiting, b.on?'auto':'you')} waiting`
+                       :'<b style="color:var(--ok)">nothing waiting</b>')}</span>
+        </div>
+        <div class="dim" style="font-size:11.5px;margin-top:3px">${esc(b.does||'')}</div>
+        ${b.detail?`<div class="dim" style="font-size:11px;margin-top:2px">${esc(b.detail)}</div>`:''}
+        ${b.why?`<div class="dim" style="font-size:10.5px;margin-top:2px;opacity:.75">${esc(b.why)}</div>`:''}
+        ${(idl.running||idl.paused)?`<div style="margin-top:5px">${idleStrip(idl,{})}</div>`:''}
+        <div style="margin-top:6px;display:flex;gap:12px;align-items:center;
+             font-size:11.5px;flex-wrap:wrap">
+          ${subsSwitchHtml(b)}
+          ${b.panel?`<a href="#" onclick="subsDetail('${b.key}');return false"
+            title="the full panel for this one - the lists, the buttons and the pickers">${
+            subsOpen(b.key)?'▾ hide the detail':'▸ the detail'}</a>`:''}
+        </div>
+      </div>`;
+    }).join('')}
+    </div></div>`;
+}
+
+function subsWorkHtml(){
+  const W=(_subs.working||[]);
+  if(!W.length) return '';
+  return `<div class="lkind" style="padding:9px 12px;margin-bottom:8px">
+    <div style="display:flex;gap:9px;align-items:baseline">
+      <span class="busy" style="color:var(--acc);flex:none"><span class="sp"></span></span>
+      <b>Working through them right now</b>
+      <span class="dim" style="font-size:11px">${fmt(W.length)} file${
+        W.length===1?'':'s'} — never two on one spindle</span>
+    </div>
+    ${W.map(t=>{
+      const c=t.disk?diskColor(t.disk):'#6fb0ff';
+      const p=Math.max(0,Math.min(100,Math.round((t.progress||0)*100)));
+      return `<div style="display:flex;gap:8px;align-items:baseline;
+           font-size:11px;margin-top:4px">
+        <span class="dim" style="flex:none">${esc(t.system||'')}</span>
+        <span style="flex:1 1 auto;min-width:0;overflow:hidden;
+          text-overflow:ellipsis;white-space:nowrap;color:${c}"
+          title="${esc(t.file||'')}">${esc(t.file||'')}</span>
+        <b style="flex:none;color:${c}">${p}%</b>
+        ${t.disk?`<span style="flex:none;color:${c};opacity:.8">${esc(t.disk)}</span>`:''}
+      </div>
+      <div class="hsbar item" style="margin-top:2px"><i
+        style="width:${p}%;background:${c}"></i></div>`;
+    }).join('')}
+  </div>`;
+}
+
+function subsRowsSorted(){
+  const R=(_subs.rows||[]).slice();
+  if(_subsSort==='what') return _subsDesc ? R.reverse() : R;
+  const key = {file:e=>String(e.name||'').toLowerCase(),
+               disk:e=>String(e.disk||''),
+               library:e=>String(e.library||''),
+               n:e=>(e.n||0)}[_subsSort] || (e=>0);
+  R.sort((a,b)=>{ const x=key(a), y=key(b);
+                  return x<y?-1:x>y?1:String(a.name||'').localeCompare(String(b.name||'')); });
+  return _subsDesc ? R.reverse() : R;
+}
+
+function subsHead(k, label, w, align){
+  const on=_subsSort===k;
+  return `<th style="width:${w};text-align:${align||'center'};cursor:pointer;
+      ${on?'color:#6fb0ff':''}" onclick="subsSort('${k}')"
+      title="sort by ${esc(label.toLowerCase())}">${esc(label)}${
+      on?(_subsDesc?' ▾':' ▴'):''}</th>`;
+}
+
+function subsListHtml(){
+  const R=subsRowsSorted(), total=_subs.total||0;
+  if(!total)
+    return `<div class="lkind" style="padding:14px 12px">
+      <b style="color:var(--ok)">Nothing wants anything.</b>
+      <span class="dim" style="font-size:11.5px">No file in the library has a
+      sidecar to take in, a duplicate track, a burned-in subtitle to mark or a
+      title that lies.</span></div>`;
+  // From the server, counted over every file - not over the four hundred
+  // this table happens to be showing.
+  const ready=(_subs.ready!==undefined)?_subs.ready:R.filter(e=>e.ready).length;
+  return `<div class="lkind capswrap" style="padding:10px 12px">
+    <div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap">
+      <b style="color:#6fb0ff">What would happen, file by file</b>
+      <span class="dim" style="font-size:11.5px">${num(total,'auto')} file${
+        total===1?'':'s'} — ${num(ready,'auto')} nuarr will get to on its own${
+        (total-ready)?`, ${num(total-ready,'you')} waiting on a switch above`
+                     :''}</span>
+      <span class="dim" style="font-size:10.5px;margin-left:auto">${
+        R.length<total?`showing the first ${fmt(R.length)}`:''}</span>
+    </div>
+    <div class="dim" style="font-size:10.5px;margin-top:3px">One row per file.
+      A file with three things wrong with it is one row with three chips, not
+      three rows in three panels.</div>
+    <div class="scrollbox" style="max-height:420px;overflow:auto;margin-top:7px">
+    <table class="tt" style="width:100%;table-layout:fixed">
+      <thead><tr style="font-size:10.5px">
+        ${subsHead('file','File','44%','left')}
+        ${subsHead('disk','Disk','11%')}
+        ${subsHead('library','Library','13%')}
+        ${subsHead('what','What would happen','32%','left')}
+      </tr></thead>
+      <tbody>${R.map(e=>`<tr style="vertical-align:top${
+          e.ready?'':';opacity:.72'}">
+        <td style="text-align:left;overflow:hidden;text-overflow:ellipsis;
+            white-space:nowrap" title="${esc(e.path||'')}">${esc(e.name||'')}</td>
+        <td style="text-align:center">${e.disk?diskTag(e.disk):'<span class="dim">—</span>'}</td>
+        <td style="text-align:center" class="dim">${esc(e.library||'')}</td>
+        <td style="text-align:left">${(e.acts||[]).map(a=>{
+            const c=SUBS_C[a.key]||'#6fb0ff';
+            return `<div style="font-size:11px;margin-bottom:2px">
+              <span class="capsc" style="border-color:${c};color:${c}"
+                title="${esc(SUBS_W[a.key]||'')}${a.on?'':' — waiting on a switch'}">${
+                esc(a.word||'')}</span>${a.why?`<div class="dim"
+                style="font-size:10px;opacity:.7;white-space:normal">${
+                esc(String(a.why).slice(0,160))}</div>`:''}</div>`;
+          }).join('')}</td>
+      </tr>`).join('')}</tbody>
+    </table></div></div>`;
+}
+
+function subsPaint(){
+  const el=document.getElementById('subsTop'); if(!el||!_subs) return;
+  // HOLDS STILL UNDER THE POINTER. Same rule the old panel learned: a list
+  // being read is a list that must not be rebuilt beneath the reader.
+  if(panelScrolled('subsTop')) return;
+  const html = subsBoardHtml() + subsWorkHtml() + subsListHtml();
+  if(html!==_subsKey){ _subsKey=html; el.innerHTML=html; }
+  subsDetailPaint();
+}
+
 function laneLines(fl, small){
   fl = fl||[];
   if(!fl.length) return '';
