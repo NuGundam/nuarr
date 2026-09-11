@@ -176,7 +176,7 @@ def _dict_state(mod_name, key, name, where, note="", attr="") -> list:
 # clock beside it is what turns a slow answer into a visibly stuck one.
 # key, module, label, where its page is, what it is doing, and WHICH DICT.
 _SIMPLE = [
-    ("audit", "audit", "Rule check", "/settings#rulecheck",
+    ("audit", "audit", "Rule check", "/settings#ruleschk",
      "re-reading committed files against today's rules", "STATS"),
     ("audiotitle", "audiotitle", "Audio titles", "/settings#alang",
      "checking track titles against the streams they describe", "_CACHE"),

@@ -1583,4 +1583,4 @@ async def watch() -> None:
                    disk_of=lambda r: r.get("pool_disk") or "",
                    note_of=lambda r: f"sampling {SAMPLES} frames",
                    system_name="Subtitles in the picture",
-                   goto="/settings#subs", on_pass=_after)
+                   goto="/settings#hardsub", on_pass=_after)

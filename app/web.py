@@ -12105,6 +12105,21 @@ button[disabled]{opacity:.5;cursor:default}
 .procpop.open{display:block}
 .procpop table{border-collapse:collapse;width:100%}
 .procpop td{padding:3px 0;white-space:nowrap}
+/* A PANEL THAT RESIZES WHILE YOU READ IT IS A PANEL YOU CANNOT READ.
+   min-width let the width follow the longest row, so an episode title
+   arriving two seconds later shoved the whole box sideways; and the height
+   followed the number of systems, which changes constantly - a sweep
+   finishing took two rows out from under the pointer. This one is a fixed
+   width, wide enough for the four-column table and the system rows, and its
+   height is pinned in JS to the tallest it has been since you opened it. */
+#procPop{width:436px;min-width:0}
+#procPop table{table-layout:fixed}
+#procPop td:first-child{white-space:normal;overflow-wrap:anywhere}
+#procPop .pname{display:block;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap}
+/* A row that goes somewhere should look like it does. */
+#procPop a.prow{color:inherit;text-decoration:none;display:block}
+#procPop a.prow:hover .pname{color:var(--acc);text-decoration:underline}
 /* The GPU block's little meters. A percentage and a bar together, because
    three engine figures in a column are read as a comparison and a bar is the
    fastest way to make one. */
@@ -17628,10 +17643,15 @@ function paintProcBtn(n){
   }
   btn.classList.toggle('on', _procOpen);
 }
+let _procMinH = 0;
 function toggleProcs(ev){
   if(ev) ev.stopPropagation();
   closeSu();                       // only one header panel open at a time
   _procOpen=!_procOpen;
+  // A NEW OPENING IS A NEW MEASUREMENT. The floor exists to stop the box
+  // twitching while you read it, not to make it permanently as tall as the
+  // busiest moment it has ever seen.
+  if(!_procOpen) _procMinH = 0;
   const pop=document.getElementById('procPop');
   if(pop) pop.classList.toggle('open', _procOpen);
   if(_procLast){
@@ -17643,6 +17663,26 @@ function closeProcs(){ if(_procOpen) toggleProcs(); }
 // Click anywhere else to dismiss - the panel itself stops the event.
 document.addEventListener('click', ()=>closeProcs());
 
+// WHERE A PIECE OF WORK LIVES.
+//
+// Every row in this panel is named after the work rather than the executable -
+// "Audio language · ffmpeg.exe" instead of "ffmpeg.exe" - which answers what
+// is running and then leaves you to go and find it. The page that owns each
+// activity is a fact nuarr already has; it simply was not attached to
+// anything clickable. A row now jumps to that page AND scrolls to the panel,
+// because landing at the top of a long settings pane and leaving the reader
+// to hunt is the same as not linking at all (see the subsync link, which has
+// worked this way for months).
+const PROC_GOTO = {
+  "Audio language":  "/settings#alang",
+  "Transcode":       "/#running",
+  "Probe":           "/#running",
+  "Subtitles":       "/settings#subembed",
+  "Subtitle OCR":    "/settings#ocr",
+  "Handler script":  "/settings#rules",
+  "Library scan":    "/#scan",
+  "Does it decode?": "/settings#integrity",
+};
 function paintProcs(s){
   const pop=document.getElementById('procPop');
   if(!pop) return;
@@ -17684,10 +17724,16 @@ function paintProcs(s){
       // "Transcode · ffmpeg.exe" still answers "what is actually running".
       const exe = (!g.self && g.named && g.exes.size)
         ? `<span class="mult"> · ${esc([...g.exes].join(', '))}</span>` : '';
+      // The server itself has no page of its own; its children do.
+      const to = g.self ? '' : (PROC_GOTO[name] || '');
+      const body = (g.n>1?`<span class="mult">${g.n} × </span>`:'')
+           + `<span class="pname">${esc(name)}${
+               g.self?' <span class="mult">(the server)</span>':exe}</span>`
+           + sub;
       return `<tr><td class="${g.self?'me':(stale?'old':'')}">`
-           + (g.n>1?`<span class="mult">${g.n} × </span>`:'')
-           + `${esc(name)}${g.self?' <span class="mult">(the server)</span>':exe}`
-           + sub + `</td>`
+           + (to ? `<a class="prow" href="${esc(to)}" title="${esc(
+                     'go to '+name+' and scroll to it')}">${body}</a>` : body)
+           + `</td>`
            + `<td class="v">${mb(g.mb)}</td>`
            + `<td class="v">${share>=0.5?share.toFixed(share<10?1:0)+'%':'—'}</td>`
            + `<td class="v ${stale?'old':''}">${g.age>=60?hms(g.age):'—'}</td></tr>`;
@@ -17707,6 +17753,14 @@ function paintProcs(s){
            + `the server sitting here for more than ten minutes is a straggler.</div>`;
 
   setHTML(pop, html);      // same rule as every other pill in the header
+  // TALLEST SO FAR, UNTIL YOU CLOSE IT. Growing is fine - new information
+  // arriving needs the room - but shrinking pulls the row under the pointer
+  // out from under it, and the panel is repainted every two seconds.
+  try{
+    const h = pop.scrollHeight;
+    if(h > (_procMinH||0)) _procMinH = h;
+    pop.style.minHeight = _procMinH ? (_procMinH + 'px') : '';
+  }catch(_){ }
 }
 
 // ---- THE GPU PANEL -------------------------------------------------------
@@ -23578,7 +23632,54 @@ const PANE_OF = {ffmpeg:'ffPane', backup:'bkPane',  rules:'rulesPane',
 // clicked Arrs and got an empty page. An alias names a pane plus an intent;
 // it never claims an element of its own.
 const ALIAS_OF = {arrsync:'arrs', audiotitle:'acodec', arrgap:'libs',
-                  subsync:'lang', plexsync:'plex'};
+                  subsync:'lang', plexsync:'plex',
+                  // THE RUNNING LIST LINKS HERE, so these have to be real.
+                  // Every system on the shared runner carries the page it
+                  // belongs to, and three of them were pointing at '#subs' -
+                  // which is not a pane key, so the switcher fell through to
+                  // the default and you landed on Counts. A link that goes to
+                  // the wrong page is worse than no link: it looks like the
+                  // page is wrong rather than the link.
+                  subembed:'lang', hardsub:'lang', subtitletitle:'lang',
+                  integrity:'health', audiolang:'alang', ruleschk:'ruleschk'};
+
+// WHERE ON THE PAGE, not just which page. Landing at the top of a settings
+// pane a thousand pixels tall and leaving the reader to find the panel they
+// clicked is the same as not linking at all - which is why the subsync and
+// arrgap links have scrolled and flashed their card for months. This is that,
+// generalised, so a new system is one line rather than another bespoke branch.
+const SCROLL_OF = {subembed:'sePanel', hardsub:'skPanel',
+                   subtitletitle:'skPanel', integrity:'igCard',
+                   audiolang:'alangBody'};
+function flashTo(id, tries){
+  const c = document.getElementById(id);
+  if(!c){
+    // The pane loads asynchronously, so the target may not exist yet. Try a
+    // few times and then give up quietly rather than throwing at a timer.
+    if((tries||0) < 12) setTimeout(()=>flashTo(id, (tries||0)+1), 250);
+    return;
+  }
+  // SCROLLED MORE THAN ONCE, BECAUSE THE PAGE IS STILL ARRIVING. A settings
+  // pane is a stack of panels that each load on their own, so the target sits
+  // at one offset when the scroll happens and a thousand pixels lower a
+  // second later - measured: the sidecar panel landed at 930px after being
+  // centred, because everything above it had grown in the meantime. Put it
+  // back twice more as the pane settles; a scroll that is already correct
+  // costs nothing.
+  // TO ITS TOP, NOT ITS MIDDLE. Centring works for a card and fails for a
+  // panel: the sidecar list is a short skeleton that becomes five thousand
+  // rows, so "centre it" aims at a midpoint that moves hundreds of pixels
+  // while you watch. The top of the thing you clicked is a fixed point on it.
+  c.style.scrollMarginTop = '14px';
+  const land = () => c.scrollIntoView({behavior:'smooth', block:'start'});
+  land();
+  setTimeout(land, 900);
+  setTimeout(land, 1900);
+  setTimeout(land, 3600);
+  c.style.transition='box-shadow .4s';
+  c.style.boxShadow='0 0 0 2px var(--acc)';
+  setTimeout(()=>{ c.style.boxShadow=''; }, 2600);
+}
 
 // A BLANK PANE IS THE WORST FAILURE MODE THERE IS, because it looks like an
 // empty page rather than a broken one - there is nothing to read, nothing to
@@ -23667,6 +23768,9 @@ function wtab(which){
   // highlights and rewrites the hash, so there is no way back into wtab and
   // no recursion to guard against.
   if(window._setLit) window._setLit(intent);
+  // Scheduled here rather than in each branch below, because several of them
+  // return early and a tail at the end of this function would never run.
+  if(SCROLL_OF[intent]) setTimeout(()=>flashTo(SCROLL_OF[intent]), 500);
   which = ALIAS_OF[which] || which;
   const isPane = Object.prototype.hasOwnProperty.call(PANE_OF, which);
   const set = document.getElementById('wSettings');
@@ -35709,7 +35813,13 @@ _SETTINGS_SHIM = """
   // front of me". They are deliberately absent from the sidebar - there is no
   // menu entry for a card - so they have to be admitted here by name. wtab()
   // already knows what to do with each of them; it was simply never asked.
-  const DEEP = ['arrgap','arrsync','audiotitle','subsync','plexsync'];
+  // ONE LIST TO GET ON, AND THE COST OF NOT BEING ON IT IS A BLANK-LOOKING
+  // WRONG PAGE. The running-systems popover links to the page that owns each
+  // background system, and a hash this shim does not recognise is replaced
+  // with the first entry - so "Subtitle files beside the video" landed on
+  // Counts and read as the link being broken rather than unlisted.
+  const DEEP = ['arrgap','arrsync','audiotitle','subsync','plexsync',
+                'subembed','hardsub','subtitletitle','integrity','audiolang'];
   const VALID = KEYS.concat(DEEP);
 
   document.title = 'nuarr settings';
@@ -35809,7 +35919,9 @@ _SETTINGS_SHIM = """
   // its own closure and reaching into the page's ALIAS_OF would tie the two
   // together for one lookup.
   const DEEP_PANE = {arrgap:'libs', arrsync:'arrs', audiotitle:'acodec',
-                     subsync:'lang', plexsync:'plex'};
+                     subsync:'lang', plexsync:'plex',
+                     subembed:'lang', hardsub:'lang', subtitletitle:'lang',
+                     integrity:'health', audiolang:'alang'};
   // Highlight and URL only - no navigation. wtab() calls this after it has
   // already switched panes, which is how a link inside a pane ends up lighting
   // the right sidebar entry and leaving a hash you can refresh onto.

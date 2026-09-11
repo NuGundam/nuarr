@@ -471,4 +471,4 @@ async def watch() -> None:
                    disk_of=lambda r: r.get("pool_disk") or "",
                    note_of=lambda r: "decoding both ends",
                    system_name="Does it decode?",
-                   goto="/settings#health", on_pass=_after)
+                   goto="/settings#integrity", on_pass=_after)

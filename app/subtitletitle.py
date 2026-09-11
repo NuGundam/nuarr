@@ -592,7 +592,7 @@ async def watch() -> None:
                    disk_of=lambda r: r.get("pool_disk") or "",
                    note_of=lambda r: "reading the subtitle events",
                    system_name="Subtitle titles",
-                   goto="/settings#subs", on_pass=_after)
+                   goto="/settings#subtitletitle", on_pass=_after)
 
 
 async def inspect_paced(limit: int = PER_RUN, force: bool = False) -> dict:

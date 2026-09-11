@@ -1738,4 +1738,4 @@ async def watch() -> None:
                    disk_of=lambda p: p.get("pool_disk") or "",
                    note_of=lambda p: "taking subtitles in",
                    system_name="Sidecar subtitles",
-                   goto="/settings#subs")
+                   goto="/settings#subembed")
