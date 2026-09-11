@@ -81,6 +81,11 @@ def _fresh(key: str, title: str) -> dict:
         "key": key, "title": title,
         "running": False, "paused": False, "paused_why": "",
         "now": "", "done": 0, "total": 0, "ok": 0, "failed": 0,
+        # HOW FAR THROUGH THE ONE IN FRONT OF IT. A 63-second remux with no
+        # inner progress is indistinguishable from a stall, and this work is
+        # measured in whole files - so the overall bar can sit still for a
+        # minute at a time while everything is perfectly fine.
+        "item_pct": 0.0, "item_at": 0.0,
         "t0": 0.0, "secs_each": 0.0,
         "last_run": 0.0, "last_done": 0, "last_took": 0.0, "runs": 0,
         "next_look": 0.0, "idle_why": "", "last_error": "",
@@ -241,14 +246,23 @@ async def run(key: str, title: str, pending, do_one, label=None, *,
                              paused_why=b["why"], now="")
                     break
                 d["now"] = lab(it)
+                d["item_pct"], d["item_at"] = 0.0, time.time()
                 t_item = time.time()
+
+                def _report(pct: float) -> None:
+                    """Called from the worker thread as the tool reports."""
+                    try:
+                        d["item_pct"] = max(0.0, min(100.0, float(pct)))
+                    except Exception:                            # noqa: BLE001
+                        pass
                 try:
-                    res = await asyncio.to_thread(do_one, it)
+                    res = await asyncio.to_thread(do_one, it, _report)
                     good = bool((res or {}).get("ok", True))
                 except Exception as e:                           # noqa: BLE001
                     good, res = False, None
                     d["last_error"] = f"{type(e).__name__}: {e}"
                 d["done"] += 1
+                d["item_pct"] = 0.0
                 d["ok" if good else "failed"] += 1
                 # SMOOTHED, because one enormous remux should move the
                 # estimate without owning it.
@@ -295,4 +309,11 @@ def progress(key: str) -> dict:
     d["secs_each"] = round(each, 2)
     d["eta"] = round(d["left"] * each) if (d["left"] and each) else 0
     d["cpu_line"] = f"waits above {CPU_BUSY_PCT:.0f}% CPU or {GPU_BUSY_PCT:.0f}% GPU"
+    # THE FILE IN FRONT OF IT, and how long it has been on it. Only while
+    # running: a percentage left over from the last file would read as
+    # progress that is not happening.
+    if not d.get("running"):
+        d["item_pct"] = 0.0
+    d["item_elapsed"] = (round(time.time() - d["item_at"], 1)
+                         if (d.get("running") and d.get("item_at")) else 0.0)
     return d

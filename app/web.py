@@ -32498,15 +32498,21 @@ async function idleLoad(key){
 function idleStrip(d, opts){
   d=d||{}; opts=opts||{};
   const pct=Math.max(0,Math.min(100,d.pct||0));
+  const ip=Math.max(0,Math.min(100,d.item_pct||0));
   const head=`<div style="display:flex;gap:10px;align-items:baseline;
        flex-wrap:wrap;font-size:11.5px">
     ${d.running?'<span class="busy" style="color:var(--acc);flex:none"><span class="sp"></span></span>':''}
-    <span style="flex:none">${num(d.done||0,'done')} of ${num(d.total||0,'auto')}</span>
+    <span style="flex:none">${num(d.done||0,'done')} of ${num(d.total||0,'auto')}
+      <span class="dim" style="font-size:10.5px">(${pct.toFixed(0)}%)</span></span>
     <span class="dim" style="flex:1 1 auto;min-width:0;overflow:hidden;
-      text-overflow:ellipsis;white-space:nowrap">${esc(d.now||'')}</span>
+      text-overflow:ellipsis;white-space:nowrap">${esc(d.now||'')}${
+      (d.running&&ip)?` <b style="color:#6fb0ff">${ip.toFixed(0)}%</b>`:''}${
+      (d.running&&d.item_elapsed)?` <span style="opacity:.7">${
+        hsDur(d.item_elapsed)} in</span>`:''}</span>
     <span style="flex:none;margin-left:auto;display:flex;gap:10px">
       ${d.rate?`<span class="dim" title="Measured on this run">${
-        d.rate>=1?d.rate.toFixed(1)+' a second':(d.secs_each||0).toFixed(1)+'s each'}</span>`:''}
+        d.rate>=1?`<b style="color:var(--ok)">${d.rate.toFixed(1)}</b> a second`
+                 :`<b style="color:var(--ok)">${(d.secs_each||0).toFixed(1)}s</b> each`}</span>`:''}
       ${d.eta?`<span title="At the rate above">${numt(hsDur(d.eta))} left</span>`:''}
     </span></div>`;
   // WAITING, AND FOR WHAT. The line that makes a stopped bar readable.
@@ -32525,16 +32531,20 @@ function idleStrip(d, opts){
        d.last_took?` · took ${hsDur(d.last_took)}`:''}</span>`
       :'<span>has not finished a run yet</span>'}
     ${d.runs?`<span>${num(d.runs,'done')} run${d.runs===1?'':'s'}</span>`:''}
-    ${d.secs_each?`<span title="Smoothed across everything it has done">${
-       (d.secs_each||0).toFixed(1)}s a file</span>`:''}
+    ${d.secs_each?`<span title="Smoothed across everything it has done"><b
+       style="color:var(--ok)">${(d.secs_each||0).toFixed(1)}s</b> a file</span>`:''}
     <span title="Background work waits for anybody watching, a full encoder queue, a busy disk, a DrivePool move, or the machine itself.">${
       esc(d.cpu_line||'')}</span>
     ${d.last_error?`<span class="err">${esc(d.last_error)}</span>`:''}
   </div>`;
   return `<div class="lkind" style="padding:8px 11px;margin:6px 0">
     ${opts.title?`<b style="font-size:11.5px;color:#6fb0ff">${esc(opts.title)}</b>`:''}
-    ${(d.running||d.total)?`<div class="hsbar" style="margin-top:5px"><i
-       style="width:${pct}%"></i></div>`:''}
+    ${(d.running||d.total)?`<div class="hsbar${d.paused?' paused':''}"
+       style="margin-top:5px" title="${fmt(d.done||0)} of ${fmt(d.total||0)} files"
+       ><i style="width:${pct}%"></i></div>`:''}
+    ${(d.running&&ip)?`<div class="hsbar item"
+       title="how far through ${esc(d.now||'this file')}"><i
+       style="width:${ip}%"></i></div>`:''}
     ${head}${wait}${hist}</div>`;
 }
 // "in 4m" / "4m ago", for a time that may be ahead of us.
@@ -35801,6 +35811,14 @@ span.askhost{display:inline-block}
   margin:6px 0 0}
 .hsbar i{display:block;height:100%;border-radius:3px;background:var(--acc);
   transition:width .6s ease}
+/* A PAUSED BAR IS NOT A STALLED ONE, and it should not look like it. Amber
+   says waiting on purpose; the stripes say nothing is moving right now. */
+.hsbar.paused i{background:repeating-linear-gradient(135deg,
+  var(--warn) 0 6px, #8a6a17 6px 12px)}
+/* The file in front of it: thinner, under the overall bar, so the two read
+   as "this run" and "this file" rather than competing. */
+.hsbar.item{height:3px;margin-top:3px;opacity:.85}
+.hsbar.item i{background:#6fb0ff}
 /* A REFRESH THAT SAYS IT IS REFRESHING. Without this the button did nothing
    visible for the second the fetch took, so it got pressed again. */
 .gapchk.spinning{position:relative;color:transparent!important;pointer-events:none}

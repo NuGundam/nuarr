@@ -659,6 +659,60 @@ def _size(p: str) -> int:
 
 
 # ------------------------------------------------------------- doing it -----
+class _Ran:
+    """What subprocess.run would have given back, for the streaming version."""
+
+    def __init__(self, code: int, out: str, err: str) -> None:
+        self.returncode, self.stdout, self.stderr = code, out, err
+
+
+_PROG_RE = re.compile(r"(?:#GUI#progress\s+|Progress:\s*)(\d{1,3})\s*%")
+
+
+def _run_reporting(cmd: list, report=None, timeout: int = 3600) -> _Ran:
+    r"""Run mkvmerge, calling `report(pct)` as it announces its progress.
+
+    STREAMED, NOT CAPTURED. subprocess.run() hands back everything at the end,
+    which is exactly too late to draw a bar with. The output is small and
+    line-based, so reading it as it arrives costs nothing and turns a minute
+    of apparent silence into a moving number.
+    """
+    if report is None:
+        return _Ran(*_plain(cmd, timeout))
+    import subprocess as _sp
+    p = _sp.Popen([cmd[0], "--gui-mode"] + list(cmd[1:]),
+                  stdout=_sp.PIPE, stderr=_sp.PIPE, text=True,
+                  encoding="utf-8", errors="replace", bufsize=1,
+                  creationflags=NO_WINDOW, startupinfo=hidden_si())
+    out: list = []
+    t0 = time.time()
+    try:
+        for line in p.stdout:                     # type: ignore[union-attr]
+            out.append(line)
+            m = _PROG_RE.search(line)
+            if m:
+                try:
+                    report(float(m.group(1)))
+                except Exception:                                # noqa: BLE001
+                    pass
+            if time.time() - t0 > timeout:
+                p.kill()
+                break
+    finally:
+        try:
+            err = p.stderr.read() if p.stderr else ""            # type: ignore
+        except Exception:                                        # noqa: BLE001
+            err = ""
+        p.wait()
+    return _Ran(p.returncode, "".join(out), err)
+
+
+def _plain(cmd: list, timeout: int) -> tuple:
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                       creationflags=NO_WINDOW, startupinfo=hidden_si())
+    return r.returncode, r.stdout or "", r.stderr or ""
+
+
 def _probe_langs(path: str) -> set:
     """Read the subtitle languages out of a file on disk, now."""
     from .jobs import _ffprobe_exe
@@ -691,7 +745,7 @@ def _note(file_id: int, path: str, side: str, lang: str, ok: bool,
         pass
 
 
-def embed_one(file_id: int) -> dict:
+def embed_one(file_id: int, report=None) -> dict:
     r"""Remux this file's eligible sidecars into it, then recycle them.
 
     ONE mkvmerge FOR ALL OF THEM. Two sidecars means two subtitle tracks and
@@ -771,9 +825,14 @@ def embed_one(file_id: int) -> dict:
         if "forced" in (t.get("role") or ""):
             cmd += ["--forced-track", "0:yes"]
         cmd += [t["sidecar"]]
+    # READ ITS PROGRESS AS IT GOES, rather than waiting sixty seconds for an
+    # exit code. mkvmerge prints "Progress: 37%" as it copies; with --gui-mode
+    # it prints "#GUI#progress 37%" on a line of its own, which is the same
+    # number without the carriage-return games. Nothing about the result
+    # changes - the exit code and the read-back below still decide - this only
+    # gives the panel something true to draw while it waits.
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600,
-                           creationflags=NO_WINDOW, startupinfo=hidden_si())
+        r = _run_reporting(cmd, report)
     except Exception as e:                                       # noqa: BLE001
         fileops._quiet_remove(tmp)
         return {"ok": False, "why": f"{type(e).__name__}: {e}"}
@@ -1136,8 +1195,8 @@ def _pending() -> list:
         return []
 
 
-def _do_one(p: dict) -> dict:
-    return embed_one(int(p["file_id"]))
+def _do_one(p: dict, report=None) -> dict:
+    return embed_one(int(p["file_id"]), report=report)
 
 
 async def watch() -> None:
