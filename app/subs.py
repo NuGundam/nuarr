@@ -83,6 +83,38 @@ def _side_word(t: dict) -> str:
 
 
 # ------------------------------------------------------------ the switches --
+def by_decision() -> dict:
+    r"""How many queued files carry a step of each kind, and how many ask.
+
+    THE COUNT IS NOW WHAT IS GOING TO HAPPEN, not what a sweep estimated it
+    might find. Every one of these numbers used to come from a different
+    system's own preview - a walk, a candidate list, a findings table - each
+    computed at a different moment with a different notion of what counted.
+    They are one query over one table now, so they add up.
+    """
+    from . import subqueue
+    from .db import cursor
+    import json as _json
+    subqueue.init()
+    n = {SIDECAR: 0, DUPE: 0, PICTURE: 0, TITLE: 0, ASK: 0}
+    try:
+        with cursor() as cur:
+            for r in cur.execute("SELECT steps, asks FROM sub_queue "
+                                 " WHERE state != 'done'"):
+                try:
+                    steps = _json.loads(r["steps"] or "[]")
+                except Exception:                                # noqa: BLE001
+                    steps = []
+                for k in {_OF_STEP.get(s.get("do")) for s in steps}:
+                    if k:
+                        n[k] += 1
+                if (r["asks"] or "[]") != "[]":
+                    n[ASK] += 1
+    except Exception:                                            # noqa: BLE001
+        pass
+    return n
+
+
 def board() -> list:
     """Every subtitle decision as one row, and what it is set to right now.
 
@@ -93,6 +125,10 @@ def board() -> list:
     files it is holding up.
     """
     rows = []
+    # WHAT IS ACTUALLY QUEUED, which is the only count on this page that can
+    # be checked against something. Each row below still says what its rule
+    # IS; how many files are waiting on it is read off the queue.
+    tally = by_decision()
 
     # 1. What is sitting beside the file.
     try:
@@ -126,8 +162,9 @@ def board() -> list:
             "setting": (f"on for {', '.join(sorted(on))}" if on
                         else "off in every library"),
             "per_library": libs,
-            "waiting": int(sm.get("files") or 0),
-            "waiting_word": "files with a sidecar these rules would take in",
+            "waiting": tally[SIDECAR],
+            "waiting_word": "queued files with a sidecar to take in or a "
+                            "loose copy to recycle",
             "counting": counting,
             "detail": walk_word,
             "goto": "subembed", "panel": "sePanel",
@@ -153,8 +190,8 @@ def board() -> list:
             "setting": ("on" if subdupe.enabled()
                         else "off - it is the only sweep that takes a track "
                              "OUT, so it waits to be switched on"),
-            "waiting": len(subdupe.cached() or []),
-            "waiting_word": "files carrying a twin or an empty track",
+            "waiting": tally[DUPE],
+            "waiting_word": "queued files carrying a twin or an empty track",
             "goto": "subdupe", "panel": "sdPanel",
             "toggle": subdupe.ENABLED_KEY,
         })
@@ -180,8 +217,8 @@ def board() -> list:
             "on": mode == "auto",
             "setting": (f"{mode} · sure at {subkind.mark_at()}%, "
                         f"dismissed at {subkind.dismiss_at()}%"),
-            "waiting": int(c.get("actionable") or 0),
-            "waiting_word": "readings with something to do about them",
+            "waiting": tally[PICTURE] + tally[TITLE],
+            "waiting_word": "queued files to mark or retitle",
             # READ IS NOT THE SAME AS OUTSTANDING, and putting the two
             # numbers side by side without saying so is how "600" ends up
             # looking like a backlog next to "1 waiting". Most of those 600
@@ -214,6 +251,98 @@ def _findings() -> dict:
         return subkind.findings(600)
     except Exception:                                            # noqa: BLE001
         return {"rows": [], "counts": {}}
+
+
+ASK = "ask"
+
+# Which switchboard row a step belongs under, so one colour means one thing
+# wherever it appears on the page.
+_OF_STEP = {"take": SIDECAR, "recycle": SIDECAR, "dropdup": DUPE,
+            "dropempty": DUPE, "retitle": TITLE, "mark": PICTURE}
+
+
+def _word(s: dict) -> str:
+    """One step, said the way a person would say it."""
+    d = s.get("do")
+    if d == "take":
+        bits = [s.get("lang") or "?"]
+        if s.get("cls") and s["cls"] != "full":
+            bits.append(s["cls"])
+        w = "take in " + " ".join(bits)
+        if s.get("replaces"):
+            w += f", replacing {len(s['replaces'])} inside"
+        return w
+    if d == "recycle":
+        return f"recycle {s.get('name') or 'a loose copy'}"
+    if d == "dropdup":
+        if int(s.get("ord", -1)) < 0:
+            n = len(s.get("weigh") or [])
+            return f"weigh {n} {s.get('cls') or ''} {s.get('lang') or ''} " \
+                   f"tracks and drop the thinner"
+        return f"drop a second {s.get('cls') or ''} {s.get('lang') or ''} track"
+    if d == "dropempty":
+        return f"drop an empty {s.get('lang') or ''} track"
+    if d == "retitle":
+        return f"retitle track {int(s.get('ord') or 0)}: " \
+               f"{s.get('from') or '(none)'} → {s.get('to') or ''}"
+    if d == "mark":
+        return f"mark the words burned into the picture ({s.get('sure')}% sure)"
+    return str(d or "")
+
+
+def queue_rows(limit: int = 400) -> dict:
+    r"""The page's list, read straight off the queue.
+
+    IT USED TO BE A MERGE OF THREE SYSTEMS' OPINIONS and it is now one table
+    lookup, because the merge moved into the queue where it belongs. The
+    difference matters beyond speed: what this list shows is now exactly what
+    is going to run, rather than three separate previews of what three
+    separate sweeps might each decide to do later.
+    """
+    from . import subqueue
+    subqueue.init()
+    out: list = []
+    with_ask = 0
+    try:
+        from .db import cursor
+        with cursor() as cur:
+            total = int(cur.execute(
+                "SELECT COUNT(*) n FROM sub_queue "
+                " WHERE state != 'done'").fetchone()["n"] or 0)
+            rows = [dict(r) for r in cur.execute(
+                "SELECT file_id, name, path, library, disk, state, steps, "
+                "       asks, n, why, err, tries "
+                "  FROM sub_queue WHERE state != 'done' "
+                " ORDER BY (asks != '[]') DESC, state, n DESC, library, name "
+                " LIMIT ?", (int(limit),))]
+    except Exception:                                            # noqa: BLE001
+        return {"total": 0, "ready": 0, "held": 0, "rows": []}
+    import json as _json
+    for r in rows:
+        try:
+            steps = _json.loads(r.get("steps") or "[]")
+        except Exception:                                        # noqa: BLE001
+            steps = []
+        try:
+            asks = _json.loads(r.get("asks") or "[]")
+        except Exception:                                        # noqa: BLE001
+            asks = []
+        acts = [{"key": _OF_STEP.get(s.get("do"), DUPE), "word": _word(s),
+                 "why": s.get("why") or "", "on": True, "n": 1}
+                for s in steps]
+        acts += [{"key": ASK, "word": a.get("asking") or "one to decide",
+                  "why": "", "on": False, "n": 1, "q": a.get("q") or ""}
+                 for a in asks]
+        if asks:
+            with_ask += 1
+        out.append({"file_id": int(r["file_id"]), "path": r.get("path") or "",
+                    "name": r.get("name") or "", "library": r.get("library") or "",
+                    "disk": r.get("disk") or "", "state": r.get("state") or "",
+                    "acts": acts, "n": len(acts), "why": r.get("why") or "",
+                    "err": r.get("err") or "",
+                    "ready": not asks, "keys": sorted({a["key"] for a in acts})})
+    return {"total": total, "ready": total - with_ask, "held": with_ask,
+            "rows": out}
 
 
 def _sidecar_acts(on_map: dict) -> dict:
@@ -384,7 +513,7 @@ def working() -> list:
         from . import idle
     except Exception:                                            # noqa: BLE001
         return []
-    mine = {"Sidecar subtitles", "Duplicate subtitles",
+    mine = {"Subtitles", "Sidecar subtitles", "Duplicate subtitles",
             "Subtitles in the picture", "Subtitle titles"}
     try:
         return [t for t in idle.tasks() if (t.get("system") or "") in mine]
@@ -407,7 +536,7 @@ def overview(limit: int = 400, force: bool = False) -> dict:
         if not _VIEW["running"]:
             _VIEW["running"] = True
             try:
-                cached = {"board": board(), **rows(limit)}
+                cached = {"board": board(), **queue_rows(limit)}
                 _VIEW.update(at=time.time(), data=cached)
             except Exception as e:                               # noqa: BLE001
                 cached = cached or {"board": [], "rows": [], "total": 0,
@@ -418,6 +547,17 @@ def overview(limit: int = 400, force: bool = False) -> dict:
             cached = cached or {"board": [], "rows": [], "total": 0}
     d = dict(cached)
     d["working"] = working()
+    # THE SCAN'S OWN PROGRESS, which is the first thing a person wants when a
+    # page says a number: how much of the library has that number been
+    # measured over? Counted, left, and how fast it is going.
+    try:
+        from . import subplan, subqueue, subscan
+        d["scan"] = subscan.progress()
+        d["queue"] = (subqueue.stats() or {}).get("q") or {}
+        d["rev"] = subplan.revision()
+        d["replanning"] = bool(subqueue.STATE.get("replanning"))
+    except Exception:                                            # noqa: BLE001
+        d["scan"], d["queue"] = {}, {}
     # THE RUNNER'S OWN STRIP, SHIPPED WITH THE PAGE. It used to be fetched
     # per panel, which meant the switchboard could only show a progress bar
     # for a system whose panel somebody had already opened - and the whole
@@ -425,7 +565,8 @@ def overview(limit: int = 400, force: bool = False) -> dict:
     d["idle"] = {}
     try:
         from . import idle
-        for k in ("subembed", "subdupe", "hardsub", "subtitletitle"):
+        for k in ("subqueue", "subscan", "subembed", "subdupe", "hardsub",
+                  "subtitletitle"):
             try:
                 d["idle"][k] = idle.progress(k)
             except Exception:                                    # noqa: BLE001

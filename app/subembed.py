@@ -1065,8 +1065,19 @@ def _disk_of(file_id: int) -> str:
         return ""
 
 
-def _embed_tail(file_id, path, takes, drops, cmd, tmp, report, work=None):
-    """The rewrite itself, so the cache claim above has one place to end."""
+def _embed_tail(file_id, path, takes, drops, cmd, tmp, report, work=None,
+                keep=None, removed=0):
+    r"""The rewrite itself, so the cache claim above has one place to end.
+
+    keep     {(lang, class)} that MUST still be in the rebuilt file. The
+             sidecar sweep on its own only ever adds, so it had nothing to
+             check beyond the languages it was adding; the merged instruction
+             can remove tracks in the same pass, and a rewrite that dropped
+             one it meant to keep has to be thrown away rather than committed.
+             Same read-it-back discipline subdupe has always used - this is
+             where the two of them became one command.
+    removed  how many tracks that pass deliberately took out, for the log.
+    """
     from . import fileops
     # ONE NUMBER, TWO PLACES. The panel's bar and the disk row's hover card
     # are both asking how far through this file is, and asking mkvmerge twice
@@ -1108,6 +1119,20 @@ def _embed_tail(file_id, path, takes, drops, cmd, tmp, report, work=None):
                f"{', '.join(missing)} - nothing was changed")
         _note(file_id, path, "", ",".join(missing), False, why)
         return {"ok": False, "why": why}
+
+    # AND EVERYTHING THIS PASS MEANT TO KEEP IS STILL THERE. Only asked when
+    # the caller named something: a plain sidecar embed removes nothing, so
+    # there is nothing for it to have lost.
+    if keep:
+        got_k = {(t["lang"], t["class"]) for t in _live_sub_tracks(tmp)}
+        lost = {k for k in keep if tuple(k) not in got_k}
+        if lost:
+            fileops._quiet_remove(tmp)
+            why = ("the rebuilt file is missing "
+                   + ", ".join(f"{l} {c}" for l, c in sorted(lost))
+                   + " - nothing was changed")
+            _note(file_id, path, "", "", False, why)
+            return {"ok": False, "why": why}
 
     # AND THE COPY BACK IS OURS TOO. safe_replace already reports its
     # progress so the queue can draw a commit bar; the same callback tells the
@@ -1204,10 +1229,12 @@ def _embed_tail(file_id, path, takes, drops, cmd, tmp, report, work=None):
                f"{os.path.basename(path)}"
                + (f", replacing {replaced} track(s) already inside"
                   if replaced else "")
+               + (f", removing {removed} track(s) that were already there "
+                  f"twice" if removed else "")
                + f" and recycled {gone}", "info")
     return {"ok": True, "embedded": len(takes), "recycled": gone,
-            "replaced": replaced, "dropped": dd["dropped"],
-            "kept": kept, "path": path}
+            "replaced": replaced, "removed": int(removed),
+            "dropped": dd["dropped"], "kept": kept, "path": path}
 
 
 # ------------------------------------------------------------- the sweep ----

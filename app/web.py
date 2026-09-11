@@ -735,15 +735,21 @@ async def _startup() -> None:
         from . import integrity as _ig
         _ig.init()
         asyncio.create_task(_ig.watch())
-        # Sidecar subtitles into the file that owns them. Does nothing at all
-        # until a library turns the rule on.
+        # ONE SUBTITLE SYSTEM, AND THIS IS ITS RUNNER.
+        #
+        # subembed.watch and subdupe.watch used to start here, one after the
+        # other, and between them they rewrote the same file twice: the first
+        # to take a sidecar in, the second to take a duplicate back out. They
+        # are one queue now - subscan reads, subplan decides, subqueue runs -
+        # and a file that needs both gets ONE mkvmerge. The two modules are
+        # still imported and still do the reading and the rewriting; what has
+        # gone is their separate schedules, their separate lists and their
+        # separate idea of what the library needs.
         from . import subembed as _se
         _se.init()
-        asyncio.create_task(_se.watch())
-        # AND THE ONE THAT TAKES A DUPLICATE BACK OUT. Off by default; see
-        # subdupe.enabled for why this one waits to be asked.
-        from . import subdupe as _sd
-        asyncio.create_task(_sd.watch())
+        from . import subqueue as _sq
+        _sq.init()
+        asyncio.create_task(_sq.watch())
         # The subtitles that are already in the picture. Only ever looks at
         # files that report having none, so a library with proper tracks costs
         # it nothing.
@@ -814,8 +820,14 @@ async def _startup() -> None:
     # they run as one pass and show as one list. See subkind.py.
     from . import subkind as _subkind
     asyncio.create_task(_subkind.watch())
-    # Acting on what has been read is its own job with its own rhythm.
-    asyncio.create_task(_subkind.watch_auto())
+    # ACTING ON WHAT HAS BEEN READ IS NO LONGER ITS JOB. subkind.watch_auto
+    # used to mark the burned-in files and correct the titles on its own
+    # schedule, which is now one more thing that decided when to rewrite a
+    # file. The readings still happen here - they are measurements, and this
+    # is where they are taken - but what to DO about them is a step in the
+    # file's instruction like any other, queued with the rest so one file is
+    # opened once. Turning this back on would mean two systems rewriting the
+    # same file for the same reason at different times.
     # Asks the arrs what they manage and compares it to what nuarr has indexed.
     # Two list calls every six hours - no disk walk - so it is cheap enough to
     # run on any machine, attached pool or share.
@@ -7601,6 +7613,76 @@ async def api_hardsub_mark(file_id: int, confirm: str = "", kind: str = ""):
         return {"ok": False, "why": "this rewrites the file to add a blank "
                                     "subtitle track - confirm required"}
     return await asyncio.to_thread(hardsub.mark_one, int(file_id), kind)
+
+
+@app.get("/api/subqueue")
+async def api_subqueue(limit: int = 60):
+    """The scan, the queue, what is running and what it wants asked."""
+    from . import subqueue, subscan, subplan
+
+    def _read():
+        return {"scan": subscan.progress(), "rev": subplan.revision(),
+                **subqueue.snapshot(int(limit)),
+                "asking": subqueue.asking(60)}
+    return await asyncio.to_thread(_read)
+
+
+@app.post("/api/subqueue/answer")
+async def api_subqueue_answer(file_id: int, question: str, choice: str,
+                              scope: str = "both"):
+    """Your decision: applied to this file, and remembered for the next."""
+    from . import subqueue
+    r = await asyncio.to_thread(subqueue.answer, int(file_id), question,
+                                choice, scope)
+    try:
+        from . import idle, subs
+        idle.bump(subqueue.KEY)
+        subs.bump()
+    except Exception:                                            # noqa: BLE001
+        pass
+    return r
+
+
+@app.post("/api/subqueue/requeue")
+async def api_subqueue_requeue(file_id: int):
+    from . import subqueue
+    r = await asyncio.to_thread(subqueue.requeue, int(file_id))
+    try:
+        from . import idle
+        idle.bump(subqueue.KEY)
+    except Exception:                                            # noqa: BLE001
+        pass
+    return r
+
+
+@app.post("/api/subqueue/replan")
+async def api_subqueue_replan(force: int = 1):
+    """Re-apply the rules to everything now, rather than at the next pass."""
+    from . import subqueue
+    subqueue.bump()
+    r = await asyncio.to_thread(subqueue.replan, 100000, bool(force))
+    try:
+        from . import idle, subs
+        idle.bump(subqueue.KEY)
+        subs.bump()
+    except Exception:                                            # noqa: BLE001
+        pass
+    return r
+
+
+@app.get("/api/subqueue/memory")
+async def api_subqueue_memory(limit: int = 400):
+    """Everything you have taught it, and where each answer came from."""
+    from . import subplan
+    return await asyncio.to_thread(subplan.memory, int(limit))
+
+
+@app.post("/api/subqueue/unlearn")
+async def api_subqueue_unlearn(scope: str, skey: str, question: str):
+    from . import subplan, subqueue
+    r = await asyncio.to_thread(subplan.unlearn, scope, skey, question)
+    subqueue.bump()
+    return r
 
 
 @app.get("/api/subs")
@@ -32383,8 +32465,8 @@ function skPaint(force){
          padding:6px 8px;margin:6px 0;border-radius:7px;
          background:rgba(88,166,255,.07);border:1px solid var(--line)">
       <b style="font-size:11.5px;color:#6fb0ff">${fmt(nsel)} selected</b>
-      <button class="rmb" onclick="skActMany(this)" ${mk.running?'disabled title="a batch is already running"':''}
-        title="Pictures get the blank marker track; tracks get their honest title.">Act on ${fmt(nsel)}</button>
+      <span class="dim" style="font-size:10.5px"
+        title="Marking a picture and correcting a title are steps in a file's instruction now, queued with everything else that file needs so it is opened once.">acting on these happens on the queue</span>
       <button class="rmb" onclick="skDismissMany(this)"
         title="Not what it says. Pictures teach the OCR filter; tracks are recorded as signs.">Not dialogue — ${fmt(nsel)}</button>
       <select class="kindsel" onchange="skBatchKind(this.value)"
@@ -33521,6 +33603,9 @@ async function loadSubs(force){
   }
   try{ _subs = await (await fetch('/api/subs?limit=400'+(force?'&force=1':''))).json(); }
   catch(e){ _subs = _subs || {board:[],rows:[],total:0}; }
+  // The queue view is the live half - what is running, what failed, what is
+  // being asked - so it is read every time rather than on the merge's cache.
+  if(force || Date.now()-_subqAt > 4000) await loadSubQ();
   subsPaint();
   clearTimeout(_subsPoll);
   // Five seconds is the live half - what is in flight and what failed. The
@@ -33592,7 +33677,8 @@ function subsBoardHtml(){
 }
 
 function subsWorkHtml(){
-  const W=(_subs.working||[]);
+  // Folded into Processing, which is where a person looks for this now.
+  const W=[];
   if(!W.length) return '';
   return `<div class="lkind" style="padding:9px 12px;margin-bottom:8px">
     <div style="display:flex;gap:9px;align-items:baseline">
@@ -33690,12 +33776,178 @@ function subsListHtml(){
     </table></div></div>`;
 }
 
+// ---- THE SCAN'S OWN PROGRESS --------------------------------------------
+// A number on a page is worth what you know about where it came from. "3,177
+// waiting" over a library that has been half read is a different sentence
+// from the same number over one that has been read through, and until this
+// bar existed there was no way to tell those apart.
+function subsScanHtml(){
+  const sc=_subs.scan||{};
+  if(!sc.total) return '';
+  const pct=sc.total?Math.max(0,Math.min(100,100*(sc.total-sc.left)/sc.total)):0;
+  const done=sc.total-(sc.left||0);
+  return `<div class="lkind" style="padding:9px 12px;margin-bottom:8px">
+    <div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;
+         font-size:11.5px">
+      ${sc.running?'<span class="busy" style="color:var(--acc);flex:none"><span class="sp"></span></span>':''}
+      <b style="flex:none">Reading what every file carries</b>
+      <span style="flex:none">${num(done,'auto')} of ${num(sc.total,'auto')}
+        <span class="dim" style="font-size:10.5px">(${pct.toFixed(0)}%)</span></span>
+      ${sc.left?`<span class="dim">${num(sc.left,'auto')} left</span>`:'<b style="color:var(--ok)">all of it</b>'}
+      <span class="dim" style="flex:1 1 auto;min-width:0;overflow:hidden;
+        text-overflow:ellipsis;white-space:nowrap">${esc(sc.last||'')}</span>
+      <span style="flex:none;margin-left:auto;display:flex;gap:10px">
+        ${sc.rate?`<span class="dim" title="Measured on this pass">${
+          `<b style="color:var(--ok)">${sc.rate.toFixed(0)}</b> a second`}</span>`:''}
+        ${sc.eta?`<span title="At the rate above">${numt(hsDur(sc.eta))} left</span>`:''}
+      </span></div>
+    <div class="hsbar" style="margin-top:4px"><i style="width:${pct}%"></i></div>
+    <div class="dim" style="font-size:10.5px;margin-top:3px">What is inside
+      each file, what is sitting beside it and what is painted into its
+      picture — read once and kept, so changing a rule costs no disk at all.
+      ${sc.errors?`<b style="color:var(--warn)">${fmt(sc.errors)}</b> could not be read.`:''}
+      <a href="#" onclick="subReplan(this);return false" title="Apply the Subtitle rules to every file again now, rather than waiting for the next pass">re-apply the rules now</a></div>
+  </div>`;
+}
+
+// ---- WHAT IS BEING PROCESSED -------------------------------------------
+// The transcode page's shape, because it is the same idea: a queue, workers
+// taking from it, and a tail of what just finished. Anybody who can read the
+// Jobs page can read this without being taught a second vocabulary.
+function subsProcHtml(){
+  const q=_subs.queue||{}, W=(_subs.working||[]);
+  const R=(_subq&&_subq.running)||[], F=(_subq&&_subq.failed)||[],
+        D=(_subq&&_subq.recent)||[];
+  const depth=(q.queued||0)+(q.running||0);
+  if(!depth && !F.length && !D.length) return '';
+  const line=(t,cls)=>{
+    const c=t.disk?diskColor(t.disk):'#6fb0ff';
+    return `<div style="display:flex;gap:8px;align-items:baseline;font-size:11px;
+         margin-top:3px">
+      <span style="flex:1 1 auto;min-width:0;overflow:hidden;
+        text-overflow:ellipsis;white-space:nowrap;color:${c}"
+        title="${esc(t.path||t.name||'')}">${esc(t.name||'')}</span>
+      <span class="dim" style="flex:none;font-size:10.5px">${esc(t.why||'')}</span>
+      ${t.disk?`<span style="flex:none;color:${c};opacity:.8">${esc(t.disk)}</span>`:''}
+      ${cls==='fail'?`<button class="btn xs" onclick="subRequeue(${t.file_id},this)"
+         title="Read the file again and put it back on the queue as it stands today">again</button>`:''}
+    </div>`;
+  };
+  return `<div class="lkind" style="padding:10px 12px;margin-bottom:8px">
+    <div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap">
+      <b style="color:#6fb0ff">Processing</b>
+      <span class="dim" style="font-size:11.5px">${
+        depth?`${num(depth,'auto')} file${depth===1?'':'s'} on the queue${
+          q.steps?` · ${num(q.steps,'auto')} step${q.steps===1?'':'s'}`:''}`
+             :'<b style="color:var(--ok)">the queue is empty</b>'}${
+        q.failed?` · <span style="color:var(--warn)">${fmt(q.failed)} could not be done</span>`:''}</span>
+      <span class="dim" style="font-size:10.5px;margin-left:auto">one rewrite
+        per file — sidecars in and duplicates out in the same pass</span>
+    </div>
+    ${(_subs.idle&&_subs.idle.subqueue)?`<div style="margin-top:5px">${
+      idleStrip(_subs.idle.subqueue,{})}</div>`:''}
+    ${W.length?`<div style="margin-top:6px">${W.map(t=>{
+      const c=t.disk?diskColor(t.disk):'#6fb0ff';
+      const p=Math.max(0,Math.min(100,Math.round((t.progress||0)*100)));
+      return `<div style="display:flex;gap:8px;align-items:baseline;font-size:11px">
+        <span style="flex:1 1 auto;min-width:0;overflow:hidden;
+          text-overflow:ellipsis;white-space:nowrap;color:${c}"
+          title="${esc(t.file||'')}">${esc(t.file||'')}</span>
+        <span class="dim" style="flex:none">${esc(t.plan||'')}</span>
+        <b style="flex:none;color:${c}">${p}%</b>
+        ${t.disk?`<span style="flex:none;color:${c};opacity:.8">${esc(t.disk)}</span>`:''}
+      </div>
+      <div class="hsbar item" style="margin-top:2px"><i
+        style="width:${p}%;background:${c}"></i></div>`;}).join('')}</div>`:''}
+    ${F.length?`<div style="margin-top:7px">
+      <div class="dim" style="font-size:10.5px">Could not be done — read again
+        and retried ${fmt(F[0].tries||0)} times before it stopped</div>
+      ${F.slice(0,6).map(t=>line(t,'fail')
+        + `<div class="dim" style="font-size:10px;padding-left:2px">${esc((t.err||'').slice(0,160))}</div>`).join('')}</div>`:''}
+    ${D.length?`<div style="margin-top:7px">
+      <div class="dim" style="font-size:10.5px">Just done</div>
+      ${D.slice(0,5).map(t=>line(t,'done')).join('')}</div>`:''}
+  </div>`;
+}
+
+// ---- THE ONES IT WILL NOT GUESS AT --------------------------------------
+// THREE THINGS ARE GENUINELY AMBIGUOUS and this is where they come. An
+// answer here is applied to the file AND written down against the show and
+// the release group, so the next episode does not ask - which is why this
+// list gets shorter as you use it rather than longer.
+function subsAskHtml(){
+  const A=(_subq&&_subq.asking)||[];
+  if(!A.length) return '';
+  return `<div class="lkind capswrap" style="padding:10px 12px;margin-bottom:8px;
+       border-left:3px solid #e8a33d">
+    <div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap">
+      <b style="color:#e8a33d">Yours to call</b>
+      <span class="dim" style="font-size:11.5px">${num(A.length,'you')} file${
+        A.length===1?'':'s'} nuarr will not guess about</span>
+      <span class="dim" style="font-size:10.5px;margin-left:auto">an answer is
+        remembered against the show and the release group, so the next
+        episode does not ask</span>
+    </div>
+    <div class="scrollbox" style="max-height:300px;overflow:auto;margin-top:7px">
+    ${A.slice(0,40).map(r=>(r.asks||[]).map(a=>`
+      <div style="border-top:1px solid var(--line);padding:7px 0">
+        <div style="display:flex;gap:8px;align-items:baseline;font-size:11.5px">
+          <span style="flex:1 1 auto;min-width:0;overflow:hidden;
+            text-overflow:ellipsis;white-space:nowrap"
+            title="${esc(r.path||'')}">${esc(r.name||'')}</span>
+          ${r.disk?`<span style="flex:none;color:${diskColor(r.disk)}">${esc(r.disk)}</span>`:''}
+        </div>
+        <div class="dim" style="font-size:11px;margin-top:2px">${esc(a.asking||'')}</div>
+        ${a.words?`<div class="dim" style="font-size:10px;margin-top:2px;opacity:.7">read: ${esc(String(a.words).slice(0,120))}</div>`:''}
+        <div style="margin-top:5px;display:flex;gap:7px;flex-wrap:wrap;
+             align-items:center">
+          ${(a.options||[]).map(o=>`<button class="btn xs"
+             title="${esc(o.what||'')}"
+             onclick="subAnswer(${r.file_id},'${esc(a.q)}','${esc(o.v)}',this)"
+             >${esc(o.label||o.v)}</button>`).join('')}
+          <span class="dim" style="font-size:10px">applies to this file and is
+            remembered for the show and the group —
+            <a href="#" title="Answer for this file only; other episodes will still ask"
+               onclick="subAnswer(${r.file_id},'${esc(a.q)}','${
+                 esc(((a.options||[])[0]||{}).v||'')}',this,'file');return false">just this one</a></span>
+        </div>
+      </div>`).join('')).join('')}
+    </div></div>`;
+}
+
+async function subAnswer(fid, q, choice, btn, scope){
+  if(btn&&btn.tagName==='BUTTON'){ btn.disabled=true; btn.textContent='…'; }
+  try{ await fetch(`/api/subqueue/answer?file_id=${fid}&question=${
+        encodeURIComponent(q)}&choice=${encodeURIComponent(choice)}&scope=${
+        scope||'both'}`, {method:'POST'}); }
+  catch(e){}
+  _subsKey=''; await loadSubQ(); loadSubs(true);
+}
+async function subRequeue(fid, btn){
+  if(btn){ btn.disabled=true; btn.textContent='…'; }
+  try{ await fetch('/api/subqueue/requeue?file_id='+fid, {method:'POST'}); }
+  catch(e){}
+  _subsKey=''; await loadSubQ(); loadSubs(true);
+}
+async function subReplan(el){
+  if(el) el.textContent='re-applying…';
+  try{ await fetch('/api/subqueue/replan?force=1', {method:'POST'}); }catch(e){}
+  _subsKey=''; await loadSubQ(); loadSubs(true);
+}
+
+let _subq=null, _subqAt=0;
+async function loadSubQ(){
+  try{ _subq = await (await fetch('/api/subqueue?limit=40')).json(); _subqAt=Date.now(); }
+  catch(e){}
+}
+
 function subsPaint(){
   const el=document.getElementById('subsTop'); if(!el||!_subs) return;
   // HOLDS STILL UNDER THE POINTER. Same rule the old panel learned: a list
   // being read is a list that must not be rebuilt beneath the reader.
   if(panelScrolled('subsTop')) return;
-  const html = subsBoardHtml() + subsWorkHtml() + subsListHtml();
+  const html = subsBoardHtml() + subsScanHtml() + subsProcHtml()
+             + subsAskHtml() + subsListHtml();
   if(html!==_subsKey){ _subsKey=html; el.innerHTML=html; }
   subsDetailPaint();
 }
@@ -33908,8 +34160,8 @@ function sdPaint(){
         <td class="c dim">${esc(f.library||'')}</td>
         <td class="c mono" style="color:var(--warn)">${
           esc((f.kinds||[]).join(', '))}</td>
-        <td class="c"><button class="rmb" onclick="sdOne(${f.file_id},this)"
-          title="Read this one now, count the lines in each copy and remove the shorter ones. One remux, verified before it replaces anything.">Tidy it</button></td>
+        <td class="c"><span class="dim" style="font-size:10.5px"
+          title="Removing a duplicate is a step in this file's instruction now, run with everything else that file needs in one pass. The queue is at the top of this page.">on the queue</span></td>
       </tr>`).join('')}</tbody></table></div>${
       d.waiting>(d.preview||[]).length?`<div class="dim" style="font-size:11px;
         margin-top:4px">showing ${fmt((d.preview||[]).length)} of ${
@@ -34197,9 +34449,8 @@ function sePaint(force){
         itself</span>`:''}
       ${F.some(f=>f.gone)?`<span class="dim" style="font-size:11px;color:#7fd18c">${
         fmt(F.filter(f=>f.gone).length)} already dealt with</span>`:''}
-      ${Fopen?`<button class="rmb" style="margin-left:auto"
-        onclick="event.stopPropagation();seRetryAll(this)"
-        title="Forget that these failed. The sweep picks its work from what is on disk, so clearing the record IS trying again - it happens on the next pass, under the gate, not right now.">Try them again</button>`:''}
+      ${Fopen?`<span class="dim" style="font-size:10.5px;margin-left:auto"
+        title="Trying again is re-reading the file and re-planning it, which is what Processing's own button does - and it does it through the queue, so the retry and the first attempt are the same code path.">retry from Processing, at the top of this page</span>`:''}
     </div>
     ${Fopen?`<div class="rowbox scrollbox" style="max-height:220px;margin-top:5px">
       <!-- FIXED LAYOUT AND A REASON THAT WRAPS. What was here printed
@@ -34237,7 +34488,7 @@ function sePaint(force){
           >${f.size===0?'empty':(f.size>0?bytesShort(f.size):'—')}</td>
         <td class="r" style="padding:4px 6px;white-space:nowrap">${
           f.gone?'<span class="dim" style="font-size:10.5px">done</span>'
-          :`<button class="rmb" onclick="seRetry('${f.key}',this)">again</button>`}</td>
+          :'<span class="dim" style="font-size:10.5px">on the queue</span>'}</td>
       </tr>`).join('')}</table>
     </div>
     ${F.filter(f=>f.broken&&!f.gone).length?`<div class="dim" style="font-size:10.5px;margin-top:5px;
@@ -34326,8 +34577,8 @@ function sePaint(force){
       Taken only when the language passes this library's subtitle rules and the
       file has no track in that language already. The sidecar is recycled, not
       deleted, and only after the rebuilt file has been read back and found to
-      contain it.${on.length?` <button class="rmb" onclick="seRun(this)"${
-        d.running?' disabled':''}>${d.running?'working…':'Do a batch now'}</button>`:''}</div>`;
+      contain it.${on.length?` <span class="dim" style="font-size:10.5px"
+        title="There is one schedule for every subtitle change now, and it is the queue at the top of this page.">Taking them in is a step on the queue.</span>`:''}</div>`;
   // A PANEL IS NOT ONE THING, AND REBUILDING IT AS ONE IS WHY THE LIST MOVED.
   //
   // Every part of this used to be a single template string written into
