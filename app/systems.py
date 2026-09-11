@@ -39,7 +39,13 @@ def _one(key, name, where, running, now="", done=0, total=0, note="",
     return {"key": key, "name": name, "goto": where,
             "running": bool(running), "now": str(now or "")[:140],
             "done": int(done or 0), "total": int(total or 0),
-            "pct": _pct(done, total), "note": str(note or "")[:140],
+            # 140 CLIPPED THE SENTENCE THAT MATTERED. A pause carries its
+            # reason AND the detail behind it - "something else has the CPU at
+            # 90% - 96% in total, 6% of it nuarr's own" - and cutting that at
+            # "6% of it nua" throws away the half that answers the question.
+            # The row wraps, so the only cost of the extra characters is
+            # characters.
+            "pct": _pct(done, total), "note": str(note or "")[:240],
             "since": float(since or 0.0),
             # A LINE PER FILE. One name and an ellipsis was fine while exactly
             # one thing ran at a time; two lanes need two lines, each with the
@@ -125,14 +131,29 @@ def _idle_runners() -> list:
     return out
 
 
-def _dict_state(mod_name, key, name, where, note="") -> list:
-    """Read a module's own STATE-shaped dict without importing it eagerly."""
+def _dict_state(mod_name, key, name, where, note="", attr="") -> list:
+    r"""Read a module's own STATE-shaped dict without importing it eagerly.
+
+    THE ATTRIBUTE IS NAMED NOW, NOT GUESSED. This tried STATE, then STATS,
+    then _CACHE, then PROGRESS, and took the first dict it found with a
+    "running" key - which is fine until a module has two, and three of them
+    do. subtitletitle's _CACHE is the cache of its FINDINGS; the sweep that
+    reads tracks off disk lives in INSPECT_STATE. So the row labelled
+    "checking cue counts against what each title claims" was reporting a
+    database read that takes a second, under a note describing work it was not
+    doing - and the actual reading never appeared at all. arrgap and
+    audiotitle had the same shape. Guessing which dict a module means is not
+    something a list of systems should be doing.
+    """
     try:
         mod = __import__(f"app.{mod_name}", fromlist=[mod_name])
     except Exception:                                            # noqa: BLE001
         return []
-    st = (getattr(mod, "STATE", None) or getattr(mod, "STATS", None)
-          or getattr(mod, "_CACHE", None) or getattr(mod, "PROGRESS", None))
+    if attr:
+        st = getattr(mod, attr, None)
+    else:
+        st = (getattr(mod, "STATE", None) or getattr(mod, "STATS", None)
+              or getattr(mod, "_CACHE", None) or getattr(mod, "PROGRESS", None))
     if not isinstance(st, dict):
         return []
     running = bool(st.get("running"))
@@ -153,23 +174,24 @@ def _dict_state(mod_name, key, name, where, note="") -> list:
 # count until the answer comes back. A row reading "Missing from the arrs 0/0"
 # says only that something is happening; the note says what, and the elapsed
 # clock beside it is what turns a slow answer into a visibly stuck one.
+# key, module, label, where its page is, what it is doing, and WHICH DICT.
 _SIMPLE = [
-    ("integrity", "integrity", "Does it decode?", "/settings#health",
-     "decoding the first and last seconds of files"),
     ("audit", "audit", "Rule check", "/settings#rulecheck",
-     "re-reading committed files against today's rules"),
+     "re-reading committed files against today's rules", "STATS"),
     ("hardsub", "hardsub", "Subtitle kinds · picture", "/settings#subs",
-     "sampling frames for words burned into the picture"),
-    ("subtitletitle", "subtitletitle", "Subtitle kinds · tracks", "/settings#subs",
-     "checking cue counts against what each title claims"),
+     "sampling frames for words burned into the picture", "STATE"),
+    # The sweep that READS TRACKS, not the cache of what it found.
+    ("subtitletitle", "subtitletitle", "Subtitle kinds · tracks",
+     "/settings#subs",
+     "checking cue counts against what each title claims", "INSPECT_STATE"),
     ("audiotitle", "audiotitle", "Audio titles", "/settings#alang",
-     "checking track titles against the streams they describe"),
+     "checking track titles against the streams they describe", "_CACHE"),
     ("arrgap", "arrgap", "Missing from the arrs", "/settings#arrs",
-     "asking Sonarr and Radarr for everything they track"),
+     "asking Sonarr and Radarr for everything they track", "_CACHE"),
     ("plexsync", "plexsync", "Plex agreement", "/settings#plex",
-     "comparing what Plex has against what nuarr has"),
+     "comparing what Plex has against what nuarr has", "STATE"),
     ("healer", "healer", "Missing-file check", "/#missing",
-     "looking again for files an arr stopped reporting"),
+     "looking again for files an arr stopped reporting", "STATS"),
 ]
 
 
@@ -199,9 +221,9 @@ def running() -> dict:
     out += _jobs()
     out += _idle_runners()
 
-    for key, mod, name, where, note in _SIMPLE:
+    for key, mod, name, where, note, attr in _SIMPLE:
         try:
-            out += _dict_state(mod, key, name, where, note)
+            out += _dict_state(mod, key, name, where, note, attr)
         except Exception:                                        # noqa: BLE001
             continue
 

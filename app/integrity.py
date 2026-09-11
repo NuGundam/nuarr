@@ -131,7 +131,8 @@ def _fatal(err: str) -> str:
     return ""
 
 
-async def _decode(path: str, ss: float, dur: float) -> tuple[int, str]:
+async def _decode(path: str, ss: float, dur: float,
+                  on_pid=None) -> tuple[int, str]:
     """Decode a window. -> (returncode, stderr).
 
     -xerror stops at the first error rather than logging thousands of them,
@@ -157,6 +158,15 @@ async def _decode(path: str, ss: float, dur: float) -> tuple[int, str]:
         proc = await asyncio.create_subprocess_exec(
             *args, stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE, creationflags=NO_WINDOW)
+        # WHOEVER IS COUNTING THE BYTES NEEDS THE PID. Without it a decode
+        # reads twenty seconds off a pool disk and the panel files those bytes
+        # under "system", which is the column that means "not nuarr" and the
+        # number the gate steers by.
+        if on_pid is not None:
+            try:
+                on_pid(proc.pid)
+            except Exception:                                    # noqa: BLE001
+                pass
         _, err = await asyncio.wait_for(proc.communicate(), timeout=240)
         return proc.returncode or 0, (err or b"").decode("utf-8", "replace")
     except asyncio.TimeoutError:
@@ -168,10 +178,13 @@ async def _decode(path: str, ss: float, dur: float) -> tuple[int, str]:
         return -1, f"__spawn__ {type(e).__name__}: {e}"
 
 
-async def test_one(file_id: int, path: str, duration: float = 0.0) -> dict:
+async def test_one(file_id: int, path: str, duration: float = 0.0,
+                   on_pid=None, on_stage=None) -> dict:
     """Head and tail. -> {verdict, detail, secs}"""
     t0 = time.time()
-    rc, err = await _decode(path, 0, HEAD_S)
+    if on_stage:
+        on_stage("head", 0.0)
+    rc, err = await _decode(path, 0, HEAD_S, on_pid)
     if err.startswith("__"):
         return {"verdict": "", "detail": err, "secs": time.time() - t0}
     why = _fatal(err)
@@ -186,7 +199,10 @@ async def test_one(file_id: int, path: str, duration: float = 0.0) -> dict:
     # decode failure is not evidence of anything.
     tail_note = ""
     if duration and duration > (HEAD_S + TAIL_S + 5):
-        rc2, err2 = await _decode(path, max(0.0, duration - TAIL_S), TAIL_S)
+        if on_stage:
+            on_stage("tail", 50.0)
+        rc2, err2 = await _decode(path, max(0.0, duration - TAIL_S), TAIL_S,
+                                  on_pid)
         if not err2.startswith("__"):
             why = _fatal(err2)
             if why:
@@ -230,7 +246,7 @@ def _candidates(limit: int) -> list[dict]:
     cutoff = time.time() - SETTLE_S
     with cursor() as cur:
         return [dict(r) for r in cur.execute(
-            "SELECT f.id file_id, f.path, f.size, f.duration, "
+            "SELECT f.id file_id, f.path, f.size, f.duration, f.pool_disk, "
             "       i.at last_at, i.verdict last_verdict "
             "  FROM files f "
             "  LEFT JOIN integrity i ON i.file_id = f.id "
@@ -343,9 +359,26 @@ def findings(limit: int = 200) -> list[dict]:
 def stats() -> dict:
     if not _READY:
         init()
+    # WHERE THE WORK ACTUALLY IS. STATE belongs to sweep(), which is now the
+    # manual button; the sweep that runs all day is the shared runner's, and a
+    # panel reading the wrong dict is a panel that says "idle" while the disks
+    # are going - which is exactly how the sidecar system came to be missing
+    # from the running list for months.
+    try:
+        from . import idle as _idle
+        _p = _idle.progress(KEY)
+    except Exception:                                            # noqa: BLE001
+        _p = {}
+    _live = bool(_p.get("running") or _p.get("paused")) or STATE["running"]
     out = {"ok": 0, "corrupt": 0, "untested": untested(), "mode": mode(),
-           "last_run": STATE["last_run"], "running": STATE["running"],
-           "now": STATE["now"], "done": STATE["done"], "total": STATE["total"],
+           "last_run": max(STATE["last_run"], _p.get("last_run") or 0.0),
+           "running": _live,
+           "now": (_p.get("now") or STATE["now"]) if _live else "",
+           "done": _p.get("done") or STATE["done"],
+           "total": _p.get("total") or STATE["total"],
+           "paused": bool(_p.get("paused")),
+           "paused_why": _p.get("paused_why") or "",
+           "idle": _p,
            "head_s": HEAD_S, "tail_s": TAIL_S, "per_run": PER_RUN}
     try:
         with cursor() as cur:
@@ -357,16 +390,85 @@ def stats() -> dict:
     return out
 
 
-async def watch() -> None:
-    """Sweep on a slow clock, and hand what it finds to the shared remedy."""
+# --------------------------------------------------------- onto the runner --
+#
+# EIGHT FILES AND THEN FIVE MINUTES ASLEEP, on a box that is idle most of the
+# night. The batch was never protection - eight bounded decodes started the
+# instant somebody presses play are still eight - and it was a real cost:
+# 39,710 files at eight a pass, five minutes apart, is eleven days of
+# wall-clock to walk the library once, nearly all of it spent waiting.
+#
+# The shared runner asks the gate before every single file instead, works at
+# whatever rate the machine can spare, and steps around a spindle somebody is
+# reading from rather than stopping on it. Same question, asked properly.
+#
+# sweep() is left exactly as it was: it is the "test some now" button, and a
+# button is a batch by definition.
+KEY = "integrity"
+TITLE = "Does it decode?"
+
+
+def _pending() -> list:
+    """Every file whose bytes have never been decoded. Not a slice of them."""
+    if not _READY:
+        init()
+    try:
+        return _candidates(100000)
+    except Exception:                                            # noqa: BLE001
+        return []
+
+
+async def _do_one(r: dict, report=None) -> dict:
+    """Decode both ends of one file and write the verdict."""
+    try:
+        st = os.stat(r["path"])
+    except OSError:
+        # GONE IS SOMEBODY ELSE'S FINDING. The missing-from-disk check owns
+        # that, and writing a verdict here would give one fact two owners that
+        # can disagree.
+        return {"ok": True, "skipped": True}
+    work = getattr(report, "task", None)
+
+    def _stage(which, pct):
+        if work is not None:
+            work.note = ("decoding the first "
+                         f"{HEAD_S}s" if which == "head"
+                         else f"decoding the last {TAIL_S}s")
+        if report is not None:
+            try:
+                report(pct)
+            except Exception:                                    # noqa: BLE001
+                pass
+    out = await test_one(int(r["file_id"]), r["path"],
+                         float(r.get("duration") or 0),
+                         on_pid=(work.set_pid if work is not None else None),
+                         on_stage=_stage)
+    if not out.get("verdict"):
+        # timeout or spawn failure - no verdict, try again another day
+        return {"ok": False, "why": out.get("detail") or "no verdict"}
+    await asyncio.to_thread(_write, int(r["file_id"]), r["path"],
+                            st.st_size, st.st_mtime, out)
+    if out["verdict"] == CORRUPT:
+        joblog.log(f"integrity: {os.path.basename(r['path'])} - "
+                   f"{out['detail']}", "error")
+    return {"ok": True, "verdict": out["verdict"]}
+
+
+async def _after(_d: dict) -> None:
+    """What a finished pass is for: handing the findings to the remedy."""
     from . import remedy
+    got = findings(50)
+    if got:
+        await remedy.auto(got, "integrity", mode() == "auto")
+
+
+async def watch() -> None:
+    """Work through the untested files for as long as the box can spare it."""
+    from . import idle
     await asyncio.sleep(120)
-    while True:
-        try:
-            await sweep()
-            got = findings(50)
-            if got:
-                await remedy.auto(got, "integrity", mode() == "auto")
-        except Exception as e:                                   # noqa: BLE001
-            STATE["last_error"] = f"{type(e).__name__}: {e}"
-        await asyncio.sleep(CYCLE_S)
+    await idle.run(KEY, TITLE, _pending, _do_one,
+                   label=lambda r: os.path.basename(r.get("path") or "")[:120],
+                   disk_of=lambda r: r.get("pool_disk") or "",
+                   note_of=lambda r: "decoding both ends",
+                   system_name="Does it decode?",
+                   goto="/settings#health", on_pass=_after)

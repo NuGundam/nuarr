@@ -922,14 +922,19 @@ def embed_one(file_id: int, report=None, disk: str = "") -> dict:
     # has not finished using yet.
     _claim = fileops.cache_reserve(_size(path))
     _claim.__enter__()
-    # AND ON THE DISK PANEL, THIS IS NUARR. Claimed before the tool starts so
-    # the row says "1 job" from the first frame rather than appearing a second
-    # late; the pid arrives when mkvmerge does.
+    # AND ON THE DISK PANEL, THIS IS NUARR. The runner claims the slot now -
+    # it already knows the file, the disk and when it started - and hands it
+    # over on the reporter, so this only has to find it and, below, tell it
+    # which process to measure. A file done by hand from the panel has no
+    # runner behind it, so it claims its own.
     from . import idle as _idle
-    _work = _idle.claim("Sidecar subtitles", os.path.basename(path),
-                        now=os.path.basename(path),
-                        disk=disk or _disk_of(int(file_id)),
-                        note="taking subtitles in")
+    _work = getattr(report, "task", None)
+    _mine = _work is None
+    if _mine:
+        _work = _idle.claim("Sidecar subtitles", os.path.basename(path),
+                            now=os.path.basename(path),
+                            disk=disk or _disk_of(int(file_id)),
+                            note="taking subtitles in")
     tmp = fileops.cache_temp(".mkv", "embed")
     cmd = [_mkvmerge(), "-o", tmp]
     # WHAT THE SIDECAR REPLACES, NAMED IN MKVMERGE'S OWN NUMBERS. The plan
@@ -980,7 +985,8 @@ def embed_one(file_id: int, report=None, disk: str = "") -> dict:
     try:
         return _embed_tail(file_id, path, takes, drops, cmd, tmp, report, _work)
     finally:
-        _work.close()
+        if _mine:
+            _work.close()
         _claim.__exit__(None, None, None)
 
 
@@ -1730,5 +1736,6 @@ async def watch() -> None:
                    # own row now, so the name is allowed to be the name.
                    label=lambda p: os.path.basename(p.get("path") or "")[:120],
                    disk_of=lambda p: p.get("pool_disk") or "",
-                   system_name="sidecar subtitles",
+                   note_of=lambda p: "taking subtitles in",
+                   system_name="Sidecar subtitles",
                    goto="/settings#subs")

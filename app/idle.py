@@ -53,6 +53,7 @@ every system that adopts this.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import time
 
 from . import joblog
@@ -82,6 +83,11 @@ from . import joblog
 LANES = 2
 
 CPU_BUSY_PCT = 80.0
+# And a ceiling on the whole box, nuarr's own work included. The line above
+# deliberately ignores nuarr's share - otherwise a system paces itself against
+# its own footprint - but "ignore our own load" cannot mean "there is always
+# room". At this point there is not.
+CPU_FULL_PCT = 96.0
 GPU_BUSY_PCT = 80.0
 # Four transcodes is a full house on this machine - the number the audit
 # already used for the same judgement.
@@ -147,7 +153,34 @@ def _machine() -> dict:
                 g = max(g, float(v))
         except Exception:                                        # noqa: BLE001
             pass
-    return {"cpu": float(s.get("cpu_pct") or 0.0), "gpu": g}
+    # WHOSE 92% IS IT.
+    #
+    # This read the whole box and compared it against 80, which is fine while
+    # the only thing being paced is a remux that costs almost no CPU - and
+    # falls apart the moment a system that DOES use the processor adopts this.
+    # Caught within a minute of moving the decode check over: two ffmpeg
+    # decodes put the box at 92%, the runner paused itself on its own load,
+    # the load then vanished because it had paused, and it resumed - a system
+    # oscillating against its own footprint and getting a fraction of the work
+    # done it would have managed by ignoring the reading entirely.
+    #
+    # Same mistake as the disk column, with a different instrument: a program
+    # that counts its own work as somebody else's will get out of its own way.
+    # The question the gate exists to answer is "does anybody else need this
+    # machine", so the figure is the box MINUS nuarr's own tree - and the
+    # encoders are covered separately by the worker count above, the GPU by
+    # its own line.
+    #
+    # A second rule survives underneath: whoever filled it, a box at 97% has
+    # nothing to spare, and starting another decode there helps nobody.
+    box = float(s.get("cpu_pct") or 0.0)
+    mine = 0.0
+    try:
+        mine = float(((s.get("nuarr") or {}).get("cpu_pct")) or 0.0)
+    except Exception:                                            # noqa: BLE001
+        mine = 0.0
+    return {"cpu": max(0.0, box - mine), "cpu_all": box, "cpu_mine": mine,
+            "gpu": g}
 
 
 async def busy(disk: str = "") -> dict:
@@ -221,8 +254,17 @@ async def busy(disk: str = "") -> dict:
     # 5. the hardware itself
     m = _machine()
     if m.get("cpu", 0) >= CPU_BUSY_PCT:
-        return {"busy": True, "why": f"the CPU is at {m['cpu']:.0f}%",
-                "detail": f"background work waits above {CPU_BUSY_PCT:.0f}%"}
+        return {"busy": True,
+                "why": f"something else has the CPU at {m['cpu']:.0f}%",
+                # SHORT ENOUGH TO SURVIVE THE ROW IT IS SHOWN IN. The
+                # running list clips a note at 140 characters, and a sentence
+                # clipped mid-clause is worse than a shorter one.
+                "detail": f"{m.get('cpu_all', 0):.0f}% in total, "
+                          f"{m.get('cpu_mine', 0):.0f}% of it nuarr's own"}
+    if m.get("cpu_all", 0) >= CPU_FULL_PCT:
+        return {"busy": True,
+                "why": f"the CPU is at {m['cpu_all']:.0f}%",
+                "detail": "whoever filled it, there is nothing left to spare"}
     if m.get("gpu", 0) >= GPU_BUSY_PCT:
         return {"busy": True, "why": f"the GPU is at {m['gpu']:.0f}%",
                 "detail": f"background work waits above {GPU_BUSY_PCT:.0f}%"}
@@ -248,8 +290,20 @@ async def busy(disk: str = "") -> dict:
 async def run(key: str, title: str, pending, do_one, label=None, *,
               empty_s: float = EMPTY_S, pause_s: float = PAUSE_S,
               system_name: str = "", disk_of=None, lanes: int = LANES,
-              goto: str = "") -> None:
+              goto: str = "", on_pass=None, note_of=None) -> None:
     r"""Work through `pending()` for as long as the machine can spare it.
+
+    WHAT A CALLER MAY HAND OVER
+        pending()          the list, cheap enough to call each cycle
+        do_one(x, report)  sync or async - a coroutine is awaited, anything
+                           else is run on a thread, because the systems that
+                           adopt this are split about evenly and neither kind
+                           should have to pretend to be the other
+        label(x)           what to show while it happens
+        disk_of(x)         which spindle, so busy disks can be stepped around
+        note_of(x)         what it is doing to that file, for the disk panel
+        on_pass(d)         called when the list runs out, for systems that
+                           hand their findings somewhere when a pass ends
 
     NO BATCH, NO END. This is a loop that lives for the life of the process:
     it does one item, asks again, does the next. There is nothing to tune -
@@ -321,6 +375,9 @@ async def run(key: str, title: str, pending, do_one, label=None, *,
 
             def _finish(task):
                 v = flight.pop(task, None) or {}
+                wk = v.get("task")
+                if wk is not None:
+                    wk.close()
                 try:
                     res = task.result()
                     good = bool((res or {}).get("ok", True))
@@ -390,8 +447,38 @@ async def run(key: str, title: str, pending, do_one, label=None, *,
                             _v["pct"] = max(0.0, min(100.0, float(pct)))
                         except Exception:                        # noqa: BLE001
                             pass
-                    task = asyncio.ensure_future(
-                        asyncio.to_thread(do_one, it, _report))
+                    # ONE LEDGER SLOT PER ITEM, CLAIMED HERE SO NOBODY HAS TO.
+                    #
+                    # The disk panel splits every spindle into Nuarr and "not
+                    # us", and a background system that does not appear in the
+                    # first column appears in the second - which is the gate's
+                    # own number. The sidecar sweep had to claim its slot by
+                    # hand, and every system adopting this runner would have
+                    # had to copy that. The runner already knows the file, the
+                    # disk and when it started, so it claims it: a module only
+                    # has to hand over the pid of whatever tool it spawns, and
+                    # it finds the slot on the reporter it was given.
+                    wk = claim(system_name or key, v["label"],
+                               now=v["label"], disk=v["disk"],
+                               note=((note_of(it) if note_of else "") or title))
+                    v["task"] = wk
+                    _report.task = wk
+
+                    async def _go(_it=it, _rep=_report):
+                        r = do_one(_it, _rep)
+                        # A COROUTINE IS AWAITED WHERE IT IS. Half these
+                        # systems are async because they shell out to ffmpeg
+                        # and half are sync because they read the database;
+                        # sending a coroutine to a thread would return the
+                        # coroutine object and call it a result.
+                        if inspect.isawaitable(r):
+                            return await r
+                        return r
+                    if inspect.iscoroutinefunction(do_one):
+                        task = asyncio.ensure_future(_go())
+                    else:
+                        task = asyncio.ensure_future(
+                            asyncio.to_thread(do_one, it, _report))
                     flight[task] = v
                 _show()
                 if not flight:
@@ -426,6 +513,17 @@ async def run(key: str, title: str, pending, do_one, label=None, *,
                         + f" in {round(time.time() - d['t0'])}s",
                         "warn" if d["failed"] else "info",
                         system=system_name or key)
+                # WHAT HAPPENS WHEN THE LIST RUNS OUT. Several of these
+                # systems do not merely find things, they hand what they found
+                # to somebody - the remedy, an arr, the queue - and that step
+                # belongs at the end of a pass rather than after every file.
+                if on_pass is not None:
+                    try:
+                        r = on_pass(d)
+                        if inspect.isawaitable(r):
+                            await r
+                    except Exception as e:                       # noqa: BLE001
+                        d["last_error"] = f"{type(e).__name__}: {e}"
             else:
                 d.update(running=False, now="", item_pct=0.0, flight=[])
         except asyncio.CancelledError:
@@ -674,7 +772,9 @@ def progress(key: str) -> dict:
     d["rate"] = round(rate, 3)
     d["secs_each"] = round(each, 2)
     d["eta"] = round(d["left"] * each) if (d["left"] and each) else 0
-    d["cpu_line"] = f"waits above {CPU_BUSY_PCT:.0f}% CPU or {GPU_BUSY_PCT:.0f}% GPU"
+    d["cpu_line"] = (f"waits above {CPU_BUSY_PCT:.0f}% CPU from anything else"
+                     f" (or {CPU_FULL_PCT:.0f}% in total) or "
+                     f"{GPU_BUSY_PCT:.0f}% GPU")
     # THE FILE IN FRONT OF IT, and how long it has been on it. Only while
     # running: a percentage left over from the last file would read as
     # progress that is not happening.
