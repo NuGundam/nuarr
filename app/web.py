@@ -33653,6 +33653,12 @@ function _seVal(f, by){
   if(by==='subs') return (f.take||[]).length;
   return 0;
 }
+// Bytes at the scale a subtitle actually is: kilobytes, mostly.
+function bytesShort(v){
+  v = v||0;
+  return v >= 1048576 ? (v/1048576).toFixed(1)+' MB'
+       : v >= 1024 ? Math.round(v/1024)+' KB' : v+' B';
+}
 async function seLoadFailed(){
   try{ _seFail=await (await fetch('/api/subembed/failed?limit=2000')).json(); }catch(e){}
 }
@@ -33916,8 +33922,8 @@ function sePaint(force){
            type of file 'P:\TV Sho". Every word of that but the last four was
            noise. It is one sentence now, and it is allowed two lines. -->
       <table style="width:100%;font-size:11px;table-layout:fixed">
-      <colgroup><col style="width:auto"><col style="width:28%">
-        <col style="width:62px"></colgroup>
+      <colgroup><col style="width:auto"><col style="width:26%">
+        <col style="width:76px"><col style="width:62px"></colgroup>
       ${F.map(f=>`<tr style="vertical-align:top">
         <td style="padding:4px 6px;overflow:hidden" title="${esc(f.path||'')}">
           <b>${esc(f.label||'')}</b>
@@ -33930,6 +33936,13 @@ function sePaint(force){
         <td style="padding:4px 6px;white-space:normal;overflow-wrap:anywhere;
             color:${f.broken?'var(--warn)':'var(--dim)'}"
             title="${esc(f.detail||'')}">${esc(f.why||'')}</td>
+        <!-- THE FACT THAT EXPLAINS MOST OF THESE OUTRIGHT. Fifteen of the
+             first twenty-one failures here were zero bytes, and no column
+             said so - the row described the symptom and withheld the cause. -->
+        <td class="c mono" style="color:${
+            f.size===0?'var(--bad)':(f.size>0?'var(--dim)':'var(--dim)')}"
+            title="${f.size===0?'There is nothing in this file. Nuarr recycles an empty sidecar on sight now, so this row is history rather than a decision waiting for you.':'how big the subtitle file is'}"
+          >${f.size===0?'empty':(f.size>0?bytesShort(f.size):'—')}</td>
         <td class="r" style="padding:4px 6px;white-space:nowrap"><button class="rmb"
           onclick="seRetry('${f.key}',this)">again</button></td>
       </tr>`).join('')}</table>

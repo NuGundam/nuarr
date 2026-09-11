@@ -214,6 +214,16 @@ def _readable(sidecar: str) -> tuple:
         key = (sidecar, st.st_size, int(st.st_mtime))
     except OSError:
         return False, "the subtitle file is not there any more"
+    # NOTHING IN IT IS NOT THE SAME AS UNREADABLE. Fifteen of twenty-one
+    # failures on this library were zero bytes, and "the subtitle file is not
+    # readable - wrong format, or damaged" is a fair thing for mkvmerge to say
+    # about an empty file and a poor thing for a panel to repeat: it invites
+    # somebody to go and look at a file with nothing to look at. An empty file
+    # has no content to lose, so this is the one refusal that can answer
+    # itself.
+    if st.st_size == 0:
+        return False, "the subtitle file is empty - nothing was ever written "\
+                      "to it"
     hit = _READABLE.get(sidecar)
     if hit and hit[0] == key:
         return hit[1]
@@ -276,12 +286,27 @@ def _screen(file_id: int, path: str, takes: list) -> list:
 
     Returns the ones worth muxing. Nothing here opens the video.
     """
+    from . import fileops
     good = []
     for t in takes:
         side = t.get("sidecar") or ""
         ok, why = _readable(side)
         if ok:
             good.append(t)
+            continue
+        # AN EMPTY FILE IS RECYCLED WHERE IT STANDS. It is the only refusal
+        # here that needs no judgement: there is nothing in it to weigh, and
+        # leaving it on disk means a failure row that a person has to read,
+        # understand and clear by hand, once per empty file, for ever. It
+        # still goes to the recycle bin rather than being deleted, and it is
+        # still written down.
+        if "is empty" in why:
+            rr = fileops.recycle(side)
+            _note(file_id, path, side, t.get("lang") or "",
+                  bool(getattr(rr, "ok", False)),
+                  "it was empty - recycled" if getattr(rr, "ok", False)
+                  else f"it is empty and could not be recycled: "
+                       f"{getattr(rr, 'why', '')}")
             continue
         _note(file_id, path, side, t.get("lang") or "", False, why)
     return good
@@ -1701,10 +1726,60 @@ def failures(limit: int = 500) -> list[dict]:
                     d["disk"] = (os.path.splitdrive(d.get("path") or "")[0]
                                  or "")
                 d["gone"] = not os.path.exists(d.get("sidecar") or "")
+                # HOW BIG IS IT. Fifteen of the first twenty-one failures on
+                # this library were zero bytes, and no column said so - the
+                # one fact that explains the failure outright was the one
+                # thing the row did not carry.
+                try:
+                    d["size"] = (0 if d["gone"]
+                                 else os.path.getsize(d["sidecar"]))
+                except OSError:
+                    d["size"] = -1
                 out.append(d)
     except Exception:                                            # noqa: BLE001
         return out
     return out
+
+
+def tidy_empty() -> dict:
+    r"""Recycle every empty sidecar sitting in the failure list.
+
+    THE NEW RULE HAS TO REACH THE OLD ROWS. An empty sidecar met from now on
+    is recycled where it stands - see _screen - but the ones that already
+    failed are not met again: a sidecar whose last attempt failed on its own
+    merits is deliberately kept out of the candidate list until somebody
+    presses Try again, which is right for a damaged file and pointless for an
+    empty one. Fifteen of the twenty-one failures on this library were zero
+    bytes, and without this they would have sat there for ever waiting for a
+    person to clear a row about a file with nothing in it.
+
+    Cheap enough to run on every pass: it is a stat per failure, and there are
+    tens of them rather than tens of thousands.
+    """
+    from . import fileops
+    gone, kept = 0, 0
+    for row in failures(5000):
+        p = row.get("sidecar") or ""
+        if not p or not os.path.exists(p):
+            continue
+        try:
+            if os.path.getsize(p) != 0:
+                continue
+        except OSError:
+            continue
+        rr = fileops.recycle(p)
+        if getattr(rr, "ok", False):
+            gone += 1
+            _note(int(row.get("file_id") or 0), row.get("path") or "", p,
+                  row.get("lang") or "", True,
+                  "it was empty - recycled")
+        else:
+            kept += 1
+    if gone:
+        joblog.log(f"recycled {gone} empty subtitle file(s) - there was "
+                   f"nothing in them to embed", "info",
+                   system="sidecar subtitles")
+    return {"ok": True, "recycled": gone, "kept": kept}
 
 
 def _rows_for(keys) -> list[dict]:
@@ -1865,6 +1940,14 @@ def _pending() -> list:
         return []
 
 
+def _after(_d: dict) -> None:
+    """What a finished pass is for: clearing what answered itself."""
+    try:
+        tidy_empty()
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
 def _do_one(p: dict, report=None) -> dict:
     out = embed_one(int(p["file_id"]), report=report,
                     disk=p.get("pool_disk") or "")
@@ -1897,7 +1980,13 @@ async def watch() -> None:
     """
     from . import idle
     await asyncio.sleep(180)
-    await idle.run(KEY, TITLE, _pending, _do_one,
+    # The empty ones answer themselves, and the answer should not wait for a
+    # whole pass to finish the first time.
+    try:
+        await asyncio.to_thread(tidy_empty)
+    except Exception:                                            # noqa: BLE001
+        pass
+    await idle.run(KEY, TITLE, _pending, _do_one, on_pass=_after,
                    # A LINE OF ITS OWN CAN HOLD A NAME. Seventy characters
                    # was the width of a shared line that also had a
                    # percentage and an elapsed clock on it; each file has its
