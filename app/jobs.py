@@ -640,9 +640,21 @@ class Worker:
             "file": os.path.basename(self.job.path), "kind": self.job.kind,
             "path": self.job.path,
             "why_pool": self.why_pool(),
-            "actions": [{"kind": a.kind, "what": a.what, "why": a.why,
-                         "detail": a.detail} for a in getattr(p, "actions", [])],
-            "plan": self.job.plan.summary() if self.job.plan else "",
+            # A SUBTITLE JOB HAS NO Plan OBJECT - its instruction was decided
+            # by subplan long before the job existed - so without this the
+            # card showed a file, a bar and nothing about what was being done
+            # to it. The steps are stashed on the worker when it starts and
+            # reported in the same shape a transcode's actions are, so the
+            # card needs no special case to draw them.
+            "actions": ([{"kind": "subtitle", "what": s, "why": why, "detail": ""}
+                         for s, why in zip(getattr(self, "sub_steps", []),
+                                           getattr(self, "sub_why", []))]
+                        if getattr(self, "sub_steps", None)
+                        else [{"kind": a.kind, "what": a.what, "why": a.why,
+                               "detail": a.detail}
+                              for a in getattr(p, "actions", [])]),
+            "plan": (getattr(self, "sub_summary", "")
+                     or (self.job.plan.summary() if self.job.plan else "")),
             # WHICH SILICON IS DOING THIS ONE. The encoder is a per-library
             # choice that can silently fall back, so the card has to say what
             # is really running rather than leave it to be inferred from the
@@ -1028,7 +1040,7 @@ def _side_ocr_allowed() -> bool:
 
 async def enqueue(file_id: int, path: str, title: str = "",
                   kind: str = "transcode", priority: int = 100,
-                  source: str = "manual") -> Job:
+                  source: str = "manual", plan_json: str = "") -> Job:
     """Decide the plan now, then persist the job.
 
     THE QUEUE IS THE DATABASE. An earlier version kept it in a Python list,
@@ -1164,7 +1176,14 @@ async def enqueue(file_id: int, path: str, title: str = "",
                 "INSERT INTO jobs(job_id,file_id,kind,state,priority,pool,path,"
                 "title,plan_json,created_at,source) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (job_id, file_id, kind, "queued", priority, pool, path, title,
-                 json.dumps(plan.to_dict()) if plan else None, time.time(),
+                 # A CALLER THAT ALREADY KNOWS WHAT WILL HAPPEN MAY SAY SO.
+                 # Only the transcode path plans inside this function, so
+                 # every other kind arrived with an empty Planned work column -
+                 # a queue that lists work without saying what the work is.
+                 # The subtitle system decides its instruction long before the
+                 # job exists, and this is where it puts it.
+                 (json.dumps(plan.to_dict()) if plan
+                  else (plan_json or None)), time.time(),
                  source))
     except sqlite3.IntegrityError as e:
         # ux_jobs_live_file. Another caller queued this same file during the
@@ -1236,21 +1255,19 @@ def _heavy(pool_name: str, plan_obj=None) -> bool:
     "one heavy job per spindle" rule did not apply to it, so several parallel
     OCR jobs could all land on the same disk and thrash it.
     """
-    if pool_name == "subs":
-        # A SUBTITLE JOB IS ONLY HEAVY WHEN IT REWRITES THE CONTAINER. Most of
-        # them do not: recycling a loose copy is a file move, correcting a
-        # title is mkvpropedit writing a header in place, and neither reads the
-        # video at all. Treating all of them as heavy would idle a spindle for
-        # a second of work; treating none of them as heavy would let two full
-        # container copies land on one disk. The plan says which this is.
-        try:
-            return bool(getattr(plan_obj, "rewrite", None)
-                        if plan_obj is not None
-                           and not isinstance(plan_obj, dict)
-                        else (plan_obj or {}).get("rewrite"))
-        except Exception:                                # noqa: BLE001
-            return True
-    return pool_name in ("passthrough", "subocr")
+    # subs is here too, and unconditionally.
+    #
+    # It is tempting to say a subtitle job is only heavy when it rewrites the
+    # container - recycling a loose copy is a file move, correcting a title is
+    # mkvpropedit writing a header, and neither reads the video. That was the
+    # first version and it was wrong in practice for a dull reason: every
+    # caller of this function passes a POOL NAME and nothing else, so the plan
+    # it would have to consult is not in scope at any of them. A rule that
+    # cannot see what it needs answers "not heavy" for everything, which is
+    # the worst of the two mistakes - two full container copies landing on one
+    # spindle. The other mistake costs a spindle a fifth of a second, because
+    # that is how long a recycle takes before it releases it.
+    return pool_name in ("passthrough", "subocr", "subs")
 
 
 def _note_disk_wait(disk: str, need_pct: float, why: str = "progress") -> None:
@@ -3410,6 +3427,20 @@ async def _subs_job(w: Worker) -> None:
                 note="the instruction was already carried out")
         return
 
+    # THE CARD GETS WHAT A PASSTHROUGH CARD GETS. Its three figures were all
+    # dashes: no size, because nothing set src_bytes; no read or write rate,
+    # because nothing told the worker which process to measure; and one stage
+    # word for the whole job however many different things it was doing. All
+    # three are knowable and none of them were being said.
+    w.src_bytes = before
+
+    class _Pid:
+        """Just enough of a process for Worker._sample_io to count its bytes."""
+        __slots__ = ("pid",)
+
+        def __init__(self, pid):
+            self.pid = pid
+
     def _prog(pct):
         try:
             w.progress = max(0.0, min(1.0, float(pct) / 100.0))
@@ -3419,11 +3450,18 @@ async def _subs_job(w: Worker) -> None:
     # on - see subqueue.do_one, which reads .task off it to join the shared
     # ledger. There is no ledger entry here: the job IS the entry.
     _prog.task = None
+    _prog.on_pid = lambda pid: setattr(w, "proc", _Pid(pid))
+    _prog.on_stage = lambda name: w.set_stage(str(name)[:60])
 
-    for s in (row.get("plan") or {}).get("steps", []):
-        joblog.log(f"will {s}", "info", job.id)
+    w.sub_steps = list((row.get("plan") or {}).get("steps") or [])
+    w.sub_why = list((row.get("plan") or {}).get("why") or [])
+    w.sub_summary = row.get("why") or ""
+    for a in w.sub_steps:
+        joblog.log(f"will {a}", "info", job.id)
     res = await asyncio.to_thread(subqueue.do_one, row, _prog, False)
+    w.proc = None
     after = os.path.getsize(job.path) if os.path.exists(job.path) else 0
+    w.out_bytes = after
     await asyncio.to_thread(subqueue.note_result, int(job.file_id), res)
     if res.get("ok"):
         joblog.log(row.get("why") or "subtitles settled", "ok", job.id)

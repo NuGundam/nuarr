@@ -188,12 +188,19 @@ def candidates(limit: int = 100000) -> list[dict]:
     return out
 
 
-def _events(path: str, track_id: int) -> int:
+def _events(path: str, track_id: int, on_pid=None) -> int:
     """How many subtitle events this track actually carries.
 
     EXTRACTED AND COUNTED, NOT ESTIMATED. Two tracks with the same language
     and the same title can be a full subtitle and a truncated one, and the
     whole point of choosing is to keep the one with something in it.
+
+    AND WHOEVER IS COUNTING BYTES GETS THE PID. Weighing three tracks of a
+    5 GB file means mkvextract reading the whole container three times, which
+    on this library was measured at over two minutes - longer than the remux
+    that follows it. Without the pid the card showed that time passing with a
+    read rate of zero, which reads as a hang rather than as the slowest part
+    of the job.
     """
     d = tempfile.mkdtemp(prefix="nuarr-dupe-")
     out = os.path.join(d, f"t{track_id}.sub")
@@ -201,9 +208,20 @@ def _events(path: str, track_id: int) -> int:
         exe = os.path.join(os.path.dirname(_mkvmerge()), "mkvextract.exe")
         if not os.path.exists(exe):
             exe = "mkvextract"
-        subprocess.run([exe, path, "tracks", f"{track_id}:{out}"],
-                       capture_output=True, text=True, timeout=600,
-                       creationflags=NO_WINDOW, startupinfo=hidden_si())
+        p = subprocess.Popen([exe, path, "tracks", f"{track_id}:{out}"],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             creationflags=NO_WINDOW, startupinfo=hidden_si())
+        if on_pid is not None:
+            try:
+                on_pid(p.pid)
+            except Exception:                                    # noqa: BLE001
+                pass
+        try:
+            p.communicate(timeout=600)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.communicate()
+            return -1
         if not os.path.exists(out):
             return -1
         txt = ""

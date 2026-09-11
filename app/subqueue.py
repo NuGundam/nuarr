@@ -294,7 +294,8 @@ def row_for(file_id: int) -> dict:
         steps = []
     if not steps:
         return {}
-    d["plan"] = {"steps": [s.get("why") or s.get("do") for s in steps]}
+    d["plan"] = {"steps": [_step_words(s) for s in steps],
+                 "why": [s.get("why") or "" for s in steps]}
     _mark(int(file_id), RUNNING, started_at=time.time())
     return d
 
@@ -338,9 +339,61 @@ def _to_hand_over(depth: int) -> tuple:
         if not room:
             return have, []
         return have, [dict(r) for r in cur.execute(
-            "SELECT file_id, path, name, rewrite FROM sub_queue "
+            "SELECT file_id, path, name, rewrite, steps, why FROM sub_queue "
             " WHERE state=? ORDER BY priority, queued_at LIMIT ?",
             (QUEUED, room))]
+
+
+def _job_plan(r: dict) -> str:
+    r"""The instruction, in the shape the queue panel reads plans in.
+
+    THE QUEUE SAID NOTHING UNDER "Planned work" for these, which is the one
+    column that answers "what is this job going to do to my file" - and for a
+    job that removes subtitle tracks that is not a detail. The transcode path
+    writes its plan at enqueue time and the panel has read it ever since;
+    this is the same thing said in the same place.
+    """
+    try:
+        steps = json.loads(r.get("steps") or "[]")
+    except Exception:                                            # noqa: BLE001
+        steps = []
+    return json.dumps({
+        "subs": True,
+        "rewrite": bool(r.get("rewrite")),
+        "summary": r.get("why") or "",
+        # Same shape the transcode plan uses for its sentences, so the row's
+        # hover and the job card's action list need no special case.
+        "actions": [{"kind": "subtitle", "what": _step_words(s),
+                     "why": s.get("why") or "", "detail": ""}
+                    for s in steps],
+    })
+
+
+def _step_words(s: dict) -> str:
+    """One step as a sentence, for the plan and the job card."""
+    d = s.get("do")
+    if d == "take":
+        w = f"take in the {s.get('cls') or 'full'} {s.get('lang') or ''} " \
+            f"subtitle sitting beside it"
+        if s.get("replaces"):
+            w += f", replacing {len(s['replaces'])} track(s) already inside"
+        return w
+    if d == "recycle":
+        return f"recycle {os.path.basename(s.get('side') or '')}"
+    if d == "dropdup":
+        if int(s.get("ord", -1)) < 0:
+            return (f"count the lines in {len(s.get('weigh') or [])} "
+                    f"{s.get('cls') or ''} {s.get('lang') or ''} tracks and "
+                    f"remove all but the fullest")
+        return f"remove a second {s.get('cls') or ''} {s.get('lang') or ''} track"
+    if d == "dropempty":
+        return f"remove an empty {s.get('lang') or ''} track"
+    if d == "retitle":
+        return (f"correct track {int(s.get('ord') or 0)}'s title to "
+                f"{s.get('to') or ''}")
+    if d == "mark":
+        return "add the blank marker saying the words are in the picture"
+    return str(d or "")
 
 
 async def topup(depth: int = QUEUE_DEPTH) -> dict:
@@ -369,7 +422,8 @@ async def topup(depth: int = QUEUE_DEPTH) -> dict:
         try:
             await jobs.enqueue(int(r["file_id"]), r["path"],
                                r.get("name") or "", kind="subs",
-                               priority=50, source="subtitles")
+                               priority=50, source="subtitles",
+                               plan_json=_job_plan(r))
             made += 1
         except ValueError:
             skipped += 1
@@ -410,10 +464,25 @@ def do_one(row: dict, report=None, claim: bool = True) -> dict:
                           now=os.path.basename(path),
                           disk=row.get("disk") or "", note="subtitles")
     out = {"ok": True, "did": [], "why": ""}
+    # WHICH OF THE FOUR THINGS IT IS DOING RIGHT NOW. A card that says
+    # "subtitles" for three minutes is a card that cannot tell a stalled
+    # container copy from a title being written, and those differ by three
+    # orders of magnitude in how long they should take.
+    stage = getattr(report, "on_stage", None)
+
+    def say(name):
+        if stage is not None:
+            try:
+                stage(name)
+            except Exception:                                    # noqa: BLE001
+                pass
     try:
         takes = [s for s in steps if s["do"] == "take"]
         drops = [s for s in steps if s["do"] in ("dropdup", "dropempty")]
         if takes or drops:
+            say("rebuilding the file"
+                + (f" — taking in {len(takes)}" if takes else "")
+                + (f", removing {len(drops)}" if drops else ""))
             r = _rewrite(fid, path, takes, drops, report, work, row)
             out["did"].append(r)
             if not r.get("ok"):
@@ -421,12 +490,16 @@ def do_one(row: dict, report=None, claim: bool = True) -> dict:
                         "did": out["did"]}
         rt = [s for s in steps if s["do"] == "retitle"]
         if rt:
+            say("correcting the title")
             out["did"].append(_retitle(fid, path, rt))
         mk = [s for s in steps if s["do"] == "mark"]
         if mk:
+            say("adding the marker track")
             out["did"].append(_mark_picture(fid, mk[0]))
         rc = [s for s in steps if s["do"] == "recycle"]
         if rc:
+            say(f"recycling {len(rc)} loose cop"
+                + ("y" if len(rc) == 1 else "ies"))
             gone, kept = 0, []
             for s in rc:
                 rr = fileops.recycle(s["side"])
@@ -439,6 +512,7 @@ def do_one(row: dict, report=None, claim: bool = True) -> dict:
         # THE FILE IS A DIFFERENT FILE NOW, so what nuarr knows about its
         # subtitles is out of date by definition. Re-reading it here is what
         # stops the next re-plan queueing the same work again.
+        say("re-reading what it carries now")
         try:
             subscan.scan_one(fid)
         except Exception:                                        # noqa: BLE001
@@ -500,12 +574,22 @@ def _rewrite(fid: int, path: str, takes: list, drops: list, report, work,
         # than a question for a person.
         ords = [int(x) for x in (s.get("weigh") or [])]
         counted = []
-        for o in ords:
+        on_pid = getattr(report, "on_pid", None)
+        stage = getattr(report, "on_stage", None)
+        for i, o in enumerate(ords):
             t = by_ord.get(o)
             if t is None:
                 return {"do": "rewrite", "ok": False,
                         "why": "the tracks have moved since this was planned"}
-            counted.append((subdupe._events(path, t["id"]), t))
+            # THE LONGEST PART OF THE JOB, SAID OUT LOUD. Three extractions of
+            # a 5 GB container take longer than the remux that follows them,
+            # and the card used to show that time under one motionless word.
+            if stage is not None:
+                try:
+                    stage(f"counting the lines in track {i + 1} of {len(ords)}")
+                except Exception:                                # noqa: BLE001
+                    pass
+            counted.append((subdupe._events(path, t["id"], on_pid=on_pid), t))
         counted.sort(key=lambda ct: (-(ct[0] if ct[0] >= 0 else -1),
                                      ct[1]["ord"]))
         for n, t in counted[1:]:
@@ -556,7 +640,8 @@ def _rewrite(fid: int, path: str, takes: list, drops: list, report, work,
                "role": t.get("role") or "", "replaces": t.get("replaces") or []}
               for t in takes]
         r = subembed._embed_tail(fid, path, tk, [], cmd, tmp, report, work,
-                                 keep=keep, removed=len(remove))
+                                 keep=keep, removed=len(remove),
+                                 on_pid=getattr(report, "on_pid", None))
         return {"do": "rewrite", **r, "removed": len(remove),
                 "took_in": len(takes)}
     finally:

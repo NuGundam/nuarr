@@ -1066,7 +1066,7 @@ def _disk_of(file_id: int) -> str:
 
 
 def _embed_tail(file_id, path, takes, drops, cmd, tmp, report, work=None,
-                keep=None, removed=0):
+                keep=None, removed=0, on_pid=None):
     r"""The rewrite itself, so the cache claim above has one place to end.
 
     keep     {(lang, class)} that MUST still be in the rebuilt file. The
@@ -1088,8 +1088,14 @@ def _embed_tail(file_id, path, takes, drops, cmd, tmp, report, work=None,
         if report is not None:
             report(pct)
     try:
+        # WHOEVER IS COUNTING THE BYTES GETS THE PID. A background pass hands
+        # in its ledger entry and a job hands in its worker; either way
+        # somebody is drawing a read/write figure for this file and it has to
+        # be measured rather than left at a dash.
         r = _run_reporting(cmd, (_rep if report is not None else None),
-                           on_pid=(work.set_pid if work is not None else None))
+                           on_pid=(on_pid if on_pid is not None
+                                   else (work.set_pid if work is not None
+                                         else None)))
     except Exception as e:                                       # noqa: BLE001
         fileops._quiet_remove(tmp)
         return {"ok": False, "why": f"{type(e).__name__}: {e}"}

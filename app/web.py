@@ -3489,6 +3489,15 @@ def _work_summary(plan_json, pool: str) -> tuple[str, str]:
         p = json.loads(plan_json)
     except (ValueError, TypeError):
         return "", ""
+    # A SUBTITLE INSTRUCTION IS ALREADY A SENTENCE. It is decided from the
+    # facts table before the job exists and written down in plain words there,
+    # so there is nothing to derive - the row gets the summary and the hover
+    # gets the steps, one per line.
+    if p.get("subs"):
+        full = "\n".join(f"• {a.get('what')}"
+                         + (f" — {a['why']}" if a.get("why") else "")
+                         for a in (p.get("actions") or []))
+        return (p.get("summary") or "settle the subtitles"), full
     bits: list[str] = []
     if p.get("encode"):
         tgt = p.get("target") or "h264"
@@ -21244,9 +21253,16 @@ const SRC_TAG = {
   auto:    ['auto',   '#8b95a5', 'added automatically from the eligible backlog'],
   manual:  ['manual', '#58a6ff', 'you queued this one'],
   requeue: ['requeue','#d2a8ff', 'sent back through deliberately'],
+  // AN UNKNOWN SOURCE FELL BACK TO "manual", which is a lie about who asked
+  // for the work - these came off the Subtitles page's reading, and nobody
+  // pressed anything. A source this table does not recognise says its own
+  // name from now on rather than borrowing somebody else's.
+  subtitles: ['subtitles','#6fb0ff',
+              'the subtitle reading found this and handed it over'],
 };
 function srcTag(s){
-  const t = SRC_TAG[s] || SRC_TAG.manual;
+  const t = SRC_TAG[s] || [String(s||'manual'), '#8b95a5',
+                          'queued by '+String(s||'something unnamed')];
   return `<span class="pill qsrc" style="color:${t[1]};border-color:${t[1]}"
             title="${esc(t[2])}">${t[0]}</span>`;
 }
