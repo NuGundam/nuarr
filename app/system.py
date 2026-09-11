@@ -247,6 +247,42 @@ def _input_name(cmd: list) -> str:
 # pid -> (at, read_bytes, write_bytes) for the rate above.
 _PIO: dict = {}
 
+# WHICH ENGINE A PROCESS IS ON, WITHOUT INVENTING A PERCENTAGE.
+#
+# Windows does not let nvidia-smi answer this. Checked on this box against
+# the RTX A5000: --query-compute-apps=used_gpu_memory returns [N/A] for every
+# process, and `nvidia-smi pmon` prints a dash under sm, mem, enc and dec for
+# all of them. That is WDDM, not a missing flag - the numbers are simply not
+# exposed per process, and no amount of asking differently will produce them.
+#
+# So the column does not pretend. What CAN be known exactly is which engine a
+# process was launched to use, because nuarr wrote the command line: an
+# encode asking for h264_nvenc is on NVENC by definition, and one with
+# -hwaccel cuda is decoding on NVDEC. That is a fact about the process rather
+# than a measurement of it, and it is the fact people actually want from this
+# column - "is this one on the card or not". The card's own engine
+# percentages stay on the Graphics chart, where being whole-card figures is
+# correct rather than misleading.
+_GPU_ARG = (
+    ("nvenc",   "NVENC"),          # encoding on the dedicated encoder
+    ("cuvid",   "NVDEC"),          # decoding on the dedicated decoder
+    ("nvdec",   "NVDEC"),
+    ("hwaccel cuda", "CUDA"),
+    ("-hwaccel_device", "CUDA"),
+    ("cuda",    "CUDA"),
+)
+
+
+def _gpu_of(cmd: list) -> str:
+    """Which GPU engine this command was asked to use, from its own arguments."""
+    jl = " ".join(cmd or []).lower()
+    if not jl:
+        return ""
+    for needle, label in _GPU_ARG:
+        if needle in jl:
+            return label
+    return ""
+
 
 def _owner(name: str, cmd: list) -> tuple[str, str]:
     r"""WHICH NUARR ACTIVITY owns this process, and what it is doing.
@@ -272,6 +308,12 @@ def _owner(name: str, cmd: list) -> tuple[str, str]:
             return "Audio language", (f"listening to {what}" if what
                                       else "listening to a sample")
         if "-progress" in jl:
+            # COPYING IS NOT ENCODING, and the GPU column made that visible:
+            # a job labelled "encoding" with nothing on the card and -c:v copy
+            # on its command line is a repack, which is the cheapest thing the
+            # queue does and reads as the most expensive.
+            if "-c:v copy" in jl or "-c:v:0 copy" in jl:
+                return "Repack", (f"copying {what}" if what else "copying")
             return "Transcode", (f"encoding {what}" if what else "encoding")
         # THE DECODE CHECK, WHICH HAD BEEN ARRIVING AS "ffmpeg". Nothing else
         # nuarr runs decodes to nowhere: -f null with -xerror is the integrity
@@ -379,8 +421,22 @@ def _self_usage() -> dict:
             age = max(0.0, time.time() - tracked.create_time())
         except psutil.Error:
             age = 0.0
+        _cmd = _cmdline(tracked)
         act, detail = ("nuarr", "the server") if p.pid == me.pid \
-            else _owner(name, _cmdline(tracked))
+            else _owner(name, _cmd)
+        # THE SERVER'S OWN GPU WORK IS NOT ON A COMMAND LINE. Whisper and
+        # PaddleOCR load into this process, so there is no child to inspect -
+        # the engines themselves report which device they came up on, and
+        # _gpu_work already collects that for the GPU panel.
+        if p.pid == me.pid:
+            try:
+                _on = [w for w in _gpu_work() if w.get("device") == "gpu"]
+            except Exception:                                # noqa: BLE001
+                _on = []
+            gpu_use = ", ".join(sorted({("OCR" if w.get("kind") == "subocr"
+                                         else "Whisper") for w in _on}))
+        else:
+            gpu_use = _gpu_of(_cmd)
         try:
             ppid = tracked.ppid()
         except psutil.Error:
@@ -426,6 +482,7 @@ def _self_usage() -> dict:
             "write_bps": round(wr),
             "io_prio": _iov,
             "cpu_prio": _cpu_cls,
+            "gpu": gpu_use,
             "self": p.pid == me.pid,
         })
 

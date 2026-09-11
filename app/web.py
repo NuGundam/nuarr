@@ -24498,6 +24498,7 @@ function tmPaint(){
     if(k==='ram')  return p.rss_mb||0;
     if(k==='read') return p.read_bps||0;
     if(k==='write')return p.write_bps||0;
+    if(k==='gpu')  return (p.gpu||'').toLowerCase();
     if(k==='age')  return p.age_s||0;
     return 0;
   };
@@ -24525,11 +24526,23 @@ function tmPaint(){
         procs.some(p=>p._gone)?`, and ${fmt(procs.filter(p=>p._gone).length)}
         that has just finished`:''}</span></div>
     <div class="scrollbox" style="max-height:340px;margin:6px 0 0">
-    <table style="width:100%;font-size:11.5px;border-collapse:collapse">
+    <!-- DECLARED WIDTHS, SO A HEADING SITS OVER ITS OWN COLUMN. With the
+         widths left to the content, every column was as wide as whatever
+         happened to be in it that second - so the heading and the figures
+         under it drifted apart, and the whole table shifted sideways each
+         time a rate gained a digit. Fixed layout also means a long episode
+         title clips instead of shoving the numbers off the edge. -->
+    <table style="width:100%;font-size:11.5px;border-collapse:collapse;
+           table-layout:fixed">
+      <colgroup><col style="width:21%"><col style="width:auto">
+        <col style="width:8%"><col style="width:9%"><col style="width:10%">
+        <col style="width:10%"><col style="width:9%"><col style="width:8%">
+        <col style="width:9%"></colgroup>
       <thead><tr>${th('name','Doing what','left')}${th('what','On what','left')}
         ${th('cpu','CPU')}${th('ram','Memory')}${th('read','Read')}
-        ${th('write','Write')}${th('age','Up')}
-        <th style="padding:4px 6px;position:sticky;top:0;background:var(--panel);
+        ${th('write','Write')}${th('gpu','GPU')}${th('age','Up')}
+        <th style="padding:4px 6px;text-align:center;position:sticky;top:0;
+          background:var(--panel);
           border-bottom:1px solid var(--line);font-size:10px;
           letter-spacing:.05em;text-transform:uppercase;color:var(--dim)"
           title="Nuarr drops a child to very low disk priority while somebody is watching the spindle it is reading.">Priority</th>
@@ -24552,16 +24565,37 @@ function tmPaint(){
         const cls = p._gone ? ' tmgone' : '';
         return `<tr class="tmrow${cls}" style="border-top:1px solid var(--line);
           opacity:${op.toFixed(3)};${tint}">
-        <td style="padding:4px 6px;text-align:left">
-          <b style="color:${p.self?'var(--acc)':(stale?'var(--warn)':'var(--fg)')}"
-            >${esc(p.activity||p.name||'?')}</b>${p.self?'<span class="dim"> (the server)</span>':''}
-          <div class="dim" style="font-size:10px">${esc(p.name||'')} · ${p.pid}</div></td>
+        <td style="padding:4px 6px;text-align:left;overflow:hidden">
+          <b style="color:${p.self?'var(--acc)':(stale?'var(--warn)':'var(--fg)')};
+             display:block;overflow:hidden;text-overflow:ellipsis;
+             white-space:nowrap"
+            >${esc(p.activity||p.name||'?')}${p.self?'<span class="dim"> (the server)</span>':''}</b>
+          <div class="dim" style="font-size:10px;overflow:hidden;
+            text-overflow:ellipsis;white-space:nowrap">${esc(p.name||'')} · ${p.pid}</div></td>
         <td class="dim" style="padding:4px 6px;text-align:left;
-            white-space:normal;overflow-wrap:anywhere">${esc(p.detail||'')}</td>
-        <td class="c mono">${share>=0.05?share.toFixed(1)+'%':'—'}</td>
+            overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+            title="${esc(p.detail||'')}">${esc(p.detail||'')}</td>
+        <!-- A LIVE PROCESS USING ALMOST NOTHING IS USING ALMOST NOTHING,
+             WHICH IS A MEASUREMENT. Printing an em-dash there said "no
+             reading" about a figure that had been read - and on a suspended
+             encode, which is the case that matters, it hid the one number
+             that explains why nothing is happening. The dash is kept for a
+             row that has finished, where there really is nothing to read. -->
+        <td class="c mono">${p._gone?'—'
+          :(share>=0.05?share.toFixed(1)+'%':'0%')}</td>
         <td class="c mono">${tmMb(p.rss_mb)}</td>
         <td class="c mono" style="color:${p.read_bps?'#58a6ff':'var(--dim)'}">${tmBps(p.read_bps)}</td>
         <td class="c mono" style="color:${p.write_bps?'#f0883e':'var(--dim)'}">${tmBps(p.write_bps)}</td>
+        <td class="c mono" style="color:${p.gpu?'#e8a33d':'var(--dim)'}"
+          title="${esc(p.gpu
+            ? p.gpu+' — what this process was launched to use. Windows gives '
+              +'nvidia-smi no per-process figure on this card (used_gpu_memory '
+              +'reads N/A and pmon reports a dash for every engine), so this '
+              +'is what it was asked to do rather than a measurement of what '
+              +'it is doing. The card\'s own engine percentages are on the '
+              +'Graphics chart above.'
+            : 'Nothing on this process\'s command line asks for the card.')}"
+          >${esc(p.gpu||'—')}</td>
         <td class="c mono ${stale?'':'dim'}" style="${stale?'color:var(--warn)':''}"
           >${(p.age_s||0)>=60?hms(p.age_s):(p.age_s||0)+'s'}</td>
         <td class="c mono" style="color:${low?'var(--warn)':'var(--dim)'}"
@@ -24613,8 +24647,10 @@ function tmPaint(){
         Math.round((H.length||0)*((_tm.history||{}).every_s||1))}
         seconds.</span>
       <span class="dim mono" style="margin-left:auto;font-size:11px">${
-        tmNum((me.cpu_pct||0).toFixed(1),'% cpu')} ·
+        tmNum((me.cpu_pct||0).toFixed(1)+'%',' cpu')} ·
         ${tmNum(tmMb(me.ram_mb),'')} ·
+        ${tmNum(((S.gpu||{}).encoder_pct!=null
+                 ? (S.gpu||{}).encoder_pct+'%' : '—'),' nvenc')} ·
         ${tmNum(fmt(me.procs||0),' processes')}</span>
     </div>
     ${grid}${work}${ptable}
