@@ -19065,9 +19065,12 @@ function sysRunningHtml(){
         ${el?`<span class="dim" style="font-size:10.5px;margin-left:auto;flex:none"
            title="how long this has been going">${esc(el)}</span>`:''}
       </div>
-      ${r.note?`<div class="dim" style="font-size:10.5px">${esc(r.note)}</div>`:''}
-      ${r.now?`<div class="dim mono" style="font-size:10px;overflow:hidden;
-         text-overflow:ellipsis;white-space:nowrap">${esc(r.now)}</div>`:''}
+      ${r.note?`<div style="font-size:10.5px;color:${
+        r.paused?'var(--warn)':'var(--dim,#8a97a6)'}">${
+        r.paused?'<b>paused</b> — ':''}${esc(r.note)}</div>`:''}
+      ${(r.flight&&r.flight.length)?laneLines(r.flight,true)
+        :(r.now?`<div class="dim mono" style="font-size:10px;overflow:hidden;
+           text-overflow:ellipsis;white-space:nowrap">${esc(r.now)}</div>`:'')}
       ${bar}</a>`;
   }).join('') + '</div>';
 }
@@ -19120,7 +19123,11 @@ function panelBusy(id){
 function panelScrolled(id){
   const el = document.getElementById(id);
   if(!el) return false;
-  return [...el.querySelectorAll('.rowbox')].some(b => b.scrollTop > 8);
+  // EITHER KIND. This looked only for .rowbox, and the long list on the
+  // sidecar panel is a .scrollbox - so the one box big enough to need
+  // scrolling was the one box a repaint was allowed to yank out from under
+  // you. Both classes mean the same thing: somebody is reading it.
+  return [...el.querySelectorAll('.rowbox,.scrollbox')].some(b => b.scrollTop > 8);
 }
 
 function askOpen(scope){
@@ -32534,6 +32541,40 @@ async function idleLoad(key){
   try{ _idle[key]=await (await fetch('/api/idle?key='+encodeURIComponent(key))).json(); }
   catch(e){ return; }
 }
+// A LANE IS A COLOUR, AND IT IS THE SAME COLOUR EVERYWHERE.
+//
+// Two files are in flight at once now, and "Mayor of Kingstown - S01E08 +1
+// more at once" told you there was a second one without telling you anything
+// about it - not its name, not how far through it was, not which disk it was
+// reading from. Two bars under one truncated name is worse than one bar: you
+// cannot tell which bar belongs to which file.
+//
+// So each lane gets a line of its own with the disk at the end, and the bar
+// beneath it is drawn in the same colour as that line. The colour carries no
+// meaning by itself; it exists so the eye can join the name to the bar
+// without counting rows.
+const LANEC=['#6fb0ff','#e8a33d','#7fd18c','#c98cf0'];
+function laneLines(fl, small){
+  fl = fl||[];
+  if(!fl.length) return '';
+  const fs = small ? '10px' : '11px';
+  return fl.map((v,i)=>{
+    const c=LANEC[i%LANEC.length];
+    const p=Math.max(0,Math.min(100,v.pct||0));
+    return `<div style="display:flex;gap:8px;align-items:baseline;
+         font-size:${fs};margin-top:3px">
+      <span style="flex:1 1 auto;min-width:0;overflow:hidden;
+        text-overflow:ellipsis;white-space:nowrap;color:${c}"
+        title="${esc(v.now||'')}">${esc(v.now||'')}</span>
+      <b style="flex:none;color:${c}">${p.toFixed(0)}%</b>
+      ${v.disk?`<span style="flex:none;color:${c};opacity:.75"
+        title="the disk this file lives on — never two at once on the same one"
+        >${esc(v.disk)}</span>`:''}
+    </div>
+    <div class="hsbar item" style="margin-top:2px"><i
+      style="width:${p}%;background:${c}"></i></div>`;
+  }).join('');
+}
 function idleStrip(d, opts){
   d=d||{}; opts=opts||{};
   const pct=Math.max(0,Math.min(100,d.pct||0));
@@ -32548,11 +32589,12 @@ function idleStrip(d, opts){
     <span style="flex:none">${num(d.done||0,'done')} of ${num(d.total||0,'auto')}
       <span class="dim" style="font-size:10.5px">(${pct.toFixed(0)}%)</span></span>
     <span class="dim" style="flex:1 1 auto;min-width:0;overflow:hidden;
-      text-overflow:ellipsis;white-space:nowrap">${esc(d.now||'')}${
-      FL.length>1?` <span style="opacity:.8">+${FL.length-1} more at once</span>`:''}${
-      (d.running&&ip)?` <b style="color:#6fb0ff">${ip.toFixed(0)}%</b>`:''}${
-      (d.running&&d.item_elapsed)?` <span style="opacity:.7">${
-        hsDur(d.item_elapsed)} in</span>`:''}</span>
+      text-overflow:ellipsis;white-space:nowrap">${FL.length?`${
+        fmt(FL.length)} at once${FL.length<(d.lanes||1)?` of ${fmt(d.lanes)}`:''}`
+      :`${esc(d.now||'')}${
+        (d.running&&ip)?` <b style="color:#6fb0ff">${ip.toFixed(0)}%</b>`:''}${
+        (d.running&&d.item_elapsed)?` <span style="opacity:.7">${
+          hsDur(d.item_elapsed)} in</span>`:''}`}</span>
     <span style="flex:none;margin-left:auto;display:flex;gap:10px">
       ${d.rate?`<span class="dim" title="Measured on this run">${
         d.rate>=1?`<b style="color:var(--ok)">${d.rate.toFixed(1)}</b> a second`
@@ -32563,11 +32605,18 @@ function idleStrip(d, opts){
   const wait = d.paused
     ? `<div style="font-size:11px;margin-top:3px;color:var(--warn)">
          <b>paused</b> — ${esc(d.paused_why||'the box is busy')}
-         <span class="dim">· it carries on by itself when that clears</span></div>`
+         <span class="dim">· it carries on by itself when that clears</span>
+         ${d.paused_detail?`<div class="dim" style="font-size:10.5px">${
+           esc(d.paused_detail)}</div>`:''}</div>`
     : (d.idle_why
        ? `<div class="dim" style="font-size:11px;margin-top:3px">${esc(d.idle_why)}${
            d.next_look?` · looks again ${ago2(d.next_look)}`:''}</div>`
-       : '');
+       : (d.running&&(d.skip_disks||[]).length
+          ? `<div class="dim" style="font-size:11px;margin-top:3px"
+               title="Somebody is reading from these, so their files are left for a later pass rather than waited on.">steering
+             around ${esc((d.skip_disks||[]).join(', '))} — ${
+             fmt(d.skipped||0)} left for later</div>`
+          : ''));
   const hist=`<div class="dim" style="font-size:11px;margin-top:3px;display:flex;
        gap:12px;flex-wrap:wrap">
     ${d.last_run?`<span title="The last time it worked all the way through what was waiting">last finished ${
@@ -32588,10 +32637,7 @@ function idleStrip(d, opts){
     ${(d.running||d.total)?`<div class="hsbar${d.paused?' paused':''}"
        style="margin-top:5px" title="${fmt(d.done||0)} of ${fmt(d.total||0)} files"
        ><i style="width:${pct}%"></i></div>`:''}
-    ${(d.running&&FL.length)?FL.map(v=>`<div class="hsbar item"
-       title="how far through ${esc(v.now||'this file')}${
-         v.disk?' — on '+esc(v.disk):''}"><i
-       style="width:${Math.max(0,Math.min(100,v.pct||0))}%"></i></div>`).join('')
+    ${(d.running&&FL.length)?laneLines(FL,false)
      :((d.running&&ip)?`<div class="hsbar item"
        title="how far through ${esc(d.now||'this file')}"><i
        style="width:${ip}%"></i></div>`:'')}
@@ -32605,6 +32651,22 @@ function ago2(t){
 
 // ---- sidecar subtitles waiting to come inside ---------------------------
 let _se=null, _seKey='', _sePoll=null, _seFail={rows:[]};
+// WHICH COLUMN, AND WHICH WAY. Nothing is remembered across a reload on
+// purpose: the useful order is whatever question you are asking this minute,
+// and a sort left over from last week is a list that looks wrong.
+let _seSort={by:'', dir:1}, _seSeen={};
+function seSort(by){
+  if(_seSort.by===by) _seSort.dir=-_seSort.dir;
+  else { _seSort.by=by; _seSort.dir=1; }
+  sePaint(true);
+}
+function _seVal(f, by){
+  if(by==='file') return String(f.path||'').split('\\').pop().toLowerCase();
+  if(by==='library') return String(f.library||'').toLowerCase();
+  if(by==='disk') return String(f.pool_disk||'').toLowerCase();
+  if(by==='subs') return (f.take||[]).length;
+  return 0;
+}
 async function seLoadFailed(){
   try{ _seFail=await (await fetch('/api/subembed/failed?limit=2000')).json(); }catch(e){}
 }
@@ -32690,7 +32752,7 @@ function seShow(on){
 // can tick at two seconds and the bar moves as files land rather than once a
 // minute when the panel happens to reload.
 let _sePoll2=null, _seDone=-1;
-function seIdleTick(){
+function seIdleTick(ms){
   clearTimeout(_sePoll2);
   _sePoll2=setTimeout(async ()=>{
     if(!document.getElementById('sePanel')) return;
@@ -32704,8 +32766,19 @@ function seIdleTick(){
       if(!seHold()) loadSubEmbed(false);
     }
     sePaint();
-    if(d.running||d.paused) seIdleTick();
-  }, 2000);
+    // IT HAS TO KEEP LOOKING TO SEE IT START.
+    //
+    // This re-armed only while the runner was already working, so the poll
+    // died the first time it found nothing - and then nothing woke it. The
+    // sweep would begin, work through a dozen files, and the panel would
+    // still be reading "0 of 0 · has not finished a run yet", because the one
+    // thing that would have noticed had stopped asking. A watcher that quits
+    // when there is nothing to watch is not a watcher.
+    //
+    // So it always comes back; it simply comes back slower when there is
+    // nothing happening. The cost either way is one dict read.
+    seIdleTick((d.running||d.paused) ? 2000 : 6000);
+  }, ms||2000);
 }
 async function loadSubEmbed(full){
   const el=document.getElementById('sePanel'); if(!el) return;
@@ -32737,7 +32810,11 @@ function seHold(){
 }
 function sePaint(force){
   const el=document.getElementById('sePanel'); if(!el||!_se) return;
-  if(!force && seHold()) return;
+  // NOT A BLANKET REFUSAL ANY MORE. This used to abandon the whole paint the
+  // moment the pointer was over the list, which froze the progress bars too -
+  // so reading the list meant losing sight of what it was doing. The hold now
+  // applies per section, down in the loop, to the two boxes that hold lists
+  // and to nothing else.
   const d=_se, pv=d.preview||[];
   const w=d.walk||{};
   // WHILE THE FIRST WALK RUNS there is no count to lead with, so the panel is
@@ -32862,24 +32939,50 @@ function sePaint(force){
     ? `<div class="err" style="font-size:11px;margin:4px 0">mkvmerge is not
        installed, so nothing can be embedded. It ships with MKVToolNix — see
        the MKVToolNix page under Tools.</div>` : '';
+  // NAMED COLUMNS, CENTRED UNDER THEIR NAME, AND A CLICK SORTS BY THEM.
+  // Four columns of unlabelled text is a table you have to decode before you
+  // can read it, and "which of these is on the disk somebody is watching" was
+  // a question the data could answer and the layout could not.
+  const SORTED = _seSort.by
+    ? pv.slice().sort((a,b)=>{
+        const x=_seVal(a,_seSort.by), y=_seVal(b,_seSort.by);
+        return (x<y?-1:x>y?1:0)*_seSort.dir;
+      })
+    : pv;
+  const _th=(k,t,w)=>`<th style="width:${w};text-align:center;padding:4px 6px;
+      font-size:10px;letter-spacing:.05em;text-transform:uppercase;
+      font-weight:600;cursor:pointer;user-select:none;position:sticky;top:0;
+      background:var(--panel);border-bottom:1px solid var(--line);
+      color:${_seSort.by===k?'var(--acc)':'var(--dim)'}"
+      onclick="seSort('${k}')"
+      title="sort by ${esc(t.toLowerCase())}">${esc(t)}<span
+      style="opacity:${_seSort.by===k?1:.25}">${
+      _seSort.by===k&&_seSort.dir<0?' \u25be':' \u25b4'}</span></th>`;
   const rows = pv.length ? `<div class="scrollbox auto"><table
-      style="width:100%;font-size:11.5px;margin-top:4px">
-      <colgroup><col style="width:48%"><col style="width:14%">
-        <col style="width:26%"><col style="width:12%"></colgroup>
-      <tbody>${pv.map(f=>`<tr>
-        <td style="padding:3px 8px 3px 0" title="${esc(f.path||'')}"
+      style="width:100%;font-size:11.5px;margin-top:4px;table-layout:fixed;
+             border-collapse:collapse">
+      <thead><tr>${_th('file','File','40%')}${_th('library','Library','16%')}${
+        _th('disk','Disk','15%')}${_th('subs','Subtitles','19%')}<th
+        style="width:10%;position:sticky;top:0;background:var(--panel);
+          border-bottom:1px solid var(--line)"></th></tr></thead>
+      <tbody>${SORTED.map(f=>`<tr>
+        <td style="padding:3px 6px;text-align:center;overflow:hidden;
+            text-overflow:ellipsis;white-space:nowrap"
+            title="${esc(f.path||'')}"
           >${esc(String(f.path||'').split('\\').pop())}</td>
-        <td class="dim" style="padding:3px 8px 3px 0">${esc(f.library||'')}${
-          f.pool_disk?`<div style="font-size:10px;opacity:.75"
-            title="Which disk in the pool this file lives on. Files on a disk somebody is reading from are stepped over rather than waited on.">${
-            esc(f.pool_disk)}</div>`:''}</td>
-        <td style="padding:3px 8px 3px 0">${(f.take||[]).map(t=>
+        <td class="dim" style="padding:3px 6px;text-align:center;overflow:hidden;
+            text-overflow:ellipsis;white-space:nowrap">${esc(f.library||'')}</td>
+        <td class="dim" style="padding:3px 6px;text-align:center;
+            white-space:nowrap"
+            title="Which disk in the pool this file lives on. Files on a disk somebody is reading from are stepped over rather than waited on."
+          >${esc(f.pool_disk||'')}</td>
+        <td style="padding:3px 6px;text-align:center">${(f.take||[]).map(t=>
           `<span class="capsc ok" title="${esc(t.sidecar||'')}">${
             esc(String(t.sidecar||'').split('.').pop())} ${esc(t.lang||'')}${
             t.role?' '+esc(t.role):''}</span>`).join('')}${
           (f.skip||[]).length?`<span class="dim" title="${esc((f.skip||[])
             .map(x=>x.why).join('\n'))}"> +${(f.skip||[]).length} skipped</span>`:''}</td>
-        <td style="padding:3px 0;white-space:nowrap">${
+        <td style="padding:3px 6px;text-align:center;white-space:nowrap">${
           f.on?`<button class="rmb" onclick="seOne(${f.file_id},this)"
              title="Remux this one now: mkvmerge copies the streams into a new container with the subtitle added, then the sidecar is recycled.">Take it in</button>`
              :`<span class="dim" title="The rule is off for this library, so this is a preview only.">rule off</span>`}</td>
@@ -32893,18 +32996,48 @@ function sePaint(force){
       deleted, and only after the rebuilt file has been read back and found to
       contain it.${on.length?` <button class="rmb" onclick="seRun(this)"${
         d.running?' disabled':''}>${d.running?'working…':'Do a batch now'}</button>`:''}</div>`;
-  const html=`<div class="lkind" style="padding:11px 12px">${head}${idleBar}${fail}${warn}${rows}${foot}</div>`;
-  if(html===_seKey) return;
-  const box=el.querySelector('.rowbox'), keep=box?box.scrollTop:0;
-  _seKey=html; el.innerHTML=html;
-  const nb=el.querySelector('.rowbox');
-  if(nb&&keep) nb.scrollTop=keep;
-  // The pointer test needs somewhere to hang, and innerHTML has just replaced
-  // whatever it was hanging on.
-  const nbox=el.querySelector('.rowbox');
-  if(nbox){
-    nbox.addEventListener('mouseenter',()=>{ _seHover=true; });
-    nbox.addEventListener('mouseleave',()=>{ _seHover=false; });
+  // A PANEL IS NOT ONE THING, AND REBUILDING IT AS ONE IS WHY THE LIST MOVED.
+  //
+  // Every part of this used to be a single template string written into
+  // innerHTML, so the two-second poll that advanced a progress bar by one
+  // percent destroyed and recreated four hundred table rows - including the
+  // one your pointer was on and the scroll position you were half-way
+  // through. Putting the scrollTop back afterwards is a patch over the wound;
+  // the wound is touching the list at all to redraw a bar.
+  //
+  // So the panel is six boxes with fixed identities. Each is compared against
+  // what it last held and written only if it differs. The bar changes every
+  // two seconds and nothing else does, so nothing else is touched, and the
+  // list simply stays where it is because no code went near it.
+  const parts={se_head:head, se_idle:idleBar, se_fail:fail,
+               se_warn:warn, se_rows:rows, se_foot:foot};
+  _seKey='';
+  let host=document.getElementById('se_host');
+  if(!host || !el.contains(host)){
+    el.innerHTML='<div class="lkind" style="padding:11px 12px" id="se_host">'
+      + Object.keys(parts).map(k=>`<div id="${k}"></div>`).join('') + '</div>';
+    host=document.getElementById('se_host');
+    _seSeen={};
+  }
+  for(const k in parts){
+    if(_seSeen[k]===parts[k]) continue;
+    // THE TWO THAT HOLD LISTS ARE LEFT ALONE while somebody is in them. The
+    // bar is not: a bar nobody can scroll is a bar that should keep moving.
+    if((k==='se_rows'||k==='se_fail') && !force && seHold()) continue;
+    const node=document.getElementById(k);
+    if(!node) continue;
+    const sb=node.querySelector('.rowbox,.scrollbox');
+    const keep=sb?sb.scrollTop:0;
+    node.innerHTML=parts[k];
+    _seSeen[k]=parts[k];
+    const nb=node.querySelector('.rowbox,.scrollbox');
+    if(nb){
+      if(keep) nb.scrollTop=keep;
+      // The pointer test needs somewhere to hang, and innerHTML has just
+      // replaced whatever it was hanging on.
+      nb.addEventListener('mouseenter',()=>{ _seHover=true; });
+      nb.addEventListener('mouseleave',()=>{ _seHover=false; });
+    }
   }
 }
 async function seOne(fid, btn){

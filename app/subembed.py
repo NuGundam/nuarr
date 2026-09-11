@@ -1634,6 +1634,12 @@ def preview(limit: int = 25, force: bool = True) -> dict:
     got = walk()[:max(0, int(limit))]
     return {"ok": True, "files": [
         {"file_id": p["file_id"], "path": p["path"], "library": p["library"],
+         # THE COLUMN WAS THERE AND THE VALUE WAS NOT. candidates() has
+         # carried the spindle with every plan since the runner started
+         # steering around busy disks; this rebuilt each row by hand and
+         # quietly left it behind, so the Disk column drew five thousand
+         # empty cells.
+         "pool_disk": p.get("pool_disk") or "",
          "on": enabled(p["library"]),
          "take": p["take"], "drop": p.get("drop") or [],
          "skip": p["skip"][:4]} for p in got]}
@@ -1666,6 +1672,11 @@ async def watch() -> None:
     from . import idle
     await asyncio.sleep(180)
     await idle.run(KEY, TITLE, _pending, _do_one,
-                   label=lambda p: os.path.basename(p.get("path") or "")[:70],
+                   # A LINE OF ITS OWN CAN HOLD A NAME. Seventy characters
+                   # was the width of a shared line that also had a
+                   # percentage and an elapsed clock on it; each file has its
+                   # own row now, so the name is allowed to be the name.
+                   label=lambda p: os.path.basename(p.get("path") or "")[:120],
                    disk_of=lambda p: p.get("pool_disk") or "",
-                   system_name="sidecar subtitles")
+                   system_name="sidecar subtitles",
+                   goto="/settings#subs")

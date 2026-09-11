@@ -35,12 +35,17 @@ def _pct(done, total) -> float:
 
 
 def _one(key, name, where, running, now="", done=0, total=0, note="",
-         since=0.0) -> dict:
+         since=0.0, flight=None, paused=False, why="") -> dict:
     return {"key": key, "name": name, "goto": where,
-            "running": bool(running), "now": str(now or "")[:90],
+            "running": bool(running), "now": str(now or "")[:140],
             "done": int(done or 0), "total": int(total or 0),
             "pct": _pct(done, total), "note": str(note or "")[:140],
-            "since": float(since or 0.0)}
+            "since": float(since or 0.0),
+            # A LINE PER FILE. One name and an ellipsis was fine while exactly
+            # one thing ran at a time; two lanes need two lines, each with the
+            # disk it is reading from.
+            "flight": list(flight or []),
+            "paused": bool(paused), "why": str(why or "")[:200]}
 
 
 def _jobs() -> list:
@@ -67,6 +72,56 @@ def _jobs() -> list:
                         done=0, total=0,
                         note=(f"{len(rs)} file{'' if len(rs) == 1 else 's'} "
                               f"in the {pool} pool")))
+    return out
+
+
+def _idle_runners() -> list:
+    r"""The shared background runner's systems, from the dict its panel reads.
+
+    THE ONE THAT RUNS ALL DAY WAS THE ONE MISSING. This list read each
+    module's own STATE dict, which is right for everything that still has one
+    - but the sidecar sweep moved onto idle.run months ago and its STATE has
+    been an empty husk ever since, true only during a manual batch. So the
+    system doing the most work was the only system that never appeared here.
+
+    AND WAITING IS WORTH A ROW. DrivePool is on this list precisely because
+    "nothing is happening" and "something else is happening" look identical
+    from outside and mean opposite things; a sweep paused for a viewer is the
+    same case, and the row says which check stopped it.
+    """
+    out = []
+    try:
+        from . import idle
+    except Exception:                                            # noqa: BLE001
+        return out
+    for key in sorted(idle.STATES or {}):
+        d = idle.STATES.get(key) or {}
+        if not (d.get("running") or d.get("paused")):
+            continue
+        try:
+            pr = idle.progress(key)
+        except Exception:                                        # noqa: BLE001
+            continue
+        fl = [{"now": str(v.get("now") or "")[:120],
+               "pct": float(v.get("pct") or 0.0),
+               "disk": str(v.get("disk") or "")}
+              for v in (pr.get("flight") or [])]
+        paused = bool(pr.get("paused"))
+        why = pr.get("paused_why") or ""
+        det = pr.get("paused_detail") or ""
+        lanes = int(pr.get("lanes") or 1)
+        note = (f"{why}{' - ' + det if det else ''}" if paused
+                else (f"up to {lanes} at once, one per disk" if lanes > 1
+                      else (d.get("system_name") or key)))
+        if not paused and pr.get("skip_disks"):
+            note += (" - stepping around "
+                     + ", ".join(list(pr["skip_disks"])[:4]))
+        out.append(_one(f"idle:{key}", d.get("title") or key,
+                        d.get("goto") or "/settings", True,
+                        now=(fl[0]["now"] if fl else (pr.get("now") or "")),
+                        done=pr.get("done") or 0, total=pr.get("total") or 0,
+                        note=note, since=pr.get("t0") or 0.0,
+                        flight=fl, paused=paused, why=why))
     return out
 
 
@@ -105,8 +160,6 @@ _SIMPLE = [
      "re-reading committed files against today's rules"),
     ("hardsub", "hardsub", "Subtitle kinds · picture", "/settings#subs",
      "sampling frames for words burned into the picture"),
-    ("subembed", "subembed", "Sidecar subtitles", "/settings#subs",
-     "walking folders for subtitles sitting outside their file"),
     ("subtitletitle", "subtitletitle", "Subtitle kinds · tracks", "/settings#subs",
      "checking cue counts against what each title claims"),
     ("audiotitle", "audiotitle", "Audio titles", "/settings#alang",
@@ -144,6 +197,7 @@ def running() -> dict:
         pass
 
     out += _jobs()
+    out += _idle_runners()
 
     for key, mod, name, where, note in _SIMPLE:
         try:

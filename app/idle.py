@@ -247,7 +247,8 @@ async def busy(disk: str = "") -> dict:
 # ------------------------------------------------------------- the runner ---
 async def run(key: str, title: str, pending, do_one, label=None, *,
               empty_s: float = EMPTY_S, pause_s: float = PAUSE_S,
-              system_name: str = "", disk_of=None, lanes: int = LANES) -> None:
+              system_name: str = "", disk_of=None, lanes: int = LANES,
+              goto: str = "") -> None:
     r"""Work through `pending()` for as long as the machine can spare it.
 
     NO BATCH, NO END. This is a loop that lives for the life of the process:
@@ -260,13 +261,17 @@ async def run(key: str, title: str, pending, do_one, label=None, *,
     who sits down to watch something in the other fifty-nine minutes.
     """
     d = state(key, title)
+    if goto:
+        d["goto"] = goto
+    d["system_name"] = system_name or key
     lab = label or (lambda x: str(x))
     while True:
         try:
             b = await busy()
             if b["busy"]:
                 d.update(running=False, paused=True,
-                         paused_why=b["why"], now="")
+                         paused_why=b["why"],
+                         paused_detail=b.get("detail") or "", now="")
                 await asyncio.sleep(pause_s)
                 continue
             d.update(paused=False, paused_why="")
@@ -295,7 +300,8 @@ async def run(key: str, title: str, pending, do_one, label=None, *,
                     pass
             d.update(running=True, idle_why="", total=len(items), done=0,
                      ok=0, failed=0, t0=time.time(), next_look=0.0,
-                     lanes=max(1, int(lanes)), flight=[])
+                     lanes=max(1, int(lanes)), flight=[], skipped=0,
+                     skip_disks=[], paused_detail="")
 
             queue = list(items)
             flight: dict = {}          # task -> {"disk","label","pct","t0"}
@@ -354,10 +360,19 @@ async def run(key: str, title: str, pending, do_one, label=None, *,
                     # is a next one.
                     if b["busy"] and (b.get("why") or "").endswith(
                             dk or "\x00"):
+                        # NAMED, NOT COUNTED. "3 skipped" is a number you can
+                        # only shrug at; "stepped over NU-DRIVE-1" is the same
+                        # fact and answers the next question with it.
                         d["skipped"] = (d.get("skipped") or 0) + 1
+                        sk = d.get("skip_disks")
+                        if not isinstance(sk, list):
+                            sk = d["skip_disks"] = []
+                        if dk and dk not in sk:
+                            sk.append(dk)
                         d["total"] = max(0, d["total"] - 1)
                         continue
                     if b["busy"]:
+                        d["paused_detail"] = b.get("detail") or ""
                         # PAUSED, NOT FAILED. Whatever is already in flight is
                         # allowed to finish - killing a half-written remux to
                         # be polite would leave more mess than it saves - but
