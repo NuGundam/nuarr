@@ -1195,6 +1195,15 @@ SATURATED_AFTER_S = 25.0
 # range requests. Below this it says nothing about capacity.
 COAST_MIN_S = 20.0
 
+# PLAYING WITHOUT FETCHING IS PROOF OF SOMETHING, EVEN WHEN IT IS NOT PROOF OF
+# HOW MUCH. A client mid-coast from an unknown starting level cannot be given
+# "capacity minus what it has played" - it may have resumed from a pause with
+# a half-empty buffer - but it is at that moment playing out of a buffer, so
+# it is demonstrably not empty. This is the whole of what can be claimed then,
+# and it exists to stop the card asserting 0s about a stream that is visibly
+# fine.
+COASTING_MIN_S = 5.0
+
 # A COAST THAT BARELY CLEARS THE THRESHOLD MEASURES THE THRESHOLD, NOT THE
 # CLIENT. Caught live and it had poisoned everything downstream: every single
 # capacity this had ever learned was 0.3 min - Plex for Windows 20s, Plex for
@@ -1287,6 +1296,127 @@ PEAK_MIN_BYTES = 32 * 1024 * 1024
 MIN_FLOOR_S = 20.0
 
 
+# ---------------------------------------------------------- shared helpers --
+#
+# ONE SPELLING OF A PATH. Plex reports some files with the extended-length
+# prefix - \\?\P:\Anime Shows\... - because that is how the over-length ones
+# were written, and handlepeek strips that prefix from every handle it reads
+# before comparing. So the two sides never matched and the BEST instrument in
+# here was silently off for every long path in the library. Measured live on a
+# 268-character episode: as Plex spells it, no handles at all; with the prefix
+# stripped, the handle sat at 56.2% of the file against a viewer at 41.8% - a
+# real buffered-to line, 204 seconds of it, being thrown away in favour of a
+# fallback that was reporting the client cap verbatim.
+def _hp_key(path: str) -> str:
+    p = str(path or "")
+    if p.startswith("\\\\?\\UNC\\"):
+        p = "\\\\" + p[8:]
+    elif p.startswith("\\\\?\\"):
+        p = p[4:]
+    return p.lower()
+
+
+# HOW MUCH THIS CLIENT CAN HOLD, ASKED TWICE FOR TWO DIFFERENT JOBS.
+#
+# A capacity is used here in two ways that pull in opposite directions, and
+# using one number for both is what pinned a laptop's reading at exactly its
+# own cap:
+#
+#   as a CEILING - "no reading may claim more than this client can hold". Its
+#     job is to catch an over-read, so it must be the most generous figure the
+#     evidence supports. A ceiling that is too low does not make the estimate
+#     careful, it makes it constant: the buffer becomes unable to exceed the
+#     cap, and if the cap sits under the floor being tested, the verdict is
+#     starvation forever by construction.
+#
+#   as a CLAIM - "this session cannot measure itself, so assume it holds what
+#     this client usually holds". That is a substitute for a measurement, so
+#     it must be the most conservative figure the evidence supports.
+#
+# And both must be computed in BYTES and converted at THIS stream's bitrate.
+# A player's buffer is a memory budget: the same client that coasts 281s on a
+# 4 Mbps episode manages a third of that on a remux. The floor calculation
+# already worked this way; the estimate did not, and went on clamping with
+# seconds learned somewhere else. Live: Plex for Windows capped at 281s while
+# that same laptop had been observed holding 441 MB, which at the bitrate it
+# was actually playing is 763s.
+def _cap_bytes_for(s: dict) -> tuple[float, float]:
+    """(generous, conservative) bytes this client has been seen to hold."""
+    dev = _device_of(s)
+    cli = _client_of(s)
+    peak = float(_CLIENT_PEAK_BYTES.get(dev, 0.0) or 0.0)
+    coast = float(_CLIENT_CAP_BYTES.get(cli, 0.0) or 0.0)
+    if peak < PEAK_MIN_BYTES:
+        peak = 0.0                     # still filling; says nothing about a ceiling
+    return (max(peak, coast), coast or peak)
+
+
+def _cap_ceiling_s(s: dict, br) -> float:
+    """The most generous capacity the evidence supports, in seconds at `br`."""
+    gen, _ = _cap_bytes_for(s)
+    by_s = (gen * 8.0 / 1000.0 / float(br)) if (gen and br) else 0.0
+    return max(by_s, float(_CLIENT_CAP.get(_client_of(s), 0.0) or 0.0))
+
+
+def _cap_claim_s(s: dict, br) -> float:
+    """The most conservative capacity worth substituting for a measurement."""
+    _, con = _cap_bytes_for(s)
+    if con and br:
+        return con * 8.0 / 1000.0 / float(br)
+    return float(_CLIENT_CAP.get(_client_of(s), 0.0) or 0.0)
+
+
+# A SEEK IS A JUMP THE CLOCK CANNOT EXPLAIN.
+#
+# The old test was "more than 300 seconds forward", which never fires on the
+# thing people actually do: skipping a 90-second intro. And a skip that is not
+# recognised is worse than one that is, because the integral keeps its anchor:
+# played_s gains 90 seconds that were never delivered, so the estimate runs 90
+# seconds low for the rest of the film and cannot recover - an anchored
+# session reports plain raw, and raw is now permanently wrong.
+#
+# Playback advances at one second per second. Anything faster than the wall
+# clock allows is somebody moving the playhead, and the wall clock is already
+# here. The allowance is generous - a background tab, a slow poll and a
+# 2x-speed player all exist - but it is bounded by elapsed time rather than by
+# a fixed number of minutes, so it stays tight when polls are seconds apart.
+SEEK_BACK_S = 8.0
+SEEK_RATE = 2.5           # the fastest a playhead may legitimately advance
+# Plus a fixed allowance, because viewOffset is not a clock. Clients report
+# their position on a timeline ping every ten seconds or so, and the poll here
+# can run every second and a half - so a perfectly normal playback shows the
+# offset standing still and then stepping. The allowance has to cover a step.
+SEEK_SLACK_S = 20.0
+# And a ceiling on the allowance, because a long gap between polls would
+# otherwise excuse any jump at all. Past this, the two failures are not
+# symmetric: a seek mistakenly declared costs one re-anchor and reads as an
+# empty buffer for a few seconds, which pauses work that did not need pausing.
+# A seek MISSED corrupts the integral for the rest of the film. Given the
+# choice, be wrong in the direction that protects the viewer.
+SEEK_ALLOW_MAX_S = 120.0
+
+
+def _seek_kind(off_s: float, last_off: float, elapsed: float) -> str:
+    """'' | 'back' | 'forward' - what the playhead did since the last look."""
+    if off_s < last_off - SEEK_BACK_S:
+        return "back"
+    allow = min(SEEK_ALLOW_MAX_S,
+                max(0.0, elapsed) * SEEK_RATE + SEEK_SLACK_S)
+    if off_s > last_off + allow:
+        return "forward"
+    return ""
+
+
+# AN ANALYSIS SWEEP IS NOT A CLIENT FETCH. PMS opens the same file for credits
+# detection, thumbnails and loudness analysis, and those run through the whole
+# file in seconds - which is exactly how a fresh episode once read "9.8 min
+# buffered" while the client held two. A client's handle cannot outrun the
+# stream it is serving by much; an analysis pass outruns it by a hundred. So
+# the high-water may only advance as fast as the file's own bitrate allows.
+HANDLE_MAX_X = 12.0        # a client may fetch this many times real-time
+HANDLE_SLACK_BYTES = 48 * 1024 * 1024
+
+
 def _bw_stats() -> list[dict]:
     now = time.time()
     if now - _BW_CACHE["at"] < 5:
@@ -1350,6 +1480,74 @@ def _disk_offsets(paths: dict[str, int]) -> dict[str, int]:
     return res
 
 
+# WHAT WAS KNOWN ABOUT A STREAM SURVIVES A RESTART.
+#
+# The learned capacities were already persisted, for a good reason written up
+# above: this machine restarts on every update, and everything in here is
+# measured patiently. But the per-SESSION estimate was not, so a restart
+# during a film threw away the one number that film had earned and started it
+# again at zero - against a floor of sixty or a hundred and twenty seconds,
+# which is the state that reads "0s ahead - Nuarr paused" about a client
+# sitting on three minutes.
+#
+# THE CONCLUSION IS PERSISTED, NOT THE INTEGRAL. Replaying the integral across
+# a gap is impossible: the bytes Plex delivered while nuarr was down are not
+# in any window the statistics endpoint still holds. What can be carried is
+# the last thing nuarr believed, reduced by everything the viewer has played
+# since - which assumes the client fetched NOTHING during the outage. That
+# assumption is wrong in the client's favour and therefore safe: the restored
+# figure can only be too low, never too high, and it decays to nothing on its
+# own if the restart was long.
+_SLEADS: dict[str, dict] = {}        # session_key -> {file, off, lead, at}
+_SLEADS_SAVED_AT = [0.0]
+SLEAD_SAVE_EVERY = 20.0
+# Older than this and the session is almost certainly not the same playback.
+SLEAD_MAX_AGE_S = 3600.0
+
+
+def _sleads_load() -> None:
+    try:
+        from .db import kv_get
+        d = json.loads(kv_get("plex_session_leads") or "{}")
+        now = time.time()
+        for k, v in (d.get("s") or {}).items():
+            if now - float(v.get("at") or 0) <= SLEAD_MAX_AGE_S:
+                _SLEADS[str(k)] = v
+        if _SLEADS:
+            joblog.log(f"plex: carried {len(_SLEADS)} buffer estimate(s) "
+                       f"across the restart", "debug")
+    except Exception:                                        # noqa: BLE001
+        pass
+
+
+def _sleads_save(live: dict) -> None:
+    now = time.time()
+    if now - _SLEADS_SAVED_AT[0] < SLEAD_SAVE_EVERY:
+        return
+    _SLEADS_SAVED_AT[0] = now
+    try:
+        from .db import kv_set
+        kv_set("plex_session_leads", json.dumps({"s": live}))
+    except Exception:                                        # noqa: BLE001
+        pass
+
+
+_sleads_load()
+
+# THE GRACE IS A WINDOW, NOT A SINGLE POLL.
+#
+# "A session key seen for the first time is a playback that just began" is
+# true, and the exception - nuarr restarted mid-stream - was handled by
+# distrusting whatever the FIRST poll returned. But that grace was spent even
+# on a poll that returned nothing at all, and Plex drops and re-adds sessions.
+# A stream that had been running for an hour and happened to appear on poll
+# two was therefore treated as freshly started: anchored, buffer zero, and the
+# queue paused on its behalf. A restart is a period of time, so the grace is
+# one too.
+_STARTED_AT = time.time()
+JOIN_GRACE_S = 120.0
+
+
 def _estimate_client_leads(sessions: list[dict]) -> None:
     global _FIRST_POLL_DONE
     live_keys = set()
@@ -1360,21 +1558,43 @@ def _estimate_client_leads(sessions: list[dict]) -> None:
             per_acct[a] = per_acct.get(a, 0) + 1
     stats = None
     now = time.time()
-    first_poll = not _FIRST_POLL_DONE
-    _FIRST_POLL_DONE = True
+    if sessions:
+        _FIRST_POLL_DONE = True
+    # Untrusted while nuarr may itself be the reason this looks new.
+    joining_blind = (not _FIRST_POLL_DONE) or (now - _STARTED_AT) < JOIN_GRACE_S
 
     # One handle sweep covers every candidate file this refresh.
+    #
+    # AND A FILE WITH TWO VIEWERS ON IT GETS NO HANDLE AT ALL. read_offsets
+    # returns the highest offset any handle holds for a path, so two people
+    # watching the same episode both receive whichever of them is further
+    # ahead - and the one behind is told it has a buffer it does not have.
+    # Same discipline as two sessions on one account: no estimate rather than
+    # a wrong one.
     want: dict[str, str] = {}
+    per_file: dict[str, int] = {}
+    for s in sessions:
+        if s.get("file"):
+            per_file[_hp_key(s["file"])] = per_file.get(_hp_key(s["file"]), 0) + 1
     for s in sessions:
         if s.get("lead_s") is None and s.get("session_key") and s.get("file"):
-            want[(s["file"] or "").lower()] = s["session_key"]
+            fk = _hp_key(s["file"])
+            if per_file.get(fk, 0) == 1:
+                want[fk] = s["session_key"]
     offs = _disk_offsets({p: 0 for p in want}) if want else {}
+    saveable: dict[str, dict] = {}
 
     for s in sessions:
         k = s.get("session_key") or ""
         live_keys.add(k)
         if s.get("lead_s") is not None:
             continue                    # the encoder's real lead beats any estimate
+
+        dur_s = (s.get("duration_ms") or 0) / 1000.0
+        off_s = (s.get("offset_ms") or 0) / 1000.0
+        br = (s.get("detail") or {}).get("src_bitrate")
+        playing = str(s.get("state") or "").lower() == "playing"
+        ceil_s = _cap_ceiling_s(s, br) if br else 0.0
 
         # ---- the server's file position for this stream --------------------
         # A strong source but NOT an unimpeachable one: PMS opens the same
@@ -1385,25 +1605,42 @@ def _estimate_client_leads(sessions: list[dict]) -> None:
         # client actually held 2 minutes. So the value is STASHED here and
         # cross-checked against the byte integral below before it is believed.
         hw_lead = None
-        f = (s.get("file") or "").lower()
-        dur_s = (s.get("duration_ms") or 0) / 1000.0
-        off_s = (s.get("offset_ms") or 0) / 1000.0
-        if f and dur_s:
-            hw = _HW.setdefault(k, {"bytes": 0, "size": 0, "last_off": off_s})
+        f = _hp_key(s.get("file") or "")
+        if f and dur_s and f in want:
+            hw = _HW.setdefault(k, {"bytes": 0, "size": 0, "last_off": off_s,
+                                    "at": now})
             if not hw["size"]:
                 try:
                     hw["size"] = os.path.getsize(s["file"])
                 except OSError:
                     hw["size"] = 0
-            # A seek backwards flushes the client's buffer and the refetch
-            # starts near the new position - a high-water from before the
-            # seek would report the old buffer as still standing.
-            if off_s < hw["last_off"] - 8:
+            # EITHER DIRECTION FLUSHES IT. A seek backwards obviously does -
+            # the client refetches from the new position - and so does a skip
+            # forwards, which is the same flush with the playhead moved the
+            # other way. The old test only knew about backwards, so a handle
+            # left parked ahead of a forward skip was read as buffer that had
+            # in fact just been thrown away.
+            if _seek_kind(off_s, hw["last_off"], now - (hw.get("at") or now)):
                 hw["bytes"] = 0
-            hw["last_off"] = off_s
+            # A HANDLE MAY NOT OUTRUN THE STREAM IT IS SERVING. Anything
+            # faster than a client could plausibly fetch is PMS analysing the
+            # file, not PMS feeding somebody.
             got = offs.get(f)
-            if got and got > hw["bytes"]:
-                hw["bytes"] = got
+            if got and hw["size"] and dur_s > 0:
+                rate = hw["size"] / dur_s                   # bytes a second
+                gap = max(0.0, now - (hw.get("at") or now))
+                if not hw["bytes"]:
+                    # First sight. Believe it only as far ahead of the
+                    # playhead as this client has ever been seen to hold.
+                    head = (ceil_s or 600.0) * rate + HANDLE_SLACK_BYTES
+                    allow = off_s * rate + head
+                else:
+                    allow = (hw["bytes"] + gap * rate * HANDLE_MAX_X
+                             + HANDLE_SLACK_BYTES)
+                if got <= allow and got > hw["bytes"]:
+                    hw["bytes"] = got
+            hw["last_off"] = off_s
+            hw["at"] = now
             if hw["bytes"] and hw["size"]:
                 to_s = hw["bytes"] / hw["size"] * dur_s
                 # A HANDLE BEHIND THE PLAYHEAD IS NO EVIDENCE, NOT ZERO BUFFER.
@@ -1426,45 +1663,74 @@ def _estimate_client_leads(sessions: list[dict]) -> None:
                 if to_s > off_s:
                     hw_lead = to_s - off_s
         acct = s.get("account_id") or ""
-        br = (s.get("detail") or {}).get("src_bitrate")
         if not (k and acct and br) or per_acct.get(acct) != 1:
             # The integral cannot run here, so the disk figure has nothing to
-            # be checked against - better an unverified measurement than none.
+            # be checked against - better an unverified measurement than none,
+            # but never more than this client could hold.
             if hw_lead is not None:
-                lead = min(hw_lead, max(0.0, dur_s - off_s)) if dur_s else hw_lead
+                lead = hw_lead
+                if ceil_s:
+                    lead = min(lead, ceil_s + 30.0)
+                if dur_s:
+                    lead = min(lead, max(0.0, dur_s - off_s))
                 s["lead_s"], s["lead_est"] = round(lead, 1), 1
                 s["lead_disk"] = 1
+                saveable[k] = {"file": f, "off": off_s, "lead": lead, "at": now}
             continue
         if stats is None:
             stats = _bw_stats()
         mine = [b for b in stats if str(b.get("accountID")) == acct]
-        off_s = (s.get("offset_ms") or 0) / 1000.0
         st = _XFER.get(k)
         # A seek voids the integral - and RE-ANCHORS it, because a client
         # flushes and refetches from the new position, so the buffer really is
-        # empty at that instant. Forward tolerance is generous: a background
-        # tab or a slow poll makes played time legitimately jump.
-        seek = st is not None and (off_s < st["last_off"] - 8
-                                   or off_s > st["last_off"] + 300)
+        # empty at that instant.
+        seek = ""
+        if st is not None:
+            seek = _seek_kind(off_s, st["last_off"],
+                              now - (st.get("last_poll") or now))
         if st is None or seek:
+            # WHOSE CLOCK. last_at is compared against Plex's own bucket
+            # timestamps, so it has to start on Plex's clock. Seeded from
+            # nuarr's, a server running even slightly behind meant every
+            # bucket looked old, no bytes were ever counted, and the session
+            # then read as idle-and-therefore-full after 25 seconds.
+            newest = max((b.get("at") or 0 for b in stats), default=0)
+            restored = None
+            if st is None and not seek:
+                r = _SLEADS.get(k)
+                if (r and _hp_key(r.get("file") or "") == f
+                        and now - float(r.get("at") or 0) <= SLEAD_MAX_AGE_S):
+                    played = max(0.0, off_s - float(r.get("off") or 0.0))
+                    restored = max(0.0, float(r.get("lead") or 0.0) - played)
             _XFER[k] = {
                 "off0": off_s, "bytes": 0.0, "last_off": off_s,
-                "last_at": max((b.get("at") or 0 for b in mine),
-                               default=int(now)),
+                "last_poll": now,
+                "last_at": max(newest,
+                               max((b.get("at") or 0 for b in mine),
+                                   default=0)) or int(now),
                 # A seek is always a clean anchor. A newly-seen session is one
-                # too, UNLESS it was already running when nuarr started.
-                "anchored": bool(seek or not first_poll),
+                # too, UNLESS nuarr may itself be the reason it looks new.
+                "anchored": bool(seek or not joining_blind),
                 "idle_since": 0.0, "peak": 0.0,
                 # Seconds of buffer PROVEN to have existed by watching the
                 # client play without fetching - see the coast rule below.
-                "coast_off": 0.0,
+                "coast_off": 0.0, "coast_full": False, "was_full": False,
                 # The lowest the growth integral has ever been - the reference
                 # point for the tightest growth-only bound; see below.
                 "min_raw": 0.0,
+                # What the last run of nuarr believed about this stream, less
+                # what has been played since. A seek voids it like everything
+                # else.
+                "restored": (None if seek else restored),
             }
-            s["lead_s"], s["lead_est"] = 0.0, 1
+            lead0 = float(restored or 0.0)
+            s["lead_s"], s["lead_est"] = round(lead0, 1), 1
             s["lead_anchored"] = 1 if _XFER[k]["anchored"] else 0
+            if restored:
+                s["lead_restored"] = 1
+            saveable[k] = {"file": f, "off": off_s, "lead": lead0, "at": now}
             continue
+        st["last_poll"] = now
         new = [b for b in mine if (b.get("at") or 0) > st["last_at"]]
         if new:
             st["bytes"] += sum(b.get("bytes") or 0 for b in new)
@@ -1475,7 +1741,6 @@ def _estimate_client_leads(sessions: list[dict]) -> None:
         st["last_off"] = off_s
         delivered_s = st["bytes"] * 8.0 / 1000.0 / float(br)
         played_s = off_s - st["off0"]
-        dur_s = (s.get("duration_ms") or 0) / 1000.0
         raw = delivered_s - played_s
 
         # PLAYING WITHOUT FETCHING MEASURES THE BUFFER - AT THE END, NOT DURING.
@@ -1497,18 +1762,29 @@ def _estimate_client_leads(sessions: list[dict]) -> None:
         # joined mid-stream, which can never measure itself forward - can be
         # reported properly as capacity minus what has been played out of it.
         client = _client_of(s)
-        playing = str(s.get("state") or "").lower() == "playing"
         coasted = 0.0
         if playing and not new:
             if not st["coast_off"]:
                 st["coast_off"] = off_s
+                # DID IT BEGIN FULL? Only a coast that starts from a client
+                # which had stopped fetching is a coast from a full buffer,
+                # and only then does "capacity minus what it has played" mean
+                # anything. A resume mid-file starts from whatever survived
+                # the pause, which is not the same thing and is the direction
+                # that over-reports.
+                st["coast_full"] = bool(st.get("was_full"))
             coasted = off_s - st["coast_off"]
         elif st["coast_off"]:
-            # The coast just ended - the client asked for more data, so it had
-            # run its buffer down to its refill mark. Take the length of that
-            # coast as this client's measured fill.
+            # A COAST THAT ENDS IN A PAUSE PROVES NOTHING. The old code took
+            # any end of a coast as "the client asked for more data, so it had
+            # run down to its refill mark" - but pressing pause ends a coast
+            # too, at whatever second the viewer happened to stop, and that
+            # second was then taught as the client's capacity. Only a refill
+            # while still playing means the buffer ran out.
             ran = st["last_off"] - st["coast_off"]
-            if ran >= COAST_TEACH_MIN_S and ran > _CLIENT_CAP.get(client, 0.0):
+            refilled = bool(new) and playing
+            if refilled and ran >= COAST_TEACH_MIN_S \
+                    and ran > _CLIENT_CAP.get(client, 0.0):
                 _CLIENT_CAP[client] = ran
                 _caps_save()
                 joblog.log(f"plex: learned {client} buffers about "
@@ -1524,7 +1800,7 @@ def _estimate_client_leads(sessions: list[dict]) -> None:
             # one, which is how a 4K film ends up with a floor it can never
             # reach. Recorded at the bitrate it was measured at, so it can be
             # converted back at whatever the next stream costs.
-            if ran >= COAST_TEACH_MIN_S and br > 0:
+            if refilled and ran >= COAST_TEACH_MIN_S and br > 0:
                 by = ran * float(br) * 1000.0 / 8.0
                 if by > _CLIENT_CAP_BYTES.get(client, 0.0):
                     _CLIENT_CAP_BYTES[client] = by
@@ -1533,8 +1809,10 @@ def _estimate_client_leads(sessions: list[dict]) -> None:
                                f"({ran:.0f}s at {float(br)/1000:.1f} Mbps)",
                                "debug")
             st["coast_off"] = 0.0
+            st["coast_full"] = False
 
-        cap = _CLIENT_CAP.get(client, 0.0)
+        # Capacity in the unit that transfers, at THIS stream's bitrate.
+        cap = _cap_claim_s(s, br)
         # THE TIGHTEST GROWTH-ONLY BOUND, and the fix for a floor that SHRANK.
         #
         # raw = delivered - played since observation began, and on a session
@@ -1559,47 +1837,51 @@ def _estimate_client_leads(sessions: list[dict]) -> None:
             lead = max(0.0, raw)
         else:
             lead = max(0.0, raw - st["min_raw"])
+        # What the previous run believed, less everything played since, is a
+        # floor rather than a reading: it decays on its own and can only be
+        # too low.
+        if st.get("restored"):
+            rem = max(0.0, float(st["restored"]) - max(0.0, off_s - st["off0"]))
+            if rem > lead:
+                lead = rem
+                s["lead_restored"] = 1
+            else:
+                st["restored"] = None
         if coasted and cap:
-            # Mid-coast with a known capacity: what is left is what it started
-            # with, minus what it has played out. This is the case that fixes a
-            # session nuarr joined late.
-            #
             # A COAST THAT OUTLASTS THE CAPACITY DISPROVES THE CAPACITY - it
             # does not empty the buffer. Read naively this subtraction goes
             # negative and clamps to zero, and the card then says "0s buffered"
             # about a client that is at that very moment playing smoothly
             # without asking for a single byte. That is self-contradictory:
             # playing without fetching is only possible OUT OF a buffer, so an
-            # ongoing coast is positive proof the buffer is not empty. Live
-            # symptom: a healthy 11.8 Mbps LAN direct play sat at 0s and was
-            # paused against a 71s floor it could never satisfy.
-            #
-            # So the longer coast wins and re-teaches the client, immediately
-            # rather than at the end - waiting for the coast to finish leaves
-            # the number wrong for exactly as long as the evidence is strongest.
-            # Re-teach first, then decide. Note the subtraction is only
-            # meaningful while the coast is still INSIDE the known capacity;
-            # once it is outside, cap - coasted is not a small number, it is a
-            # wrong one, and the growth integral computed above - which never
-            # claims more than it can prove - is the better answer.
-            if coasted > cap:
-                cap = _CLIENT_CAP[client] = coasted
+            # ongoing coast is positive proof the buffer is not empty.
+            if coasted > cap and st["coast_full"]:
+                cap = coasted
+                _CLIENT_CAP[client] = max(_CLIENT_CAP.get(client, 0.0), coasted)
                 if br > 0:
                     _CLIENT_CAP_BYTES[client] = max(
                         _CLIENT_CAP_BYTES.get(client, 0.0),
                         coasted * float(br) * 1000.0 / 8.0)
                 _caps_save()
                 s["lead_outlasted"] = 1
-            else:
+            elif st["coast_full"] and coasted <= cap:
                 lead = max(0.0, cap - coasted)
                 s["lead_proven"] = 1
+            else:
+                # Coasting, but from an unknown starting level. It is playing
+                # without fetching, so it is not empty - and that is the whole
+                # of what can be claimed.
+                lead = max(lead, COASTING_MIN_S)
+                s["lead_coasting"] = 1
         st["peak"] = max(st["peak"], lead)
 
         # THE CLIENT HAS STOPPED FETCHING, so its buffer is as full as it
         # intends to get. This is the one moment a level is knowable without
         # an anchor - and if the anchor IS trustworthy, it is also the moment
         # this client's capacity becomes a measured fact worth remembering.
-        idle = st["idle_since"] and (now - st["idle_since"]) >= SATURATED_AFTER_S
+        idle = bool(st["idle_since"]
+                    and (now - st["idle_since"]) >= SATURATED_AFTER_S)
+        st["was_full"] = idle
         # CAPACITY IS LEARNED FROM TIME, NEVER FROM BYTES. This used to also
         # learn from the byte integral when an anchored session went idle -
         # and the byte integral OVERSHOOTS on fresh starts, because players
@@ -1610,17 +1892,13 @@ def _estimate_client_leads(sessions: list[dict]) -> None:
         # so it is the only teacher - and once known, it CAPS the byte-based
         # figure, since a client never holds more than it is willing to...
         #
-        # ...but only when the capacity is itself worth believing. A cap
-        # learned from a barely-
-        # qualifying coast is a restatement of COAST_MIN_S (see
-        # COAST_TEACH_MIN_S), and clamping every reading to it made the buffer
-        # unable to exceed 20s while the floors it was compared against were 71s
-        # and 120s. That is not a tight measurement, it is a guaranteed
-        # starvation verdict: the pause could never clear, because the number
-        # being tested was pinned below the threshold by construction. A ceiling
-        # has to come from evidence stronger than the thing it overrules.
-        if cap >= COAST_TEACH_MIN_S:
-            lead = min(lead, cap)
+        # ...but the ceiling is the GENEROUS capacity, in bytes, at this
+        # stream's bitrate. Clamping with a seconds figure learned on a
+        # different stream is how a laptop's reading came to be its own cap
+        # verbatim - 281.0 s against 281.0 s - while that same device had been
+        # seen holding two and a half times as much video.
+        if ceil_s >= COAST_TEACH_MIN_S:
+            lead = min(lead, ceil_s)
         if not st["anchored"] and not s.get("lead_proven"):
             # Nothing measured forward here can be better than a floor - but a
             # capacity measured on THIS client (from an anchored fill, or from
@@ -1628,7 +1906,7 @@ def _estimate_client_leads(sessions: list[dict]) -> None:
             if idle and cap > lead:
                 lead = cap
                 s["lead_learned"] = 1
-            else:
+            elif not s.get("lead_restored"):
                 s["lead_floor"] = 1
         # ---- reconcile the two sources -------------------------------------
         # The disk position is precise about WHERE reading reached but blind
@@ -1643,13 +1921,17 @@ def _estimate_client_leads(sessions: list[dict]) -> None:
             ceil = None
             if st["anchored"]:
                 ceil = max(0.0, raw) + 30.0
-            if cap >= COAST_TEACH_MIN_S:      # same believability test as above
-                c2 = cap + 30.0
+            if ceil_s >= COAST_TEACH_MIN_S:
+                c2 = ceil_s + 30.0
                 ceil = min(ceil, c2) if ceil is not None else c2
             if ceil is not None:
                 hw_lead = min(hw_lead, ceil)
-            lead = hw_lead
-            for t in ("lead_floor", "lead_proven", "lead_learned"):
+            # WHERE TWO INSTRUMENTS DISAGREE, BELIEVE THE VIEWER. The disk
+            # figure is the better one and still wins - but not when the
+            # session has proven, by playing without fetching, that it holds
+            # more than the handle can account for. A proof beats a reading.
+            lead = max(hw_lead, lead) if s.get("lead_proven") else hw_lead
+            for t in ("lead_floor", "lead_learned"):
                 s.pop(t, None)
             s["lead_disk"] = 1
         # A PAUSE DOES NOT EMPTY THE BUFFER. Every instrument above goes quiet
@@ -1670,12 +1952,18 @@ def _estimate_client_leads(sessions: list[dict]) -> None:
         s["lead_s"], s["lead_est"] = round(lead, 1), 1
         s["lead_anchored"] = 1 if st["anchored"] else 0
         s["lead_full"] = 1 if idle else 0
+        saveable[k] = {"file": f, "off": off_s, "lead": lead, "at": now}
     for k in list(_XFER):
         if k not in live_keys:
             del _XFER[k]
     for k in list(_HW):
         if k not in live_keys:
             del _HW[k]
+    for k in list(_SLEADS):
+        if k in live_keys and k not in saveable:
+            del _SLEADS[k]
+    _SLEADS.update(saveable)
+    _sleads_save(_SLEADS)
 
 
 # ratingKey -> file path. A transcoding session does not carry its source path,
