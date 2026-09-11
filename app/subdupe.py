@@ -163,6 +163,28 @@ def candidates(limit: int = 100000) -> list[dict]:
                     "library": r.get("library") or "",
                     "pool_disk": r.get("pool_disk") or "",
                     "kinds": [f"{k[0]} {k[1]}" for k in g]})
+    # AND ANY FILE WITH A TRACK ALREADY KNOWN TO BE EMPTY. The subtitle-title
+    # check reads events off tracks it is suspicious of and writes the count
+    # down; a zero there is a track nobody has to open a file to doubt. There
+    # are none today, which is the best possible reason to have the query
+    # ready rather than to wait until there are.
+    try:
+        seen = {r["file_id"] for r in out} if False else {x["file_id"] for x in out}
+        with cursor() as cur:
+            for r in cur.execute(
+                    "SELECT s.file_id, f.path, f.library, f.pool_disk "
+                    "  FROM subtitle_shape s JOIN files f ON f.id = s.file_id "
+                    " WHERE COALESCE(s.events, -1) = 0 "
+                    "   AND f.state NOT IN ('deleted','duplicate') "
+                    " GROUP BY s.file_id"):
+                if int(r["file_id"]) in seen or len(out) >= limit:
+                    continue
+                out.append({"file_id": int(r["file_id"]), "path": r["path"],
+                            "library": r["library"] or "",
+                            "pool_disk": r["pool_disk"] or "",
+                            "kinds": ["an empty track"]})
+    except Exception:                                            # noqa: BLE001
+        pass
     return out
 
 
@@ -213,10 +235,41 @@ def plan_one(file_id: int) -> dict:
         return {"ok": False, "why": "the file is not on disk"}
     live = _live_sub_tracks(path)
     g = _groups(live)
-    if not g:
-        return {"ok": True, "path": path, "drop": [], "keep": [],
-                "why": "no two tracks of the same language and kind"}
     drop, keep = [], []
+    # AN EMPTY TRACK IS NOT A SUBTITLE, AND IT GOES WHETHER OR NOT IT IS A
+    # DUPLICATE.
+    #
+    # Same rule the sidecar sweep learned about empty .ass files: there is
+    # nothing in it to weigh, nothing to lose by removing it, and leaving it
+    # means Plex offering a subtitle that displays nothing. The counting is
+    # already being done for the duplicate groups; doing it for the rest of
+    # the tracks in a file that is open anyway is a handful of small
+    # extractions.
+    #
+    # EXCEPT THE MARKER, WHICH IS EMPTY ON PURPOSE. The hardsub check writes a
+    # blank English track titled "English (burned into the picture)" carrying
+    # one empty cue, and its whole job is to tell Bazarr and Plex there is
+    # nothing to fetch. Removing it as "empty" would undo that and invite the
+    # next pass to fetch a subtitle for words already painted on the screen.
+    dup_ids = {t["id"] for ts in g.values() for t in ts}
+    for t in live:
+        if t["id"] in dup_ids or t["class"] == "marker":
+            continue
+        n = _events(path, t["id"])
+        if n == 0:
+            drop.append({**t, "events": 0,
+                         "lang_kind": f"{t['lang']} {t['class']}",
+                         "why": "there is nothing in this track - no lines "
+                                "at all"})
+        elif n > 0:
+            keep.append({**t, "events": n,
+                         "lang_kind": f"{t['lang']} {t['class']}"})
+    if not g:
+        if not drop:
+            return {"ok": True, "path": path, "drop": [], "keep": keep,
+                    "why": "no two tracks of the same language and kind, and "
+                           "nothing empty"}
+        return {"ok": True, "path": path, "drop": drop, "keep": keep}
     for (lang, cls), tracks in sorted(g.items()):
         counts = [(_events(path, t["id"]), t) for t in tracks]
         # Most lines wins; a tie or an unreadable count keeps the first.

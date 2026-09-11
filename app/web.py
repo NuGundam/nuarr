@@ -33906,10 +33906,13 @@ function sePaint(force){
          onclick="seFailShow(${Fopen?'false':'true'})"
          title="${Fopen?'hide':'show'} the list">
       <span class="ccaret">${Fopen?'▾':'▸'}</span>
-      <b style="font-size:11.5px;color:var(--warn)">${fmt(F.length)} could not
-        be taken in</b>
-      ${Fbroken?`<span class="dim" style="font-size:11px">${fmt(Fbroken)} of
-        them the subtitle file itself</span>`:''}
+      <b style="font-size:11.5px;color:var(--warn)">${
+        fmt(F.filter(f=>!f.gone).length)} could not be taken in</b>
+      ${Fbroken?`<span class="dim" style="font-size:11px">${
+        fmt(F.filter(f=>f.broken&&!f.gone).length)} of them the subtitle file
+        itself</span>`:''}
+      ${F.some(f=>f.gone)?`<span class="dim" style="font-size:11px;color:#7fd18c">${
+        fmt(F.filter(f=>f.gone).length)} already dealt with</span>`:''}
       ${Fopen?`<button class="rmb" style="margin-left:auto"
         onclick="event.stopPropagation();seRetryAll(this)"
         title="Forget that these failed. The sweep picks its work from what is on disk, so clearing the record IS trying again - it happens on the next pass, under the gate, not right now.">Try them again</button>`:''}
@@ -33924,14 +33927,19 @@ function sePaint(force){
       <table style="width:100%;font-size:11px;table-layout:fixed">
       <colgroup><col style="width:auto"><col style="width:26%">
         <col style="width:76px"><col style="width:62px"></colgroup>
-      ${F.map(f=>`<tr style="vertical-align:top">
+      ${F.map(f=>`<tr style="vertical-align:top${
+        // A ROW ABOUT A FILE THAT IS NO LONGER THERE IS NOT A PROBLEM. It is
+        // a receipt, and it should not sit in the list at the same weight as
+        // the ones still asking for a decision.
+        f.gone?';opacity:.55':''}">
         <td style="padding:4px 6px;overflow:hidden" title="${esc(f.path||'')}">
           <b>${esc(f.label||'')}</b>
           <div class="dim" style="font-size:10px;overflow:hidden;
             text-overflow:ellipsis;white-space:nowrap">${esc(f.sidecar_name||'')}</div>
           <div style="font-size:10px;display:flex;gap:6px;flex-wrap:wrap">
             ${f.disk?`<span class="capsc" title="Which disk in the pool this episode lives on. The runner works around a disk somebody is reading from, so a file can sit here simply because its own spindle was busy.">${esc(f.disk)}</span>`:''}
-            ${f.gone?`<span class="capsc" title="The subtitle file is no longer beside the video - somebody or something has already moved it.">already gone</span>`:''}
+            ${f.gone?`<span class="capsc" style="border-color:#2f6f4f;color:#7fd18c"
+              title="The subtitle file is no longer beside the video. Nuarr recycles an empty one on sight, so this is usually its own doing - the row is history rather than a decision waiting for you, and it clears itself on the next pass.">already removed</span>`:''}
           </div></td>
         <td style="padding:4px 6px;white-space:normal;overflow-wrap:anywhere;
             color:${f.broken?'var(--warn)':'var(--dim)'}"
@@ -33943,14 +33951,16 @@ function sePaint(force){
             f.size===0?'var(--bad)':(f.size>0?'var(--dim)':'var(--dim)')}"
             title="${f.size===0?'There is nothing in this file. Nuarr recycles an empty sidecar on sight now, so this row is history rather than a decision waiting for you.':'how big the subtitle file is'}"
           >${f.size===0?'empty':(f.size>0?bytesShort(f.size):'—')}</td>
-        <td class="r" style="padding:4px 6px;white-space:nowrap"><button class="rmb"
-          onclick="seRetry('${f.key}',this)">again</button></td>
+        <td class="r" style="padding:4px 6px;white-space:nowrap">${
+          f.gone?'<span class="dim" style="font-size:10.5px">done</span>'
+          :`<button class="rmb" onclick="seRetry('${f.key}',this)">again</button>`}</td>
       </tr>`).join('')}</table>
     </div>
-    ${Fbroken?`<div class="dim" style="font-size:10.5px;margin-top:5px;
+    ${F.filter(f=>f.broken&&!f.gone).length?`<div class="dim" style="font-size:10.5px;margin-top:5px;
       display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-      <span>${fmt(Fbroken)} of them are the subtitle file itself being
-        unreadable &mdash; trying again cannot help those.</span>
+      <span>${fmt(F.filter(f=>f.broken&&!f.gone).length)} of them are the
+        subtitle file itself being unreadable &mdash; trying again cannot help
+        those.</span>
       <button class="rmb" onclick="seDropBroken(this)"
         title="Recycle the unreadable SUBTITLE files. Never the video, never a failure that was only a bad moment, and to the recycle bin rather than deleted.">Recycle the broken subtitle files</button>
     </div>`:''}`:''}</div>`:'';
