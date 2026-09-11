@@ -83,6 +83,45 @@ def _side_word(t: dict) -> str:
 
 
 # ------------------------------------------------------------ the switches --
+def needs_you() -> int:
+    r"""How many things are sitting in Subtitle User Input waiting on you.
+
+    THE ROW'S COUNT HAS TO BE THE PANEL'S COUNT, or the collapsed row is a
+    reason not to open it. It said "nothing waiting" over sixty-two things to
+    answer, because it was counting QUEUED STEPS - and a thing waiting on you
+    is by definition the thing that is not on the queue.
+
+    Two sources, because the panel has two kinds of row: a reading nuarr is
+    not sure enough about to act on, which has a score and a table row; and a
+    question nothing measured - which of two identical copies wins - which has
+    neither. Both are things you would open the panel to answer.
+    """
+    n = 0
+    try:
+        c = (_findings().get("counts") or {})
+        n += int(c.get("actionable") or 0)
+    except Exception:                                            # noqa: BLE001
+        pass
+    try:
+        import json as _json
+        from .db import cursor
+        from . import subqueue
+        subqueue.init()
+        with cursor() as cur:
+            for r in cur.execute("SELECT asks FROM sub_queue "
+                                 " WHERE asks != '[]'"):
+                try:
+                    for a in _json.loads(r["asks"] or "[]"):
+                        # The reading ones are already counted above, as rows.
+                        if a.get("q") not in ("picture", "title"):
+                            n += 1
+                except Exception:                                # noqa: BLE001
+                    pass
+    except Exception:                                            # noqa: BLE001
+        pass
+    return n
+
+
 def by_decision() -> dict:
     r"""How many queued files carry a step of each kind, and how many ask.
 
@@ -218,7 +257,9 @@ def board() -> list:
             "setting": (f"{mode} · sure at {subkind.mark_at()}%, "
                         f"dismissed at {subkind.dismiss_at()}%"),
             "waiting": tally[PICTURE] + tally[TITLE],
-            "waiting_word": "queued files to mark or retitle",
+            "waiting_word": "readings and questions in Subtitle User Input "
+                            "that nuarr will not settle without you",
+            "needs_you": needs_you(),
             # Its panel is Subtitle User Input, and this row is its handle.
             # Named rather than left as "the detail", because the panel it
             # opens has a name and it is not a detail - it is the one thing on

@@ -33724,7 +33724,8 @@ const LANEC=['#6fb0ff','#e8a33d','#7fd18c','#c98cf0'];
 // happen to it. The old panels are still underneath, one behind each
 // switchboard row, because that is where the per-row buttons and the pickers
 // live and none of that is worth losing.
-let _subs=null, _subsPoll=null, _subsKey='', _subsSort='what', _subsDesc=false;
+let _subs=null, _subsPoll=null, _subsKey='', _subsTopKey='';
+let _subsSort='what', _subsDesc=false;
 // One colour per kind of subtitle trouble, used by the chip in the list and
 // by the dot on the switchboard, so the eye can join a row to its system.
 const SUBS_C={sidecar:'#6fb0ff', dupe:'#c98cf0', picture:'#e8a33d',
@@ -33763,8 +33764,10 @@ function subsDetail(k){
   }
   const on=!subsOpen(k);
   try{ localStorage.setItem('nuarr.subs.d.'+k, on?'open':'shut'); }catch(e){}
-  subsDetailPaint();
+  // The slot only exists while the row is open, so the board has to be drawn
+  // again before the panel can be moved into it.
   _subsKey=''; subsPaint();
+  subsDetailPaint();
   if(on){
     // The detail lives below the list, so opening it without going there is
     // the same as not opening it.
@@ -33818,9 +33821,7 @@ function subsSwitchHtml(b){
   if(b.key==='sidecar')
     return `<a href="#" onclick="subsDetail('sidecar');return false"
         title="the rule is per library, so the switch is in the panel">which libraries</a>`;
-  if(b.key==='picture')
-    return `<a href="#" onclick="subsDetail('picture');return false"
-        title="manual or auto, and the two sureness lines">mode and lines</a>`;
+  if(b.key==='picture') return '';   // the row itself opens the panel
   return '';
 }
 
@@ -33848,8 +33849,14 @@ function subsBoardHtml(){
           <span style="flex:none;margin-left:auto;white-space:nowrap"
             title="${esc(b.waiting_word||'')}">${
               b.counting?'<span class="busy" style="color:var(--acc)"><span class="sp"></span></span> <span class="dim">counting</span>'
+              // A COUNT OF WHAT IS WAITING ON YOU BEATS A COUNT OF WHAT IS
+              // WAITING ON NUARR, on the one row that is a question. The
+              // picture row said "nothing waiting" over a panel holding
+              // sixty-two things to answer, because it was counting queued
+              // steps - and the queue is exactly where these are NOT.
+              :(b.needs_you?`${num(b.needs_you,'you')} to answer`
               :(b.waiting?`${num(b.waiting, b.on?'auto':'you')} waiting`
-                       :'<b style="color:var(--ok)">nothing waiting</b>')}</span>
+                       :'<b style="color:var(--ok)">nothing waiting</b>'))}</span>
         </div>
         <div class="dim" style="font-size:11.5px;margin-top:3px">${esc(b.does||'')}</div>
         ${b.detail?`<div class="dim" style="font-size:11px;margin-top:2px">${esc(b.detail)}</div>`:''}
@@ -33865,6 +33872,8 @@ function subsBoardHtml(){
             (subsOpen(b.key)?'▾ hide ':'▸ show ')
             + esc(b.detail_name || 'the detail')}</a>`:''}
         </div>
+        ${(b.panel&&b.detail_name&&subsOpen(b.key))
+          ? `<div id="skSlot" style="margin:7px -11px -9px"></div>` : ''}
       </div>`;
     }).join('')}
     </div></div>`;
@@ -34096,12 +34105,37 @@ function subsPaint(){
   // HOLDS STILL UNDER THE POINTER. Same rule the old panel learned: a list
   // being read is a list that must not be rebuilt beneath the reader.
   if(panelScrolled('subsTop')) return;
+  // TWO SLOTS, BECAUSE THEY ANSWER DIFFERENT QUESTIONS AND SIT IN DIFFERENT
+  // PLACES. What is happening right now goes at the very top of the page;
+  // the switchboard and the file list stay under the rules that produced
+  // them. Both are drawn from the same payload in the same pass, so they can
+  // never disagree about a number.
+  const top=document.getElementById('subsStatus');
+  if(top){
+    const h = subsScanHtml() + subsProcHtml();
+    if(h!==_subsTopKey){ _subsTopKey=h; top.innerHTML=h; }
+  }
   // subsAskHtml is gone: its questions live in Subtitle User Input now,
   // which is the panel that was already asking you things.
-  const html = subsBoardHtml() + subsScanHtml() + subsProcHtml()
-             + subsListHtml();
+  const html = subsBoardHtml() + subsListHtml();
+  // RESCUED BEFORE THE WIPE, AND THAT IS NOT AN OPTIONAL STEP.
+  //
+  // The panel is moved into a slot inside this container, and this line
+  // replaces the container's whole contents - so a panel sitting in the slot
+  // is a panel about to be deleted, along with its table, its selection and
+  // every listener on it. It looked like it worked, because the FIRST paint
+  // put it there and the second one took it away, leaving an open row with
+  // nothing under it and no error anywhere. It goes home first, every time.
+  const pane=document.querySelector('.subsd[data-d="picture"]');
+  const home=document.getElementById('skHome');
+  if(pane&&home&&pane.parentNode!==home) home.appendChild(pane);
   if(html!==_subsKey){ _subsKey=html; el.innerHTML=html; }
   subsDetailPaint();
+  // AND THEN INTO ITS ROW. Opening the row should drop the panel out of the
+  // row; leaving it at the bottom of the page is what made opening the row
+  // feel like nothing had happened.
+  const slot=document.getElementById('skSlot');
+  if(slot&&pane) slot.appendChild(pane);
 }
 
 function laneLines(fl, small){

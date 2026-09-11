@@ -243,7 +243,13 @@
              question - and the rules are also the one thing on this page that
              is yours to set rather than nuarr's to report. -->
 
-        <!-- 1. THE POLICY. What a file is allowed to end up carrying, per
+        <!-- 1. WHAT IS HAPPENING RIGHT NOW. The reading's own progress and
+             what is being processed, first, because it is the question you
+             open this page with. Everything under it is either the policy
+             that produced the work or the work itself. Drawn by subsPaint. -->
+        <div id="subsStatus" style="padding:6px 14px 0"></div>
+
+        <!-- 2. THE POLICY. What a file is allowed to end up carrying, per
              library, and which finished files no longer match it. -->
         <div style="padding:6px 14px 4px">
           <div class="lkind" style="padding:11px 12px">
@@ -266,17 +272,24 @@
         </div>
         <div id="langBody" style="padding:0 14px 14px"></div>
 
-        <!-- 2. WHAT NUARR IS DOING ABOUT THEM. The switchboard, the reading's
-             progress, what is being processed, and the file-by-file list. -->
+        <!-- 3. WHAT NUARR IS DOING ABOUT THEM. The switchboard and the
+             file-by-file list. -->
         <div id="subsTop" style="padding:6px 14px 4px"></div>
 
-        <!-- 3. WHAT IT NEEDS FROM YOU.
-             Collapsible from its own switchboard row above, and open unless
-             you have shut it: it is the one panel that wants something, so it
-             should not have to be found. Drawn by skPaint; see skAskHtml for
-             the questions that have no reading behind them. -->
-        <div class="subsd" data-d="picture">
-          <div id="skPanel" style="padding:0 14px 6px"></div>
+        <!-- 4. WHAT IT NEEDS FROM YOU.
+             THIS ELEMENT LIVES HERE AND IS DRAWN HERE, but it does not stay
+             here: subsPaint moves it into #skSlot, inside its own switchboard
+             row, so opening the row drops the panel out of the row rather
+             than revealing something further down the page that you then have
+             to go and find. It is a DOM move rather than a re-render, so the
+             table's scroll position, its selection and its listeners all
+             survive. When the row is shut there is no slot and the panel
+             stays here, hidden. Drawn by skPaint; see skAskHtml for the
+             questions that have no reading behind them. -->
+        <div id="skHome">
+          <div class="subsd" data-d="picture">
+            <div id="skPanel" style="padding:0 14px 6px"></div>
+          </div>
         </div>
 
         <!-- The evidence behind two of the switchboard rows, shut by default.
