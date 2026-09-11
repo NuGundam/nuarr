@@ -4842,8 +4842,11 @@ async def api_audiolang_set(file_id: int, track: int, code: str):
             "ok": True, "ms": int((time.time() - t2) * 1000)})
 
         label = display_label(r["title"], r["season"], r["episode"])
-        joblog.log(f"audio language set by hand: a:{track} of {label} = {code}",
-                   "ok", system="audiolang")
+        # BOTH NUMBERS, ONCE. The log is read beside MediaInfo, which counts
+        # audio tracks from one, and beside ffmpeg arguments, which count from
+        # zero. Printing only one of them means somebody has to know which.
+        joblog.log(f"audio language set by hand: track {track + 1} (a:{track}) "
+                   f"of {label} = {code}", "ok", system="audiolang")
         return {"ok": True, "code": code, "detail": why, "steps": steps,
                 "arrs_told": told}
     return await asyncio.to_thread(_work)
@@ -4902,7 +4905,8 @@ async def api_audiolang_apply(file_id: int, track: int, code: str,
                 # matters.
                 audiolang.fix_step(key, "arrs")
                 audiolang.notify_arrs([file_id])
-                joblog.log(f"audio language set to {code} on a:{track} of "
+                joblog.log(f"audio language set to {code} on track "
+                           f"{track + 1} (a:{track}) of "
                            f"{os.path.basename(path)}", "ok")
             audiolang.fix_end(key, ok, (f"now tagged {code}" if ok
                                         else (why or "the header edit failed")))
@@ -30125,7 +30129,21 @@ function renderAlang(){
             <div class="dim" style="font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
               >${esc((r.path||'').split('\\').pop())}</div></td>
           <td class="c dim" title="${esc(r.library||'')}">${esc(r.library||'')}</td>
-          <td class="c mono dim">a:${r.track}${r.n_audio>1?'/'+r.n_audio:''}</td>
+          <!-- AN INDEX IN A FRACTION READS AS AN ORDINAL, AND IT IS NOT ONE.
+               This printed "a:1/2", which everybody reads as "the first of
+               two" - and it meant the SECOND: a:1 is ffmpeg's zero-based
+               stream selector, and the "/2" beside it turns it into something
+               that looks counted from one. On an episode whose tracks are
+               English then Japanese, the row said a:1/2 and "says Japanese",
+               and the two halves of the same cell contradicted each other.
+               Confirmed against the file: audio_langs is 'eng,jpn', so index
+               1 is the Japanese track, which MediaInfo calls Audio #2.
+               So the cell shows the number MediaInfo shows - the one you
+               would check this against - and keeps the machine index, which
+               is what the correction actually writes, on hover where it
+               cannot be mistaken for a count. -->
+          <td class="c mono dim" title="${esc(`ffmpeg and mkvmerge call this a:${r.track}, counting from zero - that is the stream this correction writes to. MediaInfo calls it Audio #${(r.track||0)+1}.`)}"
+            >${(r.track||0)+1}${r.n_audio>1?' of '+r.n_audio:''}</td>
           <td class="c mono" style="color:#e2b341" title="${esc(
             (r.says_name||'')+' — what the file\'s tag claims')}">${esc(r.says_name||'')}</td>
           <td class="c">
@@ -30550,7 +30568,7 @@ async function alTest(btn){
   out.innerHTML=`<div class="lkind" style="margin-top:8px;padding:9px 11px">
     <div>${verdict}</div>
     <div class="dim" style="font-size:11px;margin-top:5px">
-      ${esc(r.title||'')} · track ${r.track} ·
+      ${esc(r.title||'')} · track ${(r.track||0)+1} ·
       ${r.windows} window(s) · confidence ${(r.confidence*100).toFixed(0)}% ·
       ran on ${esc(r.device||'?')} in ${r.elapsed}s${r.downloaded_model?' (including the first-time model download)':''}
       ${(r.votes&&r.votes.length)?`<br>windows: ${r.votes.map(v=>esc(v[0])+' '+(v[1]*100).toFixed(0)+'%').join(' · ')}`:''}
@@ -31574,8 +31592,8 @@ function skPaint(force){
           : 'nuarr has no record of when this file arrived'}">${
           r.added?ago(r.added):'—'}</td>
         <td class="c" style="font-size:10.5px;color:${pic?'#6fb0ff':'var(--dim)'}"
-          title="${pic?'Words burned into the picture of a file that reports no subtitle track':'A text track inside the file'}">${
-          pic?'picture':'track s:'+r.track}</td>
+          title="${pic?'Words burned into the picture of a file that reports no subtitle track':esc(`A text track inside the file - the ${(r.track||0)+1}th subtitle stream, which ffmpeg calls s:${r.track}`)}">${
+          pic?'picture':'track '+((r.track||0)+1)}</td>
         <td class="c">${r.unread
           ? '<span class="dim" style="font-size:10.5px">not read yet</span>'
           : `<select class="kindsel" onchange="skSetKind('${r.id}',this.value,this)"
@@ -31861,7 +31879,9 @@ function sttPaint(){
             :'below the line, so this one is yours to call'))}"
           >${(r.unread||r.sure===undefined)?'':r.sure+'%'}</td>
         <td class="mono" style="padding:3px 8px 3px 4px;color:var(--warn)"
-          >${esc(r.old||'')}<div class="dim" style="font-size:10px">s:${r.track}</div></td>
+          >${esc(r.old||'')}<div class="dim" style="font-size:10px"
+            title="${esc(`ffmpeg and mkvmerge call this s:${r.track}, counting from zero`)}"
+            >track ${(r.track||0)+1}</div></td>
         <td class="mono" style="padding:3px 8px 3px 0;color:${
           r.rewritable?'var(--ok)':'var(--dim)'}"
           >${r.rewritable?esc(r.new||''):'—'}</td>
