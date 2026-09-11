@@ -15454,7 +15454,8 @@ function alAutoStrip(A){
     <div style="display:flex;gap:10px;align-items:baseline;font-size:11px;
                 margin:3px 0 4px;flex-wrap:wrap">
       <span class="busy" style="color:var(--acc)"><span class="sp"></span></span>
-      <b style="flex:none">${fmt(A.done||0)} of ${fmt(A.total||0)}</b>
+      <span style="flex:none">${num(A.done||0,'done')} of ${
+        num(A.total||0,'auto')}</span>
       <span class="dim" style="flex:1 1 auto;min-width:0;overflow:hidden;
             text-overflow:ellipsis;white-space:nowrap"
             title="${esc(A.now||'')}">${esc(A.now||'')}</span>
@@ -15463,8 +15464,8 @@ function alAutoStrip(A){
           hsDur(A.elapsed)} in</span>`:''}
         ${A.rate?`<span class="dim" title="Tags corrected per second, measured on this run">${
           A.rate>=1?A.rate.toFixed(1)+'/s':(1/A.rate).toFixed(1)+'s each'}</span>`:''}
-        ${A.eta?`<b style="color:var(--acc)" title="Time left in this pass at the rate above">${
-          hsDur(A.eta)} left</b>`:''}
+        ${A.eta?`<span title="Time left in this pass at the rate above">${
+          numt(hsDur(A.eta))} left</span>`:''}
       </span>
     </div>` : '';
   return `${bar}<div class="dim" style="font-size:11px;margin:2px 0 4px;
@@ -15472,20 +15473,21 @@ function alAutoStrip(A){
     <span style="color:var(--ok)">auto</span>
     ${A.at?`<span title="When auto last went through the standing list, and what it did">last run ${
        ago(A.at)}${(A.fixed||A.failed)
-         ? ` · ${fmt(A.fixed||0)} corrected${A.failed?`, ${fmt(A.failed)} failed`:''}`
+         ? ` · ${num(A.fixed||0,'done')} corrected${
+             A.failed?`, <b class="err">${fmt(A.failed)}</b> failed`:''}`
          : ' · nothing to do'}${A.last_took?` · took ${hsDur(A.last_took)}`:''}</span>`
       :'<span title="Auto acts at the end of each listen pass. It has not reached one since nuarr started.">has not run yet</span>'}
     ${(!A.running&&A.next_run)?`<span title="Auto rides the listen pass, so this is the listener's clock - it runs every ${
        hsDur(A.cycle_s||1800)}.">next run ${(A.next_run-(Date.now()/1000))<=1
          ? 'any moment' : 'in '+hsDur(A.next_run-(Date.now()/1000))}</span>`:''}
-    ${A.runs?`<span title="Completed passes since nuarr started">${fmt(A.runs)} pass${
-       A.runs===1?'':'es'}</span>`:''}
+    ${A.runs?`<span title="Completed passes since nuarr started">${
+       num(A.runs,'done')} pass${A.runs===1?'':'es'}</span>`:''}
     ${A.secs_each?`<span title="Average seconds per correction, smoothed across passes - what the estimate is built on">${
        A.secs_each.toFixed(1)}s a file</span>`:''}
     ${A.waiting?`<span title="Disagreements past the line waiting for a pass. ${
-       A.per_pass} are taken each time, because each one is a header edit and a requeue."><b>${
-       fmt(A.waiting)}</b> still to correct${A.backlog_eta?` · <b style="color:var(--acc)">${
-       hsDur(A.backlog_eta)}</b> to work through them`:''}</span>`
+       A.per_pass} are taken each time, because each one is a header edit and a requeue.">${
+       num(A.waiting,'auto')} still to correct${
+       A.backlog_eta?` · ${numt(hsDur(A.backlog_eta))} to work through them`:''}</span>`
       :'<span>nothing waiting past the line</span>'}
   </div>`;
 }
@@ -15676,7 +15678,9 @@ function alLeftStrip(){
        title="${esc(x.label||'')} — ${x.n} answer${x.n===1?'':'s'}${x.retired
          ? ', so the rest of this show is left alone below the line'
          : `, ${min-x.n} more and the rest of this show is left alone`}">${
-       esc(x.label||x.series)} <span class="dim">${x.n}${x.retired?'':'/'+min}</span>
+       esc(x.label||x.series)} ${x.retired
+         ? `<b style="color:var(--ok)">${x.n}</b>`
+         : `<b style="color:var(--warn)">${x.n}</b><span class="dim">/${min}</span>`}
        <a href="#" style="text-decoration:none" onclick="alForget(${i});return false"
           title="Forget this show — it starts being asked about again">&times;</a></span>`).join('')}
   </div>`;
@@ -26061,6 +26065,50 @@ async function langAudioPolicy(){
 // anything reads as a decision, and leaves you wondering why it changed
 // nothing.
 function cssId(s){ return s.replace(/[^A-Za-z0-9]/g,'_'); }
+
+// ---------------------------------------------------------------------------
+// WHAT A NUMBER'S COLOUR MEANS, AND IT MEANS THE SAME THING EVERYWHERE.
+//
+// These panels are all the same shape of report: some of the work is behind
+// you, some of it is waiting on a person, and some of it the machine will get
+// to on its own. Read as plain text they are a wall of digits in which the
+// one number you wanted - how much is left - looks exactly like the six you
+// did not. The colour answers one question and only one: WHO IS THIS WAITING
+// ON?
+//
+//   green   done, or nothing left to do
+//   amber   yours - nothing moves until you answer
+//   blue    queued; auto will get to it without you
+//   grey    zero, or does not apply here
+//
+// Zero is ALWAYS grey, whatever it is counting, because a zero is never work.
+// "0 past the line" should read as nothing to worry about, not as a green
+// achievement or an amber demand.
+const NUMC={done:'var(--ok)', you:'var(--warn)', auto:'var(--acc)',
+            none:'var(--dim)'};
+function numc(n, who){ return (!Number(n)) ? NUMC.none : (NUMC[who]||NUMC.none); }
+// `num(12,'you')` -> a bold amber 12 with tabular figures, so columns of them
+// line up and a changing count does not make the text jump.
+function num(n, who, title){
+  return `<b style="color:${numc(n,who)};font-variant-numeric:tabular-nums"${
+    title?` title="${title}"`:''}>${fmt(Number(n)||0)}</b>`;
+}
+// The same for a duration, which is a number about time left rather than a
+// count - always blue, because a clock is only ever the machine's promise.
+function numt(txt){
+  return `<b style="color:var(--acc);font-variant-numeric:tabular-nums">${txt}</b>`;
+}
+// One line saying what the colours mean, so nobody has to guess. Small, dim,
+// and only drawn once per panel.
+function numKey(){
+  return `<div class="dim" style="font-size:10px;margin:2px 0 6px;display:flex;
+       gap:10px;flex-wrap:wrap" title="Every count on this panel is coloured by who it is waiting on.">
+    <span><b style="color:var(--ok)">\u25cf</b> done</span>
+    <span><b style="color:var(--warn)">\u25cf</b> yours to answer</span>
+    <span><b style="color:var(--acc)">\u25cf</b> auto will get to it</span>
+    <span><b style="color:var(--dim)">\u25cf</b> nothing there</span>
+  </div>`;
+}
 let _socAll=null;
 
 async function langSignsLoad(){
@@ -29772,13 +29820,15 @@ function renderAlang(){
       <span class="dim">%</span>
       <span class="dim" style="margin-left:8px"
         title="Rows landing between the two lines are the ones you are asked about. Above the first line auto would retag them; at or below the second the tag is left alone.">
-        ${fmt(band)} in between${past?` · ${fmt(past)} past the line`:''}</span>
+        ${num(band,'you')} in between · ${
+          num(past,'auto')} past the line</span>
       ${(_al.mode==='auto'&&past)?`<button class="rmb" onclick="alRunAuto(this)"
         title="Work the standing list now rather than waiting for the next listen pass. ${
           _al.auto_per_pass||20} at a time.">Correct them now</button>`:''}
     </div>
     ${alAutoStrip(A)}
-    ${alLeftStrip()}`;
+    ${alLeftStrip()}
+    ${numKey()}`;
     if(!rows.length) h+=`<div class="dim" style="padding:12px">Nothing disagrees.</div>`;
     else{
       const nsel=alSelIds().length;
@@ -29857,8 +29907,8 @@ function renderAlang(){
         </tr>`;
       }
       h+=`</tbody></table></div>
-        <div class="dim" style="font-size:11px;margin-top:6px">${fmt(pick.length)}
-          worth answering · least certain first</div>`;
+        <div class="dim" style="font-size:11px;margin-top:6px">${
+          num(pick.length,'you')} worth answering · least certain first</div>`;
     }
     if((_al.auto_state||{}).running) setTimeout(alAutoTick, 60);
   }
@@ -31102,15 +31152,18 @@ function skPaint(force){
   const head=`<b style="color:#6fb0ff">What subtitles does each file actually carry?</b>
     <span class="dim" style="font-size:11.5px">
       <span title="Files that report no subtitle track, sampled for words in the picture">${
-        fmt(tested)} pictures sampled · ${fmt(P.untested||0)} to go</span>
+        num(tested,'done')} pictures sampled · ${
+        num(P.untested||0,'auto')} to go</span>
       · <span title="Text tracks whose title contradicts their cue rate, and whose events have been read to settle it">${
-        fmt(c.tracks||0)} track${c.tracks===1?'':'s'} in question${
-        c.unread?`, <span style="color:var(--warn)">${fmt(c.unread)} not read yet</span>`:''}</span>${
+        num(c.tracks||0,'you')} track${c.tracks===1?'':'s'} in question${
+        c.unread?`, ${num(c.unread,'auto')} not read yet`:''}</span>${
       (P.dialogue||P.hybrid)?` · <span style="color:var(--bad)">${fmt((P.dialogue||0)+(P.hybrid||0))} picture${
         ((P.dialogue||0)+(P.hybrid||0))===1?'':'s'} carrying dialogue</span>`:''}${
-      P.marked?` · ${fmt(P.marked)} marked`:''}${
+      P.marked?` · ${num(P.marked,'done')} marked`:''}${
       P.ignored?` · <span title="Findings you said were not subtitles. The words behind them are checked against every new read.">${
-        fmt(P.ignored)} dismissed${P.garbage?`, ${fmt(P.garbage)} words learned`:''}</span>`:''}${
+        num(P.ignored,'done')} dismissed${
+        P.garbage?`, ${num(P.garbage,'done')} word${
+          P.garbage===1?'':'s'} learned`:''}</span>`:''}${
       (P.ignored_series&&P.ignored_series.length)?` · <span title="${esc(P.ignored_series.join('\n'))}">${
         P.ignored_series.length} show${P.ignored_series.length===1?'':'s'} left alone</span>`:''}
     </span>
@@ -31143,10 +31196,13 @@ function skPaint(force){
       <span class="dim">%</span>
       <span class="dim" style="margin-left:8px"
         title="Anything landing between the two lines is what you are asked about. Every answer you give feeds the dictionaries and the kept kinds that produce the next score.">
-        ${fmt(c.band||0)} in between${P.learned_good?` · ${fmt(P.learned_good)} words confirmed`:''}</span>
-      ${(P.auto_marked||P.auto_dropped)?`<span style="color:var(--ok)">last pass: ${
-        fmt(P.auto_marked||0)} marked, ${fmt(P.auto_dropped||0)} dropped</span>`:''}
+        ${num(c.band||0,'you')} in between${
+          P.learned_good?` · ${num(P.learned_good,'done')} words confirmed`:''}</span>
+      ${(P.auto_marked||P.auto_dropped)?`<span class="dim">last pass: ${
+        num(P.auto_marked||0,'done')} marked, ${
+        num(P.auto_dropped||0,'done')} dropped</span>`:''}
     </div>`;
+  const key = numKey();
   const prog = P.running ? skProgBar(P,'sampling','files')
              : T.running ? skProgBar(T,'reading','tracks') : '';
   const hist=`<div class="dim" style="font-size:11px;margin:4px 0 2px;display:flex;gap:12px;flex-wrap:wrap">
@@ -31170,7 +31226,8 @@ function skPaint(force){
     <span style="color:var(--ok)">auto</span>
     ${A.at?`<span class="dim" title="When auto last went through the standing list, and what it did with it">last run ${
        ago(A.at)}${(A.marked||A.dropped)
-         ? ` · ${fmt(A.marked||0)} marked${A.dropped?`, ${fmt(A.dropped)} dropped`:''}`
+         ? ` · ${num(A.marked||0,'done')} marked${
+             A.dropped?`, ${num(A.dropped,'done')} dropped`:''}`
          : ' · nothing to do'}</span>`
       :'<span class="dim" title="Auto acts at the head of every pass. It has not reached one since nuarr started.">has not run yet</span>'}
     ${A.marking
@@ -31180,9 +31237,9 @@ function skPaint(force){
           (A.next_run-(Date.now()/1000))<=1
             ? 'any moment' : 'in '+hsDur(A.next_run-(Date.now()/1000))}</span>`:'')}
     ${A.queued?`<span title="Findings already past the ${d.mark_at}% line waiting for a later pass. ${
-       A.per_pass} are taken each pass because every mark rewrites a container."><b>${
-       fmt(A.queued)}</b> still to mark${A.eta?` · <b style="color:var(--acc)">${
-       hsDur(A.eta)}</b> to work through them`:''}</span>`
+       A.per_pass} are taken each pass because every mark rewrites a container.">${
+       num(A.queued,'auto')} still to mark${
+       A.eta?` · ${numt(hsDur(A.eta))} to work through them`:''}</span>`
       :'<span class="dim">nothing waiting past the line</span>'}
   </div>`:''}`;
   // ---- the batch marker's own bar, separate from the readers' ------------
@@ -31191,13 +31248,14 @@ function skPaint(force){
     <div class="lkind" style="padding:7px 10px;margin:6px 0">
       <div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;font-size:11.5px">
         ${mk.running?'<span class="busy" style="color:var(--acc);flex:none"><span class="sp"></span></span>':''}
-        <b style="flex:none">${mk.running?'Marking':'Marked'} ${fmt(mk.done||0)} of ${fmt(mk.total||0)}</b>
+        <span style="flex:none">${mk.running?'Marking':'Marked'} ${
+          num(mk.done||0,'done')} of ${num(mk.total||0,'auto')}</span>
         ${(d.mode==='auto')?`<span class="dim" style="flex:none;font-size:10.5px"
            title="Auto is working through the findings already past the ${d.mark_at}% line, ${
              A.per_pass||25} a pass, because every mark rewrites a container.">on its own</span>`:''}
         ${mk.running&&mk.now?`<span class="dim" style="flex:1 1 160px;min-width:0;overflow:hidden;
            text-overflow:ellipsis;white-space:nowrap" title="${esc(mk.now)}">${esc(mk.now)}</span>`:''}
-        ${mk.ok?`<span style="color:var(--ok);flex:none">${fmt(mk.ok)} done</span>`:''}
+        ${mk.ok?`<span style="flex:none">${num(mk.ok,'done')} done</span>`:''}
         ${mk.failed?`<span class="err" style="flex:none">${fmt(mk.failed)} could not be</span>`:''}
         ${(mk.running&&mk.eta)?`<span class="dim" style="flex:none">${hsDur(mk.eta)} left${
            mk.secs_each?` · ${mk.secs_each}s a file`:''}</span>`:''}
@@ -31321,7 +31379,7 @@ function skPaint(force){
       onclick="skShow('done',${_skShowDone?0:1});return false">${
         _skShowDone?'hide':'also show'} the ${fmt(c.settled)} you set by hand</a>`:''}
   </div>`;
-  const html=`<div class="lkind" style="padding:11px 12px">${head}${note}${band}${prog}${hist}${table}${foot}</div>`;
+  const html=`<div class="lkind" style="padding:11px 12px">${head}${note}${key}${band}${prog}${hist}${table}${foot}</div>`;
   if(!force && (askOpen('skPanel') || panelBusy('skPanel') || panelScrolled('skPanel'))) return;
   if(html===_skKey) return;
   // A repaint you asked for keeps your place in the box.
@@ -32097,11 +32155,12 @@ function seWaitHtml(w){
     <div style="display:flex;gap:10px;align-items:baseline;font-size:11px;
                 margin:4px 0 0;flex-wrap:wrap">
       <span class="busy" style="color:var(--acc);flex:none"><span class="sp"></span></span>
-      <b style="flex:none">${w.total?`${fmt(w.done||0)} of ${fmt(w.total)}`:'starting…'}</b>
-      ${w.found?`<span class="dim">${fmt(w.found)} found so far</span>`:''}
+      <span style="flex:none">${w.total
+        ? `${num(w.done||0,'done')} of ${num(w.total,'auto')}`:'starting…'}</span>
+      ${w.found?`<span class="dim">${num(w.found,'you')} found so far</span>`:''}
       <span style="margin-left:auto;display:flex;gap:10px">
         ${w.rate?`<span class="dim">${fmt(Math.round(w.rate))} files/s</span>`:''}
-        ${w.eta?`<b style="color:var(--acc)">${hsDur(w.eta)} left</b>`:''}
+        ${w.eta?`<span>${numt(hsDur(w.eta))} left</span>`:''}
       </span>
     </div>
   </div>`;
@@ -32169,13 +32228,13 @@ function sePaint(){
         <span class="dim">${on.length?`on for ${esc(on.join(', '))}`
                                      :'off everywhere'}</span>
         <span class="dim" style="margin-left:auto">${
-          sum.files?`<b class="cchg">${fmt(sum.files)} file${
-            sum.files===1?'':'s'}</b>${sum.subs!==sum.files?` · ${
-            fmt(sum.subs)} subtitles`:''}${sum.replaces?` · <span
+          sum.files?`${num(sum.files, on.length?'auto':'you')} file${
+            sum.files===1?'':'s'}${sum.subs!==sum.files?` · ${
+            num(sum.subs, on.length?'auto':'you')} subtitles`:''}${sum.replaces?` · <span
             title="Sidecars that would replace a track already inside the file, because the library says the loose copy is the keeper">${
-            fmt(sum.replaces)} replacing a track inside</span>`:''}${sum.drops?` · <span
+            num(sum.replaces, on.length?'auto':'you')} replacing a track inside</span>`:''}${sum.drops?` · <span
             title="Loose copies of a subtitle the file already carries. Recycled — nothing is rewritten.">${
-            fmt(sum.drops)} to recycle</span>`:''}${libs?` <span style="opacity:.7">— ${
+            num(sum.drops, on.length?'auto':'you')} to recycle</span>`:''}${libs?` <span style="opacity:.7">— ${
             libs}</span>`:''}`
           :'<b style="color:var(--ok)">no sidecars to take in</b>'}</span>
       </div></div>`;
