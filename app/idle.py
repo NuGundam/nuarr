@@ -61,6 +61,26 @@ from . import joblog
 # WHERE "BUSY" STARTS. High on purpose: this is not a courtesy threshold, it
 # is the point past which one more container rewrite would be felt. A box at
 # 60% CPU has room for a stream copy; a box at 85% does not.
+# HOW MANY AT ONCE, AND WHY IT IS NOT ONE.
+#
+# "Is two or more at the same time not possible?" - it was not, and only
+# because nothing had asked for it: the loop below did one item, waited for
+# it, then did the next. Nothing about the work requires that.
+#
+# But two is not simply twice as fast, and which two matters more than how
+# many. A container rewrite is almost pure movement - read the whole file off
+# the disk it lives on, write it to the cache, read it back, write it home -
+# so two files on the SAME spindle take turns on one arm and finish in the
+# time one pair of them would have taken anyway, having made each other slower
+# the whole way. Two files on DIFFERENT spindles overlap almost perfectly:
+# separate arms, separate queues, one cache in the middle.
+#
+# So the rule is not a worker count, it is an exclusion: at most `lanes` in
+# flight, and never two that share a disk. Set this to 1 to go back to one at
+# a time; the gate still stops everything the instant somebody presses play,
+# whatever the number is.
+LANES = 2
+
 CPU_BUSY_PCT = 80.0
 GPU_BUSY_PCT = 80.0
 # Four transcodes is a full house on this machine - the number the audit
@@ -227,7 +247,7 @@ async def busy(disk: str = "") -> dict:
 # ------------------------------------------------------------- the runner ---
 async def run(key: str, title: str, pending, do_one, label=None, *,
               empty_s: float = EMPTY_S, pause_s: float = PAUSE_S,
-              system_name: str = "", disk_of=None) -> None:
+              system_name: str = "", disk_of=None, lanes: int = LANES) -> None:
     r"""Work through `pending()` for as long as the machine can spare it.
 
     NO BATCH, NO END. This is a loop that lives for the life of the process:
@@ -274,55 +294,112 @@ async def run(key: str, title: str, pending, do_one, label=None, *,
                 except Exception:                                # noqa: BLE001
                     pass
             d.update(running=True, idle_why="", total=len(items), done=0,
-                     ok=0, failed=0, t0=time.time(), next_look=0.0)
-            for it in items:
-                # PER ITEM AND PER SPINDLE. A viewer on one disk is a reason
-                # to work on another, not a reason to stop - which is exactly
-                # how the queue treats it.
-                b = await busy(disk_of(it) if disk_of else "")
-                # A BUSY DISK IS NOT A BUSY MACHINE. If the only thing in the
-                # way is this file's own spindle, step over it and take the
-                # next one - the sort above means there usually is a next one.
-                if b["busy"] and (b.get("why") or "").endswith(
-                        (disk_of(it) if disk_of else "\x00")):
-                    d["skipped"] = (d.get("skipped") or 0) + 1
-                    d["total"] = max(0, d["total"] - 1)
-                    continue
-                if b["busy"]:
-                    # PAUSED, NOT FAILED. The rest of the list is still
-                    # pending and will be picked up the moment the box is
-                    # free - there is nothing to resume because nothing was
-                    # half-done.
-                    d.update(running=False, paused=True,
-                             paused_why=b["why"], now="")
-                    break
-                d["now"] = lab(it)
-                d["item_pct"], d["item_at"] = 0.0, time.time()
-                t_item = time.time()
+                     ok=0, failed=0, t0=time.time(), next_look=0.0,
+                     lanes=max(1, int(lanes)), flight=[])
 
-                def _report(pct: float) -> None:
-                    """Called from the worker thread as the tool reports."""
-                    try:
-                        d["item_pct"] = max(0.0, min(100.0, float(pct)))
-                    except Exception:                            # noqa: BLE001
-                        pass
+            queue = list(items)
+            flight: dict = {}          # task -> {"disk","label","pct","t0"}
+            halt = False
+
+            def _note_item(it):
+                return {"disk": (disk_of(it) if disk_of else ""),
+                        "label": lab(it), "pct": 0.0, "t0": time.time()}
+
+            def _show():
+                """One place the panel reads from, however many are running."""
+                live = [dict(v) for v in flight.values()]
+                d["flight"] = [{"now": v["label"], "pct": v["pct"],
+                                "disk": v["disk"]} for v in live]
+                d["now"] = live[0]["label"] if live else ""
+                d["item_pct"] = live[0]["pct"] if live else 0.0
+
+            def _finish(task):
+                v = flight.pop(task, None) or {}
                 try:
-                    res = await asyncio.to_thread(do_one, it, _report)
+                    res = task.result()
                     good = bool((res or {}).get("ok", True))
+                except asyncio.CancelledError:
+                    raise
                 except Exception as e:                           # noqa: BLE001
-                    good, res = False, None
+                    good = False
                     d["last_error"] = f"{type(e).__name__}: {e}"
                 d["done"] += 1
-                d["item_pct"] = 0.0
                 d["ok" if good else "failed"] += 1
-                # SMOOTHED, because one enormous remux should move the
-                # estimate without owning it.
-                took = max(0.001, time.time() - t_item)
+                took = max(0.001, time.time() - (v.get("t0") or time.time()))
                 prev = d.get("secs_each") or 0.0
                 d["secs_each"] = took if not prev else prev * .7 + took * .3
-            else:
+
+            while (queue or flight) and not halt:
+                # ---- fill the free lanes ------------------------------------
+                while len(flight) < max(1, int(lanes)) and queue and not halt:
+                    taken = {v["disk"] for v in flight.values() if v["disk"]}
+                    pick = None
+                    for i, it in enumerate(queue):
+                        dk = (disk_of(it) if disk_of else "")
+                        # NEVER TWO ON ONE ARM. A second file on a spindle
+                        # that is already being read is not a second lane, it
+                        # is the same lane sharing itself.
+                        if dk and dk in taken:
+                            continue
+                        pick = i
+                        break
+                    if pick is None:
+                        break                      # only same-disk work left
+                    it = queue.pop(pick)
+                    dk = (disk_of(it) if disk_of else "")
+                    b = await busy(dk)
+                    # A BUSY DISK IS NOT A BUSY MACHINE. If the only thing in
+                    # the way is this file's own spindle, step over it and
+                    # take the next one - the sort above means there usually
+                    # is a next one.
+                    if b["busy"] and (b.get("why") or "").endswith(
+                            dk or "\x00"):
+                        d["skipped"] = (d.get("skipped") or 0) + 1
+                        d["total"] = max(0, d["total"] - 1)
+                        continue
+                    if b["busy"]:
+                        # PAUSED, NOT FAILED. Whatever is already in flight is
+                        # allowed to finish - killing a half-written remux to
+                        # be polite would leave more mess than it saves - but
+                        # nothing new starts.
+                        d.update(paused=True, paused_why=b["why"])
+                        queue.insert(0, it)
+                        halt = True
+                        break
+
+                    v = _note_item(it)
+
+                    def _report(pct: float, _v=v) -> None:
+                        """Called from the worker thread as the tool reports."""
+                        try:
+                            _v["pct"] = max(0.0, min(100.0, float(pct)))
+                        except Exception:                        # noqa: BLE001
+                            pass
+                    task = asyncio.ensure_future(
+                        asyncio.to_thread(do_one, it, _report))
+                    flight[task] = v
+                _show()
+                if not flight:
+                    break
+                done_set, _ = await asyncio.wait(
+                    list(flight.keys()), timeout=1.0,
+                    return_when=asyncio.FIRST_COMPLETED)
+                for task in done_set:
+                    _finish(task)
+                _show()
+
+            if halt:
+                # Drain what was already running before reporting a pause.
+                while flight:
+                    done_set, _ = await asyncio.wait(
+                        list(flight.keys()),
+                        return_when=asyncio.FIRST_COMPLETED)
+                    for task in done_set:
+                        _finish(task)
+                d.update(running=False, now="", item_pct=0.0, flight=[])
+            elif not queue:
                 # The list finished rather than being interrupted.
-                d.update(running=False, now="",
+                d.update(running=False, now="", item_pct=0.0, flight=[],
                          last_run=time.time(), last_done=d["done"],
                          last_took=round(time.time() - d["t0"], 1),
                          runs=(d.get("runs") or 0) + 1)
@@ -334,6 +411,8 @@ async def run(key: str, title: str, pending, do_one, label=None, *,
                         + f" in {round(time.time() - d['t0'])}s",
                         "warn" if d["failed"] else "info",
                         system=system_name or key)
+            else:
+                d.update(running=False, now="", item_pct=0.0, flight=[])
         except asyncio.CancelledError:
             raise
         except Exception as e:                                   # noqa: BLE001

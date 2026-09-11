@@ -119,6 +119,20 @@ def init() -> None:
             )""")
         cur.execute("CREATE INDEX IF NOT EXISTS ix_subembed_at "
                     "ON subembed_log(at)")
+        # ONE ROW PER SIDECAR IS THE QUESTION NOW, so the sidecar is what the
+        # lookups key on: is THIS subtitle file known bad, and when was it
+        # last tried.
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_subembed_side "
+                    "ON subembed_log(sidecar)")
+        # THE ROWS THAT NAMED NO FILE. Before failures were attributed one
+        # sidecar at a time, a mux of two subtitle files recorded its failure
+        # against both paths joined with a semicolon. There is no such file,
+        # so those rows cannot be retried, recycled or even looked at - they
+        # can only sit in the panel being a number. They are dropped once,
+        # here; whatever they were about is rediscovered on the next pass, one
+        # file at a time, which is the whole point.
+        cur.execute("DELETE FROM subembed_log "
+                    " WHERE ok = 0 AND sidecar LIKE '%;%'")
     _READY = True
 
 
@@ -172,6 +186,105 @@ def _mkvmerge() -> str:
 def have_mkvmerge() -> bool:
     exe = _mkvmerge()
     return bool(exe) and (os.path.exists(exe) or exe == "mkvmerge")
+
+
+# ------------------------------------------- is THIS subtitle file readable --
+#
+# A QUESTION ABOUT A SIDECAR, ASKED OF THAT SIDECAR. Two subtitle files sat
+# beside one episode - a broken .ass and a perfectly good .sdh.srt - and they
+# went into one mkvmerge command together, because one rewrite for two tracks
+# is right. But when the .ass turned out to be unreadable the WHOLE command
+# failed, and the failure was recorded against both paths joined with a
+# semicolon: a filename no filesystem has ever had. So "recycle the broken
+# subtitle file" looked for a file called "a.ass;b.srt", found nothing, and
+# quietly did nothing - while the good .srt, which was never the problem, was
+# blocked behind its neighbour on every pass for as long as both existed.
+#
+# mkvmerge answers this in milliseconds on its own: -J on a subtitle file
+# reports whether the container was recognised. Asking first costs nothing
+# next to the rewrite it saves, and it means every failure names exactly one
+# file and one reason.
+_READABLE: dict = {}
+
+
+def _readable(sidecar: str) -> tuple:
+    """(ok, why) for one subtitle file. Cached against its size and mtime."""
+    try:
+        st = os.stat(sidecar)
+        key = (sidecar, st.st_size, int(st.st_mtime))
+    except OSError:
+        return False, "the subtitle file is not there any more"
+    hit = _READABLE.get(sidecar)
+    if hit and hit[0] == key:
+        return hit[1]
+    ans = (True, "")
+    try:
+        r = _plain([_mkvmerge(), "-J", sidecar], 60)
+        d = json.loads(r[1] or "{}")
+        con = d.get("container") or {}
+        if not con.get("recognized"):
+            ans = (False, "the subtitle file is not readable - wrong format, "
+                          "or damaged")
+        elif not con.get("supported"):
+            ans = (False, "mkvmerge does not support that subtitle format")
+        else:
+            errs = [str(e) for e in (d.get("errors") or [])]
+            if errs:
+                ans = (False, _plain_why(" ".join(errs), sidecar))
+    except Exception:                                            # noqa: BLE001
+        # Could not ask. That is not evidence against the file, so it goes to
+        # the mux and is judged there, the way it always was.
+        return True, ""
+    _READABLE[sidecar] = (key, ans)
+    return ans
+
+
+# HOW LONG A FAILURE IS BELIEVED FOR. A broken subtitle file will be just as
+# broken in ten minutes, so it is not tried again until somebody presses Try
+# again - otherwise two bad files turn into twenty log rows in an hour, which
+# is what happened. A full disk or a file that was open is a bad moment rather
+# than a bad file, so those come back on their own.
+MOMENT_BACKOFF_S = 6 * 3600.0
+
+
+def bad_sidecars() -> dict:
+    """{sidecar path: why} for subtitle files not worth trying right now."""
+    if not _READY:
+        init()
+    out: dict = {}
+    now = time.time()
+    try:
+        with cursor() as cur:
+            for r in cur.execute(
+                    "SELECT sidecar, ok, detail, at FROM subembed_log "
+                    " WHERE id IN (SELECT MAX(id) FROM subembed_log "
+                    "               WHERE COALESCE(sidecar,'') != '' "
+                    "               GROUP BY sidecar)"):
+                if r["ok"] or not r["sidecar"]:
+                    continue
+                det = r["detail"] or ""
+                if _looks_broken(det) or (now - (r["at"] or 0)
+                                          < MOMENT_BACKOFF_S):
+                    out[r["sidecar"]] = _plain_why(det, r["sidecar"])
+    except Exception:                                            # noqa: BLE001
+        return {}
+    return out
+
+
+def _screen(file_id: int, path: str, takes: list) -> list:
+    """Drop the sidecars that cannot work, each with its own reason recorded.
+
+    Returns the ones worth muxing. Nothing here opens the video.
+    """
+    good = []
+    for t in takes:
+        side = t.get("sidecar") or ""
+        ok, why = _readable(side)
+        if ok:
+            good.append(t)
+            continue
+        _note(file_id, path, side, t.get("lang") or "", False, why)
+    return good
 
 
 # --------------------------------------------------------- reading the name --
@@ -760,6 +873,16 @@ def embed_one(file_id: int, report=None) -> dict:
     if not takes and not drops:
         return {**p, "embedded": 0}
     path = p["path"]
+    # ASKED OF EACH FILE BEFORE THEY ARE ASKED TOGETHER. One unreadable
+    # sidecar used to fail the whole command and take its innocent neighbour
+    # down with it; now it is refused by name and the rest go in.
+    if takes:
+        _n0 = len(takes)
+        takes = _screen(int(file_id), path, takes)
+        if not takes and not drops:
+            return {"ok": False, "embedded": 0,
+                    "why": (f"{_n0} subtitle file(s) beside this one cannot "
+                            f"be read")}
     if not os.path.exists(path):
         return {"ok": False, "why": "the file is not on disk"}
     # A DROP TOUCHES NO FILE, so it is not gated on any of what follows - not
@@ -784,6 +907,11 @@ def embed_one(file_id: int, report=None) -> dict:
     ok_room, why_room = fileops.cache_room(_size(path))
     if not ok_room:
         return {"ok": False, "why": why_room}
+    # HELD FOR THE LENGTH OF THE REWRITE. Two of these can now be in flight at
+    # once, and the second must not be told there is room on space the first
+    # has not finished using yet.
+    _claim = fileops.cache_reserve(_size(path))
+    _claim.__enter__()
     tmp = fileops.cache_temp(".mkv", "embed")
     cmd = [_mkvmerge(), "-o", tmp]
     # WHAT THE SIDECAR REPLACES, NAMED IN MKVMERGE'S OWN NUMBERS. The plan
@@ -810,8 +938,8 @@ def embed_one(file_id: int, report=None) -> dict:
             why = ("the track this would have replaced is not where the plan "
                    "said it was - the file has changed since it was looked at, "
                    "so nothing was done")
-            _note(file_id, path, ";".join(t["sidecar"] for t in takes), "",
-                  False, why)
+            for _sd in [t["sidecar"] for t in takes]:
+                _note(file_id, path, _sd, "", False, why)
             return {"ok": False, "why": why}
         # !ids means "everything except these", which is how mkvmerge spells
         # a removal: the container is copied without them.
@@ -832,6 +960,15 @@ def embed_one(file_id: int, report=None) -> dict:
     # changes - the exit code and the read-back below still decide - this only
     # gives the panel something true to draw while it waits.
     try:
+        return _embed_tail(file_id, path, takes, drops, cmd, tmp, report)
+    finally:
+        _claim.__exit__(None, None, None)
+
+
+def _embed_tail(file_id, path, takes, drops, cmd, tmp, report):
+    """The rewrite itself, so the cache claim above has one place to end."""
+    from . import fileops
+    try:
         r = _run_reporting(cmd, report)
     except Exception as e:                                       # noqa: BLE001
         fileops._quiet_remove(tmp)
@@ -842,8 +979,13 @@ def embed_one(file_id: int, report=None) -> dict:
     if r.returncode >= 2 or not os.path.exists(tmp):
         fileops._quiet_remove(tmp)
         why = (r.stderr or r.stdout or "mkvmerge failed").strip()[:300]
-        _note(file_id, path, ";".join(t["sidecar"] for t in takes), "",
-              False, why)
+        # ONE FILE PER ROW, EVEN HERE. The screen above should have caught a
+        # bad sidecar already, so reaching this means something else went
+        # wrong - but if mkvmerge named a path in its complaint, that is the
+        # one to blame, and only that one.
+        _blamed = _blame(why, [t["sidecar"] for t in takes])
+        for _sd in _blamed:
+            _note(file_id, path, _sd, "", False, why)
         return {"ok": False, "why": why}
 
     # EXIT 0 IS NOT PROOF. Read the result back and require every language to
@@ -933,6 +1075,7 @@ def candidates(limit: int = 200, force: bool = False,
                 " WHERE state IN ('queued','running')")}
     except Exception:                                            # noqa: BLE001
         pass
+    _bad = bad_sidecars()
     out = []
     total = len(rows)
     for i, r in enumerate(rows, 1):
@@ -955,6 +1098,13 @@ def candidates(limit: int = 200, force: bool = False,
         if r["id"] in _queued:
             continue
         p = plan_one(r["id"], force=force)
+        # ALREADY ASKED AND ANSWERED. A sidecar that failed on its own merits
+        # is not pending work - it is a decision waiting for Try again - and
+        # leaving it in the list meant the same two files were attempted
+        # every ten minutes, twenty times over.
+        if p.get("take") and _bad:
+            p["take"] = [t for t in p["take"]
+                         if (t.get("sidecar") or "") not in _bad]
         if p.get("take") or p.get("drop"):
             # WHICH SPINDLE IT LIVES ON, carried with the plan. The runner
             # asks the gate per disk before every file - a viewer on one is a
@@ -1002,11 +1152,21 @@ def stats() -> dict:
            "failed": 0}
     try:
         with cursor() as cur:
+            # WHAT THE LIST WILL SHOW, NOT HOW MANY TIMES IT WAS TRIED.
+            # This counted every ok=0 row ever written, and the same two
+            # broken subtitle files had been retried twenty times between
+            # them - so the header said "19 failed" over a list of one. A
+            # count and its list have to be the same number or neither can
+            # be trusted.
             r = cur.execute(
-                "SELECT SUM(ok) e, SUM(1-ok) f, COUNT(*) n "
-                "FROM subembed_log").fetchone()
+                "SELECT SUM(ok) e FROM subembed_log").fetchone()
             out["embedded"] = int((r["e"] if r else 0) or 0)
-            out["failed"] = int((r["f"] if r else 0) or 0)
+            f = cur.execute(
+                "SELECT COUNT(*) n FROM subembed_log "
+                " WHERE id IN (SELECT MAX(id) FROM subembed_log "
+                "               WHERE COALESCE(sidecar,'') != '' "
+                "               GROUP BY sidecar) AND ok = 0").fetchone()
+            out["failed"] = int((f["n"] if f else 0) or 0)
     except Exception:                                            # noqa: BLE001
         pass
     return out
@@ -1210,13 +1370,38 @@ def _plain_why(detail: str, sidecar: str = "") -> str:
     return re.sub(r"'[A-Za-z]:\\[^']*'", "that file", said)
 
 
-def _looks_broken(detail: str) -> bool:
-    """Is the SUBTITLE file itself the problem, rather than the moment?"""
+def _blame(detail: str, sidecars: list) -> list:
+    """Which of these files the message is about. All of them if it says none.
+
+    A joined list of paths is not a filename, and a failure recorded under one
+    is a failure nothing can act on.
+    """
     low = (detail or "").lower()
-    return any(b for n, _s, b in _WHY if n in low and b)
+    hit = [s for s in sidecars if s and os.path.basename(s).lower()[:60] in low]
+    return hit or list(sidecars)
 
 
-def delete_broken(file_ids) -> dict:
+def _looks_broken(detail: str) -> bool:
+    r"""Is the SUBTITLE file itself the problem, rather than the moment?
+
+    BOTH SPELLINGS OF THE SAME ANSWER. This used to read only mkvmerge's raw
+    words, which was fine while every failure was a mux failure. The check
+    that now runs BEFORE the mux writes the plain sentence straight into the
+    log instead - so the row said "the subtitle file is not readable" and this
+    said it was not the subtitle file's fault, which is the sort of
+    disagreement that turns a button into a no-op. A reason is broken if
+    either the tool's phrasing or ours says so.
+    """
+    low = (detail or "").lower()
+    for needle, said, broken in _WHY:
+        if not broken:
+            continue
+        if needle in low or said.lower() in low:
+            return True
+    return False
+
+
+def delete_broken(keys) -> dict:
     r"""Recycle subtitle files mkvmerge cannot read at all.
 
     THE SIDECAR, NEVER THE VIDEO. This only ever removes the loose subtitle
@@ -1224,37 +1409,57 @@ def delete_broken(file_ids) -> dict:
     being unreadable rather than a full disk or a locked moment - those come
     back on their own and deleting anything would be wrong.
 
+    IT WORKED ONCE AND THEN STOPPED, which was the real complaint and a real
+    bug: the failure it was reading named two paths joined with a semicolon,
+    so os.path.exists said no, and the loop stepped over it without a word.
+    Failures name one file each now, and a sidecar that has already gone is
+    counted as settled rather than skipped in silence - leaving the row on
+    screen forever was the second half of the same fault.
+
     Recycled, like everything else here, so a wrong call is a trip to the bin
     rather than a loss.
     """
     from . import fileops
-    ids = [int(i) for i in (file_ids or []) if i]
-    if not ids:
+    rows = _rows_for(keys)
+    if not rows:
         return {"ok": False, "why": "nothing chosen"}
-    gone, kept = 0, []
-    for row in failures(1000):
-        if int(row.get("file_id") or 0) not in ids:
-            continue
+    gone, already, kept = 0, 0, []
+    for row in rows:
         if not row.get("broken"):
             kept.append(row.get("sidecar_name") or "")
             continue
         p = row.get("sidecar") or ""
-        if not p or not os.path.exists(p):
+        if not p:
+            continue
+        if not os.path.exists(p):
+            # Settled, not skipped. Clear the row so the panel stops
+            # reporting a file that is not there.
+            already += 1
+            _note(int(row["file_id"] or 0), row.get("path") or "", p,
+                  row.get("lang") or "", True,
+                  "the subtitle file is already gone")
             continue
         rr = fileops.recycle(p)
         if getattr(rr, "ok", False):
             gone += 1
-            _note(int(row["file_id"]), row.get("path") or "", p,
+            _note(int(row["file_id"] or 0), row.get("path") or "", p,
                   row.get("lang") or "", True,
                   "unreadable - the subtitle file was recycled")
         else:
-            kept.append(os.path.basename(p))
-    return {"ok": True, "recycled": gone, "kept": kept,
-            "why": (f"{gone} unreadable subtitle file(s) recycled"
-                    if gone else "nothing here was the subtitle file's fault")}
+            kept.append(os.path.basename(p)
+                        + f" ({getattr(rr, 'why', '')})")
+    bits = []
+    if gone:
+        bits.append(f"{gone} unreadable subtitle file(s) recycled")
+    if already:
+        bits.append(f"{already} had already gone")
+    if kept and not gone and not already:
+        bits.append("nothing here was the subtitle file's own fault")
+    return {"ok": True, "recycled": gone, "already": already, "kept": kept,
+            "why": ", ".join(bits) or "nothing to do"}
 
 
-def failures(limit: int = 100) -> list[dict]:
+def failures(limit: int = 500) -> list[dict]:
     r"""What could not be taken in, and why - from the log, not from memory.
 
     THE PANEL SAID "2 failed" AND OFFERED NOWHERE TO LOOK. A count with no
@@ -1262,8 +1467,12 @@ def failures(limit: int = 100) -> list[dict]:
     dismissed. Every attempt has always been written to subembed_log with its
     reason; nothing read them back.
 
-    ONE ROW PER FILE, the most recent attempt. A file that failed twice and
-    then succeeded is not a failure, and the log holds all three.
+    ONE ROW PER SUBTITLE FILE, the most recent attempt at it. It used to be
+    one row per VIDEO, which sounds like the same thing and is not: an episode
+    with a broken .ass and a good .srt beside it is one video with one
+    problem, and the row that stood for both could not be acted on because
+    neither of its two buttons knew which file they meant. Brokenness belongs
+    to the subtitle file, so the row does too.
     """
     if not _READY:
         init()
@@ -1271,15 +1480,18 @@ def failures(limit: int = 100) -> list[dict]:
     try:
         with cursor() as cur:
             for r in cur.execute(
-                    "SELECT l.file_id, l.path, l.sidecar, l.lang, l.detail, "
-                    "       l.at, f.title, f.season, f.episode, f.library "
+                    "SELECT l.id, l.file_id, l.path, l.sidecar, l.lang, "
+                    "       l.detail, l.at, f.title, f.season, f.episode, "
+                    "       f.library, f.pool_disk "
                     "  FROM subembed_log l "
                     "  LEFT JOIN files f ON f.id = l.file_id "
                     " WHERE l.id IN (SELECT MAX(id) FROM subembed_log "
-                    "                 GROUP BY file_id) "
+                    "                 WHERE COALESCE(sidecar,'') != '' "
+                    "                 GROUP BY sidecar) "
                     "   AND l.ok = 0 "
                     " ORDER BY l.at DESC LIMIT ?", (int(limit),)):
                 d = dict(r)
+                d["key"] = int(d.pop("id"))
                 try:
                     from .db import display_label
                     d["label"] = (display_label(d.get("title"),
@@ -1292,35 +1504,59 @@ def failures(limit: int = 100) -> list[dict]:
                 d["why"] = _plain_why(d.get("detail") or "",
                                       d.get("sidecar") or "")
                 d["broken"] = _looks_broken(d.get("detail") or "")
+                # WHICH SPINDLE IT IS ON. The runner steers around busy disks
+                # and skips files on them, so "why has this one not been
+                # tried" and "which disk is it on" are the same question often
+                # enough that the answer belongs in the row.
+                d["disk"] = (d.pop("pool_disk", "") or "").strip()
+                if not d["disk"]:
+                    d["disk"] = (os.path.splitdrive(d.get("path") or "")[0]
+                                 or "")
+                d["gone"] = not os.path.exists(d.get("sidecar") or "")
                 out.append(d)
     except Exception:                                            # noqa: BLE001
         return out
     return out
 
 
-def retry(file_ids) -> dict:
+def _rows_for(keys) -> list[dict]:
+    """The failure rows these panel keys stand for."""
+    want = {int(k) for k in (keys or []) if str(k).strip().lstrip("-").isdigit()}
+    if not want:
+        return []
+    return [r for r in failures(5000) if int(r.get("key") or 0) in want]
+
+
+def retry(keys) -> dict:
     r"""Put failures back in the queue by forgetting they failed.
 
-    Nothing is re-run here. The sweep picks its work from what is on disk, so
-    a file only stays out of it because the log says its last attempt failed -
-    clearing that row is the whole of "try again", and it happens on the
-    runner's own schedule under the gate rather than right now on a request.
+    Nothing is re-run here. The sweep picks its work from what is on disk, and
+    now genuinely leaves a failed subtitle file alone - so clearing its rows
+    IS "try again", and it happens on the runner's own schedule under the gate
+    rather than right now on a request.
+
+    EVERY row for that subtitle file, not just the newest. Deleting only the
+    last one would uncover the one before it, which is also a failure, and the
+    button would do nothing visible.
     """
-    ids = [int(i) for i in (file_ids or []) if i]
-    if not ids:
+    rows = _rows_for(keys)
+    if not rows:
         return {"ok": False, "why": "nothing chosen"}
+    sides = sorted({r.get("sidecar") or "" for r in rows if r.get("sidecar")})
     try:
         if not _READY:
             init()
         with cursor() as cur:
-            qs = ",".join("?" * len(ids))
+            qs = ",".join("?" * len(sides))
             cur.execute(f"DELETE FROM subembed_log "
-                        f" WHERE file_id IN ({qs}) AND ok = 0", ids)
+                        f" WHERE sidecar IN ({qs}) AND ok = 0", sides)
             n = cur.rowcount or 0
     except Exception as e:                                       # noqa: BLE001
         return {"ok": False, "why": f"{type(e).__name__}: {e}"}
+    _READABLE.clear()
     return {"ok": True, "cleared": n,
-            "why": f"{len(ids)} file(s) will be tried again on the next pass"}
+            "why": f"{len(sides)} subtitle file(s) will be tried again on "
+                   f"the next pass"}
 
 
 def preview_counts(library: str, overrides: dict) -> dict:

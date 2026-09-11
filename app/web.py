@@ -7597,7 +7597,7 @@ async def api_subembed_run(limit: int = 0):
 
 
 @app.get("/api/subembed/failed")
-def api_subembed_failed(limit: int = 100):
+def api_subembed_failed(limit: int = 2000):
     """What could not be taken in, and why."""
     from . import subembed
     return {"rows": subembed.failures(limit)}
@@ -32538,6 +32538,10 @@ function idleStrip(d, opts){
   d=d||{}; opts=opts||{};
   const pct=Math.max(0,Math.min(100,d.pct||0));
   const ip=Math.max(0,Math.min(100,d.item_pct||0));
+  // ONE BAR EACH. Two files can be in flight now - never two on one disk -
+  // and a single bar labelled with the first of them would be a lie about
+  // the second.
+  const FL=(d.flight||[]);
   const head=`<div style="display:flex;gap:10px;align-items:baseline;
        flex-wrap:wrap;font-size:11.5px">
     ${d.running?'<span class="busy" style="color:var(--acc);flex:none"><span class="sp"></span></span>':''}
@@ -32545,6 +32549,7 @@ function idleStrip(d, opts){
       <span class="dim" style="font-size:10.5px">(${pct.toFixed(0)}%)</span></span>
     <span class="dim" style="flex:1 1 auto;min-width:0;overflow:hidden;
       text-overflow:ellipsis;white-space:nowrap">${esc(d.now||'')}${
+      FL.length>1?` <span style="opacity:.8">+${FL.length-1} more at once</span>`:''}${
       (d.running&&ip)?` <b style="color:#6fb0ff">${ip.toFixed(0)}%</b>`:''}${
       (d.running&&d.item_elapsed)?` <span style="opacity:.7">${
         hsDur(d.item_elapsed)} in</span>`:''}</span>
@@ -32574,6 +32579,8 @@ function idleStrip(d, opts){
        style="color:var(--ok)">${(d.secs_each||0).toFixed(1)}s</b> a file</span>`:''}
     <span title="Background work waits for anybody watching, a full encoder queue, a busy disk, a DrivePool move, or the machine itself.">${
       esc(d.cpu_line||'')}</span>
+    ${(d.lanes||1)>1?`<span title="At most this many files at a time, and never two that live on the same disk — two rewrites sharing one arm take turns and finish no sooner.">up to ${
+      fmt(d.lanes)} at once, one per disk</span>`:''}
     ${d.last_error?`<span class="err">${esc(d.last_error)}</span>`:''}
   </div>`;
   return `<div class="lkind" style="padding:8px 11px;margin:6px 0">
@@ -32581,9 +32588,13 @@ function idleStrip(d, opts){
     ${(d.running||d.total)?`<div class="hsbar${d.paused?' paused':''}"
        style="margin-top:5px" title="${fmt(d.done||0)} of ${fmt(d.total||0)} files"
        ><i style="width:${pct}%"></i></div>`:''}
-    ${(d.running&&ip)?`<div class="hsbar item"
+    ${(d.running&&FL.length)?FL.map(v=>`<div class="hsbar item"
+       title="how far through ${esc(v.now||'this file')}${
+         v.disk?' — on '+esc(v.disk):''}"><i
+       style="width:${Math.max(0,Math.min(100,v.pct||0))}%"></i></div>`).join('')
+     :((d.running&&ip)?`<div class="hsbar item"
        title="how far through ${esc(d.now||'this file')}"><i
-       style="width:${ip}%"></i></div>`:''}
+       style="width:${ip}%"></i></div>`:'')}
     ${head}${wait}${hist}</div>`;
 }
 // "in 4m" / "4m ago", for a time that may be ahead of us.
@@ -32604,7 +32615,7 @@ async function seRetry(id, btn){
   await seLoadFailed(); sePaint(true);
 }
 async function seDropBroken(btn){
-  const ids=(_seFail.rows||[]).filter(f=>f.broken).map(f=>f.file_id);
+  const ids=(_seFail.rows||[]).filter(f=>f.broken).map(f=>f.key);
   if(!ids.length) return;
   askInline(btn, `Recycle ${ids.length} unreadable subtitle file(s)? `
     +'The video is never touched, and they go to the recycle bin rather than '
@@ -32616,7 +32627,7 @@ async function seDropBroken(btn){
     });
 }
 async function seRetryAll(btn){
-  const ids=(_seFail.rows||[]).map(f=>f.file_id).join(',');
+  const ids=(_seFail.rows||[]).map(f=>f.key).join(',');
   if(!ids) return;
   askInline(btn, `Try ${(_seFail.rows||[]).length} failed file(s) again? `
     +'Nothing runs now - the record of the failure is cleared and the sweep '
@@ -32654,6 +32665,18 @@ function seWaitHtml(w){
 // SHUT BY DEFAULT, LIKE EVERY OTHER LONG LIST ON THIS PAGE. The headline count
 // is the thing worth seeing without asking; thirteen thousand rows are not.
 // Remembered per browser so opening it once does not mean opening it forever.
+// SHUT BY DEFAULT TOO, AND FOR THE SAME REASON AS ITS PARENT. A list of
+// things that went wrong is worth a glance when you go looking for it and is
+// not worth a third of the panel the rest of the time. The count stays in the
+// header either way, because that is the part you need without asking.
+function seFailShown(){
+  try{ return localStorage.getItem('nuarr.subembed.fail')==='open'; }
+  catch(e){ return false; }
+}
+function seFailShow(on){
+  try{ localStorage.setItem('nuarr.subembed.fail', on?'open':'shut'); }catch(e){}
+  sePaint(true);
+}
 function seShown(){
   try{ return localStorage.getItem('nuarr.subembed')==='open'; }
   catch(e){ return false; }
@@ -32768,15 +32791,24 @@ function sePaint(force){
   // WHAT COULD NOT BE DONE, AND A WAY TO ASK AGAIN. The header has counted
   // failures since this panel existed and offered nowhere to look at them.
   const F=(_seFail.rows||[]);
+  const Fbroken=F.filter(f=>f.broken).length;
+  const Fopen=seFailShown();
   const fail=F.length?`<div class="lkind" style="padding:8px 11px;margin:6px 0;
        border-left:3px solid var(--warn)">
-    <div style="display:flex;gap:8px;align-items:baseline;flex-wrap:wrap">
+    <div class="ckhead" style="cursor:pointer;display:flex;gap:8px;
+         align-items:baseline;flex-wrap:wrap"
+         onclick="seFailShow(${Fopen?'false':'true'})"
+         title="${Fopen?'hide':'show'} the list">
+      <span class="ccaret">${Fopen?'▾':'▸'}</span>
       <b style="font-size:11.5px;color:var(--warn)">${fmt(F.length)} could not
         be taken in</b>
-      <button class="rmb" style="margin-left:auto" onclick="seRetryAll(this)"
-        title="Forget that these failed. The sweep picks its work from what is on disk, so clearing the record IS trying again - it happens on the next pass, under the gate, not right now.">Try them again</button>
+      ${Fbroken?`<span class="dim" style="font-size:11px">${fmt(Fbroken)} of
+        them the subtitle file itself</span>`:''}
+      ${Fopen?`<button class="rmb" style="margin-left:auto"
+        onclick="event.stopPropagation();seRetryAll(this)"
+        title="Forget that these failed. The sweep picks its work from what is on disk, so clearing the record IS trying again - it happens on the next pass, under the gate, not right now.">Try them again</button>`:''}
     </div>
-    <div class="rowbox scrollbox" style="max-height:220px;margin-top:5px">
+    ${Fopen?`<div class="rowbox scrollbox" style="max-height:220px;margin-top:5px">
       <!-- FIXED LAYOUT AND A REASON THAT WRAPS. What was here printed
            mkvmerge's whole answer - version banner, #GUI#error marker,
            absolute path - clipped to one line, so what you could read was
@@ -32790,21 +32822,25 @@ function sePaint(force){
         <td style="padding:4px 6px;overflow:hidden" title="${esc(f.path||'')}">
           <b>${esc(f.label||'')}</b>
           <div class="dim" style="font-size:10px;overflow:hidden;
-            text-overflow:ellipsis;white-space:nowrap">${esc(f.sidecar_name||'')}</div></td>
+            text-overflow:ellipsis;white-space:nowrap">${esc(f.sidecar_name||'')}</div>
+          <div style="font-size:10px;display:flex;gap:6px;flex-wrap:wrap">
+            ${f.disk?`<span class="capsc" title="Which disk in the pool this episode lives on. The runner works around a disk somebody is reading from, so a file can sit here simply because its own spindle was busy.">${esc(f.disk)}</span>`:''}
+            ${f.gone?`<span class="capsc" title="The subtitle file is no longer beside the video - somebody or something has already moved it.">already gone</span>`:''}
+          </div></td>
         <td style="padding:4px 6px;white-space:normal;overflow-wrap:anywhere;
             color:${f.broken?'var(--warn)':'var(--dim)'}"
             title="${esc(f.detail||'')}">${esc(f.why||'')}</td>
         <td class="r" style="padding:4px 6px;white-space:nowrap"><button class="rmb"
-          onclick="seRetry('${f.file_id}',this)">again</button></td>
+          onclick="seRetry('${f.key}',this)">again</button></td>
       </tr>`).join('')}</table>
     </div>
-    ${F.some(f=>f.broken)?`<div class="dim" style="font-size:10.5px;margin-top:5px;
+    ${Fbroken?`<div class="dim" style="font-size:10.5px;margin-top:5px;
       display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-      <span>${fmt(F.filter(f=>f.broken).length)} of them are the subtitle file
-        itself being unreadable &mdash; trying again cannot help those.</span>
+      <span>${fmt(Fbroken)} of them are the subtitle file itself being
+        unreadable &mdash; trying again cannot help those.</span>
       <button class="rmb" onclick="seDropBroken(this)"
         title="Recycle the unreadable SUBTITLE files. Never the video, never a failure that was only a bad moment, and to the recycle bin rather than deleted.">Recycle the broken subtitle files</button>
-    </div>`:''}</div>`:'';
+    </div>`:''}`:''}</div>`:'';
   // THE NUMBER IS THE HEADLINE AND THE SWITCH IS ELSEWHERE. The rule lives in
   // the list above with every other subtitle rule; putting a second control
   // here would be two switches for one setting, which can only disagree.
@@ -32833,7 +32869,10 @@ function sePaint(force){
       <tbody>${pv.map(f=>`<tr>
         <td style="padding:3px 8px 3px 0" title="${esc(f.path||'')}"
           >${esc(String(f.path||'').split('\\').pop())}</td>
-        <td class="dim" style="padding:3px 8px 3px 0">${esc(f.library||'')}</td>
+        <td class="dim" style="padding:3px 8px 3px 0">${esc(f.library||'')}${
+          f.pool_disk?`<div style="font-size:10px;opacity:.75"
+            title="Which disk in the pool this file lives on. Files on a disk somebody is reading from are stepped over rather than waited on.">${
+            esc(f.pool_disk)}</div>`:''}</td>
         <td style="padding:3px 8px 3px 0">${(f.take||[]).map(t=>
           `<span class="capsc ok" title="${esc(t.sidecar||'')}">${
             esc(String(t.sidecar||'').split('.').pop())} ${esc(t.lang||'')}${

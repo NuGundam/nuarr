@@ -1225,20 +1225,70 @@ def cache_temp(suffix: str = "", prefix: str = "nuarr") -> str:
     return p
 
 
+# WHAT IS ABOUT TO BE WRITTEN COUNTS AS WRITTEN. free_space_gb reports what
+# the filesystem says NOW, and a 40 GB remux that started a second ago has
+# only put a few megabytes on the disk - so a second one asking "is there
+# room" gets told yes on space the first one is already spending. That was
+# harmless while exactly one thing ran at a time, and stops being harmless
+# the moment two do. A claim is held for the life of the work and released
+# whatever happens to it.
+_RESERVED: dict = {}
+_RES_N = [0]
+_RES_LOCK = None
+
+
+def _res_lock():
+    global _RES_LOCK
+    if _RES_LOCK is None:
+        import threading
+        _RES_LOCK = threading.Lock()
+    return _RES_LOCK
+
+
+def reserved_bytes() -> int:
+    return sum(_RESERVED.values())
+
+
+class cache_reserve:
+    """Hold a claim on cache space for the duration of a piece of work."""
+
+    def __init__(self, need_bytes: int = 0) -> None:
+        self.need = max(0, int(need_bytes or 0))
+        self.tok = 0
+
+    def __enter__(self):
+        with _res_lock():
+            _RES_N[0] += 1
+            self.tok = _RES_N[0]
+            _RESERVED[self.tok] = self.need
+        return self
+
+    def __exit__(self, *exc):
+        with _res_lock():
+            _RESERVED.pop(self.tok, None)
+        return False
+
+
 def cache_room(need_bytes: int = 0) -> tuple[bool, str]:
     r"""Is there space to write this, with the floor the gate uses still intact?
 
     ASKED BEFORE THE WORK, NOT AFTER. A remux that fills the cache fails at
     the last step having spent the whole read, and takes the next job's space
     with it on the way down.
+
+    AND WHAT SOMEBODY ELSE IS ALREADY SPENDING counts against it, because the
+    disk will not have told the filesystem about that yet.
     """
     free = free_space_gb(str(getattr(SETTINGS, "cache_dir", "") or ""))
+    held = reserved_bytes() / (1024 ** 3)
     floor = float(getattr(SETTINGS, "cache_min_free_gb", 0) or 0)
     want = (float(need_bytes) / (1024 ** 3)) + floor
-    if free < want:
-        return False, (f"only {free:.0f} GB free on the cache - this needs "
-                       f"{need_bytes / (1024 ** 3):.1f} GB plus the "
-                       f"{floor:.0f} GB floor")
+    if (free - held) < want:
+        return False, (f"only {max(0.0, free - held):.0f} GB free on the cache"
+                       + (f" ({held:.0f} GB of it already spoken for)"
+                          if held > 0.5 else "")
+                       + f" - this needs {need_bytes / (1024 ** 3):.1f} GB "
+                         f"plus the {floor:.0f} GB floor")
     return True, ""
 
 
