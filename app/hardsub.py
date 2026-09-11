@@ -1273,7 +1273,7 @@ def _candidates(limit: int) -> list:
     cutoff = time.time() - SETTLE_S
     with cursor() as cur:
         return [dict(r) for r in cur.execute(
-            "SELECT f.id file_id, f.path, f.library FROM files f "
+            "SELECT f.id file_id, f.path, f.library, f.pool_disk FROM files f "
             "LEFT JOIN hardsub h ON h.file_id=f.id AND h.size=f.size "
             "WHERE f.state NOT IN ('deleted','duplicate') "
             "  AND COALESCE(f.sub_langs,'')='' "
@@ -1446,6 +1446,13 @@ def stats() -> dict:
             out["marked"] = int((r["n"] if r else 0) or 0)
     except Exception:                                            # noqa: BLE001
         pass
+    # AND WHAT THE RUNNER KNOWS BETTER. STATE belongs to the button now; the
+    # sweep that runs all day is the shared runner's. See idle.merge_stats.
+    try:
+        from . import idle as _idle
+        out = _idle.merge_stats(KEY, out)
+    except Exception:                                            # noqa: BLE001
+        pass
     return out
 
 
@@ -1516,7 +1523,49 @@ def found(limit: int = 60) -> list:
     return rows
 
 
+# --------------------------------------------------------- onto the runner --
+# NINETY FILES AND THEN ASLEEP. The per-file gate check was already right -
+# see sweep() - so all that has to go is the batch and the clock. The shared
+# runner asks the same question before every file, works two at a time on
+# different spindles, and steps around a disk somebody is reading from instead
+# of stopping the pass on it.
+#
+# sweep() stays exactly as it is: it is the "check some now" button.
+KEY = "hardsub"
+TITLE = "Subtitles burned into the picture"
+
+
+def _pending() -> list:
+    """Every file that reports no subtitle track and has not been sampled."""
+    try:
+        return _candidates(100000)
+    except Exception:                                            # noqa: BLE001
+        return []
+
+
+def _do_one(r: dict, report=None) -> dict:
+    """Sample one file's frames, save the verdict, and act if auto says so."""
+    d = probe_one(r["file_id"])
+    if not d.get("ok"):
+        return {"ok": False, "why": d.get("why") or "could not sample it"}
+    _save(d)
+    if d["state"] != NONE and mode() == "auto":
+        _auto_one(r["file_id"])
+    return {"ok": True, "state": d["state"]}
+
+
+def _after(d: dict) -> None:
+    try:
+        from . import schedules
+        schedules.beat(SCHED_KEY,
+                       f"{d.get('ok') or 0} checked" if d.get("done")
+                       else "nothing left to look at")
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
 async def watch() -> None:
+    from . import idle
     try:
         from . import schedules
         schedules.register(
@@ -1524,14 +1573,14 @@ async def watch() -> None:
             CYCLE_S,
             what=f"Samples {SAMPLES} frames of each file that reports having "
                  f"no subtitle track, counts the bright pixels low in the "
-                 f"picture, and shows the best few to the OCR. {PER_RUN} "
-                 f"files a pass.")
+                 f"picture, and shows the best few to the OCR. Works "
+                 f"continuously while the box is idle rather than in batches.")
     except Exception:                                        # noqa: BLE001
         pass
     await asyncio.sleep(240)
-    while True:
-        try:
-            await sweep()
-        except Exception as e:                                   # noqa: BLE001
-            STATE["last_error"] = f"{type(e).__name__}: {e}"
-        await asyncio.sleep(CYCLE_S)
+    await idle.run(KEY, TITLE, _pending, _do_one,
+                   label=lambda r: os.path.basename(r.get("path") or "")[:120],
+                   disk_of=lambda r: r.get("pool_disk") or "",
+                   note_of=lambda r: f"sampling {SAMPLES} frames",
+                   system_name="Subtitles in the picture",
+                   goto="/settings#subs", on_pass=_after)

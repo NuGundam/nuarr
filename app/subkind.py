@@ -573,25 +573,33 @@ async def watch_auto() -> None:
 
 
 async def watch() -> None:
-    """The one schedule both readers run on."""
+    r"""Start both readers on the shared runner and get out of the way.
+
+    ONE SCHEDULE WAS THE RIGHT IDEA AND A CLOCK WAS THE WRONG MECHANISM.
+    These two answer the same question - what does this file carry - so they
+    belong on one page and under one heading, and that has not changed. What
+    has changed is that a batch and a sleep are no longer how either of them
+    is paced: they take turns here, ninety pictures then forty tracks and then
+    five minutes of nothing, on a box that is idle most of the night. Worse,
+    they took turns SEQUENTIALLY, so the track reader waited out the picture
+    sampler even when the two would have used different disks.
+    
+    Each runs on its own now, asking the gate before every file, two at a time
+    across different spindles, stepping around a disk somebody is reading
+    from. run() stays exactly as it was: it is the "check some now" button,
+    and a button is a batch by definition.
+    """
     from . import hardsub, subtitletitle as stt
     try:
         from . import schedules
         schedules.register(
             SCHED_KEY, "What subtitles does each file carry?", "Subtitles",
             CYCLE_S,
-            what=(f"Samples frames of files that report no subtitle track "
-                  f"({hardsub.PER_RUN} a pass) and reads the events of text "
-                  f"tracks whose title looks wrong ({stt.PER_RUN} a pass). "
-                  f"Both yield to the job gate before every file."))
+            what=("Samples frames of files that report no subtitle track and "
+                  "reads the events of text tracks whose title looks wrong. "
+                  "Both work continuously while the box is idle, and both "
+                  "yield to the job gate before every file."))
     except Exception:                                            # noqa: BLE001
         pass
-    STATE["due_at"] = time.time() + 240.0
-    await asyncio.sleep(240)
-    while True:
-        try:
-            await run()
-        except Exception as e:                                   # noqa: BLE001
-            STATE["last_error"] = f"{type(e).__name__}: {e}"
-            joblog.log(f"subtitle kind check: {STATE['last_error']}", "warn")
-        await asyncio.sleep(CYCLE_S)
+    STATE["due_at"] = 0.0
+    await asyncio.gather(hardsub.watch(), stt.watch())

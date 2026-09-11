@@ -178,12 +178,6 @@ def _dict_state(mod_name, key, name, where, note="", attr="") -> list:
 _SIMPLE = [
     ("audit", "audit", "Rule check", "/settings#rulecheck",
      "re-reading committed files against today's rules", "STATS"),
-    ("hardsub", "hardsub", "Subtitle kinds · picture", "/settings#subs",
-     "sampling frames for words burned into the picture", "STATE"),
-    # The sweep that READS TRACKS, not the cache of what it found.
-    ("subtitletitle", "subtitletitle", "Subtitle kinds · tracks",
-     "/settings#subs",
-     "checking cue counts against what each title claims", "INSPECT_STATE"),
     ("audiotitle", "audiotitle", "Audio titles", "/settings#alang",
      "checking track titles against the streams they describe", "_CACHE"),
     ("arrgap", "arrgap", "Missing from the arrs", "/settings#arrs",

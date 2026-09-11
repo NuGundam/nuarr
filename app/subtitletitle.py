@@ -529,27 +529,70 @@ async def _too_busy() -> bool:
         return False
 
 
+# --------------------------------------------------------- onto the runner --
+# FORTY READS AND THEN FIVE MINUTES ASLEEP. The gate check per file was
+# already here and already right; the batch and the clock are what go.
+#
+# THE LIST IS REBUILT EACH CYCLE, WHICH THIS ALREADY RELIED ON. The scan is a
+# query and costs under a second, and the runner calls pending() every time
+# the list runs out - so refresh() belongs there rather than on a timer beside
+# it.
+KEY = "subtitletitle"
+TITLE = "Subtitle titles against what the track carries"
+
+
+def _pending() -> list:
+    """Every flagged track that has not been read. Not a slice of them."""
+    try:
+        refresh()
+    except Exception:                                            # noqa: BLE001
+        pass
+    d = _CACHE.get("data") or {}
+    return [r for r in (d.get("rows") or [])
+            if r.get("unread") and r.get("mkv_id")]
+
+
+def _do_one(r: dict, report=None) -> dict:
+    """Read one track's events and judge what it actually carries."""
+    try:
+        sh = shape_of(r["file_id"], r["path"], r["track"],
+                      int(r.get("size") or 0), r["mkv_id"])
+    except Exception as e:                                       # noqa: BLE001
+        return {"ok": False, "why": f"{type(e).__name__}: {e}"}
+    # LET THE PAGE SEE IT AS IT GOES. The scan is a query and costs under a
+    # second; re-judging as each read lands is what turns "40 not read yet"
+    # into a number that visibly falls while you watch.
+    _CACHE["at"] = 0.0
+    return {"ok": True, "cleared": bool(_is_really_signs(sh))}
+
+
+def _after(d: dict) -> None:
+    _CACHE["at"] = 0.0
+    _beat(f"{d.get('done') or 0} read" if d.get("done")
+          else "nothing left to read")
+
+
 async def watch() -> None:
-    """Re-scan and read a handful, on a schedule, yielding to the gate."""
     import asyncio
+    from . import idle
     try:
         from . import schedules
         schedules.register(
             SCHED_KEY, "Subtitle titles", "Subtitles", CYCLE_S,
-            what=(f"Compares each subtitle title against the cue count in "
-                  f"its stored probe, then reads the actual events of "
-                  f"anything that looks wrong - {PER_RUN} a pass - because "
-                  f"the count alone cannot tell karaoke from dialogue."))
+            what=("Compares each subtitle title against the cue count in "
+                  "its stored probe, then reads the actual events of "
+                  "anything that looks wrong - continuously while the box is "
+                  "idle - because the count alone cannot tell karaoke from "
+                  "dialogue."))
     except Exception:                                            # noqa: BLE001
         pass
     await asyncio.sleep(300)
-    while True:
-        try:
-            await asyncio.to_thread(refresh)
-            await inspect_paced(PER_RUN)
-        except Exception as e:                                   # noqa: BLE001
-            INSPECT_STATE["last_error"] = f"{type(e).__name__}: {e}"
-        await asyncio.sleep(CYCLE_S)
+    await idle.run(KEY, TITLE, _pending, _do_one,
+                   label=lambda r: os.path.basename(r.get("path") or "")[:120],
+                   disk_of=lambda r: r.get("pool_disk") or "",
+                   note_of=lambda r: "reading the subtitle events",
+                   system_name="Subtitle titles",
+                   goto="/settings#subs", on_pass=_after)
 
 
 async def inspect_paced(limit: int = PER_RUN, force: bool = False) -> dict:
@@ -1114,6 +1157,14 @@ def progress() -> dict:
                                     unread * each if each else 0))
                           if unread else 0,
            "next_run": 0.0}
+    # AND WHAT THE RUNNER KNOWS BETTER. INSPECT_STATE is the manual button's
+    # now; the reading that runs all day is the shared runner's, and a panel
+    # reading the wrong dict says "idle" while the disks are going.
+    try:
+        from . import idle as _idle
+        out = _idle.merge_stats(KEY, out)
+    except Exception:                                            # noqa: BLE001
+        pass
     try:
         from . import schedules
         for r in (schedules.snapshot() or {}).get("rows", []):

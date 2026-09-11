@@ -754,6 +754,63 @@ def rw_by_label() -> dict:
     return out
 
 
+def merge_stats(key: str, out: dict, *, live_keys=()) -> dict:
+    r"""Overlay the runner's own progress onto a module's stats dict.
+
+    ONE LINE PER PANEL, INSTEAD OF ONE BUG PER PANEL.
+    
+    Every system that moves onto this runner leaves its old STATE dict behind
+    as a husk - true only while its manual button runs - and every panel
+    reading that husk then says "idle" while the disks are going. That is not
+    hypothetical: it is exactly what happened to the sidecar sweep, which was
+    missing from the running list for months because the list read a dict
+    nothing wrote to any more.
+    
+    So the conversion is mechanical. A module keeps its own stats() for the
+    things only it knows - how many are left, what it found, where its
+    thresholds are - and hands the dict through here for the things the runner
+    knows better: whether it is working, on what, how far through, how fast,
+    and what it is waiting for.
+    
+    The module's own values survive when the runner has nothing to say, so a
+    manual run still reports itself.
+    """
+    try:
+        p = progress(key)
+    except Exception:                                            # noqa: BLE001
+        return out
+    live = bool(p.get("running") or p.get("paused"))
+    if live or not any(out.get(k) for k in ("running",) + tuple(live_keys)):
+        out["running"] = live or bool(out.get("running"))
+    if live:
+        out["now"] = p.get("now") or out.get("now") or ""
+        out["done"] = p.get("done") or 0
+        out["total"] = p.get("total") or 0
+        out["elapsed"] = p.get("elapsed") or 0.0
+        out["rate"] = p.get("rate") or 0.0
+        out["eta"] = p.get("eta") or 0
+    # These are true whether or not it happens to be working this second.
+    out["paused"] = bool(p.get("paused"))
+    out["paused_why"] = p.get("paused_why") or ""
+    out["paused_detail"] = p.get("paused_detail") or ""
+    out["lanes"] = p.get("lanes") or 1
+    out["flight"] = p.get("flight") or []
+    out["skipped"] = p.get("skipped") or 0
+    out["skip_disks"] = p.get("skip_disks") or []
+    out["idle_why"] = p.get("idle_why") or ""
+    out["next_look"] = p.get("next_look") or 0.0
+    out["cpu_line"] = p.get("cpu_line") or ""
+    for k in ("secs_each", "last_run", "last_took", "runs"):
+        v = p.get(k)
+        if v:
+            out[k] = v
+    if p.get("last_done"):
+        out.setdefault("last_checked", p["last_done"])
+    if p.get("last_error"):
+        out["last_error"] = p["last_error"]
+    return out
+
+
 def progress(key: str) -> dict:
     r"""The shape every panel draws. Same keys for every system that adopts it."""
     d = dict(STATES.get(key) or {})
