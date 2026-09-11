@@ -435,6 +435,227 @@ async def run(key: str, title: str, pending, do_one, label=None, *,
             await asyncio.sleep(pause_s)
 
 
+# ------------------------------------- what nuarr is doing that is not a job --
+#
+# "WHAT IS NUARR DOING ON THIS SPINDLE" HAD ONE ANSWER AND IT WAS INCOMPLETE.
+#
+# The pool panel splits every disk three ways - Nuarr, viewer, system - and
+# system means "not us", which is the half the gate steers around. Only the
+# transcode queue could ever put anything in the Nuarr column, because that is
+# the only place that kept per-job byte counters. So a sidecar remux, which
+# reads a 40 GB file off NU-DRIVE-9 and writes it back, showed up as SYSTEM:
+# the panel said "no jobs here" on the disk nuarr was busy rewriting, and
+# blamed the traffic on something outside the program.
+#
+# That is not a display problem. "System" is the number the gate reacts to,
+# and a system that mistakes its own work for somebody else's will steer away
+# from a disk it is itself using, or hold the queue for a load that is its own.
+# The scanner already had this fixed by hand - a disk being walked counts as
+# ours - and every new background system would have needed the same patch.
+#
+# So there is one ledger. Anything doing real disk work outside the queue
+# claims a slot here, hands over the pid of whatever tool it spawned, and is
+# measured exactly the way a worker measures its ffmpeg: psutil io_counters,
+# same smoothing, same floor. The panel, the gate and the disk report all read
+# from it, so there is no way for them to disagree.
+TASKS: dict = {}
+_TASK_N = [0]
+_SAMPLE_AT = [0.0]
+SAMPLE_EVERY = 0.5
+IO_FLOOR = 200_000.0          # under this it is noise, same as a worker's
+
+
+class Task:
+    """One piece of background work, measured the way a job is measured."""
+
+    __slots__ = ("id", "system", "title", "now", "disk", "dest_disk", "pid",
+                 "read_bps", "write_bps", "since", "note", "pct",
+                 "_last", "_moved")
+
+    def __init__(self, system, title, now="", disk="", dest_disk="", note=""):
+        _TASK_N[0] += 1
+        self.id = _TASK_N[0]
+        self.system, self.title = str(system or ""), str(title or "")
+        self.now, self.note = str(now or ""), str(note or "")
+        self.disk, self.dest_disk = str(disk or ""), str(dest_disk or "")
+        self.pid = 0
+        self.pct = 0.0
+        self.read_bps = self.write_bps = 0.0
+        self.since = time.time()
+        self._last = None
+        self._moved = None
+
+    # The tool is spawned after the slot is claimed, so the pid arrives late.
+    def set_pid(self, pid) -> None:
+        self.pid = int(pid or 0)
+        self._last = None
+
+    def sample(self) -> None:
+        if not self.pid:
+            return
+        try:
+            import psutil
+            io = psutil.Process(self.pid).io_counters()
+        except Exception:                                        # noqa: BLE001
+            # The tool has exited. Whatever it was moving, it is not moving it
+            # now - and a rate left standing is a rate that lies.
+            self.read_bps = self.write_bps = 0.0
+            self.pid = 0
+            return
+        now = time.time()
+        if self._last:
+            t0, r0, w0 = self._last
+            dt = now - t0
+            if dt < 0.5:
+                return
+            ir = max(0.0, (io.read_bytes - r0) / dt)
+            iw = max(0.0, (io.write_bytes - w0) / dt)
+            self.read_bps = 0.3 * ir + 0.7 * (self.read_bps or ir)
+            self.write_bps = 0.3 * iw + 0.7 * (self.write_bps or iw)
+            if self.read_bps < IO_FLOOR:
+                self.read_bps = 0.0
+            if self.write_bps < IO_FLOOR:
+                self.write_bps = 0.0
+        self._last = (now, io.read_bytes, io.write_bytes)
+
+    def moved(self, copied: int, note: str = "", pct: float = -1.0) -> None:
+        r"""Bytes written by hand, for the phases that spawn no tool.
+
+        THE SECOND HALF OF A REWRITE HAS NO CHILD PROCESS. mkvmerge builds the
+        new file on the cache, and then nuarr itself copies it back onto the
+        pool - tens of gigabytes, moved by this process, with no pid of its
+        own to point psutil at. Measuring only the tool would have fixed half
+        the mislabelling and left the other half reading "system", which is
+        the half that actually lands on the media disk.
+
+        The copy already reports its progress for the commit bar; the same
+        callback carries the byte count, so the rate is a subtraction rather
+        than a new measurement.
+        """
+        now = time.time()
+        if note:
+            self.note = note
+        if pct >= 0:
+            self.pct = max(0.0, min(100.0, float(pct)))
+        if self._moved:
+            t0, b0 = self._moved
+            dt = now - t0
+            if dt < 0.5:
+                return
+            rate = max(0.0, (int(copied) - b0) / dt)
+            self.write_bps = 0.3 * rate + 0.7 * (self.write_bps or rate)
+            if self.write_bps < IO_FLOOR:
+                self.write_bps = 0.0
+        self._moved = (now, int(copied))
+
+    def close(self) -> None:
+        TASKS.pop(self.id, None)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+
+def claim(system, title, now="", disk="", dest_disk="", note="") -> Task:
+    """Register a piece of background work. Close it when it ends."""
+    t = Task(system, title, now, disk, dest_disk, note)
+    TASKS[t.id] = t
+    return t
+
+
+def _sample_all() -> list:
+    """Every live task, refreshed at most twice a second."""
+    live = list(TASKS.values())
+    now = time.time()
+    if now - _SAMPLE_AT[0] >= SAMPLE_EVERY:
+        _SAMPLE_AT[0] = now
+        for t in live:
+            try:
+                t.sample()
+            except Exception:                                    # noqa: BLE001
+                pass
+    return live
+
+
+def tasks() -> list[dict]:
+    """The same shape a worker reports itself in, so one renderer draws both."""
+    out = []
+    for t in _sample_all():
+        out.append({
+            "job_id": f"bg{t.id}", "background": True,
+            "system": t.system, "title": t.title or t.now, "file": t.now,
+            "pool": "background", "stage": t.note or t.system,
+            "stage_s": round(time.time() - t.since),
+            "elapsed_s": round(time.time() - t.since),
+            "progress": round(max(0.0, min(1.0, (t.pct or 0.0) / 100.0)), 3),
+            "paused_for_viewer": False, "paused_for_load": False,
+            "disk": t.disk, "dest_disk": t.dest_disk,
+            "read_bps": round(t.read_bps), "write_bps": round(t.write_bps),
+            "plan": t.note or "",
+        })
+    return out
+
+
+def by_disk() -> dict:
+    """{pool disk: {jobs, read_bps, write_bps, jobs_detail}} for background work."""
+    out: dict = {}
+
+    def row(lbl):
+        return out.setdefault(lbl, {"disk": lbl, "jobs": 0, "read_bps": 0.0,
+                                    "write_bps": 0.0, "jobs_detail": []})
+    for d in tasks():
+        src, dst = d["disk"], d["dest_disk"]
+        # THE READ AND THE WRITE ARE ON DIFFERENT SPINDLES FOR MOST OF THIS.
+        # A remux reads the file off the pool and writes the new one to the
+        # cache, which is deliberately not a pool disk - so during that phase
+        # there is a read to claim here and a write that belongs to a drive
+        # this panel does not draw. Claiming it anyway would credit nuarr with
+        # bytes it did not put on that spindle, and the number this subtracts
+        # from is the one the gate steers by. An empty dest means "somewhere
+        # that is not the pool", and the write is simply not claimed.
+        if src:
+            e = row(src)
+            e["read_bps"] += d["read_bps"]
+            e["jobs"] += 1
+            e["jobs_detail"].append(d)
+            if dst == src:
+                e["write_bps"] += d["write_bps"]
+        if dst and dst != src:
+            row(dst)["write_bps"] += d["write_bps"]
+    return out
+
+
+def bps_by_label() -> dict:
+    """Total bytes a second this is putting on each pool disk."""
+    out: dict = {}
+    for d in tasks():
+        rate = (d["read_bps"] or 0) + (d["write_bps"] or 0)
+        if rate <= 0:
+            continue
+        for lbl in (d["disk"], d["dest_disk"]):
+            if lbl:
+                out[lbl] = out.get(lbl, 0.0) + rate
+    return out
+
+
+def rw_by_label() -> dict:
+    """(read, write) per pool disk, split the way the transfer detector needs."""
+    out: dict = {}
+    for d in tasks():
+        r, w = float(d["read_bps"] or 0), float(d["write_bps"] or 0)
+        src, dst = d["disk"], (d["dest_disk"] or d["disk"])
+        if src:
+            a, b = out.get(src, (0.0, 0.0))
+            out[src] = (a + r, b + (w if dst == src else 0.0))
+        if dst and dst != src:
+            a, b = out.get(dst, (0.0, 0.0))
+            out[dst] = (a, b + w)
+    return out
+
+
 def progress(key: str) -> dict:
     r"""The shape every panel draws. Same keys for every system that adopts it."""
     d = dict(STATES.get(key) or {})

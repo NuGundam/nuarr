@@ -14716,10 +14716,19 @@ function jpopHtml(disk){
        jobs_detail: bd.flatMap(x=>(x.jobs_detail||[]).map(w=>Object.assign({_disk:x.disk}, w)))}
     : bd.find(x=>x.disk===disk);
   const jd=(e&&e.jobs_detail)||[];
-  if(!jd.length) return `<div class="tpop-h">${esc(disk)} <span class="dim">— Nuarr</span></div><div class="dim">no jobs here now</div>`;
+  if(!jd.length) return `<div class="tpop-h">${esc(disk)} <span class="dim">— Nuarr</span></div>`
+    + `<div class="dim">nothing of Nuarr's on this disk right now — no queued job and no background fixer</div>`;
   const stage=w=>w.paused_for_viewer?'paused for viewer':w.paused_for_load?'paused for disk load':(w.stage||'starting');
   const held=w=>w.paused_for_viewer||w.paused_for_load||/^waiting/.test(w.stage||'');
-  const head=`<div class="tpop-h">${esc(disk)} <span class="dim">— Nuarr, ${jd.length} job${jd.length===1?'':'s'}</span></div>
+  // WHAT IS ON THIS SPINDLE, IN NUARR'S NAME. Queue jobs and background
+  // fixers are both ours and are counted together - the split is said out
+  // loud because "3 jobs" on a disk with no encoder running is a sentence
+  // somebody would otherwise have to go and check.
+  const _bgN=jd.filter(w=>w.background).length, _qN=jd.length-_bgN;
+  const _what = _bgN && _qN ? `${_qN} job${_qN===1?'':'s'}, ${_bgN} background`
+              : _bgN ? `${_bgN} background task${_bgN===1?'':'s'}`
+              : `${_qN} job${_qN===1?'':'s'}`;
+  const head=`<div class="tpop-h">${esc(disk)} <span class="dim">— Nuarr, ${_what}</span></div>
     <div class="tpop-n"><b>reading</b> <span class="m-read">${mbps(e.read_bps)}</span> · <b>writing</b> <span class="m-write">${mbps(e.write_bps)}</span>${
       jd.some(held)?` · <b style="color:var(--warn)">${jd.filter(held).length} held</b>`:''}</div>`;
   const blocks=jd.map(w=>{
@@ -14740,7 +14749,9 @@ function jpopHtml(disk){
     const size=w.src_bytes?`<span class="dim">in</span> <span class="m-size">${gb(w.src_bytes)}</span>${
       (w.out_bytes||w.est_out_bytes)?` <span class="dim">→</span> <span class="m-size">${gb(w.out_bytes||0)}</span>${w.est_out_bytes?` <span class="dim">of ~${gb(w.est_out_bytes)}</span>`:''}`:''}`:'';
     return `<div class="jpop-job">
-      <div class="jpop-t"><span class="pill" style="color:${pc};border-color:${pc};font-size:9.5px;padding:0 5px">${esc(w.pool)}</span>${w._disk?` ${diskTag(w._disk)}`:''} <b>${esc(w.title||w.file)}</b></div>
+      <div class="jpop-t"><span class="pill" style="color:${pc};border-color:${pc};font-size:9.5px;padding:0 5px"
+        title="${w.background?'A background fixer — not queued, but Nuarr\'s own work and counted as such':'Which pool this job is running in'}"
+        >${esc(w.background?(w.system||'background'):w.pool)}</span>${w._disk?` ${diskTag(w._disk)}`:''} <b>${esc(w.title||w.file)}</b></div>
       ${w.plan?`<div class="dim jpop-plan">${esc(w.plan)}</div>`:''}
       <div class="bar" style="height:5px;margin:4px 0 3px"><i class="${isHeld?'held':''}" style="width:${pct.toFixed(1)}%;background-color:${col}"></i></div>
       <div class="jpop-l"><span class="m-pct" style="font-size:11px">${pct.toFixed(1)}%</span> · ${bits.join(' · ')}</div>
@@ -15031,6 +15042,11 @@ guess.">looks like data moving</span>${other.slice(0,3).map(m=>pair(m,'')).join(
       // its stage and how long it has been in it.
       const jd = (a && a.jobs_detail) || [];
       const stWord = w => w.paused_for_viewer ? 'paused for viewer' : w.paused_for_load ? 'paused for disk load'
+        // NOT A QUEUE JOB, AND NOT SOMEBODY ELSE EITHER. A background fixer
+        // has a stage and a percentage like everything else here; it simply
+        // never went through the queue, which is a fact about how it was
+        // started and not about whose work it is.
+        : w.background ? (w.stage||'working')+(w.progress?' '+Math.round(w.progress*100)+'%':'')
         : w.stage==='encoding' ? (w.pool==='passthrough'?'copying ':'encoding ')+Math.round((w.progress||0)*100)+'%'
         : (w.stage||'starting').replace(/^waiting for subtitle OCR.*/,'waiting for OCR');
       // The hover is a card (jpopShow), not a native title: a title tooltip
@@ -20096,7 +20112,8 @@ const DISK_COLORS = ['#58a6ff','#3fb950','#e3b341','#ff7b72','#d2a8ff',
 // while they were purple in the card right above. A third copy was the reason
 // to collapse them, so here it is, and the callers just ask.
 function poolColor(pool){
-  return pool==='encode'      ? 'var(--acc)'      // blue - GPU work
+  return pool==='background'  ? '#5ad1c4'         // teal - the quiet fixers
+       : pool==='encode'      ? 'var(--acc)'      // blue - GPU work
        : pool==='subocr'      ? '#b48bf2'         // purple - CPU OCR
        : pool==='handler'     ? '#d2a8ff'         // lilac - script handlers
        : pool==='passthrough' ? 'var(--ok)'       // green - stream copy

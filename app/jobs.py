@@ -5246,6 +5246,23 @@ def build_ffmpeg(src: str, dst: str, plan, duration: float,
     return a
 
 
+def _bg_io() -> tuple:
+    """(read, write) the background fixers are moving right now.
+
+    THE POOL LINE HAS THE SAME PROBLEM THE DISK ROWS HAD. It sums the workers,
+    which is every byte nuarr moves THROUGH THE QUEUE - so a sweep rewriting
+    four hundred files showed the pool as doing nothing on nuarr's behalf
+    while it did exactly that.
+    """
+    try:
+        from . import idle as _idle
+        ts = _idle.tasks()
+        return (sum(t["read_bps"] for t in ts),
+                sum(t["write_bps"] for t in ts))
+    except Exception:                                            # noqa: BLE001
+        return (0.0, 0.0)
+
+
 def _io_by_disk(workers: list["Worker"]) -> list[dict]:
     """Group live throughput by pool disk, busiest first."""
     agg: dict[str, dict] = {}
@@ -5281,6 +5298,22 @@ def _io_by_disk(workers: list["Worker"]) -> list[dict]:
             "commit_total": getattr(w, "commit_total", None),
             "plan": w.job.plan.summary() if w.job.plan else "",
         })
+    # THE QUEUE IS NOT THE ONLY THING NUARR RUNS. A background remux reads and
+    # writes exactly like a job does, and the panel this feeds has one column
+    # for "us" and one for "not us" - so leaving them out did not merely omit
+    # them, it filed them under somebody else. They arrive in the same shape,
+    # measured the same way, and merge into the same rows.
+    try:
+        from . import idle as _idle
+        for disk, e2 in (_idle.by_disk() or {}).items():
+            e = agg.setdefault(disk, {"disk": disk, "jobs": 0,
+                                      "read_bps": 0.0, "write_bps": 0.0})
+            e["jobs"] += int(e2.get("jobs") or 0)
+            e["read_bps"] += float(e2.get("read_bps") or 0)
+            e["write_bps"] += float(e2.get("write_bps") or 0)
+            e.setdefault("jobs_detail", []).extend(e2.get("jobs_detail") or [])
+    except Exception:                                            # noqa: BLE001
+        pass
     out = []
     for e in agg.values():
         e["total_bps"] = round(e["read_bps"] + e["write_bps"])
@@ -5314,9 +5347,12 @@ def live_snapshot() -> dict:
         "queued": depth,
         "overall": _overall(depth, workers),
         "io": {
-            "read_bps": round(sum(w.read_bps for w in workers)),
-            "write_bps": round(sum(w.write_bps for w in workers)),
-            "total_bps": round(sum(w.read_bps + w.write_bps for w in workers)),
+            "read_bps": round(sum(w.read_bps for w in workers)
+                              + _bg_io()[0]),
+            "write_bps": round(sum(w.write_bps for w in workers)
+                               + _bg_io()[1]),
+            "total_bps": round(sum(w.read_bps + w.write_bps for w in workers)
+                               + sum(_bg_io())),
             "by_disk": _io_by_disk(workers),
         },
         "disk_waits": _live_disk_waits(workers),
@@ -5410,9 +5446,12 @@ def snapshot(recent_limit: int = 60) -> dict:
         # total: four copies at 12 MB/s each is a saturated pool, not four slow
         # jobs, and that distinction decides whether adding workers helps.
         "io": {
-            "read_bps": round(sum(w.read_bps for w in workers)),
-            "write_bps": round(sum(w.write_bps for w in workers)),
-            "total_bps": round(sum(w.read_bps + w.write_bps for w in workers)),
+            "read_bps": round(sum(w.read_bps for w in workers)
+                              + _bg_io()[0]),
+            "write_bps": round(sum(w.write_bps for w in workers)
+                               + _bg_io()[1]),
+            "total_bps": round(sum(w.read_bps + w.write_bps for w in workers)
+                               + sum(_bg_io())),
             # PER DISK. Two jobs at 8 MB/s each on the same spindle is a
             # contended disk; the same two on different spindles is a pool
             # nowhere near its limit. The totals cannot distinguish them.

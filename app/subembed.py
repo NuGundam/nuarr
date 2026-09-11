@@ -782,7 +782,8 @@ class _Ran:
 _PROG_RE = re.compile(r"(?:#GUI#progress\s+|Progress:\s*)(\d{1,3})\s*%")
 
 
-def _run_reporting(cmd: list, report=None, timeout: int = 3600) -> _Ran:
+def _run_reporting(cmd: list, report=None, timeout: int = 3600,
+                   on_pid=None) -> _Ran:
     r"""Run mkvmerge, calling `report(pct)` as it announces its progress.
 
     STREAMED, NOT CAPTURED. subprocess.run() hands back everything at the end,
@@ -797,6 +798,15 @@ def _run_reporting(cmd: list, report=None, timeout: int = 3600) -> _Ran:
                   stdout=_sp.PIPE, stderr=_sp.PIPE, text=True,
                   encoding="utf-8", errors="replace", bufsize=1,
                   creationflags=NO_WINDOW, startupinfo=hidden_si())
+    # WHOEVER IS COUNTING THE BYTES NEEDS THE PID. A worker measures its own
+    # ffmpeg this way; there is no reason a background remux should be
+    # measured any differently, and every reason it should not be measured as
+    # "somebody else".
+    if on_pid is not None:
+        try:
+            on_pid(p.pid)
+        except Exception:                                        # noqa: BLE001
+            pass
     out: list = []
     t0 = time.time()
     try:
@@ -858,7 +868,7 @@ def _note(file_id: int, path: str, side: str, lang: str, ok: bool,
         pass
 
 
-def embed_one(file_id: int, report=None) -> dict:
+def embed_one(file_id: int, report=None, disk: str = "") -> dict:
     r"""Remux this file's eligible sidecars into it, then recycle them.
 
     ONE mkvmerge FOR ALL OF THEM. Two sidecars means two subtitle tracks and
@@ -912,6 +922,14 @@ def embed_one(file_id: int, report=None) -> dict:
     # has not finished using yet.
     _claim = fileops.cache_reserve(_size(path))
     _claim.__enter__()
+    # AND ON THE DISK PANEL, THIS IS NUARR. Claimed before the tool starts so
+    # the row says "1 job" from the first frame rather than appearing a second
+    # late; the pid arrives when mkvmerge does.
+    from . import idle as _idle
+    _work = _idle.claim("Sidecar subtitles", os.path.basename(path),
+                        now=os.path.basename(path),
+                        disk=disk or _disk_of(int(file_id)),
+                        note="taking subtitles in")
     tmp = fileops.cache_temp(".mkv", "embed")
     cmd = [_mkvmerge(), "-o", tmp]
     # WHAT THE SIDECAR REPLACES, NAMED IN MKVMERGE'S OWN NUMBERS. The plan
@@ -960,16 +978,37 @@ def embed_one(file_id: int, report=None) -> dict:
     # changes - the exit code and the read-back below still decide - this only
     # gives the panel something true to draw while it waits.
     try:
-        return _embed_tail(file_id, path, takes, drops, cmd, tmp, report)
+        return _embed_tail(file_id, path, takes, drops, cmd, tmp, report, _work)
     finally:
+        _work.close()
         _claim.__exit__(None, None, None)
 
 
-def _embed_tail(file_id, path, takes, drops, cmd, tmp, report):
+def _disk_of(file_id: int) -> str:
+    """Which pool disk this file lives on. One small read, only when asked."""
+    try:
+        with cursor() as cur:
+            r = cur.execute("SELECT pool_disk FROM files WHERE id=?",
+                            (int(file_id),)).fetchone()
+        return (r["pool_disk"] if r else "") or ""
+    except Exception:                                            # noqa: BLE001
+        return ""
+
+
+def _embed_tail(file_id, path, takes, drops, cmd, tmp, report, work=None):
     """The rewrite itself, so the cache claim above has one place to end."""
     from . import fileops
+    # ONE NUMBER, TWO PLACES. The panel's bar and the disk row's hover card
+    # are both asking how far through this file is, and asking mkvmerge twice
+    # would be two answers to one question.
+    def _rep(pct):
+        if work is not None:
+            work.pct = pct
+        if report is not None:
+            report(pct)
     try:
-        r = _run_reporting(cmd, report)
+        r = _run_reporting(cmd, (_rep if report is not None else None),
+                           on_pid=(work.set_pid if work is not None else None))
     except Exception as e:                                       # noqa: BLE001
         fileops._quiet_remove(tmp)
         return {"ok": False, "why": f"{type(e).__name__}: {e}"}
@@ -1000,7 +1039,19 @@ def _embed_tail(file_id, path, takes, drops, cmd, tmp, report):
         _note(file_id, path, "", ",".join(missing), False, why)
         return {"ok": False, "why": why}
 
-    res = fileops.safe_replace(path, tmp)
+    # AND THE COPY BACK IS OURS TOO. safe_replace already reports its
+    # progress so the queue can draw a commit bar; the same callback tells the
+    # ledger how many bytes have landed, so the second half of the rewrite
+    # stops being filed under "system" on the very disk it is landing on.
+    if work is not None:
+        work.dest_disk = work.disk
+    def _stage(what, dest, done, total):
+        if work is None:
+            return
+        work.moved(int(done or 0), note="putting it back",
+                   pct=(100.0 * (done or 0) / total) if total else -1.0)
+    res = fileops.safe_replace(path, tmp,
+                               on_stage=(_stage if work is not None else None))
     if not getattr(res, "ok", False):
         fileops._quiet_remove(tmp)
         why = f"could not put the rebuilt file in place: {getattr(res, 'why', '')}"
@@ -1660,7 +1711,8 @@ def _pending() -> list:
 
 
 def _do_one(p: dict, report=None) -> dict:
-    return embed_one(int(p["file_id"]), report=report)
+    return embed_one(int(p["file_id"]), report=report,
+                     disk=p.get("pool_disk") or "")
 
 
 async def watch() -> None:

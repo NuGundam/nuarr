@@ -2445,6 +2445,20 @@ def _our_bps_by_key() -> dict[str, float]:
                     out[k] = out.get(k, 0.0) + rate
     except Exception:
         pass
+    # AND THE WORK THAT IS NOT A JOB. A sidecar remux moves as many bytes as
+    # an encode and used to be counted as somebody else's - which is the one
+    # mistake this function exists to prevent, since "not ours" is what the
+    # gate steers around. The scanner had this patched in by hand below; every
+    # background system now answers through one ledger instead.
+    try:
+        from . import idle as _idle
+        keys = _label_keys()
+        for lbl, rate in (_idle.bps_by_label() or {}).items():
+            k = keys.get(lbl or "")
+            if k and rate > 0:
+                out[k] = out.get(k, 0.0) + rate
+    except Exception:                                            # noqa: BLE001
+        pass
     return out
 
 
@@ -2726,6 +2740,17 @@ def _our_rw_by_key() -> dict[str, tuple[float, float]]:
                 a, b = out.get(dst, (0.0, 0.0))
                 out[dst] = (a, b + wr)
     except Exception:
+        pass
+    try:
+        from . import idle as _idle
+        keys = _label_keys()
+        for lbl, (r, wr) in (_idle.rw_by_label() or {}).items():
+            k = keys.get(lbl or "")
+            if not k:
+                continue
+            a, b = out.get(k, (0.0, 0.0))
+            out[k] = (a + r, b + wr)
+    except Exception:                                            # noqa: BLE001
         pass
     return out
 
