@@ -24415,31 +24415,69 @@ function tmPaint(){
   const H = (_tm.history||{}).rows || [];
   const cores = (_tm.history||{}).cores || S.cpu_cores || 1;
   const nowMs = Date.now();
-  const procs = (me.proc_list||[]).slice();
-  // Anything that was here last time and is not here now goes to the
-  // departures board rather than simply ceasing to exist.
-  const live = new Set(procs.map(p=>p.pid));
-  for(const p of procs){
-    if(_tmPids[p.pid] === undefined) _tmPids[p.pid] = nowMs;
-    delete _tmGone[p.pid];
+
+  // ONE ROW PER PIECE OF WORK, NOT PER PID.
+  //
+  // The table was a row per process and it danced, for two reasons that look
+  // like one. Nearly everything nuarr spawns comes in pairs - an ffmpeg and
+  // the conhost Windows gives it - and an audio-language pass makes a fresh
+  // pair per file, so half the rows had a lifetime of about a second. Sorting
+  // that by a live figure then moved whatever survived, because the numbers
+  // it was sorted on change every second too.
+  //
+  // Grouping by the WORK fixes both at once: "Audio language" is one line
+  // whose count and figures change, rather than four lines that come and go.
+  // And a group only appears or disappears when the work does, which is the
+  // event actually worth animating - a per-pid fade was animating Windows
+  // bookkeeping.
+  const byWork = new Map();
+  for(const p of (me.proc_list||[])){
+    const k = p.activity || p.name || '?';
+    let g = byWork.get(k);
+    if(!g){
+      g = {key:k, n:0, cpu:0, ram:0, read:0, write:0, age:0, self:false,
+           gpu:'', low:false, exes:new Set(), details:[], pids:[]};
+      byWork.set(k, g);
+    }
+    g.n++;
+    g.cpu += p.cpu_pct||0; g.ram += p.rss_mb||0;
+    g.read += p.read_bps||0; g.write += p.write_bps||0;
+    g.age = Math.max(g.age, p.age_s||0);
+    if(p.self) g.self = true;
+    if(p.gpu && !g.gpu) g.gpu = p.gpu;
+    // ANY ONE OF THEM YIELDING MAKES THE GROUP YIELDING. It is the fact worth
+    // surfacing, and the conhost beside a demoted ffmpeg is never the one
+    // that was demoted.
+    if(p.io_prio!=null && p.io_prio<=1) g.low = true;
+    if(p.name) g.exes.add(p.name);
+    if(p.detail && !p.detail.startsWith('console for')
+       && g.details.indexOf(p.detail)<0 && g.details.length<3)
+      g.details.push(p.detail);
+    g.pids.push(p.pid);
   }
-  for(const pid in _tmPids){
-    if(!live.has(+pid) && !_tmGone[pid]){
-      const was = (_tmSeen.last||[]).find(x=>x.pid===+pid);
-      if(was) _tmGone[pid] = {row: was, at: nowMs};
-      delete _tmPids[pid];
+  // A GROUP THAT HAS GONE LINGERS; A PID THAT HAS GONE DOES NOT.
+  const liveKeys = new Set(byWork.keys());
+  for(const k of liveKeys){
+    if(_tmPids[k] === undefined) _tmPids[k] = nowMs;
+    delete _tmGone[k];
+  }
+  for(const k in _tmPids){
+    if(!liveKeys.has(k) && !_tmGone[k]){
+      const was = (_tmSeen.groups||{})[k];
+      if(was) _tmGone[k] = {row: was, at: nowMs};
+      delete _tmPids[k];
     }
   }
-  for(const pid in _tmGone){
-    if(nowMs - _tmGone[pid].at > TM_LINGER_MS) delete _tmGone[pid];
+  const groups = [...byWork.values()];
+  for(const k in _tmGone){
+    if(nowMs - _tmGone[k].at > TM_LINGER_MS) delete _tmGone[k];
   }
-  // Newest departures first, and only a few of them.
   Object.keys(_tmGone)
     .sort((a,b)=>_tmGone[b].at - _tmGone[a].at)
     .slice(0, TM_GONE_MAX)
-    .forEach(pid=>procs.push(
-      Object.assign({}, _tmGone[pid].row, {_gone: true})));
-  _tmSeen.last = (me.proc_list||[]).slice();
+    .forEach(k=>groups.push(Object.assign({}, _tmGone[k].row, {_gone:true})));
+  _tmSeen.groups = Object.fromEntries([...byWork.entries()]);
+  const procs = groups;
   const idl = _tm.idle || {}, jb = _tm.jobs || {};
 
   // ---- the four headline figures, each with its own line ------------------
@@ -24492,21 +24530,28 @@ function tmPaint(){
 
   // ---- the processes, in full ---------------------------------------------
   const val = (p,k)=>{
-    if(k==='name') return (p.activity||p.name||'').toLowerCase();
-    if(k==='what') return (p.detail||'').toLowerCase();
-    if(k==='cpu')  return p.cpu_pct||0;
-    if(k==='ram')  return p.rss_mb||0;
-    if(k==='read') return p.read_bps||0;
-    if(k==='write')return p.write_bps||0;
+    if(k==='name') return (p.key||'').toLowerCase();
+    if(k==='what') return (p.details||[]).join(' ').toLowerCase();
+    if(k==='cpu')  return p.cpu||0;
+    if(k==='ram')  return p.ram||0;
+    if(k==='read') return p.read||0;
+    if(k==='write')return p.write||0;
     if(k==='gpu')  return (p.gpu||'').toLowerCase();
-    if(k==='age')  return p.age_s||0;
+    if(k==='age')  return p.age||0;
     return 0;
   };
   procs.sort((a,b)=>{
     // Gone last, always: a departures row is a footnote, not a result.
     if(!!a._gone !== !!b._gone) return a._gone ? 1 : -1;
+    // The server first, because it is the one row that is always there and
+    // the one everything else is a child of.
+    if(!!a.self !== !!b.self) return a.self ? -1 : 1;
     const x=val(a,_tmSort.by), y=val(b,_tmSort.by);
-    return (x<y?-1:x>y?1:0)*_tmSort.dir;
+    if(x!==y) return (x<y?-1:1)*_tmSort.dir;
+    // AND A FIXED TIEBREAK, so two groups reading 0% do not swap places
+    // every second. Sorting on a live figure without one is why the table
+    // reshuffled even when nothing arrived or left.
+    return (a.key||'') < (b.key||'') ? -1 : 1;
   });
   const IOW = {0:'very low', 1:'low', 2:'normal'};
   const CPUW = {16384:'below normal', 32:'normal', 64:'idle',
@@ -24547,61 +24592,71 @@ function tmPaint(){
           letter-spacing:.05em;text-transform:uppercase;color:var(--dim)"
           title="Nuarr drops a child to very low disk priority while somebody is watching the spindle it is reading.">Priority</th>
       </tr></thead><tbody>${procs.map(p=>{
-        const share = cores ? (p.cpu_pct||0)/cores : (p.cpu_pct||0);
-        const stale = !p.self && (p.age_s||0) >= 600;
-        const low = p.io_prio!=null && p.io_prio<=1;
-        // THE FADE IS COMPUTED, NOT ANIMATED, because the table is
-        // rebuilt every second: a CSS animation would restart on every
-        // repaint and a six-second fade would never get past its first
-        // second. An elapsed time turned into an opacity does not care how
-        // often it is asked.
-        const goneMs = p._gone ? (nowMs - ((_tmGone[p.pid]||{}).at||nowMs)) : 0;
-        const newMs  = p._gone ? 0 : (nowMs - (_tmPids[p.pid]||nowMs));
-        const op = p._gone ? Math.max(0.06, 0.62*(1 - goneMs/TM_LINGER_MS))
-                 : Math.min(1, 0.25 + newMs/500);
-        const tint = (!p._gone && newMs < 1400)
-          ? `background:rgba(88,166,255,${(0.16*(1-newMs/1400)).toFixed(3)});`
-          : '';
-        const cls = p._gone ? ' tmgone' : '';
+        const share = cores ? (p.cpu||0)/cores : (p.cpu||0);
+        const stale = !p.self && (p.age||0) >= 600;
+        // A FADE YOU CAN STILL READ.
+        //
+        // The first attempt started a new row at a quarter opacity, which
+        // made the one row worth noticing the one row you could not read -
+        // and since a group now only arrives when the WORK does, an arrival
+        // is worth seeing properly rather than squinting at. So a new row
+        // comes in at full strength with a blue wash behind it that drains
+        // away, and a finished one keeps its text legible while the wash
+        // turns amber and the whole row settles down. Opacity is the last
+        // thing to move, not the first.
+        const goneMs = p._gone ? (nowMs - ((_tmGone[p.key]||{}).at||nowMs)) : 0;
+        const newMs  = p._gone ? 0 : (nowMs - (_tmPids[p.key]||nowMs));
+        const fresh = !p._gone && newMs < 2600;
+        const op = p._gone ? Math.max(0.35, 1 - 0.65*(goneMs/TM_LINGER_MS)) : 1;
+        const wash = p._gone
+          ? `background:rgba(210,153,34,${(0.13*(1-goneMs/TM_LINGER_MS)).toFixed(3)});`
+          : (fresh ? `background:rgba(88,166,255,${
+              (0.13*(1-newMs/2600)).toFixed(3)});` : '');
+        const cls = p._gone ? ' tmgone' : (fresh ? ' tmfresh' : '');
         return `<tr class="tmrow${cls}" style="border-top:1px solid var(--line);
-          opacity:${op.toFixed(3)};${tint}">
+          opacity:${op.toFixed(3)};${wash}">
         <td style="padding:4px 6px;text-align:left;overflow:hidden">
           <b style="color:${p.self?'var(--acc)':(stale?'var(--warn)':'var(--fg)')};
              display:block;overflow:hidden;text-overflow:ellipsis;
-             white-space:nowrap"
-            >${esc(p.activity||p.name||'?')}${p.self?'<span class="dim"> (the server)</span>':''}</b>
+             white-space:nowrap">${
+            p.n>1?`<span class="dim">${p.n} × </span>`:''}${esc(p.key||'?')}${
+            p.self?'<span class="dim"> (the server)</span>':''}</b>
           <div class="dim" style="font-size:10px;overflow:hidden;
-            text-overflow:ellipsis;white-space:nowrap">${esc(p.name||'')} · ${p.pid}</div></td>
+            text-overflow:ellipsis;white-space:nowrap"
+            title="${esc((p.pids||[]).join(', '))}">${
+            esc([...(p.exes||[])].join(', '))}${
+            (p.pids||[]).length===1?' · '+p.pids[0]:''}</div></td>
         <td class="dim" style="padding:4px 6px;text-align:left;
             overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
-            title="${esc(p.detail||'')}">${esc(p.detail||'')}</td>
-        <!-- A LIVE PROCESS USING ALMOST NOTHING IS USING ALMOST NOTHING,
-             WHICH IS A MEASUREMENT. Printing an em-dash there said "no
-             reading" about a figure that had been read - and on a suspended
-             encode, which is the case that matters, it hid the one number
-             that explains why nothing is happening. The dash is kept for a
-             row that has finished, where there really is nothing to read. -->
+            title="${esc((p.details||[]).join('\n'))}">${
+            p._gone?'<span style="color:var(--warn)">finished</span>'
+                   :esc((p.details||[])[0]||'')}${
+            (p.details||[]).length>1?`<span class="dim"> +${
+              (p.details||[]).length-1}</span>`:''}</td>
         <td class="c mono">${p._gone?'—'
           :(share>=0.05?share.toFixed(1)+'%':'0%')}</td>
-        <td class="c mono">${tmMb(p.rss_mb)}</td>
-        <td class="c mono" style="color:${p.read_bps?'#58a6ff':'var(--dim)'}">${tmBps(p.read_bps)}</td>
-        <td class="c mono" style="color:${p.write_bps?'#f0883e':'var(--dim)'}">${tmBps(p.write_bps)}</td>
+        <td class="c mono">${tmMb(p.ram)}</td>
+        <td class="c mono" style="color:${p.read?'#58a6ff':'var(--dim)'}">${tmBps(p.read)}</td>
+        <td class="c mono" style="color:${p.write?'#f0883e':'var(--dim)'}">${tmBps(p.write)}</td>
         <td class="c mono" style="color:${p.gpu?'#e8a33d':'var(--dim)'}"
           title="${esc(p.gpu
-            ? p.gpu+' — what this process was launched to use. Windows gives '
+            ? p.gpu+' — what this work was launched to use. Windows gives '
               +'nvidia-smi no per-process figure on this card (used_gpu_memory '
               +'reads N/A and pmon reports a dash for every engine), so this '
               +'is what it was asked to do rather than a measurement of what '
               +'it is doing. The card\'s own engine percentages are on the '
               +'Graphics chart above.'
-            : 'Nothing on this process\'s command line asks for the card.')}"
+            : 'Nothing on this work\'s command line asks for the card.')}"
           >${esc(p.gpu||'—')}</td>
         <td class="c mono ${stale?'':'dim'}" style="${stale?'color:var(--warn)':''}"
-          >${(p.age_s||0)>=60?hms(p.age_s):(p.age_s||0)+'s'}</td>
-        <td class="c mono" style="color:${low?'var(--warn)':'var(--dim)'}"
-          title="${esc('disk '+(IOW[p.io_prio]||p.io_prio||'?')+', cpu '+(CPUW[p.cpu_prio]||p.cpu_prio||'?'))}"
-          >${p._gone?'<span class="dim">finished</span>'
-            :(low?'yielding':(IOW[p.io_prio]||'—'))}</td>
+          >${(p.age||0)>=60?hms(p.age):(p.age||0)+'s'}</td>
+        <td class="c mono" style="color:${p.low?'var(--warn)':'var(--dim)'}"
+          title="${esc(p.low
+            ? 'At least one of these is at very low disk priority, because '
+              + 'somebody is watching the spindle it is reading.'
+            : 'Running at normal disk priority.')}"
+          >${p._gone?'<span class="dim">—</span>'
+            :(p.low?'yielding':'normal')}</td>
       </tr>`;}).join('')}</tbody></table></div></div>`;
 
   // ---- and what its background systems are holding -----------------------

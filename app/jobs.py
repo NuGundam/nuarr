@@ -2175,7 +2175,9 @@ IO_THROTTLED: dict = {"on": False, "procs": 0, "changed_at": 0.0,
 
 
 def _drivepool_yield(watched: set | None = None,
-                     everything: bool = False) -> None:
+                     everything: bool = False,
+                     live: set | None = None,
+                     nxt: set | None = None) -> None:
     r"""Ask DrivePool's housekeeping to step aside, or let it back up.
 
     THE SAME LEVER, POINTED THE OTHER WAY. This loop has spent years demoting
@@ -2202,8 +2204,54 @@ def _drivepool_yield(watched: set | None = None,
             return
         why, on = "", []
         if watched:
-            on = sorted(watched)[:3]
-            why = "somebody is watching " + ", ".join(on)
+            # WHICH OF THESE IS A VIEWER, AND WHICH IS SOMETHING ELSE.
+            #
+            # `watched` is the set of spindles nuarr is yielding, and three
+            # different facts get a disk into it: somebody is watching from it
+            # AND is short enough of buffer to need it; the NEXT episode is on
+            # it, so it is pre-yielded before the rollover; or a viewer left it
+            # within the hold and it is still sticky. One sentence for all
+            # three said "somebody is watching NU-DRIVE-6" about a disk nobody
+            # was watching - it was where the next episode lived - while the
+            # panel two inches away drew the viewer on NU-DRIVE-1. Two places
+            # describing the same instant have to agree, and the one that was
+            # wrong is the one that had thrown the distinction away.
+            now_l = set(live or ())
+            nxt_l = set(nxt or ()) - now_l
+            held_l = set(watched) - now_l - nxt_l
+            bits = []
+            if now_l:
+                bits.append("somebody is watching " + ", ".join(sorted(now_l)[:3]))
+            if nxt_l:
+                bits.append("the next episode is on "
+                            + ", ".join(sorted(nxt_l)[:3]))
+            if held_l and not bits:
+                # THE HELD ONES KEEP THEIR OWN REASONS. A disk still inside
+                # the ninety-second hold was either being watched or was where
+                # the next episode was going to be read from, and saying the
+                # first about the second is the whole of the bug this fixes.
+                was_v = sorted(d for d in held_l
+                               if _IO_WHY.get(d) == "viewer")
+                was_n = sorted(d for d in held_l
+                               if _IO_WHY.get(d) == "next")
+                # AND NO DEFAULT OF "VIEWER" FOR A DISK WHOSE REASON WAS
+                # NEVER RECORDED. Guessing the more alarming of two answers is
+                # how the wrong one gets printed confidently; a disk nuarr is
+                # yielding for a reason it has forgotten is described as
+                # exactly that.
+                rest = sorted(set(held_l) - set(was_v) - set(was_n))
+                if was_v:
+                    bits.append("somebody has just been watching "
+                                + ", ".join(was_v[:3]))
+                if was_n:
+                    bits.append("the next episode is on "
+                                + ", ".join(was_n[:3]))
+                if rest:
+                    bits.append("nuarr is still yielding "
+                                + ", ".join(rest[:3]))
+            on = sorted(now_l | nxt_l | held_l)[:4]
+            why = " and ".join(bits) or ("nuarr is yielding "
+                                         + ", ".join(sorted(watched)[:3]))
         elif everything:
             why = "nuarr's own work is being held for a move"
         else:
@@ -2327,6 +2375,13 @@ IO_FAST_S = 1.0
 IO_IDLE_S = 5.0
 # disk -> when a viewer was last on it
 _IO_SEEN: dict[str, float] = {}
+# ...AND WHY IT GOT IN. Two very different facts put a disk in that set - a
+# viewer who needs it, and the disk the NEXT episode sits on, pre-yielded
+# before the rollover - and once they are both in there the reason for each is
+# gone. Which is how the DrivePool panel came to say "somebody is watching
+# NU-DRIVE-6" about a disk nobody was watching: it was where the next episode
+# lived. Keeping the reason costs one dict.
+_IO_WHY: dict[str, str] = {}
 
 
 _SUSPENDED: dict[str, float] = {}      # job id -> when it was suspended
@@ -2503,12 +2558,17 @@ async def io_priority_watch() -> None:
             now = time.time()
             for d in live:
                 _IO_SEEN[d] = now
+                if d not in nxt:
+                    _IO_WHY[d] = "viewer"
+                else:
+                    _IO_WHY.setdefault(d, "next")
             # STICKY. A disk stays in the set for IO_HOLD_S after the last time
             # a viewer was on it, so the gap between two episodes never reads
             # as "nobody is watching".
             for d, t in list(_IO_SEEN.items()):
                 if now - t > IO_HOLD_S:
                     _IO_SEEN.pop(d, None)
+                    _IO_WHY.pop(d, None)
             watched = set(_IO_SEEN)
             # ...and so does anything ELSE that owns a spindle. This used to
             # ask DrivePool whether it was balancing and, if so, demote every
@@ -2596,7 +2656,8 @@ async def io_priority_watch() -> None:
                         "debug")
             # ASKED EVERY CYCLE, because the case that must not be missed
             # is DrivePool left demoted after the reason for it has gone.
-            await asyncio.to_thread(_drivepool_yield, watched, not want)
+            await asyncio.to_thread(_drivepool_yield, watched, not want,
+                                    live, nxt)
         except Exception as e:
             playing = False
             joblog.log(f"io priority: {type(e).__name__}: {e}", "debug")
