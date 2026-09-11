@@ -7212,6 +7212,45 @@ def api_audiolang_backlog():
             "usable": audiolang.usable()}
 
 
+@app.get("/api/system/history")
+def api_system_history(n: int = 0):
+    """Nuarr's own load over the last few minutes, for the task manager."""
+    from . import system
+    return system.history(max(0, min(int(n or 0), system.HIST_MAX)))
+
+
+@app.get("/api/taskmgr")
+def api_taskmgr(n: int = 300):
+    """Everything the task manager page draws, in one answer.
+
+    ONE REQUEST BECAUSE IT IS ONE PICTURE. The page shows nuarr's load, the
+    processes behind it and what its background systems have in flight, and
+    those three have to describe the same instant - three polls on three
+    clocks is how a panel ends up contradicting itself.
+    """
+    from . import system
+    out = {"at": time.time(), "sample": system.snapshot(),
+           "history": system.history(max(0, min(int(n or 0),
+                                                system.HIST_MAX)))}
+    try:
+        from . import idle
+        out["idle"] = {"systems": [idle.progress(k)
+                                   for k in sorted(idle.STATES)],
+                       "inflight": idle.inflight(),
+                       "tasks": idle.tasks()}
+    except Exception as e:                                   # noqa: BLE001
+        out["idle"] = {"error": f"{type(e).__name__}: {e}"}
+    try:
+        from . import jobs
+        live = jobs.live_snapshot() or {}
+        out["jobs"] = {"running": live.get("running") or [],
+                       "queued": live.get("queued") or 0,
+                       "io": live.get("io") or {}}
+    except Exception as e:                                   # noqa: BLE001
+        out["jobs"] = {"error": f"{type(e).__name__}: {e}"}
+    return out
+
+
 @app.get("/api/systems")
 def api_systems():
     """Every system doing work right now. One dict read each; safe to poll."""
@@ -12148,6 +12187,25 @@ button[disabled]{opacity:.5;cursor:default}
   border:1px solid var(--line);border-radius:9px;padding:9px 11px;
   box-shadow:0 12px 30px rgba(0,0,0,.6);font-size:11px;color:var(--fg);
   text-align:left;cursor:default}
+/* ---- task manager ---------------------------------------------------- */
+/* FOUR ACROSS WHERE THERE IS ROOM, TWO WHERE THERE IS NOT. The four figures
+   are read against each other - a spike in the encoder beside a flat disk
+   line is a different story from both rising - so they want to be on one
+   screen rather than stacked into a scroll. */
+.tmgrid{display:grid;gap:10px;grid-template-columns:repeat(2,minmax(0,1fr));
+  margin-bottom:10px}
+@media (min-width:1500px){ .tmgrid{grid-template-columns:repeat(4,minmax(0,1fr))} }
+.tmcard{padding:9px 12px}
+.tmhead{font-size:12px}
+.tmsub{font-size:10.5px;line-height:1.35;margin:2px 0 6px;min-height:28px}
+/* The line is given a fixed height and told to ignore its aspect ratio, so a
+   narrow column squashes it horizontally rather than shrinking it away. */
+.tmchart svg{display:block;width:100%;height:64px}
+.tmchart path{stroke-width:1.3px}
+.tmlegend{display:flex;gap:8px;align-items:baseline;font-size:10.5px;
+  margin-top:3px;font-variant-numeric:tabular-nums;flex-wrap:wrap}
+#tmPane table td.c{text-align:center}
+#tmPane .scrollbox{border-top:1px solid var(--line)}
 .procpop.open{display:block}
 .procpop table{border-collapse:collapse;width:100%}
 .procpop td{padding:3px 0;white-space:nowrap}
@@ -23670,7 +23728,8 @@ const PANE_OF = {ffmpeg:'ffPane', backup:'bkPane',  rules:'rulesPane',
                  tautulli:'tautPane',
                  ocr:'ocrPane', plexwork:'plexworkPane', ruleschk:'ruleschkPane',
                  process:'processPane', notland:'notlandPane',
-                 updates:'updPane', drivepool:'dpPane'};
+                 updates:'updPane', drivepool:'dpPane',
+                 taskmgr:'tmPane'};
 // DEEP LINKS ARE ALIASES, NOT PANES. Adding 'arrsync' to the table above as a
 // second key for 'arrsPane' blanked the Arrs page: the switcher assigned
 // display per KEY, so the second key's 'none' landed after the first key's ''
@@ -23832,6 +23891,11 @@ function wtab(which){
   const isFf = which==='ffmpeg', isBk = which==='backup', isRu = which==='rules';
   const isMk = which==='mkv', isAr = which==='arrs', isMe = which==='meta';
   const hint=document.getElementById('wtabhint');
+  if(which==='taskmgr'){
+    if(hint) hint.textContent='· task manager';
+    paneLoad('taskmgr', loadTaskmgr);
+    return;
+  }
   if(which==='gate'){
     if(hint) hint.textContent='· job gate';
     paneLoad('gate', loadGate);        // repaints #gateCfg wherever it lives
@@ -24173,6 +24237,275 @@ function dpPrioHtml(d){
         p.err?esc(p.err):'DrivePool\'s service is not running, so there is nothing to hold down.'}</div>`}
   </div>`;
 }
+// ================= TASK MANAGER ==========================================
+//
+// NUARR'S OWN COSTS, OVER TIME, IN ONE PLACE.
+//
+// The header has three bubbles - cpu, gpu, ram - and each answers "how much"
+// with a single number and a panel behind it. That is the right shape for a
+// header and the wrong shape for the question people actually arrive with,
+// which is "what has it been doing, and which part of it is expensive". A
+// number with no past cannot answer that: 6% means nothing without knowing
+// whether it has been 6% for an hour or 90% a second ago.
+//
+// EVERYTHING HERE IS NUARR'S. The machine's own totals appear only where the
+// comparison is the point - nuarr's CPU against the box's, because the gap
+// between those two is what the job gate steers on and what makes "the CPU is
+// at 97%" either alarming or irrelevant.
+let _tm = null, _tmTimer = null, _tmSort = {by:'cpu', dir:-1}, _tmSeen = {};
+
+function tmNum(v, unit){
+  return `<b class="mono">${v}</b><span class="dim">${unit||''}</span>`;
+}
+function tmBps(v){
+  v = v||0;
+  return v >= 1e6 ? (v/1e6).toFixed(1)+' MB/s'
+       : v >= 1e3 ? Math.round(v/1e3)+' KB/s' : '—';
+}
+function tmMb(v){
+  v = v||0;
+  return v >= 1024 ? (v/1024).toFixed(2)+' GB' : Math.round(v)+' MB';
+}
+// A LINE, NOT A GAUGE. Drawn as a path over the history ring rather than with
+// a chart library, because the whole figure is one polyline and pulling in a
+// dependency to draw it would cost more than the page.
+function tmChart(rows, series, opts){
+  opts = opts || {};
+  const W = 100, H = 30;                 // a viewBox; the CSS sizes it
+  const n = rows.length;
+  if(n < 2) return `<div class="dim" style="font-size:11px;padding:14px 0">
+    measuring — the first points arrive a second apart</div>`;
+  let top = opts.max || 0;
+  for(const s of series) for(const r of rows) top = Math.max(top, s.get(r)||0);
+  if(!top) top = 1;
+  const x = i => (i/(n-1))*W;
+  const y = v => H - (Math.max(0, Math.min(top, v))/top)*H;
+  // A BASELINE, SO AN EMPTY CHART READS AS EMPTY RATHER THAN BROKEN. With
+  // nothing to draw, a bare viewBox is indistinguishable from a panel that
+  // failed to render.
+  const base = `<path d="M0 ${H} L ${W} ${H}" stroke="var(--line)"
+    stroke-width="0.6" vector-effect="non-scaling-stroke" fill="none"/>`;
+  const paths = base + series.map(s=>{
+    let d = '';
+    rows.forEach((r,i)=>{ d += (i?'L':'M') + x(i).toFixed(2) + ' '
+                               + y(s.get(r)||0).toFixed(2) + ' '; });
+    const area = d + `L ${W} ${H} L 0 ${H} Z`;
+    return `${s.fill!==false?`<path d="${area}" fill="${s.colour}" opacity=".12"/>`:''}
+      <path d="${d}" fill="none" stroke="${s.colour}" stroke-width="0.9"
+        vector-effect="non-scaling-stroke" stroke-linejoin="round"/>`;
+  }).join('');
+  const last = series.map(s=>{
+    const v = s.get(rows[n-1])||0;
+    return `<span style="color:${s.colour}">${esc(s.name)} ${
+      opts.fmt?opts.fmt(v):Math.round(v)+'%'}</span>`;
+  }).join('<span class="dim"> · </span>');
+  return `<div class="tmchart">
+    <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">${paths}</svg>
+    <div class="tmlegend">${last}<span class="dim" style="margin-left:auto">${
+      opts.peak?`peak ${opts.fmt?opts.fmt(top):Math.round(top)+'%'}`:''} · ${
+      Math.round(n*(_tm&&_tm.history?_tm.history.every_s:1))}s</span></div>
+  </div>`;
+}
+function tmSortBy(k){
+  if(_tmSort.by===k) _tmSort.dir = -_tmSort.dir;
+  else { _tmSort.by = k; _tmSort.dir = (k==='name'||k==='what') ? 1 : -1; }
+  tmPaint();
+}
+async function loadTaskmgr(){
+  const el = document.getElementById('tmPane'); if(!el) return;
+  try{ _tm = await (await fetch('/api/taskmgr?n=600')).json(); }
+  catch(e){
+    if(!_tm) el.innerHTML = '<div class="dim" style="padding:14px">could not load</div>';
+    tmTick(); return;
+  }
+  tmPaint();
+  tmTick();
+}
+// HIDDEN IS NOT GONE, AND THIS PAGE IS EXPENSIVE TO ASK.
+//
+// The settings panes are all in the DOM at once and switched with display -
+// so "stop when the element disappears" would never fire, and leaving Task
+// manager for another page would leave it polling /api/taskmgr every two
+// seconds for the life of the tab. That endpoint samples the process tree and
+// asks the job pump for its live snapshot; it is exactly the kind of poll
+// that should not outlive the reason for it. Visibility is the test, the
+// browser tab's own included: a minimised window is nobody looking.
+function tmVisible(){
+  const p = document.getElementById('tmPane');
+  if(!p || document.hidden) return false;
+  return !!(p.offsetParent || p.getClientRects().length);
+}
+function tmTick(){
+  clearTimeout(_tmTimer);
+  _tmTimer = setTimeout(async ()=>{
+    if(!tmVisible()){
+      // Keep a slow heartbeat rather than stopping dead, so coming back to
+      // the page picks up again without needing the router to know about it.
+      _tmTimer = setTimeout(tmTick, 4000);
+      return;
+    }
+    try{ await loadTaskmgr(); }
+    catch(_){ tmTick(); }
+  }, 2000);
+}
+function tmPaint(){
+  const el = document.getElementById('tmPane'); if(!el || !_tm) return;
+  const S = _tm.sample || {}, me = S.nuarr || {}, g = S.gpu || {};
+  const H = (_tm.history||{}).rows || [];
+  const cores = (_tm.history||{}).cores || S.cpu_cores || 1;
+  const procs = (me.proc_list||[]).slice();
+  const idl = _tm.idle || {}, jb = _tm.jobs || {};
+
+  // ---- the four headline figures, each with its own line ------------------
+  const cards = [
+    {t:'Processor', sub:`nuarr's share of all ${cores} threads, against the
+        whole machine's — the gap between them is what the job gate steers on`,
+     html: tmChart(H, [
+       {name:'nuarr', colour:'#58a6ff', get:r=>r.cpu},
+       {name:'the box', colour:'#8b949e', get:r=>r.cpu_all, fill:false}],
+       {max:100, peak:true})},
+    {t:'Memory', sub:'resident across every process nuarr has spawned',
+     html: tmChart(H, [{name:'nuarr', colour:'#7fd18c', get:r=>r.ram_mb}],
+       {peak:true, fmt:v=>tmMb(v)})},
+    {t:'Graphics', sub:`${esc(g.name||'no card reported')} — the encoder is the
+        engine an encode actually runs on; the SM figure sits far below it`,
+     html: tmChart(H, [
+       {name:'encoder', colour:'#e8a33d', get:r=>r.enc},
+       {name:'decoder', colour:'#c98cf0', get:r=>r.dec, fill:false},
+       {name:'cores',   colour:'#5ad1c4', get:r=>r.gpu, fill:false}],
+       {max:100, peak:true})},
+    {t:'Disk', sub:`what nuarr's own processes are moving — summed from their
+        own counters, so nothing here can be somebody else's work`,
+     html: tmChart(H, [
+       {name:'read',  colour:'#58a6ff', get:r=>r.read},
+       {name:'write', colour:'#f0883e', get:r=>r.write}],
+       {peak:true, fmt:v=>tmBps(v)})},
+  ];
+  const grid = `<div class="tmgrid">${cards.map(c=>`<div class="lkind tmcard">
+      <div class="tmhead"><b>${esc(c.t)}</b></div>
+      <div class="dim tmsub">${c.sub}</div>${c.html}</div>`).join('')}</div>`;
+
+  // ---- the processes, in full ---------------------------------------------
+  const val = (p,k)=>{
+    if(k==='name') return (p.activity||p.name||'').toLowerCase();
+    if(k==='what') return (p.detail||'').toLowerCase();
+    if(k==='cpu')  return p.cpu_pct||0;
+    if(k==='ram')  return p.rss_mb||0;
+    if(k==='read') return p.read_bps||0;
+    if(k==='write')return p.write_bps||0;
+    if(k==='age')  return p.age_s||0;
+    return 0;
+  };
+  procs.sort((a,b)=>{
+    const x=val(a,_tmSort.by), y=val(b,_tmSort.by);
+    return (x<y?-1:x>y?1:0)*_tmSort.dir;
+  });
+  const IOW = {0:'very low', 1:'low', 2:'normal'};
+  const CPUW = {16384:'below normal', 32:'normal', 64:'idle',
+                32768:'above normal', 128:'high'};
+  const th=(k,t,al)=>`<th style="text-align:${al||'center'};cursor:pointer;
+      user-select:none;position:sticky;top:0;background:var(--panel);
+      border-bottom:1px solid var(--line);padding:4px 6px;font-size:10px;
+      letter-spacing:.05em;text-transform:uppercase;
+      color:${_tmSort.by===k?'var(--acc)':'var(--dim)'}"
+      onclick="tmSortBy('${k}')">${esc(t)}<span style="opacity:${
+      _tmSort.by===k?1:.25}">${_tmSort.by===k&&_tmSort.dir<0?' ▾':' ▴'}</span></th>`;
+  const ptable = `<div class="lkind" style="padding:0;overflow:hidden">
+    <div class="tmhead" style="padding:9px 12px 0"><b>Processes</b>
+      <span class="dim" style="font-weight:400"> — ${fmt(procs.length)}, named
+        by the work they are doing rather than by the executable</span></div>
+    <div class="scrollbox" style="max-height:340px;margin:6px 0 0">
+    <table style="width:100%;font-size:11.5px;border-collapse:collapse">
+      <thead><tr>${th('name','Doing what','left')}${th('what','On what','left')}
+        ${th('cpu','CPU')}${th('ram','Memory')}${th('read','Read')}
+        ${th('write','Write')}${th('age','Up')}
+        <th style="padding:4px 6px;position:sticky;top:0;background:var(--panel);
+          border-bottom:1px solid var(--line);font-size:10px;
+          letter-spacing:.05em;text-transform:uppercase;color:var(--dim)"
+          title="Nuarr drops a child to very low disk priority while somebody is watching the spindle it is reading.">Priority</th>
+      </tr></thead><tbody>${procs.map(p=>{
+        const share = cores ? (p.cpu_pct||0)/cores : (p.cpu_pct||0);
+        const stale = !p.self && (p.age_s||0) >= 600;
+        const low = p.io_prio!=null && p.io_prio<=1;
+        return `<tr style="border-top:1px solid var(--line)">
+        <td style="padding:4px 6px;text-align:left">
+          <b style="color:${p.self?'var(--acc)':(stale?'var(--warn)':'var(--fg)')}"
+            >${esc(p.activity||p.name||'?')}</b>${p.self?'<span class="dim"> (the server)</span>':''}
+          <div class="dim" style="font-size:10px">${esc(p.name||'')} · ${p.pid}</div></td>
+        <td class="dim" style="padding:4px 6px;text-align:left;
+            white-space:normal;overflow-wrap:anywhere">${esc(p.detail||'')}</td>
+        <td class="c mono">${share>=0.05?share.toFixed(1)+'%':'—'}</td>
+        <td class="c mono">${tmMb(p.rss_mb)}</td>
+        <td class="c mono" style="color:${p.read_bps?'#58a6ff':'var(--dim)'}">${tmBps(p.read_bps)}</td>
+        <td class="c mono" style="color:${p.write_bps?'#f0883e':'var(--dim)'}">${tmBps(p.write_bps)}</td>
+        <td class="c mono ${stale?'':'dim'}" style="${stale?'color:var(--warn)':''}"
+          >${(p.age_s||0)>=60?hms(p.age_s):(p.age_s||0)+'s'}</td>
+        <td class="c mono" style="color:${low?'var(--warn)':'var(--dim)'}"
+          title="${esc('disk '+(IOW[p.io_prio]||p.io_prio||'?')+', cpu '+(CPUW[p.cpu_prio]||p.cpu_prio||'?'))}"
+          >${low?'yielding':(IOW[p.io_prio]||'—')}</td>
+      </tr>`;}).join('')}</tbody></table></div></div>`;
+
+  // ---- and what its background systems are holding -----------------------
+  const inf = idl.inflight || {};
+  const sys = (idl.systems||[]).filter(x=>x.running||x.paused);
+  const work = `<div class="lkind" style="padding:9px 12px">
+    <div class="tmhead"><b>Background work</b>
+      <span class="dim" style="font-weight:400"> — ${fmt(inf.n||0)} of ${
+        fmt(inf.limit||0)} files in flight across every system${
+        (inf.disks||[]).length?`, on ${esc((inf.disks||[]).join(', '))}`:''}</span></div>
+    ${(jb.running||[]).length?`<div class="dim" style="font-size:11.5px;margin-top:4px">
+      ${fmt((jb.running||[]).length)} transcode worker${
+        (jb.running||[]).length===1?'':'s'} running · ${fmt(jb.queued||0)} queued
+      · nuarr is moving ${tmBps((jb.io||{}).read_bps)} read and ${
+        tmBps((jb.io||{}).write_bps)} written</div>`:''}
+    ${sys.length?sys.map(x=>`<div style="margin-top:6px">
+      <div style="display:flex;gap:8px;align-items:baseline;font-size:11.5px">
+        <a href="${esc(x.goto||'#')}" style="color:#6fb0ff;text-decoration:none"
+          >${esc(x.title||x.key)}</a>
+        <span class="mono dim">${fmt(x.done||0)} of ${fmt(x.total||0)}</span>
+        ${x.paused?`<span style="color:var(--warn)">paused — ${esc(x.paused_why||'')}</span>`
+          :(x.waiting_for?`<span class="dim">waiting — ${esc(x.waiting_for)}</span>`:'')}
+      </div>
+      ${(x.flight||[]).map(v=>`<div class="dim" style="font-size:10.5px;
+          margin-left:10px;overflow:hidden;text-overflow:ellipsis;
+          white-space:nowrap">${esc(v.disk||'')} · ${
+          Math.round(v.pct||0)}% · ${esc(v.now||'')}</div>`).join('')}
+    </div>`).join('')
+    :`<div class="dim" style="font-size:11.5px;margin-top:4px">Nothing in the
+      background right now. Every one of these works only while the box has
+      something to spare, so an idle list here is usually the machine being
+      busy rather than the work being done.</div>`}
+  </div>`;
+
+  const html = `<div style="padding:12px 14px 16px">
+    <div style="display:flex;gap:12px;align-items:baseline;flex-wrap:wrap;
+         margin-bottom:8px">
+      <b style="font-size:13px">Task manager</b>
+      <span class="dim" style="font-size:11.5px">nuarr only — its own
+        processor share, memory, graphics engines and disk traffic, and every
+        process it has spawned. Updated every two seconds; the lines hold the
+        last ${Math.round((H.length||0)*((_tm.history||{}).every_s||1))}
+        seconds.</span>
+      <span class="dim mono" style="margin-left:auto;font-size:11px">${
+        tmNum((me.cpu_pct||0).toFixed(1),'% cpu')} ·
+        ${tmNum(tmMb(me.ram_mb),'')} ·
+        ${tmNum(fmt(me.procs||0),' processes')}</span>
+    </div>
+    ${grid}${work}${ptable}
+  </div>`;
+  // The scroll box and the sort order have to survive a two-second repaint,
+  // so only the parts that changed are written - same rule as the sidecar
+  // panel, for the same reason.
+  if(_tmSeen.html !== html){
+    const box = el.querySelector('.scrollbox');
+    const keep = box ? box.scrollTop : 0;
+    _tmSeen.html = html;
+    el.innerHTML = html;
+    const nb = el.querySelector('.scrollbox');
+    if(nb && keep) nb.scrollTop = keep;
+  }
+}
+
 function dpPaint(disks){
   const el=document.getElementById('dpBody'); const d=_dp; if(!el||!d) return;
   // KEEP THE SCROLL. The whole body is rebuilt every two seconds during a
@@ -35894,6 +36227,12 @@ _SETTINGS_NAV = [
                       ("drivepool", "DrivePool",   "folder"),
                       ("meta", "Metadata",         "globe")]),
     ("System",     [("health", "Health checks",     "shield"),
+                    # WHAT NUARR ITSELF COSTS. The header bubbles answer "is
+                    # it busy" in one number each; this answers "with what,
+                    # and since when", which is a different question and was
+                    # only ever available by opening three popovers and
+                    # remembering what the first one said.
+                    ("taskmgr", "Task manager",      "gauge"),
                     ("libs",   "Libraries",         "folder"),
                     # Not a tool - it is where nuarr keeps its working files,
                     # which puts it with Libraries and Backup rather than
@@ -35953,6 +36292,8 @@ _SETTINGS_SHIM = """
   // inline, keyed by the nav item so two entries never share one.
   const I = (d) => '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'+d+'</svg>';
   const ICON = {
+    gauge:   I('<path d="M4 18a8 8 0 1116 0"/><path d="M12 18l4.5-5"/>'
+             + '<circle cx="12" cy="18" r="1.3"/>'),
     counts:  I('<path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/>'),
     timing:  I('<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/>'),
     gate:    I('<path d="M12 3l7 3v5c0 4.5-3 8.5-7 10-4-1.5-7-5.5-7-10V6l7-3z"/>'),

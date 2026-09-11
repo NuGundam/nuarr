@@ -27,6 +27,67 @@ _GPU_TTL = 2.0          # nvidia-smi costs ~100ms; do not run it per poll
 _LATEST: dict = {}
 SAMPLE_S = 1.0
 
+# ---------------------------------------------------------------- history ---
+#
+# A GRAPH THAT STARTS EMPTY ANSWERS NOTHING. The sampler has always kept
+# exactly one reading - the latest - which is all a gauge needs and useless to
+# a line. Opening a page and being told to wait a minute before it can show
+# you what the last minute looked like is the wrong way round: the minute has
+# already happened, and the cost of remembering it is a handful of floats a
+# second.
+#
+# Fifteen minutes at one second, which is long enough to cover a whole encode
+# commit or a sidecar remux and short enough that the whole ring is smaller
+# than one of the JSON payloads that carries it.
+#
+# NUARR'S OWN NUMBERS, BESIDE THE MACHINE'S. Both, deliberately: "nuarr is at
+# 6%" and "the box is at 97%" are different facts and the interesting thing is
+# usually the gap between them - see the CPU gate, which had to learn the same
+# lesson.
+HIST_MAX = 900
+_HIST: list = []
+
+
+def _hist_push(s: dict) -> None:
+    me = s.get("nuarr") or {}
+    g = s.get("gpu") or {}
+    io_ = s.get("cache_io") or {}
+    row = {
+        "at": round(float(s.get("at") or time.time()), 1),
+        "cpu": float(me.get("cpu_pct") or 0.0),
+        "cpu_all": float(s.get("cpu_pct") or 0.0),
+        "ram_mb": float(me.get("ram_mb") or 0.0),
+        "ram_all_pct": float(s.get("ram_pct") or 0.0),
+        "procs": int(me.get("procs") or 0),
+        "gpu": float(g.get("gpu_pct") or 0.0),
+        "enc": float(g.get("encoder_pct") or 0.0),
+        "dec": float(g.get("decoder_pct") or 0.0),
+        "gpu_mem": float(g.get("mem_used") or 0.0),
+        # THE CACHE VOLUME, which is where every encode and every remux
+        # stages its output, so it is the one disk whose figure is almost
+        # entirely nuarr's doing.
+        "cache_read": float(io_.get("read_bps") or 0.0),
+        "cache_write": float(io_.get("write_bps") or 0.0),
+        # AND NUARR'S OWN BYTES, SUMMED FROM ITS OWN PROCESSES. Not the disk
+        # counters minus a guess - the actual per-process totals this sample
+        # just differenced, which is the only figure here that cannot include
+        # somebody else's work by construction.
+        "read": float(sum(p.get("read_bps") or 0
+                          for p in (me.get("proc_list") or []))),
+        "write": float(sum(p.get("write_bps") or 0
+                           for p in (me.get("proc_list") or []))),
+    }
+    _HIST.append(row)
+    if len(_HIST) > HIST_MAX:
+        del _HIST[:len(_HIST) - HIST_MAX]
+
+
+def history(n: int = 0) -> dict:
+    """The ring, oldest first. `n` trims to the most recent n samples."""
+    rows = _HIST[-int(n):] if n else list(_HIST)
+    return {"rows": rows, "every_s": SAMPLE_S, "max": HIST_MAX,
+            "cores": psutil.cpu_count(logical=True) or 1}
+
 
 def _gpu() -> dict:
     """GPU load via nvidia-smi. Encoder utilisation is the one that matters."""
@@ -183,6 +244,10 @@ def _input_name(cmd: list) -> str:
         return os.path.basename(raw)
 
 
+# pid -> (at, read_bytes, write_bytes) for the rate above.
+_PIO: dict = {}
+
+
 def _owner(name: str, cmd: list) -> tuple[str, str]:
     r"""WHICH NUARR ACTIVITY owns this process, and what it is doing.
 
@@ -208,6 +273,14 @@ def _owner(name: str, cmd: list) -> tuple[str, str]:
                                       else "listening to a sample")
         if "-progress" in jl:
             return "Transcode", (f"encoding {what}" if what else "encoding")
+        # THE DECODE CHECK, WHICH HAD BEEN ARRIVING AS "ffmpeg". Nothing else
+        # nuarr runs decodes to nowhere: -f null with -xerror is the integrity
+        # sweep reading both ends of a file to see whether the bytes are good.
+        # A panel whose whole point is naming the work should not have two
+        # rows on it called after the executable.
+        if "-f null" in jl and "-xerror" in jl:
+            return "Does it decode?", (f"reading both ends of {what}" if what
+                                       else "reading both ends of a file")
         return "ffmpeg", what
     if low.startswith("ffprobe"):
         if "format=duration" in jl:
@@ -312,6 +385,34 @@ def _self_usage() -> dict:
             ppid = tracked.ppid()
         except psutil.Error:
             ppid = 0
+        # PER-PROCESS I/O, DIFFERENCED HERE BECAUSE THIS IS THE ONLY PLACE
+        # WITH A CLOCK. io_counters is a running total; a rate needs the
+        # previous total and the gap, and the sampler is the one thing that
+        # visits on a fixed cadence.
+        rd = wr = 0.0
+        try:
+            ioc = tracked.io_counters()
+            prev = _PIO.get(p.pid)
+            nowt = time.time()
+            if prev:
+                dt = max(0.25, nowt - prev[0])
+                rd = max(0.0, (ioc.read_bytes - prev[1]) / dt)
+                wr = max(0.0, (ioc.write_bytes - prev[2]) / dt)
+            _PIO[p.pid] = (nowt, ioc.read_bytes, ioc.write_bytes)
+        except Exception:                                    # noqa: BLE001
+            pass
+        # AND AT WHAT PRIORITY, because nuarr demotes its own children when a
+        # viewer wants their spindle and the only way to see that was to
+        # believe the panel that did it.
+        try:
+            _io = tracked.ionice()
+            _iov = int(_io) if not hasattr(_io, "value") else int(_io.value)
+        except Exception:                                    # noqa: BLE001
+            _iov = None
+        try:
+            _cpu_cls = int(tracked.nice())
+        except Exception:                                    # noqa: BLE001
+            _cpu_cls = None
         procs.append({
             "pid": p.pid,
             "ppid": ppid,
@@ -321,6 +422,10 @@ def _self_usage() -> dict:
             "rss_mb": round(m / 1024 ** 2, 1),
             "cpu_pct": round(c, 1),
             "age_s": round(age),
+            "read_bps": round(rd),
+            "write_bps": round(wr),
+            "io_prio": _iov,
+            "cpu_prio": _cpu_cls,
             "self": p.pid == me.pid,
         })
 
@@ -339,6 +444,7 @@ def _self_usage() -> dict:
     for pid in [p for p in _PROCS if p not in alive]:
         _PROCS.pop(pid, None)
         _CMD.pop(pid, None)
+        _PIO.pop(pid, None)
 
     # Heaviest first: the one worth looking at is the one using the memory.
     procs.sort(key=lambda x: (not x["self"], -x["rss_mb"]))
@@ -631,6 +737,7 @@ async def sampler() -> None:
     while True:
         try:
             _LATEST = await asyncio.to_thread(_sample)
+            _hist_push(_LATEST)
         except Exception:
             pass
         await asyncio.sleep(SAMPLE_S)
