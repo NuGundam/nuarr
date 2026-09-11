@@ -1026,6 +1026,15 @@ def mark_one(file_id: int, kind: str = "") -> dict:
                         (int(file_id),))
     except Exception:                                            # noqa: BLE001
         pass
+    # A CONFIRMATION MUST COUNT AT ONCE, the same way a dismissal does.
+    #
+    # dismiss() has always reset the garbage dictionary and the ignored-series
+    # list so the answer lands on every other finding immediately. Marking
+    # feeds the OPPOSITE dictionary - good_words() - and nothing reset it, so
+    # a confirmation sat in a two-minute cache while the panel went on scoring
+    # every other row without it. The asymmetry was invisible and wrong: both
+    # answers teach, so both have to take effect on the same breath.
+    _GOOD["at"] = 0.0
     # AND TELL THE THINGS THAT CACHE WHAT IS IN THIS FILE. mkvmerge has just
     # stream-copied the whole container to add a track and safe_replace has
     # put it where the old one was, so every stream list anybody holds for
