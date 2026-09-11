@@ -1560,8 +1560,14 @@ async def _queue_blockers_impl():
                       for p, c in caps.items()}}
 
 
+# What the file picker will offer. Video containers only - a spot check reads
+# audio tracks and subtitle tracks, and neither exists in a .nfo.
+_PICK_EXT = {".mkv", ".mp4", ".m4v", ".avi", ".mov", ".ts", ".m2ts", ".webm",
+             ".wmv", ".mpg", ".mpeg", ".flv", ".ogm", ".divx"}
+
+
 @app.get("/api/fs/folders")
-def api_fs_folders(path: str = ""):
+def api_fs_folders(path: str = "", files: int = 0):
     r"""Folders only, for the library picker.
 
     NOT "launch Explorer on the server". nuarr already learned that lesson once
@@ -1573,10 +1579,11 @@ def api_fs_folders(path: str = ""):
     So the picker browses through this instead: it works from the phone on the
     sofa exactly as it does at the console.
 
-    Directories only. It never returns file names, never reads contents, and
-    the errors it can raise are "gone" and "not allowed" - so the worst it can
-    tell an unwanted visitor is which folders exist on a machine they already
-    have the port open to.
+    Directories only BY DEFAULT, and that was the whole story until the spot
+    check needed to land on a single episode. `files=1` adds the video files
+    in the folder and nothing else - no contents, no sizes beyond what a
+    listing already gives - so the picker can be walked down to one file
+    without becoming a file server.
     """
     path = (path or "").strip()
     if not path:
@@ -1627,12 +1634,23 @@ def api_fs_folders(path: str = ""):
             raise HTTPException(404, f"{path} is not a folder")
     try:
         entries = []
+        vids = []
         with os.scandir(path) as it:
             for e in it:
                 try:
-                    if not e.is_dir(follow_symlinks=False):
-                        continue
+                    isdir = e.is_dir(follow_symlinks=False)
                 except OSError:
+                    continue
+                if not isdir:
+                    if not files:
+                        continue
+                    if os.path.splitext(e.name)[1].lower() not in _PICK_EXT:
+                        continue
+                    try:
+                        sz = e.stat().st_size
+                    except OSError:
+                        sz = 0
+                    vids.append({"name": e.name, "path": e.path, "size": sz})
                     continue
                 if e.name.startswith("$") or e.name.lower() == "system volume information":
                     continue           # noise nobody is looking for a library in
@@ -1643,10 +1661,29 @@ def api_fs_folders(path: str = ""):
     except OSError as e:
         raise HTTPException(400, f"could not read that folder: {e}")
     entries.sort(key=lambda x: x["name"].lower())
+    vids.sort(key=lambda x: x["name"].lower())
     parent = os.path.dirname(path.rstrip("\\/"))
     if parent == path or len(path.rstrip("\\/")) <= 2:
         parent = ""                    # at a drive root: up goes to the list
-    return {"path": path, "parent": parent, "folders": entries}
+    out = {"path": path, "parent": parent, "folders": entries}
+    if files:
+        # WHICH OF THEM NUARR ACTUALLY KNOWS. A spot check can only produce a
+        # finding about a file that has a row - so the picker says which ones
+        # do, rather than letting somebody pick one and be told afterwards.
+        try:
+            known = set()
+            with cursor() as cur:
+                like = path.rstrip("\\/") + os.sep + "%"
+                for r in cur.execute(
+                        "SELECT path FROM files WHERE path LIKE ? "
+                        "  AND state != 'deleted'", (like,)):
+                    known.add(os.path.normcase(os.path.normpath(r["path"])))
+            for v in vids:
+                v["known"] = os.path.normcase(os.path.normpath(v["path"])) in known
+        except Exception:                                # noqa: BLE001
+            pass
+        out["files"] = vids
+    return out
 
 
 # ---------------------------------------------------- network shares ----
@@ -6908,6 +6945,62 @@ async def api_audiolang_forget(series: str = ""):
     out = await asyncio.to_thread(audiolang.forget_series, series)
     _amemo_expire("audiolang:")
     return out
+
+
+# ------------------------------------------------- checking ONE file now ---
+# THE SWEEPS ANSWER EVENTUALLY. This answers while you are looking at it.
+#
+# Nothing below is a new detector: each calls the same function the sweep
+# calls, writes the same row to the same table, and whatever it finds appears
+# in the same panel with the same buttons. What a person gets is the choice of
+# file and a clock.
+@app.post("/api/spotcheck/audio")
+async def api_spotcheck_audio(path: str = ""):
+    """Listen to every tagged audio track in one file, now."""
+    from . import heavy, spotcheck
+
+    def _work():
+        # THE SAME ONE-AT-A-TIME RULE AS EVERY OTHER MODEL LOAD. Claimed
+        # inside the thread, because Lane is a plain context manager and the
+        # work it guards is the blocking part.
+        lane = heavy.Lane("Whisper listen")
+        with lane:
+            if not lane.got:
+                return {"ok": False,
+                        "why": f"{lane.holder} is running - engine work is "
+                               f"done one at a time. Try again when it "
+                               f"finishes."}
+            return spotcheck.check_audio(path)
+
+    async def _go():
+        try:
+            await asyncio.to_thread(_work)
+        except Exception:                                    # noqa: BLE001
+            pass
+        _amemo_expire("audiolang:")
+    asyncio.create_task(_go())
+    return {"ok": True, "started": True, "path": path}
+
+
+@app.post("/api/spotcheck/subs")
+async def api_spotcheck_subs(path: str = ""):
+    """Read one file's subtitles - its text tracks, or its picture."""
+    from . import spotcheck
+
+    async def _go():
+        try:
+            await asyncio.to_thread(spotcheck.check_subs, path)
+        except Exception:                                    # noqa: BLE001
+            pass
+    asyncio.create_task(_go())
+    return {"ok": True, "started": True, "path": path}
+
+
+@app.get("/api/spotcheck")
+def api_spotcheck_progress(kind: str = "audio"):
+    """Where the check has got to. Cheap enough to poll while it runs."""
+    from . import spotcheck
+    return spotcheck.progress(kind if kind in ("audio", "subs") else "audio")
 
 
 @app.get("/api/audiolang/auto")
@@ -29580,6 +29673,7 @@ async function loadAlang(force){
   _alFetchedAt = Date.now();
   if(_al.schedule) _al.schedule.__base = _al.server_now || 0;
   renderAlang();
+  scPaint('audio');
 }
 function alTab(t){ _alTab=t; renderAlang(); }
 
@@ -31380,6 +31474,7 @@ function skPaint(force){
         _skShowDone?'hide':'also show'} the ${fmt(c.settled)} you set by hand</a>`:''}
   </div>`;
   const html=`<div class="lkind" style="padding:11px 12px">${head}${note}${key}${band}${prog}${hist}${table}${foot}</div>`;
+  scPaint('subs');
   if(!force && (askOpen('skPanel') || panelBusy('skPanel') || panelScrolled('skPanel'))) return;
   if(html===_skKey) return;
   // A repaint you asked for keeps your place in the box.
@@ -32138,6 +32233,158 @@ async function hsMark(fid, btn){
       setTimeout(loadHardsub, 1500);
       return r.ok ? {ok:true, why:'marked'} : r;
     });
+}
+
+
+// ======================= CHECK ONE FILE ====================================
+// THE SAME PICKER AS THE LIBRARY ONE, walked one step further.
+//
+// Adding a library stops at a folder; this has to land on a file, so the same
+// /api/fs/folders is asked for files too. Everything else is deliberately
+// identical - drives with free space, stored network shares, one click to go
+// down, one to come back - because it is the same act and should not need
+// learning twice.
+//
+// A file nuarr has no row for is shown but not offered: a finding has to live
+// somewhere, and a path outside every library has no row to hang one on. Said
+// at the point of choosing rather than after the work.
+const _sc={audio:{open:false,path:'',cwd:'',list:null,busy:false,poll:null},
+           subs:{open:false,path:'',cwd:'',list:null,busy:false,poll:null}};
+function scHost(kind){ return document.getElementById('sc_'+kind); }
+function scToggle(kind){
+  const st=_sc[kind]; st.open=!st.open;
+  if(st.open && !st.list) scGo(kind,'');
+  else scPaint(kind);
+}
+async function scGo(kind, path){
+  const st=_sc[kind];
+  st.list={loading:true}; scPaint(kind);
+  try{
+    const q=new URLSearchParams({files:'1'});
+    if(path) q.set('path', path);
+    st.list=await (await fetch('/api/fs/folders?'+q)).json();
+    st.cwd=st.list.path||'';
+  }catch(e){ st.list={error:'could not read that folder'}; }
+  scPaint(kind);
+}
+function scPick(kind, path){
+  const st=_sc[kind]; st.path=path; scPaint(kind);
+}
+async function scRun(kind){
+  const st=_sc[kind];
+  if(!st.path || st.busy) return;
+  st.busy=true; scPaint(kind);
+  try{
+    await fetch('/api/spotcheck/'+(kind==='audio'?'audio':'subs')
+                +'?path='+encodeURIComponent(st.path), {method:'POST'});
+  }catch(e){}
+  scTick(kind);
+}
+// POLLED WHILE IT RUNS, and one more time after it stops - the last poll is
+// the one carrying the verdict, and stopping on the first "not running" would
+// throw it away.
+async function scTick(kind){
+  const st=_sc[kind];
+  let p=null;
+  try{ p=await (await fetch('/api/spotcheck?kind='+kind)).json(); }catch(e){}
+  st.prog=p||null;
+  if(p && p.running){
+    scPaint(kind);
+    clearTimeout(st.poll);
+    st.poll=setTimeout(()=>scTick(kind), 700);
+    return;
+  }
+  st.busy=false;
+  scPaint(kind);
+  // Whatever it found belongs in the panel, not here.
+  if(kind==='audio'){ loadAlang(true); } else { loadSubKind(true); }
+}
+function scBar(p){
+  if(!p || (!p.running && p.ok===undefined)) return '';
+  const pct=Math.max(0,Math.min(100, p.pct||0));
+  if(p.running) return `
+    <div class="hsbar" style="margin-top:6px"><i style="width:${pct}%"></i></div>
+    <div style="display:flex;gap:10px;align-items:baseline;font-size:11px;
+         margin:3px 0 0;flex-wrap:wrap">
+      <span class="busy" style="color:var(--acc);flex:none"><span class="sp"></span></span>
+      <span style="flex:none">${num(p.step||0,'done')} of ${num(p.total||0,'auto')}</span>
+      <span class="dim" style="flex:1 1 auto;min-width:0;overflow:hidden;
+        text-overflow:ellipsis;white-space:nowrap">${esc(p.now||'')}</span>
+      <span style="flex:none;margin-left:auto;display:flex;gap:10px">
+        ${p.elapsed?`<span class="dim">${hsDur(p.elapsed)} in</span>`:''}
+        ${p.eta?`<span>${numt(hsDur(p.eta))} left</span>`:''}
+      </span>
+    </div>`;
+  const good=p.ok!==false;
+  return `<div class="lkind" style="padding:7px 10px;margin-top:6px;
+       border-left:3px solid ${good?'var(--ok)':'var(--warn)'}">
+    <b style="font-size:11.5px">${esc(p.label||'')}</b>
+    <div style="font-size:11.5px;margin-top:2px;color:${
+      good?'var(--fg)':'var(--warn)'}">${esc(p.why||'')}</div>
+    ${p.took?`<div class="dim" style="font-size:10.5px;margin-top:2px">took ${
+      hsDur(p.took)}</div>`:''}
+  </div>`;
+}
+function scPaint(kind){
+  const el=scHost(kind); if(!el) return;
+  const st=_sc[kind];
+  const what=kind==='audio'
+    ? 'Listen to one file now'
+    : 'Read one file\'s subtitles now';
+  const why=kind==='audio'
+    ? 'Every tagged audio track, heard and written into the ledger. Anything that disagrees appears in the list above.'
+    : 'Its text tracks get read, or - if it reports none - its picture is sampled for words. Anything contradicted appears in the list above.';
+  if(!st.open){
+    el.innerHTML=`<div class="lkindhead ckhead" onclick="scToggle('${kind}')"
+        style="cursor:pointer" title="${esc(why)}">
+      <span class="ccaret">&#9656;</span>
+      <span class="clib">${what}</span>
+      <span class="dim">pick a file</span>
+      <span class="dim" style="margin-left:auto">${st.path?esc(st.path.split('\\').pop()):''}</span>
+    </div>`;
+    return;
+  }
+  const L=st.list||{};
+  let body='';
+  if(L.loading) body='<div class="dim" style="padding:10px">reading&hellip;</div>';
+  else if(L.error) body=`<div class="err" style="padding:10px">${esc(L.error)}</div>`;
+  else{
+    const rows=[];
+    if(st.cwd) rows.push(`<tr><td style="padding:5px 8px" colspan="2">
+      <a href="#" onclick="scGo('${kind}',${JSON.stringify(L.parent||'')
+        .replace(/"/g,'&quot;')});return false">&#8593; up</a></td></tr>`);
+    for(const f of (L.folders||[])) rows.push(`<tr>
+      <td style="padding:4px 8px"><a href="#" onclick="scGo('${kind}',${
+        JSON.stringify(f.path).replace(/"/g,'&quot;')});return false">${esc(f.name)}</a></td>
+      <td class="r dim" style="font-size:11px">${f.free?gb(f.free)+' free':''}</td></tr>`);
+    for(const f of (L.files||[])) rows.push(`<tr>
+      <td style="padding:4px 8px">${f.known
+        ? `<a href="#" onclick="scPick('${kind}',${JSON.stringify(f.path)
+            .replace(/"/g,'&quot;')});return false">${esc(f.name)}</a>`
+        : `<span class="dim" title="nuarr has no record of this file, so a finding about it would have nowhere to live">${esc(f.name)}</span>`}</td>
+      <td class="r dim" style="font-size:11px">${f.size?bytesShort(f.size):''}</td></tr>`);
+    body=`<div class="rowbox scrollbox" style="max-height:260px"><table
+      style="width:100%;font-size:12px">${rows.join('')}</table></div>`;
+  }
+  el.innerHTML=`<div class="lkind" style="padding:10px 11px">
+    <div class="lkindhead ckhead" onclick="scToggle('${kind}')" style="cursor:pointer">
+      <span class="ccaret">&#9662;</span><b style="color:#6fb0ff">${what}</b>
+      <span class="dim" style="margin-left:auto">close</span>
+    </div>
+    <div class="dim" style="font-size:11px;margin:2px 0 6px">${why}</div>
+    <div class="dim mono" style="font-size:11px;margin-bottom:4px">${
+      esc(st.cwd||'This PC')}</div>
+    ${body}
+    <div style="display:flex;gap:8px;align-items:center;margin-top:8px;
+         flex-wrap:wrap">
+      <span class="dim" style="font-size:11px;min-width:0;overflow:hidden;
+        text-overflow:ellipsis;white-space:nowrap;flex:1 1 auto">${
+        st.path?esc(st.path):'no file chosen yet'}</span>
+      <button class="rmb" ${(!st.path||st.busy)?'disabled':''}
+        onclick="scRun('${kind}')">${st.busy?'checking&hellip;':'Check this file'}</button>
+    </div>
+    ${scBar(st.prog)}
+  </div>`;
 }
 
 // ---- sidecar subtitles waiting to come inside ---------------------------
