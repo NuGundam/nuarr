@@ -6219,6 +6219,29 @@ async def api_subocr_config(body: dict = Body(...)):
     # out rather than recompute here: the panel asks within the second and the
     # count runs on its own thread, so the save still returns immediately.
     subocr._RULES_GAP["at"] = 0.0
+    # AND EVERY SYSTEM THAT READS THESE RULES IS TOLD, RATHER THAN LEFT TO
+    # FIND OUT. A rule is what decides which files these sweeps are allowed
+    # to touch, so turning one on for a second library admits thousands of
+    # files at once - and each of those systems reads its list when a pass
+    # ENDS, which on a library this size is most of a day away. Erik turned
+    # one on, watched the panel not change, and restarted nuarr; a restart
+    # worked for exactly the reason the wait would have, which is the whole
+    # tell that this was a notification problem and not a cache one.
+    #
+    # Two things go stale and both are cleared here: the walk the panel's
+    # counts come from, and the runner's own idea of what is pending.
+    try:
+        from . import subembed as _se
+        _se._WALK["at"] = 0.0
+        _se._SUM["at"] = 0.0
+    except Exception:                                    # noqa: BLE001
+        pass
+    try:
+        from . import idle as _idle
+        for _k in ("subembed", "hardsub", "subtitletitle"):
+            _idle.bump(_k)
+    except Exception:                                    # noqa: BLE001
+        pass
     out = {"ok": True, **subocr.status()}
     # "TAKES EFFECT ON THE NEXT SWEEP" INVITES THE QUESTION "WHEN IS THAT".
     # Erik asked it. The schedule registry already knows; ship the answer with
@@ -8140,6 +8163,17 @@ def _log_scan_report(rep, promoted: int, sw: dict, vm: dict, vu: dict,
         return f"{int(x or 0):,}"
 
     took = getattr(rep, "seconds", 0) or 0
+    # NEW FILES ARE NEW WORK, AND THE SWEEPS SHOULD NOT HAVE TO WAIT OUT A
+    # PASS TO HEAR ABOUT THEM. A scan is the one moment nuarr knows the
+    # library has changed; every background system reads its list when a pass
+    # ends, which can be hours. Same bell the rule save rings.
+    try:
+        from . import idle as _idle, subembed as _se
+        _se._WALK["at"] = 0.0
+        _se._SUM["at"] = 0.0
+        _idle.bump()
+    except Exception:                                    # noqa: BLE001
+        pass
     joblog.log(f"scan complete in {took:.0f}s — {n(rep.on_disk)} files on "
                f"{n(rep.disks)} disks, {n(rep.from_arrs)} tracked by the arrs",
                "ok")

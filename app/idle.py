@@ -145,6 +145,31 @@ def _fresh(key: str, title: str) -> dict:
     }
 
 
+def bump(key: str = "") -> None:
+    r"""Tell a runner - or all of them - that the work has changed.
+
+    THE LIST IS READ ONCE PER PASS, AND A PASS CAN BE HOURS.
+    
+    "No batch, no end" is the point of this runner and it has one consequence
+    nobody had asked about: pending() is called when the queue empties, so
+    everything learned between then and the end of the pass is learned late.
+    Turn a rule on for a second library and the five thousand files it just
+    admitted are invisible until the current pass drains - which on a library
+    this size is most of a day. Erik turned one on, watched the panel not
+    change, and restarted nuarr, which is the correct thing to do about
+    software that looks stuck and the wrong thing to have to do.
+    
+    A restart worked for the same reason the wait would have: it re-read the
+    list. So the fix is to let anything that CHANGES the list say so, and the
+    runner re-reads between files rather than at the end. New files from an
+    arr, a rule switched on, a retry cleared by hand - all the same event.
+    """
+    for k in ([key] if key else list(STATES)):
+        d = STATES.get(k)
+        if d is not None:
+            d["revision"] = int(d.get("revision") or 0) + 1
+
+
 def state(key: str, title: str = "") -> dict:
     d = STATES.get(key)
     if d is None:
@@ -358,10 +383,20 @@ async def run(key: str, title: str, pending, do_one, label=None, *,
             d.update(paused=False, paused_why="")
             items = await asyncio.to_thread(pending)
             if not items:
+                rev0 = int(d.get("revision") or 0)
                 d.update(running=False, now="", total=0, done=0,
                          idle_why="nothing waiting",
                          next_look=time.time() + empty_s)
-                await asyncio.sleep(empty_s)
+                # AND IT LISTENS WHILE IT WAITS. Sleeping the full five
+                # minutes after finding nothing is the other half of the same
+                # complaint: a rule turned on the second after that check is a
+                # rule that does nothing for five minutes.
+                waited = 0.0
+                while waited < empty_s:
+                    await asyncio.sleep(min(2.0, empty_s - waited))
+                    waited += 2.0
+                    if int(d.get("revision") or 0) != rev0:
+                        break
                 continue
             # THE FREE SPINDLES FIRST. A viewer on one disk used to mean the
             # runner stopped at the first file that lived there and waited
@@ -379,6 +414,7 @@ async def run(key: str, title: str, pending, do_one, label=None, *,
                             items, key=lambda x: (disk_of(x) or "") in hot)
                 except Exception:                                # noqa: BLE001
                     pass
+            rev = int(d.get("revision") or 0)
             d.update(running=True, idle_why="", total=len(items), done=0,
                      ok=0, failed=0, t0=time.time(), next_look=0.0,
                      lanes=max(1, int(lanes)), flight=[], skipped=0,
@@ -389,7 +425,8 @@ async def run(key: str, title: str, pending, do_one, label=None, *,
             halt = False
 
             def _note_item(it):
-                return {"disk": (disk_of(it) if disk_of else ""),
+                return {"item": it,
+                        "disk": (disk_of(it) if disk_of else ""),
                         "label": lab(it), "pct": 0.0, "t0": time.time()}
 
             def _show():
@@ -421,6 +458,23 @@ async def run(key: str, title: str, pending, do_one, label=None, *,
 
             while (queue or flight) and not halt:
                 # ---- fill the free lanes ------------------------------------
+                # ASKED AGAIN BECAUSE SOMEBODY SAID SO. Not on a timer -
+                # re-reading the list every few seconds would be a query per
+                # file on a forty-thousand-row walk - but the moment anything
+                # that changes the answer rings the bell.
+                if int(d.get("revision") or 0) != rev:
+                    rev = int(d.get("revision") or 0)
+                    try:
+                        fresh = await asyncio.to_thread(pending)
+                    except Exception:                            # noqa: BLE001
+                        fresh = None
+                    if fresh is not None:
+                        busy_now = {id(x) for x in
+                                    (v.get("item") for v in flight.values())
+                                    if x is not None}
+                        queue = [x for x in fresh if id(x) not in busy_now]
+                        d["total"] = d["done"] + len(flight) + len(queue)
+                        d["idle_why"] = ""
                 while len(flight) < max(1, int(lanes)) and queue and not halt:
                     # WHAT EVERY SYSTEM IS HOLDING, not just this one.
                     others = [t for t in TASKS.values()

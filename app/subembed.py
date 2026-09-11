@@ -1611,9 +1611,19 @@ def retry(keys) -> dict:
     except Exception as e:                                       # noqa: BLE001
         return {"ok": False, "why": f"{type(e).__name__}: {e}"}
     _READABLE.clear()
+    # ON THE NEXT PASS WAS TRUE AND TOO SLOW TO BE USEFUL. The runner reads
+    # its list when a pass ends, so "try again" meant "some hours from now" -
+    # and the button gave no sign of that. It rings the bell instead, and the
+    # file is back in the list within seconds.
+    _WALK["at"] = 0.0
+    _SUM["at"] = 0.0
+    try:
+        from . import idle as _idle
+        _idle.bump(KEY)
+    except Exception:                                            # noqa: BLE001
+        pass
     return {"ok": True, "cleared": n,
-            "why": f"{len(sides)} subtitle file(s) will be tried again on "
-                   f"the next pass"}
+            "why": f"{len(sides)} subtitle file(s) go back in the list now"}
 
 
 def preview_counts(library: str, overrides: dict) -> dict:
