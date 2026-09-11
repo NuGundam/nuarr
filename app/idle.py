@@ -1,0 +1,298 @@
+r"""nuarr - the shared way background fixers wait their turn.
+
+THE PROBLEM THIS REPLACES
+-------------------------
+Every system in nuarr that quietly fixes media in the background grew its own
+answer to the same two questions, and the answers did not match:
+
+    "may I run right now?"      audit._too_busy() asked the gate about Plex
+                                and counted workers; subtitletitle delegated
+                                to it; audiolang asked a third way; subembed
+                                asked nothing at all.
+    "how do I not hog the box?" a fixed batch per pass - twelve files, twenty
+                                tracks, twenty-five marks - chosen so that a
+                                bad moment could only be so bad.
+
+A FIXED BATCH IS A GUESS ABOUT A BAD MOMENT. It costs you the good ones too:
+this box is idle most of the time, and a sweep that does twelve files and then
+sleeps ten minutes leaves 434 of them waiting through an empty night. Worse,
+the batch is no protection when the moment IS bad - twelve container rewrites
+started the instant somebody presses play are still twelve.
+
+So the batch goes and the question is asked before every single item instead.
+Busy means pause, not stop; free means keep going. Work is done at whatever
+rate the machine can spare, which on an idle box is all of it and during a
+film is none.
+
+WHAT BUSY MEANS, ONCE
+---------------------
+  somebody is watching     the gate's own Plex check, not a second opinion
+  the encoders are full    four or more transcode workers running
+  a disk is saturated      the gate's per-spindle measurement, which also
+                           catches a DrivePool balance, a backup, a big copy
+  the CPU is busy          from the sampler that already runs, not a new one
+  the GPU is busy          same sampler; encoder utilisation is the figure
+                           that matters
+  DrivePool is holding     a balance or duplication pass in flight
+
+Every one of those is something nuarr ALREADY measures for another reason.
+Nothing here samples anything new, and nothing here decides "busy" differently
+from the gate - it just collects the answers in one place and says which one
+spoke, so a panel can tell you what it is waiting for rather than only that it
+is waiting.
+
+WHAT A CALLER PROVIDES
+----------------------
+    pending()   -> a list of things to do, cheap enough to call each cycle
+    do_one(x)   -> does one of them, synchronously; run on a thread here
+    label(x)    -> what to show while it is happening
+
+and gets back a progress dict of a fixed shape, so one panel renderer draws
+every system that adopts this.
+"""
+from __future__ import annotations
+
+import asyncio
+import time
+
+from . import joblog
+
+# ---------------------------------------------------------------- the lines --
+# WHERE "BUSY" STARTS. High on purpose: this is not a courtesy threshold, it
+# is the point past which one more container rewrite would be felt. A box at
+# 60% CPU has room for a stream copy; a box at 85% does not.
+CPU_BUSY_PCT = 80.0
+GPU_BUSY_PCT = 80.0
+# Four transcodes is a full house on this machine - the number the audit
+# already used for the same judgement.
+WORKERS_BUSY = 4
+# How long to wait before asking again once something said no. Long enough not
+# to poll the gate to death, short enough that a paused sweep resumes within a
+# minute of the film ending.
+PAUSE_S = 20.0
+# How long to wait when there is simply nothing to do.
+EMPTY_S = 300.0
+
+STATES: dict = {}
+
+
+def _fresh(key: str, title: str) -> dict:
+    return {
+        "key": key, "title": title,
+        "running": False, "paused": False, "paused_why": "",
+        "now": "", "done": 0, "total": 0, "ok": 0, "failed": 0,
+        "t0": 0.0, "secs_each": 0.0,
+        "last_run": 0.0, "last_done": 0, "last_took": 0.0, "runs": 0,
+        "next_look": 0.0, "idle_why": "", "last_error": "",
+    }
+
+
+def state(key: str, title: str = "") -> dict:
+    d = STATES.get(key)
+    if d is None:
+        d = STATES[key] = _fresh(key, title or key)
+    if title:
+        d["title"] = title
+    return d
+
+
+# ------------------------------------------------------------- is it busy? --
+def _machine() -> dict:
+    """CPU and GPU, from the sampler that is already running.
+
+    NEVER SAMPLES. system.snapshot() returns the last reading taken on a fixed
+    cadence; asking it to measure here would put a psutil interval or an
+    nvidia-smi launch inside a loop that runs once per file.
+    """
+    try:
+        from . import system
+        s = system.snapshot() or {}
+    except Exception:                                            # noqa: BLE001
+        return {}
+    gpu = s.get("gpu") or {}
+    # THE ENCODER FIGURE LEADS, and system.py explains why at the point it is
+    # read: NVENC sits at 99% while utilization.gpu reports 35-40%, because
+    # the encode runs on a dedicated engine the SM figure does not cover.
+    # Taking the higher of the two means neither can hide a busy card.
+    g = 0.0
+    for k in ("encoder_pct", "gpu_pct"):
+        try:
+            v = gpu.get(k)
+            if v is not None:
+                g = max(g, float(v))
+        except Exception:                                        # noqa: BLE001
+            pass
+    return {"cpu": float(s.get("cpu_pct") or 0.0), "gpu": g}
+
+
+async def busy() -> dict:
+    r"""May a background fixer do one more thing right now, and if not, why.
+
+    ORDERED BY WHO IS WAITING. A person watching something comes first, then
+    the work nuarr has already committed to, then the hardware. The first
+    answer wins and the rest are not asked - they all mean the same thing to
+    the caller, and the reason it shows should be the one a person would
+    give.
+    """
+    # 1. somebody is watching
+    # ON A THREAD, AND NOT AWAITED. check_plex is a SYNCHRONOUS function that
+    # makes an httpx call with a ten-second timeout, and it returns a Reason
+    # dataclass. audit._too_busy has been writing `await gate.check_plex()`
+    # since it was written - awaiting a dataclass raises TypeError, the bare
+    # except swallowed it, and the Plex half of that check has therefore never
+    # once fired. subtitletitle delegates to it, so "yield before every file"
+    # was only ever counting workers.
+    try:
+        from . import gate
+        st = await asyncio.to_thread(gate.check_plex)
+        if st is not None and getattr(st, "blocked", False):
+            return {"busy": True, "why": "somebody is watching",
+                    "detail": getattr(st, "detail", "") or ""}
+    except Exception:                                            # noqa: BLE001
+        pass
+    # 2. the encoders are full
+    try:
+        from . import jobs
+        live = jobs.live_snapshot() or {}
+        n = len([w for w in (live.get("workers") or [])
+                 if (w or {}).get("state") == "running"])
+        if n >= WORKERS_BUSY:
+            return {"busy": True, "why": f"{n} transcodes are running",
+                    "detail": "the encoders and the disks they read are "
+                              "already carrying everything they can"}
+    except Exception:                                            # noqa: BLE001
+        pass
+    # 3. a disk is saturated - a balance, a backup, a copy, anything
+    try:
+        from . import gate
+        st = await asyncio.to_thread(gate.check_disk_activity)
+        if st and getattr(st, "blocked", False):
+            return {"busy": True, "why": "a disk is busy",
+                    "detail": getattr(st, "detail", "") or ""}
+    except Exception:                                            # noqa: BLE001
+        pass
+    # 4. DrivePool is moving things about
+    try:
+        from . import drivepool
+        # "jobs" is the toggle that means file work - there is no separate
+        # one for background fixers, and inventing a fourth kind would be a
+        # switch nobody knows to set.
+        held, why = drivepool.hold("jobs")
+        if held:
+            return {"busy": True, "why": "DrivePool is working",
+                    "detail": why or ""}
+    except Exception:                                            # noqa: BLE001
+        pass
+    # 5. the hardware itself
+    m = _machine()
+    if m.get("cpu", 0) >= CPU_BUSY_PCT:
+        return {"busy": True, "why": f"the CPU is at {m['cpu']:.0f}%",
+                "detail": f"background work waits above {CPU_BUSY_PCT:.0f}%"}
+    if m.get("gpu", 0) >= GPU_BUSY_PCT:
+        return {"busy": True, "why": f"the GPU is at {m['gpu']:.0f}%",
+                "detail": f"background work waits above {GPU_BUSY_PCT:.0f}%"}
+    return {"busy": False, "why": "", "detail": "",
+            "cpu": m.get("cpu", 0), "gpu": m.get("gpu", 0)}
+
+
+# ------------------------------------------------------------- the runner ---
+async def run(key: str, title: str, pending, do_one, label=None, *,
+              empty_s: float = EMPTY_S, pause_s: float = PAUSE_S,
+              system_name: str = "") -> None:
+    r"""Work through `pending()` for as long as the machine can spare it.
+
+    NO BATCH, NO END. This is a loop that lives for the life of the process:
+    it does one item, asks again, does the next. There is nothing to tune -
+    the machine's own state is the throttle, and on an idle box that means it
+    simply finishes.
+
+    THE QUESTION IS ASKED BEFORE EVERY ITEM, not once per pass. A pass that
+    lasts an hour and checks once at the start is a pass that ignores anybody
+    who sits down to watch something in the other fifty-nine minutes.
+    """
+    d = state(key, title)
+    lab = label or (lambda x: str(x))
+    while True:
+        try:
+            b = await busy()
+            if b["busy"]:
+                d.update(running=False, paused=True,
+                         paused_why=b["why"], now="")
+                await asyncio.sleep(pause_s)
+                continue
+            d.update(paused=False, paused_why="")
+            items = await asyncio.to_thread(pending)
+            if not items:
+                d.update(running=False, now="", total=0, done=0,
+                         idle_why="nothing waiting",
+                         next_look=time.time() + empty_s)
+                await asyncio.sleep(empty_s)
+                continue
+            d.update(running=True, idle_why="", total=len(items), done=0,
+                     ok=0, failed=0, t0=time.time(), next_look=0.0)
+            for it in items:
+                b = await busy()
+                if b["busy"]:
+                    # PAUSED, NOT FAILED. The rest of the list is still
+                    # pending and will be picked up the moment the box is
+                    # free - there is nothing to resume because nothing was
+                    # half-done.
+                    d.update(running=False, paused=True,
+                             paused_why=b["why"], now="")
+                    break
+                d["now"] = lab(it)
+                t_item = time.time()
+                try:
+                    res = await asyncio.to_thread(do_one, it)
+                    good = bool((res or {}).get("ok", True))
+                except Exception as e:                           # noqa: BLE001
+                    good, res = False, None
+                    d["last_error"] = f"{type(e).__name__}: {e}"
+                d["done"] += 1
+                d["ok" if good else "failed"] += 1
+                # SMOOTHED, because one enormous remux should move the
+                # estimate without owning it.
+                took = max(0.001, time.time() - t_item)
+                prev = d.get("secs_each") or 0.0
+                d["secs_each"] = took if not prev else prev * .7 + took * .3
+            else:
+                # The list finished rather than being interrupted.
+                d.update(running=False, now="",
+                         last_run=time.time(), last_done=d["done"],
+                         last_took=round(time.time() - d["t0"], 1),
+                         runs=(d.get("runs") or 0) + 1)
+                if d["done"]:
+                    joblog.log(
+                        f"{title}: {d['ok']} done"
+                        + (f", {d['failed']} could not be" if d["failed"]
+                           else "")
+                        + f" in {round(time.time() - d['t0'])}s",
+                        "warn" if d["failed"] else "info",
+                        system=system_name or key)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:                                   # noqa: BLE001
+            d["last_error"] = f"{type(e).__name__}: {e}"
+            await asyncio.sleep(pause_s)
+
+
+def progress(key: str) -> dict:
+    r"""The shape every panel draws. Same keys for every system that adopts it."""
+    d = dict(STATES.get(key) or {})
+    if not d:
+        return {"running": False, "paused": False, "total": 0, "done": 0}
+    now = time.time()
+    el = (now - d["t0"]) if (d.get("running") and d.get("t0")) else 0.0
+    done, total = int(d.get("done") or 0), int(d.get("total") or 0)
+    d["elapsed"] = round(el, 1)
+    d["left"] = max(0, total - done)
+    d["pct"] = round(min(100.0, (done / total * 100.0) if total else 0.0), 1)
+    # RATE FROM THIS RUN, falling back to the smoothed per-item time so a
+    # freshly started pass still has an estimate.
+    rate = (done / el) if (el > 0.5 and done) else 0.0
+    each = d.get("secs_each") or (1 / rate if rate else 0.0)
+    d["rate"] = round(rate, 3)
+    d["secs_each"] = round(each, 2)
+    d["eta"] = round(d["left"] * each) if (d["left"] and each) else 0
+    d["cpu_line"] = f"waits above {CPU_BUSY_PCT:.0f}% CPU or {GPU_BUSY_PCT:.0f}% GPU"
+    return d

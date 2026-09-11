@@ -7532,6 +7532,25 @@ def api_subembed(preview: int = 12, full: int = 0, refresh: int = 0):
     return d
 
 
+# ---------------------------------------------- background work, uniformly --
+# ONE SHAPE FOR EVERY SYSTEM THAT FIXES MEDIA QUIETLY. idle.py runs them; this
+# reports them, and the panel renderer that draws one draws all of them.
+@app.get("/api/idle")
+def api_idle(key: str = ""):
+    """Where a background fixer has got to, and what it is waiting for."""
+    from . import idle
+    if key:
+        return idle.progress(key)
+    return {"systems": [idle.progress(k) for k in sorted(idle.STATES)]}
+
+
+@app.get("/api/idle/busy")
+async def api_idle_busy():
+    """May background work run right now - and if not, which check said no."""
+    from . import idle
+    return await idle.busy()
+
+
 @app.post("/api/subembed/run")
 async def api_subembed_run(limit: int = 0):
     from . import subembed
@@ -32431,6 +32450,72 @@ function scPaint(kind){
   </div>`;
 }
 
+
+// ================= BACKGROUND WORK, DRAWN ONCE =============================
+// ONE STRIP FOR EVERY SYSTEM THAT FIXES MEDIA QUIETLY.
+//
+// These all have the same story to tell - how much is left, how fast it is
+// going, when it last finished, and what it is waiting for - and every one of
+// them had been telling it differently, or not at all. idle.py gives them a
+// single progress shape; this draws it. The next system to adopt the runner
+// gets this panel for nothing.
+//
+// THE PAUSE IS THE INTERESTING STATE, not an error. A sweep that has stopped
+// because somebody is watching something is working correctly, and the strip
+// says which check spoke rather than leaving a stalled bar to be interpreted.
+const _idle={};
+async function idleLoad(key){
+  try{ _idle[key]=await (await fetch('/api/idle?key='+encodeURIComponent(key))).json(); }
+  catch(e){ return; }
+}
+function idleStrip(d, opts){
+  d=d||{}; opts=opts||{};
+  const pct=Math.max(0,Math.min(100,d.pct||0));
+  const head=`<div style="display:flex;gap:10px;align-items:baseline;
+       flex-wrap:wrap;font-size:11.5px">
+    ${d.running?'<span class="busy" style="color:var(--acc);flex:none"><span class="sp"></span></span>':''}
+    <span style="flex:none">${num(d.done||0,'done')} of ${num(d.total||0,'auto')}</span>
+    <span class="dim" style="flex:1 1 auto;min-width:0;overflow:hidden;
+      text-overflow:ellipsis;white-space:nowrap">${esc(d.now||'')}</span>
+    <span style="flex:none;margin-left:auto;display:flex;gap:10px">
+      ${d.rate?`<span class="dim" title="Measured on this run">${
+        d.rate>=1?d.rate.toFixed(1)+' a second':(d.secs_each||0).toFixed(1)+'s each'}</span>`:''}
+      ${d.eta?`<span title="At the rate above">${numt(hsDur(d.eta))} left</span>`:''}
+    </span></div>`;
+  // WAITING, AND FOR WHAT. The line that makes a stopped bar readable.
+  const wait = d.paused
+    ? `<div style="font-size:11px;margin-top:3px;color:var(--warn)">
+         <b>paused</b> — ${esc(d.paused_why||'the box is busy')}
+         <span class="dim">· it carries on by itself when that clears</span></div>`
+    : (d.idle_why
+       ? `<div class="dim" style="font-size:11px;margin-top:3px">${esc(d.idle_why)}${
+           d.next_look?` · looks again ${ago2(d.next_look)}`:''}</div>`
+       : '');
+  const hist=`<div class="dim" style="font-size:11px;margin-top:3px;display:flex;
+       gap:12px;flex-wrap:wrap">
+    ${d.last_run?`<span title="The last time it worked all the way through what was waiting">last finished ${
+       ago(d.last_run)} · ${num(d.last_done||0,'done')} done${
+       d.last_took?` · took ${hsDur(d.last_took)}`:''}</span>`
+      :'<span>has not finished a run yet</span>'}
+    ${d.runs?`<span>${num(d.runs,'done')} run${d.runs===1?'':'s'}</span>`:''}
+    ${d.secs_each?`<span title="Smoothed across everything it has done">${
+       (d.secs_each||0).toFixed(1)}s a file</span>`:''}
+    <span title="Background work waits for anybody watching, a full encoder queue, a busy disk, a DrivePool move, or the machine itself.">${
+      esc(d.cpu_line||'')}</span>
+    ${d.last_error?`<span class="err">${esc(d.last_error)}</span>`:''}
+  </div>`;
+  return `<div class="lkind" style="padding:8px 11px;margin:6px 0">
+    ${opts.title?`<b style="font-size:11.5px;color:#6fb0ff">${esc(opts.title)}</b>`:''}
+    ${(d.running||d.total)?`<div class="hsbar" style="margin-top:5px"><i
+       style="width:${pct}%"></i></div>`:''}
+    ${head}${wait}${hist}</div>`;
+}
+// "in 4m" / "4m ago", for a time that may be ahead of us.
+function ago2(t){
+  const d=(t||0)-(Date.now()/1000);
+  return d>1 ? 'in '+hsDur(d) : ago(t);
+}
+
 // ---- sidecar subtitles waiting to come inside ---------------------------
 let _se=null, _seKey='', _sePoll=null;
 // The waiting state, with as much of a measurement as exists yet.
@@ -32468,8 +32553,23 @@ function seShow(on){
   if(on && !(_se&&_se.preview&&_se.preview.length>12)) loadSubEmbed(true);
   else sePaint();
 }
+// THE RUNNER IS POLLED WHILE IT WORKS. Cheap - a dict read, no walk - so it
+// can tick at two seconds and the bar moves as files land rather than once a
+// minute when the panel happens to reload.
+let _sePoll2=null;
+function seIdleTick(){
+  clearTimeout(_sePoll2);
+  _sePoll2=setTimeout(async ()=>{
+    if(!document.getElementById('sePanel')) return;
+    await idleLoad('subembed');
+    sePaint();
+    const d=_idle['subembed']||{};
+    if(d.running||d.paused) seIdleTick();
+  }, 2000);
+}
 async function loadSubEmbed(full){
   const el=document.getElementById('sePanel'); if(!el) return;
+  idleLoad('subembed').then(()=>{ seIdleTick(); });
   // A SIXTY-SECOND WALK WITH NO SIGN OF LIFE READS AS A BROKEN PANEL. The
   // first open has to list every folder in the library, and until it answers
   // the panel had nothing on it at all. Same skeleton every other slow panel
@@ -32533,6 +32633,8 @@ function sePaint(){
     return;
   }
   const takes=pv.reduce((n,f)=>n+(f.take||[]).length,0);
+  const idleBar=idleStrip(_idle['subembed']||{},
+                          {title:'Working through them'});
   // THE NUMBER IS THE HEADLINE AND THE SWITCH IS ELSEWHERE. The rule lives in
   // the list above with every other subtitle rule; putting a second control
   // here would be two switches for one setting, which can only disagree.
@@ -32582,7 +32684,7 @@ function sePaint(){
       deleted, and only after the rebuilt file has been read back and found to
       contain it.${on.length?` <button class="rmb" onclick="seRun(this)"${
         d.running?' disabled':''}>${d.running?'working…':'Do a batch now'}</button>`:''}</div>`;
-  const html=`<div class="lkind" style="padding:11px 12px">${head}${warn}${rows}${foot}</div>`;
+  const html=`<div class="lkind" style="padding:11px 12px">${head}${idleBar}${warn}${rows}${foot}</div>`;
   if(html===_seKey) return;
   _seKey=html; el.innerHTML=html;
 }

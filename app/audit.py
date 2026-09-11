@@ -59,31 +59,19 @@ CYCLE_S = 600
 async def _too_busy() -> bool:
     """True when the pool has more urgent work than a conformance sample.
 
-    Deliberately the gate's own opinion, not a second definition: somebody
-    watching, or a disk already saturated, is exactly what the gate exists to
-    notice, and the audit has no business being the one component that decides
-    it differently.
+    DELEGATED NOW, because there should be one answer to this and idle.py is
+    where it lives. What was here asked two of the six questions idle asks -
+    and one of those two, the Plex check, never actually ran: it wrote
+    `await gate.check_plex()`, check_plex is synchronous and returns a Reason
+    dataclass, awaiting one raises TypeError, and the bare except underneath
+    swallowed it every time. So this - and subtitletitle, which delegates to
+    it - has been yielding to a full encoder queue and to nothing else.
     """
     try:
-        from . import gate
-        st = await gate.check_plex()
-        if st and st.get("blocked"):
-            return True
+        from . import idle
+        return bool((await idle.busy()).get("busy"))
     except Exception:                                        # noqa: BLE001
-        pass
-    try:
-        from . import jobs
-        live = jobs.live_snapshot() or {}
-        # A full house of workers means the disks are already carrying
-        # everything they can. One or two running is not busy - that is the
-        # normal state of this box.
-        running = len([w for w in (live.get("workers") or [])
-                       if (w or {}).get("state") == "running"])
-        if running >= 4:
-            return True
-    except Exception:                                        # noqa: BLE001
-        pass
-    return False
+        return False
 
 
 def _every_hours() -> float:

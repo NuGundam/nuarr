@@ -78,9 +78,20 @@ _PREFER = {".srt": 0, ".vtt": 1, ".smi": 2, ".ass": 3, ".ssa": 4, ".sub": 5}
 # Plex reads these from a subfolder too, as of server 1.41.
 SUB_DIRS = ("subs", "subtitles")
 
-# How many files one pass may rewrite. Each is a stream-copy remux of a whole
-# file - minutes of disk, not of GPU - and a library of 13,000 sidecars would
-# otherwise saturate the pool for a day the first time this is switched on.
+# WHAT PER_RUN USED TO BE FOR, AND WHY IT IS GONE.
+#
+# Twelve files a pass, ten minutes apart, was a guess about a bad moment: each
+# one is a stream-copy remux of a whole container, and a library of 13,000
+# sidecars would otherwise saturate the pool for a day the first time this was
+# switched on. It cost the good moments too - 446 files at twelve every ten
+# minutes is six hours of an idle box doing nothing for nine minutes in ten -
+# and it was never protection anyway, because twelve remuxes started the
+# instant somebody presses play are still twelve.
+#
+# idle.py asks before EVERY file instead, so the throttle is the machine's own
+# state rather than a number somebody picked. Busy means pause; free means
+# keep going. PER_RUN survives only for the manual "run it now" button, where
+# a person has already decided.
 PER_RUN = 12
 CYCLE_S = 600
 # Never touch a file written in the last few minutes; it may still be landing.
@@ -1108,12 +1119,32 @@ def preview(limit: int = 25, force: bool = True) -> dict:
          "skip": p["skip"][:4]} for p in got]}
 
 
+KEY = "subembed"
+TITLE = "Subtitle files beside the video"
+
+
+def _pending() -> list:
+    """Everything waiting, not a slice of it. The runner does the pacing."""
+    if not any(active(l.name) for l in (SETTINGS.libraries or [])):
+        return []
+    try:
+        return candidates(limit=100000)
+    except Exception:                                            # noqa: BLE001
+        return []
+
+
+def _do_one(p: dict) -> dict:
+    return embed_one(int(p["file_id"]))
+
+
 async def watch() -> None:
+    r"""Work through the sidecars for as long as the box can spare it.
+
+    No batch and no cycle of its own: idle.run() asks before every file and
+    pauses the moment anything more important wants the machine.
+    """
+    from . import idle
     await asyncio.sleep(180)
-    while True:
-        try:
-            if any(active(l.name) for l in (SETTINGS.libraries or [])):
-                await sweep()
-        except Exception as e:                                   # noqa: BLE001
-            STATE["last_error"] = f"{type(e).__name__}: {e}"
-        await asyncio.sleep(CYCLE_S)
+    await idle.run(KEY, TITLE, _pending, _do_one,
+                   label=lambda p: os.path.basename(p.get("path") or "")[:70],
+                   system_name="sidecar subtitles")
