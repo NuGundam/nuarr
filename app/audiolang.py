@@ -2126,6 +2126,13 @@ def mismatches(limit: int = 200, floor: float | None = None,
                 "  FROM audio_lang a JOIN files f ON f.id = a.file_id "
                 " WHERE a.ok = 1 AND COALESCE(a.code,'') != '' "
                 "   AND f.state = 'done' "
+                # AND HEARD FROM THE FILE THAT IS THERE NOW. store() has
+                # always recorded the size it listened to; nothing read it
+                # back, so a re-encode or a remux left the old verdict
+                # standing and the panel offered to correct a track that may
+                # not exist any more.
+                "   AND (a.size IS NULL OR a.size = 0 OR f.size IS NULL "
+                "        OR a.size = f.size) "
                 " ORDER BY a.checked_at DESC").fetchall()
     except Exception:                                    # noqa: BLE001
         return out
@@ -2470,6 +2477,21 @@ def auto_pass() -> dict:
                    + (f" - {out['queued']} wait for the next pass"
                       if out["queued"] else ""), "info", system="audiolang")
     return out
+
+
+def forget(file_ids) -> int:
+    """Drop every verdict heard from bytes that are no longer there."""
+    ids = [int(i) for i in (file_ids or []) if i]
+    if not ids:
+        return 0
+    try:
+        ensure_table()
+        with cursor() as cur:
+            qs = ",".join("?" * len(ids))
+            cur.execute(f"DELETE FROM audio_lang WHERE file_id IN ({qs})", ids)
+            return cur.rowcount or 0
+    except Exception:                                            # noqa: BLE001
+        return 0
 
 
 def path_of(file_id: int) -> str:

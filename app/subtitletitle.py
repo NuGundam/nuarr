@@ -482,9 +482,21 @@ def _shapes_for(file_ids) -> dict:
             for i in range(0, len(ids), 400):
                 chunk = ids[i:i + 400]
                 qs = ",".join("?" * len(chunk))
+                # ONLY SHAPES READ FROM THE FILE AS IT IS NOW. shape_of()
+                # has always matched on size when reading one track; this is
+                # the batch the PANEL is built from and it did not, so a file
+                # rewritten since the read was described by the old shape.
                 for r in cur.execute(
-                        f"SELECT * FROM subtitle_shape "
-                        f" WHERE file_id IN ({qs})", chunk):
+                        f"SELECT s.* FROM subtitle_shape s "
+                        f"  JOIN files f ON f.id = s.file_id "
+                        f" WHERE s.file_id IN ({qs}) "
+                        f"   AND f.state NOT IN ('deleted','duplicate') "
+                        # A kind you set by hand is a decision about the
+                        # file, not a reading of its bytes, and correcting
+                        # the title is itself what moved the size.
+                        f"   AND (COALESCE(s.chosen,'') != '' "
+                        f"        OR s.size IS NULL OR f.size IS NULL "
+                        f"        OR s.size = f.size)", chunk):
                     out[(r["file_id"], r["track"])] = dict(r)
     except Exception:                                            # noqa: BLE001
         return {}
@@ -712,6 +724,24 @@ def kind_of(sh: dict, minutes: float) -> dict:
                     f"of people talking"
                     + (" - with sign styles beside them" if kind == HYBRID
                        else ""))}
+
+
+def forget(file_ids) -> int:
+    """Drop every shape read from bytes that are no longer there."""
+    ids = [int(i) for i in (file_ids or []) if i]
+    if not ids:
+        return 0
+    try:
+        _inspect_init()
+        with cursor() as cur:
+            qs = ",".join("?" * len(ids))
+            cur.execute(f"DELETE FROM subtitle_shape "
+                        f" WHERE file_id IN ({qs})", ids)
+            n = cur.rowcount or 0
+        _CACHE["at"] = 0.0                    # the next read re-scans
+        return n
+    except Exception:                                            # noqa: BLE001
+        return 0
 
 
 def ack(file_id: int, track: int, on: bool = True) -> dict:

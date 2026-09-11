@@ -541,6 +541,32 @@ _GARB: dict = {"at": 0.0, "words": set()}
 _GARB_TTL = 120.0
 
 
+def forget(file_ids) -> int:
+    r"""Throw away what was read from bytes that no longer exist.
+
+    THE VERDICT BELONGED TO THE OLD FILE. An upgrade replaces the release
+    under the same row: different encode, different subtitle tracks, possibly
+    not hardsubbed at all. Keeping the reading would answer a question about a
+    file nobody has any more.
+
+    The dismissals are NOT touched. Those are about words and about shows -
+    "this read is OCR noise", "leave this series alone" - and neither belongs
+    to one file's bytes.
+    """
+    ids = [int(i) for i in (file_ids or []) if i]
+    if not ids:
+        return 0
+    try:
+        if not _READY:
+            init()
+        with cursor() as cur:
+            qs = ",".join("?" * len(ids))
+            cur.execute(f"DELETE FROM hardsub WHERE file_id IN ({qs})", ids)
+            return cur.rowcount or 0
+    except Exception:                                            # noqa: BLE001
+        return 0
+
+
 def garbage_words() -> set:
     r"""Words that have only ever appeared in findings somebody threw away.
 
@@ -1383,11 +1409,21 @@ def stats() -> dict:
         pass
     try:
         with cursor() as cur:
-            for r in cur.execute("SELECT state, COUNT(*) n FROM hardsub "
-                                 "GROUP BY state"):
+            # COUNTED THE SAME WAY THE LIST IS BUILT. These counted every
+            # row in the table, including files that have been deleted and
+            # files whose bytes have changed - so the headline disagreed with
+            # the list underneath it, which is the one number a person checks
+            # the other against.
+            live = ("  FROM hardsub h JOIN files f ON f.id = h.file_id "
+                    " WHERE f.state NOT IN ('deleted','duplicate') "
+                    "   AND (h.marked = 1 OR h.chosen IS NOT NULL "
+                    "        OR h.size IS NULL OR f.size IS NULL "
+                    "        OR h.size = f.size) ")
+            for r in cur.execute("SELECT h.state, COUNT(*) n " + live
+                                 + " GROUP BY h.state"):
                 out[r["state"] or "none"] = r["n"]
-            r = cur.execute("SELECT COUNT(*) n FROM hardsub "
-                            "WHERE marked=1").fetchone()
+            r = cur.execute("SELECT COUNT(*) n " + live
+                            + " AND h.marked=1").fetchone()
             out["marked"] = int((r["n"] if r else 0) or 0)
     except Exception:                                            # noqa: BLE001
         pass
@@ -1414,6 +1450,13 @@ def found(limit: int = 60) -> list:
                 "       f.library, f.title, f.season, f.episode, f.first_seen "
                 "  FROM hardsub h JOIN files f ON f.id = h.file_id "
                 " WHERE h.state != ? AND f.state NOT IN ('deleted','duplicate') "
+                # THE SAME JOIN THE CANDIDATE PICKER USES. _candidates() has
+                # always matched on size, so a file whose bytes changed is
+                # already queued to be read again - this stops the OLD answer
+                # being shown as a live question in the meantime.
+                "   AND (h.marked = 1 OR h.chosen IS NOT NULL "
+                "        OR h.size IS NULL OR f.size IS NULL "
+                "        OR h.size = f.size) "
                 "   AND NOT EXISTS (SELECT 1 FROM hardsub_ignored i "
                 "                    WHERE i.file_id = h.file_id) "
                 " ORDER BY h.marked ASC, h.at DESC LIMIT ?",
@@ -1428,6 +1471,8 @@ def found(limit: int = 60) -> list:
                 "       h.words, h.detail, h.marked, h.chosen, h.at, "
                 "       f.library, f.title, f.season, f.episode, f.first_seen "
                 "  FROM hardsub h JOIN files f ON f.id = h.file_id "
+                # No size test here at all: marked=1 IS the decision, and
+                # the act of marking is what moved the size.
                 " WHERE h.marked = 1 AND f.state NOT IN ('deleted','duplicate') "
                 " ORDER BY h.at DESC LIMIT 200") if r["file_id"] not in have]
     except Exception:                                            # noqa: BLE001

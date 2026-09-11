@@ -1376,6 +1376,46 @@ async def scan(full: bool = True, probe_orphans: bool = True,
                     cur.execute(f"UPDATE files SET adopt_state=NULL, "
                                 f"adopt_attempts=0 WHERE id IN ({qs}) "
                                 f"AND adopt_state IS NOT NULL", changed_ids)
+                    # AND EVERYTHING THAT WAS READ OUT OF THOSE BYTES.
+                    #
+                    # Three readers record what they found in a file: whether
+                    # the subtitles are burned into the picture, what shape
+                    # each subtitle track has, and what language each audio
+                    # track sounded like. All three are statements about the
+                    # file that WAS there. An upgrade is a different encode
+                    # with different tracks - it may not be hardsubbed at all,
+                    # and its track 2 may be somebody else's track 3.
+                    #
+                    # Dropped here rather than left for the read to notice,
+                    # because the next read can be hours away and until then
+                    # the panels offer the old answer as a live question.
+                    # What is NOT dropped: the dismissals and the shows left
+                    # alone. Those are about words and about series, and
+                    # neither belongs to one file's bytes.
+                    #
+                    # GUARDED, ONE AT A TIME. These tables are created lazily
+                    # by the readers that own them, and a reader that has
+                    # never run on this install has no table. An
+                    # OperationalError here would take down the scan pass
+                    # that was only trying to tidy up after itself.
+                    # KEEPING WHAT SOMEBODY DECIDED. A reading dies with the
+                    # bytes; an answer does not. "I marked this", "this track
+                    # carries signs", "this language is right" are statements
+                    # about the FILE, and nuarr's own edits move the size too
+                    # - so a blanket delete would throw away every mark it had
+                    # ever made the moment it made it.
+                    for _t, _keep in (("hardsub",
+                                       " AND marked = 0 AND chosen IS NULL"),
+                                      ("subtitle_shape",
+                                       " AND COALESCE(chosen,'') = ''"),
+                                      ("audio_lang",
+                                       " AND confidence < 1.0")):
+                        try:
+                            cur.execute(f"DELETE FROM {_t} "
+                                        f" WHERE file_id IN ({qs})" + _keep,
+                                        changed_ids)
+                        except Exception:                    # noqa: BLE001
+                            pass
             if events:
                 cur.executemany(
                     "INSERT INTO history(file_id,event,detail,at) VALUES(?,?,?,?)",
