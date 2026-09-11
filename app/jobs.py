@@ -2174,6 +2174,52 @@ IO_THROTTLED: dict = {"on": False, "procs": 0, "changed_at": 0.0,
                       "disks": [], "reason": ""}
 
 
+def _drivepool_yield(watched: set | None = None,
+                     everything: bool = False) -> None:
+    r"""Ask DrivePool's housekeeping to step aside, or let it back up.
+
+    THE SAME LEVER, POINTED THE OTHER WAY. This loop has spent years demoting
+    nuarr's own ffmpeg children so a viewer gets their spindle - and doing
+    nothing at all about the one process that is far more likely to be in that
+    viewer's way, because DrivePool is somebody else's program and there was
+    no command to ask it with. There still is not: dpcmd has no priority
+    command. But psutil's ionice works on any process nuarr has rights to, and
+    a balance is background work by definition.
+
+    Demote when somebody is watching a pool disk, or when nuarr's own queue is
+    being held for a move - which is the case where waiting is the whole cost.
+    Restore the moment neither is true, so DrivePool is never left slow.
+    """
+    try:
+        from . import drivepool as dp
+    except Exception:                                            # noqa: BLE001
+        return
+    try:
+        if not dp.get_toggle("drivepool.yield"):
+            # Never leave it demoted after the switch is turned off.
+            if (dp._PRIO or {}).get("low"):
+                dp.set_priority(False)
+            return
+        why = ""
+        if watched:
+            why = ("somebody is watching "
+                   + ", ".join(sorted(watched)[:3]))
+        elif everything:
+            why = "nuarr's own work is being held for a move"
+        else:
+            held, hw = dp.hold_active("jobs")
+            if held:
+                why = hw or "the queue is held for a move"
+        if why and not dp.moving():
+            # Nothing is actually moving, so there is nothing to step aside.
+            why = ""
+        want = bool(why)
+        if want != bool((dp._PRIO or {}).get("low")):
+            dp.set_priority(want, why)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
 def _set_io_priority(watched: set | None = None,
                      everything: bool = False) -> int:
     """Demote the jobs that are actually in someone's way. Restore the rest.
@@ -2531,6 +2577,9 @@ async def io_priority_watch() -> None:
                          if want else "disk priority restored — nothing is "
                                       "competing for the pool"),
                         "debug")
+            # ASKED EVERY CYCLE, because the case that must not be missed
+            # is DrivePool left demoted after the reason for it has gone.
+            await asyncio.to_thread(_drivepool_yield, watched, not want)
         except Exception as e:
             playing = False
             joblog.log(f"io priority: {type(e).__name__}: {e}", "debug")

@@ -5459,9 +5459,21 @@ def api_health():
             acts = list(st_dp.get("active") or {})
             hold_on = [k for k in ("jobs", "commits", "renames")
                        if (st_dp.get("holds") or {}).get(k, {}).get("on")]
+            # AND WHETHER IT HAS BEEN ASKED TO STEP ASIDE. "Holding commits"
+            # says what nuarr has stopped doing; it does not say whether
+            # DrivePool is still going flat out while nuarr waits. Those are
+            # different facts and this row is where somebody looks for both.
+            _pr = st_dp.get("priority") or {}
+            _pw = ""
+            if _pr.get("enabled"):
+                _pw = (" - its housekeeping is stepped aside"
+                       + (f" ({_pr.get('why')})" if _pr.get("why") else "")
+                       if _pr.get("low") else
+                       " - it may be asked to step aside")
             add("drivepool", "Is DrivePool moving data?", "drivepool", 0,
                 ((", ".join(st_dp["active"][a]["text"] for a in acts)
-                  + (" - holding " + ", ".join(hold_on) if hold_on else ""))
+                  + (" - holding " + ", ".join(hold_on) if hold_on else "")
+                  + _pw)
                  if acts else "idle - the pool is not being rearranged"),
                 running=bool(acts), warn=False)
     except Exception as e:                                   # noqa: BLE001
@@ -24071,6 +24083,62 @@ function dpMb(b){ return (b/1e6).toFixed(0)+' MB/s'; }
 function advNum(bytes){ const v=(bytes||0)/1e12; return v>=1?Math.round(v):Math.round(v*10)/10; }
 function advTB(bytes){ return advNum(bytes)+' TB'; }
 function dpDur(s){ s=Math.max(0,Math.round(s)); return s>=3600?`${Math.floor(s/3600)}h ${Math.floor(s%3600/60)}m`:(s>=60?`${Math.floor(s/60)}m ${s%60}s`:`${s}s`); }
+// ---- ASKING IT TO STEP ASIDE, AND SAYING WHETHER IT DID -------------------
+//
+// dpcmd cannot change DrivePool's priority - its whole command set is pool
+// structure and duplication, checked against 2.3.13.1687 - so this is Windows
+// doing it from outside, with the same psutil call nuarr has always used on
+// its own ffmpeg children. The panel has to be honest about that: it says
+// which processes it is holding down, at what, and why.
+function dpPrioHtml(d){
+  const p = d.priority || {};
+  const on = !!p.enabled;
+  const procs = p.procs || [];
+  const low = !!p.low, mixed = !!p.mixed;
+  const state = !on ? 'off'
+              : low ? 'stepped aside'
+              : mixed ? 'part way'
+              : 'running normally';
+  const col = !on ? 'var(--dim)' : low ? 'var(--warn)' : 'var(--ok)';
+  return `<div class="lkind" style="padding:10px 12px;margin-top:8px">
+    <div style="display:flex;gap:12px;align-items:baseline;flex-wrap:wrap">
+      <b style="color:#6fb0ff">Housekeeping priority</b>
+      <span style="color:${col};font-size:12px">${esc(state)}</span>
+      ${p.why?`<span class="dim" style="font-size:11.5px">— ${esc(p.why)}${
+        p.since?` · ${dpDur(Math.max(0,Date.now()/1000-p.since))} ago`:''}</span>`:''}
+      <label class="gsw" style="margin-left:auto"
+        title="Windows can lower another program's I/O and CPU priority in real time; dpcmd has no command for it. Only DrivePool's SERVICE processes are touched - the pool's own reads and writes go through the covefs kernel driver, not the service - so this slows balancing, duplication and re-measuring and nothing else.">
+        <input type="checkbox" ${on?'checked':''}
+          onchange="dpToggle('drivepool.yield',this.checked)">
+        <span class="gname">step aside for viewers and the queue</span>
+        <span class="gstate ${on?'on':'off'}">${on?'on':'off'}</span>
+      </label>
+    </div>
+    <div class="dim" style="font-size:11.5px;margin-top:4px;line-height:1.45">
+      Today a move simply HOLDS nuarr: the queue stops and waits, which on a
+      full rebalance is hours. With this on, DrivePool's background half is
+      dropped to very low I/O and below-normal CPU while somebody is watching
+      a pool disk or the queue is being held for a move, and restored the
+      moment neither is true. The balance takes longer; nothing stops.
+      Very low rather than idle, because an idle-class process can be starved
+      outright and a mover stalled halfway through a file is worse than a
+      slow one.
+    </div>
+    ${procs.length?`<table style="width:100%;font-size:11.5px;margin-top:6px">
+      <thead><tr class="dim" style="font-size:10px;letter-spacing:.05em">
+        <th class="l" style="text-align:left">process</th>
+        <th class="c">pid</th><th class="c">disk i/o</th><th class="c">cpu</th>
+      </tr></thead><tbody>${procs.map(x=>`<tr>
+        <td class="mono">${esc(x.name||'')}</td>
+        <td class="c mono dim">${x.pid}</td>
+        <td class="c mono" style="color:${x.io<=1?'var(--warn)':'var(--ok)'}"
+          >${esc(x.io_word||'')}</td>
+        <td class="c mono dim">${x.cpu===16384?'below normal':(x.cpu===32?'normal':x.cpu)}</td>
+      </tr>`).join('')}</tbody></table>`
+    : `<div class="dim" style="font-size:11.5px;margin-top:5px">${
+        p.err?esc(p.err):'DrivePool\'s service is not running, so there is nothing to hold down.'}</div>`}
+  </div>`;
+}
 function dpPaint(disks){
   const el=document.getElementById('dpBody'); const d=_dp; if(!el||!d) return;
   // KEEP THE SCROLL. The whole body is rebuilt every two seconds during a
@@ -24096,7 +24164,7 @@ function dpPaint(disks){
         <input type="checkbox" ${en?'checked':''} onchange="dpToggle('drivepool.enabled',this.checked)">
         <span class="gname">integration</span><span class="gstate ${en?'on':'off'}">${en?'on':'off'}</span>
       </label>
-    </div>`;
+    </div>` + dpPrioHtml(d);
   // ---- what it is doing now ------------------------------------------
   disks.forEach(x=>{ x._r=dpRate(x,''); });
   const emptying=disks.filter(x=>x._r<-2e6).sort((a,b)=>a._r-b._r).slice(0,3);

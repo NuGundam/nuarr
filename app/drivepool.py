@@ -76,6 +76,12 @@ FLAGS = ("Measuring", "MissingDisk", "PoolPartBusy", "DuplicationFileInUse",
 # on it is on the move and nuarr cannot know which.
 DEFAULTS = {
     "drivepool.enabled": "1",
+    # ASK IT TO STEP ASIDE RATHER THAN WAITING IT OUT. Off by default because
+    # it reaches into another program's processes, and because the trade is
+    # real: the balance takes longer. See set_priority for why it is safe -
+    # the pool's data path is the kernel driver, not this service - and why
+    # dpcmd cannot do it.
+    "drivepool.yield": "0",
     "drivepool.balancing.jobs": "0",
     "drivepool.balancing.commits": "1",
     "drivepool.balancing.renames": "1",
@@ -104,6 +110,125 @@ STATE: dict = {
 }
 _TAIL = {"file": "", "pos": 0}
 _IO = {"at": 0.0, "r": 0, "w": 0}
+
+# ------------------------------------------------- asking it to step aside ---
+#
+# CAN DRIVEPOOL'S PRIORITY BE CHANGED IN REAL TIME FROM A COMMAND LINE? Not by
+# dpcmd. Checked against the copy on this box - 2.3.13.1687 - and its entire
+# command set is pool structure and duplication: add-poolpart,
+# check-pool-fileparts, get/set-duplication, list-open-files, list-pools,
+# remeasure-pool, refresh-all-poolparts, ignore/unignore-poolpart. There is no
+# priority, no pause, no throttle. DrivePool's own advanced setting
+# DrivePool_BackgroundTasksVeryLowPriority does put background tasks at IDLE
+# cpu, but it is a config file read at service start: a permanent choice, not a
+# live control, and it says nothing about I/O.
+#
+# BUT WINDOWS CAN, AND NUARR ALREADY KNOWS HOW. jobs._set_io_priority has been
+# demoting nuarr's own ffmpeg children with psutil's ionice/nice for as long as
+# the viewer yield has existed, and that call works on any process nuarr has
+# rights to. Verified on DrivePool's own processes here: ionice read 2 (normal)
+# and 0 (very low) was accepted and restored cleanly.
+#
+# WHICH PROCESS, AND WHY IT IS SAFE TO SLOW. The pool's DATA PATH is the
+# covefs kernel driver - reads and writes of pooled files do not go through
+# the service. DrivePool.Service.exe is the background half: balancing,
+# duplication, re-measuring, the mover. Demoting it therefore slows the
+# housekeeping and not the file system, which is exactly the half that gets in
+# a viewer's way. The UI and notification processes are left alone; they cost
+# nothing and slowing them would only make the tray look broken.
+#
+# AND IT IS THE OPPOSITE OF WHAT NUARR DOES NOW. Today a balance simply BLOCKS
+# the queue: nuarr stops and waits for DrivePool to finish, which on a full
+# rebalance is hours. Being able to demote the mover instead means the two can
+# share - the balance takes longer, the queue keeps moving, and the viewer is
+# ahead of both.
+DP_PROCS = ("drivepool.service.exe", "drivepool.service.native.exe")
+_PRIO = {"low": False, "at": 0.0, "why": "", "pids": {}, "err": "",
+         "can": None}
+
+
+def _dp_processes() -> list:
+    try:
+        import psutil
+    except Exception:                                        # noqa: BLE001
+        return []
+    out = []
+    try:
+        for x in psutil.process_iter(["name", "pid"]):
+            if (x.info["name"] or "").lower() in DP_PROCS:
+                out.append(psutil.Process(x.info["pid"]))
+    except Exception:                                        # noqa: BLE001
+        return out
+    return out
+
+
+def priority() -> dict:
+    """What priority DrivePool's background half is running at, right now."""
+    try:
+        import psutil
+    except Exception:                                        # noqa: BLE001
+        return {"ok": False, "why": "psutil is not available"}
+    rows, low_n, norm_n = [], 0, 0
+    for p in _dp_processes():
+        try:
+            io = p.ionice()
+            cpu = p.nice()
+            iv = int(io) if not hasattr(io, "value") else int(io.value)
+            rows.append({"pid": p.pid, "name": p.name(),
+                         "io": iv, "cpu": int(cpu),
+                         "io_word": {0: "very low", 1: "low",
+                                     2: "normal"}.get(iv, str(iv))})
+            if iv <= 1:
+                low_n += 1
+            else:
+                norm_n += 1
+        except Exception:                                    # noqa: BLE001
+            continue
+    return {"ok": bool(rows), "procs": rows, "low": bool(low_n and not norm_n),
+            "mixed": bool(low_n and norm_n),
+            "want_low": bool(_PRIO["low"]), "why": _PRIO["why"],
+            "since": _PRIO["at"], "err": _PRIO["err"],
+            "can": _PRIO["can"],
+            "enabled": get_toggle("drivepool.yield")}
+
+
+def set_priority(low: bool, why: str = "") -> dict:
+    """Demote or restore DrivePool's background half. Returns what happened.
+
+    IDLE WAS THE WRONG FLOOR FOR NUARR'S OWN JOBS and it is the wrong floor
+    here too, for the same reason jobs.py gives: an idle-class process can be
+    starved outright by anything at all, and a mover stalled halfway through
+    relocating a file is worse than a slow one. Very low I/O with
+    below-normal CPU is the pairing that yields without stopping.
+    """
+    try:
+        import psutil
+    except Exception as e:                                   # noqa: BLE001
+        _PRIO["err"] = f"{type(e).__name__}: {e}"
+        return {"ok": False, "why": _PRIO["err"]}
+    want_io = psutil.IOPRIO_VERYLOW if low else psutil.IOPRIO_NORMAL
+    want_cpu = (psutil.BELOW_NORMAL_PRIORITY_CLASS if low
+                else psutil.NORMAL_PRIORITY_CLASS)
+    done, failed = 0, ""
+    for p in _dp_processes():
+        try:
+            p.ionice(want_io)
+            p.nice(want_cpu)
+            done += 1
+        except Exception as e:                               # noqa: BLE001
+            failed = f"{type(e).__name__}: {e}"
+    _PRIO["can"] = bool(done) if not failed else False
+    if done:
+        if bool(_PRIO["low"]) != bool(low) or why != _PRIO["why"]:
+            _log(f"DrivePool background priority "
+                 + ("lowered" if low else "restored")
+                 + (f" - {why}" if why and low else ""),
+                 "info" if low else "ok")
+        _PRIO.update(low=bool(low), at=time.time(), why=(why if low else ""),
+                     err=failed)
+    else:
+        _PRIO["err"] = failed or "DrivePool is not running"
+    return {"ok": bool(done), "changed": done, "err": _PRIO["err"]}
 
 
 def init() -> None:
@@ -748,6 +873,9 @@ def status() -> dict:
         "pressure": press,
         "targets": targets(), "targets_at": _TGT["at"], "targets_err": _TGT["err"],
         "balance": balance_info(),
+        # WHAT PRIORITY ITS HOUSEKEEPING IS RUNNING AT, and whether nuarr is
+        # the reason. See set_priority: dpcmd cannot do this, Windows can.
+        "priority": priority(),
     }
 
 
