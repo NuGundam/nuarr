@@ -130,8 +130,18 @@ def _machine() -> dict:
     return {"cpu": float(s.get("cpu_pct") or 0.0), "gpu": g}
 
 
-async def busy() -> dict:
+async def busy(disk: str = "") -> dict:
     r"""May a background fixer do one more thing right now, and if not, why.
+
+    `disk` IS THE HALF THIS WAS MISSING, and it showed up the first evening.
+    The transcode queue holds work PER SPINDLE - sixteen Outlander jobs sat
+    there saying "waiting on: viewer on NU-DRIVE-1" - while this said "not
+    busy" and rewrote Outlander episodes on that same disk, because
+    check_plex() answers a GLOBAL question and was blocked=False: one session
+    playing, nothing transcoding, the pool as a whole fine.
+    So the polite system stopped and the new one walked straight past it, onto
+    the exact spindle the viewer was reading from. The gate already publishes
+    the per-disk answer; this asks for it.
 
     ORDERED BY WHO IS WAITING. A person watching something comes first, then
     the work nuarr has already committed to, then the hardware. The first
@@ -196,6 +206,20 @@ async def busy() -> dict:
     if m.get("gpu", 0) >= GPU_BUSY_PCT:
         return {"busy": True, "why": f"the GPU is at {m['gpu']:.0f}%",
                 "detail": f"background work waits above {GPU_BUSY_PCT:.0f}%"}
+    # 6. and THIS FILE'S disk, which is the question the queue asks
+    if disk:
+        try:
+            from . import gate
+            if disk in gate.plex_disks():
+                return {"busy": True, "why": f"a viewer is on {disk}",
+                        "detail": "the transcode queue steers around this "
+                                  "spindle for the same reason"}
+            if disk in gate.busy_disks():
+                return {"busy": True, "why": f"{disk} is busy",
+                        "detail": "a rebuild, a balance or a copy has that "
+                                  "disk - the other eleven are free"}
+        except Exception:                                        # noqa: BLE001
+            pass
     return {"busy": False, "why": "", "detail": "",
             "cpu": m.get("cpu", 0), "gpu": m.get("gpu", 0)}
 
@@ -203,7 +227,7 @@ async def busy() -> dict:
 # ------------------------------------------------------------- the runner ---
 async def run(key: str, title: str, pending, do_one, label=None, *,
               empty_s: float = EMPTY_S, pause_s: float = PAUSE_S,
-              system_name: str = "") -> None:
+              system_name: str = "", disk_of=None) -> None:
     r"""Work through `pending()` for as long as the machine can spare it.
 
     NO BATCH, NO END. This is a loop that lives for the life of the process:
@@ -236,7 +260,10 @@ async def run(key: str, title: str, pending, do_one, label=None, *,
             d.update(running=True, idle_why="", total=len(items), done=0,
                      ok=0, failed=0, t0=time.time(), next_look=0.0)
             for it in items:
-                b = await busy()
+                # PER ITEM AND PER SPINDLE. A viewer on one disk is a reason
+                # to work on another, not a reason to stop - which is exactly
+                # how the queue treats it.
+                b = await busy(disk_of(it) if disk_of else "")
                 if b["busy"]:
                     # PAUSED, NOT FAILED. The rest of the list is still
                     # pending and will be picked up the moment the box is

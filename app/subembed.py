@@ -911,7 +911,7 @@ def candidates(limit: int = 200, force: bool = False,
     cutoff = time.time() - SETTLE_S
     with cursor() as cur:
         rows = [dict(r) for r in cur.execute(
-            f"SELECT id, path, library FROM files "
+            f"SELECT id, path, library, pool_disk FROM files "
             f" WHERE library IN ({qs}) "
             f"   AND state NOT IN ('deleted','duplicate') "
             f"   AND COALESCE(path,'') != '' "
@@ -942,6 +942,11 @@ def candidates(limit: int = 200, force: bool = False,
             continue                       # cheap listdir, no probe, no policy
         p = plan_one(r["id"], force=force)
         if p.get("take") or p.get("drop"):
+            # WHICH SPINDLE IT LIVES ON, carried with the plan. The runner
+            # asks the gate per disk before every file - a viewer on one is a
+            # reason to work on another, not a reason to stop - and plan_one
+            # has no reason to know about disks.
+            p["pool_disk"] = r.get("pool_disk") or ""
             out.append(p)
     return out
 
@@ -1209,4 +1214,5 @@ async def watch() -> None:
     await asyncio.sleep(180)
     await idle.run(KEY, TITLE, _pending, _do_one,
                    label=lambda p: os.path.basename(p.get("path") or "")[:70],
+                   disk_of=lambda p: p.get("pool_disk") or "",
                    system_name="sidecar subtitles")

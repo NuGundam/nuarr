@@ -7572,10 +7572,22 @@ def api_idle(key: str = ""):
 
 
 @app.get("/api/idle/busy")
-async def api_idle_busy():
-    """May background work run right now - and if not, which check said no."""
+async def api_idle_busy(disk: str = ""):
+    """May background work run right now - and if not, which check said no.
+
+    `disk` asks the per-spindle half as well, which is the question the
+    transcode queue asks and the one that matters: a viewer on NU-DRIVE-1 is a
+    reason to leave NU-DRIVE-1 alone, not a reason to stop.
+    """
     from . import idle
-    return await idle.busy()
+    out = await idle.busy(disk)
+    try:
+        from . import gate
+        out["viewer_disks"] = sorted(gate.plex_disks())
+        out["busy_disks"] = sorted(gate.busy_disks())
+    except Exception:                                    # noqa: BLE001
+        pass
+    return out
 
 
 @app.post("/api/subembed/run")
