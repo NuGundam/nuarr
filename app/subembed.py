@@ -1276,6 +1276,19 @@ def walk(force_refresh: bool = False) -> list:
     global _WALK_LOCK
     now = time.time()
     fresh = (_WALK["rows"] is not None and now - _WALK["at"] < _SUM_TTL)
+    # AND A SWEEP IN FLIGHT KEEPS ITS OWN LIST FRESH. A pass runs for hours,
+    # so the ten-minute clock would call the runner's copy stale and start a
+    # second walk of the same folders to produce the same answer - while the
+    # runner is removing each file from that copy as it finishes it. The list
+    # is only out of date when nobody is working through it.
+    if not fresh and _WALK["rows"] is not None:
+        try:
+            from . import idle as _idle
+            st = _idle.STATES.get(KEY) or {}
+            if st.get("running") or st.get("paused"):
+                fresh = True
+        except Exception:                                        # noqa: BLE001
+            pass
     if fresh and not force_refresh:
         return _WALK["rows"]
     if not _WALK["running"]:
@@ -1287,6 +1300,30 @@ def walk(force_refresh: bool = False) -> list:
                 _WALK["running"] = True     # claimed before the thread starts
                 threading.Thread(target=_walk_now, args=(force_refresh,),
                                  daemon=True).start()
+    return _WALK["rows"] or []
+
+
+def walk_now() -> list:
+    r"""Walk in THIS thread and publish it, so one walk serves both readers.
+
+    TWO WALKS OF THE SAME FORTY THOUSAND FOLDERS, EACH WITH ITS OWN CACHE.
+    The runner walked to find its work and the panel walked to draw its list,
+    and neither knew about the other's answer - so opening the page after a
+    quiet night meant sitting through a minute of listdir for a question the
+    sweep had answered a few seconds earlier, and would answer again shortly.
+    A skeleton for a minute on a page whose whole subject is work that has
+    already been done reads as the page being broken.
+
+    The runner's walk is the wider one - every library, so the preview can
+    show what a rule WOULD do - and the pending list is that walk filtered to
+    the libraries whose rule is actually on. One walk, two readers, and
+    because the sweep walks on every pass the panel's copy is never more than
+    a pass old.
+    """
+    if _WALK["running"]:
+        # Somebody is already walking. Their answer will be this answer.
+        return _WALK["rows"] or []
+    _walk_now(True)
     return _WALK["rows"] or []
 
 
@@ -1717,18 +1754,45 @@ TITLE = "Subtitle files beside the video"
 
 
 def _pending() -> list:
-    """Everything waiting, not a slice of it. The runner does the pacing."""
+    """Everything waiting, not a slice of it. The runner does the pacing.
+
+    THE SAME WALK THE PANEL READS. See walk_now: the wide walk covers every
+    library so the preview can show what a rule would do, and this is that
+    walk filtered to the libraries whose rule is on. plan_one(force=True)
+    widens the RULES only for libraries that are off, so for an enabled
+    library the plan is identical either way - which is what makes the filter
+    equivalent to walking again with force off, and not merely similar.
+    """
     if not any(active(l.name) for l in (SETTINGS.libraries or [])):
         return []
     try:
-        return candidates(limit=100000)
+        return [p for p in walk_now() if active(p.get("library") or "")]
     except Exception:                                            # noqa: BLE001
         return []
 
 
 def _do_one(p: dict, report=None) -> dict:
-    return embed_one(int(p["file_id"]), report=report,
-                     disk=p.get("pool_disk") or "")
+    out = embed_one(int(p["file_id"]), report=report,
+                    disk=p.get("pool_disk") or "")
+    # A FILE THAT IS DONE LEAVES THE SHARED LIST, RATHER THAN WAITING FOR THE
+    # NEXT WALK TO NOTICE. The panel reads the same rows the runner is working
+    # through (see walk_now), and a pass over three thousand files takes
+    # hours - so without this the list on screen would be an hour out of date
+    # by the middle of a pass, showing work that has already been done. One
+    # comprehension over a few thousand dicts, once per file, against a walk
+    # that costs a minute.
+    if out.get("ok"):
+        try:
+            fid = int(p["file_id"])
+            rows = _WALK.get("rows")
+            if rows:
+                _WALK["rows"] = [r for r in rows
+                                 if int(r.get("file_id") or 0) != fid]
+                _WALK["found"] = len(_WALK["rows"])
+                _SUM["at"] = 0.0
+        except Exception:                                        # noqa: BLE001
+            pass
+    return out
 
 
 async def watch() -> None:
