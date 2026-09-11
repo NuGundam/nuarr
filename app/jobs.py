@@ -606,6 +606,11 @@ class Worker:
             return ("Reading picture subtitles into text. Background work — it "
                     "waits behind everything else and stays off any disk "
                     "someone is watching from.")
+        if self.pool == "subs":
+            return ("Settling this file's subtitles — taking in what is beside "
+                    "it, removing what is inside twice, correcting a title. "
+                    "Its own pool, so it can never take a slot a transcode is "
+                    "waiting for.")
         if self.pool == "handler":
             return ("Repairing the file first, so it is not rebuilt and then "
                     "changed again underneath.")
@@ -959,6 +964,18 @@ def _capacity(pool: str) -> int:
         # 10-core box measured at 3% load that left nine cores idle while one
         # ground through 5,264 files.
         return max(1, getattr(w, "subocr_workers", 4))
+    if pool == "subs":
+        # ITS OWN POOL, AND A NARROW ONE. Most subtitle instructions are
+        # instant - binning a loose .srt, correcting a title in place - but the
+        # ones that are not are a full container copy, which is the same disk
+        # profile as a remux. Two at a time is what the background runner used
+        # before this moved into the queue, and the one-heavy-job-per-spindle
+        # rule below keeps those two off the same disk.
+        #
+        # It is a pool of its own rather than a share of passthrough so that
+        # subtitle work can never take a slot a transcode was waiting for: the
+        # two drain in parallel and neither can starve the other.
+        return max(1, min(2, getattr(w, "passthrough_workers", 4)))
     if pool == "handler":
         # Repairs are mostly single-threaded CPU/disk work and several of them
         # rewrite files in place, so run them narrowly.
@@ -1084,7 +1101,8 @@ async def enqueue(file_id: int, path: str, title: str = "",
     # Non-transcode work gets its own pool so it can be drained BEFORE any
     # encode starts, and a lower priority number so it sorts first.
     pool = ("passthrough" if kind == "transcode"
-            else "subocr" if kind == "sub_ocr" else "handler")
+            else "subocr" if kind == "sub_ocr"
+            else "subs" if kind == "subs" else "handler")
     if kind != "transcode":
         priority = min(priority, 50)
     # ...EXCEPT subtitle OCR, which is explicitly background work. The clamp
@@ -1218,6 +1236,20 @@ def _heavy(pool_name: str, plan_obj=None) -> bool:
     "one heavy job per spindle" rule did not apply to it, so several parallel
     OCR jobs could all land on the same disk and thrash it.
     """
+    if pool_name == "subs":
+        # A SUBTITLE JOB IS ONLY HEAVY WHEN IT REWRITES THE CONTAINER. Most of
+        # them do not: recycling a loose copy is a file move, correcting a
+        # title is mkvpropedit writing a header in place, and neither reads the
+        # video at all. Treating all of them as heavy would idle a spindle for
+        # a second of work; treating none of them as heavy would let two full
+        # container copies land on one disk. The plan says which this is.
+        try:
+            return bool(getattr(plan_obj, "rewrite", None)
+                        if plan_obj is not None
+                           and not isinstance(plan_obj, dict)
+                        else (plan_obj or {}).get("rewrite"))
+        except Exception:                                # noqa: BLE001
+            return True
     return pool_name in ("passthrough", "subocr")
 
 
@@ -1888,7 +1920,7 @@ async def pump() -> None:
                 # entire film for no reason. Each pool now asks whether anything
                 # holds IT specifically.
                 if any(st.open_for(p) for p in
-                       ("handler", "encode", "passthrough", "subocr")):
+                       ("handler", "encode", "passthrough", "subocr", "subs")):
                     async with _lock:
                         # HANDLERS FIRST. OCR, repairs and flag fixes must finish
                         # before a transcode touches the same library, otherwise
@@ -1902,8 +1934,20 @@ async def pump() -> None:
                         # from the handler block, because unlike a repair it
                         # does not race a transcode - _sub_ocr hands off to one
                         # when both apply.
-                        for pool in ("handler", "encode", "passthrough", "subocr"):
-                            if pool not in ("handler", "subocr") and blocked:
+                        # SUBTITLES GO WITH THE HANDLERS, FIRST AND EXEMPT.
+                        # Same argument the comment above makes about repairs:
+                        # a subtitle instruction rewrites the container, so
+                        # encoding a file that is about to be rewritten burns
+                        # GPU time and then collides on the commit. And it is
+                        # exempt from the handler block for subocr's reason -
+                        # it cannot race a transcode, because enqueue refuses
+                        # a second live job for a file, so a transcode that is
+                        # already queued simply keeps the subtitle row waiting
+                        # for the next top-up.
+                        for pool in ("handler", "subs", "encode",
+                                     "passthrough", "subocr"):
+                            if pool not in ("handler", "subs", "subocr") \
+                                    and blocked:
                                 continue
                             if not st.open_for(pool):
                                 continue
@@ -2792,6 +2836,16 @@ async def _run(job: Job, pool: str) -> None:
         # every sub_ocr job fail with "unknown handler 'sub_ocr'" - it never
         # reached the native branch because this one caught it first. Both are
         # guarded now; a third would be a reason to collapse them.
+        # SUBTITLES ARE SETTLED HERE TOO, AND BEFORE THE PROBE. The whole
+        # instruction was decided from the facts table before this job existed
+        # (see subplan) and the worker re-reads the live container itself, so
+        # an ffprobe at this point would be a subprocess whose answer nothing
+        # reads. Guarded at BOTH dispatch sites for the reason the comment
+        # below sub_ocr gives.
+        if job.kind == "subs":
+            await _subs_job(w)
+            return
+
         if job.kind == "sub_ocr":
             data = await probe(job.path)
             if not data:
@@ -2914,6 +2968,10 @@ async def _run(job: Job, pool: str) -> None:
         # rewriting a library file safe, and 9.95 TB of remuxing has no
         # business going round it. Checked before the handler branch so it can
         # never fall through to the shell-out path.
+        if job.kind == "subs":
+            await _subs_job(w)
+            return
+
         if job.kind == "sub_ocr":
             await _sub_ocr(w, data)
             return
@@ -3313,6 +3371,68 @@ def _commit_stage_cb(w: Worker):
             except Exception:
                 pass
     return _on_stage
+
+
+async def _subs_job(w: Worker) -> None:
+    r"""Carry out one file's subtitle instruction, inside a job.
+
+    WHY IT IS A JOB AND NOT A BACKGROUND SWEEP ANY MORE. It used to be both:
+    the sidecar work, the duplicate work and the marking each ran on their own
+    schedule off to one side, so "what is nuarr doing" had two answers
+    depending on which page you were looking at. A subtitle rewrite is a full
+    container copy committed over a library file - exactly what the queue, the
+    gate, the spindle rule and the commit path exist for - so it belongs in
+    them rather than beside them.
+
+    THE INSTRUCTION IS NOT RE-DECIDED HERE. subplan wrote it, subqueue holds
+    it, and this runs it; the worker re-reads the live container to join the
+    plan's ordinals to mkvmerge's own numbers, and abandons the job rather
+    than guessing if the file has changed since. What the queue shows you
+    before it starts is what runs.
+    """
+    from . import subqueue
+    job = w.job
+    w.set_stage("subtitles")
+    before = os.path.getsize(job.path) if os.path.exists(job.path) else 0
+    if not getattr(w, "disk", ""):
+        try:
+            with cursor() as cur:
+                r = cur.execute("SELECT pool_disk FROM files WHERE id=?",
+                                (job.file_id,)).fetchone()
+            w.disk = (r["pool_disk"] if r else "") or ""
+        except Exception:                                # noqa: BLE001
+            w.disk = ""
+
+    row = await asyncio.to_thread(subqueue.row_for, int(job.file_id))
+    if not row:
+        joblog.log("nothing left to do to this file's subtitles", "ok", job.id)
+        _finish(job, "skipped", 0, 0,
+                note="the instruction was already carried out")
+        return
+
+    def _prog(pct):
+        try:
+            w.progress = max(0.0, min(1.0, float(pct) / 100.0))
+        except (TypeError, ValueError):
+            pass
+    # The reporter doubles as the handle the rewrite hangs its own reporting
+    # on - see subqueue.do_one, which reads .task off it to join the shared
+    # ledger. There is no ledger entry here: the job IS the entry.
+    _prog.task = None
+
+    for s in (row.get("plan") or {}).get("steps", []):
+        joblog.log(f"will {s}", "info", job.id)
+    res = await asyncio.to_thread(subqueue.do_one, row, _prog, False)
+    after = os.path.getsize(job.path) if os.path.exists(job.path) else 0
+    await asyncio.to_thread(subqueue.note_result, int(job.file_id), res)
+    if res.get("ok"):
+        joblog.log(row.get("why") or "subtitles settled", "ok", job.id)
+        _finish(job, "done", before, after,
+                note=(row.get("why") or "subtitles settled")[:300])
+    else:
+        why = str(res.get("why") or "the instruction could not be carried out")
+        joblog.log(f"FAILED: {why}", "error", job.id)
+        _finish(job, "failed", before, after, why[:400])
 
 
 async def _sub_ocr(w: Worker, probe_data: dict) -> None:
@@ -5503,10 +5623,12 @@ def live_snapshot() -> dict:
         "paused_reason": PAUSED_REASON,
         "capacity": {"encode": _capacity("encode"),
                      "passthrough": _capacity("passthrough"),
-                     "subocr": _capacity("subocr")},
+                     "subocr": _capacity("subocr"),
+                     "subs": _capacity("subs")},
         "in_use": {"encode": _in_pool("encode"),
                    "passthrough": _in_pool("passthrough"),
-                   "subocr": _in_pool("subocr")},
+                   "subocr": _in_pool("subocr"),
+                   "subs": _in_pool("subs")},
         "subocr_inline": sum(1 for w in workers if w.sub_ocr_active),
         # How the recently-finished jobs ended, so a ghost card can say what
         # actually happened instead of assuming success. See FATE.
@@ -5611,10 +5733,12 @@ def snapshot(recent_limit: int = 60) -> dict:
         "paused_reason": PAUSED_REASON,
         "capacity": {"encode": _capacity("encode"),
                      "passthrough": _capacity("passthrough"),
-                     "subocr": _capacity("subocr")},
+                     "subocr": _capacity("subocr"),
+                     "subs": _capacity("subs")},
         "in_use": {"encode": _in_pool("encode"),
                    "passthrough": _in_pool("passthrough"),
-                   "subocr": _in_pool("subocr")},
+                   "subocr": _in_pool("subocr"),
+                   "subs": _in_pool("subs")},
         # How much of the subocr figure above is running INSIDE a transcode
         # rather than as a job of its own. Same budget, different home, and the
         # header says so instead of leaving you to wonder why the count moves

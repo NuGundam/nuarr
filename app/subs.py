@@ -521,6 +521,38 @@ def working() -> list:
         return []
 
 
+def _subtitle_jobs() -> dict:
+    r"""The subtitle jobs on the main queue: how many, and what is moving.
+
+    READ FROM THE JOBS TABLE AND THE RUNNING WORKERS, not from anything this
+    module keeps. There is one queue and one set of workers; a second count
+    kept here would be a second opinion about the same rows, which is the
+    failure this whole page has been built to avoid.
+    """
+    out = {"running": 0, "queued": 0, "rows": []}
+    try:
+        from .db import cursor
+        with cursor() as cur:
+            for r in cur.execute(
+                    "SELECT state, COUNT(*) n FROM jobs "
+                    " WHERE kind='subs' AND state IN ('queued','running') "
+                    " GROUP BY state"):
+                out[r["state"]] = int(r["n"] or 0)
+    except Exception:                                            # noqa: BLE001
+        pass
+    try:
+        from . import jobs
+        for w in list(jobs.RUNNING.values()):
+            if getattr(w.job, "kind", "") != "subs":
+                continue
+            out["rows"].append({"title": w.job.title or "",
+                                "disk": getattr(w, "disk", "") or "",
+                                "progress": float(getattr(w, "progress", 0.0))})
+    except Exception:                                            # noqa: BLE001
+        pass
+    return out
+
+
 def overview(limit: int = 400, force: bool = False) -> dict:
     """Everything the page needs, in one answer, at most once every 20s.
 
@@ -556,6 +588,11 @@ def overview(limit: int = 400, force: bool = False) -> dict:
         d["queue"] = (subqueue.stats() or {}).get("q") or {}
         d["rev"] = subplan.revision()
         d["replanning"] = bool(subqueue.STATE.get("replanning"))
+        # WHAT THE MAIN QUEUE HAS OF OURS. The work runs over there now, so
+        # this page reports it rather than owning it - how many subtitle jobs
+        # are running, how many are waiting behind them, and enough of the
+        # live ones to show something moving.
+        d["jobs"] = _subtitle_jobs()
     except Exception:                                            # noqa: BLE001
         d["scan"], d["queue"] = {}, {}
     # THE RUNNER'S OWN STRIP, SHIPPED WITH THE PAGE. It used to be fetched

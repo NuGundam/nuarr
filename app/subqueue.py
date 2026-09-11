@@ -64,7 +64,10 @@ _CTX: dict = {"at": 0.0, "data": None}
 _CTX_TTL = 60.0
 
 STATE: dict = {"replanning": False, "at": 0.0, "took": 0.0, "made": 0,
-               "gone": 0, "changed": 0, "rev": "", "err": ""}
+               "gone": 0, "changed": 0, "rev": "", "err": "",
+               # How many rows the last pass handed to the main job queue, and
+               # how many subtitle jobs are live on it right now.
+               "fed": 0, "on_queue": 0}
 
 
 def init() -> None:
@@ -99,6 +102,21 @@ def init() -> None:
                     "ON sub_queue(state, priority, queued_at)")
         cur.execute("CREATE INDEX IF NOT EXISTS ix_sub_queue_fin "
                     "ON sub_queue(finished_at DESC)")
+        # A ROW MARKED RUNNING WITH NOBODY RUNNING IT IS A ROW FROM BEFORE THE
+        # RESTART. The worker sets that state and the process that was going
+        # to clear it is gone, so without this the file is stuck: replan will
+        # not touch a running row, and no worker will ever pick it up again
+        # because pending() only looks at queued ones. Put it back rather than
+        # fail it - nothing was necessarily wrong with the file, the machine
+        # simply stopped.
+        try:
+            cur.execute(
+                "UPDATE sub_queue SET state='queued', started_at=0 "
+                " WHERE state='running' AND file_id NOT IN "
+                "   (SELECT file_id FROM jobs WHERE kind='subs' "
+                "     AND state='running' AND file_id IS NOT NULL)")
+        except Exception:                                        # noqa: BLE001
+            pass
     _READY = True
 
 
@@ -252,7 +270,116 @@ def _mark(file_id: int, state: str, **kw) -> None:
                     args)
 
 
-def do_one(row: dict, report=None) -> dict:
+def row_for(file_id: int) -> dict:
+    r"""The instruction for one file, marked as running. For the job worker.
+
+    MARKED HERE RATHER THAN WHEN THE JOB WAS MADE. There can be minutes
+    between a row being handed to the queue and a worker picking it up, and in
+    that time a rule change or a rescan may have re-planned it - so the state
+    that means "a worker has this" is set by the worker, and the row it reads
+    is whatever the row says at that moment rather than what it said when the
+    job row was written.
+    """
+    init()
+    with cursor() as cur:
+        r = cur.execute(
+            "SELECT file_id, path, name, library, disk, steps, n, why, rewrite "
+            "  FROM sub_queue WHERE file_id=?", (int(file_id),)).fetchone()
+    if not r:
+        return {}
+    d = dict(r)
+    try:
+        steps = json.loads(d.get("steps") or "[]")
+    except Exception:                                            # noqa: BLE001
+        steps = []
+    if not steps:
+        return {}
+    d["plan"] = {"steps": [s.get("why") or s.get("do") for s in steps]}
+    _mark(int(file_id), RUNNING, started_at=time.time())
+    return d
+
+
+def note_result(file_id: int, res: dict) -> None:
+    """What the worker found, written back onto the row."""
+    init()
+    fid = int(file_id)
+    if res.get("ok"):
+        _mark(fid, DONE, finished_at=time.time(), err="",
+              result=json.dumps(res)[:4000])
+        return
+    with cursor() as cur:
+        cur.execute("UPDATE sub_queue SET tries=tries+1 WHERE file_id=?", (fid,))
+        n = cur.execute("SELECT tries FROM sub_queue WHERE file_id=?",
+                        (fid,)).fetchone()
+    tries = int((n["tries"] if n else 0) or 0)
+    _mark(fid, FAILED if tries >= MAX_TRIES else QUEUED,
+          finished_at=time.time(), err=str(res.get("why") or "")[:400],
+          result=json.dumps(res)[:4000])
+
+
+# How many subtitle jobs to keep on the main queue at once. THE MANIFEST IS
+# NOT THE QUEUE - there are five thousand files wanting something and putting
+# all of them in the jobs table would make the queue panel a scrollbar and
+# every poll of it a page fault. autoqueue reached the same conclusion about
+# transcodes for the same reasons; this is the same answer with a smaller
+# number, because these drain much faster.
+QUEUE_DEPTH = 200
+
+
+def _to_hand_over(depth: int) -> tuple:
+    """How much room the queue has, and which rows would fill it."""
+    init()
+    with cursor() as cur:
+        have = int(cur.execute(
+            "SELECT COUNT(*) n FROM jobs "
+            " WHERE kind='subs' AND state IN ('queued','running')"
+        ).fetchone()["n"] or 0)
+        room = max(0, int(depth) - have)
+        if not room:
+            return have, []
+        return have, [dict(r) for r in cur.execute(
+            "SELECT file_id, path, name, rewrite FROM sub_queue "
+            " WHERE state=? ORDER BY priority, queued_at LIMIT ?",
+            (QUEUED, room))]
+
+
+async def topup(depth: int = QUEUE_DEPTH) -> dict:
+    r"""Hand what the reading is sure about to the main queue.
+
+    ONLY WHAT IT IS SURE ABOUT. A row with a question on it is in state 'ask'
+    and is never handed over - that is what "Yours to call" means. Answering
+    one re-plans it into 'queued', and then it comes through here like
+    anything else, which is why there is no separate route from an answer to
+    the work. One road in, and the thing you were asked about takes it like
+    everything else.
+
+    AND THE DUPLICATE GUARD IS RESPECTED RATHER THAN WORKED AROUND.
+    jobs.enqueue refuses a second live job for a file and raises to say so. A
+    file already being transcoded is a file whose subtitles the transcode will
+    carry in, or which can be settled the moment it is done - so a refusal is
+    counted and the row simply waits for the next top-up.
+    """
+    from . import jobs
+    made = skipped = 0
+    try:
+        have, rows = await asyncio.to_thread(_to_hand_over, depth)
+    except Exception as e:                                       # noqa: BLE001
+        return {"ok": False, "why": f"{type(e).__name__}: {e}"[:200]}
+    for r in rows:
+        try:
+            await jobs.enqueue(int(r["file_id"]), r["path"],
+                               r.get("name") or "", kind="subs",
+                               priority=50, source="subtitles")
+            made += 1
+        except ValueError:
+            skipped += 1
+        except Exception:                                        # noqa: BLE001
+            skipped += 1
+    return {"ok": True, "made": made, "skipped": skipped,
+            "on_queue": have + made}
+
+
+def do_one(row: dict, report=None, claim: bool = True) -> dict:
     r"""Carry out one file's whole instruction.
 
     THE ORDER IS NOT NEGOTIABLE. The container pass first, because everything
@@ -272,8 +399,12 @@ def do_one(row: dict, report=None) -> dict:
     if not os.path.exists(path):
         return {"ok": False, "why": "the file is not on disk"}
 
+    # A JOB IS ALREADY A LEDGER ENTRY. When this runs inside a worker the job
+    # card is what says which file, which disk and how far along - claiming a
+    # second entry in the background ledger would put the same file on the
+    # disk panel twice and count its bytes twice with it.
     work = getattr(report, "task", None)
-    mine = work is None
+    mine = claim and work is None
     if mine:
         work = idle.claim(SYSTEM, os.path.basename(path),
                           now=os.path.basename(path),
@@ -596,41 +727,24 @@ def stats() -> dict:
     return out
 
 
-# ------------------------------------------------------------- the runner --
-def _pending() -> list:
-    return pending(500)
+# ------------------------------------------------------- feeding the queue --
+def run_now(file_id: int) -> dict:
+    r"""Carry out one file's instruction here and now, without a job.
 
-
-def _do_one(row: dict, report=None) -> dict:
-    fid = int(row["file_id"])
-    _mark(fid, RUNNING, started_at=time.time())
-    t0 = time.time()
+    The one path that does not go through the queue, and it is for a person
+    pressing a button about one file they are looking at. Everything the
+    SYSTEM decides to do goes through the queue; this exists so that asking
+    for something by hand does not mean waiting for a top-up.
+    """
+    row = row_for(int(file_id))
+    if not row:
+        return {"ok": True, "why": "nothing to do to this file"}
     try:
-        r = do_one(row, report)
+        r = do_one(row)
     except Exception as e:                                       # noqa: BLE001
         r = {"ok": False, "why": f"{type(e).__name__}: {e}"[:240]}
-    took = time.time() - t0
-    if r.get("ok"):
-        _mark(fid, DONE, finished_at=time.time(), took=took, err="",
-              result=json.dumps(r)[:4000])
-        joblog.log(f"subtitles settled on {row.get('name') or fid}: "
-                   f"{row.get('why') or ''}", "ok", system="subtitles")
-    else:
-        with cursor() as cur:
-            cur.execute("UPDATE sub_queue SET tries=tries+1 WHERE file_id=?",
-                        (fid,))
-            n = cur.execute("SELECT tries FROM sub_queue WHERE file_id=?",
-                            (fid,)).fetchone()
-        tries = int((n["tries"] if n else 0) or 0)
-        _mark(fid, FAILED if tries >= MAX_TRIES else QUEUED,
-              finished_at=time.time(), took=took,
-              err=str(r.get("why") or "")[:400],
-              result=json.dumps(r)[:4000])
+    note_result(int(file_id), r)
     return r
-
-
-def _disk_of(row: dict) -> str:
-    return row.get("disk") or ""
 
 
 # How often the reader comes back. Fast while there is unread material, slow
@@ -640,19 +754,27 @@ READ_BUSY_S = 5.0
 READ_IDLE_S = 300.0
 
 
-async def _reader() -> None:
+async def _reader_and_feeder() -> None:
     r"""Read a slice of the library, then bring the queue into line with it.
 
-    ITS OWN LOOP, BESIDE THE WORKER RATHER THAN INSIDE IT. idle.run never
-    returns - it is the process's working life - so anything that has to keep
-    happening cannot sit in front of it. And these are genuinely two different
-    jobs: one gathers what is true and costs a listdir, the other rewrites
-    containers. Tying them together would mean the library stopped being read
-    whenever there was work, which is exactly when new work is arriving.
+    THREE THINGS IN ORDER, AND NONE OF THEM DOES THE WORK.
 
-    IT STANDS ASIDE FOR THE SAME REASONS THE WORKER DOES. A listdir across a
-    spun-down pool disk is not free while somebody is watching something, so
-    the same gate answers for both.
+        read     a slice of the library into the facts table
+        plan     bring the queue into line with the facts and the rules
+        hand over  put what it is SURE about onto the main job queue
+
+    That last step is the change Erik asked for: the reading no longer feeds a
+    worker of its own, it feeds the queue everything else goes through, and
+    the work appears in Processing System beside the transcodes. There is one
+    place to look at what nuarr is doing to a file again.
+
+    READING STANDS ASIDE; HANDING OVER DOES NOT. A listdir across a spun-down
+    pool disk is not free while somebody is watching something, so the scan
+    waits for the gate. Writing a row to the jobs table costs nothing and
+    blocks nobody, and whether the WORK may start is not this loop's question -
+    it is asked per job at dispatch, by the same gate that holds a transcode.
+    Holding the hand-over as well would only mean the queue sat empty at
+    exactly the moment it was allowed to drain.
     """
     from . import idle, subscan
     while True:
@@ -661,34 +783,29 @@ async def _reader() -> None:
             b = await idle.busy()
             if not b["busy"]:
                 await asyncio.to_thread(subscan.scan, subscan.BATCH)
-                d = await asyncio.to_thread(replan)
+                await asyncio.to_thread(replan)
                 left = int(subscan.counts().get("left") or 0)
-                # A NEW ROW IS NEWS. The worker sleeps five minutes after
-                # finding nothing; ringing the bell means work found by this
-                # pass starts now rather than when that sleep happens to end.
-                if (d.get("made") or 0) or (d.get("changed") or 0):
-                    idle.bump(KEY)
+        except Exception:                                        # noqa: BLE001
+            pass
+        try:
+            d = await topup()
+            STATE["fed"] = int(d.get("made") or 0)
+            STATE["on_queue"] = int(d.get("on_queue") or 0)
         except Exception:                                        # noqa: BLE001
             pass
         await asyncio.sleep(READ_BUSY_S if left else READ_IDLE_S)
 
 
-def _after(_d: dict) -> None:
-    """A finished pass re-plans at once, rather than waiting for the reader."""
-    try:
-        replan()
-    except Exception:                                            # noqa: BLE001
-        pass
-
-
 async def watch() -> None:
-    """The reader and the worker, side by side for the life of the process."""
-    from . import idle
-    await asyncio.gather(
-        _reader(),
-        idle.run(KEY, TITLE, _pending, _do_one,
-                 label=(lambda r: r.get("name") or ""),
-                 system_name=SYSTEM, disk_of=_disk_of,
-                 empty_s=300.0, pause_s=20.0, rank=40,
-                 goto="/settings#lang", on_pass=_after,
-                 note_of=(lambda r: r.get("why") or "")))
+    r"""Read, plan, hand over. The working is somebody else's job now.
+
+    THIS USED TO RUN A WORKER OF ITS OWN, on the shared background runner,
+    with its own pacing and its own idea of when the box was free. That was
+    one more schedule deciding when a library file gets rewritten, and it
+    meant the answer to "what is nuarr doing" depended on which page you had
+    open. The instruction is handed to the queue now and the queue's workers
+    carry it out under the gate, on the spindle rule, through the commit
+    path - the same treatment a transcode gets, because it is the same kind
+    of risk.
+    """
+    await _reader_and_feeder()

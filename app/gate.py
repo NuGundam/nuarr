@@ -222,7 +222,12 @@ class GateStatus:
     # letting it through. It reads and rewrites pool files exactly as
     # passthrough does, so anything holding passthrough for disk reasons must
     # hold this too.
-    POOLS = ("encode", "passthrough", "subocr")
+    # subs is here for exactly the same reason subocr is: a subtitle
+    # instruction can be a full container copy read from and written back to a
+    # pool spindle, so anything holding passthrough for disk reasons has to
+    # hold this as well. Naming it means a hold SAYS it is holding subtitle
+    # work rather than letting it through in silence.
+    POOLS = ("encode", "passthrough", "subocr", "subs")
 
     def headline(self) -> dict:
         """What the banner says: what is held, by whom, and what frees it.

@@ -7634,9 +7634,16 @@ async def api_subqueue_answer(file_id: int, question: str, choice: str,
     from . import subqueue
     r = await asyncio.to_thread(subqueue.answer, int(file_id), question,
                                 choice, scope)
+    # AND STRAIGHT ONTO THE QUEUE IF THE ANSWER MEANT WORK. Waiting for the
+    # next top-up would be up to five minutes of a panel saying it had taken
+    # your decision and nothing visibly happening because of it.
     try:
-        from . import idle, subs
-        idle.bump(subqueue.KEY)
+        fed = await subqueue.topup()
+        r["queued_now"] = int(fed.get("made") or 0)
+    except Exception:                                            # noqa: BLE001
+        pass
+    try:
+        from . import subs
         subs.bump()
     except Exception:                                            # noqa: BLE001
         pass
@@ -7648,8 +7655,8 @@ async def api_subqueue_requeue(file_id: int):
     from . import subqueue
     r = await asyncio.to_thread(subqueue.requeue, int(file_id))
     try:
-        from . import idle
-        idle.bump(subqueue.KEY)
+        fed = await subqueue.topup()
+        r["queued_now"] = int(fed.get("made") or 0)
     except Exception:                                            # noqa: BLE001
         pass
     return r
@@ -7662,8 +7669,12 @@ async def api_subqueue_replan(force: int = 1):
     subqueue.bump()
     r = await asyncio.to_thread(subqueue.replan, 100000, bool(force))
     try:
-        from . import idle, subs
-        idle.bump(subqueue.KEY)
+        fed = await subqueue.topup()
+        r["queued_now"] = int(fed.get("made") or 0)
+    except Exception:                                            # noqa: BLE001
+        pass
+    try:
+        from . import subs
         subs.bump()
     except Exception:                                            # noqa: BLE001
         pass
@@ -14044,7 +14055,7 @@ html.mobile #logsPane{height:auto;min-height:60vh}
     <div id="queueList" class="qbox"></div>
   </div>
   <div class="panel" id="transcoding">
-    <h2>Transcoding<span class="live"><span class="dot"></span>live</span>
+    <h2>Processing System<span class="live"><span class="dot"></span>live</span>
         <span class="live"><button onclick="cancelAll()"
           title="cancel every running job — the queue is left alone"
           >Cancel all</button></span></h2>
@@ -20449,6 +20460,7 @@ function poolColor(pool){
   return pool==='background'  ? '#5ad1c4'         // teal - the quiet fixers
        : pool==='encode'      ? 'var(--acc)'      // blue - GPU work
        : pool==='subocr'      ? '#b48bf2'         // purple - CPU OCR
+       : pool==='subs'        ? '#6fb0ff'         // the Subtitles page's blue
        : pool==='handler'     ? '#d2a8ff'         // lilac - script handlers
        : pool==='passthrough' ? 'var(--ok)'       // green - stream copy
        : 'var(--ok)';
@@ -21666,6 +21678,11 @@ async function loadJobs(){
   document.getElementById('jobCap').innerHTML =
     capCell('encode', j.in_use.encode, j.capacity.encode, 'encode')
     + capCell('passthrough', j.in_use.passthrough, j.capacity.passthrough, 'passthrough')
+    // AND THE SUBTITLE POOL, for exactly the reason the subocr comment below
+    // gives. It has its own two workers so it can never take a slot a
+    // transcode was waiting for, and a pool with its own workers that does not
+    // appear here is a pool nobody can tell is running.
+    + capCell('subs', (j.in_use||{}).subs||0, (j.capacity||{}).subs||0, 'subs')
     // subocr sat invisible here while running four workers - the header said
     // "encode 0/4 passthrough 0/6" over a machine grinding at full tilt.
     + capCell('subocr', (j.in_use||{}).subocr||0, (j.capacity||{}).subocr||0, 'subocr',
@@ -22982,7 +22999,7 @@ async function stopQueue(){
   b.done(`${fmt(j.queued)} queued — confirm to clear`);
   _qwBusy=false;
   if(!confirm(`Clear ${fmt(j.queued)} queued job(s)?\n\n`
-    +`Anything already running keeps going — use "Cancel all" in Transcoding `
+    +`Anything already running keeps going — use "Cancel all" in Processing System `
     +`to stop those.`)){ document.getElementById('qMsg').textContent=''; return; }
   _qwBusy=true;
   const b2=busy(`clearing ${fmt(j.queued)} queued job(s)…`,
@@ -28738,7 +28755,7 @@ function gapRender(){
     <div class="dim" style="font-size:10.5px;margin:3px 0 7px">Each job
       re-reads the rules when it starts. Subtitle-only work is a remux, not a
       re-encode. Watch them go through
-      <a href="/#transcoding">Transcoding on the dashboard</a>.</div>
+      <a href="/#transcoding">Processing System on the dashboard</a>.</div>
     ${gapWhyHtml()}
     <div id="gapRows">${(d.libraries&&d.libraries.length)
       ? gapLibsHtml()
@@ -29114,7 +29131,7 @@ its share already. The next batch goes in as these finish."
       <b>${fmt(dr.keep||100)}</b> of these are kept in the transcoding queue and
       topped up as they finish, so this stays behind everything else nuarr is
       doing instead of arriving as one library-wide rewrite. Watch it on
-      <a href="/#transcoding">Transcoding on the dashboard</a>.</div>
+      <a href="/#transcoding">Processing System on the dashboard</a>.</div>
   </div>`;
 }
 
@@ -29211,7 +29228,7 @@ function gapDone(dr){
   _gapBusy=null; _gapFading=true;
   const msg=document.getElementById('gapMsg');
   if(msg) msg.textContent = n
-    ? `handed over ${fmt(n)} — Transcoding is working through them`
+    ? `handed over ${fmt(n)} — Processing System is working through them`
     : 'nothing needed queueing — they were already in the queue or already right';
   for(const lib of targets){
     const row=document.getElementById(gapRowId(lib));
@@ -33815,58 +33832,46 @@ function subsScanHtml(){
 // taking from it, and a tail of what just finished. Anybody who can read the
 // Jobs page can read this without being taught a second vocabulary.
 function subsProcHtml(){
-  const q=_subs.queue||{}, W=(_subs.working||[]);
-  const R=(_subq&&_subq.running)||[], F=(_subq&&_subq.failed)||[],
-        D=(_subq&&_subq.recent)||[];
-  const depth=(q.queued||0)+(q.running||0);
-  if(!depth && !F.length && !D.length) return '';
-  const line=(t,cls)=>{
-    const c=t.disk?diskColor(t.disk):'#6fb0ff';
-    return `<div style="display:flex;gap:8px;align-items:baseline;font-size:11px;
-         margin-top:3px">
-      <span style="flex:1 1 auto;min-width:0;overflow:hidden;
-        text-overflow:ellipsis;white-space:nowrap;color:${c}"
-        title="${esc(t.path||t.name||'')}">${esc(t.name||'')}</span>
-      <span class="dim" style="flex:none;font-size:10.5px">${esc(t.why||'')}</span>
-      ${t.disk?`<span style="flex:none;color:${c};opacity:.8">${esc(t.disk)}</span>`:''}
-      ${cls==='fail'?`<button class="btn xs" onclick="subRequeue(${t.file_id},this)"
-         title="Read the file again and put it back on the queue as it stands today">again</button>`:''}
-    </div>`;
-  };
+  // A SUMMARY, BECAUSE THE WORK IS NOT HERE ANY MORE.
+  //
+  // This was a full panel: running jobs, the queue behind them, what failed,
+  // what had just finished. All of that is on Processing System now, beside
+  // the transcodes, because subtitle work became jobs like anything else -
+  // and a second full view of one queue is the thing this page has spent two
+  // rounds getting rid of. What stays is the one sentence you would come to
+  // this page to read: is any of it moving, and how much is left.
+  const q=_subs.queue||{}, j=(_subs.jobs||{});
+  const waiting=(q.queued||0), asking=(q.asking||0);
+  const live=(j.running||0)+(j.queued||0);
+  if(!waiting && !live && !(q.failed||0)) return '';
   return `<div class="lkind" style="padding:10px 12px;margin-bottom:8px">
     <div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap">
-      <b style="color:#6fb0ff">Processing</b>
+      ${j.running?'<span class="busy" style="color:var(--acc);flex:none"><span class="sp"></span></span>':''}
+      <b style="color:#6fb0ff">Being processed</b>
       <span class="dim" style="font-size:11.5px">${
-        depth?`${num(depth,'auto')} file${depth===1?'':'s'} on the queue${
-          q.steps?` · ${num(q.steps,'auto')} step${q.steps===1?'':'s'}`:''}`
-             :'<b style="color:var(--ok)">the queue is empty</b>'}${
+        j.running?`${num(j.running,'auto')} running`:'nothing running'}${
+        j.queued?` · ${num(j.queued,'auto')} handed over and waiting`:''}${
+        waiting?` · ${num(waiting,'auto')} still to hand over`:''}${
         q.failed?` · <span style="color:var(--warn)">${fmt(q.failed)} could not be done</span>`:''}</span>
-      <span class="dim" style="font-size:10.5px;margin-left:auto">one rewrite
-        per file — sidecars in and duplicates out in the same pass</span>
+      <a href="/#transcoding" style="margin-left:auto;flex:none"
+         title="Subtitle work is queued and run beside the transcodes now — same gate, same one-heavy-job-per-disk rule, same commit path.">watch it in Processing System →</a>
     </div>
-    ${(_subs.idle&&_subs.idle.subqueue)?`<div style="margin-top:5px">${
-      idleStrip(_subs.idle.subqueue,{})}</div>`:''}
-    ${W.length?`<div style="margin-top:6px">${W.map(t=>{
+    ${j.rows&&j.rows.length?`<div style="margin-top:5px">${j.rows.slice(0,3).map(t=>{
       const c=t.disk?diskColor(t.disk):'#6fb0ff';
       const p=Math.max(0,Math.min(100,Math.round((t.progress||0)*100)));
       return `<div style="display:flex;gap:8px;align-items:baseline;font-size:11px">
         <span style="flex:1 1 auto;min-width:0;overflow:hidden;
           text-overflow:ellipsis;white-space:nowrap;color:${c}"
-          title="${esc(t.file||'')}">${esc(t.file||'')}</span>
-        <span class="dim" style="flex:none">${esc(t.plan||'')}</span>
+          title="${esc(t.title||'')}">${esc(t.title||'')}</span>
         <b style="flex:none;color:${c}">${p}%</b>
         ${t.disk?`<span style="flex:none;color:${c};opacity:.8">${esc(t.disk)}</span>`:''}
       </div>
       <div class="hsbar item" style="margin-top:2px"><i
         style="width:${p}%;background:${c}"></i></div>`;}).join('')}</div>`:''}
-    ${F.length?`<div style="margin-top:7px">
-      <div class="dim" style="font-size:10.5px">Could not be done — read again
-        and retried ${fmt(F[0].tries||0)} times before it stopped</div>
-      ${F.slice(0,6).map(t=>line(t,'fail')
-        + `<div class="dim" style="font-size:10px;padding-left:2px">${esc((t.err||'').slice(0,160))}</div>`).join('')}</div>`:''}
-    ${D.length?`<div style="margin-top:7px">
-      <div class="dim" style="font-size:10.5px">Just done</div>
-      ${D.slice(0,5).map(t=>line(t,'done')).join('')}</div>`:''}
+    <div class="dim" style="font-size:10.5px;margin-top:4px">The reading hands
+      over what it is sure about; anything it is not sure about waits below
+      until you say. One rewrite per file — sidecars in and duplicates out in
+      the same pass.</div>
   </div>`;
 }
 
