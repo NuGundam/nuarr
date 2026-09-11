@@ -12206,6 +12206,13 @@ button[disabled]{opacity:.5;cursor:default}
   margin-top:3px;font-variant-numeric:tabular-nums;flex-wrap:wrap}
 #tmPane table td.c{text-align:center}
 #tmPane .scrollbox{border-top:1px solid var(--line)}
+/* ARRIVING AND LEAVING, BOTH VISIBLE. A row that blinks into existence and a
+   row that blinks out are the same failure: the table moves and you cannot
+   tell what moved. */
+#tmPane .tmrow{transition:opacity .4s linear, background-color .4s linear}
+#tmPane .tmrow.tmgone td{color:var(--dim)}
+#tmPane .tmrow.tmgone td:first-child b{text-decoration:line-through;
+  text-decoration-thickness:1px}
 .procpop.open{display:block}
 .procpop table{border-collapse:collapse;width:100%}
 .procpop td{padding:3px 0;white-space:nowrap}
@@ -24202,8 +24209,16 @@ function dpPrioHtml(d){
     <div style="display:flex;gap:12px;align-items:baseline;flex-wrap:wrap">
       <b style="color:#6fb0ff">Housekeeping priority</b>
       <span style="color:${col};font-size:12px">${esc(state)}</span>
-      ${p.why?`<span class="dim" style="font-size:11.5px">— ${esc(p.why)}${
-        p.since?` · ${dpDur(Math.max(0,Date.now()/1000-p.since))} ago`:''}</span>`:''}
+      ${p.why?`<span class="dim" style="font-size:11.5px">— ${
+        // A SPINDLE IS THE SAME COLOUR EVERYWHERE ON THIS PAGE. The reason
+        // names disks and was printing them as plain grey text, so the one
+        // sentence that says WHICH disk is being protected was the only place
+        // on the page where a disk name was not recognisable at a glance.
+        (p.disks||[]).reduce((t,dk)=>t.split(dk).join(
+          `<b style="color:${diskColor(dk)}">${esc(dk)}</b>`), esc(p.why))
+      }${p.since?` · ${dpDur(Math.max(0,Date.now()/1000-p.since))} ago`:''}${
+        p.linger_left?` · holding for another ${dpDur(p.linger_left)} after the
+          reason clears`:''}</span>`:''}
       <label class="gsw" style="margin-left:auto"
         title="Windows can lower another program's I/O and CPU priority in real time; dpcmd has no command for it. Only DrivePool's SERVICE processes are touched - the pool's own reads and writes go through the covefs kernel driver, not the service - so this slows balancing, duplication and re-measuring and nothing else.">
         <input type="checkbox" ${on?'checked':''}
@@ -24220,7 +24235,11 @@ function dpPrioHtml(d){
       moment neither is true. The balance takes longer; nothing stops.
       Very low rather than idle, because an idle-class process can be starved
       outright and a mover stalled halfway through a file is worse than a
-      slow one.
+      slow one. It is quick to step aside and slow to come back &mdash; ${
+        Math.round((p.linger_s||120)/60*10)/10} minutes after the last reason
+      clears &mdash; because the gap between two episodes is not the end of a
+      viewing session, and handing the array back during it is what makes the
+      next episode buffer.
     </div>
     ${procs.length?`<table style="width:100%;font-size:11.5px;margin-top:6px">
       <thead><tr class="dim" style="font-size:10px;letter-spacing:.05em">
@@ -24253,6 +24272,29 @@ function dpPrioHtml(d){
 // between those two is what the job gate steers on and what makes "the CPU is
 // at 97%" either alarming or irrelevant.
 let _tm = null, _tmTimer = null, _tmSort = {by:'cpu', dir:-1}, _tmSeen = {};
+// A PROCESS THAT LASTS ONE SECOND STILL HAPPENED.
+//
+// Half of what nuarr spawns is gone before you can read it: an ffprobe, a
+// conhost, a mkvpropedit that writes one header and exits. On a one-second
+// repaint those rows appear and vanish between glances, which makes the table
+// feel like it is flickering at you rather than telling you something - and
+// the row you were trying to read is exactly the one that left.
+//
+// So a row that has gone is KEPT for a few seconds, greyed and struck
+// through, with its last known figures frozen. It is not pretending the
+// process is still there; it is admitting that it was. New rows fade in for
+// the same reason in reverse: something appearing is worth noticing, and an
+// instant appearance is indistinguishable from having always been there.
+// SIX SECONDS AND NO LIMIT PUT TWELVE GHOSTS UNDER FIVE LIVE ROWS. An
+// audio-language pass spawns an ffprobe and a conhost per file and they last
+// about a second each, so a generous linger turns the departures board into
+// most of the table - which is the same illegibility the fade was meant to
+// cure, arriving from the other direction. Long enough to read one, few
+// enough that the living still lead.
+const TM_LINGER_MS = 4000;
+const TM_GONE_MAX = 5;
+let _tmGone = {};                 // pid -> {row, at}
+let _tmPids = {};                 // pid -> first seen, for the fade-in
 
 function tmNum(v, unit){
   return `<b class="mono">${v}</b><span class="dim">${unit||''}</span>`;
@@ -24275,9 +24317,20 @@ function tmChart(rows, series, opts){
   const n = rows.length;
   if(n < 2) return `<div class="dim" style="font-size:11px;padding:14px 0">
     measuring — the first points arrive a second apart</div>`;
+  // A SERIES ON ITS OWN SCALE. Megabytes of nuarr's memory and a percentage
+  // of the machine's cannot share an axis, and drawing them as if they could
+  // is how a backdrop line ends up flat against the floor or pinned to the
+  // ceiling. Those get their own top and are drawn for shape rather than
+  // value; the legend still prints the real figure.
   let top = opts.max || 0;
-  for(const s of series) for(const r of rows) top = Math.max(top, s.get(r)||0);
+  for(const s of series) if(!s.axis)
+    for(const r of rows) top = Math.max(top, s.get(r)||0);
   if(!top) top = 1;
+  for(const s of series) if(s.axis){
+    let t2 = 0;
+    for(const r of rows) t2 = Math.max(t2, s.get(r)||0);
+    s._top = t2 || 1;
+  }
   const x = i => (i/(n-1))*W;
   const y = v => H - (Math.max(0, Math.min(top, v))/top)*H;
   // A BASELINE, SO AN EMPTY CHART READS AS EMPTY RATHER THAN BROKEN. With
@@ -24287,8 +24340,10 @@ function tmChart(rows, series, opts){
     stroke-width="0.6" vector-effect="non-scaling-stroke" fill="none"/>`;
   const paths = base + series.map(s=>{
     let d = '';
+    const yy = s.axis ? (v => H - (Math.max(0, Math.min(s._top, v))/s._top)*H)
+                      : y;
     rows.forEach((r,i)=>{ d += (i?'L':'M') + x(i).toFixed(2) + ' '
-                               + y(s.get(r)||0).toFixed(2) + ' '; });
+                               + yy(s.get(r)||0).toFixed(2) + ' '; });
     const area = d + `L ${W} ${H} L 0 ${H} Z`;
     return `${s.fill!==false?`<path d="${area}" fill="${s.colour}" opacity=".12"/>`:''}
       <path d="${d}" fill="none" stroke="${s.colour}" stroke-width="0.9"
@@ -24296,8 +24351,9 @@ function tmChart(rows, series, opts){
   }).join('');
   const last = series.map(s=>{
     const v = s.get(rows[n-1])||0;
+    const f = s.fmt || opts.fmt;
     return `<span style="color:${s.colour}">${esc(s.name)} ${
-      opts.fmt?opts.fmt(v):Math.round(v)+'%'}</span>`;
+      f?f(v):Math.round(v)+'%'}</span>`;
   }).join('<span class="dim"> · </span>');
   return `<div class="tmchart">
     <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">${paths}</svg>
@@ -24346,14 +24402,44 @@ function tmTick(){
     }
     try{ await loadTaskmgr(); }
     catch(_){ tmTick(); }
-  }, 2000);
+    // ONE SECOND, WHICH IS THE RATE THE HISTORY IS SAMPLED AT. Two seconds
+    // meant every repaint stepped the line twice, which reads as a stutter on
+    // a graph that is otherwise smooth - and the endpoint is nuarr's own
+    // process tree and a dict read, so the extra poll costs about what the
+    // sampler already spends.
+  }, 1000);
 }
 function tmPaint(){
   const el = document.getElementById('tmPane'); if(!el || !_tm) return;
   const S = _tm.sample || {}, me = S.nuarr || {}, g = S.gpu || {};
   const H = (_tm.history||{}).rows || [];
   const cores = (_tm.history||{}).cores || S.cpu_cores || 1;
+  const nowMs = Date.now();
   const procs = (me.proc_list||[]).slice();
+  // Anything that was here last time and is not here now goes to the
+  // departures board rather than simply ceasing to exist.
+  const live = new Set(procs.map(p=>p.pid));
+  for(const p of procs){
+    if(_tmPids[p.pid] === undefined) _tmPids[p.pid] = nowMs;
+    delete _tmGone[p.pid];
+  }
+  for(const pid in _tmPids){
+    if(!live.has(+pid) && !_tmGone[pid]){
+      const was = (_tmSeen.last||[]).find(x=>x.pid===+pid);
+      if(was) _tmGone[pid] = {row: was, at: nowMs};
+      delete _tmPids[pid];
+    }
+  }
+  for(const pid in _tmGone){
+    if(nowMs - _tmGone[pid].at > TM_LINGER_MS) delete _tmGone[pid];
+  }
+  // Newest departures first, and only a few of them.
+  Object.keys(_tmGone)
+    .sort((a,b)=>_tmGone[b].at - _tmGone[a].at)
+    .slice(0, TM_GONE_MAX)
+    .forEach(pid=>procs.push(
+      Object.assign({}, _tmGone[pid].row, {_gone: true})));
+  _tmSeen.last = (me.proc_list||[]).slice();
   const idl = _tm.idle || {}, jb = _tm.jobs || {};
 
   // ---- the four headline figures, each with its own line ------------------
@@ -24364,21 +24450,40 @@ function tmPaint(){
        {name:'nuarr', colour:'#58a6ff', get:r=>r.cpu},
        {name:'the box', colour:'#8b949e', get:r=>r.cpu_all, fill:false}],
        {max:100, peak:true})},
-    {t:'Memory', sub:'resident across every process nuarr has spawned',
-     html: tmChart(H, [{name:'nuarr', colour:'#7fd18c', get:r=>r.ram_mb}],
+    // THE MACHINE'S OWN LINE ON EVERY CHART, IN GREY. It was on the
+    // processor one because that gap is what the gate steers on - and the
+    // same argument holds for the rest: nuarr at 1.28 GB means one thing on
+    // a box at 20% memory and another on a box at 95%. Grey and unfilled
+    // throughout, so it reads as the backdrop it is rather than competing
+    // with the figure the card is about.
+    {t:'Memory', sub:`resident across every process nuarr has spawned, against
+        how full the machine's memory is`,
+     html: tmChart(H, [
+       {name:'nuarr', colour:'#7fd18c', get:r=>r.ram_mb},
+       {name:'the box', colour:'#8b949e', fill:false, axis:'right',
+        get:r=>r.ram_all_pct, fmt:v=>Math.round(v)+'%'}],
        {peak:true, fmt:v=>tmMb(v)})},
     {t:'Graphics', sub:`${esc(g.name||'no card reported')} — the encoder is the
         engine an encode actually runs on; the SM figure sits far below it`,
      html: tmChart(H, [
        {name:'encoder', colour:'#e8a33d', get:r=>r.enc},
        {name:'decoder', colour:'#c98cf0', get:r=>r.dec, fill:false},
-       {name:'cores',   colour:'#5ad1c4', get:r=>r.gpu, fill:false}],
+       {name:'cores',   colour:'#5ad1c4', get:r=>r.gpu, fill:false},
+       // The card is the whole card, so its memory IS the machine's line
+       // here - there is no nuarr-only figure to compare against.
+       {name:'card memory', colour:'#8b949e', fill:false, axis:'right',
+        get:r=>r.gpu_mem, fmt:v=>v?Math.round(v)+' MB':'—'}],
        {max:100, peak:true})},
     {t:'Disk', sub:`what nuarr's own processes are moving — summed from their
         own counters, so nothing here can be somebody else's work`,
      html: tmChart(H, [
        {name:'read',  colour:'#58a6ff', get:r=>r.read},
-       {name:'write', colour:'#f0883e', get:r=>r.write}],
+       {name:'write', colour:'#f0883e', get:r=>r.write},
+       // The cache volume, which every encode and every remux stages through
+       // - the nearest thing to "the machine's disks" that means anything
+       // here, and the one whose figure is almost entirely nuarr's doing.
+       {name:'the cache', colour:'#8b949e', fill:false,
+        get:r=>(r.cache_read||0)+(r.cache_write||0)}],
        {peak:true, fmt:v=>tmBps(v)})},
   ];
   const grid = `<div class="tmgrid">${cards.map(c=>`<div class="lkind tmcard">
@@ -24397,6 +24502,8 @@ function tmPaint(){
     return 0;
   };
   procs.sort((a,b)=>{
+    // Gone last, always: a departures row is a footnote, not a result.
+    if(!!a._gone !== !!b._gone) return a._gone ? 1 : -1;
     const x=val(a,_tmSort.by), y=val(b,_tmSort.by);
     return (x<y?-1:x>y?1:0)*_tmSort.dir;
   });
@@ -24412,8 +24519,11 @@ function tmPaint(){
       _tmSort.by===k?1:.25}">${_tmSort.by===k&&_tmSort.dir<0?' ▾':' ▴'}</span></th>`;
   const ptable = `<div class="lkind" style="padding:0;overflow:hidden">
     <div class="tmhead" style="padding:9px 12px 0"><b>Processes</b>
-      <span class="dim" style="font-weight:400"> — ${fmt(procs.length)}, named
-        by the work they are doing rather than by the executable</span></div>
+      <span class="dim" style="font-weight:400"> — ${
+        fmt(procs.filter(p=>!p._gone).length)}, named by the work they are
+        doing rather than by the executable${
+        procs.some(p=>p._gone)?`, and ${fmt(procs.filter(p=>p._gone).length)}
+        that has just finished`:''}</span></div>
     <div class="scrollbox" style="max-height:340px;margin:6px 0 0">
     <table style="width:100%;font-size:11.5px;border-collapse:collapse">
       <thead><tr>${th('name','Doing what','left')}${th('what','On what','left')}
@@ -24427,7 +24537,21 @@ function tmPaint(){
         const share = cores ? (p.cpu_pct||0)/cores : (p.cpu_pct||0);
         const stale = !p.self && (p.age_s||0) >= 600;
         const low = p.io_prio!=null && p.io_prio<=1;
-        return `<tr style="border-top:1px solid var(--line)">
+        // THE FADE IS COMPUTED, NOT ANIMATED, because the table is
+        // rebuilt every second: a CSS animation would restart on every
+        // repaint and a six-second fade would never get past its first
+        // second. An elapsed time turned into an opacity does not care how
+        // often it is asked.
+        const goneMs = p._gone ? (nowMs - ((_tmGone[p.pid]||{}).at||nowMs)) : 0;
+        const newMs  = p._gone ? 0 : (nowMs - (_tmPids[p.pid]||nowMs));
+        const op = p._gone ? Math.max(0.06, 0.62*(1 - goneMs/TM_LINGER_MS))
+                 : Math.min(1, 0.25 + newMs/500);
+        const tint = (!p._gone && newMs < 1400)
+          ? `background:rgba(88,166,255,${(0.16*(1-newMs/1400)).toFixed(3)});`
+          : '';
+        const cls = p._gone ? ' tmgone' : '';
+        return `<tr class="tmrow${cls}" style="border-top:1px solid var(--line);
+          opacity:${op.toFixed(3)};${tint}">
         <td style="padding:4px 6px;text-align:left">
           <b style="color:${p.self?'var(--acc)':(stale?'var(--warn)':'var(--fg)')}"
             >${esc(p.activity||p.name||'?')}</b>${p.self?'<span class="dim"> (the server)</span>':''}
@@ -24442,7 +24566,8 @@ function tmPaint(){
           >${(p.age_s||0)>=60?hms(p.age_s):(p.age_s||0)+'s'}</td>
         <td class="c mono" style="color:${low?'var(--warn)':'var(--dim)'}"
           title="${esc('disk '+(IOW[p.io_prio]||p.io_prio||'?')+', cpu '+(CPUW[p.cpu_prio]||p.cpu_prio||'?'))}"
-          >${low?'yielding':(IOW[p.io_prio]||'—')}</td>
+          >${p._gone?'<span class="dim">finished</span>'
+            :(low?'yielding':(IOW[p.io_prio]||'—'))}</td>
       </tr>`;}).join('')}</tbody></table></div></div>`;
 
   // ---- and what its background systems are holding -----------------------
@@ -24483,8 +24608,9 @@ function tmPaint(){
       <b style="font-size:13px">Task manager</b>
       <span class="dim" style="font-size:11.5px">nuarr only — its own
         processor share, memory, graphics engines and disk traffic, and every
-        process it has spawned. Updated every two seconds; the lines hold the
-        last ${Math.round((H.length||0)*((_tm.history||{}).every_s||1))}
+        process it has spawned. Updated every second, which is the rate the
+        readings are taken at; the lines hold the last ${
+        Math.round((H.length||0)*((_tm.history||{}).every_s||1))}
         seconds.</span>
       <span class="dim mono" style="margin-left:auto;font-size:11px">${
         tmNum((me.cpu_pct||0).toFixed(1),'% cpu')} ·
@@ -24496,6 +24622,9 @@ function tmPaint(){
   // The scroll box and the sort order have to survive a two-second repaint,
   // so only the parts that changed are written - same rule as the sidecar
   // panel, for the same reason.
+  // The opacity of a fading row is part of the html, so an unchanged string
+  // genuinely means nothing moved - which is the cheap case and the common
+  // one when the box is quiet.
   if(_tmSeen.html !== html){
     const box = el.querySelector('.scrollbox');
     const keep = box ? box.scrollTop : 0;

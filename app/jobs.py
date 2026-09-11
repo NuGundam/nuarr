@@ -2200,10 +2200,10 @@ def _drivepool_yield(watched: set | None = None,
             if (dp._PRIO or {}).get("low"):
                 dp.set_priority(False)
             return
-        why = ""
+        why, on = "", []
         if watched:
-            why = ("somebody is watching "
-                   + ", ".join(sorted(watched)[:3]))
+            on = sorted(watched)[:3]
+            why = "somebody is watching " + ", ".join(on)
         elif everything:
             why = "nuarr's own work is being held for a move"
         else:
@@ -2212,10 +2212,27 @@ def _drivepool_yield(watched: set | None = None,
                 why = hw or "the queue is held for a move"
         if why and not dp.moving():
             # Nothing is actually moving, so there is nothing to step aside.
-            why = ""
+            why, on = "", []
         want = bool(why)
-        if want != bool((dp._PRIO or {}).get("low")):
-            dp.set_priority(want, why)
+        low = bool((dp._PRIO or {}).get("low"))
+        now = time.time()
+        if want:
+            dp._PRIO["clear_at"] = 0.0
+            # RESTATED EVERY TIME THE REASON MOVES. The viewer changes disk,
+            # the balance changes phase, the hold changes owner - and the
+            # sentence on the panel has to follow, or it names whichever disk
+            # happened to be involved when this started.
+            if not low or why != (dp._PRIO or {}).get("why"):
+                dp.set_priority(True, why, on)
+        elif low:
+            # SLOW TO TAKE IT BACK. See drivepool.DP_LINGER_S: the gap between
+            # two episodes is not the end of a viewing session, and treating
+            # it as one is what made the next episode buffer.
+            if not dp._PRIO.get("clear_at"):
+                dp._PRIO["clear_at"] = now
+            elif now - dp._PRIO["clear_at"] >= dp.DP_LINGER_S:
+                dp._PRIO["clear_at"] = 0.0
+                dp.set_priority(False)
     except Exception:                                            # noqa: BLE001
         pass
 

@@ -143,8 +143,23 @@ _IO = {"at": 0.0, "r": 0, "w": 0}
 # share - the balance takes longer, the queue keeps moving, and the viewer is
 # ahead of both.
 DP_PROCS = ("drivepool.service.exe", "drivepool.service.native.exe")
-_PRIO = {"low": False, "at": 0.0, "why": "", "pids": {}, "err": "",
-         "can": None}
+
+# HOW LONG IT STAYS STEPPED ASIDE AFTER THE REASON HAS GONE.
+#
+# Asymmetric on purpose, and for the same reason jobs.IO_HOLD_S exists: fast
+# to yield, slow to take back. Plex closes one episode and opens the next, and
+# for a second or two in between there is no session on any disk at all - so
+# the mover was handed the array back at full speed, put 167 MB/s through a
+# spindle, and was demoted again once the next episode registered. The viewer
+# pays for that gap twice: once for the burst and once for the seek storm
+# when it is throttled back. Erik watched exactly that happen and the next
+# episode buffered.
+#
+# Being wrong about yielding costs a balance some minutes. Being wrong about
+# taking it back costs somebody's playback.
+DP_LINGER_S = 120.0
+_PRIO = {"low": False, "at": 0.0, "why": "", "disks": [], "pids": {},
+         "err": "", "can": None, "clear_at": 0.0}
 
 
 def _dp_processes() -> list:
@@ -184,15 +199,24 @@ def priority() -> dict:
                 norm_n += 1
         except Exception:                                    # noqa: BLE001
             continue
+    left = 0.0
+    if _PRIO.get("low") and _PRIO.get("clear_at"):
+        left = max(0.0, DP_LINGER_S - (time.time() - _PRIO["clear_at"]))
     return {"ok": bool(rows), "procs": rows, "low": bool(low_n and not norm_n),
             "mixed": bool(low_n and norm_n),
             "want_low": bool(_PRIO["low"]), "why": _PRIO["why"],
+            # The disks the reason is about, so a panel can colour them the
+            # way every other mention of a spindle on this page is coloured.
+            "disks": list(_PRIO.get("disks") or []),
             "since": _PRIO["at"], "err": _PRIO["err"],
             "can": _PRIO["can"],
+            # How much of the linger is left, so "why is it still low when
+            # nobody is watching" has an answer on screen.
+            "linger_s": DP_LINGER_S, "linger_left": round(left, 1),
             "enabled": get_toggle("drivepool.yield")}
 
 
-def set_priority(low: bool, why: str = "") -> dict:
+def set_priority(low: bool, why: str = "", disks=None) -> dict:
     """Demote or restore DrivePool's background half. Returns what happened.
 
     IDLE WAS THE WRONG FLOOR FOR NUARR'S OWN JOBS and it is the wrong floor
@@ -219,13 +243,25 @@ def set_priority(low: bool, why: str = "") -> dict:
             failed = f"{type(e).__name__}: {e}"
     _PRIO["can"] = bool(done) if not failed else False
     if done:
-        if bool(_PRIO["low"]) != bool(low) or why != _PRIO["why"]:
+        # THE REASON IS RESTATED, NOT REMEMBERED. It used to be written once,
+        # when the state changed, and then left alone for as long as the state
+        # held - so a demotion that began because somebody was watching
+        # NU-DRIVE-6 went on saying NU-DRIVE-6 after they had moved to
+        # NU-DRIVE-1 and the balance had moved on too. Ten minutes of a
+        # confidently wrong sentence about which disk was being protected.
+        changed = bool(_PRIO["low"]) != bool(low)
+        if changed:
             _log(f"DrivePool background priority "
                  + ("lowered" if low else "restored")
                  + (f" - {why}" if why and low else ""),
                  "info" if low else "ok")
-        _PRIO.update(low=bool(low), at=time.time(), why=(why if low else ""),
+        _PRIO.update(low=bool(low), why=(why if low else ""),
+                     disks=(list(disks or []) if low else []),
                      err=failed)
+        # `at` is "since when has it been in this state", so only a real
+        # change moves it; a restated reason must not reset the clock.
+        if changed or not _PRIO.get("at"):
+            _PRIO["at"] = time.time()
     else:
         _PRIO["err"] = failed or "DrivePool is not running"
     return {"ok": bool(done), "changed": done, "err": _PRIO["err"]}
