@@ -4042,6 +4042,28 @@ async def _transcode(w: Worker, probe_data: dict) -> None:
             # rescue would keep a full bar on the card through the commit.
             w.sub_fix_stage = ""
             w.sub_fix_frac = 0.0
+    # AND THE SIDECARS, IN THE SAME PASS. This file is about to be written
+    # out anyway; a subtitle sitting beside it can ride along for the cost of
+    # the track. Doing it separately meant the same 8 GB container copied
+    # twice, hours apart - once by the planner and once by the sidecar sweep.
+    # The sweep skips anything already queued here for exactly this reason.
+    _side: list = []
+    try:
+        from . import subembed as _se
+        _side = _se.for_rebuild(job.file_id)
+        if _side:
+            joblog.log(f"{len(_side)} subtitle file(s) beside this one will "
+                       f"come in with this rewrite rather than costing a "
+                       f"second one", "info", job.id)
+            _pend = list(_pend) + [
+                {"srt": t["sidecar"],
+                 "name": (t.get("role") or "").upper() or "Subtitles",
+                 "lang": t.get("lang") or "eng", "sidecar": True}
+                for t in _side]
+    except Exception as e:                                       # noqa: BLE001
+        joblog.log(f"could not look for sidecars ({type(e).__name__}); "
+                   f"the sweep will pick them up later", "warn", job.id)
+        _side = []
     _pend_used = False
     if _pend:
         w.set_stage("embedding subtitles")
@@ -4054,7 +4076,8 @@ async def _transcode(w: Worker, probe_data: dict) -> None:
             # <job_id>.mkv, and a differently-named output would be invisible
             # to them.
             tmp = out + ".subs"
-            _so.embed(out, [(p["srt"], p.get("name") or "English")
+            _so.embed(out, [(p["srt"], p.get("name") or "English",
+                             p.get("lang") or "eng")
                             for p in _pend], tmp,
                       drop_image_covered=bool(_so._s(
                           "subocr_remove_image", False,
@@ -4273,6 +4296,24 @@ async def _transcode(w: Worker, probe_data: dict) -> None:
         pass
     # An arr refresh waits on RefreshSeries, which on a large series is the
     # slowest thing in the whole job. It is still work, so keep it visible.
+    # THE SIDECARS THIS REWRITE CARRIED IN, now that it is committed. Same
+    # proof the sweep demands and in the same order: the language has to be in
+    # the file that is on disk before the loose copy goes to the bin.
+    if _side:
+        try:
+            from . import subembed as _se2
+            r = await asyncio.to_thread(_se2.after_rebuild, job.file_id,
+                                        job.path, _side)
+            if r.get("recycled"):
+                joblog.log(f"recycled {r['recycled']} subtitle file(s) this "
+                           f"rewrite carried in", "ok", job.id)
+            if r.get("kept"):
+                joblog.log(f"left {len(r['kept'])} subtitle file(s) where they "
+                           f"were - the rebuilt file does not carry them",
+                           "warn", job.id)
+        except Exception as e:                                   # noqa: BLE001
+            joblog.log(f"could not tidy the sidecars ({type(e).__name__}) - "
+                       f"they stay where they are", "warn", job.id)
     w.set_stage("arr refresh / rename")
     await _post_commit(job)
     w.set_stage("done")

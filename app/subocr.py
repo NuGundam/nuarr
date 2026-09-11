@@ -1462,8 +1462,14 @@ def embed(src: str, subs: list[tuple[str, str]], dst: str,
     tagxml = os.path.join(os.path.dirname(dst) or ".", "nuarr_ocr_tags.xml")
     with open(tagxml, "w", encoding="utf-8") as _f:
         _f.write(_OCR_TAG_XML)
-    for i, (srt, name) in enumerate(subs):
-        args += ["--language", "0:eng", "--track-name", f"0:{clean_label(name)}",
+    for i, sp in enumerate(subs):
+        # (path, name) or (path, name, language). The two-element form is
+        # every existing caller and means English, because that is what an OCR
+        # pass over this library produces; the third element exists so a
+        # sidecar can bring its own.
+        srt, name = sp[0], sp[1]
+        lang = (sp[2] if len(sp) > 2 else "") or "eng"
+        args += ["--language", f"0:{lang}", "--track-name", f"0:{clean_label(name)}",
                  "--tags", f"0:{tagxml}",
                  "--forced-display-flag", "0:no",
                  # NOT DEFAULT. This was default=yes on the first track, and it

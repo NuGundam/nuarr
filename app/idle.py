@@ -257,6 +257,22 @@ async def run(key: str, title: str, pending, do_one, label=None, *,
                          next_look=time.time() + empty_s)
                 await asyncio.sleep(empty_s)
                 continue
+            # THE FREE SPINDLES FIRST. A viewer on one disk used to mean the
+            # runner stopped at the first file that lived there and waited
+            # twenty seconds, over and over, while eleven other disks sat
+            # idle with work on them. Sorting by whether the disk is spoken
+            # for turns "paused" into "working on something else" - which is
+            # what the transcode queue has always done, and the reason it
+            # says "steering around them" rather than "held".
+            if disk_of:
+                try:
+                    from . import gate
+                    hot = set(gate.plex_disks()) | set(gate.busy_disks())
+                    if hot:
+                        items = sorted(
+                            items, key=lambda x: (disk_of(x) or "") in hot)
+                except Exception:                                # noqa: BLE001
+                    pass
             d.update(running=True, idle_why="", total=len(items), done=0,
                      ok=0, failed=0, t0=time.time(), next_look=0.0)
             for it in items:
@@ -264,6 +280,14 @@ async def run(key: str, title: str, pending, do_one, label=None, *,
                 # to work on another, not a reason to stop - which is exactly
                 # how the queue treats it.
                 b = await busy(disk_of(it) if disk_of else "")
+                # A BUSY DISK IS NOT A BUSY MACHINE. If the only thing in the
+                # way is this file's own spindle, step over it and take the
+                # next one - the sort above means there usually is a next one.
+                if b["busy"] and (b.get("why") or "").endswith(
+                        (disk_of(it) if disk_of else "\x00")):
+                    d["skipped"] = (d.get("skipped") or 0) + 1
+                    d["total"] = max(0, d["total"] - 1)
+                    continue
                 if b["busy"]:
                     # PAUSED, NOT FAILED. The rest of the list is still
                     # pending and will be picked up the moment the box is

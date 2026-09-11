@@ -924,6 +924,15 @@ def candidates(limit: int = 200, force: bool = False,
             # search, which is not the same thing and was never meant to.
             f"   AND COALESCE(mtime,0) < ? "
             f" ORDER BY id", libs + [cutoff])]
+    # Which files the transcode queue is already going to rewrite.
+    _queued: set = set()
+    try:
+        with cursor() as cur:
+            _queued = {r["file_id"] for r in cur.execute(
+                "SELECT DISTINCT file_id FROM jobs "
+                " WHERE state IN ('queued','running')")}
+    except Exception:                                            # noqa: BLE001
+        pass
     out = []
     total = len(rows)
     for i, r in enumerate(rows, 1):
@@ -940,6 +949,11 @@ def candidates(limit: int = 200, force: bool = False,
                 pass
         if not sidecars_for(r["path"]):
             continue                       # cheap listdir, no probe, no policy
+        # A REBUILD ALREADY QUEUED WILL CARRY THEM. Doing it here as well
+        # means the same container copied twice, so the queue wins: it was
+        # going to open the file anyway.
+        if r["id"] in _queued:
+            continue
         p = plan_one(r["id"], force=force)
         if p.get("take") or p.get("drop"):
             # WHICH SPINDLE IT LIVES ON, carried with the plan. The runner
@@ -1106,6 +1120,140 @@ def summary(force_refresh: bool = False) -> dict:
     return dict(d)
 
 
+def for_rebuild(file_id: int) -> list[dict]:
+    r"""The sidecars a transcode of this file should carry in with it.
+
+    ONE REWRITE, NOT TWO. A file that needs its flags moved and has a subtitle
+    sitting beside it was getting two full container copies - the planner's,
+    then this module's, hours apart. The transcode is already opening the
+    container and writing a new one; adding a track to that pass costs nothing
+    beyond the track.
+
+    Same guards as the sweep, because it is the same question: the language
+    has to pass the library's rules, the file must not already carry that kind
+    of subtitle, and a marker track means the words are painted on and nothing
+    may be added at all. Returns [] for a library with the rule off.
+    """
+    try:
+        p = plan_one(int(file_id))
+        return list(p.get("take") or []) if p.get("ok") else []
+    except Exception:                                            # noqa: BLE001
+        return []
+
+
+def after_rebuild(file_id: int, path: str, takes: list) -> dict:
+    r"""Recycle the sidecars a rebuild just carried in, once it is committed.
+
+    The same proof the sweep demands: the language has to be IN the file that
+    is now on disk before the loose copy goes anywhere.
+    """
+    from . import fileops
+    out = {"recycled": 0, "kept": []}
+    if not takes:
+        return out
+    got = _probe_langs(path)
+    for t in takes:
+        if _lang_key(t.get("lang") or "") not in got:
+            out["kept"].append(os.path.basename(t.get("sidecar") or ""))
+            _note(file_id, path, t.get("sidecar") or "", t.get("lang") or "",
+                  False, "the rebuilt file does not carry it - the sidecar "
+                         "was left alone")
+            continue
+        rr = fileops.recycle(t["sidecar"])
+        if getattr(rr, "ok", False):
+            out["recycled"] += 1
+        else:
+            out["kept"].append(os.path.basename(t["sidecar"]))
+        _note(file_id, path, t["sidecar"], t.get("lang") or "", True,
+              "carried in by the rebuild"
+              + ("" if getattr(rr, "ok", False) else " (sidecar left in place)"))
+    return out
+
+
+# WHAT MKVMERGE SAYS, AND WHAT IT MEANS.
+#
+# The panel was printing the tool's whole answer - a version banner, a
+# #GUI#error marker and an absolute path - across a cell sized for a sentence,
+# so what you could read was "mkvmerge v100.0 ('Do Hot Girls Like Chords')
+# 64-bit #GUI#error The type of file 'P:\TV Sho". Every word of that except
+# the last four is noise.
+# MATCHED ON THE PART THAT SURVIVES. _note() keeps the first 500 characters
+# of the tool's output, and mkvmerge puts the whole absolute path in the
+# middle of its sentence - so on a long name the message is cut off at
+# "could not be r" and a test for the closing phrase never fires. The opening
+# words are the ones that are always there.
+_WHY = (
+    ("the type of file",
+     "the subtitle file is not readable - wrong format, or damaged", True),
+    ("could not be recognized",
+     "the subtitle file is not readable - wrong format, or damaged", True),
+    ("no space left",  "the disk filled up", False),
+    ("permission",     "nuarr was not allowed to read or write it", False),
+    ("file not found", "the subtitle file is not there any more", False),
+    ("could not be opened", "the file could not be opened", True),
+    ("unsupported",    "mkvmerge does not support that subtitle format", True),
+)
+
+
+def _plain_why(detail: str, sidecar: str = "") -> str:
+    """One sentence, no banner, no path."""
+    d = (detail or "").replace("#GUI#error", " ").strip()
+    low = d.lower()
+    for needle, said, _broken in _WHY:
+        if needle in low:
+            return said
+    # Nothing recognised: give the last line, with the version banner and any
+    # absolute path taken out, so it is at least one readable sentence.
+    line = [x.strip() for x in d.splitlines() if x.strip()]
+    line = [x for x in line if not x.lower().startswith("mkvmerge v")]
+    said = (line[-1] if line else d)[:160]
+    return re.sub(r"'[A-Za-z]:\\[^']*'", "that file", said)
+
+
+def _looks_broken(detail: str) -> bool:
+    """Is the SUBTITLE file itself the problem, rather than the moment?"""
+    low = (detail or "").lower()
+    return any(b for n, _s, b in _WHY if n in low and b)
+
+
+def delete_broken(file_ids) -> dict:
+    r"""Recycle subtitle files mkvmerge cannot read at all.
+
+    THE SIDECAR, NEVER THE VIDEO. This only ever removes the loose subtitle
+    file named in the failure, and only when the reason was the file itself
+    being unreadable rather than a full disk or a locked moment - those come
+    back on their own and deleting anything would be wrong.
+
+    Recycled, like everything else here, so a wrong call is a trip to the bin
+    rather than a loss.
+    """
+    from . import fileops
+    ids = [int(i) for i in (file_ids or []) if i]
+    if not ids:
+        return {"ok": False, "why": "nothing chosen"}
+    gone, kept = 0, []
+    for row in failures(1000):
+        if int(row.get("file_id") or 0) not in ids:
+            continue
+        if not row.get("broken"):
+            kept.append(row.get("sidecar_name") or "")
+            continue
+        p = row.get("sidecar") or ""
+        if not p or not os.path.exists(p):
+            continue
+        rr = fileops.recycle(p)
+        if getattr(rr, "ok", False):
+            gone += 1
+            _note(int(row["file_id"]), row.get("path") or "", p,
+                  row.get("lang") or "", True,
+                  "unreadable - the subtitle file was recycled")
+        else:
+            kept.append(os.path.basename(p))
+    return {"ok": True, "recycled": gone, "kept": kept,
+            "why": (f"{gone} unreadable subtitle file(s) recycled"
+                    if gone else "nothing here was the subtitle file's fault")}
+
+
 def failures(limit: int = 100) -> list[dict]:
     r"""What could not be taken in, and why - from the log, not from memory.
 
@@ -1141,6 +1289,9 @@ def failures(limit: int = 100) -> list[dict]:
                 except Exception:                                # noqa: BLE001
                     d["label"] = os.path.basename(d.get("path") or "")
                 d["sidecar_name"] = os.path.basename(d.get("sidecar") or "")
+                d["why"] = _plain_why(d.get("detail") or "",
+                                      d.get("sidecar") or "")
+                d["broken"] = _looks_broken(d.get("detail") or "")
                 out.append(d)
     except Exception:                                            # noqa: BLE001
         return out

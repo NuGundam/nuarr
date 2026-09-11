@@ -7603,6 +7603,14 @@ def api_subembed_failed(limit: int = 100):
     return {"rows": subembed.failures(limit)}
 
 
+@app.post("/api/subembed/delete-broken")
+async def api_subembed_delete_broken(ids: str = ""):
+    """Recycle subtitle files mkvmerge cannot read. Never the video."""
+    from . import subembed
+    got = [int(t) for t in (ids or "").split(",") if t.strip().isdigit()]
+    return await asyncio.to_thread(subembed.delete_broken, got)
+
+
 @app.post("/api/subembed/retry")
 async def api_subembed_retry(ids: str = ""):
     """Let the sweep try these again on its next pass."""
@@ -32587,13 +32595,25 @@ function ago2(t){
 // ---- sidecar subtitles waiting to come inside ---------------------------
 let _se=null, _seKey='', _sePoll=null, _seFail={rows:[]};
 async function seLoadFailed(){
-  try{ _seFail=await (await fetch('/api/subembed/failed')).json(); }catch(e){}
+  try{ _seFail=await (await fetch('/api/subembed/failed?limit=2000')).json(); }catch(e){}
 }
 async function seRetry(id, btn){
   if(btn){ btn.disabled=true; btn.textContent='…'; }
   try{ await fetch('/api/subembed/retry?ids='+encodeURIComponent(id),
                    {method:'POST'}); }catch(e){}
   await seLoadFailed(); sePaint(true);
+}
+async function seDropBroken(btn){
+  const ids=(_seFail.rows||[]).filter(f=>f.broken).map(f=>f.file_id);
+  if(!ids.length) return;
+  askInline(btn, `Recycle ${ids.length} unreadable subtitle file(s)? `
+    +'The video is never touched, and they go to the recycle bin rather than '
+    +'being deleted.', `Yes, recycle ${ids.length}`, async ()=>{
+      const r=await (await fetch('/api/subembed/delete-broken?ids='
+        +encodeURIComponent(ids.join(',')), {method:'POST'})).json();
+      await seLoadFailed(); sePaint(true);
+      return r;
+    });
 }
 async function seRetryAll(btn){
   const ids=(_seFail.rows||[]).map(f=>f.file_id).join(',');
@@ -32756,15 +32776,35 @@ function sePaint(force){
       <button class="rmb" style="margin-left:auto" onclick="seRetryAll(this)"
         title="Forget that these failed. The sweep picks its work from what is on disk, so clearing the record IS trying again - it happens on the next pass, under the gate, not right now.">Try them again</button>
     </div>
-    <div class="rowbox scrollbox" style="max-height:140px;margin-top:5px">
-      <table style="width:100%;font-size:11px">${F.map(f=>`<tr>
-        <td style="padding:3px 6px" title="${esc(f.path||'')}">${esc(f.label||'')}</td>
-        <td class="dim" style="padding:3px 6px">${esc(f.sidecar_name||'')}</td>
-        <td class="dim" style="padding:3px 6px">${esc((f.detail||'').slice(0,90))}</td>
-        <td class="r" style="padding:3px 6px"><button class="rmb"
+    <div class="rowbox scrollbox" style="max-height:220px;margin-top:5px">
+      <!-- FIXED LAYOUT AND A REASON THAT WRAPS. What was here printed
+           mkvmerge's whole answer - version banner, #GUI#error marker,
+           absolute path - clipped to one line, so what you could read was
+           "mkvmerge v100.0 ('Do Hot Girls Like Chords') 64-bit #GUI#error The
+           type of file 'P:\TV Sho". Every word of that but the last four was
+           noise. It is one sentence now, and it is allowed two lines. -->
+      <table style="width:100%;font-size:11px;table-layout:fixed">
+      <colgroup><col style="width:auto"><col style="width:28%">
+        <col style="width:62px"></colgroup>
+      ${F.map(f=>`<tr style="vertical-align:top">
+        <td style="padding:4px 6px;overflow:hidden" title="${esc(f.path||'')}">
+          <b>${esc(f.label||'')}</b>
+          <div class="dim" style="font-size:10px;overflow:hidden;
+            text-overflow:ellipsis;white-space:nowrap">${esc(f.sidecar_name||'')}</div></td>
+        <td style="padding:4px 6px;white-space:normal;overflow-wrap:anywhere;
+            color:${f.broken?'var(--warn)':'var(--dim)'}"
+            title="${esc(f.detail||'')}">${esc(f.why||'')}</td>
+        <td class="r" style="padding:4px 6px;white-space:nowrap"><button class="rmb"
           onclick="seRetry('${f.file_id}',this)">again</button></td>
       </tr>`).join('')}</table>
-    </div></div>`:'';
+    </div>
+    ${F.some(f=>f.broken)?`<div class="dim" style="font-size:10.5px;margin-top:5px;
+      display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <span>${fmt(F.filter(f=>f.broken).length)} of them are the subtitle file
+        itself being unreadable &mdash; trying again cannot help those.</span>
+      <button class="rmb" onclick="seDropBroken(this)"
+        title="Recycle the unreadable SUBTITLE files. Never the video, never a failure that was only a bad moment, and to the recycle bin rather than deleted.">Recycle the broken subtitle files</button>
+    </div>`:''}</div>`:'';
   // THE NUMBER IS THE HEADLINE AND THE SWITCH IS ELSEWHERE. The rule lives in
   // the list above with every other subtitle rule; putting a second control
   // here would be two switches for one setting, which can only disagree.
