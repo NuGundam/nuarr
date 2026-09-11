@@ -161,7 +161,13 @@ def check_audio(path: str) -> dict:
                               "on this machine")
     codes = [c for c in (r.get("audio_langs") or "").split(",") if c.strip()]
     n = max(1, len(codes))
-    steps = ["opening the file"] + [f"listening to track {i}" for i in range(n)]
+    # COUNTED THE WAY A PERSON COUNTS. "listening to track 0 of 2" is not a
+    # sentence: zero is ffmpeg's stream index and it has no business in a line
+    # of English beside a total. The step says which track a person would
+    # point at - the same number MediaInfo prints - and the index it writes
+    # with stays where it belongs, in the call below.
+    steps = ["opening the file"] + [f"listening to track {i + 1}"
+                                    for i in range(n)]
     if not _LOCK.acquire(blocking=False):
         return _end(d, False, "a check is already running")
     d["steps"] = steps
@@ -176,7 +182,7 @@ def check_audio(path: str) -> dict:
             pass
         heard = []
         for i in range(n):
-            _step(d, i + 1, f"listening to track {i} of {n}")
+            _step(d, i + 1, f"listening to track {i + 1} of {n}")
             try:
                 res = audiolang.check(int(r["id"]), r["path"], i, refresh=True)
             except Exception as e:                               # noqa: BLE001
@@ -270,11 +276,13 @@ def check_subs(path: str) -> dict:
                     if int(x.get("file_id") or 0) == int(r["id"])]
             todo = [x for x in mine if x.get("unread") and x.get("mkv_id")]
             d["steps"] = (["looking at what the titles claim"]
-                          + [f"reading track s:{x.get('track')}" for x in todo]
+                          + [f"reading subtitle track "
+                             f"{int(x.get('track') or 0) + 1}" for x in todo]
                           + ["working out what each track carries"])
             d["total"] = len(d["steps"])
             for i, x in enumerate(todo, 1):
-                _step(d, i + 1, f"reading track s:{x.get('track')} - "
+                _step(d, i + 1, f"reading subtitle track "
+                                f"{int(x.get('track') or 0) + 1} - "
                                 f"{i} of {len(todo)}")
                 try:
                     stt.shape_of(x["file_id"], x["path"], x["track"],

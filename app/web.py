@@ -32480,7 +32480,13 @@ function scBar(p){
     <div style="display:flex;gap:10px;align-items:baseline;font-size:11px;
          margin:3px 0 0;flex-wrap:wrap">
       <span class="busy" style="color:var(--acc);flex:none"><span class="sp"></span></span>
-      <span style="flex:none">${num(p.step||0,'done')} of ${num(p.total||0,'auto')}</span>
+      <!-- SAY WHAT IS BEING COUNTED. A bare "1 of 3" beside a two-track
+           file reads as a claim about tracks, and it is not one: the steps
+           are opening the file and then one per track, so a file with two
+           audio tracks has three steps. Naming the unit costs four
+           characters and removes the whole question. -->
+      <span style="flex:none" title="Opening the file counts as a step, and then each track is one — so a file with two audio tracks has three steps.">step ${
+        num(p.step||0,'done')} of ${num(p.total||0,'auto')}</span>
       <span class="dim" style="flex:1 1 auto;min-width:0;overflow:hidden;
         text-overflow:ellipsis;white-space:nowrap">${esc(p.now||'')}</span>
       <span style="flex:none;margin-left:auto;display:flex;gap:10px">
