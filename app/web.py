@@ -5409,6 +5409,17 @@ def _pool_ledger() -> dict:
             d["failed"] += int(r["recent_failed"] or 0)
         if st == "done" and r["last"]:
             d["last"] = max(d["last"], float(r["last"]))
+    # WHERE THE WAITING WORK IS. A pool with queued jobs and nothing running
+    # is either held by the gate or has every queued file on a spindle
+    # somebody is watching - and the row has to say which, or "0 running ·
+    # 6 queued · last finished 3.8h ago" reads as a stalled system when it
+    # is the disk-yield rule doing exactly its job.
+    for r in _rows("SELECT COALESCE(j.pool, j.kind) p, COALESCE(f.pool_disk,'') d, "
+                   "       COUNT(*) n FROM jobs j LEFT JOIN files f ON f.id = j.file_id "
+                   " WHERE j.state = 'queued' GROUP BY 1, 2"):
+        d = out.setdefault(r["p"], {"done": 0, "queued": 0, "running": 0,
+                                    "failed": 0, "last": 0.0})
+        d.setdefault("disks", {})[r["d"] or "?"] = int(r["n"] or 0)
     _LEDGER.update(at=now, data=out)
     return out
 
@@ -5768,6 +5779,26 @@ def api_health():
                 note += f" · last finished {_ago(last)} ago"
             if fl:
                 note += f" · {fl} failed in the last day"
+            # WHY NOTHING IS RUNNING, when something is waiting.
+            if q and not r_ and not off:
+                disks = d.get("disks") or {}
+                try:
+                    viewer = set(gate.plex_disks())
+                    busy = set(gate.busy_disks())
+                except Exception:                            # noqa: BLE001
+                    viewer, busy = set(), set()
+                on_v = [k for k in disks if k in viewer]
+                on_b = [k for k in disks if k in busy and k not in viewer]
+                if disks and all(k in viewer or k in busy for k in disks):
+                    parts = []
+                    if on_v:
+                        parts.append(f"{', '.join(sorted(on_v))} - a viewer is on "
+                                     f"{'it' if len(on_v) == 1 else 'them'}")
+                    if on_b:
+                        parts.append(f"{', '.join(sorted(on_b))} - busy elsewhere")
+                    note += " · waiting: every queued file is on " + "; ".join(parts)
+                elif jobs.PAUSED_REASON:
+                    note += f" · held: {jobs.PAUSED_REASON}"
             add(pool, label, goto, 0, note, mode=None, running=bool(r_),
                 warn=bool(off and q) or fl > 0, when="counted from the queue",
                 pool=pool, done=dn, left=q + r_)
