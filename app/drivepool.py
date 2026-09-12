@@ -47,9 +47,11 @@ import asyncio
 import glob
 import os
 import re
+import subprocess
 import time
 
 from . import joblog
+from .config import NO_WINDOW
 from .db import cursor, kv_get, kv_set
 
 LOG_DIR = r"C:\ProgramData\StableBit DrivePool\Service\Logs\Service"
@@ -871,6 +873,166 @@ def balancers() -> dict:
     return out
 
 
+# ------------------------------------------------- starting and stopping it --
+#
+# DRIVEPOOL HAS NO SWITCH FOR THIS THAT ANYTHING BUT ITS OWN UI CAN REACH.
+# dpcmd can add and remove pool parts, set duplication and remeasure; it
+# cannot start or stop a balance. The UI talks to the service over a private
+# .NET channel. What there IS: the service is an ordinary Windows service, and
+# the pool is NOT the service - it is the covefs kernel driver, which keeps the
+# pool mounted, readable and writable whether the service is up or not.
+# Measured here before any of this was written: service stopped in 3 s, the
+# pool listed 748 folders and read a file while it was down, service back in
+# under a second.
+#
+# So "stop balancing" is: stop the service, which abandons the move in
+# progress (DrivePool copies to a temp name and cleans up on the next start),
+# set the pool's automatic-balancing option to "do not balance automatically",
+# and start the service again. "Start balancing" sets the option to "balance
+# immediately" and does the same restart, after which DrivePool begins a pass
+# whenever the pool is outside its own thresholds, throttled to one every ten
+# minutes. Those two options are exactly the radio DrivePool's own Balancing
+# settings page shows; nuarr writes the same value to the same store.
+#
+# WHAT A RESTART COSTS. Three seconds without the service: no balancing, no
+# background duplication, no UI, no notifications. The data path is untouched.
+# The option is edited only while the service is stopped, because the running
+# service owns that store and writes it back on its own schedule.
+SERVICE = "DrivePoolService"
+AUTO_WORD = {0: "do not balance automatically", 1: "balance immediately"}
+
+
+def service_state() -> str:
+    """running | stopped | <other> | unknown"""
+    try:
+        r = subprocess.run(["sc.exe", "query", SERVICE], capture_output=True,
+                           text=True, timeout=15, creationflags=NO_WINDOW)
+        m = re.search(r"STATE\s*:\s*\d+\s+(\w+)", r.stdout or "")
+        return (m.group(1).lower() if m else "unknown")
+    except Exception:                                        # noqa: BLE001
+        return "unknown"
+
+
+def _pool_options_path() -> str:
+    import glob as _g
+    hits = sorted(_g.glob(os.path.join(STORE_JSON, "*_PoolOptions.json")))
+    return hits[0] if hits else ""
+
+
+def _read_pool_options() -> dict:
+    p = _pool_options_path()
+    if not p:
+        return {}
+    try:
+        import json as _j
+        with open(p, encoding="utf-8") as fh:
+            return _j.load(fh)
+    except Exception:                                        # noqa: BLE001
+        return {}
+
+
+def balancing() -> dict:
+    """Where the switch is, whether the service is up, and whether it is moving."""
+    d = _read_pool_options()
+    item = d.get("Item") or {}
+    auto = item.get("AutoBalanceType")
+    try:
+        auto = int(auto)
+    except (TypeError, ValueError):
+        auto = None
+    return {"service": service_state(),
+            "auto": auto, "auto_word": AUTO_WORD.get(auto, "unknown"),
+            "allow_immediate": bool(item.get("AllowBalanceImmediately", True)),
+            "throttle": str(item.get("ImmediateBalanceThrottle") or ""),
+            "time_of_day": str(item.get("BalancingTimeOfDay") or ""),
+            "moving": "balancing" in moving(),
+            "store": bool(_pool_options_path()),
+            "last": dict(_BAL_LAST)}
+
+
+_BAL_LAST: dict = {"at": 0.0, "what": "", "ok": None, "why": ""}
+
+
+def _svc(verb: str, want: str, timeout: float = 45.0) -> tuple:
+    try:
+        subprocess.run(["sc.exe", verb, SERVICE], capture_output=True,
+                       text=True, timeout=20, creationflags=NO_WINDOW)
+    except Exception as e:                                   # noqa: BLE001
+        return False, f"sc {verb}: {type(e).__name__}: {e}"[:160]
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        if service_state() == want:
+            return True, ""
+        time.sleep(0.5)
+    return False, f"the service did not reach '{want}' within {int(timeout)}s"
+
+
+def _write_auto(auto: int) -> tuple:
+    """Set AutoBalanceType in the pool's own store. Only while stopped."""
+    import json as _j
+    p = _pool_options_path()
+    if not p:
+        return False, "no PoolOptions in DrivePool's store"
+    try:
+        with open(p, encoding="utf-8") as fh:
+            d = _j.load(fh)
+        item = d.setdefault("Item", {})
+        if int(item.get("AutoBalanceType", -1)) == int(auto):
+            return True, "already set"
+        item["AutoBalanceType"] = int(auto)
+        if auto == 1:
+            item["AllowBalanceImmediately"] = True
+        tmp = p + ".nuarr.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            _j.dump(d, fh, indent=2)
+        os.replace(tmp, p)
+        return True, ""
+    except Exception as e:                                   # noqa: BLE001
+        return False, f"{type(e).__name__}: {e}"[:160]
+
+
+def set_balancing(action: str) -> dict:
+    r"""start | stop. Restarts the service around the option change.
+
+    Synchronous and a few seconds long; the caller runs it off the loop. It
+    says exactly what it did and where it stopped if it could not finish, so
+    a half-done restart is never silent.
+    """
+    action = (action or "").strip().lower()
+    if action not in ("start", "stop"):
+        return {"ok": False, "why": "action must be start or stop"}
+    auto = 1 if action == "start" else 0
+    steps: list = []
+    was = service_state()
+    steps.append(f"service was {was}")
+    if was == "running":
+        ok, why = _svc("stop", "stopped")
+        steps.append("stopped" if ok else f"could not stop: {why}")
+        if not ok:
+            _BAL_LAST.update(at=time.time(), what=action, ok=False, why=why)
+            return {"ok": False, "why": why, "steps": steps}
+    ok, why = _write_auto(auto)
+    steps.append(f"set '{AUTO_WORD[auto]}'" + (f" ({why})" if why else "")
+                 if ok else f"could not set the option: {why}")
+    ok2, why2 = _svc("start", "running")
+    steps.append("started" if ok2 else f"could not start: {why2}")
+    done = ok and ok2
+    _BAL_LAST.update(at=time.time(), what=action, ok=done,
+                     why=(why or why2) if not done else "")
+    try:
+        joblog.log("DrivePool: " + ("balancing started - " if action == "start"
+                                    else "balancing stopped - ")
+                   + "; ".join(steps), "info" if done else "warn")
+    except Exception:                                        # noqa: BLE001
+        pass
+    try:
+        STATE["at"] = 0.0                # make the watcher re-read at once
+    except Exception:                                        # noqa: BLE001
+        pass
+    return {"ok": done, "why": (why or why2), "steps": steps,
+            "balancing": balancing()}
+
+
 def status() -> dict:
     """Everything the page shows."""
     ev = []
@@ -909,6 +1071,8 @@ def status() -> dict:
         "pressure": press,
         "targets": targets(), "targets_at": _TGT["at"], "targets_err": _TGT["err"],
         "balance": balance_info(),
+        # THE START/STOP SWITCH, and where DrivePool's own option sits.
+        "balancing": balancing(),
         # WHAT PRIORITY ITS HOUSEKEEPING IS RUNNING AT, and whether nuarr is
         # the reason. See set_priority: dpcmd cannot do this, Windows can.
         "priority": priority(),

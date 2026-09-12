@@ -11409,6 +11409,20 @@ def api_drivepool():
     return drivepool.status()
 
 
+@app.post("/api/drivepool/balancing")
+async def api_drivepool_balancing(action: str):
+    r"""Start or stop DrivePool's balancing. Restarts its service to do it.
+
+    Off the event loop: it is three seconds of waiting on sc.exe, and a page
+    that polls every five must not be able to stall the server for that. See
+    drivepool.set_balancing for what is actually done and why it is safe.
+    """
+    from . import drivepool
+    if action not in ("start", "stop"):
+        raise HTTPException(400, "action must be start or stop")
+    return await asyncio.to_thread(drivepool.set_balancing, action)
+
+
 @app.post("/api/drivepool/toggle")
 async def api_drivepool_toggle(key: str, on: bool):
     from . import drivepool
@@ -25385,6 +25399,27 @@ function tmPaint(){
   }
 }
 
+async function dpBalance(action, btn){
+  askInline(btn,
+    action==='stop'
+      ? 'Stop balancing? DrivePool\'s service is restarted with automatic '
+        +'balancing OFF. The move in progress is abandoned cleanly and nothing '
+        +'moves until you start it again. The pool stays mounted; the three '
+        +'seconds without the service cost nothing but the balance.'
+      : 'Start balancing? DrivePool\'s service is restarted with automatic '
+        +'balancing set to "balance immediately" - its own option - and it '
+        +'begins a pass whenever the pool is outside its thresholds. The pool '
+        +'stays mounted throughout.',
+    action==='stop' ? 'Yes, stop it' : 'Yes, start it',
+    async ()=>{
+      const r=await (await fetch('/api/drivepool/balancing?action='+action,
+                                  {method:'POST'})).json();
+      setTimeout(()=>loadDrivePool(), 800);
+      return r.ok ? {ok:true, why:(r.steps||[]).join(' · ')}
+                  : {ok:false, why:(r.why||'failed')+' — '+(r.steps||[]).join(' · ')};
+    });
+}
+
 function dpPaint(disks){
   const el=document.getElementById('dpBody'); const d=_dp; if(!el||!d) return;
   // KEEP THE SCROLL. The whole body is rebuilt every two seconds during a
@@ -25508,9 +25543,32 @@ function dpPaint(disks){
     : `<div><span class="pill p-ok" style="font-size:12.5px">idle</span> <b>DrivePool is not moving anything</b>
        ${d.rate_bps>2e6?`<span class="dim" style="font-size:12.5px"> · the service is still doing ${dpMb(d.rate_bps)} of I/O (placement or a measure)</span>`:''}</div>`;
   const flags=Object.keys(d.flags||{}).filter(f=>f!=='PoolPartBusy');
+  // START AND STOP. DrivePool has no switch for this that anything but its
+  // own window can reach; what it has is an ordinary Windows service and a
+  // pool that is a kernel driver, mounted whether the service is up or not.
+  // So the buttons restart the service around the same option DrivePool's
+  // Balancing settings page shows, and say so. See drivepool.set_balancing.
+  const B=d.balancing||{};
+  const svcUp=B.service==='running';
+  const balCtl=`<div class="askhost" style="margin-top:8px;padding-top:8px;border-top:1px solid var(--line);
+       display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-size:12.5px">
+      <b style="flex:none">Balancing</b>
+      <span class="pill ${svcUp?'p-ok':'p-warn'}" title="DrivePool's Windows service. The pool itself is a kernel driver and stays mounted either way.">service ${esc(B.service||'?')}</span>
+      <span class="pill ${B.auto===1?'p-warn':'p-ok'}"
+        title="DrivePool's own 'Automatic balancing' option - the radio on its Balancing settings page. nuarr reads and writes the same value.">${esc(B.auto_word||'unknown')}</span>
+      ${(B.moving||B.auto===1)
+        ? `<button class="rmb" onclick="dpBalance('stop',this)"
+             title="Stop the service (the move in progress is abandoned - DrivePool copies to a temporary name and cleans up on its next start), set 'do not balance automatically', and start the service again. About three seconds; the pool stays mounted throughout.">Stop balancing</button>`
+        : `<button class="rmb" onclick="dpBalance('start',this)"
+             title="Set 'balance immediately' - DrivePool's own option - and restart the service. It then starts a pass whenever the pool is outside its thresholds, throttled to one every ${esc(B.throttle||'00:10:00')}. About three seconds; the pool stays mounted throughout.">Start balancing</button>`}
+      <span class="dim" style="font-size:11px">${
+        B.last&&B.last.at
+          ? `last: ${esc(B.last.what||'')} ${B.last.ok?'ok':'<span class="err">failed'+(B.last.why?' — '+esc(B.last.why):'')+'</span>'} · ${ago(B.last.at)}`
+          : 'changes DrivePool\'s own Automatic balancing option, by restarting its service'}</span>
+    </div>`;
   const nowCard=`<div class="lkind" style="padding:11px 12px;margin-top:10px">
       <div class="dim" style="font-size:12px;letter-spacing:.04em;text-transform:uppercase;margin-bottom:5px">right now</div>
-      ${now}${flow}${target}
+      ${now}${flow}${target}${balCtl}
       ${flags.length?`<div class="dim" style="font-size:12.5px;margin-top:6px">also flagged: ${flags.map(esc).join(', ')}</div>`:''}
     </div>`;
   // ---- what nuarr is holding -----------------------------------------
