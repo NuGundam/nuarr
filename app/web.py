@@ -12756,6 +12756,16 @@ button[disabled]{opacity:.5;cursor:default}
 .subsp .subsn{flex:none;margin-left:auto;white-space:nowrap;
               font-variant-numeric:tabular-nums}
 .subsp .subssub{font-size:11.5px}
+/* WHICH OF THREE THINGS IS THIS?
+   Reading a settings page you cannot tell a background check that runs on its
+   own from a list produced by something you just changed - they look
+   identical, and the difference decides whether you wait or press something.
+   Every panel says which it is, in three words, in the same place. */
+.subskind{flex:none;font-size:9.5px;letter-spacing:.06em;text-transform:uppercase;
+          border:1px solid;border-radius:999px;padding:1px 7px;opacity:.9}
+.subskind.k-auto{color:#6fb0ff;border-color:#2b4a6f}
+.subskind.k-yours{color:#c98cf0;border-color:#4a3566}
+.subskind.k-ask{color:#e8a33d;border-color:#6b4a17}
 .subsp .subswhy{font-size:10.5px;color:var(--dim);margin-top:2px}
 /* Border pulse when a panel's data actually changes */
 @keyframes glow{0%{box-shadow:0 0 0 0 rgba(88,166,255,.55);border-color:var(--acc)}
@@ -27182,7 +27192,11 @@ async function loadLangTab(){
   // is the part that belongs to the RULES: how many there are, when the check
   // last ran, whether it acts by itself, and the button to run it now.
   el.innerHTML += `<div class="subsp" id="gapCard" style="margin-top:12px">
-      <div class="subshd"><b style="color:#6fb0ff">Files built under older subtitle rules</b>
+      <div class="subshd"><b style="color:#6fb0ff">Rule drift</b>
+        <span class="subskind k-auto"
+          title="A background check. Nobody starts it - it re-reads finished files against the rules above on its own schedule, and again the moment a job rewrites one.">runs by itself</span>
+        <span class="dim subssub">finished files measured against the Subtitle
+          rules above &mdash; not against anything you changed in a library</span>
         <span class="subsn" id="gapTotal"></span></div>
       <div class="dim" style="font-size:11px;margin-top:2px">
         Rules apply when a file is built. Files finished before a rule changed
@@ -29282,25 +29296,59 @@ function gapRowHtml(lib, n){
 // progress line would make the one number people want - how much is left - the
 // only thing they cannot see. The counts here are live; the rows below are
 // from the last check and say so.
+// HOW FAST THE DRAIN IS ACTUALLY MOVING, measured rather than assumed.
+// It hands a file over as a job finishes, so its speed is the queue's speed
+// and nothing here can know it in advance. Samples of (when, how many handed
+// over) over the last two minutes give a rate, and the rate gives a time.
+const _gapSpeed=[];
+function gapRate(queued){
+  const now=Date.now()/1000;
+  // SAMPLED EVERY POLL, NOT ONLY WHEN THE COUNT MOVES. Only recording
+  // changes meant a drain that was waiting for room kept ONE sample for as
+  // long as it waited - and then, the moment it moved, measured that one file
+  // against the whole wait and reported a rate of nothing. Time passing is
+  // part of the measurement; the window below is what keeps the answer recent.
+  _gapSpeed.push({t:now, q:queued});
+  while(_gapSpeed.length>2 && now-_gapSpeed[0].t>120) _gapSpeed.shift();
+  if(_gapSpeed.length<2) return 0;
+  const a=_gapSpeed[0], b=_gapSpeed[_gapSpeed.length-1];
+  const dt=b.t-a.t, dq=b.q-a.q;
+  return (dt>5 && dq>0) ? dq/dt : 0;          // files a second
+}
+
 function gapDrainHtml(){
   const dr=(_gap&&_gap.drain)||{};
   if(!dr.on) return '';
   const total=(dr.queued||0)+(dr.left||0);
   const frac=total?Math.min(1,(dr.queued||0)/total):0;
+  const rate=gapRate(dr.queued||0);
+  const eta=(rate>0 && dr.left) ? Math.round(dr.left/rate) : 0;
   return `<div style="border:1px solid var(--acc);border-radius:6px;
               padding:6px 9px;margin-bottom:8px">
     <div style="display:flex;gap:9px;align-items:center;font-size:11.5px">
       <span class="spin" style="width:11px;height:11px"></span>
-      <b style="color:var(--acc)">requeueing ${dr.library?esc(dr.library)
-        :'every library'}</b>
+      <b style="color:var(--acc)">rebuilding ${dr.library?esc(dr.library)
+        :'every library'} under today's rules</b>
       <span class="dim gapdrain-n" style="font-variant-numeric:tabular-nums"
-        >${fmt(dr.queued||0)} handed over${dr.left!=null
-          ? ' · '+fmt(dr.left)+' to go':''}</span>
-      ${(dr.in_flight||0)>=(dr.keep||100)?`<span class="dim"
-        style="font-size:10.5px" title="Nothing is stuck - the queue simply has
-its share already. The next batch goes in as these finish."
-        >· waiting for room (${fmt(dr.in_flight)} of these already queued)</span>`
-        :''}
+        >${num(dr.queued||0,'done')} sent to the queue${dr.left!=null
+          ? ' · '+num(dr.left,'auto')+' still to send':''}
+         <b style="color:var(--acc)">${(frac*100).toFixed(0)}%</b>${
+        rate?` · <span title="Measured on this run">${rate>=1
+          ? '<b>'+rate.toFixed(1)+'</b> a second'
+          : '<b>'+(60*rate).toFixed(1)+'</b> a minute'}</span>`
+          // A BAR THAT IS NOT MOVING SHOULD SAY SO rather than just omit the
+          // clock. There is no rate because nothing has been handed over
+          // lately, and "no ETA" and "stalled" look identical unless one of
+          // them is written down.
+          :` · <span class="dim" title="The drain hands a file over as one on the queue finishes, and the gate can hold it while somebody is watching. A number that is not moving means it is waiting rather than that it has stopped — Stop is the only thing that stops it.">holding · nothing handed over in the last minute</span>`}${
+        eta?` · ${numt(hsDur(eta))} left`:''}</span>
+      ${(dr.in_flight!=null)?`<span class="dim" style="font-size:10.5px"
+        title="Nothing is stuck. The drain holds this many on the queue and adds
+the next one as each finishes, so a static number here means the queue is full
+of these rather than that something has stopped."
+        >· ${num(dr.in_flight,'auto')} of ${fmt(dr.keep||100)} on the queue${
+          (dr.in_flight||0)>=(dr.keep||100)-2
+            ? ' — full, the next goes in as one finishes':''}</span>`:''}
       <button style="font-size:10.5px;padding:1px 9px;margin-left:auto"
         onclick="gapStop(this)"
         title="Leave what is already queued alone and stop adding more."
@@ -29309,10 +29357,14 @@ its share already. The next batch goes in as these finish."
     <div class="gapscanbar" style="margin-top:5px"><i style="width:${
       (frac*100).toFixed(1)}%"></i></div>
     <div class="dim" style="font-size:10.5px;margin-top:3px">
-      Sent a few at a time rather than all at once: <b>${fmt(dr.keep||100)}</b>
-      stay on the queue and more go on as those finish, so a rebuild of a whole
-      library never arrives in front of the work nuarr was already doing. Stop
-      leaves everything already queued alone. Watch them go through
+      WHAT IS BEING SENT: finished files whose subtitles today's rules would
+      have handled differently. Each one goes back through the normal queue and
+      is rebuilt — a remux, not a re-encode — and re-reads the rules as it
+      starts, so a rule you change while this runs applies to everything after
+      it. <b>${fmt(dr.keep||100)}</b> stay on the queue at a time and more go
+      on as those finish, so a whole library never arrives in front of the work
+      nuarr was already doing. <b>Stop</b> leaves everything already sent
+      alone. Watch them go through
       <a href="/#transcoding">Processing System</a>.</div>
   </div>`;
 }
@@ -32599,8 +32651,10 @@ function skPaint(force){
   // shows - both are "things here waiting on you", so they have to agree.
   const _need=(c.actionable||0);
   const head=`<div class="subshd"><b style="color:#e8a33d">Subtitle User Input</b>
+    <span class="subskind k-ask"
+      title="This one is waiting on an answer from you. Nothing on it moves until you give one.">waiting on you</span>
     <span class="dim subssub"
-      title="Every reading nuarr is not sure enough about to act on by itself, in one place. Answering one records the correction, remembers it against the show and the release group, and puts the file on the queue.">what nuarr cannot settle on its own</span>
+      title="Every reading nuarr is not sure enough about to act on by itself, in one place. Answering one records the correction, remembers it against the show and the release group, and puts the file on the queue.">readings nuarr will not act on without you</span>
     <span class="subsn">${_need?`${num(_need,'you')} <span class="dim">to answer</span>`
                               :'<b style="color:var(--ok)">nothing to answer</b>'}</span>
     </div>
@@ -33967,7 +34021,7 @@ function subsBoardHtml(){
   const tot=(_subs.total||0), you=(_subs.held||0);
   return subsPanel({
     id:'subsPanelBoard', accent:'#6fb0ff',
-    title:'Every subtitle decision, and what it is set to',
+    title:'What nuarr may do on its own', kind:'yours',
     right:`${num(tot,'auto')} <span class="dim">files want something</span>${
       you?` · ${num(you,'you')} <span class="dim">yours</span>`:''}`,
     why:`Four things can be wrong with a file's subtitles. This is all of them,
@@ -34081,7 +34135,7 @@ function subsListHtml(){
   const ready=(_subs.ready!==undefined)?_subs.ready:R.filter(e=>e.ready).length;
   return subsPanel({
     id:'subsPanelList', accent:'#6fb0ff',
-    title:'What would happen, file by file',
+    title:'What the rules above would change, file by file', kind:'auto',
     sub:`${num(ready,'auto')} nuarr will get to on its own${
         (total-ready)?` · ${num(total-ready,'you')} waiting on a switch above`
                      :''}${
@@ -34142,11 +34196,23 @@ function subsListHtml(){
 // is about, and its body; nothing else decides where those go. The accent is
 // the only thing that differs, and it is the same colour vocabulary the chips
 // in the list use - so a blue edge and a blue chip mean the same system.
+const SUBS_KIND_WORD={auto:'runs by itself', yours:'you set this',
+                      ask:'waiting on you'};
+const SUBS_KIND_WHY={
+  auto:'A background check. Nobody starts it - it looks at the library on its '
+      +'own schedule and reports what it finds. Nothing here is a consequence '
+      +'of something you just did.',
+  yours:'Settings. What is on this panel is what YOU have chosen, and every '
+       +'count on the page below is a consequence of it.',
+  ask:'This one is waiting on an answer from you. Nothing on it moves until '
+     +'you give one.'};
 function subsPanel(o){
   return `<div class="subsp" id="${o.id||''}">
     <div class="subshd">
       ${o.busy?'<span class="busy" style="color:var(--acc);flex:none"><span class="sp"></span></span>':''}
       <b style="color:${o.accent||'var(--acc)'}">${esc(o.title||'')}</b>
+      ${o.kind?`<span class="subskind k-${o.kind}" title="${esc(SUBS_KIND_WHY[o.kind]||'')}"
+        >${esc(SUBS_KIND_WORD[o.kind]||o.kind)}</span>`:''}
       ${o.sub?`<span class="dim subssub">${o.sub}</span>`:''}
       ${o.right?`<span class="subsn">${o.right}</span>`:''}
     </div>
@@ -34162,7 +34228,7 @@ function subsScanHtml(){
   const done=sc.total-(sc.left||0);
   return subsPanel({
     id:'subsPanelScan', accent:'#6fb0ff', busy:!!sc.running,
-    title:'Reading what every file carries',
+    title:'Reading the library', kind:'auto',
     sub:`${num(done,'auto')} of ${num(sc.total,'auto')}
       <span style="font-size:10.5px">(${pct.toFixed(0)}%)</span>
       ${sc.rate?` · <b style="color:var(--ok)">${sc.rate.toFixed(0)}</b> a second`:''}
@@ -34201,7 +34267,7 @@ function subsProcHtml(){
   if(!waiting && !live && !(q.failed||0) && !F.length) return '';
   return subsPanel({
     id:'subsPanelProc', accent:'#6fb0ff', busy:!!j.running,
-    title:'Being processed',
+    title:'Subtitle queue', kind:'auto',
     sub:`${j.running?`${num(j.running,'auto')} running`:'nothing running'}${
         j.queued?` · ${num(j.queued,'auto')} handed over and waiting`:''}${
         q.failed?` · ${num(q.failed,'you')} could not be done`:''}
