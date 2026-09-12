@@ -497,6 +497,24 @@ def sweep() -> dict:
                 sec.keep()
                 sec.note(f"removed {sw['dirs_removed']} abandoned OCR work "
                          f"directories ({sw['mb_freed']:,.0f} MB)", "ok")
+            # THE FOURTH PLACE THINGS ACCUMULATE, and the only one that
+            # had no timer: working files on the cache and staging files
+            # beside the media. sweep_strays() existed and was wired to a
+            # button. A leak in a success path filled 746 GB before
+            # anybody pressed it.
+            try:
+                from . import fileops as _fo
+                st = _fo.sweep_strays()
+                res["strays"] = {k: st.get(k) for k in
+                                 ("looked", "removed", "bytes", "kept")}
+                if st.get("removed"):
+                    sec.keep()
+                    sec.note(f"removed {st['removed']} leftover working "
+                             f"file(s), {st['bytes'] / 1024 ** 3:.1f} GB",
+                             "ok")
+            except Exception as e:                           # noqa: BLE001
+                sec.note(f"stray sweep failed: {type(e).__name__}: {e}",
+                         "warn")
 
             if lg.get("rotated"):
                 sec.keep()

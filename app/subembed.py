@@ -1197,8 +1197,12 @@ def _embed_tail(file_id, path, takes, drops, cmd, tmp, report, work=None,
                    pct=(100.0 * (done or 0) / total) if total else -1.0)
     res = fileops.safe_replace(path, tmp,
                                on_stage=(_stage if work is not None else None))
+    # Whatever happened, the working copy on the cache is finished with.
+    # safe_replace consumes it on success now; this is the belt to that
+    # brace, because the failure branches always removed it and the
+    # success branch was the one that leaked.
+    fileops._quiet_remove(tmp)
     if not getattr(res, "ok", False):
-        fileops._quiet_remove(tmp)
         why = f"could not put the rebuilt file in place: {getattr(res, 'why', '')}"
         _note(file_id, path, "", "", False, why)
         return {"ok": False, "why": why}

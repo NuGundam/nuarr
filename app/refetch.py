@@ -58,6 +58,12 @@ _CONTENT = [
 _TRANSIENT = [
     (r"database is locked|database table is locked|database is busy",
      "the database was busy for a moment - nothing is wrong with the file"),
+    # A full cache is a condition of the MACHINE, not the file, and it
+    # clears by itself: finishing jobs release their working copies and
+    # the housekeeping sweep removes anything left behind. Sixty-one
+    # files sat in Errors with "refusing to guess" for exactly this.
+    (r"free on the cache", "the cache was full - it is swept and the "
+                           "file retried once there is room"),
     (r"\bdisk i/?o error\b", "a disk read faltered"),
     (r"temporarily unavailable|resource busy|try again",
      "something was busy for a moment"),

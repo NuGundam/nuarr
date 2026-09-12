@@ -3415,11 +3415,28 @@ def check_audiolang() -> Reason:
                   extra=extra, active=True)
 
 
+_CACHE_SWEEP = {"at": 0.0}
+
+
 def check_cache_space() -> Reason:
     """Refuse to start work we cannot finish."""
     from . import fileops
     free = fileops.free_space_gb(SETTINGS.cache_dir)
     need = SETTINGS.cache_min_free_gb
+    if free < need:
+        # BEFORE HOLDING EVERYTHING, LOOK FOR WHAT IS SPARE. The floor is
+        # meant to be crossed by work in flight, which frees itself; when
+        # it is crossed by leftovers nothing is coming to free them and
+        # the gate would hold for good. At most once every ten minutes.
+        now = time.time()
+        if now - _CACHE_SWEEP["at"] > 600:
+            _CACHE_SWEEP["at"] = now
+            try:
+                st = fileops.sweep_strays(roots=[SETTINGS.cache_dir])
+                if st.get("removed"):
+                    free = fileops.free_space_gb(SETTINGS.cache_dir)
+            except Exception:                            # noqa: BLE001
+                pass
     if free < need:
         return Reason(
             True, "cache",

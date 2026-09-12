@@ -645,6 +645,7 @@ def safe_replace(target: str, replacement: str, *, attempts: int = 5,
 
     new_sig_size = os.path.getsize(replacement)
     backup = target + ".nuarr-bak"
+    original = replacement           # what the caller handed over
 
     # CROSS-VOLUME STAGING.
     # os.replace() is a rename, and a rename cannot cross drives - it raises
@@ -712,6 +713,19 @@ def safe_replace(target: str, replacement: str, *, attempts: int = 5,
 
             if moved_backup and not keep_backup:
                 _quiet_remove(backup)
+            # THE REPLACEMENT IS CONSUMED EITHER WAY. On one volume the
+            # rename above took it; across volumes only the STAGED copy
+            # was renamed and the original sat on the cache untouched.
+            # Every caller that built its output on the cache and did
+            # not clean up after a success left one full copy of the
+            # file behind - 925 of them in 7.6 hours once the subtitle
+            # rewrite ran at queue speed, 746 GB, and the cache went from
+            # 841 GB free to the 100 GB floor with every job after that
+            # refusing for want of room. "Replace target with
+            # replacement" means the replacement is gone afterwards,
+            # whichever drive it started on.
+            if staged:
+                _quiet_remove(original)
             return OpResult(True, "replace", f"{human_bytes(new_sig_size)} in place"
                             + (" (staged across volumes)" if staged else ""),
                             attempt, waited, holders)
@@ -1073,8 +1087,11 @@ def recover_interrupted_commits(roots: list[str],
 #   .nuarr-mark-*   Nothing depends on it and nothing can recover it, so age
 #   .nuarr-shape-*  is the only question: anything older than a few hours
 #                   cannot belong to a live operation.
+# Every prefix cache_temp() is ever called with - grep it - plus the two
+# older spellings. A name here is a promise that nothing keeps such a file
+# on purpose past STRAY_AGE_S.
 STRAY_PREFIX = (".nuarr-embed-", ".nuarr-mark-", ".nuarr-shape-", "embed-",
-                "mark-", "shape-")
+                "mark-", "shape-", "subs-", "dupe-", "nuarr-")
 STRAY_SUFFIX = (".nuarr-bak", ".nuarr-new", ".nuarr-mv")
 # No single operation nuarr performs runs for six hours. A 2160p remux is
 # minutes; the longest transcode measured here is under two.

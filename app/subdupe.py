@@ -385,8 +385,8 @@ def fix_one(file_id: int, report=None) -> dict:
                             if lost else
                             "the rebuilt file still has duplicates")}
         res = fileops.safe_replace(path, tmp)
+        fileops._quiet_remove(tmp)      # finished with, succeed or fail
         if not getattr(res, "ok", False):
-            fileops._quiet_remove(tmp)
             return {"ok": False,
                     "why": f"could not put it in place: {getattr(res, 'why', '')}"}
         # AND THE RECORD IS REFRESHED, which is the lesson that created this
