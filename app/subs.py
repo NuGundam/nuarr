@@ -206,7 +206,7 @@ def board() -> list:
                             "loose copy to recycle",
             "counting": counting,
             "detail": walk_word,
-            "goto": "subembed", "panel": "sePanel",
+            "goto": "subembed", "panel": "",
             "toggle": "",
         })
     except Exception as e:                                       # noqa: BLE001
@@ -231,7 +231,7 @@ def board() -> list:
                              "OUT, so it waits to be switched on"),
             "waiting": tally[DUPE],
             "waiting_word": "queued files carrying a twin or an empty track",
-            "goto": "subdupe", "panel": "sdPanel",
+            "goto": "subdupe", "panel": "",
             "toggle": subdupe.ENABLED_KEY,
         })
     except Exception as e:                                       # noqa: BLE001
@@ -300,6 +300,10 @@ def _findings() -> dict:
 
 
 ASK = "ask"
+# A file that is FINISHED but was built before a rule changed. Not queued and
+# not waiting on you - it would simply come out differently if it went through
+# again. Still a thing that would happen to a file, so still a row here.
+DRIFT = "drift"
 
 # Which switchboard row a step belongs under, so one colour means one thing
 # wherever it appears on the page.
@@ -334,6 +338,70 @@ def _word(s: dict) -> str:
     if d == "mark":
         return f"mark the words burned into the picture ({s.get('sure')}% sure)"
     return str(d or "")
+
+
+def _drift_rows() -> dict:
+    r"""Files already built that today's rules would build differently.
+
+    A DIFFERENT QUESTION IN THE SAME SENTENCE. Everything else in this list is
+    work that is waiting; these are files that are DONE and would come out
+    differently if they went through again - so they carry their own chip and
+    their own verb, Requeue, rather than being quietly mixed in with work that
+    is already on its way. They are here rather than in a card of their own
+    because "what would happen to this file" is one question, and a person
+    scanning that list should not have to know which of two panels a given
+    episode was going to appear in.
+    """
+    out: dict = {}
+    try:
+        from . import subocr
+        for lib in (subocr.gap_libraries() or []):
+            for f in (lib.get("files") or []):
+                fid = int(f.get("file_id") or 0)
+                if not fid:
+                    continue
+                ch = [c for c in (f.get("changes") or []) if c]
+                out[fid] = {
+                    "file_id": fid, "path": f.get("path") or "",
+                    "name": os.path.basename(f.get("path") or "")
+                            or (f.get("label") or ""),
+                    "library": lib.get("library") or "",
+                    "disk": f.get("disk") or "",
+                    "act": {"key": DRIFT,
+                            "word": "; ".join(ch[:2]) or "would be built "
+                                                        "differently today",
+                            "why": "finished before a rule changed, so it "
+                                   "still follows the old one",
+                            "on": False, "n": 1, "requeue": True,
+                            "queued": f.get("queued") or ""},
+                }
+    except Exception:                                            # noqa: BLE001
+        pass
+    return out
+
+
+def by_show(limit: int = 14) -> list:
+    r"""Where the waiting work is concentrated, by show.
+
+    The duplicate panel's own summary, kept when that panel went: "463 of
+    these are Detective Conan" is the kind of fact that turns a number into a
+    decision, and it is one GROUP BY over a table that is already indexed.
+    """
+    from . import subqueue
+    from .db import cursor
+    subqueue.init()
+    by: dict = {}
+    try:
+        with cursor() as cur:
+            for r in cur.execute("SELECT path, library FROM sub_queue "
+                                 " WHERE state != 'done'"):
+                parts = (r["path"] or "").split("\\")
+                show = parts[2] if len(parts) > 2 else (r["library"] or "?")
+                by[show] = by.get(show, 0) + 1
+    except Exception:                                            # noqa: BLE001
+        return []
+    return sorted(({"show": k, "n": v} for k, v in by.items()),
+                  key=lambda x: -x["n"])[:int(limit)]
 
 
 def queue_rows(limit: int = 400) -> dict:
@@ -387,7 +455,29 @@ def queue_rows(limit: int = 400) -> dict:
                     "acts": acts, "n": len(acts), "why": r.get("why") or "",
                     "err": r.get("err") or "",
                     "ready": not asks, "keys": sorted({a["key"] for a in acts})})
-    return {"total": total, "ready": total - with_ask, "held": with_ask,
+    # AND THE FILES BUILT UNDER OLDER RULES, in the same list. A file can be
+    # in both - queued for something today AND built under a rule that has
+    # since changed - so it joins the row it already has rather than getting a
+    # second one. One row per file is the whole point of this table.
+    drift = _drift_rows()
+    seen = {r["file_id"]: r for r in out}
+    for fid, d in drift.items():
+        e = seen.get(fid)
+        if e is not None:
+            e["acts"].append(d["act"])
+            e["n"] = len(e["acts"])
+            e["keys"] = sorted({a["key"] for a in e["acts"]})
+            continue
+        out.append({"file_id": fid, "path": d["path"], "name": d["name"],
+                    "library": d["library"], "disk": d["disk"],
+                    "state": "built", "acts": [d["act"]], "n": 1,
+                    "why": d["act"]["word"], "err": "",
+                    "ready": False, "keys": [DRIFT]})
+    # The total counts FILES, so a drifted file that already had a row does
+    # not count twice - it gained a chip, not a row.
+    extra = len(drift.keys() - seen.keys())
+    return {"total": total + extra, "ready": total - with_ask,
+            "held": with_ask, "drift": len(drift), "by_show": by_show(),
             "rows": out}
 
 

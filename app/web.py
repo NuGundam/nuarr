@@ -6111,6 +6111,31 @@ def api_subocr_rulesgap(check: int = 0):
     return d
 
 
+@app.post("/api/subocr/rulesgap/requeue-one")
+async def api_subocr_rulesgap_requeue_one(file_id: int):
+    r"""Send ONE drifted file back through the queue.
+
+    The drain below is the right shape for a library - it keeps the queue
+    topped up and feeds it as jobs finish. A Requeue button on a single row in
+    the file-by-file list means one file, now, and using the drain for that
+    would start a background machine to move one thing.
+    """
+    from . import jobs
+    from .db import cursor
+    with cursor() as cur:
+        r = cur.execute("SELECT path, title FROM files WHERE id=?",
+                        (int(file_id),)).fetchone()
+    if not r or not (r["path"] or ""):
+        return {"ok": False, "why": "no such file"}
+    try:
+        j = await jobs.enqueue(int(file_id), r["path"], r["title"] or "",
+                               kind="transcode", priority=100,
+                               source="requeue")
+        return {"ok": True, "job": j.id}
+    except ValueError as e:
+        return {"ok": False, "why": str(e)}
+
+
 @app.post("/api/subocr/rulesgap/requeue")
 async def api_subocr_rulesgap_requeue(library: str = "", stop: bool = False):
     r"""Start (or stop) draining the out-of-date list into the queue.
@@ -27122,6 +27147,12 @@ async function loadLangTab(){
   // configured, not where the decision about what to read is made. Erik asked
   // for it here, under the per-library switches whose every change alters what
   // it reports.
+  // THE LIST THAT WAS HERE IS IN "What would happen, file by file" NOW,
+  // as a chip with a Requeue beside it - a file that would come out
+  // differently today is still a file something would happen to, and keeping
+  // it in a card of its own meant one more per-file list to read. What stays
+  // is the part that belongs to the RULES: how many there are, when the check
+  // last ran, whether it acts by itself, and the button to run it now.
   el.innerHTML += `<div class="lkind" id="gapCard" style="padding:11px 12px;margin-top:12px">
       <b style="color:#6fb0ff">Files built under older subtitle rules</b>
       <div class="dim" style="font-size:11px;margin-top:2px">
@@ -29043,7 +29074,14 @@ function gapLibsHtml(){
             : 'Start feeding this library\'s out-of-date files into the queue, a hundred at a time, topping up as they finish.'}"
           >Requeue</button>
       </div>
-      ${open?gapFilesHtml(L):''}
+      ${open?`<div class="dim" style="padding:6px 9px;font-size:11px;
+           border-top:1px solid var(--line)">The files themselves are in
+        <a href="#" onclick="wtab('lang');setTimeout(()=>{const e=document.getElementById('subsTop');if(e)e.scrollIntoView({behavior:'smooth',block:'start'});},250);return false"
+           >What would happen, file by file</a>, with a Requeue on each one —
+        a file that would come out differently today is still a file something
+        would happen to, and it belongs in the one list that says so rather
+        than in a second list here. Requeue above sends this whole library
+        through, a hundred at a time.</div>`:''}
     </div>`;}).join('');
 }
 
@@ -33729,9 +33767,12 @@ let _subsSort='what', _subsDesc=false;
 // One colour per kind of subtitle trouble, used by the chip in the list and
 // by the dot on the switchboard, so the eye can join a row to its system.
 const SUBS_C={sidecar:'#6fb0ff', dupe:'#c98cf0', picture:'#e8a33d',
-              title:'#7fd18c'};
+              title:'#7fd18c', ask:'#e8a33d', drift:'#9aa7b8'};
 const SUBS_W={sidecar:'sitting beside it', dupe:'twice inside it',
-              picture:'burned into the picture', title:'a title that lies'};
+              picture:'burned into the picture', title:'a title that lies',
+              ask:'nuarr will not guess about this one',
+              drift:'finished before a rule changed, so it still follows the '
+                   +'old one'};
 // Which runner's strip belongs to which switchboard row. The picture row
 // covers two readers and they share one schedule, so hardsub's strip is the
 // one that speaks for it.
@@ -33819,8 +33860,12 @@ function subsSwitchHtml(b){
         title="${b.on?'stop removing duplicate tracks':'start removing duplicate tracks — one per language and kind survives, the one with the most lines'}"
         >${b.on?'Turn it off':'Turn it on'}</button>`;
   if(b.key==='sidecar')
-    return `<a href="#" onclick="subsDetail('sidecar');return false"
-        title="the rule is per library, so the switch is in the panel">which libraries</a>`;
+    // The per-library switches are in Subtitle rules, at the top of the page.
+    // This used to open the sidecar preview panel, which had them too - and
+    // that panel is gone, so the link goes to where they actually live.
+    return `<a href="#" onclick="const e=document.getElementById('langBody');
+        if(e)e.scrollIntoView({behavior:'smooth',block:'start'});return false"
+        title="The rule is per library. Its switches are in Subtitle rules, at the top of this page.">which libraries</a>`;
   if(b.key==='picture') return '';   // the row itself opens the panel
   return '';
 }
@@ -33945,13 +33990,20 @@ function subsListHtml(){
       <span class="dim" style="font-size:11.5px">${num(total,'auto')} file${
         total===1?'':'s'} — ${num(ready,'auto')} nuarr will get to on its own${
         (total-ready)?`, ${num(total-ready,'you')} waiting on a switch above`
-                     :''}</span>
+                     :''}${
+        _subs.drift?` · <span title="Rules apply when a file is built. These finished before a rule changed, so they still follow the old one — Requeue sends one back through the normal queue to be rebuilt.">${
+          num(_subs.drift,'you')} built under older rules</span>`:''}</span>
       <span class="dim" style="font-size:10.5px;margin-left:auto">${
         R.length<total?`showing the first ${fmt(R.length)}`:''}</span>
     </div>
     <div class="dim" style="font-size:10.5px;margin-top:3px">One row per file.
       A file with three things wrong with it is one row with three chips, not
       three rows in three panels.</div>
+    ${(_subs.by_show&&_subs.by_show.length)?`<div style="margin-top:5px;
+         display:flex;gap:5px;flex-wrap:wrap" title="Where the waiting work is concentrated. One show accounting for hundreds of files usually means one release group's habit rather than hundreds of separate problems.">${
+      _subs.by_show.slice(0,12).map(x=>`<span class="capsc"
+        style="font-size:10px">${esc(x.show)} <b>${fmt(x.n)}</b></span>`).join('')
+    }</div>`:''}
     <div class="scrollbox" style="max-height:420px;overflow:auto;margin-top:7px">
     <table class="tt" style="width:100%;table-layout:fixed">
       <thead><tr style="font-size:10.5px">
@@ -33971,7 +34023,14 @@ function subsListHtml(){
             return `<div style="font-size:11px;margin-bottom:2px">
               <span class="capsc" style="border-color:${c};color:${c}"
                 title="${esc(SUBS_W[a.key]||'')}${a.on?'':' — waiting on a switch'}">${
-                esc(a.word||'')}</span>${a.why?`<div class="dim"
+                esc(a.word||'')}</span>${
+              (a.key==='drift')
+                ? (a.queued
+                   ? `<span class="dim" style="font-size:10px;margin-left:5px">already ${esc(a.queued)}</span>`
+                   : ` <button class="rmb" style="margin-left:5px"
+                        title="Send this file back through the normal queue so it is rebuilt under today's rules."
+                        onclick="subDriftRequeue(${e.file_id},this)">Requeue</button>`)
+                : ''}${a.why?`<div class="dim"
                 style="font-size:10px;opacity:.7;white-space:normal">${
                 esc(String(a.why).slice(0,160))}</div>`:''}</div>`;
           }).join('')}</td>
@@ -34027,9 +34086,10 @@ function subsProcHtml(){
   // rounds getting rid of. What stays is the one sentence you would come to
   // this page to read: is any of it moving, and how much is left.
   const q=_subs.queue||{}, j=(_subs.jobs||{});
+  const F=(_subs.failed||[]);
   const waiting=(q.queued||0), asking=(q.asking||0);
   const live=(j.running||0)+(j.queued||0);
-  if(!waiting && !live && !(q.failed||0)) return '';
+  if(!waiting && !live && !(q.failed||0) && !F.length) return '';
   return `<div class="lkind" style="padding:10px 12px;margin-bottom:8px">
     <div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap">
       ${j.running?'<span class="busy" style="color:var(--acc);flex:none"><span class="sp"></span></span>':''}
@@ -34054,10 +34114,30 @@ function subsProcHtml(){
       </div>
       <div class="hsbar item" style="margin-top:2px"><i
         style="width:${p}%;background:${c}"></i></div>`;}).join('')}</div>`:''}
+    ${(F&&F.length)?`<div style="margin-top:7px;border-top:1px solid var(--line);
+         padding-top:6px">
+      <div style="display:flex;gap:9px;align-items:baseline;flex-wrap:wrap">
+        <b style="font-size:11.5px;color:var(--warn)">${fmt(F.length)} could not
+          be taken in</b>
+        <span class="dim" style="font-size:10.5px">the subtitle file itself is
+          unreadable — trying again cannot help those</span>
+        ${F.some(f=>f.broken)?`<button class="rmb" style="margin-left:auto"
+          onclick="seDelBrokenTop(this)"
+          title="Recycle the subtitle files mkvmerge will never accept. The video is not touched.">Recycle the broken subtitle files</button>`:''}
+      </div>
+      ${F.slice(0,6).map(f=>`<div style="display:flex;gap:8px;align-items:baseline;
+           font-size:11px;margin-top:3px">
+        <span style="flex:1 1 auto;min-width:0;overflow:hidden;
+          text-overflow:ellipsis;white-space:nowrap"
+          title="${esc(f.sidecar||f.key||'')}">${esc(f.label||f.name||'')}</span>
+        ${f.disk?`<span style="flex:none;color:${diskColor(f.disk)}">${esc(f.disk)}</span>`:''}
+        <span class="dim" style="flex:none;font-size:10px">${esc((f.why||'').slice(0,64))}</span>
+      </div>`).join('')}
+    </div>`:''}
     <div class="dim" style="font-size:10.5px;margin-top:4px">The reading hands
-      over what it is sure about; anything it is not sure about waits below
-      until you say. One rewrite per file — sidecars in and duplicates out in
-      the same pass.</div>
+      over what it is sure about; anything it is not sure about waits in
+      Subtitle User Input until you say. One rewrite per file — sidecars in and
+      duplicates out in the same pass.</div>
   </div>`;
 }
 
@@ -34092,6 +34172,34 @@ async function subReplan(el){
   if(el) el.textContent='re-applying…';
   try{ await fetch('/api/subqueue/replan?force=1', {method:'POST'}); }catch(e){}
   _subsKey=''; await loadSubQ(); loadSubs(true);
+}
+
+// ONE FILE BACK THROUGH, from the row that named it. The drain endpoint takes
+// a library and feeds the queue as jobs finish; this is the single-file case,
+// which is what a Requeue button on one row has to mean.
+async function subDriftRequeue(fid, btn){
+  if(btn){ btn.disabled=true; btn.textContent='…'; }
+  try{ await fetch('/api/subocr/rulesgap/requeue-one?file_id='+fid,
+                   {method:'POST'}); }
+  catch(e){}
+  if(btn) btn.textContent='sent';
+  _subsKey=''; setTimeout(()=>loadSubs(true), 900);
+}
+// The sidecar panel's own button, kept when that panel went. Same endpoint,
+// same effect: the subtitle files mkvmerge will never accept are recycled and
+// stop being offered.
+async function seDelBrokenTop(btn){
+  const F=(_subs.failed||[]).filter(f=>f.broken&&!f.gone);
+  if(!F.length) return;
+  askInline(btn, `Recycle ${F.length} unreadable subtitle file(s)? The video `
+    +'is never touched, and they go to the recycle bin rather than being '
+    +'deleted.', `Yes, recycle ${F.length}`, async ()=>{
+      const r=await (await fetch('/api/subembed/delete-broken?ids='
+        +encodeURIComponent(F.map(f=>f.key).join(',')),
+        {method:'POST'})).json();
+      _subsKey=''; setTimeout(()=>loadSubs(true), 700);
+      return r;
+    });
 }
 
 let _subq=null, _subqAt=0;

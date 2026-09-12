@@ -302,18 +302,16 @@
              What the sidecar rule would do, readable BEFORE it is switched
              on - it rewrites files and recycles others, so the preview is the
              point rather than a decoration. -->
-        <div id="seHome">
-          <div class="subsd" data-d="sidecar" style="display:none">
-            <div id="sePanel" style="padding:0 14px 6px"></div>
-          </div>
-        </div>
-        <!-- The other half of the same subject: what is already inside a
-             file, and whether any of it is there twice. Drawn by sdPaint. -->
-        <div id="sdHome">
-          <div class="subsd" data-d="dupe" style="display:none">
-            <div id="sdPanel" style="padding:0 14px 6px"></div>
-          </div>
-        </div>
+        <!-- THE SIDECAR PREVIEW AND THE DUPLICATE LIST USED TO LIVE HERE.
+             Both were lists of files with something wrong with their
+             subtitles, which is what "What would happen, file by file" is - so
+             the same episode could appear in three places on one page, worded
+             three ways, and you had to know which panel a given problem was
+             going to show up in. The counts they carried are on their
+             switchboard rows, the failures are in Processing beside the other
+             failures, and the per-show breakdown is under the merged list's
+             own header. See subs.queue_rows: it reads the queue, and the
+             queue is what is actually going to happen. -->
 
         <!-- CHECK ONE FILE NOW. The readers above are sweeps; this is the
              same reader pointed at a file you chose, with a clock on it. It
