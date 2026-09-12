@@ -12736,9 +12736,17 @@ button[disabled]{opacity:.5;cursor:default}
    saying which system it belongs to, a title on the left, the number that
    panel is about on the RIGHT, and the same pulse as the dashboard when that
    number changes. */
-.subsp{border:1px solid var(--line);border-left:3px solid var(--acc);
+/* A PLAIN EDGE. Every panel here wore a thick blue stripe down its left side,
+   which was meant to say "this one belongs to that system" - but once all of
+   them had one it said nothing except that the page has a lot of panels, and
+   six blue bars down the left is a lot of blue. The stripe is now for the one
+   panel that is different in kind: Subtitle User Input, which is the only one
+   waiting on you, keeps its amber. */
+.subsp{border:1px solid var(--line);
        border-radius:8px;padding:10px 12px;margin-bottom:8px;
        background:var(--panel,transparent)}
+/* The exception, and it earns it by being the only one. */
+.subsp.subsp-ask{border-left:3px solid #e8a33d}
 .subsp .subshd{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
 .subsp .subshd > b{flex:none}
 /* THE COUNT IS ALWAYS THE LAST THING ON THE LINE, on every panel, so the eye
@@ -32832,8 +32840,7 @@ function skPaint(force){
   // THE PAGE'S SHAPE, not this panel's own. Same border, same padding, same
   // number-on-the-right as Reading, Being processed and the file list - this
   // was the last panel here still wearing its own.
-  const html=`<div class="subsp" id="subsPanelInput"
-       style="border-left-color:#e8a33d">${
+  const html=`<div class="subsp subsp-ask" id="subsPanelInput">${
     head}${skAskHtml()}${note}${key}${band}${prog}${hist}${table}${foot}</div>`;
   scPaint('subs');
   if(!force && (askOpen('skPanel') || panelBusy('skPanel') || panelScrolled('skPanel'))) return;
@@ -34136,8 +34143,7 @@ function subsListHtml(){
 // the only thing that differs, and it is the same colour vocabulary the chips
 // in the list use - so a blue edge and a blue chip mean the same system.
 function subsPanel(o){
-  return `<div class="subsp" id="${o.id||''}"
-       style="border-left-color:${o.accent||'var(--acc)'}">
+  return `<div class="subsp" id="${o.id||''}">
     <div class="subshd">
       ${o.busy?'<span class="busy" style="color:var(--acc);flex:none"><span class="sp"></span></span>':''}
       <b style="color:${o.accent||'var(--acc)'}">${esc(o.title||'')}</b>
