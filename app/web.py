@@ -7921,6 +7921,153 @@ async def api_subs(limit: int = 400, force: int = 0):
     return await asyncio.to_thread(subs.overview, int(limit), bool(force))
 
 
+@app.get("/api/aud")
+async def api_aud(limit: int = 400, force: int = 0):
+    r"""The whole Audio languages page in one answer.
+
+    ONE REQUEST, BECAUSE IT IS ONE QUESTION - the argument api_subs makes, and
+    the page it describes is now this page too. The audio pane used to poll the
+    backlog, the policy, the ledger and the auto progress on four timers, so
+    the header could say one thing while the list under it said another and
+    there was no moment at which the screen was all true at once.
+
+    OFF THE EVENT LOOP, because the first call after a restart plans.
+    """
+    from . import aud
+    return await asyncio.to_thread(aud.overview, int(limit), bool(force))
+
+
+@app.get("/api/audqueue")
+async def api_audqueue(limit: int = 60):
+    """The queue, what is running, and what it wants asked."""
+    from . import audplan, audqueue
+
+    def _read():
+        return {"rev": audplan.revision(), **audqueue.snapshot(int(limit)),
+                "asking": audqueue.asking(200)}
+    return await asyncio.to_thread(_read)
+
+
+@app.post("/api/audqueue/answer")
+async def api_audqueue_answer(file_id: int, question: str, choice: str,
+                              scope: str = "both"):
+    """Your decision: applied to this file, and remembered for the next."""
+    from . import aud, audqueue
+    r = await asyncio.to_thread(audqueue.answer, int(file_id), question,
+                                choice, scope)
+    # AND STRAIGHT ONTO THE QUEUE IF THE ANSWER MEANT WORK. Waiting for the
+    # next top-up would be a minute of a panel saying it had taken your
+    # decision and nothing visibly happening because of it.
+    try:
+        fed = await audqueue.topup()
+        r["queued_now"] = int(fed.get("made") or 0)
+    except Exception:                                            # noqa: BLE001
+        pass
+    try:
+        aud.bump()
+    except Exception:                                            # noqa: BLE001
+        pass
+    return r
+
+
+@app.post("/api/audqueue/answer/batch")
+async def api_audqueue_answer_batch(payload: dict = Body(...)):
+    r"""One decision applied to a whole selection.
+
+    THREE OUTCOMES, DECIDED PER ROW WHERE THE FACTS ARE - the lesson the
+    subtitle batch had to learn twice. Your answer is recorded on everything
+    you ticked; the rows it leaves something to do go on the queue; the rows it
+    settles are acked and leave the list. Reporting only the first of those
+    three is how a batch of eleven said "1 queued" and left ten sitting there
+    looking unanswered.
+    """
+    from . import aud, audqueue
+    ids = [int(x) for x in (payload.get("file_ids") or []) if x]
+    choice = str(payload.get("choice") or "")
+    question = str(payload.get("question") or "tag")
+    scope = str(payload.get("scope") or "both")
+    if not ids or not choice:
+        return {"ok": False, "why": "nothing selected"}
+
+    def _work():
+        out = {"answered": 0, "queued": 0, "settled": 0, "failed": 0,
+               "learned": []}
+        for fid in ids:
+            try:
+                r = audqueue.answer(fid, question, choice, scope)
+            except Exception:                                    # noqa: BLE001
+                out["failed"] += 1
+                continue
+            if not r.get("ok"):
+                out["failed"] += 1
+                continue
+            out["answered"] += 1
+            if r.get("queued"):
+                out["queued"] += 1
+            elif r.get("settled"):
+                out["settled"] += 1
+            for l in (r.get("learned") or []):
+                if l not in out["learned"]:
+                    out["learned"].append(l)
+        return out
+    r = await asyncio.to_thread(_work)
+    try:
+        fed = await audqueue.topup()
+        r["queued_now"] = int(fed.get("made") or 0)
+    except Exception:                                            # noqa: BLE001
+        pass
+    try:
+        aud.bump()
+    except Exception:                                            # noqa: BLE001
+        pass
+    r["ok"] = True
+    return r
+
+
+@app.post("/api/audqueue/requeue")
+async def api_audqueue_requeue(file_id: int):
+    from . import aud, audqueue
+    r = await asyncio.to_thread(audqueue.requeue, int(file_id))
+    try:
+        fed = await audqueue.topup()
+        r["queued_now"] = int(fed.get("made") or 0)
+    except Exception:                                            # noqa: BLE001
+        pass
+    aud.bump()
+    return r
+
+
+@app.post("/api/audqueue/replan")
+async def api_audqueue_replan(force: int = 1):
+    """Re-apply the rules to everything now, rather than at the next pass."""
+    from . import aud, audqueue
+    audqueue.bump()
+    r = await asyncio.to_thread(audqueue.replan, 100000, bool(force))
+    try:
+        fed = await audqueue.topup()
+        r["queued_now"] = int(fed.get("made") or 0)
+    except Exception:                                            # noqa: BLE001
+        pass
+    aud.bump()
+    return r
+
+
+@app.get("/api/audqueue/memory")
+async def api_audqueue_memory(limit: int = 400):
+    """Everything you have taught it, and where each answer came from."""
+    from . import aud
+    return await asyncio.to_thread(aud.memory, int(limit))
+
+
+@app.post("/api/audqueue/unlearn")
+async def api_audqueue_unlearn(scope: str, skey: str, question: str):
+    from . import aud, audplan, audqueue
+    r = await asyncio.to_thread(audplan.unlearn, scope, skey, question)
+    audqueue.bump()
+    aud.bump()
+    return r
+
+
 @app.get("/api/subdupe")
 def api_subdupe(preview: int = 40):
     """Files carrying the same subtitle twice, and what would be removed."""
@@ -24388,7 +24535,10 @@ function wtab(which){
     return;
   }
   if(which==='alang'){
-    loadAlangProg();
+    // THE PAGE'S OWN LOADER FIRST. loadAud fetches /api/aud - the switchboard,
+    // the list, the listening bar and the queue in one request - and everything
+    // after it is the read-only evidence underneath.
+    loadAud(true);
     if(hint) hint.textContent='· audio language';
     paneLoad('alang', loadAlang);
     langAudioPolicy();          // the policy card above the measurements
@@ -34015,6 +34165,534 @@ async function idleLoad(key){
 // colour now says something rather than merely separating: the bar, the name
 // and the disk are all that spindle's colour, in the strip and in the table.
 const LANEC=['#6fb0ff','#e8a33d','#7fd18c','#c98cf0'];
+// ============ THE AUDIO LANGUAGES PAGE, ASKED AS ONE QUESTION ==============
+//
+// THE SUBTITLE PAGE'S SHAPE, DELIBERATELY. That page was rebuilt because its
+// panels each brought a header, a count, a progress bar, a switch and a list,
+// in three vocabularies, about the same library. This page had the same
+// problem in miniature - a backlog box, a policy card, an auto-progress strip
+// and a ledger, on four timers - so it gets the same answer: one switchboard
+// saying what every audio-language decision is and whether it is on, a strip
+// of what is being read and what is being done, and ONE list whose unit is the
+// FILE. The ledger is still underneath, as evidence.
+//
+// EVERYTHING HERE DRAWS FROM /api/aud, in one request, so the header cannot
+// say one thing while the list under it says another.
+let _aud=null, _audPoll=null, _audKey='', _audTopKey='', _audQ=null, _audQAt=0;
+let _audSort='what', _audDesc=false;
+let _audSel=new Set(), _audLast=null;
+// One colour per kind of audio-language trouble, used by the chip in the list
+// and by the edge on the switchboard, so the eye can join a row to its rule.
+const AUD_C={tag:'#6fb0ff', title:'#7fd18c', policy:'#c98cf0', ask:'#e8a33d'};
+const AUD_W={tag:'the tag claims a language the track is not',
+             title:'the title names a different language from the tag',
+             policy:'which languages this library keeps',
+             ask:'nuarr will not guess about this one'};
+
+// Audio User Input is open unless you shut it - the same exception Subtitle
+// User Input has, for the same reason. The evidence panels are there when you
+// go looking; this one is the page asking you a question, and a question
+// nobody sees is a list that only ever grows.
+function audOpen(k){
+  let v=null;
+  try{ v=localStorage.getItem('nuarr.aud.d.'+k); }catch(e){}
+  if(v===null) return k==='tag';
+  return v==='open';
+}
+function audDetailPaint(){
+  for(const w of document.querySelectorAll('.audd'))
+    w.style.display = audOpen(w.dataset.d) ? '' : 'none';
+}
+function audDetail(k){
+  if(!document.querySelector('.audd[data-d="'+k+'"]')){
+    if(k==='policy'){
+      const e=document.getElementById('alpolCard');
+      if(e) e.scrollIntoView({behavior:'smooth', block:'start'});
+    }
+    return;
+  }
+  const on=!audOpen(k);
+  try{ localStorage.setItem('nuarr.aud.d.'+k, on?'open':'shut'); }catch(e){}
+  // The slot only exists while the row is open, so the board has to be drawn
+  // again before the panel can be moved into it.
+  _audKey=''; audPaint(); audDetailPaint();
+  if(on){
+    const w=document.querySelector('.audd[data-d="'+k+'"]');
+    if(w) setTimeout(()=>w.scrollIntoView({behavior:'smooth',block:'start'}),80);
+  }
+}
+function audSort(k){
+  if(_audSort===k) _audDesc=!_audDesc; else { _audSort=k; _audDesc=false; }
+  _audKey=''; audPaint();
+}
+
+async function loadAudQ(){
+  try{ _audQ=await (await fetch('/api/audqueue?limit=40')).json();
+       _audQAt=Date.now(); }
+  catch(e){}
+}
+
+async function loadAud(force){
+  if(!document.getElementById('audTop')) return;
+  // EVERY PANE LIVES IN ONE DOCUMENT, so "the element exists" is not "the page
+  // is open". Without this the plan would be re-read every five seconds while
+  // somebody sat on the Jobs page. A slow heartbeat stays, so arriving here
+  // finds an answer waiting rather than a skeleton.
+  const pane=document.getElementById('alangPane');
+  if(!force && pane && pane.style.display==='none'){
+    clearTimeout(_audPoll);
+    _audPoll=setTimeout(()=>loadAud(), 20000);
+    return;
+  }
+  try{ _aud=await (await fetch('/api/aud?limit=400'+(force?'&force=1':''))).json(); }
+  catch(e){ _aud=_aud||{board:[],rows:[],total:0}; }
+  if(force || Date.now()-_audQAt > 4000) await loadAudQ();
+  audPaint();
+  clearTimeout(_audPoll);
+  // ONE CLOCK FOR THE WHOLE PAGE, the subtitle page's rule. The panels here
+  // used to keep their own timers, so two of them describing the same library
+  // could be seconds apart - and the moment you noticed was always the moment
+  // one of them was wrong.
+  _audPoll=setTimeout(()=>{ if(document.getElementById('audTop')) loadAud(); },
+                      5000);
+}
+
+// ---- WHAT HAS BEEN LISTENED TO ------------------------------------------
+// A number on a page is worth what you know about where it came from. "6 files
+// want a tag corrected" over a library that is two-thirds read is a different
+// sentence from the same number over one that has been read through, and until
+// this bar existed there was no way to tell those apart.
+function audListenHtml(){
+  const L=_aud.listen||{};
+  if(!L.total) return '';
+  const busy = (L.state==='listening'||L.state==='scanning'||L.state==='writing');
+  return subsPanel({
+    id:'audPanelListen', accent:'#6fb0ff', busy:busy,
+    title:'Listening to the library', kind:'auto',
+    sub:`${num(L.done,'auto')} of ${num(L.total,'auto')}
+      <span style="font-size:10.5px">(${(L.pct||0).toFixed(0)}%)</span>
+      ${L.each?` · <b style="color:var(--ok)">${L.each.toFixed(1)}s</b> a track`:''}
+      ${L.eta?` · ${numt(hsDur(L.eta))} left`:''}
+      <span style="opacity:.75;display:inline-block;max-width:38ch;
+        overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+        vertical-align:bottom" title="${esc(L.current||'')}">${esc(L.current||'')}</span>`,
+    right: L.left ? `${num(L.left,'auto')} <span class="dim">left to hear</span>`
+                  : '<b style="color:var(--ok)">all of it heard</b>',
+    body:`<div class="hsbar" style="margin-top:4px"><i style="width:${L.pct||0}%"></i></div>
+      <div class="subswhy">Five 30-second windows per track, through Whisper's
+        language identifier. This is the expensive half of the page and the
+        only part that reads a file — everything below it is decided from what
+        this heard, so changing a rule costs no disk at all.
+        <a href="#" onclick="audReplan(this);return false"
+           title="Apply the lines and the rules to every reading again now, rather than waiting for the next pass">re-apply the rules now</a></div>`});
+}
+
+// ---- WHAT IS BEING DONE -------------------------------------------------
+// A SUMMARY, BECAUSE THE WORK IS NOT HERE. It runs in Processing System beside
+// the transcodes, and a second full view of one queue is exactly what this
+// page is being rebuilt to remove. What stays is the sentence you would come
+// here to read: is any of it moving, and how much is left.
+function audProcHtml(){
+  const q=_aud.queue||{}, j=_aud.jobs||{}, F=(_aud.failed||[]);
+  const waiting=(q.queued||0), live=(j.running||0)+(j.queued||0);
+  if(!waiting && !live && !(q.failed||0) && !F.length) return '';
+  return subsPanel({
+    id:'audPanelProc', accent:'#6fb0ff', busy:!!j.running,
+    title:'Audio language queue', kind:'auto',
+    sub:`${j.running?`${num(j.running,'auto')} running`:'nothing running'}${
+        j.queued?` · ${num(j.queued,'auto')} handed over and waiting`:''}${
+        q.failed?` · ${num(q.failed,'you')} could not be done`:''}
+      <a href="/#transcoding"
+         title="Audio work is queued and run beside the transcodes now — same gate, same one-heavy-job-per-disk rule.">watch it in Processing System →</a>`,
+    right:`${num(waiting,'auto')} <span class="dim">still to hand over</span>`,
+    body:`
+    ${j.rows&&j.rows.length?`<div style="margin-top:5px">${j.rows.slice(0,3).map(t=>{
+      const c=t.disk?diskColor(t.disk):'#6fb0ff';
+      const p=Math.max(0,Math.min(100,Math.round((t.progress||0)*100)));
+      return `<div style="display:flex;gap:8px;align-items:baseline;font-size:11px">
+        <span style="flex:1 1 auto;min-width:0;overflow:hidden;
+          text-overflow:ellipsis;white-space:nowrap;color:${c}"
+          title="${esc(t.title||'')}">${esc(t.title||'')}</span>
+        <b style="flex:none;color:${c}">${p}%</b>
+        ${t.disk?`<span style="flex:none;color:${c};opacity:.8">${esc(t.disk)}</span>`:''}
+      </div>
+      <div class="hsbar item" style="margin-top:2px"><i
+        style="width:${p}%;background:${c}"></i></div>`;}).join('')}</div>`:''}
+    ${(F&&F.length)?`<div style="margin-top:7px;border-top:1px solid var(--line);
+         padding-top:6px">
+      <div style="display:flex;gap:9px;align-items:baseline;flex-wrap:wrap">
+        <b style="font-size:11.5px;color:var(--warn)">${fmt(F.length)} could not
+          be written</b>
+        <span class="dim" style="font-size:10.5px">a container mkvpropedit
+          cannot edit in place, or a file that was busy</span>
+      </div>
+      ${F.slice(0,6).map(f=>`<div style="display:flex;gap:8px;align-items:baseline;
+           font-size:11px;margin-top:3px">
+        <span style="flex:1 1 auto;min-width:0;overflow:hidden;
+          text-overflow:ellipsis;white-space:nowrap"
+          title="${esc(f.path||'')}">${esc(f.name||'')}</span>
+        ${f.disk?`<span style="flex:none;color:${diskColor(f.disk)}">${esc(f.disk)}</span>`:''}
+        <span class="dim" style="flex:none;font-size:10px">${esc((f.err||'').slice(0,64))}</span>
+        <button class="rmb" style="flex:none"
+          onclick="audRequeue(${f.file_id},this)"
+          title="Plan this file again from what is known now and put it back on the queue.">Try again</button>
+      </div>`).join('')}
+    </div>`:''}
+    <div class="subswhy">What it is sure about is handed over automatically;
+      what sits between the two lines waits in Audio User Input until you say.
+      Every step here is one mkvpropedit header write — nothing is
+      re-encoded and no container is copied.</div>`});
+}
+
+// ---- THE SWITCHBOARD ----------------------------------------------------
+function audSwitchHtml(b){
+  if(b.key==='tag')
+    return `<a href="#" onclick="audDetail('tag');return false"
+        title="Where the mode and the two confidence lines are set.">the mode and the lines</a>`;
+  if(b.key==='policy')
+    return `<a href="#" onclick="const e=document.getElementById('alpolCard');
+        if(e)e.scrollIntoView({behavior:'smooth',block:'start'});return false"
+        title="The rule is per library. Its pickers are in Audio language rules, at the top of this page.">which libraries</a>`;
+  return '';
+}
+
+function audBoardHtml(){
+  const B=(_aud.board||[]);
+  if(!B.length) return '';
+  const tot=(_aud.total||0), you=(_aud.held||0);
+  return subsPanel({
+    id:'audPanelBoard', accent:'#6fb0ff',
+    title:'What nuarr may do on its own', kind:'yours',
+    right:`${num(tot,'auto')} <span class="dim">files want something</span>${
+      you?` · ${num(you,'you')} <span class="dim">yours</span>`:''}`,
+    why:`Three things can be wrong about a file's audio languages. This is all
+      of them, whether nuarr is allowed to act on each, and how many files are
+      waiting on that answer.`,
+    body:`<div style="margin-top:8px;display:flex;flex-direction:column;gap:6px">
+    ${B.map(b=>{
+      const c=AUD_C[b.key]||'#6fb0ff';
+      return `<div class="lkind" style="padding:9px 11px;border-left:3px solid ${c}">
+        <div style="display:flex;gap:9px;align-items:baseline;flex-wrap:wrap">
+          <span style="flex:none;color:${b.on?'var(--ok)':'var(--warn)'}"
+            title="${b.on?'nuarr acts on this by itself':'nothing happens until this is switched on'}">${b.on?'●':'○'}</span>
+          <b style="flex:none">${esc(b.name)}</b>
+          <span class="capsc" style="border-color:${c};color:${c}"
+            title="the current setting">${esc(b.setting)}</span>
+          <span style="flex:none;margin-left:auto;white-space:nowrap"
+            title="${esc(b.waiting_word||'')}">${
+              // A COUNT OF WHAT IS WAITING ON YOU BEATS A COUNT OF WHAT IS
+              // WAITING ON NUARR, on the row that is a question.
+              b.needs_you?`${num(b.needs_you,'you')} to answer`
+              :(b.waiting?`${num(b.waiting, b.on?'auto':'you')} waiting`
+                        :'<b style="color:var(--ok)">nothing waiting</b>')}</span>
+        </div>
+        <div class="dim" style="font-size:11.5px;margin-top:3px">${esc(b.does||'')}</div>
+        ${b.detail?`<div class="dim" style="font-size:11px;margin-top:2px">${esc(b.detail)}</div>`:''}
+        ${b.why?`<div class="dim" style="font-size:10.5px;margin-top:2px;opacity:.75">${esc(b.why)}</div>`:''}
+        <div style="margin-top:6px;display:flex;gap:12px;align-items:center;
+             font-size:11.5px;flex-wrap:wrap">
+          ${audSwitchHtml(b)}
+          ${b.detail_name?`<a href="#" onclick="audDetail('${b.key}');return false"
+            title="Show or hide ${esc(b.detail_name)}, and jump to it">${
+            (audOpen(b.key)?'▾ hide ':'▸ show ') + esc(b.detail_name)}</a>`:''}
+        </div>
+        ${(b.detail_name&&audOpen(b.key))
+          ? `<div id="audSlot-${b.key}" style="margin:7px -11px -9px"></div>` : ''}
+      </div>`;
+    }).join('')}
+    </div>`});
+}
+
+// ---- THE FILE-BY-FILE LIST ----------------------------------------------
+function audRowsSorted(){
+  const R=(_aud.rows||[]).slice();
+  if(_audSort==='what') return _audDesc ? R.reverse() : R;
+  const key={file:e=>String(e.name||'').toLowerCase(),
+             disk:e=>String(e.disk||''),
+             library:e=>String(e.library||''),
+             n:e=>(e.n||0)}[_audSort] || (e=>0);
+  R.sort((a,b)=>{ const x=key(a), y=key(b);
+                  return x<y?-1:x>y?1:String(a.name||'').localeCompare(String(b.name||'')); });
+  return _audDesc ? R.reverse() : R;
+}
+function audHead(k, label, w, align){
+  const on=_audSort===k;
+  return `<th style="width:${w};text-align:${align||'center'};cursor:pointer;
+      ${on?'color:#6fb0ff':''}" onclick="audSort('${k}')"
+      title="sort by ${esc(label.toLowerCase())}">${esc(label)}${
+      on?(_audDesc?' ▾':' ▴'):''}</th>`;
+}
+
+function audListHtml(){
+  const R=audRowsSorted(), total=_aud.total||0;
+  if(!total)
+    return subsPanel({
+      id:'audPanelList', accent:'#6fb0ff',
+      title:'What the rules above would change, file by file', kind:'auto',
+      right:'<b style="color:var(--ok)">nothing</b>',
+      body:`<div class="subswhy" style="margin-top:4px">Every track that has
+        been listened to agrees with the tag it carries, and no title names a
+        language its track is not. ${(_aud.listen&&_aud.listen.left)
+          ? `<b>${fmt(_aud.listen.left)}</b> tracks have not been heard yet —
+             that is what the bar above is working through.` : ''}</div>`});
+  const ready=(_aud.ready!==undefined)?_aud.ready:R.filter(e=>e.ready).length;
+  return subsPanel({
+    id:'audPanelList', accent:'#6fb0ff',
+    title:'What the rules above would change, file by file', kind:'auto',
+    sub:`${num(ready,'auto')} nuarr will get to on its own${
+        (total-ready)?` · ${num(total-ready,'you')} waiting on you`:''}`,
+    right:`${num(total,'auto')} <span class="dim">file${total===1?'':'s'}</span>${
+      R.length<total?` <span class="dim" style="font-size:10px">(first ${fmt(R.length)})</span>`:''}`,
+    why:`One row per file. A file with two lying tags is one row with two
+      chips, not two rows — two headers in one container are one write.`,
+    body:`
+    ${(_aud.by_show&&_aud.by_show.length)?`<div style="margin-top:5px;
+         display:flex;gap:5px;flex-wrap:wrap" title="Where the waiting work is concentrated. One show accounting for dozens of files usually means one release group's habit rather than dozens of separate problems.">${
+      _aud.by_show.slice(0,12).map(x=>`<span class="capsc"
+        style="font-size:10px" title="${esc(x.show)}">${
+        esc(String(x.show).replace(/\s*\{[^}]*\}\s*/g,' ').trim())} ${
+        num(x.n,'auto')}</span>`).join('')
+    }</div>`:''}
+    <div class="scrollbox" style="max-height:420px;overflow:auto;margin-top:7px">
+    <table class="tt" style="width:100%;table-layout:fixed">
+      <thead><tr style="font-size:10.5px">
+        ${audHead('file','File','44%','left')}
+        ${audHead('disk','Disk','11%')}
+        ${audHead('library','Library','13%')}
+        ${audHead('what','What would happen','32%','left')}
+      </tr></thead>
+      <tbody>${R.map(e=>`<tr style="vertical-align:top${e.ready?'':';opacity:.72'}">
+        <td style="text-align:left;overflow:hidden;text-overflow:ellipsis;
+            white-space:nowrap" title="${esc(e.path||'')}">${esc(e.name||'')}</td>
+        <td style="text-align:center">${e.disk?diskTag(e.disk):'<span class="dim">—</span>'}</td>
+        <td style="text-align:center" class="dim">${esc(e.library||'')}</td>
+        <td style="text-align:left">${(e.acts||[]).map(a=>{
+            const c=AUD_C[a.key]||'#6fb0ff';
+            return `<div style="font-size:11px;margin-bottom:2px">
+              <span class="capsc" style="border-color:${c};color:${c}"
+                title="${esc(AUD_W[a.key]||'')}">${esc(a.word||'')}</span>${
+              a.why?`<div class="dim" style="font-size:10px;opacity:.7;
+                white-space:normal">${esc(String(a.why).slice(0,160))}</div>`:''}</div>`;
+          }).join('')}${
+          // NOT LOOKED AT IS NOT THE SAME AS NOTHING TO FIX, and reading the
+          // first as the second is how a lying title survives. The planner
+          // says which it is; the queue checks live before it writes.
+          e.titles_unread?`<div class="dim" style="font-size:10px;opacity:.6"
+            title="There is no stored probe for this file, so its track titles were not checked when this was planned. The queue reads the container itself before it writes anything.">titles not checked yet</div>`:''}</td>
+      </tr>`).join('')}</tbody>
+    </table></div>`});
+}
+
+// ---- AUDIO USER INPUT ---------------------------------------------------
+// THE READINGS BETWEEN THE TWO LINES, which is the whole of what nuarr will
+// not settle by itself. An answer here is applied to the file AND written down
+// against the show and the release group, so the next episode does not ask -
+// which is why this list gets shorter as you use it rather than longer.
+function audAskRows(){
+  // Flattened to one row per QUESTION, because that is what you answer. A file
+  // with two uncertain tracks is two decisions, and folding them into one row
+  // would mean a checkbox that means "both" when you only meant one.
+  const out=[];
+  for(const r of ((_audQ&&_audQ.asking)||[])){
+    for(const a of (r.asks||[]))
+      out.push({id:`${r.file_id}:${a.q}:${a.track}`, file_id:r.file_id,
+                name:r.name, path:r.path, disk:r.disk, library:r.library,
+                series:r.series, ask:a});
+  }
+  return out;
+}
+function audSelIds(){
+  const live=new Set(audAskRows().map(r=>r.id));
+  return [..._audSel].filter(id=>live.has(id));
+}
+function audToggle(id, ev){
+  const rows=audAskRows(), i=rows.findIndex(r=>r.id===id);
+  if(ev && ev.shiftKey && _audLast!==null && i>=0){
+    const a=Math.min(i,_audLast), b=Math.max(i,_audLast);
+    const on=!_audSel.has(id);
+    for(let k=a;k<=b;k++){ if(on) _audSel.add(rows[k].id); else _audSel.delete(rows[k].id); }
+  }else{
+    if(_audSel.has(id)) _audSel.delete(id); else _audSel.add(id);
+  }
+  if(i>=0) _audLast=i;
+  _audKey=''; audAskPaint();
+}
+function audSelAll(on){
+  if(on) audAskRows().forEach(r=>_audSel.add(r.id)); else _audSel.clear();
+  _audLast=null; _audKey=''; audAskPaint();
+}
+
+function audAskHtml(){
+  const R=audAskRows();
+  const sel=audSelIds();
+  const head=`<div class="subshd">
+    <b style="color:#e8a33d">Audio User Input</b>
+    <span class="subskind k-ask"
+      title="This one is waiting on an answer from you. Nothing on it moves until you give one.">waiting on you</span>
+    <span class="dim subssub"
+      title="Every reading nuarr is not sure enough about to act on by itself, in one place. Answering one records the correction, remembers it against the show and the release group, and puts the file on the queue.">readings nuarr will not act on without you</span>
+    <span class="subsn">${R.length?`${num(R.length,'you')} <span class="dim">to answer</span>`
+                                  :'<b style="color:var(--ok)">nothing to answer</b>'}</span>
+    </div>`;
+  if(!R.length)
+    return head+`<div class="subswhy">Every reading is either past the
+      certain line — those are corrected and queued on their own — or below the
+      leave-alone line, where the tag is left as it is and the row is never
+      offered. Move either line in the rules above and this list changes with
+      it.</div>`;
+  return head + `
+    <div class="subswhy">A reading between the two lines is yours to call.
+      Your answer is remembered against this file, then the show, then the
+      release group — so the next episode does not ask.</div>
+    <div style="margin-top:6px;display:flex;gap:9px;align-items:center;
+         flex-wrap:wrap;font-size:11.5px">
+      <label style="display:flex;gap:5px;align-items:center;cursor:pointer">
+        <input type="checkbox" ${sel.length===R.length&&R.length?'checked':''}
+          onchange="audSelAll(this.checked)"> <span class="dim">all ${fmt(R.length)}</span>
+      </label>
+      ${sel.length?`
+        <span class="dim">${fmt(sel.length)} selected</span>
+        <button class="rmb" onclick="audAnswerMany('tag',this)"
+          title="Correct every selected track's tag to what was heard, and remember that answer for each one's show and release group.">Yes — correct ${fmt(sel.length)}</button>
+        <button class="rmb" onclick="audAnswerMany('leave',this)"
+          title="Leave every selected track's tag as it is, and stop asking about those shows.">Leave ${fmt(sel.length)} alone</button>
+        <a href="#" onclick="audSelAll(false);return false">clear</a>`
+      :'<span class="dim" style="font-size:10.5px">tick some to answer them together — shift-click selects a range</span>'}
+    </div>
+    <div class="scrollbox" style="max-height:360px;overflow:auto;margin-top:6px">
+    ${R.map(r=>{
+      const a=r.ask, on=_audSel.has(r.id);
+      return `<div style="padding:6px 0;border-top:1px solid var(--line);
+           display:flex;gap:9px;align-items:flex-start${on?';background:#141c26':''}">
+        <input type="checkbox" ${on?'checked':''} style="margin-top:3px;flex:none"
+          onclick="audToggle('${r.id}', event)">
+        <div style="flex:1 1 auto;min-width:0">
+          <div style="display:flex;gap:8px;align-items:baseline;font-size:11.5px">
+            <span style="flex:1 1 auto;min-width:0;overflow:hidden;
+              text-overflow:ellipsis;white-space:nowrap"
+              title="${esc(r.path||'')}">${esc(r.name||'')}</span>
+            ${a.fake_dual?`<span class="capsc" style="flex:none;border-color:#b3543f;color:#e08a6f"
+               title="Another track in this file was heard in the same language. A release claiming dual audio and shipping one language twice is the case worth blocklisting.">claims dual audio</span>`:''}
+            ${a.held?`<span class="capsc" style="flex:none;border-color:#6b4a17;color:#e8a33d"
+               title="Past the certain line, but you have left this show's tags alone enough times that nuarr will not act on it by itself.">show left alone before</span>`:''}
+            ${r.disk?`<span style="flex:none;color:${diskColor(r.disk)}">${esc(r.disk)}</span>`:''}
+          </div>
+          <div style="font-size:11px;margin-top:2px">${esc(a.asking||'')}</div>
+          <div class="dim" style="font-size:10px;margin-top:1px">${esc(a.why||'')}</div>
+          <div style="margin-top:4px;display:flex;gap:7px;flex-wrap:wrap;
+               align-items:center">
+            ${(a.options||[]).map(o=>`<button class="rmb"
+               title="${esc(o.what||'')}"
+               onclick="audAnswer(${r.file_id},'${esc(a.q)}','${esc(o.v)}',this)"
+               >${esc(o.label||o.v)}</button>`).join('')}
+            <span class="dim" style="font-size:10px">remembered for the show and
+              the group — <a href="#"
+                title="Answer for this file only; other episodes of the show will still ask"
+                onclick="audAnswer(${r.file_id},'${esc(a.q)}','${
+                  esc(((a.options||[])[0]||{}).v||'')}',this,'file');return false"
+                >just this one</a></span>
+          </div>
+        </div>
+      </div>`;
+    }).join('')}
+    </div>`;
+}
+
+function audAskPaint(){
+  const el=document.getElementById('alAskPanel'); if(!el) return;
+  if(askOpen('alAskPanel')) return;
+  const h=audAskHtml();
+  if(h!==el.dataset.k){ el.dataset.k=h; el.innerHTML=h; }
+}
+
+async function audAnswer(fid, q, choice, btn, scope){
+  if(btn&&btn.tagName==='BUTTON'){ btn.disabled=true; btn.textContent='…'; }
+  try{ await fetch(`/api/audqueue/answer?file_id=${fid}&question=${
+        encodeURIComponent(q)}&choice=${encodeURIComponent(choice)}&scope=${
+        scope||'both'}`, {method:'POST'}); }
+  catch(e){}
+  _audKey=''; await loadAudQ(); loadAud(true);
+}
+
+async function audAnswerMany(choice, btn){
+  const ids=audSelIds(); if(!ids.length) return;
+  const rows=audAskRows().filter(r=>ids.includes(r.id));
+  const fids=[...new Set(rows.map(r=>r.file_id))];
+  askInline(btn,
+    (choice==='tag'
+      ? `Correct ${fmt(ids.length)} tag${ids.length===1?'':'s'} to what was heard?`
+      : `Leave ${fmt(ids.length)} tag${ids.length===1?'':'s'} as they are?`)
+    + ' Your answer is remembered against each file, its show and its release '
+    + 'group, so the rest of those shows stop asking. '
+    + (choice==='tag'
+       ? 'Nothing is rewritten here — the files go on the queue, and each is '
+       + 'one mkvpropedit header write.'
+       : 'Nothing is written at all; the rows simply leave.'),
+    choice==='tag' ? `Yes, correct ${fmt(ids.length)}`
+                   : `Yes, leave ${fmt(ids.length)}`,
+    async ()=>{
+      const x=await (await fetch('/api/audqueue/answer/batch',
+        {method:'POST', headers:{'Content-Type':'application/json'},
+         body:JSON.stringify({file_ids:fids, choice:choice, question:'tag',
+                              scope:'both'})})).json();
+      _audSel.clear(); _audLast=null;
+      _audKey=''; await loadAudQ(); loadAud(true);
+      return x.ok ? {ok:true, why:`${fmt(x.queued||0)} queued, ${
+        fmt(x.settled||0)} settled`} : x;
+    });
+}
+
+async function audRequeue(fid, btn){
+  if(btn){ btn.disabled=true; btn.textContent='…'; }
+  try{ await fetch('/api/audqueue/requeue?file_id='+fid, {method:'POST'}); }
+  catch(e){}
+  _audKey=''; await loadAudQ(); loadAud(true);
+}
+async function audReplan(el){
+  if(el) el.textContent='re-applying…';
+  try{ await fetch('/api/audqueue/replan?force=1', {method:'POST'}); }catch(e){}
+  _audKey=''; await loadAudQ(); loadAud(true);
+}
+
+function audPaint(){
+  const el=document.getElementById('audTop'); if(!el||!_aud) return;
+  // HOLDS STILL UNDER THE POINTER, and does not repaint over a question it is
+  // waiting for an answer to. Both rules the subtitle page had to learn.
+  if(panelScrolled('audTop')) return;
+  if(askOpen('audStatus') || askOpen('audTop') || askOpen('alAskPanel')) return;
+  const top=document.getElementById('audStatus');
+  if(top){
+    const h=audListenHtml() + audProcHtml();
+    if(h!==_audTopKey){
+      _audTopKey=h; top.innerHTML=h;
+      // The COUNT is the news, not the html - the current filename and the
+      // elapsed seconds change constantly and are not.
+      const L=_aud.listen||{}, q=_aud.queue||{}, j=_aud.jobs||{};
+      ifChanged('aud.listen', `${L.left}/${L.total}`,
+                document.getElementById('audPanelListen'));
+      ifChanged('aud.proc', `${j.running}/${j.queued}/${q.queued}/${q.failed}`,
+                document.getElementById('audPanelProc'));
+    }
+  }
+  const html=audBoardHtml() + audListHtml();
+  // RESCUED BEFORE THE WIPE, AND THAT IS NOT OPTIONAL. The panel is moved into
+  // a slot inside this container, and the next line replaces the container's
+  // whole contents - so a panel sitting in a slot is a panel about to be
+  // deleted along with its selection and every listener on it. Home first.
+  const pane=document.querySelector('.audd[data-d="tag"]');
+  const home=document.getElementById('alHome');
+  if(pane && home && pane.parentNode!==home) home.appendChild(pane);
+  if(html!==_audKey){ _audKey=html; el.innerHTML=html; }
+  audDetailPaint();
+  audAskPaint();
+  ifChanged('aud.board', `${_aud.total}/${_aud.held}/${_aud.needs_you}`,
+            document.getElementById('audPanelBoard'));
+  ifChanged('aud.list', `${_aud.total}/${_aud.ready}`,
+            document.getElementById('audPanelList'));
+  const slot=document.getElementById('audSlot-tag');
+  if(slot && pane) slot.appendChild(pane);
+}
+
 // ============ THE SUBTITLES PAGE, ASKED AS ONE QUESTION ====================
 //
 // WHY THIS REPLACED FOUR PANELS. Three sweeps grew up on this page one at a

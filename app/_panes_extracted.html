@@ -504,40 +504,57 @@
           <div class="dim" style="padding:14px">loading&hellip;</div>
         </div>
       </div>
+      <!-- THE SUBTITLE PAGE'S ORDER, AND FOR ITS REASONS.
+           Status first: what is being read and what is being done, because
+           that is what you came to see. Then the rules, because they are what
+           produced it. Then the switchboard and the one file-by-file list.
+           Then the raw ledger underneath, as read-only evidence. -->
       <div id="alangPane" style="display:none">
-        <!-- THE BACKLOG, not the batch. alProg already exists and reports the
-             pass in flight; this is the other question - how much of the
-             library has never been listened to at all, and how long that
-             takes. Two different facts, so two different boxes. -->
-        <div id="alBacklog" style="padding:6px 14px 0"></div>
+        <div id="audStatus" style="padding:6px 14px 0"></div>
         <div style="padding:0 14px 4px">
           <div class="lkind" id="alpolCard" style="padding:11px 12px">
             <b style="color:#6fb0ff">Audio language rules</b>
             <div style="font-size:11.5px;margin-top:2px;opacity:.85">Which spoken languages a file keeps, per library.</div>
             <div class="dim" style="font-size:11px;margin-top:2px">
-              The policy half of this page: below is what each track was
-              measured to BE, here is which of them a file keeps. Each
-              library previews and saves itself.
+              The policy half of this page: everything below is what each track
+              was measured to BE, and this is which of them a file keeps. Each
+              library previews and saves itself. Changing anything here
+              re-plans the queue below on the next pass.
             </div>
             <div id="alpolBody" style="margin-top:6px">
               <span class="dim" style="font-size:11.5px">loading&hellip;</span>
             </div>
           </div>
         </div>
+        <!-- The switchboard and the file-by-file list. Audio User Input drops
+             out of its own row, so opening it happens where you asked. -->
+        <div id="audTop" style="padding:0 14px 4px"></div>
+        <div id="alHome" style="display:none">
+          <div class="audd" data-d="tag" style="display:none">
+            <div class="subsp" id="alAskPanel" style="margin:0"></div>
+          </div>
+        </div>
         <div style="padding:6px 14px 4px">
           <div class="lkind" style="padding:11px 12px">
-            <b style="color:#6fb0ff">Language identifier system</b>
-            <div style="font-size:11.5px;margin-top:2px;opacity:.85">Listens to tracks with no language tag and works out what they are.</div>
+            <b style="color:#6fb0ff">How a language is measured</b>
+            <div style="font-size:11.5px;margin-top:2px;opacity:.85">The reading behind every number on this page.</div>
             <div class="dim" style="font-size:11px;margin-top:2px">
               A language tag is the one thing about a file Nuarr cannot take on
               trust and cannot work out from anything else. An empty tag is not
               neutral &mdash; Sonarr, Radarr and every player read a blank as
               <b>English</b> &mdash; and a wrong tag looks exactly like a right
-              one. So it is <b>measured</b>: five 30-second windows spread across the file, through Whisper's language identifier, and the confident windows have to agree. Spread on purpose - three windows clustered in the middle are one sample, and an episode with a long foreign-language stretch through its centre reads as that language. Below is what was heard, what the files claim, and - deliberately - every case where Nuarr refused to answer.</b>: three 30-second windows from the
-              middle of the file, through Whisper&rsquo;s language identifier,
-              and the confident windows have to agree. Below is what was heard,
-              what the files claim, and &mdash; deliberately &mdash; every case
-              where Nuarr refused to answer.
+              one. So it is <b>measured</b>: five 30-second windows spread
+              across the file, through Whisper&rsquo;s language identifier, and
+              the confident windows have to agree. Spread on purpose &mdash;
+              three windows clustered in the middle are one sample, and an
+              episode with a long foreign-language stretch through its centre
+              would read as that language.
+            </div>
+            <div class="dim" style="font-size:11px;margin-top:4px">
+              Below is the raw ledger: what was heard, what the files claim,
+              and &mdash; deliberately &mdash; every case where Nuarr refused
+              to answer. It is the evidence for the list above, not a second
+              copy of it; nothing is decided down here.
             </div>
           </div>
         </div>
