@@ -81,6 +81,7 @@ _FATAL = [
 ]
 
 OK, CORRUPT, UNREADABLE = "ok", "corrupt", "unreadable"
+MISSING = "missing"          # was not on disk; not a fault in the bytes
 
 STATE = {"running": False, "done": 0, "total": 0, "now": "", "last_run": 0.0,
          "last_error": "", "tested": 0, "found": 0,
@@ -631,6 +632,15 @@ async def job_one(r: dict, on_pid=None, on_stage=None) -> dict:
     try:
         st = os.stat(r["path"])
     except OSError:
+        # WRITE THE ABSENCE DOWN, or the feeder picks the same file again on
+        # its next pass - a file Sonarr had replaced was queued, skipped and
+        # re-queued once a minute for as long as anyone looked. The row is
+        # keyed to the size the files table holds, so a file that comes
+        # back at a different size is a different file and is checked.
+        await asyncio.to_thread(
+            _write, int(r["file_id"]), r["path"], int(r.get("size") or 0),
+            0.0, {"verdict": MISSING,
+                  "detail": "not on disk when the check came round"})
         return {"ok": True, "skipped": True,
                 "why": "not on disk - the missing-file check owns that"}
 

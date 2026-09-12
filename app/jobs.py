@@ -5479,6 +5479,12 @@ _END_STAGE = {
 }
 
 
+# The job kinds whose outcome IS the file's outcome. Everything else on the
+# queue is a reading or a header write that leaves the file's place in the
+# pipeline exactly where it was.
+FILE_STATE_KINDS = ("transcode", "sub_ocr")
+
+
 def _finish_stage(job_id: str, state: str) -> None:
     try:
         w = RUNNING.get(job_id)
@@ -5525,15 +5531,27 @@ def _finish(job: Job, state: str, before: int, after: int,
             "error=?, result_json=COALESCE(?, result_json) WHERE job_id=?",
             (state, time.time(), before or None, after or None, error,
              json.dumps({"summary": note}) if note else None, job.id))
-        if state == "done":
-            cur.execute("UPDATE files SET state='done', processed_at=? WHERE id=?",
-                        (time.time(), job.file_id))
-        elif state == "failed":
-            cur.execute("UPDATE files SET state='error', state_reason=? WHERE id=?",
-                        (error, job.file_id))
-        elif state == "skipped":
-            cur.execute("UPDATE files SET state='done', state_reason='no work needed' "
-                        "WHERE id=?", (job.file_id,))
+        # ONLY THE KINDS THAT PROCESS THE FILE MAY SAY THE FILE IS DONE.
+        #
+        # This used to run for every kind. When the checks joined the queue
+        # - listen, decode, subread, audio, subs - each finished job wrote
+        # state='done' on the FILE, and a file that had never been planned
+        # left the eligible pool the moment Whisper finished listening to
+        # it. WWE SmackDown 1412, sixteen audio tracks in fourteen
+        # languages the library does not keep, was "done" at 09:47:57 -
+        # the second its listen job ended - and never transcoded. A
+        # check answers a question about the file; the file's state is the
+        # transcoder's to change.
+        if job.kind in FILE_STATE_KINDS:
+            if state == "done":
+                cur.execute("UPDATE files SET state='done', processed_at=? WHERE id=?",
+                            (time.time(), job.file_id))
+            elif state == "failed":
+                cur.execute("UPDATE files SET state='error', state_reason=? WHERE id=?",
+                            (error, job.file_id))
+            elif state == "skipped":
+                cur.execute("UPDATE files SET state='done', state_reason='no work needed' "
+                            "WHERE id=?", (job.file_id,))
     # A MOMENTARY FAILURE SHOULD TRY AGAIN BY ITSELF. Outside the cursor block
     # above so a bookkeeping error here can never roll back the job's own
     # result - the outcome is recorded, the retry is a bonus on top.
