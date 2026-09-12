@@ -32920,6 +32920,20 @@ function skGoneMany(ids, word, ok=true){
 // THE ROW SAYS IT IS WORKING. Add the moving bar, dim the rest, and put a
 // spinner and a sentence where the buttons were. Returns what was there so a
 // failure can put it back.
+// "JUST THIS ONE" IS A CHECKBOX, OFF BY DEFAULT. It was a link that answered
+// with the first option and a narrower memory in one click - a second way to
+// press "yes" that was easy to hit by accident and could not be combined with
+// "leave". Now it only decides how far the answer is remembered, and the two
+// buttons beside it do the answering.
+// The tick survives a repaint: the panels rebuild their tables on every
+// change, and a box you ticked a second ago must still be ticked.
+const _askJust=new Set();
+function askJustToggle(id, on){ if(on) _askJust.add(id); else _askJust.delete(id); }
+function answerScope(btn){
+  const box=btn && btn.closest ? btn.closest('.askhost, div') : null;
+  const cb=box ? box.querySelector('input.askjust') : null;
+  return (cb && cb.checked) ? 'file' : 'both';
+}
 function rowWorking(tr, text){
   if(!tr) return '';
   const cell=tr.lastElementChild;
@@ -33186,14 +33200,12 @@ function skAskHtml(){
              align-items:center">
           ${(a.options||[]).map(o=>`<button class="rmb"
              title="${esc(o.what||'')}"
-             onclick="subAnswer(${r.file_id},'${esc(a.q)}','${esc(o.v)}',this)"
+             onclick="subAnswer(${r.file_id},'${esc(a.q)}','${esc(o.v)}',this,answerScope(this))"
              >${esc(o.label||o.v)}</button>`).join('')}
-          <span class="dim" style="font-size:10px">remembered for the show and
-            the group — <a href="#"
-              title="Answer for this file only; other episodes will still ask"
-              onclick="subAnswer(${r.file_id},'${esc(a.q)}','${
-                esc(((a.options||[])[0]||{}).v||'')}',this,'file');return false"
-              >just this one</a></span>
+          <label class="dim" style="font-size:10px;display:flex;gap:4px;align-items:center;cursor:pointer"
+            title="Off: your answer is remembered for the whole show and its release group, so the next episode does not ask. On: this file only; other episodes will still ask.">
+            <input type="checkbox" class="askjust" style="margin:0" ${_askJust.has(r.file_id+':'+a.q)?'checked':''}
+              onchange="askJustToggle('${r.file_id}:${esc(a.q)}', this.checked)"> just this one</label>
         </div>
       </div>`).join('')).join('')}
     </div></div>`;
@@ -35082,10 +35094,11 @@ function audAskHtml(){
       <td class="c mono" style="font-variant-numeric:tabular-nums;color:${audSureColor(r)}" title="${esc(r.why||'')}">${r.sure}%</td>
       <td class="r askhost">${opts.map(o=>`<button class="rmb"
           title="${esc(o.what||'')}"
-          onclick="audAnswer(${r.file_id},'${esc(r.q)}','${esc(o.v)}',this)">${esc(o.label||o.v)}</button>`).join('')}
-        <div class="dim" style="font-size:9.5px;margin-top:2px">for the show and the group · <a href="#"
-          title="Answer for this file only; other episodes will still ask"
-          onclick="audAnswer(${r.file_id},'${esc(r.q)}','${esc((opts[0]||{}).v||'')}',this,'file');return false">just this one</a></div></td>
+          onclick="audAnswer(${r.file_id},'${esc(r.q)}','${esc(o.v)}',this,answerScope(this))">${esc(o.label||o.v)}</button>`).join('')}
+        <label class="dim" style="font-size:9.5px;margin-top:2px;display:flex;gap:4px;align-items:center;justify-content:flex-end;cursor:pointer"
+          title="Off: your answer is remembered for the whole show and its release group, so the next episode does not ask. On: this file only; other episodes will still ask.">
+          <input type="checkbox" class="askjust" style="margin:0" ${_askJust.has(r.id)?'checked':''}
+            onchange="askJustToggle('${esc(r.id)}', this.checked)"> just this one</label></td>
       </tr>${open?`<tr id="auddet-${esc(r.id)}" style="background:rgba(255,255,255,.025)"><td colspan="8" style="padding:0;border-bottom:1px solid var(--line)">${audDetailHtml(r)}</td></tr>`:''}`;}).join('')}</tbody></table></div>`
     : `<div class="dim" style="font-size:11.5px;padding:8px 0">Every reading is either past
         the correct line — those are corrected and queued on their own — or at or
