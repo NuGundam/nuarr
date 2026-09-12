@@ -12824,8 +12824,11 @@ button[disabled]{opacity:.5;cursor:default}
 .subsp{border:1px solid var(--line);
        border-radius:8px;padding:10px 12px;margin-bottom:8px;
        background:var(--panel,transparent)}
-/* The exception, and it earns it by being the only one. */
-.subsp.subsp-ask{border-left:3px solid #e8a33d}
+/* Subtitle User Input kept an amber stripe here for a while, on the argument
+   that it is the only panel waiting on YOU rather than reporting. The panel
+   already says that twice - an amber title and a WAITING ON YOU pill - so the
+   stripe was a third copy of one fact, and an inner panel with an edge its
+   parent does not have reads as a nesting boundary rather than as emphasis. */
 .subsp .subshd{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
 .subsp .subshd > b{flex:none}
 /* THE COUNT IS ALWAYS THE LAST THING ON THE LINE, on every panel, so the eye
@@ -33034,7 +33037,7 @@ function skPaint(force){
   // THE PAGE'S SHAPE, not this panel's own. Same border, same padding, same
   // number-on-the-right as Reading, Being processed and the file list - this
   // was the last panel here still wearing its own.
-  const html=`<div class="subsp subsp-ask" id="subsPanelInput">${
+  const html=`<div class="subsp" id="subsPanelInput">${
     head}${skAskHtml()}${note}${key}${band}${prog}${hist}${table}${foot}</div>`;
   scPaint('subs');
   if(!force && (askOpen('skPanel') || panelBusy('skPanel') || panelScrolled('skPanel'))) return;
