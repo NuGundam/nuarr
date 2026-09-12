@@ -205,7 +205,14 @@ def _track_rows(limit: int) -> list:
             "why": r.get("kind_why") or r.get("why") or "",
             "auto": auto, "auto_why": auto_why,
             "title_old": r.get("old") or "", "title_new": r.get("new") or "",
-            "action": ("retitle" if rewritable else
+            # NOTHING IS OFFERED UNTIL THE TRACK HAS BEEN READ. A row whose
+            # events are still on the queue carried "retitle" as its action
+            # because the title LOOKED regenerable, and the header counted
+            # it as yours to answer - "12 yours" over a table of "not read
+            # yet". The planner already refuses to act on an unread row; the
+            # row now says so too.
+            "action": ("" if unread else
+                       "retitle" if rewritable else
                        ("leave" if (settled and not acked) else "")),
             "action_word": ("Correct the title" if rewritable else
                             ("Leave it as it is" if (settled and not acked)
@@ -354,7 +361,8 @@ def findings(limit: int = 600, want_done: bool = True,
             # are different states and the footer should not call them one.
             "queued": sum(1 for r in rows if r.get("queued")),
             "settled": sum(1 for r in rows if r.get("acked")),
-            "actionable": sum(1 for r in rows if r["action"] and not r["done"]),
+            "actionable": sum(1 for r in rows if r["action"] and not r["done"]
+                              and not r["unread"]),
         },
         "picture": hs,
         "tracks": sp,
