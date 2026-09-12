@@ -491,6 +491,23 @@ def sweep() -> dict:
                 sec.keep()
                 sec.note(f"removed {lg['logs_deleted']:,} job logs older than "
                          f"{LOG_DAYS} days ({lg['logs_mb_freed']} MB)", "ok")
+            # VERDICTS WHOSE FILE IS GONE. integrity rows are keyed by file
+            # id and nothing removed them when the file left - a replaced
+            # release kept its "corrupt" verdict on the books for good.
+            try:
+                with cursor() as cur:
+                    gone = cur.execute(
+                        "DELETE FROM integrity WHERE file_id NOT IN "
+                        "(SELECT id FROM files WHERE state NOT IN "
+                        " ('deleted','duplicate'))").rowcount
+                res["integrity_orphans"] = int(gone or 0)
+                if gone:
+                    sec.keep()
+                    sec.note(f"dropped {gone} decode verdict(s) for files "
+                             f"that are gone", "ok")
+            except Exception as e:                           # noqa: BLE001
+                sec.note(f"integrity tidy failed: {type(e).__name__}: {e}",
+                         "warn")
             sw = prune_subocr_work()
             res["subocr_work"] = sw
             if sw.get("dirs_removed"):

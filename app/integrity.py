@@ -434,8 +434,16 @@ def stats() -> dict:
            "head_s": HEAD_S, "tail_s": TAIL_S, "per_run": PER_RUN}
     try:
         with cursor() as cur:
-            for r in cur.execute("SELECT verdict, COUNT(*) n FROM integrity "
-                                 "GROUP BY verdict"):
+            # LIVE FILES ONLY - the same join findings() uses. A verdict
+            # outlives its file: the remedy replaces a corrupt release, the
+            # old row leaves the files table, and the integrity row stayed
+            # and was still counted. The card read "4 that will not decode"
+            # over a list of none, because the four had all been dealt with.
+            for r in cur.execute(
+                    "SELECT i.verdict, COUNT(*) n FROM integrity i "
+                    "  JOIN files f ON f.id = i.file_id "
+                    " WHERE f.state NOT IN ('deleted','duplicate') "
+                    " GROUP BY i.verdict"):
                 out[r["verdict"] or "none"] = r["n"]
     except Exception:                                            # noqa: BLE001
         pass
