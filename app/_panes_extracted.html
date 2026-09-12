@@ -506,32 +506,14 @@
            that is what you came to see. Then the rules, because they are what
            produced it. Then the switchboard and the one file-by-file list.
            Then the raw ledger underneath, as read-only evidence. -->
+      <!-- THE SUBTITLE PAGE'S ORDER, AND FOR ITS REASONS.
+           Status first: what is being read and what is being done, because
+           that is what you came to see. Then how the number is measured,
+           then the rules, then the switchboard and the one file-by-file
+           list. The raw ledger is last, as evidence, in a panel of its own. -->
       <div id="alangPane" style="display:none">
         <div id="audStatus" style="padding:6px 14px 0"></div>
         <div style="padding:0 14px 4px">
-          <div class="lkind" id="alpolCard" style="padding:11px 12px">
-            <b style="color:#6fb0ff">Audio language rules</b>
-            <div style="font-size:11.5px;margin-top:2px;opacity:.85">Which spoken languages a file keeps, per library.</div>
-            <div class="dim" style="font-size:11px;margin-top:2px">
-              The policy half of this page: everything below is what each track
-              was measured to BE, and this is which of them a file keeps. Each
-              library previews and saves itself. Changing anything here
-              re-plans the queue below on the next pass.
-            </div>
-            <div id="alpolBody" style="margin-top:6px">
-              <span class="dim" style="font-size:11.5px">loading&hellip;</span>
-            </div>
-          </div>
-        </div>
-        <!-- The switchboard and the file-by-file list. Audio User Input drops
-             out of its own row, so opening it happens where you asked. -->
-        <div id="audTop" style="padding:0 14px 4px"></div>
-        <div id="alHome" style="display:none">
-          <div class="audd" data-d="tag" style="display:none">
-            <div class="subsp" id="alAskPanel" style="margin:0"></div>
-          </div>
-        </div>
-        <div style="padding:6px 14px 4px">
           <div class="lkind" style="padding:11px 12px">
             <b style="color:#6fb0ff">How a language is measured</b>
             <div style="font-size:11.5px;margin-top:2px;opacity:.85">The reading behind every number on this page.</div>
@@ -547,16 +529,48 @@
               episode with a long foreign-language stretch through its centre
               would read as that language.
             </div>
-            <div class="dim" style="font-size:11px;margin-top:4px">
-              Below is the raw ledger: what was heard, what the files claim,
-              and &mdash; deliberately &mdash; every case where Nuarr refused
-              to answer. It is the evidence for the list above, not a second
-              copy of it; nothing is decided down here.
+          </div>
+        </div>
+        <div style="padding:6px 14px 4px">
+          <div class="lkind" id="alpolCard" style="padding:11px 12px">
+            <b style="color:#6fb0ff">Audio language rules</b>
+            <div style="font-size:11.5px;margin-top:2px;opacity:.85">Which spoken languages a file keeps, per library.</div>
+            <div class="dim" style="font-size:11px;margin-top:2px">
+              The policy half of this page: everything below is what each track
+              was measured to BE, and this is which of them a file keeps. Each
+              library previews and saves itself. Changing anything here
+              re-plans the queue below on the next pass.
+            </div>
+            <div id="alpolBody" style="margin-top:6px">
+              <span class="dim" style="font-size:11.5px">loading&hellip;</span>
             </div>
           </div>
         </div>
-        <div id="alangBody" style="padding:0 14px 14px">
-          <div class="dim" style="padding:14px">loading&hellip;</div>
+        <!-- The switchboard and the file-by-file list. Audio User Input drops
+             out of the tag row; Coverage drops out of the switchboard's foot. -->
+        <div id="audTop" style="padding:0 14px 4px"></div>
+        <div id="alHome" style="display:none">
+          <div class="audd" data-d="tag" style="display:none">
+            <div class="subsp" id="alAskPanel" style="margin:0"></div>
+          </div>
+          <div class="audd" data-d="coverage" style="display:none">
+            <div class="subsp" id="alCoverage" style="margin:0"></div>
+          </div>
+        </div>
+        <!-- THE RAW LEDGER, LAST. What was heard, what the files claim, and -
+             deliberately - every case where Nuarr refused to answer. It is
+             the evidence for the list above, not a second copy of it;
+             nothing is decided down here. -->
+        <div style="padding:0 14px 8px">
+          <div class="subsp" id="alCheckedPanel">
+            <div class="subshd"><b style="color:#6fb0ff">Everything checked</b>
+              <span class="subskind k-auto"
+                title="A background check. Nobody starts it - it looks at the library on its own schedule and reports what it finds.">runs by itself</span>
+              <span class="dim subssub">the raw ledger &mdash; what was heard, what the files claim, and every case where Nuarr refused to answer. Evidence for the list above; nothing is decided here.</span>
+              <span class="subsn" id="alCheckedN"></span>
+            </div>
+            <div id="alChecked"><div class="dim" style="padding:10px 0">loading&hellip;</div></div>
+          </div>
         </div>
         <!-- CHECK ONE FILE NOW, with the same listener the sweep uses. -->
         <div id="sc_audio" style="padding:0 14px 14px"></div>

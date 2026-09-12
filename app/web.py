@@ -24427,7 +24427,7 @@ const ALIAS_OF = {arrsync:'arrs', audiotitle:'acodec', arrgap:'libs',
 // generalised, so a new system is one line rather than another bespoke branch.
 const SCROLL_OF = {subembed:'sePanel', hardsub:'skPanel',
                    subtitletitle:'skPanel', integrity:'igCard',
-                   audiolang:'alangBody'};
+                   audiolang:'alCheckedPanel'};
 function flashTo(id, tries){
   const c = document.getElementById(id);
   if(!c){
@@ -31375,10 +31375,10 @@ async function saveCacheCfg(btn){
 // library has been checked, where the files and the audio DISAGREE, and what
 // Nuarr refused to answer. The refusals are on the page on purpose - a
 // detector that only shows its successes is asking to be trusted blindly.
-let _al=null, _alTab='sum';
+let _al=null, _alTab='odd';
 
 async function loadAlang(force){
-  const el=document.getElementById('alangBody');
+  const el=document.getElementById('alChecked');
   if(!el) return;
   // A background refresh must not yank the table out from under a reader.
   // An explicit action (a Save, a tab click) passes force.
@@ -31405,7 +31405,15 @@ function alBar(parts){
 }
 
 function renderAlang(){
-  const el=document.getElementById('alangBody'); if(!el||!_al) return;
+  // TWO PANELS FROM ONE PAYLOAD. Coverage - how much of the library has a
+  // language named, what the listener answered, by library, which languages
+  // are on disk - drops out of the switchboard, because it is the measurement
+  // the switchboard's counts stand on. The lists - waiting, disagreements,
+  // unresolved, everything checked - are the raw ledger and sit in the
+  // Everything checked panel at the foot of the page. Erik's words: "Coverage
+  // and Everything checked should be under different panels".
+  const el=document.getElementById('alChecked'); if(!el||!_al) return;
+  const cov=document.getElementById('alCoverage');
   const t=_al.totals;
   // Never round UP to 100%: with 10 tracks still blank out of 55,886 the
   // honest figure is "99.9%", and printing 100.0% next to a non-zero backlog
@@ -31423,14 +31431,68 @@ function renderAlang(){
   // inference has named.
   const canHear = !!_al.available;
   const TABS = canHear
-    ? [['sum','Coverage'],
-       ['wait','Waiting ('+(_al.waiting_total||0)+')'],
+    ? [['wait','Waiting ('+(_al.waiting_total||0)+')'],
        ['odd','Disagreements ('+(_al.contradictions||[]).length+')'],
        ['open','Unresolved ('+(_al.open||[]).length+')'],
        ['all','Everything checked']]
-    : [['sum','Coverage']];
-  if(!canHear && _alTab!=='sum') _alTab='sum';
+    : [];
+  if(_alTab==='sum') _alTab='odd';
   let h='';
+  // ---- coverage, into its own panel --------------------------------------
+  if(cov){
+    let c=`<div class="subshd"><b style="color:#6fb0ff">Coverage</b>
+      <span class="subskind k-auto" title="A measurement. Nothing here is a consequence of something you just did.">runs by itself</span>
+      <span class="dim subssub">how much of the library has a language named on it, and what the listener made of it</span>
+      <span class="subsn">${num(t.tagged||0,'done')} <span class="dim">of ${fmt(t.tracks||0)} tracks named</span></span></div>`;
+    c+=alBar([{n:t.tagged,c:'#2f6f4f',label:'named'},
+              {n:t.untagged,c:'#8a5a2b',label:'still blank'}]);
+    c+=`<div class="dim" style="font-size:11px">
+        <b style="color:#7fd4a3">${t.tagged}</b> named (${pct(t.tagged,t.tracks)})
+        &nbsp;·&nbsp; <b style="color:#e2b341">${t.untagged}</b> still blank
+        &nbsp;·&nbsp; a blank tag is read as English by Sonarr, Radarr and
+        every player, so these are not neutral &mdash; they are wrong by
+        default.</div>`;
+    if(canHear){
+      c+=`<div class="dim" style="font-size:11px;margin-top:8px">
+        <b style="color:#7fd4a3">${t.heard}</b> tracks answered confidently
+        &nbsp;·&nbsp; <b style="color:#e2b341">${t.refused}</b> refused
+        &nbsp;·&nbsp; ${t.checked} checked in total
+        ${_al.waiting_total?`&nbsp;·&nbsp; <b style="color:#e2b341">${_al.waiting_total}</b> waiting`:''}
+        &nbsp;·&nbsp; model <span class="mono">${esc(_al.model)}</span>, confidence floor
+        <span class="mono">${(_al.min_prob*100).toFixed(0)}%</span>
+        ${t.stale?`&nbsp;·&nbsp; <b style="color:#e2b341">${t.stale}</b> verdict(s) ignored as out of date - the file was rewritten since`:''}
+        </div>
+        <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+          <button class="rmb" onclick="alTest(this)" title="Run the language identifier on one short sample to prove it loads and answers, without touching the library.">Test detection now</button>
+          <span id="alTestOut" style="font-size:12px"></span>
+        </div>`;
+    }
+    c+=`<div style="margin-top:8px"><table style="width:100%;font-size:12px;border-collapse:collapse">
+        <tr class="dim" style="font-size:11px"><td style="padding:4px 0">library</td>
+        <td>tracks</td><td>blank</td><td>heard</td><td>refused</td></tr>`;
+    for(const b of _al.by_library){
+      c+=`<tr><td style="padding:3px 0"><b style="color:#6fb0ff">${esc(b.library)}</b></td>
+          <td class="mono">${b.tracks}</td>
+          <td class="mono" style="color:${b.untagged?'#e2b341':'#7f8a96'}">${b.untagged}</td>
+          <td class="mono" style="color:#7fd4a3">${b.heard}</td>
+          <td class="mono dim">${b.refused}</td></tr>`;
+    }
+    c+=`</table></div>`;
+    const L=_al.languages||{}, N=_al.lang_names||{};
+    c+=`<div class="lchips" style="padding:8px 0 0">`;
+    for(const k of Object.keys(L).slice(0,24)){
+      const nm=N[k]||k;
+      c+=`<span class="lchip on" title="${esc(nm)} — ${fmt(L[k])} track(s)">
+           <span class="mono">${esc(k)}</span>
+           <span class="dim" style="margin-left:5px">${L[k]}</span></span>`;
+    }
+    c+=`</div>`;
+    if(cov.dataset.k!==c){ cov.dataset.k=c; cov.innerHTML=c; }
+  }
+  const nEl=document.getElementById('alCheckedN');
+  if(nEl) nEl.innerHTML = canHear
+    ? `${num(t.checked||0,'done')} <span class="dim">checked</span>`
+    : '<span class="dim">no listener</span>';
 
   if(!canHear){
     // TWO DIFFERENT SITUATIONS, and only one of them has an action. Not
@@ -31463,7 +31525,7 @@ function renderAlang(){
      TABS.map(([k,l])=>`<button class="tab${_alTab===k?' on':''}"
         onclick="alTab('${k}')">${esc(l)}</button>`).join('')+`</div>`;
 
-  if(_alTab==='sum'){
+  if(false){
     h+=`<div class="lkind" style="padding:11px 12px;margin-bottom:10px">
       <div style="display:flex;justify-content:space-between;align-items:baseline">
         <b style="color:#6fb0ff">Coverage</b>
@@ -34335,7 +34397,7 @@ const AUD_W={tag:'the tag claims a language the track is not',
 function audOpen(k){
   let v=null;
   try{ v=localStorage.getItem('nuarr.aud.d.'+k); }catch(e){}
-  if(v===null) return k==='tag';
+  if(v===null) return k==='tag' || k==='coverage';
   return v==='open';
 }
 function audDetailPaint(){
@@ -34534,7 +34596,16 @@ function audBoardHtml(){
     why:`The one audio-language decision that can be yours: a tag that claims
       a language the track is not. Above the line nuarr corrects it alone;
       between the lines it asks.`,
-    body:rowsHtml(ask)});
+    // COVERAGE DROPS OUT OF THE FOOT OF THIS PANEL. It is the measurement
+    // every count above stands on - how much of the library has been
+    // named, and what the listener made of it - so it belongs under the
+    // switchboard rather than in a ledger at the bottom of the page.
+    body:rowsHtml(ask)+`
+      <div style="margin-top:8px;font-size:11.5px">
+        <a href="#" onclick="audDetail('coverage');return false"
+           title="How much of the library has a language named, what the listener answered and refused, by library, and which languages are on disk.">${
+           audOpen('coverage')?'▾ hide coverage':'▸ show coverage'}</a></div>
+      ${audOpen('coverage')?'<div id="audSlot-coverage" style="margin:7px -12px -10px"></div>':''}`});
 }
 
 function audRowHtml(b){
@@ -34977,9 +35048,14 @@ function audPaint(){
   // a slot inside this container, and the next line replaces the container's
   // whole contents - so a panel sitting in a slot is a panel about to be
   // deleted along with its selection and every listener on it. Home first.
-  const pane=document.querySelector('.audd[data-d="tag"]');
   const home=document.getElementById('alHome');
-  if(pane && home && pane.parentNode!==home) home.appendChild(pane);
+  const panes={};
+  for(const k of ['tag','coverage']){
+    const p=document.querySelector('.audd[data-d="'+k+'"]');
+    if(!p) continue;
+    panes[k]=p;
+    if(home && p.parentNode!==home) home.appendChild(p);
+  }
   if(html!==_audKey){ _audKey=html; el.innerHTML=html; }
   audDetailPaint();
   audAskPaint();
@@ -34989,8 +35065,10 @@ function audPaint(){
             document.getElementById('audPanelQuiet'));
   ifChanged('aud.list', `${_aud.total}/${_aud.ready}`,
             document.getElementById('audPanelList'));
-  const slot=document.getElementById('audSlot-tag');
-  if(slot && pane) slot.appendChild(pane);
+  for(const k in panes){
+    const slot=document.getElementById('audSlot-'+k);
+    if(slot) slot.appendChild(panes[k]);
+  }
 }
 
 // ============ THE SUBTITLES PAGE, ASKED AS ONE QUESTION ====================
