@@ -31375,7 +31375,7 @@ async function saveCacheCfg(btn){
 // library has been checked, where the files and the audio DISAGREE, and what
 // Nuarr refused to answer. The refusals are on the page on purpose - a
 // detector that only shows its successes is asking to be trusted blindly.
-let _al=null, _alTab='odd';
+let _al=null, _alTab='all';
 
 async function loadAlang(force){
   const el=document.getElementById('alChecked');
@@ -31430,20 +31430,16 @@ function renderAlang(){
   // never run, so the page narrows to what remains true: coverage, and what
   // inference has named.
   const canHear = !!_al.available;
-  const TABS = canHear
-    ? [['wait','Waiting ('+(_al.waiting_total||0)+')'],
-       ['odd','Disagreements ('+(_al.contradictions||[]).length+')'],
-       ['open','Unresolved ('+(_al.open||[]).length+')'],
-       ['all','Everything checked']]
-    : [];
-  if(_alTab==='sum') _alTab='odd';
+  // ONE VIEW. Waiting, Disagreements and Unresolved are Audio User Input's
+  // now - a blank nobody would guess is a question for you, a blank not yet
+  // heard is one on its way, and a disagreement between the lines already
+  // was one. What is left here is the record itself.
+  const TABS = [];
+  _alTab='all';
   let h='';
   // ---- coverage, into its own panel --------------------------------------
   if(cov){
-    let c=`<div class="subshd"><b style="color:#6fb0ff">Coverage</b>
-      <span class="subskind k-auto" title="A measurement. Nothing here is a consequence of something you just did.">runs by itself</span>
-      <span class="dim subssub">how much of the library has a language named on it, and what the listener made of it</span>
-      <span class="subsn">${num(t.tagged||0,'done')} <span class="dim">of ${fmt(t.tracks||0)} tracks named</span></span></div>`;
+    let c='';
     c+=alBar([{n:t.tagged,c:'#2f6f4f',label:'named'},
               {n:t.untagged,c:'#8a5a2b',label:'still blank'}]);
     c+=`<div class="dim" style="font-size:11px">
@@ -31816,6 +31812,8 @@ function renderAlang(){
   if(_alTab==='all') h+=alRows((_al.rows||[]).slice(0,400));
 
   el.innerHTML=h;
+  // The coverage row and the User Input rows read this payload too.
+  try{ _audKey=''; audPaint(); audAskPaint(true); }catch(e){}
 }
 
 // Whisper answers in ISO 639-1; nobody reads "ja" faster than "Japanese".
@@ -34384,7 +34382,8 @@ let _audSort='what', _audDesc=false;
 let _audSel=new Set(), _audLast=null;
 // One colour per kind of audio-language trouble, used by the chip in the list
 // and by the edge on the switchboard, so the eye can join a row to its rule.
-const AUD_C={tag:'#6fb0ff', title:'#7fd18c', policy:'#c98cf0', ask:'#e8a33d'};
+const AUD_C={tag:'#6fb0ff', title:'#7fd18c', policy:'#c98cf0', ask:'#e8a33d',
+             coverage:'#39d3c3'};
 const AUD_W={tag:'the tag claims a language the track is not',
              title:'the title names a different language from the tag',
              policy:'which languages this library keeps',
@@ -34397,7 +34396,7 @@ const AUD_W={tag:'the tag claims a language the track is not',
 function audOpen(k){
   let v=null;
   try{ v=localStorage.getItem('nuarr.aud.d.'+k); }catch(e){}
-  if(v===null) return k==='tag' || k==='coverage';
+  if(v===null) return k==='tag';
   return v==='open';
 }
 function audDetailPaint(){
@@ -34575,6 +34574,23 @@ function audBoardHtml(){
   // and the switchboard keeps the one row that is a question: the tag, with
   // Audio User Input dropping out of it.
   const quiet=B.filter(b=>b.key!=='tag'), ask=B.filter(b=>b.key==='tag');
+  // COVERAGE IS A ROW HERE, in the shape of the policy row beside it: a
+  // name, chips saying where it stands, a count on the right, and a detail
+  // that drops out of the row when asked for - shut by default, because it
+  // is a report rather than a decision. Its numbers come from the ledger's
+  // payload (_al), which is the one place they are counted.
+  const T=(_al&&_al.totals)||null;
+  quiet.push({key:'coverage', on:true,
+    name:'How much of the library has a language named',
+    setting: T ? `${fmt(T.tagged||0)} of ${fmt(T.tracks||0)} tracks named` : 'reading…',
+    chips: T ? [`${fmt(T.tagged||0)} of ${fmt(T.tracks||0)} named`,
+                `${fmt(T.heard||0)} heard`, `${fmt(T.refused||0)} refused`] : [],
+    right_html: T ? (T.untagged
+        ? `${num(T.untagged,'you')} still blank`
+        : '<b style="color:var(--ok)">every track named</b>') : '<span class="dim">reading…</span>',
+    does:'Counts every audio track with a language tag on it, what the listener answered and refused, by library, and which languages are on disk.',
+    why:'A blank tag is not neutral: Sonarr, Radarr and every player read it as English. So the count that matters is the blanks, and the rest is where the names came from.',
+    detail_name:'coverage', detail:''});
   const rowsHtml=(rows)=>`<div style="margin-top:8px;display:flex;flex-direction:column;gap:6px">
     ${rows.map(b=>audRowHtml(b)).join('')}
     </div>`;
@@ -34596,16 +34612,7 @@ function audBoardHtml(){
     why:`The one audio-language decision that can be yours: a tag that claims
       a language the track is not. Above the line nuarr corrects it alone;
       between the lines it asks.`,
-    // COVERAGE DROPS OUT OF THE FOOT OF THIS PANEL. It is the measurement
-    // every count above stands on - how much of the library has been
-    // named, and what the listener made of it - so it belongs under the
-    // switchboard rather than in a ledger at the bottom of the page.
-    body:rowsHtml(ask)+`
-      <div style="margin-top:8px;font-size:11.5px">
-        <a href="#" onclick="audDetail('coverage');return false"
-           title="How much of the library has a language named, what the listener answered and refused, by library, and which languages are on disk.">${
-           audOpen('coverage')?'▾ hide coverage':'▸ show coverage'}</a></div>
-      ${audOpen('coverage')?'<div id="audSlot-coverage" style="margin:7px -12px -10px"></div>':''}`});
+    body:rowsHtml(ask)});
 }
 
 function audRowHtml(b){
@@ -34616,7 +34623,9 @@ function audRowHtml(b){
           <span style="flex:none;color:${b.on?'var(--ok)':'var(--warn)'}"
             title="${b.on?'nuarr acts on this by itself':'nothing happens until this is switched on'}">${b.on?'●':'○'}</span>
           <b style="flex:none">${esc(b.name)}</b>
-          ${b.key==='policy' && b.per_library
+          ${b.chips ? b.chips.map(x=>`<span class="capsc"
+                style="border-color:${c};color:${c};font-size:10.5px">${esc(x)}</span>`).join(' ')
+          : b.key==='policy' && b.per_library
             // ONE CHIP PER LIBRARY, not the union. "eng, jpn, und" was every
             // library's list added together, which is a set nobody chose:
             // the anime libraries keep Japanese and the live-action ones do
@@ -34632,6 +34641,7 @@ function audRowHtml(b){
             title="the current setting">${esc(b.setting)}</span>`}
           <span style="flex:none;margin-left:auto;white-space:nowrap"
             title="${esc(b.waiting_word||'')}">${
+              b.right_html ? b.right_html :
               // A COUNT OF WHAT IS WAITING ON YOU BEATS A COUNT OF WHAT IS
               // WAITING ON NUARR, on the row that is a question.
               b.needs_you?`${num(b.needs_you,'you')} to answer`
@@ -34741,13 +34751,43 @@ function audListHtml(){
 // This is the same thing with the audio words in the cells: the reading is a
 // language heard against a language tagged, and the answer is yes or leave.
 let _audAskSort='sure', _audAskDesc=false, _audShowAnswered=false;
+let _audShowWaiting=false;
 function audAskRows(){
   // One row per QUESTION - the server flattens them - because that is what
   // you answer. A file with two uncertain tracks is two decisions.
-  return ((_aud&&_aud.asking)||[]).slice();
+  //
+  // THREE KINDS OF ROW, ONE TABLE. The ledger used to keep two of these in
+  // tabs of its own: a track that is still BLANK and nuarr would not guess
+  // at, which is a question for you with a language picker for an answer;
+  // and a blank not yet HEARD, which is on its way and only shown when asked
+  // for. Both are the same activity as the reading between the lines - you,
+  // looking at a track nuarr is unsure of, and saying what it is.
+  const out=((_aud&&_aud.asking)||[]).map(r=>({...r, kind:'ask'}));
+  if(_al){
+    for(const r of (_al.open||[])){
+      out.push({id:`blank:${r.file_id}:${r.track}`, kind:'blank',
+        file_id:r.file_id, track:r.track, q:'blank',
+        label:r.title||'', name:String(r.path||'').split('\\').pop(), path:r.path,
+        library:r.library||'', disk:'', added:0,
+        tagged:'', heard:(r.ok&&r.heard_name)||'', sure:Math.round((r.confidence||0)*100),
+        why:alWhyPlain(r), al:r, options:[]});
+    }
+    if(_audShowWaiting){
+      for(const r of (_al.waiting||[])){
+        out.push({id:`wait:${r.file_id}:${r.track}`, kind:'wait',
+          file_id:r.file_id, track:r.track, q:'wait',
+          label:r.title||'', name:String(r.path||'').split('\\').pop(), path:r.path,
+          library:r.library||'', disk:'', added:0,
+          tagged:'', heard:'', sure:0,
+          why:'arrived with a blank audio tag and has not been listened to yet - it is on the queue', options:[]});
+      }
+    }
+  }
+  return out;
 }
+function audShowWaiting(on){ _audShowWaiting=!!on; _audKey=''; audAskPaint(true); }
 function audSelIds(){
-  const live=new Set(audAskRows().map(r=>r.id));
+  const live=new Set(audAskRows().filter(r=>r.kind==='ask').map(r=>r.id));
   return [..._audSel].filter(id=>live.has(id));
 }
 function audAskSorted(){
@@ -34778,7 +34818,7 @@ function audToggle(id, ev){
   _audKey=''; audAskPaint(true);
 }
 function audSelAll(on){
-  if(on) audAskRows().forEach(r=>_audSel.add(r.id)); else _audSel.clear();
+  if(on) audAskRows().filter(r=>r.kind==='ask').forEach(r=>_audSel.add(r.id)); else _audSel.clear();
   _audLast=null; _audKey=''; audAskPaint(true);
 }
 async function audMode(m){
@@ -34811,7 +34851,9 @@ async function audUnlearn(scope, skey, q, btn){
 function audAskHtml(){
   const d=_aud||{}, L=d.listen||{};
   const R=audAskSorted(), sel=audSelIds(), nsel=sel.length;
-  const allOn=R.length>0 && nsel===R.length;
+  const nAsk=R.filter(r=>r.kind==='ask').length;
+  const nQ=R.filter(r=>r.kind!=='wait').length;
+  const allOn=nAsk>0 && nsel===nAsk;
   const running=!!d.listen_running;
   const head=`<div class="subshd">
     <b style="color:#e8a33d">Audio User Input</b>
@@ -34819,7 +34861,7 @@ function audAskHtml(){
       title="This one is waiting on an answer from you. Nothing on it moves until you give one.">waiting on you</span>
     <span class="dim subssub"
       title="Every reading nuarr is not sure enough about to act on by itself, in one place. Answering one records the correction, remembers it against the show and the release group, and puts the file on the queue.">readings nuarr will not act on without you</span>
-    <span class="subsn">${R.length?`${num(R.length,'you')} <span class="dim">to answer</span>`
+    <span class="subsn">${nQ?`${num(nQ,'you')} <span class="dim">to answer</span>`
                                   :'<b style="color:var(--ok)">nothing to answer</b>'}</span>
     </div>
     <span class="dim" style="font-size:11.5px">
@@ -34857,7 +34899,10 @@ function audAskHtml(){
       <span class="dim">%</span>
       <span class="dim" style="margin-left:8px"
         title="Anything landing between the two lines is what you are asked about.">
-        ${num(R.length,'you')} in between</span>
+        ${num(nAsk,'you')} in between</span>${
+      (_al&&(_al.open||[]).length)?`<span class="dim" style="margin-left:8px"
+        title="Still blank, and nuarr would not guess. A wrong tag is worse than a missing one; a person who can listen settles it in one click.">${
+        num((_al.open||[]).length,'you')} blank and unguessed</span>`:''}
     </div>`;
   const key=numKey();
   // NO SECOND LISTENING BAR. Listening to the library, at the top of the
@@ -34877,7 +34922,7 @@ function audAskHtml(){
       <button class="rmb" onclick="audSelAll(false)">Clear</button>
       <span class="dim" style="font-size:10.5px">shift-click to take a range</span>
     </div>`:'';
-  const table=R.length?`${selBar}
+  const table=(R.length||(_al&&_al.waiting_total))?`${selBar}
     <div class="rowbox scrollbox"><table class="sktbl" style="width:100%;font-size:11.5px;table-layout:fixed">
     <colgroup><col style="width:24px"><col style="width:auto"><col style="width:104px">
       <col style="width:78px"><col style="width:74px"><col style="width:150px">
@@ -34898,6 +34943,39 @@ function audAskHtml(){
     <tbody>${R.map(r=>{
       const on=_audSel.has(r.id);
       const opts=r.options||[];
+      if(r.kind!=='ask'){
+        // A BLANK, OR A BLANK ON ITS WAY. No checkbox: the answer is a
+        // language picked by hand, not a yes or a no.
+        const al=r.al||{}, selId=`al_${r.file_id}_${r.track}`;
+        const floor=(_al&&_al.min_prob)||0.6;
+        const strong=(al.votes||[]).filter(v=>v[1]>=floor);
+        const cnt={}; for(const v of strong) cnt[v[0]]=(cnt[v[0]]||0)+1;
+        const lean=Object.keys(cnt).sort((a,b)=>cnt[b]-cnt[a])[0];
+        const guess=lean?({en:'eng',ja:'jpn',zh:'chi',ko:'kor',es:'spa',pt:'por',
+                           fr:'fre',de:'ger',it:'ita',ru:'rus',nl:'dut',sv:'swe',
+                           pl:'pol',th:'tha',hi:'hin',tr:'tur',vi:'vie'}[lean]||''):'';
+        return `<tr style="opacity:${r.kind==='wait'?'.65':'1'}">
+        <td class="l"></td>
+        <td class="l" title="${esc(r.path||'')}">${esc(r.label||r.name||'')}
+          <div class="dim" style="font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.name||'')}</div></td>
+        <td class="c dim">${esc(r.library||'')}</td>
+        <td class="c dim">—</td>
+        <td class="c" style="font-size:10.5px;color:var(--dim)">track ${(r.track||0)+1}</td>
+        <td class="c mono"><span style="color:#e2b341" title="no language tag - players read this as English">none</span>
+          <span class="dim">→</span> ${r.heard?`<span style="color:var(--ok)">${esc(r.heard)}</span>`:'<span class="dim">?</span>'}</td>
+        <td class="c mono" style="font-variant-numeric:tabular-nums;color:var(--dim)">${r.sure?r.sure+'%':'—'}</td>
+        <td class="l dim" style="font-size:10.5px;white-space:normal">${esc(r.why||'')}</td>
+        <td class="r askhost">${r.kind==='wait'
+          ? '<span class="dim" style="font-size:10.5px" title="On the listen queue. Nothing is offered until it has been heard.">not heard yet</span>'
+          : `<select id="${selId}" style="font-size:11px">
+               <option value="">choose…</option>
+               ${((_al&&_al.choices)||[]).map(ch=>`<option value="${esc(ch.code)}"${ch.code===guess?' selected':''}>${esc(ch.name)}</option>`).join('')}
+             </select>
+             <button class="rmb" onclick="alCheck(${r.file_id},${r.track},'${selId}',this)" title="Listen again, harder, and say whether the file agrees">Check</button>
+             <button class="rmb" onclick="alSet(${r.file_id},${r.track},'${selId}',this)" title="Write this language onto track ${(r.track||0)+1} - a header edit, no re-encode">Save</button>
+             <div id="${selId}_msg" class="dim" style="font-size:10px;margin-top:2px"></div>`}</td>
+        </tr>`;
+      }
       return `<tr${on?' style="background:rgba(88,166,255,.06)"':''}>
       <td class="l"><input type="checkbox" ${on?'checked':''} onclick="audToggle('${r.id}', event)"></td>
       <td class="l" title="${esc(r.path||'')}">${esc(r.label||r.name||'')}
@@ -34948,10 +35026,13 @@ function audAskHtml(){
                        :'<div class="dim" style="font-size:11px;padding:6px 0">nothing remembered yet</div>')}
   </div>`:'';
   const foot=`<div class="dim" style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;font-size:11px;margin-top:6px">
-    <span>${fmt(R.length)} still to answer · ${_audAskSort==='sure'&&!_audAskDesc
+    <span>${fmt(nQ)} still to answer · ${_audAskSort==='sure'&&!_audAskDesc
       ? 'least certain first'
       : `sorted by ${esc(_audAskSort==='heard'?'tagged → heard':_audAskSort)}${_audAskDesc?', highest first':''}`}${
       !(_audAskSort==='sure'&&!_audAskDesc)?` · <a href="#" onclick="_audAskSort='sure';_audAskDesc=false;_audKey='';audAskPaint(true);return false">back to least certain first</a>`:''}</span>
+    ${(_al&&_al.waiting_total)?`<a href="#" onclick="audShowWaiting(${_audShowWaiting?0:1});return false"
+      title="Blank tags that have not been listened to yet. They are on the listen queue; nothing is asked until they have been heard.">${
+      _audShowWaiting?'hide':'also show'} the ${fmt(_al.waiting_total)} not heard yet</a>`:''}
     ${d.answered?`<a href="#" onclick="audShowAnswered(${_audShowAnswered?0:1});return false"
       title="Answers you have given. Some are already done to the file; the rest are answered and waiting for the queue to reach them.">${
       _audShowAnswered?'hide':'also show'} the ${fmt(d.answered)} answered${
