@@ -27191,7 +27191,18 @@ async function loadLangTab(){
   // it in a card of its own meant one more per-file list to read. What stays
   // is the part that belongs to the RULES: how many there are, when the check
   // last ran, whether it acts by itself, and the button to run it now.
-  el.innerHTML += `<div class="subsp" id="gapCard" style="margin-top:12px">
+  // INTO ITS OWN HOST, NOT ONTO THE END OF THE RULES.
+  //
+  // It used to be appended to langBody, which put it directly under the
+  // per-library switches - close to the rules it measures against, which was
+  // the point. But that also put it above Reading the library, and the
+  // reading is what produces everything the page says: a panel reporting what
+  // a check FOUND should not sit above the panel saying how much of the
+  // library has been looked at. So the card renders into a slot of its own,
+  // placed after the two live panels, and says in its own subtitle which
+  // rules it is measuring against.
+  const gapHost=document.getElementById('gapHost') || el;
+  gapHost.innerHTML = `<div class="subsp" id="gapCard" style="margin-top:12px">
       <div class="subshd"><b style="color:#6fb0ff">Rule drift</b>
         <span class="subskind k-auto"
           title="A background check. Nobody starts it - it re-reads finished files against the rules above on its own schedule, and again the moment a job rewrites one.">runs by itself</span>
