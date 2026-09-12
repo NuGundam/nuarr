@@ -606,6 +606,10 @@ class Worker:
             return ("Reading picture subtitles into text. Background work — it "
                     "waits behind everything else and stays off any disk "
                     "someone is watching from.")
+        if self.pool == "decode":
+            return ("Checking the file actually decodes \u2014 the first 20 "
+                    "seconds and the last 25, to nowhere. Its own pool, lowest "
+                    "priority, and never on a disk somebody is watching from.")
         if self.pool == "audio":
             return ("Correcting what this file's audio tracks SAY they are. "
                     "One header write each — the video is never touched — "
@@ -637,10 +641,104 @@ class Worker:
         return (f"The picture is untouched — {detail}. Copying at disk speed, "
                 f"no quality lost.")
 
+    def what_runs(self) -> dict:
+        r"""Which tool is doing this job right now, and on which silicon.
+
+        THE CARD SAID "encoding" AND LEFT THE REST TO BE INFERRED. Whether the
+        encode was on the GPU or the CPU, whether the decode was too, whether
+        a subtitle job was copying a container or writing a header - all of
+        it was knowable from the plan and the stage, and none of it was said.
+        Erik asked to see "what hardware and tool is doing the work", and the
+        honest answer changes by STAGE, not by job: a sub_ocr job is Tesseract
+        on the CPU for ten minutes and then mkvmerge on a disk for two, and a
+        chip that said one of those for the whole job would be wrong half the
+        time.
+
+        So this reads the stage and the plan and says what is true at this
+        moment. Where nothing is running yet it says so rather than guessing.
+        """
+        st = (self.stage or "").lower()
+        kind = getattr(self.job, "kind", "") or ""
+        p = self.job.plan
+        fam = ((getattr(p, "venc", None) or {}).get("family") or "").lower()
+        fam_word = {"nvenc": "GPU \u00b7 NVENC", "qsv": "GPU \u00b7 QuickSync",
+                    "amf": "GPU \u00b7 AMF", "vaapi": "GPU \u00b7 VA-API",
+                    "x264": "CPU \u00b7 x264", "x265": "CPU \u00b7 x265",
+                    "cpu": "CPU"}.get(fam, ("GPU" if fam and fam != "cpu"
+                                            else "CPU"))
+        # STAGES THAT ARE THE SAME WHATEVER THE KIND.
+        if not st or st in ("probing",):
+            return {"tool": "ffprobe", "hw": "disk", "why": "reading the header"}
+        if st.startswith("waiting"):
+            return {"tool": "", "hw": "", "why": "waiting - nothing is running"}
+        if st in ("committing", "done", "flags", "arr refresh / rename"):
+            if st == "flags":
+                return {"tool": "mkvpropedit", "hw": "disk",
+                        "why": "writing header flags in place"}
+            return {"tool": "file copy" if st == "committing" else "",
+                    "hw": "disk" if st == "committing" else "",
+                    "why": "moving the finished file into place"
+                           if st == "committing" else st}
+        if kind == "transcode":
+            if st == "encoding":
+                if getattr(p, "encode", False):
+                    return {"tool": "ffmpeg", "hw": fam_word,
+                            "why": ((getattr(p, "venc", None) or {})
+                                    .get("family_why") or
+                                    "re-encoding the video; the decode is on "
+                                    "the same silicon as the encode")}
+                return {"tool": "ffmpeg", "hw": "disk \u00b7 stream copy",
+                        "why": "no decode and no encode - the streams are "
+                               "copied at disk speed"}
+            if "subtitle" in st or "rescu" in st:
+                return {"tool": "mkvmerge", "hw": "disk",
+                        "why": "container copy - no decode"}
+            return {"tool": "ffmpeg", "hw": fam_word if getattr(p, "encode",
+                                                                False)
+                    else "disk", "why": st}
+        if kind == "sub_ocr":
+            if st == "ocr":
+                return {"tool": "Tesseract", "hw": "CPU",
+                        "why": "reading picture subtitles into text, one "
+                               "thread per job - no GPU path exists for this"}
+            if "mux" in st or "embed" in st:
+                return {"tool": "mkvmerge", "hw": "disk",
+                        "why": "container copy - no decode"}
+            return {"tool": "ffmpeg", "hw": "disk", "why": st}
+        if kind == "subs":
+            if "count" in st:
+                return {"tool": "mkvextract", "hw": "disk",
+                        "why": "pulling a track out to count its lines"}
+            if "rebuild" in st or "marker" in st or st == "subtitles":
+                return {"tool": "mkvmerge", "hw": "disk",
+                        "why": "container copy - no decode"}
+            if "title" in st:
+                return {"tool": "mkvpropedit", "hw": "disk",
+                        "why": "header write in place"}
+            if "recycl" in st:
+                return {"tool": "file move", "hw": "disk", "why": st}
+            if "re-read" in st:
+                return {"tool": "mkvmerge -J", "hw": "disk",
+                        "why": "reading the rebuilt header back"}
+            return {"tool": "mkvmerge", "hw": "disk", "why": st}
+        if kind == "audio":
+            return {"tool": "mkvpropedit", "hw": "disk",
+                    "why": "header write in place - nothing decoded"}
+        if kind == "decode":
+            return {"tool": "ffmpeg", "hw": "CPU \u00b7 software decode",
+                    "why": "decoding both ends of the file to null - a GPU "
+                           "decode would hide the very errors this is "
+                           "looking for"}
+        return {"tool": "", "hw": "", "why": st}
+
     def as_dict(self) -> dict:
         el = time.time() - self.started_at
         p = self.job.plan
         return {
+            # WHICH TOOL, ON WHICH SILICON, RIGHT NOW. Per stage, because a
+            # job changes tools as it goes and a chip is only worth having if
+            # it is true at the moment you read it.
+            "doing": self.what_runs(),
             "job_id": self.job.id, "pool": self.pool, "title": self.job.title,
             "file": os.path.basename(self.job.path), "kind": self.job.kind,
             "path": self.job.path,
@@ -981,6 +1079,13 @@ def _capacity(pool: str) -> int:
         # 10-core box measured at 3% load that left nine cores idle while one
         # ground through 5,264 files.
         return max(1, getattr(w, "subocr_workers", 4))
+    if pool == "decode":
+        # TWO AT ONCE, ON DIFFERENT SPINDLES. Each is a software decode of 45
+        # seconds of video - a core for half a minute and a sequential read
+        # off a pool disk - and nothing is waiting on the answer, so there is
+        # no reason to run more than the dispatcher can spread across quiet
+        # disks. The spindle rule keeps the two apart.
+        return max(1, min(2, getattr(w, "passthrough_workers", 2)))
     if pool == "audio":
         # WIDER THAN subs, BECAUSE THE WORK IS NOT THE SAME SHAPE. Every audio
         # step is mkvpropedit writing a header: it opens the file, rewrites a
@@ -1128,8 +1233,9 @@ async def enqueue(file_id: int, path: str, title: str = "",
     pool = ("passthrough" if kind == "transcode"
             else "subocr" if kind == "sub_ocr"
             else "subs" if kind == "subs"
-            else "audio" if kind == "audio" else "handler")
-    if kind != "transcode":
+            else "audio" if kind == "audio"
+            else "decode" if kind == "decode" else "handler")
+    if kind not in ("transcode", "decode"):
         priority = min(priority, 50)
     # ...EXCEPT subtitle OCR, which is explicitly background work. The clamp
     # above exists because repairs and pool maps are quick and want to jump the
@@ -1289,7 +1395,10 @@ def _heavy(pool_name: str, plan_obj=None) -> bool:
     # where one of these reads a video stream. Calling it heavy would reserve a
     # whole spindle for a fifth of a second of work and keep a transcode off it
     # the entire time.
-    return pool_name in ("passthrough", "subocr", "subs")
+    # decode IS heavy, and knowably so: every decode job reads 45 seconds of
+    # video sequentially off one pool disk, which is the spindle profile the
+    # rule exists for, and the reason Erik wanted these "on non busy disks".
+    return pool_name in ("passthrough", "subocr", "subs", "decode")
 
 
 def _note_disk_wait(disk: str, need_pct: float, why: str = "progress") -> None:
@@ -1960,7 +2069,7 @@ async def pump() -> None:
                 # holds IT specifically.
                 if any(st.open_for(p) for p in
                        ("handler", "encode", "passthrough", "subocr",
-                        "subs", "audio")):
+                        "subs", "audio", "decode")):
                     async with _lock:
                         # HANDLERS FIRST. OCR, repairs and flag fixes must finish
                         # before a transcode touches the same library, otherwise
@@ -1985,9 +2094,9 @@ async def pump() -> None:
                         # already queued simply keeps the subtitle row waiting
                         # for the next top-up.
                         for pool in ("handler", "subs", "audio", "encode",
-                                     "passthrough", "subocr"):
+                                     "passthrough", "subocr", "decode"):
                             if pool not in ("handler", "subs", "audio",
-                                            "subocr") and blocked:
+                                            "subocr", "decode") and blocked:
                                 continue
                             if not st.open_for(pool):
                                 continue
@@ -2895,6 +3004,10 @@ async def _run(job: Job, pool: str) -> None:
             await _audio_job(w)
             return
 
+        if job.kind == "decode":
+            await _decode_job(w)
+            return
+
         if job.kind == "sub_ocr":
             data = await probe(job.path)
             if not data:
@@ -3023,6 +3136,10 @@ async def _run(job: Job, pool: str) -> None:
 
         if job.kind == "audio":
             await _audio_job(w)
+            return
+
+        if job.kind == "decode":
+            await _decode_job(w)
             return
 
         if job.kind == "sub_ocr":
@@ -3576,6 +3693,88 @@ async def _audio_job(w: Worker) -> None:
         why = str(res.get("why") or "the instruction could not be carried out")
         joblog.log(f"FAILED: {why}", "error", job.id)
         _finish(job, "failed", before, after, why[:400])
+
+
+async def _decode_job(w: Worker) -> None:
+    r"""Decode both ends of one file to nowhere, inside a job.
+
+    WHY IT IS A JOB. The check used to run on the shared idle runner - a second
+    scheduler beside the queue, with a second idea of what the box could spare
+    - and Erik asked for it under the main queue, spread across disks that are
+    not busy. Here the dispatcher does that for it, the same way it does for a
+    transcode: it prefers the quietest spindle, refuses a viewer's, and never
+    starts a second heavy read on a disk that already has one.
+
+    NOTHING IS WRITTEN TO THE FILE. The only output is a verdict row, and a
+    corrupt one goes to the remedy, where "file/corrupt" is one of the four
+    findings auto mode may act on - which is why the decoder's word is not
+    trusted until it matches the fatal list in integrity.py.
+    """
+    from . import integrity
+    job = w.job
+    w.set_stage("decoding")
+    before = os.path.getsize(job.path) if os.path.exists(job.path) else 0
+    w.src_bytes = before
+    if not getattr(w, "disk", ""):
+        try:
+            with cursor() as cur:
+                r = cur.execute("SELECT pool_disk FROM files WHERE id=?",
+                                (job.file_id,)).fetchone()
+            w.disk = (r["pool_disk"] if r else "") or ""
+        except Exception:                                # noqa: BLE001
+            w.disk = ""
+    dur = 0.0
+    try:
+        with cursor() as cur:
+            r = cur.execute("SELECT duration FROM files WHERE id=?",
+                            (job.file_id,)).fetchone()
+        dur = float((r["duration"] if r else 0) or 0)
+    except Exception:                                    # noqa: BLE001
+        pass
+
+    class _Pid:
+        __slots__ = ("pid",)
+
+        def __init__(self, pid):
+            self.pid = pid
+
+    def _on_pid(pid):
+        w.proc = _Pid(pid)
+
+    def _on_stage(name, pct):
+        w.set_stage(str(name)[:60])
+        try:
+            w.progress = max(0.0, min(1.0, float(pct) / 100.0))
+        except (TypeError, ValueError):
+            pass
+
+    w.sub_steps = [f"decode the first {integrity.HEAD_S}s to null"] + (
+        [f"decode the last {integrity.TAIL_S}s to null"]
+        if dur > (integrity.HEAD_S + integrity.TAIL_S + 5) else [])
+    w.sub_why = ["header and stream damage show here",
+                 "truncation only shows at the end"][:len(w.sub_steps)]
+    w.sub_summary = "does it actually decode?"
+    res = await integrity.job_one(
+        {"file_id": job.file_id, "path": job.path, "duration": dur},
+        on_pid=_on_pid, on_stage=_on_stage)
+    w.proc = None
+    w.progress = 1.0
+    if res.get("skipped"):
+        _finish(job, "skipped", 0, 0, note=res.get("why") or "not on disk")
+        return
+    if res.get("ok"):
+        v = res.get("verdict") or ""
+        word = ("decodes cleanly at both ends" if v == integrity.OK
+                else f"CORRUPT - {res.get('detail') or ''}")
+        joblog.log(word, "ok" if v == integrity.OK else "error", job.id)
+        _finish(job, "done", before, before, note=word[:300])
+    else:
+        why = str(res.get("why") or "no verdict")
+        joblog.log(f"no verdict: {why}", "warn", job.id)
+        # A DECODE THAT NEVER FINISHED IS NOT A VERDICT, so this is not a
+        # failure of the file - the row stays untested and the feeder offers
+        # it again another day.
+        _finish(job, "skipped", before, before, note=f"no verdict - {why}"[:300])
 
 
 async def _sub_ocr(w: Worker, probe_data: dict) -> None:
@@ -5768,12 +5967,14 @@ def live_snapshot() -> dict:
                      "passthrough": _capacity("passthrough"),
                      "subocr": _capacity("subocr"),
                      "subs": _capacity("subs"),
-                     "audio": _capacity("audio")},
+                     "audio": _capacity("audio"),
+                     "decode": _capacity("decode")},
         "in_use": {"encode": _in_pool("encode"),
                    "passthrough": _in_pool("passthrough"),
                    "subocr": _in_pool("subocr"),
                    "subs": _in_pool("subs"),
-                   "audio": _in_pool("audio")},
+                   "audio": _in_pool("audio"),
+                   "decode": _in_pool("decode")},
         "subocr_inline": sum(1 for w in workers if w.sub_ocr_active),
         # How the recently-finished jobs ended, so a ghost card can say what
         # actually happened instead of assuming success. See FATE.
@@ -5880,12 +6081,14 @@ def snapshot(recent_limit: int = 60) -> dict:
                      "passthrough": _capacity("passthrough"),
                      "subocr": _capacity("subocr"),
                      "subs": _capacity("subs"),
-                     "audio": _capacity("audio")},
+                     "audio": _capacity("audio"),
+                     "decode": _capacity("decode")},
         "in_use": {"encode": _in_pool("encode"),
                    "passthrough": _in_pool("passthrough"),
                    "subocr": _in_pool("subocr"),
                    "subs": _in_pool("subs"),
-                   "audio": _in_pool("audio")},
+                   "audio": _in_pool("audio"),
+                   "decode": _in_pool("decode")},
         # How much of the subocr figure above is running INSIDE a transcode
         # rather than as a job of its own. Same budget, different home, and the
         # header says so instead of leaving you to wonder why the count moves

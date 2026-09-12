@@ -333,7 +333,118 @@ def queue_rows(limit: int = 400) -> dict:
             "by_show": by_show(), "rows": out}
 
 
+def asking(limit: int = 400) -> list:
+    r"""One row per QUESTION, in the shape Subtitle User Input's table reads.
+
+    A QUESTION, NOT A FILE, because that is what you answer. A file with two
+    uncertain tracks is two decisions, and folding them into one row would make
+    a checkbox mean "both" when you only meant one. Each row carries what the
+    table's columns need - the episode label, when the file landed, which track,
+    what the tag says against what was heard, how sure - read from the queue
+    row and the files table in one query rather than looked up per row.
+    """
+    from . import audqueue
+    from .db import cursor
+    audqueue.init()
+    out: list = []
+    try:
+        with cursor() as cur:
+            rows = [dict(r) for r in cur.execute(
+                "SELECT q.file_id, q.path, q.name, q.library, q.disk, q.series, "
+                "       q.asks, f.title, f.season, f.episode, f.first_seen "
+                "  FROM aud_queue q LEFT JOIN files f ON f.id = q.file_id "
+                " WHERE q.asks != '[]' ORDER BY q.queued_at LIMIT ?",
+                (int(limit),))]
+    except Exception:                                            # noqa: BLE001
+        return out
+    for r in rows:
+        try:
+            asks = _json.loads(r.get("asks") or "[]")
+        except Exception:                                        # noqa: BLE001
+            asks = []
+        label = r.get("title") or ""
+        try:
+            s, e = r.get("season"), r.get("episode")
+            if label and s is not None and e is not None:
+                label = f"{label} - S{int(s):02d}E{int(e):02d}"
+        except Exception:                                        # noqa: BLE001
+            pass
+        if not label:
+            try:
+                from .db import pretty_from_filename
+                label = pretty_from_filename(r.get("path") or "")
+            except Exception:                                    # noqa: BLE001
+                label = r.get("name") or ""
+        for a in asks:
+            out.append({
+                "id": f"{r['file_id']}:{a.get('q') or 'tag'}:{a.get('track') or 0}",
+                "file_id": int(r["file_id"]), "path": r.get("path") or "",
+                "name": r.get("name") or "", "label": label,
+                "library": r.get("library") or "", "disk": r.get("disk") or "",
+                "series": r.get("series") or "",
+                "added": float(r.get("first_seen") or 0),
+                "q": a.get("q") or "tag", "track": int(a.get("track") or 0),
+                "tagged": a.get("from") or "", "heard": a.get("to") or "",
+                "sure": int(a.get("sure") or 0),
+                "asking": a.get("asking") or "", "why": a.get("why") or "",
+                "held": bool(a.get("held")), "fake_dual": bool(a.get("fake_dual")),
+                "options": a.get("options") or []})
+    return out
+
+
+def answered() -> dict:
+    r"""What you have already said, so the footer can offer to show it.
+
+    Two numbers, because they are two things: answers REMEMBERED (one memory
+    row each - the thing the footer counts), and files an answer put ON THE
+    QUEUE that have not run yet. The second is a subset of what the first
+    caused, and saying "12 answered - 3 of them on the queue" is the honest
+    sentence; "12 answered" alone reads as twelve things still to happen.
+    """
+    from . import audplan, audqueue
+    from .db import cursor
+    n_mem = 0
+    try:
+        n_mem = len(audplan.memory(5000))
+    except Exception:                                            # noqa: BLE001
+        pass
+    on_queue = 0
+    try:
+        audqueue.init()
+        with cursor() as cur:
+            for r in cur.execute("SELECT steps FROM aud_queue "
+                                 " WHERE state IN ('queued','running')"):
+                if "you said" in (r["steps"] or ""):
+                    on_queue += 1
+    except Exception:                                            # noqa: BLE001
+        pass
+    return {"answered": n_mem, "on_queue": on_queue}
+
+
 # ------------------------------------------------------------- the reading --
+_DEV: dict = {"at": 0.0, "data": {}}
+
+
+def _device() -> dict:
+    """Whisper's model and device, held for a minute - info() probes packages."""
+    now = time.time()
+    if now - _DEV["at"] > 60 or not _DEV["data"]:
+        d = {"tool": "Whisper", "hw": "", "model": ""}
+        try:
+            from . import audiolang
+            i = audiolang.info() or {}
+            dev = str(i.get("device") or "")
+            d["model"] = str(i.get("model") or "")
+            d["hw"] = ("GPU · CUDA" if dev == "cuda"
+                       else "CPU" if dev == "cpu" else "")
+            if not i.get("loaded") and i.get("last_error"):
+                d["hw"] = d["hw"] or "not loaded"
+        except Exception:                                        # noqa: BLE001
+            pass
+        _DEV.update(at=now, data=d)
+    return dict(_DEV["data"])
+
+
 def listening() -> dict:
     r"""How much of the library has been listened to, and how fast.
 
@@ -366,6 +477,11 @@ def listening() -> dict:
                pct=round(100.0 * total / whole, 1) if whole else 0.0,
                state=str(p.get("state") or ""),
                current=str(p.get("current") or ""))
+    # WHICH TOOL, ON WHICH SILICON. The listener is Whisper's language
+    # identifier through ctranslate2, on CUDA when the packages and a card are
+    # there and on the CPU otherwise - and the two differ by an order of
+    # magnitude per track, so the bar should say which it is.
+    out.update(_device())
     # SECONDS PER TRACK, MEASURED RATHER THAN ASSUMED - and only reported once
     # there is a measurement. A rate invented from one file is not a rate.
     try:
@@ -460,6 +576,22 @@ def overview(limit: int = 400, force: bool = False) -> dict:
     except Exception:                                            # noqa: BLE001
         d["queue"], d["jobs"] = {}, {}
     d["needs_you"] = needs_you()
+    # THE QUESTIONS THEMSELVES RIDE WITH THE PAGE. They used to be a second
+    # request (/api/audqueue) on a second timer, so the panel's rows and its
+    # switchboard count could be a poll apart. One payload, one moment.
+    d["asking"] = asking(400)
+    d.update(answered())
+    # The mode and the two lines, so the panel can draw its controls without
+    # a third request.
+    try:
+        from . import audiolang
+        d["mode"] = audiolang.mode()
+        d["fix_at"] = audiolang.fix_at()
+        d["leave_at"] = audiolang.leave_at()
+        d["listen_running"] = bool((d.get("listen") or {}).get("state")
+                                   in ("listening", "scanning", "writing"))
+    except Exception:                                            # noqa: BLE001
+        pass
     d["at"] = _VIEW["at"]
     d["age_s"] = round(now - (_VIEW["at"] or now), 1)
     # WHAT COULD NOT BE DONE belongs to the page, not to one panel of it.

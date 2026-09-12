@@ -7165,6 +7165,18 @@ async def api_audiolang_mode(mode: str = "", fix_at: int = -1,
     p.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True),
                  encoding="utf-8")
     _amemo_expire("audiolang:")
+    # THE LINES MOVED, SO THE INSTRUCTIONS MOVE. A reading at 92% is a question
+    # under a 95% line and a correction under a 90% one; the queue is re-planned
+    # against the new lines now rather than at the next pass, so the page you
+    # are looking at answers the setting you just made.
+    try:
+        from . import aud, audqueue
+        audqueue.bump()
+        await asyncio.to_thread(audqueue.replan, 100000, True)
+        await audqueue.topup()
+        aud.bump()
+    except Exception:                                            # noqa: BLE001
+        pass
     joblog.log("audio language: " + ", ".join(said)
                + (" - disagreements above the line are corrected without "
                   "asking, and the band between the lines is what you are "
@@ -22246,6 +22258,7 @@ function paintRunning(j){
             <button onclick="cancelJob('${esc(w.job_id)}')">Cancel</button></span>
         </div>
         <div class="mono wkfile m-file">${esc(w.file)}</div>
+        ${doingChip(w)}
         <div class="whypool">${esc(w.why_pool||'')}</div>
         <div class="dim wkplan">${esc(w.plan||'')}</div>
         ${(w.actions&&w.actions.length)?`<ul class="acts">`
@@ -22279,6 +22292,23 @@ function paintRunning(j){
       return _lastRunIds.has(w.job_id)
         ? card : card.replace('<div class="wk"', '<div class="wk arriving"');
     }).join('');
+  }
+
+  // WHICH TOOL, ON WHICH SILICON. Two chips, read off the worker per stage,
+  // so a sub_ocr card says Tesseract on the CPU while it reads and mkvmerge
+  // on a disk while it muxes, and an encode card says whether the GPU is the
+  // one doing it. GPU is coloured so the eye can find the cards that are
+  // holding the card everybody else is waiting for.
+  function doingChip(w){
+    const d=w.doing||{}; if(!d.tool && !d.hw) return '';
+    const gpu=/gpu/i.test(d.hw||''), cpu=/^cpu/i.test(d.hw||'');
+    const hc = gpu?'#7fd18c' : cpu?'#e8a33d' : 'var(--dim)';
+    return `<div class="doing" style="display:flex;gap:6px;align-items:center;
+         font-size:10.5px;margin:2px 0 3px" title="${esc(d.why||'')}">
+      ${d.tool?`<span class="capsc" style="border-color:#3b4a5e;color:#c2ccd6">${esc(d.tool)}</span>`:''}
+      ${d.hw?`<span class="capsc" style="border-color:${hc};color:${hc}">${esc(d.hw)}</span>`:''}
+      ${d.why?`<span class="dim" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0">${esc(d.why)}</span>`:''}
+    </div>`;
   }
 
   // WHAT EACH ENDING MEANS, in words rather than internal state names.
@@ -34269,7 +34299,11 @@ function audListenHtml(){
   return subsPanel({
     id:'audPanelListen', accent:'#6fb0ff', busy:busy,
     title:'Listening to the library', kind:'auto',
-    sub:`${num(L.done,'auto')} of ${num(L.total,'auto')}
+    sub:`${L.tool?`<span class="capsc" style="border-color:#3b4a5e;color:#c2ccd6"
+          title="${esc(L.model?'model '+L.model:'')}">${esc(L.tool)}${L.model?' '+esc(L.model):''}</span>`:''}${
+        L.hw?` <span class="capsc" style="border-color:${/gpu/i.test(L.hw)?'#7fd18c':'#e8a33d'};color:${/gpu/i.test(L.hw)?'#7fd18c':'#e8a33d'}"
+          title="Which silicon the language identifier runs on. CUDA is an order of magnitude faster per track than the CPU.">${esc(L.hw)}</span> `:''}
+      ${num(L.done,'auto')} of ${num(L.total,'auto')}
       <span style="font-size:10.5px">(${(L.pct||0).toFixed(0)}%)</span>
       ${L.each?` · <b style="color:var(--ok)">${L.each.toFixed(1)}s</b> a track`:''}
       ${L.eta?` · ${numt(hsDur(L.eta))} left`:''}
@@ -34484,29 +34518,38 @@ function audListHtml(){
 }
 
 // ---- AUDIO USER INPUT ---------------------------------------------------
-// THE READINGS BETWEEN THE TWO LINES, which is the whole of what nuarr will
-// not settle by itself. An answer here is applied to the file AND written down
-// against the show and the release group, so the next episode does not ask -
-// which is why this list gets shorter as you use it rather than longer.
+// SUBTITLE USER INPUT'S SHAPE, ROW FOR ROW. That panel is a stats line, the
+// mode and its two lines, the reader's progress, a table with a checkbox per
+// row and a heading per column, and a footer that offers the answered ones.
+// This is the same thing with the audio words in the cells: the reading is a
+// language heard against a language tagged, and the answer is yes or leave.
+let _audAskSort='sure', _audAskDesc=false, _audShowAnswered=false;
 function audAskRows(){
-  // Flattened to one row per QUESTION, because that is what you answer. A file
-  // with two uncertain tracks is two decisions, and folding them into one row
-  // would mean a checkbox that means "both" when you only meant one.
-  const out=[];
-  for(const r of ((_audQ&&_audQ.asking)||[])){
-    for(const a of (r.asks||[]))
-      out.push({id:`${r.file_id}:${a.q}:${a.track}`, file_id:r.file_id,
-                name:r.name, path:r.path, disk:r.disk, library:r.library,
-                series:r.series, ask:a});
-  }
-  return out;
+  // One row per QUESTION - the server flattens them - because that is what
+  // you answer. A file with two uncertain tracks is two decisions.
+  return ((_aud&&_aud.asking)||[]).slice();
 }
 function audSelIds(){
   const live=new Set(audAskRows().map(r=>r.id));
   return [..._audSel].filter(id=>live.has(id));
 }
+function audAskSorted(){
+  const R=audAskRows();
+  const key={sure:r=>(r.sure||0), episode:r=>String(r.label||'').toLowerCase(),
+             library:r=>String(r.library||''), added:r=>(r.added||0),
+             where:r=>(r.track||0), heard:r=>String(r.heard||''),
+             disk:r=>String(r.disk||'')}[_audAskSort]||(r=>0);
+  R.sort((a,b)=>{ const x=key(a), y=key(b);
+                  return x<y?-1:x>y?1:String(a.label||'').localeCompare(String(b.label||'')); });
+  return _audAskDesc ? R.reverse() : R;
+}
+function audAskSortBy(k){
+  if(_audAskSort===k) _audAskDesc=!_audAskDesc; else { _audAskSort=k; _audAskDesc=(k==='added'); }
+  _audKey=''; audAskPaint(true);
+}
+function audAskSortMark(k){ return _audAskSort===k ? (_audAskDesc?'▾':'▴') : ''; }
 function audToggle(id, ev){
-  const rows=audAskRows(), i=rows.findIndex(r=>r.id===id);
+  const rows=audAskSorted(), i=rows.findIndex(r=>r.id===id);
   if(ev && ev.shiftKey && _audLast!==null && i>=0){
     const a=Math.min(i,_audLast), b=Math.max(i,_audLast);
     const on=!_audSel.has(id);
@@ -34515,16 +34558,44 @@ function audToggle(id, ev){
     if(_audSel.has(id)) _audSel.delete(id); else _audSel.add(id);
   }
   if(i>=0) _audLast=i;
-  _audKey=''; audAskPaint();
+  _audKey=''; audAskPaint(true);
 }
 function audSelAll(on){
   if(on) audAskRows().forEach(r=>_audSel.add(r.id)); else _audSel.clear();
-  _audLast=null; _audKey=''; audAskPaint();
+  _audLast=null; _audKey=''; audAskPaint(true);
+}
+async function audMode(m){
+  try{ await fetch('/api/audiolang/mode?mode='+encodeURIComponent(m),{method:'POST'}); }catch(e){}
+  _audKey=''; loadAud(true);
+}
+async function audLine(which, val){
+  try{ await fetch(`/api/audiolang/mode?${which}=${encodeURIComponent(val)}`,{method:'POST'}); }catch(e){}
+  _audKey=''; loadAud(true);
+}
+async function audListenNow(btn){
+  if(btn){ btn.disabled=true; btn.textContent='listening…'; }
+  try{ await fetch('/api/audiolang/run?limit=200',{method:'POST'}); }catch(e){}
+  setTimeout(()=>{ _audKey=''; loadAud(true); }, 900);
+}
+function audShowAnswered(on){ _audShowAnswered=!!on; _audKey=''; audAskPaint(true); if(on) audMemLoad(); }
+let _audMem=null;
+async function audMemLoad(){
+  try{ _audMem=await (await fetch('/api/audqueue/memory?limit=400')).json(); }catch(e){ _audMem=[]; }
+  _audKey=''; audAskPaint(true);
+}
+async function audUnlearn(scope, skey, q, btn){
+  if(btn){ btn.disabled=true; btn.textContent='…'; }
+  try{ await fetch(`/api/audqueue/unlearn?scope=${encodeURIComponent(scope)}&skey=${
+        encodeURIComponent(skey)}&question=${encodeURIComponent(q)}`,{method:'POST'}); }catch(e){}
+  await fetch('/api/audqueue/replan?force=1',{method:'POST'}).catch(()=>{});
+  await audMemLoad(); loadAud(true);
 }
 
 function audAskHtml(){
-  const R=audAskRows();
-  const sel=audSelIds();
+  const d=_aud||{}, L=d.listen||{};
+  const R=audAskSorted(), sel=audSelIds(), nsel=sel.length;
+  const allOn=R.length>0 && nsel===R.length;
+  const running=!!d.listen_running;
   const head=`<div class="subshd">
     <b style="color:#e8a33d">Audio User Input</b>
     <span class="subskind k-ask"
@@ -34533,76 +34604,159 @@ function audAskHtml(){
       title="Every reading nuarr is not sure enough about to act on by itself, in one place. Answering one records the correction, remembers it against the show and the release group, and puts the file on the queue.">readings nuarr will not act on without you</span>
     <span class="subsn">${R.length?`${num(R.length,'you')} <span class="dim">to answer</span>`
                                   :'<b style="color:var(--ok)">nothing to answer</b>'}</span>
-    </div>`;
-  if(!R.length)
-    return head+`<div class="subswhy">Every reading is either past the
-      certain line — those are corrected and queued on their own — or below the
-      leave-alone line, where the tag is left as it is and the row is never
-      offered. Move either line in the rules above and this list changes with
-      it.</div>`;
-  return head + `
-    <div class="subswhy">A reading between the two lines is yours to call.
-      Your answer is remembered against this file, then the show, then the
-      release group — so the next episode does not ask.</div>
-    <div style="margin-top:6px;display:flex;gap:9px;align-items:center;
-         flex-wrap:wrap;font-size:11.5px">
-      <label style="display:flex;gap:5px;align-items:center;cursor:pointer">
-        <input type="checkbox" ${sel.length===R.length&&R.length?'checked':''}
-          onchange="audSelAll(this.checked)"> <span class="dim">all ${fmt(R.length)}</span>
-      </label>
-      ${sel.length?`
-        <span class="dim">${fmt(sel.length)} selected</span>
-        <button class="rmb" onclick="audAnswerMany('tag',this)"
-          title="Correct every selected track's tag to what was heard, and remember that answer for each one's show and release group.">Yes — correct ${fmt(sel.length)}</button>
-        <button class="rmb" onclick="audAnswerMany('leave',this)"
-          title="Leave every selected track's tag as it is, and stop asking about those shows.">Leave ${fmt(sel.length)} alone</button>
-        <a href="#" onclick="audSelAll(false);return false">clear</a>`
-      :'<span class="dim" style="font-size:10.5px">tick some to answer them together — shift-click selects a range</span>'}
     </div>
-    <div class="scrollbox" style="max-height:360px;overflow:auto;margin-top:6px">
-    ${R.map(r=>{
-      const a=r.ask, on=_audSel.has(r.id);
-      return `<div style="padding:6px 0;border-top:1px solid var(--line);
-           display:flex;gap:9px;align-items:flex-start${on?';background:#141c26':''}">
-        <input type="checkbox" ${on?'checked':''} style="margin-top:3px;flex:none"
-          onclick="audToggle('${r.id}', event)">
-        <div style="flex:1 1 auto;min-width:0">
-          <div style="display:flex;gap:8px;align-items:baseline;font-size:11.5px">
-            <span style="flex:1 1 auto;min-width:0;overflow:hidden;
-              text-overflow:ellipsis;white-space:nowrap"
-              title="${esc(r.path||'')}">${esc(r.name||'')}</span>
-            ${a.fake_dual?`<span class="capsc" style="flex:none;border-color:#b3543f;color:#e08a6f"
-               title="Another track in this file was heard in the same language. A release claiming dual audio and shipping one language twice is the case worth blocklisting.">claims dual audio</span>`:''}
-            ${a.held?`<span class="capsc" style="flex:none;border-color:#6b4a17;color:#e8a33d"
-               title="Past the certain line, but you have left this show's tags alone enough times that nuarr will not act on it by itself.">show left alone before</span>`:''}
-            ${r.disk?`<span style="flex:none;color:${diskColor(r.disk)}">${esc(r.disk)}</span>`:''}
-          </div>
-          <div style="font-size:11px;margin-top:2px">${esc(a.asking||'')}</div>
-          <div class="dim" style="font-size:10px;margin-top:1px">${esc(a.why||'')}</div>
-          <div style="margin-top:4px;display:flex;gap:7px;flex-wrap:wrap;
-               align-items:center">
-            ${(a.options||[]).map(o=>`<button class="rmb"
-               title="${esc(o.what||'')}"
-               onclick="audAnswer(${r.file_id},'${esc(a.q)}','${esc(o.v)}',this)"
-               >${esc(o.label||o.v)}</button>`).join('')}
-            <span class="dim" style="font-size:10px">remembered for the show and
-              the group — <a href="#"
-                title="Answer for this file only; other episodes of the show will still ask"
-                onclick="audAnswer(${r.file_id},'${esc(a.q)}','${
-                  esc(((a.options||[])[0]||{}).v||'')}',this,'file');return false"
-                >just this one</a></span>
-          </div>
-        </div>
-      </div>`;
-    }).join('')}
+    <span class="dim" style="font-size:11.5px">
+      <span title="Tracks that have been listened to, against the tracks the reader will ever listen to">${
+        num(L.done||0,'done')} tracks heard · ${num(L.left||0,'auto')} to go</span>
+      · <span title="Files whose tag disagrees with what was heard, past the certain line, corrected without asking">${
+        num((d.queue||{}).done||0,'done')} corrected</span>${
+      (d.queue||{}).queued?` · ${num(d.queue.queued,'auto')} on the queue`:''}${
+      d.answered?` · <span title="Answers you have given. Each is remembered against a file, a show or a release group and consulted before the next episode asks.">${
+        num(d.answered,'done')} answered</span>`:''}
+    </span>
+    <span style="float:right;display:flex;gap:8px;align-items:center">
+      ${modeSeg('when it is sure enough', d.mode, 'audMode', {
+        auto:'Readings at or above the correct line have their tag rewritten without asking, on the pass. Everything between the two lines still waits for you.',
+        manual:'Everything is scored and listed, and nothing is corrected. The two lines still colour the rows, so you can see what auto would have done before letting it do it.'})}
+      <button class="rmb" onclick="audListenNow(this)" ${running?'disabled':''}
+        title="Listen to a batch of outstanding tracks now, rather than waiting for the half-hourly pass.">${
+        running?'listening…':'Listen to some now'}</button></span>`;
+  const note=`<div class="dim" style="font-size:11px;margin:3px 0 4px">
+    One reader, one question. Five 30-second windows per track go through
+    Whisper's language identifier and the confident windows have to agree; the
+    result is a language and how sure. Where that disagrees with the tag the
+    file carries, it is judged on one number, and your answer outranks the
+    reading: it is written against the file, the show and the release group,
+    and consulted before the next episode asks.</div>`;
+  const band=`<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;
+        font-size:11px;margin:2px 0 6px">
+      <span class="dim">Sure enough to correct on its own</span>
+      <input type="number" min="70" max="100" step="5" value="${d.fix_at||95}"
+        style="width:62px" onchange="audLine('fix_at',this.value)">
+      <span class="dim">%</span>
+      <span class="dim" style="margin-left:8px">Unsure enough to leave alone</span>
+      <input type="number" min="0" max="90" step="5" value="${d.leave_at||60}"
+        style="width:62px" onchange="audLine('leave_at',this.value)">
+      <span class="dim">%</span>
+      <span class="dim" style="margin-left:8px"
+        title="Anything landing between the two lines is what you are asked about.">
+        ${num(R.length,'you')} in between</span>
     </div>`;
+  const key=numKey();
+  const prog=(running&&L.total)?`<div class="hsbar"><i style="width:${(L.pct||0).toFixed(1)}%"></i></div>
+    <div style="display:flex;gap:10px;align-items:baseline;font-size:11px;margin:3px 0 6px;flex-wrap:wrap">
+      <span class="busy" style="color:var(--acc)"><span class="sp"></span></span>
+      <b style="flex:none">listening ${fmt(L.done||0)} of ${fmt(L.total||0)}</b>
+      <span class="dim" style="flex:1 1 auto;min-width:0;overflow:hidden;
+            text-overflow:ellipsis;white-space:nowrap" title="${esc(L.current||'')}">${esc(L.current||'')}</span>
+      <span style="flex:none;margin-left:auto;display:flex;gap:10px">
+        ${L.each?`<span class="dim">${L.each.toFixed(1)}s each</span>`:''}
+        ${L.eta?`<b style="color:var(--acc)">${hsDur(L.eta)} left</b>`:''}
+      </span></div>`:'';
+  const selBar=nsel?`
+    <div class="askhost" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;
+         padding:6px 8px;margin:6px 0;border-radius:7px;
+         background:rgba(88,166,255,.07);border:1px solid var(--line)">
+      <b style="font-size:11.5px;color:#6fb0ff">${fmt(nsel)} selected</b>
+      <button class="rmb" onclick="audAnswerMany('tag',this)"
+        title="Correct every selected track's tag to what was heard, and remember that answer for each one's show and release group. Each is one header write on the queue.">Yes — correct ${fmt(nsel)}</button>
+      <button class="rmb" onclick="audAnswerMany('leave',this)"
+        title="Leave every selected track's tag as it is, and stop asking about those shows. Nothing is written.">Leave ${fmt(nsel)} alone</button>
+      <button class="rmb" onclick="audSelAll(false)">Clear</button>
+      <span class="dim" style="font-size:10.5px">shift-click to take a range</span>
+    </div>`:'';
+  const table=R.length?`${selBar}
+    <div class="rowbox scrollbox"><table class="sktbl" style="width:100%;font-size:11.5px;table-layout:fixed">
+    <colgroup><col style="width:24px"><col style="width:auto"><col style="width:104px">
+      <col style="width:78px"><col style="width:74px"><col style="width:150px">
+      <col style="width:58px"><col style="width:19%"><col style="width:214px"></colgroup>
+    <thead><tr class="dim sksort" style="font-size:10.5px">
+      <th class="l"><input type="checkbox" ${allOn?'checked':''}
+          title="Select every question on screen" onclick="audSelAll(this.checked)"></th>
+      <th class="l" onclick="audAskSortBy('episode')" title="Sort by episode">episode ${audAskSortMark('episode')}</th>
+      <th class="c" onclick="audAskSortBy('library')" title="Sort by library">library ${audAskSortMark('library')}</th>
+      <th class="c" onclick="audAskSortBy('added')"
+        title="When this file first landed in the library. Click to put the newest at the top.">added ${audAskSortMark('added')}</th>
+      <th class="c" onclick="audAskSortBy('where')" title="Which audio track - a:N is what ffmpeg calls it">where ${audAskSortMark('where')}</th>
+      <th class="c" onclick="audAskSortBy('heard')" title="What the tag says, and what was actually heard">tagged → heard ${audAskSortMark('heard')}</th>
+      <th class="c" onclick="audAskSortBy('sure')" title="How sure the reading is, 0-100. Above the correct line it would be corrected alone; at or below the leave line never offered; in between is yours to call.">sure ${audAskSortMark('sure')}</th>
+      <th class="l" title="What the reading says about itself">note</th>
+      <th class="r" title="Your call">answer</th>
+    </tr></thead>
+    <tbody>${R.map(r=>{
+      const on=_audSel.has(r.id);
+      const opts=r.options||[];
+      return `<tr${on?' style="background:rgba(88,166,255,.06)"':''}>
+      <td class="l"><input type="checkbox" ${on?'checked':''} onclick="audToggle('${r.id}', event)"></td>
+      <td class="l" title="${esc(r.path||'')}">${esc(r.label||r.name||'')}
+        <div class="dim" style="font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.name||'')}</div></td>
+      <td class="c dim">${esc(r.library||'')}</td>
+      <td class="c dim" style="font-size:10.5px" title="${r.added?esc(new Date(r.added*1000).toLocaleString()):'nuarr has no record of when this file arrived'}">${r.added?ago(r.added):'—'}</td>
+      <td class="c" style="font-size:10.5px;color:var(--dim)" title="${esc(`The ${(r.track||0)+1}th audio stream, which ffmpeg calls a:${r.track||0}`)}">track ${(r.track||0)+1}${
+        r.disk?`<div style="font-size:9.5px;color:${diskColor(r.disk)}">${esc(r.disk)}</div>`:''}</td>
+      <td class="c mono"><span style="color:var(--warn)" title="what the tag claims">${esc(r.tagged||'?')}</span>
+        <span class="dim">→</span> <span style="color:var(--ok)" title="what was heard">${esc(r.heard||'?')}</span>${
+        r.fake_dual?`<div style="font-size:9.5px;color:#e08a6f" title="Another track in this file was heard in the same language. A release claiming dual audio and shipping one language twice is the case worth blocklisting.">claims dual audio</div>`:''}${
+        r.held?`<div style="font-size:9.5px;color:#e8a33d" title="Past the correct line, but you have left this show's tags alone enough times that nuarr will not act on it by itself.">show left alone before</div>`:''}</td>
+      <td class="c mono" style="font-variant-numeric:tabular-nums;color:var(--warn)" title="${esc(r.why||'')}">${r.sure}%</td>
+      <td class="l dim" style="font-size:10.5px;white-space:normal">${esc(r.why||'')}</td>
+      <td class="r askhost">${opts.map(o=>`<button class="rmb"
+          title="${esc(o.what||'')}"
+          onclick="audAnswer(${r.file_id},'${esc(r.q)}','${esc(o.v)}',this)">${esc(o.label||o.v)}</button>`).join('')}
+        <div class="dim" style="font-size:9.5px;margin-top:2px">for the show and the group · <a href="#"
+          title="Answer for this file only; other episodes will still ask"
+          onclick="audAnswer(${r.file_id},'${esc(r.q)}','${esc((opts[0]||{}).v||'')}',this,'file');return false">just this one</a></div></td>
+      </tr>`;}).join('')}</tbody></table></div>`
+    : `<div class="dim" style="font-size:11.5px;padding:8px 0">Every reading is either past
+        the correct line — those are corrected and queued on their own — or at or
+        below the leave-alone line, where the tag is left as it is and the row is
+        never offered. Move either line above and this list changes with it.</div>`;
+  // THE ANSWERED ONES, WHEN ASKED FOR. The audio equivalent of "you set by
+  // hand": each remembered answer, what it applies to, and a way to take it
+  // back - which re-plans, so a file the answer was hiding comes straight
+  // back as a question.
+  const mem=(_audShowAnswered?(_audMem||[]):[]);
+  const memTbl=_audShowAnswered?`<div style="margin-top:8px;border-top:1px solid var(--line);padding-top:6px">
+    <div style="display:flex;gap:9px;align-items:baseline;flex-wrap:wrap">
+      <b style="font-size:11.5px">${fmt(mem.length)} answer${mem.length===1?'':'s'} remembered</b>
+      <span class="dim" style="font-size:10.5px">consulted before a file asks: this file first, then its show, then its release group</span>
+    </div>
+    ${mem.length?`<div class="rowbox scrollbox" style="max-height:220px"><table class="sktbl" style="width:100%;font-size:11px;table-layout:fixed">
+      <colgroup><col style="width:70px"><col style="width:auto"><col style="width:180px"><col style="width:90px"><col style="width:80px"></colgroup>
+      <thead><tr class="dim" style="font-size:10.5px"><th class="l">scope</th><th class="l">applies to</th><th class="l">you said</th><th class="c">when</th><th class="r"></th></tr></thead>
+      <tbody>${mem.map(m=>`<tr>
+        <td class="l dim">${esc(m.scope)}</td>
+        <td class="l mono" title="${esc(m.skey)}">${esc(m.skey)}</td>
+        <td class="l" style="color:${m.answer==='tag'?'var(--ok)':'var(--warn)'}">${esc(m.what||m.answer)}</td>
+        <td class="c dim" style="font-size:10.5px">${m.at?ago(m.at):''}</td>
+        <td class="r"><button class="rmb" title="Forget this answer. Anything it was settling is asked again."
+          onclick="audUnlearn('${esc(m.scope)}','${esc(m.skey)}','${esc(m.question)}',this)">forget</button></td>
+      </tr>`).join('')}</tbody></table></div>`
+      : (_audMem===null?'<div class="dim" style="font-size:11px;padding:6px 0">loading…</div>'
+                       :'<div class="dim" style="font-size:11px;padding:6px 0">nothing remembered yet</div>')}
+  </div>`:'';
+  const foot=`<div class="dim" style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;font-size:11px;margin-top:6px">
+    <span>${fmt(R.length)} still to answer · ${_audAskSort==='sure'&&!_audAskDesc
+      ? 'least certain first'
+      : `sorted by ${esc(_audAskSort==='heard'?'tagged → heard':_audAskSort)}${_audAskDesc?', highest first':''}`}${
+      !(_audAskSort==='sure'&&!_audAskDesc)?` · <a href="#" onclick="_audAskSort='sure';_audAskDesc=false;_audKey='';audAskPaint(true);return false">back to least certain first</a>`:''}</span>
+    ${d.answered?`<a href="#" onclick="audShowAnswered(${_audShowAnswered?0:1});return false"
+      title="Answers you have given. Some are already done to the file; the rest are answered and waiting for the queue to reach them.">${
+      _audShowAnswered?'hide':'also show'} the ${fmt(d.answered)} answered${
+      d.on_queue?` — ${fmt(d.on_queue)} of them on the queue`:''}</a>`:''}
+  </div>`;
+  return head+note+key+band+prog+table+memTbl+foot;
 }
 
-function audAskPaint(){
-  const el=document.getElementById('alAskPanel'); if(!el) return;
-  if(askOpen('alAskPanel')) return;
+function audAskPaint(force){
+  const el=document.getElementById('alAskPanel'); if(!el||!_aud) return;
+  if(!force && (askOpen('alAskPanel') || panelBusy('alAskPanel') || panelScrolled('alAskPanel'))) return;
   const h=audAskHtml();
-  if(h!==el.dataset.k){ el.dataset.k=h; el.innerHTML=h; }
+  if(h===el.dataset.k) return;
+  const box=el.querySelector('.rowbox'), keep=box?box.scrollTop:0;
+  el.dataset.k=h; el.innerHTML=h;
+  try{ ifChanged('aud.input', `${(_aud.asking||[]).length}/${_aud.answered||0}`, el); }catch(e){}
+  const nb=el.querySelector('.rowbox'); if(nb&&keep) nb.scrollTop=keep;
 }
 
 async function audAnswer(fid, q, choice, btn, scope){
@@ -34618,6 +34772,9 @@ async function audAnswerMany(choice, btn){
   const ids=audSelIds(); if(!ids.length) return;
   const rows=audAskRows().filter(r=>ids.includes(r.id));
   const fids=[...new Set(rows.map(r=>r.file_id))];
+  // A FILE IS ANSWERED ONCE, HOWEVER MANY OF ITS QUESTIONS WERE TICKED. The
+  // memory is keyed on the file, so answering it twice would only write the
+  // same row twice.
   askInline(btn,
     (choice==='tag'
       ? `Correct ${fmt(ids.length)} tag${ids.length===1?'':'s'} to what was heard?`
