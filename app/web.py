@@ -20869,6 +20869,8 @@ function poolColor(pool){
        : pool==='subs'        ? '#6fb0ff'         // the Subtitles page's blue
        : pool==='handler'     ? '#d2a8ff'         // lilac - script handlers
        : pool==='passthrough' ? 'var(--ok)'       // green - stream copy
+       : pool==='audio'       ? '#c98cf0'         // the audio page's violet
+       : pool==='decode'      ? '#e8a33d'         // amber - a CPU check, not a copy
        : 'var(--ok)';
 }
 function diskColor(name){

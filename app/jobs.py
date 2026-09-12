@@ -1079,33 +1079,16 @@ def _capacity(pool: str) -> int:
         # 10-core box measured at 3% load that left nine cores idle while one
         # ground through 5,264 files.
         return max(1, getattr(w, "subocr_workers", 4))
+    # THE THREE QUEUE-BORN POOLS READ THEIR OWN KNOB. They used to be derived
+    # from passthrough_workers with a cap, which was a guess dressed as a rule
+    # and could not be changed from the page that shows every other pool. The
+    # reasoning behind each default is on the knob itself, in workers.LIMITS.
     if pool == "decode":
-        # TWO AT ONCE, ON DIFFERENT SPINDLES. Each is a software decode of 45
-        # seconds of video - a core for half a minute and a sequential read
-        # off a pool disk - and nothing is waiting on the answer, so there is
-        # no reason to run more than the dispatcher can spread across quiet
-        # disks. The spindle rule keeps the two apart.
-        return max(1, min(2, getattr(w, "passthrough_workers", 2)))
+        return max(0, int(getattr(w, "decode_workers", 2)))
     if pool == "audio":
-        # WIDER THAN subs, BECAUSE THE WORK IS NOT THE SAME SHAPE. Every audio
-        # step is mkvpropedit writing a header: it opens the file, rewrites a
-        # few bytes near the front and closes it, in well under a second. There
-        # is no container copy, no cache reservation and no commit, so the
-        # limit that matters is "do not have four of these seeking into the
-        # pool at once" rather than anything about throughput.
-        return max(1, min(4, getattr(w, "passthrough_workers", 2) * 2))
+        return max(0, int(getattr(w, "audio_workers", 4)))
     if pool == "subs":
-        # ITS OWN POOL, AND A NARROW ONE. Most subtitle instructions are
-        # instant - binning a loose .srt, correcting a title in place - but the
-        # ones that are not are a full container copy, which is the same disk
-        # profile as a remux. Two at a time is what the background runner used
-        # before this moved into the queue, and the one-heavy-job-per-spindle
-        # rule below keeps those two off the same disk.
-        #
-        # It is a pool of its own rather than a share of passthrough so that
-        # subtitle work can never take a slot a transcode was waiting for: the
-        # two drain in parallel and neither can starve the other.
-        return max(1, min(2, getattr(w, "passthrough_workers", 4)))
+        return max(0, int(getattr(w, "subs_workers", 2)))
     if pool == "handler":
         # Repairs are mostly single-threaded CPU/disk work and several of them
         # rewrite files in place, so run them narrowly.
@@ -1650,6 +1633,30 @@ async def _wait_for_drivepool(w, job) -> None:
         await asyncio.sleep(10)
     
 
+def _viewer_disk_held(disk: str, share_pct: float, busy_now: dict) -> bool:
+    r"""Should a job stay off this viewer's spindle right now?
+
+    NO, if the thinnest viewer there has the full-speed lead banked: that is
+    what viewer_pace measures, and it returns 0.0 only when every viewer on
+    the disk is either buffered past the line or has the rest of their file.
+    A copy started on that basis is then paced per chunk by the same number,
+    so a lead that thins after the start slows and pauses the copy rather
+    than being ignored.
+
+    OTHERWISE the old head-room test: below viewer_share_pct busy the disk is
+    shared and the job's I/O is demoted under the viewer's; above it, held.
+    That branch is now only reached for a viewer with no lead measurement, or
+    one whose lead is already inside the ramp.
+    """
+    try:
+        if get_toggle_safe("gate.plex_io_throttle") and viewer_pace({disk}) == 0.0 \
+                and (gate.viewer_lead(disk) is not None or gate.viewer_done(disk)):
+            return False
+    except Exception:                                    # noqa: BLE001
+        pass
+    return share_pct <= 0 or busy_now.get(disk, 100) >= share_pct
+
+
 def _claim(pool: str) -> Job | None:
     """Atomically take the next queued job for a pool.
 
@@ -1757,8 +1764,25 @@ def _claim(pool: str) -> Job | None:
                         for e in (gate.disk_report().get("disks") or [])}
         except Exception:
             busy_now = {}
+        # AND THE VIEWER'S OWN BUFFER OUTRANKS THE DISK'S BUSY FIGURE.
+        #
+        # Erik's screen, side by side: the session card said "266s buffered,
+        # Nuarr at full speed" - the pacing rule that ramps a copy down as a
+        # viewer's lead thins had measured this viewer and found nothing to
+        # protect - while the queue said "waiting: viewer on NU-DRIVE-1" over
+        # 369 files and started none of them. Two rules about one viewer,
+        # disagreeing. This one only knew the disk's busy percentage, and a
+        # spindle at 68% from the very seeks the viewer is making failed the
+        # head-room test however much buffer that viewer had banked.
+        #
+        # So the lead is consulted first, through the same function the copy
+        # loop paces itself by. A viewer with more than the full-speed line
+        # banked can absorb a read starting on their disk - and if the lead
+        # then thins, the copy that started is paced down and paused by the
+        # rule that already does that, per chunk. The busy-percentage test
+        # stays for the viewer nobody has a measurement for.
         watched = {d for d in gate.plex_disks()
-                   if share_pct <= 0 or busy_now.get(d, 100) >= share_pct}
+                   if _viewer_disk_held(d, share_pct, busy_now)}
         # SPINDLES SOMETHING ELSE IS HAMMERING, steered around exactly like a
         # viewer's disk. This is the generic half of the old DrivePool balance
         # hold, and it is strictly better than one: a balance - or a backup, a
@@ -1855,7 +1879,7 @@ def _claim(pool: str) -> Job | None:
         # get busier between the two, and because a job claimed on a viewer's
         # disk is the one case where being a second late genuinely shows.
         if cand_disk and cand_disk in gate.plex_disks() \
-                and (share_pct <= 0 or busy_now.get(cand_disk, 100) >= share_pct):
+                and _viewer_disk_held(cand_disk, share_pct, busy_now):
             _note_disk_wait(cand_disk, 0.0, why="viewer")
             return None
 

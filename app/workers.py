@@ -39,6 +39,22 @@ LIMITS = {
     # Turn subocr_workers up to keep the disk busy and leave this near what the
     # GPU actually saturates at - measured, two lanes reaches the floor.
     "subocr_gpu_lanes": (1, 6, 2),
+    # THE THREE KINDS THAT JOINED THE QUEUE, EACH WITH ITS OWN POOL, each with
+    # a knob here rather than a constant in jobs.py - because a pool whose
+    # width cannot be seen or changed from this page is a pool that will be
+    # asked about from this page. Erik asked for exactly that.
+    #
+    # Subtitle instructions: mostly instant (a title, a recycle) but the ones
+    # that are not are a full container copy, the same spindle profile as a
+    # remux. Two is what the background runner used before this moved.
+    "subs_workers": (0, 6, 2),
+    # Audio tags: mkvpropedit writing a header, well under a second each. The
+    # only limit that matters is "not four seeks into the pool at once".
+    "audio_workers": (0, 6, 4),
+    # Does it decode: a 4-thread software decode of 45 seconds of video and a
+    # sequential read off one pool disk. Two of these at once measured 51-68%
+    # CPU on a 20-thread box - more is not a corner of the machine any more.
+    "decode_workers": (0, 6, 2),
     # ffprobe is cheap but still a pool read each.
     "probe_workers": (0, 16, 4),
     # Health/rename checks against the arrs.
@@ -244,6 +260,9 @@ LABELS = {
     "passthrough_workers": "Remuxes at once",
     "subocr_workers": "Subtitle reads at once",
     "subocr_gpu_lanes": "Subtitle reads on the GPU at once",
+    "subs_workers": "Subtitle fixes at once",
+    "audio_workers": "Audio tag fixes at once",
+    "decode_workers": "Decode checks at once",
     "probe_workers": "File scans at once",
     "arr_concurrency": "Sonarr/Radarr calls at once",
     "hold_minutes": "Settle time (minutes)",
@@ -277,6 +296,20 @@ HINTS = {
         "are not counted here, so workers above this number still help - they "
         "read and write while the card is busy. Measured on this box, two "
         "lanes already reach the card's floor; more only queues.",
+    "subs_workers": "How many files may have their subtitles settled at once - "
+                    "a sidecar taken in, a duplicate track removed, a title "
+                    "corrected. Most are instant; the ones that rebuild the "
+                    "container read and write a whole file, so this is disk "
+                    "work like a remux and never two on one disk.",
+    "audio_workers": "How many files may have a language tag corrected at "
+                     "once. Each is one header write with mkvpropedit, a "
+                     "fraction of a second - nothing is decoded or copied. "
+                     "The limit is only how many seeks into the pool at once.",
+    "decode_workers": "How many files may be checked for corruption at once. "
+                      "Each decodes the first 20 and last 25 seconds on the "
+                      "CPU with four threads - two at once measured 51-68% "
+                      "CPU on this box - and reads sequentially off one pool "
+                      "disk, never two on the same disk.",
     "probe_workers": "How many files may be inspected at once. Cheap on the "
                      "processor, one disk read each.",
     "arr_concurrency": "How many questions Nuarr may ask Sonarr and Radarr at "
@@ -379,6 +412,9 @@ class WorkerConfig:
     passthrough_workers: int
     subocr_workers: int
     subocr_gpu_lanes: int
+    subs_workers: int
+    audio_workers: int
+    decode_workers: int
     probe_workers: int
     arr_concurrency: int
     hold_minutes: int
