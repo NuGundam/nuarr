@@ -7351,8 +7351,20 @@ async def api_subkind_kind(file_id: int, source: str, kind: str):
     return await asyncio.to_thread(subkind.set_kind, int(file_id), source, kind)
 
 
-def _sk_settle(file_id: int, source: str, kind: str, answer: str) -> dict:
-    r"""Record what you said about a file, then hand it to the queue.
+def _sk_settle(file_id: int, source: str, kind: str, answer: str,
+               rescan: bool = True) -> dict:
+    r"""Record what you said about a file, then do whatever that leaves to do.
+
+    TWO OUTCOMES, AND THE SECOND ONE WAS MISSING. Setting a track to "signs or
+    songs" when its title already SAYS Signs/Songs does not create work - it
+    settles the row, because your answer and the title now agree and there is
+    nothing to correct. Those rows used to have their kind recorded and then
+    stay on the list offering "Leave it as it is", so a batch of eleven
+    reported one queued and left ten sitting there looking unanswered.
+
+    An answer settles the row when nothing is left to change, and the row
+    leaves; it queues the row when something is. Either way it is answered,
+    which is the only thing you said.
 
     THIS IS WHAT "ACT" MEANS NOW. It used to mark the picture or rewrite the
     title on the spot, from this panel, on its own - which was a second route
@@ -7363,8 +7375,9 @@ def _sk_settle(file_id: int, source: str, kind: str, answer: str) -> dict:
     same show should not ask. Then the file is re-planned and queued, and the
     work happens where all the other work happens.
     """
-    from . import subkind, subplan, subqueue
-    out = {"ok": True, "recorded": [], "why": ""}
+    from . import subkind, subqueue, subtitletitle as stt
+    out = {"ok": True, "recorded": [], "why": "", "settled": False}
+    pic, track = subkind._split(source)
     # 1. The reading, corrected where you picked a kind.
     if kind and kind != "__leave__":
         try:
@@ -7376,15 +7389,44 @@ def _sk_settle(file_id: int, source: str, kind: str, answer: str) -> dict:
         try:
             subkind.act(int(file_id), source, kind)          # ack only
             out["recorded"].append("left alone")
+            out["settled"] = True
+            return out
         except Exception:                                    # noqa: BLE001
             pass
-    # 2. The decision, against the show and the release group.
-    q = "picture" if source == "picture" else "title"
+    # 2. WHAT DOES THE ROW WANT NOW? Asked after the kind was recorded,
+    # because recording it is exactly what can leave nothing to do. The
+    # re-read is the caller's to skip: a batch does it once for all of them
+    # rather than once per row.
+    if not pic:
+        if rescan:
+            try:
+                subkind._rescan()
+            except Exception:                                # noqa: BLE001
+                pass
+        try:
+            here = [r for r in (stt.cached().get("rows") or [])
+                    if int(r.get("file_id") or 0) == int(file_id)
+                    and int(r.get("track") or -1) == track]
+        except Exception:                                    # noqa: BLE001
+            here = []
+        if not here or not here[0].get("rewritable"):
+            # Nothing to correct - your answer and the title agree. Take the
+            # row off the list rather than leaving it asking a settled
+            # question.
+            try:
+                stt.ack(int(file_id), track, True)
+            except Exception:                                # noqa: BLE001
+                pass
+            out["settled"] = True
+            out["why"] = ("the title already says that - nothing to change"
+                          if here else "there is nothing left to correct")
+            return out
+    # 3. It does want something: remembered, re-planned and queued.
+    q = "picture" if pic else "title"
     r = subqueue.answer(int(file_id), q, answer)
     out["learned"] = r.get("learned") or []
     out["queued"] = bool(r.get("queued"))
     out["plan"] = r.get("now") or ""
-    _ = subplan                                  # imported for the docstring
     return out
 
 
@@ -7429,22 +7471,51 @@ async def api_subkind_act_batch(ids: str = "", confirm: str = "",
     items = _sk_items(ids)
 
     def _all():
-        n = 0
+        r"""Every selected row, kind first, then one re-read for all of them.
+
+        THE KIND APPLIES TO THE WHOLE SELECTION and the queueing applies to
+        whatever is left over - which is the opposite way round from how this
+        used to work. Picking "all as signs or songs" over eleven rows and
+        having it recorded on the one row that also happened to need its title
+        changed is not a batch, and it is what Erik hit.
+
+        The re-read is done ONCE, between the two halves. It is a full re-read
+        of the title findings, so doing it per row turned a batch of eleven
+        into eleven of them.
+        """
+        from . import subkind
+        done = {"set": 0, "queued": 0, "settled": 0, "failed": 0}
+        # 1. record what you said, for all of them
+        if kind and kind != "__leave__":
+            for it in items:
+                try:
+                    subkind.set_kind(int(it["file_id"]), it["source"], kind)
+                    done["set"] += 1
+                except Exception:                            # noqa: BLE001
+                    done["failed"] += 1
+        # 2. one re-read, so the next step sees what that changed
+        try:
+            subkind._rescan()
+        except Exception:                                    # noqa: BLE001
+            pass
+        # 3. queue what still wants something; settle what no longer does
         for it in items:
             try:
-                _sk_settle(int(it["file_id"]), it["source"], kind,
-                           "mark" if it["source"] == "picture" else "retitle")
-                n += 1
+                r = _sk_settle(int(it["file_id"]), it["source"], "",
+                               "mark" if it["source"] == "picture" else "retitle",
+                               rescan=False)
+                done["settled" if r.get("settled") else "queued"] += 1
             except Exception:                                # noqa: BLE001
-                pass
-        return n
-    n = await asyncio.to_thread(_all)
+                done["failed"] += 1
+        return done
+    d = await asyncio.to_thread(_all)
     try:
         from . import subqueue
         fed = await subqueue.topup()
-        return {"ok": True, "answered": n, "queued_now": fed.get("made") or 0}
+        d["queued_now"] = fed.get("made") or 0
     except Exception:                                        # noqa: BLE001
-        return {"ok": True, "answered": n}
+        pass
+    return {"ok": True, "answered": len(items), **d}
 
 
 @app.post("/api/subkind/dismiss/batch")
@@ -32528,28 +32599,35 @@ async function skDismiss(id, btn){
   }
 }
 async function skActMany(btn){
-  // THE SELECTION IS WIDER THAN THIS BUTTON. Rows with nothing to correct can
-  // be selected now, because Not dialogue applies to them - so this takes the
-  // subset it can act on and names that number rather than acting on a count
-  // it cannot honour.
-  const all=skSelIds();
-  const rows=skRows().filter(r=>all.includes(r.id) && r.action);
-  const ids=rows.map(r=>r.id);
+  // ALL OF THEM, AND THE SERVER DECIDES WHAT EACH ONE NEEDS.
+  //
+  // This used to narrow the selection to rows with something to correct,
+  // which quietly broke the kind picker: choosing "all as signs or songs"
+  // over eleven rows recorded it on the one row that also wanted its title
+  // changed. Setting the kind applies to everything you ticked; queueing
+  // applies to whatever that leaves undone; and a row your answer settles -
+  // its title already says what you just said it carries - is acked and
+  // leaves the list. Three outcomes, one press, decided per row where the
+  // facts are.
+  const ids=skSelIds();
+  const rows=skRows().filter(r=>ids.includes(r.id));
   if(!ids.length) return;
   askInline(btn,
-    `Go ahead and ${skActWord(rows)}`
+    `Go ahead and answer ${fmt(rows.length)}`
     + (_skBatchKind?`, all recorded as ${SKW[_skBatchKind]?SKW[_skBatchKind][0]:_skBatchKind}`
                    :', each keeping the kind its own row shows')
-    + '? Nothing is rewritten here - each answer is remembered against its '
-    + 'show and release group, and the files go on the queue, where they are '
-    + 'stream-copied or header-edited under the same gate as everything else.',
+    + '? Nothing is rewritten here. Any whose title then disagrees with that '
+    + 'go on the queue - remembered against their show and release group - '
+    + 'and any whose title already agrees are settled and leave the list.',
     `Yes, do ${fmt(ids.length)}`,
     async ()=>{
       const x=await (await fetch('/api/subkind/act/batch?confirm=yes&ids='
         +encodeURIComponent(ids.join(','))
         +(_skBatchKind?'&kind='+encodeURIComponent(_skBatchKind):''),
         {method:'POST'})).json();
-      if(x.ok) skGoneMany(ids, 'on the queue');
+      if(x.ok) skGoneMany(ids, (x.queued&&!x.settled) ? 'on the queue'
+                                : (x.settled&&!x.queued) ? 'settled'
+                                : `${fmt(x.queued||0)} queued, ${fmt(x.settled||0)} settled`);
       else setTimeout(()=>{ _skKey=''; loadSubKind(true); }, 1300);
       _skSel.clear(); _skLast=null;
       if(x.ok) skMarkWatch();
@@ -32838,10 +32916,9 @@ function skPaint(force){
          padding:6px 8px;margin:6px 0;border-radius:7px;
          background:rgba(88,166,255,.07);border:1px solid var(--line)">
       <b style="font-size:11.5px;color:#6fb0ff">${fmt(nsel)} selected</b>
-      ${nact?`<button class="rmb" onclick="skActMany(this)"
-        title="Your answer is recorded, remembered against each show and release group, and every one of these files goes on the queue - where the work happens beside everything else, one rewrite per file.">Yes — queue ${fmt(nact)}</button>`
-        :`<span class="dim" style="font-size:10.5px"
-           title="Every row in this selection is already saying the right thing about itself - there is nothing to correct. Not dialogue still applies to all of them.">nothing here to correct</span>`}
+      <button class="rmb" onclick="skActMany(this)"
+        title="Applies to every row selected. The kind you picked is recorded on all of them; any whose title then needs changing go on the queue, and any whose title already agrees are settled and leave the list.">Yes — apply to ${fmt(nsel)}${
+          nact?` <span class="dim">(${fmt(nact)} to correct)</span>`:''}</button>
       <button class="rmb" onclick="skDismissMany(this)"
         title="Not what it says. Pictures teach the OCR filter; tracks are recorded as signs. This one applies to every row selected, including the ones with nothing to correct.">Not dialogue — ${fmt(nsel)}</button>
       <select class="kindsel" onchange="skBatchKind(this.value)"
