@@ -44,6 +44,30 @@ RUNNING: dict[str, "Worker"] = {}
 # Worker.set_stage. One worker, so transitions persist in the order they
 # happened; daemon, so it never holds up shutdown.
 _STAGE_DB = ThreadPoolExecutor(max_workers=1, thread_name_prefix="stage-db")
+
+# THE WORK POOL, SEPARATE FROM THE ONE EVERY REQUEST USES.
+#
+# asyncio.to_thread hands everything to the loop's default executor - by
+# default min(32, cores+4) threads, 24 on this box. That pool was carrying the
+# job bodies (a subtitle rewrite that counts lines for ninety seconds, a
+# Whisper listen of ten to twenty seconds, a picture sample of thirty) AND the
+# feeders' library scans (one measured at seventeen seconds) AND every
+# endpoint's database read. Measured on the live process: a no-op to_thread
+# waited 988 ms for a thread, and every page felt it - /api/workers, a
+# handful of key-value reads, took 388 ms.
+#
+# Long bodies go here now, sized for the sum of every pool's workers with
+# room to spare. The default executor keeps the short reads, and is widened at
+# startup so a burst of them does not queue either.
+WORK = ThreadPoolExecutor(max_workers=48, thread_name_prefix="work")
+
+
+async def in_work(fn, *args, **kwargs):
+    """Run a long, blocking job body on the work pool rather than the loop's
+    default executor - see WORK."""
+    import functools
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(WORK, functools.partial(fn, *args, **kwargs))
 QUEUE: list["Job"] = []
 _lock = asyncio.Lock()
 _pump_task: asyncio.Task | None = None
@@ -1146,6 +1170,92 @@ def _capacity(pool: str) -> int:
     return w.passthrough_workers
 
 
+def enqueue_many(rows: list, kind: str, priority: int = 50,
+                 source: str = "manual") -> dict:
+    r"""Queue many files of one kind in one transaction, off the loop.
+
+    THE FEEDERS USED TO CALL enqueue() ONCE PER FILE. It is an async function
+    that does its three queries synchronously - the duplicate check, the title
+    lookup, the insert - so a hundred-and-twenty-row top-up was three hundred
+    and sixty database calls made ON THE EVENT LOOP, and the diagnostics
+    counted 479 of them in a few minutes. Here the duplicate check is one set,
+    the titles one query, the inserts one executemany, and the caller runs
+    the whole thing on a thread.
+
+    Only for the kinds that need no probe and no plan of their own decided
+    here - subs, audio, decode, listen, subread - each row bringing its
+    plan_json. A transcode still goes through enqueue(), which probes.
+    """
+    from . import scanner as _sc
+    from .db import display_label
+    pool = {"subs": "subs", "audio": "audio", "decode": "decode",
+            "listen": "listen", "subread": "subread"}.get(kind, "handler")
+    if kind not in ("transcode", "decode", "listen", "subread"):
+        priority = min(priority, 50)
+    want = [r for r in rows if r.get("file_id") and r.get("path")
+            and not _sc.is_excluded(r["path"])]
+    if not want:
+        return {"made": 0, "skipped": len(rows)}
+    ids = [int(r["file_id"]) for r in want]
+    made = skipped = 0
+    with cursor() as cur:
+        live: set = set()
+        for i in range(0, len(ids), 900):
+            chunk = ids[i:i + 900]
+            q = ",".join("?" * len(chunk))
+            live |= {int(x["file_id"]) for x in cur.execute(
+                f"SELECT file_id FROM jobs WHERE state IN ('queued','running') "
+                f"  AND file_id IN ({q})", chunk)}
+        titles: dict = {}
+        for i in range(0, len(ids), 900):
+            chunk = ids[i:i + 900]
+            q = ",".join("?" * len(chunk))
+            for x in cur.execute(
+                    f"SELECT id, title, season, episode FROM files "
+                    f" WHERE id IN ({q})", chunk):
+                if x["title"]:
+                    titles[int(x["id"])] = display_label(
+                        x["title"], x["season"], x["episode"])
+        now = time.time()
+        batch = []
+        for r in want:
+            fid = int(r["file_id"])
+            if fid in live:
+                skipped += 1
+                continue
+            live.add(fid)
+            batch.append((uuid.uuid4().hex[:12], fid, kind, "queued",
+                          int(priority), pool, r["path"],
+                          titles.get(fid) or r.get("name")
+                          or os.path.basename(r["path"]),
+                          r.get("plan_json") or None, now, source))
+        if batch:
+            try:
+                cur.executemany(
+                    "INSERT INTO jobs(job_id,file_id,kind,state,priority,pool,"
+                    "path,title,plan_json,created_at,source) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?)", batch)
+                made = len(batch)
+            except sqlite3.IntegrityError:
+                # A race with another queuer on one row: fall back to one at
+                # a time so the rest still land.
+                for b in batch:
+                    try:
+                        cur.execute(
+                            "INSERT INTO jobs(job_id,file_id,kind,state,"
+                            "priority,pool,path,title,plan_json,created_at,"
+                            "source) VALUES(?,?,?,?,?,?,?,?,?,?,?)", b)
+                        made += 1
+                    except sqlite3.IntegrityError:
+                        skipped += 1
+    for b in batch[:made]:
+        try:
+            joblog.log(f"queued [{kind}]: {b[7]}", "info", b[0])
+        except Exception:                                    # noqa: BLE001
+            pass
+    return {"made": made, "skipped": skipped}
+
+
 def _handlers_pending() -> bool:
     """Any handler work still queued or running?
 
@@ -1757,7 +1867,10 @@ def _claim(pool: str) -> Job | None:
         # ffmpeg, deferred, and was re-claimed seconds later - a loop of
         # "deferred - file is in use by FFmpeg (pid N)" that never resolved
         # because the holder was us.
-        live_files = {w.job.file_id for w in RUNNING.values() if w.job.file_id}
+        # A SNAPSHOT, because _claim runs on a thread now and the loop adds
+        # and removes workers while it does. list() of a dict's values is one
+        # C call under the GIL; a comprehension over the live view is not.
+        live_files = {w.job.file_id for w in list(RUNNING.values()) if w.job.file_id}
         base = ("SELECT j.id,j.job_id,j.file_id,j.kind,j.priority,j.path,"
                 "       j.title,j.plan_json, f.pool_disk AS pool_disk "
                 "FROM jobs j LEFT JOIN files f ON f.id = j.file_id "
@@ -1950,7 +2063,7 @@ def _claim(pool: str) -> Job | None:
                 # spindle, so waiting for its overall percentage to reach 85 -
                 # a percentage that now advances at OCR speed, not disk speed -
                 # holds the disk closed for minutes over work that finished.
-                on_disk = [w for w in RUNNING.values()
+                on_disk = [w for w in list(RUNNING.values())
                            if w.disk == cand_disk and _heavy(w.pool)
                            and not (getattr(w, "sub_ocr_active", False)
                                     and w.stage != "committing"
@@ -2183,7 +2296,13 @@ async def pump() -> None:
                             if not st.open_for(pool):
                                 continue
                             while _in_pool(pool) < _capacity(pool):
-                                job = _claim(pool)
+                                # OFF THE LOOP. _claim is a handful of queries
+                                # plus disk_report, and it was the single
+                                # biggest on-loop database caller in the
+                                # diagnostics (490 calls). The lock above is
+                                # an asyncio lock, so nothing else claims
+                                # while this thread does.
+                                job = await asyncio.to_thread(_claim, pool)
                                 if not job:
                                     break
                                 # Register the worker HERE, synchronously.
@@ -3701,7 +3820,7 @@ async def _subs_job(w: Worker) -> None:
     w.sub_summary = row.get("why") or ""
     for a in w.sub_steps:
         joblog.log(f"will {a}", "info", job.id)
-    res = await asyncio.to_thread(subqueue.do_one, row, _prog, False)
+    res = await in_work(subqueue.do_one, row, _prog, False)
     w.proc = None
     after = os.path.getsize(job.path) if os.path.exists(job.path) else 0
     w.out_bytes = after
@@ -3771,7 +3890,7 @@ async def _audio_job(w: Worker) -> None:
     w.sub_summary = row.get("why") or ""
     for a in w.sub_steps:
         joblog.log(f"will {a}", "info", job.id)
-    res = await asyncio.to_thread(audqueue.do_one, row, _prog, False)
+    res = await in_work(audqueue.do_one, row, _prog, False)
     after = os.path.getsize(job.path) if os.path.exists(job.path) else 0
     w.out_bytes = after
     await asyncio.to_thread(audqueue.note_result, int(job.file_id), res)
@@ -3805,22 +3924,20 @@ async def _decode_job(w: Worker) -> None:
     w.set_stage("decoding")
     before = os.path.getsize(job.path) if os.path.exists(job.path) else 0
     w.src_bytes = before
-    if not getattr(w, "disk", ""):
+    def _facts():
+        d, dur = "", 0.0
         try:
             with cursor() as cur:
-                r = cur.execute("SELECT pool_disk FROM files WHERE id=?",
+                r = cur.execute("SELECT pool_disk, duration FROM files WHERE id=?",
                                 (job.file_id,)).fetchone()
-            w.disk = (r["pool_disk"] if r else "") or ""
+            d = (r["pool_disk"] if r else "") or ""
+            dur = float((r["duration"] if r else 0) or 0)
         except Exception:                                # noqa: BLE001
-            w.disk = ""
-    dur = 0.0
-    try:
-        with cursor() as cur:
-            r = cur.execute("SELECT duration FROM files WHERE id=?",
-                            (job.file_id,)).fetchone()
-        dur = float((r["duration"] if r else 0) or 0)
-    except Exception:                                    # noqa: BLE001
-        pass
+            pass
+        return d, dur
+    _d, dur = await asyncio.to_thread(_facts)
+    if not getattr(w, "disk", ""):
+        w.disk = _d
 
     class _Pid:
         __slots__ = ("pid",)
@@ -3916,12 +4033,12 @@ async def _reader_job(w: Worker) -> None:
         return
     try:
         if job.kind == "listen":
-            res = await asyncio.to_thread(
+            res = await in_work(
                 readers.listen_one, int(job.file_id), job.path,
                 list(plan.get("tracks") or []), bool(plan.get("jumped")),
                 _on_stage)
         else:
-            res = await asyncio.to_thread(
+            res = await in_work(
                 readers.subread_one, str(plan.get("subread") or "picture"),
                 dict(plan.get("row") or {"file_id": job.file_id,
                                          "path": job.path}), _on_stage)

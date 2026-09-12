@@ -43,6 +43,7 @@ FEED_S = 60.0
 
 STATE: dict = {"listen": {"fed": 0, "on_queue": 0, "at": 0.0},
                "subread": {"fed": 0, "on_queue": 0, "at": 0.0}}
+_SUBREAD_EMPTY: dict = {"at": 0.0}
 
 
 # ------------------------------------------------------------ the helpers --
@@ -109,6 +110,13 @@ def _listen_pending(limit: int) -> list:
     does not have to ask again.
     """
     from . import audiolang
+    # Tidy the jump queue first: rows whose every track has since been
+    # judged by some other path stay in the table forever otherwise, and
+    # each one is re-examined on every feeder pass.
+    try:
+        audiolang.queue_sync()
+    except Exception:                                    # noqa: BLE001
+        pass
     todo = list(audiolang.queued(limit))
     if len(todo) < limit:
         todo += audiolang.pending(limit - len(todo))
@@ -154,6 +162,7 @@ def _listen_plan(f: dict) -> str:
 
 async def topup_listen(depth: int | None = None) -> dict:
     from . import audiolang, jobs
+    _ = asyncio
     depth = DEPTH["listen"] if depth is None else int(depth)
     try:
         if not audiolang.available():
@@ -166,22 +175,17 @@ async def topup_listen(depth: int | None = None) -> dict:
         # feeder does. It waits until a quarter of the depth has drained.
         if room < max(1, depth // 4):
             return {"ok": True, "made": 0, "on_queue": have}
-        files = await asyncio.to_thread(_listen_pending, max(room * 6, 300))
+        files = await jobs.in_work(_listen_pending, max(room * 6, 300))
         live = await asyncio.to_thread(_live_ids)
         files = [f for f in files if f["file_id"] not in live]
         rows = _deal(files, room, lambda f: f.get("disk"))
     except Exception as e:                                       # noqa: BLE001
         return {"ok": False, "why": f"{type(e).__name__}: {e}"[:200]}
-    made = 0
-    for f in rows:
-        try:
-            await jobs.enqueue(int(f["file_id"]), f["path"],
-                               os.path.basename(f["path"]), kind="listen",
-                               priority=80, source="audio language",
-                               plan_json=_listen_plan(f))
-            made += 1
-        except Exception:                                        # noqa: BLE001
-            pass
+    # ONE TRANSACTION, OFF THE LOOP - see jobs.enqueue_many.
+    r = await jobs.in_work(jobs.enqueue_many,
+                           [{**f, "plan_json": _listen_plan(f)} for f in rows],
+                           "listen", 80, "audio language")
+    made = int(r.get("made") or 0)
     STATE["listen"].update(fed=made, on_queue=have + made, at=time.time())
     return {"ok": True, "made": made, "on_queue": have + made}
 
@@ -299,22 +303,22 @@ async def topup_subread(depth: int | None = None) -> dict:
         room = max(0, depth - have)
         if room < max(1, depth // 4):
             return {"ok": True, "made": 0, "on_queue": have}
-        rows = await asyncio.to_thread(_subread_pending, max(room * 8, 400))
+        # NOT EVERY MINUTE FOR NOTHING. The two readers' pending lists cost
+        # 3.6 s together and are almost always empty on a library that has
+        # been read; an empty answer is believed for ten minutes.
+        if _SUBREAD_EMPTY["at"] and time.time() - _SUBREAD_EMPTY["at"] < 600:
+            return {"ok": True, "made": 0, "on_queue": have}
+        rows = await jobs.in_work(_subread_pending, max(room * 8, 400))
         live = await asyncio.to_thread(_live_ids)
         rows = [r for r in rows if r["file_id"] not in live]
+        _SUBREAD_EMPTY["at"] = time.time() if not rows else 0.0
         rows = _deal(rows, room, lambda r: r.get("disk"))
     except Exception as e:                                       # noqa: BLE001
         return {"ok": False, "why": f"{type(e).__name__}: {e}"[:200]}
-    made = 0
-    for r in rows:
-        try:
-            await jobs.enqueue(int(r["file_id"]), r["path"],
-                               os.path.basename(r["path"]), kind="subread",
-                               priority=80, source="subtitle kinds",
-                               plan_json=_subread_plan(r))
-            made += 1
-        except Exception:                                        # noqa: BLE001
-            pass
+    r = await jobs.in_work(jobs.enqueue_many,
+                           [{**x, "plan_json": _subread_plan(x)} for x in rows],
+                           "subread", 80, "subtitle kinds")
+    made = int(r.get("made") or 0)
     STATE["subread"].update(fed=made, on_queue=have + made, at=time.time())
     return {"ok": True, "made": made, "on_queue": have + made}
 

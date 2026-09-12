@@ -90,7 +90,10 @@ RENAME_GAVEUP_DAYS = 90
 # roughly 10,000/day, oldest five days old, and prune() only ever covered
 # database tables. Enumerating that directory already cost 1.8 s; left alone it
 # reaches ~900,000 files by the time the 90-day windows above first fire.
-LOG_DAYS = 21
+# Fourteen days now, not twenty-one. The readers became job kinds and a job
+# is a log file: seventy thousand of them measured on this box at the old
+# window, most of them four lines saying a decode was clean.
+LOG_DAYS = 14
 # nuarr.log had no rotation either and had reached 139.6 MB, having roughly
 # doubled in a single working session.
 LOG_MAX_MB = 32
@@ -548,8 +551,20 @@ async def watch() -> None:
             # reader holding a snapshot) is normal; the next look gets it.
             try:
                 if wal_mb() > WAL_KEEP_MB:
-                    c = await asyncio.to_thread(checkpoint, "TRUNCATE")
-                    if c.get("ok") and not c.get("busy") and c.get("before_mb", 0) > 256:
+                    # A FEW TRIES, NOT ONE. TRUNCATE needs a moment with no
+                    # reader on an older snapshot, and with twenty-odd
+                    # threads polling there is rarely such a moment on the
+                    # first ask - the WAL sat at 524 MB with only 394 pages
+                    # in it, folded but never restarted. An external process
+                    # got the gap first time; asking six times over ten
+                    # seconds finds it too.
+                    c = {}
+                    for _i in range(6):
+                        c = await asyncio.to_thread(checkpoint, "TRUNCATE")
+                        if c.get("ok") and not c.get("busy"):
+                            break
+                        await asyncio.sleep(1.5)
+                    if c.get("ok") and not c.get("busy") and c.get("before_mb", 0) > 64:
                         joblog.log(f"WAL folded back: {c['before_mb']} MB -> "
                                    f"{c['after_mb']} MB", "debug")
             except Exception:                                # noqa: BLE001

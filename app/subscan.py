@@ -156,7 +156,7 @@ def _sides_of(path: str) -> list:
     """What is sitting beside it, named as far as the name can be read."""
     from . import subembed
     out: list = []
-    for side in subembed.sidecars_for(path):
+    for side in subembed.sidecars_for(path, fresh=True):
         name = subembed.read_sidecar_name(path, side)
         try:
             sz = os.path.getsize(side)
@@ -285,13 +285,30 @@ def pending(limit: int = BATCH) -> list:
         return []
 
 
+_COUNTS: dict = {"at": 0.0, "data": None}
+
+
 def counts() -> dict:
     r"""How many files there are, how many have been read, how many are left.
 
     ONE QUERY, THREE NUMBERS. Asking separately would let them disagree - the
     library grows while the page is drawing - and "19,002 of 19,001" is the
     kind of thing that makes a person stop believing the whole panel.
+
+    HELD FOR TEN SECONDS. The query joins forty thousand files to their facts
+    and measured 1.5 s; the Subtitles page polls every five. The reader
+    updates its own STATE per file, so the bar still moves - this is only the
+    denominator, which changes when the library does.
     """
+    now = time.time()
+    if _COUNTS["data"] is not None and now - _COUNTS["at"] < 10:
+        return dict(_COUNTS["data"])
+    out = _counts_now()
+    _COUNTS.update(at=now, data=dict(out))
+    return out
+
+
+def _counts_now() -> dict:
     init()
     cutoff = time.time() - MAX_AGE_S
     out = {"total": 0, "counted": 0, "left": 0, "fresh": 0, "errors": 0}

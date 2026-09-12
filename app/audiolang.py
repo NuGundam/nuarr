@@ -1253,6 +1253,7 @@ def store(file_id: int, track: int, path: str, res: dict) -> None:
     import json as _json
     size, mtime = _stat(path)
     ensure_table()
+    mismatches_expire()
     with cursor() as cur:
         cur.execute(
             "INSERT INTO audio_lang(file_id,track,code,code2,confidence,ok,why,"
@@ -1437,6 +1438,7 @@ def apply_and_restamp(file_id: int, path: str, tags: dict[int, str]) -> tuple[bo
     ok, why = apply_tags(path, tags)
     if ok:
         restamp(file_id, path)
+        mismatches_expire()
     return ok, why
 
 
@@ -1495,10 +1497,14 @@ def pending(limit: int = 5000) -> list[dict]:
     try:
         ensure_table()
         with cursor() as cur:
-            have = {(r["file_id"], r["track"]): r for r in
-                    cur.execute("SELECT * FROM audio_lang").fetchall()}
+            # ONLY THE COLUMNS FRESHNESS NEEDS. This was SELECT * over
+            # 35,000 verdict rows - votes, why, overall, every blob - to
+            # answer size and mtime, and it ran on the gate's poll.
+            have = {(r["file_id"], r["track"]): r for r in cur.execute(
+                "SELECT file_id, track, size, mtime FROM audio_lang").fetchall()}
             rows = cur.execute(
-                "SELECT id, path, title, season, episode, library, audio_langs "
+                "SELECT id, path, title, season, episode, library, audio_langs, "
+                "       size, mtime "
                 "  FROM files "
                 " WHERE state!='deleted' AND audio_langs IS NOT NULL "
                 "   AND (audio_langs = '-' OR audio_langs LIKE '-,%' "
@@ -1516,8 +1522,9 @@ def pending(limit: int = 5000) -> list[dict]:
             # Re-check when the verdict predates the file. Skip when a fresh
             # verdict already exists, whatever it said - including a refusal,
             # because re-listening to the same audio gives the same answer and
-            # would burn the GPU on a loop.
-            if prev is not None and row_fresh(prev, r["path"]):
+            # would burn the GPU on a loop. Freshness from the files row,
+            # not a stat - see unverified().
+            if _fresh_by_row(prev, r["size"], r["mtime"]):
                 continue
             out.append({"file_id": r["id"], "path": r["path"], "track": ai,
                         "title": r["title"] or "", "season": r["season"],
@@ -1572,7 +1579,7 @@ def _queue_rows(limit: int = 100000) -> list:
     with cursor() as cur:
         return cur.execute(
             "SELECT q.file_id, q.at, f.state, f.path, f.title, f.season, "
-            "       f.episode, f.library, "
+            "       f.episode, f.library, f.size, f.mtime, "
             "       COALESCE(f.audio_langs,'') AS audio_langs "
             "  FROM audio_lang_queue q LEFT JOIN files f ON f.id = q.file_id "
             " ORDER BY q.at LIMIT ?", (int(limit),)).fetchall()
@@ -1593,9 +1600,29 @@ def _verdicts_for(ids) -> dict:
             chunk = ids[i:i + 400]
             qs = ",".join("?" * len(chunk))
             for r in cur.execute(
-                    f"SELECT * FROM audio_lang WHERE file_id IN ({qs})", chunk):
+                    f"SELECT file_id, track, size, mtime FROM audio_lang "
+                    f" WHERE file_id IN ({qs})", chunk):
                 out[(r["file_id"], r["track"])] = r
     return out
+
+
+def _fresh_by_row(prev, size, mtime) -> bool:
+    """row_fresh() without the stat: the files row already says what is there.
+
+    queued() and queue_sync() were stat-ing every queued file on every call
+    to decide whether a verdict still described it - 662 queued files on
+    pool disks, measured at 11.7 s per feeder pass. files.size / files.mtime
+    are what the scanner recorded for the file that is there now, which is
+    the same question row_fresh() asks the disk. The listen job stats the
+    one file it opens.
+    """
+    if prev is None:
+        return False
+    try:
+        return (int(prev["size"] or 0) == int(size or 0)
+                and abs(float(prev["mtime"] or 0) - float(mtime or 0)) <= 1.0)
+    except Exception:                                    # noqa: BLE001
+        return False
 
 
 def queued(limit: int = 200) -> list[dict]:
@@ -1614,7 +1641,7 @@ def queued(limit: int = 200) -> list[dict]:
         codes = (r["audio_langs"] or "").split(",")
         for ai, raw_code in enumerate(codes):
             prev = have.get((r["file_id"], ai))
-            if prev is not None and row_fresh(prev, r["path"]):
+            if _fresh_by_row(prev, r["size"], r["mtime"]):
                 continue
             out.append({"file_id": r["file_id"], "path": r["path"], "track": ai,
                         "title": r["title"] or "", "season": r["season"],
@@ -1660,9 +1687,9 @@ def unqueue(file_ids) -> None:
 #                                        file was noticed at import and has
 #                                        not finished being imported yet.
 #
-# Bounded per call, because it stats each file to decide whether a verdict
-# still describes it, and a re-import of five thousand files must not turn a
-# poll into a disk storm. Anything past the cap is tidied on the next call.
+# Bounded per call so a re-import of five thousand files is tidied in slices
+# rather than one long transaction. Freshness comes from the files row now,
+# not a stat, so the cap is about lock time rather than disk time.
 QSYNC_MAX = 500
 QSYNC_TTL = 10.0
 _QSYNC = {"at": 0.0}
@@ -1690,7 +1717,7 @@ def queue_sync(limit: int = QSYNC_MAX) -> int:
             continue
         codes = [c for c in (r["audio_langs"] or "").split(",") if c != ""]
         outstanding = any(
-            not row_fresh(have.get((r["file_id"], ai)), r["path"])
+            not _fresh_by_row(have.get((r["file_id"], ai)), r["size"], r["mtime"])
             for ai in range(len(codes)))
         if not outstanding:
             drop.append(r["file_id"])
@@ -1748,10 +1775,13 @@ def unverified(limit: int = 5000) -> list[dict]:
     try:
         ensure_table()
         with cursor() as cur:
-            have = {(r["file_id"], r["track"]): r for r in
-                    cur.execute("SELECT * FROM audio_lang").fetchall()}
+            have = {(r["file_id"], r["track"]): (int(r["size"] or 0),
+                                                 float(r["mtime"] or 0))
+                    for r in cur.execute(
+                        "SELECT file_id, track, size, mtime FROM audio_lang")}
             rows = cur.execute(
-                "SELECT id, path, title, season, episode, library, audio_langs "
+                "SELECT id, path, title, season, episode, library, audio_langs, "
+                "       size, mtime "
                 "  FROM files "
                 " WHERE state='done' AND COALESCE(audio_langs,'') != '' "
                 "   AND audio_langs != '-' "
@@ -1767,7 +1797,15 @@ def unverified(limit: int = 5000) -> list[dict]:
             if not raw_code or raw_code == "-":
                 continue                    # pending() owns the untagged ones
             prev = have.get((r["id"], ai))
-            if prev is not None and row_fresh(prev, r["path"]):
+            # FRESHNESS FROM THE TABLE, NOT FROM A STAT. row_fresh() stats the
+            # file, and this loop walks every verified track before it finds
+            # an unverified one - thirty-four thousand stats against pool
+            # disks to return three hundred rows, measured at seventeen
+            # seconds. files.size and files.mtime are what the scanner
+            # recorded for the file that is there now, which is the same
+            # question; the listen job stats the one file it opens.
+            if prev is not None and prev[0] == int(r["size"] or 0) \
+                    and abs(prev[1] - float(r["mtime"] or 0)) <= 1.0:
                 continue
             out.append({"file_id": r["id"], "path": r["path"], "track": ai,
                         "title": r["title"] or "", "season": r["season"],
@@ -1974,6 +2012,7 @@ def series_key(arr_name, parent_id, library, title) -> str:
 def left_reset() -> None:
     """An answer must count at once, not in a minute."""
     _LEFT["at"] = 0.0
+    mismatches_expire()
 
 
 def _left() -> tuple[set, set]:
@@ -2105,8 +2144,37 @@ def verdict_for(row) -> dict:
     return d
 
 
+# ONE JOIN, REMEMBERED FOR FIFTEEN SECONDS. mismatches() walks every
+# verdict joined to its file - 32,000 rows, 0.7-1.3 s - to find the thirty
+# that disagree, and it is asked by the audio page, the planner, the auto
+# pass, the pipeline tile and the health check, several of them within the
+# same second. The rows only change when a verdict is stored, a tag is
+# rewritten or an answer is given, and each of those expires the memo.
+_MM_TTL = 15.0
+_MM: dict = {}
+
+
+def mismatches_expire() -> None:
+    _MM.clear()
+
+
 def mismatches(limit: int = 200, floor: float | None = None,
                respect_answers: bool = True) -> list[dict]:
+    """Memoised front of _mismatches_now(); same contract."""
+    key = (int(limit), floor, bool(respect_answers))
+    now = time.time()
+    hit = _MM.get(key)
+    if hit and now - hit[0] < _MM_TTL:
+        return [dict(x) for x in hit[1]]
+    out = _mismatches_now(limit, floor, respect_answers)
+    if len(_MM) > 32:
+        _MM.clear()
+    _MM[key] = (now, [dict(x) for x in out])
+    return out
+
+
+def _mismatches_now(limit: int = 200, floor: float | None = None,
+                    respect_answers: bool = True) -> list[dict]:
     r"""Tracks where what was heard is not what the tag claims.
 
     Only confident disagreements. A verdict this acts on gets a file rebuilt
@@ -2537,6 +2605,7 @@ def fix_mislabel(file_id: int, track: int) -> dict:
     cost, and it belongs to the remedy layer next to every other one.
     """
     from . import langkey
+    mismatches_expire()             # a button press reads the table, not the memo
     m = [x for x in mismatches(2000, floor=0.0, respect_answers=False)
          if x["file_id"] == int(file_id) and x["track"] == int(track)]
     if not m:
@@ -2654,7 +2723,7 @@ def attention() -> dict | None:
 
 
 _PENDING_CACHE: dict = {"n": 0, "at": 0.0}
-_PENDING_TTL = 20.0
+_PENDING_TTL = 60.0
 
 
 def pending_count() -> int:

@@ -301,7 +301,7 @@ def _screen(file_id: int, path: str, takes: list) -> list:
         # still goes to the recycle bin rather than being deleted, and it is
         # still written down.
         if "is empty" in why:
-            rr = fileops.recycle(side)
+            forget_sidecars(); rr = fileops.recycle(side)
             _note(file_id, path, side, t.get("lang") or "",
                   bool(getattr(rr, "ok", False)),
                   "it was empty - recycled" if getattr(rr, "ok", False)
@@ -399,24 +399,68 @@ def wanted(lang: str, library: str) -> tuple[bool, str]:
                    f"{lang or 'untagged'}")
 
 
-def sidecars_for(video: str) -> list[str]:
+# ONE LISTDIR PER FOLDER, REMEMBERED FOR A FEW SECONDS.
+#
+# sidecars_for() used to list the video's folder and its Subs/ folder afresh
+# on every call. Two things made that expensive. The subtitle page asks about
+# the same forty-odd files four or five times per build (board, findings,
+# picture rows, hardsub stats) - 0.5-2.2 s of listdir against pool disks per
+# page. And the library walk asks about every file in turn - forty thousand
+# files that live in a few thousand folders, so a season of twenty-four
+# episodes listed the same folder twenty-four times, plus twenty-four
+# isdir() probes of a Subs/ folder that is usually not there.
+#
+# The memo is per FOLDER, not per file: one listing serves every episode in
+# it, and only the subtitle-looking names are kept, so the whole library's
+# worth of folders is a few hundred KB. Twenty seconds is long enough for
+# one page build or one run of siblings in the walk and short enough that a
+# sidecar dropped beside a file is seen on the next poll. The paths that
+# MOVE sidecars ask for a fresh look, and drop the memo when they are done.
+_DIR_TTL = 20.0
+_DIR_CACHE: dict = {}
+
+
+def forget_sidecars(video: str = "") -> None:
+    """Drop the folder memo - all of it, or the folders one video lives in."""
+    if not video:
+        _DIR_CACHE.clear()
+        return
+    d = os.path.dirname(video)
+    for place in [d] + [os.path.join(d, x) for x in SUB_DIRS]:
+        _DIR_CACHE.pop(place, None)
+
+
+def _sub_names(place: str, fresh: bool) -> list[str] | None:
+    """Subtitle-looking names in this folder, or None if it is not a folder."""
+    now = time.time()
+    if not fresh:
+        hit = _DIR_CACHE.get(place)
+        if hit and now - hit[0] < _DIR_TTL:
+            return hit[1]
+    try:
+        names = ([f for f in os.listdir(place)
+                  if f.lower().endswith(SIDECAR_EXT)]
+                 if os.path.isdir(place) else None)
+    except OSError:
+        names = None
+    if len(_DIR_CACHE) > 20000:
+        _DIR_CACHE.clear()
+    _DIR_CACHE[place] = (now, names)
+    return names
+
+
+def sidecars_for(video: str, fresh: bool = False) -> list[str]:
     """Every subtitle file that belongs to this video, folder or Subs/."""
     out: list[str] = []
     d = os.path.dirname(video)
     stem = os.path.splitext(os.path.basename(video))[0]
-    places = [d] + [os.path.join(d, s) for s in SUB_DIRS]
-    for place in places:
-        try:
-            if not os.path.isdir(place):
-                continue
-            for f in os.listdir(place):
-                if not f.lower().endswith(SIDECAR_EXT):
-                    continue
-                if not f.startswith(stem):
-                    continue
-                out.append(os.path.join(place, f))
-        except OSError:
+    for place in [d] + [os.path.join(d, x) for x in SUB_DIRS]:
+        names = _sub_names(place, fresh)
+        if not names:
             continue
+        for f in names:
+            if f.startswith(stem):
+                out.append(os.path.join(place, f))
     return sorted(out)
 
 
@@ -634,7 +678,7 @@ def plan_one(file_id: int, force: bool = False,
     # the case this list exists to stop being wrong about.
     inside = _probe_sub_tracks(int(file_id)) if take_them or tidy else []
     out["drop"] = []
-    for side in sidecars_for(path):
+    for side in sidecars_for(path, fresh=True):
         name = read_sidecar_name(path, side)
         if not name["ok"]:
             out["skip"].append({"sidecar": side, "why": name["why"]})
@@ -816,7 +860,7 @@ def _recycle_drops(file_id: int, path: str, drops: list) -> dict:
                   "the track it duplicates is not in the file after all - "
                   "the sidecar was left alone")
             continue
-        rr = fileops.recycle(d["sidecar"])
+        forget_sidecars(); rr = fileops.recycle(d["sidecar"])
         if getattr(rr, "ok", False):
             out["dropped"] += 1
             _note(file_id, path, d["sidecar"], d["lang"], True,
@@ -1217,7 +1261,7 @@ def _embed_tail(file_id, path, takes, drops, cmd, tmp, report, work=None,
     # AND ONLY NOW THE SIDECARS, one at a time, recycled rather than deleted.
     gone, kept = 0, []
     for t in takes:
-        rr = fileops.recycle(t["sidecar"])
+        forget_sidecars(); rr = fileops.recycle(t["sidecar"])
         if getattr(rr, "ok", False):
             gone += 1
         else:
@@ -1565,7 +1609,7 @@ def after_rebuild(file_id: int, path: str, takes: list) -> dict:
                   False, "the rebuilt file does not carry it - the sidecar "
                          "was left alone")
             continue
-        rr = fileops.recycle(t["sidecar"])
+        forget_sidecars(); rr = fileops.recycle(t["sidecar"])
         if getattr(rr, "ok", False):
             out["recycled"] += 1
         else:
@@ -1685,7 +1729,7 @@ def delete_broken(keys) -> dict:
                   row.get("lang") or "", True,
                   "the subtitle file is already gone")
             continue
-        rr = fileops.recycle(p)
+        forget_sidecars(); rr = fileops.recycle(p)
         if getattr(rr, "ok", False):
             gone += 1
             _note(int(row["file_id"] or 0), row.get("path") or "", p,
@@ -1800,7 +1844,7 @@ def tidy_empty() -> dict:
                 continue
         except OSError:
             continue
-        rr = fileops.recycle(p)
+        forget_sidecars(); rr = fileops.recycle(p)
         if getattr(rr, "ok", False):
             gone += 1
             _note(int(row.get("file_id") or 0), row.get("path") or "", p,

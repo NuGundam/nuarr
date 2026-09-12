@@ -565,12 +565,13 @@ def answered() -> dict:
 
 # ------------------------------------------------------------- the reading --
 _DEV: dict = {"at": 0.0, "data": {}}
+_LEFT: dict = {"at": 0.0, "n": 0}
 
 
 def _device() -> dict:
     """Whisper's model and device, held for a minute - info() probes packages."""
     now = time.time()
-    if now - _DEV["at"] > 60 or not _DEV["data"]:
+    if now - _DEV["at"] > 600 or not _DEV["data"]:
         d = {"tool": "Whisper", "hw": "", "model": ""}
         try:
             from . import audiolang
@@ -599,10 +600,13 @@ def listening() -> dict:
     from . import audiolang
     out = {"left": 0, "done": 0, "total": 0, "pct": 0.0, "rate": 0.0,
            "eta": 0, "state": "", "current": "", "each": 0.0}
-    try:
-        left = int(audiolang.unverified_count() or 0)
-    except Exception:                                            # noqa: BLE001
-        left = 0
+    now = time.time()
+    if now - _LEFT["at"] > 30:
+        try:
+            _LEFT.update(at=now, n=int(audiolang.unverified_count() or 0))
+        except Exception:                                        # noqa: BLE001
+            _LEFT["at"] = now
+    left = int(_LEFT["n"])
     try:
         p = audiolang.progress() or {}
     except Exception:                                            # noqa: BLE001
@@ -732,8 +736,18 @@ def overview(limit: int = 400, force: bool = False) -> dict:
     # THE QUESTIONS THEMSELVES RIDE WITH THE PAGE. They used to be a second
     # request (/api/audqueue) on a second timer, so the panel's rows and its
     # switchboard count could be a poll apart. One payload, one moment.
-    d["asking"] = asking(400)
-    d.update(answered())
+    #
+    # CACHED WITH THE VIEW, not rebuilt per poll: the blank rows walk the
+    # untagged tracks through audiolang.pending(), which reads the whole
+    # verdict table - half a second, every five seconds, for a list that
+    # changes when a job finishes. The view's fifteen seconds is the right
+    # lifetime; bump() clears it on every answer.
+    if force or "asking" not in cached or now - _VIEW["at"] > _VIEW_TTL:
+        cached["asking"] = asking(400)
+        cached.update(answered())
+    d["asking"] = cached.get("asking") or []
+    d["answered"] = cached.get("answered", 0)
+    d["on_queue"] = cached.get("on_queue", 0)
     # The mode and the two lines, so the panel can draw its controls without
     # a third request.
     try:

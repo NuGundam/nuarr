@@ -457,22 +457,15 @@ async def topup(depth: int = QUEUE_DEPTH) -> dict:
     counted and the row simply waits for the next top-up.
     """
     from . import jobs
-    made = skipped = 0
     try:
-        have, rows = await asyncio.to_thread(_to_hand_over, depth)
+        have, rows = await jobs.in_work(_to_hand_over, depth)
     except Exception as e:                                       # noqa: BLE001
         return {"ok": False, "why": f"{type(e).__name__}: {e}"[:200]}
-    for r in rows:
-        try:
-            await jobs.enqueue(int(r["file_id"]), r["path"],
-                               r.get("name") or "", kind="subs",
-                               priority=50, source="subtitles",
-                               plan_json=_job_plan(r))
-            made += 1
-        except ValueError:
-            skipped += 1
-        except Exception:                                        # noqa: BLE001
-            skipped += 1
+    # ONE TRANSACTION, OFF THE LOOP - see jobs.enqueue_many.
+    r = await jobs.in_work(jobs.enqueue_many,
+                           [{**x, "plan_json": _job_plan(x)} for x in rows],
+                           "subs", 50, "subtitles")
+    made, skipped = int(r.get("made") or 0), int(r.get("skipped") or 0)
     return {"ok": True, "made": made, "skipped": skipped,
             "on_queue": have + made}
 
@@ -922,8 +915,9 @@ async def _reader_and_feeder() -> None:
         try:
             b = await idle.busy()
             if not b["busy"]:
-                await asyncio.to_thread(subscan.scan, subscan.BATCH)
-                await asyncio.to_thread(replan)
+                from . import jobs as _jobs
+                await _jobs.in_work(subscan.scan, subscan.BATCH)
+                await _jobs.in_work(replan)
                 left = int(subscan.counts().get("left") or 0)
         except Exception:                                        # noqa: BLE001
             pass

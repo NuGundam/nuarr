@@ -659,6 +659,15 @@ async def api_diag_pool():
 
 @app.on_event("startup")
 async def _startup() -> None:
+    # A WIDER DEFAULT EXECUTOR. See jobs.WORK: the long job bodies have their
+    # own pool now, and this one keeps the short database reads every endpoint
+    # makes. 24 threads was measured starving; 48 gives a burst of polls room.
+    try:
+        from concurrent.futures import ThreadPoolExecutor as _TPE
+        asyncio.get_running_loop().set_default_executor(
+            _TPE(max_workers=48, thread_name_prefix="loop"))
+    except Exception:                                            # noqa: BLE001
+        pass
     BOOT["started"] = time.time()
     # FIRST, BEFORE ANYTHING CAN SPAWN. This wraps subprocess.Popen so every
     # process nuarr starts records the line that started it - and a process
@@ -3903,7 +3912,7 @@ async def api_audiolang(limit: int = Query(400, le=3000)):
             # hundred and usually about ten.
             files = cur.execute(
                 "SELECT id, path, title, season, episode, library, "
-                "       orig_lang, audio_langs "
+                "       orig_lang, audio_langs, size, mtime "
                 "FROM files WHERE state!='deleted'").fetchall()
 
         # THE TWELVE THIS PAGE USED TO KNOW, and then the rest. A row that
@@ -3960,7 +3969,12 @@ async def api_audiolang(limit: int = Query(400, le=3000)):
                 # renumbers tracks, so an old row does not merely go out of
                 # date - it starts describing a different track. Seven TaleSpin
                 # episodes were reported as mislabelled for exactly this reason.
-                if d is not None and not audiolang.row_fresh(d, f["path"]):
+                # FROM THE FILES ROW, NOT A STAT: this line used to stat
+                # every verdict's file - 35,000 stats across the pool
+                # disks, 42 seconds cold - to learn a size and mtime the
+                # scanner had already written down.
+                if d is not None and not audiolang._fresh_by_row(
+                        d, f["size"], f["mtime"]):
                     stale += 1
                     d = None
                 if blank:

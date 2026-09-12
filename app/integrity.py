@@ -605,21 +605,15 @@ async def topup(depth: int = QUEUE_DEPTH) -> dict:
     from . import jobs
     if not _READY:
         init()
-    made = skipped = 0
     try:
-        have, rows = await asyncio.to_thread(_to_hand_over, depth)
+        have, rows = await jobs.in_work(_to_hand_over, depth)
     except Exception as e:                                       # noqa: BLE001
         return {"ok": False, "why": f"{type(e).__name__}: {e}"[:200]}
-    for r in rows:
-        try:
-            await jobs.enqueue(int(r["file_id"]), r["path"],
-                               os.path.basename(r["path"] or ""),
-                               kind="decode", priority=90,
-                               source="does it decode?",
-                               plan_json=_job_plan(r))
-            made += 1
-        except Exception:                                        # noqa: BLE001
-            skipped += 1
+    # ONE TRANSACTION, OFF THE LOOP - see jobs.enqueue_many.
+    r = await jobs.in_work(jobs.enqueue_many,
+                           [{**x, "plan_json": _job_plan(x)} for x in rows],
+                           "decode", 90, "does it decode?")
+    made, skipped = int(r.get("made") or 0), int(r.get("skipped") or 0)
     STATE["on_queue"] = have + made
     return {"ok": True, "made": made, "skipped": skipped,
             "on_queue": have + made}

@@ -2940,7 +2940,22 @@ def busy_disks() -> set[str]:
     return set(_BUSY_DISKS)
 
 
+_DISK_REPORT: dict = {"at": 0.0, "data": None}
+
+
 def disk_report() -> dict:
+    """Per-managed-disk load, for the pool panel. Held for two seconds: the
+    dispatcher asks twice per claim and the pool panel once a poll, and the
+    counters underneath only tick once a second anyway."""
+    now = time.time()
+    if _DISK_REPORT["data"] is not None and now - _DISK_REPORT["at"] < 2.0:
+        return _DISK_REPORT["data"]
+    out = _disk_report_now()
+    _DISK_REPORT.update(at=now, data=out)
+    return out
+
+
+def _disk_report_now() -> dict:
     """Per-managed-disk load, for the pool panel.
 
     Only disks the library actually lives on. The counters expose every disk on
