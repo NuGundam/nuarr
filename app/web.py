@@ -32339,9 +32339,19 @@ function skColor(r){
   return 'var(--warn)';
 }
 function skRows(){
-  // Only rows a batch can do something with: not done, not unread, and with
-  // an action to take. A "left alone" track has nothing to tick for.
-  return ((_sk&&_sk.rows)||[]).filter(r=>!r.done && !r.unread && r.action);
+  // EVERY ROW A BATCH CAN DO SOMETHING WITH.
+  //
+  // It used to require an action, which was reading the row from one of the
+  // two buttons' point of view. A track whose title is already honest has no
+  // "Correct the title" to offer - but it still has "Not dialogue", which is
+  // a batch operation and the one you want most often, because a whole
+  // show's worth of "Signs/Songs" rows are all the same answer. Those rows
+  // had no checkbox, so dismissing forty of them was forty clicks.
+  //
+  // A row is selectable when it has been read and not yet answered. What each
+  // BUTTON can do with the selection is the button's business, and each says
+  // how many of it applies to.
+  return ((_sk&&_sk.rows)||[]).filter(r=>!r.done && !r.unread);
 }
 function skSelIds(){
   const live=new Set(skRows().map(r=>r.id));
@@ -32518,8 +32528,14 @@ async function skDismiss(id, btn){
   }
 }
 async function skActMany(btn){
-  const ids=skSelIds(); if(!ids.length) return;
-  const rows=skRows().filter(r=>ids.includes(r.id));
+  // THE SELECTION IS WIDER THAN THIS BUTTON. Rows with nothing to correct can
+  // be selected now, because Not dialogue applies to them - so this takes the
+  // subset it can act on and names that number rather than acting on a count
+  // it cannot honour.
+  const all=skSelIds();
+  const rows=skRows().filter(r=>all.includes(r.id) && r.action);
+  const ids=rows.map(r=>r.id);
+  if(!ids.length) return;
   askInline(btn,
     `Go ahead and ${skActWord(rows)}`
     + (_skBatchKind?`, all recorded as ${SKW[_skBatchKind]?SKW[_skBatchKind][0]:_skBatchKind}`
@@ -32811,15 +32827,23 @@ function skPaint(force){
         mk.errors.map(e=>`<div class="err">${esc(e.name||'')} — ${esc(e.why||'')}</div>`).join('')}</div>`:''}
     </div>`:'';
   const pick=skRows(), nsel=skSelIds().length, allOn=pick.length>0&&nsel===pick.length;
+  // How many of the selection each button can actually do something with.
+  // Dismiss applies to all of them; correcting applies only to the ones that
+  // have something to correct, and saying so beats a button that silently
+  // does less than its number promises.
+  const nact=skSelIds().filter(id=>{
+    const r=(_sk.rows||[]).find(x=>x.id===id); return r && r.action; }).length;
   const selBar=nsel?`
     <div class="askhost" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;
          padding:6px 8px;margin:6px 0;border-radius:7px;
          background:rgba(88,166,255,.07);border:1px solid var(--line)">
       <b style="font-size:11.5px;color:#6fb0ff">${fmt(nsel)} selected</b>
-      <button class="rmb" onclick="skActMany(this)"
-        title="Your answer is recorded, remembered against each show and release group, and every one of these files goes on the queue - where the work happens beside everything else, one rewrite per file.">Yes — queue ${fmt(nsel)}</button>
+      ${nact?`<button class="rmb" onclick="skActMany(this)"
+        title="Your answer is recorded, remembered against each show and release group, and every one of these files goes on the queue - where the work happens beside everything else, one rewrite per file.">Yes — queue ${fmt(nact)}</button>`
+        :`<span class="dim" style="font-size:10.5px"
+           title="Every row in this selection is already saying the right thing about itself - there is nothing to correct. Not dialogue still applies to all of them.">nothing here to correct</span>`}
       <button class="rmb" onclick="skDismissMany(this)"
-        title="Not what it says. Pictures teach the OCR filter; tracks are recorded as signs.">Not dialogue — ${fmt(nsel)}</button>
+        title="Not what it says. Pictures teach the OCR filter; tracks are recorded as signs. This one applies to every row selected, including the ones with nothing to correct.">Not dialogue — ${fmt(nsel)}</button>
       <select class="kindsel" onchange="skBatchKind(this.value)"
         title="Leave this alone and every row keeps whatever it says it is. Pick one and all of them are recorded as that.">
         <option value=""${_skBatchKind?'':' selected'}>keep each row's kind</option>
@@ -32843,7 +32867,7 @@ function skPaint(force){
            again to turn it around; "sure" returns to least-certain-first. -->
       <thead><tr class="dim sksort" style="font-size:10.5px">
         <th class="l"><input type="checkbox" ${allOn?'checked':''}
-            title="Select every row with something to do" onclick="skSelAll(this.checked)"></th>
+            title="Select every row on screen that has been read and not yet answered" onclick="skSelAll(this.checked)"></th>
         <th class="l" onclick="skSortBy('episode')" title="Sort by episode">episode ${skSortMark('episode')}</th>
         <th class="c" onclick="skSortBy('library')" title="Sort by library">library ${skSortMark('library')}</th>
         <th class="c" onclick="skSortBy('added')"
@@ -32856,7 +32880,7 @@ function skPaint(force){
       </tr></thead>
       <tbody>${rows.map(r=>{
         const [word,col]=SKW[r.kind]||[r.kind||'','var(--dim)'];
-        const on=_skSel.has(r.id), can=!r.done&&!r.unread&&r.action;
+        const on=_skSel.has(r.id), can=!r.done&&!r.unread;
         const pic=r.source==='picture', open=_skOpen.has(r.id);
         return `<tr${on?' style="background:rgba(88,166,255,.06)"':''}>
         <td class="l">${can?`<input type="checkbox" ${on?'checked':''}
