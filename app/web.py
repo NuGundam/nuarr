@@ -29301,10 +29301,11 @@ its share already. The next batch goes in as these finish."
     <div class="gapscanbar" style="margin-top:5px"><i style="width:${
       (frac*100).toFixed(1)}%"></i></div>
     <div class="dim" style="font-size:10.5px;margin-top:3px">
-      <b>${fmt(dr.keep||100)}</b> of these are kept in the transcoding queue and
-      topped up as they finish, so this stays behind everything else nuarr is
-      doing instead of arriving as one library-wide rewrite. Watch it on
-      <a href="/#transcoding">Processing System on the dashboard</a>.</div>
+      Sent a few at a time rather than all at once: <b>${fmt(dr.keep||100)}</b>
+      stay on the queue and more go on as those finish, so a rebuild of a whole
+      library never arrives in front of the work nuarr was already doing. Stop
+      leaves everything already queued alone. Watch them go through
+      <a href="/#transcoding">Processing System</a>.</div>
   </div>`;
 }
 
@@ -34087,7 +34088,9 @@ function subsListHtml(){
     ${(_subs.by_show&&_subs.by_show.length)?`<div style="margin-top:5px;
          display:flex;gap:5px;flex-wrap:wrap" title="Where the waiting work is concentrated. One show accounting for hundreds of files usually means one release group's habit rather than hundreds of separate problems.">${
       _subs.by_show.slice(0,12).map(x=>`<span class="capsc"
-        style="font-size:10px">${esc(x.show)} <b>${fmt(x.n)}</b></span>`).join('')
+        style="font-size:10px" title="${esc(x.show)}">${
+        esc(String(x.show).replace(/\s*\{[^}]*\}\s*/g,' ').trim())} ${
+        num(x.n,'auto')}</span>`).join('')
     }</div>`:''}
     <div class="scrollbox" style="max-height:420px;overflow:auto;margin-top:7px">
     <table class="tt" style="width:100%;table-layout:fixed">
@@ -34158,7 +34161,10 @@ function subsScanHtml(){
       <span style="font-size:10.5px">(${pct.toFixed(0)}%)</span>
       ${sc.rate?` · <b style="color:var(--ok)">${sc.rate.toFixed(0)}</b> a second`:''}
       ${sc.eta?` · ${numt(hsDur(sc.eta))} left`:''}
-      <span style="opacity:.75">${esc((sc.last||'').slice(0,70))}</span>`,
+      <span style="opacity:.75;display:inline-block;max-width:38ch;
+        overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+        vertical-align:bottom" title="${esc(sc.last||'')}">${
+        esc(sc.last||'')}</span>`,
     right: sc.left ? `${num(sc.left,'auto')} <span class="dim">left to read</span>`
                    : '<b style="color:var(--ok)">all of it read</b>',
     body:`<div class="hsbar" style="margin-top:4px"><i style="width:${pct}%"></i></div>
@@ -34307,6 +34313,16 @@ function subsPaint(){
   // HOLDS STILL UNDER THE POINTER. Same rule the old panel learned: a list
   // being read is a list that must not be rebuilt beneath the reader.
   if(panelScrolled('subsTop')) return;
+  // AND A QUESTION ON SCREEN IS NOT SOMETHING TO REPAINT OVER.
+  //
+  // "Recycle the broken subtitle files" asks before it acts - it replaces
+  // itself with "Yes, recycle 2" - and the next poll arrived five seconds
+  // later and rebuilt the panel, taking the confirmation with it. The button
+  // came back, so it read as the second half of the button vanishing rather
+  // than as a repaint. askOpen is the same guard the other panels use; the
+  // page simply stops redrawing while it is waiting for an answer, which it
+  // was going to do anyway the moment you pressed either way.
+  if(askOpen('subsStatus') || askOpen('subsTop')) return;
   // TWO SLOTS, BECAUSE THEY ANSWER DIFFERENT QUESTIONS AND SIT IN DIFFERENT
   // PLACES. What is happening right now goes at the very top of the page;
   // the switchboard and the file list stay under the rules that produced

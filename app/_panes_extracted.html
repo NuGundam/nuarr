@@ -236,26 +236,20 @@
         <div id="jobsBody" style="padding:0 14px 14px"></div>
       </div>
       <div id="langPane" style="display:none">
-        <!-- THE ORDER OF THIS PAGE IS THE ORDER OF THE QUESTION.
-             What are the rules? Then: what is nuarr doing about them? Then:
-             what does it need from me? The rules used to be third, under the
-             switchboard and the queue, which put the answer above the
-             question - and the rules are also the one thing on this page that
-             is yours to set rather than nuarr's to report. -->
+        <!-- THE ORDER OF THIS PAGE.
+             The rules first, because they are the only thing here that is
+             yours to set rather than nuarr's to report - and because every
+             number below them is a consequence of them. Then what nuarr is
+             doing about them, then what it needs from you. -->
 
-        <!-- 1. WHAT IS HAPPENING RIGHT NOW. The reading's own progress and
-             what is being processed, first, because it is the question you
-             open this page with. Everything under it is either the policy
-             that produced the work or the work itself. Drawn by subsPaint. -->
-        <div id="subsStatus" style="padding:6px 14px 0"></div>
-
-        <!-- 2. THE POLICY. What a file is allowed to end up carrying, per
+        <!-- 1. THE POLICY. What a file is allowed to end up carrying, per
              library, and which finished files no longer match it. -->
         <div style="padding:6px 14px 4px">
-          <div class="lkind" style="padding:11px 12px">
-            <b style="color:#6fb0ff">Subtitle rules</b>
-            <div style="font-size:11.5px;margin-top:2px;opacity:.85">Which subtitle tracks a file keeps, and what happens to picture ones.</div>
-            <div class="dim" style="font-size:11px;margin-top:2px">
+          <div class="subsp">
+            <div class="subshd"><b style="color:#6fb0ff">Subtitle rules</b>
+              <span class="dim subssub">Which subtitle tracks a file keeps, and what happens to picture ones.</span>
+            </div>
+            <div class="subswhy">
               And what becomes of the picture ones. The queue and the
               transcoder read this directly &mdash; it is the same policy the
               planner applies, not a copy of it.
@@ -271,6 +265,10 @@
           </div>
         </div>
         <div id="langBody" style="padding:0 14px 14px"></div>
+
+        <!-- 2. WHAT IS HAPPENING RIGHT NOW. The reading's own progress and
+             what is being processed. Drawn by subsPaint. -->
+        <div id="subsStatus" style="padding:6px 14px 0"></div>
 
         <!-- 3. WHAT NUARR IS DOING ABOUT THEM. The switchboard and the
              file-by-file list. -->
@@ -291,27 +289,6 @@
             <div id="skPanel" style="padding:0 14px 6px"></div>
           </div>
         </div>
-
-        <!-- The evidence behind two of the switchboard rows, shut by default,
-             and homed here for the same reason Subtitle User Input is: each
-             one is moved into a slot inside its own row when that row is
-             opened, and brought back here before the board is redrawn. See
-             subsPaint - putting a panel inside a container that gets its
-             innerHTML replaced is how you delete it.
-
-             What the sidecar rule would do, readable BEFORE it is switched
-             on - it rewrites files and recycles others, so the preview is the
-             point rather than a decoration. -->
-        <!-- THE SIDECAR PREVIEW AND THE DUPLICATE LIST USED TO LIVE HERE.
-             Both were lists of files with something wrong with their
-             subtitles, which is what "What would happen, file by file" is - so
-             the same episode could appear in three places on one page, worded
-             three ways, and you had to know which panel a given problem was
-             going to show up in. The counts they carried are on their
-             switchboard rows, the failures are in Processing beside the other
-             failures, and the per-show breakdown is under the merged list's
-             own header. See subs.queue_rows: it reads the queue, and the
-             queue is what is actually going to happen. -->
 
         <!-- CHECK ONE FILE NOW. The readers above are sweeps; this is the
              same reader pointed at a file you chose, with a clock on it. It
