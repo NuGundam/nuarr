@@ -6204,8 +6204,10 @@ async def api_plexcoll_set(library: str, on: int = 1, title: str = ""):
 
 @app.post("/api/plexcoll/run")
 async def api_plexcoll_run():
+    """Sync now is a FULL sweep: a person pressing it wants the collection
+    checked against Plex, not against what nuarr remembers of Plex."""
     from . import plexcollections
-    asyncio.create_task(plexcollections.sync())
+    asyncio.create_task(plexcollections.sync(force=True))
     return {"ok": True, "started": True}
 
 
@@ -29071,6 +29073,11 @@ async function loadPlexCfg(){
         <span id="pxMsg" class="dim" style="font-size:11.5px"></span>
       </div>
     </div>`;
+  // The collections card sits under Tautulli, inside this body, so it is
+  // part of the Plex configuration rather than a stray card after it - and
+  // it has to be re-created here because the innerHTML above just replaced
+  // whatever was there.
+  loadPlexColl();
 }
 
 async function plexLink(btn){
@@ -29306,14 +29313,17 @@ let _pxsRate=null, _pxsSeen=null;
 // step every six hours and on demand.
 let _pcoll=null, _pcollTimer=null;
 async function loadPlexColl(){
-  const host=document.getElementById('pxsCard');
-  if(!host) return;
+  const body=document.getElementById('plexBody');
+  if(!body) return;
   let el=document.getElementById('pcollCard');
   if(!el){
+    // Only once the configuration has rendered - the loading placeholder is
+    // replaced wholesale, and a card appended to it would go with it.
+    if(!body.querySelector('#pxTUrl')) return;
     el=document.createElement('div');
     el.className='lkind'; el.id='pcollCard';
-    el.style.cssText='margin:0 14px 14px;padding:11px 12px';
-    host.parentNode.insertBefore(el, host);
+    el.style.cssText='padding:11px 12px;margin-top:10px';
+    body.appendChild(el);
   }
   try{ _pcoll=await (await fetch('/api/plexcoll')).json(); }
   catch(e){ el.innerHTML='<span class="dim">could not load</span>'; return; }
@@ -29330,9 +29340,20 @@ function pcollPaint(){
     const line = !L.on ? '<span class="dim">off</span>'
       : l.error ? `<span class="err">${esc(l.error)}</span>`
       : l.at ? `<span style="color:var(--ok)">${fmt(l.in_collection||0)}</span><span class="dim"> in the collection · ${fmt(l.ended||0)} ended of ${fmt(l.plex_shows||0)} shows${
-            l.unmatched?` · ${fmt(l.unmatched)} Sonarr does not know`:''}${
-            (l.added||l.removed)?` · last pass ${l.added?'+'+fmt(l.added):''}${l.added&&l.removed?' ':''}${l.removed?'−'+fmt(l.removed):''}`:''} · synced ${esc(when)}</span>`
+            (l.added||l.removed)?` · last pass ${l.added?'+'+fmt(l.added):''}${l.added&&l.removed?' ':''}${l.removed?'−'+fmt(l.removed):''}`:''} · synced ${esc(when)}${
+            l.mode?` <span title="${l.mode==='changes'?'only what can have changed since the last full sweep: Sonarr statuses, and shows Plex added since':'every show in the library checked against Plex and Sonarr'}">(${l.mode==='changes'?'changes only':'full sweep'})</span>`:''}</span>`
       : '<span class="dim">on - first pass is on its way</span>';
+    // THE ONES SONARR DOES NOT KNOW, BY NAME. A count is a claim; the names
+    // are what you need to go and find out why - usually a show Plex matched
+    // to a different tvdb entry than Sonarr, or one Sonarr never had.
+    const um=(l.unmatched_titles||[]);
+    const unmatched = (L.on && l.at && (l.unmatched||0))
+      ? `<details style="margin:2px 0 4px 160px;font-size:11px">
+           <summary class="dim" style="cursor:pointer">${fmt(l.unmatched)} Sonarr does not know</summary>
+           <div style="margin:4px 0 0 12px;columns:2;column-gap:24px">${
+             um.map(t=>`<div style="break-inside:avoid">${esc(t)}</div>`).join('')
+             || '<span class="dim">names arrive on the next pass</span>'}</div>
+         </details>` : '';
     return `<div style="display:flex;gap:10px;align-items:center;padding:6px 0;border-top:1px solid var(--line);font-size:11.5px">
       <b style="flex:none;min-width:150px">${esc(L.library)}</b>
       <span class="dim" style="flex:none">collection</span>
@@ -29341,10 +29362,10 @@ function pcollPaint(){
       <button class="wsw ${L.on?'on':'off'}" onclick="pcollSet(${JSON.stringify(L.library).replace(/"/g,'&quot;')},${L.on?0:1},this)"
         title="${L.on?'Nuarr keeps this collection in step with Sonarr. Click to stop - the collection is left as it is.':'Click to keep an Ended collection in this library, in step with Sonarr.'}"
         ><span class="knob"></span>${L.on?'kept':'off'}</button>
-    </div>`;
+    </div>${unmatched}`;
   }).join('');
   el.innerHTML=`<b style="color:#6fb0ff">Collections Nuarr keeps</b>
-    <span class="dim" style="font-size:11px;margin-left:8px">every ${d.every_h}h, and when you ask</span>
+    <span class="dim" style="font-size:11px;margin-left:8px">changes every ${d.every_h}h, a full sweep daily, and when you ask</span>
     <span style="float:right;display:flex;gap:8px;align-items:center">
       ${d.running?`<span class="dim" style="font-size:11px">${esc(d.now||'working…')}</span>`:''}
       <button onclick="pcollRun(this)" ${d.running?'disabled':''} style="font-size:10.5px;padding:1px 8px">${d.running?'syncing…':'Sync now'}</button>
