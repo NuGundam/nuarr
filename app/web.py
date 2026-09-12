@@ -22304,11 +22304,24 @@ async function loadJobs(){
           +[...held].map(d=>`<span class="v" style="color:var(--warn)">${esc(d)}</span>`)
              .join('<span class="dim">, </span>')
           +`</span>`
-        : (j.io_throttled
-            ? `<span class="grp"><span class="k">viewer on</span>`
-              +`<span class="dim" title="a session is playing but its file could not be
+        // BETWEEN EPISODES, OR JUST PAUSED. The live set empties for a
+        // moment while the yield (90 s sticky) is still on, and the strip
+        // read "viewer on unknown disk" - which is not what was happening.
+        // The yielded disks are the honest answer for that gap.
+        : ((j.io_disks||[]).length
+            ? `<span class="grp"><span class="k">yielding</span>`
+              +(j.io_disks||[]).map(d=>`<span class="v" style="color:var(--warn);opacity:.75"
+                  title="a viewer was on this disk moments ago; it stays yielded for 90 s in case they are between episodes">${esc(d)}</span>`)
+                 .join('<span class="dim">, </span>')
+              +`</span>`
+            : (j.io_throttled
+                ? `<span class="grp"><span class="k">viewer on</span>`
+                  +`<span class="dim" title="a session is playing but its file could not be
 resolved to a pool disk, so the per-spindle avoidance cannot apply">unknown disk</span></span>`
-            : ''));
+                : '')))
+    + (j.buffer_hold
+        ? `<span class="grp" title="a viewer is buffering: every pool holds and every running job is frozen until they are in the clear"><span class="k" style="color:var(--bad)">⏸ buffering</span><span class="v" style="color:var(--bad)">everything held</span></span>`
+        : '');
   // show bulk-queue progress while it builds
   try{
     const e=await (await fetch('/api/jobs/enqueue/status')).json();

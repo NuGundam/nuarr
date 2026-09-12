@@ -2833,7 +2833,11 @@ def _suspend_for_viewers() -> None:
         dst = getattr(w, "dest_disk", "") or ""
         disks = {d for d in (src, dst) if d}
 
-        want_stop = bool(disks) and _viewer_starving(disks)
+        # A BUFFERING VIEWER FREEZES EVERY JOB, whichever disk it is on.
+        # The per-spindle test below is the everyday rule; this is the
+        # one for the moment it has already failed. See gate.buffer_hold.
+        buf_hold = _buffer_hold_on()
+        want_stop = buf_hold or (bool(disks) and _viewer_starving(disks))
         # NEVER hold one past the cap. A viewer stuck under the threshold for
         # minutes is a different problem, and a permanently frozen encode
         # holding a worker slot and cache space is not the answer to it.
@@ -2859,7 +2863,9 @@ def _suspend_for_viewers() -> None:
                 _SUSPENDED[jid] = now
                 _SUSPENDED_PID[jid] = proc.pid
                 w.paused_for_viewer = True
-                joblog.log("paused — a viewer on this spindle is low on buffer",
+                joblog.log("paused — a viewer is buffering; everything holds"
+                           if buf_hold else
+                           "paused — a viewer on this spindle is low on buffer",
                            "info", jid)
             except Exception:                            # noqa: BLE001
                 _SUSPENDED.pop(jid, None)
@@ -2900,6 +2906,34 @@ def _suspend_for_viewers() -> None:
         except Exception:                                # noqa: BLE001
             pass                                         # already gone: fine
     _CAPPED.intersection_update(live_ids)
+
+
+def _buffer_hold_read() -> bool:
+    """The hold as last computed - no refresh, safe on the event loop."""
+    try:
+        from . import gate as _g
+        return bool(_g.buffer_hold()[0])
+    except Exception:                                    # noqa: BLE001
+        return False
+
+
+def _buffer_hold_on() -> bool:
+    """Is the buffering hold on - and keep its clock ticking while jobs run.
+
+    The hold's state machine only advances inside check_plex(), which the
+    dispatcher asks for while the queue has depth and the dashboard asks for
+    while someone is looking. With running jobs, an empty queue and no
+    browser open, nothing would ask - so a hold could neither begin nor end.
+    This runs on the I/O watch's thread every tick; the check is cached at
+    ~2 s and the session list behind it at 1.5 s, so it costs nothing extra.
+    """
+    try:
+        from . import gate as _g
+        if RUNNING:
+            _g._cached("plex", _g.check_plex)
+        return bool(_g.buffer_hold()[0])
+    except Exception:                                    # noqa: BLE001
+        return False
 
 
 def suspended_jobs() -> dict:
@@ -6253,6 +6287,11 @@ def live_snapshot() -> dict:
         "disk_waits": _live_disk_waits(workers),
         "io_throttled": bool(IO_THROTTLED.get("on")),
         "io_reason": IO_THROTTLED.get("reason") or "",
+        # The disks still yielded - live viewers plus the IO_HOLD_S tail
+        # after one leaves - so the strip can name a disk during the gap
+        # between episodes instead of saying "unknown disk".
+        "io_disks": sorted(_IO_SEEN),
+        "buffer_hold": _buffer_hold_read(),
         "io_low_jobs": [w.job.id for w in workers
                         if getattr(w, "io_low", False)],
         "plex_disks": sorted(_plex_disks_safe()),
@@ -6373,6 +6412,11 @@ def snapshot(recent_limit: int = 60) -> dict:
         # asked from a different panel.
         "io_throttled": bool(IO_THROTTLED.get("on")),
         "io_reason": IO_THROTTLED.get("reason") or "",
+        # The disks still yielded - live viewers plus the IO_HOLD_S tail
+        # after one leaves - so the strip can name a disk during the gap
+        # between episodes instead of saying "unknown disk".
+        "io_disks": sorted(_IO_SEEN),
+        "buffer_hold": _buffer_hold_read(),
         "io_low_jobs": [w.job.id for w in RUNNING.values()
                         if getattr(w, "io_low", False)],
         "plex_disks": sorted(_plex_disks_safe()),

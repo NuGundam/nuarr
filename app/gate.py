@@ -78,6 +78,7 @@ _LAST_BUSY: dict[str, float] = {}
 # know the codebase.
 LABELS = {
     "manual": "Manual",
+    "buffering": "Viewer buffering",
     "plex": "Plex",
     "cache": "Cache",
     "arrs": "Sonarr / Radarr",
@@ -2252,6 +2253,11 @@ def check_plex() -> Reason:
         (active if st in ("playing", "buffering") else paused_sessions).append(s)
     paused = len(paused_sessions)
     buffering = [s for s in active if str(s.get("state") or "").lower() == "buffering"]
+    try:
+        from . import workers as _wk0
+        _buffer_note(active, buffering, float(_wk0.get().viewer_pause_lead_s))
+    except Exception:                                    # noqa: BLE001
+        pass
 
     if get_toggle("gate.plex_transcodes_only"):
         busy = [s for s in active
@@ -3344,6 +3350,94 @@ def check_drivepool() -> Reason:
                   active=True)
 
 
+# ---------------------------------------------------- a viewer buffering --
+#
+# THE PER-DISK YIELD IS FOR KEEPING A VIEWER OUT OF TROUBLE. THIS IS FOR WHEN
+# THEY ARE ALREADY IN IT. Once a player says "buffering" the question of
+# which spindle they are on is no longer the interesting one: whatever nuarr
+# is doing - reading two other disks at 150 MB/s, encoding on the card,
+# writing the pool - is load on the same box, and the only safe answer is
+# all of it, now. So every pool holds and every running job is frozen, for
+# a minimum time after the LAST stall, and then until the viewer is back
+# over their floor and has stayed there. Sticky in both directions on
+# purpose: a stall that clears in two seconds still buys the viewer a full
+# hold, and a buffer that pops over the line for one poll does not release.
+BUFFER_SETTLE_S = 20.0
+_BUF: dict = {"since": 0.0, "last": 0.0, "ok_since": 0.0, "who": ""}
+
+
+def _buffer_note(active: list, buffering: list, base: float) -> None:
+    """Advance the buffering hold's state machine. Called by check_plex."""
+    hold_s = _tune("buffer_hold_s")
+    now = time.time()
+    if hold_s <= 0:
+        if _BUF["since"]:
+            _BUF.update(since=0.0, last=0.0, ok_since=0.0, who="")
+        return
+    if buffering:
+        who = ", ".join(sorted({str(s.get("user") or s.get("username")
+                                    or "a viewer") for s in buffering}))
+        if not _BUF["since"]:
+            joblog.log(f"{who} is buffering - every pool holds and every "
+                       f"running job is frozen until they are in the clear",
+                       "warn")
+            _BUF["since"] = now
+        _BUF.update(last=now, ok_since=0.0, who=who)
+        return
+    if not _BUF["since"]:
+        return
+    # Nobody is buffering this instant. Released when the minimum has been
+    # served since the LAST stall and every measured viewer is back over
+    # their floor and has stayed there - or when nobody is watching at all.
+    clear = True
+    for s in active:
+        try:
+            lead = float(s.get("lead_s"))
+        except (TypeError, ValueError):
+            continue                       # unmeasured is not "in trouble"
+        floor = session_floor(s, base)
+        if floor > 0 and lead < floor:
+            clear = False
+            break
+    if not clear:
+        _BUF["ok_since"] = 0.0
+    elif not _BUF["ok_since"]:
+        _BUF["ok_since"] = now
+    served = now - _BUF["last"] >= hold_s
+    settled = bool(_BUF["ok_since"]) and now - _BUF["ok_since"] >= BUFFER_SETTLE_S
+    if (served and settled) or not active:
+        joblog.log(f"buffering hold released after {now - _BUF['since']:.0f}s - "
+                   + ("nobody is watching" if not active
+                      else f"{_BUF['who']} has buffer again"), "ok")
+        _BUF.update(since=0.0, last=0.0, ok_since=0.0, who="")
+
+
+def buffer_hold() -> tuple[bool, str, float]:
+    """(holding, who, seconds of the minimum still to serve)."""
+    if not _BUF["since"]:
+        return False, "", 0.0
+    left = max(0.0, _tune("buffer_hold_s") - (time.time() - _BUF["last"]))
+    return True, _BUF["who"], left
+
+
+def check_buffering() -> Reason:
+    on, who, left = buffer_hold()
+    if not on:
+        return Reason(False, "buffering", "no viewer is stalling")
+    settle = int(BUFFER_SETTLE_S)
+    return Reason(
+        True, "buffering",
+        f"{who} is buffering - everything is held",
+        extra=["Every pool holds and every running job is frozen, on "
+               "every disk: a stalling viewer is the one thing nuarr must "
+               "never be the cause of",
+               (f"at least {left:.0f}s more" if left > 0
+                else "minimum served; waiting for the buffer to settle")],
+        clears=(f"{int(_tune('buffer_hold_s'))}s after the last stall, once "
+                f"their buffer is back over its floor for {settle}s - or "
+                "when they stop watching"))
+
+
 def check_manual() -> Reason:
     if get_toggle("gate.manual_pause"):
         return Reason(True, "manual", "Paused from the dashboard",
@@ -3479,6 +3573,9 @@ async def status() -> GateStatus:
     # see - and it steers around the busy disks instead of holding everything.
     reasons = [
         check_manual(),
+        # A stalling viewer outranks everything below it, and holds every
+        # pool - the one reason here with no scope.
+        check_buffering(),
         disks, cache,
         # DrivePool beside the disks row: the disks row measures the load a
         # balance causes; this one names the balance and says what waits.

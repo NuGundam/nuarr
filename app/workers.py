@@ -113,6 +113,13 @@ LIMITS = {
     # period the queue restarts the instant someone pauses or an episode ends,
     # so a viewer flicking between episodes gets a GPU-loaded server every time.
     "hold_grace_s": (0, 1800, 120),
+    # A VIEWER WHO IS BUFFERING STOPS EVERYTHING. Not one pool, not one
+    # spindle: every running job is frozen and no pool may start work,
+    # for at least this long after the last stall and until the viewer's
+    # buffer is back over its floor and has stayed there. The per-disk
+    # yield is the everyday rule; this is the one for the moment it has
+    # already failed. 0 turns it off.
+    "buffer_hold_s": (0, 600, 60),
     # PERCENTAGE POINTS a throttled Plex transcode must already be ahead of the
     # viewer before nuarr stops holding the queue for it. Plex transcodes ahead
     # and then parks with the encoder idle; that idle time is free GPU, but only
@@ -281,6 +288,7 @@ LABELS = {
     "control_poll_s": "Check for restart or shutdown every (seconds)",
     "disk_wait_pct": "Wait before a second job on the same disk (percent done)",
     "hold_grace_s": "Keep waiting after Plex stops (seconds)",
+    "buffer_hold_s": "Stop everything when a viewer buffers (seconds)",
     "throttle_lead_pct": "How far ahead a paused Plex transcode must be (percent)",
     "gate_recheck_s": "Re-check while work is held (seconds)",
     "gate_cache_s": "Reuse the last check for (seconds)",
@@ -352,6 +360,12 @@ HINTS = {
     "hold_grace_s": "How long Nuarr keeps waiting after the last Plex stream "
                     "ends, in case someone is between episodes. 0 resumes "
                     "immediately.",
+    "buffer_hold_s": "When any viewer's player reports buffering, every "
+                     "running job is frozen and no pool starts anything - "
+                     "on every disk, not just theirs - for at least this "
+                     "long after the last stall, and until their buffer is "
+                     "back over its floor and has stayed there for 20 s. "
+                     "0 turns it off and leaves only the per-disk yield.",
     "throttle_lead_pct": "How far ahead of the viewer a paused Plex conversion "
                          "must be before Nuarr stops waiting for it. Plex "
                          "buffers ahead and then parks its encoder, which "
@@ -427,6 +441,7 @@ POOL_OF = {"encode_workers": "encode", "passthrough_workers": "passthrough",
 # Which tab each setting belongs to in the UI.
 TIMING_KEYS = ("hold_minutes", "scan_every_min", "ffmpeg_check_h",
                "control_poll_s", "disk_wait_pct", "hold_grace_s",
+               "buffer_hold_s",
                "throttle_lead_pct",
                "gate_recheck_s", "gate_cache_s",
                "disk_busy_pct", "viewer_share_pct", "viewer_pause_lead_s",
@@ -453,6 +468,7 @@ class WorkerConfig:
     control_poll_s: int
     disk_wait_pct: int
     hold_grace_s: int
+    buffer_hold_s: int
     throttle_lead_pct: int
     gate_recheck_s: int
     gate_cache_s: int
