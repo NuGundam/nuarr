@@ -188,7 +188,10 @@ def candidates(limit: int = 100000) -> list[dict]:
     return out
 
 
-def _events(path: str, track_id: int, on_pid=None) -> int:
+_PROG_RE = re.compile(r"(?:#GUI#progress\s+|Progress:\s*)(\d{1,3})\s*%")
+
+
+def _events(path: str, track_id: int, on_pid=None, on_pct=None) -> int:
     """How many subtitle events this track actually carries.
 
     EXTRACTED AND COUNTED, NOT ESTIMATED. Two tracks with the same language
@@ -208,19 +211,38 @@ def _events(path: str, track_id: int, on_pid=None) -> int:
         exe = os.path.join(os.path.dirname(_mkvmerge()), "mkvextract.exe")
         if not os.path.exists(exe):
             exe = "mkvextract"
-        p = subprocess.Popen([exe, path, "tracks", f"{track_id}:{out}"],
-                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        # AND ITS PROGRESS, LINE BY LINE. --gui-mode makes mkvextract print
+        # "#GUI#progress 37%" on a line of its own as it walks the container,
+        # exactly as mkvmerge does for the rewrite that follows. Without it the
+        # card sat on "counting the lines in track 1 of 2" for over a minute
+        # with a bar that did not move - which, at very low I/O behind a
+        # viewer, is the slowest part of the whole job and the part most worth
+        # seeing move.
+        p = subprocess.Popen([exe, "--gui-mode", path, "tracks",
+                              f"{track_id}:{out}"],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             text=True, encoding="utf-8", errors="replace",
                              creationflags=NO_WINDOW, startupinfo=hidden_si())
         if on_pid is not None:
             try:
                 on_pid(p.pid)
             except Exception:                                    # noqa: BLE001
                 pass
+        t_end = time.time() + 600
         try:
-            p.communicate(timeout=600)
+            for line in (p.stdout or []):
+                if time.time() > t_end:
+                    raise subprocess.TimeoutExpired(exe, 600)
+                m = _PROG_RE.search(line)
+                if m and on_pct is not None:
+                    try:
+                        on_pct(float(m.group(1)))
+                    except Exception:                            # noqa: BLE001
+                        pass
+            p.wait(timeout=max(1.0, t_end - time.time()))
         except subprocess.TimeoutExpired:
             p.kill()
-            p.communicate()
+            p.wait()
             return -1
         if not os.path.exists(out):
             return -1

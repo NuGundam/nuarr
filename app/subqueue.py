@@ -633,7 +633,18 @@ def _rewrite(fid: int, path: str, takes: list, drops: list, report, work,
                     stage(f"counting the lines in track {i + 1} of {len(ords)}")
                 except Exception:                                # noqa: BLE001
                     pass
-            counted.append((subdupe._events(path, t["id"], on_pid=on_pid), t))
+            # THE WEIGH IS MOST OF THE JOB, SO THE BAR FOLLOWS IT. Each track
+            # is an equal share of the bar, and mkvextract's own percentage
+            # moves within that share - the rewrite that follows is short by
+            # comparison and reports through the same hook after.
+            def _pct(p, _i=i, _n=len(ords)):
+                if report is not None:
+                    try:
+                        report((_i + max(0.0, min(100.0, p)) / 100.0) / _n * 100.0)
+                    except Exception:                            # noqa: BLE001
+                        pass
+            counted.append((subdupe._events(path, t["id"], on_pid=on_pid,
+                                            on_pct=_pct), t))
         counted.sort(key=lambda ct: (-(ct[0] if ct[0] >= 0 else -1),
                                      ct[1]["ord"]))
         for n, t in counted[1:]:

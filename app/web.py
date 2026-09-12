@@ -21085,8 +21085,9 @@ function ioCell(w){
       ? `<span class="pill p-warn iotier" title="a viewer is playing from ${
            esc(onWatched?w.disk:w.dest_disk)} — this job ${
            onWatched?'reads from':'writes to'} that disk, so it runs at Very Low
-I/O priority and the viewer's reads overtake it">very low I/O · viewer on ${
-           esc(onWatched?w.disk:w.dest_disk)}</span>`
+I/O priority and the viewer's reads overtake it">very low I/O · viewer on <span style="color:${
+           diskColor(onWatched?w.disk:w.dest_disk)}">${
+           esc(onWatched?w.disk:w.dest_disk)}</span></span>`
       : `<span class="pill p-warn iotier"
            title="${esc(_ioReason||'lowered disk priority')}">low I/O</span>`);
   }else{
@@ -21100,12 +21101,21 @@ I/O priority and the viewer's reads overtake it">very low I/O · viewer on ${
   // Rates whenever there are rates. The old `showIo` gate asked what STAGE the
   // job was in, which is a proxy for "does it move bytes" and a bad one - the
   // fields themselves answer that exactly.
-  if(w.read_bps)
+  // THE RATE, AND THE TOTAL BESIDE IT. A rate is a claim about now, and on a
+  // job demoted to very low I/O behind a viewer it can honestly be under the
+  // floor and show nothing - which left a subtitle card with no read figure
+  // at all for a minute and a half while it was reading the whole file. The
+  // total only climbs, so it always has something true to say.
+  if(w.read_bps || w.read_total)
     bits.push(`<span class="m-lbl">read</span> `
-             +`<span class="m-read">${mbps(w.read_bps)}</span>`);
-  if(w.write_bps)
+             +(w.read_bps?`<span class="m-read">${mbps(w.read_bps)}</span>`:'<span class="dim">—</span>')
+             +(w.read_total?` <span class="dim" title="bytes this job has read so far, across every process it has run">${bytesShort(w.read_total)} so far</span>`:''));
+  // Under a megabyte written is a log line or a header, not a write stream -
+  // "write — 0 MB so far" on a job that only reads says nothing true.
+  if(w.write_bps || (w.write_total||0) >= 1048576)
     bits.push(`<span class="m-lbl">write</span> `
-             +`<span class="m-write">${mbps(w.write_bps)}</span>`);
+             +(w.write_bps?`<span class="m-write">${mbps(w.write_bps)}</span>`:'<span class="dim">—</span>')
+             +(w.write_total?` <span class="dim" title="bytes this job has written so far, across every process it has run">${bytesShort(w.write_total)} so far</span>`:''));
   if((w.pool==='subocr' || w.sub_ocr_active) && !w.read_bps && !w.write_bps){
     // WHICH PROCESSOR, read from the job rather than assumed. This line was
     // written when Tesseract was the only engine and said "OCR is CPU work"
@@ -21870,7 +21880,7 @@ async function loadQueue(){
                                  .filter(d=>d && busyDisks.has(d)))];
       const poolFull=Object.keys(cap).filter(p=>!freeBy[p]);
       if(blocked.length)
-        stallNote=` · <span class="dim">waiting for ${esc(blocked.join(', '))} `
+        stallNote=` · <span class="dim">waiting for ${blocked.map(d=>diskTag(d)).join(', ')} `
                  +`— every queued file is on a disk already in use</span>`;
       else if(poolFull.length)
         stallNote=` · <span class="dim">all ${esc(poolFull.join(' and '))} `
@@ -22534,9 +22544,15 @@ function wkStatsHtml(w, pct, indet){
       ? ' title="estimated from bytes written — ffmpeg reports no usable output timeline for this file"'
       : ''}>${indet?'—':pct.toFixed(1)+'%'
       }${(w.by_bytes&&w.stage==='encoding')?'<span class="dim" style="font-size:10px">~</span>':''}</span>
-    <span>${w.fps?`<span class="m-fps">${w.fps}</span> <span class="m-lbl">fps</span>`:'—'}</span>
+    ${(w.kind==='subs'||w.kind==='audio'||w.kind==='decode')
+      // NO FPS AND NO SPEED, BECAUSE THERE IS NO VIDEO TIMELINE. These jobs
+      // move bytes and write headers; two dashes where a number belongs read
+      // as "something is missing", and nothing is. The bytes moved are on
+      // the row below.
+      ? ''
+      : `<span>${w.fps?`<span class="m-fps">${w.fps}</span> <span class="m-lbl">fps</span>`:'—'}</span>
     <span>${w.speed?`<span class="m-fps">${w.speed}×</span>`
-            : (w.by_bytes?'<span class="dim" title="the ×-multiplier comes from ffmpeg\'s output timeline, which is not usable on this file">n/a</span>':'—')}</span>
+            : (w.by_bytes?'<span class="dim" title="the ×-multiplier comes from ffmpeg\'s output timeline, which is not usable on this file">n/a</span>':'—')}</span>`}
     <span><span class="m-lbl">elapsed</span> <span class="m-time">${hms(w.elapsed_s)}</span></span>
     <span>${stageCell(w)}</span>`;
 }
@@ -35684,7 +35700,13 @@ function _seVal(f, by){
   return 0;
 }
 // Bytes at the scale a subtitle actually is: kilobytes, mostly.
-function bytesShort(v){
+//
+// THIS WAS CALLED bytesShort, AND SO WAS THE JOB CARD'S. Two function
+// declarations with one name in one script: the later one wins, silently, so
+// every card's "smaller / larger" figure was formatted by a kilobyte helper
+// that never took the absolute value - which is how a card came to say
+// "-830635283 B smaller". Named for what it is now.
+function bytesKB(v){
   v = v||0;
   return v >= 1048576 ? (v/1048576).toFixed(1)+' MB'
        : v >= 1024 ? Math.round(v/1024)+' KB' : v+' B';
@@ -35979,7 +36001,7 @@ function sePaint(force){
         <td class="c mono" style="color:${
             f.size===0?'var(--bad)':(f.size>0?'var(--dim)':'var(--dim)')}"
             title="${f.size===0?'There is nothing in this file. Nuarr recycles an empty sidecar on sight now, so this row is history rather than a decision waiting for you.':'how big the subtitle file is'}"
-          >${f.size===0?'empty':(f.size>0?bytesShort(f.size):'—')}</td>
+          >${f.size===0?'empty':(f.size>0?bytesKB(f.size):'—')}</td>
         <td class="r" style="padding:4px 6px;white-space:nowrap">${
           f.gone?'<span class="dim" style="font-size:10.5px">done</span>'
           :'<span class="dim" style="font-size:10.5px">on the queue</span>'}</td>

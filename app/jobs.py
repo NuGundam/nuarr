@@ -490,6 +490,13 @@ class Worker:
     _last_bytes: int = 0
     _last_bytes_at: float = 0.0
     _last_io: tuple = ()
+    _last_io_pid: int = 0
+    # BYTES MOVED BY THIS JOB SO FAR, across every process it has run. A rate
+    # is a claim about now and decays; these only climb. They are what lets a
+    # card say "read 1.4 GB so far" through a subtitle job that runs three
+    # mkvextracts and an mkvmerge in turn - each a different pid.
+    read_total: int = 0
+    write_total: int = 0
 
     def set_stage(self, name: str) -> None:
         """Record which phase this job is in. Persisted, but never on the loop.
@@ -577,10 +584,19 @@ class Worker:
             import psutil
             io = psutil.Process(pid).io_counters()
             now = time.time()
+            # A NEW PROCESS HAS NEW COUNTERS. A subtitle job runs mkvextract,
+            # then another, then mkvmerge - and differencing the second
+            # process's counters against the first's produced either a
+            # nonsense spike or a clamped zero for the first sample of each.
+            if self._last_io and self._last_io_pid != pid:
+                self._last_io = ()
+            self._last_io_pid = pid
             if self._last_io:
                 t0, r0, w0 = self._last_io
                 dt = now - t0
                 if dt >= 0.5:
+                    self.read_total += max(0, io.read_bytes - r0)
+                    self.write_total += max(0, io.write_bytes - w0)
                     ir = max(0.0, (io.read_bytes - r0) / dt)
                     iw = max(0.0, (io.write_bytes - w0) / dt)
                     # Same smoothing as before, but applied EVERY sample rather
@@ -799,6 +815,8 @@ class Worker:
             "write_bps": round(self.write_bps),
             "read_bps": round(self.read_bps),
             "io_bps": round(self.write_bps + self.read_bps),
+            "read_total": int(self.read_total),
+            "write_total": int(self.write_total),
             "commit_bytes": self.commit_bytes,
             "commit_total": self.commit_total,
             "commit_bps": round(self.commit_bps),
