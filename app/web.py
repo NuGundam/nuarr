@@ -32085,6 +32085,10 @@ async function alSet(fileId, track, selId, btn){
     return;
   }
   btn.disabled=true; sel.disabled=true;
+  // AND THE ROW ITSELF SAYS SO, when this is a User Input row: the moving bar
+  // and the dimmed cells, the same as an answer.
+  const _tr = btn.closest ? btn.closest('tr') : null;
+  if(_tr && _tr.closest('#alAskPanel')) _tr.classList.add('skwait');
   // An INDETERMINATE bar while the request is in flight. It does not claim a
   // percentage, because the page cannot see inside the request and a bar that
   // invents progress looks like evidence. The real steps are listed after,
@@ -32118,6 +32122,7 @@ async function alSet(fileId, track, selId, btn){
     }else{
       if(msg){ msg.style.color='#e2b341'; msg.textContent=r.error||'failed'; }
       btn.disabled=false; sel.disabled=false;
+      if(_tr) _tr.classList.remove('skwait');
     }
   }catch(e){
     if(msg){ msg.style.color='#e2b341'; msg.textContent='failed'; }
@@ -32908,14 +32913,69 @@ function skGoneMany(ids, word, ok=true){
   const el=document.getElementById('skPanel'); if(!el) return;
   const rows=[...el.querySelectorAll('.sktbl tbody tr')]
     .filter(tr=>ids.some(id=>(tr.innerHTML||'').includes(`'${id}'`)));
-  rows.forEach((tr,i)=>setTimeout(()=>{
-    const cell=tr.lastElementChild;
-    if(cell) cell.innerHTML=`<span class="skword">${esc(word)}</span>`;
-    tr.classList.add('skgone'); if(!ok) tr.classList.add('skfail');
-    setTimeout(()=>tr.classList.add('skshut'), 700);
-    setTimeout(()=>{ if(tr.parentNode) tr.parentNode.removeChild(tr); }, 1000);
-  }, i*35));
-  setTimeout(()=>{ _skKey=''; loadSubKind(true); }, 1100 + rows.length*35);
+  rows.forEach((tr,i)=>setTimeout(()=>rowCollapse([tr], word, ok), i*35));
+  setTimeout(()=>{ _skKey=''; loadSubKind(true); }, 1150 + rows.length*35);
+}
+
+// THE ROW SAYS IT IS WORKING. Add the moving bar, dim the rest, and put a
+// spinner and a sentence where the buttons were. Returns what was there so a
+// failure can put it back.
+function rowWorking(tr, text){
+  if(!tr) return '';
+  const cell=tr.lastElementChild;
+  const held=cell?cell.innerHTML:'';
+  tr.classList.add('skwait');
+  if(cell) cell.innerHTML=`<span class="skworking"><span class="busy"><span class="sp"></span></span>${esc(text||'working…')}</span>`;
+  return held;
+}
+function rowRestore(tr, held, err){
+  if(!tr) return;
+  tr.classList.remove('skwait');
+  const cell=tr.lastElementChild;
+  if(cell){
+    cell.innerHTML=held||'';
+    if(err){
+      const e=document.createElement('div');
+      e.className='err'; e.style.fontSize='10.5px'; e.textContent=err;
+      cell.appendChild(e);
+    }
+  }
+}
+// THE ROW LEAVING, IN THREE BEATS - see the .skgone / .skcol notes in the
+// stylesheet. `rows` is the row and, if open, its detail row; they go together.
+function rowCollapse(rows, word, ok=true, after=null){
+  rows=(rows||[]).filter(Boolean);
+  if(!rows.length){ if(after) after(); return; }
+  const main=rows[0];
+  const cell=main.lastElementChild;
+  main.classList.remove('skwait');
+  if(cell) cell.innerHTML=`<span class="skword"><span class="sktick"></span>${esc(word)}</span>`;
+  rows.forEach(tr=>{ tr.classList.add('skgone'); if(!ok) tr.classList.add('skfail'); });
+  // Beat two: wrap and collapse. The wrapper takes the cell's measured height
+  // first, so the transition has a number to move from.
+  setTimeout(()=>{
+    rows.forEach(tr=>{
+      for(const td of tr.children){
+        const h=td.getBoundingClientRect().height;
+        const w=document.createElement('div');
+        w.className='skcol';
+        w.style.maxHeight=Math.max(1,Math.ceil(h))+'px';
+        while(td.firstChild) w.appendChild(td.firstChild);
+        td.appendChild(w);
+        td.style.paddingTop='0'; td.style.paddingBottom='0';
+        td.style.transition='padding .32s ease';
+      }
+    });
+    // next frame, so the max-height above has been laid out before it moves
+    requestAnimationFrame(()=>requestAnimationFrame(()=>{
+      rows.forEach(tr=>tr.classList.add('skshut'));
+    }));
+  }, 650);
+  // Beat three: gone.
+  setTimeout(()=>{
+    rows.forEach(tr=>{ if(tr.parentNode) tr.parentNode.removeChild(tr); });
+    if(after) after();
+  }, 1100);
 }
 
 function skGone(el, word, ok=true, rowId=''){
@@ -32926,15 +32986,8 @@ function skGone(el, word, ok=true, rowId=''){
   const det = tr.nextElementSibling &&
               String(tr.nextElementSibling.id||'').startsWith('skdet-')
               ? tr.nextElementSibling : null;
-  const cell = tr.lastElementChild;
-  if(cell) cell.innerHTML = `<span class="skword">${esc(word)}</span>`;
-  [tr, det].forEach(x=>{ if(x){ x.classList.add('skgone'); if(!ok) x.classList.add('skfail'); } });
-  setTimeout(()=>{ [tr, det].forEach(x=>{ if(x) x.classList.add('skshut'); }); }, 800);
-  setTimeout(()=>{
-    [tr, det].forEach(x=>{ if(x && x.parentNode) x.parentNode.removeChild(x); });
-    // The row is gone from the page; catch the page up with the server.
-    _skKey=''; loadSubKind(true);
-  }, 1120);
+  // The row is gone from the page; catch the page up with the server.
+  rowCollapse([tr, det], word, ok, ()=>{ _skKey=''; loadSubKind(true); });
 }
 
 async function skAct(id, btn){
@@ -35143,29 +35196,35 @@ function audAskPaint(force){
 // gap, and only then is the page reloaded, by which time the server agrees.
 // Without this an answer was recorded and the row simply sat there until a
 // poll happened to get past the scroll and focus guards.
+function audRowEls(rowId){
+  const el=document.getElementById('alAskPanel'); if(!el) return [];
+  const main=[...el.querySelectorAll('.sktbl tbody tr')].find(tr=>!tr.id && (tr.innerHTML||'').includes(`'${rowId}'`));
+  const det=document.getElementById('auddet-'+rowId);
+  return [main, det].filter(Boolean);
+}
 function audGone(rowId, word, ok=true){
-  const el=document.getElementById('alAskPanel'); if(!el) return;
-  const rows=[...el.querySelectorAll('.sktbl tbody tr')]
-    .filter(tr=>(tr.innerHTML||'').includes(`'${rowId}'`) || tr.id==='auddet-'+rowId);
-  rows.forEach(tr=>{
-    const cell=tr.lastElementChild;
-    if(cell && !tr.id.startsWith('auddet-')) cell.innerHTML=`<span class="skword">${esc(word)}</span>`;
-    tr.classList.add('skgone'); if(!ok) tr.classList.add('skfail');
-    setTimeout(()=>tr.classList.add('skshut'), 700);
-    setTimeout(()=>{ if(tr.parentNode) tr.parentNode.removeChild(tr); }, 1000);
-  });
+  rowCollapse(audRowEls(rowId), word, ok);
 }
 async function audAnswer(fid, q, choice, btn, scope){
-  if(btn&&btn.tagName==='BUTTON'){ btn.disabled=true; btn.textContent='…'; }
+  // WORKING, IN THE ROW. The answer is recorded, the file re-planned and the
+  // queue topped up before this returns - about a second - and the row says
+  // so where you pressed rather than leaving a dead button.
+  const mine=audAskRows().filter(x=>x.file_id===fid && x.kind==='ask');
+  const held={};
+  mine.forEach(x=>{ const [tr]=audRowEls(x.id); if(tr) held[x.id]=rowWorking(tr,
+    choice==='leave' ? 'recording your answer…' : 'recording your answer and queueing the fix…'); });
   let r={};
   try{ r=await (await fetch(`/api/audqueue/answer?file_id=${fid}&question=${
         encodeURIComponent(q)}&choice=${encodeURIComponent(choice)}&scope=${
         scope||'both'}`, {method:'POST'})).json(); }
-  catch(e){ r={ok:false}; }
-  const rows=audAskRows().filter(x=>x.file_id===fid && x.kind==='ask');
-  const word = !r.ok ? 'failed' : r.queued ? 'on the queue' : r.settled ? 'settled' : (choice==='leave'?'left alone':'answered');
-  rows.forEach(x=>audGone(x.id, word, !!r.ok));
-  setTimeout(async ()=>{ _audKey=''; await loadAudQ(); await loadAud(true); audAskPaint(true); }, 1100);
+  catch(e){ r={ok:false, why:String(e)}; }
+  if(!r.ok){
+    mine.forEach(x=>{ const [tr]=audRowEls(x.id); rowRestore(tr, held[x.id], r.why||'could not record that'); });
+    return;
+  }
+  const word = choice==='leave' ? 'left alone' : r.queued ? 'on the queue' : r.settled ? 'settled' : 'answered';
+  mine.forEach(x=>audGone(x.id, word, true));
+  setTimeout(async ()=>{ _audKey=''; await loadAudQ(); await loadAud(true); audAskPaint(true); }, 1150);
 }
 
 async function audAnswerMany(choice, btn){
@@ -35188,12 +35247,21 @@ async function audAnswerMany(choice, btn){
     choice==='tag' ? `Yes, correct ${fmt(ids.length)}`
                    : `Yes, leave ${fmt(ids.length)}`,
     async ()=>{
+      const held={};
+      rows.forEach(x=>{ const [tr]=audRowEls(x.id); if(tr) held[x.id]=rowWorking(tr, 'recording…'); });
       const x=await (await fetch('/api/audqueue/answer/batch',
         {method:'POST', headers:{'Content-Type':'application/json'},
          body:JSON.stringify({file_ids:fids, choice:choice, question:'tag',
                               scope:'both'})})).json();
       _audSel.clear(); _audLast=null;
-      _audKey=''; await loadAudQ(); loadAud(true);
+      if(x.ok){
+        const word = choice==='leave' ? 'left alone' : (x.queued && !x.settled) ? 'on the queue'
+                   : (x.settled && !x.queued) ? 'settled' : 'answered';
+        rows.forEach((r,i)=>setTimeout(()=>audGone(r.id, word, true), i*35));
+        setTimeout(async ()=>{ _audKey=''; await loadAudQ(); await loadAud(true); audAskPaint(true); }, 1200 + rows.length*35);
+      }else{
+        rows.forEach(r=>{ const [tr]=audRowEls(r.id); rowRestore(tr, held[r.id], x.why||'failed'); });
+      }
       return x.ok ? {ok:true, why:`${fmt(x.queued||0)} queued, ${
         fmt(x.settled||0)} settled`} : x;
     });
@@ -39615,6 +39683,32 @@ html.mobile .setwrap:not(.rail) .setmain,html.mobile .setwrap:not(.rail) #worker
   animation:skwaitbar 1.1s linear infinite}
 @keyframes skwaitbar{from{background-position:-40% 100%}
                      to{background-position:140% 100%}}
+/* THE WORKING STATE, SAID IN THE ROW. The buttons you pressed are replaced by
+   a spinner and a sentence, the rest of the row goes quiet, and the bar above
+   moves - so a request that takes a second is a second of something visibly
+   happening rather than a second of wondering whether the click landed. */
+.sktbl tr.skwait > td:not(:last-child){opacity:.55;transition:opacity .2s ease}
+.skworking{display:inline-flex;gap:7px;align-items:center;font-size:10.5px;
+  color:var(--acc);white-space:nowrap}
+/* THE ROW LEAVING, IN THREE BEATS. Tint and the word (what it became) with a
+   tick that draws in; then every cell's content collapses to nothing while
+   the row fades; then it is removed. The collapse is on a wrapper around each
+   cell's content, put there at the moment of leaving, because a table row
+   cannot animate its own height and a cell with three lines in it does not
+   fold when its own line-height goes to zero. */
+.sktbl tr.skgone .skword{display:inline-flex;gap:5px;align-items:center;font-weight:600}
+.sktbl tr.skgone .skword .sktick{display:inline-block;width:12px;height:12px;
+  border-radius:50%;border:1.5px solid currentColor;position:relative;flex:none;
+  animation:sktickin .28s ease-out}
+.sktbl tr.skgone .skword .sktick::after{content:'';position:absolute;left:3px;top:1px;
+  width:3px;height:6px;border:solid currentColor;border-width:0 1.5px 1.5px 0;
+  transform:rotate(45deg)}
+.sktbl tr.skgone.skfail .skword .sktick::after{width:0;height:6px;left:5px;top:2px;
+  border-width:0 1.5px 0 0;transform:none}
+@keyframes sktickin{from{transform:scale(.4);opacity:0}to{transform:scale(1);opacity:1}}
+.skcol{overflow:hidden;transition:max-height .32s cubic-bezier(.4,0,.2,1),
+  opacity .26s ease}
+.sktbl tr.skshut > td > .skcol{max-height:0 !important;opacity:0}
 .sktbl thead tr.sksort th[onclick]{cursor:pointer;user-select:none}
 .sktbl thead tr.sksort th[onclick]:hover{color:var(--fg)}
 .sktbl th.l:first-child,.sktbl td.l:first-child{padding-left:4px;padding-right:0}
