@@ -1195,8 +1195,17 @@ def _embed_tail(file_id, path, takes, drops, cmd, tmp, report, work=None,
             return
         work.moved(int(done or 0), note="putting it back",
                    pct=(100.0 * (done or 0) / total) if total else -1.0)
+    # PACED LIKE A TRANSCODE'S COMMIT. This copy writes a whole container
+    # back onto a pool spindle and had no pace at all, so it ran at full
+    # speed onto a disk somebody was watching from.
+    try:
+        from . import jobs as _jp
+        _pace = _jp._commit_pace(work) if work is not None else None
+    except Exception:                                            # noqa: BLE001
+        _pace = None
     res = fileops.safe_replace(path, tmp,
-                               on_stage=(_stage if work is not None else None))
+                               on_stage=(_stage if work is not None else None),
+                               pace=_pace)
     # Whatever happened, the working copy on the cache is finished with.
     # safe_replace consumes it on success now; this is the belt to that
     # brace, because the failure branches always removed it and the

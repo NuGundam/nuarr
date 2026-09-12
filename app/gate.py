@@ -79,6 +79,7 @@ _LAST_BUSY: dict[str, float] = {}
 LABELS = {
     "manual": "Manual",
     "buffering": "Viewer buffering",
+    "newviewer": "New viewer",
     "plex": "Plex",
     "cache": "Cache",
     "arrs": "Sonarr / Radarr",
@@ -2256,6 +2257,8 @@ def check_plex() -> Reason:
     try:
         from . import workers as _wk0
         _buffer_note(active, buffering, float(_wk0.get().viewer_pause_lead_s))
+        _landing_note(active, active + paused_sessions,
+                      float(_wk0.get().viewer_pause_lead_s))
     except Exception:                                    # noqa: BLE001
         pass
 
@@ -3420,6 +3423,123 @@ def buffer_hold() -> tuple[bool, str, float]:
     return True, _BUF["who"], left
 
 
+# ------------------------------------------------------ a viewer landing --
+#
+# THE FIRST SECONDS OF A STREAM ARE THE ONES NUARR CANNOT SEE. A new
+# session appears with no file named yet, then a file and no disk, then a
+# disk and a buffer of nought - and through all of it the per-spindle rules
+# have nothing to hold on to, so a remux three disks away runs at full
+# tilt into the moment the player is trying to fill its buffer from
+# nothing. The same again at every episode rollover.
+#
+# So a viewer LANDING holds everything, the way a stall does, until nuarr
+# knows which disk they are on and their buffer is over its floor. Then
+# the hold lifts and the everyday rules take over: that one spindle stays
+# yielded or paused as its viewer needs, the rest of the pool carries on.
+# Capped, because a disk that cannot be resolved must not hold the queue
+# for the length of a film.
+_LAND: dict = {}          # session key -> {"since", "who", "file"}
+_LAND_SEEN: dict = {}     # session key -> file last seen on it
+_LAND_PRIMED = [False]    # the first pass after startup only records
+
+
+def _sess_key(s: dict) -> str:
+    return (str(s.get("session_key") or s.get("key") or "")
+            or f"{s.get('user')}|{s.get('file')}")
+
+
+def _landing_note(active: list, everyone: list, base: float) -> None:
+    """Advance the landing hold's state machine. Called by check_plex."""
+    hold_s = _tune("new_viewer_hold_s")
+    now = time.time()
+    if hold_s <= 0:
+        _LAND.clear()
+        _LAND_SEEN.clear()
+        _LAND_PRIMED[0] = False
+        return
+    live: dict = {}
+    playing = {_sess_key(s) for s in active}
+    for s in everyone:
+        key = _sess_key(s)
+        f = str(s.get("file") or "")
+        live[key] = f
+        prev = _LAND_SEEN.get(key)
+        # NEW: a session nuarr has not seen, or a session that moved to a
+        # different file (the next episode). Only a PLAYING one holds; a
+        # session that appears paused is not reading anything yet.
+        if (_LAND_PRIMED[0] and key in playing and key not in _LAND
+                and (prev is None or (f and prev != f))):
+            who = str(s.get("user") or s.get("username") or "a viewer")
+            _LAND[key] = {"since": now, "who": who, "file": f}
+            joblog.log(f"{who} pressed play - everything holds until nuarr "
+                       f"knows which disk they are on and their buffer is "
+                       f"over its floor", "info")
+        _LAND_SEEN[key] = f or (prev or "")
+        e = _LAND.get(key)
+        if not e:
+            continue
+        # RESOLVED? The disk is known and the buffer is measured and over
+        # its floor - or the wait has hit its cap, or they paused.
+        d = _disk_for(f) if f else None
+        try:
+            lead = float(s.get("lead_s"))
+        except (TypeError, ValueError):
+            lead = None
+        floor = session_floor(s, base) if lead is not None else 0.0
+        held = now - e["since"]
+        settled = bool(d) and lead is not None and (floor <= 0 or lead >= floor)
+        if settled or held >= hold_s or key not in playing:
+            joblog.log(
+                f"{e['who']} is on {d or 'an unknown disk'}"
+                + (f" with {lead:.0f}s buffered" if lead is not None else "")
+                + (" - the rest of the pool carries on" if settled
+                   else " - wait capped, the rest of the pool carries on"
+                   if key in playing else " - paused before it settled"),
+                "ok" if settled else "info")
+            _LAND.pop(key, None)
+    for k in [k for k in _LAND_SEEN if k not in live]:
+        _LAND_SEEN.pop(k, None)
+        _LAND.pop(k, None)
+    _LAND_PRIMED[0] = True
+
+
+def landing_hold() -> tuple[bool, str, float]:
+    """(holding, who, seconds of the cap still to run)."""
+    if not _LAND:
+        return False, "", 0.0
+    oldest = min(v["since"] for v in _LAND.values())
+    left = max(0.0, _tune("new_viewer_hold_s") - (time.time() - oldest))
+    who = ", ".join(sorted({v["who"] for v in _LAND.values()}))
+    return True, who, left
+
+
+def global_hold() -> tuple[bool, str, float]:
+    """The one question the job pump and the suspender ask: is EVERYTHING
+    held right now, and why. A stall outranks a landing."""
+    on, who, left = buffer_hold()
+    if on:
+        return True, f"{who} is buffering", left
+    on, who, left = landing_hold()
+    if on:
+        return True, f"{who} just pressed play", left
+    return False, "", 0.0
+
+
+def check_landing() -> Reason:
+    on, who, left = landing_hold()
+    if not on:
+        return Reason(False, "newviewer", "nobody has just started")
+    return Reason(
+        True, "newviewer",
+        f"{who} just pressed play - everything is held while they settle",
+        extra=["Every pool holds and every running job is frozen until "
+               "nuarr knows which disk they are reading and their buffer "
+               "is over its floor; then only that disk stays yielded",
+               f"at most {left:.0f}s more"],
+        clears="As soon as their disk is known and their buffer is over "
+               "its floor, or when the wait hits its cap")
+
+
 def check_buffering() -> Reason:
     on, who, left = buffer_hold()
     if not on:
@@ -3576,6 +3696,7 @@ async def status() -> GateStatus:
         # A stalling viewer outranks everything below it, and holds every
         # pool - the one reason here with no scope.
         check_buffering(),
+        check_landing(),
         disks, cache,
         # DrivePool beside the disks row: the disks row measures the load a
         # balance causes; this one names the balance and says what waits.

@@ -22320,7 +22320,7 @@ async function loadJobs(){
 resolved to a pool disk, so the per-spindle avoidance cannot apply">unknown disk</span></span>`
                 : '')))
     + (j.buffer_hold
-        ? `<span class="grp" title="a viewer is buffering: every pool holds and every running job is frozen until they are in the clear"><span class="k" style="color:var(--bad)">⏸ buffering</span><span class="v" style="color:var(--bad)">everything held</span></span>`
+        ? `<span class="grp" title="every pool holds and every running job is frozen until the viewer is in the clear"><span class="k" style="color:var(--bad)">⏸ ${esc(j.hold_why||'a viewer is buffering')}</span><span class="v" style="color:var(--bad)">everything held</span></span>`
         : '');
   // show bulk-queue progress while it builds
   try{

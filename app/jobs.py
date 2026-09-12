@@ -2836,7 +2836,7 @@ def _suspend_for_viewers() -> None:
         # A BUFFERING VIEWER FREEZES EVERY JOB, whichever disk it is on.
         # The per-spindle test below is the everyday rule; this is the
         # one for the moment it has already failed. See gate.buffer_hold.
-        buf_hold = _buffer_hold_on()
+        buf_hold, hold_why = _buffer_hold_on()
         want_stop = buf_hold or (bool(disks) and _viewer_starving(disks))
         # NEVER hold one past the cap. A viewer stuck under the threshold for
         # minutes is a different problem, and a permanently frozen encode
@@ -2863,7 +2863,7 @@ def _suspend_for_viewers() -> None:
                 _SUSPENDED[jid] = now
                 _SUSPENDED_PID[jid] = proc.pid
                 w.paused_for_viewer = True
-                joblog.log("paused — a viewer is buffering; everything holds"
+                joblog.log(f"paused — {hold_why}; everything holds"
                            if buf_hold else
                            "paused — a viewer on this spindle is low on buffer",
                            "info", jid)
@@ -2908,16 +2908,17 @@ def _suspend_for_viewers() -> None:
     _CAPPED.intersection_update(live_ids)
 
 
-def _buffer_hold_read() -> bool:
+def _buffer_hold_read() -> tuple[bool, str]:
     """The hold as last computed - no refresh, safe on the event loop."""
     try:
         from . import gate as _g
-        return bool(_g.buffer_hold()[0])
+        on, why, _left = _g.global_hold()
+        return bool(on), why
     except Exception:                                    # noqa: BLE001
-        return False
+        return False, ""
 
 
-def _buffer_hold_on() -> bool:
+def _buffer_hold_on() -> tuple[bool, str]:
     """Is the buffering hold on - and keep its clock ticking while jobs run.
 
     The hold's state machine only advances inside check_plex(), which the
@@ -2931,9 +2932,10 @@ def _buffer_hold_on() -> bool:
         from . import gate as _g
         if RUNNING:
             _g._cached("plex", _g.check_plex)
-        return bool(_g.buffer_hold()[0])
+        on, why, _left = _g.global_hold()
+        return bool(on), why
     except Exception:                                    # noqa: BLE001
-        return False
+        return False, ""
 
 
 def suspended_jobs() -> dict:
@@ -3699,6 +3701,17 @@ def disk_pace(w) -> float:
             if hit:
                 fv = viewer_pace(hit)
                 why_v = ("a viewer is short of buffer on " if fv < 0 else "a viewer is on ") + ", ".join(sorted(hit))
+                # THE COPY BACK FROM THE CACHE WAITS, IT DOES NOT SHARE.
+                # Slowing to a quarter is the right answer for a read on
+                # a viewer's spindle; a commit WRITING gigabytes onto the
+                # disk they are watching from, while their buffer is still
+                # short of the full-speed line, is not something to do
+                # slowly - it is something to do later. The pause is
+                # capped by fileops.PAUSE_CAP_S like every other.
+                if 0 < fv and dest and dest in hit:
+                    fv = -1.0
+                    why_v = (f"a viewer on {dest} is not yet at full-speed "
+                             f"buffer - the commit waits")
     except Exception:                                    # noqa: BLE001
         fv = 0.0
     try:
@@ -6291,7 +6304,8 @@ def live_snapshot() -> dict:
         # after one leaves - so the strip can name a disk during the gap
         # between episodes instead of saying "unknown disk".
         "io_disks": sorted(_IO_SEEN),
-        "buffer_hold": _buffer_hold_read(),
+        "buffer_hold": _buffer_hold_read()[0],
+        "hold_why": _buffer_hold_read()[1],
         "io_low_jobs": [w.job.id for w in workers
                         if getattr(w, "io_low", False)],
         "plex_disks": sorted(_plex_disks_safe()),
@@ -6416,7 +6430,8 @@ def snapshot(recent_limit: int = 60) -> dict:
         # after one leaves - so the strip can name a disk during the gap
         # between episodes instead of saying "unknown disk".
         "io_disks": sorted(_IO_SEEN),
-        "buffer_hold": _buffer_hold_read(),
+        "buffer_hold": _buffer_hold_read()[0],
+        "hold_why": _buffer_hold_read()[1],
         "io_low_jobs": [w.job.id for w in RUNNING.values()
                         if getattr(w, "io_low", False)],
         "plex_disks": sorted(_plex_disks_safe()),

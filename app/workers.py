@@ -120,6 +120,15 @@ LIMITS = {
     # yield is the everyday rule; this is the one for the moment it has
     # already failed. 0 turns it off.
     "buffer_hold_s": (0, 600, 60),
+    # A VIEWER WHO HAS JUST PRESSED PLAY STOPS EVERYTHING, BRIEFLY. Nuarr
+    # cannot know which spindle a new stream is about to read until Plex
+    # names the file, and the player has no buffer at all in its first
+    # seconds - the one moment a competing 150 MB/s read anywhere on the
+    # pool is guaranteed to be felt. So every pool holds and every running
+    # job is frozen until the disk is known and the viewer is over their
+    # floor; then the per-disk rules take over and the rest of the pool
+    # carries on. This is the most that wait may last. 0 turns it off.
+    "new_viewer_hold_s": (0, 120, 30),
     # PERCENTAGE POINTS a throttled Plex transcode must already be ahead of the
     # viewer before nuarr stops holding the queue for it. Plex transcodes ahead
     # and then parks with the encoder idle; that idle time is free GPU, but only
@@ -289,6 +298,7 @@ LABELS = {
     "disk_wait_pct": "Wait before a second job on the same disk (percent done)",
     "hold_grace_s": "Keep waiting after Plex stops (seconds)",
     "buffer_hold_s": "Stop everything when a viewer buffers (seconds)",
+    "new_viewer_hold_s": "Stop everything when a viewer starts (seconds, at most)",
     "throttle_lead_pct": "How far ahead a paused Plex transcode must be (percent)",
     "gate_recheck_s": "Re-check while work is held (seconds)",
     "gate_cache_s": "Reuse the last check for (seconds)",
@@ -366,6 +376,14 @@ HINTS = {
                      "long after the last stall, and until their buffer is "
                      "back over its floor and has stayed there for 20 s. "
                      "0 turns it off and leaves only the per-disk yield.",
+    "new_viewer_hold_s": "When someone presses play - a new stream, or the "
+                         "next episode - every running job is frozen and no "
+                         "pool starts anything until Nuarr knows which disk "
+                         "they are reading and their buffer is over its "
+                         "floor. Then only that disk stays yielded and the "
+                         "rest of the pool carries on. This is the longest "
+                         "the wait may last if the disk or the buffer cannot "
+                         "be read. 0 turns it off.",
     "throttle_lead_pct": "How far ahead of the viewer a paused Plex conversion "
                          "must be before Nuarr stops waiting for it. Plex "
                          "buffers ahead and then parks its encoder, which "
@@ -441,7 +459,7 @@ POOL_OF = {"encode_workers": "encode", "passthrough_workers": "passthrough",
 # Which tab each setting belongs to in the UI.
 TIMING_KEYS = ("hold_minutes", "scan_every_min", "ffmpeg_check_h",
                "control_poll_s", "disk_wait_pct", "hold_grace_s",
-               "buffer_hold_s",
+               "buffer_hold_s", "new_viewer_hold_s",
                "throttle_lead_pct",
                "gate_recheck_s", "gate_cache_s",
                "disk_busy_pct", "viewer_share_pct", "viewer_pause_lead_s",
@@ -469,6 +487,7 @@ class WorkerConfig:
     disk_wait_pct: int
     hold_grace_s: int
     buffer_hold_s: int
+    new_viewer_hold_s: int
     throttle_lead_pct: int
     gate_recheck_s: int
     gate_cache_s: int
