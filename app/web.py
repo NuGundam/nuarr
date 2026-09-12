@@ -33872,8 +33872,8 @@ function subsBoardHtml(){
             (subsOpen(b.key)?'▾ hide ':'▸ show ')
             + esc(b.detail_name || 'the detail')}</a>`:''}
         </div>
-        ${(b.panel&&b.detail_name&&subsOpen(b.key))
-          ? `<div id="skSlot" style="margin:7px -11px -9px"></div>` : ''}
+        ${(b.panel&&subsOpen(b.key))
+          ? `<div id="subsSlot-${b.key}" style="margin:7px -11px -9px"></div>` : ''}
       </div>`;
     }).join('')}
     </div></div>`;
@@ -34120,22 +34120,30 @@ function subsPaint(){
   const html = subsBoardHtml() + subsListHtml();
   // RESCUED BEFORE THE WIPE, AND THAT IS NOT AN OPTIONAL STEP.
   //
-  // The panel is moved into a slot inside this container, and this line
-  // replaces the container's whole contents - so a panel sitting in the slot
+  // Each panel is moved into a slot inside this container, and this line
+  // replaces the container's whole contents - so a panel sitting in a slot
   // is a panel about to be deleted, along with its table, its selection and
   // every listener on it. It looked like it worked, because the FIRST paint
   // put it there and the second one took it away, leaving an open row with
-  // nothing under it and no error anywhere. It goes home first, every time.
-  const pane=document.querySelector('.subsd[data-d="picture"]');
-  const home=document.getElementById('skHome');
-  if(pane&&home&&pane.parentNode!==home) home.appendChild(pane);
+  // nothing under it and no error anywhere. They go home first, every time.
+  const PANES={sidecar:'seHome', dupe:'sdHome', picture:'skHome'};
+  const held={};
+  for(const k in PANES){
+    const pane=document.querySelector('.subsd[data-d="'+k+'"]');
+    const home=document.getElementById(PANES[k]);
+    if(!pane) continue;
+    held[k]=pane;
+    if(home&&pane.parentNode!==home) home.appendChild(pane);
+  }
   if(html!==_subsKey){ _subsKey=html; el.innerHTML=html; }
   subsDetailPaint();
-  // AND THEN INTO ITS ROW. Opening the row should drop the panel out of the
-  // row; leaving it at the bottom of the page is what made opening the row
-  // feel like nothing had happened.
-  const slot=document.getElementById('skSlot');
-  if(slot&&pane) slot.appendChild(pane);
+  // AND THEN EACH INTO ITS OWN ROW. Opening a row should drop its panel out
+  // of that row; leaving it at the bottom of the page is what made opening
+  // one feel like nothing had happened.
+  for(const k in PANES){
+    const slot=document.getElementById('subsSlot-'+k);
+    if(slot&&held[k]) slot.appendChild(held[k]);
+  }
 }
 
 function laneLines(fl, small){

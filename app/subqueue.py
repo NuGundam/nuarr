@@ -328,7 +328,27 @@ QUEUE_DEPTH = 200
 
 
 def _to_hand_over(depth: int) -> tuple:
-    """How much room the queue has, and which rows would fill it."""
+    r"""How much room the queue has, and which rows would fill it.
+
+    SPREAD ACROSS SPINDLES, NOT TAKEN IN ORDER.
+    -------------------------------------------
+    Measured here the first time this ran for real: of 5,300 files waiting,
+    3,302 were on NU-DRIVE-1 - that is simply where the duplicate-heavy shows
+    live. Taking the oldest two hundred therefore took two hundred files from
+    NU-DRIVE-1, every one of them, and the whole queue then sat still behind
+    one viewer on that disk. Eleven other spindles had between 105 and 397
+    files of work on them and not one of those files was ever offered.
+
+    The dispatcher already refuses to put two heavy jobs on one spindle, and
+    that rule is right; it cannot help if every job it is given is on the same
+    spindle. So the hand-over deals the rows out round-robin by disk. Two
+    hundred rows then cover every disk that has work, the two workers can
+    always find a spindle nobody is reading from, and a viewer stops the files
+    on THEIR disk rather than stopping everything.
+
+    It is still oldest-first WITHIN a disk, so nothing is starved and the
+    order inside a show is preserved.
+    """
     init()
     with cursor() as cur:
         have = int(cur.execute(
@@ -338,10 +358,34 @@ def _to_hand_over(depth: int) -> tuple:
         room = max(0, int(depth) - have)
         if not room:
             return have, []
-        return have, [dict(r) for r in cur.execute(
-            "SELECT file_id, path, name, rewrite, steps, why FROM sub_queue "
-            " WHERE state=? ORDER BY priority, queued_at LIMIT ?",
-            (QUEUED, room))]
+        # Read a wider slice than needed so there is something from the
+        # smaller disks to deal out. Bounded, because this is a poll.
+        rows = [dict(r) for r in cur.execute(
+            "SELECT file_id, path, name, rewrite, steps, why, disk "
+            "  FROM sub_queue WHERE state=? "
+            " ORDER BY priority, queued_at LIMIT ?",
+            (QUEUED, min(20000, max(room * 20, 2000))))]
+    by_disk: dict = {}
+    for r in rows:
+        by_disk.setdefault(r.get("disk") or "?", []).append(r)
+    # Deal one per disk, then the next, until the room is full. Disks with
+    # more waiting are not favoured: a spindle with a hundred files is as
+    # useful to a stalled worker as one with three thousand.
+    out: list = []
+    lanes = [iter(v) for _k, v in sorted(by_disk.items())]
+    while lanes and len(out) < room:
+        alive = []
+        for it in lanes:
+            if len(out) >= room:
+                alive.append(it)
+                continue
+            try:
+                out.append(next(it))
+                alive.append(it)
+            except StopIteration:
+                pass
+        lanes = alive
+    return have, out
 
 
 def _job_plan(r: dict) -> str:
