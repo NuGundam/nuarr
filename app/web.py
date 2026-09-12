@@ -32940,7 +32940,9 @@ function skPaint(force){
       ? 'least certain first'
       : `sorted by ${esc(_skSort==='kind'?'what it carries':_skSort)}${_skDesc?', highest first':''}`}${
       _skSort!=='doubt'?` · <a href="#" onclick="_skSort='doubt';_skDesc=false;_skKey='';skPaint(true);return false">back to least certain first</a>`:''}</span>
-    ${hiddenDone?`<a href="#" onclick="skShow('done',1);return false">also show the ${fmt(hiddenDone)} already marked</a>`:''}${
+    ${hiddenDone?`<a href="#" onclick="skShow('done',1);return false"
+      title="Answered ones. Some are already done to the file; the rest are answered and waiting for the queue to reach them.">also show the ${fmt(hiddenDone)} answered${
+      (c.queued||0)?` — ${fmt(c.queued)} of them on the queue`:''}</a>`:''}${
       (_skShowDone&&c.done)?`<a href="#" onclick="skShow('done',0);return false">hide the marked ones</a>`:''}
     ${hiddenUnread?`<a href="#" onclick="skShow('unread',1);return false">also show the ${fmt(hiddenUnread)} not read yet</a>`:''}${
       (_skShowUnread&&c.unread)?`<a href="#" onclick="skShow('unread',0);return false">only the ones read</a>`:''}

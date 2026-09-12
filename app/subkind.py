@@ -224,6 +224,40 @@ def _track_rows(limit: int) -> list:
     return out
 
 
+def _queued_steps() -> dict:
+    r"""{file_id: {"retitle": {track, ...}, "mark": set()}} for live queue rows.
+
+    ONE QUERY OVER THE ROWS THAT ARE WAITING, not one per finding. The queue
+    holds a few thousand rows at most and only the ones carrying a retitle or
+    a mark matter here, so the JSON is only parsed for rows whose text
+    contains one - a string test against a blob is far cheaper than decoding
+    every instruction to find out it was about a sidecar.
+    """
+    import json as _json
+    out: dict = {}
+    try:
+        from .db import cursor
+        with cursor() as cur:
+            for r in cur.execute(
+                    "SELECT file_id, steps FROM sub_queue "
+                    " WHERE state IN ('queued','running','ask') "
+                    "   AND (steps LIKE '%\"retitle\"%' OR steps LIKE '%\"mark\"%')"):
+                try:
+                    steps = _json.loads(r["steps"] or "[]")
+                except Exception:                                # noqa: BLE001
+                    continue
+                got = out.setdefault(int(r["file_id"]), {})
+                for s in steps:
+                    d = s.get("do")
+                    if d == "retitle":
+                        got.setdefault("retitle", set()).add(int(s.get("ord") or 0))
+                    elif d == "mark":
+                        got.setdefault("mark", set())
+    except Exception:                                            # noqa: BLE001
+        pass
+    return out
+
+
 def findings(limit: int = 600, want_done: bool = True,
              want_unread: bool = True) -> dict:
     r"""Everything, least certain first, with the counts the header needs.
@@ -252,6 +286,37 @@ def findings(limit: int = 600, want_done: bool = True,
     # and the done ones last because they are answered already.
     rows.sort(key=lambda r: (bool(r["done"]), bool(r["unread"]),
                              abs(r["sure"] - mid)))
+    # A QUESTION YOU HAVE ALREADY ANSWERED IS NOT A QUESTION.
+    #
+    # This is the bug Erik found by answering three Moonrise episodes and
+    # watching them come straight back. Everything about the answer worked:
+    # the memory was written against the show and the release group, the file
+    # was re-planned, and the retitle went on the queue. What did not happen
+    # was the READING changing - and the reading is what this list is made of.
+    # The title says "English[Signs]" until the job actually rewrites it, and
+    # that job is behind five thousand others, so the row kept asking.
+    #
+    # The row is answered the moment the work is queued, so that is what it
+    # says. No new column: the queue already knows, and reading it here means
+    # the row goes back to asking by itself if the job fails and the step
+    # leaves the queue - which is exactly when it SHOULD ask again.
+    _queued = _queued_steps()
+    for r in rows:
+        if r["done"] or not r.get("action"):
+            continue
+        want = "mark" if r["source"] == PICTURE else "retitle"
+        hit = _queued.get(int(r.get("file_id") or 0)) or {}
+        ords = hit.get(want)
+        if ords is None:
+            continue
+        if want == "retitle" and ords and int(r.get("track") or -1) not in ords:
+            continue
+        r["done"] = True
+        r["done_word"] = "on the queue"
+        r["action"] = ""
+        r["action_word"] = ""
+        r["queued"] = True
+
     hs = hardsub.stats()
     sp = stt.progress()
     # COUNTED OVER ALL OF THEM, SENT AS THE FEW. The filter is applied after
@@ -274,6 +339,10 @@ def findings(limit: int = 600, want_done: bool = True,
             "band": sum(1 for r in rows if r["auto"] == "ask"
                         and not r["unread"] and not r["done"]),
             "done": sum(1 for r in rows if r["done"]),
+            # Of the answered ones, how many are answered but not yet carried
+            # out. "already marked" and "waiting for the queue to get to it"
+            # are different states and the footer should not call them one.
+            "queued": sum(1 for r in rows if r.get("queued")),
             "settled": sum(1 for r in rows if r.get("acked")),
             "actionable": sum(1 for r in rows if r["action"] and not r["done"]),
         },
