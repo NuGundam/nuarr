@@ -804,7 +804,12 @@ async def _startup() -> None:
     asyncio.create_task(commitqueue.watch())
     asyncio.create_task(system.sampler())
     # Reports only - never installs on its own. See ffmpeg_update.watch().
-    asyncio.create_task(audiolang.watch())
+    # THE LISTENER IS A JOB KIND NOW - see readers.py. audiolang.watch ran a
+    # pass of up to four hundred tracks every half hour on its own clock; the
+    # feeder below deals unheard files to the main queue instead, and the
+    # audio page's bar reads the queue. run_once stays as the button.
+    from . import readers as _readers
+    asyncio.create_task(_readers.watch())
     # Queues OCR conversions a batch at a time - see subocr.watch().
     from . import subocr as _subocr
     asyncio.create_task(_subocr.watch())
@@ -827,8 +832,11 @@ async def _startup() -> None:
     # ONE SCHEDULE FOR BOTH SUBTITLE READERS. The picture sampler and the
     # track reader answer the same question - what does this file carry - so
     # they run as one pass and show as one list. See subkind.py.
+    # AND SO ARE BOTH SUBTITLE READERS - the same feeder, kind `subread`.
+    # subkind.watch started them on the shared idle runner; the runner is not
+    # started for them any more, and their pending lists feed the queue.
     from . import subkind as _subkind
-    asyncio.create_task(_subkind.watch())
+    asyncio.create_task(_subkind.register_only())
     # ACTING ON WHAT HAS BEEN READ IS NO LONGER ITS JOB. subkind.watch_auto
     # used to mark the burned-in files and correct the titles on its own
     # schedule, which is now one more thing that decided when to rewrite a
@@ -20866,10 +20874,12 @@ function poolColor(pool){
   return pool==='background'  ? '#5ad1c4'         // teal - the quiet fixers
        : pool==='encode'      ? 'var(--acc)'      // blue - GPU work
        : pool==='subocr'      ? '#b48bf2'         // purple - CPU OCR
-       : pool==='subs'        ? '#6fb0ff'         // the Subtitles page's blue
+       : pool==='subs'        ? '#f778ba'         // pink - was the page's blue, too close to encode
+       : pool==='listen'      ? '#e5d352'         // yellow - Whisper on the card
+       : pool==='subread'     ? '#c9d1d9'         // grey - a measurement, not a change
        : pool==='handler'     ? '#d2a8ff'         // lilac - script handlers
        : pool==='passthrough' ? 'var(--ok)'       // green - stream copy
-       : pool==='audio'       ? '#c98cf0'         // the audio page's violet
+       : pool==='audio'       ? '#39d3c3'         // teal - was violet, too close to subocr
        : pool==='decode'      ? '#e8a33d'         // amber - a CPU check, not a copy
        : 'var(--ok)';
 }
@@ -24323,8 +24333,11 @@ function workerRow(k,v){
   // A typed field alongside the steppers: 1800 -> 5 is 60 clicks otherwise, and
   // the raw number is what the min/max are quoted in. The unit label sits next
   // to it so "1800" is still readable as 30 h.
+  // THE POOL'S OWN BUBBLE, in the pool's own colour, so the row on this page
+  // and the pill on the queue and the card are visibly one thing.
+  const pc = v.pool ? poolColor(v.pool) : '';
   return `<tr>
-    <td><div>${esc(v.label || k.replace(/_/g,' '))}</div>
+    <td><div>${v.pool?`<span class="pill" style="color:${pc};border-color:${pc};margin-right:7px;font-size:10.5px">${esc(v.pool)}</span>`:''}${esc(v.label || k.replace(/_/g,' '))}</div>
         <div class="dim" style="font-size:11px">${esc(v.hint)}</div></td>
     <td style="width:250px;text-align:right;white-space:nowrap">
       <button onclick="bump('${k}',${Math.max(v.min,v.value-st)})"
@@ -33055,8 +33068,21 @@ function skPaint(force){
         num(P.auto_dropped||0,'done')} dropped</span>`:''}
     </div>`;
   const key = numKey();
-  const prog = P.running ? skProgBar(P,'sampling','files')
-             : T.running ? skProgBar(T,'reading','tracks') : '';
+  // THE READERS ARE ON THE MAIN QUEUE NOW, so the strip says what is on it
+  // rather than drawing the idle runner's bar, which no longer runs.
+  const Q = d.queue || {};
+  const prog = (Q.queued||Q.running)
+    ? `<div style="display:flex;gap:10px;align-items:baseline;font-size:11px;
+            margin:3px 0 6px;flex-wrap:wrap">
+        ${Q.running?'<span class="busy" style="color:var(--acc)"><span class="sp"></span></span>':''}
+        <b style="flex:none">${Q.running?`${num(Q.running,'auto')} reading`:'nothing reading'}${
+          Q.queued?` · ${num(Q.queued,'auto')} on the queue`:''}</b>
+        ${Q.now?`<span class="dim" style="flex:1 1 auto;min-width:0;overflow:hidden;
+            text-overflow:ellipsis;white-space:nowrap" title="${esc(Q.now)}">${esc(Q.now)}</span>`:''}
+        <a href="/#transcoding" style="flex:none"
+           title="The picture sampler and the track reader run as jobs beside the transcodes now - same gate, same one-heavy-read-per-disk rule.">watch it in Processing System →</a>
+       </div>`
+    : '';
   const hist=`<div class="dim" style="font-size:11px;margin:4px 0 2px;display:flex;gap:12px;flex-wrap:wrap">
     ${S.last_run?`<span title="When the last pass finished and how long it took">last pass ${ago(S.last_run)}${
        S.last_took?` · took ${hsDur(S.last_took)}`:''}</span>`:'<span>has not run yet</span>'}

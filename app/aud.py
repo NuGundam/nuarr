@@ -473,10 +473,21 @@ def listening() -> dict:
     except Exception:                                            # noqa: BLE001
         total = 0
     whole = total + left
+    # THE LISTENER IS ON THE MAIN QUEUE NOW, so "is it moving" is read from
+    # the jobs table - how many listen jobs are queued and running, and which
+    # file the running one is on - rather than from the old pass's PROGRESS,
+    # which no longer runs.
+    try:
+        from . import readers
+        q = readers.queue_counts("listen")
+    except Exception:                                            # noqa: BLE001
+        q = {"queued": 0, "running": 0, "now": ""}
     out.update(left=left, done=total, total=whole,
                pct=round(100.0 * total / whole, 1) if whole else 0.0,
-               state=str(p.get("state") or ""),
-               current=str(p.get("current") or ""))
+               state=("listening" if q.get("running")
+                      else str(p.get("state") or "idle")),
+               current=str(q.get("now") or p.get("current") or ""),
+               queue=q)
     # WHICH TOOL, ON WHICH SILICON. The listener is Whisper's language
     # identifier through ctranslate2, on CUDA when the packages and a card are
     # there and on the CPU otherwise - and the two differ by an order of

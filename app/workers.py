@@ -55,6 +55,14 @@ LIMITS = {
     # sequential read off one pool disk. Two of these at once measured 51-68%
     # CPU on a 20-thread box - more is not a corner of the machine any more.
     "decode_workers": (0, 6, 2),
+    # Whisper. One loaded model on one card; a second job shares the same
+    # model and the same VRAM, which works but halves each. One is the honest
+    # default; two is for a box with the card to spare.
+    "listen_workers": (0, 3, 1),
+    # The picture sampler and the track reader. Each is a whole-file read off
+    # a spindle - frames from across the file, or a track out of the container
+    # - so two on different disks is what the background runner used.
+    "subread_workers": (0, 6, 2),
     # ffprobe is cheap but still a pool read each.
     "probe_workers": (0, 16, 4),
     # Health/rename checks against the arrs.
@@ -263,6 +271,8 @@ LABELS = {
     "subs_workers": "Subtitle fixes at once",
     "audio_workers": "Audio tag fixes at once",
     "decode_workers": "Decode checks at once",
+    "listen_workers": "Audio listens at once",
+    "subread_workers": "Subtitle reads (kinds) at once",
     "probe_workers": "File scans at once",
     "arr_concurrency": "Sonarr/Radarr calls at once",
     "hold_minutes": "Settle time (minutes)",
@@ -310,6 +320,15 @@ HINTS = {
                       "CPU with four threads - two at once measured 51-68% "
                       "CPU on this box - and reads sequentially off one pool "
                       "disk, never two on the same disk.",
+    "listen_workers": "How many files may be listened to at once. Each runs "
+                      "five 30-second windows per track through Whisper's "
+                      "language identifier on the graphics card. One model "
+                      "is loaded; a second job shares it and each runs at "
+                      "half speed, so one is the honest default.",
+    "subread_workers": "How many files may have their subtitles read at once "
+                       "- frames sampled for burned-in words, or a track's "
+                       "events read to judge its title. Each is a whole-file "
+                       "read off one pool disk, never two on the same disk.",
     "probe_workers": "How many files may be inspected at once. Cheap on the "
                      "processor, one disk read each.",
     "arr_concurrency": "How many questions Nuarr may ask Sonarr and Radarr at "
@@ -396,6 +415,15 @@ HINTS = {
 # it any more, and a knob that decides nothing is worse than no knob.
 HIDDEN_KEYS = ("hold_minutes", "audit_every_h")
 
+# WHICH POOL EACH KNOB WIDENS, so the settings row can wear the same coloured
+# bubble the queue and the cards use for that pool - and a knob with no pool
+# (probes, arr calls) wears none rather than a made-up one.
+POOL_OF = {"encode_workers": "encode", "passthrough_workers": "passthrough",
+           "subocr_workers": "subocr", "subocr_gpu_lanes": "subocr",
+           "subs_workers": "subs", "audio_workers": "audio",
+           "decode_workers": "decode", "listen_workers": "listen",
+           "subread_workers": "subread"}
+
 # Which tab each setting belongs to in the UI.
 TIMING_KEYS = ("hold_minutes", "scan_every_min", "ffmpeg_check_h",
                "control_poll_s", "disk_wait_pct", "hold_grace_s",
@@ -415,6 +443,8 @@ class WorkerConfig:
     subs_workers: int
     audio_workers: int
     decode_workers: int
+    listen_workers: int
+    subread_workers: int
     probe_workers: int
     arr_concurrency: int
     hold_minutes: int
@@ -446,6 +476,7 @@ class WorkerConfig:
                          else _subocr_hint() if k == "subocr_workers"
                          else HINTS[k]),
                 "label": LABELS.get(k, k.replace("_", " ")),
+                "pool": POOL_OF.get(k, ""),
                 "timing": k in TIMING_KEYS,
             }
             for k in LIMITS if k not in HIDDEN_KEYS

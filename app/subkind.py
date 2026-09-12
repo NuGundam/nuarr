@@ -258,6 +258,15 @@ def _queued_steps() -> dict:
     return out
 
 
+def queue() -> dict:
+    """How many reads are on the main queue, for the panel's strip."""
+    try:
+        from . import readers
+        return readers.queue_counts("subread")
+    except Exception:                                            # noqa: BLE001
+        return {"queued": 0, "running": 0, "now": ""}
+
+
 def findings(limit: int = 600, want_done: bool = True,
              want_unread: bool = True) -> dict:
     r"""Everything, least certain first, with the counts the header needs.
@@ -332,6 +341,7 @@ def findings(limit: int = 600, want_done: bool = True,
         "shown": len(shown), "found": len(rows),
         "filtered": {"done": not want_done, "unread": not want_unread},
         "mode": mode(), "mark_at": mark_at(), "dismiss_at": dismiss_at(),
+        "queue": queue(),
         "counts": {
             "picture": sum(1 for r in rows if r["source"] == PICTURE),
             "tracks": sum(1 for r in rows if r["source"] != PICTURE),
@@ -666,6 +676,22 @@ async def watch_auto() -> None:
         except Exception as e:                                   # noqa: BLE001
             STATE["last_error"] = f"auto: {type(e).__name__}: {e}"
         await asyncio.sleep(AUTO_TICK_S)
+
+
+async def register_only() -> None:
+    """The schedule entry, without the runner. The readers are jobs now."""
+    try:
+        from . import schedules
+        schedules.register(
+            SCHED_KEY, "What subtitles does each file carry?", "Subtitles",
+            CYCLE_S,
+            what=("Samples frames of files that report no subtitle track and "
+                  "reads the events of text tracks whose title looks wrong. "
+                  "Both run as jobs on the main queue now, dealt across the "
+                  "pool disks with everything else."))
+    except Exception:                                            # noqa: BLE001
+        pass
+    STATE["due_at"] = 0.0
 
 
 async def watch() -> None:

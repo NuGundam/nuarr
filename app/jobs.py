@@ -622,6 +622,15 @@ class Worker:
             return ("Reading picture subtitles into text. Background work — it "
                     "waits behind everything else and stays off any disk "
                     "someone is watching from.")
+        if self.pool == "listen":
+            return ("Listening to this file's audio through Whisper to learn "
+                    "what language each track is. GPU work in its own pool, "
+                    "so it neither takes an encode slot nor waits behind one.")
+        if self.pool == "subread":
+            return ("Reading what this file's subtitles actually carry \u2014 "
+                    "sampling the picture for burned-in words, or reading a "
+                    "track's events to judge its title. A measurement, not a "
+                    "change: nothing is written to the file.")
         if self.pool == "decode":
             return ("Checking the file actually decodes \u2014 the first 20 "
                     "seconds and the last 25, to nowhere. Its own pool, lowest "
@@ -740,6 +749,25 @@ class Worker:
         if kind == "audio":
             return {"tool": "mkvpropedit", "hw": "disk",
                     "why": "header write in place - nothing decoded"}
+        if kind == "listen":
+            dev = ""
+            try:
+                from . import audiolang as _al
+                dev = getattr(_al, "_MODEL_DEV", "") or ""
+            except Exception:                            # noqa: BLE001
+                pass
+            return {"tool": "Whisper",
+                    "hw": ("GPU \u00b7 CUDA" if dev == "cuda"
+                           else "CPU" if dev == "cpu" else "GPU"),
+                    "why": "the language identifier over five 30-second "
+                           "windows; the audio is decoded by ffmpeg first"}
+        if kind == "subread":
+            if "sampl" in st:
+                return {"tool": "ffmpeg + Tesseract", "hw": "CPU",
+                        "why": "frames decoded and the bright text low in the "
+                               "picture shown to the OCR"}
+            return {"tool": "mkvextract", "hw": "disk",
+                    "why": "pulling the track out to read its events"}
         if kind == "decode":
             return {"tool": "ffmpeg", "hw": "CPU \u00b7 software decode",
                     "why": "decoding both ends of the file to null - a GPU "
@@ -1103,6 +1131,10 @@ def _capacity(pool: str) -> int:
     # reasoning behind each default is on the knob itself, in workers.LIMITS.
     if pool == "decode":
         return max(0, int(getattr(w, "decode_workers", 2)))
+    if pool == "listen":
+        return max(0, int(getattr(w, "listen_workers", 1)))
+    if pool == "subread":
+        return max(0, int(getattr(w, "subread_workers", 2)))
     if pool == "audio":
         return max(0, int(getattr(w, "audio_workers", 4)))
     if pool == "subs":
@@ -1235,8 +1267,10 @@ async def enqueue(file_id: int, path: str, title: str = "",
             else "subocr" if kind == "sub_ocr"
             else "subs" if kind == "subs"
             else "audio" if kind == "audio"
-            else "decode" if kind == "decode" else "handler")
-    if kind not in ("transcode", "decode"):
+            else "decode" if kind == "decode"
+            else "listen" if kind == "listen"
+            else "subread" if kind == "subread" else "handler")
+    if kind not in ("transcode", "decode", "listen", "subread"):
         priority = min(priority, 50)
     # ...EXCEPT subtitle OCR, which is explicitly background work. The clamp
     # above exists because repairs and pool maps are quick and want to jump the
@@ -1399,7 +1433,11 @@ def _heavy(pool_name: str, plan_obj=None) -> bool:
     # decode IS heavy, and knowably so: every decode job reads 45 seconds of
     # video sequentially off one pool disk, which is the spindle profile the
     # rule exists for, and the reason Erik wanted these "on non busy disks".
-    return pool_name in ("passthrough", "subocr", "subs", "decode")
+    # subread is heavy too: the picture sampler decodes frames from across the
+    # whole file and the track reader pulls a track out of the whole container.
+    # listen is NOT: five 30-second windows is a few hundred megabytes of
+    # audio, and the cost is on the GPU rather than the spindle.
+    return pool_name in ("passthrough", "subocr", "subs", "decode", "subread")
 
 
 def _note_disk_wait(disk: str, need_pct: float, why: str = "progress") -> None:
@@ -2111,7 +2149,7 @@ async def pump() -> None:
                 # holds IT specifically.
                 if any(st.open_for(p) for p in
                        ("handler", "encode", "passthrough", "subocr",
-                        "subs", "audio", "decode")):
+                        "subs", "audio", "decode", "listen", "subread")):
                     async with _lock:
                         # HANDLERS FIRST. OCR, repairs and flag fixes must finish
                         # before a transcode touches the same library, otherwise
@@ -2136,9 +2174,11 @@ async def pump() -> None:
                         # already queued simply keeps the subtitle row waiting
                         # for the next top-up.
                         for pool in ("handler", "subs", "audio", "encode",
-                                     "passthrough", "subocr", "decode"):
+                                     "passthrough", "subocr", "decode",
+                                     "listen", "subread"):
                             if pool not in ("handler", "subs", "audio",
-                                            "subocr", "decode") and blocked:
+                                            "subocr", "decode", "listen",
+                                            "subread") and blocked:
                                 continue
                             if not st.open_for(pool):
                                 continue
@@ -3050,6 +3090,10 @@ async def _run(job: Job, pool: str) -> None:
             await _decode_job(w)
             return
 
+        if job.kind in ("listen", "subread"):
+            await _reader_job(w)
+            return
+
         if job.kind == "sub_ocr":
             data = await probe(job.path)
             if not data:
@@ -3182,6 +3226,10 @@ async def _run(job: Job, pool: str) -> None:
 
         if job.kind == "decode":
             await _decode_job(w)
+            return
+
+        if job.kind in ("listen", "subread"):
+            await _reader_job(w)
             return
 
         if job.kind == "sub_ocr":
@@ -3817,6 +3865,79 @@ async def _decode_job(w: Worker) -> None:
         # failure of the file - the row stays untested and the feeder offers
         # it again another day.
         _finish(job, "skipped", before, before, note=f"no verdict - {why}"[:300])
+
+
+async def _reader_job(w: Worker) -> None:
+    r"""One reader's measurement of one file, inside a job.
+
+    listen: every unheard track in the file through Whisper; subread: one
+    picture sample or one track read. See readers.py for why each is the unit
+    it is. The plan the feeder wrote carries what the worker needs, so nothing
+    is re-queried here; the worker reports stage and progress to its own card
+    and the reader modules keep their tables exactly as before.
+    """
+    from . import readers
+    job = w.job
+    w.set_stage("listening" if job.kind == "listen" else "reading")
+    before = os.path.getsize(job.path) if os.path.exists(job.path) else 0
+    w.src_bytes = before
+    if not getattr(w, "disk", ""):
+        try:
+            with cursor() as cur:
+                r = cur.execute("SELECT pool_disk FROM files WHERE id=?",
+                                (job.file_id,)).fetchone()
+            w.disk = (r["pool_disk"] if r else "") or ""
+        except Exception:                                # noqa: BLE001
+            w.disk = ""
+    # THE FEEDER'S PLAN, READ BACK AS IT WAS WRITTEN. _claim parses plan_json
+    # through rules.plan_from_dict for the transcode shape; these plans are a
+    # different shape, so the row is read again here rather than trusting
+    # what that parse made of it.
+    try:
+        with cursor() as cur:
+            r = cur.execute("SELECT plan_json FROM jobs WHERE job_id=?",
+                            (job.id,)).fetchone()
+        plan = json.loads((r["plan_json"] if r else "") or "{}")
+    except Exception:                                    # noqa: BLE001
+        plan = {}
+
+    def _on_stage(name, pct):
+        w.set_stage(str(name)[:60])
+        try:
+            w.progress = max(0.0, min(1.0, float(pct) / 100.0))
+        except (TypeError, ValueError):
+            pass
+
+    w.sub_steps = [a.get("what") or "" for a in (plan.get("actions") or [])]
+    w.sub_why = [a.get("why") or "" for a in (plan.get("actions") or [])]
+    w.sub_summary = plan.get("summary") or ""
+    if not os.path.exists(job.path):
+        _finish(job, "skipped", 0, 0, note="not on disk")
+        return
+    try:
+        if job.kind == "listen":
+            res = await asyncio.to_thread(
+                readers.listen_one, int(job.file_id), job.path,
+                list(plan.get("tracks") or []), bool(plan.get("jumped")),
+                _on_stage)
+        else:
+            res = await asyncio.to_thread(
+                readers.subread_one, str(plan.get("subread") or "picture"),
+                dict(plan.get("row") or {"file_id": job.file_id,
+                                         "path": job.path}), _on_stage)
+    except Exception as e:                               # noqa: BLE001
+        res = {"ok": False, "why": f"{type(e).__name__}: {e}"[:200]}
+    w.progress = 1.0
+    if res.get("ok"):
+        joblog.log(res.get("why") or "read", "ok", job.id)
+        _finish(job, "done", before, before,
+                note=(res.get("why") or "read")[:300])
+    else:
+        why = str(res.get("why") or "could not read it")
+        joblog.log(f"no reading: {why}", "warn", job.id)
+        # A READING THAT DID NOT HAPPEN IS NOT A FAULT OF THE FILE. The row
+        # stays unread and the feeder offers it again another day.
+        _finish(job, "skipped", before, before, note=f"no reading - {why}"[:300])
 
 
 async def _sub_ocr(w: Worker, probe_data: dict) -> None:
@@ -6010,13 +6131,17 @@ def live_snapshot() -> dict:
                      "subocr": _capacity("subocr"),
                      "subs": _capacity("subs"),
                      "audio": _capacity("audio"),
-                     "decode": _capacity("decode")},
+                     "decode": _capacity("decode"),
+                     "listen": _capacity("listen"),
+                     "subread": _capacity("subread")},
         "in_use": {"encode": _in_pool("encode"),
                    "passthrough": _in_pool("passthrough"),
                    "subocr": _in_pool("subocr"),
                    "subs": _in_pool("subs"),
                    "audio": _in_pool("audio"),
-                   "decode": _in_pool("decode")},
+                   "decode": _in_pool("decode"),
+                   "listen": _in_pool("listen"),
+                   "subread": _in_pool("subread")},
         "subocr_inline": sum(1 for w in workers if w.sub_ocr_active),
         # How the recently-finished jobs ended, so a ghost card can say what
         # actually happened instead of assuming success. See FATE.
@@ -6124,13 +6249,17 @@ def snapshot(recent_limit: int = 60) -> dict:
                      "subocr": _capacity("subocr"),
                      "subs": _capacity("subs"),
                      "audio": _capacity("audio"),
-                     "decode": _capacity("decode")},
+                     "decode": _capacity("decode"),
+                     "listen": _capacity("listen"),
+                     "subread": _capacity("subread")},
         "in_use": {"encode": _in_pool("encode"),
                    "passthrough": _in_pool("passthrough"),
                    "subocr": _in_pool("subocr"),
                    "subs": _in_pool("subs"),
                    "audio": _in_pool("audio"),
-                   "decode": _in_pool("decode")},
+                   "decode": _in_pool("decode"),
+                   "listen": _in_pool("listen"),
+                   "subread": _in_pool("subread")},
         # How much of the subocr figure above is running INSIDE a transcode
         # rather than as a job of its own. Same budget, different home, and the
         # header says so instead of leaving you to wonder why the count moves
