@@ -12729,6 +12729,26 @@ button[disabled]{opacity:.5;cursor:default}
    not a verdict, so amber. The state can appear in Activity now that the
    recent feed stopped excluding it. */
 .e-deferred{color:#e3b341;border-color:#4a3a12}
+/* ONE SHAPE FOR EVERY PANEL ON THE SUBTITLES PAGE.
+   Each panel had grown its own padding, its own border and its own idea of
+   where the headline number went - so the page read as six things that
+   happened to be stacked rather than one page. The rule is: a coloured edge
+   saying which system it belongs to, a title on the left, the number that
+   panel is about on the RIGHT, and the same pulse as the dashboard when that
+   number changes. */
+.subsp{border:1px solid var(--line);border-left:3px solid var(--acc);
+       border-radius:8px;padding:10px 12px;margin-bottom:8px;
+       background:var(--panel,transparent)}
+.subsp .subshd{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
+.subsp .subshd > b{flex:none}
+/* THE COUNT IS ALWAYS THE LAST THING ON THE LINE, on every panel, so the eye
+   can run straight down the right-hand edge and read the page as a column of
+   numbers. margin-left:auto rather than a fixed column because the titles are
+   different lengths and a fixed column would strand the short ones. */
+.subsp .subsn{flex:none;margin-left:auto;white-space:nowrap;
+              font-variant-numeric:tabular-nums}
+.subsp .subssub{font-size:11.5px}
+.subsp .subswhy{font-size:10.5px;color:var(--dim);margin-top:2px}
 /* Border pulse when a panel's data actually changes */
 @keyframes glow{0%{box-shadow:0 0 0 0 rgba(88,166,255,.55);border-color:var(--acc)}
                 100%{box-shadow:0 0 0 8px rgba(88,166,255,0);border-color:var(--line)}}
@@ -27153,8 +27173,9 @@ async function loadLangTab(){
   // it in a card of its own meant one more per-file list to read. What stays
   // is the part that belongs to the RULES: how many there are, when the check
   // last ran, whether it acts by itself, and the button to run it now.
-  el.innerHTML += `<div class="lkind" id="gapCard" style="padding:11px 12px;margin-top:12px">
-      <b style="color:#6fb0ff">Files built under older subtitle rules</b>
+  el.innerHTML += `<div class="subsp" id="gapCard" style="margin-top:12px">
+      <div class="subshd"><b style="color:#6fb0ff">Files built under older subtitle rules</b>
+        <span class="subsn" id="gapTotal"></span></div>
       <div class="dim" style="font-size:11px;margin-top:2px">
         Rules apply when a file is built. Files finished before a rule changed
         still follow the old rule, and nothing on screen says so. This check
@@ -28796,7 +28817,24 @@ function gapAuto(){ return !!(_gap && _gap.mode==='auto'); }
 
 function gapRowId(lib){ return 'gaprow_'+cssId(lib||'__all__'); }
 
+// THE CARD'S COUNT ON THE RIGHT, like every other panel on this page, and in
+// the same colour vocabulary: amber because these are yours to send back, or
+// green when there are none. Written into the header rather than built with
+// the body, because the body is replaced wholesale and the header is not.
+function gapTotalPaint(){
+  const el=document.getElementById('gapTotal');
+  if(!el) return;
+  const tot=(_gap&&_gap.total)!=null ? Number(_gap.total) : null;
+  if(tot===null){ el.innerHTML='<span class="dim">counting…</span>'; return; }
+  el.innerHTML = tot
+    ? `${num(tot,'you')} <span class="dim">built under older rules</span>`
+    : '<b style="color:var(--ok)">every file matches</b>';
+  try{ ifChanged('subs.gap', String(tot),
+                 document.getElementById('gapCard')); }catch(e){}
+}
+
 function gapRender(){
+  gapTotalPaint();
   const el=document.getElementById('gapBody');
   if(!el||!_gap) return;
   const d=_gap, tot=d.total;
@@ -32548,10 +32586,15 @@ function skPaint(force){
   const hiddenUnread=_skShowUnread?0:all.filter(r=>r.unread).length;
   const tested=(P.none||0)+(P.signs||0)+(P.dialogue||0)+(P.hybrid||0);
   const running=!!(P.running||T.running||S.running);
-  const head=`<b style="color:#e8a33d">Subtitle User Input</b>
-    <span class="dim" style="font-size:11px;margin-left:6px"
+  // ITS OWN COUNT, ON THE RIGHT, and it is the same number its switchboard row
+  // shows - both are "things here waiting on you", so they have to agree.
+  const _need=(c.actionable||0);
+  const head=`<div class="subshd"><b style="color:#e8a33d">Subtitle User Input</b>
+    <span class="dim subssub"
       title="Every reading nuarr is not sure enough about to act on by itself, in one place. Answering one records the correction, remembers it against the show and the release group, and puts the file on the queue.">what nuarr cannot settle on its own</span>
-    <br>
+    <span class="subsn">${_need?`${num(_need,'you')} <span class="dim">to answer</span>`
+                              :'<b style="color:var(--ok)">nothing to answer</b>'}</span>
+    </div>
     <span class="dim" style="font-size:11.5px">
       <span title="Files that report no subtitle track, sampled for words in the picture">${
         num(tested,'done')} pictures sampled · ${
@@ -32785,7 +32828,11 @@ function skPaint(force){
   // said "this one is waiting on you" at a glance, and it is the only thing
   // from "Yours to call" worth carrying over - the list, the pickers and the
   // sorting here are better than what it had.
-  const html=`<div class="lkind" style="padding:11px 12px;border-left:3px solid #e8a33d">${
+  // THE PAGE'S SHAPE, not this panel's own. Same border, same padding, same
+  // number-on-the-right as Reading, Being processed and the file list - this
+  // was the last panel here still wearing its own.
+  const html=`<div class="subsp" id="subsPanelInput"
+       style="border-left-color:#e8a33d">${
     head}${skAskHtml()}${note}${key}${band}${prog}${hist}${table}${foot}</div>`;
   scPaint('subs');
   if(!force && (askOpen('skPanel') || panelBusy('skPanel') || panelScrolled('skPanel'))) return;
@@ -32793,6 +32840,11 @@ function skPaint(force){
   // A repaint you asked for keeps your place in the box.
   const box=el.querySelector('.rowbox'), keep=box?box.scrollTop:0;
   _skKey=html; el.innerHTML=html;
+  // The dashboard's pulse, fired on the COUNT rather than on the markup - the
+  // sureness sliders, the last-read line and the elapsed seconds all move on
+  // their own and none of them is news.
+  try{ ifChanged('subs.input', `${c.actionable}/${c.band}/${c.done}`,
+                 document.getElementById('subsPanelInput')); }catch(e){}
   const nb=el.querySelector('.rowbox'); if(nb&&keep) nb.scrollTop=keep;
   clearTimeout(_skPoll);
   // THE MARKER OUTLIVES THE PASS THAT STARTED IT. mark_many() returns as
@@ -33842,12 +33894,40 @@ async function loadSubs(force){
   // being asked - so it is read every time rather than on the merge's cache.
   if(force || Date.now()-_subqAt > 4000) await loadSubQ();
   subsPaint();
+  // ONE CLOCK FOR THE WHOLE PAGE.
+  //
+  // Every panel here used to keep its own timer: the merge at five seconds,
+  // the findings at fifteen, the rules gap at its own cadence, the per-library
+  // rows whenever somebody happened to reload them. So two panels describing
+  // the same library could be seconds apart, and the moment you noticed was
+  // always the moment one of them was wrong - a count that had already changed
+  // sitting next to one that had not caught up. They all tick off this now.
+  // The requests still go out separately, because they are separate questions
+  // of separate systems; what is shared is WHEN.
+  subsBeat();
   clearTimeout(_subsPoll);
   // Five seconds is the live half - what is in flight and what failed. The
   // merge behind it is cached server-side for twenty, so this costs a dict
   // read most of the time.
   _subsPoll=setTimeout(()=>{ if(document.getElementById('subsTop')) loadSubs(); },
                        5000);
+}
+
+// The other panels' loaders, driven off the same tick. Each is guarded: a
+// panel that is shut, or whose element is not on the page, is not asked about.
+let _subsBeatAt=0;
+function subsBeat(){
+  const pane=document.getElementById('langPane');
+  if(!pane || pane.style.display==='none') return;
+  const now=Date.now();
+  // The merge polls at five seconds; these are heavier and honest at fifteen,
+  // but they land ON one of its ticks rather than on a clock of their own, so
+  // what is on screen is always one moment rather than three.
+  if(now-_subsBeatAt < 14000) return;
+  _subsBeatAt=now;
+  try{ if(subsOpen('picture')) loadSubKind(); }catch(e){}
+  try{ if(document.getElementById('gapBody')) gapLoad(); }catch(e){}
+  try{ if(document.getElementById('langBody')) langSignsLoad(); }catch(e){}
 }
 
 function subsSwitchHtml(b){
@@ -33873,12 +33953,19 @@ function subsSwitchHtml(b){
 function subsBoardHtml(){
   const B=(_subs.board||[]);
   if(!B.length) return '';
-  return `<div class="lkind" style="padding:11px 12px;margin-bottom:8px">
-    <b style="color:#6fb0ff">Every subtitle decision, and what it is set to</b>
-    <div class="dim" style="font-size:11px;margin-top:2px">Four things can be
-      wrong with a file's subtitles. This is all of them, whether nuarr is
-      allowed to act on each, and how many files are waiting on that answer.</div>
-    <div style="margin-top:8px;display:flex;flex-direction:column;gap:6px">
+  // The page's own total, on the right like every other panel: what all the
+  // decisions below add up to, so the switchboard agrees with the list under
+  // it at a glance rather than after arithmetic.
+  const tot=(_subs.total||0), you=(_subs.held||0);
+  return subsPanel({
+    id:'subsPanelBoard', accent:'#6fb0ff',
+    title:'Every subtitle decision, and what it is set to',
+    right:`${num(tot,'auto')} <span class="dim">files want something</span>${
+      you?` · ${num(you,'you')} <span class="dim">yours</span>`:''}`,
+    why:`Four things can be wrong with a file's subtitles. This is all of them,
+      whether nuarr is allowed to act on each, and how many files are waiting
+      on that answer.`,
+    body:`<div style="margin-top:8px;display:flex;flex-direction:column;gap:6px">
     ${B.map(b=>{
       const c=SUBS_C[b.key]||'#6fb0ff';
       // From /api/subs, not from _idle: the strip has to be there whether or
@@ -33921,7 +34008,7 @@ function subsBoardHtml(){
           ? `<div id="subsSlot-${b.key}" style="margin:7px -11px -9px"></div>` : ''}
       </div>`;
     }).join('')}
-    </div></div>`;
+    </div>`});
 }
 
 function subsWorkHtml(){
@@ -33984,21 +34071,19 @@ function subsListHtml(){
   // From the server, counted over every file - not over the four hundred
   // this table happens to be showing.
   const ready=(_subs.ready!==undefined)?_subs.ready:R.filter(e=>e.ready).length;
-  return `<div class="lkind capswrap" style="padding:10px 12px">
-    <div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap">
-      <b style="color:#6fb0ff">What would happen, file by file</b>
-      <span class="dim" style="font-size:11.5px">${num(total,'auto')} file${
-        total===1?'':'s'} — ${num(ready,'auto')} nuarr will get to on its own${
-        (total-ready)?`, ${num(total-ready,'you')} waiting on a switch above`
+  return subsPanel({
+    id:'subsPanelList', accent:'#6fb0ff',
+    title:'What would happen, file by file',
+    sub:`${num(ready,'auto')} nuarr will get to on its own${
+        (total-ready)?` · ${num(total-ready,'you')} waiting on a switch above`
                      :''}${
         _subs.drift?` · <span title="Rules apply when a file is built. These finished before a rule changed, so they still follow the old one — Requeue sends one back through the normal queue to be rebuilt.">${
-          num(_subs.drift,'you')} built under older rules</span>`:''}</span>
-      <span class="dim" style="font-size:10.5px;margin-left:auto">${
-        R.length<total?`showing the first ${fmt(R.length)}`:''}</span>
-    </div>
-    <div class="dim" style="font-size:10.5px;margin-top:3px">One row per file.
-      A file with three things wrong with it is one row with three chips, not
-      three rows in three panels.</div>
+          num(_subs.drift,'you')} built under older rules</span>`:''}`,
+    right:`${num(total,'auto')} <span class="dim">file${total===1?'':'s'}</span>${
+      R.length<total?` <span class="dim" style="font-size:10px">(first ${fmt(R.length)})</span>`:''}`,
+    why:`One row per file. A file with three things wrong with it is one row
+      with three chips, not three rows in three panels.`,
+    body:`
     ${(_subs.by_show&&_subs.by_show.length)?`<div style="margin-top:5px;
          display:flex;gap:5px;flex-wrap:wrap" title="Where the waiting work is concentrated. One show accounting for hundreds of files usually means one release group's habit rather than hundreds of separate problems.">${
       _subs.by_show.slice(0,12).map(x=>`<span class="capsc"
@@ -34035,7 +34120,7 @@ function subsListHtml(){
                 esc(String(a.why).slice(0,160))}</div>`:''}</div>`;
           }).join('')}</td>
       </tr>`).join('')}</tbody>
-    </table></div></div>`;
+    </table></div>`});
 }
 
 // ---- THE SCAN'S OWN PROGRESS --------------------------------------------
@@ -34043,33 +34128,45 @@ function subsListHtml(){
 // waiting" over a library that has been half read is a different sentence
 // from the same number over one that has been read through, and until this
 // bar existed there was no way to tell those apart.
+// ONE HEADER, DRAWN ONCE. Every panel below hands in a title, the number it
+// is about, and its body; nothing else decides where those go. The accent is
+// the only thing that differs, and it is the same colour vocabulary the chips
+// in the list use - so a blue edge and a blue chip mean the same system.
+function subsPanel(o){
+  return `<div class="subsp" id="${o.id||''}"
+       style="border-left-color:${o.accent||'var(--acc)'}">
+    <div class="subshd">
+      ${o.busy?'<span class="busy" style="color:var(--acc);flex:none"><span class="sp"></span></span>':''}
+      <b style="color:${o.accent||'var(--acc)'}">${esc(o.title||'')}</b>
+      ${o.sub?`<span class="dim subssub">${o.sub}</span>`:''}
+      ${o.right?`<span class="subsn">${o.right}</span>`:''}
+    </div>
+    ${o.why?`<div class="subswhy">${o.why}</div>`:''}
+    ${o.body||''}
+  </div>`;
+}
+
 function subsScanHtml(){
   const sc=_subs.scan||{};
   if(!sc.total) return '';
   const pct=sc.total?Math.max(0,Math.min(100,100*(sc.total-sc.left)/sc.total)):0;
   const done=sc.total-(sc.left||0);
-  return `<div class="lkind" style="padding:9px 12px;margin-bottom:8px">
-    <div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;
-         font-size:11.5px">
-      ${sc.running?'<span class="busy" style="color:var(--acc);flex:none"><span class="sp"></span></span>':''}
-      <b style="flex:none">Reading what every file carries</b>
-      <span style="flex:none">${num(done,'auto')} of ${num(sc.total,'auto')}
-        <span class="dim" style="font-size:10.5px">(${pct.toFixed(0)}%)</span></span>
-      ${sc.left?`<span class="dim">${num(sc.left,'auto')} left</span>`:'<b style="color:var(--ok)">all of it</b>'}
-      <span class="dim" style="flex:1 1 auto;min-width:0;overflow:hidden;
-        text-overflow:ellipsis;white-space:nowrap">${esc(sc.last||'')}</span>
-      <span style="flex:none;margin-left:auto;display:flex;gap:10px">
-        ${sc.rate?`<span class="dim" title="Measured on this pass">${
-          `<b style="color:var(--ok)">${sc.rate.toFixed(0)}</b> a second`}</span>`:''}
-        ${sc.eta?`<span title="At the rate above">${numt(hsDur(sc.eta))} left</span>`:''}
-      </span></div>
-    <div class="hsbar" style="margin-top:4px"><i style="width:${pct}%"></i></div>
-    <div class="dim" style="font-size:10.5px;margin-top:3px">What is inside
-      each file, what is sitting beside it and what is painted into its
-      picture — read once and kept, so changing a rule costs no disk at all.
-      ${sc.errors?`<b style="color:var(--warn)">${fmt(sc.errors)}</b> could not be read.`:''}
-      <a href="#" onclick="subReplan(this);return false" title="Apply the Subtitle rules to every file again now, rather than waiting for the next pass">re-apply the rules now</a></div>
-  </div>`;
+  return subsPanel({
+    id:'subsPanelScan', accent:'#6fb0ff', busy:!!sc.running,
+    title:'Reading what every file carries',
+    sub:`${num(done,'auto')} of ${num(sc.total,'auto')}
+      <span style="font-size:10.5px">(${pct.toFixed(0)}%)</span>
+      ${sc.rate?` · <b style="color:var(--ok)">${sc.rate.toFixed(0)}</b> a second`:''}
+      ${sc.eta?` · ${numt(hsDur(sc.eta))} left`:''}
+      <span style="opacity:.75">${esc((sc.last||'').slice(0,70))}</span>`,
+    right: sc.left ? `${num(sc.left,'auto')} <span class="dim">left to read</span>`
+                   : '<b style="color:var(--ok)">all of it read</b>',
+    body:`<div class="hsbar" style="margin-top:4px"><i style="width:${pct}%"></i></div>
+      <div class="subswhy">What is inside each file, what is sitting beside it
+        and what is painted into its picture — read once and kept, so changing
+        a rule costs no disk at all.
+        ${sc.errors?`<b style="color:var(--warn)">${fmt(sc.errors)}</b> could not be read.`:''}
+        <a href="#" onclick="subReplan(this);return false" title="Apply the Subtitle rules to every file again now, rather than waiting for the next pass">re-apply the rules now</a></div>`});
 }
 
 // ---- WHAT IS BEING PROCESSED -------------------------------------------
@@ -34090,18 +34187,16 @@ function subsProcHtml(){
   const waiting=(q.queued||0), asking=(q.asking||0);
   const live=(j.running||0)+(j.queued||0);
   if(!waiting && !live && !(q.failed||0) && !F.length) return '';
-  return `<div class="lkind" style="padding:10px 12px;margin-bottom:8px">
-    <div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap">
-      ${j.running?'<span class="busy" style="color:var(--acc);flex:none"><span class="sp"></span></span>':''}
-      <b style="color:#6fb0ff">Being processed</b>
-      <span class="dim" style="font-size:11.5px">${
-        j.running?`${num(j.running,'auto')} running`:'nothing running'}${
+  return subsPanel({
+    id:'subsPanelProc', accent:'#6fb0ff', busy:!!j.running,
+    title:'Being processed',
+    sub:`${j.running?`${num(j.running,'auto')} running`:'nothing running'}${
         j.queued?` · ${num(j.queued,'auto')} handed over and waiting`:''}${
-        waiting?` · ${num(waiting,'auto')} still to hand over`:''}${
-        q.failed?` · <span style="color:var(--warn)">${fmt(q.failed)} could not be done</span>`:''}</span>
-      <a href="/#transcoding" style="margin-left:auto;flex:none"
-         title="Subtitle work is queued and run beside the transcodes now — same gate, same one-heavy-job-per-disk rule, same commit path.">watch it in Processing System →</a>
-    </div>
+        q.failed?` · ${num(q.failed,'you')} could not be done`:''}
+      <a href="/#transcoding"
+         title="Subtitle work is queued and run beside the transcodes now — same gate, same one-heavy-job-per-disk rule, same commit path.">watch it in Processing System →</a>`,
+    right:`${num(waiting,'auto')} <span class="dim">still to hand over</span>`,
+    body:`
     ${j.rows&&j.rows.length?`<div style="margin-top:5px">${j.rows.slice(0,3).map(t=>{
       const c=t.disk?diskColor(t.disk):'#6fb0ff';
       const p=Math.max(0,Math.min(100,Math.round((t.progress||0)*100)));
@@ -34134,11 +34229,10 @@ function subsProcHtml(){
         <span class="dim" style="flex:none;font-size:10px">${esc((f.why||'').slice(0,64))}</span>
       </div>`).join('')}
     </div>`:''}
-    <div class="dim" style="font-size:10.5px;margin-top:4px">The reading hands
-      over what it is sure about; anything it is not sure about waits in
-      Subtitle User Input until you say. One rewrite per file — sidecars in and
-      duplicates out in the same pass.</div>
-  </div>`;
+    <div class="subswhy">The reading hands over what it is sure about;
+      anything it is not sure about waits in Subtitle User Input until you say.
+      One rewrite per file — sidecars in and duplicates out in the same
+      pass.</div>`});
 }
 
 // ---- THE ONES IT WILL NOT GUESS AT --------------------------------------
@@ -34221,7 +34315,20 @@ function subsPaint(){
   const top=document.getElementById('subsStatus');
   if(top){
     const h = subsScanHtml() + subsProcHtml();
-    if(h!==_subsTopKey){ _subsTopKey=h; top.innerHTML=h; }
+    if(h!==_subsTopKey){
+      _subsTopKey=h; top.innerHTML=h;
+      // THE DASHBOARD'S OWN PULSE, not a second one invented here. ifChanged
+      // fires it only when the value it is watching really moved, which is
+      // the whole point: a border that flashes on every poll is a border that
+      // means "the page is alive", and this one means "this number changed".
+      // The signature is the COUNT, not the html - the last-read filename and
+      // the elapsed seconds change constantly and are not news.
+      const sc=_subs.scan||{}, q=_subs.queue||{}, j=_subs.jobs||{};
+      ifChanged('subs.scan', `${sc.left}/${sc.total}`,
+                document.getElementById('subsPanelScan'));
+      ifChanged('subs.proc', `${j.running}/${j.queued}/${q.queued}/${q.failed}`,
+                document.getElementById('subsPanelProc'));
+    }
   }
   // subsAskHtml is gone: its questions live in Subtitle User Input now,
   // which is the panel that was already asking you things.
@@ -34245,6 +34352,11 @@ function subsPaint(){
   }
   if(html!==_subsKey){ _subsKey=html; el.innerHTML=html; }
   subsDetailPaint();
+  // Same rule for the two panels in this container: the count is the news.
+  ifChanged('subs.board', `${_subs.total}/${_subs.held}/${_subs.drift}`,
+            document.getElementById('subsPanelBoard'));
+  ifChanged('subs.list', `${_subs.total}/${_subs.ready}/${_subs.drift}`,
+            document.getElementById('subsPanelList'));
   // AND THEN EACH INTO ITS OWN ROW. Opening a row should drop its panel out
   // of that row; leaving it at the bottom of the page is what made opening
   // one feel like nothing had happened.
