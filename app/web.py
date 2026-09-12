@@ -5437,10 +5437,42 @@ def api_health():
                       "one that will"),
     }
 
+    # WHICH SYSTEM DOES THE WORK BEHIND THIS ROW, and how far it has got.
+    # A check that rides a queue pool wears that pool's bubble - the same
+    # one the Workers panel and the strip use - and says how many files
+    # its system has been through and how many are still to come. Rows
+    # that only count something carry neither.
+    POOL = {"integrity": "decode", "subsync": "subs", "audiotitle": "audio"}
+
+    def _progress(key) -> tuple:
+        try:
+            if key == "integrity":
+                from . import integrity as _ig2
+                d2 = _ig2.stats()
+                done = sum(int(d2.get(k) or 0) for k in
+                           ("ok", "corrupt", "unreadable", "missing"))
+                tot = _rows("SELECT COUNT(*) n FROM files WHERE state NOT IN "
+                            "('deleted','duplicate')")[0]["n"]
+                return done, max(0, int(tot) - done)
+            if key == "subsync":
+                from . import subscan as _ss2
+                c2 = _ss2.counts()
+                return int(c2.get("counted") or 0), int(c2.get("left") or 0)
+            if key == "audiotitle":
+                from . import aud as _aud2
+                l2 = _aud2.listening()
+                return int(l2.get("done") or 0), int(l2.get("left") or 0)
+        except Exception:                                # noqa: BLE001
+            pass
+        return None, None
+
     def add(key, label, goto, n, note, mode=None, running=False, warn=None,
             when=""):
         rem = REMEDY.get(key)
+        done, left = _progress(key) if key in POOL else (None, None)
         checks.append({"remedy": rem[0] if rem else "",
+                       "pool": POOL.get(key, ""),
+                       "done": done, "left": left,
                        "remedy_why": rem[1] if rem else "",
                        "key": key, "label": label, "goto": goto,
                        "n": int(n or 0), "note": note, "mode": mode,
@@ -12907,6 +12939,14 @@ button[disabled]{opacity:.5;cursor:default}
 .procpop .gputab td:last-child{padding-left:0}
 .procpop td.v{text-align:right;padding-left:16px;
   font-variant-numeric:tabular-nums;color:var(--dim)}
+/* THE DOOR, TOP RIGHT. Pinned to the panel's corner rather than appended
+   after whatever the panel happened to end with, so it sits in the same
+   place on every one of them and never scrolls out of reach. The heading
+   keeps clear of it. */
+.procpop .tmtop{position:absolute;top:8px;right:11px;font-size:10px;
+  color:#6fb0ff;text-decoration:none;opacity:.85;z-index:1}
+.procpop .tmtop:hover{opacity:1;text-decoration:underline}
+.procpop .ph:first-of-type{padding-right:96px}
 .procpop .ph{color:var(--dim);font-size:10px;text-transform:uppercase;
   letter-spacing:.4px;margin-bottom:7px;padding-bottom:6px;
   border-bottom:1px solid var(--line)}
@@ -18392,10 +18432,9 @@ let _suOpen=null, _suLast=null;
 // process table, and a glance that wants more should not have to know
 // where that page is.
 function tmLink(){
-  return `<div class="pf" style="display:flex;justify-content:flex-end">`
-       + `<a href="/settings#taskmgr" style="color:#6fb0ff;text-decoration:none"`
+  return `<a class="tmtop" href="/settings#taskmgr"`
        + ` title="charts of CPU, memory, GPU and disk over time, and every process in full"`
-       + `>open the Task manager page →</a></div>`;
+       + `>Task manager →</a>`;
 }
 // ---- the done/left chip and its panel ------------------------------------
 let _sysCounts=null;
@@ -18470,8 +18509,8 @@ function paintSu(which, s){
   const cap=k=>k.charAt(0).toUpperCase()+k.slice(1);
   const pop=document.getElementById('su'+cap(which)+'Pop');
   if(!pop || !s) return;
-  if(which==='gpu'){ setHTML(pop, gpuPanel(s)+tmLink()); return; }
-  if(which==='sys'){ setHTML(pop, sysPanel()+tmLink()); return; }
+  if(which==='gpu'){ setHTML(pop, tmLink()+gpuPanel(s)); return; }
+  if(which==='sys'){ setHTML(pop, tmLink()+sysPanel()); return; }
   const n=s.nuarr||{};
   const others=(s.others||[]).slice();
   const mb=v=>v>=1024 ? (Math.round(v/102.4)/10)+' GB' : Math.round(v)+' MB';
@@ -18539,7 +18578,7 @@ function paintSu(which, s){
   }
   if(rows) html += `<div class="ph" style="margin-top:9px">Biggest outside Nuarr</div>`
                  + `<table>${rows}</table>`;
-  setHTML(pop, html+tmLink());
+  setHTML(pop, tmLink()+html);
 }
 document.addEventListener('click', ()=>closeSu());
 
@@ -18681,8 +18720,8 @@ function paintProcs(s){
            + `<td class="v">up</td></tr>${rows}</table>`
            + `<div class="pf">Everything Nuarr has spawned, named by the work `
            + `it is doing rather than by the executable. Anything other than `
-           + `the server sitting here for more than ten minutes is a straggler.</div>`
-           + tmLink();
+           + `the server sitting here for more than ten minutes is a straggler.</div>`;
+  html = tmLink() + html;
 
   setHTML(pop, html);      // same rule as every other pill in the header
   // TALLEST SO FAR, UNTIL YOU CLOSE IT. Growing is fine - new information
@@ -27158,9 +27197,18 @@ function hlPaint(){
       <span style="width:9px;height:9px;border-radius:50%;flex:none;
         background:${c.running?'var(--acc)':(c.warn?'var(--warn)':'var(--ok)')}"></span>
       <b style="flex:none;min-width:290px">${esc(c.label)}</b>
+      <span style="flex:none;min-width:64px">${c.pool
+        ?`<span class="pill" style="color:${poolColor(c.pool)};border-color:${poolColor(c.pool)};font-size:10px"
+            title="the queue pool that does this row's work">${esc(c.pool)}</span>`:''}</span>
       <span class="${c.warn?'warn':'dim'}" style="flex:1;overflow:hidden;
         text-overflow:ellipsis;white-space:nowrap">
         ${c.running?'checking now… ':''}${esc(c.note||'')}</span>
+      <span class="mono" style="flex:none;min-width:190px;text-align:right;font-size:10.5px"
+        title="how many files this row's system has been through, and how many are still to come">${
+        c.done!=null
+          ? `<span style="color:var(--ok)">${fmt(c.done)}</span><span class="dim"> done · </span>`
+            +`<span style="color:${c.left?poolColor(c.pool):'var(--ok)'}">${fmt(c.left)}</span><span class="dim"> left</span>`
+          : ''}</span>
       <span style="flex:none;font-size:10.5px;min-width:150px;
         text-align:right;color:${hlRemedyColor(c.remedy)}" title="${esc(c.remedy_why
           ? 'What nuarr does about what this row finds. '+c.remedy_why
