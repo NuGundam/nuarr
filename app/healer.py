@@ -150,7 +150,15 @@ async def _heal_one(row: dict) -> tuple[str, str]:
         new_path, tracked = await _current_path(c, file_id)
 
         if not tracked:
-            return "healed", "the arr no longer tracks this file record"
+            # NOT HEALED - GONE. The arr has dropped the record and the path
+            # is not on disk: the release was replaced or removed, and this
+            # row is its ghost. Calling that "healed" put the row back to
+            # 'new', the scanner promoted it to eligible, the decode feeder
+            # queued it, the job skipped it as absent, the next walk marked
+            # it missing again, and round it went - once a minute, for the
+            # old SmackDown 1412 - while the audio page counted its one
+            # untagged track as "1 still blank" for the whole day.
+            return "gone", "the arr no longer tracks this file and it is not on disk"
         if new_path and os.path.normcase(new_path) != os.path.normcase(path):
             if os.path.exists(new_path):
                 with cursor() as cur:
@@ -215,7 +223,15 @@ async def sweep() -> dict:
                 outcome, detail = "still-missing", f"{type(e).__name__}: {e}"
 
             now = time.time()
-            if outcome == "healed":
+            if outcome == "gone":
+                with cursor() as cur:
+                    cur.execute("UPDATE files SET state='deleted', heal_attempts=0, "
+                                "heal_last_at=?, heal_state=NULL, state_reason=?, "
+                                "updated_at=? WHERE id=?",
+                                (now, detail, now, r["id"]))
+                healed += 1
+                sec.note(f"gone: {title} - {detail}", "info")
+            elif outcome == "healed":
                 with cursor() as cur:
                     # state may already have been set by _heal_one for a move
                     cur.execute("UPDATE files SET state=CASE WHEN state='missing' "
