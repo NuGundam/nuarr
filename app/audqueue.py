@@ -530,10 +530,76 @@ def do_one(row: dict, report=None, claim: bool = True) -> dict:
                 return {"ok": False, "did": out["did"],
                         "why": out["did"][-1]["why"]}
         out["why"] = "; ".join(_step_words(s) for s in steps)
+        # A CORRECTED TAG CHANGES WHAT THE RULES SEE, so the file goes back
+        # through them. Before this the tag was rewritten, the probe refreshed,
+        # the arrs told - and the file stayed 'done', because nothing put it
+        # back in front of the planner. Children of the Sea: the second track
+        # said eng and was jpn; corrected, the file is two Japanese tracks and
+        # no English, which the dedupe rule would fix and the fake-dual
+        # finding would replace - and neither ran. Now: every corrected file
+        # is offered to the planner, and a release that lied about being dual
+        # audio is blocklisted and asked for again when the mode is auto.
+        fixed = [d for d in out["did"] if d.get("do") == "tag" and d.get("ok")
+                 and not d.get("gone")]
+        if fixed:
+            _follow_through(fid, path, any(d.get("fake_dual") for d in fixed))
         return out
     finally:
         if mine and work is not None:
             work.close()
+
+
+def _follow_through(fid: int, path: str, fake_dual: bool) -> None:
+    """Hand a corrected file to the planner - and, for a release that lied
+    about being dual audio, to the remedy. Off this thread, on the app's
+    loop, because both are coroutines and neither may block a worker."""
+    import asyncio
+    from . import audiolang, joblog, remedy, schedules
+    auto = audiolang.mode() == "auto"
+    name = os.path.basename(path)
+
+    async def _go():
+        # A RELEASE THAT LIED IS REPLACED, NOT REPAIRED. The duplicate could
+        # be dropped, but the missing language cannot be conjured; in auto
+        # mode the release is blocklisted and the arr asked for another,
+        # which deletes this file - so there is nothing left to requeue. If
+        # the replace is refused (budget, attempts, no grab to blocklist),
+        # the file goes to the planner instead so it is at least made honest.
+        replaced = False
+        if fake_dual and auto:
+            try:
+                r = await remedy.replace(fid, "audio/fake-dual", source="audiolang",
+                                         why="the release claimed two audio "
+                                             "languages and carries one of them "
+                                             "twice", auto=True)
+                replaced = bool(r.get("ok"))
+                joblog.log(f"audio language: {name} - "
+                           + ("release blocklisted, the arr asked for another"
+                              if replaced else
+                              f"not replaced: {r.get('why', '')}"),
+                           "warn" if replaced else "info", system="audiolang")
+            except Exception as e:                           # noqa: BLE001
+                joblog.log(f"audio language: replace of {name} failed: "
+                           f"{type(e).__name__}: {e}", "warn", system="audiolang")
+        if replaced:
+            return
+        try:
+            r = await remedy.requeue(fid, "audio/mislabelled", source="audiolang",
+                                     why="a language tag was corrected; the "
+                                         "rules see a different file now",
+                                     auto=auto)
+            joblog.log(f"audio language: {name} - "
+                       + ("back on the queue" if r.get("ok") else
+                          f"not requeued: {r.get('why', '')}"),
+                       "info" if r.get("ok") else "warn", system="audiolang")
+        except Exception as e:                               # noqa: BLE001
+            joblog.log(f"audio language: requeue of {name} failed: "
+                       f"{type(e).__name__}: {e}", "warn", system="audiolang")
+
+    loop = getattr(schedules, "_LOOP", None)
+    if loop is None or loop.is_closed():
+        return
+    asyncio.run_coroutine_threadsafe(_go(), loop)
 
 
 def _fill_blank(fid: int, path: str, track: int, code: str) -> dict:

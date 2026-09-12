@@ -46,31 +46,85 @@ from .db import kv_get, kv_set
 EVERY_S = 6 * 3600
 TITLE_DEFAULT = "Ended"
 
-# THE RULES A LIBRARY CAN KEEP. Each is a collection title and a test over
-# what nuarr knows about a show: Sonarr's status, whether every regular
-# episode in the library carries English audio (nuarr's own probe of every
-# file, specials excluded), and whether anyone has watched any of it.
-RULES = {
-    "ended":             ("Ended", "Sonarr calls the show ended"),
-    "english":           ("English", "every regular episode has English audio "
-                                     "(specials do not count)"),
-    "english_ended":     ("English Ended", "English, and ended"),
-    "english_unwatched": ("English Unwatched", "English, and nothing of it "
-                                               "has been watched yet"),
-}
-RULE_ORDER = ("ended", "english", "english_ended", "english_unwatched")
+# THE RULES A LIBRARY CAN KEEP, READ OFF ITS AUDIO LANGUAGE POLICY.
+#
+# Two are always on offer: Ended (Sonarr's word) and Unwatched (nothing of
+# the show watched). The rest come from the library's own "which spoken
+# languages a file keeps" rule: every kept language that is NOT the
+# library's native one gets a collection of the shows that carry it on
+# every regular episode, plus an Ended and an Unwatched cut of that. For
+# anime the native language is Japanese, so English - the dub - is the
+# collection worth having; for a live-action or animation library English
+# IS the native language and a collection of it would be the whole shelf,
+# so none is offered. Add Spanish to a library's policy and Spanish,
+# Spanish Ended and Spanish Unwatched appear as options on the next look.
+NATIVE = {"anime": "jpn", "animation": "eng", "live": "eng"}
+
+
+def _lang_name(code: str) -> str:
+    try:
+        from . import langpolicy
+        for x in langpolicy.iso_languages():
+            if x.get("c") == code:
+                return x.get("n") or code
+    except Exception:                                        # noqa: BLE001
+        pass
+    return {"eng": "English", "jpn": "Japanese", "spa": "Spanish",
+            "fre": "French", "ger": "German", "kor": "Korean",
+            "chi": "Chinese", "ita": "Italian", "por": "Portuguese"}.get(code, code)
+
+
+def rules_available(library: str) -> list:
+    """[{key, title, what, lang}] this library may keep, in display order."""
+    out = [{"key": "ended", "title": "Ended", "what": "Sonarr calls the show ended", "lang": ""},
+           {"key": "unwatched", "title": "Unwatched",
+            "what": "nothing of the show has been watched yet", "lang": ""}]
+    try:
+        from . import langpolicy, langkey
+        pol = langpolicy.for_library(library, "audio") or {}
+        native = NATIVE.get(langpolicy.kind_for(library=library), "eng")
+        seen = set()
+        for code in (pol.get("langs") or []):
+            k = langkey.key(code)
+            if not k or k in ("un", "und") or langkey.same(code, native) or k in seen:
+                continue
+            seen.add(k)
+            name = _lang_name(code)
+            out.append({"key": f"lang:{code}", "title": name, "lang": code,
+                        "what": f"every regular episode has {name} audio "
+                                f"(specials do not count)"})
+            out.append({"key": f"lang_ended:{code}", "title": f"{name} Ended",
+                        "lang": code, "what": f"{name}, and ended"})
+            out.append({"key": f"lang_unwatched:{code}", "title": f"{name} Unwatched",
+                        "lang": code,
+                        "what": f"{name}, and nothing of it has been watched yet"})
+    except Exception:                                        # noqa: BLE001
+        pass
+    return out
+
+
+def _title_of(key: str, avail: list) -> str:
+    for r in avail:
+        if r["key"] == key:
+            return r["title"]
+    return key
 
 
 def _want(rule: str, f: dict) -> bool:
-    st, en, un = f.get("status"), bool(f.get("english")), bool(f.get("unwatched"))
+    st, un = f.get("status"), bool(f.get("unwatched"))
+    langs = set(f.get("langs") or ())
     if rule == "ended":
         return st == "ended"
-    if rule == "english":
-        return en
-    if rule == "english_ended":
-        return en and st == "ended"
-    if rule == "english_unwatched":
-        return en and un
+    if rule == "unwatched":
+        return un
+    kind, _, code = rule.partition(":")
+    has = code in langs
+    if kind == "lang":
+        return has
+    if kind == "lang_ended":
+        return has and st == "ended"
+    if kind == "lang_unwatched":
+        return has and un
     return False
 
 # The last pass, per library, for the card. In memory; kv holds the last
@@ -88,23 +142,31 @@ def enabled(library: str) -> bool:
 
 
 def rules_for(library: str) -> list:
-    """The rule keys this library keeps, in RULE_ORDER. Default: ended."""
+    """The rule keys this library keeps, in display order, limited to what
+    its policy offers. Nothing stored yet: Ended, Unwatched, and every
+    language cut the policy offers."""
+    avail = [r["key"] for r in rules_available(library)]
     raw = (kv_get(_key(library) + ".rules") or "").strip()
-    keys = [k for k in raw.split(",") if k in RULES] if raw else ["ended"]
-    return [k for k in RULE_ORDER if k in keys]
+    if not raw:
+        return avail
+    if raw == "-":
+        return []
+    keys = set(raw.split(","))
+    return [k for k in avail if k in keys]
 
 
 def set_enabled(library: str, on: bool, rules: str = "") -> None:
     kv_set(_key(library), "1" if on else "0")
     if rules is not None and rules != "":
-        keep = [k for k in rules.split(",") if k in RULES]
-        kv_set(_key(library) + ".rules", ",".join(keep))
+        avail = {r["key"] for r in rules_available(library)}
+        keep = [k for k in rules.split(",") if k in avail]
+        kv_set(_key(library) + ".rules", ",".join(keep) or "-")
 
 
 def title_for(library: str) -> str:
     """The first kept collection's title - what the health row names."""
     r = rules_for(library)
-    return RULES[r[0]][0] if r else TITLE_DEFAULT
+    return _title_of(r[0], rules_available(library)) if r else TITLE_DEFAULT
 
 
 def tv_libraries() -> list:
@@ -243,10 +305,10 @@ async def _sonarr_status() -> dict:
     return {"tvdb": by_tvdb, "path": by_path, "sid": by_sid}
 
 
-# --------------------------------------------------------- english audio ---
-def _english_tvdbs(library: str, arr: dict) -> set:
-    """The tvdb ids of every show in this library whose regular episodes ALL
-    carry English audio, from nuarr's own probe of every file.
+# ------------------------------------------------------ languages carried ---
+def _langs_by_tvdb(library: str, arr: dict, codes: list) -> dict:
+    """{tvdb id: set of codes} - the codes every regular episode of the show
+    carries, from nuarr's own probe of every file.
 
     Specials (season 0) do not count either way: an English OVA does not make
     a Japanese-only show English, and a Japanese-only extra does not take a
@@ -254,22 +316,31 @@ def _english_tvdbs(library: str, arr: dict) -> set:
     "every episode" has to mean every episode nuarr can vouch for.
     """
     from .db import cursor
-    out: set = set()
+    from . import langkey
+    out: dict = {}
+    if not codes:
+        return out
+    per: dict = {}
     with cursor() as cur:
         rows = cur.execute(
-            "SELECT arr_name, arr_parent_id, "
-            "       COUNT(*) n, "
-            "       SUM(CASE WHEN ',' || COALESCE(audio_langs,'') || ',' "
-            "                     LIKE '%,eng,%' THEN 1 ELSE 0 END) eng "
+            "SELECT arr_name, arr_parent_id, COALESCE(audio_langs,'') al "
             "  FROM files "
             " WHERE library = ? AND state NOT IN ('deleted','duplicate') "
-            "   AND COALESCE(season, 0) > 0 AND arr_parent_id IS NOT NULL "
-            " GROUP BY arr_name, arr_parent_id", (library,)).fetchall()
+            "   AND COALESCE(season, 0) > 0 AND arr_parent_id IS NOT NULL",
+            (library,)).fetchall()
     for r in rows:
-        if int(r["n"] or 0) > 0 and int(r["eng"] or 0) == int(r["n"] or 0):
-            tv = arr["sid"].get((r["arr_name"], int(r["arr_parent_id"] or 0)))
-            if tv:
-                out.add(tv)
+        sid = (r["arr_name"], int(r["arr_parent_id"] or 0))
+        have = {t.strip() for t in r["al"].split(",") if t.strip()}
+        d = per.setdefault(sid, {"n": 0, "hit": {c: 0 for c in codes}})
+        d["n"] += 1
+        for c in codes:
+            if any(langkey.same(c, t) for t in have):
+                d["hit"][c] += 1
+    for sid, d in per.items():
+        tv = arr["sid"].get(sid)
+        if not tv or d["n"] == 0:
+            continue
+        out[tv] = {c for c in codes if d["hit"][c] == d["n"]}
     return out
 
 
@@ -333,14 +404,14 @@ async def _apply(section: str, title: str, add: list, remove: list, res: dict) -
                                 f"{batch[0]['title']}: {type(e).__name__}")
 
 
-def _diff_and_members(rules: list, facts: dict, members: dict) -> tuple:
+def _diff_and_members(rules: list, titles: dict, facts: dict, members: dict) -> tuple:
     """For every rule: what to add, what to remove, and the members after.
-    facts: key -> {title, status, english, unwatched}; members: title -> set."""
+    facts: key -> {title, status, langs, unwatched}; members: title -> set."""
     adds: dict = {}
     removes: dict = {}
     after: dict = {}
     for rk in rules:
-        title = RULES[rk][0]
+        title = titles[rk]
         have = set(members.get(title) or ())
         want = {k for k, f in facts.items() if _want(rk, f)}
         adds[title] = [{"key": k, "title": facts[k]["title"]} for k in sorted(want - have)]
@@ -354,8 +425,11 @@ async def sync_library(lib, arr: dict | None = None, dry: bool = False,
                        full: bool = False) -> dict:
     """Bring one library's kept collections in line. Returns what it did."""
     rules = rules_for(lib.name)
+    avail = rules_available(lib.name)
+    codes = sorted({r["lang"] for r in avail if r["lang"]})
+    titles = {rk: _title_of(rk, avail) for rk in rules}
     res = {"library": lib.name, "rules": rules,
-           "titles": [RULES[r][0] for r in rules], "at": time.time(),
+           "titles": [titles[r] for r in rules], "at": time.time(),
            "plex_shows": 0, "counts": {}, "added": 0, "removed": 0,
            "unmatched": 0, "unmatched_titles": [], "error": "", "mode": "full"}
     if not rules:
@@ -365,7 +439,7 @@ async def sync_library(lib, arr: dict | None = None, dry: bool = False,
     now = time.time()
     if (not full and mem and mem.get("rules") == rules
             and now - float(mem.get("full_at") or 0) < FULL_EVERY_S):
-        return await _sync_changes(lib, arr, mem, res, dry)
+        return await _sync_changes(lib, arr, mem, res, dry, titles, codes)
     try:
         section = await asyncio.to_thread(_section_for, lib.path)
         if not section:
@@ -374,13 +448,13 @@ async def sync_library(lib, arr: dict | None = None, dry: bool = False,
         shows = await asyncio.to_thread(_plex_shows, section)
         if arr is None:
             arr = await _sonarr_status()
-        eng = await asyncio.to_thread(_english_tvdbs, lib.name, arr)
+        by_lang = await asyncio.to_thread(_langs_by_tvdb, lib.name, arr, codes)
     except Exception as e:                                   # noqa: BLE001
         res["error"] = f"{type(e).__name__}: {e}"
         return res
     res["plex_shows"] = len(shows)
     facts: dict = {}
-    members: dict = {RULES[r][0]: set() for r in rules}
+    members: dict = {titles[r]: set() for r in rules}
     for s in shows:
         st = _status_of(s, arr)
         if st is None:
@@ -389,12 +463,12 @@ async def sync_library(lib, arr: dict | None = None, dry: bool = False,
                 res["unmatched_titles"].append(s["title"])
             continue                     # Sonarr does not know it: leave it be
         facts[s["key"]] = {"title": s["title"], "tvdb": s["tvdb"], "status": st,
-                           "english": s["tvdb"] in eng,
+                           "langs": sorted(by_lang.get(s["tvdb"]) or ()),
                            "unwatched": bool(s["unwatched"])}
         for t in members:
             if t in s["in"]:
                 members[t].add(s["key"])
-    adds, removes, after = _diff_and_members(rules, facts, members)
+    adds, removes, after = _diff_and_members(rules, titles, facts, members)
     res["counts"] = {t: len(v) for t, v in after.items()}
     if dry:
         res.update(added=sum(len(v) for v in adds.values()),
@@ -418,7 +492,8 @@ async def sync_library(lib, arr: dict | None = None, dry: bool = False,
 
 
 async def _sync_changes(lib, arr: dict | None, mem: dict, res: dict,
-                        dry: bool = False) -> dict:
+                        dry: bool = False, titles: dict | None = None,
+                        codes: list | None = None) -> dict:
     """Only what can have changed since the last pass."""
     res["mode"] = "changes"
     rules = res["rules"]
@@ -426,7 +501,7 @@ async def _sync_changes(lib, arr: dict | None, mem: dict, res: dict,
     try:
         if arr is None:
             arr = await _sonarr_status()
-        eng = await asyncio.to_thread(_english_tvdbs, lib.name, arr)
+        by_lang = await asyncio.to_thread(_langs_by_tvdb, lib.name, arr, codes or [])
         since = float(mem.get("changes_at") or mem.get("full_at") or 0) - 3600
         new_shows = await asyncio.to_thread(
             _plex_shows, section, float(mem.get("full_at") or 0) - 3600)
@@ -440,7 +515,7 @@ async def _sync_changes(lib, arr: dict | None, mem: dict, res: dict,
         tv = f.get("tvdb") or ""
         if tv and tv in arr["tvdb"]:
             f["status"] = arr["tvdb"][tv]
-        f["english"] = bool(tv) and tv in eng
+        f["langs"] = sorted(by_lang.get(tv) or ()) if tv else []
     # 2. somebody watched something
     for v in viewed:
         if v["key"] in facts:
@@ -457,7 +532,7 @@ async def _sync_changes(lib, arr: dict | None, mem: dict, res: dict,
                 res["unmatched_titles"].append(s["title"])
             continue
         facts[s["key"]] = {"title": s["title"], "tvdb": s["tvdb"], "status": st,
-                           "english": s["tvdb"] in eng,
+                           "langs": sorted(by_lang.get(s["tvdb"]) or ()),
                            "unwatched": bool(s["unwatched"])}
     for t in (mem.get("unmatched_titles") or []):
         if t not in res["unmatched_titles"] and len(res["unmatched_titles"]) < 100:
@@ -466,15 +541,15 @@ async def _sync_changes(lib, arr: dict | None, mem: dict, res: dict,
     res["plex_shows"] = int(mem.get("plex_shows") or 0) + seen_new
     members = {t: set(v) for t, v in (mem.get("members") or {}).items()}
     for rk in rules:
-        members.setdefault(RULES[rk][0], set())
-    adds, removes, after = _diff_and_members(rules, facts, members)
+        members.setdefault(titles[rk], set())
+    adds, removes, after = _diff_and_members(rules, titles, facts, members)
     res["counts"] = {t: len(v) for t, v in after.items()}
     if dry:
         res.update(added=sum(len(v) for v in adds.values()),
                    removed=sum(len(v) for v in removes.values()), dry=True)
         return res
     for rk in rules:
-        t = RULES[rk][0]
+        t = titles[rk]
         await _apply(section, t, adds[t], removes[t], res)
     if not res["error"]:
         mem.update(shows=facts, members=after, plex_shows=res["plex_shows"],
@@ -703,21 +778,21 @@ def status() -> dict:
     for lib in tv_libraries():
         rules = rules_for(lib.name)
         libs.append({"library": lib.name, "on": enabled(lib.name),
-                     "rules": rules, "title": title_for(lib.name),
+                     "rules": rules, "available": rules_available(lib.name),
+                     "title": title_for(lib.name),
                      "last": last.get(lib.name) or {}})
     return {"running": STATE["running"], "now": STATE["now"],
-            "every_h": EVERY_S // 3600,
-            "rules": [{"key": k, "title": RULES[k][0], "what": RULES[k][1]}
-                      for k in RULE_ORDER],
-            "libraries": libs}
+            "every_h": EVERY_S // 3600, "libraries": libs}
 
 
 async def watch() -> None:
     schedules.register(
         "plexcoll", "Plex collections", "Plex", EVERY_S,
         what="Keeps collections per switched-on TV library in step with what "
-             "nuarr knows: Ended (Sonarr), English (every regular episode "
-             "has English audio), English Ended, English Unwatched.")
+             "nuarr knows: Ended (Sonarr), Unwatched (Plex), and for every "
+             "non-native language the library's audio policy keeps, the shows "
+             "that carry it on every regular episode, with Ended and "
+             "Unwatched cuts.")
     await asyncio.sleep(300)
     while True:
         schedules.beat("plexcoll")

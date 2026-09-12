@@ -7468,6 +7468,15 @@ async def api_audiolang_fix_batch(ids: str = "", confirm: str = ""):
                 r = {"ok": False, "why": f"{type(e).__name__}: {e}"}
             if r.get("ok"):
                 ok += 1
+                # THE SAME FOLLOW-THROUGH THE QUEUE GIVES A CORRECTION: back to
+                # the planner, and a lying release to the remedy.
+                if not r.get("gone"):
+                    try:
+                        from . import audqueue as _aqf
+                        _aqf._follow_through(fid, r.get("path") or "",
+                                             bool(r.get("fake_dual")))
+                    except Exception:                        # noqa: BLE001
+                        pass
             else:
                 bad += 1
         return ok, bad
@@ -29397,12 +29406,13 @@ function pcollPaint(){
       : '<span class="dim">on - first pass is on its way</span>';
     // WHICH COLLECTIONS THIS LIBRARY KEEPS - one chip per rule, lit when
     // kept, click to add or drop one. A change starts a full sweep.
-    const chips=(d.rules||[]).map(r=>{
+    const avail=L.available||[];
+    const chips=avail.map(r=>{
       const on=(L.rules||[]).includes(r.key);
-      const next=(d.rules||[]).filter(x=>x.key===r.key?!on:(L.rules||[]).includes(x.key)).map(x=>x.key).join(',');
+      const next=avail.filter(x=>x.key===r.key?!on:(L.rules||[]).includes(x.key)).map(x=>x.key).join(',');
       return `<button class="pill" style="cursor:pointer;font-size:10px;padding:0 7px;margin-right:4px;${on?'color:#6fb0ff;border-color:#6fb0ff':'color:var(--dim);opacity:.7'}"
         title="${esc(r.what)}${on?' — kept; click to drop':' — click to keep'}"
-        onclick="pcollRules(${JSON.stringify(L.library).replace(/"/g,'&quot;')},${JSON.stringify(next||'ended').replace(/"/g,'&quot;')},this)">${esc(r.title)}</button>`;
+        onclick="pcollRules(${JSON.stringify(L.library).replace(/"/g,'&quot;')},${JSON.stringify(next||'-').replace(/"/g,'&quot;')},this)">${esc(r.title)}</button>`;
     }).join('');
     // THE ONES SONARR DOES NOT KNOW, BY NAME. A count is a claim; the names
     // are what you need to go and find out why - usually a show Plex matched
@@ -29431,12 +29441,15 @@ function pcollPaint(){
       <button onclick="pcollRun(this)" ${d.running?'disabled':''} style="font-size:10.5px;padding:1px 8px">${d.running?'syncing…':'Sync now'}</button>
     </span>
     <div class="dim" style="font-size:11px;margin:3px 0 6px">Collections Plex cannot
-      build for itself, kept in step with what Nuarr knows: <b>Ended</b> from Sonarr's
-      word; <b>English</b> where every regular episode carries English audio in
-      Nuarr's own probe (specials do not count); <b>English Ended</b> and
-      <b>English Unwatched</b> (nothing of it watched yet) from both. A show that
-      changes leaves or joins on the next pass. Turning a library off leaves its
-      collections as they stand.</div>
+      build for itself, kept in step with what Nuarr knows. <b>Ended</b> is Sonarr's
+      word; <b>Unwatched</b> is nothing of the show watched yet. The language ones
+      follow each library's <a href="#alang" style="color:#6fb0ff">Audio language rules</a>:
+      every kept language that is not the library's own (Japanese for anime,
+      English otherwise) gets a collection of the shows carrying it on every
+      regular episode - specials do not count - with an Ended and an Unwatched
+      cut. Add a language to a library's policy and its collections appear here.
+      A show that changes leaves or joins on the next pass; turning a library
+      off leaves its collections as they stand.</div>
     ${rows||'<div class="dim">no TV libraries</div>'}`;
 }
 async function pcollRules(library,rules,btn){

@@ -156,7 +156,11 @@ _kind("container/name", True, False, False,
 # tag can be corrected and the duplicate dropped - which makes the file honest
 # - but it cannot make the missing language appear. Only a different release
 # can do that, which is what makes this replaceable at all.
-_kind("audio/fake-dual", True, True, False,
+# UNATTENDED NOW, when the audio-language mode is auto - the tag has been
+# corrected and heard with confidence by then, so the finding is not on the
+# strength of a tag but of the audio itself, and Erik wants the lying release
+# blocklisted so it is never fetched again.
+_kind("audio/fake-dual", True, True, True,
       "the file claims two audio languages and carries one of them twice. "
       "Correcting the tag and dropping the duplicate makes it honest; only a "
       "different release makes it dual audio")
