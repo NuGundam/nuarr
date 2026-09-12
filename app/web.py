@@ -750,6 +750,15 @@ async def _startup() -> None:
         from . import subqueue as _sq
         _sq.init()
         asyncio.create_task(_sq.watch())
+        # AND THE SAME ARRANGEMENT FOR AUDIO LANGUAGES. audiolang still does
+        # the listening on its own pass - that is the expensive part and it has
+        # always had its own pacing - but what to DO about what it heard is now
+        # planned, queued and carried out exactly like the subtitle side, so
+        # the correction shows up in Processing System with everything else
+        # rather than happening quietly somewhere off the page.
+        from . import audqueue as _aq
+        _aq.init()
+        asyncio.create_task(_aq.watch())
         # The subtitles that are already in the picture. Only ever looks at
         # files that report having none, so a library with proper tracks costs
         # it nothing.
@@ -7204,21 +7213,24 @@ async def api_audiolang_fix_batch(ids: str = "", confirm: str = ""):
 
 @app.post("/api/audiolang/run/auto")
 async def api_audiolang_run_auto():
-    """Work the standing list now, without waiting for the listen pass.
+    r"""Work the standing list now, without waiting for the listen pass.
 
-    RETURNS AS SOON AS IT HAS STARTED, like every other batch here. Waiting
-    for twenty header edits meant the button sat disabled for ten seconds
-    with nothing to look at and then the whole list changed at once - the
-    progress this endpoint already publishes was unreachable because the
-    request that would have shown it was the one blocking.
+    WHAT THIS DOES NOW IS PLAN AND HAND OVER. It used to carry out twenty
+    header edits itself; the audio queue does the carrying out, so pressing
+    this re-plans every reading against the current lines and puts what it is
+    sure about on the main job queue. The work then appears in Processing
+    System with its own card, its own progress and its own log - which is
+    rather more than this endpoint could ever show you.
+
+    RETURNS AS SOON AS IT HAS STARTED, like every other batch here.
     """
-    from . import audiolang
-    if audiolang.AUTO_STATE.get("running"):
-        return {"ok": False, "why": "already running"}
+    from . import audqueue
 
     async def _go():
         try:
-            await asyncio.to_thread(audiolang.auto_pass)
+            audqueue.bump()
+            await asyncio.to_thread(audqueue.replan, 100000, True)
+            await audqueue.topup()
         finally:
             _amemo_expire("audiolang:")
     asyncio.create_task(_go())

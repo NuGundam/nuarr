@@ -2426,8 +2426,22 @@ def auto_progress() -> dict:
     return d
 
 
-def auto_pass() -> dict:
-    """Correct the disagreements past the line. Bounded, and gated by mode.
+def auto_pass(force: bool = False) -> dict:
+    r"""Correct the disagreements past the line. Bounded, and gated by mode.
+
+    THE QUEUE OWNS THIS NOW, AND NOTHING CALLS IT. audqueue plans every
+    disagreement into an instruction, hands what it is sure about to the main
+    job queue, and the correction happens in a worker under the gate, on the
+    spindle rules, visible in Processing System beside the transcodes. This
+    function did the same work on its own schedule off to one side, which meant
+    two systems could pick up the same file, and "what is nuarr doing to my
+    files" had a different answer depending on which page you had open.
+
+    It is kept rather than deleted because it is the honest record of what the
+    fix loop used to be, and because run_now is one button press away from
+    wanting exactly this for one file. It refuses by default so that it cannot
+    quietly race the queue if something calls it again; pass force=True and you
+    are saying you know the queue is not also holding these rows.
 
     EACH ONE IS A HEADER EDIT AND A REQUEUE, not a re-encode - but it is still
     a write to a file somebody may be watching, so a pass takes a bounded
@@ -2437,6 +2451,10 @@ def auto_pass() -> dict:
     """
     out = {"fixed": 0, "failed": 0, "queued": 0}
     if mode() != "auto":
+        return out
+    if not force:
+        out["why"] = ("the audio queue carries these out now - see Processing "
+                      "System")
         return out
     # verdict_for, not verdict_of: a show you have twice left alone is
     # never corrected on its own, however loud one episode of it is.
@@ -2686,12 +2704,24 @@ async def watch() -> None:
             if available():
                 with joblog.section("Audio language listen"):
                     await asyncio.to_thread(run_once)
-            # AND THEN ACT ON WHAT IT HEARD. Listening and correcting are the
-            # same job here - unlike the subtitle readers, where reading is
-            # half an hour and acting is seconds, a mislabel is only found by
-            # listening and there is nothing to act on until a pass has run.
-            if mode() == "auto":
-                await asyncio.to_thread(auto_pass)
+            # AND THEN TELL THE QUEUE WHAT IT HEARD.
+            #
+            # This used to call auto_pass and do the correcting itself, right
+            # here, because listening and correcting really are found together:
+            # a mislabel does not exist until a pass has heard it. That is
+            # still true, and it is still the reason this is the thing that
+            # wakes the planner - but the correcting belongs with all the other
+            # work nuarr does to a library file, not on this loop's schedule.
+            #
+            # So the pass ends by re-planning. New readings become instructions,
+            # the sure ones go on the main job queue, and the rest wait for you
+            # on the audio page. Nothing is written to a file from here.
+            try:
+                from . import audqueue
+                await asyncio.to_thread(audqueue.replan)
+                await audqueue.topup()
+            except Exception:                            # noqa: BLE001
+                pass
         except Exception as e:                           # noqa: BLE001
             PROGRESS.update(state="error", error=f"{type(e).__name__}: {e}")
             joblog.log(f"audio language: {type(e).__name__}: {e}", "warn", system="audiolang")

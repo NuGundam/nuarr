@@ -606,6 +606,11 @@ class Worker:
             return ("Reading picture subtitles into text. Background work — it "
                     "waits behind everything else and stays off any disk "
                     "someone is watching from.")
+        if self.pool == "audio":
+            return ("Correcting what this file's audio tracks SAY they are. "
+                    "One header write each — the video is never touched — "
+                    "so it has its own pool and can never take a slot a "
+                    "transcode is waiting for.")
         if self.pool == "subs":
             return ("Settling this file's subtitles — taking in what is beside "
                     "it, removing what is inside twice, correcting a title. "
@@ -976,6 +981,14 @@ def _capacity(pool: str) -> int:
         # 10-core box measured at 3% load that left nine cores idle while one
         # ground through 5,264 files.
         return max(1, getattr(w, "subocr_workers", 4))
+    if pool == "audio":
+        # WIDER THAN subs, BECAUSE THE WORK IS NOT THE SAME SHAPE. Every audio
+        # step is mkvpropedit writing a header: it opens the file, rewrites a
+        # few bytes near the front and closes it, in well under a second. There
+        # is no container copy, no cache reservation and no commit, so the
+        # limit that matters is "do not have four of these seeking into the
+        # pool at once" rather than anything about throughput.
+        return max(1, min(4, getattr(w, "passthrough_workers", 2) * 2))
     if pool == "subs":
         # ITS OWN POOL, AND A NARROW ONE. Most subtitle instructions are
         # instant - binning a loose .srt, correcting a title in place - but the
@@ -1114,7 +1127,8 @@ async def enqueue(file_id: int, path: str, title: str = "",
     # encode starts, and a lower priority number so it sorts first.
     pool = ("passthrough" if kind == "transcode"
             else "subocr" if kind == "sub_ocr"
-            else "subs" if kind == "subs" else "handler")
+            else "subs" if kind == "subs"
+            else "audio" if kind == "audio" else "handler")
     if kind != "transcode":
         priority = min(priority, 50)
     # ...EXCEPT subtitle OCR, which is explicitly background work. The clamp
@@ -1267,6 +1281,14 @@ def _heavy(pool_name: str, plan_obj=None) -> bool:
     # the worst of the two mistakes - two full container copies landing on one
     # spindle. The other mistake costs a spindle a fifth of a second, because
     # that is how long a recycle takes before it releases it.
+    # AUDIO IS NOT HERE, AND UNLIKE subs THAT IS A DECISION THIS FUNCTION CAN
+    # ACTUALLY MAKE. The note above says subs has to be called heavy because a
+    # pool name alone cannot tell a container copy from a title edit. For audio
+    # the pool name IS enough: every step audplan can produce is mkvpropedit
+    # editing a header in place, so there is no plan to consult and no case
+    # where one of these reads a video stream. Calling it heavy would reserve a
+    # whole spindle for a fifth of a second of work and keep a transcode off it
+    # the entire time.
     return pool_name in ("passthrough", "subocr", "subs")
 
 
@@ -1937,7 +1959,8 @@ async def pump() -> None:
                 # entire film for no reason. Each pool now asks whether anything
                 # holds IT specifically.
                 if any(st.open_for(p) for p in
-                       ("handler", "encode", "passthrough", "subocr", "subs")):
+                       ("handler", "encode", "passthrough", "subocr",
+                        "subs", "audio")):
                     async with _lock:
                         # HANDLERS FIRST. OCR, repairs and flag fixes must finish
                         # before a transcode touches the same library, otherwise
@@ -1961,10 +1984,10 @@ async def pump() -> None:
                         # a second live job for a file, so a transcode that is
                         # already queued simply keeps the subtitle row waiting
                         # for the next top-up.
-                        for pool in ("handler", "subs", "encode",
+                        for pool in ("handler", "subs", "audio", "encode",
                                      "passthrough", "subocr"):
-                            if pool not in ("handler", "subs", "subocr") \
-                                    and blocked:
+                            if pool not in ("handler", "subs", "audio",
+                                            "subocr") and blocked:
                                 continue
                             if not st.open_for(pool):
                                 continue
@@ -2863,6 +2886,15 @@ async def _run(job: Job, pool: str) -> None:
             await _subs_job(w)
             return
 
+        # AND AUDIO FOR THE SAME REASON, ALSO BEFORE THE PROBE. The whole
+        # instruction was decided from the audio_lang table before this job
+        # existed (see audplan) and the worker re-reads the live container
+        # itself, so an ffprobe here would be a subprocess whose answer nothing
+        # reads.
+        if job.kind == "audio":
+            await _audio_job(w)
+            return
+
         if job.kind == "sub_ocr":
             data = await probe(job.path)
             if not data:
@@ -2987,6 +3019,10 @@ async def _run(job: Job, pool: str) -> None:
         # never fall through to the shell-out path.
         if job.kind == "subs":
             await _subs_job(w)
+            return
+
+        if job.kind == "audio":
+            await _audio_job(w)
             return
 
         if job.kind == "sub_ocr":
@@ -3467,6 +3503,75 @@ async def _subs_job(w: Worker) -> None:
         joblog.log(row.get("why") or "subtitles settled", "ok", job.id)
         _finish(job, "done", before, after,
                 note=(row.get("why") or "subtitles settled")[:300])
+    else:
+        why = str(res.get("why") or "the instruction could not be carried out")
+        joblog.log(f"FAILED: {why}", "error", job.id)
+        _finish(job, "failed", before, after, why[:400])
+
+
+async def _audio_job(w: Worker) -> None:
+    r"""Correct one file's audio language tags, inside a job.
+
+    WHY IT IS A JOB. Not because it is expensive - it is the cheapest thing
+    nuarr does to a library file - but because "what is nuarr doing to my
+    files" should have one answer. The audio page used to run its own pass on
+    its own schedule, so a tag being corrected appeared nowhere the transcodes
+    appeared, and a file could be picked up by both at once. It goes through
+    the queue, the gate and the spindle rules now, like everything else.
+
+    THE INSTRUCTION IS NOT RE-DECIDED HERE. audplan wrote it, audqueue holds
+    it, and this runs it. What the queue shows you before it starts is what
+    runs.
+    """
+    from . import audqueue
+    job = w.job
+    w.set_stage("audio languages")
+    before = os.path.getsize(job.path) if os.path.exists(job.path) else 0
+    if not getattr(w, "disk", ""):
+        try:
+            with cursor() as cur:
+                r = cur.execute("SELECT pool_disk FROM files WHERE id=?",
+                                (job.file_id,)).fetchone()
+            w.disk = (r["pool_disk"] if r else "") or ""
+        except Exception:                                # noqa: BLE001
+            w.disk = ""
+
+    row = await asyncio.to_thread(audqueue.row_for, int(job.file_id))
+    if not row:
+        joblog.log("nothing left to correct on this file's audio tracks",
+                   "ok", job.id)
+        _finish(job, "skipped", 0, 0,
+                note="the instruction was already carried out")
+        return
+
+    # THE CARD GETS WHAT A PASSTHROUGH CARD GETS - the same three figures, for
+    # the reason the subtitle path gives. There is no size change to report
+    # here (a header edit leaves the file the length it was, give or take the
+    # padding), and that is itself worth showing rather than leaving blank.
+    w.src_bytes = before
+
+    def _prog(pct):
+        try:
+            w.progress = max(0.0, min(1.0, float(pct) / 100.0))
+        except (TypeError, ValueError):
+            pass
+    _prog.task = None
+    _prog.on_pid = lambda pid: None
+    _prog.on_stage = lambda name: w.set_stage(str(name)[:60])
+
+    w.sub_steps = list((row.get("plan") or {}).get("steps") or [])
+    w.sub_why = list((row.get("plan") or {}).get("why") or [])
+    w.sub_summary = row.get("why") or ""
+    for a in w.sub_steps:
+        joblog.log(f"will {a}", "info", job.id)
+    res = await asyncio.to_thread(audqueue.do_one, row, _prog, False)
+    after = os.path.getsize(job.path) if os.path.exists(job.path) else 0
+    w.out_bytes = after
+    await asyncio.to_thread(audqueue.note_result, int(job.file_id), res)
+    if res.get("ok"):
+        joblog.log(row.get("why") or "audio languages settled", "ok", job.id)
+        _finish(job, "done", before, after,
+                note=(row.get("why") or "audio languages settled")[:300])
     else:
         why = str(res.get("why") or "the instruction could not be carried out")
         joblog.log(f"FAILED: {why}", "error", job.id)
@@ -5662,11 +5767,13 @@ def live_snapshot() -> dict:
         "capacity": {"encode": _capacity("encode"),
                      "passthrough": _capacity("passthrough"),
                      "subocr": _capacity("subocr"),
-                     "subs": _capacity("subs")},
+                     "subs": _capacity("subs"),
+                     "audio": _capacity("audio")},
         "in_use": {"encode": _in_pool("encode"),
                    "passthrough": _in_pool("passthrough"),
                    "subocr": _in_pool("subocr"),
-                   "subs": _in_pool("subs")},
+                   "subs": _in_pool("subs"),
+                   "audio": _in_pool("audio")},
         "subocr_inline": sum(1 for w in workers if w.sub_ocr_active),
         # How the recently-finished jobs ended, so a ghost card can say what
         # actually happened instead of assuming success. See FATE.
@@ -5772,11 +5879,13 @@ def snapshot(recent_limit: int = 60) -> dict:
         "capacity": {"encode": _capacity("encode"),
                      "passthrough": _capacity("passthrough"),
                      "subocr": _capacity("subocr"),
-                     "subs": _capacity("subs")},
+                     "subs": _capacity("subs"),
+                     "audio": _capacity("audio")},
         "in_use": {"encode": _in_pool("encode"),
                    "passthrough": _in_pool("passthrough"),
                    "subocr": _in_pool("subocr"),
-                   "subs": _in_pool("subs")},
+                   "subs": _in_pool("subs"),
+                   "audio": _in_pool("audio")},
         # How much of the subocr figure above is running INSIDE a transcode
         # rather than as a job of its own. Same budget, different home, and the
         # header says so instead of leaving you to wonder why the count moves
