@@ -5452,7 +5452,8 @@ def api_health():
             "drivepool": "DrivePool",
             "notland": "Still not landed", "counts": "Counts", "logs": "Logs",
             "ocr": "OCR engines", "ruleschk": "Rule check",
-            "process": "Processing System", "alang": "Audio language"}
+            "process": "Processing System", "alang": "Audio language",
+            "plex": "Plex"}
 
     # key -> (what fixes it, the sentence explaining why the others do not)
     REMEDY = {
@@ -5806,6 +5807,39 @@ def api_health():
                 pool=pool, done=dn, left=q + r_)
     except Exception as e:                                   # noqa: BLE001
         add("queue", "The work systems", "process", 0,
+            f"check unavailable: {type(e).__name__}", warn=True)
+
+    # THE COLLECTIONS NUARR KEEPS IN PLEX - a system with a schedule, so a
+    # pass that stops or a library Plex cannot find shows up here.
+    try:
+        from . import plexcollections as _pc
+        st = _pc.status()
+        on = [L for L in st.get("libraries") or [] if L.get("on")]
+        if not on:
+            add("plexcoll", "Collections Nuarr keeps in Plex", "plex", 0,
+                "off in every library - switch one on under Plex",
+                when="every 6h, a full sweep daily")
+        else:
+            bits, bad = [], False
+            for L in on:
+                l = L.get("last") or {}
+                if l.get("error"):
+                    bad = True
+                    bits.append(f"{L['library']}: {l['error']}")
+                elif l.get("at"):
+                    bits.append(f"{L['library']}: {l.get('in_collection', 0):,} in "
+                                f"'{L['title']}'"
+                                + (f", {l['unmatched']} unknown to Sonarr"
+                                   if l.get("unmatched") else ""))
+                else:
+                    bits.append(f"{L['library']}: first pass on its way")
+            add("plexcoll", "Collections Nuarr keeps in Plex", "plex", 0,
+                ("syncing - " + st["now"] + " · " if st.get("running") else "")
+                + " · ".join(bits),
+                running=bool(st.get("running")), warn=bad,
+                when="every 6h, a full sweep daily")
+    except Exception as e:                                   # noqa: BLE001
+        add("plexcoll", "Collections Nuarr keeps in Plex", "plex", 0,
             f"check unavailable: {type(e).__name__}", warn=True)
 
     warn = sum(1 for c in checks if c["warn"])
@@ -27423,9 +27457,23 @@ function hlPaint(){
   // where the same page name appearing twice looks like a bug rather than like
   // two checks that happen to be filed together. Warnings still come first;
   // within that, rows that open the same page sit next to each other.
-  const sorted=[...cs].sort((a,b)=>(b.warn?1:0)-(a.warn?1:0)
-    || (a.where||'').localeCompare(b.where||''));
-  el.innerHTML=head+sorted.map(row).join('')
+  // GROUPED BY THE PAGE THEY OPEN. Every row already said where it lives
+  // at its right-hand end; laid out flat, the page names read as a
+  // column of near-duplicates ("Libraries", "Libraries", "Libraries")
+  // and the eye had to match them up. A heading per page, groups with
+  // something to report first, warnings first within a group.
+  const groups=new Map();
+  for(const c of cs){ const k=c.where||'Other'; (groups.get(k)||groups.set(k,[]).get(k)).push(c); }
+  const glist=[...groups.entries()].map(([name,rows])=>({name, rows:
+      rows.sort((a,b)=>(b.warn?1:0)-(a.warn?1:0) || (b.running?1:0)-(a.running?1:0)),
+      warns: rows.filter(r=>r.warn).length}))
+    .sort((a,b)=>(b.warns-a.warns) || a.name.localeCompare(b.name));
+  const groupHtml=g=>`<div style="margin:12px 0 4px;display:flex;align-items:baseline;gap:8px">
+      <b style="font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:#6fb0ff">${esc(g.name)}</b>
+      <span class="dim" style="font-size:10.5px">${g.rows.length} check${g.rows.length===1?'':'s'}${
+        g.warns?` · <span style="color:var(--warn)">${g.warns} found something</span>`:''}</span>
+    </div>`+g.rows.map(row).join('');
+  el.innerHTML=head+glist.map(groupHtml).join('')
     +`<div class="dim" style="font-size:10.5px;margin-top:6px">Each row is a
       shortcut: the full card - list, buttons, its own switch - lives on the
       page named at the end of the row. Several checks share a page; the name

@@ -303,12 +303,121 @@ async def sync_library(lib, arr: dict | None = None, dry: bool = False,
         return res
     await _apply(section, title, add, remove, res)
     res["in_collection"] = res["in_collection"] + res["added"] - res["removed"]
+    # The finishing touches, on the full sweep only: the kept collection
+    # sorted by title, and a poster for every collection in the library that
+    # Plex leaves blank. Never fatal - a poster is not a membership.
+    try:
+        res["posters"] = await asyncio.to_thread(
+            tidy_collections, section, title, mem.get("posters") or {})
+    except Exception as e:                                   # noqa: BLE001
+        res["posters"] = {"error": f"{type(e).__name__}: {e}"}
     if not res["error"]:
         _mem_save(lib.name, {"full_at": now, "section": section, "title": title,
                              "keys": keys, "status": status, "members": members,
                              "plex_shows": len(shows),
-                             "unmatched_titles": res["unmatched_titles"]})
+                             "unmatched_titles": res["unmatched_titles"],
+                             "posters": (res["posters"] or {}).get("stamps")
+                                        or mem.get("posters") or {}})
     return res
+
+
+# --------------------------------------------------------- the finishing ---
+#
+# SORTED BY TITLE. A collection Plex builds from tags lists its members in
+# the order they were added, which for ours is the order Plex returned the
+# library - useless to browse. collectionSort=1 is Plex's own "alphabetical".
+#
+# A POSTER FOR THE ONES PLEX LEAVES BLANK. Plex draws a 2x2 collage for an
+# ordinary collection and NOTHING for a smart one - the composite URL it
+# advertises for a smart collection answers 404, which is why "English
+# Unwatched" was a grey tile. So nuarr draws the same collage itself, from
+# the first four members' posters, and uploads it. Re-uploaded only when
+# those four change, so the poster list does not fill with copies.
+COLLAGE_W, COLLAGE_H = 400, 600
+
+
+def _posters_of(coll_key: str) -> list:
+    d = _get(f"/library/collections/{coll_key}/children?X-Plex-Container-Size=4"
+             "&X-Plex-Container-Start=0")
+    out = []
+    for m in (d.get("MediaContainer") or {}).get("Metadata") or []:
+        if m.get("thumb"):
+            out.append((str(m.get("ratingKey") or ""), m["thumb"]))
+    return out[:4]
+
+
+def _fetch_image(path: str) -> bytes:
+    url, token = _plex()
+    sep = "&" if "?" in path else "?"
+    req = urllib.request.Request(
+        f"{url}{path}{sep}width=200&height=300&X-Plex-Token={token}")
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return r.read()
+
+
+def _collage(thumbs: list) -> bytes:
+    import io as _io
+    from PIL import Image
+    canvas = Image.new("RGB", (COLLAGE_W, COLLAGE_H), (15, 18, 22))
+    cw, ch = COLLAGE_W // 2, COLLAGE_H // 2
+    for i, (_k, th) in enumerate(thumbs[:4]):
+        try:
+            im = Image.open(_io.BytesIO(_fetch_image(th))).convert("RGB")
+        except Exception:                                    # noqa: BLE001
+            continue
+        # cover-fit into the cell
+        r = max(cw / im.width, ch / im.height)
+        im = im.resize((max(1, int(im.width * r)), max(1, int(im.height * r))))
+        x0 = (im.width - cw) // 2
+        y0 = (im.height - ch) // 2
+        im = im.crop((x0, y0, x0 + cw, y0 + ch))
+        canvas.paste(im, ((i % 2) * cw, (i // 2) * ch))
+    b = _io.BytesIO()
+    canvas.save(b, "JPEG", quality=88)
+    return b.getvalue()
+
+
+def _upload_poster(coll_key: str, data: bytes) -> None:
+    url, token = _plex()
+    req = urllib.request.Request(
+        f"{url}/library/metadata/{coll_key}/posters", data=data, method="POST",
+        headers={"X-Plex-Token": token, "Content-Type": "image/jpeg"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        r.read()
+
+
+def tidy_collections(section: str, kept_title: str, stamps: dict) -> dict:
+    """Sort the kept collection by title; give every blank one a collage.
+    Returns {"stamps": {coll_key: "k1,k2,k3,k4"}, "posted": n, "sorted": bool}."""
+    out = {"stamps": dict(stamps), "posted": 0, "sorted": False}
+    d = _get(f"/library/sections/{section}/collections")
+    for c in (d.get("MediaContainer") or {}).get("Metadata") or []:
+        key = str(c.get("ratingKey") or "")
+        if not key:
+            continue
+        if (c.get("title") or "") == kept_title and str(c.get("collectionSort")) != "1":
+            _put(f"/library/metadata/{key}/prefs?collectionSort=1")
+            out["sorted"] = True
+        # Does its poster actually answer? Plex's own composite does for an
+        # ordinary collection and does not for a smart one; an uploaded
+        # poster always does. Only a blank tile gets a collage.
+        thumb = c.get("thumb") or ""
+        blank = False
+        if "/composite/" in thumb:
+            try:
+                _fetch_image(thumb)
+            except Exception:                                # noqa: BLE001
+                blank = True
+        if not blank and key not in out["stamps"]:
+            continue                       # has a poster nuarr did not make
+        thumbs = _posters_of(key)
+        stamp = ",".join(k for k, _t in thumbs)
+        if not thumbs or out["stamps"].get(key) == stamp:
+            continue                       # nothing to draw, or unchanged
+        _upload_poster(key, _collage(thumbs))
+        out["stamps"][key] = stamp
+        out["posted"] += 1
+    return out
 
 
 async def _sync_changes(lib, section_hint: str, arr: dict | None, mem: dict,
