@@ -34412,12 +34412,12 @@ const AUD_W={tag:'the tag claims a language the track is not',
 function audOpen(k){
   let v=null;
   try{ v=localStorage.getItem('nuarr.aud.d.'+k); }catch(e){}
-  if(v===null) return k==='tag';
+  if(v===null) return k==='tag' || k==='ledger';
   return v==='open';
 }
 function audDetailPaint(){
   for(const w of document.querySelectorAll('.audd'))
-    w.style.display = audOpen(w.dataset.d) ? '' : 'none';
+    w.style.display = (w.dataset.d==='ledger' || audOpen(w.dataset.d)) ? '' : 'none';
 }
 function audDetail(k){
   if(!document.querySelector('.audd[data-d="'+k+'"]')){
@@ -34950,6 +34950,7 @@ function audAskHtml(){
         const guess=lean?({en:'eng',ja:'jpn',zh:'chi',ko:'kor',es:'spa',pt:'por',
                            fr:'fre',de:'ger',it:'ita',ru:'rus',nl:'dut',sv:'swe',
                            pl:'pol',th:'tha',hi:'hin',tr:'tur',vi:'vie'}[lean]||''):'';
+        const guessName=guess?((((d&&d.choices)||[]).find(ch=>ch.code===guess)||{}).name||''):'';
         const open=_audOpenRows.has(r.id);
         return `<tr style="opacity:${r.kind==='wait'?'.7':'1'}">
         <td class="l"></td>
@@ -34963,20 +34964,25 @@ function audAskHtml(){
           r.disk?`<div style="font-size:9.5px;color:${diskColor(r.disk)}">${esc(r.disk)}</div>`:''}</td>
         <td class="c mono"><span style="color:#e2b341" title="no language tag - players read this as English">none</span>
           <span class="dim">→</span> ${r.heard?`<span style="color:var(--ok)">${esc(r.heard)}</span>`:'<span class="dim">?</span>'}</td>
-        <td class="c mono" style="font-variant-numeric:tabular-nums;color:var(--dim)">${r.sure?r.sure+'%':'—'}</td>
-        <td class="r askhost">${r.kind==='wait'
+        <td class="c mono" style="font-variant-numeric:tabular-nums;color:${audSureColor(r)}"
+            title="${r.sure?`${r.sure}% - above ${(_aud&&_aud.fix_at)||95}% nuarr would act alone; at or under ${(_aud&&_aud.leave_at)||60}% it leaves the tag; between is yours`:'not heard yet'}">${r.sure?r.sure+'%':'—'}</td>
+        <td class="r askhost" style="white-space:normal">${r.kind==='wait'
           ? `<span class="dim" style="font-size:10.5px" title="On the listen queue. Nothing is offered until it has been heard.">not heard yet</span>
              <button class="rmb" onclick="alCheck(${r.file_id},${r.track},'${selId}',this)" title="Listen to this file now rather than waiting for the queue to reach it">Listen to the file</button>
              <select id="${selId}" style="display:none"><option value=""></option></select>
              <div id="${selId}_msg" class="dim" style="font-size:10px;margin-top:2px"></div>`
-          : `<select id="${selId}" style="font-size:11px">
+          : `<div style="display:flex;gap:6px;align-items:center;justify-content:flex-end;flex-wrap:wrap">
+             <select id="${selId}" style="font-size:11px"
+               onchange="const b=this.closest('td').querySelector('.audsave'); if(b) b.textContent=this.value?'Yes, it is '+this.options[this.selectedIndex].text:'Yes, save it'">
                <option value="">choose…</option>
                ${((d&&d.choices)||[]).map(ch=>`<option value="${esc(ch.code)}"${ch.code===guess?' selected':''}>${esc(ch.name)}</option>`).join('')}
              </select>
-             <button class="rmb" onclick="alCheck(${r.file_id},${r.track},'${selId}',this)" title="Listen to the file again, harder, and say whether it agrees with your pick">Listen to the file</button>
-             <button class="rmb" onclick="alSet(${r.file_id},${r.track},'${selId}',this)" title="${r.fast_path===false
+             <button class="rmb audsave" onclick="alSet(${r.file_id},${r.track},'${selId}',this)" title="${r.fast_path===false
                 ?'This container cannot be edited in place - the tag is written when the file is next rebuilt'
-                :'Write this language onto track '+((r.track||0)+1)+' - a header edit, no re-encode'}">Save</button>
+                :'Write this language onto track '+((r.track||0)+1)+' - a header edit, no re-encode'}">${
+                guessName?'Yes, it is '+esc(guessName):'Yes, save it'}</button></div>
+             <div class="dim" style="font-size:9.5px;margin-top:2px">or <a href="#" onclick="alCheck(${r.file_id},${r.track},'${selId}',this);return false"
+               title="Listen to the file again, harder, and say whether it agrees with your pick">listen to the file</a> first</div>
              <div id="${selId}_msg" class="dim" style="font-size:10px;margin-top:2px"></div>`}</td>
         </tr>${open?`<tr id="auddet-${esc(r.id)}" style="background:rgba(255,255,255,.025)"><td colspan="8" style="padding:0;border-bottom:1px solid var(--line)">${audDetailHtml(r)}</td></tr>`:''}`;
       }
@@ -34995,7 +35001,7 @@ function audAskHtml(){
         <span class="dim">→</span> <span style="color:var(--ok)" title="what was heard">${esc(r.heard||'?')}</span>${
         r.fake_dual?`<div style="font-size:9.5px;color:#e08a6f" title="Another track in this file was heard in the same language. A release claiming dual audio and shipping one language twice is the case worth blocklisting.">claims dual audio</div>`:''}${
         r.held?`<div style="font-size:9.5px;color:#e8a33d" title="Past the correct line, but you have left this show's tags alone enough times that nuarr will not act on it by itself.">show left alone before</div>`:''}</td>
-      <td class="c mono" style="font-variant-numeric:tabular-nums;color:var(--warn)" title="${esc(r.why||'')}">${r.sure}%</td>
+      <td class="c mono" style="font-variant-numeric:tabular-nums;color:${audSureColor(r)}" title="${esc(r.why||'')}">${r.sure}%</td>
       <td class="r askhost">${opts.map(o=>`<button class="rmb"
           title="${esc(o.what||'')}"
           onclick="audAnswer(${r.file_id},'${esc(r.q)}','${esc(o.v)}',this)">${esc(o.label||o.v)}</button>`).join('')}
@@ -35085,6 +35091,17 @@ function audDetailHtml(r){
   </div>`;
 }
 
+// THE SAME COLOURS THE SUBTITLE PANEL USES FOR THE SAME NUMBER: green past
+// the line nuarr would act on alone, dim at or under the line it would leave
+// alone, amber in between - the band that is yours. Not heard yet is dim.
+function audSureColor(r){
+  if(!r.sure) return 'var(--dim)';
+  const hi=(_aud&&_aud.fix_at)||95, lo=(_aud&&_aud.leave_at)||60;
+  if(r.sure>=hi) return 'var(--ok)';
+  if(r.sure<=lo) return 'var(--dim)';
+  return 'var(--warn)';
+}
+
 function audAskPaint(force){
   const el=document.getElementById('alAskPanel'); if(!el||!_aud) return;
   if(!force && (askOpen('alAskPanel') || panelBusy('alAskPanel') || panelScrolled('alAskPanel'))) return;
@@ -35168,14 +35185,14 @@ function audPaint(){
                 document.getElementById('audPanelProc'));
     }
   }
-  const html=audBoardHtml() + audListHtml();
+  const html=audBoardHtml() + '<div id="audSlot-ledger"></div>' + audListHtml();
   // RESCUED BEFORE THE WIPE, AND THAT IS NOT OPTIONAL. The panel is moved into
   // a slot inside this container, and the next line replaces the container's
   // whole contents - so a panel sitting in a slot is a panel about to be
   // deleted along with its selection and every listener on it. Home first.
   const home=document.getElementById('alHome');
   const panes={};
-  for(const k of ['tag','coverage']){
+  for(const k of ['tag','coverage','ledger']){
     const p=document.querySelector('.audd[data-d="'+k+'"]');
     if(!p) continue;
     panes[k]=p;

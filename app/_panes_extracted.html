@@ -556,21 +556,22 @@
           <div class="audd" data-d="coverage" style="display:none">
             <div class="subsp" id="alCoverage" style="margin:0"></div>
           </div>
-        </div>
-        <!-- THE RAW LEDGER, LAST. What was heard, what the files claim, and -
-             deliberately - every case where Nuarr refused to answer. It is
-             the evidence for the list above, not a second copy of it;
-             nothing is decided down here. -->
-        <div style="padding:0 14px 8px">
-          <div class="subsp" id="alCheckedPanel">
-            <div class="subshd"><b style="color:#6fb0ff">Everything checked</b>
-              <span class="subskind k-auto"
-                title="A background check. Nobody starts it - it looks at the library on its own schedule and reports what it finds.">runs by itself</span>
-              <span class="dim subssub">the raw ledger &mdash; what was heard, what the files claim, and every case where Nuarr refused to answer. Evidence for the list above; nothing is decided here.</span>
-              <span class="subsn" id="alCheckedN"></span>
+          <!-- THE RAW LEDGER. What was heard, what the files claim, and -
+               deliberately - every case where Nuarr refused to answer. It is
+               the evidence for the list it sits above, not a second copy of
+               it; nothing is decided here. Slotted between the switchboard
+               and the file list by audPaint. -->
+          <div class="audd" data-d="ledger">
+            <div class="subsp" id="alCheckedPanel">
+              <div class="subshd"><b style="color:#6fb0ff">Everything checked</b>
+                <span class="subskind k-auto"
+                  title="A background check. Nobody starts it - it looks at the library on its own schedule and reports what it finds.">runs by itself</span>
+                <span class="dim subssub">the raw ledger &mdash; what was heard, what the files claim, and every case where Nuarr refused to answer. Evidence for the list below; nothing is decided here.</span>
+                <span class="subsn" id="alCheckedN"></span>
+              </div>
+              <div class="subswhy"><a href="#" id="alCheckedToggle" onclick="alCheckedToggle();return false">&#9656; show the ledger</a></div>
+              <div id="alChecked" style="display:none"><div class="dim" style="padding:10px 0">loading&hellip;</div></div>
             </div>
-            <div class="subswhy"><a href="#" id="alCheckedToggle" onclick="alCheckedToggle();return false">&#9656; show the ledger</a></div>
-            <div id="alChecked" style="display:none"><div class="dim" style="padding:10px 0">loading&hellip;</div></div>
           </div>
         </div>
         <!-- CHECK ONE FILE NOW, with the same listener the sweep uses. -->
