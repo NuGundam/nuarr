@@ -362,33 +362,165 @@ def asking(limit: int = 400) -> list:
             asks = _json.loads(r.get("asks") or "[]")
         except Exception:                                        # noqa: BLE001
             asks = []
-        label = r.get("title") or ""
-        try:
-            s, e = r.get("season"), r.get("episode")
-            if label and s is not None and e is not None:
-                label = f"{label} - S{int(s):02d}E{int(e):02d}"
-        except Exception:                                        # noqa: BLE001
-            pass
-        if not label:
-            try:
-                from .db import pretty_from_filename
-                label = pretty_from_filename(r.get("path") or "")
-            except Exception:                                    # noqa: BLE001
-                label = r.get("name") or ""
+        label = _label(r)
         for a in asks:
+            tr = int(a.get("track") or 0)
             out.append({
-                "id": f"{r['file_id']}:{a.get('q') or 'tag'}:{a.get('track') or 0}",
+                "id": f"{r['file_id']}:{a.get('q') or 'tag'}:{tr}",
+                "kind": "ask",
                 "file_id": int(r["file_id"]), "path": r.get("path") or "",
                 "name": r.get("name") or "", "label": label,
                 "library": r.get("library") or "", "disk": r.get("disk") or "",
                 "series": r.get("series") or "",
                 "added": float(r.get("first_seen") or 0),
-                "q": a.get("q") or "tag", "track": int(a.get("track") or 0),
+                "q": a.get("q") or "tag", "track": tr,
                 "tagged": a.get("from") or "", "heard": a.get("to") or "",
                 "sure": int(a.get("sure") or 0),
                 "asking": a.get("asking") or "", "why": a.get("why") or "",
                 "held": bool(a.get("held")), "fake_dual": bool(a.get("fake_dual")),
-                "options": a.get("options") or []})
+                "options": a.get("options") or [],
+                **_evidence(int(r["file_id"]), tr)})
+    out += _blank_rows()
+    return out
+
+
+def _label(r: dict) -> str:
+    """The episode, not the show - twenty rows all reading the series name is
+    a list you cannot act on."""
+    label = r.get("title") or ""
+    try:
+        s, e = r.get("season"), r.get("episode")
+        if label and s is not None and e is not None:
+            label = f"{label} - S{int(s):02d}E{int(e):02d}"
+    except Exception:                                            # noqa: BLE001
+        pass
+    if not label:
+        try:
+            from .db import pretty_from_filename
+            label = pretty_from_filename(r.get("path") or "")
+        except Exception:                                        # noqa: BLE001
+            label = r.get("name") or os.path.basename(r.get("path") or "")
+    return label
+
+
+def _evidence(file_id: int, track: int) -> dict:
+    r"""What the detail row under a question shows: the reading itself.
+
+    Each 30-second window's answer and score, the overall distribution, when
+    it was heard, and enough about the track to tell it from its neighbour -
+    codec, channels, title. Read per row rather than per page, because a
+    question list is tens of rows and the probe blob is only opened for those.
+    """
+    from .db import cursor
+    out = {"votes": [], "overall": [], "checked_at": 0.0, "verdict_why": "",
+           "codec": "", "channels": 0, "track_title": "", "n_audio": 0,
+           "fast_path": True}
+    try:
+        with cursor() as cur:
+            v = cur.execute("SELECT votes, overall, checked_at, why, ok, code, "
+                            "       confidence "
+                            "  FROM audio_lang WHERE file_id=? AND track=?",
+                            (int(file_id), int(track))).fetchone()
+            p = cur.execute("SELECT p.json, f.path, f.audio_langs "
+                            "  FROM files f LEFT JOIN file_probes p ON p.file_id=f.id "
+                            " WHERE f.id=?", (int(file_id),)).fetchone()
+        if v:
+            try:
+                out["votes"] = _json.loads(v["votes"] or "[]")
+            except Exception:                                    # noqa: BLE001
+                pass
+            try:
+                out["overall"] = _json.loads(v["overall"] or "[]")
+            except Exception:                                    # noqa: BLE001
+                pass
+            out["checked_at"] = float(v["checked_at"] or 0)
+            out["verdict_why"] = v["why"] or ""
+            out["verdict_ok"] = bool(v["ok"])
+            out["verdict_code"] = v["code"] or ""
+            out["verdict_conf"] = float(v["confidence"] or 0)
+        if p:
+            out["n_audio"] = len([x for x in (p["audio_langs"] or "").split(",") if x != ""])
+            try:
+                streams = (_json.loads(p["json"] or "{}").get("streams") or [])
+                aud = [s for s in streams if s.get("codec_type") == "audio"]
+                s = aud[int(track)] if int(track) < len(aud) else {}
+                out["codec"] = (s.get("codec_name") or "").upper()
+                out["channels"] = int(s.get("channels") or 0)
+                out["track_title"] = str((s.get("tags") or {}).get("title") or "").strip('"')
+            except Exception:                                    # noqa: BLE001
+                pass
+            try:
+                from . import audiolang
+                out["fast_path"] = bool(audiolang.can_fast_path(p["path"] or ""))
+            except Exception:                                    # noqa: BLE001
+                pass
+    except Exception:                                            # noqa: BLE001
+        pass
+    return out
+
+
+def _blank_rows() -> list:
+    r"""The tracks with no language tag at all, as questions.
+
+    TWO KINDS, AND THEY ARE NOT THE SAME QUESTION. A blank the listener has
+    heard and refused to name is yours: nothing more will be measured, and a
+    person who can play the file settles it in one pick. A blank not yet heard
+    is on its way - it is on the listen queue - and is only shown when asked
+    for. The ledger used to keep these in two tabs of its own; they are the
+    same activity as the readings between the lines, so they sit in the same
+    table.
+    """
+    from . import audiolang
+    from .db import cursor
+    out: list = []
+    try:
+        waiting = {(int(t["file_id"]), int(t["track"]))
+                   for t in audiolang.pending(5000)}
+    except Exception:                                            # noqa: BLE001
+        waiting = set()
+    try:
+        with cursor() as cur:
+            rows = [dict(r) for r in cur.execute(
+                "SELECT id file_id, path, title, season, episode, library, "
+                "       audio_langs, first_seen, COALESCE(pool_disk,'') disk "
+                "  FROM files "
+                " WHERE state!='deleted' AND audio_langs IS NOT NULL "
+                "   AND (audio_langs = '-' OR audio_langs LIKE '-,%' "
+                "        OR audio_langs LIKE '%,-' OR audio_langs LIKE '%,-,%') "
+                " LIMIT 500")]
+    except Exception:                                            # noqa: BLE001
+        return out
+    for r in rows:
+        label = _label(r)
+        for ai, raw in enumerate((r.get("audio_langs") or "").split(",")):
+            if raw != "-":
+                continue
+            ev = _evidence(int(r["file_id"]), ai)
+            is_wait = (int(r["file_id"]), ai) in waiting or not ev.get("checked_at")
+            heard = "" if is_wait else (ev.get("verdict_code") or "")
+            # A BLANK THE LISTENER DID NAME - heard en at 0.99, say, from a
+            # Check pressed by hand that measures but does not write - is not
+            # "would not guess". It shows what was heard and how sure, and
+            # Save has that language ready.
+            sure = 0 if is_wait else int(round((ev.get("verdict_conf") or 0) * 100))
+            why = ("the file has changed since it was last heard - on the "
+                   "listen queue again" if (is_wait and ev.get("checked_at"))
+                   else "not listened to yet - it is on the listen queue" if is_wait
+                   else (f"heard {heard} at {sure}% but nothing was written - "
+                         f"a Check measures, Save writes" if heard
+                         else (ev.get("verdict_why") or "the listener would not "
+                               "put a name to it")))
+            out.append({
+                "id": f"{'wait' if is_wait else 'blank'}:{r['file_id']}:{ai}",
+                "kind": "wait" if is_wait else "blank",
+                "file_id": int(r["file_id"]), "path": r.get("path") or "",
+                "name": os.path.basename(r.get("path") or ""), "label": label,
+                "library": r.get("library") or "", "disk": r.get("disk") or "",
+                "series": "", "added": float(r.get("first_seen") or 0),
+                "q": "blank", "track": ai, "tagged": "", "heard": heard,
+                "sure": sure, "asking": "", "why": why,
+                "held": False, "fake_dual": False, "options": [],
+                **ev})
     return out
 
 
@@ -599,6 +731,12 @@ def overview(limit: int = 400, force: bool = False) -> dict:
         d["mode"] = audiolang.mode()
         d["fix_at"] = audiolang.fix_at()
         d["leave_at"] = audiolang.leave_at()
+        # The picker's languages and the vote floor, so a blank row can offer
+        # its picker and a detail row can strike out the windows under the
+        # floor without a second request.
+        d["choices"] = list(getattr(audiolang, "CHOICES", []) or [])
+        d["min_prob"] = float(getattr(audiolang, "MIN_PROB", 0.6) or 0.6)
+        d["waiting_total"] = sum(1 for x in d["asking"] if x.get("kind") == "wait")
         d["listen_running"] = bool((d.get("listen") or {}).get("state")
                                    in ("listening", "scanning", "writing"))
     except Exception:                                            # noqa: BLE001
