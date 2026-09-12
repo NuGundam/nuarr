@@ -5827,9 +5827,10 @@ def api_health():
                     bad = True
                     bits.append(f"{L['library']}: {l['error']}")
                 elif l.get("at"):
-                    bits.append(f"{L['library']}: {l.get('in_collection', 0):,} in "
-                                f"'{L['title']}'"
-                                + (f", {l['unmatched']} unknown to Sonarr"
+                    cn = l.get("counts") or {}
+                    bits.append(f"{L['library']}: "
+                                + " · ".join(f"{t} {n:,}" for t, n in cn.items())
+                                + (f" · {l['unmatched']} unknown to Sonarr"
                                    if l.get("unmatched") else ""))
                 else:
                     bits.append(f"{L['library']}: first pass on its way")
@@ -6228,11 +6229,13 @@ def api_plexcoll():
 
 
 @app.post("/api/plexcoll/set")
-async def api_plexcoll_set(library: str, on: int = 1, title: str = ""):
+async def api_plexcoll_set(library: str, on: int = 1, rules: str = ""):
+    """Switch a library on or off, and/or set which collections it keeps
+    (a comma list of rule keys). A change starts a full sweep."""
     from . import plexcollections
-    plexcollections.set_enabled(library, bool(on), title)
+    plexcollections.set_enabled(library, bool(on), rules)
     if on:
-        asyncio.create_task(plexcollections.sync())
+        asyncio.create_task(plexcollections.sync(force=True))
     return {"ok": True, **plexcollections.status()}
 
 
@@ -29385,12 +29388,22 @@ function pcollPaint(){
   const rows=(d.libraries||[]).map(L=>{
     const l=L.last||{};
     const when=l.at?ago(l.at):'never';
+    const cn=l.counts||{};
     const line = !L.on ? '<span class="dim">off</span>'
       : l.error ? `<span class="err">${esc(l.error)}</span>`
-      : l.at ? `<span style="color:var(--ok)">${fmt(l.in_collection||0)}</span><span class="dim"> in the collection · ${fmt(l.ended||0)} ended of ${fmt(l.plex_shows||0)} shows${
+      : l.at ? `${Object.keys(cn).map(t=>`<span class="mono" style="color:#6fb0ff">${esc(t)}</span> <span style="color:var(--ok)">${fmt(cn[t])}</span>`).join('<span class="dim"> · </span>')}<span class="dim"> of ${fmt(l.plex_shows||0)} shows${
             (l.added||l.removed)?` · last pass ${l.added?'+'+fmt(l.added):''}${l.added&&l.removed?' ':''}${l.removed?'−'+fmt(l.removed):''}`:''} · synced ${esc(when)}${
-            l.mode?` <span title="${l.mode==='changes'?'only what can have changed since the last full sweep: Sonarr statuses, and shows Plex added since':'every show in the library checked against Plex and Sonarr'}">(${l.mode==='changes'?'changes only':'full sweep'})</span>`:''}</span>`
+            l.mode?` <span title="${l.mode==='changes'?'only what can have changed since the last full sweep: Sonarr statuses, English audio, shows Plex added or somebody watched since':'every show in the library checked against Plex, Sonarr and nuarr'}">(${l.mode==='changes'?'changes only':'full sweep'})</span>`:''}</span>`
       : '<span class="dim">on - first pass is on its way</span>';
+    // WHICH COLLECTIONS THIS LIBRARY KEEPS - one chip per rule, lit when
+    // kept, click to add or drop one. A change starts a full sweep.
+    const chips=(d.rules||[]).map(r=>{
+      const on=(L.rules||[]).includes(r.key);
+      const next=(d.rules||[]).filter(x=>x.key===r.key?!on:(L.rules||[]).includes(x.key)).map(x=>x.key).join(',');
+      return `<button class="pill" style="cursor:pointer;font-size:10px;padding:0 7px;margin-right:4px;${on?'color:#6fb0ff;border-color:#6fb0ff':'color:var(--dim);opacity:.7'}"
+        title="${esc(r.what)}${on?' — kept; click to drop':' — click to keep'}"
+        onclick="pcollRules(${JSON.stringify(L.library).replace(/"/g,'&quot;')},${JSON.stringify(next||'ended').replace(/"/g,'&quot;')},this)">${esc(r.title)}</button>`;
+    }).join('');
     // THE ONES SONARR DOES NOT KNOW, BY NAME. A count is a claim; the names
     // are what you need to go and find out why - usually a show Plex matched
     // to a different tvdb entry than Sonarr, or one Sonarr never had.
@@ -29404,8 +29417,7 @@ function pcollPaint(){
          </details>` : '';
     return `<div style="display:flex;gap:10px;align-items:center;padding:6px 0;border-top:1px solid var(--line);font-size:11.5px">
       <b style="flex:none;min-width:150px">${esc(L.library)}</b>
-      <span class="dim" style="flex:none">collection</span>
-      <span class="mono" style="flex:none;color:#6fb0ff">${esc(L.title)}</span>
+      <span style="flex:none">${L.on?chips:''}</span>
       <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${line}</span>
       <button class="wsw ${L.on?'on':'off'}" onclick="pcollSet(${JSON.stringify(L.library).replace(/"/g,'&quot;')},${L.on?0:1},this)"
         title="${L.on?'Nuarr keeps this collection in step with Sonarr. Click to stop - the collection is left as it is.':'Click to keep an Ended collection in this library, in step with Sonarr.'}"
@@ -29418,12 +29430,19 @@ function pcollPaint(){
       ${d.running?`<span class="dim" style="font-size:11px">${esc(d.now||'working…')}</span>`:''}
       <button onclick="pcollRun(this)" ${d.running?'disabled':''} style="font-size:10.5px;padding:1px 8px">${d.running?'syncing…':'Sync now'}</button>
     </span>
-    <div class="dim" style="font-size:11px;margin:3px 0 6px">Plex cannot filter on
-      whether a show has ended - that is Sonarr's word. Each switched-on library
-      gets a collection of every show Sonarr calls <b>ended</b>; a show that gets
-      another season leaves it on the next pass, and a show that finishes joins.
-      Turning a library off leaves the collection as it stands.</div>
+    <div class="dim" style="font-size:11px;margin:3px 0 6px">Collections Plex cannot
+      build for itself, kept in step with what Nuarr knows: <b>Ended</b> from Sonarr's
+      word; <b>English</b> where every regular episode carries English audio in
+      Nuarr's own probe (specials do not count); <b>English Ended</b> and
+      <b>English Unwatched</b> (nothing of it watched yet) from both. A show that
+      changes leaves or joins on the next pass. Turning a library off leaves its
+      collections as they stand.</div>
     ${rows||'<div class="dim">no TV libraries</div>'}`;
+}
+async function pcollRules(library,rules,btn){
+  if(btn) btn.disabled=true;
+  try{ await fetch('/api/plexcoll/set?library='+encodeURIComponent(library)+'&on=1&rules='+encodeURIComponent(rules),{method:'POST'}); }catch(e){}
+  loadPlexColl();
 }
 async function pcollSet(library,on,btn){
   if(btn) btn.disabled=true;

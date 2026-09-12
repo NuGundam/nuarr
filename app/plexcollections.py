@@ -46,6 +46,33 @@ from .db import kv_get, kv_set
 EVERY_S = 6 * 3600
 TITLE_DEFAULT = "Ended"
 
+# THE RULES A LIBRARY CAN KEEP. Each is a collection title and a test over
+# what nuarr knows about a show: Sonarr's status, whether every regular
+# episode in the library carries English audio (nuarr's own probe of every
+# file, specials excluded), and whether anyone has watched any of it.
+RULES = {
+    "ended":             ("Ended", "Sonarr calls the show ended"),
+    "english":           ("English", "every regular episode has English audio "
+                                     "(specials do not count)"),
+    "english_ended":     ("English Ended", "English, and ended"),
+    "english_unwatched": ("English Unwatched", "English, and nothing of it "
+                                               "has been watched yet"),
+}
+RULE_ORDER = ("ended", "english", "english_ended", "english_unwatched")
+
+
+def _want(rule: str, f: dict) -> bool:
+    st, en, un = f.get("status"), bool(f.get("english")), bool(f.get("unwatched"))
+    if rule == "ended":
+        return st == "ended"
+    if rule == "english":
+        return en
+    if rule == "english_ended":
+        return en and st == "ended"
+    if rule == "english_unwatched":
+        return en and un
+    return False
+
 # The last pass, per library, for the card. In memory; kv holds the last
 # summary across restarts so the page says something before the first run.
 STATE: dict = {"running": False, "now": "", "last": {}}
@@ -60,14 +87,24 @@ def enabled(library: str) -> bool:
     return (kv_get(_key(library)) or "") == "1"
 
 
-def title_for(library: str) -> str:
-    return (kv_get(_key(library) + ".title") or "").strip() or TITLE_DEFAULT
+def rules_for(library: str) -> list:
+    """The rule keys this library keeps, in RULE_ORDER. Default: ended."""
+    raw = (kv_get(_key(library) + ".rules") or "").strip()
+    keys = [k for k in raw.split(",") if k in RULES] if raw else ["ended"]
+    return [k for k in RULE_ORDER if k in keys]
 
 
-def set_enabled(library: str, on: bool, title: str = "") -> None:
+def set_enabled(library: str, on: bool, rules: str = "") -> None:
     kv_set(_key(library), "1" if on else "0")
-    if title:
-        kv_set(_key(library) + ".title", title.strip()[:60])
+    if rules is not None and rules != "":
+        keep = [k for k in rules.split(",") if k in RULES]
+        kv_set(_key(library) + ".rules", ",".join(keep))
+
+
+def title_for(library: str) -> str:
+    """The first kept collection's title - what the health row names."""
+    r = rules_for(library)
+    return RULES[r[0]][0] if r else TITLE_DEFAULT
 
 
 def tv_libraries() -> list:
@@ -137,7 +174,22 @@ def _plex_shows(section: str, added_since: float = 0.0) -> list[dict]:
         out.append({"key": str(m.get("ratingKey") or ""),
                     "title": m.get("title") or "", "tvdb": tvdb,
                     "path": loc.rstrip("\\/").lower(),
+                    # Nothing watched at all - a show somebody has started is
+                    # not "unwatched", whatever Plex's own smart filter calls
+                    # a show with unwatched episodes left in it.
+                    "unwatched": int(m.get("viewedLeafCount") or 0) == 0,
                     "in": [c.get("tag") or "" for c in (m.get("Collection") or [])]})
+    return out
+
+
+def _plex_viewed_since(section: str, since: float) -> list[dict]:
+    """The shows anybody has watched something of since a time."""
+    d = _get(f"/library/sections/{section}/all?type=2&includeGuids=1"
+             f"&lastViewedAt>>={int(since)}")
+    out = []
+    for m in (d.get("MediaContainer") or {}).get("Metadata") or []:
+        out.append({"key": str(m.get("ratingKey") or ""),
+                    "unwatched": int(m.get("viewedLeafCount") or 0) == 0})
     return out
 
 
@@ -165,11 +217,12 @@ BATCH = 50
 
 # ---------------------------------------------------------------- sonarr ---
 async def _sonarr_status() -> dict:
-    """{tvdb id (str): status} and {series path (lower): status} from every
-    enabled Sonarr."""
+    """{tvdb id (str): status}, {series path (lower): status}, and the Sonarr
+    series id -> tvdb id map nuarr's files table is keyed on."""
     from .arr import shared_client
     by_tvdb: dict = {}
     by_path: dict = {}
+    by_sid: dict = {}
     for cfg in (SETTINGS.arrs or []):
         if cfg.kind != "sonarr" or not cfg.enabled or not cfg.api_key:
             continue
@@ -181,24 +234,57 @@ async def _sonarr_status() -> dict:
             continue
         for s in series or []:
             st = str(s.get("status") or "").lower()
-            if s.get("tvdbId"):
-                by_tvdb[str(s["tvdbId"])] = st
+            tv = str(s.get("tvdbId") or "")
+            if tv:
+                by_tvdb[tv] = st
+                by_sid[(cfg.name, int(s.get("id") or 0))] = tv
             if s.get("path"):
                 by_path[str(s["path"]).rstrip("\\/").lower()] = st
-    return {"tvdb": by_tvdb, "path": by_path}
+    return {"tvdb": by_tvdb, "path": by_path, "sid": by_sid}
+
+
+# --------------------------------------------------------- english audio ---
+def _english_tvdbs(library: str, arr: dict) -> set:
+    """The tvdb ids of every show in this library whose regular episodes ALL
+    carry English audio, from nuarr's own probe of every file.
+
+    Specials (season 0) do not count either way: an English OVA does not make
+    a Japanese-only show English, and a Japanese-only extra does not take a
+    dubbed show out. A file nuarr has not probed counts against the show -
+    "every episode" has to mean every episode nuarr can vouch for.
+    """
+    from .db import cursor
+    out: set = set()
+    with cursor() as cur:
+        rows = cur.execute(
+            "SELECT arr_name, arr_parent_id, "
+            "       COUNT(*) n, "
+            "       SUM(CASE WHEN ',' || COALESCE(audio_langs,'') || ',' "
+            "                     LIKE '%,eng,%' THEN 1 ELSE 0 END) eng "
+            "  FROM files "
+            " WHERE library = ? AND state NOT IN ('deleted','duplicate') "
+            "   AND COALESCE(season, 0) > 0 AND arr_parent_id IS NOT NULL "
+            " GROUP BY arr_name, arr_parent_id", (library,)).fetchall()
+    for r in rows:
+        if int(r["n"] or 0) > 0 and int(r["eng"] or 0) == int(r["n"] or 0):
+            tv = arr["sid"].get((r["arr_name"], int(r["arr_parent_id"] or 0)))
+            if tv:
+                out.add(tv)
+    return out
 
 
 # ------------------------------------------------------------------ sync ---
 #
 # A FULL SWEEP, THEN ONLY THE CHANGES. A sweep reads every show in the
-# library from Plex with its collections, matches each to Sonarr, and tags
-# the difference - the right thing to do the first time and once a day to
-# catch drift. Between sweeps the answer can only change three ways: a show
-# changed status in Sonarr, a show arrived in Plex, a show left Plex. The
-# incremental pass asks Sonarr for statuses (one call, always), asks Plex
-# only for shows added since the sweep, and compares against what it
-# remembers - so a six-hourly pass on a library of seven hundred shows is
-# two small requests and usually no writes at all.
+# library from Plex with its collections and watched state, works out what
+# nuarr knows about each - Sonarr's status, English audio, unwatched - and
+# tags the difference for every rule the library keeps. Right the first
+# time and once a day to catch drift. Between sweeps the answer can only
+# change a few ways: a status changed in Sonarr, a show's files changed
+# under nuarr, somebody watched something, a show arrived in Plex. The
+# incremental pass asks Sonarr for statuses, nuarr's own table for English,
+# and Plex only for shows added or viewed since the last pass, and works
+# the rest from what it remembers.
 FULL_EVERY_S = 24 * 3600
 
 
@@ -209,7 +295,7 @@ def _mem_key(library: str) -> str:
 def _mem_load(library: str) -> dict:
     try:
         d = json.loads(kv_get(_mem_key(library)) or "{}")
-        if d.get("full_at"):
+        if d.get("full_at") and d.get("shows") is not None:
             return d
     except Exception:                                        # noqa: BLE001
         pass
@@ -234,32 +320,52 @@ async def _apply(section: str, title: str, add: list, remove: list, res: dict) -
     for what, rows, on in (("adding", add, True), ("removing", remove, False)):
         for i in range(0, len(rows), BATCH):
             batch = rows[i:i + BATCH]
-            STATE["now"] = (f"{what} {batch[0]['title']}"
+            STATE["now"] = (f"{what} {batch[0]['title']} to {title}"
                             + (f" and {len(batch) - 1} more" if len(batch) > 1 else "")
                             + f" ({i + len(batch)} of {len(rows)})")
             try:
                 await asyncio.to_thread(_tag, section, [b["key"] for b in batch],
                                         title, on)
-                res["added" if on else "removed"] += len(batch)
+                res["added"] += len(batch) if on else 0
+                res["removed"] += 0 if on else len(batch)
             except Exception as e:                           # noqa: BLE001
                 res["error"] = (f"could not {'tag' if on else 'untag'} "
                                 f"{batch[0]['title']}: {type(e).__name__}")
 
 
+def _diff_and_members(rules: list, facts: dict, members: dict) -> tuple:
+    """For every rule: what to add, what to remove, and the members after.
+    facts: key -> {title, status, english, unwatched}; members: title -> set."""
+    adds: dict = {}
+    removes: dict = {}
+    after: dict = {}
+    for rk in rules:
+        title = RULES[rk][0]
+        have = set(members.get(title) or ())
+        want = {k for k, f in facts.items() if _want(rk, f)}
+        adds[title] = [{"key": k, "title": facts[k]["title"]} for k in sorted(want - have)]
+        removes[title] = [{"key": k, "title": facts[k].get("title", k)}
+                          for k in sorted(have - want) if k in facts]
+        after[title] = sorted(want)
+    return adds, removes, after
+
+
 async def sync_library(lib, arr: dict | None = None, dry: bool = False,
                        full: bool = False) -> dict:
-    """Bring one library's Ended collection in line. Returns what it did."""
-    title = title_for(lib.name)
-    res = {"library": lib.name, "title": title, "at": time.time(),
-           "plex_shows": 0, "ended": 0, "in_collection": 0,
-           "added": 0, "removed": 0, "unmatched": 0, "unmatched_titles": [],
-           "error": "", "mode": "full"}
+    """Bring one library's kept collections in line. Returns what it did."""
+    rules = rules_for(lib.name)
+    res = {"library": lib.name, "rules": rules,
+           "titles": [RULES[r][0] for r in rules], "at": time.time(),
+           "plex_shows": 0, "counts": {}, "added": 0, "removed": 0,
+           "unmatched": 0, "unmatched_titles": [], "error": "", "mode": "full"}
+    if not rules:
+        res["error"] = "no rules are switched on for this library"
+        return res
     mem = _mem_load(lib.name)
     now = time.time()
-    if (not full and mem and mem.get("title") == title
+    if (not full and mem and mem.get("rules") == rules
             and now - float(mem.get("full_at") or 0) < FULL_EVERY_S):
-        return await _sync_changes(lib, section_hint=mem.get("section", ""),
-                                   arr=arr, mem=mem, res=res, dry=dry)
+        return await _sync_changes(lib, arr, mem, res, dry)
     try:
         section = await asyncio.to_thread(_section_for, lib.path)
         if not section:
@@ -268,14 +374,13 @@ async def sync_library(lib, arr: dict | None = None, dry: bool = False,
         shows = await asyncio.to_thread(_plex_shows, section)
         if arr is None:
             arr = await _sonarr_status()
+        eng = await asyncio.to_thread(_english_tvdbs, lib.name, arr)
     except Exception as e:                                   # noqa: BLE001
         res["error"] = f"{type(e).__name__}: {e}"
         return res
     res["plex_shows"] = len(shows)
-    add, remove = [], []
-    keys: dict = {}          # tvdb -> rating key, for the incremental passes
-    status: dict = {}        # tvdb -> status as of this sweep
-    members: dict = {}       # rating key -> title, as of this sweep
+    facts: dict = {}
+    members: dict = {RULES[r][0]: set() for r in rules}
     for s in shows:
         st = _status_of(s, arr)
         if st is None:
@@ -283,41 +388,98 @@ async def sync_library(lib, arr: dict | None = None, dry: bool = False,
             if len(res["unmatched_titles"]) < 100:
                 res["unmatched_titles"].append(s["title"])
             continue                     # Sonarr does not know it: leave it be
-        want = st == "ended"
-        have = title in s["in"]
-        if s["tvdb"]:
-            keys[s["tvdb"]] = s["key"]
-            status[s["tvdb"]] = st
-        if want:
-            res["ended"] += 1
-        if have:
-            res["in_collection"] += 1
-        if want and not have:
-            add.append(s)
-        elif have and not want:
-            remove.append(s)
-        if want:
-            members[s["key"]] = s["title"]
+        facts[s["key"]] = {"title": s["title"], "tvdb": s["tvdb"], "status": st,
+                           "english": s["tvdb"] in eng,
+                           "unwatched": bool(s["unwatched"])}
+        for t in members:
+            if t in s["in"]:
+                members[t].add(s["key"])
+    adds, removes, after = _diff_and_members(rules, facts, members)
+    res["counts"] = {t: len(v) for t, v in after.items()}
     if dry:
-        res.update(added=len(add), removed=len(remove), dry=True)
+        res.update(added=sum(len(v) for v in adds.values()),
+                   removed=sum(len(v) for v in removes.values()), dry=True)
         return res
-    await _apply(section, title, add, remove, res)
-    res["in_collection"] = res["in_collection"] + res["added"] - res["removed"]
-    # The finishing touches, on the full sweep only: the kept collection
-    # sorted by title, and a poster for every collection in the library that
-    # Plex leaves blank. Never fatal - a poster is not a membership.
+    for t in members:
+        await _apply(section, t, adds[t], removes[t], res)
     try:
         res["posters"] = await asyncio.to_thread(
-            tidy_collections, section, title, mem.get("posters") or {})
+            tidy_collections, section, list(members), mem.get("posters") or {})
     except Exception as e:                                   # noqa: BLE001
         res["posters"] = {"error": f"{type(e).__name__}: {e}"}
     if not res["error"]:
-        _mem_save(lib.name, {"full_at": now, "section": section, "title": title,
-                             "keys": keys, "status": status, "members": members,
+        _mem_save(lib.name, {"full_at": now, "changes_at": now, "section": section,
+                             "rules": rules, "shows": facts, "members": after,
                              "plex_shows": len(shows),
                              "unmatched_titles": res["unmatched_titles"],
-                             "posters": (res["posters"] or {}).get("stamps")
+                             "posters": (res.get("posters") or {}).get("stamps")
                                         or mem.get("posters") or {}})
+    return res
+
+
+async def _sync_changes(lib, arr: dict | None, mem: dict, res: dict,
+                        dry: bool = False) -> dict:
+    """Only what can have changed since the last pass."""
+    res["mode"] = "changes"
+    rules = res["rules"]
+    section = mem.get("section") or ""
+    try:
+        if arr is None:
+            arr = await _sonarr_status()
+        eng = await asyncio.to_thread(_english_tvdbs, lib.name, arr)
+        since = float(mem.get("changes_at") or mem.get("full_at") or 0) - 3600
+        new_shows = await asyncio.to_thread(
+            _plex_shows, section, float(mem.get("full_at") or 0) - 3600)
+        viewed = await asyncio.to_thread(_plex_viewed_since, section, since)
+    except Exception as e:                                   # noqa: BLE001
+        res["error"] = f"{type(e).__name__}: {e}"
+        return res
+    facts = {k: dict(v) for k, v in (mem.get("shows") or {}).items()}
+    # 1. what Sonarr and nuarr's own table say now, for every remembered show
+    for k, f in facts.items():
+        tv = f.get("tvdb") or ""
+        if tv and tv in arr["tvdb"]:
+            f["status"] = arr["tvdb"][tv]
+        f["english"] = bool(tv) and tv in eng
+    # 2. somebody watched something
+    for v in viewed:
+        if v["key"] in facts:
+            facts[v["key"]]["unwatched"] = v["unwatched"]
+    # 3. shows Plex added since the sweep
+    seen_new = 0
+    for s in new_shows:
+        if s["key"] in facts:
+            continue
+        seen_new += 1
+        st = _status_of(s, arr)
+        if st is None:
+            if s["title"] not in res["unmatched_titles"] and len(res["unmatched_titles"]) < 100:
+                res["unmatched_titles"].append(s["title"])
+            continue
+        facts[s["key"]] = {"title": s["title"], "tvdb": s["tvdb"], "status": st,
+                           "english": s["tvdb"] in eng,
+                           "unwatched": bool(s["unwatched"])}
+    for t in (mem.get("unmatched_titles") or []):
+        if t not in res["unmatched_titles"] and len(res["unmatched_titles"]) < 100:
+            res["unmatched_titles"].append(t)
+    res["unmatched"] = len(res["unmatched_titles"])
+    res["plex_shows"] = int(mem.get("plex_shows") or 0) + seen_new
+    members = {t: set(v) for t, v in (mem.get("members") or {}).items()}
+    for rk in rules:
+        members.setdefault(RULES[rk][0], set())
+    adds, removes, after = _diff_and_members(rules, facts, members)
+    res["counts"] = {t: len(v) for t, v in after.items()}
+    if dry:
+        res.update(added=sum(len(v) for v in adds.values()),
+                   removed=sum(len(v) for v in removes.values()), dry=True)
+        return res
+    for rk in rules:
+        t = RULES[rk][0]
+        await _apply(section, t, adds[t], removes[t], res)
+    if not res["error"]:
+        mem.update(shows=facts, members=after, plex_shows=res["plex_shows"],
+                   unmatched_titles=res["unmatched_titles"], changes_at=time.time())
+        _mem_save(lib.name, mem)
     return res
 
 
@@ -386,8 +548,8 @@ def _upload_poster(coll_key: str, data: bytes) -> None:
         r.read()
 
 
-def tidy_collections(section: str, kept_title: str, stamps: dict) -> dict:
-    """Sort the kept collection by title; give every blank one a collage.
+def tidy_collections(section: str, kept_titles: list, stamps: dict) -> dict:
+    """Sort the kept collections by title; give every blank one a collage.
     Returns {"stamps": {coll_key: "k1,k2,k3,k4"}, "posted": n, "sorted": bool}."""
     out = {"stamps": dict(stamps), "posted": 0, "sorted": False}
     d = _get(f"/library/sections/{section}/collections")
@@ -395,7 +557,7 @@ def tidy_collections(section: str, kept_title: str, stamps: dict) -> dict:
         key = str(c.get("ratingKey") or "")
         if not key:
             continue
-        if (c.get("title") or "") == kept_title and str(c.get("collectionSort")) != "1":
+        if (c.get("title") or "") in kept_titles and str(c.get("collectionSort")) != "1":
             _put(f"/library/metadata/{key}/prefs?collectionSort=1")
             out["sorted"] = True
         # Does its poster actually answer? Plex's own composite does for an
@@ -514,12 +676,11 @@ async def sync(force: bool = False) -> dict:
             r = await sync_library(lib, arr, full=force)
             out[lib.name] = r
             if r.get("error"):
-                joblog.log(f"collections: {lib.name} '{r['title']}' - "
-                           f"{r['error']}", "warn")
+                joblog.log(f"collections: {lib.name} - {r['error']}", "warn")
             elif r["added"] or r["removed"]:
-                joblog.log(f"collections: {lib.name} '{r['title']}' - "
-                           f"{r['added']} added, {r['removed']} removed, "
-                           f"{r['in_collection']} in it now "
+                joblog.log(f"collections: {lib.name} - {r['added']} added, "
+                           f"{r['removed']} removed across "
+                           f"{', '.join(r['titles'])} "
                            f"({r.get('mode', 'full')} pass)", "ok")
         STATE["last"] = out
         try:
@@ -540,19 +701,23 @@ def status() -> dict:
             last = {}
     libs = []
     for lib in tv_libraries():
+        rules = rules_for(lib.name)
         libs.append({"library": lib.name, "on": enabled(lib.name),
-                     "title": title_for(lib.name),
+                     "rules": rules, "title": title_for(lib.name),
                      "last": last.get(lib.name) or {}})
     return {"running": STATE["running"], "now": STATE["now"],
-            "every_h": EVERY_S // 3600, "libraries": libs}
+            "every_h": EVERY_S // 3600,
+            "rules": [{"key": k, "title": RULES[k][0], "what": RULES[k][1]}
+                      for k in RULE_ORDER],
+            "libraries": libs}
 
 
 async def watch() -> None:
     schedules.register(
         "plexcoll", "Plex collections", "Plex", EVERY_S,
-        what="Keeps an 'Ended' collection per switched-on TV library in step "
-             "with Sonarr: shows Sonarr calls ended are in it, shows that are "
-             "continuing or come back are not.")
+        what="Keeps collections per switched-on TV library in step with what "
+             "nuarr knows: Ended (Sonarr), English (every regular episode "
+             "has English audio), English Ended, English Unwatched.")
     await asyncio.sleep(300)
     while True:
         schedules.beat("plexcoll")
