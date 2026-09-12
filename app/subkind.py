@@ -224,8 +224,25 @@ def _track_rows(limit: int) -> list:
     return out
 
 
-def findings(limit: int = 600) -> dict:
-    """Everything, least certain first, with the counts the header needs."""
+def findings(limit: int = 600, want_done: bool = True,
+             want_unread: bool = True) -> dict:
+    r"""Everything, least certain first, with the counts the header needs.
+
+    WHAT IT SENDS AND WHAT IT COUNTS ARE TWO DIFFERENT SETS, and separating
+    them is the whole performance story of this panel.
+
+    Measured before the split: 683 rows, 800 KB of JSON, 0.9 to 1.8 seconds an
+    endpoint call - to draw a panel whose default view shows SEVEN of them.
+    655 were findings already marked and 21 not read yet; both are hidden
+    unless you press the footer link that asks for them, and both were being
+    serialised, shipped and parsed every fifteen seconds regardless.
+
+    The counts still come from everything, because the header's whole job is
+    to say how many are hidden - "also show the 655 already marked" cannot be
+    written without counting 655. That costs two queries and about 150 ms of
+    Python; what it does not cost any more is three quarters of a megabyte on
+    the wire.
+    """
     from . import hardsub, subtitletitle as stt
     rows = _picture_rows(limit) + _track_rows(limit)
     lo, hi = dismiss_at(), mark_at()
@@ -237,8 +254,18 @@ def findings(limit: int = 600) -> dict:
                              abs(r["sure"] - mid)))
     hs = hardsub.stats()
     sp = stt.progress()
+    # COUNTED OVER ALL OF THEM, SENT AS THE FEW. The filter is applied after
+    # the counts below have been taken from the whole set, which is why the
+    # header can still say how many are being left out.
+    shown = [r for r in rows
+             if (want_done or not r["done"])
+             and (want_unread or not r["unread"])]
     return {
-        "rows": rows,
+        "rows": shown,
+        # So the panel can say "showing 7 of 683" honestly rather than
+        # inferring it from a list it was only given part of.
+        "shown": len(shown), "found": len(rows),
+        "filtered": {"done": not want_done, "unread": not want_unread},
         "mode": mode(), "mark_at": mark_at(), "dismiss_at": dismiss_at(),
         "counts": {
             "picture": sum(1 for r in rows if r["source"] == PICTURE),

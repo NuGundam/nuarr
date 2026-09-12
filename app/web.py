@@ -7314,11 +7314,19 @@ def api_systems():
 
 
 @app.get("/api/subkind")
-def api_subkind(limit: int = 600):
-    """What subtitles each file carries - the picture and every text track.
-    600, because "select all" has to mean all of them."""
+def api_subkind(limit: int = 600, done: int = 0, unread: int = 0):
+    r"""What subtitles each file carries - the picture and every text track.
+
+    600, because "select all" has to mean all of them.
+
+    done/unread ARE THE PANEL'S OWN FILTERS, pushed down here. They used to be
+    applied in the browser, which meant the server sent every row and the
+    browser threw most of them away: 800 KB to draw seven lines. The counts
+    still cover everything, so the footer can still offer what it is hiding.
+    """
     from . import subkind
-    return subkind.findings(max(1, min(int(limit), 1000)))
+    return subkind.findings(max(1, min(int(limit), 1000)),
+                            want_done=bool(done), want_unread=bool(unread))
 
 
 def _sk_items(ids: str) -> list:
@@ -32359,11 +32367,14 @@ function skClearSel(){ _skSel.clear(); _skLast=null; _skKey=''; skPaint(true); }
 function skBatchKind(v){ _skBatchKind=v||''; _skKey=''; skPaint(true); }
 function skShow(what, on){
   if(what==='done') _skShowDone=!!on; else _skShowUnread=!!on;
-  // FORCED. A click on the footer link is a request to repaint now; the
-  // scrolled-box and focused-control guards exist to protect against the
-  // poll, and the box is nearly always scrolled by the time the footer is
-  // reachable - so without this the link did nothing until the next poll.
-  _skKey=''; skPaint(true);
+  // AND FETCHED AGAIN, because the rows it is asking for are not here. The
+  // filter lives on the server now, so "also show the 655 already marked" is
+  // a request for 655 rows nobody has sent yet rather than a change of mind
+  // about ones already in memory. FORCED for the old reason too: a click on
+  // the footer is a request to repaint now, and the scrolled-box guard would
+  // otherwise hold it until the next poll.
+  _skKey='';
+  loadSubKind(true);
 }
 async function skMode(m){
   try{ await fetch('/api/hardsub/mode?mode='+encodeURIComponent(m),{method:'POST'}); }catch(e){}
@@ -32565,9 +32576,20 @@ async function loadSubKind(force){
   const el=document.getElementById('skPanel'); if(!el) return;
   if(!_sk) el.innerHTML='<div class="skel" style="padding:12px">'
     +'<i style="width:52%"></i><i style="width:70%"></i></div>';
-  try{ _sk=await (await fetch('/api/subkind?limit=600')).json(); }
+  // THE PANEL'S FILTERS GO WITH THE REQUEST. They used to be applied here,
+  // after the server had sent every row - 683 of them, 800 KB, to draw the
+  // seven that were not already answered. The server counts all of them and
+  // sends the ones this view is actually showing.
+  try{ _sk=await (await fetch(`/api/subkind?limit=600&done=${
+        _skShowDone?1:0}&unread=${_skShowUnread?1:0}`)).json(); }
   catch(e){ el.innerHTML='<span class="dim">could not load</span>'; return; }
-  try{ _skMark=await (await fetch('/api/hardsub/mark/progress')).json(); }catch(e){}
+  // ONLY WHILE THERE IS A BATCH TO REPORT ON. This was a second request on
+  // every poll of a panel that is idle almost all the time; the marker's own
+  // state is already in the payload above (d.marking) and this is only needed
+  // for the detail while one is actually running.
+  if((_sk.marking&&_sk.marking.running) || (_skMark&&_skMark.running)){
+    try{ _skMark=await (await fetch('/api/hardsub/mark/progress')).json(); }catch(e){}
+  }
   // The rank the server gave each row, kept so "least certain first" can be
   // returned to after sorting by something else.
   (_sk.rows||[]).forEach((r,i)=>{ r._i=i; });
@@ -32654,8 +32676,12 @@ function skPaint(force){
   // What is on screen, in the order it is on screen - what a pin is measured
   // against.
   _skRows=rows;
-  const hiddenDone=_skShowDone?0:all.filter(r=>r.done).length;
-  const hiddenUnread=_skShowUnread?0:all.filter(r=>r.unread).length;
+  // FROM THE COUNTS, NOT FROM THE ROWS. `all` is what the server sent, which
+  // is now what this view asked for - so counting the hidden ones inside it
+  // would always be nought and the footer would stop offering them. The
+  // counts are taken over everything for exactly this reason.
+  const hiddenDone=_skShowDone?0:(c.done||0);
+  const hiddenUnread=_skShowUnread?0:(c.unread||0);
   const tested=(P.none||0)+(P.signs||0)+(P.dialogue||0)+(P.hybrid||0);
   const running=!!(P.running||T.running||S.running);
   // ITS OWN COUNT, ON THE RIGHT, and it is the same number its switchboard row
