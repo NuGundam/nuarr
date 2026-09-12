@@ -10007,7 +10007,11 @@ def api_activity(q: str = "", page: int = 1, page_size: int = 50):
 
 
 @app.get("/api/attention")
-def api_attention(limit: int = 400):
+async def api_attention(limit: int = 400):
+    return await asyncio.to_thread(_attention, limit)
+
+
+def _attention(limit: int = 400):
     """THE ACTUAL FILES behind the Attention tile, not just the counts.
 
     The tile could say "3" and send you to a panel that listed none of them:
@@ -10024,15 +10028,38 @@ def api_attention(limit: int = 400):
         except Exception:                                    # noqa: BLE001
             return []
 
-    for r in rows(
-            "SELECT id, path, title, state_reason FROM files "
-            "WHERE state='error' ORDER BY COALESCE(processed_at,0) DESC "
-            "LIMIT ?", (limit,)):
-        kind, why = refetch.classify(r["state_reason"], r["path"])
+    # THE ERRORS LIST LIVES HERE NOW. Each row carries what the old drill
+    # carried - the episode label rather than the bare series title, the
+    # size, the disk, when it failed and the job whose transcript explains
+    # it - so "Needs attention" is the one place a failure is read.
+    errs = rows(
+        "SELECT id, path, title, season, episode, library, state_reason, "
+        "       size, pool_disk, processed_at, updated_at FROM files "
+        "WHERE state='error' ORDER BY COALESCE(processed_at,0) DESC "
+        "LIMIT ?", (limit,))
+    jobs_of: dict = {}
+    ids = [r["id"] for r in errs]
+    for i in range(0, len(ids), 400):
+        chunk = ids[i:i + 400]
+        qs = ",".join("?" * len(chunk))
+        for j in rows("SELECT file_id, job_id, error FROM jobs "
+                      f"WHERE file_id IN ({qs}) AND rowid IN ("
+                      f"  SELECT MAX(rowid) FROM jobs WHERE file_id IN ({qs}) "
+                      "   GROUP BY file_id)", tuple(chunk) + tuple(chunk)):
+            jobs_of[j["file_id"]] = j
+    for r in errs:
+        j = jobs_of.get(r["id"]) or {}
+        reason = r["state_reason"] or j.get("error") or "the job failed"
+        kind, why = refetch.classify(reason, r["path"])
         out.append({"source": "file errors", "id": r["id"],
-                    "title": r["title"] or os.path.basename(r["path"] or ""),
-                    "path": r["path"] or "",
-                    "detail": r["state_reason"] or "the job failed",
+                    "title": display_label(r["title"], r["season"],
+                                           r["episode"])
+                             or os.path.basename(r["path"] or ""),
+                    "path": r["path"] or "", "library": r["library"] or "",
+                    "detail": reason,
+                    "size": r["size"] or 0, "pool_disk": r["pool_disk"] or "",
+                    "at": r["processed_at"] or r["updated_at"] or 0,
+                    "job_id": j.get("job_id") or "",
                     "goto": "", "act": "errors",
                     "refetch_kind": kind, "refetch_why": why})
 
@@ -11491,6 +11518,17 @@ def api_workers_reset():
     return {"ok": True, "workers": workers.reset()}
 
 
+@app.post("/api/workers/pause")
+def api_workers_pause(pool: str, on: int = 1):
+    """Stop one pool taking new work, or let it again. Running jobs finish."""
+    ok, msg = workers.set_paused(pool, bool(on))
+    if not ok:
+        raise HTTPException(400, msg)
+    joblog.log(f"worker pool {msg}", "warn" if on else "ok")
+    return {"ok": True, "message": msg, "paused": sorted(workers.paused()),
+            "workers": workers.get().as_dict()}
+
+
 @app.get("/api/cleanup")
 def api_cleanup(under_mb: int = 100):
     """What cleanup.py would target. Read-only - removal is CLI-only, on purpose."""
@@ -12556,6 +12594,22 @@ button.on{border-color:var(--ok);color:var(--ok)}
 .runbox::-webkit-scrollbar-thumb{background:#2b3340;border-radius:6px}
 .runbox::-webkit-scrollbar-track{background:#0b0e12}
 .watchbox{margin-top:8px;border-top:1px solid var(--line);padding-top:8px}
+/* THE POOL SWITCH. A toggle, not a button pair: one control that shows its
+   state and flips on click, the way every "is this on" control elsewhere
+   on the page reads. Green knob right = running; dim knob left = paused. */
+.wsw{display:inline-flex;align-items:center;gap:6px;font-size:10.5px;padding:2px 8px 2px 4px;
+     border-radius:12px;border:1px solid var(--line);background:transparent;cursor:pointer;
+     color:var(--dim);white-space:nowrap}
+.wsw .knob{width:22px;height:12px;border-radius:7px;background:rgba(255,255,255,.08);
+     position:relative;display:inline-block;transition:background .2s}
+.wsw .knob::after{content:"";position:absolute;top:2px;left:2px;width:8px;height:8px;border-radius:50%;
+     background:var(--dim);transition:left .2s,background .2s}
+.wsw.on{color:var(--ok);border-color:rgba(127,212,163,.45)}
+.wsw.on .knob{background:rgba(127,212,163,.25)}
+.wsw.on .knob::after{left:12px;background:var(--ok)}
+.wsw.off{color:var(--warn);border-color:rgba(226,179,65,.45)}
+.wsw.off .knob::after{background:var(--warn)}
+tr.wpaused td:first-child{opacity:.75}
 .watchbox .logbox.inline{margin:0;max-height:200px}
 td.act button.on{border-color:var(--acc);color:var(--acc)}
 button.resume{border-color:var(--acc);color:var(--acc);font-size:11px;padding:2px 8px}
@@ -14752,8 +14806,33 @@ function pulse(el){ if(!el) return; el.classList.remove('changed');
 // ---- per-panel auto-scroll ------------------------------------------------
 // Scrolling up to read something must not be undone two seconds later by the
 // next refresh. Each panel tracks its own state and offers a way back.
+// NOTHING REPAINTS UNDER A MOVING WHEEL. Every follow guard on this page
+// asks "is the reader at the top / bottom?" and repaints if so - which is
+// exactly where a reader is in the first few hundred milliseconds of
+// scrolling away. The poll landed mid-gesture, innerHTML was rebuilt, the
+// momentum died and the box snapped. So the guards also ask "is a hand on
+// it right now?": any wheel, touch, scroll key or held mouse button (a
+// scrollbar drag) marks the page busy for a moment, and every repaint that
+// consults follows() waits for the next tick instead. Programmatic scrolls
+// (keepPinned) are not counted, so a following box cannot starve itself.
+let _scrollBusyUntil=0, _mouseHeld=false, _mouseDownAt=0;
+// A held button counts for eight seconds at most, and a window that loses
+// focus lets go: a mouseup that lands outside the window never arrives, and
+// a flag that never clears would freeze every panel on the page for good.
+function userScrolling(){
+  return (_mouseHeld && Date.now()-_mouseDownAt<8000) || Date.now()<_scrollBusyUntil;
+}
+window.addEventListener('blur', ()=>{ _mouseHeld=false; });
+function _touchScroll(){ _scrollBusyUntil=Date.now()+900; }
+document.addEventListener('wheel', _touchScroll, {passive:true, capture:true});
+document.addEventListener('touchmove', _touchScroll, {passive:true, capture:true});
+document.addEventListener('keydown', e=>{
+  if(['ArrowUp','ArrowDown','PageUp','PageDown','Home','End',' '].includes(e.key)) _touchScroll();
+}, {passive:true, capture:true});
+document.addEventListener('mousedown', ()=>{ _mouseHeld=true; _mouseDownAt=Date.now(); }, {capture:true});
+document.addEventListener('mouseup',   ()=>{ _mouseHeld=false; _touchScroll(); }, {capture:true});
 const _follow={};
-function follows(id){ return _follow[id]!==false; }
+function follows(id){ return !userScrolling() && _follow[id]!==false; }
 function watchScroll(id){
   const el=document.getElementById(id);
   if(!el || el.dataset.watched) return;
@@ -16675,6 +16754,17 @@ async function alFixTag(fid, track, btn){
     ()=>loadAttention(true));
 }
 
+// A FILTER, NOT A DIFFERENT PANEL. The library rows' "N error" used to open
+// the errors drill for that library; the errors list lives under Needs
+// attention now, so the link opens that and types the library into its
+// filter - every path carries the library name, so the filter is exact.
+async function attnOpen(q){
+  const box=document.getElementById('attnQ');
+  if(box) box.value=q||'';
+  await loadAttention(true);
+  const p=document.getElementById('attnPanel');
+  if(p) p.scrollIntoView({behavior:'smooth',block:'nearest'});
+}
 async function loadAttention(force){
   const p=document.getElementById('attnPanel');
   if(p) p.style.display='';
@@ -16727,14 +16817,32 @@ function attnPaint(){
           display:flex;gap:10px;align-items:baseline;flex-wrap:wrap">
         <b style="color:${col}">${esc(src)}</b>
         <span class="dim" style="font-size:11px">${list.length} · ${esc(blurb)}</span>
-        ${go.goto?`<a href="${esc(go.goto)}" style="font-size:11px">open the ${esc(src)} page →</a>`
-                 :`<a href="#" style="font-size:11px" onclick="document.getElementById('attnPanel').style.display='none';drill({errors:1,t:'Errors'});return false">open the errors list →</a>`}
+        ${go.goto?`<a href="${esc(go.goto)}" style="font-size:11px">open the ${esc(src)} page →</a>`:''}
       </div>`;
     if(src==='file errors'){
-      // The count and the door. The drill behind it is the view.
-      h+=`<div style="padding:2px 14px 10px 26px" class="dim" style="font-size:11.5px">
-        ${list.length} file${list.length===1?'':'s'} failed — the errors list
-        has the message, the size, the disk, when it happened and a filter.</div>`;
+      // THE ROWS THEMSELVES, not a count and a door. This used to say "N
+      // files failed - the errors list has the message" and send you to a
+      // second panel; the message, the fix, the size, the disk, the time
+      // and the transcript are all here now, one row per file.
+      h+=`<table class="fixed vtop" style="margin:0 0 6px"><tr><th style="padding-left:26px">Title</th>
+        <th class="num nb" style="width:80px">Size</th>
+        <th class="nb" style="width:110px">Disk</th>
+        <th class="nb" style="width:96px">When</th>
+        <th class="nb" style="width:72px"></th></tr>`
+        + list.map(it=>{
+          const rk=it.refetch_kind;
+          const act = rk==='content' && it.id
+            ? `<button class="refetch" title="reject the release this came from and ask the arr for another"
+                       onclick="refetchAsk(${it.id}, true, this)">Blocklist &amp; re-download</button>`
+            : (rk && it.refetch_why ? `<div class="dim sub">fix: ${esc(it.refetch_why)}</div>` : '');
+          return `<tr><td class="wrap" style="padding-left:26px"><div>${esc(it.title||'')}</div>
+              <div class="err sub">${esc(it.detail||'')}</div>${act}
+              <div class="mono dim sub">${esc(it.path||'')}</div></td>
+            <td class="num dim nb">${gb(it.size||0)}</td>
+            <td class="mono nb" style="color:${it.pool_disk?diskColor(it.pool_disk):'var(--dim)'};max-width:110px;overflow:hidden;text-overflow:ellipsis">${esc(it.pool_disk||'—')}</td>
+            <td class="nb" style="font-size:11px" title="${it.at?new Date(it.at*1000).toLocaleString():''}">${it.at?ago(it.at):'<span class="dim">—</span>'}</td>
+            <td class="nb">${it.job_id?`<a class="pill p-bad" style="text-decoration:none" href="/api/logs/job/${esc(it.job_id)}/raw" target="_blank" title="the job's full transcript, as text">error · log</a>`:`<span class="pill p-bad">error</span>`}</td></tr>`;
+        }).join('') + '</table>';
       continue;
     }
     for(const it of list){
@@ -16911,6 +17019,7 @@ async function drillTick(){
     }
     const box=document.getElementById('drillBody');
     if(box && box.scrollTop>40) return;      // frozen: they are reading it
+    if(userScrolling()) return;              // frozen: a hand is on it
     _drillBusy=true;
     try{ await drillRefresh(true); } finally{ _drillBusy=false; }
   } finally { drillSchedule(); }
@@ -17410,7 +17519,7 @@ async function loadLibs(){
           <span style="color:var(--ok)">${fmt(l.eligible)} eligible</span>
           ${l.inflight?`<span style="color:var(--acc)"> · ${fmt(l.inflight)} in progress</span>`:''}
           <span class="dim"> · ${fmt(l.held)} held · ${fmt(l.done)} done</span>
-          ${l.errors?`<span class="err lnk" onclick="drill({state:'error',library:'${esc(l.name)}',t:'Errors — '+${JSON.stringify(l.name)}})"> · ${fmt(l.errors)} error</span>`:''}
+          ${l.errors?`<span class="err lnk" title="open Needs attention, filtered to this library" onclick="attnOpen(${JSON.stringify(l.name)})"> · ${fmt(l.errors)} error</span>`:''}
           ${l.blocked?`<span class="warn lnk" onclick="drill({state:'blocked',library:'${esc(l.name)}',t:'Blocked — '+${JSON.stringify(l.name)}})"> · ${fmt(l.blocked)} blocked</span>`:''}
           ${l.cancelled?`<span class="warn" title="cancelled and never re-run — these still need doing"> · ${fmt(l.cancelled)} cancelled, still to do</span>`:''}
           ${l.failed_jobs?`<span class="err" title="the last attempt failed and nothing has been queued since"> · ${fmt(l.failed_jobs)} failed, still to do</span>`:''}
@@ -22144,11 +22253,13 @@ async function loadJobs(){
   };
   const capCell=(name,used,cap,pool,note)=>{
     const full = cap>0 && used>=cap;
+    const off = (j.paused||[]).includes(pool);
     const col = full ? 'var(--ok)' : (used>0 ? 'var(--acc)' : 'var(--dim)');
-    return `<span class="grp"${note?` title="${esc(note)}"`:''}>`
-          +`<span class="k" style="color:${poolColor(pool)};opacity:.9">${esc(name)}</span>`
+    return `<span class="grp"${note?` title="${esc(note)}"`:(off?` title="paused from the Workers panel — running jobs finish, nothing new starts"`:'')}>`
+          +`<span class="k" style="color:${poolColor(pool)};opacity:${off?'.45':'.9'}">${esc(name)}</span>`
           +`<span class="v" style="color:${col}">${used}</span>`
-          +`<span class="dim">/${cap}</span>`
+          +(off?`<span class="dim" style="font-size:10px;margin-left:3px">⏸ paused</span>`
+               :`<span class="dim">/${cap}</span>`)
           +(note?`<span class="dim" style="font-size:10px;margin-left:3px"
                        >inline</span>`:'')
           +`${ioTag(pool)}</span>`;
@@ -22494,10 +22605,17 @@ function paintRunning(j){
   // Sitting at the very bottom is a position too - keep it, so a reader who
   // wants to follow the tail can, without the panel deciding for them.
   const _wbEnd = _wb && (_wb.scrollTop + _wb.clientHeight >= _wb.scrollHeight - 4);
-  document.getElementById('jobsRun').innerHTML=html;
-  if(_wbTop !== null){
-    const nb = document.querySelector('.watchbox .logbox');
-    if(nb) nb.scrollTop = _wbEnd ? nb.scrollHeight : _wbTop;
+  // AND NOT AT ALL WHILE A HAND IS ON IT. Restoring scrollTop after the
+  // rebuild put the log back where it was, but the rebuild itself still
+  // killed the wheel's momentum twice a second - every scroll through the
+  // transcript was a series of stutters. The next tick paints from the
+  // same state; nothing is lost by sitting one out.
+  if(!userScrolling()){
+    document.getElementById('jobsRun').innerHTML=html;
+    if(_wbTop !== null){
+      const nb = document.querySelector('.watchbox .logbox');
+      if(nb) nb.scrollTop = _wbEnd ? nb.scrollHeight : _wbTop;
+    }
   }
 
   // The queue strip that used to sit here has moved to the Queue panel above,
@@ -22901,7 +23019,11 @@ function renderDone(j){
       const st=lbl.split(' · ').pop();
       return `<span class="pill ${stateClass(st)}">${esc(lbl+cnt)}</span>`;
     }
-    if(['passthrough','encode','subocr','transcode','job'].includes(lbl))
+    // EVERY POOL, not the three that existed when this was written. decode
+    // and listen rows sat in plain grey among coloured neighbours, which
+    // read as "state unknown" rather than "a check ran".
+    if(['passthrough','encode','subocr','transcode','job',
+        'subs','audio','decode','listen','subread','handler'].includes(lbl))
       return `<span class="pill" style="color:${poolColor(lbl)};
         border-color:${poolColor(lbl)}">${esc(lbl+cnt)}</span>`;
     return `<span class="pill ${stateClass(lbl)}">${esc(lbl+cnt)}</span>`;
@@ -24378,7 +24500,44 @@ function unitFor(k,val){
   if(k.endsWith('_s'))   return plural(val,'second');
   return String(val);
 }
-function workerRow(k,v){
+// THE SWITCH BESIDE THE DIAL. Setting a count to 0 stops a pool but loses
+// the number; the switch keeps it. Off means the pool claims nothing new
+// and what is running finishes - the thing you reach for when one kind of
+// work is flooding the box and you want it stopped now and back later.
+async function poolPause(pool, on, btn){
+  if(btn) btn.disabled=true;
+  const m=document.getElementById('wmsg'); if(m) m.textContent='…';
+  try{
+    const r=await fetch('/api/workers/pause?pool='+encodeURIComponent(pool)+'&on='+(on?1:0),{method:'POST'});
+    const j=await r.json();
+    if(m) m.textContent = r.ok ? j.message : (j.detail||'failed');
+  }catch(e){ if(m) m.textContent='failed'; }
+  loadWorkers();
+  if(typeof loadJobs==='function') loadJobs();   // the strip says paused at once
+}
+function poolSwitch(v){
+  if(!v.pool) return '';
+  const off=!!v.paused;
+  return `<button class="wsw ${off?'off':'on'}" onclick="poolPause('${v.pool}',${off?'false':'true'},this)"
+      title="${off?'Paused — nothing new starts in this pool. Click to let it run.'
+                  :'Running. Click to pause: what is running finishes, nothing new starts, the count above is kept.'}"
+      ><span class="knob"></span>${off?'paused':'running'}</button>`;
+}
+function numCtl(k,v){
+  const st=stepFor(v);
+  return `<button onclick="bump('${k}',${Math.max(v.min,v.value-st)})"
+              ${v.value<=v.min?'disabled':''}>−</button>
+      <input id="wi-${k}" class="wnum" type="number" value="${v.value}"
+             min="${v.min}" max="${v.max}" step="1"
+             onkeydown="if(event.key==='Enter'){event.preventDefault();this.blur();}"
+             onchange="commitNum('${k}',this)">
+      <button onclick="bump('${k}',${Math.min(v.max,v.value+st)})"
+              ${v.value>=v.max?'disabled':''}>+</button>`;
+}
+// `extra` is a second setting folded into the same row - the subocr GPU
+// lanes ride under the subocr worker count, because two rows wearing the
+// same bubble read as the same pool listed twice.
+function workerRow(k,v,extra){
   const st=stepFor(v);
   // A typed field alongside the steppers: 1800 -> 5 is 60 clicks otherwise, and
   // the raw number is what the min/max are quoted in. The unit label sits next
@@ -24386,21 +24545,22 @@ function workerRow(k,v){
   // THE POOL'S OWN BUBBLE, in the pool's own colour, so the row on this page
   // and the pill on the queue and the card are visibly one thing.
   const pc = v.pool ? poolColor(v.pool) : '';
-  return `<tr>
-    <td><div>${v.pool?`<span class="pill" style="color:${pc};border-color:${pc};margin-right:7px;font-size:10.5px">${esc(v.pool)}</span>`:''}${esc(v.label || k.replace(/_/g,' '))}</div>
-        <div class="dim" style="font-size:11px">${esc(v.hint)}</div></td>
+  const off = !!v.paused;
+  const [ek, ev] = extra || [];
+  return `<tr class="${off?'wpaused':''}">
+    <td><div>${v.pool?`<span class="pill" style="color:${pc};border-color:${pc};margin-right:7px;font-size:10.5px">${esc(v.pool)}</span>`:''}${esc(v.label || k.replace(/_/g,' '))}
+        ${off?`<span class="dim" style="font-size:10.5px;margin-left:8px">⏸ paused — running jobs finish, nothing new starts</span>`:''}</div>
+        <div class="dim" style="font-size:11px">${esc(v.hint)}</div>
+        ${ev?`<div style="margin-top:6px"><b style="font-size:11.5px">${esc(ev.label||ek)}</b>
+              <div class="dim" style="font-size:11px">${esc(ev.hint)}</div></div>`:''}</td>
     <td style="width:250px;text-align:right;white-space:nowrap">
-      <button onclick="bump('${k}',${Math.max(v.min,v.value-st)})"
-              ${v.value<=v.min?'disabled':''}>−</button>
-      <input id="wi-${k}" class="wnum" type="number" value="${v.value}"
-             min="${v.min}" max="${v.max}" step="1"
-             onkeydown="if(event.key==='Enter'){event.preventDefault();this.blur();}"
-             onchange="commitNum('${k}',this)">
-      <button onclick="bump('${k}',${Math.min(v.max,v.value+st)})"
-              ${v.value>=v.max?'disabled':''}>+</button>
+      ${numCtl(k,v)}
       <div class="dim" style="font-size:11px">
         ${esc(unitFor(k,v.value))} · min ${v.min} · max ${v.max} · default ${v.default}</div>
-    </td></tr>`;
+      ${ev?`<div style="margin-top:8px">${numCtl(ek,ev)}
+        <div class="dim" style="font-size:11px">on the GPU · min ${ev.min} · max ${ev.max} · default ${ev.default}</div></div>`:''}
+    </td>
+    <td style="width:96px;text-align:right;vertical-align:middle">${poolSwitch(v)}</td></tr>`;
 }
 // Typed values are clamped server-side too; this only avoids a pointless
 // round-trip and shows the correction immediately.
@@ -38855,7 +39015,11 @@ async function bkRestore(name){
 let _encLine='';   // "encoding on: ..." - fetched once, painted into the header
 function paintWorkers(){
   const w=_wdata;
-  const rows=Object.entries(w).filter(([k,v])=> _wtab==='timing' ? v.timing : !v.timing);
+  // ONE ROW PER POOL: the subocr GPU-lane setting rides inside the subocr
+  // row rather than wearing the same bubble on a row of its own.
+  const rows=Object.entries(w).filter(([k,v])=> (_wtab==='timing' ? v.timing : !v.timing)
+                                              && k!=='subocr_gpu_lanes');
+  const extraOf=k=> k==='subocr_workers' && w.subocr_gpu_lanes ? ['subocr_gpu_lanes', w.subocr_gpu_lanes] : null;
   const blurb = _wtab==='timing'
     ? `How long files settle before processing, and how long jobs stay held
        while Plex is playing or another app is working the disks.`
@@ -38864,7 +39028,7 @@ function paintWorkers(){
     ? `<div style="padding:0 14px 8px;font-size:11.5px">${_encLine}</div>` : '';
   document.getElementById('workers').innerHTML=
     `<div class="dim" style="padding:9px 14px ${enc?'4px':'9px'};font-size:11px">${blurb}</div>`+enc
-    +'<table>'+rows.map(([k,v])=>workerRow(k,v)).join('')+'</table>';
+    +'<table>'+rows.map(([k,v])=>workerRow(k,v,extraOf(k))).join('')+'</table>';
   const hint=document.getElementById('wtabhint');
   if(hint) hint.textContent = _wtab==='timing' ? '· holds & timing' : '· concurrency';
   if(_wtab!=='timing' && !_encLine) encLineFetch();

@@ -34,6 +34,10 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 from . import dvfix, fileops, gate, joblog, rules, workers  # noqa: F401  (rules used in snapshot)
+# The two snapshot builders name a local `workers` (the list of running
+# Worker objects), which shadows the module; the pause switch reads the
+# module through this alias.
+from . import workers as _wcfg
 from .config import NO_WINDOW, SETTINGS, hidden_si
 from .db import cursor, log_event
 
@@ -1138,6 +1142,10 @@ def refresh_track_langs(file_id: int, data: dict) -> None:
 
 
 def _capacity(pool: str) -> int:
+    # THE SWITCH BEATS THE DIAL. A paused pool has no capacity whatever its
+    # count says; the count is kept so the switch can be flipped back.
+    if pool in workers.paused():
+        return 0
     w = workers.get()
     if pool == "encode":
         return w.encode_workers
@@ -6259,6 +6267,7 @@ def live_snapshot() -> dict:
                    "decode": _in_pool("decode"),
                    "listen": _in_pool("listen"),
                    "subread": _in_pool("subread")},
+        "paused": sorted(_wcfg.paused()),
         "subocr_inline": sum(1 for w in workers if w.sub_ocr_active),
         # How the recently-finished jobs ended, so a ghost card can say what
         # actually happened instead of assuming success. See FATE.
@@ -6377,6 +6386,7 @@ def snapshot(recent_limit: int = 60) -> dict:
                    "decode": _in_pool("decode"),
                    "listen": _in_pool("listen"),
                    "subread": _in_pool("subread")},
+        "paused": sorted(_wcfg.paused()),
         # How much of the subocr figure above is running INSIDE a transcode
         # rather than as a job of its own. Same budget, different home, and the
         # header says so instead of leaving you to wonder why the count moves

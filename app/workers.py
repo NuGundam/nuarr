@@ -466,9 +466,11 @@ class WorkerConfig:
     audit_every_h: int
 
     def as_dict(self) -> dict:
+        off = paused()
         return {
             k: {
                 "value": getattr(self, k),
+                "paused": POOL_OF.get(k, "") in off,
                 "min": LIMITS[k][0],
                 "max": LIMITS[k][1],
                 "default": LIMITS[k][2],
@@ -481,6 +483,36 @@ class WorkerConfig:
             }
             for k in LIMITS if k not in HIDDEN_KEYS
         }
+
+
+# A SWITCH PER POOL, beside the dial. Turning a pool's count to 0 pauses
+# it, but that throws the number away - and "what was it set to before I
+# stopped it" is exactly the question asked at 3 a.m. when a pool is
+# flooding the server and needs to be stopped NOW and put back later.
+# The switch keeps the count and takes the pool's capacity to zero for as
+# long as it is off: running jobs finish, nothing new is claimed. Persisted
+# like the counts, so a restart does not silently restart a pool somebody
+# stopped on purpose.
+PAUSABLE = ("encode", "passthrough", "subocr", "subs", "audio", "decode",
+            "listen", "subread")
+
+
+def paused() -> set:
+    raw = kv_get("worker.paused") or ""
+    return {p for p in raw.split(",") if p in PAUSABLE}
+
+
+def set_paused(pool: str, on: bool) -> tuple[bool, str]:
+    if pool not in PAUSABLE:
+        return False, f"unknown pool '{pool}'"
+    cur = paused()
+    if on:
+        cur.add(pool)
+    else:
+        cur.discard(pool)
+    kv_set("worker.paused", ",".join(sorted(cur)))
+    return True, (f"{pool} paused - running jobs finish, nothing new starts"
+                  if on else f"{pool} running again")
 
 
 def _default(key: str) -> int:
