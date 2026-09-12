@@ -9801,6 +9801,57 @@ def favicon_svg():
                     headers={"Cache-Control": "public, max-age=86400"})
 
 
+# THE INSTALLED APP. Chrome and Edge offer "Install as app" - and give the
+# installed window, the Start menu entry and the taskbar their own icon -
+# only when the page names a web app manifest with PNG icons at 192 and 512
+# px. The SVG favicon is fine in a tab and useless here: the installed Nuarr
+# showed a generic "N" letter tile. The PNGs are the same glyph, shipped
+# inline from icons.py so there is no static folder and no build step.
+@app.get("/manifest.webmanifest", include_in_schema=False)
+def webmanifest():
+    man = {
+        "name": "Nuarr", "short_name": "Nuarr",
+        "description": "The media standardiser - queue, rules, viewers and "
+                       "checks for the pool.",
+        "start_url": "/", "scope": "/", "display": "standalone",
+        "background_color": "#0f1216", "theme_color": "#58a6ff",
+        "icons": [
+            {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png",
+             "purpose": "any"},
+            {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png",
+             "purpose": "any"},
+            {"src": "/icon-512-maskable.png", "sizes": "512x512",
+             "type": "image/png", "purpose": "maskable"},
+        ],
+    }
+    return Response(json.dumps(man), media_type="application/manifest+json",
+                    headers={"Cache-Control": "public, max-age=86400"})
+
+
+def _png(b64: str) -> Response:
+    import base64 as _b64
+    return Response(_b64.b64decode(b64), media_type="image/png",
+                    headers={"Cache-Control": "public, max-age=604800"})
+
+
+@app.get("/icon-192.png", include_in_schema=False)
+def icon_192():
+    from . import icons
+    return _png(icons.ICON_192)
+
+
+@app.get("/icon-512.png", include_in_schema=False)
+def icon_512():
+    from . import icons
+    return _png(icons.ICON_512)
+
+
+@app.get("/icon-512-maskable.png", include_in_schema=False)
+def icon_512_maskable():
+    from . import icons
+    return _png(icons.ICON_512_MASKABLE)
+
+
 @app.get("/favicon.ico", include_in_schema=False)
 def favicon_ico():
     # Browsers still request /favicon.ico unprompted. Serving the SVG here
@@ -11705,7 +11756,8 @@ def api_cleanup(under_mb: int = 100):
 INDEX = r"""
 <!doctype html><html><head><meta charset="utf-8"><title>Nuarr</title>
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
-<link rel="apple-touch-icon" href="/favicon.svg">
+<link rel="apple-touch-icon" href="/icon-192.png">
+<link rel="manifest" href="/manifest.webmanifest">
 <meta name="theme-color" content="#58a6ff">
 <!-- Without this a phone lays the page out at a virtual 980px and then zooms
      out, so every responsive rule below is measured against a width the device
