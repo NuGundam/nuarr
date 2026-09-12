@@ -4153,6 +4153,7 @@ async def api_audiolang_check(file_id: int, track: int = 0,
     Also in the heavy lane: it loads the same model as the test button, so
     the same "not while something else has a model open" rule applies.
     """
+    _aud_touched()
     _amemo_expire("audiolang:")
     from . import heavy
 
@@ -4822,6 +4823,19 @@ async def api_audiolang_confirm(file_id: int, track: int, code: str):
     return await asyncio.to_thread(_work)
 
 
+def _aud_touched():
+    """A tag was written or a track heard by hand: the audio page's cached
+    view and the queue's planning context are both stale. Warehouse 13 was
+    saved from the page and the page went on showing it blank until the cache
+    aged out, which read as the button doing nothing."""
+    try:
+        from . import aud, audqueue
+        aud.bump()
+        audqueue.bump()
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
 @app.post("/api/audiolang/set")
 async def api_audiolang_set(file_id: int, track: int, code: str):
     r"""A PERSON says what this track is. Written as stated, no second-guessing.
@@ -4834,6 +4848,7 @@ async def api_audiolang_set(file_id: int, track: int, code: str):
     The choice is recorded with confidence 1.0 and a why that names it as
     manual, so the page never presents a human decision as a measurement.
     """
+    _aud_touched()
     _amemo_expire("audiolang:")
     def _work():
         from . import audiolang as _al
@@ -32092,7 +32107,14 @@ async function alSet(fileId, track, selId, btn){
           <div class="altick">✓ saved</div>${steps}`;
       }
       // Long enough to read the three ticks, short enough not to feel stuck.
-      setTimeout(()=>loadAlang(true), 2600);
+      // AND THE USER INPUT ROW LEAVES. The save is done; the row it came
+      // from is in Audio User Input, and a saved tag is not a question any
+      // more.
+      setTimeout(()=>{
+        try{ audGone(`blank:${fileId}:${track}`, 'saved'); audGone(`wait:${fileId}:${track}`, 'saved'); }catch(e){}
+        setTimeout(async ()=>{ _audKey=''; await loadAud(true); audAskPaint(true); }, 1100);
+        loadAlang(true);
+      }, 2600);
     }else{
       if(msg){ msg.style.color='#e2b341'; msg.textContent=r.error||'failed'; }
       btn.disabled=false; sel.disabled=false;
@@ -34464,6 +34486,9 @@ async function loadAud(force){
   catch(e){ _aud=_aud||{board:[],rows:[],total:0}; }
   if(force || Date.now()-_audQAt > 4000) await loadAudQ();
   audPaint();
+  // A load you asked for repaints the panel whatever the guards say - the
+  // guards exist to stop the poll pulling the rug, and this is not the poll.
+  if(force) audAskPaint(true);
   clearTimeout(_audPoll);
   // ONE CLOCK FOR THE WHOLE PAGE, the subtitle page's rule. The panels here
   // used to keep their own timers, so two of them describing the same library
@@ -35113,13 +35138,34 @@ function audAskPaint(force){
   const nb=el.querySelector('.rowbox'); if(nb&&keep) nb.scrollTop=keep;
 }
 
+// THE ROW LEAVING, AS ONE THING - the subtitle panel's skGone. The word for
+// what it became replaces its buttons, it fades, the list closes over the
+// gap, and only then is the page reloaded, by which time the server agrees.
+// Without this an answer was recorded and the row simply sat there until a
+// poll happened to get past the scroll and focus guards.
+function audGone(rowId, word, ok=true){
+  const el=document.getElementById('alAskPanel'); if(!el) return;
+  const rows=[...el.querySelectorAll('.sktbl tbody tr')]
+    .filter(tr=>(tr.innerHTML||'').includes(`'${rowId}'`) || tr.id==='auddet-'+rowId);
+  rows.forEach(tr=>{
+    const cell=tr.lastElementChild;
+    if(cell && !tr.id.startsWith('auddet-')) cell.innerHTML=`<span class="skword">${esc(word)}</span>`;
+    tr.classList.add('skgone'); if(!ok) tr.classList.add('skfail');
+    setTimeout(()=>tr.classList.add('skshut'), 700);
+    setTimeout(()=>{ if(tr.parentNode) tr.parentNode.removeChild(tr); }, 1000);
+  });
+}
 async function audAnswer(fid, q, choice, btn, scope){
   if(btn&&btn.tagName==='BUTTON'){ btn.disabled=true; btn.textContent='…'; }
-  try{ await fetch(`/api/audqueue/answer?file_id=${fid}&question=${
+  let r={};
+  try{ r=await (await fetch(`/api/audqueue/answer?file_id=${fid}&question=${
         encodeURIComponent(q)}&choice=${encodeURIComponent(choice)}&scope=${
-        scope||'both'}`, {method:'POST'}); }
-  catch(e){}
-  _audKey=''; await loadAudQ(); loadAud(true);
+        scope||'both'}`, {method:'POST'})).json(); }
+  catch(e){ r={ok:false}; }
+  const rows=audAskRows().filter(x=>x.file_id===fid && x.kind==='ask');
+  const word = !r.ok ? 'failed' : r.queued ? 'on the queue' : r.settled ? 'settled' : (choice==='leave'?'left alone':'answered');
+  rows.forEach(x=>audGone(x.id, word, !!r.ok));
+  setTimeout(async ()=>{ _audKey=''; await loadAudQ(); await loadAud(true); audAskPaint(true); }, 1100);
 }
 
 async function audAnswerMany(choice, btn){

@@ -391,6 +391,8 @@ def _step_words(s: dict) -> str:
     """One step as a sentence, for the plan and the job card."""
     d = s.get("do")
     t = int(s.get("track") or 0) + 1
+    if d == "tag" and s.get("blank"):
+        return f"name track {t}'s language, which has no tag: {s.get('to') or '?'}"
     if d == "tag":
         return (f"correct track {t}'s language from {s.get('from') or '?'} "
                 f"to {s.get('to') or '?'}")
@@ -486,7 +488,16 @@ def do_one(row: dict, report=None, claim: bool = True) -> dict:
         for i, s in enumerate(tags):
             say(f"correcting language tag {i + 1} of {len(tags)}")
             try:
-                r = audiolang.fix_mislabel(fid, int(s.get("track") or 0))
+                if s.get("blank"):
+                    # A BLANK IS WRITTEN, NOT CORRECTED. fix_mislabel looks
+                    # the track up in the mismatch list, and an untagged
+                    # track is not a mismatch - it would report "nothing left
+                    # to correct" and write nothing. This is the listen
+                    # pass's own gap-fill: the header, the probe, the arrs.
+                    r = _fill_blank(fid, path, int(s.get("track") or 0),
+                                    str(s.get("to") or ""))
+                else:
+                    r = audiolang.fix_mislabel(fid, int(s.get("track") or 0))
             except Exception as e:                               # noqa: BLE001
                 r = {"ok": False, "why": f"{type(e).__name__}: {e}"[:200]}
             out["did"].append({"do": "tag", "track": s.get("track"), **r})
@@ -530,6 +541,28 @@ def do_one(row: dict, report=None, claim: bool = True) -> dict:
     finally:
         if mine and work is not None:
             work.close()
+
+
+def _fill_blank(fid: int, path: str, track: int, code: str) -> dict:
+    """Write a language onto a track that has none. Header edit only."""
+    from . import audiolang
+    if not code:
+        return {"ok": False, "why": "no language to write"}
+    if not audiolang.can_fast_path(path):
+        return {"ok": False, "why": "this container cannot be edited in place"}
+    ok, why = audiolang.apply_and_restamp(int(fid), path, {int(track): code})
+    if not ok:
+        return {"ok": False, "why": why or "the header could not be written"}
+    try:
+        audiolang._reprobe_quiet(int(fid), path)
+    except Exception:                                            # noqa: BLE001
+        pass
+    try:
+        audiolang.notify_arrs([int(fid)])
+    except Exception:                                            # noqa: BLE001
+        pass
+    return {"ok": True, "tagged": "", "heard": code,
+            "why": f"named {code} - the track had no tag"}
 
 
 # ------------------------------------------------------------ the answers --

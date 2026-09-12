@@ -52,6 +52,9 @@ def _word(s: dict) -> str:
     """One step, said the way a person would say it."""
     d = s.get("do")
     t = int(s.get("track") or 0) + 1
+    if d == "tag" and s.get("blank"):
+        return (f"name track {t}, which has no tag: {s.get('to') or ''}"
+                + (f" ({s['sure']}% sure)" if s.get("sure") else ""))
     if d == "tag":
         return (f"retag track {t}: {s.get('from') or '(none)'} → "
                 f"{s.get('to') or ''}"
@@ -498,6 +501,13 @@ def _blank_rows() -> list:
             ev = _evidence(int(r["file_id"]), ai)
             is_wait = (int(r["file_id"]), ai) in waiting or not ev.get("checked_at")
             heard = "" if is_wait else (ev.get("verdict_code") or "")
+            # A BLANK THE LISTENER NAMED CONFIDENTLY IS WORK, NOT A QUESTION.
+            # audplan plans it as a tag step and the queue writes it; it shows
+            # in the file list as "name a blank tag", and listing it here as
+            # well would be one file asking twice.
+            if (not is_wait and ev.get("verdict_ok") and heard
+                    and ev.get("fast_path", True)):
+                continue
             # A BLANK THE LISTENER DID NAME - heard en at 0.99, say, from a
             # Check pressed by hand that measures but does not write - is not
             # "would not guess". It shows what was heard and how sure, and

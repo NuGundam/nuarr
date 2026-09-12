@@ -328,6 +328,18 @@ def context(limit: int = 6000, titles: bool = True) -> dict:
         ctx["rows"] = audiolang.mismatches(int(limit))
     except Exception:                                            # noqa: BLE001
         ctx["rows"] = []
+    # AND THE BLANKS THE LISTENER HAS ALREADY NAMED. mismatches() skips an
+    # untagged track on purpose - "untagged is a gap, not a lie" - and the
+    # listen pass fills a gap the moment it hears it. But a verdict can also
+    # arrive by hand: a Check pressed on the page measures and stores without
+    # writing, and the listen queue then skips the track because a fresh
+    # verdict exists. Warehouse 13 sat that way for eight days, blank with
+    # "eng at 99.5%" on it. So a blank with a fresh, confident answer is work,
+    # planned here like any other tag.
+    try:
+        ctx["rows"] += _blanks_named()
+    except Exception:                                            # noqa: BLE001
+        pass
     ids = sorted({int(r.get("file_id") or 0)
                   for r in ctx["rows"] if r.get("file_id")})
     ctx["disks"] = _disks(ids)
@@ -338,6 +350,42 @@ def context(limit: int = 6000, titles: bool = True) -> dict:
     else:
         ctx["untitled"] = set(ids)
     return ctx
+
+
+def _blanks_named() -> list:
+    """Untagged tracks with a fresh verdict that named them, in the shape
+    mismatches() rows come in, marked blank so the plan and the worker know
+    they are filling a gap rather than correcting a lie."""
+    from . import audiolang
+    out: list = []
+    with cursor() as cur:
+        rows = cur.execute(
+            "SELECT a.file_id, a.track, a.code, a.confidence, f.path, f.library, "
+            "       f.title, f.arr_name, f.arr_parent_id, f.audio_langs "
+            "  FROM audio_lang a JOIN files f ON f.id = a.file_id "
+            " WHERE a.ok = 1 AND COALESCE(a.code,'') != '' "
+            "   AND f.state = 'done' AND f.audio_langs LIKE '%-%' "
+            "   AND (a.size IS NULL OR a.size = 0 OR f.size IS NULL "
+            "        OR a.size = f.size)").fetchall()
+    for r in rows:
+        codes = (r["audio_langs"] or "").split(",")
+        if r["track"] >= len(codes) or codes[r["track"]].strip() != "-":
+            continue
+        try:
+            if not audiolang.can_fast_path(r["path"]):
+                continue           # a header this cannot write in place
+        except Exception:                                        # noqa: BLE001
+            continue
+        out.append({"file_id": int(r["file_id"]), "track": int(r["track"]),
+                    "tagged": "", "heard": r["code"],
+                    "confidence": round(float(r["confidence"] or 0), 3),
+                    "path": r["path"], "library": r["library"] or "",
+                    "title": r["title"] or "", "held": False, "blank": True,
+                    "series": audiolang.series_key(r["arr_name"],
+                                                   r["arr_parent_id"],
+                                                   r["library"], r["title"]),
+                    "fake_dual": False, "langs": r["audio_langs"] or ""})
+    return out
 
 
 def by_file(ctx: dict | None = None) -> list:
@@ -384,6 +432,20 @@ def plan(row: dict, ctx: dict | None = None, live_titles: bool = False) -> dict:
 
     said, whose = recall(fid, path, "tag")
     for t in (row.get("tracks") or []):
+        if t.get("blank"):
+            # A GAP, NOT A LIE, and filled whatever the mode or the lines say:
+            # a blank is read as English by every player, so any confident
+            # answer is an improvement, and there is nobody's decision to
+            # overwrite. The listen pass has always filled these on the spot;
+            # this is the same rule reaching the ones it missed.
+            sure = int(round(float(t.get("confidence") or 0) * 100))
+            steps.append({
+                "do": "tag", "track": int(t.get("track") or 0), "from": "",
+                "to": t.get("heard") or "", "sure": sure, "blank": True,
+                "why": (f"no language tag at all - heard {t.get('heard')} at "
+                        f"{sure}%; a blank is read as English by every "
+                        f"player, so naming it is safe")})
+            continue
         v = audiolang.verdict_for(t)
         sure = int(v.get("sure") or 0)
         heard = t.get("heard") or ""
@@ -459,10 +521,16 @@ def _sentence(steps: list, asks: list) -> str:
     n: dict = {}
     for s in steps:
         n[s["do"]] = n.get(s["do"], 0) + 1
-    words = {"tag": "correct a language tag",
+    words = {"tag": "correct a language tag", "blank": "name a blank tag",
              "retitle": "correct a track title"}
     bits = []
-    for k in ("tag", "retitle"):
+    nb = sum(1 for s in steps if s.get("blank"))
+    if nb:
+        n["tag"] -= nb
+        n["blank"] = nb
+        if n["tag"] <= 0:
+            del n["tag"]
+    for k in ("tag", "blank", "retitle"):
         if k in n:
             bits.append(words[k] if n[k] == 1 else f"{words[k]} ×{n[k]}")
     if asks:
