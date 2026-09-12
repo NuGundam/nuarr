@@ -5382,6 +5382,37 @@ async def api_arrgap_mode(mode: str):
     return arrgap.cached()
 
 
+# One pass over the jobs table, remembered for twenty seconds: per pool, how
+# many jobs are done, queued, running, how many failed in the last day, and
+# when one last finished. Half a second on 74,000 rows, which is why it is
+# not asked per row or per poll.
+_LEDGER: dict = {"at": 0.0, "data": {}}
+
+
+def _pool_ledger() -> dict:
+    now = time.time()
+    if now - _LEDGER["at"] < 20:
+        return _LEDGER["data"]
+    out: dict = {}
+    day = now - 86400
+    for r in _rows("SELECT COALESCE(pool, kind) p, state, COUNT(*) n, "
+                   "       MAX(finished_at) last, "
+                   "       SUM(CASE WHEN state='failed' AND COALESCE(finished_at,0) > ? "
+                   "                THEN 1 ELSE 0 END) recent_failed "
+                   "  FROM jobs GROUP BY COALESCE(pool, kind), state", (day,)):
+        d = out.setdefault(r["p"], {"done": 0, "queued": 0, "running": 0,
+                                    "failed": 0, "last": 0.0})
+        st = r["state"]
+        if st in ("done", "queued", "running"):
+            d[st] += int(r["n"] or 0)
+        if st == "failed":
+            d["failed"] += int(r["recent_failed"] or 0)
+        if st == "done" and r["last"]:
+            d["last"] = max(d["last"], float(r["last"]))
+    _LEDGER.update(at=now, data=out)
+    return out
+
+
 @app.get("/api/health")
 def api_health():
     r"""Every self-check nuarr runs, on one page - what found what, and where.
@@ -5407,7 +5438,8 @@ def api_health():
             "subsync": "Subtitles", "plexsync": "Plex",
             "drivepool": "DrivePool",
             "notland": "Still not landed", "counts": "Counts", "logs": "Logs",
-            "ocr": "OCR engines", "ruleschk": "Rule check"}
+            "ocr": "OCR engines", "ruleschk": "Rule check",
+            "process": "Processing System", "alang": "Audio language"}
 
     # key -> (what fixes it, the sentence explaining why the others do not)
     REMEDY = {
@@ -5467,11 +5499,12 @@ def api_health():
         return None, None
 
     def add(key, label, goto, n, note, mode=None, running=False, warn=None,
-            when=""):
+            when="", pool=None, done=None, left=None):
         rem = REMEDY.get(key)
-        done, left = _progress(key) if key in POOL else (None, None)
+        if done is None and left is None and key in POOL:
+            done, left = _progress(key)
         checks.append({"remedy": rem[0] if rem else "",
-                       "pool": POOL.get(key, ""),
+                       "pool": pool if pool is not None else POOL.get(key, ""),
                        "done": done, "left": left,
                        "remedy_why": rem[1] if rem else "",
                        "key": key, "label": label, "goto": goto,
@@ -5694,6 +5727,53 @@ def api_health():
             warn=bool(st.get("mode") == "full" and st.get("peer_nuarr")))
     except Exception:                                        # noqa: BLE001
         pass
+
+    # THE WORK SYSTEMS, ONE ROW EACH, READ OFF THE QUEUE. The checks above
+    # say whether something is WRONG; these say whether the systems that do
+    # the work are MOVING - encodes, remuxes, OCR, listening, subtitle reads
+    # - with the pool's bubble, how many files it has put through and how
+    # many are waiting, and when it last finished one. Every figure is a
+    # count over the jobs table, so a system that has quietly stopped shows
+    # a last-finished time drifting into the past. Erik: "add the other
+    # systems under health checks to track that they are working".
+    try:
+        led = _pool_ledger()
+        try:
+            _paused = set(workers.paused())
+        except Exception:                                    # noqa: BLE001
+            _paused = set()
+        _now = time.time()
+
+        def _ago(t):
+            d = max(0, _now - float(t or 0))
+            return (f"{int(d)}s" if d < 60 else f"{int(d // 60)}m" if d < 3600
+                    else f"{d / 3600:.1f}h" if d < 86400 else f"{d / 86400:.1f}d")
+        for pool, label, goto in (
+                ("encode", "Encodes - the transcoder on the card", "process"),
+                ("passthrough", "Remuxes - stream copies through the pool", "process"),
+                ("subocr", "Subtitle OCR - picture subtitles read into text", "ocr"),
+                ("listen", "Audio listening - Whisper naming untagged tracks", "alang"),
+                ("subread", "Subtitle reads - burned-in words and track titles", "lang")):
+            d = led.get(pool) or {}
+            q, r_, dn = int(d.get("queued") or 0), int(d.get("running") or 0), int(d.get("done") or 0)
+            fl, last = int(d.get("failed") or 0), float(d.get("last") or 0)
+            off = pool in _paused
+            if off:
+                note = "paused from the Workers panel" + (f" - {q} waiting" if q else "")
+            elif r_ or q:
+                note = f"{r_} running · {q} queued"
+            else:
+                note = "idle - nothing queued"
+            if last:
+                note += f" · last finished {_ago(last)} ago"
+            if fl:
+                note += f" · {fl} failed in the last day"
+            add(pool, label, goto, 0, note, mode=None, running=bool(r_),
+                warn=bool(off and q) or fl > 0, when="counted from the queue",
+                pool=pool, done=dn, left=q + r_)
+    except Exception as e:                                   # noqa: BLE001
+        add("queue", "The work systems", "process", 0,
+            f"check unavailable: {type(e).__name__}", warn=True)
 
     warn = sum(1 for c in checks if c["warn"])
     return {"checks": checks, "warnings": warn,
@@ -27202,7 +27282,7 @@ function hlPaint(){
             title="the queue pool that does this row's work">${esc(c.pool)}</span>`:''}</span>
       <span class="${c.warn?'warn':'dim'}" style="flex:1;overflow:hidden;
         text-overflow:ellipsis;white-space:nowrap">
-        ${c.running?'checking now… ':''}${esc(c.note||'')}</span>
+        ${(c.running&&!(c.done!=null&&c.mode==null))?'checking now… ':''}${esc(c.note||'')}</span>
       <span class="mono" style="flex:none;min-width:190px;text-align:right;font-size:10.5px"
         title="how many files this row's system has been through, and how many are still to come">${
         c.done!=null
