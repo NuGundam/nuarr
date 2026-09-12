@@ -22103,7 +22103,7 @@ async function loadJobs(){
     const full = cap>0 && used>=cap;
     const col = full ? 'var(--ok)' : (used>0 ? 'var(--acc)' : 'var(--dim)');
     return `<span class="grp"${note?` title="${esc(note)}"`:''}>`
-          +`<span class="k">${esc(name)}</span>`
+          +`<span class="k" style="color:${poolColor(pool)};opacity:.9">${esc(name)}</span>`
           +`<span class="v" style="color:${col}">${used}</span>`
           +`<span class="dim">/${cap}</span>`
           +(note?`<span class="dim" style="font-size:10px;margin-left:3px"
@@ -22130,6 +22130,13 @@ async function loadJobs(){
                   + `passthrough job (one rewrite carrying both changes); `
                   + `they use the same OCR budget as a standalone subtitle job`
                 : '')
+    // AND THE FOUR POOLS THAT JOINED THE QUEUE SINCE. Same rule the subs and
+    // subocr lines above were added under: a pool with its own workers that
+    // does not appear here is a pool nobody can tell is running. Erik's
+    // words for this strip were "missing the new integrated systems". The
+    // name wears its pool colour, so the strip and the card pills agree.
+    + ['audio','decode','listen','subread'].map(p=>
+        capCell(p, (j.in_use||{})[p]||0, (j.capacity||{})[p]||0, p)).join('')
     // THE ONE queued figure. It used to appear here AND six lines below in the
     // run-progress line, computed a moment apart so the two disagreed by a
     // handful - two different numbers for the same thing. The other one is
