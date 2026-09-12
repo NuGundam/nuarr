@@ -34357,13 +34357,15 @@ function audListenHtml(){
       ${num(L.done,'auto')} of ${num(L.total,'auto')}
       <span style="font-size:10.5px">(${(L.pct||0).toFixed(0)}%)</span>
       ${L.each?` · <b style="color:var(--ok)">${L.each.toFixed(1)}s</b> a track`:''}
-      ${L.eta?` · ${numt(hsDur(L.eta))} left`:''}
-      <span style="opacity:.75;display:inline-block;max-width:38ch;
-        overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
-        vertical-align:bottom" title="${esc(L.current||'')}">${esc(L.current||'')}</span>`,
+      ${L.eta?` · ${numt(hsDur(L.eta))} left`:''}${
+      (L.queue&&(L.queue.queued||L.queue.running))
+        ? ` · ${num(L.queue.running||0,'auto')} listening, ${num(L.queue.queued||0,'auto')} on the queue`:''}`,
     right: L.left ? `${num(L.left,'auto')} <span class="dim">left to hear</span>`
                   : '<b style="color:var(--ok)">all of it heard</b>',
     body:`<div class="hsbar" style="margin-top:4px"><i style="width:${L.pct||0}%"></i></div>
+      ${L.current?`<div class="dim mono" style="font-size:10.5px;margin-top:3px;
+          word-break:break-all;white-space:normal"
+          title="the file being listened to now">${esc(L.current)}</div>`:''}
       <div class="subswhy">Five 30-second windows per track, through Whisper's
         language identifier. This is the expensive half of the page and the
         only part that reads a file — everything below it is decided from what
@@ -34431,9 +34433,9 @@ function audProcHtml(){
 
 // ---- THE SWITCHBOARD ----------------------------------------------------
 function audSwitchHtml(b){
-  if(b.key==='tag')
-    return `<a href="#" onclick="audDetail('tag');return false"
-        title="Where the mode and the two confidence lines are set.">the mode and the lines</a>`;
+  // The tag row's "the mode and the lines" link is gone: it opened the same
+  // panel the "show Audio User Input" link beside it opens, and two links to
+  // one place is one too many.
   if(b.key==='policy')
     return `<a href="#" onclick="const e=document.getElementById('alpolCard');
         if(e)e.scrollIntoView({behavior:'smooth',block:'start'});return false"
@@ -34461,8 +34463,20 @@ function audBoardHtml(){
           <span style="flex:none;color:${b.on?'var(--ok)':'var(--warn)'}"
             title="${b.on?'nuarr acts on this by itself':'nothing happens until this is switched on'}">${b.on?'●':'○'}</span>
           <b style="flex:none">${esc(b.name)}</b>
-          <span class="capsc" style="border-color:${c};color:${c}"
-            title="the current setting">${esc(b.setting)}</span>
+          ${b.key==='policy' && b.per_library
+            // ONE CHIP PER LIBRARY, not the union. "eng, jpn, und" was every
+            // library's list added together, which is a set nobody chose:
+            // the anime libraries keep Japanese and the live-action ones do
+            // not, and the whole point of the rule is that it differs.
+            ? Object.entries(b.per_library).map(([lib,v])=>`<span class="capsc"
+                style="border-color:${c};color:${c};font-size:10.5px"
+                title="${esc(lib)}: keeps ${esc((v.langs||[]).join(', ')||'nothing named')}${
+                  v.keep_original?' plus the title\'s original language':''}${
+                  v.keep_untagged?', and untagged tracks':''}">${
+                esc(lib)} <span style="opacity:.75">·</span> ${esc((v.langs||[]).join(', ')||'—')}${
+                v.keep_original?' <span style="opacity:.75">+orig</span>':''}</span>`).join(' ')
+            : `<span class="capsc" style="border-color:${c};color:${c}"
+            title="the current setting">${esc(b.setting)}</span>`}
           <span style="flex:none;margin-left:auto;white-space:nowrap"
             title="${esc(b.waiting_word||'')}">${
               // A COUNT OF WHAT IS WAITING ON YOU BEATS A COUNT OF WHAT IS
@@ -35270,17 +35284,23 @@ function subsScanHtml(){
   return subsPanel({
     id:'subsPanelScan', accent:'#6fb0ff', busy:!!sc.running,
     title:'Reading the library', kind:'auto',
-    sub:`${num(done,'auto')} of ${num(sc.total,'auto')}
+    // THE SAME CHIPS THE LISTENING PANEL WEARS, for the same question: which
+    // tool, on which silicon. This reader opens no video - it reads the
+    // stored probe and lists the directory beside the file - so it is disk.
+    sub:`<span class="capsc" style="border-color:#3b4a5e;color:#c2ccd6"
+          title="What is inside comes from the stored ffprobe; what is beside it from one directory listing; what is in the picture from the sampler's stored verdict. Nothing is decoded here.">stored probe + listdir</span>
+      <span class="capsc" style="border-color:#e8a33d;color:#e8a33d"
+          title="Disk work only - one directory listing per file, and a spun-down pool disk can take a second to answer.">disk</span>
+      ${num(done,'auto')} of ${num(sc.total,'auto')}
       <span style="font-size:10.5px">(${pct.toFixed(0)}%)</span>
       ${sc.rate?` · <b style="color:var(--ok)">${sc.rate.toFixed(0)}</b> a second`:''}
-      ${sc.eta?` · ${numt(hsDur(sc.eta))} left`:''}
-      <span style="opacity:.75;display:inline-block;max-width:38ch;
-        overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
-        vertical-align:bottom" title="${esc(sc.last||'')}">${
-        esc(sc.last||'')}</span>`,
+      ${sc.eta?` · ${numt(hsDur(sc.eta))} left`:''}`,
     right: sc.left ? `${num(sc.left,'auto')} <span class="dim">left to read</span>`
                    : '<b style="color:var(--ok)">all of it read</b>',
     body:`<div class="hsbar" style="margin-top:4px"><i style="width:${pct}%"></i></div>
+      ${sc.last?`<div class="dim mono" style="font-size:10.5px;margin-top:3px;
+          word-break:break-all;white-space:normal"
+          title="the file read most recently">${esc(sc.last)}</div>`:''}
       <div class="subswhy">What is inside each file, what is sitting beside it
         and what is painted into its picture — read once and kept, so changing
         a rule costs no disk at all.

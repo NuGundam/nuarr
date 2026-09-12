@@ -236,11 +236,12 @@
         <div id="jobsBody" style="padding:0 14px 14px"></div>
       </div>
       <div id="langPane" style="display:none">
-        <!-- THE ORDER OF THIS PAGE.
-             The rules first, because they are the only thing here that is
-             yours to set rather than nuarr's to report - and because every
-             number below them is a consequence of them. Then what nuarr is
-             doing about them, then what it needs from you. -->
+        <!-- THE ORDER OF THIS PAGE - the audio page's order now.
+             Status first: what is being read and what is being done, because
+             that is what you came to see. Then the rules, because they are
+             what produced it. Then what nuarr is doing about them, then what
+             it needs from you. -->
+        <div id="subsStatus" style="padding:6px 14px 0"></div>
 
         <!-- 1. THE POLICY. What a file is allowed to end up carrying, per
              library, and which finished files no longer match it. -->
@@ -267,10 +268,6 @@
           </div>
         </div>
         <div id="langBody" style="padding:0 14px 14px"></div>
-
-        <!-- 2. WHAT IS HAPPENING RIGHT NOW. The reading's own progress and
-             what is being processed. Drawn by subsPaint. -->
-        <div id="subsStatus" style="padding:6px 14px 0"></div>
 
         <!-- Rule drift renders here rather than on the end of the rules
              above: it reports what a check FOUND, and a finding should not
