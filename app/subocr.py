@@ -249,6 +249,27 @@ def library_track_kinds(force: bool = False, blocking: bool = True) -> dict:
     very first call on a cold start has nothing to serve.
     """
     now = time.time()
+    # COLD IS ALSO NOT A REASON TO BLOCK THE PAGE. With nothing cached the
+    # first open of the OCR page sat on this for four seconds of JSON
+    # parsing. A non-blocking caller gets zeros and a "counting" flag at
+    # once, the count runs behind it, and the page's next poll has it.
+    if not force and not blocking and not _KINDS["data"]:
+        if not _KINDS.get("busy"):
+            _KINDS["busy"] = True
+
+            def _cold():
+                try:
+                    library_track_kinds(force=True)
+                finally:
+                    _KINDS["busy"] = False
+            threading.Thread(target=_cold, name="subocr-kinds",
+                             daemon=True).start()
+        try:
+            return {l.name: {"image": 0, "signs": 0, "forced": 0,
+                             "dialogue": 0, "files": 0, "counting": True}
+                    for l in (SETTINGS.libraries or [])}
+        except Exception:                                # noqa: BLE001
+            return {}
     if not force and _KINDS["data"]:
         if (now - _KINDS["at"]) < _KINDS_TTL:
             return dict(_KINDS["data"])

@@ -819,6 +819,16 @@ async def _startup() -> None:
     # audio page's bar reads the queue. run_once stays as the button.
     from . import readers as _readers
     asyncio.create_task(_readers.watch())
+    # WARM THE OCR PAGE'S COUNT, so its first open is instant rather than
+    # a four-second parse of every probe with a picture subtitle in it.
+    async def _warm_kinds():
+        await asyncio.sleep(90)
+        try:
+            from . import subocr as _so_warm
+            await asyncio.to_thread(_so_warm.library_track_kinds, True)
+        except Exception:                                # noqa: BLE001
+            pass
+    asyncio.create_task(_warm_kinds())
     # Queues OCR conversions a batch at a time - see subocr.watch().
     from . import subocr as _subocr
     asyncio.create_task(_subocr.watch())
@@ -12811,6 +12821,9 @@ button[disabled]{opacity:.5;cursor:default}
 #suGpuBtn{min-width:78px}
 #suGpuBtn b{min-width:34px}
 #suProcBtn{min-width:104px}
+#suSysBtn{min-width:150px}
+#suSysBtn b{min-width:44px}
+#suSysBtn #suSysLeft{min-width:30px}
 #suProcRun:not(:empty){color:var(--acc);opacity:1}
 #suProcBtn b{min-width:18px}
 /* The process chip is always present. It used to be display:none whenever
@@ -15096,6 +15109,9 @@ async function loadAll(){
     + s.disks.length+' pool disks' + svTxt);
 
   const byState=Object.fromEntries(s.states.map(x=>[x.state,x]));
+  // Feeds the header's done/left chip; the summary is the one place these
+  // counts are already fetched, so the chip costs no request of its own.
+  try{ sysCountsFrom(s, byState); }catch(_){ }
   const c=[];
 
   // THE SUBTITLE ON A SWEPT TILE, in priority order.
@@ -18234,6 +18250,16 @@ function renderSelfUse(s){
     +           '<span class="caret" id="suRamCaret">▸</span></button>'
     +   '<div class="procpop" id="suRamPop" onclick="event.stopPropagation()"></div>'
     + '</span>'
+    // THE LIBRARY, NOT THE MACHINE. Four chips say what Nuarr is costing;
+    // this one says what it has to show for it - files done and files
+    // still to do - which is the number the whole page exists to move.
+    + '<span class="suwrap">'
+    +   '<button class="procbtn" id="suSysBtn" title="files processed, and files still to process"'
+    +           ' onclick="toggleSu(event,\'sys\')"><b>—</b>'
+    +           ' <span class="mult">done ·</span> <b id="suSysLeft">—</b> <span class="mult">left</span>'
+    +           '<span class="caret" id="suSysCaret">▸</span></button>'
+    +   '<div class="procpop" id="suSysPop" onclick="event.stopPropagation()"></div>'
+    + '</span>'
     + '<span class="suwrap" id="suWrap">'
     +   '<button class="procbtn" id="suProcBtn" title="what Nuarr is running"'
     +           ' onclick="toggleProcs(event)"><b>—</b>'
@@ -18361,12 +18387,63 @@ function renderSelfUse(s){
 // One open at a time - two overlapping popups in a header strip is unreadable,
 // and nobody wants to compare two panels that are covering each other.
 let _suOpen=null, _suLast=null;
+// THE DOOR AT THE BOTTOM OF EVERY HEADER PANEL. Each one is a glance; the
+// Task manager page is the same numbers with a history and the full
+// process table, and a glance that wants more should not have to know
+// where that page is.
+function tmLink(){
+  return `<div class="pf" style="display:flex;justify-content:flex-end">`
+       + `<a href="/settings#taskmgr" style="color:#6fb0ff;text-decoration:none"`
+       + ` title="charts of CPU, memory, GPU and disk over time, and every process in full"`
+       + `>open the Task manager page →</a></div>`;
+}
+// ---- the done/left chip and its panel ------------------------------------
+let _sysCounts=null;
+function sysCountsFrom(s, byState){
+  const n=k=>((byState[k]||{}).n)||0;
+  const total=(s.totals||{}).n||0;
+  const done=n('done'), eligible=n('eligible'), held=n('new'), err=n('error'),
+        missing=n('missing'), blocked=n('blocked');
+  _sysCounts={total, done, eligible, held, err, missing, blocked,
+              left: eligible+held, bytes:(s.totals||{}).bytes||0};
+  renderSysChip();
+  if(_suOpen==='sys') paintSu('sys', _suLast||{});
+}
+function renderSysChip(){
+  const b=document.querySelector('#suSysBtn b');
+  const l=document.getElementById('suSysLeft');
+  if(!b || !_sysCounts) return;
+  b.firstChild.nodeValue=fmt(_sysCounts.done);
+  if(l){ l.firstChild.nodeValue=fmt(_sysCounts.left);
+         l.style.color=_sysCounts.left?'var(--acc)':'var(--ok)'; }
+}
+function sysPanel(){
+  const c=_sysCounts;
+  if(!c) return '<div class="ph">Library</div><div class="pf">no summary yet</div>';
+  const pct=c.total?Math.round(c.done/c.total*100):0;
+  const row=(k,v,col,tip)=>`<tr title="${esc(tip||'')}"><td>${esc(k)}</td>`
+     +`<td class="v" style="color:${col||'inherit'}">${fmt(v)}</td></tr>`;
+  return `<div class="ph">Library — ${fmt(c.total)} files, ${pct}% processed</div>`
+    +`<div style="height:6px;border-radius:3px;background:rgba(255,255,255,.07);margin:6px 0 8px;overflow:hidden">`
+    +`<div style="width:${pct}%;height:100%;background:var(--ok)"></div></div>`
+    +`<table>`
+    +row('done', c.done, 'var(--ok)', 'processed and put back, or judged to need nothing')
+    +row('left', c.left, c.left?'var(--acc)':'var(--ok)', 'eligible plus held: everything the queue still has to get through')
+    +row('  eligible', c.eligible, '', 'ready for the queue')
+    +row('  held', c.held, '', 'seen, but not settled yet - still being written or still in use')
+    +(c.err?row('errors', c.err, 'var(--bad)', 'the job failed - see Needs attention'):'')
+    +(c.blocked?row('blocked', c.blocked, 'var(--warn)', 'cannot be processed as things stand'):'')
+    +(c.missing?row('missing', c.missing, 'var(--warn)', 'not on disk'):'')
+    +`</table>`
+    +`<div class="pf">${gb(c.bytes)} across the pool. The queue drains "left"; `
+    +`"done" is the whole library minus what is still to do.</div>`;
+}
 function toggleSu(ev, which){
   if(ev) ev.stopPropagation();
   closeProcs();
   _suOpen = (_suOpen===which) ? null : which;
   const cap=k=>k.charAt(0).toUpperCase()+k.slice(1);
-  for(const k of ['cpu','ram','gpu']){
+  for(const k of ['cpu','ram','gpu','sys']){
     const pop=document.getElementById('su'+cap(k)+'Pop');
     const btn=document.getElementById('su'+cap(k)+'Btn');
     const car=document.getElementById('su'+cap(k)+'Caret');
@@ -18393,7 +18470,8 @@ function paintSu(which, s){
   const cap=k=>k.charAt(0).toUpperCase()+k.slice(1);
   const pop=document.getElementById('su'+cap(which)+'Pop');
   if(!pop || !s) return;
-  if(which==='gpu'){ setHTML(pop, gpuPanel(s)); return; }
+  if(which==='gpu'){ setHTML(pop, gpuPanel(s)+tmLink()); return; }
+  if(which==='sys'){ setHTML(pop, sysPanel()+tmLink()); return; }
   const n=s.nuarr||{};
   const others=(s.others||[]).slice();
   const mb=v=>v>=1024 ? (Math.round(v/102.4)/10)+' GB' : Math.round(v)+' MB';
@@ -18461,7 +18539,7 @@ function paintSu(which, s){
   }
   if(rows) html += `<div class="ph" style="margin-top:9px">Biggest outside Nuarr</div>`
                  + `<table>${rows}</table>`;
-  setHTML(pop, html);
+  setHTML(pop, html+tmLink());
 }
 document.addEventListener('click', ()=>closeSu());
 
@@ -18603,7 +18681,8 @@ function paintProcs(s){
            + `<td class="v">up</td></tr>${rows}</table>`
            + `<div class="pf">Everything Nuarr has spawned, named by the work `
            + `it is doing rather than by the executable. Anything other than `
-           + `the server sitting here for more than ten minutes is a straggler.</div>`;
+           + `the server sitting here for more than ten minutes is a straggler.</div>`
+           + tmLink();
 
   setHTML(pop, html);      // same rule as every other pill in the header
   // TALLEST SO FAR, UNTIL YOU CLOSE IT. Growing is fine - new information
@@ -25237,6 +25316,36 @@ function tmChart(rows, series, opts){
       Math.round(n*(_tm&&_tm.history?_tm.history.every_s:1))}s</span></div>
   </div>`;
 }
+// A GROUP OPENS INTO ITS PROCESSES. "2 × Does it decode?" is the right
+// row to read at a glance and the wrong one when a single ffmpeg is the
+// question; the caret opens the group into one line per process - pid,
+// executable, its own figures - and stays open across the 1 s repaint.
+const _tmOpen = new Set();
+function tmToggle(ev, key){
+  if(ev){ ev.stopPropagation(); ev.preventDefault(); }
+  if(_tmOpen.has(key)) _tmOpen.delete(key); else _tmOpen.add(key);
+  tmPaint();
+}
+function tmChildRows(p, cores){
+  return (p.procs||[]).slice().sort((a,b)=>(b.cpu_pct||0)-(a.cpu_pct||0)).map(q=>{
+    const share = cores ? (q.cpu_pct||0)/cores : (q.cpu_pct||0);
+    const low = q.io_prio!=null && q.io_prio<=1;
+    return `<tr class="tmrow tmchild" style="border-top:1px dashed var(--line);opacity:.85">
+      <td style="padding:3px 6px 3px 22px;text-align:left;overflow:hidden;white-space:nowrap;text-overflow:ellipsis">
+        <span class="dim">└</span> <span class="mono">${esc(q.name||'?')}</span>
+        <span class="dim mono" style="font-size:10px"> · ${q.pid}</span></td>
+      <td class="dim" style="padding:3px 6px;text-align:left;overflow:hidden;white-space:nowrap;text-overflow:ellipsis"
+          title="${esc(q.detail||'')}">${esc(q.detail||'')}</td>
+      <td class="c mono">${share>=0.05?share.toFixed(1)+'%':'0%'}</td>
+      <td class="c mono">${tmMb(q.rss_mb)}</td>
+      <td class="c mono" style="color:${q.read_bps?'#58a6ff':'var(--dim)'}">${tmBps(q.read_bps)}</td>
+      <td class="c mono" style="color:${q.write_bps?'#f0883e':'var(--dim)'}">${tmBps(q.write_bps)}</td>
+      <td class="c mono" style="color:${q.gpu?'#e8a33d':'var(--dim)'}">${esc(q.gpu||'—')}</td>
+      <td class="c mono dim">${(q.age_s||0)>=60?hms(q.age_s):(q.age_s||0)+'s'}</td>
+      <td class="c mono" style="color:${low?'var(--warn)':'var(--dim)'}">${low?'yielding':'normal'}</td>
+    </tr>`;
+  }).join('');
+}
 function tmSortBy(k){
   if(_tmSort.by===k) _tmSort.dir = -_tmSort.dir;
   else { _tmSort.by = k; _tmSort.dir = (k==='name'||k==='what') ? 1 : -1; }
@@ -25311,7 +25420,7 @@ function tmPaint(){
     let g = byWork.get(k);
     if(!g){
       g = {key:k, n:0, cpu:0, ram:0, read:0, write:0, age:0, self:false,
-           gpu:'', low:false, exes:new Set(), details:[], pids:[]};
+           gpu:'', low:false, exes:new Set(), details:[], pids:[], procs:[]};
       byWork.set(k, g);
     }
     g.n++;
@@ -25329,6 +25438,7 @@ function tmPaint(){
        && g.details.indexOf(p.detail)<0 && g.details.length<3)
       g.details.push(p.detail);
     g.pids.push(p.pid);
+    g.procs.push(p);
   }
   // A GROUP THAT HAS GONE LINGERS; A PID THAT HAS GONE DOES NOT.
   const liveKeys = new Set(byWork.keys());
@@ -25488,12 +25598,16 @@ function tmPaint(){
           : (fresh ? `background:rgba(88,166,255,${
               (0.13*(1-newMs/2600)).toFixed(3)});` : '');
         const cls = p._gone ? ' tmgone' : (fresh ? ' tmfresh' : '');
+        const tree = p.n>1 && !p._gone;
+        const open = tree && _tmOpen.has(p.key);
         return `<tr class="tmrow${cls}" style="border-top:1px solid var(--line);
-          opacity:${op.toFixed(3)};${wash}">
+          opacity:${op.toFixed(3)};${wash}${tree?'cursor:pointer':''}"
+          ${tree?`onclick="tmToggle(event,${esc(JSON.stringify(p.key))})" title="${open?'hide':'show'} the ${p.n} processes in this group"`:''}>
         <td style="padding:4px 6px;text-align:left;overflow:hidden">
           <b style="color:${p.self?'var(--acc)':(stale?'var(--warn)':'var(--fg)')};
              display:block;overflow:hidden;text-overflow:ellipsis;
              white-space:nowrap">${
+            tree?`<span class="dim" style="display:inline-block;width:11px">${open?'▾':'▸'}</span>`:''}${
             p.n>1?`<span class="dim">${p.n} × </span>`:''}${esc(p.key||'?')}${
             p.self?'<span class="dim"> (the server)</span>':''}</b>
           <div class="dim" style="font-size:10px;overflow:hidden;
@@ -25532,7 +25646,7 @@ function tmPaint(){
             : 'Running at normal disk priority.')}"
           >${p._gone?'<span class="dim">—</span>'
             :(p.low?'yielding':'normal')}</td>
-      </tr>`;}).join('')}</tbody></table></div></div>`;
+      </tr>` + (open ? tmChildRows(p, cores) : '');}).join('')}</tbody></table></div></div>`;
 
   // ---- and what its background systems are holding -----------------------
   const inf = idl.inflight || {};
@@ -27047,8 +27161,8 @@ function hlPaint(){
       <span class="${c.warn?'warn':'dim'}" style="flex:1;overflow:hidden;
         text-overflow:ellipsis;white-space:nowrap">
         ${c.running?'checking now… ':''}${esc(c.note||'')}</span>
-      <span class="dim" style="flex:none;font-size:10.5px;min-width:150px;
-        text-align:right" title="${esc(c.remedy_why
+      <span style="flex:none;font-size:10.5px;min-width:150px;
+        text-align:right;color:${hlRemedyColor(c.remedy)}" title="${esc(c.remedy_why
           ? 'What nuarr does about what this row finds. '+c.remedy_why
           : 'this row reports a count; there is nothing to correct')}">${
         c.remedy?esc(c.remedy):''}</span>
@@ -27056,9 +27170,10 @@ function hlPaint(){
         text-align:right" title="${c.mode
           ? 'this system\'s own auto/manual switch, lives on its card'
           : 'this row has no switch - it reports a count'}">${
-        c.mode?`<span style="border:1px solid var(--line);border-radius:9px;
-          padding:0 7px">${esc(c.mode)}</span>`:esc(c.when||'')}</span>
-      <span class="dim" style="flex:none;min-width:96px;text-align:right"
+        c.mode?`<span style="border:1px solid ${c.mode==='auto'?'rgba(127,212,163,.5)':'rgba(226,179,65,.5)'};
+          color:${c.mode==='auto'?'var(--ok)':'var(--warn)'};border-radius:9px;
+          padding:0 7px">${esc(c.mode)}</span>`:`<span style="color:#8fa3b8">${esc(c.when||'')}</span>`}</span>
+      <span style="flex:none;min-width:96px;text-align:right;color:#6fb0ff"
         title="the page this row opens">${esc(c.where||'')} ›</span>
     </div>`;
   // WHAT NEEDS YOU FIRST. All-clear rows still show - a health page that
@@ -27076,6 +27191,18 @@ function hlPaint(){
       shortcut: the full card - list, buttons, its own switch - lives on the
       page named at the end of the row. Several checks share a page; the name
       is the same because the destination is, not because the row is.</div>`;
+}
+// THE REMEDY COLUMN, COLOURED BY WHAT IT COSTS. "fix in place" is a header
+// write; "requeue" is a rebuild; "replace" throws the file away and asks
+// the arr for another. Reading the column used to mean reading every
+// word; the colour says which of the three it is from across the room.
+function hlRemedyColor(r){
+  r=String(r||'').toLowerCase();
+  if(!r) return 'var(--dim)';
+  if(r.indexOf('replace')>=0) return 'var(--warn)';
+  if(r.indexOf('requeue')>=0) return 'var(--acc)';
+  if(r.indexOf('fix')>=0) return '#5ad1c4';
+  return 'var(--dim)';
 }
 async function hlRun(){
   const m=document.getElementById('hlMsg'); if(m) m.textContent='starting…';
