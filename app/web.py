@@ -819,6 +819,8 @@ async def _startup() -> None:
     # audio page's bar reads the queue. run_once stays as the button.
     from . import readers as _readers
     asyncio.create_task(_readers.watch())
+    from . import plexcollections as _pcoll
+    asyncio.create_task(_pcoll.watch())
     # WARM THE OCR PAGE'S COUNT, so its first open is instant rather than
     # a four-second parse of every probe with a picture subtitle in it.
     async def _warm_kinds():
@@ -6182,6 +6184,29 @@ async def api_plex_queue_requeue(file_id: int | None = None,
                "info")
     r = await plexqueue.run_due(limit=200)
     return {"ok": True, "reopened": n, "run": r}
+
+
+@app.get("/api/plexcoll")
+def api_plexcoll():
+    """The collections nuarr keeps in Plex, per TV library."""
+    from . import plexcollections
+    return plexcollections.status()
+
+
+@app.post("/api/plexcoll/set")
+async def api_plexcoll_set(library: str, on: int = 1, title: str = ""):
+    from . import plexcollections
+    plexcollections.set_enabled(library, bool(on), title)
+    if on:
+        asyncio.create_task(plexcollections.sync())
+    return {"ok": True, **plexcollections.status()}
+
+
+@app.post("/api/plexcoll/run")
+async def api_plexcoll_run():
+    from . import plexcollections
+    asyncio.create_task(plexcollections.sync())
+    return {"ok": True, "started": True}
 
 
 @app.get("/api/plexsync")
@@ -25184,6 +25209,7 @@ function wtab(which){
     if(hint) hint.textContent='· plex';
     paneLoad('plex', loadPlexCfg);
     loadPlexSync();
+    loadPlexColl();
     // Arrived from the health page: the agreement card is below the
     // connection settings, so put it in front of the reader.
     if(intent==='plexsync') setTimeout(()=>{
@@ -29273,6 +29299,73 @@ let _pxs=null, _pxsTimer=null;
 // slows from ~500 items/sec to ~100 as it goes.
 let _pxsRate=null, _pxsSeen=null;
 
+// ---- collections nuarr keeps in Plex ---------------------------------------
+// Plex cannot filter on "ended" - that is Sonarr's word - so a smart
+// collection cannot do this and a hand-made one goes stale the day a show
+// comes back. One switch per TV library; nuarr keeps the collection in
+// step every six hours and on demand.
+let _pcoll=null, _pcollTimer=null;
+async function loadPlexColl(){
+  const host=document.getElementById('pxsCard');
+  if(!host) return;
+  let el=document.getElementById('pcollCard');
+  if(!el){
+    el=document.createElement('div');
+    el.className='lkind'; el.id='pcollCard';
+    el.style.cssText='margin:0 14px 14px;padding:11px 12px';
+    host.parentNode.insertBefore(el, host);
+  }
+  try{ _pcoll=await (await fetch('/api/plexcoll')).json(); }
+  catch(e){ el.innerHTML='<span class="dim">could not load</span>'; return; }
+  pcollPaint();
+  clearTimeout(_pcollTimer);
+  _pcollTimer=setTimeout(loadPlexColl, _pcoll.running?1500:20000);
+}
+function pcollPaint(){
+  const el=document.getElementById('pcollCard'); if(!el||!_pcoll) return;
+  const d=_pcoll;
+  const rows=(d.libraries||[]).map(L=>{
+    const l=L.last||{};
+    const when=l.at?ago(l.at):'never';
+    const line = !L.on ? '<span class="dim">off</span>'
+      : l.error ? `<span class="err">${esc(l.error)}</span>`
+      : l.at ? `<span style="color:var(--ok)">${fmt(l.in_collection||0)}</span><span class="dim"> in the collection · ${fmt(l.ended||0)} ended of ${fmt(l.plex_shows||0)} shows${
+            l.unmatched?` · ${fmt(l.unmatched)} Sonarr does not know`:''}${
+            (l.added||l.removed)?` · last pass ${l.added?'+'+fmt(l.added):''}${l.added&&l.removed?' ':''}${l.removed?'−'+fmt(l.removed):''}`:''} · synced ${esc(when)}</span>`
+      : '<span class="dim">on - first pass is on its way</span>';
+    return `<div style="display:flex;gap:10px;align-items:center;padding:6px 0;border-top:1px solid var(--line);font-size:11.5px">
+      <b style="flex:none;min-width:150px">${esc(L.library)}</b>
+      <span class="dim" style="flex:none">collection</span>
+      <span class="mono" style="flex:none;color:#6fb0ff">${esc(L.title)}</span>
+      <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${line}</span>
+      <button class="wsw ${L.on?'on':'off'}" onclick="pcollSet(${JSON.stringify(L.library).replace(/"/g,'&quot;')},${L.on?0:1},this)"
+        title="${L.on?'Nuarr keeps this collection in step with Sonarr. Click to stop - the collection is left as it is.':'Click to keep an Ended collection in this library, in step with Sonarr.'}"
+        ><span class="knob"></span>${L.on?'kept':'off'}</button>
+    </div>`;
+  }).join('');
+  el.innerHTML=`<b style="color:#6fb0ff">Collections Nuarr keeps</b>
+    <span class="dim" style="font-size:11px;margin-left:8px">every ${d.every_h}h, and when you ask</span>
+    <span style="float:right;display:flex;gap:8px;align-items:center">
+      ${d.running?`<span class="dim" style="font-size:11px">${esc(d.now||'working…')}</span>`:''}
+      <button onclick="pcollRun(this)" ${d.running?'disabled':''} style="font-size:10.5px;padding:1px 8px">${d.running?'syncing…':'Sync now'}</button>
+    </span>
+    <div class="dim" style="font-size:11px;margin:3px 0 6px">Plex cannot filter on
+      whether a show has ended - that is Sonarr's word. Each switched-on library
+      gets a collection of every show Sonarr calls <b>ended</b>; a show that gets
+      another season leaves it on the next pass, and a show that finishes joins.
+      Turning a library off leaves the collection as it stands.</div>
+    ${rows||'<div class="dim">no TV libraries</div>'}`;
+}
+async function pcollSet(library,on,btn){
+  if(btn) btn.disabled=true;
+  try{ await fetch('/api/plexcoll/set?library='+encodeURIComponent(library)+'&on='+on,{method:'POST'}); }catch(e){}
+  loadPlexColl();
+}
+async function pcollRun(btn){
+  if(btn){ btn.disabled=true; btn.textContent='syncing…'; }
+  try{ await fetch('/api/plexcoll/run',{method:'POST'}); }catch(e){}
+  setTimeout(loadPlexColl, 800);
+}
 async function loadPlexSync(){
   const el=document.getElementById('pxsBody');
   if(!el){ if(_pxsTimer) clearTimeout(_pxsTimer); _pxsTimer=null; return; }

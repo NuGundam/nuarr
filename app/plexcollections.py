@@ -1,0 +1,306 @@
+"""
+nuarr - collections Plex cannot build for itself
+
+WHY
+---
+Plex smart collections filter on what Plex knows: year, genre, rating,
+watched. Plex does not know whether a show has ENDED - that is Sonarr's
+word, read from TheTVDB, and it changes when a network announces another
+season. So "every finished show in Anime Shows" cannot be a smart
+collection, and a hand-made one goes stale the day a show comes back.
+
+Nuarr knows both sides. Sonarr says which series are ended and which are
+continuing; Plex says which shows are in the library and what their tvdb id
+is. This module keeps a collection per library in step with that answer:
+shows that are ended are in it, shows that are continuing or upcoming are
+not, and a show that goes from ended to continuing leaves on the next pass.
+
+HOW
+---
+Plex's tag interface, not its newer collections endpoint: setting the
+"collection" tag on a show puts it in a collection of that name (creating
+it the first time), and removing the tag takes it out. One PUT per change,
+nothing to create or delete by hand, and Plex owns the collection's poster
+and ordering as it does for any other.
+
+Matching is by tvdb id - Plex carries `tvdb://NNN` in a show's Guid list and
+Sonarr carries tvdbId - with the series path as the fallback for a show Plex
+has not matched to an agent.
+
+Runs every six hours, five minutes after startup, and on demand. Per
+library, switchable, off unless turned on: a collection appearing in a
+library nobody asked for it in is a surprise.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+import urllib.parse
+import urllib.request
+
+from . import joblog, schedules
+from .config import SETTINGS
+from .db import kv_get, kv_set
+
+EVERY_S = 6 * 3600
+TITLE_DEFAULT = "Ended"
+
+# The last pass, per library, for the card. In memory; kv holds the last
+# summary across restarts so the page says something before the first run.
+STATE: dict = {"running": False, "now": "", "last": {}}
+
+
+# ------------------------------------------------------------- settings ---
+def _key(library: str) -> str:
+    return "plexcoll." + library
+
+
+def enabled(library: str) -> bool:
+    return (kv_get(_key(library)) or "") == "1"
+
+
+def title_for(library: str) -> str:
+    return (kv_get(_key(library) + ".title") or "").strip() or TITLE_DEFAULT
+
+
+def set_enabled(library: str, on: bool, title: str = "") -> None:
+    kv_set(_key(library), "1" if on else "0")
+    if title:
+        kv_set(_key(library) + ".title", title.strip()[:60])
+
+
+def tv_libraries() -> list:
+    """Every library Sonarr feeds, whatever it is called."""
+    out = []
+    for lib in (SETTINGS.libraries or []):
+        kind = (getattr(lib, "kind", "") or getattr(lib, "type", "") or "").lower()
+        if kind and "movie" in kind:
+            continue
+        out.append(lib)
+    return out
+
+
+# ------------------------------------------------------------------ plex ---
+def _plex() -> tuple[str, str]:
+    from . import plexnotify
+    return plexnotify._plex()
+
+
+def _get(path: str, timeout: float = 60.0) -> dict:
+    url, token = _plex()
+    req = urllib.request.Request(
+        url + path, headers={"X-Plex-Token": token, "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read() or b"{}")
+
+
+def _put(path: str, timeout: float = 30.0) -> None:
+    url, token = _plex()
+    req = urllib.request.Request(
+        url + path, method="PUT",
+        headers={"X-Plex-Token": token, "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        r.read()
+
+
+def _section_for(lib_path: str) -> str:
+    want = (lib_path or "").rstrip("\\/").lower()
+    d = _get("/library/sections")
+    for s in (d.get("MediaContainer") or {}).get("Directory") or []:
+        if (s.get("type") or "") != "show":
+            continue
+        for loc in s.get("Location") or []:
+            if (loc.get("path") or "").rstrip("\\/").lower() == want:
+                return str(s.get("key") or "")
+    return ""
+
+
+def _plex_shows(section: str) -> list[dict]:
+    """[{key, title, tvdb, path, in: [collection titles]}] for one section."""
+    d = _get(f"/library/sections/{section}/all?type=2&includeGuids=1")
+    out = []
+    for m in (d.get("MediaContainer") or {}).get("Metadata") or []:
+        tvdb = ""
+        for g in m.get("Guid") or []:
+            gid = str(g.get("id") or "")
+            if gid.startswith("tvdb://"):
+                tvdb = gid[7:]
+                break
+        loc = ""
+        for l in m.get("Location") or []:
+            loc = (l.get("path") or "")
+            if loc:
+                break
+        out.append({"key": str(m.get("ratingKey") or ""),
+                    "title": m.get("title") or "", "tvdb": tvdb,
+                    "path": loc.rstrip("\\/").lower(),
+                    "in": [c.get("tag") or "" for c in (m.get("Collection") or [])]})
+    return out
+
+
+def _tag(section: str, keys, title: str, on: bool) -> None:
+    """Tag (or untag) one show or a batch of them in a single PUT.
+
+    Plex takes a second or so per tag write, and the first pass on a library
+    of six hundred ended shows is six hundred of them - ten minutes done one
+    at a time, and it was. The endpoint accepts a comma-separated list of
+    ids, so a batch of fifty costs about what one did.
+    """
+    if isinstance(keys, str):
+        keys = [keys]
+    ids = ",".join(str(k) for k in keys if k)
+    if not ids:
+        return
+    q = urllib.parse.urlencode({"type": 2, "id": ids, "collection.locked": 1})
+    field = ("collection[0].tag.tag=" if on else "collection[].tag.tag-=") \
+        + urllib.parse.quote(title)
+    _put(f"/library/sections/{section}/all?{q}&{field}", timeout=120)
+
+
+BATCH = 50
+
+
+# ---------------------------------------------------------------- sonarr ---
+async def _sonarr_status() -> dict:
+    """{tvdb id (str): status} and {series path (lower): status} from every
+    enabled Sonarr."""
+    from .arr import shared_client
+    by_tvdb: dict = {}
+    by_path: dict = {}
+    for cfg in (SETTINGS.arrs or []):
+        if cfg.kind != "sonarr" or not cfg.enabled or not cfg.api_key:
+            continue
+        try:
+            series = await shared_client(cfg)._get("/series")
+        except Exception as e:                               # noqa: BLE001
+            joblog.log(f"collections: {cfg.name} did not answer: "
+                       f"{type(e).__name__}: {e}", "warn")
+            continue
+        for s in series or []:
+            st = str(s.get("status") or "").lower()
+            if s.get("tvdbId"):
+                by_tvdb[str(s["tvdbId"])] = st
+            if s.get("path"):
+                by_path[str(s["path"]).rstrip("\\/").lower()] = st
+    return {"tvdb": by_tvdb, "path": by_path}
+
+
+# ------------------------------------------------------------------ sync ---
+async def sync_library(lib, arr: dict | None = None, dry: bool = False) -> dict:
+    """Bring one library's Ended collection in line. Returns what it did."""
+    title = title_for(lib.name)
+    res = {"library": lib.name, "title": title, "at": time.time(),
+           "plex_shows": 0, "ended": 0, "in_collection": 0,
+           "added": 0, "removed": 0, "unmatched": 0, "error": ""}
+    try:
+        section = await asyncio.to_thread(_section_for, lib.path)
+        if not section:
+            res["error"] = "Plex has no TV library at this path"
+            return res
+        shows = await asyncio.to_thread(_plex_shows, section)
+        if arr is None:
+            arr = await _sonarr_status()
+    except Exception as e:                                   # noqa: BLE001
+        res["error"] = f"{type(e).__name__}: {e}"
+        return res
+    res["plex_shows"] = len(shows)
+    add, remove = [], []
+    for s in shows:
+        st = arr["tvdb"].get(s["tvdb"]) if s["tvdb"] else None
+        if st is None and s["path"]:
+            st = arr["path"].get(s["path"])
+        if st is None:
+            res["unmatched"] += 1
+            continue                     # Sonarr does not know it: leave it be
+        want = st == "ended"
+        have = title in s["in"]
+        if want:
+            res["ended"] += 1
+        if have:
+            res["in_collection"] += 1
+        if want and not have:
+            add.append(s)
+        elif have and not want:
+            remove.append(s)
+    if dry:
+        res.update(added=len(add), removed=len(remove), dry=True)
+        return res
+    for what, rows, on in (("adding", add, True), ("removing", remove, False)):
+        for i in range(0, len(rows), BATCH):
+            batch = rows[i:i + BATCH]
+            STATE["now"] = (f"{what} {batch[0]['title']}"
+                            + (f" and {len(batch) - 1} more" if len(batch) > 1 else "")
+                            + f" ({i + len(batch)} of {len(rows)})")
+            try:
+                await asyncio.to_thread(_tag, section, [b["key"] for b in batch],
+                                        title, on)
+                res["added" if on else "removed"] += len(batch)
+            except Exception as e:                           # noqa: BLE001
+                res["error"] = (f"could not {'tag' if on else 'untag'} "
+                                f"{batch[0]['title']}: {type(e).__name__}")
+    res["in_collection"] = res["in_collection"] + res["added"] - res["removed"]
+    return res
+
+
+async def sync(force: bool = False) -> dict:
+    """Every switched-on library. Returns {library: result}."""
+    if STATE["running"]:
+        return {"ok": False, "why": "already running"}
+    libs = [l for l in tv_libraries() if enabled(l.name)]
+    if not libs:
+        return {"ok": True, "libraries": {}}
+    STATE.update(running=True, now="asking Sonarr")
+    out: dict = {}
+    try:
+        arr = await _sonarr_status()
+        for lib in libs:
+            r = await sync_library(lib, arr)
+            out[lib.name] = r
+            if r.get("error"):
+                joblog.log(f"collections: {lib.name} '{r['title']}' - "
+                           f"{r['error']}", "warn")
+            elif r["added"] or r["removed"]:
+                joblog.log(f"collections: {lib.name} '{r['title']}' - "
+                           f"{r['added']} added, {r['removed']} removed, "
+                           f"{r['in_collection']} in it now", "ok")
+        STATE["last"] = out
+        try:
+            kv_set("plexcoll.last", json.dumps(out))
+        except Exception:                                    # noqa: BLE001
+            pass
+    finally:
+        STATE.update(running=False, now="")
+    return {"ok": True, "libraries": out}
+
+
+def status() -> dict:
+    last = STATE.get("last") or {}
+    if not last:
+        try:
+            last = json.loads(kv_get("plexcoll.last") or "{}")
+        except Exception:                                    # noqa: BLE001
+            last = {}
+    libs = []
+    for lib in tv_libraries():
+        libs.append({"library": lib.name, "on": enabled(lib.name),
+                     "title": title_for(lib.name),
+                     "last": last.get(lib.name) or {}})
+    return {"running": STATE["running"], "now": STATE["now"],
+            "every_h": EVERY_S // 3600, "libraries": libs}
+
+
+async def watch() -> None:
+    schedules.register(
+        "plexcoll", "Plex collections", "Plex", EVERY_S,
+        what="Keeps an 'Ended' collection per switched-on TV library in step "
+             "with Sonarr: shows Sonarr calls ended are in it, shows that are "
+             "continuing or come back are not.")
+    await asyncio.sleep(300)
+    while True:
+        schedules.beat("plexcoll")
+        try:
+            await sync()
+        except Exception as e:                               # noqa: BLE001
+            joblog.log(f"collections: {type(e).__name__}: {e}", "error")
+        await asyncio.sleep(EVERY_S)
