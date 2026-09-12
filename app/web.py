@@ -34363,9 +34363,11 @@ function audListenHtml(){
     right: L.left ? `${num(L.left,'auto')} <span class="dim">left to hear</span>`
                   : '<b style="color:var(--ok)">all of it heard</b>',
     body:`<div class="hsbar" style="margin-top:4px"><i style="width:${L.pct||0}%"></i></div>
-      ${L.current?`<div class="dim mono" style="font-size:10.5px;margin-top:3px;
-          word-break:break-all;white-space:normal"
-          title="the file being listened to now">${esc(L.current)}</div>`:''}
+      ${L.current?`<div style="font-size:12px;margin-top:5px;word-break:break-word;
+          white-space:normal;line-height:1.35"
+          title="the file being listened to now"><span class="dim" style="font-size:10.5px;
+          letter-spacing:.04em;text-transform:uppercase;margin-right:8px">listening to</span>${
+          esc(L.current)}</div>`:''}
       <div class="subswhy">Five 30-second windows per track, through Whisper's
         language identifier. This is the expensive half of the page and the
         only part that reads a file — everything below it is decided from what
@@ -34447,16 +34449,38 @@ function audBoardHtml(){
   const B=(_aud.board||[]);
   if(!B.length) return '';
   const tot=(_aud.total||0), you=(_aud.held||0);
-  return subsPanel({
+  // TWO PANELS, BECAUSE THE ROWS ARE TWO KINDS OF THING. The title rule and
+  // the policy never ask anything - one is always on, the other is enforced
+  // by the rebuild - so they sit in their own panel ABOVE the switchboard,
+  // and the switchboard keeps the one row that is a question: the tag, with
+  // Audio User Input dropping out of it.
+  const quiet=B.filter(b=>b.key!=='tag'), ask=B.filter(b=>b.key==='tag');
+  const rowsHtml=(rows)=>`<div style="margin-top:8px;display:flex;flex-direction:column;gap:6px">
+    ${rows.map(b=>audRowHtml(b)).join('')}
+    </div>`;
+  const qw=quiet.reduce((a,b)=>a+(b.waiting||0),0);
+  return (quiet.length?subsPanel({
+    id:'audPanelQuiet', accent:'#6fb0ff',
+    title:'What happens without asking', kind:'auto',
+    right: qw ? `${num(qw,'auto')} <span class="dim">waiting</span>`
+              : '<b style="color:var(--ok)">nothing waiting</b>',
+    why:`Two of the three audio-language rules never need an answer from you:
+      a title is corrected to agree with its tag in the same header write, and
+      the languages a library keeps are applied when a file is next rebuilt.`,
+    body:rowsHtml(quiet)}):'')
+  + subsPanel({
     id:'audPanelBoard', accent:'#6fb0ff',
     title:'What nuarr may do on its own', kind:'yours',
     right:`${num(tot,'auto')} <span class="dim">files want something</span>${
       you?` · ${num(you,'you')} <span class="dim">yours</span>`:''}`,
-    why:`Three things can be wrong about a file's audio languages. This is all
-      of them, whether nuarr is allowed to act on each, and how many files are
-      waiting on that answer.`,
-    body:`<div style="margin-top:8px;display:flex;flex-direction:column;gap:6px">
-    ${B.map(b=>{
+    why:`The one audio-language decision that can be yours: a tag that claims
+      a language the track is not. Above the line nuarr corrects it alone;
+      between the lines it asks.`,
+    body:rowsHtml(ask)});
+}
+
+function audRowHtml(b){
+  return (b=>{
       const c=AUD_C[b.key]||'#6fb0ff';
       return `<div class="lkind" style="padding:9px 11px;border-left:3px solid ${c}">
         <div style="display:flex;gap:9px;align-items:baseline;flex-wrap:wrap">
@@ -34498,8 +34522,7 @@ function audBoardHtml(){
         ${(b.detail_name&&audOpen(b.key))
           ? `<div id="audSlot-${b.key}" style="margin:7px -11px -9px"></div>` : ''}
       </div>`;
-    }).join('')}
-    </div>`});
+    })(b);
 }
 
 // ---- THE FILE-BY-FILE LIST ----------------------------------------------
@@ -34708,16 +34731,11 @@ function audAskHtml(){
         ${num(R.length,'you')} in between</span>
     </div>`;
   const key=numKey();
-  const prog=(running&&L.total)?`<div class="hsbar"><i style="width:${(L.pct||0).toFixed(1)}%"></i></div>
-    <div style="display:flex;gap:10px;align-items:baseline;font-size:11px;margin:3px 0 6px;flex-wrap:wrap">
-      <span class="busy" style="color:var(--acc)"><span class="sp"></span></span>
-      <b style="flex:none">listening ${fmt(L.done||0)} of ${fmt(L.total||0)}</b>
-      <span class="dim" style="flex:1 1 auto;min-width:0;overflow:hidden;
-            text-overflow:ellipsis;white-space:nowrap" title="${esc(L.current||'')}">${esc(L.current||'')}</span>
-      <span style="flex:none;margin-left:auto;display:flex;gap:10px">
-        ${L.each?`<span class="dim">${L.each.toFixed(1)}s each</span>`:''}
-        ${L.eta?`<b style="color:var(--acc)">${hsDur(L.eta)} left</b>`:''}
-      </span></div>`:'';
+  // NO SECOND LISTENING BAR. Listening to the library, at the top of the
+  // page, already draws this one - the same number, the same file - and two
+  // bars for one pass is the kind of duplication this page was rebuilt to
+  // remove.
+  const prog='';
   const selBar=nsel?`
     <div class="askhost" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;
          padding:6px 8px;margin:6px 0;border-radius:7px;
@@ -34909,6 +34927,8 @@ function audPaint(){
   audAskPaint();
   ifChanged('aud.board', `${_aud.total}/${_aud.held}/${_aud.needs_you}`,
             document.getElementById('audPanelBoard'));
+  ifChanged('aud.quiet', (_aud.board||[]).filter(b=>b.key!=='tag').map(b=>b.waiting||0).join('/'),
+            document.getElementById('audPanelQuiet'));
   ifChanged('aud.list', `${_aud.total}/${_aud.ready}`,
             document.getElementById('audPanelList'));
   const slot=document.getElementById('audSlot-tag');
@@ -35298,9 +35318,11 @@ function subsScanHtml(){
     right: sc.left ? `${num(sc.left,'auto')} <span class="dim">left to read</span>`
                    : '<b style="color:var(--ok)">all of it read</b>',
     body:`<div class="hsbar" style="margin-top:4px"><i style="width:${pct}%"></i></div>
-      ${sc.last?`<div class="dim mono" style="font-size:10.5px;margin-top:3px;
-          word-break:break-all;white-space:normal"
-          title="the file read most recently">${esc(sc.last)}</div>`:''}
+      ${sc.last?`<div style="font-size:12px;margin-top:5px;word-break:break-word;
+          white-space:normal;line-height:1.35"
+          title="the file read most recently"><span class="dim" style="font-size:10.5px;
+          letter-spacing:.04em;text-transform:uppercase;margin-right:8px">last read</span>${
+          esc(sc.last)}</div>`:''}
       <div class="subswhy">What is inside each file, what is sitting beside it
         and what is painted into its picture — read once and kept, so changing
         a rule costs no disk at all.
