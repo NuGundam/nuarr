@@ -1280,7 +1280,8 @@ def _candidates(limit: int) -> list:
             "  AND COALESCE(f.duration,0) > 120 "
             "  AND COALESCE(f.mtime,0) < ? "
             "  AND h.file_id IS NULL "
-            "ORDER BY f.id LIMIT ?", (cutoff, int(limit)))]
+            # eligible first - see precedence.py
+            "ORDER BY (f.state='eligible') DESC, f.id LIMIT ?", (cutoff, int(limit)))]
 
 
 async def _too_busy() -> bool:

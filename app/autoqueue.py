@@ -546,6 +546,7 @@ async def _top_up_locked() -> int:
 
     added = 0
     nowork = 0
+    held_n = 0                 # waiting on an earlier system, see precedence.py
     STATE.update(running=True, last_error="")
 
     # PROBE SEVERAL AT ONCE.
@@ -599,6 +600,14 @@ async def _top_up_locked() -> int:
                 nowork += 1
                 STATE["last_verdict"] = ("skipped", r["label"])
                 _note_check(r, "skipped")
+            except jobs.HeldForOrder as e:
+                # NOT YET, NOT NEVER. An earlier system - the decode check,
+                # the listener - still owes this file an answer the plan
+                # needs, so it stays eligible and is offered again next
+                # pass. See precedence.py. Neither an error nor a skip.
+                held_n += 1
+                STATE["last_verdict"] = ("held", r["label"])
+                _note_check(r, "held", err=str(e))
             except Exception as e:
                 # One bad file must not stall the whole mechanism.
                 joblog.log(f"auto-queue skipped {r['label']}: "
@@ -621,7 +630,7 @@ async def _top_up_locked() -> int:
     finally:
         STATE.update(running=False, current="", verdict="", checking=0,
                      checking_names=[], last_run=time.time(),
-                     last_added=added, last_nowork=nowork)
+                     last_added=added, last_nowork=nowork, last_held=held_n)
         STATE["added_total"] = STATE.get("added_total", 0) + added
         STATE["nowork_total"] = STATE.get("nowork_total", 0) + nowork
     if added or nowork:

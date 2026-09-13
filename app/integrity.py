@@ -284,8 +284,11 @@ def _candidates_per_disk(per_disk: int) -> list[dict]:
         return [dict(r) for r in cur.execute(
             "SELECT file_id, path, size, duration, pool_disk FROM ("
             "  SELECT f.id file_id, f.path, f.size, f.duration, f.pool_disk, "
+            # ELIGIBLE FIRST. precedence.py holds a transcode until this
+            # verdict exists, so a file about to be processed must not queue
+            # behind the never-checked back catalogue on its disk.
             "         ROW_NUMBER() OVER (PARTITION BY COALESCE(f.pool_disk,'') "
-            "                            ORDER BY f.id) rn "
+            "                            ORDER BY (f.state='eligible') DESC, f.id) rn "
             "    FROM files f "
             "    LEFT JOIN integrity i ON i.file_id = f.id AND i.size = f.size "
             "   WHERE f.state NOT IN ('deleted','duplicate') "

@@ -407,6 +407,11 @@ class Job:
     created_at: float = field(default_factory=time.time)
 
 
+class HeldForOrder(ValueError):
+    """Not queued yet: an earlier system still has work owed on this file.
+    See precedence.py. The feeder offers the file again next pass."""
+
+
 class NothingToDo(ValueError):
     """The probe says this file needs no work, so no job was created.
 
@@ -1202,8 +1207,17 @@ def enqueue_many(rows: list, kind: str, priority: int = 50,
         priority = min(priority, 50)
     want = [r for r in rows if r.get("file_id") and r.get("path")
             and not _sc.is_excluded(r["path"])]
+    # THE ORDER THE SYSTEMS TAKE A FILE IN - see precedence.py. A row whose
+    # file still has earlier work owed is not queued this pass; it stays
+    # wherever its feeder keeps it and is offered again.
+    held: dict = {}
+    try:
+        from . import precedence
+        want, held = precedence.filter_rows(want, kind, source)
+    except Exception:                                        # noqa: BLE001
+        held = {}
     if not want:
-        return {"made": 0, "skipped": len(rows)}
+        return {"made": 0, "skipped": len(rows), "held": held}
     ids = [int(r["file_id"]) for r in want]
     made = skipped = 0
     with cursor() as cur:
@@ -1261,7 +1275,13 @@ def enqueue_many(rows: list, kind: str, priority: int = 50,
             joblog.log(f"queued [{kind}]: {b[7]}", "info", b[0])
         except Exception:                                    # noqa: BLE001
             pass
-    return {"made": made, "skipped": skipped}
+    if held:
+        try:
+            from . import precedence
+            joblog.log(f"[{kind}] {precedence.describe(held)}", "debug")
+        except Exception:                                    # noqa: BLE001
+            pass
+    return {"made": made, "skipped": skipped, "held": held}
 
 
 def _handlers_pending() -> bool:
@@ -1328,6 +1348,21 @@ async def enqueue(file_id: int, path: str, title: str = "",
     from . import scanner as _sc
     if _sc.is_excluded(path):
         raise ValueError(f"path is excluded from nuarr: {path}")
+
+    # THE ORDER THE SYSTEMS TAKE A FILE IN - see precedence.py. A transcode
+    # is not queued while the decode check or the listener still owe this
+    # file an answer; subtitle OCR waits for the transcode. A person's own
+    # click is never held. The feeder that asked offers the file again on
+    # its next pass, so nothing is lost by saying no now.
+    if file_id:
+        try:
+            from . import precedence
+            ok, on = precedence.ready(int(file_id), kind, source)
+        except Exception:                                    # noqa: BLE001
+            ok, on = True, ""
+        if not ok:
+            raise HeldForOrder(f"not yet - {on} still has work owed on this "
+                               f"file, and {kind} comes after it")
 
     # ONE LIVE JOB PER FILE. A bulk queue overlapping an earlier one, or a
     # webhook arriving while a file is already queued, produced two rows for

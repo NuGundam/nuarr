@@ -1783,9 +1783,17 @@ def unverified(limit: int = 5000) -> list[dict]:
                 "SELECT id, path, title, season, episode, library, audio_langs, "
                 "       size, mtime "
                 "  FROM files "
-                " WHERE state='done' AND COALESCE(audio_langs,'') != '' "
+                # ELIGIBLE FIRST. The transcode keeps and drops tracks by
+                # their language, and precedence.py now holds the transcode
+                # until this listener has checked the tags - so the files
+                # about to be processed are the ones to check first, and
+                # the done pile after them. (Children of the Sea was a
+                # wrong tag found AFTER the transcode; this is the order
+                # that finds it before.)
+                " WHERE state IN ('done','eligible') "
+                "   AND COALESCE(audio_langs,'') != '' "
                 "   AND audio_langs != '-' "
-                " ORDER BY id DESC").fetchall()
+                " ORDER BY (state='eligible') DESC, id DESC").fetchall()
     except Exception:                                    # noqa: BLE001
         return out
     for r in rows:
@@ -1862,7 +1870,8 @@ def unverified_count() -> int:
         with cursor() as cur:
             r = cur.execute(
                 "SELECT COUNT(*) n FROM files f "
-                " WHERE f.state='done' AND COALESCE(f.audio_langs,'') != '' "
+                " WHERE f.state IN ('done','eligible') "
+                "   AND COALESCE(f.audio_langs,'') != '' "
                 "   AND f.audio_langs != '-' "
                 "   AND NOT EXISTS (SELECT 1 FROM audio_lang a "
                 "                    WHERE a.file_id = f.id)").fetchone()
