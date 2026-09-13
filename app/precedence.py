@@ -83,6 +83,24 @@ POOL_OF_KIND = {"decode": "decode", "listen": "listen", "audio": "audio",
 MAX_WAIT_S = 6 * 3600
 UNHELD_SOURCES = ("manual", "ui")
 
+# PUT THE THING THAT UNBLOCKS IT FORWARD.
+#
+# Holding a file is only half an answer. The other half is that the work it
+# is waiting FOR should jump: a transcode waiting on a decode check is a
+# decode check worth doing before the fifteen thousand that nobody is waiting
+# on. So when a file is held, its prerequisite job is promoted to the front
+# of that pool's queue - and where no job exists yet, the system that owns
+# the answer is asked to take that file next.
+#
+# Lower priority number runs first (see jobs.enqueue_many). 10 is ahead of
+# everything the feeders queue (50-95) and behind a person's own click.
+PROMOTE_TO = 10
+_PROMOTED_AT: dict = {}          # (file_id, prereq) -> when it was pushed
+PROMOTE_EVERY_S = 120.0
+# job_id -> what it is unblocking, for the queue panel.
+UNBLOCKS: dict = {}
+UNBLOCKS_MAX = 400
+
 # (file_id, kind) -> when it was first deferred, for the starvation cap.
 _FIRST: dict = {}
 # What the last pass held and why, for the page and the log.
@@ -204,15 +222,7 @@ def ready(file_id: int, kind: str, source: str = "") -> tuple[bool, str]:
         _FIRST.pop(key, None)
         return True, ""
     first = _FIRST.setdefault(key, time.time())
-    # A HELD TRANSCODE JUMPS ITS FILE IN THE LISTENER'S QUEUE. The listener
-    # has a backlog of thousands of tagged-but-unheard files; a file the
-    # processing system is waiting on should not queue behind them.
-    if k == "listen":
-        try:
-            from . import audiolang
-            audiolang.queue_check(int(file_id))
-        except Exception:                                    # noqa: BLE001
-            pass
+    promote(int(file_id), k, kind)
     if time.time() - first > MAX_WAIT_S:
         STATS["let_through"] = STATS.get("let_through", 0) + 1
         try:
@@ -272,6 +282,7 @@ def eligible_breakdown(force: bool = False) -> dict:
     if not force and _BREAK["data"] and now - _BREAK["at"] < _BREAK_TTL:
         return _BREAK["data"]
     out = {"total": 0, "ready": 0, "by": {}, "queued": 0, "at": now}
+    held: list = []
     try:
         paused = _paused()
         with cursor() as cur:
@@ -301,6 +312,7 @@ def eligible_breakdown(force: bool = False) -> dict:
                         continue
                 if on:
                     out["by"][on] = out["by"].get(on, 0) + 1
+                    held.append((int(f["id"]), on))
                 else:
                     out["ready"] += 1
             out["queued"] = int(cur.execute(
@@ -308,6 +320,16 @@ def eligible_breakdown(force: bool = False) -> dict:
                 "  AND pool IN ('encode','passthrough')").fetchone()["n"] or 0)
     except Exception as e:                                   # noqa: BLE001
         out["error"] = f"{type(e).__name__}: {e}"[:120]
+    # AND WHILE WE ARE HERE, PUT THE WORK THEY ARE WAITING ON FORWARD.
+    #
+    # The other caller of promote() is the enqueue path, which only fires when
+    # a feeder happens to offer a held file - and a feeder that has nothing to
+    # offer (every eligible file already carries a job of another kind) never
+    # fires it at all. This runs whenever the processing system is idle and
+    # something is waiting, which is exactly when the unblocking matters.
+    # promote() throttles itself per file, so the repetition costs nothing.
+    for fid, on in held[:200]:
+        promote(fid, on, "the processing system")
     _BREAK.update(at=now, data=out)
     return out
 
@@ -317,3 +339,63 @@ WHERE = {"decode": ("the decode check", "#health"),
          "listen": ("audio listening", "#alang"),
          "audio": ("audio tag fixes", "#alang"),
          "subread": ("subtitle reads", "#lang")}
+
+
+def promote(file_id: int, prereq: str, blocking: str = "") -> None:
+    """Push the work this file is waiting on to the front of its own queue.
+
+    Two halves, because the answer may or may not already be queued:
+      * a QUEUED job of that kind for this file has its priority lifted to
+        PROMOTE_TO, so the next free worker in that pool takes it;
+      * where nothing is queued, the system that owns the answer is asked to
+        take this file next - the listener has its own jump queue, the audio
+        queue has a priority column, and the decode and subtitle feeders
+        already order eligible files first.
+
+    Throttled per file and prerequisite: this is called from the enqueue
+    path, which a feeder may hit hundreds of times a minute.
+    """
+    now = time.time()
+    key = (int(file_id), prereq)
+    if now - _PROMOTED_AT.get(key, 0.0) < PROMOTE_EVERY_S:
+        return
+    _PROMOTED_AT[key] = now
+    lifted = 0
+    try:
+        with cursor() as cur:
+            rows = cur.execute(
+                "SELECT job_id, priority FROM jobs "
+                " WHERE file_id=? AND kind=? AND state='queued'",
+                (int(file_id), prereq)).fetchall()
+            for r in rows:
+                if int(r["priority"] or 100) > PROMOTE_TO:
+                    cur.execute("UPDATE jobs SET priority=? WHERE job_id=?",
+                                (PROMOTE_TO, r["job_id"]))
+                    lifted += 1
+                UNBLOCKS[r["job_id"]] = blocking or "the next step"
+            if len(UNBLOCKS) > UNBLOCKS_MAX:
+                for jid in list(UNBLOCKS)[:len(UNBLOCKS) - UNBLOCKS_MAX]:
+                    UNBLOCKS.pop(jid, None)
+            if prereq == "audio":
+                # Its own queue has a priority column, read by pending().
+                cur.execute("UPDATE aud_queue SET priority=? "
+                            " WHERE file_id=? AND state='queued'",
+                            (PROMOTE_TO, int(file_id)))
+    except Exception:                                        # noqa: BLE001
+        pass
+    if lifted:
+        try:
+            from . import joblog
+            joblog.log(f"[order] moved a {prereq} job to the front - "
+                       f"{blocking or 'work'} on file {file_id} is waiting "
+                       f"on it", "debug")
+        except Exception:                                    # noqa: BLE001
+            pass
+        return
+    # NOTHING QUEUED YET: ask the system that owns the answer for this file.
+    try:
+        if prereq == "listen":
+            from . import audiolang
+            audiolang.queue_check(int(file_id))
+    except Exception:                                        # noqa: BLE001
+        pass

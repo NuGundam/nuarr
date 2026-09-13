@@ -3731,6 +3731,18 @@ def api_queue(pool: str | None = None, disk: str | None = None,
     # which is exactly the case on a fresh page load.
     running = [{"pool": w.pool, "disk": w.disk}
                for w in jobs.RUNNING.values()]
+    # WHICH ROWS ARE HERE TO UNBLOCK SOMETHING ELSE. A decode check that a
+    # transcode is waiting on has been moved to the front of its pool (see
+    # precedence.promote); the row should say so, or the reordering looks
+    # arbitrary from the outside.
+    try:
+        from . import precedence as _prec
+        for it in rows:
+            u = _prec.UNBLOCKS.get(it.get("job_id"))
+            if u:
+                it["unblocks"] = u
+    except Exception:                                        # noqa: BLE001
+        pass
     _t["aggregates_ms"] = round((time.perf_counter() - _m2) * 1000, 1)
     _t["total_ms"] = round((time.perf_counter() - _m0) * 1000, 1)
     return {"total": tot["n"], "bytes": tot["bytes"], "shown": len(rows),
@@ -12421,7 +12433,11 @@ tr.logdrop td{padding:0 0 8px 0;background:#1c2129;border-bottom:1px solid var(-
   color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.02em;
   font-weight:500;padding:7px 14px;border-bottom:1px solid var(--line)}
 .qrow.qhead:hover{background:var(--panel)}
-.qrow.qhead .qpool,.qrow.qhead .qsrc{text-align:left}
+/* CENTRED, LIKE THE PILLS UNDER THEM. These two were left-aligned while
+   their cells are centred bubbles, so the two labels sat a pill's width to
+   the left of the things they name - the one visible misalignment in the
+   row. */
+.qrow.qhead .qpool,.qrow.qhead .qsrc{text-align:center;justify-content:center}
 .qrow.qhead .qwork,.qrow.qhead .qwhy,.qrow.qhead .qlib,.qrow.qhead .qsz{
   color:var(--dim);font-size:11px}
 .qrow.qhead .qsz,.qrow.qhead .qwhy{text-align:right}
@@ -12441,6 +12457,12 @@ tr.logdrop td{padding:0 0 8px 0;background:#1c2129;border-bottom:1px solid var(-
             box-shadow:inset 2px 0 0 var(--acc);
             animation:qglow 2.4s ease-in-out infinite}
 .qrow.qnext .qt{font-weight:600}
+/* A JOB THAT IS HERE TO UNBLOCK SOMETHING ELSE. It has been moved to the
+   front of its pool by precedence.promote(), and without a word for it the
+   reordering looks arbitrary from the outside. */
+.qub{font-size:9px;letter-spacing:.04em;text-transform:uppercase;
+  color:#7fd18c;border:1px solid rgba(127,209,140,.45);border-radius:8px;
+  padding:0 5px;margin-right:5px;vertical-align:1px}
 /* A pulsing background behind text is a readability problem for some people,
    and the browser already knows who. */
 @media (prefers-reduced-motion: reduce){
@@ -22647,7 +22669,9 @@ async function loadQueue(){
             <span class="qn">${up?'<span class="qspin"><i></i><i></i><i></i></span>':''}${i+1}</span>
             <span class="pill qpool" style="color:${col};border-color:${col}">${esc(it.pool||'')}</span>
           ${srcTag(it.source)}
-            <span class="qt" title="${esc(it.path||'')}">${esc(it.title||it.path||'')}</span>
+            <span class="qt" title="${esc(it.path||'')}">${
+              it.unblocks?`<span class="qub" title="the processing system is waiting on this one — it has been moved to the front of its pool">unblocks</span> `:''
+            }${esc(it.title||it.path||'')}</span>
             <span class="qwork" title="${esc(it.work_full||it.work||'')}">${esc(it.work||'')}</span>
             <span class="qlib">${esc(it.library||'')}</span>
             <span class="mono qdisk" style="color:${
