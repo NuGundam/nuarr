@@ -5452,6 +5452,69 @@ def _pool_ledger() -> dict:
     return out
 
 
+# THE TRUE LEFT. "12,710 left" on the encode row is what is in the queue,
+# and the queue is fed a slice at a time, so it says nothing about the
+# eligible files behind it. Each system's whole backlog, asked of the
+# system that owns the answer and remembered for a minute: the rows show
+# both, so a queue that is nearly drained does not read as a job nearly
+# finished. Erik: "show also the true left number as well".
+_TRUE: dict = {"at": 0.0, "data": {}}
+
+
+def _true_left(led: dict) -> dict:
+    """pool -> (n, note) where n is everything still to do, queued or not.
+    None when the owner is still counting."""
+    now = time.time()
+    if now - _TRUE["at"] < 60:
+        return _TRUE["data"]
+    out: dict = {}
+
+    def inq(pool):
+        d = led.get(pool) or {}
+        return int(d.get("queued") or 0) + int(d.get("running") or 0)
+    try:
+        elig = int(_rows("SELECT COUNT(*) n FROM files WHERE state='eligible' "
+                         "AND arr_file_id IS NOT NULL")[0]["n"] or 0)
+        why = (f"in the queue plus {elig:,} eligible files not yet planned - "
+               f"those go to encodes or remuxes once the planner looks at them, "
+               f"so the two rows share this backlog")
+        out["encode"] = (inq("encode") + elig, why)
+        out["passthrough"] = (inq("passthrough") + elig, why)
+    except Exception:                                        # noqa: BLE001
+        pass
+    try:
+        from . import subocr as _so
+        b = _so._backlog()
+        out["subocr"] = (None if b is None else inq("subocr") + int(b),
+                         "in the queue plus every file with a picture subtitle "
+                         "the sweep has still to pick up")
+    except Exception:                                        # noqa: BLE001
+        pass
+    try:
+        from . import audiolang as _al
+        heard = set()
+        for t in _al.pending(limit=100000):
+            if t.get("file_id"):
+                heard.add(int(t["file_id"]))
+        out["listen"] = (inq("listen") + len(heard) + int(_al.unverified_count() or 0),
+                         "in the queue plus every file with an untagged track and "
+                         "every tagged file nobody has listened to yet")
+    except Exception:                                        # noqa: BLE001
+        pass
+    try:
+        from . import hardsub as _hs, subtitletitle as _stt
+        d = _stt._CACHE.get("data") or {}
+        tracks = sum(1 for r in (d.get("rows") or [])
+                     if r.get("unread") and r.get("mkv_id"))
+        out["subread"] = (inq("subread") + int(_hs.untested() or 0) + tracks,
+                          "in the queue plus every file not yet sampled for "
+                          "burned-in words and every flagged track not yet read")
+    except Exception:                                        # noqa: BLE001
+        pass
+    _TRUE.update(at=now, data=out)
+    return out
+
+
 @app.get("/api/health")
 def api_health():
     r"""Every self-check nuarr runs, on one page - what found what, and where.
@@ -5539,13 +5602,18 @@ def api_health():
         return None, None
 
     def add(key, label, goto, n, note, mode=None, running=False, warn=None,
-            when="", pool=None, done=None, left=None):
+            when="", pool=None, done=None, left=None, true_left=None,
+            true_why=""):
         rem = REMEDY.get(key)
         if done is None and left is None and key in POOL:
             done, left = _progress(key)
         checks.append({"remedy": rem[0] if rem else "",
                        "pool": pool if pool is not None else POOL.get(key, ""),
                        "done": done, "left": left,
+                       # EVERYTHING STILL TO DO, queued or not - None while
+                       # the owning system is still counting; absent on rows
+                       # whose left already is the whole backlog.
+                       "true_left": true_left, "true_why": true_why,
                        # WHEN THE FIGURES LAST MOVED, so a glance says
                        # whether anything has happened since the last one.
                        "moved_at": _moved(key, done, left) if done is not None else 0,
@@ -5782,6 +5850,10 @@ def api_health():
     try:
         led = _pool_ledger()
         try:
+            _true = _true_left(led)
+        except Exception:                                    # noqa: BLE001
+            _true = {}
+        try:
             _paused = set(workers.paused())
         except Exception:                                    # noqa: BLE001
             _paused = set()
@@ -5831,9 +5903,11 @@ def api_health():
                     note += " · waiting: every queued file is on " + "; ".join(parts)
                 elif jobs.PAUSED_REASON:
                     note += f" · held: {jobs.PAUSED_REASON}"
+            tl = _true.get(pool)
             add(pool, label, goto, 0, note, mode=None, running=bool(r_),
                 warn=bool(off and q) or fl > 0, when="counted from the queue",
-                pool=pool, done=dn, left=q + r_)
+                pool=pool, done=dn, left=q + r_,
+                true_left=(tl[0] if tl else None), true_why=(tl[1] if tl else ""))
     except Exception as e:                                   # noqa: BLE001
         add("queue", "The work systems", "process", 0,
             f"check unavailable: {type(e).__name__}", warn=True)
@@ -27474,6 +27548,7 @@ function hlPaint(){
         c.done!=null
           ? `<span style="color:var(--ok)">${fmt(c.done)}</span><span class="dim"> done · </span>`
             +`<span style="color:${c.left?poolColor(c.pool):'var(--ok)'}">${fmt(c.left)}</span><span class="dim"> left</span>`
+            +(c.true_why?`<div style="font-size:11px;margin-top:2px" title="${esc(c.true_why)}"><span style="color:#f0a848;font-weight:600">${c.true_left==null?'counting':fmt(c.true_left)}</span> <span class="dim">true left</span></div>`:'')
             +(c.moved_at?`<div class="dim" style="font-size:10px;margin-top:1px" title="when these two figures last changed — ${new Date(c.moved_at*1000).toLocaleString()}">updated ${esc(ago(c.moved_at))}</div>`:'')
           : ''}</span>
       <span style="flex:none;font-size:10.5px;min-width:150px;
