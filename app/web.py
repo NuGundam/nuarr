@@ -25904,6 +25904,28 @@ function tmSpark(vals, colour, top){
       fill="none" stroke="${colour||'#58a6ff'}" stroke-width="1"
       vector-effect="non-scaling-stroke"/></svg>`;
 }
+// A HEADING THAT DOES NOT SIT OVER ITS OWN COLUMN IS WORSE THAN NO HEADING.
+// Every table on these pages declares its columns once - name, width and
+// alignment - and both the heading and the cells are built from that one
+// list, so the two cannot drift apart the way they had: a left-aligned
+// "disk" over a centred spindle name, a centred "running" over a
+// left-aligned tool, a right-aligned figure under a centred word.
+function tmCols(cols){
+  return `<colgroup>${cols.map(c=>`<col style="width:${c.w}">`).join('')}</colgroup>
+    <thead><tr class="dim" style="font-size:10px;letter-spacing:.05em;
+      text-transform:uppercase">${cols.map(c=>`<th style="text-align:${
+        c.a||'right'};padding:3px 6px;font-weight:600">${esc(c.t)}</th>`).join('')}
+    </tr></thead>`;
+}
+function tmCell(c, html, extra){
+  return `<td ${extra||''} style="text-align:${c.a||'right'};padding:3px 6px;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${html}</td>`;
+}
+// How full something is, in the colours the rest of the page already uses
+// for "fine", "getting on" and "nearly out".
+function tmFullColour(p){
+  return p>=92 ? '#f0883e' : p>=80 ? '#e8a33d' : p>=60 ? '#58a6ff' : '#7fd18c';
+}
 function tmFig(label, value, note){
   return `<div style="min-width:120px">
     <div class="dim" style="font-size:10px;letter-spacing:.05em;
@@ -25965,6 +25987,7 @@ function tmCpuView(H, cores){
   const D = _tmD || {};
   const C = D.cores || {rows:[]}, R = C.rows || [];
   const t = D.times || {}, st = D.stats || {}, f = D.freq || {}, cn = D.counts || {};
+  const T = D.temp || {};
   const last = R.length ? R[R.length-1].pct : [];
   const figs = [
     tmFig('threads', `${cn.logical||cores||'—'}`,
@@ -25977,6 +26000,22 @@ function tmCpuView(H, cores){
     tmFig('interrupt + dpc', tmPct((t.interrupt||0)+(t.dpc||0)), 'drivers'),
     tmFig('context switches', st.ctx_switches!=null?fmt(st.ctx_switches)+'/s':'—'),
     tmFig('interrupts', st.interrupts!=null?fmt(st.interrupts)+'/s':'—'),
+    // TEMPERATURE, WHERE ANYTHING WILL REPORT IT. Windows has no supported
+    // interface for a core temperature - it takes a kernel driver, which is
+    // what LibreHardwareMonitor installs - so this says where its figure came
+    // from, or why there is not one, rather than showing a number from
+    // somewhere unrelated.
+    (T.c!=null
+      ? tmFig('temperature',
+              `<span style="color:${T.c>=85?'#f0883e':T.c>=70?'#e8a33d':'inherit'}">${
+                Math.round(T.c)}°C</span>`,
+              esc((T.what||'') + (T.source?` · ${T.source}`:'')))
+      : `<div style="min-width:120px" title="${esc(T.why||'')}">
+           <div class="dim" style="font-size:10px;letter-spacing:.05em;
+                text-transform:uppercase">temperature</div>
+           <div class="mono dim" style="font-size:15px;margin-top:1px">—</div>
+           <div class="dim" style="font-size:10.5px">no sensor Windows will
+             report</div></div>`),
   ];
   // WHERE THE TIME GOES, as one bar: the same four figures the list above
   // carries, drawn to scale against each other so "60% of what?" has a shape.
@@ -26090,33 +26129,41 @@ function tmGpuView(H){
   // copy - the card never sees it - and printing four empty encoder columns
   // beside it said "an encode nuarr cannot describe" instead of "not an
   // encode". Each row now says what is actually running and on what.
+  const ECOLS = [{t:'file', w:'auto', a:'left'},
+                 {t:'running', w:'18%', a:'left'},
+                 {t:'encoder', w:'14%', a:'left'},
+                 {t:'preset', w:'9%'}, {t:'cq', w:'5%'},
+                 {t:'fps', w:'7%'}, {t:'speed', w:'7%'},
+                 {t:'eta', w:'8%'}, {t:'done', w:'7%'}];
+  // A REPACK IS NOT AN ENCODE. It runs at 276 fps because it is a stream
+  // copy - the card never sees it - and four dashes under encoder, preset,
+  // cq and speed read as an encode nobody could describe rather than as a
+  // job with no encoder in it. One cell says so instead.
+  const encRow = e=>{
+    const plain = !e.encoder && !e.family;
+    return `<tr style="border-top:1px solid var(--line)">
+      ${tmCell(ECOLS[0], tmPill(e.pool||e.kind) + ' ' + esc(e.title)
+        + (e.stage?`<span class="dim"> — ${esc(e.stage)}</span>`:''))}
+      ${tmCell(ECOLS[1], `<span class="mono">${esc(e.tool||'—')}</span>`
+        + (e.hw?`<span style="font-size:10.5px;color:${e.on_gpu?'#e8a33d':'var(--dim,#8a97a6)'}"> ${esc(e.hw)}</span>`:''),
+        `title="${esc(e.why||'')}"`)}
+      ${plain
+        ? `<td colspan="3" style="text-align:left;padding:3px 6px;
+             color:var(--dim,#8a97a6);font-size:10.5px;white-space:nowrap;
+             overflow:hidden;text-overflow:ellipsis">stream copy — no encoder,
+             so no preset and no quality setting</td>`
+        : tmCell(ECOLS[2], `<span class="mono">${esc(e.encoder||e.family)}</span>`)
+          + tmCell(ECOLS[3], `<span class="mono">${esc(e.preset||'—')}</span>`)
+          + tmCell(ECOLS[4], `<span class="mono">${e.cq!=null?e.cq:'—'}</span>`)}
+      ${tmCell(ECOLS[5], `<span class="mono">${e.fps||'—'}</span>`)}
+      ${tmCell(ECOLS[6], `<span class="mono">${e.speed?e.speed+'×':'—'}</span>`)}
+      ${tmCell(ECOLS[7], `<span class="mono dim">${e.eta_s?tmAge(e.eta_s):'—'}</span>`)}
+      ${tmCell(ECOLS[8], `<span class="mono">${Math.round((e.progress||0)*100)}%</span>`)}
+    </tr>`;
+  };
   const encTable = enc.length ? `<table style="width:100%;font-size:11.5px;
-      border-collapse:collapse;table-layout:fixed">
-      <colgroup><col style="width:auto"><col style="width:17%"><col style="width:13%">
-        <col style="width:9%"><col style="width:6%"><col style="width:8%">
-        <col style="width:8%"><col style="width:7%"></colgroup>
-      <thead><tr class="dim" style="font-size:10px;
-      letter-spacing:.05em;text-transform:uppercase">
-      <th style="text-align:left;padding:3px 6px">file</th>
-      <th style="text-align:left">running</th><th>encoder</th>
-      <th>preset</th><th>cq</th><th>fps</th><th>speed</th><th>done</th></tr></thead>
-      <tbody>${enc.map(e=>`<tr style="border-top:1px solid var(--line)">
-        <td style="padding:3px 6px;overflow:hidden;
-            text-overflow:ellipsis;white-space:nowrap">${tmPill(e.pool||e.kind)}
-          ${esc(e.title)}
-          <span class="dim">${esc(e.stage?'— '+e.stage:'')}</span></td>
-        <td style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
-            title="${esc(e.why||'')}"><span class="mono">${esc(e.tool||'—')}</span>
-          ${e.hw?`<span style="color:${e.on_gpu?'#e8a33d':'var(--dim,#8a97a6)'};
-            font-size:10.5px"> ${esc(e.hw)}</span>`:''}</td>
-        <td class="mono" style="text-align:center;color:${e.encoder?'inherit':'var(--dim,#8a97a6)'}">${
-          esc(e.encoder||e.family||'stream copy')}</td>
-        <td class="mono" style="text-align:center">${esc(e.preset||'—')}</td>
-        <td class="mono" style="text-align:center">${e.cq!=null?e.cq:'—'}</td>
-        <td class="mono" style="text-align:center">${e.fps||'—'}</td>
-        <td class="mono" style="text-align:center">${e.speed?e.speed+'×':'—'}</td>
-        <td class="mono" style="text-align:center">${Math.round((e.progress||0)*100)}%</td>
-      </tr>`).join('')}</tbody></table>
+      border-collapse:collapse;table-layout:fixed">${tmCols(ECOLS)}
+      <tbody>${enc.map(encRow).join('')}</tbody></table>
       ${enc.some(e=>e.on_gpu)?'':`<div class="dim" style="font-size:10.5px;
         margin-top:4px">none of these is on the card — a stream copy is read,
         remuxed and written without an encoder, which is why the engines above
@@ -26154,51 +26201,80 @@ function tmDiskView(H){
     tmFig('every spindle', tmBps(tot), `${by.length} disks with traffic`),
     tmFig('nuarr reads', tmBps(H.length?H[H.length-1].read:0), 'from its own counters'),
     tmFig('nuarr writes', tmBps(H.length?H[H.length-1].write:0), 'from its own counters'),
-    tmFig('the cache', tmBps(H.length?((H[H.length-1].cache_read||0)+(H[H.length-1].cache_write||0)):0),
+    tmFig('Nuarr Cache', tmBps(H.length?((H[H.length-1].cache_read||0)+(H[H.length-1].cache_write||0)):0),
           'where every encode stages'),
     tmFig('files in flight', fmt(files.length), 'jobs with a file open'),
   ];
+  const DCOLS = [{t:'disk', w:'auto', a:'left'},
+                 {t:`last ${rows.length}s`, w:'22%', a:'left'},
+                 {t:'read', w:'10%'}, {t:'write', w:'10%'},
+                 {t:'10s average', w:'15%'}, {t:'operations/s', w:'12%'}];
   const diskRows = by.map(d=>{
     const series = rows.map(r=>(r.d[d.name]||[0,0])[0] + (r.d[d.name]||[0,0])[1]);
     // nuarr's own disks keep the colour every other panel gives them; the
     // rest are grey, because a colour that means nothing elsewhere would
     // read as if it did.
     const col = (d.mine && typeof diskColor==='function') ? diskColor(d.label) : '#8b949e';
+    // READ IS BLUE AND WRITE IS ORANGE EVERYWHERE ELSE ON THIS PAGE, so the
+    // average and the operation counts wear the same two colours rather than
+    // being a grey pair you have to read the heading to decode.
+    const rw = (a,b,fa,fb)=>`<span style="color:${a?'#58a6ff':'var(--dim,#8a97a6)'}">${fa}</span>`
+      + `<span class="dim"> / </span><span style="color:${b?'#f0883e':'var(--dim,#8a97a6)'}">${fb}</span>`;
     return `<tr style="border-top:1px solid var(--line)">
-      <td style="padding:4px 6px;white-space:nowrap;overflow:hidden;
-          text-overflow:ellipsis" title="${esc(d.name)}${d.model?' — '+esc(d.model):''}">
-        <b style="color:${col}">${esc(d.label||d.name)}</b>
-        ${d.note?`<span class="dim" style="font-size:10px"> ${esc(d.note)}</span>`:''}</td>
-      <td style="width:26%">${tmSpark(series, col)}</td>
-      <td class="mono" style="text-align:right;color:#58a6ff">${tmBps(d.read_bps)}</td>
-      <td class="mono" style="text-align:right;color:#f0883e">${tmBps(d.write_bps)}</td>
-      <td class="mono dim" style="text-align:right">${tmBps(d.avg_read)} / ${tmBps(d.avg_write)}</td>
-      <td class="mono dim" style="text-align:right">${fmt(d.reads||0)} r · ${fmt(d.writes||0)} w</td>
+      ${tmCell(DCOLS[0], `<b style="color:${col}">${esc(d.label||d.name)}</b>`
+        + (d.note?`<span class="dim" style="font-size:10px"> ${esc(d.note)}</span>`:''))}
+      ${tmCell(DCOLS[1], tmSpark(series, col))}
+      ${tmCell(DCOLS[2], `<span class="mono" style="color:${d.read_bps?'#58a6ff':'var(--dim,#8a97a6)'}">${tmBps(d.read_bps)}</span>`)}
+      ${tmCell(DCOLS[3], `<span class="mono" style="color:${d.write_bps?'#f0883e':'var(--dim,#8a97a6)'}">${tmBps(d.write_bps)}</span>`)}
+      ${tmCell(DCOLS[4], `<span class="mono" style="font-size:10.5px">`
+        + rw(d.avg_read, d.avg_write, tmBps(d.avg_read), tmBps(d.avg_write)) + `</span>`)}
+      ${tmCell(DCOLS[5], `<span class="mono" style="font-size:10.5px">`
+        + rw(d.reads, d.writes, fmt(d.reads||0)+' r', fmt(d.writes||0)+' w') + `</span>`)}
     </tr>`;
   }).join('');
+  // A BAR WITH NO SCALE IS A SHAPE. Thirteen of them side by side invite
+  // exactly one question - how full is that, really - and answering it meant
+  // reading the figure at the end of the row and doing the arithmetic. The
+  // quarters are marked once, under the column, and every bar is drawn
+  // against them; the percentage wears the colour its own fullness earns.
+  const VCOLS = [{t:'volume', w:'auto', a:'left'}, {t:'used', w:'46%', a:'left'},
+                 {t:'free', w:'14%'}, {t:'full', w:'16%'}];
+  const volScale = `<tr><td></td><td style="padding:0 6px">
+      <div style="position:relative;height:11px">
+        ${[0,25,50,75,100].map(p=>`<span style="position:absolute;left:${p}%;
+            transform:translateX(${p===0?'0':p===100?'-100%':'-50%'});
+            font-size:9px;color:var(--dim,#8a97a6)">${p}%</span>`).join('')}
+      </div></td><td colspan="2"></td></tr>`;
   const volRows = vols.map(v=>{
     const pct = v.total ? 100*v.used/v.total : 0;
     const col = (typeof diskColor==='function' && v.kind==='pool') ? diskColor(v.label) : '#8b949e';
-    return `<tr><td style="padding:3px 6px;white-space:nowrap">
-        <b style="color:${col}">${esc(v.label)}</b>
-        ${v.note?`<span class="dim" style="font-size:10px"> ${esc(v.note)}</span>`:''}</td>
-      <td style="width:52%">${tmBar(pct, pct>90?'#f0883e':col, 7)}</td>
-      <td class="mono" style="text-align:right;white-space:nowrap">${tmSize(v.free)} free</td>
-      <td class="mono dim" style="text-align:right;white-space:nowrap">${Math.round(pct)}% of ${tmSize(v.total)}</td>
+    const full = tmFullColour(pct);
+    return `<tr>
+      ${tmCell(VCOLS[0], `<b style="color:${col}">${esc(v.label)}</b>`
+        + (v.note?`<span class="dim" style="font-size:10px"> ${esc(v.note)}</span>`:''))}
+      ${tmCell(VCOLS[1], `<div style="position:relative">
+          ${tmBar(pct, pct>=80?full:col, 9)}
+          ${[25,50,75].map(p=>`<span style="position:absolute;left:${p}%;top:0;
+             width:1px;height:9px;background:rgba(255,255,255,.14)"></span>`).join('')}
+        </div>`)}
+      ${tmCell(VCOLS[2], `<span class="mono">${tmSize(v.free)}</span>`)}
+      ${tmCell(VCOLS[3], `<span class="mono" style="color:${full}">${Math.round(pct)}%</span>`
+        + `<span class="dim" style="font-size:10px"> of ${tmSize(v.total)}</span>`)}
     </tr>`;
   }).join('');
+  const FCOLS = [{t:'file', w:'auto', a:'left'}, {t:'disk', w:'19%', a:'left'},
+                 {t:'read', w:'11%'}, {t:'write', w:'11%'},
+                 {t:'done', w:'8%'}, {t:'note', w:'16%', a:'left'}];
   const fileRows = files.length ? files.map(f=>`<tr style="border-top:1px solid var(--line)">
-      <td style="padding:4px 6px;max-width:0;overflow:hidden;text-overflow:ellipsis;
-          white-space:nowrap">${tmPill(f.pool||f.kind)} ${esc(f.title||f.file)}
-        ${f.stage?`<span class="dim"> — ${esc(f.stage)}</span>`:''}</td>
-      <td style="white-space:nowrap;text-align:center">${
-        f.from?`<b style="color:${diskColor(f.from)}">${esc(f.from)}</b>`:'—'}
-        ${f.to&&f.to!==f.from?` → <b style="color:${diskColor(f.to)}">${esc(f.to)}</b>`:''}</td>
-      <td class="mono" style="text-align:right;color:#58a6ff">${tmBps(f.read_bps)}</td>
-      <td class="mono" style="text-align:right;color:#f0883e">${tmBps(f.write_bps||f.commit_bps)}</td>
-      <td class="mono" style="text-align:right">${Math.round((f.progress||0)*100)}%</td>
-      <td class="dim" style="text-align:right;font-size:10.5px;white-space:nowrap">${
-        f.paced?esc(f.pace_why||'held'):(f.commit_phase?esc(f.commit_phase):'')}</td>
+      ${tmCell(FCOLS[0], tmPill(f.pool||f.kind) + ' ' + esc(f.title||f.file)
+        + (f.stage?`<span class="dim"> — ${esc(f.stage)}</span>`:''))}
+      ${tmCell(FCOLS[1], (f.from?`<b style="color:${diskColor(f.from)}">${esc(f.from)}</b>`:'—')
+        + (f.to&&f.to!==f.from?` <span class="dim">&rarr;</span> <b style="color:${diskColor(f.to)}">${esc(f.to)}</b>`:''))}
+      ${tmCell(FCOLS[2], `<span class="mono" style="color:${f.read_bps?'#58a6ff':'var(--dim,#8a97a6)'}">${tmBps(f.read_bps)}</span>`)}
+      ${tmCell(FCOLS[3], `<span class="mono" style="color:${(f.write_bps||f.commit_bps)?'#f0883e':'var(--dim,#8a97a6)'}">${tmBps(f.write_bps||f.commit_bps)}</span>`)}
+      ${tmCell(FCOLS[4], `<span class="mono">${Math.round((f.progress||0)*100)}%</span>`)}
+      ${tmCell(FCOLS[5], `<span class="${f.paced?'warn':'dim'}" style="font-size:10.5px">`
+        + (f.paced?esc(f.pace_why||'held'):(f.commit_phase?esc(f.commit_phase):'')) + `</span>`)}
     </tr>`).join('')
     : `<tr><td colspan="6" class="dim" style="padding:6px">nothing has a file open right now</td></tr>`;
   return tmBack('Disk')
@@ -26207,32 +26283,21 @@ function tmDiskView(H){
         'summed from its own processes\' counters, so nothing here can be somebody else\'s work',
         tmChart(H, [{name:'read', colour:'#58a6ff', get:r=>r.read},
                     {name:'write', colour:'#f0883e', get:r=>r.write},
-                    {name:'the cache', colour:'#8b949e', fill:false,
+                    {name:'Nuarr Cache', colour:'#8b949e', fill:false,
                      get:r=>(r.cache_read||0)+(r.cache_write||0)}],
                 {peak:true, fmt:v=>tmBps(v)}))
     + tmSection('Every spindle',
         'the machine\'s own per-disk counters — everything on the disk, nuarr\'s work and anyone else\'s',
-        `<table style="width:100%;font-size:11.5px;border-collapse:collapse">
-          <thead><tr class="dim" style="font-size:10px;letter-spacing:.05em;
-            text-transform:uppercase"><th style="text-align:left;padding:3px 6px">disk</th>
-            <th>last ${rows.length}s</th><th style="text-align:right">read</th>
-            <th style="text-align:right">write</th>
-            <th style="text-align:right">10s average</th>
-            <th style="text-align:right">operations/s</th></tr></thead>
+        `<table style="width:100%;font-size:11.5px;border-collapse:collapse;
+           table-layout:fixed">${tmCols(DCOLS)}
           <tbody>${diskRows||'<tr><td class="dim" style="padding:6px">no traffic</td></tr>'}</tbody></table>`)
     + tmSection('Which file, and where it is going',
         'every job with a file open: the spindle it is reading from, the one it will be written back to, and what it is moving',
-        `<table style="width:100%;font-size:11.5px;border-collapse:collapse;table-layout:fixed">
-          <colgroup><col style="width:auto"><col style="width:19%"><col style="width:11%">
-            <col style="width:11%"><col style="width:8%"><col style="width:14%"></colgroup>
-          <thead><tr class="dim" style="font-size:10px;letter-spacing:.05em;
-            text-transform:uppercase"><th style="text-align:left;padding:3px 6px">file</th>
-            <th>disk</th><th style="text-align:right">read</th>
-            <th style="text-align:right">write</th><th style="text-align:right">done</th>
-            <th style="text-align:right">note</th></tr></thead>
-          <tbody>${fileRows}</tbody></table>`)
+        `<table style="width:100%;font-size:11.5px;border-collapse:collapse;
+           table-layout:fixed">${tmCols(FCOLS)}<tbody>${fileRows}</tbody></table>`)
     + tmSection('The volumes', 'how full each pool disk and the cache is',
-        `<table style="width:100%;font-size:11.5px;border-collapse:collapse">${volRows}</table>`);
+        `<table style="width:100%;font-size:11.5px;border-collapse:collapse;
+           table-layout:fixed">${tmCols(VCOLS)}<tbody>${volScale}${volRows}</tbody></table>`);
 }
 // The same bubble the strip and the Workers panel use, from the one global
 // that knows the colours. (pillFor lives inside another function, so it is
@@ -26414,7 +26479,7 @@ function tmPaint(){
        // The cache volume, which every encode and every remux stages through
        // - the nearest thing to "the machine's disks" that means anything
        // here, and the one whose figure is almost entirely nuarr's doing.
-       {name:'the cache', colour:'#8b949e', fill:false,
+       {name:'Nuarr Cache', colour:'#8b949e', fill:false,
         get:r=>(r.cache_read||0)+(r.cache_write||0)}],
        {peak:true, fmt:v=>tmBps(v)})},
   ];

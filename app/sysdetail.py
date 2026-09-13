@@ -78,8 +78,100 @@ def cpu() -> dict:
         out["loadavg"] = []
     # cpu_pct, NOT cpu. proc_list carries cpu_pct, so the old key summed a
     # field that was never there and every bar read 0%.
+    out["temp"] = _cpu_temp()
     out["by_work"] = _by_work("cpu_pct")
     out["top"] = _top_procs("cpu_pct", 12)
+    return out
+
+
+_TEMP: dict = {"at": 0.0, "out": {}}
+
+
+def _cpu_temp() -> dict:
+    r"""How hot the processor is, if anything on this machine will say.
+
+    WINDOWS DOES NOT KNOW. There is no supported interface for a CPU core
+    temperature: reading it means talking to the chipset over a kernel
+    driver, which is what LibreHardwareMonitor and HWiNFO install and why
+    they can answer when nothing else can. Four sources are tried in the
+    order of how much they can be trusted, and when none of them answers
+    the page says so rather than showing a number from somewhere else -
+    measured on this box: the ACPI thermal zone returns nothing, and the
+    two temperature probes cimv2 lists are LM78A stubs with a null
+    reading, which is the usual state of affairs on a server board.
+
+    Cached for ten seconds: a temperature does not move faster than that
+    and each attempt is a WMI round trip.
+    """
+    if _TEMP["out"] and time.time() - _TEMP["at"] < 10:
+        return _TEMP["out"]
+    out: dict = {}
+    try:
+        from . import diskload
+        # 1 + 2. LibreHardwareMonitor / OpenHardwareMonitor, when running.
+        for ns, who in ((r"root\LibreHardwareMonitor", "LibreHardwareMonitor"),
+                        (r"root\OpenHardwareMonitor", "OpenHardwareMonitor")):
+            best, name = None, ""
+            for r in diskload.wmi_query(
+                    "SELECT Name, Value, SensorType, Parent FROM Sensor", ns):
+                if str(getattr(r, "SensorType", "")) != "Temperature":
+                    continue
+                nm = str(getattr(r, "Name", "") or "")
+                par = str(getattr(r, "Parent", "") or "")
+                if "cpu" not in (nm + par).lower():
+                    continue
+                try:
+                    v = float(getattr(r, "Value", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                # "CPU Package" is the one to lead with; otherwise the
+                # hottest core is the honest answer.
+                if "package" in nm.lower():
+                    best, name = v, nm
+                    break
+                if best is None or v > best:
+                    best, name = v, nm
+            if best:
+                out = {"c": round(best, 1), "source": who, "what": name}
+                break
+        # 3. The ACPI thermal zone - tenths of a kelvin.
+        if not out:
+            vals = []
+            for r in diskload.wmi_query(
+                    "SELECT CurrentTemperature FROM MSAcpi_ThermalZoneTemperature",
+                    r"root\wmi"):
+                try:
+                    k = float(getattr(r, "CurrentTemperature", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                if k > 2000:                      # 273.15 K is 0 C
+                    vals.append(k / 10.0 - 273.15)
+            if vals:
+                out = {"c": round(max(vals), 1), "source": "ACPI thermal zone",
+                       "what": "the warmest zone"}
+        # 4. A board sensor, where one is actually wired up.
+        if not out:
+            for r in diskload.wmi_query(
+                    "SELECT CurrentReading, Description FROM Win32_TemperatureProbe"):
+                v = getattr(r, "CurrentReading", None)
+                if v in (None, ""):
+                    continue
+                try:
+                    out = {"c": round(float(v) / 10.0 - 273.15, 1),
+                           "source": "board sensor",
+                           "what": str(getattr(r, "Description", "") or "")}
+                    break
+                except (TypeError, ValueError):
+                    continue
+    except Exception:                                        # noqa: BLE001
+        pass
+    if not out:
+        out = {"c": None, "source": "",
+               "why": "Windows exposes no processor temperature on this "
+                      "machine - the ACPI thermal zone reports nothing and "
+                      "the board probes read null. Install "
+                      "LibreHardwareMonitor and this fills itself in."}
+    _TEMP.update(at=time.time(), out=out)
     return out
 
 
@@ -429,7 +521,7 @@ def _pool_labels() -> dict:
         try:
             k = system._cache_disk_key()
             if k:
-                _LABELS.setdefault(k, "the cache")
+                _LABELS.setdefault(k, "Nuarr Cache")
         except Exception:                                    # noqa: BLE001
             pass
     return _LABELS
@@ -525,7 +617,7 @@ def _volumes() -> list:
         try:
             u = shutil.disk_usage(path)
             drive = os.path.splitdrive(os.path.abspath(path))[0] or path
-            out.append({"label": "the cache", "note": drive,
+            out.append({"label": "Nuarr Cache", "note": drive,
                         "total": u.total, "used": u.used,
                         "free": u.free, "kind": kind})
         except OSError:
