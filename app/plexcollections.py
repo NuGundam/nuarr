@@ -78,7 +78,10 @@ def rules_available(library: str) -> list:
     """[{key, title, what, lang}] this library may keep, in display order."""
     out = [{"key": "ended", "title": "Ended", "what": "Sonarr calls the show ended", "lang": ""},
            {"key": "unwatched", "title": "Unwatched",
-            "what": "nothing of the show has been watched yet", "lang": ""}]
+            "what": "nothing of the show has been watched yet", "lang": ""},
+           {"key": "unwatched_ended", "title": "Unwatched Ended",
+            "what": "nothing of it watched yet, and Sonarr calls it ended - "
+                    "a finished show you can start without waiting", "lang": ""}]
     try:
         from . import langpolicy, langkey
         pol = langpolicy.for_library(library, "audio") or {}
@@ -117,6 +120,8 @@ def _want(rule: str, f: dict) -> bool:
         return st == "ended"
     if rule == "unwatched":
         return un
+    if rule == "unwatched_ended":
+        return un and st == "ended"
     kind, _, code = rule.partition(":")
     has = code in langs
     if kind == "lang":
