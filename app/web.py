@@ -14136,6 +14136,14 @@ button[disabled]{opacity:.5;cursor:default}
            letter-spacing:.4px;margin-right:4px}
 .capbar .v{font-variant-numeric:tabular-nums;font-weight:600}
 .capbar .grp{display:flex;align-items:baseline;gap:3px}
+/* The dashboard's compact Workers panel - see workersCompact(). One chip per
+   pool, the number and nothing else; the page that can change them is a link
+   away. */
+.wcrow{display:flex;gap:7px;flex-wrap:wrap;align-items:center}
+.wcchip{display:inline-flex;align-items:baseline;gap:5px;font-size:12px;
+  padding:2px 9px;border:1px solid var(--line);border-radius:11px;
+  white-space:nowrap;cursor:help}
+.wcchip b{font-variant-numeric:tabular-nums;font-size:13px}
 /* Per-pool I/O priority, sat against the pool it describes. */
 .iop{font-size:10px;padding:1px 6px;border-radius:9px;margin-left:6px;
      border:1px solid;white-space:nowrap;cursor:help}
@@ -40492,8 +40500,61 @@ async function bkRestore(name){
   loadBackup(false);
 }
 let _encLine='';   // "encoding on: ..." - fetched once, painted into the header
+// THE DASHBOARD IS NOT THE SETTINGS PAGE, and this panel is on both.
+//
+// Workers - concurrency is the one settings pane that stays on the dashboard,
+// because it is a dial on the running system rather than a setting you visit
+// once. But the full version is eleven rows of steppers, hints, min/max lines,
+// pause switches and cost strips - a page and a half of configuration in the
+// middle of a dashboard that repaints every 750 ms. What the dashboard needs
+// is the ANSWER: how many of each, right now, and which are paused. The rest
+// is one click away, on the page whose job it is.
+function workersCompact(w){
+  const POOLS = ['encode_workers','passthrough_workers','subocr_workers',
+                 'subs_workers','audio_workers','decode_workers',
+                 'listen_workers','subread_workers'];
+  const OTHER = ['probe_workers','arr_concurrency'];
+  const short = {encode_workers:'encode', passthrough_workers:'remux',
+                 subocr_workers:'sub OCR', subs_workers:'sub fixes',
+                 audio_workers:'audio tags', decode_workers:'decode',
+                 listen_workers:'listen', subread_workers:'sub reads',
+                 probe_workers:'file scans', arr_concurrency:'arr calls'};
+  const chip = (k)=>{
+    const v = w[k]; if(!v) return '';
+    const col = v.pool ? poolColor(v.pool) : 'var(--dim)';
+    const gpu = (k==='subocr_workers' && w.subocr_gpu_lanes)
+      ? `<span class="dim" style="font-size:10px"> \u00b7 ${w.subocr_gpu_lanes.value} on the card</span>` : '';
+    return `<span class="wcchip" title="${esc(v.label||k)}${
+        v.paused?' \u2014 paused: running jobs finish, nothing new starts':''}">`
+      + `<span style="color:${col};${v.paused?'opacity:.45':''}">${esc(short[k]||k)}</span>`
+      + (v.paused ? `<b class="dim" style="font-size:11px">\u23f8</b>`
+                  : `<b style="color:${v.value?'var(--fg,#c9d1d9)':'var(--dim)'}">${v.value}</b>`)
+      + gpu + `</span>`;
+  };
+  const anyPaused = POOLS.some(k=>(w[k]||{}).paused);
+  return `<div style="padding:9px 14px 10px">
+      <div class="wcrow">${POOLS.map(chip).join('')}</div>
+      <div class="wcrow" style="margin-top:5px;opacity:.7">${OTHER.map(chip).join('')}</div>
+      <div class="dim" style="font-size:11px;margin-top:7px;display:flex;
+           gap:10px;align-items:baseline;flex-wrap:wrap">
+        <span>how many of each may run at once${
+          anyPaused?' \u2014 <span class="warn">a pool is paused</span>':''}</span>
+        <a href="/settings#counts" style="color:#6fb0ff;text-decoration:none;margin-left:auto"
+           title="the full version: limits, defaults, pause switches, what each worker costs the box, and the holds and timing tab"
+           >Change these \u2192</a>
+      </div></div>`;
+}
 function paintWorkers(){
   const w=_wdata;
+  // The compact version on the dashboard; the real one under /settings.
+  if(!location.pathname.startsWith('/settings')){
+    document.getElementById('workers').innerHTML = workersCompact(w);
+    const hint=document.getElementById('wtabhint');
+    if(hint) hint.textContent='\u00b7 concurrency';
+    const foot=document.querySelector('#wSettings > div:last-child');
+    if(foot && foot.querySelector('button')) foot.style.display='none';
+    return;
+  }
   // ONE ROW PER POOL: the subocr GPU-lane setting rides inside the subocr
   // row rather than wearing the same bubble on a row of its own.
   const rows=Object.entries(w).filter(([k,v])=> (_wtab==='timing' ? v.timing : !v.timing)
