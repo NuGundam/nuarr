@@ -40,7 +40,7 @@ from . import (arrhealth, audiolang, autoqueue, backup, commitqueue,
 from .arr import ArrClient
 from .config import DB_PATH, NO_WINDOW, SETTINGS, hidden_si
 from .db import ON_LOOP as db_on_loop
-from .db import cursor, display_label, init_db
+from .db import cursor, display_label, init_db, kv_get, kv_set
 
 app = FastAPI(title="nuarr", version="0.1")
 
@@ -5391,6 +5391,32 @@ async def api_arrgap_mode(mode: str):
 _LEDGER: dict = {"at": 0.0, "data": {}}
 
 
+# WHEN EACH ROW'S DONE / LEFT LAST CHANGED. A pair of numbers says where a
+# system is; the time they last moved says whether it is moving. Kept in
+# kv so a restart does not make every row look freshly changed.
+_MOVED: dict = {}
+
+
+def _moved(key: str, done, left) -> float:
+    global _MOVED
+    if not _MOVED:
+        try:
+            _MOVED = json.loads(kv_get("health.moved") or "{}") or {}
+        except Exception:                                    # noqa: BLE001
+            _MOVED = {}
+        _MOVED.setdefault("_", 1)
+    now = time.time()
+    cur = _MOVED.get(key) or {}
+    if cur.get("d") != done or cur.get("l") != left:
+        _MOVED[key] = {"d": done, "l": left, "at": now}
+        try:
+            kv_set("health.moved", json.dumps(_MOVED))
+        except Exception:                                    # noqa: BLE001
+            pass
+        return now
+    return float(cur.get("at") or now)
+
+
 def _pool_ledger() -> dict:
     now = time.time()
     if now - _LEDGER["at"] < 20:
@@ -5520,6 +5546,9 @@ def api_health():
         checks.append({"remedy": rem[0] if rem else "",
                        "pool": pool if pool is not None else POOL.get(key, ""),
                        "done": done, "left": left,
+                       # WHEN THE FIGURES LAST MOVED, so a glance says
+                       # whether anything has happened since the last one.
+                       "moved_at": _moved(key, done, left) if done is not None else 0,
                        "remedy_why": rem[1] if rem else "",
                        "key": key, "label": label, "goto": goto,
                        "n": int(n or 0), "note": note, "mode": mode,
@@ -27445,6 +27474,7 @@ function hlPaint(){
         c.done!=null
           ? `<span style="color:var(--ok)">${fmt(c.done)}</span><span class="dim"> done · </span>`
             +`<span style="color:${c.left?poolColor(c.pool):'var(--ok)'}">${fmt(c.left)}</span><span class="dim"> left</span>`
+            +(c.moved_at?`<div class="dim" style="font-size:10px;margin-top:1px" title="when these two figures last changed — ${new Date(c.moved_at*1000).toLocaleString()}">updated ${esc(ago(c.moved_at))}</div>`:'')
           : ''}</span>
       <span style="flex:none;font-size:10.5px;min-width:150px;
         text-align:right;color:${hlRemedyColor(c.remedy)}" title="${esc(c.remedy_why
