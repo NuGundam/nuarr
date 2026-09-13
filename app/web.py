@@ -25041,6 +25041,39 @@ function numCtl(k,v){
 // `extra` is a second setting folded into the same row - the subocr GPU
 // lanes ride under the subocr worker count, because two rows wearing the
 // same bubble read as the same pool listed twice.
+// ---- WHAT EACH WORKER COSTS ------------------------------------------------
+//
+// Every row here is "how many at once", and that number means nothing without
+// knowing which of the four things the work eats. Four encodes and four
+// remuxes are the same figure and a completely different machine afterwards:
+// one is bound by a single NVENC engine, the other by twelve spindles. So
+// each row carries a strip - processor, card, memory, disk - with the one
+// that runs out FIRST named, and the medians from the jobs table behind it.
+const COST_COL = {cpu:'#58a6ff', gpu:'#e8a33d', ram:'#7fd18c', disk:'#c98cf0'};
+const COST_NAME = {cpu:'processor', gpu:'card', ram:'memory', disk:'disk'};
+function costPips(n, colour){
+  return [0,1,2].map(i=>`<span style="display:inline-block;width:7px;height:7px;
+    border-radius:1.5px;margin-right:2px;background:${
+      i<n?colour:'rgba(255,255,255,.10)'}"></span>`).join('');
+}
+function costStrip(c){
+  if(!c || c.cpu==null) return '';
+  const m = c.measured;
+  const parts = ['cpu','gpu','ram','disk'].map(x=>{
+    const lead = c.lead===x;
+    return `<span style="margin-right:11px;white-space:nowrap"
+       title="${esc(COST_NAME[x])}: ${['nothing','light','moderate','heavy'][c[x]]||''}${
+         lead?' — and the first thing this row runs out of':''}">
+      <span style="font-size:9.5px;letter-spacing:.04em;text-transform:uppercase;
+        color:${c[x]?COST_COL[x]:'var(--dim,#8a97a6)'};${lead?'font-weight:700':''}">${x}</span>
+      <span style="margin-left:3px">${costPips(c[x], COST_COL[x])}</span></span>`;
+  }).join('');
+  const med = m ? `<span class="dim" style="font-size:10px">${fmt(m.jobs)} jobs ·
+      middle one ${m.secs<60?m.secs+'s':(m.secs/60).toFixed(1)+'m'}${
+      m.gb?` · ${m.gb} GB`:''}</span>` : '';
+  return `<div style="margin-top:4px;display:flex;align-items:center;
+      flex-wrap:wrap;gap:2px" title="${esc(c.why||'')}">${parts}${med}</div>`;
+}
 function workerRow(k,v,extra){
   const st=stepFor(v);
   // A typed field alongside the steppers: 1800 -> 5 is 60 clicks otherwise, and
@@ -25055,8 +25088,10 @@ function workerRow(k,v,extra){
     <td><div>${v.pool?`<span class="pill" style="color:${pc};border-color:${pc};margin-right:7px;font-size:10.5px">${esc(v.pool)}</span>`:''}${esc(v.label || k.replace(/_/g,' '))}
         ${off?`<span class="dim" style="font-size:10.5px;margin-left:8px">⏸ paused — running jobs finish, nothing new starts</span>`:''}</div>
         <div class="dim" style="font-size:11px">${esc(v.hint)}</div>
+        ${costStrip(v.cost)}
         ${ev?`<div style="margin-top:6px"><b style="font-size:11.5px">${esc(ev.label||ek)}</b>
-              <div class="dim" style="font-size:11px">${esc(ev.hint)}</div></div>`:''}</td>
+              <div class="dim" style="font-size:11px">${esc(ev.hint)}</div>
+              ${costStrip(ev.cost)}</div>`:''}</td>
     <td style="width:250px;text-align:right;white-space:nowrap">
       ${numCtl(k,v)}
       <div class="dim" style="font-size:11px">
@@ -40345,7 +40380,13 @@ function paintWorkers(){
   const blurb = _wtab==='timing'
     ? `How long files settle before processing, and how long jobs stay held
        while Plex is playing or another app is working the disks.`
-    : `How much runs at once. Encode is NVENC-bound; passthrough is disk-bound.`;
+    : `How much runs at once — and what each one costs. The strip under every
+       row is what that work eats: <span style="color:#58a6ff">processor</span>,
+       <span style="color:#e8a33d">card</span>,
+       <span style="color:#7fd18c">memory</span>,
+       <span style="color:#c98cf0">disk</span>, one to three pips each, with
+       the one it runs out of FIRST in bold. Hover a row for why, and for how
+       long the middle job of that kind actually took.`;
   const enc = (_wtab!=='timing' && _encLine)
     ? `<div style="padding:0 14px 8px;font-size:11.5px">${_encLine}</div>` : '';
   document.getElementById('workers').innerHTML=

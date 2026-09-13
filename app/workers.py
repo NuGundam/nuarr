@@ -515,6 +515,8 @@ class WorkerConfig:
                 "label": LABELS.get(k, k.replace("_", " ")),
                 "pool": POOL_OF.get(k, ""),
                 "timing": k in TIMING_KEYS,
+                # WHICH OF THE FOUR THINGS THIS ONE EATS. See COST.
+                "cost": cost_of(k),
             }
             for k in LIMITS if k not in HIDDEN_KEYS
         }
@@ -528,6 +530,178 @@ class WorkerConfig:
 # long as it is off: running jobs finish, nothing new is claimed. Persisted
 # like the counts, so a restart does not silently restart a pool somebody
 # stopped on purpose.
+# WHAT EACH WORKER ACTUALLY COSTS THE BOX.
+#
+# Every row on this page is "how many of these at once", and the honest way
+# to answer that is to know which of the four things a worker eats: the
+# processor, the card, memory, or the disks. They are not interchangeable -
+# four encodes and four remuxes are the same number and completely different
+# machines afterwards, because one is bound by a single NVENC engine and the
+# other by twelve spindles. Nothing here is guessed: the ratings come from
+# what the tool provably does (see what_runs() in jobs.py, which says the
+# same thing per stage) and the figures beside them are medians over the
+# jobs table.
+#
+# 0 nothing · 1 light · 2 moderate · 3 heavy. `lead` is the one that runs
+# out first - the number this row is really limited by.
+COST = {
+    "encode_workers": {
+        "cpu": 1, "gpu": 3, "ram": 1, "disk": 2, "lead": "gpu",
+        "why": "NVENC does the encoding on its own engine - the card has one, "
+               "which is why this is the number that matters. The processor "
+               "only feeds it and collects the result; a burn-in adds filter "
+               "work on the SMs. The disk half is the commit at the end."},
+    "passthrough_workers": {
+        "cpu": 2, "gpu": 0, "ram": 1, "disk": 3, "lead": "disk",
+        "why": "Reads a whole file and writes a whole file - the card is "
+               "never involved. The processor share is whatever audio the "
+               "plan converts on the way through (TrueHD down to 5.1, EAC3 "
+               "to AAC), which is real but small beside the I/O."},
+    "subocr_workers": {
+        "cpu": 2, "gpu": 2, "ram": 2, "disk": 3, "lead": "disk",
+        "why": "Three parts with different appetites: demux the picture "
+               "subtitles (disk), read them (the engine - CUDA on Paddle, "
+               "the processor on Tesseract), then rebuild the container "
+               "(disk again, a whole file each way). The longest job nuarr "
+               "runs after an encode."},
+    "subocr_gpu_lanes": {
+        "cpu": 0, "gpu": 3, "ram": 2, "disk": 0, "lead": "gpu",
+        "why": "Only the read itself - the card and the model it holds in "
+               "video memory. The unpacking and repacking either side are "
+               "disk work and are counted by the row above."},
+    "subs_workers": {
+        "cpu": 1, "gpu": 0, "ram": 1, "disk": 3, "lead": "disk",
+        "why": "mkvmerge rebuilds the container: a whole file read and a "
+               "whole file written, with almost nothing for the processor to "
+               "do in between. Two of these on one spindle is the thing to "
+               "avoid, not two on the box."},
+    "audio_workers": {
+        "cpu": 0, "gpu": 0, "ram": 0, "disk": 1, "lead": "disk",
+        "why": "mkvpropedit rewrites the header in place - a seek and a few "
+               "hundred bytes. Nothing is decoded, nothing is copied. The "
+               "cheapest work nuarr does."},
+    "decode_workers": {
+        "cpu": 3, "gpu": 0, "ram": 1, "disk": 2, "lead": "cpu",
+        "why": "ffmpeg decodes the first twenty and last twenty-five seconds "
+               "on four threads, on the processor, deliberately - the point "
+               "is to find out whether the bytes decode at all. Measured here "
+               "at about four full cores per job while it runs."},
+    "listen_workers": {
+        "cpu": 2, "gpu": 2, "ram": 2, "disk": 1, "lead": "gpu",
+        "why": "Whisper's language identifier over five thirty-second "
+               "windows per track. One model is loaded and shared, so the "
+               "second job shares the card rather than doubling the memory; "
+               "only a few minutes of audio is ever read off the disk."},
+    "subread_workers": {
+        "cpu": 2, "gpu": 1, "ram": 1, "disk": 2, "lead": "disk",
+        "why": "Either samples frames and shows them to the OCR (processor, "
+               "some card), or reads a subtitle track's events end to end "
+               "(disk). A whole-file read off one pool disk either way."},
+    "probe_workers": {
+        "cpu": 1, "gpu": 0, "ram": 0, "disk": 2, "lead": "disk",
+        "why": "ffprobe reads a header. The cost is one seek per file across "
+               "a spun-down pool disk, not the parsing."},
+    "arr_concurrency": {
+        "cpu": 0, "gpu": 0, "ram": 0, "disk": 0, "lead": "",
+        "why": "Questions over the network to Sonarr and Radarr. The limit is "
+               "their patience, not this machine's."},
+}
+
+# WHICH POOL EACH ROW'S JOBS ARE FILED UNDER, so the medians below can be
+# looked up. Not POOL_OF: that maps to the pause switch and is empty for the
+# rows that have no pool of their own.
+_COST_POOL = {"encode_workers": "encode", "passthrough_workers": "passthrough",
+              "subocr_workers": "subocr", "subocr_gpu_lanes": "subocr",
+              "subs_workers": "subs", "audio_workers": "audio",
+              "decode_workers": "decode", "listen_workers": "listen",
+              "subread_workers": "subread"}
+
+_MED: dict = {"at": 0.0, "data": {}}
+
+
+def medians() -> dict:
+    """Per pool, from the last fortnight of finished jobs: how many, how long
+    the middle one took, and how big the middle file was.
+
+    A rating says which resource; this says how much of it, and it is the
+    figure that settles an argument - subtitle OCR reads for 57 seconds a
+    file and an audio tag fix is done in three.
+    """
+    import time as _t
+    if _MED["data"] and _t.time() - _MED["at"] < 600:
+        return _MED["data"]
+    out: dict = {}
+    try:
+        import statistics
+        from .db import cursor as _cur
+        since = _t.time() - 14 * 86400
+        with _cur() as cur:
+            rows = cur.execute(
+                "SELECT COALESCE(pool,kind) p, started_at, finished_at, "
+                "       size_before FROM jobs "
+                " WHERE state='done' AND COALESCE(finished_at,0) > ?",
+                (since,)).fetchall()
+        agg: dict = {}
+        for r in rows:
+            st, fi = r["started_at"] or 0, r["finished_at"] or 0
+            d = agg.setdefault(r["p"], {"n": 0, "secs": [], "gb": []})
+            d["n"] += 1
+            if st and fi and fi > st:
+                d["secs"].append(fi - st)
+            if r["size_before"]:
+                d["gb"].append(r["size_before"] / 2 ** 30)
+        for k, d in agg.items():
+            out[k] = {"jobs": d["n"],
+                      "secs": round(statistics.median(d["secs"]), 1) if d["secs"] else 0,
+                      "gb": round(statistics.median(d["gb"]), 2) if d["gb"] else 0}
+    except Exception:                                        # noqa: BLE001
+        out = {}
+    _MED.update(at=_t.time(), data=out)
+    return out
+
+
+def cost_of(key: str) -> dict:
+    """The profile for one row, with the engine it actually uses folded in."""
+    c = COST.get(key)
+    if not c:
+        return {}
+    c = dict(c)
+    # TWO OF THESE CHANGE SHAPE WITH THEIR ENGINE, and saying "GPU" on a box
+    # whose OCR is Tesseract would be a fact about somebody else's machine.
+    try:
+        if key in ("subocr_workers", "subocr_gpu_lanes"):
+            from . import subocr
+            if (subocr.engine() or "").lower() != "paddle":
+                c["gpu"] = 0
+                c["cpu"] = 3 if key == "subocr_workers" else 3
+                c["lead"] = "cpu"
+                c["why"] = c["why"].replace(
+                    "the engine - CUDA on Paddle, the processor on Tesseract",
+                    "Tesseract, on the processor")
+        if key == "listen_workers":
+            from . import audiolang
+            # THE DEVICE THE MODEL IS ACTUALLY LOADED ON - not the one the box
+            # could offer. faster-whisper installed for the CPU is a CPU job
+            # however many cards are in the machine, and _MODEL_DEV is what
+            # the loader ended up with. info()'s answer is the fallback
+            # before the first load. (progress() does not carry a device -
+            # reading it there quietly rated a CUDA listener as CPU work.)
+            dev = getattr(audiolang, "_MODEL_DEV", "") or \
+                (audiolang.info() or {}).get("device") or ""
+            if str(dev) != "cuda":
+                c["gpu"] = 0
+                c["cpu"] = 3
+                c["lead"] = "cpu"
+                c["why"] = c["why"].replace(
+                    "shares the card", "shares the model")
+    except Exception:                                        # noqa: BLE001
+        pass
+    m = medians().get(_COST_POOL.get(key, ""), {})
+    if m:
+        c["measured"] = m
+    return c
+
+
 PAUSABLE = ("encode", "passthrough", "subocr", "subs", "audio", "decode",
             "listen", "subread")
 
