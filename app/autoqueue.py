@@ -570,7 +570,7 @@ async def _top_up_locked() -> int:
     STATE["checking"] = 0
 
     async def one(r):
-        nonlocal added, nowork
+        nonlocal added, nowork, held_n
         async with sem:
             if not enabled():          # turned off mid-pass; stop promptly
                 return

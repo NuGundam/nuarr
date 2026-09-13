@@ -22907,6 +22907,62 @@ resolved to a pool disk, so the per-spindle avoidance cannot apply">unknown disk
 // cards without also refetching the Finished list and the queue preview. Those
 // two are why the panel ran at 2 s: they are large and they rarely change,
 // while the thing you actually watch - the bar - changes continuously.
+// ---- WHY NOTHING IS BEING PROCESSED ---------------------------------------
+//
+// An empty panel had five different meanings - nothing eligible, the gate
+// holding, the pool paused, every eligible file waiting on a fact the plan
+// needs, or simply nothing queued - and looked the same in all five. It reads
+// as a fault, and the one that is hardest to guess is the newest: the order
+// the systems take a file in (see precedence.py) can legitimately hold every
+// eligible file behind a decode check or the listener.
+const IDLE_WHERE = {decode:['the decode check','#health'],
+                    listen:['audio listening','#alang'],
+                    audio:['audio tag fixes','#alang'],
+                    subread:['subtitle reads','#lang']};
+function whyIdleHtml(j){
+  const w = j && j.why_idle;
+  if(!w || !Object.keys(w).length) return '';           // something is running
+  const bits = [];
+  let lead = '', tone = 'dim';
+  if((w.paused||[]).length){
+    lead = `${w.paused.join(' and ')} ${w.paused.length>1?'are':'is'} paused —
+            running jobs finish, nothing new starts`;
+    tone = 'warn';
+  } else if(w.hold){
+    lead = esc(w.hold); tone = 'warn';
+  } else if(w.queued_here){
+    lead = `${fmt(w.queued_here)} queued here, waiting for a turn`;
+  } else if(!w.eligible){
+    lead = 'nothing is eligible — every file the arrs manage has been through';
+  } else if(w.ready){
+    lead = `${fmt(w.ready)} file${w.ready>1?'s are':' is'} ready to queue —
+            the feeder tops up every few seconds`;
+  } else {
+    lead = `${fmt(w.eligible)} eligible file${w.eligible>1?'s':''}, none ready yet`;
+    tone = 'warn';
+  }
+  // WHAT THEY ARE WAITING ON, each a link to the system that owes it.
+  const waits = Object.entries(w.waiting||{}).sort((a,b)=>b[1]-a[1]);
+  for(const [k, n] of waits){
+    const [name, href] = IDLE_WHERE[k] || [k, ''];
+    bits.push(`<a href="/settings${href}" style="color:#6fb0ff;text-decoration:none"
+       title="the plan is built from this, so the file waits until it is known">
+       ${fmt(n)} behind ${esc(name)}</a>`);
+  }
+  const els = Object.entries(w.elsewhere||{});
+  const elsTxt = els.length
+    ? `<span class="dim"> · other systems are working: ${els.map(([k,n])=>
+        `<span style="color:${poolColor(k)}">${esc(k)} ${n}</span>`).join(', ')}</span>`
+    : (w.queued_all ? `<span class="dim"> · ${fmt(w.queued_all)} queued across every pool</span>` : '');
+  return `<div style="padding:8px 14px;border-bottom:1px solid var(--line);
+      font-size:12px">
+      <span class="pill ${tone==='warn'?'p-warn':'p-ok'}"
+        style="font-size:9.5px">IDLE</span>
+      <span class="${tone==='warn'?'warn':'dim'}" style="margin-left:6px">${lead}</span>
+      ${bits.length?`<span class="dim"> — </span>${bits.join('<span class="dim">, </span>')}`:''}
+      ${elsTxt}
+    </div>`;
+}
 function paintRunning(j){
   // The Processing-now tile and its panel ride this payload rather than
   // fetching their own - both polls land here, so the tile can never show a
@@ -22932,10 +22988,11 @@ function paintRunning(j){
   // minute is not activity.
   if(lastDisks.length) renderDisks();
   renderOverall(j.overall);
-  document.getElementById('jobsHeld').innerHTML = j.paused_reason
-    ? `<div style="padding:10px 14px;border-bottom:1px solid var(--line)">
-       <span class="pill p-warn">HELD</span> <span class="dim">${esc(j.paused_reason)}</span></div>`
-    : '';
+  document.getElementById('jobsHeld').innerHTML =
+    (j.paused_reason
+      ? `<div style="padding:10px 14px;border-bottom:1px solid var(--line)">
+         <span class="pill p-warn">HELD</span> <span class="dim">${esc(j.paused_reason)}</span></div>`
+      : '') + whyIdleHtml(j);
 
   // Feed the interpolator FIRST, so barState() below - in either the patch or
   // the rebuild path - reads this sample rather than the previous one.

@@ -252,3 +252,68 @@ def describe(held: dict) -> str:
         return ""
     return "held for order: " + ", ".join(
         f"{n} behind {k}" for k, n in sorted(held.items(), key=lambda kv: -kv[1]))
+
+# --------------------------------------- why the processing system is idle --
+#
+# "Nothing running" has five different causes and the panel said none of them.
+# This answers the one question worth asking when the queue is not moving:
+# how many files COULD be processed, and what each of them is waiting for.
+# Cached, and only computed when somebody asks - the panel asks while the
+# encode and passthrough pools are empty, which is exactly when nobody is
+# paying for it.
+_BREAK: dict = {"at": 0.0, "data": {}}
+_BREAK_TTL = 20.0
+
+
+def eligible_breakdown(force: bool = False) -> dict:
+    """{total, ready, by: {prereq: n}, oldest} over the files the processing
+    system could take next."""
+    now = time.time()
+    if not force and _BREAK["data"] and now - _BREAK["at"] < _BREAK_TTL:
+        return _BREAK["data"]
+    out = {"total": 0, "ready": 0, "by": {}, "queued": 0, "at": now}
+    try:
+        paused = _paused()
+        with cursor() as cur:
+            # THE SAME POPULATION THE FEEDER DRAWS FROM - eligible, and known
+            # to an arr (autoqueue's own filter), minus anything already on
+            # the queue.
+            rows = [dict(r) for r in cur.execute(
+                "SELECT f.id, f.path, f.state, f.size, f.duration, "
+                "       f.audio_langs, f.sub_langs "
+                "  FROM files f "
+                " WHERE f.state='eligible' AND f.arr_file_id IS NOT NULL "
+                "   AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.file_id=f.id "
+                "                    AND j.state IN ('queued','running')) "
+                " ORDER BY f.id LIMIT 4000")]
+            out["total"] = len(rows)
+            for f in rows:
+                on = ""
+                for k in PREREQS["transcode"]:
+                    if POOL_OF_KIND.get(k, "") in paused:
+                        continue
+                    fn = ORACLE.get(k)
+                    try:
+                        if fn and fn(cur, f):
+                            on = k
+                            break
+                    except Exception:                        # noqa: BLE001
+                        continue
+                if on:
+                    out["by"][on] = out["by"].get(on, 0) + 1
+                else:
+                    out["ready"] += 1
+            out["queued"] = int(cur.execute(
+                "SELECT COUNT(*) n FROM jobs WHERE state='queued' "
+                "  AND pool IN ('encode','passthrough')").fetchone()["n"] or 0)
+    except Exception as e:                                   # noqa: BLE001
+        out["error"] = f"{type(e).__name__}: {e}"[:120]
+    _BREAK.update(at=now, data=out)
+    return out
+
+
+# What each prerequisite is called on a page, and where its own system lives.
+WHERE = {"decode": ("the decode check", "#health"),
+         "listen": ("audio listening", "#alang"),
+         "audio": ("audio tag fixes", "#alang"),
+         "subread": ("subtitle reads", "#lang")}

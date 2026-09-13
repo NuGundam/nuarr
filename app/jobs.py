@@ -6397,6 +6397,39 @@ def _io_by_disk(workers: list["Worker"]) -> list[dict]:
     return sorted(out, key=lambda x: -x["total_bps"])
 
 
+def _why_idle(workers, depth: int) -> dict:
+    """What the Processing System panel should say when it is not moving.
+
+    Only computed while the two processing pools are empty: a busy panel needs
+    no explanation, and this walks the eligible files.
+    """
+    if any(getattr(w, "pool", "") in ("encode", "passthrough") for w in workers):
+        return {}
+    out: dict = {}
+    try:
+        from . import workers as _wcfg
+        out["paused"] = sorted(set(_wcfg.paused()) & {"encode", "passthrough"})
+    except Exception:                                        # noqa: BLE001
+        out["paused"] = []
+    out["hold"] = PAUSED_REASON or ""
+    try:
+        from . import precedence
+        b = precedence.eligible_breakdown()
+        out.update(eligible=int(b.get("total") or 0),
+                   ready=int(b.get("ready") or 0),
+                   waiting=dict(b.get("by") or {}),
+                   queued_here=int(b.get("queued") or 0))
+    except Exception as e:                                   # noqa: BLE001
+        out["error"] = f"{type(e).__name__}"
+    # THE OTHER POOLS ARE WORKING, and saying so matters: an idle processing
+    # panel beside a busy box reads as a fault otherwise.
+    els = {p: sum(1 for w in workers if getattr(w, "pool", "") == p)
+           for p in ("subs", "subocr", "decode", "listen", "audio", "subread")}
+    out["elsewhere"] = {k: v for k, v in els.items() if v}
+    out["queued_all"] = int(depth or 0)
+    return out
+
+
 def live_snapshot() -> dict:
     """Just the moving parts, cheap enough to poll several times a second.
 
@@ -6429,6 +6462,11 @@ def live_snapshot() -> dict:
                                + sum(_bg_io())),
             "by_disk": _io_by_disk(workers),
         },
+        # WHY NOTHING IS BEING PROCESSED, asked only while nothing is. Five
+        # different causes used to look identical - an empty panel - and the
+        # newest one matters most: files that ARE eligible and are waiting on
+        # a fact the plan needs. See precedence.py.
+        "why_idle": _why_idle(workers, depth),
         "disk_waits": _live_disk_waits(workers),
         "io_throttled": bool(IO_THROTTLED.get("on")),
         "io_reason": IO_THROTTLED.get("reason") or "",
@@ -6548,6 +6586,12 @@ def snapshot(recent_limit: int = 60) -> dict:
             # nowhere near its limit. The totals cannot distinguish them.
             "by_disk": _io_by_disk(workers),
         },
+        # WHY NOTHING IS BEING PROCESSED - in the full snapshot as well as the
+        # live one. The dashboard paints this panel from BOTH (the fast poll
+        # hands over to the full one whenever a job starts or ends, which on
+        # short jobs is nearly every second), so a field only one of them
+        # carries is a field that blinks out.
+        "why_idle": _why_idle(workers, depth),
         # Spindles where a queued job is deliberately held back. Built live so
         # the percentage matches the worker card for the job it names.
         "disk_waits": _live_disk_waits(workers),
