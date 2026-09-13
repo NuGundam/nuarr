@@ -106,6 +106,31 @@ def _cpu_temp() -> dict:
     if _TEMP["out"] and time.time() - _TEMP["at"] < 10:
         return _TEMP["out"]
     out: dict = {}
+    # 0. THE CHIP'S OWN SENSORS, through LibreHardwareMonitor's library -
+    # see cputemp.py. Package temperature leads, every core beside it.
+    driver_why = ""
+    try:
+        from . import cputemp
+        t = cputemp.read()
+        if t.get("ok"):
+            lead = t.get("package") if t.get("package") is not None else t.get("max")
+            out = {"c": round(float(lead), 1), "source": t.get("source", ""),
+                   "what": ("CPU package" if t.get("package") is not None
+                            else "hottest core"),
+                   "cores": [round(float(v)) for v in (t.get("cores") or [])],
+                   "max": t.get("max"), "avg": t.get("avg"),
+                   "tjmax_margin": t.get("tjmax_margin"),
+                   "chip": t.get("chip") or ""}
+            # A DRIVER READ IS FRESHER THAN A WMI ONE, so it is not held
+            # for the full ten seconds - cputemp paces itself.
+            _TEMP.update(at=time.time() - 8, out=out)
+            return out
+        if t.get("opening"):
+            return {"c": None, "source": "", "opening": True,
+                    "why": "opening the sensor driver…"}
+        driver_why = t.get("why") or ""
+    except Exception as e:                                   # noqa: BLE001
+        driver_why = f"{type(e).__name__}"
     try:
         from . import diskload
         # 1 + 2. LibreHardwareMonitor / OpenHardwareMonitor, when running.
@@ -167,10 +192,12 @@ def _cpu_temp() -> dict:
         pass
     if not out:
         out = {"c": None, "source": "",
-               "why": "Windows exposes no processor temperature on this "
-                      "machine - the ACPI thermal zone reports nothing and "
-                      "the board probes read null. Install "
-                      "LibreHardwareMonitor and this fills itself in."}
+               "why": ("Windows exposes no processor temperature on this "
+                       "machine - the ACPI thermal zone reports nothing and "
+                       "the board probes read null."
+                       + (f" The sensor driver could not be used: {driver_why}"
+                          if driver_why else
+                          " pip install WinTmp and this fills itself in."))}
     _TEMP.update(at=time.time(), out=out)
     return out
 
@@ -395,9 +422,44 @@ def _encodes() -> list:
             else:
                 tool, hw, why = str(doing), "", ""
             fam = (v.get("family") or "").lower()
+            # THE AUDIO HALF. "Keeping the picture as-is" is not "doing
+            # nothing": most passthrough jobs convert a track - TrueHD
+            # down to 5.1, EAC3 to AAC stereo - and strip a Dolby Vision
+            # layer, and the page showed none of it because the video
+            # encoder was the only thing it asked about.
+            plan = getattr(getattr(w, "job", None), "plan", None)
+            aud = []
+            try:
+                for op in (getattr(plan, "audio_ops", None) or []):
+                    to = str(op.get("to") or "copy").lower()
+                    if to == "copy":
+                        continue
+                    ch = op.get("ch")
+                    br = op.get("br")
+                    aud.append(to + (f" {ch}ch" if ch else "")
+                               + (f" {int(br)}k" if br else ""))
+            except Exception:                                # noqa: BLE001
+                aud = []
+            n_copy = 0
+            try:
+                n_copy = sum(1 for op in (getattr(plan, "audio_ops", None) or [])
+                             if str(op.get("to") or "copy").lower() == "copy")
+            except Exception:                                # noqa: BLE001
+                pass
             rows.append({"title": d.get("title") or d.get("file") or "",
+                         "video": (v.get("encoder") or v.get("family")
+                                   or "copy"),
+                         "strip_dv": bool(getattr(plan, "strip_dv", False)),
+                         "audio": aud, "audio_copy": n_copy,
+                         "audio_what": [a.get("what") for a in (d.get("actions") or [])
+                                        if a.get("kind") == "audio"],
                          "stage": d.get("stage") or "", "fps": d.get("fps"),
                          "speed": d.get("speed"),
+                         # A COPY HAS NO SPEED MULTIPLIER - ffmpeg's figure is
+                         # derived from out_time, which does not move on a
+                         # stream copy, so the worker blanks it on purpose.
+                         # What a copy does have is a write rate.
+                         "write_bps": d.get("write_bps") or 0,
                          "progress": d.get("progress"),
                          "encoder": v.get("encoder") or "",
                          "family": v.get("family") or "",

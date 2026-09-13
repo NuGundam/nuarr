@@ -26007,9 +26007,13 @@ function tmCpuView(H, cores){
     // somewhere unrelated.
     (T.c!=null
       ? tmFig('temperature',
-              `<span style="color:${T.c>=85?'#f0883e':T.c>=70?'#e8a33d':'inherit'}">${
-                Math.round(T.c)}°C</span>`,
-              esc((T.what||'') + (T.source?` · ${T.source}`:'')))
+              `<span style="color:${tmTempColour(T.c)}">${Math.round(T.c)}°C</span>`,
+              (T.max!=null?`hottest core ${Math.round(T.max)}° · avg ${Math.round(T.avg||0)}°`
+                          :esc(T.what||''))
+              + (T.tjmax_margin!=null?` · ${Math.round(T.tjmax_margin)}° to TjMax`:'')
+              + `<span title="${esc((T.what||'')+(T.chip?' on '+T.chip:'')+' · '+(T.source||''))}"></span>`)
+      : T.opening
+      ? tmFig('temperature', '<span class="dim">…</span>', 'opening the sensor driver')
       : `<div style="min-width:120px" title="${esc(T.why||'')}">
            <div class="dim" style="font-size:10px;letter-spacing:.05em;
                 text-transform:uppercase">temperature</div>
@@ -26028,12 +26032,20 @@ function tmCpuView(H, cores){
         background:${c}"></div>`).join('')}</div>
     <div class="dim" style="font-size:10.5px">${seg.map(([n,c,v])=>
       `<span style="color:${c}">■</span> ${n} ${tmPct(v)}`).join(' · ')}</div>`;
-  const tiles = last.map((v,i)=>`<div class="lkind" style="padding:6px 8px">
+  // A THREAD'S TEMPERATURE IS ITS PHYSICAL CORE'S. The chip reports one
+  // sensor per core and Windows counts two threads per core, so thread 7
+  // reads core 3's sensor - the same mapping the OS uses for siblings.
+  const perCore = T.cores || [];
+  const perThread = (perCore.length && last.length)
+    ? Math.max(1, Math.round(last.length / perCore.length)) : 0;
+  const tiles = last.map((v,i)=>{
+    const tc = perThread ? perCore[Math.floor(i / perThread)] : null;
+    return `<div class="lkind" style="padding:6px 8px">
       <div style="display:flex;justify-content:space-between;font-size:10.5px">
-        <span class="dim">core ${i}</span>
+        <span class="dim">core ${i}${tc!=null?` <span style="color:${tmTempColour(tc)}">${Math.round(tc)}°</span>`:''}</span>
         <b class="mono" style="color:${v>90?'#f0883e':v>60?'#e8a33d':'inherit'}">${Math.round(v)}%</b>
       </div>${tmBar(v, null, 5)}
-      ${tmSpark(R.map(r=>r.pct[i]), '#58a6ff', 100)}</div>`).join('');
+      ${tmSpark(R.map(r=>r.pct[i]), '#58a6ff', 100)}</div>`;}).join('');
   return tmBack('Processor')
     + tmFigs(figs)
     + tmSection('nuarr against the whole machine',
@@ -26130,44 +26142,57 @@ function tmGpuView(H){
   // beside it said "an encode nuarr cannot describe" instead of "not an
   // encode". Each row now says what is actually running and on what.
   const ECOLS = [{t:'file', w:'auto', a:'left'},
-                 {t:'running', w:'18%', a:'left'},
-                 {t:'encoder', w:'14%', a:'left'},
-                 {t:'preset', w:'9%'}, {t:'cq', w:'5%'},
+                 {t:'running', w:'13%', a:'left'},
+                 {t:'video', w:'11%', a:'left'},
+                 {t:'audio', w:'13%', a:'left'},
+                 {t:'preset', w:'7%'}, {t:'cq', w:'5%'},
                  {t:'fps', w:'7%'}, {t:'speed', w:'7%'},
-                 {t:'eta', w:'8%'}, {t:'done', w:'7%'}];
-  // A REPACK IS NOT AN ENCODE. It runs at 276 fps because it is a stream
-  // copy - the card never sees it - and four dashes under encoder, preset,
-  // cq and speed read as an encode nobody could describe rather than as a
-  // job with no encoder in it. One cell says so instead.
+                 {t:'eta', w:'8%'}, {t:'done', w:'6%'}];
+  // "KEEPING THE PICTURE AS-IS" IS NOT "DOING NOTHING". A passthrough job
+  // copies the video and usually converts a track - TrueHD down to 5.1, EAC3
+  // to AAC stereo - and strips a Dolby Vision layer, and the first version of
+  // this table asked only about the video encoder, so it said "stream copy"
+  // and nothing else. Video and audio each get a column now; preset and cq
+  // belong to a video encode and read as such - a copy has neither, and a
+  // dash there is the true answer rather than a missing one.
   const encRow = e=>{
-    const plain = !e.encoder && !e.family;
+    const copy = !e.encoder && !e.family;
+    const vid = copy
+      ? `<span class="dim">copy</span>${e.strip_dv?`<span style="color:#c98cf0;font-size:10.5px" title="the Dolby Vision layer is removed; HDR10 stays"> − DV</span>`:''}`
+      : `<span class="mono" style="color:${e.on_gpu?'#e8a33d':'inherit'}">${esc(e.encoder||e.family)}</span>`;
+    const aud = (e.audio&&e.audio.length)
+      ? `<span class="mono" style="color:#5ad1c4" title="${esc((e.audio_what||[]).join('\n'))}">${esc(e.audio.join(', '))}</span>`
+        + (e.audio_copy?`<span class="dim" style="font-size:10px"> +${e.audio_copy} copied</span>`:'')
+      : `<span class="dim" title="${esc((e.audio_what||[]).join('\n'))}">copy</span>`;
     return `<tr style="border-top:1px solid var(--line)">
       ${tmCell(ECOLS[0], tmPill(e.pool||e.kind) + ' ' + esc(e.title)
         + (e.stage?`<span class="dim"> — ${esc(e.stage)}</span>`:''))}
       ${tmCell(ECOLS[1], `<span class="mono">${esc(e.tool||'—')}</span>`
         + (e.hw?`<span style="font-size:10.5px;color:${e.on_gpu?'#e8a33d':'var(--dim,#8a97a6)'}"> ${esc(e.hw)}</span>`:''),
         `title="${esc(e.why||'')}"`)}
-      ${plain
-        ? `<td colspan="3" style="text-align:left;padding:3px 6px;
-             color:var(--dim,#8a97a6);font-size:10.5px;white-space:nowrap;
-             overflow:hidden;text-overflow:ellipsis">stream copy — no encoder,
-             so no preset and no quality setting</td>`
-        : tmCell(ECOLS[2], `<span class="mono">${esc(e.encoder||e.family)}</span>`)
-          + tmCell(ECOLS[3], `<span class="mono">${esc(e.preset||'—')}</span>`)
-          + tmCell(ECOLS[4], `<span class="mono">${e.cq!=null?e.cq:'—'}</span>`)}
-      ${tmCell(ECOLS[5], `<span class="mono">${e.fps||'—'}</span>`)}
-      ${tmCell(ECOLS[6], `<span class="mono">${e.speed?e.speed+'×':'—'}</span>`)}
-      ${tmCell(ECOLS[7], `<span class="mono dim">${e.eta_s?tmAge(e.eta_s):'—'}</span>`)}
-      ${tmCell(ECOLS[8], `<span class="mono">${Math.round((e.progress||0)*100)}%</span>`)}
+      ${tmCell(ECOLS[2], vid)}
+      ${tmCell(ECOLS[3], aud)}
+      ${tmCell(ECOLS[4], `<span class="mono${copy?' dim':''}">${copy?'—':esc(e.preset||'—')}</span>`,
+        copy?'title="no video encoder in this job, so no preset"':'')}
+      ${tmCell(ECOLS[5], `<span class="mono${copy?' dim':''}">${copy?'—':(e.cq!=null?e.cq:'—')}</span>`,
+        copy?'title="no video encoder in this job, so no quality setting"':'')}
+      ${tmCell(ECOLS[6], `<span class="mono">${e.fps||'—'}</span>`)}
+      ${tmCell(ECOLS[7], e.speed
+          ? `<span class="mono">${e.speed}×</span>`
+          : e.write_bps
+          ? `<span class="mono" style="color:#f0883e" title="a copy has no speed multiplier - this is the rate it is being written at">${tmBps(e.write_bps)}</span>`
+          : '<span class="mono dim">—</span>')}
+      ${tmCell(ECOLS[8], `<span class="mono dim">${e.eta_s?tmAge(e.eta_s):'—'}</span>`)}
+      ${tmCell(ECOLS[9], `<span class="mono">${Math.round((e.progress||0)*100)}%</span>`)}
     </tr>`;
   };
   const encTable = enc.length ? `<table style="width:100%;font-size:11.5px;
       border-collapse:collapse;table-layout:fixed">${tmCols(ECOLS)}
       <tbody>${enc.map(encRow).join('')}</tbody></table>
       ${enc.some(e=>e.on_gpu)?'':`<div class="dim" style="font-size:10.5px;
-        margin-top:4px">none of these is on the card — a stream copy is read,
-        remuxed and written without an encoder, which is why the engines above
-        are idle while this list is not</div>`}`
+        margin-top:4px">none of these is on the card — the picture is copied,
+        not encoded, and the audio work is done on the CPU, which is why the
+        engines above are idle while this list is not</div>`}`
     : '<div class="dim" style="font-size:11.5px">nothing is on the video path right now</div>';
   const procs = (D.procs||[]);
   return tmBack('Graphics')
@@ -26334,6 +26359,10 @@ function tmGpuProcs(procs){
         graphics context — desktop windows, browsers, the compositor</summary>
       <table style="width:100%;font-size:11.5px;border-collapse:collapse;
         margin-top:3px">${rest.map(row).join('')}</table></details>`:''}`;
+}
+// The same three steps the card uses for its own temperature.
+function tmTempColour(c){
+  return c>=85 ? '#f0883e' : c>=70 ? '#e8a33d' : 'inherit';
 }
 function tmThrottle(v){
   const t = (v||'').trim();
