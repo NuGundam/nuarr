@@ -24,14 +24,23 @@ LIMITS = {
     "encode_workers": (0, 8, 4),
     # Remux/passthrough never touches NVENC - it is pure disk I/O on the pool,
     # so the ceiling is spindle contention, not the GPU.
-    "passthrough_workers": (0, 12, 4),
+    # Six, not four: 10,774 of them in a fortnight at a median of 7.4 seconds
+    # and 0.57 GB, each one holding a single spindle for that time. With
+    # twelve disks and the budget keeping one rewrite per spindle, six in
+    # flight is six disks working and six idle - the CPU share (the audio
+    # conversions on the way through) is small beside the I/O.
+    "passthrough_workers": (0, 12, 6),
     # Subtitle OCR. Its own pool because the two halves pull opposite ways: the
     # OCR is single-threaded CPU with no disk at all, the mux and commit are
     # pure pool I/O. Sharing the handler cap of 2 left nine of ten cores idle
     # on a box measured at 3% load. 4 is a starting point, not a ceiling -
     # spindle contention on the commit is the real limit, and disk_wait_pct
     # already guards that.
-    "subocr_workers": (0, 10, 4),
+    # Six. The card is capped separately (subocr_gpu_lanes), and the point of
+    # a higher number here is that the two disk halves - the demux in and the
+    # remux out - run while the card is busy with somebody else's read. The
+    # longest job nuarr has after an encode: 57 s median over 1,333 of them.
+    "subocr_workers": (0, 10, 6),
     # HOW MANY MAY BE ON THE CARD, as against how many files are in flight.
     # Only the OCR pass touches the GPU; the demux and the mux either side of
     # it are pool I/O. Capping the whole job at what the card can take left the
@@ -46,25 +55,39 @@ LIMITS = {
     #
     # Subtitle instructions: mostly instant (a title, a recycle) but the ones
     # that are not are a full container copy, the same spindle profile as a
-    # remux. Two is what the background runner used before this moved.
-    "subs_workers": (0, 6, 2),
-    # Audio tags: mkvpropedit writing a header, well under a second each. The
-    # only limit that matters is "not four seeks into the pool at once".
-    "audio_workers": (0, 6, 4),
+    # remux. Two was what the background runner used before this moved, on a
+    # box that then had one heavy job per spindle whatever the pool. With the
+    # spindle budget (jobs.SPINDLE_WEIGHT) each of these still gets a disk to
+    # itself and they simply land on different ones: twelve spindles, 5,412
+    # jobs in a fortnight at a median of six seconds each, so four in flight
+    # is four disks busy for six seconds, not four jobs fighting over one.
+    "subs_workers": (0, 6, 4),
+    # Audio tags: mkvpropedit writing a header, well under a second each -
+    # measured at a 3.2 s median including everything around it, and rated
+    # the cheapest work nuarr does. The only limit that matters is "not too
+    # many seeks into the pool at once", and six of those is nothing.
+    "audio_workers": (0, 6, 6),
     # Does it decode: a 4-thread software decode of 45 seconds of video and a
     # sequential read off one pool disk. Two of these at once measured 51-68%
-    # CPU on a 20-thread box - more is not a corner of the machine any more.
-    "decode_workers": (0, 6, 2),
+    # CPU on a 20-thread box - THE PROCESSOR is what this one runs out of, not
+    # the disk, and it is the only pool of which that is true. Three fits
+    # (about twelve of twenty threads, leaving the encoder's feeder and the
+    # commit copies their share); four does not. The busiest pool by far -
+    # 15,211 jobs in a fortnight at four seconds each.
+    "decode_workers": (0, 6, 3),
     # Whisper. One loaded model on one card; a second job shares the same
     # model and the same VRAM, which works but halves each. One is the honest
     # default; two is for a box with the card to spare.
     "listen_workers": (0, 3, 1),
     # The picture sampler and the track reader. Each is a whole-file read off
-    # a spindle - frames from across the file, or a track out of the container
-    # - so two on different disks is what the background runner used.
-    "subread_workers": (0, 6, 2),
-    # ffprobe is cheap but still a pool read each.
-    "probe_workers": (0, 16, 4),
+    # a spindle - frames from across the file, or a track out of the container.
+    # Weight 2 under the spindle budget, so two of them may share a disk and
+    # four across twelve disks is comfortable. Median 6.3 s.
+    "subread_workers": (0, 6, 4),
+    # ffprobe is cheap but still a pool read each - one seek per file, rated
+    # disk 2 / cpu 1. Eight keeps a library walk moving without making the
+    # pool sound like a scan.
+    "probe_workers": (0, 16, 8),
     # Health/rename checks against the arrs.
     "arr_concurrency": (1, 30, 20),
 
@@ -508,7 +531,11 @@ class WorkerConfig:
                 "paused": POOL_OF.get(k, "") in off,
                 "min": LIMITS[k][0],
                 "max": LIMITS[k][1],
-                "default": LIMITS[k][2],
+                # THE EFFECTIVE DEFAULT, not the one in the table. Three of
+                # these keys also exist as config fields, and a config field
+                # wins - so quoting LIMITS here told you "default 6" beside a
+                # Reset button that would have set 4.
+                "default": _default(k),
                 "hint": (_encode_hint() if k == "encode_workers"
                          else _subocr_hint() if k == "subocr_workers"
                          else HINTS[k]),
@@ -728,7 +755,54 @@ def _default(key: str) -> int:
     return int(getattr(SETTINGS, key, LIMITS[key][2]))
 
 
+# THE OLD RECOMMENDATIONS, AND WHY THEY ARE WRITTEN DOWN.
+#
+# Raising a default does nothing for a box that has already saved the old one,
+# and every one of these was saved simply by existing. So a value that is
+# still sitting on the number nuarr used to recommend is moved to the number
+# it recommends now - once, recorded in the log, and only where the two are
+# both untouched by hand. A value somebody chose is never overwritten: if it
+# does not match the old default exactly, it stays.
+_WAS_DEFAULT = {"passthrough_workers": 4, "subocr_workers": 4,
+                "subs_workers": 2, "audio_workers": 4, "decode_workers": 2,
+                "subread_workers": 2, "probe_workers": 4}
+# Bumped once after the first run: two of the seven did not move, because
+# their recommendation lives in config.py as well and that copy still said
+# the old number. Re-running is safe - a key already on its new value no
+# longer matches `was` and is left alone.
+_MIGRATED_KEY = "worker.defaults.2026-09b"
+
+
+def _adopt_new_defaults() -> None:
+    """Move untouched counts onto the new recommendations. Runs once."""
+    if kv_get(_MIGRATED_KEY):
+        return
+    moved = []
+    for key, was in _WAS_DEFAULT.items():
+        now = _default(key)
+        if now == was:
+            continue
+        raw = kv_get(f"worker.{key}")
+        try:
+            cur = int(raw) if raw is not None else was
+        except (TypeError, ValueError):
+            continue
+        if cur != was:
+            continue                       # somebody chose this; leave it
+        kv_set(f"worker.{key}", str(now))
+        moved.append(f"{LABELS.get(key, key)} {was} -> {now}")
+    kv_set(_MIGRATED_KEY, "1")
+    if moved:
+        try:
+            from . import joblog
+            joblog.log("worker counts moved to the new recommendations: "
+                       + "; ".join(moved), "info")
+        except Exception:                                # noqa: BLE001
+            pass
+
+
 def get() -> WorkerConfig:
+    _adopt_new_defaults()
     vals = {}
     for key in LIMITS:
         raw = kv_get(f"worker.{key}")

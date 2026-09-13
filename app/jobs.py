@@ -1555,7 +1555,80 @@ def _heavy(pool_name: str, plan_obj=None) -> bool:
     # whole file and the track reader pulls a track out of the whole container.
     # listen is NOT: five 30-second windows is a few hundred megabytes of
     # audio, and the cost is on the GPU rather than the spindle.
-    return pool_name in ("passthrough", "subocr", "subs", "decode", "subread")
+    return SPINDLE_WEIGHT.get(pool_name, 0) >= OCCUPIES_AT
+
+
+# HOW MUCH OF A SPINDLE EACH POOL ACTUALLY TAKES.
+#
+# _heavy() was a yes or a no, and a spindle is not a yes or a no. The rule it
+# drove - one heavy job per disk, everything else waits for it to reach 85% -
+# is right for two full-container rewrites and wrong for two decode checks:
+# a rewrite reads and writes the whole file and a decode check reads forty-five
+# seconds of it, and calling both "heavy" made the cheap one wait behind
+# nothing. Erik: "queue both non busy disks and workers that can work ok
+# together if on the same disk".
+#
+# So each pool has a weight and a spindle has a budget. The weights are the
+# measured shape of the work (see workers.COST, which rates the same jobs for
+# the whole box):
+#
+#   3  reads a whole file AND writes a whole one - passthrough, subocr, subs
+#   2  reads a whole file, or reads across it - subread, decode
+#   1  reads at its own pace and mostly is not on the disk at all - encode,
+#      listen
+#   0  a header write or a stat - audio, probe, handlers
+#
+# BUDGET 4, so the twos may double up and a three may not share with anything
+# that counts. And an incumbent only OCCUPIES the spindle from weight 2: an
+# encode already on a disk never kept a copy off it, and making it do so now
+# would be a tightening nobody asked for.
+SPINDLE_WEIGHT = {"passthrough": 3, "subocr": 3, "subs": 3,
+                  "subread": 2, "decode": 2,
+                  "encode": 1, "listen": 1,
+                  "audio": 0, "probe": 0, "handler": 0}
+SPINDLE_BUDGET = 4
+OCCUPIES_AT = 2                    # below this, a job is not in anyone's way
+
+
+def spindle_weight(pool_name: str) -> int:
+    return SPINDLE_WEIGHT.get(pool_name or "", 1)
+
+
+def _spindle_used(disk: str, running=None) -> int:
+    """What is already on this spindle, counting only jobs heavy enough to be
+    in the way - and not counting a subtitle OCR that has stopped reading."""
+    total = 0
+    for w in (RUNNING.values() if running is None else running):
+        src = getattr(w, "disk", "")
+        # A JOB IN THE OCR PHASE IS NOT ON THE DISK - the same test disk_load()
+        # uses, for the same reason: ffmpeg has exited and what is left is
+        # pictures being read into text at 1% of a spindle.
+        ocr_idle = (getattr(w, "sub_ocr_active", False)
+                    and getattr(w, "stage", "") != "committing"
+                    and (getattr(w, "read_bps", 0) or 0)
+                        + (getattr(w, "write_bps", 0) or 0) < 5_000_000)
+        if src == disk and not ocr_idle:
+            wt = spindle_weight(getattr(w, "pool", ""))
+            if wt >= OCCUPIES_AT:
+                total += wt
+        # THE COMMIT IS A WHOLE FILE GOING BACK INTO THE POOL, and it lands on
+        # the DESTINATION disk, which is very often not the one the job read
+        # from - more so now that nuarr picks that disk itself. Counted
+        # outside the source test, because a job reading D1 and committing to
+        # D0 occupies D0 and the first version skipped it for not being a D0
+        # job at all.
+        if getattr(w, "stage", "") == "committing" \
+                and (getattr(w, "dest_disk", "") or src) == disk:
+            total += 3
+    return total
+
+
+def disk_has_room(disk: str, pool_name: str, running=None) -> bool:
+    """May this pool start on this spindle without the two of them crawling?"""
+    wt = spindle_weight(pool_name)
+    if wt < OCCUPIES_AT:
+        return True                    # never in the way, never held back
+    return _spindle_used(disk, running) + wt <= SPINDLE_BUDGET
 
 
 def _note_disk_wait(disk: str, need_pct: float, why: str = "progress") -> None:
@@ -1721,10 +1794,12 @@ def disk_load(running=None) -> dict[str, int]:
                     and getattr(w, "stage", "") != "committing"
                     and (getattr(w, "read_bps", 0) or 0)
                         + (getattr(w, "write_bps", 0) or 0) < 5_000_000)
+        # THE SAME WEIGHTS THE CLAIM GATE USES, so "which disk is quietest"
+        # and "may I start here" cannot disagree - they did when this was a
+        # binary heavy/not-heavy and the gate was about to become a budget.
         add(getattr(w, "disk", ""),
-            0 if ocr_only
-            else (COPY_WEIGHT if _heavy(getattr(w, "pool", ""))
-                  else ENCODE_WEIGHT))
+            0 if ocr_only else max(ENCODE_WEIGHT,
+                                   spindle_weight(getattr(w, "pool", ""))))
         # The commit is a full-file copy INTO the pool, whatever the pool was.
         if getattr(w, "stage", "") == "committing":
             add(getattr(w, "dest_disk", "") or getattr(w, "disk", ""),
@@ -2013,7 +2088,25 @@ def _claim(pool: str) -> Job | None:
             return cur.execute(base + where_extra + f"ORDER BY {ordr} LIMIT 1",
                                tuple(params)).fetchone()
 
-        row = _pick(watched | hot)
+        # SPINDLES WITH NO ROOM FOR THIS POOL, excluded before the query
+        # rather than discovered after it. The old shape picked the best
+        # candidate, found it was on an occupied disk and returned None - so
+        # a pool with work waiting on eleven free disks sat idle because its
+        # highest-priority file happened to live on the twelfth. Asking for a
+        # file on a disk that HAS room is the same query with one more
+        # exclusion, and it is the half of this Erik asked for: "queue both
+        # non busy disks".
+        full = set()
+        try:
+            if spindle_weight(pool) >= OCCUPIES_AT:
+                for d in {getattr(w, "disk", "") for w in list(RUNNING.values())}:
+                    if d and not disk_has_room(d, pool):
+                        full.add(d)
+        except Exception:                                # noqa: BLE001
+            full = set()
+        row = _pick(watched | hot | full)
+        if row is None and full:
+            row = _pick(watched | hot)     # nothing with room: the old order
         if row is None and hot:
             # BEFORE SETTLING FOR A HOT DISK, ASK WHERE THE FILES ARE NOW.
             # The placement in the table is from the last scan. The thing
@@ -2060,7 +2153,10 @@ def _claim(pool: str) -> Job | None:
             _note_disk_wait(cand_disk, 0.0, why="viewer")
             return None
 
-        if cand_disk and cand_disk in busy and _heavy(pool):
+        # AND THE SAME BUDGET, ASKED OF WHATEVER THE QUERY RETURNED. The
+        # exclusion above is a preference the fallbacks may overrule, and a
+        # disk can fill between the two; this is the decision.
+        if cand_disk and not disk_has_room(cand_disk, pool):
             try:
                 wait_pct = float(workers.get().disk_wait_pct)
             except Exception:
@@ -2072,7 +2168,8 @@ def _claim(pool: str) -> Job | None:
                 # a percentage that now advances at OCR speed, not disk speed -
                 # holds the disk closed for minutes over work that finished.
                 on_disk = [w for w in list(RUNNING.values())
-                           if w.disk == cand_disk and _heavy(w.pool)
+                           if w.disk == cand_disk
+                           and spindle_weight(w.pool) >= OCCUPIES_AT
                            and not (getattr(w, "sub_ocr_active", False)
                                     and w.stage != "committing"
                                     and (w.read_bps or 0) + (w.write_bps or 0)

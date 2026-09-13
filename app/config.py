@@ -266,9 +266,14 @@ class Settings:
     # The A5000 has ONE NVENC engine; measured saturation is ~4 concurrent
     # 1080p encodes. Pass-through/remux jobs do not touch NVENC, so they get a
     # separate pool and can run wider.
+    # THESE THREE ARE ALSO IN workers.LIMITS, and the two have to agree: a
+    # field here WINS over the LIMITS default (see workers._default), so a
+    # recommendation raised there and left at the old number here would be
+    # silently ignored - which is exactly what happened when passthrough went
+    # to six and probes to eight and neither moved.
     encode_workers: int = 4
-    passthrough_workers: int = 4
-    probe_workers: int = 4
+    passthrough_workers: int = 6
+    probe_workers: int = 8
 
     # Where the PowerShell handler scripts live. Empty = look inside the
     # install (<root>\scripts), then fall back to the folder beside it, which

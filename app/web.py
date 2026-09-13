@@ -3447,8 +3447,30 @@ def _summary_impl():
             health["top"] = top.get("label") or ""
     except Exception:                                        # noqa: BLE001
         pass
+    # WHAT THE QUEUE IS CARRYING, for the library popover. Free here: the
+    # health block above has already built the pool ledger this poll window,
+    # so this is a dict read rather than a second pass over 74,000 job rows.
+    work = {"queued": 0, "running": 0, "pools": {}}
+    try:
+        led = _pool_ledger()
+        for pool, d in led.items():
+            work["pools"][pool] = {"done": int(d.get("done") or 0),
+                                   "queued": int(d.get("queued") or 0),
+                                   "running": int(d.get("running") or 0)}
+            work["queued"] += int(d.get("queued") or 0)
+            work["running"] += int(d.get("running") or 0)
+        # THE PROCESSING SYSTEM IS TWO POOLS. An encode and a remux are the
+        # same decision taken two ways - the planner picks between them per
+        # file - so the page that says "processing" means both.
+        proc = [work["pools"].get(p, {}) for p in ("encode", "passthrough")]
+        work["processing"] = {
+            "done": sum(int(x.get("done") or 0) for x in proc),
+            "left": sum(int(x.get("queued") or 0) + int(x.get("running") or 0)
+                        for x in proc)}
+    except Exception:                                        # noqa: BLE001
+        pass
     return {"states": states, "disks": disks, "pool_trend": pool_trend, "libraries": libs,
-            "health": health,
+            "health": health, "work": work,
             "saved": saved, "attention": attention,
             "errors": errors, "error_kinds": err_kinds,
             "totals": totals, "orphans": orphans, "extras": extras,
@@ -18810,8 +18832,9 @@ function tmLink(){
        + `>Task manager →</a>`;
 }
 // ---- the done/left chip and its panel ------------------------------------
-let _sysCounts=null;
+let _sysCounts=null, _sysWork=null;
 function sysCountsFrom(s, byState){
+  _sysWork = s.work || null;
   const n=k=>((byState[k]||{}).n)||0;
   const total=(s.totals||{}).n||0;
   const done=n('done'), eligible=n('eligible'), held=n('new'), err=n('error'),
@@ -18830,7 +18853,7 @@ function renderSysChip(){
          l.style.color=_sysCounts.left?'var(--acc)':'var(--ok)'; }
 }
 function sysPanel(){
-  const c=_sysCounts;
+  const c=_sysCounts, w=_sysWork;
   if(!c) return '<div class="ph">Library</div><div class="pf">no summary yet</div>';
   const pct=c.total?Math.round(c.done/c.total*100):0;
   const row=(k,v,col,tip)=>`<tr title="${esc(tip||'')}"><td>${esc(k)}</td>`
@@ -18847,6 +18870,24 @@ function sysPanel(){
     +(c.blocked?row('blocked', c.blocked, 'var(--warn)', 'cannot be processed as things stand'):'')
     +(c.missing?row('missing', c.missing, 'var(--warn)', 'not on disk'):'')
     +`</table>`
+    +((w && (w.queued || w.running || (w.processing||{}).done))
+      ? `<div class="ph" style="margin-top:9px">In the queue right now</div>`
+        +`<table>`
+        +row('queued', w.queued||0, (w.queued?'var(--acc)':'var(--ok)'),
+             'jobs waiting for a worker, across every pool')
+        +row('running', w.running||0, (w.running?'var(--acc)':''),
+             'jobs a worker has picked up and is doing')
+        +`</table>`
+        +(w.processing
+          ? `<div class="ph" style="margin-top:9px">Processing System</div>`
+            +`<table>`
+            +row('done', w.processing.done||0, 'var(--ok)',
+                 'encodes and remuxes finished - the whole history, not today')
+            +row('left', w.processing.left||0,
+                 (w.processing.left?'var(--acc)':'var(--ok)'),
+                 'encodes and remuxes queued or running right now')
+            +`</table>` : '')
+      : '')
     +`<div class="pf">${gb(c.bytes)} across the pool. The queue drains "left"; `
     +`"done" is the whole library minus what is still to do.</div>`;
 }
