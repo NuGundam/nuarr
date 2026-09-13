@@ -48,11 +48,13 @@ TITLE_DEFAULT = "Ended"
 
 # THE RULES A LIBRARY CAN KEEP, READ OFF ITS AUDIO LANGUAGE POLICY.
 #
-# Two are always on offer: Ended (Sonarr's word) and Unwatched (nothing of
-# the show watched). The rest come from the library's own "which spoken
-# languages a file keeps" rule: every kept language that is NOT the
-# library's native one gets a collection of the shows that carry it on
-# every regular episode, plus an Ended and an Unwatched cut of that. For
+# Three are always on offer - the base set: Ended (Sonarr's word),
+# Unwatched (nothing of the show watched) and Unwatched Ended (both). The
+# rest come from the library's own "which spoken languages a file keeps"
+# rule: every kept language that is NOT the library's native one gets a
+# collection of the shows that carry it on every regular episode, plus the
+# same three cuts of that - <Lang> Ended, <Lang> Unwatched, <Lang>
+# Unwatched Ended. For
 # anime the native language is Japanese, so English - the dub - is the
 # collection worth having; for a live-action or animation library English
 # IS the native language and a collection of it would be the whole shelf,
@@ -101,6 +103,9 @@ def rules_available(library: str) -> list:
             out.append({"key": f"lang_unwatched:{code}", "title": f"{name} Unwatched",
                         "lang": code,
                         "what": f"{name}, and nothing of it has been watched yet"})
+            out.append({"key": f"lang_unwatched_ended:{code}",
+                        "title": f"{name} Unwatched Ended", "lang": code,
+                        "what": f"{name}, nothing of it watched yet, and ended"})
     except Exception:                                        # noqa: BLE001
         pass
     return out
@@ -130,6 +135,8 @@ def _want(rule: str, f: dict) -> bool:
         return has and st == "ended"
     if kind == "lang_unwatched":
         return has and un
+    if kind == "lang_unwatched_ended":
+        return has and un and st == "ended"
     return False
 
 # The last pass, per library, for the card. In memory; kv holds the last
