@@ -14136,6 +14136,12 @@ button[disabled]{opacity:.5;cursor:default}
            letter-spacing:.4px;margin-right:4px}
 .capbar .v{font-variant-numeric:tabular-nums;font-weight:600}
 .capbar .grp{display:flex;align-items:baseline;gap:3px}
+/* The way to the full version. Last on the line, quiet until wanted: the
+   dashboard says what is working, the Concurrency page says how many of each
+   there should be and what each one costs. */
+.capbar .capmore{margin-left:auto;font-size:11.5px;color:#6fb0ff;
+  text-decoration:none;opacity:.75;white-space:nowrap}
+.capbar .capmore:hover{opacity:1;text-decoration:underline}
 /* Per-pool I/O priority, sat against the pool it describes. */
 .iop{font-size:10px;padding:1px 6px;border-radius:9px;margin-left:6px;
      border:1px solid;white-space:nowrap;cursor:help}
@@ -22807,52 +22813,55 @@ async function loadJobs(){
           + ' running job(s) in this pool touch that and are at lowered disk priority'
         : 'lowered disk priority')}">low I/O ${low}/${mine.length}</span>`;
   };
-  const capCell=(name,used,cap,pool,note)=>{
-    const full = cap>0 && used>=cap;
-    const off = (j.paused||[]).includes(pool);
-    const col = full ? 'var(--ok)' : (used>0 ? 'var(--acc)' : 'var(--dim)');
-    return `<span class="grp"${note?` title="${esc(note)}"`:(off?` title="paused from the Workers panel — running jobs finish, nothing new starts"`:'')}>`
-          +`<span class="k" style="color:${poolColor(pool)};opacity:${off?'.45':'.9'}">${esc(name)}</span>`
-          +`<span class="v" style="color:${col}">${used}</span>`
-          +(off?`<span class="dim" style="font-size:10px;margin-left:3px">⏸ paused</span>`
-               :`<span class="dim">/${cap}</span>`)
-          +(note?`<span class="dim" style="font-size:10px;margin-left:3px"
-                       >inline</span>`:'')
-          +`${ioTag(pool)}</span>`;
+  // ---- THE WORKER STRIP, SIMPLIFIED --------------------------------------
+  //
+  // Eight pools each carrying a name, a count, a capacity and an "I/O" badge
+  // is sixteen figures across the top of the dashboard, and fifteen of them
+  // say "normal" on a quiet box. The dashboard's question is "what is working
+  // right now"; the Concurrency page's question is "how many of each should
+  // there be", and that is where the caps, the switches, the hints and the
+  // cost strips belong. So: the pools with something in them, by name; the
+  // rest folded into one count; and the facts that explain an unexpectedly
+  // quiet queue - what is queued, who is watching, what is held.
+  const POOLS = ['encode','passthrough','subs','subocr','audio','decode',
+                 'listen','subread'];
+  const inUse = (p)=>(j.in_use||{})[p]||0, capOf = (p)=>(j.capacity||{})[p]||0;
+  const offPools = (j.paused||[]);
+  const busy = POOLS.filter(p=>inUse(p)>0);
+  const idle = POOLS.filter(p=>inUse(p)===0 && !offPools.includes(p));
+  const cell = (p)=>{
+    const used=inUse(p), cap=capOf(p), full=cap>0 && used>=cap;
+    return `<span class="grp" title="${esc(p)}: ${used} of ${cap} workers busy`
+      + `${(j.subocr_inline||0) && p==='subocr'
+          ? ` (${j.subocr_inline} running inside a transcode)` : ''}">`
+      + `<span class="k" style="color:${poolColor(p)}">${esc(p)}</span>`
+      + `<span class="v" style="color:${full?'var(--ok)':'var(--acc)'}">${used}</span>`
+      + `<span class="dim">/${cap}</span></span>`;
   };
+  const pausedCell = (p)=>`<span class="grp" title="paused on the Concurrency page — running jobs finish, nothing new starts">`
+      + `<span class="k" style="color:${poolColor(p)};opacity:.45">${esc(p)}</span>`
+      + `<span class="dim" style="font-size:10px">⏸ paused</span></span>`;
+  // ONE I/O CHIP, NOT EIGHT. The per-pool badge was the same word repeated
+  // across the strip; what matters is whether anything is demoted at all and
+  // why, and the disk panel below has the per-spindle detail.
+  const lowN = (j.running||[]).filter(w=>_ioLowJobs.has(w.job_id)).length;
+  const ioChip = (j.io_throttled && lowN)
+    ? `<span class="grp" title="${esc(j.io_reason||'sharing a spindle with something else')}">`
+      + `<span class="k">low I/O</span><span class="v" style="color:var(--warn)">${lowN}</span>`
+      + `<span class="dim">/${(j.running||[]).length}</span></span>`
+    : '';
   document.getElementById('jobCap').innerHTML =
-    capCell('encode', j.in_use.encode, j.capacity.encode, 'encode')
-    + capCell('passthrough', j.in_use.passthrough, j.capacity.passthrough, 'passthrough')
-    // AND THE SUBTITLE POOL, for exactly the reason the subocr comment below
-    // gives. It has its own two workers so it can never take a slot a
-    // transcode was waiting for, and a pool with its own workers that does not
-    // appear here is a pool nobody can tell is running.
-    + capCell('subs', (j.in_use||{}).subs||0, (j.capacity||{}).subs||0, 'subs')
-    // subocr sat invisible here while running four workers - the header said
-    // "encode 0/4 passthrough 0/6" over a machine grinding at full tilt.
-    + capCell('subocr', (j.in_use||{}).subocr||0, (j.capacity||{}).subocr||0, 'subocr',
-              // An OCR running inside a transcode spends the same budget, so
-              // it is counted - but it has no card of its own in this pool,
-              // and a number that moves with nothing to point at is worse than
-              // no number. Name the inline ones.
-              (j.subocr_inline||0)
-                ? `${j.subocr_inline} of these run inside a transcode or `
-                  + `passthrough job (one rewrite carrying both changes); `
-                  + `they use the same OCR budget as a standalone subtitle job`
-                : '')
-    // AND THE FOUR POOLS THAT JOINED THE QUEUE SINCE. Same rule the subs and
-    // subocr lines above were added under: a pool with its own workers that
-    // does not appear here is a pool nobody can tell is running. Erik's
-    // words for this strip were "missing the new integrated systems". The
-    // name wears its pool colour, so the strip and the card pills agree.
-    + ['audio','decode','listen','subread'].map(p=>
-        capCell(p, (j.in_use||{})[p]||0, (j.capacity||{})[p]||0, p)).join('')
-    // THE ONE queued figure. It used to appear here AND six lines below in the
-    // run-progress line, computed a moment apart so the two disagreed by a
-    // handful - two different numbers for the same thing. The other one is
-    // gone; this is the one that stays, next to the workers it feeds.
+    (busy.length ? busy.map(cell).join('')
+                 : `<span class="grp"><span class="k">workers</span><span class="dim">all idle</span></span>`)
+    + offPools.map(pausedCell).join('')
+    + (idle.length
+        ? `<span class="grp" title="${esc(idle.map(p=>p+' 0/'+capOf(p)).join(' · '))}">`
+          + `<span class="k">idle</span><span class="dim">${idle.length} pool${
+              idle.length===1?'':'s'}</span></span>`
+        : '')
     + `<span class="grp"><span class="k">queued</span>`
     + `<span class="v">${fmt(j.queued)}</span></span>`
+    + ioChip
     // WHICH SPINDLE, not just "a viewer exists". This is the fact that decides
     // where the next stream copy can go.
     + (held.size
@@ -22860,10 +22869,9 @@ async function loadJobs(){
           +[...held].map(d=>`<span class="v" style="color:var(--warn)">${esc(d)}</span>`)
              .join('<span class="dim">, </span>')
           +`</span>`
-        // BETWEEN EPISODES, OR JUST PAUSED. The live set empties for a
-        // moment while the yield (90 s sticky) is still on, and the strip
-        // read "viewer on unknown disk" - which is not what was happening.
-        // The yielded disks are the honest answer for that gap.
+        // BETWEEN EPISODES, OR JUST PAUSED. The live set empties for a moment
+        // while the yield (90 s sticky) is still on, and the strip read
+        // "viewer on unknown disk" - which is not what was happening.
         : ((j.io_disks||[]).length
             ? `<span class="grp"><span class="k">yielding</span>`
               +(j.io_disks||[]).map(d=>`<span class="v" style="color:var(--warn);opacity:.75"
@@ -22872,12 +22880,17 @@ async function loadJobs(){
               +`</span>`
             : (j.io_throttled
                 ? `<span class="grp"><span class="k">viewer on</span>`
-                  +`<span class="dim" title="a session is playing but its file could not be
-resolved to a pool disk, so the per-spindle avoidance cannot apply">unknown disk</span></span>`
+                  +`<span class="dim" title="a session is playing but its file could not be resolved to a pool disk, so the per-spindle avoidance cannot apply">unknown disk</span></span>`
                 : '')))
     + (j.buffer_hold
         ? `<span class="grp" title="every pool holds and every running job is frozen until the viewer is in the clear"><span class="k" style="color:var(--bad)">⏸ ${esc(j.hold_why||'a viewer is buffering')}</span><span class="v" style="color:var(--bad)">everything held</span></span>`
-        : '');
+        : '')
+    // AND WHERE THE FULL VERSION LIVES. Caps, per-pool switches, what each
+    // worker costs and how long its median job takes are all one click away
+    // rather than crowded in here.
+    + `<a class="grp capmore" href="/settings#counts"
+         title="capacities, per-pool pause switches, and what each worker costs the box"
+         >Workers &amp; concurrency &rarr;</a>`;
   // show bulk-queue progress while it builds
   try{
     const e=await (await fetch('/api/jobs/enqueue/status')).json();
