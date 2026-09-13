@@ -7700,6 +7700,21 @@ def api_taskmgr(n: int = 300):
     return out
 
 
+@app.get("/api/taskmgr/detail")
+async def api_taskmgr_detail(which: str):
+    r"""One of the four detail views behind the task manager's cards.
+
+    OFF THE LOOP, because the graphics one runs nvidia-smi - cached for two
+    seconds, but the first call after that has to wait for a process - and
+    the disk one asks Windows for its volumes. Everything else is a counter
+    read that is already being sampled once a second.
+    """
+    from . import sysdetail
+    if which not in ("cpu", "mem", "gpu", "disk"):
+        raise HTTPException(400, "which must be cpu, mem, gpu or disk")
+    return await asyncio.to_thread(sysdetail.detail, which)
+
+
 @app.get("/api/systems")
 def api_systems():
     """Every system doing work right now. One dict read each; safe to poll."""
@@ -13232,6 +13247,17 @@ button[disabled]{opacity:.5;cursor:default}
 .tmcard{padding:9px 12px}
 .tmhead{font-size:12px}
 .tmsub{font-size:10.5px;line-height:1.35;margin:2px 0 6px;min-height:28px}
+/* A CARD THAT OPENS HAS TO LOOK LIKE ONE. The four headline cards are links
+   to a page each; without an affordance they are four panels that happen to
+   react to a click, which nobody tries. */
+.tmcard.tmopen{cursor:pointer;transition:border-color .12s,background .12s}
+.tmcard.tmopen:hover{border-color:#3d6fa8;background:rgba(88,166,255,.05)}
+.tmhead{display:flex;align-items:baseline;gap:8px}
+.tmmore{margin-left:auto;font-size:10px;color:#6fb0ff;opacity:.55}
+.tmcard.tmopen:hover .tmmore{opacity:1}
+/* One tile per logical thread; they stay readable from 4 up to 64. */
+.tmcores{display:grid;gap:6px;margin-top:6px;
+  grid-template-columns:repeat(auto-fill,minmax(112px,1fr))}
 /* The line is given a fixed height and told to ignore its aspect ratio, so a
    narrow column squashes it horizontally rather than shrinking it away. */
 .tmchart svg{display:block;width:100%;height:64px}
@@ -25077,6 +25103,8 @@ const PANE_OF = {ffmpeg:'ffPane', backup:'bkPane',  rules:'rulesPane',
 // it never claims an element of its own.
 const ALIAS_OF = {arrsync:'arrs', audiotitle:'acodec', arrgap:'libs',
                   subsync:'lang', plexsync:'plex',
+                  tmcpu:'taskmgr', tmmem:'taskmgr',
+                  tmgpu:'taskmgr', tmdisk:'taskmgr',
                   // THE RUNNING LIST LINKS HERE, so these have to be real.
                   // Every system on the shared runner carries the page it
                   // belongs to, and three of them were pointing at '#subs' -
@@ -25204,6 +25232,13 @@ function wtab(which){
   // the point at which that stopped being a style preference: one table, one
   // loop, and a new pane is one line.
   const intent = which;                     // what was asked for, for the tail
+  // A TASK MANAGER DETAIL PAGE IS THE SAME PANE WITH A DIFFERENT VIEW. The
+  // hash is its own (#tmdisk), so it survives a refresh and can be linked to,
+  // and the alias below sends it at the pane that draws it.
+  if(typeof TM_VIEW !== 'undefined'){
+    if(TM_VIEW[intent]) _tmView = TM_VIEW[intent];
+    else if(intent==='taskmgr') _tmView = '';
+  }
   // THE SIDEBAR HAS TO FOLLOW. Every in-page cross-link calls wtab() directly,
   // which swapped the pane and left the sidebar lit on the page you came FROM
   // and the URL pointing at it - so "Audio language" from the Subtitles page
@@ -25643,6 +25678,19 @@ function dpPrioHtml(d){
 // between those two is what the job gate steers on and what makes "the CPU is
 // at 97%" either alarming or irrelevant.
 let _tm = null, _tmTimer = null, _tmSort = {by:'cpu', dir:-1}, _tmSeen = {};
+// ---- THE FOUR CARDS OPEN ---------------------------------------------------
+//
+// Each card answers one question with one line, which is the right amount for
+// a card and the wrong amount for the moment the line does something you did
+// not expect: 34% cpu does not say whether that is one thread pinned or twenty
+// busy, and 222 MB/s does not say off which spindle, for which file. So each
+// one is a link to a page of its own under Task manager, with a hash you can
+// refresh onto and link to. _tmView is which of them is open, '' for the
+// summary.
+const TM_VIEW = {tmcpu:'cpu', tmmem:'mem', tmgpu:'gpu', tmdisk:'disk'};
+const TM_KEY  = {cpu:'tmcpu', mem:'tmmem', gpu:'tmgpu', disk:'tmdisk'};
+const TM_NAME = {cpu:'Processor', mem:'Memory', gpu:'Graphics', disk:'Disk'};
+let _tmView = '', _tmD = null, _tmDWhich = '';
 // A PROCESS THAT LASTS ONE SECOND STILL HAPPENED.
 //
 // Half of what nuarr spawns is gone before you can read it: an ffprobe, a
@@ -25775,6 +25823,14 @@ async function loadTaskmgr(){
     if(!_tm) el.innerHTML = '<div class="dim" style="padding:14px">could not load</div>';
     tmTick(); return;
   }
+  // THE DETAIL IS A SECOND REQUEST, AND ONLY WHILE ITS PAGE IS OPEN. The
+  // summary needs none of it, and the graphics one runs nvidia-smi.
+  if(_tmView){
+    try{
+      const r = await fetch('/api/taskmgr/detail?which='+encodeURIComponent(_tmView));
+      _tmD = await r.json(); _tmDWhich = _tmView;
+    }catch(e){ if(_tmDWhich !== _tmView) _tmD = null; }
+  }
   tmPaint();
   tmTick();
 }
@@ -25810,11 +25866,423 @@ function tmTick(){
     // sampler already spends.
   }, 1000);
 }
+// ---- THE DETAIL PAGES ------------------------------------------------------
+//
+// One shape for all four: a back link and a title, the card's own line drawn
+// larger, a row of figures, and then whatever that particular question needs -
+// a tile per core, a row per engine, a row per spindle, a row per file. The
+// summary's poll drives them, so they move at the same one second the lines do.
+function tmGo(view){
+  _tmView = view || '';
+  _tmD = null;
+  const key = view ? TM_KEY[view] : 'taskmgr';
+  location.hash = '#' + key;
+  if(typeof wtab === 'function') wtab(key);
+  loadTaskmgr();
+}
+function tmPct(v){ return (v==null||isNaN(v)) ? '—' : (Math.round(v*10)/10)+'%'; }
+function tmHz(v){ return v==null ? '—' : (v>=1000 ? (v/1000).toFixed(2)+' GHz' : Math.round(v)+' MHz'); }
+// A bar that is a bar: one figure, drawn to scale, coloured by how close to
+// full it is. Used for cores, engines and volumes alike.
+function tmBar(pct, colour, h){
+  const p = Math.max(0, Math.min(100, pct||0));
+  const c = colour || (p>90?'#f0883e':p>60?'#e8a33d':'#58a6ff');
+  return `<div style="background:rgba(255,255,255,.06);border-radius:3px;
+      height:${h||8}px;overflow:hidden"><div style="width:${p}%;height:100%;
+      background:${c};border-radius:3px"></div></div>`;
+}
+// The same ring the cards draw, one core (or one spindle) wide.
+function tmSpark(vals, colour, top){
+  const n = vals.length;
+  if(n < 2) return '<div style="height:22px"></div>';
+  let mx = top || 0;
+  if(!top) for(const v of vals) mx = Math.max(mx, v||0);
+  if(!mx) mx = 1;
+  const pts = vals.map((v,i)=>`${(i/(n-1)*100).toFixed(2)},${(22-(Math.max(0,v||0)/mx)*22).toFixed(2)}`).join(' ');
+  return `<svg viewBox="0 0 100 22" preserveAspectRatio="none"
+      style="width:100%;height:22px;display:block"><polyline points="${pts}"
+      fill="none" stroke="${colour||'#58a6ff'}" stroke-width="1"
+      vector-effect="non-scaling-stroke"/></svg>`;
+}
+function tmFig(label, value, note){
+  return `<div style="min-width:120px">
+    <div class="dim" style="font-size:10px;letter-spacing:.05em;
+         text-transform:uppercase">${esc(label)}</div>
+    <div class="mono" style="font-size:15px;margin-top:1px">${value}</div>
+    ${note?`<div class="dim" style="font-size:10.5px">${note}</div>`:''}</div>`;
+}
+function tmFigs(list){
+  return `<div class="lkind" style="padding:10px 12px;display:flex;gap:22px;
+      flex-wrap:wrap;margin-bottom:8px">${list.join('')}</div>`;
+}
+function tmSection(title, sub, body){
+  return `<div class="lkind" style="padding:10px 12px;margin-bottom:8px">
+    <div class="tmhead"><b>${esc(title)}</b></div>
+    ${sub?`<div class="dim tmsub">${sub}</div>`:''}${body}</div>`;
+}
+function tmWorkTable(rows, fmtv, unit){
+  if(!rows || !rows.length) return '<div class="dim" style="font-size:11.5px">nothing running</div>';
+  const top = Math.max(...rows.map(r=>r.v||0), 1);
+  return `<table style="width:100%;font-size:11.5px;border-collapse:collapse">
+    ${rows.map(r=>`<tr>
+      <td style="padding:2px 6px 2px 0;white-space:nowrap">${esc(r.key)}
+        <span class="dim">× ${r.n}</span></td>
+      <td style="width:55%">${tmBar(100*(r.v||0)/top, null, 6)}</td>
+      <td class="mono" style="text-align:right;white-space:nowrap">${fmtv(r.v)}${unit||''}</td>
+    </tr>`).join('')}</table>`;
+}
+function tmProcTable(rows, cols){
+  if(!rows || !rows.length) return '<div class="dim" style="font-size:11.5px">no processes</div>';
+  return `<div class="scrollbox" style="max-height:260px">
+   <table style="width:100%;font-size:11.5px;border-collapse:collapse;table-layout:fixed">
+    <colgroup><col style="width:auto"><col style="width:12%">
+      ${cols.map(()=>'<col style="width:11%">').join('')}</colgroup>
+    <thead><tr class="dim" style="font-size:10px;letter-spacing:.05em;
+        text-transform:uppercase">
+      <th style="text-align:left;padding:3px 6px">process</th>
+      <th style="text-align:center">pid</th>
+      ${cols.map(c=>`<th style="text-align:right;padding-right:6px">${esc(c.t)}</th>`).join('')}
+    </tr></thead><tbody>
+    ${rows.map(p=>`<tr style="border-top:1px solid var(--line)">
+      <td style="padding:3px 6px;overflow:hidden;text-overflow:ellipsis;
+          white-space:nowrap">${esc(p.activity||p.name||'?')}
+        ${p.detail?`<span class="dim"> — ${esc(p.detail)}</span>`:''}</td>
+      <td class="mono dim" style="text-align:center">${p.pid}</td>
+      ${cols.map(c=>`<td class="mono" style="text-align:right;padding-right:6px">${
+        c.get(p)}</td>`).join('')}
+    </tr>`).join('')}</tbody></table></div>`;
+}
+function tmBack(name){
+  return `<div style="display:flex;align-items:baseline;gap:10px;margin-bottom:8px">
+    <a href="#taskmgr" onclick="tmGo('');return false;"
+       style="color:#6fb0ff;font-size:12px;text-decoration:none">‹ Task manager</a>
+    <b style="font-size:14px">${esc(name)}</b>
+    <span class="dim" style="font-size:11px;margin-left:auto">every second</span>
+  </div>`;
+}
+// ---- processor -------------------------------------------------------------
+function tmCpuView(H, cores){
+  const D = _tmD || {};
+  const C = D.cores || {rows:[]}, R = C.rows || [];
+  const t = D.times || {}, st = D.stats || {}, f = D.freq || {}, cn = D.counts || {};
+  const last = R.length ? R[R.length-1].pct : [];
+  const figs = [
+    tmFig('threads', `${cn.logical||cores||'—'}`,
+          cn.physical?`${cn.physical} physical cores`:''),
+    tmFig('clock', tmHz(f.now), f.max?`of ${tmHz(f.max)}`:''),
+    tmFig('busiest core', last.length?tmPct(Math.max(...last)):'—',
+          last.length?`core ${last.indexOf(Math.max(...last))}`:''),
+    tmFig('user', tmPct(t.user), 'doing work'),
+    tmFig('system', tmPct(t.system), 'in the kernel'),
+    tmFig('interrupt + dpc', tmPct((t.interrupt||0)+(t.dpc||0)), 'drivers'),
+    tmFig('context switches', st.ctx_switches!=null?fmt(st.ctx_switches)+'/s':'—'),
+    tmFig('interrupts', st.interrupts!=null?fmt(st.interrupts)+'/s':'—'),
+  ];
+  // WHERE THE TIME GOES, as one bar: the same four figures the list above
+  // carries, drawn to scale against each other so "60% of what?" has a shape.
+  const seg = [['user','#58a6ff',t.user],['system','#e8a33d',t.system],
+               ['interrupt','#f0883e',t.interrupt],['dpc','#c98cf0',t.dpc],
+               ['idle','#2c333d',t.idle]];
+  const split = `<div style="display:flex;height:14px;border-radius:4px;
+      overflow:hidden;margin:6px 0 4px">${seg.map(([n,c,v])=>
+      `<div title="${n} ${tmPct(v)}" style="width:${Math.max(0,v||0)}%;
+        background:${c}"></div>`).join('')}</div>
+    <div class="dim" style="font-size:10.5px">${seg.map(([n,c,v])=>
+      `<span style="color:${c}">■</span> ${n} ${tmPct(v)}`).join(' · ')}</div>`;
+  const tiles = last.map((v,i)=>`<div class="lkind" style="padding:6px 8px">
+      <div style="display:flex;justify-content:space-between;font-size:10.5px">
+        <span class="dim">core ${i}</span>
+        <b class="mono" style="color:${v>90?'#f0883e':v>60?'#e8a33d':'inherit'}">${Math.round(v)}%</b>
+      </div>${tmBar(v, null, 5)}
+      ${tmSpark(R.map(r=>r.pct[i]), '#58a6ff', 100)}</div>`).join('');
+  return tmBack('Processor')
+    + tmFigs(figs)
+    + tmSection('nuarr against the whole machine',
+        `nuarr's share of all ${cn.logical||cores} threads, and the box's own —
+         the gap between them is what the job gate steers on`,
+        tmChart(H, [{name:'nuarr', colour:'#58a6ff', get:r=>r.cpu},
+                    {name:'the box', colour:'#8b949e', get:r=>r.cpu_all, fill:false}],
+                {max:100, peak:true}) + split)
+    + tmSection('Every core',
+        `one tile per logical thread, with the last ${R.length} seconds under it.
+         A single pinned core and twenty busy ones read the same on the card above
+         and mean opposite things`,
+        `<div class="tmcores">${tiles}</div>`)
+    + tmSection('What nuarr is spending it on', 'processor share by the work it belongs to, not by the executable',
+        tmWorkTable(D.by_work||[], v=>(Math.round(v*10)/10), '%'))
+    + tmSection('Heaviest processes', '',
+        tmProcTable(D.top||[], [
+          {t:'cpu', get:p=>tmPct(p.cpu_pct)},
+          {t:'memory', get:p=>tmMb(p.rss_mb)},
+          {t:'up', get:p=>tmAge(p.age_s)}]));
+}
+// ---- memory ----------------------------------------------------------------
+function tmMemView(H){
+  const D = _tmD || {};
+  const vm = D.vm || {}, sw = D.swap || {}, tr = D.trim || {};
+  const figs = [
+    tmFig('the machine', tmMb(vm.used), `of ${tmMb(vm.total)} — ${tmPct(vm.percent)}`),
+    tmFig('available', tmMb(vm.available), 'before anything has to be paged'),
+    tmFig('nuarr', tmMb((_tm.sample.nuarr||{}).ram_mb),
+          `${(_tm.sample.nuarr||{}).procs||0} processes`),
+    tmFig('page file', sw.total?`${tmMb(sw.used)}`:'—',
+          sw.total?`of ${tmMb(sw.total)} — ${tmPct(sw.percent)}`:'none'),
+    tmFig('paging', (sw.in_bps!=null)?`${tmBps(sw.in_bps)} in`:'—',
+          (sw.out_bps!=null)?`${tmBps(sw.out_bps)} out`:''),
+    tmFig('last trim', tr.at?ago(tr.at):'never',
+          tr.at?`${Math.round(tr.from_mb)} → ${Math.round(tr.to_mb)} MB, ${tr.n} times`:''),
+  ];
+  return tmBack('Memory')
+    + tmFigs(figs)
+    + tmSection('nuarr against the machine',
+        'resident across every process nuarr has spawned, against how full the machine\'s memory is',
+        tmChart(H, [{name:'nuarr', colour:'#7fd18c', get:r=>r.ram_mb},
+                    {name:'the box', colour:'#8b949e', fill:false, axis:'right',
+                     get:r=>r.ram_all_pct, fmt:v=>Math.round(v)+'%'}],
+                {peak:true, fmt:v=>tmMb(v)}))
+    + tmSection('Where the machine\'s memory is',
+        'used, and what is left before Windows has to page something out',
+        `<div style="display:flex;height:16px;border-radius:4px;overflow:hidden;margin:6px 0 4px">
+          <div title="nuarr" style="width:${100*((_tm.sample.nuarr||{}).ram_mb||0)/(vm.total||1)}%;background:#7fd18c"></div>
+          <div title="everything else" style="width:${Math.max(0,100*((vm.used||0)-((_tm.sample.nuarr||{}).ram_mb||0))/(vm.total||1))}%;background:#58a6ff"></div>
+          <div title="free" style="flex:1;background:#2c333d"></div>
+         </div>
+         <div class="dim" style="font-size:10.5px">
+           <span style="color:#7fd18c">■</span> nuarr ${tmMb((_tm.sample.nuarr||{}).ram_mb)} ·
+           <span style="color:#58a6ff">■</span> everything else ${tmMb(Math.max(0,(vm.used||0)-((_tm.sample.nuarr||{}).ram_mb||0)))} ·
+           <span style="color:#8b949e">■</span> free ${tmMb(vm.available)}</div>`)
+    + tmSection('What nuarr is holding it for', 'resident memory by the work it belongs to',
+        tmWorkTable(D.by_work||[], v=>tmMb(v), ''))
+    + tmSection('Largest processes', '',
+        tmProcTable(D.top||[], [
+          {t:'memory', get:p=>tmMb(p.rss_mb)},
+          {t:'cpu', get:p=>tmPct(p.cpu_pct)},
+          {t:'up', get:p=>tmAge(p.age_s)}]));
+}
+// ---- graphics --------------------------------------------------------------
+function tmGpuView(H){
+  const D = _tmD || {}, c = D.card || {};
+  if(D.why && !D.card) return tmBack('Graphics') +
+    `<div class="lkind" style="padding:14px" class="dim">${esc(D.why)}</div>`;
+  const figs = [
+    tmFig('card', esc(c.name||'—'), c.driver?`driver ${esc(c.driver)}`:''),
+    tmFig('encoder', tmPct(c.encoder_pct), 'NVENC — where an encode runs'),
+    tmFig('decoder', tmPct(c.decoder_pct), 'NVDEC — where it is read'),
+    tmFig('cores', tmPct(c.sm_pct), 'the SMs, for filter work'),
+    tmFig('memory', c.vram_used!=null?`${Math.round(c.vram_used)} MB`:'—',
+          c.vram_total?`of ${Math.round(c.vram_total)} MB`:''),
+    tmFig('clocks', tmHz(c.clock_sm), c.clock_sm_max?`of ${tmHz(c.clock_sm_max)}`:''),
+    tmFig('power', c.power!=null?`${Math.round(c.power)} W`:'—',
+          c.power_limit?`of ${Math.round(c.power_limit)} W`:''),
+    tmFig('temperature', c.temp_c!=null?`${Math.round(c.temp_c)}°C`:'—',
+          c.fan!=null?`fan ${Math.round(c.fan)}%`:''),
+    tmFig('encode sessions', c.sessions!=null?fmt(c.sessions):'—',
+          c.session_fps?`${Math.round(c.session_fps)} fps · ${Math.round(c.session_latency||0)} µs`:''),
+  ];
+  const eng = [['encoder','#e8a33d',c.encoder_pct],['decoder','#c98cf0',c.decoder_pct],
+               ['cores (SM)','#5ad1c4',c.sm_pct],['memory bus','#58a6ff',c.vram_bus_pct]];
+  const bars = eng.map(([n,col,v])=>`<div style="margin:5px 0">
+      <div style="display:flex;justify-content:space-between;font-size:11px">
+        <span style="color:${col}">${n}</span><b class="mono">${tmPct(v)}</b></div>
+      ${tmBar(v, col, 7)}</div>`).join('');
+  const enc = (D.encodes||[]);
+  const encTable = enc.length ? `<table style="width:100%;font-size:11.5px;
+      border-collapse:collapse"><thead><tr class="dim" style="font-size:10px;
+      letter-spacing:.05em;text-transform:uppercase">
+      <th style="text-align:left;padding:3px 6px">file</th><th>encoder</th>
+      <th>preset</th><th>cq</th><th>fps</th><th>speed</th><th>done</th></tr></thead>
+      <tbody>${enc.map(e=>`<tr style="border-top:1px solid var(--line)">
+        <td style="padding:3px 6px;max-width:0;overflow:hidden;
+            text-overflow:ellipsis;white-space:nowrap">${esc(e.title)}
+          <span class="dim">${esc(e.stage||'')}</span></td>
+        <td class="mono c" style="text-align:center">${esc(e.encoder||e.family||e.doing||'—')}</td>
+        <td class="mono c" style="text-align:center">${esc(e.preset||'—')}</td>
+        <td class="mono c" style="text-align:center">${e.cq!=null?e.cq:'—'}</td>
+        <td class="mono c" style="text-align:center">${e.fps||'—'}</td>
+        <td class="mono c" style="text-align:center">${e.speed?e.speed+'×':'—'}</td>
+        <td class="mono c" style="text-align:center">${Math.round((e.progress||0)*100)}%</td>
+      </tr>`).join('')}</tbody></table>`
+    : '<div class="dim" style="font-size:11.5px">nuarr is not encoding anything right now</div>';
+  const procs = (D.procs||[]);
+  return tmBack('Graphics')
+    + tmFigs(figs)
+    + tmSection('The three engines',
+        `an encode uses all of them — NVDEC to read the source, the SMs for any
+         filtering, NVENC to write the result. The card's headline figure only
+         covers the middle one${tmThrottle(c.throttle)}`,
+        bars + tmChart(H, [
+          {name:'encoder', colour:'#e8a33d', get:r=>r.enc},
+          {name:'decoder', colour:'#c98cf0', get:r=>r.dec, fill:false},
+          {name:'cores',   colour:'#5ad1c4', get:r=>r.gpu, fill:false},
+          {name:'card memory', colour:'#8b949e', fill:false, axis:'right',
+           get:r=>r.gpu_mem, fmt:v=>v?Math.round(v)+' MB':'—'}], {max:100, peak:true}))
+    + tmSection('What nuarr is asking of it', 'every encode running now, with the encoder and preset it was given',
+        encTable)
+    + tmSection('Everything on the card',
+        D.per_proc_vram ? 'with the memory each holds'
+          : 'the driver does not attribute video memory per process on Windows, so only the list is real',
+        procs.length ? tmGpuProcs(procs)
+          : '<div class="dim" style="font-size:11.5px">nothing is holding a context</div>');
+}
+// ---- disk ------------------------------------------------------------------
+function tmDiskView(H){
+  const D = _tmD || {};
+  const by = D.by_disk || [], rows = D.rows || [], vols = D.volumes || [];
+  const files = D.files || [];
+  const tot = by.reduce((a,d)=>a+(d.read_bps||0)+(d.write_bps||0), 0);
+  const figs = [
+    tmFig('every spindle', tmBps(tot), `${by.length} disks with traffic`),
+    tmFig('nuarr reads', tmBps(H.length?H[H.length-1].read:0), 'from its own counters'),
+    tmFig('nuarr writes', tmBps(H.length?H[H.length-1].write:0), 'from its own counters'),
+    tmFig('the cache', tmBps(H.length?((H[H.length-1].cache_read||0)+(H[H.length-1].cache_write||0)):0),
+          'where every encode stages'),
+    tmFig('files in flight', fmt(files.length), 'jobs with a file open'),
+  ];
+  const diskRows = by.map(d=>{
+    const series = rows.map(r=>(r.d[d.name]||[0,0])[0] + (r.d[d.name]||[0,0])[1]);
+    const col = (typeof diskColor==='function' && d.label) ? diskColor(d.label) : '#58a6ff';
+    return `<tr style="border-top:1px solid var(--line)">
+      <td style="padding:4px 6px;white-space:nowrap">
+        <b style="color:${col}">${esc(d.label||d.name)}</b>
+        ${d.label?`<span class="dim" style="font-size:10px"> ${esc(d.name)}</span>`:''}</td>
+      <td style="width:26%">${tmSpark(series, col)}</td>
+      <td class="mono" style="text-align:right;color:#58a6ff">${tmBps(d.read_bps)}</td>
+      <td class="mono" style="text-align:right;color:#f0883e">${tmBps(d.write_bps)}</td>
+      <td class="mono dim" style="text-align:right">${tmBps(d.avg_read)} / ${tmBps(d.avg_write)}</td>
+      <td class="mono dim" style="text-align:right">${fmt(d.reads||0)} r · ${fmt(d.writes||0)} w</td>
+    </tr>`;
+  }).join('');
+  const volRows = vols.map(v=>{
+    const pct = v.total ? 100*v.used/v.total : 0;
+    const col = (typeof diskColor==='function' && v.kind==='pool') ? diskColor(v.label) : '#8b949e';
+    return `<tr><td style="padding:3px 6px;white-space:nowrap">
+        <b style="color:${col}">${esc(v.label)}</b>
+        ${v.kind!=='pool'?`<span class="dim" style="font-size:10px"> ${esc(v.kind)}</span>`:''}</td>
+      <td style="width:52%">${tmBar(pct, pct>90?'#f0883e':col, 7)}</td>
+      <td class="mono" style="text-align:right;white-space:nowrap">${tmSize(v.free)} free</td>
+      <td class="mono dim" style="text-align:right;white-space:nowrap">${Math.round(pct)}% of ${tmSize(v.total)}</td>
+    </tr>`;
+  }).join('');
+  const fileRows = files.length ? files.map(f=>`<tr style="border-top:1px solid var(--line)">
+      <td style="padding:4px 6px;max-width:0;overflow:hidden;text-overflow:ellipsis;
+          white-space:nowrap">${tmPill(f.pool||f.kind)} ${esc(f.title||f.file)}
+        ${f.stage?`<span class="dim"> — ${esc(f.stage)}</span>`:''}</td>
+      <td style="white-space:nowrap;text-align:center">${
+        f.from?`<b style="color:${diskColor(f.from)}">${esc(f.from)}</b>`:'—'}
+        ${f.to&&f.to!==f.from?` → <b style="color:${diskColor(f.to)}">${esc(f.to)}</b>`:''}</td>
+      <td class="mono" style="text-align:right;color:#58a6ff">${tmBps(f.read_bps)}</td>
+      <td class="mono" style="text-align:right;color:#f0883e">${tmBps(f.write_bps||f.commit_bps)}</td>
+      <td class="mono" style="text-align:right">${Math.round((f.progress||0)*100)}%</td>
+      <td class="dim" style="text-align:right;font-size:10.5px;white-space:nowrap">${
+        f.paced?esc(f.pace_why||'held'):(f.commit_phase?esc(f.commit_phase):'')}</td>
+    </tr>`).join('')
+    : `<tr><td colspan="6" class="dim" style="padding:6px">nothing has a file open right now</td></tr>`;
+  return tmBack('Disk')
+    + tmFigs(figs)
+    + tmSection('What nuarr is moving',
+        'summed from its own processes\' counters, so nothing here can be somebody else\'s work',
+        tmChart(H, [{name:'read', colour:'#58a6ff', get:r=>r.read},
+                    {name:'write', colour:'#f0883e', get:r=>r.write},
+                    {name:'the cache', colour:'#8b949e', fill:false,
+                     get:r=>(r.cache_read||0)+(r.cache_write||0)}],
+                {peak:true, fmt:v=>tmBps(v)}))
+    + tmSection('Every spindle',
+        'the machine\'s own per-disk counters — everything on the disk, nuarr\'s work and anyone else\'s',
+        `<table style="width:100%;font-size:11.5px;border-collapse:collapse">
+          <thead><tr class="dim" style="font-size:10px;letter-spacing:.05em;
+            text-transform:uppercase"><th style="text-align:left;padding:3px 6px">disk</th>
+            <th>last ${rows.length}s</th><th style="text-align:right">read</th>
+            <th style="text-align:right">write</th>
+            <th style="text-align:right">10s average</th>
+            <th style="text-align:right">operations/s</th></tr></thead>
+          <tbody>${diskRows||'<tr><td class="dim" style="padding:6px">no traffic</td></tr>'}</tbody></table>`)
+    + tmSection('Which file, and where it is going',
+        'every job with a file open: the spindle it is reading from, the one it will be written back to, and what it is moving',
+        `<table style="width:100%;font-size:11.5px;border-collapse:collapse;table-layout:fixed">
+          <colgroup><col style="width:auto"><col style="width:19%"><col style="width:11%">
+            <col style="width:11%"><col style="width:8%"><col style="width:14%"></colgroup>
+          <thead><tr class="dim" style="font-size:10px;letter-spacing:.05em;
+            text-transform:uppercase"><th style="text-align:left;padding:3px 6px">file</th>
+            <th>disk</th><th style="text-align:right">read</th>
+            <th style="text-align:right">write</th><th style="text-align:right">done</th>
+            <th style="text-align:right">note</th></tr></thead>
+          <tbody>${fileRows}</tbody></table>`)
+    + tmSection('The volumes', 'how full each pool disk and the cache is',
+        `<table style="width:100%;font-size:11.5px;border-collapse:collapse">${volRows}</table>`);
+}
+// The same bubble the strip and the Workers panel use, from the one global
+// that knows the colours. (pillFor lives inside another function, so it is
+// not reachable from here - and a second colour table would be a second
+// thing to keep in step.)
+// humanBytes stops at GB, which reads badly on an 18 TB spindle - "18627.00
+// GB" is a number you have to count the digits of.
+function tmSize(b){
+  b = Number(b)||0;
+  return b >= 1024**4 ? (b/1024**4).toFixed(2)+' TB'
+       : b >= 1024**3 ? (b/1024**3).toFixed(0)+' GB'
+       : b >= 1024**2 ? (b/1024**2).toFixed(0)+' MB' : Math.round(b)+' B';
+}
+// nvidia-smi answers the throttle question as a bitmask, and its usual value
+// is a run of zeros - which is "nothing is holding the clocks down" and reads
+// on a page as an alarming hex number.
+// WHO IS ON THE CARD, AND WHO IS ONLY ON IT BECAUSE WINDOWS DRAWS WINDOWS.
+// Every process with a graphics context shows up here - dwm, explorer, two
+// Chromes - and on this driver none of them report VRAM, so the list as it
+// comes is twenty rows of nothing. The ones that can actually compete for
+// NVENC lead; the rest fold away.
+const TM_GPU_KEY = /ffmpeg|nuarr|python|plex|handbrake|nvenc/i;
+function tmGpuProcs(procs){
+  const mine = procs.filter(p=>TM_GPU_KEY.test(p.name||''));
+  const rest = procs.filter(p=>!TM_GPU_KEY.test(p.name||''));
+  const row = p=>`<tr><td style="padding:2px 6px 2px 0">${esc(p.name||'')}</td>
+      <td class="mono dim" style="width:70px">${p.pid}</td>
+      <td class="mono" style="text-align:right">${
+        p.vram_mb!=null?Math.round(p.vram_mb)+' MB':'—'}</td></tr>`;
+  return `<table style="width:100%;font-size:11.5px;border-collapse:collapse">
+      ${mine.map(row).join('')}</table>
+    ${rest.length?`<details style="margin-top:4px"><summary class="dim"
+        style="font-size:11px;cursor:pointer">${rest.length} more holding a
+        graphics context — desktop windows, browsers, the compositor</summary>
+      <table style="width:100%;font-size:11.5px;border-collapse:collapse;
+        margin-top:3px">${rest.map(row).join('')}</table></details>`:''}`;
+}
+function tmThrottle(v){
+  const t = (v||'').trim();
+  if(!t || t==='Not Active' || /^0x0+$/i.test(t)) return '';
+  return ` · <span class="warn">clocks held down: ${esc(t)}</span>`;
+}
+function tmPill(pool){
+  if(!pool) return '';
+  const c = (typeof poolColor==='function') ? poolColor(pool) : '#8b949e';
+  return `<span class="pill" style="color:${c};border-color:${c};font-size:9.5px;
+    padding:0 5px">${esc(pool)}</span>`;
+}
+function tmAge(s){
+  s = s||0;
+  return s<60 ? s+'s' : s<3600 ? Math.floor(s/60)+'m '+(s%60)+'s'
+       : Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m';
+}
 function tmPaint(){
   const el = document.getElementById('tmPane'); if(!el || !_tm) return;
   const S = _tm.sample || {}, me = S.nuarr || {}, g = S.gpu || {};
   const H = (_tm.history||{}).rows || [];
   const cores = (_tm.history||{}).cores || S.cpu_cores || 1;
+  // A CARD THAT HAS BEEN OPENED REPLACES THE PAGE, rather than appearing
+  // under it: the summary's own four lines are the first thing on every
+  // detail page anyway, drawn larger, so keeping both would be the same
+  // picture twice with the interesting half below the fold.
+  if(_tmView){
+    if(!_tmD || _tmDWhich !== _tmView){
+      el.innerHTML = tmBack(TM_NAME[_tmView]||'') +
+        '<div class="dim" style="padding:14px">reading the counters…</div>';
+      return;
+    }
+    el.innerHTML = _tmView==='cpu'  ? tmCpuView(H, cores)
+                 : _tmView==='mem'  ? tmMemView(H)
+                 : _tmView==='gpu'  ? tmGpuView(H)
+                 : _tmView==='disk' ? tmDiskView(H) : '';
+    return;
+  }
   const nowMs = Date.now();
 
   // ONE ROW PER PIECE OF WORK, NOT PER PID.
@@ -25884,7 +26352,7 @@ function tmPaint(){
 
   // ---- the four headline figures, each with its own line ------------------
   const cards = [
-    {t:'Processor', sub:`nuarr's share of all ${cores} threads, against the
+    {t:'Processor', v:'cpu', more:'every core, where the time goes, and what nuarr is spending it on', sub:`nuarr's share of all ${cores} threads, against the
         whole machine's — the gap between them is what the job gate steers on`,
      html: tmChart(H, [
        {name:'nuarr', colour:'#58a6ff', get:r=>r.cpu},
@@ -25896,14 +26364,14 @@ function tmPaint(){
     // a box at 20% memory and another on a box at 95%. Grey and unfilled
     // throughout, so it reads as the backdrop it is rather than competing
     // with the figure the card is about.
-    {t:'Memory', sub:`resident across every process nuarr has spawned, against
+    {t:'Memory', v:'mem', more:'the machine\'s memory, the page file, and who is holding it', sub:`resident across every process nuarr has spawned, against
         how full the machine's memory is`,
      html: tmChart(H, [
        {name:'nuarr', colour:'#7fd18c', get:r=>r.ram_mb},
        {name:'the box', colour:'#8b949e', fill:false, axis:'right',
         get:r=>r.ram_all_pct, fmt:v=>Math.round(v)+'%'}],
        {peak:true, fmt:v=>tmMb(v)})},
-    {t:'Graphics', sub:`${esc(g.name||'no card reported')} — the encoder is the
+    {t:'Graphics', v:'gpu', more:'all three engines, clocks, power and every encode running', sub:`${esc(g.name||'no card reported')} — the encoder is the
         engine an encode actually runs on; the SM figure sits far below it`,
      html: tmChart(H, [
        {name:'encoder', colour:'#e8a33d', get:r=>r.enc},
@@ -25914,7 +26382,7 @@ function tmPaint(){
        {name:'card memory', colour:'#8b949e', fill:false, axis:'right',
         get:r=>r.gpu_mem, fmt:v=>v?Math.round(v)+' MB':'—'}],
        {max:100, peak:true})},
-    {t:'Disk', sub:`what nuarr's own processes are moving — summed from their
+    {t:'Disk', v:'disk', more:'every spindle, every volume, and which file each byte belongs to', sub:`what nuarr's own processes are moving — summed from their
         own counters, so nothing here can be somebody else's work`,
      html: tmChart(H, [
        {name:'read',  colour:'#58a6ff', get:r=>r.read},
@@ -25926,8 +26394,11 @@ function tmPaint(){
         get:r=>(r.cache_read||0)+(r.cache_write||0)}],
        {peak:true, fmt:v=>tmBps(v)})},
   ];
-  const grid = `<div class="tmgrid">${cards.map(c=>`<div class="lkind tmcard">
-      <div class="tmhead"><b>${esc(c.t)}</b></div>
+  const grid = `<div class="tmgrid">${cards.map(c=>`<div class="lkind tmcard tmopen"
+       onclick="tmGo('${c.v}')" title="open the ${c.t.toLowerCase()} page — ${
+         c.more}">
+      <div class="tmhead"><b>${esc(c.t)}</b>
+        <span class="tmmore">details ›</span></div>
       <div class="dim tmsub">${c.sub}</div>${c.html}</div>`).join('')}</div>`;
 
   // ---- the processes, in full ---------------------------------------------
@@ -40080,7 +40551,10 @@ _SETTINGS_SHIM = """
   // with the first entry - so "Subtitle files beside the video" landed on
   // Counts and read as the link being broken rather than unlisted.
   const DEEP = ['arrgap','arrsync','audiotitle','subsync','plexsync',
-                'subembed','hardsub','subtitletitle','integrity','audiolang'];
+                'subembed','hardsub','subtitletitle','integrity','audiolang',
+                // The task manager's four cards each open a page of their
+                // own, and each has a hash you can refresh onto.
+                'tmcpu','tmmem','tmgpu','tmdisk'];
   const VALID = KEYS.concat(DEEP);
 
   document.title = 'nuarr settings';
@@ -40184,7 +40658,9 @@ _SETTINGS_SHIM = """
   const DEEP_PANE = {arrgap:'libs', arrsync:'arrs', audiotitle:'acodec',
                      subsync:'lang', plexsync:'plex',
                      subembed:'lang', hardsub:'lang', subtitletitle:'lang',
-                     integrity:'health', audiolang:'alang'};
+                     integrity:'health', audiolang:'alang',
+                     tmcpu:'taskmgr', tmmem:'taskmgr',
+                     tmgpu:'taskmgr', tmdisk:'taskmgr'};
   // Highlight and URL only - no navigation. wtab() calls this after it has
   // already switched panes, which is how a link inside a pane ends up lighting
   // the right sidebar entry and leaving a hash you can refresh onto.

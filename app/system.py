@@ -82,6 +82,64 @@ def _hist_push(s: dict) -> None:
         del _HIST[:len(_HIST) - HIST_MAX]
 
 
+# THE SAME RING, PER CORE AND PER DISK - for the detail pages only.
+#
+# The headline ring above carries one figure per thing, which is what a card
+# can draw and all it needs. "Which core" and "which spindle" are the next
+# question down, and answering them from a one-second poll means keeping them
+# too - five minutes of each, because these are read when somebody has gone
+# looking rather than continuously.
+DETAIL_MAX = 300
+_CORES: list = []                     # [{at, pct: [...]}]
+_DISKS: list = []                     # [{at, d: {name: [read_bps, write_bps]}}]
+_DISK_PREV: dict = {}
+
+
+def _cores_push() -> None:
+    try:
+        pct = psutil.cpu_percent(interval=None, percpu=True) or []
+    except Exception:                                        # noqa: BLE001
+        return
+    _CORES.append({"at": round(time.time(), 1),
+                   "pct": [round(float(x), 1) for x in pct]})
+    if len(_CORES) > DETAIL_MAX:
+        del _CORES[:len(_CORES) - DETAIL_MAX]
+
+
+def _disks_push() -> None:
+    """Every physical disk's rate, differenced against the last sample."""
+    global _DISK_PREV
+    try:
+        cur = psutil.disk_io_counters(perdisk=True) or {}
+    except Exception:                                        # noqa: BLE001
+        return
+    now = time.time()
+    row: dict = {}
+    for name, c in cur.items():
+        p = _DISK_PREV.get(name)
+        if p:
+            dt = now - p[0]
+            if 0 < dt <= 30:
+                row[name] = [max(0.0, (c.read_bytes - p[1]) / dt),
+                             max(0.0, (c.write_bytes - p[2]) / dt),
+                             max(0, c.read_count - p[3]),
+                             max(0, c.write_count - p[4])]
+        _DISK_PREV[name] = (now, c.read_bytes, c.write_bytes,
+                            c.read_count, c.write_count)
+    if row:
+        _DISKS.append({"at": round(now, 1), "d": row})
+        if len(_DISKS) > DETAIL_MAX:
+            del _DISKS[:len(_DISKS) - DETAIL_MAX]
+
+
+def cores_history(n: int = 0) -> list:
+    return _CORES[-int(n):] if n else list(_CORES)
+
+
+def disks_history(n: int = 0) -> list:
+    return _DISKS[-int(n):] if n else list(_DISKS)
+
+
 def history(n: int = 0) -> dict:
     """The ring, oldest first. `n` trims to the most recent n samples."""
     rows = _HIST[-int(n):] if n else list(_HIST)
@@ -795,14 +853,20 @@ async def sampler() -> None:
         try:
             _LATEST = await asyncio.to_thread(_sample)
             _hist_push(_LATEST)
+            # The per-core and per-disk rings the detail pages draw. Both are
+            # one counter read; neither spawns anything.
+            await asyncio.to_thread(_cores_push)
+            await asyncio.to_thread(_disks_push)
         except Exception:
             pass
         await asyncio.sleep(SAMPLE_S)
 
 
-# Prime the CPU counter so the first real reading is not 0.0
+# Prime the CPU counters so the first real reading is not 0.0. Per-core keeps
+# its own last-call state inside psutil, so it has to be primed separately.
 try:
     psutil.cpu_percent(interval=None)
+    psutil.cpu_percent(interval=None, percpu=True)
 except Exception:
     pass
 
