@@ -14490,6 +14490,10 @@ tr.logrow td{background:#1c2129;border-bottom:1px solid var(--acc);padding:0 12p
 .scanmark{font-size:10px}
 .scant{font-variant-numeric:tabular-nums}
 .two{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+/* A GRID TRACK GROWS TO ITS WIDEST CHILD unless told not to: one nowrap
+   note on the health page stretched the whole settings column past the
+   window and pushed every row's right-hand columns off screen. */
+.wrap>.two,.two>*,.setwrap,.setwrap>*{min-width:0}
 @media(max-width:900px){.two{grid-template-columns:1fr}}
 input,select{background:#0b0e12;color:var(--fg);border:1px solid var(--line);
              padding:5px 9px;border-radius:6px;font-size:13px}
@@ -27531,19 +27535,19 @@ function hlPaint(){
   const row=c=>`
     <div style="display:flex;gap:10px;align-items:center;padding:7px 10px;
                 border:1px solid var(--line);border-radius:6px;margin-bottom:5px;
-                font-size:11.5px;cursor:pointer"
+                font-size:11.5px;cursor:pointer;flex-wrap:wrap;min-width:0"
          onclick="location.hash='${esc(c.goto)}'"
          title="open the full card">
       <span style="width:9px;height:9px;border-radius:50%;flex:none;
         background:${c.running?'var(--acc)':(c.warn?'var(--warn)':'var(--ok)')}"></span>
-      <b style="flex:none;min-width:290px">${esc(c.label)}</b>
+      <b style="flex:0 1 290px;min-width:200px">${esc(c.label)}</b>
       <span style="flex:none;min-width:64px">${c.pool
         ?`<span class="pill" style="color:${poolColor(c.pool)};border-color:${poolColor(c.pool)};font-size:10px"
             title="the queue pool that does this row's work">${esc(c.pool)}</span>`:''}</span>
-      <span class="${c.warn?'warn':'dim'}" style="flex:1;overflow:hidden;
-        text-overflow:ellipsis;white-space:nowrap">
+      <span class="${c.warn?'warn':'dim'}" style="flex:1 1 240px;min-width:0;overflow:hidden;
+        text-overflow:ellipsis;white-space:nowrap" title="${esc(c.note||'')}">
         ${(c.running&&!(c.done!=null&&c.mode==null))?'checking now… ':''}${esc(c.note||'')}</span>
-      <span class="mono" style="flex:none;min-width:190px;text-align:right;font-size:10.5px"
+      <span class="mono" style="flex:none;min-width:150px;text-align:right;font-size:10.5px"
         title="how many files this row's system has been through, and how many are still to come">${
         c.done!=null
           ? `<span style="color:var(--ok)">${fmt(c.done)}</span><span class="dim"> done · </span>`
@@ -27551,19 +27555,19 @@ function hlPaint(){
             +(c.true_why?`<div style="font-size:11px;margin-top:2px" title="${esc(c.true_why)}"><span style="color:#f0a848;font-weight:600">${c.true_left==null?'counting':fmt(c.true_left)}</span> <span class="dim">true left</span></div>`:'')
             +(c.moved_at?`<div class="dim" style="font-size:10px;margin-top:1px" title="when these two figures last changed — ${new Date(c.moved_at*1000).toLocaleString()}">updated ${esc(ago(c.moved_at))}</div>`:'')
           : ''}</span>
-      <span style="flex:none;font-size:10.5px;min-width:150px;
+      <span style="flex:none;font-size:10.5px;min-width:110px;
         text-align:right;color:${hlRemedyColor(c.remedy)}" title="${esc(c.remedy_why
           ? 'What nuarr does about what this row finds. '+c.remedy_why
           : 'this row reports a count; there is nothing to correct')}">${
         c.remedy?esc(c.remedy):''}</span>
-      <span class="dim" style="flex:none;font-size:10.5px;min-width:118px;
+      <span class="dim" style="flex:none;font-size:10.5px;min-width:100px;
         text-align:right" title="${c.mode
           ? 'this system\'s own auto/manual switch, lives on its card'
           : 'this row has no switch - it reports a count'}">${
         c.mode?`<span style="border:1px solid ${c.mode==='auto'?'rgba(127,212,163,.5)':'rgba(226,179,65,.5)'};
           color:${c.mode==='auto'?'var(--ok)':'var(--warn)'};border-radius:9px;
           padding:0 7px">${esc(c.mode)}</span>`:`<span style="color:#8fa3b8">${esc(c.when||'')}</span>`}</span>
-      <span style="flex:none;min-width:96px;text-align:right;color:#6fb0ff"
+      <span style="flex:none;min-width:80px;text-align:right;color:#6fb0ff"
         title="the page this row opens">${esc(c.where||'')} ›</span>
     </div>`;
   // WHAT NEEDS YOU FIRST. All-clear rows still show - a health page that
