@@ -356,6 +356,12 @@ def _disk_of_poolpart(pooled_path: str, pool_root: str = "P:\\") -> str | None:
     global _DISK_CACHE
     if not _DISK_CACHE:
         _DISK_CACHE = pool_disks()
+    # A PATH INSIDE A POOLPART NAMES ITS DISK. A placed commit stages on the
+    # member volume itself, and that path is not under the pool root.
+    low = (pooled_path or "").lower()
+    for label, part in _DISK_CACHE.items():
+        if low.startswith(part.lower()):
+            return label
     pooled_path = strip_extended_prefix(pooled_path)
     try:
         rel = os.path.relpath(pooled_path, pool_root)

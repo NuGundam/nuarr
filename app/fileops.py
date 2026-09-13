@@ -612,6 +612,15 @@ def fix_container_extension(path: str, *, lock_timeout: float = 120) -> OpResult
     return OpResult(True, "rename-ext", target)
 
 
+# WHO CHOOSES THE SPINDLE A COMMIT LANDS ON. Unset, DrivePool does, by
+# staging the copy at its final pool path. placement.register() sets both:
+# PLACER(target, size) -> (member root, label, why) names a member disk's
+# PoolPart to stage into directly, or (None, "", why) to leave it to
+# DrivePool; PLACED(target, label) is told when the swap has landed there.
+PLACER = None
+PLACED = None
+
+
 def safe_replace(target: str, replacement: str, *, attempts: int = 5,
                  base_delay: float = 3.0, lock_timeout: float = 600,
                  keep_backup: bool = False, on_stage=None, pace=None) -> OpResult:
@@ -655,9 +664,31 @@ def safe_replace(target: str, replacement: str, *, attempts: int = 5,
     # the final step after all the work is done.
     # Stage a copy next to the target first, so the swap itself stays atomic.
     staged: str | None = None
+    # PLACED, OR LEFT TO DRIVEPOOL. With a placer registered and a disk
+    # chosen, the copy is staged inside that disk's PoolPart at the file's
+    # own relative path, and the final rename happens there - so the file
+    # lands on the chosen spindle and the pool shows it at `target` at
+    # once. Without one, the staging file sits at its final pool path and
+    # DrivePool picks, exactly as before.
+    phys: str | None = None
+    place_label = ""
     if os.path.splitdrive(os.path.abspath(replacement))[0].lower() != \
        os.path.splitdrive(os.path.abspath(target))[0].lower():
-        staged = target + ".nuarr-new"
+        if PLACER:
+            try:
+                root, place_label, _why = PLACER(target, new_sig_size)
+            except Exception:                                # noqa: BLE001
+                root, place_label = None, ""
+            if root:
+                try:
+                    from . import scanner as _sc
+                    bare = _sc.strip_extended_prefix(target)
+                    rel = os.path.relpath(bare, os.path.splitdrive(bare)[0] + "\\")
+                    phys = os.path.join(root, rel)
+                    os.makedirs(os.path.dirname(phys), exist_ok=True)
+                except Exception:                            # noqa: BLE001
+                    phys, place_label = None, ""
+        staged = (phys + ".nuarr-new") if phys else (target + ".nuarr-new")
         try:
             if os.path.exists(staged):
                 os.remove(staged)
@@ -706,9 +737,23 @@ def safe_replace(target: str, replacement: str, *, attempts: int = 5,
                 os.replace(target, backup)
                 moved_backup = True
 
-            os.replace(replacement, target)
+            if phys:
+                # Same disk as the staging copy: an atomic rename inside
+                # the PoolPart. The pool view is checked, not the member
+                # path - if DrivePool does not show it at `target`, it
+                # did not land.
+                os.replace(replacement, phys)
+                for _ in range(10):
+                    if os.path.exists(target) and os.path.getsize(target) == new_sig_size:
+                        break
+                    time.sleep(0.2)
+            else:
+                os.replace(replacement, target)
 
             if not os.path.exists(target) or os.path.getsize(target) != new_sig_size:
+                if phys:
+                    # never leave a second copy for the pool to find
+                    _quiet_remove(phys)
                 raise OSError("post-replace verification failed")
 
             if moved_backup and not keep_backup:
@@ -726,13 +771,24 @@ def safe_replace(target: str, replacement: str, *, attempts: int = 5,
             # whichever drive it started on.
             if staged:
                 _quiet_remove(original)
+            if phys and place_label and PLACED:
+                try:
+                    PLACED(target, place_label)
+                except Exception:                            # noqa: BLE001
+                    pass
             return OpResult(True, "replace", f"{human_bytes(new_sig_size)} in place"
-                            + (" (staged across volumes)" if staged else ""),
+                            + (f" (placed on {place_label})" if phys
+                               else " (staged across volumes)" if staged else ""),
                             attempt, waited, holders)
 
         except OSError as e:
             # roll back so the library is never left without the original
             rolled = False
+            # A PLACED COPY GOES BEFORE THE ORIGINAL COMES BACK: while it
+            # sits in its PoolPart the pool shows it at `target`, and the
+            # restore below would see the target "present" and leave two.
+            if phys and moved_backup and os.path.exists(backup) and os.path.exists(phys):
+                _quiet_remove(phys)
             if moved_backup and not os.path.exists(target) and os.path.exists(backup):
                 try:
                     os.replace(backup, target)

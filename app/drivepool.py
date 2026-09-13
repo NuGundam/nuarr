@@ -93,6 +93,10 @@ DEFAULTS = {
     "drivepool.removing.jobs": "1",
     "drivepool.removing.commits": "1",
     "drivepool.removing.renames": "1",
+    # A COMMIT LANDS ON THE EMPTIEST DISK THAT IS NOT IN USE, staged into
+    # that disk's PoolPart directly, when DrivePool's balancer is off or
+    # places by free space itself. See placement.py.
+    "drivepool.place": "1",
 }
 HOLDS = ("jobs", "commits", "renames")
 
@@ -1033,6 +1037,14 @@ def set_balancing(action: str) -> dict:
             "balancing": balancing()}
 
 
+def _placement() -> dict:
+    try:
+        from . import placement
+        return placement.status()
+    except Exception as e:                                   # noqa: BLE001
+        return {"enabled": False, "why": f"unavailable: {type(e).__name__}"}
+
+
 def status() -> dict:
     """Everything the page shows."""
     ev = []
@@ -1073,6 +1085,8 @@ def status() -> dict:
         "balance": balance_info(),
         # THE START/STOP SWITCH, and where DrivePool's own option sits.
         "balancing": balancing(),
+        # WHERE A COMMIT LANDS, and the last decision.
+        "placement": _placement(),
         # WHAT PRIORITY ITS HOUSEKEEPING IS RUNNING AT, and whether nuarr is
         # the reason. See set_priority: dpcmd cannot do this, Windows can.
         "priority": priority(),

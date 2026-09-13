@@ -725,6 +725,10 @@ async def _startup() -> None:
         from . import drivepool
         drivepool.init()
         asyncio.create_task(drivepool.watch())
+        # Commits land on the emptiest free disk - the chooser hooks into
+        # fileops so every commit path gets it.
+        from . import placement
+        placement.register()
         # What every device will actually play, topped up from Tautulli's
         # history on a timer. Incremental, so a run with nothing new is one
         # API call.
@@ -25532,6 +25536,36 @@ function dpDur(s){ s=Math.max(0,Math.round(s)); return s>=3600?`${Math.floor(s/3
 // doing it from outside, with the same psutil call nuarr has always used on
 // its own ffmpeg children. The panel has to be honest about that: it says
 // which processes it is holding down, at what, and why.
+// WHERE A COMMIT LANDS. The copy back from the cache used to be placed by
+// DrivePool; with this on, nuarr puts it on the emptiest member disk nobody
+// is using, straight into that disk's PoolPart, and steps back to DrivePool's
+// choice when its balancer places by something other than free space.
+function dpPlaceHtml(d){
+  const p=d.placement||{}; const on=!!(d.toggles||{})['drivepool.place'];
+  const L=p.last||{};
+  const verdict=!on?'off — DrivePool chooses'
+    :(p.may_place?`on — the emptiest disk not in use, by ${esc(p.by||'')}`
+      :`on, but stepping back: ${esc(p.why||'')}`);
+  const last=L.at?`last: <b style="color:${L.placed?'var(--ok)':'var(--dim,#8a97a6)'}">${
+      L.placed?`placed on <span style="color:${diskColor(L.chosen)}">${esc(L.chosen)}</span>`:'left to DrivePool'}</b>
+      <span class="dim">— ${esc(L.why||'')} · ${esc(L.file||'')} · ${dpDur(Math.max(0,Date.now()/1000-L.at))} ago</span>`:'';
+  return `<div class="lkind" style="padding:10px 12px;margin-top:8px">
+    <div style="display:flex;gap:12px;align-items:baseline;flex-wrap:wrap">
+      <b style="color:#6fb0ff">Where a commit lands</b>
+      <span style="color:${on?(p.may_place?'var(--ok)':'var(--warn)'):'var(--dim,#8a97a6)'};font-size:12px">${verdict}</span>
+      <label class="gsw" style="margin-left:auto"
+        title="The finished file is copied from the cache straight into the PoolPart of the emptiest member disk that no viewer is on and the load counters do not call busy, with 20 GB to spare and under Prevent Drive Overfill's line when that is on. DrivePool keeps no record of where a file is - the PoolPart it sits in IS the record - so the pool shows it there at once. With the balancer on and placing by free space (Disk Space Equalizer, All In One) the two agree; with Ordered File Placement, the SSD Optimizer or the Drive Usage Limiter on, DrivePool chooses as before.">
+        <input type="checkbox" ${on?'checked':''}
+          onchange="dpToggle('drivepool.place',this.checked)">
+        <span class="gname">fill the emptiest free disk</span>
+        <span class="gstate ${on?'on':'off'}">${on?'on':'off'}</span>
+      </label>
+    </div>
+    <div class="dim" style="font-size:11.5px;margin-top:4px;line-height:1.45">
+      ${last||'No commit has been placed yet this run.'}
+    </div>
+  </div>`;
+}
 function dpPrioHtml(d){
   const p = d.priority || {};
   const on = !!p.enabled;
@@ -26144,7 +26178,7 @@ function dpPaint(disks){
         <input type="checkbox" ${en?'checked':''} onchange="dpToggle('drivepool.enabled',this.checked)">
         <span class="gname">integration</span><span class="gstate ${en?'on':'off'}">${en?'on':'off'}</span>
       </label>
-    </div>` + dpPrioHtml(d);
+    </div>` + dpPrioHtml(d) + dpPlaceHtml(d);
   // ---- what it is doing now ------------------------------------------
   disks.forEach(x=>{ x._r=dpRate(x,''); });
   const emptying=disks.filter(x=>x._r<-2e6).sort((a,b)=>a._r-b._r).slice(0,3);
