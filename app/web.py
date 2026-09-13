@@ -26287,9 +26287,10 @@ function dpPaint(disks){
        display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-size:12.5px">
       <b style="flex:none">Balancing</b>
       <span class="pill ${svcUp?'p-ok':'p-warn'}" title="DrivePool's Windows service. The pool itself is a kernel driver and stays mounted either way.">service ${esc(B.service||'?')}</span>
-      <span class="pill ${B.auto===1?'p-warn':'p-ok'}"
+      <span class="pill ${B.on?'p-warn':'p-ok'}"
         title="DrivePool's own 'Automatic balancing' option - the radio on its Balancing settings page. nuarr reads and writes the same value.">${esc(B.auto_word||'unknown')}</span>
-      ${(B.moving||B.auto===1)
+      ${B.on?`<span class="dim" style="font-size:11.5px" title="DrivePool's own triggers, read from its store: a pass starts when the balance ratio falls under the first, or when at least the second needs moving${B.auto===2?', and not more often than the throttle':''}">runs when ratio &lt; ${Math.round((B.trigger_ratio||0)*100)}% or ≥ ${humanBytes(B.trigger_bytes||0)} to move${B.auto===2&&B.throttle?` · not more often than every ${(t=>{const [h,m]=t.split(':').map(Number);return (h?h+'h ':'')+(m?m+'m':'')||t;})(B.throttle)}`:''}</span>`:''}
+      ${(B.moving||B.on)
         ? `<button class="rmb" onclick="dpBalance('stop',this)"
              title="Stop the service (the move in progress is abandoned - DrivePool copies to a temporary name and cleans up on its next start), set 'do not balance automatically', and start the service again. About three seconds; the pool stays mounted throughout.">Stop balancing</button>`
         : `<button class="rmb" onclick="dpBalance('start',this)"

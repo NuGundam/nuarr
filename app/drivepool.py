@@ -903,7 +903,14 @@ def balancers() -> dict:
 # The option is edited only while the service is stopped, because the running
 # service owns that store and writes it back on its own schedule.
 SERVICE = "DrivePoolService"
-AUTO_WORD = {0: "do not balance automatically", 1: "balance immediately"}
+# THE RADIO ON DRIVEPOOL'S BALANCING PAGE, BY VALUE. Read off the store
+# against the window: with "Balance immediately" selected the store holds 2,
+# so 1 is the remaining choice, "balance every day at". nuarr had 1 down as
+# immediately, which made the page call a balancing pool "unknown" and the
+# Start button set the daily option instead.
+AUTO_WORD = {0: "do not balance automatically", 1: "balance every day at",
+             2: "balance immediately"}
+AUTO_IMMEDIATE = 2
 
 
 def service_state() -> str:
@@ -944,11 +951,35 @@ def balancing() -> dict:
         auto = int(auto)
     except (TypeError, ValueError):
         auto = None
+    word = AUTO_WORD.get(auto, "unknown")
+    tod = str(item.get("BalancingTimeOfDay") or "")
+    if auto == 1 and tod:
+        word += " " + tod[:5]
+    try:
+        ratio = float(item.get("CriticalBalanceRatio") or 0)
+    except (TypeError, ValueError):
+        ratio = 0.0
+    try:
+        cbytes = int(item.get("CriticalBalanceBytes") or 0)
+    except (TypeError, ValueError):
+        cbytes = 0
     return {"service": service_state(),
-            "auto": auto, "auto_word": AUTO_WORD.get(auto, "unknown"),
+            "auto": auto, "auto_word": word,
+            "on": auto in (1, 2),
             "allow_immediate": bool(item.get("AllowBalanceImmediately", True)),
             "throttle": str(item.get("ImmediateBalanceThrottle") or ""),
-            "time_of_day": str(item.get("BalancingTimeOfDay") or ""),
+            "time_of_day": tod,
+            # THE TRIGGERS, as the Balancing page shows them: a pass starts
+            # when the ratio falls under this, or this much needs moving.
+            "trigger_ratio": ratio, "trigger_bytes": cbytes,
+            # the file-placement settings underneath - whether the mover
+            # obeys placement rules, which is what decides if nuarr's own
+            # placement could ever be undone by a rule
+            "mover_obeys_rules": bool(item.get("FileMoverObeysFilePatternLimits", True)),
+            "rules_obey_limits": bool(item.get("FilePatternMoverObeysRealTimeLimits", True)),
+            "violate_on_empty": bool(item.get("FileMoverViolatesFilePatternLimitsOnDriveEmpty", True)),
+            "realtime_dup": bool(item.get("IsDuplicatingInRealTime", True)),
+            "read_striping": bool(item.get("ReadStriping", False)),
             "moving": "balancing" in moving(),
             "store": bool(_pool_options_path()),
             "last": dict(_BAL_LAST)}
@@ -984,7 +1015,7 @@ def _write_auto(auto: int) -> tuple:
         if int(item.get("AutoBalanceType", -1)) == int(auto):
             return True, "already set"
         item["AutoBalanceType"] = int(auto)
-        if auto == 1:
+        if auto == AUTO_IMMEDIATE:
             item["AllowBalanceImmediately"] = True
         tmp = p + ".nuarr.tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
@@ -1005,7 +1036,7 @@ def set_balancing(action: str) -> dict:
     action = (action or "").strip().lower()
     if action not in ("start", "stop"):
         return {"ok": False, "why": "action must be start or stop"}
-    auto = 1 if action == "start" else 0
+    auto = AUTO_IMMEDIATE if action == "start" else 0
     steps: list = []
     was = service_state()
     steps.append(f"service was {was}")
