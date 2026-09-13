@@ -364,6 +364,16 @@ def _read_events(path: str, mkv_track_id: int) -> dict | None:
                        capture_output=True, text=True, timeout=180)
         if r.returncode >= 2 or not os.path.exists(out):
             return None
+        # A PICTURE TRACK IS NOT A TRACK THIS CAN READ, and saying so is the
+        # whole point. Read as text a .sup is a stack of bitmaps with no
+        # "Dialogue:" and no "-->" in it, so this used to come back "0 events,
+        # nothing readable" and write that down - and a stored zero is what
+        # the duplicate sweep deletes a track for. Unreadable here means
+        # nothing is written at all.
+        with open(out, "rb") as fh:
+            head = fh.read(4096)
+        if head[:2] == b"PG" or b"\x00" in head:
+            return None
         with open(out, encoding="utf-8-sig", errors="replace") as fh:
             text = fh.read()
     except Exception:                                            # noqa: BLE001

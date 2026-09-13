@@ -65,10 +65,22 @@ SETTLE_S = 600.0
 
 
 def _groups(tracks: list) -> dict:
-    """{(language, kind): [tracks]} - the groups with more than one are the work."""
+    """{(language, kind, format): [tracks]} - more than one is the work.
+
+    FORMAT IS PART OF THE IDENTITY. A picture track and a text track of the
+    same language and kind are the same WORDS, not the same TRACK: one can be
+    searched, restyled and resized by the player and the other is bitmaps it
+    has to paint. Releases that ship both (a fansub ASS beside the disc's
+    official PGS) are shipping two usable things, and nuarr itself makes that
+    pair on purpose - subtitle OCR reads the pictures into text and leaves the
+    original in place, demoted. Grouping them together meant weighing 577 ASS
+    lines against a .sup nothing had read, which is not a comparison; it is
+    two numbers in different units, and the loser was deleted.
+    """
     out: dict = {}
     for t in tracks:
-        out.setdefault((t["lang"], t["class"]), []).append(t)
+        out.setdefault((t["lang"], t["class"], t.get("fmt") or "text"),
+                       []).append(t)
     return {k: v for k, v in out.items() if len(v) > 1}
 
 
@@ -82,7 +94,7 @@ def _probe_groups(file_id: int) -> dict:
                             (int(file_id),)).fetchone()
         if not r:
             return {}
-        from .subembed import _track_class
+        from .subembed import _fmt_of, _track_class
         seen: dict = {}
         for s in (json.loads(r["json"]).get("streams") or []):
             if s.get("codec_type") != "subtitle":
@@ -91,7 +103,8 @@ def _probe_groups(file_id: int) -> dict:
             disp = s.get("disposition") or {}
             k = (_lang_key(tags.get("language") or "und"),
                  _track_class(tags.get("title") or "",
-                              bool(disp.get("forced"))))
+                              bool(disp.get("forced"))),
+                 _fmt_of(s.get("codec_name") or ""))
             seen[k] = seen.get(k, 0) + 1
         return {k: v for k, v in seen.items() if v > 1}
     except Exception:                                            # noqa: BLE001
@@ -162,7 +175,9 @@ def candidates(limit: int = 100000) -> list[dict]:
         out.append({"file_id": int(r["id"]), "path": r["path"],
                     "library": r.get("library") or "",
                     "pool_disk": r.get("pool_disk") or "",
-                    "kinds": [f"{k[0]} {k[1]}" for k in g]})
+                    "kinds": [f"{k[0]} {k[1]}"
+                              + (" (picture)" if len(k) > 2 and k[2] == "picture"
+                                 else "") for k in g]})
     # AND ANY FILE WITH A TRACK ALREADY KNOWN TO BE EMPTY. The subtitle-title
     # check reads events off tracks it is suspicious of and writes the count
     # down; a zero there is a track nobody has to open a file to doubt. There
@@ -191,7 +206,54 @@ def candidates(limit: int = 100000) -> list[dict]:
 _PROG_RE = re.compile(r"(?:#GUI#progress\s+|Progress:\s*)(\d{1,3})\s*%")
 
 
-def _events(path: str, track_id: int, on_pid=None, on_pct=None) -> int:
+def _picture_events(out: str, d: str) -> int:
+    r"""Display sets in an extracted picture subtitle, or -1 if unreadable.
+
+    A .sup IS READABLE, JUST NOT AS TEXT. The text counter opens the extract
+    and looks for "Dialogue:" and "-->", finds neither in a stack of bitmaps,
+    and returns 0 - which every caller here reads as "there is nothing in this
+    track", the one verdict that deletes it. A PGS stream is a sequence of
+    segments, each "PG" then nine bytes of header then a size, and every
+    display set opens with a presentation composition segment (type 0x16);
+    counting those gives the same figure MediaInfo prints as "count of
+    elements". VobSub extracts as an .idx of timestamps beside the .sub, so
+    the timestamps are the count. Anything else returns -1, which means
+    unreadable rather than empty and never removes anything.
+    """
+    import glob as _g
+    try:
+        with open(out, "rb") as fh:
+            head = fh.read(2)
+            if head == b"PG":
+                fh.seek(0)
+                data = fh.read()
+                n, i, L = 0, 0, len(data)
+                while i + 13 <= L:
+                    if data[i:i + 2] != b"PG":
+                        return n if n else -1        # desynced: trust nothing
+                    if data[i + 10] == 0x16:         # presentation composition
+                        n += 1
+                    i += 13 + int.from_bytes(data[i + 11:i + 13], "big")
+                return n
+    except OSError:
+        return -1
+    # VobSub and friends: whatever else landed in the directory.
+    try:
+        for f in _g.glob(os.path.join(d, "*")):
+            if os.path.getsize(f) > 4 * 2**20:
+                continue                              # that is the bitmap half
+            with open(f, "r", encoding="utf-8", errors="replace") as fh:
+                txt = fh.read()
+            n = len(re.findall(r"^timestamp:", txt, re.M))
+            if n:
+                return n
+    except OSError:
+        pass
+    return -1
+
+
+def _events(path: str, track_id: int, on_pid=None, on_pct=None,
+            picture: bool = False) -> int:
     """How many subtitle events this track actually carries.
 
     EXTRACTED AND COUNTED, NOT ESTIMATED. Two tracks with the same language
@@ -246,6 +308,8 @@ def _events(path: str, track_id: int, on_pid=None, on_pct=None) -> int:
             return -1
         if not os.path.exists(out):
             return -1
+        if picture:
+            return _picture_events(out, d)
         txt = ""
         with open(out, "r", encoding="utf-8", errors="replace") as fh:
             txt = fh.read()
@@ -295,7 +359,7 @@ def plan_one(file_id: int) -> dict:
     for t in live:
         if t["id"] in dup_ids or t["class"] == "marker":
             continue
-        n = _events(path, t["id"])
+        n = _events(path, t["id"], picture=(t.get("fmt") == "picture"))
         if n == 0:
             drop.append({**t, "events": 0,
                          "lang_kind": f"{t['lang']} {t['class']}",
@@ -303,24 +367,31 @@ def plan_one(file_id: int) -> dict:
                                 "at all"})
         elif n > 0:
             keep.append({**t, "events": n,
-                         "lang_kind": f"{t['lang']} {t['class']}"})
+                         "lang_kind": f"{t['lang']} {t['class']}"
+                                      + (" picture" if t.get("fmt") == "picture"
+                                         else "")})
     if not g:
         if not drop:
             return {"ok": True, "path": path, "drop": [], "keep": keep,
                     "why": "no two tracks of the same language and kind, and "
                            "nothing empty"}
         return {"ok": True, "path": path, "drop": drop, "keep": keep}
-    for (lang, cls), tracks in sorted(g.items()):
-        counts = [(_events(path, t["id"]), t) for t in tracks]
+    for (lang, cls, fmt), tracks in sorted(g.items()):
+        counts = [(_events(path, t["id"],
+                           picture=(t.get("fmt") == "picture")), t)
+                  for t in tracks]
         # Most lines wins; a tie or an unreadable count keeps the first.
         counts.sort(key=lambda ct: (-(ct[0] if ct[0] >= 0 else -1),
                                     ct[1]["ord"]))
+        what = f"{lang} {cls}" + (" picture" if fmt == "picture" else "")
         keep.append({**counts[0][1], "events": counts[0][0],
-                     "lang_kind": f"{lang} {cls}"})
+                     "lang_kind": what})
         for n, t in counts[1:]:
-            drop.append({**t, "events": n, "lang_kind": f"{lang} {cls}",
-                         "why": f"a second {cls} {lang} track; keeping the "
-                                f"one with {counts[0][0]} lines"})
+            drop.append({**t, "events": n, "lang_kind": what,
+                         "why": f"a second {cls} {lang} "
+                                f"{'picture ' if fmt == 'picture' else ''}"
+                                f"track; keeping the one with "
+                                f"{counts[0][0]} lines"})
     return {"ok": True, "path": path, "drop": drop, "keep": keep}
 
 

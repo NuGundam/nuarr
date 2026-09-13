@@ -534,6 +534,37 @@ def _is_marker(title: str) -> bool:
     return "burned into the picture" in t
 
 
+# PICTURES OR WORDS - THE DISTINCTION EVERY DUPLICATE QUESTION TURNS ON.
+#
+# A PGS track and an ASS track can carry the same lines of the same dialogue
+# in the same language, and they are still not copies of each other: one is
+# text a player can search, restyle and resize, the other is a stack of
+# bitmaps it has to paint. nuarr itself keeps both on purpose - subtitle OCR
+# reads a picture track into text and leaves the original in place, demoted -
+# so anything that decides "these two are the same track twice" has to ask
+# this first. Accepts either spelling: ffprobe's codec_name (hdmv_pgs_subtitle)
+# or Matroska's codec id (S_HDMV/PGS).
+_IMG_NAMES = {"hdmv_pgs_subtitle", "pgssub", "dvd_subtitle", "dvdsub",
+              "dvb_subtitle", "dvbsub", "xsub"}
+_IMG_IDS = ("S_HDMV/PGS", "S_VOBSUB", "S_DVBSUB", "S_IMAGE/BMP", "S_HDMV/TEXTST")
+
+
+def is_picture_sub(codec: str) -> bool:
+    """True for a subtitle carried as images rather than as text."""
+    c = (codec or "").strip()
+    if not c:
+        return False
+    if c.lower() in _IMG_NAMES:
+        return True
+    u = c.upper().replace("\\", "/")
+    return any(u.startswith(x) for x in _IMG_IDS[:4]) and not u.startswith("S_TEXT")
+
+
+def _fmt_of(codec: str) -> str:
+    """'picture' or 'text' - the half of a track's identity codecs decide."""
+    return "picture" if is_picture_sub(codec) else "text"
+
+
 def _track_class(title: str, forced: bool) -> str:
     """The four kinds an embedded track can be, from its title and flags."""
     if _is_marker(title):
@@ -579,6 +610,8 @@ def _probe_sub_tracks(file_id: int) -> list:
             disp = st.get("disposition") or {}
             out.append({
                 "ord": n,
+                "codec": (st.get("codec_name") or "").lower(),
+                "fmt": _fmt_of(st.get("codec_name") or ""),
                 "lang": _lang_key(tags.get("language") or "und"),
                 "title": (tags.get("title") or "").strip(),
                 "class": _track_class(tags.get("title") or "",
@@ -612,6 +645,7 @@ def _live_sub_tracks(path: str) -> list:
         if t.get("type") != "subtitles":
             continue
         p = t.get("properties") or {}
+        codec = str(p.get("codec_id") or t.get("codec") or "")
         out.append({
             "id": t.get("id"),
             "ord": n,
@@ -619,6 +653,10 @@ def _live_sub_tracks(path: str) -> list:
             "title": (p.get("track_name") or "").strip(),
             "class": _track_class(p.get("track_name") or "",
                                   bool(p.get("forced_track"))),
+            # WHICH OF THE TWO FORMATS, carried so the duplicate question can
+            # be asked of like and like. See is_picture_sub().
+            "codec": codec,
+            "fmt": _fmt_of(codec),
         })
         n += 1
     return out

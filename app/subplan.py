@@ -427,13 +427,18 @@ def plan(f: dict, ctx: dict | None = None) -> dict:
         for t in tracks:
             if t["class"] == "marker":
                 continue
-            groups.setdefault((t["lang"], t["class"]), []).append(t)
-        taken = {(_lang_key(s["lang"]), s["cls"]) for s in steps
+            # FORMAT IS PART OF THE KEY. Pictures and text of the same
+            # language and kind are two usable things, not one thing twice -
+            # see subdupe._groups. A sidecar always arrives as text, so that
+            # is the half of the file a take can duplicate.
+            groups.setdefault((t["lang"], t["class"],
+                               _fmt(t.get("codec"))), []).append(t)
+        taken = {(_lang_key(s["lang"]), s["cls"], "text") for s in steps
                  if s["do"] == "take"}
-        for (lang, cls), ts in sorted(groups.items()):
+        for (lang, cls, fmt), ts in sorted(groups.items()):
             if len(ts) < 2:
                 continue
-            if (lang, cls) in taken:
+            if (lang, cls, fmt) in taken:
                 # A sidecar is going in as this language and kind in the same
                 # pass; what is duplicated will be different afterwards, so
                 # the duplicate question is asked of the file that results,
@@ -478,9 +483,10 @@ def plan(f: dict, ctx: dict | None = None) -> dict:
                     steps.append({"do": "dropdup", "ord": t["ord"],
                                   "lang": lang, "cls": cls,
                                   "lines": _lines(t),
-                                  "why": f"a second {cls} {lang} track; "
-                                         f"keeping the one with {best_n} "
-                                         f"lines"})
+                                  "why": f"a second {cls} {lang} "
+                                         f"{'picture ' if fmt == 'picture' else ''}"
+                                         f"track; keeping the one with "
+                                         f"{best_n} lines"})
             else:
                 # NOT KNOWN YET, AND NOT A QUESTION FOR A PERSON. Which copy
                 # is fuller is measurable - extract and count - so the worker
@@ -492,6 +498,11 @@ def plan(f: dict, ctx: dict | None = None) -> dict:
                                      f"they are counted before anything goes"})
         for t in tracks:
             if t["class"] == "marker" or _lines(t) != 0:
+                continue
+            # AND NEVER A PICTURE TRACK ON A TEXT READER'S WORD. Counting a
+            # .sup by looking for "Dialogue:" in it returns nothing, which is
+            # a fact about the reader and not about the track.
+            if _fmt(t.get("codec")) == "picture":
                 continue
             if any(s.get("ord") == t["ord"] for s in steps
                    if s["do"] == "dropdup"):
@@ -577,6 +588,11 @@ def plan(f: dict, ctx: dict | None = None) -> dict:
             "steps": steps, "asks": asks, "skips": skips,
             "n": len(steps), "rewrite": rewrite, "rev": ctx["rev"],
             "why": _sentence(steps, asks)}
+
+
+def _fmt(codec) -> str:
+    from .subembed import _fmt_of
+    return _fmt_of(codec or "")
 
 
 def _lines(t: dict) -> int:
