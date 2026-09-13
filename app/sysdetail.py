@@ -76,7 +76,9 @@ def cpu() -> dict:
         out["loadavg"] = [round(x, 2) for x in la]
     except Exception:                                        # noqa: BLE001
         out["loadavg"] = []
-    out["by_work"] = _by_work("cpu")
+    # cpu_pct, NOT cpu. proc_list carries cpu_pct, so the old key summed a
+    # field that was never there and every bar read 0%.
+    out["by_work"] = _by_work("cpu_pct")
     out["top"] = _top_procs("cpu_pct", 12)
     return out
 
@@ -276,6 +278,16 @@ def gpu() -> dict:
 
 
 def _encodes() -> list:
+    r"""Every job on the video path, and whether it is on the card at all.
+
+    NOT EVERY TRANSCODE IS AN ENCODE. A repack is a stream copy: it runs at
+    276 fps through the CPU and the disk and never touches NVENC, so listing
+    it with four empty encoder columns said "this is an encode nuarr cannot
+    describe" when the truth is "this is not an encode". The row now carries
+    what is actually running (the tool and the silicon, from the same
+    what_runs() the job cards use) and says plainly when there is no encoder
+    in the job.
+    """
     rows = []
     try:
         from . import jobs
@@ -284,6 +296,13 @@ def _encodes() -> list:
             if not d.get("venc") and d.get("kind") != "transcode":
                 continue
             v = d.get("venc") or {}
+            doing = d.get("doing") or {}
+            if isinstance(doing, dict):
+                tool, hw = doing.get("tool") or "", doing.get("hw") or ""
+                why = doing.get("why") or ""
+            else:
+                tool, hw, why = str(doing), "", ""
+            fam = (v.get("family") or "").lower()
             rows.append({"title": d.get("title") or d.get("file") or "",
                          "stage": d.get("stage") or "", "fps": d.get("fps"),
                          "speed": d.get("speed"),
@@ -291,7 +310,12 @@ def _encodes() -> list:
                          "encoder": v.get("encoder") or "",
                          "family": v.get("family") or "",
                          "preset": v.get("preset") or "",
-                         "cq": v.get("cq"), "doing": d.get("doing") or "",
+                         "cq": v.get("cq"),
+                         "tool": tool, "hw": hw, "why": why,
+                         "pool": d.get("pool") or "", "kind": d.get("kind") or "",
+                         # Whether this one is on the card. A stream copy is
+                         # not, and a CPU encoder is not either.
+                         "on_gpu": bool(fam and fam not in ("cpu", "x264", "x265")),
                          "eta_s": d.get("eta_s")})
     except Exception:                                        # noqa: BLE001
         pass
@@ -304,8 +328,9 @@ def disk() -> dict:
     out: dict = {"at": time.time()}
     hist = system.disks_history(SPARK)
     out["rows"] = hist
-    names = sorted({n for row in hist[-30:] for n in row["d"]}) if hist else []
-    out["disks"] = [{"name": n, "label": _label_for(n)} for n in names]
+    names = sorted({n for row in hist[-30:] for n in row["d"]},
+                   key=_disk_order) if hist else []
+    out["disks"] = [_named(n) for n in names]
     out["by_disk"] = _disk_now(hist)
     out["volumes"] = _volumes()
     out["files"] = _files_in_flight()
@@ -314,10 +339,84 @@ def disk() -> dict:
 
 
 _LABELS: dict = {}
+_NAMES: dict = {}
+_NAMES_AT = 0.0
 
 
-def _label_for(name: str) -> str:
-    """PhysicalDrive7 -> NU-DRIVE-3, where nuarr knows which is which."""
+def _win_names() -> dict:
+    r"""What WINDOWS calls each physical disk: its letters, volume labels and
+    the model on the label.
+
+    Five of the disks on this box are not pool members and not the cache, so
+    nuarr had no name for them and the page printed "PhysicalDrive12" - which
+    is a number, not an answer. Windows knows all of it: MSFT_Disk has the
+    model, MSFT_Partition maps a disk number to its drive letters, and
+    MSFT_Volume has the label somebody typed. One query each, asked at most
+    once a minute, through the same in-process WMI the disk-load sampler
+    already uses - no powershell.exe.
+    """
+    global _NAMES, _NAMES_AT
+    if _NAMES and time.time() - _NAMES_AT < 60:
+        return _NAMES
+    out: dict = {}
+    try:
+        from . import diskload
+        ST = "root\\Microsoft\\Windows\\Storage"
+        # TWO PROPERTIES, NOT FIVE. Asking MSFT_Disk for Size, BusType and
+        # MediaType alongside these returns an empty set on this build -
+        # no error, no rows - while the same query for Number and
+        # FriendlyName returns all seventeen. Measured, not assumed.
+        for r in diskload.wmi_query(
+                "SELECT Number, FriendlyName FROM MSFT_Disk", ST):
+            try:
+                n = int(r.Number)
+            except (TypeError, ValueError):
+                continue
+            out[f"PhysicalDrive{n}"] = {
+                "model": str(getattr(r, "FriendlyName", "") or "").strip(),
+                "letters": [], "labels": []}
+        letters: dict = {}
+        for r in diskload.wmi_query(
+                "SELECT DiskNumber, DriveLetter FROM MSFT_Partition", ST):
+            try:
+                n = int(r.DiskNumber)
+            except (TypeError, ValueError):
+                continue
+            # The storage namespace hands a drive letter back as a character
+            # CODE - 70 for F - and a partition without one as 0.
+            ch = getattr(r, "DriveLetter", None)
+            if isinstance(ch, int):
+                ch = chr(ch) if 65 <= ch <= 90 else ""
+            ch = str(ch or "").strip().strip("\x00").upper()
+            if not ch.isalpha():
+                continue
+            d = out.setdefault(f"PhysicalDrive{n}",
+                               {"model": "", "letters": [], "labels": []})
+            if ch not in d["letters"]:
+                d["letters"].append(ch)
+            letters.setdefault(ch, n)
+        # THE NAME SOMEBODY TYPED, from cimv2 rather than from MSFT_Volume.
+        # MSFT_Volume has the label and returns None for DriveLetter in the
+        # same projection, so there is nothing to join it to; Win32_LogicalDisk
+        # carries both in one row.
+        for r in diskload.wmi_query(
+                "SELECT DeviceID, VolumeName FROM Win32_LogicalDisk"):
+            dev = str(getattr(r, "DeviceID", "") or "").strip().rstrip(":")
+            lab = str(getattr(r, "VolumeName", "") or "").strip()
+            n = letters.get(dev.upper())
+            if n is None or not lab:
+                continue
+            d = out.get(f"PhysicalDrive{n}")
+            if d and lab not in d["labels"]:
+                d["labels"].append(lab)
+    except Exception:                                        # noqa: BLE001
+        pass
+    if out:
+        _NAMES, _NAMES_AT = out, time.time()
+    return _NAMES
+
+
+def _pool_labels() -> dict:
     if not _LABELS:
         try:
             from . import diskload, scanner
@@ -333,7 +432,59 @@ def _label_for(name: str) -> str:
                 _LABELS.setdefault(k, "the cache")
         except Exception:                                    # noqa: BLE001
             pass
-    return _LABELS.get(name, "")
+    return _LABELS
+
+
+def _label_for(name: str) -> str:
+    """PhysicalDrive7 -> NU-DRIVE-3, where nuarr knows which is which."""
+    return _pool_labels().get(name, "")
+
+
+def _named(name: str) -> dict:
+    """Everything there is to call this disk: nuarr's name, Windows', both."""
+    w = _win_names().get(name) or {}
+    letters = w.get("letters") or []
+    labs = w.get("labels") or []
+    mine = _label_for(name)
+    # WHAT TO LEAD WITH. nuarr's own name where it has one, because that is
+    # what every other panel calls it; otherwise the volume label somebody
+    # typed, then the drive letters, then the model on the case.
+    lead = mine or (labs[0] if labs else "") or \
+        (":, ".join(letters) + ":" if letters else "") or w.get("model") or name
+    bits = []
+    if letters:
+        bits.append(", ".join(f"{c}:" for c in letters))
+    if labs and labs[0] != lead:
+        bits.append(labs[0])
+    if w.get("model"):
+        bits.append(w["model"])
+    return {"name": name, "label": lead, "mine": bool(mine),
+            "note": " · ".join(bits), "model": w.get("model") or ""}
+
+
+def _disk_order(name: str):
+    """PhysicalDrive2 before PhysicalDrive10, and nuarr's own disks first.
+
+    SORTED BY NAME, NOT BY RATE. Ordering seventeen rows by how busy they are
+    means every row moves every second and the one you were reading is
+    somewhere else by the time you find it - which is the same complaint the
+    process table was rewritten for.
+    """
+    d = _named(name)
+    try:
+        n = int(name.replace("PhysicalDrive", ""))
+    except ValueError:
+        n = 9999
+    lab = d["label"]
+    # NU-DRIVE-2 before NU-DRIVE-10: the tail digits sort as a number.
+    tail = ""
+    for ch in reversed(lab):
+        if ch.isdigit():
+            tail = ch + tail
+        else:
+            break
+    return (0 if d["mine"] else 1, lab[:len(lab) - len(tail)].lower(),
+            int(tail) if tail else -1, n)
 
 
 def _disk_now(hist: list) -> list:
@@ -343,16 +494,15 @@ def _disk_now(hist: list) -> list:
     last = hist[-1]["d"]
     recent = hist[-10:]
     out = []
-    for name, v in sorted(last.items()):
+    for name, v in sorted(last.items(), key=lambda kv: _disk_order(kv[0])):
         vals = [row["d"].get(name) for row in recent if name in row["d"]]
         out.append({
-            "name": name, "label": _label_for(name),
+            **_named(name),
             "read_bps": v[0], "write_bps": v[1],
             "reads": v[2], "writes": v[3],
             "avg_read": sum(x[0] for x in vals) / len(vals) if vals else 0.0,
             "avg_write": sum(x[1] for x in vals) / len(vals) if vals else 0.0,
         })
-    out.sort(key=lambda d: -(d["read_bps"] + d["write_bps"]))
     return out
 
 
@@ -374,8 +524,9 @@ def _volumes() -> list:
     for path, kind in ((SETTINGS.cache_dir, "cache"),):
         try:
             u = shutil.disk_usage(path)
-            out.append({"label": os.path.splitdrive(os.path.abspath(path))[0]
-                        or path, "total": u.total, "used": u.used,
+            drive = os.path.splitdrive(os.path.abspath(path))[0] or path
+            out.append({"label": "the cache", "note": drive,
+                        "total": u.total, "used": u.used,
                         "free": u.free, "kind": kind})
         except OSError:
             pass

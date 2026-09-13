@@ -26086,23 +26086,42 @@ function tmGpuView(H){
         <span style="color:${col}">${n}</span><b class="mono">${tmPct(v)}</b></div>
       ${tmBar(v, col, 7)}</div>`).join('');
   const enc = (D.encodes||[]);
+  // A REPACK IS NOT AN ENCODE. It runs at 276 fps because it is a stream
+  // copy - the card never sees it - and printing four empty encoder columns
+  // beside it said "an encode nuarr cannot describe" instead of "not an
+  // encode". Each row now says what is actually running and on what.
   const encTable = enc.length ? `<table style="width:100%;font-size:11.5px;
-      border-collapse:collapse"><thead><tr class="dim" style="font-size:10px;
+      border-collapse:collapse;table-layout:fixed">
+      <colgroup><col style="width:auto"><col style="width:17%"><col style="width:13%">
+        <col style="width:9%"><col style="width:6%"><col style="width:8%">
+        <col style="width:8%"><col style="width:7%"></colgroup>
+      <thead><tr class="dim" style="font-size:10px;
       letter-spacing:.05em;text-transform:uppercase">
-      <th style="text-align:left;padding:3px 6px">file</th><th>encoder</th>
+      <th style="text-align:left;padding:3px 6px">file</th>
+      <th style="text-align:left">running</th><th>encoder</th>
       <th>preset</th><th>cq</th><th>fps</th><th>speed</th><th>done</th></tr></thead>
       <tbody>${enc.map(e=>`<tr style="border-top:1px solid var(--line)">
-        <td style="padding:3px 6px;max-width:0;overflow:hidden;
-            text-overflow:ellipsis;white-space:nowrap">${esc(e.title)}
-          <span class="dim">${esc(e.stage||'')}</span></td>
-        <td class="mono c" style="text-align:center">${esc(e.encoder||e.family||e.doing||'—')}</td>
-        <td class="mono c" style="text-align:center">${esc(e.preset||'—')}</td>
-        <td class="mono c" style="text-align:center">${e.cq!=null?e.cq:'—'}</td>
-        <td class="mono c" style="text-align:center">${e.fps||'—'}</td>
-        <td class="mono c" style="text-align:center">${e.speed?e.speed+'×':'—'}</td>
-        <td class="mono c" style="text-align:center">${Math.round((e.progress||0)*100)}%</td>
-      </tr>`).join('')}</tbody></table>`
-    : '<div class="dim" style="font-size:11.5px">nuarr is not encoding anything right now</div>';
+        <td style="padding:3px 6px;overflow:hidden;
+            text-overflow:ellipsis;white-space:nowrap">${tmPill(e.pool||e.kind)}
+          ${esc(e.title)}
+          <span class="dim">${esc(e.stage?'— '+e.stage:'')}</span></td>
+        <td style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+            title="${esc(e.why||'')}"><span class="mono">${esc(e.tool||'—')}</span>
+          ${e.hw?`<span style="color:${e.on_gpu?'#e8a33d':'var(--dim,#8a97a6)'};
+            font-size:10.5px"> ${esc(e.hw)}</span>`:''}</td>
+        <td class="mono" style="text-align:center;color:${e.encoder?'inherit':'var(--dim,#8a97a6)'}">${
+          esc(e.encoder||e.family||'stream copy')}</td>
+        <td class="mono" style="text-align:center">${esc(e.preset||'—')}</td>
+        <td class="mono" style="text-align:center">${e.cq!=null?e.cq:'—'}</td>
+        <td class="mono" style="text-align:center">${e.fps||'—'}</td>
+        <td class="mono" style="text-align:center">${e.speed?e.speed+'×':'—'}</td>
+        <td class="mono" style="text-align:center">${Math.round((e.progress||0)*100)}%</td>
+      </tr>`).join('')}</tbody></table>
+      ${enc.some(e=>e.on_gpu)?'':`<div class="dim" style="font-size:10.5px;
+        margin-top:4px">none of these is on the card — a stream copy is read,
+        remuxed and written without an encoder, which is why the engines above
+        are idle while this list is not</div>`}`
+    : '<div class="dim" style="font-size:11.5px">nothing is on the video path right now</div>';
   const procs = (D.procs||[]);
   return tmBack('Graphics')
     + tmFigs(figs)
@@ -26116,7 +26135,8 @@ function tmGpuView(H){
           {name:'cores',   colour:'#5ad1c4', get:r=>r.gpu, fill:false},
           {name:'card memory', colour:'#8b949e', fill:false, axis:'right',
            get:r=>r.gpu_mem, fmt:v=>v?Math.round(v)+' MB':'—'}], {max:100, peak:true}))
-    + tmSection('What nuarr is asking of it', 'every encode running now, with the encoder and preset it was given',
+    + tmSection('What nuarr is asking of it',
+        'every job on the video path — an encode uses NVENC, a repack is a stream copy and never touches it',
         encTable)
     + tmSection('Everything on the card',
         D.per_proc_vram ? 'with the memory each holds'
@@ -26140,11 +26160,15 @@ function tmDiskView(H){
   ];
   const diskRows = by.map(d=>{
     const series = rows.map(r=>(r.d[d.name]||[0,0])[0] + (r.d[d.name]||[0,0])[1]);
-    const col = (typeof diskColor==='function' && d.label) ? diskColor(d.label) : '#58a6ff';
+    // nuarr's own disks keep the colour every other panel gives them; the
+    // rest are grey, because a colour that means nothing elsewhere would
+    // read as if it did.
+    const col = (d.mine && typeof diskColor==='function') ? diskColor(d.label) : '#8b949e';
     return `<tr style="border-top:1px solid var(--line)">
-      <td style="padding:4px 6px;white-space:nowrap">
+      <td style="padding:4px 6px;white-space:nowrap;overflow:hidden;
+          text-overflow:ellipsis" title="${esc(d.name)}${d.model?' — '+esc(d.model):''}">
         <b style="color:${col}">${esc(d.label||d.name)}</b>
-        ${d.label?`<span class="dim" style="font-size:10px"> ${esc(d.name)}</span>`:''}</td>
+        ${d.note?`<span class="dim" style="font-size:10px"> ${esc(d.note)}</span>`:''}</td>
       <td style="width:26%">${tmSpark(series, col)}</td>
       <td class="mono" style="text-align:right;color:#58a6ff">${tmBps(d.read_bps)}</td>
       <td class="mono" style="text-align:right;color:#f0883e">${tmBps(d.write_bps)}</td>
@@ -26157,7 +26181,7 @@ function tmDiskView(H){
     const col = (typeof diskColor==='function' && v.kind==='pool') ? diskColor(v.label) : '#8b949e';
     return `<tr><td style="padding:3px 6px;white-space:nowrap">
         <b style="color:${col}">${esc(v.label)}</b>
-        ${v.kind!=='pool'?`<span class="dim" style="font-size:10px"> ${esc(v.kind)}</span>`:''}</td>
+        ${v.note?`<span class="dim" style="font-size:10px"> ${esc(v.note)}</span>`:''}</td>
       <td style="width:52%">${tmBar(pct, pct>90?'#f0883e':col, 7)}</td>
       <td class="mono" style="text-align:right;white-space:nowrap">${tmSize(v.free)} free</td>
       <td class="mono dim" style="text-align:right;white-space:nowrap">${Math.round(pct)}% of ${tmSize(v.total)}</td>
