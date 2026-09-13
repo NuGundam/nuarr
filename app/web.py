@@ -25577,13 +25577,28 @@ function dpDur(s){ s=Math.max(0,Math.round(s)); return s>=3600?`${Math.floor(s/3
 // choice when its balancer places by something other than free space.
 function dpPlaceHtml(d){
   const p=d.placement||{}; const on=!!(d.toggles||{})['drivepool.place'];
-  const L=p.last||{};
   const verdict=!on?'off — DrivePool chooses'
     :(p.may_place?`on — the emptiest disk not in use, by ${esc(p.by||'')}`
       :`on, but stepping back: ${esc(p.why||'')}`);
-  const last=L.at?`last: <b style="color:${L.placed?'var(--ok)':'var(--dim,#8a97a6)'}">${
-      L.placed?`placed on <span style="color:${diskColor(L.chosen)}">${esc(L.chosen)}</span>`:'left to DrivePool'}</b>
-      <span class="dim">— ${esc(L.why||'')} · ${esc(L.file||'')} · ${dpDur(Math.max(0,Date.now()/1000-L.at))} ago</span>`:'';
+  // ONE ROW PER DECISION, THE LAST FOUR. The single sentence had the disk,
+  // the reason, the percentage, the whole filename and the age run together
+  // in one line of grey; the same facts in columns read at a glance, and
+  // four of them say whether every commit is landing on the same spindle.
+  const rec=(p.recent&&p.recent.length)?p.recent:(p.last&&p.last.at?[p.last]:[]);
+  const rows=rec.map(L=>{
+    const m=/at (\d+)% \(([\d,]+ GB free)\)/.exec(L.why||'');
+    const where=L.placed
+      ? `<b style="color:${diskColor(L.chosen)}">${esc(L.chosen)}</b>`
+        +(L.from?`<span class="dim"> from </span><span style="color:${diskColor(L.from)}">${esc(L.from)}</span>`:'')
+      : `<span class="dim">stayed${L.from?' on ':''}</span>${L.from?`<span style="color:${diskColor(L.from)}">${esc(L.from)}</span>`:''}`;
+    const why=L.placed&&m ? `${m[1]}% full · ${m[2]}` : esc(L.why||'');
+    return `<tr>
+      <td class="mono dim" style="padding:2px 8px 2px 0;white-space:nowrap;font-size:10.5px">${dpDur(Math.max(0,Date.now()/1000-L.at))} ago</td>
+      <td style="padding:2px 8px 2px 0;white-space:nowrap">${where}</td>
+      <td class="dim" style="padding:2px 8px 2px 0;white-space:nowrap;font-size:11px" title="${esc(L.why||'')}">${why}</td>
+      <td style="padding:2px 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:0" title="${esc(L.file||'')}">${esc(L.file||'')}</td>
+    </tr>`;
+  }).join('');
   return `<div class="lkind" style="padding:10px 12px;margin-top:8px">
     <div style="display:flex;gap:12px;align-items:baseline;flex-wrap:wrap">
       <b style="color:#6fb0ff">Where a commit lands</b>
@@ -25596,9 +25611,10 @@ function dpPlaceHtml(d){
         <span class="gstate ${on?'on':'off'}">${on?'on':'off'}</span>
       </label>
     </div>
-    <div class="dim" style="font-size:11.5px;margin-top:4px;line-height:1.45">
-      ${last||'No commit has been placed yet this run.'}
-    </div>
+    ${rows?`<table style="width:100%;font-size:12px;border-collapse:collapse;margin-top:6px;table-layout:fixed">
+      <colgroup><col style="width:70px"><col style="width:230px"><col style="width:190px"><col style="width:auto"></colgroup>
+      <tbody>${rows}</tbody></table>`
+      :'<div class="dim" style="font-size:11.5px;margin-top:4px">No commit has been placed yet this run.</div>'}
   </div>`;
 }
 function dpPrioHtml(d){

@@ -60,6 +60,12 @@ MARGIN_FRACTION = 0.02
 # The last decision, for the page: {at, file, chosen, from, why, placed}
 LAST: dict = {"at": 0.0, "file": "", "chosen": "", "from": "", "why": "",
               "placed": False}
+# THE LAST FEW, NOT JUST THE LAST. One line answers "what did it just do";
+# four answer "is it doing the same thing every time" - the question that
+# says whether the emptiest disk is soaking up every commit or the choice
+# is spreading. Newest first.
+RECENT: list = []
+RECENT_MAX = 4
 _USAGE: dict = {"at": 0.0, "data": {}}
 
 
@@ -198,6 +204,8 @@ def choose(target: str, size: int, pool_root: str = "P:\\") -> tuple:
 def _note(target: str, chosen: str, src: str, why: str, placed: bool) -> None:
     LAST.update(at=time.time(), file=os.path.basename(target or ""),
                 chosen=chosen, **{"from": src}, why=why, placed=placed)
+    RECENT.insert(0, dict(LAST))
+    del RECENT[RECENT_MAX:]
 
 
 def landed(target: str, label: str) -> None:
@@ -218,7 +226,8 @@ def status() -> dict:
     ok, why = _balancer_verdict() if enabled() else (False, "placement is off")
     return {"enabled": enabled(), "may_place": ok, "why": why,
             "by": "percent used" if _by_percent() else "free space",
-            "ceiling": _fill_ceiling(), "last": dict(LAST)}
+            "ceiling": _fill_ceiling(), "last": dict(LAST),
+            "recent": [dict(r) for r in RECENT]}
 
 
 def register() -> None:
