@@ -61,11 +61,11 @@ MARGIN_FRACTION = 0.02
 LAST: dict = {"at": 0.0, "file": "", "chosen": "", "from": "", "why": "",
               "placed": False}
 # THE LAST FEW, NOT JUST THE LAST. One line answers "what did it just do";
-# four answer "is it doing the same thing every time" - the question that
+# five answer "is it doing the same thing every time" - the question that
 # says whether the emptiest disk is soaking up every commit or the choice
-# is spreading. Newest first.
+# is spreading. Newest first; the page leads with it and lists the rest.
 RECENT: list = []
-RECENT_MAX = 4
+RECENT_MAX = 5
 _USAGE: dict = {"at": 0.0, "data": {}}
 
 

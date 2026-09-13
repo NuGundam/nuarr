@@ -25577,44 +25577,72 @@ function dpDur(s){ s=Math.max(0,Math.round(s)); return s>=3600?`${Math.floor(s/3
 // choice when its balancer places by something other than free space.
 function dpPlaceHtml(d){
   const p=d.placement||{}; const on=!!(d.toggles||{})['drivepool.place'];
-  const verdict=!on?'off — DrivePool chooses'
+  const verdict=!on?'off — DrivePool chooses the disk'
     :(p.may_place?`on — the emptiest disk not in use, by ${esc(p.by||'')}`
       :`on, but stepping back: ${esc(p.why||'')}`);
-  // ONE ROW PER DECISION, THE LAST FOUR. The single sentence had the disk,
-  // the reason, the percentage, the whole filename and the age run together
-  // in one line of grey; the same facts in columns read at a glance, and
-  // four of them say whether every commit is landing on the same spindle.
   const rec=(p.recent&&p.recent.length)?p.recent:(p.last&&p.last.at?[p.last]:[]);
-  const rows=rec.map(L=>{
+  // TO, THEN FROM. The disk the file ended up on is the answer; where it came
+  // from is context, and leading with "placed on X ... from Y" put the two the
+  // wrong way round for a sentence that is read left to right.
+  const where=(L,big)=>{
+    const sz=big?'':'font-size:11.5px';
+    if(!L.placed) return `<span class="dim" style="${sz}">stayed${
+      L.from?' on ':''}</span>${L.from?`<span style="color:${diskColor(L.from)};${sz}">${esc(L.from)}</span>`:''}`;
+    return `<span class="dim" style="${sz}">to </span>`
+      + `<b style="color:${diskColor(L.chosen)};${sz}">${esc(L.chosen)}</b>`
+      + (L.from?`<span class="dim" style="${sz}"> from </span>`
+         + `<span style="color:${diskColor(L.from)};${sz}">${esc(L.from)}</span>`:'');
+  };
+  const fullness=L=>{
     const m=/at (\d+)% \(([\d,]+ GB free)\)/.exec(L.why||'');
-    const where=L.placed
-      ? `<b style="color:${diskColor(L.chosen)}">${esc(L.chosen)}</b>`
-        +(L.from?`<span class="dim"> from </span><span style="color:${diskColor(L.from)}">${esc(L.from)}</span>`:'')
-      : `<span class="dim">stayed${L.from?' on ':''}</span>${L.from?`<span style="color:${diskColor(L.from)}">${esc(L.from)}</span>`:''}`;
-    const why=L.placed&&m ? `${m[1]}% full · ${m[2]}` : esc(L.why||'');
-    return `<tr>
-      <td class="mono dim" style="padding:2px 8px 2px 0;white-space:nowrap;font-size:10.5px">${dpDur(Math.max(0,Date.now()/1000-L.at))} ago</td>
-      <td style="padding:2px 8px 2px 0;white-space:nowrap">${where}</td>
-      <td class="dim" style="padding:2px 8px 2px 0;white-space:nowrap;font-size:11px" title="${esc(L.why||'')}">${why}</td>
-      <td style="padding:2px 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:0" title="${esc(L.file||'')}">${esc(L.file||'')}</td>
-    </tr>`;
-  }).join('');
+    return (L.placed&&m) ? `${m[1]}% full · ${m[2]}` : esc(L.why||'');
+  };
+  const head=rec[0], rest=rec.slice(1);
+  // THE LATEST IS THE ONE BEING WATCHED, so it is a line of its own above the
+  // rule rather than the first row of a list where it looks like history.
+  const lead=head?`<div style="display:flex;gap:10px;align-items:baseline;
+      flex-wrap:wrap;margin-top:7px;font-size:13px">
+      <span class="dim" style="font-size:11px;min-width:62px">latest</span>
+      ${where(head,true)}
+      <span class="dim" style="font-size:11.5px">${fullness(head)}</span>
+      <span class="dim" style="font-size:11.5px;margin-left:auto">${
+        dpDur(Math.max(0,Date.now()/1000-head.at))} ago</span>
+    </div>
+    <div style="font-size:11.5px;color:#8fa3b8;overflow:hidden;
+        text-overflow:ellipsis;white-space:nowrap;margin-top:1px"
+        title="${esc(head.file||'')}">${esc(head.file||'')}</div>`:'';
+  const rows=rest.map(L=>`<tr>
+      <td class="mono dim" style="padding:2px 10px 2px 0;white-space:nowrap;
+          font-size:10.5px;width:62px">${dpDur(Math.max(0,Date.now()/1000-L.at))} ago</td>
+      <td style="padding:2px 10px 2px 0;white-space:nowrap">${where(L)}</td>
+      <td class="dim" style="padding:2px 10px 2px 0;white-space:nowrap;
+          font-size:11px" title="${esc(L.why||'')}">${fullness(L)}</td>
+      <td style="padding:2px 0;overflow:hidden;text-overflow:ellipsis;
+          white-space:nowrap;max-width:0;font-size:11px;color:#8fa3b8"
+          title="${esc(L.file||'')}">${esc(L.file||'')}</td>
+    </tr>`).join('');
   return `<div class="lkind" style="padding:10px 12px;margin-top:8px">
     <div style="display:flex;gap:12px;align-items:baseline;flex-wrap:wrap">
-      <b style="color:#6fb0ff">Where a commit lands</b>
+      <b style="color:#6fb0ff">Nuarr picks the disk</b>
       <span style="color:${on?(p.may_place?'var(--ok)':'var(--warn)'):'var(--dim,#8a97a6)'};font-size:12px">${verdict}</span>
       <label class="gsw" style="margin-left:auto"
-        title="The finished file is copied from the cache straight into the PoolPart of the emptiest member disk that no viewer is on and the load counters do not call busy, with 20 GB to spare and under Prevent Drive Overfill's line when that is on. DrivePool keeps no record of where a file is - the PoolPart it sits in IS the record - so the pool shows it there at once. With the balancer on and placing by free space (Disk Space Equalizer, All In One) the two agree; with Ordered File Placement, the SSD Optimizer or the Drive Usage Limiter on, DrivePool chooses as before.">
+        title="NUARR'S OWN PLACEMENT, not DrivePool's. The finished file is copied from the cache straight into the PoolPart of the emptiest member disk that no viewer is on and the load counters do not call busy, with 20 GB to spare and under Prevent Drive Overfill's line when that is on. DrivePool keeps no record of where a file is - the PoolPart it sits in IS the record - so the pool shows it there at once. With the balancer on and placing by free space (Disk Space Equalizer, All In One) the two agree; with Ordered File Placement, the SSD Optimizer or the Drive Usage Limiter on, nuarr steps back and DrivePool chooses as before.">
         <input type="checkbox" ${on?'checked':''}
           onchange="dpToggle('drivepool.place',this.checked)">
         <span class="gname">fill the emptiest free disk</span>
         <span class="gstate ${on?'on':'off'}">${on?'on':'off'}</span>
       </label>
     </div>
-    ${rows?`<table style="width:100%;font-size:12px;border-collapse:collapse;margin-top:6px;table-layout:fixed">
-      <colgroup><col style="width:70px"><col style="width:230px"><col style="width:190px"><col style="width:auto"></colgroup>
-      <tbody>${rows}</tbody></table>`
-      :'<div class="dim" style="font-size:11.5px;margin-top:4px">No commit has been placed yet this run.</div>'}
+    <div class="dim" style="font-size:11px;margin-top:2px">nuarr chooses the
+      spindle for every file it commits and writes it there itself — DrivePool
+      is told nothing and moves nothing</div>
+    ${lead}
+    ${rows?`<table style="width:100%;font-size:12px;border-collapse:collapse;
+      margin-top:6px;padding-top:6px;border-top:1px solid var(--line);
+      table-layout:fixed"><colgroup><col style="width:62px">
+        <col style="width:240px"><col style="width:190px"><col style="width:auto">
+      </colgroup><tbody>${rows}</tbody></table>`:''}
+    ${rec.length?'':'<div class="dim" style="font-size:11.5px;margin-top:4px">No commit has been placed yet this run.</div>'}
   </div>`;
 }
 function dpPrioHtml(d){
