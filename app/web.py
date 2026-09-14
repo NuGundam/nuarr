@@ -32503,15 +32503,24 @@ async function loadProcess(){
 // truncated to what actually fits rather than trusted to be short.
 const _PIPE_W=196, _PIPE_H=56, _PIPE_GX=346, _PIPE_GY=104, _PIPE_PAD=16;
 const _PIPE_GAP=_PIPE_GX-_PIPE_W;
-function pipeXY(n){
-  return {x:_PIPE_PAD+n.col*_PIPE_GX, y:_PIPE_PAD+n.row*_PIPE_GY};
+// A SECOND GEOMETRY, FOR A CHAIN RATHER THAN A FAN. The order graph is seven
+// boxes in a straight line: at the main grid that is 2,304px, which the page
+// then scales into the panel and takes every label down with it - 12px became
+// 8. Narrower boxes and a shorter gap fit the same seven across without
+// scaling, and a chain needs no room for branch labels.
+const _PIPE_TIGHT={w:158, h:52, gx:232, gy:92, pad:14};
+const _PIPE_WIDE ={w:_PIPE_W, h:_PIPE_H, gx:_PIPE_GX, gy:_PIPE_GY, pad:_PIPE_PAD};
+function pipeXY(n, g){
+  g = g || _PIPE_WIDE;
+  return {x:g.pad+n.col*g.gx, y:g.pad+n.row*g.gy};
 }
 // The drawn width of a graph, so the wrapper can be given a definite size.
 // An inline-block sized by a child's max-width collapses instead of measuring,
 // which is how the centred pair ended up squeezed into a column.
-function pipeWidth(g){
+function pipeWidth(g, geo){
+  geo = geo || _PIPE_WIDE;
   const maxCol=Math.max(...(g.nodes||[{col:0}]).map(n=>n.col));
-  return _PIPE_PAD*2+maxCol*_PIPE_GX+_PIPE_W;
+  return geo.pad*2+maxCol*geo.gx+geo.w;
 }
 function pipeNodeColor(n){
   if(n.kind==='pool')  return poolColor(n.pool||'');
@@ -32525,13 +32534,15 @@ function pipeNodeColor(n){
   if(n.kind==='source')return '#6fb0ff';
   return 'var(--ok)';
 }
-function pipeSvg(g, route, idPrefix){
+function pipeSvg(g, route, idPrefix, geo){
+  geo = geo || _PIPE_WIDE;
+  const GAP = geo.gx - geo.w;
   const nodes=g.nodes, edges=g.edges;
   const byId={}; nodes.forEach(n=>byId[n.id]=n);
   const maxCol=Math.max(...nodes.map(n=>n.col));
   const maxRow=Math.max(...nodes.map(n=>n.row));
-  const W=_PIPE_PAD*2+maxCol*_PIPE_GX+_PIPE_W;
-  const H=_PIPE_PAD*2+maxRow*_PIPE_GY+_PIPE_H;
+  const W=geo.pad*2+maxCol*geo.gx+geo.w;
+  const H=geo.pad*2+maxRow*geo.gy+geo.h;
   const on=new Set(route||[]);
   const lit=(a,b)=>{
     if(!route||!route.length) return false;
@@ -32543,8 +32554,8 @@ function pipeSvg(g, route, idPrefix){
   edges.forEach((e,i)=>{
     const A=byId[e.a], B=byId[e.b];
     if(!A||!B) return;
-    const p=pipeXY(A), q=pipeXY(B);
-    const x1=p.x+_PIPE_W, y1=p.y+_PIPE_H/2, x2=q.x, y2=q.y+_PIPE_H/2;
+    const p=pipeXY(A, geo), q=pipeXY(B, geo);
+    const x1=p.x+geo.w, y1=p.y+geo.h/2, x2=q.x, y2=q.y+geo.h/2;
     const mx=(x1+x2)/2;
     const d=`M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}`;
     const isLit=lit(e.a,e.b);
@@ -32556,7 +32567,7 @@ function pipeSvg(g, route, idPrefix){
     if(e.label){
       // ~5.1px per character at 9.5px in this face; clip to the gap so a long
       // condition never reaches out over the boxes either side of it.
-      const room=Math.max(8, Math.floor(_PIPE_GAP/5.1));
+      const room=Math.max(8, Math.floor(GAP/5.1));
       const txt=e.label.length>room ? e.label.slice(0,room-1)+'…' : e.label;
       svg+=`<text x="${mx}" y="${(y1+y2)/2-7}" text-anchor="middle"
          font-size="9.5" fill="${isLit?'#6fb0ff':'var(--dim)'}"
@@ -32577,18 +32588,18 @@ function pipeSvg(g, route, idPrefix){
     }
   });
   nodes.forEach(n=>{
-    const p=pipeXY(n), c=pipeNodeColor(n);
+    const p=pipeXY(n, geo), c=pipeNodeColor(n);
     const isOn=on.has(n.id);
     svg+=`<g class="pipeNode" style="cursor:help">
       <title>${esc(n.note||'')}</title>
-      <rect x="${p.x}" y="${p.y}" width="${_PIPE_W}" height="${_PIPE_H}" rx="9"
+      <rect x="${p.x}" y="${p.y}" width="${geo.w}" height="${geo.h}" rx="9"
         fill="${isOn?'#16324e':'#141922'}"
         stroke="${isOn?'#6fb0ff':c}" stroke-width="${isOn?2:1.1}"
         opacity="${n.kind==='idle'&&!isOn?0.55:1}"/>
-      <text x="${p.x+12}" y="${p.y+22}" font-size="12" font-weight="600"
-        fill="${isOn?'#cfe6ff':c}">${esc(n.label)}</text>
+      <text x="${p.x+11}" y="${p.y+(geo.h>54?22:20)}" font-size="12"
+        font-weight="600" fill="${isOn?'#cfe6ff':c}">${esc(n.label)}</text>
       ${n.count===null||n.count===undefined?'':
-        `<text x="${p.x+12}" y="${p.y+40}" font-size="11.5"
+        `<text x="${p.x+11}" y="${p.y+(geo.h>54?40:38)}" font-size="11.5"
            fill="var(--dim)">${fmt(n.count)}</text>`}
     </g>`;
   });
@@ -32651,21 +32662,41 @@ function pipeDraw(){
          most of why they are on the same page. -->
     <div style="overflow-x:auto;display:flex;justify-content:center">
       <div style="width:${Math.max(pipeWidth(_pipe),
+                    _pipe.order?pipeWidth(_pipe.order,_PIPE_TIGHT):0,
                     _pipe.checks?pipeWidth(_pipe.checks):0)}px;max-width:100%;flex:0 0 auto">
         ${pipeSvg(_pipe, r?r.path:null, 'a')}
-        <div class="lkindhead" style="margin:14px 0 6px"><b style="color:#6fb0ff">
+        ${(_pipe.order&&(_pipe.order.nodes||[]).length)?`
+        <div class="lkindhead" style="margin:18px 0 2px"><b style="color:#6fb0ff">
+          The order they take it in — and why it is an order</b></div>
+        <div class="dim" style="font-size:11.5px;margin:0 0 8px;max-width:820px">
+          Seven systems feed the one queue and each decides on its own what to
+          do to a file. Nothing stopped them doing it in the wrong order, and
+          the wrong order is how the same file gets rewritten three times: the
+          rewrite keeps and drops audio by its language tags, so a tag that is
+          wrong gives a wrong plan and the listener finds it afterwards; the
+          OCR reads a picture track for a minute and the rewrite then drops it;
+          a subtitle fix is planned against tracks the rewrite moves. So a job
+          of one kind is not queued for a file while an earlier kind still owes
+          an answer on it — and the thing it is waiting for jumps to the front
+          of its own queue. Nothing starves: a paused pool is not owed, and a
+          file that has waited six hours goes anyway.</div>
+        ${pipeSvg(_pipe.order, null, 'o', _PIPE_TIGHT)}`:''}
+        <div class="lkindhead" style="margin:18px 0 6px"><b style="color:#6fb0ff">
           Picture subtitles — the branch with a measurement behind it</b></div>
         ${pipeSvg(_pipe.sub, r?r.sub_path:null, 'b')}
         ${_pipe.checks?`
         <div class="lkindhead" style="margin:18px 0 2px"><b style="color:#6fb0ff">
           After it lands — the checks that keep looking</b></div>
         <div class="dim" style="font-size:11.5px;margin:0 0 8px;max-width:760px">
-          These do not run on the way past. They run on their own clocks over
-          files that were committed weeks ago, because a file can stop being
-          what it claims to be long after nuarr last touched it. What they have
-          in common is where they end: one remedy layer, one policy table
-          deciding what may be done about each kind of finding, and one hourly
-          budget shared between all of them.</div>
+          These run on their own clocks over files that were committed weeks
+          ago, because a file can stop being what it claims to be long after
+          nuarr last touched it. Three of them — the decode check, the
+          listener and the subtitle reader — are also the prerequisites in the
+          flow above: the same system, asked once on the way past and again
+          months later. What they all have in common is where they end: one
+          remedy layer, one policy table deciding what may be done about each
+          kind of finding, and one hourly budget shared between all of
+          them.</div>
         ${pipeSvg(_pipe.checks, null, 'c')}`:''}
       </div>
     </div>`;

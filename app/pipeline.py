@@ -28,7 +28,30 @@ except Exception:                                            # noqa: BLE001
 
 # One place for the shape. Positions are a grid the page turns into pixels -
 # column, row - so re-laying-out the diagram does not mean touching the labels.
-_COLS = ["found", "read", "decided", "waiting", "working", "kept"]
+_COLS = ["found", "read", "decided", "known", "waiting", "working", "kept"]
+
+# THE ORDER THE SYSTEMS TAKE A FILE IN, read from precedence.py rather than
+# retyped here - the whole point of this module. Each is (kind, label, note).
+_FACT_WORDS = {
+    "decode":  ("Does it decode?",
+                "the first 20 and last 25 seconds are actually decoded. A "
+                "truncated download passes ffprobe and fails halfway through "
+                "the episode; every minute spent rewriting one is wasted."),
+    "listen":  ("What language is it really?",
+                "Whisper listens to five windows of each audio track. A tag "
+                "that is WRONG is worse than one that is missing: the plan "
+                "keeps and drops tracks by language, so a mislabelled track "
+                "gets the file rewritten, then found out, then rewritten "
+                "again."),
+    "audio":   ("Audio tags corrected",
+                "the corrected tags are written into the header - in place, "
+                "in under a second, before anything reads them to build a "
+                "plan."),
+    "subread": ("What the subtitle tracks are",
+                "which track is dialogue, which is signs, and whether there "
+                "are words burned into the picture - so the plan can flag "
+                "and keep the right ones rather than guessing from titles."),
+}
 
 
 def _n(cur, sql: str, args: tuple = ()) -> int:
@@ -130,6 +153,14 @@ def _settings_labels() -> dict:
     return out
 
 
+def _busy_pool(kind: str, rn: dict, qn: dict) -> int:
+    """Outstanding jobs of one fact-finding kind. Its pool shares its name
+    except for the two that do not, so the map is written down once."""
+    pool = {"decode": "decode", "listen": "listen", "audio": "audio",
+            "subread": "subread"}.get(kind, kind)
+    return int(rn.get(pool, 0)) + int(qn.get(pool, 0))
+
+
 def graph() -> dict:
     """Nodes, edges, counts and labels. One pass over the database."""
     lab = _settings_labels()
@@ -140,16 +171,39 @@ def graph() -> dict:
                          "ON f.id=p.file_id "
                          "WHERE f.state NOT IN ('deleted','duplicate')")
         unprobed = max(0, live - probed)
-        q_enc = _n(cur, "SELECT COUNT(*) FROM jobs WHERE state='queued' "
-                        "AND pool IN ('encode','passthrough')")
-        q_sub = _n(cur, "SELECT COUNT(*) FROM jobs WHERE state='queued' "
-                        "AND pool='subocr'")
-        r_enc = _n(cur, "SELECT COUNT(*) FROM jobs WHERE state='running' "
-                        "AND pool='encode'")
-        r_pass = _n(cur, "SELECT COUNT(*) FROM jobs WHERE state='running' "
-                         "AND pool='passthrough'")
-        r_sub = _n(cur, "SELECT COUNT(*) FROM jobs WHERE state='running' "
-                        "AND pool='subocr'")
+        # EVERY POOL, NOT THREE OF THEM.
+        #
+        # The queue had encode, passthrough and subocr when this was drawn. It
+        # has eight pools now, and four of them answer questions ABOUT a file
+        # that the plan is then built from - they run BEFORE the rewrite, not
+        # beside it. Counting three of eight made the gate read 0 while 216
+        # files were waiting in it, which is the one number on this page that
+        # has to be true.
+        live_by_pool: dict = {"queued": {}, "running": {}}
+        try:
+            for r in cur.execute(
+                    "SELECT pool, state, COUNT(*) n FROM jobs "
+                    " WHERE state IN ('queued','running') GROUP BY pool, state"):
+                live_by_pool[r["state"]][r["pool"] or ""] = int(r["n"] or 0)
+        except Exception:                                    # noqa: BLE001
+            pass
+        qn, rn = live_by_pool["queued"], live_by_pool["running"]
+
+        def _busy(*pools) -> int:
+            """Outstanding work in these pools - queued and running together.
+
+            A running count alone is what made three boxes read 0 on a machine
+            with a full queue: at any instant most pools have nothing IN a
+            worker, and "how much of this is there to do" is the question a
+            box on a flow diagram is being asked.
+            """
+            return sum(qn.get(p, 0) + rn.get(p, 0) for p in pools)
+
+        q_all = sum(qn.values())
+        r_enc = _busy("encode")
+        r_pass = _busy("passthrough")
+        r_sub = _busy("subocr")
+        r_subs = _busy("subs")
         # OUTSTANDING, NOT HISTORICAL. Counting every row that ever failed
         # answered a question nobody asked: of 33 such rows here, 4 were fixed
         # by a later pass and 14 belong to files that have since been deleted
@@ -176,7 +230,9 @@ def graph() -> dict:
                          "AND pool='passthrough'")
         d_sub = _n(cur, "SELECT COUNT(*) FROM jobs WHERE state='done' "
                         "AND pool='subocr'")
-        jobs_done = d_enc + d_pass + d_sub
+        d_subs = _n(cur, "SELECT COUNT(*) FROM jobs WHERE state='done' "
+                         "AND pool='subs'")
+        jobs_done = d_enc + d_pass + d_sub + d_subs
         files_done = _n(cur, """
             SELECT COUNT(DISTINCT j.file_id) FROM jobs j JOIN files f
               ON f.id = j.file_id
@@ -211,6 +267,13 @@ def graph() -> dict:
         # own idea of what to do about a finding; they now all hand it to one
         # remedy layer with one policy table and one hourly budget, and that
         # convergence is the thing this picture exists to show.
+        #
+        # THREE OF THEM APPEAR TWICE ON THIS PAGE NOW, and that is not a
+        # duplicate. The decode check, the listener and the subtitle reader
+        # are prerequisites in the flow above - a transcode waits for them -
+        # AND they keep running afterwards over files committed months ago,
+        # which is this graph. Same system, two jobs; the notes say which is
+        # which rather than the reader having to work it out.
         ck_decode = _n(cur, "SELECT COUNT(*) FROM integrity "
                             "WHERE verdict='corrupt'")
         ck_read = _n(cur, "SELECT COUNT(*) FROM integrity")
@@ -234,6 +297,18 @@ def graph() -> dict:
         acted_h = {r[0]: r[1] for r in cur.execute(
             "SELECT action, COUNT(*) FROM remedy_log WHERE ok=1 AND at>=? "
             "GROUP BY action", (hour_ago,))} if _has(cur, "remedy_log") else {}
+
+    # WHO IS WAITING ON WHAT, from the same breakdown the dashboard's idle
+    # line reads - so the diagram and the panel cannot tell two stories. It is
+    # memoised inside precedence; this never computes it on its own.
+    held: dict = {}
+    order: tuple = ("decode", "listen", "audio", "subread")
+    try:
+        from . import precedence
+        held = dict((precedence.eligible_breakdown() or {}).get("by") or {})
+        order = tuple(k for k in precedence.ORDER if k in _FACT_WORDS)
+    except Exception:                                        # noqa: BLE001
+        pass
 
     eng = lab.get("ocr_engine") or "the OCR"
     libs = lab.get("ocr_libraries") or []
@@ -263,9 +338,14 @@ def graph() -> dict:
                    "total, since a file is re-examined whenever the rules or "
                    "the file change.")),
         dict(id="gate", col=3, row=1, label="Job gate",
-             count=q_enc + q_sub, kind="gate",
-             note="holds work while someone is watching, while a disk is "
-                  "busy, or while you have paused it"),
+             count=q_all, kind="gate",
+             note=("everything queued, in every pool. The gate holds work "
+                   "while someone is watching, while a disk is busy, or while "
+                   "you have paused a pool - and a file also waits here until "
+                   "the facts its plan is built from are known, which is the "
+                   "order drawn below"
+                   + (f". {sum(held.values()):,} file(s) are waiting on a "
+                      f"fact right now" if sum(held.values()) else ""))),
         dict(id="encode", col=4, row=0, label="Encode",
              count=r_enc, kind="pool", pool="encode",
              note="the picture is rebuilt on the graphics card"),
@@ -275,7 +355,15 @@ def graph() -> dict:
         dict(id="subocr", col=4, row=2, label="Subtitle OCR",
              count=r_sub, kind="pool", pool="subocr",
              note=f"picture subtitles read into text with {eng}, "
-                  f"for {libtxt}"),
+                  f"for {libtxt}. After the rewrite, never before it: a track "
+                  f"the transcode is about to drop is a minute of OCR nobody "
+                  f"needed"),
+        dict(id="subs", col=4, row=3, label="Subtitle fixes",
+             count=r_subs, kind="pool", pool="subs",
+             note="sidecars taken inside, duplicate tracks dropped, titles "
+                  "corrected - planned against the container the transcode "
+                  "leaves behind, so a rewrite cannot invalidate the "
+                  "instruction while it waits"),
         dict(id="commit", col=5, row=1, label="Committed",
              count=files_done, kind="stage",
              note=("files that have been rewritten at least once and written "
@@ -299,15 +387,17 @@ def graph() -> dict:
         dict(a="probe", b="plan", label="rules decide", n=probed),
         dict(a="plan", b="nothing", label="already correct", n=skipped,
              muted=True),
-        dict(a="plan", b="gate", label="a change is needed", n=q_enc + q_sub),
+        dict(a="plan", b="gate", label="a change is needed", n=q_all),
         dict(a="gate", b="encode", label="picture must be rebuilt", n=r_enc),
         dict(a="gate", b="passthrough", label="picture can be copied",
              n=r_pass),
         dict(a="gate", b="subocr", label="picture subtitles to read",
              n=r_sub),
+        dict(a="gate", b="subs", label="subtitles to settle", n=r_subs),
         dict(a="encode", b="commit", label="", n=d_enc),
         dict(a="passthrough", b="commit", label="", n=d_pass),
         dict(a="subocr", b="commit", label="", n=d_sub),
+        dict(a="subs", b="commit", label="", n=d_subs),
         dict(a="encode", b="failed", label="", n=bad_now, muted=True),
     ]
     # The subtitle decision, drawn as its own small graph under the main one -
@@ -344,6 +434,65 @@ def graph() -> dict:
         dict(a="s_type", b="s_burn", label="", n=typeset),
         dict(a="s_dial", b="s_ocr", label="", n=dialogue),
     ]
+    # ---- the order the systems take a file in --------------------------
+    #
+    # Its own small graph, like the subtitle branch: it is a chain rather than
+    # a fan, and it is the part of the page that has to be explained rather
+    # than pointed at. Built from precedence.ORDER and PREREQS so it cannot
+    # describe an order the dispatcher does not keep.
+    ord_nodes, ord_edges = [], []
+    try:
+        from . import precedence as _prec
+        _chain = list(_prec.ORDER)
+        _pool_of = dict(_prec.POOL_OF_KIND)
+    except Exception:                                        # noqa: BLE001
+        _chain = ["decode", "listen", "audio", "subread", "transcode",
+                  "sub_ocr", "subs"]
+        _pool_of = {"decode": "decode", "listen": "listen", "audio": "audio",
+                    "subread": "subread", "transcode": "encode",
+                    "sub_ocr": "subocr", "subs": "subs"}
+    # THE CHAIN'S OWN SHORT NAMES. Seven boxes across is a narrower box, and
+    # a label that does not fit is a label nobody reads; what each one means
+    # is in its note, where there is room for it.
+    _SHORT = {"decode": "Does it decode?", "listen": "What language?",
+              "audio": "Tags corrected", "subread": "What the subs are",
+              "transcode": "The rewrite", "sub_ocr": "Subtitle OCR",
+              "subs": "Subtitle fixes"}
+    _REST = {
+        "transcode": ("The rewrite",
+                      "the standardising pass: unwanted tracks dropped, audio "
+                      "converted, Dolby Vision stripped. Everything above it "
+                      "exists so this runs once on a file rather than three "
+                      "times."),
+        "sub_ocr": ("Subtitle OCR",
+                    "the picture subtitles that SURVIVED the rewrite are read "
+                    "into text - fewer of them, and never one that was about "
+                    "to be dropped as a language nobody here reads."),
+        "subs": ("Subtitle fixes",
+                 "sidecars in, duplicates out, titles corrected - on the "
+                 "final container, so a rewrite that comes later cannot "
+                 "invalidate the instruction while it waits."),
+    }
+    for i, k in enumerate(_chain):
+        lbl, note = (_FACT_WORDS.get(k) or _REST.get(k)
+                     or (k.replace("_", " "), ""))
+        n_now = _busy_pool(_pool_of.get(k, k), rn, qn)
+        ord_nodes.append(dict(
+            id=f"o_{k}", col=i, row=0, label=_SHORT.get(k, lbl),
+            count=n_now, kind="pool", pool=_pool_of.get(k, ""),
+            note=(f"{i + 1} of {len(_chain)}. " + note
+                  + (f" {held[k]:,} file(s) are held waiting for this right "
+                     f"now." if held.get(k) else ""))))
+        if i:
+            prev = _chain[i - 1]
+            ord_edges.append(dict(
+                a=f"o_{prev}", b=f"o_{k}",
+                # Short: the chain's gap is 74px, which is fourteen characters
+                # before the label is clipped - see _PIPE_TIGHT.
+                label=("facts first" if k == "transcode"
+                       else "after it" if prev == "transcode" else ""),
+                n=n_now))
+
     # ---- the standing checks, and the one place they all end up --------
     sidecars = _sidecars_cached()
     ck_lie = _mislabelled()
@@ -360,7 +509,9 @@ def graph() -> dict:
                    "seconds actually decoded, not merely probed - a truncated "
                    "download passes ffprobe and fails halfway through the "
                    "episode, which is where a viewer finds it. The number "
-                   "shown is how many will not decode.")),
+                   "shown is how many will not decode. The same check runs "
+                   "ahead of a rewrite in the flow above - there is no point "
+                   "spending an hour on a file that is broken.")),
         dict(id="c_lang", col=0, row=1, label="Is the audio what it says?",
              count=ck_lie, kind="warn" if ck_lie else "stage",
              note=(f"{ck_heard:,} tracks have been listened to with Whisper - "
@@ -369,9 +520,11 @@ def graph() -> dict:
                    "automatically; a tag that is demonstrably wrong is never "
                    "overwritten without a person, because that restraint is "
                    "all that stops it re-labelling every English dub. "
-                   f"{ck_waiting:,} freshly imported files are waiting their "
-                   "turn ahead of the backlog. The number shown is how many "
-                   "tracks are tagged a language they demonstrably are not.")),
+                   f"{ck_waiting:,} files are waiting their turn ahead of the "
+                   "backlog - freshly imported ones, and any the processing "
+                   "system is standing still behind, which jump to the front. "
+                   "The number shown is how many tracks are tagged a language "
+                   "they demonstrably are not.")),
         dict(id="c_burn", col=0, row=2, label="Subtitles in the picture",
              count=ck_burn, kind="warn" if ck_burn else "stage",
              note=(f"{ck_burn_seen:,} files that report NO subtitle track have "
@@ -379,7 +532,9 @@ def graph() -> dict:
                    "pixels counted first, then the best few shown to the OCR. "
                    f"{ck_marked:,} carry a blank marker track, which exists so "
                    "Plex and Bazarr stop fetching subtitles for a file that "
-                   "already has them painted on.")),
+                   "already has them painted on. This reading also runs ahead "
+                   "of a rewrite, so the plan flags and keeps the right "
+                   "tracks rather than guessing from their titles.")),
         dict(id="c_side", col=0, row=3, label="Sidecars sitting outside",
              count=sidecars, kind="stage",
              note=("subtitle files sitting next to the video rather than "
@@ -460,6 +615,7 @@ def graph() -> dict:
     ]
 
     return {"cols": _COLS, "nodes": nodes, "edges": edges,
+            "order": {"nodes": ord_nodes, "edges": ord_edges},
             "sub": {"nodes": sub_nodes, "edges": sub_edges},
             "checks": {"nodes": ck_nodes, "edges": ck_edges},
             "engine": eng, "libraries": libs, "at": time.time()}
