@@ -305,13 +305,18 @@ def _subocr_hint() -> str:
 LABELS = {
     "encode_workers": "Encodes at once",
     "passthrough_workers": "Remuxes at once",
-    "subocr_workers": "Subtitle reads at once",
-    "subocr_gpu_lanes": "Subtitle reads on the GPU at once",
+    # TWO DIFFERENT READS, TWO DIFFERENT NAMES. subocr turns pictures into
+    # words; subread looks at what each track IS. Both were called "Subtitle
+    # reads at once" - the second with "(kinds)" in brackets, which is not a
+    # distinction anybody can hold - and the dashboard now shows these names
+    # rather than its own short forms, so the collision was on two pages.
+    "subocr_workers": "Subtitle OCR at once",
+    "subocr_gpu_lanes": "Subtitle OCR on the GPU at once",
     "subs_workers": "Subtitle fixes at once",
     "audio_workers": "Audio tag fixes at once",
     "decode_workers": "Decode checks at once",
     "listen_workers": "Audio listens at once",
-    "subread_workers": "Subtitle reads (kinds) at once",
+    "subread_workers": "Subtitle track reads at once",
     "probe_workers": "File scans at once",
     "arr_concurrency": "Sonarr/Radarr calls at once",
     "hold_minutes": "Settle time (minutes)",
@@ -749,6 +754,17 @@ def set_paused(pool: str, on: bool) -> tuple[bool, str]:
     kv_set("worker.paused", ",".join(sorted(cur)))
     return True, (f"{pool} paused - running jobs finish, nothing new starts"
                   if on else f"{pool} running again")
+
+
+def set_paused_all(on: bool) -> tuple[bool, str]:
+    """Every pool at once - the master switch on the Concurrency page.
+
+    One write rather than eight round trips, so the page cannot be caught
+    half-paused, and so the log says it as one decision.
+    """
+    kv_set("worker.paused", ",".join(sorted(PAUSABLE)) if on else "")
+    return True, ("every pool paused - running jobs finish, nothing new starts"
+                  if on else "every pool running again")
 
 
 def _default(key: str) -> int:

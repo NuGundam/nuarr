@@ -961,6 +961,18 @@ async def _reader_and_feeder() -> None:
             STATE["on_queue"] = int(d.get("on_queue") or 0)
         except Exception:                                        # noqa: BLE001
             pass
+        # AND THE BATONS NOBODY CAN TAKE. Prepared OCR subtitles wait here for
+        # whatever rewrites the file next; when that has already happened, or
+        # the file is gone, or a day has passed with nothing queued, they are
+        # so much cache. This is the subtitle system's own loop and they are
+        # subtitle work, so it sweeps them - throttled to once every ten
+        # minutes inside sweep_pending, which is why calling it every pass is
+        # not a cost. See subocr.pending_state.
+        try:
+            from . import jobs as _j, subocr as _so
+            await _j.in_work(_so.sweep_pending)
+        except Exception:                                        # noqa: BLE001
+            pass
         await asyncio.sleep(READ_BUSY_S if left else READ_IDLE_S)
 
 

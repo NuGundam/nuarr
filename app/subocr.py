@@ -1566,6 +1566,151 @@ def clear_pending(file_id: int, root: str | None = None) -> None:
     shutil.rmtree(pending_dir(file_id, root), ignore_errors=True)
 
 
+# ------------------------------------------- what is coming for a baton ----
+# WHO IS GOING TO PICK THESE UP, AND WHAT IF NOBODY IS.
+#
+# The subs-pending area is a baton pass: OCR leaves SRTs here and whatever
+# rewrites the file next carries them in. Two things were wrong with how that
+# was reported. The panel asked only "is a job queued for this file", so a
+# rewrite that had already been and gone read as "NOTHING IS COMING FOR THESE"
+# forever - Joker: Folie a Deux sat like that for twelve hours while the
+# subtitles it was waiting for were already in the file, 1,814 cues of them.
+# And nothing ever cleaned up: a baton nobody can take stayed on disk for good.
+#
+# So the verdict is asked of the FILE as well as the queue, and the sweep
+# below acts on it. Four answers:
+#
+#   waiting    a job is queued or running; it will carry them in
+#   spent      a rewrite finished AFTER these were prepared and the file now
+#              has a text subtitle track - they went in, these are the copies
+#   missed     a rewrite finished after them and the file still has no text
+#              subtitles - the rewrite went past without them, and an embed
+#              job will put them in without paying the OCR again
+#   orphaned   the file is gone
+#   stranded   nothing has run and nothing is queued
+#
+# Only 'missed' and 'stranded' can be collected - the others have nothing to
+# collect - and only those two wait: spent and orphaned are cleared on the
+# next sweep, stranded after STRANDED_KEEP_S.
+STRANDED_KEEP_S = 24 * 3600
+_REWRITE_KINDS = ("transcode", "sub_ocr", "subs")
+# Text subtitle codecs. A picture track does not count: the whole point of the
+# OCR is that the file had pictures and needed words.
+_TEXT_SUB = ("subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "text")
+
+
+def _has_text_sub(cur, file_id: int, size: int) -> bool:
+    """Does the file hold a text subtitle track NOW, by the latest reading?"""
+    r = cur.execute("SELECT size, tracks FROM sub_facts WHERE file_id=?",
+                    (int(file_id),)).fetchone()
+    if not r:
+        return False
+    # A reading of different bytes says nothing about the file as it stands.
+    if size and r["size"] and int(r["size"]) != int(size):
+        return False
+    try:
+        for t in json.loads(r["tracks"] or "[]"):
+            if str(t.get("codec") or "").lower() in _TEXT_SUB:
+                return True
+    except Exception:                                        # noqa: BLE001
+        return False
+    return False
+
+
+def pending_state(file_id: int, prepared_at: float) -> dict:
+    """-> {state, why, collect}. See the block comment above."""
+    from .db import cursor
+    with cursor() as cur:
+        f = cur.execute("SELECT path, state, size FROM files WHERE id=?",
+                        (int(file_id),)).fetchone()
+        if not f or (f["state"] or "") in ("deleted", "duplicate") \
+                or not (f["path"] and os.path.exists(f["path"])):
+            return {"state": "orphaned", "collect": False,
+                    "why": "ORPHANED - the file these belong to is gone"}
+        live = cur.execute(
+            "SELECT kind, state FROM jobs WHERE file_id=? AND state IN "
+            "('queued','running','deferred') ORDER BY created_at DESC LIMIT 1",
+            (int(file_id),)).fetchone()
+        if live:
+            k = live["kind"]
+            return {"state": "waiting", "collect": False,
+                    "why": (f"a {live['state']} transcode will carry them in"
+                            if k == "transcode"
+                            else f"a {live['state']} {k} job will embed them")}
+        gone = cur.execute(
+            "SELECT kind, finished_at FROM jobs WHERE file_id=? "
+            f"  AND kind IN ({','.join('?' * len(_REWRITE_KINDS))}) "
+            "  AND finished_at > ? ORDER BY finished_at DESC LIMIT 1",
+            (int(file_id), *_REWRITE_KINDS, float(prepared_at or 0))).fetchone()
+        if gone:
+            if _has_text_sub(cur, file_id, int(f["size"] or 0)):
+                return {"state": "spent", "collect": False,
+                        "why": (f"already carried in - the {gone['kind']} that "
+                                f"followed put them in the file, so these "
+                                f"copies are spent")}
+            return {"state": "missed", "collect": True,
+                    "why": (f"the {gone['kind']} that followed went past "
+                            f"without them - embedding costs no second OCR")}
+        waiting = cur.execute(
+            "SELECT COUNT(*) n FROM jobs WHERE kind='sub_ocr' "
+            "AND state IN ('queued','running')").fetchone()["n"]
+    if waiting:
+        return {"state": "waiting", "collect": False,
+                "why": (f"the subtitle queue reaches this file on a later "
+                        f"pass ({waiting:,} OCR jobs ahead)")}
+    return {"state": "stranded", "collect": True,
+            "why": "nothing is queued for this file - embed them or they go"}
+
+
+_LAST_SWEEP = 0.0
+SWEEP_EVERY_S = 600.0
+
+
+def sweep_pending(root: str | None = None, force: bool = False) -> int:
+    """Throw away the batons nobody can take. -> how many were cleared.
+
+    Called from the subtitle feeder's loop, at most once every ten minutes.
+    Spent and orphaned sets go at once - there is nothing to wait for. A
+    stranded one is kept for a day first, because a file can be queued by hand
+    in that window and the OCR is not free.
+    """
+    global _LAST_SWEEP
+    now = time.time()
+    if not force and now - _LAST_SWEEP < SWEEP_EVERY_S:
+        return 0
+    _LAST_SWEEP = now
+    base = os.path.join(root or getattr(SETTINGS, "cache_dir", "."),
+                        "subs-pending")
+    try:
+        names = os.listdir(base)
+    except OSError:
+        return 0
+    from . import joblog
+    cleared = 0
+    for name in names:
+        try:
+            fid = int(name)
+        except ValueError:
+            continue
+        man = os.path.join(base, name, "manifest.json")
+        try:
+            at = os.path.getmtime(man)
+        except OSError:
+            continue
+        try:
+            v = pending_state(fid, at)
+        except Exception:                                    # noqa: BLE001
+            continue
+        old = now - at
+        if v["state"] in ("spent", "orphaned") or (
+                v["state"] == "stranded" and old > STRANDED_KEEP_S):
+            clear_pending(fid, root)
+            cleared += 1
+            joblog.log(f"prepared OCR subtitles for file #{fid} discarded "
+                       f"after {old / 3600:.1f}h - {v['why']}", "info")
+    return cleared
+
+
 def ffmpeg_sub_args(src_probe: dict, pend: list[dict],
                     first_input: int = 1) -> tuple[list[str], list[str]]:
     r"""ffmpeg inputs and mapping so an ENCODE can carry the SRTs itself.

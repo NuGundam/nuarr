@@ -193,6 +193,26 @@ async def _decode(path: str, ss: float, dur: float,
         return -1, f"__spawn__ {type(e).__name__}: {e}"
 
 
+def say(detail: str) -> str:
+    r"""An internal sentinel, in words a person reads.
+
+    `_decode` marks "there is no verdict" with __timeout__ and __spawn__ so
+    its callers can test for it without parsing English. Those markers were
+    then handed straight to the job note, and the Activity feed showed
+    "no verdict - __timeout__" - which tells the reader nothing except that
+    something inside has leaked out. The markers stay; this is where they stop.
+    """
+    d = (detail or "").strip()
+    if d == "__timeout__":
+        return ("the decode ran past four minutes without finishing - usually "
+                "a spun-down pool disk or a member being rebalanced "
+                "underneath it, not a fault in the file")
+    if d.startswith("__spawn__"):
+        return ("ffmpeg could not be started ("
+                + (d[len("__spawn__"):].strip() or "no reason given") + ")")
+    return d or "no verdict"
+
+
 async def test_one(file_id: int, path: str, duration: float = 0.0,
                    on_pid=None, on_stage=None) -> dict:
     """Head and tail. -> {verdict, detail, secs}"""
@@ -508,7 +528,7 @@ async def _do_one(r: dict, report=None) -> dict:
                          on_stage=_stage)
     if not out.get("verdict"):
         # timeout or spawn failure - no verdict, try again another day
-        return {"ok": False, "why": out.get("detail") or "no verdict"}
+        return {"ok": False, "why": say(out.get("detail"))}
     await asyncio.to_thread(_write, int(r["file_id"]), r["path"],
                             st.st_size, st.st_mtime, out)
     if out["verdict"] == CORRUPT:
@@ -666,7 +686,7 @@ async def job_one(r: dict, on_pid=None, on_stage=None) -> dict:
                          float(r.get("duration") or 0),
                          on_pid=on_pid, on_stage=_stage)
     if not out.get("verdict"):
-        return {"ok": False, "why": out.get("detail") or "no verdict"}
+        return {"ok": False, "why": say(out.get("detail"))}
     await asyncio.to_thread(_write, int(r["file_id"]), r["path"],
                             st.st_size, st.st_mtime, out)
     if out["verdict"] == CORRUPT:

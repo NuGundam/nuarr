@@ -7203,6 +7203,7 @@ def api_subocr_pending():
     in. A baton nobody can see is a baton that gets dropped silently - this is
     the panel that makes a stranded one visible.
     """
+    from . import subocr as _so
     root = os.path.join(SETTINGS.cache_dir, "subs-pending")
     out, total_b = [], 0
     try:
@@ -7240,41 +7241,25 @@ def api_subocr_pending():
         title = (display_label(row[0]["title"], row[0]["season"],
                                row[0]["episode"]) if row else f"file #{fid}")
         path = row[0]["path"] if row else ""
-        # Who will pick these up? Named explicitly, because "waiting" without
-        # a consumer is exactly the stranded case this panel exists to catch.
-        stranded = False
-        j = _rows("SELECT kind, state FROM jobs WHERE file_id=? AND state IN "
-                  "('queued','running','deferred') ORDER BY created_at DESC "
-                  "LIMIT 1", (fid,))
-        if j and j[0]["kind"] == "transcode":
-            consumer = f"a {j[0]['state']} transcode will carry them in"
-        elif j:
-            consumer = f"a {j[0]['state']} {j[0]['kind']} job will embed them"
-        elif not row or row[0]["state"] == "deleted":
-            consumer = "ORPHANED - the file is gone"
-            stranded = True
-        else:
-            # "the subtitle queue embeds them on its next pass" was a promise
-            # the panel could not keep. There IS no next pass unless something
-            # queues one, and after the queue was cleared these sat with a
-            # confident consumer line and no consumer - which is the exact
-            # failure the panel was built to make visible, wearing the
-            # reassuring text. Say what is true, and only claim a pass when one
-            # is actually scheduled.
-            waiting = _rows("SELECT COUNT(*) n FROM jobs WHERE kind='sub_ocr' "
-                            "AND state IN ('queued','running')")[0]["n"]
-            if waiting:
-                consumer = (f"the subtitle queue reaches this file on a later "
-                            f"pass ({waiting:,} OCR jobs ahead)")
-            else:
-                consumer = ("NOTHING IS COMING FOR THESE - no transcode and no "
-                            "OCR job is queued for this file")
-                stranded = True
+        # WHO WILL PICK THESE UP - asked of the file as well as the queue.
+        #
+        # This used to ask only "is a job queued", so a rewrite that had
+        # already been and gone read as "NOTHING IS COMING FOR THESE" forever,
+        # with a Collect button that had nothing to collect. subocr.pending_state
+        # is the one answer now, and the sweep acts on the same verdict rather
+        # than on a second opinion. `collect` says whether the button would do
+        # anything at all; it is not offered where it would not.
+        v = _so.pending_state(fid, time.time() - age_s)
         out.append({"file_id": fid, "title": title, "path": path,
                     "tracks": names, "srt_bytes": srt_b,
-                    "age_s": round(age_s), "consumer": consumer,
-                    "stranded": stranded})
-    return {"pending": len(out), "bytes": total_b, "rows": out}
+                    "age_s": round(age_s), "consumer": v["why"],
+                    "state": v["state"], "collect": bool(v["collect"]),
+                    # Kept for anything still reading the old name.
+                    "stranded": v["state"] in ("stranded", "missed", "orphaned"),
+                    "goes_in_s": (max(0, round(_so.STRANDED_KEEP_S - age_s))
+                                  if v["state"] == "stranded" else None)})
+    return {"pending": len(out), "bytes": total_b, "rows": out,
+            "keep_s": int(_so.STRANDED_KEEP_S)}
 
 
 @app.post("/api/subocr/pending/clear")
@@ -11962,6 +11947,17 @@ def api_workers_pause(pool: str, on: int = 1):
             "workers": workers.get().as_dict()}
 
 
+@app.post("/api/workers/pause_all")
+def api_workers_pause_all(on: int = 1):
+    """Every pool at once. The one switch at the top of the Concurrency page."""
+    ok, msg = workers.set_paused_all(bool(on))
+    if not ok:
+        raise HTTPException(400, msg)
+    joblog.log(f"worker pools: {msg}", "warn" if on else "ok")
+    return {"ok": True, "message": msg, "paused": sorted(workers.paused()),
+            "workers": workers.get().as_dict()}
+
+
 @app.get("/api/cleanup")
 def api_cleanup(under_mb: int = 100):
     """What cleanup.py would target. Read-only - removal is CLI-only, on purpose."""
@@ -14136,14 +14132,30 @@ button[disabled]{opacity:.5;cursor:default}
            letter-spacing:.4px;margin-right:4px}
 .capbar .v{font-variant-numeric:tabular-nums;font-weight:600}
 .capbar .grp{display:flex;align-items:baseline;gap:3px}
-/* The dashboard's compact Workers panel - see workersCompact(). One chip per
-   pool, the number and nothing else; the page that can change them is a link
-   away. */
-.wcrow{display:flex;gap:7px;flex-wrap:wrap;align-items:center}
-.wcchip{display:inline-flex;align-items:baseline;gap:5px;font-size:12px;
-  padding:2px 9px;border:1px solid var(--line);border-radius:11px;
-  white-space:nowrap;cursor:help}
-.wcchip b{font-variant-numeric:tabular-nums;font-size:13px}
+/* The dashboard's Workers panel - see workersCompact(). ONE SHAPE, TEN TIMES.
+   It was a row of chips sized to their own text, so nothing lined up with
+   anything and the sub OCR one carried an extra clause that made it twice the
+   width of its neighbours. A grid of equal cells reads as a set of dials;
+   whatever else a cell has to say is in the card that opens on hover. */
+.wcgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(176px,1fr));
+        gap:7px;padding:10px 14px 2px}
+.wcell{border:1px solid var(--line);border-radius:8px;padding:6px 9px 7px;
+       cursor:pointer;background:rgba(255,255,255,.014)}
+.wcell:hover{border-color:var(--acc)}
+.wcell.off{opacity:.5}
+.wcname{font-size:11px;letter-spacing:.2px;white-space:nowrap;overflow:hidden;
+        text-overflow:ellipsis}
+.wcval{display:flex;align-items:baseline;gap:6px;margin-top:1px}
+.wcval b{font-size:17px;line-height:1.15;font-variant-numeric:tabular-nums}
+.wcsub{font-size:10.5px;color:var(--dim)}
+.wcfoot{text-align:center;font-size:11px;padding:7px 14px 0;color:var(--dim)}
+.wclink{text-align:center;padding:5px 14px 11px}
+.wclink a{color:#6fb0ff;text-decoration:none;font-size:12px}
+.wclink a:hover{text-decoration:underline}
+/* The one switch above the eleven. */
+.wmaster{display:flex;gap:12px;align-items:center;justify-content:space-between;
+         margin:0 14px 9px;padding:8px 12px;border:1px solid var(--line);
+         border-radius:8px;background:rgba(255,255,255,.02)}
 /* Per-pool I/O priority, sat against the pool it describes. */
 .iop{font-size:10px;padding:1px 6px;border-radius:9px;margin-left:6px;
      border:1px solid;white-space:nowrap;cursor:help}
@@ -15995,13 +16007,13 @@ async function tpopShow(chip){
 document.addEventListener('mouseover', e=>{
   const chip=e.target.closest && e.target.closest('.trend[data-tdisk]');
   if(chip){ if(_tpopTimer) clearTimeout(_tpopTimer); tpopShow(chip); }
-  const jd=e.target.closest && e.target.closest('[data-jdisk],[data-dpop]');
+  const jd=e.target.closest && e.target.closest('[data-jdisk],[data-dpop],[data-wpop]');
   if(jd){ if(_jpopTimer) clearTimeout(_jpopTimer); jpopShow(jd); }
 });
 document.addEventListener('mouseout', e=>{
   const chip=e.target.closest && e.target.closest('.trend[data-tdisk]');
   if(chip && !(e.relatedTarget && _tpop && _tpop.contains(e.relatedTarget))) tpopHide();
-  const jd=e.target.closest && e.target.closest('[data-jdisk],[data-dpop]');
+  const jd=e.target.closest && e.target.closest('[data-jdisk],[data-dpop],[data-wpop]');
   if(jd && !(e.relatedTarget && _jpop && _jpop.contains(e.relatedTarget))) jpopHide();
 });
 // WHERE THE POINTER IS, for the repaint check below. A row that is rebuilt
@@ -16033,8 +16045,43 @@ function dpopHtml(kind, disk){
     ${figs.length?`<div class="tpop-n">${figs.map(f=>`<b>${esc(f[0])}</b> ${f[1]}`).join('<br>')}</div>`:''}
     ${t.text?`<div class="dim jpop-plan" style="-webkit-line-clamp:unset;white-space:pre-line">${esc(t.text)}</div>`:''}`;
 }
-function popKeyOf(a){ return a.dataset.jdisk ? 'jobs:'+a.dataset.jdisk : a.dataset.dpop+':'+a.dataset.ddisk; }
-function popHtmlFor(key){ const i=key.indexOf(':'); const kind=key.slice(0,i), disk=key.slice(i+1); return kind==='jobs' ? jpopHtml(disk) : dpopHtml(kind, disk); }
+function popKeyOf(a){ return a.dataset.wpop ? 'worker:'+a.dataset.wpop
+                     : a.dataset.jdisk ? 'jobs:'+a.dataset.jdisk
+                     : a.dataset.dpop+':'+a.dataset.ddisk; }
+function popHtmlFor(key){ const i=key.indexOf(':'); const kind=key.slice(0,i), disk=key.slice(i+1);
+  return kind==='jobs' ? jpopHtml(disk)
+       : kind==='worker' ? wpopHtml(disk)
+       : dpopHtml(kind, disk); }
+// ONE DIAL, IN FULL. The dashboard cell has room for a name and a number; this
+// is everything else the Concurrency page would tell you about it - what it is
+// bound by, what the middle job of that kind actually took, how many are
+// running right now - in the same card the disk panel opens, because a second
+// kind of hover card would be a second thing to learn.
+function wpopHtml(k){
+  const v=(_wdata||{})[k]; if(!v) return '';
+  const col=v.pool?poolColor(v.pool):'var(--dim)';
+  const used=v.pool?(_poolUse[v.pool]||0):null;
+  const c=v.cost||{}, m=c.measured||{};
+  const rows=[];
+  rows.push(`<b>now</b> ${v.paused
+      ? '<span style="color:var(--warn)">paused — what is running finishes, nothing new starts</span>'
+      : (used!=null ? `${used} of ${v.value} running` : `${v.value} at once`)}`);
+  rows.push(`<b>range</b> ${v.min} to ${v.max} <span class="dim">·</span> <b>default</b> ${v.default}`
+    + (v.value!==v.default?' <span class="dim">(changed by hand)</span>':''));
+  // The measured medians are NOT repeated here - costStrip prints them under
+  // the pips, and the same sentence twice in one card is one too many.
+  const lanes = (k==='subocr_workers' && (_wdata||{}).subocr_gpu_lanes)
+    ? `<div class="dim" style="font-size:11px;margin-top:5px"><b>on the card</b> ${
+        _wdata.subocr_gpu_lanes.value} of them may use the GPU at once</div>` : '';
+  return `<div class="tpop-h" style="color:${col}">${esc(v.label||k)}${
+      v.pool?` <span class="dim">— ${esc(v.pool)} pool</span>`:''}</div>
+    <div class="tpop-n">${rows.join('<br>')}</div>
+    <div class="dim" style="font-size:11px;line-height:1.45">${esc(v.hint||'')}</div>
+    ${costStrip(c)}
+    ${c.why?`<div class="dim" style="font-size:10.5px;margin-top:4px;line-height:1.45">${esc(c.why)}</div>`:''}
+    ${lanes}
+    <div class="dim" style="font-size:10.5px;margin-top:7px">click to change it on the Concurrency page</div>`;
+}
 function jpopEl(){
   if(_jpop) return _jpop;
   _jpop=document.createElement('div'); _jpop.className='tpop jpop'; _jpop.style.display='none';
@@ -16123,7 +16170,7 @@ function jpopShow(anchor){
 // with fresh numbers - and close it only if the pointer has really left.
 function popsRefresh(){
   if(_jpop && _jpop.style.display!=='none' && _jpopKey){
-    const a=_under('[data-jdisk],[data-dpop]');
+    const a=_under('[data-jdisk],[data-dpop],[data-wpop]');
     if(_jpopHover || (a && popKeyOf(a)===_jpopKey)){ if(_jpopTimer) clearTimeout(_jpopTimer); _jpop.innerHTML=popHtmlFor(_jpopKey); if(a) jpopPlace(a); }
     else jpopHide();
   }
@@ -18425,10 +18472,29 @@ function metric(label,val,pct,sub,tip){
 function renderSys(s){
   const el=document.getElementById('sysbar');
   if(!el||!s) return;
-  const g=s.gpu||{};
-  let h = metric('CPU', s.cpu_pct+'%', s.cpu_pct, s.cpu_cores+' threads')
-        + metric('RAM', s.ram_pct+'%', s.ram_pct,
-                 `${s.ram_used_gb} / ${s.ram_total_gb} GB`);
+  const g=s.gpu||{}, n=s.nuarr||{};
+  // NUARR'S SHARE, NOT THE MACHINE'S.
+  //
+  // This strip sits inside Processing System, under the worker cards, and it
+  // was reporting the whole box - so "CPU 29.6%" on a machine where Claude
+  // and Plex and Docker were most of it read as nuarr working hard when nuarr
+  // was nearly idle. The question this panel is asked is "what is MY work
+  // costing", and the box's own figure is the comparison rather than the
+  // answer: it is the small grey number beside each one, and the whole
+  // breakdown - who has the rest - is two clicks away in Task manager.
+  const boxCpu = s.cpu_pct, boxRam = s.ram_pct;
+  const nCpu = (n.cpu_pct==null) ? null : n.cpu_pct;
+  const nRamGb = Math.round((n.ram_mb||0)/1024*10)/10;
+  const nRamPct = s.ram_total_gb ? Math.round(nRamGb/s.ram_total_gb*1000)/10 : 0;
+  let h = metric('CPU', (nCpu==null?'—':nCpu+'%'), nCpu||0,
+                 `nuarr · box ${boxCpu}% of ${s.cpu_cores}`,
+                 'Nuarr and its children — the server, ffmpeg, mkvmerge, the '
+                 +'OCR readers — as a share of the whole processor. The box '
+                 +'figure beside it is everything running, nuarr included.')
+        + metric('RAM', nRamGb+' GB', nRamPct,
+                 `nuarr · box ${boxRam}% of ${s.ram_total_gb} GB`,
+                 'Resident memory held by nuarr and its children. The box '
+                 +'figure beside it is the whole machine.');
   if(g.name){
     // THREE ENGINES, NOT ONE NUMBER.
     // A re-encode uses NVDEC to decode, the SMs for filter work, and NVENC to
@@ -18436,16 +18502,38 @@ function renderSys(s){
     // NVENC 99%, SM cores 35%, decoder 14%. Read on its own "GPU 35%" says
     // there is plenty of headroom when the encoder is completely full, so the
     // encoder leads and the SM figure is labelled as cores rather than "GPU".
-    h += metric('NVENC', g.encoder_pct+'%', g.encoder_pct, 'encode engine')
+    // AND THE CARD, THE SAME WAY. nvidia-smi cannot attribute an engine
+    // percentage to a process on Windows, so nuarr's share is not measured -
+    // it is KNOWN: an engine reading belongs to nuarr when nuarr has work on
+    // that engine, and when it does not, nuarr's share of it is zero however
+    // busy the card is. The card's own figure stays beside it, so a reading
+    // of 0 next to a busy encoder says the obvious thing - somebody else is
+    // using it - rather than looking like a broken sensor.
+    const gw = s.gpu_work||{};
+    const mine = !!(typeof _nuarrEnc!=='undefined' && _nuarrEnc && _nuarrEnc.length);
+    const onCores = gw.device==='gpu' && (gw.n||0) > 0;
+    const els = who => `card ${who}%`;
+    h += metric('NVENC', (mine?g.encoder_pct:0)+'%', mine?g.encoder_pct:0,
+                mine ? `nuarr encoding · ${els(g.encoder_pct)}`
+                     : `nuarr idle · ${els(g.encoder_pct)}`,
+                'Nuarr\'s own encoding. NVENC is one engine and nuarr is on it '
+                +'only while an encode job is running; the card figure beside '
+                +'it is every process, Plex included.')
        + (g.decoder_pct!=null
-            ? metric('NVDEC', g.decoder_pct+'%', g.decoder_pct, 'decode engine')
+            ? metric('NVDEC', (mine?g.decoder_pct:0)+'%', mine?g.decoder_pct:0,
+                     mine ? `with nuarr's encodes · ${els(g.decoder_pct)}`
+                          : `nuarr decodes on the CPU · ${els(g.decoder_pct)}`,
+                     'Nuarr only uses the decode engine as part of an encode. '
+                     +'The integrity check decodes on the processor on purpose, '
+                     +'so this reads 0 while "Does it decode?" is running.')
             : '')
-       + metric('GPU', g.gpu_pct+'%', g.gpu_pct,
-                `cores · ${Math.round(g.vram_used_mb/1024*10)/10} / ${
+       + metric('GPU', (onCores?g.gpu_pct:0)+'%', onCores?g.gpu_pct:0,
+                `${gw.label?esc(gw.label):'nuarr idle on the cores'} · ${
+                  Math.round(g.vram_used_mb/1024*10)/10} / ${
                   Math.round(g.vram_total_mb/1024)} GB · ${g.temp_c}°C`,
-                'Shader cores only. The encode itself runs on NVENC, which is '
-                +'a separate engine - this figure can read low while the encoder '
-                +'is saturated, so judge worker headroom by NVENC.');
+                'Shader cores, and only nuarr\'s: Whisper and the OCR readers '
+                +'run here, the encode does not. The card is at '
+                +g.gpu_pct+'% in total.');
   }
   // CACHE THROUGHPUT. Every encode writes its output to E: and every commit
   // reads it straight back, which makes this the busiest volume in the system
@@ -19646,30 +19734,42 @@ async function loadSocrPending(){
       +'every prepared subtitle has been embedded</div>');
     return;
   }
+  // FIVE VERDICTS, AND THE BUTTON ONLY WHERE IT DOES SOMETHING.
+  //
+  // Collect was offered on every stranded row, including rows where there was
+  // nothing left to collect: Joker: Folie a Deux sat here for twelve hours
+  // saying "NOTHING IS COMING FOR THESE" with a button on it, while the
+  // subtitles it was waiting for were already in the file - 1,814 cues of
+  // them, carried in by the transcode that followed. The server works out
+  // whether an embed would do anything (subocr.pending_state) and the button
+  // follows that, rather than the panel guessing from the queue alone.
+  const TONE = {orphaned:'p-bad', missed:'p-bad', stranded:'p-warn',
+                spent:'p-dim', waiting:'p-ok'};
+  const WORD = {orphaned:'orphaned', missed:'missed', stranded:'stranded',
+                spent:'already in', waiting:'waiting'};
   const rows=(d.rows||[]).map(r=>{
-    const orphan = /ORPHANED/.test(r.consumer);
-    // Stranded is not the same as orphaned: the FILE is fine, but nothing is
-    // scheduled to carry these subtitles in, so they would wait forever. It
-    // gets its own pill and its own remedy rather than hiding inside "waiting".
-    const stuck = !!r.stranded && !orphan;
-    // Age matters: freshly prepared is normal, hours-old means the consumer
-    // never came and the subtitle queue should be the one picking it up.
-    const stale = r.age_s > 6*3600;
+    const st = r.state || (r.stranded?'stranded':'waiting');
+    const bad = st==='orphaned' || st==='missed';
     return `<tr>
       <td class="wrap"><div>${esc(r.title||'')}</div>
         <div class="dim sub">${esc(r.tracks.join(', '))}</div></td>
-      <td class="nb"><span class="pill ${orphan?'p-bad':(stuck?'p-bad':(stale?'p-warn':'p-ok'))}"
-          title="${esc(r.path||'')}">${orphan?'orphaned':(stuck?'stranded':(stale?'stale':'waiting'))}</span></td>
-      <td class="${stuck?'err':'dim'} nb">${esc(r.consumer)}</td>
+      <td class="nb"><span class="pill ${TONE[st]||'p-ok'}"
+          title="${esc(r.path||'')}">${WORD[st]||st}</span></td>
+      <td class="${bad?'err':'dim'} nb">${esc(r.consumer)}${
+        r.goes_in_s!=null?`<div class="dim" style="font-size:10.5px">nuarr discards
+          these on its own in ${hms(r.goes_in_s)}</div>`:''}</td>
       <td class="num dim nb">${hms(r.age_s)} old</td>
-      <td class="nb">${stuck?`<button class="on"
-            title="queue the rewrite that carries these in — no second OCR, the subtitles are already made"
+      <td class="nb">${r.collect?`<button class="on"
+            title="embed them now — no second OCR, the subtitles are already made"
             onclick="socrpCollect(${r.file_id})">Collect</button> `:''}<button
           title="discard these prepared subtitles — redoing them costs one OCR pass"
           onclick="socrpClear(${r.file_id})">Discard</button></td></tr>`;
   }).join('');
   setHTML(el, `<div class="dim" style="padding:6px 14px;font-size:11px">
       ${fmt(d.pending)} prepared, ${gb(d.bytes)} of SRT waiting for the next rewrite of each file
+      — a set that has already been carried in, or whose file is gone, is
+      discarded on the next sweep; one with nothing coming for it goes after
+      ${hms(d.keep_s||86400)}
     </div><table class="fixed vtop">${rows}</table>`);
 }
 // Queue the rewrite that will carry stranded subtitles in. A transcode is
@@ -22831,6 +22931,9 @@ let _nuarrEnc=[];
 // Job ids the server has actually demoted. Priority is per spindle now, so a
 // card can only claim "low I/O" if its own job is in this set.
 let _ioLowJobs=new Set(), _ioReason='';
+// Per-pool occupancy from the job poll, so the Workers panel and its hover
+// card can say "2 of 4 running" without a fetch of their own.
+let _poolUse={}, _poolCap={};
 // Ghost cards for jobs that just finished. FADE_MS is deliberately shorter than
 // the 2 s poll, so the animation is always complete before the next repaint
 // clears the entry - no timer of our own to keep in sync.
@@ -22875,6 +22978,8 @@ async function loadJobs(){
   // state now sits beside each pool, which is what makes "encode 0/4"
   // explicable rather than mysterious.
   const held = new Set(j.plex_disks||[]);
+  // The Workers panel says how many of each MAY run; this is how many are.
+  _poolUse = j.in_use||{}; _poolCap = j.capacity||{};
   _ioLowJobs = new Set(j.io_low_jobs||[]);
   // HOW MANY of this pool's jobs are actually demoted, not "is the feature on".
   // Priority is now applied per spindle, so with a viewer on one disk and four
@@ -25220,6 +25325,43 @@ async function poolPause(pool, on, btn){
   const m=document.getElementById('wmsg'); if(m) m.textContent='…';
   try{
     const r=await fetch('/api/workers/pause?pool='+encodeURIComponent(pool)+'&on='+(on?1:0),{method:'POST'});
+    const j=await r.json();
+    if(m) m.textContent = r.ok ? j.message : (j.detail||'failed');
+  }catch(e){ if(m) m.textContent='failed'; }
+  loadWorkers();
+  if(typeof loadJobs==='function') loadJobs();   // the strip says paused at once
+}
+// EVERY POOL AT ONCE. Eight switches is the right control for "this kind of
+// work is in the way"; it is the wrong one for "stop, I am about to do
+// something to this machine" - which meant eight clicks, in some order, with
+// the box still claiming work between them. One switch, one write, and the
+// line above it says what the eight are currently doing so the state is never
+// implied by the button alone.
+function masterSwitch(w){
+  if(_wtab==='timing') return '';
+  const pools = Object.entries(w).filter(([k,v])=>v.pool);
+  if(!pools.length) return '';
+  const off = pools.filter(([k,v])=>v.paused).length;
+  const allOff = off===pools.length;
+  const word = allOff ? 'Every pool is paused'
+             : off ? `${off} of ${pools.length} pools are paused`
+                   : 'Every pool is running';
+  return `<div class="wmaster">
+      <div><b style="color:${allOff?'var(--warn)':off?'var(--warn)':'var(--ok)'}">${word}</b>
+        <div class="dim" style="font-size:11px">One switch for all of them.
+          ${allOff ? 'Letting them run again starts claiming work immediately.'
+                   : 'Pausing lets what is running finish and starts nothing new; every count here is kept.'}</div></div>
+      <button class="wsw ${allOff?'off':'on'}" onclick="pauseAll(${allOff?'false':'true'},this)"
+        title="${allOff?'Let every pool run again.'
+                       :'Pause every pool: what is running finishes, nothing new starts.'}"
+        ><span class="knob"></span>${allOff?'all paused':(off?'pause the rest':'all running')}</button>
+    </div>`;
+}
+async function pauseAll(on, btn){
+  if(btn) btn.disabled=true;
+  const m=document.getElementById('wmsg'); if(m) m.textContent='\u2026';
+  try{
+    const r=await fetch('/api/workers/pause_all?on='+(on?1:0),{method:'POST'});
     const j=await r.json();
     if(m) m.textContent = r.ok ? j.message : (j.detail||'failed');
   }catch(e){ if(m) m.textContent='failed'; }
@@ -40586,40 +40728,40 @@ let _encLine='';   // "encoding on: ..." - fetched once, painted into the header
 // middle of a dashboard that repaints every 750 ms. What the dashboard needs
 // is the ANSWER: how many of each, right now, and which are paused. The rest
 // is one click away, on the page whose job it is.
+// THE NAMES ARE THE SETTINGS PAGE'S NAMES.
+//
+// This panel used to invent a short form for each dial - "remux", "sub fixes",
+// "arr calls" - so the same setting had one name here and another on the page
+// that changes it, and neither could be searched for from the other. It shows
+// the label the Concurrency page shows now, in a cell the same size as every
+// other cell, with what a cell has no room for on the hover card.
 function workersCompact(w){
-  const POOLS = ['encode_workers','passthrough_workers','subocr_workers',
-                 'subs_workers','audio_workers','decode_workers',
-                 'listen_workers','subread_workers'];
-  const OTHER = ['probe_workers','arr_concurrency'];
-  const short = {encode_workers:'encode', passthrough_workers:'remux',
-                 subocr_workers:'sub OCR', subs_workers:'sub fixes',
-                 audio_workers:'audio tags', decode_workers:'decode',
-                 listen_workers:'listen', subread_workers:'sub reads',
-                 probe_workers:'file scans', arr_concurrency:'arr calls'};
-  const chip = (k)=>{
+  const KEYS = ['encode_workers','passthrough_workers','subocr_workers',
+                'subs_workers','audio_workers','decode_workers',
+                'listen_workers','subread_workers',
+                'probe_workers','arr_concurrency'];
+  const cell = (k)=>{
     const v = w[k]; if(!v) return '';
     const col = v.pool ? poolColor(v.pool) : 'var(--dim)';
-    const gpu = (k==='subocr_workers' && w.subocr_gpu_lanes)
-      ? `<span class="dim" style="font-size:10px"> \u00b7 ${w.subocr_gpu_lanes.value} on the card</span>` : '';
-    return `<span class="wcchip" title="${esc(v.label||k)}${
-        v.paused?' \u2014 paused: running jobs finish, nothing new starts':''}">`
-      + `<span style="color:${col};${v.paused?'opacity:.45':''}">${esc(short[k]||k)}</span>`
-      + (v.paused ? `<b class="dim" style="font-size:11px">\u23f8</b>`
-                  : `<b style="color:${v.value?'var(--fg,#c9d1d9)':'var(--dim)'}">${v.value}</b>`)
-      + gpu + `</span>`;
+    const used = v.pool ? (_poolUse[v.pool]||0) : null;
+    return `<div class="wcell${v.paused?' off':''}" data-wpop="${esc(k)}"
+         onclick="location.href='/settings#counts'">
+         <div class="wcname" style="color:${col}" title="${esc(v.label||k)}">${esc(v.label||k)}</div>
+         <div class="wcval"><b style="color:${v.value?'var(--fg,#c9d1d9)':'var(--dim)'}">${v.value}</b>`
+      + (v.paused
+          ? `<span class="wcsub" style="color:var(--warn)">\u23f8 paused</span>`
+          : `<span class="wcsub">${used!=null ? `${used} running now` : 'at once'}</span>`)
+      + `</div></div>`;
   };
-  const anyPaused = POOLS.some(k=>(w[k]||{}).paused);
-  return `<div style="padding:9px 14px 10px">
-      <div class="wcrow">${POOLS.map(chip).join('')}</div>
-      <div class="wcrow" style="margin-top:5px;opacity:.7">${OTHER.map(chip).join('')}</div>
-      <div class="dim" style="font-size:11px;margin-top:7px;display:flex;
-           gap:10px;align-items:baseline;flex-wrap:wrap">
-        <span>how many of each may run at once${
-          anyPaused?' \u2014 <span class="warn">a pool is paused</span>':''}</span>
-        <a href="/settings#counts" style="color:#6fb0ff;text-decoration:none;margin-left:auto"
-           title="the full version: limits, defaults, pause switches, what each worker costs the box, and the holds and timing tab"
-           >Change these \u2192</a>
-      </div></div>`;
+  const pools = KEYS.filter(k=>(w[k]||{}).pool);
+  const off = pools.filter(k=>w[k].paused).length;
+  return `<div class="wcgrid">${KEYS.map(cell).join('')}</div>
+      <div class="wcfoot">${off
+        ? `<span class="warn">${off} of ${pools.length} pools paused \u2014 what is running finishes, nothing new starts</span>`
+        : 'how many of each may run at once \u2014 hover one for what it costs the box'}</div>
+      <div class="wclink"><a href="/settings#counts"
+         title="limits, defaults, the pause switches, what each worker costs, and the holds and timing tab"
+         >Concurrency Settings \u2192</a></div>`;
 }
 function paintWorkers(){
   const w=_wdata;
@@ -40651,6 +40793,7 @@ function paintWorkers(){
     ? `<div style="padding:0 14px 8px;font-size:11.5px">${_encLine}</div>` : '';
   document.getElementById('workers').innerHTML=
     `<div class="dim" style="padding:9px 14px ${enc?'4px':'9px'};font-size:11px">${blurb}</div>`+enc
+    + masterSwitch(w)
     +'<table>'+rows.map(([k,v])=>workerRow(k,v,extraOf(k))).join('')+'</table>';
   const hint=document.getElementById('wtabhint');
   if(hint) hint.textContent = _wtab==='timing' ? '· holds & timing' : '· concurrency';
