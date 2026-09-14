@@ -345,19 +345,32 @@ async def topup_subread(depth: int | None = None) -> dict:
         live = await asyncio.to_thread(_live_ids)
         rows = [r for r in rows if r["file_id"] not in live]
         _SUBREAD_EMPTY["at"] = time.time() if not rows else 0.0
-        # Files a transcode is held on lead, then the round robin as before.
+        # Files a transcode is held on get their own room, then the round
+        # robin as before - and they go in at the promotion priority, which is
+        # the half that actually makes them run first.
         try:
             from . import precedence as _prec
-            rows = _prec.wanted_first("subread", rows)
+            want = _prec.wanted("subread")
         except Exception:                                        # noqa: BLE001
-            pass
-        rows = _deal(rows, room, lambda r: r.get("disk"))
+            want = set()
+        stuck = [r for r in rows if int(r.get("file_id") or 0) in want]
+        other = [r for r in rows if int(r.get("file_id") or 0) not in want]
+        front = _deal(stuck, room, lambda r: r.get("disk"))
+        rows = _deal(other, max(0, room - len(front)), lambda r: r.get("disk"))
     except Exception as e:                                       # noqa: BLE001
         return {"ok": False, "why": f"{type(e).__name__}: {e}"[:200]}
+    made = 0
+    if front:
+        from . import precedence as _prec2
+        rf = await jobs.in_work(
+            jobs.enqueue_many,
+            [{**x, "plan_json": _subread_plan(x)} for x in front],
+            "subread", _prec2.PROMOTE_TO, "subtitle kinds")
+        made += int(rf.get("made") or 0)
     r = await jobs.in_work(jobs.enqueue_many,
                            [{**x, "plan_json": _subread_plan(x)} for x in rows],
                            "subread", 80, "subtitle kinds")
-    made = int(r.get("made") or 0)
+    made += int(r.get("made") or 0)
     STATE["subread"].update(fed=made, on_queue=have + made, at=time.time())
     return {"ok": True, "made": made, "on_queue": have + made}
 

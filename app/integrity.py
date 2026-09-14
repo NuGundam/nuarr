@@ -278,6 +278,14 @@ def _candidates(limit: int) -> list[dict]:
     #
     # mtime is the filesystem's own answer to "when was this last written",
     # which is the question that was being asked.
+    #
+    # AND 'eligible' IS EXEMPT FROM IT, because it has already served a longer
+    # one. A file becomes eligible by sitting out nuarr's own settle hold -
+    # half an hour by default - so applying a second ten-minute guard to it
+    # only delays the one population that is waiting to be processed.
+    # Measured when Erik asked why eligible files were not moving: fifteen of
+    # them were held on this check, and fourteen were excluded from its
+    # candidate list for being under ten minutes old.
     cutoff = time.time() - SETTLE_S
     with cursor() as cur:
         return [dict(r) for r in cur.execute(
@@ -289,7 +297,7 @@ def _candidates(limit: int) -> list[dict]:
             " WHERE f.state NOT IN ('deleted','duplicate') "
             "   AND COALESCE(f.path,'') != '' "
             "   AND COALESCE(f.size,0) > 0 "
-            "   AND COALESCE(f.mtime, 0) < ? "
+            "   AND (COALESCE(f.mtime, 0) < ? OR f.state='eligible') "
             "   AND (i.file_id IS NULL OR i.verdict = '') "
             " ORDER BY f.id LIMIT ?", (cutoff, int(limit)))]
 
@@ -314,7 +322,8 @@ def _candidates_per_disk(per_disk: int) -> list[dict]:
             "   WHERE f.state NOT IN ('deleted','duplicate') "
             "     AND COALESCE(f.path,'') != '' "
             "     AND COALESCE(f.size,0) > 0 "
-            "     AND COALESCE(f.mtime, 0) < ? "
+            # See _candidates: eligible has already served a longer settle.
+            "     AND (COALESCE(f.mtime, 0) < ? OR f.state='eligible') "
             "     AND (i.file_id IS NULL OR i.verdict = '')) "
             " WHERE rn <= ? ORDER BY pool_disk, rn",
             (cutoff, int(per_disk)))]
@@ -599,26 +608,44 @@ def _to_hand_over(depth: int) -> tuple:
                 "  AND file_id IS NOT NULL")}
     except Exception:                                            # noqa: BLE001
         live = set()
-    by_disk: dict = {}
-    for r in rows:
-        if int(r["file_id"]) in live:
-            continue
-        by_disk.setdefault(r.get("pool_disk") or "?", []).append(r)
-    out: list = []
-    lanes = [iter(v) for _k, v in sorted(by_disk.items())]
-    while lanes and len(out) < room:
-        alive = []
-        for it in lanes:
-            if len(out) >= room:
-                alive.append(it)
-                continue
-            try:
-                out.append(next(it))
-                alive.append(it)
-            except StopIteration:
-                pass
-        lanes = alive
-    return have, out
+    rows = [r for r in rows if int(r["file_id"]) not in live]
+
+    def _deal(rs, n):
+        """Round robin by spindle, oldest first within each."""
+        by_disk: dict = {}
+        for r in rs:
+            by_disk.setdefault(r.get("pool_disk") or "?", []).append(r)
+        out: list = []
+        lanes = [iter(v) for _k, v in sorted(by_disk.items())]
+        while lanes and len(out) < n:
+            alive = []
+            for it in lanes:
+                if len(out) >= n:
+                    alive.append(it)
+                    continue
+                try:
+                    out.append(next(it))
+                    alive.append(it)
+                except StopIteration:
+                    pass
+            lanes = alive
+        return out
+
+    # THE BLOCKED ONES ARE DEALT THEIR OWN ROOM FIRST. Being first in the
+    # candidate list is not enough: a round robin over twelve spindles can
+    # spend the whole allowance on files nobody is waiting for before it
+    # reaches them.
+    try:
+        from . import precedence as _prec
+        want = _prec.wanted("decode")
+    except Exception:                                            # noqa: BLE001
+        want = set()
+    front = _deal([r for r in rows if int(r["file_id"]) in want], room)
+    rest = _deal([r for r in rows if int(r["file_id"]) not in want],
+                 max(0, room - len(front)))
+    for r in front:
+        r["_blocking"] = True
+    return have, front + rest
 
 
 def _job_plan(r: dict) -> str:
@@ -649,11 +676,28 @@ async def topup(depth: int = QUEUE_DEPTH) -> dict:
         have, rows = await jobs.in_work(_to_hand_over, depth)
     except Exception as e:                                       # noqa: BLE001
         return {"ok": False, "why": f"{type(e).__name__}: {e}"[:200]}
-    # ONE TRANSACTION, OFF THE LOOP - see jobs.enqueue_many.
-    r = await jobs.in_work(jobs.enqueue_many,
-                           [{**x, "plan_json": _job_plan(x)} for x in rows],
-                           "decode", 90, "does it decode?")
-    made, skipped = int(r.get("made") or 0), int(r.get("skipped") or 0)
+    # ONE TRANSACTION, OFF THE LOOP - see jobs.enqueue_many. Two of them: a
+    # file the processing system is standing still behind goes in at the
+    # promotion priority, ahead of the backlog nobody is waiting on. Queued at
+    # 90 with the rest, it would have sat behind eighty-seven older rows and
+    # the transcode would have waited for all of them.
+    made = skipped = 0
+    front = [x for x in rows if x.get("_blocking")]
+    rest = [x for x in rows if not x.get("_blocking")]
+    if front:
+        from . import precedence as _prec
+        rf = await jobs.in_work(
+            jobs.enqueue_many,
+            [{**x, "plan_json": _job_plan(x)} for x in front],
+            "decode", _prec.PROMOTE_TO, "does it decode?")
+        made += int(rf.get("made") or 0)
+        skipped += int(rf.get("skipped") or 0)
+    if rest:
+        r = await jobs.in_work(jobs.enqueue_many,
+                               [{**x, "plan_json": _job_plan(x)} for x in rest],
+                               "decode", 90, "does it decode?")
+        made += int(r.get("made") or 0)
+        skipped += int(r.get("skipped") or 0)
     STATE["on_queue"] = have + made
     return {"ok": True, "made": made, "skipped": skipped,
             "on_queue": have + made}
