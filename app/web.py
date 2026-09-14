@@ -8985,6 +8985,31 @@ def api_files(state: str | None = None, library: str | None = None,
                         r["job_state"] = j["job_state"]
                         break
     _file_steps(rows)
+    # SORTED BY WHEN IT WILL ACTUALLY BE WORKED ON, not by how big it is.
+    #
+    # And sorted by the job's own PRIORITY AND AGE rather than by the integer
+    # position, because the position of every row shifts by one each time a
+    # job finishes - an order built on it would reshuffle the whole list every
+    # few seconds. Priority and created_at are what the dispatcher orders by;
+    # they only change when something genuinely reorders, so a row keeps its
+    # place until it has a reason not to. Files with nothing queued sort after
+    # the ones that have, oldest first within that, and the file id breaks any
+    # remaining tie so the order is total and repeatable.
+    if any(r.get("steps") for r in rows):
+        BIG = float("inf")
+
+        def _soon(r):
+            best = (BIG, BIG)
+            for st in (r.get("steps") or []):
+                if st.get("state") == "running":
+                    return (-1.0, 0.0, int(r.get("id") or 0))
+                if st.get("state") == "queued":
+                    k = (float(st.get("priority") or 1e6),
+                         float(st.get("since") or 0))
+                    best = min(best, k)
+            return (best[0], best[1], int(r.get("id") or 0))
+
+        rows.sort(key=_soon)
 
     # WHEN WILL A HELD FILE SETTLE? ASK THE LOCK CLOCK, NOT THE FILE'S DATE.
     #
@@ -17290,6 +17315,8 @@ guess.">looks like data moving</span>${other.slice(0,3).map(m=>pair(m,'')).join(
 }
 
 let drillQuery=null;
+// Any change of question starts a fresh order - see drillReorder().
+function drillFresh(){ _drillOrder = []; _drillKey = ''; }
 function drillUrl(extra){
   const q=drillQuery||{}; const p=new URLSearchParams();
   if(q.state) p.set('state',q.state);
@@ -17881,6 +17908,68 @@ drillSchedule();
 // byte-identical markup is not free - it drops the scroll position, kills any
 // text selection, and restarts the caret animation - so the poll compares
 // first and writes only on a real change.
+// THE ORDER IS HELD WHILE THE PANEL IS OPEN.
+//
+// Sorting by when a file will be worked on is the right order and the worst
+// possible behaviour if it is re-applied every five seconds: a job finishes,
+// everything behind it moves up, and the row somebody was reading is somewhere
+// else. So the order is decided once, from the first answer, and every later
+// answer is arranged to match it - rows that have gone are dropped, rows that
+// are new go on the end, and nothing that is still there ever moves. Closing
+// the panel, changing the filter or pressing Re-sort starts a fresh order.
+let _drillOrder = [];      // file ids, in the order they were first shown
+let _drillRows = [];       // the last answer, for the in-place patches
+
+function drillReorder(rows){
+  const byId = new Map(rows.map(r => [r.id, r]));
+  const out = [];
+  for(const id of _drillOrder){            // keep what is still here, in place
+    const r = byId.get(id);
+    if(r){ out.push(r); byId.delete(id); }
+  }
+  for(const r of rows) if(byId.has(r.id)) out.push(r);   // newcomers on the end
+  _drillOrder = out.map(r => r.id);
+  return out;
+}
+function drillResort(){ _drillOrder = []; _drillKey = ''; drillRefresh(true); }
+
+// THE BUBBLES MOVE WITHOUT THE TABLE BEING REBUILT.
+//
+// A rebuild drops the scroll position, the text selection and any tooltip that
+// is open, so the list only rebuilds when the SET of rows changes. Everything
+// that changes more often than that - the state of a step, its place in the
+// queue, the fill on a running one - is written into the existing elements.
+// Called from the drill's own poll and from the job poll, so a running bubble
+// fills at the job poll's rate rather than the list's.
+function patchSteps(rows){
+  const box = document.getElementById('drillBody');
+  if(!box) return;
+  for(const r of (rows || [])){
+    for(const s of (r.steps || [])){
+      const el = box.querySelector(
+        `.wstep[data-fid="${r.id}"][data-kind="${s.kind}"]`);
+      if(!el) continue;
+      const cls = 'wstep s-' + s.state;
+      if(el.className !== cls) el.className = cls;
+      const col = s.state==='owed' ? '' : poolColor(s.pool||'');
+      if(el.style.color !== col) el.style.color = col;
+      const run = (s.state==='running' && lastJobs)
+        ? ((lastJobs.running)||[]).find(w=>w.job_id===s.job_id) : null;
+      const pct = run ? Math.round(Math.max(0, Math.min(1, run.progress||0))*100) : 0;
+      let fill = el.querySelector('i');
+      if(run){
+        if(!fill){ fill = document.createElement('i'); el.insertBefore(fill, el.firstChild); }
+        const w = pct + '%';
+        if(fill.style.width !== w) fill.style.width = w;
+      } else if(fill){ fill.remove(); }
+      const b = el.querySelector('b');
+      const want = s.kind.toUpperCase()
+                 + (s.state==='queued' && s.pos ? ' ' + s.pos : '');
+      if(b && b.textContent !== want) b.textContent = want;
+    }
+  }
+}
+
 let _drillKey='';
 async function drillRefresh(force){
   // A quiet pulse while the fetch is in flight, so a background refresh is
@@ -17899,6 +17988,17 @@ async function drillRefresh(force){
     + (held && d.lock_quiet_s ? ` · promoted after ${Math.round(d.lock_quiet_s)}s with no reader` : '')
     // Say so, rather than letting a frozen list look like a broken one.
     + (_drillLogId ? ' · paused while you read the log' : '');
+  // Only worth saying where the order is the queue's rather than the size's.
+  const oc=document.getElementById('drillCount');
+  if(oc && d.rows.length && d.rows[0].steps){
+    oc.insertAdjacentHTML('beforeend',
+      ' <span class="dim">· soonest first, order held while you read</span>'
+      + ' <button style="font-size:10px;padding:1px 7px;margin-left:6px"'
+      + ' title="re-sort now: put the list back in the order the workers will'
+      + ' take it in, as it stands this second" onclick="drillResort()">Re-sort</button>');
+  }
+  d.rows = drillReorder(d.rows || []);
+  _drillRows = d.rows;
   const html = d.rows.length
     // Path lives UNDER the title, not in its own column. As a column it wrapped
     // to two or three lines and made every row a different height, so the size,
@@ -17974,7 +18074,7 @@ async function drillRefresh(force){
         }
         if(r.subocr_state==='rejected')
           why += `<div class="dim sub">subtitle OCR rejected this file — see reason above</div>`;
-        const main = `<tr class="${open?'rowopen':''}">
+        const main = `<tr class="${open?'rowopen':''}" data-fid="${r.id}">
          <td class="wrap"><div>${esc(r.label||r.title||'')}${stepBubbles(r)}</div>
            ${why}
            ${act}
@@ -18028,14 +18128,20 @@ async function drillRefresh(force){
 
   const box=document.getElementById('drillBody');
   if(!box) return;
-  if(!force && html===_drillKey) return;     // identical markup: leave it alone
-  _drillKey=html;
+  // THE KEY IS THE ROW SET, NOT THE MARKUP. Including the markup meant a
+  // queue position ticking from 21 to 20 rebuilt the whole table - which is
+  // the one thing this panel must not do while somebody is reading it. The
+  // volatile parts are written in place by patchSteps() instead.
+  const key = d.rows.map(r=>r.id).join(',') + '|' + (_drillLogId||'') + '|' + held;
+  if(!force && key===_drillKey){ patchSteps(d.rows); return; }
+  _drillKey=key;
   // Hold the scroll position across the rebuild. Even a genuine change - one
   // file leaving the error list - should not throw the reader back to the top
   // of the other ninety.
   const top=box.scrollTop;
   box.innerHTML=html;
   if(top) box.scrollTop=top;
+  patchSteps(d.rows);
 }
 
 // ONE BUBBLE PER WORKER, IN THE ORDER THE WORK HAPPENS.
@@ -18061,10 +18167,13 @@ function stepBubbles(r){
     const tip = s.label + ' - ' + (
         s.state==='owed'   ? 'nothing queued for it yet, and the answer is missing'
       : s.state==='queued' ? `queued as ${s.pool}, number ${s.pos||'?'} in that worker's line`
-      : s.state==='running'? `a ${s.pool} worker has it now${pct?' - '+pct+'%':''}`
+      : s.state==='running'? `a ${s.pool} worker has it now`
+                             + (run ? ' - ' + pct + '%' : ' - starting')
       :                      'answered; this step is behind the file');
-    return `<span class="wstep s-${s.state}" style="${col}" title="${esc(tip)}">`
-         + (s.state==='running' ? `<i style="width:${pct}%"></i>` : '')
+    return `<span class="wstep s-${s.state}" style="${col}" title="${esc(tip)}"
+         data-fid="${r.id}" data-kind="${esc(s.kind)}"
+         data-job="${esc(s.job_id||'')}">`
+         + (run ? `<i style="width:${pct}%"></i>` : '')
          + `<b>${esc(s.kind)}${s.state==='queued'&&s.pos?' '+s.pos:''}</b></span>`;
   }).join('')}</span>`;
 }
@@ -23595,6 +23704,9 @@ function paintRunning(j){
   // minute is not activity.
   if(lastDisks.length) renderDisks();
   renderOverall(j.overall);
+  // The eligible list's step bubbles, if it is open - see patchSteps().
+  try{ if(typeof _drillRows!=='undefined' && _drillRows.length) patchSteps(_drillRows); }
+  catch(_){ }
   document.getElementById('jobsHeld').innerHTML =
     (j.paused_reason
       ? `<div style="padding:10px 14px;border-bottom:1px solid var(--line)">
