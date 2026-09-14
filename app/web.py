@@ -12492,6 +12492,35 @@ tr.logdrop td{padding:0 0 8px 0;background:#1c2129;border-bottom:1px solid var(-
    PLANNED WORK and 0.7 GB never lined up with SIZE. Centred, header and cell
    alike, from the same rule. */
 .qrow .qwork,.qrow .qlib,.qrow .qdisk,.qrow .qsz{text-align:center}
+/* A GRID, NOT A FLEX ROW - for the main queue only (#queueList; the Plex and
+   arr-gap cards reuse .qrow with their own widths and keep the flex layout).
+   Flex sized the elastic cells by their content, so a short title and a wide
+   reason column left the right third of the box empty while the title was
+   cut off on the left. A grid hands every row the same tracks: the fixed
+   ones stay fixed, the elastic ones share what is left in a stated ratio,
+   and a cell is centred in its track rather than in whatever was left over.
+   The header is the same grid, so it cannot drift. */
+#queueList .qrow{display:grid;align-items:center;column-gap:10px;
+  grid-template-columns:40px 78px 80px minmax(0,3.4fr) minmax(0,2fr)
+                        minmax(0,1.1fr) 100px 68px 84px}
+#queueList.haswhy .qrow{
+  grid-template-columns:40px 78px 80px minmax(0,3fr) minmax(0,1.6fr)
+                        minmax(0,1fr) 100px 68px minmax(0,1.5fr) 84px}
+#queueList .qrow > *{min-width:0}
+#queueList .qrow .qpool,#queueList .qrow .qsrc{justify-self:center}
+#queueList .qrow .qmv{justify-self:end}
+#queueList .qrow .qwhy{text-align:right}
+/* ONE STYLE FOR EVERY HEADING. The header cells wear the row cells' classes
+   so they share widths - which also meant SOURCE inherited the 9px pill size
+   and the pool and reason cells brought their own colours. Every heading is
+   the same face at the same size, whatever its cell is. */
+#queueList .qrow.qhead > span{font-size:11px;font-weight:500;line-height:1.4;
+  text-transform:uppercase;letter-spacing:.02em;color:var(--dim);
+  padding:0;border:0;background:none;opacity:1;justify-self:stretch;
+  text-align:center}
+#queueList .qrow.qhead .qt{text-align:left}
+#queueList .qrow.qhead .qwhy{text-align:right}
+#queueList .qrow.qhead .qn{text-align:left}
 .qrow.qhead .qmv{opacity:1}
 /* ABOUT TO BE CLAIMED BY A FREE WORKER.
    The tint alone was easy to miss on a 300-row list, and these rows are the
@@ -22925,6 +22954,7 @@ async function loadQueue(){
       return (!b || b.state === 'next') ? null : b;
     };
     const anyWhy = items.some(whyOf);
+    box.classList.toggle('haswhy', anyWhy);
     const WHYCOL = {viewer:'#e3b341', held:'#f778ba', full:'var(--dim)'};
 
     const rowHtml=(it,i,up)=>{
