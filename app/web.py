@@ -3747,8 +3747,19 @@ def api_queue(pool: str | None = None, disk: str | None = None,
     # sat in plan_json ever since; the queue never said. Summarised to a short
     # phrase for the row, with the plan's own action sentences as the hover.
     for r in rows:
-        r["work"], r["work_full"] = _work_summary(r.pop("plan_json", None),
-                                                  r.get("pool") or "")
+        pj = r.pop("plan_json", None)
+        r["work"], r["work_full"] = _work_summary(pj, r.get("pool") or "")
+        # A JOB THAT WAS BORN AT THE FRONT SAYS SO TOO. UNBLOCKS below only
+        # knows about jobs that were LIFTED by precedence.promote(); one that
+        # the feeder created because something was blocked on it never passed
+        # through there, and read as an ordinary row that had jumped the queue
+        # for no stated reason.
+        if pj and '"blocking"' in pj:
+            try:
+                if json.loads(pj).get("blocking"):
+                    r["unblocks"] = "the processing system"
+            except (ValueError, TypeError):
+                pass
 
     tot = _rows(f"SELECT COUNT(*) n, COALESCE(SUM(f.size),0) bytes "
                 f"FROM jobs j LEFT JOIN files f ON f.id=j.file_id WHERE {w}",

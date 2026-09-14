@@ -582,6 +582,14 @@ def _to_hand_over(depth: int) -> tuple:
     # which is the exact failure it exists to prevent. The window takes the
     # oldest few dozen from EVERY disk that has any.
     rows = _candidates_per_disk(max(4, room))
+    # A FILE THE PROCESSING SYSTEM IS HELD ON COMES FIRST. The window above is
+    # already eligible-first, which is the right population; this is the one
+    # file in it that something is actually standing still behind.
+    try:
+        from . import precedence as _prec
+        rows = _prec.wanted_first("decode", rows)
+    except Exception:                                            # noqa: BLE001
+        pass
     # Skip what is already on the jobs table for any reason - enqueue would
     # refuse it anyway, but refusing two hundred rows a pass is noise.
     try:

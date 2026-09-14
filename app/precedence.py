@@ -101,6 +101,42 @@ PROMOTE_EVERY_S = 120.0
 UNBLOCKS: dict = {}
 UNBLOCKS_MAX = 400
 
+# WHICH FILES EACH SYSTEM IS BEING WAITED ON FOR - kind -> {file_id}.
+#
+# promote() lifts a job that EXISTS. The case it could not touch is the one
+# that was actually happening: no job of that kind for that file anywhere, and
+# a feeder choosing its next hundred files by its own rules, which do not
+# include "somebody is waiting on this one". Measured on this box: fifteen
+# files held on the listener, forty-seven listen jobs queued, and not one of
+# the forty-seven was for a file anything was waiting on.
+#
+# So each feeder reads this and puts these files first. Rebuilt from the live
+# held list on every breakdown pass, so a file that has since been answered
+# stops being preferred without anybody having to remember to remove it.
+WANTED: dict = {}
+
+
+def wanted(kind: str) -> set:
+    """The files something is waiting on this system for. Never raises."""
+    try:
+        return set(WANTED.get(kind) or ())
+    except Exception:                                        # noqa: BLE001
+        return set()
+
+
+def wanted_first(kind: str, rows: list, key=None) -> list:
+    """Stable-sort a feeder's candidate list so the blocking files lead."""
+    w = wanted(kind)
+    if not w or not rows:
+        return rows
+    if key is None:
+        def key(r):
+            return int((r or {}).get("file_id") or 0)
+    try:
+        return sorted(rows, key=lambda r: 0 if int(key(r)) in w else 1)
+    except Exception:                                        # noqa: BLE001
+        return rows
+
 # (file_id, kind) -> when it was first deferred, for the starvation cap.
 _FIRST: dict = {}
 # What the last pass held and why, for the page and the log.
@@ -328,6 +364,14 @@ def eligible_breakdown(force: bool = False) -> dict:
     # fires it at all. This runs whenever the processing system is idle and
     # something is waiting, which is exactly when the unblocking matters.
     # promote() throttles itself per file, so the repetition costs nothing.
+    # AND THE AUTHORITATIVE LIST OF WHO IS WAITING ON WHAT. Rebuilt rather
+    # than added to: this is the complete held set as of this pass, so a file
+    # that has been answered since the last one drops out by itself.
+    fresh: dict = {}
+    for fid, on in held:
+        fresh.setdefault(on, set()).add(int(fid))
+    WANTED.clear()
+    WANTED.update(fresh)
     for fid, on in held[:200]:
         promote(fid, on, "the processing system")
     _BREAK.update(at=now, data=out)
@@ -393,9 +437,17 @@ def promote(file_id: int, prereq: str, blocking: str = "") -> None:
             pass
         return
     # NOTHING QUEUED YET: ask the system that owns the answer for this file.
+    #
+    # AND SAY THAT SOMETHING IS BLOCKED ON IT, not merely that it is wanted.
+    # The listener's jump queue took the request and then dropped it on the
+    # way out: queued() only handed over files in state 'done', and a file
+    # waiting to be transcoded is 'eligible' by definition - so the one queue
+    # built for exactly this could never serve it. The flag rides with the
+    # request now and the feeder reads it.
+    WANTED.setdefault(prereq, set()).add(int(file_id))
     try:
         if prereq == "listen":
             from . import audiolang
-            audiolang.queue_check(int(file_id))
+            audiolang.queue_check(int(file_id), blocking=True)
     except Exception:                                        # noqa: BLE001
         pass

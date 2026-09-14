@@ -1554,20 +1554,52 @@ def _jump_init() -> None:
                 file_id INTEGER PRIMARY KEY,
                 at      REAL NOT NULL
             )""")
+        # blocking: the transcode of this very file is held until the answer
+        # exists (see precedence.promote). A plain request waits its turn; one
+        # of these is why something else is standing still, so it leads.
+        cols = {r["name"] for r in cur.execute(
+            "PRAGMA table_info(audio_lang_queue)")}
+        if "blocking" not in cols:
+            cur.execute("ALTER TABLE audio_lang_queue "
+                        "ADD COLUMN blocking INTEGER NOT NULL DEFAULT 0")
     _JUMP_READY = True
 
 
-def queue_check(file_id: int) -> None:
-    """Ask for this file to be listened to next. Cheap; never listens here."""
+def queue_check(file_id: int, blocking: bool = False) -> None:
+    """Ask for this file to be listened to next. Cheap; never listens here.
+
+    THE REQUEST TIME IS NOT REFRESHED ON A REPEAT. It used to be, and the
+    queue is read oldest-first - so a file asked for every two minutes by the
+    precedence pass sorted to the BACK of the queue, further back each time it
+    was asked for. A second request is the same request.
+    """
     try:
         if not _JUMP_READY:
             _jump_init()
         with cursor() as cur:
-            cur.execute("INSERT INTO audio_lang_queue(file_id,at) VALUES(?,?) "
-                        "ON CONFLICT(file_id) DO UPDATE SET at=excluded.at",
-                        (int(file_id), time.time()))
+            cur.execute(
+                "INSERT INTO audio_lang_queue(file_id,at,blocking) "
+                "VALUES(?,?,?) ON CONFLICT(file_id) DO UPDATE SET "
+                "  blocking=MAX(blocking, excluded.blocking)",
+                (int(file_id), time.time(), 1 if blocking else 0))
     except Exception:                                    # noqa: BLE001
         pass
+
+
+def blocking_count() -> int:
+    """Files something is blocked on that still have no listen job."""
+    try:
+        if not _JUMP_READY:
+            _jump_init()
+        with cursor() as cur:
+            return int(cur.execute(
+                "SELECT COUNT(*) n FROM audio_lang_queue q "
+                " WHERE q.blocking=1 AND NOT EXISTS ("
+                "   SELECT 1 FROM jobs j WHERE j.file_id=q.file_id "
+                "     AND j.kind='listen' AND j.state IN ('queued','running'))"
+            ).fetchone()["n"] or 0)
+    except Exception:                                    # noqa: BLE001
+        return 0
 
 
 def _queue_rows(limit: int = 100000) -> list:
@@ -1578,11 +1610,14 @@ def _queue_rows(limit: int = 100000) -> list:
     """
     with cursor() as cur:
         return cur.execute(
-            "SELECT q.file_id, q.at, f.state, f.path, f.title, f.season, "
+            "SELECT q.file_id, q.at, COALESCE(q.blocking,0) AS blocking, "
+            "       f.state, f.path, f.title, f.season, "
             "       f.episode, f.library, f.size, f.mtime, "
             "       COALESCE(f.audio_langs,'') AS audio_langs "
             "  FROM audio_lang_queue q LEFT JOIN files f ON f.id = q.file_id "
-            " ORDER BY q.at LIMIT ?", (int(limit),)).fetchall()
+            # BLOCKING FIRST. Everything else is oldest-first, as it was.
+            " ORDER BY q.blocking DESC, q.at LIMIT ?",
+            (int(limit),)).fetchall()
 
 
 def _verdicts_for(ids) -> dict:
@@ -1632,8 +1667,17 @@ def queued(limit: int = 200) -> list[dict]:
         if not _JUMP_READY:
             _jump_init()
         ensure_table()
+        # 'eligible' AS WELL AS 'done', AND THIS IS THE WHOLE BUG.
+        #
+        # The filter was written for files still landing - a half-imported
+        # file should not be listened to. But it was expressed as "only
+        # 'done'", and a file waiting for the processing system is 'eligible'.
+        # So the one queue built to let the precedence system jump a file to
+        # the front of the listener silently dropped every file it was given:
+        # 82 rows in the table, 15 of them blocking a transcode, 0 of the 15
+        # ever handed over. Anything still landing is still excluded.
         rows = [r for r in _queue_rows(limit)
-                if r["state"] == "done" and (r["audio_langs"] or "")]
+                if r["state"] in ("done", "eligible") and (r["audio_langs"] or "")]
         have = _verdicts_for([r["file_id"] for r in rows])
     except Exception:                                    # noqa: BLE001
         return out
@@ -1647,7 +1691,7 @@ def queued(limit: int = 200) -> list[dict]:
                         "title": r["title"] or "", "season": r["season"],
                         "episode": r["episode"], "library": r["library"] or "",
                         "tagged": (raw_code or "").strip().strip("-"),
-                        "jumped": True,
+                        "jumped": True, "blocking": bool(r["blocking"]),
                         "n_audio": len(codes)})
     return out
 

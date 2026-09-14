@@ -132,7 +132,11 @@ def _listen_pending(limit: int) -> list:
             order.append(fid)
             files[fid] = {"file_id": fid, "path": t.get("path") or "",
                           "library": t.get("library") or "", "tracks": [],
-                          "jumped": bool(t.get("jumped"))}
+                          "jumped": bool(t.get("jumped")),
+                          "blocking": False}
+        # Any track of a blocking file makes the file blocking.
+        if t.get("blocking"):
+            files[fid]["blocking"] = True
         files[fid]["tracks"].append({"track": int(t.get("track") or 0),
                                      "tagged": t.get("tagged") or ""})
     disks = _disks_of(order)
@@ -147,6 +151,9 @@ def _listen_plan(f: dict) -> str:
     return json.dumps({
         "listen": True, "rewrite": False,
         "tracks": f["tracks"], "jumped": bool(f.get("jumped")),
+        # Recorded on the job so the queue row can say why it is at the front
+        # even though nobody lifted it - it was born there. See api_queue.
+        "blocking": bool(f.get("blocking")),
         "summary": (f"listen to {n} track{'s' if n != 1 else ''}"
                     + (f" - {gaps} with no tag" if gaps else "")),
         "actions": [
@@ -173,19 +180,45 @@ async def topup_listen(depth: int | None = None) -> dict:
         # populations and measured fifteen seconds on this library; paying
         # that every minute to refill two slots would be most of what the
         # feeder does. It waits until a quarter of the depth has drained.
-        if room < max(1, depth // 4):
+        #
+        # THE DEADBAND IS FOR A QUIET QUEUE, NOT A BLOCKED ONE. With sixty
+        # slots it will not refill until fifteen are free, and a transcode
+        # held on a file with no listen job waits out that whole drain -
+        # measured: room 13 against a threshold of 15, so the feeder was
+        # doing nothing at all while fifteen files stood still behind it.
+        urgent = await asyncio.to_thread(audiolang.blocking_count)
+        if room < max(1, depth // 4) and not urgent:
             return {"ok": True, "made": 0, "on_queue": have}
+        if not room:
+            room = max(1, min(urgent, 8))   # make space for the blocked ones
         files = await jobs.in_work(_listen_pending, max(room * 6, 300))
         live = await asyncio.to_thread(_live_ids)
         files = [f for f in files if f["file_id"] not in live]
-        rows = _deal(files, room, lambda f: f.get("disk"))
+        # THE BLOCKING ONES ARE DEALT FIRST AND KEEP THEIR OWN ROOM, so a
+        # round robin over twelve spindles cannot spend the whole allowance
+        # on files nobody is waiting for.
+        stuck = [f for f in files if f.get("blocking")]
+        other = [f for f in files if not f.get("blocking")]
+        front = _deal(stuck, room, lambda f: f.get("disk"))
+        rows = _deal(other, max(0, room - len(front)), lambda f: f.get("disk"))
     except Exception as e:                                       # noqa: BLE001
         return {"ok": False, "why": f"{type(e).__name__}: {e}"[:200]}
-    # ONE TRANSACTION, OFF THE LOOP - see jobs.enqueue_many.
-    r = await jobs.in_work(jobs.enqueue_many,
-                           [{**f, "plan_json": _listen_plan(f)} for f in rows],
-                           "listen", 80, "audio language")
-    made = int(r.get("made") or 0)
+    made = 0
+    # ONE TRANSACTION, OFF THE LOOP - see jobs.enqueue_many. Two of them here:
+    # the blocked files go in at the promotion priority, ahead of everything
+    # the feeders queue, which is the entire point of noticing them.
+    if front:
+        from . import precedence as _prec
+        rf = await jobs.in_work(
+            jobs.enqueue_many,
+            [{**f, "plan_json": _listen_plan(f)} for f in front],
+            "listen", _prec.PROMOTE_TO, "audio language")
+        made += int(rf.get("made") or 0)
+    if rows:
+        r = await jobs.in_work(jobs.enqueue_many,
+                               [{**f, "plan_json": _listen_plan(f)} for f in rows],
+                               "listen", 80, "audio language")
+        made += int(r.get("made") or 0)
     STATE["listen"].update(fed=made, on_queue=have + made, at=time.time())
     return {"ok": True, "made": made, "on_queue": have + made}
 
@@ -312,6 +345,12 @@ async def topup_subread(depth: int | None = None) -> dict:
         live = await asyncio.to_thread(_live_ids)
         rows = [r for r in rows if r["file_id"] not in live]
         _SUBREAD_EMPTY["at"] = time.time() if not rows else 0.0
+        # Files a transcode is held on lead, then the round robin as before.
+        try:
+            from . import precedence as _prec
+            rows = _prec.wanted_first("subread", rows)
+        except Exception:                                        # noqa: BLE001
+            pass
         rows = _deal(rows, room, lambda r: r.get("disk"))
     except Exception as e:                                       # noqa: BLE001
         return {"ok": False, "why": f"{type(e).__name__}: {e}"[:200]}
