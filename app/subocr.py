@@ -1388,9 +1388,12 @@ def is_ocr_track(track: dict) -> bool:
     return bool(_OCR_TITLE.search(str(p.get("track_name") or "")))
 
 
-def embed(src: str, subs: list[tuple[str, str]], dst: str,
+def embed(src: str, subs: list[tuple], dst: str,
           drop_old_ocr: bool = True, drop_image_covered: bool = False) -> None:
     """Mux the SRTs in, demote every image sub, and put text subs FIRST.
+
+    `subs` is (path, name) or (path, name, language) - see the normalisation
+    at the top of the body.
 
     One pass, not a merge followed by an mkvpropedit: a second tool touching
     the file is a second chance to leave it half-done.
@@ -1427,7 +1430,25 @@ def embed(src: str, subs: list[tuple[str, str]], dst: str,
     # the muxer undid the previous pass every time. Each earlier OCR track is
     # now dropped only if THIS pass carries a replacement for its role;
     # one it does not replace is exactly the work the last pass did, and stays.
-    new_roles = {role_of(name) for _srt, name in subs}
+    # ONE SHAPE, NORMALISED ONCE, BEFORE ANY LINE READS IT.
+    #
+    # Callers pass (path, name) or (path, name, language). The argument loop
+    # below handled both; THIS line did not, and unpacking a three-element
+    # tuple into two names raises ValueError - so the embed died here, before
+    # mkvmerge was reached at all.
+    #
+    # That was every subtitle the TRANSCODE path prepared from the day
+    # sidecars started travelling with the rewrite, because that call site
+    # always passes the language: sixty jobs, each one committing the encode
+    # without the subtitles it had just paid the OCR to read and leaving the
+    # SRTs in subs-pending. Those are the "missed" rows in the pending panel -
+    # the panel was right, the verdict was right, and the cause was one line.
+    #
+    # Normalising up front rather than widening the one line, because the next
+    # line to read `subs` would have been just as free to assume the short form.
+    subs = [(sp[0], sp[1], (sp[2] if len(sp) > 2 else "") or "eng")
+            for sp in subs]
+    new_roles = {role_of(name) for _srt, name, _lang in subs}
     stale = [t["id"] for t in src_tracks
              if is_ocr_track(t)
              and role_of(str((t.get("properties") or {}).get("track_name") or ""))
@@ -1483,13 +1504,7 @@ def embed(src: str, subs: list[tuple[str, str]], dst: str,
     tagxml = os.path.join(os.path.dirname(dst) or ".", "nuarr_ocr_tags.xml")
     with open(tagxml, "w", encoding="utf-8") as _f:
         _f.write(_OCR_TAG_XML)
-    for i, sp in enumerate(subs):
-        # (path, name) or (path, name, language). The two-element form is
-        # every existing caller and means English, because that is what an OCR
-        # pass over this library produces; the third element exists so a
-        # sidecar can bring its own.
-        srt, name = sp[0], sp[1]
-        lang = (sp[2] if len(sp) > 2 else "") or "eng"
+    for i, (srt, name, lang) in enumerate(subs):
         args += ["--language", f"0:{lang}", "--track-name", f"0:{clean_label(name)}",
                  "--tags", f"0:{tagxml}",
                  "--forced-display-flag", "0:no",

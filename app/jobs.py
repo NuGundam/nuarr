@@ -5428,9 +5428,17 @@ async def _transcode(w: Worker, probe_data: dict) -> None:
             joblog.log(f"subtitles embedded; output is now "
                        f"{size_after/2**20:.1f} MB", "ok", job.id)
         except Exception as e:
-            joblog.log(f"could not embed the prepared subtitles - kept on "
-                       f"disk for the next subtitle pass: "
-                       f"{type(e).__name__}: {e}", "warn", job.id)
+            # ERROR, NOT WARN. This step is non-fatal on purpose - the encode
+            # is good and the commit goes ahead - and that is exactly why it
+            # has to be loud. Sixty jobs went past with the same ValueError
+            # before anyone saw it, each leaving an SRT in subs-pending and a
+            # file in the library without the subtitles it had just paid to
+            # read. Needs attention collects errors; a warn in one job's
+            # transcript is not a thing anybody reads.
+            joblog.log(f"could not embed the {len(_pend)} prepared subtitle "
+                       f"track(s) - the file commits WITHOUT them and the "
+                       f"SRTs stay in subs-pending for the next pass: "
+                       f"{type(e).__name__}: {e}", "error", job.id)
 
     # RE-RESOLVE THE TARGET BEFORE COMMITTING.
     # job.path was captured at enqueue, and an encode can run for an hour. If
