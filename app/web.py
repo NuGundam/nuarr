@@ -3695,7 +3695,10 @@ def api_queue(pool: str | None = None, disk: str | None = None,
     # can reorder and reason about. Which item starts NEXT is a different
     # question, answered by the ▶ next-up markers, which already account for
     # busy spindles and the Plex disk.
-    order = "j.priority, j.created_at"
+    # The same tiebreak the dispatcher uses - newest arrival first inside the
+    # fresh band, queue order everywhere else - or the panel would show an
+    # order the claimer does not keep.
+    order = f"j.priority, {jobs.FRESH_TIEBREAK}"
     order_params: tuple = ()
 
     # An explicit column sort REPLACES the dispatch ordering - you are asking
@@ -3706,7 +3709,7 @@ def api_queue(pool: str | None = None, disk: str | None = None,
             "pool_disk": "f.pool_disk", "library": "f.library",
             "pool": "j.pool"}
     if sort in cols:
-        order = f"{cols[sort]} {d}, j.priority, j.created_at"
+        order = f"{cols[sort]} {d}, j.priority, {jobs.FRESH_TIEBREAK}"
         order_params = ()
 
     cols_sel = ("SELECT j.job_id, j.kind, j.pool, j.priority, j.created_at, "
@@ -3730,8 +3733,8 @@ def api_queue(pool: str | None = None, disk: str | None = None,
         # end this endpoint swings between 2 and 12 seconds under load, which
         # buries a difference this size. Chosen for the smaller lock footprint,
         # not on a measurement. 2,000 rows of thirteen columns is ~1 MB.
-        _all = _rows(cols_sel + f"WHERE {w} ORDER BY j.priority, j.created_at",
-                     tuple(params))
+        _all = _rows(cols_sel + f"WHERE {w} ORDER BY j.priority, "
+                     f"{jobs.FRESH_TIEBREAK}", tuple(params))
         _t["sql_ms"] = round((time.perf_counter() - _m0) * 1000, 1)
         _t["scanned"] = len(_all)
         _m1 = time.perf_counter()

@@ -546,6 +546,17 @@ class Job:
 FRESH_PRIORITY = 20
 FRESH_STATES = ("eligible",)
 
+# AND WITHIN THAT BAND, THE NEWEST ARRIVAL FIRST. Two files both waiting to
+# be processed are not equal: the one that landed ten minutes ago is the one
+# somebody is about to look for, and the one that has waited a day has, by
+# definition, been waited for. So the tie inside the fresh band is broken by
+# when nuarr first saw the file, newest first - and only there. Everything
+# above the band keeps queue order, so the backlog is still worked in the
+# order it was queued. Used by the dispatcher and by the queue panel's own
+# sort, so what the panel shows is what the claimer does.
+FRESH_TIEBREAK = (f"CASE WHEN j.priority <= {FRESH_PRIORITY} "
+                  f"THEN -COALESCE(f.first_seen, 0) ELSE j.created_at END")
+
 
 def _fresh_priority(state: str, priority: int) -> int:
     if (state or "") in FRESH_STATES:
@@ -2298,7 +2309,7 @@ def _claim(pool: str) -> Job | None:
                 terms.append(f"CASE f.pool_disk {cases} ELSE 0 END")
                 for d, n in busy_rank.items():
                     params += [d, n]
-            ordr = ", ".join(terms + ["j.priority", "j.created_at"])
+            ordr = ", ".join(terms + ["j.priority", FRESH_TIEBREAK])
             return cur.execute(base + where_extra + f"ORDER BY {ordr} LIMIT 1",
                                tuple(params)).fetchone()
 

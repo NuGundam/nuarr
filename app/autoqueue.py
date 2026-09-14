@@ -194,7 +194,7 @@ def candidates(limit: int, only_disks: list[str] | None = None) -> list[dict]:
                   "               WHERE file_id IS NOT NULL "
                   "                 AND state IN ('queued','running')) ")
     cols = ("id, path, title, season, episode, mtime, size, requeued_at, "
-            "pool_disk")
+            "pool_disk, first_seen")
     # TARGETED TOP-UP. When the caller is filling a full-but-stuck queue, the
     # ONLY useful rows are the ones on the idle spindles - anything else would
     # deepen a queue that is already too deep to start.
@@ -219,15 +219,21 @@ def candidates(limit: int, only_disks: list[str] | None = None) -> list[dict]:
             "  AND requeued_at IS NOT NULL) "
             "WHERE rn <= ? ORDER BY rn, requeued_at DESC",
             disk_params + (per_disk,))]
+        # NEWEST ARRIVAL FIRST, NOT OLDEST. This was oldest-first on the
+        # reasoning that auto works the backlog - and it does, but a file
+        # that landed ten minutes ago is the one somebody is about to look
+        # for, and it was being queued behind every older file on its disk.
+        # Erik: "add a time stamp to the logic so new files get queued
+        # first". first_seen is when nuarr took the file in, which is the
+        # honest arrival time; mtime can be anything for a file copied from
+        # elsewhere. The spread across spindles is unchanged.
         if len(rows) < limit:
             rows += [dict(r) for r in cur.execute(
                 f"SELECT {cols} FROM (SELECT {cols}, ROW_NUMBER() OVER ("
-                "    PARTITION BY pool_disk "
-                "    ORDER BY CASE WHEN mtime IS NULL THEN 1 ELSE 0 END, mtime"
+                "    PARTITION BY pool_disk ORDER BY first_seen DESC"
                 f"  ) rn FROM files WHERE {base_where} "
                 "  AND requeued_at IS NULL) "
-                "WHERE rn <= ? "
-                "ORDER BY rn, CASE WHEN mtime IS NULL THEN 1 ELSE 0 END, mtime",
+                "WHERE rn <= ? ORDER BY rn, first_seen DESC",
                 disk_params + (per_disk,))]
 
     rows = _spread_by_disk(rows, limit)
@@ -237,16 +243,18 @@ def candidates(limit: int, only_disks: list[str] | None = None) -> list[dict]:
     return rows
 
 
-def _deal(rows: list[dict], limit: int, key="mtime") -> list[dict]:
+def _deal(rows: list[dict], limit: int, key="first_seen") -> list[dict]:
     """Round-robin one group of rows across spindles, order kept per disk."""
     by_disk: dict[str, list] = {}
     for r in rows:
         by_disk.setdefault(r.get("pool_disk") or "", []).append(r)
     if not by_disk:
         return []
-    # Start with the disk holding the oldest file, so the head of the queue is
-    # still the oldest thing on disk rather than an arbitrary spindle.
-    order = sorted(by_disk, key=lambda d: (by_disk[d][0].get(key) or 0))
+    # Start with the disk holding the NEWEST file, so the head of the queue
+    # is the newest thing on disk rather than an arbitrary spindle - the
+    # rows arrive newest-first per disk (see candidates), and the requeued
+    # group is likewise newest-requeue-first.
+    order = sorted(by_disk, key=lambda d: -(by_disk[d][0].get(key) or 0))
     out: list[dict] = []
     i = 0
     while len(out) < limit and any(by_disk.values()):
