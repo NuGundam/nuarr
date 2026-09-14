@@ -235,10 +235,29 @@ def _delete(file_id: int) -> None:
         cur.execute("DELETE FROM aud_queue WHERE file_id=?", (int(file_id),))
 
 
+def forget(file_id: int, why: str = "") -> None:
+    r"""Drop the instruction for a file that is no longer there.
+
+    The sibling of subqueue.forget - same reasoning. The row is an instruction
+    about tracks in a file; when an arr replaces that file the instruction is
+    void, and the listener writes a fresh one for the new file. Keeping it
+    only guarantees a job that can never succeed, every top-up.
+    """
+    _delete(file_id)
+    from . import joblog
+    joblog.log(f"audio languages: forgot the instruction for file {file_id}"
+               f"{' - ' + why if why else ''}", "warn")
+
+
 def _sweep_done() -> None:
     with cursor() as cur:
         cur.execute("DELETE FROM aud_queue WHERE state=? AND finished_at < ?",
                     (DONE, time.time() - DONE_KEEP_S))
+        # And instructions for files that are no longer there - the sibling of
+        # the same sweep in subqueue, where 59 such rows were found.
+        cur.execute("DELETE FROM aud_queue WHERE state=? AND file_id NOT IN "
+                    "(SELECT id FROM files WHERE state NOT IN "
+                    "('deleted','duplicate'))", (QUEUED,))
 
 
 # ---------------------------------------------------------------- the work --
@@ -340,10 +359,15 @@ def _to_hand_over(depth: int) -> tuple:
         room = max(0, int(depth) - have)
         if not room:
             return have, []
+        # NOT A FILE THAT IS NO LONGER THERE - see the same join in subqueue,
+        # where it was costing 18,667 dead jobs. Nothing has gone wrong here
+        # yet; the guard is the same size as the bug it prevents.
         rows = [dict(r) for r in cur.execute(
-            "SELECT file_id, path, name, steps, why, disk "
-            "  FROM aud_queue WHERE state=? "
-            " ORDER BY priority, queued_at LIMIT ?",
+            "SELECT q.file_id, q.path, q.name, q.steps, q.why, q.disk "
+            "  FROM aud_queue q LEFT JOIN files f ON f.id = q.file_id "
+            " WHERE q.state=? AND f.id IS NOT NULL "
+            "   AND (f.state IS NULL OR f.state NOT IN ('deleted','duplicate')) "
+            " ORDER BY q.priority, q.queued_at LIMIT ?",
             (QUEUED, min(20000, max(room * 20, 2000))))]
     by_disk: dict = {}
     for r in rows:

@@ -207,6 +207,9 @@ _refresh_lock = asyncio.Lock()
 BATCH: dict = {
     "started_at": None,
     "done": 0, "skipped": 0,
+    # label -> {n, look, pools, last, detail}. A bare count cannot be acted
+    # on; see _note_skip.
+    "skips": {},
     "pools": {},            # pool -> {media_s, wall_s, rate, n}
     "media_done_s": 0.0,
     "eta_shown": None,
@@ -253,10 +256,127 @@ def _batch_note_finish(pool: str, started_at: float, media_s: float,
 def _batch_reset_if_idle(queued: int, running: int) -> None:
     if queued == 0 and running == 0:
         BATCH.update(started_at=None, done=0, skipped=0, failed=0, pools={},
-                     media_done_s=0.0, eta_shown=None)
+                     skips={}, media_done_s=0.0, eta_shown=None)
     elif BATCH["started_at"] is None:
-        BATCH.update(started_at=time.time(), done=0, skipped=0, failed=0, pools={},
-                     media_done_s=0.0, eta_shown=None)
+        BATCH.update(started_at=time.time(), done=0, skipped=0, failed=0,
+                     pools={}, skips={}, media_done_s=0.0, eta_shown=None)
+
+
+# --------------------------------------------------- why a job was skipped --
+# A SKIP IS NOT A FAILURE AND IT IS NOT NOTHING EITHER, AND A BARE COUNT
+# CANNOT TELL THE TWO APART.
+#
+# The run line has carried "skipped 41" for as long as it has existed. Forty
+# one files that were already correct is the system working exactly as it
+# should; forty one files that are not where nuarr thinks they are is a fault
+# that will repeat every five minutes until somebody looks. The number is
+# identical either way, which is why nobody ever looked.
+#
+# Measured on this box the first time this was asked for: of 30,000 skipped
+# jobs, 29,101 had NO reason recorded at all - 18,667 of them subtitle jobs
+# for 154 files the arrs had replaced months ago, handed back by the subtitle
+# queue on every top-up, forever. That is what a number with no words next to
+# it hides.
+#
+# So every skip is bucketed into one short phrase, the full note is kept for
+# the hover, and the buckets that mean "look at this" say so. First needle to
+# match wins, so the specific cases sit above the general ones.
+_SKIP_WHY = (
+    ("source replaced during the encode", "replaced while it ran", True),
+    ("the file is not there",      "the file is not there",        True),
+    ("not where nuarr thinks",     "the file is not there",        True),
+    ("not on disk",                "the file is not there",        True),
+    ("source is gone",             "the file is not there",        True),
+    ("already carried out",        "already correct",              False),
+    ("already matches",            "already correct",              False),
+    ("nothing to change",          "already correct",              False),
+    ("no-op",                      "already correct",              False),
+    ("image sub to convert",       "no picture subtitles to read", False),
+    ("rejected:",                  "the OCR was not good enough",  False),
+    ("cues/min",                   "the OCR was not good enough",  False),
+    ("cues recovered",             "the OCR was not good enough",  False),
+    ("not ocr'd",                  "the OCR was not good enough",  False),
+    ("no verdict",                 "no verdict yet - it is asked again", False),
+    ("no reading",                 "nothing read yet - it is asked again", False),
+    ("produced no srt",            "the OCR tool could not read it", True),
+    ("extraction failed",          "the OCR tool could not read it", True),
+    ("winerror",                   "the OCR tool could not read it", True),
+    ("sharing violation",          "the file was open in something else", True),
+    ("timed out",                  "it timed out",                 True),
+    ("re-encode produced",         "re-encoding would not shrink it", False),
+    ("beyond the ceiling",         "re-encoding would not shrink it", False),
+    ("discarded",                  "re-encoding would not shrink it", False),
+)
+_SKIP_MAX = 24                 # buckets kept per run; the tail folds into +N
+
+
+def _skip_bucket(text: str) -> tuple:
+    """(short phrase, is it worth looking at) for one skip's note."""
+    t = (text or "").strip().lower()
+    if not t:
+        # Deliberately alarming. Every path that skips a job can say why, so
+        # this appearing at all is a call site that has not been given words.
+        return "no reason recorded", True
+    for needle, label, look in _SKIP_WHY:
+        if needle in t:
+            return label, look
+    # An unbucketed note still beats a number: take its first clause.
+    first = (text or "").split(" - ")[0].split(":")[0].strip()
+    return (first[:48] or "no reason recorded"), False
+
+
+def _note_skip(job: "Job", pool: str, text: str) -> None:
+    """Fold one skipped job into this run's breakdown. Never raises."""
+    try:
+        label, look = _skip_bucket(text)
+        skips = BATCH.setdefault("skips", {})
+        d = skips.get(label)
+        if d is None:
+            if len(skips) >= _SKIP_MAX:
+                return
+            d = skips[label] = {"n": 0, "look": look, "pools": {},
+                                "last": "", "detail": ""}
+        d["n"] += 1
+        who = pool or job.kind or "job"
+        d["pools"][who] = d["pools"].get(who, 0) + 1
+        d["last"] = job.title or os.path.basename(job.path or "")
+        if text:
+            d["detail"] = text[:200]
+    except Exception:                                        # noqa: BLE001
+        pass                    # telemetry must never be able to fail a job
+
+
+def _skip_rows(limit: int = 6) -> list:
+    """The breakdown the panel draws, biggest bucket first."""
+    skips = BATCH.get("skips") or {}
+    rows = sorted(skips.items(), key=lambda kv: -kv[1]["n"])
+    return [{"why": k, "n": v["n"], "look": bool(v["look"]),
+             "pools": sorted(v["pools"], key=lambda p: -v["pools"][p]),
+             "last": v["last"], "detail": v["detail"]}
+            for k, v in rows[:limit]]
+
+
+def _forget_queue_row(job: "Job") -> None:
+    r"""A vanished source voids the instruction, so drop the row that holds it.
+
+    THE MEASURED CASE. A subs job whose file is gone finished 'skipped' and
+    touched nothing else, so its sub_queue row stayed 'queued' and the next
+    top-up handed it straight back - 18,667 skipped subtitle jobs over two
+    days, all of them the same 154 files an arr had replaced with an upgrade.
+    The row describes a file that does not exist; when the replacement is
+    scanned, subplan writes a fresh row for the new file. Nothing is lost by
+    forgetting this one, and a poll that cannot ever succeed is not work.
+    """
+    try:
+        if job.kind == "subs":
+            from . import subqueue
+            subqueue.forget(int(job.file_id), "the file is no longer there")
+        elif job.kind == "audio":
+            from . import audqueue
+            audqueue.forget(int(job.file_id), "the file is no longer there")
+    except Exception as e:                                   # noqa: BLE001
+        joblog.log(f"could not clear the queue row for a vanished file: "
+                   f"{type(e).__name__}: {e}", "debug", job.id)
 
 
 def _queued_work() -> tuple[dict, float]:
@@ -380,6 +500,7 @@ def _overall(queued: int, workers: list["Worker"]) -> dict:
     return {"active": True, "done": BATCH["done"], "running": running,
             "queued": queued, "total": total,
             "skipped": BATCH.get("skipped", 0),
+            "skips": _skip_rows(),
             "failed": BATCH.get("failed", 0),
             "fraction": round(min(1.0, max(0.0, fraction)), 4),
             "eta_s": round(eta) if eta is not None else None,
@@ -3338,7 +3459,12 @@ async def _run(job: Job, pool: str) -> None:
             # already own deciding what the file's real state is.
             joblog.log(f"source is gone - the arr has replaced or moved it "
                        f"since this job was queued: {job.path}", "warn", job.id)
-            _finish(job, "skipped", 0, 0)
+            # And the instruction that pointed at it goes too, or the feeder
+            # hands the same dead file back every top-up - see the docstring.
+            _forget_queue_row(job)
+            _finish(job, "skipped", 0, 0,
+                    note="the file is not there - the arr replaced or moved "
+                         "it after this job was queued")
             return
 
         # IS ANYONE USING THIS FILE RIGHT NOW?
@@ -3537,8 +3663,10 @@ async def _run(job: Job, pool: str) -> None:
             return
 
         if job.plan.skip_reason or not job.plan.needed:
-            joblog.log("nothing to do - file left untouched", "ok", job.id)
-            _finish(job, "skipped", 0, 0)
+            why = job.plan.skip_reason or "it already matches the rules"
+            joblog.log(f"nothing to do - file left untouched ({why})",
+                       "ok", job.id)
+            _finish(job, "skipped", 0, 0, note=f"nothing to do - {why}")
             return
 
         await _transcode(w, data)
@@ -5696,6 +5824,8 @@ def _finish(job: Job, state: str, before: int, after: int,
                 BATCH["failed"] = BATCH.get("failed", 0) + 1
             elif state == "skipped":
                 BATCH["skipped"] = BATCH.get("skipped", 0) + 1
+                # `error` because two call sites put their words there.
+                _note_skip(job, w.pool if w else "", note or error or "")
     except Exception as e:
         joblog.log(f"batch telemetry error (ignored): {type(e).__name__}: {e}",
                    "debug", job.id)

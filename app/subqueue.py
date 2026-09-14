@@ -241,10 +241,33 @@ def _delete(file_id: int) -> None:
         cur.execute("DELETE FROM sub_queue WHERE file_id=?", (int(file_id),))
 
 
+def forget(file_id: int, why: str = "") -> None:
+    r"""Drop the instruction for a file that is no longer there.
+
+    Called by the job runner when it finds the source gone. The row is an
+    instruction ABOUT a file; with the file replaced by an arr upgrade the
+    instruction describes tracks that no longer exist, and the reading writes
+    a fresh row for the new file when it is scanned. Keeping the old one only
+    guarantees the same dead job every top-up - which is exactly what was
+    happening: 18,667 subtitle jobs skipped over two days for 154 files.
+    """
+    _delete(file_id)
+    joblog.log(f"subtitles: forgot the instruction for file {file_id}"
+               f"{' - ' + why if why else ''}", "warn")
+
+
 def _sweep_done() -> None:
     with cursor() as cur:
         cur.execute("DELETE FROM sub_queue WHERE state=? AND finished_at < ?",
                     (DONE, time.time() - DONE_KEEP_S))
+        # AND THE INSTRUCTIONS WHOSE FILE IS NOT THERE ANY MORE. The hand-over
+        # refuses to offer these (see _to_hand_over), which stops the dead
+        # jobs but leaves the rows sitting in the queue forever, counted as
+        # work waiting. 59 of them were found the day this was written. The
+        # replan's own "gone" pass only covers files that still have facts.
+        cur.execute("DELETE FROM sub_queue WHERE state=? AND file_id NOT IN "
+                    "(SELECT id FROM files WHERE state NOT IN "
+                    "('deleted','duplicate'))", (QUEUED,))
 
 
 # ---------------------------------------------------------------- the work --
@@ -360,10 +383,21 @@ def _to_hand_over(depth: int) -> tuple:
             return have, []
         # Read a wider slice than needed so there is something from the
         # smaller disks to deal out. Bounded, because this is a poll.
+        # AND NEVER A FILE THAT IS NOT THERE ANY MORE.
+        #
+        # An arr upgrade removes the row in `files` (or marks it deleted) and
+        # leaves this instruction pointing at a path nothing can open. The job
+        # it makes finishes 'skipped' in under two milliseconds having done
+        # nothing and told nobody, and the next top-up hands the same row
+        # straight back. Measured before this join existed: 59 such rows,
+        # 18,667 skipped subtitle jobs over two days, 353 of them for one
+        # episode of Ishura. A file that is gone has no subtitles to settle.
         rows = [dict(r) for r in cur.execute(
-            "SELECT file_id, path, name, rewrite, steps, why, disk "
-            "  FROM sub_queue WHERE state=? "
-            " ORDER BY priority, queued_at LIMIT ?",
+            "SELECT q.file_id, q.path, q.name, q.rewrite, q.steps, q.why, q.disk "
+            "  FROM sub_queue q LEFT JOIN files f ON f.id = q.file_id "
+            " WHERE q.state=? AND f.id IS NOT NULL "
+            "   AND (f.state IS NULL OR f.state NOT IN ('deleted','duplicate')) "
+            " ORDER BY q.priority, q.queued_at LIMIT ?",
             (QUEUED, min(20000, max(room * 20, 2000))))]
     by_disk: dict = {}
     for r in rows:

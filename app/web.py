@@ -14283,6 +14283,22 @@ tr.logrow td{background:#1c2129;border-bottom:1px solid var(--acc);padding:0 12p
        white-space:nowrap}
 .ovl-dv{font-variant-numeric:tabular-nums;font-weight:600}
 .ovl-x{color:var(--warn);font-size:11px;cursor:help}
+/* WHAT WAS SKIPPED, AND WHY. Its own line rather than another group in .ovl:
+   the run line is all rates and sizes, and this is the one thing on it that
+   might need doing something about. Chips wrap; the amber ones are the
+   reasons that mean look, and they are amber wherever they land in the row. */
+.skrow{display:flex;flex-wrap:wrap;gap:6px 10px;align-items:baseline;
+       margin-top:8px;padding-top:8px;border-top:1px dashed var(--line);
+       font-size:12px}
+.skn{font-variant-numeric:tabular-nums}
+.skchips{display:flex;flex-wrap:wrap;gap:5px;align-items:baseline;flex:1}
+.skchip{display:inline-flex;align-items:baseline;gap:5px;cursor:pointer;
+        padding:1px 7px;border:1px solid var(--line);border-radius:10px;
+        color:var(--dim);font-size:11px;white-space:nowrap}
+.skchip b{color:var(--fg);font-variant-numeric:tabular-nums}
+.skchip.look{border-color:var(--warn);color:var(--warn)}
+.skchip.look b{color:var(--warn)}
+.sklink{color:#6fb0ff;text-decoration:none;font-size:11px;white-space:nowrap}
 /* Files per pool disk. Sized so nothing can be squeezed off the end: the
    figures get fixed widths and the capacity bar - the only elastic thing -
    absorbs whatever is left. */
@@ -22093,7 +22109,10 @@ competing with each other, not just keeping the pool busy">×${d.jobs}</span>`
   }
   if(o.remaining_media_s)
     bits.push(G('video left', hms(o.remaining_media_s)));
-  if(o.skipped) bits.push(G('skipped', fmt(o.skipped)));
+  // ONLY WHEN THE STRIP BELOW CANNOT SAY IT BETTER. The breakdown carries the
+  // same total and the reasons with it, so showing the bare figure here too
+  // was the same number twice on two adjacent lines.
+  if(o.skipped && !(o.skips||[]).length) bits.push(G('skipped', fmt(o.skipped)));
   el.innerHTML=
     `<div style="padding:10px 14px;border-bottom:1px solid var(--line)">
        <div style="display:flex;justify-content:space-between;align-items:baseline;
@@ -22108,7 +22127,65 @@ competing with each other, not just keeping the pool busy">×${d.jobs}</span>`
        </div>
        <div class="bar big"><i style="width:${pct.toFixed(1)}%"></i></div>
        <div class="ovl">${bits.join('')}</div>
+       ${skipStrip(o)}
      </div>`;
+}
+
+// WHAT WAS SKIPPED, AND WHY, WITHOUT OPENING ANYTHING.
+//
+// "skipped 41" was on this line for months and could not be acted on: 41 files
+// that were already correct is the system working, and 41 files that are not
+// where nuarr thinks they are is a fault that repeats every five minutes until
+// somebody looks. The count is identical either way. jobs.py buckets each skip
+// into one short phrase now (see _SKIP_WHY), so the count arrives with the
+// reasons already counted - biggest first, the ones worth looking at in amber,
+// the full note and the last file on the hover.
+function skipStrip(o){
+  const rows=(o.skips||[]).filter(x=>x && x.n);
+  if(!o.skipped || !rows.length) return '';
+  const look=rows.some(x=>x.look);
+  const shown=rows.reduce((a,x)=>a+x.n,0);
+  const rest=Math.max(0, (o.skipped||0)-shown);
+  const chips=rows.map(x=>{
+    const pools=(x.pools||[]).join(', ');
+    const tip=(x.detail||x.why)
+            + (pools?`\n\nseen in: ${pools}`:'')
+            + (x.last?`\nlast one: ${x.last}`:'')
+            + (x.look?'\n\nThis one is worth a look — nothing was done to '
+                     +'these files, and the reason is not "they were fine".':'');
+    return `<span class="skchip${x.look?' look':''}" title="${esc(tip)}"`
+         + ` onclick="skipJump('${jsq((x.pools||[])[0]||'')}')"`
+         + `>${esc(x.why)} <b>${fmt(x.n)}</b></span>`;
+  }).join('');
+  return `<div class="skrow">
+      <span class="pill ${look?'p-warn':'p-dim'}" style="font-size:9.5px"
+        title="A skipped job ran and changed nothing. That is the right answer
+for a file that already matches the rules, and the wrong one for a file that
+has moved - which is why they are broken out.">SKIPPED</span>
+      <span class="skn"><b>${fmt(o.skipped)}</b>
+        <span class="dim">of ${fmt(o.done)} finished — nothing was changed</span></span>
+      <span class="skchips">${chips}${rest?`<span class="skchip"
+        title="the smaller reasons, each below the six shown">+${fmt(rest)} more</span>`:''}</span>
+      <a class="sklink" href="#" onclick="skipJump();return false;"
+         title="jump to the Activity feed with the skipped rows selected"
+         >see them in Activity →</a>
+    </div>`;
+}
+
+// The Activity filter is stocked from what is in the feed, and its values read
+// "subs · skipped" rather than "skipped" - so pick the option that matches the
+// pool asked for, or any skipped one, rather than setting a value that is not
+// in the list and silently filtering to nothing.
+function skipJump(pool){
+  const sel=document.getElementById('doneFilter');
+  if(sel){
+    const opts=[...sel.options].filter(o=>/skipped/.test(o.value));
+    const hit=(pool && opts.find(o=>o.value.indexOf(pool)===0)) || opts[0];
+    if(hit){ sel.value=hit.value; applyDoneFilter(); }
+  }
+  const p=document.getElementById('jobsDone');
+  if(p) p.scrollIntoView({behavior:'smooth', block:'center'});
+  return false;
 }
 
 // Overlap guard. The poll fires every 2 s; when a response took longer than
