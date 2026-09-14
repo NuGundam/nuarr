@@ -12459,7 +12459,10 @@ tr.logdrop td{padding:0 0 8px 0;background:#1c2129;border-bottom:1px solid var(-
    and smooth turns each of those into its own animation that the next tick
    interrupts - the list stalls and scrollTop reads back mid-flight. The Top
    button asks for smooth explicitly instead. */
-.qbox{height:300px;overflow-y:auto}
+/* SIXTEEN ROWS. 300px showed nine and a half, which on a queue whose first
+   wave is five files and whose point is the order behind them left the
+   order mostly below the fold. */
+.qbox{height:620px;overflow-y:auto}
 .qbox::-webkit-scrollbar{width:12px}
 .qbox::-webkit-scrollbar-thumb{background:#2b3340;border-radius:6px}
 .qbox::-webkit-scrollbar-track{background:#0b0e12}
@@ -12483,7 +12486,12 @@ tr.logdrop td{padding:0 0 8px 0;background:#1c2129;border-bottom:1px solid var(-
 .qrow.qhead .qpool,.qrow.qhead .qsrc{text-align:center;justify-content:center}
 .qrow.qhead .qwork,.qrow.qhead .qwhy,.qrow.qhead .qlib,.qrow.qhead .qsz{
   color:var(--dim);font-size:11px}
-.qrow.qhead .qsz,.qrow.qhead .qwhy{text-align:right}
+.qrow.qhead .qwhy{text-align:right}
+/* UNDER THEIR HEADINGS. Work, library, disk and size were left-aligned data
+   under centred-looking labels, so "verify" sat a column's width left of
+   PLANNED WORK and 0.7 GB never lined up with SIZE. Centred, header and cell
+   alike, from the same rule. */
+.qrow .qwork,.qrow .qlib,.qrow .qdisk,.qrow .qsz{text-align:center}
 .qrow.qhead .qmv{opacity:1}
 /* ABOUT TO BE CLAIMED BY A FREE WORKER.
    The tint alone was easy to miss on a 300-row list, and these rows are the
@@ -12518,6 +12526,18 @@ tr.logdrop td{padding:0 0 8px 0;background:#1c2129;border-bottom:1px solid var(-
         border-bottom:1px solid rgba(255,255,255,.05)}
 .qsplit i{flex:1;height:1px;background:var(--line)}
 .qsplit b{color:var(--acc);font-weight:600;letter-spacing:.08em}
+/* THE EXPLANATION IS A SENTENCE, NOT A LABEL. The divider's upper-case,
+   tracked, 10.5px styling is right for "STARTING NEXT" and wrong for "the
+   next copy on a spindle starts when the one there passes 85%" - which is
+   the one line on this panel that explains why the order is what it is.
+   The sentence gets its own line under the label, in normal case at reading
+   size, with the count beside the label where it belongs. */
+.qsplit.qnexthead{flex-wrap:wrap;padding:7px 14px 6px;row-gap:3px}
+.qsplit.qnexthead .qcount{color:var(--fg,#c9d1d9);letter-spacing:0;
+  text-transform:none;font-size:11.5px}
+.qsplit.qnexthead .qexplain{flex-basis:100%;text-transform:none;letter-spacing:0;
+  font-size:11.5px;line-height:1.45;color:#aab6c6}
+.qsplit.qnexthead .qexplain b{color:var(--fg,#c9d1d9);font-weight:600;letter-spacing:0}
 /* The next-up marker uses the SAME three-dot indicator as the Transcoding
    panel's running groups (.spin). A static ▶ said "this one is next" but not
    "and the system is actively working towards it"; the two panels sit one
@@ -13058,7 +13078,7 @@ button.on{border-color:var(--ok);color:var(--ok)}
 .qrow .qdisk{flex:0 0 96px;overflow:hidden;text-overflow:ellipsis;
              white-space:nowrap}
 .qrow .qsz{color:var(--dim);font-variant-numeric:tabular-nums;flex:0 0 70px;
-           text-align:right}
+           text-align:center}
 /* Reorder controls. Hidden until the row is hovered so 300 rows are not 1,200
    buttons competing with the text. */
 .qrow .qmv{display:flex;gap:2px;opacity:0;transition:opacity .12s}
@@ -22958,8 +22978,9 @@ async function loadQueue(){
     box.innerHTML = items.length
       ? headHtml
         + (pinned
-          ? `<div class="qsplit"><b>starting next</b><span>${pinned} file${
-                pinned===1?'':'s'}${_qHead?' — '+esc(_qHead):''}</span><i></i></div>`
+          ? `<div class="qsplit qnexthead"><b>starting next</b><span class="qcount">${pinned} file${
+                pinned===1?'':'s'}</span><i></i>${
+                _qHead?`<span class="qexplain">${qHeadHtml(_qHead)}</span>`:''}</div>`
             + items.slice(0, pinned).map((it,i)=>rowHtml(it,i,true)).join('')
             + (items.length > pinned
                 ? `<div class="qsplit"><span>then, in order</span><i></i></div>`
@@ -27683,6 +27704,14 @@ async function metaSync(){
 // functions the dispatcher uses - so the explanation cannot drift away from
 // the behaviour it is explaining.
 let _qWhy = {}, _qHead = '';
+// The headline is prose from the server; the spindle names and the figures
+// in it are the parts the eye is looking for, so they are lit and the disk
+// names wear their colour - the same one they wear in the rows below.
+function qHeadHtml(t){
+  return esc(t)
+    .replace(/\b(NU-DRIVE-\d+)\b/g, (m)=>`<b style="color:${diskColor(m)}">${m}</b>`)
+    .replace(/(\d+(?:\.\d+)?%)/g, '<b>$1</b>');
+}
 async function loadQueueWhy(){
   try{
     const d = await (await fetch('/api/queue/blockers')).json();
