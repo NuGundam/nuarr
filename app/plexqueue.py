@@ -429,6 +429,41 @@ def _revive_if_auto() -> None:
                    "up", "info")
 
 
+# How long a finished row is kept. Nothing reads one after the panel has shown
+# it; the count of what is OUTSTANDING is what these tables are for. See the
+# sweep in watch().
+DONE_KEEP_S = 14 * 24 * 3600
+
+_TABLE = 'plex_queue'
+
+
+def sweep_done(keep_s: float = DONE_KEEP_S) -> int:
+    """Drop finished rows older than keep_s. -> how many went."""
+    try:
+        with cursor() as cur:
+            n = cur.execute(
+                f"DELETE FROM {_TABLE} WHERE done_at IS NOT NULL AND done_at < ?",
+                (time.time() - float(keep_s),)).rowcount
+        return int(n or 0)
+    except Exception:                                            # noqa: BLE001
+        return 0
+
+
+_LAST_SWEEP = {"at": 0.0}
+
+
+def _sweep_done_sometimes() -> None:
+    """At most once an hour, from the loop. Never raises."""
+    now = time.time()
+    if now - _LAST_SWEEP["at"] < 3600:
+        return
+    _LAST_SWEEP["at"] = now
+    n = sweep_done()
+    if n:
+        joblog.log(f"{_TABLE}: forgot {n:,} finished row(s) older than "
+                   f"{DONE_KEEP_S / 86400:.0f} days", "debug")
+
+
 async def watch() -> None:
     init()
     await asyncio.sleep(60)
@@ -437,6 +472,7 @@ async def watch() -> None:
         try:
             await asyncio.to_thread(_revive_if_auto)
             await run_due()
+            await asyncio.to_thread(_sweep_done_sometimes)
         except Exception as e:                               # noqa: BLE001
             joblog.log(f"Plex queue loop error: {type(e).__name__}: {e}",
                        "error")

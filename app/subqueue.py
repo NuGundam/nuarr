@@ -323,6 +323,37 @@ def row_for(file_id: int) -> dict:
     return d
 
 
+# "THE FILE HAS CHANGED SINCE IT WAS READ" IS NOT A FAILURE TO RETRY.
+#
+# do_one refuses to act when the plan's track ordinals no longer match the
+# container - correctly, because acting on a stale map is how the wrong track
+# gets deleted. What happened next was wrong: note_result counted it as an
+# attempt and re-queued the SAME stale plan, which cannot succeed, three times,
+# and then marked the row failed and left the file's subtitles unsettled for
+# good with nothing scheduled to look again.
+#
+# Measured at the audit: 30 such failures across 10 files, three runs each,
+# every run a full container read to enumerate tracks that were never going to
+# match. The answer is to throw the READING away, not the file: drop the row
+# and the facts it was planned from, and the reader re-reads the file on its
+# next pass and plans it again from what is there now.
+_STALE_MARKS = ("have moved since", "has changed since", "not where the plan")
+
+
+def _replan_from_scratch(fid: int, why: str) -> None:
+    """Forget what was read about this file so the reader reads it again."""
+    try:
+        with cursor() as cur:
+            cur.execute("DELETE FROM sub_queue WHERE file_id=?", (fid,))
+            cur.execute("DELETE FROM sub_facts WHERE file_id=?", (fid,))
+        joblog.log(f"subtitles: file {fid} changed since it was read - the "
+                   f"instruction is void, re-reading rather than retrying it "
+                   f"({why[:80]})", "warn")
+    except Exception as e:                                       # noqa: BLE001
+        joblog.log(f"could not clear the stale subtitle reading for {fid}: "
+                   f"{type(e).__name__}: {e}", "debug")
+
+
 def note_result(file_id: int, res: dict) -> None:
     """What the worker found, written back onto the row."""
     init()
@@ -330,6 +361,10 @@ def note_result(file_id: int, res: dict) -> None:
     if res.get("ok"):
         _mark(fid, DONE, finished_at=time.time(), err="",
               result=json.dumps(res)[:4000])
+        return
+    why = str(res.get("why") or "")
+    if any(m in why.lower() for m in _STALE_MARKS):
+        _replan_from_scratch(fid, why)
         return
     with cursor() as cur:
         cur.execute("UPDATE sub_queue SET tries=tries+1 WHERE file_id=?", (fid,))

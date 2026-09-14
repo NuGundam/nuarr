@@ -2658,39 +2658,97 @@ async def pump() -> None:
         await asyncio.sleep(max(1.0, nap))
 
 
-def reap_orphan_encoders() -> dict:
-    r"""Kill ffmpeg processes left behind by a previous nuarr process.
+# EVERY TOOL NUARR SPAWNS, NOT JUST FFMPEG.
+#
+# The first version of this reaper knew about ffmpeg. Measured at the audit,
+# three days after it was written: 21 orphaned children were alive on this box
+# - twelve mkvextract, seven ffmpeg, two mkvmerge - the oldest three days old,
+# holding 600 MB of memory and, worse, holding cache files open. That is why
+# the stray sweep reported "kept 3, removed 0" over two abandoned subtitle
+# rewrites it had itself just said it would remove: os.remove failed because a
+# dead job's mkvmerge still had the handle.
+#
+# Plex's transcoder is "Plex Transcoder.exe" and is not in this list. Anything
+# that IS in it still has to be working on one of our own paths before it is
+# touched.
+_CHILD_TOOLS = ("ffmpeg.exe", "ffprobe.exe", "mkvmerge.exe", "mkvextract.exe",
+                "mkvpropedit.exe", "ffmpeg", "ffprobe", "mkvmerge",
+                "mkvextract", "mkvpropedit")
+# Never touch a child younger than this. A job that has just started has a
+# parent, and a parent lookup that is momentarily unlucky must not be able to
+# kill live work.
+ORPHAN_GRACE_S = 20 * 60
 
-    When the server dies or is restarted mid-encode, its ffmpeg children keep
-    running: Windows does not reap them, and they hold a read handle on the
-    SOURCE file for as long as they live. The restarted server then re-queues
-    those same jobs, the lock check correctly reports the file is in use, and
-    every one of them defers - forever, because the orphan never finishes into
-    anything. Symptom is a log full of
-    "deferred - file is in use by FFmpeg command-line tools (pid N)".
 
-    Identified by output path, not by name: only processes writing into our own
-    cache directory are ours. Anything else - Plex, Tdarr, a manual ffmpeg - is
-    left strictly alone.
+def _our_roots() -> list:
+    roots = [os.path.normcase(os.path.abspath(SETTINGS.cache_dir))]
+    try:
+        for l in (SETTINGS.libraries or []):
+            p = getattr(l, "path", None) or (l.get("path") if isinstance(l, dict)
+                                             else None)
+            if p:
+                roots.append(os.path.normcase(os.path.abspath(str(p))))
+    except Exception:                                        # noqa: BLE001
+        pass
+    return roots
+
+
+def reap_orphan_encoders(dry: bool = False) -> dict:
+    r"""Kill the tool processes left behind by a previous nuarr process.
+
+    When the server dies or is restarted mid-job, its children keep running:
+    Windows does not reap them. They hold a handle on the source file (so the
+    lock check defers that job forever - a log full of "deferred - file is in
+    use by FFmpeg command-line tools (pid N)"), they hold their output in the
+    cache (so the stray sweep cannot delete it), and they hold their memory.
+
+    THREE TESTS, ALL OF WHICH MUST PASS, because this kills things:
+      the name   is one of the tools nuarr spawns
+      the paths  it is working on the cache or inside one of our libraries
+      the parent is not a live nuarr. Not "the ppid exists" - Windows recycles
+                 pids, and an orphan adopted by an unrelated process looked
+                 owned - but "the process at that pid is a nuarr older than
+                 this child".
     """
     import psutil
 
-    cache = os.path.normcase(os.path.abspath(SETTINGS.cache_dir))
-    killed, skipped = [], 0
-    me = os.getpid()
-    for p in psutil.process_iter(["pid", "name", "ppid", "cmdline"]):
+    roots = _our_roots()
+    killed, skipped, kept = [], 0, 0
+    me = psutil.Process()
+    my_pid, my_name = me.pid, (me.name() or "").lower()
+    now = time.time()
+    for p in psutil.process_iter(["pid", "name", "ppid", "cmdline",
+                                  "create_time"]):
         try:
-            if (p.info["name"] or "").lower() not in ("ffmpeg.exe", "ffmpeg"):
+            if (p.info["name"] or "").lower() not in _CHILD_TOOLS:
                 continue
             cmd = p.info["cmdline"] or []
-            if not any(cache in os.path.normcase(str(a)) for a in cmd):
+            if not any(any(r in os.path.normcase(str(a)) for r in roots)
+                       for a in cmd):
                 skipped += 1
                 continue          # not ours - never touch it
+            if now - float(p.info["create_time"] or now) < ORPHAN_GRACE_S:
+                kept += 1
+                continue          # too young to judge
             ppid = p.info["ppid"]
-            if ppid == me or psutil.pid_exists(ppid):
-                continue          # a live parent owns it; leave it running
+            if ppid == my_pid:
+                kept += 1
+                continue          # ours, and we are alive
+            alive = False
+            try:
+                par = psutil.Process(ppid)
+                alive = ((par.name() or "").lower() == my_name
+                         and par.create_time() <= float(p.info["create_time"]))
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                alive = False
+            if alive:
+                kept += 1
+                continue          # a live nuarr owns it
+            if dry:
+                killed.append(p.info["pid"])
+                continue
             out = next((a for a in reversed(cmd)
-                        if cache in os.path.normcase(str(a))), None)
+                        if roots[0] in os.path.normcase(str(a))), None)
             p.kill()
             killed.append(p.info["pid"])
             if out and os.path.exists(out):
@@ -2700,11 +2758,28 @@ def reap_orphan_encoders() -> dict:
                     pass
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
-    if killed:
-        joblog.log(f"reaped {len(killed)} orphaned encoder(s) from a previous "
-                   f"run (pids {', '.join(map(str, killed))}) — they were "
-                   f"holding source files locked", "warn")
-    return {"killed": killed, "left_alone": skipped}
+    if killed and not dry:
+        joblog.log(f"reaped {len(killed)} orphaned tool process(es) left by an "
+                   f"earlier run (pids {', '.join(map(str, killed))}) - they "
+                   f"were holding files open", "warn")
+    return {"killed": killed, "left_alone": skipped, "still_working": kept}
+
+
+async def reap_orphans_forever() -> None:
+    """And keep doing it. A restart is not the only way one gets away.
+
+    The reaper ran at boot only, which catches the orphans a restart makes and
+    none of the ones a cancelled or timed-out job makes while the server keeps
+    running - and those were most of the twenty-one found at the audit.
+    """
+    await asyncio.sleep(900)
+    while True:
+        try:
+            r = await asyncio.to_thread(reap_orphan_encoders)
+            _ = r
+        except Exception as e:                               # noqa: BLE001
+            joblog.log(f"orphan reaper: {type(e).__name__}: {e}", "debug")
+        await asyncio.sleep(3600)
 
 
 # Set once the slow disk recovery below has finished. pump() is gated behind it,

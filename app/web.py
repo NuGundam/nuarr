@@ -788,6 +788,31 @@ async def _startup() -> None:
         # oldest from the 8th of August - the residue of commits interrupted
         # by a restart. Only files older than six hours, and a backup or a
         # staged copy only once the file it was made from is back.
+        # A SIX-HOUR STALENESS RULE ENFORCED ONCE A DAY IS A DAY-LONG LEAK.
+        #
+        # Found at the audit: two abandoned subtitle rewrites, 0.59 GB, sitting
+        # in the cache for a day and a half - both of them things the sweep
+        # itself says it would remove. The cache is four entries and the walk
+        # is instant, so it gets its own hourly pass; the library walk is six
+        # roots and 39,855 files and stays daily, which is the cadence that
+        # rule was written for.
+        async def _sweep_cache_hourly():
+            from . import fileops as _fo
+            from .config import SETTINGS as _S
+            await asyncio.sleep(300)
+            while True:
+                try:
+                    st = await asyncio.to_thread(
+                        _fo.sweep_strays, [_S.cache_dir])
+                    if st.get("removed"):
+                        joblog.log(
+                            f"cache: removed {st['removed']} abandoned working "
+                            f"file(s), {st['bytes'] / 2**30:.2f} GB", "ok")
+                except Exception:                            # noqa: BLE001
+                    pass
+                await asyncio.sleep(3600)
+        asyncio.create_task(_sweep_cache_hourly())
+
         async def _sweep_strays_daily():
             from . import fileops as _fo
             await asyncio.sleep(600)
@@ -889,6 +914,12 @@ async def _startup() -> None:
     # Clear OCR readers stranded by an earlier run. Nothing else ever will -
     # they are in no job table and no code holds a handle to them.
     asyncio.create_task(asyncio.to_thread(_subocr.reap_orphans))
+    # AND EVERY OTHER TOOL, HOURLY. The boot reaper catches what a
+    # restart orphans; a cancelled or timed-out job orphans one while the
+    # server keeps running, and those were 19 of the 21 found at the
+    # audit - the oldest 60 hours old, holding a cache file open.
+    from . import jobs as _jobs_reap
+    asyncio.create_task(_jobs_reap.reap_orphans_forever())
     # Notices console windows that actually appear, and writes down what
     # opened them - so the next flash has an answer waiting instead of needing
     # somebody to sit and watch for it.
