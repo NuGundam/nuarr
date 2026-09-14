@@ -12762,6 +12762,30 @@ tr.logdrop td{padding:0 0 8px 0;background:#1c2129;border-bottom:1px solid var(-
   color:var(--rowcol,var(--acc));margin-left:7px;opacity:.85}
 @media (prefers-reduced-motion: reduce){
   #drillBody tr.liverow > td{animation:none}}
+/* HOW FAR IN IT IS, AFTER THE LAST BUBBLE.
+   The bubbles say WHICH worker has the file and the glow says the row is
+   live; neither answers "how much longer". The number sits where the eye
+   already is - immediately after the transcode bubble - in the same colour
+   as the worker, and tabular so the digits do not jitter as it counts. */
+#drillBody .livenote{
+  font-size:10px;margin-left:7px;letter-spacing:.04em;opacity:.9;
+  font-variant-numeric:tabular-nums;color:var(--rowcol,var(--acc))}
+/* 100% IS NOT THE END OF THE JOB. ffmpeg finishing is the moment the file
+   starts MOVING, and where it lands is decided by DrivePool, not by us - so
+   the note turns green and names the spindle instead of sitting at 100%,
+   which reads as finished-and-stuck. */
+#drillBody .livenote.lnmove{color:var(--ok);opacity:1}
+/* AND THE ROW DOES NOT BLINK OUT. A file that finishes leaves this list,
+   and vanishing between two polls is indistinguishable from a bug. It is
+   drawn once more, saying where the file went, and fades. */
+#drillBody tr.rowgone > td{
+  animation:rowgone 1.5s ease-in forwards;pointer-events:none}
+@keyframes rowgone{
+  0%  {opacity:1}
+  30% {opacity:1;background:rgba(63,185,80,.09)}
+  100%{opacity:0;background:transparent}}
+@media (prefers-reduced-motion: reduce){
+  #drillBody tr.rowgone > td{animation:none;opacity:.4}}
 /* A JOB THAT IS HERE TO UNBLOCK SOMETHING ELSE. It has been moved to the
    front of its pool by precedence.promote(), and without a word for it the
    reordering looks arbitrary from the outside. */
@@ -17340,7 +17364,20 @@ guess.">looks like data moving</span>${other.slice(0,3).map(m=>pair(m,'')).join(
 
 let drillQuery=null;
 // Any change of question starts a fresh order - see drillReorder().
-function drillFresh(){ _drillOrder = []; _drillKey = ''; }
+// The last thing each live row was saying, by file id: ['done - moving to
+// NU-DRIVE-10', 'move'] or ['72%', 'pct']. Kept so a row that LEAVES the list
+// can be shown one last time saying what became of the file. Declared here,
+// above the first function that touches them, because a `let` cannot be read
+// - not even through typeof - before its own line has run.
+let _lastNote = new Map();
+let _drillGone = new Map();   // id -> the row as it last was, fading out
+let _drillLastUrl = null;     // the question the previous answer answered
+function drillFresh(){
+  _drillOrder = []; _drillKey = '';
+  // A different question means the rows that are about to vanish are not
+  // finishing, they are simply not being asked about.
+  _drillGone.clear(); _lastNote.clear(); _drillLastUrl = null;
+}
 function drillUrl(extra){
   const q=drillQuery||{}; const p=new URLSearchParams();
   if(q.state) p.set('state',q.state);
@@ -17912,7 +17949,20 @@ async function drillTick(){
     if(box && box.scrollTop>40) return;      // frozen: they are reading it
     if(userScrolling()) return;              // frozen: a hand is on it
     _drillBusy=true;
-    try{ await drillRefresh(true); } finally{ _drillBusy=false; }
+    // A POLL THAT CANNOT REACH THE SERVER IS NOT AN ERROR WORTH THROWING.
+    // Restarting nuarr puts an open page through a minute of refused
+    // connections, one unhandled rejection per tick, and fifty "Failed to
+    // fetch" is enough to bury whatever real message was underneath it - the
+    // console is only useful if what is in it means something. Said in the
+    // header instead, where a person can see it, and wiped by the next
+    // answer that arrives.
+    try{ await drillRefresh(true); }
+    catch(e){
+      const c=document.getElementById('drillCount');
+      if(c && c.textContent.indexOf('offline') < 0)
+        c.textContent += ' \u00b7 offline - retrying';
+    }
+    finally{ _drillBusy=false; }
   } finally { drillSchedule(); }
 }
 // THE HELD LIST IS A COUNTDOWN, so it needs a countdown's refresh rate. Every
@@ -17944,18 +17994,38 @@ drillSchedule();
 let _drillOrder = [];      // file ids, in the order they were first shown
 let _drillRows = [];       // the last answer, for the in-place patches
 
-function drillReorder(rows){
+function drillReorder(rows, sameQuestion){
+  // A ghost is drawn exactly once and then forgotten.
+  for(const [id, g] of _drillGone) if(g._shown) _drillGone.delete(id);
+  // WHICH ROWS HAVE GONE SINCE THE LAST ANSWER. Only rows that were being
+  // worked on get a farewell - a row that left for any other reason simply is
+  // not here any more, and fading fifty of them would be theatre. And only
+  // when the QUESTION has not changed: typing in the filter box removes rows
+  // by the dozen and none of them went anywhere.
+  if(sameQuestion){
+    const here = new Set(rows.map(r => r.id));
+    for(const r of (_drillRows || [])){
+      if(r._gone || here.has(r.id) || _drillGone.has(r.id)) continue;
+      const n = _lastNote.get(r.id);
+      if(!n || n[1] !== 'move') continue;   // it was not finishing; let it go
+      _drillGone.set(r.id, Object.assign({}, r, {_gone: true, _note: n[0]}));
+    }
+  }
+  for(const id of _lastNote.keys())         // do not grow without bound
+    if(!rows.some(r => r.id === id) && !_drillGone.has(id)) _lastNote.delete(id);
   const byId = new Map(rows.map(r => [r.id, r]));
   const out = [];
   for(const id of _drillOrder){            // keep what is still here, in place
     const r = byId.get(id);
-    if(r){ out.push(r); byId.delete(id); }
+    if(r){ out.push(r); byId.delete(id); continue; }
+    const g = _drillGone.get(id);
+    if(g && !g._shown){ g._shown = true; out.push(g); }
   }
   for(const r of rows) if(byId.has(r.id)) out.push(r);   // newcomers on the end
   _drillOrder = out.map(r => r.id);
   return out;
 }
-function drillResort(){ _drillOrder = []; _drillKey = ''; drillRefresh(true); }
+function drillResort(){ drillFresh(); drillRefresh(true); }
 
 // THE BUBBLES MOVE WITHOUT THE TABLE BEING REBUILT.
 //
@@ -17969,6 +18039,7 @@ function patchSteps(rows){
   const box = document.getElementById('drillBody');
   if(!box) return;
   for(const r of (rows || [])){
+    if(r._gone) continue;             // a fading row is finished being updated
     // THE GLOW IS PATCHED TOO, so a row lights up and goes dark on the job
     // poll rather than waiting for the list's own five seconds.
     const tr = box.querySelector(`tr[data-fid="${r.id}"]`);
@@ -17995,6 +18066,26 @@ function patchSteps(rows){
       const ttl = tr.querySelector('td div span:first-child');
       if(ttl && ttl.classList.contains('livetitle') !== on)
         ttl.classList.toggle('livetitle', on);
+      // AND THE NUMBER TICKS ON THE JOB POLL, not the list's. A percentage
+      // that moves every five seconds looks like a stalled one.
+      const nt = noteFor(r);
+      let ne = tr.querySelector('.livenote');
+      if(nt){
+        if(!ne){
+          const strip = tr.querySelector('.wsteps');
+          if(strip && strip.parentNode){
+            ne = document.createElement('span');
+            ne.className = 'livenote';
+            strip.parentNode.insertBefore(ne, strip.nextSibling);
+          }
+        }
+        if(ne){
+          if(ne.textContent !== nt[0]) ne.textContent = nt[0];
+          const mv = nt[1] === 'move';
+          if(ne.classList.contains('lnmove') !== mv)
+            ne.classList.toggle('lnmove', mv);
+        }
+      } else if(ne){ ne.remove(); }
     }
     for(const s of (r.steps || [])){
       const el = box.querySelector(
@@ -18028,8 +18119,13 @@ async function drillRefresh(force){
   const dot=document.getElementById('drillLive');
   if(dot) dot.style.opacity='1';
   let d;
-  try{ d=await (await fetch(drillUrl())).json(); }
+  // The URL is kept because a row that leaves the answer only means the file
+  // has moved on if the QUESTION was the same one - see drillReorder().
+  const url = drillUrl();
+  try{ d=await (await fetch(url)).json(); }
   finally{ if(dot) setTimeout(()=>{dot.style.opacity='0';},250); }
+  const sameQ = (url === _drillLastUrl);
+  _drillLastUrl = url;
   // The Settles column only means anything for held files.
   const held=d.rows.some(r=>r.state==='new');
   document.getElementById('drillCount').textContent=
@@ -18048,7 +18144,7 @@ async function drillRefresh(force){
       + ' title="re-sort now: put the list back in the order the workers will'
       + ' take it in, as it stands this second" onclick="drillResort()">Re-sort</button>');
   }
-  d.rows = drillReorder(d.rows || []);
+  d.rows = drillReorder(d.rows || [], sameQ);
   _drillRows = d.rows;
   const html = d.rows.length
     // Path lives UNDER the title, not in its own column. As a column it wrapped
@@ -18067,7 +18163,7 @@ async function drillRefresh(force){
         // 3199971767" - and no way to reach the transcript that explains it,
         // short of going to the log tab and searching for the title. The
         // Finished panel already had this; the drill-down did not.
-        const open = _drillLogId && _drillLogId===r.job_id;
+        const open = !r._gone && _drillLogId && _drillLogId===r.job_id;
         const cols = 5 + (held?1:0);
         // WHEN: processed beats updated beats file mtime, and the label says
         // which one it is - "processed 2h ago" and "seen 3d ago" answer
@@ -18127,14 +18223,16 @@ async function drillRefresh(force){
           why += `<div class="dim sub">subtitle OCR rejected this file — see reason above</div>`;
         // WHICH STEP HAS IT, if any - that decides the row's colour as well
         // as whether it glows at all. See the .liverow rules.
-        const liveStep = (r.steps||[]).find(x=>x.state==='running');
+        const liveStep = r._gone
+          ? null : (r.steps||[]).find(x=>x.state==='running');
         const rowCol = liveStep ? poolColor(liveStep.pool||'') : '';
-        const main = `<tr class="${open?'rowopen ':''}${liveStep?'liverow':''}"
+        const main = `<tr class="${open?'rowopen ':''}${liveStep?'liverow':''}${
+             r._gone?' rowgone':''}"
            data-fid="${r.id}"${rowCol?` style="--rowcol:${rowCol}"`:''}>
          <td class="wrap"><div><span class="${liveStep?'livetitle':''}"
            >${esc(r.label||r.title||'')}</span>${
              liveStep?`<span class="livenow">${esc(liveStep.pool||'')} now</span>`:''
-           }${stepBubbles(r)}</div>
+           }${stepBubbles(r)}${liveNote(r)}</div>
            ${why}
            ${act}
            <div class="mono dim sub">${esc(r.path||'')}</div></td>
@@ -18200,6 +18298,10 @@ async function drillRefresh(force){
   const top=box.scrollTop;
   box.innerHTML=html;
   if(top) box.scrollTop=top;
+  // The fade is an animation, so the row is still holding its gap open when
+  // the animation ends - take it out of the table once it has finished.
+  for(const tr of box.querySelectorAll('tr.rowgone'))
+    setTimeout(()=>{ if(tr.isConnected) tr.remove(); }, 1600);
   patchSteps(d.rows);
 }
 
@@ -18235,6 +18337,57 @@ function stepBubbles(r){
          + (run ? `<i style="width:${pct}%"></i>` : '')
          + `<b>${esc(s.kind)}${s.state==='queued'&&s.pos?' '+s.pos:''}</b></span>`;
   }).join('')}</span>`;
+}
+
+// HOW FAR IN, AND THEN WHERE IT WENT.
+//
+// A bubble filling from the left says "moving"; it does not say how much
+// longer, and on a two-hour encode that is the only question. So the running
+// step's own percentage is printed after the last bubble - and when ffmpeg
+// reaches the end, the note does NOT sit at 100%. 100% is where the file
+// starts travelling: the commit reads it out of the cache and writes it into
+// the pool, DrivePool decides which spindle, and that takes as long again on
+// a big remux. The note says so, and names the disk as soon as the commit
+// knows it.
+//
+// Returns [text, kind] or null. kind 'move' is what earns the green and what
+// a row is allowed to say on its way out of the list.
+function noteFor(r){
+  if(r._gone) return r._note ? [r._note, 'move'] : null;
+  const s = (r.steps || []).find(x => x.state === 'running');
+  if(!s || typeof lastJobs === 'undefined' || !lastJobs) return null;
+  const w = ((lastJobs.running) || []).find(x => x.job_id === s.job_id);
+  if(!w) return null;                       // the poll has not seen it yet
+  let out;
+  if(w.stage === 'committing' || w.commit_phase)
+    out = [w.dest_disk ? 'done \u00b7 moving to ' + w.dest_disk
+                       : 'done \u00b7 finding it a disk', 'move'];
+  else if(w.stage === 'arr refresh / rename' || w.stage === 'done')
+    out = [w.dest_disk ? 'done \u00b7 on ' + w.dest_disk : 'done', 'move'];
+  else {
+    const pct = Math.round(Math.max(0, Math.min(1, w.progress || 0)) * 100);
+    // 100% AND STILL HERE means the rewrite is done and something else is
+    // holding the job - the side OCR it is carrying, the commit queue, a
+    // DrivePool balance. A bare "100%" for that is precisely the
+    // finished-and-stuck look this note exists to end, so it names what.
+    if(pct >= 100){
+      const st = String(w.stage || '').split(' - ')[0].trim();
+      out = ['done \u00b7 ' + (st && st !== 'encoding' ? st : 'waiting'),
+             'move'];
+    } else out = [pct + '%', 'pct'];
+  }
+  _lastNote.set(r.id, out);
+  return out;
+}
+function liveNote(r){
+  const n = noteFor(r);
+  if(!n) return '';
+  const tip = n[1] === 'move'
+    ? 'the rewrite is finished and the file is being copied into the pool - '
+      + 'this row leaves the list when it lands'
+    : 'how much of the file this worker has been through';
+  return `<span class="livenote${n[1]==='move'?' lnmove':''}"
+     title="${esc(tip)}">${esc(n[0])}</span>`;
 }
 
 // Which drill row has its log open, and the transcript for it. Separate from
