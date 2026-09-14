@@ -3488,29 +3488,64 @@ def _summary_impl():
                                  "total", "done", "last_run")}}
 
 
-def _dispatch_order(rows: list, cap: dict, busy: set, want: int) -> list:
-    """Replay the dispatcher over the WHOLE queue and return the first `want`.
+# The pools the queue can hold. Every one of them, because a replay that
+# knows only two of them cannot order the other six at all - see below.
+_QUEUE_POOLS = ("encode", "passthrough", "subocr", "subs", "audio", "decode",
+                "listen", "subread")
+
+
+def _dispatch_order(rows: list, want: int) -> list:
+    r"""Replay the dispatcher over the WHOLE queue and return the first `want`.
 
     This used to run in the browser over the 300 rows the server had already
     sent, which quietly made it wrong in the one case it mattered. The queue
     was 1,975 stream copies and 22 encodes, and every encode sat below position
-    1,198 - so "next to run" never saw a single one. Worse, they were not just
-    missing from the list, they were the items MOST likely to start next: the
-    encode workers were idle, and only an encode job can fill an encode slot.
-    The panel was hiding imminent work behind a page boundary.
+    1,198 - so "next to run" never saw a single one. Ordering therefore has to
+    happen before the LIMIT, over every queued row.
 
-    Ordering therefore has to happen before the LIMIT, over every queued row.
+    AND THEN IT WAS WRONG AGAIN, FOR SIX OF THE EIGHT POOLS. The replay was
+    given slots for encode and passthrough only, so a subs or decode or listen
+    row could never be claimed, the first wave made no progress, and the loop
+    gave up on the spot - handing back plain queue order under a heading that
+    said "next to run". Erik: "fix the sort for next run as it is not working".
+    Measured when he said it: 219 rows, every one of them subs, all in
+    insertion order, with the summary line claiming they were all waiting for
+    a disk.
+
+    The replay is the dispatcher's own rules now, not a sketch of them:
+
+      slots      every pool's capacity (_capacity - so a paused pool has
+                 none), less what is already running in it for the first wave
+      spindles   the weight-and-budget rule from jobs.py - a heavy job may
+                 not share a disk with a heavy job, two decodes may - seeded
+                 from what is actually on each spindle right now
+      viewers    a spindle Plex is reading from takes no heavy work
+
     Waves: claim what can start, assume it finishes, release its slot and its
-    spindle, repeat. Rows that never become claimable keep their queue position
-    at the end rather than being dropped.
+    spindle, repeat. Rows claimed in the FIRST wave are marked next_up - they
+    are the ones the dispatcher would take this instant - and rows that never
+    become claimable keep their queue position at the end rather than being
+    dropped.
     """
     pending = list(rows)
     ordered: list = []
-    slots = dict(cap)
-    held = set(busy)
-    # Each wave claims at most one job per spindle, so ~12 rows per pass. The
-    # guard is generous enough to fill a 300-row page and still terminate on a
-    # queue where most rows are unclaimable.
+    running = list(jobs.RUNNING.values())
+    cap = {p: jobs._capacity(p) for p in _QUEUE_POOLS}
+    in_pool: dict = {}
+    for w in running:
+        in_pool[w.pool] = in_pool.get(w.pool, 0) + 1
+    try:
+        viewer = set(jobs._plex_disks_safe())
+    except Exception:                                        # noqa: BLE001
+        viewer = set()
+    # First wave: what is free NOW, on top of what is running.
+    slots = {p: max(0, cap[p] - in_pool.get(p, 0)) for p in cap}
+    used = {}
+    for w in running:
+        for d in {getattr(w, "disk", ""), getattr(w, "dest_disk", "")}:
+            if d and d not in used:
+                used[d] = jobs._spindle_used(d, running)
+    first = True
     for _ in range(400):
         if not pending or len(ordered) >= want:
             break
@@ -3518,21 +3553,34 @@ def _dispatch_order(rows: list, cap: dict, busy: set, want: int) -> list:
         i = 0
         while i < len(pending):
             r = pending[i]
+            p = r.get("pool") or ""
             d = r.get("pool_disk") or ""
-            if slots.get(r.get("pool"), 0) > 0 and not (d and d in held):
+            wt = jobs.spindle_weight(p)
+            heavy = wt >= jobs.OCCUPIES_AT
+            ok = slots.get(p, 0) > 0
+            if ok and heavy and d:
+                if d in viewer:
+                    ok = False
+                elif used.get(d, 0) + wt > jobs.SPINDLE_BUDGET:
+                    ok = False
+            if ok:
+                if first:
+                    r["next_up"] = True
                 ordered.append(pending.pop(i))
-                slots[r["pool"]] -= 1
-                if d:
-                    held.add(d)
+                slots[p] -= 1
+                if heavy and d:
+                    used[d] = used.get(d, 0) + wt
                 progressed = True
             else:
                 i += 1
         if not progressed:
             break
         # Wave over: slots free, spindles release. After the first wave the
-        # jobs running right now have finished too, so their disks open up.
+        # jobs running right now have finished too, so their disks open up;
+        # a viewer's disk stays a viewer's disk.
+        first = False
         slots = dict(cap)
-        held = set()
+        used = {}
     return (ordered + pending)[:want]
 
 
@@ -3669,8 +3717,7 @@ def api_queue(pool: str | None = None, disk: str | None = None,
                 "       f.pool_disk, f.size, f.library, f.season, f.episode "
                 "FROM jobs j LEFT JOIN files f ON f.id = j.file_id ")
 
-    cap_now = {p: jobs._capacity(p) for p in ("encode", "passthrough")}
-    busy_now = {w.disk for w in jobs.RUNNING.values() if w.disk}
+    cap_now = {p: jobs._capacity(p) for p in _QUEUE_POOLS}
     _t: dict = {}
     _m0 = time.perf_counter()
 
@@ -3688,7 +3735,7 @@ def api_queue(pool: str | None = None, disk: str | None = None,
         _t["sql_ms"] = round((time.perf_counter() - _m0) * 1000, 1)
         _t["scanned"] = len(_all)
         _m1 = time.perf_counter()
-        rows = _dispatch_order(_all, cap_now, busy_now, limit)
+        rows = _dispatch_order(_all, limit)
         _t["sim_ms"] = round((time.perf_counter() - _m1) * 1000, 1)
     else:
         rows = _rows(cols_sel + f"WHERE {w} ORDER BY {order} LIMIT ?",
@@ -14144,8 +14191,13 @@ button[disabled]{opacity:.5;cursor:default}
 .wcell:hover{border-color:var(--acc)}
 .wcell.off{opacity:.5}
 .wcname{font-size:11px;letter-spacing:.2px;white-space:nowrap;overflow:hidden;
-        text-overflow:ellipsis}
-.wcval{display:flex;align-items:baseline;gap:6px;margin-top:1px}
+        text-overflow:ellipsis;text-align:center}
+.wcval{display:flex;align-items:baseline;justify-content:center;gap:6px;
+       margin-top:1px}
+/* Numbers in the system strip's sub-lines. The line is dim on purpose - it
+   is the comparison, not the answer - but a figure inside it still has to be
+   findable at a glance, so the figures alone are lit. */
+.sn{color:var(--fg,#c9d1d9);font-variant-numeric:tabular-nums}
 .wcval b{font-size:17px;line-height:1.15;font-variant-numeric:tabular-nums}
 .wcsub{font-size:10.5px;color:var(--dim)}
 .wcfoot{text-align:center;font-size:11px;padding:7px 14px 0;color:var(--dim)}
@@ -16073,8 +16125,12 @@ function wpopHtml(k){
   const lanes = (k==='subocr_workers' && (_wdata||{}).subocr_gpu_lanes)
     ? `<div class="dim" style="font-size:11px;margin-top:5px"><b>on the card</b> ${
         _wdata.subocr_gpu_lanes.value} of them may use the GPU at once</div>` : '';
-  return `<div class="tpop-h" style="color:${col}">${esc(v.label||k)}${
-      v.pool?` <span class="dim">— ${esc(v.pool)} pool</span>`:''}</div>
+  // THE SAME BUBBLE THE QUEUE AND THE CARDS WEAR, so the card and the rows
+  // it explains are visibly one thing - the Concurrency page does the same.
+  const pill = v.pool
+    ? `<span class="pill" style="color:${col};border-color:${col};margin-right:7px;font-size:10.5px">${esc(v.pool)}</span>`
+    : '';
+  return `<div class="tpop-h" style="color:${col}">${pill}${esc(v.label||k)}</div>
     <div class="tpop-n">${rows.join('<br>')}</div>
     <div class="dim" style="font-size:11px;line-height:1.45">${esc(v.hint||'')}</div>
     ${costStrip(c)}
@@ -18486,13 +18542,18 @@ function renderSys(s){
   const nCpu = (n.cpu_pct==null) ? null : n.cpu_pct;
   const nRamGb = Math.round((n.ram_mb||0)/1024*10)/10;
   const nRamPct = s.ram_total_gb ? Math.round(nRamGb/s.ram_total_gb*1000)/10 : 0;
+  // sn() lights a figure inside the dim sub-line; snc() colours it by load,
+  // the way the headline figures are coloured, so "box 91%" reads as the
+  // warning it is.
+  const sn  = v => `<span class="sn">${v}</span>`;
+  const snc = (v,p) => `<span class="sn" style="color:${loadCol(p)}">${v}</span>`;
   let h = metric('CPU', (nCpu==null?'—':nCpu+'%'), nCpu||0,
-                 `nuarr · box ${boxCpu}% of ${s.cpu_cores}`,
+                 `nuarr · box ${snc(boxCpu+'%',boxCpu)} of ${sn(s.cpu_cores)}`,
                  'Nuarr and its children — the server, ffmpeg, mkvmerge, the '
                  +'OCR readers — as a share of the whole processor. The box '
                  +'figure beside it is everything running, nuarr included.')
         + metric('RAM', nRamGb+' GB', nRamPct,
-                 `nuarr · box ${boxRam}% of ${s.ram_total_gb} GB`,
+                 `nuarr · box ${snc(boxRam+'%',boxRam)} of ${sn(s.ram_total_gb+' GB')}`,
                  'Resident memory held by nuarr and its children. The box '
                  +'figure beside it is the whole machine.');
   if(g.name){
@@ -18512,7 +18573,7 @@ function renderSys(s){
     const gw = s.gpu_work||{};
     const mine = !!(typeof _nuarrEnc!=='undefined' && _nuarrEnc && _nuarrEnc.length);
     const onCores = gw.device==='gpu' && (gw.n||0) > 0;
-    const els = who => `card ${who}%`;
+    const els = who => `card ${snc(who+'%',who)}`;
     h += metric('NVENC', (mine?g.encoder_pct:0)+'%', mine?g.encoder_pct:0,
                 mine ? `nuarr encoding · ${els(g.encoder_pct)}`
                      : `nuarr idle · ${els(g.encoder_pct)}`,
@@ -18529,8 +18590,9 @@ function renderSys(s){
             : '')
        + metric('GPU', (onCores?g.gpu_pct:0)+'%', onCores?g.gpu_pct:0,
                 `${gw.label?esc(gw.label):'nuarr idle on the cores'} · ${
-                  Math.round(g.vram_used_mb/1024*10)/10} / ${
-                  Math.round(g.vram_total_mb/1024)} GB · ${g.temp_c}°C`,
+                  sn(Math.round(g.vram_used_mb/1024*10)/10)} / ${
+                  sn(Math.round(g.vram_total_mb/1024)+' GB')} · ${
+                  snc(g.temp_c+'°C', g.temp_c>=83?95:g.temp_c>=70?75:0)}`,
                 'Shader cores, and only nuarr\'s: Whisper and the OCR readers '
                 +'run here, the encode does not. The card is at '
                 +g.gpu_pct+'% in total.');
@@ -18547,7 +18609,7 @@ function renderSys(s){
     : '';
   h += `<div class="met"><span class="lbl">Cache</span>
         <span class="val" style="color:${s.cache_free_gb<100?'var(--warn)':'var(--fg)'}">
-        ${s.cache_free_gb} GB</span><span class="sub">free on E:${
+        ${s.cache_free_gb} GB</span><span class="sub">free on ${sn('E:')}${
           crw?' · ':''}${crw}</span></div>`;
   el.innerHTML=h;
   renderSelfUse(s);
@@ -22733,20 +22795,18 @@ async function loadQueue(){
     // saturated - which is most of the time on a full queue, and exactly when
     // you want to know what is coming. Instead: for each pool, the next
     // `capacity` files that are not on a disk already in use.
+    // THE SERVER SAYS WHICH. The replay in _dispatch_order runs the
+    // dispatcher's real rules - every pool's capacity, the spindle budget, the
+    // viewer's disk - over every queued row, and marks what its first wave
+    // would claim. The browser used to run a second, simpler model here (two
+    // pools, one job per disk) over the page it had, and the two disagreed
+    // whenever it mattered. One model, one answer.
     const cap = q.capacity || {};
     const run = q.running || [];
-    const freeBy = Object.assign({}, cap);
     const busyDisks = new Set(run.map(w=>w.disk).filter(Boolean));
-    const diskTaken = new Set(busyDisks);
-    const nextUp = new Set();
-    (q.items||[]).forEach(it=>{
-      const p = it.pool;
-      if(!freeBy[p]) return;
-      if(it.pool_disk && diskTaken.has(it.pool_disk)) return;
-      nextUp.add(it.job_id);
-      freeBy[p] -= 1;
-      if(it.pool_disk) diskTaken.add(it.pool_disk);
-    });
+    const freeBy = Object.assign({}, cap);
+    run.forEach(w=>{ if(freeBy[w.pool]!=null) freeBy[w.pool]=Math.max(0,freeBy[w.pool]-1); });
+    const nextUp = new Set((q.items||[]).filter(it=>it.next_up).map(it=>it.job_id));
 
     // SORT BY WHAT ACTUALLY RUNS NEXT.
     //
