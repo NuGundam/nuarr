@@ -12738,6 +12738,30 @@ tr.logdrop td{padding:0 0 8px 0;background:#1c2129;border-bottom:1px solid var(-
 @keyframes wstepglow{0%,100%{opacity:.25}50%{opacity:.9}}
 /* done: the answer exists and the step is behind the file */
 .wstep.s-done{background:rgba(255,255,255,.06)}
+/* THE WHOLE ROW GLOWS WHILE A WORKER HAS THE FILE.
+   A bubble the size of a word is the right amount of detail for "which step"
+   and not enough to catch the eye on an 81-row list - the one row where
+   something is actually happening should be findable without reading. Same
+   idiom as the queue's next-up rows and the running worker cards: a tinted
+   background, a bar down the leading edge in the pool's colour, and a slow
+   pulse. Slow on purpose - this list is read, not watched, and anything
+   faster is a distraction rather than a signal. */
+#drillBody tr.liverow > td{
+  background:rgba(88,166,255,.06);
+  animation:liveglow 2.6s ease-in-out infinite}
+#drillBody tr.liverow > td:first-child{
+  box-shadow:inset 3px 0 0 var(--rowcol, var(--acc))}
+@keyframes liveglow{
+  0%,100%{background:rgba(88,166,255,.05)}
+  50%    {background:rgba(88,166,255,.12)}}
+/* The title earns a little weight and the pool's colour, so the row says
+   WHICH worker has it without the reader going to the bubbles for it. */
+#drillBody tr.liverow .livetitle{font-weight:600;color:var(--rowcol,var(--acc))}
+#drillBody tr.liverow .livenow{
+  font-size:9px;letter-spacing:.06em;text-transform:uppercase;
+  color:var(--rowcol,var(--acc));margin-left:7px;opacity:.85}
+@media (prefers-reduced-motion: reduce){
+  #drillBody tr.liverow > td{animation:none}}
 /* A JOB THAT IS HERE TO UNBLOCK SOMETHING ELSE. It has been moved to the
    front of its pool by precedence.promote(), and without a word for it the
    reordering looks arbitrary from the outside. */
@@ -17945,6 +17969,33 @@ function patchSteps(rows){
   const box = document.getElementById('drillBody');
   if(!box) return;
   for(const r of (rows || [])){
+    // THE GLOW IS PATCHED TOO, so a row lights up and goes dark on the job
+    // poll rather than waiting for the list's own five seconds.
+    const tr = box.querySelector(`tr[data-fid="${r.id}"]`);
+    if(tr){
+      const st = (r.steps||[]).find(x=>x.state==='running');
+      const on = !!st;
+      if(tr.classList.contains('liverow') !== on) tr.classList.toggle('liverow', on);
+      const col = st ? poolColor(st.pool||'') : '';
+      if(tr.style.getPropertyValue('--rowcol') !== col)
+        tr.style.setProperty('--rowcol', col);
+      const now = tr.querySelector('.livenow');
+      if(on && !now){
+        const t = tr.querySelector('td .wrap, td > div');
+        const badge = document.createElement('span');
+        badge.className = 'livenow';
+        badge.textContent = (st.pool||'') + ' now';
+        const title = tr.querySelector('.livetitle') || (t && t.firstChild);
+        if(title && title.parentNode)
+          title.parentNode.insertBefore(badge, title.nextSibling);
+      } else if(on && now){
+        const want = (st.pool||'') + ' now';
+        if(now.textContent !== want) now.textContent = want;
+      } else if(!on && now){ now.remove(); }
+      const ttl = tr.querySelector('td div span:first-child');
+      if(ttl && ttl.classList.contains('livetitle') !== on)
+        ttl.classList.toggle('livetitle', on);
+    }
     for(const s of (r.steps || [])){
       const el = box.querySelector(
         `.wstep[data-fid="${r.id}"][data-kind="${s.kind}"]`);
@@ -18074,8 +18125,16 @@ async function drillRefresh(force){
         }
         if(r.subocr_state==='rejected')
           why += `<div class="dim sub">subtitle OCR rejected this file — see reason above</div>`;
-        const main = `<tr class="${open?'rowopen':''}" data-fid="${r.id}">
-         <td class="wrap"><div>${esc(r.label||r.title||'')}${stepBubbles(r)}</div>
+        // WHICH STEP HAS IT, if any - that decides the row's colour as well
+        // as whether it glows at all. See the .liverow rules.
+        const liveStep = (r.steps||[]).find(x=>x.state==='running');
+        const rowCol = liveStep ? poolColor(liveStep.pool||'') : '';
+        const main = `<tr class="${open?'rowopen ':''}${liveStep?'liverow':''}"
+           data-fid="${r.id}"${rowCol?` style="--rowcol:${rowCol}"`:''}>
+         <td class="wrap"><div><span class="${liveStep?'livetitle':''}"
+           >${esc(r.label||r.title||'')}</span>${
+             liveStep?`<span class="livenow">${esc(liveStep.pool||'')} now</span>`:''
+           }${stepBubbles(r)}</div>
            ${why}
            ${act}
            <div class="mono dim sub">${esc(r.path||'')}</div></td>
