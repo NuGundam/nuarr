@@ -14244,10 +14244,17 @@ button[disabled]{opacity:.5;cursor:default}
    anything and the sub OCR one carried an extra clause that made it twice the
    width of its neighbours. A grid of equal cells reads as a set of dials;
    whatever else a cell has to say is in the card that opens on hover. */
-.wcgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(176px,1fr));
+/* FLEX, NOT GRID, FOR ONE REASON: the last row. A grid lays its trailing row
+   out from column 1, so ten cells over six columns left four sitting under the
+   first four with a gap the width of two beside them - the panel read as
+   unfinished rather than as two rows. Flex centres each line, including the
+   short one. Every cell keeps the same basis and the same shrink, so they stay
+   identical widths; the row simply does not stretch to the edges any more,
+   which is what being centred means. */
+.wcgrid{display:flex;flex-wrap:wrap;justify-content:center;
         gap:7px;padding:10px 14px 2px}
-.wcell{border:1px solid var(--line);border-radius:8px;padding:6px 9px 7px;
-       cursor:pointer;background:rgba(255,255,255,.014)}
+.wcell{flex:0 1 176px;border:1px solid var(--line);border-radius:8px;
+       padding:6px 9px 7px;cursor:pointer;background:rgba(255,255,255,.014)}
 .wcell:hover{border-color:var(--acc)}
 .wcell.off{opacity:.5}
 .wcname{font-size:11px;letter-spacing:.2px;white-space:nowrap;overflow:hidden;
