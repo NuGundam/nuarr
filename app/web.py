@@ -8816,6 +8816,87 @@ async def api_refetch_run(file_id: int, confirm: str = ""):
     return await refetch.run(file_id)
 
 
+# WHAT EACH FILE IS STILL WAITING FOR, ONE BUBBLE PER WORKER.
+#
+# The eligible list said "eligible" on every row and left the obvious question
+# unanswered: eligible for what, and what is it waiting on? The answer already
+# existed in three places nobody could see at once - precedence's oracles say
+# what is OWED, the jobs table says what is queued or running, and the pool
+# order says where in the line it is. This puts the three together, per file,
+# in the order the work actually happens.
+#
+# Four states, and they are what the colours mean:
+#   owed     nothing has been queued for it yet and the answer is missing
+#   queued   a job exists and is waiting its turn - with its place in that
+#            worker's queue, which is the "queue number"
+#   running  a worker has it right now
+#   done     the answer exists; this step is behind the file
+_STEP_LABEL = {"decode": "Does it decode?", "listen": "What language?",
+               "audio": "Tags corrected", "subread": "What the subs are",
+               "transcode": "The rewrite"}
+_STEP_POOL = {"decode": "decode", "listen": "listen", "audio": "audio",
+              "subread": "subread", "transcode": "encode"}
+_STEP_ORDER = ("decode", "listen", "audio", "subread", "transcode")
+
+
+def _file_steps(rows: list, cap: int = 400) -> None:
+    """Attach r['steps'] to every eligible row. Best effort, never raises."""
+    want = [r for r in rows if (r.get("state") or "") == "eligible"][:cap]
+    if not want:
+        return
+    try:
+        from . import precedence as _prec
+        ids = [int(r["id"]) for r in want]
+        qs = ",".join("?" * len(ids))
+        live: dict = {}
+        with cursor() as cur:
+            for j in cur.execute(
+                    f"SELECT file_id, kind, pool, state, priority, job_id, "
+                    f"       created_at FROM jobs "
+                    f" WHERE state IN ('queued','running') AND file_id IN ({qs})",
+                    tuple(ids)):
+                live[(int(j["file_id"]), j["kind"])] = dict(j)
+            # Where each queued job sits in its own worker's line. One pass per
+            # pool over the queued rows - the whole queue is a few hundred.
+            place: dict = {}
+            for pool in set(_STEP_POOL.values()) | {"passthrough"}:
+                for i, j in enumerate(cur.execute(
+                        "SELECT job_id FROM jobs WHERE state='queued' AND pool=? "
+                        " ORDER BY priority, created_at", (pool,))):
+                    place[j["job_id"]] = i + 1
+            for r in want:
+                f = {"id": r["id"], "size": r.get("size"),
+                     "path": r.get("path"), "duration": r.get("duration"),
+                     "audio_langs": r.get("audio_langs"),
+                     "sub_langs": r.get("sub_langs")}
+                steps = []
+                for k in _STEP_ORDER:
+                    j = live.get((int(r["id"]), k))
+                    if j:
+                        st = "running" if j["state"] == "running" else "queued"
+                    elif k == "transcode":
+                        # An eligible file has not been rewritten yet by
+                        # definition - that is what eligible means.
+                        st = "owed"
+                    else:
+                        fn = _prec.ORACLE.get(k)
+                        try:
+                            st = "owed" if (fn and fn(cur, f)) else "done"
+                        except Exception:                    # noqa: BLE001
+                            st = "done"
+                    steps.append({
+                        "kind": k, "label": _STEP_LABEL.get(k, k),
+                        "pool": (j or {}).get("pool") or _STEP_POOL.get(k, ""),
+                        "state": st,
+                        "pos": place.get((j or {}).get("job_id")) if j else None,
+                        "priority": (j or {}).get("priority") if j else None,
+                        "job_id": (j or {}).get("job_id") if j else None,
+                        "since": (j or {}).get("created_at") if j else None})
+                r["steps"] = steps
+    except Exception:                                        # noqa: BLE001
+        pass
+
+
 @app.get("/api/files")
 def api_files(state: str | None = None, library: str | None = None,
               q: str | None = None, disk: str | None = None,
@@ -8847,7 +8928,11 @@ def api_files(state: str | None = None, library: str | None = None,
         params += [f"%{q}%", f"%{q}%"]
     sql = ("SELECT id,arr_name,arr_file_id,title,season,episode,library,path,"
            "size,pool_disk,state,state_reason,mtime,processed_at,updated_at,"
-           "adopt_state,adopt_attempts,subocr_state FROM files")
+           "adopt_state,adopt_attempts,subocr_state,"
+           # audio_langs/sub_langs/duration are what the precedence oracles
+           # read - see _file_steps(). Three columns off a row already being
+           # fetched; nothing extra is queried for them.
+           "audio_langs,sub_langs,duration FROM files")
     if where:
         sql += " WHERE " + " AND ".join(where)
     total = _rows(f"SELECT COUNT(*) n FROM ({sql})", tuple(params))[0]["n"]
@@ -8899,6 +8984,8 @@ def api_files(state: str | None = None, library: str | None = None,
                         r["job_id"] = j["job_id"]
                         r["job_state"] = j["job_state"]
                         break
+    _file_steps(rows)
+
     # WHEN WILL A HELD FILE SETTLE? ASK THE LOCK CLOCK, NOT THE FILE'S DATE.
     #
     # This counted down mtime + hold_minutes*60 - a rule mark_eligible() stopped
@@ -12582,6 +12669,32 @@ tr.logdrop td{padding:0 0 8px 0;background:#1c2129;border-bottom:1px solid var(-
             box-shadow:inset 2px 0 0 var(--acc);
             animation:qglow 2.4s ease-in-out infinite}
 .qrow.qnext .qt{font-weight:600}
+/* WHAT A FILE IS STILL WAITING FOR, ONE BUBBLE PER WORKER, BESIDE ITS NAME.
+   Grey is owed, the pool's own colour is done, and a job that exists sits
+   between the two: outlined while it waits its turn, and filling from the left
+   while a worker has it. The fill is the job's own progress where there is
+   one, so a row being worked on visibly moves. */
+.wsteps{display:inline-flex;gap:4px;margin-left:8px;vertical-align:1px}
+.wstep{position:relative;display:inline-flex;align-items:center;
+  font-size:9px;letter-spacing:.04em;text-transform:uppercase;
+  padding:0 6px;height:15px;border-radius:8px;white-space:nowrap;
+  border:1px solid currentColor;cursor:help;overflow:hidden}
+.wstep i{position:absolute;left:0;top:0;bottom:0;width:0;opacity:.30;
+  background:currentColor;transition:width .6s linear}
+.wstep b{position:relative;font-weight:600}
+/* owed: nothing has been queued for it, and the answer is missing */
+.wstep.s-owed{color:#5c6672;border-color:#39424e;background:rgba(255,255,255,.02)}
+/* queued: a job exists and is in line - the number is its place in that line */
+.wstep.s-queued{background:rgba(255,255,255,.03)}
+.wstep.s-queued b{opacity:.9}
+/* running: a worker has it now; the bar behind the word is its progress */
+.wstep.s-running{background:rgba(255,255,255,.05);font-weight:700}
+.wstep.s-running::after{content:'';position:absolute;inset:0;
+  border-radius:8px;box-shadow:0 0 0 1px currentColor inset;
+  animation:wstepglow 1.8s ease-in-out infinite}
+@keyframes wstepglow{0%,100%{opacity:.25}50%{opacity:.9}}
+/* done: the answer exists and the step is behind the file */
+.wstep.s-done{background:rgba(255,255,255,.06)}
 /* A JOB THAT IS HERE TO UNBLOCK SOMETHING ELSE. It has been moved to the
    front of its pool by precedence.promote(), and without a word for it the
    reordering looks arbitrary from the outside. */
@@ -17844,7 +17957,7 @@ async function drillRefresh(force){
         if(r.subocr_state==='rejected')
           why += `<div class="dim sub">subtitle OCR rejected this file — see reason above</div>`;
         const main = `<tr class="${open?'rowopen':''}">
-         <td class="wrap"><div>${esc(r.label||r.title||'')}</div>
+         <td class="wrap"><div>${esc(r.label||r.title||'')}${stepBubbles(r)}</div>
            ${why}
            ${act}
            <div class="mono dim sub">${esc(r.path||'')}</div></td>
@@ -17857,7 +17970,34 @@ async function drillRefresh(force){
          ${held?`<td class="nb">${settleCell(r)}</td>`:''}
          <td class="nb">${pill}</td></tr>`;
         if(!open) return main;
-        return main + `<tr class="logrow"><td colspan="${cols}">
+        // THE LOG ROW LEADS WITH WHERE THE FILE ACTUALLY IS. The transcript
+        // answers "what did that job say"; it never answered "why is this
+        // file sitting here", which is the question the list is open for.
+        const sd = (r.steps||[]).map(s=>{
+          const col = s.state==='owed' ? 'var(--dim)' : poolColor(s.pool||'');
+          const say = s.state==='owed'
+              ? 'nothing queued for it yet'
+            : s.state==='queued'
+              ? `queued as <b>${esc(s.pool)}</b> - number <b>${s.pos||'?'}</b> in that line`
+                + (s.priority!=null?` - priority ${s.priority}`:'')
+                + (s.since?` - waiting ${ago(s.since)}`:'')
+            : s.state==='running'
+              ? `a <b>${esc(s.pool)}</b> worker has it now`
+                + (s.since?` - queued ${ago(s.since)}`:'')
+            : 'answered';
+          return `<div style="padding:1px 0">
+              <span style="color:${col};display:inline-block;min-width:150px">
+                ${esc(s.label)}</span>
+              <span class="dim">${say}</span>
+              ${s.job_id?`<span class="mono dim" style="font-size:10px"> ${esc(s.job_id)}</span>`:''}
+            </div>`;
+        }).join('');
+        const where = sd
+          ? `<div style="font-size:11.5px;margin:2px 0 8px">
+               <div class="dim" style="font-size:10.5px;text-transform:uppercase;
+                    letter-spacing:.06em;margin-bottom:3px">where this file is</div>
+               ${sd}</div>` : '';
+        return main + `<tr class="logrow"><td colspan="${cols}">${where}
             <div class="loghead">
               <span class="mono dim">job ${esc(r.job_id)}</span>
               <a href="/api/logs/job/${esc(r.job_id)}/raw" target="_blank">open as text</a>
@@ -17878,6 +18018,37 @@ async function drillRefresh(force){
   const top=box.scrollTop;
   box.innerHTML=html;
   if(top) box.scrollTop=top;
+}
+
+// ONE BUBBLE PER WORKER, IN THE ORDER THE WORK HAPPENS.
+//
+// The eligible list said "eligible" on every row and left the obvious question
+// unanswered: waiting for what? Each file carries its five steps now - the
+// four facts a plan is built from, then the rewrite - and each bubble says
+// which of the four states it is in. The colour is the pool's own colour, the
+// same one it wears in the queue, on the worker card and in Processing System.
+//
+// The number on a queued bubble is its place in THAT worker's queue, which is
+// the one fact that answers "so when?". A running bubble fills from the left
+// with the job's real progress, read from the live job poll, so a row being
+// worked on moves while you watch it.
+function stepBubbles(r){
+  const steps = r.steps || [];
+  if(!steps.length) return '';
+  return `<span class="wsteps">${steps.map(s=>{
+    const col = s.state==='owed' ? '' : `color:${poolColor(s.pool||'')}`;
+    const run = (s.state==='running' && typeof lastJobs!=='undefined' && lastJobs)
+      ? ((lastJobs.running)||[]).find(w=>w.job_id===s.job_id) : null;
+    const pct = run ? Math.round(Math.max(0, Math.min(1, run.progress||0))*100) : 0;
+    const tip = s.label + ' - ' + (
+        s.state==='owed'   ? 'nothing queued for it yet, and the answer is missing'
+      : s.state==='queued' ? `queued as ${s.pool}, number ${s.pos||'?'} in that worker's line`
+      : s.state==='running'? `a ${s.pool} worker has it now${pct?' - '+pct+'%':''}`
+      :                      'answered; this step is behind the file');
+    return `<span class="wstep s-${s.state}" style="${col}" title="${esc(tip)}">`
+         + (s.state==='running' ? `<i style="width:${pct}%"></i>` : '')
+         + `<b>${esc(s.kind)}${s.state==='queued'&&s.pos?' '+s.pos:''}</b></span>`;
+  }).join('')}</span>`;
 }
 
 // Which drill row has its log open, and the transcript for it. Separate from
