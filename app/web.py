@@ -32682,10 +32682,19 @@ function pipeDraw(){
       <div style="width:${Math.max(pipeWidth(_pipe),
                     _pipe.order?pipeWidth(_pipe.order,_PIPE_TIGHT):0,
                     _pipe.checks?pipeWidth(_pipe.checks):0)}px;max-width:100%;flex:0 0 auto">
-        ${pipeSvg(_pipe, r?r.path:null, 'a')}
+        <div class="lkindhead" style="margin:2px 0 2px"><b style="color:#6fb0ff">
+          1 · A file nuarr has never seen — start to finish</b></div>
+        <div class="dim" style="font-size:11.5px;margin:0 0 8px;max-width:820px">
+          Left to right, once. An arr imports it, nuarr waits out the settle
+          hold in case it is still being written, four systems answer the
+          questions the plan is built from, the rules decide, and either there
+          is nothing to do — the commonest outcome — or one worker rewrites it
+          and the result is written back over the original. A file that has
+          just landed outranks the backlog at every step.</div>
+        ${pipeSvg(_pipe, r?r.path:null, 'a', _PIPE_TIGHT)}
         ${(_pipe.order&&(_pipe.order.nodes||[]).length)?`
         <div class="lkindhead" style="margin:18px 0 2px"><b style="color:#6fb0ff">
-          The order they take it in — and why it is an order</b></div>
+          2 · The order those four are asked in — and why it is an order</b></div>
         <div class="dim" style="font-size:11.5px;margin:0 0 8px;max-width:820px">
           Seven systems feed the one queue and each decides on its own what to
           do to a file. Nothing stopped them doing it in the wrong order, and
@@ -32700,21 +32709,22 @@ function pipeDraw(){
           file that has waited six hours goes anyway.</div>
         ${pipeSvg(_pipe.order, null, 'o', _PIPE_TIGHT)}`:''}
         <div class="lkindhead" style="margin:18px 0 6px"><b style="color:#6fb0ff">
-          Picture subtitles — the branch with a measurement behind it</b></div>
+          3 · Picture subtitles — the one branch with a measurement behind it</b></div>
         ${pipeSvg(_pipe.sub, r?r.sub_path:null, 'b')}
         ${_pipe.checks?`
         <div class="lkindhead" style="margin:18px 0 2px"><b style="color:#6fb0ff">
-          After it lands — the checks that keep looking</b></div>
-        <div class="dim" style="font-size:11.5px;margin:0 0 8px;max-width:760px">
-          These run on their own clocks over files that were committed weeks
-          ago, because a file can stop being what it claims to be long after
-          nuarr last touched it. Three of them — the decode check, the
-          listener and the subtitle reader — are also the prerequisites in the
-          flow above: the same system, asked once on the way past and again
-          months later. What they all have in common is where they end: one
-          remedy layer, one policy table deciding what may be done about each
-          kind of finding, and one hourly budget shared between all of
-          them.</div>
+          4 · A file already in the library — what puts it back on that line</b></div>
+        <div class="dim" style="font-size:11.5px;margin:0 0 8px;max-width:820px">
+          Picture 1 happens once. Everything after it is this: a committed file
+          is not finished, it is just correct <i>for now</i>. Six checks keep
+          looking — on their own clocks, over files committed weeks ago,
+          because a file can stop being what it claims to be long after nuarr
+          last touched it — and three of them are the same systems picture 2
+          orders, asked again months later. A rule you change and an upgrade
+          the arr lands need no check at all. Every road ends in the same
+          place: one remedy layer with one policy table and one hourly budget,
+          and then the file re-enters picture 1 at <b>Ready to plan</b> and is
+          planned from what it is now.</div>
         ${pipeSvg(_pipe.checks, null, 'c')}`:''}
       </div>
     </div>`;

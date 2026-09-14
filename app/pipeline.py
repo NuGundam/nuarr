@@ -247,6 +247,20 @@ def graph() -> dict:
                      ORDER BY j.id DESC LIMIT 1) = 'skipped'""")
         skipped_ever = _n(cur, "SELECT COUNT(*) FROM jobs "
                                "WHERE state='skipped'")
+        # THE TWO POPULATIONS THIS PAGE IS ABOUT.
+        #
+        # A file nuarr has never seen walks the line once, left to right. A
+        # file already in the library is not on that line at all until
+        # something puts it back on it. The page drew one graph starting at
+        # "In the library", which is neither: 39,782 files is not a thing that
+        # happens to a file.
+        n_new = _n(cur, "SELECT COUNT(*) FROM files WHERE state='new'")
+        n_elig = _n(cur, "SELECT COUNT(*) FROM files WHERE state='eligible'")
+        # Back on the line because a rule changed or somebody asked, rather
+        # than because it has just arrived.
+        n_again = _n(cur, "SELECT COUNT(*) FROM files WHERE state='eligible' "
+                          "  AND requeued_at IS NOT NULL")
+        n_first = max(0, n_elig - n_again)
         # The subtitle branch, which is the part with a measurement behind it.
         shaped = _n(cur, "SELECT COUNT(DISTINCT file_id) FROM sub_shape")
         typeset = _n(cur, "SELECT COUNT(DISTINCT file_id) FROM sub_shape "
@@ -316,28 +330,50 @@ def graph() -> dict:
               else (f"{len(libs)} libraries" if libs else "no libraries"))
 
     nodes = [
-        dict(id="found", col=0, row=1, label="In the library",
-             count=live, kind="source",
-             note="every file the arrs have told nuarr about"),
-        dict(id="probe", col=1, row=1, label="Probed",
-             count=probed, kind="stage",
-             note="ffprobe has read its streams; the answer is cached so a "
-                  "rescan does not re-probe"),
-        dict(id="unprobed", col=1, row=2, label="Not probed yet",
+        # ---- what a file nuarr has never seen actually does, in order ----
+        dict(id="found", col=0, row=1, label="It lands",
+             count=n_new, kind="source",
+             note=("an arr tells nuarr a file has been imported, or the scan "
+                   "finds it. The count is how many are in the settle hold "
+                   "right now: nuarr will not touch a file while it might "
+                   "still be being written, and the wait is the one setting "
+                   "in Holds and timing that every file pays.")),
+        dict(id="elig", col=1, row=1, label="Ready to plan",
+             count=n_elig, kind="stage",
+             note=(f"past the hold and waiting for the processing system. "
+                   f"{n_first:,} are here for the first time; {n_again:,} are "
+                   f"back because a rule changed or somebody asked - see the "
+                   f"second picture below. A file here outranks the backlog: "
+                   f"its jobs are queued ahead of work on files that have "
+                   f"already been through, newest arrival first.")),
+        dict(id="unprobed", col=1, row=2, label="Not read yet",
              count=unprobed, kind="idle",
-             note="waiting for the next scan"),
-        dict(id="plan", col=2, row=1, label="Planned",
+             note=(f"ffprobe has read the streams of {probed:,} files and the "
+                   f"answer is cached, so a rescan does not re-probe. The rest "
+                   f"are read the first time something needs them.")),
+        dict(id="facts", col=2, row=1, label="The facts first",
+             count=sum(held.values()) or None, kind="gate",
+             note=("before the plan can be trusted: does it decode, what "
+                   "language is each audio track really, are its tags "
+                   "corrected, what are its subtitle tracks. A rewrite is not "
+                   "queued for a file while any of them still owes an answer, "
+                   "and the answer it is waiting for jumps the queue. The "
+                   "count is how many files are waiting on one right now; the "
+                   "order is the picture directly below.")),
+        dict(id="plan", col=3, row=1, label="Planned",
              count=None, kind="stage",
-             note="the rules turn the probe into a plan: which video, which "
-                  "audio, which subtitles, and therefore which pool"),
-        dict(id="nothing", col=2, row=2, label="Nothing to do",
+             note="the rules turn the probe and the facts into a plan: which "
+                  "video, which audio, which subtitles, and therefore which "
+                  "worker"),
+        dict(id="nothing", col=3, row=2, label="Nothing to do",
              count=skipped, kind="idle",
-             note=("files whose last look found nothing worth changing - they "
-                   "already match the policy. "
+             note=("the commonest outcome, and not a failure: the file already "
+                   "matches the policy, so it is marked done without being "
+                   "touched. "
                    f"{skipped_ever:,} such conclusions have been reached in "
                    "total, since a file is re-examined whenever the rules or "
                    "the file change.")),
-        dict(id="gate", col=3, row=1, label="Job gate",
+        dict(id="gate", col=4, row=1, label="Job gate",
              count=q_all, kind="gate",
              note=("everything queued, in every pool. The gate holds work "
                    "while someone is watching, while a disk is busy, or while "
@@ -346,31 +382,31 @@ def graph() -> dict:
                    "order drawn below"
                    + (f". {sum(held.values()):,} file(s) are waiting on a "
                       f"fact right now" if sum(held.values()) else ""))),
-        dict(id="encode", col=4, row=0, label="Encode",
+        dict(id="encode", col=5, row=0, label="Encode",
              count=r_enc, kind="pool", pool="encode",
              note="the picture is rebuilt on the graphics card"),
-        dict(id="passthrough", col=4, row=1, label="Passthrough",
+        dict(id="passthrough", col=5, row=1, label="Passthrough",
              count=r_pass, kind="pool", pool="passthrough",
              note="tracks and flags change, the picture is copied untouched"),
-        dict(id="subocr", col=4, row=2, label="Subtitle OCR",
+        dict(id="subocr", col=5, row=2, label="Subtitle OCR",
              count=r_sub, kind="pool", pool="subocr",
              note=f"picture subtitles read into text with {eng}, "
                   f"for {libtxt}. After the rewrite, never before it: a track "
                   f"the transcode is about to drop is a minute of OCR nobody "
                   f"needed"),
-        dict(id="subs", col=4, row=3, label="Subtitle fixes",
+        dict(id="subs", col=5, row=3, label="Subtitle fixes",
              count=r_subs, kind="pool", pool="subs",
              note="sidecars taken inside, duplicate tracks dropped, titles "
                   "corrected - planned against the container the transcode "
                   "leaves behind, so a rewrite cannot invalidate the "
                   "instruction while it waits"),
-        dict(id="commit", col=5, row=1, label="Committed",
+        dict(id="commit", col=6, row=1, label="Committed",
              count=files_done, kind="stage",
              note=("files that have been rewritten at least once and written "
                    "back over the original, paced so a viewer never feels it. "
                    f"{jobs_done:,} commits in total - a file is rewritten "
                    "again whenever the policy changes under it.")),
-        dict(id="failed", col=5, row=2, label="Still not landed",
+        dict(id="failed", col=6, row=2, label="Still not landed",
              count=bad_now, kind="bad",
              note=("files whose most recent attempt failed or was blocked, "
                    "and which nothing has put right since. Retried on a "
@@ -381,10 +417,10 @@ def graph() -> dict:
                    "deleted or replaced.")),
     ]
     edges = [
-        dict(a="found", b="probe", label="scan reads it", n=probed),
-        dict(a="found", b="unprobed", label="not reached yet", n=unprobed,
-             muted=True),
-        dict(a="probe", b="plan", label="rules decide", n=probed),
+        dict(a="found", b="elig", label="the hold passes", n=n_elig),
+        dict(a="elig", b="unprobed", label="", n=unprobed, muted=True),
+        dict(a="elig", b="facts", label="four things to know", n=n_elig),
+        dict(a="facts", b="plan", label="all four answered", n=probed),
         dict(a="plan", b="nothing", label="already correct", n=skipped,
              muted=True),
         dict(a="plan", b="gate", label="a change is needed", n=q_all),
@@ -584,6 +620,31 @@ def graph() -> dict:
                    "one more indexer search. Nothing is deleted, because the "
                    "deleting was done the first time. Six hours between asks "
                    "about the same file.")),
+        # The two re-entries that are not findings at all. A rule change or
+        # an arr upgrade puts a file back on the line directly - no check, no
+        # remedy, no budget - and the page never showed either.
+        dict(id="c_rule2", col=0, row=6, label="A rule changed",
+             count=n_again, kind="source",
+             note=("change a rule - a codec, a language, a subtitle policy - "
+                   "and every file it now judges differently is put back to "
+                   "'ready to plan'. No check finds this and no remedy is "
+                   "involved; the rule IS the finding. The count is how many "
+                   "are waiting on that account right now.")),
+        dict(id="c_upg", col=0, row=7, label="The arr replaced it",
+             count=None, kind="source",
+             note=("an upgrade lands at the same path with different bytes. "
+                   "nuarr notices the size change, throws away everything it "
+                   "knew about the old release - the probe, the verdicts, the "
+                   "plan - and the file starts again as if it were new, "
+                   "because it is.")),
+        dict(id="c_back", col=3, row=3, label="Back to Ready to plan",
+             count=n_elig, kind="source",
+             note=("and round again: whatever the remedy did, the file "
+                   "re-enters the first picture at 'Ready to plan' and is "
+                   "planned from what it is NOW. This is the only way a file "
+                   "that is already committed gets touched again, which is "
+                   "why nothing on this page runs on a schedule of its own "
+                   "any more.")),
         dict(id="c_rep", col=2, row=4, label="Blocklist and replace",
              count=n_rep, kind="bad",
              note=(f"the file is deleted, the release blocklisted, and the arr "
@@ -612,6 +673,13 @@ def graph() -> dict:
         dict(a="c_found", b="c_ask", label="already blocklisted", n=n_ask),
         dict(a="c_found", b="c_rep", label="only another release can",
              n=n_rep),
+        # ...and every road leads back to the start.
+        dict(a="c_req", b="c_back", label="", n=n_req),
+        dict(a="c_fix", b="c_back", label="", n=n_fix),
+        dict(a="c_rep", b="c_back", label="the new one arrives", n=n_rep),
+        dict(a="c_rule2", b="c_back", label="straight back on the line",
+             n=n_again),
+        dict(a="c_upg", b="c_back", label="as if it were new", n=n_again),
     ]
 
     return {"cols": _COLS, "nodes": nodes, "edges": edges,
