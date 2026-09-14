@@ -528,6 +528,52 @@ class Job:
     created_at: float = field(default_factory=time.time)
 
 
+# A FILE THAT IS WAITING TO BE PROCESSED OUTRANKS ONE THAT ALREADY HAS BEEN.
+#
+# Every feeder queues at its own fixed priority - subtitles 50, listening 80,
+# the decode check 90, a transcode 100 - and none of them knows whether the
+# file it is queuing is a fresh import or a file done in March being looked at
+# again. So a new episode's decode check went in at 90 behind eighty-seven
+# checks on old files, its listen at 80 behind forty-six, and the transcode
+# that all of that was for waited for the lot. Erik: "push eligible files'
+# priority up so they get processed before older existing files".
+#
+# One rule, at the one door every job comes through: a job on an 'eligible'
+# file - past the settle hold, waiting for the processing system - is lifted
+# to FRESH_PRIORITY whatever its kind. Below every feeder's band, above the
+# promotion band, so a file something is standing still behind still leads
+# and a person's move-to-front still wins.
+FRESH_PRIORITY = 20
+FRESH_STATES = ("eligible",)
+
+
+def _fresh_priority(state: str, priority: int) -> int:
+    if (state or "") in FRESH_STATES:
+        return min(int(priority), FRESH_PRIORITY)
+    return int(priority)
+
+
+def lift_fresh() -> int:
+    """Apply FRESH_PRIORITY to what is ALREADY queued. -> rows lifted.
+
+    The rule is applied at enqueue, so on its own it would take effect one
+    feeder pass at a time while everything queued before it kept the old
+    order - measured at the restart that introduced it: 59 decode checks on
+    eligible files still at 90. Run once at start-up; idempotent, one UPDATE.
+    """
+    try:
+        with cursor() as cur:
+            n = cur.execute(
+                "UPDATE jobs SET priority=? WHERE state='queued' "
+                "  AND priority > ? AND file_id IN "
+                "  (SELECT id FROM files WHERE state IN "
+                f"   ({','.join('?' * len(FRESH_STATES))}))",
+                (FRESH_PRIORITY, FRESH_PRIORITY, *FRESH_STATES)).rowcount
+        return int(n or 0)
+    except Exception:                                        # noqa: BLE001
+        return 0
+
+
 class HeldForOrder(ValueError):
     """Not queued yet: an earlier system still has work owed on this file.
     See precedence.py. The feeder offers the file again next pass."""
@@ -1350,12 +1396,14 @@ def enqueue_many(rows: list, kind: str, priority: int = 50,
                 f"SELECT file_id FROM jobs WHERE state IN ('queued','running') "
                 f"  AND file_id IN ({q})", chunk)}
         titles: dict = {}
+        states: dict = {}
         for i in range(0, len(ids), 900):
             chunk = ids[i:i + 900]
             q = ",".join("?" * len(chunk))
             for x in cur.execute(
-                    f"SELECT id, title, season, episode FROM files "
+                    f"SELECT id, title, season, episode, state FROM files "
                     f" WHERE id IN ({q})", chunk):
+                states[int(x["id"])] = x["state"] or ""
                 if x["title"]:
                     titles[int(x["id"])] = display_label(
                         x["title"], x["season"], x["episode"])
@@ -1368,7 +1416,8 @@ def enqueue_many(rows: list, kind: str, priority: int = 50,
                 continue
             live.add(fid)
             batch.append((uuid.uuid4().hex[:12], fid, kind, "queued",
-                          int(priority), pool, r["path"],
+                          _fresh_priority(states.get(fid, ""), priority),
+                          pool, r["path"],
                           titles.get(fid) or r.get("name")
                           or os.path.basename(r["path"]),
                           r.get("plan_json") or None, now, source))
@@ -1601,6 +1650,15 @@ async def enqueue(file_id: int, path: str, title: str = "",
 
     try:
         with cursor() as cur:
+            # See FRESH_PRIORITY: a file waiting to be processed goes ahead of
+            # the backlog of files that already have been.
+            try:
+                _st = cur.execute("SELECT state FROM files WHERE id=?",
+                                  (file_id,)).fetchone()
+                priority = _fresh_priority(_st["state"] if _st else "",
+                                           priority)
+            except Exception:                                # noqa: BLE001
+                pass
             cur.execute(
                 "INSERT INTO jobs(job_id,file_id,kind,state,priority,pool,path,"
                 "title,plan_json,created_at,source) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
@@ -3406,6 +3464,15 @@ async def start() -> None:
         n = recover_interrupted()
         if n:
             joblog.log(f"requeued {n} job(s) interrupted by a restart", "warn")
+        # The queue as it stands obeys the fresh-file rule, not just what is
+        # queued from here on. See lift_fresh.
+        try:
+            lifted = lift_fresh()
+            if lifted:
+                joblog.log(f"[order] moved {lifted} queued job(s) on eligible "
+                           f"files ahead of the backlog", "info")
+        except Exception:                                    # noqa: BLE001
+            pass
         RECOVERED.clear()
         RECOVERY.update(state="pending", note="")
         _pump_task = asyncio.create_task(_recover_then_pump())

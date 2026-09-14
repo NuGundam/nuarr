@@ -15152,11 +15152,19 @@ html.mobile #logsPane{height:auto;min-height:60vh}
                 gap:8px;align-items:center;flex-wrap:wrap;font-size:12px;
                 transition:opacity .15s">
       <span class="dim rowlbl">showing</span>
-      <select id="qfPool" onchange="qReload('showing '+(this.value||'all pools')+'…')">
-        <option value="">all pools</option>
+      <!-- EVERY WORKER, not the three the queue had when this was written.
+           Five of the eight were unfilterable, which on a queue that is mostly
+           decode checks and subtitle fixes is most of what is in it. -->
+      <select id="qfPool" onchange="qReload('showing '+(this.value||'all workers')+'…')">
+        <option value="">all workers</option>
         <option value="encode">encode</option>
         <option value="passthrough">passthrough</option>
-        <option value="subocr">subocr</option></select>
+        <option value="subocr">subocr</option>
+        <option value="subs">subs</option>
+        <option value="audio">audio</option>
+        <option value="decode">decode</option>
+        <option value="listen">listen</option>
+        <option value="subread">subread</option></select>
       <select id="qfDisk" onchange="qReload(this.value?('filtering to '+this.value+'…'):'showing all disks…')">
         <option value="">all disks</option></select>
       <input id="qfText" placeholder="filter by title or path" style="width:200px"
@@ -23012,7 +23020,7 @@ async function loadQueue(){
     const headHtml =
       `<div class="qrow qhead">
         <span class="qn">#</span>
-        <span class="qpool">Pool</span>
+        <span class="qpool">Worker</span>
         <span class="qsrc">Source</span>
         <span class="qt">Title</span>
         <span class="qwork">Planned work</span>
