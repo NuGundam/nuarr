@@ -56,6 +56,22 @@ class OpResult:
     def __bool__(self) -> bool:
         return self.ok
 
+    def say(self) -> str:
+        """The detail, with the lock holders named if there are any.
+
+        Every caller that records a failure should use this rather than
+        `detail`: "file stayed locked" is a fact nobody can act on, and
+        "file stayed locked - held by Plex Media Server.exe (pid 11572)" is
+        the same fact with the next step in it.
+        """
+        d = (self.detail or "").strip()
+        who = [str(w) for w in (self.locked_by or []) if w]
+        if who and "held by" not in d.lower():
+            d += " - held by " + ", ".join(who[:3])
+            if len(who) > 3:
+                d += f" and {len(who) - 3} more"
+        return d
+
 
 # --------------------------------------------------------------------------
 # lock detection

@@ -539,6 +539,53 @@ async def topup(depth: int = QUEUE_DEPTH) -> dict:
             "on_queue": have + made}
 
 
+# A SUBTITLE JOB IS THREE THINGS, AND THE BAR WAS DRAWING THEM AS ONE.
+#
+# It counted the lines in each track (mkvextract, minutes), then rewrote the
+# container (mkvmerge, minutes), then read the result back and committed it -
+# and every one of those reported its own 0 to 100 into the same bar. So the
+# bar ran to the end, snapped back to nothing, ran to the end again, and sat
+# at 100% for the whole of the longest phase. Erik: "it looks like it's been
+# stuck for a while".
+#
+# The phases get shares of the bar instead, in the proportion they actually
+# take on this library, and each one says what it is. A number that only ever
+# goes forwards is the whole point of a progress bar.
+PHASES = (("counting the lines", 0.0, 55.0),
+          ("rewriting the container", 55.0, 92.0),
+          ("reading it back and committing", 92.0, 100.0))
+
+
+def _phase_report(report, lo: float, hi: float, note: str = ""):
+    """A reporter that maps a tool's own 0-100 into [lo, hi] of the bar.
+
+    Keeps the attributes the callers hang off the reporter - the ledger entry,
+    the pid hook and the stage hook - so a phase is a drop-in for the original.
+    """
+    if report is None:
+        return None
+
+    def rep(p):
+        try:
+            p = max(0.0, min(100.0, float(p)))
+            report(lo + (hi - lo) * p / 100.0)
+        except Exception:                                        # noqa: BLE001
+            pass
+    for a in ("task", "on_pid", "on_stage"):
+        try:
+            setattr(rep, a, getattr(report, a, None))
+        except Exception:                                        # noqa: BLE001
+            pass
+    if note:
+        stage = getattr(report, "on_stage", None)
+        if stage is not None:
+            try:
+                stage(note)
+            except Exception:                                    # noqa: BLE001
+                pass
+    return rep
+
+
 def do_one(row: dict, report=None, claim: bool = True) -> dict:
     r"""Carry out one file's whole instruction.
 
@@ -699,10 +746,16 @@ def _rewrite(fid: int, path: str, takes: list, drops: list, report, work,
             # is an equal share of the bar, and mkvextract's own percentage
             # moves within that share - the rewrite that follows is short by
             # comparison and reports through the same hook after.
+            # The counting owns the first slice of the bar, and each track
+            # owns an equal share of that slice - so two tracks reach 27% and
+            # 55%, not 50% and 100%. See PHASES.
+            _lo, _hi = PHASES[0][1], PHASES[0][2]
+
             def _pct(p, _i=i, _n=len(ords)):
                 if report is not None:
                     try:
-                        report((_i + max(0.0, min(100.0, p)) / 100.0) / _n * 100.0)
+                        share = (_i + max(0.0, min(100.0, p)) / 100.0) / _n
+                        report(_lo + (_hi - _lo) * share)
                     except Exception:                            # noqa: BLE001
                         pass
             counted.append((subdupe._events(path, t["id"], on_pid=on_pid,
@@ -756,7 +809,12 @@ def _rewrite(fid: int, path: str, takes: list, drops: list, report, work,
         tk = [{"sidecar": t["side"], "lang": t["lang"],
                "role": t.get("role") or "", "replaces": t.get("replaces") or []}
               for t in takes]
-        r = subembed._embed_tail(fid, path, tk, [], cmd, tmp, report, work,
+        # The rewrite gets the middle slice, and says so - the card used to
+        # show "counting the lines in track 2 of 2" for the whole of it.
+        r = subembed._embed_tail(fid, path, tk, [], cmd, tmp,
+                                 _phase_report(report, PHASES[1][1],
+                                               PHASES[1][2], PHASES[1][0]),
+                                 work,
                                  keep=keep, removed=len(remove),
                                  on_pid=getattr(report, "on_pid", None))
         return {"do": "rewrite", **r, "removed": len(remove),

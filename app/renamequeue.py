@@ -305,7 +305,9 @@ async def _attempt_batch(rows: list[dict]) -> list[tuple[dict, bool, str]]:
                 out.append((row, True,
                             f"renamed -> {os.path.basename(p.new_rel)}"))
             else:
-                out.append((row, False, res.detail))
+                # .say(), not .detail - the holders are the point. See
+                # fileops.OpResult.say().
+                out.append((row, False, res.say()))
     except Exception as e:
         done = {id(r) for r, _, _ in out}
         for r in rows:

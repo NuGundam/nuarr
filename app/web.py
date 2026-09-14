@@ -12126,6 +12126,24 @@ def api_workers_pause(pool: str, on: int = 1):
             "workers": workers.get().as_dict()}
 
 
+@app.get("/api/whoholds")
+def api_who_holds(path: str = ""):
+    """Which processes have this file open, RIGHT NOW.
+
+    The stored reason on a queue row is what was true when the attempt failed,
+    which can be an hour ago; the question a person actually has in front of a
+    stuck row is "who has it now". The Restart Manager answers in milliseconds
+    and the answer is a process name and a pid - enough to go and look.
+    """
+    from . import fileops as _fo
+    p = (path or "").strip()
+    if not p:
+        raise HTTPException(400, "no path")
+    who = _fo.who_locks(p)
+    return {"path": p, "exists": os.path.exists(p), "held_by": who,
+            "free": not who, "at": time.time()}
+
+
 @app.post("/api/workers/pause_all")
 def api_workers_pause_all(on: int = 1):
     """Every pool at once. The one switch at the top of the Concurrency page."""
@@ -19886,7 +19904,13 @@ async function loadRenq(){
       <td class="wrap"><div>${esc((r.path||'').split('\\').pop())}</div>
         <div class="sub ${cls==='p-bad'?'rq-bad':cls==='p-warn'?'rq-warn':'dim'}"
           >${esc(why)}</div>
-        ${fix?`<div class="sub rq-fix">To fix: ${esc(fix)}</div>`:''}</td>
+        ${fix?`<div class="sub rq-fix">To fix: ${esc(fix)}</div>`:''}
+        ${/lock/i.test(r.last_error||'')?`<div class="sub">
+           <button class="refetch" style="border-color:var(--acc);color:var(--acc)"
+             title="ask Windows who has this file open right now - the stored
+reason is what was true when the attempt failed, which may be an hour ago"
+             onclick="whoHolds(${JSON.stringify(esc(r.path||''))}, this)"
+             >Who has it?</button></div>`:''}</td>
       <td class="nb">${pill}</td>
       <td class="num dim nb">${wait>0?('in '+hms(wait)):'due now'}</td></tr>`;
   }).join('');
@@ -19907,6 +19931,33 @@ async function loadRenq(){
     (rows?`<table class="fixed vtop"><tr><th>File</th>
         <th class="nb" style="width:92px">Attempt</th>
         <th class="num nb" style="width:92px">Next try</th></tr>${rows}</table>`:'');
+}
+
+// WHO HAS THIS FILE OPEN, ASKED OF WINDOWS, NOW.
+//
+// A row that says "file stayed locked" names its holder from the moment it
+// failed - see fileops.OpResult.say(). That is the right thing to record and
+// the wrong thing to act on an hour later, because the holder may have let go
+// or may be a different process now. This asks the Restart Manager live and
+// writes the answer into the row, so the question "what is holding my file"
+// has a button rather than a procedure.
+async function whoHolds(path, btn){
+  if(btn){ btn.disabled=true; btn.textContent='asking…'; }
+  let d;
+  try{ d=await (await fetch('/api/whoholds?path='+encodeURIComponent(path))).json(); }
+  catch(e){ d=null; }
+  if(!btn) return;
+  btn.disabled=false;
+  if(!d){ btn.textContent='could not ask'; return; }
+  const box=document.createElement('div');
+  box.className='sub';
+  box.style.marginTop='3px';
+  box.innerHTML = d.free
+    ? `<span style="color:var(--ok)">nobody has it open right now</span>
+       <span class="dim">— the next try should land${
+         d.exists?'':'; the file is not on disk any more'}</span>`
+    : `<span style="color:var(--warn)">held by ${d.held_by.map(esc).join(', ')}</span>`;
+  btn.replaceWith(box);
 }
 
 // ---- Plex catching up ----------------------------------------------------
