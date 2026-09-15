@@ -1257,10 +1257,39 @@ def cache_probe(file_id: int, data: dict) -> None:
     # TaleSpin episodes were reported as mislabelled because a "track 0 is
     # Chinese" result survived a remux that removed sixteen tracks.
     if not layout_changed:
+        # THE SAME LAYOUT STILL HAS A NEW FINGERPRINT. Nothing moved, so every
+        # verdict still describes the track it names - but a flags-only edit
+        # changes size and mtime, and size and mtime are what the freshness
+        # test reads. Left alone, the cheapest possible rewrite sent the whole
+        # file back to Whisper: #10253 was heard at 03:52, given a 0-second
+        # transcode at 07:16, and heard again at 07:17 for the same answer.
+        try:
+            from . import audiolang as _alr
+            _p = ((data.get("format") or {}).get("filename") or "")
+            if not _p:
+                with cursor() as cur:
+                    _r = cur.execute("SELECT path FROM files WHERE id=?",
+                                     (file_id,)).fetchone()
+                _p = (_r["path"] if _r else "") or ""
+            if _p:
+                _alr.restamp(file_id, _p)
+        except Exception:                                # noqa: BLE001
+            pass
         return
+    # THE ONES THAT PREDATE THIS FILE, not the ones written for it. A commit
+    # carries its verdicts onto the rewritten file and stamps them with its
+    # size and mtime (audiolang.carry); this probe arrives seconds later and
+    # used to delete them anyway, so the listener heard the whole file again
+    # for the answer already in the table. The fingerprint decides.
     try:
         from . import audiolang
-        audiolang.invalidate(file_id)
+        _ip = ((data.get("format") or {}).get("filename") or "")
+        if not _ip:
+            with cursor() as cur:
+                _r = cur.execute("SELECT path FROM files WHERE id=?",
+                                 (file_id,)).fetchone()
+            _ip = (_r["path"] if _r else "") or ""
+        audiolang.invalidate(file_id, _ip)
     except Exception:                                    # noqa: BLE001
         pass
 
@@ -4575,7 +4604,7 @@ async def _reader_job(w: Worker) -> None:
             res = await in_work(
                 readers.listen_one, int(job.file_id), job.path,
                 list(plan.get("tracks") or []), bool(plan.get("jumped")),
-                _on_stage)
+                _on_stage, list(plan.get("spare") or []))
         else:
             res = await in_work(
                 readers.subread_one, str(plan.get("subread") or "picture"),
@@ -5716,6 +5745,30 @@ async def _transcode(w: Worker, probe_data: dict) -> None:
     # The surprise is still worth a warning, and it is a SHARPER one now:
     # landing somewhere other than the disk that was chosen is DrivePool
     # overriding the placement, which is the thing actually worth knowing.
+    # THE LANGUAGE VERDICTS FOLLOW THE AUDIO THROUGH THE REWRITE.
+    #
+    # The one place that knows both halves: the file that is now on disk, and
+    # the plan that built it. enumerate(plan.keep_audio) is the same mapping
+    # the muxer wrote its -map arguments from, so source track N is output
+    # track amap[N] by construction rather than by inference - and a source
+    # track that is not in it was dropped, so its verdict goes too.
+    #
+    # Without this, the commit changed size and mtime, every verdict for the
+    # file read as stale, and the listener heard the whole thing again for the
+    # same answer. Erik: "whisper should not waste time on listening to tracks
+    # that will be removed" - and it should not re-listen to the ones that
+    # survived either.
+    try:
+        from . import audiolang as _alc
+        _keep = list(getattr(job.plan, "keep_audio", None) or [])
+        _amap = {int(src): out for out, src in enumerate(_keep)}
+        if _amap:
+            _kept = _alc.carry(job.file_id, job.path, _amap)
+            if _kept:
+                joblog.log(f"carried {_kept} language verdict(s) onto the "
+                           f"rewritten file", "debug", job.id)
+    except Exception:                                            # noqa: BLE001
+        pass
     chose = getattr(res, "placed_on", "") or ""
     if chose and dest and dest != chose:
         joblog.log(f"placed on {chose}, but it is on {dest} now - something "

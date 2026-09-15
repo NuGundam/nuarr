@@ -78,6 +78,85 @@ def _disks_of(ids: list) -> dict:
     return out
 
 
+def _policy_of(ids: list) -> dict:
+    """library, audio tags and original language for a batch of files."""
+    out: dict = {}
+    ids = [int(i) for i in ids]
+    for i in range(0, len(ids), 900):
+        chunk = ids[i:i + 900]
+        q = ",".join("?" * len(chunk))
+        with cursor() as cur:
+            for r in cur.execute(
+                    f"SELECT id, COALESCE(library,'') lib, "
+                    f"       COALESCE(audio_langs,'') langs, "
+                    f"       COALESCE(orig_lang,'') orig "
+                    f"  FROM files WHERE id IN ({q})", chunk):
+                out[int(r["id"])] = (r["lib"], r["langs"], r["orig"])
+    return out
+
+
+def _split_spare(f: dict, lib: str, langs: str, orig: str) -> None:
+    r"""Set aside the tracks nothing is going to keep.
+
+    Erik: "whisper should not waste time on listening to tracks that will be
+    removed". The Strongest Sage S01E07 is the case: six audio tracks, Whisper
+    heard all six, and ninety seconds later the rewrite said "remove audio 0
+    (rus); remove audio 1 (rus); remove audio 2 (ger); remove audio 3 (por)".
+    Four tracks read to decide nothing.
+
+    WHY IT IS SAFE TO SKIP THEM, AND THE EXACT CONDITION. The listener exists
+    because a tag can LIE - Children of the Sea carried a second Japanese track
+    wearing "eng", and the rewrite dropped the wrong one. So a track cannot be
+    skipped merely for being unwanted: if its "rus" is a lie, the English may
+    be in it.
+
+    What makes it safe is that the file ALSO claims a track in every language
+    the policy keeps, and those tracks are the ones being listened to right
+    now. If they hold up, the spares carry nothing anyone wants, whatever they
+    really are. If they do NOT hold up - a wanted language claimed by a tag and
+    not confirmed by the audio - the spares are heard after all, in the same
+    job, before it finishes. See listen_one().
+
+    And the cases where nothing is skipped at all, because nothing is dropped:
+      * one audio track - always kept;
+      * keep_original set and the original language unknown - rules keeps
+        every track rather than guessing;
+      * no track in any kept language - the never-go-silent guard in
+        rules.decide() keeps the whole file.
+    """
+    from . import langkey, langpolicy, origlang
+    codes = [c.strip() for c in (langs or "").split(",")] if langs else []
+    if len(codes) < 2:
+        return
+    pol = langpolicy.for_library(lib, "audio")
+    keep = list(pol.get("langs") or [])
+    if pol.get("keep_original"):
+        oc = origlang.codes_for(orig)
+        if not oc:
+            return
+        keep += list(oc)
+    if not keep:
+        return
+    want = langkey.expand(keep)
+    wanted_at = {i for i, c in enumerate(codes)
+                 if c and c != "-" and (langkey.key(c) in want
+                                        or c.lower() in want)}
+    if not wanted_at:
+        return
+    spare, keepers = [], []
+    for t in f.get("tracks") or []:
+        i = int(t.get("track") or 0)
+        tag = (t.get("tagged") or "").strip()
+        # An UNTAGGED track is never spare: it has no claim to disbelieve, and
+        # its language is exactly what nobody knows yet.
+        if tag and 0 <= i < len(codes) and i not in wanted_at:
+            spare.append(t)
+        else:
+            keepers.append(t)
+    if spare and keepers:
+        f["tracks"], f["spare"] = keepers, spare
+
+
 def _deal(rows: list, room: int, disk_of) -> list:
     """Round robin by spindle, oldest first within each."""
     by: dict = {}
@@ -132,6 +211,7 @@ def _listen_pending(limit: int) -> list:
             order.append(fid)
             files[fid] = {"file_id": fid, "path": t.get("path") or "",
                           "library": t.get("library") or "", "tracks": [],
+                          "spare": [],
                           "jumped": bool(t.get("jumped")),
                           "blocking": False}
         # Any track of a blocking file makes the file blocking.
@@ -140,22 +220,34 @@ def _listen_pending(limit: int) -> list:
         files[fid]["tracks"].append({"track": int(t.get("track") or 0),
                                      "tagged": t.get("tagged") or ""})
     disks = _disks_of(order)
+    pols = _policy_of(order)
     for fid in order:
         files[fid]["disk"] = disks.get(fid, "")
+        # THE TRACKS THE REWRITE IS ABOUT TO DELETE DO NOT NEED HEARING FIRST.
+        # Never raises: a policy lookup failing means the file is listened to
+        # in full, which is where it was a moment ago.
+        try:
+            _lib, _lg, _or = pols.get(fid, ("", "", ""))
+            _split_spare(files[fid], _lib, _lg, _or)
+        except Exception:                                        # noqa: BLE001
+            pass
     return [files[f] for f in order]
 
 
 def _listen_plan(f: dict) -> str:
     n = len(f["tracks"])
     gaps = sum(1 for t in f["tracks"] if not t.get("tagged"))
+    sp = list(f.get("spare") or [])
     return json.dumps({
         "listen": True, "rewrite": False,
-        "tracks": f["tracks"], "jumped": bool(f.get("jumped")),
+        "tracks": f["tracks"], "spare": sp, "jumped": bool(f.get("jumped")),
         # Recorded on the job so the queue row can say why it is at the front
         # even though nobody lifted it - it was born there. See api_queue.
         "blocking": bool(f.get("blocking")),
         "summary": (f"listen to {n} track{'s' if n != 1 else ''}"
-                    + (f" - {gaps} with no tag" if gaps else "")),
+                    + (f" - {gaps} with no tag" if gaps else "")
+                    + (f", {len(sp)} left for the rewrite to delete"
+                       if sp else "")),
         "actions": [
             {"kind": "listen",
              "what": (f"listen to track {t['track'] + 1}"
@@ -163,7 +255,13 @@ def _listen_plan(f: dict) -> str:
                          else f" and check the tag ({t['tagged']})")),
              "why": "five 30-second windows through Whisper's language "
                     "identifier; the confident windows have to agree",
-             "detail": ""} for t in f["tracks"]],
+             "detail": ""} for t in f["tracks"]]
+        + [{"kind": "listen",
+            "what": f"skip track {t['track'] + 1} ({t.get('tagged') or 'untagged'})",
+            "why": "this library keeps none of that language and the rewrite "
+                   "will drop the track; heard only if a language it does keep "
+                   "turns out not to be here",
+            "detail": ""} for t in sp],
     })
 
 
@@ -224,7 +322,7 @@ async def topup_listen(depth: int | None = None) -> dict:
 
 
 def listen_one(file_id: int, path: str, tracks: list, jumped: bool,
-               on_stage=None) -> dict:
+               on_stage=None, spare: list | None = None) -> dict:
     r"""Listen to every unheard track in one file, and fill the blanks.
 
     run_once's loop body for one file, with the bookkeeping it did per pass
@@ -233,25 +331,65 @@ def listen_one(file_id: int, path: str, tracks: list, jumped: bool,
     end of a batch that no longer exists. A tagged track that disagrees is only
     RECORDED - correcting it is audqueue's decision, made from these facts.
     """
-    from . import audiolang
+    from . import audiolang, langkey
     heard = refused = 0
     tags: dict = {}
+    got: dict = {}
     n = len(tracks)
-    for i, t in enumerate(tracks):
-        tr = int(t.get("track") or 0)
-        if on_stage:
-            on_stage(f"listening to track {tr + 1}" + (f" of {n}" if n > 1 else ""),
-                     (i / max(1, n)) * 100.0)
-        try:
-            d = audiolang.check(int(file_id), path, tr)
-        except Exception as e:                                   # noqa: BLE001
-            return {"ok": False, "why": f"{type(e).__name__}: {e}"[:200]}
-        if d.get("ok") and d.get("code"):
-            heard += 1
-            if not t.get("tagged"):
-                tags[tr] = d["code"]
-        else:
-            refused += 1
+    failed: dict = {}
+
+    def _hear(rows: list, base: int, total: int) -> bool:
+        nonlocal heard, refused
+        for i, t in enumerate(rows):
+            tr = int(t.get("track") or 0)
+            if on_stage:
+                on_stage(f"listening to track {tr + 1}"
+                         + (f" of {total}" if total > 1 else ""),
+                         ((base + i) / max(1, total)) * 100.0)
+            try:
+                d = audiolang.check(int(file_id), path, tr)
+            except Exception as e:                               # noqa: BLE001
+                failed["why"] = f"{type(e).__name__}: {e}"[:200]
+                return False
+            got[tr] = d
+            if d.get("ok") and d.get("code"):
+                heard += 1
+                if not t.get("tagged"):
+                    tags[tr] = d["code"]
+            else:
+                refused += 1
+        return True
+
+    if not _hear(tracks, 0, n):
+        return {"ok": False, "why": failed.get("why") or "listen failed"}
+
+    # THE SPARES, BUT ONLY IF THE TAGS DID NOT HOLD UP.
+    #
+    # _split_spare set aside the tracks in languages this library keeps none
+    # of, on the strength of the file ALSO claiming a track in a language it
+    # does keep. That claim has now been tested. If every kept language the
+    # tags promised is actually in the audio, the spares carry nothing anyone
+    # wants and the job is done - four tracks of Whisper saved on The
+    # Strongest Sage S01E07 alone.
+    #
+    # If one of them was a lie, the promise is void: the English this file
+    # says it has is not where it said it was, and it may be sitting in a
+    # track labelled Russian. So they are heard after all - here, in the same
+    # job, before the rewrite is unheld and acts on any of it.
+    late = 0
+    if spare:
+        claimed = {(t.get("tagged") or "").strip()
+                   for t in tracks if (t.get("tagged") or "").strip()}
+        confirmed = {str((got.get(int(t.get("track") or 0)) or {}).get("code")
+                         or "") for t in tracks}
+        confirmed.discard("")
+        lost = sorted(c for c in claimed
+                      if not any(langkey.same(c, h) for h in confirmed))
+        if lost:
+            late = len(spare)
+            if not _hear(spare, n, n + late):
+                return {"ok": False, "why": failed.get("why") or "listen failed"}
+            n += late
     applied = ""
     if tags and audiolang.can_fast_path(path):
         if on_stage:
@@ -278,6 +416,9 @@ def listen_one(file_id: int, path: str, tracks: list, jumped: bool,
     return {"ok": True, "heard": heard, "refused": refused, "tags": tags,
             "why": (f"heard {heard} of {n}"
                     + (f", {refused} refused" if refused else "")
+                    + (f" - {late} more after a tag did not hold up" if late
+                       else (f" - {len(spare)} skipped, the rewrite drops them"
+                             if spare else ""))
                     + (f" - tagged {applied}" if tags and applied
                        and not applied.startswith("could") else "")
                     + (f" - {applied}" if applied.startswith("could") else ""))}

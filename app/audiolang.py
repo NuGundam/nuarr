@@ -3024,12 +3024,107 @@ def restamp(file_id: int, path: str) -> None:
         pass
 
 
-def invalidate(file_id: int) -> None:
-    """Drop every verdict for a file. Call this whenever the file is rewritten."""
+def carry(file_id: int, path: str, amap: dict | None) -> int:
+    r"""Move the verdicts onto the file a rewrite has just produced.
+
+    A VERDICT DESCRIBES AUDIO, NOT BYTES. invalidate() below was written on the
+    rule that a remux invalidates, and that is half right: what a remux breaks
+    is the KEYING - "track 2 is Japanese" names a slot, and the slot moves when
+    tracks are dropped. The audio inside a surviving track is the same audio it
+    was a moment ago, whether it was copied or re-encoded, and Whisper will say
+    the same word about it. Throwing the answer away does not make it truer; it
+    makes it cost seven seconds a track again.
+
+    Measured before this existed: 616 files listened to before a rewrite and
+    again after it, and in a 300-file sample, 118 minutes of Whisper on 2,145
+    tracks - every one of them re-hearing audio nuarr itself had just written.
+    The Strongest Sage S01E07 is the shape of it: heard, rewritten, heard again
+    ninety seconds later, same answer.
+
+    `amap` is {source audio index: output audio index}, which the transcode
+    knows exactly - it is the same enumerate(plan.keep_audio) the muxer built
+    its -map arguments from. A source track missing from it was dropped, and
+    its verdict goes with it. Passing None means the caller does NOT know the
+    mapping, and then this does nothing and the caller should invalidate:
+    a verdict pointing at the wrong track is the failure that started all of
+    this (seven TaleSpin episodes reported as mislabelled), and it is worse
+    than no verdict at all.
+
+    Returns the number of verdicts kept.
+    """
+    if not amap:
+        return 0
+    size, mtime = _stat(path)
+    if not size:
+        return 0                       # cannot fingerprint it; leave it alone
+    cols = ("code", "code2", "confidence", "ok", "why", "votes", "overall")
     try:
         ensure_table()
         with cursor() as cur:
+            rows = cur.execute(
+                "SELECT track, code, code2, confidence, ok, why, votes, overall "
+                "  FROM audio_lang WHERE file_id=?", (file_id,)).fetchall()
+            if not rows:
+                return 0
+            keep = []
+            for r in rows:
+                dst = amap.get(int(r["track"]))
+                if dst is None:
+                    continue
+                keep.append((file_id, int(dst)) + tuple(r[c] for c in cols)
+                            + (size, mtime, time.time()))
+            # REWRITTEN WHOLESALE RATHER THAN UPDATED IN PLACE. (file_id,track)
+            # is unique, and re-keying 2 -> 0 while 0 is still sitting there
+            # collides; with the rows already read, the delete is safe.
             cur.execute("DELETE FROM audio_lang WHERE file_id=?", (file_id,))
+            if keep:
+                cur.executemany(
+                    "INSERT INTO audio_lang(file_id,track,code,code2,confidence,"
+                    "ok,why,votes,overall,size,mtime,checked_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", keep)
+        return len(keep)
+    except Exception:                                    # noqa: BLE001
+        return 0
+
+
+def invalidate(file_id: int, path: str = "") -> None:
+    r"""Drop the verdicts a rewrite has made wrong.
+
+    WITH A PATH, IT DROPS ONLY THE ONES THAT PREDATE THE FILE. The rule this
+    was written under - a remux invalidates everything - is true of a verdict
+    recorded against the OLD bytes, and false of one recorded against the new
+    ones. carry() re-keys the survivors onto the rewritten file and stamps them
+    with its size and mtime; a probe arriving seconds later then deleted them,
+    and 4 tracks of Whisper were spent again on The Flash S02E08 for the answer
+    that was already sitting in the table. Measured: #55760, carried at 12:58:56
+    and wiped at 12:59:14.
+
+    The fingerprint is the whole test and it is the same one every reader uses.
+    A verdict whose size and mtime match the file on disk was written FOR this
+    file; anything else describes bytes that are gone. No rewrite leaves size
+    and mtime untouched, so nothing stale can pass.
+
+    Without a path there is no fingerprint to compare against, and the old
+    behaviour stands: drop the lot. A verdict pointing at the wrong track is
+    worse than no verdict - seven TaleSpin episodes were reported as
+    mislabelled that way.
+    """
+    try:
+        ensure_table()
+        if not path:
+            with cursor() as cur:
+                cur.execute("DELETE FROM audio_lang WHERE file_id=?", (file_id,))
+            return
+        size, mtime = _stat(path)
+        if not size:
+            with cursor() as cur:
+                cur.execute("DELETE FROM audio_lang WHERE file_id=?", (file_id,))
+            return
+        with cursor() as cur:
+            cur.execute("DELETE FROM audio_lang "
+                        " WHERE file_id=? AND (CAST(size AS INTEGER) != ? "
+                        "                      OR ABS(COALESCE(mtime,0) - ?) > 1.0)",
+                        (file_id, int(size), float(mtime)))
     except Exception:                                    # noqa: BLE001
         pass
 
