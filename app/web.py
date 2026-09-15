@@ -12837,8 +12837,11 @@ tr.logdrop td{padding:0 0 8px 0;background:#1c2129;border-bottom:1px solid var(-
   border-radius:8px;box-shadow:0 0 0 1px currentColor inset;
   animation:wstepglow 1.8s ease-in-out infinite}
 @keyframes wstepglow{0%,100%{opacity:.25}50%{opacity:.9}}
-/* done: the answer exists and the step is behind the file */
+/* done: the answer exists and the step is behind the file - and in the
+   WAITING list that is not the question, so it is not shown. See
+   stepBubbles(). */
 .wstep.s-done{background:rgba(255,255,255,.06)}
+#drillBody .wstep.wdone{display:none}
 /* THE WHOLE ROW GLOWS WHILE A WORKER HAS THE FILE.
    A bubble the size of a word is the right amount of detail for "which step"
    and not enough to catch the eye on an 81-row list - the one row where
@@ -18213,7 +18216,7 @@ function patchSteps(rows){
       if(!el) continue;
       const L = stepLive(s);
       const sst = (L && s.kind==='sub_ocr') ? 'running' : s.state;
-      const cls = 'wstep s-' + sst;
+      const cls = 'wstep s-' + sst + (sst==='done' ? ' wdone' : '');
       if(el.className !== cls) el.className = cls;
       const col = sst==='owed' ? '' : poolColor(s.pool||'');
       if(el.style.color !== col) el.style.color = col;
@@ -18463,6 +18466,14 @@ function stepLive(s){
   return w ? {w, pct: Math.round(Math.max(0, Math.min(1, w.progress||0))*100),
               stage: w.stage || ''} : null;
 }
+// ONLY WHAT IS STILL TO BE DONE. This is the WAITING list, and the question
+// each row answers is "waiting for what" - a bubble for a check that is
+// already behind the file answers a different question, and on a row with
+// four of them done and two to go it was the four the eye landed on. Erik:
+// "only the necessary bubbles should show for this area". The finished ones
+// are not gone: the row's log block still lists every step with its answer.
+// Kept in the DOM and hidden rather than skipped, so a step finishing in
+// place can vanish on the two-second patch without a rebuild.
 function stepBubbles(r){
   const steps = r.steps || [];
   if(!steps.length) return '';
@@ -18483,7 +18494,7 @@ function stepBubbles(r){
                         + (L ? ' - ' + pct + '%' : ' - starting')
                         + (L && L.stage ? ' - ' + L.stage : '')
       :                 'answered; this step is behind the file');
-    return `<span class="wstep s-${st}" style="${col}" title="${esc(tip)}"
+    return `<span class="wstep s-${st}${st==='done'?' wdone':''}" style="${col}" title="${esc(tip)}"
          data-fid="${r.id}" data-kind="${esc(s.kind)}"
          data-job="${esc(s.job_id||'')}">`
          + (L ? `<i style="width:${pct}%"></i>` : '')
