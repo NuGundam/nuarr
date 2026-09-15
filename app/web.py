@@ -24723,7 +24723,7 @@ function renderDone(j){
   // carries the newest ~60 jobs and cannot answer "what happened in June".
   // The server hands back the same {ts, job} / {ts, ev} shape, so everything
   // below - grouping, pills, drop-downs, the size column - is unchanged.
-  const items = _actHist ? _actHist.items.slice().sort((x,y)=>x.ts-y.ts) : [
+  let items = _actHist ? _actHist.items.slice().sort((x,y)=>x.ts-y.ts) : [
     ...all.map(r=>({ts:r.finished_at||0, job:r})),
     ...events.map(e=>({ts:e.at||0, ev:e})),
   ].sort((x,y)=>x.ts-y.ts);
@@ -24739,13 +24739,41 @@ function renderDone(j){
     if(e.event==='imported' && /(upgrad|->)/i.test(e.detail||'')) return 'upgraded';
     return e.event;
   };
-  // ONE ROW PER FILE, like the Plex panel above it. The flat feed told the
-  // same file's story in interleaved fragments - Gundam SEED FREEDOM was five
-  // rows spread down the screen (passthrough, content_changed, skipped,
-  // renamed...) with other files' rows in between. Grouped, each file is one
-  // line summarising everything that happened to it, and clicking it drops
-  // down the full chronological record.
   const lblOf=it=> it.job ? doneLbl(it.job) : evName(it.ev);
+  // ONE UPGRADE IS ONE ENTRY.
+  //
+  // An upgrade writes up to three history rows across TWO file rows, because
+  // three things are true at once and each is recorded where it belongs: the
+  // arr announces the replacement, the new file records what it replaced
+  // ("338 MB -> 1.09 GB"), and the old row records that it was replaced. All
+  // three are the same event and the tree counted them as three - "upgraded
+  // x3" over one upgrade, with the two thin rows saying less than the one
+  // rich one. Erik: "should be combined as one entry".
+  //
+  // Folded here rather than at the source: the rows are correct, and months
+  // of stored history already carry the older spellings. The one kept is the
+  // one that says the most - the before -> after line, if there is one.
+  const UPGRADE_FOLD_S = 300;
+  {
+    const rich = e => /->|\u2192/.test(e.detail || '') ? 2
+                    : (e.detail || '').length > 12 ? 1 : 0;
+    const out = [], at = new Map();          // title -> index of its last one
+    for(const it of items){
+      if(it.ev && evName(it.ev) === 'upgraded'){
+        const t = it.ev.label || '\u2014';
+        const i = at.get(t);
+        if(i != null && Math.abs((it.ts || 0) - (out[i].ts || 0)) <= UPGRADE_FOLD_S){
+          const keep = rich(it.ev) > rich(out[i].ev) ? it : out[i];
+          out[i] = {...keep, ts: Math.max(out[i].ts || 0, it.ts || 0)};
+          continue;
+        }
+        out.push(it); at.set(t, out.length - 1);
+        continue;
+      }
+      out.push(it);
+    }
+    items = out;
+  }
   syncFilter('doneFilter', items.map(lblOf), 'everything');
   const want=document.getElementById('doneFilter').value;
   const groups=new Map();
