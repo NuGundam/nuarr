@@ -1530,6 +1530,33 @@ async def enqueue(file_id: int, path: str, title: str = "",
     if _sc.is_excluded(path):
         raise ValueError(f"path is excluded from nuarr: {path}")
 
+    # THE FACTS BEFORE THE ORDER CHECK, because the order check reads them.
+    #
+    # The listener's oracle asks "does this file have audio tags nobody has
+    # verified" from files.audio_langs - and that column is written by the
+    # probe. A row the arr's webhook has just created has no probe yet, so
+    # the column is empty, and an empty column reads as "nothing to hear":
+    # the check passed, the rewrite was queued, and two lines further down
+    # the probe ran and filled the tags in. From that instant the listener
+    # was owed on a file whose rewrite was already in the queue.
+    #
+    # Measured on Cyborg 009 S01E09: imported at +0.0m, rewrite queued at
+    # +6.2m with no listen job ever having existed, rewrite done at +34.2m,
+    # first listen at +34.6m - promoted to the front by the very order rule
+    # that should have held the rewrite, three passes to hear all four
+    # windows. Every file in the batch, the same. Erik saw a grey LISTEN
+    # beside a running rewrite and asked why; this is why.
+    #
+    # So for a rewrite the probe is taken first and cached, and the order
+    # check runs against a row that knows what its tracks are tagged. Same
+    # probe the plan needs anyway, taken a few lines earlier; nothing extra
+    # is read.
+    data = None
+    if kind == "transcode" and file_id:
+        data = await probe(path)
+        if data:
+            cache_probe(file_id, data)
+
     # THE ORDER THE SYSTEMS TAKE A FILE IN - see precedence.py. A transcode
     # is not queued while the decode check or the listener still owe this
     # file an answer; subtitle OCR waits for the transcode. A person's own
@@ -1614,9 +1641,11 @@ async def enqueue(file_id: int, path: str, title: str = "",
     if kind == "sub_ocr":
         priority = max(priority, 90)
     if kind == "transcode":
-        data = await probe(path)
+        if data is None:                  # no file_id above: probe here
+            data = await probe(path)
+            if data:
+                cache_probe(file_id, data)
         if data:
-            cache_probe(file_id, data)
             anime = rules.is_anime(path)
             try:
                 plan = rules.decide(data, anime=anime,
