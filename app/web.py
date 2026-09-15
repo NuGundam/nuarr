@@ -8854,15 +8854,38 @@ async def api_refetch_run(file_id: int, confirm: str = ""):
 #   done     the answer exists; this step is behind the file
 _STEP_LABEL = {"decode": "Does it decode?", "listen": "What language?",
                "audio": "Tags corrected", "subread": "What the subs are",
-               "transcode": "The rewrite"}
+               "transcode": "The rewrite",
+               "sub_ocr": "Picture subtitles read into words"}
 _STEP_POOL = {"decode": "decode", "listen": "listen", "audio": "audio",
-              "subread": "subread", "transcode": "encode"}
-_STEP_ORDER = ("decode", "listen", "audio", "subread", "transcode")
+              "subread": "subread", "transcode": "encode",
+              "sub_ocr": "subocr"}
+_STEP_ORDER = ("decode", "listen", "audio", "subread", "transcode", "sub_ocr")
+
+# THE OCR STEP IS NOT ALWAYS THERE, which is why it is the one step that can
+# be absent from the strip. A file with no picture subtitles owes no OCR and a
+# greyed-out bubble saying so on every row would be noise; a file that owes one
+# has it read DURING its own rewrite, and that was reported only as a line of
+# prose - "done - waiting for subtitle OCR" - with no way to see how far in it
+# was. It gets a bubble now, on the same terms as the other five.
+#
+# Owed is decided from the subtitle reading rather than from a fresh probe: a
+# picture track with no text twin is exactly what the OCR exists to fix.
+_TEXT_SUB = ("subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "text")
+_PIC_SUB = ("hdmv_pgs_subtitle", "pgssub", "dvd_subtitle", "dvdsub",
+            "dvb_subtitle", "vobsub", "xsub")
+
+
+# The states a file can be in while the system still owes it work. Held
+# files earn their bubbles too: the four checks are run WHILE a file settles,
+# so by the time it turns eligible they are already done - which is what made
+# two separate lists of them pointless.
+_STEP_STATES = ("eligible", "new")
 
 
 def _file_steps(rows: list, cap: int = 400) -> None:
-    """Attach r['steps'] to every eligible row. Best effort, never raises."""
-    want = [r for r in rows if (r.get("state") or "") == "eligible"][:cap]
+    """Attach r['steps'] to every unfinished row. Best effort, never raises."""
+    want = [r for r in rows
+            if (r.get("state") or "") in _STEP_STATES][:cap]
     if not want:
         return
     try:
@@ -8885,19 +8908,53 @@ def _file_steps(rows: list, cap: int = 400) -> None:
                         "SELECT job_id FROM jobs WHERE state='queued' AND pool=? "
                         " ORDER BY priority, created_at", (pool,))):
                     place[j["job_id"]] = i + 1
+            # Which of these files hold picture subtitles, and which already
+            # hold words - one pass over the readings rather than a probe per
+            # file. See _PIC_SUB / _TEXT_SUB above.
+            pic, txt = set(), set()
+            for sf in cur.execute(
+                    f"SELECT file_id, tracks FROM sub_facts "
+                    f" WHERE file_id IN ({qs})", tuple(ids)):
+                try:
+                    cc = [str(t.get("codec") or "").lower()
+                          for t in json.loads(sf["tracks"] or "[]")]
+                except Exception:                            # noqa: BLE001
+                    continue
+                fid = int(sf["file_id"])
+                if any(c in _TEXT_SUB for c in cc):
+                    txt.add(fid)
+                if any(c in _PIC_SUB for c in cc):
+                    pic.add(fid)
             for r in want:
+                fid = int(r["id"])
                 f = {"id": r["id"], "size": r.get("size"),
                      "path": r.get("path"), "duration": r.get("duration"),
                      "audio_langs": r.get("audio_langs"),
                      "sub_langs": r.get("sub_langs")}
                 steps = []
                 for k in _STEP_ORDER:
-                    j = live.get((int(r["id"]), k))
+                    j = live.get((fid, k))
+                    via = ""
+                    if k == "sub_ocr":
+                        owed = (fid in pic) and (fid not in txt)
+                        if not j and not owed:
+                            continue          # no picture subs: not in the plan
+                        if not j:
+                            # THE OCR RIDES ALONG WITH THE REWRITE. It has no
+                            # job row of its own - it runs on a thread inside
+                            # the transcode, alongside ffmpeg - so the bubble
+                            # borrows that job's id and the page reads the
+                            # worker's own OCR fraction from it.
+                            tj = live.get((fid, "transcode"))
+                            if tj and tj["state"] == "running":
+                                via = tj["job_id"]
                     if j:
                         st = "running" if j["state"] == "running" else "queued"
                     elif k == "transcode":
                         # An eligible file has not been rewritten yet by
                         # definition - that is what eligible means.
+                        st = "owed"
+                    elif k == "sub_ocr":
                         st = "owed"
                     else:
                         fn = _prec.ORACLE.get(k)
@@ -8908,7 +8965,7 @@ def _file_steps(rows: list, cap: int = 400) -> None:
                     steps.append({
                         "kind": k, "label": _STEP_LABEL.get(k, k),
                         "pool": (j or {}).get("pool") or _STEP_POOL.get(k, ""),
-                        "state": st,
+                        "state": st, "via": via,
                         "pos": place.get((j or {}).get("job_id")) if j else None,
                         "priority": (j or {}).get("priority") if j else None,
                         "job_id": (j or {}).get("job_id") if j else None,
@@ -8939,7 +8996,17 @@ def api_files(state: str | None = None, library: str | None = None,
         where.append("arr_file_id IS NULL AND state NOT IN ('duplicate','deleted') "
                      "AND COALESCE(size,0) < ?"); params.append(cut)
     if state:
-        where.append("state=?"); params.append(state)
+        # A COMMA LIST, because one tile now covers two states. Held and
+        # eligible were separate tiles and separate lists, and the split did
+        # not survive contact with the system: the four checks are run WHILE a
+        # file settles, so by the time it turns eligible they are done and the
+        # two lists were the same list with the same bubbles.
+        st = [x.strip() for x in str(state).split(",") if x.strip()]
+        if len(st) == 1:
+            where.append("state=?"); params.append(st[0])
+        elif st:
+            where.append("state IN (" + ",".join("?" * len(st)) + ")")
+            params += st
     if library:
         where.append("library=?"); params.append(library)
     if disk:
@@ -16040,9 +16107,21 @@ async function loadAll(){
   add('Total files',fmt(s.totals.n),
       gb(s.totals.bytes) + (gapTxt ? ' · '+gapTxt : ''),
       {t:'All files'});
-  add('Eligible',fmt((byState.eligible||{}).n||0),'past hold, ready to process',
-      {state:'eligible',t:'Eligible'});
-  add('Held (new)',fmt((byState.new||{}).n||0),'still settling',{state:'new',t:'Held'});
+  // ONE TILE FOR "NOT FINISHED WITH YET", not two.
+  //
+  // Held and Eligible were separate tiles, separate lists and separate
+  // questions - and the questions turned out to be the same one. The four
+  // checks are run while a file SETTLES, so a file arrives in Eligible with
+  // decode, listen, audio and subread already behind it and only the rewrite
+  // left; the bubbles said so on every row. Erik: "all of these checks were
+  // done before it hit the Eligible title". The split lives in the sub-line
+  // and on each row's own state pill, where it costs nothing to carry.
+  {
+    const nEl = (byState.eligible||{}).n||0, nNew = (byState.new||{}).n||0;
+    add('Waiting', fmt(nEl + nNew),
+        `${fmt(nEl)} ready \u00b7 ${fmt(nNew)} still settling`,
+        {state:'new,eligible', t:'Waiting'});
+  }
   // CONFIRMED missing only. A file the arr tracks but cannot find on disk is
   // usually a stale arr record, not a lost file - so the healer re-checks it
   // up to 3 times before it counts here. Showing the raw 'missing' state put
@@ -18119,13 +18198,14 @@ function patchSteps(rows){
       const el = box.querySelector(
         `.wstep[data-fid="${r.id}"][data-kind="${s.kind}"]`);
       if(!el) continue;
-      const cls = 'wstep s-' + s.state;
+      const L = stepLive(s);
+      const sst = (L && s.kind==='sub_ocr') ? 'running' : s.state;
+      const cls = 'wstep s-' + sst;
       if(el.className !== cls) el.className = cls;
-      const col = s.state==='owed' ? '' : poolColor(s.pool||'');
+      const col = sst==='owed' ? '' : poolColor(s.pool||'');
       if(el.style.color !== col) el.style.color = col;
-      const run = (s.state==='running' && lastJobs)
-        ? ((lastJobs.running)||[]).find(w=>w.job_id===s.job_id) : null;
-      const pct = run ? Math.round(Math.max(0, Math.min(1, run.progress||0))*100) : 0;
+      const run = L;
+      const pct = L ? L.pct : 0;
       let fill = el.querySelector('i');
       if(run){
         if(!fill){ fill = document.createElement('i'); el.insertBefore(fill, el.firstChild); }
@@ -18134,7 +18214,7 @@ function patchSteps(rows){
       } else if(fill){ fill.remove(); }
       const b = el.querySelector('b');
       const want = s.kind.toUpperCase()
-                 + (s.state==='queued' && s.pos ? ' ' + s.pos : '');
+                 + (sst==='queued' && s.pos ? ' ' + s.pos : '');
       if(b && b.textContent !== want) b.textContent = want;
     }
   }
@@ -18345,25 +18425,56 @@ async function drillRefresh(force){
 // the one fact that answers "so when?". A running bubble fills from the left
 // with the job's real progress, read from the live job poll, so a row being
 // worked on moves while you watch it.
+// WHAT IS ACTUALLY MOVING BEHIND ONE BUBBLE.
+//
+// A step with a job of its own reads that job's progress. The OCR step has no
+// job of its own - it runs on a thread INSIDE the transcode, alongside ffmpeg
+// - so it borrows that worker (s.via) and reads the fraction the worker keeps
+// for it. That is why the OCR can be "running" while its own state says owed:
+// there is nothing in the queue to be running, and it is running anyway.
+//
+// One function, because stepBubbles draws this and patchSteps re-draws it two
+// seconds later, and a second copy of the rule is a second answer.
+function stepLive(s){
+  if(typeof lastJobs === 'undefined' || !lastJobs) return null;
+  const all = (lastJobs.running) || [];
+  if(s.kind === 'sub_ocr' && s.via){
+    const w = all.find(x => x.job_id === s.via);
+    if(w && w.sub_ocr_active)
+      return {w, pct: Math.round(Math.max(0, Math.min(1, w.sub_ocr_frac||0))*100),
+              stage: w.sub_ocr_stage || ''};
+    return null;
+  }
+  if(s.state !== 'running') return null;
+  const w = all.find(x => x.job_id === s.job_id);
+  return w ? {w, pct: Math.round(Math.max(0, Math.min(1, w.progress||0))*100),
+              stage: w.stage || ''} : null;
+}
 function stepBubbles(r){
   const steps = r.steps || [];
   if(!steps.length) return '';
   return `<span class="wsteps">${steps.map(s=>{
-    const col = s.state==='owed' ? '' : `color:${poolColor(s.pool||'')}`;
-    const run = (s.state==='running' && typeof lastJobs!=='undefined' && lastJobs)
-      ? ((lastJobs.running)||[]).find(w=>w.job_id===s.job_id) : null;
-    const pct = run ? Math.round(Math.max(0, Math.min(1, run.progress||0))*100) : 0;
+    const L = stepLive(s);
+    // A borrowed worker makes the bubble live whatever the queue says.
+    const st = (L && s.kind==='sub_ocr') ? 'running' : s.state;
+    const col = st==='owed' ? '' : `color:${poolColor(s.pool||'')}`;
+    const pct = L ? L.pct : 0;
     const tip = s.label + ' - ' + (
-        s.state==='owed'   ? 'nothing queued for it yet, and the answer is missing'
-      : s.state==='queued' ? `queued as ${s.pool}, number ${s.pos||'?'} in that worker's line`
-      : s.state==='running'? `a ${s.pool} worker has it now`
-                             + (run ? ' - ' + pct + '%' : ' - starting')
-      :                      'answered; this step is behind the file');
-    return `<span class="wstep s-${s.state}" style="${col}" title="${esc(tip)}"
+        st==='owed'   ? (s.kind==='sub_ocr'
+                          ? 'this file has picture subtitles and no words yet -'
+                            + ' the rewrite will read them on the way through'
+                          : 'nothing queued for it yet, and the answer is missing')
+      : st==='queued' ? `queued as ${s.pool}, number ${s.pos||'?'} in that worker's line`
+      : st==='running'? (s.via ? `being read alongside the rewrite`
+                               : `a ${s.pool} worker has it now`)
+                        + (L ? ' - ' + pct + '%' : ' - starting')
+                        + (L && L.stage ? ' - ' + L.stage : '')
+      :                 'answered; this step is behind the file');
+    return `<span class="wstep s-${st}" style="${col}" title="${esc(tip)}"
          data-fid="${r.id}" data-kind="${esc(s.kind)}"
          data-job="${esc(s.job_id||'')}">`
-         + (run ? `<i style="width:${pct}%"></i>` : '')
-         + `<b>${esc(s.kind)}${s.state==='queued'&&s.pos?' '+s.pos:''}</b></span>`;
+         + (L ? `<i style="width:${pct}%"></i>` : '')
+         + `<b>${esc(s.kind)}${st==='queued'&&s.pos?' '+s.pos:''}</b></span>`;
   }).join('')}</span>`;
 }
 
@@ -18388,8 +18499,10 @@ function noteFor(r){
   if(!w) return null;                       // the poll has not seen it yet
   let out;
   if(w.stage === 'committing' || w.commit_phase)
+    // Before the copy names a spindle, the honest answer is the pool - it is
+    // going there whatever DrivePool decides about which disk.
     out = [w.dest_disk ? 'done \u00b7 moving to ' + w.dest_disk
-                       : 'done \u00b7 finding it a disk', 'move'];
+                       : 'done \u00b7 moving to the pool', 'move'];
   else if(w.stage === 'arr refresh / rename' || w.stage === 'done')
     out = [w.dest_disk ? 'done \u00b7 on ' + w.dest_disk : 'done', 'move'];
   else {
@@ -18399,7 +18512,11 @@ function noteFor(r){
     // DrivePool balance. A bare "100%" for that is precisely the
     // finished-and-stuck look this note exists to end, so it names what.
     if(pct >= 100){
-      const st = String(w.stage || '').split(' - ')[0].trim();
+      let st = String(w.stage || '').split(' - ')[0].trim();
+      // The OCR has a bubble of its own now, carrying its own fraction and
+      // its own stage. The note saying "waiting for subtitle OCR" as well was
+      // the prose this replaced - so it says only that the rewrite is done.
+      if(/subtitle ocr/i.test(st)) st = 'waiting';
       out = ['done \u00b7 ' + (st && st !== 'encoding' ? st : 'waiting'),
              'move'];
     } else out = [pct + '%', 'pct'];

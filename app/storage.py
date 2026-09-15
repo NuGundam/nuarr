@@ -208,6 +208,13 @@ def _is_remote(path: str) -> tuple[bool, str]:
     letter until you ask what is behind it.
     """
     p = (path or "").replace("/", "\\")
+    # \\?\ and \\.\ open the device namespace; they are not a server name.
+    # Every other prefixed form is unwrapped by _deprefix before it gets here,
+    # but \\?\Volume{GUID}\ deliberately survives it (see below), and without
+    # this guard that path parses as a machine called "?" - the exact fault
+    # _deprefix was written to end, re-entering by the one door left open.
+    if p[:4] in ("\\\\?\\", "\\\\.\\"):
+        return False, ""
     if p.startswith("\\\\"):
         host = p[2:].split("\\", 1)[0]
         return True, host
@@ -300,6 +307,20 @@ def _deprefix(path: str) -> str:
         rest = p[4:]
         if rest[:4].upper() == "UNC\\":
             return "\\\\" + rest[4:]
+        # \\?\Volume{GUID}\... IS THE PATH, NOT DRESSING AROUND ONE.
+        #
+        # It is the only way to name a volume that has no drive letter, which
+        # is every disk in the pool on this machine - DrivePool mounts its
+        # members without letters and a placed commit stages straight into
+        # one. Take the prefix off and what is left, "Volume{...}\PoolPart...",
+        # is a RELATIVE path: abspath then resolves it against the working
+        # directory, so the answer to "which disk is this file on" became
+        # whichever disk nuarr happens to be running from. That is C: here,
+        # labelled OS, and it is what made a commit onto NU-DRIVE-4 report
+        # "moving to OS" - a wrong answer that would have changed if the
+        # service were installed somewhere else.
+        if rest[:7].upper() == "VOLUME{":
+            return p
         return rest
     return p
 
