@@ -422,10 +422,15 @@ def init_db() -> None:
         # undifferentiated queue there was no way to answer "why is this here",
         # and no way to clear the automatic backlog without also throwing away
         # the handful of files you queued deliberately.
+        # `not_before` is WHEN A DEFERRED JOB MAY BE TRIED AGAIN. A job put
+        # back for a locked file used to be eligible for the very next
+        # dispatch, and when it was the only job in its pool that was a
+        # three-second loop against the same lock - see jobs._defer().
         for name, ddl in (("job_id", "TEXT"), ("pool", "TEXT"),
                           ("path", "TEXT"), ("title", "TEXT"),
                           ("stage", "TEXT"),
-                          ("source", "TEXT DEFAULT 'manual'")):
+                          ("source", "TEXT DEFAULT 'manual'"),
+                          ("not_before", "REAL")):
             if name not in cols:
                 cur.execute(f"ALTER TABLE jobs ADD COLUMN {name} {ddl}")
         # jobs.file_id must allow NULL.

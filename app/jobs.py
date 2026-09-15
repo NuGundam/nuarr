@@ -2211,7 +2211,9 @@ def _claim(pool: str) -> Job | None:
         base = ("SELECT j.id,j.job_id,j.file_id,j.kind,j.priority,j.path,"
                 "       j.title,j.plan_json, f.pool_disk AS pool_disk "
                 "FROM jobs j LEFT JOIN files f ON f.id = j.file_id "
-                "WHERE j.state='queued' AND j.pool=? ")
+                "WHERE j.state='queued' AND j.pool=? "
+                # A deferred job waits out its own not_before - see _defer().
+                f"AND COALESCE(j.not_before, 0) <= {float(time.time())!r} ")
         if live_files:
             base += ("AND (j.file_id IS NULL OR j.file_id NOT IN ("
                      + ",".join(str(int(i)) for i in live_files) + ")) ")
@@ -2756,20 +2758,29 @@ def reap_orphan_encoders(dry: bool = False) -> dict:
                        for a in cmd):
                 skipped += 1
                 continue          # not ours - never touch it
-            if now - float(p.info["create_time"] or now) < ORPHAN_GRACE_S:
-                kept += 1
-                continue          # too young to judge
             ppid = p.info["ppid"]
             if ppid == my_pid:
                 kept += 1
                 continue          # ours, and we are alive
             alive = False
+            parent_gone = False
             try:
                 par = psutil.Process(ppid)
                 alive = ((par.name() or "").lower() == my_name
                          and par.create_time() <= float(p.info["create_time"]))
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
+            except psutil.NoSuchProcess:
+                # NO PROCESS AT THAT PID AT ALL. That is not "adopted by
+                # something else" - it is a child whose parent died, and no
+                # age is too young for that verdict: a live nuarr's child
+                # always has a live nuarr above it. The grace below exists
+                # for the ambiguous cases, and this is not one.
+                parent_gone = True
+            except psutil.AccessDenied:
                 alive = False
+            if not parent_gone and \
+                    now - float(p.info["create_time"] or now) < ORPHAN_GRACE_S:
+                kept += 1
+                continue          # too young to judge
             if alive:
                 kept += 1
                 continue          # a live nuarr owns it
@@ -2801,7 +2812,13 @@ async def reap_orphans_forever() -> None:
     none of the ones a cancelled or timed-out job makes while the server keeps
     running - and those were most of the twenty-one found at the audit.
     """
-    await asyncio.sleep(900)
+    # AT BOOT FIRST. A restart is exactly when an orphan is made - the old
+    # nuarr's ffmpeg keeps encoding with nobody to collect the result - and
+    # waiting fifteen minutes to look meant fifteen minutes of a job deferring
+    # against a lock the previous nuarr left behind. A short pause so the
+    # process table has settled and the restart's own children are visible as
+    # ours.
+    await asyncio.sleep(20)
     while True:
         try:
             r = await asyncio.to_thread(reap_orphan_encoders)
@@ -5896,16 +5913,44 @@ def _retire_handler_job(job) -> None:
     _finish(job, "done", 0, 0, None)
 
 
+# How long a deferred job waits before it may be claimed again: a minute
+# the first time, doubling to ten minutes. A lock that was there three seconds
+# ago is almost always still there; a viewer takes an episode's length to let
+# go and an orphaned tool never does. Retrying every dispatch cycle proved
+# nothing and wrote twenty lines a minute into the transcript.
+DEFER_FIRST_S = 60.0
+DEFER_MAX_S = 600.0
+_DEFERS: dict = {}            # job_id -> how many times it has been put back
+
+
 def _defer(job: Job, why: str) -> None:
     """Put a job back on the queue because the file is busy right now.
 
     Deliberately NOT a failure: nothing is wrong with the file, someone is just
     watching it. It goes to the back of its pool so other work proceeds, and is
-    retried on a later pass.
+    retried later - LATER, not next: "the back of its pool" was the whole of
+    the delay, and with one job in the pool the back is also the front. The
+    Water Magician S01E06 was claimed, deferred against an orphaned ffmpeg,
+    and claimed again every three seconds for twenty-five minutes.
+
+    The wait doubles on every deferral, so a file that stays locked costs one
+    line a minute, then one every two, up to one every ten.
     """
+    now = time.time()
+    # How many times this job has been put back, kept in memory: a restart
+    # forgets it, and a restart is also what reaps the orphan that was most
+    # likely holding the file, so starting again from a minute is right.
+    times = _DEFERS.get(job.id, 0)
+    _DEFERS[job.id] = times + 1
+    wait = min(DEFER_MAX_S, DEFER_FIRST_S * (2 ** min(times, 4)))
     with cursor() as cur:
         cur.execute("UPDATE jobs SET state='queued', worker=NULL, started_at=NULL, "
-                    "error=?, priority=priority+5 WHERE job_id=?", (why, job.id))
+                    "error=?, priority=priority+5, not_before=? WHERE job_id=?",
+                    (why, now + wait, job.id))
+    try:
+        joblog.log(f"will try again in {int(wait)}s", "info", job.id)
+    except Exception:                                        # noqa: BLE001
+        pass
 
 
 def _purge_job_cache(job_id: str) -> int:
