@@ -446,6 +446,12 @@ def _read_events(path: str, mkv_track_id: int) -> dict | None:
             "detail": "; ".join(bits)}
 
 
+# What a shape row says when the track could not be read at all. See
+# shape_of(): the row exists so the track stops being offered, and says why.
+UNREADABLE = -1
+UNREADABLE_WHY = "could not be read - not a text track, or mkvextract refused"
+
+
 def shape_of(file_id: int, path: str, track: int, size: int,
              mkv_track_id: int) -> dict | None:
     """The cached shape of one track, reading it only when it is not known."""
@@ -463,6 +469,34 @@ def shape_of(file_id: int, path: str, track: int, size: int,
         return None
     got = _read_events(path, mkv_track_id)
     if got is None:
+        # A TRACK THAT CANNOT BE READ IS AN ANSWER, AND IT HAS TO BE STORED.
+        #
+        # It was not. _read_events returns None for a missing file, an
+        # mkvextract that refused, a picture track and any exception - and
+        # this returned None too, writing nothing. The row therefore stayed
+        # "not read yet" for ever: the scan listed it as a candidate, the
+        # feeder queued a subread for it, the read failed again in under a
+        # second, and the feeder queued it again a minute later. Measured on
+        # this library: 2,339 subread jobs over 149 files in one day, one
+        # Dororo episode 324 times in six hours, every one of them reporting
+        # success.
+        #
+        # PLAIN = -1 IS THE SENTINEL and it is deliberate that it is not 0:
+        # a stored zero means "no plain lines", which is what the duplicate
+        # sweep deletes a track for. Minus one is a shape nothing can read as
+        # a verdict, and scan() drops it from the candidates on sight.
+        try:
+            with cursor() as cur:
+                cur.execute(
+                    "INSERT INTO subtitle_shape(file_id,track,size,at,events,"
+                    "  styles,pos_pct,signish,detail,plain) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(file_id,track) DO UPDATE SET size=excluded.size,"
+                    "  at=excluded.at, detail=excluded.detail, plain=excluded.plain",
+                    (int(file_id), int(track), int(size), time.time(),
+                     0, 0, 0.0, 0, UNREADABLE_WHY, UNREADABLE))
+        except Exception:                                        # noqa: BLE001
+            pass
         return None
     try:
         with cursor() as cur:
@@ -569,6 +603,13 @@ def _do_one(r: dict, report=None) -> dict:
                       int(r.get("size") or 0), r["mkv_id"])
     except Exception as e:                                       # noqa: BLE001
         return {"ok": False, "why": f"{type(e).__name__}: {e}"}
+    # A READ THAT FAILED IS NOT A VERDICT OF DIALOGUE. shape_of returns None
+    # when the track cannot be read, and this used to fall through to
+    # cleared=False - which the caller words as "the events say dialogue".
+    # A failure reported as a finding is how the same track was read 324
+    # times: the answer never changed, and neither did the question.
+    if sh is None:
+        return {"ok": False, "why": UNREADABLE_WHY, "unreadable": True}
     # LET THE PAGE SEE IT AS IT GOES. The scan is a query and costs under a
     # second; re-judging as each read lands is what turns "40 not read yet"
     # into a number that visibly falls while you watch.
@@ -904,6 +945,11 @@ def scan(limit: int = 0) -> dict:
             r["rewritable"] = False        # nothing to press until it is read
             r["kind"] = ""
             r["kinds"] = [{"id": k, "word": KIND_WORDS[k]} for k in KINDS]
+            continue
+        # Read, and unreadable - not a candidate, and not asked again.
+        if (sh.get("plain") or 0) == UNREADABLE:
+            r["shape"] = sh.get("detail") or UNREADABLE_WHY
+            dropped.append(r)
             continue
         v = kind_of(sh, r.get("minutes") or 24.0)
         r["read"] = True

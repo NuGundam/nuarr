@@ -4821,6 +4821,15 @@ _FF_WARN = re.compile(
     r"invalid (dts|pts)|replacing by guess|non-monoton|increasing reorder buffer|"
     r"deprecated|guessed channel layout|timestamps are unset|queue input is backward|"
     r"past duration|application provided invalid|\bwarning\b", re.I)
+# NOT AN ERROR, WHATEVER WORDS IT USES. ffmpeg cannot describe an attachment
+# stream - a font, a cover image - because there is nothing to describe, and
+# it says so once per attachment while probing. On a fansubbed file with
+# twenty fonts that is twenty ERROR lines per probe, and they were every
+# single ERROR in the log: 200-odd of them, none of them a fault, sitting on
+# top of the one line that was. An error nobody can act on trains you to stop
+# reading errors.
+_FF_ATTACH = re.compile(r"could not find codec parameters for stream \d+ "
+                        r"\(attachment", re.I)
 _FF_ERR = re.compile(
     r"\berror\b|\bfailed\b|\bunable\b|could not|no such file|permission denied|"
     r"invalid data found|not supported|conversion failed|\bcannot\b|\bcorrupt|"
@@ -4831,6 +4840,8 @@ def _ffmpeg_level(line: str) -> str:
     # A metadata line is context whatever words the title happens to contain:
     # "title : Terrorist Bombing" was an ERROR under the substring rule.
     if _FF_META.match(line):
+        return "debug"
+    if _FF_ATTACH.search(line):
         return "debug"
     if _FF_WARN.search(line):
         return "warn"
@@ -5941,6 +5952,12 @@ def _defer(job: Job, why: str) -> None:
     # forgets it, and a restart is also what reaps the orphan that was most
     # likely holding the file, so starting again from a minute is right.
     times = _DEFERS.get(job.id, 0)
+    # A job that has finished will never be deferred again, and its count is
+    # dead weight; a process that runs for weeks would keep one entry per job
+    # it ever put back. Cheap to bound: the live queue is hundreds, not
+    # thousands, so anything past that is certainly finished.
+    if len(_DEFERS) > 1000:
+        _DEFERS.clear()
     _DEFERS[job.id] = times + 1
     wait = min(DEFER_MAX_S, DEFER_FIRST_S * (2 ** min(times, 4)))
     with cursor() as cur:

@@ -867,6 +867,7 @@ async def watch() -> None:
     """
     from . import audit
     await asyncio.sleep(90)
+    _swept = 0.0
     while True:
         try:
             rows = await asyncio.to_thread(_fresh_take, 25)
@@ -874,10 +875,38 @@ async def watch() -> None:
                 await auto(rows, "settling check", audit.mode() == "auto")
         except Exception:                                        # noqa: BLE001
             pass
+        if time.time() - _swept > 3600:
+            _swept = time.time()
+            try:
+                await asyncio.to_thread(sweep_log)
+            except Exception:                                    # noqa: BLE001
+                pass
         await asyncio.sleep(FRESH_CYCLE_S)
 
 
 # ------------------------------------------------------------- the ledger ---
+# HOW LONG THE EVIDENCE IS KEPT. Append-only was the right call for what this
+# table is - a record of what nuarr did on its own - but append-only with no
+# horizon is a table that only grows: 28,959 rows in six days when this was
+# measured, 3,154 of them on the last day, and nothing had ever removed one.
+# Thirty days is longer than any question anybody asks of it (the page shows
+# the last eighty) and long enough to explain a week-old decision.
+LOG_KEEP_S = 30 * 24 * 3600
+
+
+def sweep_log() -> int:
+    """Drop ledger rows past the horizon. -> how many went."""
+    if not _READY:
+        init()
+    try:
+        with cursor() as cur:
+            cur.execute("DELETE FROM remedy_log WHERE at < ?",
+                        (time.time() - LOG_KEEP_S,))
+            return int(cur.rowcount or 0)
+    except Exception:                                            # noqa: BLE001
+        return 0
+
+
 def recent(limit: int = 80) -> list[dict]:
     if not _READY:
         init()

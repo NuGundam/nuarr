@@ -429,6 +429,17 @@ def promote(file_id: int, prereq: str, blocking: str = "") -> None:
     key = (int(file_id), prereq)
     if now - _PROMOTED_AT.get(key, 0.0) < PROMOTE_EVERY_S:
         return
+    # AND FORGET THE OLD ONES. This dict answers one question - "did I push
+    # this file's prerequisite in the last two minutes" - and an entry older
+    # than that can never answer it again. It was never removed, so it grew
+    # one (file_id, prereq) tuple for every file ever held, for the life of
+    # the process: slow, invisible, and unbounded on a library this size.
+    # Swept when it gets big rather than on every call, because the sweep is
+    # a full pass and the check above is the hot path.
+    if len(_PROMOTED_AT) > 2000:
+        cut = now - PROMOTE_EVERY_S
+        for k in [k for k, t in _PROMOTED_AT.items() if t < cut]:
+            _PROMOTED_AT.pop(k, None)
     _PROMOTED_AT[key] = now
     lifted = 0
     try:
