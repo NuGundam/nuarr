@@ -359,6 +359,48 @@ async def _sync_file(cfg, file_id: int, parent_id: int | None, why: str,
                 "SELECT id, path, size, pool_disk FROM files "
                 "WHERE arr_name=? AND arr_file_id=?", (cfg.name, file_id)
             ).fetchone()
+            # THE SAME FILE, FOUND TWICE, TEN SECONDS APART.
+            #
+            # Two things notice a new file: the scan, which walks the disk and
+            # writes a row with no arr id because no arr has claimed it yet,
+            # and this webhook, which arrives when the arr finishes importing.
+            # Whichever is second inserted its own row, because the conflict
+            # clause below matches on (arr_name, arr_file_id) and a row with
+            # no arr id cannot collide with anything. The Texas Chainsaw
+            # Massacre Part 2 arrived at 11:37:23 by scan and 11:37:33 by
+            # webhook, and sat in the waiting list twice - same path, same
+            # 37.4 GB, both eligible, both about to be rewritten.
+            #
+            # So the path is asked first. A row already describing this exact
+            # file and not yet claimed by any arr IS this file; the webhook
+            # adopts it rather than starting a second history for it, which is
+            # the same rule the rename path follows one level down - identity
+            # is the file, not the id that happens to name it.
+            if row is None:
+                row = cur.execute(
+                    "SELECT id, path, size, pool_disk FROM files "
+                    " WHERE path=? COLLATE NOCASE AND arr_file_id IS NULL "
+                    "   AND COALESCE(state,'') NOT IN ('deleted','duplicate') "
+                    " ORDER BY id LIMIT 1", (path,)).fetchone()
+                if row is not None:
+                    cur.execute("UPDATE files SET arr_name=?, arr_file_id=? "
+                                " WHERE id=?", (cfg.name, file_id, row["id"]))
+                    joblog.log(f"webhook: adopted the scan's row for "
+                               f"{os.path.basename(path)} rather than adding a "
+                               f"second one", "debug")
+            # AND THE ROW THE ARR HAS JUST REPLACED. An upgrade imports to the
+            # same path under a NEW file id, so the old row is neither the one
+            # found above nor superseded by it - it stayed 'done', describing
+            # bytes that no longer exist, and showed up beside its successor.
+            # Twenty paths in this library carried two live rows for that
+            # reason.
+            cur.execute(
+                "UPDATE files SET state='deleted', state_reason=?, updated_at=? "
+                " WHERE path=? COLLATE NOCASE AND id <> COALESCE(?, -1) "
+                "   AND arr_file_id IS NOT NULL AND arr_file_id <> ? "
+                "   AND COALESCE(state,'') NOT IN ('deleted','duplicate')",
+                (f"replaced at this path by {cfg.name} file {file_id}", now,
+                 path, row["id"] if row else None, file_id))
             # WHY THE UPGRADE HAPPENED, when the reason is language. On an
             # anime library "jpn -> jpn+eng" is frequently the entire point of
             # a grab, and the quality/size columns cannot show it: both sides
