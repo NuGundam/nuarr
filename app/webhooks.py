@@ -304,7 +304,22 @@ async def _sync_file(cfg, file_id: int, parent_id: int | None, why: str,
             joblog.log(f"webhook ignored (outside configured libraries): "
                        f"{path}", "debug")
             return
+        # THE DISK IS THE SIZE, NOT THE ARR. The arr reports the size it
+        # remembers from its own last look, and its last look can predate a
+        # header edit nuarr made since - a few hundred bytes of tags that
+        # mkvpropedit wrote in place. Writing the arr's number over the row
+        # left files.size 822 bytes short of the file on Death on the Nile,
+        # and every check that keys its verdict on the size - the decode
+        # check, the listener - then compared a verdict taken at the real
+        # size against a row that said otherwise: owed, run, verdict written
+        # at the real size again, still owed. Eight decodes and five listens
+        # in fourteen minutes, all "already set up correctly". The file is
+        # right here; ask it.
         size = rec.get("size") or 0
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            pass
         # Coerce by TYPE at each level. Neither .get(k, {}) nor `or {}` is a
         # guard here: the first only substitutes when the key is missing, the
         # second only when the value is falsy. A string quality defeats both.

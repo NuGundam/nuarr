@@ -220,7 +220,33 @@ def _file(cur, file_id: int) -> dict | None:
     r = cur.execute("SELECT id, path, state, size, duration, audio_langs, "
                     "       sub_langs FROM files WHERE id=?",
                     (int(file_id),)).fetchone()
-    return dict(r) if r else None
+    if not r:
+        return None
+    f = dict(r)
+    # THE SIZE THE ORACLES COMPARE AGAINST IS THE FILE'S, NOT THE ROW'S.
+    # Every verdict - integrity, audio_lang, hardsub - is written at the size
+    # the file had when it was read, and a row whose size has drifted from
+    # the disk (an arr webhook carrying a stale number, say) makes every one
+    # of those verdicts look like it belongs to a different file. That is a
+    # loop: owed, run, verdict at the real size, still owed. One stat closes
+    # it.
+    try:
+        import os as _os
+        if f.get("path"):
+            real = _os.path.getsize(f["path"])
+            if real != int(f.get("size") or 0):
+                # And put the row right while here, or the next scan reads
+                # the same drift as content_changed and sends the file back
+                # through every check once more.
+                try:
+                    cur.execute("UPDATE files SET size=? WHERE id=?",
+                                (real, f["id"]))
+                except Exception:                            # noqa: BLE001
+                    pass
+            f["size"] = real
+    except OSError:
+        pass
+    return f
 
 
 def owed_before(file_id: int, kind: str) -> str:
