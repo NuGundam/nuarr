@@ -52,6 +52,12 @@ class OpResult:
     waited_s: float = 0.0
     locked_by: list[str] = field(default_factory=list)
     rolled_back: bool = False
+    # WHICH SPINDLE THIS COMMIT ASKED FOR, when nuarr chose it rather than
+    # leaving it to DrivePool. The caller needs it to tell a move it asked
+    # for from one the pool made behind it - the same words for both is how
+    # a deliberate placement ends up logged as a fault. Empty when DrivePool
+    # chose, which is also what every other OpResult carries.
+    placed_on: str = ""
 
     def __bool__(self) -> bool:
         return self.ok
@@ -795,7 +801,8 @@ def safe_replace(target: str, replacement: str, *, attempts: int = 5,
             return OpResult(True, "replace", f"{human_bytes(new_sig_size)} in place"
                             + (f" (placed on {place_label})" if phys
                                else " (staged across volumes)" if staged else ""),
-                            attempt, waited, holders)
+                            attempt, waited, holders,
+                            placed_on=(place_label if phys else ""))
 
         except OSError as e:
             # roll back so the library is never left without the original

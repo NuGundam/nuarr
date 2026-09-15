@@ -5622,7 +5622,28 @@ async def _transcode(w: Worker, probe_data: dict) -> None:
         with cursor() as cur:
             cur.execute("UPDATE files SET pool_disk=? WHERE id=?",
                         (dest, job.file_id))
-    if moved:
+    # A MOVE NUARR ASKED FOR IS NOT A SURPRISE.
+    #
+    # This warning was written when DrivePool chose the spindle: a file that
+    # came back on a different disk than it left on was the pool having done
+    # something behind us, and worth flagging in amber. Nuarr picks the disk
+    # itself now, so the warning fired on EVERY deliberate placement - "file
+    # moved disk: NU-DRIVE-1 -> NU-DRIVE-4", one line under the note saying
+    # it had just been placed on NU-DRIVE-4 on purpose, and one page away
+    # from a panel stating that DrivePool is told nothing and moves nothing.
+    # Two lines about one intention, the louder of them reading as a fault,
+    # which is a fair way to conclude that the pool is fighting the feature.
+    #
+    # The surprise is still worth a warning, and it is a SHARPER one now:
+    # landing somewhere other than the disk that was chosen is DrivePool
+    # overriding the placement, which is the thing actually worth knowing.
+    chose = getattr(res, "placed_on", "") or ""
+    if chose and dest and dest != chose:
+        joblog.log(f"placed on {chose}, but it is on {dest} now - something "
+                   f"moved it after the commit", "warn", job.id)
+    elif moved and chose:
+        joblog.log(f"onto {dest} as chosen, from {w.disk}", "ok", job.id)
+    elif moved:
         joblog.log(f"file moved disk: {w.disk} -> {dest}", "warn", job.id)
     elif dest:
         joblog.log(f"stayed on {dest}", "debug", job.id)
