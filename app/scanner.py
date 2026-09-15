@@ -2366,6 +2366,59 @@ def mark_eligible() -> int:
         return promoted
 
 
+# ---------------------------------------------- what WE did to a file ------
+# NUARR'S OWN REWRITE MUST NOT READ AS SOMEBODY ELSE'S CHANGE.
+#
+# The row carries the size and mtime a file had when it was last looked at,
+# and two places test that against the file as it stands: the arr's rename
+# webhook (webhooks.py - `row.size != size` means content_changed) and the
+# scan (above, same test). Both are right to: a file whose bytes changed
+# under us has to go back through the checks, because every verdict taken
+# from it is now about a file that is gone.
+#
+# The catch is that a commit changes those bytes ON PURPOSE and said nothing.
+# The row still held the pre-rewrite size, so the very next thing to look -
+# and the arr's rename webhook is triggered BY the commit, arriving a minute
+# or two later - found a difference nuarr itself had made, called it
+# content_changed, set the file back to 'new' and started the pipeline again.
+# Measured on the live system: 400 of those, across 360 files, a median 3.3
+# minutes after nuarr's own rewrite of the same file. The End of Oak Street
+# was decoded and listened to twice inside four minutes, both times to be
+# told "already set up correctly".
+#
+# So every successful replace writes down what it produced. Hooked into
+# fileops rather than added to the six callers, because five of the six had
+# already forgotten - the flags-only path in jobs.py was the one that
+# remembered, which is why a header edit never caused this and a rewrite
+# always did.
+def note_rewritten(path: str) -> None:
+    """Record the size and mtime of a file nuarr has just replaced."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return
+    try:
+        with cursor() as cur:
+            # NOT the tombstones. A path can carry several rows - the live
+            # one, plus a 'deleted' row for each release that held the path
+            # before it (47 of them on one Cyborg 009 episode). Their sizes
+            # describe files that are gone and nothing reads them, but a
+            # tombstone silently updated to the size of its successor is a
+            # trap for whoever reads that table next.
+            cur.execute("UPDATE files SET size=?, mtime=?, updated_at=? "
+                        " WHERE path=? COLLATE NOCASE "
+                        "   AND COALESCE(state,'') <> 'deleted'",
+                        (int(st.st_size), float(st.st_mtime), time.time(),
+                         path))
+    except Exception:                                        # noqa: BLE001
+        pass
+
+
+def register_rewrites() -> None:
+    """Hand fileops the note-taker, so every commit path gets it."""
+    fileops.REPLACED = note_rewritten
+
+
 if __name__ == "__main__":
     import asyncio
     from .db import init_db

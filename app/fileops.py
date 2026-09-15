@@ -641,6 +641,13 @@ def fix_container_extension(path: str, *, lock_timeout: float = 120) -> OpResult
 # DrivePool; PLACED(target, label) is told when the swap has landed there.
 PLACER = None
 PLACED = None
+# AND WHO WRITES DOWN THE FILE WE JUST WROTE. REPLACED(path) is called after
+# every successful replace, whatever asked for it - a transcode, an OCR embed,
+# a sidecar, a deferred commit retried hours later. It exists because the
+# alternative was each of those six callers remembering to do it, and five of
+# them did not. scanner.register_rewrites() sets it; unset, nothing happens
+# and the next scan corrects the row, which is the old behaviour.
+REPLACED = None
 
 
 def safe_replace(target: str, replacement: str, *, attempts: int = 5,
@@ -796,6 +803,11 @@ def safe_replace(target: str, replacement: str, *, attempts: int = 5,
             if phys and place_label and PLACED:
                 try:
                     PLACED(target, place_label)
+                except Exception:                            # noqa: BLE001
+                    pass
+            if REPLACED:
+                try:
+                    REPLACED(target)
                 except Exception:                            # noqa: BLE001
                     pass
             return OpResult(True, "replace", f"{human_bytes(new_sig_size)} in place"

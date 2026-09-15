@@ -729,6 +729,9 @@ async def _startup() -> None:
         # fileops so every commit path gets it.
         from . import placement
         placement.register()
+        # And every commit records the file it produced - see
+        # scanner.note_rewritten for the loop this closes.
+        scanner.register_rewrites()
         # What every device will actually play, topped up from Tautulli's
         # history on a timer. Incremental, so a run with nothing new is one
         # API call.
