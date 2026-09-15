@@ -3632,15 +3632,33 @@ def _work_summary(plan_json, pool: str) -> tuple[str, str]:
         p = json.loads(plan_json)
     except (ValueError, TypeError):
         return "", ""
-    # A SUBTITLE INSTRUCTION IS ALREADY A SENTENCE. It is decided from the
-    # facts table before the job exists and written down in plain words there,
-    # so there is nothing to derive - the row gets the summary and the hover
-    # gets the steps, one per line.
-    if p.get("subs"):
+    # AN INSTRUCTION THAT IS ALREADY A SENTENCE IS NOT DERIVED AGAIN.
+    #
+    # Every pool that EXAMINES a file rather than planning a re-encode writes
+    # its plan in the same shape - a summary in plain words, and one action
+    # per step with its own why: the subtitle settler, the audio tag fixer,
+    # the decode check, the listener, the subtitle read. Only the subtitle one
+    # was recognised here. The other four fell through to the transcode logic
+    # below, which reads `encode`, `audio_ops` and `needed` - and a reader has
+    # none of the three, so every one of those rows reached the last line and
+    # came out labelled "verify".
+    #
+    # Sixty listen jobs in the queue, every row saying the same wrong word
+    # about a step that is actually listening to the audio to find out what
+    # language it is in - and the right sentence, "listen to track 1 and check
+    # the tag (eng)", already sitting in the plan it was rendering.
+    #
+    # Keyed on the SHAPE - a summary, and none of the three keys only a
+    # transcode plan carries - rather than on a list of pool flags, so the
+    # next reader pool is right without anyone remembering to come back here.
+    _rewrite_plan = ("needed" in p) or ("encode" in p) or ("audio_ops" in p)
+    if p.get("summary") and not _rewrite_plan:
         full = "\n".join(f"• {a.get('what')}"
                          + (f" — {a['why']}" if a.get("why") else "")
                          for a in (p.get("actions") or []))
-        return (p.get("summary") or "settle the subtitles"), full
+        return p["summary"], full
+    if p.get("subs"):                       # a plan with steps but no summary
+        return "settle the subtitles", ""
     bits: list[str] = []
     if p.get("encode"):
         tgt = p.get("target") or "h264"
@@ -13375,6 +13393,13 @@ button.on{border-color:var(--ok);color:var(--ok)}
 .qchip{font-size:11px;padding:2px 8px;border-radius:10px;border:1px solid var(--line);
        background:#161b22;cursor:pointer;white-space:nowrap}
 .qchip.on{border-color:var(--acc);color:var(--acc)}
+/* A WORKER WITH NOTHING QUEUED IS STILL A WORKER. Dimmed rather than absent -
+   see the legend in loadQueue(). */
+.qchip.qzero{opacity:.5}
+/* The running count, kept clearly apart from the waiting count beside it. */
+.qchip i.qrun{font-style:normal;margin-left:6px;font-size:10px;opacity:.85}
+.qchip b.qpaused{font-weight:600;font-size:9.5px;letter-spacing:.05em;
+       text-transform:uppercase;color:var(--warn);margin-left:5px}
 .runbox::-webkit-scrollbar{width:12px}
 .runbox::-webkit-scrollbar-thumb{background:#2b3340;border-radius:6px}
 .runbox::-webkit-scrollbar-track{background:#0b0e12}
@@ -23400,10 +23425,41 @@ async function loadQueue(){
     // on the page: purple is subocr in the queue legend, in the row's pill, in
     // the worker card and in Activity. A legend in a different colour from the
     // thing it labels is not a legend.
-    dwrap.innerHTML = (q.by_pool||[]).map(p=>{
-      const c = poolColor(p.pool);
-      return `<span class="qchip" style="cursor:default;color:${c};border-color:${c}"
-             >${esc(p.pool)} <b>${fmt(p.n)}</b></span>`;
+    // EVERY WORKER GETS A CHIP, not only the ones with something queued.
+    // The legend was built from by_pool, which is a GROUP BY over the queued
+    // rows - so a worker with an empty queue was not in the answer and had no
+    // chip at all, and an absent chip is indistinguishable from a worker that
+    // does not exist. Erik: "the audio tag workers don't show up in the main
+    // queue panel". Audio work is a header edit that takes a second, so its
+    // queue is empty almost all of the time and the chip was almost never
+    // there; the same was true of any idle pool.
+    //
+    // IN A FIXED ORDER, and the order is the one the work actually happens in
+    // - decode, listen, audio, subread, then the rewrite and the subtitles.
+    // These were sorted by count, which reshuffled the legend every few
+    // seconds as the queue drained, moving the chip you were reading.
+    const QPOOL_ORDER = ['decode','listen','audio','subread','encode',
+                         'passthrough','subocr','subs'];
+    const qn={}; for(const p of (q.by_pool||[])) qn[p.pool]=p.n;
+    const qrun={}; for(const w of (q.running||[])) qrun[w.pool]=(qrun[w.pool]||0)+1;
+    const caps = q.capacity||{};
+    const pools = QPOOL_ORDER.filter(p=>(p in caps) || qn[p] || qrun[p])
+      .concat(Object.keys(qn).filter(p=>QPOOL_ORDER.indexOf(p)<0));
+    dwrap.innerHTML = pools.map(p=>{
+      const n=qn[p]||0, run=qrun[p]||0, cap=caps[p];
+      const c = poolColor(p);
+      // Nothing queued AND nothing running is the only thing that dims. A
+      // worker that is busy but has drained its queue is not idle.
+      const quiet = !n && !run;
+      const tip = cap===0
+        ? `${p} is switched off - it takes nothing until it is switched back on`
+        : `${p}: ${fmt(n)} waiting, ${run} of ${cap} running`;
+      return `<span class="qchip${quiet?' qzero':''}" title="${esc(tip)}"
+             style="cursor:default;color:${quiet?'var(--dim)':c};
+                    border-color:${quiet?'var(--line)':c}"
+             >${esc(p)} <b>${fmt(n)}</b>${
+               run?`<i class="qrun">\u25b6${run}</i>`:''}${
+               cap===0?'<b class="qpaused">off</b>':''}</span>`;
     }).join('');
     // keep the disk filter list in sync with what is actually queued
     const sel=document.getElementById('qfDisk');
