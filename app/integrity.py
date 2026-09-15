@@ -290,10 +290,18 @@ def _candidates(limit: int) -> list[dict]:
     with cursor() as cur:
         return [dict(r) for r in cur.execute(
             "SELECT f.id file_id, f.path, f.size, f.duration, f.pool_disk, "
-            "       i.at last_at, i.verdict last_verdict "
+            "       i.at last_at, i.verdict last_verdict, "
+            # WHICH PASS THIS IS. `i` is joined on size and therefore goes
+            # null the moment the file is rewritten; `p` is the same row
+            # without that condition, so it answers "has anything ever
+            # decoded this file", which is the difference between a first
+            # look and a re-check of what nuarr has just written. One row
+            # per file (file_id is the primary key), so no fan-out.
+            "       p.at prev_at, p.size prev_size, p.verdict prev_verdict "
             "  FROM files f "
             "  LEFT JOIN integrity i ON i.file_id = f.id "
             "                       AND i.size = f.size "
+            "  LEFT JOIN integrity p ON p.file_id = f.id "
             " WHERE f.state NOT IN ('deleted','duplicate') "
             "   AND COALESCE(f.path,'') != '' "
             "   AND COALESCE(f.size,0) > 0 "
@@ -310,8 +318,10 @@ def _candidates_per_disk(per_disk: int) -> list[dict]:
     cutoff = time.time() - SETTLE_S
     with cursor() as cur:
         return [dict(r) for r in cur.execute(
-            "SELECT file_id, path, size, duration, pool_disk FROM ("
+            "SELECT file_id, path, size, duration, pool_disk, "
+            "       prev_at, prev_size FROM ("
             "  SELECT f.id file_id, f.path, f.size, f.duration, f.pool_disk, "
+            "         p.at prev_at, p.size prev_size, "
             # ELIGIBLE FIRST. precedence.py holds a transcode until this
             # verdict exists, so a file about to be processed must not queue
             # behind the never-checked back catalogue on its disk.
@@ -319,6 +329,7 @@ def _candidates_per_disk(per_disk: int) -> list[dict]:
             "                            ORDER BY (f.state='eligible') DESC, f.id) rn "
             "    FROM files f "
             "    LEFT JOIN integrity i ON i.file_id = f.id AND i.size = f.size "
+            "    LEFT JOIN integrity p ON p.file_id = f.id "
             "   WHERE f.state NOT IN ('deleted','duplicate') "
             "     AND COALESCE(f.path,'') != '' "
             "     AND COALESCE(f.size,0) > 0 "
@@ -327,6 +338,80 @@ def _candidates_per_disk(per_disk: int) -> list[dict]:
             "     AND (i.file_id IS NULL OR i.verdict = '')) "
             " WHERE rn <= ? ORDER BY pool_disk, rn",
             (cutoff, int(per_disk)))]
+
+
+# WHICH PASS, AND WHAT IT IS FOR.
+#
+# Erik: "show the passes like for example decode pass 1 and pass 2 ... first
+# pass to check the file can be read then second pass to check if the file is
+# not corrupt after encode/passthrough".
+#
+# It is not a fixed two-step - most files are checked once and never again -
+# but when a file IS checked twice the two checks are asking different
+# questions, and the panel said "decode" both times with no way to tell which.
+# The verdict row is keyed to the bytes, so a rewrite makes the file a new
+# file and the second check is the one that says nuarr did not break it.
+#
+# Measured over seven days: 15,269 first looks, and 3,340 second passes - 2,676
+# of them after a subtitle rewrite, 627 after a transcode, 37 after an OCR
+# embed. So the second pass is named after whatever actually rewrote the file,
+# not after the transcode it usually is not.
+_AFTER_WORD = {"transcode": "the rewrite", "subs": "the subtitle rewrite",
+               "sub_ocr": "the OCR embed", "audio": "the tag write"}
+
+
+def _after_what(rows: list) -> None:
+    """Annotate each row with its pass number and what rewrote it. One query."""
+    second = [r for r in rows if (r.get("prev_at") or 0)
+              and int(r.get("prev_size") or 0) != int(r.get("size") or 0)]
+    # Identity, not equality: two rows for two files can compare equal on the
+    # columns that matter and `r in second` would then mislabel both.
+    ids = {id(r) for r in second}
+    for r in rows:
+        r["pass"] = 2 if id(r) in ids else 1
+        r["after"] = ""
+    if not second:
+        return
+    try:
+        with cursor() as cur:
+            for r in second:
+                w = cur.execute(
+                    "SELECT kind, pool FROM jobs "
+                    " WHERE file_id=? AND state='done' AND finished_at > ? "
+                    "   AND kind IN ('transcode','subs','sub_ocr','audio') "
+                    " ORDER BY finished_at DESC LIMIT 1",
+                    (int(r["file_id"]), float(r["prev_at"] or 0))).fetchone()
+                if w:
+                    # A transcode says which of its two shapes it was; the
+                    # rest have one shape each and their kind is the word.
+                    r["after"] = (("the " + (w["pool"] or "rewrite"))
+                                  if w["kind"] == "transcode"
+                                  else _AFTER_WORD.get(w["kind"], "the rewrite"))
+                else:
+                    # Nothing of nuarr's is recorded against it, so the bytes
+                    # changed some other way - the arr replaced the file. Say
+                    # that rather than blaming a rewrite that did not happen.
+                    r["after"] = ""
+                    r["replaced"] = True
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def pass_words(r: dict) -> tuple:
+    """(short label, the sentence) for one candidate row."""
+    if int(r.get("pass") or 1) < 2:
+        return ("pass 1",
+                "nothing has decoded these bytes yet - this is the check that "
+                "says the file can be played at all")
+    if r.get("replaced"):
+        return ("pass 1",
+                "the file at this name was replaced since the last check, so "
+                "these are new bytes and this is a first look at them")
+    after = r.get("after") or "the rewrite"
+    return ("pass 2",
+            f"{after} has rewritten this file since the last check, so these "
+            f"are different bytes - this is the one that says what nuarr "
+            f"wrote is not corrupt")
 
 
 def _write(file_id: int, path: str, size: int, mtime: float, out: dict) -> None:
@@ -645,7 +730,14 @@ def _to_hand_over(depth: int) -> tuple:
                  max(0, room - len(front)))
     for r in front:
         r["_blocking"] = True
-    return have, front + rest
+    out = front + rest
+    # Which pass each of these is, worked out once for the handful being
+    # queued rather than for the whole candidate list.
+    try:
+        _after_what(out)
+    except Exception:                                            # noqa: BLE001
+        pass
+    return have, out
 
 
 def _job_plan(r: dict) -> str:
@@ -653,11 +745,24 @@ def _job_plan(r: dict) -> str:
     import json
     dur = float(r.get("duration") or 0)
     both = dur > (HEAD_S + TAIL_S + 5)
+    lbl, why = pass_words(r)
+    what = (f"decode the first {HEAD_S}s and the last {TAIL_S}s"
+            if both else f"decode the first {HEAD_S}s")
     return json.dumps({
         "decode": True, "rewrite": False,
-        "summary": (f"decode the first {HEAD_S}s and the last {TAIL_S}s"
-                    if both else f"decode the first {HEAD_S}s"),
+        # Carried so the worker card, the queue row, the activity pill and the
+        # history line can all say the same thing without working it out again.
+        # FROM THE LABEL, not from the raw count: a file the arr replaced has a
+        # previous verdict and is still a first look, and the number has to
+        # agree with the sentence beside it.
+        "pass": 2 if lbl == "pass 2" else 1,
+        "pass_label": lbl,
+        "pass_why": why,
+        "after": r.get("after") or "",
+        "summary": f"{lbl} · {what}",
         "actions": [
+            {"kind": "decode", "what": f"{lbl}: {what}", "why": why,
+             "detail": ""},
             {"kind": "decode", "what": f"decode the first {HEAD_S}s to null",
              "why": "header and stream damage, bad indices, wrong codec "
                     "parameters all show here", "detail": ""}]

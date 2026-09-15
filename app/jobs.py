@@ -4523,12 +4523,30 @@ async def _decode_job(w: Worker) -> None:
         except (TypeError, ValueError):
             pass
 
-    w.sub_steps = [f"decode the first {integrity.HEAD_S}s to null"] + (
-        [f"decode the last {integrity.TAIL_S}s to null"]
-        if dur > (integrity.HEAD_S + integrity.TAIL_S + 5) else [])
-    w.sub_why = ["header and stream damage show here",
-                 "truncation only shows at the end"][:len(w.sub_steps)]
-    w.sub_summary = "does it actually decode?"
+    # THE CARD SAYS WHICH PASS, because the feeder worked it out and wrote it
+    # into the plan. The hardcoded pair below is the fallback for a job queued
+    # before this existed, or by hand.
+    _plan = {}
+    try:
+        with cursor() as cur:
+            _pr = cur.execute("SELECT plan_json FROM jobs WHERE job_id=?",
+                              (job.id,)).fetchone()
+        _plan = json.loads((_pr["plan_json"] if _pr else "") or "{}") or {}
+    except Exception:                                    # noqa: BLE001
+        _plan = {}
+    _acts = _plan.get("actions") or []
+    if _acts:
+        w.sub_steps = [a.get("what") or "" for a in _acts]
+        w.sub_why = [a.get("why") or "" for a in _acts]
+    else:
+        w.sub_steps = [f"decode the first {integrity.HEAD_S}s to null"] + (
+            [f"decode the last {integrity.TAIL_S}s to null"]
+            if dur > (integrity.HEAD_S + integrity.TAIL_S + 5) else [])
+        w.sub_why = ["header and stream damage show here",
+                     "truncation only shows at the end"][:len(w.sub_steps)]
+    _plbl = str(_plan.get("pass_label") or "")
+    w.sub_summary = (f"{_plbl} · does it actually decode?" if _plbl
+                     else "does it actually decode?")
     res = await integrity.job_one(
         {"file_id": job.file_id, "path": job.path, "duration": dur},
         on_pid=_on_pid, on_stage=_on_stage)
@@ -4541,6 +4559,13 @@ async def _decode_job(w: Worker) -> None:
         v = res.get("verdict") or ""
         word = ("decodes cleanly at both ends" if v == integrity.OK
                 else f"CORRUPT - {res.get('detail') or ''}")
+        # AND THE RECORD SAYS WHICH PASS IT WAS. Two checks of one file are
+        # two different questions - can this be read at all, and is what nuarr
+        # wrote still readable - and the history said "decode" both times.
+        if _plbl:
+            word = f"{_plbl} · {word}"
+            if _plan.get("after") and _plan.get("pass") == 2:
+                word += f" after {_plan['after']}"
         joblog.log(word, "ok" if v == integrity.OK else "error", job.id)
         _finish(job, "done", before, before, note=word[:300])
     else:
@@ -7038,17 +7063,34 @@ def snapshot(recent_limit: int = 60) -> dict:
         # unpack the plan so the UI can explain WHY, not just what
         try:
             p = json.loads(r.pop("plan_json") or "{}")
-            r["summary"] = rules.plan_from_dict(p).summary() if p else ""
             r["actions"] = p.get("actions") or []
         except Exception:
-            r["summary"], r["actions"] = "", []
-        # Plan-less jobs (subocr) carry their outcome in result_json instead.
+            p, r["actions"] = {}, []
+        # WHAT HAPPENED FIRST, WHAT WAS INTENDED SECOND. A finished job knows
+        # its own outcome - "decodes cleanly at both ends", "heard 2 of 2" -
+        # and that is the sentence worth showing; the plan is the fallback for
+        # a job whose handler records no summary.
+        try:
+            r["summary"] = (json.loads(r.get("result_json") or "{}")
+                            .get("summary") or "")
+        except Exception:
+            r["summary"] = ""
         if not r["summary"]:
+            # ONLY A TRANSCODE PLAN GOES THROUGH THE TRANSCODE READER. Keyed
+            # on the shape - a summary of its own, and none of the three keys
+            # only a rewrite plan carries - so the next reader pool is right
+            # without anyone remembering to come back here. See
+            # web._work_summary, which learned this first.
+            _rewrite = ("needed" in p) or ("encode" in p) or ("audio_ops" in p)
             try:
-                r["summary"] = (json.loads(r.get("result_json") or "{}")
-                                .get("summary") or "")
+                r["summary"] = (p.get("summary") or "") if (p and not _rewrite) \
+                    else (rules.plan_from_dict(p).summary() if p else "")
             except Exception:
-                pass
+                r["summary"] = p.get("summary") or ""
+        # WHICH PASS THIS WAS, for the pill. See integrity._job_plan.
+        if p.get("pass"):
+            r["pass"] = int(p.get("pass") or 1)
+            r["pass_label"] = p.get("pass_label") or ""
         r.pop("result_json", None)
     workers = list(RUNNING.values())
     for w in workers:                  # refresh per-process read counters

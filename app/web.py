@@ -24706,9 +24706,20 @@ function renderDone(j){
   const donePool = r => r.kind==='transcode' ? (r.pool||'transcode')
                       : r.kind==='sub_ocr'   ? 'subocr'
                       : (r.kind||'job');
+  // AND WHICH PASS IT WAS, where the work has more than one.
+  //
+  // Erik: "can it show here and other parts of the system the passes like for
+  // example decode pass 1 and pass 2". A file is decode-checked once before
+  // anything is planned - can this be read at all - and again after it has
+  // been rewritten, which is the check that says nuarr did not break it. The
+  // panel said "decode ×2" and left you to guess which was which.
+  //
+  // The feeder works it out and writes it into the plan (integrity._job_plan),
+  // so this only has to print it. A file checked once carries nothing here and
+  // reads exactly as it did.
   const doneLbl = r => {
-    const proc = donePool(r);
-    return r.state==='done' ? proc : proc+' · '+r.state;
+    const proc = donePool(r) + (r.pass_label ? ' \u00b7 '+r.pass_label : '');
+    return r.state==='done' ? proc : proc+' \u00b7 '+r.state;
   };
   // ONE FEED, TWO SOURCES. Job rows and file events merge into a single
   // timeline, but _finish also writes an event for every job it closes - so a
@@ -24781,7 +24792,13 @@ function renderDone(j){
     }
     return e.event;
   };
-  const lblOf=it=> it.job ? doneLbl(it.job) : evName(it.ev);
+  const PASS_RE=/^(pass \d)\s*\u00b7/i;
+  const noPass=d=>String(d||'').replace(PASS_RE,'').trim();
+  const evLbl=e=>{
+    const nm=evName(e), m=PASS_RE.exec((e.detail||'').trim());
+    return m ? nm+' \u00b7 '+m[1].toLowerCase() : nm;
+  };
+  const lblOf=it=> it.job ? doneLbl(it.job) : evLbl(it.ev);
   // ONE UPGRADE IS ONE ENTRY.
   //
   // An upgrade writes up to three history rows across TWO file rows, because
@@ -24867,17 +24884,24 @@ function renderDone(j){
   // Pills coloured the way they are everywhere else: pool colour for a clean
   // result, verdict class for everything else - one colour means one thing
   // across the whole page.
+  const POOLS=['passthrough','encode','subocr','transcode','job',
+               'subs','audio','decode','listen','subread','handler'];
   const pillFor=(lbl,n)=>{
     const cnt=n>1?` ×${n}`:'';
     if(lbl.includes(' · ')){
-      const st=lbl.split(' · ').pop();
-      return `<span class="pill ${stateClass(st)}">${esc(lbl+cnt)}</span>`;
+      const bits=lbl.split(' · '), head=bits[0], tail=bits[bits.length-1];
+      // A PASS IS NOT A VERDICT. "decode · pass 2" is a clean decode that
+      // happens to be the second one, so it keeps the decode colour; only
+      // "decode · failed" and its kin take the verdict class.
+      if(/^pass \d/.test(tail) && POOLS.includes(head))
+        return `<span class="pill" style="color:${poolColor(head)};
+          border-color:${poolColor(head)}">${esc(lbl+cnt)}</span>`;
+      return `<span class="pill ${stateClass(tail)}">${esc(lbl+cnt)}</span>`;
     }
     // EVERY POOL, not the three that existed when this was written. decode
     // and listen rows sat in plain grey among coloured neighbours, which
     // read as "state unknown" rather than "a check ran".
-    if(['passthrough','encode','subocr','transcode','job',
-        'subs','audio','decode','listen','subread','handler'].includes(lbl))
+    if(POOLS.includes(lbl))
       return `<span class="pill" style="color:${poolColor(lbl)};
         border-color:${poolColor(lbl)}">${esc(lbl+cnt)}</span>`;
     return `<span class="pill ${stateClass(lbl)}">${esc(lbl+cnt)}</span>`;
@@ -24916,13 +24940,16 @@ function renderDone(j){
     return `<span class="szc"><span></span><span></span><span class="dim">${cur?gb(cur):'—'}</span><span></span></span>`;
   }
   const evRow=e=>{
-    const ts=e.at||0, nm=evName(e);
+    // The CLASS comes from the kind and the TEXT from the label: a pass is a
+    // suffix on the name, not a different kind, and must not lose its colour.
+    const ts=e.at||0, nm=evName(e), lb=evLbl(e);
     return `<tr class="actsub"><td colspan="5"><div class="subgrid">
       <span class="dim when nb">${esc(fullTs(ts))}</span>
-      <span class="nb"><span class="pill ${stateClass(nm)}">${esc(nm)}</span></span>
+      <span class="nb"><span class="pill ${stateClass(nm)}">${esc(lb)}</span></span>
       <div class="wrap">${e.detail
-        ?`<div class="mono dim detail" style="font-size:11px">${fmtDetail(e.detail)}</div>`
-        :`<span class="dim">${esc(nm)}</span>`}</div>
+        ?`<div class="mono dim detail" style="font-size:11px">${
+             fmtDetail(lb===nm ? e.detail : noPass(e.detail))}</div>`
+        :`<span class="dim">${esc(lb)}</span>`}</div>
       <span class="num dim nb">${(()=>{ const u=nm==='upgraded'?upgradeSizes(e.detail):null;
         return u?szCells(u.before,u.after):szCells(0,0,e.size); })()}</span>
       <span></span></div></td></tr>`;
@@ -24947,7 +24974,8 @@ function renderDone(j){
                overflow:hidden;text-overflow:ellipsis">${esc(donePool(r))}</div>`
       }</span>
       <div class="wrap">${r.summary
-          ?`<div class="dim" style="font-size:11px">${esc(r.summary)}</div>`
+          ?`<div class="dim" style="font-size:11px">${
+               esc(r.pass_label ? noPass(r.summary) : r.summary)}</div>`
           :`<span class="dim">${esc(r.state)}</span>`}
         ${r.error?`<div class="err" style="font-size:11px">${esc(r.error)}</div>`:''}</div>
       <span class="num dim nb">${txt}</span>
