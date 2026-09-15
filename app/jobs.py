@@ -4992,12 +4992,9 @@ async def _flags_in_place(w: Worker, probe_data: dict) -> bool:
                          job.file_id))
     except Exception:                                            # noqa: BLE001
         pass
-    _finish(job, "done", before, after)
-    try:
-        log_event(job.file_id, "transcoded",
-                  "set the track flags in place - nothing was copied")
-    except Exception:                                            # noqa: BLE001
-        pass
+    _finish(job, "done", before, after,
+            note="set the track flags in place - nothing was copied",
+            event="transcoded")
     w.set_stage("arr refresh / rename")
     await _post_commit(job)
     w.set_stage("done")
@@ -5731,17 +5728,18 @@ async def _transcode(w: Worker, probe_data: dict) -> None:
         joblog.log(f"stayed on {dest}", "debug", job.id)
 
     joblog.log(f"committed: {res.detail}", "ok", job.id)
-    _finish(job, "done", size_before, size_after)
-    # Record it against the file so Recent activity can show the move.
+    # Recorded against the file so Recent activity can show the move - as
+    # _finish's own row rather than a second one after it.
     try:
         pct = ((size_after - size_before) / size_before * 100) if size_before else 0
         where = (f"moved {w.disk} -> {dest}" if moved
                  else (f"on {dest}" if dest else ""))
-        log_event(job.file_id, "transcoded",
-                  f"{job.plan.summary() if job.plan else 'processed'} · "
-                  f"{pct:+.1f}% size" + (f" · {where}" if where else ""))
+        _note = (f"{job.plan.summary() if job.plan else 'processed'} · "
+                 f"{pct:+.1f}% size" + (f" · {where}" if where else ""))
     except Exception:
-        pass
+        _note = ""
+    _finish(job, "done", size_before, size_after,
+            note=_note, event="transcoded" if _note else "")
     # An arr refresh waits on RefreshSeries, which on a large series is the
     # slowest thing in the whole job. It is still work, so keep it visible.
     # THE SIDECARS THIS REWRITE CARRIED IN, now that it is committed. Same
@@ -6180,7 +6178,17 @@ def _finish(job: Job, state: str, before: int, after: int,
     # already do with 'transcoded' - a wall of generic 'done' rows cannot be
     # filtered by process, and the events dropdown stocks itself from what
     # exists here.
-    log_event(job.file_id, event or state,
+    # AND THE EVENT IS NAMED AFTER WHO DID IT, not after the fact that it
+    # ended. `state` is 'done' for every kind that succeeds, so a decode, a
+    # listen and a subtitle read all wrote a history row called 'done' - a
+    # green pill saying nothing above a line saying "decodes cleanly at both
+    # ends". The kind is the honest name and it is already here; the state is
+    # on the job row, where anyone asking "did it succeed" will look.
+    #
+    # Only for 'done'. failed, skipped and cancelled ARE the event - what
+    # happened to that job is the whole of what a reader wants from the pill.
+    _ev = event or (job.kind if state == "done" and job.kind else state)
+    log_event(job.file_id, _ev,
               note or (job.plan.summary() if job.plan else ""),
               label=job.title)
 

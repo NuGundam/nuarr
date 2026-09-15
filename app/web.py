@@ -13987,6 +13987,18 @@ button[disabled]{opacity:.5;cursor:default}
 .e-content_changed{color:#d29922;border-color:#4a3a12}
 .e-recycled{color:#ff9e64;border-color:#5a3a1f}
 .e-done{color:#3fb950;border-color:#1f4426}
+/* A CHECK'S OWN NAME, IN ITS OWN COLOUR - the same one the worker wears in
+   the queue, on its card and in Processing System, so the pill and the bubble
+   for one system are never two different colours. See evName(). */
+.e-decode{color:#e8a33d;border-color:#4a3512}
+.e-listen{color:#e5d352;border-color:#4a4512}
+.e-audio{color:#39d3c3;border-color:#12443f}
+.e-subread{color:#b48bf2;border-color:#3c2a5a}
+.e-sub_ocr{color:#b48bf2;border-color:#3c2a5a}
+.e-subs{color:#b48bf2;border-color:#3c2a5a}
+.e-transcode{color:#58a6ff;border-color:#1f3a5f}
+.e-transcoded{color:#58a6ff;border-color:#1f3a5f}
+.e-passthrough{color:#58a6ff;border-color:#1f3a5f}
 .e-failed{color:#f85149;border-color:#5a2225}
 /* MISSING UNTIL NOW. `error` is the state the Errors tile filters on, so it is
    the one state guaranteed to appear in that list - and it was the one with no
@@ -24707,7 +24719,12 @@ function renderDone(j){
   // events are candidates - a rename lands seconds after its job too, and
   // must never be swallowed with it.
   const OUTCOME=new Set(['transcoded','subtitled','done','skipped','failed',
-                         'deferred','cancelled','error']);
+                         'deferred','cancelled','error',
+  // A FINISHED JOB IS NOW NAMED AFTER ITS KIND, and its history row is still
+  // the same fact as the job row beside it. These have to be here or every
+  // completion reads twice - once as the job, once as its own echo.
+                         'transcode','passthrough','encode','decode','listen',
+                         'subread','sub_ocr','subs','audio']);
   const isEcho=e=>{
     if(!OUTCOME.has(e.event)) return false;
     return all.some(r=>Math.abs((e.at||0)-(r.finished_at||0))<20 &&
@@ -24734,9 +24751,34 @@ function renderDone(j){
   // 'imported' whose detail carries the old -> new line. Rewriting stored
   // history would falsify the record; renaming at display time keeps the
   // bytes honest and the story readable.
+  // AND A STORED 'done' IS NAMED BY WHAT IT SAYS. Every kind that succeeded
+  // wrote its history row as 'done' until this was fixed at the source, so
+  // months of rows carry a pill that says nothing over a line that says
+  // everything - "decodes cleanly at both ends" under a green `done`. These
+  // are nuarr's own sentences, written from known code paths, so reading the
+  // kind back out of them is recovery rather than guesswork. New rows arrive
+  // named already and never reach this.
+  const DONE_KIND = [
+    // plan.summary() in its four shapes - only transcodes carry a plan
+    [/^(Rebuilding the picture|Keeping the picture as-is)|^nothing done|already set up correctly/i,
+     'transcoded'],
+    [/decode[sd]? cleanly|does not decode|decodes? the (first|last)/i, 'decode'],
+    [/\bheard \d+ of \d+|listened|language of track/i, 'listen'],
+    [/burned-in|sampled? \d+ frames|the events say|carries? (dialogue|signs)/i,
+     'subread'],
+    [/signs after all|nothing in the picture|dialogue and signs in the picture/i,
+     'subread'],
+    [/OCR|cues\/min|PGS track/i, 'sub_ocr'],
+    [/subtitle|sub track|forced|SDH|duplicate track|\btake in\b/i, 'subs'],
+    [/language tag|audio tag|track \d+'s language/i, 'audio'],
+  ];
   const evName=e=>{
     if(e.event==='deleted' && /upgrad/i.test(e.detail||'')) return 'upgraded';
     if(e.event==='imported' && /(upgrad|->)/i.test(e.detail||'')) return 'upgraded';
+    if(e.event==='done'){
+      const d = e.detail || '';
+      for(const [re, kind] of DONE_KIND) if(re.test(d)) return kind;
+    }
     return e.event;
   };
   const lblOf=it=> it.job ? doneLbl(it.job) : evName(it.ev);
@@ -24753,21 +24795,23 @@ function renderDone(j){
   // Folded here rather than at the source: the rows are correct, and months
   // of stored history already carry the older spellings. The one kept is the
   // one that says the most - the before -> after line, if there is one.
-  const UPGRADE_FOLD_S = 300;
+  const FOLD_S = {upgraded: 300, transcoded: 30};
   {
-    const rich = e => /->|\u2192/.test(e.detail || '') ? 2
+    const rich = e => /->|\u2192|% size/.test(e.detail || '') ? 2
                     : (e.detail || '').length > 12 ? 1 : 0;
-    const out = [], at = new Map();          // title -> index of its last one
+    const out = [], at = new Map();     // kind+title -> index of its last one
     for(const it of items){
-      if(it.ev && evName(it.ev) === 'upgraded'){
-        const t = it.ev.label || '\u2014';
-        const i = at.get(t);
-        if(i != null && Math.abs((it.ts || 0) - (out[i].ts || 0)) <= UPGRADE_FOLD_S){
+      const k = it.ev ? evName(it.ev) : '';
+      const win = FOLD_S[k];
+      if(win){
+        const key = k + '\u0000' + (it.ev.label || '\u2014');
+        const i = at.get(key);
+        if(i != null && Math.abs((it.ts || 0) - (out[i].ts || 0)) <= win){
           const keep = rich(it.ev) > rich(out[i].ev) ? it : out[i];
           out[i] = {...keep, ts: Math.max(out[i].ts || 0, it.ts || 0)};
           continue;
         }
-        out.push(it); at.set(t, out.length - 1);
+        out.push(it); at.set(key, out.length - 1);
         continue;
       }
       out.push(it);
