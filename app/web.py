@@ -18068,8 +18068,17 @@ async function drillTick(){
         c.textContent += ' · paused while you answer';
       return;
     }
-    const box=document.getElementById('drillBody');
-    if(box && box.scrollTop>40) return;      // frozen: they are reading it
+    // NO LONGER FROZEN WHILE SCROLLED. That rule was right when a refresh
+    // re-sorted the list and threw the reader back to the top; it is wrong
+    // now that the order is held, a rebuild restores the scroll position,
+    // and the bubbles are patched in place. What it did instead was stop
+    // the panel dead for as long as the box was scrolled - measured: two
+    // refreshes in eleven seconds at the top, none at all 120px down - so a
+    // list of seven rows in a 420px box went stale the moment anyone looked
+    // at row five, and LISTEN sat there after the listener had finished
+    // until the whole page was reloaded. Erik: "I had to refresh the whole
+    // page for this panel to update". A hand actively on the wheel still
+    // holds it, for the moment it is moving.
     if(userScrolling()) return;              // frozen: a hand is on it
     _drillBusy=true;
     // A POLL THAT CANNOT REACH THE SERVER IS NOT AN ERROR WORTH THROWING.
@@ -18079,7 +18088,10 @@ async function drillTick(){
     // console is only useful if what is in it means something. Said in the
     // header instead, where a person can see it, and wiped by the next
     // answer that arrives.
-    try{ await drillRefresh(true); }
+    // NOT FORCED. force=true made every tick rebuild the table, which is
+    // what the in-place patching exists to avoid; the key below decides
+    // when a rebuild is actually needed.
+    try{ await drillRefresh(false); }
     catch(e){
       const c=document.getElementById('drillCount');
       if(c && c.textContent.indexOf('offline') < 0)
@@ -18413,7 +18425,11 @@ async function drillRefresh(force){
   // queue position ticking from 21 to 20 rebuilt the whole table - which is
   // the one thing this panel must not do while somebody is reading it. The
   // volatile parts are written in place by patchSteps() instead.
-  const key = d.rows.map(r=>r.id).join(',') + '|' + (_drillLogId||'') + '|' + held;
+  // The row set AND each row's set of steps: a bubble can appear later (the
+  // OCR step, once the probe finds picture subtitles) and the patcher can
+  // only update bubbles that exist.
+  const key = d.rows.map(r=>r.id + ':' + (r.steps||[]).map(s=>s.kind).join('.')).join(',')
+            + '|' + (_drillLogId||'') + '|' + held;
   if(!force && key===_drillKey){ patchSteps(d.rows); return; }
   _drillKey=key;
   // Hold the scroll position across the rebuild. Even a genuine change - one
