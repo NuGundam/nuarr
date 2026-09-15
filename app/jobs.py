@@ -3745,6 +3745,31 @@ async def _run(job: Job, pool: str) -> None:
         joblog.log("PIPELINE: probe -> plan -> encode -> commit -> "
                    "arr refresh -> rename", "info", job.id)
 
+        # WHAT THE ORDER CHECK SAYS NOW, not only when this was queued.
+        #
+        # precedence.ready() is asked once, at enqueue, against the facts as
+        # they stood then - and a fact can arrive afterwards. A file whose
+        # audio languages are read AFTER its rewrite is queued owes the
+        # listener an answer that the plan has already been built without,
+        # and the only sign of it was a grey LISTEN bubble sitting beside a
+        # running rewrite. Erik spotted exactly that: "the listen bubble
+        # doesn't get processed yet it finishes".
+        #
+        # Not a reason to abandon a job that is already under way - the work
+        # is right for the facts that exist, and every one of the 39,871
+        # finished files in this library has been listened to eventually. It
+        # IS a reason to leave a record, so the next one can be explained
+        # from the transcript instead of guessed at from a bubble.
+        try:
+            from . import precedence as _pre
+            _owed = _pre.owed_before(job.file_id, "transcode")
+            if _owed:
+                joblog.log(f"the {_owed} check still owes this file an answer "
+                           f"- it was not owed when this rewrite was queued, "
+                           f"so the plan is built without it", "warn", job.id)
+        except Exception:                                        # noqa: BLE001
+            pass
+
         # The pre-encode repair stage is gone with the PowerShell handlers it
         # ran. Its purpose - fix the source before planning from it - is now
         # served by the rules themselves: a broken container or an unplayable

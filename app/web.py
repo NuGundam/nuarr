@@ -8962,8 +8962,21 @@ def _file_steps(rows: list, cap: int = 400) -> None:
                             st = "owed" if (fn and fn(cur, f)) else "done"
                         except Exception:                    # noqa: BLE001
                             st = "done"
+                    # WHAT THE BUBBLE IS CALLED. For four of the six the
+                    # kind IS the worker. The rewrite is the exception: it is
+                    # carried out by the encode pool or the passthrough pool
+                    # depending on what the plan turned out to need, and the
+                    # bubble said "TRANSCODE" either way while the badge
+                    # beside it said "ENCODE NOW" - two names for one job.
+                    # The pool is the honest word once a job exists; before
+                    # one does, neither pool has been chosen and the plan that
+                    # picks is what is owed, so it says REWRITE.
+                    word = k
+                    if k == "transcode":
+                        word = (j or {}).get("pool") or "rewrite"
                     steps.append({
                         "kind": k, "label": _STEP_LABEL.get(k, k),
+                        "word": word,
                         "pool": (j or {}).get("pool") or _STEP_POOL.get(k, ""),
                         "state": st, "via": via,
                         "pos": place.get((j or {}).get("job_id")) if j else None,
@@ -18213,7 +18226,7 @@ function patchSteps(rows){
         if(fill.style.width !== w) fill.style.width = w;
       } else if(fill){ fill.remove(); }
       const b = el.querySelector('b');
-      const want = s.kind.toUpperCase()
+      const want = (s.word || s.kind).toUpperCase()
                  + (sst==='queued' && s.pos ? ' ' + s.pos : '');
       if(b && b.textContent !== want) b.textContent = want;
     }
@@ -18474,7 +18487,7 @@ function stepBubbles(r){
          data-fid="${r.id}" data-kind="${esc(s.kind)}"
          data-job="${esc(s.job_id||'')}">`
          + (L ? `<i style="width:${pct}%"></i>` : '')
-         + `<b>${esc(s.kind)}${st==='queued'&&s.pos?' '+s.pos:''}</b></span>`;
+         + `<b>${esc(s.word||s.kind)}${st==='queued'&&s.pos?' '+s.pos:''}</b></span>`;
   }).join('')}</span>`;
 }
 
@@ -18513,10 +18526,17 @@ function noteFor(r){
     // finished-and-stuck look this note exists to end, so it names what.
     if(pct >= 100){
       let st = String(w.stage || '').split(' - ')[0].trim();
-      // The OCR has a bubble of its own now, carrying its own fraction and
-      // its own stage. The note saying "waiting for subtitle OCR" as well was
-      // the prose this replaced - so it says only that the rewrite is done.
-      if(/subtitle ocr/i.test(st)) st = 'waiting';
+      // THE OCR HAS ITS OWN BUBBLE NOW, with its own fraction and its own
+      // stage, sitting two inches to the left. A note beside it saying
+      // "done - waiting" is the prose the bubble replaced, kept on out of
+      // habit and saying less than the thing next to it. So when the OCR is
+      // what the rewrite is waiting for and the OCR is visibly running,
+      // the note says nothing at all.
+      if(/subtitle ocr/i.test(st)){
+        const o = (r.steps || []).find(x => x.kind === 'sub_ocr');
+        if(o && stepLive(o)) return null;
+        st = 'waiting';
+      }
       out = ['done \u00b7 ' + (st && st !== 'encoding' ? st : 'waiting'),
              'move'];
     } else out = [pct + '%', 'pct'];
