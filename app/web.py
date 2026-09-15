@@ -12842,6 +12842,11 @@ tr.logdrop td{padding:0 0 8px 0;background:#1c2129;border-bottom:1px solid var(-
    stepBubbles(). */
 .wstep.s-done{background:rgba(255,255,255,.06)}
 #drillBody .wstep.wdone{display:none}
+/* THE ROWS BEING WORKED ON SIT IN THEIR OWN SECTION AT THE TOP, under the
+   same divider the queue uses for "starting next" - one idiom for "these
+   are the ones moving" wherever it appears. */
+#drillBody tr.qsec > td{padding:0;border:0}
+#drillBody tr.qsec .qsplit{margin:0}
 /* THE WHOLE ROW GLOWS WHILE A WORKER HAS THE FILE.
    A bubble the size of a word is the right amount of detail for "which step"
    and not enough to catch the eye on an 81-row list - the one row where
@@ -18282,6 +18287,14 @@ async function drillRefresh(force){
   }
   d.rows = drillReorder(d.rows || [], sameQ);
   _drillRows = d.rows;
+  // THE ONES BEING WORKED ON FIRST, IN THEIR OWN SECTION - the queue panel's
+  // "starting next / then, in order" split, applied here. The held order
+  // still holds WITHIN each section; a row moves only when it starts, which
+  // is the one move a reader wants to see. Erik: "push the active one to the
+  // top of the panel in its own subsection like on the queue panel".
+  const isLive = r => (r.steps||[]).some(x => x.state === 'running');
+  const liveRows = d.rows.filter(isLive), restRows = d.rows.filter(r => !isLive(r));
+  const ordered = liveRows.concat(restRows);
   const html = d.rows.length
     // Path lives UNDER the title, not in its own column. As a column it wrapped
     // to two or three lines and made every row a different height, so the size,
@@ -18292,7 +18305,18 @@ async function drillRefresh(force){
       +'<th class="nb" style="width:118px">When</th>'
       +(held?'<th class="nb" style="width:150px">Settles</th>':'')
       +'<th class="nb" style="width:100px">State</th></tr>'
-      +d.rows.map(r=>{
+      +ordered.map((r, _i)=>{
+        // The section dividers ride in as table rows ahead of the first row
+        // of each group. "Then, in order" appears only when there IS a
+        // working group above it - a divider over the whole list says nothing.
+        let sec = '';
+        if(liveRows.length && _i === 0)
+          sec = `<tr class="qsec"><td colspan="${5 + (held?1:0)}"><div class="qsplit qnexthead">`
+              + `<b>working now</b><span class="qcount">${liveRows.length} file${liveRows.length===1?'':'s'}</span>`
+              + `</div></td></tr>`;
+        else if(liveRows.length && _i === liveRows.length)
+          sec = `<tr class="qsec"><td colspan="${5 + (held?1:0)}"><div class="qsplit">`
+              + `<span>then, in order</span><i></i></div></td></tr>`;
         // THE STATE PILL IS A BUTTON when there is a job behind it.
         //
         // The error list gave you a one-line summary - "ffmpeg exited
@@ -18362,7 +18386,7 @@ async function drillRefresh(force){
         const liveStep = r._gone
           ? null : (r.steps||[]).find(x=>x.state==='running');
         const rowCol = liveStep ? poolColor(liveStep.pool||'') : '';
-        const main = `<tr class="${open?'rowopen ':''}${liveStep?'liverow':''}${
+        const main = sec + `<tr class="${open?'rowopen ':''}${liveStep?'liverow':''}${
              r._gone?' rowgone':''}"
            data-fid="${r.id}"${rowCol?` style="--rowcol:${rowCol}"`:''}>
          <td class="wrap"><div><span class="${liveStep?'livetitle':''}"
@@ -18428,7 +18452,9 @@ async function drillRefresh(force){
   // The row set AND each row's set of steps: a bubble can appear later (the
   // OCR step, once the probe finds picture subtitles) and the patcher can
   // only update bubbles that exist.
+  // ...and the live set, so a row starting or stopping moves section.
   const key = d.rows.map(r=>r.id + ':' + (r.steps||[]).map(s=>s.kind).join('.')).join(',')
+            + '|' + liveRows.map(r=>r.id).join(',')
             + '|' + (_drillLogId||'') + '|' + held;
   if(!force && key===_drillKey){ patchSteps(d.rows); return; }
   _drillKey=key;
