@@ -345,6 +345,24 @@ async def _attempt_batch(rows: list[dict]) -> list[tuple[dict, bool, str]]:
 
 _HOLD_SAID = {"at": 0.0}
 
+# WHAT THE LAST PASS DID, FOR THE PANEL TO READ.
+#
+# Erik: "on the Renames waiting on the arrs panel show job gate pause info
+# like from the drive pool just like the processing system panel".
+#
+# The queue has a gate - drivepool.hold("renames"), because a rename moves a
+# file the balancer may be moving too - and when it closes, run_due returns
+# without touching a row. Nothing said so anywhere a person would look: the
+# panel went on reporting "78 due now", the count did not move, and the only
+# record was a joblog line written at most once every ten minutes. A queue
+# that is deliberately holding and a queue that is broken looked identical,
+# which is exactly the confusion the rename investigation started in.
+#
+# So the pass writes down what it did and why, and stats() hands it to the
+# panel beside the counts.
+STATE = {"at": 0.0, "held": False, "why": "", "tried": 0, "ok": 0,
+         "failed": 0, "titles": 0, "picked": 0}
+
 
 def _note_hold(text: str) -> None:
     """Say it once every ten minutes, not every pass."""
@@ -434,7 +452,10 @@ async def run_due(limit: int = 60) -> dict:
         held, why = False, ""
     if held:
         _note_hold(f"{len(rows)} rename(s) waiting - {why}")
+        STATE.update(at=time.time(), held=True, why=why, tried=0, ok=0,
+                     failed=0, titles=0, picked=0)
         return {"tried": 0, "ok": 0, "failed": 0, "gave_up": 0, "held": why}
+    STATE.update(held=False, why="")
 
     # Group by the series/movie they belong to - one rescan serves all of them.
     groups: dict[tuple, list[dict]] = {}
@@ -469,6 +490,8 @@ async def run_due(limit: int = 60) -> dict:
     ok = sum(x[0] for x in tally)
     failed = sum(x[1] for x in tally)
     gave_up = sum(x[2] for x in tally)
+    STATE.update(at=time.time(), held=False, why="", tried=len(results),
+                 ok=ok, failed=failed, titles=len(groups), picked=len(picked))
     sec.result = f"{ok} ok, {failed} retrying, {gave_up} gave up"
     sec.__exit__(None, None, None)
     return {"tried": len(rows), "ok": ok, "failed": failed, "gave_up": gave_up}
@@ -554,5 +577,29 @@ def stats() -> dict:
             "WHERE done_at IS NULL ORDER BY next_try_at LIMIT 50")]
         done = cur.execute("SELECT COUNT(*) n FROM rename_queue "
                            "WHERE done_at IS NOT NULL").fetchone()["n"]
+    # THE GATE, AND THE LAST PASS. A count with no explanation is what made
+    # a held queue unreadable - see the note above STATE. The hold is asked
+    # for fresh (it is a switch plus a look at what DrivePool is doing, not a
+    # disk read); everything else is what the last pass wrote down.
+    held, why = False, ""
+    try:
+        from . import drivepool as _dp
+        held, why = _dp.hold("renames")
+    except Exception:                                    # noqa: BLE001
+        pass
+    try:
+        from . import workers as _w
+        every = float(_w.tune("rename_poll_s") or POLL_S)
+    except Exception:                                    # noqa: BLE001
+        every = POLL_S
+    gate = {"held": bool(held), "why": why or STATE.get("why") or "",
+            "at": STATE.get("at") or 0.0, "every_s": every,
+            "per_pass": GROUPS_PER_PASS,
+            "last": {"tried": STATE.get("tried") or 0,
+                     "ok": STATE.get("ok") or 0,
+                     "failed": STATE.get("failed") or 0,
+                     "titles": STATE.get("titles") or 0,
+                     "picked": STATE.get("picked") or 0}}
     return {"pending": pend, "due": due, "gave_up": gave, "rows": rows,
-            "first_try": first, "retrying": retry, "done": done}
+            "first_try": first, "retrying": retry, "done": done,
+            "gate": gate}
