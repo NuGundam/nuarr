@@ -14075,13 +14075,34 @@ tr.actsub.nested .subgrid{margin-left:34px;border-left:2px solid #2a3340;
   padding-left:10px}
 /* AN EARLIER RELEASE, folded. One line saying what it was, its own pills, and
    a caret - the current release is what the group opens on. */
+/* WAITING LOOKS LIKE WAITING. "no activity yet" and "the answer has not
+   arrived yet" are different states and used to render identically - the
+   first is a claim about the library, the second about the page, and only one
+   of them was true at boot. The bars are sized like the row they stand in
+   for, so nothing jumps when the real content lands. */
+.skelbar{display:inline-block;height:9px;border-radius:3px;vertical-align:middle;
+  background:linear-gradient(90deg,var(--chip,#161b22),var(--line),var(--chip,#161b22));
+  background-size:200% 100%;animation:skelshine 1.2s ease-in-out infinite}
+.skelbar.tall{height:11px}
+tr.skelrow td{padding-top:11px;padding-bottom:11px}
+/* A spinner for the panels that are a single line rather than a table. */
+@keyframes spinDot{to{transform:rotate(360deg)}}
+.loaddot{display:inline-block;width:11px;height:11px;border-radius:50%;
+  border:2px solid #2a3340;border-top-color:var(--acc);
+  animation:spinDot .7s linear infinite;vertical-align:-2px;margin-right:7px}
+/* A reader who has asked the system to stop moving things gets a plain bar.
+   This covers the existing `.skel i` too, which never had the guard. */
+@media (prefers-reduced-motion:reduce){
+  .skelbar,.skel i{animation:none;background:var(--line)}
+  .loaddot{animation:none}
+}
 @keyframes genRowIn{from{opacity:0;transform:translateY(-6px)}
                     to{opacity:1;transform:none}}
 @keyframes genRowOut{from{opacity:1;transform:none}
                      to{opacity:0;transform:translateY(-6px)}}
 /* THE INNER GRID, NOT THE ROW. A transform on a <tr> is ignored or clips
    oddly depending on the engine; the div inside it animates reliably. */
-tr.genbody>td>.subgrid{animation:genRowIn .19s ease-out both}
+tr.genbody>td>.subgrid{animation:genRowIn .19s ease-out}
 tr.genbody.genout>td>.subgrid{animation:genRowOut .16s ease-in both}
 /* THE GLYPH ALREADY TURNS - the caret is written as U+25B8 or U+25BE by the
    renderer, so rotating it as well pointed an already-downward arrow sideways.
@@ -15803,6 +15824,40 @@ html.mobile #logsPane{height:auto;min-height:60vh}
   </div>
 </div>
 <script>
+// ---- THE BOOT GATE -------------------------------------------------------
+// See the note above the FIRST list: what the top of the page needs, in the
+// order it needs it. Anything unlisted is background and waits its turn.
+(function(){
+  const REAL = window.fetch.bind(window);
+  const FIRST = [/\/api\/jobs\/live/, /\/api\/jobs(\?|$)/, /\/api\/history/,
+                 /\/api\/summary/, /\/api\/queue/, /\/api\/disks/,
+                 /\/api\/activity/, /\/api\/workers/];
+  const MAX = 4;                 // the server is one SQLite file, not a farm
+  let active = 0, seq = 0, gate = true;
+  const q = [];
+  function pump(){
+    if(q.length > 1) q.sort((a,b)=> (a.p-b.p) || (a.i-b.i));
+    while(active < MAX && q.length){
+      const t = q.shift(); active++;
+      REAL(t.u, t.o).then(t.res, t.rej).finally(()=>{ active--; pump(); });
+    }
+  }
+  window.fetch = function(u, o){
+    if(!gate) return REAL(u, o);
+    const s = String((u && u.url) || u || '');
+    const p = FIRST.findIndex(re => re.test(s));
+    return new Promise((res, rej)=>{
+      q.push({u, o, p: p < 0 ? FIRST.length : p, i: seq++, res, rej});
+      pump();
+    });
+  };
+  // THE GATE LIFTS ITSELF, and on a timer as well as on `load` - a page that
+  // never fires load (a stalled image, a tab restored in the background) must
+  // not be rate-limited for the rest of its life.
+  const open = ()=>{ if(gate){ gate = false; pump(); } };
+  addEventListener('load', ()=> setTimeout(open, 1200));
+  setTimeout(open, 6000);
+})();
 const fmt=n=>(n||0).toLocaleString();
 const gb=b=>!b?'0':(b/1073741824>=1024?(b/1099511627776).toFixed(2)+' TB':(b/1073741824).toFixed(1)+' GB');
 const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -25308,6 +25363,24 @@ function renderDone(j){
                 row(it,false)+(it.facts||[]).map(f=>row(f,true)).join('')).join(''))
         : '');
     }).join('')+'</table></div>';
+  } else if(!_actHist && !lastJobs && !(_histRows||[]).length){
+    // NOTHING HAS ARRIVED YET - which is not the same as nothing having
+    // happened. Skeleton rows in the shape of the real ones, so the panel
+    // does not jump when they are replaced.
+    const bar=(w,cls)=>`<span class="skelbar ${cls||''}" style="width:${w}"></span>`;
+    html='<div id="doneBox" class="scrollbox nohz" style="height:460px">'
+      +'<table class="fixed">'
+      +'<tr><th>Title</th><th style="width:34%">What happened</th>'
+      +'<th class="num nb" style="width:52px">Times</th>'
+      +'<th class="num nb" style="width:206px"></th>'
+      +'<th class="nb" style="width:84px;padding-left:14px">Last</th></tr>'
+      + Array.from({length:7},(_,i)=>
+          `<tr class="skelrow"><td class="wrap">${bar((58-i*5)+'%','tall')}</td>`
+          +`<td>${bar('38%')} ${bar('24%')} ${bar('16%')}</td>`
+          +`<td class="num">${bar('56%')}</td>`
+          +`<td class="num">${bar('78%')}</td>`
+          +`<td style="padding-left:14px">${bar('66%')}</td></tr>`).join('')
+      +'</table></div>';
   } else {
     html='<div class="dim" style="padding:14px">nothing has happened yet</div>';
   }
