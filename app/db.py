@@ -676,6 +676,72 @@ def init_db() -> None:
             " END")
         # AND THE BACKLOG IS NAMED ONCE. Keyed on a kv flag so the 150,000-row
         # UPDATE runs a single time, not on every start.
+        # A NO-OP IS NOT A FAILURE, AND 288 OF THEM SAID IT WAS.
+        #
+        # Erik: "failed should only be for true failures". Of 325 history rows
+        # named 'failed', 288 read "already set up correctly" - the plan's own
+        # description of a file that needed nothing - and not one of them has
+        # a failed job within two minutes either side. They came from _finish
+        # falling back to plan.summary() for a failure with no message of its
+        # own, on a job that had already been resolved out from under its
+        # worker; both are fixed at the source now.
+        #
+        # The remaining 37 DO have a failed job beside them and keep their
+        # word: those really failed, and their detail describing the remux
+        # that failed is the right thing to have recorded.
+        #
+        # 'skipped' is the word nuarr already uses for this - 85,967 rows of
+        # it - so the vocabulary does not grow, the pill goes from red to
+        # grey, and the panel reads "Nothing To Do" instead of "Failed".
+        if not cur.execute("SELECT 1 FROM kv WHERE k='failed_noop_fixed'"
+                           ).fetchone():
+            cur.execute(
+                "UPDATE history SET event='skipped' "
+                " WHERE event='failed' AND detail='already set up correctly' "
+                "   AND NOT EXISTS (SELECT 1 FROM jobs j "
+                "        WHERE j.file_id = history.file_id "
+                "          AND j.state IN ('failed','error') "
+                "          AND ABS(COALESCE(j.finished_at,0) - history.at) < 120)")
+            cur.execute("INSERT INTO kv(k,v) VALUES('failed_noop_fixed','1')")
+        # AND THE ONES THAT REALLY DID FAIL GET THEIR REASON BACK.
+        #
+        # 37 rows are left saying "already set up correctly" and they all have
+        # a genuinely failed job beside them - every one a subs job that ended
+        # "the tracks have moved since this was planned". The word `failed` is
+        # right for those; the DETAIL was the plan's, borrowed by the same
+        # fallback. The job recorded why, so the row can simply be told.
+        #
+        # (A further 37 from August carry a plan summary and have no job
+        # within ten minutes - pruned long ago. Nothing can recover their
+        # reason, so they keep what they have.)
+        # NO ORDER BY IN THE CORRELATED SUBQUERY. SQLite 3.49.1 will not
+        # resolve the outer row's column inside a subquery's ORDER BY -
+        # "no such column: history.at" - and the first attempt at this threw
+        # on every boot, silently, leaving the flag unset so it threw again
+        # next time. Without the ordering it plans, and the window is two
+        # minutes wide: there is one failed job in it, not a choice of them.
+        if not cur.execute("SELECT 1 FROM kv WHERE k='failed_detail_fixed'"
+                           ).fetchone():
+            try:
+                cur.execute(
+                    "UPDATE history SET detail = COALESCE(("
+                    "   SELECT j.error FROM jobs j "
+                    "    WHERE j.file_id = history.file_id "
+                    "      AND j.state IN ('failed','error') "
+                    "      AND COALESCE(j.error,'') <> '' "
+                    "      AND ABS(COALESCE(j.finished_at,0) - history.at) < 120 "
+                    "    LIMIT 1), detail) "
+                    " WHERE event='failed' AND detail='already set up correctly'")
+                cur.execute(
+                    "INSERT INTO kv(k,v) VALUES('failed_detail_fixed','1')")
+            except Exception as _e:                          # noqa: BLE001
+                # A TIDY-UP MUST NOT BE ABLE TO STOP THE DATABASE OPENING.
+                # This one did throw, and nothing said so; the flag simply
+                # never appeared. Say it and carry on - the rows keep the
+                # wording they have, which is a cosmetic loss, where a failed
+                # init is not.
+                print(f"history detail tidy-up skipped: "
+                      f"{type(_e).__name__}: {_e}")
         if not cur.execute("SELECT 1 FROM kv WHERE k='history_label_backfilled'"
                            ).fetchone():
             cur.execute(

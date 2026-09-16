@@ -14113,7 +14113,10 @@ button[disabled]{opacity:.5;cursor:default}
 .e-missing{color:#d29922;border-color:#4a3a12}
 .e-duplicate{color:#a0a8b4;border-color:#3a4150}
 .e-deleted{color:#8b95a5;border-color:#242a33}
-.e-skipped{color:#8b95a5;border-color:#242a33}
+/* A FILE THAT NEEDED NOTHING IS A GOOD OUTCOME, not an absence. It shared
+   the dim grey of "no information" while the identical fact wearing a red
+   `failed` pill sat two rows above it. Green, quietly: nothing was wrong. */
+.e-skipped{color:#7fd18c;border-color:#245036}
 /* THE CHECK: the four facts a landing file is asked, folded into one row.
    Cool and pale on purpose - it is the reading, not the doing. */
 .e-checked{color:#c9d4e0;border-color:#3a4656}
@@ -25563,7 +25566,7 @@ function renderDone(j){
     moved_disk:      ['Moved Disk',                '#9aa7b8'],
     renamed:         ['Renamed',                   '#9aa7b8'],
     name_repaired:   ['Name Repaired',             '#9aa7b8'],
-    skipped:         ['Nothing To Do',             '#9aa7b8'],
+    skipped:         ['Nothing To Do',             '#7fd18c'],
     deferred:        ['Waiting Its Turn',          '#e2b341'],
     blocked:         ['Blocked',                   '#e2b341'],
     cancelled:       ['Cancelled',                 '#e2b341'],
