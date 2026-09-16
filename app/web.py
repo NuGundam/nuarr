@@ -10709,7 +10709,7 @@ def api_activity(q: str = "", page: int = 1, page_size: int = 50):
                         f"       finished_at, plan_json, result_json "
                         f"  FROM jobs WHERE finished_at IS NOT NULL AND {cond} "
                         f" ORDER BY finished_at DESC LIMIT 60"):
-                    d = dict(r)
+                    d = jobs.describe_row(dict(r))
                     d["file_size"] = d.get("size_after") or d.get("size_before") or 0
                     items.append({"ts": d.get("finished_at") or 0, "job": d})
             for cond in ("label IS NULL", "label=''"):
@@ -10735,7 +10735,8 @@ def api_activity(q: str = "", page: int = 1, page_size: int = 50):
                 f"           ORDER BY finished_at DESC) rn "
                 f"  FROM jobs WHERE finished_at IS NOT NULL AND ({cond_j})) "
                 f" WHERE rn <= 60", tuple(named)):
-            d = dict(r)
+            # THE SAME SENTENCE THE LIVE FEED PRINTS - see jobs.describe_row.
+            d = jobs.describe_row(dict(r))
             d.pop("rn", None)
             d["file_size"] = d.get("size_after") or d.get("size_before") or 0
             items.append({"ts": d.get("finished_at") or 0, "job": d})
@@ -14115,6 +14116,10 @@ tr.skelrow td{padding-top:11px;padding-bottom:11px}
 /* THE INNER GRID, NOT THE ROW. A transform on a <tr> is ignored or clips
    oddly depending on the engine; the div inside it animates reliably. */
 tr.genbody>td>.subgrid{animation:genRowIn .19s ease-out}
+/* the CURRENT release's rows fold like the others but do not play in: they
+   are already there when the title opens, and every poll would replay them */
+tr.genbody.cur>td>.subgrid{animation:none}
+tr.actsub.genhead.curhead .subgrid{border-top-style:solid}
 tr.genbody.genout>td>.subgrid{animation:genRowOut .16s ease-in both}
 /* THE GLYPH ALREADY TURNS - the caret is written as U+25B8 or U+25BE by the
    renderer, so rotating it as well pointed an already-downward arrow sideways.
@@ -24926,10 +24931,19 @@ let _actHist=null, _actQ='', _actPage=1, _actSize=50, _actQT=null;
 // two groups' old releases apart. The CURRENT release is always open when its
 // title is; only the earlier ones have a fold of their own.
 let _actGenOpen=new Set();
+// AND WHICH CURRENT RELEASES HAVE BEEN SHUT. Erik: "can you make it so the
+// current release can collapse too so it easier to read and show which
+// upgrade is which". The current release opens with its title, so its state
+// is the inverse of an earlier one's: remembered when CLOSED rather than when
+// opened. Two sets, one meaning each, and actToggleGen is told which it has.
+let _actGenClosed=new Set();
 let _actGenClosing=null;
-function actToggleGen(fid){
+function actToggleGen(fid, cur){
   const k=String(fid);
   if(_actGenClosing===k) return;            // already on its way out
+  const isOpen = cur ? !_actGenClosed.has(k) : _actGenOpen.has(k);
+  const setOpen = on => { if(cur){ if(on) _actGenClosed.delete(k); else _actGenClosed.add(k); }
+                          else   { if(on) _actGenOpen.add(k);      else _actGenOpen.delete(k); } };
   // doneForce, LIKE actToggle. Without it the re-render went through the
   // follow guard, and the follow guard says "you have scrolled down, hold
   // still" - which in history mode is always, because the earlier releases
@@ -24937,8 +24951,8 @@ function actToggleGen(fid){
   // nothing; a second click cleared the flag and painted nothing. Erik: "fix
   // drop down for upgrade entries not opening or closing correctly". A click
   // is a reason to repaint whatever the scroll position is.
-  if(!_actGenOpen.has(k)){
-    _actGenOpen.add(k); doneForce=true; lastListSig=null; renderDone(lastJobs);
+  if(!isOpen){
+    setOpen(true); doneForce=true; lastListSig=null; renderDone(lastJobs);
     return;
   }
   // CLOSING TAKES THE ROWS WITH IT, so they have to still be on the page while
@@ -24947,13 +24961,13 @@ function actToggleGen(fid){
   // changed yet, so renderDone returns early until this does the forgetting.
   const rows=document.querySelectorAll('tr.genbody[data-gen="'+k+'"]');
   if(!rows.length){
-    _actGenOpen.delete(k); doneForce=true; lastListSig=null; renderDone(lastJobs);
+    setOpen(false); doneForce=true; lastListSig=null; renderDone(lastJobs);
     return;
   }
   _actGenClosing=k;
   rows.forEach(r=>r.classList.add('genout'));
   setTimeout(()=>{
-    _actGenClosing=null; _actGenOpen.delete(k);
+    _actGenClosing=null; setOpen(false);
     doneForce=true; lastListSig=null; renderDone(lastJobs);
   }, 165);
 }
@@ -25277,8 +25291,12 @@ function renderDone(j){
       const fid=(it.job?it.job.file_id:it.ev.file_id);
       const k=(fid==null?0:fid);
       let gg=gens.get(k);
-      if(!gg){ gg={fid:k, entries:[], last:0, labels:new Map()}; gens.set(k,gg); }
+      if(!gg){ gg={fid:k, entries:[], last:0, first:0, labels:new Map()}; gens.set(k,gg); }
       gg.entries.push(it); gg.last=Math.max(gg.last, it.ts||0);
+      // WHEN IT LANDED. The header shows the first moment of the release,
+      // because that is the date that tells two releases apart; "last" is
+      // still what orders them.
+      gg.first = gg.first ? Math.min(gg.first, it.ts||gg.first) : (it.ts||0);
     }
     g.gens=[...gens.values()].sort((a,b)=>a.last-b.last);   // oldest first
     for(const gg of g.gens){
@@ -25319,7 +25337,8 @@ function renderDone(j){
   const listSig=glist.map(g=>g.title+':'
       +g.entries.map(it=>it.job?it.job.job_id+it.job.state:'e'+it.ev.id).join('.'))
     .join(',')+'|'+want+'|'+[..._actOpen].sort().join(';')
-    +'|'+[..._actGenOpen].sort().join(';');
+    +'|'+[..._actGenOpen].sort().join(';')
+    +'|'+[..._actGenClosed].sort().join(';');
 
   // Compare the LIST and the OPEN LOG separately. Folding both into one
   // signature meant that clicking Log changed the signature, hit the
@@ -25429,11 +25448,11 @@ function renderDone(j){
     }
     return `<span class="szc"><span></span><span></span><span class="dim">${cur?gb(cur):'—'}</span><span></span></span>`;
   }
-  const evRow=(e,nested,gid)=>{
+  const evRow=(e,nested,gid,cur)=>{
     // The CLASS comes from the kind and the TEXT from the label: a pass is a
     // suffix on the name, not a different kind, and must not lose its colour.
     const ts=e.at||0, nm=evName(e), lb=evLbl(e);
-    return `<tr class="actsub ${nested?'nested':''} ${gid?'genbody':''}"
+    return `<tr class="actsub ${nested?'nested':''} ${gid?'genbody':''} ${cur?'cur':''}"
       ${gid?`data-gen="${gid}"`:''}><td colspan="5"><div class="subgrid">
       <span class="dim when nb">${esc(fullTs(ts))}</span>
       <span class="nb"><span class="pill ${stateClass(nm)}">${esc(lb)}</span></span>
@@ -25445,14 +25464,14 @@ function renderDone(j){
         return u?szCells(u.before,u.after):szCells(0,0,e.size); })()}</span>
       <span></span></div></td></tr>`;
   };
-  const jobRow=(r,nested,gid)=>{
+  const jobRow=(r,nested,gid,cur)=>{
     const b=r.size_before||0, a=r.size_after||0;
     // A skipped or cancelled job records no before/after on purpose - nothing
     // was transcoded - but "—" where a size belongs reads as missing data.
     // The file's current size (joined in by the API) is the honest value.
     const txt=szCells(b,a,r.file_size);
     const isOpen=openLogId && openLogId===r.job_id;
-    const main=`<tr class="actsub ${isOpen?'rowopen':''} ${nested?'nested':''} ${gid?'genbody':''}"
+    const main=`<tr class="actsub ${isOpen?'rowopen':''} ${nested?'nested':''} ${gid?'genbody':''} ${cur?'cur':''}"
       ${gid?`data-gen="${gid}"`:''}><td colspan="5"><div class="subgrid">
       <span class="dim when nb">${esc(fullTs(r.finished_at))}</span>
       <span class="nb">${
@@ -25547,19 +25566,33 @@ function renderDone(j){
         <td class="dim nb" style="padding-left:14px;white-space:nowrap"
             title="${esc(new Date(g.last*1000).toLocaleString())}"
           >${ago(g.last)}</td></tr>`;
-      const row=(it,nested,gid)=> it.ev ? evRow(it.ev,nested,gid)
-                                        : jobRow(it.job,nested,gid);
-      // `gid` is only set for an EARLIER release. The current one is not
-      // animated: it is already there when the group opens, and playing it in
-      // on every poll would make the panel twitch.
-      const body=(gg,gid)=> gg.entries.filter(it=>!it.under).map(it=>
-        row(it,false,gid)+(it.facts||[]).map(f=>row(f,true,gid)).join('')).join('');
+      const row=(it,nested,gid,cur)=> it.ev ? evRow(it.ev,nested,gid,cur)
+                                            : jobRow(it.job,nested,gid,cur);
+      // `cur` marks the CURRENT release's rows: they carry data-gen so they
+      // can fold with their header, and the `cur` class so they do not play
+      // in on every poll (see the CSS above genRowIn).
+      const body=(gg,gid,cur)=> gg.entries.filter(it=>!it.under).map(it=>
+        row(it,false,gid,cur)+(it.facts||[]).map(f=>row(f,true,gid,cur)).join('')).join('');
       // THE CURRENT RELEASE IS THE ONE YOU OPENED THE GROUP TO SEE. The
       // earlier ones get a line each saying what they were and when, and open
       // on their own click.
       const gens=g.gens||[];
-      const genRow=(gg,gi2)=>{
-        const isOpen=_actGenOpen.has(String(gg.fid));
+      // ONE HEADER PER RELEASE, THE CURRENT ONE TOO. Erik: "can you make it so
+      // the current release can collapse too so it easier to read and show
+      // which upgrade is which". The current release's rows used to follow
+      // the earlier releases' headers with no header of their own, so the
+      // reader had to infer where the last "earlier release" ended and the
+      // present began - and with three releases in a title, which of the
+      // three the `upgraded` lines belonged to. Now every release gets the
+      // same line: when it landed, "earlier release · 1 of 3" through
+      // "current release · 3 of 3", what it is, and its pills; the current
+      // one opens with the title and folds on a click like the rest.
+      const genRow=(gg,gi2,arr)=>{
+        const cur = gi2===arr.length-1;
+        const isOpen = cur ? !_actGenClosed.has(String(gg.fid))
+                           : _actGenOpen.has(String(gg.fid));
+        const nth = arr.length>1 ? ` \u00b7 ${gi2+1} of ${arr.length}` : '';
+        const word = cur ? 'current release' : 'earlier release';
         const up=gg.entries.find(it=>it.ev && evName(it.ev)==='upgraded'
                                   && /->|\u2192/.test(it.ev.detail||''));
         const imp=gg.entries.find(it=>it.ev && evName(it.ev)==='imported');
@@ -25587,16 +25620,16 @@ function renderDone(j){
                <div class="wrap"><div class="actpills">${
                  glbls.map(([l,n])=>pillFor(l,n)).join(' ')}</div></div>
                <span></span><span></span></div></td></tr>` : '';
-        return `<tr class="actsub genhead ${isOpen?'rowopen':''}"
-            onclick="actToggleGen(${Number(gg.fid)||0})">
+        return `<tr class="actsub genhead ${cur?'curhead':''} ${isOpen?'rowopen':''}"
+            onclick="actToggleGen(${Number(gg.fid)||0}, ${cur?'true':'false'})">
           <td colspan="5"><div class="subgrid">
-          <span class="dim when nb">${esc(fullTs(gg.last))}</span>
+          <span class="dim when nb">${esc(fullTs(gg.first||gg.last))}</span>
           <span class="nb"><span class="actcaret">${isOpen?'\u25be':'\u25b8'}</span>
-            <span class="dim" style="font-size:10.5px">earlier release</span></span>
+            <span class="${cur?'':'dim'}" style="font-size:10.5px${cur?';color:var(--acc)':''}">${word}${esc(nth)}</span></span>
           <div class="wrap"><div class="dim mono ell" style="font-size:11px">${esc(what||'\u2014')}</div>
             <div class="actpills oneline" style="margin-top:3px">${pills}</div></div>
           <span></span><span></span></div></td></tr>`
-          + genPills + (isOpen?body(gg, gg.fid):'');
+          + genPills + (isOpen?body(gg, gg.fid, cur):'');
       };
       // WHAT THE CLOSED LINE COULD NOT FIT, first thing inside. A file with
       // nine kinds of work against it shows five on the line and all nine
@@ -25604,9 +25637,11 @@ function renderDone(j){
       const pillHead=(lbls.length>PILL_MAX)
         ? `<tr class="actsub pillhead"><td colspan="5">
              <div class="actpills">${pillsAll}</div></td></tr>` : '';
+      // A title with ONE release keeps the plain list - a header saying
+      // "current release" over the only release there is says nothing.
       return head+(open
         ? pillHead+(gens.length>1
-            ? gens.slice(0,-1).map(genRow).join('') + body(gens[gens.length-1], 0)
+            ? gens.map(genRow).join('')
             : g.entries.filter(it=>!it.under).map(it=>
                 row(it,false)+(it.facts||[]).map(f=>row(f,true)).join('')).join(''))
         : '');

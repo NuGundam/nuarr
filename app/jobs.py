@@ -7163,6 +7163,50 @@ def live_snapshot() -> dict:
     }
 
 
+def describe_row(r: dict) -> dict:
+    """Give a finished job row its sentence, its actions and its pass.
+
+    LIFTED OUT OF snapshot() SO THE HISTORY FEED CAN USE IT. The live feed
+    read "Keeping the picture as-is - audio 0 (jpn): convert eac3 to AAC
+    stereo ..." on a passthrough row while the history feed read "done" on
+    the very same job, because only the live reader ever ran this. Erik's
+    screenshot had both words on one screen. One reader, two callers.
+    """
+    # unpack the plan so the UI can explain WHY, not just what
+    try:
+        p = json.loads(r.pop("plan_json") or "{}")
+        r["actions"] = p.get("actions") or []
+    except Exception:
+        p, r["actions"] = {}, []
+    # WHAT HAPPENED FIRST, WHAT WAS INTENDED SECOND. A finished job knows
+    # its own outcome - "decodes cleanly at both ends", "heard 2 of 2" -
+    # and that is the sentence worth showing; the plan is the fallback for
+    # a job whose handler records no summary.
+    try:
+        r["summary"] = (json.loads(r.get("result_json") or "{}")
+                        .get("summary") or "")
+    except Exception:
+        r["summary"] = ""
+    if not r["summary"]:
+        # ONLY A TRANSCODE PLAN GOES THROUGH THE TRANSCODE READER. Keyed
+        # on the shape - a summary of its own, and none of the three keys
+        # only a rewrite plan carries - so the next reader pool is right
+        # without anyone remembering to come back here. See
+        # web._work_summary, which learned this first.
+        _rewrite = ("needed" in p) or ("encode" in p) or ("audio_ops" in p)
+        try:
+            r["summary"] = (p.get("summary") or "") if (p and not _rewrite) \
+                else (rules.plan_from_dict(p).summary() if p else "")
+        except Exception:
+            r["summary"] = p.get("summary") or ""
+    # WHICH PASS THIS WAS, for the pill. See integrity._job_plan.
+    if p.get("pass"):
+        r["pass"] = int(p.get("pass") or 1)
+        r["pass_label"] = p.get("pass_label") or ""
+    r.pop("result_json", None)
+    return r
+
+
 def snapshot(recent_limit: int = 60) -> dict:
     """Live queue state.
 
@@ -7192,38 +7236,7 @@ def snapshot(recent_limit: int = 60) -> dict:
             "'blocked','deferred') "
             "ORDER BY j.finished_at DESC LIMIT ?", (recent_limit,))]
     for r in recent_done:
-        # unpack the plan so the UI can explain WHY, not just what
-        try:
-            p = json.loads(r.pop("plan_json") or "{}")
-            r["actions"] = p.get("actions") or []
-        except Exception:
-            p, r["actions"] = {}, []
-        # WHAT HAPPENED FIRST, WHAT WAS INTENDED SECOND. A finished job knows
-        # its own outcome - "decodes cleanly at both ends", "heard 2 of 2" -
-        # and that is the sentence worth showing; the plan is the fallback for
-        # a job whose handler records no summary.
-        try:
-            r["summary"] = (json.loads(r.get("result_json") or "{}")
-                            .get("summary") or "")
-        except Exception:
-            r["summary"] = ""
-        if not r["summary"]:
-            # ONLY A TRANSCODE PLAN GOES THROUGH THE TRANSCODE READER. Keyed
-            # on the shape - a summary of its own, and none of the three keys
-            # only a rewrite plan carries - so the next reader pool is right
-            # without anyone remembering to come back here. See
-            # web._work_summary, which learned this first.
-            _rewrite = ("needed" in p) or ("encode" in p) or ("audio_ops" in p)
-            try:
-                r["summary"] = (p.get("summary") or "") if (p and not _rewrite) \
-                    else (rules.plan_from_dict(p).summary() if p else "")
-            except Exception:
-                r["summary"] = p.get("summary") or ""
-        # WHICH PASS THIS WAS, for the pill. See integrity._job_plan.
-        if p.get("pass"):
-            r["pass"] = int(p.get("pass") or 1)
-            r["pass_label"] = p.get("pass_label") or ""
-        r.pop("result_json", None)
+        describe_row(r)
     workers = list(RUNNING.values())
     for w in workers:                  # refresh per-process read counters
         w.sample_io()
