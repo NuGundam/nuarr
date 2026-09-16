@@ -55,6 +55,31 @@ MAX_ATTEMPTS = len(BACKOFF)
 # poll a 20 s delay still meant up to 80 s of waiting. run_due() is one indexed
 # query against a small table, so polling often costs nothing worth saving.
 POLL_S = 20.0
+# HOW MANY TITLES ONE PASS TAKES ON.
+#
+# Measured: 78 renames queued, every one DUE, every one still at attempts=0 -
+# the oldest 4.7 hours old - and nothing finished in six hours. Not held
+# (drivepool.hold('renames') was False) and not failing, because a failure
+# increments attempts. Simply never recorded.
+#
+# The pass attempted every parent and wrote every result at the end:
+#
+#     for key, grp in groups.items():
+#         results += await _attempt_batch(grp)      # 5 titles, serial
+#     for row, good, detail in results:            # the only writer
+#
+# Each _attempt_batch issues a RescanSeries and waits up to 300 s for it, so
+# five titles is up to twenty-five minutes of awaiting before the FIRST row is
+# written. Anything ending the pass in that window - a restart, an exception in
+# a later group - threw away the work of every group that had already
+# succeeded, and the rows went back to looking untouched. That is how a queue
+# with nothing wrong with it sat still for six hours, and how the ones that did
+# finish came to average ten hours with a worst case of twenty days.
+#
+# So each group is recorded as it completes (see _record), and a pass is
+# bounded to a few titles; the rest come round on the next tick, twenty seconds
+# later. Progress is kept either way.
+GROUPS_PER_PASS = 3
 
 # HOW LONG BEFORE THE FIRST ATTEMPT, by why it was queued.
 #
@@ -328,6 +353,68 @@ def _note_hold(text: str) -> None:
         joblog.log(text, "info")
 
 
+def _record(results) -> tuple:
+    """Write down what a batch achieved. Counts (ok, failed, gave_up).
+
+    This is run_due's own loop body, lifted out so it can be called per group
+    rather than once at the end - see the note above GROUPS_PER_PASS.
+    """
+    ok = failed = gave_up = 0
+    for row, good, detail in results:
+        if good:
+            ok += 1
+            _finish(row["file_id"], True, detail)
+            tries = row["attempts"] or 0
+            joblog.log(f"rename {'retry ' if tries else ''}ok: "
+                       f"{os.path.basename(row['path'] or '')} \u2014 {detail}", "ok")
+            # DID THE ARR KEEP HOLD OF IT? For an air-by-date series a lost
+            # episodeFile record is not recovered by a rescan, and an episode
+            # the arr thinks has no file gets searched and downloaded again.
+            try:
+                from . import arrattach
+                asyncio.create_task(arrattach.check_file(row["file_id"]))
+            except Exception:                                # noqa: BLE001
+                pass
+            # AND PLEX, WHICH THE ARR DOES NOT TELL. Both folders are scanned
+            # when the file crossed one, or the old location keeps a ghost.
+            try:
+                from . import plexqueue
+                with cursor() as cur:
+                    f = cur.execute("SELECT path FROM files WHERE id=?",
+                                    (row["file_id"],)).fetchone()
+                if f and f["path"]:
+                    plexqueue.enqueue(row["file_id"], f["path"],
+                                      old_path=row["path"] or "",
+                                      why="the arr renamed this file")
+            except Exception:                                # noqa: BLE001
+                pass
+            continue
+
+        attempts = (row["attempts"] or 0) + 1
+        failed += 1
+        if attempts >= MAX_ATTEMPTS:
+            gave_up += 1
+            with cursor() as cur:
+                cur.execute("UPDATE rename_queue SET attempts=?, last_error=?, "
+                            "done_at=? WHERE file_id=?",
+                            (attempts, f"gave up after {attempts}: {detail}"[:400],
+                             time.time(), row["file_id"]))
+            joblog.log(f"rename GAVE UP after {attempts} attempts: "
+                       f"{os.path.basename(row['path'] or '')} \u2014 {detail}", "error")
+        else:
+            delay = BACKOFF[min(attempts, len(BACKOFF) - 1)]
+            with cursor() as cur:
+                cur.execute("UPDATE rename_queue SET attempts=?, last_error=?, "
+                            "next_try_at=? WHERE file_id=?",
+                            (attempts, detail[:400], time.time() + delay,
+                             row["file_id"]))
+            joblog.log(f"rename attempt {attempts}/{MAX_ATTEMPTS} failed, next "
+                       f"in {delay//60} min: "
+                       f"{os.path.basename(row['path'] or '')} \u2014 {detail}",
+                       "warn")
+    return ok, failed, gave_up
+
+
 async def run_due(limit: int = 60) -> dict:
     """Process every due row, batched by parent. Returns a small summary."""
     now = time.time()
@@ -354,82 +441,34 @@ async def run_due(limit: int = 60) -> dict:
     for r in rows:
         groups.setdefault((r["arr_name"], r["parent_id"]), []).append(r)
 
-    ok = failed = gave_up = 0
     sec = joblog.section("rename queue")
     sec.__enter__(); sec.keep()
-    sec.note(f"{len(rows)} rename(s) due across {len(groups)} title(s)")
+    # A FEW TITLES AT A TIME. Each one costs a RescanSeries the arr runs
+    # serially and this awaits for up to 300 s; taking them all meant a pass
+    # that could outlive the process that started it. The rest are still due
+    # and come round on the next tick.
+    picked = list(groups.items())[:GROUPS_PER_PASS]
+    sec.note(f"{len(rows)} rename(s) due across {len(groups)} title(s); "
+             f"doing {len(picked)} this pass")
 
     results: list[tuple[dict, bool, str]] = []
-    for key, grp in groups.items():
-        results += await _attempt_batch(grp)
+    tally: list[tuple] = []
+    for key, grp in picked:
+        # WRITTEN AS IT LANDS, not banked to the end. See the note above
+        # GROUPS_PER_PASS: whatever this group achieved is recorded before the
+        # next one is started, so an interruption costs the group in flight
+        # and nothing else.
+        got = await _attempt_batch(grp)
+        results += got
+        try:
+            tally.append(_record(got))
+        except Exception as e:                               # noqa: BLE001
+            joblog.log(f"rename bookkeeping: {type(e).__name__}: {e}", "error")
 
-    for row, good, detail in results:
-        if good:
-            ok += 1
-            _finish(row["file_id"], True, detail)
-            # "rename retry ok" on a first pass claimed something had failed
-            # and then recovered, when nothing had gone wrong at all. attempts
-            # is 0 on the row until an attempt has actually MISSED, so anything
-            # above 0 here is a genuine retry and deserves the word.
-            tries = row["attempts"] or 0
-            joblog.log(f"rename {'retry ' if tries else ''}ok: "
-                       f"{os.path.basename(row['path'] or '')} — {detail}", "ok")
-            # DID THE ARR KEEP HOLD OF IT?
-            #
-            # This is the last moment nuarr touches the file, so it is the
-            # right place to check. For an air-by-date series a lost
-            # episodeFile record is NOT recovered by a rescan - only a manual
-            # import re-attaches it - and an episode the arr thinks has no
-            # file gets searched and downloaded again. SmackDown's history has
-            # the same episode grabbed five times in one morning.
-            try:
-                from . import arrattach
-                asyncio.create_task(arrattach.check_file(row["file_id"]))
-            except Exception:
-                pass
-            # AND PLEX, WHICH THE ARR DOES NOT TELL. The arr performs the
-            # rename and knows about it immediately; Plex is still holding the
-            # old path, which means the item plays back as missing until its
-            # own scan catches up - up to a day on this server. Both folders
-            # are scanned when the file crossed one, or the old location keeps
-            # a ghost entry.
-            try:
-                from . import plexqueue
-                with cursor() as cur:
-                    f = cur.execute("SELECT path FROM files WHERE id=?",
-                                    (row["file_id"],)).fetchone()
-                if f and f["path"]:
-                    plexqueue.enqueue(row["file_id"], f["path"],
-                                      old_path=row["path"] or "",
-                                      why="the arr renamed this file")
-            except Exception:                                # noqa: BLE001
-                pass
-            continue
-
-        attempts = row["attempts"] + 1
-        failed += 1
-        if attempts >= MAX_ATTEMPTS:
-            gave_up += 1
-            with cursor() as cur:
-                cur.execute("UPDATE rename_queue SET attempts=?, last_error=?, "
-                            "done_at=? WHERE file_id=?",
-                            (attempts, f"gave up after {attempts}: {detail}"[:400],
-                             time.time(), row["file_id"]))
-            joblog.log(f"rename GAVE UP after {attempts} attempts: "
-                       f"{os.path.basename(row['path'] or '')} — {detail}", "error")
-        else:
-            delay = BACKOFF[min(attempts, len(BACKOFF) - 1)]
-            with cursor() as cur:
-                cur.execute("UPDATE rename_queue SET attempts=?, last_error=?, "
-                            "next_try_at=? WHERE file_id=?",
-                            (attempts, detail[:400], time.time() + delay,
-                             row["file_id"]))
-            # "retry 1/6 failed" on the FIRST failure is the same lie the other
-            # way round: attempt 1 missing is not a retry missing.
-            joblog.log(f"rename attempt {attempts}/{MAX_ATTEMPTS} failed, next "
-                       f"in {delay//60} min: "
-                       f"{os.path.basename(row['path'] or '')} — {detail}",
-                       "warn")
+    # The counts come from _record, which did the writing group by group.
+    ok = sum(x[0] for x in tally)
+    failed = sum(x[1] for x in tally)
+    gave_up = sum(x[2] for x in tally)
     sec.result = f"{ok} ok, {failed} retrying, {gave_up} gave up"
     sec.__exit__(None, None, None)
     return {"tried": len(rows), "ok": ok, "failed": failed, "gave_up": gave_up}
