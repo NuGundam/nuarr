@@ -732,6 +732,19 @@ async def _startup() -> None:
         # And every commit records the file it produced - see
         # scanner.note_rewritten for the loop this closes.
         scanner.register_rewrites()
+        # WHAT HAS AND HAS NOT BEEN DONE TO EACH FILE. One row per file, one
+        # column-group per stage, keyed on the rev that hook bumps. Filled
+        # once from the stores that already know - a fresh table would claim
+        # that none of the last two years happened. See progress.py.
+        try:
+            from . import progress as _pg
+            _pg.init()
+            _r = await asyncio.to_thread(_pg.backfill)
+            if _r.get("files"):
+                joblog.log(f"progress ledger seeded: {_r['files']} files, "
+                           f"{_r.get('stages')}", "info")
+        except Exception as _pe:                             # noqa: BLE001
+            joblog.log(f"progress ledger: {type(_pe).__name__}: {_pe}", "warn")
         # What every device will actually play, topped up from Tautulli's
         # history on a timer. Incremental, so a run with nothing new is one
         # API call.
@@ -11914,6 +11927,42 @@ async def api_rescan(library: str | None = None):
 #
 # The scripts are archived at P:\BackUp Data\NuarrBackup\legacy with a README
 # explaining what each did, and can be run by hand if one is ever needed.
+
+
+@app.get("/api/files/{file_id}/progress")
+def api_file_progress(file_id: int):
+    """What has and has not been done to this file, and at which generation.
+
+    The ledger, not the stores: one line per stage saying whether it has an
+    answer for the bytes that are there now (`current`), has one for older
+    bytes (`done` but not current - the file has been rewritten since), or has
+    never run. See progress.py.
+    """
+    from . import progress
+    r = _rows("SELECT title, season, episode, path, size, COALESCE(rev,0) rev "
+              "  FROM files WHERE id=?", (file_id,))
+    if not r:
+        raise HTTPException(404, "file not found")
+    p = progress.of(file_id)
+    p["file_id"] = file_id
+    p["label"] = display_label(r[0]["title"], r[0]["season"], r[0]["episode"])
+    p["path"] = r[0]["path"]
+    p["size"] = r[0]["size"]
+    return p
+
+
+@app.get("/api/progress")
+def api_progress_summary():
+    """Library-wide: how many files each stage has a current answer for."""
+    from . import progress
+    return progress.summary()
+
+
+@app.post("/api/progress/rebuild")
+async def api_progress_rebuild():
+    """Re-derive the whole ledger from the stores. Maintenance; safe to re-run."""
+    from . import progress
+    return await asyncio.to_thread(progress.backfill, True)
 
 
 @app.post("/api/files/{file_id}/queue")

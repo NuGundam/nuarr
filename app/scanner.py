@@ -2405,7 +2405,15 @@ def note_rewritten(path: str) -> None:
             # describe files that are gone and nothing reads them, but a
             # tombstone silently updated to the size of its successor is a
             # trap for whoever reads that table next.
-            cur.execute("UPDATE files SET size=?, mtime=?, updated_at=? "
+            # AND THE GENERATION GOES UP. This is the one door every
+            # rewrite passes through, which is why the counter lives here
+            # rather than at the six call sites - five of which forgot the
+            # size, and would have forgotten this. Every per-file check
+            # records the rev it was made at; bumping it here is what makes
+            # them all go stale together, so the commit can then say which
+            # ones it did not actually invalidate. See progress.py.
+            cur.execute("UPDATE files SET size=?, mtime=?, updated_at=?, "
+                        "       rev=COALESCE(rev,0)+1 "
                         " WHERE path=? COLLATE NOCASE "
                         "   AND COALESCE(state,'') <> 'deleted'",
                         (int(st.st_size), float(st.st_mtime), time.time(),

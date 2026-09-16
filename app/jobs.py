@@ -1592,6 +1592,11 @@ def _note_checked(file_id: int, title: str, plan) -> bool:
         detail = (" \u00b7 ".join(bits) if bits else "nothing on record yet") \
             + (f" \u2192 {will}" if will else "")
         log_event(file_id, "checked", detail[:600], label=title)
+        try:
+            from . import progress as _pg
+            _pg.note(file_id, "plan", detail[:400])
+        except Exception:                                    # noqa: BLE001
+            pass
         return True
     except Exception:                                        # noqa: BLE001
         return False
@@ -5861,6 +5866,15 @@ async def _transcode(w: Worker, probe_data: dict) -> None:
                            f"rewritten file", "debug", job.id)
     except Exception:                                            # noqa: BLE001
         pass
+    # THE SAME STATEMENT, IN THE LEDGER. The rewrite bumped the rev, so every
+    # stage is stale by default - which is right for the decode check and the
+    # subtitle read, and wrong for these two. Said once, here, rather than
+    # left for each reader to work out.
+    try:
+        from . import progress as _pg2
+        _pg2.carry(job.file_id, _pg2.SURVIVES_REWRITE, _pg2.rev_of(job.file_id))
+    except Exception:                                            # noqa: BLE001
+        pass
     # AND THE ROW DESCRIBES THE NEW FILE NOW, NOT WHENEVER A SCAN GETS HERE.
     #
     # The commit updated size, mtime and the disk, and left audio_langs, the
@@ -6352,9 +6366,20 @@ def _finish(job: Job, state: str, before: int, after: int,
     # Only for 'done'. failed, skipped and cancelled ARE the event - what
     # happened to that job is the whole of what a reader wants from the pill.
     _ev = event or (job.kind if state == "done" and job.kind else state)
-    log_event(job.file_id, _ev,
-              note or (job.plan.summary() if job.plan else ""),
-              label=job.title)
+    _detail = note or (job.plan.summary() if job.plan else "")
+    log_event(job.file_id, _ev, _detail, label=job.title)
+    # AND THE LEDGER LEARNS WHAT WAS DONE. Only a success: a failed or skipped
+    # job has not answered its question, and recording it as done at this rev
+    # would stop the feeder ever offering the file again. See progress.py.
+    if state == "done" and job.file_id:
+        try:
+            from . import progress as _pg
+            _stage = {"transcode": "rewrite", "sub_ocr": "subocr"}.get(
+                job.kind, job.kind)
+            if _stage in _pg.STAGES:
+                _pg.note(job.file_id, _stage, _detail)
+        except Exception:                                    # noqa: BLE001
+            pass
 
 
 async def cancel_and_requeue(reason: str, timeout_s: float = 90.0) -> dict:

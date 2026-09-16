@@ -409,7 +409,17 @@ def init_db() -> None:
                           # parsing all 39,563 probe blobs on every request.
                           ("audio_langs", "TEXT"),
                           ("sub_langs", "TEXT"),
-                          ("requeued_at", "REAL")):
+                          ("requeued_at", "REAL"),
+                          # WHICH GENERATION OF THESE BYTES. Bumped once, in
+                          # fileops.REPLACED, every time nuarr replaces the
+                          # file - the one door a transcode, an OCR embed, a
+                          # sidecar merge and a deferred commit all pass
+                          # through. Every per-file check records the rev it
+                          # was made against, so "is this still valid" stops
+                          # being a size-and-mtime comparison that cannot tell
+                          # "somebody replaced the file" from "nuarr edited
+                          # it". See progress.py.
+                          ("rev", "INTEGER DEFAULT 0")):
             if name not in have:
                 cur.execute(f"ALTER TABLE files ADD COLUMN {name} {ddl}")
                 have.add(name)
