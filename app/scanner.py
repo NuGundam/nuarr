@@ -1098,6 +1098,12 @@ async def scan(full: bool = True, probe_orphans: bool = True,
             # Indexed by PATH as well, so an orphan's stored signature can be
             # reused instead of re-read off the pool. See the orphan loop.
             by_path = {os.path.normcase(r["path"]): r for r in rows if r["path"]}
+            # WHO ELSE IS LIVE AT THIS PATH. One path, one live row - see the
+            # retired-row guard in the reconcile loop below.
+            live_at: dict = {}
+            for r in rows:
+                if r["path"] and str(r["state"] or "") not in ("deleted", "duplicate"):
+                    live_at.setdefault(os.path.normcase(r["path"]), set()).add(r["id"])
             seen_ids: set[int] = set()
 
             inserts, updates, events, dup_inserts = [], [], [], []
@@ -1150,6 +1156,33 @@ async def scan(full: bool = True, probe_orphans: bool = True,
                         "new", None, now, now, now,
                     ))
                     rep.inserted += 1
+                    continue
+
+                # A RETIRED ROW STAYS RETIRED WHILE SOMEBODY ELSE HOLDS ITS PATH.
+                #
+                # An upgrade imports to the SAME path under a new arr file id.
+                # The webhook does the right thing - the new row is created and
+                # the old one goes to state='deleted' - but the arr goes on
+                # listing the old episode file for a few minutes afterwards, so
+                # the next scan finds it, sees the successor's size against the
+                # dead row's, calls it content_changed and sets it back to
+                # 'new'. The file is then taken through the whole intake a
+                # SECOND time on the old row: decode, listen, checked, all of
+                # it, while the real row does the same work beside it.
+                #
+                # Measured: twelve Endo and Kobayashi episodes, twelve paths
+                # with two live rows, twelve files decoded and listened to
+                # twice. Of the rows retired by an upgrade in 24 hours, 44
+                # stayed retired and these 12 came back.
+                #
+                # The test is possession, not the reason string: if a LIVE row
+                # already holds this path, this row is not that file, whatever
+                # the arr still believes. A row deleted because its file
+                # vanished is untouched by this and still revives when the file
+                # returns - nobody else holds its path.
+                if (str(prev["state"] or "") in ("deleted", "duplicate")
+                        and (live_at.get(key, set()) - {prev["id"]})):
+                    rep.unchanged += 1
                     continue
 
                 seen_ids.add(prev["id"])
