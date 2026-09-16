@@ -3420,10 +3420,16 @@ def _summary_impl():
     except Exception:                                    # noqa: BLE001
         pass
     try:
-        st = arrhealth.STATE
-        if st.get("warnings"):
-            attention.append({"what": "arr health", "n": int(st["warnings"]),
-                              "note": "warnings on Sonarr/Radarr",
+        # COUNTED OFF THE SAME LIST THE PANEL SHOWS, so the tile can never
+        # again claim two of something the panel has none of.
+        _ah = arrhealth.warnings_list(10_000)
+        if _ah:
+            _first = _ah[0]
+            attention.append({"what": "arr health", "n": len(_ah),
+                              "note": (f"{_first['arr']}: "
+                                       f"{_first['source'] or _first['type']}"
+                                       + (f" and {len(_ah) - 1} more"
+                                          if len(_ah) > 1 else "")),
                               "goto": "/settings#arrs"})
     except Exception:                                    # noqa: BLE001
         pass
@@ -10872,11 +10878,17 @@ def _attention(limit: int = 400):
         pass
 
     try:
-        st = arrhealth.STATE
-        for w in (st.get("warning_list") or [])[:limit]:
-            out.append({"source": "arr health", "id": 0, "title": str(w)[:120],
-                        "path": "", "detail": "", "goto": "/settings#arrs",
-                        "act": ""})
+        # ONE ROW PER WARNING, WITH WHAT IT SAYS AND WHERE TO READ MORE.
+        # This walked STATE["warning_list"], which arrhealth has never set -
+        # so the source could never produce a row, and the tile's "arr health
+        # 2" sat over an empty panel. See arrhealth.warnings_list.
+        for w in arrhealth.warnings_list(limit):
+            out.append({
+                "source": "arr health", "id": 0,
+                "title": f"{w['arr']}: {w['source'] or w['type']}",
+                "path": "", "detail": w["message"] or w["type"],
+                "url": w["url"], "level": w["level"],
+                "goto": "/settings#arrs", "act": ""})
     except Exception:                                        # noqa: BLE001
         pass
     try:
@@ -16443,8 +16455,15 @@ async function loadAll(){
   // flags and names the loudest one.
   const att=s.attention||[];
   const attN=att.reduce((t,a)=>t+(a.n||0),0);
+  // AND WHEN THERE IS ONLY ONE KIND, SAY WHICH ONE IT IS. "arr health 2"
+  // names a category and nothing inside it; every source already sends a
+  // `note` saying what the loudest of them actually is, and the tile was
+  // dropping it. With two or more kinds in play the list of counts is the
+  // more useful line, so that is kept.
   const attTop=att.length
-    ? esc(att.map(a=>`${a.what} ${fmt(a.n)}`).join(' · ')).slice(0,64)
+    ? esc(att.length===1 && att[0].note
+            ? `${att[0].what}: ${att[0].note}`
+            : att.map(a=>`${a.what} ${fmt(a.n)}`).join(' \u00b7 ')).slice(0,72)
     : 'nothing needs attention';
   // GO WHERE THE WORK IS. The tile used to open the file-ERRORS list whatever
   // it was counting, so rule-check findings and unresolved audio languages -
@@ -18198,9 +18217,18 @@ function attnPaint(){
         ? `<button class="refetch" style="margin-left:10px;font-size:10.5px;padding:1px 7px"
                    title="${esc(it.refetch_why||'reject the release this came from and ask the arr for another')}"
                    onclick="refetchAsk(${it.id}, true, this)">Blocklist &amp; re-download</button>` : '';
+      // AND THE DOCUMENTATION FOR IT, WHERE THERE IS ANY. Sonarr and Radarr
+      // hand a wikiUrl back with every health warning and it was being
+      // dropped, so a row said "IndexerRssNoIndexers" and nothing else.
+      // Erik: "no info or link to issue".
+      const warn = it.refetch_kind==='content' || it.level==='error';
       h+=`<div style="padding:3px 14px 6px 26px">
         <div style="font-size:12px;display:flex;align-items:center;flex-wrap:wrap">${esc(it.title||it.path||'(unnamed)')}${act}</div>
-        ${it.detail?`<div class="${it.refetch_kind==='content'?'':'dim'}" style="font-size:11px${it.refetch_kind==='content'?';color:var(--warn)':''}">${esc(it.detail)}</div>`:''}
+        ${it.detail?`<div class="${warn?'':'dim'}" style="font-size:11px${
+            it.level==='error'?';color:var(--bad)':warn?';color:var(--warn)':''}">${esc(it.detail)}</div>`:''}
+        ${it.url?`<div style="font-size:10.5px;margin-top:1px"><a href="${esc(it.url)}"
+            target="_blank" rel="noopener noreferrer"
+            title="${esc(it.url)}">what this means, on the arr's own wiki →</a></div>`:''}
         ${it.path?`<div class="mono dim" style="font-size:10px;overflow-wrap:anywhere">${esc(it.path)}</div>`:''}
       </div>`;
     }

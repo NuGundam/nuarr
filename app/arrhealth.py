@@ -103,13 +103,59 @@ async def refresh() -> dict:
                        system="arrhealth")
     _SEEN = now
 
-    STATE.update(arrs=rows, warnings=len(now), at=time.time(),
-                 checked=STATE["checked"] + 1)
+    # THE COUNT IS THE LENGTH OF THE LIST THE PANEL SHOWS. It used to be
+    # len(now) - a set keyed on (arr, source, type) - while the panel walked
+    # a different structure, which is how the two came to disagree. arrs is
+    # set first so warnings_list() reads this pass, not the last one.
+    STATE.update(arrs=rows, at=time.time(), checked=STATE["checked"] + 1)
+    STATE["warnings"] = len(warnings_list(10_000))
     return snapshot()
+
+
+def warnings_list(limit: int = 50) -> list[dict]:
+    r"""The warnings themselves, flattened, newest state first.
+
+    WHY THIS EXISTS. The tile counted STATE["warnings"] and the Needs
+    attention panel listed STATE["warning_list"] - a key this module has
+    never set. So the tile read "2 - arr health 2" over a panel reading
+    "nothing needs attention, 0 shown of 0", and there was no way to find out
+    what the two were. Erik: "no info or link to issue".
+
+    Everything needed was already fetched and thrown away: _one() reads each
+    arr's /health and keeps the type, the source, the level, the message and
+    Sonarr's own wikiUrl for it. This hands that over, and the tile counts
+    the same list it returns - so the two cannot disagree again.
+    """
+    out: list[dict] = []
+    for r in STATE.get("arrs") or []:
+        for h in r.get("health") or []:
+            out.append({
+                "arr": r.get("arr") or "",
+                "kind": r.get("kind") or "",
+                "type": h.get("type") or "",
+                "level": h.get("level") or "warn",
+                "source": h.get("source") or "",
+                "message": h.get("message") or "",
+                "url": h.get("url") or "",
+            })
+        # AN ARR THAT DOES NOT ANSWER IS THE LOUDEST WARNING OF ALL, and it
+        # was never counted: _one() returns early on a connection failure, so
+        # `health` is empty and the arr simply vanished from the reckoning.
+        if r.get("error"):
+            out.append({
+                "arr": r.get("arr") or "", "kind": r.get("kind") or "",
+                "type": "Unreachable", "level": "error", "source": "nuarr",
+                "message": f"nuarr could not reach this arr ({r['error']})",
+                "url": "",
+            })
+    return out[:limit]
 
 
 def snapshot() -> dict:
     d = dict(STATE)
+    # The list rides with the count, so anything reading the snapshot gets
+    # both and cannot pick one without the other.
+    d["warning_list"] = warnings_list()
     d["age_s"] = round(time.time() - STATE["at"]) if STATE["at"] else None
     d["poll_s"] = POLL_S
     return d
