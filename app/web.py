@@ -9234,8 +9234,8 @@ def api_history(limit: int = Query(100, le=1000), event: str | None = None):
     # f.size rides along so the Activity panel can show a file's current size
     # on rows that never ran a job - an upgrade or import has no
     # before/after pair, but the file it left behind has a size right now.
-    sql = ("SELECT h.id,h.event,h.detail,h.at,h.label,f.title,f.season,"
-           "f.episode,f.path,f.size FROM history h "
+    sql = ("SELECT h.id,h.file_id,h.event,h.detail,h.at,h.label,f.title,"
+           "f.season,f.episode,f.path,f.size FROM history h "
            "LEFT JOIN files f ON f.id=h.file_id")
     params: tuple = ()
     if event:
@@ -14069,6 +14069,11 @@ button[disabled]{opacity:.5;cursor:default}
    as one check with four answers rather than five things that happened. */
 tr.actsub.nested .subgrid{margin-left:34px;border-left:2px solid #2a3340;
   padding-left:10px}
+/* AN EARLIER RELEASE, folded. One line saying what it was, its own pills, and
+   a caret - the current release is what the group opens on. */
+tr.actsub.genhead{cursor:pointer}
+tr.actsub.genhead:hover{background:#171d26}
+tr.actsub.genhead .subgrid{border-top:1px dashed #2a3340;padding-top:6px}
 .e-cancelled{color:#8b95a5;border-color:#242a33}
 .e-blocked{color:#d29922;border-color:#4a3a12}
 /* deferred = encode done, swap waiting on the commit queue - work in flight,
@@ -24679,6 +24684,16 @@ let lastJobs=null, lastListSig=null, lastOpenId=null;
 // server page once you search or page, because the whole history is 62,000
 // jobs and no client-side slice of a 60-row window can reach it.
 let _actHist=null, _actQ='', _actPage=1, _actSize=50, _actQT=null;
+// WHICH EARLIER RELEASES ARE OPEN, by file id - one files row IS one release,
+// and the id is unique across the library, so nothing else is needed to tell
+// two groups' old releases apart. The CURRENT release is always open when its
+// title is; only the earlier ones have a fold of their own.
+let _actGenOpen=new Set();
+function actToggleGen(fid){
+  const k=String(fid);
+  if(_actGenOpen.has(k)) _actGenOpen.delete(k); else _actGenOpen.add(k);
+  lastListSig=null; renderDone(lastJobs);
+}
 
 async function actLoad(){
   const b=document.getElementById('doneBox');
@@ -24846,8 +24861,31 @@ function renderDone(j){
       const d = e.detail || '';
       for(const [re, kind] of DONE_KIND) if(re.test(d)) return kind;
     }
+    if(e.event==='transcoded' || e.event==='transcode'){
+      const d = (e.detail || '').trim();
+      for(const [re, sh] of REWRITE_SHAPE) if(re.test(d)) return sh;
+      return e.event;            // an unrecognised shape keeps its own name
+    }
     return e.event;
   };
+  // WHICH REWRITE IT WAS, not just that there was one.
+  //
+  // Erik: "is transcode bubble correct shouldn't be passthrough/encode".
+  // It was not, and the same commit read two different ways depending on the
+  // age of the feed entry: while the job row is still in the live window the
+  // pill comes from the POOL and says "passthrough"; once it ages out only
+  // the stored 'transcoded' event is left and the shape is lost. One file
+  // showed both for its two releases - "transcoded" for the older, and
+  // "passthrough" for the newer.
+  //
+  // The detail recovers it exactly, and that is checkable rather than
+  // hopeful: over three days, 538 "Keeping the picture as-is" plus 212
+  // flags-only against 750 jobs that ran in the passthrough pool, and 64
+  // "Rebuilding the picture" against 64 in encode. No remainder either way.
+  const REWRITE_SHAPE = [
+    [/^Rebuilding the picture/i, 'encode'],
+    [/^Keeping the picture as-is|set the track flags/i, 'passthrough'],
+  ];
   const PASS_RE=/^(pass \d)\s*\u00b7/i;
   const noPass=d=>String(d||'').replace(PASS_RE,'').trim();
   const evLbl=e=>{
@@ -24914,6 +24952,35 @@ function renderDone(j){
     const nm=evName(it.ev);
     return FACTS.has(nm) && !/^pass 2/i.test((it.ev.detail||'').trim());
   };
+  // ONE FILE ROW IS ONE RELEASE, so it is one generation of this title.
+  //
+  // Erik: "when a file is upgraded it should only show the current pass
+  // expanded and the other collapsed". A title that has been upgraded twice
+  // carries two complete passes - land, decode, listen, check, rewrite,
+  // decode again - and the group merges them by title, so the drop-down read
+  // as one very long story with the interesting half at the bottom.
+  //
+  // The generation key is the file id rather than anything inferred from the
+  // events: a replacement gets a NEW files row (measured: S01E01 went #55807
+  // deleted -> #55829 done), so the rows already say where one release ends
+  // and the next begins.
+  for(const g of groups.values()){
+    const gens=new Map();
+    for(const it of g.entries){
+      const fid=(it.job?it.job.file_id:it.ev.file_id);
+      const k=(fid==null?0:fid);
+      let gg=gens.get(k);
+      if(!gg){ gg={fid:k, entries:[], last:0, labels:new Map()}; gens.set(k,gg); }
+      gg.entries.push(it); gg.last=Math.max(gg.last, it.ts||0);
+    }
+    g.gens=[...gens.values()].sort((a,b)=>a.last-b.last);   // oldest first
+    for(const gg of g.gens){
+      for(const it of gg.entries){
+        if(it.under) continue;
+        const l=lblOf(it); gg.labels.set(l,(gg.labels.get(l)||0)+1);
+      }
+    }
+  }
   for(const g of groups.values()){
     for(let i=0;i<g.entries.length;i++){
       const it=g.entries[i];
@@ -24944,7 +25011,8 @@ function renderDone(j){
   const shown=glist.reduce((n,g)=>n+g.entries.length,0);
   const listSig=glist.map(g=>g.title+':'
       +g.entries.map(it=>it.job?it.job.job_id+it.job.state:'e'+it.ev.id).join('.'))
-    .join(',')+'|'+want+'|'+[..._actOpen].sort().join(';');
+    .join(',')+'|'+want+'|'+[..._actOpen].sort().join(';')
+    +'|'+[..._actGenOpen].sort().join(';');
 
   // Compare the LIST and the OPEN LOG separately. Folding both into one
   // signature meant that clicking Log changed the signature, hit the
@@ -24974,8 +25042,35 @@ function renderDone(j){
   // across the whole page.
   const POOLS=['passthrough','encode','subocr','transcode','job',
                'subs','audio','decode','listen','subread','handler'];
+  // THE PILLS READ IN THE ORDER THE WORK HAPPENS, not in the order the rows
+  // were written. Erik: "make sure the bubbles are ordered correctly as the
+  // flow chart dictates". This is precedence.ORDER with the landing at the
+  // front and the bookkeeping behind - the same sequence the Processing
+  // System diagram draws, so the pill line and the chart agree.
+  const FLOW=['imported','upgraded','checked',
+              'decode','listen','audio','subread',
+              'passthrough','encode','transcoded','transcode',
+              'subocr','sub_ocr','subs','subtitled',
+              'content_changed','moved_disk','renamed','name_repaired',
+              'skipped','deferred','failed','error','cancelled',
+              'deleted','recycled'];
+  const flowRank=lbl=>{
+    const head=String(lbl).split(' \u00b7 ')[0];
+    let i=FLOW.indexOf(head);
+    if(i<0) i=FLOW.length;
+    // The second decode pass is the check AFTER the rewrite - it belongs
+    // there in the sequence, not beside the first one. See integrity.py.
+    if(head==='decode' && /pass 2/.test(lbl)) i=FLOW.indexOf('transcoded')+0.5;
+    return i;
+  };
+  // A COUNT ONLY WHERE IT MEANS SOMETHING. "upgraded x2" says two releases
+  // came through this title, which is a fact about the title. "decode x4"
+  // only ever said "this file has been round more than once", which the
+  // upgrade count already says, and it said it four times over.
+  const COUNTED=new Set(['upgraded']);
   const pillFor=(lbl,n)=>{
-    const cnt=n>1?` ×${n}`:'';
+    const cnt=(n>1 && COUNTED.has(String(lbl).split(' \u00b7 ')[0]))
+      ? ` ×${n}` : '';
     if(lbl.includes(' · ')){
       const bits=lbl.split(' · '), head=bits[0], tail=bits[bits.length-1];
       // A PASS IS NOT A VERDICT. "decode · pass 2" is a clean decode that
@@ -25096,7 +25191,9 @@ function renderDone(j){
       +'<th class="nb" style="width:84px;padding-left:14px">Last</th></tr>';
     html+=glist.map((g,gi)=>{
       const open=_actOpen.has(g.title);
-      const pills=[...g.labels.entries()].map(([l,n])=>pillFor(l,n)).join(' ');
+      const pills=[...g.labels.entries()]
+        .sort((a,b)=>flowRank(a[0])-flowRank(b[0]))
+        .map(([l,n])=>pillFor(l,n)).join(' ');
       // Net size for the file: first job's before -> last job's after, so two
       // passes over the same file read as one honest total. When no job in
       // the window carried a delta (upgrades, imports, skips), fall back to
@@ -25134,9 +25231,39 @@ function renderDone(j){
             title="${esc(new Date(g.last*1000).toLocaleString())}"
           >${ago(g.last)}</td></tr>`;
       const row=(it,nested)=> it.ev ? evRow(it.ev,nested) : jobRow(it.job,nested);
+      const body=gg=> gg.entries.filter(it=>!it.under).map(it=>
+        row(it,false)+(it.facts||[]).map(f=>row(f,true)).join('')).join('');
+      // THE CURRENT RELEASE IS THE ONE YOU OPENED THE GROUP TO SEE. The
+      // earlier ones get a line each saying what they were and when, and open
+      // on their own click.
+      const gens=g.gens||[];
+      const genRow=(gg,gi2)=>{
+        const isOpen=_actGenOpen.has(String(gg.fid));
+        const up=gg.entries.find(it=>it.ev && evName(it.ev)==='upgraded'
+                                  && /->|\u2192/.test(it.ev.detail||''));
+        const imp=gg.entries.find(it=>it.ev && evName(it.ev)==='imported');
+        const what=up ? String(up.ev.detail||'').split(/->|\u2192/).pop().trim()
+                      : (imp ? String(imp.ev.detail||'').replace(/^import\s*\u00b7\s*/,'')
+                             : '');
+        const pills=[...gg.labels.entries()]
+          .sort((a,b)=>flowRank(a[0])-flowRank(b[0]))
+          .map(([l,n])=>pillFor(l,n)).join(' ');
+        return `<tr class="actsub genhead ${isOpen?'rowopen':''}"
+            onclick="actToggleGen(${Number(gg.fid)||0})">
+          <td colspan="5"><div class="subgrid">
+          <span class="dim when nb">${esc(fullTs(gg.last))}</span>
+          <span class="nb"><span class="actcaret">${isOpen?'\u25be':'\u25b8'}</span>
+            <span class="dim" style="font-size:10.5px">earlier release</span></span>
+          <div class="wrap"><div class="dim mono" style="font-size:11px">${esc(what||'\u2014')}</div>
+            <div class="actpills" style="margin-top:3px">${pills}</div></div>
+          <span></span><span></span></div></td></tr>`
+          + (isOpen?body(gg):'');
+      };
       return head+(open
-        ? g.entries.filter(it=>!it.under).map(it=>
-            row(it,false)+(it.facts||[]).map(f=>row(f,true)).join('')).join('')
+        ? (gens.length>1
+            ? gens.slice(0,-1).map(genRow).join('') + body(gens[gens.length-1])
+            : g.entries.filter(it=>!it.under).map(it=>
+                row(it,false)+(it.facts||[]).map(f=>row(f,true)).join('')).join(''))
         : '');
     }).join('')+'</table></div>';
   } else {

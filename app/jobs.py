@@ -7171,7 +7171,7 @@ def snapshot(recent_limit: int = 60) -> dict:
         # (nothing was transcoded) yet the file still has a size worth
         # showing instead of a dash.
         recent_done = [dict(r) for r in cur.execute(
-            "SELECT j.job_id,j.title,j.state,j.size_before,j.size_after,"
+            "SELECT j.job_id,j.file_id,j.title,j.state,j.size_before,j.size_after,"
             "j.error,j.finished_at,j.path,j.kind,j.pool,j.plan_json,"
             "j.result_json,f.size AS file_size FROM jobs j "
             "LEFT JOIN files f ON f.id=j.file_id "
