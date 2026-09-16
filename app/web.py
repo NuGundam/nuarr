@@ -14013,6 +14013,13 @@ button[disabled]{opacity:.5;cursor:default}
 .e-duplicate{color:#a0a8b4;border-color:#3a4150}
 .e-deleted{color:#8b95a5;border-color:#242a33}
 .e-skipped{color:#8b95a5;border-color:#242a33}
+/* THE CHECK: the four facts a landing file is asked, folded into one row.
+   Cool and pale on purpose - it is the reading, not the doing. */
+.e-checked{color:#c9d4e0;border-color:#3a4656}
+/* A fact that fed the check sits under it, indented, so the drop-down reads
+   as one check with four answers rather than five things that happened. */
+tr.actsub.nested .subgrid{margin-left:34px;border-left:2px solid #2a3340;
+  padding-left:10px}
 .e-cancelled{color:#8b95a5;border-color:#242a33}
 .e-blocked{color:#d29922;border-color:#4a3a12}
 /* deferred = encode done, swap waiting on the commit queue - work in flight,
@@ -24844,7 +24851,39 @@ function renderDone(j){
     if(!g){ g={title:t, entries:[], last:0, labels:new Map()}; groups.set(t,g); }
     g.entries.push(it);
     g.last=Math.max(g.last, it.ts||0);
-    const l=lblOf(it); g.labels.set(l,(g.labels.get(l)||0)+1);
+  }
+  // THE FOUR FACTS FOLD UNDER THEIR CHECK. When a file lands, decode, listen,
+  // audio and subread each answer one question and the answers become one
+  // decision - written as a single 'checked' row at the moment the rewrite
+  // is planned (jobs._note_checked). Here the fact rows that led up to that
+  // row are tucked under it: gone from the pill line, kept in the drop-down,
+  // indented. Walked backwards from the check so nothing after it - a later
+  // sweep re-listening, the second decode pass - is mistaken for part of it.
+  const FACTS=new Set(['decode','listen','audio','subread']);
+  const isFact=it=>{
+    if(it.job) return FACTS.has(it.job.kind) && !/pass 2/.test(it.job.pass_label||'');
+    const nm=evName(it.ev);
+    return FACTS.has(nm) && !/^pass 2/i.test((it.ev.detail||'').trim());
+  };
+  for(const g of groups.values()){
+    for(let i=0;i<g.entries.length;i++){
+      const it=g.entries[i];
+      if(!(it.ev && evName(it.ev)==='checked')) continue;
+      it.facts=[];
+      // Back to the landing (or the previous rewrite), gathering the facts
+      // and stepping over anything else - a rename from the arr, a disk
+      // move - which stays where it was.
+      const isEdge=x=> x.job ? x.job.kind==='transcode'
+        : ['upgraded','imported','transcoded','checked'].includes(evName(x.ev));
+      for(let j=i-1;j>=0 && !isEdge(g.entries[j]);j--){
+        if(!isFact(g.entries[j]) || g.entries[j].under) continue;
+        g.entries[j].under=it; it.facts.unshift(g.entries[j]);
+      }
+    }
+    for(const it of g.entries){
+      if(it.under) continue;
+      const l=lblOf(it); g.labels.set(l,(g.labels.get(l)||0)+1);
+    }
   }
   // The dropdown filters FILES, not rows: picking "skipped" keeps every file
   // that was skipped at least once, with its whole story intact - filtering
@@ -24939,11 +24978,11 @@ function renderDone(j){
     }
     return `<span class="szc"><span></span><span></span><span class="dim">${cur?gb(cur):'—'}</span><span></span></span>`;
   }
-  const evRow=e=>{
+  const evRow=(e,nested)=>{
     // The CLASS comes from the kind and the TEXT from the label: a pass is a
     // suffix on the name, not a different kind, and must not lose its colour.
     const ts=e.at||0, nm=evName(e), lb=evLbl(e);
-    return `<tr class="actsub"><td colspan="5"><div class="subgrid">
+    return `<tr class="actsub ${nested?'nested':''}"><td colspan="5"><div class="subgrid">
       <span class="dim when nb">${esc(fullTs(ts))}</span>
       <span class="nb"><span class="pill ${stateClass(nm)}">${esc(lb)}</span></span>
       <div class="wrap">${e.detail
@@ -24954,14 +24993,14 @@ function renderDone(j){
         return u?szCells(u.before,u.after):szCells(0,0,e.size); })()}</span>
       <span></span></div></td></tr>`;
   };
-  const jobRow=r=>{
+  const jobRow=(r,nested)=>{
     const b=r.size_before||0, a=r.size_after||0;
     // A skipped or cancelled job records no before/after on purpose - nothing
     // was transcoded - but "—" where a size belongs reads as missing data.
     // The file's current size (joined in by the API) is the honest value.
     const txt=szCells(b,a,r.file_size);
     const isOpen=openLogId && openLogId===r.job_id;
-    const main=`<tr class="actsub ${isOpen?'rowopen':''}"><td colspan="5"><div class="subgrid">
+    const main=`<tr class="actsub ${isOpen?'rowopen':''} ${nested?'nested':''}"><td colspan="5"><div class="subgrid">
       <span class="dim when nb">${esc(fullTs(r.finished_at))}</span>
       <span class="nb">${
         r.state==='done'
@@ -25045,8 +25084,10 @@ function renderDone(j){
         <td class="dim nb" style="padding-left:14px;white-space:nowrap"
             title="${esc(new Date(g.last*1000).toLocaleString())}"
           >${ago(g.last)}</td></tr>`;
+      const row=(it,nested)=> it.ev ? evRow(it.ev,nested) : jobRow(it.job,nested);
       return head+(open
-        ? g.entries.map(it=> it.ev ? evRow(it.ev) : jobRow(it.job)).join('')
+        ? g.entries.filter(it=>!it.under).map(it=>
+            row(it,false)+(it.facts||[]).map(f=>row(f,true)).join('')).join('')
         : '');
     }).join('')+'</table></div>';
   } else {

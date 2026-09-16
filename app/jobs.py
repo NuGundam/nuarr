@@ -1537,6 +1537,66 @@ def _side_ocr_allowed() -> bool:
     return _in_pool("subocr") < _capacity("subocr")
 
 
+# ONE ENTRY FOR THE WHOLE CHECK.
+#
+# Erik: "everything before rewrite ... should be copied under and merged under
+# a Check task for new files to nuarr which should show up in the activity
+# panel ... and have detail info behind it showing what it found and what it
+# will do according to the current rules".
+#
+# A file that lands is asked four questions before anything is decided - does
+# it decode, what language is each track really, are the tags right, what are
+# the subtitles - and each answer arrived in the activity panel as its own
+# pill, four of them in a row, with the decision they fed into sitting
+# somewhere else again. This is the moment they have all been answered: the
+# precedence gate has just let the transcode through, and rules.decide() has
+# just turned the four answers into a plan. So it is written down once, here,
+# as one row - what was found, and what will be done about it - and the four
+# pills fold under it on the panel.
+#
+# Once per landing. A file the arr replaces lands again and is checked again;
+# a requeue after a rules change is not a new check of the file and does not
+# write a second row.
+_FACT_KINDS = ("decode", "listen", "audio", "subread")
+_LANDING_EVENTS = ("imported", "upgraded", "transcoded", "content_changed")
+
+
+def _note_checked(file_id: int, title: str, plan) -> bool:
+    """Write the 'checked' row for this landing, if it has not been written."""
+    if not file_id or plan is None:
+        return False
+    try:
+        with cursor() as cur:
+            since = cur.execute(
+                "SELECT COALESCE(MAX(at), 0) a FROM history "
+                " WHERE file_id=? AND event IN (?,?,?,?)",
+                (file_id,) + _LANDING_EVENTS).fetchone()["a"] or 0.0
+            if cur.execute("SELECT 1 FROM history WHERE file_id=? "
+                           "  AND event='checked' AND at > ? LIMIT 1",
+                           (file_id, since)).fetchone():
+                return False
+            rows = cur.execute(
+                "SELECT event, detail FROM history "
+                " WHERE file_id=? AND at > ? AND event IN (?,?,?,?) "
+                " ORDER BY at", (file_id, since) + _FACT_KINDS).fetchall()
+        found: dict = {}
+        for r in rows:                      # the newest word from each system
+            raw = (r["detail"] or "").strip()
+            if re.match(r"^pass 2\b", raw, re.I):
+                continue                    # the after-rewrite check is not intake
+            d = re.sub(r"^pass \d\s*\u00b7\s*", "", raw)
+            if d:
+                found[r["event"]] = d
+        bits = [found[k] for k in _FACT_KINDS if k in found]
+        will = plan.summary() if plan is not None else ""
+        detail = (" \u00b7 ".join(bits) if bits else "nothing on record yet") \
+            + (f" \u2192 {will}" if will else "")
+        log_event(file_id, "checked", detail[:600], label=title)
+        return True
+    except Exception:                                        # noqa: BLE001
+        return False
+
+
 async def enqueue(file_id: int, path: str, title: str = "",
                   kind: str = "transcode", priority: int = 100,
                   source: str = "manual", plan_json: str = "") -> Job:
@@ -1710,7 +1770,11 @@ async def enqueue(file_id: int, path: str, title: str = "",
                     cur.execute("UPDATE files SET state='done', "
                                 "state_reason=?, processed_at=? WHERE id=?",
                                 (why, time.time(), file_id))
-                log_event(file_id, "skipped", plan.summary(), label=title)
+                # THE CHECK'S OWN ROW SAYS THIS, when it is the check that
+                # found it. A requeue that finds the same answer again is a
+                # skip, as before.
+                if not _note_checked(file_id, title, plan):
+                    log_event(file_id, "skipped", plan.summary(), label=title)
                 SKIPPED_EARLY["n"] = SKIPPED_EARLY.get("n", 0) + 1
                 SKIPPED_EARLY["last"] = title or os.path.basename(path)
                 joblog.log(f"no work needed, not queued: {title} - "
@@ -1754,6 +1818,9 @@ async def enqueue(file_id: int, path: str, title: str = "",
               priority=priority, plan=plan)
     joblog.log(f"queued [{pool}]: {title}"
                + (f" - {plan.summary()}" if plan else ""), "info", job_id)
+    # The four facts are in and the decision is made: one row for the check.
+    if kind == "transcode" and plan is not None:
+        _note_checked(file_id, title, plan)
     # THE ONE DOOR EVERY REQUEUE COMES THROUGH.
     #
     # The shared hourly budget can only be honest if it sees every requeue, and
