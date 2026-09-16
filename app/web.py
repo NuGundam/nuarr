@@ -14061,7 +14061,7 @@ button[disabled]{opacity:.5;cursor:default}
 .e-imported{color:#3fb950;border-color:#1f4426}
 /* an upgrade is the library improving, not losing a file - teal like the
    rule-check's "since fixed", nothing like deleted's grey */
-.e-upgraded{color:#39d3c3;border-color:#155e56}
+.e-upgraded,.e-replaced{color:#39d3c3;border-color:#155e56}
 /* Red is reserved for FAILURE. A delete is routine - most of them here are
    Sonarr replacing a file during an upgrade - so colouring it red made a
    healthy library look like it was on fire. */
@@ -25215,8 +25215,22 @@ function renderDone(j){
     [/language tag|audio tag|track \d+'s language/i, 'audio'],
   ];
   const evName=e=>{
-    if(e.event==='deleted' && /upgrad/i.test(e.detail||'')) return 'upgraded';
-    if(e.event==='imported' && /(upgrad|->)/i.test(e.detail||'')) return 'upgraded';
+    // REPLACED, NOT UPGRADED. Erik: "should say replaced not upgraded",
+    // over a row reading
+    //
+    //     Bluray-1080p Remux h264 AAC 2.0 · 312 MB
+    //       -> WEBDL-1080p x265 AAC 2.0 · 273 MB        -12.5%
+    //
+    // and eleven more like it, every one of them smaller. The arrs call any
+    // file swap an upgrade - isUpgrade is set whenever a grab replaces an
+    // existing file - and nuarr was repeating the word. Whether the new
+    // release is actually BETTER is a judgement, and the only thing that can
+    // make it is the arr's own custom format score, which now rides on the
+    // release header where the two can be compared. So the pill states the
+    // fact and leaves the judgement to the line that has the evidence.
+    if(e.event==='deleted' && /upgrad/i.test(e.detail||'')) return 'replaced';
+    if(e.event==='imported' && /(upgrad|->)/i.test(e.detail||'')) return 'replaced';
+    if(e.event==='upgraded') return 'replaced';
     if(e.event==='done'){
       const d = e.detail || '';
       for(const [re, kind] of DONE_KIND) if(re.test(d)) return kind;
@@ -25266,7 +25280,7 @@ function renderDone(j){
   // Folded here rather than at the source: the rows are correct, and months
   // of stored history already carry the older spellings. The one kept is the
   // one that says the most - the before -> after line, if there is one.
-  const FOLD_S = {upgraded: 300, transcoded: 30};
+  const FOLD_S = {replaced: 300, transcoded: 30};
   {
     const rich = e => /->|\u2192|% size/.test(e.detail || '') ? 2
                     : (e.detail || '').length > 12 ? 1 : 0;
@@ -25360,7 +25374,7 @@ function renderDone(j){
       // and stepping over anything else - a rename from the arr, a disk
       // move - which stays where it was.
       const isEdge=x=> x.job ? x.job.kind==='transcode'
-        : ['upgraded','imported','transcoded','checked'].includes(evName(x.ev));
+        : ['replaced','imported','transcoded','checked'].includes(evName(x.ev));
       for(let j=i-1;j>=0 && !isEdge(g.entries[j]);j--){
         if(!isFact(g.entries[j]) || g.entries[j].under) continue;
         g.entries[j].under=it; it.facts.unshift(g.entries[j]);
@@ -25418,7 +25432,7 @@ function renderDone(j){
   // flow chart dictates". This is precedence.ORDER with the landing at the
   // front and the bookkeeping behind - the same sequence the Processing
   // System diagram draws, so the pill line and the chart agree.
-  const FLOW=['imported','upgraded','checked',
+  const FLOW=['imported','replaced','checked',
               'decode','listen','audio','subread',
               'passthrough','encode','transcoded','transcode',
               'subocr','sub_ocr','subs','subtitled',
@@ -25508,7 +25522,7 @@ function renderDone(j){
         ?`<div class="mono dim detail" style="font-size:11px">${
              fmtDetail(lb===nm ? e.detail : noPass(e.detail))}</div>`
         :`<span class="dim">${esc(lb)}</span>`}</div>
-      <span class="num dim nb">${(()=>{ const u=nm==='upgraded'?upgradeSizes(e.detail):null;
+      <span class="num dim nb">${(()=>{ const u=nm==='replaced'?upgradeSizes(e.detail):null;
         return u?szCells(u.before,u.after):szCells(0,0,e.size); })()}</span>
       <span></span></div></td></tr>`;
   };
@@ -25591,19 +25605,46 @@ function renderDone(j){
       // so on hover.
       const _earlier=_gens.length>1
         ? _gens.slice(0,-1).reduce((n,gg)=>n+gg.entries.length,0) : 0;
-      const _over=Math.max(0, lbls.length-PILL_MAX)+_earlier;
-      const pills=lbls.slice(0,PILL_MAX).map(([l,n])=>pillFor(l,n)).join(' ')
-        +(_over
-            ? `<span class="more" title="${esc(
-                 (lbls.length>PILL_MAX
-                    ? `${lbls.length-PILL_MAX} more kind(s) of work on this release`
-                    : '')
-                 + (lbls.length>PILL_MAX && _earlier ? ', and ' : '')
-                 + (_earlier
-                    ? `${_earlier} entr${_earlier===1?'y':'ies'} against `
-                      + `${_gens.length-1} earlier release`
-                      + (_gens.length>2?'s':'')
-                    : ''))}">+${_over}</span>` : '');
+      // WHEN EVERYTHING IT NEEDED IS DONE, ONE BUBBLE SAYS SO.
+      //
+      // Erik: "once everything needed to be consider checked according to the
+      // file only show checked bubble". A file that landed, was measured,
+      // was decided about, was rewritten and came out clean does not need six
+      // pills to say it is fine - `checked` is the word for exactly that, and
+      // it is already written the moment the four facts are in.
+      //
+      // Settled means all three of: the current release HAS a check; nothing
+      // about it failed; and nothing is queued or running against it. Any one
+      // of those missing and the full strip comes back, because then the
+      // detail is the point. files.state cannot stand in for this - measured,
+      // all 39,876 live files are 'done', including ones that landed a minute
+      // ago and still owe every stage.
+      const BAD_LBL=new Set(['failed','error','cancelled','deferred','blocked']);
+      const _busy=(()=>{ const s=new Set();
+        const j=lastJobs||{};
+        for(const w of (j.running||[])) if(w.file_id!=null) s.add(Number(w.file_id));
+        for(const q of (j.queue||[]))   if(q.file_id!=null) s.add(Number(q.file_id));
+        return s; })();
+      const _settled = !!_cur && !_busy.has(Number(_cur.fid))
+        && lbls.some(([l])=>l.split(' \u00b7 ')[0]==='checked')
+        && !lbls.some(([l])=>BAD_LBL.has(l.split(' \u00b7 ')[0]));
+      const _shown = _settled
+        ? lbls.filter(([l])=>l.split(' \u00b7 ')[0]==='checked')
+        : lbls.slice(0, PILL_MAX);
+      // EVERYTHING THE FILE WENT THROUGH, counted in one place - the pills
+      // this row is not showing, plus every entry belonging to a release that
+      // has since been replaced. Erik: "move the + number over to that
+      // column", so it sits beside the time rather than trailing the bubbles.
+      const _over=Math.max(0, lbls.length-_shown.length)+_earlier;
+      const _overTip=(lbls.length>_shown.length
+            ? `${lbls.length-_shown.length} more kind(s) of work on this release`
+            : '')
+         + (lbls.length>_shown.length && _earlier ? ', and ' : '')
+         + (_earlier
+            ? `${_earlier} entr${_earlier===1?'y':'ies'} against `
+              + `${_gens.length-1} earlier release` + (_gens.length>2?'s':'')
+            : '');
+      const pills=_shown.map(([l,n])=>pillFor(l,n)).join(' ');
       // Net size for the file: first job's before -> last job's after, so two
       // passes over the same file read as one honest total. When no job in
       // the window carried a delta (upgrades, imports, skips), fall back to
@@ -25619,7 +25660,7 @@ function renderDone(j){
       const js=g.entries.filter(it=>it.job&&it.job.size_before&&it.job.size_after);
       // Upgrades count as a before-and-after too: an "upgraded x4" row is
       // the first upgrade's old file against the newest upgrade's new one.
-      const ups=g.entries.filter(it=>it.ev&&evName(it.ev)==='upgraded')
+      const ups=g.entries.filter(it=>it.ev&&evName(it.ev)==='replaced')
                          .map(it=>upgradeSizes(it.ev.detail)).filter(Boolean);
       if(js.length){
         sz=szCells(js[0].job.size_before, js[js.length-1].job.size_after);
@@ -25632,14 +25673,27 @@ function renderDone(j){
           if(s){ sz=szCells(0,0,s); break; }
         }
       }
+      // WHEN THE FILE WAS SWAPPED, not when anything last happened to it.
+      // Erik: "the time column should be changed to track the file being
+      // swapped". The current release's first moment is when this file became
+      // the one on disk; g.last moved every time a sweep touched it, so a
+      // title untouched for a month read "2m ago" because a rename had landed.
+      const _swapped=_cur ? (_cur.first||_cur.last||0) : 0;
       const head=`<tr class="actrow ${open?'rowopen':''}" onclick="actToggle(${gi})">
         <td class="wrap"><div class="ell" title="${esc(g.title)}"><span class="actcaret">${open?'▾':'▸'}</span><b>${esc(g.title)}</b></div></td>
         <td><div class="actpills oneline">${pills}</div></td>
         <td class="num dim nb">${g.entries.length}</td>
         <td class="num dim nb" style="padding-right:0">${sz}</td>
         <td class="dim nb" style="padding-left:14px;white-space:nowrap"
-            title="${esc(new Date(g.last*1000).toLocaleString())}"
-          >${ago(g.last)}</td></tr>`;
+            title="${esc(_swapped
+              ? `this release landed ${new Date(_swapped*1000).toLocaleString()}`
+              + (_gens.length>1 ? ` - the ${_gens.length}${
+                  _gens.length===2?'nd':_gens.length===3?'rd':'th'} for this title`
+                 : ' - the only one so far')
+              : new Date(g.last*1000).toLocaleString())}"
+          >${ago(_swapped||g.last)}${
+            _over?` <span class="more" title="${esc(_overTip)}">+${_over}</span>`:''
+          }</td></tr>`;
       const row=(it,nested,gid,cur)=> it.ev ? evRow(it.ev,nested,gid,cur)
                                             : jobRow(it.job,nested,gid,cur);
       // `cur` marks the CURRENT release's rows: they carry data-gen so they
@@ -25696,7 +25750,7 @@ function renderDone(j){
                      dScore>0?'+':''}${fmt(dScore)}</span>` : ''}${
                gg.group?` \u00b7 ${esc(gg.group)}`:''}</span>`
           : '';
-        const up=gg.entries.find(it=>it.ev && evName(it.ev)==='upgraded'
+        const up=gg.entries.find(it=>it.ev && evName(it.ev)==='replaced'
                                   && /->|\u2192/.test(it.ev.detail||''));
         const imp=gg.entries.find(it=>it.ev && evName(it.ev)==='imported');
         const what=up ? String(up.ev.detail||'').split(/->|\u2192/).pop().trim()

@@ -7215,9 +7215,12 @@ def snapshot(recent_limit: int = 60) -> dict:
     that had not changed. The Finished panel asks for the long list on demand.
     """
     with cursor() as cur:
+        # file_id rides along so the Activity feed can tell a file that is
+        # finished from one with work still queued against it - see the
+        # `settled` test in renderDone.
         upcoming = [dict(r) for r in cur.execute(
-            "SELECT job_id,title,kind,pool FROM jobs WHERE state='queued' "
-            "ORDER BY priority, created_at LIMIT 25")]
+            "SELECT job_id,file_id,title,kind,pool FROM jobs "
+            " WHERE state='queued' ORDER BY priority, created_at LIMIT 25")]
         depth = cur.execute(
             "SELECT COUNT(*) n FROM jobs WHERE state='queued'").fetchone()["n"]
         # 'deferred' belongs in this list: the encode is over and the swap is
