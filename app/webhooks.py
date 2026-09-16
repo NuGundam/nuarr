@@ -508,9 +508,21 @@ def _mark_deleted(cfg_name: str, file_id: int, reason: str) -> None:
     # (the bytes ARE gone); only the story told about it changes.
     ev = "upgraded" if "upgrade" in (reason or "").lower() else "deleted"
     with cursor() as cur:
-        row = cur.execute("SELECT id FROM files WHERE arr_name=? AND arr_file_id=?",
+        row = cur.execute("SELECT id, state, state_reason FROM files "
+                          " WHERE arr_name=? AND arr_file_id=?",
                           (cfg_name, file_id)).fetchone()
         if not row:
+            return
+        # A DELETION NUARR ORDERED IS ALREADY ON THE RECORD, in nuarr's words
+        # and with its reason. The arr reports the same deletion back seconds
+        # later and calls an API deletion 'manual' - the same event, told
+        # worse. Overwriting the reason with that word, and adding a second
+        # history row saying only "manual", is how a deliberate rejection came
+        # to read like something that merely happened.
+        _mine = str(row["state_reason"] or "").startswith("rejected and re-searched:")
+        if _mine and str(row["state"] or "") == "deleted":
+            joblog.log(f"{cfg_name} confirmed the deletion nuarr asked for "
+                       f"({reason})", "debug")
             return
         # Keep the row. Deleting it would cascade its history away, and on an
         # upgrade we want the audit trail of what replaced what.

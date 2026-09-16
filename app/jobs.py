@@ -4535,9 +4535,17 @@ async def _audio_job(w: Worker) -> None:
     w.out_bytes = after
     await asyncio.to_thread(audqueue.note_result, int(job.file_id), res)
     if res.get("ok"):
-        joblog.log(row.get("why") or "audio languages settled", "ok", job.id)
-        _finish(job, "done", before, after,
-                note=(row.get("why") or "audio languages settled")[:300])
+        # The steps and their reasons, as the card already shows them. Several
+        # tracks on one file become several clauses rather than one vague word.
+        _st = list((row.get("plan") or {}).get("steps") or [])
+        _wy = list((row.get("plan") or {}).get("why") or [])
+        _wy += [""] * max(0, len(_st) - len(_wy))
+        _did = " \u00b7 ".join(
+            (str(a) + (f" \u2014 {w}" if w else ""))
+            for a, w in zip(_st, _wy) if a)
+        _note = _did or row.get("why") or "audio languages settled"
+        joblog.log(_note, "ok", job.id)
+        _finish(job, "done", before, after, note=_note[:300])
     else:
         why = str(res.get("why") or "the instruction could not be carried out")
         joblog.log(f"FAILED: {why}", "error", job.id)

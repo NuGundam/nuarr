@@ -359,11 +359,28 @@ async def run(file_id: int, delete_file: bool = True,
             did.append(f"asked {cfg.name} to search for a replacement")
     except Exception as e:
         return {"ok": False, "why": f"{type(e).__name__}: {e}", "did": did}
+    # `explain` is why the FILE was rejected - classify()'s reading of its
+    # state_reason, or the rule the caller passed in. `why` is a different
+    # thing: whether the refetch can proceed at all ("no grab record survives
+    # for this file"), which on the degraded path is set even though the run
+    # goes ahead. Putting that in the story would blame the deletion on a
+    # missing blocklist entry.
+    _why = str(reason or p.get("explain") or "").strip()
+    _story = ("nuarr rejected this release"
+              + (f" \u2014 {_why}" if _why else "")
+              + ": " + "; ".join(did))
+    _now = time.time()
     with cursor() as cur:
         cur.execute("UPDATE files SET state='deleted', state_reason=?, "
                     "updated_at=? WHERE id=?",
                     (f"rejected and re-searched: {'; '.join(did)}",
-                     time.time(), file_id))
+                     _now, file_id))
+        # THE FEED GETS NUARR'S OWN ACCOUNT, not the arr's word for it. Written
+        # here, before the arr's webhook arrives, so the deletion is on the
+        # record as a decision with a reason rather than as something that
+        # merely happened to the file.
+        cur.execute("INSERT INTO history(file_id,event,detail,at) "
+                    "VALUES(?,?,?,?)", (file_id, "deleted", _story[:600], _now))
     joblog.log(f"REFETCH {row.get('title')}: {'; '.join(did)}", "warn")
     # A DELETED FILE IS A CHANGED FOLDER. The arr removes the release and goes
     # looking for another; Plex, told nothing, keeps offering an item whose
