@@ -14249,6 +14249,25 @@ tr.actsub.genhead .subgrid{border-top:1px dashed #2a3340;padding-top:6px}
   padding-left:2px}
 /* the full set, at the head of an opened file */
 tr.actsub.pillhead td{padding:6px 14px 6px 26px}
+/* an earlier release's copy brings its own grid, which brings its own padding */
+tr.actsub.pillhead.genbody td{padding:0}
+/* .wrap IS THE PAGE'S OWN LAYOUT CLASS, AND THESE CELLS BORROWED THE NAME.
+   The stylesheet has `.wrap{padding:18px 20px;display:grid;gap:16px}` for the
+   page's outer column - and every cell in this table written as
+   <td class="wrap"> or <div class="wrap"> was quietly picking it up.
+   Measured: a detail row's .wrap was 68px tall around 30px of content (18px
+   of padding top and bottom plus a 16px grid gap it never asked for), making
+   the row 79px; the summary row's title cell sat at 20px from the left while
+   every other cell and the header sat at 14px, and was a grid rather than a
+   table cell. An earlier-release line came to 104px for one date and one
+   pill. That is most of why the feed sprawls and why it appears to move so
+   much - there is three times as much of it as there is content.
+   Scoped to this box so the page's own layout is untouched. */
+#doneBox td.wrap{display:table-cell;padding-left:14px;padding-right:14px;gap:0}
+#doneBox .subgrid>.wrap{display:block;padding:0;gap:0}
+/* the earlier-release line is one line too - same rule as .actrow td.wrap */
+tr.actsub.genhead .wrap>div.ell{white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis}
 /* detail rows sit visually INSIDE their file: inset, slightly sunken, and
    with their own grid so the outer table's column widths cannot squeeze them */
 .actsub td{background:rgba(255,255,255,.016);font-size:11.5px;border-top:none;
@@ -15847,8 +15866,8 @@ html.mobile #logsPane{height:auto;min-height:60vh}
           <select id="doneSize" onchange="actSize()"
                   title="live = the newest jobs, updating as they finish. The others leave the live feed and page the whole recorded history, so many titles at a time - everything each one has ever been through, not just today.">
             <option value="50" selected>live</option>
-            <option value="10">history · 10 titles</option>
             <option value="100">history · 100 titles</option>
+            <option value="150">history · 150 titles</option>
           </select>
           <select id="doneFilter" onchange="applyDoneFilter()">
             <option value="">everything</option>
@@ -15941,6 +15960,75 @@ function poll(fn, ms, id){
   _gatedOnShow.push(g);
   return setInterval(g, ms);
 }
+
+// KEEPING YOUR PLACE ON A PAGE THAT REBUILDS ITSELF UNDER YOU.
+//
+// Erik: "fix Activity panel jumping around even when scroll pause is in
+// affect". The pause was working. Measured: with the feed scrolled to 700px
+// and four list changes forced through it, scrollTop stayed at 700 every time,
+// the pending counter went 1-2-3-4 and the resume button appeared - and the
+// same with a row open. Nothing inside the box moved.
+//
+// What moved was the box. Activity begins 7,127px down a 7,887px page, under
+// eight panels that all repaint on their own polls and all change height as
+// work moves through them: Files per pool disk (1,982px), Workers (645),
+// Queue (1,077), Processing System (1,168), Renames (202), Pending OCR (391),
+// Plex catching up (173), Pending file replaces (140). A job finishing takes a
+// card out of one of them and everything below jumps up. The feed's own
+// scroll guard cannot help with that: it holds the rows still inside a panel
+// that is itself being moved down the page.
+//
+// The browser's own scroll anchoring is meant for exactly this and cannot do
+// it here, because these panels repaint by replacing their whole innerHTML -
+// the node it anchored to is destroyed every poll. This anchors to the PANEL,
+// which is not replaced, only refilled.
+//
+// So: remember the topmost panel still on screen and how far down the window
+// it sits; after any DOM change, if it has moved, scroll by the difference.
+// Done in a rAF callback, which runs before paint, so the correction is never
+// seen. Nothing happens at the top of the page (there is nothing above you to
+// shift) or while you are actively scrolling (your scroll wins).
+(function keepPlace(){
+  let anc=null, want=0, queued=false, holding=false;
+  const pick=()=>{
+    if(window.scrollY < 40){ anc=null; return; }
+    for(const p of document.querySelectorAll('.panel,.two')){
+      const r=p.getBoundingClientRect();
+      if(r.bottom > 4){ anc=p; want=r.top; return; }
+    }
+    anc=null;
+  };
+  let pickQ=false;
+  addEventListener('scroll', ()=>{
+    // A scroll of OUR own making must not re-anchor; the element is already
+    // where we want it and re-reading would just confirm that at a cost.
+    if(holding || pickQ) return;
+    pickQ=true;
+    requestAnimationFrame(()=>{ pickQ=false; pick(); });
+  }, {passive:true});
+  const hold=()=>{
+    queued=false;
+    if(!anc || !anc.isConnected || window.scrollY < 40) return;
+    const d=anc.getBoundingClientRect().top - want;
+    // A pixel of rounding is not a jump. Anything more is the page moving
+    // under you, and is put back.
+    if(Math.abs(d) < 1) return;
+    holding=true;
+    window.scrollBy(0, d);
+    holding=false;
+  };
+  const start=()=>{
+    pick();
+    new MutationObserver(()=>{
+      if(queued) return;
+      queued=true;
+      requestAnimationFrame(hold);
+    }).observe(document.body, {childList:true, subtree:true});
+  };
+  if(document.readyState==='loading')
+    document.addEventListener('DOMContentLoaded', start);
+  else start();
+})();
 
 function ago(ts){
   const s=Math.max(0, Date.now()/1000-ts);
@@ -25471,19 +25559,37 @@ function renderDone(j){
         const what=up ? String(up.ev.detail||'').split(/->|\u2192/).pop().trim()
                       : (imp ? String(imp.ev.detail||'').replace(/^import\s*\u00b7\s*/,'')
                              : '');
-        const pills=[...gg.labels.entries()]
-          .sort((a,b)=>flowRank(a[0])-flowRank(b[0]))
-          .map(([l,n])=>pillFor(l,n)).join(' ');
+        // THE SAME RULE AS THE ROW ABOVE IT. Erik: "drop down for the
+        // upgraded entries should mirror the main drop down logic". The
+        // earlier-release line was still wrapping its whole pill strip while
+        // the current release held to one line with a count - so a title with
+        // two releases had one row of each shape, and the taller one was the
+        // one you had not asked to see. Same clip, same +N, same full set at
+        // the head of its own drop-down.
+        const glbls=[...gg.labels.entries()]
+          .sort((a,b)=>flowRank(a[0])-flowRank(b[0]));
+        const pills=glbls.slice(0,PILL_MAX).map(([l,n])=>pillFor(l,n)).join(' ')
+          +(glbls.length>PILL_MAX
+              ? `<span class="more">+${glbls.length-PILL_MAX}</span>` : '');
+        // Carries genbody/data-gen so it leaves with the generation it
+        // belongs to, and the subgrid so it lines up with the rows under it.
+        const genPills=(isOpen && glbls.length>PILL_MAX)
+          ? `<tr class="actsub pillhead genbody" data-gen="${gg.fid}">
+               <td colspan="5"><div class="subgrid">
+               <span></span><span></span>
+               <div class="wrap"><div class="actpills">${
+                 glbls.map(([l,n])=>pillFor(l,n)).join(' ')}</div></div>
+               <span></span><span></span></div></td></tr>` : '';
         return `<tr class="actsub genhead ${isOpen?'rowopen':''}"
             onclick="actToggleGen(${Number(gg.fid)||0})">
           <td colspan="5"><div class="subgrid">
           <span class="dim when nb">${esc(fullTs(gg.last))}</span>
           <span class="nb"><span class="actcaret">${isOpen?'\u25be':'\u25b8'}</span>
             <span class="dim" style="font-size:10.5px">earlier release</span></span>
-          <div class="wrap"><div class="dim mono" style="font-size:11px">${esc(what||'\u2014')}</div>
-            <div class="actpills" style="margin-top:3px">${pills}</div></div>
+          <div class="wrap"><div class="dim mono ell" style="font-size:11px">${esc(what||'\u2014')}</div>
+            <div class="actpills oneline" style="margin-top:3px">${pills}</div></div>
           <span></span><span></span></div></td></tr>`
-          + (isOpen?body(gg, gg.fid):'');
+          + genPills + (isOpen?body(gg, gg.fid):'');
       };
       // WHAT THE CLOSED LINE COULD NOT FIT, first thing inside. A file with
       // nine kinds of work against it shows five on the line and all nine
