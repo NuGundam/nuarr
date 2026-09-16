@@ -6335,6 +6335,14 @@ def _finish(job: Job, state: str, before: int, after: int,
             "error=?, result_json=COALESCE(?, result_json) WHERE job_id=?",
             (state, time.time(), before or None, after or None, error,
              json.dumps({"summary": note}) if note else None, job.id))
+        # DID THAT ROW EXIST? A job resolved out from under its own worker -
+        # autoqueue._resolve_nowork deletes queued jobs whose plans say there
+        # is nothing to do - leaves the worker to finish a job that is no
+        # longer there. The UPDATE hits nothing and the history row below is
+        # written anyway, which is how two files came to carry a 'failed'
+        # entry at 14:23:29 with no job of any kind beside it. An outcome for
+        # a job that does not exist is not an outcome.
+        _row_existed = (cur.rowcount or 0) > 0
         # ONLY THE KINDS THAT PROCESS THE FILE MAY SAY THE FILE IS DONE.
         #
         # This used to run for every kind. When the checks joined the queue
@@ -6387,8 +6395,28 @@ def _finish(job: Job, state: str, before: int, after: int,
     # Only for 'done'. failed, skipped and cancelled ARE the event - what
     # happened to that job is the whole of what a reader wants from the pill.
     _ev = event or (job.kind if state == "done" and job.kind else state)
-    _detail = note or (job.plan.summary() if job.plan else "")
-    log_event(job.file_id, _ev, _detail, label=job.title)
+    # A FAILURE DOES NOT BORROW THE PLAN'S SENTENCE.
+    #
+    # Erik: "failed bubble should not be for already setup". The detail fell
+    # back to plan.summary() for every state, so a job that failed with no
+    # message of its own - _finish(job, "failed", 0, 0, str(e)) where the
+    # exception carries no text - printed a red `failed` bubble over the words
+    # "already set up correctly", which is the plan's description of what
+    # nuarr had decided NOT to do. The most misleading line the panel could
+    # have produced, and it read as the no-op itself having failed.
+    #
+    # The plan is what was intended; it can only speak for the states where
+    # the intention was carried out. A failure says what went wrong, or says
+    # that nothing was recorded.
+    _bad = state in ("failed", "error", "cancelled")
+    _detail = (note or (error or "").strip()
+               or (f"{state} with no reason recorded" if _bad else "")) if _bad \
+        else (note or (job.plan.summary() if job.plan else ""))
+    if _row_existed:
+        log_event(job.file_id, _ev, _detail, label=job.title)
+    else:
+        joblog.log(f"finished a job that was no longer in the queue "
+                   f"({state}) - no history written", "debug", job.id)
     # AND THE LEDGER LEARNS WHAT WAS DONE. Only a success: a failed or skipped
     # job has not answered its question, and recording it as done at this rev
     # would stop the feeder ever offering the file again. See progress.py.
@@ -7233,7 +7261,10 @@ def snapshot(recent_limit: int = 60) -> dict:
         recent_done = [dict(r) for r in cur.execute(
             "SELECT j.job_id,j.file_id,j.title,j.state,j.size_before,j.size_after,"
             "j.error,j.finished_at,j.path,j.kind,j.pool,j.plan_json,"
-            "j.result_json,f.size AS file_size,f.pool_disk FROM jobs j "
+            "j.result_json,f.size AS file_size,f.pool_disk,"
+            "(SELECT event FROM history WHERE file_id=j.file_id "
+            "   AND event IN ('imported','upgraded') "
+            " ORDER BY at DESC LIMIT 1) AS landed FROM jobs j "
             "LEFT JOIN files f ON f.id=j.file_id "
             "WHERE j.state IN ('done','failed','skipped','cancelled',"
             "'blocked','deferred') "

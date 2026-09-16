@@ -1481,6 +1481,41 @@ def progress() -> dict:
     return dict(PROGRESS)
 
 
+# FILES WITH A REWRITE IN FLIGHT ARE NOT WORTH LISTENING TO YET.
+#
+# Both readers below decide freshness by comparing the verdict's size and
+# mtime against the files row. That is the right test, and it goes wrong for
+# exactly as long as a rewrite is in progress: the commit moves the file's
+# size and mtime, every stored verdict is instantly stale, and the feeder
+# hands the whole file back on its next poll - once a minute, for as long as
+# the work takes.
+#
+# Measured on "Let This Grieving Soul Retire! S01E22": seven listens, at
+# 14:10:59, 14:15:45, 14:16:48, 14:17:48, 14:18:48, 14:19:51 and 14:20:52 -
+# one a minute, straddling the passthrough that finished at 14:18:32 - all
+# reaching the same answer, jpn 0.988 and eng 0.828, which the table had
+# already held since 14:15:07. Whisper read the same two tracks six times
+# over to confirm what it had said the first time.
+#
+# So a file that something is about to rewrite waits. Only the kinds that
+# CHANGE the file count: a queued decode or another listen is not a reason to
+# skip it, and precedence.py raises HeldForOrder before a transcode is
+# queued, so nothing here can deadlock a file waiting on its own checks.
+_REWRITERS = ("transcode", "subs", "sub_ocr", "audio")
+
+
+def _busy_files(cur) -> set:
+    """file_ids with a rewrite queued or running against them."""
+    try:
+        qs = ",".join("?" * len(_REWRITERS))
+        return {r["file_id"] for r in cur.execute(
+            f"SELECT DISTINCT file_id FROM jobs "
+            f" WHERE state IN ('queued','running') AND kind IN ({qs}) "
+            f"   AND file_id IS NOT NULL", _REWRITERS)}
+    except Exception:                                    # noqa: BLE001
+        return set()
+
+
 def pending(limit: int = 5000) -> list[dict]:
     r"""Tracks with no usable language tag and no current verdict.
 
@@ -1502,6 +1537,7 @@ def pending(limit: int = 5000) -> list[dict]:
             # answer size and mtime, and it ran on the gate's poll.
             have = {(r["file_id"], r["track"]): r for r in cur.execute(
                 "SELECT file_id, track, size, mtime FROM audio_lang").fetchall()}
+            busy = _busy_files(cur)
             rows = cur.execute(
                 "SELECT id, path, title, season, episode, library, audio_langs, "
                 "       size, mtime "
@@ -1515,6 +1551,8 @@ def pending(limit: int = 5000) -> list[dict]:
     for r in rows:
         if len(out) >= limit:
             break
+        if r["id"] in busy:
+            continue                        # see _busy_files
         for ai, raw in enumerate((r["audio_langs"] or "").split(",")):
             if raw != "-":
                 continue
@@ -1838,11 +1876,14 @@ def unverified(limit: int = 5000) -> list[dict]:
                 "   AND COALESCE(audio_langs,'') != '' "
                 "   AND audio_langs != '-' "
                 " ORDER BY (state='eligible') DESC, id DESC").fetchall()
+            busy = _busy_files(cur)
     except Exception:                                    # noqa: BLE001
         return out
     for r in rows:
         if len(out) >= limit:
             break
+        if r["id"] in busy:
+            continue                        # see _busy_files
         codes = (r["audio_langs"] or "").split(",")
         for ai, raw_code in enumerate(codes):
             raw_code = (raw_code or "").strip()

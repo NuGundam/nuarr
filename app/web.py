@@ -9261,7 +9261,11 @@ def api_history(limit: int = Query(100, le=1000), event: str | None = None):
     # a release exists at all. See files.cf_score in db.py.
     sql = ("SELECT h.id,h.file_id,h.event,h.detail,h.at,h.label,f.title,"
            "f.season,f.episode,f.path,f.size,f.cf_score,f.cf_names,"
-           "f.release_group,f.state_reason,f.pool_disk FROM history h "
+           "f.release_group,f.state_reason,f.pool_disk,"
+           "(SELECT event FROM history x WHERE x.file_id=h.file_id "
+           "   AND x.event IN ('imported','upgraded') "
+           " ORDER BY x.at DESC LIMIT 1) landed "
+           "  FROM history h "
            "LEFT JOIN files f ON f.id=h.file_id")
     params: tuple = ()
     if event:
@@ -10745,11 +10749,16 @@ def api_activity(q: str = "", page: int = 1, page_size: int = 50):
                 f"SELECT * FROM (SELECT j.job_id, j.file_id, j.title, j.path, "
                 f"       j.kind, j.pool, j.state, j.size_before, j.size_after, "
                 f"       j.error, j.finished_at, j.plan_json, j.result_json, "
-                f"       f.pool_disk, "
+                f"       f.pool_disk, (SELECT event FROM history x WHERE x.file_id=j.file_id AND x.event IN ('imported','upgraded') ORDER BY x.at DESC LIMIT 1) landed, "
                 f"       ROW_NUMBER() OVER (PARTITION BY j.title "
                 f"           ORDER BY j.finished_at DESC) rn "
                 f"  FROM jobs j LEFT JOIN files f ON f.id = j.file_id "
-                f" WHERE j.finished_at IS NOT NULL AND ({cond_j})) "
+                # j.title, NOT title. Adding the files join to pick up pool_disk put
+        # a second `title` in scope and SQLite refused the whole query -
+        # "ambiguous column name: title" - so /api/activity returned 500, and
+        # actLoad's catch turned that into a silent fall back to live mode.
+        # Erik: "history doesn't work". Mine, from the Disk column commit.
+        f" WHERE j.finished_at IS NOT NULL AND ({cond_j.replace('title', 'j.title')})) "
                 f" WHERE rn <= 60", tuple(named)):
             # THE SAME SENTENCE THE LIVE FEED PRINTS - see jobs.describe_row.
             d = jobs.describe_row(dict(r))
@@ -10760,6 +10769,7 @@ def api_activity(q: str = "", page: int = 1, page_size: int = 50):
                 f"SELECT * FROM (SELECT h.id, h.file_id, h.event, h.detail, "
                 f"       h.at, h.label, f.cf_score, f.cf_names, "
                 f"       f.release_group, f.state_reason, f.pool_disk, "
+                f"       (SELECT event FROM history x WHERE x.file_id=h.file_id AND x.event IN ('imported','upgraded') ORDER BY x.at DESC LIMIT 1) landed, "
                 f"       ROW_NUMBER() OVER (PARTITION BY h.label "
                 f"           ORDER BY h.at DESC) rn FROM history h "
                 f"  LEFT JOIN files f ON f.id = h.file_id "
@@ -25032,10 +25042,24 @@ async function actLoad(){
   const b=document.getElementById('doneBox');
   if(b) b.style.opacity='0.55';
   try{
-    _actHist=await (await fetch(`/api/activity?q=${encodeURIComponent(_actQ)}`
-      +`&page=${_actPage}&page_size=${_actSize}`)).json();
+    const _r=await fetch(`/api/activity?q=${encodeURIComponent(_actQ)}`
+      +`&page=${_actPage}&page_size=${_actSize}`);
+    if(!_r.ok) throw new Error(`the server answered ${_r.status}`);
+    _actHist=await _r.json();
     _actPage=_actHist.page||1;
-  }catch(e){ _actHist=null; }
+  }catch(e){
+    // A FAILED FETCH IS NOT "YOU ASKED FOR LIVE". This swallowed everything
+    // and left _actHist null, which is exactly what live mode looks like - so
+    // a 500 from /api/activity read as the history option doing nothing at
+    // all, with no error anywhere. Say it where the count goes, and put the
+    // picker back to the mode actually being shown.
+    _actHist=null;
+    const _dc=document.getElementById('doneCount');
+    if(_dc) _dc.textContent=`history could not be loaded \u2014 ${e.message||e}`;
+    const _ds=document.getElementById('doneSize');
+    if(_ds) _ds.value='50';
+    _actSize=50;
+  }
   if(b) b.style.opacity='';
   doneForce=true; lastListSig=null;
   renderDone(lastJobs);
@@ -25362,11 +25386,17 @@ function renderDone(j){
       const k=(fid==null?0:fid);
       let gg=gens.get(k);
       if(!gg){ gg={fid:k, entries:[], last:0, first:0, labels:new Map(),
-                   score:null, formats:'', group:''}; gens.set(k,gg); }
+                   score:null, formats:'', group:'', landed:''}; gens.set(k,gg); }
       gg.entries.push(it); gg.last=Math.max(gg.last, it.ts||0);
       // WHAT THE ARR SCORED THIS RELEASE. Every row of a generation carries
       // its file's score, so the first one that has it settles it.
       if(gg.score==null && it.ev && it.ev.cf_score!=null) gg.score=it.ev.cf_score;
+      // HOW THIS RELEASE ARRIVED, from the file's own record rather than from
+      // whatever is in the feed's window. See LANDED in web.py.
+      if(!gg.landed){
+        const _l=(it.ev&&it.ev.landed)||(it.job&&it.job.landed)||'';
+        if(_l) gg.landed = (_l==='imported') ? 'imported' : 'replaced';
+      }
       if(!gg.formats && it.ev && it.ev.cf_names) gg.formats=it.ev.cf_names;
       if(!gg.group && it.ev && it.ev.release_group) gg.group=it.ev.release_group;
       // WHEN IT LANDED. The header shows the first moment of the release,
@@ -25737,9 +25767,20 @@ function renderDone(j){
       // announcing it has no landing at all, so `checked` stays as the
       // fallback: it is still the honest word for "measured, decided, fine".
       const LANDING=['replaced','upgraded','imported'];
-      const _landed = _settled
-        ? lbls.filter(([l])=>LANDING.includes(l.split(' \u00b7 ')[0])) : [];
-      const _shown = !_settled ? lbls.slice(0, PILL_MAX)
+      const _inWindow = lbls.filter(([l])=>LANDING.includes(l.split(' \u00b7 ')[0]));
+      // The landing entry may be older than anything the feed is holding, so
+      // fall back to the file's own record of it - see gg.landed.
+      const _landWord = _inWindow.length
+        ? _inWindow[0][0].split(' \u00b7 ')[0]
+        : ((_cur && _cur.landed) || '');
+      const _landed = _inWindow.length ? _inWindow
+        : (_landWord ? [[_landWord, 1]] : []);
+      // A ROW STILL WORKING SAYS WHERE IT CAME FROM TOO. The landing goes in
+      // front of whatever is happening to it, so "Remuxed - Decode Checked
+      // Again - Renamed" reads "Replaced - Remuxed - Decode Checked Again".
+      const _rest = lbls.filter(([l])=>!LANDING.includes(l.split(' \u00b7 ')[0]));
+      const _shown = !_settled
+        ? (_landed.length ? _landed.concat(_rest) : _rest).slice(0, PILL_MAX)
         : (_landed.length ? _landed
            : lbls.filter(([l])=>l.split(' \u00b7 ')[0]==='checked'));
       // AND "UPGRADED" IS EARNED, NOT ASSUMED. The word only appears where
