@@ -14273,6 +14273,9 @@ tr.actsub.genhead .subgrid{border-top:1px dashed #2a3340;padding-top:6px}
    out of table flow and every column after it shifts */
 .actpills{display:flex;flex-wrap:wrap;gap:3px;align-items:center}
 .actpills.oneline{flex-wrap:nowrap;overflow:hidden}
+/* the summary row's plain-words answer - see WORDS in renderDone */
+.actwords{font-size:11.5px;white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis}
 .actpills .more{color:var(--dim);font-size:10.5px;white-space:nowrap;
   padding-left:2px}
 /* the full set, at the head of an opened file */
@@ -25477,6 +25480,72 @@ function renderDone(j){
         border-color:${poolColor(lbl)}">${esc(lbl+cnt)}</span>`;
     return `<span class="pill ${stateClass(lbl)}">${esc(lbl+cnt)}</span>`;
   };
+  // WHAT HAPPENED, IN WORDS. Erik: "for the What happened column lets change
+  // it to color simple info txt - Replaced, Upgraded, Moved Disk, Failed -
+  // Replaced, Rule Check Fix or Update, and anything else".
+  //
+  // The bubbles are the vocabulary of the pipeline - pool names, job kinds,
+  // event names - and they belong in the drop-down where you are reading a
+  // file's story step by step. On the summary line the question is simpler:
+  // what happened to this file? So the line answers it in English.
+  //
+  // "and anything else" is taken literally. Every label the feed can produce
+  // is named here, counted off the database rather than guessed: the 22
+  // history events (done, skipped, content_changed, transcoded, moved_disk,
+  // renamed, upgraded, imported, subtitled, deleted, decode, name_repaired,
+  // listen, recycled, failed, checked, subs, deferred, requeued, transcode,
+  // cancelled, subread) and the job labels they are joined by (passthrough,
+  // encode, subocr, audio, handler, job). Anything that still slips through
+  // is Title Cased from its own name rather than shown raw.
+  const WORDS={
+    imported:        ['Imported',                  '#6fb0ff'],
+    replaced:        ['Replaced',                  '#39d3c3'],
+    upgraded:        ['Upgraded',                  '#39d3c3'],
+    checked:         ['Checked',                   'var(--ok)'],
+    decode:          ['Decode Checked',            '#e8a33d'],
+    listen:          ['Audio Heard',               '#e2b341'],
+    audio:           ['Audio Tag Fixed',           '#e2b341'],
+    subread:         ['Subtitles Read',            '#b48bf2'],
+    passthrough:     ['Remuxed',                   '#7fd18c'],
+    encode:          ['Re-encoded',                '#e0575b'],
+    transcoded:      ['Rewritten',                 '#7fd18c'],
+    transcode:       ['Rewritten',                 '#7fd18c'],
+    subocr:          ['Subtitles Read From Picture','#b48bf2'],
+    sub_ocr:         ['Subtitles Read From Picture','#b48bf2'],
+    subs:            ['Subtitles Updated',         '#6fb0ff'],
+    subtitled:       ['Subtitles Updated',         '#6fb0ff'],
+    requeued:        ['Rule Check Fix or Update',  '#e2b341'],
+    content_changed: ['Contents Changed',          '#9aa7b8'],
+    moved_disk:      ['Moved Disk',                '#9aa7b8'],
+    renamed:         ['Renamed',                   '#9aa7b8'],
+    name_repaired:   ['Name Repaired',             '#9aa7b8'],
+    skipped:         ['Nothing To Do',             '#9aa7b8'],
+    deferred:        ['Waiting Its Turn',          '#e2b341'],
+    blocked:         ['Blocked',                   '#e2b341'],
+    cancelled:       ['Cancelled',                 '#e2b341'],
+    failed:          ['Failed',                    'var(--bad)'],
+    error:           ['Failed',                    'var(--bad)'],
+    deleted:         ['Deleted',                   'var(--bad)'],
+    recycled:        ['Recycled',                  '#9aa7b8'],
+    done:            ['Done',                      'var(--ok)'],
+    job:             ['Worked On',                 '#9aa7b8'],
+    handler:         ['Worked On',                 '#9aa7b8'],
+    pool_map:        ['Worked On',                 '#9aa7b8'],
+  };
+  const TITLECASE=w=>String(w||'').replace(/_/g,' ')
+    .replace(/\b\w/g, c=>c.toUpperCase());
+  const BAD_WORD=new Set(['failed','error','cancelled','deleted']);
+  // A LABEL IS "head · tail", where the tail is either a pass number or the
+  // state the job ended in. A failure is the news whichever half carries it.
+  function phraseOf(lbl){
+    const bits=String(lbl).split(' \u00b7 ');
+    const head=bits[0], tail=bits.length>1 ? bits[bits.length-1] : '';
+    if(tail && BAD_WORD.has(tail)) return WORDS[tail] || ['Failed','var(--bad)'];
+    const w=WORDS[head] || [TITLECASE(head), '#9aa7b8'];
+    // "decode · pass 2" is the check AFTER the rewrite - worth saying, since
+    // it is the one that proves nuarr did not break the file.
+    return /^pass 2/i.test(tail) ? [w[0]+' Again', w[1]] : w;
+  }
   const fullTs=ts=> ts?new Date(ts*1000).toLocaleString(undefined,
     {month:'numeric',day:'numeric',hour:'numeric',minute:'2-digit'}):'';
 
@@ -25574,7 +25643,7 @@ function renderDone(j){
       +'<table class="fixed">'
       +'<tr><th>Title</th>'
       +'<th style="width:34%">What happened</th>'
-      +'<th class="num nb" style="width:52px" title="entries for this file">Times</th>'
+      +'<th class="num nb" style="width:66px" title="how many releases of this file have been through nuarr, and how much happened to them">Releases</th>'
       // Size gets breathing room and Last gets enough width for "just now":
       // at 150/74 with no gap the two ran together as "-10.2%just now".
       +'<th class="num nb" style="width:206px;padding-right:0"><span class="szc szh"><span>before</span><span></span><span>after</span><span>change</span></span></th>'
@@ -25631,6 +25700,32 @@ function renderDone(j){
       const _shown = _settled
         ? lbls.filter(([l])=>l.split(' \u00b7 ')[0]==='checked')
         : lbls.slice(0, PILL_MAX);
+      // FAILED - REPLACED IS ONE THING THAT HAPPENED, not two. Erik named it
+      // himself: a release that broke and was swapped out for another is a
+      // single sentence, and printing "Failed" beside "Replaced" leaves the
+      // reader to join them up.
+      const _heads=new Set(_shown.map(([l])=>{
+        const b=l.split(' \u00b7 ');
+        return (b.length>1 && BAD_WORD.has(b[b.length-1])) ? b[b.length-1] : b[0];
+      }));
+      const _hasBad=[..._heads].some(h=>BAD_WORD.has(h) && h!=='deleted');
+      const _hasNew=_heads.has('replaced') || _heads.has('upgraded');
+      let _words;
+      if(_hasBad && _hasNew){
+        _words=`<span style="color:var(--bad)">Failed</span>`
+              +`<span class="dim"> \u2014 </span>`
+              +`<span style="color:#39d3c3">Replaced</span>`;
+      }else{
+        // Deduplicated: two jobs of one kind are one thing that happened.
+        const seen=new Set(); const out=[];
+        for(const [l] of _shown){
+          const [txt,col]=phraseOf(l);
+          if(seen.has(txt)) continue;
+          seen.add(txt);
+          out.push(`<span style="color:${col}">${esc(txt)}</span>`);
+        }
+        _words=out.join('<span class="dim"> \u00b7 </span>');
+      }
       // EVERYTHING THE FILE WENT THROUGH, counted in one place - the pills
       // this row is not showing, plus every entry belonging to a release that
       // has since been replaced. Erik: "move the + number over to that
@@ -25644,7 +25739,7 @@ function renderDone(j){
             ? `${_earlier} entr${_earlier===1?'y':'ies'} against `
               + `${_gens.length-1} earlier release` + (_gens.length>2?'s':'')
             : '');
-      const pills=_shown.map(([l,n])=>pillFor(l,n)).join(' ');
+
       // Net size for the file: first job's before -> last job's after, so two
       // passes over the same file read as one honest total. When no job in
       // the window carried a delta (upgrades, imports, skips), fall back to
@@ -25681,19 +25776,20 @@ function renderDone(j){
       const _swapped=_cur ? (_cur.first||_cur.last||0) : 0;
       const head=`<tr class="actrow ${open?'rowopen':''}" onclick="actToggle(${gi})">
         <td class="wrap"><div class="ell" title="${esc(g.title)}"><span class="actcaret">${open?'▾':'▸'}</span><b>${esc(g.title)}</b></div></td>
-        <td><div class="actpills oneline">${pills}</div></td>
-        <td class="num dim nb">${g.entries.length}</td>
+        <td><div class="actwords oneline">${_words}</div></td>
+        <td class="num dim nb" title="${esc(
+            (_gens.length>1
+               ? `${_gens.length} releases of this file have been through nuarr`
+               : 'one release so far')
+            + (_swapped ? `; this one landed ${
+                 new Date(_swapped*1000).toLocaleString()}` : '')
+            + (_over ? ` \u2014 ${_overTip}` : ''))}"
+          >${_gens.length||1}${
+            _over?` <span class="more">+${_over}</span>`:''}</td>
         <td class="num dim nb" style="padding-right:0">${sz}</td>
         <td class="dim nb" style="padding-left:14px;white-space:nowrap"
-            title="${esc(_swapped
-              ? `this release landed ${new Date(_swapped*1000).toLocaleString()}`
-              + (_gens.length>1 ? ` - the ${_gens.length}${
-                  _gens.length===2?'nd':_gens.length===3?'rd':'th'} for this title`
-                 : ' - the only one so far')
-              : new Date(g.last*1000).toLocaleString())}"
-          >${ago(_swapped||g.last)}${
-            _over?` <span class="more" title="${esc(_overTip)}">+${_over}</span>`:''
-          }</td></tr>`;
+            title="${esc(new Date(g.last*1000).toLocaleString())}"
+          >${ago(g.last)}</td></tr>`;
       const row=(it,nested,gid,cur)=> it.ev ? evRow(it.ev,nested,gid,cur)
                                             : jobRow(it.job,nested,gid,cur);
       // `cur` marks the CURRENT release's rows: they carry data-gen so they
@@ -25813,7 +25909,7 @@ function renderDone(j){
     html='<div id="doneBox" class="scrollbox nohz" style="height:460px">'
       +'<table class="fixed">'
       +'<tr><th>Title</th><th style="width:34%">What happened</th>'
-      +'<th class="num nb" style="width:52px">Times</th>'
+      +'<th class="num nb" style="width:66px">Releases</th>'
       +'<th class="num nb" style="width:206px"></th>'
       +'<th class="nb" style="width:84px;padding-left:14px">Last</th></tr>'
       + Array.from({length:7},(_,i)=>
