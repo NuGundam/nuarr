@@ -14215,11 +14215,28 @@ tr.actsub.genhead .subgrid{border-top:1px dashed #2a3340;padding-top:6px}
    is the only clickable one, so it alone gets the pointer and the hover. */
 .actrow{cursor:pointer}
 .actrow:hover td{background:rgba(255,255,255,.035)}
-.actrow td{border-top:1px solid var(--line)}
+/* ONE LINE, CLOSED. Erik: "I think they should be all collapsed by default
+   and use a different method that is more efficient like in pic 4" - pic 4
+   being Audio User Input, whose rows are a dense 11.5px line each.
+   They WERE all collapsed; the row was simply 57px tall while closed, because
+   the pill strip wrapped to three lines and the title wrapped under it. Seventy
+   closed files came to 4,009px of scrolling, a hundred to 5,721px. Held to one
+   line - title ellipsised, pills clipped with a count for the rest - the same
+   hundred files are about 2,600px, and everything that was clipped is in the
+   drop-down, in flow order, the moment it is opened. */
+.actrow td{border-top:1px solid var(--line);font-size:11.5px;
+  padding-top:4px;padding-bottom:4px}
+.actrow td.wrap>div.ell{white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis}
 .actcaret{display:inline-block;width:14px;color:var(--dim);font-size:10px}
 /* flex on an inner div, NEVER on the td itself - display:flex takes a cell
    out of table flow and every column after it shifts */
 .actpills{display:flex;flex-wrap:wrap;gap:3px;align-items:center}
+.actpills.oneline{flex-wrap:nowrap;overflow:hidden}
+.actpills .more{color:var(--dim);font-size:10.5px;white-space:nowrap;
+  padding-left:2px}
+/* the full set, at the head of an opened file */
+tr.actsub.pillhead td{padding:6px 14px 6px 26px}
 /* detail rows sit visually INSIDE their file: inset, slightly sunken, and
    with their own grid so the outer table's column widths cannot squeeze them */
 .actsub td{background:rgba(255,255,255,.016);font-size:11.5px;border-top:none;
@@ -15806,10 +15823,20 @@ html.mobile #logsPane{height:auto;min-height:60vh}
                typed. -->
           <input id="doneQ" placeholder="search titles" style="width:300px"
                  oninput="actSearch()">
-          <select id="doneSize" onchange="actSize()" title="rows per page">
-            <option value="10">10</option>
-            <option value="50" selected>50</option>
-            <option value="100">100</option>
+          <!-- NOT "rows per page", WHICH IS WHY 100 WAS A SURPRISE.
+               50 IS the live feed - the newest ~60 jobs the two-second poll
+               already carries. Every other value LEAVES it and pages the
+               recorded history server-side, which is a different set of rows
+               about the same episodes: everything a title has ever been
+               through, not the last few hours of it.
+               Erik: "when I set view to 100 I get pic 1 pic 2 is the normal
+               view". They were both right; they were answering two different
+               questions under one label. Named, the label says which. -->
+          <select id="doneSize" onchange="actSize()"
+                  title="live = the newest jobs, updating as they finish. The others leave the live feed and page the whole recorded history, so many titles at a time - everything each one has ever been through, not just today.">
+            <option value="50" selected>live</option>
+            <option value="10">history · 10 titles</option>
+            <option value="100">history · 100 titles</option>
           </select>
           <select id="doneFilter" onchange="applyDoneFilter()">
             <option value="">everything</option>
@@ -24898,12 +24925,22 @@ function renderDone(j){
   // completion reads twice - once as the job, once as its own echo.
                          'transcode','passthrough','encode','decode','listen',
                          'subread','sub_ocr','subs','audio']);
-  const isEcho=e=>{
+  // TAKES THE JOB ROWS IT IS JUDGED AGAINST, because there are two feeds and
+  // both of them carry the echo. See the history branch below.
+  const echoOf=(e,rows)=>{
     if(!OUTCOME.has(e.event)) return false;
-    return all.some(r=>Math.abs((e.at||0)-(r.finished_at||0))<20 &&
-      ((e.path && r.path && e.path===r.path) ||
-       (e.label && r.title && e.label===r.title)));
+    return rows.some(r=>{
+      if(Math.abs((e.at||0)-(r.finished_at||0))>=20) return false;
+      // A FILE ID ON BOTH SIDES SETTLES IT. Two releases of one title can
+      // finish inside the same twenty seconds and the title alone cannot tell
+      // them apart; _finish writes the event with the job's own file id, so
+      // when both know it, that is the answer.
+      if(e.file_id && r.file_id) return e.file_id===r.file_id;
+      return (e.path && r.path && e.path===r.path) ||
+             (e.label && r.title && e.label===r.title);
+    });
   };
+  const isEcho=e=>echoOf(e, all);
   const events=(_histRows||[]).filter(e=>!isEcho(e)).slice().reverse();
 
   // Merged oldest -> newest: inside a file's drop-down the entries read as a
@@ -24913,10 +24950,44 @@ function renderDone(j){
   // carries the newest ~60 jobs and cannot answer "what happened in June".
   // The server hands back the same {ts, job} / {ts, ev} shape, so everything
   // below - grouping, pills, drop-downs, the size column - is unchanged.
-  let items = _actHist ? _actHist.items.slice().sort((x,y)=>x.ts-y.ts) : [
-    ...all.map(r=>({ts:r.finished_at||0, job:r})),
-    ...events.map(e=>({ts:e.at||0, ev:e})),
-  ].sort((x,y)=>x.ts-y.ts);
+  //
+  // AND THE HISTORY FEED HAS THE SAME ECHO, which nothing was dropping.
+  //
+  // Erik: "when I set view to 100 I get pic 1 pic 2 is the normal view". The
+  // two views disagreed about the same episodes and this is half the reason -
+  // the live half filtered the echo out (the line above, written when the
+  // feeds were merged) and the server-paged half never did, so every finished
+  // job in history mode was listed twice: once as the job row, once as the
+  // history row _finish wrote beside it.
+  //
+  // Measured on page one: 586 jobs and 765 events, of which 562 events echo a
+  // job - 42% of every row on the page. Per title it is exact rather than
+  // approximate: "Always a Catch! - S01E12" had 14 jobs, 18 events and 14
+  // echoes, and the pairs read identically, to the second -
+  //
+  //     20:47:58  JOB  decode  #55794  pass 1 - decodes cleanly at both ends
+  //     20:47:58  ev   decode  #55794  pass 1 - decodes cleanly at both ends
+  //
+  // The four events that were not echoes - two 'checked', two 'skipped' - are
+  // rows no job ever wrote, and they stay.
+  let items;
+  if(_actHist){
+    const byT=new Map();
+    for(const x of _actHist.items){
+      if(!x.job) continue;
+      const k=x.job.title||'';
+      let a=byT.get(k); if(!a){ a=[]; byT.set(k,a); }
+      a.push(x.job);
+    }
+    items=_actHist.items
+      .filter(x=>!(x.ev && echoOf(x.ev, byT.get(x.ev.label||'')||[])))
+      .slice().sort((x,y)=>x.ts-y.ts);
+  }else{
+    items=[
+      ...all.map(r=>({ts:r.finished_at||0, job:r})),
+      ...events.map(e=>({ts:e.at||0, ev:e})),
+    ].sort((x,y)=>x.ts-y.ts);
+  }
 
   // AN UPGRADE READS AS AN UPGRADE. New events arrive named 'upgraded' from
   // the webhook now, but the history keeps months of older rows where the
@@ -25284,9 +25355,17 @@ function renderDone(j){
       +'<th class="nb" style="width:84px;padding-left:14px">Last</th></tr>';
     html+=glist.map((g,gi)=>{
       const open=_actOpen.has(g.title);
-      const pills=[...g.labels.entries()]
-        .sort((a,b)=>flowRank(a[0])-flowRank(b[0]))
-        .map(([l,n])=>pillFor(l,n)).join(' ');
+      // THE WHOLE SET IN FLOW ORDER, then as much of it as one line holds.
+      // The order is precedence.ORDER (see FLOW) either way, so the strip on
+      // the closed row is the front of the same sentence the drop-down opens
+      // with - never a different selection.
+      const lbls=[...g.labels.entries()]
+        .sort((a,b)=>flowRank(a[0])-flowRank(b[0]));
+      const pillsAll=lbls.map(([l,n])=>pillFor(l,n)).join(' ');
+      const PILL_MAX=5;
+      const pills=lbls.slice(0,PILL_MAX).map(([l,n])=>pillFor(l,n)).join(' ')
+        +(lbls.length>PILL_MAX
+            ? `<span class="more">+${lbls.length-PILL_MAX}</span>` : '');
       // Net size for the file: first job's before -> last job's after, so two
       // passes over the same file read as one honest total. When no job in
       // the window carried a delta (upgrades, imports, skips), fall back to
@@ -25316,8 +25395,8 @@ function renderDone(j){
         }
       }
       const head=`<tr class="actrow ${open?'rowopen':''}" onclick="actToggle(${gi})">
-        <td class="wrap"><div><span class="actcaret">${open?'▾':'▸'}</span><b>${esc(g.title)}</b></div></td>
-        <td><div class="actpills">${pills}</div></td>
+        <td class="wrap"><div class="ell" title="${esc(g.title)}"><span class="actcaret">${open?'▾':'▸'}</span><b>${esc(g.title)}</b></div></td>
+        <td><div class="actpills oneline">${pills}</div></td>
         <td class="num dim nb">${g.entries.length}</td>
         <td class="num dim nb" style="padding-right:0">${sz}</td>
         <td class="dim nb" style="padding-left:14px;white-space:nowrap"
@@ -25356,8 +25435,14 @@ function renderDone(j){
           <span></span><span></span></div></td></tr>`
           + (isOpen?body(gg, gg.fid):'');
       };
+      // WHAT THE CLOSED LINE COULD NOT FIT, first thing inside. A file with
+      // nine kinds of work against it shows five on the line and all nine
+      // here, in the same order, before its story starts.
+      const pillHead=(lbls.length>PILL_MAX)
+        ? `<tr class="actsub pillhead"><td colspan="5">
+             <div class="actpills">${pillsAll}</div></td></tr>` : '';
       return head+(open
-        ? (gens.length>1
+        ? pillHead+(gens.length>1
             ? gens.slice(0,-1).map(genRow).join('') + body(gens[gens.length-1], 0)
             : g.entries.filter(it=>!it.under).map(it=>
                 row(it,false)+(it.facts||[]).map(f=>row(f,true)).join('')).join(''))
@@ -38623,7 +38708,23 @@ function audPaint(){
   const el=document.getElementById('audTop'); if(!el||!_aud) return;
   // HOLDS STILL UNDER THE POINTER, and does not repaint over a question it is
   // waiting for an answer to. Both rules the subtitle page had to learn.
-  if(panelScrolled('audTop')) return;
+  // NOT panelScrolled('audTop'), WHICH FROZE THE WHOLE PAGE.
+  //
+  // Erik: "the Audio User Input panel is not in sync". audPaint owns every
+  // number on this page - tracks heard, to go, corrected, on the queue, the
+  // switchboard, the list - and it was returning here the moment ANY scroll
+  // box inside #audTop had moved. Audio User Input is slotted into #audTop
+  // (audSlot-tag), and measured on the live page its list is the ONLY scroll
+  // box in there: so the guard read "somebody scrolled the questions" and
+  // meant "stop updating the entire page". Checked by bumping listen.left by
+  // 999 with the list scrolled 25px: audPaint ran, returned, and the number
+  // never reached the screen - and would not until the list was scrolled back
+  // to the top.
+  //
+  // The guard exists so a list does not jump under the pointer, and that is
+  // still worth having - so audAskPaint keeps its OWN panelScrolled check,
+  // which covers exactly the list being read, and the scroll positions are
+  // carried across the re-slot below. The numbers keep moving either way.
   if(askOpen('audStatus') || askOpen('audTop') || askOpen('alAskPanel')) return;
   const top=document.getElementById('audStatus');
   if(top){
@@ -38646,10 +38747,18 @@ function audPaint(){
   // deleted along with its selection and every listener on it. Home first.
   const home=document.getElementById('alHome');
   const panes={};
+  // WHERE YOU HAD SCROLLED TO, CARRIED ACROSS THE MOVE. Detaching an element
+  // and putting it back resets its scroll boxes to the top, which is why this
+  // repaint used to be forbidden while one was scrolled at all. Noted here,
+  // put back after the re-slot.
+  const keepTop=new Map();
   for(const k of ['tag','coverage','ledger']){
     const p=document.querySelector('.audd[data-d="'+k+'"]');
     if(!p) continue;
     panes[k]=p;
+    p.querySelectorAll('.rowbox,.scrollbox').forEach((b,i)=>{
+      if(b.scrollTop) keepTop.set(k+':'+i, b.scrollTop);
+    });
     if(home && p.parentNode!==home) home.appendChild(p);
   }
   if(html!==_audKey){ _audKey=html; el.innerHTML=html; }
@@ -38664,6 +38773,10 @@ function audPaint(){
   for(const k in panes){
     const slot=document.getElementById('audSlot-'+k);
     if(slot) slot.appendChild(panes[k]);
+    panes[k].querySelectorAll('.rowbox,.scrollbox').forEach((b,i)=>{
+      const v=keepTop.get(k+':'+i);
+      if(v) b.scrollTop=v;
+    });
   }
 }
 
