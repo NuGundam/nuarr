@@ -14039,15 +14039,19 @@ button[disabled]{opacity:.5;cursor:default}
 /* A CHECK'S OWN NAME, IN ITS OWN COLOUR - the same one the worker wears in
    the queue, on its card and in Processing System, so the pill and the bubble
    for one system are never two different colours. See evName(). */
-.e-decode{color:#e8a33d;border-color:#4a3512}
-.e-listen{color:#e5d352;border-color:#4a4512}
-.e-audio{color:#39d3c3;border-color:#12443f}
-.e-subread{color:#b48bf2;border-color:#3c2a5a}
-.e-sub_ocr{color:#b48bf2;border-color:#3c2a5a}
-.e-subs{color:#b48bf2;border-color:#3c2a5a}
-.e-transcode{color:#58a6ff;border-color:#1f3a5f}
-.e-transcoded{color:#58a6ff;border-color:#1f3a5f}
-.e-passthrough{color:#58a6ff;border-color:#1f3a5f}
+.e-decode{color:#e8a33d;border-color:#4a3512}        /* poolColor: amber  */
+.e-listen{color:#e5d352;border-color:#4a4512}        /* poolColor: yellow */
+.e-audio{color:#39d3c3;border-color:#12443f}         /* poolColor: teal   */
+.e-subread{color:#c9d1d9;border-color:#3a4250}       /* poolColor: grey   */
+.e-sub_ocr{color:#b48bf2;border-color:#3c2a5a}       /* poolColor: purple */
+.e-subs{color:#f778ba;border-color:#5a2340}          /* poolColor: pink   */
+.e-passthrough{color:var(--ok);border-color:#1f4426} /* poolColor: green  */
+.e-encode{color:var(--acc);border-color:#1f3a5f}     /* poolColor: blue   */
+/* A rewrite whose shape nobody has classified - see REWRITE_SHAPE. Green,
+   because that is what poolColor() falls through to, and because the vast
+   majority of rewrites are stream copies. */
+.e-transcode{color:var(--ok);border-color:#1f4426}
+.e-transcoded{color:var(--ok);border-color:#1f4426}
 .e-failed{color:#f85149;border-color:#5a2225}
 /* MISSING UNTIL NOW. `error` is the state the Errors tile filters on, so it is
    the one state guaranteed to appear in that list - and it was the one with no
@@ -14071,6 +14075,19 @@ tr.actsub.nested .subgrid{margin-left:34px;border-left:2px solid #2a3340;
   padding-left:10px}
 /* AN EARLIER RELEASE, folded. One line saying what it was, its own pills, and
    a caret - the current release is what the group opens on. */
+@keyframes genRowIn{from{opacity:0;transform:translateY(-6px)}
+                    to{opacity:1;transform:none}}
+@keyframes genRowOut{from{opacity:1;transform:none}
+                     to{opacity:0;transform:translateY(-6px)}}
+/* THE INNER GRID, NOT THE ROW. A transform on a <tr> is ignored or clips
+   oddly depending on the engine; the div inside it animates reliably. */
+tr.genbody>td>.subgrid{animation:genRowIn .19s ease-out both}
+tr.genbody.genout>td>.subgrid{animation:genRowOut .16s ease-in both}
+/* THE GLYPH ALREADY TURNS - the caret is written as U+25B8 or U+25BE by the
+   renderer, so rotating it as well pointed an already-downward arrow sideways.
+   It gets a fade instead, which reads as movement without fighting the text. */
+tr.actsub.genhead .actcaret{display:inline-block;transition:opacity .18s ease}
+tr.actsub.genhead:hover .actcaret{opacity:.65}
 tr.actsub.genhead{cursor:pointer}
 tr.actsub.genhead:hover{background:#171d26}
 tr.actsub.genhead .subgrid{border-top:1px dashed #2a3340;padding-top:6px}
@@ -24689,10 +24706,29 @@ let _actHist=null, _actQ='', _actPage=1, _actSize=50, _actQT=null;
 // two groups' old releases apart. The CURRENT release is always open when its
 // title is; only the earlier ones have a fold of their own.
 let _actGenOpen=new Set();
+let _actGenClosing=null;
 function actToggleGen(fid){
   const k=String(fid);
-  if(_actGenOpen.has(k)) _actGenOpen.delete(k); else _actGenOpen.add(k);
-  lastListSig=null; renderDone(lastJobs);
+  if(_actGenClosing===k) return;            // already on its way out
+  if(!_actGenOpen.has(k)){
+    _actGenOpen.add(k); lastListSig=null; renderDone(lastJobs);
+    return;
+  }
+  // CLOSING TAKES THE ROWS WITH IT, so they have to still be on the page while
+  // they leave. Mark them, let the animation run, then forget the generation
+  // and re-render. The poll cannot interrupt: the list signature has not
+  // changed yet, so renderDone returns early until this does the forgetting.
+  const rows=document.querySelectorAll('tr.genbody[data-gen="'+k+'"]');
+  if(!rows.length){
+    _actGenOpen.delete(k); lastListSig=null; renderDone(lastJobs);
+    return;
+  }
+  _actGenClosing=k;
+  rows.forEach(r=>r.classList.add('genout'));
+  setTimeout(()=>{
+    _actGenClosing=null; _actGenOpen.delete(k);
+    lastListSig=null; renderDone(lastJobs);
+  }, 165);
 }
 
 async function actLoad(){
@@ -25122,11 +25158,12 @@ function renderDone(j){
     }
     return `<span class="szc"><span></span><span></span><span class="dim">${cur?gb(cur):'—'}</span><span></span></span>`;
   }
-  const evRow=(e,nested)=>{
+  const evRow=(e,nested,gid)=>{
     // The CLASS comes from the kind and the TEXT from the label: a pass is a
     // suffix on the name, not a different kind, and must not lose its colour.
     const ts=e.at||0, nm=evName(e), lb=evLbl(e);
-    return `<tr class="actsub ${nested?'nested':''}"><td colspan="5"><div class="subgrid">
+    return `<tr class="actsub ${nested?'nested':''} ${gid?'genbody':''}"
+      ${gid?`data-gen="${gid}"`:''}><td colspan="5"><div class="subgrid">
       <span class="dim when nb">${esc(fullTs(ts))}</span>
       <span class="nb"><span class="pill ${stateClass(nm)}">${esc(lb)}</span></span>
       <div class="wrap">${e.detail
@@ -25137,14 +25174,15 @@ function renderDone(j){
         return u?szCells(u.before,u.after):szCells(0,0,e.size); })()}</span>
       <span></span></div></td></tr>`;
   };
-  const jobRow=(r,nested)=>{
+  const jobRow=(r,nested,gid)=>{
     const b=r.size_before||0, a=r.size_after||0;
     // A skipped or cancelled job records no before/after on purpose - nothing
     // was transcoded - but "—" where a size belongs reads as missing data.
     // The file's current size (joined in by the API) is the honest value.
     const txt=szCells(b,a,r.file_size);
     const isOpen=openLogId && openLogId===r.job_id;
-    const main=`<tr class="actsub ${isOpen?'rowopen':''} ${nested?'nested':''}"><td colspan="5"><div class="subgrid">
+    const main=`<tr class="actsub ${isOpen?'rowopen':''} ${nested?'nested':''} ${gid?'genbody':''}"
+      ${gid?`data-gen="${gid}"`:''}><td colspan="5"><div class="subgrid">
       <span class="dim when nb">${esc(fullTs(r.finished_at))}</span>
       <span class="nb">${
         r.state==='done'
@@ -25230,9 +25268,13 @@ function renderDone(j){
         <td class="dim nb" style="padding-left:14px;white-space:nowrap"
             title="${esc(new Date(g.last*1000).toLocaleString())}"
           >${ago(g.last)}</td></tr>`;
-      const row=(it,nested)=> it.ev ? evRow(it.ev,nested) : jobRow(it.job,nested);
-      const body=gg=> gg.entries.filter(it=>!it.under).map(it=>
-        row(it,false)+(it.facts||[]).map(f=>row(f,true)).join('')).join('');
+      const row=(it,nested,gid)=> it.ev ? evRow(it.ev,nested,gid)
+                                        : jobRow(it.job,nested,gid);
+      // `gid` is only set for an EARLIER release. The current one is not
+      // animated: it is already there when the group opens, and playing it in
+      // on every poll would make the panel twitch.
+      const body=(gg,gid)=> gg.entries.filter(it=>!it.under).map(it=>
+        row(it,false,gid)+(it.facts||[]).map(f=>row(f,true,gid)).join('')).join('');
       // THE CURRENT RELEASE IS THE ONE YOU OPENED THE GROUP TO SEE. The
       // earlier ones get a line each saying what they were and when, and open
       // on their own click.
@@ -25257,11 +25299,11 @@ function renderDone(j){
           <div class="wrap"><div class="dim mono" style="font-size:11px">${esc(what||'\u2014')}</div>
             <div class="actpills" style="margin-top:3px">${pills}</div></div>
           <span></span><span></span></div></td></tr>`
-          + (isOpen?body(gg):'');
+          + (isOpen?body(gg, gg.fid):'');
       };
       return head+(open
         ? (gens.length>1
-            ? gens.slice(0,-1).map(genRow).join('') + body(gens[gens.length-1])
+            ? gens.slice(0,-1).map(genRow).join('') + body(gens[gens.length-1], 0)
             : g.entries.filter(it=>!it.under).map(it=>
                 row(it,false)+(it.facts||[]).map(f=>row(f,true)).join('')).join(''))
         : '');
