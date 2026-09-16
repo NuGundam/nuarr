@@ -32152,15 +32152,43 @@ async function loadArrHealth(force){
                }>${esc(h.source||h.type||'')}</b> — ${esc(h.message||'')}
              ${h.url?` <a href="${esc(h.url)}" target="_blank"
                rel="noopener noreferrer">why</a>`:''}</span></div>`;
-    const list = all.length
-      ? all.slice().sort((x,y)=>(x.muted?1:0)-(y.muted?1:0)).map(one).join('')
+    // The ones switched off that this arr is not reporting right now. Shown
+    // with the message they had when they were silenced replaced by why they
+    // have no message: not an error, just not firing.
+    const here=new Set(all.map(h=>`${h.source||''}\u0001${h.type||''}`));
+    const gone=(d.muted||[]).filter(k=>k[0]===a.arr
+        && !here.has(`${k[1]||''}\u0001${k[2]||''}`)
+        && !(k[1]==='nuarr' && k[2]==='Unreachable'))
+      .map(k=>({source:k[1], type:k[2], muted:true, level:'warn',
+                message:'not being reported right now', url:''}));
+    const list = (all.length||gone.length)
+      ? all.slice().sort((x,y)=>(x.muted?1:0)-(y.muted?1:0))
+           .concat(gone).map(one).join('')
       : (a.ok?'<div class="dim" style="font-size:11px;margin-top:3px">'
               +'nothing to report</div>':'');
     return `<div style="border:1px solid var(--line);border-radius:8px;
               padding:9px 12px;margin-bottom:8px">
         <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">${head}</div>
         ${list}</div>`;
-  }).join('');
+  }).join('') + (()=>{
+    // An arr that has been removed or renamed leaves its switched-off checks
+    // with no card to sit on. One line each, so the count in the header can
+    // always be accounted for and nothing is stuck off with no way back.
+    const names=new Set(rows.map(a=>a.arr));
+    const orphan=(d.muted||[]).filter(k=>!names.has(k[0]));
+    if(!orphan.length) return '';
+    return `<div class="dim" style="font-size:11px;border:1px solid var(--line);
+        border-radius:8px;padding:9px 12px;margin-bottom:8px;opacity:.75">
+        <b>switched off on an arr that is no longer configured</b>
+        ${orphan.map(k=>`<div style="margin-top:3px;display:flex;gap:7px;
+            align-items:baseline">
+            <button class="ahsw off" title="count this again"
+              onclick="arrMute('${jsq(k[0])}','${jsq(k[2]||'')}','${
+                jsq(k[1]||'')}',false)">off</button>
+            <span>${esc(k[0])} — <b style="text-decoration:line-through"
+              >${esc(k[1]||k[2]||'')}</b></span></div>`).join('')}
+      </div>`;
+  })();
 }
 
 async function arrMute(arr, type, source, off){
