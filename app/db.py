@@ -596,6 +596,25 @@ def init_db() -> None:
         # History rows for pool-wide work (pool_map, repairs) have no file to
         # join a title from, so they rendered as "(untitled)". Carry the name
         # on the event itself.
+        # WHAT THE ARR THOUGHT THIS RELEASE WAS WORTH.
+        #
+        # Erik: "can we actually show if the files have been upgraded using the
+        # arrs custom score number". Both arrs carry it on the file record they
+        # already hand over - /episodefile and /moviefile return
+        # customFormatScore and the named customFormats beside quality and
+        # releaseGroup - and nuarr was reading that record for its quality and
+        # languages and dropping the rest. Measured live: Sonarr 4,400 for
+        # ['1080p WEB-DL', '1080p WEB-DL (Efficient)', 'Anime Dual Audio',
+        # 'Anime Web Tier 03']; Radarr 864,600 for a Bluray-1080p grab.
+        #
+        # Stored per FILE rather than per title, because a file row is one
+        # release: an upgrade makes a new row, so the old row keeps the old
+        # score and the two can be subtracted.
+        fcols = {r["name"] for r in cur.execute("PRAGMA table_info(files)")}
+        for col, decl in (("cf_score", "INTEGER"), ("cf_names", "TEXT"),
+                          ("release_group", "TEXT")):
+            if col not in fcols:
+                cur.execute(f"ALTER TABLE files ADD COLUMN {col} {decl}")
         hcols = {r["name"] for r in cur.execute("PRAGMA table_info(history)")}
         if "label" not in hcols:
             cur.execute("ALTER TABLE history ADD COLUMN label TEXT")

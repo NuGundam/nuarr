@@ -725,6 +725,10 @@ async def _startup() -> None:
         from . import drivepool
         drivepool.init()
         asyncio.create_task(drivepool.watch())
+        # THE RELEASE SCORES FOR EVERYTHING THAT LANDED BEFORE NUARR ASKED.
+        # Drains itself and then idles - see webhooks.backfill_scores.
+        from . import webhooks as _wh
+        asyncio.create_task(_wh.backfill_scores())
         # Commits land on the emptiest free disk - the chooser hooks into
         # fileops so every commit path gets it.
         from . import placement
@@ -9252,8 +9256,12 @@ def api_history(limit: int = Query(100, le=1000), event: str | None = None):
     # f.size rides along so the Activity panel can show a file's current size
     # on rows that never ran a job - an upgrade or import has no
     # before/after pair, but the file it left behind has a size right now.
+    # cf_score rides along too: a release header wants to say what the arr
+    # thought this one was worth, and the history row is where the feed learns
+    # a release exists at all. See files.cf_score in db.py.
     sql = ("SELECT h.id,h.file_id,h.event,h.detail,h.at,h.label,f.title,"
-           "f.season,f.episode,f.path,f.size FROM history h "
+           "f.season,f.episode,f.path,f.size,f.cf_score,f.cf_names,"
+           "f.release_group,f.state_reason FROM history h "
            "LEFT JOIN files f ON f.id=h.file_id")
     params: tuple = ()
     if event:
@@ -10747,9 +10755,12 @@ def api_activity(q: str = "", page: int = 1, page_size: int = 50):
             d["file_size"] = d.get("size_after") or d.get("size_before") or 0
             items.append({"ts": d.get("finished_at") or 0, "job": d})
         for r in _rows(
-                f"SELECT * FROM (SELECT id, file_id, event, detail, at, label, "
-                f"       ROW_NUMBER() OVER (PARTITION BY label "
-                f"           ORDER BY at DESC) rn FROM history "
+                f"SELECT * FROM (SELECT h.id, h.file_id, h.event, h.detail, "
+                f"       h.at, h.label, f.cf_score, f.cf_names, "
+                f"       f.release_group, f.state_reason, "
+                f"       ROW_NUMBER() OVER (PARTITION BY h.label "
+                f"           ORDER BY h.at DESC) rn FROM history h "
+                f"  LEFT JOIN files f ON f.id = h.file_id "
                 f" WHERE {cond_h}) "
                 f" WHERE rn <= 60", tuple(named)):
             d = dict(r)
@@ -25319,8 +25330,14 @@ function renderDone(j){
       const fid=(it.job?it.job.file_id:it.ev.file_id);
       const k=(fid==null?0:fid);
       let gg=gens.get(k);
-      if(!gg){ gg={fid:k, entries:[], last:0, first:0, labels:new Map()}; gens.set(k,gg); }
+      if(!gg){ gg={fid:k, entries:[], last:0, first:0, labels:new Map(),
+                   score:null, formats:'', group:''}; gens.set(k,gg); }
       gg.entries.push(it); gg.last=Math.max(gg.last, it.ts||0);
+      // WHAT THE ARR SCORED THIS RELEASE. Every row of a generation carries
+      // its file's score, so the first one that has it settles it.
+      if(gg.score==null && it.ev && it.ev.cf_score!=null) gg.score=it.ev.cf_score;
+      if(!gg.formats && it.ev && it.ev.cf_names) gg.formats=it.ev.cf_names;
+      if(!gg.group && it.ev && it.ev.release_group) gg.group=it.ev.release_group;
       // WHEN IT LANDED. The header shows the first moment of the release,
       // because that is the date that tells two releases apart; "last" is
       // still what orders them.
@@ -25417,11 +25434,14 @@ function renderDone(j){
     if(head==='decode' && /pass 2/.test(lbl)) i=FLOW.indexOf('transcoded')+0.5;
     return i;
   };
-  // A COUNT ONLY WHERE IT MEANS SOMETHING. "upgraded x2" says two releases
-  // came through this title, which is a fact about the title. "decode x4"
-  // only ever said "this file has been round more than once", which the
-  // upgrade count already says, and it said it four times over.
-  const COUNTED=new Set(['upgraded']);
+  // NO COUNT ON ANY PILL. It was kept on `upgraded` alone, as the one place
+  // where "x2" said something a reader wanted - two releases came through
+  // this title. Erik: "remove the x2 from upgrade and just use the + XX at
+  // the end of the bubble row to show the changes the file went through".
+  // The release headers number themselves now ("earlier release - 1 of 3"),
+  // so the count on the pill was saying a third time what the row and the
+  // headers already say twice.
+  const COUNTED=new Set();
   const pillFor=(lbl,n)=>{
     const cnt=(n>1 && COUNTED.has(String(lbl).split(' \u00b7 ')[0]))
       ? ` ×${n}` : '';
@@ -25547,17 +25567,43 @@ function renderDone(j){
       +'<th class="nb" style="width:84px;padding-left:14px">Last</th></tr>';
     html+=glist.map((g,gi)=>{
       const open=_actOpen.has(g.title);
-      // THE WHOLE SET IN FLOW ORDER, then as much of it as one line holds.
-      // The order is precedence.ORDER (see FLOW) either way, so the strip on
-      // the closed row is the front of the same sentence the drop-down opens
-      // with - never a different selection.
-      const lbls=[...g.labels.entries()]
+      // THE CURRENT RELEASE'S PILLS, AND NOTHING ELSE'S.
+      //
+      // Erik: "only show the current release bubbles on the main row as that
+      // only matters in the end if the file is good". The row was the union of
+      // every generation, so a title upgraded twice wore the marks of two
+      // files that no longer exist - a `failed` from a release the arr had
+      // already thrown away read as a present-tense problem.
+      //
+      // g.gens is already built - one entry per files row, oldest first - so
+      // the current release is simply the last of them.
+      const _gens=g.gens||[];
+      const _cur=_gens.length ? _gens[_gens.length-1] : null;
+      const lbls=[...((_cur?_cur.labels:g.labels)||new Map()).entries()]
         .sort((a,b)=>flowRank(a[0])-flowRank(b[0]));
       const pillsAll=lbls.map(([l,n])=>pillFor(l,n)).join(' ');
       const PILL_MAX=5;
+      // AND THE +N IS EVERYTHING THE FILE WENT THROUGH, not just the pills
+      // that would not fit. Erik: "use the + XX at the end of the bubble row
+      // to show the changes the file went through". So it counts the steps
+      // behind this row - the current release's own overflow, plus every
+      // entry belonging to a release that has since been replaced - and says
+      // so on hover.
+      const _earlier=_gens.length>1
+        ? _gens.slice(0,-1).reduce((n,gg)=>n+gg.entries.length,0) : 0;
+      const _over=Math.max(0, lbls.length-PILL_MAX)+_earlier;
       const pills=lbls.slice(0,PILL_MAX).map(([l,n])=>pillFor(l,n)).join(' ')
-        +(lbls.length>PILL_MAX
-            ? `<span class="more">+${lbls.length-PILL_MAX}</span>` : '');
+        +(_over
+            ? `<span class="more" title="${esc(
+                 (lbls.length>PILL_MAX
+                    ? `${lbls.length-PILL_MAX} more kind(s) of work on this release`
+                    : '')
+                 + (lbls.length>PILL_MAX && _earlier ? ', and ' : '')
+                 + (_earlier
+                    ? `${_earlier} entr${_earlier===1?'y':'ies'} against `
+                      + `${_gens.length-1} earlier release`
+                      + (_gens.length>2?'s':'')
+                    : ''))}">+${_over}</span>` : '');
       // Net size for the file: first job's before -> last job's after, so two
       // passes over the same file read as one honest total. When no job in
       // the window carried a delta (upgrades, imports, skips), fall back to
@@ -25621,6 +25667,35 @@ function renderDone(j){
                            : _actGenOpen.has(String(gg.fid));
         const nth = arr.length>1 ? ` \u00b7 ${gi2+1} of ${arr.length}` : '';
         const word = cur ? 'current release' : 'earlier release';
+        // WHY THIS RELEASE STOPPED BEING THE ONE, in the arrs' own terms.
+        //
+        // Erik: "can we actually show if the files have been upgraded using
+        // the arrs custom score number and or just been replaced because of
+        // file error and blocklisted". Two different things wearing one word.
+        // A real upgrade is the arr preferring a higher-scoring release; a
+        // rejection is nuarr finding the file broken, blocklisting it and
+        // asking for another - refetch.py writes that into the history row as
+        // "nuarr rejected this release - <why>", which is the only place the
+        // difference was recorded.
+        const rej=gg.entries.find(it=>it.ev
+              && /nuarr rejected this release/i.test(it.ev.detail||''));
+        const prev=gi2>0 ? arr[gi2-1] : null;
+        const dScore=(gg.score!=null && prev && prev.score!=null)
+                       ? gg.score-prev.score : null;
+        const why = rej
+          ? `<span style="color:var(--bad)">rejected by nuarr</span>`
+            + `<span class="dim"> \u2014 ${esc(String(rej.ev.detail||'')
+                 .replace(/^nuarr rejected this release\s*[\u2014-]*\s*/i,'')
+                 .split(':')[0].slice(0,70))}, blocklisted and re-searched</span>`
+          : gg.score!=null
+          ? `<span class="dim" title="${esc(gg.formats
+                 ? 'custom formats: '+gg.formats : 'the arr\'s custom format score')}"
+               >score <b style="color:var(--fg)">${fmt(gg.score)}</b>${
+               dScore!=null && dScore!==0
+                 ? ` <span style="color:${dScore>0?'var(--ok)':'var(--warn)'}">${
+                     dScore>0?'+':''}${fmt(dScore)}</span>` : ''}${
+               gg.group?` \u00b7 ${esc(gg.group)}`:''}</span>`
+          : '';
         const up=gg.entries.find(it=>it.ev && evName(it.ev)==='upgraded'
                                   && /->|\u2192/.test(it.ev.detail||''));
         const imp=gg.entries.find(it=>it.ev && evName(it.ev)==='imported');
@@ -25654,7 +25729,9 @@ function renderDone(j){
           <span class="dim when nb">${esc(fullTs(gg.first||gg.last))}</span>
           <span class="nb"><span class="actcaret">${isOpen?'\u25be':'\u25b8'}</span>
             <span class="${cur?'':'dim'}" style="font-size:10.5px${cur?';color:var(--acc)':''}">${word}${esc(nth)}</span></span>
-          <div class="wrap"><div class="dim mono ell" style="font-size:11px">${esc(what||'\u2014')}</div>
+          <div class="wrap"><div class="ell" style="font-size:11px"><span
+              class="dim mono">${esc(what||'\u2014')}</span>${
+              why?` <span style="font-size:10.5px">\u00b7 ${why}</span>`:''}</div>
             <div class="actpills oneline" style="margin-top:3px">${pills}</div></div>
           <span></span><span></span></div></td></tr>`
           + genPills + (isOpen?body(gg, gg.fid, cur):'');

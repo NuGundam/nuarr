@@ -235,6 +235,109 @@ def _lang_note(before: list[str], after: list[str]) -> str:
     return note
 
 
+# --------------------------------------------------- the scores, in bulk ----
+# WHAT THE ARRS ALREADY SCORED, FOR THE FILES THAT LANDED BEFORE NUARR ASKED.
+#
+# _sync_file records customFormatScore from now on, but 39,876 files arrived
+# before it did and their release headers would say nothing. Both arrs answer
+# per PARENT - /episodefile?seriesId=N and /moviefile?movieId=N return every
+# file under it with its score - so the whole library is 1,109 Sonarr calls and
+# a couple of thousand Radarr ones rather than 39,876.
+#
+# Paced rather than rushed: a handful of parents a minute, only for files that
+# still have no score, so it drains in the background and stops on its own. A
+# file whose score changes later is re-read by _sync_file anyway.
+SCORE_PARENTS_PER_PASS = 6
+SCORE_POLL_S = 45.0
+
+
+async def _score_one_parent(cfg, parent_id: int) -> int:
+    """Fill in every unscored file under one series or movie. -> how many."""
+    from .arr import shared_client
+    c = shared_client(cfg)
+    ep = ("/episodefile?seriesId=" if cfg.kind == "sonarr"
+          else "/moviefile?movieId=")
+    try:
+        recs = await c._get(f"{ep}{int(parent_id)}")
+    except Exception:                                        # noqa: BLE001
+        return 0
+    if not isinstance(recs, list):
+        return 0
+    n = 0
+    with cursor() as cur:
+        for rec in recs:
+            if not isinstance(rec, dict) or not rec.get("id"):
+                continue
+            try:
+                score = int(rec.get("customFormatScore"))
+            except (TypeError, ValueError):
+                score = None
+            names = ", ".join(
+                str(x.get("name")) for x in (rec.get("customFormats") or [])
+                if isinstance(x, dict) and x.get("name"))[:300] or None
+            grp = str(rec.get("releaseGroup") or "")[:80] or None
+            if score is None and names is None and grp is None:
+                continue
+            cur.execute(
+                "UPDATE files SET cf_score=?, cf_names=?, release_group=? "
+                " WHERE arr_name=? AND arr_file_id=? AND cf_score IS NULL",
+                (score, names, grp, cfg.name, int(rec["id"])))
+            n += cur.rowcount or 0
+    return n
+
+
+async def backfill_scores() -> None:
+    """Drain the unscored files, a few parents at a time, then stop."""
+    from . import schedules
+    schedules.register(
+        "arrscores", "Release scores", "Integrations", SCORE_POLL_S,
+        what="Asks the arrs what custom format score each release was given, "
+             "for files that landed before nuarr started recording it. Runs "
+             "until nothing is left unscored and then does nothing.")
+    await asyncio.sleep(90)
+    while True:
+        try:
+            schedules.beat("arrscores")
+            todo: list[tuple] = []
+            with cursor() as cur:
+                todo = [(r["arr_name"], r["arr_parent_id"]) for r in cur.execute(
+                    "SELECT arr_name, arr_parent_id FROM files "
+                    " WHERE cf_score IS NULL AND arr_file_id IS NOT NULL "
+                    "   AND arr_parent_id IS NOT NULL "
+                    "   AND state NOT IN ('deleted','duplicate') "
+                    " GROUP BY arr_name, arr_parent_id LIMIT ?",
+                    (SCORE_PARENTS_PER_PASS,))]
+            if not todo:
+                schedules.REG["arrscores"]["last_result"] = "every release scored"
+                await asyncio.sleep(SCORE_POLL_S * 20)
+                continue
+            done = 0
+            for name, parent in todo:
+                cfg = next((c for c in SETTINGS.arrs
+                            if c.name == name and c.enabled and c.api_key), None)
+                if cfg is None:
+                    # No arr by that name any more - do not ask again forever.
+                    with cursor() as cur:
+                        cur.execute(
+                            "UPDATE files SET cf_score=-1 WHERE arr_name=? "
+                            "  AND arr_parent_id=? AND cf_score IS NULL",
+                            (name, parent))
+                    continue
+                done += await _score_one_parent(cfg, parent)
+            left = 0
+            with cursor() as cur:
+                left = cur.execute(
+                    "SELECT COUNT(*) n FROM files WHERE cf_score IS NULL "
+                    "  AND arr_file_id IS NOT NULL "
+                    "  AND state NOT IN ('deleted','duplicate')").fetchone()["n"]
+            schedules.REG["arrscores"]["last_result"] = (
+                f"scored {done}, {left:,} left")
+        except Exception as e:                               # noqa: BLE001
+            joblog.log(f"release scores: {type(e).__name__}: {e}", "warn",
+                       system="arrscores")
+        await asyncio.sleep(SCORE_POLL_S)
+
+
 def _upgrade_detail(body: dict, new_files: list[dict]) -> str:
     """What actually changed in an upgrade, not just the word 'upgrade'.
 
@@ -353,6 +456,16 @@ async def _sync_file(cfg, file_id: int, parent_id: int | None, why: str,
         # full episodefile/moviefile, which carries audioLanguages ('eng/jpn');
         # the webhook payload's file entries do not carry mediaInfo at all.
         new_langs = _langs(_obj(rec.get("mediaInfo")).get("audioLanguages"))
+        # AND WHAT THE ARR SCORED IT. Free: the record is already in hand. See
+        # the note beside files.cf_score in db.py.
+        try:
+            cf_score = int(rec.get("customFormatScore"))
+        except (TypeError, ValueError):
+            cf_score = None
+        cf_names = ", ".join(
+            str(x.get("name")) for x in (rec.get("customFormats") or [])
+            if isinstance(x, dict) and x.get("name"))[:300] or None
+        rel_grp = str(rec.get("releaseGroup") or "")[:80] or None
 
         with cursor() as cur:
             row = cur.execute(
@@ -433,6 +546,9 @@ async def _sync_file(cfg, file_id: int, parent_id: int | None, why: str,
                     (cfg.name, file_id, parent, path, lib, title, season, episode,
                      size, mtime, disk, "new", why, now, now, now))
                 new_id = cur.lastrowid
+                cur.execute("UPDATE files SET cf_score=?, cf_names=?, "
+                            "release_group=? WHERE id=?",
+                            (cf_score, cf_names, rel_grp, new_id))
                 cur.execute("INSERT INTO history(file_id,event,detail,at) "
                             "VALUES(?,?,?,?)", (new_id, event, why, now))
                 return
@@ -452,6 +568,12 @@ async def _sync_file(cfg, file_id: int, parent_id: int | None, why: str,
                             (row["id"], "content_changed",
                              f"{row['size']} -> {size} bytes ({why})", now))
 
+            # THE SCORE FOLLOWS THE ROW EITHER WAY. A re-sync of an existing
+            # row - a rename, a re-read - is still the arr's latest word on
+            # what this release is worth.
+            cur.execute("UPDATE files SET cf_score=?, cf_names=?, "
+                        "release_group=? WHERE id=?",
+                        (cf_score, cf_names, rel_grp, row["id"]))
             if state:
                 cur.execute(
                     "UPDATE files SET arr_parent_id=?,path=?,library=?,title=?,"
