@@ -1558,7 +1558,7 @@ def _side_ocr_allowed() -> bool:
 # a requeue after a rules change is not a new check of the file and does not
 # write a second row.
 _FACT_KINDS = ("decode", "listen", "audio", "subread")
-_LANDING_EVENTS = ("imported", "upgraded", "transcoded", "content_changed")
+_LANDING_EVENTS = ("imported", "upgraded")
 
 
 def _note_checked(file_id: int, title: str, plan) -> bool:
@@ -1569,7 +1569,7 @@ def _note_checked(file_id: int, title: str, plan) -> bool:
         with cursor() as cur:
             since = cur.execute(
                 "SELECT COALESCE(MAX(at), 0) a FROM history "
-                " WHERE file_id=? AND event IN (?,?,?,?)",
+                " WHERE file_id=? AND event IN (?,?)",
                 (file_id,) + _LANDING_EVENTS).fetchone()["a"] or 0.0
             if cur.execute("SELECT 1 FROM history WHERE file_id=? "
                            "  AND event='checked' AND at > ? LIMIT 1",
@@ -5861,6 +5861,25 @@ async def _transcode(w: Worker, probe_data: dict) -> None:
                            f"rewritten file", "debug", job.id)
     except Exception:                                            # noqa: BLE001
         pass
+    # AND THE ROW DESCRIBES THE NEW FILE NOW, NOT WHENEVER A SCAN GETS HERE.
+    #
+    # The commit updated size, mtime and the disk, and left audio_langs, the
+    # codecs and the stored probe describing the file that was just replaced.
+    # For the minutes until something else happened to probe it, every reader
+    # of the row worked from the old track list: Always a Catch! S01E12 was
+    # remuxed down to one audio track at 20:49:22 and the listener, reading a
+    # two-track row, queued "listen to 2 tracks" at 20:51:33 and heard the
+    # ghost of the second. The flags-only path already probes here; the remux
+    # path is the one that actually changes the layout and did not. The
+    # verdicts were carried a moment ago and stamped with this file, so the
+    # probe's layout-changed branch keeps them (audiolang.invalidate(path)).
+    try:
+        _nd = await probe(job.path)
+        if _nd:
+            cache_probe(job.file_id, _nd)
+    except Exception as _pe:                                     # noqa: BLE001
+        joblog.log(f"post-commit probe: {type(_pe).__name__}: {_pe}",
+                   "debug", job.id)
     chose = getattr(res, "placed_on", "") or ""
     if chose and dest and dest != chose:
         joblog.log(f"placed on {chose}, but it is on {dest} now - something "
