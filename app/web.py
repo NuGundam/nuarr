@@ -9261,7 +9261,7 @@ def api_history(limit: int = Query(100, le=1000), event: str | None = None):
     # a release exists at all. See files.cf_score in db.py.
     sql = ("SELECT h.id,h.file_id,h.event,h.detail,h.at,h.label,f.title,"
            "f.season,f.episode,f.path,f.size,f.cf_score,f.cf_names,"
-           "f.release_group,f.state_reason FROM history h "
+           "f.release_group,f.state_reason,f.pool_disk FROM history h "
            "LEFT JOIN files f ON f.id=h.file_id")
     params: tuple = ()
     if event:
@@ -10742,12 +10742,14 @@ def api_activity(q: str = "", page: int = 1, page_size: int = 50):
         # story at the newest 60 entries, so every group on the page gets its
         # own share and the payload stays proportional to the page size.
         for r in _rows(
-                f"SELECT * FROM (SELECT job_id, file_id, title, path, kind, "
-                f"       pool, state, size_before, size_after, error, "
-                f"       finished_at, plan_json, result_json, "
-                f"       ROW_NUMBER() OVER (PARTITION BY title "
-                f"           ORDER BY finished_at DESC) rn "
-                f"  FROM jobs WHERE finished_at IS NOT NULL AND ({cond_j})) "
+                f"SELECT * FROM (SELECT j.job_id, j.file_id, j.title, j.path, "
+                f"       j.kind, j.pool, j.state, j.size_before, j.size_after, "
+                f"       j.error, j.finished_at, j.plan_json, j.result_json, "
+                f"       f.pool_disk, "
+                f"       ROW_NUMBER() OVER (PARTITION BY j.title "
+                f"           ORDER BY j.finished_at DESC) rn "
+                f"  FROM jobs j LEFT JOIN files f ON f.id = j.file_id "
+                f" WHERE j.finished_at IS NOT NULL AND ({cond_j})) "
                 f" WHERE rn <= 60", tuple(named)):
             # THE SAME SENTENCE THE LIVE FEED PRINTS - see jobs.describe_row.
             d = jobs.describe_row(dict(r))
@@ -10757,7 +10759,7 @@ def api_activity(q: str = "", page: int = 1, page_size: int = 50):
         for r in _rows(
                 f"SELECT * FROM (SELECT h.id, h.file_id, h.event, h.detail, "
                 f"       h.at, h.label, f.cf_score, f.cf_names, "
-                f"       f.release_group, f.state_reason, "
+                f"       f.release_group, f.state_reason, f.pool_disk, "
                 f"       ROW_NUMBER() OVER (PARTITION BY h.label "
                 f"           ORDER BY h.at DESC) rn FROM history h "
                 f"  LEFT JOIN files f ON f.id = h.file_id "
@@ -25584,7 +25586,7 @@ function renderDone(j){
     // suffix on the name, not a different kind, and must not lose its colour.
     const ts=e.at||0, nm=evName(e), lb=evLbl(e);
     return `<tr class="actsub ${nested?'nested':''} ${gid?'genbody':''} ${cur?'cur':''}"
-      ${gid?`data-gen="${gid}"`:''}><td colspan="5"><div class="subgrid">
+      ${gid?`data-gen="${gid}"`:''}><td colspan="6"><div class="subgrid">
       <span class="dim when nb">${esc(fullTs(ts))}</span>
       <span class="nb"><span class="pill ${stateClass(nm)}">${esc(lb)}</span></span>
       <div class="wrap">${e.detail
@@ -25603,7 +25605,7 @@ function renderDone(j){
     const txt=szCells(b,a,r.file_size);
     const isOpen=openLogId && openLogId===r.job_id;
     const main=`<tr class="actsub ${isOpen?'rowopen':''} ${nested?'nested':''} ${gid?'genbody':''} ${cur?'cur':''}"
-      ${gid?`data-gen="${gid}"`:''}><td colspan="5"><div class="subgrid">
+      ${gid?`data-gen="${gid}"`:''}><td colspan="6"><div class="subgrid">
       <span class="dim when nb">${esc(fullTs(r.finished_at))}</span>
       <span class="nb">${
         r.state==='done'
@@ -25633,7 +25635,7 @@ function renderDone(j){
       ? `<div class="dim mono" style="padding:4px 14px;font-size:11px;
            overflow-wrap:anywhere">${esc(r.path)}</div>` : '';
     return main+(isOpen
-      ? `<tr class="logdrop"><td colspan="5">${pathline}${why}${openLogHtml}</td></tr>`
+      ? `<tr class="logdrop"><td colspan="6">${pathline}${why}${openLogHtml}</td></tr>`
       : '');
   };
 
@@ -25643,6 +25645,7 @@ function renderDone(j){
       +'<table class="fixed">'
       +'<tr><th>Title</th>'
       +'<th style="width:34%">What happened</th>'
+      +'<th class="nb" style="width:118px" title="the pool member this file lives on now, and where it came from if nuarr or DrivePool has moved it">Disk</th>'
       +'<th class="num nb" style="width:66px" title="how many releases of this file have been through nuarr, and how much happened to them">Releases</th>'
       // Size gets breathing room and Last gets enough width for "just now":
       // at 150/74 with no gap the two ran together as "-10.2%just now".
@@ -25719,6 +25722,46 @@ function renderDone(j){
       // which is why the pill was renamed to Replaced in the first place.
       // Until the score backfill reaches a title, both sides are unknown and
       // it stays Replaced, which is what nuarr can actually see.
+      // WHERE THE FILE LIVES, AND WHERE IT CAME FROM.
+      //
+      // Erik: "add a DISK column in the panel to track disk movement". Every
+      // row already carries its file's pool_disk, and a move writes a
+      // moved_disk event whose detail is exactly "NU-DRIVE-11 -> NU-DRIVE-2"
+      // - one shape, checked across 4,000 of them, so it can be read rather
+      // than parsed hopefully.
+      //
+      // The cell shows where it is now, in that disk's own colour. When this
+      // release has moved, the disk it left is shown struck through before
+      // it, so a row that has been shuffled says so without being opened.
+      const _diskCell=(()=>{
+        const cur=(_cur?_cur.entries:g.entries)
+          .map(it=>(it.ev&&it.ev.pool_disk)||(it.job&&it.job.pool_disk)||'')
+          .filter(Boolean).pop() || '';
+        const moves=(_cur?_cur.entries:g.entries)
+          .filter(it=>it.ev && evName(it.ev)==='moved_disk'
+                   && /->/.test(it.ev.detail||''));
+        const from=moves.length
+          ? String(moves[0].ev.detail).split('->')[0].trim() : '';
+        if(!cur) return '<span class="dim">\u2014</span>';
+        // WHERE IT IS NOW IS THE FILES ROW, which is written from the
+        // filesystem and checked against it. The move events are the story of
+        // how it got there and can be a step short - see the note in
+        // webhooks._sync_file - so when the last one does not land where the
+        // file actually is, the cell says both rather than picking one.
+        const lastTo=moves.length
+          ? String(moves[moves.length-1].ev.detail).split('->').pop().trim() : '';
+        const tip=moves.length
+          ? `moved ${moves.length} time${moves.length===1?'':'s'} - `
+            + moves.map(m=>String(m.ev.detail).replace(/\s+/g,' ').trim()).join(', ')
+            + (lastTo && lastTo!==cur ? `; it is on ${cur} now` : '')
+          : 'has not moved since it landed';
+        return `<span title="${esc(tip)}">`
+          + (from && from!==cur
+              ? `<span class="dim" style="text-decoration:line-through">${
+                  esc(from)}</span> <span class="dim">\u2192</span> ` : '')
+          + `<span class="mono" style="color:${diskColor(cur)}">${esc(cur)}</span>`
+          + `</span>`;
+      })();
       const _prevGen=_gens.length>1 ? _gens[_gens.length-2] : null;
       const _better = !!(_cur && _prevGen && _cur.score!=null
                          && _prevGen.score!=null && _cur.score > _prevGen.score);
@@ -25733,7 +25776,24 @@ function renderDone(j){
       const _hasBad=[..._heads].some(h=>BAD_WORD.has(h) && h!=='deleted');
       const _hasNew=_heads.has('replaced') || _heads.has('upgraded');
       let _words;
-      if(_hasBad && _hasNew){
+      // PROCESSED. Erik: "can you say only Processed replacing all txt info
+      // only when all workers needed to check the file is done to simplify
+      // the panel".
+      //
+      // A file that has been through everything it needed produces the same
+      // reading every time, whatever the route: nothing is wrong, nothing is
+      // outstanding, there is nothing to do about it. Six words saying that
+      // in six different ways is six things to read and no decision at the
+      // end of any of them. One word says it, and the drop-down still holds
+      // every step for when the answer is not enough.
+      //
+      // Only the settled rows get it - the same three conditions as before
+      // (the release has a check, nothing failed, nothing queued or running
+      // against it), so a file still being worked on keeps its running
+      // commentary, which is where the detail earns its place.
+      if(_settled){
+        _words=`<span style="color:var(--ok)">Processed</span>`;
+      }else if(_hasBad && _hasNew){
         _words=`<span style="color:var(--bad)">Failed</span>`
               +`<span class="dim"> \u2014 </span>`
               +`<span style="color:#39d3c3">Replaced</span>`;
@@ -25801,6 +25861,7 @@ function renderDone(j){
       const head=`<tr class="actrow ${open?'rowopen':''}" onclick="actToggle(${gi})">
         <td class="wrap"><div class="ell" title="${esc(g.title)}"><span class="actcaret">${open?'▾':'▸'}</span><b>${esc(g.title)}</b></div></td>
         <td><div class="actwords oneline">${_words}</div></td>
+        <td class="nb" style="font-size:11px">${_diskCell}</td>
         <td class="num dim nb" title="${esc(
             (_gens.length>1
                ? `${_gens.length} releases of this file have been through nuarr`
@@ -25892,14 +25953,14 @@ function renderDone(j){
         // belongs to, and the subgrid so it lines up with the rows under it.
         const genPills=(isOpen && glbls.length>PILL_MAX)
           ? `<tr class="actsub pillhead genbody" data-gen="${gg.fid}">
-               <td colspan="5"><div class="subgrid">
+               <td colspan="6"><div class="subgrid">
                <span></span><span></span>
                <div class="wrap"><div class="actpills">${
                  glbls.map(([l,n])=>pillFor(l,n)).join(' ')}</div></div>
                <span></span><span></span></div></td></tr>` : '';
         return `<tr class="actsub genhead ${cur?'curhead':''} ${isOpen?'rowopen':''}"
             onclick="actToggleGen(${Number(gg.fid)||0}, ${cur?'true':'false'})">
-          <td colspan="5"><div class="subgrid">
+          <td colspan="6"><div class="subgrid">
           <span class="dim when nb">${esc(fullTs(gg.first||gg.last))}</span>
           <span class="nb"><span class="actcaret">${isOpen?'\u25be':'\u25b8'}</span>
             <span class="${cur?'':'dim'}" style="font-size:10.5px${cur?';color:var(--acc)':''}">${word}${esc(nth)}</span></span>
@@ -25914,7 +25975,7 @@ function renderDone(j){
       // nine kinds of work against it shows five on the line and all nine
       // here, in the same order, before its story starts.
       const pillHead=(lbls.length>PILL_MAX)
-        ? `<tr class="actsub pillhead"><td colspan="5">
+        ? `<tr class="actsub pillhead"><td colspan="6">
              <div class="actpills">${pillsAll}</div></td></tr>` : '';
       // A title with ONE release keeps the plain list - a header saying
       // "current release" over the only release there is says nothing.
@@ -25933,12 +25994,14 @@ function renderDone(j){
     html='<div id="doneBox" class="scrollbox nohz" style="height:460px">'
       +'<table class="fixed">'
       +'<tr><th>Title</th><th style="width:34%">What happened</th>'
+      +'<th class="nb" style="width:118px">Disk</th>'
       +'<th class="num nb" style="width:66px">Releases</th>'
       +'<th class="num nb" style="width:206px"></th>'
       +'<th class="nb" style="width:84px;padding-left:14px">Last</th></tr>'
       + Array.from({length:7},(_,i)=>
           `<tr class="skelrow"><td class="wrap">${bar((58-i*5)+'%','tall')}</td>`
           +`<td>${bar('38%')} ${bar('24%')} ${bar('16%')}</td>`
+          +`<td>${bar('72%')}</td>`
           +`<td class="num">${bar('56%')}</td>`
           +`<td class="num">${bar('78%')}</td>`
           +`<td style="padding-left:14px">${bar('66%')}</td></tr>`).join('')

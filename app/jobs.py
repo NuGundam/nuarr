@@ -7233,7 +7233,7 @@ def snapshot(recent_limit: int = 60) -> dict:
         recent_done = [dict(r) for r in cur.execute(
             "SELECT j.job_id,j.file_id,j.title,j.state,j.size_before,j.size_after,"
             "j.error,j.finished_at,j.path,j.kind,j.pool,j.plan_json,"
-            "j.result_json,f.size AS file_size FROM jobs j "
+            "j.result_json,f.size AS file_size,f.pool_disk FROM jobs j "
             "LEFT JOIN files f ON f.id=j.file_id "
             "WHERE j.state IN ('done','failed','skipped','cancelled',"
             "'blocked','deferred') "

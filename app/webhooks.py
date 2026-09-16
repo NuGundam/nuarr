@@ -560,6 +560,22 @@ async def _sync_file(cfg, file_id: int, parent_id: int | None, why: str,
                             "VALUES(?,?,?,?)",
                             (row["id"], "renamed", f"{row['path']} -> {path}", now))
 
+            # AND A CHANGE OF SPINDLE IS A MOVE, WHOEVER NOTICED IT.
+            #
+            # The scanner records moved_disk when the disk under a path
+            # changes; this path overwrites pool_disk and says nothing. So the
+            # history could end on a move that never came back - measured
+            # against the live pool: of the 400 most recent movers, 11 had a
+            # last event reading "-> NU-DRIVE-0" while both the files row AND
+            # the filesystem said NU-DRIVE-7. The row was right and the record
+            # was short of an entry, because the move back arrived through
+            # here.
+            if disk and row["pool_disk"] and disk != row["pool_disk"]:
+                cur.execute("INSERT INTO history(file_id,event,detail,at) "
+                            "VALUES(?,?,?,?)",
+                            (row["id"], "moved_disk",
+                             f"{row['pool_disk']} -> {disk}", now))
+
             changed = row["size"] is not None and size and row["size"] != size
             state = "new" if changed else None
             if changed:
