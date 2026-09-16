@@ -54,6 +54,33 @@ HEAD_S = 20
 TAIL_S = 25
 # How many decoder threads one check may use. See _decode.
 DECODE_THREADS = 4
+# HOW LONG ONE DECODE MAY TAKE BEFORE IT IS GIVEN UP ON.
+#
+# It was 240 s, and the check's own record says that is inside the real
+# distribution rather than beyond it: of 39,876 stored verdicts the slowest
+# ten run 200-254 s, the slowest of all 253.7 s. Over one day 643 decode jobs
+# finished - 551 of them under ten seconds - with a tail of 17 between twenty
+# and forty seconds, nine to eighty, two to 160, one to 239, and then
+# SEVENTEEN sitting exactly on the 240 s wall. A cap landing in the middle of
+# a tail turns contention into a verdict.
+#
+# And it IS contention, not the files. Measured by hand against the two worst
+# repeat offenders while the queue ran: #55782, a 5.8 GB film that had timed
+# out seven times, read its head in 0.1 s and decoded both windows in 1.1 s
+# and 0.7 s; #56100 in 1.6 s and 2.0 s. Nothing is wrong with either. They
+# were asked while 153 other jobs were on the same spindles.
+#
+# Ten minutes clears the measured tail four times over and still bounds a
+# genuinely stuck read.
+DECODE_BUDGET_S = 600
+# HOW LONG A FILE THAT COULD NOT BE MEASURED WAITS BEFORE BEING ASKED AGAIN,
+# and how many times before it is left alone. A timeout used to write nothing
+# at all, so the candidate query - which offers any file with no row - handed
+# the same file straight back on the next pass, forever: one film burned seven
+# slots and twenty-eight minutes of pool time for no answer, ahead of files
+# that had never been looked at once.
+NOANSWER_BACKOFF = (1800, 7200, 21600, 86400)
+MAX_NOANSWER = len(NOANSWER_BACKOFF)
 # How many files one pass may test. Each costs two bounded decodes off a
 # spinning pool disk; eight is roughly a minute of work and leaves the disks
 # to whatever else wants them.
@@ -160,6 +187,13 @@ def init() -> None:
                 detail  TEXT,
                 secs    REAL
             )""")
+        # HOW MANY TIMES THIS FILE HAS BEEN ASKED AND NOT ANSWERED. See
+        # NOANSWER_BACKOFF: without it a timeout leaves no trace and the
+        # feeder offers the same file again on the next pass.
+        icols = {r["name"] for r in cur.execute("PRAGMA table_info(integrity)")}
+        if "tries" not in icols:
+            cur.execute("ALTER TABLE integrity ADD COLUMN tries INTEGER "
+                        "DEFAULT 0")
         cur.execute("CREATE INDEX IF NOT EXISTS ix_integrity_verdict "
                     "ON integrity(verdict)")
     _READY = True
@@ -228,9 +262,18 @@ async def _decode(path: str, ss: float, dur: float,
                 on_pid(proc.pid)
             except Exception:                                    # noqa: BLE001
                 pass
-        _, err = await asyncio.wait_for(proc.communicate(), timeout=240)
+        _, err = await asyncio.wait_for(proc.communicate(),
+                                        timeout=DECODE_BUDGET_S)
         return proc.returncode or 0, (err or b"").decode("utf-8", "replace")
     except asyncio.TimeoutError:
+        # AND THE PROCESS IS KILLED, not abandoned. wait_for cancels the await;
+        # it does not stop the ffmpeg on the other end of it, so every timeout
+        # left a process still reading the spindle that made it time out - the
+        # one thing guaranteed to make the next check time out too.
+        try:
+            proc.kill()
+        except Exception:                                        # noqa: BLE001
+            pass
         # A DECODE THAT NEVER FINISHES IS NOT A VERDICT. It is usually a disk
         # that went to sleep or a pool member being rebalanced under us, and
         # calling that corruption would delete a healthy file.
@@ -250,9 +293,10 @@ def say(detail: str) -> str:
     """
     d = (detail or "").strip()
     if d == "__timeout__":
-        return ("the decode ran past four minutes without finishing - usually "
-                "a spun-down pool disk or a member being rebalanced "
-                "underneath it, not a fault in the file")
+        return (f"the decode ran past {DECODE_BUDGET_S // 60} minutes without "
+                "finishing - usually a spun-down pool disk, a member being "
+                "rebalanced underneath it, or simply too much else reading the "
+                "same spindle; not a fault in the file")
     if d.startswith("__spawn__"):
         return ("ffmpeg could not be started ("
                 + (d[len("__spawn__"):].strip() or "no reason given") + ")")
@@ -372,8 +416,11 @@ def _candidates(limit: int) -> list[dict]:
             "   AND COALESCE(f.path,'') != '' "
             "   AND COALESCE(f.size,0) > 0 "
             "   AND (COALESCE(f.mtime, 0) < ? OR f.state='eligible') "
-            "   AND (i.file_id IS NULL OR i.verdict = '') "
-            " ORDER BY f.id LIMIT ?", (cutoff, int(limit)))]
+            # A FILE THAT COULD NOT BE ANSWERED WAITS BEFORE BEING ASKED
+            # AGAIN, and after four goes is left alone. See NOANSWER_BACKOFF.
+            "   AND (i.file_id IS NULL OR (i.verdict = '' AND "
+            + noanswer_wait_sql("i") + ")) "
+            " ORDER BY f.id LIMIT ?", (cutoff, time.time(), int(limit)))]
 
 
 def _candidates_per_disk(per_disk: int) -> list[dict]:
@@ -401,9 +448,11 @@ def _candidates_per_disk(per_disk: int) -> list[dict]:
             "     AND COALESCE(f.size,0) > 0 "
             # See _candidates: eligible has already served a longer settle.
             "     AND (COALESCE(f.mtime, 0) < ? OR f.state='eligible') "
-            "     AND (i.file_id IS NULL OR i.verdict = '')) "
+            # The same wait as _candidates - see noanswer_wait_sql.
+            "     AND (i.file_id IS NULL OR (i.verdict = '' AND "
+            + noanswer_wait_sql("i") + "))) "
             " WHERE rn <= ? ORDER BY pool_disk, rn",
-            (cutoff, int(per_disk)))]
+            (cutoff, time.time(), int(per_disk)))]
 
 
 # WHICH PASS, AND WHAT IT IS FOR.
@@ -480,18 +529,38 @@ def pass_words(r: dict) -> tuple:
             f"wrote is not corrupt")
 
 
+def noanswer_wait_sql(alias: str = "i") -> str:
+    r"""The "has it waited long enough to be asked again" test, as SQL.
+
+    ONE LADDER, BOTH FEEDERS. _candidates and _candidates_per_disk each decide
+    what to offer, and a file that could not be measured has to look the same
+    to both of them or the disk-diverse feeder simply undoes the wait. Takes
+    one bound parameter - the current time - immediately after the settle
+    cutoff.
+    """
+    ladder = " ".join(f"WHEN {n} THEN {v}"
+                      for n, v in enumerate(NOANSWER_BACKOFF, start=1))
+    return (f"COALESCE({alias}.tries,0) < {MAX_NOANSWER} AND ? > {alias}.at + "
+            f"CASE COALESCE({alias}.tries,0) {ladder} "
+            f"ELSE {NOANSWER_BACKOFF[-1]} END")
+
+
 def _write(file_id: int, path: str, size: int, mtime: float, out: dict) -> None:
+    # A VERDICT RESETS THE COUNT; NO ANSWER ADDS TO IT. An answer of any kind
+    # means the file could be read after all, so whatever went wrong before is
+    # no longer true of it.
+    tries = 0 if out.get("verdict") else int(out.get("tries") or 1)
     with cursor() as cur:
         cur.execute(
             "INSERT INTO integrity(file_id,path,size,mtime,at,verdict,detail,"
-            "secs) VALUES(?,?,?,?,?,?,?,?) "
+            "secs,tries) VALUES(?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(file_id) DO UPDATE SET path=excluded.path, "
             "  size=excluded.size, mtime=excluded.mtime, at=excluded.at, "
             "  verdict=excluded.verdict, detail=excluded.detail, "
-            "  secs=excluded.secs",
+            "  secs=excluded.secs, tries=excluded.tries",
             (int(file_id), path, int(size or 0), float(mtime or 0), time.time(),
              out.get("verdict") or "", (out.get("detail") or "")[:600],
-             float(out.get("secs") or 0)))
+             float(out.get("secs") or 0), tries))
 
 
 async def sweep(limit: int = 0, force: bool = False) -> dict:
@@ -920,7 +989,27 @@ async def job_one(r: dict, on_pid=None, on_stage=None) -> dict:
                          float(r.get("duration") or 0),
                          on_pid=on_pid, on_stage=_stage)
     if not out.get("verdict"):
-        return {"ok": False, "why": say(out.get("detail"))}
+        # NO ANSWER IS ALSO SOMETHING TO RECORD. It is not a verdict about the
+        # file and must never read as one - the row keeps verdict '' - but the
+        # ATTEMPT is a fact, and writing it down is what stops the feeder
+        # handing the same file back every pass for the rest of the week.
+        n = 1
+        try:
+            with cursor() as cur:
+                row = cur.execute("SELECT tries FROM integrity WHERE file_id=?",
+                                  (int(r["file_id"]),)).fetchone()
+            n = int((row["tries"] if row else 0) or 0) + 1
+        except Exception:                                        # noqa: BLE001
+            pass
+        out["tries"] = n
+        await asyncio.to_thread(_write, int(r["file_id"]), r["path"],
+                                st.st_size, st.st_mtime, out)
+        if n >= MAX_NOANSWER:
+            joblog.log(f"integrity: giving up on "
+                       f"{os.path.basename(r['path'])} after {n} attempts "
+                       f"with no answer - {say(out.get('detail'))}", "warn")
+        return {"ok": False, "why": say(out.get("detail")),
+                "tries": n, "gave_up": n >= MAX_NOANSWER}
     await asyncio.to_thread(_write, int(r["file_id"]), r["path"],
                             st.st_size, st.st_mtime, out)
     # BOTH FAILING VERDICTS GO TO THE REMEDY, and the remedy decides what may
