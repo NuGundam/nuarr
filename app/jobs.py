@@ -4637,8 +4637,18 @@ async def _decode_job(w: Worker) -> None:
         return
     if res.get("ok"):
         v = res.get("verdict") or ""
-        word = ("decodes cleanly at both ends" if v == integrity.OK
-                else f"CORRUPT - {res.get('detail') or ''}")
+        # THREE VERDICTS, THREE WORDS. "CORRUPT - ..." was printed for
+        # everything that was not OK, which would have called a file nuarr
+        # simply has no decoder for a broken one. And an OK verdict whose
+        # ffmpeg exited badly no longer gets to claim it decoded cleanly -
+        # see integrity.test_one, which now reports that instead of dropping
+        # the return code on the floor.
+        word = ("CORRUPT - " + (res.get("detail") or "")
+                if v == integrity.CORRUPT else
+                "cannot be read - " + (res.get("detail") or "")
+                if v == integrity.UNREADABLE else
+                "decodes cleanly at both ends" if res.get("clean", True)
+                else (res.get("detail") or "the decode did not end cleanly"))
         # AND THE RECORD SAYS WHICH PASS IT WAS. Two checks of one file are
         # two different questions - can this be read at all, and is what nuarr
         # wrote still readable - and the history said "decode" both times.
@@ -4646,7 +4656,10 @@ async def _decode_job(w: Worker) -> None:
             word = f"{_plbl} · {word}"
             if _plan.get("after") and _plan.get("pass") == 2:
                 word += f" after {_plan['after']}"
-        joblog.log(word, "ok" if v == integrity.OK else "error", job.id)
+        joblog.log(word,
+                   "ok" if v == integrity.OK and res.get("clean", True)
+                   else "warn" if v == integrity.UNREADABLE else "error",
+                   job.id)
         _finish(job, "done", before, before, note=word[:300])
     else:
         why = str(res.get("why") or "no verdict")

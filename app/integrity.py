@@ -80,7 +80,53 @@ _FATAL = [
     (r"invalid nal unit|missing picture in access unit", "the video stream is broken"),
 ]
 
+# NOTHING WAS DECODED, AND THAT IS NOT THE SAME AS DECODING CLEANLY.
+#
+# Erik: "looks like the decode pass 1 failed to check for these encode sub
+# issues". It was worse than that - pass 1 had not read a single frame.
+#
+# 'Sentenced to Be a Hero' S01E01-E12 are Matroska files with 108 streams and a
+# video stream ffmpeg cannot identify at all:
+#
+#     Stream #0:0: Video: none, none, 1920x1080, 23.98 fps   codec_tag [0][0][0][0]
+#
+# The container carries the picture's shape and not what the frames are. So the
+# check's own command - map 0:v:0, decode twenty seconds - returned -22 with
+#
+#     [vist#0:0/none] Decoding requested, but no decoder found for: none
+#
+# and test_one stored verdict=ok with that sentence as its "note", because the
+# message matched nothing in _FATAL and the return code was thrown away on the
+# line that read `_ = rc`. The panel then said "decodes cleanly at both ends"
+# over a file where no decode had happened, twice, and eighteen encode jobs
+# went on to fail on the same twelve files.
+#
+# This is deliberately NOT _FATAL. The bytes are not known to be wrong - a
+# player with the right decoder might be perfectly happy - so it must not
+# arrive at remedy.py's auto-delete path. It is its own verdict: nuarr cannot
+# read this, which is a fact about nuarr as much as about the file.
+_NO_DECODER = re.compile(
+    r"no decoder found for|decoder not found|"
+    r"(video|audio):\s*none|unknown codec", re.I)
+
 OK, CORRUPT, UNREADABLE = "ok", "corrupt", "unreadable"
+
+
+def _no_decoder(rc: int, err: str) -> str:
+    """Did this run decode anything at all? -> why not, or "".
+
+    See the note above _NO_DECODER. Returns the sentence a person reads, and
+    only for the case that is certain: ffmpeg said in words that it had no
+    decoder. A non-zero exit with stderr nobody has classified is left alone
+    here and reported as itself by test_one - fail closed on the delete path,
+    loud everywhere else, which is this module's rule.
+    """
+    if _NO_DECODER.search(err or ""):
+        return ("ffmpeg has no decoder for this file's video stream - the "
+                "container describes the picture and not what the frames "
+                "are, so nothing was decoded and nothing can re-encode it")
+    _ = rc
+    return ""
 MISSING = "missing"          # was not on disk; not a fault in the bytes
 
 STATE = {"running": False, "done": 0, "total": 0, "now": "", "last_run": 0.0,
@@ -222,6 +268,12 @@ async def test_one(file_id: int, path: str, duration: float = 0.0,
     rc, err = await _decode(path, 0, HEAD_S, on_pid)
     if err.startswith("__"):
         return {"verdict": "", "detail": err, "secs": time.time() - t0}
+    # BEFORE _fatal, because "there is no decoder" is not "the bytes are bad"
+    # and must never reach the path that deletes a file.
+    why = _no_decoder(rc, err)
+    if why:
+        return {"verdict": UNREADABLE, "detail": why,
+                "secs": time.time() - t0}
     why = _fatal(err)
     if why:
         return {"verdict": CORRUPT, "detail": f"{why} (in the first "
@@ -239,20 +291,34 @@ async def test_one(file_id: int, path: str, duration: float = 0.0,
         rc2, err2 = await _decode(path, max(0.0, duration - TAIL_S), TAIL_S,
                                   on_pid)
         if not err2.startswith("__"):
+            why = _no_decoder(rc2, err2)
+            if why:
+                return {"verdict": UNREADABLE, "detail": why,
+                        "secs": time.time() - t0}
             why = _fatal(err2)
             if why:
                 return {"verdict": CORRUPT, "detail": f"{why} (in the last "
                         f"{TAIL_S}s): {err2.strip().splitlines()[0][:200]}",
                         "secs": time.time() - t0}
             tail_note = err2.strip()
-        _ = rc2
-    _ = rc
+            rc = rc or rc2
     note = "; ".join(x.splitlines()[0][:150] for x in (head_note, tail_note)
                      if x)
+    # AND THE EXIT CODE IS PART OF THE ANSWER. This line used to read `_ = rc`
+    # - the return code was read from the process and then thrown away, so an
+    # ffmpeg that refused the command outright was recorded as an ok verdict
+    # with its complaint filed as a "note". The verdict still fails open (see
+    # the module docstring: an unclassified message must not arrive with a
+    # delete button attached) but it no longer fails SILENT: a run that ended
+    # badly says so in the sentence the panel prints.
+    if rc:
+        note = (f"ffmpeg exited {rc} on the head" + (f" - {note}" if note else "")
+                )[:300]
     return {"verdict": OK,
             "detail": note or f"decoded {HEAD_S}s at the head"
                               + (f" and {TAIL_S}s at the tail" if tail_note
                                  or duration else ""),
+            "clean": not rc,
             "secs": time.time() - t0}
 
 
@@ -494,19 +560,30 @@ def untested() -> int:
 
 
 def findings(limit: int = 200) -> list[dict]:
-    """The corrupt ones, in remedy.py's shape."""
+    """The ones that failed, in remedy.py's shape.
+
+    TWO VERDICTS, TWO KINDS. 'corrupt' means the bytes are wrong and only a
+    different release can help, which is why auto mode may act on it.
+    'unreadable' means ffmpeg has no decoder for the stream - the file may be
+    perfectly good to something else - so it is reported and never replaced
+    without a person saying so. Until this, unreadable was a constant this
+    module defined and nothing ever produced or read.
+    """
     if not _READY:
         init()
+    kinds = {CORRUPT: "file/corrupt", UNREADABLE: "file/unreadable"}
     try:
         with cursor() as cur:
-            return [{"file_id": r["file_id"], "kind": "file/corrupt",
+            return [{"file_id": r["file_id"],
+                     "kind": kinds.get(r["verdict"], "file/corrupt"),
                      "path": r["path"], "why": r["detail"], "at": r["at"]}
                     for r in cur.execute(
-                        "SELECT i.file_id, i.path, i.detail, i.at "
+                        "SELECT i.file_id, i.path, i.detail, i.at, i.verdict "
                         "  FROM integrity i JOIN files f ON f.id = i.file_id "
-                        " WHERE i.verdict = ? "
+                        " WHERE i.verdict IN (?, ?) "
                         "   AND f.state NOT IN ('deleted','duplicate') "
-                        " ORDER BY i.at DESC LIMIT ?", (CORRUPT, int(limit)))]
+                        " ORDER BY i.at DESC LIMIT ?",
+                        (CORRUPT, UNREADABLE, int(limit)))]
     except Exception:                                            # noqa: BLE001
         return []
 
@@ -846,16 +923,26 @@ async def job_one(r: dict, on_pid=None, on_stage=None) -> dict:
         return {"ok": False, "why": say(out.get("detail"))}
     await asyncio.to_thread(_write, int(r["file_id"]), r["path"],
                             st.st_size, st.st_mtime, out)
-    if out["verdict"] == CORRUPT:
+    # BOTH FAILING VERDICTS GO TO THE REMEDY, and the remedy decides what may
+    # be done about each: file/corrupt may be replaced by a sweep, and
+    # file/unreadable may only be replaced by a person. Routing just the
+    # corrupt ones here meant an unreadable file was written down and never
+    # mentioned again.
+    if out["verdict"] in (CORRUPT, UNREADABLE):
         joblog.log(f"integrity: {os.path.basename(r['path'])} - "
-                   f"{out['detail']}", "error")
+                   f"{out['detail']}",
+                   "error" if out["verdict"] == CORRUPT else "warn")
         try:
             from . import remedy
             await remedy.auto(findings(50), "integrity", mode() == "auto")
         except Exception:                                        # noqa: BLE001
             pass
     return {"ok": True, "verdict": out["verdict"],
-            "detail": out.get("detail") or "", "secs": out.get("secs") or 0}
+            "detail": out.get("detail") or "",
+            # WHETHER FFMPEG ITSELF ENDED WELL, carried out to the job so the
+            # note can stop claiming a clean decode after a bad exit.
+            "clean": bool(out.get("clean", True)),
+            "secs": out.get("secs") or 0}
 
 
 FEED_S = 60.0

@@ -1522,6 +1522,31 @@ def decide(probe: dict, *, anime: bool = False, filename: str = "",
     v = video[0]
     height = int(v.get("height") or 0)
     vcodec = (v.get("codec_name") or "").lower()
+    # AND A STREAM FFMPEG CANNOT NAME IS NOT A CODEC TO CONVERT FROM.
+    #
+    # The guard above asks whether there IS a video stream. These files have
+    # one - 1920x1080, 23.98 fps, codec_tag [0][0][0][0] - and ffmpeg reports
+    # its codec as `none`. An empty vcodec is not in `accepted`, so the rule
+    # below read it as "a codec Plex will not direct-play" and planned a
+    # re-encode FROM nothing. The sentence it produced said so out loud:
+    #
+    #     rebuild the video from  to h264
+    #
+    # with the blank where the source codec belongs. ffmpeg then rejected the
+    # command it was handed - eighteen failed encode jobs across twelve files
+    # of one show, retried as fast as the queue could offer them.
+    #
+    # Skipped rather than failed, because there is no work here to get right:
+    # the job records the reason, the file is marked done with it, and it
+    # stops coming back round. integrity.py reaches the same file by its own
+    # road and files it under "nuarr cannot read this" for a person to see.
+    if not vcodec or vcodec == "none":
+        p.skip_reason = (
+            "ffmpeg cannot name this file's video codec - the container "
+            f"describes the picture ({height}p, {v.get('width') or '?'}"
+            f"x{height}) and not what the frames are, so nothing can decode "
+            "it and no re-encode has a source to work from")
+        return p
     hdr, ten_bit = _is_hdr(v), _is_10bit(v)
     duration = float(fmt.get("duration") or 0)
     overall_mbps = (int(fmt.get("bit_rate") or 0) / 1_000_000) if fmt.get("bit_rate") else (

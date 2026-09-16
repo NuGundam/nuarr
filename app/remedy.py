@@ -108,6 +108,14 @@ def _kind(name: str, requeue: bool, replace: bool, auto_replace: bool,
 _kind("file/corrupt", False, True, True,
       "the file does not decode - no re-encode can rebuild bytes that are "
       "not there")
+# -- nuarr cannot read it. That is not the same as the bytes being wrong, and
+#    the difference is a delete button: auto_replace is False here on purpose.
+#    A file whose codec ffmpeg cannot name may play perfectly somewhere else,
+#    so it is put in front of a person rather than thrown away by a sweep.
+_kind("file/unreadable", False, True, False,
+      "ffmpeg has no decoder for this file - nothing here can read it, but "
+      "that is a limit of this toolchain as much as of the file, so the "
+      "replacement is yours to ask for")
 _kind("audio/missing", False, True, True,
       "there is no audio stream at all - there is nothing to re-encode")
 _kind("video/missing", False, True, True,

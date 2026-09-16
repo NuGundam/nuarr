@@ -5799,9 +5799,21 @@ def api_health():
     try:
         from . import integrity as _ig
         d = _ig.stats()
+        # TWO WAYS TO FAIL, AND THE TILE COUNTED ONE. A file whose codec
+        # ffmpeg cannot name never decodes either, and reading only "corrupt"
+        # meant the card said "39,857 read, all decoded" over twelve files
+        # that had not been read at all. They are counted apart because the
+        # answer is different: corrupt wants a different release, unreadable
+        # wants a person to look.
         bad = int(d.get("corrupt") or 0)
-        add("integrity", "Does it actually decode?", "ruleschk", bad,
-            (f"{bad} file(s) will not decode" if bad else
+        unread = int(d.get("unreadable") or 0)
+        _w = []
+        if bad:
+            _w.append(f"{bad} file(s) will not decode")
+        if unread:
+            _w.append(f"{unread} that nothing here can read")
+        add("integrity", "Does it actually decode?", "ruleschk", bad + unread,
+            ("; ".join(_w) if _w else
              f"{int(d.get('ok') or 0):,} read, all decoded"
              if d.get("ok") else "nothing read yet"),
             mode=d.get("mode"), running=d.get("running"))
@@ -20589,13 +20601,50 @@ function renqWhy(err){
   const permanent = /^not retrying/i.test(s) || /^gave up/i.test(s);
   return [why, permanent ? 'p-bad' : 'p-warn', fix];
 }
+// WHAT THE GATE IS DOING, in the words the job rows use for the same fact.
+//
+// Erik: "show job gate pause info like from the drive pool just like the
+// processing system panel". A rename races the balancer for the same file, so
+// drivepool.hold("renames") can stop the whole pass - and when it did, this
+// panel went on saying "78 due now" with nothing to explain why none of them
+// moved. Held reads amber, exactly like "waiting for DrivePool" on a job row;
+// running reads dim, and says when the last pass was and what it got through,
+// so a queue that is simply taking its turn cannot be mistaken for a stuck one.
+function renqGate(g){
+  if(!g) return '';
+  const when = g.at ? ago(g.at) : '';
+  if(g.held){
+    return `<div class="sub" style="color:var(--warn);margin-top:3px">`
+      +`<b>held</b> \u2014 ${esc(g.why||'DrivePool is moving data')}`
+      +`<span class="dim"> \u00b7 nothing is attempted while this is on; `
+      +`the rows keep their place and their backoff</span></div>`;
+  }
+  const l=g.last||{};
+  const did = l.tried
+    ? `last pass ${when} took ${fmt(l.picked)} of ${fmt(l.titles)} title(s)`
+      + ` \u2014 ${fmt(l.ok)} renamed`
+      + (l.failed?`, <span class="err">${fmt(l.failed)} failed</span>`:'')
+    : (when ? `last pass ${when} found nothing due` : 'no pass yet');
+  return `<div class="sub dim" style="margin-top:3px">`
+    +`gate open \u00b7 ${did} \u00b7 up to ${fmt(g.per_pass)} title(s) every `
+    +`${Math.round(g.every_s||20)}s</div>`;
+}
+
 async function loadRenq(){
   const el=document.getElementById('renq'), head=document.getElementById('renqHead');
   if(!el) return;
   let q;
   try{ q=await (await fetch('/api/renames/queue')).json(); }catch(_){ return; }
   if(!q.pending && !q.gave_up){
-    if(head) head.style.display='none';
+    // THE GATE STILL SHOWS WITH AN EMPTY QUEUE, because "nothing waiting"
+    // and "held, so nothing has been attempted" are different sentences and
+    // the second one is the interesting one.
+    const g=q.gate||{};
+    if(head){
+      if(g.held){ head.style.display=''; head.className='pinhead';
+                  head.innerHTML=renqGate(g); }
+      else head.style.display='none';
+    }
     el.innerHTML='<div class="dim" style="padding:10px 14px;border-bottom:1px solid var(--line)">'
       +'nothing waiting — every processed file has been renamed'
       +(q.done?` <span style="opacity:.7">(${fmt(q.done)} handled so far)</span>`:'')
@@ -20636,7 +20685,8 @@ reason is what was true when the attempt failed, which may be an hour ago"
     head.innerHTML=
       (bits.join(' <span class="dim">·</span> ') || `<b>${fmt(q.pending)}</b> queued`)
       + ` <span class="dim">· ${fmt(q.due)} due now</span>`
-      + (q.gave_up?`<span class="err"> · ${fmt(q.gave_up)} gave up</span>`:'');
+      + (q.gave_up?`<span class="err"> · ${fmt(q.gave_up)} gave up</span>`:'')
+      + renqGate(q.gate);
   }
   el.innerHTML=
     (rows?`<table class="fixed vtop"><tr><th>File</th>
