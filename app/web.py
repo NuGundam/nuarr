@@ -14221,10 +14221,15 @@ tr.actsub.genhead .subgrid{border-top:1px dashed #2a3340;padding-top:6px}
 .num{text-align:right;font-variant-numeric:tabular-nums}
 /* the Activity size cell: before | -> | after | change, each a fixed slot */
 .szc{display:inline-flex;align-items:baseline;gap:0;white-space:nowrap;font-variant-numeric:tabular-nums}
-.szc>span:nth-child(1){width:58px;text-align:right}
-.szc>span:nth-child(2){width:16px;text-align:center}
-.szc>span:nth-child(3){width:58px;text-align:right}
-.szc>span:nth-child(4){width:50px;text-align:right}
+/* 58/16/58/50 CAME TO 182px, AND THE COLUMN IS A SHARE NOW. Measured at a
+   1,180px window: the size column is 179px there and the block overflowed it
+   by three. Trimmed to 166px, which fits every figure the column can hold
+   - "25.1 GB", "-100.0%" - and keeps the cell whole down to a 1,040px
+   panel, below which the phone rules hide it anyway. */
+.szc>span:nth-child(1){width:54px;text-align:right}
+.szc>span:nth-child(2){width:14px;text-align:center}
+.szc>span:nth-child(3){width:54px;text-align:right}
+.szc>span:nth-child(4){width:44px;text-align:right}
 .szc.szh>span{font-weight:inherit;text-transform:inherit}
 .pill{display:inline-block;padding:1px 8px;border-radius:20px;font-size:11px;border:1px solid}
 .p-ok{color:var(--ok);border-color:#1f4426}.p-warn{color:var(--warn);border-color:#4a3a12}
@@ -15350,10 +15355,17 @@ html.mobile .diskio .io-slot{flex:0 1 auto}
    empty. Drop the size and count columns on mobile - the title, what
    happened and when are the ones read on a phone - and let the rest scroll. */
 html.mobile #doneBox table.fixed{table-layout:auto;min-width:0}
+/* THESE COUNT COLUMNS, SO ADDING ONE MOVED THEM ALL. Before the Disk column
+   these hid Releases and the size block and sized Last; with Disk inserted at
+   3 they were hiding Disk and Releases, keeping the widest column of the six,
+   and setting the size block to 64px. On a phone the three worth the width
+   are the title, what happened and when - so 3, 4 and 5 go and 6 is Last. */
 html.mobile #doneBox th:nth-child(3),html.mobile #doneBox td:nth-child(3),
-html.mobile #doneBox th:nth-child(4),html.mobile #doneBox td:nth-child(4){display:none}
+html.mobile #doneBox th:nth-child(4),html.mobile #doneBox td:nth-child(4),
+html.mobile #doneBox th:nth-child(5),html.mobile #doneBox td:nth-child(5){display:none}
+html.mobile #doneBox th:nth-child(1){width:52% !important}
 html.mobile #doneBox th:nth-child(2){width:auto !important}
-html.mobile #doneBox th:nth-child(5){width:64px !important;padding-left:6px !important}
+html.mobile #doneBox th:nth-child(6){width:64px !important;padding-left:6px !important}
 html.mobile .scrollbox.nohz{overflow-x:auto}
 html.mobile #doneQ{width:100% !important;box-sizing:border-box}
 html.mobile .panel > h2 > span[style*="float:right"]{float:none !important;width:100%;flex-wrap:wrap}
@@ -25642,15 +25654,28 @@ function renderDone(j){
   let html='';
   if(glist.length){
     html+='<div id="doneBox" class="scrollbox nohz" style="height:460px">'
+      // EVERY COLUMN A SHARE OF THE PANEL, NOT A PIXEL COUNT.
+      //
+      // Erik: "evenly space the columns and entries across the panel". The
+      // widths were one auto column, one percentage and four fixed pixel
+      // counts, set when the middle column held a wrapping strip of bubbles.
+      // It holds one word now, so at 1,884px the layout worked out as a 770px
+      // Title beside short episode names, a 640px "What happened" holding
+      // "Processed", and Disk crushed into 118px - narrow enough that
+      // "NU-DRIVE-11 -> NU-DRIVE-2" ran straight into the Releases number
+      // beside it.
+      //
+      // Percentages that sum to 100 keep the proportions at any width. Size
+      // is the one with a floor - its four inner slots are 58/16/58/50px, so
+      // it needs 182px and 16% reaches that down to a 1,140px panel, below
+      // which the mobile rules take over anyway.
       +'<table class="fixed">'
-      +'<tr><th>Title</th>'
-      +'<th style="width:34%">What happened</th>'
-      +'<th class="nb" style="width:118px" title="the pool member this file lives on now, and where it came from if nuarr or DrivePool has moved it">Disk</th>'
-      +'<th class="num nb" style="width:66px" title="how many releases of this file have been through nuarr, and how much happened to them">Releases</th>'
-      // Size gets breathing room and Last gets enough width for "just now":
-      // at 150/74 with no gap the two ran together as "-10.2%just now".
-      +'<th class="num nb" style="width:206px;padding-right:0"><span class="szc szh"><span>before</span><span></span><span>after</span><span>change</span></span></th>'
-      +'<th class="nb" style="width:84px;padding-left:14px">Last</th></tr>';
+      +'<tr><th style="width:29%">Title</th>'
+      +'<th style="width:27%">What happened</th>'
+      +'<th class="nb" style="width:14%" title="the pool member this file lives on now, and where it came from if nuarr or DrivePool has moved it">Disk</th>'
+      +'<th class="num nb" style="width:7%" title="how many releases of this file have been through nuarr, and how much happened to them">Releases</th>'
+      +'<th class="num nb" style="width:16%;padding-right:0"><span class="szc szh"><span>before</span><span></span><span>after</span><span>change</span></span></th>'
+      +'<th class="nb" style="width:7%;padding-left:14px">Last</th></tr>';
     html+=glist.map((g,gi)=>{
       const open=_actOpen.has(g.title);
       // THE CURRENT RELEASE'S PILLS, AND NOTHING ELSE'S.
@@ -25861,7 +25886,8 @@ function renderDone(j){
       const head=`<tr class="actrow ${open?'rowopen':''}" onclick="actToggle(${gi})">
         <td class="wrap"><div class="ell" title="${esc(g.title)}"><span class="actcaret">${open?'▾':'▸'}</span><b>${esc(g.title)}</b></div></td>
         <td><div class="actwords oneline">${_words}</div></td>
-        <td class="nb" style="font-size:11px">${_diskCell}</td>
+        <td class="nb" style="font-size:11px;padding-right:10px;
+            overflow:hidden;text-overflow:ellipsis">${_diskCell}</td>
         <td class="num dim nb" title="${esc(
             (_gens.length>1
                ? `${_gens.length} releases of this file have been through nuarr`
@@ -25993,11 +26019,12 @@ function renderDone(j){
     const bar=(w,cls)=>`<span class="skelbar ${cls||''}" style="width:${w}"></span>`;
     html='<div id="doneBox" class="scrollbox nohz" style="height:460px">'
       +'<table class="fixed">'
-      +'<tr><th>Title</th><th style="width:34%">What happened</th>'
-      +'<th class="nb" style="width:118px">Disk</th>'
-      +'<th class="num nb" style="width:66px">Releases</th>'
-      +'<th class="num nb" style="width:206px"></th>'
-      +'<th class="nb" style="width:84px;padding-left:14px">Last</th></tr>'
+      +'<tr><th style="width:29%">Title</th>'
+      +'<th style="width:27%">What happened</th>'
+      +'<th class="nb" style="width:14%">Disk</th>'
+      +'<th class="num nb" style="width:7%">Releases</th>'
+      +'<th class="num nb" style="width:16%"></th>'
+      +'<th class="nb" style="width:7%;padding-left:14px">Last</th></tr>'
       + Array.from({length:7},(_,i)=>
           `<tr class="skelrow"><td class="wrap">${bar((58-i*5)+'%','tall')}</td>`
           +`<td>${bar('38%')} ${bar('24%')} ${bar('16%')}</td>`
