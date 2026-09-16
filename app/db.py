@@ -605,6 +605,65 @@ def init_db() -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS ix_history_label "
                     "ON history(label, at DESC)")
 
+        # THE LABEL IS FILLED IN BY THE DATABASE, BECAUSE NINE WRITERS FORGOT.
+        #
+        # Erik: "fix history mode blank entry". The Activity feed groups
+        # history by label, and 151,883 of 351,252 rows had none - every
+        # one of the last week's 20,989 for a file that HAS a title. So the
+        # feed showed a title called "-" with twenty-six entries and twenty
+        # "earlier releases", each a different file that happened to be
+        # nameless: moved_disk 7,149, content_changed 4,830, transcoded
+        # 4,767, upgraded 2,202, renamed 1,792, imported 231 in seven days.
+        #
+        # log_event() takes a label and most callers do not pass one; four
+        # more places INSERT into history directly and never could. Fixing
+        # each is nine edits that drift the moment a tenth writer appears.
+        # A trigger is one place: any row that arrives without a label gets
+        # its file's display label - the same "Title - S01E06" shape
+        # display_label() builds - from the files table, at insert time.
+        # A row whose file has no title, or no file at all, stays blank,
+        # which is the honest answer for it.
+        _LABEL_SQL = (
+            "(SELECT CASE"
+            "   WHEN COALESCE(f.title,'')='' THEN NULL"
+            "   WHEN f.season IS NULL AND COALESCE(f.episode,'')='' THEN f.title"
+            "   WHEN f.season IS NOT NULL AND COALESCE(f.episode,'')<>'' THEN"
+            "        f.title || ' - S' || printf('%02d', f.season) || 'E' ||"
+            # THE SAME SHAPE display_label() MAKES, OR THE ROW LANDS UNDER A
+            # DIFFERENT TITLE FROM ITS OWN JOBS. Checked against every live
+            # file before this ran: 39,601 agreed and 274 did not, all of
+            # them two-part episodes - 'S12E23-24' here against 'S12E23-E24'
+            # there. Each half is padded and the second gets its E, which is
+            # what the Python does; there are no three-part ranges and no
+            # non-numeric ones in the table.
+            "        CASE WHEN f.episode NOT GLOB '*[^0-9]*'"
+            "             THEN printf('%02d', CAST(f.episode AS INTEGER))"
+            "             WHEN f.episode GLOB '[0-9]*-[0-9]*' AND f.episode NOT GLOB '*[^0-9-]*'"
+            "             THEN printf('%02d', CAST(substr(f.episode, 1, instr(f.episode,'-')-1) AS INTEGER))"
+            "                  || '-E' ||"
+            "                  printf('%02d', CAST(substr(f.episode, instr(f.episode,'-')+1) AS INTEGER))"
+            "             ELSE f.episode END"
+            "   WHEN f.season IS NOT NULL THEN"
+            "        f.title || ' - S' || printf('%02d', f.season)"
+            "   ELSE f.title END"
+            "  FROM files f WHERE f.id = {fid})")
+        cur.execute("DROP TRIGGER IF EXISTS history_label")
+        cur.execute(
+            "CREATE TRIGGER history_label AFTER INSERT ON history "
+            " WHEN (NEW.label IS NULL OR NEW.label = '') AND NEW.file_id IS NOT NULL "
+            " BEGIN "
+            "   UPDATE history SET label = " + _LABEL_SQL.format(fid="NEW.file_id")
+            + "   WHERE id = NEW.id; "
+            " END")
+        # AND THE BACKLOG IS NAMED ONCE. Keyed on a kv flag so the 150,000-row
+        # UPDATE runs a single time, not on every start.
+        if not cur.execute("SELECT 1 FROM kv WHERE k='history_label_backfilled'"
+                           ).fetchone():
+            cur.execute(
+                "UPDATE history SET label = " + _LABEL_SQL.format(fid="history.file_id")
+                + " WHERE (label IS NULL OR label = '') AND file_id IS NOT NULL")
+            cur.execute("INSERT INTO kv(k,v) VALUES('history_label_backfilled','1')")
+
         # --- files.probe_json -> file_probes ---------------------------------
         # One-way migration, run once. The blob is moved rather than dropped so
         # nothing is lost, then the column is emptied to release the pages.

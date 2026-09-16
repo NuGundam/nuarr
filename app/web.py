@@ -24930,8 +24930,15 @@ let _actGenClosing=null;
 function actToggleGen(fid){
   const k=String(fid);
   if(_actGenClosing===k) return;            // already on its way out
+  // doneForce, LIKE actToggle. Without it the re-render went through the
+  // follow guard, and the follow guard says "you have scrolled down, hold
+  // still" - which in history mode is always, because the earlier releases
+  // are never at the top of the box. The click set the flag and painted
+  // nothing; a second click cleared the flag and painted nothing. Erik: "fix
+  // drop down for upgrade entries not opening or closing correctly". A click
+  // is a reason to repaint whatever the scroll position is.
   if(!_actGenOpen.has(k)){
-    _actGenOpen.add(k); lastListSig=null; renderDone(lastJobs);
+    _actGenOpen.add(k); doneForce=true; lastListSig=null; renderDone(lastJobs);
     return;
   }
   // CLOSING TAKES THE ROWS WITH IT, so they have to still be on the page while
@@ -24940,14 +24947,14 @@ function actToggleGen(fid){
   // changed yet, so renderDone returns early until this does the forgetting.
   const rows=document.querySelectorAll('tr.genbody[data-gen="'+k+'"]');
   if(!rows.length){
-    _actGenOpen.delete(k); lastListSig=null; renderDone(lastJobs);
+    _actGenOpen.delete(k); doneForce=true; lastListSig=null; renderDone(lastJobs);
     return;
   }
   _actGenClosing=k;
   rows.forEach(r=>r.classList.add('genout'));
   setTimeout(()=>{
     _actGenClosing=null; _actGenOpen.delete(k);
-    lastListSig=null; renderDone(lastJobs);
+    doneForce=true; lastListSig=null; renderDone(lastJobs);
   }, 165);
 }
 
