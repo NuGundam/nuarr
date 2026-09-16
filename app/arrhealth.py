@@ -24,6 +24,7 @@ string would report the same warning as newly appeared every few minutes.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 
 from . import joblog
@@ -41,6 +42,64 @@ STATE: dict = {"arrs": [], "warnings": 0, "at": 0.0, "checked": 0}
 _SEEN: set[tuple] = set()
 
 _LEVEL = {"error": "error", "warning": "warn", "notice": "info"}
+
+# ---- SWITCHING A CHECK OFF -------------------------------------------------
+#
+# Not every health check is nuarr's business. AllowedHostsCheck fires on both
+# arrs and will fire forever: on a LAN it is a deliberate configuration, not a
+# fault, so there is nothing to fix and nothing to wait for. Left alone it sits
+# in the Attention tile permanently, and a counter that never reaches zero is a
+# counter nobody reads - which is how a real warning appearing underneath it
+# goes unnoticed.
+#
+# SWITCHED OFF, NOT HIDDEN. A muted check is still fetched and still shown on
+# its arr's card, greyed, with its switch beside it. What changes is that it
+# stops COUNTING: out of STATE["warnings"], out of the tile, out of Needs
+# attention, and out of the log when it appears or clears. Hiding the row would
+# mean the only way to find what you had silenced was to remember you had.
+#
+# KEYED (arr, source, type) - the key the poller already dedupes on. Per-arr on
+# purpose: Sonarr's indexer being down and Radarr's are two different facts,
+# and silencing one must not silence the other.
+_MUTE_KEY = "arrhealth.muted"
+_MUTED: set[tuple[str, str, str]] | None = None
+
+
+def mkey(arr: str, source: str, type_: str) -> tuple[str, str, str]:
+    return (arr or "", source or "", type_ or "")
+
+
+def muted() -> set[tuple[str, str, str]]:
+    global _MUTED
+    if _MUTED is None:
+        from . import db
+        try:
+            _MUTED = {tuple(x[:3]) for x in
+                      json.loads(db.kv_get(_MUTE_KEY) or "[]")
+                      if isinstance(x, list) and len(x) == 3}
+        except Exception:                                # noqa: BLE001
+            _MUTED = set()
+    return _MUTED
+
+
+def set_muted(arr: str, source: str, type_: str, off: bool) -> int:
+    """Switch one check off (off=True) or back on. Returns the new count."""
+    from . import db
+    global _MUTED
+    key = mkey(arr, source, type_)
+    m = set(muted())
+    m.add(key) if off else m.discard(key)
+    _MUTED = m
+    db.kv_set(_MUTE_KEY, json.dumps(sorted(list(k) for k in m)))
+    # THE COUNT MOVES NOW, not at the next poll five minutes from now. The
+    # tile reads STATE["warnings"], so leaving that stale would make pressing
+    # the switch look like it had done nothing at all.
+    STATE["warnings"] = len(warnings_list(10_000))
+    joblog.log(f"{arr}: {source or type_} switched "
+               f"{'off' if off else 'back on'}"
+               f" - {STATE['warnings']} warning(s) now counted",
+               "info", system="arrhealth")
+    return STATE["warnings"]
 
 
 async def _one(cfg) -> dict:
@@ -92,13 +151,18 @@ async def refresh() -> dict:
     # pre-existing warnings as "new" every time nuarr restarts would train the
     # eye to skip them, which is the opposite of the point.
     if STATE["checked"]:
+        _off = muted()
         for key in sorted(now - _SEEN):
+            if key in _off:
+                continue
             h = detail[key]
             joblog.log(f"{key[0]}: {h.get('source') or h.get('type')} — "
                        f"{h.get('message','')[:140]}",
                        "error" if h.get("level") == "error" else "warn",
                        system="arrhealth")
         for key in sorted(_SEEN - now):
+            if key in _off:
+                continue
             joblog.log(f"{key[0]}: {key[1] or key[2]} cleared", "ok",
                        system="arrhealth")
     _SEEN = now
@@ -127,8 +191,11 @@ def warnings_list(limit: int = 50) -> list[dict]:
     the same list it returns - so the two cannot disagree again.
     """
     out: list[dict] = []
+    off = muted()
     for r in STATE.get("arrs") or []:
         for h in r.get("health") or []:
+            if mkey(r.get("arr"), h.get("source"), h.get("type")) in off:
+                continue
             out.append({
                 "arr": r.get("arr") or "",
                 "kind": r.get("kind") or "",
@@ -141,7 +208,8 @@ def warnings_list(limit: int = 50) -> list[dict]:
         # AN ARR THAT DOES NOT ANSWER IS THE LOUDEST WARNING OF ALL, and it
         # was never counted: _one() returns early on a connection failure, so
         # `health` is empty and the arr simply vanished from the reckoning.
-        if r.get("error"):
+        if r.get("error") and mkey(
+                r.get("arr"), "nuarr", "Unreachable") not in off:
             out.append({
                 "arr": r.get("arr") or "", "kind": r.get("kind") or "",
                 "type": "Unreachable", "level": "error", "source": "nuarr",
@@ -153,6 +221,17 @@ def warnings_list(limit: int = 50) -> list[dict]:
 
 def snapshot() -> dict:
     d = dict(STATE)
+    # THE CARDS SHOW EVERY CHECK, muted or not, so each row carries its own
+    # state rather than the page rebuilding the key and guessing. Copied, not
+    # annotated in place: STATE belongs to the poller and a view must not
+    # write into it.
+    off = muted()
+    d["arrs"] = [dict(r, health=[
+        dict(h, muted=mkey(r.get("arr"), h.get("source"), h.get("type")) in off)
+        for h in (r.get("health") or [])],
+        unreachable_muted=mkey(r.get("arr"), "nuarr", "Unreachable") in off)
+        for r in (STATE.get("arrs") or [])]
+    d["muted"] = [list(k) for k in sorted(off)]
     # The list rides with the count, so anything reading the snapshot gets
     # both and cannot pick one without the other.
     d["warning_list"] = warnings_list()

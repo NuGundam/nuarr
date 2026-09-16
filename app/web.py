@@ -10135,6 +10135,23 @@ async def api_arrs_health(refresh: bool = False):
     return arrhealth.snapshot()
 
 
+@app.post("/api/arrs/health/mute")
+async def api_arrs_health_mute(arr: str, type: str = "", source: str = "",
+                               off: bool = True):
+    r"""Stop counting one health check, or start again.
+
+    THE THREE PARTS GO OVER THE WIRE SEPARATELY rather than as one joined key.
+    An arr's name is whatever Erik typed, so any delimiter chosen here is one
+    somebody can eventually put in a name - and the failure mode of a key that
+    splits wrongly is silencing a different check than the one clicked, which
+    nothing on the page would show.
+    """
+    from . import arrhealth
+    n = arrhealth.set_muted(arr, source, type, bool(off))
+    return {"ok": True, "warnings": n,
+            "muted": [list(k) for k in sorted(arrhealth.muted())]}
+
+
 @app.get("/api/metadata")
 async def api_metadata():
     r"""The metadata chain, stated as a chain rather than as a status light.
@@ -15231,6 +15248,11 @@ tr.logrow td{background:#1c2129;border-bottom:1px solid var(--acc);padding:0 12p
         margin-left:auto;text-transform:uppercase;letter-spacing:.5px}
 .gstate.on{color:var(--ok);border-color:var(--ok);background:rgba(63,185,80,.10)}
 .gstate.off{color:var(--dim);border-color:var(--line)}
+.ahsw{flex:none;font-size:9.5px;line-height:1.6;padding:0 6px;border-radius:9px;
+      border:1px solid var(--ok);color:var(--ok);background:rgba(63,185,80,.10);
+      text-transform:uppercase;letter-spacing:.5px;cursor:pointer;min-width:30px}
+.ahsw.off{color:var(--dim);border-color:var(--line);background:transparent}
+.ahsw:hover{filter:brightness(1.3)}
 .gwhat{font-size:12.5px;color:var(--fg);opacity:.85;margin:5px 0 0 26px;line-height:1.45}
 .gba{margin:7px 0 0 26px;display:grid;gap:4px;font-size:12px;line-height:1.45}
 .gba>div{display:flex;gap:7px;align-items:baseline;color:var(--dim)}
@@ -28082,8 +28104,11 @@ function dpPlaceHtml(d){
       flex-wrap:wrap;margin-top:7px;font-size:13px">
       <span class="dim" style="font-size:11px;min-width:62px">latest</span>
       ${where(head,true)}
-      <span class="dim" style="font-size:11.5px">${fullness(head)}</span>
-      <span class="dim" style="font-size:11.5px;margin-left:auto">${
+      <span class="dim" style="font-size:11.5px;min-width:0;overflow:hidden;
+        text-overflow:ellipsis;white-space:nowrap"
+        title="${esc(head.why||'')}">${fullness(head)}</span>
+      <span class="dim" style="font-size:11.5px;margin-left:auto;
+        white-space:nowrap;padding-left:10px">${
         dpDur(Math.max(0,Date.now()/1000-head.at))} ago</span>
     </div>
     <div style="font-size:11.5px;color:#8fa3b8;overflow:hidden;
@@ -28091,9 +28116,14 @@ function dpPlaceHtml(d){
         title="${esc(head.file||'')}">${esc(head.file||'')}</div>`:'';
   const rows=rest.map(L=>`<tr>
       <td class="mono dim" style="padding:2px 10px 2px 0;white-space:nowrap;
-          font-size:10.5px;width:62px">${dpDur(Math.max(0,Date.now()/1000-L.at))} ago</td>
-      <td style="padding:2px 10px 2px 0;white-space:nowrap">${where(L)}</td>
+          overflow:hidden;text-overflow:ellipsis;
+          font-size:10.5px">${dpDur(Math.max(0,Date.now()/1000-L.at))} ago</td>
+      <td style="padding:2px 10px 2px 0;white-space:nowrap;
+          overflow:hidden;text-overflow:ellipsis"
+          title="${esc((L.placed?'placed on ':'stayed on ')+(L.chosen||L.from||''))}"
+          >${where(L)}</td>
       <td class="dim" style="padding:2px 10px 2px 0;white-space:nowrap;
+          overflow:hidden;text-overflow:ellipsis;
           font-size:11px" title="${esc(L.why||'')}">${fullness(L)}</td>
       <td style="padding:2px 0;overflow:hidden;text-overflow:ellipsis;
           white-space:nowrap;max-width:0;font-size:11px;color:#8fa3b8"
@@ -28117,8 +28147,8 @@ function dpPlaceHtml(d){
     ${lead}
     ${rows?`<table style="width:100%;font-size:12px;border-collapse:collapse;
       margin-top:6px;padding-top:6px;border-top:1px solid var(--line);
-      table-layout:fixed"><colgroup><col style="width:62px">
-        <col style="width:240px"><col style="width:190px"><col style="width:auto">
+      table-layout:fixed"><colgroup><col style="width:78px">
+        <col style="width:230px"><col style="width:250px"><col style="width:auto">
       </colgroup><tbody>${rows}</tbody></table>`:''}
     ${rec.length?'':'<div class="dim" style="font-size:11.5px;margin-top:4px">No commit has been placed yet this run.</div>'}
   </div>`;
@@ -32076,16 +32106,24 @@ async function loadArrHealth(force){
   const age = d.age_s==null ? 'just now'
             : d.age_s<60 ? `${d.age_s}s ago`
             : `${Math.round(d.age_s/60)}m ago`;
+  const nOff=(d.muted||[]).length;
   el.innerHTML=`<div class="dim" style="font-size:11px;display:flex;
       align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap">
       <span>Checked every ${Math.round((d.poll_s||300)/60)} min · last ${esc(age)}
         ${d.warnings?`· <b style="color:#e2b341">${d.warnings} open</b>`
-                    :'· <b style="color:#7fd4a3">all clear</b>'}</span>
+                    :'· <b style="color:#7fd4a3">all clear</b>'}${
+        nOff?` · <b class="dim">${nOff} switched off</b>`:''}</span>
       <button onclick="loadArrHealth(true)" style="font-size:11px">Check now</button>
       <span class="dim">Appearing and clearing are both logged — filter the
-        log by <b>Arr health</b>.</span>
+        log by <b>Arr health</b>. A check switched off stays on its card and
+        stops counting.</span>
     </div>` + rows.map(a=>{
-    const bad=(a.health||[]).filter(h=>String(h.type||'').toLowerCase()!=='ok');
+    const all=(a.health||[]).filter(h=>String(h.type||'').toLowerCase()!=='ok');
+    // WHAT THE BADGE COUNTS IS WHAT THE TILE COUNTS. Both now mean "open and
+    // still being counted" - a card reading "2 warnings" over two rows that
+    // have been switched off would put the panel back in disagreement with
+    // the tile, which is the bug this whole area started as.
+    const bad=all.filter(h=>!h.muted);
     // The badge before the name, so two cards are told apart by colour at a
     // glance rather than by reading them.
     const head=`${arrIcon(a.kind||a.arr, 15)} <b>${esc(a.arr)}</b>`
@@ -32097,12 +32135,25 @@ async function loadArrHealth(force){
     // Each warning on its own line, with the source named. "IndexerLongTerm
     // StatusCheck" alone says nothing; "NZBFinder (Prowlarr)" is the thing to
     // go and look at.
-    const list = bad.length
-      ? bad.map(h=>`<div class="${h.level==='error'?'err':'dim'}"
-           style="font-size:11px;margin-top:3px;line-height:1.45">
-           <b>${esc(h.source||h.type||'')}</b> — ${esc(h.message||'')}
-           ${h.url?` <a href="${esc(h.url)}" target="_blank"
-             rel="noopener noreferrer">why</a>`:''}</div>`).join('')
+    // Switched-off rows go last, because the ones being counted are the ones
+    // being read; and they stay visible, because a silenced check you cannot
+    // find is a silenced check you cannot undo.
+    const one=h=>`<div class="${h.muted?'dim':(h.level==='error'?'err':'dim')}"
+           style="font-size:11px;margin-top:3px;line-height:1.45;display:flex;
+             gap:7px;align-items:baseline${h.muted?';opacity:.55':''}">
+           <button class="ahsw${h.muted?' off':''}" title="${h.muted
+               ? 'switched off — not counted; click to count it again'
+               : 'stop counting this check — it stays here, greyed'}"
+             onclick="arrMute('${jsq(a.arr)}','${jsq(h.type||'')}','${
+               jsq(h.source||'')}',${h.muted?'false':'true'})"
+             >${h.muted?'off':'on'}</button>
+           <span style="min-width:0">
+             <b${h.muted?' style="text-decoration:line-through"':''
+               }>${esc(h.source||h.type||'')}</b> — ${esc(h.message||'')}
+             ${h.url?` <a href="${esc(h.url)}" target="_blank"
+               rel="noopener noreferrer">why</a>`:''}</span></div>`;
+    const list = all.length
+      ? all.slice().sort((x,y)=>(x.muted?1:0)-(y.muted?1:0)).map(one).join('')
       : (a.ok?'<div class="dim" style="font-size:11px;margin-top:3px">'
               +'nothing to report</div>':'');
     return `<div style="border:1px solid var(--line);border-radius:8px;
@@ -32110,6 +32161,20 @@ async function loadArrHealth(force){
         <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">${head}</div>
         ${list}</div>`;
   }).join('');
+}
+
+async function arrMute(arr, type, source, off){
+  try{
+    await fetch('/api/arrs/health/mute?arr='+encodeURIComponent(arr)
+      +'&type='+encodeURIComponent(type||'')
+      +'&source='+encodeURIComponent(source||'')
+      +'&off='+(off?'true':'false'), {method:'POST'});
+  }catch(e){}
+  // Repaint from the server rather than from the click: the count is
+  // recomputed there, and a panel that adjusted itself optimistically would
+  // disagree with the tile for as long as anyone was looking at it.
+  loadArrHealth();
+  if(typeof loadAttention==='function'){ try{ loadAttention(); }catch(e){} }
 }
 
 // The original-language pull, on the Arrs page where it belongs. Reads
