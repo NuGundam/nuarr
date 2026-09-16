@@ -25697,9 +25697,31 @@ function renderDone(j){
       const _settled = !!_cur && !_busy.has(Number(_cur.fid))
         && lbls.some(([l])=>l.split(' \u00b7 ')[0]==='checked')
         && !lbls.some(([l])=>BAD_LBL.has(l.split(' \u00b7 ')[0]));
-      const _shown = _settled
-        ? lbls.filter(([l])=>l.split(' \u00b7 ')[0]==='checked')
-        : lbls.slice(0, PILL_MAX);
+      // A FINISHED FILE SAYS HOW IT GOT HERE, NOT THAT IT WAS LOOKED AT.
+      //
+      // Erik: "instead of checked change it to if the file has been
+      // replaced/imported/upgraded instead". "Checked" is true of every
+      // settled row and therefore tells you nothing between one row and the
+      // next; the landing word is the one fact that differs - this file came
+      // in fresh, or it displaced something.
+      //
+      // A file nuarr found by walking the disk rather than by an arr
+      // announcing it has no landing at all, so `checked` stays as the
+      // fallback: it is still the honest word for "measured, decided, fine".
+      const LANDING=['replaced','upgraded','imported'];
+      const _landed = _settled
+        ? lbls.filter(([l])=>LANDING.includes(l.split(' \u00b7 ')[0])) : [];
+      const _shown = !_settled ? lbls.slice(0, PILL_MAX)
+        : (_landed.length ? _landed
+           : lbls.filter(([l])=>l.split(' \u00b7 ')[0]==='checked'));
+      // AND "UPGRADED" IS EARNED, NOT ASSUMED. The word only appears where
+      // the arr's own score says this release beat the one it displaced -
+      // which is why the pill was renamed to Replaced in the first place.
+      // Until the score backfill reaches a title, both sides are unknown and
+      // it stays Replaced, which is what nuarr can actually see.
+      const _prevGen=_gens.length>1 ? _gens[_gens.length-2] : null;
+      const _better = !!(_cur && _prevGen && _cur.score!=null
+                         && _prevGen.score!=null && _cur.score > _prevGen.score);
       // FAILED - REPLACED IS ONE THING THAT HAPPENED, not two. Erik named it
       // himself: a release that broke and was swapped out for another is a
       // single sentence, and printing "Failed" beside "Replaced" leaves the
@@ -25719,7 +25741,9 @@ function renderDone(j){
         // Deduplicated: two jobs of one kind are one thing that happened.
         const seen=new Set(); const out=[];
         for(const [l] of _shown){
-          const [txt,col]=phraseOf(l);
+          let [txt,col]=phraseOf(l);
+          if(_better && l.split(' \u00b7 ')[0]==='replaced')
+            [txt,col]=WORDS.upgraded;
           if(seen.has(txt)) continue;
           seen.add(txt);
           out.push(`<span style="color:${col}">${esc(txt)}</span>`);
