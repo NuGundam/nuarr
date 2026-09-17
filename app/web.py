@@ -31701,9 +31701,9 @@ function subNeedPaint(){
         The library reader fills these in as it goes.</div>`:''}
     ${miss?`<div style="margin-top:8px;max-height:420px;overflow:auto">
       <table style="width:100%;font-size:12px;border-collapse:collapse;
-        table-layout:fixed"><colgroup><col style="width:auto">
-        <col style="width:58px"><col style="width:120px">
-        <col style="width:96px"><col style="width:128px"></colgroup>
+        table-layout:fixed"><colgroup><col style="width:34%">
+        <col style="width:7%"><col style="width:31%">
+        <col style="width:12%"><col style="width:16%"></colgroup>
       <thead><tr class="dim" style="font-size:10px;letter-spacing:.05em;
         text-transform:uppercase"><th style="text-align:left">file</th>
         <th style="text-align:left">wants</th>
@@ -31717,13 +31717,14 @@ function subNeedPaint(){
                 r.episode?'E'+String(r.episode).padStart(2,'0'):''}</span>`:''}</td>
         <td style="padding:3px 8px 3px 0"><span class="pill"
             style="color:#e8a33d;border-color:#4a3a12">${esc(r.lang||'')}</span></td>
-        <td class="dim" style="padding:3px 8px 3px 0;overflow:hidden;
+        <td class="dim" style="padding:3px 10px 3px 0;overflow:hidden;
             text-overflow:ellipsis;white-space:nowrap;font-size:11px"
             title="${esc(r.why||'')}">${esc(r.why||'')}</td>
         <td class="dim mono" style="padding:3px 8px 3px 0;font-size:10.5px;
             overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
             >${esc(r.pool_disk||'')}</td>
-        <td style="padding:3px 0"><button style="font-size:10.5px"
+        <td style="padding:3px 0"><button style="font-size:10.5px;
+            white-space:nowrap;width:100%"
             title="Blocklist this release so the arr never grabs it again, delete the file, and search for a replacement. ${esc(String(Math.round((r.size||0)/1073741824*100)/100))} GB is deleted. Not reversible."
             onclick="subNeedReplace(this, ${r.file_id})"
             >blocklist &amp; re-download</button></td>

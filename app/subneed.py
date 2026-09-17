@@ -102,6 +102,13 @@ OK, MISSING, UNKNOWN = "ok", "missing", "unknown"
 
 KIND = "subs/missing-language"
 
+# THE SAME LINE hardsub.py DRAWS FOR "A DIALOGUE CADENCE", and deliberately
+# the same number rather than one of this module's own: it is being used to
+# ask the same question, and two thresholds for one question drift apart.
+# hardsub counts frames with something bright LOW in the picture - where
+# subtitles live - and calls 20% of them a dialogue rhythm.
+PICTURE_MARKS_RATIO = 0.20
+
 # Slow on purpose. Nothing here touches a disk - it reads sub_facts, hardsub
 # and file_probes, all of which somebody else has already filled in - so the
 # cost is a few table scans, and the thing it is looking for changes only when
@@ -193,8 +200,19 @@ def _audio_langs(file_id: int, cur) -> set[str]:
             for s in streams if s.get("codec_type") == "audio"}
 
 
+def _picture(file_id: int, cur, pic=None):
+    if pic is not None:
+        return pic
+    try:
+        return cur.execute(
+            "SELECT state, chosen, low_hits, samples, words FROM hardsub "
+            " WHERE file_id=?", (int(file_id),)).fetchone()
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
 def verdict(file_id: int, lang: str, cur, facts=None,
-            untagged_ok: bool = True) -> tuple[str, str]:
+            untagged_ok: bool = True, pic=None) -> tuple[str, str]:
     """Does this file carry `lang` subtitles? Returns (state, why).
 
     `facts` is an optional pre-fetched sub_facts row, so a sweep over 40,000
@@ -243,21 +261,64 @@ def verdict(file_id: int, lang: str, cur, facts=None,
                 return OK, ("has an untagged subtitle track, which this "
                             "library keeps - it may be the one")
 
-    try:
-        pic = json.loads(facts["picture"] or "{}")
-    except Exception:                                            # noqa: BLE001
-        pic = {}
+    # ---- THE PICTURE, AND THE THREE THINGS IT CAN SAY ----------------------
+    #
+    # Erik: "shows like City Hunter have burn-in subs so the system should
+    # account for that too". They do, and it did not - because a `none`
+    # verdict from the picture reader was being read as "there is nothing in
+    # the picture", and that is not what it means.
+    #
+    # hardsub samples 24 frames, counts the ones with something bright low in
+    # the picture, then OCRs them. If the OCR brings back no readable words
+    # the verdict is NONE - correctly, from its point of view: it cannot show
+    # you a caption it could not read. But the frame counts are still there,
+    # and on City Hunter S01E20 they read:
+    #
+    #     state='none'   low_hits=16   samples=24   words=''
+    #
+    # Two thirds of sampled frames had subtitle-shaped marks in the subtitle
+    # band and not one word came back - which is what an SDTV-era hardsub
+    # looks like to an OCR trained on clean type. Treating that as "no
+    # subtitles" put 126 of 146 files on a list offering to delete them.
+    # Measured across the whole list when this was written:
+    #
+    #     146 missing
+    #     126 ... the reader saw marks it could not read   <- these
+    #      20 ... the picture really is clean
+    #
+    # So `none` is only evidence of a clean picture when the FRAME COUNTS
+    # agree. Above the line, the picture question is unresolved and the file
+    # goes to `unknown` with the rest of what nuarr does not know.
+    prow = _picture(file_id, cur, pic)
+    if prow is None:
+        return UNKNOWN, ("the picture reader has not looked at this file, so "
+                         "burned-in subtitles cannot be ruled out")
+    pstate = str((prow["chosen"] if "chosen" in prow.keys() else None)
+                 or prow["state"] or "")
     # `signs` is deliberately not on this list. Signs and songs are not
     # dialogue, and a file carrying only those still needs subtitles.
-    if str(pic.get("state") or "") in ("dialogue", "hybrid"):
+    if pstate in ("dialogue", "hybrid"):
         return OK, "the dialogue is burned into the picture"
 
     if lang in _audio_langs(file_id, cur):
         return OK, f"the audio is already in {lang}"
 
+    n_s = int(prow["samples"] or 0)
+    n_lo = int(prow["low_hits"] or 0)
+    if n_s and (n_lo / n_s) >= PICTURE_MARKS_RATIO:
+        return UNKNOWN, (
+            f"the picture reader found marks low in the picture in "
+            f"{n_lo} of {n_s} frames but could read none of them - burned-in "
+            f"subtitles it cannot transcribe look exactly like this")
+    if not n_s:
+        return UNKNOWN, ("the picture reader has no frames for this file, so "
+                         "burned-in subtitles cannot be ruled out")
+
     n = len(tracks) + len(sides)
-    return MISSING, ("carries no subtitles at all" if not n
-                     else f"carries {n} subtitle(s), none of them {lang}")
+    return MISSING, ("carries no subtitles at all, and nothing in the picture"
+                     if not n
+                     else f"carries {n} subtitle(s), none of them {lang}, "
+                          f"and nothing in the picture")
 
 
 # -------------------------------------------------------------- the sweep ---
@@ -322,16 +383,22 @@ def sweep(limit: int = BATCH) -> dict:
                 untagged = _keeps_untagged(lib)
                 rows = cur.execute(
                     "SELECT f.id, f.library, s.tracks, s.sides, s.picture, "
+                    "       h.state, h.chosen, h.low_hits, h.samples, "
                     "       (SELECT MIN(n.checked_at) FROM sub_need n "
-                    "         WHERE n.file_id=f.id) AS seen "
+                    "         WHERE n.file_id=f.id) AS seen, "
+                    "       (h.file_id IS NOT NULL) AS haspic "
                     "  FROM files f LEFT JOIN sub_facts s ON s.file_id=f.id "
+                    "                LEFT JOIN hardsub h ON h.file_id=f.id "
                     " WHERE f.library=? AND f.state NOT IN ('deleted','duplicate') "
                     " ORDER BY seen IS NOT NULL, seen "
                     " LIMIT ?", (lib, int(limit))).fetchall()
                 now = time.time()
                 for r in rows:
+                    # The joined row carries the picture columns, so the sweep
+                    # does not make a second query per file to read them.
+                    prow = r if r["haspic"] else None
                     for lang in want:
-                        st, why = verdict(r["id"], lang, cur, r, untagged)
+                        st, why = verdict(r["id"], lang, cur, r, untagged, prow)
                         tally[st] = tally.get(st, 0) + 1
                         cur.execute(
                             "INSERT INTO sub_need"
