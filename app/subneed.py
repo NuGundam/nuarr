@@ -121,7 +121,10 @@ POLL_S = 900.0
 BATCH = 5000
 
 STATE: dict = {"running": False, "at": 0.0, "took": 0.0, "checked": 0,
-               "ok": 0, "missing": 0, "unknown": 0, "err": "", "runs": 0}
+               "ok": 0, "missing": 0, "unknown": 0, "err": "", "runs": 0,
+               # A RUN YOU ASKED FOR, measured: how much of the library it
+               # has judged so far and how much is left, for the bar.
+               "done": 0, "total": 0, "t0": 0.0}
 
 _READY = False
 
@@ -442,8 +445,13 @@ def counts() -> dict:
 def missing(limit: int = 200, library: str = "") -> list[dict]:
     """The files that are actually missing something, newest verdict first."""
     init()
+    # first_seen is WHEN THE FILE ARRIVED, which is what an "added" column
+    # means to a person deciding about it - "this landed an hour ago" says
+    # it is the batch just grabbed. The first draft sent 0 and the column
+    # drew a dash on every row. Erik: "fix date under ADDED column".
     sql = ("SELECT n.file_id, n.lang, n.library, n.why, n.checked_at, "
-           "       f.path, f.title, f.season, f.episode, f.size, f.pool_disk "
+           "       f.path, f.title, f.season, f.episode, f.size, f.pool_disk, "
+           "       f.first_seen "
            "  FROM sub_need n JOIN files f ON f.id=n.file_id "
            " WHERE n.state='missing'"
            + (" AND n.library=?" if library else "") +
@@ -451,9 +459,32 @@ def missing(limit: int = 200, library: str = "") -> list[dict]:
     args = ((library, int(limit)) if library else (int(limit),))
     try:
         with cursor() as cur:
-            return [dict(r) for r in cur.execute(sql, args)]
+            out = [dict(r) for r in cur.execute(sql, args)]
     except Exception:                                            # noqa: BLE001
         return []
+    for r in out:
+        r["short"] = short_why(r.get("why") or "")
+    return out
+
+
+def short_why(why: str) -> str:
+    """The sentence, as a phrase. Erik: "simplify title info".
+
+    The long form is right for a tooltip and wrong for a column: "carries no
+    subtitles at all, and nothing in the picture" is read once, and after
+    that the eye wants a word it can run down.
+    """
+    w = (why or "").lower()
+    if w.startswith("carries no subtitles at all"):
+        return "no subtitles at all"
+    if w.startswith("carries "):
+        # "carries 2 subtitle(s), none of them eng, and nothing in the picture"
+        try:
+            n = int(w.split()[1])
+        except (IndexError, ValueError):
+            n = 0
+        return f"{n} other-language track{'s' if n != 1 else ''}"
+    return why[:40]
 
 
 def unknown_sample(limit: int = 20) -> list[dict]:
@@ -484,6 +515,10 @@ def snapshot() -> dict:
             "any_required": bool(req),
             "mode": mode(),
             "running": bool(STATE["running"]),
+            "done": int(STATE.get("done") or 0),
+            "total": int(STATE.get("total") or 0),
+            "elapsed": (round(time.time() - STATE["t0"], 1)
+                        if STATE["running"] and STATE.get("t0") else 0.0),
             "at": STATE["at"], "took": STATE["took"], "runs": STATE["runs"],
             "err": STATE["err"],
             "age_s": (round(time.time() - STATE["at"]) if STATE["at"] else None),
@@ -491,6 +526,60 @@ def snapshot() -> dict:
 
 
 # ------------------------------------------------------------ the loop ------
+def _total() -> int:
+    """How many files the required libraries hold - the bar's denominator."""
+    libs = list(required())
+    if not libs:
+        return 0
+    try:
+        with cursor() as cur:
+            return int(cur.execute(
+                "SELECT COUNT(*) n FROM files WHERE library IN (%s) "
+                "  AND state NOT IN ('deleted','duplicate')"
+                % ",".join("?" * len(libs)), tuple(libs)).fetchone()["n"])
+    except Exception:                                            # noqa: BLE001
+        return 0
+
+
+def sweep_all() -> dict:
+    r"""Judge EVERY file, not one batch, and say how far along it is.
+
+    Erik: "fix the scan now ... and show scanning animation". The button
+    called sweep() once, which judges BATCH rows and returns - a fifth of the
+    library - and reported nothing while it did it. So Check now looked like
+    it had done something small or nothing at all, and there was no way to
+    tell which.
+
+    This runs batches back to back until every file has been judged in THIS
+    run, keeps done/total current so a bar can move, and refuses to overlap
+    itself. It is still cheap - stored facts only, no disk - so the whole
+    library is a few seconds; but a few seconds with nothing moving reads as
+    broken, and a few seconds with a bar reads as working.
+    """
+    if STATE["running"]:
+        return {"ok": False, "why": "already running"}
+    total = _total()
+    STATE.update(running=True, done=0, total=total, t0=time.time(), err="")
+    started = time.time()
+    n = 0
+    try:
+        # sweep() picks the least-recently-judged rows first, so running it
+        # until it has covered `total` rows covers the library exactly once.
+        while n < total:
+            r = sweep(BATCH)
+            got = int(r.get("checked") or 0)
+            if not got:
+                break
+            n += got
+            STATE["done"] = min(n, total)
+            # sweep() flips running off when it returns; this run is not over.
+            STATE["running"] = True
+    finally:
+        STATE.update(running=False, done=min(n, total))
+    return {"ok": True, "checked": n, "total": total,
+            "took": round(time.time() - started, 1), **counts()}
+
+
 async def watch() -> None:
     from . import schedules
     schedules.register(

@@ -44,13 +44,7 @@ SCHED_KEY = "subkind"
 CYCLE_S = 300.0
 
 PICTURE = "picture"
-# THE THIRD SOURCE. A picture row says "the words are painted in"; a track row
-# says "this track's title lies"; a language row says "the language this
-# library requires is nowhere in the file at all". Same table, because Erik
-# wants "all scanning and decision done in one place" - and because a person
-# deciding what to do with a file wants every finding about it in one list,
-# not one list per module that happened to notice.
-LANGUAGE = "language"
+
 
 STATE: dict = {"running": False, "phase": "", "t0": 0.0, "last_run": 0.0,
                "runs": 0, "last_took": 0.0, "last_error": "",
@@ -162,65 +156,6 @@ def _picture_rows(limit: int) -> list:
             "found_at": float(r.get("at") or 0.0),
         })
     return out
-
-
-def _language_rows(limit: int) -> list:
-    """Every missing-required-language finding, in the merged shape.
-
-    ONLY `missing`. subneed's `unknown` verdict - never looked inside, or the
-    picture reader saw marks it could not read - is deliberately not a row
-    here, because a row in this table has a button on it and unknown must
-    never reach one. It is counted in the section above the table instead.
-    """
-    from . import subneed
-    auto = subneed.mode() == "auto"
-    out = []
-    for r in subneed.missing(limit):
-        lang = str(r.get("lang") or "").lower()
-        out.append({
-            "id": f"{r['file_id']}:{LANGUAGE}:{lang}",
-            "file_id": int(r["file_id"]), "source": f"{LANGUAGE}:{lang}",
-            "lang": lang,
-            "source_word": "the whole file",
-            "path": r.get("path") or "", "label": _label_of(r),
-            "library": r.get("library") or "",
-            # Not a reading with a score - a fact about the container. 100
-            # because it is certain, and because that sorts it after the
-            # genuinely uncertain rows, which are the ones a person's
-            # attention is for.
-            "kind": f"no {lang}", "chosen": False, "kinds": [],
-            "sure": 100, "read": True, "unread": False,
-            "evidence": r.get("why") or "",
-            "why": f"carries no {lang} subtitles in any form",
-            "auto": "act" if auto else "ask",
-            "auto_why": ("the missing-language check is in auto, so the "
-                         "shared remedy will blocklist and re-search this"
-                         if auto else
-                         "the missing-language check is in manual, so this "
-                         "waits for you"),
-            "action": "replace",
-            "action_word": "Blocklist & re-download",
-            "done": False, "done_word": "",
-            "detail": r.get("why") or "",
-            "size": int(r.get("size") or 0),
-            "disk": r.get("pool_disk") or "",
-            "added": 0.0,
-            "found_at": float(r.get("checked_at") or 0.0),
-        })
-    return out
-
-
-def _label_of(r: dict) -> str:
-    t = str(r.get("title") or "")
-    s, e = r.get("season"), r.get("episode")
-    if s:
-        t += f" S{int(s):02d}"
-        if e:
-            try:
-                t += f"E{int(str(e).split('-')[0]):02d}"
-            except ValueError:
-                t += f"E{e}"
-    return t
 
 
 def _track_rows(limit: int) -> list:
@@ -348,19 +283,6 @@ def _safe(fn):
         return {}
 
 
-def _need_summary(limit: int = 200) -> dict:
-    """Files carrying none of a subtitle language their library requires."""
-    from . import subneed
-    d = subneed.snapshot()
-    d["missing_list"] = subneed.missing(limit)
-    try:
-        from . import remedy
-        d["budget"] = remedy.budget()
-    except Exception:                                            # noqa: BLE001
-        d["budget"] = {}
-    return d
-
-
 def findings(limit: int = 600, want_done: bool = True,
              want_unread: bool = True) -> dict:
     r"""Everything, least certain first, with the counts the header needs.
@@ -381,7 +303,7 @@ def findings(limit: int = 600, want_done: bool = True,
     the wire.
     """
     from . import hardsub, subtitletitle as stt
-    rows = _picture_rows(limit) + _track_rows(limit) + _language_rows(limit)
+    rows = _picture_rows(limit) + _track_rows(limit)
     lo, hi = dismiss_at(), mark_at()
     mid = (lo + hi) / 2.0
     # LEAST CERTAIN FIRST among the rows that can be answered; the unread
@@ -406,8 +328,6 @@ def findings(limit: int = 600, want_done: bool = True,
     _queued = _queued_steps()
     for r in rows:
         if r["done"] or not r.get("action"):
-            continue
-        if str(r["source"]).startswith(LANGUAGE):
             continue
         want = "mark" if r["source"] == PICTURE else "retitle"
         hit = _queued.get(int(r.get("file_id") or 0)) or {}
@@ -465,7 +385,6 @@ def findings(limit: int = 600, want_done: bool = True,
         # files are still owed a marker track. These two are counts of the
         # library and are always true.
         "marker": _safe(lambda: hardsub.marker()),
-        "need": _safe(lambda: _need_summary()),
         "auto": {
             "marked": STATE.get("auto_marked") or 0,
             "dropped": STATE.get("auto_dropped") or 0,

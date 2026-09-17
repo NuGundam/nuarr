@@ -8013,25 +8013,6 @@ async def api_subkind_act(file_id: int, source: str, kind: str = "",
     """Yes, do this one: recorded, remembered, and put on the queue."""
     if confirm != "yes":
         return {"ok": False, "why": "confirm=yes required"}
-    # A LANGUAGE ROW IS NOT SETTLED, IT IS REPLACED. Nothing is remembered
-    # against the show and nothing goes on the planner's queue: the file is
-    # deleted, the release blocklisted and the arr asked for another. Same
-    # path the standalone button used, with the same refusal for a file
-    # nuarr has not looked inside - the rule lives in the endpoint, not the
-    # button, because anything that deletes 5 GB has to hold its own rule.
-    if str(source).startswith("language"):
-        from . import remedy
-        with cursor() as cur:
-            n = cur.execute("SELECT state, why FROM sub_need WHERE file_id=? "
-                            " ORDER BY state LIMIT 1", (int(file_id),)).fetchone()
-        if not n or n["state"] != subneed.MISSING:
-            return {"ok": False, "why": (
-                "nuarr has not looked inside this file, so it has no opinion "
-                "about what is missing from it" if (n and n["state"] == "unknown")
-                else "this file is not recorded as missing a required language")}
-        return await remedy.replace(int(file_id), subneed.KIND,
-                                    source="subneed", why=n["why"] or "",
-                                    auto=False)
     r = await asyncio.to_thread(_sk_settle, int(file_id), source, kind,
                                 "mark" if source == "picture" else "retitle")
     try:
@@ -8065,19 +8046,6 @@ async def api_subkind_act_batch(ids: str = "", confirm: str = "",
         return {"ok": False, "why": "confirm=yes required"}
     _ = force
     items = _sk_items(ids)
-    # A LANGUAGE ROW IS NEVER PART OF A BATCH. The batch settles readings -
-    # a kind recorded, a title corrected, a marker queued - and none of that
-    # is reversible only in the sense of costing GPU time. A language row's
-    # answer deletes a file and blocklists a release. "Select all, Yes" must
-    # not be able to do that to twenty files at once with one confirmation
-    # written for retitles. Each one is its own button, its own question,
-    # naming its own file and its own size.
-    skipped = [i for i in items if str(i["source"]).startswith("language")]
-    items = [i for i in items if not str(i["source"]).startswith("language")]
-    if skipped and not items:
-        return {"ok": False, "why": (
-            f"{len(skipped)} whole-file row(s) left out: replacing a release "
-            f"deletes the file, so each one is answered on its own button")}
 
     def _all():
         r"""Every selected row, kind first, then one re-read for all of them.
@@ -10224,9 +10192,61 @@ async def api_subneed_require(library: str, lang: str, on: bool = True):
 
 
 @app.post("/api/subneed/check")
-async def api_subneed_check(limit: int = 5000):
-    """Run the sweep now rather than waiting for its own clock."""
-    return await asyncio.to_thread(subneed.sweep, int(limit))
+async def api_subneed_check():
+    """Judge the whole library now, in the background; the panel polls the bar.
+
+    Returns at once. The first version awaited one batch of five thousand and
+    reported nothing while it ran, so Check now looked like it did something
+    small or nothing at all. Now it kicks a run of every file and the panel
+    watches done/total in /api/subneed until running goes false.
+    """
+    if subneed.STATE.get("running"):
+        return {"ok": False, "why": "already running", **subneed.snapshot()}
+    asyncio.create_task(asyncio.to_thread(subneed.sweep_all))
+    await asyncio.sleep(0.05)
+    return {"ok": True, **subneed.snapshot()}
+
+
+@app.post("/api/subneed/replace/batch")
+async def api_subneed_replace_batch(ids: str = "", confirm: str = ""):
+    r"""Blocklist and re-search several at once. Erik asked for the batch.
+
+    Each one still goes through remedy.replace() on its own - the hourly cap
+    counts them, the ledger records them, and a file nuarr has not looked
+    inside is refused per file rather than failing the lot. The cap is what
+    makes a batch of twenty safe to offer: past it the rest are declined and
+    say so, and the person can come back in an hour.
+    """
+    if confirm != "yes":
+        return {"ok": False, "why": "confirm=yes required"}
+    from . import remedy
+    out = {"ok": True, "asked": 0, "refused": 0, "capped": 0, "rows": []}
+    for tok in (ids or "").split(","):
+        try:
+            fid = int(tok.strip())
+        except ValueError:
+            continue
+        with cursor() as cur:
+            n = cur.execute("SELECT state, why FROM sub_need WHERE file_id=? "
+                            " ORDER BY state LIMIT 1", (fid,)).fetchone()
+        if not n or n["state"] != subneed.MISSING:
+            out["refused"] += 1
+            out["rows"].append({"file_id": fid, "ok": False,
+                                "why": "not recorded as missing"})
+            continue
+        r = await remedy.replace(fid, subneed.KIND, source="subneed",
+                                 why=n["why"] or "", auto=False)
+        if r.get("ok"):
+            out["asked"] += 1
+        elif r.get("capped"):
+            out["capped"] += 1
+        else:
+            out["refused"] += 1
+        out["rows"].append({"file_id": fid, "ok": bool(r.get("ok")),
+                            "why": r.get("why") or ""})
+        if r.get("capped"):
+            break
+    return out
 
 
 @app.post("/api/subneed/replace")
@@ -31790,7 +31810,7 @@ async function langRequire(lib, code, on){
   // (lowercased, three letters) and the switch has to show what was STORED,
   // not what was clicked.
   await loadLangTab();
-  try{ loadSubKind(true); }catch(e){}
+  try{ loadSubNeed(true); loadSubs(true); }catch(e){}
 }
 
 // THE SAVE LIVES WITH THE THING IT SAVES. One global "Save policy" at the foot
@@ -37357,25 +37377,6 @@ async function skAct(id, btn){
   const r=((_sk&&_sk.rows)||[]).find(x=>x.id===id); if(!r) return;
   const [fid, src]=skSplit(id);
   const pic = src==='picture';
-  // A LANGUAGE ROW DELETES A FILE, so the question says so, names the file,
-  // and gives the size. refetch deletes first on purpose - the arr scores
-  // candidates against whatever is still on disk - so there is no undo.
-  if(String(src).startsWith('language')){
-    const gb=Math.round((r.size||0)/1073741824*100)/100;
-    askInline(btn,
-      `Blocklist this release and ask for another? ${r.label||''} — the file `
-      +`is deleted first (${gb} GB), because the arr scores replacements `
-      +`against whatever is still on disk. This cannot be undone.`,
-      'Yes, replace it',
-      async ()=>{
-        const x=await (await fetch(`/api/subkind/act?confirm=yes&file_id=${fid}&source=${
-          encodeURIComponent(src)}`,{method:'POST'})).json();
-        if(x.ok) skGone(btn, 'asked for another', true, id);
-        else setTimeout(()=>{ _skKey=''; loadSubKind(true); }, 1500);
-        return x.ok ? {ok:true, why:'replaced'} : x;
-      });
-    return;
-  }
   // NOTHING IS WRITTEN, so nothing is asked. It is a row leaving a list.
   if(r.action==='leave'){
     if(btn) btn.disabled=true;
@@ -37652,52 +37653,193 @@ function skMarkerHtml(){
     </div>`});
 }
 
-function skNeedHtml(){
-  const d=(_sk&&_sk.need)||{};
-  if(!d.any_required){
-    return skSection({
-      accent:'#e8a33d', title:'A required subtitle language',
-      sub:'nothing is required yet',
-      right:'',
-      body:`<div class="dim" style="font-size:11px;margin-top:4px">Tick
-        <b>require</b> under a language in <b>Subtitle rules</b> and every file
-        in that library is checked for it — a track, a file beside it, the
-        words burned into the picture, or the audio already in that language.
-        A file with none of those cannot be fixed by re-encoding, so the only
-        remedy is a different release.</div>`});
-  }
-  const c=d.counts||{}, miss=c.missing||0, unk=c.unknown||0, ok=c.ok||0;
-  const rows=d.missing_list||[];
-  const auto=(d.mode==='auto');
+// ============================================================================
+// REQUIRED SUBTITLE LANGUAGE - Subtitle User Input's shape, for a different
+// verb.
+//
+// Erik: "split A required subtitle language from Subtitle User Input but
+// mirror that same system and tweak it to work with A required subtitle
+// language". So: the same head, the same selection bar with a dropdown, the
+// same table with the same column rhythm and the same per-row button, the
+// same footer - and where the other panel records a kind and queues a retitle
+// or a marker, this one blocklists a release and asks the arr for another.
+//
+// It is its own panel rather than a third row-type in that table because the
+// two verbs are not the same weight. "Yes - apply to 12" there costs GPU
+// time; here it deletes twelve files. Keeping them apart means the batch
+// button on each panel promises one thing.
+let _sn=null, _snKey='', _snPoll=null, _snSel=new Set(), _snLast=null;
+const _snOpen=new Set();
+function snRows(){ return ((_sn&&_sn.missing_list)||[]); }
+function snSelIds(){ const live=new Set(snRows().map(r=>r.file_id)); return [..._snSel].filter(id=>live.has(id)); }
+function snPick(fid, ev){
+  const rows=snRows();
+  if(ev&&ev.shiftKey&&_snLast!=null){
+    const a=rows.findIndex(r=>r.file_id===_snLast), b=rows.findIndex(r=>r.file_id===fid);
+    if(a>=0&&b>=0){ const on=!_snSel.has(fid);
+      for(let k=Math.min(a,b);k<=Math.max(a,b);k++){ if(on) _snSel.add(rows[k].file_id); else _snSel.delete(rows[k].file_id); } }
+  } else { if(_snSel.has(fid)) _snSel.delete(fid); else _snSel.add(fid); }
+  _snLast=fid; _snKey=''; snPaint(true);
+}
+function snSelAll(on){ if(on) snRows().forEach(r=>_snSel.add(r.file_id)); else _snSel.clear(); _snKey=''; snPaint(true); }
+function snClearSel(){ _snSel.clear(); _snKey=''; snPaint(true); }
+function snToggle(fid){ if(_snOpen.has(fid)) _snOpen.delete(fid); else _snOpen.add(fid); _snKey=''; snPaint(true); }
+let _snBatch='';
+function snBatchKind(v){ _snBatch=v||''; _snKey=''; snPaint(true); }
+
+async function loadSubNeed(force){
+  const el=document.getElementById('snPanel'); if(!el) return;
+  if(!_sn) el.innerHTML='<div class="skel" style="padding:12px">'
+    +'<i style="width:52%"></i><i style="width:70%"></i></div>';
+  try{ _sn=await (await fetch('/api/subneed?limit=600')).json(); }
+  catch(e){ el.innerHTML='<span class="dim">could not load</span>'; return; }
+  snPaint(force);
+}
+
+function snPaint(force){
+  const el=document.getElementById('snPanel'); if(!el||!_sn) return;
+  const d=_sn, c=d.counts||{}, rows=snRows();
+  const miss=c.missing||0, unk=c.unknown||0, ok=c.ok||0;
+  const auto=(d.mode==='auto'), running=!!d.running;
   const req=Object.entries(d.required||{})
     .map(([lib,ls])=>`${esc(lib)} <b>${ls.map(esc).join(', ')}</b>`).join(' · ');
-  return skSection({
-    accent:'#e8a33d', title:'A required subtitle language',
-    sub:req,
-    right:`${miss?`<b style="color:#e8a33d">${fmt(miss)}</b> missing`
-                :'<b style="color:var(--ok)">none missing</b>'}${
-      unk?` · <span class="dim">${fmt(unk)} unread</span>`:''}${
-      ok?` · <span class="dim">${fmt(ok)} fine</span>`:''}
-      <button class="rmb ${auto?'':'on'}" style="font-size:10px;margin-left:8px"
-        onclick="subNeedMode('manual')">manual</button>
-      <button class="rmb ${auto?'on':''}" style="font-size:10px"
-        title="Let the shared remedy blocklist and re-search these by itself, capped per hour across every check. It is the only thing on this page that deletes a file."
-        onclick="subNeedMode('auto')">auto</button>
-      <button class="rmb" style="font-size:10px;margin-left:5px"
-        onclick="subNeedCheck(this)">Check now</button>`,
-    body:`
-      ${unk?`<div class="dim" style="font-size:11px;margin-top:5px;
-        border-left:2px solid var(--line);padding-left:8px"><b
-        style="color:#9aa7b8">${fmt(unk)}</b> file(s) have never been looked
-        inside, or the picture reader found marks it could not read. nuarr has
-        no opinion about those, they are not listed below, and no button here
-        will touch them.</div>`:''}
-      ${miss
-        ? `<div class="dim" style="font-size:11px;margin-top:5px">The ${fmt(miss)}
-            are rows in the list above, marked <b style="color:#e8a33d">whole
-            file</b>, each with its own button.</div>`
-        : `<div style="font-size:11.5px;margin-top:5px;color:var(--ok)">Every file
-            that has been looked inside carries what its library requires.</div>`}`});
+  const gb=n=>Math.round((n||0)/1073741824*100)/100;
+
+  // ---- head: the other panel's, with this one's words ----
+  const head=`<div class="subshd"><b style="color:#e8a33d">Required subtitle language</b>
+    <span class="subskind ${auto?'k-auto':'k-ask'}"
+      title="${auto?'Files carrying none of a required language are replaced by the shared remedy without asking, capped per hour across every check.':'Nothing is replaced until you press a button.'}">${auto?'runs by itself':'waiting on you'}</span>
+    <span class="dim subssub" title="A file counts as carrying a language if it has a track tagged with it, a subtitle file beside it, the dialogue burned into its picture, the audio in that language already, or - where the library keeps untagged tracks - an untagged track that may be it. What is left carries none of them, and no re-encode writes subtitles that are not in the release.">files carrying none of the language their library requires</span>
+    <span class="subsn">${miss?`${num(miss,'you')} <span class="dim">to answer</span>`
+                              :'<b style="color:var(--ok)">nothing to answer</b>'}</span>
+    </div>
+    <span class="dim" style="font-size:11.5px">
+      ${req?`<span>${req}</span> · `:''}
+      <span title="carry what their library requires">${num(ok,'done')} carry it</span>
+      · <span title="Never looked inside, or the picture reader found marks it could not read. nuarr has no opinion about these, they are not listed, and no button touches them.">${num(unk,'auto')} not looked inside</span>
+    </span>
+    <span style="float:right;display:flex;gap:8px;align-items:center">
+      ${modeSeg('when it is sure', d.mode, 'snMode', {
+        auto:'Every file listed here is replaced by the shared remedy without asking - the release blocklisted, the file deleted, the arr asked for another - up to the hourly cap shared with every other check.',
+        manual:'Everything is listed and nothing is replaced. Each row has its own button; select several for the batch.'})}
+      <button class="rmb" onclick="snRun(this)" ${running?'disabled':''}>${
+        running?'checking…':'Check now'}</button>
+    </span>`;
+
+  // ---- the scan, while it runs ----
+  const pct=d.total?Math.max(0,Math.min(100,100*(d.done||0)/d.total)):0;
+  const prog=running?`
+    <div style="display:flex;gap:10px;align-items:center;margin:8px 0 2px;font-size:11.5px">
+      <span class="busy" style="color:var(--acc);flex:none"><span class="sp"></span></span>
+      <span style="flex:none">Checking ${num(d.done||0,'auto')} of ${num(d.total||0,'auto')}</span>
+      <div class="hsbar" style="flex:1 1 200px"><i style="width:${pct}%"></i></div>
+      <span class="dim" style="flex:none">${d.elapsed?hsDur(d.elapsed)+' so far':''}</span>
+    </div>`:'';
+
+  // ---- selection bar: the other panel's, with one verb in the dropdown ----
+  const nsel=snSelIds().length, allOn=rows.length>0&&nsel===rows.length;
+  const selGb=snSelIds().reduce((t,id)=>{ const r=rows.find(x=>x.file_id===id); return t+(r?(r.size||0):0); },0);
+  const selBar=nsel?`
+    <div class="askhost" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;
+         padding:6px 8px;margin:6px 0;border-radius:7px;
+         background:rgba(232,163,61,.07);border:1px solid var(--line)">
+      <b style="font-size:11.5px;color:#e8a33d">${fmt(nsel)} selected</b>
+      <select class="kindsel" onchange="snBatchKind(this.value)"
+        title="What to do with every row selected.">
+        <option value=""${_snBatch?'':' selected'}>choose an action…</option>
+        <option value="replace"${_snBatch==='replace'?' selected':''}>Blocklist &amp; re-download</option>
+      </select>
+      <button class="rmb" onclick="snActMany(this)" ${_snBatch?'':'disabled'}
+        title="Blocklist each release so the arr never grabs it again, delete each file, and search for replacements. ${esc(String(gb(selGb)))} GB is deleted. Capped per hour across every check; past the cap the rest wait.">Yes — apply to ${fmt(nsel)} <span class="dim">(${esc(String(gb(selGb)))} GB)</span></button>
+      <button class="rmb" onclick="snClearSel()">Clear</button>
+      <span class="dim" style="font-size:10.5px">shift-click to take a range</span>
+    </div>`:'';
+
+  // ---- the table: the other panel's columns, minus the ones this verb has no use for ----
+  const table=rows.length?`${selBar}
+      <div class="rowbox scrollbox"><table class="sktbl" style="width:100%;font-size:11.5px;table-layout:fixed">
+      <colgroup><col style="width:26px"><col><col style="width:110px"><col style="width:74px">
+        <col style="width:96px"><col style="width:150px"><col style="width:96px"><col style="width:180px"></colgroup>
+      <thead><tr class="dim" style="font-size:10px;letter-spacing:.05em;text-transform:uppercase">
+        <th class="c"><input type="checkbox" ${allOn?'checked':''} title="Select every row" onclick="snSelAll(this.checked)"></th>
+        <th class="l">episode</th><th class="c">library</th><th class="c">added</th>
+        <th class="c">wants</th><th class="c">what it has</th><th class="c">disk</th><th class="r">answer</th>
+      </tr></thead><tbody>${rows.map(r=>{
+        const open=_snOpen.has(r.file_id);
+        return `<tr>
+        <td class="c"><input type="checkbox" ${_snSel.has(r.file_id)?'checked':''} onclick="snPick(${r.file_id},event)"></td>
+        <td class="l" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+          <a href="#" onclick="snToggle(${r.file_id});return false" class="dim" style="text-decoration:none">${open?'▾':'▸'}</a>
+          <b>${esc(r.title||'')}</b>${r.season?` <span class="dim">S${String(r.season).padStart(2,'0')}${r.episode?'E'+String(r.episode).padStart(2,'0'):''}</span>`:''}
+          <div class="dim" style="font-size:10px;overflow:hidden;text-overflow:ellipsis" title="${esc(r.path||'')}">${esc((r.path||'').split(/[\\/]/).pop())}</div></td>
+        <td class="c dim">${esc(r.library||'')}</td>
+        <td class="c dim" style="font-size:10.5px" title="${r.first_seen?esc(new Date(r.first_seen*1000).toLocaleString()):'nuarr has no record of when this file arrived'}">${r.first_seen?ago(r.first_seen):'—'}</td>
+        <td class="c"><span class="pill" style="color:#e8a33d;border-color:#4a3a12">${esc(r.lang||'')}</span></td>
+        <td class="c dim" style="font-size:10.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(r.why||'')}">${esc(r.short||r.why||'')}</td>
+        <td class="c mono" style="font-size:10.5px;color:${r.pool_disk?diskColor(r.pool_disk):'var(--dim)'}">${esc(r.pool_disk||'')}</td>
+        <td class="r askhost"><button class="rmb" onclick="snAct(${r.file_id},this)"
+          title="Blocklist this release so the arr never grabs it again, delete the file (${esc(String(gb(r.size)))} GB), and search for a replacement. Not reversible.">Blocklist &amp; re-download</button></td>
+      </tr>${open?`<tr style="background:rgba(255,255,255,.025)"><td colspan="8" style="padding:6px 10px;border-bottom:1px solid var(--line);font-size:11px">
+        <div><span class="dim">what it has:</span> ${esc(r.why||'')}</div>
+        <div><span class="dim">size:</span> ${esc(String(gb(r.size)))} GB · <span class="dim">judged</span> ${r.checked_at?ago(r.checked_at):'—'}</div>
+        <div class="mono dim" style="font-size:10px;word-break:break-all">${esc(r.path||'')}</div></td></tr>`:''}`;}).join('')}</tbody></table></div>`
+    : `<div class="dim" style="font-size:11.5px;padding:8px 0">${
+        d.any_required?'Every file that has been looked inside carries what its library requires.'
+                      :'Nothing is required yet. Tick <b>require</b> under a language in Subtitle rules.'}</div>`;
+  const foot=`<div class="dim" style="font-size:11px;margin-top:6px">${
+    miss?`${fmt(miss)} still to answer`:''}${
+    unk?` · ${fmt(unk)} not looked inside - no opinion, no button`:''}</div>`;
+
+  const html=`<div class="subsp" id="subsPanelNeed">${head}${prog}${table}${foot}</div>`;
+  if(!force && (askOpen('snPanel') || panelScrolled('snPanel'))) return;
+  if(html===_snKey) return;
+  const box=el.querySelector('.rowbox'), keep=box?box.scrollTop:0;
+  _snKey=html; el.innerHTML=html;
+  const nb=el.querySelector('.rowbox'); if(nb&&keep) nb.scrollTop=keep;
+  clearTimeout(_snPoll);
+  // While a check runs the bar has to move, so poll fast; otherwise the
+  // page's own cadence is enough.
+  if(running) _snPoll=setTimeout(()=>{ if(document.getElementById('snPanel')) loadSubNeed(true); }, 1200);
+}
+async function snMode(m){
+  try{ await fetch('/api/subneed/mode?mode='+m, {method:'POST'}); }catch(e){}
+  loadSubNeed(true); loadSubs(true);
+}
+async function snRun(btn){
+  if(btn){ btn.disabled=true; btn.textContent='checking…'; }
+  try{ await fetch('/api/subneed/check', {method:'POST'}); }catch(e){}
+  // The bar draws itself from the poll; this just starts the poll now.
+  setTimeout(()=>loadSubNeed(true), 250);
+}
+async function snAct(fid, btn){
+  const r=snRows().find(x=>x.file_id===fid)||{};
+  const gb=Math.round((r.size||0)/1073741824*100)/100;
+  askInline(btn,
+    `Blocklist this release and ask for another? ${r.title||''}${r.season?' S'+String(r.season).padStart(2,'0')+(r.episode?'E'+String(r.episode).padStart(2,'0'):''):''} — `
+    +`the file is deleted first (${gb} GB), because the arr scores replacements `
+    +`against whatever is still on disk. This cannot be undone.`,
+    'Yes, replace it',
+    async ()=>{
+      const x=await (await fetch('/api/subneed/replace?file_id='+fid,{method:'POST'})).json();
+      if(x.ok){ _snSel.delete(fid); setTimeout(()=>{ _snKey=''; loadSubNeed(true); loadSubs(true); }, 900); }
+      return x.ok ? {ok:true, why:'asked for another'} : x;
+    });
+}
+async function snActMany(btn){
+  const ids=snSelIds(); if(!ids.length||_snBatch!=='replace') return;
+  const rows=snRows();
+  const gb=Math.round(ids.reduce((t,id)=>{ const r=rows.find(x=>x.file_id===id); return t+(r?(r.size||0):0); },0)/1073741824*100)/100;
+  askInline(btn,
+    `Blocklist ${ids.length} release${ids.length===1?'':'s'} and ask for others? `
+    +`${gb} GB of files is deleted first. Capped per hour across every check - `
+    +`past the cap the rest are left for later and say so. This cannot be undone.`,
+    `Yes, replace ${ids.length}`,
+    async ()=>{
+      const x=await (await fetch('/api/subneed/replace/batch?confirm=yes&ids='+encodeURIComponent(ids.join(',')),{method:'POST'})).json();
+      _snSel.clear(); _snBatch='';
+      setTimeout(()=>{ _snKey=''; loadSubNeed(true); loadSubs(true); }, 900);
+      return x.ok ? {ok:true, why:`${x.asked} asked for${x.capped?`, ${x.capped} past the hourly cap`:''}${x.refused?`, ${x.refused} refused`:''}`} : x;
+    });
 }
 
 function skPaint(force){
@@ -37915,7 +38057,6 @@ function skPaint(force){
         const [word,col]=SKW[r.kind]||[r.kind||'','var(--dim)'];
         const on=_skSel.has(r.id), can=!r.done&&!r.unread;
         const pic=r.source==='picture', open=_skOpen.has(r.id);
-        const lang=String(r.source||'').startsWith('language');
         return `<tr${on?' style="background:rgba(88,166,255,.06)"':''}>
         <td class="l">${can?`<input type="checkbox" ${on?'checked':''}
              onclick="skToggle('${r.id}', event)">`:''}</td>
@@ -37929,15 +38070,10 @@ function skPaint(force){
           ? esc(new Date(r.added*1000).toLocaleString())
           : 'nuarr has no record of when this file arrived'}">${
           r.added?ago(r.added):'—'}</td>
-        <td class="c" style="font-size:10.5px;color:${lang?'#e8a33d':(pic?'#6fb0ff':'var(--dim)')}"
-          title="${lang?'The whole file: no subtitle track, no file beside it, nothing burned into the picture, and the audio is not in this language either'
-                 :(pic?'Words burned into the picture of a file that reports no subtitle track':esc(`A text track inside the file - the ${(r.track||0)+1}th subtitle stream, which ffmpeg calls s:${r.track}`))}">${
-          lang?'whole file':(pic?'picture':'track '+((r.track||0)+1))}</td>
-        <td class="c">${lang
-          ? `<span class="pill" style="color:#e8a33d;border-color:#4a3a12"
-               title="${esc(r.evidence||'')}">no ${esc(r.lang||'')}</span>
-             <div class="dim" style="font-size:9.5px">${esc(r.library||'')} requires it</div>`
-          : r.unread
+        <td class="c" style="font-size:10.5px;color:${pic?'#6fb0ff':'var(--dim)'}"
+          title="${pic?'Words burned into the picture of a file that reports no subtitle track':esc(`A text track inside the file - the ${(r.track||0)+1}th subtitle stream, which ffmpeg calls s:${r.track}`)}">${
+          pic?'picture':'track '+((r.track||0)+1)}</td>
+        <td class="c">${r.unread
           ? '<span class="dim" style="font-size:10.5px">not read yet</span>'
           : `<select class="kindsel" onchange="skSetKind('${r.id}',this.value,this)"
                title="${esc((r.why||('read as '+word))+'. If that is wrong, set it here - the choice is kept and the next pass will not overwrite it.')}"
@@ -37948,11 +38084,7 @@ function skPaint(force){
                        :`<div style="font-size:9.5px;color:${col}">read as ${esc(word)}</div>`}`}</td>
         <td class="c mono" style="font-variant-numeric:tabular-nums;color:${skColor(r)}"
             title="${esc((r.why||'')+' — '+(r.auto_why||''))}">${r.unread?'':(r.sure+'%')}</td>
-        <td class="l mono">${lang
-          ?`<span class="dim" style="font-size:10.5px;font-family:inherit"
-              title="${esc(r.evidence||'')}">${esc(r.evidence||'')}</span>${
-              r.disk?` <span style="font-size:10px;color:${diskColor(r.disk)}">${esc(r.disk)}</span>`:''}`
-          :pic?'<span class="dim">—</span>'
+        <td class="l mono">${pic?'<span class="dim">—</span>'
           :`<span style="color:var(--warn)" title="${esc(r.title_old||'')}">${esc(r.title_old||'')}</span>${
              r.action==='retitle'?`<div style="font-size:10px;color:var(--ok);overflow:hidden;text-overflow:ellipsis" title="${
                esc((r.title_new||'')+(r.unsafe?' — this replaces a title nuarr did not write, because you set the kind by hand':''))}">→ ${
@@ -37962,10 +38094,7 @@ function skPaint(force){
                                       ? `<div class="dim" style="font-size:10px" title="You said this track carries ${
                                           esc(SKW[r.kind]?SKW[r.kind][0]:r.kind)}, and its title already says so - there is nothing to correct.">title already agrees</div>`
                                       : '<div class="dim" style="font-size:10px" title="The title carries a name nuarr did not write and cannot regenerate, so it is reported and left as it is. Set what it carries by hand and the correction is offered anyway - your call outranks the caution.">left alone</div>'))}`}</td>
-        <td class="r askhost">${lang
-          ? `<button class="rmb" onclick="skAct('${r.id}',this)"
-               title="Blocklist this release so the arr never grabs it again, delete the file, and search for a replacement. ${esc(String(Math.round((r.size||0)/1073741824*100)/100))} GB is deleted. Not reversible.">${esc(r.action_word)}</button>`
-          : r.done
+        <td class="r askhost">${r.done
           ? '<span class="dim" title="This file already carries the blank marker track.">marked</span>'
           : r.unread ? '<span class="dim" style="font-size:10.5px" title="The cue rate flagged this; its events have not been read yet. Nothing is offered until they have.">not read yet</span>'
           : `${r.action?`<button class="rmb" onclick="skAct('${r.id}',this)" title="${
@@ -38005,7 +38134,7 @@ function skPaint(force){
   // was the last panel here still wearing its own.
   const html=`<div class="subsp" id="subsPanelInput">${
     head}${skAskHtml()}${note}${key}${band}${prog}${hist}${
-    skMarkerHtml()}${skNeedHtml()}${table}${foot}</div>`;
+    skMarkerHtml()}${table}${foot}</div>`;
   scPaint('subs');
   if(!force && (askOpen('skPanel') || panelBusy('skPanel') || panelScrolled('skPanel'))) return;
   if(html===_skKey) return;
@@ -39891,7 +40020,7 @@ let _subs=null, _subsPoll=null, _subsKey='', _subsTopKey='';
 let _subsSort='what', _subsDesc=false;
 // One colour per kind of subtitle trouble, used by the chip in the list and
 // by the dot on the switchboard, so the eye can join a row to its system.
-const SUBS_C={sidecar:'#6fb0ff', dupe:'#c98cf0', picture:'#e8a33d',
+const SUBS_C={sidecar:'#6fb0ff', dupe:'#c98cf0', picture:'#e8a33d', language:'#e8a33d',
               title:'#7fd18c', ask:'#e8a33d', drift:'#9aa7b8'};
 const SUBS_W={sidecar:'sitting beside it', dupe:'twice inside it',
               picture:'burned into the picture', title:'a title that lies',
@@ -39922,9 +40051,10 @@ function subsDetail(k){
   // A panel with no collapsed wrapper is a jump rather than a toggle, so
   // adding one here never needs this function changed.
   if(!document.querySelector('.subsd[data-d="'+k+'"]')){
-    const id={picture:'skPanel'}[k]||'';
+    const id={picture:'skPanel', language:'snPanel'}[k]||'';
     const el=id&&document.getElementById(id);
     if(el){ if(k==='picture') loadSubKind();
+            if(k==='language') loadSubNeed();
             el.scrollIntoView({behavior:'smooth', block:'start'}); }
     return;
   }
@@ -39940,6 +40070,7 @@ function subsDetail(k){
     if(k==='sidecar') loadSubEmbed();
     if(k==='dupe')    loadSubdupe();
     if(k==='picture') loadSubKind();
+    if(k==='language') loadSubNeed();
     const w=document.querySelector('.subsd[data-d="'+k+'"]');
     if(w) setTimeout(()=>w.scrollIntoView({behavior:'smooth',block:'start'}),80);
   }
@@ -40448,7 +40579,7 @@ function subsPaint(){
   // every listener on it. It looked like it worked, because the FIRST paint
   // put it there and the second one took it away, leaving an open row with
   // nothing under it and no error anywhere. They go home first, every time.
-  const PANES={sidecar:'seHome', dupe:'sdHome', picture:'skHome'};
+  const PANES={sidecar:'seHome', dupe:'sdHome', picture:'skHome', language:'snHome'};
   const held={};
   for(const k in PANES){
     const pane=document.querySelector('.subsd[data-d="'+k+'"]');

@@ -279,6 +279,48 @@ def board() -> list:
     except Exception as e:                                       # noqa: BLE001
         rows.append(_broken(PICTURE, "What each file actually carries", e))
 
+    # 5. WHAT A FILE SHOULD CARRY AND DOES NOT. The row above asks whether
+    # what is there is right; this one asks whether what is required is there
+    # at all. Its own row because its answer is a different verb - the
+    # picture row marks and retitles, this one replaces a release - and a
+    # person should see which they are switching on.
+    try:
+        from . import subneed
+        sn = subneed.snapshot()
+        c = sn.get("counts") or {}
+        req = sn.get("required") or {}
+        mode = sn.get("mode") or "manual"
+        rows.append({
+            "key": "language",
+            "name": "A required subtitle language",
+            "does": "Checks every file against the subtitle languages its "
+                    "library requires - a track, a file beside it, the words "
+                    "burned into the picture, or the audio already in that "
+                    "language. Lists what carries none, and can blocklist the "
+                    "release and ask the arr for another.",
+            "why": "A raw Japanese release with no subtitle track passes every "
+                   "other check, because every other check asks whether what "
+                   "is there is correct. Nothing was asking whether what was "
+                   "asked for is there at all.",
+            "on": mode == "auto",
+            "setting": (f"{mode} · " + (" · ".join(
+                f"{lib} needs {', '.join(ls)}" for lib, ls in req.items())
+                if req else "nothing required yet")),
+            "waiting": int(c.get("missing") or 0),
+            "waiting_word": "files carrying none of a required language - "
+                            "each one a release to replace",
+            "needs_you": 0 if mode == "auto" else int(c.get("missing") or 0),
+            "detail_name": "Required subtitle language",
+            "detail": (f"{int(c.get('ok') or 0):,} carry it · "
+                       f"{int(c.get('unknown') or 0):,} not looked inside yet, "
+                       f"so no opinion and no button"
+                       if req else "tick require under a language in "
+                                   "Subtitle rules to start"),
+            "goto": "", "panel": "snPanel", "toggle": "",
+        })
+    except Exception as e:                                       # noqa: BLE001
+        rows.append(_broken("language", "A required subtitle language", e))
+
     return rows
 
 
