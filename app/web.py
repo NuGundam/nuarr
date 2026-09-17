@@ -25812,12 +25812,25 @@ function renderDone(j){
   const TITLECASE=w=>String(w||'').replace(/_/g,' ')
     .replace(/\b\w/g, c=>c.toUpperCase());
   const BAD_WORD=new Set(['failed','error','cancelled','deleted']);
+  // AND THE STATES THAT MEAN THE WORK DID NOT HAPPEN. doneLbl puts the job's
+  // state in the tail for anything that did not finish 'done', so these are
+  // the other half of the same thing BAD_WORD covers: the head names work
+  // that was planned, and the tail says it was not carried out.
+  const NOT_DONE=new Set(['skipped','deferred','blocked','held',
+                          'queued','running']);
   // A LABEL IS "head · tail", where the tail is either a pass number or the
-  // state the job ended in. A failure is the news whichever half carries it.
+  // state the job ended in. A failure is the news whichever half carries it -
+  // and so is any other state, for the same reason. "subs · skipped" rendered
+  // off its head as "Subtitles Updated", which is the opposite of what
+  // happened; five of those in a row is how the Dragon Ball GT batch read
+  // while its subtitle jobs were skipping. The head is only the right word
+  // when the work actually ran.
   function phraseOf(lbl){
     const bits=String(lbl).split(' \u00b7 ');
     const head=bits[0], tail=bits.length>1 ? bits[bits.length-1] : '';
     if(tail && BAD_WORD.has(tail)) return WORDS[tail] || ['Failed','var(--bad)'];
+    if(tail && NOT_DONE.has(tail))
+      return WORDS[tail] || [TITLECASE(tail), '#9aa7b8'];
     const w=WORDS[head] || [TITLECASE(head), '#9aa7b8'];
     // "decode · pass 2" is the check AFTER the rewrite - worth saying, since
     // it is the one that proves nuarr did not break the file.
