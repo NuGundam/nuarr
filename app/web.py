@@ -40874,6 +40874,11 @@ function subsScanVisits(sc){
        :' · <span style="color:var(--ok)">all rows current</span>'}${
     sc.max_age_s?` · <span title="A row is re-read when the file changes, and in any case once it is this old - a sidecar can land beside a video nobody touched.">re-read after ${
       esc(hsDur(sc.max_age_s))}</span>`:''}
+    ${(sc.opened||sc.opened_total)?` · <span style="color:var(--ok)"
+        title="Files this sweep OPENED rather than read from cache. This is the number that raises 'read inside' - a pass that only reads cached rows cannot move it. Capped at ${
+          esc(String(sc.probe_per_pass||0))} a pass because it is the only part that touches a disk.">${
+        fmt(sc.opened||0)} opened this pass${
+        sc.opened_total?` · ${fmt(sc.opened_total)} since start`:''}</span>`:''}
     ${nxt!=null?` · <span title="${sc.gated
         ? 'The sweep only reads while the box is idle, and something is using it now - so this is when it will next LOOK, not when it will read.'
         : 'When the next pass is due. It reads only while the box is idle.'}">next look ${

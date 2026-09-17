@@ -47,6 +47,8 @@ import json
 import os
 import time
 
+import subprocess
+
 from .config import SETTINGS
 from .db import cursor
 
@@ -59,6 +61,14 @@ MAX_AGE_S = 6 * 3600.0
 # How many files one pass will read before it lets go. The runner paces the
 # passes; this only stops a single pass from holding the thread for an hour.
 BATCH = 4000
+# AND HOW MANY OF THOSE IT MAY OPEN. Reading a cached probe is a database
+# read; fetching one is a process and a seek on a pool disk that may be spun
+# down. This is the only part of the sweep that costs anything, so it is
+# capped per pass - the rest of the batch still gets read from cache, and the
+# next pass takes the next few. At this rate a library with twenty thousand
+# unopened files clears in a few hours of idle time.
+PROBE_PER_PASS = 150
+PROBE_TIMEOUT_S = 60.0
 
 _READY = False
 
@@ -72,7 +82,11 @@ STATE: dict = {"running": False, "t0": 0.0, "done": 0, "total": 0,
                # When the next pass is due, set by the loop that runs it -
                # subqueue._reader_and_feeder. It is gated on the box being
                # idle, so this is "not before", never a promise.
-               "next_at": 0.0, "gated": False}
+               "next_at": 0.0, "gated": False,
+               # How many files this pass actually OPENED, as opposed to read
+               # from cache. The number that has to move for "read inside" to
+               # move - see _open_it.
+               "opened": 0, "opened_total": 0}
 
 
 def init() -> None:
@@ -130,6 +144,41 @@ def init() -> None:
 
 
 # --------------------------------------------------------------- the facts --
+def _open_it(file_id: int, path: str) -> bool:
+    r"""Fetch a probe for a file that has none, and cache it. True if it landed.
+
+    THE ONLY PART OF THIS SWEEP THAT OPENS A FILE, and the reason the read
+    count can move at all. Without it scan_one records "could not look inside"
+    for every file whose probe is not cached, forever - the sweep visits them
+    again next pass and learns the same nothing.
+
+    Through jobs' own ffprobe and jobs.cache_probe so this writes exactly the
+    probe a transcode would have written: one cache, one shape, one owner.
+    Synchronous because scan() runs on a thread via jobs.in_work, where there
+    is no loop to await jobs.probe() on.
+    """
+    try:
+        from . import jobs
+        if not path or not os.path.exists(path):
+            return False
+        r = subprocess.run(
+            [jobs._ffprobe_exe(), "-v", "quiet", "-print_format", "json",
+             "-show_streams", "-show_format", path],
+            capture_output=True, timeout=PROBE_TIMEOUT_S,
+            creationflags=getattr(jobs, "NO_WINDOW", 0))
+        if r.returncode != 0:
+            return False
+        data = json.loads(r.stdout.decode("utf-8", "replace") or "{}")
+        if not data.get("streams"):
+            return False
+        jobs.cache_probe(int(file_id), data)
+        return True
+    except Exception:                                            # noqa: BLE001
+        # A file that will not probe is not a failure of the sweep - it is
+        # recorded as unread and offered again, which is what it is.
+        return False
+
+
 def _probed(file_id: int, cur) -> bool:
     """Has anybody actually looked inside this file?
 
@@ -352,6 +401,15 @@ def _stale_sql(limit: int) -> tuple:
            AND (s.file_id IS NULL
                 OR COALESCE(s.mtime,-1) != COALESCE(f.mtime,0)
                 OR COALESCE(s.size,-1)  != COALESCE(f.size,0)
+                -- NOBODY HAS OPENED IT YET. Without this a row saying "could
+                -- not look inside" counts as finished the moment it is
+                -- written, so the files the sweep most needs to get to were
+                -- the only ones it never offered - and the opener had nothing
+                -- to open. Self-pacing: scan_one stamps scanned_at whether
+                -- the open worked or not, and the order below is
+                -- oldest-first, so a file that will never probe goes to the
+                -- back of the queue rather than holding the head of it.
+                OR COALESCE(s.probed,0) = 0
                 OR COALESCE(s.scanned_at,0) < ?)
          ORDER BY (s.file_id IS NOT NULL), COALESCE(s.scanned_at,0), f.id
          LIMIT ?""", (cutoff, int(limit)))
@@ -407,9 +465,15 @@ def _counts_now() -> dict:
                 SELECT COUNT(*) AS total,
                        SUM(CASE WHEN s.file_id IS NOT NULL THEN 1 ELSE 0 END)
                            AS counted,
+                       -- FRESH MEANS THE SWEEP HAS NOTHING LEFT TO DO WITH
+                       -- IT, which now includes having opened it - the same
+                       -- test _stale_sql uses, or the panel would say "all
+                       -- rows current" while the sweep chewed through
+                       -- thousands of unopened files.
                        SUM(CASE WHEN s.file_id IS NOT NULL
                                  AND COALESCE(s.mtime,-1) = COALESCE(f.mtime,0)
                                  AND COALESCE(s.size,-1)  = COALESCE(f.size,0)
+                                 AND COALESCE(s.probed,0) = 1
                                  AND COALESCE(s.scanned_at,0) >= ?
                                 THEN 1 ELSE 0 END) AS fresh,
                        SUM(CASE WHEN COALESCE(s.err,'') != '' THEN 1 ELSE 0 END)
@@ -480,6 +544,9 @@ def progress() -> dict:
                       "any line count already counted for a track"],
             "batch": BATCH, "max_age_s": MAX_AGE_S,
             "last_found": dict(st.get("last_found") or {}),
+            "opened": int(st.get("opened") or 0),
+            "opened_total": int(st.get("opened_total") or 0),
+            "probe_per_pass": PROBE_PER_PASS,
             "next_at": st.get("next_at") or 0.0,
             "gated": bool(st.get("gated")),
             "elapsed": round(el, 1), "rate": round(rate, 1),
@@ -500,11 +567,24 @@ def scan(limit: int = BATCH, on_each=None) -> dict:
         return {"ok": False, "why": "already reading"}
     rows = pending(limit)
     STATE.update(running=True, t0=time.time(), done=0, total=len(rows),
-                 last="", err="", written=0)
+                 last="", err="", written=0, opened=0)
     t0 = time.time()
+    budget = PROBE_PER_PASS
     try:
         for r in rows:
             try:
+                # OPEN IT IF NOBODY EVER HAS. Checked before the read so the
+                # row this pass writes reflects the probe this pass fetched,
+                # rather than recording "could not look" and picking it up on
+                # some later pass.
+                if budget > 0:
+                    with cursor() as _c:
+                        seen = _probed(int(r["id"]), _c)
+                    if not seen and _open_it(int(r["id"]), r["path"] or ""):
+                        budget -= 1
+                        STATE["opened"] += 1
+                        STATE["opened_total"] = int(
+                            STATE.get("opened_total") or 0) + 1
                 scan_one(int(r["id"]), r)
                 STATE["written"] += 1
             except Exception as e:                               # noqa: BLE001
