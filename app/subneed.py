@@ -512,6 +512,63 @@ def answered(file_id: int) -> None:
         pass
 
 
+def answered_list(limit: int = 200) -> list[dict]:
+    r"""What this panel has already replaced. From the LEDGER, not this table.
+
+    Erik: "can the panel have a link below allowing to see the answered one
+    like on the top panel".
+
+    The top panel can filter its own rows because answering one leaves the row
+    behind with `done` set. This panel cannot: answered() DELETES the verdict,
+    which is right - the file is gone, and a question about a file that no
+    longer exists is not a question being kept, it is a stale row waiting to
+    confuse somebody. See its docstring.
+
+    So the answered list comes from where the answer actually lives:
+    remedy_log, which records every replace with its kind, its source, whether
+    it worked and what was on disk at the time. That record outlives the file,
+    which is exactly the property this needs - and it is the same ledger the
+    other six checks write to, so "what did I replace, and when" has one
+    answer across all of them.
+    """
+    init()
+    try:
+        with cursor() as cur:
+            rows = cur.execute(
+                "SELECT r.at, r.file_id, r.ok, r.auto, r.detail, r.path, "
+                "       f.title, f.season, f.episode, f.library "
+                "  FROM remedy_log r LEFT JOIN files f ON f.id = r.file_id "
+                " WHERE r.kind = ? AND r.action = 'replace' "
+                " ORDER BY r.at DESC LIMIT ?", (KIND, int(limit))).fetchall()
+    except Exception:                                            # noqa: BLE001
+        return []
+    out = []
+    for r in rows:
+        d = dict(r)
+        # THE FILE IS USUALLY GONE, which is the point - so the name comes
+        # from the path the ledger kept rather than from a row that may no
+        # longer exist.
+        import os
+        d["name"] = (d.get("title") or
+                     os.path.basename(d.get("path") or "") or
+                     f"file {d['file_id']}")
+        d["gone"] = d.get("title") is None
+        out.append(d)
+    return out
+
+
+def answered_count() -> int:
+    init()
+    try:
+        with cursor() as cur:
+            r = cur.execute("SELECT COUNT(*) n FROM remedy_log "
+                            " WHERE kind=? AND action='replace'",
+                            (KIND,)).fetchone()
+        return int((r["n"] if r else 0) or 0)
+    except Exception:                                            # noqa: BLE001
+        return 0
+
+
 def unknown_sample(limit: int = 20) -> list[dict]:
     """A few of the never-looked-at, so the count is not just a number."""
     init()
@@ -548,6 +605,7 @@ def snapshot() -> dict:
             "err": STATE["err"],
             "age_s": (round(time.time() - STATE["at"]) if STATE["at"] else None),
             "poll_s": POLL_S,
+            "answered": answered_count(),
             # ITS SCHEDULE ROW, so the panel can say when the next pass is
             # rather than only offering a button. Erik: "make the check now a
             # job time". It is already registered - this is the panel finally

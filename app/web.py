@@ -10133,6 +10133,13 @@ async def api_subneed(limit: int = 200, library: str = ""):
     return d
 
 
+@app.get("/api/subneed/answered")
+async def api_subneed_answered(limit: int = 200):
+    """The releases this check has already replaced, newest first."""
+    return {"rows": subneed.answered_list(int(limit)),
+            "total": subneed.answered_count()}
+
+
 @app.post("/api/subneed/mode")
 async def api_subneed_mode(mode: str):
     """manual lists what is missing; auto lets the remedy replace the release."""
@@ -37697,6 +37704,12 @@ function skMarkerHtml(){
 // time; here it deletes twelve files. Keeping them apart means the batch
 // button on each panel promises one thing.
 let _sn=null, _snKey='', _snPoll=null, _snSel=new Set(), _snLast=null;
+// WHAT HAS ALREADY BEEN ANSWERED, fetched only when asked for. It comes from
+// the remedy ledger rather than from this check's own table - answering a row
+// DELETES the verdict, because the file it was about is gone - so it is a
+// second request, and there is no reason to spend it on a panel nobody has
+// asked to see the history of.
+let _snDone=false, _snDoneRows=null;
 const _snOpen=new Set();
 function snRows(){ return ((_sn&&_sn.missing_list)||[]); }
 function snSelIds(){ const live=new Set(snRows().map(r=>r.file_id)); return [..._snSel].filter(id=>live.has(id)); }
@@ -37725,7 +37738,17 @@ async function loadSubNeed(force){
     +'<i style="width:52%"></i><i style="width:70%"></i></div>';
   try{ _sn=await (await fetch('/api/subneed?limit=600')).json(); }
   catch(e){ el.innerHTML='<span class="dim">could not load</span>'; return; }
+  if(_snDone && !_snDoneRows) await snLoadDone();
   snPaint(force);
+}
+async function snLoadDone(){
+  try{ _snDoneRows=(await (await fetch('/api/subneed/answered?limit=200')).json()).rows||[]; }
+  catch(e){ _snDoneRows=[]; }
+}
+async function snShowDone(on){
+  _snDone=!!on;
+  if(_snDone && !_snDoneRows) await snLoadDone();
+  _snKey=''; snPaint(true);
 }
 
 function snPaint(force){
@@ -37830,9 +37853,52 @@ function snPaint(force){
     : `<div class="dim" style="font-size:11.5px;padding:8px 0">${
         d.any_required?'Every file that has been looked inside carries what its library requires.'
                       :'Nothing is required yet. Tick <b>require</b> under a language in Subtitle rules.'}</div>`;
-  const foot=`<div class="dim" style="font-size:11px;margin-top:6px">${
-    miss?`${fmt(miss)} still to answer`:''}${
-    unk?` · ${fmt(unk)} not looked inside - no opinion, no button`:''}</div>`;
+  // ALREADY ANSWERED, under the list, the way the panel above does it.
+  // The rows are the ledger's, so they say what was done and when rather
+  // than what is wrong - there is nothing wrong with them any more.
+  const nDone=d.answered||0;
+  const doneRows=_snDoneRows||[];
+  const doneList=(_snDone&&doneRows.length)?`
+    <div class="rowbox scrollbox" style="margin-top:6px;max-height:220px">
+      <table class="sktbl" style="width:100%;font-size:11.5px;table-layout:fixed">
+      <colgroup><col style="width:24px"><col style="width:auto"><col style="width:104px">
+        <col style="width:78px"><col style="width:74px"><col style="width:150px">
+        <col style="width:58px"><col style="width:19%"><col style="width:214px"></colgroup>
+      <thead><tr class="dim" style="font-size:10.5px">
+        <th class="l"></th><th class="l">episode</th><th class="c">library</th>
+        <th class="c">answered</th><th class="c">how</th><th class="c">what happened</th>
+        <th class="c"></th><th class="l">the file</th><th class="r">result</th>
+      </tr></thead><tbody>${doneRows.map(r=>`<tr style="opacity:.8">
+        <td class="l"></td>
+        <td class="l" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+          title="${esc(r.path||'')}"><b>${esc(r.name||'')}</b>${
+          r.season?` <span class="dim">S${String(r.season).padStart(2,'0')}${
+            r.episode?'E'+String(r.episode).padStart(2,'0'):''}</span>`:''}</td>
+        <td class="c dim">${esc(r.library||'')}</td>
+        <td class="c dim" style="font-size:10.5px"
+          title="${esc(new Date((r.at||0)*1000).toLocaleString())}">${r.at?ago(r.at):'—'}</td>
+        <td class="c dim" style="font-size:10.5px">${r.auto?'auto':'by hand'}</td>
+        <td class="c dim" style="font-size:10.5px;overflow:hidden;
+          text-overflow:ellipsis;white-space:nowrap" title="${esc(r.detail||'')}"
+          >${esc(r.detail||'blocklisted and re-searched')}</td>
+        <td class="c"></td>
+        <td class="l dim mono" style="font-size:10px;overflow:hidden;
+          text-overflow:ellipsis;white-space:nowrap"
+          title="${r.gone?'nuarr no longer has a row for this file - it was deleted, which is what the answer does':'the file nuarr still has a row for'}"
+          >${r.gone?'replaced — gone':'still indexed'}</td>
+        <td class="r">${r.ok
+          ? '<span style="color:var(--ok)">asked for another</span>'
+          : '<span class="err">could not</span>'}</td>
+      </tr>`).join('')}</tbody></table></div>`:'';
+
+  const foot=`<div class="dim" style="display:flex;gap:12px;align-items:center;
+       flex-wrap:wrap;font-size:11px;margin-top:6px">
+    <span>${miss?`${fmt(miss)} still to answer`:'nothing still to answer'}${
+      unk?` · ${fmt(unk)} not looked inside - no opinion, no button`:''}</span>
+    ${nDone?`<a href="#" onclick="snShowDone(${_snDone?0:1});return false"
+      title="Releases this check has already blocklisted and re-searched. They come from the shared remedy ledger rather than from this list, because answering one deletes its row - the file it was about no longer exists.">${
+      _snDone?'hide':'also show'} the ${fmt(nDone)} answered</a>`:''}
+  </div>${doneList}`;
 
   const html=`<div class="subsp" id="subsPanelNeed">${head}${prog}${table}${foot}</div>`;
   if(!force && (askOpen('snPanel') || panelScrolled('snPanel'))) return;
