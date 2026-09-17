@@ -430,16 +430,56 @@ def sweep(limit: int = BATCH) -> dict:
 
 # ------------------------------------------------------------- for the UI ---
 def counts() -> dict:
+    r"""How many files sit at each verdict - counted the way they are LISTED.
+
+    THE HEADLINE AND THE LIST MUST BE THE SAME SET. This read sub_need on its
+    own while missing() joined `files` and dropped the dead ones, so the panel
+    said "43 waiting" over an empty list: 27 of those rows belonged to files
+    marked deleted and 16 to files with no row left at all. A number you
+    cannot reach the members of is worse than no number - it reads as work
+    queued up and ignored.
+
+    Same join, same filter, so every figure here describes a file that exists.
+    """
     init()
     out = {OK: 0, MISSING: 0, UNKNOWN: 0}
     try:
         with cursor() as cur:
-            for r in cur.execute("SELECT state, COUNT(*) n FROM sub_need "
-                                 " GROUP BY state"):
-                out[r["state"]] = int(r["n"])
+            for r in cur.execute(
+                    "SELECT n.state AS st, COUNT(*) AS c FROM sub_need n "
+                    "  JOIN files f ON f.id = n.file_id "
+                    " WHERE f.state NOT IN ('deleted','duplicate') "
+                    " GROUP BY n.state"):
+                out[r["st"]] = int(r["c"])
     except Exception:                                            # noqa: BLE001
         pass
     return out
+
+
+def prune() -> int:
+    r"""Forget verdicts about files that are not there any more.
+
+    A replacement gets a NEW files row, so a verdict against the old one is
+    not waiting for anything: it can never be answered, acted on or listed.
+    Left alone they pile up - 43 of them here, every single one dead - and
+    they were the whole of what the panel was calling "waiting".
+
+    Called from the sweep, where the verdicts are made, so the table cannot
+    fill up with them again. What was actually DONE is in remedy_log, which is
+    where answered_count() reads from, so nothing is lost by dropping these.
+    """
+    init()
+    try:
+        with cursor() as cur:
+            cur.execute(
+                "DELETE FROM sub_need WHERE file_id IN ("
+                "  SELECT n.file_id FROM sub_need n "
+                "    LEFT JOIN files f ON f.id = n.file_id "
+                "   WHERE f.id IS NULL "
+                "      OR f.state IN ('deleted','duplicate'))")
+            return int(cur.rowcount or 0)
+    except Exception:                                            # noqa: BLE001
+        return 0
 
 
 def missing(limit: int = 200, library: str = "") -> list[dict]:
@@ -658,6 +698,9 @@ def sweep_all() -> dict:
     if STATE["running"]:
         return {"ok": False, "why": "already running"}
     total = _total()
+    # Clear the dead verdicts BEFORE judging, so the counts this run produces
+    # are about files that exist - see prune().
+    prune()
     STATE.update(running=True, done=0, total=total, t0=time.time(), err="")
     started = time.time()
     n = 0

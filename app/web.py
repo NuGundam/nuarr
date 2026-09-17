@@ -37878,6 +37878,40 @@ async function snShowDone(on){
   _snKey=''; snPaint(true);
 }
 
+// WHEN THIS ROW'S TURN COMES.
+//
+// Not a guess about the order: remedy.auto() is fed by findings(), findings()
+// is missing(), and missing() returns the rows sorted by title/season/episode
+// - so the row's index here IS its position in the queue, and this only has
+// to put it into words.
+//
+// `left` is what remains of THIS hour's replacements, and the cap is shared
+// with every other check that deletes files, so the hours are a floor rather
+// than a promise: another check spending the budget pushes these back, never
+// forward. The tooltip says so rather than letting a tidy number imply more
+// certainty than there is.
+function snWhen(i, d){
+  if((d.mode||'')!=='auto')
+    return ['waiting for you', 'var(--dim)',
+            'Manual mode - nothing is replaced until you press a button.'];
+  const b=(d.budget||{}).replace||{};
+  const cap=b.cap||0, left=b.left||0;
+  const nx=d.next_run?Math.max(0, d.next_run-Date.now()/1000):null;
+  const when=nx==null?'on its next pass':('in '+hsDur(nx));
+  if(i===0 && left)
+    return ['next', 'var(--warn)',
+            'First in the queue - this one goes '+when+'.'];
+  if(i<left)
+    return ['this pass', '',
+            'Position '+(i+1)+'. Inside what is left of this hour\'s '+cap
+            +' replacements, so it goes '+when+'.'];
+  if(!cap) return ['\u2014', 'var(--dim)', 'No replacement cap is set.'];
+  const hrs=Math.floor((i-left)/cap)+1;
+  return ['~'+hsDur(hrs*3600)+' away', 'var(--dim)',
+          'Position '+(i+1)+'. This hour\'s '+cap+' replacements are spoken '
+          +'for, and the cap refills hourly - so about '+hrs+' hour'
+          +(hrs===1?'':'s')+' from now, later if another check spends it.'];
+}
 function snPaint(force){
   const el=document.getElementById('snPanel'); if(!el||!_sn) return;
   const d=_sn, c=d.counts||{}, rows=snRows();
@@ -37973,11 +38007,14 @@ function snPaint(force){
       <div class="rowbox scrollbox"><table class="sktbl" style="width:100%;font-size:11.5px;table-layout:fixed">
       <colgroup><col style="width:24px"><col style="width:auto"><col style="width:104px">
         <col style="width:78px"><col style="width:74px"><col style="width:150px">
+        <col style="width:86px">
         <col style="width:58px"><col style="width:19%"><col style="width:214px"></colgroup>
       <thead><tr class="dim" style="font-size:10.5px">
         <th class="l"><input type="checkbox" ${allOn?'checked':''} title="Select every row" onclick="snSelAll(this.checked)"></th>
         <th class="l">episode</th><th class="c">library</th><th class="c">added</th>
-        <th class="c">wants</th><th class="c">what it has</th><th class="c">size</th>
+        <th class="c">wants</th><th class="c">what it has</th>
+        <th class="c" title="These are in the order the shared remedy takes them, so a row's place in this list is its place in the queue.">when</th>
+        <th class="c">size</th>
         <th class="l">where it lives</th><th class="r">answer</th>
       </tr></thead><tbody>${rows.map(r=>{
         const open=_snOpen.has(r.file_id);
@@ -37991,13 +38028,17 @@ function snPaint(force){
         <td class="c dim" style="font-size:10.5px" title="${r.first_seen?esc(new Date(r.first_seen*1000).toLocaleString()):'nuarr has no record of when this file arrived'}">${r.first_seen?ago(r.first_seen):'—'}</td>
         <td class="c"><span class="pill" style="color:#e8a33d;border-color:#4a3a12">${esc(r.lang||'')}</span></td>
         <td class="c dim" style="font-size:10.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(r.why||'')}">${esc(r.short||r.why||'')}</td>
+        ${(()=>{ const [w,col,tip]=snWhen(rows.indexOf(r), d);
+          return `<td class="c" style="font-size:10.5px${col?';color:'+col:''}"
+            title="${esc(tip)}">${col==='var(--warn)'
+              ?`<b>${esc(w)}</b>`:esc(w)}</td>`; })()}
         <td class="c mono" style="font-size:10.5px;font-variant-numeric:tabular-nums"
           title="what pressing the button deletes">${esc(String(gb(r.size)))}<span class="dim"> GB</span></td>
         <td class="l mono" style="font-size:10.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:${r.pool_disk?diskColor(r.pool_disk):'var(--dim)'}"
           title="the pool disk this file is on">${esc(r.pool_disk||'—')}</td>
         <td class="r askhost"><button class="rmb" onclick="snAct(${r.file_id},this)"
           title="Blocklist this release so the arr never grabs it again, delete the file (${esc(String(gb(r.size)))} GB), and search for a replacement. Not reversible.">Blocklist &amp; re-download</button></td>
-      </tr>${open?`<tr style="background:rgba(255,255,255,.025)"><td colspan="9" style="padding:6px 10px;border-bottom:1px solid var(--line);font-size:11px">
+      </tr>${open?`<tr style="background:rgba(255,255,255,.025)"><td colspan="10" style="padding:6px 10px;border-bottom:1px solid var(--line);font-size:11px">
         <div><span class="dim">what it has:</span> ${esc(r.why||'')}</div>
         <div><span class="dim">size:</span> ${esc(String(gb(r.size)))} GB · <span class="dim">judged</span> ${r.checked_at?ago(r.checked_at):'—'}</div>
         <div class="mono dim" style="font-size:10px;word-break:break-all">${esc(r.path||'')}</div></td></tr>`:''}`;}).join('')}</tbody></table></div>`
@@ -38014,10 +38055,12 @@ function snPaint(force){
       <table class="sktbl" style="width:100%;font-size:11.5px;table-layout:fixed">
       <colgroup><col style="width:24px"><col style="width:auto"><col style="width:104px">
         <col style="width:78px"><col style="width:74px"><col style="width:150px">
+        <col style="width:86px">
         <col style="width:58px"><col style="width:19%"><col style="width:214px"></colgroup>
       <thead><tr class="dim" style="font-size:10.5px">
         <th class="l"></th><th class="l">episode</th><th class="c">library</th>
         <th class="c">answered</th><th class="c">how</th><th class="c">what happened</th>
+        <th class="c"></th>
         <th class="c"></th><th class="l">the file</th><th class="r">result</th>
       </tr></thead><tbody>${doneRows.map(r=>`<tr style="opacity:.8">
         <td class="l"></td>
@@ -38032,6 +38075,7 @@ function snPaint(force){
         <td class="c dim" style="font-size:10.5px;overflow:hidden;
           text-overflow:ellipsis;white-space:nowrap" title="${esc(r.detail||'')}"
           >${esc(r.detail||'blocklisted and re-searched')}</td>
+        <td class="c"></td>
         <td class="c"></td>
         <td class="l dim mono" style="font-size:10px;overflow:hidden;
           text-overflow:ellipsis;white-space:nowrap"
