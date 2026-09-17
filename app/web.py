@@ -25630,12 +25630,11 @@ function renderDone(j){
       gg.first = gg.first ? Math.min(gg.first, it.ts||gg.first) : (it.ts||0);
     }
     g.gens=[...gens.values()].sort((a,b)=>a.last-b.last);   // oldest first
-    for(const gg of g.gens){
-      for(const it of gg.entries){
-        if(it.under) continue;
-        const l=lblOf(it); gg.labels.set(l,(gg.labels.get(l)||0)+1);
-      }
-    }
+    // The labels are NOT counted here. Nothing has been folded yet at this
+    // point - the loop that tucks the four facts under their check runs
+    // below - so counting now would record every fact as its own label and
+    // put it back on the summary line the fold exists to clear. See the
+    // second pass over g.gens after the fold.
   }
   for(const g of groups.values()){
     for(let i=0;i<g.entries.length;i++){
@@ -25655,6 +25654,15 @@ function renderDone(j){
     for(const it of g.entries){
       if(it.under) continue;
       const l=lblOf(it); g.labels.set(l,(g.labels.get(l)||0)+1);
+    }
+    // NOW the generations can be counted, with the same rule and the same
+    // `under` flags the title-level count above has just used.
+    for(const gg of (g.gens||[])){
+      gg.labels.clear();
+      for(const it of gg.entries){
+        if(it.under) continue;
+        const l=lblOf(it); gg.labels.set(l,(gg.labels.get(l)||0)+1);
+      }
     }
   }
   // The dropdown filters FILES, not rows: picking "skipped" keeps every file
@@ -25977,8 +25985,19 @@ function renderDone(j){
         for(const w of (j.running||[])) if(w.file_id!=null) s.add(Number(w.file_id));
         for(const q of (j.queue||[]))   if(q.file_id!=null) s.add(Number(q.file_id));
         return s; })();
+      // A CHECK, OR THE SECOND PASS THAT COULD ONLY HAPPEN BECAUSE OF ONE.
+      //
+      // `checked` is written once, early - at the moment the rewrite is
+      // planned - so every later step pushes it further back through the
+      // feed's window, and the files that did the most work were the first
+      // to lose it. A clean `decode . pass 2` carries the same news: it runs
+      // only after nuarr's own rewrite, which only happens after a check, and
+      // it is the step that proves the rewrite did not break the file.
+      const _done1=l=>{ const b=l.split(' \u00b7 ');
+        return b[0]==='checked'
+            || (b[0]==='decode' && /^pass 2/i.test(b[b.length-1]||'')); };
       const _settled = !!_cur && !_busy.has(Number(_cur.fid))
-        && lbls.some(([l])=>l.split(' \u00b7 ')[0]==='checked')
+        && lbls.some(([l])=>_done1(l))
         && !lbls.some(([l])=>BAD_LBL.has(l.split(' \u00b7 ')[0]));
       // A FINISHED FILE SAYS HOW IT GOT HERE, NOT THAT IT WAS LOOKED AT.
       //

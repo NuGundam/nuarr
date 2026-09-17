@@ -524,13 +524,38 @@ def _to_hand_over(depth: int) -> tuple:
         # straight back. Measured before this join existed: 59 such rows,
         # 18,667 skipped subtitle jobs over two days, 353 of them for one
         # episode of Ishura. A file that is gone has no subtitles to settle.
+        # AND THE PATH THE FILE HAS NOW, NOT THE ONE IT HAD WHEN PLANNED.
+        #
+        # q.path is frozen at planning time. nuarr rewrites the file, the arr
+        # renames it to match what changed - "[AAC 5.1]" becomes "[EAC3 5.1]"
+        # - and files.path follows while the instruction does not. Handing
+        # over the stale name gave the job a path nothing could open: it
+        # finished 'skipped' in milliseconds, _forget_queue_row dropped the
+        # row, the sweep re-planned the same file, and round it went.
+        # Measured: 151 such skips in 24h across 14 files, 72 in the last
+        # hour, 106 skipped against 56 done in three hours - and every one of
+        # those files was sitting on disk under its new name the whole time.
+        #
+        # The guard below already refuses a file whose ROW has gone. That is
+        # the other half of the question, and it was never the half that was
+        # failing. files.path is written by the scan and by the rename
+        # handler, so it is the one that knows.
         rows = [dict(r) for r in cur.execute(
-            "SELECT q.file_id, q.path, q.name, q.rewrite, q.steps, q.why, q.disk "
+            "SELECT q.file_id, COALESCE(f.path, q.path) AS path, "
+            "       q.name, q.rewrite, q.steps, q.why, q.disk "
             "  FROM sub_queue q LEFT JOIN files f ON f.id = q.file_id "
             " WHERE q.state=? AND f.id IS NOT NULL "
             "   AND (f.state IS NULL OR f.state NOT IN ('deleted','duplicate')) "
             " ORDER BY q.priority, q.queued_at LIMIT ?",
             (QUEUED, min(20000, max(room * 20, 2000))))]
+        # The row is now handed over correctly whatever it stores, but a
+        # stored path that disagrees with the file is a lie the panel and the
+        # log both repeat. Realign the ones this pass touched.
+        drift = [(r["path"], r["file_id"]) for r in rows]
+        if drift:
+            cur.executemany(
+                "UPDATE sub_queue SET path=? WHERE file_id=? AND path<>?",
+                [(p, i, p) for p, i in drift])
     by_disk: dict = {}
     for r in rows:
         by_disk.setdefault(r.get("disk") or "?", []).append(r)
