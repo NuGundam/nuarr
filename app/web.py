@@ -31612,7 +31612,6 @@ async function loadLangTab(){
   // library has been looked at. So the card renders into a slot of its own,
   // placed after the two live panels, and says in its own subtitle which
   // rules it is measuring against.
-  subNeedLoad();
   const gapHost=document.getElementById('gapHost') || el;
   gapHost.innerHTML = `<div class="subsp" id="gapCard" style="margin-top:12px">
       <div class="subshd"><b style="color:#6fb0ff">Rule drift</b>
@@ -31636,141 +31635,26 @@ async function loadLangTab(){
   langSignsLoad();
 }
 
-// ---- FILES THAT CARRY NONE OF A REQUIRED SUBTITLE LANGUAGE ---------------
-//
-// The panel Erik asked for, in the decode strip's shape because it is the
-// same kind of thing: a check with a manual/auto switch, a count, and a list
-// of files whose only remedy is a different release.
-//
-// THE THIRD COUNT IS THE ONE TO READ. `unknown` is every file nuarr has never
-// looked inside. sub_facts cannot tell those apart from files that genuinely
-// carry nothing - an absent probe and an empty track list produce the same
-// row - so they are counted separately, shown plainly, and given no button.
-// When this was written that was 11,687 files in Anime Shows against 153 the
-// check could actually justify an opinion about.
-let _subNeed=null, _subNeedBusy=false;
-async function subNeedLoad(force){
-  const host=document.getElementById('subNeedHost');
-  if(!host) return;
-  if(_subNeedBusy && !force) return;
-  _subNeedBusy=true;
-  try{ _subNeed=await (await fetch('/api/subneed?limit=200')).json(); }
-  catch(e){ _subNeedBusy=false; return; }
-  _subNeedBusy=false;
-  subNeedPaint();
-}
-function subNeedPaint(){
-  const host=document.getElementById('subNeedHost');
-  if(!host) return;
-  const d=_subNeed;
-  if(!d){ host.innerHTML=''; return; }
-  // NOTHING REQUIRED, NOTHING TO SAY - but say that, rather than rendering an
-  // empty panel that reads as "all clear". They are different facts.
-  if(!d.any_required){
-    host.innerHTML=subsPanel({
-      id:'subsPanelNeed', accent:'#e8a33d', kind:'yours',
-      title:'Files missing a required subtitle language',
-      sub:'nothing is required yet',
-      body:`<div class="subswhy">Tick <b>require</b> under a language above and
-        nuarr will check every file in that library actually carries it — a
-        subtitle track, a file beside it, or the words burned into the picture.
-        A file with none of those cannot be fixed by re-encoding it, so the
-        only remedy is a different release.</div>`});
-    return;
-  }
-  const c=d.counts||{}, miss=c.missing||0, unk=c.unknown||0, ok=c.ok||0;
-  const rows=d.missing_list||[];
-  const auto=(d.mode==='auto');
-  const req=Object.entries(d.required||{})
-    .map(([lib,ls])=>`${esc(lib)} <b>${ls.map(esc).join(', ')}</b>`).join(' · ');
-  const cap=((d.budget||{}).replace)||{};
-  const body=`
-    <div class="subswhy">Checks every file against the subtitle languages its
-      library requires. A file counts as carrying one if it has a track tagged
-      that language, a subtitle file beside it, the dialogue burned into its
-      picture, or the audio is in that language already — and an untagged
-      track counts too, wherever the library keeps untagged tracks, because an
-      unread track may well be the one. What is left carries none of them, and
-      no re-encode writes subtitles that are not in the release.</div>
-    ${unk?`<div class="dim" style="font-size:11.5px;margin-top:6px;
-        border-left:2px solid var(--line);padding-left:8px">
-        <b style="color:#9aa7b8">${fmt(unk)}</b> file(s) have never been looked
-        inside, so nuarr has no opinion about them. They are not in the list
-        below and no button here will touch them —
-        <span title="sub_facts records what a file carries from its stored probe. A file with no probe produces an empty track list, which is written as 'no subtitles' with no error. Counting those as missing would mean deleting thousands of files over a question nobody asked.">why</span>.
-        The library reader fills these in as it goes.</div>`:''}
-    ${miss?`<div style="margin-top:8px;max-height:420px;overflow:auto">
-      <table style="width:100%;font-size:12px;border-collapse:collapse;
-        table-layout:fixed"><colgroup><col style="width:34%">
-        <col style="width:7%"><col style="width:31%">
-        <col style="width:12%"><col style="width:16%"></colgroup>
-      <thead><tr class="dim" style="font-size:10px;letter-spacing:.05em;
-        text-transform:uppercase"><th style="text-align:left">file</th>
-        <th style="text-align:left">wants</th>
-        <th style="text-align:left">what it has</th>
-        <th style="text-align:left">disk</th><th></th></tr></thead>
-      <tbody>${rows.map(r=>`<tr>
-        <td style="padding:3px 8px 3px 0;overflow:hidden;
-            text-overflow:ellipsis;white-space:nowrap"
-            title="${esc(r.path||'')}">${esc(r.title||'')}${
-              r.season?` <span class="dim">S${String(r.season).padStart(2,'0')}${
-                r.episode?'E'+String(r.episode).padStart(2,'0'):''}</span>`:''}</td>
-        <td style="padding:3px 8px 3px 0"><span class="pill"
-            style="color:#e8a33d;border-color:#4a3a12">${esc(r.lang||'')}</span></td>
-        <td class="dim" style="padding:3px 10px 3px 0;overflow:hidden;
-            text-overflow:ellipsis;white-space:nowrap;font-size:11px"
-            title="${esc(r.why||'')}">${esc(r.why||'')}</td>
-        <td class="dim mono" style="padding:3px 8px 3px 0;font-size:10.5px;
-            overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
-            >${esc(r.pool_disk||'')}</td>
-        <td style="padding:3px 0"><button style="font-size:10.5px;
-            white-space:nowrap;width:100%"
-            title="Blocklist this release so the arr never grabs it again, delete the file, and search for a replacement. ${esc(String(Math.round((r.size||0)/1073741824*100)/100))} GB is deleted. Not reversible."
-            onclick="subNeedReplace(this, ${r.file_id})"
-            >blocklist &amp; re-download</button></td>
-      </tr>`).join('')}</tbody></table></div>`
-     : `<div style="font-size:12px;margin-top:8px;color:var(--ok)">Every file
-        that has been looked inside carries what its library requires.</div>`}`;
-  host.innerHTML=subsPanel({
-    id:'subsPanelNeed', accent:'#e8a33d', kind:'auto',
-    busy:!!d.running,
-    title:'Files missing a required subtitle language',
-    sub:`<span class="capsc" style="border-color:#3b4a5e;color:#c2ccd6"
-        title="Reads what the library reader already stored. Opens no file and touches no disk.">stored facts</span>
-      ${req?`<span class="dim">${req}</span>`:''}`,
-    right:`${miss?`<b style="color:#e8a33d">${fmt(miss)}</b> missing`
-                :'<b style="color:var(--ok)">none missing</b>'}
-      ${unk?` · <span class="dim">${fmt(unk)} unread</span>`:''}
-      ${ok?` · <span class="dim">${fmt(ok)} fine</span>`:''}
-      <button class="${auto?'':'on'}" style="font-size:10.5px;margin-left:10px"
-        onclick="subNeedMode('manual')">manual</button>
-      <button class="${auto?'on':''}" style="font-size:10.5px"
-        title="Let the shared remedy blocklist and re-search these by itself. It is capped per hour across every check, and it is the only thing on this page that deletes a file."
-        onclick="subNeedMode('auto')">auto</button>
-      <button style="font-size:10.5px;margin-left:6px"
-        onclick="subNeedCheck(this)">Check now</button>`,
-    body:body
-      + (auto?`<div class="dim" style="font-size:11px;margin-top:6px">
-          <b style="color:var(--warn)">auto</b> — these are being replaced
-          without asking${cap.cap?`, up to ${cap.cap} an hour shared with every
-          other check (${cap.left} left this hour)`:''}.</div>`:'')});
-}
+// THE BUTTONS MOVED WITH THE SECTION, so what they refresh moved too: the
+// counts they change now arrive inside /api/subkind, and reloading the old
+// standalone panel would repaint something that no longer exists.
 async function subNeedMode(m){
   try{ await fetch('/api/subneed/mode?mode='+m, {method:'POST'}); }catch(e){}
-  subNeedLoad(true);
+  loadSubKind(true);
 }
 async function subNeedCheck(btn){
   if(btn){ btn.disabled=true; btn.textContent='checking…'; }
   try{ await fetch('/api/subneed/check', {method:'POST'}); }catch(e){}
   if(btn){ btn.disabled=false; btn.textContent='Check now'; }
-  subNeedLoad(true);
+  loadSubKind(true);
 }
 async function subNeedReplace(btn, fid){
   // The confirmation names the file and says the word delete, because the
   // button says neither and this is the last point at which somebody can
   // stop. refetch deletes first on purpose - the arr scores candidates
   // against whatever is still on disk - so there is no undo after this.
-  const row=(_subNeed&&(_subNeed.missing_list||[]).find(r=>r.file_id===fid))||{};
+  const row=((_sk&&_sk.need&&_sk.need.missing_list)||[])
+    .find(r=>r.file_id===fid)||{};
   const gb=Math.round((row.size||0)/1073741824*100)/100;
   if(!confirm(`Blocklist this release and ask for another?\n\n${
       row.title||''}\n${row.path||''}\n\nThe file is deleted first (${gb} GB) — `
@@ -31784,7 +31668,7 @@ async function subNeedReplace(btn, fid){
   catch(e){ if(btn){ btn.disabled=false; btn.textContent='failed'; } return; }
   if(btn){ btn.textContent=r&&r.ok?'asked':(r&&r.why?'refused':'failed'); }
   if(r&&!r.ok&&r.why) alert(r.why);
-  setTimeout(()=>subNeedLoad(true), 1200);
+  setTimeout(()=>loadSubKind(true), 1200);
 }
 
 // EXTRACTED so two pages can draw the same block: the Subtitles page draws
@@ -31874,7 +31758,7 @@ async function langRequire(lib, code, on){
   // (lowercased, three letters) and the switch has to show what was STORED,
   // not what was clicked.
   await loadLangTab();
-  subNeedLoad(true);
+  try{ loadSubKind(true); }catch(e){}
 }
 
 // THE SAVE LIVES WITH THE THING IT SAVES. One global "Save policy" at the foot
@@ -37644,6 +37528,152 @@ function skAskHtml(){
     </div></div>`;
 }
 
+// ---- THE TWO SECTIONS THAT USED TO BE PANELS -----------------------------
+//
+// Erik: "merge Files missing a required subtitle language and The marker track
+// for burned-in subtitles into Subtitle User Input ... as they are similar
+// systems and can be handled under there".
+//
+// He is right, and /api/subkind's own docstring says why: "What subtitles each
+// file carries". That is the question both of these answer - whether the words
+// are painted into the picture, and whether the language the library asked for
+// is anywhere in the file at all. They were two panels because they were
+// written a day apart, not because they are two subjects.
+//
+// The live batch bar is NOT repeated here. This panel already draws one from
+// `d.marking` a few lines below, and two progress bars for one batch is how
+// they end up disagreeing. What these add is the STANDING backlog, which
+// MARK_STATE cannot carry: it exists while a batch runs and is empty the rest
+// of the time, so between batches the page could say nothing at all about how
+// many files were still owed a marker track.
+function skSection(o){
+  return `<div style="border-top:1px solid var(--line);margin-top:9px;
+      padding-top:8px">
+    <div style="display:flex;gap:9px;align-items:baseline;flex-wrap:wrap">
+      <b style="font-size:11.5px;color:${o.accent}">${o.title}</b>
+      ${o.sub?`<span class="dim" style="font-size:10.5px">${o.sub}</span>`:''}
+      <span style="margin-left:auto;font-size:11.5px;white-space:nowrap">${o.right||''}</span>
+    </div>
+    ${o.body||''}</div>`;
+}
+
+function skMarkerHtml(){
+  const m=(_sk&&_sk.marker)||{};
+  if(!m.marked && !m.total_found) return '';
+  const auto=(m.mode==='auto');
+  const tiles=[
+    ['marked', m.marked, 'var(--ok)', 'files carrying the marker track now'],
+    [auto?'nuarr will take':'ready for nuarr', m.auto_ready,
+     auto?'var(--acc)':'var(--warn)',
+     auto?`at or above the ${m.mark_at}% line — the next pass writes these by itself`
+         :`at or above the ${m.mark_at}% line — switch this panel to auto, or mark them yourself`],
+    ['yours to call', m.needs_you, '#e8a33d',
+     `between ${m.dismiss_at}% and ${m.mark_at}% — nuarr will not decide these either way`],
+    ['not eligible', (m.signs_only||0)+(m.not_mkv||0)+(m.has_eng||0)+(m.dismissed||0),
+     'var(--dim)',
+     `${m.dismissed||0} findings you threw away, ${m.signs_only||0} signs or songs only, `
+     +`${m.not_mkv||0} not Matroska, ${m.has_eng||0} already have an English track `
+     +`— no run clears these`]];
+  return skSection({
+    accent:'#c98cf0', title:'The marker track',
+    sub:'a blank English track, so Bazarr stops hunting and Plex stops '
+       +'reporting none — nothing is drawn over the picture',
+    right: m.waiting
+      ? `${num(m.waiting,auto?'auto':'you')} <span class="dim">waiting</span>`
+      : '<b style="color:var(--ok)">every one marked</b>',
+    body:`<div style="margin-top:6px;display:grid;
+        grid-template-columns:repeat(auto-fit,minmax(132px,1fr));gap:6px">
+      ${tiles.map(([k,v,c,t])=>`<div class="lkind" style="padding:6px 9px"
+        title="${esc(t)}"><div style="font-size:15px;color:${c}">${fmt(v||0)}</div>
+        <div class="dim" style="font-size:10px;letter-spacing:.04em;
+          text-transform:uppercase">${esc(k)}</div></div>`).join('')}
+    </div>
+    <div class="dim" style="font-size:11px;margin-top:6px;display:flex;gap:14px;
+         flex-wrap:wrap">
+      <span>last marked <b>${m.last_at?esc(ago(m.last_at)):'never'}</b></span>
+      <span title="The picture reader has no schedule. It runs on the shared idle runner - whenever the pool is quiet and nobody is watching - and marking rides on its pass.">the reader <b>${
+        m.reader_running?'<span style="color:var(--acc)">working now</span>'
+        :(m.reader_paused?'<span style="color:var(--warn)">paused</span>'
+                         :'idle — waiting for a quiet pool')}</b>${
+        m.reader_left?` · <b>${fmt(m.reader_left)}</b> still to look at`
+                     :' · every file looked at'}</span>
+      ${(m.eta&&auto&&m.auto_ready)?`<span>clearing them <b>${esc(hsDur(m.eta))}</b></span>`:''}
+    </div>`});
+}
+
+function skNeedHtml(){
+  const d=(_sk&&_sk.need)||{};
+  if(!d.any_required){
+    return skSection({
+      accent:'#e8a33d', title:'A required subtitle language',
+      sub:'nothing is required yet',
+      right:'',
+      body:`<div class="dim" style="font-size:11px;margin-top:4px">Tick
+        <b>require</b> under a language in <b>Subtitle rules</b> and every file
+        in that library is checked for it — a track, a file beside it, the
+        words burned into the picture, or the audio already in that language.
+        A file with none of those cannot be fixed by re-encoding, so the only
+        remedy is a different release.</div>`});
+  }
+  const c=d.counts||{}, miss=c.missing||0, unk=c.unknown||0, ok=c.ok||0;
+  const rows=d.missing_list||[];
+  const auto=(d.mode==='auto');
+  const req=Object.entries(d.required||{})
+    .map(([lib,ls])=>`${esc(lib)} <b>${ls.map(esc).join(', ')}</b>`).join(' · ');
+  return skSection({
+    accent:'#e8a33d', title:'A required subtitle language',
+    sub:req,
+    right:`${miss?`<b style="color:#e8a33d">${fmt(miss)}</b> missing`
+                :'<b style="color:var(--ok)">none missing</b>'}${
+      unk?` · <span class="dim">${fmt(unk)} unread</span>`:''}${
+      ok?` · <span class="dim">${fmt(ok)} fine</span>`:''}
+      <button class="rmb ${auto?'':'on'}" style="font-size:10px;margin-left:8px"
+        onclick="subNeedMode('manual')">manual</button>
+      <button class="rmb ${auto?'on':''}" style="font-size:10px"
+        title="Let the shared remedy blocklist and re-search these by itself, capped per hour across every check. It is the only thing on this page that deletes a file."
+        onclick="subNeedMode('auto')">auto</button>
+      <button class="rmb" style="font-size:10px;margin-left:5px"
+        onclick="subNeedCheck(this)">Check now</button>`,
+    body:`
+      ${unk?`<div class="dim" style="font-size:11px;margin-top:5px;
+        border-left:2px solid var(--line);padding-left:8px"><b
+        style="color:#9aa7b8">${fmt(unk)}</b> file(s) have never been looked
+        inside, or the picture reader found marks it could not read. nuarr has
+        no opinion about those, they are not listed below, and no button here
+        will touch them.</div>`:''}
+      ${miss?`<div class="scrollbox" style="max-height:260px;overflow:auto;margin-top:6px">
+        <table style="width:100%;font-size:11.5px;border-collapse:collapse;
+          table-layout:fixed"><colgroup><col style="width:34%">
+          <col style="width:7%"><col style="width:31%"><col style="width:12%">
+          <col style="width:16%"></colgroup>
+        <thead><tr class="dim" style="font-size:10px;letter-spacing:.05em;
+          text-transform:uppercase"><th style="text-align:left">file</th>
+          <th style="text-align:left">wants</th>
+          <th style="text-align:left">what it has</th>
+          <th style="text-align:left">disk</th><th></th></tr></thead>
+        <tbody>${rows.map(r=>`<tr>
+          <td style="padding:3px 8px 3px 0;overflow:hidden;text-overflow:ellipsis;
+            white-space:nowrap" title="${esc(r.path||'')}">${esc(r.title||'')}${
+            r.season?` <span class="dim">S${String(r.season).padStart(2,'0')}${
+              r.episode?'E'+String(r.episode).padStart(2,'0'):''}</span>`:''}</td>
+          <td style="padding:3px 8px 3px 0"><span class="pill"
+            style="color:#e8a33d;border-color:#4a3a12">${esc(r.lang||'')}</span></td>
+          <td class="dim" style="padding:3px 10px 3px 0;overflow:hidden;
+            text-overflow:ellipsis;white-space:nowrap"
+            title="${esc(r.why||'')}">${esc(r.why||'')}</td>
+          <td class="dim mono" style="padding:3px 8px 3px 0;font-size:10.5px;
+            overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+            >${esc(r.pool_disk||'')}</td>
+          <td style="padding:3px 0"><button class="rmb" style="font-size:10px;
+              white-space:nowrap;width:100%"
+              title="Blocklist this release so the arr never grabs it again, delete the file, and search for a replacement. ${esc(String(Math.round((r.size||0)/1073741824*100)/100))} GB is deleted. Not reversible."
+              onclick="subNeedReplace(this, ${r.file_id})"
+              >blocklist &amp; re-download</button></td>
+        </tr>`).join('')}</tbody></table></div>`
+       :`<div style="font-size:11.5px;margin-top:5px;color:var(--ok)">Every file
+          that has been looked inside carries what its library requires.</div>`}`});
+}
+
 function skPaint(force){
   const el=document.getElementById('skPanel'); if(!el||!_sk) return;
   const d=_sk, all=d.rows||[], c=d.counts||{}, P=d.picture||{}, T=d.tracks||{}, S=d.state||{};
@@ -37935,7 +37965,8 @@ function skPaint(force){
   // number-on-the-right as Reading, Being processed and the file list - this
   // was the last panel here still wearing its own.
   const html=`<div class="subsp" id="subsPanelInput">${
-    head}${skAskHtml()}${note}${key}${band}${prog}${hist}${table}${foot}</div>`;
+    head}${skAskHtml()}${note}${key}${band}${prog}${hist}${table}${foot}${
+    skMarkerHtml()}${skNeedHtml()}</div>`;
   scPaint('subs');
   if(!force && (askOpen('skPanel') || panelBusy('skPanel') || panelScrolled('skPanel'))) return;
   if(html===_skKey) return;
@@ -39953,100 +39984,6 @@ function subsSwitchHtml(b){
   return '';
 }
 
-// ---- THE MARKER TRACK'S OWN PROGRESS -------------------------------------
-//
-// Erik: "I don't see the progress for this like last run eta how many files
-// done how many left when it runs next".
-//
-// There was none. Marking had a live bar only WHILE a batch ran - and a batch
-// is a button somebody presses, so for all the time in between, the number of
-// files waiting for a marker track was not on the page at all. The reader's
-// panel reports the reader: frames sampled, files left to look at, next pass.
-// It says nothing about whether anything was WRITTEN, and those are the two
-// halves of this feature.
-//
-// WAITING IS FOUR ANSWERS, NOT ONE. A file can be waiting on nuarr (past the
-// mark line, auto will take it), waiting on you (in the uncertain band),
-// or not waiting at all (signs only, not Matroska, already has an English
-// track). Rolling those into one number is how "21 waiting" turns into a
-// person pressing a button that clears three of them and wondering why.
-function subsMarkerHtml(){
-  const m=(_subs.marker||{});
-  if(!m.marked && !m.waiting && !m.total_found) return '';
-  const auto=(m.mode==='auto');
-  const b=m.batch||{};
-  const pct=(b.total?Math.max(0,Math.min(100,100*(b.done||0)/b.total)):0);
-  const when=t=>t?ago(t):'never';
-  const dur=sec=>!sec?'':(sec<90?`${Math.round(sec)}s`
-    :sec<5400?`${Math.round(sec/60)}m`:`${(sec/3600).toFixed(1)}h`);
-  // THE HEADLINE IS WHAT IS LEFT, not what is done. A progress line whose
-  // big number only goes up reads as finished from the first day.
-  const right = m.running
-    ? `<span class="busy" style="color:var(--acc)"><span class="sp"></span></span>
-       ${num(b.done||0,'auto')} of ${num(b.total||0,'auto')}${
-         b.eta?` · ${esc(dur(b.eta))} left`:''}`
-    : (m.waiting
-        ? `${num(m.waiting,auto?'auto':'you')} <span class="dim">waiting</span>
-           · ${num(m.marked,'ok')} <span class="dim">done</span>`
-        : `<b style="color:var(--ok)">every one marked</b>
-           · ${num(m.marked,'ok')} <span class="dim">done</span>`);
-  return subsPanel({
-    id:'subsPanelMarker', accent:'#c98cf0', kind:'auto', busy:!!m.running,
-    title:'The marker track for burned-in subtitles',
-    sub:`<span class="capsc" style="border-color:#c98cf0;color:#c98cf0"
-        title="One remux of the container with mkvmerge - no re-encode, no OCR, no GPU. About ${esc(String(Math.round(m.secs_each||6)))}s a file.">mkvmerge remux</span>
-      <span class="dim">rides on the picture reader's pass</span>`,
-    right:right,
-    why:`A file whose dialogue is painted into the picture has no subtitle
-      track, so Bazarr keeps hunting for one and Plex reports it as having
-      none. This gives it a blank English track — one cue, a zero-width space,
-      named <b>English (burned into the picture)</b> — which answers both
-      without drawing anything over the words already on screen.`,
-    body:`
-      ${m.running?`<div class="hsbar" style="margin-top:6px"><i style="width:${pct}%"></i></div>
-        ${b.now?`<div class="dim" style="font-size:11.5px;margin-top:4px;
-          overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(b.now)}</div>`:''}`:''}
-      <div style="margin-top:8px;display:grid;
-           grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px">
-        ${[
-          ['marked',        m.marked,     'var(--ok)',
-           'files carrying the marker track now'],
-          [auto?'nuarr will take':'ready for nuarr', m.auto_ready,
-           auto?'var(--acc)':'var(--warn)',
-           auto? `at or above the ${m.mark_at}% line, so the next pass marks these by itself`
-               : `at or above the ${m.mark_at}% line — switch this check to auto, or mark them yourself`],
-          ['yours to call',  m.needs_you, '#e8a33d',
-           `between ${m.dismiss_at}% and ${m.mark_at}% — nuarr will not decide these either way`],
-          ['not eligible',  (m.signs_only||0)+(m.not_mkv||0)+(m.has_eng||0)
-                            +(m.dismissed||0),
-           'var(--dim)',
-           `${m.dismissed||0} findings you threw away, ${m.signs_only||0} signs `
-           +`or songs only, ${m.not_mkv||0} not Matroska, ${m.has_eng||0} already `
-           +`have an English track — no run clears these`],
-        ].map(([k,v,c,t])=>`<div class="lkind" style="padding:7px 10px"
-             title="${esc(t)}">
-             <div style="font-size:17px;color:${c}">${fmt(v||0)}</div>
-             <div class="dim" style="font-size:10.5px;letter-spacing:.04em;
-               text-transform:uppercase">${esc(k)}</div></div>`).join('')}
-      </div>
-      <div class="dim" style="font-size:11.5px;margin-top:8px;display:flex;
-           gap:14px;flex-wrap:wrap;align-items:baseline">
-        <span title="the most recent file to be given the track">last marked
-          <b>${esc(when(m.last_at))}</b></span>
-        <span title="The picture reader has no schedule. It runs on the shared idle runner - whenever the pool is quiet and nobody is watching - and stops the moment either stops being true. Marking rides on its pass, so this is the honest answer to when the next marker appears.">the reader
-          <b>${m.reader_running?'<span style="color:var(--acc)">working now</span>'
-             :(m.reader_paused?'<span style="color:var(--warn)">paused</span>'
-                              :'idle — waiting for a quiet pool')}</b>${
-          m.reader_left?` · <b>${fmt(m.reader_left)}</b> files still to look at`
-                       :' · every file looked at'}</span>
-        ${(!m.running&&m.eta&&auto)?`<span title="how long the files past the mark line would take, at the measured cost of a remux">clearing them
-          <b>${esc(dur(m.eta))}</b></span>`:''}
-        <span title="Set on the picture-reader panel. In manual nothing is written without you.">${
-          auto?'<b style="color:var(--acc)">auto</b> — marked without asking'
-             :'<b style="color:var(--warn)">manual</b> — nothing is written until you say so'}</span>
-      </div>`});
-}
-
 function subsBoardHtml(){
   const B=(_subs.board||[]);
   if(!B.length) return '';
@@ -40463,7 +40400,7 @@ function subsPaint(){
   }
   // subsAskHtml is gone: its questions live in Subtitle User Input now,
   // which is the panel that was already asking you things.
-  const html = subsBoardHtml() + subsMarkerHtml() + subsListHtml();
+  const html = subsBoardHtml() + subsListHtml();
   // RESCUED BEFORE THE WIPE, AND THAT IS NOT AN OPTIONAL STEP.
   //
   // Each panel is moved into a slot inside this container, and this line

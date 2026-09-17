@@ -274,6 +274,27 @@ def queue() -> dict:
         return {"queued": 0, "running": 0, "now": ""}
 
 
+def _safe(fn):
+    """A section of a panel must not be able to take the panel down."""
+    try:
+        return fn() or {}
+    except Exception:                                            # noqa: BLE001
+        return {}
+
+
+def _need_summary(limit: int = 200) -> dict:
+    """Files carrying none of a subtitle language their library requires."""
+    from . import subneed
+    d = subneed.snapshot()
+    d["missing_list"] = subneed.missing(limit)
+    try:
+        from . import remedy
+        d["budget"] = remedy.budget()
+    except Exception:                                            # noqa: BLE001
+        d["budget"] = {}
+    return d
+
+
 def findings(limit: int = 600, want_done: bool = True,
              want_unread: bool = True) -> dict:
     r"""Everything, least certain first, with the counts the header needs.
@@ -370,6 +391,13 @@ def findings(limit: int = 600, want_done: bool = True,
         # progress is auto's progress and the panel reads it from here rather
         # than from a second endpoint.
         "marking": dict(hardsub.MARK_STATE or {}),
+        # THE STANDING BACKLOG, which `marking` above is not. MARK_STATE is a
+        # batch: it exists while one runs and is empty the rest of the time,
+        # so between batches the panel could say nothing at all about how many
+        # files are still owed a marker track. These two are counts of the
+        # library and are always true.
+        "marker": _safe(lambda: hardsub.marker()),
+        "need": _safe(lambda: _need_summary()),
         "auto": {
             "marked": STATE.get("auto_marked") or 0,
             "dropped": STATE.get("auto_dropped") or 0,
