@@ -390,6 +390,12 @@ class Settings:
     # that will not decode means blocklisting the release. Opt-in for the same
     # reason audit_mode is.
     integrity_mode: str = "manual"
+    # "manual" (default) or "auto". The missing-subtitle check finds files that
+    # carry none of the subtitle languages their library REQUIRES - a raw
+    # Japanese release where English subs were asked for. Nothing can be
+    # re-encoded into existence, so the only remedy is a different release,
+    # which means a delete. Opt-in for exactly the reason the two above are.
+    subneed_mode: str = "manual"
     # The burned-in subtitle check scores every finding 0-100 from the shape of
     # what the OCR read. In "auto" it acts on the confident ends of that range
     # by itself - marking above hardsub_mark_at, dismissing below

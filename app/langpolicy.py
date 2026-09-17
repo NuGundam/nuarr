@@ -56,15 +56,18 @@ _KEY_V1 = "langpolicy.v1"
 KIND_DEFAULTS: dict = {
     "anime": {
         "audio": {"keep_original": True, "langs": ["jpn", "eng", "und"]},
-        "subs":  {"keep_original": False, "langs": ["eng"], "keep_untagged": True},
+        "subs":  {"keep_original": False, "langs": ["eng"], "keep_untagged": True,
+                  "require": []},
     },
     "animation": {
         "audio": {"keep_original": True, "langs": ["eng"]},
-        "subs":  {"keep_original": False, "langs": ["eng"], "keep_untagged": True},
+        "subs":  {"keep_original": False, "langs": ["eng"], "keep_untagged": True,
+                  "require": []},
     },
     "live": {
         "audio": {"keep_original": True, "langs": ["eng"]},
-        "subs":  {"keep_original": False, "langs": ["eng"], "keep_untagged": True},
+        "subs":  {"keep_original": False, "langs": ["eng"], "keep_untagged": True,
+                  "require": []},
     },
 }
 
@@ -128,7 +131,24 @@ def _seed(name: str) -> dict:
     return json.loads(json.dumps(KIND_DEFAULTS[kind_for(library=name)]))
 
 
+# REQUIRING IS NOT KEEPING, and the two are separate lists because they answer
+# different questions. `langs` says "if this is here, do not throw it away";
+# `require` says "if this is not here, the file is wrong and no re-encode fixes
+# it". A library can reasonably keep six languages and require one - and a
+# language can be required without being kept, which reads oddly but is what
+# somebody means when they want English subtitles on a file that has none yet.
 def _norm(got: dict, into: dict) -> None:
+    # NO `in into` GUARD, UNLIKE THE FLAGS BELOW, and that is not an oversight.
+    # save() normalises onto whatever is ALREADY STORED, and every policy
+    # stored before this key existed has no `require` in it - so guarding on
+    # the key being present meant the first save of a new requirement was
+    # silently dropped, every time, for exactly the libraries that had ever
+    # been configured. Observed: the switch wrote eng, the endpoint reported
+    # eng, and the stored policy came back with an empty list.
+    if isinstance(got.get("require"), list):
+        into["require"] = sorted({str(x).strip().lower()[:3]
+                                  for x in got["require"] if str(x).strip()})
+    into.setdefault("require", [])
     if isinstance(got.get("langs"), list):
         # Normalised on the way in, so a policy saved as "ENG " cannot quietly
         # fail to match a probe reporting "eng".

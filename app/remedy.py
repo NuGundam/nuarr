@@ -123,6 +123,21 @@ _kind("video/missing", False, True, True,
 _kind("audio/language", False, True, True,
       "the audio is in no language this library keeps, and no re-encode "
       "changes what language somebody is speaking")
+# THE SUBTITLE TWIN OF THE LINE ABOVE, and requeue is False for the same
+# reason: the planner rearranges what a file carries and cannot add a language
+# that was never in the release. A raw Japanese encode with no subtitle track,
+# no sidecar and nothing burned into the picture has nothing for the OCR to
+# read and nothing for the embedder to embed. Only a different release has the
+# words in it.
+#
+# auto_replace is True, but reaching it takes two deliberate steps: the
+# language has to be marked REQUIRED for that library, and subneed_mode has to
+# be set to auto. And subneed only ever hands over files it has actually
+# looked inside - see its docstring on why that distinction is the whole
+# safety argument here.
+_kind("subs/missing-language", False, True, True,
+      "the file carries no subtitles in a language this library requires, and "
+      "no re-encode writes subtitles that are not in the release")
 _kind("job/content", False, True, True,
       "the job failed on the file's own contents")
 
@@ -807,6 +822,18 @@ def reconsider(file_id: int, probe: dict | None = None) -> int:
         found = audit.check(probe, rules.is_anime(path), lib, path)
     except Exception:                                            # noqa: BLE001
         return 0
+    # THE SAME BREATH, FOR THE SAME REASON. A file that has just landed is
+    # exactly when "does this carry the subtitle language its library
+    # requires" is worth asking: the release is fresh enough to blocklist
+    # usefully, and nobody has tried to watch it yet. Waiting for subneed's
+    # own fifteen-minute sweep would be the delay this whole section exists
+    # to remove. It reads the probe that is already in hand and writes one
+    # row; if it cannot, the landing carries on regardless.
+    try:
+        from . import subneed
+        subneed.check_one(int(file_id))
+    except Exception:                                        # noqa: BLE001
+        pass
     now, n = time.time(), 0
     try:
         _fresh_init()

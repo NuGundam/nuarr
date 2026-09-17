@@ -32,7 +32,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi import Response
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
-from . import (arrhealth, audiolang, autoqueue, backup, commitqueue,
+from . import (arrhealth, audiolang, autoqueue, backup, commitqueue, subneed,
                ffmpeg_update, gate,
                adopter, healer, joblog, jobs, lifecycle, maintenance,
                refetch, renamequeue, renamer, rules, scanner, system, updates,
@@ -888,6 +888,7 @@ async def _startup() -> None:
     from . import schedules as _sch
     _sch.bind_loop(asyncio.get_running_loop())
     asyncio.create_task(arrhealth.watch())
+    asyncio.create_task(subneed.watch())
     # Twice a day: do nuarr and the arrs still describe the same files? The
     # check existed before this line did, which meant it only ever ran when
     # someone opened the page and pressed a button - a thing to remember to
@@ -10111,6 +10112,116 @@ async def api_playback_poll():
     return await playback.poll_once()
 
 
+@app.get("/api/subneed")
+async def api_subneed(limit: int = 200, library: str = ""):
+    r"""Files carrying none of the subtitle languages their library requires.
+
+    THREE COUNTS, NOT TWO, and the third one is the point. `unknown` is every
+    file nuarr has never looked inside - which reads as "no subtitles" in
+    sub_facts because an absent probe and an empty track list are the same
+    row. It is reported so the number is visible and never offered a button.
+    See subneed.py's docstring for the measurement that made this necessary.
+    """
+    d = subneed.snapshot()
+    d["missing_list"] = subneed.missing(limit, library)
+    d["unknown_sample"] = subneed.unknown_sample(12)
+    try:
+        from . import remedy
+        d["budget"] = remedy.budget()
+    except Exception:                                    # noqa: BLE001
+        d["budget"] = {}
+    return d
+
+
+@app.post("/api/subneed/mode")
+async def api_subneed_mode(mode: str):
+    """manual lists what is missing; auto lets the remedy replace the release."""
+    import yaml
+    mode = (mode or "").strip().lower()
+    if mode not in ("auto", "manual"):
+        raise HTTPException(400, "mode must be auto or manual")
+    p = _config_path()
+    raw = {}
+    if p.exists():
+        try:
+            raw = yaml.safe_load(p.read_text(encoding="utf-8-sig")) or {}
+        except Exception:                                # noqa: BLE001
+            raw = {}
+    raw["subneed_mode"] = mode
+    p.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True),
+                 encoding="utf-8")
+    SETTINGS.subneed_mode = mode
+    joblog.log(
+        f"missing-subtitle check set to {mode}"
+        + (" - a file carrying none of the subtitle languages its library "
+           "requires will have its release blocklisted and re-searched"
+           if mode == "auto" else
+           " - files missing a required subtitle language will be listed "
+           "and wait for you"), "warn" if mode == "auto" else "info")
+    return {"ok": True, "mode": subneed.mode()}
+
+
+@app.post("/api/subneed/require")
+async def api_subneed_require(library: str, lang: str, on: bool = True):
+    """Mark one subtitle language required for one library, or stop.
+
+    Its own endpoint rather than a langpolicy save: that route runs a full
+    replan to report how many files the change would plan differently, and for
+    this switch the honest answer is always none - it turns a CHECK on, it
+    does not change what the planner does to anything.
+    """
+    from . import langpolicy
+    lang = (lang or "").strip().lower()[:3]
+    if not lang:
+        raise HTTPException(400, "lang is required")
+    pol = langpolicy.load()
+    if library not in pol:
+        raise HTTPException(404, f"no library named {library!r}")
+    want = set((pol[library].get("subs") or {}).get("require") or [])
+    want.add(lang) if on else want.discard(lang)
+    langpolicy.save({library: {"subs": {"require": sorted(want)}}})
+    joblog.log(
+        f"{library}: {lang} subtitles are "
+        + ("now REQUIRED - files carrying none will be listed as needing a "
+           "different release" if on else "no longer required"), "info")
+    # Judge against the new requirement now. Waiting up to fifteen minutes to
+    # find out whether the switch did anything is how a setting gets clicked
+    # twice.
+    r = await asyncio.to_thread(subneed.sweep)
+    return {"ok": True, "require": sorted(want), "swept": r}
+
+
+@app.post("/api/subneed/check")
+async def api_subneed_check(limit: int = 5000):
+    """Run the sweep now rather than waiting for its own clock."""
+    return await asyncio.to_thread(subneed.sweep, int(limit))
+
+
+@app.post("/api/subneed/replace")
+async def api_subneed_replace(file_id: int):
+    r"""Blocklist this release, delete the file, ask the arr for another.
+
+    Goes through remedy rather than calling refetch directly, so this shares
+    the hourly cap and the ledger with the other six checks - and so a file
+    that keeps coming back can be seen to have come back.
+
+    REFUSES A FILE IT HAS NOT LOOKED INSIDE. The button is not drawn for one,
+    but a refusal here is what makes that a rule rather than a rendering
+    decision: anything that can delete 5 GB has to hold the rule itself.
+    """
+    from . import remedy
+    with cursor() as cur:
+        r = cur.execute("SELECT state, why FROM sub_need WHERE file_id=? "
+                        " ORDER BY state LIMIT 1", (int(file_id),)).fetchone()
+    if not r or r["state"] != subneed.MISSING:
+        return {"ok": False, "why": (
+            "nuarr has not looked inside this file, so it has no opinion "
+            "about what is missing from it" if (r and r["state"] == "unknown")
+            else "this file is not recorded as missing a required language")}
+    return await remedy.replace(int(file_id), subneed.KIND, source="subneed",
+                                why=r["why"] or "", auto=False)
+
+
 @app.get("/api/arrs/health")
 async def api_arrs_health(refresh: bool = False):
     r"""What Sonarr and Radarr say is wrong with THEMSELVES.
@@ -15248,6 +15359,15 @@ tr.logrow td{background:#1c2129;border-bottom:1px solid var(--acc);padding:0 12p
         margin-left:auto;text-transform:uppercase;letter-spacing:.5px}
 .gstate.on{color:var(--ok);border-color:var(--ok);background:rgba(63,185,80,.10)}
 .gstate.off{color:var(--dim);border-color:var(--line)}
+/* KEEP above, REQUIRE below it. One column per language so the two switches
+   are visibly about the same thing, and the second is visibly subordinate. */
+.lcell{display:inline-flex;flex-direction:column;gap:2px;align-items:flex-start;
+       vertical-align:top;margin:0 6px 4px 0}
+.lreq{display:inline-flex;align-items:center;gap:4px;font-size:9.5px;
+      letter-spacing:.06em;text-transform:uppercase;color:var(--dim);
+      cursor:pointer;padding-left:3px}
+.lreq input{margin:0;width:11px;height:11px}
+.lreq.on{color:#e8a33d}
 .ahsw{flex:none;font-size:9.5px;line-height:1.6;padding:0 6px;border-radius:9px;
       border:1px solid var(--ok);color:var(--ok);background:rgba(63,185,80,.10);
       text-transform:uppercase;letter-spacing:.5px;cursor:pointer;min-width:30px}
@@ -31492,6 +31612,7 @@ async function loadLangTab(){
   // library has been looked at. So the card renders into a slot of its own,
   // placed after the two live panels, and says in its own subtitle which
   // rules it is measuring against.
+  subNeedLoad();
   const gapHost=document.getElementById('gapHost') || el;
   gapHost.innerHTML = `<div class="subsp" id="gapCard" style="margin-top:12px">
       <div class="subshd"><b style="color:#6fb0ff">Rule drift</b>
@@ -31515,6 +31636,156 @@ async function loadLangTab(){
   langSignsLoad();
 }
 
+// ---- FILES THAT CARRY NONE OF A REQUIRED SUBTITLE LANGUAGE ---------------
+//
+// The panel Erik asked for, in the decode strip's shape because it is the
+// same kind of thing: a check with a manual/auto switch, a count, and a list
+// of files whose only remedy is a different release.
+//
+// THE THIRD COUNT IS THE ONE TO READ. `unknown` is every file nuarr has never
+// looked inside. sub_facts cannot tell those apart from files that genuinely
+// carry nothing - an absent probe and an empty track list produce the same
+// row - so they are counted separately, shown plainly, and given no button.
+// When this was written that was 11,687 files in Anime Shows against 153 the
+// check could actually justify an opinion about.
+let _subNeed=null, _subNeedBusy=false;
+async function subNeedLoad(force){
+  const host=document.getElementById('subNeedHost');
+  if(!host) return;
+  if(_subNeedBusy && !force) return;
+  _subNeedBusy=true;
+  try{ _subNeed=await (await fetch('/api/subneed?limit=200')).json(); }
+  catch(e){ _subNeedBusy=false; return; }
+  _subNeedBusy=false;
+  subNeedPaint();
+}
+function subNeedPaint(){
+  const host=document.getElementById('subNeedHost');
+  if(!host) return;
+  const d=_subNeed;
+  if(!d){ host.innerHTML=''; return; }
+  // NOTHING REQUIRED, NOTHING TO SAY - but say that, rather than rendering an
+  // empty panel that reads as "all clear". They are different facts.
+  if(!d.any_required){
+    host.innerHTML=subsPanel({
+      id:'subsPanelNeed', accent:'#e8a33d', kind:'yours',
+      title:'Files missing a required subtitle language',
+      sub:'nothing is required yet',
+      body:`<div class="subswhy">Tick <b>require</b> under a language above and
+        nuarr will check every file in that library actually carries it — a
+        subtitle track, a file beside it, or the words burned into the picture.
+        A file with none of those cannot be fixed by re-encoding it, so the
+        only remedy is a different release.</div>`});
+    return;
+  }
+  const c=d.counts||{}, miss=c.missing||0, unk=c.unknown||0, ok=c.ok||0;
+  const rows=d.missing_list||[];
+  const auto=(d.mode==='auto');
+  const req=Object.entries(d.required||{})
+    .map(([lib,ls])=>`${esc(lib)} <b>${ls.map(esc).join(', ')}</b>`).join(' · ');
+  const cap=((d.budget||{}).replace)||{};
+  const body=`
+    <div class="subswhy">Checks every file against the subtitle languages its
+      library requires. A file counts as carrying one if it has a track tagged
+      that language, a subtitle file beside it, the dialogue burned into its
+      picture, or the audio is in that language already — and an untagged
+      track counts too, wherever the library keeps untagged tracks, because an
+      unread track may well be the one. What is left carries none of them, and
+      no re-encode writes subtitles that are not in the release.</div>
+    ${unk?`<div class="dim" style="font-size:11.5px;margin-top:6px;
+        border-left:2px solid var(--line);padding-left:8px">
+        <b style="color:#9aa7b8">${fmt(unk)}</b> file(s) have never been looked
+        inside, so nuarr has no opinion about them. They are not in the list
+        below and no button here will touch them —
+        <span title="sub_facts records what a file carries from its stored probe. A file with no probe produces an empty track list, which is written as 'no subtitles' with no error. Counting those as missing would mean deleting thousands of files over a question nobody asked.">why</span>.
+        The library reader fills these in as it goes.</div>`:''}
+    ${miss?`<div style="margin-top:8px;max-height:420px;overflow:auto">
+      <table style="width:100%;font-size:12px;border-collapse:collapse;
+        table-layout:fixed"><colgroup><col style="width:auto">
+        <col style="width:58px"><col style="width:120px">
+        <col style="width:96px"><col style="width:128px"></colgroup>
+      <thead><tr class="dim" style="font-size:10px;letter-spacing:.05em;
+        text-transform:uppercase"><th style="text-align:left">file</th>
+        <th style="text-align:left">wants</th>
+        <th style="text-align:left">what it has</th>
+        <th style="text-align:left">disk</th><th></th></tr></thead>
+      <tbody>${rows.map(r=>`<tr>
+        <td style="padding:3px 8px 3px 0;overflow:hidden;
+            text-overflow:ellipsis;white-space:nowrap"
+            title="${esc(r.path||'')}">${esc(r.title||'')}${
+              r.season?` <span class="dim">S${String(r.season).padStart(2,'0')}${
+                r.episode?'E'+String(r.episode).padStart(2,'0'):''}</span>`:''}</td>
+        <td style="padding:3px 8px 3px 0"><span class="pill"
+            style="color:#e8a33d;border-color:#4a3a12">${esc(r.lang||'')}</span></td>
+        <td class="dim" style="padding:3px 8px 3px 0;overflow:hidden;
+            text-overflow:ellipsis;white-space:nowrap;font-size:11px"
+            title="${esc(r.why||'')}">${esc(r.why||'')}</td>
+        <td class="dim mono" style="padding:3px 8px 3px 0;font-size:10.5px;
+            overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+            >${esc(r.pool_disk||'')}</td>
+        <td style="padding:3px 0"><button style="font-size:10.5px"
+            title="Blocklist this release so the arr never grabs it again, delete the file, and search for a replacement. ${esc(String(Math.round((r.size||0)/1073741824*100)/100))} GB is deleted. Not reversible."
+            onclick="subNeedReplace(this, ${r.file_id})"
+            >blocklist &amp; re-download</button></td>
+      </tr>`).join('')}</tbody></table></div>`
+     : `<div style="font-size:12px;margin-top:8px;color:var(--ok)">Every file
+        that has been looked inside carries what its library requires.</div>`}`;
+  host.innerHTML=subsPanel({
+    id:'subsPanelNeed', accent:'#e8a33d', kind:'auto',
+    busy:!!d.running,
+    title:'Files missing a required subtitle language',
+    sub:`<span class="capsc" style="border-color:#3b4a5e;color:#c2ccd6"
+        title="Reads what the library reader already stored. Opens no file and touches no disk.">stored facts</span>
+      ${req?`<span class="dim">${req}</span>`:''}`,
+    right:`${miss?`<b style="color:#e8a33d">${fmt(miss)}</b> missing`
+                :'<b style="color:var(--ok)">none missing</b>'}
+      ${unk?` · <span class="dim">${fmt(unk)} unread</span>`:''}
+      ${ok?` · <span class="dim">${fmt(ok)} fine</span>`:''}
+      <button class="${auto?'':'on'}" style="font-size:10.5px;margin-left:10px"
+        onclick="subNeedMode('manual')">manual</button>
+      <button class="${auto?'on':''}" style="font-size:10.5px"
+        title="Let the shared remedy blocklist and re-search these by itself. It is capped per hour across every check, and it is the only thing on this page that deletes a file."
+        onclick="subNeedMode('auto')">auto</button>
+      <button style="font-size:10.5px;margin-left:6px"
+        onclick="subNeedCheck(this)">Check now</button>`,
+    body:body
+      + (auto?`<div class="dim" style="font-size:11px;margin-top:6px">
+          <b style="color:var(--warn)">auto</b> — these are being replaced
+          without asking${cap.cap?`, up to ${cap.cap} an hour shared with every
+          other check (${cap.left} left this hour)`:''}.</div>`:'')});
+}
+async function subNeedMode(m){
+  try{ await fetch('/api/subneed/mode?mode='+m, {method:'POST'}); }catch(e){}
+  subNeedLoad(true);
+}
+async function subNeedCheck(btn){
+  if(btn){ btn.disabled=true; btn.textContent='checking…'; }
+  try{ await fetch('/api/subneed/check', {method:'POST'}); }catch(e){}
+  if(btn){ btn.disabled=false; btn.textContent='Check now'; }
+  subNeedLoad(true);
+}
+async function subNeedReplace(btn, fid){
+  // The confirmation names the file and says the word delete, because the
+  // button says neither and this is the last point at which somebody can
+  // stop. refetch deletes first on purpose - the arr scores candidates
+  // against whatever is still on disk - so there is no undo after this.
+  const row=(_subNeed&&(_subNeed.missing_list||[]).find(r=>r.file_id===fid))||{};
+  const gb=Math.round((row.size||0)/1073741824*100)/100;
+  if(!confirm(`Blocklist this release and ask for another?\n\n${
+      row.title||''}\n${row.path||''}\n\nThe file is deleted first (${gb} GB) — `
+      +`the arr scores replacements against whatever is still on disk, so `
+      +`leaving it there makes the search reject its own results. `
+      +`This cannot be undone.`)) return;
+  if(btn){ btn.disabled=true; btn.textContent='asking…'; }
+  let r;
+  try{ r=await (await fetch('/api/subneed/replace?file_id='+fid,
+        {method:'POST'})).json(); }
+  catch(e){ if(btn){ btn.disabled=false; btn.textContent='failed'; } return; }
+  if(btn){ btn.textContent=r&&r.ok?'asked':(r&&r.why?'refused':'failed'); }
+  if(r&&!r.ok&&r.why) alert(r.why);
+  setTimeout(()=>subNeedLoad(true), 1200);
+}
+
 // EXTRACTED so two pages can draw the same block: the Subtitles page draws
 // side='subs', the Audio codec page draws side='audio'. One renderer, one
 // toggle handler, one save flow - the alternative was two copies that drift.
@@ -31527,11 +31798,27 @@ function langBlockHtml(lib, side, sideLabel){
   // by the anime shelf is noise when you are looking at Movies.
   const here=Object.entries(((_lang.present||{})[lib]||{})[side]||{})
     .sort((a,b)=>b[1]-a[1]).filter(([c])=>c!=='und').slice(0,12);
+  // KEEPING AND REQUIRING ARE DIFFERENT QUESTIONS, so they are different
+  // switches. Keeping says "if this is here, do not throw it away";
+  // requiring says "if this is not here, the file is wrong" - and only the
+  // second one can end in a release being blocklisted, so it is its own
+  // deliberate click and only offered on a language already being kept.
+  const req=new Set((cfg.require)||[]);
+  const reqSw=c=>side!=='subs'?'':`<label class="lreq${req.has(c)?' on':''}"
+      title="${req.has(c)
+        ? 'Required. A file carrying no '+esc(name(c))+' subtitles - no track, no sidecar, nothing burned into the picture, and not spoken in it either - is listed below as a file only a different release can fix.'
+        : 'Only kept. Nothing checks whether a file actually HAS '+esc(name(c))+' subtitles.'}"
+      onclick="event.stopPropagation()">
+      <input type="checkbox" ${req.has(c)?'checked':''}
+             onchange="langRequire('${esc(lib)}','${c}',this.checked)">
+      require</label>`;
   const chips=here.map(([c,n])=>`
-    <label class="lchip${chosen.has(c)?' on':''}">
-      <input type="checkbox" ${chosen.has(c)?'checked':''}
-             onchange="langToggle('${esc(lib)}','${side}','${c}',this.checked)">
-      ${esc(name(c))} <span class="dim">${fmt(n)}</span></label>`).join('');
+    <span class="lcell">
+      <label class="lchip${chosen.has(c)?' on':''}">
+        <input type="checkbox" ${chosen.has(c)?'checked':''}
+               onchange="langToggle('${esc(lib)}','${side}','${c}',this.checked)">
+        ${esc(name(c))} <span class="dim">${fmt(n)}</span></label>
+      ${chosen.has(c)?reqSw(c):''}</span>`).join('');
   const extra=[...chosen].filter(c=>!here.some(([cc])=>cc===c));
   return `<div class="lblock">
     <div class="lhead">${esc(sideLabel)}</div>
@@ -31549,8 +31836,10 @@ function langBlockHtml(lib, side, sideLabel){
     <div class="lchips">${chips||'<span class="dim" style="font-size:11px">no '
       +esc(sideLabel.toLowerCase())+' tracks scanned in this library yet</span>'}</div>
     ${extra.length?`<div class="dim" style="font-size:11px;margin-top:5px">also kept:
-      ${extra.map(c=>`<span class="lchip on" onclick="langToggle('${esc(lib)}','${side}','${c}',false)"
-        title="click to remove">${esc(name(c))} ×</span>`).join(' ')}</div>`:''}
+      ${extra.map(c=>`<span class="lcell"><span class="lchip on"
+        onclick="langToggle('${esc(lib)}','${side}','${c}',false)"
+        title="click to remove">${esc(name(c))} ×</span>${
+        chosen.has(c)?reqSw(c):''}</span>`).join(' ')}</div>`:''}
     <div style="margin-top:6px">
       <select onchange="if(this.value){langToggle('${esc(lib)}','${side}',this.value,true);this.value='';}">
         <option value="">add another language…</option>
@@ -31558,6 +31847,33 @@ function langBlockHtml(lib, side, sideLabel){
       </select>
     </div>
   </div>`;
+}
+
+// REQUIRING SAVES IMMEDIATELY, and does not ride with the Save policy button.
+//
+// Every other switch on this block changes what the PLANNER will do to files
+// from now on, which is why they are batched behind a preview that counts how
+// many files would come out differently. This one changes nothing about any
+// file: it turns a check on. Holding it behind the same preview would have it
+// report "0 files would be planned differently" - true, and completely beside
+// the point - and then leave somebody wondering why the list below had not
+// appeared.
+// It also has an endpoint of its own rather than going through
+// /api/langpolicy, which runs a full replan to report how many files the save
+// would change. That is the right thing for a policy edit and pure waste here:
+// the answer is always zero, and paying seconds of planning for it would make
+// a checkbox feel broken.
+async function langRequire(lib, code, on){
+  try{
+    await fetch('/api/subneed/require?library='+encodeURIComponent(lib)
+      +'&lang='+encodeURIComponent(code)+'&on='+(on?'true':'false'),
+      {method:'POST'});
+  }catch(e){}
+  // Re-read rather than patching the local copy: the server normalises
+  // (lowercased, three letters) and the switch has to show what was STORED,
+  // not what was clicked.
+  await loadLangTab();
+  subNeedLoad(true);
 }
 
 // THE SAVE LIVES WITH THE THING IT SAVES. One global "Save policy" at the foot
