@@ -324,6 +324,28 @@ def board() -> list:
     return rows
 
 
+def board_totals(rows: list) -> dict:
+    r"""What the switchboard's own rows add up to.
+
+    THE HEADLINE HAD A DIFFERENT SOURCE FROM THE ROWS UNDER IT. It read
+    _subs.total - files the planner would change - while the rows counted
+    their own backlogs, so the board said "16 files want something" over rows
+    adding to 38. The panel's own comment says the number is there "so the
+    switchboard agrees with the list under it at a glance rather than after
+    arithmetic", which is exactly what it stopped doing when a fifth row
+    arrived that the merge had never seen.
+    """
+    # AND IT SUMS WHAT EACH ROW DISPLAYS, which is not always `waiting`.
+    # The picture row reports waiting=0 and needs_you=5 - its backlog is in
+    # Subtitle User Input, not in a queue - and the row itself shows the
+    # needs_you. Summing the raw `waiting` gave "22 files want something · 27
+    # yours", a headline where the part is bigger than the whole.
+    return {"waiting": sum(max(int(r.get("waiting") or 0),
+                               int(r.get("needs_you") or 0)) for r in rows),
+            "yours": sum(int(r.get("needs_you") or 0) for r in rows),
+            "checks": len(rows)}
+
+
 def _broken(key: str, name: str, e: Exception) -> dict:
     """A decision that could not be read is still a decision, and says so."""
     return {"key": key, "name": name, "does": "", "why": "", "on": False,
@@ -746,7 +768,9 @@ def overview(limit: int = 400, force: bool = False) -> dict:
         if not _VIEW["running"]:
             _VIEW["running"] = True
             try:
-                cached = {"board": board(), **queue_rows(limit)}
+                _b = board()
+                cached = {"board": _b, **queue_rows(limit),
+                          "board_totals": board_totals(_b)}
                 _VIEW.update(at=time.time(), data=cached)
             except Exception as e:                               # noqa: BLE001
                 cached = cached or {"board": [], "rows": [], "total": 0,

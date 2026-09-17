@@ -453,7 +453,10 @@ def missing(limit: int = 200, library: str = "") -> list[dict]:
            "       f.path, f.title, f.season, f.episode, f.size, f.pool_disk, "
            "       f.first_seen "
            "  FROM sub_need n JOIN files f ON f.id=n.file_id "
-           " WHERE n.state='missing'"
+           # THE SAME LIVE FILTER EVERY OTHER LIST USES. answered() takes a
+           # row off the moment the button is pressed; this catches the ones
+           # auto replaced, and anything deleted by a path nobody thought of.
+           " WHERE n.state='missing' AND f.state NOT IN ('deleted','duplicate')"
            + (" AND n.library=?" if library else "") +
            " ORDER BY f.title, f.season, f.episode LIMIT ?")
     args = ((library, int(limit)) if library else (int(limit),))
@@ -485,6 +488,28 @@ def short_why(why: str) -> str:
             n = 0
         return f"{n} other-language track{'s' if n != 1 else ''}"
     return why[:40]
+
+
+def answered(file_id: int) -> None:
+    r"""The release was replaced. Take the question off the list.
+
+    Erik: "I did a batch edit of all the Dragon Ball GT but it didn't
+    disappear from the scroll box". The batch worked - five replaces in the
+    remedy ledger, all ok - but the rows stayed, because a successful replace
+    changes the FILE and this table still held the verdict about it. Measured
+    after: 22 rows still saying `missing`, five of them for files whose row
+    was already gone or marked deleted.
+
+    Deleting the verdict is right rather than rewriting it: the question was
+    "does this file carry eng", and there is no longer a file to ask it of.
+    When the replacement lands, remedy.reconsider() judges it from scratch.
+    """
+    init()
+    try:
+        with cursor() as cur:
+            cur.execute("DELETE FROM sub_need WHERE file_id=?", (int(file_id),))
+    except Exception:                                            # noqa: BLE001
+        pass
 
 
 def unknown_sample(limit: int = 20) -> list[dict]:
@@ -522,7 +547,23 @@ def snapshot() -> dict:
             "at": STATE["at"], "took": STATE["took"], "runs": STATE["runs"],
             "err": STATE["err"],
             "age_s": (round(time.time() - STATE["at"]) if STATE["at"] else None),
-            "poll_s": POLL_S}
+            "poll_s": POLL_S,
+            # ITS SCHEDULE ROW, so the panel can say when the next pass is
+            # rather than only offering a button. Erik: "make the check now a
+            # job time". It is already registered - this is the panel finally
+            # reading it.
+            "next_run": _next_run()}
+
+
+def _next_run() -> float:
+    try:
+        from . import schedules
+        for r in (schedules.snapshot() or {}).get("rows", []):
+            if r.get("key") == "subneed":
+                return float(r.get("next_run") or 0.0)
+    except Exception:                                            # noqa: BLE001
+        pass
+    return 0.0
 
 
 # ------------------------------------------------------------ the loop ------
@@ -583,7 +624,7 @@ def sweep_all() -> dict:
 async def watch() -> None:
     from . import schedules
     schedules.register(
-        "subneed", "Missing subtitle languages", "Subtitles", POLL_S,
+        "subneed", "Required subtitle language", "Subtitles", POLL_S,
         what="Asks, for every file, whether it carries the subtitle languages "
              "its library requires - and says so when a file carries none and "
              "no re-encode could produce one. Reads stored facts only; opens "

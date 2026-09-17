@@ -10238,6 +10238,7 @@ async def api_subneed_replace_batch(ids: str = "", confirm: str = ""):
                                  why=n["why"] or "", auto=False)
         if r.get("ok"):
             out["asked"] += 1
+            subneed.answered(fid)
         elif r.get("capped"):
             out["capped"] += 1
         else:
@@ -10270,8 +10271,13 @@ async def api_subneed_replace(file_id: int):
             "nuarr has not looked inside this file, so it has no opinion "
             "about what is missing from it" if (r and r["state"] == "unknown")
             else "this file is not recorded as missing a required language")}
-    return await remedy.replace(int(file_id), subneed.KIND, source="subneed",
-                                why=r["why"] or "", auto=False)
+    out = await remedy.replace(int(file_id), subneed.KIND, source="subneed",
+                               why=r["why"] or "", auto=False)
+    # THE QUESTION IS ANSWERED, so it leaves the list now rather than at the
+    # next sweep. See subneed.answered().
+    if out.get("ok"):
+        subneed.answered(int(file_id))
+    return out
 
 
 @app.get("/api/arrs/health")
@@ -31747,7 +31753,7 @@ function langBlockHtml(lib, side, sideLabel){
         : 'Only kept. Nothing checks whether a file actually HAS '+esc(name(c))+' subtitles.'}"
       onclick="event.stopPropagation()">
       <input type="checkbox" ${req.has(c)?'checked':''}
-             onchange="langRequire('${esc(lib)}','${c}',this.checked)">
+             onchange="langRequire('${esc(lib)}','${c}',this.checked,this)">
       require</label>`;
   const chips=here.map(([c,n])=>`
     <span class="lcell">
@@ -31800,17 +31806,39 @@ function langBlockHtml(lib, side, sideLabel){
 // would change. That is the right thing for a policy edit and pure waste here:
 // the answer is always zero, and paying seconds of planning for it would make
 // a checkbox feel broken.
-async function langRequire(lib, code, on){
+// THE TICK MOVES, AND NOTHING ELSE DOES.
+//
+// Erik: "fix page flash Required subtitle language is open and selecting
+// option like Require". loadLangTab() rebuilds every library block on the
+// page - six accordions, their chips, their pickers - to move one checkbox,
+// and it does it while the panel below is open, so the whole page repaints
+// under the cursor.
+//
+// The server normalises what it stores (lowercased, three letters), so the
+// switch still has to end up showing what was STORED rather than what was
+// clicked - but that is one boolean, not a page. The checkbox is set from
+// the response, the cached policy is patched to match, and the full reload
+// only happens if the two disagree, which means something else changed it.
+async function langRequire(lib, code, on, el){
+  let r=null;
   try{
-    await fetch('/api/subneed/require?library='+encodeURIComponent(lib)
+    r=await (await fetch('/api/subneed/require?library='+encodeURIComponent(lib)
       +'&lang='+encodeURIComponent(code)+'&on='+(on?'true':'false'),
-      {method:'POST'});
+      {method:'POST'})).json();
   }catch(e){}
-  // Re-read rather than patching the local copy: the server normalises
-  // (lowercased, three letters) and the switch has to show what was STORED,
-  // not what was clicked.
-  await loadLangTab();
-  try{ loadSubNeed(true); loadSubs(true); }catch(e){}
+  const want=(r&&r.require)||null;
+  if(want && _lang && _lang.policy && _lang.policy[lib] && _lang.policy[lib].subs){
+    _lang.policy[lib].subs.require=want;
+    const got=want.indexOf(String(code).toLowerCase().slice(0,3))>=0;
+    if(el) el.checked=got;
+    const lab=el&&el.closest('.lreq'); if(lab) lab.classList.toggle('on', got);
+    if(got!==!!on){ await loadLangTab(); }        // the server disagreed
+  }else{
+    await loadLangTab();
+  }
+  // The panel below is the thing that actually changed; repaint that.
+  try{ loadSubNeed(true); }catch(e){}
+  try{ loadSubs(true); }catch(e){}
 }
 
 // THE SAVE LIVES WITH THE THING IT SAVES. One global "Save policy" at the foot
@@ -37683,7 +37711,11 @@ function snPick(fid, ev){
 }
 function snSelAll(on){ if(on) snRows().forEach(r=>_snSel.add(r.file_id)); else _snSel.clear(); _snKey=''; snPaint(true); }
 function snClearSel(){ _snSel.clear(); _snKey=''; snPaint(true); }
-function snToggle(fid){ if(_snOpen.has(fid)) _snOpen.delete(fid); else _snOpen.add(fid); _snKey=''; snPaint(true); }
+function snToggle(fid, ev){
+  if(ev) ev.stopPropagation();
+  if(_snOpen.has(fid)) _snOpen.delete(fid); else _snOpen.add(fid);
+  _snKey=''; snPaint(true);
+}
 let _snBatch='';
 function snBatchKind(v){ _snBatch=v||''; _snKey=''; snPaint(true); }
 
@@ -37724,6 +37756,13 @@ function snPaint(force){
         manual:'Everything is listed and nothing is replaced. Each row has its own button; select several for the batch.'})}
       <button class="rmb" onclick="snRun(this)" ${running?'disabled':''}>${
         running?'checking…':'Check now'}</button>
+    </span>
+    <span class="dim" style="font-size:11px;display:block;margin-top:2px">
+      <span title="This runs on its own schedule as well - Check now just brings the next one forward. Its row is under System · Jobs, named Required subtitle language.">runs by itself every ${
+        esc(hsDur(d.poll_s||900))}</span>${
+      d.at?` · last ${esc(ago(d.at))}${d.took?` in ${esc(hsDur(d.took))}`:''}`:' · not run yet'}${
+      d.next_run?` · next ${esc(hsDur(Math.max(0,d.next_run-Date.now()/1000)))} away`:''}${
+      d.runs?` · ${fmt(d.runs)} pass${d.runs===1?'':'es'}`:''}
     </span>`;
 
   // ---- the scan, while it runs ----
@@ -37758,28 +37797,33 @@ function snPaint(force){
   // ---- the table: the other panel's columns, minus the ones this verb has no use for ----
   const table=rows.length?`${selBar}
       <div class="rowbox scrollbox"><table class="sktbl" style="width:100%;font-size:11.5px;table-layout:fixed">
-      <colgroup><col style="width:26px"><col><col style="width:110px"><col style="width:74px">
-        <col style="width:96px"><col style="width:150px"><col style="width:96px"><col style="width:180px"></colgroup>
-      <thead><tr class="dim" style="font-size:10px;letter-spacing:.05em;text-transform:uppercase">
-        <th class="c"><input type="checkbox" ${allOn?'checked':''} title="Select every row" onclick="snSelAll(this.checked)"></th>
+      <colgroup><col style="width:24px"><col style="width:auto"><col style="width:104px">
+        <col style="width:78px"><col style="width:74px"><col style="width:150px">
+        <col style="width:58px"><col style="width:19%"><col style="width:214px"></colgroup>
+      <thead><tr class="dim" style="font-size:10.5px">
+        <th class="l"><input type="checkbox" ${allOn?'checked':''} title="Select every row" onclick="snSelAll(this.checked)"></th>
         <th class="l">episode</th><th class="c">library</th><th class="c">added</th>
-        <th class="c">wants</th><th class="c">what it has</th><th class="c">disk</th><th class="r">answer</th>
+        <th class="c">wants</th><th class="c">what it has</th><th class="c">size</th>
+        <th class="l">where it lives</th><th class="r">answer</th>
       </tr></thead><tbody>${rows.map(r=>{
         const open=_snOpen.has(r.file_id);
-        return `<tr>
-        <td class="c"><input type="checkbox" ${_snSel.has(r.file_id)?'checked':''} onclick="snPick(${r.file_id},event)"></td>
-        <td class="l" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
-          <a href="#" onclick="snToggle(${r.file_id});return false" class="dim" style="text-decoration:none">${open?'▾':'▸'}</a>
-          <b>${esc(r.title||'')}</b>${r.season?` <span class="dim">S${String(r.season).padStart(2,'0')}${r.episode?'E'+String(r.episode).padStart(2,'0'):''}</span>`:''}
-          <div class="dim" style="font-size:10px;overflow:hidden;text-overflow:ellipsis" title="${esc(r.path||'')}">${esc((r.path||'').split(/[\\/]/).pop())}</div></td>
+        return `<tr${_snSel.has(r.file_id)?' style="background:rgba(232,163,61,.06)"':''}>
+        <td class="l"><input type="checkbox" ${_snSel.has(r.file_id)?'checked':''} onclick="snPick(${r.file_id},event)"></td>
+        <td class="l" style="cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+          title="${esc(r.path||'')}" onclick="snToggle(${r.file_id},event)"
+          ><span class="actcaret">${open?'▾':'▸'}</span><b>${esc(r.title||'')}</b>${r.season?` <span class="dim">S${String(r.season).padStart(2,'0')}${r.episode?'E'+String(r.episode).padStart(2,'0'):''}</span>`:''}
+          <div class="dim" style="font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-left:14px">${esc((r.path||'').split(/[\\/]/).pop())}</div></td>
         <td class="c dim">${esc(r.library||'')}</td>
         <td class="c dim" style="font-size:10.5px" title="${r.first_seen?esc(new Date(r.first_seen*1000).toLocaleString()):'nuarr has no record of when this file arrived'}">${r.first_seen?ago(r.first_seen):'—'}</td>
         <td class="c"><span class="pill" style="color:#e8a33d;border-color:#4a3a12">${esc(r.lang||'')}</span></td>
         <td class="c dim" style="font-size:10.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(r.why||'')}">${esc(r.short||r.why||'')}</td>
-        <td class="c mono" style="font-size:10.5px;color:${r.pool_disk?diskColor(r.pool_disk):'var(--dim)'}">${esc(r.pool_disk||'')}</td>
+        <td class="c mono" style="font-size:10.5px;font-variant-numeric:tabular-nums"
+          title="what pressing the button deletes">${esc(String(gb(r.size)))}<span class="dim"> GB</span></td>
+        <td class="l mono" style="font-size:10.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:${r.pool_disk?diskColor(r.pool_disk):'var(--dim)'}"
+          title="the pool disk this file is on">${esc(r.pool_disk||'—')}</td>
         <td class="r askhost"><button class="rmb" onclick="snAct(${r.file_id},this)"
           title="Blocklist this release so the arr never grabs it again, delete the file (${esc(String(gb(r.size)))} GB), and search for a replacement. Not reversible.">Blocklist &amp; re-download</button></td>
-      </tr>${open?`<tr style="background:rgba(255,255,255,.025)"><td colspan="8" style="padding:6px 10px;border-bottom:1px solid var(--line);font-size:11px">
+      </tr>${open?`<tr style="background:rgba(255,255,255,.025)"><td colspan="9" style="padding:6px 10px;border-bottom:1px solid var(--line);font-size:11px">
         <div><span class="dim">what it has:</span> ${esc(r.why||'')}</div>
         <div><span class="dim">size:</span> ${esc(String(gb(r.size)))} GB · <span class="dim">judged</span> ${r.checked_at?ago(r.checked_at):'—'}</div>
         <div class="mono dim" style="font-size:10px;word-break:break-all">${esc(r.path||'')}</div></td></tr>`:''}`;}).join('')}</tbody></table></div>`
@@ -40160,15 +40204,21 @@ function subsBoardHtml(){
   // The page's own total, on the right like every other panel: what all the
   // decisions below add up to, so the switchboard agrees with the list under
   // it at a glance rather than after arithmetic.
-  const tot=(_subs.total||0), you=(_subs.held||0);
+  // COUNTED FROM THE ROWS BELOW, not from the merge. The merge never sees
+  // the required-language check - it is not a plan, it is a release to
+  // replace - so the headline read 16 over rows adding to 38.
+  const T=(_subs.board_totals||{});
+  const tot=(T.waiting!=null?T.waiting:(_subs.total||0));
+  const you=(T.yours!=null?T.yours:(_subs.held||0));
+  const nchk=T.checks||B.length;
   return subsPanel({
     id:'subsPanelBoard', accent:'#6fb0ff',
     title:'What nuarr may do on its own', kind:'yours',
     right:`${num(tot,'auto')} <span class="dim">files want something</span>${
       you?` · ${num(you,'you')} <span class="dim">yours</span>`:''}`,
-    why:`Four things can be wrong with a file's subtitles. This is all of them,
-      whether nuarr is allowed to act on each, and how many files are waiting
-      on that answer.`,
+    why:`${nchk===5?'Five':nchk===4?'Four':nchk} things can be wrong with a
+      file's subtitles. This is all of them, whether nuarr is allowed to act
+      on each, and how many files are waiting on that answer.`,
     body:`<div style="margin-top:8px;display:flex;flex-direction:column;gap:6px">
     ${B.map(b=>{
       const c=SUBS_C[b.key]||'#6fb0ff';
