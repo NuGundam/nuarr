@@ -40808,6 +40808,43 @@ function subsPanel(o){
   </div>`;
 }
 
+// WHAT IT LOOKS FOR IN EVERY FILE, and how much of each it has found.
+//
+// "18,229 of 39,886" says how far it has got and nothing about what it is
+// establishing. These four are exactly what scan_one reads per file, and each
+// is a question somebody has: what is in the file, what is beside it, whether
+// the words are painted into the picture, and - because the scanner cannot
+// always look - whether anybody has read it at all.
+//
+// Counted server-side off the SAME query as the totals (subscan._counts_now),
+// so a part cannot exceed its whole. Read-and-carrying-nothing is shown
+// separately from not-read-at-all on purpose: telling those two apart is the
+// whole reason `probed` exists.
+function subsScanFound(sc){
+  const f=(sc && sc.found) || {};
+  if(!Object.keys(f).length) return '';
+  const R=[
+    ['inside it',      f.tracks,  '#6fb0ff',
+     'A subtitle track in the file itself - its codec (srt, ass, PGS), its language tag, its title and its cue count, all read from the stored probe.'],
+    ['beside it',      f.sides,   '#c98cf0',
+     'A loose subtitle file sitting in the same folder. One directory listing per file; this is the only part that touches a disk.'],
+    ['in the picture', f.picture, '#e8a33d',
+     'The picture reader has a verdict on whether the words are painted into the frames. Its own reading, from its own pass - it outlives the probe beside it.'],
+    ['carries none',   f.bare,    '#7fd18c',
+     'Read, and carrying no track and no sidecar. A real answer, not a gap - which is only distinguishable from the next one because the row records whether anybody looked.'],
+    ['not read yet',   f.unread,  '#9aa7b8',
+     'No probe behind the row, so what is inside is unknown. Nothing is decided about these: the rules need something to compare against.'],
+  ].filter(x=>x[1]!=null);
+  return `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:7px">${
+    R.map(([label,n,col,tip])=>`<span class="capsc"
+        style="border-color:${col};color:${col};font-size:10.5px"
+        title="${esc(tip)}">${esc(label)} <b>${fmt(n||0)}</b></span>`).join('')
+  }</div>
+  <div class="dim" style="font-size:10.5px;margin-top:4px">every file is asked
+    all ${R.length===5?'four':'these'} questions in one pass — the counts above
+    are what it has established so far, not four separate sweeps</div>`;
+}
+
 function subsScanHtml(){
   const sc=_subs.scan||{};
   if(!sc.total) return '';
@@ -40829,12 +40866,16 @@ function subsScanHtml(){
       ${sc.eta?` · ${numt(hsDur(sc.eta))} left`:''}`,
     right: sc.left ? `${num(sc.left,'auto')} <span class="dim">left to read</span>`
                    : '<b style="color:var(--ok)">all of it read</b>',
-    body:`<div class="hsbar" style="margin-top:4px"><i style="width:${pct}%"></i></div>
+    body:`<div class="hsbar${sc.running?' live':''}" style="margin-top:4px"
+        ><i style="width:${pct}%"></i></div>
       ${sc.last?`<div style="font-size:12px;margin-top:5px;word-break:break-word;
           white-space:normal;line-height:1.35"
-          title="the file read most recently"><span class="dim" style="font-size:10.5px;
-          letter-spacing:.04em;text-transform:uppercase;margin-right:8px">last read</span>${
+          title="${sc.running?'the file it is reading now':'the file read most recently'}"><span class="dim" style="font-size:10.5px;
+          letter-spacing:.04em;text-transform:uppercase;margin-right:8px">${
+          sc.running?'<span class="busy" style="color:var(--acc)"><span class="sp"></span></span> reading'
+                    :'last read'}</span>${
           esc(sc.last)}</div>`:''}
+      ${subsScanFound(sc)}
       <div class="subswhy">What is inside each file, what is sitting beside it
         and what is painted into its picture — read once and kept, so changing
         a rule costs no disk at all.
@@ -44938,6 +44979,19 @@ span.askhost{display:inline-block}
    says waiting on purpose; the stripes say nothing is moving right now. */
 .hsbar.paused i{background:repeating-linear-gradient(135deg,
   var(--warn) 0 6px, #8a6a17 6px 12px)}
+/* A BAR THAT IS READING SAYS SO WITHOUT WAITING FOR THE NUMBER TO MOVE.
+   One file in 39,886 is a 250th of a percent, so a bar that only steps on
+   arithmetic is indistinguishable from a stalled one. The stripes travel
+   while the pass is live and stop the moment it is not - a finished bar that
+   kept moving would be the same lie the other way up. */
+.hsbar.live i{background-image:repeating-linear-gradient(135deg,
+  rgba(255,255,255,.28) 0 7px, rgba(255,255,255,0) 7px 14px);
+  background-size:28px 100%;animation:hsflow 1.1s linear infinite}
+@keyframes hsflow{from{background-position:0 0}to{background-position:28px 0}}
+/* Reduced-motion users get the colour and none of the travel. */
+@media (prefers-reduced-motion:reduce){
+  .hsbar.live i{animation:none}
+}
 /* The file in front of it: thinner, under the overall bar, so the two read
    as "this run" and "this file" rather than competing. */
 .hsbar.item{height:3px;margin-top:3px;opacity:.85}

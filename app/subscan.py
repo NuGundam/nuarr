@@ -132,7 +132,7 @@ def _probed(file_id: int, cur) -> bool:
                             (int(file_id),)).fetchone())
 
 
-def _tracks_of(file_id: int, cur) -> list:
+def _tracks_of(file_id: int, cur, size: int | None = None) -> list:
     """What is inside, from the stored probe, plus any line count known.
 
     RETURNS [] FOR TWO DIFFERENT REASONS, which is why the caller records
@@ -175,15 +175,35 @@ def _tracks_of(file_id: int, cur) -> list:
     # Where somebody has actually extracted and counted a track, that number
     # beats the header's - the header can be absent, and on a remuxed file it
     # can be left over from the container it came from.
+    #
+    # ONLY IF IT WAS COUNTED IN THIS FILE. shape_of() guards its own cache
+    # with `WHERE size=?` because a rewrite invalidates a count; this read had
+    # no such test, so counts taken before nuarr's own remux were still being
+    # applied after it. Measured: 158 of 675 shape rows that still join to a
+    # live file - 23% - record a size the file no longer has. Dropping a
+    # duplicate track rewrites the container, which both shrinks the file and
+    # RENUMBERS the tracks that remain, so a stale row either lands its count
+    # on a different track than the one it was counted in, or points past the
+    # end. The first is silent and feeds the sweep that decides which copy to
+    # keep by comparing counts.
+    #
+    # Left at -1 when it does not match, which is the value meaning "nobody
+    # has counted this" that every caller already handles.
     try:
-        for s in cur.execute("SELECT track, events, chosen FROM subtitle_shape "
-                             " WHERE file_id=?", (int(file_id),)):
+        for s in cur.execute(
+                "SELECT track, events, chosen, size FROM subtitle_shape "
+                " WHERE file_id=?", (int(file_id),)):
             i = int(s["track"])
-            if 0 <= i < len(out):
-                if s["events"] is not None:
-                    out[i]["events"] = int(s["events"])
-                if s["chosen"]:
-                    out[i]["chosen"] = str(s["chosen"])
+            if not (0 <= i < len(out)):
+                continue
+            fresh = (size is None
+                     or int(s["size"] or 0) == int(size or 0))
+            if fresh and s["events"] is not None:
+                out[i]["events"] = int(s["events"])
+            # `chosen` is YOUR answer about that track, not a measurement, so
+            # it is not invalidated by the file changing size.
+            if s["chosen"]:
+                out[i]["chosen"] = str(s["chosen"])
     except Exception:                                            # noqa: BLE001
         pass
     return out
@@ -254,7 +274,7 @@ def scan_one(file_id: int, row=None) -> dict:
             # from an unprobed file is not a fact about the file; `probed`
             # is what lets the planner tell that from a real absence.
             d["probed"] = 1 if _probed(int(file_id), cur) else 0
-            d["tracks"] = _tracks_of(int(file_id), cur)
+            d["tracks"] = _tracks_of(int(file_id), cur, d["size"])
             d["picture"] = _picture_of(int(file_id), cur)
         except Exception as e:                                   # noqa: BLE001
             d["err"] = f"{type(e).__name__}: {e}"[:180]
@@ -354,7 +374,13 @@ def counts() -> dict:
 def _counts_now() -> dict:
     init()
     cutoff = time.time() - MAX_AGE_S
-    out = {"total": 0, "counted": 0, "left": 0, "fresh": 0, "errors": 0}
+    out = {"total": 0, "counted": 0, "left": 0, "fresh": 0, "errors": 0,
+           # WHAT IT IS ESTABLISHING, not just how far it has got. These are
+           # the four things scan_one reads for every file, and they come off
+           # the SAME query as the totals above so a part can never exceed its
+           # whole - see the note on counts().
+           "found": {"tracks": 0, "sides": 0, "picture": 0, "unread": 0,
+                     "bare": 0}}
     try:
         with cursor() as cur:
             r = cur.execute("""
@@ -367,7 +393,24 @@ def _counts_now() -> dict:
                                  AND COALESCE(s.scanned_at,0) >= ?
                                 THEN 1 ELSE 0 END) AS fresh,
                        SUM(CASE WHEN COALESCE(s.err,'') != '' THEN 1 ELSE 0 END)
-                           AS errors
+                           AS errors,
+                       SUM(CASE WHEN COALESCE(s.n_tracks,0) > 0
+                                THEN 1 ELSE 0 END) AS n_tracks,
+                       SUM(CASE WHEN COALESCE(s.n_sides,0) > 0
+                                THEN 1 ELSE 0 END) AS n_sides,
+                       SUM(CASE WHEN COALESCE(s.picture,'{}') NOT IN ('{}','')
+                                THEN 1 ELSE 0 END) AS n_pic,
+                       -- Read, and carrying nothing at all. Only meaningful
+                       -- BECAUSE `probed` exists: without it this number
+                       -- silently included every file nobody had opened.
+                       SUM(CASE WHEN s.file_id IS NOT NULL
+                                 AND COALESCE(s.probed,0) = 1
+                                 AND COALESCE(s.n_tracks,0) = 0
+                                 AND COALESCE(s.n_sides,0) = 0
+                                THEN 1 ELSE 0 END) AS n_bare,
+                       SUM(CASE WHEN s.file_id IS NOT NULL
+                                 AND COALESCE(s.probed,0) = 0
+                                THEN 1 ELSE 0 END) AS n_unread
                   FROM files f LEFT JOIN sub_facts s ON s.file_id = f.id
                  WHERE """ + _live_where(), (cutoff,)).fetchone()
         out["total"] = int(r["total"] or 0)
@@ -375,6 +418,11 @@ def _counts_now() -> dict:
         out["fresh"] = int(r["fresh"] or 0)
         out["errors"] = int(r["errors"] or 0)
         out["left"] = max(0, out["total"] - out["fresh"])
+        out["found"] = {"tracks": int(r["n_tracks"] or 0),
+                        "sides": int(r["n_sides"] or 0),
+                        "picture": int(r["n_pic"] or 0),
+                        "bare": int(r["n_bare"] or 0),
+                        "unread": int(r["n_unread"] or 0)}
     except Exception:                                            # noqa: BLE001
         pass
     return out
@@ -388,6 +436,13 @@ def progress() -> dict:
     rate = (st["done"] / el) if el > 0.5 else 0.0
     return {**c, "running": st["running"], "done_this_pass": st["done"],
             "of_this_pass": st["total"], "last": st["last"],
+            # What one file costs, so the panel can say what it is doing per
+            # file rather than only per library.
+            "reads": ["the probe for its subtitle tracks",
+                      "the folder beside it for loose subtitle files",
+                      "the picture reader's verdict",
+                      "any line count already counted for a track"],
+            "batch": BATCH, "max_age_s": MAX_AGE_S,
             "elapsed": round(el, 1), "rate": round(rate, 1),
             "eta": round(c["left"] / rate) if rate > 0.05 else 0,
             "last_run": st["last_run"], "took": round(st["took"], 1),
