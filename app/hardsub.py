@@ -1457,6 +1457,138 @@ def stats() -> dict:
     return out
 
 
+def marker() -> dict:
+    r"""How far the marker track has got, and what it is waiting on.
+
+    WHY THIS IS NOT stats(). stats() is about the READER - how much of the
+    library has been sampled, how many frames a second, when the next pass
+    runs. This is about the WRITER: the blank English track that tells Bazarr
+    and Plex the words are already in the picture. They are two different jobs
+    with two different backlogs, and the reader finishing says nothing about
+    whether anything was written.
+
+    Erik: "I don't see the progress for this like last run eta how many files
+    done how many left when it runs next". There was none to see. Marking had
+    live progress only WHILE a batch was running - MARK_STATE, which is empty
+    the other 99% of the time - so between batches the answer to "how many are
+    waiting" was nowhere on the page.
+
+    Everything here is counted the way stats() counts, against live files
+    whose bytes still match what was read, so this panel and that one cannot
+    disagree about the same library.
+    """
+    if not _READY:
+        init()
+    out = {"marked": 0, "waiting": 0, "auto_ready": 0, "needs_you": 0,
+           "signs_only": 0, "not_mkv": 0, "has_eng": 0, "dismissed": 0,
+           "total_found": 0,
+           "mode": mode(), "mark_at": mark_at(), "dismiss_at": dismiss_at(),
+           "last_at": 0.0, "cycle_s": CYCLE_S,
+           "reader_left": 0, "reader_running": False,
+           "secs_each": 0.0, "eta": 0, "running": False}
+    live = ("  FROM hardsub h JOIN files f ON f.id = h.file_id "
+            " WHERE f.state NOT IN ('deleted','duplicate') "
+            "   AND (h.marked = 1 OR h.chosen IS NOT NULL "
+            "        OR h.size IS NULL OR f.size IS NULL "
+            "        OR h.size = f.size) ")
+    ignored = ignored_ids()
+    try:
+        with cursor() as cur:
+            r = cur.execute("SELECT COUNT(*) n " + live + " AND h.marked=1"
+                            ).fetchone()
+            out["marked"] = int((r["n"] if r else 0) or 0)
+            r = cur.execute("SELECT MAX(h.at) m " + live + " AND h.marked=1"
+                            ).fetchone()
+            out["last_at"] = float((r["m"] if r else 0) or 0)
+
+            # THE BACKLOG, FILE BY FILE, because "waiting" is four different
+            # answers and a single number hides which one you are looking at.
+            # A file the marker can never write to is not waiting on anything
+            # and must not be counted as though a run would clear it.
+            rows = cur.execute(
+                "SELECT h.file_id, h.state, h.chosen, h.low_hits, h.samples, "
+                "       h.words, h.marked, f.path, f.sub_langs " + live
+                + " AND COALESCE(h.marked,0)=0 "
+                "   AND COALESCE(h.chosen, h.state) IN "
+                "       ('dialogue','hybrid','signs')").fetchall()
+        for r in rows:
+            out["total_found"] += 1
+            if int(r["file_id"]) in ignored:
+                out["dismissed"] += 1
+                continue
+            st = str(r["chosen"] or r["state"] or "")
+            path = r["path"] or ""
+            # Two hard stops, checked here because mark_one() checks them too
+            # and a panel that promises what the writer will refuse is worse
+            # than no panel.
+            if os.path.splitext(path)[1].lower() != ".mkv":
+                out["not_mkv"] += 1
+                continue
+            from .subembed import _lang_key
+            if any(_lang_key(x) == _lang_key("eng")
+                   for x in (r["sub_langs"] or "").split(",") if x.strip()):
+                out["has_eng"] += 1
+                continue
+            if st == SIGNS:
+                out["signs_only"] += 1
+                continue
+            out["waiting"] += 1
+            try:
+                v = verdict_for(r)
+            except Exception:                                    # noqa: BLE001
+                v = {"auto": "ask"}
+            if v.get("auto") == "mark":
+                out["auto_ready"] += 1
+            else:
+                out["needs_you"] += 1
+    except Exception:                                            # noqa: BLE001
+        pass
+
+    # "WHEN DOES IT RUN NEXT" HAS NO ANSWER, AND SAYING SO IS THE ANSWER.
+    #
+    # The first draft read a next_run out of schedules under the key "hardsub".
+    # There is no such row: hardsub.watch() - which registers it - is never
+    # started. The picture reader runs through readers.watch() on the shared
+    # IDLE runner, which has no clock at all. It works whenever the pool is
+    # quiet and nobody is watching, and stops the moment either stops being
+    # true.
+    #
+    # So the panel would have shown a countdown to a time that means nothing,
+    # computed from a row that does not exist, and it would have read 0 -
+    # "not scheduled" - which is true by accident and for the wrong reason.
+    # What is actually worth knowing is whether it is working now and how much
+    # of the library it has still to look at, because THAT is what decides
+    # when the next marker appears.
+    try:
+        from . import idle as _idle
+        p = _idle.progress(KEY) or {}
+        out["reader_running"] = bool(p.get("running"))
+        out["reader_paused"] = bool(p.get("paused"))
+    except Exception:                                            # noqa: BLE001
+        pass
+    try:
+        out["reader_left"] = untested()
+    except Exception:                                            # noqa: BLE001
+        pass
+
+    # A LIVE BATCH OVERRIDES ALL OF IT. mark_progress() already measures
+    # done/total/eta while mark_many is running; this just carries it through
+    # so the panel has one place to read instead of two.
+    p = mark_progress()
+    if p.get("running"):
+        out.update(running=True, batch=p)
+        out["eta"] = int(p.get("eta") or 0)
+        out["secs_each"] = float(p.get("secs_each") or 0)
+    else:
+        # Between batches the honest estimate is the measured cost of the last
+        # one. Roughly six seconds a file - it is a remux of the container,
+        # not a re-encode - but measured beats remembered.
+        each = float(p.get("secs_each") or 0) or 6.0
+        out["secs_each"] = each
+        out["eta"] = int(out["auto_ready"] * each) if out["auto_ready"] else 0
+    return out
+
+
 def found(limit: int = 60) -> list:
     """The findings, each with how sure it is and what auto would do.
 

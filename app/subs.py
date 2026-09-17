@@ -735,6 +735,14 @@ def overview(limit: int = 400, force: bool = False) -> dict:
     # per panel, which meant the switchboard could only show a progress bar
     # for a system whose panel somebody had already opened - and the whole
     # point of the switchboard is that you do not have to open anything.
+    # THE MARKER'S OWN PROGRESS, on the page that shows the marker. Folded
+    # into this answer rather than given a poll of its own, for the reason in
+    # this function's docstring: the page is one question.
+    try:
+        from . import hardsub
+        d["marker"] = hardsub.marker()
+    except Exception:                                            # noqa: BLE001
+        d["marker"] = {}
     d["idle"] = {}
     try:
         from . import idle

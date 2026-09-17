@@ -39953,6 +39953,100 @@ function subsSwitchHtml(b){
   return '';
 }
 
+// ---- THE MARKER TRACK'S OWN PROGRESS -------------------------------------
+//
+// Erik: "I don't see the progress for this like last run eta how many files
+// done how many left when it runs next".
+//
+// There was none. Marking had a live bar only WHILE a batch ran - and a batch
+// is a button somebody presses, so for all the time in between, the number of
+// files waiting for a marker track was not on the page at all. The reader's
+// panel reports the reader: frames sampled, files left to look at, next pass.
+// It says nothing about whether anything was WRITTEN, and those are the two
+// halves of this feature.
+//
+// WAITING IS FOUR ANSWERS, NOT ONE. A file can be waiting on nuarr (past the
+// mark line, auto will take it), waiting on you (in the uncertain band),
+// or not waiting at all (signs only, not Matroska, already has an English
+// track). Rolling those into one number is how "21 waiting" turns into a
+// person pressing a button that clears three of them and wondering why.
+function subsMarkerHtml(){
+  const m=(_subs.marker||{});
+  if(!m.marked && !m.waiting && !m.total_found) return '';
+  const auto=(m.mode==='auto');
+  const b=m.batch||{};
+  const pct=(b.total?Math.max(0,Math.min(100,100*(b.done||0)/b.total)):0);
+  const when=t=>t?ago(t):'never';
+  const dur=sec=>!sec?'':(sec<90?`${Math.round(sec)}s`
+    :sec<5400?`${Math.round(sec/60)}m`:`${(sec/3600).toFixed(1)}h`);
+  // THE HEADLINE IS WHAT IS LEFT, not what is done. A progress line whose
+  // big number only goes up reads as finished from the first day.
+  const right = m.running
+    ? `<span class="busy" style="color:var(--acc)"><span class="sp"></span></span>
+       ${num(b.done||0,'auto')} of ${num(b.total||0,'auto')}${
+         b.eta?` · ${esc(dur(b.eta))} left`:''}`
+    : (m.waiting
+        ? `${num(m.waiting,auto?'auto':'you')} <span class="dim">waiting</span>
+           · ${num(m.marked,'ok')} <span class="dim">done</span>`
+        : `<b style="color:var(--ok)">every one marked</b>
+           · ${num(m.marked,'ok')} <span class="dim">done</span>`);
+  return subsPanel({
+    id:'subsPanelMarker', accent:'#c98cf0', kind:'auto', busy:!!m.running,
+    title:'The marker track for burned-in subtitles',
+    sub:`<span class="capsc" style="border-color:#c98cf0;color:#c98cf0"
+        title="One remux of the container with mkvmerge - no re-encode, no OCR, no GPU. About ${esc(String(Math.round(m.secs_each||6)))}s a file.">mkvmerge remux</span>
+      <span class="dim">rides on the picture reader's pass</span>`,
+    right:right,
+    why:`A file whose dialogue is painted into the picture has no subtitle
+      track, so Bazarr keeps hunting for one and Plex reports it as having
+      none. This gives it a blank English track — one cue, a zero-width space,
+      named <b>English (burned into the picture)</b> — which answers both
+      without drawing anything over the words already on screen.`,
+    body:`
+      ${m.running?`<div class="hsbar" style="margin-top:6px"><i style="width:${pct}%"></i></div>
+        ${b.now?`<div class="dim" style="font-size:11.5px;margin-top:4px;
+          overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(b.now)}</div>`:''}`:''}
+      <div style="margin-top:8px;display:grid;
+           grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px">
+        ${[
+          ['marked',        m.marked,     'var(--ok)',
+           'files carrying the marker track now'],
+          [auto?'nuarr will take':'ready for nuarr', m.auto_ready,
+           auto?'var(--acc)':'var(--warn)',
+           auto? `at or above the ${m.mark_at}% line, so the next pass marks these by itself`
+               : `at or above the ${m.mark_at}% line — switch this check to auto, or mark them yourself`],
+          ['yours to call',  m.needs_you, '#e8a33d',
+           `between ${m.dismiss_at}% and ${m.mark_at}% — nuarr will not decide these either way`],
+          ['not eligible',  (m.signs_only||0)+(m.not_mkv||0)+(m.has_eng||0)
+                            +(m.dismissed||0),
+           'var(--dim)',
+           `${m.dismissed||0} findings you threw away, ${m.signs_only||0} signs `
+           +`or songs only, ${m.not_mkv||0} not Matroska, ${m.has_eng||0} already `
+           +`have an English track — no run clears these`],
+        ].map(([k,v,c,t])=>`<div class="lkind" style="padding:7px 10px"
+             title="${esc(t)}">
+             <div style="font-size:17px;color:${c}">${fmt(v||0)}</div>
+             <div class="dim" style="font-size:10.5px;letter-spacing:.04em;
+               text-transform:uppercase">${esc(k)}</div></div>`).join('')}
+      </div>
+      <div class="dim" style="font-size:11.5px;margin-top:8px;display:flex;
+           gap:14px;flex-wrap:wrap;align-items:baseline">
+        <span title="the most recent file to be given the track">last marked
+          <b>${esc(when(m.last_at))}</b></span>
+        <span title="The picture reader has no schedule. It runs on the shared idle runner - whenever the pool is quiet and nobody is watching - and stops the moment either stops being true. Marking rides on its pass, so this is the honest answer to when the next marker appears.">the reader
+          <b>${m.reader_running?'<span style="color:var(--acc)">working now</span>'
+             :(m.reader_paused?'<span style="color:var(--warn)">paused</span>'
+                              :'idle — waiting for a quiet pool')}</b>${
+          m.reader_left?` · <b>${fmt(m.reader_left)}</b> files still to look at`
+                       :' · every file looked at'}</span>
+        ${(!m.running&&m.eta&&auto)?`<span title="how long the files past the mark line would take, at the measured cost of a remux">clearing them
+          <b>${esc(dur(m.eta))}</b></span>`:''}
+        <span title="Set on the picture-reader panel. In manual nothing is written without you.">${
+          auto?'<b style="color:var(--acc)">auto</b> — marked without asking'
+             :'<b style="color:var(--warn)">manual</b> — nothing is written until you say so'}</span>
+      </div>`});
+}
+
 function subsBoardHtml(){
   const B=(_subs.board||[]);
   if(!B.length) return '';
@@ -40369,7 +40463,7 @@ function subsPaint(){
   }
   // subsAskHtml is gone: its questions live in Subtitle User Input now,
   // which is the panel that was already asking you things.
-  const html = subsBoardHtml() + subsListHtml();
+  const html = subsBoardHtml() + subsMarkerHtml() + subsListHtml();
   // RESCUED BEFORE THE WIPE, AND THAT IS NOT AN OPTIONAL STEP.
   //
   // Each panel is moved into a slot inside this container, and this line
