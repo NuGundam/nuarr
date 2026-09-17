@@ -340,15 +340,111 @@ def row_for(file_id: int) -> dict:
 _STALE_MARKS = ("have moved since", "has changed since", "not where the plan")
 
 
+# HOW MANY TIMES RE-READING IS ALLOWED TO BE THE ANSWER.
+#
+# Three, and then the file waits for a person. The re-read exists for a file
+# that genuinely changed between being read and being worked on: read it again
+# and the new plan fits. That is a ONE-TIME event per change. A file that
+# comes back stale three times running is not a file that keeps changing - it
+# is a file the reader and the container disagree about, and re-reading it a
+# fourth time produces the fourth identical impossible plan.
+MAX_STALE_REPLANS = 3
+
+
+def _stale_init() -> None:
+    with cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS sub_stale(
+                file_id INTEGER PRIMARY KEY,
+                n       INTEGER NOT NULL DEFAULT 0,
+                first   REAL    NOT NULL DEFAULT 0,
+                last    REAL    NOT NULL DEFAULT 0,
+                why     TEXT    NOT NULL DEFAULT ''
+            )""")
+
+
+def stale_count(fid: int) -> int:
+    try:
+        _stale_init()
+        with cursor() as cur:
+            r = cur.execute("SELECT n FROM sub_stale WHERE file_id=?",
+                            (int(fid),)).fetchone()
+        return int((r["n"] if r else 0) or 0)
+    except Exception:                                            # noqa: BLE001
+        return 0
+
+
+def stale_clear(fid: int) -> None:
+    """A pass that finished is a file that is no longer arguing with itself."""
+    try:
+        _stale_init()
+        with cursor() as cur:
+            cur.execute("DELETE FROM sub_stale WHERE file_id=?", (int(fid),))
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
 def _replan_from_scratch(fid: int, why: str) -> None:
-    """Forget what was read about this file so the reader reads it again."""
+    r"""Forget what was read about this file so the reader reads it again.
+
+    AND COUNT IT, WHICH THE FIRST VERSION DID NOT.
+    ---------------------------------------------
+    This deleted the sub_queue row and the sub_facts row and returned. The
+    queue row is where `tries` lives - so deleting it reset the attempt
+    counter, every time, and the file could never reach MAX_TRIES. The reader
+    re-read it on the next pass, produced the same plan from the same
+    container, the job failed with the same sentence, and the row was deleted
+    again.
+
+    Measured on Erik's library when he reported the Activity panel looked
+    wrong: 1,125 failed subs jobs carrying "the tracks have moved since this
+    was planned", 265 of them in one hour, five Dark Winds episodes going
+    round at about one a minute for 52 minutes - one file 342 times. Each lap
+    wrote a history row, which is what filled his panel.
+
+    The count lives in its own table precisely BECAUSE the queue row is
+    deleted here; a counter kept in the thing being deleted is not a counter.
+    """
+    n = stale_count(fid) + 1
+    now = time.time()
+    try:
+        _stale_init()
+        with cursor() as cur:
+            cur.execute(
+                "INSERT INTO sub_stale(file_id,n,first,last,why) "
+                "VALUES(?,?,?,?,?) ON CONFLICT(file_id) DO UPDATE SET "
+                " n=excluded.n, last=excluded.last, why=excluded.why",
+                (int(fid), n, now, now, why[:200]))
+    except Exception:                                            # noqa: BLE001
+        pass
+
+    if n > MAX_STALE_REPLANS:
+        # STOP. The row stays, marked failed, with the reason - so the file is
+        # visible as something to look at rather than silently spinning.
+        try:
+            with cursor() as cur:
+                cur.execute(
+                    "UPDATE sub_queue SET state=?, finished_at=?, err=? "
+                    " WHERE file_id=?",
+                    (FAILED, now,
+                     f"re-read {n - 1} times and the plan still does not fit "
+                     f"the file - {why[:160]}", int(fid)))
+        except Exception:                                        # noqa: BLE001
+            pass
+        joblog.log(
+            f"subtitles: file {fid} has been re-read {n - 1} times and the "
+            f"plan still does not match the container - giving up rather than "
+            f"looping. The reader and the file disagree; this one needs a "
+            f"person ({why[:80]})", "warn")
+        return
+
     try:
         with cursor() as cur:
             cur.execute("DELETE FROM sub_queue WHERE file_id=?", (fid,))
             cur.execute("DELETE FROM sub_facts WHERE file_id=?", (fid,))
         joblog.log(f"subtitles: file {fid} changed since it was read - the "
                    f"instruction is void, re-reading rather than retrying it "
-                   f"({why[:80]})", "warn")
+                   f"(attempt {n} of {MAX_STALE_REPLANS}; {why[:60]})", "warn")
     except Exception as e:                                       # noqa: BLE001
         joblog.log(f"could not clear the stale subtitle reading for {fid}: "
                    f"{type(e).__name__}: {e}", "debug")
@@ -361,6 +457,7 @@ def note_result(file_id: int, res: dict) -> None:
     if res.get("ok"):
         _mark(fid, DONE, finished_at=time.time(), err="",
               result=json.dumps(res)[:4000])
+        stale_clear(fid)
         return
     why = str(res.get("why") or "")
     if any(m in why.lower() for m in _STALE_MARKS):
