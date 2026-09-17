@@ -679,6 +679,36 @@ def sweep_all() -> dict:
             "took": round(time.time() - started, 1), **counts()}
 
 
+async def act_now(limit: int = 50) -> dict:
+    r"""Hand what is missing to the shared remedy, now.
+
+    Erik enabled auto, pressed Check now, and asked when the files would be
+    fixed. The honest answer at the time was "not because of anything you just
+    did": Check now ran sweep_all(), which JUDGES files and nothing else. Only
+    the fifteen-minute loop below called remedy.auto(), so the scan he asked
+    for could not act however many findings it produced.
+
+    Judging and acting are still separate - a sweep in manual mode must touch
+    nothing - but "check now" in auto mode plainly means both, so the button
+    calls this after the sweep and reports what came of it.
+
+    The cap is remedy's and is shared across every check. Being refused by it
+    is a normal outcome, not a failure, and it is returned rather than
+    swallowed so the panel can say so.
+    """
+    if mode() != "auto":
+        return {"ok": True, "why": "manual mode - nothing acted on",
+                "replaced": 0}
+    from . import remedy
+    got = findings(limit)
+    if not got:
+        return {"ok": True, "why": "nothing to act on", "replaced": 0}
+    r = await remedy.auto(got, "subneed", True)
+    # Anything replaced has had its question answered, so it leaves the list
+    # here the same way the buttons do.
+    return {"ok": True, **r}
+
+
 async def watch() -> None:
     from . import schedules
     schedules.register(
@@ -697,8 +727,7 @@ async def watch() -> None:
                 f"{r.get('missing', 0)} missing, {r.get('unknown', 0)} unread"
                 if r.get("checked") else (r.get("why") or "nothing required"))
             if r.get("missing"):
-                from . import remedy
-                await remedy.auto(findings(50), "subneed", mode() == "auto")
+                await act_now(50)
         except Exception as e:                                   # noqa: BLE001
             joblog.log(f"missing-subtitle check: {type(e).__name__}: {e}",
                        "warn", system="subneed")

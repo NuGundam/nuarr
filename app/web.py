@@ -10209,7 +10209,22 @@ async def api_subneed_check():
     """
     if subneed.STATE.get("running"):
         return {"ok": False, "why": "already running", **subneed.snapshot()}
-    asyncio.create_task(asyncio.to_thread(subneed.sweep_all))
+
+    async def _run():
+        r"""Judge everything, then - in auto - hand the findings over.
+
+        IN THAT ORDER AND NOT THE OTHER. Acting on a stale list is how a file
+        that was fixed an hour ago gets replaced again; the sweep is what
+        makes the list true, so it goes first.
+        """
+        await asyncio.to_thread(subneed.sweep_all)
+        try:
+            await subneed.act_now(50)
+        except Exception as e:                           # noqa: BLE001
+            joblog.log(f"required subtitle language (auto): "
+                       f"{type(e).__name__}: {e}", "warn")
+
+    asyncio.create_task(_run())
     await asyncio.sleep(0.05)
     return {"ok": True, **subneed.snapshot()}
 
@@ -37780,8 +37795,32 @@ function snPaint(force){
       <button class="rmb" onclick="snRun(this)" ${running?'disabled':''}>${
         running?'checking…':'Check now'}</button>
     </span>
+    ${auto?`<div style="font-size:11.5px;margin-top:4px;padding:5px 8px;
+        border-radius:6px;background:rgba(232,163,61,.07);
+        border:1px solid var(--line);display:flex;gap:12px;flex-wrap:wrap;
+        align-items:baseline">
+      <b style="color:var(--warn);flex:none">auto</b>
+      <span>${miss?`these ${fmt(miss)} are replaced without asking`
+                  :'nothing left to replace'}</span>
+      ${(()=>{
+        const b=(d.budget||{}).replace||{};
+        if(b.cap==null) return '';
+        const left=b.left||0, cap=b.cap||0;
+        // THE CAP IS SHARED, so "0 left" usually means another check spent
+        // it, and saying only "0 left" invites the conclusion that this one
+        // is broken.
+        const rate=`<span title="Replacements are capped across every check that can make one - the rule audit, the integrity sweep and this one - because they all delete files. ${esc(String(b.spent||0))} of ${esc(String(cap))} have been used this hour.">${
+          left?`${fmt(left)} of ${fmt(cap)} replacements left this hour`
+              :`<b style="color:var(--warn)">this hour's ${fmt(cap)} replacements are already used</b>`}</span>`;
+        const eta=(miss&&cap)?` · about ${esc(hsDur(Math.ceil(miss/cap)*3600))} to clear ${fmt(miss)} at that rate`:'';
+        return rate+eta;
+      })()}
+      <span title="The unattended pass judges the library and then hands what it finds to the shared remedy. Check now does both at once.">next pass ${
+        d.next_run?esc(hsDur(Math.max(0,d.next_run-Date.now()/1000)))+' away'
+                  :'on its own schedule'}</span>
+    </div>`:''}
     <span class="dim" style="font-size:11px;display:block;margin-top:2px">
-      <span title="This runs on its own schedule as well - Check now just brings the next one forward. Its row is under System · Jobs, named Required subtitle language.">runs by itself every ${
+      <span title="This runs on its own schedule as well - Check now just brings the next one forward, and in auto it acts on what it finds. Its row is under System · Jobs, named Required subtitle language.">runs by itself every ${
         esc(hsDur(d.poll_s||900))}</span>${
       d.at?` · last ${esc(ago(d.at))}${d.took?` in ${esc(hsDur(d.took))}`:''}`:' · not run yet'}${
       d.next_run?` · next ${esc(hsDur(Math.max(0,d.next_run-Date.now()/1000)))} away`:''}${
@@ -37918,7 +37957,9 @@ async function snMode(m){
 async function snRun(btn){
   if(btn){ btn.disabled=true; btn.textContent='checking…'; }
   try{ await fetch('/api/subneed/check', {method:'POST'}); }catch(e){}
-  // The bar draws itself from the poll; this just starts the poll now.
+  // The bar draws itself from the poll; this just starts the poll now. In
+  // auto the same request also hands the findings to the remedy, so the
+  // count moving afterwards is the point rather than a coincidence.
   setTimeout(()=>loadSubNeed(true), 250);
 }
 async function snAct(fid, btn){
