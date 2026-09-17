@@ -171,7 +171,11 @@ def _open_it(file_id: int, path: str) -> bool:
         data = json.loads(r.stdout.decode("utf-8", "replace") or "{}")
         if not data.get("streams"):
             return False
-        jobs.cache_probe(int(file_id), data)
+        # changed=False: this file has not moved, its probe simply aged out.
+        # cache_probe's invalidations exist for a file that was REWRITTEN, and
+        # firing them here threw away OCR shape verdicts that were still true
+        # - measured, sub_shape fell 195 -> 179 as this sweep ran.
+        jobs.cache_probe(int(file_id), data, changed=False)
         return True
     except Exception:                                            # noqa: BLE001
         # A file that will not probe is not a failure of the sweep - it is
@@ -272,6 +276,36 @@ def _tracks_of(file_id: int, cur, size: int | None = None) -> list:
             # it is not invalidated by the file changing size.
             if s["chosen"]:
                 out[i]["chosen"] = str(s["chosen"])
+    except Exception:                                            # noqa: BLE001
+        pass
+    # AND WHAT THE PICTURE READER MADE OF A PICTURE TRACK - the last fact that
+    # lived outside this row. sub_shape answers "is this picture track typeset
+    # signs, or dialogue", measured from glyph height while the OCR reader had
+    # the track open.
+    #
+    # `rel` is ffmpeg's subtitle selector: subocr maps the stream with
+    # `-map 0:s:{rel}`, so it counts subtitle streams from zero - the same
+    # index as `ord` here. Checked against the data before being relied on -
+    # 184 of 192 rows are rel=0, which a one-based counter cannot produce -
+    # because the equivalent number in subtitle_shape turned out to be
+    # one-based and had been read as zero-based for months.
+    #
+    # No freshness test, and that is not an oversight: subocr.forget_shapes()
+    # DELETES these when a file is re-probed after a rewrite, so a row that is
+    # here is a row about this version of the file. A second opinion about
+    # freshness is how the bugs this week started.
+    try:
+        for s in cur.execute(
+                "SELECT rel, typeset, median_h, tall_share "
+                "  FROM sub_shape WHERE file_id=?", (int(file_id),)):
+            i = int(s["rel"])
+            if not (0 <= i < len(out)):
+                continue
+            out[i]["typeset"] = bool(s["typeset"])
+            if s["median_h"] is not None:
+                out[i]["median_h"] = float(s["median_h"])
+            if s["tall_share"] is not None:
+                out[i]["tall_share"] = float(s["tall_share"])
     except Exception:                                            # noqa: BLE001
         pass
     return out

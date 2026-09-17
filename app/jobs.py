@@ -1164,7 +1164,7 @@ def _library_of(file_id: int) -> str:
         return ""
 
 
-def cache_probe(file_id: int, data: dict) -> None:
+def cache_probe(file_id: int, data: dict, changed: bool = True) -> None:
     """Record a probe: useful fields on the row, raw output in a side table.
 
     The raw JSON used to be a column on `files`. At ~4.6 KB a row it had reached
@@ -1228,8 +1228,9 @@ def cache_probe(file_id: int, data: dict) -> None:
     # and the rescan re-read it. Asked here, once, rather than on the page's
     # next five-minute cache miss.
     try:
-        from . import subocr as _so
-        _so.gap_reconsider(file_id, data)
+        if changed:
+            from . import subocr as _so
+            _so.gap_reconsider(file_id, data)
     except Exception:                                        # noqa: BLE001
         pass
     # AND THE SAME QUESTION FOR THE RULES THAT HAVE A REMEDY. Checked against
@@ -1289,7 +1290,8 @@ def cache_probe(file_id: int, data: dict) -> None:
                 _r = cur.execute("SELECT path FROM files WHERE id=?",
                                  (file_id,)).fetchone()
             _ip = (_r["path"] if _r else "") or ""
-        audiolang.invalidate(file_id, _ip)
+        if changed:
+            audiolang.invalidate(file_id, _ip)
     except Exception:                                    # noqa: BLE001
         pass
 
@@ -1306,9 +1308,18 @@ def cache_probe(file_id: int, data: dict) -> None:
     # a full rescan to answer a question about five thousand files that nothing
     # will ask. subocr.screen_for_typeset() asks it for the handful of files
     # the OCR sweep is actually about to queue.
+    #
+    # AND ONLY WHEN THE FILE REALLY CHANGED. A probe fetched because the
+    # cached one aged out - file_probes expires on its own clock - describes
+    # the same file it described before, so nothing derived from it is stale.
+    # Invalidating there cost the OCR sweep a full container read (~15s off a
+    # cold spindle) to relearn what it already knew: measured, sub_shape fell
+    # 195 -> 179 while the subtitle sweep worked through its backlog opening
+    # files whose probes had expired.
     try:
-        from . import subocr as _so_probe
-        _so_probe.forget_shapes(file_id)
+        if changed:
+            from . import subocr as _so_probe
+            _so_probe.forget_shapes(file_id)
     except Exception:                                    # noqa: BLE001
         pass
 
