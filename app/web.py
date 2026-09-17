@@ -16368,6 +16368,40 @@ function agoTick(root){
 // string first costs one compare, skips the DOM write, and leaves the anchor -
 // and the tooltip on it - alive. Returns true when it really did write, for
 // callers that want to know.
+// THE SAME COMPARE, PLUS "NOT WHILE A HAND IS ON THE PAGE".
+//
+// setHTML stops a write that changes nothing. This also stops one that
+// changes something at the wrong moment: a 600-node subtree replaced
+// mid-gesture reflows under the wheel and the momentum dies. The markup is
+// kept and written as soon as the gesture ends, so nothing is lost and
+// nothing waits for the next poll.
+//
+// For panels big enough that the reflow is felt. A header pill is three nodes
+// and can repaint whenever it likes.
+const _idleHTML = new Map();
+function setHTMLIdle(el, html){
+  if(!el) return false;
+  if(userScrolling()){ _idleHTML.set(el, html); return false; }
+  _idleHTML.delete(el);
+  return setHTML(el, html);
+}
+// The moment scrolling stops, put back whatever was held. Cheap: the map is
+// empty except during a gesture, so this is a size check five times a second.
+setInterval(()=>{
+  if(!_idleHTML.size || userScrolling()) return;
+  for(const [el, html] of _idleHTML) setHTML(el, html);
+  _idleHTML.clear();
+}, 200);
+// AND A WAY TO USE IT WITHOUT TOUCHING THE STATEMENT. These panels are built
+// by one assignment spanning hundreds of lines of nested template literals;
+// turning that into a function call means finding its end, and the end of a
+// 600-line expression is not something to locate by searching for a
+// semicolon. This swaps the left-hand side only.
+function idleEl(id){
+  const el = document.getElementById(id);
+  return { set innerHTML(v){ setHTMLIdle(el, v); },
+           get innerHTML(){ return el ? el.innerHTML : ''; } };
+}
 function setHTML(el, html){
   if(!el) return false;
   if(el.dataset.k===html) return false;
@@ -17465,7 +17499,11 @@ a plain file copy alike. With several moves at once the pairing is a best
 guess.">looks like data moving</span>${other.slice(0,3).map(m=>pair(m,'')).join('')}` : '')
       + '</div>';
   }
-  document.getElementById('disks').innerHTML = moveLine + hostIoHtml()
+  // NOT UNDER A MOVING WHEEL, and not at all when it has not changed - see
+  // setHTMLIdle. Measured: 641 nodes and 31 KB rebuilt every 750 ms, nine per
+  // cent of the page, while #jobsRun beside it has sat its turns out since
+  // the log-scrolling fix. This one is the taller of the two.
+  idleEl('disks').innerHTML = moveLine + hostIoHtml()
     + '<table class="disktab"><thead><tr>'
     +th('pool_disk','Disk')+th('n','Files','num')
     +th('total','Size','num dcol-size')+th('used','Used','num dcol-used')
@@ -24810,7 +24848,8 @@ function paintRunning(j){
   // The eligible list's step bubbles, if it is open - see patchSteps().
   try{ if(typeof _drillRows!=='undefined' && _drillRows.length) patchSteps(_drillRows); }
   catch(_){ }
-  document.getElementById('jobsHeld').innerHTML =
+  // Same rule as the cards below it.
+  idleEl('jobsHeld').innerHTML =
     (j.paused_reason
       ? `<div style="padding:10px 14px;border-bottom:1px solid var(--line)">
          <span class="pill p-warn">HELD</span> <span class="dim">${esc(j.paused_reason)}</span></div>`
