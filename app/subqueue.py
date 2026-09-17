@@ -1163,6 +1163,10 @@ async def _reader_and_feeder() -> None:
         left = 0
         try:
             b = await idle.busy()
+            # WHETHER IT IS ALLOWED TO READ, recorded either way. The panel
+            # says "next pass in 40s" and a held sweep makes that a lie unless
+            # the hold is said too - see subscan.STATE["gated"].
+            subscan.STATE["gated"] = bool(b["busy"])
             if not b["busy"]:
                 from . import jobs as _jobs
                 await _jobs.in_work(subscan.scan, subscan.BATCH)
@@ -1188,7 +1192,14 @@ async def _reader_and_feeder() -> None:
             await _j.in_work(_so.sweep_pending)
         except Exception:                                        # noqa: BLE001
             pass
-        await asyncio.sleep(READ_BUSY_S if left else READ_IDLE_S)
+        _nap = READ_BUSY_S if left else READ_IDLE_S
+        # NOT BEFORE, rather than a promise: the pass at the top of this loop
+        # only reads if the box is idle, so this is when it will next LOOK.
+        try:
+            subscan.STATE["next_at"] = time.time() + _nap
+        except Exception:                                        # noqa: BLE001
+            pass
+        await asyncio.sleep(_nap)
 
 
 async def watch() -> None:

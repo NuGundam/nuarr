@@ -40841,15 +40841,83 @@ function subsScanFound(sc){
         title="${esc(tip)}">${esc(label)} <b>${fmt(n||0)}</b></span>`).join('')
   }</div>
   <div class="dim" style="font-size:10.5px;margin-top:4px">every file is asked
-    all ${R.length===5?'four':'these'} questions in one pass — the counts above
-    are what it has established so far, not four separate sweeps</div>`;
+    all of these in one pass — one sweep, not four — and a file can answer
+    yes to several</div>`;
+}
+
+// WHAT THE LAST FILE GAVE UP. Its name alone proves the sweep is alive and
+// says nothing about what it learned, which is the question being asked.
+function subsScanLastFound(sc){
+  const L=sc.last_found||{};
+  if(!L.name) return '';
+  const bits=[];
+  if(!L.probed)
+    bits.push('<span style="color:#9aa7b8">could not look inside — no probe</span>');
+  else bits.push(`<b>${fmt(L.tracks||0)}</b> track${L.tracks===1?'':'s'}`);
+  if(L.sides) bits.push(`<b>${fmt(L.sides)}</b> beside it`);
+  if(L.picture) bits.push(`picture: ${esc(L.picture)}`);
+  if(L.err) bits.push(`<span class="err">${esc(String(L.err).slice(0,60))}</span>`);
+  return `<div class="dim" style="font-size:10.5px;margin-top:2px;padding-left:2px"
+     title="What this file actually yielded when it was read.">found ${
+     bits.join(' · ')}</div>`;
+}
+
+// THE VISIT COVERAGE, in its own words so it cannot be read as knowledge.
+function subsScanVisits(sc){
+  const left=sc.left||0, total=sc.total||0, counted=sc.counted||0;
+  const nxt=sc.next_at ? Math.max(0, sc.next_at - Date.now()/1000) : null;
+  return `<div class="dim" style="font-size:10.5px;margin-top:3px">
+    <span title="A file has a row once the sweep has been to it. That is not the same as having seen inside - that is the bar above.">${
+      fmt(counted)} of ${fmt(total)} have a row</span>${
+    left?` · <span title="Their file changed, or the row is older than the re-read age, so the next pass reads them again.">${
+      fmt(left)} due a re-read</span>`
+       :' · <span style="color:var(--ok)">all rows current</span>'}${
+    sc.max_age_s?` · <span title="A row is re-read when the file changes, and in any case once it is this old - a sidecar can land beside a video nobody touched.">re-read after ${
+      esc(hsDur(sc.max_age_s))}</span>`:''}
+    ${nxt!=null?` · <span title="${sc.gated
+        ? 'The sweep only reads while the box is idle, and something is using it now - so this is when it will next LOOK, not when it will read.'
+        : 'When the next pass is due. It reads only while the box is idle.'}">next look ${
+      sc.gated?'<span style="color:var(--warn)">held — something is using the box</span>'
+              :'in '+esc(hsDur(nxt))}</span>`:''}
+  </div>`;
+}
+
+// PER LIBRARY, because one library at 2% is invisible in a single figure.
+function subsScanLibs(sc){
+  const L=(sc.by_library||[]).filter(x=>x.total);
+  if(L.length<2) return '';
+  return `<div style="display:flex;gap:5px;flex-wrap:wrap;margin-top:5px"
+      title="How much of each library nuarr has been able to read inside.">${
+    L.map(x=>{
+      const p=x.total?Math.round(100*x.read/x.total):0;
+      const col=p>=90?'var(--ok)':p>=40?'#e8a33d':'#9aa7b8';
+      return `<span class="capsc" style="font-size:10px;border-color:${col};color:${col}"
+        title="${esc(x.library)} — ${fmt(x.read)} of ${fmt(x.total)} read inside">${
+        esc(x.library)} <b>${p}%</b> <span class="dim">${fmt(x.read)}/${fmt(x.total)}</span></span>`;
+    }).join('')}</div>`;
 }
 
 function subsScanHtml(){
   const sc=_subs.scan||{};
   if(!sc.total) return '';
-  const pct=sc.total?Math.max(0,Math.min(100,100*(sc.total-sc.left)/sc.total)):0;
-  const done=sc.total-(sc.left||0);
+  // THE BAR COUNTS THE READING, because that is what the panel is called.
+  //
+  // It used to be (total - left)/total: how many files have an up-to-date
+  // ROW. Every file had one, so it read "39,887 of 39,887 (100%) all of it
+  // read" directly above a chip saying "not read yet 21,847". Both numbers
+  // were right and they are not the same word - the sweep had VISITED
+  // everything and could see inside less than half of it.
+  const f=sc.found||{};
+  const read=(sc.read_inside!=null)
+    ? sc.read_inside : Math.max(0,(sc.counted||0)-(f.unread||0));
+  const pct=sc.total?Math.max(0,Math.min(100,100*read/sc.total)):0;
+  const done=read;
+  // STATE["last"] is cleared at the top of every pass, so a pass that finds
+  // nothing stale blanks it - and the last-read line vanishes even though a
+  // file WAS the last thing read. last_found is written per file by
+  // scan_one, including single-file reads outside a pass, so it is what
+  // actually answers "what did it read last".
+  const lastName = sc.last || ((sc.last_found||{}).name || '');
   return subsPanel({
     id:'subsPanelScan', accent:'#6fb0ff', busy:!!sc.running,
     title:'Reading the library', kind:'auto',
@@ -40860,22 +40928,26 @@ function subsScanHtml(){
           title="What is inside comes from the stored ffprobe; what is beside it from one directory listing; what is in the picture from the sampler's stored verdict. Nothing is decoded here.">stored probe + listdir</span>
       <span class="capsc" style="border-color:#e8a33d;color:#e8a33d"
           title="Disk work only - one directory listing per file, and a spun-down pool disk can take a second to answer.">disk</span>
-      ${num(done,'auto')} of ${num(sc.total,'auto')}
+      <span title="Files nuarr has been able to look INSIDE. The rest have a row saying it could not - see the chips below.">${
+        num(done,'auto')} of ${num(sc.total,'auto')} read inside</span>
       <span style="font-size:10.5px">(${pct.toFixed(0)}%)</span>
       ${sc.rate?` · <b style="color:var(--ok)">${sc.rate.toFixed(0)}</b> a second`:''}
       ${sc.eta?` · ${numt(hsDur(sc.eta))} left`:''}`,
-    right: sc.left ? `${num(sc.left,'auto')} <span class="dim">left to read</span>`
-                   : '<b style="color:var(--ok)">all of it read</b>',
+    right: (f.unread)
+      ? `${num(f.unread,'you')} <span class="dim">not opened yet</span>`
+      : '<b style="color:var(--ok)">every file read inside</b>',
     body:`<div class="hsbar${sc.running?' live':''}" style="margin-top:4px"
         ><i style="width:${pct}%"></i></div>
-      ${sc.last?`<div style="font-size:12px;margin-top:5px;word-break:break-word;
+      ${lastName?`<div style="font-size:12px;margin-top:5px;word-break:break-word;
           white-space:normal;line-height:1.35"
           title="${sc.running?'the file it is reading now':'the file read most recently'}"><span class="dim" style="font-size:10.5px;
           letter-spacing:.04em;text-transform:uppercase;margin-right:8px">${
           sc.running?'<span class="busy" style="color:var(--acc)"><span class="sp"></span></span> reading'
                     :'last read'}</span>${
-          esc(sc.last)}</div>`:''}
+          esc(lastName)}${subsScanLastFound(sc)}</div>`:''}
       ${subsScanFound(sc)}
+      ${subsScanVisits(sc)}
+      ${subsScanLibs(sc)}
       <div class="subswhy">What is inside each file, what is sitting beside it
         and what is painted into its picture — read once and kept, so changing
         a rule costs no disk at all.

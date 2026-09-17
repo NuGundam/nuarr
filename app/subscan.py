@@ -64,7 +64,15 @@ _READY = False
 
 STATE: dict = {"running": False, "t0": 0.0, "done": 0, "total": 0,
                "last": "", "last_run": 0.0, "took": 0.0, "err": "",
-               "written": 0}
+               "written": 0,
+               # WHAT THE LAST FILE YIELDED, not just its name. A filename on
+               # its own says the sweep is alive and nothing about what it
+               # learned, which is the question a person watching it has.
+               "last_found": {},
+               # When the next pass is due, set by the loop that runs it -
+               # subqueue._reader_and_feeder. It is gated on the box being
+               # idle, so this is "not before", never a promise.
+               "next_at": 0.0, "gated": False}
 
 
 def init() -> None:
@@ -306,6 +314,18 @@ def scan_one(file_id: int, row=None) -> dict:
                  time.time(), d["err"], int(d["probed"])))
     except Exception as e:                                       # noqa: BLE001
         d["err"] = f"{type(e).__name__}: {e}"[:180]
+    # WHAT THIS ONE CAME BACK WITH. Recorded for every file, not only inside a
+    # batch, so "last read" on the panel is always the most recent thing that
+    # actually happened rather than the last thing a sweep happened to touch.
+    try:
+        STATE["last_found"] = {
+            "name": os.path.basename(path),
+            "tracks": len(d["tracks"]), "sides": len(d["sides"]),
+            "picture": (d["picture"] or {}).get("state") or "",
+            "probed": int(d["probed"] or 0),
+            "library": d["library"], "err": d["err"], "at": time.time()}
+    except Exception:                                            # noqa: BLE001
+        pass
     return d
 
 
@@ -423,6 +443,22 @@ def _counts_now() -> dict:
                         "picture": int(r["n_pic"] or 0),
                         "bare": int(r["n_bare"] or 0),
                         "unread": int(r["n_unread"] or 0)}
+        out["read_inside"] = max(0, out["counted"] - out["found"]["unread"])
+        # PER LIBRARY, because one library sitting at 2% read is invisible in
+        # a single figure for forty thousand files. Same live filter, same
+        # pass, so these add up to the totals above.
+        with cursor() as cur2:
+            out["by_library"] = [
+                {"library": (x["library"] or "?"),
+                 "total": int(x["n"] or 0),
+                 "read": int(x["rd"] or 0)}
+                for x in cur2.execute(
+                    "SELECT f.library AS library, COUNT(*) AS n,"
+                    "       SUM(CASE WHEN COALESCE(s.probed,0)=1"
+                    "                THEN 1 ELSE 0 END) AS rd"
+                    "  FROM files f LEFT JOIN sub_facts s ON s.file_id = f.id"
+                    " WHERE " + _live_where() +
+                    " GROUP BY f.library ORDER BY n DESC")]
     except Exception:                                            # noqa: BLE001
         pass
     return out
@@ -443,6 +479,9 @@ def progress() -> dict:
                       "the picture reader's verdict",
                       "any line count already counted for a track"],
             "batch": BATCH, "max_age_s": MAX_AGE_S,
+            "last_found": dict(st.get("last_found") or {}),
+            "next_at": st.get("next_at") or 0.0,
+            "gated": bool(st.get("gated")),
             "elapsed": round(el, 1), "rate": round(rate, 1),
             "eta": round(c["left"] / rate) if rate > 0.05 else 0,
             "last_run": st["last_run"], "took": round(st["took"], 1),
