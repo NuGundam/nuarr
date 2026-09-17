@@ -16318,6 +16318,42 @@ function ago(ts){
   if(s<3456000) return Math.round(s/86400)+'d ago';
   return new Date(ts*1000).toLocaleDateString();
 }
+// THE SAME CLOCK, COUNTING THE FIRST MINUTE. Erik: "can it show sec until the
+// first min to show the difference between the just now". A dozen rows all
+// saying "just now" are in no order at all, when they in fact landed tens of
+// seconds apart - and that order is what the Last column is for.
+//
+// Separate from ago() rather than replacing it: ago() is read by every panel
+// on the page, and the repaint guard immediately below is there because a
+// string that changes forces a DOM write that destroys what the browser had
+// attached to the element - a native title= tooltip most visibly. A value
+// that moved every second would strobe every tooltip in the header.
+//
+// It differs from ago() ONLY below 90 seconds - the stretch ago() calls "just
+// now" - and hands back to it above that, so an hour still reads "1h ago" and
+// a three-day-old row does not come out as "4320m ago".
+function agoFine(ts){
+  const s=Math.max(0, Date.now()/1000-ts);
+  if(s<1) return 'now';
+  if(s<60) return Math.floor(s)+'s ago';
+  if(s<90) return '1m ago';      // ago() says "just now" here; keep counting
+  return ago(ts);
+}
+// AND THE CELLS KEEP COUNTING WITHOUT THE TABLE BEING REBUILT. renderDone
+// repaints only when its list signature changes, and that signature is made
+// of job and event ids - nothing time-based - so a seconds count written into
+// the table would stop at the moment the last entry arrived and sit there
+// looking live. Rewriting textContent touches no element, so an open log and
+// every tooltip survive the tick.
+function agoTick(root){
+  const box=root||document;
+  box.querySelectorAll('[data-ago]').forEach(el=>{
+    const t=parseFloat(el.dataset.ago);
+    if(!t) return;
+    const w=agoFine(t);
+    if(el.textContent!==w) el.textContent=w;
+  });
+}
 // WRITE MARKUP ONLY WHEN IT HAS ACTUALLY CHANGED.
 //
 // Replacing an element destroys everything the browser has attached to it, and
@@ -25698,6 +25734,11 @@ function renderDone(j){
         +(openLogId?' · paused while you read':'')
         +((!_actHist && !openLogId && !follows('doneBox'))?' · paused (scrolled down)':'');
   actPagerPaint();
+  // ABOVE THE GUARD, for the same reason the header line is: the Last column
+  // has to keep counting on the polls that find nothing new. Below the guard
+  // it would only move when the feed did, which is precisely when it does not
+  // need to.
+  agoTick(document.getElementById('doneBox'));
   if(!listChanged && !openChanged) return;              // nothing to do
   if(openLogId && listChanged && !openChanged) return;  // defer: you're reading
   lastListSig=listSig; lastOpenId=openLogId;
@@ -26198,7 +26239,8 @@ function renderDone(j){
         <td class="num dim nb" style="padding-right:0">${sz}</td>
         <td class="dim nb" style="padding-left:14px;white-space:nowrap"
             title="${esc(new Date(g.last*1000).toLocaleString())}"
-          >${ago(g.last)}</td></tr>`;
+            data-ago="${g.last}"
+          >${agoFine(g.last)}</td></tr>`;
       const row=(it,nested,gid,cur)=> it.ev ? evRow(it.ev,nested,gid,cur)
                                             : jobRow(it.job,nested,gid,cur);
       // `cur` marks the CURRENT release's rows: they carry data-gen so they
