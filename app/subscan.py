@@ -86,8 +86,30 @@ def init() -> None:
                 n_tracks  INTEGER NOT NULL DEFAULT 0,
                 n_sides   INTEGER NOT NULL DEFAULT 0,
                 scanned_at REAL   NOT NULL DEFAULT 0,
-                err       TEXT    NOT NULL DEFAULT ''
+                err       TEXT    NOT NULL DEFAULT '',
+                -- DID ANYBODY ACTUALLY LOOK INSIDE? Without this, n_tracks=0
+                -- means both "counted, there are none" and "no probe was
+                -- cached, so the list came back empty" - and the planner
+                -- cannot tell which. See the note on _tracks_of.
+                probed    INTEGER NOT NULL DEFAULT 0
             )""")
+        # The column arrived after the table; add it where it is missing.
+        try:
+            cur.execute("ALTER TABLE sub_facts ADD COLUMN "
+                        "probed INTEGER NOT NULL DEFAULT 0")
+        except Exception:                                        # noqa: BLE001
+            pass                                  # already there
+        # BACKFILL. A cached probe proves it was read. So does a non-empty
+        # track list - that can only have come from a probe, even if the probe
+        # itself has since been pruned. Everything else is honestly unknown
+        # and the next sweep will settle it.
+        try:
+            cur.execute(
+                "UPDATE sub_facts SET probed=1 "
+                " WHERE probed=0 AND (n_tracks > 0 "
+                "    OR file_id IN (SELECT file_id FROM file_probes))")
+        except Exception:                                        # noqa: BLE001
+            pass
         cur.execute("CREATE INDEX IF NOT EXISTS ix_sub_facts_at "
                     "ON sub_facts(scanned_at)")
         # The planner asks "which files have something beside them or twice
@@ -100,8 +122,23 @@ def init() -> None:
 
 
 # --------------------------------------------------------------- the facts --
+def _probed(file_id: int, cur) -> bool:
+    """Has anybody actually looked inside this file?
+
+    The one question that separates "it carries no subtitles" from "nuarr has
+    never opened it". They were the same empty list until this existed.
+    """
+    return bool(cur.execute("SELECT 1 FROM file_probes WHERE file_id=?",
+                            (int(file_id),)).fetchone())
+
+
 def _tracks_of(file_id: int, cur) -> list:
-    """What is inside, from the stored probe, plus any line count known."""
+    """What is inside, from the stored probe, plus any line count known.
+
+    RETURNS [] FOR TWO DIFFERENT REASONS, which is why the caller records
+    _probed() alongside this: no probe cached, or a probe that lists no
+    subtitle streams. Only the second one means the file has no subtitles.
+    """
     from .subembed import _lang_key, _track_class
     out: list = []
     r = cur.execute("SELECT json FROM file_probes WHERE file_id=?",
@@ -210,8 +247,13 @@ def scan_one(file_id: int, row=None) -> dict:
         d = {"file_id": int(file_id), "path": path,
              "library": row["library"] or "", "disk": row["pool_disk"] or "",
              "mtime": float(row["mtime"] or 0.0), "size": int(row["size"] or 0),
-             "tracks": [], "sides": [], "picture": {}, "err": ""}
+             "tracks": [], "sides": [], "picture": {}, "err": "",
+             "probed": 0}
         try:
+            # ORDER MATTERS ONLY IN THAT BOTH ARE READ. An empty track list
+            # from an unprobed file is not a fact about the file; `probed`
+            # is what lets the planner tell that from a real absence.
+            d["probed"] = 1 if _probed(int(file_id), cur) else 0
             d["tracks"] = _tracks_of(int(file_id), cur)
             d["picture"] = _picture_of(int(file_id), cur)
         except Exception as e:                                   # noqa: BLE001
@@ -228,19 +270,20 @@ def scan_one(file_id: int, row=None) -> dict:
         with cursor() as cur:
             cur.execute(
                 "INSERT INTO sub_facts(file_id,path,library,disk,mtime,size,"
-                "  tracks,sides,picture,n_tracks,n_sides,scanned_at,err) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "  tracks,sides,picture,n_tracks,n_sides,scanned_at,err,"
+                "  probed) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(file_id) DO UPDATE SET path=excluded.path,"
                 "  library=excluded.library, disk=excluded.disk,"
                 "  mtime=excluded.mtime, size=excluded.size,"
                 "  tracks=excluded.tracks, sides=excluded.sides,"
                 "  picture=excluded.picture, n_tracks=excluded.n_tracks,"
                 "  n_sides=excluded.n_sides, scanned_at=excluded.scanned_at,"
-                "  err=excluded.err",
+                "  err=excluded.err, probed=excluded.probed",
                 (int(file_id), d["path"], d["library"], d["disk"], d["mtime"],
                  d["size"], json.dumps(d["tracks"]), json.dumps(d["sides"]),
                  json.dumps(d["picture"]), len(d["tracks"]), len(d["sides"]),
-                 time.time(), d["err"]))
+                 time.time(), d["err"], int(d["probed"])))
     except Exception as e:                                       # noqa: BLE001
         d["err"] = f"{type(e).__name__}: {e}"[:180]
     return d
@@ -420,10 +463,21 @@ def interesting(limit: int = 100000) -> list:
     init()
     with cursor() as cur:
         return [_row(r) for r in cur.execute(
-            "SELECT * FROM sub_facts "
-            " WHERE n_sides > 0 OR n_tracks > 1 "
-            "    OR COALESCE(picture,'{}') NOT IN ('{}','') "
-            " ORDER BY file_id LIMIT ?", (int(limit),))]
+            # AND THE FILE HAS TO STILL EXIST. Measured before this join: of
+            # 11,537 rows offered, 297 had no `files` row at all and 162 were
+            # deleted or duplicates; 68 of those still had work planned, and
+            # 67 of THOSE were not on disk either. Every one became a job that
+            # reached a worker, found nothing, and reported "the file is not
+            # there - the arr replaced or moved it". A row about a file that
+            # has gone is not a file that could possibly need something doing
+            # to it, which is what this function claims to return.
+            "SELECT s.* FROM sub_facts s "
+            "  JOIN files f ON f.id = s.file_id "
+            " WHERE f.state NOT IN ('deleted','duplicate') "
+            "   AND COALESCE(f.path,'') != '' "
+            "   AND (s.n_sides > 0 OR s.n_tracks > 1 "
+            "    OR COALESCE(s.picture,'{}') NOT IN ('{}','')) "
+            " ORDER BY s.file_id LIMIT ?", (int(limit),))]
 
 
 def forget(file_id: int) -> None:

@@ -306,6 +306,26 @@ def plan(f: dict, ctx: dict | None = None) -> dict:
     asks: list = []
     skips: list = []
 
+    # NOTHING IS DECIDED ABOUT A FILE NOBODY HAS LOOKED INSIDE.
+    #
+    # Every rule below reasons from `tracks`. "Nothing inside is full eng, so
+    # take the sidecar in" and "there are two full eng, so drop one" are both
+    # claims about the track list - and until sub_facts carried `probed`, an
+    # empty list meant either "counted, none" or "no probe was cached", with
+    # no way to tell them apart. Measured over the whole offered set: files
+    # without a probe produced 15 `take` and 12 `recycle`; files with one
+    # produced none of either. Each of those 15 would have imported a sidecar
+    # on the strength of an absence nobody had established.
+    #
+    # Guarded once here rather than inside each rule, because every rule has
+    # the same dependency and the next one added would need it too. The file
+    # is not dismissed - it waits for a reader, which is what the sweep is
+    # for - and the reason is recorded so the panel can say so.
+    # It may still ASK - see the filter just before the return. A question is
+    # how not-knowing gets resolved, and the picture reading that raises one
+    # is its own evidence from its own reader.
+    unread = not int(f.get("probed") or 0)
+
     embed_on = bool(rules.get("embed_sidecars"))
     conflict = str(rules.get("sidecar_conflict") or "leave")
     if conflict == "sidecar" and not embed_on:
@@ -581,6 +601,29 @@ def plan(f: dict, ctx: dict | None = None) -> dict:
                             {"v": "leave", "label": "No, leave it",
                              "what": "and stop asking about this show"}]})
 
+    # NOTHING IS DONE TO A FILE NOBODY HAS READ.
+    #
+    # Every step above compares what is inside the file against something
+    # else - a sidecar, another track, a rule. When no probe has been read
+    # `tracks` is empty for the wrong reason, and "nothing inside is full eng,
+    # so take the sidecar in" becomes a conclusion drawn from an absence
+    # nobody established. Measured over the whole offered set: files without a
+    # probe produced 15 `take` and 12 `recycle`; files with one produced none
+    # of either.
+    #
+    # The ASKS survive on purpose. The first version of this guard returned
+    # early and took them with it - subqueue's asking list went 11 to 0, and
+    # one of the silenced files had been read by the picture reader at 50%
+    # with its sampled words attached. `picture` comes from that reader, not
+    # from ffprobe, and file_probes ages out by design, so the two go missing
+    # independently. Suppressing a question because a DIFFERENT system's cache
+    # had expired is the same mistake this guard exists to prevent.
+    if unread and steps:
+        skips.append({"what": ", ".join(sorted({s["do"] for s in steps})),
+                      "why": "nuarr has not read inside this file, so there "
+                             "is nothing to compare against - it is left "
+                             "alone until something reads it"})
+        steps = []
     steps.sort(key=lambda s: ORDER.get(s["do"], 9))
     rewrite = any(s["do"] in ("take", "dropdup", "dropempty") for s in steps)
     return {"file_id": fid, "path": path, "library": lib,

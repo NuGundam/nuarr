@@ -715,6 +715,46 @@ async def register_only() -> None:
     except Exception:                                            # noqa: BLE001
         pass
     STATE["due_at"] = 0.0
+    # AND THE ROW REPORTS ITSELF, instead of saying "never" forever.
+    #
+    # schedules.snapshot() derives last_run, next_run and status from beat(),
+    # which every clock-driven loop calls at the top of a pass. This check has
+    # no pass of its own any more - its two readers are `subread` jobs on the
+    # main queue - so nothing ever called it, and the row read
+    #
+    #     subkind   Subtitles   every 300s   last run: never
+    #
+    # over readers that had between them filled 4,346 hardsub rows and 683
+    # subtitle_shape rows. That is what a broken check looks like.
+    await _heartbeat()
+
+
+async def _heartbeat() -> None:
+    """Report the subread feeder on the schedule row that names it."""
+    from .db import cursor
+    try:
+        from . import schedules
+    except Exception:                                            # noqa: BLE001
+        return
+    while True:
+        await asyncio.sleep(CYCLE_S)
+        try:
+            since = time.time() - CYCLE_S
+            with cursor() as cur:
+                done = int(cur.execute(
+                    "SELECT COUNT(*) c FROM jobs WHERE kind='subread' "
+                    "  AND state='done' AND COALESCE(finished_at,0) > ?",
+                    (since,)).fetchone()["c"] or 0)
+                left = int(cur.execute(
+                    "SELECT COUNT(*) c FROM jobs WHERE kind='subread' "
+                    "  AND state IN ('queued','running')").fetchone()["c"] or 0)
+            said = (f"{done} read this pass" if done else "idle - nothing read")
+            if left:
+                said += f", {left} waiting"
+            schedules.beat(SCHED_KEY, said)
+            STATE["last_run"] = time.time()
+        except Exception as e:                                   # noqa: BLE001
+            STATE["last_error"] = f"heartbeat: {type(e).__name__}: {e}"
 
 
 async def watch() -> None:
@@ -747,4 +787,8 @@ async def watch() -> None:
     except Exception:                                            # noqa: BLE001
         pass
     STATE["due_at"] = 0.0
+    # NOTE: web.py does not call this - it calls register_only(), and the
+    # readers run as `subread` jobs on the main queue. The heartbeat that
+    # keeps this check's schedule row honest lives there for that reason.
     await asyncio.gather(hardsub.watch(), stt.watch())
+
