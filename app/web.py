@@ -37666,18 +37666,59 @@ function skProgBar(p, what, unit){
 // measured those, so there is nothing to score and no row to put it in - but
 // they are the same question being asked of the same person, so they sit at
 // the top of the same panel rather than in a panel of their own.
-function skAskHtml(){
-  const A=((_subq&&_subq.asking)||[]).map(r=>({
-      ...r, asks:(r.asks||[]).filter(a=>a.q!=='picture'&&a.q!=='title')}))
+// THE QUESTIONS THIS PANEL IS SHOWING - one definition, read by the section
+// that draws them AND by the headline that counts them. They were two
+// expressions over two stores once, and that is how eleven of them ended up
+// counted in one place, named in another and answerable in neither.
+function skAsksShown(){
+  const shown=new Set(((_sk&&_sk.rows)||[])
+    .map(r=>Number(r.file_id)).filter(n=>n));
+  return ((_subq&&_subq.asking)||[]).map(r=>({
+      ...r, asks:(r.asks||[]).filter(a=>
+        (a.q!=='picture' && a.q!=='title') || !shown.has(Number(r.file_id)))}))
     .filter(r=>r.asks.length);
+}
+function skAskHtml(){
+  // WHICH ASKS BELONG HERE: the ones nothing else on this panel is showing.
+  //
+  // This used to drop every ask whose q was 'picture' or 'title', on the
+  // stated assumption that those always appear as scored rows in the table
+  // below, with their own picker and evidence. They do not always.
+  //
+  // Measured: sub_queue held ELEVEN picture asks while the table held none -
+  // subkind had settled everything it knew about (715 done, 0 actionable) and
+  // those eleven live in sub_queue, which is a different store. So they were
+  // counted by the file-by-file panel, called "waiting on your answer", and
+  // rendered nowhere at all. Erik: "they don't show up".
+  //
+  // The test is now what it always meant - do not print a question twice - so
+  // it asks that directly: is this file already answerable among the rows
+  // being rendered? If it is, leave it to that row. If it is not, it belongs
+  // here, whatever its q says. The two descriptions cannot drift apart again
+  // because there is only one of them now.
+  const A=skAsksShown();
   if(!A.length) return '';
+  // AND THE HEADING SAYS WHICH KIND IT IS HOLDING. "nothing measured - there
+  // is no reading to show you" is true of two identical tracks and false of a
+  // picture read at 50% with its sampled words attached, which is most of
+  // what lands here now.
+  const _n=A.reduce((n,r)=>n+r.asks.length,0);
+  const _read=A.reduce((n,r)=>n+r.asks.filter(a=>
+    a.q==='picture'||a.q==='title').length,0);
+  const _head=_read===0
+    ? ['nothing measured','two copies nuarr cannot tell apart — there is no '
+       +'reading to show you, only the choice']
+    : _read===_n
+      ? ['to answer','nuarr has a reading for each of these and will not act '
+         +'on it without you']
+      : ['to answer','some carry a reading, some had nothing to measure — '
+         +'either way the choice is yours'];
   return `<div style="margin:8px 0 4px;border-top:1px solid var(--line);
        border-bottom:1px solid var(--line);padding:6px 0">
     <div style="display:flex;gap:9px;align-items:baseline;flex-wrap:wrap">
-      <b style="font-size:11.5px;color:#e8a33d">${num(A.length,'you')} nothing
-        measured</b>
-      <span class="dim" style="font-size:10.5px">two copies nuarr cannot tell
-        apart — there is no reading to show you, only the choice</span>
+      <b style="font-size:11.5px;color:#e8a33d">${num(A.length,'you')} ${
+        esc(_head[0])}</b>
+      <span class="dim" style="font-size:10.5px">${esc(_head[1])}</span>
     </div>
     <div class="scrollbox" style="max-height:210px;overflow:auto;margin-top:4px">
     ${A.slice(0,30).map(r=>(r.asks||[]).map(a=>`
@@ -38196,7 +38237,11 @@ function skPaint(force){
   const running=!!(P.running||T.running||S.running);
   // ITS OWN COUNT, ON THE RIGHT, and it is the same number its switchboard row
   // shows - both are "things here waiting on you", so they have to agree.
-  const _need=(c.actionable||0);
+  // The rows this panel can act on, PLUS the queue's questions it is drawing
+  // above them. c.actionable counts table rows; skAsksShown() deliberately
+  // drops any ask whose file is one of those, so the two never overlap.
+  const _need=(c.actionable||0)
+    + skAsksShown().reduce((n,r)=>n+(r.asks||[]).length, 0);
   const head=`<div class="subshd"><b style="color:#e8a33d">Subtitle User Input</b>
     <span class="subskind k-ask"
       title="This one is waiting on an answer from you. Nothing on it moves until you give one.">waiting on you</span>

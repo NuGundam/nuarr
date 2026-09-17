@@ -97,9 +97,18 @@ def needs_you() -> int:
     neither. Both are things you would open the panel to answer.
     """
     n = 0
+    # The files the panel is actually listing, so an ask about one of them is
+    # not counted twice - and an ask about anything else is not lost.
+    shown: set = set()
     try:
-        c = (_findings().get("counts") or {})
+        f = _findings()
+        c = (f.get("counts") or {})
         n += int(c.get("actionable") or 0)
+        # done=0 is what the panel fetches, so this is the same set of rows it
+        # draws. Counting ALL findings here would hide the asks again: 715 of
+        # them are done and the panel shows none of those.
+        shown = {int(r.get("file_id") or 0) for r in (f.get("rows") or [])
+                 if not r.get("done") and r.get("file_id")}
     except Exception:                                            # noqa: BLE001
         pass
     try:
@@ -108,12 +117,22 @@ def needs_you() -> int:
         from . import subqueue
         subqueue.init()
         with cursor() as cur:
-            for r in cur.execute("SELECT asks FROM sub_queue "
+            for r in cur.execute("SELECT file_id, asks FROM sub_queue "
                                  " WHERE asks != '[]'"):
                 try:
+                    fid = int(r["file_id"] or 0)
+                except (TypeError, ValueError):
+                    fid = 0
+                try:
                     for a in _json.loads(r["asks"] or "[]"):
-                        # The reading ones are already counted above, as rows.
-                        if a.get("q") not in ("picture", "title"):
+                        # A READING ONE IS ONLY "ALREADY COUNTED" IF ITS FILE
+                        # IS REALLY UP THERE. This used to skip every picture
+                        # and title ask on the assumption that each had a row
+                        # in subkind - and with subkind reporting actionable=0
+                        # while sub_queue held eleven picture asks, the row
+                        # said "nothing waiting" over eleven questions.
+                        if (a.get("q") not in ("picture", "title")
+                                or fid not in shown):
                             n += 1
                 except Exception:                                # noqa: BLE001
                     pass
