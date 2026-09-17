@@ -37725,6 +37725,9 @@ let _sn=null, _snKey='', _snPoll=null, _snSel=new Set(), _snLast=null;
 // second request, and there is no reason to spend it on a panel nobody has
 // asked to see the history of.
 let _snDone=false, _snDoneRows=null;
+// The rows as they were last drawn, so a poll can tell a real change from the
+// clock ticking over in the header. See snPaint.
+let _snRowSig='';
 const _snOpen=new Set();
 function snRows(){ return ((_sn&&_sn.missing_list)||[]); }
 function snSelIds(){ const live=new Set(snRows().map(r=>r.file_id)); return [..._snSel].filter(id=>live.has(id)); }
@@ -37747,14 +37750,49 @@ function snToggle(fid, ev){
 let _snBatch='';
 function snBatchKind(v){ _snBatch=v||''; _snKey=''; snPaint(true); }
 
+// A LIST THAT EMPTIES ITSELF HAS TO BE WATCHED.
+//
+// Erik: "make the scroll box update when an entry has changed". It did not.
+// The only poll was the one during a scan, so between scans the panel was a
+// photograph: auto replaces three files on its fifteen-minute pass, their
+// rows are gone from the server's answer, and the box on screen still shows
+// them until something else happens to repaint it. In auto that is the normal
+// case rather than an edge one - the whole point is that entries change
+// without you doing anything.
+//
+// So it keeps a heartbeat while the page is open, at the same cadence and
+// with the same hidden-pane guard loadSubs uses, and repaints only when the
+// answer is actually different. See snPaint for what "different" means.
 async function loadSubNeed(force){
-  const el=document.getElementById('snPanel'); if(!el) return;
+  const el=document.getElementById('snPanel');
+  if(!el){ clearTimeout(_snPoll); _snPoll=null; return; }
+  // EVERY PANE LIVES IN ONE DOCUMENT, so "the element exists" is not "the
+  // page is open". Without this it would fetch every ten seconds while
+  // somebody sat on the Jobs page.
+  const pane=document.getElementById('langPane');
+  if(!force && pane && pane.style.display==='none'){
+    clearTimeout(_snPoll);
+    _snPoll=setTimeout(()=>loadSubNeed(), 20000);
+    return;
+  }
   if(!_sn) el.innerHTML='<div class="skel" style="padding:12px">'
     +'<i style="width:52%"></i><i style="width:70%"></i></div>';
   try{ _sn=await (await fetch('/api/subneed?limit=600')).json(); }
-  catch(e){ el.innerHTML='<span class="dim">could not load</span>'; return; }
+  catch(e){ if(!_sn) el.innerHTML='<span class="dim">could not load</span>';
+            snSchedule(); return; }
   if(_snDone && !_snDoneRows) await snLoadDone();
   snPaint(force);
+}
+
+// ONE TIMER, SET IN ONE PLACE. Fast while a scan is moving the bar, slow the
+// rest of the time - a list whose entries change on a fifteen-minute pass
+// does not need a second-by-second poll, and this panel is usually open
+// beside four others that are already polling.
+function snSchedule(){
+  clearTimeout(_snPoll);
+  if(!document.getElementById('snPanel')) { _snPoll=null; return; }
+  const fast=!!(_sn&&_sn.running);
+  _snPoll=setTimeout(()=>loadSubNeed(), fast?1200:10000);
 }
 async function snLoadDone(){
   try{ _snDoneRows=(await (await fetch('/api/subneed/answered?limit=200')).json()).rows||[]; }
@@ -37940,15 +37978,39 @@ function snPaint(force){
   </div>${doneList}`;
 
   const html=`<div class="subsp" id="subsPanelNeed">${head}${prog}${table}${foot}</div>`;
-  if(!force && (askOpen('snPanel') || panelScrolled('snPanel'))) return;
-  if(html===_snKey) return;
+
+  // WHAT COUNTS AS CHANGED IS THE ROWS, not the markup.
+  //
+  // The markup carries "last 2m ago" and "next 12m 55s away", which differ on
+  // every single poll - so comparing it would repaint the table once every
+  // ten seconds forever, which is the flicker this comparison exists to
+  // prevent. The row signature is the file ids and their verdicts: it changes
+  // exactly when an entry has been answered, replaced or newly found, which
+  // is when Erik asked for the box to update.
+  const sig=rows.map(r=>r.file_id+':'+(r.short||'')).join(',')+'|'+miss+'|'+unk
+            +'|'+(_snDone?(doneRows.length+':on'):'off');
+  const rowsChanged=(sig!==_snRowSig);
+
+  // THE GUARDS STILL APPLY TO COSMETIC REPAINTS ONLY. A confirmation open in
+  // the panel must never be yanked away mid-question - that one is absolute.
+  // But being scrolled is NOT a reason to keep showing a file that no longer
+  // exists, which is what blocking on it did: auto would replace the row you
+  // were looking at and the row would stay. So a scroll defers the redraw of
+  // the same rows and never defers a change to them; the position is put back
+  // either way.
+  if(!force && askOpen('snPanel')) { snSchedule(); return; }
+  if(!force && !rowsChanged && (panelBusy('snPanel') || panelScrolled('snPanel'))) {
+    snSchedule(); return; }
+  if(html===_snKey){ snSchedule(); return; }
+
   const box=el.querySelector('.rowbox'), keep=box?box.scrollTop:0;
-  _snKey=html; el.innerHTML=html;
+  _snKey=html; _snRowSig=sig; el.innerHTML=html;
   const nb=el.querySelector('.rowbox'); if(nb&&keep) nb.scrollTop=keep;
-  clearTimeout(_snPoll);
-  // While a check runs the bar has to move, so poll fast; otherwise the
-  // page's own cadence is enough.
-  if(running) _snPoll=setTimeout(()=>{ if(document.getElementById('snPanel')) loadSubNeed(true); }, 1200);
+  // SAY SO WHEN IT MOVES. A row vanishing while you are looking at the panel
+  // is news, and the same pulse every other panel here uses is how this page
+  // reports news.
+  if(rowsChanged) try{ ifChanged('subs.need', sig, el); }catch(e){}
+  snSchedule();
 }
 async function snMode(m){
   try{ await fetch('/api/subneed/mode?mode='+m, {method:'POST'}); }catch(e){}
@@ -40758,6 +40820,17 @@ function subsPaint(){
   for(const k in PANES){
     const slot=document.getElementById('subsSlot-'+k);
     if(slot&&held[k]) slot.appendChild(held[k]);
+  }
+  // AN OPEN ROW ON A FRESH PAGE HAS TO FILL ITSELF.
+  //
+  // Which row is open is remembered in localStorage, so arriving at the page
+  // puts the panel straight into its slot - but only subsDetail() ever called
+  // its loader, and subsDetail only runs when somebody CLICKS. So a row left
+  // open yesterday came back as an empty box, and the fix for it was to close
+  // the row and open it again. Starting the loader here means the panel is
+  // filled by being placed, which is when it is first visible.
+  if(subsOpen('language') && document.getElementById('snPanel') && !_sn){
+    try{ loadSubNeed(); }catch(e){}
   }
 }
 
