@@ -8013,6 +8013,25 @@ async def api_subkind_act(file_id: int, source: str, kind: str = "",
     """Yes, do this one: recorded, remembered, and put on the queue."""
     if confirm != "yes":
         return {"ok": False, "why": "confirm=yes required"}
+    # A LANGUAGE ROW IS NOT SETTLED, IT IS REPLACED. Nothing is remembered
+    # against the show and nothing goes on the planner's queue: the file is
+    # deleted, the release blocklisted and the arr asked for another. Same
+    # path the standalone button used, with the same refusal for a file
+    # nuarr has not looked inside - the rule lives in the endpoint, not the
+    # button, because anything that deletes 5 GB has to hold its own rule.
+    if str(source).startswith("language"):
+        from . import remedy
+        with cursor() as cur:
+            n = cur.execute("SELECT state, why FROM sub_need WHERE file_id=? "
+                            " ORDER BY state LIMIT 1", (int(file_id),)).fetchone()
+        if not n or n["state"] != subneed.MISSING:
+            return {"ok": False, "why": (
+                "nuarr has not looked inside this file, so it has no opinion "
+                "about what is missing from it" if (n and n["state"] == "unknown")
+                else "this file is not recorded as missing a required language")}
+        return await remedy.replace(int(file_id), subneed.KIND,
+                                    source="subneed", why=n["why"] or "",
+                                    auto=False)
     r = await asyncio.to_thread(_sk_settle, int(file_id), source, kind,
                                 "mark" if source == "picture" else "retitle")
     try:
@@ -8046,6 +8065,19 @@ async def api_subkind_act_batch(ids: str = "", confirm: str = "",
         return {"ok": False, "why": "confirm=yes required"}
     _ = force
     items = _sk_items(ids)
+    # A LANGUAGE ROW IS NEVER PART OF A BATCH. The batch settles readings -
+    # a kind recorded, a title corrected, a marker queued - and none of that
+    # is reversible only in the sense of costing GPU time. A language row's
+    # answer deletes a file and blocklists a release. "Select all, Yes" must
+    # not be able to do that to twenty files at once with one confirmation
+    # written for retitles. Each one is its own button, its own question,
+    # naming its own file and its own size.
+    skipped = [i for i in items if str(i["source"]).startswith("language")]
+    items = [i for i in items if not str(i["source"]).startswith("language")]
+    if skipped and not items:
+        return {"ok": False, "why": (
+            f"{len(skipped)} whole-file row(s) left out: replacing a release "
+            f"deletes the file, so each one is answered on its own button")}
 
     def _all():
         r"""Every selected row, kind first, then one re-read for all of them.
@@ -37325,6 +37357,25 @@ async function skAct(id, btn){
   const r=((_sk&&_sk.rows)||[]).find(x=>x.id===id); if(!r) return;
   const [fid, src]=skSplit(id);
   const pic = src==='picture';
+  // A LANGUAGE ROW DELETES A FILE, so the question says so, names the file,
+  // and gives the size. refetch deletes first on purpose - the arr scores
+  // candidates against whatever is still on disk - so there is no undo.
+  if(String(src).startsWith('language')){
+    const gb=Math.round((r.size||0)/1073741824*100)/100;
+    askInline(btn,
+      `Blocklist this release and ask for another? ${r.label||''} — the file `
+      +`is deleted first (${gb} GB), because the arr scores replacements `
+      +`against whatever is still on disk. This cannot be undone.`,
+      'Yes, replace it',
+      async ()=>{
+        const x=await (await fetch(`/api/subkind/act?confirm=yes&file_id=${fid}&source=${
+          encodeURIComponent(src)}`,{method:'POST'})).json();
+        if(x.ok) skGone(btn, 'asked for another', true, id);
+        else setTimeout(()=>{ _skKey=''; loadSubKind(true); }, 1500);
+        return x.ok ? {ok:true, why:'replaced'} : x;
+      });
+    return;
+  }
   // NOTHING IS WRITTEN, so nothing is asked. It is a row leaving a list.
   if(r.action==='leave'){
     if(btn) btn.disabled=true;
@@ -37641,37 +37692,12 @@ function skNeedHtml(){
         inside, or the picture reader found marks it could not read. nuarr has
         no opinion about those, they are not listed below, and no button here
         will touch them.</div>`:''}
-      ${miss?`<div class="scrollbox" style="max-height:260px;overflow:auto;margin-top:6px">
-        <table style="width:100%;font-size:11.5px;border-collapse:collapse;
-          table-layout:fixed"><colgroup><col style="width:34%">
-          <col style="width:7%"><col style="width:31%"><col style="width:12%">
-          <col style="width:16%"></colgroup>
-        <thead><tr class="dim" style="font-size:10px;letter-spacing:.05em;
-          text-transform:uppercase"><th style="text-align:left">file</th>
-          <th style="text-align:left">wants</th>
-          <th style="text-align:left">what it has</th>
-          <th style="text-align:left">disk</th><th></th></tr></thead>
-        <tbody>${rows.map(r=>`<tr>
-          <td style="padding:3px 8px 3px 0;overflow:hidden;text-overflow:ellipsis;
-            white-space:nowrap" title="${esc(r.path||'')}">${esc(r.title||'')}${
-            r.season?` <span class="dim">S${String(r.season).padStart(2,'0')}${
-              r.episode?'E'+String(r.episode).padStart(2,'0'):''}</span>`:''}</td>
-          <td style="padding:3px 8px 3px 0"><span class="pill"
-            style="color:#e8a33d;border-color:#4a3a12">${esc(r.lang||'')}</span></td>
-          <td class="dim" style="padding:3px 10px 3px 0;overflow:hidden;
-            text-overflow:ellipsis;white-space:nowrap"
-            title="${esc(r.why||'')}">${esc(r.why||'')}</td>
-          <td class="dim mono" style="padding:3px 8px 3px 0;font-size:10.5px;
-            overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
-            >${esc(r.pool_disk||'')}</td>
-          <td style="padding:3px 0"><button class="rmb" style="font-size:10px;
-              white-space:nowrap;width:100%"
-              title="Blocklist this release so the arr never grabs it again, delete the file, and search for a replacement. ${esc(String(Math.round((r.size||0)/1073741824*100)/100))} GB is deleted. Not reversible."
-              onclick="subNeedReplace(this, ${r.file_id})"
-              >blocklist &amp; re-download</button></td>
-        </tr>`).join('')}</tbody></table></div>`
-       :`<div style="font-size:11.5px;margin-top:5px;color:var(--ok)">Every file
-          that has been looked inside carries what its library requires.</div>`}`});
+      ${miss
+        ? `<div class="dim" style="font-size:11px;margin-top:5px">The ${fmt(miss)}
+            are rows in the list above, marked <b style="color:#e8a33d">whole
+            file</b>, each with its own button.</div>`
+        : `<div style="font-size:11.5px;margin-top:5px;color:var(--ok)">Every file
+            that has been looked inside carries what its library requires.</div>`}`});
 }
 
 function skPaint(force){
@@ -37889,6 +37915,7 @@ function skPaint(force){
         const [word,col]=SKW[r.kind]||[r.kind||'','var(--dim)'];
         const on=_skSel.has(r.id), can=!r.done&&!r.unread;
         const pic=r.source==='picture', open=_skOpen.has(r.id);
+        const lang=String(r.source||'').startsWith('language');
         return `<tr${on?' style="background:rgba(88,166,255,.06)"':''}>
         <td class="l">${can?`<input type="checkbox" ${on?'checked':''}
              onclick="skToggle('${r.id}', event)">`:''}</td>
@@ -37902,10 +37929,15 @@ function skPaint(force){
           ? esc(new Date(r.added*1000).toLocaleString())
           : 'nuarr has no record of when this file arrived'}">${
           r.added?ago(r.added):'—'}</td>
-        <td class="c" style="font-size:10.5px;color:${pic?'#6fb0ff':'var(--dim)'}"
-          title="${pic?'Words burned into the picture of a file that reports no subtitle track':esc(`A text track inside the file - the ${(r.track||0)+1}th subtitle stream, which ffmpeg calls s:${r.track}`)}">${
-          pic?'picture':'track '+((r.track||0)+1)}</td>
-        <td class="c">${r.unread
+        <td class="c" style="font-size:10.5px;color:${lang?'#e8a33d':(pic?'#6fb0ff':'var(--dim)')}"
+          title="${lang?'The whole file: no subtitle track, no file beside it, nothing burned into the picture, and the audio is not in this language either'
+                 :(pic?'Words burned into the picture of a file that reports no subtitle track':esc(`A text track inside the file - the ${(r.track||0)+1}th subtitle stream, which ffmpeg calls s:${r.track}`))}">${
+          lang?'whole file':(pic?'picture':'track '+((r.track||0)+1))}</td>
+        <td class="c">${lang
+          ? `<span class="pill" style="color:#e8a33d;border-color:#4a3a12"
+               title="${esc(r.evidence||'')}">no ${esc(r.lang||'')}</span>
+             <div class="dim" style="font-size:9.5px">${esc(r.library||'')} requires it</div>`
+          : r.unread
           ? '<span class="dim" style="font-size:10.5px">not read yet</span>'
           : `<select class="kindsel" onchange="skSetKind('${r.id}',this.value,this)"
                title="${esc((r.why||('read as '+word))+'. If that is wrong, set it here - the choice is kept and the next pass will not overwrite it.')}"
@@ -37916,7 +37948,11 @@ function skPaint(force){
                        :`<div style="font-size:9.5px;color:${col}">read as ${esc(word)}</div>`}`}</td>
         <td class="c mono" style="font-variant-numeric:tabular-nums;color:${skColor(r)}"
             title="${esc((r.why||'')+' — '+(r.auto_why||''))}">${r.unread?'':(r.sure+'%')}</td>
-        <td class="l mono">${pic?'<span class="dim">—</span>'
+        <td class="l mono">${lang
+          ?`<span class="dim" style="font-size:10.5px;font-family:inherit"
+              title="${esc(r.evidence||'')}">${esc(r.evidence||'')}</span>${
+              r.disk?` <span style="font-size:10px;color:${diskColor(r.disk)}">${esc(r.disk)}</span>`:''}`
+          :pic?'<span class="dim">—</span>'
           :`<span style="color:var(--warn)" title="${esc(r.title_old||'')}">${esc(r.title_old||'')}</span>${
              r.action==='retitle'?`<div style="font-size:10px;color:var(--ok);overflow:hidden;text-overflow:ellipsis" title="${
                esc((r.title_new||'')+(r.unsafe?' — this replaces a title nuarr did not write, because you set the kind by hand':''))}">→ ${
@@ -37926,7 +37962,10 @@ function skPaint(force){
                                       ? `<div class="dim" style="font-size:10px" title="You said this track carries ${
                                           esc(SKW[r.kind]?SKW[r.kind][0]:r.kind)}, and its title already says so - there is nothing to correct.">title already agrees</div>`
                                       : '<div class="dim" style="font-size:10px" title="The title carries a name nuarr did not write and cannot regenerate, so it is reported and left as it is. Set what it carries by hand and the correction is offered anyway - your call outranks the caution.">left alone</div>'))}`}</td>
-        <td class="r askhost">${r.done
+        <td class="r askhost">${lang
+          ? `<button class="rmb" onclick="skAct('${r.id}',this)"
+               title="Blocklist this release so the arr never grabs it again, delete the file, and search for a replacement. ${esc(String(Math.round((r.size||0)/1073741824*100)/100))} GB is deleted. Not reversible.">${esc(r.action_word)}</button>`
+          : r.done
           ? '<span class="dim" title="This file already carries the blank marker track.">marked</span>'
           : r.unread ? '<span class="dim" style="font-size:10.5px" title="The cue rate flagged this; its events have not been read yet. Nothing is offered until they have.">not read yet</span>'
           : `${r.action?`<button class="rmb" onclick="skAct('${r.id}',this)" title="${
@@ -37965,8 +38004,8 @@ function skPaint(force){
   // number-on-the-right as Reading, Being processed and the file list - this
   // was the last panel here still wearing its own.
   const html=`<div class="subsp" id="subsPanelInput">${
-    head}${skAskHtml()}${note}${key}${band}${prog}${hist}${table}${foot}${
-    skMarkerHtml()}${skNeedHtml()}</div>`;
+    head}${skAskHtml()}${note}${key}${band}${prog}${hist}${
+    skMarkerHtml()}${skNeedHtml()}${table}${foot}</div>`;
   scPaint('subs');
   if(!force && (askOpen('skPanel') || panelBusy('skPanel') || panelScrolled('skPanel'))) return;
   if(html===_skKey) return;
