@@ -40349,6 +40349,26 @@ function audPaint(){
 // live and none of that is worth losing.
 let _subs=null, _subsPoll=null, _subsKey='', _subsTopKey='';
 let _subsSort='what', _subsDesc=false;
+// SHOW ONLY THE ONES NOTHING WILL HAPPEN TO. The header counts them; this is
+// that number made into the filter it was already describing.
+let _subsOnlyWaiting=false;
+function subsOnlyWaiting(on){
+  _subsOnlyWaiting=!!on; _subsKey=''; subsPaint();
+}
+// TAKE ME TO THE SWITCH. "waiting on a switch above" is true and useless on
+// its own - the board has five rows and the row does not say which. This
+// scrolls the right one to the middle and flashes it, so the thing to press
+// is the thing that just moved.
+function subsToSwitch(key){
+  const el=document.getElementById('subsRow-'+key);
+  if(!el) return;
+  el.scrollIntoView({behavior:'smooth', block:'center'});
+  const shadow=el.style.boxShadow, bg=el.style.background;
+  el.style.transition='box-shadow .25s, background .25s';
+  el.style.boxShadow='0 0 0 2px var(--warn)';
+  el.style.background='rgba(232,163,61,.10)';
+  setTimeout(()=>{ el.style.boxShadow=shadow; el.style.background=bg; }, 2200);
+}
 // One colour per kind of subtitle trouble, used by the chip in the list and
 // by the dot on the switchboard, so the eye can join a row to its system.
 const SUBS_C={sidecar:'#6fb0ff', dupe:'#c98cf0', picture:'#e8a33d', language:'#e8a33d',
@@ -40512,7 +40532,8 @@ function subsBoardHtml(){
       // From /api/subs, not from _idle: the strip has to be there whether or
       // not the panel that used to fetch it has ever been opened.
       const idl=((_subs.idle||{})[SUBS_IDLE[b.key]||''])||{};
-      return `<div class="lkind" style="padding:9px 11px;border-left:3px solid ${c}">
+      return `<div class="lkind" id="subsRow-${b.key}"
+        style="padding:9px 11px;border-left:3px solid ${c}">
         <div style="display:flex;gap:9px;align-items:baseline;flex-wrap:wrap">
           <span style="flex:none;color:${b.on?'var(--ok)':'var(--warn)'}"
             title="${b.on?'nuarr acts on this by itself':'nothing happens until this is switched on'}">${b.on?'●':'○'}</span>
@@ -40582,7 +40603,9 @@ function subsWorkHtml(){
 }
 
 function subsRowsSorted(){
-  const R=(_subs.rows||[]).slice();
+  // !ready is what the header counts as "waiting on a switch above", so the
+  // filter and the number it hangs off cannot drift apart.
+  const R=(_subs.rows||[]).filter(e=>!_subsOnlyWaiting || !e.ready).slice();
   if(_subsSort==='what') return _subsDesc ? R.reverse() : R;
   const key = {file:e=>String(e.name||'').toLowerCase(),
                disk:e=>String(e.disk||''),
@@ -40612,11 +40635,28 @@ function subsListHtml(){
   // From the server, counted over every file - not over the four hundred
   // this table happens to be showing.
   const ready=(_subs.ready!==undefined)?_subs.ready:R.filter(e=>e.ready).length;
+  // WHAT KIND OF WAITING, read off the rows instead of assumed. "waiting on a
+  // switch above" sent people to the board looking for a switch that is not
+  // there: every one of these was an `ask`, which is a question already put to
+  // them, not a setting they had left off.
+  const _wait=(_subs.rows||[]).filter(e=>!e.ready);
+  const _offOf=e=>(e.acts||[]).filter(a=>!a.on);
+  const _allAsk=_wait.length && _wait.every(e=>_offOf(e).every(a=>a.key==='ask'));
+  const _someAsk=_wait.some(e=>_offOf(e).some(a=>a.key==='ask'));
+  const _waitWord=_allAsk ? 'waiting on your answer'
+                 : _someAsk ? 'waiting on you'
+                 : 'waiting on a switch above';
   return subsPanel({
     id:'subsPanelList', accent:'#6fb0ff',
     title:'What the rules above would change, file by file', kind:'auto',
     sub:`${num(ready,'auto')} nuarr will get to on its own${
-        (total-ready)?` · ${num(total-ready,'you')} waiting on a switch above`
+        (total-ready)?` · <a href="#" style="text-decoration:none"
+            onclick="subsOnlyWaiting(${_subsOnlyWaiting?0:1});return false"
+            title="${_subsOnlyWaiting
+              ? 'Show every file again.'
+              : 'Show only the files nothing will happen to yet. Each one says what it is waiting on and links straight to it.'}"
+            >${num(total-ready,'you')} ${_waitWord}${
+            _subsOnlyWaiting?' <b style="color:var(--warn)">— showing only these</b>':''}</a>`
                      :''}${
         _subs.drift?` · <span title="Rules apply when a file is built. These finished before a rule changed, so they still follow the old one — Requeue sends one back through the normal queue to be rebuilt.">${
           num(_subs.drift,'you')} built under older rules</span>`:''}`,
@@ -40648,10 +40688,33 @@ function subsListHtml(){
         <td style="text-align:center" class="dim">${esc(e.library||'')}</td>
         <td style="text-align:left">${(e.acts||[]).map(a=>{
             const c=SUBS_C[a.key]||'#6fb0ff';
+            // WHICH switch, by name, and a way to reach it. A dimmed row and
+            // a tooltip were the whole of this before, and neither is
+            // something you can see without already knowing to look.
+            const sw=(_subs.board||[]).find(x=>x.key===a.key)||{};
+            const swName=sw.name||SUBS_W[a.key]||a.key;
+            // WHERE THIS ONE IS ACTUALLY STUCK. An `ask` is not waiting on a
+            // switch: it is a question nuarr has already asked, held until
+            // somebody answers, and the board has no `ask` row to send you
+            // to. Pointing at one would be a link that silently does nothing
+            // - the same fault as the tooltip this replaced.
+            const stuck = (a.key==='ask' || !sw.key)
+              ? {word:'waiting on your answer', go:"subsDetail('picture')",
+                 tip:'nuarr has asked about this file and is holding it until '
+                    +'you answer. This opens Subtitle User Input, where the '
+                    +'question and its buttons are.'}
+              : {word:'waiting on '+swName, go:"subsToSwitch('"+a.key+"')",
+                 tip:'Nothing happens to this file until '+swName+' is '
+                    +'switched on. This takes you to that switch and '
+                    +'flashes it.'};
             return `<div style="font-size:11px;margin-bottom:2px">
               <span class="capsc" style="border-color:${c};color:${c}"
                 title="${esc(SUBS_W[a.key]||'')}${a.on?'':' — waiting on a switch'}">${
                 esc(a.word||'')}</span>${
+              a.on?'':` <a href="#" class="capsc"
+                style="border-color:var(--warn);color:var(--warn);text-decoration:none"
+                onclick="${stuck.go};return false"
+                title="${esc(stuck.tip)}">\u25cb ${esc(stuck.word)}</a>`}${
               (a.key==='drift')
                 ? (a.queued
                    ? `<span class="dim" style="font-size:10px;margin-left:5px">already ${esc(a.queued)}</span>`
