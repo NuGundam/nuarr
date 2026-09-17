@@ -275,14 +275,18 @@ def check_subs(path: str) -> dict:
             mine = [x for x in (stt.cached().get("rows") or [])
                     if int(x.get("file_id") or 0) == int(r["id"])]
             todo = [x for x in mine if x.get("unread") and x.get("mkv_id")]
+            # `track` ALREADY COUNTS FROM ONE - see subtitletitle's
+            # _rows_from_probe, which increments before storing so the number
+            # also addresses mkvpropedit's s1/s2. Adding one announced
+            # "reading subtitle track 2" while reading the first.
             d["steps"] = (["looking at what the titles claim"]
                           + [f"reading subtitle track "
-                             f"{int(x.get('track') or 0) + 1}" for x in todo]
+                             f"{int(x.get('track') or 0)}" for x in todo]
                           + ["working out what each track carries"])
             d["total"] = len(d["steps"])
             for i, x in enumerate(todo, 1):
                 _step(d, i + 1, f"reading subtitle track "
-                                f"{int(x.get('track') or 0) + 1} - "
+                                f"{int(x.get('track') or 0)} - "
                                 f"{i} of {len(todo)}")
                 try:
                     stt.shape_of(x["file_id"], x["path"], x["track"],

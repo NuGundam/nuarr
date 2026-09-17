@@ -250,7 +250,18 @@ def _tracks_of(file_id: int, cur, size: int | None = None) -> list:
         for s in cur.execute(
                 "SELECT track, events, chosen, size FROM subtitle_shape "
                 " WHERE file_id=?", (int(file_id),)):
-            i = int(s["track"])
+            # ONE-BASED IN THE TABLE, zero-based in this list.
+            #
+            # subtitletitle._rows_from_probe increments before it stores -
+            # "# mkvpropedit numbers subtitle tracks from 1" - because the
+            # same number addresses mkvpropedit's s1/s2. Read as an index
+            # into `out` it pointed one track too far: measured, 538 of the
+            # rows with a live probe match the 1-based reading and none match
+            # the 0-based one, and the table holds no track=0 at all. So
+            # every count was landing on the NEXT track, and the last track's
+            # count fell past the end and was dropped - which is why a row
+            # saying track=2 on a two-subtitle file looked like nonsense.
+            i = int(s["track"]) - 1
             if not (0 <= i < len(out)):
                 continue
             fresh = (size is None

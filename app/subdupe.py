@@ -329,12 +329,53 @@ def _events(path: str, track_id: int, on_pid=None, on_pct=None,
             pass
 
 
+def _remember(file_id: int, size: int, ordinal: int, events: int) -> None:
+    r"""Keep a count somebody paid for, so nobody pays for it twice.
+
+    Counting a track means mkvextract walking the whole container - over two
+    minutes on a 5 GB file here, longer than the remux it precedes. The number
+    was used to pick a survivor and then dropped, so the next system to want
+    it opened the file again.
+
+    subtitle_shape is where counts already live: subscan._tracks_of reads it
+    into sub_facts.tracks[].events, which every other reader consults. So this
+    writes there rather than inventing a second store.
+
+    ONE-BASED, like everything else in that column - subtitletitle increments
+    before storing so the same number addresses mkvpropedit's s1/s2. Getting
+    this wrong would land every count on the neighbouring track.
+
+    SIZE IS THE FILES-TABLE SIZE, because that is what _tracks_of compares
+    against when deciding whether a stored count still describes the file. A
+    count is then invalidated by exactly the thing that should invalidate it:
+    nuarr's own remux changing the row.
+    """
+    if events is None or int(events) < 0:
+        return                      # unreadable is not a measurement
+    try:
+        from . import subtitletitle as _stt
+        _stt._inspect_init()
+        with cursor() as cur:
+            cur.execute(
+                "INSERT INTO subtitle_shape(file_id,track,size,at,events) "
+                "VALUES(?,?,?,?,?) "
+                "ON CONFLICT(file_id,track) DO UPDATE SET "
+                "  size=excluded.size, at=excluded.at, events=excluded.events",
+                (int(file_id), int(ordinal) + 1, int(size or 0), time.time(),
+                 int(events)))
+    except Exception:                                            # noqa: BLE001
+        # A count that cannot be filed is still a count that was used; the
+        # plan it fed is unaffected.
+        pass
+
+
 def plan_one(file_id: int) -> dict:
     """Which tracks would go, and which would stay. Reads only."""
     with cursor() as cur:
-        r = cur.execute("SELECT path FROM files WHERE id=?",
+        r = cur.execute("SELECT path, size FROM files WHERE id=?",
                         (int(file_id),)).fetchone()
     path = (r["path"] if r else "") or ""
+    fsize = int((r["size"] if r else 0) or 0)
     if not path or not os.path.exists(path):
         return {"ok": False, "why": "the file is not on disk"}
     live = _live_sub_tracks(path)
@@ -360,6 +401,7 @@ def plan_one(file_id: int) -> dict:
         if t["id"] in dup_ids or t["class"] == "marker":
             continue
         n = _events(path, t["id"], picture=(t.get("fmt") == "picture"))
+        _remember(int(file_id), fsize, int(t.get("ord") or 0), n)
         if n == 0:
             drop.append({**t, "events": 0,
                          "lang_kind": f"{t['lang']} {t['class']}",
@@ -380,6 +422,12 @@ def plan_one(file_id: int) -> dict:
         counts = [(_events(path, t["id"],
                            picture=(t.get("fmt") == "picture")), t)
                   for t in tracks]
+        # Every one of these cost a walk of the container. File them all, not
+        # just the survivor's - the losers are about to be deleted, but until
+        # the remux actually happens they are still tracks somebody may ask
+        # about, and a re-plan would otherwise count them again.
+        for _n, _t in counts:
+            _remember(int(file_id), fsize, int(_t.get("ord") or 0), _n)
         # Most lines wins; a tie or an unreadable count keeps the first.
         counts.sort(key=lambda ct: (-(ct[0] if ct[0] >= 0 else -1),
                                     ct[1]["ord"]))
