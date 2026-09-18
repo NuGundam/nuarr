@@ -461,6 +461,13 @@ class Settings:
     # actually saturates at.
     subocr_gpu_lanes: int = 2
     subocr_engine: str = "tesseract"
+    # WHICH SILICON PaddleOCR RUNS ON. auto = the card when the build can see
+    # one, which is what nuarr did on its own before this was askable. gpu and
+    # cpu are a deliberate choice: a CPU shared with other services is a
+    # reason to want the card even where the card is slower, and vice versa.
+    # Resolved through subocr.device(), which will not hand "gpu" to a build
+    # that has no CUDA. Tesseract is CPU-only and ignores this.
+    subocr_device: str = "auto"
     subocr_sdh: bool = True              # convert SDH image subs too
     subocr_all: bool = False             # override: OCR every kept PGS track
     subocr_signs_unburned: bool = True   # convert signs when nothing burns them

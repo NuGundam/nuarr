@@ -7141,6 +7141,84 @@ async def api_ocr_engine(engine: str = Query(...)):
             "requeued": requeued}
 
 
+@app.post("/api/ocr/device")
+async def api_ocr_device(device: str = Query(...)):
+    r"""Choose the silicon PaddleOCR runs on, for the whole install.
+
+    Erik: "I'd rather use my GPU as it's there not doing much and my CPU is
+    shared with other systems like HA and docker". That is a scheduling
+    decision about this machine, and nuarr was taking it silently - "the card
+    if the build can see one", written twice.
+
+    THE SAME HANDLING AS THE ENGINE SWITCH, because it is the same kind of
+    change: anything queued or running was planned against the old device, so
+    it is stopped and put straight back rather than quietly finishing on the
+    silicon you just moved away from. The picture reader's serving worker is
+    closed too - it holds one model loaded onto one device, so a new one has
+    to start or the change would not take effect until the idle timer.
+
+    NOT A CLAIM THAT IT WILL BE FASTER. The engine comparison on this page is
+    measured on this machine and is the place to check that; this switch is
+    about WHERE the work happens, which is a different question from how long
+    it takes.
+    """
+    import yaml
+    if device not in ("auto", "gpu", "cpu"):
+        return {"ok": False, "error": "unknown device"}
+    from . import subocr as _so, hardsub as _hs
+    if device == "gpu":
+        info = await asyncio.to_thread(_so.paddle_info)
+        if not info.get("cuda"):
+            return {"ok": False,
+                    "error": "the installed PaddleOCR has no CUDA support, so "
+                             "it cannot use the card - install the GPU build "
+                             "below first"}
+    p = _config_path()
+    raw = {}
+    if p.exists():
+        try:
+            raw = yaml.safe_load(p.read_text(encoding="utf-8-sig")) or {}
+        except Exception:                                # noqa: BLE001
+            raw = {}
+    raw["subocr_device"] = device
+    p.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True),
+                 encoding="utf-8")
+    SETTINGS.subocr_device = device
+    # The picture reader's worker is one model on one device. Let it go.
+    try:
+        await asyncio.to_thread(_hs.ocr_close)
+    except Exception:                                    # noqa: BLE001
+        pass
+
+    rows = _rows("SELECT j.job_id, j.file_id, j.path, j.state, "
+                 "       f.title, f.season, f.episode "
+                 "  FROM jobs j LEFT JOIN files f ON f.id = j.file_id "
+                 " WHERE j.kind='sub_ocr' AND j.state IN ('queued','running')")
+    cancelled = requeued = 0
+    for r in rows:
+        try:
+            if await jobs.cancel(r["job_id"]):
+                cancelled += 1
+        except Exception:                                # noqa: BLE001
+            continue
+    for r in rows:
+        label = display_label(r["title"], r["season"], r["episode"])
+        try:
+            if await jobs.enqueue(r["file_id"], r["path"], label,
+                                  kind="sub_ocr", priority=90):
+                requeued += 1
+        except Exception:                                # noqa: BLE001
+            continue
+    if cancelled or requeued:
+        await jobs.start()
+    now = await asyncio.to_thread(_so.device)
+    joblog.log(f"OCR device set to {device} (running on {now})"
+               + (f" - {cancelled} job(s) stopped and {requeued} requeued"
+                  if cancelled else ""), "ok")
+    return {"ok": True, "device": device, "device_now": now,
+            "cancelled": cancelled, "requeued": requeued}
+
+
 @app.post("/api/ocr/test")
 async def api_ocr_test(engine: str = Query("tesseract"),
                        device: str = Query("cpu")):
@@ -33042,10 +33120,10 @@ async function loadOcr(){
         !!s.tesseract_version)}
       ${pick('paddle','PaddleOCR',
         padReady
-          ? `Reads italics correctly and keeps each subtitle's position on screen.
-             ${p.cuda?'Using the GPU.':'<span style="color:#e2b341">CPU build — much slower than Tesseract.</span>'}`
+          ? `Reads italics correctly and keeps each subtitle's position on screen.`
           : 'Not installed yet — install it below to choose it.',
         padReady)}
+      ${padReady?ocrDeviceHtml(s,p):''}
       <div id="ocrEngMsg" class="dim" style="font-size:11.5px;margin-top:4px"></div>
     </div>`;
 
@@ -34583,6 +34661,65 @@ function ocrCompareHtml(s,p){
 // as numbers from the machine Nuarr was written on - the kind of claim that
 // goes stale and cannot be checked.
 let _ocrMeas={};
+
+// WHICH SILICON, AND WHAT IT MEASURED HERE.
+//
+// Erik asked for this because his CPU is shared with Home Assistant and
+// docker while the card sits idle - a reason about his machine that nuarr
+// cannot work out for itself, which is exactly the kind of thing that should
+// be a setting rather than a rule.
+//
+// The numbers beside each option come from the same measurements the
+// comparison table below uses. They are here because this machine has
+// already measured both and a switch that hides a number already on the page
+// is a switch somebody regrets quietly. No argument and no confirm box: the
+// figure, next to the button, in the unit the table uses.
+function ocrDeviceHtml(s, p){
+  const want=s.device||'auto', now=s.device_now||'cpu';
+  const per=k=>{
+    const m=_ocrMeas['paddle:'+k];
+    if(!m||!m.per_cue_ms) return '';
+    return `<span class="dim" style="font-size:10px"> · measured ${
+      (m.per_cue_ms/1000).toFixed(1)}s a cue${m.at?' '+ago(m.at):''}</span>`;
+  };
+  const opt=(k,label,note,ok)=>`<label style="display:inline-flex;gap:5px;
+      align-items:center;cursor:${ok?'pointer':'default'};opacity:${ok?1:.45};
+      font-size:11.5px;margin-right:14px" title="${esc(note)}">
+      <input type="radio" name="ocrDev" value="${k}" ${want===k?'checked':''}
+        ${ok?'':'disabled'} onchange="ocrSetDevice('${k}')" style="margin:0">
+      ${label}${k==='auto'?'':per(k)}</label>`;
+  return `<div style="margin:2px 0 0 26px;padding:6px 0 2px;
+       border-top:1px solid var(--line)">
+    <div class="dim" style="font-size:10px;letter-spacing:.04em;
+         text-transform:uppercase;margin-bottom:3px">which silicon it runs on</div>
+    ${opt('auto','Auto',
+      'Use the card when the installed build can see one. This is what nuarr did on its own before the choice existed.',true)}
+    ${opt('gpu','GPU',
+      p.cuda ? 'Always the card, leaving the CPU for everything else on this machine.'
+             : 'The installed PaddleOCR has no CUDA support, so it cannot use the card.',
+      !!p.cuda)}
+    ${opt('cpu','CPU','Always the processor, leaving the card for Whisper and the encoders.',true)}
+    ${(want==='auto')?`<div class="dim" style="font-size:10.5px;margin-top:3px">running on <b>${
+      now.toUpperCase()}</b></div>`
+     :(want!==now)?`<div style="font-size:10.5px;margin-top:3px;color:#e2b341">asked for ${
+      want.toUpperCase()}, running on <b>${now.toUpperCase()}</b> — the installed build cannot use the card</div>`:''}
+    <div id="ocrDevMsg" class="dim" style="font-size:11px;margin-top:3px"></div>
+  </div>`;
+}
+async function ocrSetDevice(dev){
+  const m=document.getElementById('ocrDevMsg');
+  if(m){ m.style.color=''; m.textContent='switching…'; }
+  try{
+    const r=await (await fetch('/api/ocr/device?device='+dev,{method:'POST'})).json();
+    if(!r.ok){ if(m){ m.style.color='#e0575b'; m.textContent=r.error||'failed'; }
+               loadOcr(); return; }
+    if(m){ m.style.color='#7fd4a3';
+      m.textContent = (r.cancelled
+        ? `now reading on ${String(r.device_now||dev).toUpperCase()} — ${r.cancelled} job(s) stopped and ${r.requeued} requeued`
+        : `now reading on ${String(r.device_now||dev).toUpperCase()}`); }
+    loadOcr();
+  }catch(e){ if(m){ m.style.color='#e0575b'; m.textContent='failed'; } }
+}
 
 async function ocrSetEngine(engine){
   const m=document.getElementById('ocrEngMsg');

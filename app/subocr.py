@@ -2127,6 +2127,12 @@ def status() -> dict:
         "install": dict(_INSTALL),
         # The install-wide engine, for the OCR engines page.
         "engine": engine(),
+        # AND WHICH SILICON, both halves of it: what was asked for and what
+        # that resolves to here. They differ when `gpu` is chosen on a build
+        # with no CUDA, and the page says so rather than showing a setting
+        # that is quietly not being honoured.
+        "device": device_wanted(),
+        "device_now": device(),
         "every_h": int(_s("subocr_every_h", 6)),
         "batch": int(_s("subocr_batch", 20)),
         # Per library: the effective settings, plus what that library
@@ -2518,6 +2524,35 @@ def engine(library: str | None = None) -> str:
     return e if e in ("tesseract", "paddle") else "tesseract"
 
 
+def device() -> str:
+    r"""Which silicon PaddleOCR should use here - "gpu" or "cpu".
+
+    THE SETTING SAYS WHAT YOU WANT; THIS SAYS WHAT IS POSSIBLE. `auto` is
+    what nuarr did on its own before the choice existed: take the card when
+    the installed build can see one. An explicit `gpu` is honoured only when
+    the build is CUDA-capable, because handing "gpu" to a CPU-only paddle
+    does not fail politely - it either ignores it or dies on import, and a
+    setting that cannot be honoured is worse than one that is overruled
+    out loud. want() below is what the page shows beside it.
+    """
+    want = str(getattr(SETTINGS, "subocr_device", "auto") or "auto").lower()
+    if want not in ("auto", "gpu", "cpu"):
+        want = "auto"
+    if want == "cpu":
+        return "cpu"
+    try:
+        cuda = bool(paddle_info().get("cuda"))
+    except Exception:                                            # noqa: BLE001
+        cuda = False
+    return "gpu" if cuda else "cpu"
+
+
+def device_wanted() -> str:
+    """What the setting asks for, before the card is taken into account."""
+    want = str(getattr(SETTINGS, "subocr_device", "auto") or "auto").lower()
+    return want if want in ("auto", "gpu", "cpu") else "auto"
+
+
 def ocr_paddle(sup: str, tick=None, base: float = 0.0, span: float = 1.0,
                who: str = "", ass: bool = False, device: str = "") -> str:
     r"""Read a .sup with PaddleOCR, in its own process.
@@ -2526,7 +2561,10 @@ def ocr_paddle(sup: str, tick=None, base: float = 0.0, span: float = 1.0,
     which is the mode that keeps each cue's position on screen.
     """
     import sys as _sys
-    dev = device or ("gpu" if paddle_info().get("cuda") else "cpu")
+    # The caller may name one (the engine test does); otherwise the install's
+    # setting decides. This used to auto-detect here, in the second of two
+    # identical copies of that rule.
+    dev = device or globals()["device"]()
     out = os.path.splitext(sup)[0] + (".ass" if ass else ".srt")
     args = [_sys.executable,
             os.path.join(os.path.dirname(os.path.abspath(__file__)),

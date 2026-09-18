@@ -342,7 +342,7 @@ _WORD = re.compile(r"[A-Za-z]{3,}")
 # frames are not known in advance and cannot be batched. Spawning per frame
 # would pay the load twenty-five times over the work. One process, opened on
 # the first frame of a pass and closed when the reader goes quiet.
-_OCR = {"proc": None, "engine": "", "at": 0.0}
+_OCR = {"proc": None, "engine": "", "device": "", "at": 0.0}
 _OCR_LOCK = threading.Lock()
 # Closed after this long unused, so the GPU goes back to Whisper and the
 # encoders between passes. The same bargain audiolang.unload makes.
@@ -360,7 +360,7 @@ def ocr_engine() -> str:
 
 def _ocr_close() -> None:
     p = _OCR.get("proc")
-    _OCR.update(proc=None, engine="", at=0.0)
+    _OCR.update(proc=None, engine="", device="", at=0.0)
     if not p:
         return
     try:
@@ -387,15 +387,28 @@ def ocr_close() -> None:
 def _ocr_proc(engine: str):
     """The serving worker for this engine, started if it is not up."""
     import sys as _sys
+    # A RUNNING WORKER IS ENGINE **AND** DEVICE. It holds one model loaded
+    # onto one piece of silicon; switching the setting has to start a new one
+    # or the change is invisible until the idle timer happens to close it.
+    try:
+        from . import subocr as _so
+        want_dev = _so.device() if engine == "paddle" else "cpu"
+    except Exception:                                            # noqa: BLE001
+        want_dev = "cpu"
     p = _OCR.get("proc")
-    if p is not None and p.poll() is None and _OCR.get("engine") == engine:
+    if (p is not None and p.poll() is None
+            and _OCR.get("engine") == engine
+            and _OCR.get("device") == want_dev):
         return p
     _ocr_close()
+    # WHICH SILICON, ASKED ONCE. This was the first of two copies of
+    # "gpu if cuda else cpu"; both are subocr.device() now, which puts the
+    # install's setting in front of the detection.
     dev = "cpu"
     if engine == "paddle":
         try:
             from . import subocr
-            dev = "gpu" if subocr.paddle_info().get("cuda") else "cpu"
+            dev = subocr.device()
         except Exception:                                        # noqa: BLE001
             dev = "cpu"
     env = dict(os.environ)
@@ -423,7 +436,7 @@ def _ocr_proc(engine: str):
                    f"falling back to Tesseract", "warn", system="hardsub")
         _OCR.update(proc=None, engine="", at=0.0)
         return None
-    _OCR.update(proc=p, engine=engine, at=time.time())
+    _OCR.update(proc=p, engine=engine, device=dev, at=time.time())
     return p
 
 
