@@ -317,6 +317,49 @@ def _bright(path: str, t: float, band: str) -> int:
     return sum(1 for v in b[:W * H] if v > BRIGHT)
 
 
+def _bands(path: str, t: float) -> tuple:
+    r"""Both bands of ONE frame, from ONE decode. (low, high), -1 on failure.
+
+    THE FRAME GRAB IS THIS READER'S WHOLE COST, and it was being paid twice.
+    _bright above takes a single band, so the sampler called it once for the
+    caption band and once for the band above it - two ffmpeg processes, each
+    seeking to the same timestamp and decoding the same picture, for two crops
+    of that one picture. 24 frames, 48 decodes.
+
+    Measured before this: of the CPU one file costs, 92% was ffmpeg grabbing
+    frames and 8% was PaddleOCR reading them. Halving the decodes is most of
+    what there is to win here.
+
+    ONE OUTPUT STREAM, STACKED, on purpose: `split` feeds both crops, each is
+    scaled and greyed exactly as it was alone, and vstack puts them in one
+    rawvideo pipe - so this stays a plain subprocess.run with one stdout to
+    read. Two pipes on Windows would be a second way to fail for a saving
+    already banked by the single decode. Low band first, high band after it.
+    """
+    fc = (f"[0:v]split=2[a][b];"
+          f"[a]{LOW_BAND},scale={W}:{H},format=gray[la];"
+          f"[b]{HIGH_BAND},scale={W}:{H},format=gray[hb];"
+          f"[la][hb]vstack=inputs=2[out]")
+    cmd = [_ffmpeg(), "-hide_banner", "-v", "error", "-nostdin",
+           "-ss", f"{t:.2f}", "-i", path, "-frames:v", "1",
+           "-filter_complex", fc, "-map", "[out]",
+           "-f", "rawvideo", "-"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=90,
+                           creationflags=NO_WINDOW)
+    except Exception:                                            # noqa: BLE001
+        return (-1, -1)
+    b = r.stdout or b""
+    n = W * H
+    if len(b) < n * 2:
+        # A FAILURE HERE IS NOT A FACT ABOUT THE FILE. Fall back to the two
+        # separate reads rather than recording a blank: this module treats an
+        # unreadable frame as "nothing in the picture", which is a verdict.
+        return (_bright(path, t, LOW_BAND), _bright(path, t, HIGH_BAND))
+    return (sum(1 for v in b[:n] if v > BRIGHT),
+            sum(1 for v in b[n:n * 2] if v > BRIGHT))
+
+
 def _tesseract() -> str:
     try:
         from . import subocr
@@ -553,8 +596,11 @@ def probe_one(file_id: int, samples: int = SAMPLES,
     from concurrent.futures import ThreadPoolExecutor, as_completed
     low, high, read = [], [], 0
     with ThreadPoolExecutor(max_workers=LANES) as ex:
-        futs = {ex.submit(_bright, path, t, b): (t, b)
-                for t in marks for b in (LOW_BAND, HIGH_BAND)}
+        # ONE JOB PER FRAME, NOT ONE PER BAND. Both crops come out of a
+        # single decode - see _bands. This was 48 ffmpeg processes for 24
+        # frames, each pair seeking to the same timestamp for two crops of
+        # the same picture.
+        futs = {ex.submit(_bands, path, t): t for t in marks}
         got: dict = {}
         # AS THEY FINISH, NOT IN THE ORDER THEY WERE SUBMITTED. Twelve lanes
         # answer in whatever order the disks feel like; waiting on the first
@@ -562,15 +608,16 @@ def probe_one(file_id: int, samples: int = SAMPLES,
         # still and then jump. Same results, same cost, honest movement.
         done_n, total_n = 0, max(1, len(futs))
         for f in as_completed(futs):
-            t, b = futs[f]
+            t = futs[f]
             try:
-                got[(t, b)] = f.result()
+                lo, hi = f.result()
             except Exception:                                # noqa: BLE001
-                got[(t, b)] = -1
+                lo, hi = -1, -1
+            got[(t, LOW_BAND)] = lo
+            got[(t, HIGH_BAND)] = hi
             done_n += 1
-            if done_n % 2 == 0 or done_n == total_n:
-                _say(f"measuring frame {min(samples, (done_n + 1) // 2)} "
-                     f"of {samples}", 55.0 * done_n / total_n)
+            _say(f"measuring frame {done_n} of {samples}",
+                 55.0 * done_n / total_n)
     for t in marks:
         c = got.get((t, LOW_BAND), -1)
         if c < 0:
