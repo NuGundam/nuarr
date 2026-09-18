@@ -303,9 +303,58 @@ def _label(r) -> str:
 POS_SHARE = 0.25         # a quarter positioned is already not dialogue
 MANY_STYLES = 5
 INSPECT_PER_SCAN = 80    # bounded: each is a demux of ~40 KB, not free
-_STYLE_SIGN = re.compile(
-    r"\b(sign|signs|op|ed|oped|karaoke|kara|title|credit|credits|note|"
-    r"caption|typeset|logo|insert)\b", re.I)
+# THE WORDS THE TYPESETTER WRITES ON A STYLE THAT IS NOT DIALOGUE. Singular
+# only - the plural is handled below - and no "opening"/"ending", because the
+# test is for words that were written, not words that were nearly written.
+_SIGN_WORDS = frozenset((
+    "sign", "op", "ed", "oped", "karaoke", "kara", "title", "titlecard",
+    "credit", "note", "caption", "typeset", "logo", "insert", "song",
+    "lyric", "eyecatch", "romaji"))
+# HOW A STYLE NAME BREAKS INTO WORDS. This used to be \b, which is a boundary
+# between a word character and a non-word character - and a digit is a word
+# character, so "OP1 - English" did not contain the word "op" while the same
+# release's "1$OP" did. The test was reading punctuation rather than names.
+#
+# A style name is written by a person in a box that allows anything, so the
+# separators are punctuation, spaces, underscores, digits running into
+# letters, and CamelCase humps - including the acronym hump in "GTCredits".
+_STYLE_SPLIT = re.compile(
+    r"[^A-Za-z0-9]+"                     # - _ / # space
+    r"|(?<=[a-z])(?=[A-Z])"              # SeriesTitle
+    r"|(?<=[A-Z])(?=[A-Z][a-z])"         # GTCredits
+    r"|(?<=[A-Za-z])(?=[0-9])"           # OP1, signs1
+    r"|(?<=[0-9])(?=[A-Za-z])")          # 2Alt
+
+
+# WHICH VERSION OF THIS READER PRODUCED A STORED COUNT.
+#
+# `plain` is "lines in non-sign styles", so it is only as good as the test
+# above - and shape_of re-reads on a SIZE change, which never comes, because
+# what changed is the reader and not the file. Bumped whenever the shape of
+# the answer changes; shape_of re-reads anything behind it that has something
+# to gain.
+#
+#   1  the \b style test - "OP1 - English" counted as dialogue
+#   2  style names tokenised, so a numbered or glued theme style is a theme
+SHAPE_REV = 2
+
+
+def _style_is_sign(name: str) -> bool:
+    r"""Did whoever typeset this release call the style a sign or a theme?
+
+    Whole tokens, with an optional plural, so "Titles" and "signs1" match and
+    "Editor", "Titan" and "Dialogue1" do not. Measured across every style
+    name in the library when this replaced the \b test: 38 names and 127
+    files newly recognised, nothing that matched before stopped matching,
+    and no dialogue style caught.
+    """
+    for tok in _STYLE_SPLIT.split(name or ""):
+        if not tok:
+            continue
+        t = tok.lower()
+        if t in _SIGN_WORDS or (t.endswith("s") and t[:-1] in _SIGN_WORDS):
+            return True
+    return False
 _EVENT = re.compile(r"^Dialogue:\s*(.*)$", re.M)
 _POSITIONED = re.compile(r"\\(?:pos|move)\s*\(", re.I)
 
@@ -351,7 +400,11 @@ def _inspect_init() -> None:
         # "looked, and this file names none" (0).
         for col, decl in (("plain", "INTEGER"), ("chosen", "TEXT"),
                           ("acked", "INTEGER"),
-                          ("plain_out", "INTEGER"), ("oped_s", "REAL")):
+                          ("plain_out", "INTEGER"), ("oped_s", "REAL"),
+                          # rev: which version of this reader counted it. See
+                          # SHAPE_REV. NULL is "before there was one", which
+                          # is every row that existed when this was added.
+                          ("rev", "INTEGER")):
             try:
                 cur.execute(f"ALTER TABLE subtitle_shape ADD COLUMN {col} {decl}")
             except Exception:                                    # noqa: BLE001
@@ -469,12 +522,12 @@ def _read_events(path: str, mkv_track_id: int, oped=None) -> dict | None:
                     in_oped += 1
         if _POSITIONED.search(parts[9]):
             positioned += 1
-        elif not _STYLE_SIGN.search(st or ""):
+        elif not _style_is_sign(st):
             plain += 1
             if plain_out is not None and not theme:
                 plain_out += 1
     n = max(1, len(lines))
-    named = sorted(s for s in styles if _STYLE_SIGN.search(s or ""))
+    named = sorted(s for s in styles if _style_is_sign(s))
     top = max(styles.items(), key=lambda kv: kv[1]) if styles else ("", 0)
     share = positioned / n
     dstyles = len(styles) - len(named)
@@ -553,7 +606,29 @@ def shape_of(file_id: int, path: str, track: int, size: int,
         # eighty reads a scan, so spending them on files that cannot change
         # is spending them on nothing.
         if r and r["plain"] is not None:
-            stale = (oped and r["plain_out"] is None)
+            stale = bool(oped and r["plain_out"] is None)
+            # AND A COUNT MADE BY AN EARLIER READER IS NOT A COUNT.
+            #
+            # `plain` means "lines in non-sign styles", so it is only as good
+            # as _style_is_sign was on the day it was written - and the \b
+            # test missed every numbered theme style, which is why eight
+            # Undead Unluck episodes read as speech at 8.2 lines a minute.
+            # Nothing else would ever redo them: the re-read above is keyed
+            # on the file's size, and the file is fine. The reader changed.
+            #
+            # ONLY WHERE THERE IS SOMETHING TO GAIN. Each re-read is an
+            # mkvextract, eighty a pass. A track already counting zero plain
+            # lines cannot count fewer, and reclassifying a style can only
+            # ever remove lines from that count - so of 1,219 stored shapes
+            # this asks for 655 and leaves 560 alone. A kind set by hand
+            # outranks the reader entirely and is never re-read.
+            try:
+                behind = int(r["rev"] or 0) < SHAPE_REV
+            except Exception:                                    # noqa: BLE001
+                behind = True
+            if (behind and int(r["plain"] or 0) > 0
+                    and not (r["chosen"] or "")):
+                stale = True
             if not stale:
                 return dict(r)
     except Exception:                                            # noqa: BLE001
@@ -593,18 +668,18 @@ def shape_of(file_id: int, path: str, track: int, size: int,
         with cursor() as cur:
             cur.execute(
                 "INSERT INTO subtitle_shape(file_id,track,size,at,events,"
-                "  styles,pos_pct,signish,detail,plain,plain_out,oped_s) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?) "
+                "  styles,pos_pct,signish,detail,plain,plain_out,oped_s,rev) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(file_id,track) DO UPDATE SET size=excluded.size, "
                 "  at=excluded.at, events=excluded.events, "
                 "  styles=excluded.styles, pos_pct=excluded.pos_pct, "
                 "  signish=excluded.signish, detail=excluded.detail, "
                 "  plain=excluded.plain, plain_out=excluded.plain_out, "
-                "  oped_s=excluded.oped_s",
+                "  oped_s=excluded.oped_s, rev=excluded.rev",
                 (int(file_id), int(track), int(size), time.time(),
                  got["events"], got["styles"], got["pos_pct"], got["signish"],
                  got["detail"][:300], got.get("plain") or 0,
-                 got.get("plain_out"), got.get("oped_s")))
+                 got.get("plain_out"), got.get("oped_s"), SHAPE_REV))
     except Exception:                                            # noqa: BLE001
         pass
     return got
