@@ -586,13 +586,21 @@ def _readers(out_left: int, running: bool) -> list:
              "left": int(out_left), "running": bool(running)}]
     try:
         from . import hardsub
+        eng = hardsub.ocr_engine()
+        eng_name = "PaddleOCR" if eng == "paddle" else "Tesseract"
         rows.append({
             "key": "picture", "name": "words burned into the picture",
-            "tool": "ffmpeg frames + Tesseract OCR",
+            # THE ENGINE THIS INSTALL IS SET TO, asked rather than assumed.
+            # This said "Tesseract" because that is what the code did when the
+            # label was written; it is a setting now, and a page that hardcodes
+            # the name of something the user can change will eventually be
+            # wrong about it with complete confidence.
+            "tool": f"ffmpeg frames + {eng_name}",
+            "engine": eng,
             "what": f"For files that report no subtitle track at all. ffmpeg "
                     f"pulls {hardsub.SAMPLES} frames off the disk, the "
                     f"brightest part of the caption band is counted, and the "
-                    f"best of them go to Tesseract to be read. This is the "
+                    f"best of them go to {eng_name} to be read. This is the "
                     f"only reader that decodes video, so it is the slow one - "
                     f"it runs while the pool is quiet and nothing is being "
                     f"watched.",

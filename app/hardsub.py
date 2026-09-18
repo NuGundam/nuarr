@@ -57,6 +57,8 @@ Bazarr, correct the counts, and decide whether transcription is worth it.
 from __future__ import annotations
 
 import asyncio
+import json
+import threading
 import os
 import re
 import subprocess
@@ -115,7 +117,10 @@ MIN_CHARS = 6
 #   5  reading more words made the credit-roll veto too strict: any single
 #      credit word voided the read, and "assistant" is one. It is a
 #      fraction now, like the junk test beside it.
-READER_REV = 5
+#   6  the OCR is whichever engine the install is set to. It was Tesseract,
+#      hardcoded, while every library was set to PaddleOCR - and Paddle
+#      refuses noise Tesseract invents, so the verdicts can differ.
+READER_REV = 6
 
 # BELOW THIS A BAND IS BLANK, whatever the font. MIN_PX is a guess about how
 # many pixels a CAPTION makes; this is the far weaker claim that something is
@@ -324,10 +329,131 @@ def _tesseract() -> str:
 _WORD = re.compile(r"[A-Za-z]{3,}")
 
 
+# ---- THE OCR, WHICHEVER ONE THE INSTALL IS SET TO ------------------------
+#
+# This module used to call tesseract.exe and nothing else, while the settings
+# page offered "one choice for the whole install" and every library was set to
+# PaddleOCR. Two engines in one system because one of them was hardcoded.
+#
+# THE WORKER IS KEPT ALIVE. Measured: Paddle reads a frame in 293 ms after 7.7
+# seconds of model load, against Tesseract's 530 ms and no load at all. This
+# reader takes four to seven frames of a file and moves on, and the walk down
+# the caption band picks each frame from what the last one read - so the
+# frames are not known in advance and cannot be batched. Spawning per frame
+# would pay the load twenty-five times over the work. One process, opened on
+# the first frame of a pass and closed when the reader goes quiet.
+_OCR = {"proc": None, "engine": "", "at": 0.0}
+_OCR_LOCK = threading.Lock()
+# Closed after this long unused, so the GPU goes back to Whisper and the
+# encoders between passes. The same bargain audiolang.unload makes.
+OCR_IDLE_S = 300.0
+
+
+def ocr_engine() -> str:
+    """Which OCR this install uses. The same answer subocr gives."""
+    try:
+        from . import subocr
+        return subocr.engine("")
+    except Exception:                                            # noqa: BLE001
+        return "tesseract"
+
+
+def _ocr_close() -> None:
+    p = _OCR.get("proc")
+    _OCR.update(proc=None, engine="", at=0.0)
+    if not p:
+        return
+    try:
+        if p.stdin:
+            p.stdin.write("QUIT\n")
+            p.stdin.flush()
+    except Exception:                                            # noqa: BLE001
+        pass
+    try:
+        p.wait(timeout=5)
+    except Exception:                                            # noqa: BLE001
+        try:
+            p.kill()
+        except Exception:                                        # noqa: BLE001
+            pass
+
+
+def ocr_close() -> None:
+    """Let the engine go. Called when the reader's pass ends."""
+    with _OCR_LOCK:
+        _ocr_close()
+
+
+def _ocr_proc(engine: str):
+    """The serving worker for this engine, started if it is not up."""
+    import sys as _sys
+    p = _OCR.get("proc")
+    if p is not None and p.poll() is None and _OCR.get("engine") == engine:
+        return p
+    _ocr_close()
+    dev = "cpu"
+    if engine == "paddle":
+        try:
+            from . import subocr
+            dev = "gpu" if subocr.paddle_info().get("cuda") else "cpu"
+        except Exception:                                        # noqa: BLE001
+            dev = "cpu"
+    env = dict(os.environ)
+    try:
+        from . import subocr
+        env["NUARR_TESSERACT_DIR"] = subocr.tesseract_dir()
+    except Exception:                                            # noqa: BLE001
+        pass
+    try:
+        p = subprocess.Popen(
+            [_sys.executable,
+             os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "paddle_worker.py"),
+             "--serve", "--engine", engine, "--device", dev],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, env=env,
+            creationflags=NO_WINDOW, startupinfo=hidden_si())
+        # It says hello once the model is up - so the first read waits for the
+        # load instead of timing out in the middle of it.
+        line = p.stdout.readline()
+        if not line or not json.loads(line).get("ready"):
+            raise RuntimeError("worker did not come up")
+    except Exception as e:                                       # noqa: BLE001
+        joblog.log(f"picture reader: {engine} would not start ({e}) - "
+                   f"falling back to Tesseract", "warn", system="hardsub")
+        _OCR.update(proc=None, engine="", at=0.0)
+        return None
+    _OCR.update(proc=p, engine=engine, at=time.time())
+    return p
+
+
+def _read_served(engine: str, img: str) -> str:
+    """One image through the kept-alive worker. '' if it could not answer."""
+    with _OCR_LOCK:
+        if _OCR.get("at") and time.time() - _OCR["at"] > OCR_IDLE_S:
+            _ocr_close()
+        p = _ocr_proc(engine)
+        if p is None:
+            return ""
+        try:
+            p.stdin.write(img + "\n")
+            p.stdin.flush()
+            line = p.stdout.readline()
+            _OCR["at"] = time.time()
+            if not line:
+                raise RuntimeError("worker closed")
+            d = json.loads(line)
+            return str(d.get("text") or "") if d.get("ok") else ""
+        except Exception:                                        # noqa: BLE001
+            _ocr_close()
+            return ""
+
+
 def _read_text(path: str, t: float, band: str) -> str:
     """OCR one band of one frame. Empty string when nothing readable."""
+    engine = ocr_engine()
     exe = _tesseract()
-    if not exe:
+    if engine != "paddle" and not exe:
         return ""
     tmp = os.path.join(os.environ.get("TEMP") or ".",
                        f"nuarr-hs-{os.getpid()}-{int(t)}.png")
@@ -343,6 +469,18 @@ def _read_text(path: str, t: float, band: str) -> str:
             creationflags=NO_WINDOW, startupinfo=hidden_si())
         if not os.path.exists(tmp):
             return ""
+        if engine == "paddle":
+            # Measured identical to Tesseract on the thresholded image and on
+            # the raw colour crop, so the threshold above is kept - it is what
+            # the brightness numbers are counted from and changing it would
+            # make them mean something different.
+            got = _read_served("paddle", tmp)
+            if got:
+                return got.strip()
+            if not exe:
+                return ""
+            # Paddle could not answer and Tesseract is here: read it rather
+            # than record a blank, which this module treats as a fact.
         r = subprocess.run([exe, tmp, "stdout", "-l", "eng", "--psm", "6"],
                            capture_output=True, text=True, timeout=120,
                            creationflags=NO_WINDOW, startupinfo=hidden_si())
@@ -1623,7 +1761,9 @@ def stats() -> dict:
                (left / max(1, PER_RUN)) * CYCLE_S,
                left * each if each else 0)) if left else 0,
            "next_run": 0.0,
-           "have_ocr": bool(_tesseract()), NONE: 0, SIGNS: 0,
+           # The engine the INSTALL is set to, not whichever one is on disk.
+           "have_ocr": bool(_tesseract()) or ocr_engine() == "paddle",
+           "ocr_engine": ocr_engine(), NONE: 0, SIGNS: 0,
            DIALOGUE: 0, HYBRID: 0, "marked": 0}
     try:
         from . import schedules
@@ -1911,6 +2051,12 @@ def _do_one(r: dict, report=None) -> dict:
 
 
 def _after(d: dict) -> None:
+    # The pass is over, so the model can go and the GPU is Whisper's and the
+    # encoders' again until the next one.
+    try:
+        ocr_close()
+    except Exception:                                            # noqa: BLE001
+        pass
     try:
         from . import schedules
         schedules.beat(SCHED_KEY,

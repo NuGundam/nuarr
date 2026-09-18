@@ -40974,6 +40974,8 @@ function subsPanel(o){
 // so a part cannot exceed its whole. Read-and-carrying-nothing is shown
 // separately from not-read-at-all on purpose: telling those two apart is the
 // whole reason `probed` exists.
+// Takes the whole scan so the picture chip can name the engine the install
+// is set to rather than the one that was true when this was written.
 function subsScanFound(sc){
   const f=(sc && sc.found) || {};
   if(!Object.keys(f).length) return '';
@@ -40987,7 +40989,9 @@ function subsScanFound(sc){
      'A subtitle track inside the file itself. Read from the ffprobe nuarr already stores — its codec (srt, ass, PGS), its language tag, its title and its cue count. No disk: the probe was taken when the file landed.'],
     ['has a subtitle file next to it', f.sides, '#c98cf0', 'one folder listing',
      'A loose .srt or .ass sitting in the same folder as the video. Found by listing that folder once — this is the only part of this sweep that touches a disk at all.'],
-    ['words burned into the picture', f.picture, '#e8a33d', 'frames + OCR',
+    ['words burned into the picture', f.picture, '#e8a33d',
+     'frames + ' + (((sc.readers||[]).find(r=>r.key==='picture')||{}).engine==='paddle'
+                    ? 'PaddleOCR' : 'Tesseract'),
      'The subtitles are painted into the video itself, so there is no track to find. ffmpeg pulls 24 frames off the disk, the brightest are handed to Tesseract, and what it reads decides it. Its own pass, on its own clock — see "the picture" below.'],
     ['no subtitles anywhere',  f.bare,    '#7fd18c', 'all three agreed',
      'Looked at, and carrying no track, no file beside it and nothing in the picture. This is an ANSWER, not a gap — and it is only different from the next chip because the row records whether anybody actually looked.'],

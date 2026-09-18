@@ -134,37 +134,16 @@ def read_sup(path: str):
     return out
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("sup")
-    ap.add_argument("--out", required=True)
-    ap.add_argument("--device", default="cpu")
-    ap.add_argument("--lang", default="en")
-    ap.add_argument("--ass", action="store_true",
-                    help="write positioned ASS instead of flat SRT")
-    ap.add_argument("--an8", action="store_true",
-                    help="SRT, but tag top and middle cues with {\\an8}/{\\an5} "
-                         "so signs keep their place without leaving SRT")
-    ap.add_argument("--progress", action="store_true")
-    ap.add_argument("--engine", default="paddle",
-                    choices=("paddle", "tesseract"))
-    ap.add_argument("--limit", type=int, default=0,
-                    help="stop after N cues - used by the settings-page test")
-    a = ap.parse_args()
+def make_reader(engine: str, lang: str, device: str):
+    """Load one OCR engine and return read(image) -> (texts, cy, spread).
 
+    LIFTED OUT OF main() SO IT CAN BE LOADED ONCE AND USED MANY TIMES. The
+    .sup path loads it, reads a whole track and exits; --serve loads the same
+    thing and then answers frames until it is closed. One engine setup, so
+    the two paths cannot drift into reading differently.
+    """
     import numpy as np
-
-    cues = read_sup(a.sup)
-    if not cues:
-        _die("no cues decoded from the sup")
-    if a.limit:
-        cues = cues[:a.limit]
-
-    # ONE HARNESS, TWO ENGINES. Tesseract normally runs through pgsrip, which
-    # does its own decoding - but a comparison is only worth reading if both
-    # engines saw exactly the same pictures, so the test path drives both from
-    # the decode above. Each `read` takes an image and returns text lines.
-    if a.engine == "paddle":
+    if engine == "paddle":
         try:
             from paddleocr import PaddleOCR
         except Exception as e:                           # noqa: BLE001
@@ -174,7 +153,7 @@ def main() -> None:
         # kernel on this class of model. Disabling it costs CPU speed and is
         # the difference between working and not working at all.
         kw = dict(use_doc_orientation_classify=False, use_doc_unwarping=False,
-                  use_textline_orientation=False, lang=a.lang, device=a.device)
+                  use_textline_orientation=False, lang=lang, device=device)
         try:
             ocr = PaddleOCR(enable_mkldnn=False, **kw)
         except TypeError:
@@ -217,21 +196,96 @@ def main() -> None:
             if not ys:
                 return texts, None, None
             return texts, sum(ys) / len(ys), (max(ys) - min(ys))
-    else:
-        try:
-            import pytesseract
-            from PIL import Image
-        except Exception as e:                           # noqa: BLE001
-            _die(f"pytesseract is not available: {e}")
-        tdir = os.environ.get("NUARR_TESSERACT_DIR", "")
-        if tdir and os.path.isdir(tdir):
-            os.environ["PATH"] = tdir + os.pathsep + os.environ.get("PATH", "")
+        return read
 
-        def read(pic):
-            txt = pytesseract.image_to_string(
-                Image.fromarray(pic).convert("L"), lang="eng", config="--psm 6")
-            # No box from this path, so callers fall back to the bitmap.
-            return [l for l in txt.splitlines() if l.strip()], None, None
+    try:
+        import pytesseract
+        from PIL import Image
+    except Exception as e:                               # noqa: BLE001
+        _die(f"pytesseract is not available: {e}")
+    tdir = os.environ.get("NUARR_TESSERACT_DIR", "")
+    if tdir and os.path.isdir(tdir):
+        os.environ["PATH"] = tdir + os.pathsep + os.environ.get("PATH", "")
+
+    def read(pic):
+        txt = pytesseract.image_to_string(
+            Image.fromarray(pic).convert("L"), lang="eng", config="--psm 6")
+        # No box from this path, so callers fall back to the bitmap.
+        return [l for l in txt.splitlines() if l.strip()], None, None
+    return read
+
+
+def serve(engine: str, lang: str, device: str) -> None:
+    r"""Answer one image path per line on stdin, one JSON line per answer.
+
+    THE WHOLE POINT IS THE MODEL LOAD. PaddleOCR takes 7.7 seconds to come up
+    and 0.3 seconds to read a frame, and the picture reader wants four to
+    seven frames of a file before moving to the next one. Paying the load per
+    frame would be twenty-five times the cost of the work; paying it per pass
+    is nothing.
+
+    The protocol is deliberately the dumbest thing that works - a path in, a
+    JSON object out, one per line - because the interesting failure is the
+    engine dying, and a line-oriented pipe makes that visible immediately
+    instead of hanging.
+    """
+    import numpy as np
+    read = make_reader(engine, lang, device)
+    from PIL import Image
+    print(json.dumps({"ready": True, "engine": engine, "device": device}),
+          flush=True)
+    for line in sys.stdin:
+        p = line.strip()
+        if not p or p == "QUIT":
+            break
+        try:
+            pic = np.array(Image.open(p).convert("RGB"))
+            texts, cy, spread = read(pic)
+            print(json.dumps({"ok": True, "text": "\n".join(
+                t.strip() for t in texts if t and t.strip())}), flush=True)
+        except Exception as e:                           # noqa: BLE001
+            print(json.dumps({"ok": False, "why": str(e)[:160]}), flush=True)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("sup", nargs="?", default="")
+    ap.add_argument("--out", default="")
+    ap.add_argument("--serve", action="store_true",
+                    help="load the engine and answer image paths on stdin")
+    ap.add_argument("--device", default="cpu")
+    ap.add_argument("--lang", default="en")
+    ap.add_argument("--ass", action="store_true",
+                    help="write positioned ASS instead of flat SRT")
+    ap.add_argument("--an8", action="store_true",
+                    help="SRT, but tag top and middle cues with {\\an8}/{\\an5} "
+                         "so signs keep their place without leaving SRT")
+    ap.add_argument("--progress", action="store_true")
+    ap.add_argument("--engine", default="paddle",
+                    choices=("paddle", "tesseract"))
+    ap.add_argument("--limit", type=int, default=0,
+                    help="stop after N cues - used by the settings-page test")
+    a = ap.parse_args()
+
+    if a.serve:
+        serve(a.engine, a.lang, a.device)
+        return
+    if not a.sup or not a.out:
+        _die("a .sup and --out are required unless --serve is given")
+
+    import numpy as np
+
+    cues = read_sup(a.sup)
+    if not cues:
+        _die("no cues decoded from the sup")
+    if a.limit:
+        cues = cues[:a.limit]
+
+    # ONE HARNESS, TWO ENGINES. Tesseract normally runs through pgsrip, which
+    # does its own decoding - but a comparison is only worth reading if both
+    # engines saw exactly the same pictures, so the test path drives both from
+    # the decode above. Each `read` takes an image and returns text lines.
+    read = make_reader(a.engine, a.lang, a.device)
 
     rows = []
     n = len(cues)
