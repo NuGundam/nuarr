@@ -575,19 +575,27 @@ def _counts_now() -> dict:
 
 def _readers(out_left: int, running: bool) -> list:
     """One line per subtitle reader: what it reads, and how much is left."""
-    rows = [{"key": "facts", "name": "the row for each file",
-             "what": "the stored probe, the folder beside it, and what the "
-                     "picture reader already decided - no disk beyond one "
-                     "directory listing",
+    rows = [{"key": "facts", "name": "what each file says it has",
+             "tool": "ffprobe + folder listing",
+             "what": "Reads the ffprobe nuarr already stored for the file, "
+                     "lists the folder beside it once for loose subtitle "
+                     "files, and picks up whatever the picture reader has "
+                     "already decided. Nothing is decoded and nothing is "
+                     "opened - the only disk it touches is that one listing, "
+                     "which is why it can sweep forty thousand files.",
              "left": int(out_left), "running": bool(running)}]
     try:
         from . import hardsub
         rows.append({
-            "key": "picture", "name": "the picture",
-            "what": f"{hardsub.SAMPLES} frames sampled off the disk and the "
-                    f"brightest shown to the OCR, for files that report no "
-                    f"subtitle track - this is the one that finds words "
-                    f"burned into the image",
+            "key": "picture", "name": "words burned into the picture",
+            "tool": "ffmpeg frames + Tesseract OCR",
+            "what": f"For files that report no subtitle track at all. ffmpeg "
+                    f"pulls {hardsub.SAMPLES} frames off the disk, the "
+                    f"brightest part of the caption band is counted, and the "
+                    f"best of them go to Tesseract to be read. This is the "
+                    f"only reader that decodes video, so it is the slow one - "
+                    f"it runs while the pool is quiet and nothing is being "
+                    f"watched.",
             "left": int(hardsub.untested() or 0),
             "running": bool((hardsub.STATE or {}).get("running")),
             "goto": "/settings#hardsub"})
@@ -597,10 +605,14 @@ def _readers(out_left: int, running: bool) -> list:
         from . import subtitletitle as _stt
         d = (_stt._CACHE.get("data") or {})
         rows.append({
-            "key": "events", "name": "a track's events",
-            "what": "the actual lines of a text track whose title contradicts "
-                    "its cue count, demuxed and counted - the only way to "
-                    "tell karaoke from dialogue",
+            "key": "events", "name": "what a subtitle track really contains",
+            "tool": "mkvextract",
+            "what": "For a text track whose TITLE contradicts its cue count - "
+                    "'Signs only' at the cadence of people talking. "
+                    "mkvextract pulls the track out and its lines are counted "
+                    "by style and by position, which is the only way to tell "
+                    "karaoke and signs from real dialogue. A few dozen "
+                    "kilobytes per track, not a whole file.",
             "left": int(d.get("unread") or 0),
             "running": bool((_stt.INSPECT_STATE or {}).get("running")),
             "goto": "/settings#subtitletitle"})

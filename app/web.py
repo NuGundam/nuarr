@@ -38567,7 +38567,7 @@ function skPaint(force){
   // was the last panel here still wearing its own.
   const html=`<div class="subsp" id="subsPanelInput">${
     head}${skAskHtml()}${note}${key}${band}${prog}${hist}${
-    skMarkerHtml()}${table}${foot}</div>`;
+    ''}${table}${foot}</div>`;
   scPaint('subs');
   if(!force && (askOpen('skPanel') || panelBusy('skPanel') || panelScrolled('skPanel'))) return;
   if(html===_skKey) return;
@@ -40977,26 +40977,34 @@ function subsPanel(o){
 function subsScanFound(sc){
   const f=(sc && sc.found) || {};
   if(!Object.keys(f).length) return '';
+  // WHAT WAS FOUND, AND WHAT FOUND IT. These were "inside it / beside it /
+  // in the picture", which is shorthand that only reads once you already
+  // know the answer. The tool is on the face of each one now, because "in
+  // the picture" and "an OCR read words off the screen" are not the same
+  // amount of information.
   const R=[
-    ['inside it',      f.tracks,  '#6fb0ff',
-     'A subtitle track in the file itself - its codec (srt, ass, PGS), its language tag, its title and its cue count, all read from the stored probe.'],
-    ['beside it',      f.sides,   '#c98cf0',
-     'A loose subtitle file sitting in the same folder. One directory listing per file; this is the only part that touches a disk.'],
-    ['in the picture', f.picture, '#e8a33d',
-     'The picture reader has a verdict on whether the words are painted into the frames. Its own reading, from its own pass - it outlives the probe beside it.'],
-    ['carries none',   f.bare,    '#7fd18c',
-     'Read, and carrying no track and no sidecar. A real answer, not a gap - which is only distinguishable from the next one because the row records whether anybody looked.'],
-    ['not read yet',   f.unread,  '#9aa7b8',
-     'No probe behind the row, so what is inside is unknown. Nothing is decided about these: the rules need something to compare against.'],
+    ['has a subtitle track',   f.tracks,  '#6fb0ff', 'ffprobe',
+     'A subtitle track inside the file itself. Read from the ffprobe nuarr already stores — its codec (srt, ass, PGS), its language tag, its title and its cue count. No disk: the probe was taken when the file landed.'],
+    ['has a subtitle file next to it', f.sides, '#c98cf0', 'one folder listing',
+     'A loose .srt or .ass sitting in the same folder as the video. Found by listing that folder once — this is the only part of this sweep that touches a disk at all.'],
+    ['words burned into the picture', f.picture, '#e8a33d', 'frames + OCR',
+     'The subtitles are painted into the video itself, so there is no track to find. ffmpeg pulls 24 frames off the disk, the brightest are handed to Tesseract, and what it reads decides it. Its own pass, on its own clock — see "the picture" below.'],
+    ['no subtitles anywhere',  f.bare,    '#7fd18c', 'all three agreed',
+     'Looked at, and carrying no track, no file beside it and nothing in the picture. This is an ANSWER, not a gap — and it is only different from the next chip because the row records whether anybody actually looked.'],
+    ['not opened yet',         f.unread,  '#9aa7b8', 'nothing has looked',
+     'No probe behind the row, so what is inside is genuinely unknown. Nothing is decided about these: a rule needs something to compare against.'],
   ].filter(x=>x[1]!=null);
   return `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:7px">${
-    R.map(([label,n,col,tip])=>`<span class="capsc"
+    R.map(([label,n,col,tool,tip])=>`<span class="capsc"
         style="border-color:${col};color:${col};font-size:10.5px"
-        title="${esc(tip)}">${esc(label)} <b>${fmt(n||0)}</b></span>`).join('')
+        title="${esc(tip)}">${esc(label)} <b>${fmt(n||0)}</b>${
+        tool?` <span class="dim" style="font-size:9.5px">${esc(tool)}</span>`:''
+        }</span>`).join('')
   }</div>
   <div class="dim" style="font-size:10.5px;margin-top:4px">every file is asked
-    all of these in one pass — one sweep, not four — and a file can answer
-    yes to several</div>`;
+    all five of these in one pass — one sweep, not five — and a file can
+    answer yes to more than one. The small grey word on each is what actually
+    answered it.</div>`;
 }
 
 // WHAT THE LAST FILE GAVE UP. Its name alone proves the sweep is alive and
@@ -41069,6 +41077,12 @@ function subsScanLibs(sc){
 //
 // The work stays in three passes because it genuinely is three jobs: stored
 // facts, frames off a disk, a demuxed track. Only the reporting is joined.
+// How much reading is outstanding across all three, so the panel cannot say
+// it is finished while one of them is working.
+function subsReadersLeft(sc){
+  return (sc.readers||[]).reduce((n,r)=>n+(r.left||0), 0);
+}
+
 function subsScanReaders(sc){
   const R=(sc.readers||[]);
   if(R.length<2) return '';
@@ -41079,7 +41093,8 @@ function subsScanReaders(sc){
       return `<span class="capsc" style="font-size:10px;border-color:${col};
           color:${col}" title="${esc(r.what||'')}">${
         r.running?'<span class="busy"><span class="sp"></span></span> ':''}${
-        esc(r.name)} ${done?'<b>read through</b>'
+        esc(r.name)}${r.tool?` <span class="dim" style="font-size:9.5px">${
+          esc(r.tool)}</span>`:''} ${done?'<b>read through</b>'
                            :`<b>${fmt(r.left)}</b> left`}</span>`;
     }).join('')}</div>
   <div class="dim" style="font-size:10.5px;margin-top:3px">three passes,
@@ -41128,9 +41143,18 @@ function subsScanHtml(){
       <span style="font-size:10.5px">(${pct.toFixed(0)}%)</span>
       ${sc.rate?` · <b style="color:var(--ok)">${sc.rate.toFixed(0)}</b> a second`:''}
       ${sc.eta?` · ${numt(hsDur(sc.eta))} left`:''}`,
+    // NOT "DONE" WHILE A READER IS STILL WORKING. The bar counts files
+    // nuarr has been able to look INSIDE, and every file has been - so it
+    // read 39,882 of 39,882, 100%, "every file read inside", while the
+    // picture reader had three thousand to go and LAST READ was updating
+    // underneath. Both numbers were true; the sentence they made together
+    // was not. The claim now waits for all three readers to agree.
     right: (f.unread)
       ? `${num(f.unread,'you')} <span class="dim">not opened yet</span>`
-      : '<b style="color:var(--ok)">every file read inside</b>',
+      : (subsReadersLeft(sc)
+          ? `${num(subsReadersLeft(sc),'auto')} <span class="dim">still to
+             read</span>`
+          : '<b style="color:var(--ok)">every file read inside</b>'),
     body:`<div class="hsbar${sc.running?' live':''}" style="margin-top:4px"
         ><i style="width:${pct}%"></i></div>
       ${lastName?`<div style="font-size:12px;margin-top:5px;word-break:break-word;

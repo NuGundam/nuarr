@@ -47,6 +47,7 @@ import time
 # rank than subdupe in the shared runner.
 SIDECAR = "sidecar"
 DUPE = "dupe"
+MARKER = "marker"
 PICTURE = "picture"
 TITLE = "title"
 
@@ -256,7 +257,59 @@ def board() -> list:
     except Exception as e:                                       # noqa: BLE001
         rows.append(_broken(DUPE, "The same subtitle inside the file twice", e))
 
-    # 3 and 4. What the inside actually says. One system, two readers, and
+    # 3. The blank track that says "the words are already on the screen".
+    #
+    # This was a section inside Subtitle User Input, which is the panel for
+    # readings that want an ANSWER. This wants none: it is a rule with a
+    # switch, exactly like the one above it, so it belongs on the switchboard
+    # beside it rather than buried in somebody else's panel.
+    try:
+        from . import hardsub
+        m = hardsub.marker()
+        auto = (m.get("mode") == "auto")
+        left = int(m.get("unreviewed") or 0)
+        bits = [f"{int(m.get('marked') or 0):,} already carry it"]
+        if m.get("auto_ready"):
+            bits.append(f"{int(m['auto_ready']):,} "
+                        + ("nuarr will take on its next pass" if auto
+                           else "are over the line and waiting for the switch"))
+        if m.get("needs_you"):
+            bits.append(f"{int(m['needs_you']):,} sit between the two lines "
+                        f"and are yours to call")
+        skip = (int(m.get("signs_only") or 0) + int(m.get("not_mkv") or 0)
+                + int(m.get("has_eng") or 0) + int(m.get("dismissed") or 0))
+        if skip:
+            bits.append(f"{skip:,} can never take one - signs only, not "
+                        f"Matroska, already English, or dismissed by you")
+        rows.append({
+            "key": MARKER,
+            "name": "A blank English track for a file with the words painted on",
+            "does": "Adds an empty English subtitle track to files the picture "
+                    "reader found burned-in dialogue in. It draws nothing on "
+                    "screen - it exists so Bazarr stops hunting for subtitles "
+                    "that are already there and Plex stops reporting none.",
+            "why": "A hardsubbed release has English subtitles; it just has "
+                   "them in the picture instead of in a track. Everything "
+                   "downstream reads the track list, sees nothing, and keeps "
+                   "fetching a file that is not needed.",
+            "on": auto,
+            "setting": (f"auto · at or above {m.get('mark_at')}% sure" if auto
+                        else f"manual · nothing is written until you say so"),
+            "waiting": int(m.get("waiting") or 0),
+            "waiting_word": "files read as carrying burned-in dialogue that "
+                            "have no marker track yet",
+            "detail": " · ".join(bits) + (
+                f" · {left:,} more were read by an older version of the "
+                f"picture reader and are queued to be read again, so these "
+                f"numbers do not speak for them" if left else ""),
+            "goto": "hardsub", "panel": "",
+            "toggle": "",
+        })
+    except Exception as e:                                       # noqa: BLE001
+        rows.append(_broken(
+            MARKER, "A blank English track for a file with the words painted on", e))
+
+    # 4 and 5. What the inside actually says. One system, two readers, and
     # one mode - so it is one switchboard row with two counts under it.
     try:
         from . import subkind
