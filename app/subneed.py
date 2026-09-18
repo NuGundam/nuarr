@@ -109,6 +109,59 @@ KIND = "subs/missing-language"
 # subtitles live - and calls 20% of them a dialogue rhythm.
 PICTURE_MARKS_RATIO = 0.20
 
+# THE COMMONEST ENGLISH FUNCTION WORDS, and this is a test for ENGLISH rather
+# than a test for text.
+#
+# The picture reader OCRs the frames it thinks carry subtitles and keeps the
+# words. Asked whether ANY words came back, the answer is useless: on
+# Japanese-audio anime the OCR reads compression artifacts and on-screen
+# Japanese and returns 'cng, eae, ener, rel, senna' and 'corrs, dil, hbencb,
+# wet'. Asked whether any ENGLISH came back, the answer is exact. Measured
+# over the 23 accused files that had any words at all:
+#
+#     13 with a function word   every one Spanish-audio Velvet, English
+#                               burned in - 'are, barbara, doing, here,
+#                               what, you'
+#     10 without one            every one Japanese-audio Conan or Naruto,
+#                               pure OCR noise
+#
+# A perfect split, landing exactly on the audio language. Function words are
+# what makes it work: they are short, ubiquitous and high-frequency, so a
+# line of dialogue almost always has one and noise almost never does.
+#
+# It speaks for English only. For any other required language this list is
+# silent and the frame counts decide, because an English stopword says
+# nothing about whether Korean is on the screen - see _is_english().
+_ENGLISH_STOP = {
+    "the", "a", "an", "and", "or", "but", "if", "of", "to", "in", "on", "at",
+    "for", "with", "from", "by", "as", "is", "are", "was", "were", "be",
+    "been", "am", "do", "does", "did", "have", "has", "had", "will", "would",
+    "can", "could", "should", "not", "no", "yes", "i", "you", "he", "she",
+    "it", "we", "they", "me", "him", "her", "us", "them", "my", "your", "his",
+    "its", "our", "their", "this", "that", "these", "those", "what", "who",
+    "why", "how", "when", "where", "which", "here", "there", "now", "then",
+    "all", "just", "like", "get", "got", "go", "going", "know", "think",
+    "want", "need", "let", "come", "take", "see", "look", "tell", "say",
+    "said", "make", "really", "very", "please", "thank", "thanks", "sorry",
+    "hello", "okay", "ok", "about", "because", "out", "up", "down", "over",
+    "into", "than", "too", "also", "some", "any", "more", "one", "two",
+    "don", "doesn", "isn", "won", "didn", "dont",
+}
+
+
+def _is_english(lang: str) -> bool:
+    return str(lang or "").strip().lower()[:3] in ("eng", "en")
+
+
+def _english_hits(words: str) -> list:
+    """Which of the OCRed words are English function words."""
+    out = []
+    for w in str(words or "").split(","):
+        w = w.strip().lower()
+        if w and w in _ENGLISH_STOP:
+            out.append(w)
+    return out
+
 # Slow on purpose. Nothing here touches a disk - it reads sub_facts, hardsub
 # and file_probes, all of which somebody else has already filled in - so the
 # cost is a few table scans, and the thing it is looking for changes only when
@@ -306,6 +359,48 @@ def verdict(file_id: int, lang: str, cur, facts=None,
     if lang in _audio_langs(file_id, cur):
         return OK, f"the audio is already in {lang}"
 
+    # DID IT READ ANY WORDS? Asked before the frame counts, because it is the
+    # stronger evidence and because nothing was asking it at all.
+    #
+    # The guard below was written for City Hunter - many frames with
+    # subtitle-shaped marks, not one readable word. Velvet, The New Empire
+    # fails the mirror image: a Spanish telenovela with English burned in,
+    # where the marks detector caught 1 frame in 24 because the subtitles are
+    # on screen for a fraction of the runtime, and that one frame OCR'd
+    # cleanly:
+    #
+    #     #32070 S01E47  state='none'  low_hits=1/24
+    #                    words='are, barbara, doing, here, what, you'
+    #
+    # "what are you doing here, barbara" - read off the screen, while the
+    # verdict said there was nothing in the picture and the row offered to
+    # blocklist the file and fetch another copy. Measured across the list: 27
+    # of the 80 accused had words the OCR had already read, 9 of them six
+    # words or more.
+    #
+    # A COUNT OF WORDS IS NOT A COUNT OF FRAMES. One asks how often something
+    # subtitle-shaped appeared, the other whether any of it turned out to be
+    # language, and they miss in opposite directions.
+    #
+    # UNKNOWN and not OK: words on screen might be a shop sign or a chyron,
+    # and `dialogue`/`hybrid` above is where the picture reader says it is
+    # really dialogue. This only says burned-in subtitles cannot be ruled out,
+    # which is true, and takes the file off the delete list.
+    words = ""
+    try:
+        if "words" in prow.keys():
+            words = str(prow["words"] or "").strip()
+    except Exception:                                            # noqa: BLE001
+        words = ""
+    hits = _english_hits(words) if _is_english(lang) else []
+    if hits:
+        got = [w for w in (x.strip() for x in words.split(",")) if w]
+        shown = ", ".join(got[:8]) + ("..." if len(got) > 8 else "")
+        return UNKNOWN, (
+            f"the picture reader OCRed English off the picture - {shown} - "
+            f"so there is English burned into this file whatever the frame "
+            f"counts say")
+
     n_s = int(prow["samples"] or 0)
     n_lo = int(prow["low_hits"] or 0)
     if n_s and (n_lo / n_s) >= PICTURE_MARKS_RATIO:
@@ -386,7 +481,13 @@ def sweep(limit: int = BATCH) -> dict:
                 untagged = _keeps_untagged(lib)
                 rows = cur.execute(
                     "SELECT f.id, f.library, s.tracks, s.sides, s.picture, "
-                    "       h.state, h.chosen, h.low_hits, h.samples, "
+                    # h.words IS NOT OPTIONAL. verdict() reads it to decide
+                    # whether the OCR pulled English off the picture, and this
+                    # hand-written column list is the only thing feeding it on
+                    # the sweep path. Leaving it out made the whole check a
+                    # no-op here while single-file calls worked perfectly -
+                    # see the note on _ENGLISH_STOP.
+                    "       h.state, h.chosen, h.low_hits, h.samples, h.words, "
                     "       (SELECT MIN(n.checked_at) FROM sub_need n "
                     "         WHERE n.file_id=f.id) AS seen, "
                     "       (h.file_id IS NOT NULL) AS haspic "
