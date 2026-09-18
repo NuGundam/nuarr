@@ -244,16 +244,48 @@ def _keeps_untagged(lib: str) -> bool:
 
 # ----------------------------------------------------------- the verdict ----
 def _audio_langs(file_id: int, cur) -> set[str]:
+    r"""What languages the audio is in - heard where possible, tagged where not.
+
+    THE TAG IS A CLAIM, AND THIS PAGE WAS TAKING IT AS A FACT. A file tagged
+    eng whose audio is really Japanese returned OK here - "the audio is
+    already in eng" - and nuarr stopped asking whether it had English
+    subtitles. The tag satisfied a requirement the file does not meet. That
+    failure is the whole reason audiolang exists: S01E12 of "Pass the Monster
+    Meat, Milady!" carries two Japanese tracks and calls one of them English.
+
+    So a fresh, confident verdict from the listener outranks the tag for that
+    track. Where nothing has been listened to the tag stands, because it is
+    the only evidence there is.
+    """
+    out: set[str] = set()
+    tags: list = []
     r = cur.execute("SELECT json FROM file_probes WHERE file_id=?",
                     (int(file_id),)).fetchone()
-    if not r:
-        return set()
+    if r:
+        try:
+            streams = json.loads(r["json"]).get("streams") or []
+            tags = [str((s.get("tags") or {}).get("language") or "").lower()[:3]
+                    for s in streams if s.get("codec_type") == "audio"]
+        except Exception:                                        # noqa: BLE001
+            tags = []
+    heard: dict = {}
     try:
-        streams = json.loads(r["json"]).get("streams") or []
+        for a in cur.execute(
+                "SELECT a.track, a.code FROM audio_lang a "
+                "  JOIN files f ON f.id = a.file_id "
+                " WHERE a.file_id = ? AND COALESCE(a.ok,0) = 1 "
+                "   AND COALESCE(a.code,'') <> '' "
+                "   AND a.size = COALESCE(f.size,0) "
+                "   AND ABS(COALESCE(a.mtime,0) - COALESCE(f.mtime,0)) <= 1.0",
+                (int(file_id),)):
+            heard[int(a["track"])] = str(a["code"]).lower()[:3]
     except Exception:                                            # noqa: BLE001
-        return set()
-    return {str((s.get("tags") or {}).get("language") or "").lower()[:3]
-            for s in streams if s.get("codec_type") == "audio"}
+        heard = {}
+    for i, t in enumerate(tags):
+        out.add(heard.get(i) or t)
+    # A verdict for a track the probe did not list still counts.
+    out.update(heard.values())
+    return out
 
 
 def _picture(file_id: int, cur, pic=None):
@@ -396,6 +428,29 @@ def verdict(file_id: int, lang: str, cur, facts=None,
     if hits:
         got = [w for w in (x.strip() for x in words.split(",")) if w]
         shown = ", ".join(got[:8]) + ("..." if len(got) > 8 else "")
+        # HEARD ONE LANGUAGE, SAW ANOTHER - a translation subtitle.
+        #
+        # Getting here already means the required language is NOT in the audio
+        # (the check above returns OK when it is), so English on the screen
+        # here is English the audio does not have. That is what a translation
+        # subtitle IS, and it is a different fact from "some words are on the
+        # screen": a shop sign does not produce English function words and a
+        # chyron does not produce several.
+        #
+        # Velvet, The New Empire is the case - Spanish audio, and the picture
+        # reading "are, barbara, doing, here, what, you". Both readings were
+        # already stored; this only compares them.
+        #
+        # Two function words to decide, one to wonder. Measured over the 23
+        # accused files that had any words at all, the thirteen real ones
+        # scored 1,2,2,2,2,2,2,3,4,4,4,6 and the ten noise ones scored zero.
+        heard = _audio_langs(file_id, cur)
+        spoken = sorted(x for x in heard if x and x not in ("und", "un", ""))
+        if len(hits) >= 2:
+            return OK, (
+                f"the audio is {'/'.join(spoken) or 'not English'} and the "
+                f"picture reader OCRed English off the screen - {shown} - so "
+                f"the English is burned in as a translation subtitle")
         return UNKNOWN, (
             f"the picture reader OCRed English off the picture - {shown} - "
             f"so there is English burned into this file whatever the frame "

@@ -12722,6 +12722,10 @@ td.detail b{color:var(--fg);font-weight:600}
    the panel as empty space. They only need to scroll on the days they are
    long - a rename backlog after a big import, or several commits held behind
    a locked file. */
+/* height:auto so a list of one is one tall. The fixed 400px above is a
+   height, not a cap, so an inline max-height clamps it to exactly that many
+   pixels of mostly nothing - which is what put two hundred blank pixels under
+   a single question in Subtitle User Input. */
 .scrollbox.auto{height:auto;max-height:340px;overflow-y:auto}
 /* no sideways scrolling - the table must fit the panel and wrap instead */
 .nohz{overflow-x:hidden}
@@ -37759,7 +37763,7 @@ function skAskHtml(){
         esc(_head[0])}</b>
       <span class="dim" style="font-size:10.5px">${esc(_head[1])}</span>
     </div>
-    <div class="scrollbox" style="max-height:210px;overflow:auto;margin-top:4px">
+    <div class="scrollbox auto" style="max-height:210px;overflow:auto;margin-top:4px">
     ${A.slice(0,30).map(r=>(r.asks||[]).map(a=>`
       <div style="padding:5px 0;border-top:1px solid var(--line)">
         <div style="display:flex;gap:8px;align-items:baseline;font-size:11.5px">
@@ -37830,13 +37834,29 @@ function skMarkerHtml(){
      `${m.dismissed||0} findings you threw away, ${m.signs_only||0} signs or songs only, `
      +`${m.not_mkv||0} not Matroska, ${m.has_eng||0} already have an English track `
      +`— no run clears these`]];
+  // FILES THIS PANEL'S NUMBERS DO NOT SPEAK FOR. Its population is the files
+  // read as carrying burned-in text; one read as carrying none is absent from
+  // every tile above. While the picture reader has rows from an older, worse
+  // reader still to revisit, that absence is not evidence of anything.
+  if(m.unreviewed) tiles.push(['not re-read yet', m.unreviewed, '#9aa7b8',
+    'Read by an earlier version of the picture reader, before the caption '
+    +'floor was calibrated per file. Every Velvet episode sat here reading '
+    +'"none" with English burned into the picture. The sweep revisits these '
+    +'on its own and the number falls to zero.']);
   return skSection({
     accent:'#c98cf0', title:'The marker track',
     sub:'a blank English track, so Bazarr stops hunting and Plex stops '
        +'reporting none — nothing is drawn over the picture',
     right: m.waiting
       ? `${num(m.waiting,auto?'auto':'you')} <span class="dim">waiting</span>`
-      : '<b style="color:var(--ok)">every one marked</b>',
+      : (m.unreviewed
+          // NOT "EVERY ONE" WHILE THERE ARE ROWS NOBODY HAS RE-READ. The
+          // claim only ever covered files already read as having burned-in
+          // text, and said nothing about files the old reader called clean.
+          ? `<span title="Every file read as carrying burned-in text is marked. ${
+              fmt(m.unreviewed)} more were read by an earlier version of the reader and have not been looked at again yet, so this is not a statement about them.">marked, of ${
+              fmt((m.marked||0))} read</span>`
+          : '<b style="color:var(--ok)">every one marked</b>'),
     body:`<div style="margin-top:6px;display:grid;
         grid-template-columns:repeat(auto-fit,minmax(132px,1fr));gap:6px">
       ${tiles.map(([k,v,c,t])=>`<div class="lkind" style="padding:6px 9px"

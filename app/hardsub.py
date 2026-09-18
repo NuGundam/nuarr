@@ -93,6 +93,20 @@ DIALOGUE_RATIO = 0.20
 # Real words, not two stray glyphs.
 MIN_CHARS = 6
 
+# WHICH READER PRODUCED A VERDICT.
+#
+# Bumped whenever the reading rules change in a way that could alter an
+# answer, so the sweep can go back for rows that predate the change. Without
+# it a row written once is never revisited - _candidates only picks files with
+# no row at all - and every improvement to the reader applies only to files
+# nobody had read yet.
+#
+#   1  the original: a fixed MIN_PX caption floor
+#   2  the floor is calibrated per file from frames the OCR read speech out
+#      of, and one frame under the floor is read on purpose to find a thin
+#      font. 3,691 rows said 'none' under rev 1, Velvet's among them.
+READER_REV = 2
+
 # BELOW THIS A BAND IS BLANK, whatever the font. MIN_PX is a guess about how
 # many pixels a CAPTION makes; this is the far weaker claim that something is
 # there at all, and it exists so the OCR has candidates to calibrate from on a
@@ -232,6 +246,12 @@ def init() -> None:
         # disagree the person is right, and the row has to remember that or
         # the next sweep quietly overwrites the correction with the same wrong
         # guess it made the first time.
+        # See READER_REV. NULL means rev 1 - every row written before the
+        # column existed came from the fixed-floor reader.
+        try:
+            cur.execute("ALTER TABLE hardsub ADD COLUMN rev INTEGER")
+        except Exception:                                        # noqa: BLE001
+            pass
         try:
             cur.execute("ALTER TABLE hardsub ADD COLUMN chosen TEXT")
         except Exception:                                        # noqa: BLE001
@@ -561,15 +581,17 @@ def _save(d: dict) -> None:
                 d = dict(d, state=row["chosen"])
             cur.execute(
                 "INSERT INTO hardsub(file_id,path,size,at,state,low_hits,"
-                "high_hits,samples,words,detail) VALUES(?,?,?,?,?,?,?,?,?,?) "
+                "high_hits,samples,words,detail,rev) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(file_id) DO UPDATE SET path=excluded.path, "
                 "  size=excluded.size, at=excluded.at, state=excluded.state, "
                 "  low_hits=excluded.low_hits, high_hits=excluded.high_hits, "
                 "  samples=excluded.samples, words=excluded.words, "
-                "  detail=excluded.detail",
+                "  detail=excluded.detail, rev=excluded.rev",
                 (int(d["file_id"]), d["path"], _size(d["path"]), time.time(),
                  d["state"], d["low_hits"], d["high_hits"], d["samples"],
-                 ", ".join(d.get("words") or []), d["detail"][:400]))
+                 ", ".join(d.get("words") or []), d["detail"][:400],
+                 READER_REV))
     except Exception:                                            # noqa: BLE001
         pass
 
@@ -1340,6 +1362,15 @@ def _auto_one(file_id: int) -> str:
 
 # ------------------------------------------------------------- the sweep ----
 def untested() -> int:
+    r"""How many files the reader still has to look at.
+
+    THE SAME PREDICATE _candidates USES, and it has to stay that way. This
+    counted files with no row at all, which was the same question until
+    _candidates learned to go back for rows written by an older reader. Then
+    the panel said "every file looked at" over 3,280 files queued to be read
+    again - a count of what had been TOUCHED being printed as a count of what
+    was KNOWN, which is the fault the tile beside it was just fixed for.
+    """
     if not _READY:
         init()
     try:
@@ -1350,7 +1381,11 @@ def untested() -> int:
                 "WHERE f.state NOT IN ('deleted','duplicate') "
                 "  AND COALESCE(f.sub_langs,'')='' "
                 "  AND COALESCE(f.duration,0) > 120 "
-                "  AND h.file_id IS NULL").fetchone()
+                "  AND (h.file_id IS NULL "
+                "       OR (COALESCE(h.rev,1) < ? "
+                "           AND COALESCE(h.chosen,'') = '' "
+                "           AND COALESCE(h.state,'') IN ('none','signs')))",
+                (int(READER_REV),)).fetchone()
         return int(r["n"] or 0)
     except Exception:                                            # noqa: BLE001
         return 0
@@ -1375,9 +1410,26 @@ def _candidates(limit: int) -> list:
             "  AND COALESCE(f.sub_langs,'')='' "
             "  AND COALESCE(f.duration,0) > 120 "
             "  AND COALESCE(f.mtime,0) < ? "
-            "  AND h.file_id IS NULL "
+            # NEVER READ, OR READ BY A READER THAT HAS SINCE BEEN CORRECTED.
+            #
+            # A row used to be final: this picked files with no row at all, so
+            # every improvement to the reader reached only files nobody had
+            # got to yet. The caption floor is calibrated now and 3,691 rows
+            # say 'none' on the old fixed one - Velvet among them, with full
+            # English sentences in frames it never showed the OCR.
+            #
+            # Only the two verdicts a lower floor can change. 'dialogue' and
+            # 'hybrid' are already the strongest answers available and
+            # re-reading them would be a disk seek to learn nothing, which is
+            # the same reason files with a subtitle track are left alone. A
+            # verdict you set by hand is never revisited at all.
+            "  AND (h.file_id IS NULL "
+            "       OR (COALESCE(h.rev,1) < ? "
+            "           AND COALESCE(h.chosen,'') = '' "
+            "           AND COALESCE(h.state,'') IN ('none','signs'))) "
             # eligible first - see precedence.py
-            "ORDER BY (f.state='eligible') DESC, f.id LIMIT ?", (cutoff, int(limit)))]
+            "ORDER BY (f.state='eligible') DESC, f.id LIMIT ?",
+            (cutoff, int(READER_REV), int(limit)))]
 
 
 async def _too_busy() -> bool:
@@ -1578,6 +1630,13 @@ def marker() -> dict:
     out = {"marked": 0, "waiting": 0, "auto_ready": 0, "needs_you": 0,
            "signs_only": 0, "not_mkv": 0, "has_eng": 0, "dismissed": 0,
            "total_found": 0,
+           # ROWS THIS PANEL'S CLAIM DOES NOT COVER. Its population is
+           # state IN ('dialogue','hybrid','signs'), so a file reading 'none'
+           # is invisible here - not waiting, not ineligible, absent. With
+           # nothing waiting it said "every one marked", which was true of the
+           # files it believed carry burned-in subtitles and silent about the
+           # ones it wrongly believed do not. Velvet was in the second group.
+           "unreviewed": 0, "reader_rev": READER_REV,
            "mode": mode(), "mark_at": mark_at(), "dismiss_at": dismiss_at(),
            "last_at": 0.0, "cycle_s": CYCLE_S,
            "reader_left": 0, "reader_running": False,
@@ -1596,6 +1655,14 @@ def marker() -> dict:
             r = cur.execute("SELECT MAX(h.at) m " + live + " AND h.marked=1"
                             ).fetchone()
             out["last_at"] = float((r["m"] if r else 0) or 0)
+            # Read by a reader that has since been corrected - see READER_REV.
+            r = cur.execute(
+                "SELECT COUNT(*) n " + live +
+                "   AND COALESCE(h.rev,1) < ? "
+                "   AND COALESCE(h.chosen,'') = '' "
+                "   AND COALESCE(h.state,'') IN ('none','signs')",
+                (int(READER_REV),)).fetchone()
+            out["unreviewed"] = int((r["n"] if r else 0) or 0)
 
             # THE BACKLOG, FILE BY FILE, because "waiting" is four different
             # answers and a single number hides which one you are looking at.
