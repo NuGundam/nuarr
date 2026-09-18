@@ -1297,7 +1297,23 @@ def scan(limit: int = 0) -> dict:
     for r in list(rows):
         sh = known.get((r["file_id"], r["track"]))
         # A row read before `plain` existed is unread for this purpose.
-        if sh is None or (sh.get("plain") is None and not sh.get("chosen")):
+        #
+        # AND SO IS ONE COUNTED BY AN EARLIER READER. shape_of() re-reads a
+        # track behind SHAPE_REV - but shape_of is only called for rows THIS
+        # marks unread, so a read-but-stale row was never fed to it and the
+        # revision check was unreachable from the sweep. The panel said "3
+        # left" while 508 were owed. Same three guards as shape_of, so the
+        # two agree on what is worth an mkvextract: something to gain, not
+        # set by hand, behind the reader.
+        behind = False
+        if sh is not None and not sh.get("chosen"):
+            try:
+                behind = (int(sh.get("rev") or 0) < SHAPE_REV
+                          and int(sh.get("plain") or 0) > 0)
+            except Exception:                                    # noqa: BLE001
+                behind = False
+        if sh is None or behind or (sh.get("plain") is None
+                                    and not sh.get("chosen")):
             unread += 1
             r["unread"] = True
             r["rewritable"] = False        # nothing to press until it is read
