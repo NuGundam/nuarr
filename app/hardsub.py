@@ -105,7 +105,17 @@ MIN_CHARS = 6
 #   2  the floor is calibrated per file from frames the OCR read speech out
 #      of, and one frame under the floor is read on purpose to find a thin
 #      font. 3,691 rows said 'none' under rev 1, Velvet's among them.
-READER_REV = 2
+#   3  that probe took the BRIGHTEST frame under the floor, so the floor was
+#      derived from the top of the caption band and half of each file's
+#      captions fell under it - Velvet S01E04 counted 4 of 24 on an episode
+#      of solid dialogue.
+#   4  and its guard meant it never ran at all. The reader now walks DOWN
+#      from the dimmest confirmed caption, one probe at a time, until a
+#      probe comes back as noise - which is where the caption band ends.
+#   5  reading more words made the credit-roll veto too strict: any single
+#      credit word voided the read, and "assistant" is one. It is a
+#      fraction now, like the junk test beside it.
+READER_REV = 5
 
 # BELOW THIS A BAND IS BLANK, whatever the font. MIN_PX is a guess about how
 # many pixels a CAPTION makes; this is the far weaker claim that something is
@@ -455,17 +465,52 @@ def probe_one(file_id: int, samples: int = SAMPLES,
     # are frames between blank and the floor, the brightest of them is read.
     # One extra call, and it is the only way to answer the question the
     # pre-filter was guessing at: are the dim frames captions, or noise.
-    if not [c for c in lit if c < MIN_PX]:
-        dim = sorted(((t, c) for t, c in low
-                      if CAL_FLOOR_PX <= c < MIN_PX), key=lambda x: -x[1])
-        for t, c in dim[:1]:
+    if True:
+        # FROM THE MIDDLE OF THE BAND, NOT THE TOP OF IT.
+        #
+        # Everything else handed to the OCR is the brightest thing available -
+        # that is what the pre-filter is for - so a floor derived from those
+        # samples lands near the top of the caption band and half of the
+        # file's captions fall under it. Measured on Velvet, swept at forty
+        # frames: captions run from about 25 to about 80 bright pixels, and
+        # the floor was coming out at 52 and 56.
+        #
+        #     S01E26  captions 25-81   floor 52.5   counted  8 of 24
+        #     S01E04  captions 25-80   floor 56.0   counted  4 of 24  -> signs
+        #
+        # on episodes that are wall-to-wall dialogue. So the two probes are
+        # taken at the median and the lower quartile of the non-blank frames:
+        # the floor then comes from a caption near the BOTTOM of what this
+        # file produces, which is what "the dimmest thing still worth counting
+        # as a caption" means.
+        # A WALK DOWNWARDS, NOT A SINGLE LOOK.
+        #
+        # Every frame the OCR is shown is the brightest one available, so the
+        # dimmest CONFIRMED caption is only ever the dimmest of the bright
+        # ones - and the floor derived from it sits in the middle of the
+        # caption band, excluding the other half. Velvet S01E26's captions run
+        # 25 to 81 bright pixels and the floor came out at 52.5; S01E04's
+        # came out at 56 and counted 4 frames of 24 on an episode that is
+        # solid dialogue.
+        #
+        # So: take the frames dimmer than the dimmest caption so far, probe
+        # the middle of THAT, and if it reads as speech the floor moves down
+        # and the question is asked again. The walk stops the moment a probe
+        # comes back as noise, which is where this file's captions end.
+        for _step in range(3):
+            edge = min(lit) if lit else MIN_PX
+            below = sorted(((t, c) for t, c in low
+                            if CAL_FLOOR_PX <= c < edge), key=lambda x: x[1])
+            if not below:
+                break
+            t, c = below[len(below) // 2]
             got = [w.lower() for w in _words(_read_text(path, t, LOW_BAND))
                    if len(w) >= 3]
-            if len(got) >= 2:
-                text_frames += 1
-                words.extend(got)
-                if _FUNCTION & set(got):
-                    lit.append(c)
+            if len(got) < 2 or not (_FUNCTION & set(got)):
+                break                      # noise down here - the band ends
+            text_frames += 1
+            words.extend(got)
+            lit.append(c)
 
     # AND NOW COUNT THE FRAMES AGAIN, AGAINST WHAT WAS ACTUALLY SEEN.
     #
@@ -510,9 +555,23 @@ def probe_one(file_id: int, samples: int = SAMPLES,
     # read again. Judged as a fraction rather than a flat count, because a long
     # correct read will always pick up one or two.
     mostly_junk = bool(uniq) and len(junk) >= max(2, len(uniq) * 0.5)
+    # A CREDIT ROLL IS MOSTLY CREDIT WORDS, not one of them.
+    #
+    # This was `bool(credits)` - any overlap at all - and it was safe while a
+    # read was four frames and a handful of words. The reader walks down the
+    # caption band now and brings back thirty or more, so the chance of one
+    # ordinary word landing in the list rose with every frame the evidence
+    # improved by. Velvet S01E10: 15 of 24 frames carrying captions, a page of
+    # dialogue, and the whole read voided because somebody said "assistant".
+    #
+    # A third rather than mostly_junk's half: "produced directed written
+    # starring" arrives together and densely, so a real roll clears this
+    # easily while a line of speech that happens to mention a producer does
+    # not.
+    credit_roll = bool(uniq) and len(credits) >= max(2, len(uniq) * 0.34)
     confirmed = (text_frames >= MIN_TEXT_FRAMES
                  and sum(len(w) for w in uniq) >= MIN_CHARS
-                 and bool(speech) and not credits
+                 and bool(speech) and not credit_roll
                  and not seen_before and not mostly_junk)
 
     if not confirmed:
@@ -524,9 +583,10 @@ def probe_one(file_id: int, samples: int = SAMPLES,
             why = (f"most of what was read ({', '.join(sorted(junk)[:4])}) "
                    f"matches words from findings you threw away, so this is "
                    f"the same bad read again rather than dialogue")
-        elif credits:
-            why = (f"the words read are a credit roll "
-                   f"({', '.join(sorted(credits)[:3])}), not speech")
+        elif credit_roll:
+            why = (f"{len(credits)} of the {len(uniq)} words read are credit-roll "
+                   f"words ({', '.join(sorted(credits)[:3])}) - a roll, not "
+                   f"speech")
         elif uniq and not speech:
             why = (f"words came back ({', '.join(uniq[:5])}) but none of them "
                    f"are the ones speech is made of - so a title card, a "
