@@ -38473,7 +38473,39 @@ function skPaint(force){
       <button class="rmb" onclick="skClearSel()">Clear</button>
       <span class="dim" style="font-size:10.5px">shift-click to take a range</span>
     </div>`:'';
-  const table=rows.length?`${markBar}${selBar}
+  // THE QUEUE'S QUESTIONS, AS ROWS. They were a block above the table, which
+  // made two lists of one thing - the header counts them together. Same nine
+  // columns; the question's own buttons sit in the answer column, and "just
+  // this one" travels with them.
+  const askRows=skAsksShown().slice(0,60).map(r=>(r.asks||[]).map(a=>{
+    const kind=a.kind||(a.q==='title'?(a.to||''):'');
+    const [word,col]=SKW[kind]||[kind||'','var(--dim)'];
+    const where=a.q==='picture'?'picture':(a.q==='title'&&a.ord!=null?`track ${a.ord+1}`:'—');
+    const title=a.q==='title'
+      ? `<span class="mono" style="font-size:10.5px">${esc(a.from||'')}</span>${
+          a.to?`<div class="dim" style="font-size:10px">→ ${esc(a.to)}</div>`:''}`
+      : '<span class="dim">—</span>';
+    const jk=r.file_id+':'+esc(a.q);
+    return `<tr style="background:rgba(232,163,61,.05)">
+      <td class="l"></td>
+      <td class="l" title="${esc(a.asking||'')}">${esc(r.name||'').replace(/\.[^.]+$/,'')}
+        <div class="dim" style="font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(a.asking||'')}</div></td>
+      <td class="c dim">${esc(r.library||'')}</td>
+      <td class="c dim"></td>
+      <td class="c"><span style="color:${a.q==='picture'?'#6fb0ff':'var(--dim)'}">${where}</span></td>
+      <td class="c"><span style="font-size:10.5px;color:${col}">${esc(word)}</span></td>
+      <td class="c mono" style="font-variant-numeric:tabular-nums;color:#e8a33d">${a.sure!=null?a.sure+'%':''}</td>
+      <td class="l">${title}</td>
+      <td class="r askhost"><span style="display:inline-flex;gap:5px;align-items:center;flex-wrap:wrap;justify-content:flex-end">${
+        (a.options||[]).map(o=>`<button class="rmb" title="${esc(o.what||'')}"
+           onclick="subAnswer(${r.file_id},'${esc(a.q)}','${esc(o.v)}',this,answerScope(this))">${esc(o.label||o.v)}</button>`).join('')}
+        <label class="dim" style="font-size:10px;display:inline-flex;gap:3px;align-items:center;cursor:pointer"
+          title="Off: remembered for the whole show and its release group. On: this file only.">
+          <input type="checkbox" class="askjust" style="margin:0" ${_askJust.has(jk)?'checked':''}
+            onchange="askJustToggle('${jk}', this.checked)">just this one</label></span></td>
+    </tr>`;}).join('')).join('');
+  const nAsk=skAsksShown().reduce((n,r)=>n+(r.asks||[]).length,0);
+  const table=(rows.length||askRows)?`${markBar}${selBar}
       <div class="rowbox scrollbox"><table class="sktbl" style="width:100%;font-size:11.5px;table-layout:fixed">
       <!-- FIXED LAYOUT, because an auto-laid table widens the whole page to
            fit its widest cell. Every cell clips; the row opens for the rest.
@@ -38499,7 +38531,7 @@ function skPaint(force){
         <th class="l" onclick="skSortBy('title')" title="For a track: what its title says now, and what it would be corrected to">title ${skSortMark('title')}</th>
         <th class="r" onclick="skSortBy('answer')" title="Sort by what there is to do">answer ${skSortMark('answer')}</th>
       </tr></thead>
-      <tbody>${rows.map(r=>{
+      <tbody>${askRows}${rows.map(r=>{
         const [word,col]=SKW[r.kind]||[r.kind||'','var(--dim)'];
         const on=_skSel.has(r.id), can=!r.done&&!r.unread;
         const pic=r.source==='picture', open=_skOpen.has(r.id);
@@ -38563,7 +38595,7 @@ function skPaint(force){
         // being 48 tracks nuarr has already decided to leave alone - listed
         // because a batch "Not dialogue" still applies to them, but not
         // waiting on anyone.
-        const ask=pick.filter(r=>r.auto==='ask').length, rest=pick.length-ask;
+        const ask=pick.filter(r=>r.auto==='ask').length+nAsk, rest=pick.length-(ask-nAsk);
         return `${ask?`${fmt(ask)} still to answer`:'nothing still to answer'}${
           rest?` · <span class="dim" title="Read, and nuarr has decided what to do with them on its own - most often to leave a title alone because it carries a name nuarr did not write. Shown because a batch answer can still apply to them.">${fmt(rest)} settled, shown</span>`:''}`;
       })()} · ${_skSort==='doubt'
@@ -38588,7 +38620,7 @@ function skPaint(force){
   // number-on-the-right as Reading, Being processed and the file list - this
   // was the last panel here still wearing its own.
   const html=`<div class="subsp" id="subsPanelInput">${
-    head}${skAskHtml()}${note}${key}${band}${prog}${hist}${
+    head}${note}${key}${band}${prog}${hist}${
     ''}${table}${foot}</div>`;
   scPaint('subs');
   if(!force && (askOpen('skPanel') || panelBusy('skPanel') || panelScrolled('skPanel'))) return;

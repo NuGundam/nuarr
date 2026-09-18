@@ -451,12 +451,18 @@ def _subread_pending(limit: int) -> list:
 def _subread_plan(r: dict) -> str:
     from . import hardsub
     if r["reader"] == "picture":
+        # THE CARD NAMES THE ENGINE. The OCR is one setting for the whole
+        # install now, so "the OCR" on a job card is a name withheld.
+        try:
+            eng = "PaddleOCR" if hardsub.ocr_engine() == "paddle" else "Tesseract"
+        except Exception:                                        # noqa: BLE001
+            eng = "the OCR"
         return json.dumps({
             "subread": "picture", "rewrite": False, "row": r["row"],
-            "summary": "sample the picture for burned-in subtitles",
+            "summary": f"sample the picture for burned-in subtitles · {eng}",
             "actions": [{"kind": "subread",
                          "what": f"sample {hardsub.SAMPLES} frames and show the "
-                                 f"bright text low in the picture to the OCR",
+                                 f"bright text low in the picture to {eng}",
                          "why": "the file reports no subtitle track, and words "
                                 "burned into the image are still subtitles",
                          "detail": ""}]})
