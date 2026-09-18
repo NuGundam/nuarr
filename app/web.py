@@ -39615,6 +39615,88 @@ async function loadAud(force){
 // want a tag corrected" over a library that is two-thirds read is a different
 // sentence from the same number over one that has been read through, and until
 // this bar existed there was no way to tell those apart.
+// WHAT THE LISTENING ESTABLISHED, not only how far it got.
+//
+// "unsure" is the one that was missing and it is the largest surprise on the
+// page: 3,818 tracks have been listened to and refused - three windows that
+// did not agree, or music, or silence - and they were being counted as read
+// with nothing to distinguish them from a track that came back named. A
+// reading that found nothing is knowledge; a reading that never happened is
+// not, and a bar that adds them together can say neither.
+function audListenFound(L){
+  const f=L.found||{};
+  if(f.named==null && f.unsure==null && f.unheard==null) return '';
+  const R=[
+    ['named', f.named, '#7fd18c',
+     'Three 30-second windows agreed on a language, above the confidence floor. This is the verdict the rules act on.'],
+    ['no confident answer', f.unsure, '#e8a33d',
+     'Listened to, and the windows did not agree - a dual-language track, a long musical stretch, or silence. A real result, not a gap: re-listening to the same audio gives the same answer, so these are not queued again.'],
+    ['not heard yet', f.unheard, '#9aa7b8',
+     'No verdict recorded against the bytes that are on the disk now. Nothing is decided about these - the tag is taken at its word until something has listened.'],
+  ].filter(x=>x[1]!=null);
+  return `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:7px">${
+    R.map(([label,n,col,tip])=>`<span class="capsc"
+        style="border-color:${col};color:${col};font-size:10.5px"
+        title="${esc(tip)}">${esc(label)} <b>${fmt(n||0)}</b></span>`).join('')
+  }</div>
+  <div class="dim" style="font-size:10.5px;margin-top:4px">one verdict per
+    audio track, and these three are every track there is — they come off the
+    same query as the bar, so a part cannot exceed its whole</div>`;
+}
+
+// WHAT THE LAST TRACK GAVE UP. Written where the verdict is stored, so a
+// single track listened to from this page counts the same as one from a pass.
+function audListenLastFound(L){
+  const H=L.last_found||{};
+  if(!H.name) return '';
+  const bits=[];
+  if(H.ok && H.code) bits.push(`<b style="color:var(--ok)">${esc(H.code)}</b> at ${fmt(H.sure||0)}%`);
+  else bits.push(`<span style="color:#e8a33d">no confident answer</span>${
+    H.why?` — ${esc(String(H.why).slice(0,70))}`:''}`);
+  return `<div style="font-size:12px;margin-top:5px;word-break:break-word;
+      white-space:normal;line-height:1.35"><span class="dim" style="font-size:10.5px;
+      letter-spacing:.04em;text-transform:uppercase;margin-right:8px">last heard</span>${
+      esc(H.name)}
+    <div class="dim" style="font-size:10.5px;margin-top:2px;padding-left:2px"
+      title="What this track actually yielded when it was listened to.">track ${
+      fmt((H.track||0)+1)} · ${bits.join(' · ')}</div></div>`;
+}
+
+// THE COVERAGE IN ITS OWN WORDS, so it cannot be read as knowledge.
+function audListenVisits(L){
+  const nxt = L.next_at ? Math.max(0, L.next_at - Date.now()/1000) : null;
+  return `<div class="dim" style="font-size:10.5px;margin-top:3px">
+    <span title="Files where every audio track has a verdict recorded against the bytes on the disk now.">${
+      fmt(L.files_done||0)} of ${fmt(L.files||0)} files heard through</span>${
+    L.files_untouched?` · <span title="Files where nothing has been listened to at all. Their language tags are being taken at their word.">${
+      fmt(L.files_untouched)} not listened to at all</span>`:''}${
+    L.stale?` · <span title="Verdicts recorded against bytes that have since been replaced - a re-download or a rewrite. They are not counted as heard, and the listener will come back to them.">${
+      fmt(L.stale)} verdicts outlived their file</span>`:''}${
+    nxt!=null?` · <span title="When the feeder next tops up the listen queue. The listening itself runs beside the transcodes, one heavy job per disk.">next look in ${
+      esc(hsDur(nxt))}</span>`:''}
+  </div>`;
+}
+
+// PER LIBRARY, because one library short of the rest is invisible in a single
+// figure for fifty-six thousand tracks.
+function audListenLibs(L){
+  const A=(L.by_library||[]).filter(x=>x.total);
+  if(A.length<2) return '';
+  return `<div style="display:flex;gap:5px;flex-wrap:wrap;margin-top:5px"
+      title="How much of each library has been listened to.">${
+    A.map(x=>{
+      // 100 MEANS NOTHING IS LEFT, here as on the bar above - these chips
+      // went on reading 100% over 39,368 of 39,394 after the bar had been
+      // taught not to.
+      let p=x.total?Math.round(100*x.heard/x.total):0;
+      if(x.heard<x.total && p>=100) p=99;
+      const col=p>=99?'var(--ok)':p>=40?'#e8a33d':'#9aa7b8';
+      return `<span class="capsc" style="font-size:10px;border-color:${col};color:${col}"
+        title="${esc(x.library)} — ${fmt(x.heard)} of ${fmt(x.total)} tracks heard">${
+        esc(x.library)} <b>${p}%</b> <span class="dim">${fmt(x.heard)}/${fmt(x.total)}</span></span>`;
+    }).join('')}</div>`;
+}
+
 function audListenHtml(){
   const L=_aud.listen||{};
   if(!L.total) return '';
@@ -39626,20 +39708,26 @@ function audListenHtml(){
           title="${esc(L.model?'model '+L.model:'')}">${esc(L.tool)}${L.model?' '+esc(L.model):''}</span>`:''}${
         L.hw?` <span class="capsc" style="border-color:${/gpu/i.test(L.hw)?'#7fd18c':'#e8a33d'};color:${/gpu/i.test(L.hw)?'#7fd18c':'#e8a33d'}"
           title="Which silicon the language identifier runs on. CUDA is an order of magnitude faster per track than the CPU.">${esc(L.hw)}</span> `:''}
-      ${num(L.done,'auto')} of ${num(L.total,'auto')}
-      <span style="font-size:10.5px">(${(L.pct||0).toFixed(0)}%)</span>
+      <span title="Audio tracks carrying a verdict recorded against the bytes that are on the disk now — out of the tracks those files actually have. This used to be rows in the verdict table over rows plus files: 2,520 of those rows were about files that no longer exist, so the bar read 100% while 43 tracks had never been heard.">${
+        num(L.done,'auto')} of ${num(L.total,'auto')} tracks heard</span>
+      <span style="font-size:10.5px">(${(L.pct||0).toFixed(1)}%)</span>
       ${L.each?` · <b style="color:var(--ok)">${L.each.toFixed(1)}s</b> a track`:''}
       ${L.eta?` · ${numt(hsDur(L.eta))} left`:''}${
       (L.queue&&(L.queue.queued||L.queue.running))
         ? ` · ${num(L.queue.running||0,'auto')} listening, ${num(L.queue.queued||0,'auto')} on the queue`:''}`,
-    right: L.left ? `${num(L.left,'auto')} <span class="dim">left to hear</span>`
-                  : '<b style="color:var(--ok)">all of it heard</b>',
-    body:`<div class="hsbar" style="margin-top:4px"><i style="width:${L.pct||0}%"></i></div>
+    right: L.left ? `${num(L.left,'auto')} <span class="dim">tracks left to hear</span>`
+                  : '<b style="color:var(--ok)">every track heard</b>',
+    body:`<div class="hsbar${busy?' live':''}" style="margin-top:4px"><i style="width:${L.pct||0}%"></i></div>
       ${L.current?`<div style="font-size:12px;margin-top:5px;word-break:break-word;
           white-space:normal;line-height:1.35"
           title="the file being listened to now"><span class="dim" style="font-size:10.5px;
-          letter-spacing:.04em;text-transform:uppercase;margin-right:8px">listening to</span>${
-          esc(L.current)}</div>`:''}
+          letter-spacing:.04em;text-transform:uppercase;margin-right:8px"><span
+          class="busy" style="color:var(--acc)"><span class="sp"></span></span>
+          listening to</span>${esc(L.current)}</div>`:''}
+      ${audListenLastFound(L)}
+      ${audListenFound(L)}
+      ${audListenVisits(L)}
+      ${audListenLibs(L)}
       <div class="subswhy">Five 30-second windows per track, through Whisper's
         language identifier. This is the expensive half of the page and the
         only part that reads a file — everything below it is decided from what
@@ -40933,7 +41021,9 @@ function subsScanLibs(sc){
   return `<div style="display:flex;gap:5px;flex-wrap:wrap;margin-top:5px"
       title="How much of each library nuarr has been able to read inside.">${
     L.map(x=>{
-      const p=x.total?Math.round(100*x.read/x.total):0;
+      // Same rule as the audio chips: 100 is reserved for finished.
+      let p=x.total?Math.round(100*x.read/x.total):0;
+      if(x.read<x.total && p>=100) p=99;
       const col=p>=90?'var(--ok)':p>=40?'#e8a33d':'#9aa7b8';
       return `<span class="capsc" style="font-size:10px;border-color:${col};color:${col}"
         title="${esc(x.library)} — ${fmt(x.read)} of ${fmt(x.total)} read inside">${
@@ -40954,7 +41044,11 @@ function subsScanHtml(){
   const f=sc.found||{};
   const read=(sc.read_inside!=null)
     ? sc.read_inside : Math.max(0,(sc.counted||0)-(f.unread||0));
-  const pct=sc.total?Math.max(0,Math.min(100,100*read/sc.total)):0;
+  // 100 IS RESERVED FOR FINISHED - the audio bar printed 100.0% over 28
+  // unheard tracks because 99.9504 rounds up, and this one rounds to a whole
+  // number, so it would do the same thing one percent sooner.
+  let pct=sc.total?Math.max(0,Math.min(100,100*read/sc.total)):0;
+  if((f.unread||0)>0 && pct>99) pct=99;
   const done=read;
   // STATE["last"] is cleared at the top of every pass, so a pass that finds
   // nothing stale blanks it - and the last-read line vanishes even though a

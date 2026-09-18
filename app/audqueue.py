@@ -362,8 +362,16 @@ def _to_hand_over(depth: int) -> tuple:
         # NOT A FILE THAT IS NO LONGER THERE - see the same join in subqueue,
         # where it was costing 18,667 dead jobs. Nothing has gone wrong here
         # yet; the guard is the same size as the bug it prevents.
+        # AND THE PATH THE FILE IS AT NOW, not the one it was at when the
+        # row was made. The row stores a path; the renamer moves the file
+        # afterwards; the worker opens the stored path and reports the file
+        # is not there. That is what it cost sub_queue - 151 false skips a
+        # day - and this queue is not doing it (0 rows drifted when it was
+        # checked, because header edits drain in seconds and leave no window
+        # for a rename). f.path is the better answer whenever there is one.
         rows = [dict(r) for r in cur.execute(
-            "SELECT q.file_id, q.path, q.name, q.steps, q.why, q.disk "
+            "SELECT q.file_id, COALESCE(NULLIF(f.path,''), q.path) AS path, "
+            "       q.name, q.steps, q.why, q.disk "
             "  FROM aud_queue q LEFT JOIN files f ON f.id = q.file_id "
             " WHERE q.state=? AND f.id IS NOT NULL "
             "   AND (f.state IS NULL OR f.state NOT IN ('deleted','duplicate')) "

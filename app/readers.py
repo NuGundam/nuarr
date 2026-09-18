@@ -39,6 +39,9 @@ from .db import cursor
 # queue: there are fourteen thousand unheard tracks and putting all of them in
 # the jobs table would make the queue panel a scrollbar.
 DEPTH = {"listen": 60, "subread": 120}
+
+# When the verdict table was last swept, and what went. See watch().
+_PRUNE: dict = {"at": 0.0, "last": {}}
 FEED_S = 60.0
 
 STATE: dict = {"listen": {"fed": 0, "on_queue": 0, "at": 0.0},
@@ -549,6 +552,25 @@ async def watch() -> None:
             pass
         try:
             await topup_subread()
+        except Exception:                                        # noqa: BLE001
+            pass
+        # AND THE VERDICT TABLE IS TIDIED HERE, NOT BY A BUTTON.
+        #
+        # audio_lang had 1,801 rows whose file_id is not in `files` at all and
+        # 719 for files marked deleted or duplicate. forget() and invalidate()
+        # are per-file and are called from paths that KNOW a file changed;
+        # nothing answered for the rows nobody was told about. Because the
+        # listening bar counted the table's rows as library read, all 2,520
+        # were reported as tracks heard.
+        #
+        # Hourly, off the feeder that is already awake, and only when nothing
+        # is listening - two DELETEs against an index, but there is no reason
+        # for them to land in the middle of a pass.
+        try:
+            from . import audiolang as _al_prune
+            if time.time() - _PRUNE["at"] > 3600:
+                _PRUNE["at"] = time.time()
+                _PRUNE["last"] = await asyncio.to_thread(_al_prune.prune)
         except Exception:                                        # noqa: BLE001
             pass
         # THE MODEL GIVES ITS VRAM BACK WHEN THERE IS NOTHING TO HEAR. run_once

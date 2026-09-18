@@ -1249,9 +1249,26 @@ def cached(file_id: int, track: int, path: str) -> dict | None:
             "cached": True}
 
 
+# WHAT THE LAST TRACK GAVE UP. The file's name proves the listener is alive
+# and says nothing about what it learned, which is the question being asked -
+# the same reason the subtitle scanner keeps last_found. Written here rather
+# than in the job, so a single track listened to from the page counts too.
+LAST_HEARD: dict = {"name": "", "track": 0, "code": "", "sure": 0,
+                    "ok": False, "why": "", "at": 0.0}
+
+
 def store(file_id: int, track: int, path: str, res: dict) -> None:
     import json as _json
     size, mtime = _stat(path)
+    try:
+        LAST_HEARD.update(
+            name=os.path.basename(path or ""), track=int(track),
+            code=str(res.get("code") or ""),
+            sure=int(round(float(res.get("confidence") or 0) * 100)),
+            ok=bool(res.get("ok")), why=str(res.get("why") or "")[:120],
+            at=time.time())
+    except Exception:                                    # noqa: BLE001
+        pass
     ensure_table()
     mismatches_expire()
     with cursor() as cur:
@@ -1542,7 +1559,15 @@ def pending(limit: int = 5000) -> list[dict]:
                 "SELECT id, path, title, season, episode, library, audio_langs, "
                 "       size, mtime "
                 "  FROM files "
-                " WHERE state!='deleted' AND audio_langs IS NOT NULL "
+                # THE SAME LIVE FILE unverified() MEANS. This said
+                # state != 'deleted', which also admits 'duplicate' and every
+                # state a file passes through while it is still landing.
+                # Nothing had come through the gap when it was measured - 0
+                # duplicates and 0 mid-import files with a blank tag - but
+                # two spellings of one question is how the counts on this
+                # page came to disagree in the first place.
+                " WHERE state IN ('done','eligible') "
+                "   AND audio_langs IS NOT NULL "
                 "   AND (audio_langs = '-' OR audio_langs LIKE '-,%' "
                 "        OR audio_langs LIKE '%,-' OR audio_langs LIKE '%,-,%')"
             ).fetchall()
@@ -1830,8 +1855,16 @@ def queue_count() -> int:
         return 0
 
 
-def unverified(limit: int = 5000) -> list[dict]:
+def unverified(limit: int = 5000, count_only: bool = False):
     r"""Tracks that CARRY a tag nobody has ever checked against the audio.
+
+    COUNT_ONLY RETURNS THE NUMBER THIS WOULD HAVE RETURNED ROWS FOR, and it
+    exists so the tile and the backlog cannot be different questions. They
+    were: unverified_count() counted FILES with no verdict row at all, this
+    returns TRACKS and tests freshness, and the page showed 15 over a list of
+    43. A second query written to agree would be a second thing to keep in
+    agreement, so there is one loop, one predicate, one set of rows, and the
+    flag decides only whether a dict is built for each hit.
 
     THE HOLE THIS FILLS, AND HOW IT WAS FOUND. pending() returns tracks whose
     language tag is missing - `audio_langs` holding a "-" - and listens to
@@ -1854,6 +1887,7 @@ def unverified(limit: int = 5000) -> list[dict]:
     had ever been read - so it is drained after pending(), never instead of it.
     """
     out: list[dict] = []
+    n = 0
     try:
         ensure_table()
         with cursor() as cur:
@@ -1878,9 +1912,9 @@ def unverified(limit: int = 5000) -> list[dict]:
                 " ORDER BY (state='eligible') DESC, id DESC").fetchall()
             busy = _busy_files(cur)
     except Exception:                                    # noqa: BLE001
-        return out
+        return n if count_only else out
     for r in rows:
-        if len(out) >= limit:
+        if not count_only and len(out) >= limit:
             break
         if r["id"] in busy:
             continue                        # see _busy_files
@@ -1900,12 +1934,15 @@ def unverified(limit: int = 5000) -> list[dict]:
             if prev is not None and prev[0] == int(r["size"] or 0) \
                     and abs(prev[1] - float(r["mtime"] or 0)) <= 1.0:
                 continue
+            n += 1
+            if count_only:
+                continue
             out.append({"file_id": r["id"], "path": r["path"], "track": ai,
                         "title": r["title"] or "", "season": r["season"],
                         "episode": r["episode"], "library": r["library"] or "",
                         "tagged": raw_code,
                         "n_audio": len(codes)})
-    return out
+    return n if count_only else out
 
 
 _PACE = {"at": 0.0, "each": 0.0}
@@ -1949,18 +1986,27 @@ def secs_each_seen(sample: int = 400) -> float:
 
 
 def unverified_count() -> int:
-    """How many tagged tracks have never been listened to."""
+    r"""How many tagged tracks have never been listened to.
+
+    THE SAME QUESTION unverified() ANSWERS, because it is the same call. This
+    used to be its own SQL - COUNT(*) over FILES with NOT EXISTS(any verdict
+    row) - and it disagreed with the list in both directions at once:
+
+        files, not tracks   a file with two tracks and one heard counted as
+                            done here and appeared in the list there
+        no freshness test   a verdict recorded against bytes that have since
+                            been replaced counted as heard here and was
+                            re-listened to there
+
+    Measured before the change: this said 15, unverified() returned 43 tracks
+    across 19 files, and the tile above the backlog contradicted the backlog.
+
+    It costs one pass over the verdict table - 0.4s across 59,000 rows - and
+    aud.listening() holds it for thirty seconds, so the page polls do not pay
+    for it. Being right and cached beats being cheap and wrong.
+    """
     try:
-        ensure_table()
-        with cursor() as cur:
-            r = cur.execute(
-                "SELECT COUNT(*) n FROM files f "
-                " WHERE f.state IN ('done','eligible') "
-                "   AND COALESCE(f.audio_langs,'') != '' "
-                "   AND f.audio_langs != '-' "
-                "   AND NOT EXISTS (SELECT 1 FROM audio_lang a "
-                "                    WHERE a.file_id = f.id)").fetchone()
-        return int(r["n"] or 0)
+        return int(unverified(limit=0, count_only=True) or 0)
     except Exception:                                    # noqa: BLE001
         return 0
 
@@ -2656,6 +2702,152 @@ def auto_pass(force: bool = False) -> dict:
                    + (f", {out['failed']} could not be" if out["failed"] else "")
                    + (f" - {out['queued']} wait for the next pass"
                       if out["queued"] else ""), "info", system="audiolang")
+    return out
+
+
+# ONE DEFINITION OF A FILE WORTH HAVING AN OPINION ABOUT, so every count on
+# this page is over the same population. pending() said state != 'deleted'
+# and unverified() said state IN ('done','eligible'); nothing had slipped
+# through the gap today, but they are the same question and one of them was
+# going to be wrong eventually.
+LIVE_STATES = ("done", "eligible")
+_LIVE_WHERE = ("f.state IN ('done','eligible') "
+               "AND COALESCE(f.audio_langs,'') <> ''")
+
+
+def prune() -> dict:
+    r"""Drop verdicts about files that are not there any more.
+
+    WHY forget() AND invalidate() WERE NOT ENOUGH. Both are per-file and both
+    are called from a path that KNOWS the file changed - a rewrite, a delete
+    nuarr performed. Nothing answers for the rows nobody was told about: a
+    file removed outside nuarr, a row re-keyed to a duplicate, an id that
+    stopped existing between one scan and the next.
+
+    Measured before this existed: 1,801 rows whose file_id is not in `files`
+    at all, and 719 for files marked deleted or duplicate. 2,520 verdicts
+    about nothing - and because listening() counted the table's rows as work
+    done, every one of them was being reported as a track of the library
+    read. That is the shape of the bug this whole audit keeps finding: a
+    record that outlived its subject, then read as knowledge.
+
+    subneed.prune() is the same function for the subtitle page, written for
+    the same reason and called from the same place - the sweep, not a button.
+    """
+    out = {"orphans": 0, "dead": 0}
+    try:
+        ensure_table()
+        with cursor() as cur:
+            cur.execute(
+                "DELETE FROM audio_lang WHERE file_id NOT IN "
+                "  (SELECT id FROM files)")
+            out["orphans"] = int(cur.rowcount or 0)
+            cur.execute(
+                "DELETE FROM audio_lang WHERE file_id IN "
+                "  (SELECT id FROM files WHERE state IN ('deleted','duplicate'))")
+            out["dead"] = int(cur.rowcount or 0)
+    except Exception:                                    # noqa: BLE001
+        pass
+    return out
+
+
+def counts() -> dict:
+    r"""How much of the library has actually been heard, over what.
+
+    ONE QUERY, so a part can never exceed its whole - the rule the subtitle
+    scanner's counts() was rebuilt around after its panel reported more files
+    "not read yet" than it had files.
+
+    THE TOTAL IS TRACKS THAT EXIST, not rows that have been written. It is
+    summed from files.audio_langs, which is what the scanner recorded for the
+    file that is on the disk now, so a verdict about a file that is gone
+    cannot inflate it and neither can a verdict about a track a rewrite
+    removed. The old total was COUNT(*) over the verdict table plus a count
+    of files, which is two units added together over a population including
+    2,520 rows about files that no longer exist.
+
+    HEARD IS FRESH AND IN RANGE. A row counts only when its size and mtime
+    match the file's - the same fingerprint every reader here uses - and only
+    when its track number is one the file still has.
+    """
+    out = {"files": 0, "tracks": 0, "heard": 0, "left": 0, "pct": 0.0,
+           "files_done": 0, "files_untouched": 0,
+           "found": {"named": 0, "unsure": 0, "unheard": 0},
+           "stale": 0, "orphans": 0, "by_library": []}
+    # nt: how many audio tracks the file has now, from the extracted column.
+    # hd: how many of them carry a verdict written for THESE bytes.
+    inner = (
+        "SELECT f.id AS id, COALESCE(f.library,'?') AS library, "
+        "       (LENGTH(f.audio_langs) "
+        "        - LENGTH(REPLACE(f.audio_langs,',','')) + 1) AS nt, "
+        "       COUNT(a.file_id) AS hd, "
+        "       SUM(CASE WHEN COALESCE(a.ok,0)=1 THEN 1 ELSE 0 END) AS okn "
+        "  FROM files f "
+        "  LEFT JOIN audio_lang a "
+        "    ON a.file_id = f.id "
+        "   AND a.size = COALESCE(f.size,0) "
+        "   AND ABS(COALESCE(a.mtime,0) - COALESCE(f.mtime,0)) <= 1.0 "
+        "   AND a.track < (LENGTH(f.audio_langs) "
+        "                  - LENGTH(REPLACE(f.audio_langs,',','')) + 1) "
+        " WHERE " + _LIVE_WHERE +
+        " GROUP BY f.id")
+    try:
+        ensure_table()
+        with cursor() as cur:
+            r = cur.execute(
+                "SELECT COUNT(*) AS files, "
+                "       COALESCE(SUM(nt),0)  AS tracks, "
+                "       COALESCE(SUM(hd),0)  AS heard, "
+                "       COALESCE(SUM(okn),0) AS named, "
+                "       SUM(CASE WHEN hd >= nt THEN 1 ELSE 0 END) AS whole, "
+                "       SUM(CASE WHEN hd = 0  THEN 1 ELSE 0 END) AS none "
+                "  FROM (" + inner + ")").fetchone()
+            out["files"] = int(r["files"] or 0)
+            out["tracks"] = int(r["tracks"] or 0)
+            out["heard"] = int(r["heard"] or 0)
+            out["files_done"] = int(r["whole"] or 0)
+            out["files_untouched"] = int(r["none"] or 0)
+            named = int(r["named"] or 0)
+            out["left"] = max(0, out["tracks"] - out["heard"])
+            # 100 IS RESERVED FOR FINISHED. The first live reading of this bar
+            # was 56,413 of 56,441 with 28 tracks still to hear, and it
+            # printed 100.0% - round(99.9504, 1) is 100.0. The entire point of
+            # rebuilding the count was that the panel should stop claiming the
+            # library had been heard through when it had not, and the rounding
+            # put that back one decimal place lower. So it is floored while
+            # anything is outstanding.
+            pct = (100.0 * out["heard"] / out["tracks"]) if out["tracks"] else 0.0
+            if out["left"] and pct >= 99.95:
+                pct = 99.9
+            out["pct"] = round(pct, 1)
+            # A TRACK HEARD AND REFUSED IS NOT A TRACK UNHEARD. The three
+            # come off the query above, so they add up to `tracks` exactly.
+            out["found"] = {"named": named,
+                            "unsure": max(0, out["heard"] - named),
+                            "unheard": out["left"]}
+            # The two populations the sweep is carrying, named rather than
+            # summed - they answer "what is it waiting on", not "how far".
+            out["by_library"] = [
+                {"library": x["library"], "total": int(x["nt"] or 0),
+                 "heard": int(x["hd"] or 0)}
+                for x in cur.execute(
+                    "SELECT library, SUM(nt) AS nt, SUM(hd) AS hd "
+                    "  FROM (" + inner + ") GROUP BY library "
+                    " ORDER BY nt DESC")]
+            out["stale"] = int(cur.execute(
+                "SELECT COUNT(*) n FROM audio_lang a JOIN files f "
+                "    ON f.id = a.file_id "
+                " WHERE a.size <> COALESCE(f.size,0) "
+                "    OR ABS(COALESCE(a.mtime,0) - COALESCE(f.mtime,0)) > 1.0"
+            ).fetchone()["n"] or 0)
+            out["orphans"] = int(cur.execute(
+                "SELECT COUNT(*) n FROM audio_lang a "
+                " WHERE a.file_id NOT IN (SELECT id FROM files) "
+                "    OR a.file_id IN (SELECT id FROM files "
+                "                      WHERE state IN ('deleted','duplicate'))"
+            ).fetchone()["n"] or 0)
+    except Exception:                                    # noqa: BLE001
+        pass
     return out
 
 

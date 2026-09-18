@@ -565,7 +565,7 @@ def answered() -> dict:
 
 # ------------------------------------------------------------- the reading --
 _DEV: dict = {"at": 0.0, "data": {}}
-_LEFT: dict = {"at": 0.0, "n": 0}
+_LEFT: dict = {"at": 0.0, "n": 0, "c": {}}
 
 
 def _device() -> dict:
@@ -601,24 +601,36 @@ def listening() -> dict:
     out = {"left": 0, "done": 0, "total": 0, "pct": 0.0, "rate": 0.0,
            "eta": 0, "state": "", "current": "", "each": 0.0}
     now = time.time()
+    # ONE QUERY BEHIND EVERY NUMBER IN THIS PANEL, held for thirty seconds.
+    #
+    # This used to be two, and they were not the same question. `done` was
+    # SELECT COUNT(*) FROM audio_lang - every verdict ever written, including
+    # 2,520 about files that are not in the files table or are marked deleted
+    # - and `left` was unverified_count(), a count of FILES. The whole was
+    # the two added together, so the bar was tracks plus files over a
+    # numerator padded with the dead, and it read:
+    #
+    #     58,958 of 58,973   (100.0%)   what the page said
+    #     56,420 of 56,463   ( 99.9%)   what was true, 43 tracks to hear
+    #
+    # counts() answers all of it at once from the files that are there: the
+    # total is audio tracks summed off files.audio_langs, heard is verdicts
+    # whose size and mtime match the file and whose track the file still has.
+    # A part cannot exceed its whole because there is one whole.
     if now - _LEFT["at"] > 30:
         try:
-            _LEFT.update(at=now, n=int(audiolang.unverified_count() or 0))
+            _LEFT.update(at=now, c=(audiolang.counts() or {}))
         except Exception:                                        # noqa: BLE001
             _LEFT["at"] = now
-    left = int(_LEFT["n"])
+    c = _LEFT.get("c") or {}
+    left = int(c.get("left") or 0)
+    total = int(c.get("heard") or 0)
+    whole = int(c.get("tracks") or 0)
+    _LEFT["n"] = left
     try:
         p = audiolang.progress() or {}
     except Exception:                                            # noqa: BLE001
         p = {}
-    try:
-        from .db import cursor
-        with cursor() as cur:
-            total = int(cur.execute(
-                "SELECT COUNT(*) n FROM audio_lang").fetchone()["n"] or 0)
-    except Exception:                                            # noqa: BLE001
-        total = 0
-    whole = total + left
     # THE LISTENER IS ON THE MAIN QUEUE NOW, so "is it moving" is read from
     # the jobs table - how many listen jobs are queued and running, and which
     # file the running one is on - rather than from the old pass's PROGRESS,
@@ -629,11 +641,43 @@ def listening() -> dict:
     except Exception:                                            # noqa: BLE001
         q = {"queued": 0, "running": 0, "now": ""}
     out.update(left=left, done=total, total=whole,
-               pct=round(100.0 * total / whole, 1) if whole else 0.0,
+               # THE PERCENTAGE COMES WITH THE COUNTS. It was recomputed here
+               # - the same division, rounded the same way - and that second
+               # copy is why the floor added to counts() had no effect: the
+               # bar went on reading 100.0% over 17 unheard tracks because
+               # round(99.9699, 1) is 100.0. One number, one place.
+               pct=float(c.get("pct") or 0.0),
                state=("listening" if q.get("running")
                       else str(p.get("state") or "idle")),
                current=str(q.get("now") or p.get("current") or ""),
-               queue=q)
+               queue=q,
+               # WHAT IT IS ESTABLISHING, not only how far it has got - the
+               # subtitle scanner's chips, for the same reason. These three
+               # come off the same query as the totals, so they sum to it.
+               found=(c.get("found") or {}),
+               by_library=(c.get("by_library") or []),
+               files=int(c.get("files") or 0),
+               files_done=int(c.get("files_done") or 0),
+               files_untouched=int(c.get("files_untouched") or 0),
+               stale=int(c.get("stale") or 0),
+               orphans=int(c.get("orphans") or 0))
+    # WHAT THE LAST TRACK GAVE UP, and when the feeder next looks. A name
+    # alone proves the listener is alive and says nothing about what it
+    # learned; the countdown is what stops "nothing is happening" from
+    # looking like "it has stopped".
+    try:
+        lh = dict(getattr(audiolang, "LAST_HEARD", None) or {})
+        if lh.get("name"):
+            out["last_found"] = lh
+    except Exception:                                            # noqa: BLE001
+        pass
+    try:
+        from . import readers
+        at = float((readers.STATE.get("listen") or {}).get("at") or 0)
+        if at:
+            out["next_at"] = at + float(getattr(readers, "FEED_S", 60.0))
+    except Exception:                                            # noqa: BLE001
+        pass
     # WHICH TOOL, ON WHICH SILICON. The listener is Whisper's language
     # identifier through ctranslate2, on CUDA when the packages and a card are
     # there and on the CPU otherwise - and the two differ by an order of
