@@ -526,11 +526,18 @@ async def topup_subread(depth: int | None = None) -> dict:
 
 
 def subread_one(reader: str, row: dict, on_stage=None) -> dict:
+    r"""Read one file, saying where it has got to as it goes.
+
+    on_stage(text, pct) is the job card's bar. It used to be called once with
+    0.0 and then nothing for the next eighteen seconds, which the card drew as
+    an indeterminate sweep and a row of dashes - it had nothing else to go on.
+    Both readers report their real stages now; see hardsub.probe_one.
+    """
     from . import hardsub, subtitletitle as stt
     if reader == "picture":
         if on_stage:
             on_stage(f"sampling {hardsub.SAMPLES} frames", 0.0)
-        r = hardsub._do_one(row)
+        r = hardsub._do_one(row, report=on_stage)
         if r.get("ok"):
             r["why"] = {"none": "nothing in the picture",
                         "signs": "signs or songs in the picture",
@@ -539,8 +546,8 @@ def subread_one(reader: str, row: dict, on_stage=None) -> dict:
                 str(r.get("state") or ""), f"read as {r.get('state')}")
         return r
     if on_stage:
-        on_stage("reading the subtitle events", 0.0)
-    r = stt._do_one(row)
+        on_stage("pulling the track out", 0.0)
+    r = stt._do_one(row, report=on_stage)
     if r.get("ok"):
         r["why"] = ("signs after all - cleared" if r.get("cleared")
                     else "the events say dialogue - it stays on the list")

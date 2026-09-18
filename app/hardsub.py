@@ -500,8 +500,21 @@ def _words(text: str) -> list:
 
 # ------------------------------------------------------------- the verdict --
 def probe_one(file_id: int, samples: int = SAMPLES,
-              confirm: int = CONFIRM) -> dict:
-    r"""Does this file carry burned-in text, and of what kind."""
+              confirm: int = CONFIRM, on=None) -> dict:
+    r"""Does this file carry burned-in text, and of what kind.
+
+    `on(text, pct)` is called as it goes, if given. The work is in three
+    parts and they cost very different amounts - 48 ffmpeg decodes, then a
+    handful of OCR calls, then a short walk down under the brightness floor -
+    so the percentage is divided between them in that proportion rather than
+    evenly. See the card in Processing System.
+    """
+    def _say(text, pct):
+        if on:
+            try:
+                on(text, float(pct))
+            except Exception:                                    # noqa: BLE001
+                pass
     with cursor() as cur:
         row = cur.execute("SELECT id, path, duration, size, sub_langs "
                           "FROM files WHERE id=?", (int(file_id),)).fetchone()
@@ -524,17 +537,27 @@ def probe_one(file_id: int, samples: int = SAMPLES,
     # ACROSS LANES, NOT ONE AFTER ANOTHER. Each _bright is a subprocess that
     # spends its life waiting on a spinning disk, so the GIL is free the whole
     # time and the pool has twelve disks to answer from.
-    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     low, high, read = [], [], 0
     with ThreadPoolExecutor(max_workers=LANES) as ex:
         futs = {ex.submit(_bright, path, t, b): (t, b)
                 for t in marks for b in (LOW_BAND, HIGH_BAND)}
         got: dict = {}
-        for f, (t, b) in futs.items():
+        # AS THEY FINISH, NOT IN THE ORDER THEY WERE SUBMITTED. Twelve lanes
+        # answer in whatever order the disks feel like; waiting on the first
+        # while eleven others are already done makes a progress bar stand
+        # still and then jump. Same results, same cost, honest movement.
+        done_n, total_n = 0, max(1, len(futs))
+        for f in as_completed(futs):
+            t, b = futs[f]
             try:
                 got[(t, b)] = f.result()
             except Exception:                                # noqa: BLE001
                 got[(t, b)] = -1
+            done_n += 1
+            if done_n % 2 == 0 or done_n == total_n:
+                _say(f"measuring frame {min(samples, (done_n + 1) // 2)} "
+                     f"of {samples}", 55.0 * done_n / total_n)
     for t in marks:
         c = got.get((t, LOW_BAND), -1)
         if c < 0:
@@ -577,7 +600,11 @@ def probe_one(file_id: int, samples: int = SAMPLES,
                        key=lambda x: -x[1])
         cand += spare[:max(0, confirm) - len(cand)]
     lit: list = []                       # brightness of frames that held words
-    for t, _c in cand[:max(0, confirm)]:
+    _shown = cand[:max(0, confirm)]
+    _eng = "PaddleOCR" if ocr_engine() == "paddle" else "Tesseract"
+    for _i, (t, _c) in enumerate(_shown, 1):
+        _say(f"reading frame {_i} of {len(_shown)} \u00b7 {_eng}",
+             55.0 + 33.0 * (_i - 1) / max(1, len(_shown)))
         got = [w.lower() for w in _words(_read_text(path, t, LOW_BAND))
                if len(w) >= 3]
         # TWO REAL WORDS IN ONE FRAME, not two glyphs across four frames.
@@ -635,6 +662,7 @@ def probe_one(file_id: int, samples: int = SAMPLES,
         # the middle of THAT, and if it reads as speech the floor moves down
         # and the question is asked again. The walk stops the moment a probe
         # comes back as noise, which is where this file's captions end.
+        _say("looking under the brightness floor", 88.0)
         for _step in range(3):
             edge = min(lit) if lit else MIN_PX
             below = sorted(((t, c) for t, c in low
@@ -2090,9 +2118,14 @@ def _pending() -> list:
 
 def _do_one(r: dict, report=None) -> dict:
     """Sample one file's frames, save the verdict, and act if auto says so."""
-    d = probe_one(r["file_id"])
+    d = probe_one(r["file_id"], on=report)
     if not d.get("ok"):
         return {"ok": False, "why": d.get("why") or "could not sample it"}
+    if report:
+        try:
+            report("saving the verdict", 97.0)
+        except Exception:                                        # noqa: BLE001
+            pass
     _save(d)
     if d["state"] != NONE and mode() == "auto":
         _auto_one(r["file_id"])

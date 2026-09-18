@@ -894,11 +894,23 @@ def _pending() -> list:
 
 def _do_one(r: dict, report=None) -> dict:
     """Read one track's events and judge what it actually carries."""
+    def _say(text, pct):
+        if report:
+            try:
+                report(text, float(pct))
+            except Exception:                                    # noqa: BLE001
+                pass
+    # TWO PARTS, AND ONLY ONE OF THEM WAITS. mkvextract pulls perhaps forty
+    # kilobytes of events off a pool disk, which is a seek and a read on a
+    # disk that may be spun down; counting the styles afterwards is instant.
+    # So the demux gets the bar and the parse gets the last few per cent.
+    _say("pulling the track out with mkvextract", 10.0)
     try:
         sh = shape_of(r["file_id"], r["path"], r["track"],
                       int(r.get("size") or 0), r["mkv_id"])
     except Exception as e:                                       # noqa: BLE001
         return {"ok": False, "why": f"{type(e).__name__}: {e}"}
+    _say(f"judging {int((sh or {}).get('events') or 0):,} events", 90.0)
     # A READ THAT FAILED IS NOT A VERDICT OF DIALOGUE. shape_of returns None
     # when the track cannot be read, and this used to fall through to
     # cleared=False - which the caller words as "the events say dialogue".

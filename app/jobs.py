@@ -973,10 +973,24 @@ class Worker:
                     "why": "the language identifier over five 30-second "
                            "windows; the audio is decoded by ffmpeg first"}
         if kind == "subread":
-            if "sampl" in st:
-                return {"tool": "ffmpeg + Tesseract", "hw": "CPU",
-                        "why": "frames decoded and the bright text low in the "
-                               "picture shown to the OCR"}
+            # WHICH OCR, ASKED RATHER THAN TYPED. This said Tesseract while
+            # the action line on the same card said PaddleOCR - two lines of
+            # one card disagreeing about which program is running, because
+            # the name was hardcoded here when Tesseract was the only one.
+            if "sampl" in st or "frame" in st or "floor" in st:
+                try:
+                    from . import hardsub as _hs
+                    eng = ("PaddleOCR" if _hs.ocr_engine() == "paddle"
+                           else "Tesseract")
+                except Exception:                        # noqa: BLE001
+                    eng = "the OCR"
+                return {"tool": f"ffmpeg + {eng}", "hw": "CPU",
+                        "why": f"frames decoded and the bright text low in "
+                               f"the picture shown to {eng}"}
+            if "verdict" in st:
+                return {"tool": "sqlite", "hw": "disk",
+                        "why": "writing what the frames said, and re-planning "
+                               "the file if the answer moved"}
             return {"tool": "mkvextract", "hw": "disk",
                     "why": "pulling the track out to read its events"}
         if kind == "decode":

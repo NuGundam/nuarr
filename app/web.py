@@ -25189,7 +25189,8 @@ function wkStatsHtml(w, pct, indet){
       ? ' title="estimated from bytes written — ffmpeg reports no usable output timeline for this file"'
       : ''}>${indet?'—':pct.toFixed(1)+'%'
       }${(w.by_bytes&&w.stage==='encoding')?'<span class="dim" style="font-size:10px">~</span>':''}</span>
-    ${(w.kind==='subs'||w.kind==='audio'||w.kind==='decode')
+    ${(w.kind==='subs'||w.kind==='audio'||w.kind==='decode'
+       ||w.kind==='subread'||w.kind==='listen')
       // NO FPS AND NO SPEED, BECAUSE THERE IS NO VIDEO TIMELINE. These jobs
       // move bytes and write headers; two dashes where a number belongs read
       // as "something is missing", and nothing is. The bytes moved are on
