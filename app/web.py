@@ -41020,17 +41020,15 @@ function subsScanFound(sc){
     ['not opened yet',         f.unread,  '#9aa7b8', 'nothing has looked',
      'No probe behind the row, so what is inside is genuinely unknown. Nothing is decided about these: a rule needs something to compare against.'],
   ].filter(x=>x[1]!=null);
-  return `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:7px">${
+  return `<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:8px">
+    <span class="dim" style="font-size:10px;letter-spacing:.04em;text-transform:uppercase;margin-right:2px"
+      title="Every file is asked all five of these in one pass — one sweep, not five — and a file can answer yes to more than one. The small grey word on each chip is what actually answered it.">found so far</span>${
     R.map(([label,n,col,tool,tip])=>`<span class="capsc"
         style="border-color:${col};color:${col};font-size:10.5px"
         title="${esc(tip)}">${esc(label)} <b>${fmt(n||0)}</b>${
         tool?` <span class="dim" style="font-size:9.5px">${esc(tool)}</span>`:''
         }</span>`).join('')
-  }</div>
-  <div class="dim" style="font-size:10.5px;margin-top:4px">every file is asked
-    all five of these in one pass — one sweep, not five — and a file can
-    answer yes to more than one. The small grey word on each is what actually
-    answered it.</div>`;
+  }</div>`;
 }
 
 // WHAT THE LAST FILE GAVE UP. Its name alone proves the sweep is alive and
@@ -41109,24 +41107,70 @@ function subsReadersLeft(sc){
   return (sc.readers||[]).reduce((n,r)=>n+(r.left||0), 0);
 }
 
+// WHO READS WHAT EACH READER WROTE. This is the fact that makes the page
+// hang together - the three readers each fill a table, and every other panel
+// on the page is a judge of one or more of those tables - and it was written
+// nowhere. Each entry is a panel on this page, and the link opens it.
+const SUBS_READER_FEEDS={
+  facts:[
+    ['board',    'What nuarr may do on its own',
+     'The sidecar, duplicate and title rows of the switchboard are all decided from what this reader stored - which tracks are inside, what is beside the file.'],
+    ['list',     'the file-by-file list',
+     'Every plan in that list is made from this reader\'s row for the file.'],
+    ['language', 'Required subtitle language',
+     'Whether a file carries a track in its required language is read from here first.']],
+  picture:[
+    ['picture',  'Subtitle User Input',
+     'Its picture rows - the ones with a Mark it button - are this reader\'s verdicts, scored.'],
+    ['language', 'Required subtitle language',
+     'A file with the dialogue burned into the picture carries its language; one this reader has not looked at, or found marks it could not read, is not accused.']],
+  events:[
+    ['picture',  'Subtitle User Input',
+     'Its track rows - the title-contradicts-cue-rate ones - are this reader\'s counts of plain dialogue lines, and the cross-episode match.']],
+};
+// Open a panel if it is folded, then go to it. The two detail panels live
+// behind a "show" link on their switchboard row; the others are always there.
+function subsJump(k){
+  if(k==='picture'||k==='language'){
+    if(!subsOpen(k)){ subsDetail(k); return; }
+    const el=document.getElementById(k==='picture'?'skPanel':'snPanel');
+    if(el) el.scrollIntoView({block:'start'});
+    return;
+  }
+  const id={board:'subsPanelBoard', list:'subsPanelList', proc:'subsPanelProc'}[k];
+  const el=id&&document.getElementById(id);
+  if(el) el.scrollIntoView({block:'start'});
+}
 function subsScanReaders(sc){
   const R=(sc.readers||[]);
   if(R.length<2) return '';
-  return `<div style="display:flex;gap:5px;flex-wrap:wrap;margin-top:6px">${
-    R.map(r=>{
-      const done=!r.left;
-      const col=r.running?'var(--acc)':(done?'var(--ok)':'#e8a33d');
-      return `<span class="capsc" style="font-size:10px;border-color:${col};
-          color:${col}" title="${esc(r.what||'')}">${
-        r.running?'<span class="busy"><span class="sp"></span></span> ':''}${
-        esc(r.name)}${r.tool?` <span class="dim" style="font-size:9.5px">${
-          esc(r.tool)}</span>`:''} ${done?'<b>read through</b>'
-                           :`<b>${fmt(r.left)}</b> left`}</span>`;
-    }).join('')}</div>
-  <div class="dim" style="font-size:10.5px;margin-top:3px">three passes,
-    because they cost different things — one reads what is already stored, one
-    samples frames off a disk, one demuxes a track. This is every one of them
-    in a single line.</div>`;
+  const row=r=>{
+    const done=!r.left;
+    const col=r.running?'var(--acc)':(done?'var(--ok)':'#e8a33d');
+    const feeds=(SUBS_READER_FEEDS[r.key]||[]);
+    return `<tr>
+      <td style="padding:3px 10px 3px 0;white-space:nowrap;color:${col}" title="${esc(r.what||'')}">${
+        r.running?'<span class="busy"><span class="sp"></span></span> ':'<span style="opacity:.7">▪</span> '}${esc(r.name)}</td>
+      <td class="dim mono" style="padding:3px 10px 3px 0;white-space:nowrap;font-size:10px">${esc(r.tool||'')}</td>
+      <td style="padding:3px 14px 3px 0;white-space:nowrap;text-align:right;color:${col}" title="${
+        done?'Every file this reader can read has been read.':'Files this reader still has to look at, including any it has decided to look at again.'}">${
+        done?'read through':`<b>${fmt(r.left)}</b> left`}</td>
+      <td style="padding:3px 0;font-size:11px"><span class="dim" style="margin-right:6px">→</span>${
+        feeds.map(([k,name,tip],i)=>`${i?'<span class="dim"> · </span>':''}<a href="#"
+          onclick="subsJump('${k}');return false" title="${esc(tip)}">${esc(name)}</a>`).join('')}</td>
+    </tr>`;
+  };
+  return `<div style="margin-top:9px">
+    <div class="dim" style="font-size:10px;letter-spacing:.04em;text-transform:uppercase;margin-bottom:2px"
+      title="Three passes, because they cost different things — one reads what is already stored, one samples frames off a disk, one demuxes a track. Each writes a table, and the panels on the right are the ones that judge from it.">what it reads, with what, and which panel uses it</div>
+    <table style="border-collapse:collapse;font-size:11.5px"><thead>
+      <tr class="dim" style="font-size:9.5px;text-align:left;letter-spacing:.03em">
+        <th style="font-weight:normal;padding:0 10px 2px 0">reader</th>
+        <th style="font-weight:normal;padding:0 10px 2px 0">tool</th>
+        <th style="font-weight:normal;padding:0 14px 2px 0;text-align:right">left</th>
+        <th style="font-weight:normal;padding:0 0 2px">feeds</th>
+      </tr></thead><tbody>${R.map(row).join('')}</tbody></table>
+  </div>`;
 }
 
 function subsScanHtml(){
@@ -41190,8 +41234,8 @@ function subsScanHtml(){
           sc.running?'<span class="busy" style="color:var(--acc)"><span class="sp"></span></span> reading'
                     :'last read'}</span>${
           esc(lastName)}${subsScanLastFound(sc)}</div>`:''}
-      ${subsScanFound(sc)}
       ${subsScanReaders(sc)}
+      ${subsScanFound(sc)}
       ${subsScanVisits(sc)}
       ${subsScanLibs(sc)}
       <div class="subswhy">What is inside each file, what is sitting beside it
