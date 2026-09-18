@@ -2773,7 +2773,18 @@ def counts() -> dict:
     out = {"files": 0, "tracks": 0, "heard": 0, "left": 0, "pct": 0.0,
            "files_done": 0, "files_untouched": 0,
            "found": {"named": 0, "unsure": 0, "unheard": 0},
-           "stale": 0, "orphans": 0, "by_library": []}
+           "stale": 0, "orphans": 0, "by_library": [],
+           # EVERY LIVE FILE, AND THE ONES THIS TOTAL CANNOT SPEAK FOR.
+           # `files` counts files whose audio track count is known, because
+           # that is what `tracks` is summed over. A file whose audio_langs
+           # has never been filled was not counted as unheard - it was not
+           # counted at all, and the denominator silently shrank by one.
+           # Zero today, by the luck of complete ffprobe coverage rather
+           # than by design, and the same shape as every other bug on these
+           # two pages: a gap in what is known, recorded as nothing rather
+           # than as a gap. Counted here so the day it is not zero the panel
+           # says so.
+           "files_all": 0, "files_unknown": 0}
     # nt: how many audio tracks the file has now, from the extracted column.
     # hd: how many of them carry a verdict written for THESE bytes.
     inner = (
@@ -2834,6 +2845,12 @@ def counts() -> dict:
                     "SELECT library, SUM(nt) AS nt, SUM(hd) AS hd "
                     "  FROM (" + inner + ") GROUP BY library "
                     " ORDER BY nt DESC")]
+            # Whatever their audio_langs says, or does not - the same live
+            # states, without the "and we know its tracks" clause.
+            out["files_all"] = int(cur.execute(
+                "SELECT COUNT(*) n FROM files f "
+                " WHERE f.state IN ('done','eligible')").fetchone()["n"] or 0)
+            out["files_unknown"] = max(0, out["files_all"] - out["files"])
             out["stale"] = int(cur.execute(
                 "SELECT COUNT(*) n FROM audio_lang a JOIN files f "
                 "    ON f.id = a.file_id "

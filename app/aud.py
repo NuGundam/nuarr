@@ -657,6 +657,8 @@ def listening() -> dict:
                found=(c.get("found") or {}),
                by_library=(c.get("by_library") or []),
                files=int(c.get("files") or 0),
+               files_all=int(c.get("files_all") or 0),
+               files_unknown=int(c.get("files_unknown") or 0),
                files_done=int(c.get("files_done") or 0),
                files_untouched=int(c.get("files_untouched") or 0),
                stale=int(c.get("stale") or 0),

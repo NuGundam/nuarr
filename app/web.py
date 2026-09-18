@@ -39708,9 +39708,18 @@ function audListenHtml(){
           title="${esc(L.model?'model '+L.model:'')}">${esc(L.tool)}${L.model?' '+esc(L.model):''}</span>`:''}${
         L.hw?` <span class="capsc" style="border-color:${/gpu/i.test(L.hw)?'#7fd18c':'#e8a33d'};color:${/gpu/i.test(L.hw)?'#7fd18c':'#e8a33d'}"
           title="Which silicon the language identifier runs on. CUDA is an order of magnitude faster per track than the CPU.">${esc(L.hw)}</span> `:''}
-      <span title="Audio tracks carrying a verdict recorded against the bytes that are on the disk now — out of the tracks those files actually have. This used to be rows in the verdict table over rows plus files: 2,520 of those rows were about files that no longer exist, so the bar read 100% while 43 tracks had never been heard.">${
-        num(L.done,'auto')} of ${num(L.total,'auto')} tracks heard</span>
-      <span style="font-size:10.5px">(${(L.pct||0).toFixed(1)}%)</span>
+      <span title="Every file nuarr is keeping an eye on, counted live. This moves when the library does — 7,168 files were re-probed in the last hour as subtitle embeds and transcodes rewrote them.">${
+        num(L.files_all||L.files||0,'auto')} files</span>
+      <span class="dim">·</span>
+      <span title="How many audio tracks are inside those files, summed from the ffprobe nuarr already stores for every one of them. That is why this page has no separate scanning pass and the subtitle one does: the track count lives in a column on the file and survives, where the subtitle reader depends on the probe cache, which ages out. This total follows the library — a rewrite can change how many audio tracks a file has.">${
+        num(L.total,'auto')} audio tracks</span>
+      <span class="dim">·</span>
+      <span title="Tracks carrying a verdict recorded against the bytes on the disk now. This used to be rows in the verdict table over rows plus files: 2,520 of those rows were about files that no longer exist, so the bar read 100% while 43 tracks had never been heard.">${
+        num(L.done,'auto')} heard</span>
+      <span style="font-size:10.5px">(${(L.pct||0).toFixed(1)}%)</span>${
+      L.files_unknown?` <span class="capsc" style="border-color:var(--warn);color:var(--warn)"
+        title="Live files with no audio track count recorded, so their tracks are not in the total beside this. They are not counted as unheard — they are not counted at all, which is why this chip exists rather than the total quietly shrinking.">${
+        fmt(L.files_unknown)} files not counted</span>`:''}
       ${L.each?` · <b style="color:var(--ok)">${L.each.toFixed(1)}s</b> a track`:''}
       ${L.eta?` · ${numt(hsDur(L.eta))} left`:''}${
       (L.queue&&(L.queue.queued||L.queue.running))
