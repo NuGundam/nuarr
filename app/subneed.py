@@ -293,7 +293,7 @@ def _picture(file_id: int, cur, pic=None):
         return pic
     try:
         return cur.execute(
-            "SELECT state, chosen, low_hits, samples, words FROM hardsub "
+            "SELECT state, chosen, low_hits, samples, words, rev FROM hardsub "
             " WHERE file_id=?", (int(file_id),)).fetchone()
     except Exception:                                            # noqa: BLE001
         return None
@@ -467,6 +467,41 @@ def verdict(file_id: int, lang: str, cur, facts=None,
         return UNKNOWN, ("the picture reader has no frames for this file, so "
                          "burned-in subtitles cannot be ruled out")
 
+    # LAST, BECAUSE IT ONLY ANSWERS THE ACCUSATION.
+    #
+    # A READING THIS FILE IS ALREADY QUEUED TO HAVE REDONE IS NOT ONE TO
+    # DELETE A RELEASE OVER. The picture reader records which version of
+    # itself produced a verdict, and it has been corrected twice - the caption
+    # floor, then the OCR engine. Measured when this went in: all 34 files on
+    # the blocklist list rested on an older reader and none on the current
+    # one. The Velvet episodes had been in exactly that state - read as
+    # "nothing in the picture", offered for deletion, carrying burned-in
+    # English throughout.
+    #
+    # THE PLACEMENT IS THE WHOLE POINT, and I had it wrong first: this sat at
+    # the top of the picture section, where it also pre-empted the two lines
+    # that say a file is FINE - the dialogue is burned in, the audio is
+    # already in the language - and 2,523 settled files went from `ok` to
+    # `unknown` in one restart. An old verdict is a bad reason to delete
+    # something and a perfectly good reason to leave it alone. Everything that
+    # can clear a file still clears it above; only the accusation waits.
+    #
+    # It returns to `missing` by itself once the re-read confirms it.
+    try:
+        from . import hardsub as _hs
+        rev = 0
+        if "rev" in prow.keys():
+            rev = int(prow["rev"] or 0)
+        if rev < int(_hs.READER_REV) and not (
+                prow["chosen"] if "chosen" in prow.keys() else None):
+            return UNKNOWN, (
+                "the picture was read by an earlier version of the reader and "
+                "is queued to be read again - the caption floor and the OCR "
+                "engine have both changed since, so this is not an answer to "
+                "delete a release over")
+    except Exception:                                            # noqa: BLE001
+        pass
+
     n = len(tracks) + len(sides)
     return MISSING, ("carries no subtitles at all, and nothing in the picture"
                      if not n
@@ -542,7 +577,15 @@ def sweep(limit: int = BATCH) -> dict:
                     # the sweep path. Leaving it out made the whole check a
                     # no-op here while single-file calls worked perfectly -
                     # see the note on _ENGLISH_STOP.
+                    # h.rev FOR THE SAME REASON h.words IS HERE. verdict()
+                    # reads it to tell a current reading from one queued to be
+                    # redone, and this hand-written list is the only thing
+                    # feeding it on the sweep path. Leaving a column out makes
+                    # the check a silent no-op here while single-file calls
+                    # work perfectly - which is exactly how it went this
+                    # morning.
                     "       h.state, h.chosen, h.low_hits, h.samples, h.words, "
+                    "       h.rev, "
                     "       (SELECT MIN(n.checked_at) FROM sub_need n "
                     "         WHERE n.file_id=f.id) AS seen, "
                     "       (h.file_id IS NOT NULL) AS haspic "
@@ -598,7 +641,8 @@ def counts() -> dict:
     Same join, same filter, so every figure here describes a file that exists.
     """
     init()
-    out = {OK: 0, MISSING: 0, UNKNOWN: 0}
+    out = {OK: 0, MISSING: 0, UNKNOWN: 0,
+           "unknown_by": {"unread": 0, "stale": 0, "open": 0}}
     try:
         with cursor() as cur:
             for r in cur.execute(
@@ -607,6 +651,32 @@ def counts() -> dict:
                     " WHERE f.state NOT IN ('deleted','duplicate') "
                     " GROUP BY n.state"):
                 out[r["st"]] = int(r["c"])
+            # WHAT "UNKNOWN" IS MADE OF. One number stood in for three, and
+            # the panel called all of it "not looked inside" while most of it
+            # was files this check has looked inside and declined to judge
+            # on a verdict the picture reader has already decided to redo.
+            # Same join as above so the three add up to the one; whether a
+            # file is on the re-read list is asked of the reader's own `rev`
+            # rather than of the reason sentence, because the stale guard
+            # only fires in front of the accusation and an unknown file's
+            # `why` says something else while it is nonetheless waiting.
+            try:
+                from . import hardsub as _hs
+                rev = int(_hs.READER_REV)
+            except Exception:                                    # noqa: BLE001
+                rev = 0
+            for r in cur.execute(
+                    "SELECT CASE WHEN h.file_id IS NULL THEN 'unread' "
+                    "            WHEN COALESCE(h.rev,1) < ? "
+                    "                 AND COALESCE(h.chosen,'')='' THEN 'stale' "
+                    "            ELSE 'open' END AS k, COUNT(*) AS c "
+                    "  FROM sub_need n "
+                    "  JOIN files f ON f.id = n.file_id "
+                    "  LEFT JOIN hardsub h ON h.file_id = n.file_id "
+                    " WHERE n.state = ? "
+                    "   AND f.state NOT IN ('deleted','duplicate') "
+                    " GROUP BY k", (rev, UNKNOWN)):
+                out["unknown_by"][r["k"]] = int(r["c"])
     except Exception:                                            # noqa: BLE001
         pass
     return out

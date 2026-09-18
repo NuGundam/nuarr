@@ -38010,6 +38010,18 @@ function snWhen(i, d){
           +'for, and the cap refills hourly - so about '+hrs+' hour'
           +(hrs===1?'':'s')+' from now, later if another check spends it.'];
 }
+// WHAT "UNKNOWN" IS MADE OF, in words. One number used to stand in for
+// three and the panel called all of it "not looked inside", while most of it
+// was files this check HAS looked inside and declined to judge on a picture
+// verdict the reader has already queued to redo.
+function snUnknownWords(c){
+  const u=c.unknown_by||{}, bits=[];
+  if(u.unread) bits.push(`<span title="No probe or no picture reading yet. nuarr has no opinion about these, they are not listed, and no button touches them.">${num(u.unread,'auto')} not looked inside</span>`);
+  if(u.stale) bits.push(`<span title="Their picture was read by an earlier version of the reader - the caption floor and the OCR engine have both changed since - and they are queued to be read again. Not accused on a verdict nuarr has already decided to redo.">${num(u.stale,'auto')} waiting on a re-read</span>`);
+  if(u.open) bits.push(`<span title="Read by the current reader, and it saw marks it could not read or a single English word - enough to stop the accusation, not enough to clear the file.">${num(u.open,'auto')} undecided</span>`);
+  if(!bits.length) return `${num(c.unknown||0,'auto')} no opinion`;
+  return bits.join(' · ');
+}
 function snPaint(force){
   const el=document.getElementById('snPanel'); if(!el||!_sn) return;
   const d=_sn, c=d.counts||{}, rows=snRows();
@@ -38030,7 +38042,7 @@ function snPaint(force){
     <span class="dim" style="font-size:11.5px">
       ${req?`<span>${req}</span> · `:''}
       <span title="carry what their library requires">${num(ok,'done')} carry it</span>
-      · <span title="Never looked inside, or the picture reader found marks it could not read. nuarr has no opinion about these, they are not listed, and no button touches them.">${num(unk,'auto')} not looked inside</span>
+      ${unk?` · ${snUnknownWords(c)}`:''}
     </span>
     <span style="float:right;display:flex;gap:8px;align-items:center">
       ${modeSeg('when it is sure', d.mode, 'snMode', {
@@ -38141,8 +38153,15 @@ function snPaint(force){
         <div><span class="dim">size:</span> ${esc(String(gb(r.size)))} GB · <span class="dim">judged</span> ${r.checked_at?ago(r.checked_at):'—'}</div>
         <div class="mono dim" style="font-size:10px;word-break:break-all">${esc(r.path||'')}</div></td></tr>`:''}`;}).join('')}</tbody></table></div>`
     : `<div class="dim" style="font-size:11.5px;padding:8px 0">${
-        d.any_required?'Every file that has been looked inside carries what its library requires.'
-                      :'Nothing is required yet. Tick <b>require</b> under a language in Subtitle rules.'}</div>`;
+        !d.any_required?'Nothing is required yet. Tick <b>require</b> under a language in Subtitle rules.'
+        :(((c.unknown_by||{}).stale)
+           // NOT "everything is fine" WHILE THE RE-READ IS STILL RUNNING. The
+           // list emptied because this check declines to accuse a file on a
+           // picture verdict the reader has already decided to redo; saying
+           // every file carries what it needs would be claiming an answer it
+           // has deliberately not given yet.
+           ? `Nothing to accuse yet. ${fmt(c.unknown_by.stale)} file${c.unknown_by.stale===1?'':'s'} carry no track and rest on a picture reading from an older reader - they are queued to be read again, and any that still come back empty will appear here on their own.`
+           : 'Every file that has been looked inside carries what its library requires.')}</div>`;
   // ALREADY ANSWERED, under the list, the way the panel above does it.
   // The rows are the ledger's, so they say what was done and when rather
   // than what is wrong - there is nothing wrong with them any more.
@@ -38187,7 +38206,7 @@ function snPaint(force){
   const foot=`<div class="dim" style="display:flex;gap:12px;align-items:center;
        flex-wrap:wrap;font-size:11px;margin-top:6px">
     <span>${miss?`${fmt(miss)} still to answer`:'nothing still to answer'}${
-      unk?` · ${fmt(unk)} not looked inside - no opinion, no button`:''}</span>
+      unk?` · ${snUnknownWords(c)} - no opinion, no button`:''}</span>
     ${nDone?`<a href="#" onclick="snShowDone(${_snDone?0:1});return false"
       title="Releases this check has already blocklisted and re-searched. They come from the shared remedy ledger rather than from this list, because answering one deletes its row - the file it was about no longer exists.">${
       _snDone?'hide':'also show'} the ${fmt(nDone)} answered</a>`:''}
@@ -38394,23 +38413,17 @@ function skPaint(force){
   ${d.mode==='auto'?`<div style="font-size:11px;margin:2px 0 4px;display:flex;
        gap:12px;flex-wrap:wrap;align-items:center">
     <span style="color:var(--ok)">auto</span>
-    ${A.at?`<span class="dim" title="When auto last went through the standing list, and what it did with it">last run ${
-       ago(A.at)}${(A.marked||A.dropped)
-         ? ` · ${num(A.marked||0,'done')} marked${
-             A.dropped?`, ${num(A.dropped,'done')} dropped`:''}`
-         : ' · nothing to do'}</span>`
-      :'<span class="dim" title="Auto acts at the head of every pass. It has not reached one since nuarr started.">has not run yet</span>'}
-    ${A.marking
-      ? `<span style="color:var(--acc)" title="Auto is marking a batch right now. The bar below is its progress.">marking now</span>`
-      : (A.next_run?`<span class="dim" title="Auto looks for work every ${
-          hsDur(A.cycle_s||45)}, and takes the next batch whenever the marker is free.">next look ${
-          (A.next_run-(Date.now()/1000))<=1
-            ? 'any moment' : 'in '+hsDur(A.next_run-(Date.now()/1000))}</span>`:'')}
-    ${A.queued?`<span title="Findings already past the ${d.mark_at}% line waiting for a later pass. ${
-       A.per_pass} are taken each pass because every mark rewrites a container.">${
-       num(A.queued,'auto')} still to mark${
+    <span class="dim" title="A reading past the ${d.mark_at}% line is planned as a mark step the moment it lands and runs on the queue like any other rewrite - there is no separate auto pass to wait for.">works through the queue</span>
+    ${A.running?`<span style="color:var(--acc)" title="A mark is being written right now.">${num(A.running,'auto')} marking now</span>`:''}
+    ${A.queued?`<span title="Past the ${d.mark_at}% line and planned; waiting for a worker under the same gate as a transcode.">${
+       num(A.queued,'auto')} queued to mark${
        A.eta?` · ${numt(hsDur(A.eta))} to work through them`:''}</span>`
-      :'<span class="dim">nothing waiting past the line</span>'}
+      :'<span class="dim">nothing past the line waiting</span>'}
+    ${A.marked?`<span class="dim" title="Mark steps the queue has finished and still remembers (a day). ${esc(A.last||'')}">${
+       num(A.marked,'done')} marked${A.at?`, last ${ago(A.at)}`:''}</span>`:''}
+    ${A.failed?`<span class="err" title="Mark steps that failed - see the failures under Processing System.">${fmt(A.failed)} failed</span>`:''}
+    ${A.asking?`<span class="dim" title="Between the two lines: auto will not touch these, they are the questions above.">${fmt(A.asking)} in the band, yours</span>`:''}
+    <a href="/#transcoding" class="dim">see them in Processing System →</a>
   </div>`:''}`;
   // ---- the batch marker's own bar, separate from the readers' ------------
   const mk=d.marking||_skMark||{}, mkPct=mk.total?Math.min(100,(mk.done/mk.total)*100):0;
@@ -38544,7 +38557,16 @@ function skPaint(force){
     : `<div class="dim" style="font-size:11.5px;padding:8px 0">${
         (tested||c.tracks)?'Nothing checked so far is carrying subtitles it should not, or under a title it should not.':'Nothing checked yet.'}</div>`;
   const foot=`<div class="dim" style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;font-size:11px;margin-top:6px">
-    <span>${fmt(pick.length)} still to answer · ${_skSort==='doubt'
+    <span>${(()=>{
+        // THE SAME NUMBER AS THE HEADER. This counted rows; the header counts
+        // questions. Measured: 102 rows against 56 questions, the difference
+        // being 48 tracks nuarr has already decided to leave alone - listed
+        // because a batch "Not dialogue" still applies to them, but not
+        // waiting on anyone.
+        const ask=pick.filter(r=>r.auto==='ask').length, rest=pick.length-ask;
+        return `${ask?`${fmt(ask)} still to answer`:'nothing still to answer'}${
+          rest?` · <span class="dim" title="Read, and nuarr has decided what to do with them on its own - most often to leave a title alone because it carries a name nuarr did not write. Shown because a batch answer can still apply to them.">${fmt(rest)} settled, shown</span>`:''}`;
+      })()} · ${_skSort==='doubt'
       ? 'least certain first'
       : `sorted by ${esc(_skSort==='kind'?'what it carries':_skSort)}${_skDesc?', highest first':''}`}${
       _skSort!=='doubt'?` · <a href="#" onclick="_skSort='doubt';_skDesc=false;_skKey='';skPaint(true);return false">back to least certain first</a>`:''}</span>

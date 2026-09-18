@@ -773,8 +773,10 @@ def _save(d: dict) -> None:
             # with signs over the top. Twenty-four frames landing on the sparse
             # parts of an episode is exactly how that mistake happens, and it
             # would happen again on the next pass with the same twenty-four.
-            row = cur.execute("SELECT chosen FROM hardsub WHERE file_id=?",
+            row = cur.execute("SELECT chosen, state FROM hardsub "
+                              " WHERE file_id=?",
                               (int(d["file_id"]),)).fetchone()
+            was = (row["state"] if row else None)
             if row and (row["chosen"] or ""):
                 d = dict(d, state=row["chosen"])
             cur.execute(
@@ -790,6 +792,53 @@ def _save(d: dict) -> None:
                  d["state"], d["low_hits"], d["high_hits"], d["samples"],
                  ", ".join(d.get("words") or []), d["detail"][:400],
                  READER_REV))
+    except Exception:                                            # noqa: BLE001
+        return
+    # AND THE FACTS ROW IS WHERE EVERYONE ELSE LOOKS FOR IT.
+    #
+    # hardsub owns its table and nothing else reads it directly: the planner,
+    # the queue and the blocklist list all go through sub_facts, which keeps
+    # its own copy of the picture verdict and is refreshed by a library-wide
+    # sweep. So a reading finished here was invisible downstream until that
+    # sweep happened to come round - hours, typically.
+    #
+    # Measured on the eight files still not being marked after the requeue
+    # hook went in: three had no sub_facts row at all, read at 20:28 and never
+    # scanned, so interesting() could not offer them and replan never saw
+    # them; five had a row written before the picture dict carried the
+    # scorer's inputs, so they scored without the cadence term and fell under
+    # the line. Both are the same thing - the reading was complete and nothing
+    # downstream could see it.
+    #
+    # ONE PROBE-CACHE READ AND ONE LISTDIR, immediately after this reader has
+    # spent seven seconds pulling twenty-four frames out of that same file.
+    # The directory could not be warmer, and the alternative is nuarr knowing
+    # something and behaving as though it does not.
+    try:
+        from . import subscan
+        subscan.scan_one(int(d["file_id"]))
+    except Exception:                                            # noqa: BLE001
+        pass
+    # A NEW READING IS A NEW FACT, AND THE QUEUE HAS TO BE TOLD.
+    #
+    # The plan for a file is re-made when subplan.revision() changes, and that
+    # stamp is built from the RULES - the mode, the two lines, the language
+    # policy. So moving a line re-plans the whole library and learning
+    # something new about one file re-plans nothing.
+    #
+    # Measured: 22 files sat past the 85% line, in auto, with a verdict of
+    # 'dialogue' at up to 100% sure, and not one of them had a mark step
+    # queued. Their plans had been made while the picture still read 'none'.
+    # The queue was not refusing - it had never been asked.
+    #
+    # ONLY WHEN THE ANSWER ACTUALLY MOVED. The re-read sweep will write three
+    # thousand rows that say exactly what they said before, and re-planning
+    # those would be three thousand plans to reach three thousand identical
+    # conclusions.
+    try:
+        if str(was or "") != str(d.get("state") or ""):
+            from . import subqueue
+            subqueue.requeue(int(d["file_id"]))
     except Exception:                                            # noqa: BLE001
         pass
 
@@ -2050,11 +2099,42 @@ def _do_one(r: dict, report=None) -> dict:
     return {"ok": True, "state": d["state"]}
 
 
+def prune() -> int:
+    r"""Forget readings about files that are not there any more.
+
+    The same prune subneed and audiolang got, for the same reason. A
+    replacement gets a NEW files row, so a reading against the old one can
+    never be marked, listed or re-read - it can only be counted. Measured
+    when this went in: 290 of them, three of which turned up on the "past the
+    line and not marked" list and could not be acted on because
+    requeue() answered "no such file". They inflate "pictures sampled" and
+    "pictures carrying dialogue" on the panel by exactly their number.
+
+    Called at the end of each reader pass, where the rows are made, so the
+    table cannot fill up with them again.
+    """
+    try:
+        with cursor() as cur:
+            cur.execute(
+                "DELETE FROM hardsub WHERE file_id IN ("
+                "  SELECT h.file_id FROM hardsub h "
+                "    LEFT JOIN files f ON f.id = h.file_id "
+                "   WHERE f.id IS NULL "
+                "      OR f.state IN ('deleted','duplicate'))")
+            return int(cur.rowcount or 0)
+    except Exception:                                            # noqa: BLE001
+        return 0
+
+
 def _after(d: dict) -> None:
     # The pass is over, so the model can go and the GPU is Whisper's and the
     # encoders' again until the next one.
     try:
         ocr_close()
+    except Exception:                                            # noqa: BLE001
+        pass
+    try:
+        prune()
     except Exception:                                            # noqa: BLE001
         pass
     try:

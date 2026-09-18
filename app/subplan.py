@@ -575,10 +575,14 @@ def plan(f: dict, ctx: dict | None = None) -> dict:
         sure = int(pic.get("sure") or 0)
         if state and state not in ("none", "clean"):
             if pic.get("by_hand") or sure >= ctx["mark_at"]:
+                # THE SCORER'S OWN SENTENCE. This said "N% of the sampled
+                # frames carry words", written when the number really was a
+                # fraction of frames - the wrong fraction, as it turned out.
+                # `sure` is score_of's now, and score_of explains itself.
                 steps.append({"do": "mark", "kind": state, "sure": sure,
                               "why": ("you said so" if pic.get("by_hand")
-                                      else f"{sure}% of the sampled frames "
-                                           f"carry words")})
+                                      else (str(pic.get("why") or "")
+                                            or f"{sure}% sure"))})
             elif sure > ctx["dismiss_at"]:
                 said, whose = recall(fid, path, "picture")
                 if said == "mark":
@@ -590,9 +594,10 @@ def plan(f: dict, ctx: dict | None = None) -> dict:
                 else:
                     asks.append({
                         "q": "picture", "kind": state, "sure": sure,
-                        "asking": (f"{sure}% of the sampled frames look like "
-                                   f"they carry words painted into the "
-                                   f"picture."),
+                        "asking": (f"{sure}% sure there are words painted "
+                                   f"into the picture"
+                                   + (f" - {pic.get('why')}"
+                                      if pic.get("why") else ".")),
                         "words": pic.get("words") or "",
                         "options": [
                             {"v": "mark", "label": "Yes, they are burned in",

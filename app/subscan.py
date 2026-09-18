@@ -337,21 +337,51 @@ def _sides_of(path: str) -> list:
 def _picture_of(file_id: int, cur) -> dict:
     """What the picture reader last said about this file. A read, not a read."""
     try:
-        r = cur.execute("SELECT state, chosen, marked, low_hits, high_hits, "
-                        "       samples, words, at FROM hardsub WHERE file_id=?",
+        r = cur.execute("SELECT state, chosen, marked, path, low_hits, "
+                        "       high_hits, samples, words, at "
+                        "  FROM hardsub WHERE file_id=?",
                         (int(file_id),)).fetchone()
     except Exception:                                            # noqa: BLE001
         return {}
     if not r:
         return {}
-    lo = int(r["low_hits"] or 0)
-    hi = int(r["high_hits"] or 0)
-    n = int(r["samples"] or 0)
+    # HOW SURE IS ASKED OF THE MODULE THAT OWNS THE QUESTION.
+    #
+    # This used to compute its own: round(100 * high_hits / samples). That is
+    # not a sureness at all - high_hits counts frames with marks HIGH in the
+    # picture, which is how the reader tells a SIGN from a subtitle. For a
+    # file whose burned-in text is dialogue along the bottom it is correctly
+    # near zero, so the better the evidence that a file has burned-in
+    # dialogue, the less confident the planner became that it had anything.
+    #
+    # Measured over the 691 findings carrying a verdict: the two numbers
+    # differed by 20 or more on 534 of them, and 485 scored past the 85 line
+    # in the real scorer while sitting below it here - which is why 22 files
+    # read as 'dialogue' at up to 100% had no mark step queued. They were
+    # never refused; the plan was answering a different question.
+    #
+    # score_of() is the number the 85 line was drawn against, it explains
+    # itself, and it re-scores from the stored row every time it is asked, so
+    # a word learned tonight improves a finding from March. There is no reason
+    # for a second opinion to exist here.
+    sure, why = 0, ""
+    try:
+        from . import hardsub as _hs
+        d = _hs.score_of(r)
+        sure, why = int(d["score"]), str(d["why"])
+    except Exception:                                            # noqa: BLE001
+        pass
     return {"state": (r["chosen"] or r["state"] or ""),
             "by_hand": bool(r["chosen"]),
             "marked": bool(r["marked"]),
-            "sure": int(round(100.0 * hi / n)) if n else 0,
+            "sure": sure,
+            "why": why,
             "words": (r["words"] or "")[:200],
+            # THE SCORER'S INPUTS TRAVEL WITH IT, so _row() below can re-score
+            # the stored copy instead of trusting the integer beside them.
+            "path": str(r["path"] or ""),
+            "low_hits": int(r["low_hits"] or 0),
+            "samples": int(r["samples"] or 0),
             "at": float(r["at"] or 0.0)}
 
 
@@ -725,6 +755,26 @@ def _row(r) -> dict:
             d[k] = json.loads(d.get(k) or ("{}" if k == "picture" else "[]"))
         except Exception:                                        # noqa: BLE001
             d[k] = {} if k == "picture" else []
+    # THE SURENESS IS RE-SCORED, NOT READ BACK.
+    #
+    # sub_facts stores the picture dict as JSON, and this is the copy the
+    # planner sees on every path except a forced re-scan. Trusting the stored
+    # integer would put back the thing score_of explicitly refuses to be: a
+    # number that stopped learning the moment it was written. Its dictionaries
+    # are fed by every mark and every dismissal, so a word confirmed tonight
+    # has to lift a finding from March without a frame being re-read.
+    #
+    # The row carries the scorer's four inputs, score_of takes anything with
+    # .keys(), and both dictionaries are memoised - so scoring the few
+    # thousand rows interesting() returns costs no queries.
+    try:
+        p = d.get("picture")
+        if isinstance(p, dict) and p.get("words"):
+            from . import hardsub as _hs
+            sc = _hs.score_of(p)
+            p["sure"], p["why"] = int(sc["score"]), str(sc["why"])
+    except Exception:                                            # noqa: BLE001
+        pass
     return d
 
 

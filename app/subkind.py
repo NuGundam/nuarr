@@ -275,6 +275,58 @@ def queue() -> dict:
         return {"queued": 0, "running": 0, "now": ""}
 
 
+def auto_from_queue() -> dict:
+    r"""What the queue is doing with the findings past the line.
+
+    A mark step is planned the moment a picture verdict scores past the mark
+    line (subplan, rule 4) and runs as a job like any other rewrite. So "what
+    has auto done and what is it about to do" is a question about sub_queue
+    rows carrying a `mark` step, by state - not about a loop of its own.
+    """
+    from . import subqueue
+    from .db import cursor
+    out = {"queued": 0, "running": 0, "marked": 0, "failed": 0,
+           "asking": 0, "at": 0.0, "last": "", "eta": 0.0}
+    with cursor() as cur:
+        for r in cur.execute(
+                "SELECT state, COUNT(*) n, MAX(finished_at) at "
+                "  FROM sub_queue "
+                " WHERE steps LIKE '%\"do\": \"mark\"%' GROUP BY state"):
+            st, n = str(r["state"] or ""), int(r["n"] or 0)
+            if st == subqueue.QUEUED or st == subqueue.HELD:
+                out["queued"] += n
+            elif st == subqueue.RUNNING:
+                out["running"] += n
+            elif st == subqueue.DONE:
+                out["marked"] += n
+                out["at"] = max(out["at"], float(r["at"] or 0.0))
+            elif st == subqueue.FAILED:
+                out["failed"] += n
+        r = cur.execute(
+            "SELECT name FROM sub_queue "
+            " WHERE steps LIKE '%\"do\": \"mark\"%' AND state=? "
+            " ORDER BY finished_at DESC LIMIT 1", (subqueue.DONE,)).fetchone()
+        out["last"] = str((r["name"] if r else "") or "")
+        # AND THE ONES IT WILL NOT TOUCH: pictures in the band, waiting on
+        # an answer. Counted here so the line can say where the rest went.
+        r = cur.execute(
+            "SELECT COUNT(*) n FROM sub_queue "
+            " WHERE asks LIKE '%\"q\": \"picture\"%' AND state=?",
+            (subqueue.ASK,)).fetchone()
+        out["asking"] = int((r["n"] if r else 0) or 0)
+    # How long the queued ones will take, from what a mark has cost here.
+    try:
+        from . import hardsub
+        each = float((hardsub.MARK_STATE or {}).get("secs_each") or 0.0)
+        if not each:
+            each = float(hardsub.mark_progress().get("secs_each") or 0.0)
+        if each and out["queued"]:
+            out["eta"] = each * out["queued"]
+    except Exception:                                            # noqa: BLE001
+        pass
+    return out
+
+
 def _safe(fn):
     """A section of a panel must not be able to take the panel down."""
     try:
@@ -385,27 +437,12 @@ def findings(limit: int = 600, want_done: bool = True,
         # files are still owed a marker track. These two are counts of the
         # library and are always true.
         "marker": _safe(lambda: hardsub.marker()),
-        "auto": {
-            "marked": STATE.get("auto_marked") or 0,
-            "dropped": STATE.get("auto_dropped") or 0,
-            "queued": STATE.get("auto_queued") or 0,
-            "at": STATE.get("auto_at") or 0.0,
-            "per_pass": AUTO_MARKS_PER_PASS,
-            "runs": STATE.get("auto_runs") or 0,
-            # AUTO HAS ITS OWN CLOCK. It is idle between batches, not waiting
-            # on the readers, so what it is doing right now is the answer:
-            # marking, or free and looking again within the tick.
-            "next_run": STATE.get("auto_due") or 0.0,
-            "cycle_s": AUTO_TICK_S,
-            "marking": bool((hardsub.MARK_STATE or {}).get("running")),
-            # HOW LONG UNTIL AUTO IS DONE with what it can already see: the
-            # queue over the per-pass cap, at the cadence the pass runs on.
-            # WHAT IT ACTUALLY COSTS, where that has been measured: every
-            # mark is a stream copy of a whole container, and how long that
-            # takes on this pool is the only honest basis for the estimate.
-            # The tick only matters while nothing has been timed yet.
-            "eta": _auto_eta(),
-        },
+        # WHAT AUTO IS, NOW: the queue carrying mark steps. The auto_* fields
+        # in STATE belong to watch_auto(), which register_only() never starts
+        # because the queue does this job - so a line built from them said
+        # "has not run yet · nothing waiting past the line" on an evening the
+        # queue marked eighteen files and held four more.
+        "auto": _safe(auto_from_queue),
         "state": {**STATE, "cycle_s": CYCLE_S, "next_run": _next_run()},
         "kinds": [{"id": k, "word": hardsub.KIND_WORDS[k]}
                   for k in hardsub.KINDS],
