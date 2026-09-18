@@ -1122,9 +1122,21 @@ def _ffprobe_exe() -> str:
 
 async def probe(path: str) -> dict | None:
     """ffprobe one file. Cached into the DB so a rescan does not re-probe."""
+    # -show_chapters IS THE WHOLE OF IT.
+    #
+    # Matroska carries named chapters and release groups label them: Undead
+    # Unluck S01E06 ships Prologue / Part A / OP / Part B / Part C / Part D /
+    # ED / Preview. That is testimony about where the theme songs are, written
+    # by somebody who had the episode in front of them - and no probe in this
+    # codebase had ever asked for it, so nuarr could not see it.
+    #
+    # It is in the same header ffprobe is already reading, so it costs
+    # nothing, and the whole dict is what gets stored in file_probes, so the
+    # chapters reach the cache with no schema change. See chapters.py for what
+    # reads them and how little it trusts them.
     proc = await asyncio.create_subprocess_exec(
         _ffprobe_exe(), "-v", "quiet", "-print_format", "json",
-        "-show_streams", "-show_format", path,
+        "-show_streams", "-show_format", "-show_chapters", path,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
         creationflags=NO_WINDOW)
     out, _ = await proc.communicate()

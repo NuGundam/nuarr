@@ -77,7 +77,25 @@ def _add_cuda_dirs() -> list[str]:
     for s in site.getsitepackages():
         dirs += glob.glob(os.path.join(s, "nvidia", "*", "bin"))
     if dirs:
-        os.environ["PATH"] = os.pathsep.join(dirs) + os.pathsep + os.environ.get("PATH", "")
+        # ONLY WHAT IS NOT ALREADY THERE.
+        #
+        # This is called from _model(), and unload() drops the model whenever
+        # the listen queue drains - so every reload used to prepend the same
+        # six directories again. About 500 characters a cycle against
+        # Windows' 32,767-character environment limit: after roughly
+        # sixty-five cycles CreateProcess refuses to start ANY child, the
+        # model probe included, and every listen fails with
+        #
+        #     ValueError: the environment variable is longer than 32767 chars
+        #
+        # 123 tracks carry that sentence as their stored verdict. Whisper
+        # never ran on one of them.
+        have = {p.strip().lower().rstrip("\\/")
+                for p in os.environ.get("PATH", "").split(os.pathsep) if p.strip()}
+        add = [d for d in dirs if d.strip().lower().rstrip("\\/") not in have]
+        if add:
+            os.environ["PATH"] = (os.pathsep.join(add) + os.pathsep
+                                  + os.environ.get("PATH", ""))
         for d in dirs:
             try:
                 os.add_dll_directory(d)
@@ -949,7 +967,7 @@ def _judge(votes: list, strong_floor: float = MIN_PROB) -> dict:
 
 
 def detect(path: str, track: int = 0, fracs=FIRST_LOOK,
-           secs: int = 30) -> dict:
+           secs: int = 30, file_id: int = 0) -> dict:
     r"""Listen to `track` of `path` and report what language it is in.
 
     Returns {code, code2, confidence, votes, ok, why}. `code` is ISO 639-2 or
@@ -979,6 +997,37 @@ def detect(path: str, track: int = 0, fracs=FIRST_LOOK,
         return out
 
     dur = _duration(path) or 1400.0
+
+    # NOT THE THEME SONG, WHERE THE FILE SAYS WHERE IT IS.
+    #
+    # An opening is a Japanese song playing over an English dub, and a window
+    # that lands on it disagrees with every other window - which is exactly
+    # what a refusal is made of. Measured on dual-audio anime that all carry a
+    # named OP/ED chapter, so the only difference between the two groups is
+    # where the windows happened to fall:
+    #
+    #     a routine window lands in the OP/ED   228 tracks   21.9% refused
+    #     every routine window misses it        264 tracks    1.9% refused
+    #
+    # Eleven and a half times. And 3,124 of this library's 3,819 refusals say
+    # "windows disagree: en, ja", which is the signature.
+    #
+    # The windows SLIDE rather than being dropped - see chapters.dodge. Only
+    # where the file names its own chapters; a file that does not is sampled
+    # exactly as before, because a guess about where the opening is would be
+    # a worse input than no opinion at all.
+    oped = []
+    from . import chapters as _ch
+    try:
+        if file_id:
+            oped = _ch.sane(_ch.for_file(int(file_id), path, live=True) or [], dur)
+        else:
+            oped = _ch.sane(_ch.spans({"chapters": _ch.read(path) or []}), dur)
+        if oped:
+            fracs = _ch.dodge(fracs, dur, oped, float(secs))
+    except Exception:                                        # noqa: BLE001
+        oped = []
+
     votes: list[tuple[str, float]] = []
     dists: list[list] = []
     silent = 0
@@ -1026,7 +1075,20 @@ def detect(path: str, track: int = 0, fracs=FIRST_LOOK,
     v = _judge(votes)
     if not v["ok"] and v["retry"] and readable:
         # The file can be read and the model was unsure: look again, elsewhere.
-        listen(SECOND_LOOK)
+        #
+        # OFF THE THEME SONG TOO, and this is the pass where it matters most.
+        # SECOND_LOOK ends at 0.93 - 22.3 minutes into a 24-minute episode -
+        # and an ending that starts at 22.1 is exactly there. Measured on
+        # Undead Unluck S01E06: ED 22.10-23.60m, 2nd look @0.93 at 22.20m.
+        #
+        # And the second look only runs when the first pass was ALREADY
+        # unsure, so the windows brought in to settle a disagreement were the
+        # ones most likely to land on a song. That is the refusal loop closing
+        # on itself.
+        # `taken=fracs` so the second look cannot land on a window the
+        # first one already took - see chapters.dodge.
+        listen(_ch.dodge(SECOND_LOOK, dur, oped, float(secs), taken=fracs)
+               if oped else SECOND_LOOK)
         out["looks"] = 2
         v = _judge(votes)
 
@@ -1257,8 +1319,40 @@ LAST_HEARD: dict = {"name": "", "track": 0, "code": "", "sure": 0,
                     "ok": False, "why": "", "at": 0.0}
 
 
+# FAILURES THAT ARE NOT ABOUT THE AUDIO.
+#
+# A verdict row says "this track was listened to and here is what was heard",
+# and freshness is size and mtime only - so a row written for a reason that
+# has nothing to do with the audio is permanent. The model failing to load,
+# the environment being out of room, the disk not answering in sixty seconds:
+# none of those listened to anything, and all of them are "come back later".
+#
+# The way to say "not known yet" in this system is to have no row. It is what
+# a file nobody has reached looks like, and the sweep already knows how to
+# read it. So these write nothing at all.
+#
+# Measured: 123 tracks were holding "model unavailable: the environment
+# variable is longer than 32767 characters" as their answer, and no sweep
+# would ever have gone back to them.
+_NOT_ABOUT_THE_AUDIO = (
+    "model unavailable",
+    "the environment variable is longer",
+    "took over",                 # ffmpeg timed out pulling a window
+    "file not found",
+)
+
+
+def _environmental(why: str) -> bool:
+    w = (why or "").lower()
+    return any(t in w for t in _NOT_ABOUT_THE_AUDIO)
+
+
 def store(file_id: int, track: int, path: str, res: dict) -> None:
     import json as _json
+    # See _NOT_ABOUT_THE_AUDIO. Nothing listened, so nothing is recorded -
+    # and the track stays on the list rather than looking answered.
+    if not res.get("ok") and _environmental(res.get("why", "")):
+        return
     size, mtime = _stat(path)
     try:
         LAST_HEARD.update(
@@ -1295,7 +1389,9 @@ def check(file_id: int, path: str, track: int = 0, refresh: bool = False) -> dic
         c = cached(file_id, track, path)
         if c is not None:
             return c
-    res = detect(path, track)
+    # file_id lets detect() read the chapters out of the stored probe rather
+    # than seeking the disk for them.
+    res = detect(path, track, file_id=int(file_id))
     store(file_id, track, path, res)
     res["cached"] = False
     return res
@@ -2734,10 +2830,23 @@ def prune() -> dict:
     subneed.prune() is the same function for the subtitle page, written for
     the same reason and called from the same place - the sweep, not a button.
     """
-    out = {"orphans": 0, "dead": 0}
+    out = {"orphans": 0, "dead": 0, "forged": 0}
     try:
         ensure_table()
         with cursor() as cur:
+            # AND VERDICTS THAT WERE NEVER ABOUT THE AUDIO. See
+            # _NOT_ABOUT_THE_AUDIO: store() no longer writes these, but 123
+            # were already in the table saying the environment had run out of
+            # room, and a stored failure is permanent because freshness is
+            # size and mtime. Deleting the row is how the track goes back on
+            # the list.
+            cur.execute(
+                "DELETE FROM audio_lang WHERE COALESCE(ok,0)=0 AND ("
+                "     why LIKE 'model unavailable%' "
+                "  OR why LIKE '%environment variable is longer%' "
+                "  OR why LIKE '%took over%' "
+                "  OR why LIKE 'file not found%')")
+            out["forged"] = int(cur.rowcount or 0)
             cur.execute(
                 "DELETE FROM audio_lang WHERE file_id NOT IN "
                 "  (SELECT id FROM files)")
