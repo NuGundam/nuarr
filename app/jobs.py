@@ -978,15 +978,30 @@ class Worker:
             # one card disagreeing about which program is running, because
             # the name was hardcoded here when Tesseract was the only one.
             if "sampl" in st or "frame" in st or "floor" in st:
+                # AND WHICH SILICON, ASKED TOO. This said CPU on a machine
+                # reading on an A5000, because the engine name was made a
+                # question here and the hardware was left typed in on the
+                # very next line. The `listen` branch above has read
+                # audiolang's real model device since the day it was written.
+                #
+                # ONE STAGE, TWO PIECES OF SILICON: ffmpeg decodes the frames
+                # on the CPU and PaddleOCR reads the best of them on the card,
+                # so a single word cannot be true. It names both.
+                eng, dev = "the OCR", "cpu"
                 try:
-                    from . import hardsub as _hs
-                    eng = ("PaddleOCR" if _hs.ocr_engine() == "paddle"
-                           else "Tesseract")
+                    from . import hardsub as _hs, subocr as _so
+                    paddle = _hs.ocr_engine() == "paddle"
+                    eng = "PaddleOCR" if paddle else "Tesseract"
+                    dev = _so.device() if paddle else "cpu"
                 except Exception:                        # noqa: BLE001
-                    eng = "the OCR"
-                return {"tool": f"ffmpeg + {eng}", "hw": "CPU",
-                        "why": f"frames decoded and the bright text low in "
-                               f"the picture shown to {eng}"}
+                    pass
+                hw = ("CPU \u00b7 frames, GPU \u00b7 reading" if dev == "gpu"
+                      else "CPU")
+                return {"tool": f"ffmpeg + {eng}", "hw": hw,
+                        "why": f"frames decoded by ffmpeg on the CPU, and the "
+                               f"bright text low in the picture shown to "
+                               f"{eng} on the "
+                               f"{'graphics card' if dev == 'gpu' else 'CPU'}"}
             if "verdict" in st:
                 return {"tool": "sqlite", "hw": "disk",
                         "why": "writing what the frames said, and re-planning "
