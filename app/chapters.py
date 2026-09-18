@@ -52,6 +52,25 @@ OPED_TITLES = {
     "opening theme", "ending theme", "theme", "title sequence",
 }
 
+# TITLES THAT MIGHT NOT MEAN THE THEME AT ALL.
+#
+# Sasaki and Peeps S1E6 is chaptered Intro 0-130s, OP 130-220s, ED 1330s. The
+# OP is at 130 seconds, so that 'Intro' is the COLD OPEN - a scene, with
+# dialogue in it. Other groups do use 'Intro' for the theme itself. The title
+# alone cannot tell you which, and the cost of being wrong is not the same
+# for both readers:
+#
+#   moving a listening window off a cold open costs nothing - the sample is
+#   taken from elsewhere and the language is the same
+#
+#   subtracting a cold open from the subtitle line count removes REAL
+#   dialogue from the number that decides dialogue-or-signs, and a signs
+#   verdict is what gets a track dropped as a duplicate
+#
+# So callers who are about to act irreversibly ask with strict=True and get
+# only the titles that can mean nothing but a theme.
+MAYBE_NOT_A_THEME = {"intro", "outro", "credits", "next", "preview"}
+
 # A SINGLE BLOCK MAY NOT CLAIM MORE THAN THIS MUCH OF THE FILE. An opening is
 # ninety seconds; an ending is ninety seconds. Plex marked a 22-minute episode
 # of 3rd Rock with a 7.7-minute "intro", and a reader that believed it would
@@ -66,20 +85,24 @@ MAX_SHARE = 0.15
 MAX_TOTAL_SHARE = 0.34
 
 
-def spans(data: dict | None) -> list | None:
+def spans(data: dict | None, strict: bool = False) -> list | None:   # noqa: ARG001
     r"""[(start_s, end_s, title)] for the OP/ED blocks in a probe.
 
     None means NOBODY LOOKED - the probe predates chapters being asked for,
     so there is no evidence either way. [] means the file was read and names
     no opening or ending. Callers must tell those apart: the first is a gap
     in what nuarr knows and the second is a fact about the file.
+
+    Every named block comes back; deciding which of the ambiguous ones are
+    really themes needs the runtime, so it happens in sane().
     """
     if not data or "chapters" not in data:
         return None
     out = []
     for c in (data.get("chapters") or []):
         title = ((c.get("tags") or {}).get("title") or "").strip()
-        if title.lower() not in OPED_TITLES:
+        low = title.lower()
+        if low not in OPED_TITLES:
             continue
         try:
             a = float(c.get("start_time") or 0)
@@ -91,12 +114,52 @@ def spans(data: dict | None) -> list | None:
     return out
 
 
-def sane(blocks: list | None, duration: float) -> list:
-    """Drop blocks too big to be a theme, and give up if too many are."""
+# An ambiguous block starting within this much of the top is an opening
+# rather than a scene; one starting after this much of the way through is an
+# ending. Between the two it is neither, whatever it is called.
+HEAD_S = 120.0
+TAIL_SHARE = 0.80
+
+
+def sane(blocks: list | None, duration: float, strict: bool = False) -> list:
+    r"""Drop blocks too big to be a theme, and give up if too many are.
+
+    strict=True also resolves the ambiguous titles - see MAYBE_NOT_A_THEME -
+    by WHERE THEY SIT, because the word cannot do it and the position can:
+
+        Sasaki and Peeps   Intro 0-130s, OP 130-220s
+            something unambiguous claims to be the theme AFTER this Intro, so
+            the Intro is the cold open before it. It keeps its dialogue.
+
+        Farming Life       Intro 3-91s, Credits 1336-1432s of 1432s
+            nothing else claims the theme, the Intro starts at the top and
+            runs ninety seconds, the Credits are the last ninety-six seconds.
+            Both are what they look like.
+
+    Callers about to remove something irreversible ask strictly; a caller
+    only moving a sample point does not need to.
+    """
     if not blocks or duration <= 0:
         return []
     keep = [(a, b, t) for a, b, t in blocks
             if (b - a) <= duration * MAX_SHARE]
+    if strict:
+        sure = [(a, b, t) for a, b, t in keep
+                if (t or "").strip().lower() not in MAYBE_NOT_A_THEME]
+        out = []
+        for a, b, t in keep:
+            if (t or "").strip().lower() not in MAYBE_NOT_A_THEME:
+                out.append((a, b, t))
+                continue
+            if a >= duration * TAIL_SHARE:
+                out.append((a, b, t))            # an ending
+                continue
+            if a <= HEAD_S and not any(s0 > a for s0, _e, _tt in sure):
+                out.append((a, b, t))            # an opening, nothing after it
+                continue
+            # Anywhere else, or with a real theme following it, this is a
+            # scene and its lines are somebody's dialogue.
+        keep = out
     if sum(b - a for a, b, _t in keep) > duration * MAX_TOTAL_SHARE:
         return []
     return keep
@@ -121,7 +184,8 @@ def read(path: str, timeout: float = 45.0) -> list | None:
         return None
 
 
-def for_file(file_id: int, path: str = "", live: bool = False) -> list | None:
+def for_file(file_id: int, path: str = "", live: bool = False,
+             strict: bool = False) -> list | None:
     r"""The OP/ED blocks for one file, from the stored probe where possible.
 
     live=True falls back to reading the file when the cached probe predates
@@ -137,7 +201,7 @@ def for_file(file_id: int, path: str = "", live: bool = False) -> list | None:
             data = json.loads(r["json"])
     except Exception:                                        # noqa: BLE001
         data = None
-    got = spans(data)
+    got = spans(data, strict)
     if got is not None:
         return got
     if not live or not path or not os.path.exists(path):
@@ -145,7 +209,7 @@ def for_file(file_id: int, path: str = "", live: bool = False) -> list | None:
     ch = read(path)
     if ch is None:
         return None
-    return spans({"chapters": ch})
+    return spans({"chapters": ch}, strict)
 
 
 def dodge(fracs, duration: float, blocks: list, secs: float = 30.0,

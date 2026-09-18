@@ -337,15 +337,37 @@ def _inspect_init() -> None:
         # acked: you have seen what your choice did and taken the row off
         # the list. Setting a kind is not that - the row has to stay until a
         # button is pressed, or the picker becomes a way to lose rows.
+        # plain_out: plain non-sign-style lines OUTSIDE the OP/ED, and
+        # oped_s: how many seconds of theme that was measured against.
+        #
+        # BOTH NULLABLE, AND THE NULL MEANS SOMETHING. plain_out is NULL when
+        # nuarr does not know where this file's theme is, which is most of the
+        # library - only 15% of files name an OP or ED chapter. Writing the
+        # unrestricted count into plain_out instead would say "no lyrics here"
+        # about a file nobody checked, and this column decides whether a
+        # subtitle track is kept.
+        #
+        # oped_s = -1 likewise separates "never looked for chapters" from
+        # "looked, and this file names none" (0).
         for col, decl in (("plain", "INTEGER"), ("chosen", "TEXT"),
-                          ("acked", "INTEGER")):
+                          ("acked", "INTEGER"),
+                          ("plain_out", "INTEGER"), ("oped_s", "REAL")):
             try:
                 cur.execute(f"ALTER TABLE subtitle_shape ADD COLUMN {col} {decl}")
             except Exception:                                    # noqa: BLE001
                 pass
 
 
-def _read_events(path: str, mkv_track_id: int) -> dict | None:
+def _ass_secs(t: str) -> float:
+    """'0:01:28.50' -> 88.5. -1 when it is not a timestamp."""
+    try:
+        h, m, rest = t.strip().split(":")
+        return int(h) * 3600 + int(m) * 60 + float(rest)
+    except Exception:                                            # noqa: BLE001
+        return -1.0
+
+
+def _read_events(path: str, mkv_track_id: int, oped=None) -> dict | None:
     r"""Pull one text subtitle track out and describe its SHAPE.
 
     Never its words - this is about where the lines are and what the styles
@@ -392,7 +414,13 @@ def _read_events(path: str, mkv_track_id: int) -> dict | None:
         # line, which is exactly what makes an SRT a dialogue format. The
         # cue count IS the plain count.
         srt_n = len(re.findall(r"^\d+\s*$", text, re.M))
+        # An SRT carries no styles, so there is nothing for the theme to
+        # hide in and nothing to restrict - but the column still has to
+        # distinguish "no lyrics outside" from "nobody looked".
         return {"events": srt_n, "styles": 1 if srt_n else 0, "plain": srt_n,
+                "plain_out": (srt_n if oped is not None else None),
+                "oped_s": (sum(b - a for a, b, _t in (oped or []))
+                           if oped is not None else -1.0),
                 "pos_pct": 0.0, "signish": 0,
                 "detail": (f"{srt_n} plain cues, no styling - a text format "
                            f"that can only be dialogue" if srt_n
@@ -417,16 +445,34 @@ def _read_events(path: str, mkv_track_id: int) -> dict | None:
     # calling that "a typesetter's palette" was the mistake that cleared it.
     styles: dict = {}
     positioned = plain = 0
+    # SEPARATELY, THE ONES OUTSIDE THE THEME. Song lyrics are plain lines in
+    # a style often called nothing more suspicious than Default, so they pass
+    # both halves of the test above and a track that is only an opening and an
+    # ending reads as dialogue. The theme is the one place they can be
+    # excluded from without excluding real speech - see chapters.py.
+    plain_out = 0 if oped is not None else None
+    in_oped = 0
     for ln in lines:
         parts = ln.split(",", 9)
         if len(parts) < 10:
             continue
         st = parts[3].strip()
         styles[st] = styles.get(st, 0) + 1
+        theme = False
+        if oped:
+            a, b = _ass_secs(parts[1]), _ass_secs(parts[2])
+            if a >= 0:
+                if b < a:
+                    b = a
+                theme = any(a < e and b > s0 for s0, e, _t in oped)
+                if theme:
+                    in_oped += 1
         if _POSITIONED.search(parts[9]):
             positioned += 1
         elif not _STYLE_SIGN.search(st or ""):
             plain += 1
+            if plain_out is not None and not theme:
+                plain_out += 1
     n = max(1, len(lines))
     named = sorted(s for s in styles if _STYLE_SIGN.search(s or ""))
     top = max(styles.items(), key=lambda kv: kv[1]) if styles else ("", 0)
@@ -441,9 +487,25 @@ def _read_events(path: str, mkv_track_id: int) -> dict | None:
         bits.append("sign styles " + ", ".join(f"{s!r}" for s in named[:3]))
     if share:
         bits.append(f"{share*100:.0f}% positioned with \\pos or \\move")
+    if oped is not None and plain_out is not None and plain_out != plain:
+        bits.append(f"{plain - plain_out} of them inside the OP/ED")
     return {"events": len(lines), "styles": len(styles), "plain": plain,
+            "plain_out": plain_out,
+            "oped_s": (sum(b - a for a, b, _t in (oped or []))
+                       if oped is not None else -1.0),
             "pos_pct": round(share * 100, 1), "signish": len(named),
             "detail": "; ".join(bits)}
+
+
+def _duration_of(file_id: int) -> float:
+    """Runtime in seconds, for judging whether a chapter is theme-sized."""
+    try:
+        with cursor() as cur:
+            r = cur.execute("SELECT duration FROM files WHERE id=?",
+                            (int(file_id),)).fetchone()
+        return float((r and r["duration"]) or 0.0)
+    except Exception:                                            # noqa: BLE001
+        return 0.0
 
 
 # What a shape row says when the track could not be read at all. See
@@ -455,19 +517,48 @@ UNREADABLE_WHY = "could not be read - not a text track, or mkvextract refused"
 def shape_of(file_id: int, path: str, track: int, size: int,
              mkv_track_id: int) -> dict | None:
     """The cached shape of one track, reading it only when it is not known."""
+    r = None
     try:
         _inspect_init()
         with cursor() as cur:
             r = cur.execute(
                 "SELECT * FROM subtitle_shape WHERE file_id=? AND track=? "
                 "  AND size=?", (int(file_id), int(track), int(size))).fetchone()
-        # A row read before `plain` existed is a row that has to be read
-        # again - it cannot answer the question that now decides everything.
-        if r and r["plain"] is not None:
-            return dict(r)
     except Exception:                                            # noqa: BLE001
         return None
-    got = _read_events(path, mkv_track_id)
+    # WHERE THIS FILE'S THEME IS, if it says. None means nobody knows, which
+    # is most of the library - only 15% of files name an OP or ED chapter -
+    # and the reader is told None rather than an empty list so it can leave
+    # plain_out NULL instead of claiming there are no lyrics.
+    oped = None
+    try:
+        from . import chapters as _ch
+        # strict: an ambiguous chapter title is only treated as a theme when
+        # its POSITION says so. This number decides dialogue-or-signs and a
+        # signs verdict is what drops a track, so a cold open chaptered
+        # 'Intro' must not have its dialogue subtracted - see chapters.sane.
+        found = _ch.for_file(int(file_id), path, live=True)
+        if found is not None:
+            oped = _ch.sane(found, _duration_of(file_id), strict=True)
+    except Exception:                                            # noqa: BLE001
+        oped = None
+    try:
+        # A row read before `plain` existed is a row that has to be read
+        # again - it cannot answer the question that now decides everything.
+        #
+        # AND SO IS ONE READ BEFORE THE THEME WAS KNOWN, but only when the
+        # theme is known NOW and this file actually has one. A file with no
+        # OP/ED chapter gets the same answer either way, so re-reading it
+        # would be an mkvextract for nothing - and this sweep is bounded at
+        # eighty reads a scan, so spending them on files that cannot change
+        # is spending them on nothing.
+        if r and r["plain"] is not None:
+            stale = (oped and r["plain_out"] is None)
+            if not stale:
+                return dict(r)
+    except Exception:                                            # noqa: BLE001
+        return None
+    got = _read_events(path, mkv_track_id, oped)
     if got is None:
         # A TRACK THAT CANNOT BE READ IS AN ANSWER, AND IT HAS TO BE STORED.
         #
@@ -502,16 +593,18 @@ def shape_of(file_id: int, path: str, track: int, size: int,
         with cursor() as cur:
             cur.execute(
                 "INSERT INTO subtitle_shape(file_id,track,size,at,events,"
-                "  styles,pos_pct,signish,detail,plain) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?) "
+                "  styles,pos_pct,signish,detail,plain,plain_out,oped_s) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(file_id,track) DO UPDATE SET size=excluded.size, "
                 "  at=excluded.at, events=excluded.events, "
                 "  styles=excluded.styles, pos_pct=excluded.pos_pct, "
                 "  signish=excluded.signish, detail=excluded.detail, "
-                "  plain=excluded.plain",
+                "  plain=excluded.plain, plain_out=excluded.plain_out, "
+                "  oped_s=excluded.oped_s",
                 (int(file_id), int(track), int(size), time.time(),
                  got["events"], got["styles"], got["pos_pct"], got["signish"],
-                 got["detail"][:300], got.get("plain") or 0))
+                 got["detail"][:300], got.get("plain") or 0,
+                 got.get("plain_out"), got.get("oped_s")))
     except Exception:                                            # noqa: BLE001
         pass
     return got
@@ -791,8 +884,30 @@ def kind_of(sh: dict, minutes: float) -> dict:
         return {"kind": sh["chosen"], "rate": 0.0, "score": 100,
                 "why": f"set by hand to {KIND_WORDS.get(sh['chosen'], sh['chosen'])}",
                 "chosen": True}
+    # THE LYRICS DO NOT VOTE, WHERE NUARR KNOWS WHERE THEY ARE.
+    #
+    # A song subtitle carries no \pos and sits in a style called Default or
+    # Romaji, so it is "a plain line in a non-sign style" by both halves of
+    # this test - and a track that is only an opening and an ending therefore
+    # read as dialogue. Restricting the count to lines outside the theme, over
+    # the runtime outside the theme, removes them from both sides of the rate.
+    # Measured: Gundam 00's 'Signs/Titles/OP & ED Karaoke' track has 37 events
+    # of which 73% are in the theme, against 347 in the dialogue track of
+    # which 8% are.
+    #
+    # ONLY WHERE IT IS KNOWN. plain_out is NULL for the ~85% of files that
+    # name no OP/ED chapter, and the fallback is the number this always used.
+    # A zero read out of a NULL would say "no dialogue outside the theme"
+    # about a file whose theme was never found, in the one place that decides
+    # whether a subtitle track is kept.
     plain = int(sh.get("plain") or 0)
     mins = max(1.0, float(minutes or 0))
+    restricted = sh.get("plain_out")
+    if restricted is not None:
+        oped_s = float(sh.get("oped_s") or 0.0)
+        if oped_s > 0:
+            mins = max(1.0, mins - oped_s / 60.0)
+        plain = int(restricted)
     rate = plain / mins
     if not sh.get("events"):
         return {"kind": NONE, "rate": 0.0, "score": 100,
