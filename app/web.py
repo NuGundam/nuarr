@@ -37339,6 +37339,8 @@ function skColor(r){
   if(r.auto==='dismiss') return 'var(--dim)';
   return 'var(--warn)';
 }
+// The four kinds, for a row that did not come with its own list.
+let SUBS_KINDS=[];
 function skRows(){
   // EVERY ROW A BATCH CAN DO SOMETHING WITH.
   //
@@ -38291,6 +38293,7 @@ async function snActMany(btn){
 }
 
 function skPaint(force){
+  try{ if(_sk&&_sk.kinds&&_sk.kinds.length) SUBS_KINDS=_sk.kinds; }catch(e){}
   const el=document.getElementById('skPanel'); if(!el||!_sk) return;
   const d=_sk, all=d.rows||[], c=d.counts||{}, P=d.picture||{}, T=d.tracks||{}, S=d.state||{};
   // Declared with the rest of the payload, not beside the bar that first drew
@@ -38478,32 +38481,56 @@ function skPaint(force){
   // columns; the question's own buttons sit in the answer column, and "just
   // this one" travels with them.
   const askRows=skAsksShown().slice(0,60).map(r=>(r.asks||[]).map(a=>{
-    const kind=a.kind||(a.q==='title'?(a.to||''):'');
+    // CELL FOR CELL A READER ROW. Same caret, label, filename line, library,
+    // added, where, picker with "read as" under it, sure, title, two buttons.
+    // The only differences are the ones that are true: a track question's
+    // picker is disabled because there is no reading to overrule, and the
+    // question sentence and the "just this one" scope live in the expanded
+    // detail rather than on the face of the row.
+    const pic=(a.q==='picture');
+    const kind=a.kind||(pic?'':(a.to?'dialogue':''));
     const [word,col]=SKW[kind]||[kind||'','var(--dim)'];
-    const where=a.q==='picture'?'picture':(a.q==='title'&&a.ord!=null?`track ${a.ord+1}`:'—');
-    const title=a.q==='title'
-      ? `<span class="mono" style="font-size:10.5px">${esc(a.from||'')}</span>${
-          a.to?`<div class="dim" style="font-size:10px">→ ${esc(a.to)}</div>`:''}`
-      : '<span class="dim">—</span>';
+    const id='ask:'+r.file_id+':'+a.q, open=_skOpen.has(id);
+    const fname=String(r.name||r.path||'').split('\\').pop();
+    const label=r.label||fname.replace(/\.[^.]+$/,'');
+    const tr=(a.q==='title'&&a.ord!=null)?('track '+(a.ord+1)):(pic?'picture':'—');
+    const sureCol=(a.sure==null)?'var(--dim)':'var(--warn)';
     const jk=r.file_id+':'+esc(a.q);
-    return `<tr style="background:rgba(232,163,61,.05)">
+    return `<tr>
       <td class="l"></td>
-      <td class="l" title="${esc(a.asking||'')}">${esc(r.name||'').replace(/\.[^.]+$/,'')}
-        <div class="dim" style="font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(a.asking||'')}</div></td>
+      <td class="l" style="cursor:pointer" title="${esc(String(r.path||''))}"
+        onclick="skToggleOpen('${id}', event)"
+        ><span class="actcaret">${open?'▾':'▸'}</span>${esc(label)}
+        <div class="dim" style="font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-left:14px"
+          >${esc(fname)}</div></td>
       <td class="c dim">${esc(r.library||'')}</td>
-      <td class="c dim"></td>
-      <td class="c"><span style="color:${a.q==='picture'?'#6fb0ff':'var(--dim)'}">${where}</span></td>
-      <td class="c"><span style="font-size:10.5px;color:${col}">${esc(word)}</span></td>
-      <td class="c mono" style="font-variant-numeric:tabular-nums;color:#e8a33d">${a.sure!=null?a.sure+'%':''}</td>
-      <td class="l">${title}</td>
-      <td class="r askhost"><span style="display:inline-flex;gap:5px;align-items:center;flex-wrap:wrap;justify-content:flex-end">${
-        (a.options||[]).map(o=>`<button class="rmb" title="${esc(o.what||'')}"
-           onclick="subAnswer(${r.file_id},'${esc(a.q)}','${esc(o.v)}',this,answerScope(this))">${esc(o.label||o.v)}</button>`).join('')}
-        <label class="dim" style="font-size:10px;display:inline-flex;gap:3px;align-items:center;cursor:pointer"
-          title="Off: remembered for the whole show and its release group. On: this file only.">
-          <input type="checkbox" class="askjust" style="margin:0" ${_askJust.has(jk)?'checked':''}
-            onchange="askJustToggle('${jk}', this.checked)">just this one</label></span></td>
-    </tr>`;}).join('')).join('');
+      <td class="c dim" style="font-size:10.5px" title="${r.added
+        ? esc(new Date(r.added*1000).toLocaleString())
+        : 'nuarr has no record of when this file arrived'}">${r.added?ago(r.added):'—'}</td>
+      <td class="c" style="font-size:10.5px;color:${pic?'#6fb0ff':'var(--dim)'}"
+        title="${pic?'Words burned into the picture of a file that reports no subtitle track':'A text track inside the file'}">${tr}</td>
+      <td class="c">
+        <select class="kindsel" ${pic?`onchange="hsSetKind(${r.file_id},this.value,this)"`:'disabled'}
+          title="${esc(pic?'Read as '+word+'. If that is wrong, set it here before answering - the choice is kept and the next sweep will not overwrite it.'
+                         :'What the reading says this track carries. Answer with the buttons on the right.')}">
+          ${(SUBS_KINDS||[]).map(k=>`<option value="${esc(k.id)}"${k.id===kind?' selected':''}>${esc(k.word)}</option>`).join('')}
+        </select>
+        <div style="font-size:9.5px;color:${col}">read as ${esc(word)}</div></td>
+      <td class="c mono" style="font-variant-numeric:tabular-nums;color:${sureCol}"
+          title="${esc(a.asking||'')}">${a.sure!=null?(a.sure+'%'):''}</td>
+      <td class="l mono">${pic?'<span class="dim">—</span>'
+        :`<span style="color:var(--warn)" title="${esc(a.from||'')}">${esc(a.from||'')}</span>${
+           a.to?`<div style="font-size:10px;color:var(--ok);overflow:hidden;text-overflow:ellipsis" title="${esc(a.to)}">→ ${esc(a.to)}</div>`:''}`}</td>
+      <td class="r askhost">${(a.options||[]).map(o=>`<button class="rmb" title="${esc(o.what||'')}"
+          onclick="subAnswer(${r.file_id},'${esc(a.q)}','${esc(o.v)}',this,answerScope(this))">${esc(o.label||o.v)}</button>`).join('')}<span style="display:none"><input type="checkbox" class="askjust" ${_askJust.has(jk)?'checked':''}></span></td>
+    </tr>${open?`<tr id="skdet-${esc(id)}" style="background:rgba(255,255,255,.025)"><td colspan="9" style="padding:6px 10px 7px 34px;border-bottom:1px solid var(--line);font-size:11px">
+      <div>${esc(a.asking||'')}</div>
+      <label class="dim" style="font-size:10.5px;display:inline-flex;gap:5px;align-items:center;cursor:pointer;margin-top:4px"
+        title="Off: your answer is remembered for the whole show and its release group, so the next episode does not ask. On: this file only; other episodes will still ask.">
+        <input type="checkbox" class="askjust" style="margin:0" ${_askJust.has(jk)?'checked':''}
+          onchange="askJustToggle('${jk}', this.checked); const h=this.closest('tr').previousElementSibling.querySelector('.askhost input.askjust'); if(h) h.checked=this.checked;"> just this one - remember the answer for this file only</label>
+      <div class="mono dim" style="font-size:10px;word-break:break-all;margin-top:3px">${esc(r.path||'')}</div></td></tr>`:''}`;
+  }).join('')).join('');
   const nAsk=skAsksShown().reduce((n,r)=>n+(r.asks||[]).length,0);
   const table=(rows.length||askRows)?`${markBar}${selBar}
       <div class="rowbox scrollbox"><table class="sktbl" style="width:100%;font-size:11.5px;table-layout:fixed">

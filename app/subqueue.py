@@ -975,12 +975,25 @@ def asking(limit: int = 200) -> list:
     """Every file with a question on it, and what the question is."""
     init()
     out = []
+    from .db import display_label
     with cursor() as cur:
         for r in cur.execute(
-                "SELECT file_id, path, name, library, disk, asks, steps, why "
-                "  FROM sub_queue WHERE asks != '[]' "
-                " ORDER BY queued_at LIMIT ?", (int(limit),)):
+                # THE SAME LABEL AND DATE THE READER ROWS CARRY, so a question
+                # can be drawn as one of them rather than beside them.
+                "SELECT q.file_id, q.path, q.name, q.library, q.disk, q.asks, "
+                "       q.steps, q.why, f.title, f.season, f.episode, "
+                "       f.first_seen "
+                "  FROM sub_queue q LEFT JOIN files f ON f.id = q.file_id "
+                " WHERE q.asks != '[]' "
+                " ORDER BY q.queued_at LIMIT ?", (int(limit),)):
             d = dict(r)
+            try:
+                d["label"] = display_label(d.pop("title", None),
+                                           d.pop("season", None),
+                                           d.pop("episode", None)) or ""
+            except Exception:                                    # noqa: BLE001
+                d["label"] = ""
+            d["added"] = float(d.pop("first_seen", 0) or 0.0)
             try:
                 d["asks"] = json.loads(d["asks"] or "[]")
             except Exception:                                    # noqa: BLE001
