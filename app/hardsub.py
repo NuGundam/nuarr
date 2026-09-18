@@ -93,6 +93,17 @@ DIALOGUE_RATIO = 0.20
 # Real words, not two stray glyphs.
 MIN_CHARS = 6
 
+# BELOW THIS A BAND IS BLANK, whatever the font. MIN_PX is a guess about how
+# many pixels a CAPTION makes; this is the far weaker claim that something is
+# there at all, and it exists so the OCR has candidates to calibrate from on a
+# file whose captions sit under MIN_PX. Measured on Velvet S01E47: blank bands
+# read 0 and captions read 60-100, with one frame at 19 between them.
+CAL_FLOOR_PX = 25
+# Once the OCR has confirmed which frames really carry captions, the counting
+# floor is set from the DIMMEST of them, with this much slack for a frame
+# holding one short line rather than two long ones.
+CAL_SLACK = 0.70
+
 # WHAT THE FIRST SWEEP TAUGHT, IN ONE PASS OVER EIGHT FILES.
 #
 # The detector found burned-in TEXT correctly and then called all of it
@@ -378,7 +389,27 @@ def probe_one(file_id: int, samples: int = SAMPLES,
     # caption band is a frame with more caption on it.
     words: list = []
     text_frames = 0
-    for t, _c in sorted(low_hit, key=lambda x: -x[1])[:max(0, confirm)]:
+    # THE BRIGHTEST FRAMES, WHETHER OR NOT THEY CLEARED MIN_PX.
+    #
+    # MIN_PX is a claim about how many pixels a caption makes, and it was
+    # measured on one show. Velvet S01E47's captions read 60-100 against a
+    # floor of 120, so only 2 of 60 frames were ever offered to the OCR - and
+    # the rejected ones held "hope you can understand and that have your
+    # support". The candidates are topped up from everything that is not
+    # blank, so the OCR gets to see what this file's captions look like.
+    #
+    # Same number of Tesseract calls, and no extra decoding: every frame here
+    # has already been measured.
+    cand = [(t, c) for t, c in sorted(low_hit, key=lambda x: -x[1])]
+    if len(cand) < max(0, confirm):
+        seen_t = {t for t, _c in cand}
+        spare = sorted(((t, c) for t, c in low
+                        if t not in seen_t and c >= CAL_FLOOR_PX
+                        and c <= MAX_PX),
+                       key=lambda x: -x[1])
+        cand += spare[:max(0, confirm) - len(cand)]
+    lit: list = []                       # brightness of frames that held words
+    for t, _c in cand[:max(0, confirm)]:
         got = [w.lower() for w in _words(_read_text(path, t, LOW_BAND))
                if len(w) >= 3]
         # TWO REAL WORDS IN ONE FRAME, not two glyphs across four frames.
@@ -386,8 +417,67 @@ def probe_one(file_id: int, samples: int = SAMPLES,
         if len(got) >= 2:
             text_frames += 1
             words.extend(got)
+            if _FUNCTION & set(got):
+                lit.append(_c)           # a caption, and this is its weight
         if text_frames >= MIN_TEXT_FRAMES and len(set(words)) >= 5:
             break
+    # ONE LOOK UNDER THE FLOOR, WHEN NOTHING DIM HAS BEEN SEEN YET.
+    #
+    # The candidates above are the brightest frames, so on a file where a few
+    # frames DID clear MIN_PX the budget fills with those and the dim ones are
+    # never read. Velvet S01E03: four bright frames over a lit scene, a floor
+    # derived from them of 430, no recount, and the fifteen dim caption frames
+    # never shown to the OCR. The calibration could only ever find a dim font
+    # on a file where nothing at all was bright, which is not what an episode
+    # looks like - captions sit over whatever the scene happens to be.
+    #
+    # So if the OCR has not yet seen anything dimmer than the floor, and there
+    # are frames between blank and the floor, the brightest of them is read.
+    # One extra call, and it is the only way to answer the question the
+    # pre-filter was guessing at: are the dim frames captions, or noise.
+    if not [c for c in lit if c < MIN_PX]:
+        dim = sorted(((t, c) for t, c in low
+                      if CAL_FLOOR_PX <= c < MIN_PX), key=lambda x: -x[1])
+        for t, c in dim[:1]:
+            got = [w.lower() for w in _words(_read_text(path, t, LOW_BAND))
+                   if len(w) >= 3]
+            if len(got) >= 2:
+                text_frames += 1
+                words.extend(got)
+                if _FUNCTION & set(got):
+                    lit.append(c)
+
+    # AND NOW COUNT THE FRAMES AGAIN, AGAINST WHAT WAS ACTUALLY SEEN.
+    #
+    # `lit` holds the brightness of the frames the OCR read a line of speech
+    # out of. Those are captions, measured rather than assumed, so the dimmest
+    # of them is what a caption weighs in THIS file - and every frame at least
+    # that bright is one too. Without this the ratio still says 1/24, because
+    # the ratio is what decides dialogue from signs and it was reading a
+    # threshold rather than the picture.
+    #
+    # Only ever downwards, and only on the evidence of speech: a file with
+    # nothing on screen produces no lit frames, nothing is recalibrated, and
+    # the answer is the one it always gave.
+    calibrated = 0.0
+    if lit:
+        # NOT CONDITIONED ON HOW MANY FRAMES CLEARED THE OLD FLOOR. The first
+        # version only recalibrated when low_hit had already fallen below the
+        # dialogue ratio, and Velvet S01E03 sat exactly on the boundary - 4 of
+        # 24, 16.7%, called "signs" while the calibration that would have
+        # found the other fifteen never ran because 4 is not less than 4.
+        #
+        # The question is about the FONT, and the OCR has answered it by
+        # reading one. How many captions there are is the next question, and
+        # it cannot be asked until this one is settled.
+        calibrated = max(float(CAL_FLOOR_PX), min(lit) * CAL_SLACK)
+        if calibrated < MIN_PX:
+            low_hit = [(t, c) for t, c in low
+                       if calibrated <= c <= MAX_PX]
+            high_hit = [(t, c) for t, c in high
+                        if calibrated <= c <= MAX_PX]
+            ratio = len(low_hit) / max(1, read)
+
     uniq = sorted(set(words))
     speech = _FUNCTION & set(uniq)
     credits = _CREDITS & set(uniq)
@@ -441,8 +531,14 @@ def probe_one(file_id: int, samples: int = SAMPLES,
         state = SIGNS
         detail = (f"words in only {len(low_hit)}/{read} sampled frames - too "
                   f"sparse for dialogue, so signs or song captions")
+    if calibrated:
+        detail = (f"{detail}; the caption floor was set to {calibrated:.0f} "
+                  f"bright pixels from frames the OCR read speech out of, "
+                  f"rather than the default {MIN_PX} - a thinner font than "
+                  f"the one that number was measured on")
     return {"ok": True, "file_id": int(file_id), "path": path, "state": state,
             "low_hits": len(low_hit), "high_hits": len(high_hit),
+            "calibrated": round(calibrated, 1),
             "samples": read, "ratio": round(ratio, 3),
             "words": uniq[:12], "detail": detail,
             "has_track": bool((row.get("sub_langs") or "").strip())}
