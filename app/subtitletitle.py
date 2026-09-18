@@ -50,6 +50,7 @@ refetch classifier follows.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -336,7 +337,9 @@ _STYLE_SPLIT = re.compile(
 #
 #   1  the \b style test - "OP1 - English" counted as dialogue
 #   2  style names tokenised, so a numbered or glued theme style is a theme
-SHAPE_REV = 2
+#   3  the plain lines are fingerprinted, so a block repeated across episodes
+#      can be told from this episode's dialogue
+SHAPE_REV = 3
 
 
 def _style_is_sign(name: str) -> bool:
@@ -404,7 +407,13 @@ def _inspect_init() -> None:
                           # rev: which version of this reader counted it. See
                           # SHAPE_REV. NULL is "before there was one", which
                           # is every row that existed when this was added.
-                          ("rev", "INTEGER")):
+                          ("rev", "INTEGER"),
+                          # plain_sig: a fingerprint of the plain lines, so a
+                          # block that appears identically in a sibling
+                          # episode can be recognised as a muxed-in constant
+                          # rather than this episode's speech. See
+                          # _signature() and _repeat_index().
+                          ("plain_sig", "TEXT")):
             try:
                 cur.execute(f"ALTER TABLE subtitle_shape ADD COLUMN {col} {decl}")
             except Exception:                                    # noqa: BLE001
@@ -470,7 +479,12 @@ def _read_events(path: str, mkv_track_id: int, oped=None) -> dict | None:
         # An SRT carries no styles, so there is nothing for the theme to
         # hide in and nothing to restrict - but the column still has to
         # distinguish "no lyrics outside" from "nobody looked".
+        # NO SIGNATURE FOR AN SRT. It has no styles, so it cannot carry a
+        # karaoke block separate from its dialogue, and the whole file is the
+        # "plain lines" - two episodes matching would mean two episodes with
+        # the same subtitles, which is a broken release rather than a theme.
         return {"events": srt_n, "styles": 1 if srt_n else 0, "plain": srt_n,
+                "plain_sig": "",
                 "plain_out": (srt_n if oped is not None else None),
                 "oped_s": (sum(b - a for a, b, _t in (oped or []))
                            if oped is not None else -1.0),
@@ -498,6 +512,11 @@ def _read_events(path: str, mkv_track_id: int, oped=None) -> dict | None:
     # calling that "a typesetter's palette" was the mistake that cleared it.
     styles: dict = {}
     positioned = plain = 0
+    # THE PLAIN LINES THEMSELVES, so another episode can be compared against
+    # them exactly. Text only - no timings, which drift by a frame between
+    # releases of the same script - sorted, so a reordered script still
+    # matches, and hashed, so the row stays one short column.
+    plain_text: list = []
     # SEPARATELY, THE ONES OUTSIDE THE THEME. Song lyrics are plain lines in
     # a style often called nothing more suspicious than Default, so they pass
     # both halves of the test above and a track that is only an opening and an
@@ -524,6 +543,7 @@ def _read_events(path: str, mkv_track_id: int, oped=None) -> dict | None:
             positioned += 1
         elif not _style_is_sign(st):
             plain += 1
+            plain_text.append(_norm_line(parts[9]))
             if plain_out is not None and not theme:
                 plain_out += 1
     n = max(1, len(lines))
@@ -543,11 +563,110 @@ def _read_events(path: str, mkv_track_id: int, oped=None) -> dict | None:
     if oped is not None and plain_out is not None and plain_out != plain:
         bits.append(f"{plain - plain_out} of them inside the OP/ED")
     return {"events": len(lines), "styles": len(styles), "plain": plain,
+            "plain_sig": _signature(plain_text),
             "plain_out": plain_out,
             "oped_s": (sum(b - a for a, b, _t in (oped or []))
                        if oped is not None else -1.0),
             "pos_pct": round(share * 100, 1), "signish": len(named),
             "detail": "; ".join(bits)}
+
+
+_LINE_TRIM = re.compile(r"\{[^}]*\}|\\[Nnh]|\s+")
+
+
+def _norm_line(text: str) -> str:
+    """One subtitle line, as words, with the typesetting taken off.
+
+    ASS override blocks carry \\pos coordinates and fade timings that differ
+    between two muxes of the same script, so a raw compare would miss a block
+    that is plainly the same words. What is left is the text a person reads.
+    """
+    return _LINE_TRIM.sub(" ", str(text or "")).strip().lower()
+
+
+def _signature(lines) -> str:
+    """A short, exact fingerprint of a track's plain lines.
+
+    SORTED, so a script reordered between releases still matches, and hashed
+    rather than stored, because the point is only ever whether two of them are
+    the same. Empty for a track with no plain lines - there is nothing to
+    compare and `plain = 0` has already answered the question.
+    """
+    got = [x for x in (lines or []) if x]
+    if not got:
+        return ""
+    h = hashlib.sha1()
+    for x in sorted(got):
+        h.update(x.encode("utf-8", "replace"))
+        h.update(b"\n")
+    return f"{len(got)}:{h.hexdigest()[:16]}"
+
+
+# WHICH EPISODE OF WHICH SHOW, from the path. The show folder is two up - the
+# season's parent - and the episode is the SxxExx the arrs put in the name.
+# Both are needed: the show so siblings are only compared with siblings, and
+# the episode so the same episode present twice as two releases counts once.
+_EPNUM = re.compile(r"[Ss](\d{1,3})[Ee](\d{1,4})")
+_REPEATS: dict = {"at": 0.0, "map": {}}
+_REPEATS_TTL = 120.0
+
+
+def _episode_of(path: str):
+    """('show folder', 'S01E06') or None when this is not an episode."""
+    try:
+        base = os.path.basename(path or "")
+        m = _EPNUM.search(base)
+        if not m:
+            return None
+        show = os.path.basename(os.path.dirname(os.path.dirname(path)))
+        if not show:
+            return None
+        return show.lower(), f"s{int(m.group(1))}e{int(m.group(2))}"
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _repeat_index() -> dict:
+    r"""(show, signature) -> how many DISTINCT episodes carry those lines.
+
+    Built over the whole table at once, which is a thousand rows and one
+    query, and held for two minutes: every caller wants the same map, and it
+    only changes when a track is re-read.
+
+    A show that changes its theme halfway has two signatures and therefore two
+    entries, and every episode matches its own half - which is the "2
+    different OP/ED" case, handled by not assuming there is one answer per
+    show.
+    """
+    now = time.time()
+    if now - _REPEATS["at"] < _REPEATS_TTL and _REPEATS["map"]:
+        return _REPEATS["map"]
+    seen: dict = {}
+    try:
+        _inspect_init()
+        with cursor() as cur:
+            for r in cur.execute(
+                    "SELECT s.plain_sig, f.path FROM subtitle_shape s "
+                    "  JOIN files f ON f.id = s.file_id "
+                    " WHERE COALESCE(s.plain_sig,'') != '' "
+                    "   AND f.state NOT IN ('deleted','duplicate')"):
+                ep = _episode_of(r["path"])
+                if ep:
+                    seen.setdefault((ep[0], r["plain_sig"]), set()).add(ep[1])
+    except Exception:                                            # noqa: BLE001
+        return _REPEATS["map"]
+    _REPEATS.update(at=now, map={k: len(v) for k, v in seen.items()})
+    return _REPEATS["map"]
+
+
+def repeats_of(path: str, sig: str) -> int:
+    """How many OTHER episodes of this show carry exactly these plain lines."""
+    if not sig:
+        return 0
+    ep = _episode_of(path)
+    if not ep:
+        return 0
+    return max(0, int(_repeat_index().get((ep[0], sig), 0)) - 1)
 
 
 def _duration_of(file_id: int) -> float:
@@ -630,10 +749,14 @@ def shape_of(file_id: int, path: str, track: int, size: int,
                     and not (r["chosen"] or "")):
                 stale = True
             if not stale:
-                return dict(r)
+                d = dict(r)
+                d["repeats"] = repeats_of(path, d.get("plain_sig") or "")
+                return d
     except Exception:                                            # noqa: BLE001
         return None
     got = _read_events(path, mkv_track_id, oped)
+    # A NEW SIGNATURE CHANGES WHO MATCHES WHOM, so the cached index has to go.
+    _REPEATS.update(at=0.0)
     if got is None:
         # A TRACK THAT CANNOT BE READ IS AN ANSWER, AND IT HAS TO BE STORED.
         #
@@ -668,20 +791,24 @@ def shape_of(file_id: int, path: str, track: int, size: int,
         with cursor() as cur:
             cur.execute(
                 "INSERT INTO subtitle_shape(file_id,track,size,at,events,"
-                "  styles,pos_pct,signish,detail,plain,plain_out,oped_s,rev) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "  styles,pos_pct,signish,detail,plain,plain_out,oped_s,"
+                "  rev,plain_sig) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(file_id,track) DO UPDATE SET size=excluded.size, "
                 "  at=excluded.at, events=excluded.events, "
                 "  styles=excluded.styles, pos_pct=excluded.pos_pct, "
                 "  signish=excluded.signish, detail=excluded.detail, "
                 "  plain=excluded.plain, plain_out=excluded.plain_out, "
-                "  oped_s=excluded.oped_s, rev=excluded.rev",
+                "  oped_s=excluded.oped_s, rev=excluded.rev, "
+                "  plain_sig=excluded.plain_sig",
                 (int(file_id), int(track), int(size), time.time(),
                  got["events"], got["styles"], got["pos_pct"], got["signish"],
                  got["detail"][:300], got.get("plain") or 0,
-                 got.get("plain_out"), got.get("oped_s"), SHAPE_REV))
+                 got.get("plain_out"), got.get("oped_s"), SHAPE_REV,
+                 got.get("plain_sig") or ""))
     except Exception:                                            # noqa: BLE001
         pass
+    got["repeats"] = repeats_of(path, got.get("plain_sig") or "")
     return got
 
 
@@ -702,7 +829,8 @@ def _shapes_for(file_ids) -> dict:
                 # the batch the PANEL is built from and it did not, so a file
                 # rewritten since the read was described by the old shape.
                 for r in cur.execute(
-                        f"SELECT s.* FROM subtitle_shape s "
+                        f"SELECT s.*, f.path AS _path "
+                        f"  FROM subtitle_shape s "
                         f"  JOIN files f ON f.id = s.file_id "
                         f" WHERE s.file_id IN ({qs}) "
                         f"   AND f.state NOT IN ('deleted','duplicate') "
@@ -975,6 +1103,36 @@ def kind_of(sh: dict, minutes: float) -> dict:
     # A zero read out of a NULL would say "no dialogue outside the theme"
     # about a file whose theme was never found, in the one place that decides
     # whether a subtitle track is kept.
+    # LINES THAT ARE WORD FOR WORD IN ANOTHER EPISODE ARE NOT THIS EPISODE'S.
+    #
+    # Erik: "2 or more files line up to have the same dialog lines ... it
+    # would increase the % for S+S". An episode's dialogue is unique to that
+    # episode; a karaoke script is muxed into every file unchanged. So a
+    # plain-line block that appears IDENTICALLY in a sibling cannot be
+    # speech - whatever style it was written in, and whether or not this file
+    # names an OP/ED chapter.
+    #
+    # ABOVE THE THEME CHECK BELOW because it is the stronger fact. That one
+    # needs the file to name its chapters, which 85% of the library does not;
+    # this one needs only a sibling. Measured on the count alone, over every
+    # shape in the library - within a series, distinct episodes, tracks with
+    # styles: a count shared with a sibling gave 346 signs / 68 hybrid / 2
+    # dialogue, a unique count 131 / 27 / 19. The two on the wrong side were
+    # count collisions, which is why the match is on a fingerprint of the
+    # lines and not on how many there are.
+    #
+    # THE NUMBER OF SIBLINGS IS THE CONFIDENCE. One is a pair - nearly always
+    # a theme, occasionally two releases of one script. Three cannot be
+    # anything else.
+    rep = int(sh.get("repeats") or 0)
+    if rep and int(sh.get("plain") or 0) > 0:
+        return {"kind": SIGNS, "rate": 0.0,
+                "score": 100 if rep >= 2 else 92,
+                "repeats": rep,
+                "why": (f"every one of its {int(sh['plain'])} plain lines "
+                        f"appears word for word in {rep} other episode"
+                        f"{'' if rep == 1 else 's'} of this show - a script "
+                        f"muxed into each file, not this episode's dialogue")}
     plain = int(sh.get("plain") or 0)
     mins = max(1.0, float(minutes or 0))
     restricted = sh.get("plain_out")
@@ -1126,6 +1284,16 @@ def scan(limit: int = 0) -> dict:
     # would have renamed 82 correctly-labelled signs tracks to "English".
     dropped, unread = [], 0
     known = _shapes_for([r["file_id"] for r in rows])
+    # HOW MANY SIBLINGS CARRY THE SAME LINES, filled in for the whole batch.
+    # _shapes_for reads the path alongside each row for exactly this: the
+    # answer is about a file's neighbours in its show folder, so the shape
+    # alone cannot produce it.
+    for _k, _sh in known.items():
+        try:
+            _sh["repeats"] = repeats_of(_sh.get("_path") or "",
+                                        _sh.get("plain_sig") or "")
+        except Exception:                                        # noqa: BLE001
+            _sh["repeats"] = 0
     for r in list(rows):
         sh = known.get((r["file_id"], r["track"]))
         # A row read before `plain` existed is unread for this purpose.
