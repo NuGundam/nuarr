@@ -37867,12 +37867,10 @@ function skMarkerHtml(){
     <div class="dim" style="font-size:11px;margin-top:6px;display:flex;gap:14px;
          flex-wrap:wrap">
       <span>last marked <b>${m.last_at?esc(ago(m.last_at)):'never'}</b></span>
-      <span title="The picture reader has no schedule. It runs on the shared idle runner - whenever the pool is quiet and nobody is watching - and marking rides on its pass.">the reader <b>${
+      <span title="The picture reader has no schedule. It runs on the shared idle runner - whenever the pool is quiet and nobody is watching - and marking rides on its pass. How much it still has to read is reported once, with the other two readers, in Reading the library above.">the reader <b>${
         m.reader_running?'<span style="color:var(--acc)">working now</span>'
         :(m.reader_paused?'<span style="color:var(--warn)">paused</span>'
-                         :'idle — waiting for a quiet pool')}</b>${
-        m.reader_left?` · <b>${fmt(m.reader_left)}</b> still to look at`
-                     :' · every file looked at'}</span>
+                         :'idle — waiting for a quiet pool')}</b></span>
       ${(m.eta&&auto&&m.auto_ready)?`<span>clearing them <b>${esc(hsDur(m.eta))}</b></span>`:''}
     </div>`});
 }
@@ -41060,6 +41058,36 @@ function subsScanLibs(sc){
     }).join('')}</div>`;
 }
 
+// THREE READERS, ONE PLACE THAT SAYS HOW FAR EACH HAS GOT.
+//
+// Erik: "can this be put into the main reader with everything else". The
+// picture reader's backlog was living in the marker-track panel, which is
+// about the WRITER - the blank English track - and the events reader's was in
+// its own settings section. Three progress lines in three panels is how the
+// page came to say "every file looked at" in one while another showed three
+// thousand waiting.
+//
+// The work stays in three passes because it genuinely is three jobs: stored
+// facts, frames off a disk, a demuxed track. Only the reporting is joined.
+function subsScanReaders(sc){
+  const R=(sc.readers||[]);
+  if(R.length<2) return '';
+  return `<div style="display:flex;gap:5px;flex-wrap:wrap;margin-top:6px">${
+    R.map(r=>{
+      const done=!r.left;
+      const col=r.running?'var(--acc)':(done?'var(--ok)':'#e8a33d');
+      return `<span class="capsc" style="font-size:10px;border-color:${col};
+          color:${col}" title="${esc(r.what||'')}">${
+        r.running?'<span class="busy"><span class="sp"></span></span> ':''}${
+        esc(r.name)} ${done?'<b>read through</b>'
+                           :`<b>${fmt(r.left)}</b> left`}</span>`;
+    }).join('')}</div>
+  <div class="dim" style="font-size:10.5px;margin-top:3px">three passes,
+    because they cost different things — one reads what is already stored, one
+    samples frames off a disk, one demuxes a track. This is every one of them
+    in a single line.</div>`;
+}
+
 function subsScanHtml(){
   const sc=_subs.scan||{};
   if(!sc.total) return '';
@@ -41113,6 +41141,7 @@ function subsScanHtml(){
                     :'last read'}</span>${
           esc(lastName)}${subsScanLastFound(sc)}</div>`:''}
       ${subsScanFound(sc)}
+      ${subsScanReaders(sc)}
       ${subsScanVisits(sc)}
       ${subsScanLibs(sc)}
       <div class="subswhy">What is inside each file, what is sitting beside it

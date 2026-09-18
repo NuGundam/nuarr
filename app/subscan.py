@@ -573,6 +573,42 @@ def _counts_now() -> dict:
     return out
 
 
+def _readers(out_left: int, running: bool) -> list:
+    """One line per subtitle reader: what it reads, and how much is left."""
+    rows = [{"key": "facts", "name": "the row for each file",
+             "what": "the stored probe, the folder beside it, and what the "
+                     "picture reader already decided - no disk beyond one "
+                     "directory listing",
+             "left": int(out_left), "running": bool(running)}]
+    try:
+        from . import hardsub
+        rows.append({
+            "key": "picture", "name": "the picture",
+            "what": f"{hardsub.SAMPLES} frames sampled off the disk and the "
+                    f"brightest shown to the OCR, for files that report no "
+                    f"subtitle track - this is the one that finds words "
+                    f"burned into the image",
+            "left": int(hardsub.untested() or 0),
+            "running": bool((hardsub.STATE or {}).get("running")),
+            "goto": "/settings#hardsub"})
+    except Exception:                                            # noqa: BLE001
+        pass
+    try:
+        from . import subtitletitle as _stt
+        d = (_stt._CACHE.get("data") or {})
+        rows.append({
+            "key": "events", "name": "a track's events",
+            "what": "the actual lines of a text track whose title contradicts "
+                    "its cue count, demuxed and counted - the only way to "
+                    "tell karaoke from dialogue",
+            "left": int(d.get("unread") or 0),
+            "running": bool((_stt.INSPECT_STATE or {}).get("running")),
+            "goto": "/settings#subtitletitle"})
+    except Exception:                                            # noqa: BLE001
+        pass
+    return rows
+
+
 def progress() -> dict:
     """The scan's own state, for the panel. Counted, left, rate, how long."""
     c = counts()
@@ -587,6 +623,20 @@ def progress() -> dict:
                       "the folder beside it for loose subtitle files",
                       "the picture reader's verdict",
                       "any line count already counted for a track"],
+            # THE OTHER TWO READERS, so one place answers "is anything
+            # still being read". They do different work on different clocks -
+            # this one reads stored facts, the picture reader samples frames
+            # off a disk, the events reader demuxes a track - and that is why
+            # they are three passes rather than one. It is not a reason for
+            # their PROGRESS to live in three panels: that is how the page
+            # came to say "every file looked at" in one place while another
+            # showed three thousand waiting.
+            #
+            # Each number comes from the reader that owns it. A count
+            # computed twice is a count that will eventually disagree with
+            # itself.
+            "readers": _readers(out_left=max(0, int(c.get("left") or 0)),
+                                running=bool(st["running"])),
             "batch": BATCH, "max_age_s": MAX_AGE_S,
             "last_found": dict(st.get("last_found") or {}),
             "opened": int(st.get("opened") or 0),
