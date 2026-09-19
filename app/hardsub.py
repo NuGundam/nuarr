@@ -940,10 +940,15 @@ def _save(d: dict) -> None:
             # with signs over the top. Twenty-four frames landing on the sparse
             # parts of an episode is exactly how that mistake happens, and it
             # would happen again on the next pass with the same twenty-four.
-            row = cur.execute("SELECT chosen, state FROM hardsub "
-                              " WHERE file_id=?",
+            row = cur.execute("SELECT * FROM hardsub WHERE file_id=?",
                               (int(d["file_id"]),)).fetchone()
             was = (row["state"] if row else None)
+            # WHAT AUTO WOULD HAVE DONE WITH THE OLD ROW, so the queue can be
+            # told when a re-read keeps the same kind but crosses a line.
+            try:
+                was_auto = verdict_for(row)["auto"] if row else ""
+            except Exception:                                    # noqa: BLE001
+                was_auto = ""
             if row and (row["chosen"] or ""):
                 d = dict(d, state=row["chosen"])
             cur.execute(
@@ -1002,8 +1007,21 @@ def _save(d: dict) -> None:
     # thousand rows that say exactly what they said before, and re-planning
     # those would be three thousand plans to reach three thousand identical
     # conclusions.
+    #
+    # OR THE LINE IT SITS ON MOVED. Same kind, 70% -> 90%, is the same state
+    # and a different plan: a mark step now, none before. The reader used to
+    # mark that file itself and the queue never needed to hear about it; now
+    # that the queue is the only writer, "the answer moved" includes the
+    # score crossing the mark or dismiss line, not just the kind changing.
     try:
-        if str(was or "") != str(d.get("state") or ""):
+        moved = str(was or "") != str(d.get("state") or "")
+        if not moved:
+            with cursor() as cur:
+                now_row = cur.execute("SELECT * FROM hardsub WHERE file_id=?",
+                                      (int(d["file_id"]),)).fetchone()
+            moved = bool(now_row) and (
+                verdict_for(now_row)["auto"] != was_auto)
+        if moved:
             from . import subqueue
             subqueue.requeue(int(d["file_id"]))
     except Exception:                                            # noqa: BLE001
@@ -1887,20 +1905,11 @@ async def sweep(limit: int = 0, force: bool = False) -> dict:
             if d["state"] != NONE:
                 found += 1
                 STATE["found"] = found
-                # AUTO ACTS ONLY WHERE THE EVIDENCE IS NOT IN DOUBT, and the
-                # asymmetry is deliberate: dismissing is a row disappearing
-                # and can be undone from the ignored list, while marking
-                # rewrites a file. Both ends are still gated on the same
-                # score, but the one with consequences sits behind a
-                # threshold a person set on purpose.
-                if mode() == "auto":
-                    acted = await asyncio.to_thread(_auto_one, r["file_id"])
-                    if acted == "mark":
-                        auto_marked += 1
-                        STATE["auto_marked"] = auto_marked
-                    elif acted == "dismiss":
-                        auto_dropped += 1
-                        STATE["auto_dropped"] = auto_dropped
+                # ACTING IS THE QUEUE'S JOB, not the sweep's - see _do_one.
+                # The sweep is the pre-queue reader and no button reaches it
+                # any more; it is kept so a one-off read can still be called
+                # by hand, but it measures only. auto_marked/auto_dropped
+                # stay in the result at zero for whoever still reads them.
     finally:
         took = max(0.001, time.time() - t0)
         # SECONDS PER FILE, SMOOTHED ACROSS RUNS. One run of twenty files is a
@@ -2256,7 +2265,18 @@ def _pending() -> list:
 
 
 def _do_one(r: dict, report=None) -> dict:
-    """Sample one file's frames, save the verdict, and act if auto says so."""
+    """Sample one file's frames and save the verdict. Nothing more.
+
+    THIS USED TO MARK THE FILE TOO, in auto, the moment the verdict was saved
+    - while subplan rule 4 planned a `mark` step for the same file on the
+    queue. Two writers for one reason: the log showed twenty files marked
+    here "on its own" and twenty-one marked by queue steps, and which one got
+    a given file was a race. mark_one's guards stopped a second track, but
+    the direct path skipped the queue's hold, ask and precedence rules. The
+    reading is a measurement; acting on it is the queue's job (see the note
+    at startup in web.py). So: measure, save, and the re-plan that follows
+    every new reading puts the mark on the queue if the score earns it.
+    """
     d = probe_one(r["file_id"], on=report)
     if not d.get("ok"):
         return {"ok": False, "why": d.get("why") or "could not sample it"}
@@ -2266,8 +2286,6 @@ def _do_one(r: dict, report=None) -> dict:
         except Exception:                                        # noqa: BLE001
             pass
     _save(d)
-    if d["state"] != NONE and mode() == "auto":
-        _auto_one(r["file_id"])
     return {"ok": True, "state": d["state"]}
 
 

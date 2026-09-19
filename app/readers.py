@@ -496,6 +496,18 @@ def _subread_plan(r: dict) -> str:
                      "detail": ""}]})
 
 
+async def feed_subread_now(depth: int | None = None) -> dict:
+    """The button. Top the queue up this second, whatever the empty cache
+    says - a person who pressed it has just changed something, or wants to
+    see the readers move, and "nothing was pending ten minutes ago" is not an
+    answer to that. The reads then run as subread jobs on the workers, where
+    they show as cards, count on the disk panel, and stop when the queue is
+    paused - which is why this replaced the in-process readers the button
+    used to run."""
+    _SUBREAD_EMPTY["at"] = 0.0
+    return await topup_subread(depth)
+
+
 async def topup_subread(depth: int | None = None) -> dict:
     from . import jobs
     depth = DEPTH["subread"] if depth is None else int(depth)

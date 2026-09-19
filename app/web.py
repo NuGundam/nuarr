@@ -8205,10 +8205,15 @@ async def api_subkind_dismiss_batch(ids: str = ""):
 
 @app.post("/api/subkind/run")
 async def api_subkind_run():
-    """Both readers, now. The button is the decision, so neither yields."""
-    from . import subkind
-    asyncio.create_task(subkind.run(force=True))
-    return {"ok": True}
+    """Read some now - as jobs. This used to run both readers in-process
+    (subkind.run: hardsub.sweep + stt.inspect_paced, force=True): outside the
+    worker slots, blind to pause and the busy gate, invisible in Processing
+    System, and its candidate list did not know what the queue was about to
+    read, so a file could be sampled twice. The queue's subread feeder is the
+    one reader now; the button just tops it up this second."""
+    from . import readers
+    r = await readers.feed_subread_now()
+    return {"ok": bool(r.get("ok", True)), **r}
 
 
 @app.get("/api/hardsub")
@@ -8386,9 +8391,11 @@ async def api_hardsub_mode(mode: str = "", mark_at: int = -1,
 
 @app.post("/api/hardsub/run")
 async def api_hardsub_run(limit: int = 0):
-    """Sweep now. Does not yield to the gate - the button IS the decision."""
-    from . import hardsub
-    return await hardsub.sweep(limit=limit, force=True)
+    """Same button on the evidence panel; same answer - feed the queue. The
+    in-process sweep was the second writer in auto (see hardsub._do_one)."""
+    from . import readers
+    r = await readers.feed_subread_now()
+    return {"ok": bool(r.get("ok", True)), **r}
 
 
 @app.post("/api/hardsub/check")
@@ -16550,22 +16557,42 @@ function idleEl(id){
   // WRITING TEXT IN BETWEEN FORGETS THE KEY. `el.textContent='loading…'`
   // followed by the same innerHTML as before must render, not be skipped as
   // identical - the element is not what the key says it is any more.
+  //
+  // AND THE KEY IS ON THE PANEL, NOT THE BUTTON. The first version forgot
+  // the key of the node written - the button - while the innerHTML that
+  // follows is set on the panel forty levels up, whose key still matched.
+  // Seen on Read some now: the button said "114 already waiting", disabled,
+  // for good, because the panel's repaint was byte-identical to the one
+  // before the click and was skipped. A hand edit anywhere under a panel
+  // makes that panel's key a lie, so every ancestor forgets.
+  function forget(n){
+    for(let e = n; e; e = e.parentNode) if(e.__nk !== undefined) e.__nk = undefined;
+  }
   for(const [proto, prop] of [[Node.prototype, 'textContent'],
                               [HTMLElement.prototype, 'innerText']]){
     const p = Object.getOwnPropertyDescriptor(proto, prop);
     if(!p || !p.set) continue;
     Object.defineProperty(proto, prop, {configurable: true, enumerable: p.enumerable,
-      get: p.get, set: function(v){ this.__nk = undefined; p.set.call(this, v); }});
+      get: p.get, set: function(v){ forget(this); p.set.call(this, v); }});
   }
   for(const m of ['insertAdjacentHTML', 'replaceChildren', 'append', 'prepend']){
     const f = Element.prototype[m];
     if(typeof f !== 'function') continue;
-    Element.prototype[m] = function(){ this.__nk = undefined; return f.apply(this, arguments); };
+    Element.prototype[m] = function(){ forget(this); return f.apply(this, arguments); };
   }
   for(const m of ['appendChild', 'removeChild', 'insertBefore', 'replaceChild']){
     const f = Node.prototype[m];
     if(typeof f !== 'function') continue;
-    Node.prototype[m] = function(){ this.__nk = undefined; return f.apply(this, arguments); };
+    Node.prototype[m] = function(){ forget(this); return f.apply(this, arguments); };
+  }
+  // A DISABLED BUTTON IS A HAND EDIT TOO. `btn.disabled=true` while a
+  // request runs, then the identical repaint, left it disabled for ever.
+  {
+    const p = Object.getOwnPropertyDescriptor(HTMLButtonElement.prototype, 'disabled');
+    if(p && p.set)
+      Object.defineProperty(HTMLButtonElement.prototype, 'disabled', {
+        configurable: true, enumerable: p.enumerable, get: p.get,
+        set: function(v){ forget(this); p.set.call(this, v); }});
   }
 })();
 function setHTML(el, html){
@@ -37963,9 +37990,21 @@ function skMarkWatch(){
   }, 1500);
 }
 async function skRun(btn){
-  if(btn){ btn.disabled=true; btn.textContent='looking…'; }
-  try{ await fetch('/api/subkind/run',{method:'POST'}); }catch(e){}
-  setTimeout(()=>{ _skKey=''; loadSubKind(true); }, 800);
+  if(btn){ btn.disabled=true; btn.textContent='queueing…'; }
+  let r={};
+  try{ r=await fetch('/api/subkind/run',{method:'POST'}).then(r=>r.json())||{}; }catch(e){}
+  // SAY WHAT HAPPENED ON THE BUTTON, briefly. Nothing reads in this request
+  // any more - the jobs do - and "made 0" has two causes that deserve two
+  // sentences: the queue already holds its fill of reads (the usual one, 114
+  // of 120 when this was written), or there is nothing left unread.
+  if(btn){ btn.textContent=readNowWord(r); }
+  setTimeout(()=>{ _skKey=''; loadSubKind(true); }, 1400);
+}
+function readNowWord(r){
+  const made=(r&&r.made)||0, on=(r&&r.on_queue)||0;
+  if(made) return `${made} queued`;
+  if(on) return `${on} already waiting`;
+  return 'nothing left to read';
 }
 // `force` means YOU asked for this, so paint it whatever the guards say.
 // The guards exist to stop the 2.5-second poll pulling the rug: they skip a
@@ -38362,8 +38401,9 @@ function snPaint(force){
       ${modeSeg('when it is sure', d.mode, 'snMode', {
         auto:'Every file listed here is replaced by the shared remedy without asking - the release blocklisted, the file deleted, the arr asked for another - up to the hourly cap shared with every other check.',
         manual:'Everything is listed and nothing is replaced. Each row has its own button; select several for the batch.'})}
-      <button class="rmb" onclick="snRun(this)" ${running?'disabled':''}>${
-        running?'checking…':'Check now'}</button>
+      <button class="rmb" onclick="snRun(this)" ${running?'disabled':''}
+        title="Re-judges every file against the required languages from what is already known - the subtitle facts and the audio verdicts. Opens no file; the next automatic pass is in up to 15 minutes.">${
+        running?'recomputing…':'Recompute now'}</button>
     </span>
     ${auto?`<div style="font-size:11.5px;margin-top:4px;padding:5px 8px;
         border-radius:6px;background:rgba(232,163,61,.07);
@@ -38566,7 +38606,7 @@ async function snMode(m){
   loadSubNeed(true); loadSubs(true);
 }
 async function snRun(btn){
-  if(btn){ btn.disabled=true; btn.textContent='checking…'; }
+  if(btn){ btn.disabled=true; btn.textContent='recomputing…'; }
   try{ await fetch('/api/subneed/check', {method:'POST'}); }catch(e){}
   // The bar draws itself from the poll; this just starts the poll now. In
   // auto the same request also hands the findings to the remedy, so the
@@ -38662,8 +38702,9 @@ function skPaint(force){
       ${modeSeg('when it is sure enough', d.mode, 'skMode', {
         auto:'Findings above the act line are acted on without asking - a picture gets its marker track, a track gets its honest title - and findings below the dismiss line are thrown away, both on the pass. Everything between the two lines still waits for you.',
         manual:'Everything is scored and listed, and nothing is acted on. The two lines still colour the rows, so you can see what auto would have done before letting it do it.'})}
-      <button class="rmb" onclick="skRun(this)" ${running?'disabled':''}>${
-        running?'looking…':'Check some now'}</button></span>`;
+      <button class="rmb" onclick="skRun(this)" ${running?'disabled':''}
+        title="Puts the next batch of unread files on the queue now, so the readers run as jobs on the workers and show in Processing System.">${
+        running?'reading…':'Read some now'}</button></span>`;
   const note=`<div class="dim" style="font-size:11px;margin:3px 0 4px">
     Two readers, one question. Files that report <b>no subtitle track</b> have
     twenty-four frames sampled and the bright text low in the picture shown to
@@ -39466,7 +39507,9 @@ function hsPaint(){
         auto:'Findings above the mark line are marked without asking and findings below the dismiss line are thrown away, both on the sweep. Everything between the two lines still waits for you - that band is the part the evidence cannot settle.',
         manual:'Everything is scored and listed, and nothing is acted on. The two lines still colour the rows, so you can see what auto would have done before letting it do it.'})}
       <button class="rmb" onclick="hsRun(this)" ${
-      d.running?'disabled':''}>${d.running?'looking…':'Check some now'}</button></span>`;
+      d.running?'disabled':''}
+        title="Puts the next batch of unread files on the queue now; the picture reads run as jobs on the workers.">${
+        d.running?'reading…':'Read some now'}</button></span>`;
   // ---- the two lines, and what falls between them -----------------------
   // SHOWN WHETHER OR NOT AUTO IS ON, because where you would put the lines is
   // a thing to work out BEFORE letting anything act on them - the scores are
@@ -39697,9 +39740,11 @@ function hsDur(s){
   return dd+'d'+(hh?' '+hh+'h':'');
 }
 async function hsRun(btn){
-  if(btn){ btn.disabled=true; btn.textContent='looking…'; }
-  try{ await fetch('/api/hardsub/run',{method:'POST'}); }catch(e){}
-  loadHardsub();
+  if(btn){ btn.disabled=true; btn.textContent='queueing…'; }
+  let r={};
+  try{ r=await fetch('/api/hardsub/run',{method:'POST'}).then(r=>r.json())||{}; }catch(e){}
+  if(btn){ btn.textContent=readNowWord(r); }
+  setTimeout(()=>{ _hsKey=''; loadHardsub(); }, 1400);
 }
 async function hsIgnore(fid, btn){
   // NO CONFIRMATION. Nothing is written to a file and nothing is deleted -
