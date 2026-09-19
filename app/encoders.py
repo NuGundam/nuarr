@@ -47,6 +47,10 @@ FAMILIES: dict[str, dict] = {
         "hevc": "hevc_nvenc", "h264": "h264_nvenc", "av1": "av1_nvenc",
         "presets": NVENC_PRESETS, "default_preset": "p5",
         "hwaccel": "cuda",
+        # THE FORMAT ITS FRAMES TAKE WHEN THEY NEVER LEAVE THE CARD.
+        # Empty means "download them", which is what every family did before
+        # and what the unmeasured ones still do - see decode_args.
+        "hwframes": "cuda",
         "pix10": "p010le",
         "note": "The GeForce/Quadro encoder block. Does not touch the CUDA "
                 "cores, so an encode and a game or a Whisper listen can share "
@@ -57,6 +61,10 @@ FAMILIES: dict[str, dict] = {
         "hevc": "hevc_qsv", "h264": "h264_qsv", "av1": "av1_qsv",
         "presets": QSV_PRESETS, "default_preset": "medium",
         "hwaccel": "qsv",
+        # qsv is the format here, and it is left off deliberately: nobody has
+        # run it on Intel hardware and a flag that has not been measured is a
+        # claim, not a feature.
+        "hwframes": "",
         "pix10": "p010le",
         "note": "The encoder built into Intel iGPUs and Arc cards. Very "
                 "efficient per watt; needs an Intel GPU present and its "
@@ -67,6 +75,7 @@ FAMILIES: dict[str, dict] = {
         "hevc": "hevc_amf", "h264": "h264_amf", "av1": "av1_amf",
         "presets": AMF_PRESETS, "default_preset": "balanced",
         "hwaccel": "d3d11va",
+        "hwframes": "",          # d3d11, unmeasured - same reasoning as qsv
         "pix10": "p010le",
         "note": "The encoder on Radeon cards. Needs an AMD GPU and the "
                 "Adrenalin driver.",
@@ -76,6 +85,7 @@ FAMILIES: dict[str, dict] = {
         "hevc": "libx265", "h264": "libx264", "av1": "libsvtav1",
         "presets": CPU_PRESETS, "default_preset": "medium",
         "hwaccel": "",
+        "hwframes": "",
         "pix10": "yuv420p10le",
         "note": "Software encoding. Much slower and it will use every core, "
                 "but it is the most efficient per bit and it works on any "
@@ -259,7 +269,7 @@ def _quality_args(fam: str, cq: int) -> list[str]:
 
 
 def video_args(family: str, target: str, cq: int, preset: str,
-               ten_bit: bool = False) -> list[str]:
+               ten_bit: bool = False, on_card: bool = False) -> list[str]:
     r"""Everything after -c:v for one encode, for whichever family is in use.
 
     Kept in one place so the command builder does not grow a branch per family
@@ -274,7 +284,17 @@ def video_args(family: str, target: str, cq: int, preset: str,
         preset = spec["default_preset"]
     a = ["-c:v", enc, "-preset", preset] + _quality_args(family, cq)
     if ten_bit:
-        a += ["-pix_fmt", spec["pix10"]]
+        # -pix_fmt IS A CONVERSION REQUEST, and a hardware frame has nowhere
+        # to perform one. Asking for p010le on CUDA frames fails the whole
+        # encode before the first packet:
+        #     [vf#0:0] Task finished with error code: -40 (Function not
+        #     implemented)
+        #     [vost#0:0/hevc_nvenc] Could not open encoder before EOF
+        # The surface already carries the depth it was decoded at, so on the
+        # card the profile is the only thing that still needs saying -
+        # verified with ffprobe: hevc / Main 10 / yuv420p10le, same bytes.
+        if not on_card:
+            a += ["-pix_fmt", spec["pix10"]]
         if target == "hevc":
             a += ["-profile:v", "main10"]
     return a
@@ -369,17 +389,32 @@ def hdr_args(vstream: dict, family: str) -> list[str]:
     return a
 
 
-def decode_args(family: str, want_hw: bool) -> list[str]:
+def decode_args(family: str, want_hw: bool,
+                keep_on_card: bool = False) -> list[str]:
     r"""Input-side hardware decode flags.
 
     Only ever the family's OWN accelerator: feeding CUDA frames to an AMF
     encoder means a download and re-upload per frame, which is slower than
     decoding on the CPU in the first place.
+
+    `keep_on_card` adds the flag that stops ffmpeg pulling each decoded frame
+    back into system RAM just so the encoder can push it up again. Measured
+    on this machine it is -76% CPU on 8-bit H.264 and -85% on 10-bit HEVC,
+    with the output identical - but it is only correct when NOTHING in the
+    chain needs a frame it can address, so the caller decides. See
+    build_ffmpeg, which owns that question.
     """
     if not want_hw:
         return []
-    hw = (FAMILIES.get(family) or {}).get("hwaccel") or ""
-    return ["-hwaccel", hw] if hw else []
+    spec = FAMILIES.get(family) or {}
+    hw = spec.get("hwaccel") or ""
+    if not hw:
+        return []
+    a = ["-hwaccel", hw]
+    fmt = spec.get("hwframes") or ""
+    if keep_on_card and fmt:
+        a += ["-hwaccel_output_format", fmt]
+    return a
 
 
 _DEVICES: dict = {}

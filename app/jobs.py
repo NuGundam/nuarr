@@ -6821,17 +6821,54 @@ def build_ffmpeg(src: str, dst: str, plan, duration: float,
     # initialises a CUDA context per process, costs startup time, and holds
     # driver resources the encode pool could be using. Copy jobs were carrying
     # it for no benefit.
+    # CAN THE FRAMES STAY ON THE CARD FOR THE WHOLE JOB?
+    #
+    # Three things have to be true, and every one of them is checkable here
+    # rather than hopeful:
+    #
+    #   nothing filters   burning signs uses overlay/scale2ref or libass, and
+    #                     all of those need a frame the CPU can address. Hand
+    #                     them a CUDA surface and ffmpeg stops with "Function
+    #                     not implemented" before the first packet.
+    #   the depth matches the encoder cannot convert 8-bit surfaces into a
+    #                     10-bit encode without somewhere to do the
+    #                     conversion. The planner only asks for 10-bit on a
+    #                     10-bit source, but the codecs page's manual
+    #                     re-encode can ask by hand.
+    #   somebody measured it
+    #                     encoders.FAMILIES carries a zero-copy format only
+    #                     for the family it has been measured on.
+    #
+    # When they are, this is -76% to -85% of the CPU an encode costs, with
+    # the output identical - see encoders.decode_args.
+    _burn = getattr(plan, "burn_index", None)
+    _on_card = False
     if plan.encode and (C["hwDecode"] if "hwDecode" in C else True):
         # THE DECODER MUST MATCH THE ENCODER'S FAMILY. Handing CUDA frames to
         # an AMF or QuickSync encoder forces a download and re-upload of every
         # frame, which is slower than never accelerating the decode at all -
         # and a CPU encode wants no hardware decode surface in the first place.
         _fam = (getattr(plan, "venc", None) or {}).get("family") or "nvenc"
+        _src10 = False
+        try:
+            _vs = next((x for x in (probe or {}).get("streams", [])
+                        if x.get("codec_type") == "video"), None) or {}
+            _src10 = ("10" in (_vs.get("pix_fmt") or "")
+                      or str(_vs.get("bits_per_raw_sample") or "") == "10")
+        except Exception:                                # noqa: BLE001
+            _src10 = False
+        _on_card = (_burn is None
+                    and bool(getattr(plan, "ten_bit", False)) == _src10)
         try:
             from . import encoders as _enc
-            a += _enc.decode_args(_fam, True)
+            a += _enc.decode_args(_fam, True, _on_card)
+            # It is only on the card if the family actually had a format for
+            # it - decode_args silently declines for the unmeasured ones, and
+            # video_args below must not then drop -pix_fmt.
+            _on_card = _on_card and "-hwaccel_output_format" in a
         except Exception:                                # noqa: BLE001
             a += ["-hwaccel", "cuda"]
+            _on_card = False
     a += ["-i", src]
 
     if plan.encode:
@@ -6849,7 +6886,7 @@ def build_ffmpeg(src: str, dst: str, plan, duration: float,
         # track instead of painting it in. Image subs go through overlay (with
         # scale2ref so a 1080p PGS over a 720p encode fits); text subs use the
         # subtitles filter.
-        burn = getattr(plan, "burn_index", None)
+        burn = _burn
         # KEEP 10-BIT ALL THE WAY THROUGH THE CHAIN.
         #
         # Asking the encoder for p010le is not enough on its own. If a filter
@@ -6889,7 +6926,7 @@ def build_ffmpeg(src: str, dst: str, plan, duration: float,
         try:
             from . import encoders as _enc
             a += _enc.video_args(_fam, _codec, int(tgt["cq"]),
-                                 str(tgt["preset"]), ten)
+                                 str(tgt["preset"]), ten, _on_card)
         except Exception:                                # noqa: BLE001
             a += ["-c:v", tgt["encoder"], "-preset", tgt["preset"],
                   "-rc", "vbr", "-cq", str(tgt["cq"])]

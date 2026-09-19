@@ -302,9 +302,32 @@ def init() -> None:
 # measurement put it there and credited it a saving that was noise.
 #
 # AND NOT -hwaccel cuda, which was the obvious idea and is measurably worse
-# here: +28% CPU and +287% wall, because each of the twenty-four processes
-# pays a CUDA context set-up to get one frame back. NVDEC pays off over
-# thousands of frames in one process, which is not this.
+# here - tested twice, the second time properly.
+#
+#   the first test          -hwaccel cuda, nothing else: +28% cpu, +287% wall
+#
+# That test deserved the objection it got: decoding on NVDEC and then pulling
+# the frame straight back into system RAM for the crop is the half-measure
+# NVIDIA's transcoding guide exists to warn about, so it measured a pipeline
+# nobody would recommend. Run again with the frames kept on the card, eight
+# frames, two alternating rounds:
+#
+#   A  software, as below                  1.4s wall   1.8s cpu
+#   B  -hwaccel cuda                       3.6s        2.5s    +152% / +37%
+#   D  -hwaccel_output_format cuda,
+#      hwdownload after the decode         3.0s        2.4s    +111% / +36%
+#
+# Better than B and still much worse than doing it on the CPU, for the reason
+# that has nothing to do with which flag is used: this runs ONE frame per
+# process, twenty-four times a file, and every one of those processes pays a
+# CUDA context set-up to get a single picture back. NVDEC pays off when one
+# process decodes thousands of frames - see build_ffmpeg, where it does, and
+# where keeping the frames on the card is worth -76% to -85% of the CPU.
+#
+# Cropping to the caption band ON the card would at least shrink what comes
+# back, and is not available: this ffmpeg's scale_cuda has w, h, format and
+# an interpolation algorithm, and no crop of any spelling. The threshold has
+# no CUDA filter either, so something always comes down regardless.
 FF_IN = ["-threads", "2", "-filter_threads", "1"]
 # This wants a picture. Opening the audio, subtitle and data streams to get it
 # is work nobody asked for.
@@ -1441,7 +1464,7 @@ def _size(p: str) -> int:
 # and sees a blank subtitle selected deserves an explanation rather than a bug
 # report.
 MARK_NAME = "English (burned into the picture)"
-_MARK_SRT = "1\r\n00:00:00,000 --> 00:00:01,000\r\n​\r\n\r\n"
+_MARK_SRT = "1\r\n00:00:00,000 --> 00:00:01,000\r\nâ€‹\r\n\r\n"
 
 
 def mark_one(file_id: int, kind: str = "") -> dict:
