@@ -12628,7 +12628,17 @@ async def api_gate_toggle(key: str, on: bool):
 
 @app.get("/api/workers")
 def api_workers():
-    return workers.get().as_dict()
+    """Every dial, plus what this box is - the page needs both to say where
+    a default came from."""
+    from . import boxspec
+    out = workers.get().as_dict()
+    try:
+        out["_box"] = {**boxspec.spec(), "sentence": boxspec.sentence(),
+                       "lanes": boxspec.lanes(1),
+                       "reserve": 2.0}
+    except Exception:                                    # noqa: BLE001
+        out["_box"] = {}
+    return out
 
 
 @app.post("/api/workers")
@@ -24020,6 +24030,25 @@ function renderOverall(o){
     });
   }
 
+  // HELD BY THE BOX, NOT BY A DISK. The spindle holds above answer "why is
+  // this disk quiet"; this one answers "why is a pool with work queued not
+  // starting any of it" - the processor budget is full and the next job of
+  // that pool is priced above what is left. Without a line here it looks
+  // exactly like a stall, which is the whole reason the disk holds got one.
+  if(_cpuWaits && _cpuWaits.length){
+    _cpuWaits.forEach(w=>{
+      bits.push(`<span class="ovl-g ovl-wait" title="Nuarr keeps what it is `
+        +`running under ${w.budget} cores - four fifths of this box, so a `
+        +`viewer still gets a machine that answers. This pool's next job is `
+        +`measured at ${w.need} cores and there is not that much left, so it `
+        +`waits for something to finish rather than making everything slower.">`
+        +`<span class="ovl-k">waiting</span>`
+        +`<span class="ovl-v">${esc(w.pool)}</span>`
+        +`<span class="ovl-note">processor budget — ${w.used} of ${w.budget}`
+        +` cores in use, this one needs ${w.need}</span></span>`);
+    });
+  }
+
   // Per-spindle breakdown. A disk carrying more than one job is flagged,
   // because that is the case where the jobs are competing rather than the
   // pool simply being busy.
@@ -24777,6 +24806,7 @@ function filterDisk(d){
 }
 
 let _jobsBusy=false, _jobsSeq=0, _lastIo=null, _lastWaits=[];
+let _cpuWaits=[], _cpuBudget=null;
 // Pool disks a Plex client is currently reading from, and whether encoders are
 // yielding disk priority because of it. Both ride along on the job poll.
 let _plexDisks=[], _ioThrottled=false;
@@ -25056,6 +25086,8 @@ function paintRunning(j){
   _ioLowJobs = new Set(j.io_low_jobs || []);
   _ioReason = j.io_reason || '';
   _lastWaits = j.disk_waits || [];
+  _cpuWaits = j.cpu_waits || [];
+  _cpuBudget = j.cpu_budget || null;
   // Repaint the pool-disk table from the JOB poll (2 s) rather than waiting for
   // the summary poll (15 s) - an "activity" column that updates four times a
   // minute is not activity.
@@ -28100,10 +28132,27 @@ function workerRow(k,v,extra){
       ${numCtl(k,v)}
       <div class="dim" style="font-size:11px">
         ${esc(unitFor(k,v.value))} · min ${v.min} · max ${v.max} · default ${v.default}</div>
+      ${sizedNote(k,v)}
       ${ev?`<div style="margin-top:8px">${numCtl(ek,ev)}
-        <div class="dim" style="font-size:11px">on the GPU · min ${ev.min} · max ${ev.max} · default ${ev.default}</div></div>`:''}
+        <div class="dim" style="font-size:11px">on the GPU · min ${ev.min} · max ${ev.max} · default ${ev.default}</div>
+        ${sizedNote(ek,ev)}</div>`:''}
     </td>
     <td style="width:96px;text-align:right;vertical-align:middle">${poolSwitch(v)}</td></tr>`;
+}
+// WHAT THIS BOX WOULD CHOOSE, and whether you are on it. Shown on every row
+// rather than only on the ones that differ, because "sized for this box" at
+// the top of a page whose rows say nothing about the box is a claim with no
+// evidence under it. The reason is in the tooltip; the row stays one line.
+function sizedNote(k, v){
+  const z = v.sized || {};
+  if(!z.n) return '';
+  const same = Number(v.value) === Number(z.n);
+  return `<div class="dim" style="font-size:10.5px;margin-top:2px"
+       title="${esc(z.why||'')}">${same
+    ? `<span style="color:#7fd18c">✓</span> sized for this box`
+    : `<span style="color:var(--warn)">you set this</span> — this box works
+       out <b>${z.n}</b> <a href="#" onclick="bump('${k}',${z.n});return false"
+       style="color:#6fb0ff;text-decoration:none">use it</a>`}</div>`;
 }
 // Typed values are clamped server-side too; this only avoids a pointless
 // round-trip and shows the correction immediately.
@@ -44852,7 +44901,8 @@ function paintWorkers(){
   }
   // ONE ROW PER POOL: the subocr GPU-lane setting rides inside the subocr
   // row rather than wearing the same bubble on a row of its own.
-  const rows=Object.entries(w).filter(([k,v])=> (_wtab==='timing' ? v.timing : !v.timing)
+  const rows=Object.entries(w).filter(([k,v])=> k[0]!=='_' && v && v.label
+                                              && (_wtab==='timing' ? v.timing : !v.timing)
                                               && k!=='subocr_gpu_lanes');
   const extraOf=k=> k==='subocr_workers' && w.subocr_gpu_lanes ? ['subocr_gpu_lanes', w.subocr_gpu_lanes] : null;
   const blurb = _wtab==='timing'
@@ -44867,8 +44917,25 @@ function paintWorkers(){
        long the middle job of that kind actually took.`;
   const enc = (_wtab!=='timing' && _encLine)
     ? `<div style="padding:0 14px 8px;font-size:11.5px">${_encLine}</div>` : '';
+  // WHAT THESE NUMBERS WERE CHOSEN FOR. Every default on this page used to be
+  // a figure measured on one machine and written down for everybody; they are
+  // worked out from the box now, so the box is worth naming - and so is the
+  // budget, because it is the thing that decides which of two ready jobs
+  // actually starts.
+  const B = w._box || {};
+  const box = (_wtab!=='timing' && B.sentence)
+    ? `<div style="padding:0 14px 9px;font-size:11.5px">
+         Sized for this box: <b>${esc(B.sentence)}</b>
+         <div class="dim" style="font-size:11px;margin-top:2px">
+           Nothing starts that would push nuarr past
+           <b>${B.budget}</b> cores in flight — four fifths of
+           ${B.threads} threads, the rest left for Plex and the box itself —
+           and background work (checks, reads, listens) stops
+           ${B.reserve} cores short of that so a repack never queues behind
+           it. A row you have moved is marked; the number beside it is what
+           nuarr would choose here.</div></div>` : '';
   document.getElementById('workers').innerHTML=
-    `<div class="dim" style="padding:9px 14px ${enc?'4px':'9px'};font-size:11px">${blurb}</div>`+enc
+    `<div class="dim" style="padding:9px 14px ${enc||box?'4px':'9px'};font-size:11px">${blurb}</div>`+enc+box
     + masterSwitch(w)
     +'<table>'+rows.map(([k,v])=>workerRow(k,v,extraOf(k))).join('')+'</table>';
   const hint=document.getElementById('wtabhint');

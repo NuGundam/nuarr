@@ -189,7 +189,32 @@ MIN_TEXT_FRAMES = 2
 # CPU-bound, and eight lanes took a run from ~70s to ~9s here". Six lanes here
 # for the same reason, and one lower because this reads two bands per
 # timestamp rather than one file per probe.
-LANES = 6
+# AND THEN IT WAS MEASURED PROPERLY, which is how this stopped being a
+# constant. Six lanes at two threads each is NINE CORES on a 1080p 10-bit
+# episode - the heaviest thing nuarr asks of the processor, heavier than the
+# decode check that was rated its heaviest - and with four picture reads
+# allowed at once that was thirty-six cores wanted on a twenty-thread box:
+#
+#   6 lanes   16.2s wall   146.8 cpu-s   9.1 cores
+#   3 lanes   22.5s        115.2         5.1
+#   2 lanes   32.1s        112.6         3.5
+#
+# The wall time is what six lanes buy and the extra 34 cpu-seconds are what
+# they cost - work spent on crowding rather than on frames. So the number now
+# comes from the box and from how many reads are in flight (boxspec.lanes):
+# a share of the processor budget, divided by the reads already using it,
+# floor two. On the box above that is three lanes for one read and two when a
+# second starts, instead of six each whatever else was happening.
+LANES = 6                              # the fallback, if boxspec cannot answer
+
+
+def lanes() -> int:
+    """How many frames to grab at once, here, now."""
+    try:
+        from . import boxspec
+        return int(boxspec.lanes())
+    except Exception:                                            # noqa: BLE001
+        return LANES
 
 # THE PACE, AND WHAT IT YIELDS TO.
 #
@@ -674,7 +699,8 @@ def probe_one(file_id: int, samples: int = SAMPLES,
     # time and the pool has twelve disks to answer from.
     from concurrent.futures import ThreadPoolExecutor, as_completed
     low, high, read = [], [], 0
-    with ThreadPoolExecutor(max_workers=LANES) as ex:
+    _lanes = lanes()
+    with ThreadPoolExecutor(max_workers=_lanes) as ex:
         # ONE JOB PER FRAME, NOT ONE PER BAND. Both crops come out of a
         # single decode - see _bands. This was 48 ffmpeg processes for 24
         # frames, each pair seeking to the same timestamp for two crops of

@@ -557,6 +557,11 @@ class WorkerConfig:
                 "timing": k in TIMING_KEYS,
                 # WHICH OF THE FOUR THINGS THIS ONE EATS. See COST.
                 "cost": cost_of(k),
+                # AND WHERE THE DEFAULT CAME FROM. "default 4" beside a Reset
+                # button is a number with no argument behind it; this is the
+                # argument - what about this box produced it - so a value you
+                # moved can be compared with the one nuarr would choose.
+                "sized": _sized(k),
             }
             for k in LIMITS if k not in HIDDEN_KEYS
         }
@@ -794,7 +799,44 @@ def set_paused_all(on: bool) -> tuple[bool, str]:
                   if on else "every pool running again")
 
 
+def _sized(key: str) -> dict:
+    """{n, why} - what this box works out for this row, and from what."""
+    try:
+        from . import boxspec
+        n, why = boxspec.recommend_one(key)
+        if n:
+            lo, hi, _d = LIMITS[key]
+            return {"n": max(lo, min(hi, int(n))), "why": why}
+    except Exception:                                        # noqa: BLE001
+        pass
+    return {}
+
+
 def _default(key: str) -> int:
+    """The number for THIS box, or the one typed for the box these figures
+    were measured on if the machine cannot be read.
+
+    THE TABLE ABOVE IS ONE MACHINE'S ANSWER. Every figure in LIMITS was taken
+    on twenty threads with an A5000 and twelve spindles, and handing the same
+    number to a four-core NUC tells it to run three decode checks at four
+    threads each. boxspec asks what this box actually is and divides by what
+    each job is measured to cost; on the box the constants came from it
+    returns the constants, which is the check that it is not inventing
+    anything.
+    """
+    try:
+        from . import boxspec
+        n, _why = boxspec.recommend_one(key)
+        if n:
+            lo, hi, _d = LIMITS[key]
+            return max(lo, min(hi, int(n)))
+    except Exception:                                        # noqa: BLE001
+        pass
+    return int(getattr(SETTINGS, key, LIMITS[key][2]))
+
+
+def _typed_default(key: str) -> int:
+    """What the table says, before the box is taken into account."""
     return int(getattr(SETTINGS, key, LIMITS[key][2]))
 
 
@@ -814,6 +856,13 @@ _WAS_DEFAULT = {"passthrough_workers": 4, "subocr_workers": 4,
 # the old number. Re-running is safe - a key already on its new value no
 # longer matches `was` and is left alone.
 _MIGRATED_KEY = "worker.defaults.2026-09b"
+# AND THE SAME RULE AGAIN, now that the recommendation is the box's rather
+# than the table's. A saved value that still equals what the table typed is a
+# value nobody chose - it was written by existing - so it moves onto what this
+# machine works out for itself. Anything else is somebody's decision and is
+# left exactly where it is. Once, logged, and safe to re-run: a key already on
+# its new number no longer matches the typed default.
+_SIZED_KEY = "worker.defaults.boxsized.1"
 
 
 def _adopt_new_defaults() -> None:
@@ -844,8 +893,60 @@ def _adopt_new_defaults() -> None:
             pass
 
 
+def _adopt_box_sizes() -> None:
+    """Untouched counts move onto what this box works out. Runs once.
+
+    AND NOT UNTIL THE BOX HAS BEEN SEEN. The first version ran at startup,
+    when the pool walk has not happened and the disk count is zero; it read
+    the minimum recommendation that produced and wrote it down. Waiting costs
+    nothing - get() is called on every page poll, so this runs within seconds
+    of the disks appearing - and it is the difference between sizing a machine
+    and sizing the silence before one answers.
+    """
+    if kv_get(_SIZED_KEY):
+        return
+    try:
+        from . import boxspec
+        if not boxspec.spec().get("settled"):
+            return
+    except Exception:                                    # noqa: BLE001
+        return
+    moved = []
+    for key in LIMITS:
+        try:
+            typed = _typed_default(key)
+            now = _default(key)
+        except Exception:                                # noqa: BLE001
+            continue
+        if now == typed:
+            continue
+        raw = kv_get(f"worker.{key}")
+        if raw is None:
+            # NOTHING SAVED, NOTHING TO MOVE. get() already resolves an unset
+            # key through _default(), which is the box's answer - writing it
+            # down would only freeze today's answer against a machine that
+            # gains a disk tomorrow.
+            continue
+        try:
+            if int(raw) != typed:
+                continue                   # somebody chose this; leave it
+        except (TypeError, ValueError):
+            continue
+        kv_set(f"worker.{key}", str(now))
+        moved.append(f"{LABELS.get(key, key)} {typed} -> {now}")
+    kv_set(_SIZED_KEY, "1")
+    if moved:
+        try:
+            from . import boxspec, joblog
+            joblog.log("worker counts sized for this box (" + boxspec.sentence()
+                       + "): " + "; ".join(moved), "info")
+        except Exception:                                # noqa: BLE001
+            pass
+
+
 def get() -> WorkerConfig:
     _adopt_new_defaults()
+    _adopt_box_sizes()
     vals = {}
     for key in LIMITS:
         raw = kv_get(f"worker.{key}")

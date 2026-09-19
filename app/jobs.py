@@ -2073,6 +2073,139 @@ def _spindle_used(disk: str, running=None) -> int:
     return total
 
 
+# ------------------------------------------------- THE PROCESSOR BUDGET ---
+#
+# The spindle budget below stopped two whole-file rewrites from crawling over
+# one disk. Nothing did the same for the processor, and the measurements that
+# went with this comment say why it was needed: a picture read is nine cores
+# while it runs, a decode check three, and the counts that were allowed at
+# once added up to forty-five cores on a box with twenty threads. Nothing
+# crashed - Windows time-slices it - but everything took longer than it should
+# have, the encoder's feeder included, and a viewer felt it.
+#
+# So: one budget for the whole box (boxspec.budget - 80% of the threads,
+# leaving Plex its fifth), each pool priced by what it was MEASURED to cost
+# (boxspec.COST_CORES), and a job starts only if what is already running plus
+# its own price fits. The same table sizes the recommendations on the
+# Concurrency page, so the number you are shown and the number the pump
+# enforces can never drift apart.
+#
+# THE CHEAP WORK IS NEVER HELD. A header write, an ffprobe, a listen - priced
+# under half a core - is let through whatever the budget says, because making
+# a language tag wait behind a subtitle read is all cost and no saving.
+CPU_FREE_UNDER = 0.5
+# AND THE WORK YOU CAN SEE KEEPS A CORNER OF THE BUDGET. The measurements
+# that prompted this are all background work - checking files decode, reading
+# subtitles, listening for a language - and background work is both the
+# hungriest and the most patient. Without a reserve the first three decode
+# checks would take nine of sixteen cores and the repack behind them would
+# wait on a queue that never empties, because there is always another file to
+# check. Two cores held back is one repack's audio conversion plus the
+# encoder's feeder: enough that the visible half of nuarr never queues behind
+# the invisible half.
+BACKGROUND_POOLS = frozenset({"decode", "subread", "probe", "listen"})
+VIDEO_RESERVE = 2.0
+
+
+def cpu_cost(pool_name: str, plan_json: str = "") -> float:
+    """What one job of this pool is about to cost the processor, in cores."""
+    try:
+        from . import boxspec
+    except Exception:                                        # noqa: BLE001
+        return 0.0
+    if pool_name == "subread":
+        # TWO JOBS WEARING ONE NAME: sampling 24 frames through several
+        # ffmpeg processes, or pulling one subtitle track out of a container.
+        # Sixteen times the difference in price, so it is worth the parse.
+        picture = True
+        if plan_json:
+            try:
+                picture = (str(json.loads(plan_json).get("subread")
+                               or "picture") == "picture")
+            except Exception:                                # noqa: BLE001
+                picture = True
+        return boxspec.subread_cores(picture)
+    return float(boxspec.COST_CORES.get(pool_name, 0.5))
+
+
+def cpu_used(running=None) -> float:
+    """Cores nuarr already has in flight, by the same prices."""
+    total = 0.0
+    for w in (RUNNING.values() if running is None else running):
+        pool = getattr(w, "pool", "") or ""
+        if pool == "subread":
+            total += _subread_cores_of(w)
+        else:
+            try:
+                from . import boxspec
+                total += float(boxspec.COST_CORES.get(pool, 0.5))
+            except Exception:                                # noqa: BLE001
+                pass
+    return round(total, 2)
+
+
+def _subread_cores_of(w) -> float:
+    """A running subtitle read costs what its CURRENT half costs."""
+    try:
+        from . import boxspec
+        return (boxspec.subread_cores(True)
+                if boxspec._sampling(getattr(w, "stage", ""))
+                else boxspec.COST_CORES_SUBREAD_TRACK)
+    except Exception:                                        # noqa: BLE001
+        return 1.0
+
+
+def cpu_has_room(pool_name: str, plan_json: str = "", running=None) -> bool:
+    """May this pool start without the box being asked for more than it has?"""
+    try:
+        from . import boxspec
+        need = cpu_cost(pool_name, plan_json)
+        if need <= CPU_FREE_UNDER:
+            return True
+        used = cpu_used(running)
+        budget = boxspec.budget()
+        if pool_name in BACKGROUND_POOLS:
+            budget = max(need, budget - VIDEO_RESERVE)
+        if used + need <= budget:
+            _clear_cpu_wait(pool_name)
+            return True
+        _note_cpu_wait(pool_name, need, used, budget)
+        return False
+    except Exception:                                        # noqa: BLE001
+        return True                        # never let the budget stop work
+
+
+def _cpu_budget() -> float:
+    try:
+        from . import boxspec
+        return boxspec.budget()
+    except Exception:                                        # noqa: BLE001
+        return 0.0
+
+
+CPU_WAIT: dict[str, dict] = {}
+
+
+def _note_cpu_wait(pool: str, need: float, used: float, budget: float) -> None:
+    prev = CPU_WAIT.get(pool, {})
+    CPU_WAIT[pool] = {"pool": pool, "need": round(need, 1),
+                      "used": round(used, 1), "budget": round(budget, 1),
+                      "since": prev.get("since") or time.time()}
+
+
+def _clear_cpu_wait(pool: str) -> None:
+    CPU_WAIT.pop(pool, None)
+
+
+def cpu_waits() -> list[dict]:
+    """Pools held by the processor budget right now, freshest figures."""
+    out = []
+    for pool, d in list(CPU_WAIT.items()):
+        out.append({**d, "used": cpu_used(), "for_s": round(
+            time.time() - (d.get("since") or time.time()), 1)})
+    return out
+
+
 def disk_has_room(disk: str, pool_name: str, running=None) -> bool:
     """May this pool start on this spindle without the two of them crawling?"""
     wt = spindle_weight(pool_name)
@@ -2632,6 +2765,15 @@ def _claim(pool: str) -> Job | None:
                 if on_disk and not nearly:
                     _note_disk_wait(cand_disk, wait_pct, why="progress")
                     return None
+        # AND THE BOX ITSELF HAS A BUDGET, asked last because it is the one
+        # that is about the whole machine rather than about this disk. A
+        # subtitle read priced at five cores does not start on top of three
+        # decode checks priced at three each; it waits the few seconds one of
+        # them takes to finish, and the page says so rather than looking
+        # stalled. The cheap pools never reach this test (CPU_FREE_UNDER).
+        pj = (row["plan_json"] if "plan_json" in row.keys() else "") or ""
+        if not cpu_has_room(pool, pj):
+            return None
         cur.execute("UPDATE jobs SET state='running', worker=?, started_at=? "
                     "WHERE id=? AND state='queued'",
                     (pool, time.time(), row["id"]))
@@ -7318,6 +7460,11 @@ def live_snapshot() -> dict:
         # a fact the plan needs. See precedence.py.
         "why_idle": _why_idle(workers, depth),
         "disk_waits": _live_disk_waits(workers),
+        # HELD BY THE BOX RATHER THAN BY A DISK. Same shape, different
+        # reason: the processor budget is full and this pool's next job is
+        # priced above what is left.
+        "cpu_waits": cpu_waits(),
+        "cpu_budget": {"used": cpu_used(workers), "budget": _cpu_budget()},
         "io_throttled": bool(IO_THROTTLED.get("on")),
         "io_reason": IO_THROTTLED.get("reason") or "",
         # The disks still yielded - live viewers plus the IO_HOLD_S tail
@@ -7481,6 +7628,11 @@ def snapshot(recent_limit: int = 60) -> dict:
         # Spindles where a queued job is deliberately held back. Built live so
         # the percentage matches the worker card for the job it names.
         "disk_waits": _live_disk_waits(workers),
+        # HELD BY THE BOX RATHER THAN BY A DISK. Same shape, different
+        # reason: the processor budget is full and this pool's next job is
+        # priced above what is left.
+        "cpu_waits": cpu_waits(),
+        "cpu_budget": {"used": cpu_used(workers), "budget": _cpu_budget()},
         # Whether encoders are currently yielding the disk to a viewer, and
         # which spindles a viewer is on. Both belong here rather than only in
         # the gate: the gate answers "may jobs start", this answers "why is
