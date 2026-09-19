@@ -288,6 +288,29 @@ def init() -> None:
     _READY = True
 
 
+# HOW THIS READER CALLS FFMPEG, in one place.
+#
+# ONE FRAME IS NOT A STREAM. ffmpeg defaults the decoder to a thread per core;
+# this opens a file, seeks, decodes a single frame and exits, and twelve of
+# them run at once - so a twenty-core box was being asked for up to 240 decode
+# threads to produce twelve pictures. Capping the decoder at two and leaving
+# the filter chain (a crop, a scale to 320x60, a vstack) single-threaded
+# measured -39% CPU over three alternating rounds, for identical numbers.
+#
+# BEFORE -i, DELIBERATELY. After -i, -threads is the ENCODER's thread count,
+# which for a rawvideo pipe is close to meaningless; an earlier run of this
+# measurement put it there and credited it a saving that was noise.
+#
+# AND NOT -hwaccel cuda, which was the obvious idea and is measurably worse
+# here: +28% CPU and +287% wall, because each of the twenty-four processes
+# pays a CUDA context set-up to get one frame back. NVDEC pays off over
+# thousands of frames in one process, which is not this.
+FF_IN = ["-threads", "2", "-filter_threads", "1"]
+# This wants a picture. Opening the audio, subtitle and data streams to get it
+# is work nobody asked for.
+FF_OUT = ["-an", "-sn", "-dn"]
+
+
 def _ffmpeg() -> str:
     from .jobs import _ffmpeg_exe
     return _ffmpeg_exe()
@@ -303,9 +326,10 @@ def _bright(path: str, t: float, band: str) -> int:
     anything that only correlates with the pixels will eventually disagree
     with them.
     """
-    cmd = [_ffmpeg(), "-hide_banner", "-v", "error", "-nostdin",
-           "-ss", f"{t:.2f}", "-i", path, "-frames:v", "1",
-           "-vf", f"{band},scale={W}:{H},format=gray", "-f", "rawvideo", "-"]
+    cmd = ([_ffmpeg(), "-hide_banner", "-v", "error", "-nostdin"] + FF_IN +
+           ["-ss", f"{t:.2f}", "-i", path] + FF_OUT +
+           ["-frames:v", "1",
+            "-vf", f"{band},scale={W}:{H},format=gray", "-f", "rawvideo", "-"])
     try:
         r = subprocess.run(cmd, capture_output=True, timeout=90,
                            creationflags=NO_WINDOW)
@@ -340,10 +364,10 @@ def _bands(path: str, t: float) -> tuple:
           f"[a]{LOW_BAND},scale={W}:{H},format=gray[la];"
           f"[b]{HIGH_BAND},scale={W}:{H},format=gray[hb];"
           f"[la][hb]vstack=inputs=2[out]")
-    cmd = [_ffmpeg(), "-hide_banner", "-v", "error", "-nostdin",
-           "-ss", f"{t:.2f}", "-i", path, "-frames:v", "1",
-           "-filter_complex", fc, "-map", "[out]",
-           "-f", "rawvideo", "-"]
+    cmd = ([_ffmpeg(), "-hide_banner", "-v", "error", "-nostdin"] + FF_IN +
+           ["-ss", f"{t:.2f}", "-i", path] + FF_OUT +
+           ["-frames:v", "1", "-filter_complex", fc, "-map", "[out]",
+            "-f", "rawvideo", "-"])
     try:
         r = subprocess.run(cmd, capture_output=True, timeout=90,
                            creationflags=NO_WINDOW)
@@ -467,7 +491,13 @@ def _ocr_proc(engine: str):
                           "paddle_worker.py"),
              "--serve", "--engine", engine, "--device", dev],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, text=True, env=env,
+            stderr=subprocess.DEVNULL, text=True,
+            # UTF-8, NOT THE MACHINE'S LOCALE. text=True alone decodes with
+            # cp1252 here, and the worker answers in UTF-8 - so one accented
+            # letter or CJK glyph raised inside readline(), was caught below,
+            # closed the worker and returned "" - which this module records as
+            # "nothing in the picture". See _read_served.
+            encoding="utf-8", errors="replace", env=env,
             creationflags=NO_WINDOW, startupinfo=hidden_si())
         # It says hello once the model is up - so the first read waits for the
         # load instead of timing out in the middle of it.
@@ -517,8 +547,9 @@ def _read_text(path: str, t: float, band: str) -> str:
         # Upscaled and hard-thresholded: Tesseract is far better on big clean
         # black-on-white than on a subtitle sitting over artwork.
         subprocess.run(
-            [_ffmpeg(), "-hide_banner", "-v", "error", "-nostdin",
-             "-ss", f"{t:.2f}", "-i", path, "-frames:v", "1",
+            [_ffmpeg(), "-hide_banner", "-v", "error", "-nostdin"] + FF_IN +
+            ["-ss", f"{t:.2f}", "-i", path] + FF_OUT +
+            ["-frames:v", "1",
              "-vf", f"{band},scale=1280:-1,format=gray,"
                     f"lut=y='if(gt(val,{BRIGHT}),0,255)'",
              "-y", tmp], capture_output=True, timeout=90,
@@ -537,8 +568,11 @@ def _read_text(path: str, t: float, band: str) -> str:
                 return ""
             # Paddle could not answer and Tesseract is here: read it rather
             # than record a blank, which this module treats as a fact.
+        # Same reason as the worker's pipe above: Tesseract writes UTF-8 and
+        # text=True on its own would decode it as cp1252.
         r = subprocess.run([exe, tmp, "stdout", "-l", "eng", "--psm", "6"],
                            capture_output=True, text=True, timeout=120,
+                           encoding="utf-8", errors="replace",
                            creationflags=NO_WINDOW, startupinfo=hidden_si())
         return (r.stdout or "").strip()
     except Exception:                                            # noqa: BLE001
