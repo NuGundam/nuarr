@@ -416,9 +416,14 @@ def _ocr_device_of(w) -> str:
         return ""
     try:
         from . import subocr as _so
-        if _so.engine("") != "paddle":
+        eng = _so.engine("")
+        if not _so.engine_worker(eng):
             return "cpu"                     # Tesseract, always
-        data = (_so._PADDLE_CACHE.get("data") or {})
+        # WHICHEVER WORKER ENGINE IT IS, and from the cache only - this runs
+        # on a dashboard poll and must not start a child to draw a chip.
+        # "not paddle means CPU" was true when Paddle was the only engine
+        # with a card; RapidOCR has one too, when its runtime carries CUDA.
+        data = _so.engine_cached(eng) or {}
         if not data:
             return ""
         return "gpu" if data.get("cuda") else "cpu"

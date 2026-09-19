@@ -579,7 +579,12 @@ def _read_text(path: str, t: float, band: str) -> str:
     """OCR one band of one frame. Empty string when nothing readable."""
     engine = ocr_engine()
     exe = _tesseract()
-    if engine != "paddle" and not exe:
+    # A WORKER ENGINE BRINGS ITS OWN MODELS; only the Tesseract path needs an
+    # exe on disk. Asking "is it paddle" here meant that choosing RapidOCR on
+    # a box without Tesseract returned "" before decoding anything - and an
+    # empty read is recorded by this module as "nothing in the picture",
+    # which is a verdict about the file rather than about the install.
+    if not _worker_engine(engine) and not exe:
         return ""
     tmp = os.path.join(os.environ.get("TEMP") or ".",
                        f"nuarr-hs-{os.getpid()}-{int(t)}.png")
