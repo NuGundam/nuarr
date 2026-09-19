@@ -2162,8 +2162,6 @@ def status() -> dict:
         # engines page; a second control for the same setting can only ever
         # disagree with it.
         "engine_label": engine_name(engine("")),
-        # What RapidOCR is on this install, in the shape paddle_info() uses.
-        "rapid": rapid_info(),
     }
 
 
@@ -2534,7 +2532,6 @@ def paddle_install_start(mode: str) -> dict:
 ENGINES = {
     "tesseract": {"name": "Tesseract", "worker": False, "devices": ("cpu",)},
     "paddle": {"name": "PaddleOCR", "worker": True, "devices": ("cpu", "gpu")},
-    "rapid": {"name": "RapidOCR", "worker": True, "devices": ("cpu", "gpu")},
 }
 
 
@@ -2579,11 +2576,8 @@ def device(eng: str = "") -> str:
     eng = eng or engine("")
     if "gpu" not in engine_devices(eng):
         return "cpu"
-    # ASK THE ENGINE THAT WILL RUN, not PaddleOCR every time. The two
-    # worker engines answer this from different places: Paddle is either
-    # compiled with CUDA or it is not, while RapidOCR's card depends on
-    # whether the installed ONNX Runtime carries a CUDA provider - the same
-    # package name either way.
+    # ASK THE ENGINE THAT WILL RUN. Only Paddle has a card to ask about
+    # today; engine_gpu_ready is where a second one would answer.
     try:
         cuda = bool(engine_gpu_ready(eng))
     except Exception:                                            # noqa: BLE001
@@ -2602,8 +2596,6 @@ def engine_info(eng: str = "") -> dict:
     eng = eng or engine("")
     if eng == "paddle":
         return paddle_info()
-    if eng == "rapid":
-        return rapid_info()
     # Tesseract is on disk or it is not, and status() already knows.
     return {"installed": bool(_TVER.get("v"))}
 
@@ -2619,8 +2611,6 @@ def engine_cached(eng: str = "") -> dict | None:
     eng = eng or engine("")
     if eng == "paddle":
         return _PADDLE_CACHE.get("data")
-    if eng == "rapid":
-        return _RAPID_CACHE.get("data")
     return None
 
 
@@ -2629,8 +2619,6 @@ def engine_gpu_ready(eng: str = "") -> bool:
     eng = eng or engine("")
     if eng == "paddle":
         return bool(paddle_info().get("cuda"))
-    if eng == "rapid":
-        return bool(rapid_info().get("cuda"))
     return False
 
 
@@ -2913,72 +2901,6 @@ def _record_measurement(row: dict) -> None:
         pass
 
 
-_RAPID_CACHE: dict = {"at": 0.0, "data": None}
-
-
-def rapid_invalidate() -> None:
-    """Forget the cached answer - after an install, or on demand."""
-    _RAPID_CACHE["at"] = 0.0
-
-
-def rapid_info(force: bool = False) -> dict:
-    """Which RapidOCR is installed, and can ONNX Runtime see the card.
-
-    Same shape and the same reasoning as paddle_info(): asked in a child so
-    a broken wheel cannot take the web server down, and cached because the
-    answer only changes when somebody installs something.
-
-    THE CARD IS THE RUNTIME'S, NOT THE PACKAGE'S. `onnxruntime` and
-    `onnxruntime-gpu` are the same import name, the same version numbers and
-    the same API - the only difference is whether CUDAExecutionProvider is in
-    the provider list. So that list is the question, and the answer names the
-    providers it found rather than saying yes or no and being believed.
-    """
-    import subprocess as _sp
-    import sys as _sys
-    now = time.time()
-    if not force and _RAPID_CACHE["data"] is not None \
-            and (now - _RAPID_CACHE["at"]) < _PADDLE_TTL:
-        return dict(_RAPID_CACHE["data"])
-    out = {"installed": False, "rapidocr": "", "onnxruntime": "",
-           "cuda": False, "providers": [], "rapidocr_dir": ""}
-    from .config import CHILD_HIDE_PREAMBLE
-    code = (
-        CHILD_HIDE_PREAMBLE +
-        "import json, os\n"
-        "d={}\n"
-        "try:\n"
-        "    from importlib import metadata\n"
-        "    d['rapidocr']=metadata.version('rapidocr')\n"
-        "    from importlib.util import find_spec\n"
-        "    sp=find_spec('rapidocr')\n"
-        "    d['rapidocr_dir']=os.path.dirname(sp.origin or '') if sp else ''\n"
-        "except Exception: pass\n"
-        "try:\n"
-        "    import onnxruntime as o\n"
-        "    d['onnxruntime']=o.__version__\n"
-        "    d['providers']=list(o.get_available_providers() or [])\n"
-        "except Exception: pass\n"
-        "print(json.dumps(d))\n")
-    try:
-        r = _sp.run([_sys.executable, "-c", code], capture_output=True,
-                    text=True, timeout=120, creationflags=NO_WINDOW,
-                    startupinfo=_hidden())
-        lines = [l for l in (r.stdout or "").strip().splitlines() if l.strip()]
-        if lines:
-            d = json.loads(lines[-1])
-            out.update(rapidocr=d.get("rapidocr", ""),
-                       onnxruntime=d.get("onnxruntime", ""),
-                       providers=list(d.get("providers") or []),
-                       rapidocr_dir=d.get("rapidocr_dir", ""))
-            out["installed"] = bool(out["rapidocr"] and out["onnxruntime"])
-            out["cuda"] = "CUDAExecutionProvider" in out["providers"]
-    except Exception:                                    # noqa: BLE001
-        pass
-    _RAPID_CACHE.update(at=now, data=dict(out))
-    return out
-
-
 def engine_test(which: str = "tesseract", device: str = "cpu",
                 limit: int = 12) -> dict:
     """Read a few real cues with one engine and report what came back.
@@ -3034,9 +2956,9 @@ def engine_test(which: str = "tesseract", device: str = "cpu",
         os.remove(out)
     except OSError:
         pass
-    # THE SILICON IT GOT, not the one it was asked for - see _make_rapid in
-    # paddle_worker. A GPU column filled in by a run that fell back to the
-    # processor is worse than an empty one.
+    # THE SILICON IT GOT, not the one it was asked for - the worker reports
+    # it in its TIMING line. A GPU column filled in by a run that fell back to
+    # the processor is worse than an empty one.
     read_s = rd if rd is not None else el
     row = {"ok": True, "engine": which, "device": dev_used,
            "device_asked": device,

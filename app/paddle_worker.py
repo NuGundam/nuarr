@@ -154,8 +154,6 @@ def make_reader(engine: str, lang: str, device: str):
     the two paths cannot drift into reading differently.
     """
     import numpy as np
-    if engine == "rapid":
-        return _make_rapid(lang, device)
     if engine == "paddle":
         try:
             from paddleocr import PaddleOCR
@@ -228,70 +226,6 @@ def make_reader(engine: str, lang: str, device: str):
     return read
 
 
-def _make_rapid(lang: str, device: str):
-    """RapidOCR: PP-OCR's models on ONNX Runtime."""
-    import numpy as np
-    try:
-        from rapidocr import RapidOCR
-    except Exception as e:                               # noqa: BLE001
-        _die(f"rapidocr is not installed: {e}")
-    got = "cpu"
-    params = {}
-    if device == "gpu":
-        # ASK THE RUNTIME, DO NOT ASSUME. onnxruntime and onnxruntime-gpu are
-        # the same import name and the same API; only the provider list tells
-        # them apart, and the CPU build accepts use_cuda without complaint.
-        try:
-            import onnxruntime as _ort
-            if "CUDAExecutionProvider" in (_ort.get_available_providers()
-                                           or []):
-                params = {"EngineConfig.onnxruntime.use_cuda": True,
-                          "EngineConfig.onnxruntime.cuda_ep_cfg.device_id": 0}
-                got = "gpu"
-            else:
-                print("rapidocr: onnxruntime has no CUDAExecutionProvider, "
-                      "reading on the CPU", file=sys.stderr, flush=True)
-        except Exception as e:                           # noqa: BLE001
-            print(f"rapidocr: could not ask onnxruntime about CUDA ({e}), "
-                  "reading on the CPU", file=sys.stderr, flush=True)
-    try:
-        ocr = RapidOCR(params=params) if params else RapidOCR()
-    except Exception as e:                               # noqa: BLE001
-        if not params:
-            _die(f"rapidocr would not start: {e}")
-        # The card was there and it still would not start. Fall back rather
-        # than fail the whole read - and say so, because a silent fallback is
-        # how a GPU column ends up quoting a CPU number.
-        print(f"rapidocr: CUDA setup failed ({e}), reading on the CPU",
-              file=sys.stderr, flush=True)
-        ocr = RapidOCR()
-        got = "cpu"
-
-    def read(pic):
-        # Three channels, same reason as the Paddle branch above.
-        if pic.ndim == 2:
-            pic = np.stack([pic] * 3, axis=-1)
-        if pic.shape[2] == 4:
-            pic = pic[:, :, :3]
-        r = ocr(pic)
-        texts = [t for t in (getattr(r, "txts", None) or []) if t]
-        boxes = getattr(r, "boxes", None)
-        ys = []
-        if boxes is not None and len(boxes):
-            for b in boxes:
-                arr = np.asarray(b, dtype=float)
-                if arr.ndim == 2 and arr.shape[1] >= 2:
-                    ys.append(float(arr[:, 1].mean()))
-        # Mean AND spread, exactly as the Paddle branch documents: one bitmap
-        # often carries a sign and the dialogue under it, and the caller uses
-        # the spread to refuse to guess a position for both at once.
-        if not ys:
-            return texts, None, None
-        return texts, sum(ys) / len(ys), (max(ys) - min(ys))
-    read.device = got
-    return read
-
-
 def serve(engine: str, lang: str, device: str) -> None:
     r"""Answer one image path per line on stdin, one JSON line per answer.
 
@@ -311,7 +245,7 @@ def serve(engine: str, lang: str, device: str) -> None:
     from PIL import Image
     # WHAT IT GOT, NOT WHAT IT WAS ASKED FOR. A reader that answers "gpu"
     # while running on the processor is how a measured column ends up
-    # quoting the wrong silicon - see _make_rapid.
+    # quoting the wrong silicon.
     print(json.dumps({"ready": True, "engine": engine,
                       "device": getattr(read, "device", device)}),
           flush=True)
@@ -343,7 +277,7 @@ def main() -> None:
                          "so signs keep their place without leaving SRT")
     ap.add_argument("--progress", action="store_true")
     ap.add_argument("--engine", default="paddle",
-                    choices=("paddle", "tesseract", "rapid"))
+                    choices=("paddle", "tesseract"))
     ap.add_argument("--limit", type=int, default=0,
                     help="stop after N cues - used by the settings-page test")
     a = ap.parse_args()

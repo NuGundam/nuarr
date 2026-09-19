@@ -3277,6 +3277,17 @@ def _summary_impl():
     mine = int(totals["n"] or 0)
     totals["mine"] = mine
     totals["mine_bytes"] = int(totals["bytes"] or 0)
+    # WHAT IS INSIDE THE FILES, not just how many. Counted from the probes on
+    # a background thread every ten minutes - see trackcounts for why the
+    # files columns cannot be summed for this.
+    try:
+        from . import trackcounts as _tc
+        _t = _tc.cached()
+        totals["audio_tracks"] = int(_t.get("audio") or 0)
+        totals["sub_tracks"] = int(_t.get("subs") or 0)
+        totals["tracks_age_s"] = _t.get("age_s")
+    except Exception:                                    # noqa: BLE001
+        pass
     try:
         from . import arrtotals, hostio
         at = arrtotals.cached()
@@ -16487,6 +16498,76 @@ function idleEl(id){
   return { set innerHTML(v){ setHTMLIdle(el, v); },
            get innerHTML(){ return el ? el.innerHTML : ''; } };
 }
+// EVERY innerHTML ON THE PAGE GOES THROUGH THIS, not just the 26 sites that
+// call setHTML. Measured on the dashboard: 698 assignments in 35 seconds, 90%
+// of them rebuilding a panel into exactly what it already was, and one panel
+// above the viewport that changed height and moved the page under the reader.
+// Three rules, applied once, under all 363 direct assignments:
+//   identical is a no-op;
+//   a panel above the viewport that grows or shrinks takes the scroll with it,
+//     so what is on screen stays where it is (idempotent against Chrome's own
+//     anchoring: "scrollY should now be y0 + delta", whoever got there first);
+//   a scroll box inside the panel gets its position back.
+// setHTML/setHTMLIdle still do what they did - they sit on top of this.
+(function(){
+  const d = Object.getOwnPropertyDescriptor(Element.prototype, 'innerHTML');
+  if(!d || !d.set || Element.prototype.__nuarrHTML) return;
+  Element.prototype.__nuarrHTML = true;
+  Object.defineProperty(Element.prototype, 'innerHTML', {
+    configurable: true, enumerable: d.enumerable, get: d.get,
+    set: function(v){
+      if(typeof v !== 'string') v = String(v);
+      if(this.__nk === v) return;                    // 1. identical: nothing
+      this.__nk = v;
+      if(!document.body || !document.body.contains(this) || document.hidden){
+        d.set.call(this, v); return;                 // offscreen build: plain
+      }
+      // 3. remember scroll boxes inside, by id, before they are destroyed.
+      const kept = [];
+      try{
+        if(this.scrollTop || this.scrollLeft) kept.push([null, this.scrollTop, this.scrollLeft]);
+        for(const n of this.querySelectorAll('[id]'))
+          if(n.scrollTop || n.scrollLeft) kept.push([n.id, n.scrollTop, n.scrollLeft]);
+      }catch(_){}
+      // 2. where it was, and how tall, before.
+      const y0 = window.scrollY;
+      const r0 = this.getBoundingClientRect();
+      const above = r0.bottom <= 0;
+      d.set.call(this, v);
+      if(above){
+        const dh = this.getBoundingClientRect().height - r0.height;   // forces layout
+        if(dh){
+          const want = y0 + dh;
+          if(Math.abs(window.scrollY - want) > 0.5) window.scrollTo(window.scrollX, want);
+        }
+      }
+      for(const [id, t, l] of kept){
+        const n = id ? document.getElementById(id) : this;
+        if(n){ if(t) n.scrollTop = t; if(l) n.scrollLeft = l; }
+      }
+    }
+  });
+  // WRITING TEXT IN BETWEEN FORGETS THE KEY. `el.textContent='loading…'`
+  // followed by the same innerHTML as before must render, not be skipped as
+  // identical - the element is not what the key says it is any more.
+  for(const [proto, prop] of [[Node.prototype, 'textContent'],
+                              [HTMLElement.prototype, 'innerText']]){
+    const p = Object.getOwnPropertyDescriptor(proto, prop);
+    if(!p || !p.set) continue;
+    Object.defineProperty(proto, prop, {configurable: true, enumerable: p.enumerable,
+      get: p.get, set: function(v){ this.__nk = undefined; p.set.call(this, v); }});
+  }
+  for(const m of ['insertAdjacentHTML', 'replaceChildren', 'append', 'prepend']){
+    const f = Element.prototype[m];
+    if(typeof f !== 'function') continue;
+    Element.prototype[m] = function(){ this.__nk = undefined; return f.apply(this, arguments); };
+  }
+  for(const m of ['appendChild', 'removeChild', 'insertBefore', 'replaceChild']){
+    const f = Node.prototype[m];
+    if(typeof f !== 'function') continue;
+    Node.prototype[m] = function(){ this.__nk = undefined; return f.apply(this, arguments); };
+  }
+})();
 function setHTML(el, html){
   if(!el) return false;
   if(el.dataset.k===html) return false;
@@ -16784,8 +16865,17 @@ async function loadAll(){
     return join([naBit]);
   };
   const gapTxt = arrGap(s.totals);
+  // WHAT THE FILES CARRY. Shown only once counted - a zero here would read
+  // as "no subtitles anywhere", which is a claim, where "not counted yet" is
+  // just absence.
+  const trk = (s.totals.tracks_age_s!=null)
+    ? ' · <span title="audio tracks and subtitle tracks inside those files, '
+      + 'counted from the stored probes">'
+      + fmt(s.totals.audio_tracks||0)+' audio · '
+      + fmt(s.totals.sub_tracks||0)+' subs</span>'
+    : '';
   setHTML(document.getElementById('sub'),
-    fmt(s.totals.n)+' files'+tf+' · '+gb(s.totals.bytes)+' · '
+    fmt(s.totals.n)+' files'+tf+trk+' · '+gb(s.totals.bytes)+' · '
     + (gapTxt ? gapTxt+' · ' : '')
     + s.disks.length+' pool disks' + svTxt);
 
@@ -33113,7 +33203,6 @@ async function loadOcr(){
   }catch(e){ el.innerHTML='<div class="dim" style="padding:14px">could not load</div>'; return; }
   const s=_soc, p=_pad, inst=p.install||{};
   const padReady=!!p.installed;
-  const rap=s.rapid||{}, rapReady=!!rap.installed;
   const eng=_ocrEng;
 
   // ---- which engine, for everything -----------------------------------
@@ -33141,14 +33230,7 @@ async function loadOcr(){
           ? `Reads italics correctly and keeps each subtitle's position on screen.`
           : 'Not installed yet — install it below to choose it.',
         padReady)}
-      ${pick('rapid','RapidOCR',
-        rapReady
-          ? `The same PP-OCR models as PaddleOCR, read by ONNX Runtime instead of Paddle's own. ${
-              rap.cuda?'':'<span class="dim">CPU here — the installed ONNX Runtime has no CUDA provider.</span>'}`
-          : 'Not installed yet.',
-        rapReady)}
       ${(eng==='paddle'&&padReady)?ocrDeviceHtml(s,p,'paddle'):''}
-      ${(eng==='rapid'&&rapReady)?ocrDeviceHtml(s,rap,'rapid'):''}
       <div id="ocrEngMsg" class="dim" style="font-size:11.5px;margin-top:4px"></div>
     </div>`;
 
@@ -33204,12 +33286,6 @@ async function loadOcr(){
           p.cuda?'GPU build — can use the card'
                 :(p.gpu_name?`CPU build — a GPU is present (${esc(p.gpu_name)}) but unused`
                             :'CPU build'))}
-        ${socRow('rapidocr', rap.rapidocr||'—', rap.rapidocr_dir,
-          'PP-OCR\'s models, read by ONNX Runtime')}
-        ${socRow('onnxruntime', rap.onnxruntime||'—', '',
-          rap.cuda?'has a CUDA provider — RapidOCR can use the card'
-                  :`no CUDA provider — RapidOCR reads on the processor${
-                     (rap.providers||[]).length?' ('+esc((rap.providers||[]).join(', '))+')':''}`)}
         ${p.python?socRow('Python', p.python_version||'—', p.python,
           'the interpreter the two paddle packages live in'):''}
       </table>
@@ -34569,14 +34645,7 @@ async function gapRequeue(lib, btn){
 //   inst   is present on this machine
 // "is it paddle?" answered all three until a third engine arrived and each
 // of them stopped meaning the same thing.
-//
-// RAPIDOCR IS PP-OCR'S MODELS ON ONNX RUNTIME - the same detector and
-// recogniser PaddleOCR ships, run by a different runtime. Its card is the
-// RUNTIME'S, not the package's: onnxruntime and onnxruntime-gpu are the same
-// import with the same version, and only the provider list tells them apart,
-// so the GPU column appears when that list really has CUDA in it.
 function ocrCols(s,p){
-  const r=s.rapid||{};
   const cols=[{key:'tesseract', name:'Tesseract', ver:s.tesseract_version,
                ok:!!s.tesseract_version, engine:'tesseract', device:'cpu',
                gpu:false, boxes:false, dev:false, inst:!!s.tesseract_version}];
@@ -34587,19 +34656,6 @@ function ocrCols(s,p){
   cols.push({key:'paddle:cpu', name:'PaddleOCR — CPU', ver:p.paddleocr,
              ok:!!p.installed, engine:'paddle', device:'cpu', gpu:false,
              boxes:true, dev:true, inst:!!p.installed});
-  if(r.installed && r.cuda)
-    cols.push({key:'rapid:gpu', name:'RapidOCR — GPU', ver:r.rapidocr,
-               ok:true, engine:'rapid', device:'gpu', gpu:true,
-               boxes:true, dev:true, inst:true});
-  cols.push({key:'rapid:cpu', name:'RapidOCR — CPU', ver:r.rapidocr,
-             ok:!!r.installed, engine:'rapid', device:'cpu', gpu:false,
-             boxes:true, dev:true, inst:!!r.installed,
-             gpuwhy:(r.installed&&!r.cuda)
-               ?('the installed ONNX Runtime '+(r.onnxruntime||'')
-                 +' has no CUDA provider, so RapidOCR can only read on the '
-                 +'processor here — its providers are: '
-                 +((r.providers||[]).join(', ')||'none'))
-               :''});
   return cols;
 }
 function ocrCompareHtml(s,p){
@@ -34779,9 +34835,7 @@ function ocrDeviceHtml(s, p, eng){
       'Use the card when the installed build can see one. This is what nuarr did on its own before the choice existed.',true)}
     ${opt('gpu','GPU',
       p.cuda ? 'Always the card, leaving the CPU for everything else on this machine.'
-             : (eng==='rapid'
-                ? 'The installed ONNX Runtime carries no CUDA provider, so RapidOCR cannot use the card.'
-                : 'The installed PaddleOCR has no CUDA support, so it cannot use the card.'),
+             : 'The installed PaddleOCR has no CUDA support, so it cannot use the card.',
       !!p.cuda)}
     ${opt('cpu','CPU','Always the processor, leaving the card for Whisper and the encoders.',true)}
     ${(want==='auto')?`<div class="dim" style="font-size:10.5px;margin-top:3px">running on <b>${
