@@ -2026,9 +2026,10 @@ def run_one(path: str, probe: dict, work_root: str | None = None,
                     # goes through pgsrip as it always has; PaddleOCR runs in
                     # its own process, reads italics far better, and can keep
                     # each cue's position.
-                    if engine(library) == "paddle":
-                        srt = ocr_paddle(sup, tick, base + span * 0.1,
-                                         span * 0.8, who)
+                    if engine_worker(engine(library)):
+                        srt = ocr_worker(sup, tick, base + span * 0.1,
+                                         span * 0.8, who,
+                                         eng=engine(library))
                     else:
                         srt = ocr(sup, tick, base + span * 0.1, span * 0.8, who)
                 tick(base + span * 0.9, f"OCR track {i+1}/{n}{who} done")
@@ -2160,8 +2161,9 @@ def status() -> dict:
         # a fact rather than offer as a choice. The choice lives on the OCR
         # engines page; a second control for the same setting can only ever
         # disagree with it.
-        "engine_label": ("PaddleOCR" if engine("") == "paddle"
-                         else "Tesseract"),
+        "engine_label": engine_name(engine("")),
+        # What RapidOCR is on this install, in the shape paddle_info() uses.
+        "rapid": rapid_info(),
     }
 
 
@@ -2518,14 +2520,48 @@ def paddle_install_start(mode: str) -> dict:
     return {"ok": True, "mode": mode}
 
 
+# WHAT EACH ENGINE IS, IN ONE PLACE.
+#
+#   name     what to call it on screen - never spelled out at a call site.
+#   worker   reads through paddle_worker.py (one process, our own decode,
+#            per-cue boxes) rather than pgsrip.
+#   devices  which silicon it can be asked for. One entry means the device
+#            is not a choice, and the measurement key drops it.
+#
+# Everything downstream used to ask `engine == "paddle"` and mean whichever
+# of these it happened to need. With two engines those were the same
+# question; with three they are not.
+ENGINES = {
+    "tesseract": {"name": "Tesseract", "worker": False, "devices": ("cpu",)},
+    "paddle": {"name": "PaddleOCR", "worker": True, "devices": ("cpu", "gpu")},
+    "rapid": {"name": "RapidOCR", "worker": True, "devices": ("cpu", "gpu")},
+}
+
+
 def engine(library: str | None = None) -> str:
     """Which OCR engine this library uses. Tesseract unless told otherwise."""
     e = str(_s("subocr_engine", "tesseract", library) or "tesseract").lower()
-    return e if e in ("tesseract", "paddle") else "tesseract"
+    return e if e in ENGINES else "tesseract"
 
 
-def device() -> str:
-    r"""Which silicon PaddleOCR should use here - "gpu" or "cpu".
+def engine_name(e: str = "") -> str:
+    """What to call it on screen. The one place that spells the names."""
+    return (ENGINES.get(e or engine("")) or ENGINES["tesseract"])["name"]
+
+
+def engine_worker(e: str = "") -> bool:
+    """Does it read through paddle_worker.py rather than pgsrip?"""
+    return bool((ENGINES.get(e or engine("")) or {}).get("worker"))
+
+
+def engine_devices(e: str = "") -> tuple:
+    """Which silicon this engine can be asked for."""
+    return tuple((ENGINES.get(e or engine("")) or ENGINES["tesseract"])
+                 ["devices"])
+
+
+def device(eng: str = "") -> str:
+    r"""Which silicon the OCR should use here - "gpu" or "cpu".
 
     THE SETTING SAYS WHAT YOU WANT; THIS SAYS WHAT IS POSSIBLE. `auto` is
     what nuarr did on its own before the choice existed: take the card when
@@ -2540,11 +2576,62 @@ def device() -> str:
         want = "auto"
     if want == "cpu":
         return "cpu"
+    eng = eng or engine("")
+    if "gpu" not in engine_devices(eng):
+        return "cpu"
+    # ASK THE ENGINE THAT WILL RUN, not PaddleOCR every time. The two
+    # worker engines answer this from different places: Paddle is either
+    # compiled with CUDA or it is not, while RapidOCR's card depends on
+    # whether the installed ONNX Runtime carries a CUDA provider - the same
+    # package name either way.
     try:
-        cuda = bool(paddle_info().get("cuda"))
+        cuda = bool(engine_gpu_ready(eng))
     except Exception:                                            # noqa: BLE001
         cuda = False
     return "gpu" if cuda else "cpu"
+
+
+def engine_info(eng: str = "") -> dict:
+    """What is installed for this engine, asked properly.
+
+    The counterpart of engine_cached(): this one will start a child and take
+    seconds if the answer is not cached. Callers that can afford to wait -
+    the engine switch, which has to refuse an engine that is not there -
+    use this; the dashboard poll does not.
+    """
+    eng = eng or engine("")
+    if eng == "paddle":
+        return paddle_info()
+    if eng == "rapid":
+        return rapid_info()
+    # Tesseract is on disk or it is not, and status() already knows.
+    return {"installed": bool(_TVER.get("v"))}
+
+
+def engine_cached(eng: str = "") -> dict | None:
+    """What is ALREADY known about this engine's card, or None.
+
+    For callers on a hot path - the GPU panel redraws on every dashboard
+    poll and must not start a child process to draw a label. None means
+    nobody has asked yet, which is not the same as "no card" and is not
+    reported as one.
+    """
+    eng = eng or engine("")
+    if eng == "paddle":
+        return _PADDLE_CACHE.get("data")
+    if eng == "rapid":
+        return _RAPID_CACHE.get("data")
+    return None
+
+
+def engine_gpu_ready(eng: str = "") -> bool:
+    """Can this engine really take the card on this install?"""
+    eng = eng or engine("")
+    if eng == "paddle":
+        return bool(paddle_info().get("cuda"))
+    if eng == "rapid":
+        return bool(rapid_info().get("cuda"))
+    return False
 
 
 def device_wanted() -> str:
@@ -2553,9 +2640,10 @@ def device_wanted() -> str:
     return want if want in ("auto", "gpu", "cpu") else "auto"
 
 
-def ocr_paddle(sup: str, tick=None, base: float = 0.0, span: float = 1.0,
-               who: str = "", ass: bool = False, device: str = "") -> str:
-    r"""Read a .sup with PaddleOCR, in its own process.
+def ocr_worker(sup: str, tick=None, base: float = 0.0, span: float = 1.0,
+               who: str = "", ass: bool = False, device: str = "",
+               eng: str = "") -> str:
+    r"""Read a .sup with a worker engine, in its own process.
 
     Returns the path it produced - .srt normally, .ass when `ass` is set,
     which is the mode that keeps each cue's position on screen.
@@ -2564,15 +2652,19 @@ def ocr_paddle(sup: str, tick=None, base: float = 0.0, span: float = 1.0,
     # The caller may name one (the engine test does); otherwise the install's
     # setting decides. This used to auto-detect here, in the second of two
     # identical copies of that rule.
-    dev = device or globals()["device"]()
+    eng = eng or engine("")
+    if not engine_worker(eng):
+        eng = "paddle"
+    dev = device or globals()["device"](eng)
     out = os.path.splitext(sup)[0] + (".ass" if ass else ".srt")
     args = [_sys.executable,
             os.path.join(os.path.dirname(os.path.abspath(__file__)),
                          "paddle_worker.py"),
-            sup, "--out", out, "--device", dev, "--progress"]
+            sup, "--out", out, "--device", dev, "--engine", eng,
+            "--progress"]
     if ass:
         args.append("--ass")
-    label = f"PaddleOCR · {dev.upper()}"
+    label = f"{engine_name(eng)} · {dev.upper()}"
     if tick:
         tick(base, f"OCR{who} — {label}")
     # REAL PROGRESS, NOT AN ESTIMATE. The Tesseract path has to guess from the
@@ -2581,11 +2673,16 @@ def ocr_paddle(sup: str, tick=None, base: float = 0.0, span: float = 1.0,
     # different sources - see ocr().
     rc, err, tail = _run_progress(args, tick, base, span, who, label)
     if not os.path.exists(out):
-        raise RuntimeError(f"PaddleOCR produced nothing (rc={rc}): "
+        raise RuntimeError(f"{engine_name(eng)} produced nothing (rc={rc}): "
                            f"{(err or tail).strip()[:300]}")
     if tick:
         tick(base + span, f"OCR{who} — {label} done")
     return out
+
+
+# The name it had when PaddleOCR was the only worker engine. Kept so nothing
+# outside this module has to care that a second one arrived.
+ocr_paddle = ocr_worker
 
 
 def _run_progress(args: list[str], tick, base: float, span: float,
@@ -2798,15 +2895,88 @@ def _record_measurement(row: dict) -> None:
     try:
         from .db import kv_get, kv_set
         cur = json.loads(kv_get("subocr.measurements") or "{}")
-        key = (f"{row['engine']}:{row['device']}" if row["engine"] == "paddle"
-               else row["engine"])
+        # ONE KEY PER THING THAT CAN BE MEASURED SEPARATELY. An engine with
+        # a device to choose gets a column per device; one that has no choice
+        # would only ever write "tesseract:cpu" and read it back as a second
+        # column that never fills in.
+        key = (f"{row['engine']}:{row['device']}"
+               if len(engine_devices(row["engine"])) > 1 else row["engine"])
         cur[key] = {"per_cue_ms": row.get("per_cue_ms"),
                     "cues": row.get("cues"), "elapsed": row.get("elapsed"),
+                    "decode_s": row.get("decode_s"),
+                    "load_s": row.get("load_s"),
+                    "read_s": row.get("read_s"),
                     "title": row.get("title", ""), "at": time.time(),
                     "lines": (row.get("lines") or [])[:6]}
         kv_set("subocr.measurements", json.dumps(cur))
     except Exception:                                    # noqa: BLE001
         pass
+
+
+_RAPID_CACHE: dict = {"at": 0.0, "data": None}
+
+
+def rapid_invalidate() -> None:
+    """Forget the cached answer - after an install, or on demand."""
+    _RAPID_CACHE["at"] = 0.0
+
+
+def rapid_info(force: bool = False) -> dict:
+    """Which RapidOCR is installed, and can ONNX Runtime see the card.
+
+    Same shape and the same reasoning as paddle_info(): asked in a child so
+    a broken wheel cannot take the web server down, and cached because the
+    answer only changes when somebody installs something.
+
+    THE CARD IS THE RUNTIME'S, NOT THE PACKAGE'S. `onnxruntime` and
+    `onnxruntime-gpu` are the same import name, the same version numbers and
+    the same API - the only difference is whether CUDAExecutionProvider is in
+    the provider list. So that list is the question, and the answer names the
+    providers it found rather than saying yes or no and being believed.
+    """
+    import subprocess as _sp
+    import sys as _sys
+    now = time.time()
+    if not force and _RAPID_CACHE["data"] is not None \
+            and (now - _RAPID_CACHE["at"]) < _PADDLE_TTL:
+        return dict(_RAPID_CACHE["data"])
+    out = {"installed": False, "rapidocr": "", "onnxruntime": "",
+           "cuda": False, "providers": [], "rapidocr_dir": ""}
+    from .config import CHILD_HIDE_PREAMBLE
+    code = (
+        CHILD_HIDE_PREAMBLE +
+        "import json, os\n"
+        "d={}\n"
+        "try:\n"
+        "    from importlib import metadata\n"
+        "    d['rapidocr']=metadata.version('rapidocr')\n"
+        "    from importlib.util import find_spec\n"
+        "    sp=find_spec('rapidocr')\n"
+        "    d['rapidocr_dir']=os.path.dirname(sp.origin or '') if sp else ''\n"
+        "except Exception: pass\n"
+        "try:\n"
+        "    import onnxruntime as o\n"
+        "    d['onnxruntime']=o.__version__\n"
+        "    d['providers']=list(o.get_available_providers() or [])\n"
+        "except Exception: pass\n"
+        "print(json.dumps(d))\n")
+    try:
+        r = _sp.run([_sys.executable, "-c", code], capture_output=True,
+                    text=True, timeout=120, creationflags=NO_WINDOW,
+                    startupinfo=_hidden())
+        lines = [l for l in (r.stdout or "").strip().splitlines() if l.strip()]
+        if lines:
+            d = json.loads(lines[-1])
+            out.update(rapidocr=d.get("rapidocr", ""),
+                       onnxruntime=d.get("onnxruntime", ""),
+                       providers=list(d.get("providers") or []),
+                       rapidocr_dir=d.get("rapidocr_dir", ""))
+            out["installed"] = bool(out["rapidocr"] and out["onnxruntime"])
+            out["cuda"] = "CUDAExecutionProvider" in out["providers"]
+    except Exception:                                    # noqa: BLE001
+        pass
+    _RAPID_CACHE.update(at=now, data=dict(out))
+    return out
 
 
 def engine_test(which: str = "tesseract", device: str = "cpu",
@@ -2841,6 +3011,16 @@ def engine_test(which: str = "tesseract", device: str = "cpu",
         else:
             os.environ["NUARR_TESSERACT_DIR"] = old
     el = time.time() - t0
+    # WHAT THE CHILD SAID IT SPENT WHERE. Decoding the sample and loading a
+    # model are the same work in every column; only the reading differs
+    # between engines, and dividing the whole run by the cues reported the
+    # decode as the engine's speed - measured here, 80 of 90 seconds.
+    def _num(key: str):
+        m = re.search(rf"TIMING[^\r\n]*\b{key}=([0-9.]+)", err or "")
+        return float(m.group(1)) if m else None
+    m_dev = re.search(r"TIMING[^\r\n]*\bdevice=(\w+)", err or "")
+    dev_used = m_dev.group(1) if m_dev else device
+    dec, load, rd = _num("decode"), _num("load"), _num("read")
     if not os.path.exists(out):
         return {"ok": False, "engine": which, "device": device,
                 "elapsed": round(el, 1),
@@ -2854,10 +3034,18 @@ def engine_test(which: str = "tesseract", device: str = "cpu",
         os.remove(out)
     except OSError:
         pass
-    row = {"ok": True, "engine": which, "device": device,
+    # THE SILICON IT GOT, not the one it was asked for - see _make_rapid in
+    # paddle_worker. A GPU column filled in by a run that fell back to the
+    # processor is worse than an empty one.
+    read_s = rd if rd is not None else el
+    row = {"ok": True, "engine": which, "device": dev_used,
+           "device_asked": device,
            "title": samp["title"], "cues": len(lines),
            "elapsed": round(el, 1),
-           "per_cue_ms": int(el * 1000 / max(1, len(lines))),
+           "decode_s": round(dec, 1) if dec is not None else None,
+           "load_s": round(load, 1) if load is not None else None,
+           "read_s": round(read_s, 1),
+           "per_cue_ms": int(read_s * 1000 / max(1, len(lines))),
            "lines": lines[:8]}
     _record_measurement(row)
     return row

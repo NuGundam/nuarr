@@ -934,9 +934,25 @@ class Worker:
                     else "disk", "why": st}
         if kind == "sub_ocr":
             if st == "ocr":
-                return {"tool": "Tesseract", "hw": "CPU",
-                        "why": "reading picture subtitles into text, one "
-                               "thread per job - no GPU path exists for this"}
+                # WHICH ENGINE AND WHICH SILICON, ASKED. This said Tesseract
+                # on the CPU with "no GPU path exists for this" written
+                # underneath it, which was true when Tesseract was the only
+                # reader and has been wrong since the engine became a
+                # setting. On this machine that path reads a cue in 0.17s on
+                # the card against 17.8s on the processor.
+                eng, dev = "the OCR", "cpu"
+                try:
+                    from . import subocr as _so
+                    which = _so.engine("")
+                    eng = _so.engine_name(which)
+                    dev = _so.device(which)
+                except Exception:                        # noqa: BLE001
+                    pass
+                return {"tool": eng, "hw": dev.upper(),
+                        "why": ("reading picture subtitles into text on the "
+                                "card" if dev == "gpu" else
+                                "reading picture subtitles into text, one "
+                                "thread per job")}
             if "mux" in st or "embed" in st:
                 return {"tool": "mkvmerge", "hw": "disk",
                         "why": "container copy - no decode"}
@@ -984,15 +1000,17 @@ class Worker:
                 # very next line. The `listen` branch above has read
                 # audiolang's real model device since the day it was written.
                 #
-                # ONE STAGE, TWO PIECES OF SILICON: ffmpeg decodes the frames
-                # on the CPU and PaddleOCR reads the best of them on the card,
-                # so a single word cannot be true. It names both.
+                # ONE STAGE, TWO PIECES OF SILICON: ffmpeg decodes the
+                # frames on the CPU and the OCR reads the best of them on the
+                # card, so a single word cannot be true. It names both - and
+                # asks which engine and which device rather than saying, which
+                # is the bug this line already had once.
                 eng, dev = "the OCR", "cpu"
                 try:
                     from . import hardsub as _hs, subocr as _so
-                    paddle = _hs.ocr_engine() == "paddle"
-                    eng = "PaddleOCR" if paddle else "Tesseract"
-                    dev = _so.device() if paddle else "cpu"
+                    which = _hs.ocr_engine()
+                    eng = _so.engine_name(which)
+                    dev = _so.device(which)
                 except Exception:                        # noqa: BLE001
                     pass
                 hw = ("CPU \u00b7 frames, GPU \u00b7 reading" if dev == "gpu"

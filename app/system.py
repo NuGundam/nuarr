@@ -794,20 +794,23 @@ def _gpu_work() -> list[dict]:
                 if getattr(getattr(w, "job", None), "kind", "") == "sub_ocr"
                 or getattr(w, "sub_ocr_active", False))
         eng = subocr.engine()
-        if n and eng == "paddle":
-            cached = subocr._PADDLE_CACHE.get("data")
+        if n and subocr.engine_worker(eng):
+            # THE CACHED ANSWER ONLY. This runs on every dashboard poll, and
+            # asking properly costs a child process - so it reads whatever
+            # was already worked out and says nothing it does not know.
+            cached = subocr.engine_cached(eng)
             # An empty cache is "not asked yet", not "no CUDA" - claiming
             # CPU on a GPU build right after boot would be invented, so an
             # unknown device is reported as gpu (its usual home) and said so.
             on_gpu = True if cached is None else bool(cached.get("cuda"))
             work.append({"kind": "subocr",
-                         "label": "subtitle OCR — PaddleOCR"
+                         "label": f"subtitle OCR — {subocr.engine_name(eng)}"
                                   + ("" if cached is None else
-                                     (" (CUDA)" if on_gpu else " (CPU build)")),
+                                     (" (CUDA)" if on_gpu else " (CPU)")),
                          "n": n, "device": "gpu" if on_gpu else "cpu"})
         elif n:
             work.append({"kind": "subocr",
-                         "label": f"subtitle OCR — {eng or 'tesseract'}",
+                         "label": f"subtitle OCR — {subocr.engine_name(eng)}",
                          "n": n, "device": "cpu"})
     except Exception:                                    # noqa: BLE001
         pass

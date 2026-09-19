@@ -26,6 +26,7 @@ import json
 import os
 import subprocess as _sp
 import sys
+import time
 
 # HIDE EVERY DESCENDANT. This process runs without a console, so any
 # console-subsystem child anything in here spawns would get a brand new one
@@ -79,12 +80,18 @@ def _ass_ts(ms: int) -> str:
     return f"{h}:{m:02}:{s:02}.{ms // 10:02}"
 
 
-def read_sup(path: str):
+def read_sup(path: str, limit: int = 0):
     """Decode the .sup into (image, start_ms, end_ms, x, y, video_w, video_h).
 
     Uses pgsrip's own PGS parser, so nuarr has exactly one implementation of
     "what is in this subtitle track" and the two engines cannot disagree
     about how many cues a file contains.
+
+    `limit` stops once that many cues are complete. The settings-page test
+    reads twelve and used to decode all eight hundred first - about eighty
+    seconds of work thrown away, per engine, per run, and eighty seconds
+    that landed in the middle of a number labelled "seconds per cue". A real
+    OCR pass passes no limit and decodes the lot as before.
     """
     import numpy as np
     from pgsrip.media_path import MediaPath
@@ -117,6 +124,8 @@ def read_sup(path: str):
             if pending:
                 pending[2] = start
                 out.append(pending)
+                if limit and len(out) >= limit:
+                    return out
             w = ds.wds
             pending = [arr, start, start,
                        getattr(w, "x_offset", 0) or 0,
@@ -128,6 +137,8 @@ def read_sup(path: str):
             pending[2] = start
             out.append(pending)
             pending = None
+            if limit and len(out) >= limit:
+                return out
     if pending:
         pending[2] = pending[1] + 3000
         out.append(pending)
@@ -143,6 +154,8 @@ def make_reader(engine: str, lang: str, device: str):
     the two paths cannot drift into reading differently.
     """
     import numpy as np
+    if engine == "rapid":
+        return _make_rapid(lang, device)
     if engine == "paddle":
         try:
             from paddleocr import PaddleOCR
@@ -215,6 +228,70 @@ def make_reader(engine: str, lang: str, device: str):
     return read
 
 
+def _make_rapid(lang: str, device: str):
+    """RapidOCR: PP-OCR's models on ONNX Runtime."""
+    import numpy as np
+    try:
+        from rapidocr import RapidOCR
+    except Exception as e:                               # noqa: BLE001
+        _die(f"rapidocr is not installed: {e}")
+    got = "cpu"
+    params = {}
+    if device == "gpu":
+        # ASK THE RUNTIME, DO NOT ASSUME. onnxruntime and onnxruntime-gpu are
+        # the same import name and the same API; only the provider list tells
+        # them apart, and the CPU build accepts use_cuda without complaint.
+        try:
+            import onnxruntime as _ort
+            if "CUDAExecutionProvider" in (_ort.get_available_providers()
+                                           or []):
+                params = {"EngineConfig.onnxruntime.use_cuda": True,
+                          "EngineConfig.onnxruntime.cuda_ep_cfg.device_id": 0}
+                got = "gpu"
+            else:
+                print("rapidocr: onnxruntime has no CUDAExecutionProvider, "
+                      "reading on the CPU", file=sys.stderr, flush=True)
+        except Exception as e:                           # noqa: BLE001
+            print(f"rapidocr: could not ask onnxruntime about CUDA ({e}), "
+                  "reading on the CPU", file=sys.stderr, flush=True)
+    try:
+        ocr = RapidOCR(params=params) if params else RapidOCR()
+    except Exception as e:                               # noqa: BLE001
+        if not params:
+            _die(f"rapidocr would not start: {e}")
+        # The card was there and it still would not start. Fall back rather
+        # than fail the whole read - and say so, because a silent fallback is
+        # how a GPU column ends up quoting a CPU number.
+        print(f"rapidocr: CUDA setup failed ({e}), reading on the CPU",
+              file=sys.stderr, flush=True)
+        ocr = RapidOCR()
+        got = "cpu"
+
+    def read(pic):
+        # Three channels, same reason as the Paddle branch above.
+        if pic.ndim == 2:
+            pic = np.stack([pic] * 3, axis=-1)
+        if pic.shape[2] == 4:
+            pic = pic[:, :, :3]
+        r = ocr(pic)
+        texts = [t for t in (getattr(r, "txts", None) or []) if t]
+        boxes = getattr(r, "boxes", None)
+        ys = []
+        if boxes is not None and len(boxes):
+            for b in boxes:
+                arr = np.asarray(b, dtype=float)
+                if arr.ndim == 2 and arr.shape[1] >= 2:
+                    ys.append(float(arr[:, 1].mean()))
+        # Mean AND spread, exactly as the Paddle branch documents: one bitmap
+        # often carries a sign and the dialogue under it, and the caller uses
+        # the spread to refuse to guess a position for both at once.
+        if not ys:
+            return texts, None, None
+        return texts, sum(ys) / len(ys), (max(ys) - min(ys))
+    read.device = got
+    return read
+
+
 def serve(engine: str, lang: str, device: str) -> None:
     r"""Answer one image path per line on stdin, one JSON line per answer.
 
@@ -232,7 +309,11 @@ def serve(engine: str, lang: str, device: str) -> None:
     import numpy as np
     read = make_reader(engine, lang, device)
     from PIL import Image
-    print(json.dumps({"ready": True, "engine": engine, "device": device}),
+    # WHAT IT GOT, NOT WHAT IT WAS ASKED FOR. A reader that answers "gpu"
+    # while running on the processor is how a measured column ends up
+    # quoting the wrong silicon - see _make_rapid.
+    print(json.dumps({"ready": True, "engine": engine,
+                      "device": getattr(read, "device", device)}),
           flush=True)
     for line in sys.stdin:
         p = line.strip()
@@ -262,7 +343,7 @@ def main() -> None:
                          "so signs keep their place without leaving SRT")
     ap.add_argument("--progress", action="store_true")
     ap.add_argument("--engine", default="paddle",
-                    choices=("paddle", "tesseract"))
+                    choices=("paddle", "tesseract", "rapid"))
     ap.add_argument("--limit", type=int, default=0,
                     help="stop after N cues - used by the settings-page test")
     a = ap.parse_args()
@@ -275,7 +356,12 @@ def main() -> None:
 
     import numpy as np
 
-    cues = read_sup(a.sup)
+    # WHAT WAS MEASURED, SAID SEPARATELY. Decode, model load and reading are
+    # three different costs and only the last one differs between engines -
+    # see the module docstring of the patch that added this.
+    _t0 = time.time()
+    cues = read_sup(a.sup, a.limit)
+    print(f"TIMING decode={time.time() - _t0:.3f}", flush=True)
     if not cues:
         _die("no cues decoded from the sup")
     if a.limit:
@@ -285,15 +371,22 @@ def main() -> None:
     # does its own decoding - but a comparison is only worth reading if both
     # engines saw exactly the same pictures, so the test path drives both from
     # the decode above. Each `read` takes an image and returns text lines.
+    _t0 = time.time()
     read = make_reader(a.engine, a.lang, a.device)
+    print(f"TIMING load={time.time() - _t0:.3f} "
+          f"device={getattr(read, 'device', a.device)}", flush=True)
 
     rows = []
     n = len(cues)
+    _read_s = 0.0
     for i, (img, start, end, x, y, vw, vh) in enumerate(cues):
+        _t0 = time.time()
         try:
             texts, ty, spread = read(img)
         except Exception:                                # noqa: BLE001
+            _read_s += time.time() - _t0
             continue
+        _read_s += time.time() - _t0
         txt = "\n".join(t.strip() for t in texts if t and t.strip())
         if not txt:
             continue
@@ -376,6 +469,10 @@ def main() -> None:
             parts.append(f"{i}\n{_ts(r['start'])} --> {_ts(r['end'])}\n"
                          f"{tag}{r['text']}\n")
         open(a.out, "w", encoding="utf-8").write("\n".join(parts))
+    # The reading, alone, and how many cues it covers. The caller divides
+    # these two rather than dividing the whole run by the cues, which is how
+    # a decode ended up being reported as an engine's speed.
+    print(f"TIMING read={_read_s:.3f} cues={len(rows)}", flush=True)
     print(f"OK {len(rows)} cues -> {os.path.basename(a.out)}")
 
 

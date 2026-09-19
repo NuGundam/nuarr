@@ -617,7 +617,8 @@ def _readers(out_left: int, running: bool) -> list:
     try:
         from . import hardsub
         eng = hardsub.ocr_engine()
-        eng_name = "PaddleOCR" if eng == "paddle" else "Tesseract"
+        from . import subocr as _so
+        eng_name = _so.engine_name(eng)
         rows.append({
             "key": "picture", "name": "words burned into the picture",
             # THE ENGINE THIS INSTALL IS SET TO, asked rather than assumed.
@@ -627,6 +628,11 @@ def _readers(out_left: int, running: bool) -> list:
             # wrong about it with complete confidence.
             "tool": f"ffmpeg frames + {eng_name}",
             "engine": eng,
+            # THE NAME, SENT RATHER THAN DERIVED. The page used to turn the
+            # key into a name with a two-way test of its own, which is one
+            # more place to be wrong about a setting that now has three
+            # values.
+            "engine_name": eng_name,
             "what": f"For files that report no subtitle track at all. ffmpeg "
                     f"pulls {hardsub.SAMPLES} frames off the disk, the "
                     f"brightest part of the caption band is counted, and the "

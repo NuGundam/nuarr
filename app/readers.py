@@ -454,7 +454,8 @@ def _subread_plan(r: dict) -> str:
         # THE CARD NAMES THE ENGINE. The OCR is one setting for the whole
         # install now, so "the OCR" on a job card is a name withheld.
         try:
-            eng = "PaddleOCR" if hardsub.ocr_engine() == "paddle" else "Tesseract"
+            from . import subocr as _so
+            eng = _so.engine_name(hardsub.ocr_engine())
         except Exception:                                        # noqa: BLE001
             eng = "the OCR"
         return json.dumps({

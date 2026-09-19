@@ -7082,15 +7082,18 @@ async def api_ocr_engine(engine: str = Query(...)):
     they are cancelled and put straight back on the queue.
     """
     import yaml
-    if engine not in ("tesseract", "paddle"):
-        return {"ok": False, "error": "unknown engine"}
     from . import subocr as _so
-    if engine == "paddle":
-        info = await asyncio.to_thread(_so.paddle_info)
+    if engine not in _so.ENGINES:
+        return {"ok": False, "error": "unknown engine"}
+    # A WORKER ENGINE HAS TO BE THERE BEFORE IT CAN BE CHOSEN, and which
+    # question that is depends on the engine: Paddle answers from its build,
+    # RapidOCR from its wheel and whichever ONNX Runtime sits beside it.
+    if _so.engine_worker(engine):
+        info = await asyncio.to_thread(_so.engine_info, engine)
         if not info.get("installed"):
             return {"ok": False,
-                    "error": "PaddleOCR is not installed yet - install it "
-                             "above first"}
+                    "error": f"{_so.engine_name(engine)} is not installed "
+                             "yet - install it above first"}
 
     p = _config_path()
     raw = {}
@@ -7225,7 +7228,7 @@ async def api_ocr_test(engine: str = Query("tesseract"),
     """Read a dozen real cues with one engine. Writes nothing to the library."""
     from . import subocr as _so
     from . import heavy
-    if engine not in ("tesseract", "paddle"):
+    if engine not in _so.ENGINES:
         return {"ok": False, "error": "unknown engine"}
     # ONE HEAVY THING AT A TIME. A test loads a model; so does an install.
     # Both at once on a small machine is how the server ran out of memory
@@ -33096,6 +33099,7 @@ async function loadOcr(){
   }catch(e){ el.innerHTML='<div class="dim" style="padding:14px">could not load</div>'; return; }
   const s=_soc, p=_pad, inst=p.install||{};
   const padReady=!!p.installed;
+  const rap=s.rapid||{}, rapReady=!!rap.installed;
   const eng=_ocrEng;
 
   // ---- which engine, for everything -----------------------------------
@@ -33123,7 +33127,14 @@ async function loadOcr(){
           ? `Reads italics correctly and keeps each subtitle's position on screen.`
           : 'Not installed yet — install it below to choose it.',
         padReady)}
-      ${padReady?ocrDeviceHtml(s,p):''}
+      ${pick('rapid','RapidOCR',
+        rapReady
+          ? `The same PP-OCR models as PaddleOCR, read by ONNX Runtime instead of Paddle's own. ${
+              rap.cuda?'':'<span class="dim">CPU here — the installed ONNX Runtime has no CUDA provider.</span>'}`
+          : 'Not installed yet.',
+        rapReady)}
+      ${(eng==='paddle'&&padReady)?ocrDeviceHtml(s,p,'paddle'):''}
+      ${(eng==='rapid'&&rapReady)?ocrDeviceHtml(s,rap,'rapid'):''}
       <div id="ocrEngMsg" class="dim" style="font-size:11.5px;margin-top:4px"></div>
     </div>`;
 
@@ -33179,6 +33190,12 @@ async function loadOcr(){
           p.cuda?'GPU build — can use the card'
                 :(p.gpu_name?`CPU build — a GPU is present (${esc(p.gpu_name)}) but unused`
                             :'CPU build'))}
+        ${socRow('rapidocr', rap.rapidocr||'—', rap.rapidocr_dir,
+          'PP-OCR\'s models, read by ONNX Runtime')}
+        ${socRow('onnxruntime', rap.onnxruntime||'—', '',
+          rap.cuda?'has a CUDA provider — RapidOCR can use the card'
+                  :`no CUDA provider — RapidOCR reads on the processor${
+                     (rap.providers||[]).length?' ('+esc((rap.providers||[]).join(', '))+')':''}`)}
         ${p.python?socRow('Python', p.python_version||'—', p.python,
           'the interpreter the two paddle packages live in'):''}
       </table>
@@ -34532,23 +34549,54 @@ async function gapRequeue(lib, btn){
 // remotely the same proposition - the earlier version showed only whichever
 // device was configured, which hid exactly the number someone weighing the
 // install would want.
+// EVERY FACT A ROW NEEDS IS A FLAG HERE, not a name test further down.
+//   boxes  gives per-cue coordinates, so a sign can keep its place
+//   dev    has silicon to choose, so its measurement is keyed by device
+//   inst   is present on this machine
+// "is it paddle?" answered all three until a third engine arrived and each
+// of them stopped meaning the same thing.
+//
+// RAPIDOCR IS PP-OCR'S MODELS ON ONNX RUNTIME - the same detector and
+// recogniser PaddleOCR ships, run by a different runtime. Its card is the
+// RUNTIME'S, not the package's: onnxruntime and onnxruntime-gpu are the same
+// import with the same version, and only the provider list tells them apart,
+// so the GPU column appears when that list really has CUDA in it.
 function ocrCols(s,p){
+  const r=s.rapid||{};
   const cols=[{key:'tesseract', name:'Tesseract', ver:s.tesseract_version,
                ok:!!s.tesseract_version, engine:'tesseract', device:'cpu',
-               gpu:false}];
+               gpu:false, boxes:false, dev:false, inst:!!s.tesseract_version}];
   if(p.installed && p.cuda)
     cols.push({key:'paddle:gpu', name:'PaddleOCR — GPU', ver:p.paddleocr,
-               ok:true, engine:'paddle', device:'gpu', gpu:true});
+               ok:true, engine:'paddle', device:'gpu', gpu:true,
+               boxes:true, dev:true, inst:true});
   cols.push({key:'paddle:cpu', name:'PaddleOCR — CPU', ver:p.paddleocr,
-             ok:!!p.installed, engine:'paddle', device:'cpu', gpu:false});
+             ok:!!p.installed, engine:'paddle', device:'cpu', gpu:false,
+             boxes:true, dev:true, inst:!!p.installed});
+  if(r.installed && r.cuda)
+    cols.push({key:'rapid:gpu', name:'RapidOCR — GPU', ver:r.rapidocr,
+               ok:true, engine:'rapid', device:'gpu', gpu:true,
+               boxes:true, dev:true, inst:true});
+  cols.push({key:'rapid:cpu', name:'RapidOCR — CPU', ver:r.rapidocr,
+             ok:!!r.installed, engine:'rapid', device:'cpu', gpu:false,
+             boxes:true, dev:true, inst:!!r.installed,
+             gpuwhy:(r.installed&&!r.cuda)
+               ?('the installed ONNX Runtime '+(r.onnxruntime||'')
+                 +' has no CUDA provider, so RapidOCR can only read on the '
+                 +'processor here — its providers are: '
+                 +((r.providers||[]).join(', ')||'none'))
+               :''});
   return cols;
 }
 function ocrCompareHtml(s,p){
   const cols=ocrCols(s,p);
+  // The question column gives up room as engines are added, rather than the
+  // table growing a horizontal scrollbar nobody finds.
+  const lw = cols.length>3?28:(cols.length>2?40:52);
   const yes=t=>`<span style="color:var(--ok)" title="${esc(t||'')}">yes</span>`;
   const no =t=>`<span class="dim" title="${esc(t||'')}">no</span>`;
   const na =t=>`<span class="dim" title="not installed">—</span>`;
-  const paddle=c=>c.engine==='paddle';
+  const boxed=c=>!!c.boxes;
   const rows=[
     ['Reads picture subtitles into text',
      c=>c.ok?yes():na()],
@@ -34556,19 +34604,19 @@ function ocrCompareHtml(s,p){
      c=>yes('the check measures the PGS bitmaps before any engine runs, so '
            +'every column here gives the same answer')],
     ['Keeps each subtitle where it sat on screen',
-     c=>!c.ok?na():paddle(c)
+     c=>!c.ok?na():boxed(c)
        ?yes('per-cue boxes become {\\an8} tags, so a sign at the top stays '
            +'at the top')
        :no('pgsrip returns lines with no coordinates, so text lands at the '
           +'bottom')],
     ['Reads italics correctly',
-     c=>!c.ok?na():paddle(c)?yes():no('italics come back garbled or dropped')],
+     c=>!c.ok?na():boxed(c)?yes():no('italics come back garbled or dropped')],
     ['Uses the graphics card',
-     c=>!c.ok?na():c.gpu?yes(p.gpu_name||''):no(paddle(c)
-        ?'this column is the CPU device':'CPU only, always')],
+     c=>!c.ok?na():c.gpu?yes(p.gpu_name||''):no(c.gpuwhy||(c.dev
+        ?'this column is the CPU device':'CPU only, always'))],
     ['Ready without installing anything',
      c=>c.engine==='tesseract'?yes('bundled with Nuarr')
-        :(p.installed?yes('already installed'):no('needs a download first'))],
+        :(c.inst?yes('already installed'):no('needs a download first'))],
   ];
   const th=cols.map(c=>`<th style="text-align:left;padding:0 10px 6px 0">
       <b${_ocrEng===c.engine?' style="color:#6fb0ff"':''}>${esc(c.name)}</b>
@@ -34599,6 +34647,14 @@ function ocrCompareHtml(s,p){
             ${win?'<span style="color:var(--ok)" title="fastest of the engines'
                  +' measured here">· fastest</span>':''}`;
   };
+  // ONCE PER PASS, NOT PER CUE. The reader keeps one worker alive across a
+  // whole file, so this is paid once and then not again - which is the
+  // difference between a number that matters and one that does not.
+  const load=c=>{
+    const m=_ocrMeas[c.key];
+    if(!c.ok||!m||m.load_s==null) return `<span class="dim">—</span>`;
+    return `${m.load_s.toFixed(1)}s`;
+  };
   const when=c=>{
     const m=_ocrMeas[c.key];
     if(!m||!m.at) return `<span class="dim">—</span>`;
@@ -34616,9 +34672,19 @@ function ocrCompareHtml(s,p){
       ${cols.map(c=>`<td style="padding:4px 10px 4px 0;vertical-align:${va||'baseline'};
          ${va?'':'white-space:nowrap'}">${fn(c)}</td>`).join('')}
     </tr>`;
-  const btn=c=>c.ok?`<button onclick="ocrTest('${c.engine}','${c.device}')"
+  const btn=c=>c.ok?`<button onclick="ocrTest('${c.engine}','${c.device}',${c.dev?1:0})"
       style="font-size:11px;padding:2px 8px">Test ${esc(c.name)}</button>`:'';
   const untested=cols.filter(c=>c.ok&&!(_ocrMeas[c.key]||{}).per_cue_ms).length;
+  // SAY WHAT IS NOT IN THE NUMBER. Decoding the sample is the same work
+  // whichever engine reads it, and it used to be inside the per-cue figure -
+  // where it was most of it, and made two very different engines look alike.
+  const decs=cols.map(c=>(_ocrMeas[c.key]||{}).decode_s)
+                 .filter(x=>x!=null);
+  const decNote = decs.length
+    ? ` The seconds-per-subtitle row is the reading only. Pulling the sample
+        apart into pictures took ${(decs.reduce((a,b)=>a+b,0)/decs.length).toFixed(1)}s
+        on top of it, and that part is identical in every column.`
+    : '';
   return `
     <div id="ocrCompare" class="lkind" style="padding:11px 12px;margin-top:10px">
       <b style="color:#6fb0ff">Engine comparison</b>
@@ -34630,8 +34696,8 @@ function ocrCompareHtml(s,p){
         written and no file touched.</div>
       <table style="width:100%;font-size:11.5px;border-collapse:collapse;
                     margin-top:8px;table-layout:fixed">
-        <colgroup><col style="width:${cols.length>2?40:52}%">
-          ${cols.map(()=>`<col style="width:${cols.length>2?20:24}%">`).join('')}
+        <colgroup><col style="width:${lw}%">
+          ${cols.map(()=>`<col style="width:${((100-lw)/cols.length).toFixed(2)}%">`).join('')}
         </colgroup>
         <thead><tr><th style="padding:0 12px 6px 0"></th>${th}</tr></thead>
         <tbody>
@@ -34639,6 +34705,9 @@ function ocrCompareHtml(s,p){
           ${mrow('Speed on this machine <span class="dim" '
                  +'style="font-size:10.5px">— seconds per subtitle, '
                  +'lower is better</span>', speed)}
+          ${mrow('Time to load its model <span class="dim" '
+                 +'style="font-size:10.5px">— once per pass, not per '
+                 +'subtitle</span>', load)}
           ${mrow('Last tested', when)}
           ${mrow('What it read', sample, 'top')}
         </tbody>
@@ -34651,9 +34720,8 @@ function ocrCompareHtml(s,p){
         The signs-or-dialogue check is the same in every column — it measures
         the pictures before any OCR starts, so switching engines never changes
         which tracks get burned in.
-        ${untested?` Speeds fill in as you run the tests (${untested} to go);
-          a short sample means the clock includes model load, so read the text
-          as well as the timing.`:''}</div>
+        ${decNote}
+        ${untested?` Speeds fill in as you run the tests (${untested} to go).`:''}</div>
     </div>`;
 }
 
@@ -34674,10 +34742,11 @@ let _ocrMeas={};
 // already measured both and a switch that hides a number already on the page
 // is a switch somebody regrets quietly. No argument and no confirm box: the
 // figure, next to the button, in the unit the table uses.
-function ocrDeviceHtml(s, p){
+function ocrDeviceHtml(s, p, eng){
+  eng = eng || 'paddle';
   const want=s.device||'auto', now=s.device_now||'cpu';
   const per=k=>{
-    const m=_ocrMeas['paddle:'+k];
+    const m=_ocrMeas[eng+':'+k];
     if(!m||!m.per_cue_ms) return '';
     return `<span class="dim" style="font-size:10px"> · measured ${
       (m.per_cue_ms/1000).toFixed(1)}s a cue${m.at?' '+ago(m.at):''}</span>`;
@@ -34696,7 +34765,9 @@ function ocrDeviceHtml(s, p){
       'Use the card when the installed build can see one. This is what nuarr did on its own before the choice existed.',true)}
     ${opt('gpu','GPU',
       p.cuda ? 'Always the card, leaving the CPU for everything else on this machine.'
-             : 'The installed PaddleOCR has no CUDA support, so it cannot use the card.',
+             : (eng==='rapid'
+                ? 'The installed ONNX Runtime carries no CUDA provider, so RapidOCR cannot use the card.'
+                : 'The installed PaddleOCR has no CUDA support, so it cannot use the card.'),
       !!p.cuda)}
     ${opt('cpu','CPU','Always the processor, leaving the card for Whisper and the encoders.',true)}
     ${(want==='auto')?`<div class="dim" style="font-size:10.5px;margin-top:3px">running on <b>${
@@ -34736,10 +34807,10 @@ async function ocrSetEngine(engine){
   }catch(e){ if(m){ m.style.color='#e0575b'; m.textContent='failed'; } }
 }
 
-async function ocrTest(engine,device){
+async function ocrTest(engine,device,hasDev){
   const msg=document.getElementById('ocrTestMsg');
   if(msg){ msg.style.color=''; msg.textContent=
-    `reading with ${engine}${engine==='paddle'?' on '+device.toUpperCase():''}… `
+    `reading with ${engine}${hasDev?' on '+device.toUpperCase():''}… `
     +`the first run loads the model, so give it a moment`; }
   let r=null;
   try{ r=await (await fetch(`/api/ocr/test?engine=${engine}&device=${device}`,
@@ -41209,8 +41280,8 @@ function subsScanFound(sc){
     ['has a subtitle file next to it', f.sides, '#c98cf0', 'one folder listing',
      'A loose .srt or .ass sitting in the same folder as the video. Found by listing that folder once — this is the only part of this sweep that touches a disk at all.'],
     ['words burned into the picture', f.picture, '#e8a33d',
-     'frames + ' + (((sc.readers||[]).find(r=>r.key==='picture')||{}).engine==='paddle'
-                    ? 'PaddleOCR' : 'Tesseract'),
+     'frames + ' + (((sc.readers||[]).find(r=>r.key==='picture')||{})
+                     .engine_name || 'the OCR'),
      'The subtitles are painted into the video itself, so there is no track to find. ffmpeg pulls 24 frames off the disk, the brightest are handed to Tesseract, and what it reads decides it. Its own pass, on its own clock — see "the picture" below.'],
     ['no subtitles anywhere',  f.bare,    '#7fd18c', 'all three agreed',
      'Looked at, and carrying no track, no file beside it and nothing in the picture. This is an ANSWER, not a gap — and it is only different from the next chip because the row records whether anybody actually looked.'],

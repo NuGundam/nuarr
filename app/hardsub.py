@@ -416,6 +416,24 @@ _OCR_LOCK = threading.Lock()
 OCR_IDLE_S = 300.0
 
 
+def _worker_engine(e: str) -> bool:
+    """Does this engine read through the served worker rather than an exe?"""
+    try:
+        from . import subocr
+        return subocr.engine_worker(e)
+    except Exception:                                            # noqa: BLE001
+        return e == "paddle"
+
+
+def _engine_name(e: str) -> str:
+    """What to call it on a progress line. Never spelled out here."""
+    try:
+        from . import subocr
+        return subocr.engine_name(e)
+    except Exception:                                            # noqa: BLE001
+        return "Tesseract"
+
+
 def ocr_engine() -> str:
     """Which OCR this install uses. The same answer subocr gives."""
     try:
@@ -459,7 +477,7 @@ def _ocr_proc(engine: str):
     # or the change is invisible until the idle timer happens to close it.
     try:
         from . import subocr as _so
-        want_dev = _so.device() if engine == "paddle" else "cpu"
+        want_dev = _so.device(engine)
     except Exception:                                            # noqa: BLE001
         want_dev = "cpu"
     p = _OCR.get("proc")
@@ -472,12 +490,11 @@ def _ocr_proc(engine: str):
     # "gpu if cuda else cpu"; both are subocr.device() now, which puts the
     # install's setting in front of the detection.
     dev = "cpu"
-    if engine == "paddle":
-        try:
-            from . import subocr
-            dev = subocr.device()
-        except Exception:                                        # noqa: BLE001
-            dev = "cpu"
+    try:
+        from . import subocr
+        dev = subocr.device(engine)
+    except Exception:                                            # noqa: BLE001
+        dev = "cpu"
     env = dict(os.environ)
     try:
         from . import subocr
@@ -556,12 +573,12 @@ def _read_text(path: str, t: float, band: str) -> str:
             creationflags=NO_WINDOW, startupinfo=hidden_si())
         if not os.path.exists(tmp):
             return ""
-        if engine == "paddle":
+        if _worker_engine(engine):
             # Measured identical to Tesseract on the thresholded image and on
             # the raw colour crop, so the threshold above is kept - it is what
             # the brightness numbers are counted from and changing it would
             # make them mean something different.
-            got = _read_served("paddle", tmp)
+            got = _read_served(engine, tmp)
             if got:
                 return got.strip()
             if not exe:
@@ -695,7 +712,7 @@ def probe_one(file_id: int, samples: int = SAMPLES,
         cand += spare[:max(0, confirm) - len(cand)]
     lit: list = []                       # brightness of frames that held words
     _shown = cand[:max(0, confirm)]
-    _eng = "PaddleOCR" if ocr_engine() == "paddle" else "Tesseract"
+    _eng = _engine_name(ocr_engine())
     for _i, (t, _c) in enumerate(_shown, 1):
         _say(f"reading frame {_i} of {len(_shown)} \u00b7 {_eng}",
              55.0 + 33.0 * (_i - 1) / max(1, len(_shown)))
@@ -1933,7 +1950,7 @@ def stats() -> dict:
                left * each if each else 0)) if left else 0,
            "next_run": 0.0,
            # The engine the INSTALL is set to, not whichever one is on disk.
-           "have_ocr": bool(_tesseract()) or ocr_engine() == "paddle",
+           "have_ocr": bool(_tesseract()) or _worker_engine(ocr_engine()),
            "ocr_engine": ocr_engine(), NONE: 0, SIGNS: 0,
            DIALOGUE: 0, HYBRID: 0, "marked": 0}
     try:
