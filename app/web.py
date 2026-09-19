@@ -17466,7 +17466,7 @@ function jpopHtml(disk){
     if(w.stage==='encoding'){
       if(w.fps) bits.push(`<span class="m-fps">${w.fps}</span> <span class="dim">fps</span>`);
       if(w.speed) bits.push(`<span class="m-fps">${w.speed}×</span>`);
-      if(w.eta_s!=null) bits.push(`<span class="dim">ETA</span> <span class="m-time">${hms(w.eta_s)}</span>`);
+      if(w.eta_s!=null) bits.push(`<span class="dim">ETA</span> <span class="m-time">${w.eta_est?'~':''}${hms(w.eta_s)}</span>`);
     }
     if(commit) bits.push(`<span class="m-size">${gb(w.commit_bytes)}</span> <span class="dim">of</span> <span class="m-size">${gb(w.commit_total)}</span>${w.dest_disk?` <span class="dim">→</span> ${diskTag(w.dest_disk)}`:''}`);
     const io=(w.read_bps||w.write_bps)?`<span class="m-read">${mbps(w.read_bps)}</span> <span class="dim">read</span> · <span class="m-write">${mbps(w.write_bps)}</span> <span class="dim">write</span>`:'';
@@ -18800,7 +18800,7 @@ function runTileFeed(live){
   // Name the furthest along, since that is the one about to change.
   const lead=rows.slice().sort((a,b)=>(b.progress||0)-(a.progress||0))[0];
   const pct=Math.round((lead.progress||0)*100);
-  const eta=lead.eta_s?` · ${hms(lead.eta_s)} left`:'';
+  const eta=lead.eta_s?` · ${lead.eta_est?'~':''}${hms(lead.eta_s)} left`:'';
   _runSub=`${esc(lead.pool||lead.kind||'job')} ${pct}%${eta}`;
   runTilePaint();
 }
@@ -18827,7 +18827,12 @@ function runPanelPaint(){
     // Two clocks, deliberately. eta_s is the encoder's own estimate and is
     // absent early on; elapsed always exists. Showing only the first leaves a
     // fresh job looking stalled.
-    const eta=w.eta_s?`${hms(w.eta_s)} left`:'estimating…';
+    //
+    // AND FOUR OF THE FIVE ROWS USED TO SAY "estimating…" FOR EVER, because
+    // the only job with an encoder in it was the only job allowed an answer.
+    // A tilde marks the ones nuarr works out from progress rather than ones
+    // ffmpeg reports, since they are the rougher of the two.
+    const eta=etaWord(w);
     const sub=(w.sub_ocr_active||w.pool==='subocr')&&w.sub_ocr_stage
       ? `<div class="dim" style="font-size:10.5px">${
            stageMarkup(w.sub_ocr_stage)}</div>`:'';
@@ -23538,6 +23543,22 @@ const DISK_COLORS = ['#58a6ff','#3fb950','#e3b341','#ff7b72','#d2a8ff',
 // was missing purple, which is how subocr rows came out green in the queue
 // while they were purple in the card right above. A third copy was the reason
 // to collapse them, so here it is, and the callers just ask.
+// ONE SENTENCE FOR "HOW LONG IS LEFT", wherever it is asked.
+//   ffmpeg's own figure   "9s left"
+//   nuarr's own           "~3m left"  - from progress and elapsed
+//   neither               "estimating…", and only while that is true
+// A paused job says nothing rather than counting down a clock that has
+// stopped; the card already says why it is paused.
+function etaWord(w){
+  if(w && w.eta_s!=null) return `${w.eta_est?'~':''}${hms(w.eta_s)} left`;
+  if(w && (w.paused_for_viewer || w.paused_for_load)) return 'paused';
+  // PAST THE LAST PERCENT THERE IS NOTHING LEFT TO ESTIMATE. The server
+  // stops answering above 99.9% on purpose - "0s left" beside a job still
+  // writing its file is the stuck clock this whole rule exists to avoid -
+  // but "estimating…" at 100% is its own kind of wrong.
+  if(Math.round((w&&w.progress||0)*100) >= 100) return 'finishing';
+  return 'estimating…';
+}
 function poolColor(pool){
   return pool==='background'  ? '#5ad1c4'         // teal - the quiet fixers
        : pool==='encode'      ? 'var(--acc)'      // blue - GPU work
@@ -23868,9 +23889,11 @@ function stageCell(w){
          + `within a second of the buffer recovering.">paused for viewer</span>`;
   if(w.paused_for_load)
     return `<span class="pill p-warn" title="${esc(w.pace_why||'')}">paused for disk load</span>`;
-  if(w.stage==='encoding')
+  if(w.stage==='encoding' || w.eta_s!=null)
     return w.eta_s!=null
-      ? `<span class="m-lbl">ETA</span> <span class="m-time">${hms(w.eta_s)}</span>`
+      ? `<span class="m-lbl">ETA</span> <span class="m-time"${w.eta_est
+          ? ' title="worked out from how far along this job is and how long it has been running - ffmpeg only estimates for the jobs it encodes"':''
+          }>${w.eta_est?'~':''}${hms(w.eta_s)}</span>`
       : '<span class="m-lbl">ETA —</span>';
   // During the commit, name the spindle it is being written to. DrivePool
   // re-places the file, so it often is not the one it was read from.

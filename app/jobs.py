@@ -883,6 +883,55 @@ class Worker:
         return (f"The picture is untouched — {detail}. Copying at disk speed, "
                 f"no quality lost.")
 
+    def eta_now(self) -> tuple:
+        r"""(seconds left, whose estimate it is) - (None, False) when neither.
+
+        FOUR OF THE FIVE ROWS SAID "estimating..." FOREVER. eta_s is ffmpeg's
+        own figure, and the rule here was "only while the stage is literally
+        `encoding`" - which is a transcode stage. So a decode check at 80%, a
+        listen on track 1 of 4 and a subtitle read on frame 3 of 4 all said
+        they were still working it out, from the first second to the last,
+        because the only kind of job that could ever have an answer was the
+        one with an encoder in it.
+
+        Nothing about those jobs is unknowable. They report progress - real
+        progress, counted in windows, tracks and frames - and they have been
+        running for a known time, and elapsed x (1-p)/p is the estimate
+        anything else would make. It is worse than ffmpeg's, which is why the
+        second half of the answer says which one you are looking at and the
+        card marks ours with a `~`.
+
+        WHAT IT REFUSES TO ANSWER, because a wrong number is worse than none:
+          - under 5% or under three seconds in, where the extrapolation is
+            mostly noise (a job that spends two seconds opening a file would
+            claim an hour);
+          - while the job is paused for a viewer or for load, because
+            progress is not moving and an estimate from a stopped clock is a
+            lie the card would keep telling;
+          - past 99.9%, where "0s" beside a job still committing reads as the
+            hang this rule was originally written to avoid.
+        """
+        if self.eta_s and self.stage == "encoding":
+            return (round(self.eta_s), False)            # ffmpeg's own
+        if getattr(self, "paused_for_viewer", False) \
+                or getattr(self, "paused_for_load", False):
+            return (None, False)
+        try:
+            p = float(self.progress or 0.0)
+            el = time.time() - self.started_at
+        except Exception:                                # noqa: BLE001
+            return (None, False)
+        if p < 0.05 or p >= 0.999 or el < 3.0:
+            return (None, False)
+        left = el * (1.0 - p) / p
+        # "~0s left" IS NOT AN ESTIMATE, it is the stuck clock this rule was
+        # written to avoid wearing a tilde. Seen live on a repack at 99.85%,
+        # which the card rounds to 100%: under two seconds there is nothing
+        # left to predict and "finishing" is the honest word.
+        if left < 2.0 or left > 86400:
+            return (None, False)
+        return (round(left), True)
+
     def what_runs(self) -> dict:
         r"""Which tool is doing this job right now, and on which silicon.
 
@@ -1060,6 +1109,7 @@ class Worker:
 
     def as_dict(self) -> dict:
         el = time.time() - self.started_at
+        eta, eta_est = self.eta_now()          # asked once, reported twice
         p = self.job.plan
         return {
             # WHICH TOOL, ON WHICH SILICON, RIGHT NOW. Per stage, because a
@@ -1103,11 +1153,9 @@ class Worker:
             "paused_for_load": bool(getattr(self, "paused_for_load", False)),
             "pace_factor": float(getattr(self, "pace_factor", 0.0) or 0.0),
             "pace_why": getattr(self, "pace_why", "") or "",
-            # Only report an ETA while ffmpeg is actually running. Carrying the
-            # last value into the commit/rename stages produced a stuck
-            # "ETA 0s" that looked like a hang.
-            "eta_s": (round(self.eta_s) if self.eta_s and self.stage == "encoding"
-                      else None),
+            # Only ffmpeg's OWN estimate while ffmpeg is running; ours from
+            # progress for everything else. See eta_now().
+            "eta_s": eta, "eta_est": eta_est,
             "elapsed_s": round(el), "last_line": self.last_line,
             "cancelled": self.cancelled,
             "stage": self.stage,
@@ -7357,7 +7405,7 @@ def _io_by_disk(workers: list["Worker"]) -> list[dict]:
             "dest_disk": w.dest_disk, "stage_device": w.stage_device,
             "read_bps": round(w.read_bps), "write_bps": round(w.write_bps),
             "fps": round(w.fps, 1), "speed": round(w.speed, 2),
-            "eta_s": (round(w.eta_s) if w.eta_s and w.stage == "encoding" else None),
+            **dict(zip(("eta_s", "eta_est"), w.eta_now())),
             "src_bytes": w.src_bytes, "out_bytes": w.out_bytes,
             "est_out_bytes": w.est_out_bytes,
             "commit_bytes": w.commit_bytes,
