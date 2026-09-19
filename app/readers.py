@@ -345,12 +345,29 @@ def listen_one(file_id: int, path: str, tracks: list, jumped: bool,
         nonlocal heard, refused
         for i, t in enumerate(rows):
             tr = int(t.get("track") or 0)
+            _label = (f"listening to track {tr + 1}"
+                      + (f" of {total}" if total > 1 else ""))
             if on_stage:
-                on_stage(f"listening to track {tr + 1}"
-                         + (f" of {total}" if total > 1 else ""),
-                         ((base + i) / max(1, total)) * 100.0)
+                on_stage(_label, ((base + i) / max(1, total)) * 100.0)
+
+            # THE WINDOWS INSIDE THE TRACK MOVE THE BAR. Each track owns an
+            # equal share; the model's tick says how far through that share
+            # it is, so a one-track file no longer sits at 0% for the whole
+            # listen and then jumps to done.
+            # NEVER BACKWARDS. When the model takes its second look the
+            # planned count jumps from five windows to eleven, and 5/5 would
+            # become 5/11 - the bar sliding back on a job that is further
+            # along than it was. Watched live: 25% then 11%. The share only
+            # ever rises.
+            _high = [0.0]
+
+            def _tick(done, planned, _i=i):
+                if on_stage and planned:
+                    _high[0] = max(_high[0], min(1.0, done / planned))
+                    on_stage(_label, ((base + _i + _high[0])
+                                      / max(1, total)) * 100.0)
             try:
-                d = audiolang.check(int(file_id), path, tr)
+                d = audiolang.check(int(file_id), path, tr, tick=_tick)
             except Exception as e:                               # noqa: BLE001
                 failed["why"] = f"{type(e).__name__}: {e}"[:200]
                 return False

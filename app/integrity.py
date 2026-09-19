@@ -1121,10 +1121,13 @@ async def job_one(r: dict, on_pid=None, on_stage=None) -> dict:
                 "why": "not on disk - the missing-file check owns that"}
 
     def _stage(which, pct):
+        # THE CHECK'S OWN LABEL, AS IT IS. This used to translate "head" and
+        # "tail" into sentences, and every middle window fell through to
+        # "decoding the last 25s" - a decode card read the same stage from
+        # 0% to 80%. windows() already names each one for a person.
         if on_stage is not None:
             try:
-                on_stage(f"decoding the first {HEAD_S}s" if which == "head"
-                         else f"decoding the last {TAIL_S}s", pct)
+                on_stage(f"decoding {which}", pct)
             except Exception:                                    # noqa: BLE001
                 pass
     out = await test_one(int(r["file_id"]), r["path"],

@@ -25073,11 +25073,14 @@ function paintRunning(j){
       // near-full back to zero reads as "second phase", not "lost progress".
       const bs = barState(w, poolCol);
       let pct = bs.pct, col = bs.col, indet = bs.indet;
-      // Suppress the grow transition on the frame where the phase flips, so a
-      // 98% -> 0% reset does not ease backwards across the card.
-      const phaseKey = w.job_id+':'+(w.stage||'');
-      const reset = _barPhase[w.job_id] !== undefined && _barPhase[w.job_id] !== phaseKey;
-      _barPhase[w.job_id] = phaseKey;
+      // Suppress the grow transition on the frame where the bar would go
+      // BACKWARDS - the encode-to-commit reset, 98% -> 0% - so it does not
+      // ease across the card. NOT on every change of stage text: the
+      // readers' stage is "measuring frame 5 of 24" then "6 of 24", and
+      // keying on the string made every frame a "phase change", so those
+      // bars jumped instead of gliding. Watched live: nogrow on nearly every
+      // repaint of every subread, listen and decode card.
+      const reset = barReset(w, pct);
       // data-job lets Watch/Hide find and edit THIS card without a full
       // repaint - see watchLive().
       const card = `<div class="wk" data-job="${esc(w.job_id)}">
@@ -25345,6 +25348,16 @@ function noteProgress(running){
 // One place decides what the bar shows, whether the card is being built from
 // scratch or patched in place. Two copies of this logic is how the label and
 // the bar came to disagree in the first place.
+// ONE ANSWER TO "SHOULD THIS WRITE EASE?", for both paint paths. A reset
+// is the work/commit phase flipping, or the number going down; a new stage
+// label with the number still rising is the same bar carrying on.
+function barReset(w, pct){
+  const phase = w.stage==='committing' ? 'commit' : 'work';
+  const prev = _barPhase[w.job_id];
+  const reset = prev !== undefined && (prev.phase !== phase || pct < prev.pct - 0.5);
+  _barPhase[w.job_id] = {phase, pct};
+  return reset;
+}
 function barState(w, poolCol){
   let pct = w.progress*100, col = poolCol, indet = false;
   if(w.stage==='committing'){
@@ -25413,13 +25426,9 @@ function tryPatchCards(j){
     if(bar){
       bar.classList.toggle('indet', bs.indet);
       bar.classList.toggle('held', !!bs.held);
-      // The phase flip (encode -> commit) resets the bar; suppress the ease
-      // for that one write, same rule the rebuild path applies via .nogrow.
-      const phaseKey = w.job_id+':'+(w.stage||'');
-      if(_barPhase[w.job_id] !== phaseKey){
-        bar.classList.add('nogrow');
-        _barPhase[w.job_id] = phaseKey;
-      } else bar.classList.remove('nogrow');
+      // Same rule as the rebuild path, from the same function - two copies
+      // of "is this a reset" is how one of them came to fire on every frame.
+      bar.classList.toggle('nogrow', barReset(w, bs.pct));
       if(!bs.indet) bar.style.width = bs.pct.toFixed(1)+'%';
       // background-COLOR, not the shorthand: the shorthand inline resets
       // background-image and wiped the indet sweep and the held hatch.

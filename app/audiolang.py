@@ -967,7 +967,7 @@ def _judge(votes: list, strong_floor: float = MIN_PROB) -> dict:
 
 
 def detect(path: str, track: int = 0, fracs=FIRST_LOOK,
-           secs: int = 30, file_id: int = 0) -> dict:
+           secs: int = 30, file_id: int = 0, tick=None) -> dict:
     r"""Listen to `track` of `path` and report what language it is in.
 
     Returns {code, code2, confidence, votes, ok, why}. `code` is ISO 639-2 or
@@ -1033,11 +1033,25 @@ def detect(path: str, track: int = 0, fracs=FIRST_LOOK,
     silent = 0
     err = ""
 
+    # HOW FAR ALONG, for a card. Windows are the unit of work here - five
+    # in the first look, six more if it is undecided - and until this the
+    # only progress a listen could report was per TRACK, so a one-track
+    # file's bar sat at 0% until the verdict landed. `tick(done, planned)`
+    # is best-effort: planned is the first look until the second begins.
+    _done = 0
+    _planned = len(list(fracs))
+
     def listen(where) -> int:
         """Take one window at each fraction; returns how many were readable."""
-        nonlocal silent, err
+        nonlocal silent, err, _done
         got = 0
         for fr in where:
+            if tick is not None:
+                try:
+                    tick(_done, max(_planned, _done + 1))
+                except Exception:                                # noqa: BLE001
+                    pass
+            _done += 1
             try:
                 a = _pcm(path, track, dur * fr, secs)
             except subprocess.TimeoutExpired as e:
@@ -1087,6 +1101,7 @@ def detect(path: str, track: int = 0, fracs=FIRST_LOOK,
         # on itself.
         # `taken=fracs` so the second look cannot land on a window the
         # first one already took - see chapters.dodge.
+        _planned = _done + len(SECOND_LOOK)
         listen(_ch.dodge(SECOND_LOOK, dur, oped, float(secs), taken=fracs)
                if oped else SECOND_LOOK)
         out["looks"] = 2
@@ -1382,7 +1397,8 @@ def store(file_id: int, track: int, path: str, res: dict) -> None:
              size, mtime, time.time()))
 
 
-def check(file_id: int, path: str, track: int = 0, refresh: bool = False) -> dict:
+def check(file_id: int, path: str, track: int = 0, refresh: bool = False,
+          tick=None) -> dict:
     """Cached detection. This is the entry point everything else should use."""
     ensure_table()
     if not refresh:
@@ -1391,7 +1407,7 @@ def check(file_id: int, path: str, track: int = 0, refresh: bool = False) -> dic
             return c
     # file_id lets detect() read the chapters out of the stored probe rather
     # than seeking the disk for them.
-    res = detect(path, track, file_id=int(file_id))
+    res = detect(path, track, file_id=int(file_id), tick=tick)
     store(file_id, track, path, res)
     res["cached"] = False
     return res
