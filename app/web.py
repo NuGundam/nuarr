@@ -29286,6 +29286,7 @@ function tmGpuView(H){
         engines above are idle while this list is not</div>`}`
     : '<div class="dim" style="font-size:11.5px">nothing is on the video path right now</div>';
   const procs = (D.procs||[]);
+  const work = (D.work||[]);
   return tmBack('Graphics')
     + tmFigs(figs)
     + tmSection('The three engines',
@@ -29301,6 +29302,24 @@ function tmGpuView(H){
     + tmSection('What nuarr is asking of it',
         'every job on the video path — an encode uses NVENC, a repack is a stream copy and never touches it',
         encTable)
+    // THE OTHER HALF OF THE CARD'S WORK, which this page computed and then
+    // threw away. The video path is not the only thing nuarr runs on CUDA:
+    // the OCR reads subtitle pictures there and Whisper identifies languages
+    // there, and neither has a video encoder in it, so neither appeared in
+    // the table above. A run whose only GPU work was a burned-in read showed
+    // "nothing is on the video path right now" over a card doing exactly
+    // what this page exists to show. Hidden entirely when there is nothing
+    // to say - an empty second table is worse than no second table.
+    + (work.length ? tmSection('And what else is on the card',
+        'the CUDA work that is not an encode — subtitle reading and audio language identification',
+        `<table style="width:100%;font-size:11.5px;border-collapse:collapse">
+          <tbody>${work.map(w=>`<tr style="border-top:1px solid var(--line)">
+            <td style="padding:4px 6px">${esc(w.label)}${
+              w.detail?`<span class="dim"> — ${esc(w.detail)}</span>`:''}</td>
+            <td style="padding:4px 6px;text-align:right;width:22%"
+                class="mono">${w.n>1?w.n+' running':(w.n===1?'running'
+                  :'<span class="dim">idle</span>')}</td>
+          </tr>`).join('')}</tbody></table>`) : '')
     + tmSection('Everything on the card',
         D.per_proc_vram ? 'with the memory each holds'
           : 'the driver does not attribute video memory per process on Windows, so only the list is real',

@@ -848,9 +848,10 @@ class Worker:
                     "track's events to judge its title. A measurement, not a "
                     "change: nothing is written to the file.")
         if self.pool == "decode":
-            return ("Checking the file actually decodes \u2014 the first 20 "
-                    "seconds and the last 25, to nowhere. Its own pool, lowest "
-                    "priority, and never on a disk somebody is watching from.")
+            return ("Checking the file actually decodes \u2014 five windows, "
+                    "90 seconds in all, head, middle and tail, to nowhere. Its "
+                    "own pool, lowest priority, and never on a disk somebody "
+                    "is watching from.")
         if self.pool == "audio":
             return ("Correcting what this file's audio tracks SAY they are. "
                     "One header write each — the video is never touched — "
@@ -1027,13 +1028,22 @@ class Worker:
                     dev = _so.device(which)
                 except Exception:                        # noqa: BLE001
                     pass
+                # WHICH HALF IS THE BIG ONE, said out loud. "GPU · reading"
+                # next to a job sitting at nine cores reads as a broken
+                # promise; the promise was only ever about the reading. Six
+                # ffmpeg processes pull 24 frames (145 cpu-seconds on a 1080p
+                # episode, measured) and the card sees only the crops that
+                # pass the brightness floor - a fraction of a second each.
                 hw = ("CPU \u00b7 frames, GPU \u00b7 reading" if dev == "gpu"
                       else "CPU")
                 return {"tool": f"ffmpeg + {eng}", "hw": hw,
                         "why": f"frames decoded by ffmpeg on the CPU, and the "
                                f"bright text low in the picture shown to "
                                f"{eng} on the "
-                               f"{'graphics card' if dev == 'gpu' else 'CPU'}"}
+                               f"{'graphics card' if dev == 'gpu' else 'CPU'}"
+                               + (" - the frames are nearly all of the work "
+                                  "(six at a time, 24 in all), the reading is "
+                                  "the small half" if dev == "gpu" else "")}
             if "verdict" in st:
                 return {"tool": "sqlite", "hw": "disk",
                         "why": "writing what the frames said, and re-planning "

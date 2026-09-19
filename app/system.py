@@ -837,6 +837,41 @@ def _gpu_work() -> list[dict]:
                          "n": 0, "device": where})
     except Exception:                                    # noqa: BLE001
         pass
+    # AND THE PICTURE READS, which were the hole this list had. A subread job
+    # sampling frames shows its crops to the same OCR engine on the same card
+    # - the job card has said "GPU · reading" on it for weeks - and the GPU
+    # panel did not know the job existed, so a box whose only CUDA work was
+    # the burned-in reader reported an idle card. Counted separately from
+    # sub_ocr because it is a different pool with a different appetite: the
+    # card sees only the crops that pass the brightness floor, while six
+    # ffmpeg processes do the decoding on the processor.
+    try:
+        from . import subocr, hardsub
+        from . import jobs as _jobs
+        n = 0
+        for w in list(_jobs.RUNNING.values()):
+            if getattr(w, "pool", "") != "subread":
+                continue
+            st = (getattr(w, "stage", "") or "").lower()
+            if "sampl" in st or "frame" in st or "floor" in st:
+                n += 1
+        if n:
+            # THE CACHE, NOT device(): device() asks engine_gpu_ready, which
+            # starts a child when nothing is cached, and this runs on every
+            # dashboard poll. Same rule as the sub_ocr branch above.
+            eng = hardsub.ocr_engine()
+            cached = subocr.engine_cached(eng) if subocr.engine_worker(eng) \
+                else {"cuda": False}
+            on_gpu = True if cached is None else bool(cached.get("cuda"))
+            work.append({"kind": "subread",
+                         "label": "burned-in words — "
+                                  f"{subocr.engine_name(eng)}"
+                                  + (" (CUDA)" if on_gpu else " (CPU)"),
+                         "n": n, "device": "gpu" if on_gpu else "cpu",
+                         "detail": "the frames themselves are decoded on the "
+                                   "processor, six at a time"})
+    except Exception:                                    # noqa: BLE001
+        pass
     return work
 
 

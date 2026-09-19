@@ -343,8 +343,11 @@ LABELS = {
 HINTS = {
     "encode_workers": "",   # built live by _encode_hint() - see as_dict()
     "passthrough_workers": "How many files may be repacked at once. No GPU "
-                           "involved - the limit is how fast the pool disks "
-                           "can read and write.",
+                           "involved - there is no audio encoder on the card - "
+                           "so the limit is how fast the pool disks can read "
+                           "and write. A repack that also converts a track to "
+                           "AAC spends about one core for the length of the "
+                           "read; one that only copies spends nothing.",
     "subocr_workers": "",   # engine-dependent; see _subocr_hint()
     "subocr_gpu_lanes":
         "How many subtitle reads may use the graphics card at the same moment. "
@@ -362,10 +365,11 @@ HINTS = {
                      "fraction of a second - nothing is decoded or copied. "
                      "The limit is only how many seeks into the pool at once.",
     "decode_workers": "How many files may be checked for corruption at once. "
-                      "Each decodes the first 20 and last 25 seconds on the "
-                      "CPU with four threads - two at once measured 51-68% "
-                      "CPU on this box - and reads sequentially off one pool "
-                      "disk, never two on the same disk.",
+                      "Each decodes five windows - 20s at the head, three 15s "
+                      "samples down the middle, 25s at the tail - on the CPU "
+                      "with four threads, measured at three cores for ten "
+                      "seconds, and reads off one pool disk, never two on the "
+                      "same disk.",
     "listen_workers": "How many files may be listened to at once. Each runs "
                       "five 30-second windows per track through Whisper's "
                       "language identifier on the graphics card. One model "
@@ -373,8 +377,12 @@ HINTS = {
                       "half speed, so one is the honest default.",
     "subread_workers": "How many files may have their subtitles read at once "
                        "- frames sampled for burned-in words, or a track's "
-                       "events read to judge its title. Each is a whole-file "
-                       "read off one pool disk, never two on the same disk.",
+                       "events read to judge its title. The frame sampler is "
+                       "the most processor-hungry job here: six ffmpeg "
+                       "processes pulling 24 frames, measured at nine cores "
+                       "for sixteen seconds on a 1080p episode. Each is also "
+                       "a whole-file read off one pool disk, never two on the "
+                       "same disk.",
     "probe_workers": "How many files may be inspected at once. Cheap on the "
                      "processor, one disk read each.",
     "arr_concurrency": "How many questions Nuarr may ask Sonarr and Radarr at "
@@ -580,15 +588,22 @@ COST = {
     "encode_workers": {
         "cpu": 1, "gpu": 3, "ram": 1, "disk": 2, "lead": "gpu",
         "why": "NVENC does the encoding on its own engine - the card has one, "
-               "which is why this is the number that matters. The processor "
-               "only feeds it and collects the result; a burn-in adds filter "
-               "work on the SMs. The disk half is the commit at the end."},
+               "which is why this is the number that matters. NVDEC reads the "
+               "source on the same card and the frames never come down for "
+               "39,759 of the 39,859 files that can be decoded there, so the "
+               "processor only feeds and collects; a burn-in adds filter work "
+               "on the SMs. The disk half is the commit at the end."},
     "passthrough_workers": {
         "cpu": 2, "gpu": 0, "ram": 1, "disk": 3, "lead": "disk",
         "why": "Reads a whole file and writes a whole file - the card is "
-               "never involved. The processor share is whatever audio the "
+               "never involved, because there is no audio encoder on it. "
+               "Copying the streams alone is nothing (2.4 cpu-seconds for a "
+               "1.4 GB episode); the processor share is whatever audio the "
                "plan converts on the way through (TrueHD down to 5.1, EAC3 "
-               "to AAC), which is real but small beside the I/O."},
+               "to AAC), and that is about one core for as long as the read "
+               "takes - 95 cpu-seconds on that same episode through "
+               "libfdk_aac, against 139 through ffmpeg's own AAC, which is "
+               "why libfdk is the one that runs."},
     "subocr_workers": {
         "cpu": 2, "gpu": 2, "ram": 2, "disk": 3, "lead": "disk",
         "why": "Three parts with different appetites: demux the picture "
@@ -614,21 +629,33 @@ COST = {
                "cheapest work nuarr does."},
     "decode_workers": {
         "cpu": 3, "gpu": 0, "ram": 1, "disk": 2, "lead": "cpu",
-        "why": "ffmpeg decodes the first twenty and last twenty-five seconds "
-               "on four threads, on the processor, deliberately - the point "
-               "is to find out whether the bytes decode at all. Measured here "
-               "at about four full cores per job while it runs."},
+        "why": "ffmpeg decodes five windows - the first 20s, three 15s "
+               "samples spaced down the middle, the last 25s, 90 seconds in "
+               "all - on four threads, on the processor, deliberately: the "
+               "point is to find out whether the bytes decode at all, and a "
+               "hardware decoder is built to play through the damage this "
+               "looks for. Measured at 31 cpu-seconds in 10, so about three "
+               "cores per job while it runs."},
     "listen_workers": {
-        "cpu": 2, "gpu": 2, "ram": 2, "disk": 1, "lead": "gpu",
+        "cpu": 1, "gpu": 2, "ram": 2, "disk": 1, "lead": "gpu",
         "why": "Whisper's language identifier over five thirty-second "
-               "windows per track. One model is loaded and shared, so the "
+               "windows per track - eleven when those five disagree and it "
+               "takes a second look. One model is loaded and shared, so the "
                "second job shares the card rather than doubling the memory; "
-               "only a few minutes of audio is ever read off the disk."},
+               "only a few minutes of audio is ever read off the disk, and "
+               "pulling those five windows out is the whole processor share "
+               "- one cpu-second a track, measured."},
     "subread_workers": {
-        "cpu": 2, "gpu": 1, "ram": 1, "disk": 2, "lead": "disk",
-        "why": "Either samples frames and shows them to the OCR (processor, "
-               "some card), or reads a subtitle track's events end to end "
-               "(disk). A whole-file read off one pool disk either way."},
+        "cpu": 3, "gpu": 1, "ram": 1, "disk": 2, "lead": "cpu",
+        "why": "THE HEAVIEST THING NUARR ASKS OF THE PROCESSOR, measured. A "
+               "picture read grabs 24 frames through six ffmpeg processes at "
+               "two threads each: on a 1080p 10-bit episode that is 145 "
+               "cpu-seconds in 16 wall seconds - nine cores while it runs, "
+               "where a decode check is three. The OCR is the small half and "
+               "it is on the card; the frames are the big half and they are "
+               "not (NVDEC loses on one frame per process - see hardsub). A "
+               "track read instead walks one subtitle stream end to end, "
+               "which is disk."},
     "probe_workers": {
         "cpu": 1, "gpu": 0, "ram": 0, "disk": 2, "lead": "disk",
         "why": "ffprobe reads a header. The cost is one seek per file across "

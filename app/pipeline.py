@@ -34,7 +34,7 @@ _COLS = ["found", "read", "decided", "known", "waiting", "working", "kept"]
 # retyped here - the whole point of this module. Each is (kind, label, note).
 _FACT_WORDS = {
     "decode":  ("Does it decode?",
-                "the first 20 and last 25 seconds are actually decoded. A "
+                "five windows spread head to tail are actually decoded. A "
                 "truncated download passes ffprobe and fails halfway through "
                 "the episode; every minute spent rewriting one is wasted."),
     "listen":  ("What language is it really?",
@@ -541,8 +541,10 @@ def graph() -> dict:
     ck_nodes = [
         dict(id="c_dec", col=0, row=0, label="Does it decode?",
              count=ck_decode, kind="bad" if ck_decode else "stage",
-             note=(f"{ck_read:,} files have had their first 20 and last 25 "
-                   "seconds actually decoded, not merely probed - a truncated "
+             note=(f"{ck_read:,} files have had five windows - head, three "
+                   "through the middle, tail - actually decoded, not merely "
+                   "probed, and a window that decodes nothing counts as "
+                   "truncation rather than health. A truncated "
                    "download passes ffprobe and fails halfway through the "
                    "episode, which is where a viewer finds it. The number "
                    "shown is how many will not decode. The same check runs "
