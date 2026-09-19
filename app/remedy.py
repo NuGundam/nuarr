@@ -116,6 +116,15 @@ _kind("file/unreadable", False, True, False,
       "ffmpeg has no decoder for this file - nothing here can read it, but "
       "that is a limit of this toolchain as much as of the file, so the "
       "replacement is yours to ask for")
+# -- it ends before it says it does, or a window of it decoded nothing.
+#    auto_replace is False for the same reason as file/unreadable above: the
+#    evidence is an ABSENCE - no frames came back from somewhere frames were
+#    expected - and a seek landing badly on a pool disk that was spinning up
+#    produces the same absence as a truncated download. A person looks.
+_kind("file/short", False, True, False,
+      "part of this file decoded nothing - usually an interrupted download "
+      "that ends before its header says it does, occasionally a disk that "
+      "was not ready, so the replacement is yours to ask for")
 _kind("audio/missing", False, True, True,
       "there is no audio stream at all - there is nothing to re-encode")
 _kind("video/missing", False, True, True,

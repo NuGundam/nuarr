@@ -22695,12 +22695,25 @@ function igPaint(){
         <button onclick="igRun(this)" ${d.running?'disabled':''}>${
           d.running?'reading…':'Check some now'}</button>
       </span></h2>`;
+  // WHAT IT READS, ASKED RATHER THAN WRITTEN DOWN. This sentence said "the
+  // first 20s and the last 25s" because for a long time that was all there
+  // was; the windows are computed per file now, so the panel describes the
+  // shape of a typical one and gets the numbers from the same function that
+  // decides them.
+  const wins = d.windows_example || [];
+  const winSecs = wins.reduce((a,w)=>a+(w.secs||0), 0);
+  const winWords = wins.length
+    ? `${wins.length} windows — ${wins.map(w=>esc(w.label)).join(', ')} —
+       ${winSecs}s in all`
+    : `the first ${d.head_s}s and the last ${d.tail_s}s`;
   const note = `<div class="dim" style="font-size:11px;margin:2px 0 8px">
-      Decodes the first ${d.head_s}s and the last ${d.tail_s}s of ${d.per_run}
+      Decodes ${winWords} of a 22-minute episode, ${d.per_run}
       files at a time, only while the pool is idle, and only re-reads a file
-      when its bytes change. Two clean windows are not proof of a clean middle
+      when its bytes change. Sampled windows are not proof of a clean whole
       and this does not claim they are — it is the difference between finding
-      most of the broken files tonight and finding all of them never.</div>`;
+      most of the broken files tonight and finding all of them never. A window
+      that comes back with no frames at all is a finding of its own: that is
+      how a file which ends before its header says it does gets noticed.</div>`;
   const prog = d.running
     ? `<div class="dim" style="font-size:11px">${esc(d.now||'')} · ${
         d.done||0}/${d.total||0}</div>` : '';
@@ -22713,10 +22726,11 @@ function igPaint(){
         <td style="padding:3px 8px 3px 0;color:var(--bad)"
           >${esc(r.why||'')}</td>
         <td style="padding:3px 0;white-space:nowrap">${
-          remedyBtns(r.file_id,'file/corrupt',{source:'integrity'})}</td>
+          remedyBtns(r.file_id, r.kind||'file/corrupt',
+                     {source:'integrity'})}</td>
       </tr>`).join('')}</tbody></table>`
     : `<div class="dim" style="font-size:11.5px">${
-        tested ? 'Every file read so far decoded at both ends.'
+        tested ? 'Every file read so far decoded in every window.'
                : 'Nothing read yet.'}</div>`;
   const html = head + note + prog + rows;
   if(html===_igKey) return;             // nothing moved; leave the DOM alone

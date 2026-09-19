@@ -20,9 +20,15 @@ WHY IT DOES NOT DECODE THE WHOLE FILE
 bounded windows catch what actually goes wrong here:
 
     the head   header and stream damage, bad indices, wrong codec parameters
+    the middle three short samples spread through the gap, because head plus
+               tail is 45 seconds of a 22-minute episode and damage anywhere
+               in the other 97% used to decode cleanly at both ends
     the tail   truncation - the single most common way a file in a media
                library is broken, because it is what an interrupted download,
-               a full disk or a killed remux all leave behind
+               a full disk or a killed remux all leave behind. It catches it
+               by COUNTING FRAMES, not by reading ffmpeg's complaints: a
+               truncated file seeks past its own end, decodes nothing and
+               exits 0, and that used to be recorded as health
 
 A file that decodes at both ends and has an intact header is not proof of a
 clean middle, and this module does not claim it is: the verdict is stored as
@@ -52,6 +58,19 @@ from .db import cursor
 # How many seconds to decode at each end.
 HEAD_S = 20
 TAIL_S = 25
+# AND THE MIDDLE, WHICH USED TO BE NOBODY'S JOB. Head plus tail is 45 seconds
+# of a 22-minute episode - 3.4% of it - so a file damaged anywhere in the
+# other 97% decoded cleanly at both ends and was recorded as healthy.
+# Measured on a test file with 64 KB of noise written over its halfway mark:
+# passed as ok before, caught as corrupt by the 0m30s window after.
+#
+# WHAT IT COSTS, measured on thirty files taken at random off this shelf:
+# 3.7s a file before, 8.7s after - 2.4x, for 6.8% of the running time looked
+# at instead of 3.4%. All thirty kept the verdict they had, which is the
+# number that mattered: the new rules fire on the synthetic damage and on
+# nothing else.
+MID_S = 15
+MID_WINDOWS = 3
 # How many decoder threads one check may use. See _decode.
 DECODE_THREADS = 4
 # HOW LONG ONE DECODE MAY TAKE BEFORE IT IS GIVEN UP ON.
@@ -136,7 +155,13 @@ _NO_DECODER = re.compile(
     r"no decoder found for|decoder not found|"
     r"(video|audio):\s*none|unknown codec", re.I)
 
-OK, CORRUPT, UNREADABLE = "ok", "corrupt", "unreadable"
+# SHORT is its own verdict and not CORRUPT, on purpose. CORRUPT maps to
+# remedy.py's file/corrupt, which carries auto_replace=True - in auto mode
+# that deletes the file and asks the arr for another. "A window came back
+# empty" can also mean a seek landed badly on a pool disk that was spinning
+# up, and a maybe must never hold a delete button. file/short is replaceable
+# only by a person.
+OK, CORRUPT, UNREADABLE, SHORT = "ok", "corrupt", "unreadable", "short"
 
 
 def _no_decoder(rc: int, err: str) -> str:
@@ -218,8 +243,13 @@ def _fatal(err: str) -> str:
 
 
 async def _decode(path: str, ss: float, dur: float,
-                  on_pid=None) -> tuple[int, str]:
-    """Decode a window. -> (returncode, stderr).
+                  on_pid=None) -> tuple[int, str, int]:
+    """Decode a window. -> (returncode, stderr, frames).
+
+    THE FRAME COUNT IS THE THIRD THING, and it is the one that catches
+    truncation. `-progress pipe:1` writes `frame=N` to stdout in a form
+    nothing has to parse English for; stderr is untouched, so every existing
+    rule about what counts as fatal still reads exactly what it read before.
 
     -xerror stops at the first error rather than logging thousands of them,
     which is both faster and the difference between a 200-byte stderr and a
@@ -234,8 +264,16 @@ async def _decode(path: str, ss: float, dur: float,
     # when the machine was quiet. The check does not need to be fast; it needs
     # to be a corner of the machine, so it gets four threads and the pool's
     # two-at-once is eight.
+    # NOT ON THE CARD, DELIBERATELY - and this is the one place in nuarr
+    # where that is a correctness rule rather than a performance one.
+    # Measured: -hwaccel cuda is 84-93% cheaper on CPU here, and on a file
+    # with noise written through its video the software decoder reports
+    # "corrupt decoded frame" and exits non-zero while NVDEC reports nothing
+    # and exits 0. A hardware decoder is built to keep playing through damage;
+    # this check exists to notice damage. See build_ffmpeg for where the card
+    # is the right answer.
     args = [_ffmpeg(), "-hide_banner", "-v", "error", "-xerror", "-nostdin",
-            "-threads", str(DECODE_THREADS)]
+            "-progress", "pipe:1", "-threads", str(DECODE_THREADS)]
     if ss > 0:
         args += ["-ss", f"{ss:.2f}"]
     args += ["-i", path, "-t", f"{dur:.2f}", "-map", "0:v:0?",
@@ -251,7 +289,7 @@ async def _decode(path: str, ss: float, dur: float,
         # service and a console-subsystem child with no console of its own gets
         # given a brand new visible one by Windows.
         proc = await asyncio.create_subprocess_exec(
-            *args, stdout=asyncio.subprocess.DEVNULL,
+            *args, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE, creationflags=NO_WINDOW)
         # WHOEVER IS COUNTING THE BYTES NEEDS THE PID. Without it a decode
         # reads twenty seconds off a pool disk and the panel files those bytes
@@ -262,9 +300,25 @@ async def _decode(path: str, ss: float, dur: float,
                 on_pid(proc.pid)
             except Exception:                                    # noqa: BLE001
                 pass
-        _, err = await asyncio.wait_for(proc.communicate(),
-                                        timeout=DECODE_BUDGET_S)
-        return proc.returncode or 0, (err or b"").decode("utf-8", "replace")
+        out, err = await asyncio.wait_for(proc.communicate(),
+                                          timeout=DECODE_BUDGET_S)
+        # THREE STATES, NOT TWO: a number, zero, or "the counter did not
+        # answer". The last matters because the whole truncation rule rests
+        # on this parse - if -progress ever stops emitting what it emits
+        # today, a two-state count would silently read every window of every
+        # file as empty and condemn the entire library in one sweep. An
+        # unknown count is skipped instead, which costs one file's worth of
+        # coverage rather than all of them.
+        raw = out or b""
+        seen = re.findall(rb"^frame=\s*(\d+)", raw, re.M)
+        if seen:
+            frames = int(seen[-1])
+        elif b"progress=" in raw:
+            frames = 0          # it reported, and it reported nothing
+        else:
+            frames = -1         # it did not report at all
+        return (proc.returncode or 0,
+                (err or b"").decode("utf-8", "replace"), frames)
     except asyncio.TimeoutError:
         # AND THE PROCESS IS KILLED, not abandoned. wait_for cancels the await;
         # it does not stop the ffmpeg on the other end of it, so every timeout
@@ -277,9 +331,9 @@ async def _decode(path: str, ss: float, dur: float,
         # A DECODE THAT NEVER FINISHES IS NOT A VERDICT. It is usually a disk
         # that went to sleep or a pool member being rebalanced under us, and
         # calling that corruption would delete a healthy file.
-        return -1, "__timeout__"
+        return -1, "__timeout__", 0
     except Exception as e:                                       # noqa: BLE001
-        return -1, f"__spawn__ {type(e).__name__}: {e}"
+        return -1, f"__spawn__ {type(e).__name__}: {e}", 0
 
 
 def say(detail: str) -> str:
@@ -303,51 +357,109 @@ def say(detail: str) -> str:
     return d or "no verdict"
 
 
+def windows(duration: float) -> list[tuple]:
+    r"""Where to look, and what to call each place. -> [(ss, secs, label)]
+
+    THE HEAD ALWAYS, because header and stream damage live there and it needs
+    no duration to find. THE TAIL when the duration is known, because seeking
+    to an unknown offset lands somewhere arbitrary and an arbitrary decode
+    failure is evidence of nothing. THE MIDDLE because head plus tail is 45
+    seconds of a 22-minute episode and everything between them was nobody's
+    job - a test file with noise written over its halfway mark decoded
+    cleanly at both ends and was recorded healthy.
+
+    The middles are spaced inside the gap rather than across the whole file,
+    so they never overlap the two windows that were already there, and they
+    only appear on a file long enough to have a middle worth sampling.
+    """
+    w: list[tuple] = [(0.0, float(HEAD_S), f"the first {HEAD_S}s")]
+    if not duration or duration <= (HEAD_S + TAIL_S + 5):
+        return w
+    lo = HEAD_S + 5.0
+    hi = duration - TAIL_S - MID_S - 5.0
+    if hi > lo:
+        for i in range(MID_WINDOWS):
+            ss = lo + (hi - lo) * ((i + 1) / (MID_WINDOWS + 1))
+            w.append((ss, float(MID_S),
+                      f"{int(ss // 60)}m{int(ss % 60):02d}s in"))
+    w.append((max(0.0, duration - TAIL_S), float(TAIL_S),
+              f"the last {TAIL_S}s"))
+    return w
+
+
 async def test_one(file_id: int, path: str, duration: float = 0.0,
                    on_pid=None, on_stage=None) -> dict:
-    """Head and tail. -> {verdict, detail, secs}"""
+    """Every window in windows(). -> {verdict, detail, secs}"""
     t0 = time.time()
-    if on_stage:
-        on_stage("head", 0.0)
-    rc, err = await _decode(path, 0, HEAD_S, on_pid)
-    if err.startswith("__"):
-        return {"verdict": "", "detail": err, "secs": time.time() - t0}
-    # BEFORE _fatal, because "there is no decoder" is not "the bytes are bad"
-    # and must never reach the path that deletes a file.
-    why = _no_decoder(rc, err)
-    if why:
-        return {"verdict": UNREADABLE, "detail": why,
-                "secs": time.time() - t0}
-    why = _fatal(err)
-    if why:
-        return {"verdict": CORRUPT, "detail": f"{why} (in the first "
-                f"{HEAD_S}s): {err.strip().splitlines()[0][:200]}",
-                "secs": time.time() - t0}
-    head_note = err.strip()
-
-    # THE TAIL IS THE POINT. Only attempted when the duration is known, because
-    # seeking to an unknown offset lands somewhere arbitrary and an arbitrary
-    # decode failure is not evidence of anything.
-    tail_note = ""
-    if duration and duration > (HEAD_S + TAIL_S + 5):
+    wins = windows(duration)
+    notes: list[str] = []
+    empty: list[str] = []
+    full = 0
+    rc_any = 0
+    for i, (ss, secs, label) in enumerate(wins):
         if on_stage:
-            on_stage("tail", 50.0)
-        rc2, err2 = await _decode(path, max(0.0, duration - TAIL_S), TAIL_S,
-                                  on_pid)
-        if not err2.startswith("__"):
-            why = _no_decoder(rc2, err2)
-            if why:
-                return {"verdict": UNREADABLE, "detail": why,
+            on_stage(label, 100.0 * i / max(1, len(wins)))
+        rc, err, frames = await _decode(path, ss, secs, on_pid)
+        if err.startswith("__"):
+            # No verdict at all - a timeout or a failed spawn. Only the first
+            # window is allowed to end the whole check that way; later ones
+            # simply stop it, because what has already been decoded is still
+            # worth recording.
+            if i == 0:
+                return {"verdict": "", "detail": err,
                         "secs": time.time() - t0}
-            why = _fatal(err2)
-            if why:
-                return {"verdict": CORRUPT, "detail": f"{why} (in the last "
-                        f"{TAIL_S}s): {err2.strip().splitlines()[0][:200]}",
-                        "secs": time.time() - t0}
-            tail_note = err2.strip()
-            rc = rc or rc2
-    note = "; ".join(x.splitlines()[0][:150] for x in (head_note, tail_note)
-                     if x)
+            break
+        # BEFORE _fatal, because "there is no decoder" is not "the bytes are
+        # bad" and must never reach the path that deletes a file.
+        why = _no_decoder(rc, err)
+        if why:
+            return {"verdict": UNREADABLE, "detail": why,
+                    "secs": time.time() - t0}
+        why = _fatal(err)
+        if why:
+            return {"verdict": CORRUPT,
+                    "detail": f"{why} (in {label}): "
+                              f"{err.strip().splitlines()[0][:200]}",
+                    "secs": time.time() - t0}
+        if frames > 0:
+            full += 1
+        elif frames == 0:
+            empty.append(label)
+        # frames < 0 is "the counter did not answer" - see _decode. Not
+        # health, not damage, so it is not counted as either.
+        if err.strip():
+            notes.append(f"{label}: {err.strip().splitlines()[0][:120]}")
+        rc_any = rc_any or rc
+
+    # A WINDOW THAT DECODED NOTHING IS NOT A WINDOW THAT DECODED CLEANLY.
+    #
+    # This is how truncation was getting through. A file cut off at 66% of
+    # its bytes still says 90.1s in its header, so the tail window seeks to
+    # 65.1s - past where the picture stops at 56.6s - reads no frames, and
+    # exits 0. ffmpeg says "File ended prematurely", which matches nothing in
+    # _FATAL, so the check that exists to catch truncation returned ok.
+    #
+    # NOT CORRUPT. See the verdict list: CORRUPT carries auto_replace into
+    # remedy.py and a seek landing badly on a pool disk that was spinning up
+    # would then delete a healthy file. SHORT is put in front of a person.
+    if empty and full:
+        runs = (f"{int(duration // 60)}m{int(duration % 60):02d}s"
+                if duration else "an unknown length")
+        return {"verdict": SHORT,
+                "detail": ("no picture came back from "
+                           + ", ".join(empty[:3])
+                           + f" - the file says it runs {runs} and decoded "
+                             f"fine in {full} other window(s), so it ends or "
+                             f"breaks before it claims to")[:600],
+                "secs": time.time() - t0}
+    if empty and not full:
+        return {"verdict": SHORT,
+                "detail": ("no picture came back from anywhere in this file - "
+                           f"{len(empty)} window(s) tried and every one of "
+                           "them decoded nothing")[:600],
+                "secs": time.time() - t0}
+
+    note = "; ".join(notes)[:300]
     # AND THE EXIT CODE IS PART OF THE ANSWER. This line used to read `_ = rc`
     # - the return code was read from the process and then thrown away, so an
     # ffmpeg that refused the command outright was recorded as an ok verdict
@@ -355,14 +467,14 @@ async def test_one(file_id: int, path: str, duration: float = 0.0,
     # the module docstring: an unclassified message must not arrive with a
     # delete button attached) but it no longer fails SILENT: a run that ended
     # badly says so in the sentence the panel prints.
-    if rc:
-        note = (f"ffmpeg exited {rc} on the head" + (f" - {note}" if note else "")
-                )[:300]
+    if rc_any:
+        note = (f"ffmpeg exited {rc_any}" + (f" - {note}" if note else ""))[:300]
+    secs_read = sum(w[1] for w in wins)
     return {"verdict": OK,
-            "detail": note or f"decoded {HEAD_S}s at the head"
-                              + (f" and {TAIL_S}s at the tail" if tail_note
-                                 or duration else ""),
-            "clean": not rc,
+            "detail": note or (f"decoded {int(secs_read)}s across "
+                               f"{len(wins)} windows - "
+                               + ", ".join(w[2] for w in wins)),
+            "clean": not rc_any,
             "secs": time.time() - t0}
 
 
@@ -631,16 +743,26 @@ def untested() -> int:
 def findings(limit: int = 200) -> list[dict]:
     """The ones that failed, in remedy.py's shape.
 
-    TWO VERDICTS, TWO KINDS. 'corrupt' means the bytes are wrong and only a
-    different release can help, which is why auto mode may act on it.
+    THREE VERDICTS, THREE KINDS. 'corrupt' means the bytes are wrong and
+    only a different release can help, which is why auto mode may act on it.
     'unreadable' means ffmpeg has no decoder for the stream - the file may be
     perfectly good to something else - so it is reported and never replaced
     without a person saying so. Until this, unreadable was a constant this
     module defined and nothing ever produced or read.
+
+    'short' is the newest and the same shape as unreadable: a window of the
+    file decoded nothing where frames were expected. Usually an interrupted
+    download that ends before its header says it does; occasionally a disk
+    that was not ready. A person decides.
+
+    EVERY VERDICT THAT IS NOT OK BELONGS IN THIS LIST. The WHERE clause below
+    is the only thing standing between a verdict and the panel, and a new
+    verdict that is written but never selected is written to nobody.
     """
     if not _READY:
         init()
-    kinds = {CORRUPT: "file/corrupt", UNREADABLE: "file/unreadable"}
+    kinds = {CORRUPT: "file/corrupt", UNREADABLE: "file/unreadable",
+             SHORT: "file/short"}
     try:
         with cursor() as cur:
             return [{"file_id": r["file_id"],
@@ -649,10 +771,10 @@ def findings(limit: int = 200) -> list[dict]:
                     for r in cur.execute(
                         "SELECT i.file_id, i.path, i.detail, i.at, i.verdict "
                         "  FROM integrity i JOIN files f ON f.id = i.file_id "
-                        " WHERE i.verdict IN (?, ?) "
+                        " WHERE i.verdict IN (?, ?, ?) "
                         "   AND f.state NOT IN ('deleted','duplicate') "
                         " ORDER BY i.at DESC LIMIT ?",
-                        (CORRUPT, UNREADABLE, int(limit)))]
+                        (CORRUPT, UNREADABLE, SHORT, int(limit)))]
     except Exception:                                            # noqa: BLE001
         return []
 
@@ -694,7 +816,15 @@ def stats() -> dict:
            "queue": q, "on_queue": q["queued"] + q["running"],
            "fed": STATE.get("fed") or 0,
            "idle": {},
-           "head_s": HEAD_S, "tail_s": TAIL_S, "per_run": PER_RUN}
+           "head_s": HEAD_S, "tail_s": TAIL_S, "per_run": PER_RUN,
+           # WHAT IT READS, FOR A FILE OF TYPICAL LENGTH. The panel used to
+           # spell out the head and the tail because those were all there
+           # were; it cannot spell out windows whose number depends on the
+           # file, so it is given the shape of a middling one to describe.
+           "mid_s": MID_S, "mid_windows": MID_WINDOWS,
+           "windows_example": [
+               {"at": round(ss), "secs": round(secs), "label": label}
+               for ss, secs, label in windows(22 * 60.0)]}
     try:
         with cursor() as cur:
             # LIVE FILES ONLY - the same join findings() uses. A verdict
