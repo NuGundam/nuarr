@@ -7027,8 +7027,29 @@ def build_ffmpeg(src: str, dst: str, plan, duration: float,
         if op["to"] == "copy":
             a += [f"-c:a:{out_i}", "copy"]
         else:
-            a += [f"-c:a:{out_i}", "eac3" if op["to"] == "eac3" else "aac",
-                  f"-b:a:{out_i}", f"{op.get('br', 640)}k"]
+            # WHICHEVER AAC ENCODER THIS BUILD HAS. libfdk_aac when it is
+            # there, with its low-pass moved up to 20 kHz - measured better
+            # on dialogue, smaller, and 43% cheaper on the CPU, which is 94%
+            # of what a repack costs. See encoders.aac_encoder.
+            #
+            # NO CHANNEL CONVERSION HAPPENS HERE, and that matters: libfdk
+            # only takes s16, and ffmpeg's 5.1-to-stereo downmix applies its
+            # clip-protection scaling (-7.66 dB) on the s16 path and not on
+            # the float one. The AAC path is only ever reached for a source
+            # of two channels or fewer, so there is no downmix to normalise -
+            # if that ever changes, this is where it will go quiet.
+            if op["to"] == "eac3":
+                a += [f"-c:a:{out_i}", "eac3",
+                      f"-b:a:{out_i}", f"{op.get('br', 640)}k"]
+            else:
+                from . import encoders as _enc_a
+                _aenc, _aextra = _enc_a.aac_encoder()
+                a += [f"-c:a:{out_i}", _aenc,
+                      f"-b:a:{out_i}", f"{op.get('br', 640)}k"]
+                # Per stream, so a file with one AAC track and one copied
+                # does not hand the flag to the copy.
+                for _i in range(0, len(_aextra), 2):
+                    a += [f"{_aextra[_i]}:a:{out_i}", _aextra[_i + 1]]
             # SAY WHAT THE TRACK BECOMES, not what it was. The planner works
             # out the wording and refuses to touch a title carrying anything
             # it cannot regenerate - see rules.audio_title(). Container

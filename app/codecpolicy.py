@@ -567,6 +567,9 @@ def describe() -> dict:
             "usable": _enc.usable(),
             "auto": _enc.resolve("auto")[0],
             "order": _enc.ORDER,
+            # WHICH AAC ENCODER, for the audio half. The page says what a
+            # track becomes; this says what makes it.
+            "aac": _enc.aac_info(),
         }
     except Exception:                                    # noqa: BLE001
         pass
