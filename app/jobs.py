@@ -923,11 +923,16 @@ class Worker:
         if kind == "transcode":
             if st == "encoding":
                 if getattr(p, "encode", False):
+                    # THE DECODE PATH IS WHATEVER build_ffmpeg DECIDED, not a
+                    # sentence written here. It wrote it onto the plan when
+                    # it built the command; before that there is no command
+                    # and nothing to claim.
+                    _dec = getattr(p, "decode_hw", "") or ""
                     return {"tool": "ffmpeg", "hw": fam_word,
                             "why": ((getattr(p, "venc", None) or {})
                                     .get("family_why") or
-                                    "re-encoding the video; the decode is on "
-                                    "the same silicon as the encode")}
+                                    ("re-encoding the video; " + _dec if _dec
+                                     else "re-encoding the video"))}
                 return {"tool": "ffmpeg", "hw": "disk \u00b7 stream copy",
                         "why": "no decode and no encode - the streams are "
                                "copied at disk speed"}
@@ -988,9 +993,13 @@ class Worker:
                 dev = getattr(_al, "_MODEL_DEV", "") or ""
             except Exception:                            # noqa: BLE001
                 pass
+            # "loading", NOT A GUESS. _MODEL_DEV is set when the model has
+            # actually landed on a device; until then the chip does not know
+            # and says so, rather than printing GPU and being wrong on a
+            # box whose card was busy.
             return {"tool": "Whisper",
                     "hw": ("GPU \u00b7 CUDA" if dev == "cuda"
-                           else "CPU" if dev == "cpu" else "GPU"),
+                           else "CPU" if dev == "cpu" else "loading"),
                     "why": "the language identifier over five 30-second "
                            "windows; the audio is decoded by ffmpeg first"}
         if kind == "subread":
@@ -1033,9 +1042,10 @@ class Worker:
                     "why": "pulling the track out to read its events"}
         if kind == "decode":
             return {"tool": "ffmpeg", "hw": "CPU \u00b7 software decode",
-                    "why": "decoding both ends of the file to null - a GPU "
-                           "decode would hide the very errors this is "
-                           "looking for"}
+                    "why": "decoding sampled windows of the file to null - "
+                           "head, middle and tail - on the CPU, because a "
+                           "hardware decoder plays through the damage this "
+                           "is looking for"}
         return {"tool": "", "hw": "", "why": st}
 
     def as_dict(self) -> dict:
@@ -4694,11 +4704,11 @@ async def _decode_job(w: Worker) -> None:
         w.sub_steps = [a.get("what") or "" for a in _acts]
         w.sub_why = [a.get("why") or "" for a in _acts]
     else:
-        w.sub_steps = [f"decode the first {integrity.HEAD_S}s to null"] + (
-            [f"decode the last {integrity.TAIL_S}s to null"]
-            if dur > (integrity.HEAD_S + integrity.TAIL_S + 5) else [])
-        w.sub_why = ["header and stream damage show here",
-                     "truncation only shows at the end"][:len(w.sub_steps)]
+        # FROM THE SAME FUNCTION THAT DECIDES THE WINDOWS, so the card
+        # cannot list two when the check reads five.
+        _wins = integrity.windows(dur)
+        w.sub_steps = [f"decode {lbl} to null" for _ss, _sec, lbl in _wins]
+        w.sub_why = [integrity.window_why(lbl) for _ss, _sec, lbl in _wins]
     _plbl = str(_plan.get("pass_label") or "")
     w.sub_summary = (f"{_plbl} · does it actually decode?" if _plbl
                      else "does it actually decode?")
@@ -6855,6 +6865,7 @@ def build_ffmpeg(src: str, dst: str, plan, duration: float,
         # and a CPU encode wants no hardware decode surface in the first place.
         _fam = (getattr(plan, "venc", None) or {}).get("family") or "nvenc"
         _src10 = False
+        _vs: dict = {}
         try:
             _vs = next((x for x in (probe or {}).get("streams", [])
                         if x.get("codec_type") == "video"), None) or {}
@@ -6874,6 +6885,28 @@ def build_ffmpeg(src: str, dst: str, plan, duration: float,
         except Exception:                                # noqa: BLE001
             a += ["-hwaccel", "cuda"]
             _on_card = False
+        # SAY WHICH OF THE FOUR DECODE PATHS THIS IS, on the plan, for the
+        # card. The chip's sentence used to claim the decode was on the same
+        # silicon as the encode for every one of them; only this function
+        # knows which it actually is.
+        try:
+            _can, _why_not = _enc.nvdec_can(_vs) if _vs else (True, "")
+            if not _can:
+                plan.decode_hw = f"decoded in software - {_why_not}"
+            elif _on_card:
+                plan.decode_hw = ("decoded on the card, and the frames stay "
+                                  "there - nothing crosses to system memory")
+            else:
+                plan.decode_hw = ("decoded on the card, pulled back to system "
+                                  "memory for the filter, sent up again to "
+                                  "encode")
+        except Exception:                                # noqa: BLE001
+            pass
+    elif plan.encode:
+        try:
+            plan.decode_hw = "decoded in software - hardware decode is off"
+        except Exception:                                # noqa: BLE001
+            pass
     a += ["-i", src]
 
     if plan.encode:

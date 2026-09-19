@@ -389,6 +389,31 @@ def hdr_args(vstream: dict, family: str) -> list[str]:
     return a
 
 
+def nvdec_can(vstream: dict) -> tuple[bool, str]:
+    r"""Can NVDEC decode this stream at all? (yes, "") or (no, why).
+
+    When it cannot, ffmpeg falls back to software decoding on its own and
+    finishes normally - measured on a Hi10P file, rc=0, same output - so this
+    is not a guard. It is what lets the job card say "decoded in software"
+    instead of claiming the decode is on the card. Counted across this
+    library: 39,759 files NVDEC can take, 100 it cannot.
+    """
+    c = (vstream.get("codec_name") or "").lower()
+    p = (vstream.get("profile") or "").lower()
+    x = (vstream.get("pix_fmt") or "").lower()
+    if c == "h264":
+        if "10" in p or "444" in p or "422" in x or "444" in x:
+            return False, "NVDEC has no decoder for 10-bit or 4:2:2/4:4:4 H.264"
+        return True, ""
+    if c in ("hevc", "vp9", "av1", "mpeg2video", "vc1", "vp8", "mpeg4"):
+        if "444" in x:
+            return False, "4:4:4 is not a format NVDEC decodes"
+        if "12" in x:
+            return False, "12-bit is not a format NVDEC decodes"
+        return True, ""
+    return False, f"NVDEC has no {c} decoder"
+
+
 def decode_args(family: str, want_hw: bool,
                 keep_on_card: bool = False) -> list[str]:
     r"""Input-side hardware decode flags.

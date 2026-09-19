@@ -381,7 +381,7 @@ def windows(duration: float) -> list[tuple]:
         for i in range(MID_WINDOWS):
             ss = lo + (hi - lo) * ((i + 1) / (MID_WINDOWS + 1))
             w.append((ss, float(MID_S),
-                      f"{int(ss // 60)}m{int(ss % 60):02d}s in"))
+                      f"{MID_S}s at {int(ss // 60)}m{int(ss % 60):02d}s"))
     w.append((max(0.0, duration - TAIL_S), float(TAIL_S),
               f"the last {TAIL_S}s"))
     return w
@@ -1016,14 +1016,29 @@ def _to_hand_over(depth: int) -> tuple:
     return have, out
 
 
+def window_why(label: str) -> str:
+    """What each window is there to catch, for the card's action list."""
+    if label.startswith("the first"):
+        return ("header and stream damage, bad indices, wrong codec "
+                "parameters all show here")
+    if label.startswith("the last"):
+        return ("truncation - the commonest way a library file is broken - "
+                "shows here as a window that decodes nothing")
+    return "damage in the middle used to be invisible to this check"
+
+
 def _job_plan(r: dict) -> str:
     """The instruction in the shape the queue panel reads plans in."""
     import json
     dur = float(r.get("duration") or 0)
-    both = dur > (HEAD_S + TAIL_S + 5)
     lbl, why = pass_words(r)
-    what = (f"decode the first {HEAD_S}s and the last {TAIL_S}s"
-            if both else f"decode the first {HEAD_S}s")
+    # THE SAME WINDOWS THE CHECK WILL READ, from the function that decides
+    # them. This said "the first 20s and the last 25s" for a check that has
+    # read five windows since the middle was added.
+    wins = windows(dur)
+    secs = int(sum(w[1] for w in wins))
+    what = (f"decode {secs}s in {len(wins)} windows" if len(wins) > 1
+            else f"decode the first {HEAD_S}s")
     return json.dumps({
         "decode": True, "rewrite": False,
         # Carried so the worker card, the queue row, the activity pill and the
@@ -1038,13 +1053,10 @@ def _job_plan(r: dict) -> str:
         "summary": f"{lbl} · {what}",
         "actions": [
             {"kind": "decode", "what": f"{lbl}: {what}", "why": why,
-             "detail": ""},
-            {"kind": "decode", "what": f"decode the first {HEAD_S}s to null",
-             "why": "header and stream damage, bad indices, wrong codec "
-                    "parameters all show here", "detail": ""}]
-        + ([{"kind": "decode", "what": f"decode the last {TAIL_S}s to null",
-             "why": "truncation - the commonest way a library file is broken "
-                    "- only shows at the end", "detail": ""}] if both else []),
+             "detail": ""}]
+        + [{"kind": "decode", "what": f"decode {label} to null",
+            "why": window_why(label), "detail": ""}
+           for _ss, _sec, label in wins],
     })
 
 
