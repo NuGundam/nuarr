@@ -10246,6 +10246,18 @@ def api_subneed_unknown(kind: str = "", limit: int = 600):
     return subneed.unknown_files(kind, max(1, min(int(limit), 2000)))
 
 
+@app.get("/api/subneed/scoring")
+async def api_subneed_scoring():
+    """Every rung of the language ladder, how sure it is, what it carries.
+
+    The sibling of /api/subkind/scoring, and the same bargain: the weights
+    are read out of the module that uses them and the counts are recounted
+    from the library, so the table on the page cannot say anything the code
+    does not do.
+    """
+    return await asyncio.to_thread(subneed.scoring)
+
+
 @app.get("/api/subneed/answered")
 async def api_subneed_answered(limit: int = 200):
     """The releases this check has already replaced, newest first."""
@@ -38623,6 +38635,93 @@ function snUnknownWords(c){
   if(!bits.length) return `${num(c.unknown||0,'auto')} no opinion`;
   return bits.join(' · ');
 }
+// ---- HOW SURE IS THIS CHECK, AND OF WHAT ---------------------------------
+//
+// The panel above this one can say why a file scored 62% and this one could
+// say nothing at all: every verdict arrived as a sentence with no number
+// behind it, so a file cleared by the container's own tag and a file cleared
+// by "this untagged track might be the one" read exactly alike. The ladder
+// has rungs now, each with a sureness and a count of how often it has had to
+// take an answer back - see subneed.RULES and subneed.scoring().
+let _snScoreOpen=false, _snScoreData=null;
+async function snScoreToggle(){
+  _snScoreOpen = !_snScoreOpen;
+  if(_snScoreOpen && !_snScoreData){
+    try{ _snScoreData = await (await fetch('/api/subneed/scoring')).json(); }
+    catch(e){ _snScoreData = {err:String(e)}; }
+  }
+  _snKey=''; snPaint(true);
+}
+// The verdict a rung gives, as a word and a colour: the two that clear a
+// file, the one that accuses, and the five that only say the question is
+// still open.
+function snSays(w){
+  return w==='ok' ? ['carries it','#7fd18c']
+       : w==='missing' ? ['missing','var(--bad)']
+       : ['open','var(--dim,#8a97a6)'];
+}
+function snScoreTable(){
+  if(!_snScoreOpen) return '';
+  const d=_snScoreData;
+  if(!d) return `<div class="dim" style="font-size:11.5px;padding:8px 14px">reading the ladder…</div>`;
+  if(d.err) return `<div class="dim" style="font-size:11.5px;padding:8px 14px">could not read it: ${esc(d.err)}</div>`;
+  const rows=(d.rows||[]).map(r=>{
+    const [word,col]=snSays(r.says);
+    const sure = r.sure
+      ? `<span style="color:${r.sure>=95?'#7fd18c':r.sure>=80?'#e8a33d':'var(--bad)'};
+             font-weight:700">${r.sure}%</span>`
+      : `<span class="dim" style="font-size:10.5px">no claim</span>`;
+    // WHAT IT IS CARRYING, AND WHAT IT HAS GIVEN BACK. The second number is
+    // the only hit rate available here - there is no second opinion to check
+    // a verdict against, so what is worth counting is how often the check
+    // disagrees with itself once it knows more.
+    const back = r.took_back
+      ? `<span style="color:var(--warn)">${fmt(r.took_back)} taken back</span>${
+          Object.keys(r.became||{}).length
+            ? ` <span class="dim">(became ${Object.entries(r.became)
+                .map(([k,v])=>`${fmt(v)} ${esc(k)}`).join(', ')})</span>`:''}`
+      : `<span class="dim">none taken back yet</span>`;
+    const since = r.since
+      ? `<span class="dim"> · ${fmt(r.since.live)} on ${esc(r.since.day)}</span>`
+      : '';
+    return `<tr style="border-top:1px solid var(--line)">
+      <td style="padding:3px 8px 3px 0;text-align:right;white-space:nowrap;
+                 width:56px">${sure}</td>
+      <td style="padding:3px 8px 3px 0">
+        <span style="color:${col};font-size:10px;font-weight:700;
+              text-transform:uppercase">${esc(word)}</span>
+        ${esc(r.line||'')}
+        <div style="font-size:10.5px;margin-top:1px">
+          <span class="dim">${r.live?`${fmt(r.live)} file${r.live===1?'':'s'} rest on this`
+                                    :'nothing rests on this now'}</span>
+          <span class="dim"> · </span>${back}${since}
+        </div>
+        ${r.rests?`<div class="dim" style="font-size:10.5px;margin-top:1px">${esc(r.rests)}</div>`:''}
+      </td></tr>`;
+  }).join('');
+  const c=d.counted||{}, rep=d.replaced||{};
+  return `<div style="margin:6px 14px 2px;padding:9px 11px;border:1px solid
+       var(--line);border-radius:7px;background:rgba(255,255,255,.02)">
+    <div style="font-size:11.5px"><b>How this check decides, and how sure it is</b>
+      <a href="#" onclick="snScoreToggle();return false" style="margin-left:10px">hide</a></div>
+    <div class="dim" style="font-size:11px;margin-top:2px">${esc(d.how||'')}</div>
+    <table style="width:100%;border-collapse:collapse;font-size:11.5px;margin-top:5px">
+      <tbody>${rows}</tbody></table>
+    <div class="dim" style="font-size:10.5px;margin-top:6px">${esc(d.acts||'')}</div>
+    <div class="dim" style="font-size:10.5px;margin-top:9px;padding-top:7px;
+         border-top:1px solid var(--line)">
+      <b style="color:var(--fg,#c9d1d9)">What moves and what does not.</b>
+      ${esc(d.learns||'')}
+      ${c.files?`<span class="dim"> Counted just now over ${fmt(c.files)} verdicts${
+        c.moved?`, ${fmt(c.moved)} of which have moved since they were first made`:''}.</span>`:''}
+      ${rep.asked?`<span class="dim"> You acted on ${fmt(rep.asked)} of its
+        accusations and ${fmt(rep.went)} of those replacements went
+        through.</span>`:''}
+      ${(d.trail||[]).length>1?`<span class="dim"> The trail goes back to
+        ${esc(d.trail[0].day||'')} — ${(d.trail||[]).length} days of it.</span>`:''}
+    </div>
+  </div>`;
+}
 let _snUnk='', _snUnkData=null, _snUnkBusy=false;
 // Which shows are opened out into their episodes. A set rather than one
 // name: opening Detective Conan to see its eighty and then opening another
@@ -38719,6 +38818,10 @@ function snPaint(force){
       ${req?`<span>${req}</span> · `:''}
       <span title="carry what their library requires">${num(ok,'done')} carry it</span>
       ${unk?` · ${snUnknownWords(c)}`:''}
+      · <a href="#" onclick="snScoreToggle();return false"
+          title="Every rung of the ladder this check runs down, how sure that rung is, how many files rest on it, and how many of its answers it has since had to take back."
+          style="color:${_snScoreOpen?'#e8a33d':'inherit'};text-decoration:none;
+          border-bottom:1px dotted currentColor">how it decides${_snScoreOpen?' ▾':''}</a>
     </span>
     <span style="float:right;display:flex;gap:8px;align-items:center">
       ${modeSeg('when it is sure', d.mode, 'snMode', {
@@ -38827,6 +38930,10 @@ function snPaint(force){
           title="Blocklist this release so the arr never grabs it again, delete the file (${esc(String(gb(r.size)))} GB), and search for a replacement. Not reversible.">Blocklist &amp; re-download</button></td>
       </tr>${open?`<tr style="background:rgba(255,255,255,.025)"><td colspan="10" style="padding:6px 10px;border-bottom:1px solid var(--line);font-size:11px">
         <div><span class="dim">what it has:</span> ${esc(r.why||'')}</div>
+        ${r.sure?`<div><span class="dim">how sure:</span>
+          <b style="color:${r.sure>=95?'#7fd18c':r.sure>=80?'#e8a33d':'var(--bad)'}">${r.sure}%</b>
+          <span class="dim">— ${esc(r.rule_line||'')}.
+          <a href="#" onclick="snScoreToggle();return false">where that comes from</a></span></div>`:''}
         <div><span class="dim">size:</span> ${esc(String(gb(r.size)))} GB · <span class="dim">judged</span> ${r.checked_at?ago(r.checked_at):'—'}</div>
         <div class="mono dim" style="font-size:10px;word-break:break-all">${esc(r.path||'')}</div></td></tr>`:''}`;}).join('')}</tbody></table></div>`
     : `<div class="dim" style="font-size:11.5px;padding:8px 0">${
@@ -38889,7 +38996,7 @@ function snPaint(force){
       _snDone?'hide':'also show'} the ${fmt(nDone)} answered</a>`:''}
   </div>${doneList}`;
 
-  const html=`<div class="subsp" id="subsPanelNeed">${head}${snUnkBox()}${prog}${table}${foot}</div>`;
+  const html=`<div class="subsp" id="subsPanelNeed">${head}${snScoreTable()}${snUnkBox()}${prog}${table}${foot}</div>`;
 
   // WHAT COUNTS AS CHANGED IS THE ROWS, not the markup.
   //

@@ -162,6 +162,147 @@ def _english_hits(words: str) -> list:
             out.append(w)
     return out
 
+# ---- THE LADDER, AND HOW SURE EACH RUNG IS ---------------------------------
+#
+# verdict() is a ladder of early returns: the first rung that matches answers
+# the question and nothing under it ever runs. That is the right shape for the
+# logic and a poor shape for a number, because the answer came back with no
+# record of WHICH rung produced it - so every `ok` in the library read as
+# equally settled. They are not, and the gap is not small:
+#
+#     36,586  a track tagged with the language        the container says so
+#      2,744  the audio is already in that language   the probe says so
+#        127  an untagged track that might be the one a hope, deliberately given
+#
+# Three sentences, one column, and only two of them are facts. So each rung
+# carries a name, a base sureness, and the measurement that earned it.
+#
+# THE BASE DOES NOT DRIFT. A weight that moved on its own would let a file
+# change its mind overnight with nothing about the file having changed. What
+# moves is the counting beside it - how many files rest on this rung now, and
+# how many of its answers it has since had to take back - and that is read as
+# an argument about the weight rather than as the weight. See scoring().
+#
+# The unknown rungs make no claim at all, so they carry no percentage. What
+# they carry instead is a LEAN: of the files this rung once held that have
+# since been decided, the share that turned out fine. That figure is empty
+# until files move, which is the honest state of it - and the 362 sitting on
+# `marks` are queued for a re-read right now, so it will fill.
+RULES: dict = {
+    "unread": {
+        "says": UNKNOWN, "short": "not looked inside",
+        "line": "nobody has opened this file yet",
+        "rests": "every check under this one reads a probe, and a missing "
+                 "probe makes all of them return nothing - which is "
+                 "indistinguishable from the file carrying nothing. This is "
+                 "the rung that stops 11,687 unread files being reported as "
+                 "faulty."},
+    "noread": {
+        "says": UNKNOWN, "short": "subtitles not read",
+        "line": "the subtitle reader has not read this file",
+        "rests": "the probe is there but the track list is not, so there is "
+                 "nothing yet to check the language against."},
+    "track": {
+        "says": OK, "sure": 99, "short": "tagged track",
+        "line": "a track tagged with the language",
+        "rests": "the container's own tag, written by whoever made the "
+                 "release. It is the strongest thing on this ladder and it "
+                 "is still a claim: a mislabelled track would pass here and "
+                 "nothing in this library has caught one."},
+    "side": {
+        "says": OK, "sure": 99, "short": "subtitle file beside it",
+        "line": "a subtitle file sits beside the video",
+        "rests": "a .srt or .ass named for the language, next to the file. "
+                 "Same standing as a tagged track and the same caveat."},
+    "untagged": {
+        "says": OK, "sure": 70, "short": "untagged track",
+        "line": "an untagged track, which this library keeps",
+        "rests": "releases leave subtitles unlabelled, which is why the "
+                 "library keeps untagged tracks at all. Reading one to find "
+                 "out costs an extract and an OCR, and until somebody does, "
+                 "\"there is no English track\" is a guess wearing a fact's "
+                 "clothes. The benefit of the doubt, given on purpose - and "
+                 "this is the one rung where the number says so."},
+    "burned": {
+        "says": OK, "sure": 92, "short": "burned into the picture",
+        "line": "the dialogue is burned into the picture",
+        "rests": "the picture reader's own verdict of dialogue or hybrid, "
+                 "which had to clear its act line to be recorded. How that "
+                 "score is built, and how often it has agreed with you, is "
+                 "the panel above this one."},
+    "audio": {
+        "says": OK, "sure": 99, "short": "audio already in the language",
+        "line": "the audio is already in the language",
+        "rests": "the probe's own stream tags. Nobody needs an English "
+                 "subtitle for a film that is spoken in English - it is a "
+                 "convenience, not a gap."},
+    "ocr_trans": {
+        "says": OK, "sure": 88, "short": "OCRed off the screen",
+        "line": "English was read off the picture and the audio is not "
+                "English",
+        "rests": "two English function words or more, OCRed from the frames. "
+                 "Measured over the 23 accused files that had any words at "
+                 "all: the 13 with a function word were every one "
+                 "Spanish-audio Velvet with English burned in; the 10 "
+                 "without were every one Japanese-audio OCR noise. Getting "
+                 "here already means the language is not in the audio, so "
+                 "English on the screen is English the audio does not have - "
+                 "which is what a translation subtitle is."},
+    "ocr_one": {
+        "says": UNKNOWN, "short": "one word off the screen",
+        "line": "a single English word was read off the picture",
+        "rests": "one function word is a shop sign as easily as a subtitle. "
+                 "Not enough to clear the file and far too much to accuse "
+                 "it."},
+    "marks": {
+        "says": UNKNOWN, "short": "marks it could not read",
+        "line": "there are subtitle-shaped marks it could not transcribe",
+        "rests": f"marks low in the picture in {int(PICTURE_MARKS_RATIO*100)}% "
+                 "of sampled frames or more, and not one readable word - "
+                 "which is what an SDTV-era hardsub looks like to an OCR "
+                 "trained on clean type. Treating it as a clean picture put "
+                 "126 of 146 files on a list offering to delete them."},
+    "noframes": {
+        "says": UNKNOWN, "short": "no frames sampled",
+        "line": "the picture reader has no frames for this file",
+        "rests": "it looked and came back with nothing to count, so it has "
+                 "not ruled anything out."},
+    "nopic": {
+        "says": UNKNOWN, "short": "picture not read",
+        "line": "the picture reader has not looked at this file",
+        "rests": "burned-in subtitles cannot be ruled out by a reader that "
+                 "has not run."},
+    "stale": {
+        "says": UNKNOWN, "short": "waiting on a re-read",
+        "line": "it was read by an earlier version of the picture reader",
+        "rests": "the caption floor and the OCR engine have both changed, "
+                 "and the stamp has moved three times. A reading this file "
+                 "is already queued to have redone is not one to delete a "
+                 "release over - measured when this went in, all 34 files on "
+                 "the list rested on an older reader and none on the "
+                 "current one."},
+    "missing": {
+        "says": MISSING, "sure": 90, "short": "nothing anywhere",
+        "line": "nothing tagged, nothing beside it and nothing in the "
+                "picture",
+        "rests": "every rung above had its say first, including the two that "
+                 "clear a file outright and the five that only say the "
+                 "question is open. This is the only rung that accuses, and "
+                 "the only one a button acts on."},
+}
+
+RULE_ORDER = tuple(RULES)
+
+
+def rule_of(rule: str) -> dict:
+    return RULES.get(str(rule or ""), {})
+
+
+def sureness(rule: str) -> int:
+    """The rung's own number, or 0 for the rungs that make no claim."""
+    return int(RULES.get(str(rule or ""), {}).get("sure") or 0)
+
+
 # Slow on purpose. Nothing here touches a disk - it reads sub_facts, hardsub
 # and file_probes, all of which somebody else has already filled in - so the
 # cost is a few table scans, and the thing it is looking for changes only when
@@ -201,6 +342,53 @@ def init() -> None:
         # it asks about one file.
         cur.execute("CREATE INDEX IF NOT EXISTS ix_sub_need_state "
                     "ON sub_need(state, library)")
+        # WHICH RUNG ANSWERED, AND HOW SURE THAT RUNG IS. See RULES. The
+        # verdict was being stored without either, so every `ok` in the
+        # library looked equally certain - the 36,586 resting on a tag the
+        # container wrote and the 127 resting on "this untagged track might
+        # be the one" read exactly the same on the page.
+        for col, decl in (("rule", "TEXT NOT NULL DEFAULT ''"),
+                          ("sure", "INTEGER")):
+            try:
+                cur.execute(f"ALTER TABLE sub_need ADD COLUMN {col} {decl}")
+            except Exception:                                    # noqa: BLE001
+                pass
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS sub_need_log(
+                id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_id  INTEGER NOT NULL,
+                lang     TEXT    NOT NULL DEFAULT '',
+                at       REAL    NOT NULL DEFAULT 0,
+                was      TEXT    NOT NULL DEFAULT '',
+                now      TEXT    NOT NULL DEFAULT '',
+                was_rule TEXT    NOT NULL DEFAULT '',
+                now_rule TEXT    NOT NULL DEFAULT ''
+            )""")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_sub_need_log_rule "
+                    "ON sub_need_log(was_rule)")
+        # A TRIGGER RATHER THAN A LINE IN THE SWEEP. The sweep writes 40,000
+        # rows a pass and reading each one back first to see whether it moved
+        # would double the query count for a fact SQLite already has in hand.
+        # It also catches every other writer, and there are three.
+        # THE EMPTY-RUNG GUARD IS NOT A DETAIL. Every row in the table
+        # predates the rung column, so the first sweep after this lands
+        # moves all 39,900 of them from '' to a name - and without the
+        # guard that is 39,900 log rows saying the ladder changed its mind,
+        # on the day it learned to say which rung it was standing on. A
+        # rung has no history before it had a name.
+        cur.execute("""
+            CREATE TRIGGER IF NOT EXISTS tg_sub_need_moved
+            AFTER UPDATE OF state, rule ON sub_need
+            WHEN COALESCE(old.rule,'') <> ''
+             AND (old.state <> new.state
+                  OR COALESCE(old.rule,'') <> COALESCE(new.rule,''))
+            BEGIN
+              INSERT INTO sub_need_log(file_id, lang, at, was, now,
+                                       was_rule, now_rule)
+              VALUES(new.file_id, new.lang, new.checked_at, old.state,
+                     new.state, COALESCE(old.rule,''),
+                     COALESCE(new.rule,''));
+            END""")
     _READY = True
 
 
@@ -300,8 +488,12 @@ def _picture(file_id: int, cur, pic=None):
 
 
 def verdict(file_id: int, lang: str, cur, facts=None,
-            untagged_ok: bool = True, pic=None) -> tuple[str, str]:
-    """Does this file carry `lang` subtitles? Returns (state, why).
+            untagged_ok: bool = True, pic=None) -> tuple[str, str, str]:
+    """Does this file carry `lang` subtitles? Returns (state, why, rule).
+
+    `rule` names the rung that answered, so the row can say how sure that
+    rung is and scoring() can count how often it has had to take an answer
+    back. See RULES.
 
     `facts` is an optional pre-fetched sub_facts row, so a sweep over 40,000
     files does one query per file instead of two.
@@ -319,9 +511,9 @@ def verdict(file_id: int, lang: str, cur, facts=None,
     has_probe = cur.execute("SELECT 1 FROM file_probes WHERE file_id=?",
                             (int(file_id),)).fetchone()
     if not has_probe:
-        return UNKNOWN, "nuarr has not looked inside this file yet"
+        return UNKNOWN, "nuarr has not looked inside this file yet", "unread"
     if facts is None:
-        return UNKNOWN, "the subtitle reader has not read this file yet"
+        return UNKNOWN, "the subtitle reader has not read this file yet", "noread"
 
     try:
         tracks = json.loads(facts["tracks"] or "[]")
@@ -334,10 +526,10 @@ def verdict(file_id: int, lang: str, cur, facts=None,
 
     for t in tracks:
         if str(t.get("lang") or "").lower()[:3] == lang:
-            return OK, f"carries a {lang} subtitle track"
+            return OK, f"carries a {lang} subtitle track", "track"
     for s in sides:
         if str(s.get("lang") or "").lower()[:3] == lang:
-            return OK, f"has a {lang} subtitle file beside it"
+            return OK, f"has a {lang} subtitle file beside it", "side"
 
     # AN UNLABELLED TRACK MIGHT BE THE ONE. The library keeps untagged tracks
     # precisely because releases leave subtitles unlabelled; reading one to
@@ -347,7 +539,7 @@ def verdict(file_id: int, lang: str, cur, facts=None,
         for t in tracks:
             if str(t.get("lang") or "").lower()[:3] in ("", "und", "un"):
                 return OK, ("has an untagged subtitle track, which this "
-                            "library keeps - it may be the one")
+                            "library keeps - it may be the one"), "untagged"
 
     # ---- THE PICTURE, AND THE THREE THINGS IT CAN SAY ----------------------
     #
@@ -380,16 +572,16 @@ def verdict(file_id: int, lang: str, cur, facts=None,
     prow = _picture(file_id, cur, pic)
     if prow is None:
         return UNKNOWN, ("the picture reader has not looked at this file, so "
-                         "burned-in subtitles cannot be ruled out")
+                         "burned-in subtitles cannot be ruled out"), "nopic"
     pstate = str((prow["chosen"] if "chosen" in prow.keys() else None)
                  or prow["state"] or "")
     # `signs` is deliberately not on this list. Signs and songs are not
     # dialogue, and a file carrying only those still needs subtitles.
     if pstate in ("dialogue", "hybrid"):
-        return OK, "the dialogue is burned into the picture"
+        return OK, "the dialogue is burned into the picture", "burned"
 
     if lang in _audio_langs(file_id, cur):
-        return OK, f"the audio is already in {lang}"
+        return OK, f"the audio is already in {lang}", "audio"
 
     # DID IT READ ANY WORDS? Asked before the frame counts, because it is the
     # stronger evidence and because nothing was asking it at all.
@@ -450,11 +642,12 @@ def verdict(file_id: int, lang: str, cur, facts=None,
             return OK, (
                 f"the audio is {'/'.join(spoken) or 'not English'} and the "
                 f"picture reader OCRed English off the screen - {shown} - so "
-                f"the English is burned in as a translation subtitle")
+                f"the English is burned in as a translation subtitle"
+            ), "ocr_trans"
         return UNKNOWN, (
             f"the picture reader OCRed English off the picture - {shown} - "
             f"so there is English burned into this file whatever the frame "
-            f"counts say")
+            f"counts say"), "ocr_one"
 
     n_s = int(prow["samples"] or 0)
     n_lo = int(prow["low_hits"] or 0)
@@ -462,10 +655,10 @@ def verdict(file_id: int, lang: str, cur, facts=None,
         return UNKNOWN, (
             f"the picture reader found marks low in the picture in "
             f"{n_lo} of {n_s} frames but could read none of them - burned-in "
-            f"subtitles it cannot transcribe look exactly like this")
+            f"subtitles it cannot transcribe look exactly like this"), "marks"
     if not n_s:
         return UNKNOWN, ("the picture reader has no frames for this file, so "
-                         "burned-in subtitles cannot be ruled out")
+                         "burned-in subtitles cannot be ruled out"), "noframes"
 
     # LAST, BECAUSE IT ONLY ANSWERS THE ACCUSATION.
     #
@@ -498,7 +691,7 @@ def verdict(file_id: int, lang: str, cur, facts=None,
                 "the picture was read by an earlier version of the reader and "
                 "is queued to be read again - the caption floor and the OCR "
                 "engine have both changed since, so this is not an answer to "
-                "delete a release over")
+                "delete a release over"), "stale"
     except Exception:                                            # noqa: BLE001
         pass
 
@@ -506,7 +699,7 @@ def verdict(file_id: int, lang: str, cur, facts=None,
     return MISSING, ("carries no subtitles at all, and nothing in the picture"
                      if not n
                      else f"carries {n} subtitle(s), none of them {lang}, "
-                          f"and nothing in the picture")
+                          f"and nothing in the picture"), "missing"
 
 
 # -------------------------------------------------------------- the sweep ---
@@ -532,14 +725,18 @@ def check_one(file_id: int, cur=None) -> dict:
         now = time.time()
         out = {}
         for lang in want:
-            st, why = verdict(file_id, lang, cur, facts, untagged)
+            st, why, rule = verdict(file_id, lang, cur, facts, untagged)
             out[lang] = st
             cur.execute(
-                "INSERT INTO sub_need(file_id,lang,library,state,why,checked_at)"
-                " VALUES(?,?,?,?,?,?) ON CONFLICT(file_id,lang) DO UPDATE SET "
+                "INSERT INTO sub_need(file_id,lang,library,state,why,"
+                "                     checked_at,rule,sure)"
+                " VALUES(?,?,?,?,?,?,?,?) "
+                " ON CONFLICT(file_id,lang) DO UPDATE SET "
                 " library=excluded.library, state=excluded.state, "
-                " why=excluded.why, checked_at=excluded.checked_at",
-                (int(file_id), lang, lib, st, why, now))
+                " why=excluded.why, checked_at=excluded.checked_at, "
+                " rule=excluded.rule, sure=excluded.sure",
+                (int(file_id), lang, lib, st, why, now, rule,
+                 sureness(rule)))
         return {"ok": True, "checked": len(want), "states": out}
     finally:
         if close:
@@ -600,16 +797,20 @@ def sweep(limit: int = BATCH) -> dict:
                     # does not make a second query per file to read them.
                     prow = r if r["haspic"] else None
                     for lang in want:
-                        st, why = verdict(r["id"], lang, cur, r, untagged, prow)
+                        st, why, rule = verdict(r["id"], lang, cur, r,
+                                                untagged, prow)
                         tally[st] = tally.get(st, 0) + 1
                         cur.execute(
                             "INSERT INTO sub_need"
-                            "(file_id,lang,library,state,why,checked_at) "
-                            "VALUES(?,?,?,?,?,?) "
+                            "(file_id,lang,library,state,why,checked_at,"
+                            " rule,sure) "
+                            "VALUES(?,?,?,?,?,?,?,?) "
                             "ON CONFLICT(file_id,lang) DO UPDATE SET "
                             " library=excluded.library, state=excluded.state,"
-                            " why=excluded.why, checked_at=excluded.checked_at",
-                            (int(r["id"]), lang, lib, st, why, now))
+                            " why=excluded.why, checked_at=excluded.checked_at,"
+                            " rule=excluded.rule, sure=excluded.sure",
+                            (int(r["id"]), lang, lib, st, why, now, rule,
+                             sureness(rule)))
                         n += 1
     except Exception as e:                                       # noqa: BLE001
         STATE["err"] = f"{type(e).__name__}: {e}"
@@ -689,6 +890,216 @@ def counts() -> dict:
 # question about real files - 81 of the undecided are one show, Detective
 # Conan, every one of them reading "marks low in the picture the OCR could
 # not read" - and that is a fact worth being able to see rather than infer.
+# -------------------------------------------- how sure, and what has moved ---
+_STATS_TTL = 120.0
+_STATS: dict = {"at": 0.0, "data": None}
+
+
+def _rule_stats() -> dict:
+    r"""What each rung is carrying now, and what it has had to take back.
+
+    THE PART THAT LEARNS. The base sureness in RULES is fixed; this is the
+    counting beside it, and it is counted from the library rather than
+    written down anywhere.
+
+    `live` is how many verdicts rest on the rung today. `took_back` is how
+    many of its answers have since been replaced by a different verdict -
+    from the trigger on sub_need, which fires whenever a re-check moves a row.
+    The two together read as "it has answered live+took_back times and taken
+    back took_back of them", which is the only hit rate available here: there
+    is no second opinion to check a verdict against, so the thing worth
+    counting is how often the check disagrees with ITSELF once it knows more.
+
+    For the rungs that make no claim, the interesting figure is the other
+    one - of the files this rung held that have since been decided, the share
+    that turned out fine. That is `became`, and an empty `became` means
+    nothing has moved off the rung yet, which is a fact about the rung's age
+    and not about its quality.
+    """
+    out = {}
+    for k in RULES:
+        out[k] = {"live": 0, "took_back": 0, "held": 0, "became": {}}
+    try:
+        with cursor() as cur:
+            for r in cur.execute(
+                    "SELECT COALESCE(n.rule,'') AS rule, COUNT(*) AS c "
+                    "  FROM sub_need n JOIN files f ON f.id = n.file_id "
+                    " WHERE f.state NOT IN ('deleted','duplicate') "
+                    " GROUP BY COALESCE(n.rule,'')"):
+                d = out.setdefault(r["rule"], {"live": 0, "took_back": 0,
+                                               "held": 0, "became": {}})
+                d["live"] = int(r["c"] or 0)
+            for r in cur.execute(
+                    "SELECT was_rule, was, now, COUNT(*) AS c "
+                    "  FROM sub_need_log GROUP BY was_rule, was, now"):
+                d = out.get(str(r["was_rule"] or ""))
+                if d is None:
+                    continue
+                c = int(r["c"] or 0)
+                if str(r["was"]) == str(r["now"]):
+                    # Same verdict, different rung - a better reason for the
+                    # same answer is not the check changing its mind.
+                    d["held"] += c
+                else:
+                    d["took_back"] += c
+                    d["became"][str(r["now"])] = \
+                        d["became"].get(str(r["now"]), 0) + c
+    except Exception:                                            # noqa: BLE001
+        pass
+    return out
+
+
+def _replaces() -> dict:
+    """What you did about the one rung that accuses."""
+    try:
+        with cursor() as cur:
+            r = cur.execute(
+                "SELECT COUNT(*) AS asked, "
+                "       SUM(CASE WHEN ok THEN 1 ELSE 0 END) AS went "
+                "  FROM remedy_log WHERE kind=? AND action='replace'",
+                (KIND,)).fetchone()
+        return {"asked": int((r["asked"] if r else 0) or 0),
+                "went": int((r["went"] if r else 0) or 0)}
+    except Exception:                                            # noqa: BLE001
+        return {"asked": 0, "went": 0}
+
+
+def _trail_init() -> None:
+    with cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS subneed_trail(
+                day  TEXT PRIMARY KEY,
+                at   REAL,
+                json TEXT
+            )""")
+
+
+def _trail_write(d: dict) -> None:
+    """One row a day, and only when something moved - as subkind does it."""
+    try:
+        _trail_init()
+        day = time.strftime("%Y-%m-%d", time.localtime())
+        # NAMED RUNGS ONLY. Rows written before the rung column existed
+        # answer to '', and a trail row saying 39,890 files sat on a rung
+        # with no name is a record of the migration, not of the library.
+        small = {k: [v.get("live", 0), v.get("took_back", 0)]
+                 for k, v in (d.get("rules") or {}).items()
+                 if k in RULES and (v.get("live") or v.get("took_back"))}
+        blob = json.dumps(small, sort_keys=True)
+        with cursor() as cur:
+            row = cur.execute("SELECT json FROM subneed_trail "
+                              " ORDER BY day DESC LIMIT 1").fetchone()
+            if row and str(row["json"] or "") == blob:
+                return                       # nothing moved; nothing to say
+            cur.execute(
+                "INSERT INTO subneed_trail(day, at, json) VALUES(?,?,?) "
+                "ON CONFLICT(day) DO UPDATE SET at=excluded.at, "
+                "  json=excluded.json", (day, time.time(), blob))
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def trail(limit: int = 90) -> list:
+    """The dated rows, oldest first."""
+    out = []
+    try:
+        _trail_init()
+        with cursor() as cur:
+            rows = cur.execute(
+                "SELECT day, at, json FROM subneed_trail "
+                " ORDER BY day DESC LIMIT ?", (int(limit),)).fetchall()
+        for r in reversed(rows):
+            try:
+                out.append({"day": r["day"], "at": r["at"],
+                            "rules": json.loads(r["json"] or "{}")})
+            except Exception:                                    # noqa: BLE001
+                pass
+    except Exception:                                            # noqa: BLE001
+        return []
+    return out
+
+
+def stats(fresh: bool = False) -> dict:
+    """The recounted figures, held for two minutes, written to the trail."""
+    init()
+    now = time.time()
+    if not fresh and _STATS["data"] and now - _STATS["at"] < _STATS_TTL:
+        return _STATS["data"]
+    d = {"rules": _rule_stats(), "replaces": _replaces(), "at": now}
+    _STATS.update(at=now, data=d)
+    _trail_write(d)
+    return d
+
+
+def scoring() -> dict:
+    r"""Every rung of the ladder, how sure it is, and what it is carrying.
+
+    THE SAME BARGAIN THE PANEL ABOVE MAKES. The weights are read out of
+    RULES rather than typed into the page, so the table cannot say anything
+    the code does not do; the counts are recounted from the library on the
+    way in, so they move when it does.
+    """
+    st = stats()
+    rules = st.get("rules") or {}
+    hist = trail(400)
+    first = (hist[0] if hist else {}) or {}
+    first_rules = first.get("rules") or {}
+
+    rows = []
+    for rid in RULE_ORDER:
+        R = RULES[rid]
+        got = rules.get(rid) or {}
+        live = int(got.get("live") or 0)
+        back = int(got.get("took_back") or 0)
+        d = {"id": rid, "says": R["says"], "short": R["short"],
+             "line": R["line"], "rests": R["rests"],
+             "sure": int(R.get("sure") or 0),
+             "live": live, "took_back": back, "held": int(got.get("held") or 0),
+             "became": got.get("became") or {}}
+        if live + back:
+            d["kept"] = round((live) * 100.0 / (live + back))
+        was = first_rules.get(rid)
+        if was and was != [live, back]:
+            d["since"] = {"live": was[0], "took_back": was[1],
+                          "day": first.get("day") or ""}
+        rows.append(d)
+
+    rep = st.get("replaces") or {}
+    return {
+        "rows": rows,
+        "how": ("The rungs are tried in this order and the first one that "
+                "matches answers the question - nothing under it runs. So a "
+                "file's sureness is the sureness of the rung that caught it, "
+                "and the rungs that make no claim carry none: \"open\" is a "
+                "verdict about what nuarr knows, not about the file."),
+        "acts": ("Only the accusing rung is wired to a button. Everything "
+                 "the other rungs decide either clears the file or leaves the "
+                 "question open, and an open question is never acted on - "
+                 "which is the rule that keeps 384 files waiting on a re-read "
+                 "off a list offering to delete them."),
+        "replaced": rep,
+        "counted": {"files": sum(int((v or {}).get("live") or 0)
+                                 for k, v in rules.items() if k in RULES),
+                    "moved": sum(int((v or {}).get("took_back") or 0)
+                                 for k, v in rules.items() if k in RULES),
+                    "at": st.get("at", 0.0)},
+        "trail": [{"day": h.get("day"), "rules": h.get("rules") or {}}
+                  for h in hist],
+        "learns": ("Two things here are counted and not written down. How "
+                   "many files each rung is carrying, which moves every time "
+                   "the sweep runs; and how many of its answers it has since "
+                   "taken back, which is recorded by a trigger on the verdict "
+                   "table the moment a re-check moves a row. Nothing else "
+                   "learns on its own - the sureness of a rung is fixed, "
+                   "because a weight that drifted would let a file change its "
+                   "mind overnight with nothing about the file having "
+                   "changed. Read a rung that keeps taking answers back as an "
+                   "argument that its weight is too high, and read an empty "
+                   "\"taken back\" as what it is: nothing has moved off that "
+                   "rung yet."),
+    }
+
+
 UNKNOWN_KINDS = ("unread", "stale", "open")
 UNKNOWN_WORDS = {"unread": "not looked inside",
                  "stale": "waiting on a re-read",
@@ -716,6 +1127,7 @@ def unknown_files(kind: str = "", limit: int = 600) -> dict:
                  "                 AND COALESCE(h.chosen,'')='' THEN 'stale' "
                  "            ELSE 'open' END AS k, "
                  "       n.file_id, n.lang, n.why, n.checked_at, "
+                 "       COALESCE(n.rule,'') AS rule, "
                  "       f.path, f.title, f.season, f.episode, f.library "
                  "  FROM sub_need n "
                  "  JOIN files f ON f.id = n.file_id "
@@ -742,8 +1154,10 @@ def unknown_files(kind: str = "", limit: int = 600) -> dict:
                 # exactly where the sentence was about to say what it meant.
                 if not g["why"]:
                     g["why"] = str(r["why"] or "")
+                g["rule"] = g.get("rule") or str(r["rule"] or "")
                 g.setdefault("files", []).append({
                     "file_id": int(r["file_id"]),
+                    "rule": str(r["rule"] or ""),
                     "label": _row_label(r),
                     "season": r["season"], "episode": r["episode"],
                     "lang": r["lang"],
@@ -757,6 +1171,7 @@ def unknown_files(kind: str = "", limit: int = 600) -> dict:
                         "library": r["library"] or "",
                         "label": _row_label(r), "path": str(r["path"] or ""),
                         "why": str(r["why"] or ""),
+                        "rule": str(r["rule"] or ""),
                         "at": float(r["checked_at"] or 0.0)})
     except Exception as e:                                       # noqa: BLE001
         return {"ok": False, "why": f"{type(e).__name__}: {e}"[:160],
@@ -816,6 +1231,7 @@ def missing(limit: int = 200, library: str = "") -> list[dict]:
     # it is the batch just grabbed. The first draft sent 0 and the column
     # drew a dash on every row. Erik: "fix date under ADDED column".
     sql = ("SELECT n.file_id, n.lang, n.library, n.why, n.checked_at, "
+           "       n.rule, n.sure, "
            "       f.path, f.title, f.season, f.episode, f.size, f.pool_disk, "
            "       f.first_seen "
            "  FROM sub_need n JOIN files f ON f.id=n.file_id "
@@ -833,6 +1249,7 @@ def missing(limit: int = 200, library: str = "") -> list[dict]:
         return []
     for r in out:
         r["short"] = short_why(r.get("why") or "")
+        r["rule_line"] = rule_of(r.get("rule") or "").get("line") or ""
     return out
 
 
