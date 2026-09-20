@@ -32288,7 +32288,7 @@ function langBlockHtml(lib, side, sideLabel){
       onclick="event.stopPropagation()">
       <input type="checkbox" ${req.has(c)?'checked':''}
              onchange="langRequire('${esc(lib)}','${c}',this.checked,this)">
-      require</label>`;
+      require for foreign media</label>`;
   const chips=here.map(([c,n])=>`
     <span class="lcell">
       <label class="lchip${chosen.has(c)?' on':''}">
