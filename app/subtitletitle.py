@@ -103,6 +103,14 @@ _SAFE_WORDS = {
     "german", "ger", "deu", "italian", "ita", "portuguese", "por", "korean",
     "kor", "chinese", "chi", "zho", "dutch", "nld", "s", "srt", "ass", "ssa",
     "pgs", "vobsub", "text", "typeset", "typesetting", "karaoke",
+    # nuarr's OWN marker, which it refused to touch as though a stranger had
+    # written it. Older versions appended "(OCR)" to every track they made -
+    # subocr.clean_label exists to strip it - so "Forced (OCR)" was a title
+    # nuarr wrote, could regenerate exactly, and would not correct: three
+    # Animated Movies carrying a whole film's dialogue under a forced flag
+    # sat in the panel reading "left alone: the title carries a name nuarr
+    # did not write".
+    "ocr",
 }
 _TOKENS = re.compile(r"[a-z]+")
 _DUR = re.compile(r"(\d+):(\d+):([\d.]+)")
@@ -178,10 +186,67 @@ def _rewritable(title: str) -> bool:
     return all(w in _SAFE_WORDS for w in words)
 
 
+# WHAT A REAL FORCED TRACK LOOKS LIKE, counted in this library.
+#
+# A forced track exists to translate the moments the audience would otherwise
+# miss - a line of Spanish, a sign, a muffled word - so it is a handful of
+# cues, not a film's worth. Measured here, in Animated Movies alone: the
+# genuine ones carry 1, 6, 9, 65 and 117 cues. The mislabelled ones carry
+# 925, 1,110 and 1,639 - and in each case that is EXACTLY the count of the
+# full track sitting beside it in the same file, because they are the same
+# subtitles written twice. Both were flagged forced and default, so a player
+# opens the file and turns full subtitles on by itself.
+#
+# The comparison is per file rather than per library on purpose: "is this
+# sparse" needs a yardstick, and the other tracks in the same container are
+# the only yardstick that knows how much this particular film says.
+# WITHIN THIS MUCH OF EACH OTHER, BOTH WAYS. The first version asked only
+# that a track carry at least nine tenths of the fullest one's cues - and a
+# signs-and-songs track carries MORE events than the dialogue beside it,
+# because every sign and every karaoke line is an event. So it matched almost
+# every forced anime track in the library and turned a thousand of them into
+# questions. A twin is not "big"; it is the SAME, which is what these are:
+# 925 and 925, 1,110 and 1,110, 1,639 and 1,639.
+FORCED_TWIN_NEAR = 0.05
+
+
+def _forced_twin(cues: int, peers: list, me: int) -> int:
+    """The cue count of the fullest OTHER track, when this one matches it.
+
+    BY POSITION, NOT BY VALUE. The first version dropped the peers whose
+    count differed from this one's - which is every peer except the twin, and
+    then the twin as well, because a twin carries EXACTLY the same number.
+    Cloudy with a Chance of Meatballs has 1,110 and 1,110 and the test found
+    nothing to compare against.
+    """
+    if cues < MIN_CUES:
+        return 0                     # sparse: a forced track, as claimed
+    others = [p for i, p in enumerate(peers) if i != me and p > 0]
+    if not others:
+        return 0
+    top = max(others, key=lambda p: -abs(p - cues))
+    if top < MIN_CUES:
+        return 0
+    if abs(cues - top) <= max(cues, top) * FORCED_TWIN_NEAR:
+        return top
+    return 0
+
+
 def _rows_from_probe(path: str, probe: dict) -> list:
     r"""Subtitle tracks whose title contradicts their cue rate, one row each."""
     out = []
     s_i = 0
+    # Every subtitle track's cue count, so each row can be judged against the
+    # company it keeps rather than against a number picked in advance.
+    peers: list = []
+    for _s in (probe.get("streams") or []):
+        if _s.get("codec_type") != "subtitle":
+            continue
+        try:
+            peers.append(int(_stat(_s.get("tags") or {},
+                                   "NUMBER_OF_FRAMES") or 0))
+        except (TypeError, ValueError):
+            peers.append(0)
     for s in (probe.get("streams") or []):
         if s.get("codec_type") != "subtitle":
             continue
@@ -216,7 +281,25 @@ def _rows_from_probe(path: str, probe: dict) -> list:
         if sparse_claim and full_claim:
             continue
         why = new = ""
-        if sparse_claim and cues >= MIN_CUES and SPEECH_LO <= cpm <= SPEECH_HI:
+        # ONLY WHERE THE COUNT MEANS SOMETHING. NUMBER_OF_FRAMES is not a
+        # cue count for every track: Attack on Titan's ASS tracks report
+        # 18,287 and 30,887 - 800 and 1,700 a minute - and Cells at Work!
+        # reports 57,839, which is 2,444 a minute. Whatever those number, it
+        # is not lines of dialogue. Both tracks in such a file carry equally
+        # meaningless figures within a few per cent of each other, so the
+        # twin test matched 900 of them and turned the panel into a thousand
+        # questions. The branches below have always required a plausible
+        # rate before believing this number; so does this one now.
+        twin = (_forced_twin(cues, peers, s_i - 1)
+                if forced and cpm <= SPEECH_HI else 0)
+        if twin:
+            why = (f"the header flags it forced, but it carries {cues:,} cues "
+                   f"- the same subtitles as the {twin:,}-cue track beside it "
+                   f"in this file. A forced track translates the moments the "
+                   f"audience would otherwise miss; the genuine ones here "
+                   f"carry a few dozen cues, not a whole film's worth")
+            new = name or "English"
+        elif sparse_claim and cues >= MIN_CUES and SPEECH_LO <= cpm <= SPEECH_HI:
             why = (f"says signs only, carries {cues:,} cues over "
                    f"{dur/60:.0f} minutes - {cpm:.0f} a minute, which is the "
                    f"cadence of people talking")
@@ -242,7 +325,7 @@ def _rows_from_probe(path: str, probe: dict) -> list:
         else:
             # The opposite finding: the further below 3 a minute, the surer.
             sure = 100.0 - (cpm / 3.0) * 40.0
-        out.append({"track": s_i, "forced": forced,
+        out.append({"track": s_i, "forced": forced, "twin": twin,
                     # mkvextract numbers tracks the way mkvmerge does, which
                     # for Matroska is ffprobe's stream index - not the s1/s2
                     # ordinal mkvpropedit wants. Both are carried because both
@@ -1199,7 +1282,7 @@ SIGNS_MAX = 2.0
 SIGN_POINTS = {"pos_high": 40, "pos_some": 25, "title": 30, "forced": 20,
                "styles": 10, "rate_low": 30, "clustered": 40}
 DIALOGUE_POINTS = {"rate_high": -40, "live": -20, "pos_none": -20,
-                   "unique": -30, "spread": -40}
+                   "unique": -30, "spread": -40, "twin": -45}
 # WHERE THE LINES SIT, which is the sharpest of the lot. Measured on tracks
 # whose kind was already known (see _coverage): sign sheets touched 3 of 10
 # slices of the runtime with an 18.8-minute silence in the middle, and full
@@ -1323,6 +1406,15 @@ def sign_evidence(sh: dict, rate: float, ctx: dict) -> tuple:
     # episode and in none of its siblings were written for this episode,
     # which is what dialogue is. Only says anything where there were
     # siblings to check against.
+    # THE TRACK BESIDE IT IN THE SAME FILE. A forced track carries the few
+    # moments that need translating; one carrying the same cue count as the
+    # full track next to it is that full track, copied and flagged.
+    twin = int(ctx.get("twin") or 0)
+    if twin:
+        pts += DIALOGUE_POINTS["twin"]
+        why.append(f"it carries the same {twin:,} cues as the full track "
+                   f"beside it in this file - the same subtitles twice, one "
+                   f"of them flagged forced")
     sibs = int(ctx.get("siblings") or 0)
     if sibs >= 2 and not int(sh.get("repeats") or 0) and rate >= SPEECH_LO \
             and not clustered:
@@ -1617,6 +1709,7 @@ def scan(limit: int = 0) -> dict:
                      "forced": bool(r.get("forced")),
                      "family": _family(r.get("library") or ""),
                      "siblings": siblings_of(r.get("path") or ""),
+                     "twin": int(r.get("twin") or 0),
                      # Every row here is a contradiction - it is why the row
                      # exists - but say so explicitly rather than leaving the
                      # scorer to infer it from where it was called.

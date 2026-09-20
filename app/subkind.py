@@ -335,6 +335,118 @@ def _safe(fn):
         return {}
 
 
+def scoring() -> dict:
+    r"""Every signal the two readers score with, what it is worth, and the
+    measurement behind it.
+
+    WHY THIS IS BUILT HERE AND NOT WRITTEN INTO THE PAGE. The numbers move -
+    the weights came from counting this library and will be re-counted - and
+    a table typed into the HTML would start drifting from the scorer the day
+    after it was written. These are read from the modules that use them, so
+    the page cannot say anything the code does not do.
+    """
+    from . import hardsub as hs, subtitletitle as stt
+    sp, dp = stt.SIGN_POINTS, stt.DIALOGUE_POINTS
+
+    def _row(pts, what, measured):
+        return {"points": pts, "what": what, "measured": measured}
+
+    track = [
+        _row(dp["spread"], "its lines run through most of the runtime",
+             f"{stt.SPREAD_AT} of {stt.COVER_SLICES} slices or more with no "
+             f"gap past {stt.SPREAD_GAP_S/60:.0f} min. Dialogue tracks "
+             f"measured 10 of 10 and a 1.1 min gap; sign sheets 3 of 10 and "
+             f"18.8 min"),
+        _row(sp["clustered"], "its lines sit in one block",
+             f"{stt.CLUSTERED_AT} slices or fewer and silent for "
+             f"{stt.CLUSTERED_GAP_S/60:.0f} min at a stretch - an opening, an "
+             f"ending and a few signs"),
+        _row(dp["twin"], "it is the same track as the one beside it",
+             "a forced flag over the same cue count as the full track in the "
+             "same file. The genuine forced tracks here carry 1 to 117 cues; "
+             "the mislabelled ones carried 925, 1,110 and 1,639"),
+        _row(sp["pos_high"], "most of it is placed on screen",
+             "60% or more of its events carry \\pos or \\move. Of the tracks "
+             "a person had to answer, positioning was right 124 times out of "
+             "139; above 80% it was signs 56 times out of 56"),
+        _row(sp["pos_some"], "some of it is placed on screen",
+             "20% or more of its events"),
+        _row(dp["pos_none"], "none of it is placed on screen",
+             "nothing positioned at all, so nothing in it is a sign"),
+        _row(sp["title"], "the title says signs",
+             "sign, op, ed, karaoke, title, credit and the rest, as whole "
+             "words. Right 120 times out of 139 - but silenced on this panel, "
+             "where the title is the claim being tested"),
+        _row(sp["forced"], "the header flags it forced",
+             "right 120 times out of 139. It means different things by "
+             "family: 8,287 forced ASS tracks in anime are signs and songs, "
+             "781 forced SRT in live action are foreign dialogue"),
+        _row(sp["styles"], "its styles are named for signs or themes", ""),
+        _row(sp["rate_low"], "two plain dialogue lines a minute or fewer",
+             f"the line under which a signs title is telling the truth "
+             f"({stt.SIGNS_MAX:g}/min)"),
+        _row(dp["rate_high"], "it runs at the cadence of people talking",
+             f"{stt.SPEECH_LO:g} to {stt.SPEECH_HI:g} lines a minute, both "
+             f"ends measured. Overruled when the lines are clustered: fifteen "
+             f"a minute and twenty-one minutes of silence cannot both be "
+             f"speech"),
+        _row(dp["unique"], "no sibling episode carries these lines",
+             "written for this episode, which a karaoke script never is"),
+        _row(dp["live"], "live action",
+             "10% of live-action tracks read are sign sheets, against 84% of "
+             "anime"),
+    ]
+    picture = [
+        _row(60, "how much of the read looks like language",
+             "the shape test, scaled - no dictionary, because the right "
+             "reading of an anime frame is full of names no word list has"),
+        _row(25, "function words were read",
+             "the/and/you is what speech is made of and a sign never is. "
+             "Present in 98% of the files that really carry words and 11% of "
+             "those that do not"),
+        _row(15, "how much of the running time carried text low in the frame",
+             "a subtitle track is relentless; a title card is not"),
+        _row(-65, "it reads like a credit roll",
+             "a third of the words or more are roll words - not one word, "
+             "which nearly threw away a Velvet episode over 'assistant'"),
+        _row(-65, "nothing read is longer than four letters",
+             "what the OCR returns for texture. Files that really carry words "
+             "have a five-letter word 43% of the time; those called none, "
+             "never"),
+    ]
+    priors = [{"what": k, "rate": v[0], "said": v[1]}
+              for k, v in hs.BASE_RATE.items()]
+    return {
+        "track": {"rows": track, "signs_at": stt.SIGNS_AT,
+                  "dialogue_at": -30,
+                  "how": "Every signal votes and the points are added. Past "
+                         f"{stt.SIGNS_AT} it is a sign sheet, past -30 it is "
+                         "dialogue, and the further past, the higher the "
+                         "percentage. Between the two the older rate rule "
+                         "decides, which is what it was doing alone before "
+                         "any of this."},
+        "picture": {"rows": picture, "mark_at": hs.mark_at(),
+                    "dismiss_at": hs.dismiss_at(),
+                    "how": "The first three are added, the last two multiply "
+                           "what is left, and then the file's own odds below "
+                           "scale it. Past the act line nuarr marks the file "
+                           "itself; under the throw-away line it drops the "
+                           "finding; between them it asks."},
+        "priors": priors,
+        "prior_how": ("How often this kind of file carries burned-in words at "
+                      "all, counted over 3,941 pictures sampled here. The "
+                      "multiplier is that rate over the library's own "
+                      f"({hs.BASE_RATE_ALL*100:.0f}%), held between "
+                      f"{hs.PRIOR_FLOOR:g} and {hs.PRIOR_CEIL:g} so a rare "
+                      "kind cannot veto a clear reading."),
+        "language": ("Outside anime the question is not what shelf the file "
+                     "sits on but whether anyone in it speaks a language the "
+                     "audience has no track for. English audio only: 21 of "
+                     "2,160 carried burned-in words. A non-English track: 51 "
+                     "of 66."),
+    }
+
+
 def findings(limit: int = 600, want_done: bool = True,
              want_unread: bool = True) -> dict:
     r"""Everything, least certain first, with the counts the header needs.

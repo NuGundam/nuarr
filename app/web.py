@@ -8203,6 +8203,13 @@ async def api_subkind_dismiss_batch(ids: str = ""):
     return out
 
 
+@app.get("/api/subkind/scoring")
+def api_subkind_scoring():
+    """Every signal the readers score with, read from the code that uses it."""
+    from . import subkind
+    return subkind.scoring()
+
+
 @app.post("/api/subkind/run")
 async def api_subkind_run():
     """Read some now - as jobs. This used to run both readers in-process
@@ -37633,6 +37640,69 @@ function alpPaint(){
 // when rewritable meant "found wrong"; with nothing actionable until it has
 // been read, that filter left the panel saying "nothing here" over 124 rows
 // waiting for exactly the read the panel offers.
+// ---- HOW A ROW GETS ITS PERCENTAGE ---------------------------------------
+//
+// The two readers score with a dozen signals between them and the only place
+// that said so was the source. A percentage nobody can trace is a percentage
+// nobody can argue with, which is the wrong way round when the whole point of
+// the panel is that you overrule it. Read from the modules that do the
+// scoring - see subkind.scoring() - so the table cannot drift from the code.
+let _scoreOpen=false, _scoreData=null;
+async function scoreToggle(){
+  _scoreOpen = !_scoreOpen;
+  if(_scoreOpen && !_scoreData){
+    try{ _scoreData = await (await fetch('/api/subkind/scoring')).json(); }
+    catch(e){ _scoreData = {err:String(e)}; }
+  }
+  // The board is drawn behind a key guard, so it has to be told the markup
+  // changed - same as subsDetail does when it opens a panel.
+  try{ _subsKey=''; subsPaint(); }catch(e){}
+}
+function scoreRows(rows){
+  return (rows||[]).map(r=>{
+    const p = Number(r.points)||0;
+    const col = p>0 ? '#e8a33d' : (p<0 ? '#7fd18c' : 'var(--dim,#8a97a6)');
+    return `<tr style="border-top:1px solid var(--line)">
+      <td style="padding:3px 8px 3px 0;text-align:right;white-space:nowrap;
+                 color:${col};font-weight:600">${p>0?'+':''}${p}</td>
+      <td style="padding:3px 8px 3px 0">${esc(r.what||'')}
+        ${r.measured?`<div class="dim" style="font-size:10.5px">${esc(r.measured)}</div>`:''}
+      </td></tr>`;
+  }).join('');
+}
+function scoreTable(){
+  const d=_scoreData;
+  if(!d) return `<div class="dim" style="font-size:11.5px;padding:8px 0">reading the scorer…</div>`;
+  if(d.err) return `<div class="dim" style="font-size:11.5px;padding:8px 0">could not read it: ${esc(d.err)}</div>`;
+  const t=d.track||{}, p=d.picture||{};
+  const sec=(title, how, rows, foot)=>`
+    <div style="margin-top:9px">
+      <b style="font-size:11.5px">${esc(title)}</b>
+      <div class="dim" style="font-size:11px;margin:2px 0 4px">${esc(how||'')}</div>
+      <table style="width:100%;border-collapse:collapse;font-size:11.5px">
+        <tbody>${rows}</tbody></table>
+      ${foot?`<div class="dim" style="font-size:10.5px;margin-top:3px">${foot}</div>`:''}
+    </div>`;
+  const priors = (d.priors||[]).map(x=>
+     `<tr style="border-top:1px solid var(--line)">
+        <td style="padding:3px 8px 3px 0;text-align:right;white-space:nowrap;
+                   font-weight:600">${(x.rate*100).toFixed(x.rate<0.05?1:0)}%</td>
+        <td style="padding:3px 8px 3px 0">${esc(x.said||x.what||'')}</td></tr>`).join('');
+  return `<div style="margin:8px 0 2px;padding:9px 11px;border:1px solid var(--line);
+       border-radius:7px;background:rgba(255,255,255,.02)">
+    <div style="font-size:11.5px"><b>How a reading becomes a percentage</b></div>
+    <div class="dim" style="font-size:11px;margin-top:2px">Every figure below
+      was counted over this library, not chosen. Points in
+      <span style="color:#e8a33d">amber</span> argue for signs, points in
+      <span style="color:#7fd18c">green</span> for dialogue.</div>
+    ${sec('A subtitle track', t.how, scoreRows(t.rows),
+          `past ${t.signs_at} points it is a sign sheet, past ${t.dialogue_at} it is dialogue`)}
+    ${sec('Words painted into the picture', p.how, scoreRows(p.rows),
+          `at or above ${p.mark_at}% nuarr acts on its own, at or below ${p.dismiss_at}% it drops the finding`)}
+    ${sec('And the odds before anything is read', d.prior_how, priors,
+          esc(d.language||''))}
+  </div>`;
+}
 // ---- what subtitles does each file actually carry? -----------------------
 // ONE LIST FROM TWO READERS. The frame sampler (files that report no track)
 // and the track reader (tracks whose title looks wrong) used to be two panels
@@ -41293,7 +41363,11 @@ function subsBoardHtml(){
               : 'the full panel for this one - the lists, the buttons and the pickers'}">${
             (subsOpen(b.key)?'▾ hide ':'▸ show ')
             + esc(b.detail_name || 'the detail')}</a>`:''}
+          ${b.key==='picture'?`<a href="#" onclick="scoreToggle();return false"
+            title="Every signal the two readers score with, what each is worth, and the count behind it">${
+            _scoreOpen?'▾ hide how it scores':'▸ how it scores'}</a>`:''}
         </div>
+        ${b.key==='picture'&&_scoreOpen?scoreTable():''}
         ${(b.panel&&subsOpen(b.key))
           ? `<div id="subsSlot-${b.key}" style="margin:7px -11px -9px"></div>` : ''}
       </div>`;
