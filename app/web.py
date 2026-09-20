@@ -10231,6 +10231,9 @@ async def api_subneed(limit: int = 200, library: str = ""):
     d = subneed.snapshot()
     d["missing_list"] = subneed.missing(limit, library)
     d["unknown_sample"] = subneed.unknown_sample(12)
+    # The rule asks for a subtitle these have not got and the audio is in
+    # the language, so they are listed and nothing offers to delete them.
+    d["want_list"] = subneed.wanting(400, library)
     try:
         from . import remedy
         d["budget"] = remedy.budget()
@@ -38765,6 +38768,52 @@ function snScoreTable(){
     </div>
   </div>`;
 }
+// THE QUIET LIST. Files whose library asked for a subtitle they have not
+// got, and whose audio is already in that language - so the rule is
+// unsatisfied and the viewer is unaffected. Erik: "if the rule say it wants
+// subs then follow the rule but it shouldn't delete the file". Following the
+// rule means saying so; not deleting means this list has no button.
+let _snWant=false;
+function snWantShow(){ _snWant=!_snWant; _snKey=''; snPaint(true); }
+function snWantBox(){
+  if(!_snWant) return '';
+  const rows=((_sn||{}).want_list)||[];
+  if(!rows.length) return `<div class="dim" style="padding:8px 14px;
+     font-size:11.5px">nothing here.</div>`;
+  const by=new Map();
+  for(const r of rows){
+    // THE SHOW FOLDER, NOT THE SEASON FOLDER. Taking the parent directory
+    // grouped every television file under "Season 01", which is the same
+    // name in every show on the shelf - 166 files under one heading that
+    // belonged to a dozen series. P:\Anime Shows\<show>\Season 01\file is
+    // the shape, so the show is the third part, exactly as subneed._show_of
+    // reads it on the server.
+    const _p=(r.path||'').split(/[\\/]/).filter(Boolean);
+    const show=(_p.length>2?_p[2]:(_p[_p.length-1]||''))||r.library||'?';
+    if(!by.has(show)) by.set(show,{show, n:0, why:r.why||'', lib:r.library||''});
+    by.get(show).n++;
+  }
+  const shows=[...by.values()].sort((a,b)=>b.n-a.n).map(g=>
+    `<tr style="border-top:1px solid var(--line)">
+      <td style="padding:3px 8px 3px 0;text-align:right;white-space:nowrap;
+                 font-weight:700;width:52px">${fmt(g.n)}</td>
+      <td style="padding:3px 8px 3px 0">${esc(g.show)}
+        <span class="dim" style="font-size:10.5px">· ${esc(g.lib)}</span>
+        <div class="dim" style="font-size:10.5px">${esc(g.why)}</div></td>
+    </tr>`).join('');
+  return `<div style="margin:6px 14px 2px;padding:9px 11px;border:1px solid
+       var(--line);border-radius:7px;background:rgba(255,255,255,.02)">
+    <div style="font-size:11.5px"><b>${fmt(rows.length)}</b>
+      <b>the rule wants, and you can follow anyway</b>
+      <span class="dim">— ${by.size} show${by.size===1?'':'s'}. Their audio is
+        already in the language the rule asks a subtitle for, so nothing here
+        is untranslatable and no button touches them.</span>
+      <a href="#" onclick="snWantShow();return false" style="margin-left:10px">hide</a></div>
+    <div class="rowbox scrollbox nohz" style="max-height:300px;margin-top:5px">
+      <table style="width:100%;font-size:11.5px;border-collapse:collapse">
+        <tbody>${shows}</tbody></table></div>
+  </div>`;
+}
 let _snUnk='', _snUnkData=null, _snUnkBusy=false;
 // Which shows are opened out into their episodes. A set rather than one
 // name: opening Detective Conan to see its eighty and then opening another
@@ -38845,6 +38894,7 @@ function snPaint(force){
   const el=document.getElementById('snPanel'); if(!el||!_sn) return;
   const d=_sn, c=d.counts||{}, rows=snRows();
   const miss=c.missing||0, unk=c.unknown||0, ok=c.ok||0;
+  const wnt=c.want||0;
   const auto=(d.mode==='auto'), running=!!d.running;
   const req=Object.entries(d.required||{})
     .map(([lib,ls])=>`${esc(lib)} <b>${ls.map(esc).join(', ')}</b>`).join(' · ');
@@ -38861,6 +38911,10 @@ function snPaint(force){
     <span class="dim" style="font-size:11.5px">
       ${req?`<span>${req}</span> · `:''}
       <span title="carry what their library requires">${num(ok,'done')} carry it</span>
+      ${wnt?` · <a href="#" onclick="snWantShow();return false"
+          title="The rule asks these libraries for a subtitle these files have not got - and their audio is already in that language, so there is nothing in them a viewer cannot follow. They are listed because the rule asked; no button touches them, and nothing is ever deleted over one. Click to see which."
+          style="color:${_snWant?'#e8a33d':'inherit'};text-decoration:none;
+          border-bottom:1px dotted currentColor">${num(wnt,'auto')} you can follow anyway${_snWant?' ▾':''}</a>`:''}
       ${unk?` · ${snUnknownWords(c)}`:''}
       · <a href="#" onclick="snScoreToggle();return false"
           title="Every rung of the ladder this check runs down, how sure that rung is, how many files rest on it, and how many of its answers it has since had to take back."
@@ -39047,7 +39101,7 @@ function snPaint(force){
       _snDone?'hide':'also show'} the ${fmt(nDone)} answered</a>`:''}
   </div>${doneList}`;
 
-  const html=`<div class="subsp" id="subsPanelNeed">${head}${snScoreTable()}${snUnkBox()}${prog}${table}${foot}</div>`;
+  const html=`<div class="subsp" id="subsPanelNeed">${head}${snScoreTable()}${snWantBox()}${snUnkBox()}${prog}${table}${foot}</div>`;
 
   // WHAT COUNTS AS CHANGED IS THE ROWS, not the markup.
   //

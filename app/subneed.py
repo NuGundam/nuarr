@@ -100,6 +100,24 @@ from .db import cursor
 # the file. See the module docstring.
 OK, MISSING, UNKNOWN = "ok", "missing", "unknown"
 
+# AND A FOURTH, BECAUSE "MISSING" WAS DOING TWO JOBS.
+#
+# Erik: "if the rule say it wants subs then follow the rule but it shouldn't
+# delete the file, it should replace the file if there is no way for the user
+# to understand".
+#
+# Those are two different findings and the check had one word for both. A
+# Japanese film with no English subtitle cannot be followed at all: that is
+# worth deleting a release over. An episode of The Big Bang Theory with no
+# English subtitle track is spoken in English - the rule asks for the
+# subtitle and the viewer can follow the programme without it, and replacing
+# the file over that is a loud answer to a quiet question.
+#
+# `want` is the quiet one. It is listed, it is counted, and no button acts on
+# it: findings() hands only `missing` to the shared remedy. Measured when
+# this went in: 2,819 files, nearly all of them English-audio television.
+WANT = "want"
+
 KIND = "subs/missing-language"
 
 # THE SAME LINE hardsub.py DRAWS FOR "A DIALOGUE CADENCE", and deliberately
@@ -108,6 +126,15 @@ KIND = "subs/missing-language"
 # hardsub counts frames with something bright LOW in the picture - where
 # subtitles live - and calls 20% of them a dialogue rhythm.
 PICTURE_MARKS_RATIO = 0.20
+
+# THE SPEECH BAND, AND DELIBERATELY THE SAME NUMBERS subtitletitle MEASURED.
+# A track running between these is people talking; below it is a sign sheet.
+# Imported lazily so a circular import cannot take the module down, with the
+# measured values as the fallback.
+try:                                                     # pragma: no cover
+    from .subtitletitle import SPEECH_LO, SPEECH_HI
+except Exception:                                        # noqa: BLE001
+    SPEECH_LO, SPEECH_HI = 6.0, 40.0
 
 # THE COMMONEST ENGLISH FUNCTION WORDS, and this is a test for ENGLISH rather
 # than a test for text.
@@ -230,12 +257,10 @@ RULES: dict = {
                  "which had to clear its act line to be recorded. How that "
                  "score is built, and how often it has agreed with you, is "
                  "the panel above this one."},
-    "audio": {
-        "says": OK, "sure": 99, "short": "audio already in the language",
-        "line": "the audio is already in the language",
-        "rests": "the probe's own stream tags. Nobody needs an English "
-                 "subtitle for a film that is spoken in English - it is a "
-                 "convenience, not a gap."},
+    # `audio` was here, clearing any file whose audio carried the language.
+    # It became `spoken` and moved to the bottom of the ladder, where it
+    # decides how much a missing subtitle matters instead of deciding there
+    # is not one. See WANT.
     "ocr_trans": {
         "says": OK, "sure": 88, "short": "OCRed off the screen",
         "line": "English was read off the picture and the audio is not "
@@ -281,17 +306,78 @@ RULES: dict = {
                  "release over - measured when this went in, all 34 files on "
                  "the list rested on an older reader and none on the "
                  "current one."},
+    "marker": {
+        "says": OK, "sure": 97, "short": "nuarr's own marker",
+        "line": "it carries the blank marker track nuarr writes",
+        "rests": "\"English (burned into the picture)\" is not a subtitle "
+                 "track, it is nuarr's own note that the dialogue is painted "
+                 "into the frames - class 'marker' in the probe. Reading it "
+                 "as a signs track would have put 809 files on a delete "
+                 "list, every one of them already answered by nuarr itself."},
+    "mislabelled": {
+        "says": OK, "sure": 80, "short": "forced, but really dialogue",
+        "line": "its only track claims to be forced and runs at the cadence "
+                "of speech",
+        "rests": "a forced flag over a full film's worth of lines is a full "
+                 "track wearing the wrong flag, not a sign sheet - Aura Koga "
+                 "Maryuin's Last War carries 1,691 cues over 83 minutes, "
+                 "20.4 a minute, under a forced English track. The title "
+                 "check corrects the label; this only declines to delete the "
+                 "file over it."},
+    "signs_unread": {
+        "says": UNKNOWN, "short": "claims signs, unread",
+        "line": "its only track in the language claims to be signs, and the "
+                "container does not say how many lines it has",
+        "rests": "a forced or signs-titled track is usually signs and "
+                 "sometimes a full track wearing the wrong flag, and the cue "
+                 "count is what tells them apart. Where the container reports "
+                 "none the probe cannot say, so the question is left open and "
+                 "the track is read rather than guessed at. Erik: hold and "
+                 "read them."},
+    "signs_only": {
+        "says": MISSING, "sure": 88, "short": "signs, not dialogue",
+        "line": "the only track in the language is signs and songs",
+        "rests": "signs and songs is not dialogue - it translates a shop "
+                 "front and leaves the conversation untranslated. Reached "
+                 "only when the cue rate positively says so: My Home Hero "
+                 "S01E02 carries 22 cues over 24 minutes, The Castle of "
+                 "Cagliostro 12 over 99."},
+    "spoken": {
+        "says": WANT, "sure": 95, "short": "you can follow it anyway",
+        "line": "the rule asks for a subtitle this file has not got, but the "
+                "audio is in the language",
+        "rests": "heard by Whisper where it has listened, tagged where it "
+                 "has not, and the metadata's original language last of all. "
+                 "Whisper outranks the metadata on purpose: they disagree "
+                 "about 14,738 files here and 14,196 of those are the same "
+                 "shape - the metadata says Japanese and the audio is an "
+                 "English dub."},
     "missing": {
         "says": MISSING, "sure": 90, "short": "nothing anywhere",
         "line": "nothing tagged, nothing beside it and nothing in the "
                 "picture",
-        "rests": "every rung above had its say first, including the two that "
-                 "clear a file outright and the five that only say the "
-                 "question is open. This is the only rung that accuses, and "
-                 "the only one a button acts on."},
+        "rests": "every rung above had its say first, and nothing anywhere "
+                 "carries the language: no dialogue track, no file beside it, "
+                 "nothing in the picture, and the audio is in some other "
+                 "language. There is no way to follow this file."},
 }
 
-RULE_ORDER = tuple(RULES)
+# THE ORDER THE LADDER IS ACTUALLY TRIED IN, written out rather than taken
+# from the dict. The panel reads this to draw the rungs in the order they
+# answer, and after the rewrite the dict's own order was the order the
+# entries happened to be typed in - which put "the audio is in the language"
+# above "it has no subtitle", the opposite of what the code does.
+RULE_ORDER = (
+    "unread", "noread",                       # nobody has looked
+    "track", "side", "marker", "mislabelled",  # a subtitle, and a real one
+    "untagged",                                # might be the one
+    "nopic", "burned", "ocr_trans", "ocr_one",  # what the picture says
+    "marks", "noframes", "stale",
+    "signs_unread",                            # signs, or not? unread
+    "spoken",                                  # you can follow it anyway
+    "signs_only", "missing",                   # the two that accuse
+)
+assert set(RULE_ORDER) == set(RULES), "a rung is defined but never tried"
 
 
 def rule_of(rule: str) -> dict:
@@ -315,7 +401,8 @@ POLL_S = 900.0
 BATCH = 5000
 
 STATE: dict = {"running": False, "at": 0.0, "took": 0.0, "checked": 0,
-               "ok": 0, "missing": 0, "unknown": 0, "err": "", "runs": 0,
+               "ok": 0, "missing": 0, "unknown": 0, "want": 0,
+               "err": "", "runs": 0,
                # A RUN YOU ASKED FOR, measured: how much of the library it
                # has judged so far and how much is left, for the bar.
                "done": 0, "total": 0, "t0": 0.0}
@@ -431,6 +518,74 @@ def _keeps_untagged(lib: str) -> bool:
 
 
 # ----------------------------------------------------------- the verdict ----
+# WHAT THE METADATA CALLS THE ORIGINAL LANGUAGE, in the three-letter code
+# the rest of nuarr speaks. The arrs store a name, not a code.
+#
+# IT IS THE LAST WORD AND NOT THE FIRST. It describes the SHOW, not this
+# file: every dubbed anime here is "Japanese" by that measure, and 14,196 of
+# them are English dubs. So it is consulted only where nothing has been
+# listened to and nothing is tagged - which is 536 files, and for those it is
+# better than nothing.
+_ORIG3 = {
+    "japanese": "jpn", "english": "eng", "chinese": "chi", "korean": "kor",
+    "spanish": "spa", "french": "fre", "german": "ger", "italian": "ita",
+    "portuguese": "por", "russian": "rus", "dutch": "dut", "swedish": "swe",
+    "norwegian": "nor", "danish": "dan", "finnish": "fin", "polish": "pol",
+    "turkish": "tur", "arabic": "ara", "hindi": "hin", "thai": "tha",
+    "vietnamese": "vie", "indonesian": "ind", "hebrew": "heb", "czech": "cze",
+    "hungarian": "hun", "greek": "gre", "ukrainian": "ukr", "romanian": "ron",
+    "catalan": "cat", "tagalog": "tgl", "cantonese": "chi", "mandarin": "chi",
+}
+
+
+def orig_code(name: str) -> str:
+    return _ORIG3.get(str(name or "").strip().lower(), "")
+
+
+# ---- IS THIS TRACK ACTUALLY DIALOGUE ---------------------------------------
+#
+# Erik: "it can't just be S+S it has to be full dialogue if people are
+# speaking". The check asked only whether a track carried the right language
+# tag, and a signs-and-songs sheet carries it exactly as a full script does -
+# so a Japanese film whose only English track translates the shop fronts
+# counted as having English subtitles.
+#
+# The probe already knows. sub_facts stores a `class` per track, written by
+# the subtitle scan: 33,463 full, 12,847 sdh, 9,828 forced, 845 marker across
+# this library. No track has to be read for this.
+_DIALOGUE_CLASS = {"full", "sdh", "cc", "dialogue"}
+_SIGN_WORDS = ("sign", "song", "karaoke", "op/ed", "typeset", "credit")
+
+
+def _is_signy(t: dict) -> bool:
+    """Does this track SAY it is signs, by its title or its forced flag?"""
+    ti = str(t.get("title") or "").lower()
+    return any(w in ti for w in _SIGN_WORDS) or bool(t.get("forced"))
+
+
+def _is_dialogue(t: dict) -> bool:
+    """A full script, by the container's own account of it."""
+    return (not _is_signy(t)
+            and str(t.get("class") or "") in _DIALOGUE_CLASS)
+
+
+def _speech_rate(t: dict, minutes: float) -> float:
+    """Lines a minute, or 0 when the container does not say.
+
+    -1 is what sub_facts stores for "no count reported", and it is common:
+    12 of the 16 files that first reached the signs rung had it. Zero is
+    returned for that rather than a number, because a rate nobody measured
+    must not be compared against a threshold.
+    """
+    try:
+        cues = int(t.get("cues") or t.get("events") or -1)
+    except (TypeError, ValueError):
+        cues = -1
+    if cues <= 0 or minutes <= 0:
+        return 0.0
+    return cues / minutes
+
+
 def _audio_langs(file_id: int, cur) -> set[str]:
     r"""What languages the audio is in - heard where possible, tagged where not.
 
@@ -488,7 +643,8 @@ def _picture(file_id: int, cur, pic=None):
 
 
 def verdict(file_id: int, lang: str, cur, facts=None,
-            untagged_ok: bool = True, pic=None) -> tuple[str, str, str]:
+            untagged_ok: bool = True, pic=None,
+            minutes: float = 0.0) -> tuple[str, str, str]:
     """Does this file carry `lang` subtitles? Returns (state, why, rule).
 
     `rule` names the rung that answered, so the row can say how sure that
@@ -499,6 +655,16 @@ def verdict(file_id: int, lang: str, cur, facts=None,
     files does one query per file instead of two.
     """
     lang = (lang or "").lower()[:3]
+    # A CUE COUNT MEANS NOTHING WITHOUT A RUNTIME. Fetched here when the
+    # caller did not have it, which is the single-file path; the sweep
+    # already has it on the row it selected.
+    if not minutes:
+        try:
+            _r = cur.execute("SELECT duration FROM files WHERE id=?",
+                             (int(file_id),)).fetchone()
+            minutes = float((_r["duration"] if _r else 0) or 0) / 60.0
+        except Exception:                                        # noqa: BLE001
+            minutes = 0.0
     if facts is None:
         facts = cur.execute("SELECT * FROM sub_facts WHERE file_id=?",
                             (int(file_id),)).fetchone()
@@ -524,12 +690,35 @@ def verdict(file_id: int, lang: str, cur, facts=None,
     except Exception:                                            # noqa: BLE001
         sides = []
 
-    for t in tracks:
-        if str(t.get("lang") or "").lower()[:3] == lang:
-            return OK, f"carries a {lang} subtitle track", "track"
+    # ---- IS THERE A SUBTITLE, AND IS IT DIALOGUE ---------------------------
+    #
+    # This asked only whether a track carried the right language tag. Erik:
+    # "it can't just be S+S it has to be full dialogue if people are
+    # speaking". A signs-and-songs sheet carries the tag exactly as a full
+    # script does, so a Japanese film whose only English track translates the
+    # shop fronts counted as subtitled and nobody ever looked again.
+    mine = [t for t in tracks
+            if str(t.get("lang") or "").lower()[:3] == lang]
+    for t in mine:
+        if _is_dialogue(t):
+            return OK, f"carries a full {lang} dialogue track", "track"
     for s in sides:
         if str(s.get("lang") or "").lower()[:3] == lang:
             return OK, f"has a {lang} subtitle file beside it", "side"
+    # NUARR'S OWN NOTE TO ITSELF. See the marker rung.
+    for t in mine:
+        if str(t.get("class") or "") == "marker":
+            return OK, ("carries nuarr's marker track - the dialogue is "
+                        "burned into the picture"), "marker"
+    # A FORCED FLAG OVER A FULL FILM'S WORTH OF LINES. See the twin rule in
+    # subtitletitle: the genuine forced tracks here carry a few dozen cues,
+    # the mislabelled ones carry a whole script.
+    for t in mine:
+        rate = _speech_rate(t, minutes)
+        if SPEECH_LO <= rate <= SPEECH_HI:
+            return OK, (f"its {lang} track is flagged forced but carries "
+                        f"{rate:.0f} lines a minute, which is dialogue "
+                        f"wearing the wrong flag"), "mislabelled"
 
     # AN UNLABELLED TRACK MIGHT BE THE ONE. The library keeps untagged tracks
     # precisely because releases leave subtitles unlabelled; reading one to
@@ -569,81 +758,101 @@ def verdict(file_id: int, lang: str, cur, facts=None,
     # So `none` is only evidence of a clean picture when the FRAME COUNTS
     # agree. Above the line, the picture question is unresolved and the file
     # goes to `unknown` with the rest of what nuarr does not know.
+    # ---- WHAT THE PICTURE CAN SAY, IN TWO HALVES --------------------------
+    #
+    # The picture reader answers two different kinds of question and they
+    # belong on opposite sides of the quiet answer below. It can CLEAR a
+    # file - the dialogue is burned in, or it OCRed English off the screen -
+    # and that is a subtitle, so it is asked first. It can also refuse to
+    # rule anything out, and those refusals exist to stop a FALSE
+    # ACCUSATION. A file nobody is going to accuse does not need them.
+    #
+    # Ordering them together cost 2,002 files: with every shield above the
+    # quiet answer, an English-language episode with no subtitle track fell
+    # into "the picture reader saw marks it could not read" and sat at
+    # undecided for ever, when the true answer was "the audio is English,
+    # you can follow it".
     prow = _picture(file_id, cur, pic)
+    hits: list = []
+    words = ""
+    pstate = ""
+    if prow is not None:
+        pstate = str((prow["chosen"] if "chosen" in prow.keys() else None)
+                     or prow["state"] or "")
+        # `signs` is deliberately not on this list. Signs and songs are not
+        # dialogue, and a file carrying only those still needs subtitles.
+        if pstate in ("dialogue", "hybrid"):
+            return OK, "the dialogue is burned into the picture", "burned"
+        try:
+            if "words" in prow.keys():
+                words = str(prow["words"] or "").strip()
+        except Exception:                                    # noqa: BLE001
+            words = ""
+        hits = _english_hits(words) if _is_english(lang) else []
+
+    got = [w for w in (x.strip() for x in words.split(",")) if w]
+    shown = ", ".join(got[:8]) + ("..." if len(got) > 8 else "")
+
+    # HEARD ONE LANGUAGE, SAW ANOTHER - a translation subtitle.
+    #
+    # Velvet, The New Empire is the case: Spanish audio, and the picture
+    # reader returning "are, barbara, doing, here, what, you". Both readings
+    # were already stored; this only compares them. Measured over the 23
+    # accused files that had any words at all, the thirteen real ones scored
+    # 1,2,2,2,2,2,2,3,4,4,4,6 and the ten noise ones scored zero: a shop sign
+    # does not produce English function words and a chyron does not produce
+    # several.
+    spoken = _audio_langs(file_id, cur)
+    if not spoken:
+        # NOTHING HEARD AND NOTHING TAGGED - 536 files here. The metadata's
+        # original language describes the SHOW rather than this file, which
+        # is why it is asked last, and last is better than nothing.
+        try:
+            _r = cur.execute("SELECT orig_lang FROM files WHERE id=?",
+                             (int(file_id),)).fetchone()
+            _oc = orig_code(_r["orig_lang"] if _r else "")
+        except Exception:                                    # noqa: BLE001
+            _oc = ""
+        if _oc:
+            spoken = {_oc}
+    heard_it = lang in spoken
+    said = "/".join(sorted(x for x in spoken
+                           if x and x not in ("und", "un"))) or "not " + lang
+
+    if len(hits) >= 2 and not heard_it:
+        return OK, (f"the audio is {said} and the picture reader OCRed "
+                    f"English off the screen - {shown} - so the English is "
+                    f"burned in as a translation subtitle"), "ocr_trans"
+
+    # ---- CAN ANYBODY FOLLOW THIS FILE WITHOUT A SUBTITLE? -----------------
+    #
+    # Erik: "if the rule say it wants subs then follow the rule but it
+    # shouldn't delete the file, it should replace the file if there is no
+    # way for the user to understand". Everything above has established that
+    # there is no dialogue subtitle here. This decides how much that matters,
+    # and it sits ABOVE every shield because a shield only protects against
+    # an accusation and nothing below this line can accuse a file the viewer
+    # can already follow.
+    if heard_it:
+        why = f"the audio is {said}, so nothing here is untranslatable"
+        n_now = len([t for t in tracks
+                     if str(t.get("lang") or "").lower()[:3] == lang])
+        if n_now:
+            why = (f"its only {lang} track is signs and songs, but the audio "
+                   f"is {said} - the conversation needs no translation")
+        return WANT, why, "spoken"
+
+    # ---- FROM HERE ON A FILE CAN BE ACCUSED, SO THE SHIELDS APPLY ---------
     if prow is None:
         return UNKNOWN, ("the picture reader has not looked at this file, so "
                          "burned-in subtitles cannot be ruled out"), "nopic"
-    pstate = str((prow["chosen"] if "chosen" in prow.keys() else None)
-                 or prow["state"] or "")
-    # `signs` is deliberately not on this list. Signs and songs are not
-    # dialogue, and a file carrying only those still needs subtitles.
-    if pstate in ("dialogue", "hybrid"):
-        return OK, "the dialogue is burned into the picture", "burned"
-
-    if lang in _audio_langs(file_id, cur):
-        return OK, f"the audio is already in {lang}", "audio"
-
-    # DID IT READ ANY WORDS? Asked before the frame counts, because it is the
-    # stronger evidence and because nothing was asking it at all.
-    #
-    # The guard below was written for City Hunter - many frames with
-    # subtitle-shaped marks, not one readable word. Velvet, The New Empire
-    # fails the mirror image: a Spanish telenovela with English burned in,
-    # where the marks detector caught 1 frame in 24 because the subtitles are
-    # on screen for a fraction of the runtime, and that one frame OCR'd
-    # cleanly:
-    #
-    #     #32070 S01E47  state='none'  low_hits=1/24
-    #                    words='are, barbara, doing, here, what, you'
-    #
-    # "what are you doing here, barbara" - read off the screen, while the
-    # verdict said there was nothing in the picture and the row offered to
-    # blocklist the file and fetch another copy. Measured across the list: 27
-    # of the 80 accused had words the OCR had already read, 9 of them six
-    # words or more.
-    #
-    # A COUNT OF WORDS IS NOT A COUNT OF FRAMES. One asks how often something
-    # subtitle-shaped appeared, the other whether any of it turned out to be
-    # language, and they miss in opposite directions.
-    #
-    # UNKNOWN and not OK: words on screen might be a shop sign or a chyron,
-    # and `dialogue`/`hybrid` above is where the picture reader says it is
-    # really dialogue. This only says burned-in subtitles cannot be ruled out,
-    # which is true, and takes the file off the delete list.
-    words = ""
-    try:
-        if "words" in prow.keys():
-            words = str(prow["words"] or "").strip()
-    except Exception:                                            # noqa: BLE001
-        words = ""
-    hits = _english_hits(words) if _is_english(lang) else []
     if hits:
-        got = [w for w in (x.strip() for x in words.split(",")) if w]
-        shown = ", ".join(got[:8]) + ("..." if len(got) > 8 else "")
-        # HEARD ONE LANGUAGE, SAW ANOTHER - a translation subtitle.
-        #
-        # Getting here already means the required language is NOT in the audio
-        # (the check above returns OK when it is), so English on the screen
-        # here is English the audio does not have. That is what a translation
-        # subtitle IS, and it is a different fact from "some words are on the
-        # screen": a shop sign does not produce English function words and a
-        # chyron does not produce several.
-        #
-        # Velvet, The New Empire is the case - Spanish audio, and the picture
-        # reading "are, barbara, doing, here, what, you". Both readings were
-        # already stored; this only compares them.
-        #
-        # Two function words to decide, one to wonder. Measured over the 23
-        # accused files that had any words at all, the thirteen real ones
-        # scored 1,2,2,2,2,2,2,3,4,4,4,6 and the ten noise ones scored zero.
-        heard = _audio_langs(file_id, cur)
-        spoken = sorted(x for x in heard if x and x not in ("und", "un", ""))
-        if len(hits) >= 2:
-            return OK, (
-                f"the audio is {'/'.join(spoken) or 'not English'} and the "
-                f"picture reader OCRed English off the screen - {shown} - so "
-                f"the English is burned in as a translation subtitle"
-            ), "ocr_trans"
+        # UNKNOWN and not OK: one function word is a shop sign as easily as a
+        # subtitle, and `dialogue`/`hybrid` above is where the picture reader
+        # says it is really dialogue. This only says burned-in subtitles
+        # cannot be ruled out, which is true, and takes the file off the
+        # delete list. 27 of the 80 once accused had words the OCR had
+        # already read, 9 of them six words or more.
         return UNKNOWN, (
             f"the picture reader OCRed English off the picture - {shown} - "
             f"so there is English burned into this file whatever the frame "
@@ -652,6 +861,10 @@ def verdict(file_id: int, lang: str, cur, facts=None,
     n_s = int(prow["samples"] or 0)
     n_lo = int(prow["low_hits"] or 0)
     if n_s and (n_lo / n_s) >= PICTURE_MARKS_RATIO:
+        # Two thirds of sampled frames with subtitle-shaped marks and not one
+        # word back is what an SDTV-era hardsub looks like to an OCR trained
+        # on clean type. Treating that as "no subtitles" put 126 of 146 files
+        # on a list offering to delete them.
         return UNKNOWN, (
             f"the picture reader found marks low in the picture in "
             f"{n_lo} of {n_s} frames but could read none of them - burned-in "
@@ -660,26 +873,9 @@ def verdict(file_id: int, lang: str, cur, facts=None,
         return UNKNOWN, ("the picture reader has no frames for this file, so "
                          "burned-in subtitles cannot be ruled out"), "noframes"
 
-    # LAST, BECAUSE IT ONLY ANSWERS THE ACCUSATION.
-    #
     # A READING THIS FILE IS ALREADY QUEUED TO HAVE REDONE IS NOT ONE TO
-    # DELETE A RELEASE OVER. The picture reader records which version of
-    # itself produced a verdict, and it has been corrected twice - the caption
-    # floor, then the OCR engine. Measured when this went in: all 34 files on
-    # the blocklist list rested on an older reader and none on the current
-    # one. The Velvet episodes had been in exactly that state - read as
-    # "nothing in the picture", offered for deletion, carrying burned-in
-    # English throughout.
-    #
-    # THE PLACEMENT IS THE WHOLE POINT, and I had it wrong first: this sat at
-    # the top of the picture section, where it also pre-empted the two lines
-    # that say a file is FINE - the dialogue is burned in, the audio is
-    # already in the language - and 2,523 settled files went from `ok` to
-    # `unknown` in one restart. An old verdict is a bad reason to delete
-    # something and a perfectly good reason to leave it alone. Everything that
-    # can clear a file still clears it above; only the accusation waits.
-    #
-    # It returns to `missing` by itself once the re-read confirms it.
+    # DELETE A RELEASE OVER. Measured when this went in: all 34 files on the
+    # blocklist list rested on an older reader and none on the current one.
     try:
         from . import hardsub as _hs
         rev = 0
@@ -695,11 +891,26 @@ def verdict(file_id: int, lang: str, cur, facts=None,
     except Exception:                                            # noqa: BLE001
         pass
 
+    # ---- NOTHING ANYWHERE, AND NOBODY CAN FOLLOW IT -----------------------
+    if mine:
+        if not any(_speech_rate(t, minutes) > 0 for t in mine):
+            return UNKNOWN, (
+                f"its only {lang} track claims to be signs and the container "
+                f"does not say how many lines it has, so it is queued to be "
+                f"read rather than guessed at"), "signs_unread"
+        rate = min(_speech_rate(t, minutes) for t in mine
+                   if _speech_rate(t, minutes) > 0)
+        return MISSING, (
+            f"its only {lang} track is signs and songs, {rate:.1f} lines a "
+            f"minute - the conversation is not translated, and the audio is "
+            f"{said}"), "signs_only"
+
     n = len(tracks) + len(sides)
-    return MISSING, ("carries no subtitles at all, and nothing in the picture"
-                     if not n
-                     else f"carries {n} subtitle(s), none of them {lang}, "
-                          f"and nothing in the picture"), "missing"
+    why = ("carries no subtitles at all, and nothing in the picture"
+           if not n else
+           f"carries {n} subtitle(s), none of them {lang}, and nothing in "
+           f"the picture")
+    return MISSING, f"{why}, and the audio is {said}", "missing"
 
 
 # -------------------------------------------------------------- the sweep ---
@@ -710,8 +921,9 @@ def check_one(file_id: int, cur=None) -> dict:
     ctx = cursor() if close else None
     cur = ctx.__enter__() if close else cur
     try:
-        row = cur.execute("SELECT id, library, path, state FROM files "
-                          " WHERE id=?", (int(file_id),)).fetchone()
+        row = cur.execute("SELECT id, library, path, state, duration "
+                          "  FROM files WHERE id=?",
+                          (int(file_id),)).fetchone()
         if not row:
             return {"ok": False, "why": "no such file"}
         lib = row["library"] or ""
@@ -725,7 +937,9 @@ def check_one(file_id: int, cur=None) -> dict:
         now = time.time()
         out = {}
         for lang in want:
-            st, why, rule = verdict(file_id, lang, cur, facts, untagged)
+            st, why, rule = verdict(file_id, lang, cur, facts, untagged,
+                                    None,
+                                    float(row["duration"] or 0) / 60.0)
             out[lang] = st
             cur.execute(
                 "INSERT INTO sub_need(file_id,lang,library,state,why,"
@@ -750,7 +964,7 @@ def sweep(limit: int = BATCH) -> dict:
     STATE.update(running=True, err="")
     t0 = time.time()
     n = 0
-    tally = {OK: 0, MISSING: 0, UNKNOWN: 0}
+    tally = {OK: 0, MISSING: 0, UNKNOWN: 0, WANT: 0}
     try:
         with cursor() as cur:
             if not want_by_lib:
@@ -767,7 +981,15 @@ def sweep(limit: int = BATCH) -> dict:
             for lib, want in want_by_lib.items():
                 untagged = _keeps_untagged(lib)
                 rows = cur.execute(
-                    "SELECT f.id, f.library, s.tracks, s.sides, s.picture, "
+                    # f.duration IS NOT OPTIONAL either, for the same reason
+                    # h.words and h.rev are not: a cue count means nothing
+                    # without a runtime, and this hand-written column list is
+                    # the only thing feeding it on the sweep path. Leaving it
+                    # out would make every signs-or-dialogue test fall back
+                    # to "cannot say" across the whole library while
+                    # single-file calls worked perfectly.
+                    "SELECT f.id, f.library, f.duration, "
+                    "       s.tracks, s.sides, s.picture, "
                     # h.words IS NOT OPTIONAL. verdict() reads it to decide
                     # whether the OCR pulled English off the picture, and this
                     # hand-written column list is the only thing feeding it on
@@ -797,8 +1019,9 @@ def sweep(limit: int = BATCH) -> dict:
                     # does not make a second query per file to read them.
                     prow = r if r["haspic"] else None
                     for lang in want:
-                        st, why, rule = verdict(r["id"], lang, cur, r,
-                                                untagged, prow)
+                        st, why, rule = verdict(
+                            r["id"], lang, cur, r, untagged, prow,
+                            float(r["duration"] or 0) / 60.0)
                         tally[st] = tally.get(st, 0) + 1
                         cur.execute(
                             "INSERT INTO sub_need"
@@ -824,7 +1047,8 @@ def sweep(limit: int = BATCH) -> dict:
         whole = counts()
         STATE.update(running=False, at=time.time(), took=time.time() - t0,
                      checked=n, ok=whole[OK], missing=whole[MISSING],
-                     unknown=whole[UNKNOWN], runs=STATE["runs"] + 1)
+                     unknown=whole[UNKNOWN], want=whole.get(WANT, 0),
+                     runs=STATE["runs"] + 1)
     return {"ok": True, "checked": n, "pass": tally, **counts()}
 
 
@@ -842,7 +1066,7 @@ def counts() -> dict:
     Same join, same filter, so every figure here describes a file that exists.
     """
     init()
-    out = {OK: 0, MISSING: 0, UNKNOWN: 0,
+    out = {OK: 0, MISSING: 0, UNKNOWN: 0, WANT: 0,
            "unknown_by": {"unread": 0, "stale": 0, "open": 0}}
     try:
         with cursor() as cur:
@@ -1223,6 +1447,35 @@ def prune() -> int:
         return 0
 
 
+def wanting(limit: int = 400, library: str = "") -> list[dict]:
+    r"""The rule asks for a subtitle these have not got - and they can still
+    be followed, so nothing is offered to delete them.
+
+    Kept separate from missing() rather than filtered out of it, because the
+    two lists mean different things to whoever is reading them and only one
+    of them has a button. See WANT.
+    """
+    init()
+    sql = ("SELECT n.file_id, n.lang, n.library, n.why, n.checked_at, "
+           "       n.rule, n.sure, "
+           "       f.path, f.title, f.season, f.episode, f.size, f.pool_disk, "
+           "       f.first_seen "
+           "  FROM sub_need n JOIN files f ON f.id=n.file_id "
+           " WHERE n.state=? AND f.state NOT IN ('deleted','duplicate')"
+           + (" AND n.library=?" if library else "") +
+           " ORDER BY f.title, f.season, f.episode LIMIT ?")
+    args = ((WANT, library, int(limit)) if library else (WANT, int(limit)))
+    try:
+        with cursor() as cur:
+            out = [dict(r) for r in cur.execute(sql, args)]
+    except Exception:                                            # noqa: BLE001
+        return []
+    for r in out:
+        r["short"] = short_why(r.get("why") or "")
+        r["rule_line"] = rule_of(r.get("rule") or "").get("line") or ""
+    return out
+
+
 def missing(limit: int = 200, library: str = "") -> list[dict]:
     """The files that are actually missing something, newest verdict first."""
     init()
@@ -1366,7 +1619,20 @@ def unknown_sample(limit: int = 20) -> list[dict]:
 
 
 def findings(limit: int = 50) -> list[dict]:
-    """For remedy.auto(). ONLY `missing` - never `unknown`; see the docstring."""
+    r"""For remedy.auto(). ONLY `missing`.
+
+    Never `unknown`, for the reason in the module docstring - a question
+    nobody has answered is not a fault. And never `want` either: the rule
+    asks for a subtitle those files have not got, and the audio is in the
+    language, so there is nothing about them a viewer cannot follow. Deleting
+    a release over that is a loud answer to a quiet question.
+
+    Nothing here needs changing to enforce that - missing() selects
+    state='missing' - but the rule is written down because `want` arrived
+    after this function did, and the next person to widen this query needs to
+    know which of the four states a button is allowed to touch.
+    """
+
     return [{"file_id": int(r["file_id"]), "kind": KIND,
              "path": r.get("path") or "",
              "why": f"no {r['lang']} subtitles - {r['why']}"}
@@ -1389,6 +1655,11 @@ def snapshot() -> dict:
             "age_s": (round(time.time() - STATE["at"]) if STATE["at"] else None),
             "poll_s": POLL_S,
             "answered": answered_count(),
+            # THE QUIET FINDING, COUNTED IN THE HEADER. It has no button and
+            # it is not a fault, so it would be invisible without this - and
+            # a check that silently decides 2,936 files do not matter is a
+            # check nobody can argue with. See WANT.
+            "want": int(c.get(WANT) or 0),
             # ITS SCHEDULE ROW, so the panel can say when the next pass is
             # rather than only offering a button. Erik: "make the check now a
             # job time". It is already registered - this is the panel finally
