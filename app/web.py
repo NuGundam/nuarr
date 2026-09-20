@@ -37658,6 +37658,26 @@ async function scoreToggle(){
   // changed - same as subsDetail does when it opens a panel.
   try{ _subsKey=''; subsPaint(); }catch(e){}
 }
+// HOW OFTEN THIS SIGNAL HAS BEEN RIGHT, counted over the rows you settled -
+// and what it was when the trail started, when the two differ. The weight is
+// fixed; this is the evidence for or against it.
+function scoreLive(r){
+  if(!r.now) return '';
+  const pct=r.now.pct;
+  const col = pct>=85?'#7fd18c' : pct>=65?'#e8a33d' : 'var(--bad)';
+  const move = r.since ? (()=>{
+    const d = pct - r.since.pct;
+    if(!d) return '';
+    const c = d>0?'#7fd18c':'var(--warn)';
+    return `<span class="dim" style="font-size:10px"> · <span style="color:${c}">${
+      d>0?'+':''}${d}</span> since ${esc(r.since.day)} (${r.since.pct}%)</span>`;
+  })() : '';
+  return `<div style="font-size:10.5px;margin-top:1px"
+       title="Of the rows you settled by hand, this is how often this signal was on your side when it fired. Those rows are the hard ones by construction - they reached you because the readers disagreed - so a low figure here means the signal loses arguments, not that it is wrong about the whole library.">
+      <span style="color:${col};font-weight:600">${pct}%</span>
+      <span class="dim">of the ${r.now.n} you settled where it fired</span>${move}
+    </div>`;
+}
 function scoreRows(rows){
   return (rows||[]).map(r=>{
     const p = Number(r.points)||0;
@@ -37666,6 +37686,7 @@ function scoreRows(rows){
       <td style="padding:3px 8px 3px 0;text-align:right;white-space:nowrap;
                  color:${col};font-weight:600">${p>0?'+':''}${p}</td>
       <td style="padding:3px 8px 3px 0">${esc(r.what||'')}
+        ${scoreLive(r)}
         ${r.measured?`<div class="dim" style="font-size:10.5px">${esc(r.measured)}</div>`:''}
       </td></tr>`;
   }).join('');
@@ -37683,11 +37704,33 @@ function scoreTable(){
         <tbody>${rows}</tbody></table>
       ${foot?`<div class="dim" style="font-size:10.5px;margin-top:3px">${foot}</div>`:''}
     </div>`;
-  const priors = (d.priors||[]).map(x=>
-     `<tr style="border-top:1px solid var(--line)">
+  const priors = (d.priors||[]).map(x=>{
+     const now = x.now;
+     const drift = now ? (()=>{
+       const a=(x.rate*100), b=(now.rate*100);
+       const same = Math.abs(a-b) < (a<5?0.3:1.5);
+       return `<div style="font-size:10.5px;margin-top:1px">
+         <span style="color:${same?'#7fd18c':'var(--warn)'};font-weight:600">${
+           b.toFixed(b<5?1:0)}%</span>
+         <span class="dim">now · ${fmt(now.carried)} of ${fmt(now.n)} read${
+           same?'':' — the multiplier beside it was set at '+a.toFixed(a<5?1:0)+'%'}</span></div>`;
+     })() : '';
+     return `<tr style="border-top:1px solid var(--line)">
         <td style="padding:3px 8px 3px 0;text-align:right;white-space:nowrap;
                    font-weight:600">${(x.rate*100).toFixed(x.rate<0.05?1:0)}%</td>
-        <td style="padding:3px 8px 3px 0">${esc(x.said||x.what||'')}</td></tr>`).join('');
+        <td style="padding:3px 8px 3px 0">${esc(x.said||x.what||'')}${drift}</td></tr>`;
+  }).join('');
+  const lang = d.live_language||{};
+  const langNow = (lang.eng_only||lang.not_eng)
+    ? `<div style="font-size:10.5px;margin-top:2px">${
+        lang.eng_only?`<span style="color:#7fd18c;font-weight:600">${
+          fmt(lang.eng_only.carried)} of ${fmt(lang.eng_only.n)}</span>
+          <span class="dim">English-only files carry words</span>`:''}${
+        lang.not_eng?` <span class="dim">·</span> <span style="color:#e8a33d;font-weight:600">${
+          fmt(lang.not_eng.carried)} of ${fmt(lang.not_eng.n)}</span>
+          <span class="dim">with a non-English track do</span>`:''}</div>`
+    : '';
+  const c=d.counted||{};
   return `<div style="margin:8px 0 2px;padding:9px 11px;border:1px solid var(--line);
        border-radius:7px;background:rgba(255,255,255,.02)">
     <div style="font-size:11.5px"><b>How a reading becomes a percentage</b></div>
@@ -37700,7 +37743,17 @@ function scoreTable(){
     ${sec('Words painted into the picture', p.how, scoreRows(p.rows),
           `at or above ${p.mark_at}% nuarr acts on its own, at or below ${p.dismiss_at}% it drops the finding`)}
     ${sec('And the odds before anything is read', d.prior_how, priors,
-          esc(d.language||''))}
+          esc(d.language||'') + langNow)}
+    <div class="dim" style="font-size:10.5px;margin-top:9px;padding-top:7px;
+         border-top:1px solid var(--line)">
+      <b style="color:var(--fg,#c9d1d9)">What moves and what does not.</b>
+      ${esc(d.learns||'')}
+      ${c.answers?`<span class="dim"> Counted just now over ${fmt(c.answers)}
+        signal firings on rows you settled and ${fmt(c.pictures)} pictures
+        read.</span>`:''}
+      ${(d.trail||[]).length>1?`<span class="dim"> The trail goes back to
+        ${esc(d.trail[0].day||'')} — ${(d.trail||[]).length} days of it.</span>`:''}
+    </div>
   </div>`;
 }
 // ---- what subtitles does each file actually carry? -----------------------

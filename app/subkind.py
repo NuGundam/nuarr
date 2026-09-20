@@ -335,6 +335,213 @@ def _safe(fn):
         return {}
 
 
+# ---------------------------------------------------- what the answers say --
+#
+# EVERY FIGURE IN THE PANEL USED TO BE FROZEN. The weights were measured once,
+# by hand, over the library as it stood - and then written down, where they
+# would go on saying "right 124 times out of 139" however many times somebody
+# answered a row afterwards. Erik asked whether the panel updates with the
+# answers it is given; this is what makes the honest half of that answer yes.
+#
+# What is recounted here: how often each signal agreed with a person, over
+# every row a person has settled, and how often each kind of file really
+# carries burned-in words. Both are queries over what is in the database now.
+#
+# What is NOT recounted, and the panel says so: the POINTS. A weight that
+# moved on its own every time a row was answered would be a scorer nobody
+# could reason about - a row could change its mind overnight with no change
+# to the file or the evidence. The points stay put; the hit rate beside them
+# tells you when one has drifted far enough to be worth changing by hand.
+_STATS: dict = {"at": 0.0, "data": None}
+_STATS_TTL = 120.0
+
+
+def _track_signal_stats() -> dict:
+    """For every track signal: how often it agreed with the person, now."""
+    from . import subtitletitle as stt
+    from .db import cursor
+    import json as _json
+    hit: dict = {}
+
+    def note(key, agreed):
+        d = hit.setdefault(key, {"n": 0, "right": 0})
+        d["n"] += 1
+        d["right"] += 1 if agreed else 0
+
+    facts: dict = {}
+    try:
+        with cursor() as cur:
+            for r in cur.execute("SELECT file_id, tracks FROM sub_facts "
+                                 " WHERE COALESCE(tracks,'') != ''"):
+                try:
+                    facts[int(r["file_id"])] = _json.loads(r["tracks"])
+                except Exception:                            # noqa: BLE001
+                    pass
+            rows = cur.execute(
+                "SELECT s.*, f.path, f.library, f.duration "
+                "  FROM subtitle_shape s JOIN files f ON f.id=s.file_id "
+                " WHERE COALESCE(s.chosen,'') != '' "
+                "   AND f.state NOT IN ('deleted','duplicate')").fetchall()
+    except Exception:                                        # noqa: BLE001
+        return {}
+    for r in rows:
+        said_signs = str(r["chosen"] or "") == stt.SIGNS
+        ordn = int(r["track"] or 1) - 1
+        t = next((x for x in (facts.get(int(r["file_id"])) or [])
+                  if int(x.get("ord", -1)) == ordn), {})
+        mins = max(1.0, float(r["duration"] or 0) / 60.0)
+        plain = r["plain"] or 0
+        if r["plain_out"] is not None:
+            mins = max(1.0, mins - float(r["oped_s"] or 0) / 60.0)
+            plain = r["plain_out"]
+        rate = plain / mins
+        pos = float(r["pos_pct"] or 0.0)
+        cover, gap = r["cover"], float(r["gap_s"] or 0.0)
+        # Each signal is asked the same question: when you fired, was it a
+        # sign sheet? A signal that never fires on these rows says nothing
+        # and is left out rather than reported as 0 of 0.
+        if pos >= 60.0:
+            note("pos_high", said_signs)
+        if 20.0 <= pos < 60.0:
+            note("pos_some", said_signs)
+        if pos <= 0.0:
+            note("pos_none", not said_signs)
+        if stt._style_is_sign(str(t.get("title") or "")):
+            note("title", said_signs)
+        if t.get("forced"):
+            note("forced", said_signs)
+        if int(r["signish"] or 0) > 0:
+            note("styles", said_signs)
+        if rate <= stt.SIGNS_MAX:
+            note("rate_low", said_signs)
+        elif rate >= stt.SPEECH_LO:
+            note("rate_high", not said_signs)
+        if cover is not None and int(cover or 0) > 0:
+            if int(cover) <= stt.CLUSTERED_AT and gap >= stt.CLUSTERED_GAP_S:
+                note("clustered", said_signs)
+            elif int(cover) >= stt.SPREAD_AT and gap <= stt.SPREAD_GAP_S:
+                note("spread", not said_signs)
+    return hit
+
+
+def _picture_base_rates() -> dict:
+    """How often each kind of file really carries words, counted now."""
+    from .db import cursor
+    out: dict = {}
+    try:
+        with cursor() as cur:
+            rows = cur.execute(
+                "SELECT h.state, f.library, f.audio_langs FROM hardsub h "
+                "  JOIN files f ON f.id=h.file_id "
+                " WHERE f.state NOT IN ('deleted','duplicate')").fetchall()
+    except Exception:                                        # noqa: BLE001
+        return {}
+    tally: dict = {}
+    for r in rows:
+        lib = str(r["library"] or "").lower()
+        fam = ("anime" if "anime" in lib else
+               "animated" if "animated" in lib else "live")
+        carry = str(r["state"] or "") not in ("", "none")
+        d = tally.setdefault(fam, [0, 0])
+        d[0] += 1
+        d[1] += 1 if carry else 0
+        if fam != "anime":
+            langs = {x.strip().lower()
+                     for x in str(r["audio_langs"] or "").split(",") if x.strip()}
+            if langs:
+                key = ("eng_only" if not (langs - {"eng", "en", "und"})
+                       else "not_eng")
+                e = tally.setdefault(key, [0, 0])
+                e[0] += 1
+                e[1] += 1 if carry else 0
+    for k, (n, c) in tally.items():
+        out[k] = {"n": n, "carried": c, "rate": (c / n) if n else 0.0}
+    all_n = sum(v[0] for k, v in tally.items()
+                if k in ("anime", "animated", "live"))
+    all_c = sum(v[1] for k, v in tally.items()
+                if k in ("anime", "animated", "live"))
+    out["_all"] = {"n": all_n, "carried": all_c,
+                   "rate": (all_c / all_n) if all_n else 0.0}
+    return out
+
+
+def _trail_init() -> None:
+    from .db import cursor
+    with cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS subkind_trail(
+                day   TEXT PRIMARY KEY,
+                at    REAL,
+                json  TEXT
+            )""")
+
+
+def _trail_write(d: dict) -> None:
+    r"""One row a day, and only when something moved.
+
+    A HISTORY OF A NUMBER IS WORTH MORE THAN THE NUMBER. "Positioning is
+    right 89% of the time" is a fact about today; "it was 89% in September
+    and is 71% now" is a fact about the library changing under the scorer,
+    and it is the one worth acting on. Keyed by day so answering thirty rows
+    in an evening writes one row, not thirty.
+    """
+    import json as _json
+    try:
+        _trail_init()
+        day = time.strftime("%Y-%m-%d", time.localtime())
+        small = {"signals": {k: [v["right"], v["n"]]
+                             for k, v in (d.get("signals") or {}).items()},
+                 "rates": {k: [v["carried"], v["n"]]
+                           for k, v in (d.get("rates") or {}).items()}}
+        blob = _json.dumps(small, sort_keys=True)
+        from .db import cursor
+        with cursor() as cur:
+            row = cur.execute("SELECT json FROM subkind_trail "
+                              " ORDER BY day DESC LIMIT 1").fetchone()
+            if row and str(row["json"] or "") == blob:
+                return                       # nothing moved; nothing to say
+            cur.execute(
+                "INSERT INTO subkind_trail(day, at, json) VALUES(?,?,?) "
+                "ON CONFLICT(day) DO UPDATE SET at=excluded.at, "
+                "  json=excluded.json", (day, time.time(), blob))
+    except Exception:                                        # noqa: BLE001
+        pass
+
+
+def trail(limit: int = 60) -> list:
+    """The dated rows, oldest first."""
+    import json as _json
+    out = []
+    try:
+        _trail_init()
+        from .db import cursor
+        with cursor() as cur:
+            rows = cur.execute(
+                "SELECT day, at, json FROM subkind_trail "
+                " ORDER BY day DESC LIMIT ?", (int(limit),)).fetchall()
+        for r in reversed(rows):
+            try:
+                out.append({"day": r["day"], "at": r["at"],
+                            **_json.loads(r["json"] or "{}")})
+            except Exception:                                # noqa: BLE001
+                pass
+    except Exception:                                        # noqa: BLE001
+        return []
+    return out
+
+
+def stats(fresh: bool = False) -> dict:
+    """The recounted figures, held for two minutes, and written to the trail."""
+    now = time.time()
+    if not fresh and _STATS["data"] and now - _STATS["at"] < _STATS_TTL:
+        return _STATS["data"]
+    d = {"signals": _track_signal_stats(), "rates": _picture_base_rates(),
+         "at": now}
+    _STATS.update(at=now, data=d)
+    _trail_write(d)
+    return d
+
+
 def scoring() -> dict:
     r"""Every signal the two readers score with, what it is worth, and the
     measurement behind it.
@@ -348,48 +555,70 @@ def scoring() -> dict:
     from . import hardsub as hs, subtitletitle as stt
     sp, dp = stt.SIGN_POINTS, stt.DIALOGUE_POINTS
 
-    def _row(pts, what, measured):
-        return {"points": pts, "what": what, "measured": measured}
+    # THE LIVE HALF. live[key] is how often this signal agreed with a person
+    # over every row a person has settled, recounted on the way in; `since`
+    # is the same figure the first day the trail has, so a signal drifting
+    # away from the weight it was given shows it rather than hiding it.
+    st = stats()
+    live = st.get("signals") or {}
+    hist = trail(400)
+    first = (hist[0] if hist else {}) or {}
+    first_sig = first.get("signals") or {}
+
+    def _row(pts, what, measured, key=""):
+        d = {"points": pts, "what": what, "measured": measured}
+        got = live.get(key) if key else None
+        if got and got.get("n"):
+            d["now"] = {"right": got["right"], "n": got["n"],
+                        "pct": round(got["right"] * 100.0 / got["n"])}
+            was = first_sig.get(key)
+            if was and was[1] and was != [got["right"], got["n"]]:
+                d["since"] = {"right": was[0], "n": was[1],
+                              "pct": round(was[0] * 100.0 / was[1]),
+                              "day": first.get("day") or ""}
+        return d
 
     track = [
         _row(dp["spread"], "its lines run through most of the runtime",
              f"{stt.SPREAD_AT} of {stt.COVER_SLICES} slices or more with no "
              f"gap past {stt.SPREAD_GAP_S/60:.0f} min. Dialogue tracks "
              f"measured 10 of 10 and a 1.1 min gap; sign sheets 3 of 10 and "
-             f"18.8 min"),
+             f"18.8 min", "spread"),
         _row(sp["clustered"], "its lines sit in one block",
              f"{stt.CLUSTERED_AT} slices or fewer and silent for "
              f"{stt.CLUSTERED_GAP_S/60:.0f} min at a stretch - an opening, an "
-             f"ending and a few signs"),
+             f"ending and a few signs", "clustered"),
         _row(dp["twin"], "it is the same track as the one beside it",
              "a forced flag over the same cue count as the full track in the "
              "same file. The genuine forced tracks here carry 1 to 117 cues; "
-             "the mislabelled ones carried 925, 1,110 and 1,639"),
+             "the mislabelled ones carried 925, 1,110 and 1,639", "twin"),
         _row(sp["pos_high"], "most of it is placed on screen",
              "60% or more of its events carry \\pos or \\move. Of the tracks "
              "a person had to answer, positioning was right 124 times out of "
-             "139; above 80% it was signs 56 times out of 56"),
+             "139; above 80% it was signs 56 times out of 56", "pos_high"),
         _row(sp["pos_some"], "some of it is placed on screen",
-             "20% or more of its events"),
+             "20% or more of its events", "pos_some"),
         _row(dp["pos_none"], "none of it is placed on screen",
-             "nothing positioned at all, so nothing in it is a sign"),
+             "nothing positioned at all, so nothing in it is a sign",
+             "pos_none"),
         _row(sp["title"], "the title says signs",
              "sign, op, ed, karaoke, title, credit and the rest, as whole "
              "words. Right 120 times out of 139 - but silenced on this panel, "
-             "where the title is the claim being tested"),
+             "where the title is the claim being tested", "title"),
         _row(sp["forced"], "the header flags it forced",
              "right 120 times out of 139. It means different things by "
              "family: 8,287 forced ASS tracks in anime are signs and songs, "
-             "781 forced SRT in live action are foreign dialogue"),
-        _row(sp["styles"], "its styles are named for signs or themes", ""),
+             "781 forced SRT in live action are foreign dialogue", "forced"),
+        _row(sp["styles"], "its styles are named for signs or themes", "",
+             "styles"),
         _row(sp["rate_low"], "two plain dialogue lines a minute or fewer",
              f"the line under which a signs title is telling the truth "
-             f"({stt.SIGNS_MAX:g}/min)"),
+             f"({stt.SIGNS_MAX:g}/min)", "rate_low"),
         _row(dp["rate_high"], "it runs at the cadence of people talking",
              f"{stt.SPEECH_LO:g} to {stt.SPEECH_HI:g} lines a minute, both "
              f"ends measured. Overruled when the lines are clustered: fifteen "
              f"a minute and twenty-one minutes of silence cannot both be "
-             f"speech"),
+             f"speech", "rate_high"),
         _row(dp["unique"], "no sibling episode carries these lines",
              "written for this episode, which a karaoke script never is"),
         _row(dp["live"], "live action",
@@ -414,8 +643,20 @@ def scoring() -> dict:
              "have a five-letter word 43% of the time; those called none, "
              "never"),
     ]
-    priors = [{"what": k, "rate": v[0], "said": v[1]}
-              for k, v in hs.BASE_RATE.items()]
+    # THE PRIORS, AS THEY STAND NOW. hs.BASE_RATE is what the scorer
+    # multiplies by and is fixed; `now` beside it is the same question asked
+    # of the pictures read since, so the two can be compared.
+    rates = st.get("rates") or {}
+    priors = []
+    for k, v in hs.BASE_RATE.items():
+        got = rates.get(k) or {}
+        p = {"what": k, "rate": v[0], "said": v[1]}
+        if got.get("n"):
+            p["now"] = {"rate": round(got["rate"], 4),
+                        "carried": got["carried"], "n": got["n"]}
+        priors.append(p)
+    lang = {k: rates.get(k) for k in ("eng_only", "not_eng")
+            if rates.get(k, {}).get("n")}
     return {
         "track": {"rows": track, "signs_at": stt.SIGNS_AT,
                   "dialogue_at": -30,
@@ -439,6 +680,29 @@ def scoring() -> dict:
                       f"({hs.BASE_RATE_ALL*100:.0f}%), held between "
                       f"{hs.PRIOR_FLOOR:g} and {hs.PRIOR_CEIL:g} so a rare "
                       "kind cannot veto a clear reading."),
+        "counted": {"answers": sum(v.get("n", 0) for v in
+                                   (st.get("signals") or {}).values()),
+                    "pictures": (rates.get("_all") or {}).get("n", 0),
+                    "at": st.get("at", 0.0)},
+        "trail": [{"day": h.get("day"), "signals": h.get("signals") or {},
+                   "rates": h.get("rates") or {}} for h in hist],
+        "live_language": lang,
+        "learns": ("The hit rates and the odds are counted fresh from the "
+                   "rows you have settled and the pictures read so far - "
+                   "answer one and they move. The POINTS do not: a weight "
+                   "that drifted on its own would let a row change its mind "
+                   "overnight with nothing about the file having changed. "
+                   "Read the percentages as an argument about the weights "
+                   "rather than as the weights themselves - and read them "
+                   "knowing WHICH rows they are counted over. A row reaches "
+                   "you because the signals disagreed, so a signal that "
+                   "looks poor here is one that tends to be on the losing "
+                   "side of an argument, which is not the same as being "
+                   "wrong about the library. Two other things do learn on "
+                   "their own and are not listed: the words confirmed and "
+                   "thrown away by marking and dismissing, which feed the "
+                   "picture reader, and the shows dismissed often enough to "
+                   "be left alone."),
         "language": ("Outside anime the question is not what shelf the file "
                      "sits on but whether anyone in it speaks a language the "
                      "audience has no track for. English audio only: 21 of "
