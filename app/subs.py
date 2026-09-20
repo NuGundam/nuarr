@@ -381,9 +381,8 @@ def board() -> list:
                    "the story, and no amount of repacking these bytes "
                    "produces a subtitle. Only a different release fixes it.",
             "on": mode == "auto",
-            "setting": (f"{mode} · " + (" · ".join(
-                f"{lib} needs {', '.join(ls)}" for lib, ls in req.items())
-                if req else "nothing required yet")),
+            "setting": (f"{mode} · " + (_needs_line(req) if req
+                                        else "nothing required yet")),
             "waiting": int(c.get("missing") or 0),
             "waiting_word": "raws - each one a release only a different "
                             "copy can fix",
@@ -720,6 +719,22 @@ def _kind_acts() -> dict:
                           "on": (r.get("auto") == "act"), "n": 1})
     return out
 
+
+
+def _needs_line(req: dict) -> str:
+    """"foreign media needs eng in Anime Shows, TV Shows, ..." - grouped.
+
+    Erik asked for the check's setting line to say what the require switch
+    now says. Written once per LANGUAGE SET rather than once per library:
+    with six libraries all wanting English, "needs eng for foreign media"
+    six times is the same sentence six times, and the thing worth reading is
+    that the requirement only ever applies to something foreign.
+    """
+    by: dict = {}
+    for lib, ls in req.items():
+        by.setdefault(", ".join(ls), []).append(lib)
+    return " · ".join(f"foreign media needs {langs} in {', '.join(libs)}"
+                      for langs, libs in by.items())
 
 def rows(limit: int = 400) -> dict:
     """One row per file, carrying every subtitle thing that would happen.

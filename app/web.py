@@ -38897,8 +38897,19 @@ function snPaint(force){
   const miss=c.missing||0, unk=c.unknown||0, ok=c.ok||0;
   const wnt=c.want||0;
   const auto=(d.mode==='auto'), running=!!d.running;
-  const req=Object.entries(d.required||{})
-    .map(([lib,ls])=>`${esc(lib)} <b>${ls.map(esc).join(', ')}</b>`).join(' · ');
+  // GROUPED BY LANGUAGE, AND THE CONDITION SAID ONCE. Six libraries all
+  // wanting English rendered as six "Anime Shows eng · Animated Shows eng"
+  // chips, which reads as a rule about every file in them. The rule is only
+  // ever about something foreign, and that is the part worth the words.
+  const _byLang=new Map();
+  for(const [lib,ls] of Object.entries(d.required||{})){
+    const k=(ls||[]).join(', ');
+    if(!_byLang.has(k)) _byLang.set(k,[]);
+    _byLang.get(k).push(lib);
+  }
+  const req=[..._byLang.entries()].map(([ls,libs])=>
+    `<span title="Only a file spoken in some other language is checked against this. One spoken in ${esc(ls)} is listed if it has no subtitle, and never replaced - you can follow it.">foreign media needs <b>${esc(ls)}</b> in ${libs.map(esc).join(', ')}</span>`
+  ).join(' · ');
   const gb=n=>Math.round((n||0)/1073741824*100)/100;
 
   // ---- head: the other panel's, with this one's words ----
