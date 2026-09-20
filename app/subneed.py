@@ -736,8 +736,19 @@ def unknown_files(kind: str = "", limit: int = 600) -> dict:
                                               "library": r["library"] or "",
                                               "kind": r["k"], "why": ""})
                 g["n"] += 1
+                # THE WHOLE SENTENCE. It was cut at 160 characters, which
+                # landed mid-word on every row - "burned-in subtitles it
+                # cannot transcribe look exactly like th" - and the cut fell
+                # exactly where the sentence was about to say what it meant.
                 if not g["why"]:
-                    g["why"] = str(r["why"] or "")[:160]
+                    g["why"] = str(r["why"] or "")
+                g.setdefault("files", []).append({
+                    "file_id": int(r["file_id"]),
+                    "label": _row_label(r),
+                    "season": r["season"], "episode": r["episode"],
+                    "lang": r["lang"],
+                    "why": str(r["why"] or ""),
+                    "at": float(r["checked_at"] or 0.0)})
                 if len(rows) < max(1, int(limit)):
                     rows.append({
                         "file_id": int(r["file_id"]), "kind": r["k"],
@@ -745,7 +756,7 @@ def unknown_files(kind: str = "", limit: int = 600) -> dict:
                         "lang": r["lang"], "show": show,
                         "library": r["library"] or "",
                         "label": _row_label(r), "path": str(r["path"] or ""),
-                        "why": str(r["why"] or "")[:200],
+                        "why": str(r["why"] or ""),
                         "at": float(r["checked_at"] or 0.0)})
     except Exception as e:                                       # noqa: BLE001
         return {"ok": False, "why": f"{type(e).__name__}: {e}"[:160],

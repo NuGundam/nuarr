@@ -136,7 +136,18 @@ MIN_CHARS = 6
 #   6  the OCR is whichever engine the install is set to. It was Tesseract,
 #      hardcoded, while every library was set to PaddleOCR - and Paddle
 #      refuses noise Tesseract invents, so the verdicts can differ.
-READER_REV = 6
+#   7  the reader stopped at two frames and the column kept the twelve words
+#      that came first in the ALPHABET, so "no function words" was a verdict
+#      drawn from evidence nobody had gathered. It searches until it finds
+#      one now, and keeps forty with the function words first.
+#
+#      AND THIS STAMP SHOULD HAVE MOVED WITH THAT CHANGE. It did not, so
+#      3,606 readings taken under the old rules went on counting as current -
+#      including every one of the 380 files the language check calls
+#      "undecided", which is the whole reason it cannot decide: median words
+#      stored ZERO, against eleven frames of twenty-four carrying marks. A
+#      revision that does not move is a library that never hears the news.
+READER_REV = 7
 
 # BELOW THIS A BAND IS BLANK, whatever the font. MIN_PX is a guess about how
 # many pixels a CAPTION makes; this is the far weaker claim that something is

@@ -38624,9 +38624,18 @@ function snUnknownWords(c){
   return bits.join(' · ');
 }
 let _snUnk='', _snUnkData=null, _snUnkBusy=false;
+// Which shows are opened out into their episodes. A set rather than one
+// name: opening Detective Conan to see its eighty and then opening another
+// should not close the first.
+const _snUnkOpen=new Set();
+function snUnkOpen(show){
+  if(_snUnkOpen.has(show)) _snUnkOpen.delete(show); else _snUnkOpen.add(show);
+  _snKey=''; snPaint(true);
+}
 async function snUnkShow(kind){
   if(_snUnk===kind){ _snUnk=''; _snUnkData=null; _snKey=''; snPaint(true); return; }
-  _snUnk=kind; _snUnkData=null; _snUnkBusy=true; _snKey=''; snPaint(true);
+  _snUnk=kind; _snUnkData=null; _snUnkBusy=true; _snUnkOpen.clear();
+  _snKey=''; snPaint(true);
   try{ _snUnkData=await (await fetch('/api/subneed/unknown?kind='+kind
         +'&limit=800')).json(); }
   catch(e){ _snUnkData={ok:false, why:String(e)}; }
@@ -38642,13 +38651,30 @@ function snUnkBox(){
      font-size:11.5px">reading them…</div>`;
   if(d.ok===false) return `<div class="dim" style="padding:8px 14px;
      font-size:11.5px">could not read them: ${esc(d.why||'')}</div>`;
-  const shows=(d.shows||[]).map(g=>`<tr style="border-top:1px solid var(--line)">
+  // A COUNT IS THE POINT OF THE ROW, so it is coloured like one - the same
+  // scale the rest of the page uses for "how much of this is there": a
+  // couple is grey, a season's worth is amber, a whole show is loud.
+  const cnum=n=> n>=40 ? 'var(--bad)' : n>=15 ? '#e8a33d'
+             : n>=5 ? '#d9b44a' : 'var(--dim,#8a97a6)';
+  const shows=(d.shows||[]).map(g=>{
+    const open=_snUnkOpen.has(g.show);
+    const kids=open?(g.files||[]).map(f=>`<tr style="border-top:1px solid var(--line)">
+        <td style="padding:2px 8px 2px 22px">
+          <span class="dim">${esc(f.label||'')}</span></td>
+        <td style="padding:2px 8px 2px 0;width:60px;text-align:right"
+            class="dim">${esc(f.lang||'')}</td></tr>`).join(''):'';
+    return `<tr style="border-top:1px solid var(--line);cursor:pointer"
+        onclick="snUnkOpen('${esc(String(g.show).replace(/'/g,"\\'"))}')"
+        title="${open?'Hide':'Show'} the ${g.n} file${g.n===1?'':'s'} under this">
       <td style="padding:3px 8px 3px 0;text-align:right;white-space:nowrap;
-                 font-weight:600;width:52px">${fmt(g.n)}</td>
-      <td style="padding:3px 8px 3px 0">${esc(g.show)}
+                 font-weight:700;width:52px;color:${cnum(g.n)}">${fmt(g.n)}</td>
+      <td style="padding:3px 8px 3px 0">
+        <span class="dim" style="font-size:10px">${open?'▾':'▸'}</span>
+        ${esc(g.show)}
         <span class="dim" style="font-size:10.5px">· ${esc(g.library||'')}</span>
         ${g.why?`<div class="dim" style="font-size:10.5px">${esc(g.why)}</div>`:''}
-      </td></tr>`).join('');
+      </td></tr>${kids}`;
+  }).join('');
   const rows=(d.rows||[]).map(r=>`<tr style="border-top:1px solid var(--line)">
       <td style="padding:3px 8px 3px 0">${esc(r.label||'')}
         <div class="dim" style="font-size:10.5px">${esc(r.why||'')}</div></td>
@@ -38656,13 +38682,14 @@ function snUnkBox(){
           class="dim">${esc(r.lang||'')}</td></tr>`).join('');
   return `<div style="margin:6px 14px 2px;padding:9px 11px;border:1px solid
        var(--line);border-radius:7px;background:rgba(255,255,255,.02)">
-    <div style="font-size:11.5px"><b>${fmt(d.total||0)} ${esc(d.word||'')}</b>
+    <div style="font-size:11.5px"><b style="color:${cnum(d.total||0)}">${
+        fmt(d.total||0)}</b> <b>${esc(d.word||'')}</b>
       <span class="dim">— ${(d.shows||[]).length} show${
-        (d.shows||[]).length===1?'':'s'}${
-        d.shown<d.total?`, the first ${fmt(d.shown)} listed below`:''}</span>
+        (d.shows||[]).length===1?'':'s'}, click one to open it${
+        d.shown<d.total?`; the flat list below holds the first ${fmt(d.shown)}`:''}</span>
       <a href="#" onclick="snUnkShow('${_snUnk}');return false"
          style="margin-left:10px">hide</a></div>
-    <div class="rowbox scrollbox nohz" style="max-height:200px;margin-top:5px">
+    <div class="rowbox scrollbox nohz" style="max-height:300px;margin-top:5px">
       <table style="width:100%;font-size:11.5px;border-collapse:collapse">
         <tbody>${shows}</tbody></table></div>
     <div class="dim" style="font-size:10.5px;margin-top:6px">every file</div>
