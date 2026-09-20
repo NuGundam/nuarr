@@ -1,4 +1,30 @@
-r"""nuarr - files that do not carry a subtitle language the library requires.
+r"""nuarr - raws: films and episodes nobody in this house can follow.
+
+WHAT THIS CHECK IS FOR
+----------------------
+Erik, on what he built it to do: "this system was intended to fix foreign
+show/movies that get downloaded and only have their native lang - raws in
+anime terms. If a user wants a sub lang because they don't understand the
+native one and it doesn't have it, then nuarr is given the command to replace
+it if in auto mode."
+
+So the question is NOT "does this file have an English subtitle track". It is
+"can anybody here understand this film", and it has two halves that have to be
+asked in that order:
+
+    is it spoken in a language you have?     -> then it is not a raw, whatever
+                                                its subtitle tracks say
+    no? then is there dialogue you can read?  -> a track, a file beside it, or
+                                                the words burned into the
+                                                picture. Signs and songs are
+                                                not dialogue: they translate a
+                                                shop front and leave the
+                                                conversation alone.
+
+A file that fails both is a raw. Nothing nuarr can do to those bytes produces
+a subtitle - the planner cannot translate, the OCR has no picture to read and
+the listener hears Japanese - so the only fix is a different release, which is
+what the button does and what auto mode does without asking.
 
 THE FILE THIS EXISTS FOR
 ------------------------
@@ -7,18 +33,16 @@ THE FILE THIS EXISTS FOR
 
 ffprobe on it, on disk, right now: one h264 video stream, one aac stream
 tagged jpn. That is the whole file. No subtitle track, no sidecar beside it,
-nothing burned into the picture. Anime Shows keeps English subtitles, and
-there is no arrangement of these bytes that produces one - the planner cannot
-translate, the OCR has no picture to read and the listener hears Japanese.
-Every check nuarr has says this file is fine, because every check nuarr has
-asks whether what is there is correct, and nothing was asking whether what is
-required is there at all.
+nothing burned into the picture. Every check nuarr has says this file is fine,
+because every check nuarr has asks whether what is there is CORRECT - the
+title matches the track, the audio matches the tag, the bytes decode. None of
+them asks whether you can follow the story.
 
 So the file sat at `done`, and the first person to find out was whoever
 pressed play.
 
-WHY THE VERDICT HAS THREE VALUES AND NOT TWO
---------------------------------------------
+WHY THE VERDICT HAS FOUR VALUES AND NOT TWO
+-------------------------------------------
 This is the important part of the module and the reason it is written the way
 it is.
 
@@ -335,31 +359,35 @@ RULES: dict = {
                  "the track is read rather than guessed at. Erik: hold and "
                  "read them."},
     "signs_only": {
-        "says": MISSING, "sure": 88, "short": "signs, not dialogue",
-        "line": "the only track in the language is signs and songs",
+        "says": MISSING, "sure": 88, "short": "a raw with signs on top",
+        "line": "a raw whose only readable track is signs and songs",
         "rests": "signs and songs is not dialogue - it translates a shop "
                  "front and leaves the conversation untranslated. Reached "
                  "only when the cue rate positively says so: My Home Hero "
                  "S01E02 carries 22 cues over 24 minutes, The Castle of "
                  "Cagliostro 12 over 99."},
     "spoken": {
-        "says": WANT, "sure": 95, "short": "you can follow it anyway",
-        "line": "the rule asks for a subtitle this file has not got, but the "
-                "audio is in the language",
-        "rests": "heard by Whisper where it has listened, tagged where it "
-                 "has not, and the metadata's original language last of all. "
-                 "Whisper outranks the metadata on purpose: they disagree "
-                 "about 14,738 files here and 14,196 of those are the same "
-                 "shape - the metadata says Japanese and the audio is an "
-                 "English dub."},
+        "says": WANT, "sure": 95, "short": "not a raw - you speak it",
+        "line": "it is spoken in the language, so it is not a raw",
+        "rests": "the rule asked for a subtitle and this file has not got "
+                 "one, so it is listed - but you can already understand it, "
+                 "which is the whole thing the check is for. Nothing is "
+                 "deleted over a film you can follow. Heard by Whisper where "
+                 "it has listened, tagged where it has not, and the "
+                 "metadata's original language last of all: Whisper outranks "
+                 "the metadata because they disagree about 14,738 files here "
+                 "and 14,196 of those are the same shape - the metadata says "
+                 "Japanese and the audio is an English dub."},
     "missing": {
-        "says": MISSING, "sure": 90, "short": "nothing anywhere",
-        "line": "nothing tagged, nothing beside it and nothing in the "
-                "picture",
-        "rests": "every rung above had its say first, and nothing anywhere "
-                 "carries the language: no dialogue track, no file beside it, "
-                 "nothing in the picture, and the audio is in some other "
-                 "language. There is no way to follow this file."},
+        "says": MISSING, "sure": 90, "short": "a raw",
+        "line": "a raw - spoken in a language you have not got, with "
+                "nothing to read",
+        "rests": "every rung above had its say first. No dialogue track, "
+                 "no file beside it, nothing in the picture, and the audio is "
+                 "in a language this library was not asked to keep. Nothing "
+                 "nuarr can do to these bytes produces a subtitle, so the "
+                 "only fix is a different release - which is why this is the "
+                 "one rung with a button."},
 }
 
 # THE ORDER THE LADDER IS ACTUALLY TRIED IN, written out rather than taken
@@ -1291,15 +1319,22 @@ def scoring() -> dict:
     rep = st.get("replaces") or {}
     return {
         "rows": rows,
-        "how": ("The rungs are tried in this order and the first one that "
-                "matches answers the question - nothing under it runs. So a "
-                "file's sureness is the sureness of the rung that caught it, "
-                "and the rungs that make no claim carry none: \"open\" is a "
-                "verdict about what nuarr knows, not about the file."),
-        "acts": ("Only the accusing rung is wired to a button. Everything "
-                 "the other rungs decide either clears the file or leaves the "
-                 "question open, and an open question is never acted on - "
-                 "which is the rule that keeps 384 files waiting on a re-read "
+        "how": ("A RAW is a film nobody here can follow: spoken in a "
+                "language you have not got, with no dialogue you can read. "
+                "That is the only thing this check hunts, and it is the only "
+                "thing it replaces a release over. The rungs are tried in "
+                "this order and the first one that matches answers the "
+                "question, so a file's sureness is the sureness of the rung "
+                "that caught it - and the rungs that make no claim carry "
+                "none, because \"open\" is a verdict about what nuarr knows "
+                "rather than about the file."),
+        "acts": ("Only the two raw rungs are wired to a button, and in "
+                 "auto mode only those two blocklist the release and ask the "
+                 "arr for another copy. A file you can already follow is "
+                 "listed and left alone however loudly the rule asked for a "
+                 "subtitle - deleting a film you understand is a loud answer "
+                 "to a quiet question. An open question is never acted on "
+                 "either, which is what keeps the files waiting on a re-read "
                  "off a list offering to delete them."),
         "replaced": rep,
         "counted": {"files": sum(int((v or {}).get("live") or 0)
@@ -1769,7 +1804,7 @@ async def act_now(limit: int = 50) -> dict:
 async def watch() -> None:
     from . import schedules
     schedules.register(
-        "subneed", "Required subtitle language", "Subtitles", POLL_S,
+        "subneed", "Raws - nothing here you can read", "Subtitles", POLL_S,
         what="Asks, for every file, whether it carries the subtitle languages "
              "its library requires - and says so when a file carries none and "
              "no re-encode could produce one. Reads stored facts only; opens "

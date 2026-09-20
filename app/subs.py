@@ -364,26 +364,34 @@ def board() -> list:
         mode = sn.get("mode") or "manual"
         rows.append({
             "key": "language",
-            "name": "A required subtitle language",
-            "does": "Checks every file against the subtitle languages its "
-                    "library requires - a track, a file beside it, the words "
-                    "burned into the picture, or the audio already in that "
-                    "language. Lists what carries none, and can blocklist the "
-                    "release and ask the arr for another.",
-            "why": "A raw Japanese release with no subtitle track passes every "
-                   "other check, because every other check asks whether what "
-                   "is there is correct. Nothing was asking whether what was "
-                   "asked for is there at all.",
+            "name": "Raws - nothing here you can read",
+            "does": "Finds releases in a language you have not got, carrying "
+                    "no dialogue you can read - a raw, in anime terms. "
+                    "Dialogue means a track, a file beside it, or the words "
+                    "burned into the picture; signs and songs do not count, "
+                    "because they translate a shop front and leave the "
+                    "conversation alone. A film spoken in a language you keep "
+                    "is never a raw, whatever its subtitle tracks say. Only "
+                    "raws get a button: blocklist the release and ask the arr "
+                    "for a copy that has subtitles.",
+            "why": "A raw passes every other check nuarr has, because every "
+                   "other check asks whether what is there is CORRECT - the "
+                   "title matches the track, the audio matches the tag, the "
+                   "bytes decode. None of them asks whether you can follow "
+                   "the story, and no amount of repacking these bytes "
+                   "produces a subtitle. Only a different release fixes it.",
             "on": mode == "auto",
             "setting": (f"{mode} · " + (" · ".join(
                 f"{lib} needs {', '.join(ls)}" for lib, ls in req.items())
                 if req else "nothing required yet")),
             "waiting": int(c.get("missing") or 0),
-            "waiting_word": "files carrying none of a required language - "
-                            "each one a release to replace",
+            "waiting_word": "raws - each one a release only a different "
+                            "copy can fix",
             "needs_you": 0 if mode == "auto" else int(c.get("missing") or 0),
-            "detail_name": "Required subtitle language",
-            "detail": (f"{int(c.get('ok') or 0):,} carry it · "
+            "detail_name": "Raws - nothing here you can read",
+            "detail": (f"{int(c.get('ok') or 0):,} you can follow · "
+                       f"{int(c.get('want') or 0):,} spoken in the language, "
+                       f"so listed but never replaced · "
                        f"{int(c.get('unknown') or 0):,} not looked inside yet, "
                        f"so no opinion and no button"
                        if req else "tick require under a language in "
@@ -391,7 +399,7 @@ def board() -> list:
             "goto": "", "panel": "snPanel", "toggle": "",
         })
     except Exception as e:                                       # noqa: BLE001
-        rows.append(_broken("language", "A required subtitle language", e))
+        rows.append(_broken("language", "Raws - nothing here you can read", e))
 
     return rows
 

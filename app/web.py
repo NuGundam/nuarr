@@ -10291,7 +10291,7 @@ async def api_subneed_mode(mode: str):
         + (" - a file carrying none of the subtitle languages its library "
            "requires will have its release blocklisted and re-searched"
            if mode == "auto" else
-           " - files missing a required subtitle language will be listed "
+           " - raws will be listed "
            "and wait for you"), "warn" if mode == "auto" else "info")
     return {"ok": True, "mode": subneed.mode()}
 
@@ -10349,7 +10349,7 @@ async def api_subneed_check():
         try:
             await subneed.act_now(50)
         except Exception as e:                           # noqa: BLE001
-            joblog.log(f"required subtitle language (auto): "
+            joblog.log(f"raws (auto): "
                        f"{type(e).__name__}: {e}", "warn")
 
     asyncio.create_task(_run())
@@ -32283,7 +32283,7 @@ function langBlockHtml(lib, side, sideLabel){
   const req=new Set((cfg.require)||[]);
   const reqSw=c=>side!=='subs'?'':`<label class="lreq${req.has(c)?' on':''}"
       title="${req.has(c)
-        ? 'Required. A file carrying no '+esc(name(c))+' subtitles - no track, no sidecar, nothing burned into the picture, and not spoken in it either - is listed below as a file only a different release can fix.'
+        ? 'Required. This is the language you read when you cannot follow the audio. A file spoken in something else, with no '+esc(name(c))+' dialogue to read - no track, no file beside it, nothing burned into the picture - is a RAW: nothing nuarr can do to those bytes produces a subtitle, so it is listed below and only a different release fixes it. Signs and songs do not count as dialogue. A file already spoken in '+esc(name(c))+' is listed but never replaced - you can follow it.'
         : 'Only kept. Nothing checks whether a file actually HAS '+esc(name(c))+' subtitles.'}"
       onclick="event.stopPropagation()">
       <input type="checkbox" ${req.has(c)?'checked':''}
@@ -38804,10 +38804,11 @@ function snWantBox(){
   return `<div style="margin:6px 14px 2px;padding:9px 11px;border:1px solid
        var(--line);border-radius:7px;background:rgba(255,255,255,.02)">
     <div style="font-size:11.5px"><b>${fmt(rows.length)}</b>
-      <b>the rule wants, and you can follow anyway</b>
-      <span class="dim">— ${by.size} show${by.size===1?'':'s'}. Their audio is
-        already in the language the rule asks a subtitle for, so nothing here
-        is untranslatable and no button touches them.</span>
+      <b>spoken in the language, with no subtitle</b>
+      <span class="dim">— ${by.size} show${by.size===1?'':'s'}. The rule asked
+        for a subtitle and these have not got one, but they are spoken in that
+        language: not raws, nothing anybody cannot follow. Listed because the
+        rule asked; never replaced, in auto or by hand.</span>
       <a href="#" onclick="snWantShow();return false" style="margin-left:10px">hide</a></div>
     <div class="rowbox scrollbox nohz" style="max-height:300px;margin-top:5px">
       <table style="width:100%;font-size:11.5px;border-collapse:collapse">
@@ -38901,20 +38902,20 @@ function snPaint(force){
   const gb=n=>Math.round((n||0)/1073741824*100)/100;
 
   // ---- head: the other panel's, with this one's words ----
-  const head=`<div class="subshd"><b style="color:#e8a33d">Required subtitle language</b>
+  const head=`<div class="subshd"><b style="color:#e8a33d">Raws - nothing here you can read</b>
     <span class="subskind ${auto?'k-auto':'k-ask'}"
       title="${auto?'Files carrying none of a required language are replaced by the shared remedy without asking, capped per hour across every check.':'Nothing is replaced until you press a button.'}">${auto?'runs by itself':'waiting on you'}</span>
-    <span class="dim subssub" title="A file counts as carrying a language if it has a track tagged with it, a subtitle file beside it, the dialogue burned into its picture, the audio in that language already, or - where the library keeps untagged tracks - an untagged track that may be it. What is left carries none of them, and no re-encode writes subtitles that are not in the release.">files carrying none of the language their library requires</span>
+    <span class="dim subssub" title="A RAW is a film nobody here can follow: spoken in a language this library was not asked to keep, and carrying no dialogue you can read - not a tagged track, not a file beside it, not words burned into the picture, and not an untagged track that might be the one. Signs and songs are not dialogue; they translate a shop front and leave the conversation alone. Nothing nuarr can do to a raw produces a subtitle - the planner cannot translate, the OCR has no picture to read, the listener hears Japanese - so the only fix is a different release. A film spoken in the language is never a raw however its tracks are labelled.">raws - films and episodes nobody here can follow</span>
     <span class="subsn">${miss?`${num(miss,'you')} <span class="dim">to answer</span>`
                               :'<b style="color:var(--ok)">nothing to answer</b>'}</span>
     </div>
     <span class="dim" style="font-size:11.5px">
       ${req?`<span>${req}</span> · `:''}
-      <span title="carry what their library requires">${num(ok,'done')} carry it</span>
+      <span title="Either spoken in a language this library keeps, or carrying dialogue you can read. Not a raw.">${num(ok,'done')} you can follow</span>
       ${wnt?` · <a href="#" onclick="snWantShow();return false"
-          title="The rule asks these libraries for a subtitle these files have not got - and their audio is already in that language, so there is nothing in them a viewer cannot follow. They are listed because the rule asked; no button touches them, and nothing is ever deleted over one. Click to see which."
+          title="These are spoken in the language the rule asks a subtitle for, so they are not raws - you can follow every one of them. The rule asked and they have not got one, so they are listed; but a film you understand is not something to delete a release over, so no button touches them and auto mode never replaces one. Click to see which."
           style="color:${_snWant?'#e8a33d':'inherit'};text-decoration:none;
-          border-bottom:1px dotted currentColor">${num(wnt,'auto')} you can follow anyway${_snWant?' ▾':''}</a>`:''}
+          border-bottom:1px dotted currentColor">${num(wnt,'auto')} spoken in it, no subtitle${_snWant?' ▾':''}</a>`:''}
       ${unk?` · ${snUnknownWords(c)}`:''}
       · <a href="#" onclick="snScoreToggle();return false"
           title="Every rung of the ladder this check runs down, how sure that rung is, how many files rest on it, and how many of its answers it has since had to take back."
@@ -38954,7 +38955,7 @@ function snPaint(force){
                   :'on its own schedule'}</span>
     </div>`:''}
     <span class="dim" style="font-size:11px;display:block;margin-top:2px">
-      <span title="This runs on its own schedule as well - Check now just brings the next one forward, and in auto it acts on what it finds. Its row is under System · Jobs, named Required subtitle language.">runs by itself every ${
+      <span title="This runs on its own schedule as well - Check now just brings the next one forward, and in auto it acts on what it finds. Its row is under System · Jobs, named Raws - nothing here you can read.">runs by itself every ${
         esc(hsDur(d.poll_s||900))}</span>${
       d.at?` · last ${esc(ago(d.at))}${d.took?` in ${esc(hsDur(d.took))}`:''}`:' · not run yet'}${
       d.next_run?` · next ${esc(hsDur(Math.max(0,d.next_run-Date.now()/1000)))} away`:''}${
@@ -39043,7 +39044,7 @@ function snPaint(force){
            // every file carries what it needs would be claiming an answer it
            // has deliberately not given yet.
            ? `Nothing to accuse yet. ${fmt(c.unknown_by.stale)} file${c.unknown_by.stale===1?'':'s'} carry no track and rest on a picture reading from an older reader - they are queued to be read again, and any that still come back empty will appear here on their own.`
-           : 'Every file that has been looked inside carries what its library requires.')}</div>`;
+           : 'No raws. Every file that has been looked inside is either spoken in a language you keep or carries dialogue you can read.')}</div>`;
   // ALREADY ANSWERED, under the list, the way the panel above does it.
   // The rows are the ledger's, so they say what was done and when rather
   // than what is wrong - there is nothing wrong with them any more.
@@ -39094,7 +39095,8 @@ function snPaint(force){
   // as "everything is fine".
   const foot=`<div class="dim" style="display:flex;gap:12px;align-items:center;
        flex-wrap:wrap;font-size:11px;margin-top:6px">
-    <span>${miss?`${fmt(miss)} still to answer`:'nothing still to answer'}${
+    <span>${miss?`${fmt(miss)} raw${miss===1?'':'s'} still to answer`
+                 :'no raws still to answer'}${
       unk?` · ${fmt(unk)} with no opinion and no button`:''}</span>
     ${nDone?`<a href="#" onclick="snShowDone(${_snDone?0:1});return false"
       title="Releases this check has already blocklisted and re-searched. They come from the shared remedy ledger rather than from this list, because answering one deletes its row - the file it was about no longer exists.">${
@@ -42075,13 +42077,13 @@ const SUBS_READER_FEEDS={
      'The sidecar, duplicate and title rows of the switchboard are all decided from what this reader stored - which tracks are inside, what is beside the file.'],
     ['list',     'the file-by-file list',
      'Every plan in that list is made from this reader\'s row for the file.'],
-    ['language', 'Required subtitle language',
+    ['language', 'Raws - nothing here you can read',
      'Whether a file carries a track in its required language is read from here first.']],
   picture:[
     ['picture',  'Subtitle User Input',
      'Its picture rows - the ones with a Mark it button - are this reader\'s verdicts, scored.'],
-    ['language', 'Required subtitle language',
-     'A file with the dialogue burned into the picture carries its language; one this reader has not looked at, or found marks it could not read, is not accused.']],
+    ['language', 'Raws - nothing here you can read',
+     'A file with the dialogue burned into the picture is not a raw; one this reader has not looked at, or found marks it could not read, is not accused either.']],
   events:[
     ['picture',  'Subtitle User Input',
      'Its track rows - the title-contradicts-cue-rate ones - are this reader\'s counts of plain dialogue lines, and the cross-episode match.']],
