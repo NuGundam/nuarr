@@ -262,6 +262,25 @@ _CONN_PRAGMAS = (
     # the behaviour is one thing rather than twenty-five partial views.
     "PRAGMA mmap_size=0;"
     "PRAGMA busy_timeout=30000;"
+    # AND A CEILING ON THE LOG FILE, which had none.
+    #
+    # Measured on the live database: a 531 MB -wal beside a 693 MB database,
+    # and of its 135,250 frame slots exactly 487 were live. The checkpoint
+    # was working perfectly - it folds the pages back and restarts the log at
+    # the beginning, so a reader only ever walked 1.9 MB. The FILE just never
+    # shrank, because journal_size_limit defaults to -1, which means "never
+    # give the space back".
+    #
+    # maintenance.py has a loop that asks for a TRUNCATE checkpoint six times
+    # over ten seconds hoping to catch a moment with no reader on an older
+    # snapshot. That race is real and it was losing it: the note there records
+    # the WAL "at 524 MB with only 394 pages in it, folded but never
+    # restarted". This pragma does not race. SQLite truncates the log back to
+    # the limit at the end of every checkpoint it completes, on its own, and
+    # a checkpoint that finds a reader simply tries again on the next commit.
+    #
+    # 64 MB to match WAL_KEEP_MB, so there is one number and not two.
+    "PRAGMA journal_size_limit=67108864;"
 )
 
 # One connection per thread, kept open. Opening a fresh connection for every

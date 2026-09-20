@@ -86,6 +86,23 @@ PROBE_DAYS = 30          # backstop only; see above - in practice this never fir
 RENAME_DONE_DAYS = 14
 RENAME_GAVEUP_DAYS = 90
 
+# THE PLEX QUEUE, WHICH NOTHING ANYWHERE DELETED FROM. Measured in the system
+# audit: 7,294 rows, 7,293 of them carrying a done_at - finished work being
+# carried for nothing, exactly the shape rename_queue had.
+#
+# AND IT IS NOT A RUNAWAY, WHICH THE AUDIT FIRST CALLED IT. file_id is the
+# PRIMARY KEY, so re-queueing a file replaces its row rather than adding one:
+# the table cannot exceed one row per file, and the ceiling is the library -
+# about 40,000 - not the calendar. That is the difference between a bug and
+# untidiness, and this is the second.
+#
+# Worth doing anyway. A table that only ever selects `done_at IS NULL` pays
+# for every finished row it carries in index size and in backup bytes, and
+# the split is rename_queue's: a row that gave up is the only kind anybody
+# looks back at, so it outlives the ordinary ones.
+PLEX_DONE_DAYS = 14
+PLEX_GAVEUP_DAYS = 90
+
 # Job log files on disk. THIS is what had no bound at all: 50,955 files at
 # roughly 10,000/day, oldest five days old, and prune() only ever covered
 # database tables. Enumerating that directory already cost 1.8 s; left alone it
@@ -161,6 +178,8 @@ def prune(dry_run: bool = False) -> dict:
     p_cut = now - PROBE_DAYS * 86400
     rd_cut = now - RENAME_DONE_DAYS * 86400
     rg_cut = now - RENAME_GAVEUP_DAYS * 86400
+    pd_cut = now - PLEX_DONE_DAYS * 86400
+    pg_cut = now - PLEX_GAVEUP_DAYS * 86400
     out: dict = {"dry_run": dry_run}
 
     with cursor() as cur:
@@ -189,6 +208,15 @@ def prune(dry_run: bool = False) -> dict:
                 (rd_cut, rg_cut)).fetchone()["c"]
         except Exception:
             out["renames_matched"] = 0
+        # The Plex queue, on the same terms. See PLEX_DONE_DAYS.
+        try:
+            out["plexq_matched"] = cur.execute(
+                "SELECT COUNT(*) c FROM plex_queue WHERE done_at IS NOT NULL "
+                "AND ((COALESCE(last_error,'') NOT LIKE 'gave up%' AND done_at < ?) "
+                "  OR (COALESCE(last_error,'') LIKE 'gave up%' AND done_at < ?))",
+                (pd_cut, pg_cut)).fetchone()["c"]
+        except Exception:                                        # noqa: BLE001
+            out["plexq_matched"] = 0
 
         if dry_run:
             return out
@@ -219,6 +247,17 @@ def prune(dry_run: bool = False) -> dict:
                      f" LIMIT {CHUNK})", (rd_cut, rg_cut))
         except Exception:
             out["renames_deleted"] = 0
+        try:
+            out["plexq_deleted"] = _delete_chunked(
+                cur, "DELETE FROM plex_queue WHERE rowid IN "
+                     "(SELECT rowid FROM plex_queue WHERE done_at IS NOT NULL "
+                     " AND ((COALESCE(last_error,'') NOT LIKE 'gave up%' "
+                     "       AND done_at < ?) "
+                     "   OR (COALESCE(last_error,'') LIKE 'gave up%' "
+                     "       AND done_at < ?)) "
+                     f" LIMIT {CHUNK})", (pd_cut, pg_cut))
+        except Exception:                                        # noqa: BLE001
+            out["plexq_deleted"] = 0
         # SHAPE VERDICTS OUTLIVE THEIR FILES. sub_shape has no foreign key -
         # it is written by the OCR check against a file id and nothing removes
         # a row when that file leaves the library. forget_shapes() covers the
@@ -593,6 +632,14 @@ async def watch() -> None:
                     # in it, folded but never restarted. An external process
                     # got the gap first time; asking six times over ten
                     # seconds finds it too.
+                    #
+                    # THIS IS NOW THE SECOND LINE OF DEFENCE, not the first.
+                    # db.py sets journal_size_limit, so SQLite trims the file
+                    # back to 64 MB at the end of every checkpoint it
+                    # completes - no race to win and nothing to retry. This
+                    # loop still runs, and should now find the log already
+                    # small on almost every look; it earns its keep on the
+                    # day something holds a read snapshot open for hours.
                     c = {}
                     for _i in range(6):
                         c = await asyncio.to_thread(checkpoint, "TRUNCATE")

@@ -40,6 +40,7 @@ rules.decide() keeps every track rather than guessing.
 from __future__ import annotations
 
 import json
+import time
 
 from .db import cursor
 
@@ -159,12 +160,39 @@ def _norm(got: dict, into: dict) -> None:
             into[flag] = bool(got[flag])
 
 
+# THE POLICY, HELD BRIEFLY. Measured in the system audit: this was the single
+# busiest database caller running on the event loop - 2,494 reads in one
+# sample window, against a row that changes when somebody edits a setting and
+# at no other time. for_library() calls load() calls this, and for_library()
+# is called per library per pass by six different checks.
+#
+# THE CACHE HOLDS THE TEXT, NOT THE DICT, and that is the whole safety of it.
+# save() does `merged = _stored()` and then mutates merged in place; handing
+# it a shared object would let one save quietly rewrite what every later
+# reader sees, including the parts it did not touch. Parsing a small blob per
+# call costs microseconds and keeps every caller's copy its own.
+#
+# _write() refreshes it on the spot, so an edit is visible immediately and the
+# TTL is only a backstop for a row changed by some path that does not go
+# through _write.
+_CACHE: dict = {"at": 0.0, "text": ""}
+_CACHE_TTL = 30.0
+
+
 def _stored() -> dict:
+    now = time.time()
+    if _CACHE["text"] and now - _CACHE["at"] < _CACHE_TTL:
+        try:
+            return json.loads(_CACHE["text"]) or {}
+        except Exception:                                        # noqa: BLE001
+            _CACHE["text"] = ""
     try:
         with cursor() as cur:
             r = cur.execute("SELECT v FROM kv WHERE k=?", (_KEY,)).fetchone()
         if r:
+            _CACHE.update(at=now, text=str(r["v"] or ""))
             return json.loads(r["v"]) or {}
+        _CACHE.update(at=now, text="")
     except Exception:
         pass
     return {}
@@ -211,10 +239,16 @@ def load() -> dict:
 
 
 def _write(pol: dict) -> None:
+    text = json.dumps(pol)
     with cursor() as cur:
         cur.execute("INSERT INTO kv(k,v) VALUES(?,?) "
                     "ON CONFLICT(k) DO UPDATE SET v=excluded.v",
-                    (_KEY, json.dumps(pol)))
+                    (_KEY, text))
+    # The write IS the invalidation. A policy edit has to be visible on the
+    # next read rather than up to thirty seconds later - somebody ticking
+    # "require eng" and seeing the old answer come back would be a worse bug
+    # than the round trips this cache exists to save.
+    _CACHE.update(at=time.time(), text=text)
 
 
 def normalise(pol: dict, base: dict | None = None) -> dict:

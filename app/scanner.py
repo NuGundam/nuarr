@@ -1088,7 +1088,13 @@ async def scan(full: bool = True, probe_orphans: bool = True,
 
         with cursor() as cur:
             rows = cur.execute(
-                "SELECT id, arr_name, arr_file_id, content_sig, path, size, mtime, "
+                # arr_parent_id, library, title, season and episode are read
+                # for one reason: so an unchanged row can be RECOGNISED as
+                # unchanged. Without them the reconcile loop had no way to
+                # tell, and wrote all thirteen columns back on every pass
+                # whatever the values were. See `same` below.
+                "SELECT id, arr_name, arr_file_id, arr_parent_id, content_sig, "
+                "path, library, title, season, episode, size, mtime, "
                 "pool_disk, state, state_reason FROM files"
             ).fetchall()
 
@@ -1106,7 +1112,33 @@ async def scan(full: bool = True, probe_orphans: bool = True,
                     live_at.setdefault(os.path.normcase(r["path"]), set()).add(r["id"])
             seen_ids: set[int] = set()
 
+            # ---- A ROW THAT HAS NOT CHANGED STILL HAS TO BE MARKED SEEN ---
+            #
+            # The reconcile loop appended EVERY matched row to `updates` and
+            # wrote thirteen columns back, including for the rows it had just
+            # counted as unchanged - rep.unchanged, right there, and then the
+            # write anyway. Measured during the system audit: 23,052 of
+            # 39,945 file rows rewritten inside five minutes, every one with
+            # the values it already had.
+            #
+            # Timed on a copy of this database, 23,000 rows:
+            #
+            #     the thirteen-column UPDATE     755 ms   ~32 MB of log frames
+            #     last_seen only                  55 ms   a fraction of that
+            #     comparing in Python first       65 ms
+            #
+            # The gap is not the row bytes - it is the eleven other columns
+            # and the index entries that come with them. Comparing first and
+            # writing the one column that genuinely moved costs a tenth of
+            # it, and `touches` is where those go.
+            #
+            # last_seen IS STILL WRITTEN, on purpose. Nothing in nuarr reads
+            # it today, so it could have been dropped entirely - and a column
+            # that quietly stops meaning what its name says is a trap for
+            # whoever needs it next. It is cheap to keep honest, so it is
+            # kept honest.
             inserts, updates, events, dup_inserts = [], [], [], []
+            touches: list = []
             sig_inserts: list = []
             matched_paths: set[str] = set()
             sig_claimed: dict[str, str] = {s: r["path"] for s, r in by_sig.items()}
@@ -1238,10 +1270,25 @@ async def scan(full: bool = True, probe_orphans: bool = True,
                 else:
                     rep.unchanged += 1
 
-                updates.append((
-                    af.parent_id, af.path, lib, af.title, af.season, af.episode,
-                    size, mtime, disk, state, reason, now, now, prev["id"],
-                ))
+                same = (prev["arr_parent_id"] == af.parent_id
+                        and (prev["path"] or "") == (af.path or "")
+                        and (prev["library"] or "") == (lib or "")
+                        and (prev["title"] or "") == (af.title or "")
+                        and prev["season"] == af.season
+                        and prev["episode"] == af.episode
+                        and prev["size"] == size
+                        and prev["mtime"] == mtime
+                        and (prev["pool_disk"] or "") == (disk or "")
+                        and prev["state"] == state
+                        and (prev["state_reason"] or None) == (reason or None))
+                if same:
+                    touches.append((now, prev["id"]))
+                else:
+                    updates.append((
+                        af.parent_id, af.path, lib, af.title, af.season,
+                        af.episode, size, mtime, disk, state, reason, now,
+                        now, prev["id"],
+                    ))
 
             # ---------------- files on disk the arrs know nothing about ----------
             # TIMED, because this is the only part of reconcile that touches the
@@ -1319,18 +1366,35 @@ async def scan(full: bool = True, probe_orphans: bool = True,
                         rep.renamed += 1
                         events.append((prev["id"], "renamed",
                                        f"{prev['path']} -> {df.path}", now))
-                    updates.append((
-                        None, df.path, df.library, None, None, None, df.size, df.mtime,
-                        df.disk, prev["state"],
-                        # Same rule as the arr-keyed branch above: a verdict
-                        # keeps its explanation, a passing condition does not.
-                        (prev["state_reason"]
-                         if (prev["state"] in ("deleted", "error")
-                             or str(prev["state_reason"] or "")
-                             .startswith("subtitle OCR"))
-                         else None),
-                        now, now, prev["id"],
-                    ))
+                    # Same rule as the arr-keyed branch above: a verdict
+                    # keeps its explanation, a passing condition does not.
+                    _reason = (prev["state_reason"]
+                               if (prev["state"] in ("deleted", "error")
+                                   or str(prev["state_reason"] or "")
+                                   .startswith("subtitle OCR"))
+                               else None)
+                    # This branch writes NULL over five columns it does not
+                    # know - parent, title, season, episode - so "unchanged"
+                    # here means those were already null, which for an
+                    # orphan matched by signature they are.
+                    _same = (prev["arr_parent_id"] is None
+                             and (prev["path"] or "") == (df.path or "")
+                             and (prev["library"] or "") == (df.library or "")
+                             and prev["title"] is None
+                             and prev["season"] is None
+                             and prev["episode"] is None
+                             and prev["size"] == df.size
+                             and prev["mtime"] == df.mtime
+                             and (prev["pool_disk"] or "") == (df.disk or "")
+                             and (prev["state_reason"] or None) == (_reason or None))
+                    if _same:
+                        touches.append((now, prev["id"]))
+                    else:
+                        updates.append((
+                            None, df.path, df.library, None, None, None,
+                            df.size, df.mtime, df.disk, prev["state"], _reason,
+                            now, now, prev["id"],
+                        ))
 
             # UPSERT, not a bare INSERT. A plain INSERT aborts the whole pass the
             # moment one row already exists:
@@ -1391,6 +1455,12 @@ async def scan(full: bool = True, probe_orphans: bool = True,
             # duplicates carry neither key, so no unique index applies to them
             if dup_inserts:
                 cur.executemany(_INSERT_SQL, dup_inserts)
+            if touches:
+                # One column, no index entry moves, and nothing claims the row
+                # changed when it did not - updated_at stays where it was,
+                # which is what "when nuarr last touched this row" means.
+                cur.executemany(
+                    "UPDATE files SET last_seen=? WHERE id=?", touches)
             if updates:
                 cur.executemany(
                     "UPDATE files SET arr_parent_id=?, path=?, library=?, title=?, "
