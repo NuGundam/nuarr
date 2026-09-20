@@ -682,6 +682,95 @@ def counts() -> dict:
     return out
 
 
+# THE THREE BUCKETS, AND THE FILES IN THEM. The header has counted these
+# since it was written and there was no way to reach them: "138 not looked
+# inside · 380 undecided" over a panel that lists neither, so the only way to
+# find out what they were was to ask the database by hand. Each is a real
+# question about real files - 81 of the undecided are one show, Detective
+# Conan, every one of them reading "marks low in the picture the OCR could
+# not read" - and that is a fact worth being able to see rather than infer.
+UNKNOWN_KINDS = ("unread", "stale", "open")
+UNKNOWN_WORDS = {"unread": "not looked inside",
+                 "stale": "waiting on a re-read",
+                 "open": "undecided"}
+
+
+def unknown_files(kind: str = "", limit: int = 600) -> dict:
+    """The files behind one of the unknown counts, newest first.
+
+    Grouped as well as listed: 380 rows is not a list anybody reads, but
+    "Detective Conan, 80 of them, all saying the same thing" is an answer.
+    """
+    init()
+    kind = kind if kind in UNKNOWN_KINDS else ""
+    try:
+        from . import hardsub as _hs
+        rev = int(_hs.READER_REV)
+    except Exception:                                            # noqa: BLE001
+        rev = 0
+    rows, by_show = [], {}
+    try:
+        with cursor() as cur:
+            q = ("SELECT CASE WHEN h.file_id IS NULL THEN 'unread' "
+                 "            WHEN COALESCE(h.rev,1) < ? "
+                 "                 AND COALESCE(h.chosen,'')='' THEN 'stale' "
+                 "            ELSE 'open' END AS k, "
+                 "       n.file_id, n.lang, n.why, n.checked_at, "
+                 "       f.path, f.title, f.season, f.episode, f.library "
+                 "  FROM sub_need n "
+                 "  JOIN files f ON f.id = n.file_id "
+                 "  LEFT JOIN hardsub h ON h.file_id = n.file_id "
+                 " WHERE n.state = ? "
+                 "   AND f.state NOT IN ('deleted','duplicate')")
+            args: list = [rev, UNKNOWN]
+            if kind:
+                q += " AND (CASE WHEN h.file_id IS NULL THEN 'unread' " \
+                     "           WHEN COALESCE(h.rev,1) < ? " \
+                     "                AND COALESCE(h.chosen,'')='' THEN 'stale' " \
+                     "           ELSE 'open' END) = ?"
+                args += [rev, kind]
+            q += " ORDER BY f.title, f.season, f.episode"
+            for r in cur.execute(q, tuple(args)):
+                show = _show_of(str(r["path"] or ""))
+                g = by_show.setdefault(show, {"show": show, "n": 0,
+                                              "library": r["library"] or "",
+                                              "kind": r["k"], "why": ""})
+                g["n"] += 1
+                if not g["why"]:
+                    g["why"] = str(r["why"] or "")[:160]
+                if len(rows) < max(1, int(limit)):
+                    rows.append({
+                        "file_id": int(r["file_id"]), "kind": r["k"],
+                        "kind_word": UNKNOWN_WORDS.get(r["k"], r["k"]),
+                        "lang": r["lang"], "show": show,
+                        "library": r["library"] or "",
+                        "label": _row_label(r), "path": str(r["path"] or ""),
+                        "why": str(r["why"] or "")[:200],
+                        "at": float(r["checked_at"] or 0.0)})
+    except Exception as e:                                       # noqa: BLE001
+        return {"ok": False, "why": f"{type(e).__name__}: {e}"[:160],
+                "rows": [], "shows": []}
+    shows = sorted(by_show.values(), key=lambda g: -g["n"])
+    return {"ok": True, "kind": kind, "word": UNKNOWN_WORDS.get(kind, "unknown"),
+            "rows": rows, "shows": shows,
+            "total": sum(g["n"] for g in shows), "shown": len(rows)}
+
+
+def _row_label(r) -> str:
+    """'Detective Conan - S16E08', not the whole release name."""
+    try:
+        from .db import display_label
+        return display_label(r["title"], r["season"], r["episode"])
+    except Exception:                                            # noqa: BLE001
+        return str(r["title"] or "")
+
+
+def _show_of(path: str) -> str:
+    """'Detective Conan (1996) {tvdb-72454}' out of a pool path."""
+    parts = [p for p in str(path or "").replace("/", "\\").split("\\") if p]
+    return parts[2] if len(parts) > 2 else (parts[-1] if parts else "")
+
+
 def prune() -> int:
     r"""Forget verdicts about files that are not there any more.
 

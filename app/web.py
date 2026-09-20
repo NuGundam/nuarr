@@ -10239,6 +10239,13 @@ async def api_subneed(limit: int = 200, library: str = ""):
     return d
 
 
+@app.get("/api/subneed/unknown")
+def api_subneed_unknown(kind: str = "", limit: int = 600):
+    """The files behind one of the 'no opinion' counts in the header."""
+    from . import subneed
+    return subneed.unknown_files(kind, max(1, min(int(limit), 2000)))
+
+
 @app.get("/api/subneed/answered")
 async def api_subneed_answered(limit: int = 200):
     """The releases this check has already replaced, newest first."""
@@ -38592,13 +38599,77 @@ function snWhen(i, d){
 // three and the panel called all of it "not looked inside", while most of it
 // was files this check HAS looked inside and declined to judge on a picture
 // verdict the reader has already queued to redo.
+// AND EACH COUNT OPENS WHAT IT COUNTS. These three numbers were the only
+// figures on the page with no way through to the files behind them - "138
+// not looked inside" over a panel that lists neither, so the only way to
+// learn what they were was to ask the database by hand. Every one is a real
+// question about real files, and 81 of the undecided turned out to be one
+// show saying one thing.
+function snUnkLink(kind, n, word, title){
+  const on = _snUnk===kind;
+  return `<a href="#" onclick="snUnkShow('${kind}');return false" title="${title}"
+     style="color:${on?'#e8a33d':'inherit'};text-decoration:none;
+     border-bottom:1px dotted currentColor">${num(n,'auto')} ${word}${
+     on?' ▾':''}</a>`;
+}
 function snUnknownWords(c){
   const u=c.unknown_by||{}, bits=[];
-  if(u.unread) bits.push(`<span title="No probe or no picture reading yet. nuarr has no opinion about these, they are not listed, and no button touches them.">${num(u.unread,'auto')} not looked inside</span>`);
-  if(u.stale) bits.push(`<span title="Their picture was read by an earlier version of the reader - the caption floor and the OCR engine have both changed since - and they are queued to be read again. Not accused on a verdict nuarr has already decided to redo.">${num(u.stale,'auto')} waiting on a re-read</span>`);
-  if(u.open) bits.push(`<span title="Read by the current reader, and it saw marks it could not read or a single English word - enough to stop the accusation, not enough to clear the file.">${num(u.open,'auto')} undecided</span>`);
+  if(u.unread) bits.push(snUnkLink('unread', u.unread, 'not looked inside',
+    'No probe or no picture reading yet. nuarr has no opinion about these, they are not listed, and no button touches them. Click to see which.'));
+  if(u.stale) bits.push(snUnkLink('stale', u.stale, 'waiting on a re-read',
+    'Their picture was read by an earlier version of the reader - the caption floor and the OCR engine have both changed since - and they are queued to be read again. Click to see which.'));
+  if(u.open) bits.push(snUnkLink('open', u.open, 'undecided',
+    'Read by the current reader, and it saw marks it could not read or a single English word - enough to stop the accusation, not enough to clear the file. Click to see which.'));
   if(!bits.length) return `${num(c.unknown||0,'auto')} no opinion`;
   return bits.join(' · ');
+}
+let _snUnk='', _snUnkData=null, _snUnkBusy=false;
+async function snUnkShow(kind){
+  if(_snUnk===kind){ _snUnk=''; _snUnkData=null; _snKey=''; snPaint(true); return; }
+  _snUnk=kind; _snUnkData=null; _snUnkBusy=true; _snKey=''; snPaint(true);
+  try{ _snUnkData=await (await fetch('/api/subneed/unknown?kind='+kind
+        +'&limit=800')).json(); }
+  catch(e){ _snUnkData={ok:false, why:String(e)}; }
+  _snUnkBusy=false; _snKey=''; snPaint(true);
+}
+// The list, in the box the other lists use: the shows first, because 380
+// rows is not something anybody reads and "80 of them are one show" is the
+// answer most of the time.
+function snUnkBox(){
+  if(!_snUnk) return '';
+  const d=_snUnkData;
+  if(_snUnkBusy || !d) return `<div class="dim" style="padding:8px 14px;
+     font-size:11.5px">reading them…</div>`;
+  if(d.ok===false) return `<div class="dim" style="padding:8px 14px;
+     font-size:11.5px">could not read them: ${esc(d.why||'')}</div>`;
+  const shows=(d.shows||[]).map(g=>`<tr style="border-top:1px solid var(--line)">
+      <td style="padding:3px 8px 3px 0;text-align:right;white-space:nowrap;
+                 font-weight:600;width:52px">${fmt(g.n)}</td>
+      <td style="padding:3px 8px 3px 0">${esc(g.show)}
+        <span class="dim" style="font-size:10.5px">· ${esc(g.library||'')}</span>
+        ${g.why?`<div class="dim" style="font-size:10.5px">${esc(g.why)}</div>`:''}
+      </td></tr>`).join('');
+  const rows=(d.rows||[]).map(r=>`<tr style="border-top:1px solid var(--line)">
+      <td style="padding:3px 8px 3px 0">${esc(r.label||'')}
+        <div class="dim" style="font-size:10.5px">${esc(r.why||'')}</div></td>
+      <td style="padding:3px 8px 3px 0;width:70px;text-align:right"
+          class="dim">${esc(r.lang||'')}</td></tr>`).join('');
+  return `<div style="margin:6px 14px 2px;padding:9px 11px;border:1px solid
+       var(--line);border-radius:7px;background:rgba(255,255,255,.02)">
+    <div style="font-size:11.5px"><b>${fmt(d.total||0)} ${esc(d.word||'')}</b>
+      <span class="dim">— ${(d.shows||[]).length} show${
+        (d.shows||[]).length===1?'':'s'}${
+        d.shown<d.total?`, the first ${fmt(d.shown)} listed below`:''}</span>
+      <a href="#" onclick="snUnkShow('${_snUnk}');return false"
+         style="margin-left:10px">hide</a></div>
+    <div class="rowbox scrollbox nohz" style="max-height:200px;margin-top:5px">
+      <table style="width:100%;font-size:11.5px;border-collapse:collapse">
+        <tbody>${shows}</tbody></table></div>
+    <div class="dim" style="font-size:10.5px;margin-top:6px">every file</div>
+    <div class="rowbox scrollbox nohz" style="max-height:300px;margin-top:2px">
+      <table style="width:100%;font-size:11.5px;border-collapse:collapse">
+        <tbody>${rows}</tbody></table></div>
+  </div>`;
 }
 function snPaint(force){
   const el=document.getElementById('snPanel'); if(!el||!_sn) return;
@@ -38791,7 +38862,7 @@ function snPaint(force){
       _snDone?'hide':'also show'} the ${fmt(nDone)} answered</a>`:''}
   </div>${doneList}`;
 
-  const html=`<div class="subsp" id="subsPanelNeed">${head}${prog}${table}${foot}</div>`;
+  const html=`<div class="subsp" id="subsPanelNeed">${head}${snUnkBox()}${prog}${table}${foot}</div>`;
 
   // WHAT COUNTS AS CHANGED IS THE ROWS, not the markup.
   //
