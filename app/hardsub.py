@@ -1480,20 +1480,69 @@ def score_of(row) -> dict:
     # where that file came from, and a scorer with only the first will keep
     # asking about American cartoons whose OCR found a word in a title card.
     # Bounded on purpose: it nudges a borderline answer, it cannot make one.
-    fam, mult = _family_of(row), 1.0
-    if fam == "anime":
-        mult, word = 1.10, "anime, where 38% of the pictures sampled carried words"
-    elif fam == "animated":
-        mult, word = 0.60, ("animated but not anime, where 12 of 1,773 "
-                            "pictures sampled carried anything")
-    elif fam == "live":
-        mult, word = 0.90, "live action, where 12% of the pictures carried words"
-    else:
-        word = ""
-    if word:
+    fam = _family_of(row)
+    rate, said = BASE_RATE.get(fam, (0.0, ""))
+    # WHAT LANGUAGE THE FILE IS IN, which beats what shelf it sits on.
+    #
+    # Burned-in words exist because somebody had to translate something. So
+    # outside anime the question is not "is this a cartoon" but "is anyone on
+    # screen speaking a language this audience has no track for" - and the
+    # listener has already answered it for every file here. Counted over the
+    # 2,226 non-anime pictures sampled:
+    #
+    #   English audio only      21 of 2,160 carried anything      1%
+    #   a non-English track     51 of    66                      77%
+    #
+    # Eighty-fold, and per FILE rather than per library. FBI: Most Wanted
+    # S06E12 is the case that prompted it: five frames of "and, calitri,
+    # capitano, director, misner, photography, steven, susan" - a credit roll
+    # - over audio the listener heard as English in all five of its windows,
+    # scored 45% and asked about for ever.
+    if fam != "anime":
+        langs = _langs_of(row)
+        if langs and not (langs - {"eng", "en", "und", ""}):
+            rate, said = (0.0097, "the listener heard English and nothing "
+                                  "else here, and among non-anime files with "
+                                  "only English audio 21 of 2,160 carried "
+                                  "burned-in words")
+        elif langs - {"eng", "en", "und", ""}:
+            rate, said = (0.77, "this file carries audio that is not English, "
+                                "which is where burned-in words live - 51 of "
+                                "66 such files carried them")
+    if rate:
+        # THE MEASURED RATIO, NOT A NUMBER SOMEBODY LIKED. The multiplier is
+        # this family's base rate over the library's, which is what Bayes
+        # does with a prior, clamped at both ends so a rate that is nearly
+        # zero cannot veto a strong reading on its own: an animated show that
+        # really does carry burned-in words still gets there, it just has to
+        # be read clearly rather than read faintly.
+        mult = max(PRIOR_FLOOR, min(PRIOR_CEIL, rate / BASE_RATE_ALL))
         s *= mult
-        bits.append(word)
+        bits.append(said)
     return {"score": int(max(0, min(100, round(s)))), "why": "; ".join(bits)}
+
+
+# HOW OFTEN EACH KIND OF SHOW ACTUALLY CARRIES BURNED-IN WORDS, counted over
+# the 3,941 pictures this reader has sampled here. The figure on the left is
+# the share that carried anything at all.
+BASE_RATE = {
+    "anime": (0.38, "anime, where 38% of the pictures sampled carried words"),
+    "live": (0.12, "live action, where 12% of them did"),
+    "animated": (0.007, "animated but not anime, where 12 of 1,773 pictures "
+                        "sampled carried anything - seven tenths of one "
+                        "per cent"),
+}
+BASE_RATE_ALL = 0.196            # 772 of 3,941
+PRIOR_FLOOR, PRIOR_CEIL = 0.35, 1.25
+
+
+def _langs_of(row) -> set:
+    """The audio languages on this file, lowercased. Empty when unknown."""
+    try:
+        raw = str(row["audio_langs"] or "") if "audio_langs" in row.keys() else ""
+    except Exception:                                            # noqa: BLE001
+        raw = ""
+    return {x.strip().lower() for x in raw.split(",") if x.strip()}
 
 
 def _family_of(row) -> str:
@@ -1937,13 +1986,67 @@ def mark_progress() -> dict:
     return d
 
 
+def auto_dismiss(limit: int = 50) -> dict:
+    r"""Carry out the dismissals auto has already decided on.
+
+    THE HALF THAT LOST ITS RUNNER. Marking a file is a rewrite, so it moved
+    onto the queue with every other rewrite - one file, opened once. Dismissing
+    is not a rewrite at all: it writes one row saying this finding is not worth
+    acting on, and nothing else happens to the file. When marking moved, this
+    went with it by accident, and the verdict has been computed and displayed
+    ever since without anybody carrying it out - five rows sat in the panel
+    reading "auto: dismiss" and waiting for a person to press the button auto
+    had already decided to press.
+
+    Never marks. A dismissal is reversible from the ignored list; a marker
+    track is a file rewrite and stays where the queue can see it.
+    """
+    if mode() != "auto":
+        return {"ok": True, "dropped": 0, "why": "not in auto"}
+    done, seen = 0, []
+    try:
+        with cursor() as cur:
+            rows = cur.execute(
+                "SELECT h.file_id, h.path, h.state, h.low_hits, h.samples, "
+                "       h.words, h.marked, f.audio_langs, f.library "
+                "  FROM hardsub h JOIN files f ON f.id=h.file_id "
+                " WHERE h.state != ? AND h.marked=0 "
+                "   AND COALESCE(h.chosen,'')='' "
+                "   AND f.state NOT IN ('deleted','duplicate') "
+                "   AND h.file_id NOT IN (SELECT file_id FROM hardsub_ignored) "
+                " LIMIT 2000", (NONE,)).fetchall()
+    except Exception:                                            # noqa: BLE001
+        return {"ok": False, "dropped": 0}
+    for r in rows:
+        if done >= max(1, limit):
+            break
+        try:
+            if verdict_for(r).get("auto") != "dismiss":
+                continue
+            res = ignore(int(r["file_id"]))
+        except Exception:                                        # noqa: BLE001
+            continue
+        if res.get("ok"):
+            done += 1
+            seen.append(os.path.basename(str(r["path"] or "")))
+    if done:
+        joblog.log(f"burned-in subtitles: {done} finding(s) dismissed on their "
+                   f"own - nothing to act on"
+                   + (f" ({seen[0][:60]}"
+                      + (f" and {done - 1} more)" if done > 1 else ")")
+                      if seen else ""), "info")
+    return {"ok": True, "dropped": done}
+
+
 def _auto_one(file_id: int) -> str:
     """Act on one finding if its score is past either line. -> what was done."""
     try:
         with cursor() as cur:
             r = cur.execute(
-                "SELECT file_id, path, state, low_hits, samples, words, marked "
-                "  FROM hardsub WHERE file_id=?", (int(file_id),)).fetchone()
+                "SELECT h.file_id, h.path, h.state, h.low_hits, h.samples, "
+                "       h.words, h.marked, f.audio_langs, f.library "
+                "  FROM hardsub h JOIN files f ON f.id=h.file_id "
+                " WHERE h.file_id=?", (int(file_id),)).fetchone()
         if not r or r["marked"]:
             return ""
         d = verdict_for(r)
@@ -2369,7 +2472,8 @@ def found(limit: int = 60) -> list:
             rows = [dict(r) for r in cur.execute(
                 "SELECT h.file_id, h.path, h.state, h.low_hits, h.samples, "
                 "       h.words, h.detail, h.marked, h.chosen, h.at, "
-                "       f.library, f.title, f.season, f.episode, f.first_seen "
+                "       f.library, f.title, f.season, f.episode, f.first_seen, "
+                "       f.audio_langs "
                 "  FROM hardsub h JOIN files f ON f.id = h.file_id "
                 " WHERE h.state != ? AND f.state NOT IN ('deleted','duplicate') "
                 # THE SAME JOIN THE CANDIDATE PICKER USES. _candidates() has
@@ -2391,7 +2495,8 @@ def found(limit: int = 60) -> list:
             rows += [dict(r) for r in cur.execute(
                 "SELECT h.file_id, h.path, h.state, h.low_hits, h.samples, "
                 "       h.words, h.detail, h.marked, h.chosen, h.at, "
-                "       f.library, f.title, f.season, f.episode, f.first_seen "
+                "       f.library, f.title, f.season, f.episode, f.first_seen, "
+                "       f.audio_langs "
                 "  FROM hardsub h JOIN files f ON f.id = h.file_id "
                 # No size test here at all: marked=1 IS the decision, and
                 # the act of marking is what moved the size.

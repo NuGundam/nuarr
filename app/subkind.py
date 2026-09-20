@@ -788,6 +788,18 @@ async def _heartbeat() -> None:
             said = (f"{done} read this pass" if done else "idle - nothing read")
             if left:
                 said += f", {left} waiting"
+            # AND THE DISMISSALS, which are the one thing auto does that is
+            # not a rewrite and therefore has no queue step of its own. See
+            # hardsub.auto_dismiss: marking a file belongs on the queue with
+            # every other rewrite, but recording that a finding is not worth
+            # acting on is a single row and nothing to schedule around.
+            try:
+                from . import hardsub as _hs
+                drop = await asyncio.to_thread(_hs.auto_dismiss, 50)
+                if drop.get("dropped"):
+                    said += f", {drop['dropped']} dismissed"
+            except Exception:                                    # noqa: BLE001
+                pass
             schedules.beat(SCHED_KEY, said)
             STATE["last_run"] = time.time()
         except Exception as e:                                   # noqa: BLE001

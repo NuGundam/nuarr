@@ -346,7 +346,9 @@ _STYLE_SPLIT = re.compile(
 #   2  style names tokenised, so a numbered or glued theme style is a theme
 #   3  the plain lines are fingerprinted, so a block repeated across episodes
 #      can be told from this episode's dialogue
-SHAPE_REV = 3
+#   4  where the lines SIT is recorded, not just how many there are - the
+#      sharpest line between the two kinds found so far (see _coverage)
+SHAPE_REV = 4
 
 
 def _style_is_sign(name: str) -> bool:
@@ -366,6 +368,7 @@ def _style_is_sign(name: str) -> bool:
             return True
     return False
 _EVENT = re.compile(r"^Dialogue:\s*(.*)$", re.M)
+_SRT_TIME = re.compile(r"(\d+):(\d\d):(\d\d)[,.]\d+\s*-->")
 _POSITIONED = re.compile(r"\\(?:pos|move)\s*\(", re.I)
 
 
@@ -420,7 +423,12 @@ def _inspect_init() -> None:
                           # episode can be recognised as a muxed-in constant
                           # rather than this episode's speech. See
                           # _signature() and _repeat_index().
-                          ("plain_sig", "TEXT")):
+                          ("plain_sig", "TEXT"),
+                          # cover: how many tenths of the runtime the plain
+                          # lines touch. gap_s: the longest silence in them,
+                          # counting the quiet before the first line and
+                          # after the last. See _coverage().
+                          ("cover", "INTEGER"), ("gap_s", "REAL")):
             try:
                 cur.execute(f"ALTER TABLE subtitle_shape ADD COLUMN {col} {decl}")
             except Exception:                                    # noqa: BLE001
@@ -436,7 +444,38 @@ def _ass_secs(t: str) -> float:
         return -1.0
 
 
-def _read_events(path: str, mkv_track_id: int, oped=None) -> dict | None:
+# HOW MANY SLICES OF THE RUNTIME A TRACK ACTUALLY TOUCHES.
+#
+# The rate says how MANY plain lines there are; this says WHERE they are, and
+# it turns out to be the sharpest line between the two kinds. Measured on
+# tracks whose kind was already known:
+#
+#   hand-labelled sign sheets    3 of 10 slices     biggest gap 18.8 minutes
+#   full dialogue tracks        10 of 10 slices     biggest gap  1.1 minutes
+#
+# and the sign sheets' lines sit at 2-16% and 96-99% of the runtime, which is
+# the opening and the ending - a karaoke script, exactly as Erik described.
+# A forced track behaves the same way for a different reason: it covers the
+# scenes that need it and is silent through the rest.
+COVER_SLICES = 10
+
+
+def _coverage(marks: list, dur_s: float) -> tuple:
+    """(slices touched of ten, biggest silence in seconds)."""
+    marks = sorted(t for t in marks if t >= 0)
+    if not marks or dur_s <= 0:
+        return (0, 0.0)
+    hit = {min(COVER_SLICES - 1, int(t / dur_s * COVER_SLICES))
+           for t in marks if t <= dur_s}
+    gaps = [b - a for a, b in zip(marks, marks[1:])]
+    # The silence before the first line and after the last count too: a track
+    # that starts at minute nineteen has been quiet for nineteen minutes.
+    gaps += [marks[0], max(0.0, dur_s - marks[-1])]
+    return (len(hit), round(max(gaps) if gaps else dur_s, 1))
+
+
+def _read_events(path: str, mkv_track_id: int, oped=None,
+                 dur_s: float = 0.0) -> dict | None:
     r"""Pull one text subtitle track out and describe its SHAPE.
 
     Never its words - this is about where the lines are and what the styles
@@ -483,6 +522,9 @@ def _read_events(path: str, mkv_track_id: int, oped=None) -> dict | None:
         # line, which is exactly what makes an SRT a dialogue format. The
         # cue count IS the plain count.
         srt_n = len(re.findall(r"^\d+\s*$", text, re.M))
+        srt_at = [int(m.group(1)) * 3600 + int(m.group(2)) * 60
+                  + int(m.group(3)) for m in _SRT_TIME.finditer(text)]
+        srt_cover, srt_gap = _coverage(srt_at, dur_s)
         # An SRT carries no styles, so there is nothing for the theme to
         # hide in and nothing to restrict - but the column still has to
         # distinguish "no lyrics outside" from "nobody looked".
@@ -491,6 +533,7 @@ def _read_events(path: str, mkv_track_id: int, oped=None) -> dict | None:
         # "plain lines" - two episodes matching would mean two episodes with
         # the same subtitles, which is a broken release rather than a theme.
         return {"events": srt_n, "styles": 1 if srt_n else 0, "plain": srt_n,
+                "cover": srt_cover, "gap_s": srt_gap,
                 "plain_sig": "",
                 "plain_out": (srt_n if oped is not None else None),
                 "oped_s": (sum(b - a for a, b, _t in (oped or []))
@@ -530,6 +573,7 @@ def _read_events(path: str, mkv_track_id: int, oped=None) -> dict | None:
     # ending reads as dialogue. The theme is the one place they can be
     # excluded from without excluding real speech - see chapters.py.
     plain_out = 0 if oped is not None else None
+    plain_at: list = []                  # where each plain line starts
     in_oped = 0
     for ln in lines:
         parts = ln.split(",", 9)
@@ -551,6 +595,7 @@ def _read_events(path: str, mkv_track_id: int, oped=None) -> dict | None:
         elif not _style_is_sign(st):
             plain += 1
             plain_text.append(_norm_line(parts[9]))
+            plain_at.append(_ass_secs(parts[1]))
             if plain_out is not None and not theme:
                 plain_out += 1
     n = max(1, len(lines))
@@ -569,7 +614,12 @@ def _read_events(path: str, mkv_track_id: int, oped=None) -> dict | None:
         bits.append(f"{share*100:.0f}% positioned with \\pos or \\move")
     if oped is not None and plain_out is not None and plain_out != plain:
         bits.append(f"{plain - plain_out} of them inside the OP/ED")
+    cover, gap = _coverage(plain_at, dur_s)
+    if dur_s > 0 and plain:
+        bits.append(f"its plain lines touch {cover} of {COVER_SLICES} slices "
+                    f"of the runtime, longest silence {gap/60:.0f} min")
     return {"events": len(lines), "styles": len(styles), "plain": plain,
+            "cover": cover, "gap_s": gap,
             "plain_sig": _signature(plain_text),
             "plain_out": plain_out,
             "oped_s": (sum(b - a for a, b, _t in (oped or []))
@@ -790,7 +840,7 @@ def shape_of(file_id: int, path: str, track: int, size: int,
                 return d
     except Exception:                                            # noqa: BLE001
         return None
-    got = _read_events(path, mkv_track_id, oped)
+    got = _read_events(path, mkv_track_id, oped, _duration_of(file_id))
     # A NEW SIGNATURE CHANGES WHO MATCHES WHOM, so the cached index has to go.
     _REPEATS.update(at=0.0)
     if got is None:
@@ -828,20 +878,22 @@ def shape_of(file_id: int, path: str, track: int, size: int,
             cur.execute(
                 "INSERT INTO subtitle_shape(file_id,track,size,at,events,"
                 "  styles,pos_pct,signish,detail,plain,plain_out,oped_s,"
-                "  rev,plain_sig) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "  rev,plain_sig,cover,gap_s) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(file_id,track) DO UPDATE SET size=excluded.size, "
                 "  at=excluded.at, events=excluded.events, "
                 "  styles=excluded.styles, pos_pct=excluded.pos_pct, "
                 "  signish=excluded.signish, detail=excluded.detail, "
                 "  plain=excluded.plain, plain_out=excluded.plain_out, "
                 "  oped_s=excluded.oped_s, rev=excluded.rev, "
-                "  plain_sig=excluded.plain_sig",
+                "  plain_sig=excluded.plain_sig, cover=excluded.cover, "
+                "  gap_s=excluded.gap_s",
                 (int(file_id), int(track), int(size), time.time(),
                  got["events"], got["styles"], got["pos_pct"], got["signish"],
                  got["detail"][:300], got.get("plain") or 0,
                  got.get("plain_out"), got.get("oped_s"), SHAPE_REV,
-                 got.get("plain_sig") or ""))
+                 got.get("plain_sig") or "",
+                 got.get("cover"), got.get("gap_s")))
     except Exception:                                            # noqa: BLE001
         pass
     got["repeats"] = repeats_of(path, got.get("plain_sig") or "")
@@ -1145,9 +1197,19 @@ SIGNS_MAX = 2.0
 # live-action track at six lines a minute is far more likely to be a real
 # subtitle for a quiet show than a sign sheet.
 SIGN_POINTS = {"pos_high": 40, "pos_some": 25, "title": 30, "forced": 20,
-               "styles": 10, "rate_low": 30}
+               "styles": 10, "rate_low": 30, "clustered": 40}
 DIALOGUE_POINTS = {"rate_high": -40, "live": -20, "pos_none": -20,
-                   "unique": -30}
+                   "unique": -30, "spread": -40}
+# WHERE THE LINES SIT, which is the sharpest of the lot. Measured on tracks
+# whose kind was already known (see _coverage): sign sheets touched 3 of 10
+# slices of the runtime with an 18.8-minute silence in the middle, and full
+# dialogue tracks touched 10 of 10 with 1.1 minutes. The thresholds are set
+# well inside both, so the only tracks either rule fires on are the ones
+# nothing sensible disagrees about.
+CLUSTERED_AT = 5                 # slices or fewer, and it is not a whole show
+CLUSTERED_GAP_S = 300.0          # five minutes of silence
+SPREAD_AT = 9                    # slices or more, and it is
+SPREAD_GAP_S = 240.0
 SIGNS_AT = 45                    # points at or above which it is a sign sheet
 
 
@@ -1164,6 +1226,27 @@ def _title_says_signs(title: str) -> bool:
 def sign_evidence(sh: dict, rate: float, ctx: dict) -> tuple:
     """(points, sentences) - every signal that has something to say."""
     pts, why = 0, []
+    # WHERE THE LINES SIT COMES FIRST, because two of the votes below depend
+    # on it: a rate that looks like speech means something different when the
+    # lines are all in one block.
+    cover = sh.get("cover")
+    gap = float(sh.get("gap_s") or 0.0)
+    clustered = False
+    if cover is not None and int(cover or 0) > 0:
+        cover = int(cover)
+        clustered = cover <= CLUSTERED_AT and gap >= CLUSTERED_GAP_S
+        if clustered:
+            pts += SIGN_POINTS["clustered"]
+            why.append(f"its lines touch only {cover} of {COVER_SLICES} "
+                       f"slices of the runtime and it is silent for "
+                       f"{gap/60:.0f} minutes at a stretch - a sheet that "
+                       f"covers the opening, the ending and a few signs")
+        elif cover >= SPREAD_AT and gap <= SPREAD_GAP_S:
+            pts += DIALOGUE_POINTS["spread"]
+            why.append(f"its lines run through {cover} of {COVER_SLICES} "
+                       f"slices of the runtime with no gap longer than "
+                       f"{gap/60:.0f} minutes - somebody talking all the way "
+                       f"through")
     pos = float(sh.get("pos_pct") or 0.0)
     if pos >= 60.0:
         pts += SIGN_POINTS["pos_high"]
@@ -1211,10 +1294,24 @@ def sign_evidence(sh: dict, rate: float, ctx: dict) -> tuple:
     if rate <= SIGNS_MAX:
         pts += SIGN_POINTS["rate_low"]
         why.append(f"{rate:.1f} plain dialogue lines a minute")
-    elif rate >= SPEECH_LO:
+    elif rate >= SPEECH_LO and not clustered:
         pts += DIALOGUE_POINTS["rate_high"]
         why.append(f"{rate:.1f} plain dialogue lines a minute, the cadence of "
                    f"people talking")
+    elif rate >= SPEECH_LO:
+        # THE TWO FACTS CANNOT BOTH BE TRUE, and the one that is measured
+        # more sharply wins. A rate of fifteen lines a minute says people are
+        # talking; silence for twenty-one minutes says they are not. What
+        # produces both at once is karaoke: Kill la Kill S01E23 has 352 plain
+        # lines in styles called 'KLKOP2 #2 RGB' and 'KLK ED R' - an opening
+        # and an ending, which the style-name test does not catch because
+        # neither name contains the word op or ed as a word. Coverage does
+        # catch it, and it is the signal with no overlap between the kinds
+        # (3 of 10 slices against 10 of 10), so the rate does not get to call
+        # this speech.
+        why.append(f"{rate:.1f} lines a minute, but not spread through the "
+                   f"episode - a block of them, which is what a karaoke "
+                   f"sheet looks like and what speech never does")
     if ctx.get("family") == "live":
         pts += DIALOGUE_POINTS["live"]
         why.append("live action, where 10% of tracks read are sign sheets "
@@ -1227,7 +1324,8 @@ def sign_evidence(sh: dict, rate: float, ctx: dict) -> tuple:
     # which is what dialogue is. Only says anything where there were
     # siblings to check against.
     sibs = int(ctx.get("siblings") or 0)
-    if sibs >= 2 and not int(sh.get("repeats") or 0) and rate >= SPEECH_LO:
+    if sibs >= 2 and not int(sh.get("repeats") or 0) and rate >= SPEECH_LO \
+            and not clustered:
         pts += DIALOGUE_POINTS["unique"]
         why.append(f"its lines appear in none of the {sibs} other episodes "
                    f"of this show that have been read - written for this "

@@ -334,12 +334,49 @@ def _sides_of(path: str) -> list:
     return out
 
 
+_LANGS: dict = {"at": 0.0, "map": {}}
+_LANGS_TTL = 600.0
+
+
+def _langs_map() -> dict:
+    """file_id -> the audio languages on it. One query, held ten minutes.
+
+    The picture scorer wants this per row and there are a few hundred rows
+    per plan, so it is read in one go rather than per file - the same shape
+    as the word dictionaries hardsub memoises for the same reason.
+    """
+    now = time.time()
+    if _LANGS["map"] and now - _LANGS["at"] < _LANGS_TTL:
+        return _LANGS["map"]
+    m: dict = {}
+    try:
+        with cursor() as cur:
+            for r in cur.execute(
+                    "SELECT id, audio_langs FROM files "
+                    " WHERE COALESCE(audio_langs,'') != ''"):
+                m[int(r["id"])] = str(r["audio_langs"] or "")
+    except Exception:                                            # noqa: BLE001
+        return _LANGS["map"]
+    _LANGS.update(at=now, map=m)
+    return m
+
+
 def _picture_of(file_id: int, cur) -> dict:
     """What the picture reader last said about this file. A read, not a read."""
     try:
-        r = cur.execute("SELECT state, chosen, marked, path, low_hits, "
-                        "       high_hits, samples, words, at "
-                        "  FROM hardsub WHERE file_id=?",
+        # THE SCORER'S INPUTS, ALL OF THEM. It reads the audio languages and
+        # the library now - among non-anime files with only English audio,
+        # 21 of 2,160 carried burned-in words against 51 of 66 with a
+        # non-English track - and a row without those columns is a row it
+        # has to score blind. Three files sat in the queue's question list
+        # scoring 45%, 48% and 38% here while the same scorer, handed the
+        # same files with their languages attached, said 26%, 27% and 25%
+        # and dismissed them.
+        r = cur.execute("SELECT h.state, h.chosen, h.marked, h.path, "
+                        "       h.low_hits, h.high_hits, h.samples, h.words, "
+                        "       h.at, f.audio_langs, f.library "
+                        "  FROM hardsub h JOIN files f ON f.id=h.file_id "
+                        " WHERE h.file_id=?",
                         (int(file_id),)).fetchone()
     except Exception:                                            # noqa: BLE001
         return {}
@@ -382,6 +419,11 @@ def _picture_of(file_id: int, cur) -> dict:
             "path": str(r["path"] or ""),
             "low_hits": int(r["low_hits"] or 0),
             "samples": int(r["samples"] or 0),
+            # AND THE TWO THE SCORER LEARNED TO USE LATER. _row() re-scores
+            # this stored copy on every plan, so anything score_of reads has
+            # to be in it or the re-score is worse than the original.
+            "audio_langs": str(r["audio_langs"] or ""),
+            "library": str(r["library"] or ""),
             "at": float(r["at"] or 0.0)}
 
 
@@ -391,7 +433,8 @@ def scan_one(file_id: int, row=None) -> dict:
     with cursor() as cur:
         if row is None:
             row = cur.execute(
-                "SELECT id, path, library, pool_disk, mtime, size "
+                "SELECT id, path, library, pool_disk, mtime, size, "
+                "       audio_langs "
                 "  FROM files WHERE id=?", (int(file_id),)).fetchone()
         if not row:
             return {}
@@ -399,6 +442,9 @@ def scan_one(file_id: int, row=None) -> dict:
         d = {"file_id": int(file_id), "path": path,
              "library": row["library"] or "", "disk": row["pool_disk"] or "",
              "mtime": float(row["mtime"] or 0.0), "size": int(row["size"] or 0),
+             # The picture scorer reads these; see the re-score in _row().
+             "audio_langs": (row["audio_langs"]
+                             if "audio_langs" in row.keys() else "") or "",
              "tracks": [], "sides": [], "picture": {}, "err": "",
              "probed": 0}
         try:
@@ -470,6 +516,7 @@ def _stale_sql(limit: int) -> tuple:
     cutoff = time.time() - MAX_AGE_S
     return ("""
         SELECT f.id, f.path, f.library, f.pool_disk, f.mtime, f.size,
+               f.audio_langs,
                s.scanned_at AS sat
           FROM files f LEFT JOIN sub_facts s ON s.file_id = f.id
          WHERE """ + _live_where() + """
@@ -777,6 +824,23 @@ def _row(r) -> dict:
         p = d.get("picture")
         if isinstance(p, dict) and p.get("words"):
             from . import hardsub as _hs
+            # WHAT THE STORED COPY WAS WRITTEN BEFORE THE SCORER ASKED FOR IT.
+            #
+            # sub_facts holds this dict as JSON, so every row written before
+            # score_of learned to read the audio languages is a row it now
+            # has to score blind - and blind, for these three files, meant
+            # 45%, 48% and 38% in the queue's question list while the same
+            # scorer with the same evidence and the languages attached said
+            # 26%, 27% and 25% and threw them away. The facts row knows the
+            # library and the languages; handing them over costs nothing and
+            # means an old row scores like a new one.
+            for k in ("library", "audio_langs"):
+                if not p.get(k) and d.get(k):
+                    p[k] = d[k]
+            # sub_facts has a library column and no language one, so the
+            # lookup below is the only way an old row gets the languages.
+            if not p.get("audio_langs"):
+                p["audio_langs"] = _langs_map().get(int(d.get("file_id") or 0), "")
             sc = _hs.score_of(p)
             p["sure"], p["why"] = int(sc["score"]), str(sc["why"])
     except Exception:                                            # noqa: BLE001
