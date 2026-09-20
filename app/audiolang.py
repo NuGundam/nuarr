@@ -291,17 +291,47 @@ SOURCES = [
 ]
 
 
+# ASKED IN A CHILD, FOR THE SAME REASON THE MODEL IS LOADED IN ONE.
+#
+# info() used to `import ctranslate2` here to read the device count - one line,
+# no model, and it looked free. It is not: importing ctranslate2 maps
+# ctranslate2.dll and the cuDNN it links against into this process, and they
+# stay for the life of the server. Measured after the model moved out: cuBLAS
+# was gone and 18 ctranslate2 mappings and 5 cuDNN were still there, because
+# the settings panel had called info() once.
+#
+# The count cannot change while the machine is running, so it is asked once,
+# in a process that then exits, and remembered.
+_CUDA_N: dict = {"n": None, "why": ""}
+
+
+def _cuda_devices() -> tuple[int, str]:
+    """(how many CUDA devices CTranslate2 can see, why not)."""
+    if _CUDA_N["n"] is not None:
+        return int(_CUDA_N["n"]), str(_CUDA_N["why"])
+    import sys as _sys
+    n, why = 0, ""
+    try:
+        r = subprocess.run(
+            [_sys.executable, "-c",
+             "import ctranslate2;print(ctranslate2.get_cuda_device_count())"],
+            capture_output=True, text=True, timeout=60,
+            creationflags=NO_WINDOW, startupinfo=hidden_si())
+        if r.returncode == 0 and (r.stdout or "").strip().isdigit():
+            n = int(r.stdout.strip())
+        else:
+            why = ((r.stderr or r.stdout or "").strip().splitlines() or [""])[-1][:90]
+    except Exception as e:                               # noqa: BLE001
+        why = f"{type(e).__name__}: {str(e)[:90]}"
+    _CUDA_N.update(n=n, why=why)
+    return n, why
+
+
 def info() -> dict:
     """Everything the Whisper settings panel needs, without loading the model."""
     import importlib.util as _u
     have = _u.find_spec("faster_whisper") is not None
-    cuda_n = 0
-    cuda_err = ""
-    try:
-        import ctranslate2
-        cuda_n = ctranslate2.get_cuda_device_count()
-    except Exception as e:                               # noqa: BLE001
-        cuda_err = f"{type(e).__name__}: {str(e)[:90]}"
+    cuda_n, cuda_err = _cuda_devices()
     # The CUDA runtime DLLs are pip packages, separate from the wheel itself,
     # and their absence is the failure that presents as a hang rather than an
     # error - so it is reported explicitly rather than left to be discovered.
@@ -665,25 +695,182 @@ def _load_probe(dev: str, ct: str) -> tuple[bool, str]:
     return _PROBE[key]
 
 
+# ---- THE MODEL, IN A PROCESS THAT CAN BE CLOSED ----------------------------
+#
+# Measured during the system audit, with the model UNLOADED and nothing
+# listening:
+#
+#     private commit  3,055 MB      python objects alive   30 MB
+#     resident          533 MB      whisper state          none
+#     mapped: cublasLt64_12.dll 296 MB, cublas64_12.dll 95 MB, cudnn,
+#             ctranslate2.dll 35 MB
+#
+# unload() below does what it says - it drops the model and gives the VRAM
+# back - and roughly 2.5 GB of host commit stays anyway, because a CUDA
+# context cannot be unloaded from a process that is still running. The only
+# thing that releases it is the process ending, and the server process never
+# ends.
+#
+# So the model lives in a child now. paddle_worker.py already does this for
+# OCR and this is deliberately the same shape: a script, arguments in,
+# answers out, killed when the work is done. See whisper_worker.py for the
+# protocol.
+#
+# _Listener IS THE MODEL, AS FAR AS THIS MODULE IS CONCERNED. It carries one
+# method with the same name and the same signature as the thing it replaces,
+# so detect()'s call site - `lang, prob, all_probs = m.detect_language(a)` -
+# is untouched, and every decision that call feeds (the vote, the floor, the
+# second look, the theme-song dodge) is untouched with it. A worker cannot
+# drift from the verdict logic because it holds none of it.
+WORKER_START_S = 180.0      # a cold CUDA init on a busy box is not quick
+WORKER_CALL_S = 180.0       # one 30-second window through the model
+
+
+class _Listener:
+    """A whisper_worker.py child, and the pipe to it."""
+
+    def __init__(self, dev: str, ct: str, proc) -> None:
+        self.dev = dev
+        self.ct = ct
+        self.p = proc
+        self.lock = threading.Lock()
+
+    def alive(self) -> bool:
+        return self.p is not None and self.p.poll() is None
+
+    def detect_language(self, a):
+        """The model's own method, over a pipe. Same in, same out."""
+        import numpy as np
+        if not self.alive():
+            raise RuntimeError("the language worker is not running")
+        buf = np.ascontiguousarray(a, dtype="<f4").tobytes()
+        # ONE CALLER AT A TIME. The pipe is a stream: two threads writing
+        # headers into it would interleave their PCM and each would read the
+        # other's answer. detect() is called from the listen pass, which is
+        # single-threaded today - the lock is here so that staying true is
+        # not a condition of correctness.
+        with self.lock:
+            try:
+                self.p.stdin.write(f"DETECT {len(buf)}\n".encode("ascii"))
+                self.p.stdin.write(buf)
+                self.p.stdin.flush()
+                line = self.p.stdout.readline()
+            except Exception as e:                       # noqa: BLE001
+                raise RuntimeError(f"the language worker went away: "
+                                   f"{type(e).__name__}: {e}") from e
+        if not line:
+            raise RuntimeError("the language worker closed its output")
+        try:
+            r = json.loads(line.decode("utf-8", "replace"))
+        except Exception as e:                           # noqa: BLE001
+            raise RuntimeError(f"the language worker said {line[:80]!r}") from e
+        if not r.get("ok"):
+            raise RuntimeError(str(r.get("why") or "no answer"))
+        # A list of [code, prob] pairs, which is one of the two shapes _top()
+        # already accepts - see _top's docstring.
+        return r.get("lang") or "", float(r.get("prob") or 0.0), \
+            r.get("probs") or []
+
+    def close(self) -> None:
+        p, self.p = self.p, None
+        if p is None:
+            return
+        try:
+            if p.poll() is None:
+                try:
+                    p.stdin.write(b"BYE\n")
+                    p.stdin.flush()
+                except Exception:                        # noqa: BLE001
+                    pass
+                try:
+                    p.stdin.close()
+                except Exception:                        # noqa: BLE001
+                    pass
+                # A WAIT WITH NO TIMEOUT IS A PROCESS THAT CAN OUTLIVE THE
+                # PROGRAM - the same lesson subocr learned the hard way, with
+                # five orphaned OCR workers holding GPU contexts, one of them
+                # 58 hours old. Closing stdin is the exit signal; anything
+                # past a few seconds is a child that is not going to take it.
+                try:
+                    p.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+                    try:
+                        p.wait(timeout=10)
+                    except Exception:                    # noqa: BLE001
+                        pass
+        except Exception:                                # noqa: BLE001
+            pass
+
+
+def _start_worker(dev: str, ct: str):
+    """Launch whisper_worker.py and wait for it to say READY."""
+    import sys as _sys
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "whisper_worker.py")
+    if not os.path.exists(script):
+        raise RuntimeError("whisper_worker.py is missing from the install")
+    p = subprocess.Popen(
+        [_sys.executable, script, "--device", dev, "--compute", ct,
+         "--root", str(MODEL_DIR), "--size", MODEL_SIZE],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, bufsize=0,
+        creationflags=NO_WINDOW, startupinfo=hidden_si())
+    # READY OR FAIL, AND NOTHING ELSE. The worker prints exactly one line
+    # before it starts answering, so this read is the load. It can take a
+    # while on a cold CUDA context, which is why WORKER_START_S is generous -
+    # and why this is done once per pass rather than once per file.
+    line = b""
+    try:
+        line = p.stdout.readline()
+    except Exception:                                    # noqa: BLE001
+        pass
+    head = line.decode("utf-8", "replace").strip()
+    if head.startswith("READY"):
+        return _Listener(dev, ct, p)
+    why = head
+    if not why:
+        try:
+            why = (p.stderr.read() or b"").decode("utf-8", "replace").strip()
+        except Exception:                                # noqa: BLE001
+            why = ""
+    try:
+        p.kill()
+    except Exception:                                    # noqa: BLE001
+        pass
+    raise RuntimeError(why[:200] or "the language worker said nothing")
+
+
 def _model():
-    """Load once, share across calls.
+    """Start the worker once, share it across calls.
 
     A Whisper model is ~500 MB of VRAM and several seconds to load. Loading it
     per file would dominate the cost and, worse, several concurrent loads will
-    contend for the GPU alongside nuarr's own NVENC work.
+    contend for the GPU alongside nuarr's own NVENC work. So: one worker per
+    pass, kept until unload().
     """
     global _MODEL, _MODEL_ERR
-    if _MODEL is not None:
+    if _MODEL is not None and _MODEL.alive():
         return _MODEL
     with _MODEL_LOCK:
-        if _MODEL is not None:
+        if _MODEL is not None and _MODEL.alive():
             return _MODEL
+        # A WORKER THAT DIED IS NOT A WORKER. Without this the handle stayed
+        # in _MODEL and every later window failed against a closed pipe.
+        if _MODEL is not None:
+            try:
+                _MODEL.close()
+            except Exception:                            # noqa: BLE001
+                pass
+            _MODEL = None
+        # _add_cuda_dirs STAYS, and does nothing for the worker - the child
+        # sets its own DLL path. It is still needed because whisper_probe.py
+        # is launched from this process and inherits this environment.
         _add_cuda_dirs()
         note = migrate_model()
         if note:
             joblog.log(note, "info", system="audiolang")
         MODEL_DIR.mkdir(parents=True, exist_ok=True)
-        from faster_whisper import WhisperModel
         last = None
         # GPU first, CPU as a fallback. int8 on CPU is slow but still finishes,
         # and a slow answer beats no answer on a machine without a usable CUDA
@@ -702,12 +889,12 @@ def _model():
                 last = RuntimeError(why)
                 continue
             try:
-                _MODEL = WhisperModel(MODEL_SIZE, device=dev, compute_type=ct,
-                                      download_root=str(MODEL_DIR))
+                _MODEL = _start_worker(dev, ct)
                 _MODEL_ERR = ""
                 global _MODEL_DEV
                 _MODEL_DEV = dev
-                joblog.log(f"audio language ID ready: {MODEL_SIZE} on {dev}", "info", system="audiolang")
+                joblog.log(f"audio language ID ready: {MODEL_SIZE} on {dev} "
+                           f"(in its own process)", "info", system="audiolang")
                 return _MODEL
             except Exception as e:                      # noqa: BLE001
                 last = e
@@ -716,10 +903,22 @@ def _model():
 
 
 def unload() -> None:
-    """Release the VRAM. The sweep is a one-off; the GPU is for encoding."""
+    """Close the worker. The sweep is a one-off; the GPU is for encoding.
+
+    This used to set _MODEL to None and let the garbage collector give the
+    VRAM back, which it did - and left about 2.5 GB of host commit behind,
+    because the CUDA runtime it had loaded could not be unloaded from a
+    living process. Ending the process ends all of it: VRAM, the CUDA
+    context, cuBLAS, cuDNN and CTranslate2. See _Listener.
+    """
     global _MODEL
     with _MODEL_LOCK:
-        _MODEL = None
+        m, _MODEL = _MODEL, None
+    if m is not None:
+        try:
+            m.close()
+        except Exception:                                # noqa: BLE001
+            pass
 
 
 # ---------------------------------------------------------------- ffmpeg I/O
@@ -1143,6 +1342,16 @@ def self_test() -> dict:
     t0 = time.time()
 
     def _done(d: dict) -> dict:
+        # AND GIVE THE MODEL BACK. A pass calls unload() when it drains; a
+        # test never did, so pressing "Test detection now" left the model
+        # loaded until the next pass happened to run. That was easy to miss
+        # while the model lived in this process. It is a whole idle worker
+        # now - its own CUDA context, its own half-gigabyte of VRAM, sitting
+        # there because somebody pressed a button once.
+        try:
+            unload()
+        except Exception:                                # noqa: BLE001
+            pass
         d["elapsed"] = round(time.time() - t0, 1)
         return d
 
