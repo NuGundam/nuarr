@@ -5004,10 +5004,31 @@ async def _reader_job(w: Worker) -> None:
         return
     try:
         if job.kind == "listen":
+            # THE PLAN IS RE-JUDGED HERE, not taken on trust. It may have
+            # been written before the probe filled in what languages this
+            # file carries - see readers.replan_listen. It can only shrink.
+            _tr, _sp = readers.replan_listen(
+                int(job.file_id), list(plan.get("tracks") or []),
+                list(plan.get("spare") or []))
+            if len(_tr) != len(plan.get("tracks") or []):
+                _n = len(_tr)
+                _g = sum(1 for t in _tr if not t.get("tagged"))
+                w.sub_summary = (
+                    f"listen to {_n} track{'s' if _n != 1 else ''}"
+                    + (f" - {_g} with no tag" if _g else "")
+                    + (f", {len(_sp)} left for the rewrite to delete"
+                       if _sp else ""))
+                w.sub_steps = [
+                    (f"listen to track {t['track'] + 1}"
+                     + (" and write the tag it has none of" if not t.get("tagged")
+                        else f" and check the tag ({t['tagged']})"))
+                    for t in _tr]
+                w.sub_why = ["five 30-second windows through Whisper's "
+                             "language identifier; the confident windows "
+                             "have to agree"] * len(_tr)
             res = await in_work(
                 readers.listen_one, int(job.file_id), job.path,
-                list(plan.get("tracks") or []), bool(plan.get("jumped")),
-                _on_stage, list(plan.get("spare") or []))
+                _tr, bool(plan.get("jumped")), _on_stage, _sp)
         else:
             res = await in_work(
                 readers.subread_one, str(plan.get("subread") or "picture"),

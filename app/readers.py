@@ -98,6 +98,27 @@ def _policy_of(ids: list) -> dict:
     return out
 
 
+def _codes_from_probe(file_id: int) -> list:
+    """Every audio track's language tag, in track order, out of the probe."""
+    if not file_id:
+        return []
+    try:
+        with cursor() as cur:
+            r = cur.execute("SELECT json FROM file_probes WHERE file_id=?",
+                            (int(file_id),)).fetchone()
+        if not r:
+            return []
+        d = json.loads(r["json"] or "{}")
+    except Exception:                                        # noqa: BLE001
+        return []
+    out = []
+    for st in (d.get("streams") or []):
+        if st.get("codec_type") != "audio":
+            continue
+        out.append(str((st.get("tags") or {}).get("language") or "-").strip())
+    return out
+
+
 def _split_spare(f: dict, lib: str, langs: str, orig: str) -> None:
     r"""Set aside the tracks nothing is going to keep.
 
@@ -130,6 +151,22 @@ def _split_spare(f: dict, lib: str, langs: str, orig: str) -> None:
     from . import langkey, langpolicy, origlang
     codes = [c.strip() for c in (langs or "").split(",")] if langs else []
     if len(codes) < 2:
+        # THE FILE'S OWN PROBE, WHEN THE COLUMN IS NOT FILLED IN YET.
+        #
+        # This read files.audio_langs and gave up when it was empty, which
+        # is exactly the state a file is in when it has just landed - and a
+        # file that has just landed is the commonest thing in this queue.
+        # A Minecraft Movie was planned in that window: 40 tracks, one of
+        # them English, and the plan set aside none of them. Re-running the
+        # same split against the same file an hour later, with the column
+        # populated, set aside 40 of 44.
+        #
+        # The plan is written once and the job carries it for its whole
+        # life, so "the column will be filled in by the next pass" does not
+        # help the file being planned right now. The probe has the same
+        # answer and is there from the moment the file is scanned.
+        codes = _codes_from_probe(int(f.get("file_id") or 0))
+    if len(codes) < 2:
         return
     pol = langpolicy.for_library(lib, "audio")
     keep = list(pol.get("langs") or [])
@@ -149,10 +186,21 @@ def _split_spare(f: dict, lib: str, langs: str, orig: str) -> None:
     spare, keepers = [], []
     for t in f.get("tracks") or []:
         i = int(t.get("track") or 0)
+        # THE TRACK'S OWN TAG, WITH THE INDEX ONLY AS A FALLBACK.
+        #
+        # This asked whether the track's INDEX was in wanted_at, and a track
+        # whose index fell outside the code list - `0 <= i < len(codes)` -
+        # was kept by default. That guard was written for a short or missing
+        # audio_langs, and it silently turned into "listen to it" for every
+        # track past the end. On the doubled Minecraft plan that was half of
+        # them. The tag is carried on the row already and says the same
+        # thing without needing the two lists to line up.
         tag = (t.get("tagged") or "").strip()
+        if not tag and 0 <= i < len(codes):
+            tag = codes[i] if codes[i] != "-" else ""
         # An UNTAGGED track is never spare: it has no claim to disbelieve, and
         # its language is exactly what nobody knows yet.
-        if tag and 0 <= i < len(codes) and i not in wanted_at:
+        if tag and not (langkey.key(tag) in want or tag.lower() in want):
             spare.append(t)
         else:
             keepers.append(t)
@@ -206,10 +254,28 @@ def _listen_pending(limit: int) -> list:
         todo += audiolang.unverified(limit - len(todo))
     files: dict = {}
     order: list = []
+    # A TRACK CAN BE IN TWO OF THE THREE POPULATIONS AT ONCE, and nothing
+    # noticed. queued() is "somebody asked for this file now"; unverified()
+    # is "this tag has never been checked"; a jumped file whose tags are also
+    # unverified is in both, and the two lists were simply concatenated.
+    #
+    # Measured on A Minecraft Movie, 40 audio tracks: queued returned 22,
+    # pending 2, unverified 20 - 44 entries for 22 distinct tracks. The job
+    # that came out said "listen to 80 tracks", every one of the 40 twice,
+    # and Whisper listened to all of them: ten 30-second windows per track
+    # instead of five, for forty tracks, on a file with one English track.
+    #
+    # First wins, which keeps the priority the three queries were ordered in:
+    # what was asked for, then what has no tag, then what is merely unchecked.
+    seen_tracks: set = set()
     for t in todo:
         fid = int(t.get("file_id") or 0)
         if not fid:
             continue
+        key = (fid, int(t.get("track") or 0))
+        if key in seen_tracks:
+            continue
+        seen_tracks.add(key)
         if fid not in files:
             order.append(fid)
             files[fid] = {"file_id": fid, "path": t.get("path") or "",
@@ -322,6 +388,56 @@ async def topup_listen(depth: int | None = None) -> dict:
         made += int(r.get("made") or 0)
     STATE["listen"].update(fed=made, on_queue=have + made, at=time.time())
     return {"ok": True, "made": made, "on_queue": have + made}
+
+
+def replan_listen(file_id: int, tracks: list, spare: list) -> tuple:
+    r"""Judge the plan again, with today's facts, just before running it.
+
+    A PLAN IS WRITTEN ONCE AND CARRIED FOR THE JOB'S WHOLE LIFE, and that is
+    the right design until the facts it was made from arrive late. A file is
+    queued for listening the moment it lands; files.audio_langs is filled in
+    by the probe that follows; and a plan made in that window sets nothing
+    aside because it cannot yet see what languages the file has.
+
+    A Minecraft Movie is the case that found it. Planned at 09:46 with the
+    column still empty: 40 audio tracks, one of them English, none set
+    aside - and every track listed TWICE, because the three queues it was
+    folded from overlap. Eighty listens, ten 30-second windows apiece, about
+    an hour of Whisper on a file where the answer was one English track and
+    two untagged ones. Re-judged here with the probe in hand: one track to
+    listen to, eighteen set aside.
+
+    So the plan is re-made at the start of the job rather than trusted. It
+    can only ever shrink the work: the same split, the same policy, the same
+    never-go-silent guards, and anything it sets aside is still heard later
+    in this same job if the tags it kept turn out to be lies - see
+    listen_one.
+    """
+    tracks = list(tracks or [])
+    spare = list(spare or [])
+    if not tracks:
+        return tracks, spare
+    # THE SAME TRACK TWICE IS ALWAYS WRONG, whatever the policy says.
+    seen: set = set()
+    deduped = []
+    for t in tracks:
+        k = int(t.get("track") or 0)
+        if k in seen:
+            continue
+        seen.add(k)
+        deduped.append(t)
+    f = {"file_id": int(file_id), "tracks": deduped, "spare": []}
+    try:
+        pol = _policy_of([int(file_id)]).get(int(file_id))
+        if pol:
+            _split_spare(f, pol[0], pol[1], pol[2])
+    except Exception:                                        # noqa: BLE001
+        # A re-judgement that fails leaves the plan exactly as it was, which
+        # is where it was a moment ago.
+        return deduped, spare
+    # Whatever it set aside joins what the plan already had, so the late
+    # hearing in listen_one still covers all of it.
+    return f["tracks"], spare + [t for t in (f.get("spare") or [])]
 
 
 def listen_one(file_id: int, path: str, tracks: list, jumped: bool,
