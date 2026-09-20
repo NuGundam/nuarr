@@ -2128,7 +2128,22 @@ def _candidates(limit: int) -> list:
             "SELECT f.id file_id, f.path, f.library, f.pool_disk FROM files f "
             "LEFT JOIN hardsub h ON h.file_id=f.id AND h.size=f.size "
             "WHERE f.state NOT IN ('deleted','duplicate') "
-            "  AND COALESCE(f.sub_langs,'')='' "
+            # NO TRACK AT ALL - OR A TRACK THAT DOES NOT ANSWER THE QUESTION.
+            #
+            # "No subtitle track" was the whole test, and a file carrying only
+            # a forced English track, or only a Japanese one, has a subtitle
+            # track and is exactly the file whose picture needs reading: the
+            # raw check cannot clear it on the track and cannot see the
+            # picture. Measured in the audit: 58 such files, The Castle of
+            # Cagliostro among them, parked at "the picture reader has not
+            # looked at this file" with no path by which it ever would.
+            #
+            # The raw ladder already knows which files those are - it puts
+            # them on the `nopic` rung - so it is asked rather than the rule
+            # being written out a second time here and drifting.
+            "  AND (COALESCE(f.sub_langs,'')='' "
+            "       OR f.id IN (SELECT n.file_id FROM sub_need n "
+            "                    WHERE n.rule = 'nopic')) "
             "  AND COALESCE(f.duration,0) > 120 "
             "  AND COALESCE(f.mtime,0) < ? "
             # NEVER READ, OR READ BY A READER THAT HAS SINCE BEEN CORRECTED.
