@@ -76,7 +76,23 @@ NONE, SIGNS, DIALOGUE, HYBRID = "none", "signs", "dialogue", "hybrid"
 SAMPLES = 24
 # How many of them get shown to the OCR. Only the strongest candidates: the
 # arithmetic is there to pick which frames are worth a second of Tesseract.
+#
+# AND HOW MANY WHEN THE ANSWER IS STILL OPEN, which is the number that was
+# missing. The reader stopped at two frames and five words, and score_of then
+# awarded twenty-five points for "function words" - the/and/you, what speech
+# is made of - which two frames of a sign will never contain. So the ceiling
+# on a file with no function words was 60 + 15 = 75 against a mark line of
+# 85: the scorer was asking for evidence the reader was not allowed to go and
+# get, and 222 findings sat in the band because of it, some with words low in
+# the picture in 22 of 24 frames.
+#
+# Absence of evidence counts only after a search. The loop below now keeps
+# reading lit frames until a function word turns up or the candidates run
+# out, so "no function words" means "none in ten frames" rather than "none in
+# the first two". Costs one ffmpeg grab and one OCR call per extra frame, and
+# only on files that carry text at all - 772 of 3,941 sampled here.
 CONFIRM = 4
+CONFIRM_MAX = 12
 # The caption band. Measured against the City Hunter frames, where the yellow
 # dialogue sits about four fifths of the way down.
 LOW_BAND = "crop=iw:ih/3:0:ih*2/3"
@@ -757,6 +773,10 @@ def probe_one(file_id: int, samples: int = SAMPLES,
     # Same number of Tesseract calls, and no extra decoding: every frame here
     # has already been measured.
     cand = [(t, c) for t, c in sorted(low_hit, key=lambda x: -x[1])]
+    # HOW FAR THE SEARCH MAY GO, as against how far it usually needs to. The
+    # top-up below fills to `confirm`; the loop is allowed to walk past it
+    # into the dimmer candidates when nothing has settled the question yet.
+    reach = max(confirm, CONFIRM_MAX)
     if len(cand) < max(0, confirm):
         seen_t = {t for t, _c in cand}
         spare = sorted(((t, c) for t, c in low
@@ -765,7 +785,7 @@ def probe_one(file_id: int, samples: int = SAMPLES,
                        key=lambda x: -x[1])
         cand += spare[:max(0, confirm) - len(cand)]
     lit: list = []                       # brightness of frames that held words
-    _shown = cand[:max(0, confirm)]
+    _shown = cand[:max(0, reach)]
     _eng = _engine_name(ocr_engine())
     for _i, (t, _c) in enumerate(_shown, 1):
         _say(f"reading frame {_i} of {len(_shown)} \u00b7 {_eng}",
@@ -779,8 +799,21 @@ def probe_one(file_id: int, samples: int = SAMPLES,
             words.extend(got)
             if _FUNCTION & set(got):
                 lit.append(_c)           # a caption, and this is its weight
-        if text_frames >= MIN_TEXT_FRAMES and len(set(words)) >= 5:
-            break
+        # STOP WHEN THE QUESTION IS ANSWERED, NOT WHEN THE MINIMUM IS MET.
+        #
+        # This used to break at two text frames and five words, which is the
+        # least that could possibly be called a reading - and the scorer then
+        # held "no function words" against files that had been shown two
+        # frames. A function word settles it: this is speech, and there is
+        # nothing more to learn from a third frame. Without one, the search
+        # keeps going while there are candidates, up to CONFIRM_MAX, because
+        # only a thorough look makes an empty result mean anything.
+        if _FUNCTION & set(words):
+            if text_frames >= MIN_TEXT_FRAMES:
+                break
+        elif _i >= max(0, confirm) and text_frames >= MIN_TEXT_FRAMES \
+                and len(set(words)) >= 24:
+            break                        # plenty read, none of it speech
     # ONE LOOK UNDER THE FLOOR, WHEN NOTHING DIM HAS BEEN SEEN YET.
     #
     # The candidates above are the brightest frames, so on a file where a few
@@ -951,7 +984,25 @@ def probe_one(file_id: int, samples: int = SAMPLES,
             "low_hits": len(low_hit), "high_hits": len(high_hit),
             "calibrated": round(calibrated, 1),
             "samples": read, "ratio": round(ratio, 3),
-            "words": uniq[:12], "detail": detail,
+            # AND KEEP THE WORDS THAT DECIDE, which this did not.
+            #
+            # `uniq` is sorted(set(words)), so uniq[:12] kept the twelve words
+            # that come FIRST IN THE ALPHABET. We Baby Bears S02E31 was
+            # stored as "abl, ani, boi, eae, eee, ere, fal, foe, hss, loe,
+            # neat, nes" - every word starting a to n - and the scorer, which
+            # rebuilds its evidence from this column, reported "no function
+            # words, so a card or a sign rather than speech" and took 25
+            # points off. But the reader had SEEN function words: state is
+            # "dialogue" here, and it cannot be without them (see `confirmed`
+            # above). The/you/with were simply past the cut.
+            #
+            # That one line is most of why 222 findings sat in the band: the
+            # ceiling without the speech term is 60 + 15 = 75 against a mark
+            # line of 85, so nothing could ever be sure enough to act on.
+            # Function words first, then the rest, forty in all.
+            "words": (sorted(_FUNCTION & set(uniq))
+                      + [w for w in uniq if w not in _FUNCTION])[:40],
+            "detail": detail,
             "has_track": bool((row.get("sub_langs") or "").strip())}
 
 
@@ -1344,21 +1395,55 @@ def score_of(row) -> dict:
         samples = lows = 0
     ratio = (lows / samples) if samples else 0.0
 
+    # THE READER'S OWN FINDING OUTRANKS A RE-DERIVATION FROM THE COLUMN.
+    #
+    # probe_one cannot call a file dialogue, hybrid or signs without having
+    # seen function words - see `confirmed` there - so a state other than
+    # "none" IS the reader saying it found speech. This scorer was working
+    # that out again from the stored word list, which used to be the twelve
+    # words that came first in the alphabet, and concluded the opposite about
+    # hundreds of files: "no function words" beside a row the reader had
+    # already called speech. Trust the finding, and say which of the two it
+    # came from.
+    state_now = ""
+    try:
+        state_now = str(row["state"] or "") if "state" in row.keys() else ""
+    except Exception:                                            # noqa: BLE001
+        state_now = ""
+    reader_heard = state_now in (DIALOGUE, HYBRID, SIGNS)
+
     s = good_share * 60.0
-    s += min(25.0, len(speech) * 8.0)
+    s += min(25.0, len(speech) * 8.0) if speech else (22.0 if reader_heard else 0.0)
     s += min(15.0, ratio * 30.0)
     bits = [f"{good_share*100:.0f}% of the read is word-shaped"]
     if speech:
         bits.append(f"{len(speech)} function word"
                     + ("" if len(speech) == 1 else "s")
                     + f" ({', '.join(sorted(speech)[:3])})")
+    elif reader_heard:
+        bits.append("the reader found function words while it was looking at "
+                    "the frames, which is why it called this speech at all")
     else:
         bits.append("no function words, so a card or a sign rather than speech")
     if ratio:
         bits.append(f"text low in the picture in {ratio*100:.0f}% of samples")
-    if credits:
+    # A ROLL, NOT A WORD THAT APPEARS IN ONE. This took 65% off the score
+    # the moment ANY credit-ish word was read, while probe_one - looking at
+    # the same words, to decide the same thing - asks for a third of them
+    # before it calls something a credit roll. Velvet S01E10 is the case the
+    # comment up in probe_one was written about: 15 of 24 frames carrying a
+    # page of dialogue, voided because somebody on screen said "assistant".
+    # It came back at 29% and would have been thrown away automatically, so
+    # the two tests are now the one test.
+    roll = bool(uniq) and len(credits) >= max(2, len(uniq) * 0.34)
+    if roll:
         s *= 0.35
-        bits.append(f"reads like a credit roll ({', '.join(sorted(credits)[:2])})")
+        bits.append(f"reads like a credit roll - {len(credits)} of "
+                    f"{len(uniq)} words are roll words "
+                    f"({', '.join(sorted(credits)[:2])})")
+    elif credits:
+        bits.append(f"{', '.join(sorted(credits)[:2])} in the read, but too "
+                    f"little of it to be a credit roll")
     try:
         if _series_of(str(row["path"] or "")) in ignored_series():
             s *= 0.25
@@ -1369,7 +1454,65 @@ def score_of(row) -> dict:
         s *= max(0.4, 1.0 - 0.6 * junk_share)
         bits.append(f"{junk_share*100:.0f}% of it is words from findings you "
                     f"threw away")
+    # AND WHETHER THIS IS LANGUAGE AT ALL. The shape test above asks whether
+    # each word could be a word; it cannot see that a whole read of them is
+    # noise. Measured across every picture stored here:
+    #
+    #                      words   mean length   any word of 5+   has a
+    #                                            letters          function word
+    #   really carrying      12        5.0           43%             98%
+    #   called none           3        3.6            0%             11%
+    #
+    # Nothing longer than four letters, several times over, is what OCR does
+    # to compression noise and texture - "abl, ani, boi, eae, ere, fal, foe,
+    # hss, loe, nes" is a real example, from a cartoon with no subtitles in
+    # it at all. A caption that says anything says at least one longer word.
+    longish = [w for w in uniq if len(w) >= 5]
+    if len(uniq) >= 4 and not longish:
+        s *= 0.35
+        bits.append(f"not one of the {len(uniq)} words read is longer than "
+                    f"four letters, which is what the OCR returns when it is "
+                    f"reading texture rather than text")
+    # WHAT KIND OF SHOW THIS IS, which the library can answer from 3,941
+    # pictures already sampled: 38% of anime carried burned-in words, 12% of
+    # live action, and 12 of 1,773 animated - seven tenths of one per cent.
+    # A reading is evidence about one file; the base rate is evidence about
+    # where that file came from, and a scorer with only the first will keep
+    # asking about American cartoons whose OCR found a word in a title card.
+    # Bounded on purpose: it nudges a borderline answer, it cannot make one.
+    fam, mult = _family_of(row), 1.0
+    if fam == "anime":
+        mult, word = 1.10, "anime, where 38% of the pictures sampled carried words"
+    elif fam == "animated":
+        mult, word = 0.60, ("animated but not anime, where 12 of 1,773 "
+                            "pictures sampled carried anything")
+    elif fam == "live":
+        mult, word = 0.90, "live action, where 12% of the pictures carried words"
+    else:
+        word = ""
+    if word:
+        s *= mult
+        bits.append(word)
     return {"score": int(max(0, min(100, round(s)))), "why": "; ".join(bits)}
+
+
+def _family_of(row) -> str:
+    """anime | animated | live, from the library the file sits in."""
+    try:
+        lib = str(row["library"] or "").lower() if "library" in row.keys() else ""
+    except Exception:                                            # noqa: BLE001
+        lib = ""
+    if not lib:
+        try:
+            p = str(row["path"] or "").lower()
+        except Exception:                                        # noqa: BLE001
+            p = ""
+        lib = p
+    if "anime" in lib:
+        return "anime"
+    if "animated" in lib:
+        return "animated"
+    return "live" if lib else ""
 
 
 # ------------------------------------------------------- auto, and how sure --
@@ -1408,16 +1551,22 @@ def verdict_for(row) -> dict:
         state = str(row["state"] or "") if "state" in row.keys() else ""
     except Exception:                                            # noqa: BLE001
         state = ""
-    if s >= mark_at() and state == SIGNS:
-        # SIGNS ARE NOT A REASON TO MARK. The marker track tells Bazarr and
-        # Plex that this file's subtitles are in the picture and need no
-        # other; a burned-in sign or song over a file that still wants a
-        # dialogue track is the opposite of that. Sure or not, a signs-only
-        # reading is the person's call.
-        d["auto"] = "ask"
-        d["auto_why"] = (f"{s}% is past the mark line, but the picture reads "
-                         f"as signs or songs only - whether that deserves the "
-                         f"marker track is your call")
+    if state == SIGNS:
+        # SIGNS ARE NOT A REASON TO MARK, and they are not a question either.
+        #
+        # The marker track tells Bazarr and Plex that this file's subtitles
+        # are in the picture and need no other; a burned-in sign or song over
+        # a file that still wants a dialogue track is the opposite of that.
+        # That much was always right. What was wrong was the conclusion: this
+        # asked, at every score, for ever - and the answer was never in doubt,
+        # which is why it has been given 133 times by hand and always the
+        # same way. A signs-only reading is a real finding with nothing to do
+        # about it, so it is recorded and left alone rather than queued up as
+        # a question nobody needs to answer twice.
+        d["auto"] = "dismiss"
+        d["auto_why"] = (f"the picture carries signs or songs only, not "
+                         f"dialogue - real, but not a reason to add a marker "
+                         f"track, so it is recorded and left alone")
     elif s >= mark_at():
         d["auto"] = "mark"
         d["auto_why"] = f"{s}% is at or above the {mark_at()}% mark line"

@@ -203,6 +203,13 @@ def _rows_from_probe(path: str, probe: dict) -> list:
         full_claim = bool(_FULL.search(old))
         lang = (tags.get("language") or "und").lower()
         name = _LANG_NAME.get(lang, "")
+        # THE HEADER'S OWN ANSWER, carried from here because this is the only
+        # place the probe is open. Measured across the library: the flag means
+        # different things by family - 8,287 forced ASS tracks in anime, which
+        # are Signs & Songs, against 781 forced SRT in live action, which are
+        # the foreign-dialogue tracks the flag was invented for - and on the
+        # tracks a person had to answer it was right 120 times out of 139.
+        forced = bool((s.get("disposition") or {}).get("forced"))
 
         # A MIXED CLAIM IS NOT A LIE. "Dialogue + Signs + Songs" says it has
         # both, and a dialogue cadence is exactly what it promised.
@@ -235,7 +242,7 @@ def _rows_from_probe(path: str, probe: dict) -> list:
         else:
             # The opposite finding: the further below 3 a minute, the surer.
             sure = 100.0 - (cpm / 3.0) * 40.0
-        out.append({"track": s_i,
+        out.append({"track": s_i, "forced": forced,
                     # mkvextract numbers tracks the way mkvmerge does, which
                     # for Matroska is ffprobe's stream index - not the s1/s2
                     # ordinal mkvpropedit wants. Both are carried because both
@@ -626,6 +633,12 @@ def _episode_of(path: str):
         return None
 
 
+def _repeat_index_sets() -> dict:
+    """(show, signature) -> the set of episodes carrying them. See below."""
+    _repeat_index()
+    return _REPEATS.get("sets") or {}
+
+
 def _repeat_index() -> dict:
     r"""(show, signature) -> how many DISTINCT episodes carry those lines.
 
@@ -655,7 +668,10 @@ def _repeat_index() -> dict:
                     seen.setdefault((ep[0], r["plain_sig"]), set()).add(ep[1])
     except Exception:                                            # noqa: BLE001
         return _REPEATS["map"]
-    _REPEATS.update(at=now, map={k: len(v) for k, v in seen.items()})
+    # The sets as well as the counts: siblings_of() needs to know WHICH
+    # episodes, not just how many share one signature.
+    _REPEATS.update(at=now, map={k: len(v) for k, v in seen.items()},
+                    sets=seen)
     return _REPEATS["map"]
 
 
@@ -667,6 +683,26 @@ def repeats_of(path: str, sig: str) -> int:
     if not ep:
         return 0
     return max(0, int(_repeat_index().get((ep[0], sig), 0)) - 1)
+
+
+def siblings_of(path: str) -> int:
+    """How many OTHER episodes of this show have been read at all.
+
+    WHAT MAKES A ZERO MEAN SOMETHING. repeats_of() answers 0 both for "these
+    lines are unique to this episode" and for "there was nothing to compare
+    it against", and those are opposite facts: the first says this is real
+    dialogue, written for this episode, and the second says nothing at all.
+    A count of siblings is what tells them apart.
+    """
+    ep = _episode_of(path)
+    if not ep:
+        return 0
+    show, me = ep[0], ep[1]
+    n = set()
+    for (sh, _sig), eps in _repeat_index_sets().items():
+        if sh == show:
+            n |= set(eps)
+    return max(0, len(n - {me}))
 
 
 def _duration_of(file_id: int) -> float:
@@ -1084,7 +1120,122 @@ KIND_WORDS = {DIALOGUE: "dialogue", HYBRID: "dialogue + signs",
 SIGNS_MAX = 2.0
 
 
-def kind_of(sh: dict, minutes: float) -> dict:
+# ---------------------------------------------------- the other signals ----
+#
+# WHAT EACH ONE IS WORTH, and where the number came from. Scored on the 139
+# tracks a person had to answer - which are, by construction, the ones the
+# rate could not settle, so these are the hard cases rather than the average
+# one:
+#
+#   positioning >= 20%      124 right of 139     \pos or \move on a fifth of
+#                                                the events; above 80% it was
+#                                                signs 56 times out of 56
+#   the title says so       120 of 139           "Signs & Songs", "Signs/Songs"
+#   the forced flag         120 of 139           the header's own claim
+#   lines per minute        16 of 139            what decides today
+#
+# The rate is not a bad signal - it settles the easy cases and it is what
+# these four disagree with - but it was the ONLY signal, and it is the
+# weakest of the four on anything that reaches a person. So: every signal
+# votes, each row says which ones voted, and the rate is one vote among them.
+#
+# AND THE FAMILY SETS THE PRIOR. Of 1,248 tracks read, 84% of the anime ones
+# run at or under two plain lines a minute against 10% of live action and
+# none of the animated: a sign sheet is an anime thing here, and a sparse
+# live-action track at six lines a minute is far more likely to be a real
+# subtitle for a quiet show than a sign sheet.
+SIGN_POINTS = {"pos_high": 40, "pos_some": 25, "title": 30, "forced": 20,
+               "styles": 10, "rate_low": 30}
+DIALOGUE_POINTS = {"rate_high": -40, "live": -20, "pos_none": -20,
+                   "unique": -30}
+SIGNS_AT = 45                    # points at or above which it is a sign sheet
+
+
+def _family(library: str) -> str:
+    lib = (library or "").lower()
+    return ("anime" if "anime" in lib else
+            "animated" if "animated" in lib else "live" if lib else "")
+
+
+def _title_says_signs(title: str) -> bool:
+    return _style_is_sign(title or "")
+
+
+def sign_evidence(sh: dict, rate: float, ctx: dict) -> tuple:
+    """(points, sentences) - every signal that has something to say."""
+    pts, why = 0, []
+    pos = float(sh.get("pos_pct") or 0.0)
+    if pos >= 60.0:
+        pts += SIGN_POINTS["pos_high"]
+        why.append(f"{pos:.0f}% of its events are placed on screen with "
+                   f"\\pos or \\move - that is typesetting, not speech")
+    elif pos >= 20.0:
+        pts += SIGN_POINTS["pos_some"]
+        why.append(f"{pos:.0f}% of its events are placed with \\pos or "
+                   f"\\move")
+    elif pos <= 0.0:
+        pts += DIALOGUE_POINTS["pos_none"]
+        why.append("nothing in it is placed on screen, so nothing in it is a "
+                   "sign")
+    # THE CLAIM UNDER TEST IS NOT EVIDENCE FOR ITSELF.
+    #
+    # This panel lists a track BECAUSE its title contradicts what it carries -
+    # that is the entry condition (see _rows_from_probe). So inside this set,
+    # counting "the title says signs" as evidence that it is signs is
+    # circular: it is the claim being judged. It cost real confidence, too.
+    # My Daughter Left the Nest carries twelve to fourteen plain dialogue
+    # lines a minute, unique to each episode, under a title that says forced
+    # - the exact finding this module exists to make - and the header's own
+    # word was dragging it back down to 84%, just under the line, so it
+    # queued up as a question instead.
+    #
+    # Outside that set the title and the flag are what they were measured to
+    # be: right 120 times out of 139.
+    testing_claim = bool(ctx.get("contradicts"))
+    if testing_claim:
+        why.append("its title is the claim being tested here, so it does not "
+                   "get to vote on itself")
+    else:
+        if _title_says_signs(ctx.get("title") or ""):
+            pts += SIGN_POINTS["title"]
+            why.append(f"the track is called {str(ctx.get('title'))[:40]!r}")
+        if ctx.get("forced"):
+            pts += SIGN_POINTS["forced"]
+            why.append("the header flags it forced"
+                       + (" - which in anime means signs and songs"
+                          if ctx.get("family") == "anime" else ""))
+    if int(sh.get("signish") or 0) > 0:
+        pts += SIGN_POINTS["styles"]
+        why.append(f"{int(sh['signish'])} of its styles are named for signs "
+                   f"or themes")
+    if rate <= SIGNS_MAX:
+        pts += SIGN_POINTS["rate_low"]
+        why.append(f"{rate:.1f} plain dialogue lines a minute")
+    elif rate >= SPEECH_LO:
+        pts += DIALOGUE_POINTS["rate_high"]
+        why.append(f"{rate:.1f} plain dialogue lines a minute, the cadence of "
+                   f"people talking")
+    if ctx.get("family") == "live":
+        pts += DIALOGUE_POINTS["live"]
+        why.append("live action, where 10% of tracks read are sign sheets "
+                   "against 84% of anime")
+    # LINES NOBODY ELSE HAS. The mirror of the repeat test above, which calls
+    # a track signs when its plain lines turn up word for word in a sibling -
+    # a karaoke script muxed into every episode. The other way round is
+    # evidence too, and it was going unused: lines that appear in THIS
+    # episode and in none of its siblings were written for this episode,
+    # which is what dialogue is. Only says anything where there were
+    # siblings to check against.
+    sibs = int(ctx.get("siblings") or 0)
+    if sibs >= 2 and not int(sh.get("repeats") or 0) and rate >= SPEECH_LO:
+        pts += DIALOGUE_POINTS["unique"]
+        why.append(f"its lines appear in none of the {sibs} other episodes "
+                   f"of this show that have been read - written for this "
+                   f"episode, which a sign sheet never is")
+    return pts, why
+
+
+def kind_of(sh: dict, minutes: float, ctx: dict | None = None) -> dict:
     r"""What this track carries, and how sure, from its shape.
 
     THE DIALOGUE RATE IS THE WHOLE TEST. Plain lines in non-sign styles per
@@ -1157,6 +1308,29 @@ def kind_of(sh: dict, minutes: float) -> dict:
     if not sh.get("events"):
         return {"kind": NONE, "rate": 0.0, "score": 100,
                 "why": "no events at all"}
+
+    # EVERY SIGNAL VOTES. See SIGN_POINTS above for what each is worth and
+    # what it was measured on. The rate keeps the cases it settles cleanly -
+    # far below the sign line or squarely in the speech band with nothing
+    # contradicting it - and the rest is decided by the evidence together,
+    # which is what the 24 rows sitting in the middle of this panel were
+    # waiting for somebody to do by hand.
+    ctx = ctx or {}
+    pts, notes = sign_evidence(sh, rate, ctx)
+    if pts >= SIGNS_AT:
+        # How far past the line, capped: 45 points is barely, 110 is every
+        # signal agreeing.
+        score = int(max(60, min(99, 60 + (pts - SIGNS_AT) * 0.6)))
+        return {"kind": SIGNS, "rate": round(rate, 1), "score": score,
+                "points": pts,
+                "why": "; ".join(notes) or f"{rate:.1f} lines a minute"}
+    if pts <= -30:
+        kind = HYBRID if sh.get("signish") else DIALOGUE
+        score = int(max(60, min(99, 60 + (abs(pts) - 30) * 0.6)))
+        return {"kind": kind, "rate": round(rate, 1), "score": score,
+                "points": pts,
+                "why": "; ".join(notes) or f"{rate:.1f} lines a minute"}
+
     if rate <= SIGNS_MAX:
         # Sure in proportion to how empty of dialogue it is.
         score = int(round(100 - (rate / SIGNS_MAX) * 40))
@@ -1337,7 +1511,18 @@ def scan(limit: int = 0) -> dict:
             r["shape"] = sh.get("detail") or UNREADABLE_WHY
             dropped.append(r)
             continue
-        v = kind_of(sh, r.get("minutes") or 24.0)
+        # THE SIGNALS THAT ARE NOT IN THE SHAPE. The title and the forced
+        # flag come off the header, the family off the library; the shape
+        # knows only what is inside the track.
+        v = kind_of(sh, r.get("minutes") or 24.0,
+                    {"title": r.get("old") or "",
+                     "forced": bool(r.get("forced")),
+                     "family": _family(r.get("library") or ""),
+                     "siblings": siblings_of(r.get("path") or ""),
+                     # Every row here is a contradiction - it is why the row
+                     # exists - but say so explicitly rather than leaving the
+                     # scorer to infer it from where it was called.
+                     "contradicts": True})
         r["read"] = True
         r["kind"] = v["kind"]
         r["chosen"] = bool(v.get("chosen"))
