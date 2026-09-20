@@ -14697,7 +14697,18 @@ tr.actsub.genhead .wrap>div.ell{white-space:nowrap;overflow:hidden;
    pane; the scroller claims the rest of it, which means the table ends where
    the panel ends instead of stopping half way down with empty frame below. */
 #ruleschkPane #au{display:flex;flex-direction:column}
-#ruleschkPane #auScroll{flex:1 1 auto;min-height:180px}
+/* AND A FLEX CHILD SHRINKS BELOW ITS CONTENT UNLESS TOLD NOT TO, which is
+   what both of these lists were doing. Measured on the Rule check page: the
+   main list held 159 rows and 6,011px of table inside a box 180px tall - its
+   own min-height, the floor it had fallen to - and the "No rule fixes these"
+   list held four rows and 2,240px of table in a box FIFTEEN pixels tall. A
+   scroller is allowed to be shorter than its content; it is not allowed to
+   be shorter than a line of it. So: a floor that shows a useful number of
+   rows, and the stuck list keeps its own height rather than giving it away.
+   The numbers match .rowbox, which is the box the Subtitle User Input lists
+   use - Erik asked for the same format and this is it. */
+#ruleschkPane #auScroll{flex:1 1 auto;min-height:420px}
+#ruleschkPane .auscrollstuck{flex:0 0 auto;max-height:352px;min-height:120px}
 /* The 100vh-230px cap is a backstop for layouts where the flex chain cannot
    resolve a height. This one can - #ruleschkBody is a resolved flex column -
    so the cap was simply stopping the box 150px short of the panel it lives in.
@@ -22340,7 +22351,7 @@ click to read this run's findings"
     ${stuckRows?`<div class="auhead">No rule fixes these
         <span class="dim" style="font-weight:400">— the check is right and the
         rules have a gap. Requeuing will not clear them; a rule change will.</span></div>
-      <div class="scrollbox auto nohz"><table class="fixed vtop">${stuckRows}</table></div>`:''}`);
+      <div class="rowbox scrollbox nohz auscrollstuck"><table class="fixed vtop">${stuckRows}</table></div>`:''}`);
   // Three speeds. Fast while a run or heal is visibly working; a middle gear
   // while files sit at 'queued to fix', because the server re-verifies those
   // the moment their jobs land and the colour flips deserve to be seen close
