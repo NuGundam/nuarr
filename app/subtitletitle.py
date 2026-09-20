@@ -112,6 +112,39 @@ _SAFE_WORDS = {
     # did not write".
     "ocr",
 }
+
+# A REGION CODE IS NOT A STRANGER'S NAME.
+#
+# The Wave (2015) offers a track called "Forced GBR" carrying 646 cues - the
+# same subtitles as the 631-cue track beside it, under a flag that makes a
+# player turn them on by itself. The read called it dialogue at 93% and the
+# panel still said "left alone: the title carries a name nuarr did not write
+# and cannot regenerate", because "gbr" is not in the list above. GBR is the
+# ISO-3166 code for the United Kingdom. It was the only token blocking the
+# only track row left in the panel.
+#
+# These are not merged into _SAFE_WORDS, because the two lists do different
+# jobs. A safe word is one the new title already says - dropping "forced"
+# from "Forced GBR" is the whole point of the correction. A region is
+# information nuarr did not write and CANNOT regenerate, which is exactly
+# what the rule was built to protect - so it is carried through into the new
+# title instead of being discarded. See _with_region(). Erik: keep it.
+_REGION = {
+    "gbr", "usa", "can", "aus", "nzl", "irl", "zaf", "ind", "bra", "prt",
+    "mex", "esp", "arg", "col", "chl", "fra", "deu", "aut", "che", "ita",
+    "nld", "bel", "swe", "nor", "dnk", "fin", "isl", "pol", "cze", "hun",
+    "rou", "grc", "tur", "rus", "ukr", "jpn", "kor", "chn", "twn", "hkg",
+    "sgp", "tha", "vnm", "idn", "mys", "phl", "isr", "sau", "egy",
+    "uk", "us", "gb",
+    "latam", "latin", "america", "american", "british", "europe", "european",
+    "brazilian", "castilian", "iberian", "canadian", "australian",
+    "simplified", "traditional", "mandarin", "cantonese",
+}
+# How a region token is written back. A code goes back as a code; a word goes
+# back as a word, capitalised the way a title is.
+_REGION_TEXT = {w: (w.upper() if len(w) <= 3 else w.capitalize())
+                for w in _REGION}
+
 _TOKENS = re.compile(r"[a-z]+")
 _DUR = re.compile(r"(\d+):(\d+):([\d.]+)")
 
@@ -179,11 +212,45 @@ def _stat(tags: dict, name: str):
 
 
 def _rewritable(title: str) -> bool:
-    """Is this title purely a role claim, with nothing nuarr cannot regenerate?"""
+    """Is this title purely a role claim, with nothing nuarr cannot regenerate?
+
+    A region counts as rewritable because the rewrite KEEPS it - see
+    _with_region. Anything else nuarr did not write still stops the
+    correction dead: a fansub group, "Commentary", a person's name.
+    """
     words = _TOKENS.findall((title or "").lower())
     if not words:
         return False
-    return all(w in _SAFE_WORDS for w in words)
+    return all(w in _SAFE_WORDS or w in _REGION for w in words)
+
+
+def _region_of(title: str) -> str:
+    """The region this title names, written the way it should go back.
+
+    Every region token, in the order they were written: "Forced Latin
+    America" names one region in two words and keeping only the first would
+    put back "Latin", which is not a place.
+    """
+    got = [_REGION_TEXT[w] for w in _TOKENS.findall((title or "").lower())
+           if w in _REGION and w not in _SAFE_WORDS]
+    return " ".join(got)
+
+
+def _with_region(new: str, old: str) -> str:
+    """Carry the old title's region into the new one, once.
+
+    "Forced GBR" -> "English (GBR)", not "English". The forced claim is what
+    the correction is there to remove; the region is the one thing in that
+    title nuarr could not put back, and throwing it away to fix the other
+    half would be the correction doing the damage the safe-title rule exists
+    to prevent.
+    """
+    reg = _region_of(old)
+    if not new or not reg:
+        return new
+    if reg.lower() in (new or "").lower():
+        return new                       # already carried - do not do it twice
+    return f"{new} ({reg})"
 
 
 # WHAT A REAL FORCED TRACK LOOKS LIKE, counted in this library.
@@ -325,6 +392,7 @@ def _rows_from_probe(path: str, probe: dict) -> list:
         else:
             # The opposite finding: the further below 3 a minute, the surer.
             sure = 100.0 - (cpm / 3.0) * 40.0
+        new = _with_region(new, old)
         out.append({"track": s_i, "forced": forced, "twin": twin,
                     # mkvextract numbers tracks the way mkvmerge does, which
                     # for Matroska is ffprobe's stream index - not the s1/s2
@@ -1746,6 +1814,23 @@ def scan(limit: int = 0) -> dict:
             # The honest title for a track carrying both is neither word alone.
             base = _LANG_NAME.get((r.get("lang") or "").lower(), "")
             r["new"] = f"{base} (dialogue + signs)" if base else "Dialogue + Signs"
+        r["new"] = _with_region(r.get("new") or "", r.get("old") or "")
+        # ---- THE FLAG, NOT JUST THE NAME -----------------------------------
+        #
+        # Renaming "Forced GBR" to "English (GBR)" leaves the file doing the
+        # thing that was wrong with it: flag-forced is still set on a track
+        # carrying the whole film, so a player still switches full subtitles
+        # on by itself. The name was never the defect - it was the symptom
+        # that made the defect findable.
+        #
+        # Only where the evidence is the twin: this track carries the same
+        # cues as the full track beside it in the same container, within 5%
+        # both ways, at a plausible speech rate. That is not a forced track
+        # with a bad name, it is the full track wearing a flag that is not
+        # true of it. A sparse forced track - the few dozen cues the flag was
+        # invented for - is never touched however its title reads.
+        r["unforce"] = bool(r.get("forced")) and bool(r.get("twin")) \
+            and v["kind"] in (DIALOGUE, HYBRID)
         # SAFE, OR SAID BY YOU. The safe-title rule exists because nuarr
         # cannot regenerate what a fansub group wrote into a title, so a
         # DETECTOR'S opinion is never allowed to overwrite one. A kind you set
@@ -1753,8 +1838,15 @@ def scan(limit: int = 0) -> dict:
         # call - so the correction is offered, with exactly what it would
         # become written in the row for you to approve or not.
         r["rewritable"] = ((_rewritable(r.get("old") or "") or v.get("chosen"))
-                           and bool(r.get("new"))
-                           and (r["new"] or "").lower() != (r.get("old") or "").lower())
+                           and (bool(r.get("new"))
+                                and (r["new"] or "").lower()
+                                != (r.get("old") or "").lower()
+                                # A FLAG TO CLEAR IS WORK TO DO. Without this
+                                # a track already called "English", flagged
+                                # forced and carrying the whole film, had
+                                # nothing to press: the name was right, so
+                                # the row offered nothing, so the flag stayed.
+                                or bool(r.get("unforce"))))
         r["unsafe"] = bool(v.get("chosen")) and not _rewritable(r.get("old") or "")
     if dropped:
         gone = {id(r) for r in dropped}
@@ -1800,16 +1892,25 @@ def _fix_file(path: str, edits: list) -> tuple[bool, str]:
         return False, "not on disk"
     cmd = [_mkvpropedit(), path]
     for e in edits:
-        cmd += ["--edit", f"track:s{int(e['track'])}",
-                "--set", f"name={e['new']}"]
+        cmd += ["--edit", f"track:s{int(e['track'])}"]
+        # A row can be here for the name, for the flag, or for both, and
+        # setting a name to what it already says is a rewrite of the file for
+        # nothing.
+        if (e.get("new") or "") and (e["new"] or "").lower() != (
+                e.get("old") or "").lower():
+            cmd += ["--set", f"name={e['new']}"]
+        if e.get("unforce"):
+            cmd += ["--set", "flag-forced=0"]
     try:
         r = _quiet_run(cmd, capture_output=True, text=True, timeout=300)
     except Exception as e:                                   # noqa: BLE001
         return False, str(e)[:160]
     if r.returncode >= 2:
         return False, (r.stderr or r.stdout or "mkvpropedit failed").strip()[:200]
-    return True, ", ".join(f"s{e['track']}: {e['old']!r} -> {e['new']!r}"
-                           for e in edits)
+    return True, ", ".join(
+        f"s{e['track']}: {e['old']!r} -> {e['new']!r}"
+        + (" and the forced flag cleared" if e.get("unforce") else "")
+        for e in edits)
 
 
 def fix(rows: list | None = None) -> dict:
@@ -1879,8 +1980,15 @@ def _restamp(file_id: int, path: str, edits: list) -> None:
                     continue
                 s_i += 1
                 for e in edits:
-                    if int(e["track"]) == s_i:
+                    if int(e["track"]) != s_i:
+                        continue
+                    if e.get("new"):
                         s.setdefault("tags", {})["title"] = e["new"]
+                    # THE FLAG TOO. Leaving it set in the probe brings the
+                    # row straight back on the next pass, reading exactly as
+                    # it did, about a file that has already been fixed.
+                    if e.get("unforce"):
+                        s.setdefault("disposition", {})["forced"] = 0
             cur.execute("UPDATE file_probes SET json=? WHERE file_id=?",
                         (json.dumps(probe), int(file_id)))
     except Exception:                                        # noqa: BLE001

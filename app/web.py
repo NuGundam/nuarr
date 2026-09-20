@@ -38145,7 +38145,8 @@ async function skAct(id, btn){
           +'and this release group, and the file goes on the queue - a stream '
           +'copy, nothing re-encoded, and nothing drawn over the words already '
           +'in the picture.'
-        : `Rewrite this track title to "${r.title_new||''}"? Your answer is `
+        : `Rewrite this track title to "${r.title_new||''}"${
+            r.unforce?' and clear its forced flag':''}? Your answer is `
           +'remembered for this show and this release group, and the file goes '
           +'on the queue - mkvpropedit edits the header only.',
     pic ? 'Yes, mark it' : 'Yes, correct it',
@@ -38757,44 +38758,45 @@ function snUnkBox(){
              : n>=5 ? '#d9b44a' : 'var(--dim,#8a97a6)';
   const shows=(d.shows||[]).map(g=>{
     const open=_snUnkOpen.has(g.show);
+    // ONE LINE EACH. Without a fixed layout the name column collapsed to
+    // the width of the longest unbreakable word and "Detective Conan -
+    // S00E24" came out over four lines, so eighty episodes filled the box
+    // four times over. Erik: "episode name can be one line instead of 4".
     const kids=open?(g.files||[]).map(f=>`<tr style="border-top:1px solid var(--line)">
-        <td style="padding:2px 8px 2px 22px">
-          <span class="dim">${esc(f.label||'')}</span></td>
-        <td style="padding:2px 8px 2px 0;width:60px;text-align:right"
+        <td></td>
+        <td class="dim" style="padding:2px 8px 2px 18px;white-space:nowrap;
+            overflow:hidden;text-overflow:ellipsis">${esc(f.label||'')}</td>
+        <td style="padding:2px 8px 2px 0;text-align:right"
             class="dim">${esc(f.lang||'')}</td></tr>`).join(''):'';
     return `<tr style="border-top:1px solid var(--line);cursor:pointer"
         onclick="snUnkOpen('${esc(String(g.show).replace(/'/g,"\\'"))}')"
         title="${open?'Hide':'Show'} the ${g.n} file${g.n===1?'':'s'} under this">
       <td style="padding:3px 8px 3px 0;text-align:right;white-space:nowrap;
-                 font-weight:700;width:52px;color:${cnum(g.n)}">${fmt(g.n)}</td>
+                 font-weight:700;color:${cnum(g.n)}">${fmt(g.n)}</td>
       <td style="padding:3px 8px 3px 0">
         <span class="dim" style="font-size:10px">${open?'▾':'▸'}</span>
         ${esc(g.show)}
         <span class="dim" style="font-size:10.5px">· ${esc(g.library||'')}</span>
         ${g.why?`<div class="dim" style="font-size:10.5px">${esc(g.why)}</div>`:''}
-      </td></tr>${kids}`;
+      </td><td></td></tr>${kids}`;
   }).join('');
-  const rows=(d.rows||[]).map(r=>`<tr style="border-top:1px solid var(--line)">
-      <td style="padding:3px 8px 3px 0">${esc(r.label||'')}
-        <div class="dim" style="font-size:10.5px">${esc(r.why||'')}</div></td>
-      <td style="padding:3px 8px 3px 0;width:70px;text-align:right"
-          class="dim">${esc(r.lang||'')}</td></tr>`).join('');
+// THE FLAT LIST IS GONE. It was every file again, under the shows that
+  // already hold every file - the same 384 rows twice, the second copy
+  // sorted differently and saying the same sentence on each one. Erik:
+  // "every file scroll box is not need". Opening a show is the way in.
   return `<div style="margin:6px 14px 2px;padding:9px 11px;border:1px solid
        var(--line);border-radius:7px;background:rgba(255,255,255,.02)">
     <div style="font-size:11.5px"><b style="color:${cnum(d.total||0)}">${
         fmt(d.total||0)}</b> <b>${esc(d.word||'')}</b>
       <span class="dim">— ${(d.shows||[]).length} show${
-        (d.shows||[]).length===1?'':'s'}, click one to open it${
-        d.shown<d.total?`; the flat list below holds the first ${fmt(d.shown)}`:''}</span>
+        (d.shows||[]).length===1?'':'s'}, click one to open it</span>
       <a href="#" onclick="snUnkShow('${_snUnk}');return false"
          style="margin-left:10px">hide</a></div>
-    <div class="rowbox scrollbox nohz" style="max-height:300px;margin-top:5px">
-      <table style="width:100%;font-size:11.5px;border-collapse:collapse">
+    <div class="rowbox scrollbox nohz" style="max-height:420px;margin-top:5px">
+      <table style="width:100%;font-size:11.5px;border-collapse:collapse;
+             table-layout:fixed">
+        <colgroup><col style="width:52px"><col><col style="width:54px"></colgroup>
         <tbody>${shows}</tbody></table></div>
-    <div class="dim" style="font-size:10.5px;margin-top:6px">every file</div>
-    <div class="rowbox scrollbox nohz" style="max-height:300px;margin-top:2px">
-      <table style="width:100%;font-size:11.5px;border-collapse:collapse">
-        <tbody>${rows}</tbody></table></div>
   </div>`;
 }
 function snPaint(force){
@@ -38987,10 +38989,17 @@ function snPaint(force){
           : '<span class="err">could not</span>'}</td>
       </tr>`).join('')}</tbody></table></div>`:'';
 
+  // THE BREAKDOWN IS IN THE HEAD AND ONLY THERE. It was in both places,
+  // and the copy down here carried the same three links opening the same
+  // three lists - which are drawn at the top, so clicking one from the
+  // foot appeared to do nothing. Erik: "this should only be at the top
+  // don't need to duplicate below". The bare total stays: it is the other
+  // half of "nothing still to answer", and without it that sentence reads
+  // as "everything is fine".
   const foot=`<div class="dim" style="display:flex;gap:12px;align-items:center;
        flex-wrap:wrap;font-size:11px;margin-top:6px">
     <span>${miss?`${fmt(miss)} still to answer`:'nothing still to answer'}${
-      unk?` · ${snUnknownWords(c)} - no opinion, no button`:''}</span>
+      unk?` · ${fmt(unk)} with no opinion and no button`:''}</span>
     ${nDone?`<a href="#" onclick="snShowDone(${_snDone?0:1});return false"
       title="Releases this check has already blocklisted and re-searched. They come from the shared remedy ledger rather than from this list, because answering one deletes its row - the file it was about no longer exists.">${
       _snDone?'hide':'also show'} the ${fmt(nDone)} answered</a>`:''}
@@ -39376,7 +39385,10 @@ function skPaint(force){
           :`<span style="color:var(--warn)" title="${esc(r.title_old||'')}">${esc(r.title_old||'')}</span>${
              r.action==='retitle'?`<div style="font-size:10px;color:var(--ok);overflow:hidden;text-overflow:ellipsis" title="${
                esc((r.title_new||'')+(r.unsafe?' — this replaces a title nuarr did not write, because you set the kind by hand':''))}">→ ${
-               esc(r.title_new||'')}${r.unsafe?' <span class="dim">(your call)</span>':''}</div>`
+               esc(r.title_new||'')}${r.unsafe?' <span class="dim">(your call)</span>':''}</div>${
+               r.unforce?`<div style="font-size:10px;color:var(--ok)"
+                 title="This track carries the same cues as the full track beside it in the same file, so the forced flag is not true of it - and a forced track is what makes a player turn subtitles on by itself. The flag is cleared in the same call that fixes the name. A genuinely sparse forced track is never touched.">
+                 → and the forced flag cleared</div>`:''}`
                                  :(r.unread?''
                                     :(r.settled
                                       ? `<div class="dim" style="font-size:10px" title="You said this track carries ${

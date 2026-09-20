@@ -206,6 +206,12 @@ def _track_rows(limit: int) -> list:
             "why": r.get("kind_why") or r.get("why") or "",
             "auto": auto, "auto_why": auto_why,
             "title_old": r.get("old") or "", "title_new": r.get("new") or "",
+            # THE FLAG IS PART OF THE CORRECTION, so the row says so before
+            # the button is pressed. A forced-flagged track carrying the same
+            # cues as the full track beside it is the full track wearing a
+            # flag that is not true of it, and renaming it alone leaves the
+            # player still switching subtitles on by itself.
+            "unforce": bool(r.get("unforce")),
             # NOTHING IS OFFERED UNTIL THE TRACK HAS BEEN READ. A row whose
             # events are still on the queue carried "retitle" as its action
             # because the title LOOKED regenerable, and the header counted
@@ -215,7 +221,9 @@ def _track_rows(limit: int) -> list:
             "action": ("" if unread else
                        "retitle" if rewritable else
                        ("leave" if (settled and not acked) else "")),
-            "action_word": ("Correct the title" if rewritable else
+            "action_word": (("Correct it and clear the forced flag"
+                             if r.get("unforce") else "Correct the title")
+                            if rewritable else
                             ("Leave it as it is" if (settled and not acked)
                              else ("" if unread else "left alone"))),
             # DONE MEANS ANSWERED, and setting a kind is not an answer. Only
