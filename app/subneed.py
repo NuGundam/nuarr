@@ -303,6 +303,18 @@ RULES: dict = {
         "rests": "one function word is a shop sign as easily as a subtitle. "
                  "Not enough to clear the file and far too much to accuse "
                  "it."},
+    "show_burned": {
+        "says": OK, "sure": 85, "short": "the rest of the show is burned-in",
+        "line": "its picture shows marks nobody could read, and most of this "
+                "show carries burned-in dialogue",
+        "rests": "same release, same encoder, same burned-in subtitles. "
+                 "Detective Conan was 61 of the 332 nobody could decide and "
+                 "455 of its other 523 settled pictures read as burned-in "
+                 "dialogue; City Hunter was 12 of them at 78%. A PROPORTION "
+                 "and not an existence test, because one burned-in episode "
+                 "out of 170 would otherwise clear all of Teenage Mutant "
+                 "Ninja Turtles. Replayed over the 315 pictures a person "
+                 "settled by hand it clears 291 and disagrees once."},
     "marks": {
         "says": UNKNOWN, "short": "marks it could not read",
         "line": "there are subtitle-shaped marks it could not transcribe",
@@ -400,6 +412,7 @@ RULE_ORDER = (
     "track", "side", "marker", "mislabelled",  # a subtitle, and a real one
     "untagged",                                # might be the one
     "nopic", "burned", "ocr_trans", "ocr_one",  # what the picture says
+    "show_burned",                             # what the rest of the show says
     "marks", "noframes", "stale",
     "signs_unread",                            # signs, or not? unread
     "spoken",                                  # you can follow it anyway
@@ -614,6 +627,81 @@ def _speech_rate(t: dict, minutes: float) -> float:
     return cues / minutes
 
 
+# ---- WHAT THE REST OF THE SHOW CARRIES -------------------------------------
+#
+# Erik: "the undecided should be checked again for dialog subs". 332 files
+# sat at undecided, all of them the same shape - Japanese audio, no subtitle
+# track at all, and a picture with subtitle-shaped marks the OCR could not
+# read a word of. Re-reading them does not help: every one is already at the
+# current reader revision, so they HAVE been read again and came back the
+# same. The evidence that settles them is not in the file.
+#
+# It is in the other episodes. Detective Conan is 61 of the 332, and 455 of
+# its other 523 settled pictures carry burned-in dialogue - same release,
+# same encoder, same burned-in subtitles. City Hunter is 12 of them and 78%
+# of that show reads burned-in. Meanwhile EyeShield 21 is 39 of them and 5%
+# of that show does.
+#
+# A PROPORTION, NOT AN EXISTENCE TEST, and that distinction is the whole
+# rule. "Any sibling read as burned-in" would clear all 169 Teenage Mutant
+# Ninja Turtles episodes on the strength of one, and 39 EyeShield 21 on the
+# strength of two out of forty-four. Shows here are strongly bimodal - 87%,
+# 78%, or 0 to 8% - so anything from a quarter to three quarters picks out
+# the same 74 files, and half is the honest middle of that.
+#
+# VALIDATED AGAINST THE ANSWERS. Replayed over the 315 pictures Erik settled
+# by hand: the rule clears 291 of them and disagrees with him once.
+#
+# It can only CLEAR a file, never accuse one. The failure mode is leaving a
+# raw alone, not deleting something good.
+SHOW_BURNED_AT = 0.5        # of the show's settled pictures
+SHOW_BURNED_MIN = 4         # settled pictures before the show is evidence
+_SHOW_TTL = 300.0
+_SHOWS: dict = {"at": 0.0, "map": {}}
+
+
+def _show_of_path(p: str) -> str:
+    parts = [x for x in str(p or "").replace("/", "\\").split("\\") if x]
+    return parts[2] if len(parts) > 2 else (parts[-1] if parts else "")
+
+
+def show_burn(cur) -> dict:
+    """show folder -> (pictures reading burned-in, pictures settled at all).
+
+    One query for the whole library rather than one per file: the sweep
+    judges 40,000 files a pass and this table is 4,400 rows.
+    """
+    now = time.time()
+    if _SHOWS["map"] and now - _SHOWS["at"] < _SHOW_TTL:
+        return _SHOWS["map"]
+    out: dict = {}
+    try:
+        for r in cur.execute(
+                "SELECT f.path, COALESCE(NULLIF(h.chosen,''), h.state) v "
+                "  FROM hardsub h JOIN files f ON f.id = h.file_id "
+                " WHERE f.state NOT IN ('deleted','duplicate') "
+                "   AND COALESCE(NULLIF(h.chosen,''), h.state) <> ''"):
+            sh = _show_of_path(r["path"])
+            if not sh:
+                continue
+            b, n = out.get(sh, (0, 0))
+            out[sh] = (b + (1 if r["v"] in ("dialogue", "hybrid") else 0),
+                       n + 1)
+    except Exception:                                            # noqa: BLE001
+        return _SHOWS["map"] or {}
+    _SHOWS.update(at=now, map=out)
+    return out
+
+
+def show_burns_in(path: str, cur) -> tuple[bool, int, int]:
+    """(is the rest of this show burned-in, how many, out of how many)."""
+    sh = _show_of_path(path)
+    if not sh:
+        return False, 0, 0
+    b, n = (show_burn(cur).get(sh) or (0, 0))
+    return (n >= SHOW_BURNED_MIN and b >= n * SHOW_BURNED_AT), b, n
+
+
 def _audio_langs(file_id: int, cur) -> set[str]:
     r"""What languages the audio is in - heard where possible, tagged where not.
 
@@ -672,7 +760,7 @@ def _picture(file_id: int, cur, pic=None):
 
 def verdict(file_id: int, lang: str, cur, facts=None,
             untagged_ok: bool = True, pic=None,
-            minutes: float = 0.0) -> tuple[str, str, str]:
+            minutes: float = 0.0, path: str = "") -> tuple[str, str, str]:
     """Does this file carry `lang` subtitles? Returns (state, why, rule).
 
     `rule` names the rung that answered, so the row can say how sure that
@@ -686,13 +774,15 @@ def verdict(file_id: int, lang: str, cur, facts=None,
     # A CUE COUNT MEANS NOTHING WITHOUT A RUNTIME. Fetched here when the
     # caller did not have it, which is the single-file path; the sweep
     # already has it on the row it selected.
-    if not minutes:
+    if not minutes or not path:
         try:
-            _r = cur.execute("SELECT duration FROM files WHERE id=?",
+            _r = cur.execute("SELECT duration, path FROM files WHERE id=?",
                              (int(file_id),)).fetchone()
-            minutes = float((_r["duration"] if _r else 0) or 0) / 60.0
+            if _r is not None:
+                minutes = minutes or float(_r["duration"] or 0) / 60.0
+                path = path or str(_r["path"] or "")
         except Exception:                                        # noqa: BLE001
-            minutes = 0.0
+            pass
     if facts is None:
         facts = cur.execute("SELECT * FROM sub_facts WHERE file_id=?",
                             (int(file_id),)).fetchone()
@@ -889,6 +979,17 @@ def verdict(file_id: int, lang: str, cur, facts=None,
     n_s = int(prow["samples"] or 0)
     n_lo = int(prow["low_hits"] or 0)
     if n_s and (n_lo / n_s) >= PICTURE_MARKS_RATIO:
+        # THE REST OF THE SHOW GETS ASKED BEFORE THE FILE IS PARKED. See
+        # show_burns_in: marks nobody can read mean one thing in a show that
+        # is 87% burned-in and another in a show that is 0%.
+        yes, _b, _n = show_burns_in(path, cur)
+        if yes:
+            return OK, (
+                f"the picture reader found marks low in the picture in "
+                f"{n_lo} of {n_s} frames and could read none of them - and "
+                f"{_b} of the {_n} episodes of this show it has settled "
+                f"carry burned-in dialogue, so these are the same subtitles "
+                f"it cannot transcribe"), "show_burned"
         # Two thirds of sampled frames with subtitle-shaped marks and not one
         # word back is what an SDTV-era hardsub looks like to an OCR trained
         # on clean type. Treating that as "no subtitles" put 126 of 146 files
@@ -967,7 +1068,8 @@ def check_one(file_id: int, cur=None) -> dict:
         for lang in want:
             st, why, rule = verdict(file_id, lang, cur, facts, untagged,
                                     None,
-                                    float(row["duration"] or 0) / 60.0)
+                                    float(row["duration"] or 0) / 60.0,
+                                    str(row["path"] or ""))
             out[lang] = st
             cur.execute(
                 "INSERT INTO sub_need(file_id,lang,library,state,why,"
@@ -1016,7 +1118,7 @@ def sweep(limit: int = BATCH) -> dict:
                     # out would make every signs-or-dialogue test fall back
                     # to "cannot say" across the whole library while
                     # single-file calls worked perfectly.
-                    "SELECT f.id, f.library, f.duration, "
+                    "SELECT f.id, f.library, f.duration, f.path, "
                     "       s.tracks, s.sides, s.picture, "
                     # h.words IS NOT OPTIONAL. verdict() reads it to decide
                     # whether the OCR pulled English off the picture, and this
@@ -1049,7 +1151,8 @@ def sweep(limit: int = BATCH) -> dict:
                     for lang in want:
                         st, why, rule = verdict(
                             r["id"], lang, cur, r, untagged, prow,
-                            float(r["duration"] or 0) / 60.0)
+                            float(r["duration"] or 0) / 60.0,
+                            str(r["path"] or ""))
                         tally[st] = tally.get(st, 0) + 1
                         cur.execute(
                             "INSERT INTO sub_need"
