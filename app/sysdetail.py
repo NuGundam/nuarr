@@ -738,8 +738,14 @@ def _by_work(field: str) -> list:
     agg: dict = {}
     for p in _procs():
         k = p.get("activity") or p.get("name") or "?"
-        a = agg.setdefault(k, {"key": k, "n": 0, "v": 0.0})
+        a = agg.setdefault(k, {"key": k, "n": 0, "v": 0.0,
+                               # Which of the Concurrency page's counts this
+                               # work spends - carried so a bar here can be
+                               # traced to the setting that sizes it.
+                               "pool": p.get("pool") or ""})
         a["n"] += 1
+        if not a.get("pool"):
+            a["pool"] = p.get("pool") or ""
         a["v"] += float(p.get(field) or 0)
     rows = sorted(agg.values(), key=lambda a: -a["v"])
     return rows
@@ -754,6 +760,7 @@ def _top_procs(field: str, limit: int, extra: str = "") -> list:
     for p in rows[:limit]:
         out.append({"pid": p.get("pid"), "name": p.get("name"),
                     "activity": p.get("activity") or "",
+                    "pool": p.get("pool") or "",
                     "detail": p.get("detail") or "",
                     "cpu_pct": p.get("cpu_pct"), "rss_mb": p.get("rss_mb"),
                     "read_bps": p.get("read_bps"), "write_bps": p.get("write_bps"),

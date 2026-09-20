@@ -28985,11 +28985,43 @@ function tmChart(rows, series, opts){
 // row to read at a glance and the wrong one when a single ffmpeg is the
 // question; the caret opens the group into one line per process - pid,
 // executable, its own figures - and stays open across the 1 s repaint.
-const _tmOpen = new Set();
+// EVERY PROCESS SHOWS, AND THE GROUP LINE STAYS. Erik: "can we break out
+// each process and put the worker bubble next to it". The group was the row
+// and its processes were behind a caret nobody opened - so "2 x Transcode"
+// was two encodes at unknown individual cost, and finding out took a click
+// that closed itself on the next repaint.
+//
+// Held as the set of groups that are SHUT rather than the set that are open,
+// which is the whole change: a key nobody has touched is not in the set, so
+// it draws its processes. The caret still closes one, and the grouping
+// underneath is untouched - it is what stops the table dancing when four
+// short-lived ffprobes come and go inside a second.
+const _tmShut = new Set();
 function tmToggle(ev, key){
   if(ev){ ev.stopPropagation(); ev.preventDefault(); }
-  if(_tmOpen.has(key)) _tmOpen.delete(key); else _tmOpen.add(key);
+  if(_tmShut.has(key)) _tmShut.delete(key); else _tmShut.add(key);
   tmPaint();
+}
+// WHICH OF THE CONCURRENCY PAGE'S COUNTS THIS ROW IS SPENDING, in that
+// page's own colour. The server names the pool from the command line - see
+// system._owner - so this is not the page guessing from a label.
+const TM_POOL_WHY = {
+  encode:'Encodes at once - this is one of them.',
+  passthrough:'Remuxes at once - a stream copy, no encoder involved.',
+  subocr:'Subtitle OCR at once - reading words out of a picture.',
+  subread:'Subtitle track reads at once - sampling frames for burned-in words. The most expensive thing in the background.',
+  subs:'Subtitle fixes at once - a sidecar taken in, a track removed, a title corrected.',
+  audio:'Audio tag fixes at once - one header write with mkvpropedit.',
+  decode:'Decode checks at once - reading a file through to see whether the bytes are good.',
+  listen:'Audio listens at once - a sample through Whisper to find out what language is spoken.',
+  probe:'File scans at once - one disk read to inspect a file.',
+  handler:'A handler script. Not one of the sized pools.'};
+function tmPool(pool){
+  if(!pool) return '';
+  const c = poolColor(pool);
+  return `<span class="pill" style="color:${c};border-color:${c};
+     font-size:9.5px;padding:0 5px;margin-right:5px;vertical-align:1px"
+     title="${esc(TM_POOL_WHY[pool]||'One of the worker counts on the Concurrency page.')} Its limit is set under Settings - Concurrency.">${esc(pool)}</span>`;
 }
 function tmChildRows(p, cores){
   return (p.procs||[]).slice().sort((a,b)=>(b.cpu_pct||0)-(a.cpu_pct||0)).map(q=>{
@@ -28997,7 +29029,7 @@ function tmChildRows(p, cores){
     const low = q.io_prio!=null && q.io_prio<=1;
     return `<tr class="tmrow tmchild" style="border-top:1px dashed var(--line);opacity:.85">
       <td style="padding:3px 6px 3px 22px;text-align:left;overflow:hidden;white-space:nowrap;text-overflow:ellipsis">
-        <span class="dim">└</span> <span class="mono">${esc(q.name||'?')}</span>
+        <span class="dim">└</span> ${tmPool(q.pool||'')}<span class="mono">${esc(q.name||'?')}</span>
         <span class="dim mono" style="font-size:10px"> · ${q.pid}</span></td>
       <td class="dim" style="padding:3px 6px;text-align:left;overflow:hidden;white-space:nowrap;text-overflow:ellipsis"
           title="${esc(q.detail||'')}">${esc(q.detail||'')}</td>
@@ -29642,7 +29674,8 @@ function tmPaint(){
     let g = byWork.get(k);
     if(!g){
       g = {key:k, n:0, cpu:0, ram:0, read:0, write:0, age:0, self:false,
-           gpu:'', low:false, exes:new Set(), details:[], pids:[], procs:[]};
+           gpu:'', pool:'', low:false, exes:new Set(), details:[], pids:[],
+           procs:[]};
       byWork.set(k, g);
     }
     g.n++;
@@ -29651,6 +29684,10 @@ function tmPaint(){
     g.age = Math.max(g.age, p.age_s||0);
     if(p.self) g.self = true;
     if(p.gpu && !g.gpu) g.gpu = p.gpu;
+    // A conhost inherits its parent's pool, so any member answers for the
+    // group - but take the first non-empty rather than the first, or a
+    // console that arrived ahead of its ffmpeg leaves the row unlabelled.
+    if(p.pool && !g.pool) g.pool = p.pool;
     // ANY ONE OF THEM YIELDING MAKES THE GROUP YIELDING. It is the fact worth
     // surfacing, and the conhost beside a demoted ffmpeg is never the one
     // that was demoted.
@@ -29789,7 +29826,11 @@ function tmPaint(){
          title clips instead of shoving the numbers off the edge. -->
     <table style="width:100%;font-size:11.5px;border-collapse:collapse;
            table-layout:fixed">
-      <colgroup><col style="width:21%"><col style="width:auto">
+      <!-- A LITTLE WIDER SINCE THE POOL BUBBLE MOVED IN. At 21% the pill
+           ate the name it was meant to explain - "subocr Subtit..." - and
+           the column that says what the row IS should not be the one that
+           clips first. -->
+      <colgroup><col style="width:24%"><col style="width:auto">
         <col style="width:8%"><col style="width:9%"><col style="width:10%">
         <col style="width:10%"><col style="width:9%"><col style="width:8%">
         <col style="width:9%"></colgroup>
@@ -29824,15 +29865,16 @@ function tmPaint(){
               (0.13*(1-newMs/2600)).toFixed(3)});` : '');
         const cls = p._gone ? ' tmgone' : (fresh ? ' tmfresh' : '');
         const tree = p.n>1 && !p._gone;
-        const open = tree && _tmOpen.has(p.key);
+        const open = tree && !_tmShut.has(p.key);
         return `<tr class="tmrow${cls}" style="border-top:1px solid var(--line);
           opacity:${op.toFixed(3)};${wash}${tree?'cursor:pointer':''}"
-          ${tree?`onclick="tmToggle(event,${esc(JSON.stringify(p.key))})" title="${open?'hide':'show'} the ${p.n} processes in this group"`:''}>
+          ${tree?`onclick="tmToggle(event,${esc(JSON.stringify(p.key))})" title="${open?'fold these '+p.n+' processes back into one line':'break this group out into its '+p.n+' processes'}"`:''}>
         <td style="padding:4px 6px;text-align:left;overflow:hidden">
           <b style="color:${p.self?'var(--acc)':(stale?'var(--warn)':'var(--fg)')};
              display:block;overflow:hidden;text-overflow:ellipsis;
              white-space:nowrap">${
             tree?`<span class="dim" style="display:inline-block;width:11px">${open?'▾':'▸'}</span>`:''}${
+            tmPool(p.pool||'')}${
             p.n>1?`<span class="dim">${p.n} × </span>`:''}${esc(p.key||'?')}${
             p.self?'<span class="dim"> (the server)</span>':''}</b>
           <div class="dim" style="font-size:10px;overflow:hidden;

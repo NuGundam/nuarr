@@ -342,8 +342,22 @@ def _gpu_of(cmd: list) -> str:
     return ""
 
 
-def _owner(name: str, cmd: list) -> tuple[str, str]:
-    r"""WHICH NUARR ACTIVITY owns this process, and what it is doing.
+# WHICH POOL A PROCESS IS SPENDING, BY NAME.
+#
+# The task manager names every process by its work - "Transcode", "Subtitle
+# OCR" - and the Concurrency page sizes the pools those names belong to, and
+# nothing joined the two. So a row reading 12.8% told you nuarr was busy and
+# not which of the nine counts on the other page was paying for it, and the
+# only way to connect them was to know that a Repack is the passthrough pool.
+# The key is returned from here because THIS is where the command line is
+# open: an ffmpeg with -c:v copy is passthrough and one without it is encode,
+# and that is a fact about the arguments, not a guess about the name.
+#
+# An empty pool is honest: the server itself belongs to no pool, and neither
+# does a process nuarr did not recognise.
+def _owner(name: str, cmd: list) -> tuple[str, str, str]:
+    r"""WHICH NUARR ACTIVITY owns this process, what it is doing, and which
+    worker pool it is spending.
 
     "ffprobe.exe" and "conhost.exe" are true and useless: they say a process
     exists, not what nuarr is doing with it. Everything nuarr spawns is
@@ -364,39 +378,73 @@ def _owner(name: str, cmd: list) -> tuple[str, str]:
         # for it.
         if "f32le" in jl and "16000" in jl:
             return "Audio language", (f"listening to {what}" if what
-                                      else "listening to a sample")
+                                      else "listening to a sample"), "listen"
         if "-progress" in jl:
             # COPYING IS NOT ENCODING, and the GPU column made that visible:
             # a job labelled "encoding" with nothing on the card and -c:v copy
             # on its command line is a repack, which is the cheapest thing the
             # queue does and reads as the most expensive.
             if "-c:v copy" in jl or "-c:v:0 copy" in jl:
-                return "Repack", (f"copying {what}" if what else "copying")
-            return "Transcode", (f"encoding {what}" if what else "encoding")
+                return ("Repack", f"copying {what}" if what else "copying",
+                        "passthrough")
+            return ("Transcode", f"encoding {what}" if what else "encoding",
+                    "encode")
         # THE DECODE CHECK, WHICH HAD BEEN ARRIVING AS "ffmpeg". Nothing else
         # nuarr runs decodes to nowhere: -f null with -xerror is the integrity
         # sweep reading both ends of a file to see whether the bytes are good.
         # A panel whose whole point is naming the work should not have two
         # rows on it called after the executable.
         if "-f null" in jl and "-xerror" in jl:
-            return "Does it decode?", (f"reading both ends of {what}" if what
-                                       else "reading both ends of a file")
-        return "ffmpeg", what
+            return ("Does it decode?",
+                    f"reading both ends of {what}" if what
+                    else "reading both ends of a file", "decode")
+        # THE PICTURE READER'S FRAME GRABBER, which had no name and no pool.
+        # Nothing else nuarr runs asks ffmpeg for raw grey video on stdout:
+        # the reader crops the caption band, scales it and takes the bytes
+        # straight, because writing a PNG per frame is the slowest part of
+        # reading a picture. It is the single most expensive thing in the
+        # background - 9.1 cores at six lanes, measured - and it was arriving
+        # here as a row called "ffmpeg".
+        if "format=gray" in jl and "rawvideo" in jl:
+            return ("Subtitle track read",
+                    f"sampling frames from {what}" if what
+                    else "sampling frames", "subread")
+        # THE ENCODER TEST, which is the only ffmpeg here with no input
+        # file at all - it generates two seconds of test pattern to find out
+        # whether an encoder on this box actually works before the queue
+        # commits a film to it.
+        if "testsrc2" in jl:
+            return "Encoder test", "checking an encoder on this box", ""
+        return "ffmpeg", what, ""
     if low.startswith("ffprobe"):
         if "format=duration" in jl:
-            return "Audio language", (f"measuring {what}" if what else "measuring")
-        return "Probe", (f"inspecting {what}" if what else "inspecting a file")
+            return ("Audio language",
+                    f"measuring {what}" if what else "measuring", "listen")
+        return ("Probe", f"inspecting {what}" if what else "inspecting a file",
+                "probe")
     if low.startswith("mkvpropedit"):
-        return "Audio language", (f"writing the language tag on {what}"
-                                  if what else "writing a language tag")
+        return ("Audio language",
+                f"writing the language tag on {what}" if what
+                else "writing a language tag", "audio")
+    # mkvextract HAD NO NAME AT ALL - a blank row in a panel whose whole
+    # point is that nuarr should not be spawning things it cannot name. It
+    # pulls one subtitle track out of a container so its lines can be
+    # counted, which is the reading half of the subtitle work.
+    if low.startswith("mkvextract"):
+        return ("Subtitle track read",
+                f"pulling a track out of {what}" if what
+                else "pulling a track out to count its lines", "subread")
     if low.startswith("mkvmerge"):
-        return "Subtitles", (f"embedding into {what}" if what else "embedding")
+        return ("Subtitles",
+                f"embedding into {what}" if what else "embedding", "subs")
     if low.startswith(("powershell", "pwsh")):
         # Handler scripts are passed by path; name the script, not "powershell".
         m = re.search(r"([\w.-]+\.ps1)", joined, re.I)
-        return "Handler script", (m.group(1) if m else "running a handler")
+        return ("Handler script", m.group(1) if m else "running a handler",
+                "handler")
     if "tesseract" in low:
-        return "Subtitle OCR", (f"reading {what}" if what else "reading subtitles")
+        return ("Subtitle OCR",
+                f"reading {what}" if what else "reading subtitles", "subocr")
     # THE OTHER OCR ENGINE, which was invisible here.
     #
     # This function names processes by their EXECUTABLE, and Tesseract is an
@@ -411,16 +459,18 @@ def _owner(name: str, cmd: list) -> tuple[str, str]:
                else "CPU" if "--device cpu" in jl else "")
         eng = "Tesseract" if "--engine tesseract" in jl else "PaddleOCR"
         lead = f"{eng}{' on the ' + dev if dev else ''}"
-        return "Subtitle OCR", (f"{lead} reading {what}" if what
-                                else f"{lead} reading subtitles")
+        return ("Subtitle OCR",
+                f"{lead} reading {what}" if what
+                else f"{lead} reading subtitles", "subocr")
     # The Tesseract path runs through a wrapper that hides its console; the
     # wrapper itself is the process the panel sees while pgsrip works.
     if "pgsrip_hidden.py" in jl or "pgsrip" in jl:
-        return "Subtitle OCR", (f"Tesseract reading {what}" if what
-                                else "Tesseract reading subtitles")
+        return ("Subtitle OCR",
+                f"Tesseract reading {what}" if what
+                else "Tesseract reading subtitles", "subocr")
     if low.startswith("conhost"):
-        return "", "console host for another process"
-    return "", ""
+        return "", "console host for another process", ""
+    return "", "", ""
 
 
 def _self_usage() -> dict:
@@ -480,7 +530,7 @@ def _self_usage() -> dict:
         except psutil.Error:
             age = 0.0
         _cmd = _cmdline(tracked)
-        act, detail = ("nuarr", "the server") if p.pid == me.pid \
+        act, detail, pool = ("nuarr", "the server", "") if p.pid == me.pid \
             else _owner(name, _cmd)
         # THE SERVER'S OWN GPU WORK IS NOT ON A COMMAND LINE. Whisper and
         # PaddleOCR load into this process, so there is no child to inspect -
@@ -533,6 +583,8 @@ def _self_usage() -> dict:
             "name": name,
             "activity": act,
             "detail": detail,
+            # Which of the Concurrency page's counts this process is spending.
+            "pool": pool,
             "rss_mb": round(m / 1024 ** 2, 1),
             "cpu_pct": round(c, 1),
             "age_s": round(age),
@@ -554,6 +606,7 @@ def _self_usage() -> dict:
         parent = by_pid.get(x["ppid"])
         if parent and parent["activity"] and not parent["self"]:
             x["activity"] = parent["activity"]
+            x["pool"] = parent.get("pool") or ""
             x["detail"] = f"console for {parent['activity'].lower()}"
 
     for pid in [p for p in _PROCS if p not in alive]:
