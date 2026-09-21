@@ -619,6 +619,43 @@ def _is_dialogue(t: dict) -> bool:
             and str(t.get("class") or "") in _DIALOGUE_CLASS)
 
 
+def read_rate(file_id: int, ord_: int, minutes: float) -> float:
+    r"""Lines a minute from the track that was actually READ, or 0.
+
+    THE HEADER IS A CLAIM AND THE EVENTS ARE A FACT. subtitle_shape holds
+    what the track reader pulled out with mkvextract - how many events, how
+    many of them plain dialogue lines - and the raw check was not looking at
+    it. Drug Store in Another World S01E10 was read while this was being
+    written: 473 events, 467 of them plain lines over 24 minutes, and the
+    file still sat at "its only eng track claims to be signs and the
+    container does not say how many lines it has". The container still does
+    not. Somebody went and counted.
+    """
+    if minutes <= 0:
+        return 0.0
+    try:
+        with cursor() as cur:
+            r = cur.execute(
+                "SELECT plain, events FROM subtitle_shape "
+                " WHERE file_id=? AND track=?",
+                (int(file_id), int(ord_) + 1)).fetchone()
+    except Exception:                                            # noqa: BLE001
+        return 0.0
+    if not r:
+        return 0.0
+    # `plain` is the dialogue lines with the signs taken out, which is the
+    # number this question is about; events is the fallback for a row stored
+    # before that column existed.
+    n = r["plain"]
+    if n is None or int(n) < 0:
+        n = r["events"]
+    try:
+        n = int(n or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return (n / minutes) if n > 0 else 0.0
+
+
 def _speech_rate(t: dict, minutes: float) -> float:
     """Lines a minute, or 0 when the container does not say.
 
@@ -846,6 +883,13 @@ def verdict(file_id: int, lang: str, cur, facts=None,
             return OK, (f"its {lang} track is flagged forced but carries "
                         f"{rate:.0f} lines a minute, which is dialogue "
                         f"wearing the wrong flag"), "mislabelled"
+        # AND THE SAME QUESTION OF THE TRACK THAT WAS READ. The header says
+        # nothing about how long this track is; the reader counted it.
+        got = read_rate(file_id, int(t.get("ord") or 0), minutes)
+        if SPEECH_LO <= got <= SPEECH_HI:
+            return OK, (f"its {lang} track claims to be signs, and reading it "
+                        f"found {got:.0f} dialogue lines a minute - a full "
+                        f"script wearing a forced flag"), "mislabelled"
 
     # AN UNLABELLED TRACK MIGHT BE THE ONE. The library keeps untagged tracks
     # precisely because releases leave subtitles unlabelled; reading one to
@@ -1041,13 +1085,16 @@ def verdict(file_id: int, lang: str, cur, facts=None,
            f"own throw-away line" if call == "dismiss" else
            "nothing readable in the picture")
     if mine:
-        if not any(_speech_rate(t, minutes) > 0 for t in mine):
+        rates = [r for r in
+                 (_speech_rate(t, minutes)
+                  or read_rate(file_id, int(t.get("ord") or 0), minutes)
+                  for t in mine) if r > 0]
+        if not rates:
             return UNKNOWN, (
                 f"its only {lang} track claims to be signs and the container "
                 f"does not say how many lines it has, so it is queued to be "
                 f"read rather than guessed at"), "signs_unread"
-        rate = min(_speech_rate(t, minutes) for t in mine
-                   if _speech_rate(t, minutes) > 0)
+        rate = min(rates)
         return MISSING, (
             f"its only {lang} track is signs and songs, {rate:.1f} lines a "
             f"minute - the conversation is not translated; {pic}; and the "
@@ -1760,6 +1807,111 @@ def scoring() -> dict:
                    "\"taken back\" as what it is: nothing has moved off that "
                    "rung yet."),
     }
+
+
+def _stream_index(file_id: int, ord_: int, cur_=None) -> int:
+    """The ffprobe stream index of the ord_-th subtitle track, from the probe."""
+    try:
+        with cursor() as cur:
+            r = cur.execute("SELECT json FROM file_probes WHERE file_id=?",
+                            (int(file_id),)).fetchone()
+        if not r:
+            return 0
+        d = json.loads(r["json"] or "{}")
+    except Exception:                                            # noqa: BLE001
+        return 0
+    n = 0
+    for st in (d.get("streams") or []):
+        if st.get("codec_type") != "subtitle":
+            continue
+        if n == ord_:
+            try:
+                return int(st.get("index") or 0)
+            except (TypeError, ValueError):
+                return 0
+        n += 1
+    return 0
+
+
+def unread_tracks(limit: int = 400) -> list:
+    r"""Files whose only track in a required language has never been read.
+
+    THE RUNG SAYS "QUEUED TO BE READ" AND NOTHING WAS QUEUING IT.
+    signs_unread is reached when a file's only English track claims to be
+    signs - forced, or titled for them - and the container reports no cue
+    count, so the probe cannot tell a sign sheet from a full script. The
+    honest answer is to read it, and the rung said so, and no reader ever
+    picked those files up: the track reader's candidates are tracks whose
+    TITLE CONTRADICTS THEIR CUE RATE, and a track with no cue rate
+    contradicts nothing.
+
+    Drug Store in Another World is the case. One ASS track, named "English",
+    flagged forced and default by the release, no cue count in the header.
+    The probe is not stale - it matches the file byte for byte - so
+    re-probing it a hundred times would say the same thing. Reading it takes
+    a second and settles it: 361 events, 357 of them plain dialogue lines,
+    15.3 a minute, running through all ten slices of the runtime. A full
+    script wearing a forced flag, and ten episodes of it sat on the raw list.
+
+    Returned in the shape the track reader wants, so readers.py can feed
+    them to the same subread pool as everything else.
+    """
+    init()
+    out = []
+    try:
+        with cursor() as cur:
+            rows = cur.execute(
+                "SELECT n.file_id, n.lang, f.path, f.size, f.pool_disk, "
+                "       s.tracks "
+                "  FROM sub_need n JOIN files f ON f.id = n.file_id "
+                "  LEFT JOIN sub_facts s ON s.file_id = n.file_id "
+                " WHERE n.rule = 'signs_unread' "
+                "   AND f.state NOT IN ('deleted','duplicate') "
+                " LIMIT ?", (int(limit),)).fetchall()
+    except Exception:                                            # noqa: BLE001
+        return []
+    for r in rows:
+        try:
+            tks = json.loads(r["tracks"] or "[]")
+        except Exception:                                        # noqa: BLE001
+            continue
+        lang = str(r["lang"] or "").lower()[:3]
+        for t in tks:
+            if str(t.get("lang") or "").lower()[:3] != lang:
+                continue
+            # ALREADY READ ONCE IS NOT READ AGAIN. shape_of stores a row per
+            # (file, track); without this the same ten episodes would be
+            # pulled apart on every pass for ever.
+            ord_ = int(t.get("ord") or 0)
+            try:
+                with cursor() as cur:
+                    seen = cur.execute(
+                        "SELECT 1 FROM subtitle_shape "
+                        " WHERE file_id=? AND track=? AND size=?",
+                        (int(r["file_id"]), ord_ + 1,
+                         int(r["size"] or 0))).fetchone()
+            except Exception:                                    # noqa: BLE001
+                seen = None
+            if seen:
+                continue
+            # THREE DIFFERENT NUMBERS FOR ONE TRACK, and they are not the
+            # same: subtitle_shape.track is 1-based, sub_facts ord is
+            # 0-based, and mkvextract wants the ffprobe STREAM INDEX - which
+            # counts video and audio too. sub_facts does not store that one,
+            # so it comes out of the probe. Getting this wrong extracted the
+            # video stream as text once already; see subtitletitle.
+            mkv_id = _stream_index(int(r["file_id"]), ord_, cur_=None)
+            out.append({
+                "file_id": int(r["file_id"]), "path": r["path"] or "",
+                "pool_disk": r["pool_disk"] or "",
+                "track": ord_ + 1, "mkv_id": mkv_id,
+                "size": int(r["size"] or 0),
+                "old": str(t.get("title") or ""),
+                "why": "its only track in the language claims to be signs and "
+                       "the container does not say how many lines it has",
+            })
+            break
+    return out
 
 
 UNKNOWN_KINDS = ("unread", "stale", "open")

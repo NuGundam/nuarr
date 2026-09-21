@@ -578,6 +578,23 @@ def _subread_pending(limit: int) -> list:
                         "disk": r.get("pool_disk") or "", "row": dict(r)})
     except Exception:                                            # noqa: BLE001
         pass
+    # AND THE TRACKS THE RAW CHECK CANNOT JUDGE. Its signs_unread rung says
+    # the track "is queued to be read rather than guessed at" and nothing
+    # was queuing it: the title check's candidates are tracks whose title
+    # contradicts their cue rate, and these have no cue rate to contradict.
+    # Ten Drug Store in Another World episodes sat on the raw list because
+    # of it, every one carrying a full English script under a forced flag.
+    try:
+        from . import subneed as _sn
+        have = {int(x["file_id"]) for x in out}
+        for r in _sn.unread_tracks(limit):
+            if int(r["file_id"]) in have:
+                continue
+            out.append({"reader": "track", "file_id": int(r["file_id"]),
+                        "path": r.get("path") or "",
+                        "disk": r.get("pool_disk") or "", "row": dict(r)})
+    except Exception:                                            # noqa: BLE001
+        pass
     return out
 
 
@@ -607,8 +624,9 @@ def _subread_plan(r: dict) -> str:
         "actions": [{"kind": "subread",
                      "what": f"read the events of subtitle track {tr + 1} and "
                              f"judge what it carries",
-                     "why": "its title contradicts its cue rate, and only the "
-                            "events can settle which is lying",
+                     "why": (r["row"].get("why")
+                             or "its title contradicts its cue rate, and only "
+                                "the events can settle which is lying"),
                      "detail": ""}]})
 
 

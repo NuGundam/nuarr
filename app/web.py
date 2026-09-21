@@ -10406,6 +10406,90 @@ async def api_subneed_replace_batch(ids: str = "", confirm: str = ""):
     return out
 
 
+@app.post("/api/subkind/reread")
+async def api_subkind_reread(ids: str = "", confirm: str = ""):
+    r"""Read these files' subtitles again, from the bytes on disk.
+
+    Erik: "can we have a select all / multiple selection option to rescan
+    files' subtitle info as new, because Drug Store in Another World comes
+    up as raw when they clearly have subtitles".
+
+    WHAT WAS ACTUALLY WRONG THERE, because it is not what it looks like. The
+    stored probe of that file is not stale - it matches the bytes byte for
+    byte. The release ships one ASS track named "English", flagged forced
+    AND default, and the container reports no cue count for it. So the probe
+    says "a forced English track of unknown length", which is a sign sheet
+    and a full script at the same time, and nuarr will not guess between
+    them over a delete button.
+
+    Re-probing it would therefore have changed nothing at all. READING it
+    settles it in a second: 361 events, 357 of them plain dialogue lines,
+    15.3 a minute, running through all ten slices of the runtime.
+
+    So this does both, in that order, and the reading is the part that
+    matters: forget what is stored, re-probe from disk, and put the tracks
+    on the read queue. Nothing is written to any file.
+    """
+    if confirm != "yes":
+        return {"ok": False, "why": "confirm=yes required"}
+    from . import subscan, subtitletitle as stt, readers
+    out = {"ok": True, "forgotten": 0, "queued": 0, "rows": []}
+    want = []
+    for tok in (ids or "").split(","):
+        try:
+            want.append(int(tok.strip()))
+        except ValueError:
+            continue
+    for fid in want:
+        why = ""
+        try:
+            with cursor() as cur:
+                # THE STORED READINGS GO FIRST. A shape row is keyed by the
+                # file's size, so it survives a re-probe of the same bytes -
+                # which is exactly the row that has to go when somebody is
+                # asking for this to be looked at again.
+                cur.execute("DELETE FROM subtitle_shape WHERE file_id=?", (fid,))
+                cur.execute("DELETE FROM sub_facts WHERE file_id=?", (fid,))
+                # THE PROBE ITSELF STAYS. Deleting it was the first draft and
+                # it made things worse: everything downstream is built from
+                # that row, so the three test files went straight to "the
+                # subtitle reader has not read this file" and the track reads
+                # could not be queued at all - the stream index they need
+                # comes out of the probe. probed_at is cleared so the prober
+                # refreshes it in its own time; nothing is blind meanwhile.
+                cur.execute("UPDATE files SET probed_at=NULL, sub_langs='' "
+                            " WHERE id=?", (fid,))
+                # And the verdict about it, so the next sweep makes a new one
+                # rather than leaving the old sentence on the row.
+                cur.execute("DELETE FROM sub_need WHERE file_id=?", (fid,))
+            out["forgotten"] += 1
+        except Exception as e:                               # noqa: BLE001
+            why = f"{type(e).__name__}: {e}"[:120]
+        out["rows"].append({"file_id": fid, "ok": not why, "why": why})
+    # Re-probe and re-read what was just forgotten, now rather than on the
+    # next timer - somebody is watching this happen.
+    try:
+        await asyncio.to_thread(subscan.scan, max(8, len(want) * 2))
+    except Exception:                                        # noqa: BLE001
+        pass
+    # RE-JUDGE BEFORE QUEUEING, not after. The read queue is fed from the
+    # raw check's own rungs, and a file whose verdict has just been deleted
+    # is on no rung at all - so the first draft queued nothing and reported
+    # "0 queued" over three files it had just forgotten.
+    for fid in want:
+        try:
+            await asyncio.to_thread(subneed.check_one, fid)
+        except Exception:                                    # noqa: BLE001
+            pass
+    try:
+        stt._CACHE["at"] = 0.0
+        q = await readers.feed_subread_now()
+        out["queued"] = int((q or {}).get("fed") or 0)
+    except Exception:                                        # noqa: BLE001
+        pass
+    return out
+
+
 @app.post("/api/subneed/replace")
 async def api_subneed_replace(file_id: int):
     r"""Blocklist this release, delete the file, ask the arr for another.
@@ -38253,6 +38337,19 @@ async function skAct(id, btn){
 // THE RAW BUTTON. Blocklist this release and ask the arr for another - the
 // one thing a raw can be fixed by, offered here because this board is where
 // a person decides about files nuarr could not.
+// READ THIS ONE AGAIN. The same thing the batch does, for a row whose
+// answer you do not believe.
+async function skReread(id, btn){
+  const r=((_sk&&_sk.rows)||[]).find(x=>x.id===id); if(!r) return;
+  if(btn){ btn.disabled=true; btn.textContent='re-reading…'; }
+  let x={};
+  try{ x=await (await fetch('/api/subkind/reread?confirm=yes&ids='+r.file_id,
+      {method:'POST'})).json(); }
+  catch(e){ x={ok:false, why:String(e)}; }
+  if(x.ok) skGone(btn, 'being read again', true, id);
+  setTimeout(()=>{ _skKey=''; loadSubKind(true);
+    _snKey=''; if(typeof loadSubNeed==='function') loadSubNeed(true); }, 1500);
+}
 async function skReplace(id, btn){
   const r=((_sk&&_sk.rows)||[]).find(x=>x.id===id); if(!r) return;
   const gb=(r.size||0)/1073741824;
@@ -38300,6 +38397,21 @@ async function skActMany(btn){
   // THE RAWS, AS A BATCH. Only the rows the raw check is unsure about or
   // has accused take this; a picture row that is not a raw is left alone
   // rather than deleted because it happened to be ticked.
+  // NOTHING IS WRITTEN AND NOTHING IS DELETED, so nothing is asked twice.
+  // It forgets what is stored about these files and reads them again.
+  if(_skBatchKind==='reread'){
+    if(btn){ btn.disabled=true; btn.textContent='re-reading…'; }
+    let x={};
+    try{ x=await (await fetch('/api/subkind/reread?confirm=yes&ids='
+        +encodeURIComponent(rows.map(r=>r.file_id).join(',')),
+        {method:'POST'})).json(); }
+    catch(e){ x={ok:false, why:String(e)}; }
+    if(x.ok) skGoneMany(ids, `${fmt(x.forgotten||0)} being read again`);
+    _skSel.clear(); _skLast=null;
+    setTimeout(()=>{ _skKey=''; loadSubKind(true);
+      _snKey=''; if(typeof loadSubNeed==='function') loadSubNeed(true); }, 1500);
+    return;
+  }
   if(_skBatchKind==='replace'){
     const raws=rows.filter(r=>r.raw);
     if(!raws.length){ askInline(btn,'None of the selected rows is a raw.','OK',async()=>({ok:true})); return; }
@@ -39465,6 +39577,7 @@ function skPaint(force){
         title="Leave this alone and every row keeps whatever it says it is. Pick one and all of them are recorded as that.">
         <option value=""${_skBatchKind?'':' selected'}>keep each row's kind</option>
         ${['dialogue','hybrid','signs'].map(k=>`<option value="${k}"${_skBatchKind===k?' selected':''}>all as ${SKW[k][0]}</option>`).join('')}
+        <option value="reread"${_skBatchKind==='reread'?' selected':''}>read their subtitles again, from disk</option>
         <option value="replace"${_skBatchKind==='replace'?' selected':''}>blocklist &amp; re-download the raws</option>
       </select>
       <button class="rmb" onclick="skClearSel()">Clear</button>
@@ -39586,7 +39699,9 @@ function skPaint(force){
         <td class="r askhost">${r.done
           ? '<span class="dim" title="This file already carries the blank marker track.">marked</span>'
           : r.unread ? '<span class="dim" style="font-size:10.5px" title="The cue rate flagged this; its events have not been read yet. Nothing is offered until they have.">not read yet</span>'
-          : r.source==='raw' ? `<button class="rmb" onclick="skReplace('${r.id}',this)"
+          : r.source==='raw' ? `<button class="rmb" onclick="skReread('${r.id}',this)"
+              title="Forget everything stored about this file's subtitles, probe it again from disk and read its tracks. Nothing is written to the file. Use it when the answer looks wrong.">Read again</button>
+            <button class="rmb" onclick="skReplace('${r.id}',this)"
               title="${esc((r.raw_why||'')+' Nothing nuarr can do to these bytes produces a subtitle; only a different release fixes it. Blocklist this one, delete the file, ask the arr for another. Not reversible.')}">Blocklist &amp; re-download</button>`
           : `${r.action?`<button class="rmb" onclick="skAct('${r.id}',this)" title="${
                 pic?'Add a blank English subtitle track so Bazarr and Plex see one exists and stop asking for it. Nothing is drawn over the picture.'
