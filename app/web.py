@@ -37828,6 +37828,30 @@ function scoreTable(){
           `at or above ${p.mark_at}% nuarr acts on its own, at or below ${p.dismiss_at}% it drops the finding`)}
     ${sec('And the odds before anything is read', d.prior_how, priors,
           esc(d.language||'') + langNow)}
+    ${(()=>{
+      // THE RAW SCORE. Same shape as the two above - points added, then the
+      // multipliers - but this one answers a different question: not what is
+      // inside the file, but whether anybody here can follow it. It is the
+      // score behind Blocklist & re-download.
+      const R=d.raw; if(!R||!(R.rows||[]).length) return '';
+      const pts=(R.rows||[]).map(x=>`<tr style="border-top:1px solid var(--line)">
+        <td style="padding:3px 8px 3px 0;text-align:right;white-space:nowrap;
+                   color:#e8a33d;font-weight:600">+${x.points}</td>
+        <td style="padding:3px 8px 3px 0">${esc(x.what||'')}
+          ${x.measured?`<div class="dim" style="font-size:10.5px">${esc(x.measured)}</div>`:''}
+        </td></tr>`).join('');
+      const vd=(R.voids||[]).map(x=>`<tr style="border-top:1px solid var(--line)">
+        <td style="padding:3px 8px 3px 0;text-align:right;white-space:nowrap;
+                   color:#7fd18c;font-weight:600">&times;${x.mult}</td>
+        <td style="padding:3px 8px 3px 0">${esc(x.what||'')}
+          ${x.measured?`<div class="dim" style="font-size:10.5px">${esc(x.measured)}</div>`:''}
+        </td></tr>`).join('');
+      return sec('Whether anybody here can follow it', R.how, pts+vd,
+        'the score behind Blocklist &amp; re-download. Points in '
+        +'<span style="color:#e8a33d">amber</span> argue that it is a raw; the '
+        +'<span style="color:#7fd18c">green</span> multipliers are refusals - '
+        +'evidence nobody has gathered yet cannot count as evidence against the file');
+    })()}
     <div class="dim" style="font-size:10.5px;margin-top:9px;padding-top:7px;
          border-top:1px solid var(--line)">
       <b style="color:var(--fg,#c9d1d9)">What moves and what does not.</b>

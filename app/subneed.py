@@ -1087,6 +1087,9 @@ def check_one(file_id: int, cur=None) -> dict:
                                     None,
                                     float(row["duration"] or 0) / 60.0,
                                     str(row["path"] or ""))
+            sure = _sure_of(st, rule, file_id, lang, cur, facts, None,
+                            str(row["path"] or ""),
+                            float(row["duration"] or 0) / 60.0)
             out[lang] = st
             cur.execute(
                 "INSERT INTO sub_need(file_id,lang,library,state,why,"
@@ -1096,8 +1099,7 @@ def check_one(file_id: int, cur=None) -> dict:
                 " library=excluded.library, state=excluded.state, "
                 " why=excluded.why, checked_at=excluded.checked_at, "
                 " rule=excluded.rule, sure=excluded.sure",
-                (int(file_id), lang, lib, st, why, now, rule,
-                 sureness(rule)))
+                (int(file_id), lang, lib, st, why, now, rule, sure))
         return {"ok": True, "checked": len(want), "states": out}
     finally:
         if close:
@@ -1170,6 +1172,10 @@ def sweep(limit: int = BATCH) -> dict:
                             r["id"], lang, cur, r, untagged, prow,
                             float(r["duration"] or 0) / 60.0,
                             str(r["path"] or ""))
+                        sure = _sure_of(
+                            st, rule, r["id"], lang, cur, r, prow,
+                            str(r["path"] or ""),
+                            float(r["duration"] or 0) / 60.0)
                         tally[st] = tally.get(st, 0) + 1
                         cur.execute(
                             "INSERT INTO sub_need"
@@ -1181,7 +1187,7 @@ def sweep(limit: int = BATCH) -> dict:
                             " why=excluded.why, checked_at=excluded.checked_at,"
                             " rule=excluded.rule, sure=excluded.sure",
                             (int(r["id"]), lang, lib, st, why, now, rule,
-                             sureness(rule)))
+                             sure))
                         n += 1
     except Exception as e:                                       # noqa: BLE001
         STATE["err"] = f"{type(e).__name__}: {e}"
@@ -1262,6 +1268,283 @@ def counts() -> dict:
 # question about real files - 81 of the undecided are one show, Detective
 # Conan, every one of them reading "marks low in the picture the OCR could
 # not read" - and that is a fact worth being able to see rather than infer.
+
+# ---- HOW SURE IS "BLOCKLIST AND RE-DOWNLOAD" -------------------------------
+#
+# Erik: "should have point system for blocklist & redownload". The rungs
+# carry a sureness each, which is a fact about the RUNG - every file that
+# reaches `missing` shows 90% whether it is a Japanese film with nothing
+# inside it or a file nobody has ever opened. The button deletes five
+# gigabytes. It should say how sure it is about THIS file.
+#
+# So the same shape the picture scorer has: every term is evidence already
+# in hand, the points are added, and the multipliers are the refusals.
+# Measured over the 269 files the check is accusing or cannot decide:
+#
+#   what is spoken   Whisper heard 259 of them, 219 at 0.90 or better,
+#                    and the metadata agrees with the audio on 266. Two
+#                    independent readings of the same question.
+#   the tracks       211 carry no subtitle track at all; 46 carry a
+#                    dialogue track in some other language; 12 carry only
+#                    signs or forced.
+#   the picture      180 score 0% and 47 have never been read.
+#   the show         7 belong to a show that is mostly burned-in - which is
+#                    the one thing here that argues the file is fine.
+#
+# THE TWO BIG TERMS ARE THE TWO HALVES OF THE QUESTION: is it foreign, and
+# is there nothing to read. Everything else adjusts.
+RAW_POINTS = {
+    "heard": 45,        # Whisper heard a language this library does not keep
+    "tagged": 30,       # only the audio tag says so
+    "meta": 12,         # and the metadata's original language agrees
+    "no_track": 30,     # no subtitle track at all
+    "signs_only": 22,   # only signs or forced - nothing to read
+    "other_lang": 18,   # tracks, but none in a language you asked for
+    "pic_zero": 15,     # the picture reader read the frames and got nothing
+    "pic_low": 8,       # it scored them under its own throw-away line
+}
+# And the refusals - things that do not lower the score, they void it.
+RAW_VOID = {
+    "unread_pic": 0.45,   # nobody has looked at the picture
+    "unheard": 0.55,      # nobody has listened to the audio
+    "show_burned": 0.15,  # the rest of the show carries burned-in dialogue
+    "pic_band": 0.5,      # the picture reader is between its own lines
+}
+
+
+def raw_score(file_id: int, lang: str, cur, facts=None, pic=None,
+              path: str = "", minutes: float = 0.0) -> dict:
+    """How sure is this file a raw, 0-100, and the sentence explaining it."""
+    lang = (lang or "").lower()[:3]
+    if facts is None:
+        facts = cur.execute("SELECT * FROM sub_facts WHERE file_id=?",
+                            (int(file_id),)).fetchone()
+    if not path or not minutes:
+        try:
+            _r = cur.execute("SELECT path, duration FROM files WHERE id=?",
+                             (int(file_id),)).fetchone()
+            if _r is not None:
+                path = path or str(_r["path"] or "")
+                minutes = minutes or float(_r["duration"] or 0) / 60.0
+        except Exception:                                        # noqa: BLE001
+            pass
+    try:
+        tracks = json.loads((facts["tracks"] if facts else None) or "[]")
+    except Exception:                                            # noqa: BLE001
+        tracks = []
+
+    pts, why = 0.0, []
+
+    # ---- is it foreign ----------------------------------------------------
+    # THE SAME FRESHNESS TEST THE LADDER USES, and it has to be: this asked
+    # only that the stored size match, while _audio_langs also requires the
+    # mtime to - so a verdict taken before the file was replaced counted
+    # here and not there. Six files came back at 0% "the audio is in eng"
+    # while the ladder had them at `missing`, which is the check disagreeing
+    # with itself in public.
+    heard, tagged = set(), set()
+    try:
+        for a in cur.execute(
+                "SELECT a.code FROM audio_lang a "
+                "  JOIN files f ON f.id = a.file_id "
+                " WHERE a.file_id=? AND COALESCE(a.ok,0)=1 "
+                "   AND COALESCE(a.code,'')<>'' "
+                "   AND a.size = COALESCE(f.size,0) "
+                "   AND ABS(COALESCE(a.mtime,0) - COALESCE(f.mtime,0)) <= 1.0",
+                (int(file_id),)):
+            heard.add(str(a["code"]).lower()[:3])
+    except Exception:                                            # noqa: BLE001
+        heard = set()
+    try:
+        _r = cur.execute("SELECT audio_langs, orig_lang FROM files WHERE id=?",
+                         (int(file_id),)).fetchone()
+        tagged = {x.strip() for x in str((_r["audio_langs"] if _r else "")
+                                         or "").split(",") if x.strip()}
+        meta = orig_code(_r["orig_lang"] if _r else "")
+    except Exception:                                            # noqa: BLE001
+        tagged, meta = set(), ""
+
+    # SPOKEN IN THE LANGUAGE IS NOT A RAW, AT ANY SCORE. Caught by the first
+    # run of this over the library: a Scooby-Doo episode with no probe came
+    # back at 30% reading "Whisper heard eng and nothing in eng", because the
+    # term asked whether anything had been heard rather than whether what was
+    # heard was the language. A film you can follow is not a raw however
+    # little else is known about it, so it scores nothing at all.
+    # AND THE LADDER'S OWN ANSWER TO "IS IT SPOKEN", not a second one built
+    # from the tags. Tom and Jerry S1960E04 is tagged eng and Whisper heard
+    # kor: _audio_langs prefers the verdict over the tag per track, which is
+    # the whole reason it exists, and asking `lang in tagged` here let the
+    # lying tag say "not a raw" about a file the ladder had accused. One
+    # file, and one is enough - that is the check contradicting itself in
+    # public over a five-gigabyte button.
+    if lang in _audio_langs(file_id, cur):
+        return {"score": 0, "picture": 0, "call": "",
+                "why": f"the audio is in {lang} - this is not a raw, whatever "
+                       f"else is missing from it"}
+    if heard:
+        pts += RAW_POINTS["heard"]
+        why.append(f"Whisper heard {'/'.join(sorted(heard))} and nothing in "
+                   f"{lang}")
+    elif tagged:
+        pts += RAW_POINTS["tagged"]
+        why.append(f"the audio is tagged {'/'.join(sorted(tagged))}, though "
+                   f"nobody has listened to it")
+    if meta and meta != lang and (meta in heard or not heard):
+        pts += RAW_POINTS["meta"]
+        why.append(f"the metadata calls it {meta} too")
+
+    # ---- is there nothing to read ----------------------------------------
+    mine = [t for t in tracks
+            if str(t.get("lang") or "").lower()[:3] == lang]
+    if not tracks:
+        pts += RAW_POINTS["no_track"]
+        why.append("no subtitle track at all")
+    elif not mine:
+        pts += RAW_POINTS["other_lang"]
+        why.append(f"{len(tracks)} subtitle track(s), none of them {lang}")
+    else:
+        pts += RAW_POINTS["signs_only"]
+        why.append(f"its only {lang} track is signs or forced")
+
+    # ---- what the picture says -------------------------------------------
+    prow = _picture(file_id, cur, pic)
+    call, score = "", 0
+    if prow is None:
+        pts *= RAW_VOID["unread_pic"]
+        why.append("but nobody has looked at the picture")
+    else:
+        try:
+            from . import hardsub as _hs
+            _v = _hs.verdict_for({
+                "state": str(prow["state"] or ""),
+                "low_hits": prow["low_hits"], "samples": prow["samples"],
+                "words": str((prow["words"] if "words" in prow.keys()
+                              else "") or ""), "path": path})
+            call = str(_v.get("auto") or "")
+            score = int(_v.get("score") or 0)
+        except Exception:                                        # noqa: BLE001
+            call = ""
+        if score == 0:
+            pts += RAW_POINTS["pic_zero"]
+            why.append("the picture reader read the frames and got nothing")
+        elif call == "dismiss":
+            pts += RAW_POINTS["pic_low"]
+            why.append(f"the picture scores {score}%, under its throw-away line")
+        elif call == "ask":
+            pts *= RAW_VOID["pic_band"]
+            why.append(f"but the picture scores {score}%, between the reader's "
+                       f"own lines - it is not sure")
+
+    if not heard and not tagged:
+        pts *= RAW_VOID["unheard"]
+        why.append("and nobody has listened to the audio")
+
+    # ---- what the rest of the show says ----------------------------------
+    try:
+        yes, b, n = show_burns_in(path, cur)
+    except Exception:                                            # noqa: BLE001
+        yes, b, n = False, 0, 0
+    if yes:
+        pts *= RAW_VOID["show_burned"]
+        why.append(f"and {b} of the {n} episodes of this show that have been "
+                   f"settled carry burned-in dialogue")
+
+    return {"score": int(max(0, min(100, round(pts)))),
+            "why": "; ".join(why), "picture": score, "call": call}
+
+
+def _sure_of(state: str, rule: str, file_id: int, lang: str, cur,
+             facts=None, pic=None, path: str = "",
+             minutes: float = 0.0) -> int:
+    r"""The percentage stored on the row.
+
+    A RUNG'S SURENESS IS A FACT ABOUT THE RUNG. Every file that reaches
+    `missing` showed 90% - a Japanese film with nothing inside it and a file
+    nobody has ever opened, the same number. The button behind that number
+    deletes five gigabytes, so where the answer is "replace this" or "nobody
+    can decide", the figure is this FILE's own score. See raw_score.
+
+    Everywhere else the rung's own number still stands, because "it carries
+    a tagged dialogue track" is as true of one file as of another.
+    """
+    if state in (MISSING, UNKNOWN):
+        try:
+            return int(raw_score(file_id, lang, cur, facts, pic,
+                                 path, minutes).get("score") or 0)
+        except Exception:                                        # noqa: BLE001
+            return sureness(rule)
+    return sureness(rule)
+
+
+def raw_scoring() -> dict:
+    """The terms, their weights and what each was measured on - for the
+    panel, read out of this module so the two cannot drift."""
+    P, V = RAW_POINTS, RAW_VOID
+    return {
+        "how": ("A raw is a film nobody here can follow, and this is how sure "
+                "of that nuarr is about one file. The two big terms are the "
+                "two halves of the question - is it foreign, and is there "
+                "nothing to read - and the rest adjust. The multipliers are "
+                "not doubts, they are refusals: evidence nobody has gathered "
+                "yet cannot be counted as evidence that the file is bad."),
+        "rows": [
+            {"points": P["heard"], "what": "Whisper heard a language the "
+             "library does not keep",
+             "measured": "the listener's own verdict, and the strongest thing "
+                         "here: of the 269 files this check is accusing or "
+                         "cannot decide, it has heard 259, and 219 of those "
+                         "at 0.90 confidence or better"},
+            {"points": P["tagged"], "what": "only the audio TAG says it is "
+             "foreign",
+             "measured": "worth less than hearing it, because a tag is a "
+                         "claim - a file tagged eng whose audio is really "
+                         "Japanese is the failure the listener exists for"},
+            {"points": P["meta"], "what": "and the metadata's original "
+             "language agrees",
+             "measured": "two independent readings of one question. They "
+                         "agree on 266 of the 269; it is a small term "
+                         "because the metadata describes the SHOW, and 14,196 "
+                         "files here are English dubs of Japanese originals"},
+            {"points": P["no_track"], "what": "no subtitle track at all",
+             "measured": "211 of the 269. Nothing to read, and nothing nuarr "
+                         "can do to the bytes that produces one"},
+            {"points": P["signs_only"], "what": "only signs or forced tracks",
+             "measured": "12 of the 269. Signs translate a shop front and "
+                         "leave the conversation alone"},
+            {"points": P["other_lang"], "what": "subtitle tracks, but none in "
+             "a language you asked for",
+             "measured": "46 of the 269 - a Spanish and a Portuguese track on "
+                         "a Japanese film is no help to this house"},
+            {"points": P["pic_zero"], "what": "the picture reader read the "
+             "frames and got nothing",
+             "measured": "180 of the 269 score 0%. It sampled 24 frames, ran "
+                         "the OCR and recovered no words"},
+            {"points": P["pic_low"], "what": "or scored them under its own "
+             "throw-away line",
+             "measured": "something was read and it was not language"},
+        ],
+        "voids": [
+            {"mult": V["unread_pic"], "what": "nobody has looked at the "
+             "picture",
+             "measured": "47 of the 269. The dialogue may be painted into "
+                         "every frame and no one has checked"},
+            {"mult": V["unheard"], "what": "nobody has listened to the audio",
+             "measured": "10 of the 269. What is spoken is the first half of "
+                         "the question and it is unanswered"},
+            {"mult": V["pic_band"], "what": "the picture reader is between "
+             "its own two lines",
+             "measured": "32 of the 269. When the scorer that reads pictures "
+                         "says it is unsure, this one has no business being "
+                         "sure"},
+            {"mult": V["show_burned"], "what": "the rest of the show carries "
+             "burned-in dialogue",
+             "measured": "the strongest refusal there is. Detective Conan "
+                         "scores 0% on the picture and 455 of its settled "
+                         "episodes demonstrably carry burned-in subtitles the "
+                         "OCR cannot transcribe"},
+        ],
+    }
+
 # -------------------------------------------- how sure, and what has moved ---
 _STATS_TTL = 120.0
 _STATS: dict = {"at": 0.0, "data": None}
@@ -1506,7 +1789,7 @@ def unknown_files(kind: str = "", limit: int = 600) -> dict:
                  "                 AND COALESCE(h.chosen,'')='' THEN 'stale' "
                  "            ELSE 'open' END AS k, "
                  "       n.file_id, n.lang, n.why, n.checked_at, "
-                 "       COALESCE(n.rule,'') AS rule, f.first_seen, "
+                 "       COALESCE(n.rule,'') AS rule, n.sure, f.first_seen, "
                  "       f.path, f.title, f.season, f.episode, f.library "
                  "  FROM sub_need n "
                  "  JOIN files f ON f.id = n.file_id "
@@ -1552,6 +1835,7 @@ def unknown_files(kind: str = "", limit: int = 600) -> dict:
                         "why": str(r["why"] or ""),
                         "rule": str(r["rule"] or ""),
                         "first_seen": float(r["first_seen"] or 0.0),
+                        "sure": int(r["sure"] or 0),
                         "at": float(r["checked_at"] or 0.0)})
     except Exception as e:                                       # noqa: BLE001
         return {"ok": False, "why": f"{type(e).__name__}: {e}"[:160],

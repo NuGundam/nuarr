@@ -281,28 +281,23 @@ def _raw_rows(existing: list) -> list:
             hit["raw_why"] = why
             hit["raw_rule"] = rule
             continue
-        # THE PICTURE READER'S OWN SCORE, WHERE IT HAS ONE. A file on the
-        # `marks` rung has been read and scored - the scorer just sits
-        # between its lines on it - and that number belongs on the row.
-        # Only a file nothing has read carries no score, and there a number
-        # would be invented.
-        score, words, pst = 0, "", ""
+# THE RAW CHECK'S OWN SCORE FOR THIS FILE. Not the picture reader's -
+        # that one answers "are there words in these frames", and the
+        # question on this row is "is this a film nobody here can follow".
+        # The picture is one term in it; see subneed.raw_score.
+        score = int(u.get("sure") or 0)
+        words, pst = "", ""
         try:
             from .db import cursor as _cur
             with _cur() as cur:
                 h = cur.execute(
-                    "SELECT h.state, h.low_hits, h.samples, h.words "
-                    "  FROM hardsub h WHERE h.file_id=?", (fid,)).fetchone()
+                    "SELECT h.state, h.words FROM hardsub h "
+                    " WHERE h.file_id=?", (fid,)).fetchone()
             if h is not None:
                 pst = str(h["state"] or "")
                 words = str(h["words"] or "")
-                v = hardsub.verdict_for({
-                    "state": pst, "low_hits": h["low_hits"],
-                    "samples": h["samples"], "words": words,
-                    "path": u.get("path") or ""})
-                score = int(v.get("score") or 0)
         except Exception:                                        # noqa: BLE001
-            score, words, pst = 0, "", ""
+            words, pst = "", ""
         out.append({
             "id": f"{fid}:{RAW}",
             "file_id": fid, "source": RAW,
@@ -770,6 +765,13 @@ def scoring() -> dict:
                            "scale it. Past the act line nuarr marks the file "
                            "itself; under the throw-away line it drops the "
                            "finding; between them it asks."},
+        # AND THE THIRD BUTTON ON THIS BOARD. Erik: "should have point system
+        # for blocklist & redownload". The two scorers above decide what is
+        # inside a file; this one decides whether anybody can follow it, and
+        # it is the one with a five-gigabyte button behind it. Read out of
+        # subneed so the panel and the scorer cannot drift.
+        "raw": _safe(lambda: __import__(
+            "app.subneed", fromlist=["subneed"]).raw_scoring()),
         "priors": priors,
         "prior_how": ("How often this kind of file carries burned-in words at "
                       "all, counted over 3,941 pictures sampled here. The "
