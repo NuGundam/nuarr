@@ -10408,32 +10408,46 @@ async def api_subneed_replace_batch(ids: str = "", confirm: str = ""):
 
 @app.post("/api/subkind/reread")
 async def api_subkind_reread(ids: str = "", confirm: str = ""):
-    r"""Read these files' subtitles again, from the bytes on disk.
+    r"""Read these files as if they had just landed.
 
-    Erik: "can we have a select all / multiple selection option to rescan
-    files' subtitle info as new, because Drug Store in Another World comes
-    up as raw when they clearly have subtitles".
+    Erik, defining it: "read again means read the file as it is a new file -
+    check subtitle tracks external and internal, make sure they are labelled
+    correctly, check if the tracks are what they say they are (dialogue, S+S
+    or both), then check for burned-in subs too and see what type they are."
 
-    WHAT WAS ACTUALLY WRONG THERE, because it is not what it looks like. The
-    stored probe of that file is not stale - it matches the bytes byte for
-    byte. The release ships one ASS track named "English", flagged forced
-    AND default, and the container reports no cue count for it. So the probe
-    says "a forced English track of unknown length", which is a sign sheet
-    and a full script at the same time, and nuarr will not guess between
-    them over a delete button.
+    So, in order, for each file:
 
-    Re-probing it would therefore have changed nothing at all. READING it
-    settles it in a second: 361 events, 357 of them plain dialogue lines,
-    15.3 a minute, running through all ten slices of the runtime.
+      1. forget everything derived from it - the track facts, every track
+         reading, the picture reading, the raw verdict
+      2. probe it again from the bytes, here and now, so nothing downstream
+         is ever blind (the first draft deleted the probe and let the prober
+         catch up later; three files went straight to "not read" and the
+         track reads could not even be queued, because the stream index they
+         need comes out of the probe)
+      3. rebuild the track facts, internal tracks and files beside it alike
+      4. judge it again
+      5. queue every track in the required language to be read - not only
+         the ones the ladder could not decide - and put the picture back in
+         front of the sampler
 
-    So this does both, in that order, and the reading is the part that
-    matters: forget what is stored, re-probe from disk, and put the tracks
-    on the read queue. Nothing is written to any file.
+    The reads then run as jobs on the subread pool where they show as cards,
+    and each one re-judges the file as it lands. The title check picks the
+    labels up from the fresh readings on its own pass.
+
+    WHAT THIS IS NOT. Erik's worry was that the raw check had "only used OCR
+    and overwrote the DB entries for files imported into system 1". It has
+    not: the raw check writes one table, sub_need, and reads the rest. The
+    one thing that DID delete readings was the first draft of this button -
+    on purpose, so they would be redone - and where nothing then redid them
+    (no track to read, no picture re-sample) it left the file with less than
+    it had. This draft redoes all of it.
+
+    Nothing is written to any file.
     """
     if confirm != "yes":
         return {"ok": False, "why": "confirm=yes required"}
-    from . import subscan, subtitletitle as stt, readers
-    out = {"ok": True, "forgotten": 0, "queued": 0, "rows": []}
+    from . import subscan, subtitletitle as stt, readers, hardsub
+    out = {"ok": True, "forgotten": 0, "probed": 0, "queued": 0, "rows": []}
     want = []
     for tok in (ids or "").split(","):
         try:
@@ -10442,45 +10456,49 @@ async def api_subkind_reread(ids: str = "", confirm: str = ""):
             continue
     for fid in want:
         why = ""
+        path = ""
         try:
             with cursor() as cur:
-                # THE STORED READINGS GO FIRST. A shape row is keyed by the
-                # file's size, so it survives a re-probe of the same bytes -
-                # which is exactly the row that has to go when somebody is
-                # asking for this to be looked at again.
+                r = cur.execute("SELECT path FROM files WHERE id=?",
+                                (fid,)).fetchone()
+                path = str(r["path"] or "") if r else ""
                 cur.execute("DELETE FROM subtitle_shape WHERE file_id=?", (fid,))
                 cur.execute("DELETE FROM sub_facts WHERE file_id=?", (fid,))
-                # THE PROBE ITSELF STAYS. Deleting it was the first draft and
-                # it made things worse: everything downstream is built from
-                # that row, so the three test files went straight to "the
-                # subtitle reader has not read this file" and the track reads
-                # could not be queued at all - the stream index they need
-                # comes out of the probe. probed_at is cleared so the prober
-                # refreshes it in its own time; nothing is blind meanwhile.
-                cur.execute("UPDATE files SET probed_at=NULL, sub_langs='' "
-                            " WHERE id=?", (fid,))
-                # And the verdict about it, so the next sweep makes a new one
-                # rather than leaving the old sentence on the row.
+                # THE PICTURE READING GOES TOO. A file with no track has
+                # nothing else to be read, and the first draft left this row
+                # alone - so Read again on a track-less file did nothing at
+                # all, and said so with the same 44% it showed before.
+                cur.execute("DELETE FROM hardsub WHERE file_id=?", (fid,))
                 cur.execute("DELETE FROM sub_need WHERE file_id=?", (fid,))
+                cur.execute("UPDATE files SET sub_langs='' WHERE id=?", (fid,))
             out["forgotten"] += 1
         except Exception as e:                               # noqa: BLE001
             why = f"{type(e).__name__}: {e}"[:120]
+        # A FRESH PROBE, NOW. Read from the bytes and stored before anything
+        # else looks, so the track facts, the stream indexes and the language
+        # columns all describe the file as it is on disk this second.
+        if path and not why and os.path.exists(path):
+            try:
+                data = await jobs.probe(path)
+                if data:
+                    jobs.cache_probe(fid, data)
+                    out["probed"] += 1
+            except Exception as e:                           # noqa: BLE001
+                why = f"probe: {type(e).__name__}: {e}"[:120]
         out["rows"].append({"file_id": fid, "ok": not why, "why": why})
-    # Re-probe and re-read what was just forgotten, now rather than on the
-    # next timer - somebody is watching this happen.
-    try:
-        await asyncio.to_thread(subscan.scan, max(8, len(want) * 2))
-    except Exception:                                        # noqa: BLE001
-        pass
-    # RE-JUDGE BEFORE QUEUEING, not after. The read queue is fed from the
-    # raw check's own rungs, and a file whose verdict has just been deleted
-    # is on no rung at all - so the first draft queued nothing and reported
-    # "0 queued" over three files it had just forgotten.
+        subneed.REREAD.add(fid)
+    # Track facts - internal tracks and the files beside them - from the
+    # probe just taken, then the verdict from those facts.
     for fid in want:
+        try:
+            await asyncio.to_thread(subscan.scan_one, fid)
+        except Exception:                                    # noqa: BLE001
+            pass
         try:
             await asyncio.to_thread(subneed.check_one, fid)
         except Exception:                                    # noqa: BLE001
             pass
+    # And the readers: every track in the language, and the picture.
     try:
         stt._CACHE["at"] = 0.0
         q = await readers.feed_subread_now()

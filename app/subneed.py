@@ -1860,6 +1860,14 @@ def _stream_index(file_id: int, ord_: int, cur_=None) -> int:
     return 0
 
 
+# FILES A PERSON ASKED TO HAVE READ AS NEW. unread_tracks below normally
+# hands over only the tracks the ladder could not judge; a file in this set
+# gets EVERY track in the required language queued, whatever rung it is on,
+# and leaves the set once queued. Erik: "read again means read the file as
+# if it is a new file".
+REREAD: set = set()
+
+
 def unread_tracks(limit: int = 400) -> list:
     r"""Files whose only track in a required language has never been read.
 
@@ -1885,6 +1893,7 @@ def unread_tracks(limit: int = 400) -> list:
     """
     init()
     out = []
+    forced = set(REREAD)
     try:
         with cursor() as cur:
             rows = cur.execute(
@@ -1892,12 +1901,14 @@ def unread_tracks(limit: int = 400) -> list:
                 "       s.tracks "
                 "  FROM sub_need n JOIN files f ON f.id = n.file_id "
                 "  LEFT JOIN sub_facts s ON s.file_id = n.file_id "
-                " WHERE n.rule = 'signs_unread' "
+                " WHERE (n.rule = 'signs_unread' OR n.file_id IN (%s)) "
                 "   AND f.state NOT IN ('deleted','duplicate') "
-                " LIMIT ?", (int(limit),)).fetchall()
+                " LIMIT ?" % (",".join(str(int(x)) for x in forced) or "-1"),
+                (int(limit),)).fetchall()
     except Exception:                                            # noqa: BLE001
         return []
     for r in rows:
+        REREAD.discard(int(r["file_id"]))
         try:
             tks = json.loads(r["tracks"] or "[]")
         except Exception:                                        # noqa: BLE001

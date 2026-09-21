@@ -708,6 +708,17 @@ def subread_one(reader: str, row: dict, on_stage=None) -> dict:
                         "dialogue": "DIALOGUE burned into the picture",
                         "hybrid": "dialogue and signs in the picture"}.get(
                 str(r.get("state") or ""), f"read as {r.get('state')}")
+            # THE PICTURE CLOSES ITS LOOP TOO. A track-less file sits on the
+            # raw check's nopic rung - "nothing has read the picture yet" -
+            # and the moment the picture is read that sentence is false, but
+            # the verdict kept saying it until the next sweep. After Read
+            # again on Outcast's Restaurant the 24 frames landed in a minute
+            # and the row still said nopic 39% a minute later.
+            try:
+                from . import subneed as _sn
+                _sn.check_one(int(row.get("file_id") or 0))
+            except Exception:                                    # noqa: BLE001
+                pass
         return r
     if on_stage:
         on_stage("pulling the track out", 0.0)
