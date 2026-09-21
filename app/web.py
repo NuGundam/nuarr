@@ -37852,6 +37852,15 @@ let _sk=null, _skKey='', _skPoll=null, _skMark=null, _skMarkPoll=null;
 // nothing can be pressed on a row whose events have not been read, so it is
 // not a question yet. The count and the way back are in the footer.
 let _skSel=new Set(), _skLast=null, _skShowDone=false, _skShowUnread=false;
+// A ROW WITH NO READING BEHIND IT IS A DECISION MADE ON THE FILENAME.
+//
+// The raw check's open questions come here so they can be answered, and most
+// of them have a reading - the picture reader scored them and sat between its
+// own lines. Some have nothing at all: the probe never taken, the picture
+// never sampled. Those still deserve a button, and they do not deserve the
+// top of the board, because deciding one means deciding it on the name and
+// the language alone. Behind a footer link, like the answered ones.
+let _skShowNoread=false;
 let _skBatchKind='';
 // WHICH ROWS ARE OPEN. The evidence a row rests on - forty OCR words, or the
 // style-by-style shape of a track - is worth reading and far too wide for a
@@ -37963,7 +37972,7 @@ function skDetail(r){
     ${line('added', r.added?esc(new Date(r.added*1000).toLocaleString()):'')}
     ${line(pic?'OCR read':'measured', ev)}
     ${line('so', esc(r.why||''))}
-    ${pic?'':line('title', `<span style="color:var(--warn)">${esc(r.title_old||'')}</span>${
+    ${pic||r.source==='raw'?'':line('title', `<span style="color:var(--warn)">${esc(r.title_old||'')}</span>${
       r.action==='retitle'?` <span class="dim">→</span> <span style="color:var(--ok)">${esc(r.title_new||'')}</span>`
       :(r.unread?'':' <span class="dim">— left alone: it carries a name nuarr did not write</span>')}`)}
   </div>`;
@@ -38016,7 +38025,9 @@ function skSelAll(on){
 function skClearSel(){ _skSel.clear(); _skLast=null; _skKey=''; skPaint(true); }
 function skBatchKind(v){ _skBatchKind=v||''; _skKey=''; skPaint(true); }
 function skShow(what, on){
-  if(what==='done') _skShowDone=!!on; else _skShowUnread=!!on;
+  if(what==='done') _skShowDone=!!on;
+  else if(what==='noread') _skShowNoread=!!on;
+  else _skShowUnread=!!on;
   // AND FETCHED AGAIN, because the rows it is asking for are not here. The
   // filter lives on the server now, so "also show the 655 already marked" is
   // a request for 655 rows nobody has sent yet rather than a change of mind
@@ -38976,7 +38987,12 @@ function snPaint(force){
           title="These are spoken in the language the rule asks a subtitle for, so they are not raws - you can follow every one of them. The rule asked and they have not got one, so they are listed; but a film you understand is not something to delete a release over, so no button touches them and auto mode never replaces one. Click to see which."
           style="color:${_snWant?'#e8a33d':'inherit'};text-decoration:none;
           border-bottom:1px dotted currentColor">${num(wnt,'auto')} spoken in it, no subtitle${_snWant?' ▾':''}</a>`:''}
-      ${unk?` · ${snUnknownWords(c)}`:''}
+      <!-- THE UNDECIDED MOVED, SO THE COUNT DID TOO. "45 not looked
+           inside · 1 waiting on a re-read · 38 undecided" were three links
+           into a box this panel drew and could do nothing about. Every one
+           of those files is now a row on "What each file actually carries",
+           with a Blocklist & re-download button on it. A count in two
+           places is a count somebody has to reconcile. -->
       · <a href="#" onclick="snScoreToggle();return false"
           title="Every rung of the ladder this check runs down, how sure that rung is, how many files rest on it, and how many of its answers it has since had to take back."
           style="color:${_snScoreOpen?'#e8a33d':'inherit'};text-decoration:none;
@@ -39097,7 +39113,7 @@ function snPaint(force){
         <div class="mono dim" style="font-size:10px;word-break:break-all">${esc(r.path||'')}</div></td></tr>`:''}`;}).join('')}</tbody></table></div>`
     : `<div class="dim" style="font-size:11.5px;padding:8px 0">${
         !d.any_required?'Nothing is required yet. Tick <b>require</b> under a language in Subtitle rules.'
-        :(((c.unknown_by||{}).stale)
+        :(((c.unknown_by||{}).stale)  /* see the board above */
            // NOT "everything is fine" WHILE THE RE-READ IS STILL RUNNING. The
            // list emptied because this check declines to accuse a file on a
            // picture verdict the reader has already decided to redo; saying
@@ -39157,13 +39173,14 @@ function snPaint(force){
        flex-wrap:wrap;font-size:11px;margin-top:6px">
     <span>${miss?`${fmt(miss)} raw${miss===1?'':'s'} still to answer`
                  :'no raws still to answer'}${
-      unk?` · ${fmt(unk)} with no opinion and no button`:''}</span>
+      unk?` · <span title="Files nuarr could not decide - it has not been able to read the picture, or its own reader is unsure of it. They are rows on What each file actually carries, where they can be answered.">${
+        fmt(unk)} undecided, on the board above</span>`:''}</span>
     ${nDone?`<a href="#" onclick="snShowDone(${_snDone?0:1});return false"
       title="Releases this check has already blocklisted and re-searched. They come from the shared remedy ledger rather than from this list, because answering one deletes its row - the file it was about no longer exists.">${
       _snDone?'hide':'also show'} the ${fmt(nDone)} answered</a>`:''}
   </div>${doneList}`;
 
-  const html=`<div class="subsp" id="subsPanelNeed">${head}${snScoreTable()}${snWantBox()}${snUnkBox()}${prog}${table}${foot}</div>`;
+  const html=`<div class="subsp" id="subsPanelNeed">${head}${snScoreTable()}${snWantBox()}${prog}${table}${foot}</div>`;
 
   // WHAT COUNTS AS CHANGED IS THE ROWS, not the markup.
   //
@@ -39250,6 +39267,7 @@ function skPaint(force){
   // ReferenceError, not a hoist.
   const A=d.auto||{};
   const rows=skPinned(all.filter(r=>(_skShowDone||!r.done)&&(_skShowUnread||!r.unread)
+                                 && (_skShowNoread||!(r.source==='raw'&&!r.read))
                                  && !skIsAnswered(r.id))
                          .sort(skCmp));
   // What is on screen, in the order it is on screen - what a pin is measured
@@ -39261,6 +39279,7 @@ function skPaint(force){
   // counts are taken over everything for exactly this reason.
   const hiddenDone=_skShowDone?0:(c.done||0);
   const hiddenUnread=_skShowUnread?0:(c.unread||0);
+  const hiddenNoread=_skShowNoread?0:(c.noread||0);
   const tested=(P.none||0)+(P.signs||0)+(P.dialogue||0)+(P.hybrid||0);
   const running=!!(P.running||T.running||S.running);
   // ITS OWN COUNT, ON THE RIGHT, and it is the same number its switchboard row
@@ -39469,12 +39488,9 @@ function skPaint(force){
         <div style="font-size:9.5px;color:${col}">read as ${esc(word)}</div></td>
       <td class="c mono" style="font-variant-numeric:tabular-nums;color:${sureCol}"
           title="${esc(a.asking||'')}">${a.sure!=null?(a.sure+'%'):''}</td>
-      <td class="l mono">${pic?'<span class="dim">—</span>'
-        :`<span style="color:var(--warn)" title="${esc(a.from||'')}">${esc(a.from||'')}</span>${
-           a.to?`<div style="font-size:10px;color:var(--ok);overflow:hidden;text-overflow:ellipsis" title="${esc(a.to)}">→ ${esc(a.to)}</div>`:''}`}</td>
       <td class="r askhost">${(a.options||[]).map(o=>`<button class="rmb" title="${esc(o.what||'')}"
           onclick="subAnswer(${r.file_id},'${esc(a.q)}','${esc(o.v)}',this,answerScope(this))">${esc(o.label||o.v)}</button>`).join('')}<span style="display:none"><input type="checkbox" class="askjust" ${_askJust.has(jk)?'checked':''}></span></td>
-    </tr>${open?`<tr id="skdet-${esc(id)}" style="background:rgba(255,255,255,.025)"><td colspan="9" style="padding:6px 10px 7px 34px;border-bottom:1px solid var(--line);font-size:11px">
+    </tr>${open?`<tr id="skdet-${esc(id)}" style="background:rgba(255,255,255,.025)"><td colspan="8" style="padding:6px 10px 7px 34px;border-bottom:1px solid var(--line);font-size:11px">
       <div>${esc(a.asking||'')}</div>
       <label class="dim" style="font-size:10.5px;display:inline-flex;gap:5px;align-items:center;cursor:pointer;margin-top:4px"
         title="Off: your answer is remembered for the whole show and its release group, so the next episode does not ask. On: this file only; other episodes will still ask.">
@@ -39491,9 +39507,9 @@ function skPaint(force){
            the stylesheet): the episode reads left, the answer sits right, and
            everything between - a library name, a word, a picker, a number -
            is centred under its heading so the eye can run down the column. -->
-      <colgroup><col style="width:24px"><col style="width:auto"><col style="width:104px">
-        <col style="width:78px"><col style="width:74px"><col style="width:150px">
-        <col style="width:58px"><col style="width:19%"><col style="width:214px"></colgroup>
+      <colgroup><col style="width:26px"><col style="width:auto"><col style="width:118px">
+        <col style="width:96px"><col style="width:86px"><col style="width:178px">
+        <col style="width:74px"><col style="width:236px"></colgroup>
       <!-- EVERY HEADING SORTS. Click once for that column's natural order,
            again to turn it around; "sure" returns to least-certain-first. -->
       <thead><tr class="dim sksort" style="font-size:10.5px">
@@ -39506,7 +39522,6 @@ function skPaint(force){
         <th class="c" onclick="skSortBy('where')" title="Where the subtitles are: burned into the picture, or in a text track (s:N is the track's ordinal). Click to group the two.">where ${skSortMark('where')}</th>
         <th class="c" onclick="skSortBy('kind')" title="What the reader says it carries, and a way to say that is wrong. The picker outranks the reading and is what the answer records. Click to group by kind.">what it carries ${skSortMark('kind')}</th>
         <th class="c" onclick="skSortBy('sure')" title="How sure the reading is, 0-100, the same scale for both readers. Above the act line it would be acted on alone; below the dismiss line thrown away; in between is yours to call.">sure ${skSortMark('sure')}</th>
-        <th class="l" onclick="skSortBy('title')" title="For a track: what its title says now, and what it would be corrected to">title ${skSortMark('title')}</th>
         <th class="r" onclick="skSortBy('answer')" title="Sort by what there is to do">answer ${skSortMark('answer')}</th>
       </tr></thead>
       <tbody>${askRows}${rows.map(r=>{
@@ -39544,19 +39559,6 @@ function skPaint(force){
                        :`<div style="font-size:9.5px;color:${col}">read as ${esc(word)}</div>`}`}</td>
         <td class="c mono" style="font-variant-numeric:tabular-nums;color:${skColor(r)}"
             title="${esc((r.why||'')+' — '+(r.auto_why||''))}">${r.unread||(r.source==='raw'&&!r.read)?'':(r.sure+'%')}</td>
-        <td class="l mono">${(pic||r.source==='raw')?'<span class="dim">—</span>'
-          :`<span style="color:var(--warn)" title="${esc(r.title_old||'')}">${esc(r.title_old||'')}</span>${
-             r.action==='retitle'?`<div style="font-size:10px;color:var(--ok);overflow:hidden;text-overflow:ellipsis" title="${
-               esc((r.title_new||'')+(r.unsafe?' — this replaces a title nuarr did not write, because you set the kind by hand':''))}">→ ${
-               esc(r.title_new||'')}${r.unsafe?' <span class="dim">(your call)</span>':''}</div>${
-               r.unforce?`<div style="font-size:10px;color:var(--ok)"
-                 title="This track carries the same cues as the full track beside it in the same file, so the forced flag is not true of it - and a forced track is what makes a player turn subtitles on by itself. The flag is cleared in the same call that fixes the name. A genuinely sparse forced track is never touched.">
-                 → and the forced flag cleared</div>`:''}`
-                                 :(r.unread?''
-                                    :(r.settled
-                                      ? `<div class="dim" style="font-size:10px" title="You said this track carries ${
-                                          esc(SKW[r.kind]?SKW[r.kind][0]:r.kind)}, and its title already says so - there is nothing to correct.">title already agrees</div>`
-                                      : '<div class="dim" style="font-size:10px" title="The title carries a name nuarr did not write and cannot regenerate, so it is reported and left as it is. Set what it carries by hand and the correction is offered anyway - your call outranks the caution.">left alone</div>'))}`}</td>
         <td class="r askhost">${r.done
           ? '<span class="dim" title="This file already carries the blank marker track.">marked</span>'
           : r.unread ? '<span class="dim" style="font-size:10.5px" title="The cue rate flagged this; its events have not been read yet. Nothing is offered until they have.">not read yet</span>'
@@ -39574,7 +39576,7 @@ function skPaint(force){
                    :'This track is signs after all. Recorded as such, and the next read will not overwrite it.'}">Not dialogue</button>${
              r.raw?` <button class="rmb" onclick="skReplace('${r.id}',this)" style="border-color:#4a3a12;color:#e8a33d"
                title="${esc('The raw check could not decide this file: '+(r.raw_why||'')+' If you know there is nothing here anyone can read, this blocklists the release, deletes the file and asks the arr for another. Not reversible.')}">Blocklist &amp; re-download</button>`:''}`}</td>
-      </tr>${open?`<tr id="skdet-${esc(r.id)}" style="background:rgba(255,255,255,.025)"><td colspan="9" style="padding:0;border-bottom:1px solid var(--line)">${skDetail(r)}</td></tr>`:''}`;}).join('')}</tbody></table></div>`
+      </tr>${open?`<tr id="skdet-${esc(r.id)}" style="background:rgba(255,255,255,.025)"><td colspan="8" style="padding:0;border-bottom:1px solid var(--line)">${skDetail(r)}</td></tr>`:''}`;}).join('')}</tbody></table></div>`
     : `<div class="dim" style="font-size:11.5px;padding:8px 0">${
         (tested||c.tracks)?'Nothing checked so far is carrying subtitles it should not, or under a title it should not.':'Nothing checked yet.'}</div>`;
   const foot=`<div class="dim" style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;font-size:11px;margin-top:6px">
@@ -39597,6 +39599,10 @@ function skPaint(force){
       (_skShowDone&&c.done)?`<a href="#" onclick="skShow('done',0);return false">hide the marked ones</a>`:''}
     ${hiddenUnread?`<a href="#" onclick="skShow('unread',1);return false">also show the ${fmt(hiddenUnread)} not read yet</a>`:''}${
       (_skShowUnread&&c.unread)?`<a href="#" onclick="skShow('unread',0);return false">only the ones read</a>`:''}
+    ${hiddenNoread?`<a href="#" onclick="skShow('noread',1);return false"
+      title="Files the raw check cannot decide because nothing has read them - no probe, or no picture sampled. They can be answered, but only on the filename and the language, so they are not shown by default.">also show the ${
+        fmt(hiddenNoread)} nothing has read yet</a>`:''}${
+      (_skShowNoread&&c.noread)?`<a href="#" onclick="skShow('noread',0);return false">hide the unread ones</a>`:''}
     ${c.settled?`<a href="#" title="Tracks you told nuarr carry signs or nothing. Their titles already say so, so there is nothing to correct - but the choice is yours to change."
       onclick="skShow('done',${_skShowDone?0:1});return false">${
         _skShowDone?'hide':'also show'} the ${fmt(c.settled)} you set by hand</a>`:''}

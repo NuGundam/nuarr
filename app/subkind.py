@@ -313,12 +313,17 @@ def _raw_rows(existing: list) -> list:
             "kinds": [{"id": k, "word": hardsub.KIND_WORDS[k]}
                       for k in hardsub.KINDS],
             "sure": score, "read": bool(pst), "unread": False,
+            # A FILE NOTHING HAS READ STILL ARRIVED ON A DAY. The added column
+            # drew a dash on every raw row because this was left at zero -
+            # and "this whole show landed an hour ago" is exactly the context
+            # somebody deciding about a raw wants.
+            "added": float(u.get("first_seen") or 0.0),
             "evidence": words, "why": why,
             "auto": "ask", "auto_why": "nothing has read this file; yours to call",
             "action": "replace",
             "action_word": "Blocklist & re-download",
             "done": False, "done_word": "",
-            "detail": why, "added": 0.0, "found_at": float(u.get("at") or 0.0),
+            "detail": why, "found_at": float(u.get("at") or 0.0),
             "raw": True, "raw_why": why, "raw_rule": rule,
         })
     return out
@@ -890,6 +895,12 @@ def findings(limit: int = 600, want_done: bool = True,
             # The raw check's open questions on this board - tagged onto a
             # picture row or standing on their own.
             "raw": sum(1 for r in rows if r.get("raw") and not r["done"]),
+            # OF THOSE, THE ONES NOTHING HAS READ. Hidden behind a footer
+            # link like the answered ones: a row with no reading behind it
+            # is a decision made on the filename alone, and it should be
+            # asked for rather than filling the board by default.
+            "noread": sum(1 for r in rows
+                          if r.get("source") == RAW and not r.get("read")),
             "unread": sum(1 for r in rows if r["unread"]),
             "band": sum(1 for r in rows if r["auto"] == "ask"
                         and not r["unread"] and not r["done"]),

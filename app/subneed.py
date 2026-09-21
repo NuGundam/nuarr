@@ -1506,7 +1506,7 @@ def unknown_files(kind: str = "", limit: int = 600) -> dict:
                  "                 AND COALESCE(h.chosen,'')='' THEN 'stale' "
                  "            ELSE 'open' END AS k, "
                  "       n.file_id, n.lang, n.why, n.checked_at, "
-                 "       COALESCE(n.rule,'') AS rule, "
+                 "       COALESCE(n.rule,'') AS rule, f.first_seen, "
                  "       f.path, f.title, f.season, f.episode, f.library "
                  "  FROM sub_need n "
                  "  JOIN files f ON f.id = n.file_id "
@@ -1551,6 +1551,7 @@ def unknown_files(kind: str = "", limit: int = 600) -> dict:
                         "label": _row_label(r), "path": str(r["path"] or ""),
                         "why": str(r["why"] or ""),
                         "rule": str(r["rule"] or ""),
+                        "first_seen": float(r["first_seen"] or 0.0),
                         "at": float(r["checked_at"] or 0.0)})
     except Exception as e:                                       # noqa: BLE001
         return {"ok": False, "why": f"{type(e).__name__}: {e}"[:160],
