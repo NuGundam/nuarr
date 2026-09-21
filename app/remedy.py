@@ -147,6 +147,13 @@ _kind("audio/language", False, True, True,
 _kind("subs/missing-language", False, True, True,
       "the file carries no subtitles in a language this library requires, and "
       "no re-encode writes subtitles that are not in the release")
+# THE AUDIO TWIN OF THE LINE ABOVE. A file whose name promises a dub it does
+# not carry cannot be fixed by rearranging it - the track is not in there.
+# auto_replace is False: the evidence is good, but "delete five gigabytes
+# because a name lied" is a person's call until Erik says otherwise.
+_kind("audio/missing-language", False, True, False,
+      "the audio does not carry a language this library requires, and no "
+      "re-encode puts a dub into a file that never had one")
 _kind("job/content", False, True, True,
       "the job failed on the file's own contents")
 

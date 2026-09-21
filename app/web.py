@@ -32,7 +32,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi import Response
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
-from . import (arrhealth, audiolang, autoqueue, backup, commitqueue, subneed,
+from . import (arrhealth, audiolang, audneed, autoqueue, backup, commitqueue, subneed,
                ffmpeg_update, gate,
                adopter, healer, joblog, jobs, lifecycle, maintenance,
                refetch, renamequeue, renamer, rules, scanner, system, updates,
@@ -10324,6 +10324,111 @@ async def api_subneed_require(library: str, lang: str, on: bool = True):
     # twice.
     r = await asyncio.to_thread(subneed.sweep)
     return {"ok": True, "require": sorted(want), "swept": r}
+
+
+@app.post("/api/audneed/require")
+async def api_audneed_require(library: str, lang: str, on: bool = True):
+    r"""Mark one AUDIO language required for one library, or stop.
+
+    The twin of /api/subneed/require, and deliberately the same shape: the
+    two questions are asked of the same library by the same person and the
+    answer is stored in the same policy, one list per side.
+
+    What it turns on is audneed - see that module for why this check has to
+    live here rather than in Sonarr.
+    """
+    from . import langpolicy
+    lang = (lang or "").strip().lower()[:3]
+    if not lang:
+        raise HTTPException(400, "lang is required")
+    pol = langpolicy.load()
+    if library not in pol:
+        raise HTTPException(404, f"no library named {library!r}")
+    want = set((pol[library].get("audio") or {}).get("require") or [])
+    want.add(lang) if on else want.discard(lang)
+    langpolicy.save({library: {"audio": {"require": sorted(want)}}})
+    joblog.log(
+        f"{library}: {lang} audio is "
+        + ("now REQUIRED of anything claiming a dub - a file whose name "
+           "promises it and whose tracks do not carry it will be listed"
+           if on else "no longer required"), "info")
+    r = await asyncio.to_thread(audneed.sweep_all)
+    return {"ok": True, "require": sorted(want), "swept": r}
+
+
+@app.get("/api/audneed")
+async def api_audneed(library: str = "", limit: int = 500):
+    """What the audio check has found, and what it was asked to look for."""
+    d = await asyncio.to_thread(audneed.snapshot)
+    d["rows"] = await asyncio.to_thread(audneed.accused, int(limit), library)
+    return d
+
+
+@app.post("/api/audneed/check")
+async def api_audneed_check():
+    """Judge the libraries that require an audio language, now."""
+    return await asyncio.to_thread(audneed.sweep_all)
+
+
+@app.post("/api/audneed/replace")
+async def api_audneed_replace(file_id: int):
+    """Blocklist this release, delete the file, ask the arr for another.
+
+    Refuses anything this check has not actually accused - the same rule the
+    subtitle side holds, and for the same reason: the button deletes
+    gigabytes, so the rule lives behind the button rather than in the
+    rendering of it.
+    """
+    from . import remedy
+    with cursor() as cur:
+        r = cur.execute("SELECT state, why FROM aud_need WHERE file_id=? "
+                        " ORDER BY state LIMIT 1", (int(file_id),)).fetchone()
+    if not r or r["state"] != audneed.MISSING:
+        return {"ok": False, "why": (
+            "the audio check has no complaint about this file"
+            if r else "this file is not on the audio check's list")}
+    out = await remedy.replace(int(file_id), audneed.KIND, source="audneed",
+                               why=r["why"] or "", auto=False)
+    if out.get("ok"):
+        audneed.answered(int(file_id))
+    return out
+
+
+@app.post("/api/audneed/replace/batch")
+async def api_audneed_replace_batch(ids: str = "", confirm: str = ""):
+    """The same, for a selection. Each goes through remedy on its own, so the
+    hourly cap counts them and a refusal is per file rather than per batch."""
+    if confirm != "yes":
+        return {"ok": False, "why": "confirm=yes required"}
+    from . import remedy
+    out = {"ok": True, "asked": 0, "refused": 0, "capped": 0, "rows": []}
+    for tok in (ids or "").split(","):
+        try:
+            fid = int(tok.strip())
+        except ValueError:
+            continue
+        with cursor() as cur:
+            n = cur.execute("SELECT state, why FROM aud_need WHERE file_id=? "
+                            " ORDER BY state LIMIT 1", (fid,)).fetchone()
+        if not n or n["state"] != audneed.MISSING:
+            out["refused"] += 1
+            out["rows"].append({"file_id": fid, "ok": False,
+                                "why": "not accused by the audio check"})
+            continue
+        r = await remedy.replace(fid, audneed.KIND, source="audneed",
+                                 why=n["why"] or "", auto=False)
+        if r.get("ok"):
+            out["asked"] += 1
+            audneed.answered(fid)
+        elif r.get("capped"):
+            out["capped"] += 1
+        else:
+            out["refused"] += 1
+        out["rows"].append({"file_id": fid, "ok": bool(r.get("ok")),
+                            "why": r.get("why") or ""})
+        if r.get("capped"):
+            break
+    return out
 
 
 @app.post("/api/subneed/check")
@@ -32401,14 +32506,29 @@ function langBlockHtml(lib, side, sideLabel){
   // second one can end in a release being blocklisted, so it is its own
   // deliberate click and only offered on a language already being kept.
   const req=new Set((cfg.require)||[]);
-  const reqSw=c=>side!=='subs'?'':`<label class="lreq${req.has(c)?' on':''}"
-      title="${req.has(c)
+  // THE AUDIO SIDE ASKS A NARROWER QUESTION THAN THE SUBTITLE SIDE, and the
+  // switch says which. Requiring a subtitle language means "a film I cannot
+  // follow needs one" - every foreign file is in scope. Requiring an AUDIO
+  // language cannot mean "every file here must have an English dub": most
+  // anime is not dubbed, Erik has said so twice, and a rule like that would
+  // accuse twenty thousand honest Japanese releases. So it means "anything
+  // CLAIMING this language had better have it" - a file carrying two audio
+  // languages that are not this one, or a name promising a dub the tracks do
+  // not back up. See audneed.py.
+  const reqWord = side==='subs' ? 'require for foreign media'
+                                : 'require when a release claims a dub';
+  const reqSw=c=>`<label class="lreq${req.has(c)?' on':''}"
+      title="${side==='subs'
+        ? (req.has(c)
         ? 'Required. This is the language you read when you cannot follow the audio. A file spoken in something else, with no '+esc(name(c))+' dialogue to read - no track, no file beside it, nothing burned into the picture - is a RAW: nothing nuarr can do to those bytes produces a subtitle, so it is listed below and only a different release fixes it. Signs and songs do not count as dialogue. A file already spoken in '+esc(name(c))+' is listed but never replaced - you can follow it.'
-        : 'Only kept. Nothing checks whether a file actually HAS '+esc(name(c))+' subtitles.'}"
+        : 'Only kept. Nothing checks whether a file actually HAS '+esc(name(c))+' subtitles.')
+        : (req.has(c)
+        ? 'Required of anything that claims it. A file carrying two or more audio languages without '+esc(name(c))+' among them, or whose name promises a dub or dual audio that its tracks do not carry, is listed below and only a different release fixes it - no re-encode puts a dub into a file that never had one. A single-language release that claims nothing is left alone: not every show is dubbed. Sonarr cannot make this call, because before a download all it has is the name.'
+        : 'Only kept. Nothing checks whether a release claiming a dub actually carries '+esc(name(c))+' audio.')}"
       onclick="event.stopPropagation()">
       <input type="checkbox" ${req.has(c)?'checked':''}
-             onchange="langRequire('${esc(lib)}','${c}',this.checked,this)">
-      require for foreign media</label>`;
+             onchange="langRequire('${esc(lib)}','${c}','${side}',this.checked,this)">
+      ${reqWord}</label>`;
   const chips=here.map(([c,n])=>`
     <span class="lcell">
       <label class="lchip${chosen.has(c)?' on':''}">
@@ -32443,7 +32563,91 @@ function langBlockHtml(lib, side, sideLabel){
         ${iso.map(x=>`<option value="${x.c}">${esc(x.n)} (${x.c})</option>`).join('')}
       </select>
     </div>
+    ${side==='audio'&&req.size?`<div class="anbox" id="anbox_${cssId(lib)}"
+      ><span class="dim" style="font-size:11.5px">checking what claims a dub…</span></div>`:''}
   </div>`;
+}
+
+// ---- what claims a dub and does not carry one ---------------------------
+// UNDER THE RULE THAT PRODUCED IT. Erik: "put it under audio lang page under
+// each sub library so it ties into the rules so it keeps what they ask for so
+// it is not static". The list is not a fixed idea of what a library should
+// carry - it is whatever THAT library's required switch says, recounted when
+// the switch moves, and gone the moment it is turned off.
+let _anRows={};
+async function anLoad(lib){
+  const box=document.getElementById('anbox_'+cssId(lib));
+  if(!box) return;
+  let d={};
+  try{ d=await (await fetch('/api/audneed?library='+encodeURIComponent(lib)
+      +'&limit=400')).json(); }catch(e){ d={}; }
+  const rows=(d.rows||[]);
+  _anRows[lib]=rows;
+  const mine=((d.libraries||{})[lib]||{});
+  const unk=mine.unknown||0;
+  if(!rows.length){
+    box.innerHTML=`<span class="dim" style="font-size:11.5px">nothing here
+      claims an audio language it does not carry${unk?` — ${fmt(unk)} not
+      listened to yet`:''}.</span>`;
+    return;
+  }
+  box.innerHTML=`<div style="display:flex;align-items:center;gap:9px;
+      flex-wrap:wrap">
+    <b style="font-size:11.5px;color:var(--warn)">${fmt(rows.length)}
+      claim${rows.length===1?'s':''} audio ${esc((d.required||{})[lib]?
+        ((d.required||{})[lib]||[]).join(', '):'')} and do${rows.length===1?'es':''} not carry it</b>
+    <a href="#" style="font-size:11.5px"
+       onclick="anShow('${b64e(lib)}');return false">show them</a>
+    <button class="rmb" onclick="anAll('${b64e(lib)}',this)"
+      title="Blocklist every release listed here and ask the arr for another.
+Nothing is re-encoded - a dub that is not in the file cannot be put there.">
+      Blocklist &amp; re-download all ${fmt(rows.length)}</button>
+    ${unk?`<span class="dim" style="font-size:11px">· ${fmt(unk)} not
+      listened to yet</span>`:''}
+  </div>
+  <div id="anlist_${cssId(lib)}" style="display:none;margin-top:6px"></div>`;
+}
+function anShow(b){
+  const lib=b64d(b), el=document.getElementById('anlist_'+cssId(lib));
+  if(!el) return;
+  if(el.style.display!=='none'){ el.style.display='none'; return; }
+  el.style.display='';
+  el.innerHTML=`<div style="max-height:260px;overflow:auto">
+    <table style="width:100%;border-collapse:collapse;font-size:11.5px">
+    ${(_anRows[lib]||[]).map(r=>`<tr style="border-top:1px solid var(--line)">
+      <td style="padding:3px 8px 3px 0">${esc(r.title||'')}${
+        r.season?` <span class="dim">S${String(r.season).padStart(2,'0')}E${
+          String(r.episode||0).padStart(2,'0')}</span>`:''}
+        <div class="dim" style="font-size:10.5px">${esc(r.why||'')}</div></td>
+      <td class="mono dim" style="padding:3px 8px 3px 0;white-space:nowrap">${
+        esc(r.audio||'')}</td>
+      <td class="mono" style="padding:3px 8px 3px 0;text-align:right">${r.sure}%</td>
+      <td style="padding:3px 0;text-align:right"><button class="rmb"
+        onclick="anOne(${r.file_id},this)">Blocklist &amp; re-download</button></td>
+    </tr>`).join('')}</table></div>`;
+}
+async function anOne(fid, btn){
+  if(btn){ btn.disabled=true; btn.textContent='asking…'; }
+  let x={};
+  try{ x=await (await fetch('/api/audneed/replace?file_id='+fid,
+      {method:'POST'})).json(); }catch(e){ x={ok:false,why:String(e)}; }
+  if(btn){ btn.textContent=x.ok?'asked':(x.why?'refused':'failed'); }
+  if(!x.ok&&x.why) alert(x.why);
+}
+async function anAll(b, btn){
+  const lib=b64d(b), rows=_anRows[lib]||[];
+  if(!rows.length) return;
+  askInline(btn, `Blocklist ${fmt(rows.length)} release${rows.length===1?'':'s'}
+    and ask for another of each? The files are deleted - a dub that is not in
+    the bytes cannot be put there by re-encoding - and the hourly cap applies,
+    so any past it are declined and say so.`,
+    `Yes, do ${fmt(rows.length)}`, async ()=>{
+      const x=await (await fetch('/api/audneed/replace/batch?confirm=yes&ids='
+        +encodeURIComponent(rows.map(r=>r.file_id).join(',')),
+        {method:'POST'})).json();
+      await anLoad(lib);
+      return x.ok?{ok:true, why:`${fmt(x.asked||0)} asked for another`}:x;
+    });
 }
 
 // REQUIRING SAVES IMMEDIATELY, and does not ride with the Save policy button.
@@ -32473,16 +32677,18 @@ function langBlockHtml(lib, side, sideLabel){
 // clicked - but that is one boolean, not a page. The checkbox is set from
 // the response, the cached policy is patched to match, and the full reload
 // only happens if the two disagree, which means something else changed it.
-async function langRequire(lib, code, on, el){
+async function langRequire(lib, code, side, on, el){
+  side = (side==='audio') ? 'audio' : 'subs';
   let r=null;
   try{
-    r=await (await fetch('/api/subneed/require?library='+encodeURIComponent(lib)
+    r=await (await fetch('/api/'+(side==='audio'?'audneed':'subneed')
+      +'/require?library='+encodeURIComponent(lib)
       +'&lang='+encodeURIComponent(code)+'&on='+(on?'true':'false'),
       {method:'POST'})).json();
   }catch(e){}
   const want=(r&&r.require)||null;
-  if(want && _lang && _lang.policy && _lang.policy[lib] && _lang.policy[lib].subs){
-    _lang.policy[lib].subs.require=want;
+  if(want && _lang && _lang.policy && _lang.policy[lib] && _lang.policy[lib][side]){
+    _lang.policy[lib][side].require=want;
     const got=want.indexOf(String(code).toLowerCase().slice(0,3))>=0;
     if(el) el.checked=got;
     const lab=el&&el.closest('.lreq'); if(lab) lab.classList.toggle('on', got);
@@ -32615,6 +32821,14 @@ async function langAudioPolicy(){
               ${langStripHtml(L.name,'audio')}`:''}
     </div>`;}).join('')
     : '<div class="dim">no libraries configured</div>';
+  // AND THEN WHAT THE RULE FOUND, under the rule itself. Only for the
+  // libraries that are open and actually require something - a fetch per
+  // library that asks for nothing would be six queries to print six blanks.
+  for(const L of libs){
+    if(!_alpolOpen.has(L.name)) continue;
+    const c=((pol[L.name]||{}).audio)||{};
+    if(((c.require)||[]).length) anLoad(L.name);
+  }
 }
 
 // EVERY SUBTITLE DECISION LIVES ON THIS PAGE, AND PER LIBRARY. Reading image
