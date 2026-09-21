@@ -1867,6 +1867,22 @@ def _stream_index(file_id: int, ord_: int, cur_=None) -> int:
 # if it is a new file".
 REREAD: set = set()
 
+# WHAT THE PROBE FOUND, FOR THE JOB CARD. Read again checks the tracks
+# itself - ffprobe for what is inside, a folder listing for what is beside -
+# before it queues anything, and that step has no job card of its own, so
+# three files with no tracks at all showed only an OCR card and looked like
+# the button had skipped the tracks. The sentence is handed to whichever
+# read runs next so the card carries it. Capped; it is a convenience.
+FOUND: dict = {}
+
+
+def note_found(file_id: int, tracks: int, sides: int) -> None:
+    if len(FOUND) > 500:
+        FOUND.clear()
+    FOUND[int(file_id)] = (
+        f"read as new - {tracks} subtitle track{'' if tracks == 1 else 's'} "
+        f"inside, {sides} file{'' if sides == 1 else 's'} beside it")
+
 
 def unread_tracks(limit: int = 400) -> list:
     r"""Files whose only track in a required language has never been read.

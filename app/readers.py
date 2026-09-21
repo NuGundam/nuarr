@@ -697,7 +697,10 @@ def subread_one(reader: str, row: dict, on_stage=None) -> dict:
     an indeterminate sweep and a row of dashes - it had nothing else to go on.
     Both readers report their real stages now; see hardsub.probe_one.
     """
-    from . import hardsub, subtitletitle as stt
+    from . import hardsub, subtitletitle as stt, subneed as _sn
+    told = _sn.FOUND.pop(int(row.get("file_id") or 0), "")
+    if told and on_stage:
+        on_stage(told, 0.0)
     if reader == "picture":
         if on_stage:
             on_stage(f"sampling {hardsub.SAMPLES} frames", 0.0)
@@ -708,6 +711,8 @@ def subread_one(reader: str, row: dict, on_stage=None) -> dict:
                         "dialogue": "DIALOGUE burned into the picture",
                         "hybrid": "dialogue and signs in the picture"}.get(
                 str(r.get("state") or ""), f"read as {r.get('state')}")
+            if told:
+                r["why"] = told + "; " + r["why"]
             # THE PICTURE CLOSES ITS LOOP TOO. A track-less file sits on the
             # raw check's nopic rung - "nothing has read the picture yet" -
             # and the moment the picture is read that sentence is false, but
@@ -726,6 +731,8 @@ def subread_one(reader: str, row: dict, on_stage=None) -> dict:
     if r.get("ok"):
         r["why"] = ("signs after all - cleared" if r.get("cleared")
                     else "the events say dialogue - it stays on the list")
+        if told:
+            r["why"] = told + "; " + r["why"]
         # AND TELL THE RAW CHECK, WHICH ASKED FOR THIS READ.
         #
         # Its signs_unread rung is the reason half these reads happen: a

@@ -10498,6 +10498,15 @@ async def api_subkind_reread(ids: str = "", confirm: str = ""):
             await asyncio.to_thread(subneed.check_one, fid)
         except Exception:                                    # noqa: BLE001
             pass
+        # Say on the card what the track check found, since it has no card.
+        try:
+            with cursor() as cur:
+                f = cur.execute("SELECT tracks, sides FROM sub_facts "
+                                " WHERE file_id=?", (fid,)).fetchone()
+            subneed.note_found(fid, len(json.loads((f["tracks"] if f else "") or "[]")),
+                               len(json.loads((f["sides"] if f else "") or "[]")))
+        except Exception:                                    # noqa: BLE001
+            pass
     # And the readers: every track in the language, and the picture.
     try:
         stt._CACHE["at"] = 0.0
