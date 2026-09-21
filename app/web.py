@@ -10379,10 +10379,16 @@ async def api_subneed_replace_batch(ids: str = "", confirm: str = ""):
         with cursor() as cur:
             n = cur.execute("SELECT state, why FROM sub_need WHERE file_id=? "
                             " ORDER BY state LIMIT 1", (fid,)).fetchone()
-        if not n or n["state"] != subneed.MISSING:
+        # A RAW, OR A FILE NUARR COULD NOT DECIDE. Erik: "the undecided
+        # should come up in the system 1 scroll box ... with an option to
+        # blocklist & re-download". An undecided file is one nuarr has no
+        # opinion about, which is exactly when a person's is worth the most.
+        # A file it CAN follow - ok, or spoken in the language - is still
+        # refused: nothing deletes a film you understand.
+        if not n or n["state"] not in (subneed.MISSING, subneed.UNKNOWN):
             out["refused"] += 1
             out["rows"].append({"file_id": fid, "ok": False,
-                                "why": "not recorded as missing"})
+                                "why": "not a raw, and not undecided"})
             continue
         r = await remedy.replace(fid, subneed.KIND, source="subneed",
                                  why=n["why"] or "", auto=False)
@@ -10416,11 +10422,14 @@ async def api_subneed_replace(file_id: int):
     with cursor() as cur:
         r = cur.execute("SELECT state, why FROM sub_need WHERE file_id=? "
                         " ORDER BY state LIMIT 1", (int(file_id),)).fetchone()
-    if not r or r["state"] != subneed.MISSING:
+    # A raw, or a file nuarr could not decide - see the batch endpoint above
+    # for why an undecided file takes a person's call. A file you can follow
+    # is refused whatever button asked.
+    if not r or r["state"] not in (subneed.MISSING, subneed.UNKNOWN):
         return {"ok": False, "why": (
-            "nuarr has not looked inside this file, so it has no opinion "
-            "about what is missing from it" if (r and r["state"] == "unknown")
-            else "this file is not recorded as missing a required language")}
+            "this file can be followed - it is spoken in the language, or "
+            "carries a subtitle you can read - so nothing replaces it"
+            if r else "this file is not on the raw check's list")}
     out = await remedy.replace(int(file_id), subneed.KIND, source="subneed",
                                why=r["why"] or "", auto=False)
     # THE QUESTION IS ANSWERED, so it leaves the list now rather than at the
@@ -38206,6 +38215,24 @@ async function skAct(id, btn){
       return x.ok ? {ok:true, why: pic?'marked':(x.why||'corrected')} : x;
     });
 }
+// THE RAW BUTTON. Blocklist this release and ask the arr for another - the
+// one thing a raw can be fixed by, offered here because this board is where
+// a person decides about files nuarr could not.
+async function skReplace(id, btn){
+  const r=((_sk&&_sk.rows)||[]).find(x=>x.id===id); if(!r) return;
+  const gb=(r.size||0)/1073741824;
+  askInline(btn,
+    `Blocklist this release and ask the arr for another copy? The file is deleted${
+      gb?` (${gb.toFixed(2)} GB)`:''}. Not reversible.`,
+    'Yes — replace it',
+    async ()=>{
+      const x=await (await fetch(`/api/subneed/replace?file_id=${r.file_id}`,{method:'POST'})).json();
+      if(x.ok) skGone(btn, 'asked for another', true, id);
+      else setTimeout(()=>{ _skKey=''; loadSubKind(true); }, 1500);
+      setTimeout(()=>{ _snKey=''; if(typeof loadSubNeed==='function') loadSubNeed(true); }, 1200);
+      return x.ok ? {ok:true, why:'asked for another'} : x;
+    });
+}
 async function skDismiss(id, btn){
   // NO CONFIRMATION: nothing is written to a file. For a picture the words
   // behind it teach the OCR filter; for a track the kind is set to signs.
@@ -38235,6 +38262,28 @@ async function skActMany(btn){
   const ids=skSelIds();
   const rows=skRows().filter(r=>ids.includes(r.id));
   if(!ids.length) return;
+  // THE RAWS, AS A BATCH. Only the rows the raw check is unsure about or
+  // has accused take this; a picture row that is not a raw is left alone
+  // rather than deleted because it happened to be ticked.
+  if(_skBatchKind==='replace'){
+    const raws=rows.filter(r=>r.raw);
+    if(!raws.length){ askInline(btn,'None of the selected rows is a raw.','OK',async()=>({ok:true})); return; }
+    const gb=raws.reduce((t,r)=>t+(r.size||0),0)/1073741824;
+    askInline(btn,
+      `Blocklist ${fmt(raws.length)} release${raws.length===1?'':'s'} and ask the arr for another copy of each? `
+      +`The files are deleted${gb?` (${gb.toFixed(2)} GB)`:''}. Not reversible. Capped per hour across every check; past the cap the rest wait.`,
+      `Yes — replace ${fmt(raws.length)}`,
+      async ()=>{
+        const x=await (await fetch('/api/subneed/replace/batch?confirm=yes&ids='
+          +encodeURIComponent(raws.map(r=>r.file_id).join(',')),{method:'POST'})).json();
+        if(x.ok) skGoneMany(raws.map(r=>r.id), `${fmt(x.asked||0)} asked for another`);
+        else setTimeout(()=>{ _skKey=''; loadSubKind(true); }, 1300);
+        _skSel.clear(); _skLast=null;
+        setTimeout(()=>{ _snKey=''; if(typeof loadSubNeed==='function') loadSubNeed(true); }, 1200);
+        return x;
+      });
+    return;
+  }
   askInline(btn,
     `Go ahead and answer ${fmt(rows.length)}`
     + (_skBatchKind?`, all recorded as ${SKW[_skBatchKind]?SKW[_skBatchKind][0]:_skBatchKind}`
@@ -39373,6 +39422,7 @@ function skPaint(force){
         title="Leave this alone and every row keeps whatever it says it is. Pick one and all of them are recorded as that.">
         <option value=""${_skBatchKind?'':' selected'}>keep each row's kind</option>
         ${['dialogue','hybrid','signs'].map(k=>`<option value="${k}"${_skBatchKind===k?' selected':''}>all as ${SKW[k][0]}</option>`).join('')}
+        <option value="replace"${_skBatchKind==='replace'?' selected':''}>blocklist &amp; re-download the raws</option>
       </select>
       <button class="rmb" onclick="skClearSel()">Clear</button>
       <span class="dim" style="font-size:10.5px">shift-click to take a range</span>
@@ -39476,11 +39526,15 @@ function skPaint(force){
           ? esc(new Date(r.added*1000).toLocaleString())
           : 'nuarr has no record of when this file arrived'}">${
           r.added?ago(r.added):'—'}</td>
-        <td class="c" style="font-size:10.5px;color:${pic?'#6fb0ff':'var(--dim)'}"
-          title="${pic?'Words burned into the picture of a file that reports no subtitle track':esc(`A text track inside the file - the ${(r.track||0)+1}th subtitle stream, which ffmpeg calls s:${r.track}`)}">${
-          pic?'picture':'track '+((r.track||0)+1)}</td>
+        <td class="c" style="font-size:10.5px;color:${pic?'#6fb0ff':(r.source==='raw'?'#e8a33d':'var(--dim)')}"
+          title="${pic?'Words burned into the picture of a file that reports no subtitle track':(r.source==='raw'?esc(r.raw_why||''):esc(`A text track inside the file - the ${(r.track||0)+1}th subtitle stream, which ffmpeg calls s:${r.track}`))}">${
+          pic?'picture':(r.source==='raw'?'raw':'track '+((r.track||0)+1))}</td>
         <td class="c">${r.unread
           ? '<span class="dim" style="font-size:10.5px">not read yet</span>'
+          : r.source==='raw'
+          ? (r.read
+              ? `<span style="font-size:10.5px;color:#e8a33d" title="${esc(r.raw_why||'')}">${r.raw_rule==='marks'?'reader unsure':'read as '+esc(word)}</span>`
+              : `<span class="dim" style="font-size:10.5px" title="${esc(r.raw_why||'')}">nothing has read it</span>`)
           : `<select class="kindsel" onchange="skSetKind('${r.id}',this.value,this)"
                title="${esc((r.why||('read as '+word))+'. If that is wrong, set it here - the choice is kept and the next pass will not overwrite it.')}"
                ${r.done?'disabled':''}>
@@ -39489,8 +39543,8 @@ function skPaint(force){
              ${r.chosen?'<div class="dim" style="font-size:9.5px">set by hand</div>'
                        :`<div style="font-size:9.5px;color:${col}">read as ${esc(word)}</div>`}`}</td>
         <td class="c mono" style="font-variant-numeric:tabular-nums;color:${skColor(r)}"
-            title="${esc((r.why||'')+' — '+(r.auto_why||''))}">${r.unread?'':(r.sure+'%')}</td>
-        <td class="l mono">${pic?'<span class="dim">—</span>'
+            title="${esc((r.why||'')+' — '+(r.auto_why||''))}">${r.unread||(r.source==='raw'&&!r.read)?'':(r.sure+'%')}</td>
+        <td class="l mono">${(pic||r.source==='raw')?'<span class="dim">—</span>'
           :`<span style="color:var(--warn)" title="${esc(r.title_old||'')}">${esc(r.title_old||'')}</span>${
              r.action==='retitle'?`<div style="font-size:10px;color:var(--ok);overflow:hidden;text-overflow:ellipsis" title="${
                esc((r.title_new||'')+(r.unsafe?' — this replaces a title nuarr did not write, because you set the kind by hand':''))}">→ ${
@@ -39506,6 +39560,8 @@ function skPaint(force){
         <td class="r askhost">${r.done
           ? '<span class="dim" title="This file already carries the blank marker track.">marked</span>'
           : r.unread ? '<span class="dim" style="font-size:10.5px" title="The cue rate flagged this; its events have not been read yet. Nothing is offered until they have.">not read yet</span>'
+          : r.source==='raw' ? `<button class="rmb" onclick="skReplace('${r.id}',this)"
+              title="${esc((r.raw_why||'')+' Nothing nuarr can do to these bytes produces a subtitle; only a different release fixes it. Blocklist this one, delete the file, ask the arr for another. Not reversible.')}">Blocklist &amp; re-download</button>`
           : `${r.action?`<button class="rmb" onclick="skAct('${r.id}',this)" title="${
                 pic?'Add a blank English subtitle track so Bazarr and Plex see one exists and stop asking for it. Nothing is drawn over the picture.'
                    :(r.action==='leave'
@@ -39515,7 +39571,9 @@ function skPaint(force){
                        :'Rewrite the track title to what it actually carries. Header edit only.'))}">${esc(r.action_word)}</button>`:''}
              <button class="rmb" onclick="skDismiss('${r.id}',this)" title="${
                 pic?'This is not a burned-in subtitle. The words behind it join the list of reads that were wrong, and two dismissals in one series leave that show alone.'
-                   :'This track is signs after all. Recorded as such, and the next read will not overwrite it.'}">Not dialogue</button>`}</td>
+                   :'This track is signs after all. Recorded as such, and the next read will not overwrite it.'}">Not dialogue</button>${
+             r.raw?` <button class="rmb" onclick="skReplace('${r.id}',this)" style="border-color:#4a3a12;color:#e8a33d"
+               title="${esc('The raw check could not decide this file: '+(r.raw_why||'')+' If you know there is nothing here anyone can read, this blocklists the release, deletes the file and asks the arr for another. Not reversible.')}">Blocklist &amp; re-download</button>`:''}`}</td>
       </tr>${open?`<tr id="skdet-${esc(r.id)}" style="background:rgba(255,255,255,.025)"><td colspan="9" style="padding:0;border-bottom:1px solid var(--line)">${skDetail(r)}</td></tr>`:''}`;}).join('')}</tbody></table></div>`
     : `<div class="dim" style="font-size:11.5px;padding:8px 0">${
         (tested||c.tracks)?'Nothing checked so far is carrying subtitles it should not, or under a title it should not.':'Nothing checked yet.'}</div>`;

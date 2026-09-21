@@ -240,6 +240,90 @@ def _track_rows(limit: int) -> list:
     return out
 
 
+# ---- THE RAW CHECK'S OPEN QUESTIONS, AS ROWS HERE -------------------------
+#
+# Erik: "all undecided and not looked inside and waiting on re-read logic
+# should be in system 1 so the user can decide what to do with them,
+# especially the undecided, because right now the user can't do anything in
+# nuarr about them."
+#
+# True. The raw check listed them under a count with no button, on the
+# grounds that nuarr had no opinion - and "nuarr has no opinion" is exactly
+# when a person's is worth the most. So every file the raw check holds at
+# `unknown` is a row on this board: the ones that already have a picture row
+# are tagged on it, the ones that do not get a row of their own, and either
+# way the answer column offers the one thing a raw can be fixed by.
+RAW = "raw"
+
+
+def _raw_rows(existing: list) -> list:
+    """Tag the picture rows the raw check is unsure about, and add rows for
+    the files it has never been able to read at all."""
+    from . import subneed, hardsub
+    try:
+        d = subneed.unknown_files("", 2000)
+    except Exception:                                            # noqa: BLE001
+        return []
+    by_file = {int(r["file_id"]): r for r in existing
+               if r.get("source") == PICTURE}
+    out = []
+    for u in (d.get("rows") or []):
+        fid = int(u.get("file_id") or 0)
+        why = str(u.get("why") or "")
+        rule = str(u.get("rule") or u.get("kind") or "")
+        hit = by_file.get(fid)
+        if hit is not None:
+            # ALREADY HERE AS A PICTURE ROW. It keeps its score, its picker
+            # and its two buttons; it gains the raw check's reason and the
+            # third button. A row that is answered with Mark it stops being
+            # a raw by itself on the next pass.
+            hit["raw"] = True
+            hit["raw_why"] = why
+            hit["raw_rule"] = rule
+            continue
+        # THE PICTURE READER'S OWN SCORE, WHERE IT HAS ONE. A file on the
+        # `marks` rung has been read and scored - the scorer just sits
+        # between its lines on it - and that number belongs on the row.
+        # Only a file nothing has read carries no score, and there a number
+        # would be invented.
+        score, words, pst = 0, "", ""
+        try:
+            from .db import cursor as _cur
+            with _cur() as cur:
+                h = cur.execute(
+                    "SELECT h.state, h.low_hits, h.samples, h.words "
+                    "  FROM hardsub h WHERE h.file_id=?", (fid,)).fetchone()
+            if h is not None:
+                pst = str(h["state"] or "")
+                words = str(h["words"] or "")
+                v = hardsub.verdict_for({
+                    "state": pst, "low_hits": h["low_hits"],
+                    "samples": h["samples"], "words": words,
+                    "path": u.get("path") or ""})
+                score = int(v.get("score") or 0)
+        except Exception:                                        # noqa: BLE001
+            score, words, pst = 0, "", ""
+        out.append({
+            "id": f"{fid}:{RAW}",
+            "file_id": fid, "source": RAW,
+            "source_word": "the raw check",
+            "path": u.get("path") or "", "label": u.get("label") or "",
+            "library": u.get("library") or "",
+            "kind": pst, "chosen": False,
+            "kinds": [{"id": k, "word": hardsub.KIND_WORDS[k]}
+                      for k in hardsub.KINDS],
+            "sure": score, "read": bool(pst), "unread": False,
+            "evidence": words, "why": why,
+            "auto": "ask", "auto_why": "nothing has read this file; yours to call",
+            "action": "replace",
+            "action_word": "Blocklist & re-download",
+            "done": False, "done_word": "",
+            "detail": why, "added": 0.0, "found_at": float(u.get("at") or 0.0),
+            "raw": True, "raw_why": why, "raw_rule": rule,
+        })
+    return out
+
+
 def _queued_steps() -> dict:
     r"""{file_id: {"retitle": {track, ...}, "mark": set()}} for live queue rows.
 
@@ -740,12 +824,18 @@ def findings(limit: int = 600, want_done: bool = True,
     """
     from . import hardsub, subtitletitle as stt
     rows = _picture_rows(limit) + _track_rows(limit)
+    rows += _raw_rows(rows)
     lo, hi = dismiss_at(), mark_at()
     mid = (lo + hi) / 2.0
     # LEAST CERTAIN FIRST among the rows that can be answered; the unread
     # ones sit behind them because nothing can be pressed on an unread row,
     # and the done ones last because they are answered already.
+    # A FILE NOTHING HAS READ IS THE LEAST CERTAIN OF ALL. The raw-only rows
+    # carry no score, and sorting them by distance from the middle put them
+    # at the bottom of the board under hundreds of rows that at least had a
+    # reading. They are the ones a person has to decide, so they go first.
     rows.sort(key=lambda r: (bool(r["done"]), bool(r["unread"]),
+                             r.get("source") != RAW,
                              abs(r["sure"] - mid)))
     # A QUESTION YOU HAVE ALREADY ANSWERED IS NOT A QUESTION.
     #
@@ -796,7 +886,10 @@ def findings(limit: int = 600, want_done: bool = True,
         "queue": queue(),
         "counts": {
             "picture": sum(1 for r in rows if r["source"] == PICTURE),
-            "tracks": sum(1 for r in rows if r["source"] != PICTURE),
+            "tracks": sum(1 for r in rows if r["source"] not in (PICTURE, RAW)),
+            # The raw check's open questions on this board - tagged onto a
+            # picture row or standing on their own.
+            "raw": sum(1 for r in rows if r.get("raw") and not r["done"]),
             "unread": sum(1 for r in rows if r["unread"]),
             "band": sum(1 for r in rows if r["auto"] == "ask"
                         and not r["unread"] and not r["done"]),
