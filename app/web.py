@@ -37945,23 +37945,45 @@ function scoreTable(){
       // inside the file, but whether anybody here can follow it. It is the
       // score behind Blocklist & re-download.
       const R=d.raw; if(!R||!(R.rows||[]).length) return '';
+      // AND WHAT THE ANSWERS SAY ABOUT EACH TERM. Pressing Blocklist &
+      // re-download is a person saying "nothing here I can read" about a
+      // file this scorer had already put a number on, so the two can be
+      // compared; a file it accused that a later read settles as fine is
+      // the same comparison the other way. Shown beside the weight, never
+      // folded into it - a term that has drifted is for a person to move.
+      const L=(R.learned||{}), LT=(L.terms||{});
+      const hit=x=>{ const h=LT[x.key]; if(!h||!h.n) return '';
+        const pc=Math.round(100*h.raw/h.n);
+        const col=pc>=80?'#7fd18c':(pc>=50?'#e8a33d':'var(--bad,#e05252)');
+        return `<div style="font-size:10.5px;margin-top:1px">
+          <span style="color:${col};font-weight:600">${pc}%</span>
+          <span class="dim">of the ${fmt(h.n)} answered files it fired on
+            really were raws</span></div>`; };
       const pts=(R.rows||[]).map(x=>`<tr style="border-top:1px solid var(--line)">
         <td style="padding:3px 8px 3px 0;text-align:right;white-space:nowrap;
                    color:#e8a33d;font-weight:600">+${x.points}</td>
         <td style="padding:3px 8px 3px 0">${esc(x.what||'')}
           ${x.measured?`<div class="dim" style="font-size:10.5px">${esc(x.measured)}</div>`:''}
+          ${hit(x)}
         </td></tr>`).join('');
       const vd=(R.voids||[]).map(x=>`<tr style="border-top:1px solid var(--line)">
         <td style="padding:3px 8px 3px 0;text-align:right;white-space:nowrap;
                    color:#7fd18c;font-weight:600">&times;${x.mult}</td>
         <td style="padding:3px 8px 3px 0">${esc(x.what||'')}
           ${x.measured?`<div class="dim" style="font-size:10.5px">${esc(x.measured)}</div>`:''}
+          ${hit(x)}
         </td></tr>`).join('');
       return sec('Whether anybody here can follow it', R.how, pts+vd,
         'the score behind Blocklist &amp; re-download. Points in '
         +'<span style="color:#e8a33d">amber</span> argue that it is a raw; the '
         +'<span style="color:#7fd18c">green</span> multipliers are refusals - '
-        +'evidence nobody has gathered yet cannot count as evidence against the file');
+        +'evidence nobody has gathered yet cannot count as evidence against the file'
+        +(L.answers
+          ? `. <b>${fmt(L.answers)} answered so far</b> — ${fmt(L.raw)} confirmed`
+            + ` raw (${fmt(L.by_you)} by you) and ${fmt(L.not_raw)} proved wrong`
+            + ` by a later read`
+          : '. Nothing has been answered yet — pressing Blocklist &amp;'
+            + ' re-download is what teaches this one'));
     })()}
     <div class="dim" style="font-size:10.5px;margin-top:9px;padding-top:7px;
          border-top:1px solid var(--line)">

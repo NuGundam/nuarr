@@ -1153,6 +1153,14 @@ def check_one(file_id: int, cur=None) -> dict:
             return {"ok": True, "checked": 0}
         facts = cur.execute("SELECT * FROM sub_facts WHERE file_id=?",
                             (int(file_id),)).fetchone()
+        # WHAT THIS CHECK THOUGHT BEFORE THIS PASS. If it was accusing the
+        # file, or could not decide, and the reading that has just landed
+        # settles it as fine, that is the scorer being WRONG about a real
+        # file - the most useful answer there is, and nobody had to press
+        # anything for it. Kept below, once the new verdict is known.
+        was = cur.execute("SELECT state, rule, sure FROM sub_need "
+                          " WHERE file_id=? ORDER BY state LIMIT 1",
+                          (int(file_id),)).fetchone()
         untagged = _keeps_untagged(lib)
         now = time.time()
         out = {}
@@ -1165,6 +1173,18 @@ def check_one(file_id: int, cur=None) -> dict:
                             str(row["path"] or ""),
                             float(row["duration"] or 0) / 60.0)
             out[lang] = st
+            if (was and str(was["state"] or "") in (MISSING, UNKNOWN)
+                    and st == OK and str(was["rule"] or "") != "unread"):
+                try:
+                    rs = raw_score(file_id, lang, cur, facts, None,
+                                   str(row["path"] or ""),
+                                   float(row["duration"] or 0) / 60.0)
+                    record_answer(file_id, "not_raw", "a read",
+                                  str(was["rule"] or ""), int(was["sure"] or 0),
+                                  rs.get("terms") or [], str(row["path"] or ""))
+                except Exception:                                # noqa: BLE001
+                    pass
+                was = None
             cur.execute(
                 "INSERT INTO sub_need(file_id,lang,library,state,why,"
                 "                     checked_at,rule,sure)"
@@ -1388,7 +1408,12 @@ RAW_VOID = {
 
 def raw_score(file_id: int, lang: str, cur, facts=None, pic=None,
               path: str = "", minutes: float = 0.0) -> dict:
-    """How sure is this file a raw, 0-100, and the sentence explaining it."""
+    """How sure is this file a raw, 0-100, and the sentence explaining it.
+
+    It also returns WHICH terms fired, by their RAW_POINTS/RAW_VOID key. The
+    sentence is for a person; the keys are for the learning below, which
+    cannot measure a term it cannot tell apart from the prose around it.
+    """
     lang = (lang or "").lower()[:3]
     if facts is None:
         facts = cur.execute("SELECT * FROM sub_facts WHERE file_id=?",
@@ -1455,15 +1480,19 @@ def raw_score(file_id: int, lang: str, cur, facts=None, pic=None,
         return {"score": 0, "picture": 0, "call": "",
                 "why": f"the audio is in {lang} - this is not a raw, whatever "
                        f"else is missing from it"}
+    terms: list = []
     if heard:
+        terms.append("heard")
         pts += RAW_POINTS["heard"]
         why.append(f"Whisper heard {'/'.join(sorted(heard))} and nothing in "
                    f"{lang}")
     elif tagged:
+        terms.append("tagged")
         pts += RAW_POINTS["tagged"]
         why.append(f"the audio is tagged {'/'.join(sorted(tagged))}, though "
                    f"nobody has listened to it")
     if meta and meta != lang and (meta in heard or not heard):
+        terms.append("meta")
         pts += RAW_POINTS["meta"]
         why.append(f"the metadata calls it {meta} too")
 
@@ -1471,12 +1500,15 @@ def raw_score(file_id: int, lang: str, cur, facts=None, pic=None,
     mine = [t for t in tracks
             if str(t.get("lang") or "").lower()[:3] == lang]
     if not tracks:
+        terms.append("no_track")
         pts += RAW_POINTS["no_track"]
         why.append("no subtitle track at all")
     elif not mine:
+        terms.append("other_lang")
         pts += RAW_POINTS["other_lang"]
         why.append(f"{len(tracks)} subtitle track(s), none of them {lang}")
     else:
+        terms.append("signs_only")
         pts += RAW_POINTS["signs_only"]
         why.append(f"its only {lang} track is signs or forced")
 
@@ -1484,6 +1516,7 @@ def raw_score(file_id: int, lang: str, cur, facts=None, pic=None,
     prow = _picture(file_id, cur, pic)
     call, score = "", 0
     if prow is None:
+        terms.append("unread_pic")
         pts *= RAW_VOID["unread_pic"]
         why.append("but nobody has looked at the picture")
     else:
@@ -1499,17 +1532,21 @@ def raw_score(file_id: int, lang: str, cur, facts=None, pic=None,
         except Exception:                                        # noqa: BLE001
             call = ""
         if score == 0:
+            terms.append("pic_zero")
             pts += RAW_POINTS["pic_zero"]
             why.append("the picture reader read the frames and got nothing")
         elif call == "dismiss":
+            terms.append("pic_low")
             pts += RAW_POINTS["pic_low"]
             why.append(f"the picture scores {score}%, under its throw-away line")
         elif call == "ask":
+            terms.append("pic_band")
             pts *= RAW_VOID["pic_band"]
             why.append(f"but the picture scores {score}%, between the reader's "
                        f"own lines - it is not sure")
 
     if not heard and not tagged:
+        terms.append("unheard")
         pts *= RAW_VOID["unheard"]
         why.append("and nobody has listened to the audio")
 
@@ -1519,12 +1556,104 @@ def raw_score(file_id: int, lang: str, cur, facts=None, pic=None,
     except Exception:                                            # noqa: BLE001
         yes, b, n = False, 0, 0
     if yes:
+        terms.append("show_burned")
         pts *= RAW_VOID["show_burned"]
         why.append(f"and {b} of the {n} episodes of this show that have been "
                    f"settled carry burned-in dialogue")
 
     return {"score": int(max(0, min(100, round(pts)))),
-            "why": "; ".join(why), "picture": score, "call": call}
+            "why": "; ".join(why), "picture": score, "call": call,
+            "terms": terms}
+
+
+# ---------------------------------------------------- what the answers say --
+# EVERY ANSWER IS A MEASUREMENT OF THE SCORER THAT ASKED.
+#
+# Erik: "can the blocklist & re-download add to learning logic too". It can,
+# and it is the only thing on this panel that can. Pressing it is a person
+# saying "yes - there is nothing here I can read", about a file the scorer
+# had already given a number to, so the two can be compared. The other half
+# arrives on its own: a file this check accused, or could not decide, that a
+# later READ settles as fine is the same comparison with the opposite answer
+# - and it needs no button at all.
+#
+# Both are stored with the terms that fired at the time, so the panel can say
+# "the tag alone fired on 41 answered files and 29 of them really were raws"
+# beside the 30 points the tag is worth.
+#
+# WHAT THIS DOES NOT DO: move the weights. Same reason as the other panel -
+# a score that changed itself overnight is one nobody can reason about. The
+# hit rate is there to tell you when a weight has drifted far enough to be
+# worth changing by hand.
+def learn_init() -> None:
+    with cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS raw_answers(
+                file_id INTEGER PRIMARY KEY,
+                at      REAL,
+                said    TEXT,      -- raw | not_raw
+                by      TEXT,      -- you | a read
+                rule    TEXT,
+                score   INTEGER,
+                terms   TEXT,
+                path    TEXT
+            )""")
+
+
+def record_answer(file_id: int, said: str, by: str, rule: str = "",
+                  score: int = 0, terms=None, path: str = "") -> None:
+    """One answer about one file, with the scorer's state at the time."""
+    try:
+        learn_init()
+        with cursor() as cur:
+            cur.execute(
+                "INSERT INTO raw_answers(file_id,at,said,by,rule,score,terms,"
+                "                        path) VALUES(?,?,?,?,?,?,?,?) "
+                " ON CONFLICT(file_id) DO UPDATE SET at=excluded.at, "
+                " said=excluded.said, by=excluded.by, rule=excluded.rule, "
+                " score=excluded.score, terms=excluded.terms",
+                (int(file_id), time.time(), said, by, rule, int(score or 0),
+                 json.dumps(list(terms or [])), path))
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+_LEARN: dict = {"at": 0.0, "data": None}
+_LEARN_TTL = 120.0
+
+
+def learned(fresh: bool = False) -> dict:
+    """Per term: how many answered files it fired on, and how many of those
+    really were raws. Counted now, held two minutes."""
+    now = time.time()
+    if not fresh and _LEARN["data"] and now - _LEARN["at"] < _LEARN_TTL:
+        return _LEARN["data"]
+    hit: dict = {}
+    n_raw = n_not = 0
+    try:
+        learn_init()
+        with cursor() as cur:
+            rows = cur.execute("SELECT said, by, score, terms "
+                               "  FROM raw_answers").fetchall()
+    except Exception:                                            # noqa: BLE001
+        rows = []
+    for r in rows:
+        was_raw = str(r["said"] or "") == "raw"
+        n_raw += 1 if was_raw else 0
+        n_not += 0 if was_raw else 1
+        try:
+            ts = json.loads(r["terms"] or "[]")
+        except Exception:                                        # noqa: BLE001
+            ts = []
+        for k in ts:
+            d = hit.setdefault(str(k), {"n": 0, "raw": 0})
+            d["n"] += 1
+            d["raw"] += 1 if was_raw else 0
+    out = {"terms": hit, "answers": n_raw + n_not, "raw": n_raw,
+           "not_raw": n_not, "by_you": sum(
+               1 for r in rows if str(r["by"] or "") == "you"), "at": now}
+    _LEARN.update(at=now, data=out)
+    return out
 
 
 def _sure_of(state: str, rule: str, file_id: int, lang: str, cur,
@@ -1554,7 +1683,9 @@ def raw_scoring() -> dict:
     """The terms, their weights and what each was measured on - for the
     panel, read out of this module so the two cannot drift."""
     P, V = RAW_POINTS, RAW_VOID
+    L = learned()
     return {
+        "learned": L,
         "how": ("A raw is a film nobody here can follow, and this is how sure "
                 "of that nuarr is about one file. The two big terms are the "
                 "two halves of the question - is it foreign, and is there "
@@ -1562,55 +1693,55 @@ def raw_scoring() -> dict:
                 "not doubts, they are refusals: evidence nobody has gathered "
                 "yet cannot be counted as evidence that the file is bad."),
         "rows": [
-            {"points": P["heard"], "what": "Whisper heard a language the "
+            {"key": "heard", "points": P["heard"], "what": "Whisper heard a language the "
              "library does not keep",
              "measured": "the listener's own verdict, and the strongest thing "
                          "here: of the 269 files this check is accusing or "
                          "cannot decide, it has heard 259, and 219 of those "
                          "at 0.90 confidence or better"},
-            {"points": P["tagged"], "what": "only the audio TAG says it is "
+            {"key": "tagged", "points": P["tagged"], "what": "only the audio TAG says it is "
              "foreign",
              "measured": "worth less than hearing it, because a tag is a "
                          "claim - a file tagged eng whose audio is really "
                          "Japanese is the failure the listener exists for"},
-            {"points": P["meta"], "what": "and the metadata's original "
+            {"key": "meta", "points": P["meta"], "what": "and the metadata's original "
              "language agrees",
              "measured": "two independent readings of one question. They "
                          "agree on 266 of the 269; it is a small term "
                          "because the metadata describes the SHOW, and 14,196 "
                          "files here are English dubs of Japanese originals"},
-            {"points": P["no_track"], "what": "no subtitle track at all",
+            {"key": "no_track", "points": P["no_track"], "what": "no subtitle track at all",
              "measured": "211 of the 269. Nothing to read, and nothing nuarr "
                          "can do to the bytes that produces one"},
-            {"points": P["signs_only"], "what": "only signs or forced tracks",
+            {"key": "signs_only", "points": P["signs_only"], "what": "only signs or forced tracks",
              "measured": "12 of the 269. Signs translate a shop front and "
                          "leave the conversation alone"},
-            {"points": P["other_lang"], "what": "subtitle tracks, but none in "
+            {"key": "other_lang", "points": P["other_lang"], "what": "subtitle tracks, but none in "
              "a language you asked for",
              "measured": "46 of the 269 - a Spanish and a Portuguese track on "
                          "a Japanese film is no help to this house"},
-            {"points": P["pic_zero"], "what": "the picture reader read the "
+            {"key": "pic_zero", "points": P["pic_zero"], "what": "the picture reader read the "
              "frames and got nothing",
              "measured": "180 of the 269 score 0%. It sampled 24 frames, ran "
                          "the OCR and recovered no words"},
-            {"points": P["pic_low"], "what": "or scored them under its own "
+            {"key": "pic_low", "points": P["pic_low"], "what": "or scored them under its own "
              "throw-away line",
              "measured": "something was read and it was not language"},
         ],
         "voids": [
-            {"mult": V["unread_pic"], "what": "nobody has looked at the "
+            {"key": "unread_pic", "mult": V["unread_pic"], "what": "nobody has looked at the "
              "picture",
              "measured": "47 of the 269. The dialogue may be painted into "
                          "every frame and no one has checked"},
-            {"mult": V["unheard"], "what": "nobody has listened to the audio",
+            {"key": "unheard", "mult": V["unheard"], "what": "nobody has listened to the audio",
              "measured": "10 of the 269. What is spoken is the first half of "
                          "the question and it is unanswered"},
-            {"mult": V["pic_band"], "what": "the picture reader is between "
+            {"key": "pic_band", "mult": V["pic_band"], "what": "the picture reader is between "
              "its own two lines",
              "measured": "32 of the 269. When the scorer that reads pictures "
                          "says it is unsure, this one has no business being "
                          "sure"},
-            {"mult": V["show_burned"], "what": "the rest of the show carries "
+            {"key": "show_burned", "mult": V["show_burned"], "what": "the rest of the show carries "
              "burned-in dialogue",
              "measured": "the strongest refusal there is. Detective Conan "
                          "scores 0% on the picture and 455 of its settled "
@@ -2187,6 +2318,29 @@ def answered(file_id: int) -> None:
     When the replacement lands, remedy.reconsider() judges it from scratch.
     """
     init()
+    # WHAT THE SCORER SAID, BEFORE THE EVIDENCE GOES. The row is about to be
+    # deleted and the file after it, so the only moment this answer can be
+    # kept is now. See learn_init.
+    try:
+        with cursor() as cur:
+            r = cur.execute("SELECT n.lang, n.rule, n.sure, f.path, f.duration "
+                            "  FROM sub_need n JOIN files f ON f.id=n.file_id "
+                            " WHERE n.file_id=? ORDER BY n.state LIMIT 1",
+                            (int(file_id),)).fetchone()
+            terms = []
+            if r:
+                try:
+                    terms = raw_score(int(file_id), str(r["lang"] or ""), cur,
+                                      path=str(r["path"] or ""),
+                                      minutes=float(r["duration"] or 0) / 60.0
+                                      ).get("terms") or []
+                except Exception:                                # noqa: BLE001
+                    terms = []
+        if r:
+            record_answer(int(file_id), "raw", "you", str(r["rule"] or ""),
+                          int(r["sure"] or 0), terms, str(r["path"] or ""))
+    except Exception:                                            # noqa: BLE001
+        pass
     try:
         with cursor() as cur:
             cur.execute("DELETE FROM sub_need WHERE file_id=?", (int(file_id),))
