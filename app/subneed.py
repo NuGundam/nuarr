@@ -420,11 +420,11 @@ RULE_ORDER = (
     "unread", "noread",                       # nobody has looked
     "track", "side", "marker", "mislabelled",  # a subtitle, and a real one
     "untagged",                                # might be the one
-    "nopic", "burned", "scored", "ocr_trans",  # what the picture says
-    "show_burned",                             # what the rest of the show says
-    "marks", "noframes", "stale",
-    "signs_unread",                            # signs, or not? unread
+    "burned", "scored", "ocr_trans",           # what the picture can clear
     "spoken",                                  # you can follow it anyway
+    "signs_unread",                            # signs, or not? go and read it
+    "nopic", "show_burned",                    # and the shields
+    "marks", "noframes", "stale",
     "signs_only", "missing",                   # the two that accuse
 )
 assert set(RULE_ORDER) == set(RULES), "a rung is defined but never tried"
@@ -1035,6 +1035,36 @@ def verdict(file_id: int, lang: str, cur, facts=None,
                    f"is {said} - the conversation needs no translation")
         return WANT, why, "spoken"
 
+    # ---- AN UNREAD TRACK IS A SECOND OF WORK, NOT A REASON TO PARK ---------
+    #
+    # This test used to sit at the bottom, under every picture shield, and
+    # that put the two questions in the wrong order. Drug Store in Another
+    # World is twelve identical files - one forced ASS track named
+    # "English", no cue count in the header - and they came out three
+    # different ways purely on what their PICTURES happened to score:
+    #
+    #     E10  picture 13/24, scorer said dismiss  -> signs_unread, read,
+    #                                                 361 lines, cleared
+    #     E04  picture 19/24, scorer said ask      -> marks, parked for ever
+    #     E05  picture 14/24, scorer said ask      -> marks, parked for ever
+    #
+    # The `marks` rung is a shield against a false accusation, and it was
+    # shielding the file from being LOOKED AT. Nothing could get past it to
+    # notice there was an unread track, so unread_tracks never saw them, so
+    # the reader never read them, so the picture stayed the only evidence -
+    # and Erik pressed Read again on three of them and nothing happened.
+    #
+    # Reading the track costs one mkvextract. If it comes back as dialogue
+    # the picture does not matter at all, and if it comes back as signs the
+    # shields below are all still there. So it is asked first.
+    if mine and not any(_speech_rate(t, minutes) > 0
+                        or read_rate(file_id, int(t.get("ord") or 0), minutes)
+                        > 0 for t in mine):
+        return UNKNOWN, (
+            f"its only {lang} track claims to be signs and the container "
+            f"does not say how many lines it has, so it is queued to be "
+            f"read rather than guessed at"), "signs_unread"
+
     # ---- FROM HERE ON A FILE CAN BE ACCUSED ---------------------------------
     if prow is None:
         return UNKNOWN, ("the picture reader has not looked at this file, so "
@@ -1085,16 +1115,13 @@ def verdict(file_id: int, lang: str, cur, facts=None,
            f"own throw-away line" if call == "dismiss" else
            "nothing readable in the picture")
     if mine:
+        # Every track here has a rate by now - the unread ones were sent to
+        # be read above, before any shield could hide them.
         rates = [r for r in
                  (_speech_rate(t, minutes)
                   or read_rate(file_id, int(t.get("ord") or 0), minutes)
                   for t in mine) if r > 0]
-        if not rates:
-            return UNKNOWN, (
-                f"its only {lang} track claims to be signs and the container "
-                f"does not say how many lines it has, so it is queued to be "
-                f"read rather than guessed at"), "signs_unread"
-        rate = min(rates)
+        rate = min(rates) if rates else 0.0
         return MISSING, (
             f"its only {lang} track is signs and songs, {rate:.1f} lines a "
             f"minute - the conversation is not translated; {pic}; and the "

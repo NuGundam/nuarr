@@ -715,6 +715,24 @@ def subread_one(reader: str, row: dict, on_stage=None) -> dict:
     if r.get("ok"):
         r["why"] = ("signs after all - cleared" if r.get("cleared")
                     else "the events say dialogue - it stays on the list")
+        # AND TELL THE RAW CHECK, WHICH ASKED FOR THIS READ.
+        #
+        # Its signs_unread rung is the reason half these reads happen: a
+        # forced track whose container reports no cue count is a sign sheet
+        # and a full script at the same time, and only the events separate
+        # them. The events land here - and the verdict went on saying "the
+        # container does not say how many lines it has" until the next
+        # sweep came round, which on a 40,000-file library is minutes. Three
+        # Drug Store episodes sat at that sentence with the answer already
+        # in subtitle_shape.
+        #
+        # Re-judging one file is a handful of reads and it closes the loop
+        # where it was opened.
+        try:
+            from . import subneed as _sn
+            _sn.check_one(int(row.get("file_id") or 0))
+        except Exception:                                        # noqa: BLE001
+            pass
     return r
 
 
