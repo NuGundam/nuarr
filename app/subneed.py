@@ -297,12 +297,17 @@ RULES: dict = {
                  "here already means the language is not in the audio, so "
                  "English on the screen is English the audio does not have - "
                  "which is what a translation subtitle is."},
-    "ocr_one": {
-        "says": UNKNOWN, "short": "one word off the screen",
-        "line": "a single English word was read off the picture",
-        "rests": "one function word is a shop sign as easily as a subtitle. "
-                 "Not enough to clear the file and far too much to accuse "
-                 "it."},
+    "scored": {
+        "says": OK, "sure": 90, "short": "the picture reader scores it burned-in",
+        "line": "the picture reader's own score puts it past its act line",
+        "rests": "\"What each file actually carries\" scores every picture "
+                 "from the words it read, the function words among them and "
+                 "how much of the runtime carried text, against the odds for "
+                 "that kind of file. Past its act line it marks the file "
+                 "itself. Measured when this went in: 62 files sat at "
+                 "undecided here while that scorer had them at 85% or "
+                 "better - the stored verdict was written before the scorer "
+                 "was refined, and the mark had not caught up."},
     "show_burned": {
         "says": OK, "sure": 85, "short": "the rest of the show is burned-in",
         "line": "its picture shows marks nobody could read, and most of this "
@@ -316,13 +321,16 @@ RULES: dict = {
                  "Ninja Turtles. Replayed over the 315 pictures a person "
                  "settled by hand it clears 291 and disagrees once."},
     "marks": {
-        "says": UNKNOWN, "short": "marks it could not read",
-        "line": "there are subtitle-shaped marks it could not transcribe",
-        "rests": f"marks low in the picture in {int(PICTURE_MARKS_RATIO*100)}% "
-                 "of sampled frames or more, and not one readable word - "
-                 "which is what an SDTV-era hardsub looks like to an OCR "
-                 "trained on clean type. Treating it as a clean picture put "
-                 "126 of 146 files on a list offering to delete them."},
+        "says": UNKNOWN, "short": "the picture reader is unsure",
+        "line": "the picture reader's own score sits between its two lines",
+        "rests": "Erik: \"system 1 already does most of the work and is very "
+                 "refined now\". So this check no longer keeps its own "
+                 "opinion about marks the OCR could not read - it asks "
+                 "\"What each file actually carries\" for its score and takes "
+                 "the same three-way call that scorer makes for itself. Past "
+                 "the act line the file is cleared; at or under the "
+                 "throw-away line it is a raw; only in between does it wait, "
+                 "and it waits for the same reason that scorer waits."},
     "noframes": {
         "says": UNKNOWN, "short": "no frames sampled",
         "line": "the picture reader has no frames for this file",
@@ -395,11 +403,12 @@ RULES: dict = {
         "line": "a raw - spoken in a language you have not got, with "
                 "nothing to read",
         "rests": "every rung above had its say first. No dialogue track, "
-                 "no file beside it, nothing in the picture, and the audio is "
-                 "in a language this library was not asked to keep. Nothing "
-                 "nuarr can do to these bytes produces a subtitle, so the "
-                 "only fix is a different release - which is why this is the "
-                 "one rung with a button."},
+                 "no file beside it, the picture reader's own score at or "
+                 "under its throw-away line, and the audio in a language "
+                 "this library was not asked to keep. Nothing nuarr can do "
+                 "to these bytes produces a subtitle, so the only fix is a "
+                 "different release - which is why this is the one rung with "
+                 "a button."},
 }
 
 # THE ORDER THE LADDER IS ACTUALLY TRIED IN, written out rather than taken
@@ -411,7 +420,7 @@ RULE_ORDER = (
     "unread", "noread",                       # nobody has looked
     "track", "side", "marker", "mislabelled",  # a subtitle, and a real one
     "untagged",                                # might be the one
-    "nopic", "burned", "ocr_trans", "ocr_one",  # what the picture says
+    "nopic", "burned", "scored", "ocr_trans",  # what the picture says
     "show_burned",                             # what the rest of the show says
     "marks", "noframes", "stale",
     "signs_unread",                            # signs, or not? unread
@@ -876,50 +885,71 @@ def verdict(file_id: int, lang: str, cur, facts=None,
     # So `none` is only evidence of a clean picture when the FRAME COUNTS
     # agree. Above the line, the picture question is unresolved and the file
     # goes to `unknown` with the rest of what nuarr does not know.
-    # ---- WHAT THE PICTURE CAN SAY, IN TWO HALVES --------------------------
+    # ---- WHAT THE PICTURE SAYS, AS SYSTEM 1 SCORES IT ---------------------
     #
-    # The picture reader answers two different kinds of question and they
-    # belong on opposite sides of the quiet answer below. It can CLEAR a
-    # file - the dialogue is burned in, or it OCRed English off the screen -
-    # and that is a subtitle, so it is asked first. It can also refuse to
-    # rule anything out, and those refusals exist to stop a FALSE
-    # ACCUSATION. A file nobody is going to accuse does not need them.
+    # Erik: "system 2 should change its logic and should be a placeholder
+    # for system 1 - foreign media that comes up at or near 0%. System 1
+    # already does most of the work and it is very refined now, so system 2
+    # can be where foreign media gets manual/auto replaced."
     #
-    # Ordering them together cost 2,002 files: with every shield above the
-    # quiet answer, an English-language episode with no subtitle track fell
-    # into "the picture reader saw marks it could not read" and sat at
-    # undecided for ever, when the true answer was "the audio is English,
-    # you can follow it".
+    # This check used to keep its own opinion about the picture: marks the
+    # OCR could not read meant "undecided", whatever the scorer thought of
+    # them. That rule was written for a cruder reader and it outlived it.
+    # Measured on the 284 undecided files with a picture reading:
+    #
+    #     187  the scorer had at or under its throw-away line
+    #      62  the scorer had at or ABOVE its act line - burned-in dialogue,
+    #          waiting only for the mark to catch up
+    #      31  the scorer was unsure
+    #
+    # Sixty-two files sat at "marks it could not read" while the other
+    # panel was ready to mark them. Two opinions about one picture, and the
+    # better-informed one was being ignored.
+    #
+    # So this takes the scorer's own three-way call - act, dismiss, ask -
+    # and does exactly what it would do: past the act line the file is
+    # cleared, at or under the throw-away line it is a raw, and only in
+    # between does it wait.
     prow = _picture(file_id, cur, pic)
-    hits: list = []
-    words = ""
     pstate = ""
+    words = ""
+    call, score = "", 0
     if prow is not None:
         pstate = str((prow["chosen"] if "chosen" in prow.keys() else None)
                      or prow["state"] or "")
-        # `signs` is deliberately not on this list. Signs and songs are not
-        # dialogue, and a file carrying only those still needs subtitles.
-        if pstate in ("dialogue", "hybrid"):
-            return OK, "the dialogue is burned into the picture", "burned"
         try:
             if "words" in prow.keys():
                 words = str(prow["words"] or "").strip()
         except Exception:                                    # noqa: BLE001
             words = ""
-        hits = _english_hits(words) if _is_english(lang) else []
+        # `signs` is deliberately not on this list. Signs and songs are not
+        # dialogue, and a file carrying only those still needs subtitles.
+        if pstate in ("dialogue", "hybrid"):
+            return OK, "the dialogue is burned into the picture", "burned"
+        chosen = str(prow["chosen"] if "chosen" in prow.keys() else "") or ""
+        if chosen in ("none", "signs"):
+            # A person looked and said there is nothing to read here. That
+            # is the scorer's throw-away call, made by hand.
+            call = "dismiss"
+        else:
+            try:
+                from . import hardsub as _hs
+                _v = _hs.verdict_for({
+                    "state": str(prow["state"] or ""),
+                    "low_hits": prow["low_hits"], "samples": prow["samples"],
+                    "words": words, "path": path})
+                call = str(_v.get("auto") or "")
+                score = int(_v.get("score") or 0)
+            except Exception:                                # noqa: BLE001
+                call = ""
+        if call == "mark":
+            return OK, (f"the picture reader scores the frames at {score}% - "
+                        f"burned-in dialogue it has not marked yet"), "scored"
 
+    hits = _english_hits(words) if _is_english(lang) else []
     got = [w for w in (x.strip() for x in words.split(",")) if w]
     shown = ", ".join(got[:8]) + ("..." if len(got) > 8 else "")
 
-    # HEARD ONE LANGUAGE, SAW ANOTHER - a translation subtitle.
-    #
-    # Velvet, The New Empire is the case: Spanish audio, and the picture
-    # reader returning "are, barbara, doing, here, what, you". Both readings
-    # were already stored; this only compares them. Measured over the 23
-    # accused files that had any words at all, the thirteen real ones scored
-    # 1,2,2,2,2,2,2,3,4,4,4,6 and the ten noise ones scored zero: a shop sign
-    # does not produce English function words and a chyron does not produce
-    # several.
     spoken = _audio_langs(file_id, cur)
     if not spoken:
         # NOTHING HEARD AND NOTHING TAGGED - 536 files here. The metadata's
@@ -937,6 +967,9 @@ def verdict(file_id: int, lang: str, cur, facts=None,
     said = "/".join(sorted(x for x in spoken
                            if x and x not in ("und", "un"))) or "not " + lang
 
+    # HEARD ONE LANGUAGE, SAW ANOTHER - a translation subtitle. Velvet, The
+    # New Empire: Spanish audio, and the picture reader returning "are,
+    # barbara, doing, here, what, you". Two function words to decide.
     if len(hits) >= 2 and not heard_it:
         return OK, (f"the audio is {said} and the picture reader OCRed "
                     f"English off the screen - {shown} - so the English is "
@@ -953,51 +986,34 @@ def verdict(file_id: int, lang: str, cur, facts=None,
     # can already follow.
     if heard_it:
         why = f"the audio is {said}, so nothing here is untranslatable"
-        n_now = len([t for t in tracks
-                     if str(t.get("lang") or "").lower()[:3] == lang])
-        if n_now:
+        if mine:
             why = (f"its only {lang} track is signs and songs, but the audio "
                    f"is {said} - the conversation needs no translation")
         return WANT, why, "spoken"
 
-    # ---- FROM HERE ON A FILE CAN BE ACCUSED, SO THE SHIELDS APPLY ---------
+    # ---- FROM HERE ON A FILE CAN BE ACCUSED ---------------------------------
     if prow is None:
         return UNKNOWN, ("the picture reader has not looked at this file, so "
                          "burned-in subtitles cannot be ruled out"), "nopic"
-    if hits:
-        # UNKNOWN and not OK: one function word is a shop sign as easily as a
-        # subtitle, and `dialogue`/`hybrid` above is where the picture reader
-        # says it is really dialogue. This only says burned-in subtitles
-        # cannot be ruled out, which is true, and takes the file off the
-        # delete list. 27 of the 80 once accused had words the OCR had
-        # already read, 9 of them six words or more.
+    # THE REST OF THE SHOW OUTRANKS A DISMISSAL. The scorer reads Detective
+    # Conan at 0% - an SDTV-era hardsub the OCR cannot transcribe - and 455
+    # of its other episodes are settled as burned-in. Dropping this rung
+    # while deferring to the scorer put 45 of those episodes on the raw
+    # list in one dry run. See show_burns_in for the rule and its check
+    # against the answers.
+    yes, _b, _n = show_burns_in(path, cur)
+    if yes:
+        return OK, (
+            f"the picture reader scores the frames at {score}% and could "
+            f"read nothing - but {_b} of the {_n} episodes of this show it "
+            f"has settled carry burned-in dialogue, so these are the same "
+            f"subtitles it cannot transcribe"), "show_burned"
+    if call == "ask":
         return UNKNOWN, (
-            f"the picture reader OCRed English off the picture - {shown} - "
-            f"so there is English burned into this file whatever the frame "
-            f"counts say"), "ocr_one"
-
+            f"the picture reader scores the frames at {score}%, between its "
+            f"throw-away line and its act line - it is not sure, so neither "
+            f"is this"), "marks"
     n_s = int(prow["samples"] or 0)
-    n_lo = int(prow["low_hits"] or 0)
-    if n_s and (n_lo / n_s) >= PICTURE_MARKS_RATIO:
-        # THE REST OF THE SHOW GETS ASKED BEFORE THE FILE IS PARKED. See
-        # show_burns_in: marks nobody can read mean one thing in a show that
-        # is 87% burned-in and another in a show that is 0%.
-        yes, _b, _n = show_burns_in(path, cur)
-        if yes:
-            return OK, (
-                f"the picture reader found marks low in the picture in "
-                f"{n_lo} of {n_s} frames and could read none of them - and "
-                f"{_b} of the {_n} episodes of this show it has settled "
-                f"carry burned-in dialogue, so these are the same subtitles "
-                f"it cannot transcribe"), "show_burned"
-        # Two thirds of sampled frames with subtitle-shaped marks and not one
-        # word back is what an SDTV-era hardsub looks like to an OCR trained
-        # on clean type. Treating that as "no subtitles" put 126 of 146 files
-        # on a list offering to delete them.
-        return UNKNOWN, (
-            f"the picture reader found marks low in the picture in "
-            f"{n_lo} of {n_s} frames but could read none of them - burned-in "
-            f"subtitles it cannot transcribe look exactly like this"), "marks"
     if not n_s:
         return UNKNOWN, ("the picture reader has no frames for this file, so "
                          "burned-in subtitles cannot be ruled out"), "noframes"
@@ -1021,6 +1037,9 @@ def verdict(file_id: int, lang: str, cur, facts=None,
         pass
 
     # ---- NOTHING ANYWHERE, AND NOBODY CAN FOLLOW IT -----------------------
+    pic = (f"the picture reader scores the frames at {score}%, under its "
+           f"own throw-away line" if call == "dismiss" else
+           "nothing readable in the picture")
     if mine:
         if not any(_speech_rate(t, minutes) > 0 for t in mine):
             return UNKNOWN, (
@@ -1031,15 +1050,13 @@ def verdict(file_id: int, lang: str, cur, facts=None,
                    if _speech_rate(t, minutes) > 0)
         return MISSING, (
             f"its only {lang} track is signs and songs, {rate:.1f} lines a "
-            f"minute - the conversation is not translated, and the audio is "
-            f"{said}"), "signs_only"
+            f"minute - the conversation is not translated; {pic}; and the "
+            f"audio is {said}"), "signs_only"
 
     n = len(tracks) + len(sides)
-    why = ("carries no subtitles at all, and nothing in the picture"
-           if not n else
-           f"carries {n} subtitle(s), none of them {lang}, and nothing in "
-           f"the picture")
-    return MISSING, f"{why}, and the audio is {said}", "missing"
+    why = ("carries no subtitles at all" if not n else
+           f"carries {n} subtitle(s), none of them {lang}")
+    return MISSING, f"{why}; {pic}; and the audio is {said}", "missing"
 
 
 # -------------------------------------------------------------- the sweep ---
