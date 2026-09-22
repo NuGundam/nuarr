@@ -2868,6 +2868,21 @@ def api_arrban_add(kind: str = "release", value: str = "", why: str = ""):
     return r
 
 
+@app.post("/api/arrban/import")
+async def api_arrban_import(remove: int = 1, as_terms: int = 1):
+    """Move the arrs' release-profile must-not-contain lists into the bans.
+
+    remove=1 clears each list afterwards - the point of moving is to stop
+    keeping the same answer in two places.
+    """
+    from . import arrban
+    r = await arrban.import_release_profiles(delete_after=bool(remove),
+                                             as_terms=bool(as_terms))
+    if r.get("added") or r.get("deleted"):
+        await arrban.sync()
+    return r
+
+
 @app.post("/api/arrban/remove")
 def api_arrban_remove(id: int):
     from . import arrban
@@ -45153,8 +45168,8 @@ function banList(rb){
   const when=t=>t?new Date(t*1000).toLocaleDateString():'';
   const row=r=>`<div style="display:flex;gap:8px;align-items:center;padding:3px 9px;
       font-size:11px;border-top:1px solid var(--line);${r.enabled?'':'opacity:.45'}">
-      <span class="pill ${r.kind==='group'?'p-warn':'p-dim'}" style="flex:none;width:52px;
-        text-align:center">${r.kind}</span>
+      <span class="pill ${r.kind==='group'?'p-warn':(r.kind==='term'?'p-dim':'p-dim')}"
+        style="flex:none;width:52px;text-align:center">${r.kind}</span>
       <span class="mono" style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;
         white-space:nowrap" title="${esc(r.why||'')}">${esc(r.value)}</span>
       <span class="dim" style="flex:none;width:150px;overflow:hidden;text-overflow:ellipsis;
@@ -45171,20 +45186,26 @@ function banList(rb){
   return `<div style="margin-top:8px;border-top:1px solid var(--line);padding-top:8px">
     <div style="display:flex;gap:10px;align-items:center">
       <span style="font-size:11px;font-weight:600">Banned (${fmt(c.release||0)} release${
-        (c.release||0)===1?'':'s'}, ${fmt(c.group||0)} group${(c.group||0)===1?'':'s'}${
+        (c.release||0)===1?'':'s'}, ${fmt(c.group||0)} group${(c.group||0)===1?'':'s'}, ${
+        fmt(c.term||0)} term${(c.term||0)===1?'':'s'}${
         c.off?`, ${fmt(c.off)} switched off`:''})</span>
       <span style="margin-left:auto;display:flex;gap:6px;align-items:center">
         <select id="banKind" style="font-size:11px"><option value="release">release</option>
-          <option value="group">group</option></select>
+          <option value="group">group</option><option value="term">term</option></select>
         <input id="banValue" style="font-size:11px;width:260px"
                placeholder="release name or group, exactly as the indexer spells it">
         <button style="font-size:11px" onclick="banAdd()">Ban</button>
       </span>
     </div>
-    <div class="dim" style="font-size:11px;margin:3px 0 5px">A release is matched
-      however an indexer spells its dots, spaces and dashes; a group is matched
-      exactly. Pushed to the arrs within a minute of any change, and re-asserted
-      on the timer.</div>
+    <div class="dim" style="font-size:11px;margin:3px 0 5px">A <b>release</b> is
+      matched however an indexer spells its dots, spaces and dashes; a
+      <b>group</b> is matched exactly; a <b>term</b> is matched anywhere in the
+      name, which is what a release profile's "must not contain" did. Pushed to
+      the arrs within a minute of any change, and re-asserted on the timer.
+      <a href="#" onclick="banImport();return false">Take over the arrs'
+      release profiles</a> — moves every must-not-contain list here and clears
+      it there, so one list covers both apps and every tag rather than one app
+      and one tag.</div>
     <div style="max-height:260px;overflow:auto;border:1px solid var(--line);
          border-radius:6px;background:rgba(255,255,255,.02)">
       ${rows.length?rows.map(row).join('')
@@ -45194,6 +45215,23 @@ function banList(rb){
       strikes, not yet banned: ${strikes.map(x=>esc(x.grp)+' '+x.n+'/'+(rb.group_strikes||3)).join(' · ')}</div>`:''}
     <span id="banmsg" class="dim" style="font-size:11px"></span>
   </div>`;
+}
+async function banImport(){
+  if(!confirm('Move every "must not contain" list out of the Sonarr and Radarr '
+    +'release profiles and into this list, then clear them there?\n\n'
+    +'They become one list scored on every quality profile in both apps, '
+    +'rather than one app and one tag. A release profile that has nothing '
+    +'left is removed; one that also has required or preferred terms keeps '
+    +'those.')) return;
+  const m=document.getElementById('banmsg');
+  if(m) m.innerHTML='moving…';
+  let r={};
+  try{ r=await (await fetch('/api/arrban/import?remove=1',{method:'POST'})).json(); }
+  catch(e){ r={added:0, profiles:[String(e)]}; }
+  if(m) m.innerHTML=`<span class="ok">${fmt(r.added||0)} banned, ${
+    fmt(r.already||0)} already here</span> <span class="dim">${
+    esc((r.profiles||[]).join(' · '))}</span>`;
+  setTimeout(loadArrsTab, 900);
 }
 async function banAdd(){
   const k=document.getElementById('banKind'), v=document.getElementById('banValue');

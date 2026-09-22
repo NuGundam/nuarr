@@ -40,14 +40,22 @@ from . import joblog
 
 CF_RELEASES = "Nuarr: rejected releases"
 CF_GROUPS = "Nuarr: rejected groups"
+# A THIRD KIND, BECAUSE A RELEASE PROFILE HELD THREE. Erik's "must not
+# contain" lists were not all group names: ".arj", "sub es-ES", "KOR DUB"
+# and "/(XKsub)/i" are substrings and regexes, and a group specification
+# would quietly match none of them. A term is matched wherever it appears
+# in the name, which is exactly what a release profile did.
+CF_TERMS = "Nuarr: banned terms"
 SCORE = -10000
 GROUP_STRIKES = 3           # rejections from one group before the group is banned
 PER_FORMAT = 250            # release patterns per format before rolling over
 SYNC_DEBOUNCE_S = 45.0
 
-# Profiles to score on, when nothing is stored: every "Nu ..." profile and
-# every "Anime" one, which is all of Erik's. Editable per arr on the card.
-DEFAULT_PROFILE_RULE = re.compile(r"^(Nu\b|Anime\b)", re.I)
+# EMPTY MEANS EVERY PROFILE. It used to mean every "Nu ..." and "Anime"
+# one, which was this machine's profile names doing the job a setting
+# should do - and on any other install it silently scored nothing. Erik:
+# "can you just make it every Profile if not selected below".
+DEFAULT_PROFILE_RULE = None
 
 STATS: dict = {"last_run": 0.0, "last_result": "", "next_run": 0.0,
                "detail": [], "dirty": False, "dirty_at": 0.0}
@@ -84,6 +92,19 @@ def init() -> None:
 
 
 # ------------------------------------------------------------ patterns -----
+# WHAT MAY BE ESCAPED, AND NOTHING ELSE. These patterns go to Sonarr, which
+# compiles them with .NET, and .NET REJECTS an escape it does not recognise:
+# "JAM_CLUB" escaped character by character becomes JAM\_CLUB, and \_ is not
+# a legal escape there, so the whole custom format was refused with a 500 and
+# 53 imported terms scored nothing. Python's re is happy with it, which is
+# why it passed every test that did not talk to an arr.
+_META = set(".^$*+?()[]{}|\\/")
+
+
+def _esc(ch: str) -> str:
+    return ("\\" + ch) if ch in _META else ch
+
+
 def _clean_title(title: str) -> str:
     t = str(title or "").strip()
     t = re.sub(r"\.(mkv|mp4|avi|m4v|ts|webm)$", "", t, flags=re.I)
@@ -101,16 +122,24 @@ def release_pattern(title: str) -> str:
             if out and out[-1] == "[ ._-]+":
                 continue
             out.append("[ ._-]+")
-        elif ch.isalnum():
-            out.append(ch)
         else:
-            out.append("\\" + ch)
+            out.append(_esc(ch))
     return "^" + "".join(out) + r"(?![A-Za-z0-9])"
 
 
 def group_pattern(group: str) -> str:
     g = str(group or "").strip()
-    return "^" + "".join(("\\" + c) if not c.isalnum() else c for c in g) + "$"
+    return "^" + "".join(_esc(c) for c in g) + "$"
+
+
+def term_pattern(term: str) -> str:
+    """Anywhere in the name. A release profile's own /regex/i syntax is kept
+    as the regex it is; anything else is matched literally."""
+    t = str(term or "").strip()
+    m = re.match(r"^/(.*)/(i)?$", t)
+    if m:
+        return m.group(1)
+    return "".join(_esc(c) for c in t)
 
 
 def group_of(title: str) -> str:
@@ -151,11 +180,15 @@ def add(kind: str, value: str, why: str = "", source: str = "",
         by: str = "you") -> dict:
     """Add or bump one ban. Returns the row and whether it is new."""
     init()
-    kind = "group" if str(kind).lower().startswith("g") else "release"
+    k = str(kind).lower()
+    kind = ("group" if k.startswith("g")
+            else "term" if k.startswith("t") else "release")
     value = _clean_title(value) if kind == "release" else str(value).strip()
     if not value:
         return {"ok": False, "why": "nothing to ban"}
-    pat = release_pattern(value) if kind == "release" else group_pattern(value)
+    pat = (release_pattern(value) if kind == "release"
+           else group_pattern(value) if kind == "group"
+           else term_pattern(value))
     now = time.time()
     with cursor() as cur:
         r = cur.execute("SELECT id, hits FROM arr_bans WHERE kind=? AND value=?",
@@ -240,8 +273,11 @@ def profiles_for() -> dict:
 
 
 def _want_profile(name: str, listed: list) -> bool:
+    """Named profiles only, or - with nothing named - all of them."""
     if listed:
         return name in listed
+    if DEFAULT_PROFILE_RULE is None:
+        return True
     return bool(DEFAULT_PROFILE_RULE.search(name or ""))
 
 
@@ -262,9 +298,14 @@ async def sync(force: bool = False) -> str:
     from .arr import shared_client
     from .config import SETTINGS
     init()
+    try:
+        restamp()
+    except Exception:                                            # noqa: BLE001
+        pass
     live = [r for r in rows() if r["enabled"]]
     rel = [r for r in live if r["kind"] == "release"]
     grp = [r for r in live if r["kind"] == "group"]
+    trm = [r for r in live if r["kind"] == "term"]
     names = profiles_for()
     detail: list = []
     STATS["dirty"] = False
@@ -288,6 +329,16 @@ async def sync(force: bool = False) -> str:
                     "negate": False, "required": True,
                     "fields": [{"name": "value", "value": r"^\b$"}]}]
                 wanted[nm] = specs
+            wanted[CF_TERMS] = [{
+                "name": r["value"][:80],
+                "implementation": "ReleaseTitleSpecification",
+                "negate": False, "required": False,
+                "fields": [{"name": "value", "value": r["pattern"]}]}
+                for r in trm] or [{
+                "name": "no term banned yet",
+                "implementation": "ReleaseTitleSpecification",
+                "negate": False, "required": True,
+                "fields": [{"name": "value", "value": r"^\b$"}]}]
             wanted[CF_GROUPS] = [{
                 "name": r["value"][:80],
                 "implementation": "ReleaseGroupSpecification",
@@ -324,33 +375,50 @@ async def sync(force: bool = False) -> str:
                                       f"{type(e).__name__}: {e}")
             # formats of ours that are no longer needed (a list that shrank)
             for nm, f in have.items():
-                if (nm.startswith(CF_RELEASES) or nm == CF_GROUPS) \
+                if (nm.startswith(CF_RELEASES) or nm in (CF_GROUPS, CF_TERMS)) \
                         and nm not in wanted:
                     await c._delete(f"/customformat/{f['id']}")
-            # and the score, on every profile named
-            scored = []
+            # and the score, on every profile named - EACH ONE ON ITS OWN.
+            # A profile the arr refuses to save must not cost the others:
+            # Radarr would not accept its own "HD-All" and "Animation"
+            # profiles at all ("Minimum Custom Format Score can never be
+            # satisfied" - both ask for 1 point and have nothing positive to
+            # score), and that one 400 aborted the whole app's pass, so
+            # nothing in Radarr was scored.
+            scored, refused = [], []
             for pr in await c._get("/qualityprofile"):
                 if not _want_profile(pr.get("name") or "", names.get(cfg.kind) or []):
                     continue
-                full = await c._get(f"/qualityprofile/{pr['id']}")
-                items = full.get("formatItems") or []
-                seen = {it.get("format") for it in items}
-                changed = False
-                for it in items:
-                    if it.get("format") in ids.values() and it.get("score") != SCORE:
-                        it["score"] = SCORE
-                        changed = True
-                for nm, fid in ids.items():
-                    if fid not in seen:
-                        items.append({"format": fid, "name": nm, "score": SCORE})
-                        changed = True
-                if changed:
-                    full["formatItems"] = items
-                    await c._put(f"/qualityprofile/{pr['id']}", full)
-                scored.append(pr["name"])
+                try:
+                    full = await c._get(f"/qualityprofile/{pr['id']}")
+                    items = full.get("formatItems") or []
+                    seen = {it.get("format") for it in items}
+                    changed = False
+                    for it in items:
+                        if it.get("format") in ids.values() \
+                                and it.get("score") != SCORE:
+                            it["score"] = SCORE
+                            changed = True
+                    for nm, fid in ids.items():
+                        if fid not in seen:
+                            items.append({"format": fid, "name": nm,
+                                          "score": SCORE})
+                            changed = True
+                    if changed:
+                        full["formatItems"] = items
+                        await c._put(f"/qualityprofile/{pr['id']}", full)
+                    scored.append(pr["name"])
+                except Exception as e:                           # noqa: BLE001
+                    why = str(e)
+                    if "never be satisfied" in why:
+                        why = ("its minimum custom format score is higher "
+                               "than anything it could ever score")
+                    refused.append(f"{pr.get('name')} ({why[:90]})")
             detail.append(f"{cfg.name}: {len(rel)} release(s), {len(grp)} "
-                          f"group(s) on {len(scored)} profile(s): "
-                          + (", ".join(scored) or "none named"))
+                          f"group(s), {len(trm)} term(s) on {len(scored)} "
+                          f"profile(s): " + (", ".join(scored) or "none")
+                          + (f" - refused by {'; '.join(refused)}"
+                             if refused else ""))
         except Exception as e:                                   # noqa: BLE001
             detail.append(f"{cfg.name}: {type(e).__name__}: {e}")
     STATS["detail"] = detail
@@ -378,6 +446,109 @@ def kick() -> None:
     loop.create_task(sync_soon())
 
 
+# ------------------------------------------ taking over a release profile --
+def _looks_like_group(term: str) -> bool:
+    """One token, no spaces, not an extension, not a regex - a group name."""
+    t = str(term or "").strip()
+    if not t or t.startswith("/") or t.startswith(".") or " " in t:
+        return False
+    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._\-]{1,}", t))
+
+
+async def import_release_profiles(delete_after: bool = False,
+                                  as_terms: bool = True) -> dict:
+    r"""Take the must-not-contain lists out of the arrs' release profiles.
+
+    WHY MOVE THEM AT ALL. A release profile is scoped by TAG - "Anime
+    Minimum" only guards series tagged animemin - and it is invisible to
+    the other arr. Erik keeps one list of things he does not want; keeping
+    it in five places, per app, is how a group ends up banned for anime and
+    not for television. As custom formats they are one list, scored on every
+    profile, in both apps.
+
+    EVERYTHING COMES ACROSS AS A TERM by default, and that is deliberate.
+    A release profile matches its text ANYWHERE in the name; a group
+    specification matches the parsed release group exactly. Importing
+    "Hindi" as a group would quietly stop catching the releases it catches
+    today. as_terms=False asks for the tighter reading where a term looks
+    like a bare group name.
+    """
+    from .arr import shared_client
+    from .config import SETTINGS
+    init()
+    out = {"added": 0, "already": 0, "profiles": [], "deleted": []}
+    for cfg in SETTINGS.arrs:
+        if not cfg.enabled or cfg.kind not in ("radarr", "sonarr"):
+            continue
+        c = shared_client(cfg)
+        try:
+            rps = await c._get("/releaseprofile")
+        except Exception as e:                                   # noqa: BLE001
+            out["profiles"].append(f"{cfg.name}: {type(e).__name__}: {e}")
+            continue
+        for rp in rps:
+            ignored = [str(x) for x in (rp.get("ignored") or []) if str(x).strip()]
+            if not ignored:
+                continue
+            name = rp.get("name") or f"profile {rp.get('id')}"
+            for term in ignored:
+                kind = ("group" if (not as_terms and _looks_like_group(term))
+                        else "term")
+                r = add(kind, term,
+                        f"from {cfg.name} release profile {name!r}",
+                        f"{cfg.kind}:releaseprofile", by="you")
+                if r.get("new"):
+                    out["added"] += 1
+                else:
+                    out["already"] += 1
+            out["profiles"].append(f"{cfg.name}: {name} ({len(ignored)})")
+            if delete_after:
+                # A RELEASE PROFILE WITH NOTHING IN IT IS NOT VALID, so an
+                # emptied one is deleted rather than saved blank. Anything it
+                # also required or preferred is left alone - only the
+                # must-not-contain list moved.
+                try:
+                    if rp.get("required") or rp.get("preferred"):
+                        rp["ignored"] = []
+                        await c._put(f"/releaseprofile/{rp['id']}", rp)
+                        out["deleted"].append(f"{cfg.name}: {name} (emptied)")
+                    else:
+                        await c._delete(f"/releaseprofile/{rp['id']}")
+                        out["deleted"].append(f"{cfg.name}: {name} (removed)")
+                except Exception as e:                           # noqa: BLE001
+                    out["profiles"].append(
+                        f"{cfg.name}: could not clear {name}: "
+                        f"{type(e).__name__}: {e}")
+    if out["added"]:
+        joblog.log(f"release profiles taken over: {out['added']} term(s) "
+                   f"banned, {out['already']} already on the list", "ok")
+    return out
+
+
+def restamp() -> int:
+    """Rewrite every stored pattern with the current rules.
+
+    Needed once, after the escaping fix above: rows saved before it hold
+    patterns .NET will not compile, and a single bad one costs the whole
+    custom format.
+    """
+    init()
+    n = 0
+    with cursor() as cur:
+        for r in cur.execute("SELECT id, kind, value, pattern "
+                             "  FROM arr_bans").fetchall():
+            want = (release_pattern(r["value"]) if r["kind"] == "release"
+                    else group_pattern(r["value"]) if r["kind"] == "group"
+                    else term_pattern(r["value"]))
+            if want != r["pattern"]:
+                cur.execute("UPDATE arr_bans SET pattern=? WHERE id=?",
+                            (want, int(r["id"])))
+                n += 1
+    if n:
+        _mark_dirty()
+    return n
+
+
 def snapshot() -> dict:
     init()
     rs = rows()
@@ -387,5 +558,7 @@ def snapshot() -> dict:
                                       and r["enabled"]),
                        "group": sum(1 for r in rs if r["kind"] == "group"
                                     and r["enabled"]),
+                       "term": sum(1 for r in rs if r["kind"] == "term"
+                                   and r["enabled"]),
                        "off": sum(1 for r in rs if not r["enabled"])},
             "group_strikes": GROUP_STRIKES, "score": SCORE}
