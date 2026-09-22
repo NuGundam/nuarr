@@ -1004,10 +1004,12 @@ class Worker:
                     "track's events to judge its title. A measurement, not a "
                     "change: nothing is written to the file.")
         if self.pool == "decode":
-            return ("Checking the file actually decodes \u2014 five windows, "
-                    "90 seconds in all, head, middle and tail, to nowhere. Its "
-                    "own pool, lowest priority, and never on a disk somebody "
-                    "is watching from.")
+            return ("Checking this file still plays \u2014 five short windows, "
+                    "90 seconds of it in all, taken from the start, the "
+                    "middle and the end. Nothing is written and nothing is "
+                    "kept: the only question is whether the frames come out. "
+                    "Its own pool, lowest priority, and never on a disk "
+                    "somebody is watching from.")
         if self.pool == "audio":
             return ("Correcting what this file's audio tracks SAY they are. "
                     "One header write each — the video is never touched — "
@@ -1257,10 +1259,11 @@ class Worker:
                     "why": "pulling the track out to read its events"}
         if kind == "decode":
             return {"tool": "ffmpeg", "hw": "CPU \u00b7 software decode",
-                    "why": "decoding sampled windows of the file to null - "
-                           "head, middle and tail - on the CPU, because a "
-                           "hardware decoder plays through the damage this "
-                           "is looking for"}
+                    "why": "decoding real frames from five places in the file "
+                           "and throwing them away - what they look like does "
+                           "not matter, only that they decode. On the "
+                           "processor on purpose: a graphics decoder glides "
+                           "past the kind of damage this is hunting for"}
         return {"tool": "", "hw": "", "why": st}
 
     def as_dict(self) -> dict:

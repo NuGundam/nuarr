@@ -628,17 +628,17 @@ def pass_words(r: dict) -> tuple:
     """(short label, the sentence) for one candidate row."""
     if int(r.get("pass") or 1) < 2:
         return ("pass 1",
-                "nothing has decoded these bytes yet - this is the check that "
-                "says the file can be played at all")
+                "nothing has played these bytes yet - this is the first "
+                "check that the file works at all")
     if r.get("replaced"):
         return ("pass 1",
-                "the file at this name was replaced since the last check, so "
-                "these are new bytes and this is a first look at them")
+                "the file at this name was replaced since the last check - "
+                "these are new bytes, and nobody has played them either")
     after = r.get("after") or "the rewrite"
     return ("pass 2",
-            f"{after} has rewritten this file since the last check, so these "
-            f"are different bytes - this is the one that says what nuarr "
-            f"wrote is not corrupt")
+            f"{after} rewrote this file after the last check - these are "
+            f"different bytes, and this is the check that what nuarr wrote "
+            f"came out sound")
 
 
 def noanswer_wait_sql(alias: str = "i") -> str:
@@ -1017,14 +1017,22 @@ def _to_hand_over(depth: int) -> tuple:
 
 
 def window_why(label: str) -> str:
-    """What each window is there to catch, for the card's action list."""
+    r"""What each window is there to catch, for the card's action list.
+
+    SAY WHAT IT CATCHES, NOT WHAT THE CHECK USED TO MISS. The middle windows
+    read "damage in the middle used to be invisible to this check", which is
+    a fact about this code's history and no use at all to somebody looking
+    at a file: three of the five lines on the card said it.
+    """
     if label.startswith("the first"):
-        return ("header and stream damage, bad indices, wrong codec "
-                "parameters all show here")
+        return ("the header, the indexes and the codec settings - if any of "
+                "those are wrong the file will not start at all")
     if label.startswith("the last"):
-        return ("truncation - the commonest way a library file is broken - "
-                "shows here as a window that decodes nothing")
-    return "damage in the middle used to be invisible to this check"
+        return ("truncation, the commonest way a library file breaks - a "
+                "download that stopped early ends here, and the window "
+                "decodes nothing")
+    return ("a bad patch in the body - a file can start and end perfectly "
+            "and still fall apart in the middle, where nobody has played it")
 
 
 def _job_plan(r: dict) -> str:
