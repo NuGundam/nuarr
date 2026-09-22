@@ -302,6 +302,16 @@ async def run(file_id: int, delete_file: bool = True,
     cfg = _arr_for(row.get("library") or "")
     client = shared_client(cfg)
     did: list[str] = []
+    # THE NAME, BEFORE THE RECORD GOES. The grab's title when history still
+    # has it, else the scene name on the file record - which the delete two
+    # steps down removes. Either is what every indexer calls this release,
+    # and that is what the ban below is written against; see arrban.
+    _ban_name = str(p.get("release") or "")
+    if not _ban_name and row.get("arr_file_id"):
+        try:
+            _ban_name = await client.file_scene_name(int(row["arr_file_id"]))
+        except Exception:                                        # noqa: BLE001
+            _ban_name = ""
 
     # A 404 FROM THE ARR IS STALE BOOKKEEPING, NOT A FAILURE.
     #
@@ -366,6 +376,21 @@ async def run(file_id: int, delete_file: bool = True,
     # goes ahead. Putting that in the story would blame the deletion on a
     # missing blocklist entry.
     _why = str(reason or p.get("explain") or "").strip()
+    # AND EVERY OTHER INDEXER'S COPY OF IT. The blocklist entry above covers
+    # one (indexer, release) pair; the ban covers the name wherever it is
+    # offered, as a -10000 custom format. Off unless the card says on.
+    try:
+        from .gate import get_toggle
+        if _ban_name and get_toggle("arrs.release_ban"):
+            from . import arrban
+            b = arrban.note_rejection(_ban_name, _why, "refetch")
+            if (b.get("release") or {}).get("new"):
+                did.append(f"banned {_ban_name!r} for every indexer")
+            if b.get("group_banned"):
+                did.append(f"and its group {b.get('group')!r}")
+            arrban.kick()
+    except Exception as e:                                       # noqa: BLE001
+        joblog.log(f"release ban: {type(e).__name__}: {e}", "debug")
     _story = ("nuarr rejected this release"
               + (f" \u2014 {_why}" if _why else "")
               + ": " + "; ".join(did))

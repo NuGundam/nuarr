@@ -2835,7 +2835,9 @@ def api_arrguard():
     return {"stats": arrguard.STATS,
             "toggles": {"profile_guard": gate.get_toggle("arrs.profile_guard"),
                         "trash_anime": gate.get_toggle("arrs.trash_anime"),
+                        "release_ban": gate.get_toggle("arrs.release_ban"),
                         },
+            "release_ban": _arrban_snapshot(),
             # The names each job works on, so the page can show and edit them
             # instead of shipping one machine's profile names as a constant.
             "split_profiles": arrguard.targets_2160(),
@@ -2843,6 +2845,45 @@ def api_arrguard():
             "trash_autoadd": gate.get_toggle("arrs.trash_autoadd"),
             "defaults": {"split_profiles": arrguard.DEFAULT_TARGET_2160,
                          "anime_formats": arrguard.DEFAULT_ANIME_FORMATS}}
+
+
+def _arrban_snapshot() -> dict:
+    try:
+        from . import arrban
+        return arrban.snapshot()
+    except Exception as e:                                       # noqa: BLE001
+        return {"error": f"{type(e).__name__}: {e}", "rows": [], "stats": {},
+                "counts": {}, "profiles": {"radarr": [], "sonarr": []}}
+
+
+@app.post("/api/arrban/add")
+def api_arrban_add(kind: str = "release", value: str = "", why: str = ""):
+    """Ban a release name or a group by hand. Synced within a minute."""
+    from . import arrban
+    r = arrban.add(kind, value, why or "added by hand", "you", by="you")
+    if r.get("ok"):
+        joblog.log(f"release ban added by hand: {r['kind']} {r['value']!r}",
+                   "info")
+        arrban.kick()
+    return r
+
+
+@app.post("/api/arrban/remove")
+def api_arrban_remove(id: int):
+    from . import arrban
+    ok = arrban.remove(int(id))
+    if ok:
+        arrban.kick()
+    return {"ok": ok}
+
+
+@app.post("/api/arrban/enable")
+def api_arrban_enable(id: int, on: int = 1):
+    from . import arrban
+    ok = arrban.set_enabled(int(id), bool(on))
+    if ok:
+        arrban.kick()
+    return {"ok": ok, "on": bool(on)}
 
 
 @app.post("/api/arrguard/names")
@@ -2854,7 +2895,8 @@ async def api_arrguard_names(job: str, body: dict = Body(...)):
     """
     from . import arrguard
     keys = {"profile_guard": "arrs.split_profiles",
-            "trash_anime": "arrs.anime_formats"}
+            "trash_anime": "arrs.anime_formats",
+            "release_ban": "arrs.ban_profiles"}
     if job not in keys:
         raise HTTPException(400, f"job must be one of {', '.join(keys)}")
     saved = arrguard._save_names(keys[job], body or {})
@@ -2905,7 +2947,7 @@ async def api_arrguard_choices(job: str):
             continue
         c = shared_client(cfg)
         try:
-            if job == "profile_guard":
+            if job in ("profile_guard", "release_ban"):
                 rows = await c._get("/qualityprofile")
                 out[cfg.kind] = sorted({r["name"] for r in rows})
             elif job == "trash_anime":
@@ -2929,7 +2971,7 @@ async def api_arrguard_choices(job: str):
     return out
 
 
-_ARR_JOBS = ("profile_guard", "trash_anime")
+_ARR_JOBS = ("profile_guard", "trash_anime", "release_ban")
 
 
 @app.post("/api/arrguard/toggle")
@@ -2949,6 +2991,9 @@ async def api_arrguard_run(job: str):
         return {"result": await arrguard.run_guard()}
     if job == "trash_anime":
         return {"result": await arrguard.run_trash()}
+    if job == "release_ban":
+        from . import arrban
+        return {"result": await arrban.sync(force=True)}
     raise HTTPException(400, f"job must be one of {', '.join(_ARR_JOBS)}")
 
 
@@ -44949,6 +44994,7 @@ async function loadArrsTab(){
   try{ d=await (await fetch('/api/arrguard')).json(); }
   catch(e){ el.innerHTML=`<div class="err">could not load: ${esc(String(e))}</div>`; return; }
   const g=d.stats.guard||{}, t=d.stats.trash||{};
+  const rb=d.release_ban||{}, rbst=(rb.stats||{});
   // `ed` is optional: {label, kind, names:{radarr:[],sonarr:[]}, empty}
   // min-width:0 on the input is what stops the Pick button being pushed off
   // the edge: a flex item's default minimum is its CONTENT width, so a long
@@ -45083,8 +45129,91 @@ async function loadArrsTab(){
         {label:'Formats to keep in sync', kind:'trash_anime',
          names:d.anime_formats||{},
          empty:'none listed — every anime format the guides publish that already exists in the arr',
-         adder:newFmts(t)});
+         adder:newFmts(t)})
+    + job('release_ban','Rejected releases, banned for every indexer',
+        'When nuarr rejects a release - no English in a file that said DUAL, a raw '
+        +'with nothing to read, a container that does not decode - the arr blocklists '
+        +'that ONE grab from that ONE indexer, and the same release is on four others. '
+        +'This bans the release NAME as a -10000 custom format on the profiles listed, '
+        +'so no indexer can hand it back; a group that keeps doing it is banned outright '
+        +'after '+String(rb.group_strikes||3)+' strikes. The list below is the whole '
+        +'state and yours to edit.',
+        d.toggles.release_ban, rbst,
+        {label:'Profiles to score on (empty = every "Nu …" and "Anime" profile)',
+         kind:'release_ban', names:rb.profiles||{},
+         empty:'', adder:banList(rb)});
   loadHookState();
+}
+// THE LIST IS THE STATE. Every row nuarr learned or you typed, with the reason
+// it is there and how many times it has been hit; a row can be switched off
+// without being forgotten, so "why is this back" always has an answer.
+function banList(rb){
+  const rows=(rb.rows||[]);
+  const c=rb.counts||{};
+  const when=t=>t?new Date(t*1000).toLocaleDateString():'';
+  const row=r=>`<div style="display:flex;gap:8px;align-items:center;padding:3px 9px;
+      font-size:11px;border-top:1px solid var(--line);${r.enabled?'':'opacity:.45'}">
+      <span class="pill ${r.kind==='group'?'p-warn':'p-dim'}" style="flex:none;width:52px;
+        text-align:center">${r.kind}</span>
+      <span class="mono" style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;
+        white-space:nowrap" title="${esc(r.why||'')}">${esc(r.value)}</span>
+      <span class="dim" style="flex:none;width:150px;overflow:hidden;text-overflow:ellipsis;
+        white-space:nowrap" title="${esc(r.why||'')}">${esc(r.why||'')}</span>
+      <span class="dim" style="flex:none;width:42px;text-align:right">${
+        r.hits>1?fmt(r.hits)+'×':''}</span>
+      <span class="dim" style="flex:none;width:62px">${esc(r.added_by)} ${when(r.added_at)}</span>
+      <a href="#" style="flex:none" onclick="banEnable(${r.id},${r.enabled?0:1});return false">${
+        r.enabled?'off':'on'}</a>
+      <a href="#" style="flex:none;color:var(--bad,#e05252)"
+         onclick="banRemove(${r.id});return false" title="forget it">×</a>
+    </div>`;
+  const strikes=(rb.strikes||[]).filter(x=>x.n<(rb.group_strikes||3));
+  return `<div style="margin-top:8px;border-top:1px solid var(--line);padding-top:8px">
+    <div style="display:flex;gap:10px;align-items:center">
+      <span style="font-size:11px;font-weight:600">Banned (${fmt(c.release||0)} release${
+        (c.release||0)===1?'':'s'}, ${fmt(c.group||0)} group${(c.group||0)===1?'':'s'}${
+        c.off?`, ${fmt(c.off)} switched off`:''})</span>
+      <span style="margin-left:auto;display:flex;gap:6px;align-items:center">
+        <select id="banKind" style="font-size:11px"><option value="release">release</option>
+          <option value="group">group</option></select>
+        <input id="banValue" style="font-size:11px;width:260px"
+               placeholder="release name or group, exactly as the indexer spells it">
+        <button style="font-size:11px" onclick="banAdd()">Ban</button>
+      </span>
+    </div>
+    <div class="dim" style="font-size:11px;margin:3px 0 5px">A release is matched
+      however an indexer spells its dots, spaces and dashes; a group is matched
+      exactly. Pushed to the arrs within a minute of any change, and re-asserted
+      on the timer.</div>
+    <div style="max-height:260px;overflow:auto;border:1px solid var(--line);
+         border-radius:6px;background:rgba(255,255,255,.02)">
+      ${rows.length?rows.map(row).join('')
+        :'<div class="dim" style="padding:8px 10px;font-size:11px">nothing banned yet — the first rejection nuarr makes will appear here</div>'}
+    </div>
+    ${strikes.length?`<div class="dim" style="font-size:11px;margin-top:5px">groups on
+      strikes, not yet banned: ${strikes.map(x=>esc(x.grp)+' '+x.n+'/'+(rb.group_strikes||3)).join(' · ')}</div>`:''}
+    <span id="banmsg" class="dim" style="font-size:11px"></span>
+  </div>`;
+}
+async function banAdd(){
+  const k=document.getElementById('banKind'), v=document.getElementById('banValue');
+  if(!v||!v.value.trim()) return;
+  let r={};
+  try{ r=await (await fetch('/api/arrban/add?kind='+encodeURIComponent(k.value)
+      +'&value='+encodeURIComponent(v.value.trim()),{method:'POST'})).json(); }
+  catch(e){ r={ok:false, why:String(e)}; }
+  const m=document.getElementById('banmsg');
+  if(m) m.innerHTML=r.ok?`<span class="ok">banned — syncing to the arrs</span>`
+                       :`<span class="err">${esc(r.why||'failed')}</span>`;
+  setTimeout(loadArrsTab, 700);
+}
+async function banRemove(id){
+  try{ await fetch('/api/arrban/remove?id='+id,{method:'POST'}); }catch(e){}
+  loadArrsTab();
+}
+async function banEnable(id,on){
+  try{ await fetch('/api/arrban/enable?id='+id+'&on='+on,{method:'POST'}); }catch(e){}
+  loadArrsTab();
 }
 async function arrsToggle(job,on){
   await fetch(`/api/arrguard/toggle?job=${job}&on=${on}`,{method:'POST'});

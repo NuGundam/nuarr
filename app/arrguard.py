@@ -430,6 +430,16 @@ async def watch() -> None:
             STATS["trash"]["next_run"] = max(
                 STATS["trash"]["last_run"] + TRASH_MIN_GAP_S,
                 time.time() + POLL_S)
+            # THE REJECTED-RELEASE BANS. Rejections push their own debounced
+            # sync; this is the backstop that re-asserts the formats and
+            # scores on the timer, so a profile somebody re-saved without
+            # them gets them back.
+            if get_toggle("arrs.release_ban"):
+                from . import arrban
+                STATS["running"] = "release bans"
+                with joblog.section("Arr release bans"):
+                    await arrban.sync()
+                arrban.STATS["next_run"] = time.time() + POLL_S
         except Exception as e:
             joblog.log(f"arr guard loop: {type(e).__name__}: {e}", "error")
         finally:
