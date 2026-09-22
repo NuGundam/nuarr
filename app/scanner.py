@@ -1596,6 +1596,17 @@ async def scan(full: bool = True, probe_orphans: bool = True,
                         "last full scan', updated_at=? WHERE id=? AND state!='missing'",
                         [(now, i) for i in gone])
                     rep.missing = len(gone)
+                    # AND THE WORK QUEUED AGAINST THEM, IN THE SAME BREATH.
+                    # The queue's own sweep would catch these within twenty
+                    # seconds, but this is the moment it becomes true, and a
+                    # panel that still lists a job for a file this pass just
+                    # declared missing is a panel disagreeing with itself.
+                    try:
+                        from . import jobs as _jobs
+                        _jobs.drop_queued_for(
+                            sorted(gone), "the scan no longer finds the file")
+                    except Exception:                            # noqa: BLE001
+                        pass
 
         rep.seconds = time.time() - t0
         rep.sig_seconds = round(_sig_s, 2)

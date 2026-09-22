@@ -379,6 +379,162 @@ def _forget_queue_row(job: "Job") -> None:
                    f"{type(e).__name__}: {e}", "debug", job.id)
 
 
+# ---------------------------------------------------- work for dead files --
+# A QUEUE ENTRY IS A PROMISE ABOUT A FILE, AND THE FILE CAN LEAVE.
+#
+# Erik, watching 143 EyeShield episodes get imported under new names while
+# the queue went on listing "listen to 1 track
+# [DB]Eyeshield 21_-_126_(10bit_DVD480p_x265).mkv": "add logic in the queue
+# so it can remove files that are no longer present and or replaced in real
+# time".
+#
+# Until now the only thing that noticed was the dispatcher, at the moment it
+# tried to start the job - which is honest but late. The row sits in the
+# panel for however long the queue is deep, it is counted in "87 waiting" and
+# in the GB pending, and every top-up hands the same dead path back. The run
+# before this one finished 1,283 jobs whose entire outcome was "the file is
+# not there".
+#
+# Two questions, two costs. "Has the row been retired or renamed" is a join
+# and costs nothing, so it is asked of the whole queue. "Is the file still on
+# disk" is a stat on a pool disk that may be asleep, so it is asked of the
+# head of the queue - the rows about to run - and walks the rest over
+# following passes rather than waking twelve spindles at once.
+_REAP = {"at": 0.0, "from": 0}
+REAP_EVERY_S = 20.0
+REAP_STATS = 400          # how many paths to stat per pass
+
+
+def drop_queued_for(file_ids, why: str) -> int:
+    """Forget every queued job for these files, now. Nothing running is touched.
+
+    Called the moment something else establishes the file is gone - the
+    scanner's missing sweep, a replace - so the queue is right immediately
+    rather than at the next sweep.
+    """
+    ids = [int(x) for x in (file_ids or [])]
+    if not ids:
+        return 0
+    gone = []
+    try:
+        with cursor() as cur:
+            qs = ",".join("?" * len(ids))
+            rows = cur.execute(
+                f"SELECT job_id, id, kind, file_id, title, path FROM jobs "
+                f" WHERE state='queued' AND file_id IN ({qs})", ids).fetchall()
+            gone = [dict(r) for r in rows]
+            if gone:
+                cur.execute(
+                    "DELETE FROM jobs WHERE state='queued' AND id IN (%s)"
+                    % ",".join(str(int(r["id"])) for r in gone))
+    except Exception as e:                                       # noqa: BLE001
+        joblog.log(f"queue reaper: {type(e).__name__}: {e}", "debug")
+        return 0
+    for r in gone:
+        _forget_owner(r.get("kind") or "", int(r.get("file_id") or 0), why)
+        joblog.log(f"dropped from the queue - {why}: "
+                   f"{r.get('title') or r.get('path')}", "info",
+                   r.get("job_id"))
+    return len(gone)
+
+
+def _forget_owner(kind: str, file_id: int, why: str) -> None:
+    """The instruction behind the job goes too, or the feeder hands the same
+    dead file back on the next top-up - see _forget_queue_row."""
+    try:
+        if kind == "subs":
+            from . import subqueue
+            subqueue.forget(file_id, why)
+        elif kind == "audio":
+            from . import audqueue
+            audqueue.forget(file_id, why)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def reap_gone(stats: int = REAP_STATS) -> dict:
+    """Take out queue rows whose file is gone, retired or somewhere else.
+
+    Returns what it removed, by reason, so the caller can log one line rather
+    than one per row.
+    """
+    out = {"retired": 0, "moved": 0, "missing": 0, "checked": 0}
+    # ---- the free half: what the files table already knows ------------------
+    try:
+        with cursor() as cur:
+            rows = [dict(r) for r in cur.execute(
+                "SELECT j.id, j.job_id, j.kind, j.file_id, j.title, j.path, "
+                "       f.id fid, f.state fstate, f.path fpath "
+                "  FROM jobs j LEFT JOIN files f ON f.id = j.file_id "
+                " WHERE j.state='queued' AND j.file_id IS NOT NULL")]
+    except Exception as e:                                       # noqa: BLE001
+        joblog.log(f"queue reaper: {type(e).__name__}: {e}", "debug")
+        return out
+    dead: list = []
+    for r in rows:
+        if r["fid"] is None:
+            dead.append((r, "retired", "its row is gone from the library"))
+        elif str(r["fstate"] or "") in ("deleted", "missing", "duplicate"):
+            dead.append((r, "retired",
+                         f"the library has it as {r['fstate']}"))
+        elif (r["path"] and r["fpath"]
+              and os.path.normcase(str(r["path"]))
+              != os.path.normcase(str(r["fpath"]))):
+            # THE REPLACED CASE. Same file row, different path: an arr
+            # imported over it or a rename moved it, so the instruction was
+            # written about bytes that are no longer at that name.
+            dead.append((r, "moved", "it has been replaced or renamed since"))
+    if dead:
+        try:
+            with cursor() as cur:
+                cur.execute("DELETE FROM jobs WHERE state='queued' AND id IN "
+                            "(%s)" % ",".join(str(int(d[0]["id"]))
+                                              for d in dead))
+        except Exception as e:                                   # noqa: BLE001
+            joblog.log(f"queue reaper: {type(e).__name__}: {e}", "debug")
+            dead = []
+    for r, kind_, why in dead:
+        out[kind_] += 1
+        _forget_owner(r.get("kind") or "", int(r.get("file_id") or 0), why)
+        joblog.log(f"dropped from the queue - {why}: "
+                   f"{r.get('title') or r.get('path')}", "info", r.get("job_id"))
+    # ---- the paid half: is it actually on the disk --------------------------
+    live = {int(d[0]["id"]) for d in dead}
+    left = [r for r in rows if int(r["id"]) not in live and r["path"]]
+    if not left:
+        _REAP["from"] = 0
+        return out
+    start = _REAP["from"] % len(left)
+    window = left[start:start + int(stats)]
+    if len(window) < int(stats):
+        window += left[:int(stats) - len(window)]
+    _REAP["from"] = (start + len(window)) % max(1, len(left))
+    missing = []
+    for r in window:
+        out["checked"] += 1
+        try:
+            if not os.path.exists(str(r["path"])):
+                missing.append(r)
+        except Exception:                                        # noqa: BLE001
+            continue
+    if missing:
+        try:
+            with cursor() as cur:
+                cur.execute("DELETE FROM jobs WHERE state='queued' AND id IN "
+                            "(%s)" % ",".join(str(int(r["id"]))
+                                              for r in missing))
+        except Exception as e:                                   # noqa: BLE001
+            joblog.log(f"queue reaper: {type(e).__name__}: {e}", "debug")
+            missing = []
+    for r in missing:
+        out["missing"] += 1
+        _forget_owner(r.get("kind") or "", int(r.get("file_id") or 0),
+                      "the file is no longer there")
+        joblog.log(f"dropped from the queue - the file is no longer on disk: "
+                   f"{r.get('title') or r.get('path')}", "info", r.get("job_id"))
+    return out
+
+
 def _queued_work() -> tuple[dict, float]:
     """Remaining media-seconds per pool, plus a fallback per-file duration.
 
@@ -2998,6 +3154,26 @@ async def pump() -> None:
                                  + f" · {queue_depth()} job(s) would run")
                 await asyncio.sleep(10)
                 continue
+
+            # THE QUEUE IS CHECKED BEFORE IT IS DISPATCHED FROM, every
+            # REAP_EVERY_S seconds, off the loop. See reap_gone: rows about
+            # files that have been retired, renamed or deleted are taken out
+            # here rather than discovered by the worker that tries to open
+            # them.
+            if time.time() - _REAP["at"] >= REAP_EVERY_S:
+                _REAP["at"] = time.time()
+                try:
+                    r_ = await asyncio.to_thread(reap_gone)
+                    n_ = r_["retired"] + r_["moved"] + r_["missing"]
+                    if n_:
+                        joblog.log(
+                            f"queue: dropped {n_} row(s) for files that are no "
+                            f"longer there - {r_['retired']} retired, "
+                            f"{r_['moved']} replaced or renamed, "
+                            f"{r_['missing']} gone from disk", "ok")
+                except Exception as e:                           # noqa: BLE001
+                    joblog.log(f"queue reaper: {type(e).__name__}: {e}",
+                               "debug")
 
             if queue_depth():
                 st = await gate.status()
