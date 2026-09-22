@@ -45167,20 +45167,27 @@ function banList(rb){
   const rows=(rb.rows||[]);
   const c=rb.counts||{};
   const when=t=>t?new Date(t*1000).toLocaleDateString():'';
-  const row=r=>`<div style="display:flex;gap:8px;align-items:center;padding:3px 9px;
-      font-size:11px;border-top:1px solid var(--line);${r.enabled?'':'opacity:.45'}">
-      <span class="pill ${r.kind==='group'?'p-warn':(r.kind==='term'?'p-dim':'p-dim')}"
-        style="flex:none;width:52px;text-align:center">${r.kind}</span>
-      <span class="mono" style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;
-        white-space:nowrap" title="${esc(r.why||'')}">${esc(r.value)}</span>
-      <span class="dim" style="flex:none;width:150px;overflow:hidden;text-overflow:ellipsis;
-        white-space:nowrap" title="${esc(r.why||'')}">${esc(r.why||'')}</span>
-      <span class="dim" style="flex:none;width:42px;text-align:right">${
-        r.hits>1?fmt(r.hits)+'×':''}</span>
-      <span class="dim" style="flex:none;width:62px">${esc(r.added_by)} ${when(r.added_at)}</span>
-      <a href="#" style="flex:none" onclick="banEnable(${r.id},${r.enabled?0:1});return false">${
+  // A GRID, NOT A ROW OF GUESSES. Every column was a fixed pixel width
+  // chosen by eye: the reason got 150px and read "no eng subtitles -
+  // carries no ...", and "nuarr 9/21/2026" wrapped onto two lines in 62px.
+  // The two columns that hold sentences share what is left over, the rest
+  // are sized to their longest real content, and the reason is allowed to
+  // wrap to a second line rather than being cut.
+  const row=r=>`<div style="display:grid;align-items:baseline;
+      grid-template-columns:54px minmax(0,1.35fr) minmax(0,1fr) 40px 124px 26px 16px;
+      gap:10px;padding:4px 10px;font-size:11px;border-top:1px solid var(--line);
+      ${r.enabled?'':'opacity:.45'}">
+      <span class="pill ${r.kind==='group'?'p-warn':'p-dim'}"
+        style="text-align:center">${r.kind}</span>
+      <span class="mono" style="min-width:0;overflow:hidden;text-overflow:ellipsis;
+        white-space:nowrap" title="${esc(r.value)}">${esc(r.value)}</span>
+      <span class="dim" style="min-width:0;overflow-wrap:anywhere"
+        title="${esc(r.why||'')}">${esc(r.why||'')}</span>
+      <span class="dim" style="text-align:right">${r.hits>1?fmt(r.hits)+'×':''}</span>
+      <span class="dim" style="white-space:nowrap">${esc(r.added_by)} ${when(r.added_at)}</span>
+      <a href="#" onclick="banEnable(${r.id},${r.enabled?0:1});return false">${
         r.enabled?'off':'on'}</a>
-      <a href="#" style="flex:none;color:var(--bad,#e05252)"
+      <a href="#" style="color:var(--bad,#e05252)"
          onclick="banRemove(${r.id});return false" title="forget it">×</a>
     </div>`;
   const strikes=(rb.strikes||[]).filter(x=>x.n<(rb.group_strikes||3));
@@ -45207,7 +45214,7 @@ function banList(rb){
       release profiles</a> — moves every must-not-contain list here and clears
       it there, so one list covers both apps and every tag rather than one app
       and one tag.</div>
-    <div style="max-height:260px;overflow:auto;border:1px solid var(--line);
+    <div style="max-height:320px;overflow:auto;border:1px solid var(--line);
          border-radius:6px;background:rgba(255,255,255,.02)">
       ${rows.length?rows.map(row).join('')
         :'<div class="dim" style="padding:8px 10px;font-size:11px">nothing banned yet — the first rejection nuarr makes will appear here</div>'}

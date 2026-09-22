@@ -838,8 +838,42 @@ def verdict(file_id: int, lang: str, cur, facts=None,
     # is indistinguishable from the file genuinely carrying nothing. This is
     # the check that stops 11,687 unread files being reported as faulty; see
     # the module docstring before weakening it.
+    #
+    # BUT FIRST: IS THIS FILE EVEN THIS CHECK'S BUSINESS? Erik: "the raw
+    # logic should only be for media the user doesn't understand and wants
+    # subtitles for - the rule is, if the media is not eng audio then it
+    # needs eng subs". A file spoken in the language needs no subtitle to be
+    # followed, so there is nothing here to decide and nothing to chase.
+    #
+    # It matters because these two rungs answer UNKNOWN, and UNKNOWN is what
+    # puts a row on the board as undecided. Seven episodes of We Baby Bears -
+    # an AMZN WEB-DL tagged eng, English through and through - sat there as
+    # raws at 0%, purely because no subtitle scan had reached them yet. The
+    # rung that says "you speak it" was thirty lines further down and never
+    # got the chance.
+    #
+    # Only the UNREAD cases short-circuit here. A file that HAS been read
+    # goes down the whole ladder as before, so an English file with an
+    # English track still answers `track` rather than this.
     has_probe = cur.execute("SELECT 1 FROM file_probes WHERE file_id=?",
                             (int(file_id),)).fetchone()
+    if not has_probe or facts is None:
+        _sp = _audio_langs(file_id, cur)
+        if not _sp:
+            try:
+                _r0 = cur.execute("SELECT orig_lang FROM files WHERE id=?",
+                                  (int(file_id),)).fetchone()
+                _oc0 = orig_code(_r0["orig_lang"] if _r0 else "")
+            except Exception:                                    # noqa: BLE001
+                _oc0 = ""
+            if _oc0:
+                _sp = {_oc0}
+        if lang in _sp:
+            _said0 = "/".join(sorted(x for x in _sp
+                                     if x and x not in ("und", "un"))) or lang
+            return WANT, (f"the audio is {_said0} - you can follow it without "
+                          f"a subtitle, so this check has nothing to decide "
+                          f"here, read or not"), "spoken"
     if not has_probe:
         return UNKNOWN, "nuarr has not looked inside this file yet", "unread"
     if facts is None:
