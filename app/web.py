@@ -45098,7 +45098,8 @@ async function loadArrsTab(){
                      :'<span class="dim">has not run yet</span>'}
         ${on&&st.next_run?`<div class="dim">next ~${new Date(st.next_run*1000).toLocaleTimeString()}</div>`:''}
         ${(st.new_formats&&st.new_formats.length&&!ed)?`<div class="dim" style="margin-top:4px">new in the guides: ${esc(st.new_formats.join(', '))}</div>`:''}
-        ${(st.detail&&st.detail.length)?`<div class="dim" style="margin-top:4px">${st.detail.map(x=>esc(x)).join('<br>')}</div>`:''}
+        ${(st.detail&&st.detail.length&&st.detail.join('; ')!==(st.last_result||''))
+          ?`<div class="dim" style="margin-top:4px">${st.detail.map(x=>esc(x)).join('<br>')}</div>`:''}
       </div>
       ${editor(ed)}
     </div>`;
@@ -45154,7 +45155,7 @@ async function loadArrsTab(){
         +'after '+String(rb.group_strikes||3)+' strikes. The list below is the whole '
         +'state and yours to edit.',
         d.toggles.release_ban, rbst,
-        {label:'Profiles to score on (empty = every "Nu …" and "Anime" profile)',
+        {label:'Profiles to score on (empty = every profile in that arr)',
          kind:'release_ban', names:rb.profiles||{},
          empty:'', adder:banList(rb)});
   loadHookState();

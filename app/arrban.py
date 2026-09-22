@@ -409,16 +409,28 @@ async def sync(force: bool = False) -> str:
                         await c._put(f"/qualityprofile/{pr['id']}", full)
                     scored.append(pr["name"])
                 except Exception as e:                           # noqa: BLE001
+                    # THE REASON IS IN THE BODY, NOT THE MESSAGE. httpx's
+                    # text is "400 Bad Request for url ..."; the arr's own
+                    # sentence is in the response, and that is the one a
+                    # person can act on.
                     why = str(e)
-                    if "never be satisfied" in why:
-                        why = ("its minimum custom format score is higher "
-                               "than anything it could ever score")
-                    refused.append(f"{pr.get('name')} ({why[:90]})")
+                    try:
+                        body = e.response.text                   # type: ignore[attr-defined]
+                        if "never be satisfied" in body:
+                            why = ("minimum custom format score can never "
+                                   "be met - fix the profile in Radarr")
+                        else:
+                            m = re.search(r'"errorMessage":\s*"([^"]+)"', body)
+                            if m:
+                                why = m.group(1)
+                    except Exception:                            # noqa: BLE001
+                        pass
+                    refused.append(f"{pr.get('name')} - {why[:90]}")
             detail.append(f"{cfg.name}: {len(rel)} release(s), {len(grp)} "
-                          f"group(s), {len(trm)} term(s) on {len(scored)} "
-                          f"profile(s): " + (", ".join(scored) or "none")
-                          + (f" - refused by {'; '.join(refused)}"
-                             if refused else ""))
+                          f"group(s), {len(trm)} term(s) scored on "
+                          f"{len(scored)} profile(s)"
+                          + (f"; could not save {len(refused)}: "
+                             + "; ".join(refused) if refused else ""))
         except Exception as e:                                   # noqa: BLE001
             detail.append(f"{cfg.name}: {type(e).__name__}: {e}")
     STATS["detail"] = detail
