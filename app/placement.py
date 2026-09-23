@@ -227,7 +227,11 @@ def landed(target: str, label: str) -> None:
     # see drivepool.remeasure_tick for when it actually asks.
     try:
         from . import drivepool
-        drivepool.note_placed(label)
+        try:
+            _sz = os.path.getsize(target)
+        except OSError:
+            _sz = 0
+        drivepool.note_placed(label, _sz)
     except Exception:                                        # noqa: BLE001
         pass
 

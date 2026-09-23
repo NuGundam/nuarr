@@ -148,9 +148,44 @@ _IO = {"at": 0.0, "r": 0, "w": 0}
 # background job over 68 TB, and one per placement would be permanent. It is
 # debounced instead - quiet for QUIET_S after the last placement, at most one
 # an hour, and never while DrivePool is already measuring.
-REMEASURE_QUIET_S = 600.0        # settle time after the last file lands
-REMEASURE_MIN_GAP_S = 3600.0     # and never more often than this
-MEASURE = {"dirty_at": 0.0, "last": 0.0, "n": 0, "why": "", "running": False}
+REMEASURE_QUIET_S = 900.0        # settle time after the last file lands
+REMEASURE_MIN_GAP_S = 6 * 3600.0  # and never more often than this
+# HOW MUCH HAS TO HAVE BEEN PLACED BEFORE IT IS WORTH A POOL-WIDE MEASURE.
+# On this pool a measure runs for HOURS - it was still going after two -
+# so the bar has to be high enough that the answer is worth the walk.
+REMEASURE_MIN_BYTES = 150 * 2 ** 30
+MEASURE = {"dirty_at": 0.0, "last": 0.0, "n": 0, "why": "", "running": False,
+           "bytes": 0, "files": 0, "disks": []}
+
+
+def _measure_load() -> None:
+    """The floor has to survive a restart, or it is not a floor.
+
+    Measured the hard way: nuarr was restarted while testing, which zeroed
+    `last` in memory, and the next quiet window asked for a second measure
+    while the first one's effects were still settling. Erik saw one finish
+    and another start, and turned the whole thing off - correctly.
+    """
+    try:
+        raw = kv_get("drivepool.measure.state") or ""
+        if raw:
+            import json as _j
+            d = _j.loads(raw)
+            for k in ("last", "n", "bytes", "files"):
+                if k in d:
+                    MEASURE[k] = d[k]
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _measure_save() -> None:
+    try:
+        import json as _j
+        kv_set("drivepool.measure.state",
+               _j.dumps({k: MEASURE[k] for k in ("last", "n", "bytes",
+                                                 "files")}))
+    except Exception:                                            # noqa: BLE001
+        pass
 
 
 def remeasure_on() -> bool:
@@ -161,11 +196,37 @@ def remeasure_on() -> bool:
         return True
 
 
-def note_placed(label: str = "") -> None:
-    """A file was staged into a PoolPart. Start the clock; do not measure."""
+def note_placed(label: str = "", size: int = 0) -> None:
+    r"""A file was staged into a PoolPart. Start the clock; do not measure.
+
+    THE TRIGGER IS WHAT NUARR PUT THERE, and nothing else. The first version
+    asked dpcmd for each disk's figures and compared the volume's used space
+    with DrivePool's counted total - the grey bar, in numbers - and asked for
+    a measure when that gap passed 8 GB. It is the wrong number: that gap
+    also holds everything DrivePool will never count, and every pool disk
+    here carries a $RECYCLE.BIN and a System Volume Information. So the gap
+    never returns to zero, and a threshold against it asks for a measure for
+    ever. Erik stopped it after one.
+
+    The bytes nuarr has placed since the last measure are the honest figure -
+    nuarr wrote them, so it knows them exactly, and they are precisely what
+    DrivePool has not counted. The dpcmd reading stays, for the panel to
+    show, not for the trigger to believe.
+    """
+    if not MEASURE["last"] and not MEASURE["bytes"]:
+        _measure_load()
     MEASURE["dirty_at"] = time.time()
+    MEASURE["bytes"] = int(MEASURE.get("bytes") or 0) + max(0, int(size or 0))
+    MEASURE["files"] = int(MEASURE.get("files") or 0) + 1
     if label:
-        MEASURE["why"] = f"files were placed directly on {label}"
+        d = list(MEASURE.get("disks") or [])
+        if label not in d:
+            d.append(label)
+        MEASURE["disks"] = d[-8:]
+        MEASURE["why"] = (f"{MEASURE['files']} file(s), "
+                          f"{MEASURE['bytes'] / 2 ** 30:.0f} GB placed on "
+                          + ", ".join(MEASURE["disks"]))
+    _measure_save()
 
 
 def _pool_root() -> str:
@@ -204,8 +265,10 @@ def remeasure(pool: str = "", why: str = "") -> dict:
     except Exception as e:                                       # noqa: BLE001
         return {"ok": False, "why": f"{type(e).__name__}: {e}"}
     ok = "queued for remeasuring" in out.lower()
-    MEASURE.update(last=time.time(), dirty_at=0.0,
-                   n=int(MEASURE["n"]) + (1 if ok else 0))
+    if ok:
+        MEASURE.update(last=time.time(), dirty_at=0.0, bytes=0, files=0,
+                       disks=[], n=int(MEASURE["n"]) + 1)
+        _measure_save()
     joblog.log(
         f"asked DrivePool to re-measure {root} - {why or MEASURE['why'] or ''}"
         if ok else f"could not ask DrivePool to re-measure: {out[:160]}",
@@ -318,13 +381,14 @@ def uncounted_bytes() -> tuple:
             worst.get("label") or worst.get("guid") or "")
 
 
-# AND THE GAP IS WHAT DECIDES, not only the clock. A placement that landed
-# 300 MB is not worth a pool-wide measure; 177 GB of grey is.
-REMEASURE_MIN_BYTES = 8 * 2 ** 30
+_LOADED = {"done": False}
 
 
 def remeasure_tick() -> dict:
     """The debounce. Called from the watcher; does nothing most of the time."""
+    if not _LOADED["done"]:
+        _LOADED["done"] = True
+        _measure_load()
     if not remeasure_on() or not MEASURE["dirty_at"]:
         return {"ok": True, "did": False}
     now = time.time()
@@ -336,15 +400,16 @@ def remeasure_tick() -> dict:
         return {"ok": True, "did": False, "why": "it is already measuring"}
     if measuring_now():
         return {"ok": True, "did": False, "why": "it is already measuring"}
-    gap, worst = uncounted_bytes()
-    if gap and gap < REMEASURE_MIN_BYTES:
-        # Placed, but barely anything is uncounted - the balancer or a
-        # previous measure has already taken it in. Nothing to ask for.
-        MEASURE["dirty_at"] = 0.0
-        return {"ok": True, "did": False, "gap": gap,
-                "why": f"only {gap / 2 ** 30:.1f} GB is uncounted"}
-    r = remeasure(why=(f"{gap / 2 ** 30:.0f} GB not counted, most of it on "
-                       f"{worst}") if gap else "")
+    if moving():
+        # A balance is moving files between poolparts and DrivePool counts
+        # those itself. Measuring under it is work over a moving target.
+        return {"ok": True, "did": False, "why": "it is balancing"}
+    placed = int(MEASURE.get("bytes") or 0)
+    if placed < REMEASURE_MIN_BYTES:
+        return {"ok": True, "did": False, "placed": placed,
+                "why": (f"only {placed / 2 ** 30:.0f} GB placed since the "
+                        f"last measure")}
+    r = remeasure(why=MEASURE.get("why") or "")
     return {"ok": bool(r.get("ok")), "did": True, **r}
 
 
@@ -1338,6 +1403,7 @@ def status() -> dict:
         # WHAT IT HAS BEEN TOLD ABOUT WHAT NUARR PLACED. See remeasure().
         "measure": {**MEASURE, "on": remeasure_on(),
                     "parts": poolpart_usage(),
+                    "min_bytes": REMEASURE_MIN_BYTES,
                     "uncounted": uncounted_bytes()[0],
                     "worst": uncounted_bytes()[1],
                     "busy": measuring_now(),

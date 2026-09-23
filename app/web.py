@@ -29025,11 +29025,17 @@ function dpMeasureHtml(d){
   // the panel says where it is rather than leaving you to read a bar.
   const gb=b=>`${(b/1073741824).toFixed(b>107374182400?0:1)} GB`;
   const parts=(m.parts||[]).filter(p=>(p.other||0)>1073741824);
+  // WHAT IT IS WAITING FOR, IN THE NUMBER THAT DECIDES. The trigger is the
+  // bytes nuarr has placed since the last measure - which nuarr wrote, so it
+  // knows them exactly - not the grey bar, which also holds everything
+  // DrivePool will never count and so never returns to zero.
+  const placed=m.bytes||0, need=m.min_bytes||0;
+  const enough=need && placed>=need;
   const state = m.busy ? 'DrivePool is measuring now'
               : !m.on ? 'off'
-              : m.dirty_at ? (due?`asking ${due}`:'asking shortly')
-              : (m.uncounted ? `${gb(m.uncounted)} not counted yet`
-                             : 'its figures are up to date');
+              : enough ? (due?`asking ${due}`:'asking shortly')
+              : placed ? `${gb(placed)} placed, asks at ${gb(need)}`
+              : 'nothing placed since the last measure';
   return `<div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;
        margin-top:5px;font-size:11px">
     <span class="dim">DrivePool's own figures:</span>
