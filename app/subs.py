@@ -403,6 +403,21 @@ def board() -> list:
     return rows
 
 
+# WHAT AN UNRUN ROW IS ACTUALLY WAITING FOR. precedence answers with the kind
+# name - "transcode" - which is the right key and the wrong sentence.
+_OWED_WORDS = {
+    "transcode": "the transcode goes first - it rewrites the container "
+                 "anyway, so the subtitles are settled after it, not twice",
+    "decode": "the decode check goes first - nothing is rewritten until the "
+              "file is known to play",
+    "listen": "the listener goes first - what the audio is in decides which "
+              "subtitles are wanted",
+    "subread": "the subtitle reader goes first - these tracks have not been "
+               "read yet",
+    "probe": "nobody has looked inside this file yet",
+}
+
+
 def board_totals(rows: list) -> dict:
     r"""What the switchboard's own rows add up to.
 
@@ -592,11 +607,29 @@ def queue_rows(limit: int = 400) -> dict:
                  for a in asks]
         if asks:
             with_ask += 1
+        # AND WHAT IT IS WAITING FOR, WHEN IT IS NOT WAITING ON YOU.
+        #
+        # Erik, pointing at four Big Bang Theory rows that had sat there half
+        # an hour: "what about these". Nothing had failed and no switch was
+        # off - precedence was holding them, because those files still owe a
+        # transcode and a transcode rewrites the container anyway, so the
+        # subtitles are settled after it rather than twice. The right order,
+        # and completely invisible: the row said what would happen and gave no
+        # hint that something else has to happen first, which leaves "it is
+        # broken" as the only available reading.
+        owed = ""
+        if r.get("state") == "queued" and not asks:
+            try:
+                from . import precedence
+                owed = precedence.owed_before(int(r["file_id"]), "subs")
+            except Exception:                                    # noqa: BLE001
+                owed = ""
         out.append({"file_id": int(r["file_id"]), "path": r.get("path") or "",
                     "name": r.get("name") or "", "library": r.get("library") or "",
                     "disk": r.get("disk") or "", "state": r.get("state") or "",
                     "acts": acts, "n": len(acts), "why": r.get("why") or "",
                     "err": r.get("err") or "",
+                    "owed": owed, "owed_why": _OWED_WORDS.get(owed, ""),
                     "ready": not asks, "keys": sorted({a["key"] for a in acts})})
     # AND THE FILES BUILT UNDER OLDER RULES, in the same list. A file can be
     # in both - queued for something today AND built under a rule that has

@@ -1057,6 +1057,21 @@ def requeue(file_id: int) -> dict:
 
 
 # -------------------------------------------------------------- the panel --
+# WHAT EACH PREREQUISITE MEANS, IN THE WORDS THE CARD SHOULD USE. The bare
+# kind name ("transcode") is the right key and the wrong sentence.
+WAITING_WORDS = {
+    "transcode": "waiting for the transcode - it rewrites the container "
+                 "anyway, so the subtitles are settled after it, not twice",
+    "decode": "waiting for the decode check - nothing is rewritten until "
+              "the file is known to play",
+    "listen": "waiting for the listener - what language the audio is in "
+              "decides which subtitles are wanted",
+    "subread": "waiting for the subtitle reader - the tracks have not been "
+               "read yet",
+    "probe": "waiting to be looked inside",
+}
+
+
 def snapshot(limit: int = 60) -> dict:
     """What is running, what is waiting, what finished and what failed."""
     init()
@@ -1089,6 +1104,30 @@ def snapshot(limit: int = 60) -> dict:
                     r[j] = json.loads(r.get(j) or "[]")
                 except Exception:                                # noqa: BLE001
                     r[j] = []
+    # AND WHY A QUEUED ROW HAS NOT RUN YET.
+    #
+    # Erik, pointing at four Big Bang Theory rows: "what about these". They
+    # were not stuck and nothing had failed - precedence was holding them,
+    # because those files still owe a transcode and a transcode carries the
+    # subtitle work anyway. That is the right order and it was invisible: the
+    # card said what would happen and gave no hint that something else has to
+    # happen first, so the only reading available was "this is not working".
+    #
+    # Asked only of the rows on screen, and only for the queued ones - it is
+    # a handful of file rows, not a sweep.
+    try:
+        from . import precedence
+        for r in out["queued"]:
+            try:
+                owed = precedence.owed_before(int(r["file_id"]), "subs")
+            except Exception:                                    # noqa: BLE001
+                owed = ""
+            if owed:
+                r["waiting_on"] = owed
+                r["waiting_why"] = WAITING_WORDS.get(
+                    owed, f"this file owes {owed} first")
+    except Exception:                                            # noqa: BLE001
+        pass
     return out
 
 

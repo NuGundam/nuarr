@@ -42195,7 +42195,10 @@ function subsListHtml(){
             white-space:nowrap" title="${esc(e.path||'')}">${esc(e.name||'')}</td>
         <td style="text-align:center">${e.disk?diskTag(e.disk):'<span class="dim">—</span>'}</td>
         <td style="text-align:center" class="dim">${esc(e.library||'')}</td>
-        <td style="text-align:left">${(e.acts||[]).map(a=>{
+        <td style="text-align:left">${e.owed?`<div style="font-size:10.5px;
+            margin-bottom:3px;color:var(--warn)"
+            title="${esc(e.owed_why||'')}">\u25cb waiting — ${
+            esc(e.owed_why||'')}</div>`:''}${(e.acts||[]).map(a=>{
             const c=SUBS_C[a.key]||'#6fb0ff';
             // WHICH switch, by name, and a way to reach it. A dimmed row and
             // a tooltip were the whole of this before, and neither is
