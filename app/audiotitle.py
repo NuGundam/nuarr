@@ -221,7 +221,7 @@ def _fix_file(path: str, edits: list) -> tuple[bool, str]:
     for e in edits:
         cmd += ["--edit", f"track:a{e['track']}", "--set", f"name={e['new']}"]
     try:
-        r = _quiet_run(cmd, capture_output=True, text=True, timeout=300)
+        r = _quiet_run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
     except Exception as e:                                   # noqa: BLE001
         return False, f"{type(e).__name__}"
     if r.returncode != 0:

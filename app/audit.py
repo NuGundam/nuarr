@@ -217,7 +217,7 @@ def probe(path: str) -> dict | None:
         out = subprocess.run(
             [_ffprobe(), "-v", "error", "-show_streams", "-show_format",
              "-of", "json", path],
-            capture_output=True, text=True, timeout=180,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             startupinfo=hidden_si()).stdout
         return json.loads(out) if out.strip() else None

@@ -229,7 +229,7 @@ def _probe_one(exe: str, fam: str, encoder: str, timeout: float = 45.0) -> dict:
         cmd += ["-t", "2", out]
         t0 = time.time()
         try:
-            p = subprocess.run(cmd, capture_output=True, text=True,
+            p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
                                timeout=timeout, creationflags=NO_WINDOW,
             startupinfo=hidden_si())
             ok = (p.returncode == 0 and os.path.exists(out)

@@ -1829,7 +1829,7 @@ def _net_use(server: str, user: str, pwd: str) -> tuple[bool, str]:
     r = subprocess.run(
         ["net", "use", f"\\\\{server}\\IPC$", pwd, f"/user:{user}",
          "/persistent:no"],
-        capture_output=True, text=True, timeout=25, creationflags=NO_WINDOW,
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=25, creationflags=NO_WINDOW,
             startupinfo=hidden_si())
     if r.returncode == 0:
         return True, ""
@@ -1841,7 +1841,7 @@ def _net_use(server: str, user: str, pwd: str) -> tuple[bool, str]:
     # the old connection yourself" is not an error message, it is homework.
     if "1219" in msg:
         subprocess.run(["net", "use", f"\\\\{server}", "/delete", "/y"],
-                       capture_output=True, text=True, timeout=15,
+                       capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
                        creationflags=NO_WINDOW,
             startupinfo=hidden_si())
         r = subprocess.run(
@@ -1861,7 +1861,7 @@ def _net_share_names(server: str) -> list[str]:
     """The shares `server` offers, minus the administrative ones."""
     import subprocess
     r = subprocess.run(["net", "view", f"\\\\{server}"], capture_output=True,
-                       text=True, timeout=25, creationflags=NO_WINDOW,
+                       text=True, encoding="utf-8", errors="replace", timeout=25, creationflags=NO_WINDOW,
             startupinfo=hidden_si())
     if r.returncode != 0:
         return []
@@ -1968,7 +1968,7 @@ def api_net_forget(server: str):
     if len(stored) == len(_net_stored()):
         raise HTTPException(404, f"no stored connection for {server}")
     subprocess.run(["net", "use", f"\\\\{server}", "/delete", "/y"],
-                   capture_output=True, text=True, timeout=15,
+                   capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
                    creationflags=NO_WINDOW,
             startupinfo=hidden_si())
     p = _config_path()
@@ -2525,7 +2525,7 @@ async def api_codecpolicy_test(body: dict = Body(...)):
         cmd += ["-t", "3", out]
         t0 = time.time()
         try:
-            p = subprocess.run(cmd, capture_output=True, text=True,
+            p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
                                timeout=90, creationflags=NO_WINDOW,
             startupinfo=hidden_si())
             took = time.time() - t0
@@ -5271,7 +5271,7 @@ def _reprobe(file_id: int, path: str) -> None:
     try:
         q = subprocess.run([fp, "-v", "quiet", "-print_format", "json",
                             "-show_streams", "-show_format", path],
-                           capture_output=True, text=True, timeout=120,
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120,
                            creationflags=NO_WINDOW,
             startupinfo=hidden_si())
         if q.returncode == 0 and q.stdout:
@@ -10963,7 +10963,7 @@ async def api_mkvtool(check: int = 0):
             return {"ok": False, "error": "not installed", "path": exe}
         try:
             out = subprocess.run([exe, "--version"], capture_output=True,
-                                 text=True, timeout=15,
+                                 text=True, encoding="utf-8", errors="replace", timeout=15,
                                  creationflags=NO_WINDOW,
             startupinfo=hidden_si()).stdout or ""
             m = re.search(r"v(\d+(?:\.\d+)*)\s*\('([^']*)'\)", out)

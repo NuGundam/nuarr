@@ -86,7 +86,7 @@ def _ps(script: str, timeout: int = 60) -> str:
     try:
         r = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-            capture_output=True, text=True, timeout=timeout,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
             creationflags=NO_WINDOW, startupinfo=hidden_si())
         return r.stdout or ""
     except Exception:                                        # noqa: BLE001

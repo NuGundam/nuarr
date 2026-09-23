@@ -750,7 +750,7 @@ def _extract_sup_watched(path: str, rel: int, work: str, tag: str,
             "-progress", "pipe:1", "-i", path,
             "-map", f"0:s:{rel}", "-c:s", "copy", sup]
     p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                         text=True, errors="replace",
+                         text=True, encoding="utf-8", errors="replace",
                          creationflags=NO_WINDOW, startupinfo=_hidden(),
                          env=_env())
     hook = getattr(_TLS, "on_child", None)
@@ -800,7 +800,7 @@ def _probe_streams(path: str) -> dict | None:
         p = subprocess.run(
             [exe, "-v", "error", "-show_streams", "-show_format",
              "-of", "json", path],
-            capture_output=True, text=True, errors="replace", timeout=120,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120,
             creationflags=NO_WINDOW, startupinfo=_hidden())
         return json.loads(p.stdout or "{}") or None
     except Exception:                                        # noqa: BLE001
@@ -1117,7 +1117,7 @@ def _hidden() -> "subprocess.STARTUPINFO | None":
 
 def _run(args: list[str], timeout: float = 3600) -> tuple[int, str]:
     p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                         text=True, errors="replace",
+                         text=True, encoding="utf-8", errors="replace",
                          creationflags=NO_WINDOW, startupinfo=_hidden(),
                          env=_env())
     hook = getattr(_TLS, "on_child", None)
@@ -1825,7 +1825,7 @@ def reap_orphans() -> int:
             ["powershell", "-NoProfile", "-Command",
              "Get-CimInstance Win32_Process | Select-Object ProcessId,"
              "ParentProcessId,Name,CommandLine | ConvertTo-Json -Depth 3"],
-            capture_output=True, text=True, timeout=90,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90,
             creationflags=NO_WINDOW, startupinfo=_hidden()).stdout
         procs = json.loads(out or "[]")
         if isinstance(procs, dict):
@@ -2434,7 +2434,7 @@ def paddle_info(force: bool = False) -> dict:
         # got a console: one flash on the OCR engines page, first load after a
         # restart, because paddle_info() is cached after that.
         r = _sp.run([_sys.executable, "-c", code], capture_output=True,
-                    text=True, timeout=120, creationflags=NO_WINDOW,
+                    text=True, encoding="utf-8", errors="replace", timeout=120, creationflags=NO_WINDOW,
                     startupinfo=_hidden())
         lines = [l for l in (r.stdout or "").strip().splitlines() if l.strip()]
         if lines:
@@ -2491,7 +2491,7 @@ def paddle_install_start(mode: str) -> dict:
                 # hidden STARTUPINFO has to be inherited too - same reason as
                 # the probe above.
                 p = _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.STDOUT,
-                              text=True, creationflags=NO_WINDOW,
+                              text=True, encoding="utf-8", errors="replace", creationflags=NO_WINDOW,
                               startupinfo=_hidden())
                 for line in p.stdout:
                     if line.strip():
@@ -2679,7 +2679,7 @@ def _run_progress(args: list[str], tick, base: float, span: float,
     from collections import deque
     tail: deque = deque(maxlen=25)
     p = subprocess.Popen(args, stdout=subprocess.PIPE,
-                         stderr=subprocess.STDOUT, text=True,
+                         stderr=subprocess.STDOUT, text=True, encoding="utf-8",
                          errors="replace", creationflags=NO_WINDOW,
                          startupinfo=_hidden(), env=_env())
     hook = getattr(_TLS, "on_child", None)
@@ -2992,7 +2992,7 @@ def _pip_latest(pkg: str) -> str:
         # pip is not a leaf: it shells out while resolving. Inherit the hidden
         # STARTUPINFO so nothing it starts can put a console on the desktop.
         r = subprocess.run([_sys.executable, "-m", "pip", "index", "versions",
-                            pkg], capture_output=True, text=True, timeout=90,
+                            pkg], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90,
                            creationflags=NO_WINDOW, startupinfo=_hidden())
         m = re.search(r"LATEST:\s*([0-9][\w.\-]*)",
                       (r.stdout or "") + (r.stderr or ""))
@@ -3236,7 +3236,7 @@ def pip_update_start() -> dict:
             p = subprocess.Popen(
                 [sys.executable, "-m", "pip", "install", "--upgrade",
                  "--prefer-binary", "--no-warn-script-location", "pgsrip"],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
                 creationflags=NO_WINDOW,
             startupinfo=hidden_si())
             for line in p.stdout:

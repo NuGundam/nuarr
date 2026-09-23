@@ -464,7 +464,7 @@ Stop-Transcript | Out-Null
     try:
         r = subprocess.run(
             ["powershell", "-NoProfile", "-Command", spawn],
-            creationflags=0x08000000, capture_output=True, text=True,
+            creationflags=0x08000000, capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=60,
             startupinfo=hidden_si())
         if r.stdout.strip().splitlines()[-1:] != ["0"]:

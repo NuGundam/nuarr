@@ -373,7 +373,7 @@ def _stream(server: str) -> None:
         p = subprocess.Popen(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", _PS],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, text=True, creationflags=NO_WINDOW,
+            stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", creationflags=NO_WINDOW,
             env=env,
             startupinfo=hidden_si())
         p.stdin.write((pwd or "") + "\n")
@@ -427,7 +427,7 @@ def _sample(server: str) -> dict:
         p = subprocess.Popen(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", _PS],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, text=True, creationflags=NO_WINDOW,
+            stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", creationflags=NO_WINDOW,
             env=env,
             startupinfo=hidden_si())
         out, err = p.communicate(input=(pwd or "") + "\n", timeout=TIMEOUT_S)

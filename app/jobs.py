@@ -7075,7 +7075,7 @@ def _mkvextract_progress(cmd: list[str], on_frac) -> None:
     seconds of apparently-nothing otherwise.
     """
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                         text=True, errors="replace", creationflags=NO_WINDOW,
+                         text=True, encoding="utf-8", errors="replace", creationflags=NO_WINDOW,
                          bufsize=1,
             startupinfo=hidden_si())
     tail: collections.deque[str] = collections.deque(maxlen=8)
@@ -7180,7 +7180,7 @@ def _mkv_sub_tracks(src: str) -> list[dict]:
     """
     try:
         pr = subprocess.run([_mkvextract_exe().replace("mkvextract", "mkvmerge"),
-                             "-J", src], capture_output=True, text=True,
+                             "-J", src], capture_output=True, text=True, encoding="utf-8",
                             timeout=120, creationflags=NO_WINDOW, errors="replace",
             startupinfo=hidden_si())
         tracks = json.loads(pr.stdout).get("tracks") or []

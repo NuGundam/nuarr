@@ -202,7 +202,7 @@ def _read_counters() -> dict[str, dict]:
     try:
         r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive",
                             "-Command", ps],
-                           capture_output=True, text=True, timeout=20,
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20,
                            creationflags=NO_WINDOW,
             startupinfo=hidden_si())
         out: dict[str, dict] = {}
@@ -414,7 +414,7 @@ def _load_map_shell() -> None:
     try:
         r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive",
                             "-Command", ps],
-                           capture_output=True, text=True, timeout=30,
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
                            creationflags=NO_WINDOW,
             startupinfo=hidden_si())
         for line in (r.stdout or "").splitlines():

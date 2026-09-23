@@ -635,7 +635,7 @@ def _live_sub_tracks(path: str) -> list:
     out: list = []
     try:
         r = subprocess.run([_mkvmerge(), "-J", path], capture_output=True,
-                           text=True, timeout=180, creationflags=NO_WINDOW,
+                           text=True, encoding="utf-8", errors="replace", timeout=180, creationflags=NO_WINDOW,
                            startupinfo=hidden_si())
         d = json.loads(r.stdout or "{}")
     except Exception:                                            # noqa: BLE001
@@ -977,7 +977,7 @@ def _run_reporting(cmd: list, report=None, timeout: int = 3600,
 
 
 def _plain(cmd: list, timeout: int) -> tuple:
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
                        creationflags=NO_WINDOW, startupinfo=hidden_si())
     return r.returncode, r.stdout or "", r.stderr or ""
 
@@ -989,7 +989,7 @@ def _probe_langs(path: str) -> set:
         out = subprocess.run(
             [_ffprobe_exe(), "-v", "quiet", "-print_format", "json",
              "-show_streams", "-select_streams", "s", path],
-            capture_output=True, text=True, timeout=120,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120,
             creationflags=NO_WINDOW, startupinfo=hidden_si()).stdout
         got = set()
         for s in (json.loads(out or "{}").get("streams") or []):

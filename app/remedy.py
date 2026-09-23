@@ -597,8 +597,18 @@ async def requeue(file_id: int, kind: str, source: str = "", why: str = "",
         await jobs.enqueue(int(file_id), row["path"], row.get("title") or "",
                            source=source or "remedy", priority=60)
     except jobs.NothingToDo:
-        _note(file_id, kind, REQUEUE, source, auto, False,
-              "the planner has no work for this file", row["path"])
+        # NOT A FAILURE - THE FINDING HAD ALREADY GONE. A check reports what
+        # it saw when it looked; by the time the remedy runs, the planner can
+        # have nothing to do because something else already did it. Measured
+        # over a week: 97 of these, and every file behind the six I opened was
+        # state=done and matching its rules. Recording them as failed put 97
+        # false faults in the ledger and in the counts the panel reports.
+        #
+        # So it is noted as settled, with the sentence saying why, which is
+        # both true and the thing worth knowing: there is nothing to fix.
+        _note(file_id, kind, REQUEUE, source, auto, True,
+              "nothing to do - the file already matches the rules, so the "
+              "finding had been settled before this ran", row["path"])
         return {"ok": False, "nothing_to_do": True,
                 "why": "the planner re-read the file and has no work for it"}
     except ValueError:

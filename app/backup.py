@@ -246,7 +246,7 @@ def _write_bundle(dest: Path) -> dict:
         # source hash changes and the bundle is rewritten, which is why it
         # looked intermittent.
         frozen = subprocess.run([sys.executable, "-m", "pip", "freeze"],
-                                capture_output=True, text=True, timeout=120,
+                                capture_output=True, text=True, errors="replace", timeout=120,
                                 creationflags=NO_WINDOW,
             startupinfo=hidden_si())
         req.write_text(frozen.stdout, encoding="utf-8")
@@ -264,7 +264,7 @@ def _write_bundle(dest: Path) -> dict:
         rc = subprocess.run([sys.executable, "-m", "pip", "download",
                              "-r", str(req), "-d", str(wheels),
                              "--prefer-binary"],
-                            capture_output=True, text=True, timeout=1800,
+                            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=1800,
                             creationflags=NO_WINDOW,
             startupinfo=hidden_si())
         if rc.returncode != 0:
@@ -274,7 +274,7 @@ def _write_bundle(dest: Path) -> dict:
                 r1 = subprocess.run([sys.executable, "-m", "pip", "download", p,
                                      "-d", str(wheels), "--prefer-binary",
                                      "--no-deps"],
-                                    capture_output=True, text=True, timeout=180,
+                                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180,
                                     creationflags=NO_WINDOW,
             startupinfo=hidden_si())
                 if r1.returncode != 0:

@@ -642,7 +642,7 @@ def _read_events(path: str, mkv_track_id: int, oped=None,
     try:
         r = _quiet_run([_mkvextract(), "tracks", path,
                         f"{int(mkv_track_id)}:{out}"],
-                       capture_output=True, text=True, timeout=180)
+                       capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180)
         if r.returncode >= 2 or not os.path.exists(out):
             return None
         # A PICTURE TRACK IS NOT A TRACK THIS CAN READ, and saying so is the
@@ -1930,7 +1930,7 @@ def _fix_file(path: str, edits: list) -> tuple[bool, str]:
         if e.get("unforce"):
             cmd += ["--set", "flag-forced=0"]
     try:
-        r = _quiet_run(cmd, capture_output=True, text=True, timeout=300)
+        r = _quiet_run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
     except Exception as e:                                   # noqa: BLE001
         return False, str(e)[:160]
     if r.returncode >= 2:

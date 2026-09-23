@@ -315,7 +315,7 @@ def _cuda_devices() -> tuple[int, str]:
         r = subprocess.run(
             [_sys.executable, "-c",
              "import ctranslate2;print(ctranslate2.get_cuda_device_count())"],
-            capture_output=True, text=True, timeout=60,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
             creationflags=NO_WINDOW, startupinfo=hidden_si())
         if r.returncode == 0 and (r.stdout or "").strip().isdigit():
             n = int(r.stdout.strip())
@@ -399,7 +399,7 @@ def _nvidia_present() -> bool:
     """Is there an NVIDIA GPU at all - asked of the driver, not of CUDA."""
     try:
         r = subprocess.run(["nvidia-smi", "-L"], capture_output=True,
-                           text=True, timeout=10, creationflags=NO_WINDOW,
+                           text=True, encoding="utf-8", errors="replace", timeout=10, creationflags=NO_WINDOW,
                 startupinfo=hidden_si())
         return r.returncode == 0 and "GPU" in (r.stdout or "")
     except Exception:                                    # noqa: BLE001
@@ -417,7 +417,7 @@ def latest_version(pkg: str = "faster-whisper") -> dict:
     try:
         r = subprocess.run(
             [_sys.executable, "-m", "pip", "index", "versions", pkg],
-            capture_output=True, text=True, timeout=90,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90,
             creationflags=NO_WINDOW,
             startupinfo=hidden_si())
         out = (r.stdout or "") + (r.stderr or "")
@@ -524,7 +524,7 @@ def _install_worker(mode: str) -> None:
     tail: deque = deque(maxlen=40)
     try:
         p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                             stderr=subprocess.STDOUT, text=True,
+                             stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
                              creationflags=NO_WINDOW,
             startupinfo=hidden_si())
         for line in p.stdout:                      # live tail for the page
@@ -622,7 +622,7 @@ def _load_probe(dev: str, ct: str) -> tuple[bool, str]:
         r = subprocess.run(
             [_sys.executable, script, "--device", dev, "--compute", ct,
              "--root", str(MODEL_DIR), "--size", MODEL_SIZE],
-            capture_output=True, text=True, timeout=PROBE_TIMEOUT_S,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=PROBE_TIMEOUT_S,
             creationflags=NO_WINDOW,
             startupinfo=hidden_si())
     except subprocess.TimeoutExpired:
@@ -954,7 +954,7 @@ def _duration(path: str) -> float:
         p = subprocess.run(
             [fp, "-v", "quiet", "-show_entries", "format=duration",
              "-of", "csv=p=0", path],
-            capture_output=True, text=True, timeout=60,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
             creationflags=NO_WINDOW,
             startupinfo=hidden_si())
         return float((p.stdout or "0").strip() or 0)
@@ -1649,7 +1649,7 @@ def apply_tags(path: str, tags: dict[int, str]) -> tuple[bool, str]:
     for track, code in sorted(tags.items()):
         cmd += ["--edit", f"track:a{int(track) + 1}", "--set", f"language={code}"]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=600,
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=600,
                            creationflags=NO_WINDOW,
             startupinfo=hidden_si())
     except Exception as e:                               # noqa: BLE001
@@ -2822,7 +2822,7 @@ def _track_title_live(path: str, track: int) -> str:
             r"C:\Program Files\MKVToolNix\mkvmerge.exe"
         if not os.path.exists(exe) or not os.path.exists(path):
             return ""
-        r = subprocess.run([exe, "-J", path], capture_output=True, text=True,
+        r = subprocess.run([exe, "-J", path], capture_output=True, text=True, encoding="utf-8", errors="replace",
                            timeout=120, creationflags=NO_WINDOW,
                            startupinfo=hidden_si())
         auds = [t for t in (json.loads(r.stdout or "{}").get("tracks") or [])
@@ -2845,7 +2845,7 @@ def _set_track_title(path: str, track: int, title: str) -> bool:
         r = subprocess.run(
             [exe, path, "--edit", f"track:a{int(track) + 1}",
              "--set", f"name={title}"],
-            capture_output=True, text=True, timeout=600,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=600,
             creationflags=NO_WINDOW, startupinfo=hidden_si())
         return r.returncode == 0
     except Exception:                                    # noqa: BLE001
@@ -3540,7 +3540,7 @@ def _reprobe_quiet(file_id: int, path: str) -> None:
     try:
         q = subprocess.run([fp, "-v", "quiet", "-print_format", "json",
                             "-show_streams", "-show_format", path],
-                           capture_output=True, text=True, timeout=120,
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120,
                            creationflags=NO_WINDOW,
             startupinfo=hidden_si())
         if q.returncode == 0 and q.stdout:

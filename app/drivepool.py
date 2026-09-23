@@ -509,7 +509,7 @@ def refresh() -> None:
             out = subprocess.run(
                 ["powershell", "-NoProfile", "-Command",
                  f"(Get-Item '{EXE}').VersionInfo.ProductVersion"],
-                capture_output=True, text=True, timeout=20,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20,
                 creationflags=0x08000000).stdout.strip()
             STATE["version"] = out
         except Exception:                                    # noqa: BLE001
@@ -683,7 +683,7 @@ def _read_targets() -> dict:
     out = subprocess.run(
         ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
          "-EncodedCommand", enc],
-        capture_output=True, text=True, timeout=60, creationflags=0x08000000)
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60, creationflags=0x08000000)
     txt = (out.stdout or "").strip()
     if not txt:
         raise RuntimeError((out.stderr or "no output").strip()[:200])
@@ -917,7 +917,7 @@ def service_state() -> str:
     """running | stopped | <other> | unknown"""
     try:
         r = subprocess.run(["sc.exe", "query", SERVICE], capture_output=True,
-                           text=True, timeout=15, creationflags=NO_WINDOW)
+                           text=True, encoding="utf-8", errors="replace", timeout=15, creationflags=NO_WINDOW)
         m = re.search(r"STATE\s*:\s*\d+\s+(\w+)", r.stdout or "")
         return (m.group(1).lower() if m else "unknown")
     except Exception:                                        # noqa: BLE001
@@ -991,7 +991,7 @@ _BAL_LAST: dict = {"at": 0.0, "what": "", "ok": None, "why": ""}
 def _svc(verb: str, want: str, timeout: float = 45.0) -> tuple:
     try:
         subprocess.run(["sc.exe", verb, SERVICE], capture_output=True,
-                       text=True, timeout=20, creationflags=NO_WINDOW)
+                       text=True, encoding="utf-8", errors="replace", timeout=20, creationflags=NO_WINDOW)
     except Exception as e:                                   # noqa: BLE001
         return False, f"sc {verb}: {type(e).__name__}: {e}"[:160]
     t0 = time.time()

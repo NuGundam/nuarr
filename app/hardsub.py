@@ -1795,7 +1795,7 @@ def mark_one(file_id: int, kind: str = "") -> dict:
                "--default-track", f"0:{make_default}",
                "--forced-track", "0:no",
                srt]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600,
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=3600,
                            creationflags=NO_WINDOW, startupinfo=hidden_si())
         if r.returncode >= 2 or not os.path.exists(tmp):
             why = (r.stderr or r.stdout or "mkvmerge failed").strip()[:300]

@@ -331,6 +331,18 @@ async def run(file_id: int, delete_file: bool = True,
                 and e.response is not None
                 and e.response.status_code == 404)
 
+    def _code(e: Exception) -> str:
+        try:
+            return str(e.response.status_code)                   # type: ignore
+        except Exception:                                        # noqa: BLE001
+            return "an error"
+
+    def _is_5xx(e: Exception) -> bool:
+        import httpx
+        return (isinstance(e, httpx.HTTPStatusError)
+                and e.response is not None
+                and 500 <= e.response.status_code < 600)
+
     try:
         # ONE: THE FILE. Removes it from disk and from the arr's database, so
         # the episode has nothing for a replacement to be measured against.
@@ -340,10 +352,24 @@ async def run(file_id: int, delete_file: bool = True,
                 await client.delete_file(int(row["arr_file_id"]))
                 did.append("deleted the file")
             except Exception as e:
-                if not _is_404(e):
+                if _is_404(e):
+                    did.append("the arr no longer tracks this file (already "
+                               "replaced or removed) - nothing to delete")
+                elif _is_5xx(e):
+                    # THE ARR'S OWN ERROR, SAID IN WORDS. Radarr answered 500
+                    # to DELETE /moviefile/31125 and /31127, twice each, and
+                    # what reached the ledger was httpx's sentence - a URL and
+                    # a link to MDN, which tells you nothing you can act on.
+                    # The flow still stops, and it should: the replacement
+                    # search cannot accept anything while the file it is
+                    # measured against is still there.
+                    return {"ok": False, "did": did, "why": (
+                        f"{cfg.name} refused to delete its record for this "
+                        f"file ({_code(e)}) - that record is broken on its "
+                        f"side, and nothing can replace the file until it is "
+                        f"removed there")}
+                else:
                     raise
-                did.append("the arr no longer tracks this file (already "
-                           "replaced or removed) - nothing to delete")
 
         # TWO: THE RELEASE. markFailed blocklists it AND queues the arr's own
         # search, which is why the search below is a fallback rather than a

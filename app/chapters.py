@@ -177,7 +177,7 @@ def read(path: str, timeout: float = 45.0) -> list | None:
         p = subprocess.run(
             [jobs._ffprobe_exe(), "-v", "error", "-print_format", "json",
              "-show_chapters", path],
-            capture_output=True, text=True, timeout=timeout,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
             creationflags=NO_WINDOW)
         return json.loads(p.stdout or "{}").get("chapters") or []
     except Exception:                                        # noqa: BLE001

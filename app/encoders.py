@@ -156,7 +156,7 @@ def _try_family(fam: str, timeout: float = 25.0, attempts: int = 2) -> dict:
         cmd += _quality_args(fam, 28)
         cmd += ["-t", "2", out]
         try:
-            p = subprocess.run(cmd, capture_output=True, text=True,
+            p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
                                timeout=timeout, creationflags=NO_WINDOW,
             startupinfo=hidden_si())
             ok = (p.returncode == 0 and os.path.exists(out)
@@ -254,7 +254,7 @@ def aac_encoder() -> tuple[str, list[str]]:
         import subprocess as _sp
         from .config import NO_WINDOW as _NW
         r = _sp.run([_ff(), "-hide_banner", "-encoders"],
-                    capture_output=True, text=True, timeout=60,
+                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
                     creationflags=_NW)
         for line in (r.stdout or "").splitlines():
             t = line.strip()
@@ -519,7 +519,7 @@ def devices() -> dict:
     try:
         r = subprocess.run(["nvidia-smi", "--query-gpu=name",
                             "--format=csv,noheader"], capture_output=True,
-                           text=True, timeout=10, creationflags=NO_WINDOW,
+                           text=True, encoding="utf-8", errors="replace", timeout=10, creationflags=NO_WINDOW,
                 startupinfo=hidden_si())
         if r.returncode == 0:
             gpu = (r.stdout or "").strip().splitlines()[0].strip()
