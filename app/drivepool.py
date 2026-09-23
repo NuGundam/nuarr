@@ -213,6 +213,116 @@ def remeasure(pool: str = "", why: str = "") -> dict:
     return {"ok": ok, "why": out[:300], "pool": root}
 
 
+# ------------------------------------------- how far behind the figures are --
+#
+# THERE IS NO PER-DISK MEASURE. Erik asked; dpcmd 2.3.13.1687 was asked back.
+# remeasure-pool takes a poolPath and nothing else - handed "P:\Anime Shows"
+# it answers "Can't open handle to volume", and handed the pool root it
+# queues the POOL by its GUID. list-poolparts is per disk, but it reports
+# what DrivePool currently believes rather than recomputing it.
+#
+# That is still worth having, because it is the grey bar in numbers: each
+# poolpart's volume says how much space is used, DrivePool's own file totals
+# say how much of that it has counted, and the difference IS the "Other"
+# wedge. So nuarr can see the gap per disk, say so, and ask for the measure
+# on evidence rather than on a timer alone.
+_PARTS = {"at": 0.0, "rows": []}
+PARTS_TTL = 120.0
+
+
+def poolpart_usage(fresh: bool = False) -> list:
+    """Per disk: the volume's own used space, what DrivePool has counted of
+    it, and the difference - which is what shows as "Other"."""
+    now = time.time()
+    if not fresh and _PARTS["rows"] and now - _PARTS["at"] < PARTS_TTL:
+        return _PARTS["rows"]
+    exe = _dpcmd()
+    if not exe:
+        return []
+    try:
+        r = subprocess.run([exe, "list-poolparts", _pool_root(), "1"],
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=90,
+                           creationflags=NO_WINDOW)
+        text = r.stdout or ""
+    except Exception:                                            # noqa: BLE001
+        return _PARTS["rows"]
+    # label the parts with nuarr's own names, joined on the PoolPart guid -
+    # these disks have no drive letters, so the guid is the only shared key.
+    by_guid: dict = {}
+    try:
+        from . import scanner
+        for lbl, part in (scanner.pool_disks() or {}).items():
+            m = re.search(r"PoolPart\.([0-9a-fA-F-]+)", str(part))
+            if m:
+                by_guid[m.group(1).lower()] = lbl
+    except Exception:                                            # noqa: BLE001
+        pass
+    rows, cur = [], None
+    for line in text.splitlines():
+        t = line.strip()
+        m = re.search(r"PoolPart\.([0-9a-fA-F-]+)'", t)
+        if m:
+            if cur:
+                rows.append(cur)
+            g = m.group(1).lower()
+            cur = {"guid": g, "label": by_guid.get(g, ""), "state": "",
+                   "size": 0, "used": 0, "free": 0, "counted": 0}
+            continue
+        if cur is None:
+            continue
+        if t.startswith("[") and t.endswith("]"):
+            cur["state"] = t.strip("[]")
+            continue
+        m = re.match(r"- (Size|Used space|Free space|Total): ([\d,]+) B", t)
+        if m:
+            n = int(m.group(2).replace(",", ""))
+            cur[{"Size": "size", "Used space": "used",
+                 "Free space": "free", "Total": "counted"}[m.group(1)]] = n
+    if cur:
+        rows.append(cur)
+    for x in rows:
+        # "Other" is everything on the volume DrivePool has not attributed to
+        # pooled files. Never negative: a measure in flight can report more
+        # than the volume holds for a moment.
+        x["other"] = max(0, int(x["used"]) - int(x["counted"]))
+    rows.sort(key=lambda x: x.get("label") or x.get("guid") or "")
+    _PARTS.update(at=now, rows=rows)
+    return rows
+
+
+def measuring_now(rows: list | None = None) -> bool:
+    """Is DrivePool rebuilding its figures right now?
+
+    WHILE IT MEASURES, ITS OWN TOTALS ARE ZERO. Caught in the act: with a
+    measure running, eleven of twelve parts reported "statistics incomplete"
+    and a counted total of 0 B, which reads as 66 TB uncounted - the whole
+    pool. Acting on that would ask for a measure because a measure is
+    running, for ever. The state markers are the guard.
+    """
+    rows = poolpart_usage() if rows is None else rows
+    return any(str(x.get("state") or "") for x in rows)
+
+
+def uncounted_bytes() -> tuple:
+    """(bytes DrivePool has not counted, the worst disk).
+
+    Zero while a measure is in flight - see measuring_now: the figures are
+    not wrong then, they are absent, and those are different things.
+    """
+    rows = poolpart_usage()
+    if not rows or measuring_now(rows):
+        return 0, ""
+    worst = max(rows, key=lambda x: x.get("other") or 0)
+    return (sum(int(x.get("other") or 0) for x in rows),
+            worst.get("label") or worst.get("guid") or "")
+
+
+# AND THE GAP IS WHAT DECIDES, not only the clock. A placement that landed
+# 300 MB is not worth a pool-wide measure; 177 GB of grey is.
+REMEASURE_MIN_BYTES = 8 * 2 ** 30
+
+
 def remeasure_tick() -> dict:
     """The debounce. Called from the watcher; does nothing most of the time."""
     if not remeasure_on() or not MEASURE["dirty_at"]:
@@ -224,7 +334,17 @@ def remeasure_tick() -> dict:
         return {"ok": True, "did": False, "why": "measured recently"}
     if "Measuring" in (STATE.get("flags") or {}):
         return {"ok": True, "did": False, "why": "it is already measuring"}
-    r = remeasure()
+    if measuring_now():
+        return {"ok": True, "did": False, "why": "it is already measuring"}
+    gap, worst = uncounted_bytes()
+    if gap and gap < REMEASURE_MIN_BYTES:
+        # Placed, but barely anything is uncounted - the balancer or a
+        # previous measure has already taken it in. Nothing to ask for.
+        MEASURE["dirty_at"] = 0.0
+        return {"ok": True, "did": False, "gap": gap,
+                "why": f"only {gap / 2 ** 30:.1f} GB is uncounted"}
+    r = remeasure(why=(f"{gap / 2 ** 30:.0f} GB not counted, most of it on "
+                       f"{worst}") if gap else "")
     return {"ok": bool(r.get("ok")), "did": True, **r}
 
 
@@ -1217,6 +1337,10 @@ def status() -> dict:
         "flags": dict(STATE["flags"]),
         # WHAT IT HAS BEEN TOLD ABOUT WHAT NUARR PLACED. See remeasure().
         "measure": {**MEASURE, "on": remeasure_on(),
+                    "parts": poolpart_usage(),
+                    "uncounted": uncounted_bytes()[0],
+                    "worst": uncounted_bytes()[1],
+                    "busy": measuring_now(),
                     "quiet_s": REMEASURE_QUIET_S,
                     "min_gap_s": REMEASURE_MIN_GAP_S,
                     "due_in": (max(0.0, REMEASURE_QUIET_S

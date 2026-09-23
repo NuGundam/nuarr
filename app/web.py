@@ -29019,15 +29019,26 @@ function dpMeasureHtml(d){
   if(!m || m.on===undefined) return '';
   const when=t=>t?ago(t):'never';
   const due=m.due_in?`in ${Math.ceil(m.due_in/60)} min`:'';
-  const state = !m.on ? 'off'
+  // WHAT IT HAS NOT COUNTED, PER DISK - which is the grey bar, in numbers.
+  // There is no per-disk measure to ask for (dpcmd's remeasure-pool takes a
+  // pool and queues the whole thing), but the gap is readable per disk, so
+  // the panel says where it is rather than leaving you to read a bar.
+  const gb=b=>`${(b/1073741824).toFixed(b>107374182400?0:1)} GB`;
+  const parts=(m.parts||[]).filter(p=>(p.other||0)>1073741824);
+  const state = m.busy ? 'DrivePool is measuring now'
+              : !m.on ? 'off'
               : m.dirty_at ? (due?`asking ${due}`:'asking shortly')
-              : 'nothing to tell it';
+              : (m.uncounted ? `${gb(m.uncounted)} not counted yet`
+                             : 'its figures are up to date');
   return `<div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;
        margin-top:5px;font-size:11px">
     <span class="dim">DrivePool's own figures:</span>
     <span style="color:${m.on?'var(--ok)':'var(--dim,#8a97a6)'}">${esc(state)}</span>
     <span class="dim">· last asked ${esc(when(m.last))}${
-      m.n?` · ${fmt(m.n)} time${m.n===1?'':'s'} this run`:''}</span>
+      m.n?` · ${fmt(m.n)} time${m.n===1?'':'s'} this run`:''}${
+      (!m.busy&&parts.length)?` · uncounted: ${parts.slice(0,4).map(p=>
+        `${esc(p.label||'?')} ${gb(p.other)}`).join(', ')}${
+        parts.length>4?` and ${parts.length-4} more`:''}`:''}</span>
     <button class="rmb" style="font-size:10px;padding:2px 8px"
       title="Ask DrivePool to recompute its usage figures now. It runs in DrivePool's own background and can take a while on a pool this size; the files are already in the pool either way - this only corrects the grey 'Other' bar."
       onclick="dpRemeasure(this)">Re-measure now</button>
