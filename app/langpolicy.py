@@ -287,6 +287,33 @@ def for_library(name: str, side: str) -> dict:
     return KIND_DEFAULTS[kind_for(library=name)][side]
 
 
+def keeps(library: str, side: str, lang: str) -> bool:
+    r"""Would this library keep a track in this language, on this side?
+
+    ONE ANSWER, ASKED BY EVERYTHING THAT TOUCHES A TRACK. Erik, on a
+    Detective Conan episode whose subtitle job failed: "should only read
+    wanted subs per sub rules under its sub library". The file carried eight
+    subtitle tracks - eng plus ara, ita, por, rus, spa - and Anime Shows
+    keeps eng and untagged. The passthrough removed the six at 9:06 PM; a
+    subtitle job planned against them at 9:11 PM failed with "the tracks
+    have moved since this was planned", which is exactly what had happened.
+
+    Everything the planners and readers do to a track that is on its way out
+    is wasted: the mkvmerge, the extract, the question on the board. So the
+    rule lives here, once, and they all ask it.
+    """
+    pol = for_library(library, side) or {}
+    k = str(lang or "").strip().lower()[:3]
+    keep = {str(x).strip().lower()[:3] for x in (pol.get("langs") or [])}
+    if k in keep:
+        return True
+    # Untagged is its own switch on the subtitle side, and on the audio side
+    # "und" is simply one of the languages a library may list.
+    if k in ("", "un", "und", "unk") and pol.get("keep_untagged"):
+        return True
+    return False
+
+
 def iso_languages() -> list[dict]:
     """The picker's list: every ISO 639-1 language, plus the 639-2/B spellings
     ffprobe actually emits (fre, ger, chi, dut...).

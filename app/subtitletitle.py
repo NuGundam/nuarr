@@ -1674,6 +1674,26 @@ def _is_really_signs(sh: dict) -> bool:
     return bool(sh) and kind_of(sh, 24.0).get("kind") == SIGNS
 
 
+_KEEPS: dict = {"at": 0.0, "map": {}}
+
+
+def _keeps_sub(library: str, lang: str) -> bool:
+    """langpolicy.keeps, memoised for the length of one scan - this is asked
+    once per subtitle track over 39,000 files."""
+    import time as _t
+    now = _t.time()
+    if now - _KEEPS["at"] > 30.0:
+        _KEEPS.update(at=now, map={})
+    key = (str(library or ""), str(lang or "").lower()[:3])
+    if key not in _KEEPS["map"]:
+        try:
+            from . import langpolicy
+            _KEEPS["map"][key] = langpolicy.keeps(key[0], "subs", key[1])
+        except Exception:                                        # noqa: BLE001
+            _KEEPS["map"][key] = True
+    return _KEEPS["map"][key]
+
+
 def scan(limit: int = 0) -> dict:
     r"""Every contradicted subtitle title in the library, from stored probes."""
     rows, checked = [], 0
@@ -1697,6 +1717,14 @@ def scan(limit: int = 0) -> dict:
             except Exception:                                # noqa: BLE001
                 continue
             for row in _rows_from_probe(r["path"] or "", probe):
+                # NOT A TRACK THIS LIBRARY KEEPS. A Spanish title that
+                # contradicts its cue rate is a true observation about a
+                # track that is about to be removed, and reading it costs an
+                # extract and puts a question on the board that answers
+                # itself when the passthrough runs. Erik: "should only read
+                # wanted subs per sub rules under its sub library".
+                if not _keeps_sub(r["library"] or "", row.get("lang") or ""):
+                    continue
                 row.update(file_id=r["id"], path=r["path"],
                            title=r["title"] or "", library=r["library"] or "",
                            size=r["size"] or 0, label=_label(r),

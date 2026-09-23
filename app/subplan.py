@@ -442,10 +442,20 @@ def plan(f: dict, ctx: dict | None = None) -> dict:
                              f"inside it"})
 
     # ---- 2. what is inside it twice, and what is inside it empty ----------
+    #
+    # ONLY THE TRACKS THIS LIBRARY KEEPS. A track in a language the rules do
+    # not want is already on its way out - the passthrough drops it on the
+    # next pass - so tidying it is a merge nobody needed, and worse than
+    # wasted: Detective Conan S05E10 carried eng plus ara, ita, por, rus and
+    # spa, the passthrough removed the six at 9:06 PM, and a subtitle job
+    # planned against them ran at 9:11 PM and failed with "the tracks have
+    # moved since this was planned". They had. See langpolicy.keeps.
     if ctx.get("dupe"):
         groups: dict = {}
         for t in tracks:
             if t["class"] == "marker":
+                continue
+            if not _wants(t.get("lang") or "", lib, ctx)[0]:
                 continue
             # FORMAT IS PART OF THE KEY. Pictures and text of the same
             # language and kind are two usable things, not one thing twice -
@@ -518,6 +528,8 @@ def plan(f: dict, ctx: dict | None = None) -> dict:
                                      f"they are counted before anything goes"})
         for t in tracks:
             if t["class"] == "marker" or _lines(t) != 0:
+                continue
+            if not _wants(t.get("lang") or "", lib, ctx)[0]:
                 continue
             # AND NEVER A PICTURE TRACK ON A TEXT READER'S WORD. Counting a
             # .sup by looking for "Dialogue:" in it returns nothing, which is
