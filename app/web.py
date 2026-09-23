@@ -12794,6 +12794,25 @@ async def api_gate():
                            "starving_disks": starving}
 
 
+@app.post("/api/drivepool/remeasure")
+async def api_drivepool_remeasure(on: int | None = None):
+    """Ask DrivePool to re-measure now, or turn the automatic ask on and off.
+
+    A file nuarr places is written straight into the chosen disk's PoolPart,
+    which is what puts it on that spindle - and what keeps its bytes out of
+    DrivePool's cached figures until it measures again. nuarr knows when it
+    placed one; DrivePool cannot. See drivepool.remeasure.
+    """
+    from . import drivepool
+    if on is not None:
+        from .db import kv_set
+        kv_set("drivepool.remeasure", "1" if int(on) else "0")
+        joblog.log(f"DrivePool re-measure after placement turned "
+                   f"{'ON' if int(on) else 'off'}", "info")
+        return {"ok": True, "on": bool(int(on))}
+    return await asyncio.to_thread(drivepool.remeasure, "", "asked by hand")
+
+
 @app.get("/api/drivepool")
 def api_drivepool():
     """What DrivePool is doing, what nuarr is holding for it, and the switches."""
@@ -28974,7 +28993,8 @@ function dpPlaceHtml(d){
     </div>
     <div class="dim" style="font-size:11px;margin-top:2px">nuarr chooses the
       spindle for every file it commits and writes it there itself — DrivePool
-      is told nothing and moves nothing</div>
+      moves nothing, and is told once the files have stopped landing</div>
+    ${dpMeasureHtml(d)}
     ${lead}
     ${rows?`<table style="width:100%;font-size:12px;border-collapse:collapse;
       margin-top:6px;padding-top:6px;border-top:1px solid var(--line);
@@ -28983,6 +29003,55 @@ function dpPlaceHtml(d){
       </colgroup><tbody>${rows}</tbody></table>`:''}
     ${rec.length?'':'<div class="dim" style="font-size:11.5px;margin-top:4px">No commit has been placed yet this run.</div>'}
   </div>`;
+}
+// WHY THE GREY BAR APPEARS, AND WHO CLEARS IT.
+//
+// A file nuarr places is written straight into the chosen disk's PoolPart -
+// that is what puts it on that spindle - and DrivePool measures the pool from
+// its own driver, which never saw the write. The file is in the pool and
+// readable at once; only the SIZE accounting is behind, and those bytes show
+// as "Other" until it measures again. Erik: 177 GB of grey on NU-DRIVE-9.
+// DrivePool has no watcher for this and its own documentation says to
+// re-measure after writing into a PoolPart; nuarr knows the moment it placed
+// one, so nuarr does the asking - once the files have stopped landing.
+function dpMeasureHtml(d){
+  const m=(d.drivepool&&d.drivepool.measure)||d.measure||{};
+  if(!m || m.on===undefined) return '';
+  const when=t=>t?ago(t):'never';
+  const due=m.due_in?`in ${Math.ceil(m.due_in/60)} min`:'';
+  const state = !m.on ? 'off'
+              : m.dirty_at ? (due?`asking ${due}`:'asking shortly')
+              : 'nothing to tell it';
+  return `<div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;
+       margin-top:5px;font-size:11px">
+    <span class="dim">DrivePool's own figures:</span>
+    <span style="color:${m.on?'var(--ok)':'var(--dim,#8a97a6)'}">${esc(state)}</span>
+    <span class="dim">· last asked ${esc(when(m.last))}${
+      m.n?` · ${fmt(m.n)} time${m.n===1?'':'s'} this run`:''}</span>
+    <button class="rmb" style="font-size:10px;padding:2px 8px"
+      title="Ask DrivePool to recompute its usage figures now. It runs in DrivePool's own background and can take a while on a pool this size; the files are already in the pool either way - this only corrects the grey 'Other' bar."
+      onclick="dpRemeasure(this)">Re-measure now</button>
+    <label class="gsw" style="margin-left:auto"
+      title="With this on, nuarr asks DrivePool to re-measure after its files have stopped landing - at most once an hour, and never while DrivePool is already measuring. With it off, the grey bar stays until you press Re-measure in DrivePool yourself.">
+      <input type="checkbox" ${m.on?'checked':''}
+        onchange="dpRemeasureOn(this.checked)">
+      <span class="gname">tell DrivePool what was placed</span>
+      <span class="gstate ${m.on?'on':'off'}">${m.on?'on':'off'}</span>
+    </label>
+  </div>`;
+}
+async function dpRemeasure(btn){
+  if(btn){ btn.disabled=true; btn.textContent='asking…'; }
+  let r={};
+  try{ r=await (await fetch('/api/drivepool/remeasure',{method:'POST'})).json(); }
+  catch(e){ r={ok:false}; }
+  if(btn){ btn.textContent=r.ok?'queued':'failed'; }
+  setTimeout(()=>loadDrivePool&&loadDrivePool(true), 1500);
+}
+async function dpRemeasureOn(on){
+  try{ await fetch('/api/drivepool/remeasure?on='+(on?1:0),{method:'POST'}); }
+  catch(e){}
+  setTimeout(()=>loadDrivePool&&loadDrivePool(true), 600);
 }
 function dpPrioHtml(d){
   const p = d.priority || {};

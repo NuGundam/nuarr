@@ -97,6 +97,10 @@ DEFAULTS = {
     # that disk's PoolPart directly, when DrivePool's balancer is off or
     # places by free space itself. See placement.py.
     "drivepool.place": "1",
+    # TELL IT WHAT WE PUT THERE. See remeasure() - a file staged straight
+    # into a PoolPart is invisible to DrivePool's accounting until somebody
+    # asks it to measure again.
+    "drivepool.remeasure": "1",
 }
 HOLDS = ("jobs", "commits", "renames")
 
@@ -116,6 +120,113 @@ STATE: dict = {
 }
 _TAIL = {"file": "", "pos": 0}
 _IO = {"at": 0.0, "r": 0, "w": 0}
+
+# ------------------------------------------------ telling it what we placed ---
+#
+# WHY THE GREY "OTHER" APPEARS, AND WHY IT IS NOT A FAULT.
+#
+# DrivePool measures the pool from its own kernel driver: everything written
+# through P:\ is counted as it lands. nuarr's disk picker does not write
+# through P:\ - that is the whole point of it. It stages the finished file
+# straight into the chosen disk's PoolPart folder, because that is what
+# decides which spindle the file lives on, and a write through P:\ would let
+# DrivePool choose instead.
+#
+# The file IS in the pool and readable the instant it lands - a PoolPart is
+# the pool - but the SIZE accounting is a cached measurement, and nothing
+# told it. So those bytes sit in the "Other" bar, grey, until a re-measure:
+# 177 GB of it on NU-DRIVE-9 when Erik looked.
+#
+# CAN DRIVEPOOL NOTICE BY ITSELF? No. There is no watcher for out-of-band
+# writes into a PoolPart, and its own documentation says to re-measure after
+# touching one directly. Checked against dpcmd 2.3.13.1687 on this box: the
+# whole command set is pool structure, duplication, open files, and
+# remeasure-pool / refresh-all-poolparts. Nothing that watches.
+#
+# But nuarr knows the exact moment it placed a file, which DrivePool cannot,
+# so nuarr does the telling. Not per file: a re-measure is a pool-wide
+# background job over 68 TB, and one per placement would be permanent. It is
+# debounced instead - quiet for QUIET_S after the last placement, at most one
+# an hour, and never while DrivePool is already measuring.
+REMEASURE_QUIET_S = 600.0        # settle time after the last file lands
+REMEASURE_MIN_GAP_S = 3600.0     # and never more often than this
+MEASURE = {"dirty_at": 0.0, "last": 0.0, "n": 0, "why": "", "running": False}
+
+
+def remeasure_on() -> bool:
+    try:
+        from .db import kv_get
+        return str(kv_get("drivepool.remeasure") or "1") not in ("0", "false")
+    except Exception:                                            # noqa: BLE001
+        return True
+
+
+def note_placed(label: str = "") -> None:
+    """A file was staged into a PoolPart. Start the clock; do not measure."""
+    MEASURE["dirty_at"] = time.time()
+    if label:
+        MEASURE["why"] = f"files were placed directly on {label}"
+
+
+def _pool_root() -> str:
+    try:
+        from .config import SETTINGS
+        for l in (SETTINGS.libraries or []):
+            p = str(getattr(l, "path", "") or "")
+            if len(p) > 2 and p[1] == ":":
+                return p[:3]
+    except Exception:                                            # noqa: BLE001
+        pass
+    return "P:\\"
+
+
+def _dpcmd() -> str:
+    for p in (r"C:\Program Files\StableBit\DrivePool\dpcmd.exe",
+              r"C:\Program Files (x86)\StableBit\DrivePool\dpcmd.exe"):
+        if os.path.exists(p):
+            return p
+    return ""
+
+
+def remeasure(pool: str = "", why: str = "") -> dict:
+    """Ask DrivePool to recompute its usage figures. Returns at once - the
+    measure itself is queued and runs in DrivePool's own background."""
+    exe = _dpcmd()
+    if not exe:
+        return {"ok": False, "why": "dpcmd is not installed"}
+    root = pool or _pool_root()
+    try:
+        r = subprocess.run([exe, "remeasure-pool", root],
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=60,
+                           creationflags=NO_WINDOW)
+        out = ((r.stdout or "") + (r.stderr or "")).strip()
+    except Exception as e:                                       # noqa: BLE001
+        return {"ok": False, "why": f"{type(e).__name__}: {e}"}
+    ok = "queued for remeasuring" in out.lower()
+    MEASURE.update(last=time.time(), dirty_at=0.0,
+                   n=int(MEASURE["n"]) + (1 if ok else 0))
+    joblog.log(
+        f"asked DrivePool to re-measure {root} - {why or MEASURE['why'] or ''}"
+        if ok else f"could not ask DrivePool to re-measure: {out[:160]}",
+        "ok" if ok else "warn", system="drivepool")
+    return {"ok": ok, "why": out[:300], "pool": root}
+
+
+def remeasure_tick() -> dict:
+    """The debounce. Called from the watcher; does nothing most of the time."""
+    if not remeasure_on() or not MEASURE["dirty_at"]:
+        return {"ok": True, "did": False}
+    now = time.time()
+    if now - MEASURE["dirty_at"] < REMEASURE_QUIET_S:
+        return {"ok": True, "did": False, "why": "still landing files"}
+    if now - MEASURE["last"] < REMEASURE_MIN_GAP_S:
+        return {"ok": True, "did": False, "why": "measured recently"}
+    if "Measuring" in (STATE.get("flags") or {}):
+        return {"ok": True, "did": False, "why": "it is already measuring"}
+    r = remeasure()
+    return {"ok": bool(r.get("ok")), "did": True, **r}
+
 
 # ------------------------------------------------- asking it to step aside ---
 #
@@ -1104,6 +1215,13 @@ def status() -> dict:
         "active": {k: dict(v, label=LABEL[k], text=describe(k, v))
                    for k, v in moving().items()},
         "flags": dict(STATE["flags"]),
+        # WHAT IT HAS BEEN TOLD ABOUT WHAT NUARR PLACED. See remeasure().
+        "measure": {**MEASURE, "on": remeasure_on(),
+                    "quiet_s": REMEASURE_QUIET_S,
+                    "min_gap_s": REMEASURE_MIN_GAP_S,
+                    "due_in": (max(0.0, REMEASURE_QUIET_S
+                                   - (time.time() - MEASURE["dirty_at"]))
+                               if MEASURE["dirty_at"] else 0.0)},
         "rate_bps": STATE["rate_bps"], "read_bps": STATE["read_bps"],
         "write_bps": STATE["write_bps"],
         "mover_errors": [e for e in STATE["mover_errors"] if e["at"] >= today],
@@ -1134,6 +1252,14 @@ async def watch() -> None:
     await asyncio.sleep(20)
     first = True
     while True:
+        # OFF THE LOOP. Almost every pass this is two dictionary reads and a
+        # return, but the pass that fires runs dpcmd, and a 60-second
+        # subprocess on the event loop would stall everything else.
+        try:
+            await asyncio.to_thread(remeasure_tick)
+        except Exception as e:                                   # noqa: BLE001
+            joblog.log(f"re-measure tick: {type(e).__name__}: {e}", "debug",
+                       system="drivepool")
         schedules.beat("drivepool")
         try:
             await asyncio.to_thread(refresh)

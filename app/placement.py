@@ -220,6 +220,16 @@ def landed(target: str, label: str) -> None:
         joblog.log(f"placed on {label}: {os.path.basename(target)}", "info")
     except Exception:                                        # noqa: BLE001
         pass
+    # AND TELL DRIVEPOOL SOMETHING LANDED BEHIND ITS BACK. Staging into a
+    # PoolPart is what puts the file on the disk we chose, and it is also
+    # what hides the bytes from DrivePool's cached measurement - they show
+    # as grey "Other" until it measures again. This only starts a clock;
+    # see drivepool.remeasure_tick for when it actually asks.
+    try:
+        from . import drivepool
+        drivepool.note_placed(label)
+    except Exception:                                        # noqa: BLE001
+        pass
 
 
 def status() -> dict:
