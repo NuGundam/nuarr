@@ -770,7 +770,16 @@ def do_one(row: dict, report=None, claim: bool = True) -> dict:
         mk = [s for s in steps if s["do"] == "mark"]
         if mk:
             say("adding the marker track")
-            out["did"].append(_mark_picture(fid, mk[0]))
+            r_mark = _mark_picture(fid, mk[0])
+            out["did"].append(r_mark)
+            # A STEP THAT DID NOTHING MUST NOT LEAVE THE JOB SAYING "done"
+            # WITH ITS OWN WORDS. The card read "mark the burned-in words"
+            # six times over a file where no marker was ever written.
+            if not r_mark.get("ok"):
+                return {"ok": False, "did": out["did"],
+                        "why": r_mark.get("why") or "the marker was not added"}
+            if r_mark.get("skipped"):
+                out["why"] = r_mark.get("why") or "nothing to mark"
         rc = [s for s in steps if s["do"] == "recycle"]
         if rc:
             say(f"recycling {len(rc)} loose cop"

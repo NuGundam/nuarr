@@ -585,7 +585,24 @@ def plan(f: dict, ctx: dict | None = None) -> dict:
     if pic and not pic.get("marked"):
         state = str(pic.get("state") or "")
         sure = int(pic.get("sure") or 0)
-        if state and state not in ("none", "clean"):
+        # A MARKER IS FOR A FILE WITH NO SUBTITLE, AND ONLY THAT.
+        #
+        # Its whole job is to stop Bazarr asking "does this have English
+        # subtitles", getting no, and fetching one for ever over a picture
+        # that already carries the words. A file that HAS an English track
+        # needs none of that, and mark_one has always refused those - but it
+        # refused at the worker, after the step had been planned, queued and
+        # run, and the refusal settled nothing. Six laps for EyeShield 21
+        # S01E78. Asked here, it is never planned in the first place.
+        has_eng = any(_lang_key(t.get("lang")) == _lang_key("eng")
+                      for t in tracks if t.get("class") != "marker")
+        if has_eng:
+            if state and state not in ("none", "clean"):
+                skips.append({"what": "the picture",
+                              "why": "it already has an English subtitle "
+                                     "track, so a marker would change "
+                                     "nothing"})
+        elif state and state not in ("none", "clean"):
             if pic.get("by_hand") or sure >= ctx["mark_at"]:
                 # THE SCORER'S OWN SENTENCE. This said "N% of the sampled
                 # frames carry words", written when the number really was a

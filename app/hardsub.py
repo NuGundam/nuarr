@@ -1725,6 +1725,22 @@ MARK_NAME = "English (burned into the picture)"
 _MARK_SRT = "1\r\n00:00:00,000 --> 00:00:01,000\r\nâ€‹\r\n\r\n"
 
 
+def _settle(file_id: int, why: str) -> None:
+    """Close a picture finding that needs no marker, with the reason.
+
+    `marked` is the flag every candidate query tests, so it is what stops a
+    settled file being offered again; the sentence goes beside it rather than
+    over `detail`, which holds the measurement.
+    """
+    with cursor() as cur:
+        try:
+            cur.execute("ALTER TABLE hardsub ADD COLUMN mark_why TEXT")
+        except Exception:                                        # noqa: BLE001
+            pass
+        cur.execute("UPDATE hardsub SET marked=1, mark_why=? WHERE file_id=?",
+                    (why[:300], int(file_id)))
+
+
 def mark_one(file_id: int, kind: str = "") -> dict:
     """Give a hardsubbed file a blank English subtitle track.
 
@@ -1752,8 +1768,27 @@ def mark_one(file_id: int, kind: str = "") -> dict:
     # already has one does not need a marker - Bazarr is already satisfied.
     if any(_lang_key(x) == _lang_key("eng")
            for x in (row.get("sub_langs") or "").split(",") if x.strip()):
-        return {"ok": False, "why": "this file already has an English "
-                                    "subtitle track, so nothing would change"}
+        # NOTHING TO DO IS AN ANSWER, NOT A FAILURE - AND IT HAS TO BE
+        # RECORDED AS ONE.
+        #
+        # This returned ok=False and changed nothing, so `marked` stayed 0,
+        # so the file came back on the board as an unanswered question, so a
+        # marker job was planned again. EyeShield 21 S01E78 went round six
+        # times in 26 hours - the picture carries dialogue AND the file has
+        # a perfectly good English ASS track, which is precisely the case
+        # where a marker is pointless.
+        #
+        # The row is settled here with the reason, and the same test now
+        # keeps subplan from ever asking for it (see subplan, section 4).
+        try:
+            _settle(int(file_id), "the file already has an English subtitle "
+                                  "track, so a marker would change nothing")
+        except Exception:                                        # noqa: BLE001
+            pass
+        return {"ok": True, "skipped": True, "marked": False,
+                "why": "this file already has an English subtitle track, so "
+                       "nothing would change - noted, and it will not be "
+                       "asked about again"}
     if not have_mkvmerge():
         return {"ok": False, "why": "mkvmerge is not installed"}
     if fileops.is_locked(path):
