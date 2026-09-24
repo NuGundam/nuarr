@@ -148,12 +148,34 @@ _IO = {"at": 0.0, "r": 0, "w": 0}
 # background job over 68 TB, and one per placement would be permanent. It is
 # debounced instead - quiet for QUIET_S after the last placement, at most one
 # an hour, and never while DrivePool is already measuring.
-REMEASURE_QUIET_S = 900.0        # settle time after the last file lands
-REMEASURE_MIN_GAP_S = 6 * 3600.0  # and never more often than this
-# HOW MUCH HAS TO HAVE BEEN PLACED BEFORE IT IS WORTH A POOL-WIDE MEASURE.
-# On this pool a measure runs for HOURS - it was still going after two -
-# so the bar has to be high enough that the answer is worth the walk.
-REMEASURE_MIN_BYTES = 150 * 2 ** 30
+# ONCE A DAY, AT A QUIET HOUR - NOT WHENEVER ENOUGH HAS PILED UP.
+#
+# A byte threshold was the second design and it was still wrong for this
+# pool. A measure here runs for HOURS, and nuarr placed 439 GB while the
+# last one ran, so any threshold it could clear during its own measure
+# leaves the floor between asks doing all the work - up to four a day,
+# hours each, which is near enough "always measuring". Erik: once per day.
+#
+# So it is a schedule, and the bytes are only a "was there anything to
+# tell it about" test. AND THERE IS NO PER-DISK MEASURE TO ASK FOR: dpcmd
+# 2.3.13.1687 has been tested end to end for one - remeasure-pool takes the
+# pool root and rejects a subfolder ("Can't open handle to volume");
+# refresh-all-poolparts re-enumerates parts and counts nothing;
+# hint-poolpart accepts a volume, answers "Sent pool part hint", and leaves
+# every figure exactly where it was, measured over a minute. Pool-wide is
+# the only measure there is, which is precisely why it runs once a day.
+REMEASURE_QUIET_S = 900.0         # settle time after the last file lands
+REMEASURE_MIN_GAP_S = 20 * 3600.0  # a day, less the slack to catch the hour
+REMEASURE_HOUR = 5                # local hour to do it in, by default
+REMEASURE_MIN_BYTES = 2 * 2 ** 30  # "anything worth telling it about"
+
+
+def remeasure_hour() -> int:
+    try:
+        v = int(str(kv_get("drivepool.remeasure.hour") or REMEASURE_HOUR))
+        return v if 0 <= v <= 23 else REMEASURE_HOUR
+    except Exception:                                            # noqa: BLE001
+        return REMEASURE_HOUR
 MEASURE = {"dirty_at": 0.0, "last": 0.0, "n": 0, "why": "", "running": False,
            "bytes": 0, "files": 0, "disks": []}
 
@@ -407,8 +429,14 @@ def remeasure_tick() -> dict:
     placed = int(MEASURE.get("bytes") or 0)
     if placed < REMEASURE_MIN_BYTES:
         return {"ok": True, "did": False, "placed": placed,
-                "why": (f"only {placed / 2 ** 30:.0f} GB placed since the "
+                "why": (f"only {placed / 2 ** 30:.1f} GB placed since the "
                         f"last measure")}
+    # THE HOUR IS THE GATE. Anything else would be a measure starting in the
+    # middle of the evening on a pool that takes hours to walk.
+    want = remeasure_hour()
+    if time.localtime().tm_hour != want:
+        return {"ok": True, "did": False, "placed": placed,
+                "why": f"waiting for {want:02d}:00"}
     r = remeasure(why=MEASURE.get("why") or "")
     return {"ok": bool(r.get("ok")), "did": True, **r}
 
@@ -1404,6 +1432,7 @@ def status() -> dict:
         "measure": {**MEASURE, "on": remeasure_on(),
                     "parts": poolpart_usage(),
                     "min_bytes": REMEASURE_MIN_BYTES,
+                    "hour": remeasure_hour(),
                     "uncounted": uncounted_bytes()[0],
                     "worst": uncounted_bytes()[1],
                     "busy": measuring_now(),

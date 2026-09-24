@@ -12795,7 +12795,8 @@ async def api_gate():
 
 
 @app.post("/api/drivepool/remeasure")
-async def api_drivepool_remeasure(on: int | None = None):
+async def api_drivepool_remeasure(on: int | None = None,
+                                  hour: int | None = None):
     """Ask DrivePool to re-measure now, or turn the automatic ask on and off.
 
     A file nuarr places is written straight into the chosen disk's PoolPart,
@@ -12804,6 +12805,12 @@ async def api_drivepool_remeasure(on: int | None = None):
     placed one; DrivePool cannot. See drivepool.remeasure.
     """
     from . import drivepool
+    if hour is not None:
+        from .db import kv_set
+        kv_set("drivepool.remeasure.hour", str(int(hour) % 24))
+        joblog.log(f"DrivePool re-measure hour set to "
+                   f"{int(hour) % 24:02d}:00", "info")
+        return {"ok": True, "hour": int(hour) % 24}
     if on is not None:
         from .db import kv_set
         kv_set("drivepool.remeasure", "1" if int(on) else "0")
@@ -29031,11 +29038,13 @@ function dpMeasureHtml(d){
   // DrivePool will never count and so never returns to zero.
   const placed=m.bytes||0, need=m.min_bytes||0;
   const enough=need && placed>=need;
+  // ONCE A DAY, AT AN HOUR - the only measure DrivePool has is pool-wide
+  // (tested: no per-disk one exists), and on this pool it runs for hours.
+  const hh=(m.hour===undefined?5:m.hour), hhs=String(hh).padStart(2,'0')+':00';
   const state = m.busy ? 'DrivePool is measuring now'
               : !m.on ? 'off'
-              : enough ? (due?`asking ${due}`:'asking shortly')
-              : placed ? `${gb(placed)} placed, asks at ${gb(need)}`
-              : 'nothing placed since the last measure';
+              : !enough ? 'nothing placed worth telling it about'
+              : `${gb(placed)} placed — asking at ${hhs}`;
   return `<div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;
        margin-top:5px;font-size:11px">
     <span class="dim">DrivePool's own figures:</span>
@@ -29052,7 +29061,7 @@ function dpMeasureHtml(d){
       title="With this on, nuarr asks DrivePool to re-measure after its files have stopped landing - at most once an hour, and never while DrivePool is already measuring. With it off, the grey bar stays until you press Re-measure in DrivePool yourself.">
       <input type="checkbox" ${m.on?'checked':''}
         onchange="dpRemeasureOn(this.checked)">
-      <span class="gname">tell DrivePool what was placed</span>
+      <span class="gname">tell DrivePool what was placed, daily at ${esc(hhs)}</span>
       <span class="gstate ${m.on?'on':'off'}">${m.on?'on':'off'}</span>
     </label>
   </div>`;
