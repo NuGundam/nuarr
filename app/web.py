@@ -20583,6 +20583,15 @@ let _bootDone=false, _bootTimer=null, _bootFade=null, _bootStarted=0,
 // from the PREVIOUS process while the new one was still booting - the exact
 // misreading this pill exists to prevent. A changed start time means a new
 // process, so we wind back up.
+// THE LAZY POLL STILL HAS TO OBEY THE VISIBILITY GATE. This one is a bare
+// setInterval, so a tab sitting hidden behind another window asked /api/startup
+// every five seconds for as long as it was open - measured: thirteen requests
+// in 68 seconds from a tab nobody was looking at, about a boot that finished
+// eight hours earlier. gated() answers that without losing the reason the lazy
+// poll exists: coming back to the tab fires one pass immediately, so a restart
+// that happened while you were away is still caught the moment you look.
+const _bootTick = gated(loadBoot);
+_gatedOnShow.push(_bootTick);
 function bootPoll(ms){
   // The interval is tracked in _bootMs, not as a property on the handle:
   // setInterval returns a NUMBER in browsers, so assigning timer._ms silently
@@ -20591,7 +20600,7 @@ function bootPoll(ms){
   if(_bootTimer!==null && _bootMs===ms) return;
   clearInterval(_bootTimer);
   _bootMs=ms;
-  _bootTimer=setInterval(loadBoot, ms);
+  _bootTimer=setInterval(_bootTick, ms);
 }
 
 // THE PILL IS A BUTTON WITH A PANEL, like every other chip in this header.
@@ -22764,12 +22773,17 @@ function sysRunningHtml(){
       ${bar}</a>`;
   }).join('') + '</div>';
 }
+const _sysTick = gated(loadSystems);
+_gatedOnShow.push(_sysTick);
 function sysStart(){
   clearInterval(_sysTimer);
   loadSystems();
   // Two seconds: fast enough that a job finishing is noticed while you are
   // looking at it, slow enough that a dozen dict reads never register.
-  _sysTimer=setInterval(loadSystems, 2000);
+  // Gated, like every other poller: two seconds is the right rate for a panel
+  // you are watching and pure waste for one you are not - thirty requests a
+  // minute, per open tab, forever.
+  _sysTimer=setInterval(_sysTick, 2000);
 }
 // STARTED HERE, NOT AT THE BOOT BLOCK. The first attempt called this beside
 // drillSchedule() 2,600 lines above, which is before the `let` on the timer
@@ -34830,7 +34844,16 @@ function gapMore(box){
   const more=box.querySelector('.fmore');
   // A frame's breathing room, so the loader is actually seen and the append
   // does not land inside the same scroll event that asked for it.
+  //
+  // AND A finally, BECAUSE THE FLAG IS THE ONLY WAY BACK IN. _loading is the
+  // re-entry guard for this box: if anything in here throws - a row whose
+  // shape the builder did not expect, `more.lastChild` gone because the page
+  // repainted underneath us - the flag stays true and the box never loads
+  // another page for the rest of the session. You scroll, and nothing
+  // happens, with nothing in the console to say why because the throw is
+  // inside a timer callback nobody awaits.
   setTimeout(()=>{
+   try{
     const next=files.slice(shown, shown+GAP_PAGE);
     const html=next.map((f,k)=>gapRowHtml_(f, shown+k)).join('');
     if(more) more.insertAdjacentHTML('beforebegin', html);
@@ -34840,10 +34863,10 @@ function gapMore(box){
       if(more) more.outerHTML = L.n>L.listed
         ? `<div class="dim" style="padding:5px 10px 5px 28px;font-size:10.5px"
            >showing ${fmt(L.listed)} of ${fmt(L.n)}</div>` : '';
-    }else if(more){
+    }else if(more && more.lastChild){
       more.lastChild.textContent=` ${fmt(files.length-shown-next.length)} more — scroll to load`;
     }
-    box._loading=false;
+   }finally{ box._loading=false; }
   }, 60);
 }
 
@@ -39269,11 +39292,18 @@ function snUnkOpen(show){
 async function snUnkShow(kind){
   if(_snUnk===kind){ _snUnk=''; _snUnkData=null; _snKey=''; snPaint(true); return; }
   _snUnk=kind; _snUnkData=null; _snUnkBusy=true; _snUnkOpen.clear();
+  // THE BUSY FLAG IS WHAT THE BOX RENDERS FROM: while it is true the panel
+  // says "reading them…". The paint below sits outside the fetch, so a throw
+  // there used to leave the flag true with nothing left to clear it - the box
+  // reads "reading them…" until the page is reloaded, having long since
+  // stopped reading anything.
+  try{
+    _snKey=''; snPaint(true);
+    try{ _snUnkData=await (await fetch('/api/subneed/unknown?kind='+kind
+          +'&limit=800')).json(); }
+    catch(e){ _snUnkData={ok:false, why:String(e)}; }
+  }finally{ _snUnkBusy=false; }
   _snKey=''; snPaint(true);
-  try{ _snUnkData=await (await fetch('/api/subneed/unknown?kind='+kind
-        +'&limit=800')).json(); }
-  catch(e){ _snUnkData={ok:false, why:String(e)}; }
-  _snUnkBusy=false; _snKey=''; snPaint(true);
 }
 // The list, in the box the other lists use: the shows first, because 380
 // rows is not something anybody reads and "80 of them are one show" is the
@@ -45849,15 +45879,19 @@ async function bkRun(){
   if(_bkBusy) return;
   _bkBusy=true;
   const m=document.getElementById('bkMsg');
-  if(m) m.innerHTML='<span class="busy"><span class="sp"></span><span class="step">starting…</span></span>';
-  loadBackup(false);
+  // Same shape as the two above: the guard is cleared in a finally, so a throw
+  // in the paint that brackets the fetch cannot leave "Run now" permanently
+  // refusing to run.
   try{
-    const r=await (await fetch('/api/backup/run',{method:'POST'})).json();
-    if(m) m.textContent = r.ok
-      ? `done — ${r.db_mb} MB, integrity ${r.integrity}, bundle ${r.bundle}`
-      : ('failed: '+(r.error||'unknown'));
-  }catch(e){ if(m) m.textContent='failed: '+e.message; }
-  _bkBusy=false;
+    if(m) m.innerHTML='<span class="busy"><span class="sp"></span><span class="step">starting…</span></span>';
+    loadBackup(false);
+    try{
+      const r=await (await fetch('/api/backup/run',{method:'POST'})).json();
+      if(m) m.textContent = r.ok
+        ? `done — ${r.db_mb} MB, integrity ${r.integrity}, bundle ${r.bundle}`
+        : ('failed: '+(r.error||'unknown'));
+    }catch(e){ if(m) m.textContent='failed: '+e.message; }
+  }finally{ _bkBusy=false; }
   loadBackup(false);
 }
 async function bkPrune(){

@@ -120,6 +120,27 @@ def _note(disk: str, action: str, pool_path: str, library: str | None) -> None:
             STATE["pending"][library] = now
 
 
+# A NEW ctypes TYPE PER NOTIFICATION IS A PERMANENT LEAK.
+#
+# The record header was read as `ctypes.POINTER(wt.DWORD * 3)`, built inline,
+# once per change record. ctypes does not cache array types - `wt.DWORD * 3`
+# is a brand-new type object every time it is evaluated - and POINTER() then
+# files the pointer type it builds in ctypes._pointer_type_cache, which is
+# never swept. So each record left behind a pointer type, an array type, and
+# the weakref machinery that comes with them, alive for the life of the
+# process.
+#
+# Measured on this box while idle: PyCArrayType, PyCPointerType, DictRemover
+# and CallableProxyType all climbing in lockstep at ~716/hour, with
+# getset_descriptor (four per new struct type) at ~2,900/hour. Idle. During an
+# import, every file that lands is several records.
+#
+# Built once here instead. The types are identical for every record; there was
+# never a reason to make more than one.
+_DWORD3 = wt.DWORD * 3
+_PDWORD3 = ctypes.POINTER(_DWORD3)
+
+
 def _watch_thread(disk: str, part: str, pool_root: str) -> None:
     from . import scanner
     st = STATE["watchers"][disk]
@@ -154,7 +175,7 @@ def _watch_thread(disk: str, part: str, pool_root: str) -> None:
             off = 0
             while True:
                 nxt, action, nlen = ctypes.cast(
-                    ctypes.addressof(buf) + off, ctypes.POINTER(wt.DWORD * 3)).contents
+                    ctypes.addressof(buf) + off, _PDWORD3).contents
                 name = ctypes.wstring_at(ctypes.addressof(buf) + off + 12, nlen // 2)
                 ext = os.path.splitext(name)[1].lower()
                 if ext in scanner.MEDIA_EXT:

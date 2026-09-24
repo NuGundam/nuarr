@@ -879,160 +879,172 @@ async def heal(viol: list[dict]) -> dict:
     Returns counts for the panel. Never raises into the audit loop - a healer
     that can break the check it rides on is worse than no healer.
     """
-    from . import jobs
-    STATS.update(heal_running=True, heal_total=len(viol), heal_done=0,
-                 heal_current="")
-    prior = await asyncio.to_thread(_heal_rows)
-    # A FINDING'S PATH IS A SNAPSHOT; THE FILE'S PATH IS THE TRUTH.
-    #
-    # Fixing a file routinely renames it - Sonarr and Radarr rebuild the name
-    # from the new mediainfo, so downmixing Snow White moved it from
-    # [EAC3 7.1] to [EAC3 5.1] the moment the job committed. The finding still
-    # named the old path, _still_broken found nothing on disk there and returned
-    # "gone, no verdict", and the file fell through to being queued a second
-    # time to fix something already fixed. Resolve the current path first, in
-    # one query, and every check below is about the file rather than about a
-    # name it used to have.
-    def _paths(ids: list[int]) -> dict[int, tuple[str, str]]:
-        if not ids:
-            return {}
-        qs = ",".join("?" * len(ids))
-        with cursor() as cur:
-            # The LIBRARY comes along for the ride, because the re-check below
-            # has to apply the same per-library codec settings the planner did.
-            # Re-checking a file against another library's ceiling is how a
-            # finding becomes permanently "unfixable".
-            return {r["id"]: (r["path"], r["library"] or "")
-                    for r in cur.execute(
-                        f"SELECT id, path, library FROM files "
-                        f"WHERE id IN ({qs})", ids)}
-    live = await asyncio.to_thread(_paths, [v["file_id"] for v in viol])
-    for v in viol:
-        got = live.get(v["file_id"])
-        if got:
-            v["path"] = got[0] or v["path"]
-            v["library"] = got[1]
-    queued = unfixable = gave_up = skipped = fixed = 0
-    recs: list[tuple] = []
-    now = time.time()
-    for _hn, v in enumerate(viol):
-        fid = v["file_id"]
-        STATS["heal_done"] = _hn
-        STATS["heal_current"] = os.path.basename(v["path"] or "")[:60]
-        rule = ", ".join(sorted(set(v["rules"])))
-        p = prior.get(fid) or {}
-        state = (p.get("state") or "")
-        attempts = int(p.get("attempts") or 0)
-        if state in _TERMINAL:
-            skipped += 1
-            continue
-        if attempts >= MAX_HEAL_ATTEMPTS:
-            # Requeued the limit and still flagged. The planner said it had
-            # work, ran it, and the invariant did not change - so either the
-            # plan does not do what the audit measures, or something rewrites
-            # the file afterwards. Both need a person, not another attempt.
-            recs.append((fid, rule, attempts, p.get("first_at") or now, now,
-                         "gave-up",
-                         f"requeued {attempts}x and still breaking {rule} - the "
-                         f"plan is not fixing what the audit measures",
-                         v["path"]))
-            joblog.log(f"rule audit: gave up healing {os.path.basename(v['path'])} "
-                       f"- {rule} survived {attempts} requeues", "error")
-            gave_up += 1
-            continue
-        if queued >= MAX_PER_RUN:
-            skipped += 1
-            continue
+    # A FLAG THE PANEL RENDERS FROM MUST NOT OUTLIVE THE WORK.
+    # the audit healer reports itself as running from this flag, and the
+    # only thing that used to clear it was reaching the end. Anything
+    # raised on the way out - and the body below calls into the arrs,
+    # the planner and the database - left the panel saying a pass was
+    # in progress for the rest of the process's life, with nothing
+    # running behind it. The normal path still writes its full
+    # summary; this only guarantees the flag itself comes down.
 
-        # READ THE FILE BEFORE DECIDING ANYTHING ABOUT IT.
+    try:
+        from . import jobs
+        STATS.update(heal_running=True, heal_total=len(viol), heal_done=0,
+                     heal_current="")
+        prior = await asyncio.to_thread(_heal_rows)
+        # A FINDING'S PATH IS A SNAPSHOT; THE FILE'S PATH IS THE TRUTH.
         #
-        # A finding can be minutes or weeks old, and in between autoqueue, a
-        # manual requeue or an arr upgrade may have dealt with it. Asking the
-        # planner first gets that wrong in both directions, because the planner
-        # works from the STORED probe:
-        #
-        #   * stale probe still showing the fault -> it plans a job, the job
-        #     re-probes, finds nothing to do and skips. Both Snow White and The
-        #     Jungle Book were already eac3/6ch on disk and were queued anyway.
-        #   * no plan, for any reason -> recorded as "no rule fixes this", which
-        #     is how The Jungle Book was called unfixable eleven minutes after
-        #     the activity feed showed it being downmixed.
-        #
-        # One ffprobe, capped at MAX_PER_RUN per run and run in a thread, settles
-        # it. This is the same instinct the audit itself is built on: the check
-        # reads real streams off the pool rather than trusting the database, so
-        # the thing acting on the check must too.
-        broken = await asyncio.to_thread(_still_broken, v["path"],
-                                         v.get("library") or "")
-        if broken is not None and not broken:
-            recs.append((fid, rule, attempts, p.get("first_at") or now, now,
-                         "fixed",
-                         "re-read from disk and it now matches every rule",
-                         v["path"]))
-            fixed += 1
-            continue
+        # Fixing a file routinely renames it - Sonarr and Radarr rebuild the name
+        # from the new mediainfo, so downmixing Snow White moved it from
+        # [EAC3 7.1] to [EAC3 5.1] the moment the job committed. The finding still
+        # named the old path, _still_broken found nothing on disk there and returned
+        # "gone, no verdict", and the file fell through to being queued a second
+        # time to fix something already fixed. Resolve the current path first, in
+        # one query, and every check below is about the file rather than about a
+        # name it used to have.
+        def _paths(ids: list[int]) -> dict[int, tuple[str, str]]:
+            if not ids:
+                return {}
+            qs = ",".join("?" * len(ids))
+            with cursor() as cur:
+                # The LIBRARY comes along for the ride, because the re-check below
+                # has to apply the same per-library codec settings the planner did.
+                # Re-checking a file against another library's ceiling is how a
+                # finding becomes permanently "unfixable".
+                return {r["id"]: (r["path"], r["library"] or "")
+                        for r in cur.execute(
+                            f"SELECT id, path, library FROM files "
+                            f"WHERE id IN ({qs})", ids)}
+        live = await asyncio.to_thread(_paths, [v["file_id"] for v in viol])
+        for v in viol:
+            got = live.get(v["file_id"])
+            if got:
+                v["path"] = got[0] or v["path"]
+                v["library"] = got[1]
+        queued = unfixable = gave_up = skipped = fixed = 0
+        recs: list[tuple] = []
+        now = time.time()
+        for _hn, v in enumerate(viol):
+            fid = v["file_id"]
+            STATS["heal_done"] = _hn
+            STATS["heal_current"] = os.path.basename(v["path"] or "")[:60]
+            rule = ", ".join(sorted(set(v["rules"])))
+            p = prior.get(fid) or {}
+            state = (p.get("state") or "")
+            attempts = int(p.get("attempts") or 0)
+            if state in _TERMINAL:
+                skipped += 1
+                continue
+            if attempts >= MAX_HEAL_ATTEMPTS:
+                # Requeued the limit and still flagged. The planner said it had
+                # work, ran it, and the invariant did not change - so either the
+                # plan does not do what the audit measures, or something rewrites
+                # the file afterwards. Both need a person, not another attempt.
+                recs.append((fid, rule, attempts, p.get("first_at") or now, now,
+                             "gave-up",
+                             f"requeued {attempts}x and still breaking {rule} - the "
+                             f"plan is not fixing what the audit measures",
+                             v["path"]))
+                joblog.log(f"rule audit: gave up healing {os.path.basename(v['path'])} "
+                           f"- {rule} survived {attempts} requeues", "error")
+                gave_up += 1
+                continue
+            if queued >= MAX_PER_RUN:
+                skipped += 1
+                continue
 
-        label = os.path.splitext(os.path.basename(v["path"] or ""))[0]
-        try:
-            await jobs.enqueue(fid, v["path"], label, source="rule audit",
-                               priority=60)
-            new_state, detail = "queued", f"queued to fix {rule}"
-            try:
-                from . import remedy
-                remedy._note(fid, rule, remedy.REQUEUE, "rule audit",
-                             mode() == "auto", True, detail, v["path"])
-            except Exception:                                # noqa: BLE001
-                pass
-            attempts += 1
-            queued += 1
-        except jobs.NothingToDo:
-            # THE ONE GAP THE PLANNER CANNOT CLOSE BY DESIGN. container/name
-            # means Matroska content wearing another extension - nuarr's own
-            # commit writes over the original path and so keeps its name. The
-            # streams are already right, so decide() has nothing to do, and the
-            # finding sat as "no rule fixes this" forever. The remedy is a
-            # rename, which is not stream work and never will be.
-            done, why = await _fix_container_name(v, rule, broken)
-            if done:
-                new_state, detail = "fixed", why
+            # READ THE FILE BEFORE DECIDING ANYTHING ABOUT IT.
+            #
+            # A finding can be minutes or weeks old, and in between autoqueue, a
+            # manual requeue or an arr upgrade may have dealt with it. Asking the
+            # planner first gets that wrong in both directions, because the planner
+            # works from the STORED probe:
+            #
+            #   * stale probe still showing the fault -> it plans a job, the job
+            #     re-probes, finds nothing to do and skips. Both Snow White and The
+            #     Jungle Book were already eac3/6ch on disk and were queued anyway.
+            #   * no plan, for any reason -> recorded as "no rule fixes this", which
+            #     is how The Jungle Book was called unfixable eleven minutes after
+            #     the activity feed showed it being downmixed.
+            #
+            # One ffprobe, capped at MAX_PER_RUN per run and run in a thread, settles
+            # it. This is the same instinct the audit itself is built on: the check
+            # reads real streams off the pool rather than trusting the database, so
+            # the thing acting on the check must too.
+            broken = await asyncio.to_thread(_still_broken, v["path"],
+                                             v.get("library") or "")
+            if broken is not None and not broken:
+                recs.append((fid, rule, attempts, p.get("first_at") or now, now,
+                             "fixed",
+                             "re-read from disk and it now matches every rule",
+                             v["path"]))
                 fixed += 1
-            elif why:
-                # A collision, and worth naming: telling someone "no rule fixes
-                # this" when the actual situation is two copies of one episode
-                # sends them looking at the rules instead of at their disk.
-                new_state, detail = "unfixable", why
-                unfixable += 1
-            else:
-                new_state = "unfixable"
-                detail = (f"still breaking {', '.join(broken or [rule])} when "
-                          f"re-read from disk, and the planner has no work for "
-                          f"it - the check is right and the rules have a gap")
-                unfixable += 1
-        except ValueError:
-            # already queued or running - the fix is already on its way
-            new_state, detail = "queued", "a job for this file is already queued"
-            skipped += 1
-        except Exception as e:
-            new_state = "error"
-            detail = f"{type(e).__name__}: {e}"
+                continue
 
-        recs.append((fid, rule, attempts, p.get("first_at") or now, now,
-                     new_state, detail, v["path"]))
+            label = os.path.splitext(os.path.basename(v["path"] or ""))[0]
+            try:
+                await jobs.enqueue(fid, v["path"], label, source="rule audit",
+                                   priority=60)
+                new_state, detail = "queued", f"queued to fix {rule}"
+                try:
+                    from . import remedy
+                    remedy._note(fid, rule, remedy.REQUEUE, "rule audit",
+                                 mode() == "auto", True, detail, v["path"])
+                except Exception:                                # noqa: BLE001
+                    pass
+                attempts += 1
+                queued += 1
+            except jobs.NothingToDo:
+                # THE ONE GAP THE PLANNER CANNOT CLOSE BY DESIGN. container/name
+                # means Matroska content wearing another extension - nuarr's own
+                # commit writes over the original path and so keeps its name. The
+                # streams are already right, so decide() has nothing to do, and the
+                # finding sat as "no rule fixes this" forever. The remedy is a
+                # rename, which is not stream work and never will be.
+                done, why = await _fix_container_name(v, rule, broken)
+                if done:
+                    new_state, detail = "fixed", why
+                    fixed += 1
+                elif why:
+                    # A collision, and worth naming: telling someone "no rule fixes
+                    # this" when the actual situation is two copies of one episode
+                    # sends them looking at the rules instead of at their disk.
+                    new_state, detail = "unfixable", why
+                    unfixable += 1
+                else:
+                    new_state = "unfixable"
+                    detail = (f"still breaking {', '.join(broken or [rule])} when "
+                              f"re-read from disk, and the planner has no work for "
+                              f"it - the check is right and the rules have a gap")
+                    unfixable += 1
+            except ValueError:
+                # already queued or running - the fix is already on its way
+                new_state, detail = "queued", "a job for this file is already queued"
+                skipped += 1
+            except Exception as e:
+                new_state = "error"
+                detail = f"{type(e).__name__}: {e}"
 
-    STATS.update(heal_running=False, heal_done=len(viol), heal_current="")
-    await asyncio.to_thread(_write_heals, recs)
-    if queued:
-        try:
-            await jobs.start()
-        except Exception:
-            pass
-    if queued or unfixable or gave_up or fixed:
-        joblog.log(f"rule audit healing: {queued} requeued, {fixed} already "
-                   f"fixed, {unfixable} that no rule can fix, {gave_up} given "
-                   f"up on", "warn" if (unfixable or gave_up) else "ok")
-    STATS.update(healed=queued, unfixable=unfixable)
-    return {"queued": queued, "unfixable": unfixable, "gave_up": gave_up,
-            "skipped": skipped, "fixed": fixed}
+            recs.append((fid, rule, attempts, p.get("first_at") or now, now,
+                         new_state, detail, v["path"]))
+
+        STATS.update(heal_running=False, heal_done=len(viol), heal_current="")
+        await asyncio.to_thread(_write_heals, recs)
+        if queued:
+            try:
+                await jobs.start()
+            except Exception:
+                pass
+        if queued or unfixable or gave_up or fixed:
+            joblog.log(f"rule audit healing: {queued} requeued, {fixed} already "
+                       f"fixed, {unfixable} that no rule can fix, {gave_up} given "
+                       f"up on", "warn" if (unfixable or gave_up) else "ok")
+        STATS.update(healed=queued, unfixable=unfixable)
+        return {"queued": queued, "unfixable": unfixable, "gave_up": gave_up,
+                "skipped": skipped, "fixed": fixed}
+    finally:
+        STATS["heal_running"] = False
 
 
 # ------------------------------------------------------- close the loop ----

@@ -242,122 +242,134 @@ async def run_due(limit: int = 40) -> dict:
     them and there is no way to see where a pass began, what it did, or whether
     it finished. A pass that found nothing to do leaves nothing behind.
     """
-    init()
-    now = time.time()
-    with cursor() as cur:
-        rows = [dict(r) for r in cur.execute(
-            "SELECT * FROM plex_queue WHERE done_at IS NULL AND next_try_at<=? "
-            "ORDER BY next_try_at LIMIT ?", (now, limit))]
-    if not rows:
-        return {"tried": 0, "ok": 0, "failed": 0, "gave_up": 0, "held": 0}
+    # A FLAG THE PANEL RENDERS FROM MUST NOT OUTLIVE THE WORK.
+    # the Plex queue reports itself as running from this flag, and the
+    # only thing that used to clear it was reaching the end. Anything
+    # raised on the way out - and the body below calls into the arrs,
+    # the planner and the database - left the panel saying a pass was
+    # in progress for the rest of the process's life, with nothing
+    # running behind it. The normal path still writes its full
+    # summary; this only guarantees the flag itself comes down.
 
-    pending_rename = _renaming()
-    held = [r for r in rows if r["file_id"] in pending_rename]
-    rows = [r for r in rows if r["file_id"] not in pending_rename]
-    if held:
+    try:
+        init()
+        now = time.time()
         with cursor() as cur:
-            cur.executemany(
-                "UPDATE plex_queue SET next_try_at=?, last_error=? "
-                "WHERE file_id=?",
-                [(now + HOLD_S, "waiting for the arr to rename this file first",
-                  r["file_id"]) for r in held])
-    if not rows:
-        # Held-only passes are worth ONE line and no block: this is the normal
-        # twenty seconds after a commit, it happens for every processed file,
-        # and a labelled section per poll would be four an hour saying nothing.
+            rows = [dict(r) for r in cur.execute(
+                "SELECT * FROM plex_queue WHERE done_at IS NULL AND next_try_at<=? "
+                "ORDER BY next_try_at LIMIT ?", (now, limit))]
+        if not rows:
+            return {"tried": 0, "ok": 0, "failed": 0, "gave_up": 0, "held": 0}
+
+        pending_rename = _renaming()
+        held = [r for r in rows if r["file_id"] in pending_rename]
+        rows = [r for r in rows if r["file_id"] not in pending_rename]
         if held:
-            joblog.log(f"plex catch-up: holding {len(held)} file(s) until the "
-                       f"arr rename lands", "debug")
-        # A HELD-ONLY PASS IS STILL A PASS. It used to return without touching
-        # the state, so the card's "last pass" could be minutes old while the
-        # loop was running every twenty-five seconds - which is exactly the
-        # "is this thing alive?" question the state exists to answer.
-        RUN_STATE.update(running=False, at=time.time(), now="", done=0,
-                         total=0, corrected=0, already=0, failed=0,
-                         held=len(held))
-        return {"tried": 0, "ok": 0, "failed": 0, "gave_up": 0,
-                "held": len(held)}
-
-    ok = failed = gave_up = corrected = 0
-    RUN_STATE.update(running=True, started=time.time(), done=0,
-                     total=len(rows), corrected=0, already=0, failed=0,
-                     held=len(held), now="")
-    sec = joblog.section("plex catch-up")
-    sec.__enter__()
-    sec.note(f"{len(rows)} file(s) due"
-             + (f", {len(held)} more held for a rename" if held else ""))
-    for row in rows:
-        RUN_STATE["now"] = os.path.basename(row["path"] or "")[:70]
-        try:
-            good, why, seen = await asyncio.to_thread(_attempt, row)
-        except Exception as e:                               # noqa: BLE001
-            good, why, seen = False, f"{type(e).__name__}: {e}", ""
-        name = os.path.basename(row["path"] or "")
-        tail = f" — {seen}" if seen else ""
-        if good:
-            ok += 1
             with cursor() as cur:
-                cur.execute("UPDATE plex_queue SET done_at=?, last_error=NULL "
-                            "WHERE file_id=?", (time.time(), row["file_id"]))
-            # A FILE PLEX HAD WRONG AND NOW HAS RIGHT IS THE WHOLE POINT, so it
-            # is logged as work done. A file it already had right cost one
-            # request and changed nothing, so it is not.
+                cur.executemany(
+                    "UPDATE plex_queue SET next_try_at=?, last_error=? "
+                    "WHERE file_id=?",
+                    [(now + HOLD_S, "waiting for the arr to rename this file first",
+                      r["file_id"]) for r in held])
+        if not rows:
+            # Held-only passes are worth ONE line and no block: this is the normal
+            # twenty seconds after a commit, it happens for every processed file,
+            # and a labelled section per poll would be four an hour saying nothing.
+            if held:
+                joblog.log(f"plex catch-up: holding {len(held)} file(s) until the "
+                           f"arr rename lands", "debug")
+            # A HELD-ONLY PASS IS STILL A PASS. It used to return without touching
+            # the state, so the card's "last pass" could be minutes old while the
+            # loop was running every twenty-five seconds - which is exactly the
+            # "is this thing alive?" question the state exists to answer.
+            RUN_STATE.update(running=False, at=time.time(), now="", done=0,
+                             total=0, corrected=0, already=0, failed=0,
+                             held=len(held))
+            return {"tried": 0, "ok": 0, "failed": 0, "gave_up": 0,
+                    "held": len(held)}
+
+        ok = failed = gave_up = corrected = 0
+        RUN_STATE.update(running=True, started=time.time(), done=0,
+                         total=len(rows), corrected=0, already=0, failed=0,
+                         held=len(held), now="")
+        sec = joblog.section("plex catch-up")
+        sec.__enter__()
+        sec.note(f"{len(rows)} file(s) due"
+                 + (f", {len(held)} more held for a rename" if held else ""))
+        for row in rows:
+            RUN_STATE["now"] = os.path.basename(row["path"] or "")[:70]
+            try:
+                good, why, seen = await asyncio.to_thread(_attempt, row)
+            except Exception as e:                               # noqa: BLE001
+                good, why, seen = False, f"{type(e).__name__}: {e}", ""
+            name = os.path.basename(row["path"] or "")
+            tail = f" — {seen}" if seen else ""
+            if good:
+                ok += 1
+                with cursor() as cur:
+                    cur.execute("UPDATE plex_queue SET done_at=?, last_error=NULL "
+                                "WHERE file_id=?", (time.time(), row["file_id"]))
+                # A FILE PLEX HAD WRONG AND NOW HAS RIGHT IS THE WHOLE POINT, so it
+                # is logged as work done. A file it already had right cost one
+                # request and changed nothing, so it is not.
+                RUN_STATE["done"] += 1
+                if why.startswith("Plex re-read"):
+                    corrected += 1
+                    RUN_STATE["corrected"] = corrected
+                    sec.keep()
+                    sec.note(f"{name} — {why}{tail}"
+                             + (f" · after {row['attempts'] + 1} attempts"
+                                if row["attempts"] else ""), "ok")
+                else:
+                    RUN_STATE["already"] += 1
+                    joblog.log(f"plex catch-up: {name} — {why}{tail}", "debug")
+                continue
+
+            attempts = (row["attempts"] or 0) + 1
+            failed += 1
             RUN_STATE["done"] += 1
-            if why.startswith("Plex re-read"):
-                corrected += 1
-                RUN_STATE["corrected"] = corrected
+            RUN_STATE["failed"] = failed
+            if attempts >= MAX_ATTEMPTS:
+                gave_up += 1
+                with cursor() as cur:
+                    cur.execute("UPDATE plex_queue SET attempts=?, last_error=?, "
+                                "done_at=? WHERE file_id=?",
+                                (attempts, f"gave up after {attempts}: {why}"[:400],
+                                 time.time(), row["file_id"]))
                 sec.keep()
-                sec.note(f"{name} — {why}{tail}"
-                         + (f" · after {row['attempts'] + 1} attempts"
-                            if row["attempts"] else ""), "ok")
+                sec.note(f"{name} — GAVE UP after {attempts} attempts: {why}{tail}. "
+                         f"The file is correct; Plex will catch up on its own daily "
+                         f"scan.", "error")
             else:
-                RUN_STATE["already"] += 1
-                joblog.log(f"plex catch-up: {name} — {why}{tail}", "debug")
-            continue
-
-        attempts = (row["attempts"] or 0) + 1
-        failed += 1
-        RUN_STATE["done"] += 1
-        RUN_STATE["failed"] = failed
-        if attempts >= MAX_ATTEMPTS:
-            gave_up += 1
-            with cursor() as cur:
-                cur.execute("UPDATE plex_queue SET attempts=?, last_error=?, "
-                            "done_at=? WHERE file_id=?",
-                            (attempts, f"gave up after {attempts}: {why}"[:400],
-                             time.time(), row["file_id"]))
-            sec.keep()
-            sec.note(f"{name} — GAVE UP after {attempts} attempts: {why}{tail}. "
-                     f"The file is correct; Plex will catch up on its own daily "
-                     f"scan.", "error")
-        else:
-            delay = BACKOFF[min(attempts, len(BACKOFF) - 1)]
-            with cursor() as cur:
-                cur.execute("UPDATE plex_queue SET attempts=?, last_error=?, "
-                            "next_try_at=? WHERE file_id=?",
-                            (attempts, why[:400], time.time() + delay,
-                             row["file_id"]))
-            sec.keep()
-            sec.note(f"{name} — {why}{tail} · attempt {attempts}/"
-                     f"{MAX_ATTEMPTS}, trying again in "
-                     f"{_pretty(delay)}", "warn")
-    bits = []
-    if corrected:
-        bits.append(f"{corrected} corrected")
-    if ok - corrected:
-        bits.append(f"{ok - corrected} already right")
-    if failed - gave_up:
-        bits.append(f"{failed - gave_up} still waiting")
-    if gave_up:
-        bits.append(f"{gave_up} gave up")
-    if held:
-        bits.append(f"{len(held)} held for a rename")
-    sec.result = ", ".join(bits) or "nothing to do"
-    sec.__exit__(None, None, None)
-    RUN_STATE.update(running=False, at=time.time(), now="",
-                     done=len(rows), total=len(rows))
-    return {"tried": len(rows), "ok": ok, "failed": failed,
-            "gave_up": gave_up, "held": len(held), "corrected": corrected}
+                delay = BACKOFF[min(attempts, len(BACKOFF) - 1)]
+                with cursor() as cur:
+                    cur.execute("UPDATE plex_queue SET attempts=?, last_error=?, "
+                                "next_try_at=? WHERE file_id=?",
+                                (attempts, why[:400], time.time() + delay,
+                                 row["file_id"]))
+                sec.keep()
+                sec.note(f"{name} — {why}{tail} · attempt {attempts}/"
+                         f"{MAX_ATTEMPTS}, trying again in "
+                         f"{_pretty(delay)}", "warn")
+        bits = []
+        if corrected:
+            bits.append(f"{corrected} corrected")
+        if ok - corrected:
+            bits.append(f"{ok - corrected} already right")
+        if failed - gave_up:
+            bits.append(f"{failed - gave_up} still waiting")
+        if gave_up:
+            bits.append(f"{gave_up} gave up")
+        if held:
+            bits.append(f"{len(held)} held for a rename")
+        sec.result = ", ".join(bits) or "nothing to do"
+        sec.__exit__(None, None, None)
+        RUN_STATE.update(running=False, at=time.time(), now="",
+                         done=len(rows), total=len(rows))
+        return {"tried": len(rows), "ok": ok, "failed": failed,
+                "gave_up": gave_up, "held": len(held), "corrected": corrected}
+    finally:
+        RUN_STATE["running"] = False
 
 
 def _pretty(seconds: float) -> str:

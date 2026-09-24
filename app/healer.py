@@ -203,79 +203,91 @@ def _due(limit: int = 25) -> list[dict]:
 
 async def sweep() -> dict:
     """One healing pass over everything currently marked missing."""
-    due = _due()
-    STATS.update(last_run=time.time(), running=True, total=len(due),
-                 done=0, current=None)
-    healed = confirmed = still = 0
+    # A FLAG THE PANEL RENDERS FROM MUST NOT OUTLIVE THE WORK.
+    # the missing-file healer reports itself as running from this flag, and the
+    # only thing that used to clear it was reaching the end. Anything
+    # raised on the way out - and the body below calls into the arrs,
+    # the planner and the database - left the panel saying a pass was
+    # in progress for the rest of the process's life, with nothing
+    # running behind it. The normal path still writes its full
+    # summary; this only guarantees the flag itself comes down.
 
-    with joblog.section("missing check") as sec:
-        if due:
-            sec.keep()
-            sec.note(f"{len(due)} file(s) due for verification")
-        for r in due:
-            title = (r["title"] or os.path.basename(r["path"] or "")
-                     or f"id {r['id']}")
-            STATS["current"] = title
-            attempt = int(r["heal_attempts"] or 0) + 1
-            try:
-                outcome, detail = await _heal_one(r)
-            except Exception as e:
-                outcome, detail = "still-missing", f"{type(e).__name__}: {e}"
+    try:
+        due = _due()
+        STATS.update(last_run=time.time(), running=True, total=len(due),
+                     done=0, current=None)
+        healed = confirmed = still = 0
 
-            now = time.time()
-            if outcome == "gone":
-                with cursor() as cur:
-                    cur.execute("UPDATE files SET state='deleted', heal_attempts=0, "
-                                "heal_last_at=?, heal_state=NULL, state_reason=?, "
-                                "updated_at=? WHERE id=?",
-                                (now, detail, now, r["id"]))
-                healed += 1
-                sec.note(f"gone: {title} - {detail}", "info")
-            elif outcome == "healed":
-                with cursor() as cur:
-                    # state may already have been set by _heal_one for a move
-                    cur.execute("UPDATE files SET state=CASE WHEN state='missing' "
-                                "THEN 'new' ELSE state END, "
-                                "heal_attempts=0, heal_last_at=?, heal_state=NULL, "
-                                "state_reason=? WHERE id=?",
-                                (now, f"healed: {detail}", r["id"]))
-                healed += 1
-                sec.note(f"healed: {title} - {detail}", "ok")
-            elif outcome == "skip":
-                with cursor() as cur:
-                    cur.execute("UPDATE files SET heal_last_at=? WHERE id=?",
-                                (now, r["id"]))
-                sec.note(f"skipped: {title} - {detail}", "warn")
-            else:
-                final = attempt >= MAX_ATTEMPTS
-                with cursor() as cur:
-                    cur.execute("UPDATE files SET heal_attempts=?, heal_last_at=?, "
-                                "heal_state=?, state_reason=? WHERE id=?",
-                                (attempt, now,
-                                 "confirmed" if final else "checking",
-                                 (f"missing - confirmed after {attempt} checks: {detail}"
-                                  if final else
-                                  f"checking ({attempt}/{MAX_ATTEMPTS}): {detail}"),
-                                 r["id"]))
-                if final:
-                    confirmed += 1
-                    sec.note(f"CONFIRMED MISSING: {title} - {detail} "
-                             f"(checked {attempt} times)", "error")
+        with joblog.section("missing check") as sec:
+            if due:
+                sec.keep()
+                sec.note(f"{len(due)} file(s) due for verification")
+            for r in due:
+                title = (r["title"] or os.path.basename(r["path"] or "")
+                         or f"id {r['id']}")
+                STATS["current"] = title
+                attempt = int(r["heal_attempts"] or 0) + 1
+                try:
+                    outcome, detail = await _heal_one(r)
+                except Exception as e:
+                    outcome, detail = "still-missing", f"{type(e).__name__}: {e}"
+
+                now = time.time()
+                if outcome == "gone":
+                    with cursor() as cur:
+                        cur.execute("UPDATE files SET state='deleted', heal_attempts=0, "
+                                    "heal_last_at=?, heal_state=NULL, state_reason=?, "
+                                    "updated_at=? WHERE id=?",
+                                    (now, detail, now, r["id"]))
+                    healed += 1
+                    sec.note(f"gone: {title} - {detail}", "info")
+                elif outcome == "healed":
+                    with cursor() as cur:
+                        # state may already have been set by _heal_one for a move
+                        cur.execute("UPDATE files SET state=CASE WHEN state='missing' "
+                                    "THEN 'new' ELSE state END, "
+                                    "heal_attempts=0, heal_last_at=?, heal_state=NULL, "
+                                    "state_reason=? WHERE id=?",
+                                    (now, f"healed: {detail}", r["id"]))
+                    healed += 1
+                    sec.note(f"healed: {title} - {detail}", "ok")
+                elif outcome == "skip":
+                    with cursor() as cur:
+                        cur.execute("UPDATE files SET heal_last_at=? WHERE id=?",
+                                    (now, r["id"]))
+                    sec.note(f"skipped: {title} - {detail}", "warn")
                 else:
-                    still += 1
-                    sec.note(f"still absent ({attempt}/{MAX_ATTEMPTS}): {title} "
-                             f"- {detail}", "warn")
-            STATS["done"] = STATS.get("done", 0) + 1
-        if due:
-            sec.result = (f"healed {healed}, still checking {still}, "
-                          f"confirmed {confirmed}")
+                    final = attempt >= MAX_ATTEMPTS
+                    with cursor() as cur:
+                        cur.execute("UPDATE files SET heal_attempts=?, heal_last_at=?, "
+                                    "heal_state=?, state_reason=? WHERE id=?",
+                                    (attempt, now,
+                                     "confirmed" if final else "checking",
+                                     (f"missing - confirmed after {attempt} checks: {detail}"
+                                      if final else
+                                      f"checking ({attempt}/{MAX_ATTEMPTS}): {detail}"),
+                                     r["id"]))
+                    if final:
+                        confirmed += 1
+                        sec.note(f"CONFIRMED MISSING: {title} - {detail} "
+                                 f"(checked {attempt} times)", "error")
+                    else:
+                        still += 1
+                        sec.note(f"still absent ({attempt}/{MAX_ATTEMPTS}): {title} "
+                                 f"- {detail}", "warn")
+                STATS["done"] = STATS.get("done", 0) + 1
+            if due:
+                sec.result = (f"healed {healed}, still checking {still}, "
+                              f"confirmed {confirmed}")
 
-    from . import workers
-    STATS.update(running=False, current=None, checked=len(due), healed=healed,
-                 confirmed=confirmed,
-                 next_run=time.time() + workers.tune("missing_poll_s"))
-    return {"checked": len(due), "healed": healed, "still_checking": still,
-            "confirmed": confirmed}
+        from . import workers
+        STATS.update(running=False, current=None, checked=len(due), healed=healed,
+                     confirmed=confirmed,
+                     next_run=time.time() + workers.tune("missing_poll_s"))
+        return {"checked": len(due), "healed": healed, "still_checking": still,
+                "confirmed": confirmed}
+    finally:
+        STATS["running"] = False
 
 
 def counts() -> dict:
