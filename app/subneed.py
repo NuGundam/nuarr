@@ -874,7 +874,27 @@ def verdict(file_id: int, lang: str, cur, facts=None,
             return WANT, (f"the audio is {_said0} - you can follow it without "
                           f"a subtitle, so this check has nothing to decide "
                           f"here, read or not"), "spoken"
-    if not has_probe:
+    # A READING IS PROOF SOMEBODY LOOKED INSIDE, WHATEVER THE PROBE SAYS.
+    #
+    # `unread` exists to stop a file nobody has opened being called faulty -
+    # every rung below reasons from the track list, and an absent probe makes
+    # all of them answer "nothing", which is indistinguishable from a file
+    # that genuinely carries nothing. That is still right when NOTHING has
+    # read it.
+    #
+    # It was wrong when the subtitle reader HAS read it. Drug Store in
+    # Another World S01E03 carries one ASS track, tagged eng, titled
+    # "English", default, not forced - sub_facts has it, read five hours
+    # before - and its probe row had gone missing. One absent row turned a
+    # file with a perfectly good English track into a raw at 94%, still
+    # listed as "nuarr has not looked inside this file yet" when the reader
+    # plainly had. One file in the library was in this state; it took Erik
+    # opening MediaInfo to catch it.
+    #
+    # So the gate asks both questions. No probe AND no facts is unread; facts
+    # without a probe is a file to judge on its facts, which is what the
+    # whole ladder does anyway.
+    if not has_probe and facts is None:
         return UNKNOWN, "nuarr has not looked inside this file yet", "unread"
     if facts is None:
         return UNKNOWN, "the subtitle reader has not read this file yet", "noread"

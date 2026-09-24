@@ -10543,6 +10543,16 @@ async def api_subkind_reread(ids: str = "", confirm: str = ""):
                 if data:
                     jobs.cache_probe(fid, data)
                     out["probed"] += 1
+                else:
+                    # A PROBE THAT ANSWERED NOTHING IS NOT A PROBE. It used
+                    # to fall through silently, and the file was left with
+                    # no probe row at all - blind, after a button whose
+                    # whole promise is a fresh reading. Say so, and let the
+                    # prober pick it up on its own pass rather than leaving
+                    # the file looking like one nobody has ever opened.
+                    why = ("ffprobe returned nothing for this file - it has "
+                           "been left for the prober to try again")
+                    out["blind"] = int(out.get("blind") or 0) + 1
             except Exception as e:                           # noqa: BLE001
                 why = f"probe: {type(e).__name__}: {e}"[:120]
         out["rows"].append({"file_id": fid, "ok": not why, "why": why})
