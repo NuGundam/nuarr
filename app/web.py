@@ -23446,7 +23446,7 @@ async function ffDriver(force){
   try{ d=await (await fetch('/api/ffmpeg/driver'+(force?'?force=true':''))).json(); }
   catch(_){ el.innerHTML='<div class="dim" style="font-size:11px">'
                         +'driver check unavailable</div>'; return; }
-  const L=d.latest||{};
+  const L=d.latest||{}, A=d.nvenc_api||{};
   // BASIC FACTS ONLY: installed driver, newest published, and whether they
   // differ. The NVENC API chips and the ffmpeg-generation requirements table
   // that used to live here are gone - "which ffmpeg works" is now answered
@@ -23468,7 +23468,12 @@ async function ffDriver(force){
       <button style="font-size:10px;padding:1px 7px" onclick="ffDriver(true)">Re-check</button>
     </div>
     ${(L.ok && !L.stale && L.name) ? `<div class="dim" style="margin-top:3px;font-size:10px">
-       ${esc(L.name)}${L.edition?' &middot; matched for '+esc(L.edition):''}</div>`:''}`;
+       ${esc(L.name)}${L.edition?' &middot; matched for '+esc(L.edition):''}</div>`:''}
+    ${(A.stale) ? `<div class="warn" style="margin-top:3px;font-size:10px">
+       The NVENC reading below is from driver ${esc(A.measured_on||'?')}, which
+       this machine no longer runs - restart nuarr to read the new one. Until
+       then it may hold ffmpeg below what this driver can run. Encodes are
+       unaffected.</div>`:''}`;
 }
 
 // ffUnpin / ffRepair / ffRollback are gone with their buttons. The pin was

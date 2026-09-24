@@ -374,7 +374,11 @@ def driver_outlook() -> dict:
     have = _driver_version()
     latest = latest_driver()
     api = nvenc_api()
-    have_api = (api["major"], api["minor"]) if api.get("ok") else None
+    # A stale reading is worse than no reading: it is a confident wrong answer.
+    # Fall back to comparing driver numbers, which is at least labelled as the
+    # prediction it is (measured=False).
+    have_api = ((api["major"], api["minor"])
+                if api.get("ok") and not api.get("stale") else None)
 
     def as_f(v):
         try:
@@ -705,19 +709,35 @@ async def watch_driver(interval_s: float = 300.0) -> None:
                     joblog.log(f"GPU driver {now} (NVENC "
                                f"{api.get('version') or '?'})", "debug")
                 else:
-                    moved = (api.get("version") or "") != prev_api
-                    joblog.log(
-                        f"NVIDIA driver changed: {seen} -> {now}. NVENC API "
-                        + (f"{prev_api} -> {api.get('version')}" if moved
-                           else f"unchanged at {api.get('version') or '?'}"),
-                        "warn")
-                    if not moved and prev_api:
-                        # Worth saying plainly: a driver update that does not
-                        # move the API unlocks no new ffmpeg build.
+                    if api.get("stale"):
+                        # THE RE-MEASURE ABOVE CANNOT HAVE WORKED - see
+                        # _api_stale(). Do not report the old driver's API as
+                        # if it were the new one's; ask for the restart that
+                        # is the only thing which can answer the question.
                         joblog.log(
-                            "the driver moved but the NVENC API did not, so "
-                            "the same ffmpeg builds are supported as before",
-                            "info")
+                            f"NVIDIA driver changed: {seen} -> {now}. Restart "
+                            f"nuarr to read the new NVENC API - a running "
+                            f"process keeps the old encoder library mapped, "
+                            f"so until then nuarr still reads {prev_api or '?'}"
+                            f" and may hold ffmpeg below what this driver can "
+                            f"actually run. Encodes themselves are fine: every "
+                            f"job launches its own ffmpeg, which sees the new "
+                            f"driver immediately.", "warn")
+                    else:
+                        moved = (api.get("version") or "") != prev_api
+                        joblog.log(
+                            f"NVIDIA driver changed: {seen} -> {now}. NVENC "
+                            "API "
+                            + (f"{prev_api} -> {api.get('version')}" if moved
+                               else f"unchanged at {api.get('version') or '?'}"),
+                            "warn")
+                        if not moved and prev_api:
+                            # Worth saying plainly: a driver update that does
+                            # not move the API unlocks no new ffmpeg build.
+                            joblog.log(
+                                "the driver moved but the NVENC API did not, "
+                                "so the same ffmpeg builds are supported as "
+                                "before", "info")
                     # Re-probe the encoder before anything is requeued, so the
                     # replanned jobs are planned against the new reality.
                     res = nvenc_check(force=True)
@@ -735,6 +755,39 @@ async def watch_driver(interval_s: float = 300.0) -> None:
         except Exception as e:                                  # noqa: BLE001
             joblog.log(f"driver watch: {type(e).__name__}: {e}", "debug")
         await asyncio.sleep(interval_s)
+
+
+_API_ON: dict = {"driver": ""}
+
+
+def _api_stale(api: dict) -> dict:
+    """A MEASURED NVENC READING GOES STALE THE MOMENT THE DRIVER MOVES.
+
+    Windows maps nvEncodeAPI64.dll into a process once and keeps that mapping
+    for the life of the process: a second ctypes.WinDLL of the same name hands
+    back the module already loaded, not the file the new driver installed. So
+    nuarr cannot re-read the API after a driver update, however hard it tries -
+    watch_driver's nvenc_api(force=True) re-reads the OLD driver's answer and
+    believes it.
+
+    That is exactly what happened on 610.88: the driver implements NVENC 13.1
+    and ffmpeg 9.x would have run, while the ffmpeg page held the ceiling at
+    7.1.4 and said "newest usable on this driver", because the number it was
+    comparing against came from the 597 driver that had been replaced under it.
+
+    ffmpeg itself is unaffected - every job is a fresh process, so it sees the
+    new driver immediately. It is only nuarr's own reading that is frozen, so
+    the honest thing is to mark it and ask for a restart rather than to keep
+    quoting it.
+    """
+    on = api.get("driver") or ""
+    now = _driver_version()
+    if on and now and on != now:
+        api["stale"] = True
+        api["measured_on"] = on
+        api["note"] = (f"read on driver {on}; this machine is on {now} now - "
+                       "restart nuarr to read it again")
+    return api
 
 
 def nvenc_api(force: bool = False) -> dict:
@@ -759,7 +812,7 @@ def nvenc_api(force: bool = False) -> dict:
     """
     if (not force and _NVENC_API["data"]
             and time.time() - _NVENC_API["at"] < _NVENC_API_TTL):
-        return dict(_NVENC_API["data"])
+        return _api_stale(dict(_NVENC_API["data"]))
     out = {"ok": False, "major": 0, "minor": 0, "version": "", "error": ""}
     try:
         import ctypes
@@ -776,8 +829,14 @@ def nvenc_api(force: bool = False) -> dict:
         out["error"] = "no NVIDIA encoder driver on this machine"
     except Exception as e:                                    # noqa: BLE001
         out["error"] = f"{type(e).__name__}: {e}"
+    if out["ok"] and not _API_ON["driver"]:
+        # The driver this process's DLL belongs to, fixed at first load - NOT
+        # re-read later, because a later read would record the new driver
+        # against the old driver's answer and hide the staleness.
+        _API_ON["driver"] = _driver_version()
+    out["driver"] = _API_ON["driver"]
     _NVENC_API.update(at=time.time(), data=out)
-    return dict(out)
+    return _api_stale(dict(out))
 
 
 def upgrade_safety(latest: str) -> dict:
