@@ -16,12 +16,23 @@ SOURCE
 ------
 gyan.dev, the build linked from ffmpeg.org's Windows download page. Chosen over
 the alternatives because it publishes:
-    /release-version                     plain text, e.g. "8.1.2"
-    /ffmpeg-release-essentials.zip       the build
-    /ffmpeg-release-essentials.zip.sha256  a checksum to verify it
+    /release-version                  plain text, e.g. "8.1.2"
+    /ffmpeg-release-full.7z           the build
+    /ffmpeg-release-full.7z.sha256    a checksum to verify it
 
 The checksum is the deciding factor. Downloading an executable without one is
 not something to automate.
+
+THE FULL VARIANT, NOT ESSENTIALS. gyan ships two: essentials carries the common
+libraries, full adds most of the rest - libsvtav1, libdav1d, libplacebo, libsoxr
+and so on. nuarr shipped on a Jellyfin build, which has them, so every essentials
+release looked like a downgrade to the encoder bench and was refused: ffmpeg 9.0.2
+sat blocked behind libsvtav1, an AV1 encoder no nuarr job can reach. Taking the
+full build removes the discrepancy at its source rather than arguing with it.
+
+The cost is that full is published as .7z only, so unpacking needs 7-Zip or a
+libarchive-backed tar - see _unpack, which tries both and says plainly when
+neither is there.
 
 SAFETY
 ------
@@ -53,8 +64,8 @@ from . import joblog
 
 BASE = "https://www.gyan.dev/ffmpeg/builds"
 VERSION_URL = f"{BASE}/release-version"
-ZIP_URL = f"{BASE}/ffmpeg-release-essentials.zip"
-SHA_URL = f"{BASE}/ffmpeg-release-essentials.zip.sha256"
+ZIP_URL = f"{BASE}/ffmpeg-release-full.7z"
+SHA_URL = f"{BASE}/ffmpeg-release-full.7z.sha256"
 # FFmpeg's own changelog, tagged per release
 CHANGELOG_URL = "https://raw.githubusercontent.com/FFmpeg/FFmpeg/n{ver}/Changelog"
 
@@ -1413,13 +1424,68 @@ async def install(confirm: bool = False) -> dict:
             "path": applied.get("path"), "previous_kept": str(BACKUP_DIR)}
 
 
+def _7z_exe() -> str:
+    """7-Zip's command-line binary, or ''. PATH first, then where it installs."""
+    found = shutil.which("7z") or shutil.which("7za")
+    if found:
+        return found
+    for p in (r"C:\Program Files\7-Zip\7z.exe",
+              r"C:\Program Files (x86)\7-Zip\7z.exe"):
+        if os.path.exists(p):
+            return p
+    return ""
+
+
 def _unpack(zip_path: str, dest: str) -> None:
-    with zipfile.ZipFile(zip_path) as z:
-        for m in z.namelist():
-            # refuse path traversal from a crafted archive
-            if os.path.isabs(m) or ".." in m.replace("\\", "/").split("/"):
-                raise ValueError(f"unsafe path in archive: {m}")
-        z.extractall(dest)
+    """Unpack the downloaded build, whatever container it came in.
+
+    DECIDED ON THE MAGIC BYTES, not the file name - the callers write it as
+    "download.zip" out of habit and the source moved to .7z underneath them.
+    Reading the first six bytes is cheaper than keeping every caller honest.
+    """
+    with open(zip_path, "rb") as f:
+        head = f.read(6)
+    if head[:4] == b"PK\x03\x04":
+        with zipfile.ZipFile(zip_path) as z:
+            for m in z.namelist():
+                # refuse path traversal from a crafted archive
+                if os.path.isabs(m) or ".." in m.replace("\\", "/").split("/"):
+                    raise ValueError(f"unsafe path in archive: {m}")
+            z.extractall(dest)
+        return
+    if head != b"7z\xbc\xaf\x27\x1c":
+        raise ValueError("the download is neither a zip nor a 7z archive")
+
+    # The archive's SHA-256 was matched against gyan's published checksum
+    # before this runs, and `dest` is a staging directory created empty for
+    # this unpack, so the extractor is not being pointed at anything live.
+    exe = _7z_exe()
+    tries = []
+    if exe:
+        tries.append([exe, "x", "-y", "-bso0", "-bsp0", f"-o{dest}", zip_path])
+    tar = shutil.which("tar")
+    if tar:
+        # bsdtar/libarchive reads 7z where it was built with lzma. It often is
+        # on Windows Server; when it is not, it fails here rather than silently
+        # producing an empty directory, because the caller then finds no
+        # ffmpeg.exe and says so.
+        tries.append([tar, "-xf", zip_path, "-C", dest])
+    if not tries:
+        raise ValueError(
+            "this build is a .7z archive and neither 7-Zip nor tar is on this "
+            "machine to open it - install 7-Zip (7-zip.org)")
+    last = ""
+    for cmd in tries:
+        try:
+            r = subprocess.run(cmd, capture_output=True, timeout=900,
+                               creationflags=NO_WINDOW, startupinfo=hidden_si())
+            if r.returncode == 0 and _find_bin(dest):
+                return
+            last = (r.stderr or r.stdout or b"").decode(
+                "utf-8", "replace").strip()[:200] or f"exit {r.returncode}"
+        except Exception as e:                                   # noqa: BLE001
+            last = f"{type(e).__name__}: {e}"
+    raise ValueError(f"could not unpack the 7z archive: {last or 'unknown'}")
 
 
 def _find_bin(root: str) -> str | None:

@@ -36144,12 +36144,24 @@ function etWhyNot(R){
   // raw ffmpeg lines ("[vost#0:0 @ 0000...] Unknown encoder") belong in the
   // per-encoder details, not in the summary.
   if(!R.installed || !R.latest) return '';
-  const iok=new Set(R.installed.tests.filter(t=>t.status==='supported').map(t=>t.encoder));
-  const lost=R.latest.tests.filter(t=>iok.has(t.encoder)&&t.status!=='supported');
+  const iok=new Set(R.installed.tests.filter(t=>t.status==='supported')
+                     .map(t=>t.encoder));
+  const all=R.latest.tests.filter(t=>iok.has(t.encoder)&&t.status!=='supported');
+  const lost=all.filter(etGates), spare=all.filter(t=>!etGates(t));
   const v=etVer(R.latest.version), cur=etVer(R.installed.version);
+  // A LOSS THAT COSTS NOTHING IS NOT A BLOCKER, but it is still worth a line:
+  // "passed every test" next to a red row in the table reads as a bug.
+  const aside = spare.length
+    ? `<div class="dim" style="font-size:11px;margin-top:4px">
+         ${esc(spare.map(t=>t.encoder).join(', '))}
+         ${spare.length>1?'are':'is'} missing from that build as well, which
+         changes nothing here: nuarr converts AV1 away rather than to it, so
+         ${spare.length>1?'those encoders':'that encoder'} is never chosen.</div>`
+    : '';
   if(!lost.length)
     return `<div style="color:#7fd4a3;font-size:12px;margin-top:8px">
-      ffmpeg ${esc(v)} passed every test — press Apply now to install it.</div>`;
+      ffmpeg ${esc(v)} passed every test that matters — press Apply now to
+      install it.</div>` + aside;
   // One phrase per CAUSE (t.why is already the plain-words verdict from the
   // cause table), naming the family when a whole family failed together and
   // the encoders only when it did not.
@@ -36175,7 +36187,15 @@ function etWhyNot(R){
   });
   return `<div style="font-size:12px;margin-top:8px;color:#e2b341">
     ffmpeg ${esc(v)} can&rsquo;t be used: ${esc(parts.join(', and '))}.
-    Staying on ${esc(cur)}.</div>`;
+    Staying on ${esc(cur)}.</div>` + aside;
+}
+
+// WHICH TEST RESULTS CARRY A VETO. The server decides (encoders.selectable),
+// and marks each row; results saved before that existed carry no mark, so fall
+// back to the rule the flag encodes - the planner only ever targets H.264 or
+// HEVC, so an AV1 row can never be the reason a build is refused.
+function etGates(t){
+  return (t && t.gates !== undefined) ? !!t.gates : (t && t.codec !== 'AV1');
 }
 
 function etApplyGate(d){
@@ -36191,8 +36211,10 @@ function etApplyGate(d){
       why='Run Download & test first — Apply unlocks when the new build passes';
   if(d.active){ why='tests are running…'; }
   else if(R.installed && R.latest){
-    const iok=new Set(R.installed.tests.filter(t=>t.status==='supported').map(t=>t.encoder));
-    const lost=R.latest.tests.filter(t=>iok.has(t.encoder)&&t.status!=='supported');
+    const iok=new Set(R.installed.tests.filter(t=>t.status==='supported')
+                       .map(t=>t.encoder));
+    const lost=R.latest.tests.filter(
+        t=>iok.has(t.encoder)&&t.status!=='supported'&&etGates(t));
     if(!lost.length){ ok=true; why='installs ffmpeg '+(R.latest.version||''); }
     else why='blocked — '+lost.map(t=>t.encoder).join(', ')+' would break (see the verdict below)';
   }

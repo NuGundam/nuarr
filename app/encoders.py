@@ -105,6 +105,29 @@ def family_of(encoder: str) -> str:
     return ""
 
 
+def selectable() -> set:
+    """Every encoder nuarr can actually choose to run.
+
+    WHICH IS NOT EVERY ENCODER IT KNOWS ABOUT. The planner sets exactly two
+    targets - rules.py starts at "h264" and moves to "h265"; there is no third
+    branch - so the av1 entry in each family is a name in a table and nothing
+    more. AV1 is a SOURCE format here, converted away from (codecpolicy's
+    "Convert AV1 away"), never a destination.
+
+    This exists because the ffmpeg update gate was comparing the full encoder
+    list, and gyan.dev's essentials build has never carried libsvtav1 while the
+    Jellyfin build nuarr shipped on does. So every single gyan release "lost an
+    encoder" and was refused - a permanent block on updating, enforced on
+    behalf of an encoder that no job could ever reach.
+    """
+    out = set()
+    for spec in FAMILIES.values():
+        for key in ("h264", "hevc"):
+            if spec.get(key):
+                out.add(spec[key])
+    return out
+
+
 def encoder_for(family: str, target: str) -> str:
     """The encoder name a family uses for a target codec ('hevc'/'h264'/'av1')."""
     spec = FAMILIES.get(family) or FAMILIES["cpu"]

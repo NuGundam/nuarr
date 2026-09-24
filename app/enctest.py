@@ -64,6 +64,7 @@ _CODECS = [("h264", "H.264"), ("hevc", "HEVC"), ("av1", "AV1")]
 
 def _matrix() -> list[dict]:
     from . import encoders
+    sel = encoders.selectable()
     rows = []
     for fam in encoders.ORDER:
         spec = encoders.FAMILIES[fam]
@@ -71,7 +72,12 @@ def _matrix() -> list[dict]:
             enc = spec.get(key)
             if enc:
                 rows.append({"family": fam, "family_label": spec["label"],
-                             "codec": label, "encoder": enc})
+                             "codec": label, "encoder": enc,
+                             # TESTED, BUT NOT EVERY TEST GETS A VETO. An
+                             # encoder no job can reach (the AV1 ones - see
+                             # encoders.selectable) is worth knowing about and
+                             # worth nothing as a reason to refuse a build.
+                             "gates": enc in sel})
     return rows
 
 
@@ -494,10 +500,20 @@ async def adopt() -> dict:
         return {"ok": False, "error": "test the installed build first, so "
                                       "there is a baseline to compare the "
                                       "new build against"}
+    # Only encoders a job could actually be sent to get a veto here. Results
+    # saved before "gates" existed carry no flag, so fall back to asking
+    # encoders.selectable directly rather than trusting the row.
+    from . import encoders
+    sel = encoders.selectable()
+
+    def _gates(t) -> bool:
+        g = t.get("gates")
+        return (t.get("encoder") in sel) if g is None else bool(g)
+
     inst_ok = {t["encoder"] for t in inst.get("tests", [])
-               if t.get("status") == "supported"}
+               if t.get("status") == "supported" and _gates(t)}
     cand_ok = {t["encoder"] for t in cand.get("tests", [])
-               if t.get("status") == "supported"}
+               if t.get("status") == "supported" and _gates(t)}
     lost = sorted(inst_ok - cand_ok)
     if lost:
         why = {t["encoder"]: t.get("why") or "failed"
