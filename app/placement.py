@@ -208,8 +208,11 @@ def _note(target: str, chosen: str, src: str, why: str, placed: bool) -> None:
     del RECENT[RECENT_MAX:]
 
 
-def landed(target: str, label: str) -> None:
-    """The file is on `label` now: say so in the files table and the log."""
+def landed(target: str, label: str, counted: bool = False) -> None:
+    """The file is on `label` now: say so in the files table and the log.
+
+    `counted` means it went through the pool (fileops.landing_dir) and
+    DrivePool has it in its figures already - nothing to tell it later."""
     try:
         from .db import cursor
         with cursor() as cur:
@@ -217,9 +220,13 @@ def landed(target: str, label: str) -> None:
     except Exception:                                        # noqa: BLE001
         pass
     try:
-        joblog.log(f"placed on {label}: {os.path.basename(target)}", "info")
+        joblog.log(f"placed on {label}"
+                   + (" through the pool" if counted else "")
+                   + f": {os.path.basename(target)}", "info")
     except Exception:                                        # noqa: BLE001
         pass
+    if counted:
+        return
     # AND TELL DRIVEPOOL SOMETHING LANDED BEHIND ITS BACK. Staging into a
     # PoolPart is what puts the file on the disk we chose, and it is also
     # what hides the bytes from DrivePool's cached measurement - they show
@@ -238,7 +245,18 @@ def landed(target: str, label: str) -> None:
 
 def status() -> dict:
     ok, why = _balancer_verdict() if enabled() else (False, "placement is off")
+    # How many members have a landing folder on the pool - twelve of twelve
+    # means every commit goes through DrivePool and is counted as it lands.
+    try:
+        from . import fileops, scanner
+        parts = scanner.pool_disks() or {}
+        landing = sum(1 for lbl in parts
+                      if fileops.landing_dir(os.path.join("P:\\", "x"), lbl))
+        n_parts = len(parts)
+    except Exception:                                        # noqa: BLE001
+        landing, n_parts = 0, 0
     return {"enabled": enabled(), "may_place": ok, "why": why,
+            "landing": landing, "members": n_parts,
             "by": "percent used" if _by_percent() else "free space",
             "ceiling": _fill_ceiling(), "last": dict(LAST),
             "recent": [dict(r) for r in RECENT]}

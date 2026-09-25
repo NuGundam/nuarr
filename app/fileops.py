@@ -641,6 +641,46 @@ def fix_container_extension(path: str, *, lock_timeout: float = 120) -> OpResult
 # DrivePool; PLACED(target, label) is told when the swap has landed there.
 PLACER = None
 PLACED = None
+# WRITE THROUGH THE POOL, NOT AROUND IT.
+#
+# Staging straight into a member's PoolPart put the file on the disk we chose
+# and hid it from DrivePool: bytes written behind its driver are never counted,
+# show as grey "Other" until a full re-measure, and - measured on this box -
+# are SUBTRACTED from its totals when later deleted through the pool, so the
+# count drifts low with every replacement nuarr commits. The balancer then
+# works from a picture that was wrong by 970 GB, and moves data toward disks
+# nuarr had already filled.
+#
+# The pool has a landing folder per member, `.nuarr-land\<label>`, each pinned
+# to its disk by a DrivePool file-placement rule with overflow forbidden.
+# Writing the staging copy THERE, through the pool, lands it on the chosen
+# disk and counted; the final os.replace to `target` is a rename inside the
+# pool, which DrivePool performs on the disk the file is on. Proven on
+# 2026-09-24 for all twelve members: written to the pinned folder -> on that
+# disk, counted at once; renamed to a real path -> still there, still
+# counted; deleted -> the count came back to exactly where it started.
+#
+# The old direct path is kept as the fallback for a member with no landing
+# folder (a disk added before its rule exists), so nothing is ever refused.
+LANDING_DIR = ".nuarr-land"
+
+
+def landing_dir(target: str, label: str) -> str:
+    """`<pool drive>\.nuarr-land\<label>`, or '' when it is not there.
+
+    An existing folder is the whole test: the rule lives in DrivePool and
+    cannot be read from here, but a folder that exists was made for a rule,
+    and the caller checks afterwards which disk the copy actually landed on.
+    """
+    try:
+        from . import scanner as _sc
+        drive = os.path.splitdrive(_sc.strip_extended_prefix(target))[0]
+    except Exception:                                        # noqa: BLE001
+        return ""
+    if not drive or not label:
+        return ""
+    d = os.path.join(drive + "\\", LANDING_DIR, label)
+    return d if os.path.isdir(d) else ""
 # AND WHO WRITES DOWN THE FILE WE JUST WROTE. REPLACED(path) is called after
 # every successful replace, whatever asked for it - a transcode, an OCR embed,
 # a sidecar, a deferred commit retried hours later. It exists because the
@@ -701,6 +741,8 @@ def safe_replace(target: str, replacement: str, *, attempts: int = 5,
     # DrivePool picks, exactly as before.
     phys: str | None = None
     place_label = ""
+    place_root = ""
+    landed_via = ""          # the landing folder used, or '' for the old way
     if os.path.splitdrive(os.path.abspath(replacement))[0].lower() != \
        os.path.splitdrive(os.path.abspath(target))[0].lower():
         if PLACER:
@@ -709,15 +751,27 @@ def safe_replace(target: str, replacement: str, *, attempts: int = 5,
             except Exception:                                # noqa: BLE001
                 root, place_label = None, ""
             if root:
-                try:
-                    from . import scanner as _sc
-                    bare = _sc.strip_extended_prefix(target)
-                    rel = os.path.relpath(bare, os.path.splitdrive(bare)[0] + "\\")
-                    phys = os.path.join(root, rel)
-                    os.makedirs(os.path.dirname(phys), exist_ok=True)
-                except Exception:                            # noqa: BLE001
-                    phys, place_label = None, ""
-        staged = (phys + ".nuarr-new") if phys else (target + ".nuarr-new")
+                place_root = str(root)
+                land = landing_dir(target, place_label)
+                if land:
+                    # Through the pool, into the pinned folder. A unique
+                    # name: two commits of same-named files on one disk
+                    # must not share a staging path.
+                    landed_via = os.path.join(
+                        land, f"{os.path.basename(os.path.normpath(target))}"
+                              f".{os.getpid()}-{time.time_ns() % 10**9}")
+                else:
+                    try:
+                        from . import scanner as _sc
+                        bare = _sc.strip_extended_prefix(target)
+                        rel = os.path.relpath(bare, os.path.splitdrive(bare)[0] + "\\")
+                        phys = os.path.join(root, rel)
+                        os.makedirs(os.path.dirname(phys), exist_ok=True)
+                    except Exception:                        # noqa: BLE001
+                        phys, place_label = None, ""
+        staged = ((landed_via + ".nuarr-new") if landed_via
+                  else (phys + ".nuarr-new") if phys
+                  else (target + ".nuarr-new"))
         try:
             if os.path.exists(staged):
                 os.remove(staged)
@@ -745,6 +799,32 @@ def safe_replace(target: str, replacement: str, *, attempts: int = 5,
                 _quiet_remove(staged)
                 return OpResult(False, "replace", f"cross-volume staging failed: {why}")
             replacement = staged
+            if landed_via and place_root:
+                # DID THE RULE HOLD. The folder says which disk it is pinned
+                # to; the disk says where the bytes are. If they disagree the
+                # rule is missing or wrong, and the file is still a good file
+                # on some disk - so it is committed as normal and the label
+                # is corrected to the truth rather than the intention.
+                try:
+                    from . import scanner as _sc
+                    _rel = os.path.relpath(
+                        _sc.strip_extended_prefix(staged),
+                        os.path.splitdrive(_sc.strip_extended_prefix(staged))[0] + "\\")
+                    _on = [l for l, r in (_sc.pool_disks() or {}).items()
+                           if os.path.exists(os.path.join(r, _rel))]
+                    if _on != [place_label]:
+                        try:
+                            from . import joblog as _jl
+                            _jl.log(f"landing folder {LANDING_DIR}\\{place_label} "
+                                    f"did not pin: the copy is on "
+                                    f"{', '.join(_on) or 'no member disk'} - "
+                                    f"check its file-placement rule in "
+                                    f"DrivePool", "warn")
+                        except Exception:                    # noqa: BLE001
+                            pass
+                        place_label = _on[0] if len(_on) == 1 else ""
+                except Exception:                            # noqa: BLE001
+                    pass
         except OSError as e:
             _quiet_remove(staged)
             return OpResult(False, "replace", f"cross-volume staging failed: {e}")
@@ -777,6 +857,9 @@ def safe_replace(target: str, replacement: str, *, attempts: int = 5,
                         break
                     time.sleep(0.2)
             else:
+                # Pool path to pool path. With a landing copy this is the
+                # rename DrivePool performs on the disk the copy is on - it
+                # relocates nothing, and the count already includes it.
                 os.replace(replacement, target)
 
             if not os.path.exists(target) or os.path.getsize(target) != new_sig_size:
@@ -800,9 +883,11 @@ def safe_replace(target: str, replacement: str, *, attempts: int = 5,
             # whichever drive it started on.
             if staged:
                 _quiet_remove(original)
-            if phys and place_label and PLACED:
+            if (phys or landed_via) and place_label and PLACED:
                 try:
-                    PLACED(target, place_label)
+                    # counted=True: DrivePool wrote this one itself, so
+                    # there is nothing to tell it later.
+                    PLACED(target, place_label, bool(landed_via))
                 except Exception:                            # noqa: BLE001
                     pass
             if REPLACED:
@@ -811,10 +896,12 @@ def safe_replace(target: str, replacement: str, *, attempts: int = 5,
                 except Exception:                            # noqa: BLE001
                     pass
             return OpResult(True, "replace", f"{human_bytes(new_sig_size)} in place"
-                            + (f" (placed on {place_label})" if phys
+                            + (f" (placed on {place_label} through the pool)"
+                               if landed_via and place_label
+                               else f" (placed on {place_label})" if phys
                                else " (staged across volumes)" if staged else ""),
                             attempt, waited, holders,
-                            placed_on=(place_label if phys else ""))
+                            placed_on=(place_label if (phys or landed_via) else ""))
 
         except OSError as e:
             # roll back so the library is never left without the original

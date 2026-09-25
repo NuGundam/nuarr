@@ -29028,8 +29028,12 @@ function dpPlaceHtml(d){
       </label>
     </div>
     <div class="dim" style="font-size:11px;margin-top:2px">nuarr chooses the
-      spindle for every file it commits and writes it there itself — DrivePool
-      moves nothing, and is told once the files have stopped landing</div>
+      spindle for every file it commits${
+        (p.landing&&p.members&&p.landing===p.members)
+          ? ` and writes it through the pool into <span class="mono">.nuarr-land\\&lt;disk&gt;</span>, a folder DrivePool pins to that disk — so DrivePool counts it as it lands and nothing is ever "Other"`
+          : (p.landing
+             ? ` — ${p.landing} of ${p.members} disks have a landing folder on the pool; the rest are written into their PoolPart directly and told to DrivePool once the files have stopped landing`
+             : ` and writes it into the disk's PoolPart itself — DrivePool moves nothing, and is told once the files have stopped landing`)}</div>
     ${dpMeasureHtml(d)}
     ${lead}
     ${rows?`<table style="width:100%;font-size:12px;border-collapse:collapse;
