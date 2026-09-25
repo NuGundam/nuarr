@@ -422,7 +422,9 @@ def remeasure_tick() -> dict:
         return {"ok": True, "did": False, "why": "it is already measuring"}
     if measuring_now():
         return {"ok": True, "did": False, "why": "it is already measuring"}
-    if moving():
+    want = remeasure_hour()
+    at_hour = time.localtime().tm_hour == want
+    if moving() and not at_hour:
         # A balance is moving files between poolparts and DrivePool counts
         # those itself. Measuring under it is work over a moving target.
         return {"ok": True, "did": False, "why": "it is balancing"}
@@ -433,10 +435,28 @@ def remeasure_tick() -> dict:
                         f"last measure")}
     # THE HOUR IS THE GATE. Anything else would be a measure starting in the
     # middle of the evening on a pool that takes hours to walk.
-    want = remeasure_hour()
-    if time.localtime().tm_hour != want:
+    if not at_hour:
         return {"ok": True, "did": False, "placed": placed,
                 "why": f"waiting for {want:02d}:00"}
+    if moving():
+        # THE MEASURE HAPPENS AT ITS HOUR, BALANCE OR NO BALANCE. The veto
+        # above is right the rest of the day. At the hour it was a deadlock:
+        # the balance that was running was itself based on numbers this
+        # measure exists to correct - 459 GB being moved into disks nuarr
+        # had already filled, because DrivePool could not see 400 GB of
+        # what it had placed - and "not while balancing" meant the measure
+        # never ran and the balance never got true numbers. Eighteen hours
+        # of a throttled mover kept "last asked: never" true for days.
+        #
+        # Measuring under a mover is a snapshot of a moving target, but the
+        # mover counts its own moves and the error is bounded by what it
+        # shifts during the walk. Not measuring is unbounded.
+        try:
+            joblog.log("DrivePool: measuring at the scheduled hour although a "
+                       "balance is running - the balance is working from "
+                       "numbers this measure corrects", "info")
+        except Exception:                                    # noqa: BLE001
+            pass
     r = remeasure(why=MEASURE.get("why") or "")
     return {"ok": bool(r.get("ok")), "did": True, **r}
 
@@ -1235,6 +1255,44 @@ SERVICE = "DrivePoolService"
 AUTO_WORD = {0: "do not balance automatically", 1: "balance every day at",
              2: "balance immediately"}
 AUTO_IMMEDIATE = 2
+AUTO_SCHEDULED = 1
+# WHEN DRIVEPOOL IS ALLOWED TO BALANCE, AND HOW MUCH IT TAKES TO BOTHER.
+#
+# The order is the whole design: nuarr measures at REMEASURE_HOUR so that
+# DrivePool's numbers are true, and DrivePool decides half an hour later on
+# those numbers. "Balance immediately" with a 10 GB trigger was the opposite -
+# every large file nuarr placed tripped a pass, on figures that did not include
+# the file, moving data toward the disk it had just landed on.
+#
+# 100 GB, not 10: nuarr already places every file on the emptiest disk by
+# percent, so the pool stays within a point of level by construction. What is
+# left for DrivePool's balancer is the safety net - a disk being emptied, a
+# Scanner warning - and none of that is a 10 GB matter.
+BALANCE_TIME_DEFAULT = "05:30:00"
+BALANCE_BYTES_DEFAULT = 100 * 2 ** 30
+
+
+def balance_time() -> str:
+    """HH:MM:SS, from the kv or the default. Always the full form."""
+    try:
+        v = str(kv_get("drivepool.balance.time") or "").strip()
+    except Exception:                                        # noqa: BLE001
+        v = ""
+    m = re.match(r"^(\d{1,2}):(\d{2})(?::(\d{2}))?$", v)
+    if not m:
+        return BALANCE_TIME_DEFAULT
+    h, mi = int(m.group(1)), int(m.group(2))
+    if not (0 <= h <= 23 and 0 <= mi <= 59):
+        return BALANCE_TIME_DEFAULT
+    return f"{h:02d}:{mi:02d}:{int(m.group(3) or 0):02d}"
+
+
+def balance_bytes() -> int:
+    try:
+        gb = float(kv_get("drivepool.balance.bytes_gb") or 0)
+    except Exception:                                        # noqa: BLE001
+        gb = 0.0
+    return int(gb * 2 ** 30) if gb > 0 else BALANCE_BYTES_DEFAULT
 
 
 def service_state() -> str:
@@ -1328,6 +1386,17 @@ def _svc(verb: str, want: str, timeout: float = 45.0) -> tuple:
 
 def _write_auto(auto: int) -> tuple:
     """Set AutoBalanceType in the pool's own store. Only while stopped."""
+    changes = {"AutoBalanceType": int(auto)}
+    if auto == AUTO_IMMEDIATE:
+        changes["AllowBalanceImmediately"] = True
+    if auto == AUTO_SCHEDULED:
+        changes["BalancingTimeOfDay"] = balance_time()
+        changes["CriticalBalanceBytes"] = balance_bytes()
+    return _write_options(changes)
+
+
+def _write_options(changes: dict) -> tuple:
+    """Set fields on the pool's own PoolOptions. Only while stopped."""
     import json as _j
     p = _pool_options_path()
     if not p:
@@ -1336,11 +1405,9 @@ def _write_auto(auto: int) -> tuple:
         with open(p, encoding="utf-8") as fh:
             d = _j.load(fh)
         item = d.setdefault("Item", {})
-        if int(item.get("AutoBalanceType", -1)) == int(auto):
+        if all(item.get(k) == v for k, v in changes.items()):
             return True, "already set"
-        item["AutoBalanceType"] = int(auto)
-        if auto == AUTO_IMMEDIATE:
-            item["AllowBalanceImmediately"] = True
+        item.update(changes)
         tmp = p + ".nuarr.tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             _j.dump(d, fh, indent=2)
@@ -1358,9 +1425,9 @@ def set_balancing(action: str) -> dict:
     a half-done restart is never silent.
     """
     action = (action or "").strip().lower()
-    if action not in ("start", "stop"):
-        return {"ok": False, "why": "action must be start or stop"}
-    auto = AUTO_IMMEDIATE if action == "start" else 0
+    if action not in ("start", "stop", "schedule"):
+        return {"ok": False, "why": "action must be start, stop or schedule"}
+    auto = {"start": AUTO_IMMEDIATE, "schedule": AUTO_SCHEDULED}.get(action, 0)
     steps: list = []
     was = service_state()
     steps.append(f"service was {was}")
@@ -1371,7 +1438,10 @@ def set_balancing(action: str) -> dict:
             _BAL_LAST.update(at=time.time(), what=action, ok=False, why=why)
             return {"ok": False, "why": why, "steps": steps}
     ok, why = _write_auto(auto)
-    steps.append(f"set '{AUTO_WORD[auto]}'" + (f" ({why})" if why else "")
+    steps.append(f"set '{AUTO_WORD[auto]}"
+                 + (f" {balance_time()[:5]}, ≥ {balance_bytes() // 2 ** 30} GB'"
+                    if auto == AUTO_SCHEDULED else "'")
+                 + (f" ({why})" if why else "")
                  if ok else f"could not set the option: {why}")
     ok2, why2 = _svc("start", "running")
     steps.append("started" if ok2 else f"could not start: {why2}")
@@ -1379,8 +1449,9 @@ def set_balancing(action: str) -> dict:
     _BAL_LAST.update(at=time.time(), what=action, ok=done,
                      why=(why or why2) if not done else "")
     try:
-        joblog.log("DrivePool: " + ("balancing started - " if action == "start"
-                                    else "balancing stopped - ")
+        joblog.log("DrivePool: " + {"start": "balancing started - ",
+                                    "schedule": "balancing scheduled - "}.get(
+                                        action, "balancing stopped - ")
                    + "; ".join(steps), "info" if done else "warn")
     except Exception:                                        # noqa: BLE001
         pass

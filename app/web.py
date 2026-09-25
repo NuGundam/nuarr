@@ -12846,8 +12846,8 @@ async def api_drivepool_balancing(action: str):
     drivepool.set_balancing for what is actually done and why it is safe.
     """
     from . import drivepool
-    if action not in ("start", "stop"):
-        raise HTTPException(400, "action must be start or stop")
+    if action not in ("start", "stop", "schedule"):
+        raise HTTPException(400, "action must be start, stop or schedule")
     return await asyncio.to_thread(drivepool.set_balancing, action)
 
 
@@ -30296,11 +30296,17 @@ async function dpBalance(action, btn){
         +'balancing OFF. The move in progress is abandoned cleanly and nothing '
         +'moves until you start it again. The pool stays mounted; the three '
         +'seconds without the service cost nothing but the balance.'
+      : action==='schedule'
+      ? 'Balance on a schedule? DrivePool\'s service is restarted with its '
+        +'own "balance every day at" option set to half an hour after nuarr\'s '
+        +'measure, and its trigger raised to 100 GB. A pass in progress is '
+        +'abandoned cleanly. From then on DrivePool only decides once a day, '
+        +'on numbers nuarr has just made true. The pool stays mounted.'
       : 'Start balancing? DrivePool\'s service is restarted with automatic '
         +'balancing set to "balance immediately" - its own option - and it '
         +'begins a pass whenever the pool is outside its thresholds. The pool '
         +'stays mounted throughout.',
-    action==='stop' ? 'Yes, stop it' : 'Yes, start it',
+    action==='stop' ? 'Yes, stop it' : action==='schedule' ? 'Yes, schedule it' : 'Yes, start it',
     async ()=>{
       const r=await (await fetch('/api/drivepool/balancing?action='+action,
                                   {method:'POST'})).json();
@@ -30452,6 +30458,8 @@ function dpPaint(disks){
              title="Stop the service (the move in progress is abandoned - DrivePool copies to a temporary name and cleans up on its next start), set 'do not balance automatically', and start the service again. About three seconds; the pool stays mounted throughout.">Stop balancing</button>`
         : `<button class="rmb" onclick="dpBalance('start',this)"
              title="Set 'balance immediately' - DrivePool's own option - and restart the service. It then starts a pass whenever the pool is outside its thresholds, throttled to one every ${esc(B.throttle||'00:10:00')}. About three seconds; the pool stays mounted throughout.">Start balancing</button>`}
+      ${B.auto!==1?`<button class="rmb" onclick="dpBalance('schedule',this)"
+             title="Set DrivePool's own 'balance every day at' option to half an hour after nuarr's measure, with the bytes trigger raised to 100 GB, and restart the service. Measure first, then decide - once a day, on true numbers. About three seconds; the pool stays mounted throughout.">Daily, after nuarr's measure</button>`:''}
       <span class="dim" style="font-size:11px">${
         B.last&&B.last.at
           ? `last: ${esc(B.last.what||'')} ${B.last.ok?'ok':'<span class="err">failed'+(B.last.why?' — '+esc(B.last.why):'')+'</span>'} · ${ago(B.last.at)}`
