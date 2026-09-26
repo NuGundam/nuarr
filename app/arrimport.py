@@ -48,7 +48,11 @@ from . import joblog
 from .db import kv_get, kv_set
 
 VIDEO_EXT = {".mkv", ".mp4", ".m4v", ".avi", ".ts", ".m2ts", ".mov", ".wmv", ".webm"}
-SCRIPT = r"C:\nuarr\arr_import.cmd"
+# A compiled client, not the Python one: the arrs start it once per file and
+# python.exe took ~1 s to start on this box - longer than copying a 200 MB
+# episode. arr_import.exe starts in ~140 ms. arr_import.cmd/.py stay as the
+# readable reference and a fallback.
+SCRIPT = r"C:\nuarr\arr_import.exe"
 _STATS: dict = {"placed": 0, "deferred": 0, "last": None}
 # What is being copied right now - one entry per import in flight, keyed by a
 # token, so the panel can draw a bar per file with its own speed.
@@ -56,6 +60,15 @@ CURRENT: dict = {}
 _LOCK = threading.Lock()
 RECENT_MAX = 20
 _ARRS: dict = {"at": 0.0, "rows": []}
+# A SEASON PACK IS ONE THING TO WATCH, NOT FORTY. The arrs import a pack one
+# file at a time and each 200 MB episode is over in half a second, so a
+# per-file bar is a flicker. Files from the same source folder within a few
+# minutes of each other are one batch: how many of how many, how many GB,
+# the running speed and what is left - counted from the folder itself, so a
+# pack whose files are moved out as they import still knows its total.
+BATCHES: dict = {}
+BATCH_GAP_S = 180.0
+KEEP_DONE_S = 2.5
 
 
 def enabled() -> bool:
@@ -149,6 +162,7 @@ def _defer(why: str, src: str, arr: str) -> dict:
 def place(src: str, dst: str, mode: str = "", arr: str = "") -> dict:
     """Copy `src` to `dst` on the disk nuarr would choose, or say defer."""
     from . import fileops, placement, scanner
+    _t = {"in": time.time()}
     if not enabled():
         return _defer("switched off in nuarr", src, arr)
     if not src or not dst or not os.path.isfile(src):
@@ -161,7 +175,8 @@ def place(src: str, dst: str, mode: str = "", arr: str = "") -> dict:
         return _defer("source is already on the pool", src, arr)
     try:
         size = os.path.getsize(src)
-        root, label, why = placement.choose(dst, size)
+        root, label, why = _choose(dst, size)
+        _t["chosen"] = time.time()
     except Exception as e:                                   # noqa: BLE001
         return _defer(f"placement failed: {type(e).__name__}", src, arr)
     if not root or not label:
@@ -169,6 +184,7 @@ def place(src: str, dst: str, mode: str = "", arr: str = "") -> dict:
     land = fileops.landing_dir(dst, label)
     if not land:
         return _defer(f"no landing folder for {label}", src, arr)
+    _batch_start(src, arr)
     staged = os.path.join(land, f"{os.path.basename(dst)}.{os.getpid()}-"
                                 f"{time.time_ns() % 10**9}.nuarr-new")
     t0 = time.time()
@@ -206,9 +222,9 @@ def place(src: str, dst: str, mode: str = "", arr: str = "") -> dict:
         fileops._quiet_remove(staged)
         CURRENT.pop(tok, None)
         return _defer(f"{type(e).__name__}: {e}"[:160], src, arr)
-    finally:
-        pass
-    CURRENT.pop(tok, None)
+    # Kept on screen a moment at 100%: a half-second copy that vanishes
+    # before the page next asks was never seen at all.
+    CURRENT[tok].update(bytes=size, total=size, done=True, finished=time.time())
     # A MOVE MEANS THE SOURCE IS GONE AFTERWARDS - that is what the arr would
     # have done. Copy and the hardlink modes keep it (a torrent still seeding).
     if (mode or "").lower() == "move":
@@ -217,31 +233,187 @@ def place(src: str, dst: str, mode: str = "", arr: str = "") -> dict:
         except OSError:
             pass
     took = time.time() - t0
-    m = re.search(r"at (\d+)% \((\d+) GB free\)", why or "")
-    _remember({"at": time.time(), "file": os.path.basename(dst), "arr": arr,
-               "placed": label, "gb": round(size / 2**30, 2), "seconds": round(took, 1),
-               "pct": int(m.group(1)) if m else None,
-               "free_gb": int(m.group(2)) if m else None, "why": why})
+    _t["out"] = time.time()
+    _batch_done(src, os.path.basename(dst), size, label)
     _STATS["placed"] += 1
     _STATS["last"] = {"at": time.time(), "file": os.path.basename(dst), "placed": label,
                       "why": why, "arr": arr, "mb_s": round(size / 2**20 / max(took, 0.1))}
+    # THE ARR IS ANSWERED THE MOMENT THE FILE IS IN PLACE. The bookkeeping -
+    # the recent list, the files row, the log - is database writes, and on a
+    # busy server each can wait on a lock; the arr imports the next file of
+    # the pack while they happen.
+    threading.Thread(target=_after, args=(dst, label, size, took, why, arr),
+                     daemon=True).start()
+    return {"ok": True, "placed_on": label, "why": why, "seconds": round(took, 1),
+            "timing": {"choose": round(_t.get("chosen", _t["in"]) - _t["in"], 3),
+                       "copy": round(took, 3),
+                       "server": round(_t["out"] - _t["in"], 3)}}
+
+
+# ONE DECISION PER PACK, NOT ONE PER FILE. placement.choose stats every
+# member, asks which disks Plex and the queue are using and reads DrivePool's
+# balancer state - 0.15 s on a quiet box, and 0.5-2.4 s measured inside a busy
+# server, which on a 200 MB episode is longer than the copy. Placing one
+# episode does not change which disk is emptiest by percent, so for the next
+# few seconds the answer is reused, as long as the disk still has room.
+_CHOICE: dict = {"at": 0.0, "root": None, "label": "", "why": ""}
+CHOICE_TTL_S = 15.0
+
+
+def _choose(dst: str, size: int):
+    from . import placement
+    import shutil as _sh
+    c = _CHOICE
+    if c["root"] and time.time() - c["at"] < CHOICE_TTL_S and size < 20 * 2**30:
+        try:
+            if _sh.disk_usage(c["root"]).free > size + 50 * 2**30:
+                return c["root"], c["label"], c["why"]
+        except OSError:
+            pass
+    root, label, why = placement.choose(dst, size)
+    if root:
+        c.update(at=time.time(), root=root, label=label, why=why)
+    return root, label, why
+
+
+# ---- a door of its own ------------------------------------------------------
+# The arrs' client used to POST to the web server, and the request waited its
+# turn on nuarr's event loop behind every page poll: measured 1.2-3 s per file
+# before place() even started. This is a plain threaded HTTP listener on
+# 127.0.0.1:8771 that calls place() directly - no event loop in the way. The
+# web route stays as the fallback the client uses if this port does not answer.
+DIRECT_PORT = 8771
+_SRV: dict = {"srv": None}
+
+
+def start_direct() -> None:
+    if _SRV["srv"] is not None:
+        return
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):                          # quiet
+            pass
+
+        def do_POST(self):
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                b = json.loads(self.rfile.read(n) or b"{}")
+                r = place(str(b.get("src") or ""), str(b.get("dst") or ""),
+                          str(b.get("mode") or ""), str(b.get("arr") or ""))
+            except Exception as e:                           # noqa: BLE001
+                r = {"ok": False, "defer": True, "why": f"{type(e).__name__}: {e}"[:160]}
+            out = json.dumps(r).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+
+    try:
+        srv = ThreadingHTTPServer(("127.0.0.1", DIRECT_PORT), H)
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, name="arrimport-direct",
+                         daemon=True).start()
+        _SRV["srv"] = srv
+    except OSError as e:
+        joblog.log(f"arr import listener could not open port {DIRECT_PORT}: {e} - "
+                   f"imports go through the web server instead", "warn")
+
+
+def _after(dst, label, size, took, why, arr) -> None:
+    from . import placement
+    m = re.search(r"at (\d+)% \((\d+) GB free\)", why or "")
+    try:
+        _remember({"at": time.time(), "file": os.path.basename(dst), "arr": arr,
+                   "placed": label, "gb": round(size / 2**30, 2), "seconds": round(took, 1),
+                   "pct": int(m.group(1)) if m else None,
+                   "free_gb": int(m.group(2)) if m else None, "why": why})
+    except Exception:                                        # noqa: BLE001
+        pass
     try:
         placement.landed(dst, label, True)
     except Exception:                                        # noqa: BLE001
         pass
     try:
         joblog.log(f"{arr or 'arr'} import placed on {label} through the pool "
-                   f"({size / 2**30:.1f} GB in {took:.0f}s): {os.path.basename(dst)}",
+                   f"({size / 2**30:.2f} GB in {took:.1f}s): {os.path.basename(dst)}",
                    "info")
     except Exception:                                        # noqa: BLE001
         pass
-    return {"ok": True, "placed_on": label, "why": why, "seconds": round(took, 1)}
+
+
+def _videos_in(d: str) -> dict:
+    out = {}
+    try:
+        for f in os.listdir(d):
+            p = os.path.join(d, f)
+            if os.path.splitext(f)[1].lower() in VIDEO_EXT and os.path.isfile(p):
+                out[f] = os.path.getsize(p)
+    except OSError:
+        pass
+    return out
+
+
+def _batch_start(src: str, arr: str) -> None:
+    key = os.path.dirname(os.path.abspath(src)).lower()
+    now = time.time()
+    with _LOCK:
+        b = BATCHES.get(key)
+        # a finished batch that gets another file is a NEW batch, not file 29
+        # of a pack that ended a minute ago
+        if (not b or now - b["last_at"] > BATCH_GAP_S
+                or (b["done"] >= b["files"] and os.path.basename(src) not in b["seen"])):
+            b = BATCHES[key] = {"dir": os.path.basename(os.path.dirname(src)) or src,
+                                "arr": arr, "started": now, "last_at": now, "done": 0,
+                                "bytes_done": 0, "files": 0, "bytes": 0, "seen": set(),
+                                "disks": {}, "last_file": ""}
+        left = {f: z for f, z in _videos_in(os.path.dirname(src)).items()
+                if f not in b["seen"]}
+        b["files"] = max(b["files"], b["done"] + len(left))
+        b["bytes"] = max(b["bytes"], b["bytes_done"] + sum(left.values()))
+        b["last_at"] = now
+
+
+def _batch_done(src: str, name: str, size: int, label: str) -> None:
+    key = os.path.dirname(os.path.abspath(src)).lower()
+    with _LOCK:
+        b = BATCHES.get(key)
+        if not b:
+            return
+        b["seen"].add(os.path.basename(src))
+        b["done"] += 1
+        b["bytes_done"] += size
+        b["last_at"] = time.time()
+        b["last_file"] = name
+        b["disks"][label] = b["disks"].get(label, 0) + 1
 
 
 def status(fresh: bool = False) -> dict:
     now = time.time()
+    for k, v in list(CURRENT.items()):
+        if v.get("done") and now - v.get("finished", now) > KEEP_DONE_S:
+            CURRENT.pop(k, None)
+    batches = []
+    with _LOCK:
+        for k, b in list(BATCHES.items()):
+            if now - b["last_at"] > BATCH_GAP_S:
+                BATCHES.pop(k, None)
+                continue
+            if b["files"] < 2:
+                continue                      # a single file is not a batch
+            el = max(0.1, b["last_at"] - b["started"])
+            rate = b["bytes_done"] / el if b["done"] else 0.0
+            left = max(0, b["bytes"] - b["bytes_done"])
+            batches.append({"dir": b["dir"], "arr": b["arr"], "done": b["done"],
+                            "files": b["files"], "bytes_done": b["bytes_done"],
+                            "bytes": b["bytes"], "bps": rate, "elapsed": round(now - b["started"]),
+                            "eta": (left / rate) if rate and left else 0,
+                            "idle": round(now - b["last_at"]), "last_file": b["last_file"],
+                            "disks": dict(b["disks"]),
+                            "complete": b["done"] >= b["files"]})
     return {"on": enabled(), "script": SCRIPT, "arrs": arr_state(fresh),
             "placed": _STATS["placed"], "deferred": _STATS["deferred"],
             "current": [dict(v, elapsed=round(now - v["started"], 1))
                         for v in list(CURRENT.values())],
-            "recent": _recent_load()[:8]}
+            "batches": batches, "recent": _recent_load()[:8]}

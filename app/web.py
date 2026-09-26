@@ -733,6 +733,11 @@ async def _startup() -> None:
         # fileops so every commit path gets it.
         from . import placement
         placement.register()
+        try:
+            from . import arrimport as _ai
+            _ai.start_direct()
+        except Exception:                                    # noqa: BLE001
+            pass
         # And every commit records the file it produced - see
         # scanner.note_rewritten for the loop this closes.
         scanner.register_rewrites()
@@ -12837,6 +12842,9 @@ def api_drivepool():
     return drivepool.status()
 
 
+_AI_POOL = None
+
+
 @app.post("/api/arrimport")
 async def api_arrimport(request: Request):
     """The arrs' Import Using Script lands here: copy onto nuarr's chosen disk.
@@ -12850,9 +12858,16 @@ async def api_arrimport(request: Request):
         b = await request.json()
     except Exception:                                        # noqa: BLE001
         return {"ok": False, "defer": True, "why": "bad request"}
-    return await asyncio.to_thread(arrimport.place, str(b.get("src") or ""),
-                                   str(b.get("dst") or ""), str(b.get("mode") or ""),
-                                   str(b.get("arr") or ""))
+    # ITS OWN THREADS. asyncio.to_thread shares one pool with every other
+    # off-loop call nuarr makes, and an import queued behind a slow page read
+    # held the arr - and the next file of the pack - for nothing.
+    global _AI_POOL
+    if _AI_POOL is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _AI_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="arrimport")
+    return await asyncio.get_running_loop().run_in_executor(
+        _AI_POOL, arrimport.place, str(b.get("src") or ""), str(b.get("dst") or ""),
+        str(b.get("mode") or ""), str(b.get("arr") or ""))
 
 
 @app.get("/api/arrimport")
@@ -45412,6 +45427,10 @@ async function aiLoad(fresh){
     if(el) el.innerHTML = aiHtml(_ai);
   }catch(e){}
   finally{ _aiBusy = false; }
+  // WHILE SOMETHING IS MOVING, ASK TWICE A SECOND. The steady 1.5 s poll is
+  // right for an idle card and too slow for a pack of half-second copies.
+  if(_ai && ((_ai.current||[]).length || (_ai.batches||[]).some(b=>!b.complete))
+     && document.getElementById('aiCard')) setTimeout(aiLoad, 500);
 }
 async function aiToggle(box){
   const on = box.checked;
@@ -45494,7 +45513,28 @@ function aiHtml(d){
     <div id="aiMsg" class="dim" style="font-size:11px"></div>
     <div style="margin-top:8px;font-size:11px" class="dim">since nuarr started: ${
       fmt(d.placed||0)} placed · ${fmt(d.deferred||0)} left to the arr</div>
-    ${cur || `<div class="dim" style="font-size:11.5px;margin-top:8px">nothing importing right now</div>`}
+    ${(d.batches||[]).map(b=>{
+      const pct = b.bytes ? Math.min(100, b.bytes_done/b.bytes*100) : 0;
+      const dk = Object.entries(b.disks||{}).sort((x,y)=>y[1]-x[1]).map(([k,n])=>
+        `<b style="color:${diskColour(k)}">${esc(k)}</b>${n>1?' ×'+n:''}`).join(', ');
+      return `<div style="margin-top:8px;padding:6px 8px;border:1px solid var(--line);border-radius:6px">
+        <div style="display:flex;gap:8px;align-items:baseline;font-size:11.5px;flex-wrap:wrap">
+          <span class="pill p-dim">${esc(b.arr||'arr')} batch</span>
+          <span class="mono" style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1"
+            title="${esc(b.dir)}">${esc(b.dir)}</span>
+          <b class="mono">${fmt(b.done)} of ${fmt(b.files)}</b>
+          <span class="mono dim">${(b.bytes_done/1073741824).toFixed(1)} of ${
+            (b.bytes/1073741824).toFixed(1)} GB · ${(b.bps/1048576).toFixed(0)} MB/s${
+            b.complete ? ' · done in '+b.elapsed+'s'
+              : b.eta ? ' · ~'+Math.round(b.eta)+'s left' : ''}</span>
+        </div>
+        <div class="aibar" style="margin-top:5px"><i style="width:${pct.toFixed(1)}%;${
+          b.complete?'animation:none;background:#2ea043':''}"></i></div>
+        <div class="dim" style="font-size:10.5px;margin-top:3px">onto ${dk||'—'}${
+          b.last_file?` · last: <span class="mono">${esc(b.last_file)}</span>`:''}</div>
+      </div>`;}).join('')}
+    ${cur || ((d.batches||[]).length ? '' :
+      `<div class="dim" style="font-size:11.5px;margin-top:8px">nothing importing right now</div>`)}
     <div style="margin-top:10px;font-size:11px;font-weight:600">Last imported</div>
     ${rec || '<div class="dim" style="font-size:11px">none yet</div>'}`;
 }
