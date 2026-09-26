@@ -331,6 +331,65 @@ _GPU_ARG = (
 )
 
 
+# ...AND WHAT IT IS ACTUALLY USING, MEASURED.
+#
+# The paragraph above was right about nvidia-smi and wrong about Windows. WDDM
+# keeps a per-process, per-engine utilisation of its own - it is what Task
+# Manager's GPU column reads - published as the performance counter
+# \GPU Engine(pid_<pid>_luid_..._eng_<n>_engtype_<type>)\Utilization Percentage.
+# Checked on this box with four encodes running: each ffmpeg read 19-24% on
+# VideoEncode, 4% on VideoDecode, 5% CUDA and 9% Copy. Read through PDH it
+# costs about 3 ms, and a process started after the query was opened shows up
+# on the next read, so one query is kept for the life of the server.
+#
+# Per engine TYPE, the busiest instance of it: the A5000 has two decoders, and
+# a process on both at 40% is using "40% of a decoder", which is what the
+# figure should say. The command-line label stays as the fallback when the
+# counter has nothing for a pid.
+_ENG_LABEL = {"videoencode": "NVENC", "videodecode": "NVDEC", "cuda": "CUDA",
+              "compute": "CUDA", "copy": "Copy", "3d": "3D"}
+_PDH: dict = {"q": None, "c": None, "at": 0.0, "data": {}, "dead": False}
+_PDH_RX = re.compile(r"pid_(\d+)_.*?engtype_([A-Za-z0-9]+)")
+
+
+def gpu_by_pid() -> dict:
+    """{pid: {engine label: percent}} from Windows' own GPU engine counters."""
+    now = time.time()
+    if _PDH["dead"]:
+        return {}
+    if now - _PDH["at"] < 0.8:
+        return _PDH["data"]
+    try:
+        import win32pdh
+        if _PDH["q"] is None:
+            _PDH["q"] = win32pdh.OpenQuery()
+            _PDH["c"] = win32pdh.AddEnglishCounter(
+                _PDH["q"], r"\GPU Engine(*)\Utilization Percentage")
+            win32pdh.CollectQueryData(_PDH["q"])     # a rate needs two reads
+            _PDH["at"] = now
+            return {}
+        win32pdh.CollectQueryData(_PDH["q"])
+        arr = win32pdh.GetFormattedCounterArray(_PDH["c"], win32pdh.PDH_FMT_DOUBLE)
+    except Exception:                                    # noqa: BLE001
+        # No counter set on this machine (no WDDM GPU, or a Server edition
+        # with the counters unregistered): say nothing rather than guess.
+        _PDH["dead"] = True
+        return {}
+    out: dict = {}
+    for inst, v in arr.items():
+        if not v or v <= 0:
+            continue
+        m = _PDH_RX.search(inst)
+        if not m:
+            continue
+        t = m.group(2).lower()
+        lab = _ENG_LABEL.get(t) or ("CUDA" if t.startswith("compute") else t)
+        d = out.setdefault(int(m.group(1)), {})
+        d[lab] = max(d.get(lab, 0.0), float(v))
+    _PDH.update(at=now, data=out)
+    return out
+
+
 def _gpu_of(cmd: list) -> str:
     """Which GPU engine this command was asked to use, from its own arguments."""
     jl = " ".join(cmd or []).lower()
@@ -593,6 +652,8 @@ def _self_usage() -> dict:
             "io_prio": _iov,
             "cpu_prio": _cpu_cls,
             "gpu": gpu_use,
+            "gpu_engines": {k: round(v, 1) for k, v in
+                            (gpu_by_pid().get(p.pid) or {}).items() if v >= 0.1},
             "self": p.pid == me.pid,
         })
 

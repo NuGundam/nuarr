@@ -29334,6 +29334,22 @@ function tmPool(pool){
      font-size:9.5px;padding:0 5px;margin-right:5px;vertical-align:1px"
      title="${esc(TM_POOL_WHY[pool]||'One of the worker counts on the Concurrency page.')} Its limit is set under Settings - Concurrency.">${esc(pool)}</span>`;
 }
+// THE GPU CELL: a measured percentage when Windows has one for the work,
+// the engine it was launched for when it does not. `eng` is {label: pct};
+// the figure shown is the busiest engine, and the title lists them all.
+function tmGpuCell(label, eng){
+  const ks = Object.keys(eng||{}).sort((a,b)=>eng[b]-eng[a]);
+  if(ks.length){
+    const top = ks[0], pct = Math.min(100, eng[top]);
+    const all = ks.map(k=>`${k} ${Math.min(100,eng[k]).toFixed(1)}%`).join(' · ');
+    return `<td class="c mono" style="color:#e8a33d" title="${esc(
+      'Measured by Windows, per engine: '+all+'. The figure is the busiest one.')}"
+      >${pct>=1?Math.round(pct):pct.toFixed(1)}% <span class="dim">${esc(top)}</span></td>`;
+  }
+  return `<td class="c mono" style="color:${label?'#e8a33d':'var(--dim)'}" title="${esc(
+    label ? label+' - what this work was launched to use; Windows has no reading for it this second.'
+          : 'Nothing on this work\'s command line asks for the card.')}">${esc(label||'—')}</td>`;
+}
 function tmChildRows(p, cores){
   return (p.procs||[]).slice().sort((a,b)=>(b.cpu_pct||0)-(a.cpu_pct||0)).map(q=>{
     const share = cores ? (q.cpu_pct||0)/cores : (q.cpu_pct||0);
@@ -29348,7 +29364,7 @@ function tmChildRows(p, cores){
       <td class="c mono">${tmMb(q.rss_mb)}</td>
       <td class="c mono" style="color:${q.read_bps?'#58a6ff':'var(--dim)'}">${tmBps(q.read_bps)}</td>
       <td class="c mono" style="color:${q.write_bps?'#f0883e':'var(--dim)'}">${tmBps(q.write_bps)}</td>
-      <td class="c mono" style="color:${q.gpu?'#e8a33d':'var(--dim)'}">${esc(q.gpu||'—')}</td>
+      ${tmGpuCell(q.gpu, q.gpu_engines)}
       <td class="c mono dim">${(q.age_s||0)>=60?hms(q.age_s):(q.age_s||0)+'s'}</td>
       <td class="c mono" style="color:${low?'var(--warn)':'var(--dim)'}">${low?'yielding':'normal'}</td>
     </tr>`;
@@ -29985,7 +30001,7 @@ function tmPaint(){
     let g = byWork.get(k);
     if(!g){
       g = {key:k, n:0, cpu:0, ram:0, read:0, write:0, age:0, self:false,
-           gpu:'', pool:'', low:false, exes:new Set(), details:[], pids:[],
+           gpu:'', eng:{}, pool:'', low:false, exes:new Set(), details:[], pids:[],
            procs:[]};
       byWork.set(k, g);
     }
@@ -29995,6 +30011,9 @@ function tmPaint(){
     g.age = Math.max(g.age, p.age_s||0);
     if(p.self) g.self = true;
     if(p.gpu && !g.gpu) g.gpu = p.gpu;
+    // Several processes on one engine ADD UP - four encodes at 24% each are
+    // 96% of the encoder - so a group sums per engine.
+    for(const [k,v] of Object.entries(p.gpu_engines||{})) g.eng[k] = (g.eng[k]||0) + v;
     // A conhost inherits its parent's pool, so any member answers for the
     // group - but take the first non-empty rather than the first, or a
     // console that arrived ahead of its ffmpeg leaves the row unlabelled.
@@ -30094,7 +30113,7 @@ function tmPaint(){
     if(k==='ram')  return p.ram||0;
     if(k==='read') return p.read||0;
     if(k==='write')return p.write||0;
-    if(k==='gpu')  return (p.gpu||'').toLowerCase();
+    if(k==='gpu')  return Math.max(0, ...Object.values(p.eng||{})) || (p.gpu?0.001:0);
     if(k==='age')  return p.age||0;
     return 0;
   };
@@ -30205,16 +30224,7 @@ function tmPaint(){
         <td class="c mono">${tmMb(p.ram)}</td>
         <td class="c mono" style="color:${p.read?'#58a6ff':'var(--dim)'}">${tmBps(p.read)}</td>
         <td class="c mono" style="color:${p.write?'#f0883e':'var(--dim)'}">${tmBps(p.write)}</td>
-        <td class="c mono" style="color:${p.gpu?'#e8a33d':'var(--dim)'}"
-          title="${esc(p.gpu
-            ? p.gpu+' — what this work was launched to use. Windows gives '
-              +'nvidia-smi no per-process figure on this card (used_gpu_memory '
-              +'reads N/A and pmon reports a dash for every engine), so this '
-              +'is what it was asked to do rather than a measurement of what '
-              +'it is doing. The card\'s own engine percentages are on the '
-              +'Graphics chart above.'
-            : 'Nothing on this work\'s command line asks for the card.')}"
-          >${esc(p.gpu||'—')}</td>
+        ${p._gone?'<td class="c mono dim">—</td>':tmGpuCell(p.gpu, p.eng)}
         <td class="c mono ${stale?'':'dim'}" style="${stale?'color:var(--warn)':''}"
           >${(p.age||0)>=60?hms(p.age):(p.age||0)+'s'}</td>
         <td class="c mono" style="color:${p.low?'var(--warn)':'var(--dim)'}"
