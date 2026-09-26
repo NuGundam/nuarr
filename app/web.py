@@ -12837,6 +12837,30 @@ def api_drivepool():
     return drivepool.status()
 
 
+@app.post("/api/arrimport")
+async def api_arrimport(request: Request):
+    """The arrs' Import Using Script lands here: copy onto nuarr's chosen disk.
+
+    Body: {"src", "dst", "mode", "arr"}. Answers {"ok": true, "placed_on"} or
+    {"defer": true, "why"} - defer means the arr imports it itself, as before.
+    See arrimport.py. Off the loop: it is a whole-file copy.
+    """
+    from . import arrimport
+    try:
+        b = await request.json()
+    except Exception:                                        # noqa: BLE001
+        return {"ok": False, "defer": True, "why": "bad request"}
+    return await asyncio.to_thread(arrimport.place, str(b.get("src") or ""),
+                                   str(b.get("dst") or ""), str(b.get("mode") or ""),
+                                   str(b.get("arr") or ""))
+
+
+@app.get("/api/arrimport")
+def api_arrimport_status():
+    from . import arrimport
+    return arrimport.status()
+
+
 @app.post("/api/drivepool/balancing")
 async def api_drivepool_balancing(action: str):
     r"""Start or stop DrivePool's balancing. Restarts its service to do it.
