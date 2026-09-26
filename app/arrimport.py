@@ -40,16 +40,104 @@ from __future__ import annotations
 import os
 import time
 
+import json
+import re
+import threading
+
 from . import joblog
+from .db import kv_get, kv_set
 
 VIDEO_EXT = {".mkv", ".mp4", ".m4v", ".avi", ".ts", ".m2ts", ".mov", ".wmv", ".webm"}
+SCRIPT = r"C:\nuarr\arr_import.cmd"
 _STATS: dict = {"placed": 0, "deferred": 0, "last": None}
+# What is being copied right now - one entry per import in flight, keyed by a
+# token, so the panel can draw a bar per file with its own speed.
+CURRENT: dict = {}
+_LOCK = threading.Lock()
+RECENT_MAX = 20
+_ARRS: dict = {"at": 0.0, "rows": []}
+
+
+def enabled() -> bool:
+    """nuarr's own switch. Off = every call defers, whatever the arrs say."""
+    v = kv_get("arrimport.on")
+    return v is None or str(v) not in ("0", "false", "")
+
+
+def _recent_load() -> list:
+    try:
+        return json.loads(kv_get("arrimport.recent") or "[]")
+    except Exception:                                        # noqa: BLE001
+        return []
+
+
+def _remember(row: dict) -> None:
+    with _LOCK:
+        r = [row] + _recent_load()
+        kv_set("arrimport.recent", json.dumps(r[:RECENT_MAX]))
+
+
+def _arr_call(a, path, method="GET", body=None):
+    import urllib.request
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(a.url.rstrip("/") + path, data=data, method=method,
+                                 headers={"X-Api-Key": a.api_key,
+                                          "Content-Type": "application/json"})
+    t = urllib.request.urlopen(req, timeout=20).read().decode()
+    return json.loads(t) if t.strip() else {}
+
+
+def arr_state(fresh: bool = False) -> list:
+    """Whether each arr actually has Import Using Script pointed at nuarr."""
+    if not fresh and time.time() - _ARRS["at"] < 30 and _ARRS["rows"]:
+        return _ARRS["rows"]
+    from .config import SETTINGS
+    rows = []
+    for a in SETTINGS.arrs:
+        try:
+            mm = _arr_call(a, "/api/v3/config/mediamanagement")
+            rows.append({"name": a.name, "on": bool(mm.get("useScriptImport")),
+                         "ours": (mm.get("scriptImportPath") or "").lower() == SCRIPT.lower(),
+                         "path": mm.get("scriptImportPath") or "", "error": ""})
+        except Exception as e:                               # noqa: BLE001
+            rows.append({"name": a.name, "on": False, "ours": False, "path": "",
+                         "error": f"{type(e).__name__}: {e}"[:120]})
+    _ARRS.update(at=time.time(), rows=rows)
+    return rows
+
+
+def set_enabled(on: bool) -> dict:
+    """Switch it in nuarr AND in every arr, so off really means the arr copies."""
+    from .config import SETTINGS
+    kv_set("arrimport.on", "1" if on else "0")
+    out = []
+    for a in SETTINGS.arrs:
+        try:
+            mm = _arr_call(a, "/api/v3/config/mediamanagement")
+            mm["useScriptImport"] = bool(on)
+            if on:
+                mm["scriptImportPath"] = SCRIPT
+            _arr_call(a, f"/api/v3/config/mediamanagement/{mm.get('id', 1)}", "PUT", mm)
+            out.append({"name": a.name, "ok": True})
+        except Exception as e:                               # noqa: BLE001
+            out.append({"name": a.name, "ok": False, "error": f"{type(e).__name__}: {e}"[:160]})
+    try:
+        joblog.log("arr imports: nuarr chooses the disk - "
+                   + ("ON" if on else "OFF") + " ("
+                   + ", ".join(f"{x['name']} {'ok' if x['ok'] else 'failed'}" for x in out)
+                   + ")", "info")
+    except Exception:                                        # noqa: BLE001
+        pass
+    arr_state(fresh=True)
+    return {"on": on, "arrs": out}
 
 
 def _defer(why: str, src: str, arr: str) -> dict:
     _STATS["deferred"] += 1
     _STATS["last"] = {"at": time.time(), "file": os.path.basename(src), "placed": "",
                       "why": why, "arr": arr}
+    _remember({"at": time.time(), "file": os.path.basename(src), "arr": arr,
+               "placed": "", "why": why})
     try:
         joblog.log(f"{arr or 'arr'} import left to the arr ({why}): "
                    f"{os.path.basename(src)}", "debug")
@@ -61,6 +149,8 @@ def _defer(why: str, src: str, arr: str) -> dict:
 def place(src: str, dst: str, mode: str = "", arr: str = "") -> dict:
     """Copy `src` to `dst` on the disk nuarr would choose, or say defer."""
     from . import fileops, placement, scanner
+    if not enabled():
+        return _defer("switched off in nuarr", src, arr)
     if not src or not dst or not os.path.isfile(src):
         return _defer("source not found", src, arr)
     if os.path.splitext(dst)[1].lower() not in VIDEO_EXT:
@@ -82,11 +172,20 @@ def place(src: str, dst: str, mode: str = "", arr: str = "") -> dict:
     staged = os.path.join(land, f"{os.path.basename(dst)}.{os.getpid()}-"
                                 f"{time.time_ns() % 10**9}.nuarr-new")
     t0 = time.time()
+    tok = f"{os.getpid()}-{time.time_ns()}"
+    CURRENT[tok] = {"file": os.path.basename(dst), "arr": arr, "disk": label,
+                    "bytes": 0, "total": size, "started": t0, "bps": 0.0}
+
+    def _prog(c, t):
+        el = time.time() - t0
+        CURRENT[tok].update(bytes=int(c), total=int(t or size),
+                            bps=(c / el) if el > 0.3 else 0.0)
     try:
-        fileops.copy_with_progress(src, staged)
+        fileops.copy_with_progress(src, staged, _prog)
         ok, vwhy = fileops.verify_copy(src, staged)
         if not ok:
             fileops._quiet_remove(staged)
+            CURRENT.pop(tok, None)
             return _defer(f"copy did not verify: {vwhy}", src, arr)
         # which member actually has it - the label follows the truth
         try:
@@ -105,7 +204,11 @@ def place(src: str, dst: str, mode: str = "", arr: str = "") -> dict:
             raise OSError("the file is not at the destination after the rename")
     except Exception as e:                                   # noqa: BLE001
         fileops._quiet_remove(staged)
+        CURRENT.pop(tok, None)
         return _defer(f"{type(e).__name__}: {e}"[:160], src, arr)
+    finally:
+        pass
+    CURRENT.pop(tok, None)
     # A MOVE MEANS THE SOURCE IS GONE AFTERWARDS - that is what the arr would
     # have done. Copy and the hardlink modes keep it (a torrent still seeding).
     if (mode or "").lower() == "move":
@@ -114,6 +217,11 @@ def place(src: str, dst: str, mode: str = "", arr: str = "") -> dict:
         except OSError:
             pass
     took = time.time() - t0
+    m = re.search(r"at (\d+)% \((\d+) GB free\)", why or "")
+    _remember({"at": time.time(), "file": os.path.basename(dst), "arr": arr,
+               "placed": label, "gb": round(size / 2**30, 2), "seconds": round(took, 1),
+               "pct": int(m.group(1)) if m else None,
+               "free_gb": int(m.group(2)) if m else None, "why": why})
     _STATS["placed"] += 1
     _STATS["last"] = {"at": time.time(), "file": os.path.basename(dst), "placed": label,
                       "why": why, "arr": arr, "mb_s": round(size / 2**20 / max(took, 0.1))}
@@ -130,5 +238,10 @@ def place(src: str, dst: str, mode: str = "", arr: str = "") -> dict:
     return {"ok": True, "placed_on": label, "why": why, "seconds": round(took, 1)}
 
 
-def status() -> dict:
-    return dict(_STATS)
+def status(fresh: bool = False) -> dict:
+    now = time.time()
+    return {"on": enabled(), "script": SCRIPT, "arrs": arr_state(fresh),
+            "placed": _STATS["placed"], "deferred": _STATS["deferred"],
+            "current": [dict(v, elapsed=round(now - v["started"], 1))
+                        for v in list(CURRENT.values())],
+            "recent": _recent_load()[:8]}

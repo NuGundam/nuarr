@@ -12856,9 +12856,17 @@ async def api_arrimport(request: Request):
 
 
 @app.get("/api/arrimport")
-def api_arrimport_status():
+async def api_arrimport_status(fresh: bool = False):
     from . import arrimport
-    return arrimport.status()
+    return await asyncio.to_thread(arrimport.status, fresh)
+
+
+@app.post("/api/arrimport/enable")
+async def api_arrimport_enable(on: bool = True):
+    """Switch nuarr's disk choice for arr imports on or off - in nuarr and in
+    every arr's Import Using Script setting, so off means the arr copies."""
+    from . import arrimport
+    return await asyncio.to_thread(arrimport.set_enabled, bool(on))
 
 
 @app.post("/api/drivepool/balancing")
@@ -45383,9 +45391,114 @@ async function loadArrsTab(){
         d.toggles.release_ban, rbst,
         {label:'Profiles to score on (empty = every profile in that arr)',
          kind:'release_ban', names:rb.profiles||{},
-         empty:'', adder:banList(rb)});
+         empty:'', adder:banList(rb)})
+    + `<div id="aiCard" style="border:1px solid var(--line);border-radius:8px;
+         padding:10px 14px;margin-top:10px">${_ai?aiHtml(_ai):'<span class="dim">loading…</span>'}</div>`;
   loadHookState();
+  aiLoad();
 }
+
+// ---- arr imports: nuarr picks the disk ------------------------------------
+// The arrs' Import Using Script hands every import to nuarr, which copies it
+// onto the emptiest disk by percent that nobody is watching - the same choice
+// nuarr makes for its own commits. See arrimport.py.
+let _ai = null, _aiBusy = false;
+async function aiLoad(fresh){
+  if(_aiBusy) return;
+  _aiBusy = true;
+  try{
+    _ai = await (await fetch('/api/arrimport'+(fresh?'?fresh=true':''))).json();
+    const el = document.getElementById('aiCard');
+    if(el) el.innerHTML = aiHtml(_ai);
+  }catch(e){}
+  finally{ _aiBusy = false; }
+}
+async function aiToggle(box){
+  const on = box.checked;
+  box.disabled = true;
+  const m = document.getElementById('aiMsg');
+  if(m) m.textContent = (on?'switching on':'switching off')+' in nuarr and in each arr…';
+  try{
+    const r = await (await fetch('/api/arrimport/enable?on='+(on?'true':'false'),
+                                 {method:'POST'})).json();
+    if(m) m.textContent = (r.arrs||[]).map(a=>a.name+' '+(a.ok?'✓':'✗ '+(a.error||''))).join(' · ');
+  }catch(e){ if(m) m.textContent = 'failed: '+e.message; }
+  box.disabled = false;
+  aiLoad(true);
+}
+function aiHtml(d){
+  if(!document.getElementById('aiStyle')){
+    const st = document.createElement('style'); st.id = 'aiStyle';
+    st.textContent = `@keyframes aiMove{from{background-position:0 0}to{background-position:28px 0}}
+      .aibar{height:8px;border-radius:4px;background:var(--line);overflow:hidden}
+      .aibar>i{display:block;height:100%;border-radius:4px;
+        background:repeating-linear-gradient(135deg,#3fb950 0 7px,#2ea043 7px 14px);
+        background-size:28px 100%;animation:aiMove .8s linear infinite;
+        transition:width .8s ease}`;
+    document.head.appendChild(st);
+  }
+  const arrs = d.arrs||[];
+  const armed = arrs.filter(a=>a.on&&a.ours).length;
+  const pill = a => `<span class="pill ${a.error?'p-bad':(a.on&&a.ours)?'p-ok':'p-dim'}"
+      title="${esc(a.error || (a.on&&a.ours ? 'Import Using Script points at '+(d.script||'')
+            : a.on ? 'Import Using Script is on but points at '+(a.path||'?')
+            : 'Import Using Script is off - this arr copies imports itself'))}">${
+      esc(a.name)} ${a.error?'unreachable':(a.on&&a.ours)?'using nuarr':a.on?'other script':'off'}</span>`;
+  const ago = t => { const s=Math.max(0,Date.now()/1000-t);
+    return s<60?Math.round(s)+'s ago':s<3600?Math.round(s/60)+'m ago'
+         :s<86400?(s/3600).toFixed(1)+'h ago':Math.round(s/86400)+'d ago'; };
+  const cur = (d.current||[]).map(c=>{
+    const pct = c.total ? Math.min(100, c.bytes/c.total*100) : 0;
+    const eta = c.bps>0 ? Math.max(0,(c.total-c.bytes)/c.bps) : null;
+    return `<div style="margin-top:8px">
+      <div style="display:flex;gap:8px;align-items:baseline;font-size:11.5px">
+        <span class="pill p-dim">${esc(c.arr||'arr')}</span>
+        <span>to <b style="color:#58a6ff">${esc(c.disk)}</b></span>
+        <span class="mono" style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1"
+          title="${esc(c.file)}">${esc(c.file)}</span>
+        <span class="mono">${pct.toFixed(0)}%</span>
+        <span class="mono dim">${(c.bps/1048576).toFixed(0)} MB/s${eta!=null?' · '+Math.round(eta)+'s left':''}</span>
+      </div>
+      <div class="aibar" style="margin-top:4px"><i style="width:${pct.toFixed(1)}%"></i></div>
+    </div>`;}).join('');
+  const rec = (d.recent||[]).slice(0,4).map(r=>`<div style="display:grid;
+      grid-template-columns:62px 56px max-content minmax(0,1fr);gap:12px;align-items:baseline;
+      font-size:11px;padding:3px 0;border-top:1px solid var(--line)">
+      <span class="mono dim">${ago(r.at)}</span>
+      <span class="dim">${esc(r.arr||'')}</span>
+      ${r.placed
+        ? `<span style="white-space:nowrap">to <b style="color:#3fb950">${esc(r.placed)}</b>${r.pct!=null
+             ?` <span class="dim">${r.pct}% · ${fmt(r.free_gb)} GB free</span>`:''}</span>`
+        : `<span style="color:var(--warn)" title="${esc(r.why||'')}">left to the arr</span>`}
+      <span class="mono" style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+        title="${esc((r.file||'')+(r.placed?'':' — '+(r.why||'')))}">${esc(r.file||'')}${
+        r.placed&&r.gb?` <span class="dim">· ${r.gb} GB in ${r.seconds}s</span>`
+                      :(!r.placed?` <span class="dim">· ${esc(r.why||'')}</span>`:'')}</span>
+    </div>`).join('');
+  return `<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+      <b>Imports land on the disk nuarr picks</b>
+      ${arrs.map(pill).join(' ')}
+      <label style="margin-left:auto;display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer">
+        <input type="checkbox" ${d.on&&armed?'checked':''} onchange="aiToggle(this)"> ${
+          d.on&&armed?'on':'off'}</label>
+    </div>
+    <div class="dim" style="font-size:11px;margin:6px 0 4px;max-width:90ch">
+      Sonarr and Radarr copy every import from the download folder onto the pool, and
+      DrivePool gives a new file to the disk with the most free <i>bytes</i> - always one of
+      the two 18 TB disks. With this on, each arr's <span class="mono">Import Using Script</span>
+      hands the copy to nuarr, which writes it through the pool onto the emptiest disk by
+      percent that nobody is watching, the same choice it makes for its own files. DrivePool
+      counts it as it lands, so nothing needs balancing later. If nuarr cannot place a file
+      it tells the arr to import it itself, as before - an import is never held up.
+      Turning this off turns it off in the arrs too.</div>
+    <div id="aiMsg" class="dim" style="font-size:11px"></div>
+    <div style="margin-top:8px;font-size:11px" class="dim">since nuarr started: ${
+      fmt(d.placed||0)} placed · ${fmt(d.deferred||0)} left to the arr</div>
+    ${cur || `<div class="dim" style="font-size:11.5px;margin-top:8px">nothing importing right now</div>`}
+    <div style="margin-top:10px;font-size:11px;font-weight:600">Last imported</div>
+    ${rec || '<div class="dim" style="font-size:11px">none yet</div>'}`;
+}
+poll(aiLoad, 1500, 'aiCard');
 // THE LIST IS THE STATE. Every row nuarr learned or you typed, with the reason
 // it is there and how many times it has been hit; a row can be switched off
 // without being forgotten, so "why is this back" always has an answer.
