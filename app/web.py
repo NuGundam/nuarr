@@ -45453,7 +45453,7 @@ function aiHtml(d){
     return `<div style="margin-top:8px">
       <div style="display:flex;gap:8px;align-items:baseline;font-size:11.5px">
         <span class="pill p-dim">${esc(c.arr||'arr')}</span>
-        <span>to <b style="color:#58a6ff">${esc(c.disk)}</b></span>
+        <span>to <b style="color:${diskColour(c.disk)}">${esc(c.disk)}</b></span>
         <span class="mono" style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1"
           title="${esc(c.file)}">${esc(c.file)}</span>
         <span class="mono">${pct.toFixed(0)}%</span>
@@ -45467,7 +45467,7 @@ function aiHtml(d){
       <span class="mono dim">${ago(r.at)}</span>
       <span class="dim">${esc(r.arr||'')}</span>
       ${r.placed
-        ? `<span style="white-space:nowrap">to <b style="color:#3fb950">${esc(r.placed)}</b>${r.pct!=null
+        ? `<span style="white-space:nowrap">to <b style="color:${diskColour(r.placed)}">${esc(r.placed)}</b>${r.pct!=null
              ?` <span class="dim">${r.pct}% · ${fmt(r.free_gb)} GB free</span>`:''}</span>`
         : `<span style="color:var(--warn)" title="${esc(r.why||'')}">left to the arr</span>`}
       <span class="mono" style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
