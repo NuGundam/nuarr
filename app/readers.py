@@ -166,6 +166,28 @@ def _split_spare(f: dict, lib: str, langs: str, orig: str) -> None:
         # help the file being planned right now. The probe has the same
         # answer and is there from the moment the file is scanned.
         codes = _codes_from_probe(int(f.get("file_id") or 0))
+    # THE ROWS THEMSELVES CARRY THE TAGS. Every track in the plan arrived with
+    # `tagged` from the track scan, and that is the same fact the column and
+    # the probe hold - except it is there for a file that landed a minute
+    # ago, when the other two are not yet. Iron Man S01E05: fifteen audio
+    # tracks, tagged ara, ara, -, eng, spa, fre, heb, hun, ind, jpn, kor, por,
+    # rum, tha, -; audio_langs empty, no probe row yet; and this returned on
+    # `len(codes) < 2` with the answer in its hands. Whisper heard all fifteen
+    # and the rewrite deleted twelve of them two minutes later. The sister
+    # episode planned a few minutes later, probe present, set aside ten.
+    #
+    # So the plan's own tags are the first source, by track index, and the
+    # column or probe only fill in tracks the plan does not name.
+    row_tags = {}
+    for t in f.get("tracks") or []:
+        tag = (t.get("tagged") or "").strip()
+        if tag:
+            row_tags[int(t.get("track") or 0)] = tag
+    if row_tags:
+        n = max(len(codes), max(row_tags) + 1)
+        codes = [(codes[i] if i < len(codes) else "-") for i in range(n)]
+        for i, tag in row_tags.items():
+            codes[i] = tag
     if len(codes) < 2:
         return
     pol = langpolicy.for_library(lib, "audio")
