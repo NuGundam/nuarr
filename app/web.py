@@ -30128,7 +30128,7 @@ function tmPaint(){
         doing rather than by the executable${
         procs.some(p=>p._gone)?`, and ${fmt(procs.filter(p=>p._gone).length)}
         that has just finished`:''}</span></div>
-    <div class="scrollbox" style="max-height:340px;margin:6px 0 0">
+    <div class="scrollbox tmfit" style="max-height:340px;margin:6px 0 0">
     <!-- DECLARED WIDTHS, SO A HEADING SITS OVER ITS OWN COLUMN. With the
          widths left to the content, every column was as wide as whatever
          happened to be in it that second - so the heading and the figures
@@ -30291,7 +30291,22 @@ function tmPaint(){
     const nb = el.querySelector('.scrollbox');
     if(nb && keep) nb.scrollTop = keep;
   }
+  tmFit();
 }
+
+// THE PROCESS LIST RUNS TO THE BOTTOM OF THE WINDOW. A fixed 340px left the
+// lower half of a tall screen empty under a list that was already scrolling.
+// The box is sized to whatever room is left below its own top edge, measured
+// each paint and on every resize, never less than the old 340px so a short
+// window still shows a useful list.
+function tmFit(){
+  const b = document.querySelector('.tmfit');
+  if(!b || b.offsetParent === null) return;
+  const top = b.getBoundingClientRect().top;
+  const h = Math.max(340, Math.floor(window.innerHeight - top - 18));
+  if(b.style.maxHeight !== h+'px'){ b.style.maxHeight = h+'px'; b.style.height = h+'px'; }
+}
+addEventListener('resize', ()=>tmFit());
 
 async function dpBalance(action, btn){
   askInline(btn,
