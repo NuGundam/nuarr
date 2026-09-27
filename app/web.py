@@ -29175,7 +29175,8 @@ function dpMeasureHtml(d){
   const enough=need && placed>=need;
   // ONCE A DAY, AT AN HOUR - the only measure DrivePool has is pool-wide
   // (tested: no per-disk one exists), and on this pool it runs for hours.
-  const hh=(m.hour===undefined?5:m.hour), hhs=String(hh).padStart(2,'0')+':00';
+  const hh=(m.hour===undefined?5:m.hour);
+  const hhs=new Date(2000,0,1,hh,0).toLocaleTimeString([], {hour:'numeric', minute:'2-digit'});
   const state = m.busy ? 'DrivePool is measuring now'
               : !m.on ? 'off'
               : !enough ? 'nothing placed worth telling it about'
@@ -30472,7 +30473,10 @@ function dpPaint(disks){
         <input type="checkbox" ${en?'checked':''} onchange="dpToggle('drivepool.enabled',this.checked)">
         <span class="gname">integration</span><span class="gstate ${en?'on':'off'}">${en?'on':'off'}</span>
       </label>
-    </div>` + dpPrioHtml(d) + dpPlaceHtml(d);
+    </div>` + dpPrioHtml(d) + dpPlaceHtml(d)
+    + `<div id="aiCard" class="lkind" style="padding:10px 12px;margin-top:8px">${
+        _ai?aiHtml(_ai):'<span class="dim">loading…</span>'}</div>`;
+  if(!_ai) aiLoad();
   // ---- what it is doing now ------------------------------------------
   disks.forEach(x=>{ x._r=dpRate(x,''); });
   const emptying=disks.filter(x=>x._r<-2e6).sort((a,b)=>a._r-b._r).slice(0,3);
@@ -45462,10 +45466,11 @@ async function loadArrsTab(){
         {label:'Profiles to score on (empty = every profile in that arr)',
          kind:'release_ban', names:rb.profiles||{},
          empty:'', adder:banList(rb)})
-    + `<div id="aiCard" style="border:1px solid var(--line);border-radius:8px;
-         padding:10px 14px;margin-top:10px">${_ai?aiHtml(_ai):'<span class="dim">loading…</span>'}</div>`;
+    + `<div class="dim" style="font-size:11px;margin-top:10px;padding:0 4px">Where the arrs'
+         imports land - the disk nuarr picks for them, and the last few placed - is on the
+         <a href="#drivepool">DrivePool page</a>,
+         next to the same choice nuarr makes for its own files.</div>`;
   loadHookState();
-  aiLoad();
 }
 
 // ---- arr imports: nuarr picks the disk ------------------------------------
@@ -45549,22 +45554,27 @@ function aiHtml(d){
         r.placed&&r.gb?` <span class="dim">· ${r.gb} GB in ${r.seconds}s</span>`
                       :(!r.placed?` <span class="dim">· ${esc(r.why||'')}</span>`:'')}</span>
     </div>`).join('');
-  return `<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-      <b>Imports land on the disk nuarr picks</b>
+  const live=d.on&&armed;
+  return `<div style="display:flex;gap:12px;align-items:baseline;flex-wrap:wrap">
+      <b style="color:#6fb0ff">Arr imports land the same way</b>
+      <span style="color:${live?'var(--ok)':'var(--dim,#8a97a6)'};font-size:12px">${
+        live?'on — Sonarr and Radarr hand each import to nuarr':'off — the arrs copy imports themselves and DrivePool picks the disk'}</span>
       ${arrs.map(pill).join(' ')}
-      <label style="margin-left:auto;display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer">
-        <input type="checkbox" ${d.on&&armed?'checked':''} onchange="aiToggle(this)"> ${
-          d.on&&armed?'on':'off'}</label>
+      <label class="gsw" style="margin-left:auto"
+        title="THE ARRS' IMPORTS, NOT NUARR'S OWN COMMITS - those are the block above. Each arr's Import Using Script hands the copy to nuarr, which writes it through the pool onto the emptiest disk by percent that nobody is watching. Turning this off turns it off in the arrs too.">
+        <input type="checkbox" ${live?'checked':''} onchange="aiToggle(this)">
+        <span class="gname">place the arrs' imports too</span>
+        <span class="gstate ${live?'on':'off'}">${live?'on':'off'}</span>
+      </label>
     </div>
-    <div class="dim" style="font-size:11px;margin:6px 0 4px;max-width:90ch">
-      Sonarr and Radarr copy every import from the download folder onto the pool, and
-      DrivePool gives a new file to the disk with the most free <i>bytes</i> - always one of
-      the two 18 TB disks. With this on, each arr's <span class="mono">Import Using Script</span>
-      hands the copy to nuarr, which writes it through the pool onto the emptiest disk by
-      percent that nobody is watching, the same choice it makes for its own files. DrivePool
-      counts it as it lands, so nothing needs balancing later. If nuarr cannot place a file
-      it tells the arr to import it itself, as before - an import is never held up.
-      Turning this off turns it off in the arrs too.</div>
+    <div class="dim" style="font-size:11px;margin-top:2px">the block above is nuarr's own
+      files; this is what Sonarr and Radarr import from the download folder. Left to
+      themselves they copy onto the pool and DrivePool gives the file to the disk with
+      the most free <i>bytes</i> - always one of the two 18 TB disks. With this on the
+      arr's <span class="mono">Import Using Script</span> hands the copy to nuarr, which
+      places it by the same rule as above; DrivePool counts it as it lands. If nuarr
+      cannot place a file the arr imports it itself, as before - an import is never
+      held up.</div>
     <div id="aiMsg" class="dim" style="font-size:11px"></div>
     <div style="margin-top:8px;font-size:11px" class="dim">since nuarr started: ${
       fmt(d.placed||0)} placed · ${fmt(d.deferred||0)} left to the arr</div>
