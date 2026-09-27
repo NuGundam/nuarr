@@ -29136,7 +29136,6 @@ function dpPlaceHtml(d){
           : (p.landing
              ? ` — ${p.landing} of ${p.members} disks have a landing folder on the pool; the rest are written into their PoolPart directly and told to DrivePool once the files have stopped landing`
              : ` and writes it into the disk's PoolPart itself — DrivePool moves nothing, and is told once the files have stopped landing`)}</div>
-    ${dpMeasureHtml(d)}
     ${lead}
     ${rows?`<table style="width:100%;font-size:12px;border-collapse:collapse;
       margin-top:6px;padding-top:6px;border-top:1px solid var(--line);
@@ -29181,25 +29180,32 @@ function dpMeasureHtml(d){
               : !m.on ? 'off'
               : !enough ? 'nothing placed worth telling it about'
               : `${gb(placed)} placed — asking at ${hhs}`;
-  return `<div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;
-       margin-top:5px;font-size:11px">
-    <span class="dim">DrivePool's own figures:</span>
-    <span style="color:${m.on?'var(--ok)':'var(--dim,#8a97a6)'}">${esc(state)}</span>
-    <span class="dim">· last asked ${esc(when(m.last))}${
-      m.n?` · ${fmt(m.n)} time${m.n===1?'':'s'} this run`:''}${
-      (!m.busy&&parts.length)?` · uncounted: ${parts.slice(0,4).map(p=>
-        `${esc(p.label||'?')} ${gb(p.other)}`).join(', ')}${
-        parts.length>4?` and ${parts.length-4} more`:''}`:''}</span>
-    <button class="rmb" style="font-size:10px;padding:2px 8px"
-      title="Ask DrivePool to recompute its usage figures now. It runs in DrivePool's own background and can take a while on a pool this size; the files are already in the pool either way - this only corrects the grey 'Other' bar."
-      onclick="dpRemeasure(this)">Re-measure now</button>
-    <label class="gsw" style="margin-left:auto"
-      title="With this on, nuarr asks DrivePool to re-measure after its files have stopped landing - at most once an hour, and never while DrivePool is already measuring. With it off, the grey bar stays until you press Re-measure in DrivePool yourself.">
-      <input type="checkbox" ${m.on?'checked':''}
-        onchange="dpRemeasureOn(this.checked)">
-      <span class="gname">tell DrivePool what was placed, daily at ${esc(hhs)}</span>
-      <span class="gstate ${m.on?'on':'off'}">${m.on?'on':'off'}</span>
-    </label>
+  return `<div class="lkind" style="padding:10px 12px;margin-top:8px">
+    <div style="display:flex;gap:12px;align-items:baseline;flex-wrap:wrap">
+      <b style="color:#6fb0ff">DrivePool's own figures</b>
+      <span style="color:${m.busy?'var(--acc)':m.on?'var(--ok)':'var(--dim,#8a97a6)'};font-size:12px">${esc(state)}</span>
+      <label class="gsw" style="margin-left:auto"
+        title="With this on, nuarr asks DrivePool to re-measure once a day, at this hour, when its files have landed - and never while DrivePool is already measuring. With it off, the grey bar stays until you press Re-measure in DrivePool yourself.">
+        <input type="checkbox" ${m.on?'checked':''}
+          onchange="dpRemeasureOn(this.checked)">
+        <span class="gname">tell DrivePool what was placed, daily at ${esc(hhs)}</span>
+        <span class="gstate ${m.on?'on':'off'}">${m.on?'on':'off'}</span>
+      </label>
+    </div>
+    <div class="dim" style="font-size:11px;margin-top:2px">files the two blocks above
+      write straight onto a disk are in the pool at once, but DrivePool only counts
+      them when it measures - until then they show as grey "Other". This is when
+      nuarr asks it to.</div>
+    <div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;margin-top:5px;font-size:11px">
+      <span class="dim">last asked ${esc(when(m.last))}${
+        m.n?` · ${fmt(m.n)} time${m.n===1?'':'s'} this run`:''}${
+        (!m.busy&&parts.length)?` · uncounted: ${parts.slice(0,4).map(p=>
+          `<span style="color:${diskColour(p.label||'')}">${esc(p.label||'?')}</span> ${gb(p.other)}`).join(', ')}${
+          parts.length>4?` and ${parts.length-4} more`:''}`:''}</span>
+      <button class="rmb" style="font-size:10px;padding:2px 8px"
+        title="Ask DrivePool to recompute its usage figures now. It runs in DrivePool's own background and can take a while on a pool this size; the files are already in the pool either way - this only corrects the grey 'Other' bar."
+        onclick="dpRemeasure(this)">Re-measure now</button>
+    </div>
   </div>`;
 }
 async function dpRemeasure(btn){
@@ -30475,7 +30481,8 @@ function dpPaint(disks){
       </label>
     </div>` + dpPrioHtml(d) + dpPlaceHtml(d)
     + `<div id="aiCard" class="lkind" style="padding:10px 12px;margin-top:8px">${
-        _ai?aiHtml(_ai):'<span class="dim">loading…</span>'}</div>`;
+        _ai?aiHtml(_ai):'<span class="dim">loading…</span>'}</div>`
+    + dpMeasureHtml(d);
   if(!_ai) aiLoad();
   // ---- what it is doing now ------------------------------------------
   disks.forEach(x=>{ x._r=dpRate(x,''); });

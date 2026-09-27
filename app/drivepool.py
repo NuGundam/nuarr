@@ -1336,7 +1336,14 @@ def balancing() -> dict:
     word = AUTO_WORD.get(auto, "unknown")
     tod = str(item.get("BalancingTimeOfDay") or "")
     if auto == 1 and tod:
-        word += " " + tod[:5]
+        # A clock time, the way the rest of the page writes one: 5:30 AM,
+        # not 05:30.
+        m = re.match(r"^(\d{1,2}):(\d{2})", tod)
+        if m:
+            h, mi = int(m.group(1)), m.group(2)
+            word += f" {(h % 12) or 12}:{mi} {'AM' if h < 12 else 'PM'}"
+        else:
+            word += " " + tod[:5]
     try:
         ratio = float(item.get("CriticalBalanceRatio") or 0)
     except (TypeError, ValueError):
