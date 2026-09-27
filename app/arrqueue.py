@@ -274,9 +274,10 @@ class _Sab:
         self._get(mode="history", name="delete", value=",".join(ids), del_files=1)
 
 
-def _sweep_clients(arrs, tracked: set) -> tuple[int, list]:
-    """Finished items in the arrs' categories that no arr tracks any more."""
-    n, lines = 0, []
+def _sweep_clients(arrs, tracked: set) -> tuple[int, list, list]:
+    """Finished items in the arrs' categories that no arr tracks any more.
+    Returns (count, log lines, rows for the recent list)."""
+    n, lines, rows = 0, [], []
     for c in _clients(arrs):
         try:
             if c["impl"] == "QBittorrent":
@@ -291,6 +292,8 @@ def _sweep_clients(arrs, tracked: set) -> tuple[int, list]:
                     n += len(gone)
                     lines += [f"{c['name']}: removed {t.get('name', '')[:70]} (finished, no arr tracks it)"
                               for t in gone]
+                    rows += [{"at": time.time(), "arr": "", "title": t.get("name") or "", "client": c["name"],
+                              "why": "finished in the client, no arr tracks it"} for t in gone]
             elif c["impl"] == "Sabnzbd":
                 s = _Sab(c)
                 gone = [x for x in s.finished(c["cats"])
@@ -301,9 +304,11 @@ def _sweep_clients(arrs, tracked: set) -> tuple[int, list]:
                     n += len(gone)
                     lines += [f"{c['name']}: removed {x.get('name', '')[:70]} (completed, no arr tracks it)"
                               for x in gone]
+                    rows += [{"at": time.time(), "arr": "", "title": x.get("name") or "", "client": c["name"],
+                              "why": "completed in the client, no arr tracks it"} for x in gone]
         except Exception as e:                                   # noqa: BLE001
             lines.append(f"{c['name']}: {type(e).__name__}: {e}"[:160])
-    return n, lines
+    return n, lines, rows
 
 
 # ------------------------------------------------------------ the pass -----
@@ -370,7 +375,7 @@ def _pass() -> str:
             try:
                 _remove(a, r)
                 removed += 1
-                new.append({"at": time.time(), "arr": a.name, "title": (r.get("title") or "")[:120],
+                new.append({"at": time.time(), "arr": a.name, "title": r.get("title") or "",
                             "client": r.get("downloadClient") or "", "why": why})
                 STATS["detail"].append(f"{a.name}: removed {(r.get('title') or '')[:70]} - {why}")
             except Exception as e:                               # noqa: BLE001
@@ -378,13 +383,9 @@ def _pass() -> str:
                                        f"{type(e).__name__}: {e}"[:160])
     # The removals above also told the clients; anything the clients still
     # hold in an arr category, finished, that no arr tracks, goes now.
-    swept, lines = _sweep_clients(arrs, tracked)
+    swept, lines, srows = _sweep_clients(arrs, tracked)
     STATS["detail"] += lines
-    for ln in lines:
-        if ": removed " in ln:
-            new.append({"at": time.time(), "arr": "", "title": ln.split(": removed ", 1)[1][:120],
-                        "client": ln.split(":", 1)[0], "why": "finished in the client, no arr tracks it"})
-    _remember(new)
+    _remember(new + srows)
     STATS.update(removed=STATS["removed"] + removed, swept=STATS["swept"] + swept, kept=kept)
     bits = []
     if removed:
