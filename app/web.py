@@ -45565,7 +45565,7 @@ function qjTableHtml(){
     <thead><tr class="dim" style="font-size:10.5px">${th('at','when','c')}${th('arr','arr','c')}${th('client','client','c')}${th('title','release · why','l')}</tr></thead>
     <tbody>${qjSorted().map(qjRowHtml).join('')}</tbody></table></div>`;
 }
-function qjPaint(){ const e=document.getElementById('qjTable'); if(e) e.innerHTML=qjTableHtml(); }
+function qjPaint(){ keepBox('qjTable', qjTableHtml()); }
 function qjSortBy(k){ if(_qjSort.k===k) _qjSort.d=-_qjSort.d; else _qjSort={k, d:k==='at'?-1:1}; qjPaint(); }
 function qjOpen(id,ev){ if(ev) ev.stopPropagation(); if(_qjOpen.has(id)) _qjOpen.delete(id); else _qjOpen.add(id); qjPaint(); }
 function qjList(qj){
@@ -45760,6 +45760,12 @@ function banStyle(){
   document.head.appendChild(st);
 }
 function banWhen(t){ return t?new Date(t*1000).toLocaleDateString():''; }
+function keepBox(id, html){
+  const host=document.getElementById(id); if(!host) return;
+  const box=host.querySelector('.rowbox'); const top=box?box.scrollTop:0;
+  host.innerHTML=html;
+  const nb=host.querySelector('.rowbox'); if(nb && top) nb.scrollTop=top;
+}
 function banWhenFull(t){ return t?new Date(t*1000).toLocaleString():''; }
 function banMark(cur,k){ return cur.k===k?`<span style="color:var(--acc)">${cur.d>0?'▲':'▼'}</span>`:''; }
 function banScopeSel(v,attrs){
@@ -45859,9 +45865,8 @@ function banTableHtml(){
     <tbody>${rows.map(banRowHtml).join('')}</tbody></table></div>`;
 }
 function banPaintList(){
-  const set=(id,h)=>{ const e=document.getElementById(id); if(e) e.innerHTML=h; };
-  set('banSel', banSelBar());
-  set('banTable', banTableHtml());
+  const e=document.getElementById('banSel'); if(e) e.innerHTML=banSelBar();
+  keepBox('banTable', banTableHtml());
 }
 function banToggle(id, ev){
   const rows=banRows(), i=rows.findIndex(r=>r.id===id);
@@ -46009,7 +46014,7 @@ function bstTableHtml(){
       </tr></thead>
       <tbody>${rows.map(bstRowHtml).join('')}</tbody></table></div></div>`;
 }
-function bstPaint(){ const e=document.getElementById('banStrikes'); if(e) e.innerHTML=bstTableHtml(); }
+function bstPaint(){ keepBox('banStrikes', bstTableHtml()); }
 function bstToggle(g, ev){
   const rows=bstRows(), i=rows.findIndex(x=>x.grp===g);
   if(ev && ev.shiftKey && _bstLast!==null && i>=0){
