@@ -88,10 +88,46 @@ class ArrImport
                     if (e.Status != WebExceptionStatus.ConnectFailure) throw;
                 }
             }
-            if (text != null && text.Contains("\"ok\":true") && File.Exists(dst)) status = "MoveComplete";
+            bool ok = text != null && text.Contains("\"ok\":true");
+            // NUARR SAID IT IS THERE; LOOK AGAIN BEFORE DISBELIEVING IT. The file
+            // arrives at dst by a rename inside DrivePool's pool, and this process
+            // asked "is it there?" a few milliseconds after nuarr's own check
+            // passed - and 6 of 12 episodes in one pack got "no". DeferMove then
+            // sent Sonarr to copy the source itself, which nuarr had already
+            // moved away, and each of those sat in the queue as "file doesn't
+            // exist". Give the pool a few seconds to show what nuarr has
+            // verified is on the disk.
+            bool there = false;
+            if (ok)
+            {
+                for (int i = 0; i < 40 && !there; i++)
+                {
+                    there = File.Exists(dst);
+                    if (!there) System.Threading.Thread.Sleep(100);
+                }
+            }
+            if (ok && there) status = "MoveComplete";
+            Log(arr + " " + status + (ok && !there ? " (nuarr said ok but dst not visible after 4s)" : "")
+                + " | " + Path.GetFileName(dst) + " | " + (text == null ? "no answer" : text.Length > 160 ? text.Substring(0, 160) : text));
         }
-        catch { status = "DeferMove"; }
+        catch (Exception e) { status = "DeferMove"; Log("DeferMove on exception: " + e.GetType().Name + ": " + e.Message); }
         Console.WriteLine("[MoveStatus]" + status);
         return 0;
+    }
+
+    // One line per import, so the next time an entry sticks in a queue the
+    // answer is in C:\nuarr\logs\arr_import.log rather than in a guess.
+    static void Log(string line)
+    {
+        try
+        {
+            var p = @"C:\nuarr\logs\arr_import.log";
+            Directory.CreateDirectory(Path.GetDirectoryName(p));
+            var fi = new FileInfo(p);
+            if (fi.Exists && fi.Length > 2 * 1024 * 1024) File.Copy(p, p + ".1", true);
+            if (fi.Exists && fi.Length > 2 * 1024 * 1024) File.WriteAllText(p, "");
+            File.AppendAllText(p, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  " + line + Environment.NewLine);
+        }
+        catch { }
     }
 }

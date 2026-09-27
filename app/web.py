@@ -995,6 +995,8 @@ async def _startup() -> None:
     # jobs are toggle-gated and default off, so this idles unless enabled.
     from . import arrguard
     asyncio.create_task(arrguard.watch())
+    from . import arrqueue as _arrqueue
+    asyncio.create_task(_arrqueue.watch())
     # CLOSES THE LOOP. Every rule here is a claim that Plex will play the file
     # without working for it; nothing checked the claim, which is how the EAE
     # bug survived for months. This watches what Plex actually decided.
@@ -2841,8 +2843,10 @@ def api_arrguard():
             "toggles": {"profile_guard": gate.get_toggle("arrs.profile_guard"),
                         "trash_anime": gate.get_toggle("arrs.trash_anime"),
                         "release_ban": gate.get_toggle("arrs.release_ban"),
+                        "queue_janitor": gate.get_toggle("arrs.queue_janitor"),
                         },
             "release_ban": _arrban_snapshot(),
+            "queue_janitor": _arrqueue_snapshot(),
             # The names each job works on, so the page can show and edit them
             # instead of shipping one machine's profile names as a constant.
             "split_profiles": arrguard.targets_2160(),
@@ -2850,6 +2854,14 @@ def api_arrguard():
             "trash_autoadd": gate.get_toggle("arrs.trash_autoadd"),
             "defaults": {"split_profiles": arrguard.DEFAULT_TARGET_2160,
                          "anime_formats": arrguard.DEFAULT_ANIME_FORMATS}}
+
+
+def _arrqueue_snapshot() -> dict:
+    try:
+        from . import arrqueue
+        return arrqueue.snapshot()
+    except Exception as e:                                       # noqa: BLE001
+        return {"error": f"{type(e).__name__}: {e}", "stats": {}, "recent": []}
 
 
 def _arrban_snapshot() -> dict:
@@ -3044,7 +3056,7 @@ async def api_arrguard_choices(job: str):
     return out
 
 
-_ARR_JOBS = ("profile_guard", "trash_anime", "release_ban")
+_ARR_JOBS = ("profile_guard", "trash_anime", "release_ban", "queue_janitor")
 
 
 @app.post("/api/arrguard/toggle")
@@ -3069,6 +3081,9 @@ async def api_arrguard_run(job: str):
         arrban.STATS["dirty"] = True
         arrban.kick(0.1)
         return {"result": "pushing"}
+    if job == "queue_janitor":
+        from . import arrqueue
+        return {"result": await arrqueue.run()}
     raise HTTPException(400, f"job must be one of {', '.join(_ARR_JOBS)}")
 
 
@@ -45338,6 +45353,7 @@ async function loadArrsTab(){
   catch(e){ el.innerHTML=`<div class="err">could not load: ${esc(String(e))}</div>`; return; }
   const g=d.stats.guard||{}, t=d.stats.trash||{};
   const rb=d.release_ban||{}, rbst=(rb.stats||{});
+  const qj=d.queue_janitor||{}, qjst=(qj.stats||{});
   // `ed` is optional: {label, kind, names:{radarr:[],sonarr:[]}, empty}
   // min-width:0 on the input is what stops the Pick button being pushed off
   // the edge: a flex item's default minimum is its CONTENT width, so a long
@@ -45359,7 +45375,8 @@ async function loadArrsTab(){
            overflow:auto;background:rgba(255,255,255,.02)"></div>
     </div>`;
   };
-  const editor=ed=>!ed?'':`
+  // A JOB WITH NOTHING TO NAME (the queue janitor) gets only its own list.
+  const editor=ed=>!ed?'':!ed.label?(ed.adder||''):`
     <div style="margin-top:8px;border-top:1px solid var(--line);padding-top:8px">
       <div style="font-size:11px;font-weight:600">${esc(ed.label)}</div>
       ${nameRow(ed,'radarr')}${nameRow(ed,'sonarr')}
@@ -45486,11 +45503,48 @@ async function loadArrsTab(){
         {label:'Profiles to score on (empty = every profile in that arr)',
          kind:'release_ban', names:rb.profiles||{},
          empty:'', adder:banList(rb)})
+    + job('queue_janitor','Queue janitor: downloads the arrs finished with but never let go of',
+        'A download that completes and then cannot be imported - a better release '
+        +'landed first so it is "not a Custom Format upgrade", or the import already '
+        +'happened through nuarr and the arr never closed the entry - sits in the '
+        +'queue with a warning forever, and its files sit in the download client. '
+        +'Every '+String(Math.round((qj.poll_s||300)/60))+' minutes this removes those '
+        +'through the arr, which deletes them from whichever client they came from, '
+        +'files included; then it sweeps the clients for finished items in the arrs\' '
+        +'categories that no arr tracks. The clients are read from the arrs\' own '
+        +'settings, so a client you switch to is a client this sweeps. Anything still '
+        +'downloading, or with a warning it does not recognise, is left for you.',
+        d.toggles.queue_janitor, qjst,
+        {label:'', kind:'queue_janitor', names:{}, empty:'', adder:qjList(qj)})
     + `<div class="dim" style="font-size:11px;margin-top:10px;padding:0 4px">Where the arrs'
          imports land - the disk nuarr picks for them, and the last few placed - is on the
          <a href="#drivepool">DrivePool page</a>,
          next to the same choice nuarr makes for its own files.</div>`;
   loadHookState();
+}
+
+// ---- the queue janitor's recent removals ----------------------------------
+function qjList(qj){
+  const rows=qj.recent||[];
+  const st=qj.stats||{};
+  const when=t=>{ const s=Math.max(0,Date.now()/1000-t);
+    return s<60?Math.round(s)+'s ago':s<3600?Math.round(s/60)+'m ago'
+         :s<86400?(s/3600).toFixed(1)+'h ago':Math.round(s/86400)+'d ago'; };
+  return `<div style="margin-top:8px;border-top:1px solid var(--line);padding-top:8px">
+    <div style="font-size:11px;font-weight:600">Removed${rows.length?` (last ${rows.length})`:''}
+      ${st.running?'<span class="dim" style="font-weight:400"> · running…</span>':''}</div>
+    ${rows.length?`<div style="max-height:220px;overflow:auto;border:1px solid var(--line);
+         border-radius:6px;background:rgba(255,255,255,.02);margin-top:4px">
+      ${rows.map(r=>`<div style="display:grid;grid-template-columns:62px 58px minmax(0,1fr);gap:10px;
+          padding:4px 10px;font-size:11px;border-top:1px solid var(--line);align-items:baseline">
+        <span class="mono dim">${when(r.at)}</span>
+        <span class="dim">${esc(r.arr||r.client||'')}</span>
+        <span style="min-width:0"><div class="mono" style="overflow:hidden;text-overflow:ellipsis;
+          white-space:nowrap" title="${esc(r.title||'')}">${esc(r.title||'')}</div>
+          <div class="dim" style="font-size:10px">${esc(r.why||'')}${r.client&&r.arr?` · from ${esc(r.client)}`:''}</div></span>
+      </div>`).join('')}</div>`
+      :'<div class="dim" style="font-size:11px;margin-top:3px">nothing removed yet</div>'}
+  </div>`;
 }
 
 // ---- arr imports: nuarr picks the disk ------------------------------------
