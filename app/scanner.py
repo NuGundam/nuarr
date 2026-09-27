@@ -2129,11 +2129,18 @@ def clear_resolved_failures() -> dict:
     Deliberately conservative. A row is removed ONLY with positive evidence:
 
       * a LATER job for the same target finished done/skipped, or
-      * the file record it points at no longer exists (superseded or removed)
+      * the file record it points at no longer exists (superseded or removed), or
+      * the file itself reached 'done' AFTER the failure was recorded.
+
+    THE THIRD RULE IS FOR A STALE PLAN. "the tracks have moved since this was
+    planned" is a subs step finding the file already rewritten under it; the
+    steps that rewrote it were planned in the same batch, so they are OLDER
+    than the failure and the second rule never matched. 34 of those sat on
+    the panel for two weeks against files that were finished. A file whose
+    record says done, stamped after the failure, has nothing left to fix.
 
     Nothing is dropped for being merely old, and anything without evidence is
-    left exactly where it is. All seven failures on this box at the time of
-    writing qualified under the first two rules; none needed a time-based one.
+    left exactly where it is.
     """
     sql = """
     SELECT f.id, f.kind, f.title,
@@ -2141,6 +2148,10 @@ def clear_resolved_failures() -> dict:
         WHEN f.file_id IS NOT NULL AND NOT EXISTS
              (SELECT 1 FROM files x WHERE x.id = f.file_id)
           THEN 'file record gone - superseded or removed'
+        WHEN EXISTS (SELECT 1 FROM files x WHERE x.id = f.file_id
+                       AND x.state = 'done'
+                       AND COALESCE(x.updated_at,0) > COALESCE(f.created_at,0))
+          THEN 'the file was finished after the failure'
         WHEN EXISTS (SELECT 1 FROM jobs l
                      WHERE l.state IN ('done','skipped')
                        AND COALESCE(l.created_at,0) > COALESCE(f.created_at,0)
