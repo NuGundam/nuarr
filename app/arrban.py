@@ -220,6 +220,31 @@ def clear_strikes(grp: str) -> bool:
         return bool(cur.rowcount)
 
 
+def bulk(ids: list, action: str, arrs: str = "") -> int:
+    """One change to many rows: 'on', 'off', 'scope' (with arrs), 'remove'.
+    One transaction, one push - not one push per row."""
+    init()
+    ids = [int(i) for i in ids or []]
+    if not ids:
+        return 0
+    marks = ",".join("?" * len(ids))
+    with cursor() as cur:
+        if action == "remove":
+            cur.execute(f"DELETE FROM arr_bans WHERE id IN ({marks})", ids)
+        elif action in ("on", "off"):
+            cur.execute(f"UPDATE arr_bans SET enabled=? WHERE id IN ({marks})",
+                        [1 if action == "on" else 0, *ids])
+        elif action == "scope":
+            cur.execute(f"UPDATE arr_bans SET arrs=? WHERE id IN ({marks})",
+                        [_scope(arrs), *ids])
+        else:
+            return 0
+        n = cur.rowcount
+    if n:
+        _mark_dirty()
+    return int(n)
+
+
 def set_scope(ban_id: int, arrs: str) -> bool:
     init()
     with cursor() as cur:

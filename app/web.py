@@ -2895,17 +2895,35 @@ async def api_arrban_scope(id: int, arrs: str = ""):
 
 @app.post("/api/arrban/strike")
 async def api_arrban_strike(grp: str, action: str = "ban", arrs: str = ""):
-    """A group on strikes: ban it now, or forgive it (clear its strikes)."""
+    """Groups on strikes (one, or several joined by \n): ban them now, or
+    forgive them (clear their strikes). One push for the lot."""
     from . import arrban
-    if action == "clear":
-        ok = arrban.clear_strikes(grp)
-        joblog.log(f"release bans: strikes against {grp!r} cleared by hand", "info")
-        return {"ok": ok}
-    r = arrban.add("group", grp, "banned by hand while on strikes", "you",
-                   by="you", arrs=arrs)
-    if r.get("ok"):
+    grps = [g.strip() for g in str(grp).split("\n") if g.strip()]
+    n = 0
+    for g in grps:
+        if action == "clear":
+            n += int(bool(arrban.clear_strikes(g)))
+        else:
+            r = arrban.add("group", g, "banned by hand while on strikes",
+                           "you", by="you", arrs=arrs)
+            n += int(bool(r.get("ok")))
+    if n:
+        joblog.log(f"release bans: {n} group(s) {'forgiven' if action == 'clear' else 'banned'}"
+                   f" by hand: {', '.join(grps)[:200]}", "info")
+        if action != "clear":
+            arrban.kick(arrban.SYNC_HAND_S)
+    return {"ok": bool(n), "n": n}
+
+
+@app.post("/api/arrban/bulk")
+async def api_arrban_bulk(action: str, arrs: str = "", body: dict = Body(...)):
+    """{"ids":[...]} with action on / off / scope (+arrs) / remove."""
+    from . import arrban
+    n = arrban.bulk(body.get("ids") or [], action, arrs)
+    if n:
+        joblog.log(f"release bans: {n} row(s) {action}{' ' + (arrs or 'both') if action == 'scope' else ''} by hand", "info")
         arrban.kick(arrban.SYNC_HAND_S)
-    return r
+    return {"ok": bool(n), "n": n}
 
 
 @app.post("/api/arrban/import")
@@ -45586,9 +45604,19 @@ poll(aiLoad, 1500, 'aiCard');
 // 45-second batch nuarr uses for its own rejections; the push shows per arr,
 // per step, as it happens; and the list redraws in place, so the card does
 // not blink back to the top of the page after every click.
+//
+// THE SAME SHAPE AS SUBTITLE USER INPUT. Erik: "can the scroll boxes have
+// the same format logic as this one were they are selectable and the reason
+// and other info in the expand down box". Both lists are .sktbl tables in a
+// .rowbox: a checkbox on every row, shift-click for a range, a caret on the
+// name that opens the row for the reason, the pattern and where it came
+// from, headings that sort, and a bar over the selection with the things a
+// batch can do - because switching off a whole group's worth of releases was
+// one click per row.
 let _banRb=null, _banSort={k:'kind',d:1}, _banPollT=null, _banBusy=false;
+const _banSel=new Set(), _banOpen=new Set(); let _banLast=null;
+const _bstSel=new Set(), _bstOpen=new Set(); let _bstLast=null, _bstSort={k:'n',d:-1};
 const BAN_KIND_ORDER={group:0, term:1, release:2};
-const BAN_GRID='50px minmax(0,1fr) 72px 34px 70px 22px 12px';
 function banStyle(){
   if(document.getElementById('banStyle')) return;
   const st=document.createElement('style'); st.id='banStyle';
@@ -45603,14 +45631,28 @@ function banStyle(){
     .bansp{display:inline-block;width:10px;height:10px;border-radius:50%;
       border:2px solid #6fb0ff;border-right-color:transparent;
       animation:banSpin .8s linear infinite;vertical-align:-1px}
-    .banhd span{cursor:pointer;user-select:none;white-space:nowrap}
-    .banhd span:hover{color:var(--fg,#e6edf3)}
     .banscope{font-size:10px;padding:0 2px;background:transparent;
-      border:1px solid var(--line);border-radius:4px;color:inherit;width:100%}
-    .banscope.s{color:#6fb0ff}.banscope.r{color:#e3b341}`;
+      border:1px solid var(--line);border-radius:4px;color:inherit}
+    .banscope.s{color:#6fb0ff}.banscope.r{color:#e3b341}
+    .bantbl th{cursor:pointer;user-select:none}
+    .bantbl th,.bantbl td{padding-left:5px;padding-right:5px}
+    .bantbl tr.sel>td{background:rgba(88,166,255,.06)}
+    .bantbl tr.off>td{opacity:.5}
+    .bantbl tr.det>td{background:rgba(255,255,255,.025);white-space:normal}
+    .banselbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:6px 8px;
+      margin:6px 0;border-radius:7px;background:rgba(88,166,255,.07);border:1px solid var(--line)}`;
   document.head.appendChild(st);
 }
 function banWhen(t){ return t?new Date(t*1000).toLocaleDateString():''; }
+function banWhenFull(t){ return t?new Date(t*1000).toLocaleString():''; }
+function banMark(cur,k){ return cur.k===k?`<span style="color:var(--acc)">${cur.d>0?'▲':'▼'}</span>`:''; }
+function banScopeSel(v,attrs){
+  return `<select class="banscope ${v==='sonarr'?'s':v==='radarr'?'r':''}" ${attrs}>
+    <option value=""${v===''?' selected':''}>both</option>
+    <option value="sonarr"${v==='sonarr'?' selected':''}>Sonarr</option>
+    <option value="radarr"${v==='radarr'?' selected':''}>Radarr</option></select>`;
+}
+// ---------------------------------------------------------------- the bans
 function banSorted(rows){
   const k=_banSort.k, d=_banSort.d;
   const byName=(a,b)=>String(a.value).localeCompare(String(b.value),undefined,
@@ -45620,6 +45662,7 @@ function banSorted(rows){
     : k==='arrs'?({'':0,sonarr:1,radarr:2}[r.arrs||'']??0)
     : k==='hits'?(r.hits||0)
     : k==='added'?(r.added_at||0)
+    : k==='by'?(r.added_by||'')
     : k==='on'?(r.enabled?0:1) : 0;
   return [...rows].sort((a,b)=>{
     // THE NAME IS ALWAYS THE TIE-BREAK, and always A to Z, so a column sort
@@ -45630,56 +45673,101 @@ function banSorted(rows){
     return c ? c*d : byName(a,b);
   });
 }
-function banHeadHtml(){
-  const cols=[['kind','Type'],['value','Name · reason'],['arrs','Apps'],
-              ['hits','Hits'],['added','Added'],['on','On'],['','']];
-  return cols.map(([k,t])=>{
-    if(!k) return '<span></span>';
-    const on=_banSort.k===k, ar=on?(_banSort.d>0?' ▲':' ▼'):'';
-    return `<span onclick="banSortBy('${k}')" title="sort by ${t.toLowerCase()}"
-      style="${on?'color:var(--fg,#e6edf3)':''};${k==='hits'?'text-align:right':''}">${t}${ar}</span>`;
-  }).join('');
+function banRows(){ return banSorted((_banRb&&_banRb.rows)||[]); }
+function banSelIds(){ const live=new Set(((_banRb&&_banRb.rows)||[]).map(r=>r.id)); return [..._banSel].filter(i=>live.has(i)); }
+function banDetail(r){
+  const line=(k,v)=>v?`<div style="display:flex;gap:8px;margin:2px 0"><span class="dim" style="flex:none;width:96px;text-align:right">${k}</span><span style="min-width:0;overflow-wrap:anywhere;white-space:normal">${v}</span></div>`:'';
+  const how={release:'the name, however an indexer spells its dots, spaces and dashes; the container extension is ignored',
+             group:'the parsed release group, exactly',
+             term:'anywhere in the release name'}[r.kind]||'';
+  return `<div style="font-size:11px;padding:6px 10px 8px 34px;white-space:normal">
+    ${line('reason', esc(r.why||'')+(r.hits>1?` <span class="dim">· seen ${fmt(r.hits)} times</span>`:''))}
+    ${line('matches', esc(how))}
+    ${line('pattern', `<span class="mono dim" style="word-break:break-all">${esc(r.pattern||'')}</span>`)}
+    ${line('pushed to', (r.arrs||'')===''?'both arrs':(r.arrs==='sonarr'?'Sonarr only':'Radarr only'))}
+    ${line('added', `${esc(r.added_by||'')}${r.source?` <span class="dim">via ${esc(r.source)}</span>`:''} · ${esc(banWhenFull(r.added_at))}`)}
+    ${line('state', r.enabled?'on — scored -10000 on every listed profile':'<span class="dim">switched off — kept so "why is this back" has an answer, not pushed</span>')}
+  </div>`;
 }
 function banRowHtml(r){
-  const sc=r.arrs||'';
-  const d=r.added_at?new Date(r.added_at*1000).toLocaleDateString(undefined,
-    {month:'numeric',day:'numeric',year:'2-digit'}):'';
-  return `<div style="display:grid;align-items:center;grid-template-columns:${BAN_GRID};
-      gap:8px;padding:4px 10px;font-size:11px;border-top:1px solid var(--line);
-      ${r.enabled?'':'opacity:.45'}">
-      <span class="pill ${r.kind==='group'?'p-warn':'p-dim'}"
-        style="text-align:center">${r.kind}</span>
-      <span style="min-width:0">
-        <div class="mono" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
-          title="${esc(r.value)}">${esc(r.value)}</div>
-        ${r.why?`<div class="dim" style="font-size:10px;overflow:hidden;text-overflow:ellipsis;
-          white-space:nowrap" title="${esc(r.why)}">${esc(r.why)}</div>`:''}
-      </span>
-      <select class="banscope ${sc==='sonarr'?'s':sc==='radarr'?'r':''}"
-        title="which arrs this ban is pushed to" onchange="banScope(${r.id},this.value)">
-        <option value=""${sc===''?' selected':''}>both</option>
-        <option value="sonarr"${sc==='sonarr'?' selected':''}>Sonarr</option>
-        <option value="radarr"${sc==='radarr'?' selected':''}>Radarr</option></select>
-      <span class="dim" style="text-align:right">${r.hits>1?fmt(r.hits)+'×':''}</span>
-      <span class="dim" style="white-space:nowrap"
-        title="added by ${esc(r.added_by)} ${banWhen(r.added_at)}">${d}</span>
-      <a href="#" onclick="banEnable(${r.id},${r.enabled?0:1});return false">${
-        r.enabled?'off':'on'}</a>
-      <a href="#" style="color:var(--bad,#e05252)"
-         onclick="banRemove(${r.id});return false" title="forget it">×</a>
-    </div>`;
+  const on=_banSel.has(r.id), open=_banOpen.has(r.id), sc=r.arrs||'';
+  return `<tr class="${on?'sel':''}${r.enabled?'':' off'}">
+    <td class="l"><input type="checkbox" ${on?'checked':''} onclick="banToggle(${r.id},event)"></td>
+    <td class="c"><span class="pill ${r.kind==='group'?'p-warn':'p-dim'}">${r.kind}</span></td>
+    <td class="l" style="cursor:pointer" title="${esc(r.value)}" onclick="banOpen(${r.id},event)"
+      ><span class="actcaret">${open?'▾':'▸'}</span><span class="mono">${esc(r.value)}</span>
+      ${r.why?`<div class="dim" style="font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-left:14px">${esc(r.why)}</div>`:''}</td>
+    <td class="c">${banScopeSel(sc,`title="which arrs this ban is pushed to" onchange="banScope(${r.id},this.value)"`)}</td>
+    <td class="c mono dim" style="font-variant-numeric:tabular-nums">${r.hits>1?fmt(r.hits)+'×':''}</td>
+    <td class="c dim" style="font-size:10.5px" title="${esc((r.added_by||'')+' · '+banWhenFull(r.added_at))}">${r.added_at?ago(r.added_at):''}</td>
+    <td class="r askhost"><button class="rmb" onclick="banEnable(${r.id},${r.enabled?0:1})"
+        title="${r.enabled?'Keep the row, stop pushing it':'Push it to the arrs again'}">${r.enabled?'off':'on'}</button>
+      <button class="rmb bad" onclick="banRemove(${r.id})" title="Forget it entirely">×</button></td>
+  </tr>${open?`<tr class="det" id="bandet-${r.id}"><td colspan="7" style="padding:0;border-bottom:1px solid var(--line)">${banDetail(r)}</td></tr>`:''}`;
 }
-function banRowsHtml(){
-  const rows=(_banRb&&_banRb.rows)||[];
-  return rows.length?banSorted(rows).map(banRowHtml).join('')
-    :'<div class="dim" style="padding:8px 10px;font-size:11px">nothing banned yet — the first rejection nuarr makes will appear here</div>';
+function banSelBar(){
+  const ids=banSelIds(), n=ids.length;
+  if(!n) return '';
+  const rows=((_banRb&&_banRb.rows)||[]).filter(r=>_banSel.has(r.id));
+  const off=rows.filter(r=>!r.enabled).length, onn=n-off;
+  return `<div class="banselbar" id="banSelBar">
+    <b style="font-size:11.5px;color:#6fb0ff">${fmt(n)} selected</b>
+    ${onn?`<button class="rmb" onclick="banBulk('off',this)" title="Keep the rows, stop pushing them">Switch off ${fmt(onn)}</button>`:''}
+    ${off?`<button class="rmb" onclick="banBulk('on',this)" title="Push them to the arrs again">Switch on ${fmt(off)}</button>`:''}
+    <span style="display:inline-flex;gap:4px;align-items:center">
+      <span class="dim" style="font-size:10.5px">push to</span>
+      ${banScopeSel('',`id="banBulkScope" style="font-size:10.5px"`)}
+      <button class="rmb" onclick="banBulk('scope',this)">Set on ${fmt(n)}</button></span>
+    <button class="rmb bad" onclick="banBulk('remove',this)" title="Forget them entirely - not reversible">Forget ${fmt(n)}</button>
+    <button class="rmb" onclick="banClearSel()">Clear</button>
+    <span class="dim" style="font-size:10.5px">shift-click to take a range</span>
+  </div>`;
+}
+function banTableHtml(){
+  const rows=banRows();
+  const allOn=rows.length>0&&banSelIds().length===rows.length;
+  const th=(k,t,cls,tip)=>`<th class="${cls}" onclick="banSortBy('${k}')" title="${esc(tip||('Sort by '+t))}">${t} ${banMark(_banSort,k)}</th>`;
+  if(!rows.length) return `<div class="dim" style="padding:8px 10px;font-size:11px">nothing banned yet — the first rejection nuarr makes will appear here</div>`;
+  return `<div class="rowbox"><table class="sktbl bantbl" style="width:100%;font-size:11.5px;table-layout:fixed">
+    <colgroup><col style="width:24px"><col style="width:58px"><col style="width:auto"><col style="width:66px">
+      <col style="width:38px"><col style="width:62px"><col style="width:92px"></colgroup>
+    <thead><tr class="dim" style="font-size:10.5px">
+      <th class="l" onclick="event.stopPropagation()"><input type="checkbox" ${allOn?'checked':''} title="Select every row" onclick="banSelAll(this.checked)"></th>
+      ${th('kind','type','c','Sort by type: groups, then terms, then releases')}
+      ${th('value','name · reason','l','Sort by name; click the name to open the row')}
+      ${th('arrs','apps','c','Which arrs the ban is pushed to')}
+      ${th('hits','hits','c','How many times nuarr rejected this again after banning it')}
+      ${th('added','added','c','When it was added; hover for who')}
+      <th class="r">actions</th>
+    </tr></thead>
+    <tbody>${rows.map(banRowHtml).join('')}</tbody></table></div>`;
+}
+function banPaintList(){
+  const set=(id,h)=>{ const e=document.getElementById(id); if(e) e.innerHTML=h; };
+  set('banSel', banSelBar());
+  set('banTable', banTableHtml());
+}
+function banToggle(id, ev){
+  const rows=banRows(), i=rows.findIndex(r=>r.id===id);
+  if(ev && ev.shiftKey && _banLast!==null && i>=0){
+    const a=Math.min(i,_banLast), b=Math.max(i,_banLast), on=!_banSel.has(id);
+    for(let k=a;k<=b;k++){ if(on) _banSel.add(rows[k].id); else _banSel.delete(rows[k].id); }
+  }else{ if(_banSel.has(id)) _banSel.delete(id); else _banSel.add(id); }
+  if(i>=0) _banLast=i;
+  banPaintList();
+}
+function banSelAll(on){ if(on) banRows().forEach(r=>_banSel.add(r.id)); else _banSel.clear(); _banLast=null; banPaintList(); }
+function banClearSel(){ _banSel.clear(); _banLast=null; banPaintList(); }
+function banOpen(id, ev){
+  if(ev) ev.stopPropagation();
+  if(_banOpen.has(id)) _banOpen.delete(id); else _banOpen.add(id);
+  banPaintList();
+  if(_banOpen.has(id)){ const d=document.getElementById('bandet-'+id); if(d) d.scrollIntoView({block:'nearest'}); }
 }
 function banSortBy(k){
   if(_banSort.k===k) _banSort.d=-_banSort.d;
   else _banSort={k, d:(k==='hits'||k==='added')?-1:1};
-  const h=document.getElementById('banHead'), b=document.getElementById('banRows');
-  if(h) h.innerHTML=banHeadHtml();
-  if(b) b.innerHTML=banRowsHtml();
+  banPaintList();
 }
 function banCountsHtml(rb){
   const c=rb.counts||{};
@@ -45728,54 +45816,108 @@ async function banSyncPoll(){
   if(busy){ _banBusy=true; _banPollT=setTimeout(banSyncPoll, 400); }
   else if(_banBusy){ _banBusy=false; banRefresh(true); }
 }
+// ------------------------------------------------------ groups on strike
 // STRIKES WITH THEIR EVIDENCE. "ADE 2/3" said a group was close to a ban and
-// nothing about why; each row now carries what it was rejected for and the
-// releases that earned the strikes, and can be banned early or forgiven.
-function banStrikesHtml(rb){
-  const max=rb.group_strikes||3;
-  const xs=(rb.strikes||[]).filter(x=>!x.banned);
-  if(!xs.length) return '';
-  const pips=n=>`<span style="color:#e3b341;letter-spacing:1px">${
-    '●'.repeat(Math.min(n,max))}</span><span class="dim" style="letter-spacing:1px">${
-    '○'.repeat(Math.max(0,max-n))}</span>`;
-  const rel=x=>{
-    const r=x.releases||[];
-    if(!r.length) return '';
-    const all=r.map(y=>y.value+(y.why?' — '+y.why:'')).join('\n');
-    return `<div style="margin-top:2px;font-size:10px" title="${esc(all)}">${
-      r.slice(0,3).map(y=>`<div class="mono" style="overflow:hidden;text-overflow:ellipsis;
-        white-space:nowrap;opacity:.85">↳ ${esc(y.value)}</div>`).join('')}${
-      r.length>3?`<div class="dim">+${r.length-3} more — hover for all</div>`:''}</div>`;
-  };
-  return `<div style="margin-top:10px">
-    <div style="font-size:11px;font-weight:600">Groups on strike (${xs.length})
-      <span class="dim" style="font-weight:400"> — a strike is a release from this
-      group that nuarr downloaded and had to reject; at ${max} the group is banned
-      automatically.</span></div>
-    <div style="margin-top:5px;max-height:260px;overflow:auto;border:1px solid var(--line);
-         border-radius:6px;background:rgba(255,255,255,.02)">
-      ${xs.map((x,i)=>`<div style="padding:6px 10px;font-size:11px;
-          ${i?'border-top:1px solid var(--line)':''}">
-        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-          <b class="mono">${esc(x.grp)}</b>
-          <span title="${x.n} of ${max} strikes">${pips(x.n)}
-            <span class="dim">${x.n}/${max}</span></span>
-          <span class="dim">last ${banWhen(x.last)}</span>
-          <span style="margin-left:auto;display:flex;gap:5px;align-items:center">
-            <select id="bstsc-${i}" class="banscope" style="width:auto">
-              <option value="">both</option><option value="sonarr">Sonarr</option>
-              <option value="radarr">Radarr</option></select>
-            <button style="font-size:10px;padding:1px 7px"
-              onclick="banStrike('${jsq(x.grp)}','ban',${i})">Ban now</button>
-            <a href="#" class="dim" title="clear its strikes; its banned releases stay banned"
-              onclick="banStrike('${jsq(x.grp)}','clear',${i});return false">forgive</a>
-          </span>
-        </div>
-        ${x.why?`<div class="dim" style="overflow-wrap:anywhere;margin-top:1px">${esc(x.why)}</div>`:''}
-        ${rel(x)}
-      </div>`).join('')}
-    </div></div>`;
+// nothing about why; the open row carries what it was rejected for and the
+// releases that earned the strikes, and a selection can be banned early or
+// forgiven in one go.
+function bstRows(){
+  const max=(_banRb&&_banRb.group_strikes)||3;
+  const xs=((_banRb&&_banRb.strikes)||[]).filter(x=>!x.banned);
+  const k=_bstSort.k, d=_bstSort.d;
+  const byName=(a,b)=>String(a.grp).localeCompare(String(b.grp),undefined,{sensitivity:'base'});
+  const v=x=> k==='n'?x.n : k==='last'?(x.last||0) : k==='why'?(x.why||'').toLowerCase() : k==='rel'?(x.releases||[]).length : 0;
+  return xs.sort((a,b)=>{ if(k==='grp') return byName(a,b)*d; const x=v(a),y=v(b);
+    const c=(typeof x==='string')?x.localeCompare(y):(x-y); return c?c*d:byName(a,b); });
 }
+function bstSelIds(){ const live=new Set(bstRows().map(x=>x.grp)); return [..._bstSel].filter(g=>live.has(g)); }
+function bstDetail(x){
+  const r=x.releases||[];
+  return `<div style="font-size:11px;padding:6px 10px 8px 34px;white-space:normal">
+    <div style="display:flex;gap:8px;margin:2px 0"><span class="dim" style="flex:none;width:96px;text-align:right">last reason</span><span>${esc(x.why||'')}</span></div>
+    <div style="display:flex;gap:8px;margin:2px 0"><span class="dim" style="flex:none;width:96px;text-align:right">last strike</span><span>${esc(banWhenFull(x.last))}</span></div>
+    <div style="display:flex;gap:8px;margin:2px 0"><span class="dim" style="flex:none;width:96px;text-align:right">rejected</span>
+      <span style="min-width:0">${r.length?r.map(y=>`<div class="mono" style="overflow-wrap:anywhere">${esc(y.value)}${
+        y.why?` <span class="dim" style="font-family:inherit">— ${esc(y.why)}</span>`:''}${
+        y.added_at?` <span class="dim" style="font-family:inherit;font-size:10px">${ago(y.added_at)}</span>`:''}</div>`).join('')
+        :'<span class="dim">no banned release on file for this group — the strikes came from releases banned under another name</span>'}</span></div>
+  </div>`;
+}
+function bstRowHtml(x,i){
+  const max=(_banRb&&_banRb.group_strikes)||3, on=_bstSel.has(x.grp), open=_bstOpen.has(x.grp);
+  const pips=`<span style="color:#e3b341;letter-spacing:1px">${'●'.repeat(Math.min(x.n,max))}</span><span class="dim" style="letter-spacing:1px">${'○'.repeat(Math.max(0,max-x.n))}</span>`;
+  const g=jsq(x.grp);
+  return `<tr class="${on?'sel':''}">
+    <td class="l"><input type="checkbox" ${on?'checked':''} onclick="bstToggle('${g}',event)"></td>
+    <td class="l" style="cursor:pointer" onclick="bstOpen('${g}',event)"
+      ><span class="actcaret">${open?'▾':'▸'}</span><b class="mono">${esc(x.grp)}</b>
+      ${x.why?`<div class="dim" style="font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-left:14px">${esc(x.why)}</div>`:''}</td>
+    <td class="c" title="${x.n} of ${max}">${pips} <span class="dim">${x.n}/${max}</span></td>
+    <td class="c dim">${(x.releases||[]).length||''}</td>
+    <td class="c dim" style="font-size:10.5px" title="${esc(banWhenFull(x.last))}">${x.last?ago(x.last):''}</td>
+    <td class="r askhost">${banScopeSel('',`id="bstsc-${i}"`)}
+      <button class="rmb" onclick="banStrike('${g}','ban',${i})" title="Ban the group now, without waiting for strike ${max}">Ban now</button>
+      <button class="rmb" onclick="banStrike('${g}','clear',${i})" title="Clear its strikes; the releases already banned stay banned">forgive</button></td>
+  </tr>${open?`<tr class="det" id="bstdet-${esc(x.grp)}"><td colspan="6" style="padding:0;border-bottom:1px solid var(--line)">${bstDetail(x)}</td></tr>`:''}`;
+}
+function bstSelBar(){
+  const n=bstSelIds().length;
+  if(!n) return '';
+  return `<div class="banselbar">
+    <b style="font-size:11.5px;color:#e3b341">${fmt(n)} group${n===1?'':'s'} selected</b>
+    <span style="display:inline-flex;gap:4px;align-items:center">${banScopeSel('',`id="bstBulkScope" style="font-size:10.5px"`)}
+      <button class="rmb" onclick="bstBulk('ban',this)" title="Ban them now, without waiting for the third strike">Ban ${fmt(n)} now</button></span>
+    <button class="rmb" onclick="bstBulk('clear',this)" title="Clear their strikes; releases already banned stay banned">Forgive ${fmt(n)}</button>
+    <button class="rmb" onclick="_bstSel.clear();_bstLast=null;bstPaint()">Clear</button>
+    <span class="dim" style="font-size:10.5px">shift-click to take a range</span>
+  </div>`;
+}
+function bstTableHtml(){
+  const rows=bstRows(), max=(_banRb&&_banRb.group_strikes)||3;
+  if(!rows.length) return '';
+  const allOn=bstSelIds().length===rows.length;
+  const th=(k,t,cls,tip)=>`<th class="${cls}" onclick="bstSortBy('${k}')" title="${esc(tip||('Sort by '+t))}">${t} ${banMark(_bstSort,k)}</th>`;
+  return `<div style="margin-top:10px">
+    <div style="font-size:11px;font-weight:600">Groups on strike (${rows.length})
+      <span class="dim" style="font-weight:400"> — a strike is a release from this group that nuarr downloaded and had to reject; at ${max} the group is banned automatically.</span></div>
+    <div id="bstSel">${bstSelBar()}</div>
+    <div class="rowbox" style="max-height:260px"><table class="sktbl bantbl" style="width:100%;font-size:11.5px;table-layout:fixed">
+      <colgroup><col style="width:24px"><col style="width:auto"><col style="width:84px"><col style="width:44px"><col style="width:62px"><col style="width:188px"></colgroup>
+      <thead><tr class="dim" style="font-size:10.5px">
+        <th class="l" onclick="event.stopPropagation()"><input type="checkbox" ${allOn?'checked':''} title="Select every group" onclick="bstSelAll(this.checked)"></th>
+        ${th('grp','group · last reason','l','Sort by group; click the name to open the row')}
+        ${th('n','strikes','c','Closest to a ban first')}
+        ${th('rel','rel.','c','Banned releases on file for this group')}
+        ${th('last','last','c','When the latest strike landed')}
+        <th class="r">actions</th>
+      </tr></thead>
+      <tbody>${rows.map(bstRowHtml).join('')}</tbody></table></div></div>`;
+}
+function bstPaint(){ const e=document.getElementById('banStrikes'); if(e) e.innerHTML=bstTableHtml(); }
+function bstToggle(g, ev){
+  const rows=bstRows(), i=rows.findIndex(x=>x.grp===g);
+  if(ev && ev.shiftKey && _bstLast!==null && i>=0){
+    const a=Math.min(i,_bstLast), b=Math.max(i,_bstLast), on=!_bstSel.has(g);
+    for(let k=a;k<=b;k++){ if(on) _bstSel.add(rows[k].grp); else _bstSel.delete(rows[k].grp); }
+  }else{ if(_bstSel.has(g)) _bstSel.delete(g); else _bstSel.add(g); }
+  if(i>=0) _bstLast=i;
+  bstPaint();
+}
+function bstSelAll(on){ if(on) bstRows().forEach(x=>_bstSel.add(x.grp)); else _bstSel.clear(); _bstLast=null; bstPaint(); }
+function bstOpen(g, ev){ if(ev) ev.stopPropagation(); if(_bstOpen.has(g)) _bstOpen.delete(g); else _bstOpen.add(g); bstPaint(); }
+function bstSortBy(k){ if(_bstSort.k===k) _bstSort.d=-_bstSort.d; else _bstSort={k, d:(k==='n'||k==='last'||k==='rel')?-1:1}; bstPaint(); }
+async function bstBulk(action, btn){
+  const ids=bstSelIds(); if(!ids.length) return;
+  if(action==='clear'&&!confirm(`Forgive ${ids.length} group(s)? Their strikes are cleared; the releases already banned stay banned.`)) return;
+  const sc=document.getElementById('bstBulkScope');
+  if(btn) btn.classList.add('spin');
+  try{ await fetch('/api/arrban/strike?grp='+encodeURIComponent(ids.join('\n'))+'&action='+action
+      +'&arrs='+encodeURIComponent(sc?sc.value:''),{method:'POST'}); }catch(e){}
+  banSay(action==='clear'?`<span class="dim">${ids.length} group(s) forgiven</span>`:`<span class="ok">${ids.length} group(s) banned</span>`);
+  _bstSel.clear(); _bstLast=null;
+  banRefresh();
+}
+// ------------------------------------------------------------ the card
 function banList(rb){
   banStyle();
   _banRb=rb;
@@ -45808,18 +45950,13 @@ function banList(rb){
       and one tag.</div>
     <div id="banSync" style="font-size:11px;margin:0 0 6px;padding:6px 10px;
          border:1px solid var(--line);border-radius:6px">${banSyncHtml(rb.sync)}</div>
-    <div style="max-height:320px;overflow:auto;border:1px solid var(--line);
-         border-radius:6px;background:rgba(255,255,255,.02)">
-      <div id="banHead" class="dim banhd" style="display:grid;grid-template-columns:${BAN_GRID};
-        gap:10px;padding:5px 10px;font-size:10px;text-transform:uppercase;letter-spacing:.04em;
-        position:sticky;top:0;z-index:1;background:var(--panel,#161b22)">${banHeadHtml()}</div>
-      <div id="banRows">${banRowsHtml()}</div>
-    </div>
-    <div id="banStrikes">${banStrikesHtml(rb)}</div>
+    <div id="banSel">${banSelBar()}</div>
+    <div id="banTable">${banTableHtml()}</div>
+    <div id="banStrikes">${bstTableHtml()}</div>
     <span id="banmsg" class="dim" style="font-size:11px"></span>
   </div>`;
 }
-// Redraw the list, counts and strikes from the server without rebuilding the
+// Redraw the lists, counts and strikes from the server without rebuilding the
 // tab. `quiet` skips the push poll (used when a push has just finished).
 async function banRefresh(quiet){
   let d;
@@ -45828,8 +45965,8 @@ async function banRefresh(quiet){
   _banRb=rb;
   const set=(id,h)=>{ const e=document.getElementById(id); if(e) e.innerHTML=h; };
   set('banCounts', banCountsHtml(rb));
-  set('banRows', banRowsHtml());
-  set('banStrikes', banStrikesHtml(rb));
+  banPaintList();
+  bstPaint();
   if(!quiet) banSyncPoll();
 }
 function banSay(html){ const m=document.getElementById('banmsg'); if(m) m.innerHTML=html; }
@@ -45867,6 +46004,7 @@ async function banAdd(){
 }
 async function banRemove(id){
   try{ await fetch('/api/arrban/remove?id='+id,{method:'POST'}); }catch(e){}
+  _banSel.delete(id); _banOpen.delete(id);
   banRefresh();
 }
 async function banEnable(id,on){
@@ -45875,6 +46013,19 @@ async function banEnable(id,on){
 }
 async function banScope(id,arrs){
   try{ await fetch('/api/arrban/scope?id='+id+'&arrs='+encodeURIComponent(arrs),{method:'POST'}); }catch(e){}
+  banRefresh();
+}
+async function banBulk(action, btn){
+  const ids=banSelIds(); if(!ids.length) return;
+  if(action==='remove'&&!confirm(`Forget ${ids.length} ban(s)? They are removed from the list and from both arrs on the next push. Not reversible.`)) return;
+  const sc=document.getElementById('banBulkScope');
+  if(btn) btn.classList.add('spin');
+  let r={};
+  try{ r=await (await fetch('/api/arrban/bulk?action='+action+'&arrs='+encodeURIComponent(sc?sc.value:''),
+      {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({ids})})).json(); }
+  catch(e){ r={n:0}; }
+  banSay(`<span class="ok">${fmt(r.n||0)} row(s) ${action==='remove'?'forgotten':action==='scope'?'re-scoped':'switched '+action}</span>`);
+  if(action==='remove'){ ids.forEach(i=>{ _banSel.delete(i); _banOpen.delete(i); }); }
   banRefresh();
 }
 async function banStrike(grp,action,i){
