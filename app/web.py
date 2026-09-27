@@ -30711,9 +30711,22 @@ function dpPaint(disks){
     const lo0=Math.max(0,Math.floor((Math.min(lo,avg,...stops.filter(v=>v>0))-3)/2)*2);
     const hi0=Math.min(100,Math.ceil((Math.max(hi,avg,...stops)+3)/2)*2);
     const X=v=>Math.max(0,Math.min(100,(v-lo0)/(hi0-lo0)*100));
+    // THE SAME COLOUR RULE AS FILES PER POOL DISK. Erik: "make the used %
+    // color follow the same logic as in pic 2". That panel colours a disk's
+    // fill by its distance from the pool MEDIAN with a tenth-of-a-point
+    // floor - amber fuller, blue emptier, grey within - and red past 90%.
+    // This one used a whole-point band around the mean, so on a pool held
+    // within half a point every row was grey while the other panel showed
+    // which half it was on. "vs avg" keeps the one-point band: that column
+    // is the balancer's tolerance, not the disk's tint.
+    const psSorted=[...ps].sort((a,b)=>a-b), hN=psSorted.length>>1;
+    const midFill=psSorted.length ? (psSorted.length%2 ? psSorted[hN] : (psSorted[hN-1]+psSorted[hN])/2) : null;
+    const tint=v=> v>=90 ? 'var(--bad)'
+      : (midFill==null || Math.abs(v-midFill)<0.1) ? '#8b98a6'
+      : (v>midFill ? 'var(--warn)' : '#79c0ff');
     const trows=sized.map(x=>{
       const v=pct(x), dv=v-avg;
-      const col = Math.abs(dv)<=TOL ? '#8b98a6' : (dv>0?'var(--warn)':'#79c0ff');
+      const col = tint(v);
       const t=TG[x.pool_disk]||null;
       // TWO PLANS PER DISK, ONE NUMBER. DrivePool keeps the un-duplicated
       // and the duplicated bytes as separate moves (UnprotectedMoveDelta and
