@@ -2862,14 +2862,49 @@ def _arrban_snapshot() -> dict:
 
 
 @app.post("/api/arrban/add")
-def api_arrban_add(kind: str = "release", value: str = "", why: str = ""):
-    """Ban a release name or a group by hand. Synced within a minute."""
+async def api_arrban_add(kind: str = "release", value: str = "", why: str = "",
+                   arrs: str = ""):
+    """Ban a release name, group or term by hand, for both arrs or one.
+    Pushed straight away - the card shows the push as it happens."""
     from . import arrban
-    r = arrban.add(kind, value, why or "added by hand", "you", by="you")
+    r = arrban.add(kind, value, why or "added by hand", "you", by="you",
+                   arrs=arrs)
     if r.get("ok"):
-        joblog.log(f"release ban added by hand: {r['kind']} {r['value']!r}",
-                   "info")
-        arrban.kick()
+        joblog.log(f"release ban added by hand: {r['kind']} {r['value']!r}"
+                   f" ({arrs or 'both arrs'})", "info")
+        arrban.kick(arrban.SYNC_HAND_S)
+    return r
+
+
+@app.get("/api/arrban/status")
+def api_arrban_status():
+    """The push to the arrs: queued / pushing (per arr, per step) / done."""
+    from . import arrban
+    return arrban.sync_status()
+
+
+@app.post("/api/arrban/scope")
+async def api_arrban_scope(id: int, arrs: str = ""):
+    """Both arrs ('' / both), or just sonarr / radarr."""
+    from . import arrban
+    ok = arrban.set_scope(int(id), arrs)
+    if ok:
+        arrban.kick(arrban.SYNC_HAND_S)
+    return {"ok": ok}
+
+
+@app.post("/api/arrban/strike")
+async def api_arrban_strike(grp: str, action: str = "ban", arrs: str = ""):
+    """A group on strikes: ban it now, or forgive it (clear its strikes)."""
+    from . import arrban
+    if action == "clear":
+        ok = arrban.clear_strikes(grp)
+        joblog.log(f"release bans: strikes against {grp!r} cleared by hand", "info")
+        return {"ok": ok}
+    r = arrban.add("group", grp, "banned by hand while on strikes", "you",
+                   by="you", arrs=arrs)
+    if r.get("ok"):
+        arrban.kick(arrban.SYNC_HAND_S)
     return r
 
 
@@ -2884,25 +2919,25 @@ async def api_arrban_import(remove: int = 1, as_terms: int = 1):
     r = await arrban.import_release_profiles(delete_after=bool(remove),
                                              as_terms=bool(as_terms))
     if r.get("added") or r.get("deleted"):
-        await arrban.sync()
+        arrban.kick(arrban.SYNC_HAND_S)
     return r
 
 
 @app.post("/api/arrban/remove")
-def api_arrban_remove(id: int):
+async def api_arrban_remove(id: int):
     from . import arrban
     ok = arrban.remove(int(id))
     if ok:
-        arrban.kick()
+        arrban.kick(arrban.SYNC_HAND_S)
     return {"ok": ok}
 
 
 @app.post("/api/arrban/enable")
-def api_arrban_enable(id: int, on: int = 1):
+async def api_arrban_enable(id: int, on: int = 1):
     from . import arrban
     ok = arrban.set_enabled(int(id), bool(on))
     if ok:
-        arrban.kick()
+        arrban.kick(arrban.SYNC_HAND_S)
     return {"ok": ok, "on": bool(on)}
 
 
@@ -3013,7 +3048,9 @@ async def api_arrguard_run(job: str):
         return {"result": await arrguard.run_trash()}
     if job == "release_ban":
         from . import arrban
-        return {"result": await arrban.sync(force=True)}
+        arrban.STATS["dirty"] = True
+        arrban.kick(0.1)
+        return {"result": "pushing"}
     raise HTTPException(400, f"job must be one of {', '.join(_ARR_JOBS)}")
 
 
@@ -45542,67 +45579,260 @@ poll(aiLoad, 1500, 'aiCard');
 // THE LIST IS THE STATE. Every row nuarr learned or you typed, with the reason
 // it is there and how many times it has been hit; a row can be switched off
 // without being forgotten, so "why is this back" always has an answer.
-function banList(rb){
-  const rows=(rb.rows||[]);
-  const c=rb.counts||{};
-  const when=t=>t?new Date(t*1000).toLocaleDateString():'';
-  // A GRID, NOT A ROW OF GUESSES. Every column was a fixed pixel width
-  // chosen by eye: the reason got 150px and read "no eng subtitles -
-  // carries no ...", and "nuarr 9/21/2026" wrapped onto two lines in 62px.
-  // The two columns that hold sentences share what is left over, the rest
-  // are sized to their longest real content, and the reason is allowed to
-  // wrap to a second line rather than being cut.
-  const row=r=>`<div style="display:grid;align-items:baseline;
-      grid-template-columns:54px minmax(0,1.35fr) minmax(0,1fr) 40px 124px 26px 16px;
-      gap:10px;padding:4px 10px;font-size:11px;border-top:1px solid var(--line);
+//
+// Erik, on removing a term: "it took a while to update" - with nothing on
+// the card to say whether the change was coming. Three things answer that:
+// a change made here is pushed within two seconds instead of joining the
+// 45-second batch nuarr uses for its own rejections; the push shows per arr,
+// per step, as it happens; and the list redraws in place, so the card does
+// not blink back to the top of the page after every click.
+let _banRb=null, _banSort={k:'kind',d:1}, _banPollT=null, _banBusy=false;
+const BAN_KIND_ORDER={group:0, term:1, release:2};
+const BAN_GRID='50px minmax(0,1fr) 72px 34px 70px 22px 12px';
+function banStyle(){
+  if(document.getElementById('banStyle')) return;
+  const st=document.createElement('style'); st.id='banStyle';
+  st.textContent=`@keyframes banMove{from{background-position:0 0}to{background-position:28px 0}}
+    @keyframes banSpin{to{transform:rotate(360deg)}}
+    .banbar{height:6px;border-radius:3px;background:var(--line);overflow:hidden;flex:1}
+    .banbar>i{display:block;height:100%;border-radius:3px;transition:width .5s ease;
+      background:repeating-linear-gradient(135deg,#4f8fd6 0 7px,#3b78c0 7px 14px);
+      background-size:28px 100%;animation:banMove .8s linear infinite}
+    .banbar.done>i{background:#3fb950;animation:none}
+    .banbar.bad>i{background:var(--bad,#e05252);animation:none}
+    .bansp{display:inline-block;width:10px;height:10px;border-radius:50%;
+      border:2px solid #6fb0ff;border-right-color:transparent;
+      animation:banSpin .8s linear infinite;vertical-align:-1px}
+    .banhd span{cursor:pointer;user-select:none;white-space:nowrap}
+    .banhd span:hover{color:var(--fg,#e6edf3)}
+    .banscope{font-size:10px;padding:0 2px;background:transparent;
+      border:1px solid var(--line);border-radius:4px;color:inherit;width:100%}
+    .banscope.s{color:#6fb0ff}.banscope.r{color:#e3b341}`;
+  document.head.appendChild(st);
+}
+function banWhen(t){ return t?new Date(t*1000).toLocaleDateString():''; }
+function banSorted(rows){
+  const k=_banSort.k, d=_banSort.d;
+  const byName=(a,b)=>String(a.value).localeCompare(String(b.value),undefined,
+    {sensitivity:'base', numeric:true});
+  const v=r=> k==='kind'?(BAN_KIND_ORDER[r.kind]??9)
+    : k==='why'?(r.why||'').toLowerCase()
+    : k==='arrs'?({'':0,sonarr:1,radarr:2}[r.arrs||'']??0)
+    : k==='hits'?(r.hits||0)
+    : k==='added'?(r.added_at||0)
+    : k==='on'?(r.enabled?0:1) : 0;
+  return [...rows].sort((a,b)=>{
+    // THE NAME IS ALWAYS THE TIE-BREAK, and always A to Z, so a column sort
+    // never leaves its groups in a shuffled order.
+    if(k==='value') return byName(a,b)*d;
+    const x=v(a), y=v(b);
+    const c=(typeof x==='string')?x.localeCompare(y):(x-y);
+    return c ? c*d : byName(a,b);
+  });
+}
+function banHeadHtml(){
+  const cols=[['kind','Type'],['value','Name · reason'],['arrs','Apps'],
+              ['hits','Hits'],['added','Added'],['on','On'],['','']];
+  return cols.map(([k,t])=>{
+    if(!k) return '<span></span>';
+    const on=_banSort.k===k, ar=on?(_banSort.d>0?' ▲':' ▼'):'';
+    return `<span onclick="banSortBy('${k}')" title="sort by ${t.toLowerCase()}"
+      style="${on?'color:var(--fg,#e6edf3)':''};${k==='hits'?'text-align:right':''}">${t}${ar}</span>`;
+  }).join('');
+}
+function banRowHtml(r){
+  const sc=r.arrs||'';
+  const d=r.added_at?new Date(r.added_at*1000).toLocaleDateString(undefined,
+    {month:'numeric',day:'numeric',year:'2-digit'}):'';
+  return `<div style="display:grid;align-items:center;grid-template-columns:${BAN_GRID};
+      gap:8px;padding:4px 10px;font-size:11px;border-top:1px solid var(--line);
       ${r.enabled?'':'opacity:.45'}">
       <span class="pill ${r.kind==='group'?'p-warn':'p-dim'}"
         style="text-align:center">${r.kind}</span>
-      <span class="mono" style="min-width:0;overflow:hidden;text-overflow:ellipsis;
-        white-space:nowrap" title="${esc(r.value)}">${esc(r.value)}</span>
-      <span class="dim" style="min-width:0;overflow-wrap:anywhere"
-        title="${esc(r.why||'')}">${esc(r.why||'')}</span>
+      <span style="min-width:0">
+        <div class="mono" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+          title="${esc(r.value)}">${esc(r.value)}</div>
+        ${r.why?`<div class="dim" style="font-size:10px;overflow:hidden;text-overflow:ellipsis;
+          white-space:nowrap" title="${esc(r.why)}">${esc(r.why)}</div>`:''}
+      </span>
+      <select class="banscope ${sc==='sonarr'?'s':sc==='radarr'?'r':''}"
+        title="which arrs this ban is pushed to" onchange="banScope(${r.id},this.value)">
+        <option value=""${sc===''?' selected':''}>both</option>
+        <option value="sonarr"${sc==='sonarr'?' selected':''}>Sonarr</option>
+        <option value="radarr"${sc==='radarr'?' selected':''}>Radarr</option></select>
       <span class="dim" style="text-align:right">${r.hits>1?fmt(r.hits)+'×':''}</span>
-      <span class="dim" style="white-space:nowrap">${esc(r.added_by)} ${when(r.added_at)}</span>
+      <span class="dim" style="white-space:nowrap"
+        title="added by ${esc(r.added_by)} ${banWhen(r.added_at)}">${d}</span>
       <a href="#" onclick="banEnable(${r.id},${r.enabled?0:1});return false">${
         r.enabled?'off':'on'}</a>
       <a href="#" style="color:var(--bad,#e05252)"
          onclick="banRemove(${r.id});return false" title="forget it">×</a>
     </div>`;
-  const strikes=(rb.strikes||[]).filter(x=>x.n<(rb.group_strikes||3));
+}
+function banRowsHtml(){
+  const rows=(_banRb&&_banRb.rows)||[];
+  return rows.length?banSorted(rows).map(banRowHtml).join('')
+    :'<div class="dim" style="padding:8px 10px;font-size:11px">nothing banned yet — the first rejection nuarr makes will appear here</div>';
+}
+function banSortBy(k){
+  if(_banSort.k===k) _banSort.d=-_banSort.d;
+  else _banSort={k, d:(k==='hits'||k==='added')?-1:1};
+  const h=document.getElementById('banHead'), b=document.getElementById('banRows');
+  if(h) h.innerHTML=banHeadHtml();
+  if(b) b.innerHTML=banRowsHtml();
+}
+function banCountsHtml(rb){
+  const c=rb.counts||{};
+  const n=(x,w)=>`${fmt(x||0)} ${w}${(x||0)===1?'':'s'}`;
+  return `Banned (${n(c.release,'release')}, ${n(c.group,'group')}, ${n(c.term,'term')}${
+    c.off?`, ${fmt(c.off)} switched off`:''})`;
+}
+// THE PUSH, AS IT HAPPENS. Formats are the first half of each arr's bar and
+// the profile scores the second, because that is the order the arr needs
+// them in; a step that found nothing to change still counts as done.
+function banSyncHtml(s){
+  if(!s||!s.state||s.state==='idle')
+    return `<span class="dim">no push yet since nuarr started — a change here is pushed to the arrs within 2 seconds</span>`;
+  if(s.state==='queued')
+    return `<span class="bansp"></span> <span>change saved — pushing to the arrs ${
+      (s.in||0)>0.6?'in '+Math.ceil(s.in)+'s':'now'}…</span>`;
+  const arrs=Object.entries(s.arrs||{});
+  const pct=a=> a.step==='done'?100 : a.step==='failed'?100
+    : a.step==='profiles'?50+50*(a.total?a.done/a.total:0)
+    : a.step==='formats'?50*(a.total?a.done/a.total:0) : 4;
+  const stepTxt=a=> a.step==='formats'?`formats ${a.done}/${a.total}`
+    : a.step==='profiles'?`profile scores ${a.done}/${a.total}`
+    : a.step==='done'?esc(a.note||'done') : a.step==='failed'?esc(a.note||'failed')
+    : esc(a.step||'');
+  const bars=arrs.map(([n,a])=>`<div style="display:flex;align-items:center;gap:8px;margin-top:3px">
+      <span style="width:58px;color:${a.kind==='sonarr'?'#6fb0ff':'#e3b341'}">${esc(n)}</span>
+      <div class="banbar ${a.ok===false?'bad':a.step==='done'?'done':''}"><i style="width:${pct(a).toFixed(0)}%"></i></div>
+      <span class="dim" style="width:220px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
+        title="${esc(a.note||'')}">${stepTxt(a)}</span></div>`).join('');
+  if(s.state==='pushing')
+    return `<div><span class="bansp"></span> pushing to the arrs…</div>${bars}`;
+  const at=s.finished?new Date(s.finished*1000).toLocaleTimeString():'';
+  if(s.state==='error')
+    return `<div class="err">push failed at ${at}: ${esc(s.error||'')}</div>${bars}`;
+  return `<div><span class="ok">✓ arrs up to date</span> <span class="dim">· took ${
+    (s.took||0).toFixed(1)}s · ${at}</span></div>${bars}`;
+}
+async function banSyncPoll(){
+  clearTimeout(_banPollT);
+  let s;
+  try{ s=await (await fetch('/api/arrban/status')).json(); }catch(e){ return; }
+  const el=document.getElementById('banSync');
+  if(!el) return;
+  el.innerHTML=banSyncHtml(s);
+  const busy=(s.state==='queued'||s.state==='pushing');
+  if(busy){ _banBusy=true; _banPollT=setTimeout(banSyncPoll, 400); }
+  else if(_banBusy){ _banBusy=false; banRefresh(true); }
+}
+// STRIKES WITH THEIR EVIDENCE. "ADE 2/3" said a group was close to a ban and
+// nothing about why; each row now carries what it was rejected for and the
+// releases that earned the strikes, and can be banned early or forgiven.
+function banStrikesHtml(rb){
+  const max=rb.group_strikes||3;
+  const xs=(rb.strikes||[]).filter(x=>!x.banned);
+  if(!xs.length) return '';
+  const pips=n=>`<span style="color:#e3b341;letter-spacing:1px">${
+    '●'.repeat(Math.min(n,max))}</span><span class="dim" style="letter-spacing:1px">${
+    '○'.repeat(Math.max(0,max-n))}</span>`;
+  const rel=x=>{
+    const r=x.releases||[];
+    if(!r.length) return '';
+    const all=r.map(y=>y.value+(y.why?' — '+y.why:'')).join('\n');
+    return `<div style="margin-top:2px;font-size:10px" title="${esc(all)}">${
+      r.slice(0,3).map(y=>`<div class="mono" style="overflow:hidden;text-overflow:ellipsis;
+        white-space:nowrap;opacity:.85">↳ ${esc(y.value)}</div>`).join('')}${
+      r.length>3?`<div class="dim">+${r.length-3} more — hover for all</div>`:''}</div>`;
+  };
+  return `<div style="margin-top:10px">
+    <div style="font-size:11px;font-weight:600">Groups on strike (${xs.length})
+      <span class="dim" style="font-weight:400"> — a strike is a release from this
+      group that nuarr downloaded and had to reject; at ${max} the group is banned
+      automatically.</span></div>
+    <div style="margin-top:5px;max-height:260px;overflow:auto;border:1px solid var(--line);
+         border-radius:6px;background:rgba(255,255,255,.02)">
+      ${xs.map((x,i)=>`<div style="padding:6px 10px;font-size:11px;
+          ${i?'border-top:1px solid var(--line)':''}">
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          <b class="mono">${esc(x.grp)}</b>
+          <span title="${x.n} of ${max} strikes">${pips(x.n)}
+            <span class="dim">${x.n}/${max}</span></span>
+          <span class="dim">last ${banWhen(x.last)}</span>
+          <span style="margin-left:auto;display:flex;gap:5px;align-items:center">
+            <select id="bstsc-${i}" class="banscope" style="width:auto">
+              <option value="">both</option><option value="sonarr">Sonarr</option>
+              <option value="radarr">Radarr</option></select>
+            <button style="font-size:10px;padding:1px 7px"
+              onclick="banStrike('${jsq(x.grp)}','ban',${i})">Ban now</button>
+            <a href="#" class="dim" title="clear its strikes; its banned releases stay banned"
+              onclick="banStrike('${jsq(x.grp)}','clear',${i});return false">forgive</a>
+          </span>
+        </div>
+        ${x.why?`<div class="dim" style="overflow-wrap:anywhere;margin-top:1px">${esc(x.why)}</div>`:''}
+        ${rel(x)}
+      </div>`).join('')}
+    </div></div>`;
+}
+function banList(rb){
+  banStyle();
+  _banRb=rb;
+  // A PUSH IN PROGRESS WHEN THE TAB OPENS keeps being watched.
+  const st=(rb.sync||{}).state;
+  if(st==='queued'||st==='pushing') setTimeout(banSyncPoll, 50);
   return `<div style="margin-top:8px;border-top:1px solid var(--line);padding-top:8px">
-    <div style="display:flex;gap:10px;align-items:center">
-      <span style="font-size:11px;font-weight:600">Banned (${fmt(c.release||0)} release${
-        (c.release||0)===1?'':'s'}, ${fmt(c.group||0)} group${(c.group||0)===1?'':'s'}, ${
-        fmt(c.term||0)} term${(c.term||0)===1?'':'s'}${
-        c.off?`, ${fmt(c.off)} switched off`:''})</span>
-      <span style="margin-left:auto;display:flex;gap:6px;align-items:center">
+    <div style="display:flex;gap:6px 10px;align-items:center;flex-wrap:wrap">
+      <span id="banCounts" style="font-size:11px;font-weight:600;white-space:nowrap">${banCountsHtml(rb)}</span>
+      <span style="margin-left:auto;display:flex;gap:6px;align-items:center;flex-wrap:wrap">
         <select id="banKind" style="font-size:11px"><option value="release">release</option>
           <option value="group">group</option><option value="term">term</option></select>
         <input id="banValue" style="font-size:11px;width:260px"
+               onkeydown="if(event.key==='Enter')banAdd()"
                placeholder="release name or group, exactly as the indexer spells it">
+        <select id="banArrs" style="font-size:11px" title="which arrs to ban it in">
+          <option value="">both arrs</option><option value="sonarr">Sonarr only</option>
+          <option value="radarr">Radarr only</option></select>
         <button style="font-size:11px" onclick="banAdd()">Ban</button>
       </span>
     </div>
     <div class="dim" style="font-size:11px;margin:3px 0 5px">A <b>release</b> is
       matched however an indexer spells its dots, spaces and dashes; a
       <b>group</b> is matched exactly; a <b>term</b> is matched anywhere in the
-      name, which is what a release profile's "must not contain" did. Pushed to
-      the arrs within a minute of any change, and re-asserted on the timer.
+      name, which is what a release profile's "must not contain" did. A change
+      here is pushed to the arrs within 2 seconds, and re-asserted on the timer.
       <a href="#" onclick="banImport();return false">Take over the arrs'
       release profiles</a> — moves every must-not-contain list here and clears
       it there, so one list covers both apps and every tag rather than one app
       and one tag.</div>
+    <div id="banSync" style="font-size:11px;margin:0 0 6px;padding:6px 10px;
+         border:1px solid var(--line);border-radius:6px">${banSyncHtml(rb.sync)}</div>
     <div style="max-height:320px;overflow:auto;border:1px solid var(--line);
          border-radius:6px;background:rgba(255,255,255,.02)">
-      ${rows.length?rows.map(row).join('')
-        :'<div class="dim" style="padding:8px 10px;font-size:11px">nothing banned yet — the first rejection nuarr makes will appear here</div>'}
+      <div id="banHead" class="dim banhd" style="display:grid;grid-template-columns:${BAN_GRID};
+        gap:10px;padding:5px 10px;font-size:10px;text-transform:uppercase;letter-spacing:.04em;
+        position:sticky;top:0;z-index:1;background:var(--panel,#161b22)">${banHeadHtml()}</div>
+      <div id="banRows">${banRowsHtml()}</div>
     </div>
-    ${strikes.length?`<div class="dim" style="font-size:11px;margin-top:5px">groups on
-      strikes, not yet banned: ${strikes.map(x=>esc(x.grp)+' '+x.n+'/'+(rb.group_strikes||3)).join(' · ')}</div>`:''}
+    <div id="banStrikes">${banStrikesHtml(rb)}</div>
     <span id="banmsg" class="dim" style="font-size:11px"></span>
   </div>`;
 }
+// Redraw the list, counts and strikes from the server without rebuilding the
+// tab. `quiet` skips the push poll (used when a push has just finished).
+async function banRefresh(quiet){
+  let d;
+  try{ d=await (await fetch('/api/arrguard')).json(); }catch(e){ return; }
+  const rb=d.release_ban||{};
+  _banRb=rb;
+  const set=(id,h)=>{ const e=document.getElementById(id); if(e) e.innerHTML=h; };
+  set('banCounts', banCountsHtml(rb));
+  set('banRows', banRowsHtml());
+  set('banStrikes', banStrikesHtml(rb));
+  if(!quiet) banSyncPoll();
+}
+function banSay(html){ const m=document.getElementById('banmsg'); if(m) m.innerHTML=html; }
 async function banImport(){
   if(!confirm('Move every "must not contain" list out of the Sonarr and Radarr '
     +'release profiles and into this list, then clear them there?\n\n'
@@ -45610,35 +45840,51 @@ async function banImport(){
     +'rather than one app and one tag. A release profile that has nothing '
     +'left is removed; one that also has required or preferred terms keeps '
     +'those.')) return;
-  const m=document.getElementById('banmsg');
-  if(m) m.innerHTML='moving…';
+  banSay('moving…');
   let r={};
   try{ r=await (await fetch('/api/arrban/import?remove=1',{method:'POST'})).json(); }
   catch(e){ r={added:0, profiles:[String(e)]}; }
-  if(m) m.innerHTML=`<span class="ok">${fmt(r.added||0)} banned, ${
+  banSay(`<span class="ok">${fmt(r.added||0)} banned, ${
     fmt(r.already||0)} already here</span> <span class="dim">${
-    esc((r.profiles||[]).join(' · '))}</span>`;
-  setTimeout(loadArrsTab, 900);
+    esc((r.profiles||[]).join(' · '))}</span>`);
+  banRefresh();
 }
 async function banAdd(){
-  const k=document.getElementById('banKind'), v=document.getElementById('banValue');
+  const k=document.getElementById('banKind'), v=document.getElementById('banValue'),
+        a=document.getElementById('banArrs');
   if(!v||!v.value.trim()) return;
   let r={};
   try{ r=await (await fetch('/api/arrban/add?kind='+encodeURIComponent(k.value)
-      +'&value='+encodeURIComponent(v.value.trim()),{method:'POST'})).json(); }
+      +'&value='+encodeURIComponent(v.value.trim())
+      +'&arrs='+encodeURIComponent(a?a.value:''),{method:'POST'})).json(); }
   catch(e){ r={ok:false, why:String(e)}; }
-  const m=document.getElementById('banmsg');
-  if(m) m.innerHTML=r.ok?`<span class="ok">banned — syncing to the arrs</span>`
-                       :`<span class="err">${esc(r.why||'failed')}</span>`;
-  setTimeout(loadArrsTab, 700);
+  if(r.ok){
+    v.value='';
+    banSay(`<span class="ok">${r.new?'banned':'already banned — scope updated'}: ${
+      esc(r.kind)} ${esc(r.value)}</span>`);
+    banRefresh();
+  } else banSay(`<span class="err">${esc(r.why||'failed')}</span>`);
 }
 async function banRemove(id){
   try{ await fetch('/api/arrban/remove?id='+id,{method:'POST'}); }catch(e){}
-  loadArrsTab();
+  banRefresh();
 }
 async function banEnable(id,on){
   try{ await fetch('/api/arrban/enable?id='+id+'&on='+on,{method:'POST'}); }catch(e){}
-  loadArrsTab();
+  banRefresh();
+}
+async function banScope(id,arrs){
+  try{ await fetch('/api/arrban/scope?id='+id+'&arrs='+encodeURIComponent(arrs),{method:'POST'}); }catch(e){}
+  banRefresh();
+}
+async function banStrike(grp,action,i){
+  const sel=document.getElementById('bstsc-'+i);
+  if(action==='clear'&&!confirm(`Forgive ${grp}? Its strikes are cleared; the releases already banned stay banned.`)) return;
+  try{ await fetch('/api/arrban/strike?grp='+encodeURIComponent(grp)+'&action='+action
+      +'&arrs='+encodeURIComponent(sel?sel.value:''),{method:'POST'}); }catch(e){}
+  banSay(action==='clear'?`<span class="dim">${esc(grp)} forgiven</span>`
+                         :`<span class="ok">${esc(grp)} banned</span>`);
+  banRefresh();
 }
 async function arrsToggle(job,on){
   await fetch(`/api/arrguard/toggle?job=${job}&on=${on}`,{method:'POST'});

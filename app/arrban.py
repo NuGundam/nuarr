@@ -49,7 +49,15 @@ CF_TERMS = "Nuarr: banned terms"
 SCORE = -10000
 GROUP_STRIKES = 3           # rejections from one group before the group is banned
 PER_FORMAT = 250            # release patterns per format before rolling over
-SYNC_DEBOUNCE_S = 45.0
+SYNC_DEBOUNCE_S = 45.0      # nuarr's own rejections: batch them
+SYNC_HAND_S = 2.0           # a change made on the card: push it now
+
+# WHICH ARRS A BAN APPLIES TO. '' is both - the original meaning of every
+# row - and 'sonarr' / 'radarr' keep a ban to one app. Erik: "add a option
+# to Ban for both arrs or just one". A term that is right for anime ("Hindi"
+# dubs) can be wrong for a film library, and before this the only choice was
+# everything everywhere.
+SCOPES = ("", "sonarr", "radarr")
 
 # EMPTY MEANS EVERY PROFILE. It used to mean every "Nu ..." and "Anime"
 # one, which was this machine's profile names doing the job a setting
@@ -60,6 +68,16 @@ DEFAULT_PROFILE_RULE = None
 STATS: dict = {"last_run": 0.0, "last_result": "", "next_run": 0.0,
                "detail": [], "dirty": False, "dirty_at": 0.0}
 _READY = False
+
+# WHAT THE PUSH IS DOING, FOR THE CARD. Erik removed a term and "it took a
+# while to update" with nothing on screen saying whether it was coming. The
+# card polls this while it is not idle: queued (and when), pushing (per arr,
+# which step, how far), then done with the time it took, or the error.
+SYNC: dict = {"state": "idle", "due_at": 0.0, "started": 0.0,
+              "finished": 0.0, "took": 0.0, "arrs": {}, "error": ""}
+_LOCK: "asyncio.Lock | None" = None
+_LOOP: "asyncio.AbstractEventLoop | None" = None
+_PENDING: dict = {"task": None, "due": 0.0}
 
 
 def init() -> None:
@@ -88,7 +106,15 @@ def init() -> None:
                 last  REAL NOT NULL DEFAULT 0,
                 why   TEXT NOT NULL DEFAULT ''
             )""")
+        cols = {r["name"] for r in cur.execute("PRAGMA table_info(arr_bans)")}
+        if "arrs" not in cols:
+            cur.execute("ALTER TABLE arr_bans ADD COLUMN arrs TEXT NOT NULL DEFAULT ''")
     _READY = True
+
+
+def _scope(arrs: str) -> str:
+    a = str(arrs or "").strip().lower()
+    return "sonarr" if a.startswith("s") else "radarr" if a.startswith("r") else ""
 
 
 # ------------------------------------------------------------ patterns -----
@@ -157,7 +183,7 @@ def rows(include_off: bool = True) -> list:
     init()
     with cursor() as cur:
         q = ("SELECT id, kind, value, pattern, why, source, added_by, "
-             "       added_at, hits, enabled FROM arr_bans ")
+             "       added_at, hits, enabled, arrs FROM arr_bans ")
         if not include_off:
             q += " WHERE enabled=1 "
         q += " ORDER BY kind, added_at DESC"
@@ -165,10 +191,43 @@ def rows(include_off: bool = True) -> list:
 
 
 def strikes() -> list:
+    r"""Groups with strikes against them, each with the releases that earned
+    them. "ADE 2/3" said a group was close to a ban and nothing about why,
+    so there was no way to decide whether to ban it now or forgive it."""
     init()
     with cursor() as cur:
-        return [dict(r) for r in cur.execute(
-            "SELECT grp, n, last, why FROM arr_ban_strikes ORDER BY n DESC")]
+        out = [dict(r) for r in cur.execute(
+            "SELECT grp, n, last, why FROM arr_ban_strikes ORDER BY n DESC, last DESC")]
+        rel = [dict(r) for r in cur.execute(
+            "SELECT value, why, added_at, source FROM arr_bans "
+            " WHERE kind='release' ORDER BY added_at DESC")]
+        banned = {str(r["value"]).lower() for r in cur.execute(
+            "SELECT value FROM arr_bans WHERE kind='group' AND enabled=1")}
+    by: dict = {}
+    for r in rel:
+        by.setdefault(group_of(r["value"]).lower(), []).append(r)
+    for s in out:
+        s["releases"] = by.get(str(s["grp"]).lower(), [])[:10]
+        s["banned"] = str(s["grp"]).lower() in banned
+    return out
+
+
+def clear_strikes(grp: str) -> bool:
+    """Forgive a group: its strike count goes, its banned releases stay."""
+    init()
+    with cursor() as cur:
+        cur.execute("DELETE FROM arr_ban_strikes WHERE grp=?", (str(grp),))
+        return bool(cur.rowcount)
+
+
+def set_scope(ban_id: int, arrs: str) -> bool:
+    init()
+    with cursor() as cur:
+        cur.execute("UPDATE arr_bans SET arrs=? WHERE id=?",
+                    (_scope(arrs), int(ban_id)))
+        n = cur.rowcount
+    _mark_dirty()
+    return bool(n)
 
 
 def _mark_dirty() -> None:
@@ -177,9 +236,14 @@ def _mark_dirty() -> None:
 
 
 def add(kind: str, value: str, why: str = "", source: str = "",
-        by: str = "you") -> dict:
-    """Add or bump one ban. Returns the row and whether it is new."""
+        by: str = "you", arrs: "str | None" = None) -> dict:
+    """Add or bump one ban. Returns the row and whether it is new.
+
+    `arrs` is '' (both), 'sonarr' or 'radarr'. None leaves an existing row's
+    scope alone - nuarr bumping a hit must not widen a ban you narrowed.
+    """
     init()
+    scope = _scope(arrs) if arrs is not None else None
     k = str(kind).lower()
     kind = ("group" if k.startswith("g")
             else "term" if k.startswith("t") else "release")
@@ -196,13 +260,16 @@ def add(kind: str, value: str, why: str = "", source: str = "",
         if r:
             cur.execute("UPDATE arr_bans SET hits=hits+1, why=COALESCE(NULLIF(?,''),why) "
                         " WHERE id=?", (why, int(r["id"])))
+            if scope is not None:
+                cur.execute("UPDATE arr_bans SET arrs=?, enabled=1 WHERE id=?",
+                            (scope, int(r["id"])))
             new = False
             bid = int(r["id"])
         else:
             cur.execute(
                 "INSERT INTO arr_bans(kind,value,pattern,why,source,added_by,"
-                " added_at,hits,enabled) VALUES(?,?,?,?,?,?,?,1,1)",
-                (kind, value, pat, why or "", source or "", by, now))
+                " added_at,hits,enabled,arrs) VALUES(?,?,?,?,?,?,?,1,1,?)",
+                (kind, value, pat, why or "", source or "", by, now, scope or ""))
             new = True
             bid = int(cur.lastrowid)
     _mark_dirty()
@@ -294,8 +361,32 @@ async def sync(force: bool = False) -> str:
     deleted (they are nuarr's own). A format with no patterns would match
     nothing, so the list being empty leaves one placeholder spec that can
     never match rather than a format the arr rejects as invalid.
+
+    ONE AT A TIME. The card, the timer and nuarr's own rejections can all ask
+    for a push; two passes writing the same formats at once is how a profile
+    ends up saved from a stale read. A second request waits for the lock and
+    then finds nothing left to do.
     """
-    from .arr import shared_client
+    global _LOCK, _LOOP
+    _LOOP = asyncio.get_running_loop()
+    if _LOCK is None:
+        _LOCK = asyncio.Lock()
+    async with _LOCK:
+        return await _sync_locked()
+
+
+def _spec_key(specs: list) -> list:
+    """What makes two spec lists the same format, ignoring ids and order."""
+    out = []
+    for sp in specs or []:
+        v = next((f.get("value") for f in sp.get("fields") or []
+                  if f.get("name") == "value"), "")
+        out.append((sp.get("implementation") or "", bool(sp.get("negate")),
+                    bool(sp.get("required")), str(v), (sp.get("name") or "")[:80]))
+    return sorted(out)
+
+
+async def _sync_locked() -> str:
     from .config import SETTINGS
     init()
     try:
@@ -303,159 +394,249 @@ async def sync(force: bool = False) -> str:
     except Exception:                                            # noqa: BLE001
         pass
     live = [r for r in rows() if r["enabled"]]
-    rel = [r for r in live if r["kind"] == "release"]
-    grp = [r for r in live if r["kind"] == "group"]
-    trm = [r for r in live if r["kind"] == "term"]
     names = profiles_for()
-    detail: list = []
     STATS["dirty"] = False
     STATS["last_run"] = time.time()
-    for cfg in SETTINGS.arrs:
-        if not cfg.enabled or cfg.kind not in ("radarr", "sonarr"):
-            continue
-        c = shared_client(cfg)
-        try:
-            have = {f["name"]: f for f in await c._get("/customformat")}
-            wanted: dict = {}
-            for i, chunk in enumerate(_chunks(rel, PER_FORMAT)):
-                nm = CF_RELEASES if i == 0 else f"{CF_RELEASES} {i + 1}"
-                specs = [{"name": r["value"][:80],
-                          "implementation": "ReleaseTitleSpecification",
-                          "negate": False, "required": False,
-                          "fields": [{"name": "value", "value": r["pattern"]}]}
-                         for r in chunk] or [{
-                    "name": "nothing rejected yet",
-                    "implementation": "ReleaseTitleSpecification",
-                    "negate": False, "required": True,
-                    "fields": [{"name": "value", "value": r"^\b$"}]}]
-                wanted[nm] = specs
-            wanted[CF_TERMS] = [{
-                "name": r["value"][:80],
-                "implementation": "ReleaseTitleSpecification",
-                "negate": False, "required": False,
-                "fields": [{"name": "value", "value": r["pattern"]}]}
-                for r in trm] or [{
-                "name": "no term banned yet",
-                "implementation": "ReleaseTitleSpecification",
-                "negate": False, "required": True,
-                "fields": [{"name": "value", "value": r"^\b$"}]}]
-            wanted[CF_GROUPS] = [{
-                "name": r["value"][:80],
-                "implementation": "ReleaseGroupSpecification",
-                "negate": False, "required": False,
-                "fields": [{"name": "value", "value": r["pattern"]}]}
-                for r in grp] or [{
-                "name": "no group banned yet",
-                "implementation": "ReleaseGroupSpecification",
-                "negate": False, "required": True,
-                "fields": [{"name": "value", "value": r"^\b$"}]}]
-            ids: dict = {}
-            for nm, specs in wanted.items():
-                body = {"name": nm, "includeCustomFormatWhenRenaming": False,
-                        "specifications": specs}
-                # ONE FORMAT FAILING MUST NOT COST THE SCORING. The first live
-                # sync got a 500 from Sonarr on a create that had in fact
-                # succeeded, and the exception skipped the profile step, so
-                # the format existed and did nothing. Re-read after a failure
-                # - it may be there - and carry on with what is.
-                try:
-                    if nm in have:
-                        body["id"] = have[nm]["id"]
-                        r = await c._put(f"/customformat/{have[nm]['id']}", body)
-                    else:
-                        r = await c._post("/customformat", body)
-                    ids[nm] = int(r["id"])
-                except Exception as e:                           # noqa: BLE001
-                    again = {f["name"]: f for f in await c._get("/customformat")}
-                    if nm in again:
-                        ids[nm] = int(again[nm]["id"])
-                        have[nm] = again[nm]
-                    else:
-                        detail.append(f"{cfg.name}: {nm}: "
-                                      f"{type(e).__name__}: {e}")
-            # formats of ours that are no longer needed (a list that shrank)
-            for nm, f in have.items():
-                if (nm.startswith(CF_RELEASES) or nm in (CF_GROUPS, CF_TERMS)) \
-                        and nm not in wanted:
-                    await c._delete(f"/customformat/{f['id']}")
-            # and the score, on every profile named - EACH ONE ON ITS OWN.
-            # A profile the arr refuses to save must not cost the others:
-            # Radarr would not accept its own "HD-All" and "Animation"
-            # profiles at all ("Minimum Custom Format Score can never be
-            # satisfied" - both ask for 1 point and have nothing positive to
-            # score), and that one 400 aborted the whole app's pass, so
-            # nothing in Radarr was scored.
-            scored, refused = [], []
-            for pr in await c._get("/qualityprofile"):
-                if not _want_profile(pr.get("name") or "", names.get(cfg.kind) or []):
-                    continue
-                try:
-                    full = await c._get(f"/qualityprofile/{pr['id']}")
-                    items = full.get("formatItems") or []
-                    seen = {it.get("format") for it in items}
-                    changed = False
-                    for it in items:
-                        if it.get("format") in ids.values() \
-                                and it.get("score") != SCORE:
-                            it["score"] = SCORE
-                            changed = True
-                    for nm, fid in ids.items():
-                        if fid not in seen:
-                            items.append({"format": fid, "name": nm,
-                                          "score": SCORE})
-                            changed = True
-                    if changed:
-                        full["formatItems"] = items
-                        await c._put(f"/qualityprofile/{pr['id']}", full)
-                    scored.append(pr["name"])
-                except Exception as e:                           # noqa: BLE001
-                    # THE REASON IS IN THE BODY, NOT THE MESSAGE. httpx's
-                    # text is "400 Bad Request for url ..."; the arr's own
-                    # sentence is in the response, and that is the one a
-                    # person can act on.
-                    why = str(e)
-                    try:
-                        body = e.response.text                   # type: ignore[attr-defined]
-                        if "never be satisfied" in body:
-                            why = ("minimum custom format score can never "
-                                   "be met - fix the profile in Radarr")
-                        else:
-                            m = re.search(r'"errorMessage":\s*"([^"]+)"', body)
-                            if m:
-                                why = m.group(1)
-                    except Exception:                            # noqa: BLE001
-                        pass
-                    refused.append(f"{pr.get('name')} - {why[:90]}")
-            detail.append(f"{cfg.name}: {len(rel)} release(s), {len(grp)} "
-                          f"group(s), {len(trm)} term(s) scored on "
-                          f"{len(scored)} profile(s)"
-                          + (f"; could not save {len(refused)}: "
-                             + "; ".join(refused) if refused else ""))
-        except Exception as e:                                   # noqa: BLE001
-            detail.append(f"{cfg.name}: {type(e).__name__}: {e}")
+    cfgs = [c for c in SETTINGS.arrs
+            if c.enabled and c.kind in ("radarr", "sonarr")]
+    t0 = time.time()
+    SYNC.update(state="pushing", started=t0, finished=0.0, took=0.0, error="",
+                due_at=0.0,
+                arrs={c.name: {"kind": c.kind, "step": "starting", "done": 0,
+                               "total": 0, "ok": None, "note": "",
+                               "changed": 0, "same": 0} for c in cfgs})
+    # BOTH ARRS AT ONCE. They share nothing, and doing Sonarr's formats and
+    # profiles to the end before Radarr started was half the wait.
+    detail = list(await asyncio.gather(*[_sync_one(c, live, names) for c in cfgs]))
+    bad = [n for n, a in SYNC["arrs"].items() if a.get("ok") is False]
+    SYNC.update(state="error" if bad else "done", finished=time.time(),
+                took=round(time.time() - t0, 1),
+                error="; ".join(f"{n}: {SYNC['arrs'][n].get('note', '')}"
+                                for n in bad))
     STATS["detail"] = detail
     STATS["last_result"] = "; ".join(detail)
     joblog.log("arr release bans synced - " + STATS["last_result"], "info")
     return STATS["last_result"]
 
 
-async def sync_soon() -> None:
-    """Debounced: a batch of rejections becomes one sync."""
-    await asyncio.sleep(SYNC_DEBOUNCE_S)
+async def _sync_one(cfg, live: list, names: dict) -> str:
+    from .arr import shared_client
+    st = SYNC["arrs"][cfg.name]
+    # A ban scoped to one app is simply not in the other app's list, so the
+    # other app's format is rebuilt without it - narrowing a ban removes it
+    # there on the same push.
+    mine = [r for r in live if (r.get("arrs") or "") in ("", cfg.kind)]
+    rel = [r for r in mine if r["kind"] == "release"]
+    grp = [r for r in mine if r["kind"] == "group"]
+    trm = [r for r in mine if r["kind"] == "term"]
+    c = shared_client(cfg)
+    try:
+        st.update(step="reading formats")
+        have = {f["name"]: f for f in await c._get("/customformat")}
+        wanted: dict = {}
+        for i, chunk in enumerate(_chunks(rel, PER_FORMAT)):
+            nm = CF_RELEASES if i == 0 else f"{CF_RELEASES} {i + 1}"
+            specs = [{"name": r["value"][:80],
+                      "implementation": "ReleaseTitleSpecification",
+                      "negate": False, "required": False,
+                      "fields": [{"name": "value", "value": r["pattern"]}]}
+                     for r in chunk] or [{
+                "name": "nothing rejected yet",
+                "implementation": "ReleaseTitleSpecification",
+                "negate": False, "required": True,
+                "fields": [{"name": "value", "value": r"^\b$"}]}]
+            wanted[nm] = specs
+        wanted[CF_TERMS] = [{
+            "name": r["value"][:80],
+            "implementation": "ReleaseTitleSpecification",
+            "negate": False, "required": False,
+            "fields": [{"name": "value", "value": r["pattern"]}]}
+            for r in trm] or [{
+            "name": "no term banned yet",
+            "implementation": "ReleaseTitleSpecification",
+            "negate": False, "required": True,
+            "fields": [{"name": "value", "value": r"^\b$"}]}]
+        wanted[CF_GROUPS] = [{
+            "name": r["value"][:80],
+            "implementation": "ReleaseGroupSpecification",
+            "negate": False, "required": False,
+            "fields": [{"name": "value", "value": r["pattern"]}]}
+            for r in grp] or [{
+            "name": "no group banned yet",
+            "implementation": "ReleaseGroupSpecification",
+            "negate": False, "required": True,
+            "fields": [{"name": "value", "value": r"^\b$"}]}]
+        st.update(step="formats", done=0, total=len(wanted))
+        ids: dict = {}
+        for nm, specs in wanted.items():
+            # A FORMAT THAT ALREADY SAYS THIS IS LEFT ALONE. Every push used to
+            # rewrite all of them; removing one term changes one format.
+            if nm in have and _spec_key(have[nm].get("specifications")) \
+                    == _spec_key(specs):
+                ids[nm] = int(have[nm]["id"])
+                st["same"] += 1
+                st["done"] += 1
+                continue
+            body = {"name": nm, "includeCustomFormatWhenRenaming": False,
+                    "specifications": specs}
+            # ONE FORMAT FAILING MUST NOT COST THE SCORING. The first live
+            # sync got a 500 from Sonarr on a create that had in fact
+            # succeeded, and the exception skipped the profile step, so
+            # the format existed and did nothing. Re-read after a failure
+            # - it may be there - and carry on with what is.
+            try:
+                if nm in have:
+                    body["id"] = have[nm]["id"]
+                    r = await c._put(f"/customformat/{have[nm]['id']}", body)
+                else:
+                    r = await c._post("/customformat", body)
+                ids[nm] = int(r["id"])
+                st["changed"] += 1
+            except Exception as e:                               # noqa: BLE001
+                again = {f["name"]: f for f in await c._get("/customformat")}
+                if nm in again:
+                    ids[nm] = int(again[nm]["id"])
+                    have[nm] = again[nm]
+                else:
+                    st["note"] = f"{nm}: {type(e).__name__}: {e}"[:200]
+            st["done"] += 1
+        # formats of ours that are no longer needed (a list that shrank)
+        for nm, f in have.items():
+            if (nm.startswith(CF_RELEASES) or nm in (CF_GROUPS, CF_TERMS)) \
+                    and nm not in wanted:
+                await c._delete(f"/customformat/{f['id']}")
+                st["changed"] += 1
+        # and the score, on every profile named - EACH ONE ON ITS OWN.
+        # A profile the arr refuses to save must not cost the others:
+        # Radarr would not accept its own "HD-All" and "Animation"
+        # profiles at all ("Minimum Custom Format Score can never be
+        # satisfied" - both ask for 1 point and have nothing positive to
+        # score), and that one 400 aborted the whole app's pass, so
+        # nothing in Radarr was scored.
+        profs = [pr for pr in await c._get("/qualityprofile")
+                 if _want_profile(pr.get("name") or "", names.get(cfg.kind) or [])]
+        st.update(step="profiles", done=0, total=len(profs))
+        scored, refused = [], []
+        for pr in profs:
+            try:
+                # The list endpoint already carries formatItems, so there is
+                # no second read per profile.
+                full = pr
+                items = full.get("formatItems") or []
+                seen = {it.get("format") for it in items}
+                changed = False
+                for it in items:
+                    if it.get("format") in ids.values() \
+                            and it.get("score") != SCORE:
+                        it["score"] = SCORE
+                        changed = True
+                for nm, fid in ids.items():
+                    if fid not in seen:
+                        items.append({"format": fid, "name": nm,
+                                      "score": SCORE})
+                        changed = True
+                if changed:
+                    full["formatItems"] = items
+                    await c._put(f"/qualityprofile/{pr['id']}", full)
+                    st["changed"] += 1
+                scored.append(pr["name"])
+            except Exception as e:                               # noqa: BLE001
+                # THE REASON IS IN THE BODY, NOT THE MESSAGE. httpx's
+                # text is "400 Bad Request for url ..."; the arr's own
+                # sentence is in the response, and that is the one a
+                # person can act on.
+                why = str(e)
+                try:
+                    body = e.response.text                       # type: ignore[attr-defined]
+                    if "never be satisfied" in body:
+                        why = ("minimum custom format score can never "
+                               "be met - fix the profile in Radarr")
+                    else:
+                        m = re.search(r'"errorMessage":\s*"([^"]+)"', body)
+                        if m:
+                            why = m.group(1)
+                except Exception:                                # noqa: BLE001
+                    pass
+                refused.append(f"{pr.get('name')} - {why[:90]}")
+            st["done"] += 1
+        st.update(step="done", ok=True,
+                  note=(f"{st['changed']} change(s)" if st["changed"]
+                        else "already up to date")
+                  + (f"; {len(refused)} profile(s) refused" if refused else ""))
+        return (f"{cfg.name}: {len(rel)} release(s), {len(grp)} "
+                f"group(s), {len(trm)} term(s) scored on "
+                f"{len(scored)} profile(s)"
+                + (f"; could not save {len(refused)}: "
+                   + "; ".join(refused) if refused else ""))
+    except Exception as e:                                       # noqa: BLE001
+        st.update(step="failed", ok=False, note=f"{type(e).__name__}: {e}"[:200])
+        return f"{cfg.name}: {type(e).__name__}: {e}"
+
+
+async def _sync_after(delay: float) -> None:
+    try:
+        await asyncio.sleep(delay)
+    except asyncio.CancelledError:
+        return
+    _PENDING["task"] = None
     if STATS["dirty"]:
         try:
             await sync()
         except Exception as e:                                   # noqa: BLE001
+            SYNC.update(state="error", error=f"{type(e).__name__}: {e}",
+                        finished=time.time())
             joblog.log(f"arr release bans: {type(e).__name__}: {e}", "error")
+    # A change made while that push was running is not in it - go again.
+    if STATS["dirty"]:
+        kick(SYNC_HAND_S)
 
 
-def kick() -> None:
-    """Schedule a sync from sync code, if there is a loop to schedule on."""
+async def sync_soon() -> None:
+    """Debounced: a batch of rejections becomes one sync."""
+    await _sync_after(SYNC_DEBOUNCE_S)
+
+
+def kick(delay: float = SYNC_DEBOUNCE_S) -> None:
+    r"""Schedule a push. The EARLIEST request wins.
+
+    nuarr's own rejections pass the long debounce so twenty of them are one
+    push; a change made on the card passes SYNC_HAND_S and is not held up
+    behind a batch that happens to be waiting.
+
+    CALLED FROM A THREAD, THIS USED TO DO NOTHING. The card's routes were
+    plain `def`s, which FastAPI runs in a worker thread with no event loop,
+    so get_running_loop() raised and kick() returned - every add, remove
+    and on/off made on the card waited for the periodic re-assert instead.
+    That was the "it took a while" when UIndex.org was removed. From a
+    thread it now hands the scheduling to the loop it last saw.
+    """
+    global _LOOP
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
+        loop = _LOOP
+        if loop is None or loop.is_closed():
+            return
+        if SYNC["state"] != "pushing":
+            SYNC.update(state="queued", due_at=time.time() + delay)
+        loop.call_soon_threadsafe(kick, delay)
         return
-    loop.create_task(sync_soon())
+    _LOOP = loop
+    due = time.time() + delay
+    t = _PENDING.get("task")
+    if t is not None and not t.done() and _PENDING["due"] <= due:
+        return
+    if t is not None and not t.done():
+        t.cancel()
+    _PENDING.update(task=loop.create_task(_sync_after(delay)), due=due)
+    if SYNC["state"] != "pushing":
+        SYNC.update(state="queued", due_at=due)
+
+
+def sync_status() -> dict:
+    now = time.time()
+    return {**SYNC, "now": now, "dirty": STATS["dirty"],
+            "in": max(0.0, SYNC.get("due_at", 0.0) - now)}
 
 
 # ------------------------------------------ taking over a release profile --
@@ -573,4 +754,5 @@ def snapshot() -> dict:
                        "term": sum(1 for r in rs if r["kind"] == "term"
                                    and r["enabled"]),
                        "off": sum(1 for r in rs if not r["enabled"])},
-            "group_strikes": GROUP_STRIKES, "score": SCORE}
+            "group_strikes": GROUP_STRIKES, "score": SCORE,
+            "sync": sync_status()}
