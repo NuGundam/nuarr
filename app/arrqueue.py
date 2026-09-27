@@ -336,10 +336,33 @@ def _pass() -> str:
         except Exception as e:                                   # noqa: BLE001
             STATS["detail"].append(f"{a.name}: could not read the queue: {type(e).__name__}: {e}"[:160])
             continue
+        # TWO DOWNLOADS FOR ONE EPISODE: KEEP THE BEST, DROP THE REST NOW.
+        # The arr grabs a release, a better one appears, it grabs that too as
+        # an upgrade - and lets the first one finish downloading before
+        # deciding it was "not an upgrade". Erik: "is it possible to tell
+        # when 2 of the same are downloading at the same time and the one
+        # that has a lower score gets removed". It is: the queue carries
+        # each entry's custom-format score. Equal scores keep the one that
+        # was grabbed first (the lower queue id).
+        key = "episodeId" if a.kind == "sonarr" else "movieId"
+        by: dict = {}
+        for r in rows:
+            if r.get(key):
+                by.setdefault(r[key], []).append(r)
+        losers: dict = {}
+        for k, grp in by.items():
+            if len(grp) < 2:
+                continue
+            grp.sort(key=lambda x: (-(x.get("customFormatScore") or 0), x.get("id") or 0))
+            best = grp[0]
+            for r in grp[1:]:
+                losers[r["id"]] = (f"a better download for the same {'episode' if a.kind == 'sonarr' else 'movie'} "
+                                   f"is in the queue ({r.get('customFormatScore') or 0} vs "
+                                   f"{best.get('customFormatScore') or 0}: {(best.get('title') or '')[:60]})")
         for r in rows:
             if r.get("downloadId"):
                 tracked.add(str(r["downloadId"]).upper())
-            why = _verdict(a, r)
+            why = losers.get(r["id"]) or _verdict(a, r)
             if not why:
                 if (r.get("trackedDownloadStatus") or "") == "warning":
                     kept += 1
@@ -402,5 +425,8 @@ async def watch() -> None:
 
 
 def snapshot() -> dict:
-    return {"stats": {k: v for k, v in STATS.items() if k != "detail"} | {"detail": STATS["detail"][:20]},
-            "recent": _recent()[:12], "poll_s": POLL_S}
+    # The removals are the table below the card; the detail lines carry only
+    # what went wrong, so the card is not the same list twice.
+    problems = [ln for ln in STATS["detail"] if ": removed " not in ln]
+    return {"stats": {k: v for k, v in STATS.items() if k != "detail"} | {"detail": problems[:12]},
+            "recent": _recent()[:RECENT_KEEP], "poll_s": POLL_S}

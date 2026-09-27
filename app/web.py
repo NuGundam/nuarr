@@ -45524,26 +45524,58 @@ async function loadArrsTab(){
 }
 
 // ---- the queue janitor's recent removals ----------------------------------
+// THE SAME SHAPE AS THE BAN LIST: a table in a scroll box, headings that
+// sort, a caret on the name that opens the row for the reason. Rows here are
+// history, not choices, so there is no checkbox and nothing to select.
+let _qjRows=[], _qjSort={k:'at',d:-1}; const _qjOpen=new Set();
+function qjAgo(t){ const s=Math.max(0,Date.now()/1000-t);
+  return s<60?Math.round(s)+'s ago':s<3600?Math.round(s/60)+'m ago'
+       :s<86400?(s/3600).toFixed(1)+'h ago':Math.round(s/86400)+'d ago'; }
+function qjSorted(){
+  const k=_qjSort.k, d=_qjSort.d;
+  const v=r=> k==='at'?(r.at||0) : k==='arr'?(r.arr||r.client||'').toLowerCase()
+    : k==='client'?(r.client||'').toLowerCase() : k==='why'?(r.why||'').toLowerCase()
+    : (r.title||'').toLowerCase();
+  return [..._qjRows].sort((a,b)=>{ const x=v(a),y=v(b);
+    const c=(typeof x==='string')?x.localeCompare(y):(x-y); return c?c*d:((b.at||0)-(a.at||0)); });
+}
+function qjRowHtml(r,i){
+  const id=String(r.at)+':'+i, open=_qjOpen.has(id);
+  return `<tr>
+    <td class="c mono dim" style="font-size:10.5px" title="${esc(new Date((r.at||0)*1000).toLocaleString())}">${qjAgo(r.at)}</td>
+    <td class="c dim">${esc(r.arr||'')}</td>
+    <td class="c dim">${esc(r.client||'')}</td>
+    <td class="l" style="cursor:pointer" title="${esc(r.title||'')}" onclick="qjOpen('${id}',event)"
+      ><span class="actcaret">${open?'▾':'▸'}</span><span class="mono">${esc(r.title||'')}</span>
+      <div class="dim" style="font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-left:14px">${esc(r.why||'')}</div></td>
+  </tr>${open?`<tr class="det" id="qjdet-${esc(id)}"><td colspan="4" style="padding:0;border-bottom:1px solid var(--line);white-space:normal;background:rgba(255,255,255,.025)">
+    <div style="font-size:11px;padding:6px 10px 8px 34px">
+      <div style="display:flex;gap:8px;margin:2px 0"><span class="dim" style="flex:none;width:96px;text-align:right">release</span><span class="mono" style="overflow-wrap:anywhere">${esc(r.title||'')}</span></div>
+      <div style="display:flex;gap:8px;margin:2px 0"><span class="dim" style="flex:none;width:96px;text-align:right">why</span><span style="overflow-wrap:anywhere">${esc(r.why||'')}</span></div>
+      <div style="display:flex;gap:8px;margin:2px 0"><span class="dim" style="flex:none;width:96px;text-align:right">removed from</span><span>${esc(r.arr?r.arr+"'s queue":'')}${r.arr&&r.client?' and ':''}${esc(r.client||'')}${r.client?' (files deleted)':''}</span></div>
+      <div style="display:flex;gap:8px;margin:2px 0"><span class="dim" style="flex:none;width:96px;text-align:right">when</span><span>${esc(new Date((r.at||0)*1000).toLocaleString())}</span></div>
+    </div></td></tr>`:''}`;
+}
+function qjTableHtml(){
+  if(!_qjRows.length) return '<div class="dim" style="font-size:11px;margin-top:3px">nothing removed yet</div>';
+  const mk=k=>_qjSort.k===k?`<span style="color:var(--acc)">${_qjSort.d>0?'▲':'▼'}</span>`:'';
+  const th=(k,t,cls)=>`<th class="${cls}" onclick="qjSortBy('${k}')" title="Sort by ${t}">${t} ${mk(k)}</th>`;
+  return `<div class="rowbox" style="max-height:260px"><table class="sktbl bantbl" style="width:100%;font-size:11.5px;table-layout:fixed">
+    <colgroup><col style="width:62px"><col style="width:58px"><col style="width:76px"><col style="width:auto"></colgroup>
+    <thead><tr class="dim" style="font-size:10.5px">${th('at','when','c')}${th('arr','arr','c')}${th('client','client','c')}${th('title','release · why','l')}</tr></thead>
+    <tbody>${qjSorted().map(qjRowHtml).join('')}</tbody></table></div>`;
+}
+function qjPaint(){ const e=document.getElementById('qjTable'); if(e) e.innerHTML=qjTableHtml(); }
+function qjSortBy(k){ if(_qjSort.k===k) _qjSort.d=-_qjSort.d; else _qjSort={k, d:k==='at'?-1:1}; qjPaint(); }
+function qjOpen(id,ev){ if(ev) ev.stopPropagation(); if(_qjOpen.has(id)) _qjOpen.delete(id); else _qjOpen.add(id); qjPaint(); }
 function qjList(qj){
-  const rows=qj.recent||[];
+  banStyle();
+  _qjRows=qj.recent||[];
   const st=qj.stats||{};
-  const when=t=>{ const s=Math.max(0,Date.now()/1000-t);
-    return s<60?Math.round(s)+'s ago':s<3600?Math.round(s/60)+'m ago'
-         :s<86400?(s/3600).toFixed(1)+'h ago':Math.round(s/86400)+'d ago'; };
   return `<div style="margin-top:8px;border-top:1px solid var(--line);padding-top:8px">
-    <div style="font-size:11px;font-weight:600">Removed${rows.length?` (last ${rows.length})`:''}
+    <div style="font-size:11px;font-weight:600">Removed${_qjRows.length?` (last ${_qjRows.length})`:''}
       ${st.running?'<span class="dim" style="font-weight:400"> · running…</span>':''}</div>
-    ${rows.length?`<div style="max-height:220px;overflow:auto;border:1px solid var(--line);
-         border-radius:6px;background:rgba(255,255,255,.02);margin-top:4px">
-      ${rows.map(r=>`<div style="display:grid;grid-template-columns:62px 58px minmax(0,1fr);gap:10px;
-          padding:4px 10px;font-size:11px;border-top:1px solid var(--line);align-items:baseline">
-        <span class="mono dim">${when(r.at)}</span>
-        <span class="dim">${esc(r.arr||r.client||'')}</span>
-        <span style="min-width:0"><div class="mono" style="overflow:hidden;text-overflow:ellipsis;
-          white-space:nowrap" title="${esc(r.title||'')}">${esc(r.title||'')}</div>
-          <div class="dim" style="font-size:10px">${esc(r.why||'')}${r.client&&r.arr?` · from ${esc(r.client)}`:''}</div></span>
-      </div>`).join('')}</div>`
-      :'<div class="dim" style="font-size:11px;margin-top:3px">nothing removed yet</div>'}
+    <div id="qjTable" style="margin-top:4px">${qjTableHtml()}</div>
   </div>`;
 }
 
