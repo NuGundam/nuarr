@@ -277,13 +277,31 @@ def diff_words(got: tuple, want: tuple, limit: int = 3) -> str:
     return "; ".join(bits) or "no visible difference"
 
 
-def part_of(rating_key: str) -> dict:
-    """One item's first Part, streams included. {} when Plex will not say."""
+def part_of(rating_key: str, file_path: str = "") -> dict:
+    r"""The Part of this item that IS `file_path`, streams included.
+
+    ONE PLEX ITEM CAN HOLD SEVERAL FILES. When Plex matches two releases to
+    the same film it keeps both under one item as separate Media, and the
+    first one is not necessarily ours. "Batman The Dark Knight Returns Part 2"
+    had been matched onto the combined-cut film, so Media[0] was the other
+    movie's h264 file: the queue compared Part 2's x265 file against it,
+    asked Plex to re-analyse, compared against the other file again, and
+    retried six times for a disagreement nothing could resolve. So the Part
+    is picked by exact path; the first Part is only a fallback when no path
+    is given. {} when Plex will not say or does not hold that file.
+    """
     import json
     try:
         d = json.loads(_get(f"/library/metadata/{rating_key}", timeout=20))
         md = (d.get("MediaContainer") or {}).get("Metadata") or []
-        return ((md[0].get("Media") or [{}])[0].get("Part") or [{}])[0]
+        if not md:
+            return {}
+        parts = [p for media in md[0].get("Media") or []
+                 for p in media.get("Part") or []]
+        if not file_path:
+            return parts[0] if parts else {}
+        want = norm_path(file_path)
+        return next((p for p in parts if norm_path(p.get("file")) == want), {})
     except Exception:                                        # noqa: BLE001
         return {}
 

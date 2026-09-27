@@ -191,7 +191,7 @@ def _attempt(row: dict) -> tuple[bool, str, str]:
         return (False, "Plex has not indexed this path yet",
                 f"scanned {os.path.basename(folder) or folder}")
 
-    part = plexnotify.part_of(rk)
+    part = plexnotify.part_of(rk, path)
     if not part:
         return False, "Plex would not describe this item", f"item {rk}"
     got = plexnotify.plex_sig(part)
@@ -214,7 +214,7 @@ def _attempt(row: dict) -> tuple[bool, str, str]:
     # succeed, so this waits, and the backoff covers the case where it does not.
     for wait in (2.0, 4.0, 8.0):
         time.sleep(wait)
-        part = plexnotify.part_of(rk)
+        part = plexnotify.part_of(rk, path)
         if part and not plexnotify.sig_differs(plexnotify.plex_sig(part), want):
             return True, "Plex re-read the file and now agrees", seen
     return (False, "Plex was asked but is still describing the old file", seen)
