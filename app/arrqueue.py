@@ -71,6 +71,20 @@ DONE_WITH = (
 # otherwise it is a real problem and stays for a person.
 NOTHING_LEFT = "no files found are eligible for import"
 
+# MALWARE DRESSED AS AN EPISODE. Erik, 2026-09-29: five "1080p WEB H264"
+# releases for five different shows (Nyaa, LimeTorrents), every one a single
+# 869,211,326-byte .exe under a real group's name. The arr notices ("Caution:
+# Found executable file") and then does nothing - the entry sits in the queue
+# and the .exe sits in F:\Ready. A title rule cannot catch these (the names are
+# NTb, FLUX, MeGusta - groups whose real releases are wanted), so the check is
+# on what the download actually holds: the torrent's own file list, read from
+# the client as soon as the metadata is in - while it is still downloading,
+# not only once it finishes. These alone are removed WITH the blocklist, so
+# the arr never takes that release again and goes looking for another.
+EXEC_EXT = (".exe", ".scr", ".bat", ".cmd", ".com", ".pif", ".msi", ".lnk",
+            ".vbs", ".js", ".jse", ".wsf", ".ps1", ".hta", ".jar", ".dll")
+EXEC_SAYS = ("found executable file", "potentially dangerous file")
+
 STATS: dict = {"last_run": 0.0, "last_result": "", "next_run": 0.0,
                "removed": 0, "swept": 0, "kept": 0, "detail": [], "running": False}
 
@@ -139,9 +153,54 @@ def _verdict(a, row: dict) -> str:
     return ""
 
 
-def _remove(a, row: dict) -> None:
-    _call(a, f"/api/v3/queue/{row['id']}?removeFromClient=true&blocklist=false"
-             "&skipRedownload=false", "DELETE")
+def _remove(a, row: dict, blocklist: bool = False) -> None:
+    _call(a, f"/api/v3/queue/{row['id']}?removeFromClient=true"
+             f"&blocklist={'true' if blocklist else 'false'}&skipRedownload=false", "DELETE")
+
+
+def _malware(row: dict, exe: dict) -> str:
+    """Why this download is an executable, or ''. `exe` is what the client's
+    file lists found (download id -> file name); the arr's own caution is the
+    second opinion for a client this cannot read (SABnzbd)."""
+    f = exe.get(str(row.get("downloadId") or "").upper())
+    if f:
+        return f"malware: the download is {f}, not a video"
+    low = " | ".join(m for s in (row.get("statusMessages") or [])
+                     for m in list(s.get("messages") or [])).lower()
+    for k in EXEC_SAYS:
+        if k in low:
+            m = re.search(r"extension:\s*'([^']+)'", low)
+            return f"malware: the arr found an executable ({m.group(1) if m else 'unknown type'}) in it"
+    return ""
+
+
+def _exe_downloads(arrs, ids: set) -> dict:
+    """{download id: file name} for torrents whose biggest file is a program.
+    Only the torrents the arrs' queues point at are opened."""
+    out: dict = {}
+    if not ids:
+        return out
+    for c in _clients(arrs):
+        if c["impl"] != "QBittorrent":
+            continue
+        try:
+            q = _QBit(c)
+            if not q.login():
+                continue
+            for t in json.loads(q._req("/torrents/info") or "[]"):
+                h = str(t.get("hash") or "").upper()
+                if h not in ids:
+                    continue
+                files = json.loads(q._req("/torrents/files?hash=" + t["hash"]) or "[]")
+                if not files:                          # metadata not in yet
+                    continue
+                big = max(files, key=lambda f: f.get("size") or 0)
+                name = str(big.get("name") or "")
+                if os.path.splitext(name)[1].lower() in EXEC_EXT:
+                    out[h] = os.path.basename(name.replace("\\", "/"))
+        except Exception as e:                                   # noqa: BLE001
+            STATS["detail"].append(f"{c['name']}: could not read file lists: {type(e).__name__}: {e}"[:160])
+    return out
 
 
 # ------------------------------------------------------- the clients -------
@@ -332,15 +391,18 @@ def _pass() -> str:
     from .config import SETTINGS
     arrs = [a for a in SETTINGS.arrs if a.enabled and a.kind in ("sonarr", "radarr")]
     STATS["detail"] = []
-    removed = kept = 0
+    removed = kept = malware = 0
     tracked: set = set()
     new: list = []
+    queues: list = []
     for a in arrs:
         try:
-            rows = _queue(a)
+            queues.append((a, _queue(a)))
         except Exception as e:                                   # noqa: BLE001
             STATS["detail"].append(f"{a.name}: could not read the queue: {type(e).__name__}: {e}"[:160])
-            continue
+    exe = _exe_downloads(arrs, {str(r["downloadId"]).upper() for _a, rows in queues
+                                for r in rows if r.get("downloadId")})
+    for a, rows in queues:
         # TWO DOWNLOADS FOR ONE EPISODE: KEEP THE BEST, DROP THE REST NOW.
         # The arr grabs a release, a better one appears, it grabs that too as
         # an upgrade - and lets the first one finish downloading before
@@ -367,16 +429,22 @@ def _pass() -> str:
         for r in rows:
             if r.get("downloadId"):
                 tracked.add(str(r["downloadId"]).upper())
-            why = losers.get(r["id"]) or _verdict(a, r)
+            bad = _malware(r, exe)
+            why = bad or losers.get(r["id"]) or _verdict(a, r)
             if not why:
                 if (r.get("trackedDownloadStatus") or "") == "warning":
                     kept += 1
                 continue
             try:
-                _remove(a, r)
+                _remove(a, r, blocklist=bool(bad))
                 removed += 1
+                if bad:
+                    malware += 1
+                    why += (f" (from {r.get('indexer') or 'an unknown indexer'}) - "
+                            "blocklisted, the arr will look for another release")
                 new.append({"at": time.time(), "arr": a.name, "title": r.get("title") or "",
-                            "client": r.get("downloadClient") or "", "why": why})
+                            "client": r.get("downloadClient") or "", "why": why,
+                            "kind": "malware" if bad else ""})
                 STATS["detail"].append(f"{a.name}: removed {(r.get('title') or '')[:70]} - {why}")
             except Exception as e:                               # noqa: BLE001
                 STATS["detail"].append(f"{a.name}: could not remove {(r.get('title') or '')[:60]}: "
@@ -388,8 +456,10 @@ def _pass() -> str:
     _remember(new + srows)
     STATS.update(removed=STATS["removed"] + removed, swept=STATS["swept"] + swept, kept=kept)
     bits = []
-    if removed:
-        bits.append(f"{removed} finished download(s) the arr would not import, removed with their files")
+    if malware:
+        bits.append(f"{malware} executable(s) posing as video removed and blocklisted")
+    if removed - malware:
+        bits.append(f"{removed - malware} finished download(s) the arr would not import, removed with their files")
     if swept:
         bits.append(f"{swept} left in the clients, removed")
     if kept:
