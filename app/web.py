@@ -45791,15 +45791,19 @@ function poRowsSorted(){
 function poSelIds(){ const live=new Set(_poRows.map(poId)); return [..._poSel].filter(i=>live.has(i)); }
 function poMsgHtml(m){
   // Pushover's HTML subset: <b> <i> <font color> - shown here as it reads on
-  // the phone; anything else stays escaped.
-  return esc(m||'').replace(/&lt;(\/?)(b|i)&gt;/g,'<$1$2>')
+  // the phone; anything else stays escaped. The message already carries its
+  // own entities (&gt; for the arrow in "old -> new"), so escaping it again
+  // printed "-&gt;"; known entities are put back after the escape.
+  return esc(m||'').replace(/&amp;(gt|lt|amp|quot|#\d+);/g,'&$1;').replace(/&lt;(\/?)(b|i)&gt;/g,'<$1$2>')
     .replace(/&lt;font color=(?:&quot;|")(#[0-9a-fA-F]{3,8})(?:&quot;|")&gt;/g,'<span style="color:$1">')
     .replace(/&lt;\/font&gt;/g,'</span>').replace(/\n/g,'<br>');
 }
 function poDetail(r){
   const row=(k,v)=>`<div style="display:flex;gap:8px;margin:2px 0"><span class="dim" style="flex:none;width:96px;text-align:right">${k}</span><span style="min-width:0;overflow-wrap:anywhere">${v}</span></div>`;
   return `<div style="font-size:11px;padding:6px 10px 8px 34px;white-space:normal">
-    ${r.ptitle?row('title',`<b>${esc(r.ptitle)}</b>`):''}
+    ${r.ptitle?row('title',`<b>${r.arr&&r.ptitle.startsWith(r.arr)
+        ?`<span style="color:${arrLook(r.arr).c}">${esc(r.arr)}</span>${esc(r.ptitle.slice(r.arr.length))}`
+        :esc(r.ptitle)}</b>`):''}
     ${r.msg?row('message',`<div style="border-left:2px solid var(--line);padding-left:8px">${poMsgHtml(r.msg)}</div>`)
            :row('message','<span class="dim">sent before nuarr kept the full text — only the summary is on file</span>')}
     ${row('sent', esc(new Date((r.at||0)*1000).toLocaleString())+(r.resent?' <span class="dim">(resent)</span>':''))}

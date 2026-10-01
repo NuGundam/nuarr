@@ -223,6 +223,24 @@ def _esc(s) -> str:
     return html.escape(str(s or ""), quote=False)
 
 
+# COLOUR IN THE MESSAGE. Pushover's title is plain text, so the arr's colour
+# goes on the first line of the body instead - the same Sonarr blue / Radarr
+# amber the page uses. Each labelled line gets its own colour so the eye can
+# find "Placed" without reading the four above it.
+ARR_COL = {"sonarr": "#35c5f4", "radarr": "#ffc230"}
+LABEL_COL = {"Upgrade": "#a371f7", "Release": "#f778ba",
+             "Placed": "#56d4dd", "Client": "#db6d28"}
+
+
+def _lab(name: str) -> str:
+    return f'<b><font color="{LABEL_COL.get(name, "#c9d1d9")}">{name}:</font></b> '
+
+
+def _arr_tag(name: str, kind: str) -> str:
+    c = ARR_COL.get((kind or "").lower())
+    return f'<font color="{c}"><b>{_esc(name)}</b></font>' if c else f"<b>{_esc(name)}</b>"
+
+
 def _plain(s: str) -> str:
     """The recent list is text, not HTML: tags off, entities back."""
     return html.unescape(re.sub(r"<[^>]+>", "", str(s or "")))
@@ -298,15 +316,15 @@ def build(cfg, body: dict, files: list, detail: str, upgrade: bool) -> dict | No
     if sub:
         lines.append("<i>" + _esc(sub) + "</i>")
     if upgrade and detail and detail != "upgrade":
-        lines.append("<b>Upgrade:</b> " + _esc(detail))
+        lines.append(_lab("Upgrade") + _esc(detail.replace(" -> ", " → ")))
     elif spec:
         lines.append(_esc(spec))
     rl = _release_line(body)
     if rl:
-        lines.append("<b>Release:</b> " + rl)
+        lines.append(_lab("Release") + rl)
     pl = _placed(os.path.basename(path))
     if pl:
-        s = f"<b>Placed:</b> {_esc(pl.get('placed'))}"
+        s = _lab("Placed") + _esc(pl.get("placed"))
         if pl.get("pct") is not None:
             s += f" at {pl['pct']}%"
         if pl.get("free_gb") is not None:
@@ -316,10 +334,10 @@ def build(cfg, body: dict, files: list, detail: str, upgrade: bool) -> dict | No
         lines.append(s)
     dc = body.get("downloadClient")
     if dc:
-        lines.append("<b>Client:</b> " + _esc(dc))
+        lines.append(_lab("Client") + _esc(dc))
     if eng:
         lines.insert(1 if sub else 0, "<b><font color=\"#2ea44f\">Now has English audio</font></b>")
-    return {"arr": cfg.name, "series": series, "label": label, "sub": sub,
+    return {"arr": cfg.name, "kind": kind, "series": series, "label": label, "sub": sub,
             "spec": spec, "upgrade": upgrade, "lines": lines, "eng": eng,
             "ep": label[len(series):].strip() if label.startswith(series) else label,
             "at": time.time()}
@@ -379,7 +397,8 @@ async def _send_group(items: list) -> None:
         for it in items:
             title = (f"{arr} · {'upgraded' if it['upgrade'] else 'imported'} · {it['label']}"
                      + (" · English audio" if it.get("eng") else ""))
-            msg = "<b>" + _esc(it["label"]) + "</b>\n" + "\n".join(it["lines"])
+            msg = (_arr_tag(arr, it.get("kind", "")) + " · <b>" + _esc(it["label"]) + "</b>\n"
+                   + "\n".join(it["lines"]))
             ok, err = await send(title, msg, url=_link())
             _remember({"at": time.time(), "arr": arr, "title": it["label"],
                        "detail": _plain(it["spec"] or (it["lines"][0] if it["lines"] else "")),
@@ -398,12 +417,13 @@ async def _send_group(items: list) -> None:
     engs = sum(1 for x in items if x.get("eng"))
     title = f"{arr} · {what} {len(items)} · {series}" + (
         f" · {engs} now English audio" if engs else "")
-    head = "<b>" + _esc(series) + "</b>  —  " + f"{len(items)} files"
+    head = (_arr_tag(arr, items[0].get("kind", "")) + " · <b>" + _esc(series) + "</b>  —  "
+            + f"{len(items)} files")
     disks: dict = {}
     for x in items:
         for ln in x["lines"]:
-            if ln.startswith("<b>Placed:</b> "):
-                d = ln.split("</b> ", 1)[1].split(" at ")[0]
+            if ln.startswith(_lab("Placed")):
+                d = html.unescape(ln[len(_lab("Placed")):].split(" at ")[0])
                 disks[d] = disks.get(d, 0) + 1
     rows = []
     for x in items:
@@ -415,8 +435,8 @@ async def _send_group(items: list) -> None:
         rows.append(r)
     tail = []
     if disks:
-        tail.append("<b>Placed:</b> " + ", ".join(f"{_esc(k)} ×{v}" for k, v in sorted(disks.items())))
-    rel = next((ln for x in items for ln in x["lines"] if ln.startswith("<b>Release:</b>")), "")
+        tail.append(_lab("Placed") + ", ".join(f"{_esc(k)} ×{v}" for k, v in sorted(disks.items())))
+    rel = next((ln for x in items for ln in x["lines"] if ln.startswith(_lab("Release"))), "")
     if rel:
         tail.append(rel)
     msg = head + "\n" + "\n".join(rows)
