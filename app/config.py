@@ -479,6 +479,11 @@ class Settings:
     tautulli_url: str = "http://localhost:8181"
     tautulli_api_key: str | None = None
 
+    # PUSHOVER. An application token (registered as "Nuarr" at pushover.net)
+    # and the user key it delivers to. See pushover.py.
+    pushover_token: str | None = None
+    pushover_user: str | None = None
+
     # PLEX, DIRECTLY. Tautulli is a live passthrough to Plex for get_activity -
     # measured, it is not serving a cache - but it costs 2,177 ms per call
     # against 159 ms straight to Plex, and it is a second process that can die

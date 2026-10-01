@@ -3087,6 +3087,65 @@ async def api_arrguard_run(job: str):
     raise HTTPException(400, f"job must be one of {', '.join(_ARR_JOBS)}")
 
 
+@app.get("/api/pushover")
+def api_pushover():
+    """The Pushover connection, what it sends, and the last messages."""
+    from . import pushover
+    return pushover.snapshot()
+
+
+@app.post("/api/pushover/config")
+async def api_pushover_config(body: dict = Body(...)):
+    """Save the app token and user key, tested first (a validate call, then
+    one test message). A blank field keeps the stored value."""
+    import yaml
+    from . import pushover
+    token = str(body.get("token") or "").strip() or (SETTINGS.pushover_token or "")
+    user = str(body.get("user") or "").strip() or (SETTINGS.pushover_user or "")
+    if not token or not user:
+        return {"ok": False, "error": "both the app token and the user key are needed"}
+    ok, detail = await pushover.test(token, user)
+    if not ok:
+        return {"ok": False, "error": detail}
+    p = _config_path()
+    raw = {}
+    if p.exists():
+        try:
+            raw = yaml.safe_load(p.read_text(encoding="utf-8-sig")) or {}
+        except Exception:                                    # noqa: BLE001
+            raw = {}
+    raw.update({"pushover_token": token, "pushover_user": user})
+    p.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True),
+                 encoding="utf-8")
+    SETTINGS.pushover_token = token
+    SETTINGS.pushover_user = user
+    if not pushover.enabled():
+        pushover.set_enabled(True)
+    joblog.log("Pushover connection saved and tested", "ok")
+    return {"ok": True, "detail": detail}
+
+
+@app.post("/api/pushover/enabled")
+def api_pushover_enabled(on: bool = True):
+    from . import pushover
+    pushover.set_enabled(bool(on))
+    joblog.log(f"Pushover turned {'ON' if on else 'off'}", "info")
+    return {"on": bool(on)}
+
+
+@app.post("/api/pushover/opts")
+def api_pushover_opts(body: dict = Body(...)):
+    from . import pushover
+    return {"opts": pushover.set_opts(body or {})}
+
+
+@app.post("/api/pushover/test")
+async def api_pushover_test():
+    from . import pushover
+    ok, detail = await pushover.test()
+    return {"ok": ok, "detail": detail if ok else "", "error": "" if ok else detail}
+
+
 @app.get("/api/maintenance")
 def api_maintenance():
     """Database size, row counts and what housekeeping last did."""
@@ -28594,6 +28653,7 @@ const PANE_OF = {ffmpeg:'ffPane', backup:'bkPane',  rules:'rulesPane',
                  alang:'alangPane', cache:'cachePane',
                  whisper:'whisperPane', plex:'plexPane',
                  tautulli:'tautPane',
+                 pushover:'pushoverPane',
                  ocr:'ocrPane', plexwork:'plexworkPane', ruleschk:'ruleschkPane',
                  process:'processPane', notland:'notlandPane',
                  updates:'updPane', drivepool:'dpPane',
@@ -28976,6 +29036,11 @@ function wtab(which){
   if(which==='tautulli'){
     if(hint) hint.textContent='· Tautulli';
     paneLoad('tautulli', loadTautulli);
+    return;
+  }
+  if(which==='pushover'){
+    if(hint) hint.textContent='· Pushover';
+    paneLoad('pushover', loadPushover);
     return;
   }
   if(isAr){
@@ -45583,6 +45648,138 @@ function qjList(qj){
   </div>`;
 }
 
+// ---- Pushover: the arrs' imports on the phone -----------------------------
+// Same shape as the Tautulli pane: one Connection block with a switch, then
+// what gets sent and how loud, then the last messages. Keys never come back
+// to the page - only whether they are set.
+let _po=null, _poPoll=null;
+async function loadPushover(force){
+  const el=document.getElementById('poBody');
+  if(!el){ if(_poPoll) clearTimeout(_poPoll); _poPoll=null; return; }
+  const b=document.getElementById('poRefresh'); if(b) b.classList.add('spinning');
+  try{ _po=await (await fetch('/api/pushover')).json(); }
+  catch(e){ el.innerHTML='<div class="dim" style="padding:14px">could not load</div>'; if(b) b.classList.remove('spinning'); return; }
+  poPaint();
+  if(b) b.classList.remove('spinning');
+  if(_poPoll) clearTimeout(_poPoll);
+  if((_po.stats||{}).pending) _poPoll=setTimeout(()=>{ if(document.getElementById('poBody')) loadPushover(true); }, 3000);
+}
+function poPaint(){
+  const el=document.getElementById('poBody');
+  if(!el||!_po) return;
+  const d=_po, o=d.opts||{}, st=d.stats||{};
+  const state = !d.configured ? 'not configured' : !d.on ? 'switched off'
+              : st.last_error ? 'last send failed' : 'ready';
+  const col = !d.configured ? '#8a97a6' : !d.on ? '#8a97a6' : st.last_error ? '#e0575b' : '#7fd4a3';
+  const prio = {'-2':'lowest (no sound, no banner)','-1':'quiet (no sound)','0':'normal','1':'high (bypasses quiet hours)'};
+  const rows=(d.recent||[]);
+  el.innerHTML=`
+    <div class="lkind" style="padding:11px 12px;margin-bottom:10px">
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+        <b style="color:#6fb0ff">Connection</b>
+        <span style="display:flex;align-items:center;gap:12px">
+          <span style="color:${col};font-size:12px">${esc(state)}</span>
+          <label class="gsw" title="Off keeps the keys and sends nothing.">
+            <input type="checkbox" ${d.on?'checked':''} ${d.configured?'':'disabled'} onchange="poEnable(this.checked)">
+            <span class="gname">integration</span>
+            <span class="gstate ${d.on?'on':'off'}">${d.on?'on':'off'}</span>
+          </label>
+        </span>
+      </div>
+      <div class="dim" style="font-size:11px;margin-top:5px">
+        ${d.token_set?'app token saved':'<b style="color:var(--warn)">no app token</b>'} ·
+        ${d.user_set?'user key saved':'<b style="color:var(--warn)">no user key</b>'}
+        ${st.sent?` · <b style="color:#c2ccd6">${fmt(st.sent)}</b> sent since start`:''}
+        ${st.remaining!=null?` · ${fmt(st.remaining)} of ${fmt(st.limit||0)} left this month`:''}
+        ${st.last_error?`<br><span style="color:#e0575b">${esc(st.last_error)}</span>`:''}
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:9px;align-items:center">
+        <input id="poToken" type="password" spellcheck="false"
+               placeholder="${d.token_set?'app token saved — leave blank to keep':'app token (from pushover.net/apps)'}"
+               style="flex:1;min-width:220px;font-family:var(--mono,monospace);font-size:12px">
+        <input id="poUser" type="password" spellcheck="false"
+               placeholder="${d.user_set?'user key saved — leave blank to keep':'user key (pushover.net home page)'}"
+               style="flex:1;min-width:220px;font-family:var(--mono,monospace);font-size:12px">
+        <button onclick="poSave(this)">Test and save</button>
+        <button class="gapchk" onclick="poTest(this)" ${d.configured?'':'disabled'} title="Send a test message with the saved keys">Send a test</button>
+        <span id="poMsg" class="dim" style="font-size:11.5px"></span>
+      </div>
+      <div class="dim" style="font-size:11px;margin-top:5px">
+        The app token is the &ldquo;Nuarr&rdquo; application under
+        <a href="https://pushover.net/apps" target="_blank" rel="noopener">pushover.net &rarr; Your Applications</a>;
+        the user key is on the Pushover home page. Both are stored in config.yml
+        and never sent back to this page.
+      </div>
+    </div>
+
+    <div class="lkind" style="padding:11px 12px;margin-bottom:10px${d.on?'':';opacity:.5'}">
+      <b style="color:#6fb0ff">What is sent</b>
+      <div style="display:flex;flex-wrap:wrap;gap:14px 22px;margin-top:8px;align-items:center">
+        <label class="gsw" title="A file the arr did not have before."><input type="checkbox" ${o.imports?'checked':''} onchange="poOpt('imports',this.checked)"><span class="gname">new imports</span><span class="gstate ${o.imports?'on':'off'}">${o.imports?'on':'off'}</span></label>
+        <label class="gsw" title="A file replacing one the arr already had - the message shows old and new."><input type="checkbox" ${o.upgrades?'checked':''} onchange="poOpt('upgrades',this.checked)"><span class="gname">upgrades</span><span class="gstate ${o.upgrades?'on':'off'}">${o.upgrades?'on':'off'}</span></label>
+        <label class="gsw" title="Several files for one series within ${Math.round(d.quiet_s||20)} seconds go out as one message listing them all. Off sends one message per file."><input type="checkbox" ${o.digest?'checked':''} onchange="poOpt('digest',this.checked)"><span class="gname">packs as one digest</span><span class="gstate ${o.digest?'on':'off'}">${o.digest?'on':'off'}</span></label>
+        <label class="gsw" title="Attach a link that opens nuarr from the notification."><input type="checkbox" ${o.link?'checked':''} onchange="poOpt('link',this.checked)"><span class="gname">link to nuarr</span><span class="gstate ${o.link?'on':'off'}">${o.link?'on':'off'}</span></label>
+        <span style="display:flex;align-items:center;gap:6px;font-size:11.5px">priority
+          <select onchange="poOpt('priority',this.value)" style="font-size:11.5px">
+            ${['-2','-1','0','1'].map(p=>`<option value="${p}" ${String(o.priority)===p?'selected':''}>${prio[p]}</option>`).join('')}
+          </select></span>
+      </div>
+      <div class="dim" style="font-size:11px;margin-top:7px">
+        Each message carries: the show and episode (or film), the file&rsquo;s
+        quality, codecs, audio languages and size; the release, its indexer and
+        custom-format score; the pool disk nuarr placed it on with that disk&rsquo;s
+        fill and free space; and the download client. Upgrades show the old file
+        beside the new one. Every message arrives with the Nuarr icon.
+        ${d.link?` Link target: <span class="mono">${esc(d.link)}</span>.`:''}
+      </div>
+    </div>
+
+    <div class="lkind" style="padding:11px 12px">
+      <b style="color:#6fb0ff">Last messages</b>
+      ${st.pending?`<span class="busy" style="color:var(--acc);font-size:11px;margin-left:8px"><span class="sp"></span>${st.pending} waiting for the quiet window</span>`:''}
+      ${rows.length?`<div class="rowbox" style="max-height:260px;margin-top:6px"><table class="sktbl" style="width:100%;font-size:11.5px;table-layout:fixed">
+        <colgroup><col style="width:62px"><col style="width:58px"><col style="width:auto"><col style="width:24px"></colgroup>
+        <thead><tr class="dim" style="font-size:10.5px"><th class="c">when</th><th class="c">arr</th><th class="l">message</th><th></th></tr></thead>
+        <tbody>${rows.map(r=>`<tr>
+          <td class="c mono dim" style="font-size:10.5px" title="${esc(new Date((r.at||0)*1000).toLocaleString())}">${ago(r.at)}</td>
+          <td class="c dim">${esc(r.arr||'')}</td>
+          <td class="l" title="${esc(r.error||r.detail||'')}"><span class="mono">${esc(r.title||'')}</span>
+            <div class="dim" style="font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap${r.ok?'':';color:#e0575b'}">${esc(r.ok?(r.detail||''):('failed: '+(r.error||'')))}</div></td>
+          <td class="c" style="color:${r.ok?'#7fd4a3':'#e0575b'}">${r.ok?'✓':'✗'}</td></tr>`).join('')}</tbody></table></div>`
+        :'<div class="dim" style="font-size:11px;margin-top:4px">nothing sent yet</div>'}
+    </div>`;
+}
+async function poEnable(on){
+  await fetch('/api/pushover/enabled?on='+(on?1:0),{method:'POST'});
+  loadPushover(true);
+}
+async function poOpt(k,v){
+  const body={}; body[k]=(k==='priority')?parseInt(v,10):!!v;
+  await fetch('/api/pushover/opts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  loadPushover(true);
+}
+async function poSave(btn){
+  const m=document.getElementById('poMsg'); btn.disabled=true; m.textContent='testing…';
+  try{
+    const r=await (await fetch('/api/pushover/config',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({token:document.getElementById('poToken').value, user:document.getElementById('poUser').value})})).json();
+    m.textContent=r.ok?('saved · '+(r.detail||'')):(r.error||'failed');
+    m.style.color=r.ok?'#7fd4a3':'#e0575b';
+    if(r.ok) setTimeout(()=>loadPushover(true), 600);
+  }catch(e){ m.textContent='failed: '+e; }
+  btn.disabled=false;
+}
+async function poTest(btn){
+  const m=document.getElementById('poMsg'); btn.disabled=true; m.textContent='sending…';
+  try{
+    const r=await (await fetch('/api/pushover/test',{method:'POST'})).json();
+    m.textContent=r.ok?('sent · '+(r.detail||'')):(r.error||'failed');
+    m.style.color=r.ok?'#7fd4a3':'#e0575b';
+    setTimeout(()=>loadPushover(true), 600);
+  }catch(e){ m.textContent='failed: '+e; }
+  btn.disabled=false;
+}
+
 // ---- arr imports: nuarr picks the disk ------------------------------------
 // The arrs' Import Using Script hands every import to nuarr, which copies it
 // onto the emptiest disk by percent that nobody is watching - the same choice
@@ -47081,6 +47278,7 @@ _SETTINGS_NAV = [
     ("Integrations", [("arrs", "Arrs",             "link"),
                       ("plex", "Plex",             "play"),
                       ("tautulli", "Tautulli",     "health"),
+                      ("pushover", "Pushover",     "bell"),
                       ("drivepool", "DrivePool",   "folder"),
                       ("meta", "Metadata",         "globe")]),
     ("System",     [("health", "Health checks",     "shield"),
@@ -47175,6 +47373,7 @@ _SETTINGS_SHIM = """
     drivepool:I('<ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v6c0 1.7 3.6 3 8 3s8-1.3 8-3V6M4 12v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/>'),
     meta:    I('<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/>'),
     health:  I('<path d="M3 12h4l2-5 3 10 3-8 2 3h4"/>'),
+    pushover:I('<path d="M6 16V11a6 6 0 0 1 12 0v5l2 2H4z"/><path d="M10 20a2 2 0 0 0 4 0"/>'),
     libs:    I('<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>'),
     cache:   I('<path d="M4 4h16v6H4zM4 14h16v6H4z"/><path d="M8 7h.01M8 17h.01"/>'),
     jobs:    I('<circle cx="12" cy="12" r="8.5"/><path d="M12 8v4l3 1.5M5 3l-2 2M19 3l2 2"/>'),

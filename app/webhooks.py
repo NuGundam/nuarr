@@ -671,6 +671,17 @@ def _mark_deleted(cfg_name: str, file_id: int, reason: str) -> None:
 
 
 # ---------------------------------------------------------------- routing ---
+def _tell_phone(cfg, body: dict, files: list, detail: str, upgrade: bool) -> None:
+    """Hand a handled import to Pushover. Never lets a notification problem
+    reach the webhook - the import is recorded whether or not the phone is."""
+    try:
+        from . import pushover
+        if pushover.enabled():
+            pushover.queue(pushover.build(cfg, body, files, detail, upgrade))
+    except Exception as e:                                       # noqa: BLE001
+        joblog.log(f"pushover: {type(e).__name__}: {e}", "warn")
+
+
 async def _handle(cfg, body: dict) -> str:
     ev = body.get("eventType") or ""
     kind = cfg.kind
@@ -704,6 +715,7 @@ async def _handle(cfg, body: dict) -> str:
             # per-file history while the panel got a bare count. Same string,
             # both places.
             extra = f" ({len(files)} files)" if len(files) > 1 else ""
+            _tell_phone(cfg, body, files, up, bool(body.get("isUpgrade")))
             return f"{_media_label(body, 'sonarr')} — {up}{extra}"
 
         if ev == "Rename":
@@ -751,6 +763,7 @@ async def _handle(cfg, body: dict) -> str:
                 if d.get("id"):
                     _mark_deleted(cfg.name, d["id"],
                                   f"replaced by upgrade: {_describe(d)}")
+            _tell_phone(cfg, body, [mf] if mf else [], up, bool(body.get("isUpgrade")))
             return f"{_media_label(body, 'radarr')} — {up}"
 
         if ev == "Rename":
