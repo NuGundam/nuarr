@@ -242,6 +242,12 @@ def build(cfg, body: dict, files: list, detail: str, upgrade: bool) -> dict | No
         return None
     kind = cfg.kind
     label = _media_label(body, kind)
+    # GAINED ENGLISH AUDIO. On a foreign show the reason an upgrade matters is
+    # usually this - jpn-only becoming jpn+eng - and webhooks' detail already
+    # says it ("audio jpn -> jpn+eng (gained eng)"). Lifted out so the title
+    # and the digest can lead with it instead of burying it in a spec line.
+    m = re.search(r"\(gained ([^)]+)\)", detail or "") if upgrade else None
+    eng = bool(m and "eng" in m.group(1).split("+"))
     series = (_obj(body.get("series")).get("title") if kind == "sonarr"
               else _obj(body.get("movie")).get("title")) or label
     sub = ""
@@ -275,8 +281,10 @@ def build(cfg, body: dict, files: list, detail: str, upgrade: bool) -> dict | No
     dc = body.get("downloadClient")
     if dc:
         lines.append("<b>Client:</b> " + _esc(dc))
+    if eng:
+        lines.insert(1 if sub else 0, "<b><font color=\"#2ea44f\">Now has English audio</font></b>")
     return {"arr": cfg.name, "series": series, "label": label, "sub": sub,
-            "spec": spec, "upgrade": upgrade, "lines": lines,
+            "spec": spec, "upgrade": upgrade, "lines": lines, "eng": eng,
             "ep": label[len(series):].strip() if label.startswith(series) else label,
             "at": time.time()}
 
@@ -323,12 +331,13 @@ async def _send_group(items: list) -> None:
     arr = items[0]["arr"]
     if len(items) == 1 or not opts().get("digest", True):
         for it in items:
-            title = f"{arr} · {'upgraded' if it['upgrade'] else 'imported'} · {it['label']}"
+            title = (f"{arr} · {'upgraded' if it['upgrade'] else 'imported'} · {it['label']}"
+                     + (" · English audio" if it.get("eng") else ""))
             msg = "<b>" + _esc(it["label"]) + "</b>\n" + "\n".join(it["lines"])
             ok, err = await send(title, msg, url=_link())
             _remember({"at": time.time(), "arr": arr, "title": it["label"],
                        "detail": _plain(it["spec"] or (it["lines"][0] if it["lines"] else "")),
-                       "ok": ok, "error": err})
+                       "eng": int(bool(it.get("eng"))), "ok": ok, "error": err})
             if not ok:
                 joblog.log(f"pushover: could not send {it['label']}: {err}", "warn")
         return
@@ -338,7 +347,9 @@ async def _send_group(items: list) -> None:
     ups = sum(1 for x in items if x["upgrade"])
     what = ("upgraded" if ups == len(items) else "imported" if not ups
             else f"imported, {ups} upgraded")
-    title = f"{arr} · {what} {len(items)} · {series}"
+    engs = sum(1 for x in items if x.get("eng"))
+    title = f"{arr} · {what} {len(items)} · {series}" + (
+        f" · {engs} now English audio" if engs else "")
     head = "<b>" + _esc(series) + "</b>  —  " + f"{len(items)} files"
     disks: dict = {}
     for x in items:
@@ -351,6 +362,8 @@ async def _send_group(items: list) -> None:
         r = _esc(x["ep"]) + ("  " + _esc(x["spec"]) if x["spec"] else "")
         if x["upgrade"]:
             r += "  ↑"
+        if x.get("eng"):
+            r += "  <font color=\"#2ea44f\">+eng audio</font>"
         rows.append(r)
     tail = []
     if disks:
@@ -365,7 +378,7 @@ async def _send_group(items: list) -> None:
     msg += "\n" + "\n".join(tail)
     ok, err = await send(title, msg, url=_link())
     _remember({"at": time.time(), "arr": arr, "title": f"{series} ({len(items)} files)",
-               "detail": what, "ok": ok, "error": err})
+               "detail": what, "eng": engs, "ok": ok, "error": err})
     if not ok:
         joblog.log(f"pushover: could not send the {series} digest: {err}", "warn")
 

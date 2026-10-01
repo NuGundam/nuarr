@@ -2915,12 +2915,15 @@ async def api_arrban_strike(grp: str, action: str = "ban", arrs: str = ""):
     for g in grps:
         if action == "clear":
             n += int(bool(arrban.clear_strikes(g)))
+        elif action == "remove":
+            n += int(bool(arrban.remove_group(g)))
         else:
             r = arrban.add("group", g, "banned by hand while on strikes",
                            "you", by="you", arrs=arrs)
             n += int(bool(r.get("ok")))
     if n:
-        joblog.log(f"release bans: {n} group(s) {'forgiven' if action == 'clear' else 'banned'}"
+        verb = {"clear": "forgiven", "remove": "removed, release bans lifted"}.get(action, "banned")
+        joblog.log(f"release bans: {n} group(s) {verb}"
                    f" by hand: {', '.join(grps)[:200]}", "info")
         if action != "clear":
             arrban.kick(arrban.SYNC_HAND_S)
@@ -45738,12 +45741,12 @@ function poPaint(){
       <b style="color:#6fb0ff">Last messages</b>
       ${st.pending?`<span class="busy" style="color:var(--acc);font-size:11px;margin-left:8px"><span class="sp"></span>${st.pending} waiting for the quiet window</span>`:''}
       ${rows.length?`<div class="rowbox" style="max-height:260px;margin-top:6px"><table class="sktbl" style="width:100%;font-size:11.5px;table-layout:fixed">
-        <colgroup><col style="width:78px"><col style="width:64px"><col style="width:auto"><col style="width:34px"></colgroup>
+        <colgroup><col style="width:78px"><col style="width:64px"><col style="width:auto"><col style="width:52px"></colgroup>
         <thead><tr class="dim" style="font-size:10.5px"><th class="c">when</th><th class="c">arr</th><th class="l">message</th><th class="c">sent</th></tr></thead>
         <tbody>${rows.map(r=>`<tr>
           <td class="c mono dim" style="font-size:10.5px;white-space:nowrap" title="${esc(new Date((r.at||0)*1000).toLocaleString())}">${ago(r.at)}</td>
           <td class="c" style="font-weight:600;${r.arr?'color:'+arrLook(r.arr).c:''}">${esc(r.arr||'—')}</td>
-          <td class="l" title="${esc(r.error||r.detail||'')}"><span class="mono">${esc(r.title||'')}</span>
+          <td class="l" title="${esc(r.error||r.detail||'')}"><span class="mono">${esc(r.title||'')}</span>${r.eng?` <span style="font-size:10px;color:#7fd4a3;border:1px solid #7fd4a355;border-radius:3px;padding:0 4px">+ English audio${r.eng>1?' ×'+r.eng:''}</span>`:''}
             <div class="dim" style="font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap${r.ok?'':';color:#e0575b'}">${esc(r.ok?(r.detail||''):('failed: '+(r.error||'')))}</div></td>
           <td class="c" style="color:${r.ok?'#7fd4a3':'#e0575b'};overflow:visible;text-overflow:clip">${r.ok?'✓':'✗'}</td></tr>`).join('')}</tbody></table></div>`
         :'<div class="dim" style="font-size:11px;margin-top:4px">nothing sent yet</div>'}
@@ -45948,9 +45951,12 @@ function banStyle(){
     .bansp{display:inline-block;width:10px;height:10px;border-radius:50%;
       border:2px solid #6fb0ff;border-right-color:transparent;
       animation:banSpin .8s linear infinite;vertical-align:-1px}
-    .banscope{font-size:10px;padding:0 2px;background:transparent;
-      border:1px solid var(--line);border-radius:4px;color:inherit}
-    .banscope.s{color:#6fb0ff}.banscope.r{color:#e3b341}
+    .banscope{font-size:10px;padding:0 2px;background:#161b22;color-scheme:dark;
+      border:1px solid var(--line);border-radius:4px;color:#e6edf3}
+    .banscope.s{color:#35c5f4}.banscope.r{color:#ffc230}
+    .banscope option{background:#161b22;color:#e6edf3}
+    .banscope option[value="sonarr"]{color:#35c5f4}
+    .banscope option[value="radarr"]{color:#ffc230}
     .bantbl th{cursor:pointer;user-select:none}
     .bantbl th,.bantbl td{padding-left:5px;padding-right:5px}
     .bantbl tr.sel>td{background:rgba(88,166,255,.06)}
@@ -46179,7 +46185,8 @@ function bstRowHtml(x,i){
     <td class="c dim" style="font-size:10.5px" title="${esc(banWhenFull(x.last))}">${x.last?ago(x.last):''}</td>
     <td class="r askhost">${banScopeSel('',`id="bstsc-${i}"`)}
       <button class="rmb" onclick="banStrike('${g}','ban',${i})" title="Ban the group now, without waiting for strike ${max}">Ban now</button>
-      <button class="rmb" onclick="banStrike('${g}','clear',${i})" title="Clear its strikes; the releases already banned stay banned">forgive</button></td>
+      <button class="rmb" onclick="banStrike('${g}','clear',${i})" title="Clear its strikes; the releases already banned stay banned">forgive</button>
+      <button class="rmb" style="color:var(--bad,#e05252)" onclick="banStrike('${g}','remove',${i})" title="Take it off this list: clear its strikes AND lift the release bans that earned them">remove</button></td>
   </tr>${open?`<tr class="det" id="bstdet-${esc(x.grp)}"><td colspan="6" style="padding:0;border-bottom:1px solid var(--line)">${bstDetail(x)}</td></tr>`:''}`;
 }
 function bstSelBar(){
@@ -46190,6 +46197,7 @@ function bstSelBar(){
     <span style="display:inline-flex;gap:4px;align-items:center">${banScopeSel('',`id="bstBulkScope" style="font-size:10.5px"`)}
       <button class="rmb" onclick="bstBulk('ban',this)" title="Ban them now, without waiting for the third strike">Ban ${fmt(n)} now</button></span>
     <button class="rmb" onclick="bstBulk('clear',this)" title="Clear their strikes; releases already banned stay banned">Forgive ${fmt(n)}</button>
+    <button class="rmb" style="color:var(--bad,#e05252)" onclick="bstBulk('remove',this)" title="Clear their strikes AND lift the release bans that earned them">Remove ${fmt(n)}</button>
     <button class="rmb" onclick="_bstSel.clear();_bstLast=null;bstPaint()">Clear</button>
     <span class="dim" style="font-size:10.5px">shift-click to take a range</span>
   </div>`;
@@ -46204,7 +46212,7 @@ function bstTableHtml(){
       <span class="dim" style="font-weight:400"> — a strike is a release from this group that nuarr downloaded and had to reject; at ${max} the group is banned automatically.</span></div>
     <div id="bstSel">${bstSelBar()}</div>
     <div class="rowbox" style="max-height:260px"><table class="sktbl bantbl" style="width:100%;font-size:11.5px;table-layout:fixed">
-      <colgroup><col style="width:24px"><col style="width:auto"><col style="width:84px"><col style="width:44px"><col style="width:62px"><col style="width:188px"></colgroup>
+      <colgroup><col style="width:24px"><col style="width:auto"><col style="width:84px"><col style="width:44px"><col style="width:62px"><col style="width:300px"></colgroup>
       <thead><tr class="dim" style="font-size:10.5px">
         <th class="l" onclick="event.stopPropagation()"><input type="checkbox" ${allOn?'checked':''} title="Select every group" onclick="bstSelAll(this.checked)"></th>
         ${th('grp','group · last reason','l','Sort by group; click the name to open the row')}
@@ -46231,11 +46239,14 @@ function bstSortBy(k){ if(_bstSort.k===k) _bstSort.d=-_bstSort.d; else _bstSort=
 async function bstBulk(action, btn){
   const ids=bstSelIds(); if(!ids.length) return;
   if(action==='clear'&&!confirm(`Forgive ${ids.length} group(s)? Their strikes are cleared; the releases already banned stay banned.`)) return;
+  if(action==='remove'&&!confirm(`Remove ${ids.length} group(s) from the strike list? Their strikes are cleared AND the release bans that earned them are lifted, so those releases can be grabbed again.`)) return;
   const sc=document.getElementById('bstBulkScope');
   if(btn) btn.classList.add('spin');
   try{ await fetch('/api/arrban/strike?grp='+encodeURIComponent(ids.join('\n'))+'&action='+action
       +'&arrs='+encodeURIComponent(sc?sc.value:''),{method:'POST'}); }catch(e){}
-  banSay(action==='clear'?`<span class="dim">${ids.length} group(s) forgiven</span>`:`<span class="ok">${ids.length} group(s) banned</span>`);
+  banSay(action==='clear'?`<span class="dim">${ids.length} group(s) forgiven</span>`
+        :action==='remove'?`<span class="dim">${ids.length} group(s) removed, their release bans lifted</span>`
+        :`<span class="ok">${ids.length} group(s) banned</span>`);
   _bstSel.clear(); _bstLast=null;
   banRefresh();
 }
@@ -46353,10 +46364,12 @@ async function banBulk(action, btn){
 async function banStrike(grp,action,i){
   const sel=document.getElementById('bstsc-'+i);
   if(action==='clear'&&!confirm(`Forgive ${grp}? Its strikes are cleared; the releases already banned stay banned.`)) return;
+  if(action==='remove'&&!confirm(`Remove ${grp} from the strike list? Its strikes are cleared AND the release bans that earned them are lifted, so those releases can be grabbed again.`)) return;
   try{ await fetch('/api/arrban/strike?grp='+encodeURIComponent(grp)+'&action='+action
       +'&arrs='+encodeURIComponent(sel?sel.value:''),{method:'POST'}); }catch(e){}
   banSay(action==='clear'?`<span class="dim">${esc(grp)} forgiven</span>`
-                         :`<span class="ok">${esc(grp)} banned</span>`);
+        :action==='remove'?`<span class="dim">${esc(grp)} removed, its release bans lifted</span>`
+        :`<span class="ok">${esc(grp)} banned</span>`);
   banRefresh();
 }
 async function arrsToggle(job,on){

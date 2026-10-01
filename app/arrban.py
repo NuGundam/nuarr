@@ -220,6 +220,26 @@ def clear_strikes(grp: str) -> bool:
         return bool(cur.rowcount)
 
 
+def remove_group(grp: str) -> int:
+    """Take a group off the strike list entirely: its strikes go AND the
+    release bans that earned them are lifted, so those exact releases can be
+    grabbed again. Forgive keeps the release bans; this is the full undo.
+    Returns how many rows went (strike row + releases)."""
+    init()
+    g = str(grp).lower()
+    with cursor() as cur:
+        rel = [r["id"] for r in cur.execute(
+            "SELECT id, value FROM arr_bans WHERE kind='release'")
+            if group_of(r["value"]).lower() == g]
+        n = 0
+        if rel:
+            cur.execute(f"DELETE FROM arr_bans WHERE id IN ({','.join('?' * len(rel))})", rel)
+            n += cur.rowcount
+        cur.execute("DELETE FROM arr_ban_strikes WHERE grp=?", (str(grp),))
+        n += cur.rowcount
+    return n
+
+
 def bulk(ids: list, action: str, arrs: str = "") -> int:
     """One change to many rows: 'on', 'off', 'scope' (with arrs), 'remove'.
     One transaction, one push - not one push per row."""
