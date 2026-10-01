@@ -45496,6 +45496,13 @@ async function loadArrsTab(){
       </div>
     </div>`;
   };
+  // "in 4m" / "due now" for a timestamp ahead; the clock time sits beside it.
+  const jobIn=t=>{ const s=t-Date.now()/1000; return s<=5?'due now'
+    : s<60?'in '+Math.round(s)+'s' : s<3600?'in '+Math.round(s/60)+'m'
+    : 'in '+(s/3600).toFixed(1)+'h'; };
+  // The same line twelve times is one line with a count.
+  const jobDedupe=xs=>{ const m=new Map(); xs.forEach(x=>m.set(x,(m.get(x)||0)+1));
+    return [...m].map(([x,n])=>n>1?x+'  ×'+n:x); };
   const job=(id,title,desc,on,st,ed)=>`
     <div style="border:1px solid var(--line);border-radius:8px;padding:10px 14px;margin-bottom:10px">
       <div style="display:flex;align-items:center;gap:10px">
@@ -45507,12 +45514,18 @@ async function loadArrsTab(){
       </div>
       <div class="dim" style="font-size:11px;margin:6px 0 4px">${desc}</div>
       <div class="mono" style="font-size:11px">
-        ${st.last_run?`last run ${new Date(st.last_run*1000).toLocaleString()} — ${esc(st.last_result||'')}`
-                     :'<span class="dim">has not run yet</span>'}
-        ${on&&st.next_run?`<div class="dim">next ~${new Date(st.next_run*1000).toLocaleTimeString()}</div>`:''}
+        <div style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:2px">
+          <span title="${st.last_run?esc(new Date(st.last_run*1000).toLocaleString()):''}"><span class="dim">last run</span> ${
+            st.running?'<span style="color:var(--acc)">running now…</span>'
+            :st.last_run?`${ago(st.last_run)} <span class="dim">(${new Date(st.last_run*1000).toLocaleTimeString()})</span>`:'<span class="dim">not yet</span>'}</span>
+          <span title="${st.next_run?esc(new Date(st.next_run*1000).toLocaleString()):''}"><span class="dim">next run</span> ${
+            !on?'<span class="dim">off</span>'
+            :st.next_run?`${jobIn(st.next_run)} <span class="dim">(${new Date(st.next_run*1000).toLocaleTimeString()})</span>`:'<span class="dim">—</span>'}</span>
+        </div>
+        ${st.last_run?`<div>${esc(st.last_result||'')}</div>`:''}
         ${(st.new_formats&&st.new_formats.length&&!ed)?`<div class="dim" style="margin-top:4px">new in the guides: ${esc(st.new_formats.join(', '))}</div>`:''}
         ${(st.detail&&st.detail.length&&st.detail.join('; ')!==(st.last_result||''))
-          ?`<div class="dim" style="margin-top:4px">${st.detail.map(x=>esc(x)).join('<br>')}</div>`:''}
+          ?`<div class="dim" style="margin-top:4px">${jobDedupe(st.detail).map(x=>esc(x)).join('<br>')}</div>`:''}
       </div>
       ${editor(ed)}
     </div>`;
@@ -45563,7 +45576,7 @@ async function loadArrsTab(){
         'When nuarr rejects a release - no English in a file that said DUAL, a raw '
         +'with nothing to read, a container that does not decode - the arr blocklists '
         +'that ONE grab from that ONE indexer, and the same release is on four others. '
-        +'This bans the release NAME as a -10000 custom format on the profiles listed, '
+        +'This bans the release NAME as a -999999 custom format on the profiles listed, '
         +'so no indexer can hand it back; a group that keeps doing it is banned outright '
         +'after '+String(rb.group_strikes||3)+' strikes. The list below is the whole '
         +'state and yours to edit.',
@@ -46109,9 +46122,11 @@ function banCountsHtml(rb){
 function banSyncHtml(s){
   if(!s||!s.state||s.state==='idle')
     return `<span class="dim">no push yet since nuarr started — a change here is pushed to the arrs within 2 seconds</span>`;
+  const lastTook=s.last_took||s.took||0;
   if(s.state==='queued')
     return `<span class="bansp"></span> <span>change saved — pushing to the arrs ${
-      (s.in||0)>0.6?'in '+Math.ceil(s.in)+'s':'now'}…</span>`;
+      (s.in||0)>0.6?'in '+Math.ceil(s.in)+'s':'now'}…</span>${lastTook?` <span class="dim">· a push takes about ${
+      Math.max(1,Math.round(lastTook))}s, ready in ~${Math.max(1,Math.ceil((s.in||0)+lastTook))}s</span>`:''}`;
   const arrs=Object.entries(s.arrs||{});
   const pct=a=> a.step==='done'?100 : a.step==='failed'?100
     : a.step==='profiles'?50+50*(a.total?a.done/a.total:0)
@@ -46125,8 +46140,12 @@ function banSyncHtml(s){
       <div class="banbar ${a.ok===false?'bad':a.step==='done'?'done':''}"><i style="width:${pct(a).toFixed(0)}%"></i></div>
       <span class="dim" style="width:220px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
         title="${esc(a.note||'')}">${stepTxt(a)}</span></div>`).join('');
-  if(s.state==='pushing')
-    return `<div><span class="bansp"></span> pushing to the arrs…</div>${bars}`;
+  if(s.state==='pushing'){
+    const el=Math.max(0,(s.now||Date.now()/1000)-(s.started||0));
+    const left=lastTook?Math.max(0,lastTook-el):0;
+    return `<div><span class="bansp"></span> pushing to the arrs… <span class="dim">${Math.round(el)}s in${
+      lastTook?(left>0.5?` · ~${Math.ceil(left)}s left`:' · nearly done'):''}</span></div>${bars}`;
+  }
   const at=s.finished?new Date(s.finished*1000).toLocaleTimeString():'';
   if(s.state==='error')
     return `<div class="err">push failed at ${at}: ${esc(s.error||'')}</div>${bars}`;

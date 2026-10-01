@@ -44,6 +44,7 @@ import json
 import os
 import re
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -87,6 +88,7 @@ EXEC_SAYS = ("found executable file", "potentially dangerous file")
 
 STATS: dict = {"last_run": 0.0, "last_result": "", "next_run": 0.0,
                "removed": 0, "swept": 0, "kept": 0, "detail": [], "running": False}
+KV_LAST = "arrqueue.last"     # last run survives a restart, so the card is not blank
 
 
 # ------------------------------------------------------------ the arrs -----
@@ -426,9 +428,17 @@ def _pass() -> str:
                 losers[r["id"]] = (f"a better download for the same {'episode' if a.kind == 'sonarr' else 'movie'} "
                                    f"is in the queue ({r.get('customFormatScore') or 0} vs "
                                    f"{best.get('customFormatScore') or 0}: {(best.get('title') or '')[:60]})")
+        # ONE DOWNLOAD, MANY ROWS. A season pack is one torrent and one row
+        # per episode in the queue; removing it through the first row takes
+        # the whole download, and every later row then answered 404 - twelve
+        # "could not remove Sugar.Apple.Fairy.Tale..." lines for one success.
+        gone: set = set()
         for r in rows:
             if r.get("downloadId"):
                 tracked.add(str(r["downloadId"]).upper())
+            did = str(r.get("downloadId") or "").upper()
+            if did and did in gone:
+                continue
             bad = _malware(r, exe)
             why = bad or losers.get(r["id"]) or _verdict(a, r)
             if not why:
@@ -436,7 +446,13 @@ def _pass() -> str:
                     kept += 1
                 continue
             try:
-                _remove(a, r, blocklist=bool(bad))
+                try:
+                    _remove(a, r, blocklist=bool(bad))
+                except urllib.error.HTTPError as he:
+                    if he.code != 404:              # 404: already gone with its pack
+                        raise
+                if did:
+                    gone.add(did)
                 removed += 1
                 if bad:
                     malware += 1
@@ -475,6 +491,10 @@ async def run() -> str:
         STATS["running"] = False
     STATS["last_run"] = time.time()
     STATS["last_result"] = res
+    try:
+        kv_set(KV_LAST, json.dumps({"at": STATS["last_run"], "result": res}))
+    except Exception:                                            # noqa: BLE001
+        pass
     if res != "nothing to clean":
         joblog.log("arr queue janitor: " + res, "ok")
         for ln in STATS["detail"]:
@@ -484,6 +504,13 @@ async def run() -> str:
 
 async def watch() -> None:
     from .gate import get_toggle
+    STATS["next_run"] = time.time() + 300
+    try:
+        last = json.loads(kv_get(KV_LAST) or "{}")
+        STATS["last_run"] = float(last.get("at") or 0.0)
+        STATS["last_result"] = str(last.get("result") or "")
+    except Exception:                                            # noqa: BLE001
+        pass
     await asyncio.sleep(300)             # never compete with startup
     while True:
         try:

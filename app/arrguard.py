@@ -409,6 +409,12 @@ def ensure_defaults() -> None:
 
 async def watch() -> None:
     from .gate import get_toggle
+    from . import arrban
+    # The cards show "next run"; before the first pass that is this sleep.
+    first = time.time() + 240
+    STATS["guard"]["next_run"] = first
+    STATS["trash"]["next_run"] = first
+    arrban.STATS["next_run"] = first
     await asyncio.sleep(240)             # never compete with startup
     try:
         ensure_defaults()

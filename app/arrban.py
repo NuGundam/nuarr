@@ -46,7 +46,13 @@ CF_GROUPS = "Nuarr: rejected groups"
 # would quietly match none of them. A term is matched wherever it appears
 # in the name, which is exactly what a release profile did.
 CF_TERMS = "Nuarr: banned terms"
-SCORE = -10000
+# A BAN HAS TO OUTWEIGH EVERYTHING ELSE A RELEASE CAN SCORE. This was -10000,
+# and on the Nu profiles - where tier formats put a good release at 850,000+
+# against a 200,000 minimum - that was a rounding error: Radarr grabbed
+# Cesium.Fallout...-UBWEB on 2026-09-30 at 910,300 WITH "Nuarr: rejected
+# groups" matched, a week after the group was banned. -999999 is what the
+# guides' own Banned Groups formats use, for the same reason.
+SCORE = -999999
 GROUP_STRIKES = 3           # rejections from one group before the group is banned
 PER_FORMAT = 250            # release patterns per format before rolling over
 SYNC_DEBOUNCE_S = 45.0      # nuarr's own rejections: batch them
@@ -237,6 +243,8 @@ def remove_group(grp: str) -> int:
             n += cur.rowcount
         cur.execute("DELETE FROM arr_ban_strikes WHERE grp=?", (str(grp),))
         n += cur.rowcount
+    if rel:
+        _mark_dirty()
     return n
 
 
@@ -446,7 +454,7 @@ async def _sync_locked() -> str:
             if c.enabled and c.kind in ("radarr", "sonarr")]
     t0 = time.time()
     SYNC.update(state="pushing", started=t0, finished=0.0, took=0.0, error="",
-                due_at=0.0,
+                due_at=0.0, last_took=SYNC.get("took") or SYNC.get("last_took") or 0.0,
                 arrs={c.name: {"kind": c.kind, "step": "starting", "done": 0,
                                "total": 0, "ok": None, "note": "",
                                "changed": 0, "same": 0} for c in cfgs})
@@ -631,6 +639,12 @@ async def _sync_after(delay: float) -> None:
             SYNC.update(state="error", error=f"{type(e).__name__}: {e}",
                         finished=time.time())
             joblog.log(f"arr release bans: {type(e).__name__}: {e}", "error")
+    elif SYNC["state"] == "queued":
+        # NOTHING TO PUSH IS STILL AN ANSWER. A kick with no change behind it
+        # (a forgive, or a remove that lifted no release ban) used to leave the
+        # card on "change saved - pushing to the arrs now..." forever: the
+        # state said queued and nothing would ever move it on.
+        SYNC.update(state="done" if SYNC.get("finished") else "idle", due_at=0.0)
     # A change made while that push was running is not in it - go again.
     if STATS["dirty"]:
         kick(SYNC_HAND_S)
