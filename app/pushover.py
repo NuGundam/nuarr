@@ -50,6 +50,13 @@ DEFAULT_OPTS = {"imports": True, "upgrades": True, "digest": True,
 STATS: dict = {"sent": 0, "failed": 0, "last_sent": 0.0, "last_error": "",
                "pending": 0, "limit": None, "remaining": None, "reset": None}
 _PENDING: dict[tuple, dict] = {}       # (arr, series) -> {"at", "items": [...]}
+# ONE IMPORT, TWO WEBHOOKS. Sonarr's nuarr connection has both On File Import
+# and On Import Complete ticked (webhooks.py wants both), and both arrive as
+# eventType "Download" carrying the same file - so My Home Hero S01E02, one
+# file, went out as "My Home Hero (2 files)" listing E02 twice. A file seen
+# in the last SEEN_S is the same import again, not a second one.
+_SEEN: dict[tuple, float] = {}
+SEEN_S = 600.0
 _FLUSHER: asyncio.Task | None = None
 
 
@@ -279,6 +286,13 @@ def queue(item: dict | None) -> None:
     global _FLUSHER
     if not item or not enabled():
         return
+    now = time.time()
+    for k in [k for k, t in _SEEN.items() if now - t > SEEN_S]:
+        _SEEN.pop(k, None)
+    seen = (item["arr"], item["label"].lower(), item["spec"], item["upgrade"])
+    if seen in _SEEN:
+        return
+    _SEEN[seen] = now
     key = (item["arr"], item["series"].lower())
     p = _PENDING.setdefault(key, {"at": 0.0, "items": []})
     p["items"].append(item)

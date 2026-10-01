@@ -45738,14 +45738,14 @@ function poPaint(){
       <b style="color:#6fb0ff">Last messages</b>
       ${st.pending?`<span class="busy" style="color:var(--acc);font-size:11px;margin-left:8px"><span class="sp"></span>${st.pending} waiting for the quiet window</span>`:''}
       ${rows.length?`<div class="rowbox" style="max-height:260px;margin-top:6px"><table class="sktbl" style="width:100%;font-size:11.5px;table-layout:fixed">
-        <colgroup><col style="width:62px"><col style="width:58px"><col style="width:auto"><col style="width:24px"></colgroup>
-        <thead><tr class="dim" style="font-size:10.5px"><th class="c">when</th><th class="c">arr</th><th class="l">message</th><th></th></tr></thead>
+        <colgroup><col style="width:78px"><col style="width:64px"><col style="width:auto"><col style="width:34px"></colgroup>
+        <thead><tr class="dim" style="font-size:10.5px"><th class="c">when</th><th class="c">arr</th><th class="l">message</th><th class="c">sent</th></tr></thead>
         <tbody>${rows.map(r=>`<tr>
-          <td class="c mono dim" style="font-size:10.5px" title="${esc(new Date((r.at||0)*1000).toLocaleString())}">${ago(r.at)}</td>
-          <td class="c dim">${esc(r.arr||'')}</td>
+          <td class="c mono dim" style="font-size:10.5px;white-space:nowrap" title="${esc(new Date((r.at||0)*1000).toLocaleString())}">${ago(r.at)}</td>
+          <td class="c" style="font-weight:600;${r.arr?'color:'+arrLook(r.arr).c:''}">${esc(r.arr||'—')}</td>
           <td class="l" title="${esc(r.error||r.detail||'')}"><span class="mono">${esc(r.title||'')}</span>
             <div class="dim" style="font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap${r.ok?'':';color:#e0575b'}">${esc(r.ok?(r.detail||''):('failed: '+(r.error||'')))}</div></td>
-          <td class="c" style="color:${r.ok?'#7fd4a3':'#e0575b'}">${r.ok?'✓':'✗'}</td></tr>`).join('')}</tbody></table></div>`
+          <td class="c" style="color:${r.ok?'#7fd4a3':'#e0575b'};overflow:visible;text-overflow:clip">${r.ok?'✓':'✗'}</td></tr>`).join('')}</tbody></table></div>`
         :'<div class="dim" style="font-size:11px;margin-top:4px">nothing sent yet</div>'}
     </div>`;
 }
