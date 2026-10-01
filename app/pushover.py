@@ -42,7 +42,7 @@ KV_ON = "pushover.on"
 KV_OPTS = "pushover.opts"
 KV_RECENT = "pushover.recent"
 RECENT_KEEP = 30
-QUIET_S = 20.0            # a pack's webhooks arrive seconds apart; wait this long
+QUIET_S = 60.0            # a pack lands one file every few seconds - Sugar Apple had a 29 s gap after E01
 MSG_LIMIT = 1024          # Pushover's message cap
 DEFAULT_OPTS = {"imports": True, "upgrades": True, "digest": True,
                 "priority": -1, "sound": "", "link": True}
@@ -101,10 +101,46 @@ def _recent() -> list:
 
 
 def _remember(row: dict) -> None:
+    # Each row keeps what was actually sent (title and body), so the page can
+    # open a row to show it and send it again. The id is the send time in ns,
+    # which two rows cannot share.
+    row.setdefault("id", str(time.time_ns()))
     try:
         kv_set(KV_RECENT, json.dumps(([row] + _recent())[:RECENT_KEEP]))
     except Exception:                                            # noqa: BLE001
         pass
+
+
+def _rid(r: dict) -> str:
+    """Rows from before ids existed are addressed by their send time."""
+    return str(r.get("id") or r.get("at"))
+
+
+def forget(ids: list) -> int:
+    """Drop rows from the list. Nothing on the phone changes."""
+    ids = {str(i) for i in ids or []}
+    rows = _recent()
+    keep = [r for r in rows if _rid(r) not in ids]
+    kv_set(KV_RECENT, json.dumps(keep))
+    return len(rows) - len(keep)
+
+
+async def resend(ids: list) -> dict:
+    """Send these rows' messages again, exactly as they went out. A row from
+    before the body was kept has nothing to resend and is reported as such."""
+    ids = {str(i) for i in ids or []}
+    sent = failed = skipped = 0
+    for r in [r for r in _recent() if _rid(r) in ids]:
+        if not r.get("msg"):
+            skipped += 1
+            continue
+        ok, err = await send(r.get("ptitle") or r.get("title") or "nuarr", r["msg"],
+                             url=_link())
+        _remember({**{k: v for k, v in r.items() if k not in ("id", "at", "ok", "error")},
+                   "at": time.time(), "ok": ok, "error": err, "resent": True})
+        sent += int(ok)
+        failed += int(not ok)
+    return {"sent": sent, "failed": failed, "skipped": skipped}
 
 
 # ------------------------------------------------------------ sending ------
@@ -297,11 +333,21 @@ def queue(item: dict | None) -> None:
     now = time.time()
     for k in [k for k, t in _SEEN.items() if now - t > SEEN_S]:
         _SEEN.pop(k, None)
-    seen = (item["arr"], item["label"].lower(), item["spec"], item["upgrade"])
+    # THE EPISODE IS THE KEY, NOT THE PAYLOAD. The two webhooks for one import
+    # do not agree with each other: Tomb Raider King S01E12 arrived once as an
+    # upgrade (On File Import) and once as a plain import (On Import Complete),
+    # so a key that included the upgrade flag let both through as "2 files,
+    # imported, 1 upgraded". When both turn up, the upgrade is the truer one -
+    # it carries the old file - so it replaces a plain import still waiting.
+    key = (item["arr"], item["series"].lower())
+    seen = (item["arr"], item["label"].lower())
     if seen in _SEEN:
+        if item["upgrade"]:
+            for i, x in enumerate((_PENDING.get(key) or {}).get("items", [])):
+                if x["label"].lower() == seen[1] and not x["upgrade"]:
+                    _PENDING[key]["items"][i] = item
         return
     _SEEN[seen] = now
-    key = (item["arr"], item["series"].lower())
     p = _PENDING.setdefault(key, {"at": 0.0, "items": []})
     p["items"].append(item)
     p["at"] = time.time()
@@ -337,7 +383,9 @@ async def _send_group(items: list) -> None:
             ok, err = await send(title, msg, url=_link())
             _remember({"at": time.time(), "arr": arr, "title": it["label"],
                        "detail": _plain(it["spec"] or (it["lines"][0] if it["lines"] else "")),
-                       "eng": int(bool(it.get("eng"))), "ok": ok, "error": err})
+                       "eng": int(bool(it.get("eng"))), "ok": ok, "error": err,
+                       "kind": "upgraded" if it["upgrade"] else "imported", "files": 1,
+                       "ptitle": title, "msg": msg})
             if not ok:
                 joblog.log(f"pushover: could not send {it['label']}: {err}", "warn")
         return
@@ -378,7 +426,9 @@ async def _send_group(items: list) -> None:
     msg += "\n" + "\n".join(tail)
     ok, err = await send(title, msg, url=_link())
     _remember({"at": time.time(), "arr": arr, "title": f"{series} ({len(items)} files)",
-               "detail": what, "eng": engs, "ok": ok, "error": err})
+               "detail": what, "eng": engs, "ok": ok, "error": err,
+               "kind": "upgraded" if ups == len(items) else "imported", "files": len(items),
+               "ptitle": title, "msg": msg})
     if not ok:
         joblog.log(f"pushover: could not send the {series} digest: {err}", "warn")
 

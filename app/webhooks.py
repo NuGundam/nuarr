@@ -674,6 +674,13 @@ def _mark_deleted(cfg_name: str, file_id: int, reason: str) -> None:
 def _tell_phone(cfg, body: dict, files: list, detail: str, upgrade: bool) -> None:
     """Hand a handled import to Pushover. Never lets a notification problem
     reach the webhook - the import is recorded whether or not the phone is."""
+    # SONARR'S "IMPORT COMPLETE" IS THE SAME IMPORTS AGAIN. Its connection
+    # has On File Import AND On Import Complete ticked; both arrive as
+    # eventType "Download", but Import Complete carries the whole download's
+    # episodeFiles list and no single episodeFile. The per-file events already
+    # told the phone about each of those, so this one is not news.
+    if cfg.kind == "sonarr" and not _obj(body.get("episodeFile")) and _objs(body.get("episodeFiles")):
+        return
     try:
         from . import pushover
         if pushover.enabled():

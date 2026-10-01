@@ -3142,6 +3142,20 @@ def api_pushover_opts(body: dict = Body(...)):
     return {"opts": pushover.set_opts(body or {})}
 
 
+@app.post("/api/pushover/forget")
+def api_pushover_forget(body: dict = Body(...)):
+    """Take messages off the list (ids from the page). The phone is untouched."""
+    from . import pushover
+    return {"n": pushover.forget(body.get("ids") or [])}
+
+
+@app.post("/api/pushover/resend")
+async def api_pushover_resend(body: dict = Body(...)):
+    """Send these messages again, exactly as they went out."""
+    from . import pushover
+    return await pushover.resend(body.get("ids") or [])
+
+
 @app.post("/api/pushover/test")
 async def api_pushover_test():
     from . import pushover
@@ -45688,7 +45702,8 @@ function poPaint(){
               : st.last_error ? 'last send failed' : 'ready';
   const col = !d.configured ? '#8a97a6' : !d.on ? '#8a97a6' : st.last_error ? '#e0575b' : '#7fd4a3';
   const prio = {'-2':'lowest (no sound, no banner)','-1':'quiet (no sound)','0':'normal','1':'high (bypasses quiet hours)'};
-  const rows=(d.recent||[]);
+  _poRows=(d.recent||[]);
+  const _box=el.querySelector('#poTable .rowbox'), _top=_box?_box.scrollTop:0;
   el.innerHTML=`
     <div class="lkind" style="padding:11px 12px;margin-bottom:10px">
       <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
@@ -45753,17 +45768,118 @@ function poPaint(){
     <div class="lkind" style="padding:11px 12px">
       <b style="color:#6fb0ff">Last messages</b>
       ${st.pending?`<span class="busy" style="color:var(--acc);font-size:11px;margin-left:8px"><span class="sp"></span>${st.pending} waiting for the quiet window</span>`:''}
-      ${rows.length?`<div class="rowbox" style="max-height:260px;margin-top:6px"><table class="sktbl" style="width:100%;font-size:11.5px;table-layout:fixed">
-        <colgroup><col style="width:78px"><col style="width:64px"><col style="width:auto"><col style="width:52px"></colgroup>
-        <thead><tr class="dim" style="font-size:10.5px"><th class="c">when</th><th class="c">arr</th><th class="l">message</th><th class="c">sent</th></tr></thead>
-        <tbody>${rows.map(r=>`<tr>
-          <td class="c mono dim" style="font-size:10.5px;white-space:nowrap" title="${esc(new Date((r.at||0)*1000).toLocaleString())}">${ago(r.at)}</td>
-          <td class="c" style="font-weight:600;${r.arr?'color:'+arrLook(r.arr).c:''}">${esc(r.arr||'—')}</td>
-          <td class="l" title="${esc(r.error||r.detail||'')}"><span class="mono">${esc(r.title||'')}</span>${r.eng?` <span style="font-size:10px;color:#7fd4a3;border:1px solid #7fd4a355;border-radius:3px;padding:0 4px">+ English audio${r.eng>1?' ×'+r.eng:''}</span>`:''}
-            <div class="dim" style="font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap${r.ok?'':';color:#e0575b'}">${esc(r.ok?(r.detail||''):('failed: '+(r.error||'')))}</div></td>
-          <td class="c" style="color:${r.ok?'#7fd4a3':'#e0575b'};overflow:visible;text-overflow:clip">${r.ok?'✓':'✗'}</td></tr>`).join('')}</tbody></table></div>`
-        :'<div class="dim" style="font-size:11px;margin-top:4px">nothing sent yet</div>'}
+      <div id="poSel">${poSelBar()}</div>
+      <div id="poTable" style="margin-top:6px">${poTableHtml()}</div>
     </div>`;
+  const _nb=el.querySelector('#poTable .rowbox'); if(_nb&&_top) _nb.scrollTop=_top;
+}
+// ---- Pushover: the message list ------------------------------------------
+// THE SAME SHAPE AS THE BAN LIST: checkbox per row (shift-click for a range,
+// header box for all), headings that sort, a caret that opens the row - and
+// the open row is the message exactly as the phone got it. A selection can
+// be sent again or forgotten from the list in one go.
+let _poRows=[], _poSort={k:'at',d:-1}, _poLast=null;
+const _poSel=new Set(), _poOpen=new Set();
+const poId=r=>String(r.id||r.at);
+function poRowsSorted(){
+  const k=_poSort.k, d=_poSort.d;
+  const v=r=> k==='at'?(r.at||0) : k==='arr'?(r.arr||'￿').toLowerCase()
+    : k==='ok'?(r.ok?1:0) : k==='files'?(r.files||1) : (r.title||'').toLowerCase();
+  return [..._poRows].sort((a,b)=>{ const x=v(a),y=v(b);
+    const c=(typeof x==='string')?x.localeCompare(y):(x-y); return c?c*d:((b.at||0)-(a.at||0)); });
+}
+function poSelIds(){ const live=new Set(_poRows.map(poId)); return [..._poSel].filter(i=>live.has(i)); }
+function poMsgHtml(m){
+  // Pushover's HTML subset: <b> <i> <font color> - shown here as it reads on
+  // the phone; anything else stays escaped.
+  return esc(m||'').replace(/&lt;(\/?)(b|i)&gt;/g,'<$1$2>')
+    .replace(/&lt;font color=(?:&quot;|")(#[0-9a-fA-F]{3,8})(?:&quot;|")&gt;/g,'<span style="color:$1">')
+    .replace(/&lt;\/font&gt;/g,'</span>').replace(/\n/g,'<br>');
+}
+function poDetail(r){
+  const row=(k,v)=>`<div style="display:flex;gap:8px;margin:2px 0"><span class="dim" style="flex:none;width:96px;text-align:right">${k}</span><span style="min-width:0;overflow-wrap:anywhere">${v}</span></div>`;
+  return `<div style="font-size:11px;padding:6px 10px 8px 34px;white-space:normal">
+    ${r.ptitle?row('title',`<b>${esc(r.ptitle)}</b>`):''}
+    ${r.msg?row('message',`<div style="border-left:2px solid var(--line);padding-left:8px">${poMsgHtml(r.msg)}</div>`)
+           :row('message','<span class="dim">sent before nuarr kept the full text — only the summary is on file</span>')}
+    ${row('sent', esc(new Date((r.at||0)*1000).toLocaleString())+(r.resent?' <span class="dim">(resent)</span>':''))}
+    ${r.ok?'':row('error',`<span style="color:#e0575b">${esc(r.error||'unknown')}</span>`)}
+  </div>`;
+}
+function poRowHtml(r){
+  const id=poId(r), on=_poSel.has(id), open=_poOpen.has(id), q=jsq(id);
+  return `<tr class="${on?'sel':''}">
+    <td class="l"><input type="checkbox" ${on?'checked':''} onclick="poToggle('${q}',event)"></td>
+    <td class="c mono dim" style="font-size:10.5px;white-space:nowrap" title="${esc(new Date((r.at||0)*1000).toLocaleString())}">${ago(r.at)}</td>
+    <td class="c" style="font-weight:600;${r.arr?'color:'+arrLook(r.arr).c:''}">${esc(r.arr||'—')}</td>
+    <td class="l" style="cursor:pointer" onclick="poOpenRow('${q}',event)" title="${esc(r.ptitle||r.title||'')}"
+      ><span class="actcaret">${open?'▾':'▸'}</span><span class="mono">${esc(r.title||'')}</span>${
+        r.eng?` <span style="font-size:10px;color:#7fd4a3;border:1px solid #7fd4a355;border-radius:3px;padding:0 4px">+ English audio${r.eng>1?' ×'+r.eng:''}</span>`:''}${
+        r.resent?' <span class="dim" style="font-size:10px">resent</span>':''}
+      <div class="dim" style="font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-left:14px${r.ok?'':';color:#e0575b'}">${esc(r.ok?(r.detail||''):('failed: '+(r.error||'')))}</div></td>
+    <td class="c dim">${r.files||''}</td>
+    <td class="c" style="color:${r.ok?'#7fd4a3':'#e0575b'}">${r.ok?'✓':'✗'}</td>
+  </tr>${open?`<tr class="det"><td colspan="6" style="padding:0;border-bottom:1px solid var(--line);background:rgba(255,255,255,.025)">${poDetail(r)}</td></tr>`:''}`;
+}
+function poTableHtml(){
+  banStyle();
+  if(!_poRows.length) return '<div class="dim" style="font-size:11px;margin-top:4px">nothing sent yet</div>';
+  const rows=poRowsSorted(), allOn=poSelIds().length===rows.length;
+  const th=(k,t,cls,tip)=>`<th class="${cls}" onclick="poSortBy('${k}')" title="${esc(tip||('Sort by '+t))}">${t} ${banMark(_poSort,k)}</th>`;
+  return `<div class="rowbox" style="max-height:300px"><table class="sktbl bantbl" style="width:100%;font-size:11.5px;table-layout:fixed">
+    <colgroup><col style="width:24px"><col style="width:78px"><col style="width:64px"><col style="width:auto"><col style="width:44px"><col style="width:52px"></colgroup>
+    <thead><tr class="dim" style="font-size:10.5px">
+      <th class="l" onclick="event.stopPropagation()"><input type="checkbox" ${allOn?'checked':''} title="Select every message" onclick="poSelAll(this.checked)"></th>
+      ${th('at','when','c','Newest first')}
+      ${th('arr','arr','c')}
+      ${th('title','message','l','Sort by name; click a row to open the message as sent')}
+      ${th('files','files','c','Files in the message - a digest lists several')}
+      ${th('ok','sent','c','Failed first, or delivered first')}
+    </tr></thead>
+    <tbody>${rows.map(poRowHtml).join('')}</tbody></table></div>`;
+}
+function poSelBar(){
+  const n=poSelIds().length;
+  if(!n) return '';
+  return `<div class="banselbar" style="margin-top:6px">
+    <b style="font-size:11.5px;color:#e3b341">${fmt(n)} message${n===1?'':'s'} selected</b>
+    <button class="rmb" onclick="poBulk('resend',this)" title="Send them to the phone again, exactly as they went out">Resend ${fmt(n)}</button>
+    <button class="rmb" style="color:var(--bad,#e05252)" onclick="poBulk('forget',this)" title="Take them off this list; nothing on the phone changes">Forget ${fmt(n)}</button>
+    <button class="rmb" onclick="_poSel.clear();_poLast=null;poPaintList()">Clear</button>
+    <span class="dim" style="font-size:10.5px">shift-click to take a range</span>
+    <span id="poBulkMsg" class="dim" style="font-size:10.5px"></span>
+  </div>`;
+}
+function poPaintList(){
+  const e=document.getElementById('poSel'); if(e) e.innerHTML=poSelBar();
+  keepBox('poTable', poTableHtml());
+}
+function poToggle(id, ev){
+  const rows=poRowsSorted(), i=rows.findIndex(r=>poId(r)===id);
+  if(ev && ev.shiftKey && _poLast!==null && i>=0){
+    const a=Math.min(i,_poLast), b=Math.max(i,_poLast), on=!_poSel.has(id);
+    for(let k=a;k<=b;k++){ const x=poId(rows[k]); if(on) _poSel.add(x); else _poSel.delete(x); }
+  }else{ if(_poSel.has(id)) _poSel.delete(id); else _poSel.add(id); }
+  if(i>=0) _poLast=i;
+  poPaintList();
+}
+function poSelAll(on){ if(on) _poRows.forEach(r=>_poSel.add(poId(r))); else _poSel.clear(); _poLast=null; poPaintList(); }
+function poOpenRow(id, ev){ if(ev) ev.stopPropagation(); if(_poOpen.has(id)) _poOpen.delete(id); else _poOpen.add(id); poPaintList(); }
+function poSortBy(k){ if(_poSort.k===k) _poSort.d=-_poSort.d; else _poSort={k, d:(k==='at'||k==='files')?-1:1}; _poLast=null; poPaintList(); }
+async function poBulk(action, btn){
+  const ids=poSelIds(); if(!ids.length) return;
+  if(action==='forget'&&!confirm(`Forget ${ids.length} message(s)? They come off this list; nothing on the phone changes.`)) return;
+  if(action==='resend'&&!confirm(`Send ${ids.length} message(s) to the phone again?`)) return;
+  if(btn) btn.classList.add('spin');
+  let r={};
+  try{ r=await (await fetch('/api/pushover/'+action,{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({ids})})).json(); }catch(e){ r={error:String(e)}; }
+  _poSel.clear(); _poLast=null;
+  if(action==='forget') ids.forEach(i=>_poOpen.delete(i));
+  await loadPushover(true);
+  const m=document.getElementById('poMsg');
+  if(m){ m.style.color=''; m.textContent = action==='forget' ? `${r.n||0} forgotten`
+       : `${r.sent||0} resent${r.failed?`, ${r.failed} failed`:''}${r.skipped?`, ${r.skipped} had no full text to resend`:''}`; }
 }
 async function poEnable(on){
   await fetch('/api/pushover/enabled?on='+(on?1:0),{method:'POST'});
