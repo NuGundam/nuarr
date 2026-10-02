@@ -997,6 +997,9 @@ async def _startup() -> None:
     asyncio.create_task(arrguard.watch())
     from . import arrqueue as _arrqueue
     asyncio.create_task(_arrqueue.watch())
+    # SSD wear: the staging drive was at 90% before anyone looked. See diskwear.py.
+    from . import diskwear as _diskwear
+    asyncio.create_task(_diskwear.watch())
     # CLOSES THE LOOP. Every rule here is a claim that Plex will play the file
     # without working for it; nothing checked the claim, which is how the EAE
     # bug survived for months. This watches what Plex actually decided.
@@ -5939,7 +5942,7 @@ def api_health():
             "notland": "Still not landed", "counts": "Counts", "logs": "Logs",
             "ocr": "OCR engines", "ruleschk": "Rule check",
             "process": "Processing System", "alang": "Audio language",
-            "plex": "Plex"}
+            "plex": "Plex", "tmdisk": "Task manager · disks"}
 
     # key -> (what fixes it, the sentence explaining why the others do not)
     REMEDY = {
@@ -6200,6 +6203,21 @@ def api_health():
         add("arrhealth", "Sonarr and Radarr's own health", "arrs", 0,
             "check unavailable", warn=False,
             when="the arrs' own report")
+
+    # SSD WEAR. The NVMe drives' own "Percentage Used" and bytes written,
+    # read from their health logs - the figure StableBit Scanner shows. Amber
+    # at diskwear.WARN_AT%, or on a drive's own critical flag / spare / media
+    # errors. Cached ten minutes; the Health page does not wake the drives.
+    try:
+        from . import diskwear as _dw
+        _drives = _dw.read()
+        _n, _line = _dw.summary(_drives)
+        add("diskwear", "SSD wear", "tmdisk", _n, _line, warn=bool(_n),
+            when=f"the drives' own health log · amber at {_dw.WARN_AT}% used")
+    except Exception as e:                                   # noqa: BLE001
+        add("diskwear", "SSD wear", "tmdisk", 0,
+            f"check unavailable: {type(e).__name__}", warn=False,
+            when="the drives' own health log")
 
     def _ago_words(at: float) -> str:
         if not at:
