@@ -1760,7 +1760,8 @@ def enqueue_many(rows: list, kind: str, priority: int = 50,
             batch.append((uuid.uuid4().hex[:12], fid, kind, "queued",
                           _fresh_priority(states.get(fid, ""), priority),
                           pool, r["path"],
-                          titles.get(fid) or r.get("name")
+                          titles.get(fid)
+                          or (r.get("name") if not str(r.get("name") or "").startswith("(untitled)") else "")
                           or os.path.basename(r["path"]),
                           r.get("plan_json") or None, now, source))
         if batch:
@@ -1992,7 +1993,14 @@ async def enqueue(file_id: int, path: str, title: str = "",
                               (file_id,)).fetchone()
         if row and row["title"]:
             title = display_label(row["title"], row["season"], row["episode"])
-    title = title or os.path.basename(path)
+    # "(untitled)" IS NOT A TITLE. display_label() writes it for a file whose
+    # arr title has not arrived yet, and callers that built a label that way
+    # (the auto-queue does) passed it straight through - so a file imported a
+    # minute earlier ran its transcode as "(untitled)" while the decode and
+    # listen jobs queued beside it fell back to the file name. Same fallback
+    # for all of them.
+    if not title or title.startswith("(untitled)"):
+        title = os.path.basename(path)
 
     # PRE-FLIGHT BEFORE ANY WORK.
     # We commit by replacing the file in place, so if the existing path is
