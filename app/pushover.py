@@ -250,6 +250,30 @@ def _obj(x) -> dict:
     return x if isinstance(x, dict) else {}
 
 
+# The naming format's audio tag: "[JA]", "[JA+EN]", "[EN+JA]".
+_TAG = re.compile(r"\[([A-Z]{2}(?:\+[A-Z]{2})*)\]")
+_TWO = {"EN": "eng", "JA": "jpn", "KO": "kor", "ZH": "zho", "ES": "spa", "FR": "fra",
+        "DE": "deu", "IT": "ita", "PT": "por", "RU": "rus", "HI": "hin", "TH": "tha"}
+
+
+def _file_langs(path: str) -> set:
+    """Audio languages of a file as nuarr knows them: its own probe first,
+    then the [JA+EN] tag in the name. Empty when neither says."""
+    try:
+        from .db import cursor
+        with cursor() as cur:
+            r = cur.execute("SELECT audio_langs FROM files WHERE path=? COLLATE NOCASE "
+                            "ORDER BY id DESC LIMIT 1", (path,)).fetchone()
+        if r and r["audio_langs"]:
+            return {x.strip() for x in str(r["audio_langs"]).split(",") if x.strip()}
+    except Exception:                                            # noqa: BLE001
+        pass
+    tags = _TAG.findall(os.path.basename(path or ""))
+    if tags:
+        return {_TWO.get(t, t.lower()) for t in tags[-1].split("+")}
+    return set()
+
+
 def _placed(name: str) -> dict:
     """nuarr's own placement record for this file, if its import went through
     the arr-import hook: disk label, fill %, free GB, seconds."""
@@ -302,6 +326,18 @@ def build(cfg, body: dict, files: list, detail: str, upgrade: bool) -> dict | No
     # and the digest can lead with it instead of burying it in a spec line.
     m = re.search(r"\(gained ([^)]+)\)", detail or "") if upgrade else None
     eng = bool(m and "eng" in m.group(1).split("+"))
+    if upgrade and not m:
+        # THE WEBHOOK OFTEN CARRIES NO LANGUAGES. KAIJU GIRL CARAMELISE S01E12
+        # went [JA] -> [JA+EN] and the phone was never told: Sonarr's payload
+        # had no audioLanguages on either file, so there was nothing to
+        # compare. nuarr knows anyway - its own probe of the old file, and the
+        # language tag the naming format writes into both names.
+        old = [_obj(d).get("path") or "" for d in (body.get("deletedFiles") or [])
+               if isinstance(d, dict)]
+        new = [_obj(f).get("path") or "" for f in files]
+        before = set().union(*[_file_langs(p) for p in old if p]) if old else set()
+        after = set().union(*[_file_langs(p) for p in new if p]) if new else set()
+        eng = bool(before and after and "eng" in after and "eng" not in before)
     series = (_obj(body.get("series")).get("title") if kind == "sonarr"
               else _obj(body.get("movie")).get("title")) or label
     sub = ""
