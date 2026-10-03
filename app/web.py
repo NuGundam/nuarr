@@ -30195,7 +30195,7 @@ function tmDiskView(H){
            table-layout:fixed">${tmCols(VCOLS)}<tbody>${volScale}${volRows}</tbody></table>`)
     + tmSection('Drive health',
         'what each drive says about itself — an SSD\'s own endurance log, a hard disk\'s SMART table (the figures StableBit Scanner reads). '
-        + 'An SSD warns at '+((_dw&&_dw.warn_at)||80)+'% used; a hard disk warns at once on pending or uncorrectable sectors, '
+        + 'An SSD warns at '+((_dw&&_dw.warn_at)||80)+'% used; a hard disk warns at once on pending or uncorrectable sectors or a drop in helium, '
         + 'and on reallocated sectors or cable errors only when they rise past what nuarr first saw. '
         + 'Ignore quiets a drive until it gets worse.',
         dwTable());
@@ -30230,6 +30230,8 @@ function dwPopHtml(key){
     rows.push(`<b>uncorrectable</b> <span style="color:${d.uncorr?'#e0575b':'inherit'}">${fmt(d.uncorr)}</span>`+dim('could not be read even offline'));
     rows.push(`<b>cable errors</b> <span style="color:${d.crc?'#d29922':'inherit'}">${fmt(d.crc)}</span>`
       +dim('the SATA cable or connector, not the platters'+(d.crc||d.base_crc?` — was ${fmt(d.base_crc||0)}${since}`:'')));
+    if(d.helium!=null) rows.push(`<b>helium</b> <span style="color:${d.helium<100?'#e0575b':'inherit'}">${d.helium}%</span>`+dim('a sealed drive stays at 100 — any drop is a leak'));
+    rows.push(`<b>load cycles</b> ${fmt(d.load_cycles||0)}`+dim('times the heads have parked'));
     rows.push(`<b>start/stops</b> ${fmt(d.starts||0)} · <b>spin retries</b> <span style="color:${d.spin_retry?'#d29922':'inherit'}">${fmt(d.spin_retry||0)}</span>`);
   }
   rows.push(`<b>temperature</b> ${d.temp_c!=null?d.temp_c+'°C':'—'} · <b>powered on</b> ${(d.power_hours/8766).toFixed(1)} years`+dim(fmt(d.power_hours)+' hours'));
@@ -30241,7 +30243,7 @@ function dwPopHtml(key){
     ? (d.used_pct===0&&d.written>5e13
         ? 'This firmware reports 0% however much it has written, so the percentage says nothing here — go by the written total and the spare blocks.'
         : '100% is the end of the rated endurance, not a cliff: drives usually keep working past it, but that is when to have a replacement in hand. Warns at '+((_dw&&_dw.warn_at)||80)+'%, then every '+((_dw&&_dw.step)||5)+' points.')
-    : 'Warns at once on pending or uncorrectable sectors — data on those spots cannot be read. Reallocated sectors and cable errors warn only when they rise past the first count nuarr saw.';
+    : 'Warns at once on pending or uncorrectable sectors — data on those spots cannot be read — and on any drop in helium. Reallocated sectors and cable errors warn only when they rise past the first count nuarr saw.';
   const sub=[d.model].concat((d.labels||[]).filter(l=>l&&l!==d.name)).filter(Boolean).join(' · ');
   return `<div class="tpop-h" style="color:${col}">${esc(d.name)} <span class="dim">— ${esc(d.bus||'')} ${ssd?'SSD':'hard disk'} · disk ${d.disk}</span></div>
     <div class="dim" style="font-size:10.5px;margin:-2px 0 5px" class="mono">${esc(sub)}</div>
@@ -30253,57 +30255,66 @@ function dwTable(){
   const ds=(_dw&&_dw.drives)||null;
   if(!ds) return '<div class="dim" style="font-size:11.5px">reading the drives…</div>';
   if(!ds.length) return '<div class="dim" style="font-size:11.5px">no drive answered</div>';
-  // ONE TABLE, BOTH KINDS, SORTED BY TYPE THEN NAME (the server sorts):
-  // the SSDs by letter, then the pool's spindles NU-DRIVE-0..11. The middle
-  // column says what wears that kind of drive out - endurance for an SSD,
-  // the surface for a spinning disk - and the cells that do not apply to a
-  // kind are a dash rather than a zero that would read as a measurement.
-  const C=[{t:'NVMe / SSD',w:'auto',a:'left'},{t:'type',w:'5%'},{t:'wear / surface',w:'19%',a:'left'},
-           {t:'written',w:'7%'},{t:'per day',w:'7%'},{t:'to 100%',w:'7%'},{t:'temp',w:'6%'},
-           {t:'powered',w:'8%'},{t:'errors',w:'9%'},{t:'',w:'9%'}];
+  // TWO TABLES, BECAUSE THEY ARE TWO KINDS OF THING. One table gave the hard
+  // disks three columns of dashes - written, per day, to 100% - which read as
+  // missing data. A spinning disk does not count what is written to it; what
+  // it counts is its surface, its cable, its helium and its mechanics, and
+  // those get columns of their own. Each table is sorted by name.
   const TB=b=>b>=1e13?(b/1e12).toFixed(0)+' TB':(b/1e12).toFixed(1)+' TB';
   const yrs=h=>h>=8766?(h/8766).toFixed(1)+' y':fmt(Math.round(h/24))+' d';
-  let lastType='';
-  const rows=ds.map(d=>{
-    const ssd=d.type==='ssd', warn=d.warn, ign=d.ignored;
-    const watch=!d.raw_warn&&(d.notes||[]).length;
-    const col=warn?'#e3b341':ign?'#8b949e':watch?'#d29922':'#3fb950';
-    const status=(d.problems&&d.problems.length&&!ign)?d.problems.join('; ')
-      : ign?(d.rearm_at?'ignored until '+d.rearm_at+'%':'ignored until something new')
-      : warn?'past the '+((_dw&&_dw.warn_at)||80)+'% line'
+  const look=d=>{ const watch=!d.raw_warn&&(d.notes||[]).length;
+    return {watch, col:d.warn?'#e3b341':d.ignored?'#8b949e':watch?'#d29922':'#3fb950'}; };
+  const status=d=>(d.problems&&d.problems.length&&!d.ignored)?d.problems.join('; ')
+      : d.ignored?(d.rearm_at?'ignored until '+d.rearm_at+'%':'ignored until something new')
+      : d.warn?'past the '+((_dw&&_dw.warn_at)||80)+'% line'
       : (d.notes||[]).length?d.notes.join(' · ') : 'healthy';
-    const btn=d.raw_warn?`<button class="rmb" style="font-size:10.5px" onmousedown="dwIgnore('${jsq(d.key)}',${ign?0:1},this)"
-        title="${ign?'Warn about this drive again now':'Stop warning about this drive until it gets worse'}">${ign?'Un-ignore':'Ignore'}</button>`:'';
-    const sep=(lastType&&lastType!==d.type)?`<tr><td colspan="10" style="padding:8px 6px 2px;font-size:10px;letter-spacing:.06em;text-transform:uppercase" class="dim">hard disks</td></tr>`:'';
-    lastType=d.type;
-    const sub=(d.labels||[]).filter(l=>l&&l!==d.name).join(' · ');
-    const wearCell = ssd
-      ? `<div style="display:flex;align-items:center;gap:6px">${tmBar(d.used_pct, col, 8)}<span class="mono" style="color:${col}">${d.used_pct}%</span></div>`
-        + (d.used_pct===0&&d.written>5e13?'<div class="dim" style="font-size:9.5px">this firmware reports 0% — go by the written total</div>':'')
-        + `<div class="dim" style="font-size:9.5px">spare ${d.spare}% (threshold ${d.spare_thr}%)</div>`
-      : `<span class="mono" style="font-size:10.5px" title="reallocated · pending · uncorrectable sectors">`
-        + `<span style="color:${d.realloc?'#d29922':'inherit'}">${fmt(d.realloc)} realloc</span> · `
-        + `<span style="color:${d.pending?'#e0575b':'inherit'}">${fmt(d.pending)} pending</span> · `
-        + `<span style="color:${d.uncorr?'#e0575b':'inherit'}">${fmt(d.uncorr)} uncorr.</span></span>`;
-    const errCell = ssd
-      ? `<span class="mono" title="media errors / unsafe shutdowns" style="color:${d.media_errors?'#e0575b':'inherit'}">${fmt(d.media_errors)} / ${fmt(d.unsafe)}</span>`
-      : `<span class="mono" title="cable (UDMA CRC) errors" style="color:${d.crc?'#d29922':'inherit'}">${fmt(d.crc)} cable</span>`;
-    return sep+`<tr style="border-top:1px solid var(--line)" data-dpop="health" data-ddisk="${esc(d.key)}">
-      ${tmCell(C[0], `<b style="color:${col}">${esc(d.name)}</b> <span class="mono" style="font-size:10.5px">${esc(d.model||'')}</span>`
-         + (sub?`<span class="dim" style="font-size:10px"> ${esc(sub)}</span>`:'')
-         + `<div style="font-size:10px;color:${warn?'#e3b341':watch?'#d29922':'var(--dim,#8a97a6)'}">${esc(status)}</div>`)}
-      ${tmCell(C[1], `<span class="dim" style="font-size:10.5px">${esc(d.bus||(ssd?'NVMe':'SATA'))}</span>`)}
-      ${tmCell(C[2], wearCell)}
-      ${tmCell(C[3], `<span class="mono">${ssd?TB(d.written):'—'}</span>`)}
-      ${tmCell(C[4], `<span class="mono" title="${esc(d.rate_basis||'')}">${ssd&&d.per_day?TB(d.per_day):'—'}</span>`)}
-      ${tmCell(C[5], `<span class="mono" style="color:${d.days_left!=null&&d.days_left<90?'#e3b341':'inherit'}">${ssd&&d.days_left!=null?'~'+fmt(d.days_left)+' d':'—'}</span>`)}
-      ${tmCell(C[6], `<span class="mono">${d.temp_c!=null?d.temp_c+'°C':'—'}</span>`)}
-      ${tmCell(C[7], `<span class="mono" title="${fmt(d.power_hours)} hours" style="color:${d.age?'#d29922':'inherit'}">${yrs(d.power_hours)}</span>`)}
-      ${tmCell(C[8], errCell)}
-      ${tmCell(C[9], btn)}
-    </tr>`;
-  }).join('');
-  return `<table style="width:100%;font-size:11.5px;border-collapse:collapse;table-layout:fixed">${tmCols(C)}<tbody>${rows}</tbody></table>`;
+  const nameCell=(c,d)=>{ const L=look(d), sub=(d.labels||[]).filter(l=>l&&l!==d.name).join(' · ');
+    return tmCell(c, `<b style="color:${L.col}">${esc(d.name)}</b> <span class="mono" style="font-size:10.5px">${esc(d.model||'')}</span>`
+      + (sub?`<span class="dim" style="font-size:10px"> ${esc(sub)}</span>`:'')
+      + `<div style="font-size:10px;color:${d.warn?'#e3b341':L.watch?'#d29922':'var(--dim,#8a97a6)'}">${esc(status(d))}</div>`); };
+  const btn=d=>d.raw_warn?`<button class="rmb" style="font-size:10.5px" onmousedown="dwIgnore('${jsq(d.key)}',${d.ignored?0:1},this)"
+        title="${d.ignored?'Warn about this drive again now':'Stop warning about this drive until it gets worse'}">${d.ignored?'Un-ignore':'Ignore'}</button>`:'';
+  const num=(v,bad)=>`<span class="mono" style="color:${v?bad:'inherit'}">${fmt(v||0)}</span>`;
+  const tr=(d,cells)=>`<tr style="border-top:1px solid var(--line)" data-dpop="health" data-ddisk="${esc(d.key)}">${cells}</tr>`;
+  const table=(C,rows)=>`<table style="width:100%;font-size:11.5px;border-collapse:collapse;table-layout:fixed">${tmCols(C)}<tbody>${rows}</tbody></table>`;
+
+  const S=[{t:'NVMe / SSD',w:'auto',a:'left'},{t:'type',w:'5%'},{t:'life used',w:'16%',a:'left'},
+           {t:'written',w:'7%'},{t:'per day',w:'7%'},{t:'to 100%',w:'7%'},{t:'spare',w:'6%'},
+           {t:'temp',w:'6%'},{t:'powered',w:'7%'},{t:'errors',w:'8%'},{t:'',w:'8%'}];
+  const ssd=ds.filter(d=>d.type==='ssd').map(d=>{ const L=look(d); return tr(d,
+      nameCell(S[0],d)
+    + tmCell(S[1], `<span class="dim" style="font-size:10.5px">${esc(d.bus||'NVMe')}</span>`)
+    + tmCell(S[2], `<div style="display:flex;align-items:center;gap:6px">${tmBar(d.used_pct, L.col, 8)}<span class="mono" style="color:${L.col}">${d.used_pct}%</span></div>`
+        + (d.used_pct===0&&d.written>5e13?'<div class="dim" style="font-size:9.5px">this firmware reports 0% — go by the written total</div>':''))
+    + tmCell(S[3], `<span class="mono">${TB(d.written)}</span>`)
+    + tmCell(S[4], `<span class="mono" title="${esc(d.rate_basis||'')}">${d.per_day?TB(d.per_day):'—'}</span>`)
+    + tmCell(S[5], `<span class="mono" style="color:${d.days_left!=null&&d.days_left<90?'#e3b341':'inherit'}" title="${d.days_left==null?'the drive reports no percentage to project from':''}">${d.days_left!=null?'~'+fmt(d.days_left)+' d':'n/a'}</span>`)
+    + tmCell(S[6], `<span class="mono" title="the drive warns at ${d.spare_thr}%" style="color:${d.spare<=d.spare_thr?'#e0575b':'inherit'}">${d.spare}%</span>`)
+    + tmCell(S[7], `<span class="mono">${d.temp_c!=null?d.temp_c+'°C':'—'}</span>`)
+    + tmCell(S[8], `<span class="mono" title="${fmt(d.power_hours)} hours">${yrs(d.power_hours)}</span>`)
+    + tmCell(S[9], `<span class="mono" title="media errors / unsafe shutdowns" style="color:${d.media_errors?'#e0575b':'inherit'}">${fmt(d.media_errors)} / ${fmt(d.unsafe)}</span>`)
+    + tmCell(S[10], btn(d))); }).join('');
+
+  const Hc=[{t:'hard disk',w:'auto',a:'left'},{t:'type',w:'5%'},{t:'reallocated',w:'8%'},{t:'pending',w:'7%'},
+           {t:'uncorrectable',w:'9%'},{t:'cable errors',w:'8%'},{t:'helium',w:'6%'},{t:'load cycles',w:'8%'},
+           {t:'start / stops',w:'8%'},{t:'temp',w:'6%'},{t:'powered',w:'7%'},{t:'',w:'8%'}];
+  const hdd=ds.filter(d=>d.type==='hdd').map(d=>tr(d,
+      nameCell(Hc[0],d)
+    + tmCell(Hc[1], `<span class="dim" style="font-size:10.5px">${esc(d.bus||'SATA')}</span>`)
+    + tmCell(Hc[2], num(d.realloc,'#d29922'))
+    + tmCell(Hc[3], num(d.pending,'#e0575b'))
+    + tmCell(Hc[4], num(d.uncorr,'#e0575b'))
+    + tmCell(Hc[5], num(d.crc,'#d29922'))
+    + tmCell(Hc[6], `<span class="mono" style="color:${d.helium!=null&&d.helium<100?'#e0575b':'inherit'}">${d.helium!=null?d.helium+'%':'—'}</span>`)
+    + tmCell(Hc[7], `<span class="mono">${fmt(d.load_cycles||0)}</span>`)
+    + tmCell(Hc[8], `<span class="mono">${fmt(d.starts||0)}</span>`)
+    + tmCell(Hc[9], `<span class="mono">${d.temp_c!=null?d.temp_c+'°C':'—'}</span>`)
+    + tmCell(Hc[10], `<span class="mono" title="${fmt(d.power_hours)} hours" style="color:${d.age?'#d29922':'inherit'}">${yrs(d.power_hours)}</span>`)
+    + tmCell(Hc[11], btn(d)))).join('');
+
+  return (ssd?table(S,ssd):'')
+    + (hdd?`<div style="height:12px"></div>`+table(Hc,hdd)
+        +`<div class="dim" style="font-size:10.5px;margin-top:5px">A hard disk keeps no count of what is written to it, so there is no "written" or "to 100%" here — its wear shows as surface damage (reallocated, pending, uncorrectable), a leaking seal (helium) and age.</div>`:'');
 }
 async function dwIgnore(key,on,btn){
   if(btn) btn.disabled=true;

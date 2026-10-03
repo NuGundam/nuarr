@@ -141,10 +141,14 @@ def _smart(h) -> dict | None:
         return None
     data = raw[16:16 + 512]
     out = {}
+    cur = {}
     for i in range(30):
         a = data[2 + i * 12: 2 + (i + 1) * 12]
         if a[0]:
             out[a[0]] = int.from_bytes(a[5:11], "little")
+            cur[a[0]] = a[3]          # the normalised value, 100 = as new
+    if out:
+        out["cur"] = cur
     return out or None
 
 
@@ -292,10 +296,18 @@ def read(fresh: bool = False) -> list:
             elif crc:
                 notes.append(f"{crc} old cable (CRC) errors, not rising")
             age = f"{hours / 8766:.1f} years powered on" if hours >= OLD_HOURS else ""
+            # HELIUM. Every spindle in this pool is helium-filled (attribute
+            # 22, normalised: 100 is full). A sealed drive does not lose
+            # helium in normal life, so any drop is a leak - and a drive
+            # without its helium does not last.
+            helium = (sm.get("cur") or {}).get(22)
+            if helium is not None and helium < 100:
+                bad.append(f"helium level {helium}% - the drive is leaking")
             raw_warn = bool(bad)
             d.update(type="hdd", realloc=realloc, pending=pending, uncorr=uncorr, crc=crc,
                      power_hours=hours, temp_c=(sm.get(194, 0) & 0xFF) or None,
                      starts=sm.get(4, 0), spin_retry=sm.get(10, 0), used_pct=0, written=0, age=age,
+                     helium=helium, load_cycles=sm.get(193, 0),
                      bus="SATA", base_realloc=b.get("realloc", 0), base_crc=b.get("crc", 0),
                      base_at=b.get("at"))
         ig = ign_all.get(key)
