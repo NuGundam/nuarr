@@ -6231,12 +6231,12 @@ def api_health():
         from . import diskwear as _dw
         _drives = _dw.read()
         _n, _line = _dw.summary(_drives)
-        add("diskwear", "SSD wear", "tmdisk", _n, _line, warn=bool(_n),
-            when=f"the drives' own health log · amber at {_dw.WARN_AT}% used")
+        add("diskwear", "Drive health", "tmdisk", _n, _line, warn=bool(_n),
+            when=f"the drives' own logs · SSD amber at {_dw.WARN_AT}% used")
     except Exception as e:                                   # noqa: BLE001
-        add("diskwear", "SSD wear", "tmdisk", 0,
+        add("diskwear", "Drive health", "tmdisk", 0,
             f"check unavailable: {type(e).__name__}", warn=False,
-            when="the drives' own health log")
+            when="the drives' own logs")
 
     def _ago_words(at: float) -> str:
         if not at:
@@ -30065,9 +30065,11 @@ function tmDiskView(H){
   // WHICH SPINDLE IS WORN, said on its own row: the drive health section
   // below has the detail, this is so the row in the list is not innocent.
   const wornBy = {};
-  ((_dw&&_dw.drives)||[]).forEach(w=>{ if(w.raw_warn) wornBy[w.model]=w; });
-  const wornTag = d=>{ const t=String((d.note||'')+' '+(d.label||'')); const w=Object.values(wornBy).find(x=>x.model&&t.includes(x.model));
-    return w?` <span title="${esc(w.ignored?'warning ignored':'see Drive health below')}" style="font-size:10px;padding:0 5px;border-radius:3px;border:1px solid ${w.ignored?'#8b949e55':'#e3b34166'};color:${w.ignored?'#8b949e':'#e3b341'}">${w.used_pct}% worn${w.ignored?' · ignored':''}</span>`:''; };
+  ((_dw&&_dw.drives)||[]).forEach(w=>{ if(w.raw_warn) wornBy[w.key]=w; });
+  const wornTag = d=>{ const t=String((d.note||'')+' '+(d.label||''));
+    const w=Object.values(wornBy).find(x=>(x.labels||[]).includes(d.label)||(x.type==='ssd'&&x.model&&t.includes(x.model)));
+    const what=w?(w.type==='ssd'?w.used_pct+'% worn':'disk trouble'):'';
+    return w?` <span title="${esc(w.ignored?'warning ignored':'see Drive health above')}" style="font-size:10px;padding:0 5px;border-radius:3px;border:1px solid ${w.ignored?'#8b949e55':'#e3b34166'};color:${w.ignored?'#8b949e':'#e3b341'}">${what}${w.ignored?' · ignored':''}</span>`:''; };
   const diskRows = by.map(d=>{
     const series = rows.map(r=>(r.d[d.name]||[0,0])[0] + (r.d[d.name]||[0,0])[1]);
     // nuarr's own disks keep the colour every other panel gives them; the
@@ -30146,10 +30148,10 @@ function tmDiskView(H){
                      get:r=>(r.cache_read||0)+(r.cache_write||0)}],
                 {peak:true, fmt:v=>tmBps(v)}))
     + tmSection('Drive health',
-        'each NVMe drive\'s own health log — the figure StableBit Scanner reads. '
-        + 'Amber at '+((_dw&&_dw.warn_at)||80)+'% used or on a problem the drive reports. '
-        + 'Ignore quiets a drive until it climbs another '+((_dw&&_dw.step)||5)+' points or reports something new. '
-        + 'The SATA hard disks keep no such log.',
+        'what each drive says about itself — an SSD\'s own endurance log, a hard disk\'s SMART table (the figures StableBit Scanner reads). '
+        + 'An SSD warns at '+((_dw&&_dw.warn_at)||80)+'% used; a hard disk warns at once on pending or uncorrectable sectors, '
+        + 'and on reallocated sectors or cable errors only when they rise past what nuarr first saw. '
+        + 'Ignore quiets a drive until it gets worse.',
         dwTable())
     + tmSection('Every spindle',
         'the machine\'s own per-disk counters — everything on the disk, nuarr\'s work and anyone else\'s',
@@ -30167,29 +30169,54 @@ function tmDiskView(H){
 function dwTable(){
   const ds=(_dw&&_dw.drives)||null;
   if(!ds) return '<div class="dim" style="font-size:11.5px">reading the drives…</div>';
-  if(!ds.length) return '<div class="dim" style="font-size:11.5px">no NVMe drive answered</div>';
-  const C=[{t:'drive',w:'auto',a:'left'},{t:'used',w:'13%',a:'left'},{t:'written',w:'8%'},
-           {t:'per day',w:'8%'},{t:'to 100%',w:'8%'},{t:'spare',w:'7%'},{t:'temp',w:'7%'},
-           {t:'powered',w:'9%'},{t:'errors',w:'9%'},{t:'',w:'10%'}];
+  if(!ds.length) return '<div class="dim" style="font-size:11.5px">no drive answered</div>';
+  // ONE TABLE, BOTH KINDS, SORTED BY TYPE THEN NAME (the server sorts):
+  // the SSDs by letter, then the pool's spindles NU-DRIVE-0..11. The middle
+  // column says what wears that kind of drive out - endurance for an SSD,
+  // the surface for a spinning disk - and the cells that do not apply to a
+  // kind are a dash rather than a zero that would read as a measurement.
+  const C=[{t:'drive',w:'auto',a:'left'},{t:'type',w:'5%'},{t:'wear / surface',w:'19%',a:'left'},
+           {t:'written',w:'7%'},{t:'per day',w:'7%'},{t:'to 100%',w:'7%'},{t:'temp',w:'6%'},
+           {t:'powered',w:'8%'},{t:'errors',w:'9%'},{t:'',w:'9%'}];
   const TB=b=>b>=1e13?(b/1e12).toFixed(0)+' TB':(b/1e12).toFixed(1)+' TB';
+  const yrs=h=>h>=8766?(h/8766).toFixed(1)+' y':fmt(Math.round(h/24))+' d';
+  let lastType='';
   const rows=ds.map(d=>{
-    const warn=d.warn, ign=d.ignored, col=warn?'#e3b341':ign?'#8b949e':'#3fb950';
-    const name=(d.letters||[]).map(L=>L+':').join(' ');
-    const status=d.problems&&d.problems.length?d.problems.join('; '):warn?'past the '+((_dw&&_dw.warn_at)||80)+'% line':ign?'ignored until '+d.rearm_at+'%':'healthy';
+    const ssd=d.type==='ssd', warn=d.warn, ign=d.ignored;
+    const watch=!d.raw_warn&&(d.notes||[]).length;
+    const col=warn?'#e3b341':ign?'#8b949e':watch?'#d29922':'#3fb950';
+    const status=(d.problems&&d.problems.length&&!ign)?d.problems.join('; ')
+      : ign?(d.rearm_at?'ignored until '+d.rearm_at+'%':'ignored until something new')
+      : warn?'past the '+((_dw&&_dw.warn_at)||80)+'% line'
+      : (d.notes||[]).length?d.notes.join(' · ') : 'healthy';
     const btn=d.raw_warn?`<button class="rmb" style="font-size:10.5px" onclick="dwIgnore('${jsq(d.key)}',${ign?0:1},this)"
-        title="${ign?'Warn about this drive again now':'Stop warning about this drive until it climbs another '+((_dw&&_dw.step)||5)+' points or reports something new'}">${ign?'Un-ignore':'Ignore'}</button>`:'';
-    return `<tr style="border-top:1px solid var(--line)">
-      ${tmCell(C[0], `<b style="color:${col}">${esc(name||('disk '+d.disk))}</b> <span class="mono" style="font-size:10.5px">${esc(d.model||'')}</span>
-         <div style="font-size:10px;color:${warn?'#e3b341':'var(--dim,#8a97a6)'}">${esc(status)}</div>`)}
-      ${tmCell(C[1], `<div style="display:flex;align-items:center;gap:6px">${tmBar(d.used_pct, col, 8)}<span class="mono" style="color:${col}">${d.used_pct}%</span></div>`
-         + (d.used_pct===0&&d.written>5e13?'<div class="dim" style="font-size:9.5px">this firmware reports 0% — go by the written total</div>':''))}
-      ${tmCell(C[2], `<span class="mono">${TB(d.written)}</span>`)}
-      ${tmCell(C[3], `<span class="mono" title="${esc(d.rate_basis||'')}">${d.per_day?TB(d.per_day):'—'}</span>`)}
-      ${tmCell(C[4], `<span class="mono" style="color:${d.days_left!=null&&d.days_left<90?'#e3b341':'inherit'}">${d.days_left!=null?'~'+fmt(d.days_left)+' d':'—'}</span>`)}
-      ${tmCell(C[5], `<span class="mono" title="threshold ${d.spare_thr}%">${d.spare}%</span>`)}
-      ${tmCell(C[6], `<span class="mono">${d.temp_c}°C</span>`)}
-      ${tmCell(C[7], `<span class="mono" title="${fmt(d.power_hours)} hours">${fmt(Math.round(d.power_hours/24))} d</span>`)}
-      ${tmCell(C[8], `<span class="mono" title="media errors / unsafe shutdowns" style="color:${d.media_errors?'#e0575b':'inherit'}">${fmt(d.media_errors)} / ${fmt(d.unsafe)}</span>`)}
+        title="${ign?'Warn about this drive again now':'Stop warning about this drive until it gets worse'}">${ign?'Un-ignore':'Ignore'}</button>`:'';
+    const sep=(lastType&&lastType!==d.type)?`<tr><td colspan="10" style="padding:6px 0 2px;font-size:10px;letter-spacing:.06em;text-transform:uppercase" class="dim">hard disks</td></tr>`:'';
+    lastType=d.type;
+    const sub=(d.labels||[]).filter(l=>l&&l!==d.name).join(' · ');
+    const wearCell = ssd
+      ? `<div style="display:flex;align-items:center;gap:6px">${tmBar(d.used_pct, col, 8)}<span class="mono" style="color:${col}">${d.used_pct}%</span></div>`
+        + (d.used_pct===0&&d.written>5e13?'<div class="dim" style="font-size:9.5px">this firmware reports 0% — go by the written total</div>':'')
+        + `<div class="dim" style="font-size:9.5px">spare ${d.spare}% (threshold ${d.spare_thr}%)</div>`
+      : `<span class="mono" style="font-size:10.5px" title="reallocated · pending · uncorrectable sectors">`
+        + `<span style="color:${d.realloc?'#d29922':'inherit'}">${fmt(d.realloc)} realloc</span> · `
+        + `<span style="color:${d.pending?'#e0575b':'inherit'}">${fmt(d.pending)} pending</span> · `
+        + `<span style="color:${d.uncorr?'#e0575b':'inherit'}">${fmt(d.uncorr)} uncorr.</span></span>`;
+    const errCell = ssd
+      ? `<span class="mono" title="media errors / unsafe shutdowns" style="color:${d.media_errors?'#e0575b':'inherit'}">${fmt(d.media_errors)} / ${fmt(d.unsafe)}</span>`
+      : `<span class="mono" title="cable (UDMA CRC) errors" style="color:${d.crc?'#d29922':'inherit'}">${fmt(d.crc)} cable</span>`;
+    return sep+`<tr style="border-top:1px solid var(--line)">
+      ${tmCell(C[0], `<b style="color:${col}">${esc(d.name)}</b> <span class="mono" style="font-size:10.5px">${esc(d.model||'')}</span>`
+         + (sub?`<span class="dim" style="font-size:10px"> ${esc(sub)}</span>`:'')
+         + `<div style="font-size:10px;color:${warn?'#e3b341':watch?'#d29922':'var(--dim,#8a97a6)'}">${esc(status)}</div>`)}
+      ${tmCell(C[1], `<span class="dim" style="font-size:10.5px">${ssd?'SSD':'HDD'}</span>`)}
+      ${tmCell(C[2], wearCell)}
+      ${tmCell(C[3], `<span class="mono">${ssd?TB(d.written):'—'}</span>`)}
+      ${tmCell(C[4], `<span class="mono" title="${esc(d.rate_basis||'')}">${ssd&&d.per_day?TB(d.per_day):'—'}</span>`)}
+      ${tmCell(C[5], `<span class="mono" style="color:${d.days_left!=null&&d.days_left<90?'#e3b341':'inherit'}">${ssd&&d.days_left!=null?'~'+fmt(d.days_left)+' d':'—'}</span>`)}
+      ${tmCell(C[6], `<span class="mono">${d.temp_c!=null?d.temp_c+'°C':'—'}</span>`)}
+      ${tmCell(C[7], `<span class="mono" title="${fmt(d.power_hours)} hours" style="color:${d.age?'#d29922':'inherit'}">${yrs(d.power_hours)}</span>`)}
+      ${tmCell(C[8], errCell)}
       ${tmCell(C[9], btn)}
     </tr>`;
   }).join('');
