@@ -705,6 +705,29 @@ def init_db() -> None:
             "   UPDATE history SET label = " + _LABEL_SQL.format(fid="NEW.file_id")
             + "   WHERE id = NEW.id; "
             " END")
+        # AND RE-NAMED WHEN THE TITLE ARRIVES. A file is often worked on in its
+        # first minute, before the arr's title reaches it: its jobs were
+        # titled with the file name (jobs.enqueue's fallback) and its history
+        # rows got no label - so Activity, which groups by those, showed
+        # "HELL MODE: ... - S02E08" and "HELL MODE - ... (2026) - S02E08 - THE
+        # BAT....mkv" as two shows, and a "—" row besides. When the title
+        # lands, every row that was waiting for it takes the real label.
+        cur.execute("DROP TRIGGER IF EXISTS files_title_names_rows")
+        cur.execute(
+            "CREATE TRIGGER files_title_names_rows "
+            " AFTER UPDATE OF title, season, episode ON files "
+            " WHEN COALESCE(NEW.title,'') <> '' "
+            " BEGIN "
+            "   UPDATE jobs SET title = " + _LABEL_SQL.format(fid="NEW.id")
+            + "   WHERE file_id = NEW.id AND (COALESCE(title,'') = '' "
+            "      OR title LIKE '(untitled)%' OR title LIKE '%.mkv' "
+            "      OR title LIKE '%.mp4' OR title LIKE '%.avi' "
+            "      OR title LIKE '%.m4v' OR title LIKE '%.ts' OR title LIKE '%.webm'); "
+            "   UPDATE history SET label = " + _LABEL_SQL.format(fid="NEW.id")
+            + "   WHERE file_id = NEW.id AND (COALESCE(label,'') = '' "
+            "      OR label LIKE '%.mkv' OR label LIKE '%.mp4' OR label LIKE '%.avi' "
+            "      OR label LIKE '%.m4v' OR label LIKE '%.ts' OR label LIKE '%.webm'); "
+            " END")
         # AND THE BACKLOG IS NAMED ONCE. Keyed on a kv flag so the 150,000-row
         # UPDATE runs a single time, not on every start.
         # A NO-OP IS NOT A FAILURE, AND 288 OF THEM SAID IT WAS.

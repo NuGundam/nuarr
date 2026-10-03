@@ -11405,8 +11405,91 @@ def _act_index() -> list[tuple[str, float]]:
     return _act_index_build()
 
 
+_FILE_EXT = (".mkv", ".mp4", ".avi", ".m4v", ".ts", ".webm")
+
+
+def _heal_labels(full: bool = False) -> int:
+    r"""Name the Activity rows that were written before their file had a name.
+
+    The files trigger (db.py, files_title_names_rows) renames them the moment
+    a title arrives. This catches the ones whose title NEVER arrives: a file
+    Sonarr replaced inside its first minute is marked deleted untitled, so its
+    "upgraded" row stayed "—" for good. It takes the title from a titled file
+    in the same folder - the same show, under the arr's own spelling - and the
+    episode from the name, so the row joins its show's group.
+
+    Recent rows only (two weeks) except on the first pass after a start.
+    """
+    import ntpath
+    import re as _re
+    since = 0 if full else time.time() - 14 * 86400
+    fixed = 0
+    rows = _rows(
+        "SELECT 'h' k, h.id, h.file_id, f.path, f.title, f.season, f.episode "
+        "  FROM history h JOIN files f ON f.id = h.file_id "
+        " WHERE h.at >= ? AND (COALESCE(h.label,'') = '' "
+        "   OR lower(h.label) LIKE '%.mkv' OR lower(h.label) LIKE '%.mp4' OR lower(h.label) LIKE '%.avi' OR lower(h.label) LIKE '%.m4v' OR lower(h.label) LIKE '%.ts' OR lower(h.label) LIKE '%.webm' "
+        # the arr re-cased the show ("Hell Mode" -> "HELL MODE"): same words,
+        # older spelling, and Activity grouped the two apart
+        "   OR (COALESCE(f.title,'') <> '' "
+        "       AND lower(substr(h.label, 1, length(f.title))) = lower(f.title) "
+        "       AND substr(h.label, 1, length(f.title)) <> f.title)) "
+        "UNION ALL "
+        "SELECT 'j' k, j.id, j.file_id, COALESCE(f.path, j.path), f.title, f.season, f.episode "
+        "  FROM jobs j LEFT JOIN files f ON f.id = j.file_id "
+        " WHERE COALESCE(j.finished_at, j.created_at, 0) >= ? AND j.file_id IS NOT NULL "
+        "   AND (COALESCE(j.title,'') = '' OR j.title LIKE '(untitled)%' "
+        "        OR lower(j.title) LIKE '%.mkv' OR lower(j.title) LIKE '%.mp4' "
+        "        OR lower(j.title) LIKE '%.avi' OR lower(j.title) LIKE '%.m4v' "
+        "        OR lower(j.title) LIKE '%.ts' OR lower(j.title) LIKE '%.webm' "
+        "        OR (COALESCE(f.title,'') <> '' "
+        "            AND lower(substr(j.title, 1, length(f.title))) = lower(f.title) "
+        "            AND substr(j.title, 1, length(f.title)) <> f.title))",
+        (since, since))
+    if not rows:
+        return 0
+    by_dir: dict = {}
+    with cursor() as cur:
+        for r in rows:
+            title, season, episode = r["title"], r["season"], r["episode"]
+            path = r["path"] or ""
+            if not title and path:
+                d = ntpath.dirname(path)
+                if d not in by_dir:
+                    # a prefix compare, not LIKE: folder names carry % _ [ ]
+                    pre = d.rstrip("\\") + "\\"
+                    sib = cur.execute(
+                        "SELECT title FROM files WHERE COALESCE(title,'') <> '' "
+                        "   AND substr(path, 1, ?) = ? LIMIT 1",
+                        (len(pre), pre)).fetchone()
+                    by_dir[d] = sib["title"] if sib else None
+                title = by_dir[d]
+            if not title:
+                continue
+            if season is None:
+                m = _re.search(r"[Ss](\d{1,2})[Ee](\d{1,3})(?:-?[Ee](\d{1,3}))?", ntpath.basename(path))
+                if m:
+                    season = int(m.group(1))
+                    episode = m.group(2) + (f"-{m.group(3)}" if m.group(3) else "")
+            label = display_label(title, season, episode)
+            if r["k"] == "h":
+                cur.execute("UPDATE history SET label=? WHERE id=?", (label, r["id"]))
+            else:
+                cur.execute("UPDATE jobs SET title=? WHERE id=?", (label, r["id"]))
+            fixed += 1
+    return fixed
+
+
+_HEALED_ONCE = {"done": False}
+
+
 def _act_index_build() -> list[tuple[str, float]]:
     try:
+        try:
+            _heal_labels(full=not _HEALED_ONCE["done"])
+            _HEALED_ONCE["done"] = True
+        except Exception as e:                               # noqa: BLE001
+            joblog.log(f"activity labels: {type(e).__name__}: {e}", "warn")
         rows = _rows(
             "WITH j AS (SELECT title t, MAX(finished_at) last FROM jobs "
             "           WHERE finished_at IS NOT NULL GROUP BY title), "
