@@ -3166,6 +3166,25 @@ async def api_pushover_test():
     return {"ok": ok, "detail": detail if ok else "", "error": "" if ok else detail}
 
 
+@app.get("/api/diskwear")
+def api_diskwear(fresh: bool = False):
+    """Every NVMe drive's own health log: wear, written, rate, days left."""
+    from . import diskwear
+    if fresh:
+        diskwear.read(True)
+    return diskwear.snapshot()
+
+
+@app.post("/api/diskwear/ignore")
+def api_diskwear_ignore(key: str, on: int = 1):
+    """Quiet one drive's warning until it gets worse (or un-ignore it)."""
+    from . import diskwear
+    ok = diskwear.set_ignored(key, bool(on))
+    if ok:
+        joblog.log(f"ssd wear: {key} warning {'ignored' if on else 'un-ignored'}", "info")
+    return {"ok": ok}
+
+
 @app.get("/api/maintenance")
 def api_maintenance():
     """Database size, row counts and what housekeeping last did."""
@@ -29426,6 +29445,7 @@ const TM_VIEW = {tmcpu:'cpu', tmmem:'mem', tmgpu:'gpu', tmdisk:'disk'};
 const TM_KEY  = {cpu:'tmcpu', mem:'tmmem', gpu:'tmgpu', disk:'tmdisk'};
 const TM_NAME = {cpu:'Processor', mem:'Memory', gpu:'Graphics', disk:'Disk'};
 let _tmView = '', _tmD = null, _tmDWhich = '';
+let _dw = null, _dwAt = 0;
 // A PROCESS THAT LASTS ONE SECOND STILL HAPPENED.
 //
 // Half of what nuarr spawns is gone before you can read it: an ffprobe, a
@@ -29613,6 +29633,12 @@ async function loadTaskmgr(){
       const r = await fetch('/api/taskmgr/detail?which='+encodeURIComponent(_tmView));
       _tmD = await r.json(); _tmDWhich = _tmView;
     }catch(e){ if(_tmDWhich !== _tmView) _tmD = null; }
+  }
+  // DRIVE HEALTH CHANGES BY THE DAY, NOT THE SECOND. The page repaints every
+  // second; the health log is asked once a minute and only while Disk is open.
+  if(_tmView==='disk' && Date.now()-_dwAt > 60000){
+    _dwAt = Date.now();
+    try{ _dw = await (await fetch('/api/diskwear')).json(); }catch(e){}
   }
   tmPaint();
   tmTick();
@@ -30036,6 +30062,12 @@ function tmDiskView(H){
                  {t:`last ${rows.length}s`, w:'22%', a:'left'},
                  {t:'read', w:'10%'}, {t:'write', w:'10%'},
                  {t:'10s average', w:'15%'}, {t:'operations/s', w:'12%'}];
+  // WHICH SPINDLE IS WORN, said on its own row: the drive health section
+  // below has the detail, this is so the row in the list is not innocent.
+  const wornBy = {};
+  ((_dw&&_dw.drives)||[]).forEach(w=>{ if(w.raw_warn) wornBy[w.model]=w; });
+  const wornTag = d=>{ const t=String((d.note||'')+' '+(d.label||'')); const w=Object.values(wornBy).find(x=>x.model&&t.includes(x.model));
+    return w?` <span title="${esc(w.ignored?'warning ignored':'see Drive health below')}" style="font-size:10px;padding:0 5px;border-radius:3px;border:1px solid ${w.ignored?'#8b949e55':'#e3b34166'};color:${w.ignored?'#8b949e':'#e3b341'}">${w.used_pct}% worn${w.ignored?' · ignored':''}</span>`:''; };
   const diskRows = by.map(d=>{
     const series = rows.map(r=>(r.d[d.name]||[0,0])[0] + (r.d[d.name]||[0,0])[1]);
     // nuarr's own disks keep the colour every other panel gives them; the
@@ -30049,7 +30081,7 @@ function tmDiskView(H){
       + `<span class="dim"> / </span><span style="color:${b?'#f0883e':'var(--dim,#8a97a6)'}">${fb}</span>`;
     return `<tr style="border-top:1px solid var(--line)">
       ${tmCell(DCOLS[0], `<b style="color:${col}">${esc(d.label||d.name)}</b>`
-        + (d.note?`<span class="dim" style="font-size:10px"> ${esc(d.note)}</span>`:''))}
+        + (d.note?`<span class="dim" style="font-size:10px"> ${esc(d.note)}</span>`:'') + wornTag(d))}
       ${tmCell(DCOLS[1], tmSpark(series, col))}
       ${tmCell(DCOLS[2], `<span class="mono" style="color:${d.read_bps?'#58a6ff':'var(--dim,#8a97a6)'}">${tmBps(d.read_bps)}</span>`)}
       ${tmCell(DCOLS[3], `<span class="mono" style="color:${d.write_bps?'#f0883e':'var(--dim,#8a97a6)'}">${tmBps(d.write_bps)}</span>`)}
@@ -30113,6 +30145,12 @@ function tmDiskView(H){
                     {name:'Nuarr Cache', colour:'#8b949e', fill:false,
                      get:r=>(r.cache_read||0)+(r.cache_write||0)}],
                 {peak:true, fmt:v=>tmBps(v)}))
+    + tmSection('Drive health',
+        'each NVMe drive\'s own health log — the figure StableBit Scanner reads. '
+        + 'Amber at '+((_dw&&_dw.warn_at)||80)+'% used or on a problem the drive reports. '
+        + 'Ignore quiets a drive until it climbs another '+((_dw&&_dw.step)||5)+' points or reports something new. '
+        + 'The SATA hard disks keep no such log.',
+        dwTable())
     + tmSection('Every spindle',
         'the machine\'s own per-disk counters — everything on the disk, nuarr\'s work and anyone else\'s',
         `<table style="width:100%;font-size:11.5px;border-collapse:collapse;
@@ -30125,6 +30163,43 @@ function tmDiskView(H){
     + tmSection('The volumes', 'how full each pool disk and the cache is',
         `<table style="width:100%;font-size:11.5px;border-collapse:collapse;
            table-layout:fixed">${tmCols(VCOLS)}<tbody>${volScale}${volRows}</tbody></table>`);
+}
+function dwTable(){
+  const ds=(_dw&&_dw.drives)||null;
+  if(!ds) return '<div class="dim" style="font-size:11.5px">reading the drives…</div>';
+  if(!ds.length) return '<div class="dim" style="font-size:11.5px">no NVMe drive answered</div>';
+  const C=[{t:'drive',w:'auto',a:'left'},{t:'used',w:'13%',a:'left'},{t:'written',w:'8%'},
+           {t:'per day',w:'8%'},{t:'to 100%',w:'8%'},{t:'spare',w:'7%'},{t:'temp',w:'7%'},
+           {t:'powered',w:'9%'},{t:'errors',w:'9%'},{t:'',w:'10%'}];
+  const TB=b=>b>=1e13?(b/1e12).toFixed(0)+' TB':(b/1e12).toFixed(1)+' TB';
+  const rows=ds.map(d=>{
+    const warn=d.warn, ign=d.ignored, col=warn?'#e3b341':ign?'#8b949e':'#3fb950';
+    const name=(d.letters||[]).map(L=>L+':').join(' ');
+    const status=d.problems&&d.problems.length?d.problems.join('; '):warn?'past the '+((_dw&&_dw.warn_at)||80)+'% line':ign?'ignored until '+d.rearm_at+'%':'healthy';
+    const btn=d.raw_warn?`<button class="rmb" style="font-size:10.5px" onclick="dwIgnore('${jsq(d.key)}',${ign?0:1},this)"
+        title="${ign?'Warn about this drive again now':'Stop warning about this drive until it climbs another '+((_dw&&_dw.step)||5)+' points or reports something new'}">${ign?'Un-ignore':'Ignore'}</button>`:'';
+    return `<tr style="border-top:1px solid var(--line)">
+      ${tmCell(C[0], `<b style="color:${col}">${esc(name||('disk '+d.disk))}</b> <span class="mono" style="font-size:10.5px">${esc(d.model||'')}</span>
+         <div style="font-size:10px;color:${warn?'#e3b341':'var(--dim,#8a97a6)'}">${esc(status)}</div>`)}
+      ${tmCell(C[1], `<div style="display:flex;align-items:center;gap:6px">${tmBar(d.used_pct, col, 8)}<span class="mono" style="color:${col}">${d.used_pct}%</span></div>`
+         + (d.used_pct===0&&d.written>5e13?'<div class="dim" style="font-size:9.5px">this firmware reports 0% — go by the written total</div>':''))}
+      ${tmCell(C[2], `<span class="mono">${TB(d.written)}</span>`)}
+      ${tmCell(C[3], `<span class="mono" title="${esc(d.rate_basis||'')}">${d.per_day?TB(d.per_day):'—'}</span>`)}
+      ${tmCell(C[4], `<span class="mono" style="color:${d.days_left!=null&&d.days_left<90?'#e3b341':'inherit'}">${d.days_left!=null?'~'+fmt(d.days_left)+' d':'—'}</span>`)}
+      ${tmCell(C[5], `<span class="mono" title="threshold ${d.spare_thr}%">${d.spare}%</span>`)}
+      ${tmCell(C[6], `<span class="mono">${d.temp_c}°C</span>`)}
+      ${tmCell(C[7], `<span class="mono" title="${fmt(d.power_hours)} hours">${fmt(Math.round(d.power_hours/24))} d</span>`)}
+      ${tmCell(C[8], `<span class="mono" title="media errors / unsafe shutdowns" style="color:${d.media_errors?'#e0575b':'inherit'}">${fmt(d.media_errors)} / ${fmt(d.unsafe)}</span>`)}
+      ${tmCell(C[9], btn)}
+    </tr>`;
+  }).join('');
+  return `<table style="width:100%;font-size:11.5px;border-collapse:collapse;table-layout:fixed">${tmCols(C)}<tbody>${rows}</tbody></table>`;
+}
+async function dwIgnore(key,on,btn){
+  if(btn) btn.disabled=true;
+  try{ await fetch('/api/diskwear/ignore?key='+encodeURIComponent(key)+'&on='+on,{method:'POST'}); }catch(e){}
+  try{ _dw=await (await fetch('/api/diskwear')).json(); _dwAt=Date.now(); }catch(e){}
+  if(typeof tmPaint==='function') tmPaint();
 }
 // The same bubble the strip and the Workers panel use, from the one global
 // that knows the colours. (pillFor lives inside another function, so it is

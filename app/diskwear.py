@@ -38,6 +38,33 @@ STEP = 5                # then once more every 5 points
 CACHE_S = 600.0
 KV_SAMPLES = "diskwear.samples"     # {serial-ish key: [[t, written_bytes], ...]}
 KV_TOLD = "diskwear.told"           # {key: last % step the phone heard about}
+# IGNORE, THE WAY SCANNER DOES IT - BUT ONLY UNTIL IT GETS WORSE. Erik knows
+# about F: and has a replacement coming; the amber row and the alerts have
+# said what they had to. An ignored drive stays quiet until it climbs another
+# STEP points or reports a problem it did not have when it was ignored -
+# then it warns again on its own, with nothing to remember to undo.
+KV_IGNORED = "diskwear.ignored"     # {key: {"at", "pct", "problems"}}
+
+
+def _ignored() -> dict:
+    try:
+        return json.loads(kv_get(KV_IGNORED) or "{}")
+    except Exception:                                            # noqa: BLE001
+        return {}
+
+
+def set_ignored(key: str, on: bool) -> bool:
+    ig = _ignored()
+    d = next((x for x in read() if x["key"] == key), None)
+    if on:
+        if not d:
+            return False
+        ig[key] = {"at": time.time(), "pct": d["used_pct"], "problems": d["problems"]}
+    else:
+        ig.pop(key, None)
+    kv_set(KV_IGNORED, json.dumps(ig))
+    _CACHE["at"] = 0.0
+    return True
 
 _IOCTL_QUERY = 0x002D1400
 _IOCTL_DEVNUM = 0x002D1080
@@ -168,12 +195,24 @@ def read(fresh: bool = False) -> list:
             bad.append(f"spare {hl['spare']}% at/below its {hl['spare_thr']}% threshold")
         if hl["media_errors"]:
             bad.append(f"{hl['media_errors']} media errors")
-        drives.append({"disk": n, "model": model, "letters": letters.get(n, []),
+        raw_warn = bool(bad) or used >= WARN_AT
+        ig = _ignored().get(key)
+        ignored = bool(ig and raw_warn and used < int(ig.get("pct", 0)) + STEP
+                       and set(bad) <= set(ig.get("problems") or []))
+        drives.append({"disk": n, "key": key, "model": model, "letters": letters.get(n, []),
                        **hl, "per_day": per_day, "rate_basis": basis,
                        "days_left": days_left, "problems": bad,
-                       "warn": bool(bad) or used >= WARN_AT})
+                       "raw_warn": raw_warn, "ignored": ignored,
+                       "ignored_at": (ig or {}).get("at") if ignored else None,
+                       "rearm_at": (int(ig.get("pct", 0)) + STEP) if ignored else None,
+                       "warn": raw_warn and not ignored})
     _CACHE.update(at=time.time(), drives=drives)
     return drives
+
+
+def snapshot() -> dict:
+    """For the Disk page: every drive's full reading and its ignore state."""
+    return {"drives": read(), "warn_at": WARN_AT, "step": STEP, "read_at": _CACHE["at"]}
 
 
 def _name(d: dict) -> str:
@@ -190,7 +229,7 @@ def summary(drives: list | None = None) -> tuple[int, str]:
     drives = read() if drives is None else drives
     if not drives:
         return 0, "no NVMe drives answered"
-    worst = sorted(drives, key=lambda d: (not d["warn"], -d["used_pct"]))
+    worst = sorted(drives, key=lambda d: (not d["warn"], not d.get("ignored"), -d["used_pct"]))
     parts = []
     for d in worst:
         s = f"{_name(d)} {d['used_pct']}% used · {_tb(d['written'])} written"
@@ -201,6 +240,8 @@ def summary(drives: list | None = None) -> tuple[int, str]:
                 s += f" · about {d['days_left']} days to 100%"
             if d["problems"]:
                 s += " · " + "; ".join(d["problems"])
+        elif d.get("ignored"):
+            s += f" · warning ignored until {d['rearm_at']}%"
         parts.append(s)
     return sum(1 for d in drives if d["warn"]), " | ".join(parts)
 
