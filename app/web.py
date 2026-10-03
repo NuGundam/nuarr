@@ -46044,7 +46044,7 @@ function poTableHtml(){
   if(!_poRows.length) return '<div class="dim" style="font-size:11px;margin-top:4px">nothing sent yet</div>';
   const rows=poRowsSorted(), allOn=poSelIds().length===rows.length;
   const th=(k,t,cls,tip)=>`<th class="${cls}" onclick="poSortBy('${k}')" title="${esc(tip||('Sort by '+t))}">${t} ${banMark(_poSort,k)}</th>`;
-  return `<div class="rowbox" style="max-height:300px"><table class="sktbl bantbl" style="width:100%;font-size:11.5px;table-layout:fixed">
+  return `<div class="rowbox" style="max-height:max(640px, calc(100vh - 330px))"><table class="sktbl bantbl" style="width:100%;font-size:11.5px;table-layout:fixed">
     <colgroup><col style="width:24px"><col style="width:78px"><col style="width:64px"><col style="width:auto"><col style="width:44px"><col style="width:52px"></colgroup>
     <thead><tr class="dim" style="font-size:10.5px">
       <th class="l" onclick="event.stopPropagation()"><input type="checkbox" ${allOn?'checked':''} title="Select every message" onclick="poSelAll(this.checked)"></th>
@@ -47759,7 +47759,12 @@ _SETTINGS_SHIM = """
     }
   }
   html += '<a class="setlink setback" href="/" title="Back to dashboard"><span class="sico">'+I('<path d="M11 5l-7 7 7 7M4 12h16"/>')+'</span><span class="slab">Back to dashboard</span></a>';
-  side.innerHTML = html;
+  // THE MENU RIDES WITH THE PAGE. On a long page (DrivePool, the Disk page)
+  // it scrolled off the top with the first screenful, and getting to another
+  // page meant scrolling all the way back up. The links sit in a sticky block
+  // under the header; if the window is shorter than the menu, the block
+  // scrolls on its own.
+  side.innerHTML = '<div class="setstick">' + html + '</div>';
 
   // COLLAPSE TO A RAIL. Remembered per browser; a phone starts collapsed
   // (Home Assistant's default) and, when expanded there, the menu opens over
@@ -47783,6 +47788,19 @@ _SETTINGS_SHIM = """
 
   host.parentNode.insertBefore(wrap, host);
   wrap.appendChild(side);
+  // how far below the top the sticky block sits: the header's real height,
+  // which changes when its pills wrap onto a second line
+  // Measured again on every scroll and resize rather than once: the header
+  // was 58px when this ran and 152px a moment later, once its pills had
+  // loaded and wrapped, and the menu's top slid underneath it.
+  let _lastH = -1;
+  const _setH = () => { const hd = document.querySelector('header');
+    const h = (hd && hd.offsetHeight) || 0;
+    if(h !== _lastH){ _lastH = h; wrap.style.setProperty('--sethead', h + 'px'); } };
+  _setH();
+  window.addEventListener('resize', _setH);
+  window.addEventListener('scroll', _setH, {passive:true});
+  setInterval(_setH, 2000);
   wrap.appendChild(host);
   host.style.margin = '0';
   host.style.border = '0';
@@ -47826,8 +47844,15 @@ _SETTINGS_SHIM = """
 
 _SETTINGS_CSS = """
 <style>
+/* overflow:clip, not hidden - hidden makes the box a scroll container, and a
+   sticky child then sticks to the box (which never scrolls) instead of the
+   window. clip rounds the corners the same way without that. */
 .setwrap{display:flex;gap:0;align-items:stretch;border:1px solid var(--line);
-         border-radius:10px;overflow:hidden;margin:14px}
+         border-radius:10px;overflow:clip;margin:14px}
+.setstick{position:sticky;top:var(--sethead,56px);
+          max-height:calc(100vh - var(--sethead,56px));overflow-y:auto;
+          scrollbar-width:thin;padding-bottom:10px}
+html.mobile .setwrap:not(.rail) .setstick{position:static;max-height:none;overflow:visible}
 .setside{width:210px;flex:0 0 210px;border-right:1px solid var(--line);
          padding:12px 0;background:rgba(255,255,255,.02)}
 .settitle{font-size:15px;padding:2px 14px 10px;font-weight:500}
