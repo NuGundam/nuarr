@@ -173,6 +173,15 @@ def init() -> None:
                 bucket  TEXT, path TEXT, rule TEXT, detail TEXT)""")
         cur.execute("CREATE INDEX IF NOT EXISTS ix_af_run "
                     "ON audit_findings(run_id)")
+        # "THE LATEST FINDING PER FILE" NEEDS TO FIND A FILE'S FINDINGS.
+        # standing() asks, for each of 59,913 rows, whether it is the newest
+        # one for its file - a lookup by file_id with nothing to look it up
+        # in. Measured 2026-10-03: /api/audit took over a minute, the
+        # dashboard asked again before the last answer came back, and two or
+        # three of them at once held three cores and read the database at
+        # 1.3 GB/s - which is what made every other page slow.
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_af_file_at "
+                    "ON audit_findings(file_id, at)")
         # found/want split the old prose detail into the two halves every
         # violation actually consists of. Older rows keep detail only and the
         # panel falls back to it.

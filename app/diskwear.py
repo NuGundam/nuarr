@@ -201,7 +201,7 @@ def _rate(key: str, written: int, power_hours: int) -> tuple[float, str]:
     first = s[0]
     if now - first[0] >= 86400 and written >= first[1]:
         return (written - first[1]) / ((now - first[0]) / 86400), \
-            f"last {round((now - first[0]) / 86400)} days"
+            (lambda n: "the last day" if n <= 1 else f"the last {n} days")(round((now - first[0]) / 86400))
     if power_hours:
         return written / (power_hours / 24), "lifetime average"
     return 0.0, ""
@@ -266,7 +266,11 @@ def read(fresh: bool = False) -> list:
             if hl["media_errors"]:
                 bad.append(f"{hl['media_errors']} media errors")
             raw_warn = bool(bad) or used >= WARN_AT
-            d.update(type="ssd", **hl, per_day=per_day, rate_basis=basis, days_left=days_left)
+            d.update(type="ssd", bus="NVMe", **hl, per_day=per_day, rate_basis=basis,
+                     days_left=days_left,
+                     # what the drive's own percentage implies its whole
+                     # endurance is: written / % used
+                     implied_tbw=(hl["written"] / used * 100) if used else None)
         else:
             realloc, pending = sm.get(5, 0), sm.get(197, 0)
             uncorr, crc = sm.get(198, 0), sm.get(199, 0)
@@ -291,7 +295,9 @@ def read(fresh: bool = False) -> list:
             raw_warn = bool(bad)
             d.update(type="hdd", realloc=realloc, pending=pending, uncorr=uncorr, crc=crc,
                      power_hours=hours, temp_c=(sm.get(194, 0) & 0xFF) or None,
-                     starts=sm.get(4, 0), spin_retry=sm.get(10, 0), used_pct=0, written=0, age=age)
+                     starts=sm.get(4, 0), spin_retry=sm.get(10, 0), used_pct=0, written=0, age=age,
+                     bus="SATA", base_realloc=b.get("realloc", 0), base_crc=b.get("crc", 0),
+                     base_at=b.get("at"))
         ig = ign_all.get(key)
         ignored = bool(ig and raw_warn and d.get("used_pct", 0) < int(ig.get("pct", 0)) + STEP
                        and set(bad) <= set(ig.get("problems") or []))

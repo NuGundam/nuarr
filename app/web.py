@@ -5880,12 +5880,37 @@ def _pool_ledger() -> dict:
 _TRUE: dict = {"at": 0.0, "data": {}}
 
 
+_TRUE_BUSY = threading.Lock()
+
+
 def _true_left(led: dict) -> dict:
     """pool -> (n, note) where n is everything still to do, queued or not.
-    None when the owner is still counting."""
+    None when the owner is still counting.
+
+    AN OLD ANSWER NOW, A NEW ONE BEHIND IT. Counting every untagged track and
+    every unverified file is ~2 s, and it ran inside the Health request each
+    time the minute's cache lapsed. Once there is an answer the page gets it
+    at once and the recount happens on a thread; only the very first ask
+    after a start waits."""
     now = time.time()
     if now - _TRUE["at"] < 60:
         return _TRUE["data"]
+    if _TRUE["at"]:
+        if _TRUE_BUSY.acquire(blocking=False):
+            def _bg():
+                try:
+                    _true_left_count(led)
+                except Exception:                                # noqa: BLE001
+                    pass
+                finally:
+                    _TRUE_BUSY.release()
+            threading.Thread(target=_bg, daemon=True, name="true-left").start()
+        return _TRUE["data"]
+    return _true_left_count(led)
+
+
+def _true_left_count(led: dict) -> dict:
+    now = time.time()
     out: dict = {}
 
     def inq(pool):
@@ -6020,13 +6045,19 @@ def api_health():
             pass
         return None, None
 
+    _clock = [time.perf_counter()]
+
     def add(key, label, goto, n, note, mode=None, running=False, warn=None,
             when="", pool=None, done=None, left=None, true_left=None,
             true_why=""):
+        # HOW LONG THIS CHECK TOOK, on the row - the page waits for the
+        # slowest of them, and "the Health page is slow" needs a name.
+        _now = time.perf_counter()
+        _ms = round((_now - _clock[0]) * 1000)
         rem = REMEDY.get(key)
         if done is None and left is None and key in POOL:
             done, left = _progress(key)
-        checks.append({"remedy": rem[0] if rem else "",
+        checks.append({"ms": _ms, "remedy": rem[0] if rem else "",
                        "pool": pool if pool is not None else POOL.get(key, ""),
                        "done": done, "left": left,
                        # EVERYTHING STILL TO DO, queued or not - None while
@@ -6050,6 +6081,7 @@ def api_health():
                        "when": when or ("counted live" if mode is None else ""),
                        "running": bool(running),
                        "warn": bool(warn if warn is not None else n)})
+        _clock[0] = time.perf_counter()
 
     try:
         from . import integrity as _ig
@@ -17871,6 +17903,7 @@ function popKeyOf(a){ return a.dataset.wpop ? 'worker:'+a.dataset.wpop
 function popHtmlFor(key){ const i=key.indexOf(':'); const kind=key.slice(0,i), disk=key.slice(i+1);
   return kind==='jobs' ? jpopHtml(disk)
        : kind==='worker' ? wpopHtml(disk)
+       : kind==='health' ? dwPopHtml(disk)
        : dpopHtml(kind, disk); }
 // ONE DIAL, IN FULL. The dashboard cell has room for a name and a number; this
 // is everything else the Concurrency page would tell you about it - what it is
@@ -29637,8 +29670,9 @@ async function loadTaskmgr(){
   // DRIVE HEALTH CHANGES BY THE DAY, NOT THE SECOND. The page repaints every
   // second; the health log is asked once a minute and only while Disk is open.
   if(_tmView==='disk' && Date.now()-_dwAt > 60000){
-    _dwAt = Date.now();
-    try{ _dw = await (await fetch('/api/diskwear')).json(); }catch(e){}
+    // Stamped only on success: a fetch that failed used to leave the section
+    // on "reading the drives…" for a full minute before it tried again.
+    try{ _dw = await (await fetch('/api/diskwear')).json(); _dwAt = Date.now(); }catch(e){}
   }
   tmPaint();
   tmTick();
@@ -30069,7 +30103,7 @@ function tmDiskView(H){
   const wornTag = d=>{ const t=String((d.note||'')+' '+(d.label||''));
     const w=Object.values(wornBy).find(x=>(x.labels||[]).includes(d.label)||(x.type==='ssd'&&x.model&&t.includes(x.model)));
     const what=w?(w.type==='ssd'?w.used_pct+'% worn':'disk trouble'):'';
-    return w?` <span title="${esc(w.ignored?'warning ignored':'see Drive health above')}" style="font-size:10px;padding:0 5px;border-radius:3px;border:1px solid ${w.ignored?'#8b949e55':'#e3b34166'};color:${w.ignored?'#8b949e':'#e3b341'}">${what}${w.ignored?' · ignored':''}</span>`:''; };
+    return w?` <span title="${esc(w.ignored?'warning ignored':'see Drive health below')}" style="font-size:10px;padding:0 5px;border-radius:3px;border:1px solid ${w.ignored?'#8b949e55':'#e3b34166'};color:${w.ignored?'#8b949e':'#e3b341'}">${what}${w.ignored?' · ignored':''}</span>`:''; };
   const diskRows = by.map(d=>{
     const series = rows.map(r=>(r.d[d.name]||[0,0])[0] + (r.d[d.name]||[0,0])[1]);
     // nuarr's own disks keep the colour every other panel gives them; the
@@ -30147,12 +30181,6 @@ function tmDiskView(H){
                     {name:'Nuarr Cache', colour:'#8b949e', fill:false,
                      get:r=>(r.cache_read||0)+(r.cache_write||0)}],
                 {peak:true, fmt:v=>tmBps(v)}))
-    + tmSection('Drive health',
-        'what each drive says about itself — an SSD\'s own endurance log, a hard disk\'s SMART table (the figures StableBit Scanner reads). '
-        + 'An SSD warns at '+((_dw&&_dw.warn_at)||80)+'% used; a hard disk warns at once on pending or uncorrectable sectors, '
-        + 'and on reallocated sectors or cable errors only when they rise past what nuarr first saw. '
-        + 'Ignore quiets a drive until it gets worse.',
-        dwTable())
     + tmSection('Every spindle',
         'the machine\'s own per-disk counters — everything on the disk, nuarr\'s work and anyone else\'s',
         `<table style="width:100%;font-size:11.5px;border-collapse:collapse;
@@ -30164,7 +30192,62 @@ function tmDiskView(H){
            table-layout:fixed">${tmCols(FCOLS)}<tbody>${fileRows}</tbody></table>`)
     + tmSection('The volumes', 'how full each pool disk and the cache is',
         `<table style="width:100%;font-size:11.5px;border-collapse:collapse;
-           table-layout:fixed">${tmCols(VCOLS)}<tbody>${volScale}${volRows}</tbody></table>`);
+           table-layout:fixed">${tmCols(VCOLS)}<tbody>${volScale}${volRows}</tbody></table>`)
+    + tmSection('Drive health',
+        'what each drive says about itself — an SSD\'s own endurance log, a hard disk\'s SMART table (the figures StableBit Scanner reads). '
+        + 'An SSD warns at '+((_dw&&_dw.warn_at)||80)+'% used; a hard disk warns at once on pending or uncorrectable sectors, '
+        + 'and on reallocated sectors or cable errors only when they rise past what nuarr first saw. '
+        + 'Ignore quiets a drive until it gets worse.',
+        dwTable());
+}
+// ONE DRIVE, IN FULL - in the card the DrivePool panel opens, because a second
+// kind of hover card would be a second thing to learn. The row has room for
+// the figures; this is what each figure means for this drive, what nuarr
+// compared it against, and what would make it warn.
+function dwPopHtml(key){
+  const d=((_dw&&_dw.drives)||[]).find(x=>x.key===key); if(!d) return '';
+  const ssd=d.type==='ssd';
+  const TB=b=>b>=1e13?(b/1e12).toFixed(0)+' TB':(b/1e12).toFixed(1)+' TB';
+  const watch=!d.raw_warn&&(d.notes||[]).length;
+  const col=d.warn?'#e3b341':d.ignored?'#8b949e':watch?'#d29922':'#3fb950';
+  const dim=t=>` <span class="dim">· ${t}</span>`;
+  const rows=[];
+  if(ssd){
+    rows.push(`<b>life used</b> <span style="color:${col}">${d.used_pct}%</span>`+dim('the drive\'s own estimate of its rated endurance'));
+    if(d.implied_tbw) rows.push(`<b>endurance</b> ~${TB(d.implied_tbw)}`+dim('what that percentage implies: written ÷ % used'));
+    rows.push(`<b>written</b> ${TB(d.written)} · <b>read</b> ${TB(d.read||0)}`);
+    if(d.per_day) rows.push(`<b>pace</b> ${TB(d.per_day)} a day`+dim(esc(d.rate_basis||'')));
+    if(d.days_left!=null) rows.push(`<b>reaches 100%</b> in about ${fmt(d.days_left)} days`
+      +dim('around '+new Date(Date.now()+d.days_left*864e5).toLocaleDateString(undefined,{month:'short',day:'numeric',year:'numeric'})));
+    rows.push(`<b>spare blocks</b> ${d.spare}%`+dim('the drive warns at '+d.spare_thr+'%'));
+    rows.push(`<b>media errors</b> <span style="color:${d.media_errors?'#e0575b':'inherit'}">${fmt(d.media_errors)}</span> · <b>unsafe shutdowns</b> ${fmt(d.unsafe)}`);
+    if(d.critical) rows.push(`<b style="color:#e0575b">critical flag</b> 0x${d.critical.toString(16)}`+dim('set by the drive itself'));
+  }else{
+    const since=d.base_at?' ('+new Date(d.base_at*1000).toLocaleDateString(undefined,{month:'short',day:'numeric'})+')':'';
+    rows.push(`<b>reallocated</b> <span style="color:${d.realloc?'#d29922':'inherit'}">${fmt(d.realloc)}</span>`
+      +dim('bad spots already swapped for spares'+(d.realloc||d.base_realloc?` — was ${fmt(d.base_realloc||0)} when nuarr first looked${since}`:'')));
+    rows.push(`<b>pending</b> <span style="color:${d.pending?'#e0575b':'inherit'}">${fmt(d.pending)}</span>`+dim('unreadable right now, waiting to be swapped'));
+    rows.push(`<b>uncorrectable</b> <span style="color:${d.uncorr?'#e0575b':'inherit'}">${fmt(d.uncorr)}</span>`+dim('could not be read even offline'));
+    rows.push(`<b>cable errors</b> <span style="color:${d.crc?'#d29922':'inherit'}">${fmt(d.crc)}</span>`
+      +dim('the SATA cable or connector, not the platters'+(d.crc||d.base_crc?` — was ${fmt(d.base_crc||0)}${since}`:'')));
+    rows.push(`<b>start/stops</b> ${fmt(d.starts||0)} · <b>spin retries</b> <span style="color:${d.spin_retry?'#d29922':'inherit'}">${fmt(d.spin_retry||0)}</span>`);
+  }
+  rows.push(`<b>temperature</b> ${d.temp_c!=null?d.temp_c+'°C':'—'} · <b>powered on</b> ${(d.power_hours/8766).toFixed(1)} years`+dim(fmt(d.power_hours)+' hours'));
+  const status = d.ignored ? 'Warning ignored — it comes back '+(d.rearm_at?'at '+d.rearm_at+'%':'when something new appears')+'.'
+    : (d.problems||[]).length ? d.problems.join('; ')
+    : d.warn ? 'Past the '+((_dw&&_dw.warn_at)||80)+'% line.'
+    : (d.notes||[]).length ? d.notes.join(' · ') : 'Healthy — nothing to report.';
+  const why = ssd
+    ? (d.used_pct===0&&d.written>5e13
+        ? 'This firmware reports 0% however much it has written, so the percentage says nothing here — go by the written total and the spare blocks.'
+        : '100% is the end of the rated endurance, not a cliff: drives usually keep working past it, but that is when to have a replacement in hand. Warns at '+((_dw&&_dw.warn_at)||80)+'%, then every '+((_dw&&_dw.step)||5)+' points.')
+    : 'Warns at once on pending or uncorrectable sectors — data on those spots cannot be read. Reallocated sectors and cable errors warn only when they rise past the first count nuarr saw.';
+  const sub=[d.model].concat((d.labels||[]).filter(l=>l&&l!==d.name)).filter(Boolean).join(' · ');
+  return `<div class="tpop-h" style="color:${col}">${esc(d.name)} <span class="dim">— ${esc(d.bus||'')} ${ssd?'SSD':'hard disk'} · disk ${d.disk}</span></div>
+    <div class="dim" style="font-size:10.5px;margin:-2px 0 5px" class="mono">${esc(sub)}</div>
+    <div class="tpop-n">${rows.join('<br>')}</div>
+    <div style="font-size:11px;margin-top:6px;color:${d.warn?'#e3b341':watch?'#d29922':'inherit'}">${esc(status)}</div>
+    <div class="dim" style="font-size:10.5px;margin-top:5px;line-height:1.45">${esc(why)}</div>`;
 }
 function dwTable(){
   const ds=(_dw&&_dw.drives)||null;
@@ -30175,7 +30258,7 @@ function dwTable(){
   // column says what wears that kind of drive out - endurance for an SSD,
   // the surface for a spinning disk - and the cells that do not apply to a
   // kind are a dash rather than a zero that would read as a measurement.
-  const C=[{t:'drive',w:'auto',a:'left'},{t:'type',w:'5%'},{t:'wear / surface',w:'19%',a:'left'},
+  const C=[{t:'NVMe / SSD',w:'auto',a:'left'},{t:'type',w:'5%'},{t:'wear / surface',w:'19%',a:'left'},
            {t:'written',w:'7%'},{t:'per day',w:'7%'},{t:'to 100%',w:'7%'},{t:'temp',w:'6%'},
            {t:'powered',w:'8%'},{t:'errors',w:'9%'},{t:'',w:'9%'}];
   const TB=b=>b>=1e13?(b/1e12).toFixed(0)+' TB':(b/1e12).toFixed(1)+' TB';
@@ -30189,9 +30272,9 @@ function dwTable(){
       : ign?(d.rearm_at?'ignored until '+d.rearm_at+'%':'ignored until something new')
       : warn?'past the '+((_dw&&_dw.warn_at)||80)+'% line'
       : (d.notes||[]).length?d.notes.join(' · ') : 'healthy';
-    const btn=d.raw_warn?`<button class="rmb" style="font-size:10.5px" onclick="dwIgnore('${jsq(d.key)}',${ign?0:1},this)"
+    const btn=d.raw_warn?`<button class="rmb" style="font-size:10.5px" onmousedown="dwIgnore('${jsq(d.key)}',${ign?0:1},this)"
         title="${ign?'Warn about this drive again now':'Stop warning about this drive until it gets worse'}">${ign?'Un-ignore':'Ignore'}</button>`:'';
-    const sep=(lastType&&lastType!==d.type)?`<tr><td colspan="10" style="padding:6px 0 2px;font-size:10px;letter-spacing:.06em;text-transform:uppercase" class="dim">hard disks</td></tr>`:'';
+    const sep=(lastType&&lastType!==d.type)?`<tr><td colspan="10" style="padding:8px 6px 2px;font-size:10px;letter-spacing:.06em;text-transform:uppercase" class="dim">hard disks</td></tr>`:'';
     lastType=d.type;
     const sub=(d.labels||[]).filter(l=>l&&l!==d.name).join(' · ');
     const wearCell = ssd
@@ -30205,11 +30288,11 @@ function dwTable(){
     const errCell = ssd
       ? `<span class="mono" title="media errors / unsafe shutdowns" style="color:${d.media_errors?'#e0575b':'inherit'}">${fmt(d.media_errors)} / ${fmt(d.unsafe)}</span>`
       : `<span class="mono" title="cable (UDMA CRC) errors" style="color:${d.crc?'#d29922':'inherit'}">${fmt(d.crc)} cable</span>`;
-    return sep+`<tr style="border-top:1px solid var(--line)">
+    return sep+`<tr style="border-top:1px solid var(--line)" data-dpop="health" data-ddisk="${esc(d.key)}">
       ${tmCell(C[0], `<b style="color:${col}">${esc(d.name)}</b> <span class="mono" style="font-size:10.5px">${esc(d.model||'')}</span>`
          + (sub?`<span class="dim" style="font-size:10px"> ${esc(sub)}</span>`:'')
          + `<div style="font-size:10px;color:${warn?'#e3b341':watch?'#d29922':'var(--dim,#8a97a6)'}">${esc(status)}</div>`)}
-      ${tmCell(C[1], `<span class="dim" style="font-size:10.5px">${ssd?'SSD':'HDD'}</span>`)}
+      ${tmCell(C[1], `<span class="dim" style="font-size:10.5px">${esc(d.bus||(ssd?'NVMe':'SATA'))}</span>`)}
       ${tmCell(C[2], wearCell)}
       ${tmCell(C[3], `<span class="mono">${ssd?TB(d.written):'—'}</span>`)}
       ${tmCell(C[4], `<span class="mono" title="${esc(d.rate_basis||'')}">${ssd&&d.per_day?TB(d.per_day):'—'}</span>`)}

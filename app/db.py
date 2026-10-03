@@ -560,6 +560,18 @@ def init_db() -> None:
             "AND name='ix_jobs_finished'").fetchone()
         cur.execute("CREATE INDEX IF NOT EXISTS ix_jobs_finished "
                     "ON jobs(finished_at DESC)")
+        # THE HEALTH PAGE'S LEDGER. "How many jobs has each pool done, queued,
+        # failed, and when did it last finish one" is a GROUP BY over every
+        # job ever run; with nothing to walk but the table - whose rows carry
+        # each job's whole plan and result - it read all 169,376 of them and
+        # sorted in a temp b-tree: 5.5 s, measured, on every Health page load
+        # past the 20-second cache (19 s cold). The three things the query
+        # reads are the whole index, in the order it groups by.
+        if not cur.execute("SELECT 1 FROM sqlite_master WHERE type='index' "
+                           "AND name='ix_jobs_ledger'").fetchone():
+            fresh_index = True
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_jobs_ledger "
+                    "ON jobs(COALESCE(pool, kind), state, finished_at)")
         # GROUPING BY TITLE needs its own index, on both tables the Activity
         # history pages over. Without them the paged view scanned all 62,000
         # finished jobs plus every history row to build one page of ten:

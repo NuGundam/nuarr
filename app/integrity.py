@@ -724,9 +724,19 @@ async def sweep(limit: int = 0, force: bool = False) -> dict:
             "remaining": await asyncio.to_thread(untested)}
 
 
+# A COUNT OVER EVERY FILE, ASKED SEVERAL TIMES A PAGE. The Health page reads
+# stats() twice per load (the row and its progress) and the dashboard summary
+# reads the Health page; each ask joined all 40,000 files against the
+# integrity table - 0.3 to 2 s apiece under load, measured. The answer moves
+# by a handful a minute, so one count serves fifteen seconds of askers.
+_UNTESTED: dict = {"at": 0.0, "n": 0}
+
+
 def untested() -> int:
     if not _READY:
         init()
+    if time.time() - _UNTESTED["at"] < 15:
+        return _UNTESTED["n"]
     try:
         with cursor() as cur:
             r = cur.execute(
@@ -735,7 +745,8 @@ def untested() -> int:
                 "WHERE f.state NOT IN ('deleted','duplicate') "
                 "  AND COALESCE(f.size,0) > 0 AND i.file_id IS NULL"
             ).fetchone()
-        return int(r["n"] or 0)
+        _UNTESTED.update(at=time.time(), n=int(r["n"] or 0))
+        return _UNTESTED["n"]
     except Exception:                                            # noqa: BLE001
         return 0
 
