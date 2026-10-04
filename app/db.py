@@ -676,7 +676,17 @@ def init_db() -> None:
         _LABEL_SQL = (
             "(SELECT CASE"
             "   WHEN COALESCE(f.title,'')='' THEN NULL"
-            "   WHEN f.season IS NULL AND COALESCE(f.episode,'')='' THEN f.title"
+            # A FILM: title + the year Radarr's folder carries before its id,
+            # "Godzilla (1954) {tmdb-1678}" - see display_label.
+            "   WHEN f.season IS NULL AND COALESCE(f.episode,'')='' THEN"
+            "        f.title || COALESCE(' (' || CASE"
+            # braces doubled: this string goes through .format(fid=...)
+            "          WHEN instr(f.path, ') {{tmdb-') > 5 THEN substr(f.path, instr(f.path, ') {{tmdb-') - 4, 4)"
+            "          WHEN instr(f.path, ') {{imdb-') > 5 THEN substr(f.path, instr(f.path, ') {{imdb-') - 4, 4)"
+            "          END || ')', '')"
+            # a daily show: the episode is the air date - see display_label
+            "   WHEN f.episode GLOB '[12][0-9][0-9][0-9]-[01][0-9]-[0-3][0-9]'"
+            "        THEN f.title || ' - ' || f.episode"
             "   WHEN f.season IS NOT NULL AND COALESCE(f.episode,'')<>'' THEN"
             "        f.title || ' - S' || printf('%02d', f.season) || 'E' ||"
             # THE SAME SHAPE display_label() MAKES, OR THE ROW LANDS UNDER A
@@ -728,6 +738,20 @@ def init_db() -> None:
             "      OR label LIKE '%.mkv' OR label LIKE '%.mp4' OR label LIKE '%.avi' "
             "      OR label LIKE '%.m4v' OR label LIKE '%.ts' OR label LIKE '%.webm'); "
             " END")
+        # FILMS TAKE THEIR YEAR, ONCE. Every film row so far was labelled with
+        # the bare title; this renames the ones still carrying exactly that.
+        if not cur.execute("SELECT 1 FROM kv WHERE k='film_year_labels'").fetchone():
+            _films = ("SELECT id FROM files WHERE season IS NULL "
+                      "AND COALESCE(episode,'')='' AND COALESCE(title,'')<>''")
+            cur.execute(
+                "UPDATE jobs SET title = " + _LABEL_SQL.format(fid="jobs.file_id")
+                + " WHERE file_id IN (" + _films + ") "
+                "   AND title = (SELECT title FROM files f WHERE f.id = jobs.file_id)")
+            cur.execute(
+                "UPDATE history SET label = " + _LABEL_SQL.format(fid="history.file_id")
+                + " WHERE file_id IN (" + _films + ") "
+                "   AND label = (SELECT title FROM files f WHERE f.id = history.file_id)")
+            cur.execute("INSERT INTO kv(k,v) VALUES('film_year_labels','1')")
         # AND THE BACKLOG IS NAMED ONCE. Keyed on a kv flag so the 150,000-row
         # UPDATE runs a single time, not on every start.
         # A NO-OP IS NOT A FAILURE, AND 288 OF THEM SAID IT WAS.
@@ -879,18 +903,43 @@ def pretty_from_filename(name: str) -> str:
     return _re.sub(r"\s+", " ", n[:cut]).strip(" -") or n
 
 
-def display_label(title: str | None, season=None, episode=None) -> str:
+_YEAR_RE = None
+
+
+def film_year(path: str | None) -> str:
+    """The year Radarr's folder format puts before the id: 'Godzilla (1954)
+    {tmdb-1678}'. '' when the path does not carry one."""
+    global _YEAR_RE
+    if _YEAR_RE is None:
+        import re as _re
+        _YEAR_RE = _re.compile(r"\(((?:18|19|20)\d{2})\)\s*\{(?:tmdb|imdb|tvdb)-")
+    m = _YEAR_RE.search(path or "")
+    return m.group(1) if m else ""
+
+
+def display_label(title: str | None, season=None, episode=None, path: str | None = None) -> str:
     """'Sword Art Online - S02E13' rather than just 'Sword Art Online'.
 
     A series title on its own is useless in a log when 200 episodes share it -
     you cannot tell which file a line refers to.
+
+    A FILM GETS ITS YEAR when the path is given: Godzilla 1954, 1998 and 2014
+    were one Activity group called "Godzilla", and so were 30 other remade
+    titles (Aladdin, Mulan, Dumbo, Hellboy...). "Godzilla (1954)" is also how
+    Radarr and the Pushover messages name it.
     """
     t = (title or "").strip() or "(untitled)"
     if season is None and not episode:
+        y = film_year(path)
+        if y and not t.endswith(f"({y})"):
+            return f"{t} ({y})"
         return t
     # Pad each numeric part so it sorts and reads like the filenames do:
     # S01E06, and S01E04-E05 for a multi-episode file.
     raw = str(episode or "").strip()
+    # A daily show's episode IS its air date: "WWE SmackDown - 2026-09-04".
+    if len(raw) == 10 and raw[4] == "-" and raw[7] == "-" and raw[:4].isdigit():
+        return f"{t} - {raw}"
     parts = [p for p in raw.split("-") if p]
     ep = "-E".join(f"{int(p):02d}" if p.isdigit() else p for p in parts) if parts else ""
     if season is not None and ep:

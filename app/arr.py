@@ -18,7 +18,12 @@ import httpx
 
 from .config import ArrConfig
 
-_EP_RE = re.compile(r"S(\d{1,3})E(\d{1,4})(?:-E?(\d{1,4}))?", re.I)
+# FOUR-DIGIT SEASONS: Tom and Jerry is filed by year (S1950E50) and \d{1,3}
+# never matched, so 161 shorts had no episode and Activity grouped a whole
+# year of them as one "Tom and Jerry - S1950".
+_EP_RE = re.compile(r"S(\d{1,4})E(\d{1,4})(?:-E?(\d{1,4}))?", re.I)
+# A daily show is named by its air date ("WWE SmackDown - 2026-09-04 - ...").
+_DATE_RE = re.compile(r"(?<!\d)((?:19|20)\d{2}-[01]\d-[0-3]\d)(?!\d)")
 
 
 def _quality_name(f) -> str | None:
@@ -44,7 +49,8 @@ def _episodes_from_relpath(rel: str) -> str | None:
     """
     m = _EP_RE.search(rel)
     if not m:
-        return None
+        d = _DATE_RE.search(rel or "")
+        return d.group(1) if d else None
     return f"{int(m.group(2))}-{int(m.group(3))}" if m.group(3) else str(int(m.group(2)))
 
 

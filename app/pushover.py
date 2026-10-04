@@ -230,6 +230,7 @@ def _esc(s) -> str:
 ARR_COL = {"sonarr": "#35c5f4", "radarr": "#ffc230"}
 LABEL_COL = {"Upgrade": "#a371f7", "Release": "#f778ba",
              "Placed": "#56d4dd", "Client": "#db6d28"}
+FROM_COL, TO_COL = "#f0883e", "#3fb950"     # the old file, the new one
 
 
 def _lab(name: str) -> str:
@@ -352,7 +353,16 @@ def build(cfg, body: dict, files: list, detail: str, upgrade: bool) -> dict | No
     if sub:
         lines.append("<i>" + _esc(sub) + "</i>")
     if upgrade and detail and detail != "upgrade":
-        lines.append(_lab("Upgrade") + _esc(detail.replace(" -> ", " → ")))
+        # "From <old> → To <new>", the two words coloured, so which side is
+        # which does not depend on reading the arrow. Anything after the new
+        # file's spec (" · audio jpn -> jpn+eng ...") stays as it was.
+        old, sep, new = detail.partition(" -> ")
+        if sep:
+            lines.append(_lab("Upgrade") + f'<font color="{FROM_COL}"><b>From</b></font> '
+                         + _esc(old.strip()) + f' → <font color="{TO_COL}"><b>To</b></font> '
+                         + _esc(new.strip().replace(" -> ", " → ")))
+        else:
+            lines.append(_lab("Upgrade") + _esc(detail))
     elif spec:
         lines.append(_esc(spec))
     rl = _release_line(body)

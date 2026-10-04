@@ -11424,6 +11424,25 @@ def _heal_labels(full: bool = False) -> int:
     import re as _re
     since = 0 if full else time.time() - 14 * 86400
     fixed = 0
+    # EPISODES THE NAME CARRIES BUT THE ROW DOES NOT. A season with no
+    # episode labels as "Show - S1950" and every episode in it groups as one:
+    # Tom and Jerry's year-seasons (S1950E50 - the parser stopped at three
+    # digits) and WWE SmackDown's air dates. Read off the name now, and every
+    # job and history row of that file re-labelled to match.
+    from .arr import _episodes_from_relpath
+    gaps = _rows("SELECT id, path, title, season FROM files WHERE season IS NOT NULL "
+                 "AND COALESCE(episode,'') = '' AND COALESCE(title,'') <> ''")
+    if gaps:
+        with cursor() as cur:
+            for g in gaps:
+                ep = _episodes_from_relpath(ntpath.basename(g["path"] or ""))
+                if not ep:
+                    continue
+                cur.execute("UPDATE files SET episode=? WHERE id=?", (ep, g["id"]))
+                lab = display_label(g["title"], g["season"], ep, g["path"])
+                cur.execute("UPDATE jobs SET title=? WHERE file_id=?", (lab, g["id"]))
+                cur.execute("UPDATE history SET label=? WHERE file_id=?", (lab, g["id"]))
+                fixed += 1
     rows = _rows(
         "SELECT 'h' k, h.id, h.file_id, f.path, f.title, f.season, f.episode "
         "  FROM history h JOIN files f ON f.id = h.file_id "
@@ -11471,7 +11490,7 @@ def _heal_labels(full: bool = False) -> int:
                 if m:
                     season = int(m.group(1))
                     episode = m.group(2) + (f"-{m.group(3)}" if m.group(3) else "")
-            label = display_label(title, season, episode)
+            label = display_label(title, season, episode, path)
             if r["k"] == "h":
                 cur.execute("UPDATE history SET label=? WHERE id=?", (label, r["id"]))
             else:
@@ -16911,7 +16930,10 @@ html.mobile #logsPane{height:auto;min-height:60vh}
   setTimeout(open, 6000);
 })();
 const fmt=n=>(n||0).toLocaleString();
-const gb=b=>!b?'0':(b/1073741824>=1024?(b/1099511627776).toFixed(2)+' TB':(b/1073741824).toFixed(1)+' GB');
+// UNDER A GIGABYTE IT READS IN MEGABYTES: a 30 MB episode printed as
+// "0.0 GB -> 0.0 GB -3.1%", which says nothing.
+const gb=b=>!b?'0':(b/1073741824>=1024?(b/1099511627776).toFixed(2)+' TB'
+              : b<1073741824?Math.round(b/1048576)+' MB':(b/1073741824).toFixed(1)+' GB');
 const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 // FOR TEXT GOING INSIDE A SINGLE-QUOTED JS STRING INSIDE AN HTML ATTRIBUTE.
 // Two escapings, in this order: JavaScript first (backslash, then apostrophe),
@@ -27141,7 +27163,16 @@ function renderDone(j){
       // a row with only a current size puts it in the "after" slot so the
       // numbers still stack.
       let sz=szCells(0,0,0);
-      const js=g.entries.filter(it=>it.job&&it.job.size_before&&it.job.size_after);
+      // THE CURRENT RELEASE ONLY. A group spans every release the episode
+      // has had, and first-job-before against last-job-after across an
+      // upgrade compared two different files: Miss Fisher S03E02 read
+      // "0.3 GB -> 2.0 GB +476%", which was the arr swapping releases, not
+      // nuarr growing a file. The newest file id is the release on disk.
+      const _jall=g.entries.filter(it=>it.job&&it.job.size_before&&it.job.size_after);
+      const _nowRel=(g.entries.slice().reverse().find(it=>(it.job||it.ev||{}).file_id)||{});
+      const _curFid=(_nowRel.job||_nowRel.ev||{}).file_id;
+      const js=_jall.filter(it=>it.job.file_id===_curFid).length
+              ? _jall.filter(it=>it.job.file_id===_curFid) : _jall;
       // Upgrades count as a before-and-after too: an "upgraded x4" row is
       // the first upgrade's old file against the newest upgrade's new one.
       const ups=g.entries.filter(it=>it.ev&&evName(it.ev)==='replaced')

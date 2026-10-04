@@ -1743,12 +1743,12 @@ def enqueue_many(rows: list, kind: str, priority: int = 50,
             chunk = ids[i:i + 900]
             q = ",".join("?" * len(chunk))
             for x in cur.execute(
-                    f"SELECT id, title, season, episode, state FROM files "
+                    f"SELECT id, title, season, episode, state, path FROM files "
                     f" WHERE id IN ({q})", chunk):
                 states[int(x["id"])] = x["state"] or ""
                 if x["title"]:
                     titles[int(x["id"])] = display_label(
-                        x["title"], x["season"], x["episode"])
+                        x["title"], x["season"], x["episode"], x["path"])
         now = time.time()
         batch = []
         for r in want:
@@ -1989,10 +1989,10 @@ async def enqueue(file_id: int, path: str, title: str = "",
     if file_id:
         from .db import display_label
         with cursor() as cur:
-            row = cur.execute("SELECT title, season, episode FROM files WHERE id=?",
+            row = cur.execute("SELECT title, season, episode, path FROM files WHERE id=?",
                               (file_id,)).fetchone()
         if row and row["title"]:
-            title = display_label(row["title"], row["season"], row["episode"])
+            title = display_label(row["title"], row["season"], row["episode"], row["path"])
     # "(untitled)" IS NOT A TITLE. display_label() writes it for a file whose
     # arr title has not arrived yet, and callers that built a label that way
     # (the auto-queue does) passed it straight through - so a file imported a
