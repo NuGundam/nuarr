@@ -1746,7 +1746,16 @@ def _reconstruct_skipped(arr_files: list, status: dict) -> list:
                     f"SELECT arr_name, arr_file_id, arr_parent_id, path, title, "
                     f"season, episode, size FROM files "
                     f"WHERE arr_name=? AND arr_parent_id IN ({qs}) "
-                    f"AND arr_file_id IS NOT NULL",
+                    f"AND arr_file_id IS NOT NULL "
+                    # ONLY WHAT THE ARR STILL HAS. A release replaced by an
+                    # upgrade keeps its arr file id on a row marked deleted, so
+                    # this handed 1,626 dead files back to reconcile as files
+                    # the arr still listed - the Libraries panel read
+                    # arr_files=41,611 against 40,359 the arrs actually hold,
+                    # and a dead row whose old name no live row holds was open
+                    # to being walked again. The guard in reconcile only
+                    # catches the case where the successor took the same path.
+                    f"AND COALESCE(state,'') NOT IN ('deleted','duplicate')",
                         (arr_name, *chunk)):
                     key = (r["arr_name"], r["arr_file_id"])
                     if key in have:

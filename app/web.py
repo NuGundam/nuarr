@@ -9660,11 +9660,10 @@ def api_history(limit: int = Query(100, le=1000), event: str | None = None):
     sql += " ORDER BY h.at DESC LIMIT ?"
     rows = _rows(sql, params + (limit,))
     for r in rows:
-        if r.get("title"):
-            r["label"] = display_label(r["title"], r.get("season"), r.get("episode"))
-        else:
-            # pool-wide jobs carry their own name; fall back to it before giving up
-            r["label"] = r.get("label") or "—"
+        lab = (_label_for(r.get("title"), r.get("season"), r.get("episode"), r.get("path"))
+               if r.get("file_id") else None)
+        # pool-wide events carry their own name; fall back to it before giving up
+        r["label"] = lab or r.get("label") or "—"
     return {"rows": rows}
 
 
@@ -11406,6 +11405,38 @@ def _act_index() -> list[tuple[str, float]]:
 
 
 _FILE_EXT = (".mkv", ".mp4", ".avi", ".m4v", ".ts", ".webm")
+_DIR_TITLE: dict = {}
+
+
+def _label_for(title, season, episode, path) -> str | None:
+    r"""THE ONE ANSWER TO "WHAT IS THIS ROW CALLED". Activity's live feed, its
+    history pages and the repair pass each built a label their own way, and
+    they disagreed: the live feed dropped the film year ("Bugonia" beside the
+    jobs' "Bugonia (2025)") and named an untitled file "—" or the bare show -
+    so one file showed as two or three rows.
+
+    Title from the file, else from a titled file in the same folder (a file
+    the arr replaced before nuarr learned its name); season/episode from the
+    file, else read off the name; the film year from the path."""
+    import ntpath
+    if not title and path:
+        d = ntpath.dirname(path).rstrip("\\") + "\\"
+        if d not in _DIR_TITLE:
+            r = _rows("SELECT title FROM files WHERE COALESCE(title,'') <> '' "
+                      "AND substr(path, 1, ?) = ? LIMIT 1", (len(d), d))
+            _DIR_TITLE[d] = r[0]["title"] if r else None
+            if len(_DIR_TITLE) > 5000:
+                _DIR_TITLE.clear()
+        title = _DIR_TITLE.get(d)
+    if not title:
+        return None
+    if season is None and path:
+        import re as _re
+        m = _re.search(r"[Ss](\d{1,4})[Ee](\d{1,4})(?:-?[Ee](\d{1,4}))?", ntpath.basename(path))
+        if m:
+            season = int(m.group(1))
+            episode = m.group(2) + (f"-{m.group(3)}" if m.group(3) else "")
+    return display_label(title, season, episode, path)
 
 
 def _heal_labels(full: bool = False) -> int:
@@ -11443,59 +11474,39 @@ def _heal_labels(full: bool = False) -> int:
                 cur.execute("UPDATE jobs SET title=? WHERE file_id=?", (lab, g["id"]))
                 cur.execute("UPDATE history SET label=? WHERE file_id=?", (lab, g["id"]))
                 fixed += 1
-    rows = _rows(
-        "SELECT 'h' k, h.id, h.file_id, f.path, f.title, f.season, f.episode "
-        "  FROM history h JOIN files f ON f.id = h.file_id "
-        " WHERE h.at >= ? AND (COALESCE(h.label,'') = '' "
-        "   OR lower(h.label) LIKE '%.mkv' OR lower(h.label) LIKE '%.mp4' OR lower(h.label) LIKE '%.avi' OR lower(h.label) LIKE '%.m4v' OR lower(h.label) LIKE '%.ts' OR lower(h.label) LIKE '%.webm' "
-        # the arr re-cased the show ("Hell Mode" -> "HELL MODE"): same words,
-        # older spelling, and Activity grouped the two apart
-        "   OR (COALESCE(f.title,'') <> '' "
-        "       AND lower(substr(h.label, 1, length(f.title))) = lower(f.title) "
-        "       AND substr(h.label, 1, length(f.title)) <> f.title)) "
-        "UNION ALL "
-        "SELECT 'j' k, j.id, j.file_id, COALESCE(f.path, j.path), f.title, f.season, f.episode "
-        "  FROM jobs j LEFT JOIN files f ON f.id = j.file_id "
-        " WHERE COALESCE(j.finished_at, j.created_at, 0) >= ? AND j.file_id IS NOT NULL "
-        "   AND (COALESCE(j.title,'') = '' OR j.title LIKE '(untitled)%' "
-        "        OR lower(j.title) LIKE '%.mkv' OR lower(j.title) LIKE '%.mp4' "
-        "        OR lower(j.title) LIKE '%.avi' OR lower(j.title) LIKE '%.m4v' "
-        "        OR lower(j.title) LIKE '%.ts' OR lower(j.title) LIKE '%.webm' "
-        "        OR (COALESCE(f.title,'') <> '' "
-        "            AND lower(substr(j.title, 1, length(f.title))) = lower(f.title) "
-        "            AND substr(j.title, 1, length(f.title)) <> f.title))",
-        (since, since))
-    if not rows:
-        return 0
-    by_dir: dict = {}
-    with cursor() as cur:
-        for r in rows:
-            title, season, episode = r["title"], r["season"], r["episode"]
-            path = r["path"] or ""
-            if not title and path:
-                d = ntpath.dirname(path)
-                if d not in by_dir:
-                    # a prefix compare, not LIKE: folder names carry % _ [ ]
-                    pre = d.rstrip("\\") + "\\"
-                    sib = cur.execute(
-                        "SELECT title FROM files WHERE COALESCE(title,'') <> '' "
-                        "   AND substr(path, 1, ?) = ? LIMIT 1",
-                        (len(pre), pre)).fetchone()
-                    by_dir[d] = sib["title"] if sib else None
-                title = by_dir[d]
-            if not title:
-                continue
-            if season is None:
-                m = _re.search(r"[Ss](\d{1,2})[Ee](\d{1,3})(?:-?[Ee](\d{1,3}))?", ntpath.basename(path))
-                if m:
-                    season = int(m.group(1))
-                    episode = m.group(2) + (f"-{m.group(3)}" if m.group(3) else "")
-            label = display_label(title, season, episode, path)
-            if r["k"] == "h":
-                cur.execute("UPDATE history SET label=? WHERE id=?", (label, r["id"]))
-            else:
-                cur.execute("UPDATE jobs SET title=? WHERE id=?", (label, r["id"]))
-            fixed += 1
+    # EVERY ROW TO THE ONE RULE. Any job or history row belonging to a file
+    # whose stored name is not what _label_for says - a file name, a bare
+    # show with no episode, a film without its year, an old capitalisation,
+    # nothing at all - takes the right one. Read in blocks; only rows that
+    # differ are written.
+    for kind, sql in (
+            ("h", "SELECT h.id, h.label cur, f.path, f.title, f.season, f.episode "
+                  "  FROM history h JOIN files f ON f.id = h.file_id "
+                  " WHERE h.at >= ? AND h.id > ? ORDER BY h.id LIMIT 20000"),
+            ("j", "SELECT j.id, j.title cur, COALESCE(f.path, j.path) path, f.title, "
+                  "       f.season, f.episode "
+                  "  FROM jobs j JOIN files f ON f.id = j.file_id "
+                  " WHERE COALESCE(j.finished_at, j.created_at, 0) >= ? AND j.id > ? "
+                  " ORDER BY j.id LIMIT 20000")):
+        last = 0
+        while True:
+            block = _rows(sql, (since, last))
+            if not block:
+                break
+            last = block[-1]["id"]
+            todo = []
+            for r in block:
+                lab = _label_for(r["title"], r["season"], r["episode"], r["path"])
+                if lab and lab != (r["cur"] or ""):
+                    todo.append((lab, r["id"]))
+            if todo:
+                with cursor() as cur:
+                    cur.executemany(
+                        "UPDATE history SET label=? WHERE id=?" if kind == "h"
+                        else "UPDATE jobs SET title=? WHERE id=?", todo)
+                fixed += len(todo)
+            if len(block) < 20000:
+                break
     return fixed
 
 
@@ -11505,7 +11516,11 @@ _HEALED_ONCE = {"done": False}
 def _act_index_build() -> list[tuple[str, float]]:
     try:
         try:
-            _heal_labels(full=not _HEALED_ONCE["done"])
+            full = not _HEALED_ONCE["done"] and kv_get("activity_labels_v") != "3"
+            n = _heal_labels(full=full)
+            if full:
+                kv_set("activity_labels_v", "3")
+                joblog.log(f"activity labels: full pass renamed {n} row(s)", "info")
             _HEALED_ONCE["done"] = True
         except Exception as e:                               # noqa: BLE001
             joblog.log(f"activity labels: {type(e).__name__}: {e}", "warn")
