@@ -160,7 +160,8 @@ def _file_row(file_id: int) -> dict | None:
     with cursor() as cur:
         row = cur.execute(
             "SELECT id,path,title,size,state,state_reason,arr_file_id,"
-            "arr_parent_id,library FROM files WHERE id=?", (file_id,)).fetchone()
+            "arr_parent_id,library,arr_name,season,episode FROM files WHERE id=?",
+            (file_id,)).fetchone()
     return dict(row) if row else None
 
 
@@ -312,6 +313,30 @@ async def run(file_id: int, delete_file: bool = True,
             _ban_name = await client.file_scene_name(int(row["arr_file_id"]))
         except Exception:                                        # noqa: BLE001
             _ban_name = ""
+
+    # A SEARCH THAT CANNOT EXCLUDE ANYTHING, A THIRD TIME, IS A LOOP. With no
+    # grab to blocklist and no name to ban, the search can only hand back the
+    # best release on offer - which, when it is the one just rejected, is this
+    # same file again. Pokemon Ranger went round six times in a day. Two
+    # rejections of one item inside a day without being able to exclude
+    # anything is enough: stop, and leave it for a person.
+    if not p.get("grab_id") and not _ban_name and row.get("arr_parent_id"):
+        with cursor() as cur:
+            prior = cur.execute(
+                "SELECT COUNT(*) n FROM history h JOIN files f ON f.id = h.file_id "
+                " WHERE h.event = 'deleted' AND h.detail LIKE 'nuarr rejected this release%' "
+                "   AND h.at > ? AND f.arr_name = ? AND f.arr_parent_id = ? "
+                "   AND COALESCE(f.season, -1) = COALESCE(?, -1) "
+                "   AND COALESCE(f.episode, '') = COALESCE(?, '')",
+                (time.time() - 86400, row.get("arr_name"), row["arr_parent_id"],
+                 row.get("season"), row.get("episode"))).fetchone()["n"]
+        if prior >= 2:
+            why = (f"rejected {prior} times in a day, and this release cannot be "
+                   f"blocklisted or banned (no grab record, no release name) - a "
+                   f"further search would bring the same one back. Left as it is "
+                   f"for you to decide")
+            joblog.log(f"REFETCH {row.get('title')}: stopped - {why}", "warn")
+            return {"ok": False, "did": [], "why": why}
 
     # A 404 FROM THE ARR IS STALE BOOKKEEPING, NOT A FAILURE.
     #

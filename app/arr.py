@@ -198,9 +198,38 @@ class ArrClient:
                 return hit
         if scene_name:
             want = re.sub(r"[^a-z0-9]", "", scene_name.lower())
-            return next((g for g in grabs
-                         if re.sub(r"[^a-z0-9]", "",
-                                   (g.get("sourceTitle") or "").lower()) == want), None)
+            hit = next((g for g in grabs
+                        if re.sub(r"[^a-z0-9]", "",
+                                  (g.get("sourceTitle") or "").lower()) == want), None)
+            if hit:
+                return hit
+        # NUARR'S OWN REMUX BREAKS THE fileId LINK. Repackaging an .mp4 as
+        # .mkv changes the name, the arr records the old file "MissingFromDisk"
+        # and gives the new one a NEW file id - and drops its sceneName. The
+        # import record still points at the old id, so every file nuarr had
+        # touched came back "no grab record survives": nothing to blocklist,
+        # nothing to ban, and Radarr grabbed the same rejected Pokemon Ranger
+        # release six times in a day. The newest import for THE SAME item is
+        # this file's origin: for a film, the film's latest import; for an
+        # episode, the latest import of the episodes this file holds.
+        want_eps: set = set()
+        if self.cfg.kind == "sonarr":
+            try:
+                eps = await self._get("/episode", seriesId=parent_id)
+                want_eps = {e["id"] for e in (eps or [])
+                            if int(e.get("episodeFileId") or 0) == int(arr_file_id)}
+            except Exception:                                    # noqa: BLE001
+                want_eps = set()
+            if not want_eps:
+                return None
+        cand = [h for h in imports if h.get("downloadId")
+                and (not want_eps or int(h.get("episodeId") or 0) in want_eps)]
+        cand.sort(key=lambda h: h.get("date") or "", reverse=True)
+        for imp in cand[:1]:
+            hit = next((g for g in grabs
+                        if g.get("downloadId") == imp["downloadId"]), None)
+            if hit:
+                return hit
         return None
 
     async def file_scene_name(self, arr_file_id: int) -> str:

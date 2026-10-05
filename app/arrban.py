@@ -159,6 +159,40 @@ def release_pattern(title: str) -> str:
     return "^" + "".join(out) + r"(?![A-Za-z0-9])"
 
 
+_YEAR_TOKEN = re.compile(r"(?<![0-9])((?:19|20)\d{2})(?![0-9])")
+
+
+def radarr_release_pattern(title: str) -> str | None:
+    r"""The same release as Radarr's custom formats SEE it.
+
+    RADARR NEVER SHOWS A FORMAT THE MOVIE'S NAME. A ReleaseTitleSpecification
+    is matched against parsedMovieInfo.simpleReleaseTitle, where the title is
+    replaced by "A Movie" - "Pokemon.Ranger.And.The.Temple.Of.The.Sea.2006.
+    BLURAY.1080p.BluRay.5.1-WORLD" is checked as "A.Movie.2006.BLURAY.1080p.
+    BluRay.5.1-WORLD" - so every release ban nuarr had written for Radarr,
+    anchored at the full name, matched nothing. Sonarr matches the full name
+    and was unaffected. Found when Radarr grabbed a banned release six times.
+
+    The honest cost: with the title hidden, this matches any film of that
+    year whose release name ends EXACTLY like this one (same tags, same
+    group). Radarr's blocklist - per movie - stays the precise guard; this
+    is the cross-indexer net. None when the name carries no year."""
+    t = _clean_title(title)
+    years = list(_YEAR_TOKEN.finditer(t))
+    if not years:
+        return None
+    rest = t[years[-1].start():]
+    out = []
+    for ch in rest:
+        if ch in " ._-()":
+            if out and out[-1] == "[ ._()-]+":
+                continue
+            out.append("[ ._()-]+")
+        else:
+            out.append(_esc(ch))
+    return r"^A[ ._-]+Movie[ ._()-]+" + "".join(out) + r"(?![A-Za-z0-9])"
+
+
 def group_pattern(group: str) -> str:
     g = str(group or "").strip()
     return "^" + "".join(_esc(c) for c in g) + "$"
@@ -489,10 +523,15 @@ async def _sync_one(cfg, live: list, names: dict) -> str:
         wanted: dict = {}
         for i, chunk in enumerate(_chunks(rel, PER_FORMAT)):
             nm = CF_RELEASES if i == 0 else f"{CF_RELEASES} {i + 1}"
+            # Radarr sees "A Movie" where the title was - see
+            # radarr_release_pattern. A name with no year cannot be written
+            # that way and keeps its full-name pattern (which Radarr ignores).
             specs = [{"name": r["value"][:80],
                       "implementation": "ReleaseTitleSpecification",
                       "negate": False, "required": False,
-                      "fields": [{"name": "value", "value": r["pattern"]}]}
+                      "fields": [{"name": "value", "value":
+                                  ((radarr_release_pattern(r["value"]) or r["pattern"])
+                                   if cfg.kind == "radarr" else r["pattern"])}]}
                      for r in chunk] or [{
                 "name": "nothing rejected yet",
                 "implementation": "ReleaseTitleSpecification",
