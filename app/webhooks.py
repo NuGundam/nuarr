@@ -805,6 +805,35 @@ async def _handle(cfg, body: dict) -> str:
     return f"ignored {ev}"
 
 
+@router.post("/api/webhook/seerr")
+async def receive_seerr(request: Request, token: str = ""):
+    """Seerr's webhook notification. Registered before the arr route below,
+    which would otherwise take "seerr" as an arr name and 404 it."""
+    if not secrets.compare_digest(token, webhook_token()):
+        raise HTTPException(403, "bad or missing token")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "expected JSON")
+    nt = str(body.get("notification_type") or "?")
+
+    async def work():
+        from . import pushover
+        try:
+            _note("Seerr", nt, await pushover.seerr(body))
+        except Exception as e:                                   # noqa: BLE001
+            _note("Seerr", nt, f"{type(e).__name__}: {e}", ok=False)
+            joblog.log(f"webhook Seerr/{nt} FAILED: {type(e).__name__}: {e}", "error")
+
+    asyncio.create_task(work())
+    return {"accepted": True, "event": nt}
+
+
+@router.get("/api/webhook/seerr/url")
+def seerr_url():
+    return {"url": f"{default_base_url().rstrip('/')}/api/webhook/seerr?token={webhook_token()}"}
+
+
 @router.post("/api/webhook/{arr_name}")
 async def receive(arr_name: str, request: Request, token: str = ""):
     cfg = _cfg(arr_name)

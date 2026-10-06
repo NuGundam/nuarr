@@ -45181,6 +45181,7 @@ const ARR_LOOK = {
   radarr: {c:'#ffc230', dim:'#ffc23033', ch:'R'},   // Radarr amber
   lidarr: {c:'#00a65a', dim:'#00a65a33', ch:'L'},
   readarr:{c:'#ff5f5f', dim:'#ff5f5f33', ch:'B'},
+  seerr:  {c:'#9b7bf7', dim:'#9b7bf733', ch:'O'},   // Seerr purple
 };
 function arrLook(kind){
   return ARR_LOOK[(kind||'').toLowerCase()]
@@ -46092,6 +46093,7 @@ function poPaint(){
         <label class="gsw" title="A file the arr did not have before."><input type="checkbox" ${o.imports?'checked':''} onchange="poOpt('imports',this.checked)"><span class="gname">new imports</span><span class="gstate ${o.imports?'on':'off'}">${o.imports?'on':'off'}</span></label>
         <label class="gsw" title="A file replacing one the arr already had - the message shows old and new."><input type="checkbox" ${o.upgrades?'checked':''} onchange="poOpt('upgrades',this.checked)"><span class="gname">upgrades</span><span class="gstate ${o.upgrades?'on':'off'}">${o.upgrades?'on':'off'}</span></label>
         <label class="gsw" title="Several files for one series within ${Math.round(d.quiet_s||20)} seconds go out as one message listing them all. Off sends one message per file."><input type="checkbox" ${o.digest?'checked':''} onchange="poOpt('digest',this.checked)"><span class="gname">packs as one digest</span><span class="gstate ${o.digest?'on':'off'}">${o.digest?'on':'off'}</span></label>
+        <label class="gsw" title="Seerr's own webhook posts here: new requests (and ones waiting for approval), declined or failed requests, and reported issues, each with the poster. Available is left to the import message."><input type="checkbox" ${o.seerr?'checked':''} onchange="poOpt('seerr',this.checked)"><span class="gname">Seerr requests</span><span class="gstate ${o.seerr?'on':'off'}">${o.seerr?'on':'off'}</span></label>
         <label class="gsw" title="Attach a link that opens nuarr from the notification."><input type="checkbox" ${o.link?'checked':''} onchange="poOpt('link',this.checked)"><span class="gname">link to nuarr</span><span class="gstate ${o.link?'on':'off'}">${o.link?'on':'off'}</span></label>
         <span style="display:flex;align-items:center;gap:6px;font-size:11.5px">priority
           <select onchange="poOpt('priority',this.value)" style="font-size:11.5px">

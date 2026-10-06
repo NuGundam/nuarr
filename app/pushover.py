@@ -45,7 +45,7 @@ RECENT_KEEP = 30
 QUIET_S = 60.0            # a pack lands one file every few seconds - Sugar Apple had a 29 s gap after E01
 MSG_LIMIT = 1024          # Pushover's message cap
 DEFAULT_OPTS = {"imports": True, "upgrades": True, "digest": True,
-                "priority": -1, "sound": "", "link": True}
+                "priority": -1, "sound": "", "link": True, "seerr": True}
 
 STATS: dict = {"sent": 0, "failed": 0, "last_sent": 0.0, "last_error": "",
                "pending": 0, "limit": None, "remaining": None, "reset": None}
@@ -146,7 +146,8 @@ async def resend(ids: list) -> dict:
 # ------------------------------------------------------------ sending ------
 async def send(title: str, message: str, *, priority: int | None = None,
                sound: str = "", url: str = "", url_title: str = "",
-               token: str = "", user: str = "") -> tuple[bool, str]:
+               token: str = "", user: str = "",
+               attachment: bytes | None = None) -> tuple[bool, str]:
     """One message to Pushover. HTML is on; the caller escapes its own text."""
     token = token or SETTINGS.pushover_token or ""
     user = user or SETTINGS.pushover_user or ""
@@ -165,7 +166,9 @@ async def send(title: str, message: str, *, priority: int | None = None,
         data["url_title"] = url_title or "open nuarr"
     try:
         async with httpx.AsyncClient(timeout=20.0) as c:
-            r = await c.post(API + "/messages.json", data=data)
+            files = ({"attachment": ("poster.jpg", attachment, "image/jpeg")}
+                     if attachment else None)
+            r = await c.post(API + "/messages.json", data=data, files=files)
         for k, h in (("limit", "X-Limit-App-Limit"), ("remaining", "X-Limit-App-Remaining"),
                      ("reset", "X-Limit-App-Reset")):
             if r.headers.get(h):
@@ -227,7 +230,7 @@ def _esc(s) -> str:
 # goes on the first line of the body instead - the same Sonarr blue / Radarr
 # amber the page uses. Each labelled line gets its own colour so the eye can
 # find "Placed" without reading the four above it.
-ARR_COL = {"sonarr": "#35c5f4", "radarr": "#ffc230"}
+ARR_COL = {"sonarr": "#35c5f4", "radarr": "#ffc230", "seerr": "#9b7bf7"}
 LABEL_COL = {"Upgrade": "#a371f7", "Release": "#f778ba",
              "Placed": "#56d4dd", "Client": "#db6d28"}
 FROM_COL, TO_COL = "#f0883e", "#3fb950"     # the old file, the new one
@@ -497,6 +500,81 @@ async def _send_group(items: list) -> None:
                "ptitle": title, "msg": msg})
     if not ok:
         joblog.log(f"pushover: could not send the {series} digest: {err}", "warn")
+
+
+# ------------------------------------------------------- Seerr ------------
+# REQUESTS, NOT ARRIVALS. Seerr knows who asked for what and whether it was
+# approved; the arrs only learn about it once a grab lands. So Seerr's own
+# webhook (Settings -> Notifications -> Webhook) posts here and nuarr sends
+# it on with the poster. "Available" is left out on Seerr's side: the import
+# message from the arr already says that, with more detail.
+SEERR_KIND = {
+    "MEDIA_PENDING": ("requested - needs approval", "#e3b341"),
+    "MEDIA_AUTO_APPROVED": ("requested", "#3fb950"),
+    "MEDIA_APPROVED": ("approved", "#3fb950"),
+    "MEDIA_AUTO_REQUESTED": ("auto-requested", "#3fb950"),
+    "MEDIA_DECLINED": ("declined", "#e0575b"),
+    "MEDIA_FAILED": ("request failed", "#e0575b"),
+    "MEDIA_AVAILABLE": ("available", "#35c5f4"),
+    "ISSUE_CREATED": ("issue reported", "#f0883e"),
+    "ISSUE_COMMENT": ("issue comment", "#f0883e"),
+    "ISSUE_RESOLVED": ("issue resolved", "#3fb950"),
+    "ISSUE_REOPENED": ("issue reopened", "#f0883e"),
+    "TEST_NOTIFICATION": ("test", "#9b7bf7"),
+}
+
+
+async def _poster(url: str) -> bytes | None:
+    if not url.startswith("http"):
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as c:
+            r = await c.get(url)
+        if r.status_code == 200 and len(r.content) < 2_500_000:
+            return r.content
+    except Exception:                                            # noqa: BLE001
+        pass
+    return None
+
+
+async def seerr(body: dict) -> str:
+    """One Seerr webhook -> one message. Returns what happened, for the log."""
+    nt = str(body.get("notification_type") or "")
+    if not enabled():
+        return "pushover off"
+    if not opts().get("seerr", True):
+        return "seerr messages off"
+    verb, col = SEERR_KIND.get(nt, (nt.lower().replace("_", " ") or "event", "#9b7bf7"))
+    subject = str(body.get("subject") or "").strip() or "Seerr"
+    req, iss, com, med = (_obj(body.get(k)) for k in ("request", "issue", "comment", "media"))
+    who = (req.get("requestedBy_username") or iss.get("reportedBy_username")
+           or com.get("commentedBy_username") or "")
+    lines = [f'<b><font color="{col}">{_esc(verb[:1].upper() + verb[1:])}</font></b>'
+             + (f" by {_esc(who)}" if who else "")]
+    mt = str(med.get("media_type") or "")
+    if mt:
+        lines.append(_lab("Type") + ("film" if mt == "movie" else "series" if mt == "tv" else _esc(mt)))
+    for x in body.get("extra") or []:
+        x = _obj(x)
+        if x.get("name") and x.get("value"):
+            lines.append(_lab(str(x["name"])) + _esc(x["value"]))
+    if iss.get("issue_type"):
+        lines.append(_lab("Issue") + _esc(iss["issue_type"]).lower())
+    if com.get("comment_message"):
+        lines.append(_lab("Comment") + _esc(str(com["comment_message"])[:300]))
+    text = str(body.get("message") or "").strip()
+    if text and not com.get("comment_message"):
+        lines.append('<font color="#8b949e">' + _esc(text[:360] + ("…" if len(text) > 360 else "")) + "</font>")
+    msg = _arr_tag("Seerr", "seerr") + " · <b>" + _esc(subject) + "</b>\n" + "\n".join(lines)
+    title = f"Seerr · {verb} · {subject}"
+    img = await _poster(str(body.get("image") or ""))
+    ok, err = await send(title, msg, url=_link(), attachment=img)
+    _remember({"at": time.time(), "arr": "Seerr", "title": subject,
+               "detail": verb + (f" by {who}" if who else ""), "ok": ok, "error": err,
+               "kind": "seerr", "files": "", "ptitle": title, "msg": msg})
+    if not ok:
+        joblog.log(f"pushover: could not send Seerr {nt} for {subject}: {err}", "warn")
+    return f"{verb}: {subject}" + ("" if ok else f" (send failed: {err})")
 
 
 def snapshot() -> dict:
