@@ -37112,12 +37112,20 @@ async function whisInstall(mode){
 // library, which is the exact outcome the whole system exists to prevent.
 let _upd=null;
 
-async function loadUpdates(force){
+async function loadUpdates(force, quiet){
   const el=document.getElementById('updBody');
   if(!el) return;
-  el.innerHTML='<div class="dim" style="padding:14px">checking…</div>';
+  // A quiet repaint (the download poll finishing) must not blank the pane:
+  // "checking..." every few seconds read as the page reloading itself.
+  const wasOpen=!!(el.querySelector('details')||{}).open;
+  if(!quiet) el.innerHTML='<div class="dim" style="padding:14px">checking…</div>';
   try{ _upd=await (await fetch('/api/updates'+(force?'?force=1':''))).json(); }
-  catch(e){ el.innerHTML='<div class="dim" style="padding:14px">could not load</div>'; return; }
+  catch(e){ if(!quiet) el.innerHTML='<div class="dim" style="padding:14px">could not load</div>'; return; }
+  setTimeout(()=>{
+    if(quiet && wasOpen){ const d=el.querySelector('details'); if(d) d.open=true; }
+    const st=(_upd.apply||{}).state;
+    if(st==='downloading' || st==='verifying') updPoll();
+  }, 0);
   const u=_upd;
   const when = u.checked_at ? new Date(u.checked_at*1000).toLocaleString() : 'never';
 
@@ -37197,8 +37205,8 @@ async function loadUpdates(force){
           ${(u.apply||{}).state==='ready'
             ? `<button class="btn" onclick="ctlUpdate()">Install ${esc(u.apply.staged_version)} now</button>
                <span class="dim" style="font-size:11.5px">downloaded and verified - Nuarr restarts briefly to apply it</span>`
-            : (u.apply||{}).state==='downloading'
-            ? `<span class="dim">downloading… ${Math.round(((u.apply||{}).progress||0)*100)}%</span>`
+            : ['downloading','verifying'].includes((u.apply||{}).state)
+            ? `<span id="updProg" class="dim">${updProgText(u)}</span>`
             : `<button class="btn" onclick="updStage()">Download &amp; verify</button>
                <span class="dim" style="font-size:11.5px">fetches the installer, checks it byte-for-byte, and stages it - nothing restarts until you install</span>`}
           ${(u.apply||{}).state==='error'?`<span class="err" style="font-size:11.5px">✗ ${esc((u.apply||{}).error||'')}</span>`:''}
@@ -37240,17 +37248,33 @@ async function loadUpdates(force){
     </div>`;
 }
 
+function updProgText(u){
+  const a=u.apply||{};
+  return a.state==='verifying' ? 'verifying…'
+       : `downloading… ${Math.round((a.progress||0)*100)}%`;
+}
 async function updStage(){
-  try{ fetch('/api/updates/stage',{method:'POST'}); }catch(e){}
-  // repaint on a short clock while the download runs
-  setTimeout(()=>{ loadUpdates(0); loadVersion(); }, 1500);
-  const t=setInterval(async ()=>{
-    const u=await (await fetch('/api/updates')).json();
+  try{ await fetch('/api/updates/stage',{method:'POST'}); }catch(e){}
+  loadUpdates(0, true); loadVersion();
+}
+// ONE poll while a download runs, touching only the percentage. It used to
+// rebuild the whole pane every 3 s, so the page looked like it kept
+// reloading and "What changed" snapped shut. Opening the page mid-download
+// starts the same poll, so the figure moves instead of sitting still.
+let _updPollT=null;
+function updPoll(){
+  if(_updPollT) return;
+  _updPollT=setInterval(async ()=>{
+    let u; try{ u=await (await fetch('/api/updates')).json(); }catch(e){ return; }
     _updState=u; ctlUpdatePaint();
-    if((u.apply||{}).state!=='downloading' && (u.apply||{}).state!=='verifying'){
-      clearInterval(t); loadUpdates(0); loadVersion();
-    } else { loadUpdates(0); }
-  }, 3000);
+    const st=(u.apply||{}).state, p=document.getElementById('updProg');
+    if(st==='downloading' || st==='verifying'){
+      if(p){ p.textContent=updProgText(u); return; }
+      if(document.getElementById('updBody')) return;   // pane open but not drawn yet
+    }
+    clearInterval(_updPollT); _updPollT=null;
+    loadUpdates(0, true); loadVersion();
+  }, 2000);
 }
 async function updMode(m){
   await fetch('/api/updates/mode?mode='+m,{method:'POST'});
