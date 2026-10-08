@@ -97,7 +97,22 @@ While a balance runs, renames are held (they race the mover for the same
 file), a disk removal holds everything, and file replaces go ahead paced per
 chunk against the disk the file lands on. Each hold is a switch.
 
+nuarr also picks the disk. Its own commits land on the emptiest disk that is
+not in use, and — through a custom-script hook in Sonarr and Radarr — so do the
+arrs' imports, with a season pack imported at disk speed. nuarr writes through
+the pool rather than around it, tells DrivePool what it placed, and asks it to
+re-measure once a day at a quiet hour. Balancing can be started and stopped
+from the DrivePool page.
+
 ![DrivePool](docs/screenshots/drivepool.png)
+
+### It watches the drives wear
+
+The Disk page has a **Drive health** section: SSD and NVMe wear read from the
+drives' own health logs, with data written per day and a projected date to
+100%; and for hard disks, SMART — reallocated and pending sectors, temperature
+and helium level — in a table of their own. Each drive has a hover card. A
+drive can be ignored until it gets worse, and crossing a step sends an alert.
 
 ### Everything is hysteretic
 
@@ -123,8 +138,9 @@ action are not the same problem.
 |---|---|
 | **Video** | Re-encode only when the codec or profile forces a transcode. NVENC / QSV / AMF / CPU, probed by test-encode rather than trusted from `ffmpeg -encoders` |
 | **Audio** | Keep what plays, transcode what doesn't, drop what nobody needs |
-| **Subtitles** | Convert forced PGS to SRT by OCR so it stops forcing a video burn-in. The text track keeps the clean title ("English [Full]", not "English (PGS) (OCR)") and carries a `NUARR_OCR` track tag instead; when an encode is queued for a file whose read picture track is still in it, the picture track is dropped in the same mux |
-| **Language tags** | Detect mislabelled audio with Whisper and fix the tag with `mkvpropedit` — metadata only, no re-encode |
+| **Subtitles** | Convert forced PGS to SRT by OCR so it stops forcing a video burn-in. The text track keeps the clean title ("English [Full]", not "English (PGS) (OCR)") and carries a `NUARR_OCR` track tag instead; when an encode is queued for a file whose read picture track is still in it, the picture track is dropped in the same mux. Sidecar subtitles are taken into the file they belong to, one track per language and kind survives (the fullest copy), and a library can require a subtitle language |
+| **Burned-in subtitles** | Found by reading the picture with OCR, on the graphics card, and marked with a track that describes what is in the picture |
+| **Language tags** | Detect mislabelled audio with Whisper and fix the tag with `mkvpropedit` — metadata only, no re-encode. Whisper listens to the whole sample, runs outside the server, and skips theme songs and lyrics |
 | **Containers** | Remux to a container Plex will seek in |
 
 ![Codec settings](docs/screenshots/settings-codec.png)
@@ -138,6 +154,34 @@ Every file is checked against the rules it was supposed to satisfy, and the
 check self-heals: a finding is queued, fixed, and re-verified.
 
 ![Rule check](docs/screenshots/settings-rules.png)
+
+A file built before a rule changed is found and rebuilt under today's rules,
+not left following the old ones.
+
+### Read once, decide once, rewrite once
+
+Subtitles and audio are one pipeline. The library is read once — subtitle
+kinds, sidecars, burned-in text, spoken language — the planner decides once,
+and the rewrite goes through the queue as a job like any other. Every finding
+is scored, and only the uncertain middle of the range needs a person:
+**Subtitle User Input** and **Audio User Input** are the one place for what
+nuarr cannot settle by itself. A row opens to show its evidence and leaves once
+answered, and a question you have already answered is not asked again.
+
+## The Processing System
+
+Eight worker pools — encode, subtitle rewrite, OCR, listening, decode check and
+the rest — each with its own colour, its own switch, and a budget for
+processor, graphics card, memory and disk, so the pools share the box instead
+of fighting over it. The queue is a grid in the order the work will run: the
+file that just landed goes first, and work that unblocks other work moves to
+the front. Every eligible file shows its steps — grey is still owed, colour is
+done — and the row being worked on glows in its worker's colour.
+
+A **Task manager**, for nuarr only, lists every worker process with what it
+costs, Windows' own disk names, a measured GPU column and the processor
+temperature. **Health** has a row per work system: whether it is moving, how
+much is done and left, and — if work is waiting and nothing runs — why.
 
 ---
 
@@ -156,6 +200,43 @@ Sonarr's parser gives up on a daily-series name ("Show - 2026-09-04 - SmackDown
 fills in quality, language and release group itself. An `.iso` or other
 non-media file that came down as a "release" gets a blocklist-and-refetch
 button.
+
+A release that nuarr rejects is **banned in the arrs for every indexer**, not
+just the one it came from, with a points system and per-arr scope; bans are
+pushed in seconds. A **queue janitor** clears downloads the arrs finished with
+but never let go of, drops the lower-scored duplicate, and removes and
+blocklists executables dressed up as video. And when an arr keeps grabbing the
+same rejected film, nuarr stops the search instead of feeding the loop.
+
+## Plex collections and Tautulli
+
+Collections Plex cannot build for itself, per TV library and kept in step with
+Sonarr: **Ended**, **Unwatched**, **Unwatched Ended**, and the same three per
+audio language. Where Plex leaves a collection without a poster, nuarr makes a
+collage. Every change nuarr makes to a file is passed to Plex, and a second
+check confirms Plex re-read it.
+
+With Tautulli connected, nuarr learns which of your devices actually play each
+codec and subtitle format, so the codec pages can say whether the devices
+agree rather than guess.
+
+## On your phone, as notifications
+
+Under **Integrations → Pushover**, with your own app token and user key, every
+message arrives with the Nuarr icon:
+
+- **Imports and upgrades** from Sonarr and Radarr, with what the arrs leave
+  out: quality, codecs, audio languages and size; the release, its indexer and
+  score; the pool disk it landed on and how full that disk is; for an upgrade,
+  the old file beside the new one, and whether the file now has English audio.
+  A season pack arrives as one digest, not twelve messages.
+- **Seerr requests and issues** — new, waiting for approval, approved,
+  declined or failed, and reported issues — each with the poster. Point
+  Seerr's webhook notification at nuarr and it does the rest.
+- **Drive health** alerts.
+
+The sent list on the page sorts, opens each message as it was sent, and can
+resend or forget it.
 
 ## On a phone
 
@@ -240,6 +321,9 @@ Whisper (audio language detection) is optional too, and installs later with
 one click from `Settings → Whisper` — GPU or CPU. Without it, untagged audio
 is still named by inference; with it, nuarr writes what the track actually
 contains.
+
+Also optional: **Tautulli** (device capabilities), **Pushover** (notifications)
+and **Seerr** (request notifications through Pushover).
 
 ## Install
 
