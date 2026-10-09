@@ -95,7 +95,13 @@ def rules_available(library: str) -> list:
                 continue
             seen.add(k)
             name = _lang_name(code)
-            out.append({"key": f"lang:{code}", "title": name, "lang": code,
+            # THE ONE THAT GOES ON THE HOME SCREEN is named for it: a row
+            # called just "English" on Plex Home does not say which library
+            # it came from. "Anime Shows English Audio" matches the movie
+            # library's hand-made "Anime Movies English Audio". The cuts
+            # below stay short - they live inside the library.
+            out.append({"key": f"lang:{code}", "title": f"{library} {name} Audio",
+                        "old": name, "lang": code,
                         "what": f"every regular episode has {name} audio "
                                 f"(specials do not count)"})
             out.append({"key": f"lang_ended:{code}", "title": f"{name} Ended",
@@ -433,11 +439,43 @@ def _diff_and_members(rules: list, titles: dict, facts: dict, members: dict) -> 
     return adds, removes, after
 
 
+def _rename_old(lib_name: str, avail: list, rules: list) -> int:
+    """A collection whose title nuarr has changed is renamed in Plex, in
+    place - same collection, same members, same Home-screen pin - and the
+    memory follows, so the next pass does not build a second one."""
+    mem = _mem_load(lib_name)
+    members = mem.get("members") or {}
+    section = mem.get("section") or ""
+    n = 0
+    for r in avail:
+        old, new = r.get("old"), r["title"]
+        if not old or r["key"] not in rules or old not in members or new in members:
+            continue
+        if section:
+            d = _get(f"/library/sections/{section}/collections")
+            for c in (d.get("MediaContainer") or {}).get("Metadata") or []:
+                if (c.get("title") or "") == old:
+                    _put(f"/library/sections/{section}/all?type=18&id={c['ratingKey']}"
+                         f"&title.value={urllib.parse.quote(new)}&title.locked=1")
+        members[new] = members.pop(old)
+        n += 1
+    if n:
+        mem["members"] = members
+        _mem_save(lib_name, mem)
+        joblog.log(f"collections: {lib_name}: renamed {n} collection(s) to the new titles")
+    return n
+
+
 async def sync_library(lib, arr: dict | None = None, dry: bool = False,
                        full: bool = False) -> dict:
     """Bring one library's kept collections in line. Returns what it did."""
     rules = rules_for(lib.name)
     avail = rules_available(lib.name)
+    if not dry:
+        try:
+            await asyncio.to_thread(_rename_old, lib.name, avail, rules)
+        except Exception as e:                               # noqa: BLE001
+            joblog.log(f"collections: {lib.name}: rename failed: {type(e).__name__}: {e}", "warn")
     codes = sorted({r["lang"] for r in avail if r["lang"]})
     titles = {rk: _title_of(rk, avail) for rk in rules}
     res = {"library": lib.name, "rules": rules,
