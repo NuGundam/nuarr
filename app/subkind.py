@@ -880,8 +880,11 @@ def findings(limit: int = 600, want_done: bool = True,
     # COUNTED OVER ALL OF THEM, SENT AS THE FEW. The filter is applied after
     # the counts below have been taken from the whole set, which is why the
     # header can still say how many are being left out.
+    # A ROW AUTO HAS ALREADY DECIDED is with the answered ones: auto will
+    # carry it out, so it is not waiting on anyone.
+    _auto = mode() == "auto"
     shown = [r for r in rows
-             if (want_done or not r["done"])
+             if (want_done or not (r["done"] or (_auto and r.get("auto") == "act")))
              and (want_unread or not r["unread"])]
     return {
         "rows": shown,
@@ -912,8 +915,12 @@ def findings(limit: int = 600, want_done: bool = True,
             # are different states and the footer should not call them one.
             "queued": sum(1 for r in rows if r.get("queued")),
             "settled": sum(1 for r in rows if r.get("acked")),
+            # NOT A QUESTION WHEN AUTO HAS ALREADY ANSWERED IT. A 100% row in
+            # auto mode is nuarr's to carry out; counting it put "2 to answer"
+            # over a footer that said "nothing still to answer".
             "actionable": sum(1 for r in rows if r["action"] and not r["done"]
-                              and not r["unread"]),
+                              and not r["unread"]
+                              and not (mode() == "auto" and r.get("auto") == "act")),
         },
         "picture": hs,
         "tracks": sp,

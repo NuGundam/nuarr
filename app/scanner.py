@@ -2008,10 +2008,16 @@ def _verify_unmanaged_sync(arr_files, status) -> dict:
     now = time.time()
 
     with cursor() as cur:
+        # EVERY SIZE IS LINKED; ONLY THE BIG ONES ARE CALLED ORPHANS. The
+        # size floor used to sit on this query, so a file under it was never
+        # matched to the arr at all - 104 Case Closed SDTV episodes (80-97 MB)
+        # that Sonarr has tracked since 2025 sat in Extras as "OP/ED, specials,
+        # bonus" and their unlinked rows kept the queue from touching them.
+        # The floor is about what is worth reporting, not about what can be
+        # adopted.
         rows = [dict(r) for r in cur.execute(
             "SELECT id, path, size FROM files WHERE arr_file_id IS NULL "
-            "AND state NOT IN ('duplicate','deleted') AND COALESCE(size,0)>=?",
-            (cut,))]
+            "AND state NOT IN ('duplicate','deleted')")]
         for r in rows:
             p = pathmap._norm(r["path"] or "")
             hit = by_path.get(p)
@@ -2065,6 +2071,8 @@ def _verify_unmanaged_sync(arr_files, status) -> dict:
                      hit.title or "", hit.season, hit.episode, now, r["id"]))
                 linked += 1
                 continue
+            if int(r["size"] or 0) < cut:
+                continue                     # an extra - kept, not reported
             d = os.path.dirname(pathmap._norm(r["path"] or ""))
             if d in known_dirs or d in known_parents or os.path.dirname(d) in known_parents:
                 orphan_in_known.append(r["id"])

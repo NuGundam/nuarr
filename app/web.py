@@ -9414,9 +9414,14 @@ def _file_steps(rows: list, cap: int = 400) -> None:
 def api_files(state: str | None = None, library: str | None = None,
               q: str | None = None, disk: str | None = None,
               unmanaged: int = 0, extras: int = 0, errors: int = 0,
-              queueable: int = 0,
+              queueable: int = 0, no_arr: int = 0,
               limit: int = Query(200, le=5000), offset: int = 0):
     where, params = [], []
+    if no_arr:
+        # The header's "N here that no arr tracks" - both tiles' worth, any
+        # size. It opened the Unmanaged list, which has a size floor, so
+        # "111" opened onto one row.
+        where.append("arr_file_id IS NULL AND state NOT IN ('duplicate','deleted')")
     cut = SETTINGS.min_orphan_size_mb * 1024 * 1024
     if queueable:
         # Match _eligible_rows() exactly, so a preview shows what the queue
@@ -9604,7 +9609,7 @@ def _lock_quiet_s() -> float:
 def api_files_raw(state: str | None = None, library: str | None = None,
                   q: str | None = None, disk: str | None = None,
                   unmanaged: int = 0, extras: int = 0, errors: int = 0,
-                  limit: int = Query(5000, le=5000)):
+                  no_arr: int = 0, limit: int = Query(5000, le=5000)):
     """The same list as plain text, for when you want to read or keep it.
 
     CALLED BY KEYWORD, DELIBERATELY. This used to be:
@@ -9624,11 +9629,12 @@ def api_files_raw(state: str | None = None, library: str | None = None,
     """
     d = api_files(state=state, library=library, q=q, disk=disk,
                   unmanaged=unmanaged, extras=extras, errors=errors,
-                  queueable=0, limit=limit, offset=0)
+                  queueable=0, no_arr=no_arr, limit=limit, offset=0)
     head = (f"nuarr — {len(d['rows'])} of {d['total']} file(s)"
             + (f"  state={state}" if state else "")
             + ("  unmanaged" if unmanaged else "")
             + ("  extras" if extras else "")
+            + ("  no arr" if no_arr else "")
             + ("  errors" if errors else ""))
     out = [head, "=" * 78]
     for r in d["rows"]:
@@ -17484,7 +17490,7 @@ async function loadAll(){
     const na = t.no_arr || 0;
     const naBit = na
       ? `<b class="lnk" style="color:#79c0ff"`
-        + ` onclick="event.stopPropagation();drill({unmanaged:1,`
+        + ` onclick="event.stopPropagation();drill({no_arr:1,`
         + `t:'Files no arr tracks'})"`
         + ` title="Files nuarr has indexed that neither Sonarr nor Radarr has a`
         + ` record for — usually a failed or half-finished import, sometimes`
@@ -18995,6 +19001,7 @@ function drillUrl(extra){
   if(q.state) p.set('state',q.state);
   if(q.unmanaged) p.set('unmanaged','1');
   if(q.extras) p.set('extras','1');
+  if(q.no_arr) p.set('no_arr','1');
   if(q.errors) p.set('errors','1');
   if(q.library) p.set('library',q.library);
   const t=document.getElementById('drillQ');
