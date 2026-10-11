@@ -387,12 +387,12 @@ def windows(duration: float) -> list[tuple]:
     return w
 
 
-async def _video_end(path: str) -> float:
-    """How long the VIDEO stream runs, from its own header. 0 if unknown."""
+async def _stream_end(path: str, sel: str) -> float:
+    """How long one stream runs, from its own header. 0 if unknown."""
     try:
         from .jobs import _ffprobe_exe
         p = await asyncio.create_subprocess_exec(
-            _ffprobe_exe(), "-v", "error", "-select_streams", "v:0",
+            _ffprobe_exe(), "-v", "error", "-select_streams", sel,
             "-show_entries", "stream=duration:stream_tags=DURATION",
             "-of", "default=nw=1", path,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
@@ -421,8 +421,12 @@ async def _video_end(path: str) -> float:
 # of the picture and 28 healthy files were listed as "ends before it claims
 # to". The tail is measured from where the video says it ends. A video that
 # claims to be under half the container is not trusted - that is the kind of
-# header a person should look at, so the old measure stands for it.
+# header a person should look at, so the old measure stands for it -
+# UNLESS THE AUDIO ENDS IN THE SAME PLACE. EyeShield 21 S01E76: video and
+# audio both 22:16, one stray subtitle cue at 63:51 making the container
+# claim 64 minutes. Picture and sound agreeing is the file's real length.
 VIDEO_END_TRUST = 0.5
+AV_AGREE_S = 5.0
 
 
 async def test_one(file_id: int, path: str, duration: float = 0.0,
@@ -430,9 +434,14 @@ async def test_one(file_id: int, path: str, duration: float = 0.0,
     """Every window in windows(). -> {verdict, detail, secs}"""
     t0 = time.time()
     if duration:
-        vd = await _video_end(path)
-        if VIDEO_END_TRUST * duration <= vd < duration:
-            duration = vd
+        vd = await _stream_end(path, "v:0")
+        if 0 < vd < duration:
+            if vd >= VIDEO_END_TRUST * duration:
+                duration = vd
+            else:
+                ad = await _stream_end(path, "a:0")
+                if ad and abs(ad - vd) <= AV_AGREE_S:
+                    duration = vd
     wins = windows(duration)
     notes: list[str] = []
     empty: list[str] = []

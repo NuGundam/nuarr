@@ -205,7 +205,18 @@ def term_pattern(term: str) -> str:
     m = re.match(r"^/(.*)/(i)?$", t)
     if m:
         return m.group(1)
-    return "".join(_esc(c) for c in t)
+    # A WHOLE WORD, NOT A SUBSTRING. The arrs match case-insensitively, so
+    # the group "ADE" (imported from a release profile) was found inside
+    # "PhilADElphia" and every It's Always Sunny release scored -999,999 -
+    # ETHEL hides in "Bethel", KAF in "Kafka", PSA in "Psalm". A term is
+    # bounded on any side that starts or ends with a letter or digit;
+    # ".iso" still matches after any name, just not ".isolated".
+    body = "".join(_esc(c) for c in t)
+    if t[:1].isalnum():
+        body = "(?<![A-Za-z0-9])" + body
+    if t[-1:].isalnum():
+        body += "(?![A-Za-z0-9])"
+    return body
 
 
 def group_of(title: str) -> str:
