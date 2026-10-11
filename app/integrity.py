@@ -387,10 +387,52 @@ def windows(duration: float) -> list[tuple]:
     return w
 
 
+async def _video_end(path: str) -> float:
+    """How long the VIDEO stream runs, from its own header. 0 if unknown."""
+    try:
+        from .jobs import _ffprobe_exe
+        p = await asyncio.create_subprocess_exec(
+            _ffprobe_exe(), "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=duration:stream_tags=DURATION",
+            "-of", "default=nw=1", path,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+            creationflags=NO_WINDOW)
+        out, _ = await asyncio.wait_for(p.communicate(), 60)
+    except Exception:                                            # noqa: BLE001
+        return 0.0
+    for ln in out.decode("utf-8", "replace").splitlines():
+        k, _, v = ln.partition("=")
+        v = v.strip()
+        try:
+            if k == "duration" and v not in ("", "N/A"):
+                return float(v)
+            if k.upper().endswith("DURATION") and ":" in v:
+                h, m, sec = v.split(":")
+                return int(h) * 3600 + int(m) * 60 + float(sec)
+        except ValueError:
+            continue
+    return 0.0
+
+
+# THE PICTURE CAN STOP BEFORE THE FILE DOES. Netflix, Max and Paramount+
+# WEB-DLs routinely carry audio (and subtitles) 30 s to 3 min past the last
+# video frame - every Squid Game and Wednesday episode does. The container's
+# duration is the longest track, so the tail window was seeking past the end
+# of the picture and 28 healthy files were listed as "ends before it claims
+# to". The tail is measured from where the video says it ends. A video that
+# claims to be under half the container is not trusted - that is the kind of
+# header a person should look at, so the old measure stands for it.
+VIDEO_END_TRUST = 0.5
+
+
 async def test_one(file_id: int, path: str, duration: float = 0.0,
                    on_pid=None, on_stage=None) -> dict:
     """Every window in windows(). -> {verdict, detail, secs}"""
     t0 = time.time()
+    if duration:
+        vd = await _video_end(path)
+        if VIDEO_END_TRUST * duration <= vd < duration:
+            duration = vd
     wins = windows(duration)
     notes: list[str] = []
     empty: list[str] = []
