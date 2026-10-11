@@ -90,6 +90,52 @@ STATS: dict = {"last_run": 0.0, "last_result": "", "next_run": 0.0,
                "removed": 0, "swept": 0, "kept": 0, "detail": [], "running": False}
 KV_LAST = "arrqueue.last"     # last run survives a restart, so the card is not blank
 
+# A DOWNLOAD GOING NOWHERE. A torrent with no seeds sits in the arr's queue
+# as "downloading" for as long as anyone lets it; the arrs do nothing about
+# it. One that has made no progress for STALL_H hours while qBittorrent
+# calls it stalled is removed, blocklisted, and the arr searches again.
+# Progress is remembered between passes, so a slow-but-moving torrent is
+# not a stalled one.
+STALL_H = 2.0
+KV_STALL = "arrqueue.stall"   # {hash: {"p": progress, "since": epoch}}
+
+
+def _stalled(arrs, ids: set) -> dict:
+    """{download id: hours stalled} for torrents past STALL_H."""
+    if not ids:
+        return {}
+    try:
+        mem = json.loads(kv_get(KV_STALL) or "{}")
+    except Exception:                                            # noqa: BLE001
+        mem = {}
+    now = time.time()
+    seen: dict = {}
+    for c in _clients(arrs):
+        if c["impl"] != "QBittorrent":
+            continue
+        try:
+            q = _QBit(c)
+            if q.login():
+                seen.update(q.stalled(ids))
+        except Exception as e:                                   # noqa: BLE001
+            STATS["detail"].append(f"{c['name']}: could not read states: {type(e).__name__}: {e}"[:160])
+    out: dict = {}
+    for h, p in seen.items():
+        m = mem.get(h)
+        if not m or float(m.get("p") or 0) < p:
+            mem[h] = {"p": p, "since": now}
+            continue
+        hrs = (now - float(m.get("since") or now)) / 3600
+        if hrs >= STALL_H:
+            out[h] = hrs
+    # a torrent no longer stalled (or gone) starts over next time it stalls
+    mem = {h: v for h, v in mem.items() if h in seen}
+    try:
+        kv_set(KV_STALL, json.dumps(mem))
+    except Exception:                                            # noqa: BLE001
+        pass
+    return out
+
 
 # ------------------------------------------------------------ the arrs -----
 def _call(a, path: str, method: str = "GET", body=None, timeout: float = 60.0):
@@ -304,11 +350,26 @@ class _QBit:
         return t.strip() == "Ok."
 
     def finished(self, cats: set) -> list:
+        # STOPPED, NOT MERELY DOWNLOADED. This used to count "uploading" and
+        # "stalledUP" as finished, and the arr drops a torrent from its queue
+        # the moment it imports - so every torrent was deleted ten minutes
+        # after it completed and the seeding limits set in qBittorrent never
+        # got a say. qBittorrent stops a torrent itself when its ratio or
+        # seeding time is reached; that is the signal this waits for.
         rows = json.loads(self._req("/torrents/info") or "[]")
         return [t for t in rows if str(t.get("category") or "").lower() in cats
                 and t.get("progress", 0) >= 1.0
-                and t.get("state") in ("stoppedUP", "pausedUP", "queuedUP", "uploading",
-                                       "stalledUP", "forcedUP", "checkingUP")]
+                and t.get("state") in ("stoppedUP", "pausedUP")]
+
+    def stalled(self, ids: set) -> dict:
+        """{hash: progress} for the arrs' torrents that qBittorrent calls
+        stalled (no peers sending anything) or still waiting for metadata."""
+        out = {}
+        for t in json.loads(self._req("/torrents/info") or "[]"):
+            h = str(t.get("hash") or "").upper()
+            if h in ids and t.get("state") in ("stalledDL", "metaDL"):
+                out[h] = float(t.get("progress") or 0.0)
+        return out
 
     def remove(self, hashes: list):
         self._req("/torrents/delete", urllib.parse.urlencode(
@@ -393,7 +454,7 @@ def _pass() -> str:
     from .config import SETTINGS
     arrs = [a for a in SETTINGS.arrs if a.enabled and a.kind in ("sonarr", "radarr")]
     STATS["detail"] = []
-    removed = kept = malware = 0
+    removed = kept = malware = stalls = 0
     tracked: set = set()
     new: list = []
     queues: list = []
@@ -402,8 +463,13 @@ def _pass() -> str:
             queues.append((a, _queue(a)))
         except Exception as e:                                   # noqa: BLE001
             STATS["detail"].append(f"{a.name}: could not read the queue: {type(e).__name__}: {e}"[:160])
-    exe = _exe_downloads(arrs, {str(r["downloadId"]).upper() for _a, rows in queues
-                                for r in rows if r.get("downloadId")})
+    ids = {str(r["downloadId"]).upper() for _a, rows in queues for r in rows if r.get("downloadId")}
+    exe = _exe_downloads(arrs, ids)
+    stalled = _stalled(arrs, ids)
+    # A QUEUE THIS PASS COULD NOT READ leaves its downloads out of `tracked`,
+    # and the client sweep would then take them as untracked - an import in
+    # flight deleted because Sonarr was slow to answer. No sweep this pass.
+    sweep_ok = len(queues) == len(arrs)
     for a, rows in queues:
         # TWO DOWNLOADS FOR ONE EPISODE: KEEP THE BEST, DROP THE REST NOW.
         # The arr grabs a release, a better one appears, it grabs that too as
@@ -422,7 +488,9 @@ def _pass() -> str:
         for k, grp in by.items():
             if len(grp) < 2:
                 continue
-            grp.sort(key=lambda x: (-(x.get("customFormatScore") or 0), x.get("id") or 0))
+            # equal scores keep the one that is further along
+            grp.sort(key=lambda x: (-(x.get("customFormatScore") or 0),
+                                    x.get("sizeleft") or 0, x.get("id") or 0))
             best = grp[0]
             for r in grp[1:]:
                 losers[r["id"]] = (f"a better download for the same {'episode' if a.kind == 'sonarr' else 'movie'} "
@@ -440,42 +508,55 @@ def _pass() -> str:
             if did and did in gone:
                 continue
             bad = _malware(r, exe)
-            why = bad or losers.get(r["id"]) or _verdict(a, r)
+            stall = ""
+            if did in stalled and (r.get("sizeleft") or 0) > 0:
+                stall = (f"stalled: no progress for {stalled[did]:.0f} h at "
+                         f"{100 * (1 - (r.get('sizeleft') or 0) / max(1, r.get('size') or 1)):.0f}% - "
+                         "blocklisted, the arr will look for another release")
+            why = bad or stall or losers.get(r["id"]) or _verdict(a, r)
             if not why:
                 if (r.get("trackedDownloadStatus") or "") == "warning":
                     kept += 1
                 continue
             try:
                 try:
-                    _remove(a, r, blocklist=bool(bad))
+                    _remove(a, r, blocklist=bool(bad or stall))
                 except urllib.error.HTTPError as he:
                     if he.code != 404:              # 404: already gone with its pack
                         raise
                 if did:
                     gone.add(did)
                 removed += 1
+                if stall:
+                    stalls += 1
                 if bad:
                     malware += 1
                     why += (f" (from {r.get('indexer') or 'an unknown indexer'}) - "
                             "blocklisted, the arr will look for another release")
                 new.append({"at": time.time(), "arr": a.name, "title": r.get("title") or "",
                             "client": r.get("downloadClient") or "", "why": why,
-                            "kind": "malware" if bad else ""})
+                            "kind": "malware" if bad else "stalled" if stall else ""})
                 STATS["detail"].append(f"{a.name}: removed {(r.get('title') or '')[:70]} - {why}")
             except Exception as e:                               # noqa: BLE001
                 STATS["detail"].append(f"{a.name}: could not remove {(r.get('title') or '')[:60]}: "
                                        f"{type(e).__name__}: {e}"[:160])
     # The removals above also told the clients; anything the clients still
     # hold in an arr category, finished, that no arr tracks, goes now.
-    swept, lines, srows = _sweep_clients(arrs, tracked)
-    STATS["detail"] += lines
+    if sweep_ok:
+        swept, lines, srows = _sweep_clients(arrs, tracked)
+        STATS["detail"] += lines
+    else:
+        swept, srows = 0, []
+        STATS["detail"].append("client sweep skipped: an arr's queue could not be read this pass")
     _remember(new + srows)
     STATS.update(removed=STATS["removed"] + removed, swept=STATS["swept"] + swept, kept=kept)
     bits = []
     if malware:
         bits.append(f"{malware} executable(s) posing as video removed and blocklisted")
-    if removed - malware:
-        bits.append(f"{removed - malware} finished download(s) the arr would not import, removed with their files")
+    if stalls:
+        bits.append(f"{stalls} stalled download(s) removed and blocklisted, searched again")
+    if removed - malware - stalls:
+        bits.append(f"{removed - malware - stalls} finished download(s) the arr would not import, removed with their files")
     if swept:
         bits.append(f"{swept} left in the clients, removed")
     if kept:

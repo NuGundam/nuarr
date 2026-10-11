@@ -45980,8 +45980,11 @@ async function loadArrsTab(){
         +'queue with a warning forever, and its files sit in the download client. '
         +'Every '+String(Math.round((qj.poll_s||300)/60))+' minutes this removes those '
         +'through the arr, which deletes them from whichever client they came from, '
-        +'files included; then it sweeps the clients for finished items in the arrs\' '
-        +'categories that no arr tracks. The clients are read from the arrs\' own '
+        +'files included; then it sweeps the clients for items in the arrs\' '
+        +'categories that no arr tracks and that qBittorrent has itself stopped - a '
+        +'torrent still seeding is left to reach the ratio or time you set there. A '
+        +'torrent qBittorrent calls stalled that makes no progress for two hours is '
+        +'removed, blocklisted, and the arr searches again. The clients are read from the arrs\' own '
         +'settings, so a client you switch to is a client this sweeps. Anything still '
         +'downloading, or with a warning it does not recognise, is left for you. '
         +'One exception to that: a download whose file is a program (.exe, .scr, '
@@ -46021,7 +46024,7 @@ function qjRowHtml(r,i){
     <td class="c dim">${esc(r.client||'')}</td>
     <td class="l" style="cursor:pointer" title="${esc(r.title||'')}" onclick="qjOpen('${id}',event)"
       ><span class="actcaret">${open?'▾':'▸'}</span><span class="mono">${esc(r.title||'')}</span>
-      <div class="${r.kind==='malware'?'':'dim'}" style="font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-left:14px${r.kind==='malware'?';color:var(--bad,#e5534b);font-weight:600':''}">${esc(r.why||'')}</div></td>
+      <div class="${r.kind==='malware'?'':'dim'}" style="font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-left:14px${r.kind==='malware'?';color:var(--bad,#e5534b);font-weight:600':r.kind==='stalled'?';color:#e8a33d':''}">${esc(r.why||'')}</div></td>
   </tr>${open?`<tr class="det" id="qjdet-${esc(id)}"><td colspan="4" style="padding:0;border-bottom:1px solid var(--line);white-space:normal;background:rgba(255,255,255,.025)">
     <div style="font-size:11px;padding:6px 10px 8px 34px">
       <div style="display:flex;gap:8px;margin:2px 0"><span class="dim" style="flex:none;width:96px;text-align:right">release</span><span class="mono" style="overflow-wrap:anywhere">${esc(r.title||'')}</span></div>
