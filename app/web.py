@@ -1422,6 +1422,50 @@ def _file_sub_count(path: str):
     return _memo("subcount:" + path, 60.0, _work)
 
 
+@app.post("/api/plex/stop")
+def api_plex_stop(key: str, reason: str = ""):
+    """Stop one viewer's playback, through Plex's own terminate call.
+
+    THE CARD'S KEY IS NOT WHAT PLEX TERMINATES BY. Cards are keyed by
+    sessionKey; /status/sessions/terminate wants Session.id, a different
+    string. So the live session list is asked again here and the id is taken
+    from the row with this key - which also means a card that has already
+    gone stale cannot stop someone else's stream. The reason is shown to the
+    viewer on their screen. Requires Plex Pass on the server account.
+    """
+    import httpx
+    url, token = (SETTINGS.plex_url or "").rstrip("/"), SETTINGS.plex_token or ""
+    if not url or not token:
+        raise HTTPException(400, "Plex is not configured")
+    H = {"X-Plex-Token": token, "Accept": "application/json"}
+    try:
+        r = httpx.get(url + "/status/sessions", headers=H, timeout=10)
+        r.raise_for_status()
+        items = ((r.json() or {}).get("MediaContainer") or {}).get("Metadata") or []
+    except Exception as e:                                       # noqa: BLE001
+        raise HTTPException(502, f"could not read Plex sessions: {e}")
+    hit = next((m for m in items if str(m.get("sessionKey") or "") == str(key)), None)
+    if not hit:
+        raise HTTPException(404, "that playback has already ended")
+    sid = (hit.get("Session") or {}).get("id")
+    if not sid:
+        raise HTTPException(409, "Plex did not give this session an id to stop")
+    msg = (reason or "").strip() or "Playback was stopped by the server."
+    try:
+        t = httpx.get(url + "/status/sessions/terminate", headers=H, timeout=10,
+                      params={"sessionId": sid, "reason": msg[:200]})
+    except Exception as e:                                       # noqa: BLE001
+        raise HTTPException(502, f"Plex did not answer: {e}")
+    if t.status_code == 401:
+        raise HTTPException(403, "Plex refused - stopping a stream needs Plex Pass on the server account")
+    if t.status_code >= 400:
+        raise HTTPException(502, f"Plex answered {t.status_code}")
+    who = (hit.get("User") or {}).get("title") or "?"
+    what = hit.get("grandparentTitle") or hit.get("title") or "?"
+    joblog.log(f"plex: stopped {who}'s playback of {what} - {msg}", "ok")
+    return {"ok": True, "user": who, "title": what}
+
+
 @app.get("/api/plex/sessions")
 def api_plex_sessions():
     """Who is watching what, for the Job gate panel."""
@@ -15478,6 +15522,7 @@ tr.actsub.genhead .wrap>div.ell{white-space:nowrap;overflow:hidden;
    content it was fine for text, but any block child with no intrinsic width -
    the runway gauge - collapsed to its own borders, 2px wide. */
 .pxv{flex:1 1 auto;min-width:0;overflow-wrap:anywhere}
+.pxstop{margin-left:auto;font-size:10px;padding:1px 7px;color:var(--bad,#e5534b);border-color:#5c2230}
 .pxcard.px-paused{border-color:#4a3a12;background:rgba(227,179,65,.05)}
 .pxcard.px-buffering{border-color:#5c2230;background:rgba(248,81,73,.06)}
 .pxart{width:52px;height:78px;object-fit:cover;border-radius:4px;flex:0 0 52px;
@@ -31431,6 +31476,22 @@ function pxState(s){
 // advance, so the position keeps running and the next report corrects it.
 function pxPaused(s){ return pxState(s) === 'paused'; }
 function pxKey(s){ return s.key || s.label; }
+async function pxStop(ev, key, user){
+  ev.stopPropagation();
+  const why = prompt(`Stop ${user}'s playback?\n\nMessage shown to them (optional):`,
+                     'Playback was stopped by the server.');
+  if(why === null) return;
+  const b = ev.target; b.disabled = true; b.textContent = 'stopping…';
+  try{
+    const r = await fetch('/api/plex/stop?key='+encodeURIComponent(key)+'&reason='+encodeURIComponent(why),{method:'POST'});
+    const d = await r.json().catch(()=>({}));
+    if(!r.ok) throw new Error(d.detail || ('HTTP '+r.status));
+    b.textContent = 'stopped';
+  }catch(e){
+    b.disabled = false; b.textContent = '\u25a0 Stop';
+    alert('Could not stop it: '+e.message);
+  }
+}
 
 // PLEX DOES NOT REPORT POSITION IN REAL TIME.
 //
@@ -31762,6 +31823,8 @@ function pxRender(ss){
             : st==='paused'  ? '<span class="pill p-warn">paused</span>'
                              : '<span class="pill p-ok pxlive">playing</span>'}
           <b>${esc(s.user||'?')}</b>
+          ${s.key?`<button class="rmb pxstop" onclick="pxStop(event,'${esc(s.key)}','${esc((s.user||'?').replace(/'/g,''))}')"
+             title="Stop this playback. Plex shows the viewer the message you give.">&#9632; Stop</button>`:''}
         </div>
         <!-- THE DEVICE GETS ITS OWN LINE. It sat at the end of the pill row,
              so a long player name pushed the row to two lines on one card and
