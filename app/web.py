@@ -997,6 +997,8 @@ async def _startup() -> None:
     asyncio.create_task(arrguard.watch())
     from . import arrqueue as _arrqueue
     asyncio.create_task(_arrqueue.watch())
+    from . import tvdbfix as _tvdbfix
+    asyncio.create_task(_tvdbfix.watch())
     # SSD wear: the staging drive was at 90% before anyone looked. See diskwear.py.
     from . import diskwear as _diskwear
     asyncio.create_task(_diskwear.watch())
@@ -2891,7 +2893,9 @@ def api_arrguard():
                         "trash_anime": gate.get_toggle("arrs.trash_anime"),
                         "release_ban": gate.get_toggle("arrs.release_ban"),
                         "queue_janitor": gate.get_toggle("arrs.queue_janitor"),
+                        "tvdb_fix": gate.get_toggle("arrs.tvdb_fix"),
                         },
+            "tvdb_fix": _tvdbfix_snapshot(),
             "release_ban": _arrban_snapshot(),
             "queue_janitor": _arrqueue_snapshot(),
             # The names each job works on, so the page can show and edit them
@@ -2901,6 +2905,14 @@ def api_arrguard():
             "trash_autoadd": gate.get_toggle("arrs.trash_autoadd"),
             "defaults": {"split_profiles": arrguard.DEFAULT_TARGET_2160,
                          "anime_formats": arrguard.DEFAULT_ANIME_FORMATS}}
+
+
+def _tvdbfix_snapshot() -> dict:
+    try:
+        from . import tvdbfix
+        return tvdbfix.snapshot()
+    except Exception as e:                                       # noqa: BLE001
+        return {"error": f"{type(e).__name__}: {e}", "stats": {}, "recent": []}
 
 
 def _arrqueue_snapshot() -> dict:
@@ -3106,7 +3118,7 @@ async def api_arrguard_choices(job: str):
     return out
 
 
-_ARR_JOBS = ("profile_guard", "trash_anime", "release_ban", "queue_janitor")
+_ARR_JOBS = ("profile_guard", "trash_anime", "release_ban", "queue_janitor", "tvdb_fix")
 
 
 @app.post("/api/arrguard/toggle")
@@ -3134,6 +3146,9 @@ async def api_arrguard_run(job: str):
     if job == "queue_janitor":
         from . import arrqueue
         return {"result": await arrqueue.run()}
+    if job == "tvdb_fix":
+        from . import tvdbfix
+        return {"result": await tvdbfix.run()}
     raise HTTPException(400, f"job must be one of {', '.join(_ARR_JOBS)}")
 
 
@@ -46056,6 +46071,18 @@ async function loadArrsTab(){
         +'arr goes looking for a real release instead.',
         d.toggles.queue_janitor, qjst,
         {label:'', kind:'queue_janitor', names:{}, empty:'', adder:qjList(qj)})
+    + job('tvdb_fix','TVDB re-ID repair: series TheTVDB deleted and re-added',
+        'TheTVDB sometimes deletes a series and creates it again under a new id. Sonarr '
+        +'keeps the dead id - no new episodes, no metadata, a red line on its health page - '
+        +'until the series is removed and added back. Every '+String(Math.round(((d.tvdb_fix||{}).poll_s||21600)/3600))
+        +' hours this finds those and, only when exactly one TheTVDB entry has the same title '
+        +'and year, removes the series with its files kept, renames the folder to the new '
+        +'{tvdb-...} id, and adds it back with the same profile, tags and monitoring, no '
+        +'search. Sonarr re-imports the files on its rescan. No match, or more than one, is '
+        +'listed here for you and nothing is touched. Sonarr\'s own history for a repaired '
+        +'series is lost.',
+        d.toggles.tvdb_fix, ((d.tvdb_fix||{}).stats||{}),
+        {label:'', kind:'tvdb_fix', names:{}, empty:'', adder:tvList(d.tvdb_fix||{})})
     + `<div class="dim" style="font-size:11px;margin-top:10px;padding:0 4px">Where the arrs'
          imports land - the disk nuarr picks for them, and the last few placed - is on the
          <a href="#drivepool">DrivePool page</a>,
@@ -46108,6 +46135,18 @@ function qjTableHtml(){
 function qjPaint(){ keepBox('qjTable', qjTableHtml()); }
 function qjSortBy(k){ if(_qjSort.k===k) _qjSort.d=-_qjSort.d; else _qjSort={k, d:k==='at'?-1:1}; qjPaint(); }
 function qjOpen(id,ev){ if(ev) ev.stopPropagation(); if(_qjOpen.has(id)) _qjOpen.delete(id); else _qjOpen.add(id); qjPaint(); }
+function tvList(t){
+  const rows=t.recent||[];
+  if(!rows.length) return '';
+  return `<div style="margin-top:8px;border-top:1px solid var(--line);padding-top:8px">
+    <div style="font-size:11px;font-weight:600">Recent</div>
+    <div class="rowbox" style="max-height:220px;margin-top:4px"><table class="sktbl" style="width:100%;font-size:11px">
+      ${rows.map(r=>`<tr>
+        <td class="mono dim" style="white-space:nowrap;width:70px">${qjAgo(r.at||0)}</td>
+        <td><b>${esc(r.title||'')}</b> <span class="dim mono">${esc(String(r.old||''))}${r.new?' \u2192 '+esc(String(r.new)):''}</span>
+          <div style="font-size:10px;color:${r.ok?'#7fd4a3':'#e8a33d'}">${esc(r.why||'')}</div></td></tr>`).join('')}
+    </table></div></div>`;
+}
 function qjList(qj){
   banStyle();
   _qjRows=qj.recent||[];
