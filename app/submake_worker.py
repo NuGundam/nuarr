@@ -78,6 +78,45 @@ def sim(a, b):
     return difflib.SequenceMatcher(None, a, b).ratio()
 
 
+# ------------------------------------------------- already burned in ------
+# A FILE THAT ALREADY SPEAKS ENGLISH ON SCREEN gets nothing. Case Closed OVA 09
+# carried the fansubber's English burned into the picture, nuarr's picture
+# check had called it "none", and a second English track went on top of the
+# first - two sets of subtitles, one of them early. So this asks the picture
+# itself before any listening: 24 frames across the file, the bottom of each
+# read in English. Subtitles are only up while someone talks, so a fifth of
+# them carrying a sentence (OVA 09: 5 of 16) already means it is done.
+def burned_english(src, ffmpeg, duration, frames=24):
+    import numpy as np
+    from paddleocr import PaddleOCR
+    kw = dict(use_doc_orientation_classify=False, use_doc_unwarping=False,
+              use_textline_orientation=False, lang="en", device="gpu")
+    try:
+        ocr = PaddleOCR(enable_mkldnn=False, **kw)
+    except TypeError:
+        ocr = PaddleOCR(**kw)
+    W, H = 1280, 720
+    hits = seen = 0
+    for k in range(frames):
+        t = duration * (0.08 + 0.84 * k / max(1, frames - 1))
+        raw = subprocess.run([ffmpeg, "-v", "error", "-ss", f"{t:.2f}", "-i", src, "-frames:v", "1",
+                              "-vf", f"scale={W}:{H}", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+                             capture_output=True).stdout
+        if len(raw) < W * H * 3:
+            continue
+        seen += 1
+        pic = np.frombuffer(raw[:W * H * 3], np.uint8).reshape(H, W, 3)[int(H * 0.62):, :, ::-1].copy()
+        words = 0
+        for r in ocr.predict(pic):
+            for txt, sc in zip(r.get("rec_texts") or [], r.get("rec_scores") or []):
+                if sc >= 0.85:
+                    words += len(re.findall(r"[A-Za-z]{2,}", txt))
+        hits += words >= 3
+    del ocr
+    gc.collect()
+    return hits, seen
+
+
 # ------------------------------------------------------------ speech ------
 def speech(src, wlang, model_dir, ffmpeg):
     import numpy as np
@@ -280,6 +319,7 @@ def main():
     ap.add_argument("--data", required=True)
     ap.add_argument("--ffmpeg", required=True)
     ap.add_argument("--no-ocr", action="store_true")
+    ap.add_argument("--force", action="store_true", help="make them even if English is burned in")
     a = ap.parse_args()
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from app import audiolang
@@ -287,6 +327,13 @@ def main():
     wlang, plang, script = LANGS.get(a.lang, (a.lang[:2], "", ""))
     t0 = time.time()
     try:
+        if not a.force and a.duration > 60:
+            say(stage="checking for subtitles already in the picture", pct=1)
+            hits, seen = burned_english(a.src, a.ffmpeg, a.duration)
+            if seen and hits >= max(4, seen * 0.2):
+                say(error=f"English is already burned into the picture ({hits} of {seen} sampled "
+                          f"frames carry it) - nothing made. Use 'make anyway' to override.")
+                return
         talk = speech(a.src, wlang, os.path.join(a.data, "whisper"), a.ffmpeg)
         shown, words = [], []
         if plang and not a.no_ocr:

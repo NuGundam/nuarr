@@ -172,7 +172,7 @@ async def _one(file_id: int, overwrite: bool) -> None:
     film = r["title"] or os.path.splitext(os.path.basename(r["path"]))[0]
     cmd = [sys.executable, "-m", "app.submake_worker", "--src", r["path"], "--out", tmp,
            "--lang", lang, "--title", film, "--duration", str(float(r["duration"] or 0)),
-           "--data", str(DATA_DIR), "--ffmpeg", _ffmpeg_exe()]
+           "--data", str(DATA_DIR), "--ffmpeg", _ffmpeg_exe()] + (["--force"] if overwrite else [])
     p = await asyncio.create_subprocess_exec(*cmd, cwd=root, stdout=asyncio.subprocess.PIPE,
                                              stderr=asyncio.subprocess.DEVNULL,
                                              creationflags=NO_WINDOW)
