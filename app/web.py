@@ -40402,7 +40402,8 @@ function smPaint(){
   const recs=rec.length?`<div style="margin-top:4px">${rec.map(r=>`<div style="font-size:10.5px">
       <span class="dim mono">${ago(r.at)}</span> <b>${esc(r.label||'')}</b>
       <span style="color:${r.ok?'#7fd4a3':'#e0575b'}">${r.ok?`${fmt(r.narration||0)} spoken + ${fmt(r.onscreen||0)} on-screen lines`:'failed'}</span>
-      <span class="dim">— ${esc(r.why||'')}</span></div>`).join('')}</div>`:'';
+      <span class="dim">— ${esc(r.why||'')}</span>${!r.ok&&/burned into the picture/.test(r.why||'')
+        ?` <button class="rmb" style="font-size:10px" onclick="smMake(${r.file_id},this,1)" title="Make them even though English is already in the picture - the file gets a second English track.">Make anyway</button>`:''}</div>`).join('')}</div>`:'';
   el.innerHTML=`<div style="font-size:11.5px;margin:6px 0;padding:6px 9px;border:1px solid var(--line);border-radius:6px;background:rgba(121,192,255,.05)">
     <b>Subtitle maker</b> <span class="dim" style="font-size:10.5px" title="Whisper large-v3 for what is said (timed by the voice detector, so lines start when the voice does), PaddleOCR for what is written on screen, Qwen2.5-7B to translate it. The first run downloads about 11 GB of models.">listens, reads the picture, translates</span>
     <div style="display:flex;gap:6px;align-items:center;margin-top:4px">
@@ -40425,10 +40426,10 @@ async function smFind(){
     :'<div class="dim" style="font-size:10.5px">nothing matches</div>';
   smPaint();
 }
-async function smMake(fid, btn){
+async function smMake(fid, btn, force){
   btn.disabled=true; const was=btn.textContent; btn.textContent='queuing…';
   try{
-    const d=await (await fetch('/api/submake?file_id='+fid,{method:'POST'})).json();
+    const d=await (await fetch('/api/submake?file_id='+fid+(force?'&overwrite=1':''),{method:'POST'})).json();
     btn.textContent=d.added?'queued':(d.skipped&&d.skipped[0]?'skipped':'—');
     if(!d.added && d.skipped && d.skipped[0]) btn.title=d.skipped[0];
   }catch(e){ btn.textContent=was; btn.disabled=false; }
