@@ -999,6 +999,8 @@ async def _startup() -> None:
     asyncio.create_task(_arrqueue.watch())
     from . import tvdbfix as _tvdbfix
     asyncio.create_task(_tvdbfix.watch())
+    from . import submake as _submake
+    asyncio.create_task(_submake.watch())
     # SSD wear: the staging drive was at 90% before anyone looked. See diskwear.py.
     from . import diskwear as _diskwear
     asyncio.create_task(_diskwear.watch())
@@ -10584,6 +10586,26 @@ async def api_subneed(limit: int = 200, library: str = ""):
     except Exception:                                    # noqa: BLE001
         d["budget"] = {}
     return d
+
+
+@app.get("/api/submake")
+def api_submake():
+    from . import submake
+    return submake.snapshot()
+
+
+@app.post("/api/submake")
+async def api_submake_add(file_id: str, overwrite: int = 0):
+    """Queue English subtitles for these files (comma-separated ids)."""
+    from . import submake
+    ids = [int(x) for x in str(file_id).split(",") if x.strip().isdigit()]
+    return submake.enqueue(ids, overwrite=bool(overwrite))
+
+
+@app.post("/api/submake/cancel")
+def api_submake_cancel(file_id: int):
+    from . import submake
+    return {"removed": submake.cancel(file_id)}
 
 
 @app.get("/api/subneed/unknown")
@@ -40100,7 +40122,7 @@ function snPaint(force){
   const head=`<div class="subshd"><b style="color:#e8a33d">Raws - nothing here you can read</b>
     <span class="subskind ${auto?'k-auto':'k-ask'}"
       title="${auto?'Files carrying none of a required language are replaced by the shared remedy without asking, capped per hour across every check.':'Nothing is replaced until you press a button.'}">${auto?'runs by itself':'waiting on you'}</span>
-    <span class="dim subssub" title="A RAW is a film nobody here can follow: spoken in a language this library was not asked to keep, and carrying no dialogue you can read - not a tagged track, not a file beside it, not words burned into the picture, and not an untagged track that might be the one. Signs and songs are not dialogue; they translate a shop front and leave the conversation alone. Nothing nuarr can do to a raw produces a subtitle - the planner cannot translate, the OCR has no picture to read, the listener hears Japanese - so the only fix is a different release. A film spoken in the language is never a raw however its tracks are labelled.">raws - films and episodes nobody here can follow</span>
+    <span class="dim subssub" title="A RAW is a film nobody here can follow: spoken in a language this library was not asked to keep, and carrying no dialogue you can read - not a tagged track, not a file beside it, not words burned into the picture, and not an untagged track that might be the one. Signs and songs are not dialogue; they translate a shop front and leave the conversation alone. Nothing nuarr can do to a raw produces a subtitle - the planner cannot translate, the OCR has no picture to read, the listener hears Japanese - so the fixes are a different release, or the Subtitle maker above, which listens to the audio, reads the picture and writes English subtitles. A film spoken in the language is never a raw however its tracks are labelled.">raws - films and episodes nobody here can follow</span>
     <span class="subsn">${miss?`${num(miss,'you')} <span class="dim">to answer</span>`
                               :'<b style="color:var(--ok)">nothing to answer</b>'}</span>
     </div>
@@ -40225,7 +40247,9 @@ function snPaint(force){
           title="what pressing the button deletes">${esc(String(gb(r.size)))}<span class="dim"> GB</span></td>
         <td class="l mono" style="font-size:10.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:${r.pool_disk?diskColor(r.pool_disk):'var(--dim)'}"
           title="the pool disk this file is on">${esc(r.pool_disk||'—')}</td>
-        <td class="r askhost"><button class="rmb" onclick="snAct(${r.file_id},this)"
+        <td class="r askhost"><button class="rmb" onclick="smMake(${r.file_id},this)"
+          title="Listen to the audio and read the picture, and write English subtitles for it: Whisper for what is said, OCR and a language model for what is written on screen. Nothing is deleted. Where the result lives - beside the file or inside it - follows this library's sidecar rule.">Make subtitles</button>
+          <button class="rmb" onclick="snAct(${r.file_id},this)"
           title="Blocklist this release so the arr never grabs it again, delete the file (${esc(String(gb(r.size)))} GB), and search for a replacement. Not reversible.">Blocklist &amp; re-download</button></td>
       </tr>${open?`<tr style="background:rgba(255,255,255,.025)"><td colspan="10" style="padding:6px 10px;border-bottom:1px solid var(--line);font-size:11px">
         <div><span class="dim">what it has:</span> ${esc(r.why||'')}</div>
@@ -40304,7 +40328,7 @@ function snPaint(force){
       _snDone?'hide':'also show'} the ${fmt(nDone)} answered</a>`:''}
   </div>${doneList}`;
 
-  const html=`<div class="subsp" id="subsPanelNeed">${head}${snScoreTable()}${snWantBox()}${prog}${table}${foot}</div>`;
+  const html=`<div class="subsp" id="subsPanelNeed">${head}<div id="smStrip"></div>${snScoreTable()}${snWantBox()}${prog}${table}${foot}</div>`;
 
   // WHAT COUNTS AS CHANGED IS THE ROWS, not the markup.
   //
@@ -40328,10 +40352,11 @@ function snPaint(force){
   if(!force && askOpen('snPanel')) { snSchedule(); return; }
   if(!force && !rowsChanged && (panelBusy('snPanel') || panelScrolled('snPanel'))) {
     snSchedule(); return; }
-  if(html===_snKey){ snSchedule(); return; }
+  if(html===_snKey){ smPaint(); snSchedule(); return; }
 
   const box=el.querySelector('.rowbox'), keep=box?box.scrollTop:0;
   _snKey=html; _snRowSig=sig; el.innerHTML=html;
+  smPaint(); smLoad();
   const nb=el.querySelector('.rowbox'); if(nb&&keep) nb.scrollTop=keep;
   // SAY SO WHEN IT MOVES. A row vanishing while you are looking at the panel
   // is news, and the same pulse every other panel here uses is how this page
@@ -40350,6 +40375,64 @@ async function snRun(btn){
   // auto the same request also hands the findings to the remedy, so the
   // count moving afterwards is the point rather than a coincidence.
   setTimeout(()=>loadSubNeed(true), 250);
+}
+// ---- the subtitle maker (submake.py) -----------------------------------
+// ITS OWN STRIP, FILLED SEPARATELY. The Raws panel only repaints when its
+// rows change; a progress figure that moves every few seconds would defeat
+// that, so the strip is a fixed slot in the panel and this fills it.
+let _sm=null, _smPoll=null;
+async function smLoad(){
+  try{ _sm=await (await fetch('/api/submake')).json(); }catch(e){ return; }
+  smPaint();
+  if(_smPoll) clearTimeout(_smPoll);
+  const busy=_sm.state&&_sm.state.running || (_sm.queue||[]).length;
+  if(busy && document.getElementById('smStrip')) _smPoll=setTimeout(smLoad, 3000);
+}
+function smPaint(){
+  const el=document.getElementById('smStrip'); if(!el||!_sm) return;
+  const st=_sm.state||{}, q=_sm.queue||[], rec=(_sm.recent||[]).slice(0,4);
+  const bar=st.running?`<div style="display:flex;gap:10px;align-items:center">
+      <b style="color:#79c0ff">making subtitles</b><span>${esc(st.label||'')}</span>
+      <span class="dim">${esc(st.stage||'')}${st.note?' · '+esc(st.note):''}</span>
+      <span class="mono" style="margin-left:auto">${Math.round(st.pct||0)}%</span></div>
+      <div style="height:4px;background:var(--line);border-radius:2px;margin-top:3px">
+        <div style="height:4px;width:${Math.min(100,st.pct||0)}%;background:#79c0ff;border-radius:2px"></div></div>`
+    : (st.waiting_for?`<div class="dim">waiting for the heavy lane - ${esc(st.waiting_for)} is using it</div>`:'');
+  const qline=q.length?`<div class="dim" style="margin-top:3px">queued: ${q.map(x=>esc(x.label)).join(' · ')}</div>`:'';
+  const recs=rec.length?`<div style="margin-top:4px">${rec.map(r=>`<div style="font-size:10.5px">
+      <span class="dim mono">${ago(r.at)}</span> <b>${esc(r.label||'')}</b>
+      <span style="color:${r.ok?'#7fd4a3':'#e0575b'}">${r.ok?`${fmt(r.narration||0)} spoken + ${fmt(r.onscreen||0)} on-screen lines`:'failed'}</span>
+      <span class="dim">— ${esc(r.why||'')}</span></div>`).join('')}</div>`:'';
+  el.innerHTML=`<div style="font-size:11.5px;margin:6px 0;padding:6px 9px;border:1px solid var(--line);border-radius:6px;background:rgba(121,192,255,.05)">
+    <b>Subtitle maker</b> <span class="dim" style="font-size:10.5px" title="Whisper large-v3 for what is said (timed by the voice detector, so lines start when the voice does), PaddleOCR for what is written on screen, Qwen2.5-7B to translate it. The first run downloads about 11 GB of models.">listens, reads the picture, translates</span>
+    <div style="display:flex;gap:6px;align-items:center;margin-top:4px">
+      <input id="smQ" placeholder="make subtitles for… (title or file name)" style="flex:1;font-size:11px"
+        onkeydown="if(event.key==='Enter') smFind()" value="${esc(_smQ)}">
+      <button class="rmb" onclick="smFind()">Find</button></div>
+    <div id="smHits">${_smHits}</div>
+    ${bar}${qline}${recs}</div>`;
+}
+let _smQ='', _smHits='';
+async function smFind(){
+  const i=document.getElementById('smQ'); _smQ=(i&&i.value||'').trim();
+  if(!_smQ){ _smHits=''; smPaint(); return; }
+  let d; try{ d=await (await fetch('/api/files?q='+encodeURIComponent(_smQ)+'&limit=12')).json(); }catch(e){ return; }
+  const rows=(d.rows||[]);
+  _smHits=rows.length?`<table style="width:100%;font-size:10.5px;margin-top:3px">${rows.map(r=>`<tr>
+      <td>${esc(r.label||r.title||'')}</td>
+      <td class="dim">${esc(r.library||'')}</td><td class="dim mono">${esc(r.audio_langs||'')}</td>
+      <td class="r"><button class="rmb" onclick="smMake(${r.id},this)">Make subtitles</button></td></tr>`).join('')}</table>`
+    :'<div class="dim" style="font-size:10.5px">nothing matches</div>';
+  smPaint();
+}
+async function smMake(fid, btn){
+  btn.disabled=true; const was=btn.textContent; btn.textContent='queuing…';
+  try{
+    const d=await (await fetch('/api/submake?file_id='+fid,{method:'POST'})).json();
+    btn.textContent=d.added?'queued':(d.skipped&&d.skipped[0]?'skipped':'—');
+    if(!d.added && d.skipped && d.skipped[0]) btn.title=d.skipped[0];
+  }catch(e){ btn.textContent=was; btn.disabled=false; }
+  smLoad();
 }
 async function snAct(fid, btn){
   const r=snRows().find(x=>x.file_id===fid)||{};
