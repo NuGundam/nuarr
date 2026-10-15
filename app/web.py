@@ -5235,6 +5235,12 @@ def api_qwenjudge_use(on: int = 0):
     return {"on": bool(on)}
 
 
+@app.post("/api/qwenjudge/stop")
+def api_qwenjudge_stop():
+    from . import qwenjudge
+    return {"stopped": qwenjudge.stop()}
+
+
 @app.post("/api/qwenjudge/run")
 async def api_qwenjudge_run():
     from . import qwenjudge
@@ -24396,6 +24402,7 @@ function poolColor(pool){
        : pool==='audio'       ? '#39d3c3'         // teal - was violet, too close to subocr
        : pool==='decode'      ? '#e8a33d'         // amber - a CPU check, not a copy
        : pool==='submake'     ? '#79c0ff'         // light blue - the Subtitle maker, its panel's colour
+       : pool==='qwen'        ? '#f0b37e'         // apricot - the Qwen judge
        : 'var(--ok)';
 }
 function diskColor(name){
@@ -25997,7 +26004,9 @@ function paintRunning(j){
           <span class="pill" style="color:${poolCol};border-color:${poolCol}"
             >${esc(w.pool)}</span>
           <b class="wrap">${esc(w.title||w.file)}</b>
-          <span class="right2">${w.pool==='submake'
+          <span class="right2">${w.pool==='qwen'
+            ? `<button onclick="qjStop(this)" title="Stop judging. What was judged is kept; the rest waits for the next run.">Cancel</button>`
+            : w.pool==='submake'
             ? `<button onclick="smStop(this)" title="Stop making subtitles for this file. Nothing is written; it can be queued again.">Cancel</button>`
             : `<button class="${watchId===w.job_id?'on':''}"
                     onclick="watchLive('${esc(w.job_id)}')">${
@@ -27605,6 +27614,11 @@ function watchScrollTop(id){
     const b=document.getElementById(id+'Resume');
     if(b) b.style.display = atTop ? 'none' : '';
   });
+}
+async function qjStop(btn){
+  if(btn){ btn.disabled=true; btn.textContent='stopping…'; }
+  try{ await fetch('/api/qwenjudge/stop',{method:'POST'}); }catch(e){}
+  loadJobs();
 }
 async function smStop(btn){
   if(btn){ btn.disabled=true; btn.textContent='stopping…'; }
@@ -43824,6 +43838,9 @@ const SUBS_READER_FEEDS={
      'Its picture rows - the ones with a Mark it button - are this reader\'s verdicts, scored.'],
     ['language', 'Raws - nothing here you can read',
      'A file with the dialogue burned into the picture is not a raw; one this reader has not looked at, or found marks it could not read, is not accused either.']],
+  qwen:[
+    ['picture',  'Subtitle User Input',
+     'Every picture row\'s reason carries this verdict, and once switched on under how it scores it moves the sure % where the rules were in doubt.']],
   events:[
     ['picture',  'Subtitle User Input',
      'Its track rows - the title-contradicts-cue-rate ones - are this reader\'s counts of plain dialogue lines, and the cross-episode match.']],

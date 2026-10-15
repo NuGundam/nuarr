@@ -693,6 +693,21 @@ def _readers(out_left: int, running: bool) -> list:
     except Exception:                                            # noqa: BLE001
         pass
     try:
+        from . import qwenjudge as _qj
+        rows.append({
+            "key": "qwen", "name": "what the words in the picture mean",
+            "tool": "Qwen2.5-7B, the lines in order",
+            "what": "Reads the lines the picture reader kept from each frame - in order, with "
+                    "their times - with a language model, and says how likely they are to be "
+                    "burned-in dialogue rather than a logo, a title card or OCR noise. Runs in "
+                    "its own process every ten minutes when there is something new, on the "
+                    "same GPU lane as the Subtitle maker.",
+            "left": int(_qj.waiting()),
+            "running": bool(_qj.STATE.get("running")),
+            "goto": "/settings#qwen"})
+    except Exception:                                            # noqa: BLE001
+        pass
+    try:
         from . import subtitletitle as _stt
         d = (_stt._CACHE.get("data") or {})
         rows.append({

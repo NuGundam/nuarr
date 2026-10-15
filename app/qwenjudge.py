@@ -44,7 +44,8 @@ SYS = ("You judge OCR output from a video. A program took a few frames spread th
 # ONE NUMBER, NOT A VERDICT AND A CONFIDENCE. "VERDICT: NOT DIALOGUE; SURE: 0"
 # came back meaning "0% dialogue", which read as a sure "not" became 100%.
 STATE: dict = {"running": False, "last_run": 0.0, "next_run": 0.0, "last_result": "",
-               "judged": 0, "error": ""}
+               "judged": 0, "error": "", "done": 0, "total": 0, "file": "", "started": 0.0}
+_PROC = None
 
 
 # ----------------------------------------------------------------- server --
@@ -67,22 +68,34 @@ async def run() -> str:
     got, holder = heavy.claim(LANE, ttl=1800)
     if not got:
         return f"waiting - {holder} has the GPU lane"
-    STATE.update(running=True, error="")
+    global _PROC
+    STATE.update(running=True, error="", done=0, total=min(len(todo), BATCH), file="",
+                 started=time.time())
     try:
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         p = await asyncio.create_subprocess_exec(
             sys.executable, "-m", "app.qwenjudge", "--batch", str(BATCH), cwd=root,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
             creationflags=NO_WINDOW)
-        out, _ = await p.communicate()
+        _PROC = p
         n, err = 0, ""
-        for ln in out.decode("utf-8", "replace").splitlines():
+        # AS IT GOES, so the Processing System card and the reader row move
+        # while it works instead of jumping when the batch ends.
+        while True:
+            ln = await p.stdout.readline()
+            if not ln:
+                break
             try:
-                d = json.loads(ln)
+                d = json.loads(ln.decode("utf-8", "replace"))
             except Exception:                                    # noqa: BLE001
                 continue
+            if "progress" in d:
+                STATE.update(done=int(d["progress"]), total=int(d.get("total") or STATE["total"]),
+                             file=str(d.get("file") or ""))
             n = int(d.get("judged", n))
             err = d.get("error", err)
+        await p.wait()
+        _PROC = None
         res = f"judged {n} file(s)" + (f" - {err}" if err else "")
         STATE.update(judged=STATE["judged"] + n, error=err)
         if n:
@@ -146,6 +159,54 @@ def agreement() -> dict:
     return out
 
 
+def stop() -> bool:
+    p = _PROC
+    if p is None or p.returncode is not None:
+        return False
+    try:
+        import subprocess
+        from .config import NO_WINDOW
+        subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True,
+                       creationflags=NO_WINDOW)
+    except Exception:                                            # noqa: BLE001
+        return False
+    return True
+
+
+def as_running() -> list:
+    """The judge as a worker card for the job feed, while it runs."""
+    if not STATE.get("running"):
+        return []
+    el = time.time() - float(STATE.get("started") or time.time())
+    tot, done = int(STATE.get("total") or 0), int(STATE.get("done") or 0)
+    pct = (done / tot) if tot else 0.0
+    return [{
+        "job_id": "qwenjudge", "pool": "qwen", "kind": "qwen",
+        "title": f"Qwen judge - {done} of {tot} pictures", "file": STATE.get("file") or "",
+        "path": "", "stage": "reading the lines" if done else "loading Qwen",
+        "progress": pct, "elapsed_s": round(el),
+        "eta_s": round(el / pct - el) if 0.05 < pct < 1 else None, "eta_est": True,
+        "plan": "read each picture's lines in order and say how likely they are to be dialogue",
+        "why_pool": ("The Qwen judge: for the burned-in subtitle check. It reads the lines the "
+                     "picture check kept, with a language model, and stores the chance they are "
+                     "dialogue - which the sure % shows, and counts once switched on."),
+        "doing": {"tool": "Qwen2.5-7B (CTranslate2)", "hw": "GPU", "why": "judging"},
+        "actions": [{"kind": "subtitle", "what": "judge burned-in words",
+                     "why": "the rules could not always tell dialogue from logos and title cards",
+                     "detail": ""}],
+        "venc": None, "fps": 0.0, "speed": 0.0, "paused_for_viewer": False,
+        "paused_for_load": False, "pace_factor": 0.0, "pace_why": "", "cancelled": False,
+        "by_bytes": False, "disk": "", "dest_disk": "",
+    }]
+
+
+def waiting() -> int:
+    try:
+        return len(pending(100000))
+    except Exception:                                            # noqa: BLE001
+        return 0
+
+
 def snapshot() -> dict:
     from . import hardsub
     return {"state": dict(STATE), "on": hardsub.qwen_on(), "weight": hardsub.QWEN_WEIGHT,
@@ -175,8 +236,11 @@ def _judge(limit: int) -> None:
             f"SELECT file_id, path, size, samples, lines FROM hardsub WHERE file_id IN "
             f"({','.join('?' * len(ids))})", ids)] if ids else []
     done = 0
+    print(json.dumps({"progress": 0, "total": len(rows)}), flush=True)
     for i in range(0, len(rows), 8):
         part = rows[i:i + 8]
+        print(json.dumps({"progress": i, "total": len(rows),
+                          "file": os.path.basename(part[0]["path"] or "")}), flush=True)
         prompts = []
         for r in part:
             try:

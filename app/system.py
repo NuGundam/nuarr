@@ -896,6 +896,24 @@ def _gpu_work() -> list[dict]:
     state only, no subprocess, because snapshot() serves every dashboard poll.
     """
     work: list[dict] = []
+    # THE TWO THAT LIVE IN CHILD PROCESSES: the Subtitle maker (Whisper,
+    # PaddleOCR, Qwen) and the Qwen judge. Neither is a job in the pump.
+    try:
+        from . import submake
+        if submake.STATE.get("running"):
+            work.append({"kind": "submake", "label": "Subtitle maker — Whisper · PaddleOCR · Qwen",
+                         "n": 1, "device": "gpu",
+                         "detail": str(submake.STATE.get("stage") or "")[:60]})
+    except Exception:                                    # noqa: BLE001
+        pass
+    try:
+        from . import qwenjudge
+        if qwenjudge.STATE.get("running"):
+            work.append({"kind": "qwen", "label": "picture lines — Qwen judge",
+                         "n": 1, "device": "gpu",
+                         "detail": f"{qwenjudge.STATE.get('done', 0)} of {qwenjudge.STATE.get('total', 0)}"})
+    except Exception:                                    # noqa: BLE001
+        pass
     # WHICH CHIP, DECIDED BY HOW IT WAS SET UP - not by which panel is asking.
     # PaddleOCR is a GPU engine only when its CUDA build is the one installed;
     # Tesseract is always CPU; Whisper is whatever faster-whisper was installed

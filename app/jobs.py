@@ -7680,11 +7680,18 @@ def _why_idle(workers, depth: int) -> dict:
 
 def _submake_running() -> list:
     """The Subtitle maker runs outside this queue; it is shown beside it."""
+    out = []
     try:
         from . import submake
-        return submake.as_running()
+        out += submake.as_running()
     except Exception:                                            # noqa: BLE001
-        return []
+        pass
+    try:
+        from . import qwenjudge
+        out += qwenjudge.as_running()
+    except Exception:                                            # noqa: BLE001
+        pass
+    return out
 
 
 def live_snapshot() -> dict:
