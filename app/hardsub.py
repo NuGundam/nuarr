@@ -138,6 +138,7 @@ MIN_CHARS = 6
 #   5  reading more words made the credit-roll veto too strict: any single
 #      credit word voided the read, and "assistant" is one. It is a
 #      fraction now, like the junk test beside it.
+#   9  the lines are kept, in order, for the Qwen judge (see `lines`).
 #   8  a caption is recognised by its SHAPE as well as its words, and the
 #      search may read every lit frame. OVA 09 said "none" over 20 of 24
 #      frames of English: "Conan-kun!", "Exactly!", "Hey, lunchtime." carry
@@ -156,7 +157,7 @@ MIN_CHARS = 6
 #      "undecided", which is the whole reason it cannot decide: median words
 #      stored ZERO, against eleven frames of twenty-four carrying marks. A
 #      revision that does not move is a library that never hears the news.
-READER_REV = 8
+READER_REV = 9
 
 # BELOW THIS A BAND IS BLANK, whatever the font. MIN_PX is a guess about how
 # many pixels a CAPTION makes; this is the far weaker claim that something is
@@ -328,6 +329,29 @@ def init() -> None:
             cur.execute("ALTER TABLE hardsub ADD COLUMN rev INTEGER")
         except Exception:                                        # noqa: BLE001
             pass
+        # THE LINES, NOT ONLY THE WORDS. `words` is a sorted set, and in that
+        # form a channel logo repeated in every frame ("CN CARTOON NETWORK")
+        # looks like a vocabulary. Kept in order with their times they read
+        # as what they are - which is what the Qwen judge needs. JSON list of
+        # {"t": seconds, "text": what the OCR returned for that frame}.
+        try:
+            cur.execute("ALTER TABLE hardsub ADD COLUMN lines TEXT")
+        except Exception:                                        # noqa: BLE001
+            pass
+        # WHAT QWEN MADE OF THOSE LINES. Its own table so a re-read of the
+        # picture (which rewrites the hardsub row) does not lose the verdict,
+        # and `size` says which bytes it was about. dialogue_p is 0-100, the
+        # chance this is burned-in dialogue.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS hardsub_qwen(
+                file_id    INTEGER PRIMARY KEY,
+                path       TEXT,
+                size       INTEGER,
+                verdict    TEXT,
+                dialogue_p INTEGER,
+                why        TEXT,
+                at         REAL
+            )""")
         try:
             cur.execute("ALTER TABLE hardsub ADD COLUMN chosen TEXT")
         except Exception:                                        # noqa: BLE001
@@ -840,10 +864,13 @@ def probe_one(file_id: int, samples: int = SAMPLES,
     _shown = cand[:max(0, reach)]
     _eng = _engine_name(ocr_engine())
     cap_frames = 0                       # frames holding a subtitle-shaped line
+    lines: list = []                     # what each read frame said, for the Qwen judge
     for _i, (t, _c) in enumerate(_shown, 1):
         _say(f"reading frame {_i} of {len(_shown)} \u00b7 {_eng}",
              55.0 + 33.0 * (_i - 1) / max(1, len(_shown)))
         _txt = _read_text(path, t, LOW_BAND)
+        if re.search(r"[A-Za-z]{2,}", _txt or ""):
+            lines.append({"t": round(t), "text": " ".join(_txt.split())[:200]})
         got = [w.lower() for w in _words(_txt) if len(w) >= 3]
         if got and _caption_line(_txt):
             cap_frames += 1
@@ -926,8 +953,10 @@ def probe_one(file_id: int, samples: int = SAMPLES,
             if not below:
                 break
             t, c = below[len(below) // 2]
-            got = [w.lower() for w in _words(_read_text(path, t, LOW_BAND))
-                   if len(w) >= 3]
+            _txt = _read_text(path, t, LOW_BAND)
+            if re.search(r"[A-Za-z]{2,}", _txt or ""):
+                lines.append({"t": round(t), "text": " ".join(_txt.split())[:200]})
+            got = [w.lower() for w in _words(_txt) if len(w) >= 3]
             if len(got) < 2 or not (_FUNCTION & set(got)):
                 break                      # noise down here - the band ends
             text_frames += 1
@@ -1040,7 +1069,9 @@ def probe_one(file_id: int, samples: int = SAMPLES,
                   f"bright pixels from frames the OCR read speech out of, "
                   f"rather than the default {MIN_PX} - a thinner font than "
                   f"the one that number was measured on")
+    lines.sort(key=lambda x: x["t"])
     return {"ok": True, "file_id": int(file_id), "path": path, "state": state,
+            "lines": lines,
             "low_hits": len(low_hit), "high_hits": len(high_hit),
             "calibrated": round(calibrated, 1),
             "samples": read, "ratio": round(ratio, 3),
@@ -1090,17 +1121,17 @@ def _save(d: dict) -> None:
                 d = dict(d, state=row["chosen"])
             cur.execute(
                 "INSERT INTO hardsub(file_id,path,size,at,state,low_hits,"
-                "high_hits,samples,words,detail,rev) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?) "
+                "high_hits,samples,words,detail,rev,lines) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(file_id) DO UPDATE SET path=excluded.path, "
                 "  size=excluded.size, at=excluded.at, state=excluded.state, "
                 "  low_hits=excluded.low_hits, high_hits=excluded.high_hits, "
                 "  samples=excluded.samples, words=excluded.words, "
-                "  detail=excluded.detail, rev=excluded.rev",
+                "  detail=excluded.detail, rev=excluded.rev, lines=excluded.lines",
                 (int(d["file_id"]), d["path"], _size(d["path"]), time.time(),
                  d["state"], d["low_hits"], d["high_hits"], d["samples"],
                  ", ".join(d.get("words") or []), d["detail"][:400],
-                 READER_REV))
+                 READER_REV, json.dumps(d.get("lines") or [])))
     except Exception:                                            # noqa: BLE001
         return
     # AND THE FACTS ROW IS WHERE EVERYONE ELSE LOOKS FOR IT.
@@ -1416,7 +1447,93 @@ def good_words() -> set:
     return got
 
 
+# ---------------------------------------------------------- the Qwen judge --
+# qwenjudge.py reads each file's lines with a language model and stores how
+# likely they are to be burned-in dialogue. The score below shows that
+# verdict always; it MOVES the score only once the switch is on, and the
+# switch stays off until its agreement with the answers on record has been
+# seen (the scoring panel shows it).
+KV_QWEN_USE = "hardsub.qwen_use"
+QWEN_WEIGHT = 0.7
+_QW: dict = {"at": 0.0, "by_id": {}, "by_path": {}}
+
+
+def qwen_on() -> bool:
+    try:
+        from .db import kv_get
+        return str(kv_get(KV_QWEN_USE) or "0") == "1"
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def set_qwen(on: bool) -> None:
+    from .db import kv_set
+    kv_set(KV_QWEN_USE, "1" if on else "0")
+    _QW["at"] = 0.0
+
+
+def qwen_of(row) -> dict | None:
+    """Qwen's verdict on this row's file, or None - looked up by id or path,
+    because the rows reaching score_of come in several shapes."""
+    if time.time() - _QW["at"] > 60:
+        by_id, by_path = {}, {}
+        try:
+            with cursor() as cur:
+                for r in cur.execute("SELECT file_id, path, verdict, dialogue_p, why FROM hardsub_qwen"):
+                    v = {"verdict": r["verdict"], "p": int(r["dialogue_p"] or 0), "why": r["why"] or ""}
+                    by_id[int(r["file_id"])] = v
+                    if r["path"]:
+                        by_path[r["path"].lower()] = v
+        except Exception:                                        # noqa: BLE001
+            pass
+        _QW.update(at=time.time(), by_id=by_id, by_path=by_path)
+    try:
+        keys = row.keys() if hasattr(row, "keys") else []
+        if "file_id" in keys and row["file_id"] is not None:
+            v = _QW["by_id"].get(int(row["file_id"]))
+            if v:
+                return v
+        if "path" in keys and row["path"]:
+            return _QW["by_path"].get(str(row["path"]).lower())
+    except Exception:                                            # noqa: BLE001
+        pass
+    return None
+
+
 def score_of(row) -> dict:
+    d = _score_rules(row)
+    q = qwen_of(row)
+    if not q:
+        return d
+    said = (f"Qwen read the lines in order and puts dialogue at {q['p']}%"
+            + (f" - {q['why']}" if q["why"] else ""))
+    if qwen_on():
+        # IT RESOLVES DOUBT; IT DOES NOT OVERTURN CERTAINTY. Between the two
+        # lines the rules could not decide, and Qwen carries most of the
+        # score. Past either line the rules' answer stands - Case Closed OVA
+        # 09 is dialogue at 100% by the rules, and Qwen, reading eight short
+        # lines, said 50%; a blend would have sent a settled file back to a
+        # person. Only when Qwen is strongly against a confident rule is the
+        # file put back in the middle - asked about, never acted on.
+        r, p = d["score"], q["p"]
+        lo, hi = dismiss_at(), mark_at()
+        if lo < r < hi:
+            s = (1 - QWEN_WEIGHT) * r + QWEN_WEIGHT * p
+            note = f" (in doubt by the rules, so it carries {int(QWEN_WEIGHT * 100)}% of this score)"
+        elif (r >= hi and p <= 15) or (r <= lo and p >= 85):
+            s = (lo + hi) / 2
+            note = " - strongly against the rules' answer, so this one is put to you"
+        else:
+            s = r
+            note = " - the rules were already sure, so it does not move the score"
+        return {"score": int(max(0, min(100, round(s)))), "why": d["why"] + "; " + said + note,
+                "rules": r, "qwen": p}
+    return {"score": d["score"], "why": d["why"] + "; " + said
+            + " - shown only; switch it on under how it scores to let it count",
+            "rules": d["score"], "qwen": q["p"]}
+
+
+def _score_rules(row) -> dict:
     r"""How sure this finding is, 0-100, and the sentence explaining it.
 
     Every term is evidence that is already in the row:

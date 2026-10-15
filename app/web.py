@@ -1001,6 +1001,8 @@ async def _startup() -> None:
     asyncio.create_task(_tvdbfix.watch())
     from . import submake as _submake
     asyncio.create_task(_submake.watch())
+    from . import qwenjudge as _qwenjudge
+    asyncio.create_task(_qwenjudge.watch())
     # SSD wear: the staging drive was at 90% before anyone looked. See diskwear.py.
     from . import diskwear as _diskwear
     asyncio.create_task(_diskwear.watch())
@@ -5216,6 +5218,28 @@ def api_whisper():
     except Exception:                                    # noqa: BLE001
         d["large"] = {}
     return d
+
+
+@app.get("/api/qwenjudge")
+def api_qwenjudge():
+    from . import qwenjudge
+    return qwenjudge.snapshot()
+
+
+@app.post("/api/qwenjudge/use")
+def api_qwenjudge_use(on: int = 0):
+    """Let Qwen's verdict move the picture score (on) or only show it (off)."""
+    from . import hardsub
+    hardsub.set_qwen(bool(on))
+    joblog.log(f"picture scoring: Qwen's verdict {'now counts' if on else 'is shown only'}", "info")
+    return {"on": bool(on)}
+
+
+@app.post("/api/qwenjudge/run")
+async def api_qwenjudge_run():
+    from . import qwenjudge
+    asyncio.create_task(qwenjudge.run())
+    return {"started": True}
 
 
 @app.get("/api/qwen")
@@ -39005,6 +39029,57 @@ function scoreRows(rows){
       </td></tr>`;
   }).join('');
 }
+// ---- the Qwen judge, on the scoring panel ----------------------------------
+// Qwen reads each picture's lines in order and says whether they are dialogue.
+// Its verdict is always written into the row's reason; it moves the sure %
+// only when this switch is on - and the switch sits beside how often it has
+// agreed with the answers on record, so that is the thing you decide from.
+let _qj=null, _qjAt=0;
+function qjHtml(){
+  if(!_qj || Date.now()-_qjAt>20000){ qjLoad(); }
+  if(!_qj) return '<div class="dim" style="font-size:11px">reading the Qwen judge…</div>';
+  const a=_qj.agreement||{}, st=_qj.state||{}, y=a.yes||{}, n=a.no||{};
+  const pc=(x)=>x.n?Math.round(100*x.agree/x.n)+'%':'—';
+  return `<b style="font-size:11.5px">Qwen reads the lines</b>
+    <div class="dim" style="font-size:11px;margin:2px 0 4px">The picture check keeps what it read from each frame, in
+      order; Qwen reads those lines and says how likely they are to be burned-in dialogue. A logo repeated in every
+      frame or a title card reads as what it is in order, where the word list made it look like vocabulary.</div>
+    <table style="width:100%;border-collapse:collapse;font-size:11.5px"><tbody>
+      <tr style="border-top:1px solid var(--line)"><td style="padding:3px 8px 3px 0;width:160px;text-align:right" class="dim">agreed on dialogue</td>
+        <td><b>${pc(y)}</b> <span class="dim">${fmt(y.agree||0)} of ${fmt(y.n||0)} files you set to dialogue</span></td></tr>
+      <tr style="border-top:1px solid var(--line)"><td style="padding:3px 8px 3px 0;text-align:right" class="dim">agreed on not dialogue</td>
+        <td><b>${pc(n)}</b> <span class="dim">${fmt(n.agree||0)} of ${fmt(n.n||0)} files dismissed</span></td></tr>
+      <tr style="border-top:1px solid var(--line)"><td style="padding:3px 8px 3px 0;text-align:right" class="dim">judged</td>
+        <td>${fmt(a.judged||0)} <span class="dim">· ${fmt(a.waiting||0)} waiting · ${fmt(a.with_lines||0)} pictures have lines so far - the rest
+          get them as the picture check re-reads them</span></td></tr>
+      <tr style="border-top:1px solid var(--line)"><td style="padding:3px 8px 3px 0;text-align:right" class="dim">runs</td>
+        <td>${st.running?'<span style="color:var(--acc)">judging now…</span>':(st.last_run?'last '+ago(st.last_run):'not yet')}
+          <span class="dim">· every ${Math.round((_qj.poll_s||600)/60)} minutes when there is something to judge${st.last_result?' · '+esc(st.last_result):''}</span>
+          <button class="rmb" style="margin-left:6px" onclick="qjRun(this)">Judge now</button></td></tr>
+      <tr style="border-top:1px solid var(--line)"><td style="padding:3px 8px 3px 0;text-align:right" class="dim">in the sure %</td>
+        <td><label class="gsw"><input type="checkbox" ${_qj.on?'checked':''} onchange="qjUse(this.checked)">
+          <span class="gname">${_qj.on?`counts - ${Math.round((_qj.weight||0.7)*100)}% of the score`:'shown only'}</span></label>
+          <span class="dim" style="font-size:10.5px">${_qj.on?'turn off to go back to the rules alone'
+            :'its verdict is written into each row; switch on once the agreement above is good enough'}</span></td></tr>
+    </tbody></table>${(a.wrong||[]).length?`<div class="dim" style="font-size:10.5px;margin-top:3px">where it disagreed: ${
+      a.wrong.slice(0,5).map(w=>esc(w.file.slice(0,40))+' ('+w.truth+', Qwen '+w.p+'%)').join(' · ')}</div>`:''}`;
+}
+async function qjLoad(){
+  if(qjLoad._busy) return; qjLoad._busy=true;
+  try{ _qj=await (await fetch('/api/qwenjudge')).json(); _qjAt=Date.now(); }catch(e){}
+  qjLoad._busy=false;
+  const b=document.getElementById('qjBox'); if(b) b.innerHTML=qjHtml();
+}
+async function qjUse(on){
+  await fetch('/api/qwenjudge/use?on='+(on?1:0),{method:'POST'});
+  _qjAt=0; await qjLoad();
+  try{ _skKey=''; loadSubKind(); }catch(e){}
+}
+async function qjRun(btn){
+  btn.disabled=true; btn.textContent='judging…';
+  try{ await fetch('/api/qwenjudge/run',{method:'POST'}); }catch(e){}
+  setTimeout(()=>{ _qjAt=0; qjLoad(); }, 4000);
+}
 function scoreTable(){
   const d=_scoreData;
   if(!d) return `<div class="dim" style="font-size:11.5px;padding:8px 0">reading the scorer…</div>`;
@@ -39104,6 +39179,7 @@ function scoreTable(){
           : '. Nothing has been answered yet — pressing Blocklist &amp;'
             + ' re-download is what teaches this one'));
     })()}
+    <div id="qjBox" style="margin-top:9px">${qjHtml()}</div>
     <div class="dim" style="font-size:10.5px;margin-top:9px;padding-top:7px;
          border-top:1px solid var(--line)">
       <b style="color:var(--fg,#c9d1d9)">What moves and what does not.</b>
