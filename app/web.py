@@ -10602,6 +10602,13 @@ async def api_submake_add(file_id: str, overwrite: int = 0):
     return submake.enqueue(ids, overwrite=bool(overwrite))
 
 
+@app.post("/api/submake/forget")
+def api_submake_forget(at: str):
+    """Forget finished rows (comma-separated times). The files are not touched."""
+    from . import submake
+    return {"removed": submake.forget([x for x in str(at).split(",") if x.strip()])}
+
+
 @app.post("/api/submake/cancel")
 def api_submake_cancel(file_id: int):
     from . import submake
@@ -40408,54 +40415,125 @@ function smShell(){
     <div id="smTable"></div>
   </div>`;
 }
+// SELECTABLE, AND EACH ROW OPENS - the same handling as Subtitle User Input:
+// a checkbox per row (shift-click takes a range), a caret on the name that
+// opens the row for the whole story, and a bar of batch actions while
+// anything is selected. Keys say what kind of row it is, so an action is only
+// offered for the rows it can apply to.
+const _smSel=new Set(), _smOpen=new Set(); let _smLast=null, _smRows=[];
+function smKey(r){ return r.kind==='done' ? 'd:'+r.at : (r.kind==='queued'?'q:':'r:')+r.file_id; }
 function smRowHtml(r){
+  const k=smKey(r), on=_smSel.has(k), open=_smOpen.has(k);
+  const cb=`<td class="c" onclick="event.stopPropagation()">${r.kind==='running'?''
+      :`<input type="checkbox" ${on?'checked':''} onclick="smPick('${k}',event)">`}</td>`;
+  const ep=`<td class="l" style="cursor:pointer" onclick="smOpenRow('${k}')">
+      <span class="actcaret">${open?'▾':'▸'}</span><b style="font-size:11.5px">${esc(r.label||'')}</b>
+      <div class="dim mono" style="font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-left:14px">${esc(r.file||'')}</div></td>`;
   const lib=`<td class="c dim" style="font-size:10.5px">${esc(r.library||'—')}</td>`;
-  const ep=`<td class="l"><b style="font-size:11.5px">${esc(r.label||'')}</b>
-      <div class="dim mono" style="font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.file||'')}</div></td>`;
+  const lang=`<td class="c dim mono" style="font-size:10.5px">${esc(r.lang||'')}</td>`;
   const when=`<td class="c dim mono" style="font-size:10.5px" title="${r.at?esc(new Date(r.at*1000).toLocaleString()):''}">${r.at?ago(r.at):'—'}</td>`;
+  let res, where='<td class="c">—</td>', ans='<td class="r"></td>';
   if(r.kind==='running'){
     const st=r.st;
-    return `<tr>${ep}${lib}<td class="c dim mono" style="font-size:10.5px">${esc(r.lang||'')}</td>${when}
-      <td class="l" colspan="2"><div style="font-size:10.5px"><b style="color:#79c0ff">making</b> · ${esc(st.stage||'')}${st.note?' <span class="dim">· '+esc(st.note)+'</span>':''}
+    res=`<td class="l" colspan="2"><div style="font-size:10.5px"><b style="color:#79c0ff">making</b> · ${esc(st.stage||'')}${st.note?' <span class="dim">· '+esc(st.note)+'</span>':''}
         <span class="mono" style="float:right">${Math.round(st.pct||0)}%</span></div>
         <div style="height:4px;background:var(--line);border-radius:2px;margin-top:3px">
-          <div style="height:4px;width:${Math.min(100,st.pct||0)}%;background:#79c0ff;border-radius:2px"></div></div></td>
-      <td class="r"></td></tr>`;
-  }
-  if(r.kind==='queued')
-    return `<tr>${ep}${lib}<td class="c dim mono" style="font-size:10.5px">${esc(r.lang||'')}</td>${when}
-      <td class="l" colspan="2"><span style="color:#e8a33d;font-size:10.5px">queued</span>${
-        _sm.state&&_sm.state.waiting_for?` <span class="dim" style="font-size:10.5px">- waiting for ${esc(_sm.state.waiting_for)}</span>`:''}</td>
-      <td class="r"><button class="rmb" onclick="smCancel(${r.file_id},this)">Remove</button></td></tr>`;
-  const burned=!r.ok && /burned into the picture/.test(r.why||'');
-  return `<tr>${ep}${lib}<td class="c dim mono" style="font-size:10.5px">${esc(r.lang||'')}</td>${when}
-    <td class="l" style="font-size:10.5px">${r.ok
+          <div style="height:4px;width:${Math.min(100,st.pct||0)}%;background:#79c0ff;border-radius:2px"></div></div></td>`;
+    where='';
+  }else if(r.kind==='queued'){
+    res=`<td class="l" colspan="2"><span style="color:#e8a33d;font-size:10.5px">queued</span>${
+        _sm.state&&_sm.state.waiting_for?` <span class="dim" style="font-size:10.5px">- waiting for ${esc(_sm.state.waiting_for)}</span>`:''}</td>`;
+    where='';
+    ans=`<td class="r"><button class="rmb" onclick="smCancel(${r.file_id},this)">Remove</button></td>`;
+  }else{
+    const burned=!r.ok && /burned into the picture/.test(r.why||'');
+    res=`<td class="l" style="font-size:10.5px">${r.ok
         ?`<span style="color:#7fd4a3">${fmt(r.narration||0)} spoken + ${fmt(r.onscreen||0)} on-screen</span>`
         :`<span style="color:${burned?'#e8a33d':'#e0575b'}">${burned?'skipped':'failed'}</span>`}
-      <div class="dim" style="font-size:10px;white-space:normal">${esc(r.why||'')}</div></td>
-    <td class="c" style="font-size:10.5px">${r.ok?(r.where==='embedded'
+      <div class="dim" style="font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.why||'')}</div></td>`;
+    where=`<td class="c" style="font-size:10.5px">${r.ok?(r.where==='embedded'
         ?'<span style="color:#7fd4a3" title="inside the file - the library embeds sidecars">in the file</span>'
-        :'<span class="dim" title="beside the file as name.en.srt - this library keeps sidecars">beside it</span>'):'—'}</td>
-    <td class="r">${burned
+        :'<span class="dim" title="beside the file as name.en.srt - this library keeps sidecars">beside it</span>'):'—'}</td>`;
+    ans=`<td class="r">${burned
         ?`<button class="rmb" onclick="smMake(${r.file_id},this,1)" title="Make them even though English is already in the picture - the file gets a second English track.">Make anyway</button>`
-        :(!r.ok?`<button class="rmb" onclick="smMake(${r.file_id},this)">Try again</button>`:'')}</td></tr>`;
+        :(!r.ok?`<button class="rmb" onclick="smMake(${r.file_id},this)">Try again</button>`:'')}</td>`;
+  }
+  const det=open?`<tr class="det"><td></td><td colspan="7" style="padding:4px 8px 8px 22px;font-size:11px;border-bottom:1px solid var(--line);background:rgba(255,255,255,.025)">
+      ${r.kind==='running'?`<div><span class="dim">now:</span> ${esc(r.st.stage||'')}${r.st.note?' · '+esc(r.st.note):''} · ${Math.round(r.st.pct||0)}%</div>
+        <div><span class="dim">started:</span> ${r.at?esc(new Date(r.at*1000).toLocaleString()):'—'}</div>`
+      :r.kind==='queued'?`<div><span class="dim">queued:</span> ${r.at?esc(new Date(r.at*1000).toLocaleString()):'—'}</div>
+        <div class="dim">It starts when the file ahead of it is done and the heavy lane is free.</div>`
+      :`<div><span class="dim">result:</span> ${esc(r.why||'')}</div>
+        ${r.ok?`<div><span class="dim">lines:</span> ${fmt(r.narration||0)} from the audio (Whisper, timed by the voice detector) · ${fmt(r.onscreen||0)} from the picture (OCR, translated, shown at the top)</div>`:''}
+        ${r.sidecar?`<div><span class="dim">subtitle file:</span> <span class="mono">${esc(r.sidecar)}</span>${r.where==='embedded'?' <span class="dim">- taken into the file and recycled</span>':''}</div>`:''}
+        <div><span class="dim">took:</span> ${r.secs!=null?esc(hsDur(r.secs)):'—'} · <span class="dim">finished</span> ${r.at?esc(new Date(r.at*1000).toLocaleString()):'—'}</div>`}
+      <div><span class="dim">file:</span> <span class="mono">${esc(r.file||'')}</span> · <span class="dim">audio</span> ${esc(r.lang||'—')} · <span class="dim">library</span> ${esc(r.library||'—')}</div>
+    </td></tr>`:'';
+  return `<tr${on?' style="background:rgba(88,166,255,.06)"':''}>${cb}${ep}${lib}${lang}${when}${res}${where}${ans}</tr>${det}`;
+}
+function smPick(k, ev){
+  const keys=_smRows.filter(r=>r.kind!=='running').map(smKey), i=keys.indexOf(k);
+  if(ev&&ev.shiftKey&&_smLast!==null&&i>=0){
+    const a=Math.min(i,_smLast), b=Math.max(i,_smLast), on=!_smSel.has(k);
+    for(let x=a;x<=b;x++){ if(on) _smSel.add(keys[x]); else _smSel.delete(keys[x]); }
+  }else{ if(_smSel.has(k)) _smSel.delete(k); else _smSel.add(k); }
+  if(i>=0) _smLast=i;
+  _smKey=''; smPaint();
+}
+function smSelAll(on){
+  _smSel.clear(); if(on) _smRows.filter(r=>r.kind!=='running').forEach(r=>_smSel.add(smKey(r)));
+  _smLast=null; _smKey=''; smPaint();
+}
+function smOpenRow(k){ if(_smOpen.has(k)) _smOpen.delete(k); else _smOpen.add(k); _smKey=''; smPaint(); }
+function smSelBar(){
+  const live=new Set(_smRows.map(smKey));
+  for(const k of [..._smSel]) if(!live.has(k)) _smSel.delete(k);
+  const n=_smSel.size; if(!n) return '';
+  const done=[..._smSel].filter(k=>k[0]==='d'), q=[..._smSel].filter(k=>k[0]==='q');
+  return `<div class="banselbar" style="margin:4px 0 6px">
+    <b style="font-size:11.5px;color:#e3b341">${fmt(n)} selected</b>
+    ${done.length?`<button class="rmb" onclick="smBulk('again',this)" title="Make subtitles for these files again, replacing the English subtitle file beside them">Make again ${fmt(done.length)}</button>
+      <button class="rmb" onclick="smBulk('forget',this)" title="Take these rows off the list. The files and their subtitles are not touched.">Forget ${fmt(done.length)}</button>`:''}
+    ${q.length?`<button class="rmb" style="color:var(--bad,#e05252)" onclick="smBulk('remove',this)" title="Take these out of the queue before they start">Remove ${fmt(q.length)} from the queue</button>`:''}
+    <button class="rmb" onclick="_smSel.clear();_smLast=null;_smKey='';smPaint()">Clear</button>
+    <span class="dim" style="font-size:10.5px">shift-click to take a range</span></div>`;
+}
+async function smBulk(what, btn){
+  btn.disabled=true;
+  const done=[..._smSel].filter(k=>k[0]==='d').map(k=>k.slice(2));
+  const q=[..._smSel].filter(k=>k[0]==='q').map(k=>k.slice(2));
+  try{
+    if(what==='forget' && done.length)
+      await fetch('/api/submake/forget?at='+encodeURIComponent(done.join(',')),{method:'POST'});
+    if(what==='remove')
+      for(const id of q) await fetch('/api/submake/cancel?file_id='+id,{method:'POST'});
+    if(what==='again'){
+      const ids=[...new Set(_smRows.filter(r=>r.kind==='done'&&done.includes(String(r.at))).map(r=>r.file_id))];
+      if(ids.length) await fetch('/api/submake?overwrite=1&file_id='+ids.join(','),{method:'POST'});
+    }
+  }catch(e){}
+  _smSel.clear(); _smLast=null; _smKey=''; smLoad();
 }
 function smPaint(){
   const el=document.getElementById('smPanel'); if(!el||!_sm) return;
   if(!document.getElementById('smTable')) el.innerHTML=smShell();
   const st=_sm.state||{}, q=(_sm.queue||[]).filter(x=>!(st.running&&x.file_id===st.file_id));
   const rows=[];
-  if(st.running) rows.push({kind:'running', st, label:st.label, library:st.library, file:st.file, lang:st.lang, at:st.started});
+  if(st.running) rows.push({kind:'running', st, file_id:st.file_id, label:st.label, library:st.library, file:st.file, lang:st.lang, at:st.started});
   q.forEach(x=>rows.push({kind:'queued', ...x}));
   (_sm.recent||[]).forEach(x=>rows.push({kind:'done', ...x}));
+  _smRows=rows;
   const c=document.getElementById('smCount');
   if(c) c.innerHTML=st.running||q.length
     ? `${st.running?'1 making':''}${st.running&&q.length?' · ':''}${q.length?num(q.length,'you')+' <span class="dim">queued</span>':''}`
     : `<span class="dim">${fmt((_sm.recent||[]).length)} made so far</span>`;
   const h=document.getElementById('smHits'); if(h && h.innerHTML!==_smHits) h.innerHTML=_smHits;
-  const table=rows.length?`<div class="rowbox scrollbox"><table class="sktbl" style="width:100%;font-size:11.5px;table-layout:fixed">
-      <colgroup><col style="width:auto"><col style="width:96px"><col style="width:46px"><col style="width:70px"><col style="width:34%"><col style="width:76px"><col style="width:96px"></colgroup>
-      <thead><tr class="dim" style="font-size:10.5px"><th class="l">EPISODE</th><th class="c">LIBRARY</th><th class="c">AUDIO</th><th class="c">WHEN</th>
+  const pickable=rows.filter(r=>r.kind!=='running');
+  const allOn=pickable.length && pickable.every(r=>_smSel.has(smKey(r)));
+  const table=rows.length?`${smSelBar()}<div class="rowbox scrollbox"><table class="sktbl" style="width:100%;font-size:11.5px;table-layout:fixed">
+      <colgroup><col style="width:24px"><col style="width:auto"><col style="width:96px"><col style="width:46px"><col style="width:70px"><col style="width:32%"><col style="width:76px"><col style="width:96px"></colgroup>
+      <thead><tr class="dim" style="font-size:10.5px"><th class="c"><input type="checkbox" ${allOn?'checked':''} title="Select every row" onclick="smSelAll(this.checked)"></th>
+        <th class="l">EPISODE</th><th class="c">LIBRARY</th><th class="c">AUDIO</th><th class="c">WHEN</th>
         <th class="l">RESULT</th><th class="c">WHERE</th><th class="r">ANSWER</th></tr></thead>
       <tbody>${rows.map(smRowHtml).join('')}</tbody></table></div>`
     : '<div class="dim" style="font-size:11.5px;padding:6px 0">nothing made yet - find a file above, or use Make subtitles on a raw</div>';
@@ -42868,6 +42946,49 @@ let _subsSort='what', _subsDesc=false;
 // SHOW ONLY THE ONES NOTHING WILL HAPPEN TO. The header counts them; this is
 // that number made into the filter it was already describing.
 let _subsOnlyWaiting=false;
+// SELECTABLE, AND EACH ROW OPENS - Subtitle User Input's handling: a checkbox
+// per file (shift-click for a range), a caret on the name that opens the row,
+// and a bar of batch actions while anything is selected.
+const _subsSel=new Set(), _subsOpenRows=new Set(); let _subsLast=null;
+function subsPick(fid, ev){
+  const ids=subsRowsSorted().map(e=>e.file_id), i=ids.indexOf(fid);
+  if(ev&&ev.shiftKey&&_subsLast!==null&&i>=0){
+    const a=Math.min(i,_subsLast), b=Math.max(i,_subsLast), on=!_subsSel.has(fid);
+    for(let x=a;x<=b;x++){ if(on) _subsSel.add(ids[x]); else _subsSel.delete(ids[x]); }
+  }else{ if(_subsSel.has(fid)) _subsSel.delete(fid); else _subsSel.add(fid); }
+  if(i>=0) _subsLast=i;
+  _subsKey=''; subsPaint();
+}
+function subsSelAll(on){
+  _subsSel.clear(); if(on) subsRowsSorted().forEach(e=>_subsSel.add(e.file_id));
+  _subsLast=null; _subsKey=''; subsPaint();
+}
+function subsOpenRow(fid){ if(_subsOpenRows.has(fid)) _subsOpenRows.delete(fid); else _subsOpenRows.add(fid); _subsKey=''; subsPaint(); }
+function subsSelBar(R){
+  const live=new Set(R.map(e=>e.file_id));
+  for(const id of [..._subsSel]) if(!live.has(id)) _subsSel.delete(id);
+  const n=_subsSel.size; if(!n) return '';
+  const sel=R.filter(e=>_subsSel.has(e.file_id));
+  const drift=sel.filter(e=>(e.acts||[]).some(a=>a.key==='drift'&&!a.queued));
+  const ask=sel.filter(e=>(e.acts||[]).some(a=>a.key==='ask'&&!a.on));
+  return `<div class="banselbar" style="margin:6px 0 4px">
+    <b style="font-size:11.5px;color:#e3b341">${fmt(n)} file${n===1?'':'s'} selected</b>
+    ${drift.length?`<button class="rmb" onclick="subsBulkRequeue(this)" title="Send these back through the normal queue so each is rebuilt under today's rules">Requeue ${fmt(drift.length)}</button>`:''}
+    ${ask.length?`<button class="rmb" onclick="subsDetail('picture')" title="These are waiting on an answer; the questions and their buttons are in Subtitle User Input">Answer ${fmt(ask.length)} in Subtitle User Input</button>`:''}
+    <button class="rmb" onclick="_subsSel.clear();_subsLast=null;_subsKey='';subsPaint()">Clear</button>
+    <span class="dim" style="font-size:10.5px">shift-click to take a range${(!drift.length&&!ask.length)?' · nothing here needs a button - nuarr gets to these on its own':''}</span></div>`;
+}
+async function subsBulkRequeue(btn){
+  btn.disabled=true;
+  const R=subsRowsSorted().filter(e=>_subsSel.has(e.file_id)
+     && (e.acts||[]).some(a=>a.key==='drift'&&!a.queued));
+  let n=0;
+  for(const e of R){
+    btn.textContent=`requeuing ${++n} of ${R.length}…`;
+    try{ await fetch('/api/subocr/rulesgap/requeue-one?file_id='+e.file_id,{method:'POST'}); }catch(x){}
+  }
+  _subsSel.clear(); _subsLast=null; _subsKey=''; setTimeout(()=>loadSubs(true), 900);
+}
 function subsOnlyWaiting(on){
   _subsOnlyWaiting=!!on; _subsKey=''; subsPaint();
 }
@@ -43192,18 +43313,25 @@ function subsListHtml(){
         esc(String(x.show).replace(/\s*\{[^}]*\}\s*/g,' ').trim())} ${
         num(x.n,'auto')}</span>`).join('')
     }</div>`:''}
+    ${subsSelBar(R)}
     <div class="scrollbox" style="max-height:420px;overflow:auto;margin-top:7px">
     <table class="tt" style="width:100%;table-layout:fixed">
       <thead><tr style="font-size:10.5px">
-        ${subsHead('file','File','44%','left')}
+        <th style="width:24px;text-align:center"><input type="checkbox" ${R.length&&R.every(e=>_subsSel.has(e.file_id))?'checked':''}
+          title="Select every file shown" onclick="subsSelAll(this.checked)"></th>
+        ${subsHead('file','File','42%','left')}
         ${subsHead('disk','Disk','11%')}
         ${subsHead('library','Library','13%')}
         ${subsHead('what','What would happen','32%','left')}
       </tr></thead>
-      <tbody>${R.map(e=>`<tr style="vertical-align:top${
-          e.ready?'':';opacity:.72'}">
+      <tbody>${R.map(e=>{ const on=_subsSel.has(e.file_id), open=_subsOpenRows.has(e.file_id);
+        return `<tr style="vertical-align:top${
+          e.ready?'':';opacity:.72'}${on?';background:rgba(88,166,255,.06)':''}">
+        <td style="text-align:center"><input type="checkbox" ${on?'checked':''}
+          onclick="subsPick(${e.file_id},event)"></td>
         <td style="text-align:left;overflow:hidden;text-overflow:ellipsis;
-            white-space:nowrap" title="${esc(e.path||'')}">${esc(e.name||'')}</td>
+            white-space:nowrap;cursor:pointer" title="${esc(e.path||'')}"
+            onclick="subsOpenRow(${e.file_id})"><span class="actcaret">${open?'▾':'▸'}</span>${esc(e.name||'')}</td>
         <td style="text-align:center">${e.disk?diskTag(e.disk):'<span class="dim">—</span>'}</td>
         <td style="text-align:center" class="dim">${esc(e.library||'')}</td>
         <td style="text-align:left">${e.owed?`<div style="font-size:10.5px;
@@ -43248,7 +43376,16 @@ function subsListHtml(){
                 style="font-size:10px;opacity:.7;white-space:normal">${
                 esc(String(a.why).slice(0,160))}</div>`:''}</div>`;
           }).join('')}</td>
-      </tr>`).join('')}</tbody>
+      </tr>${open?`<tr><td></td><td colspan="4" style="padding:4px 8px 9px 22px;font-size:11px;
+          border-bottom:1px solid var(--line);background:rgba(255,255,255,.025);white-space:normal">
+        <div><span class="dim">file:</span> <span class="mono">${esc(e.path||e.name||'')}</span></div>
+        <div><span class="dim">disk:</span> ${esc(e.disk||'—')} · <span class="dim">library:</span> ${esc(e.library||'—')}
+          · <span class="dim">${e.ready?'nuarr will do this on its own':'held - see below'}</span></div>
+        ${e.owed?`<div style="color:var(--warn)"><span class="dim">waiting:</span> ${esc(e.owed_why||'')}</div>`:''}
+        ${(e.acts||[]).map(a=>`<div style="margin-top:4px"><span class="capsc" style="border-color:${SUBS_C[a.key]||'#6fb0ff'};color:${SUBS_C[a.key]||'#6fb0ff'}">${esc(a.word||'')}</span>
+          <span class="dim">${a.on?'switched on':'waiting'}${a.queued?' · already '+esc(a.queued):''}</span>
+          ${a.why?`<div style="margin:2px 0 0 4px">${esc(String(a.why))}</div>`:''}</div>`).join('')}
+      </td></tr>`:''}`; }).join('')}</tbody>
     </table></div>`});
 }
 

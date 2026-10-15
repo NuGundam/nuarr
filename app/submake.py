@@ -116,6 +116,15 @@ def cancel(file_id: int) -> bool:
     return len(keep) != len(q)
 
 
+def forget(ats: list) -> int:
+    """Take finished rows off the list, by their time. Nothing on disk changes."""
+    want = {round(float(x), 3) for x in ats or []}
+    rows = _recent()
+    keep = [r for r in rows if round(float(r.get("at") or 0), 3) not in want]
+    kv_set(KV_RECENT, json.dumps(keep))
+    return len(rows) - len(keep)
+
+
 def kick() -> None:
     global _TASK
     try:
