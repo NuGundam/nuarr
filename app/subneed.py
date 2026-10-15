@@ -2433,15 +2433,63 @@ def answered_list(limit: int = 200) -> list[dict]:
     except Exception:                                            # noqa: BLE001
         return []
     out = []
+    import os
+    import re
+    from .db import display_label
+    # THE PATH, WHEREVER THE LEDGER KEPT IT. Replaces were logged with an
+    # empty path (fixed in remedy.replace), so for those rows the path comes
+    # from another entry for the same file - the requeue or ask that came
+    # before it - and failing that the release name from "blocklisted '...'".
+    want = {int(r["file_id"]) for r in rows if not r["path"]}
+    paths: dict = {}
+    if want:
+        try:
+            with cursor() as cur:
+                qs = ",".join("?" * len(want))
+                for p in cur.execute(f"SELECT file_id, path FROM remedy_log WHERE file_id IN ({qs}) "
+                                     f"AND COALESCE(path,'')!='' ORDER BY at DESC", list(want)):
+                    paths.setdefault(int(p["file_id"]), p["path"])
+                # Other tables keep a file's path after the file row is gone:
+                # its subtitle facts, its picture verdict, its decode check,
+                # the Plex notice about it.
+                for t in ("sub_facts", "hardsub", "integrity", "plex_queue"):
+                    left = [i for i in want if i not in paths]
+                    if not left:
+                        break
+                    q2 = ",".join("?" * len(left))
+                    try:
+                        for p in cur.execute(f"SELECT file_id, path FROM {t} WHERE file_id IN ({q2}) "
+                                             f"AND COALESCE(path,'')!=''", left):
+                            paths.setdefault(int(p["file_id"]), p["path"])
+                    except Exception:                            # noqa: BLE001
+                        continue
+        except Exception:                                        # noqa: BLE001
+            pass
     for r in rows:
         d = dict(r)
-        # THE FILE IS USUALLY GONE, which is the point - so the name comes
-        # from the path the ledger kept rather than from a row that may no
-        # longer exist.
-        import os
-        d["name"] = (d.get("title") or
-                     os.path.basename(d.get("path") or "") or
-                     f"file {d['file_id']}")
+        path = d.get("path") or paths.get(int(d["file_id"])) or ""
+        d["path"] = path
+        if d.get("title"):
+            d["name"] = display_label(d["title"], d.get("season"), d.get("episode"), path)
+        elif path:
+            # THE FILE IS USUALLY GONE, which is the point - so the name is
+            # read off its path: the show or film from its folder, the episode
+            # from the file name, the library from the top folder.
+            parts = path.split("\\")
+            fn = os.path.basename(path)
+            m = re.search(r"[Ss](\d{1,4})[Ee](\d{1,4})", fn)
+            if m and len(parts) >= 4:
+                show = re.sub(r"\s*\{[^}]*\}", "", parts[2]).strip()
+                show = re.sub(r"\s*\(\d{4}\)$", "", show).strip()
+                d["name"] = display_label(show, int(m.group(1)), int(m.group(2)), path)
+            else:
+                film = re.sub(r"\s*\{[^}]*\}", "", parts[-2] if len(parts) >= 3 else fn).strip()
+                d["name"] = film or fn
+            if not d.get("library") and len(parts) >= 3:
+                d["library"] = parts[1]
+        else:
+            rel = re.search(r"blocklisted ['\"](.+?)['\"]", d.get("detail") or "")
+            d["name"] = rel.group(1) if rel else f"file {d['file_id']}"
         d["gone"] = d.get("title") is None
         out.append(d)
     return out

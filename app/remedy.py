@@ -688,7 +688,8 @@ async def replace(file_id: int, kind: str, source: str = "", why: str = "",
         return {"ok": False, "why": f"{kind} is replaceable, but never "
                                     f"unattended: {p['why']}"}
     from .refetch import _file_row
-    if not _file_row(int(file_id)):
+    _row = _file_row(int(file_id))
+    if not _row:
         # THE SAME TWO-ID-SPACES TRAP THE REQUEUE PATH HAD. refetch answers
         # "no such file" from three frames down, which reads as a missing file
         # rather than a caller handing over the arr's id.
@@ -709,9 +710,12 @@ async def replace(file_id: int, kind: str, source: str = "", why: str = "",
         _note(file_id, kind, REPLACE, source, auto, False,
               f"{type(e).__name__}: {e}")
         return {"ok": False, "why": f"{type(e).__name__}: {e}"}
+    # THE PATH FROM BEFORE THE DELETE. refetch removes the file and reports
+    # no path, so 603 replaces were logged with none and the answered list
+    # could only say "file 62878". The row read above still has it.
     _note(file_id, kind, REPLACE, source, auto, bool(out.get("ok")),
           "; ".join(out.get("did") or []) or out.get("why") or "",
-          out.get("path") or "")
+          out.get("path") or (_row.get("path") if isinstance(_row, dict) else "") or "")
     if out.get("ok"):
         joblog.log(f"{source or 'remedy'}: replaced a release - {kind}: "
                    f"{policy(kind)['why']}", "warn")
