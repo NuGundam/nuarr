@@ -39,6 +39,7 @@ from .db import cursor, display_label, kv_get, kv_set
 
 KV_QUEUE = "submake.queue"
 KV_RECENT = "submake.recent"
+KV_TRIED = "submake.tried"     # file_id -> {"ok", "skipped", "at", "why"}, kept for good
 RECENT_KEEP = 40
 LANE = "Subtitle maker"
 
@@ -65,8 +66,43 @@ def _recent() -> list:
         return []
 
 
+def _tried() -> dict:
+    try:
+        return json.loads(kv_get(KV_TRIED) or "{}")
+    except Exception:                                            # noqa: BLE001
+        return {}
+
+
 def _remember(row: dict) -> None:
     kv_set(KV_RECENT, json.dumps(([row] + _recent())[:RECENT_KEEP]))
+    # THE OUTCOME PER FILE, KEPT FOR GOOD. The list above is the last forty;
+    # the Raws check asks "has this file been tried, and how did it go"
+    # about any file, at any age, before it may delete one.
+    if row.get("file_id"):
+        t = _tried()
+        t[str(int(row["file_id"]))] = {
+            "ok": bool(row.get("ok")), "at": row.get("at") or time.time(),
+            "skipped": "burned into the picture" in str(row.get("why") or ""),
+            "why": str(row.get("why") or "")[:200]}
+        kv_set(KV_TRIED, json.dumps(t))
+
+
+def gate(file_id: int) -> str:
+    """Where the maker stands on this file, for a check that would delete it.
+
+    'none'    never tried       'pending'  queued or being made now
+    'ok'      subtitles made    'skipped'  English already burned in
+    'failed'  tried, and nothing came of it
+    """
+    fid = int(file_id)
+    if STATE.get("file_id") == fid or any(int(x["file_id"]) == fid for x in _queue()):
+        return "pending"
+    t = _tried().get(str(fid))
+    if not t:
+        return "none"
+    if t.get("ok"):
+        return "ok"
+    return "skipped" if t.get("skipped") else "failed"
 
 
 def _row(file_id: int) -> dict | None:
@@ -88,7 +124,7 @@ def _lang_of(r: dict) -> str:
     return langs[0] if langs else "jpn"
 
 
-def enqueue(file_ids: list, overwrite: bool = False) -> dict:
+def enqueue(file_ids: list, overwrite: bool = False, by: str = "you") -> dict:
     q = _queue()
     have = {int(x["file_id"]) for x in q}
     added, skipped = 0, []
@@ -101,7 +137,7 @@ def enqueue(file_ids: list, overwrite: bool = False) -> dict:
         if os.path.exists(_sidecar(r["path"])) and not overwrite:
             skipped.append(f"{display_label(r['title'], r['season'], r['episode'], r['path'])}: "
                            "already has an English subtitle beside it"); continue
-        q.append({"file_id": fid, "overwrite": bool(overwrite), "at": time.time()})
+        q.append({"file_id": fid, "overwrite": bool(overwrite), "at": time.time(), "by": by})
         have.add(fid)
         added += 1
     _save_queue(q)
@@ -149,7 +185,7 @@ async def _runner() -> None:
                 break
             job = q[0]
             try:
-                await _one(int(job["file_id"]), bool(job.get("overwrite")))
+                await _one(int(job["file_id"]), bool(job.get("overwrite")), job.get("by") or "you")
             except Exception as e:                               # noqa: BLE001
                 joblog.log(f"subtitle maker: {type(e).__name__}: {e}", "error")
                 _remember({"at": time.time(), "file_id": int(job["file_id"]),
@@ -161,7 +197,7 @@ async def _runner() -> None:
             STATE.update(running=False, file_id=None, label="", stage="", pct=0.0, note="")
 
 
-async def _one(file_id: int, overwrite: bool) -> None:
+async def _one(file_id: int, overwrite: bool, by: str = "you") -> None:
     from .jobs import _ffmpeg_exe
     r = _row(file_id)
     if not r or not os.path.exists(r["path"]):
@@ -202,7 +238,7 @@ async def _one(file_id: int, overwrite: bool) -> None:
     await p.wait()
     row = {"at": time.time(), "file_id": file_id, "label": label, "lang": lang,
            "library": r["library"] or "", "file": os.path.basename(r["path"]),
-           "secs": round(time.time() - STATE["started"])}
+           "secs": round(time.time() - STATE["started"]), "by": by}
     if not end.get("done") or not os.path.exists(tmp):
         row.update(ok=False, why=end.get("error") or f"the worker stopped (exit {p.returncode})")
         _remember(row)

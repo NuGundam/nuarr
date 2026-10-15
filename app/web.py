@@ -10576,6 +10576,13 @@ async def api_subneed(limit: int = 200, library: str = ""):
     """
     d = subneed.snapshot()
     d["missing_list"] = subneed.missing(limit, library)
+    # What the subtitle maker has done with each one - in auto it goes first.
+    try:
+        from . import submake
+        for r in d["missing_list"]:
+            r["maker"] = submake.gate(int(r["file_id"]))
+    except Exception:                                    # noqa: BLE001
+        pass
     d["unknown_sample"] = subneed.unknown_sample(12)
     # The rule asks for a subtitle these have not got and the audio is in
     # the language, so they are listed and nothing offers to delete them.
@@ -40179,7 +40186,7 @@ function snPaint(force){
         border:1px solid var(--line);display:flex;gap:12px;flex-wrap:wrap;
         align-items:baseline">
       <b style="color:var(--warn);flex:none">auto</b>
-      <span>${miss?`these ${fmt(miss)} are replaced without asking`
+      <span title="Each raw is first given to the Subtitle maker. A file it makes English subtitles for - or finds English already burned into - is not a raw and is left alone. Only one it tried and could not help is blocklisted, deleted and searched again.">${miss?`these ${fmt(miss)} get subtitles made first - replaced only if that fails`
                   :'nothing left to replace'}</span>
       ${(()=>{
         const b=(d.budget||{}).replace||{};
@@ -40269,7 +40276,10 @@ function snPaint(force){
           title="what pressing the button deletes">${esc(String(gb(r.size)))}<span class="dim"> GB</span></td>
         <td class="l mono" style="font-size:10.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:${r.pool_disk?diskColor(r.pool_disk):'var(--dim)'}"
           title="the pool disk this file is on">${esc(r.pool_disk||'—')}</td>
-        <td class="r askhost"><button class="rmb" onclick="smMake(${r.file_id},this)"
+        <td class="r askhost">${{pending:'<span style="color:#79c0ff;font-size:10.5px" title="The Subtitle maker has it - queued or being made now. Nothing is replaced while it works.">making subtitles…</span> ',
+            failed:'<span style="color:#e0575b;font-size:10.5px" title="The Subtitle maker tried and could not make any. In auto this one is replaced next.">maker failed</span> ',
+            ok:'<span style="color:#7fd4a3;font-size:10.5px" title="Subtitles were made; this leaves the list on the next pass.">subtitles made</span> ',
+            skipped:'<span style="color:#e8a33d;font-size:10.5px" title="English is already burned into the picture - not a raw.">English in the picture</span> '}[r.maker]||''}<button class="rmb" onclick="smMake(${r.file_id},this)"
           title="Listen to the audio and read the picture, and write English subtitles for it: Whisper for what is said, OCR and a language model for what is written on screen. Nothing is deleted. Where the result lives - beside the file or inside it - follows this library's sidecar rule.">Make subtitles</button>
           <button class="rmb" onclick="snAct(${r.file_id},this)"
           title="Blocklist this release so the arr never grabs it again, delete the file (${esc(String(gb(r.size)))} GB), and search for a replacement. Not reversible.">Blocklist &amp; re-download</button></td>
@@ -40482,7 +40492,7 @@ function smRowHtml(r){
         ${r.ok?`<div><span class="dim">lines:</span> ${fmt(r.narration||0)} from the audio (Whisper, timed by the voice detector) · ${fmt(r.onscreen||0)} from the picture (OCR, translated, shown at the top)</div>`:''}
         ${r.sidecar?`<div><span class="dim">subtitle file:</span> <span class="mono">${esc(r.sidecar)}</span>${r.where==='embedded'?' <span class="dim">- taken into the file and recycled</span>':''}</div>`:''}
         <div><span class="dim">took:</span> ${r.secs!=null?esc(hsDur(r.secs)):'—'} · <span class="dim">finished</span> ${r.at?esc(new Date(r.at*1000).toLocaleString()):'—'}</div>`}
-      <div><span class="dim">file:</span> <span class="mono">${esc(r.file||'')}</span> · <span class="dim">audio</span> ${esc(r.lang||'—')} · <span class="dim">library</span> ${esc(r.library||'—')}</div>
+      <div><span class="dim">file:</span> <span class="mono">${esc(r.file||'')}</span> · <span class="dim">audio</span> ${esc(r.lang||'—')} · <span class="dim">library</span> ${esc(r.library||'—')}${r.by?` · <span class="dim">asked by</span> ${esc(r.by)}`:''}</div>
     </td></tr>`:'';
   return `<tr${on?' style="background:rgba(88,166,255,.06)"':''}>${cb}${ep}${lib}${lang}${when}${res}${where}${ans}</tr>${det}`;
 }

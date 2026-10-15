@@ -2535,10 +2535,33 @@ def findings(limit: int = 50) -> list[dict]:
     know which of the four states a button is allowed to touch.
     """
 
-    return [{"file_id": int(r["file_id"]), "kind": KIND,
-             "path": r.get("path") or "",
-             "why": f"no {r['lang']} subtitles - {r['why']}"}
-            for r in missing(limit)]
+    # SUBTITLES FIRST, DELETION ONLY IF THAT FAILS. Erik, 2026-10-14: the
+    # Lupin film he had just hand-picked was deleted here as a raw the next
+    # day - Japanese, nothing to read, and no other release has subtitles
+    # either. The subtitle maker can usually give such a file English. So
+    # in auto a raw is first queued for it; while it is queued or being made
+    # nothing happens; if it made subtitles, or found English already burned
+    # into the picture, the file is not a raw and is left alone. Only a file
+    # the maker tried and could not help goes on to be replaced.
+    from . import submake
+    out, queue = [], []
+    for r in missing(limit):
+        g = submake.gate(int(r["file_id"]))
+        if g == "none":
+            queue.append(int(r["file_id"]))
+            continue
+        if g != "failed":
+            continue
+        out.append({"file_id": int(r["file_id"]), "kind": KIND,
+                    "path": r.get("path") or "",
+                    "why": f"no {r['lang']} subtitles, and the subtitle maker could not "
+                           f"make any - {r['why']}"})
+    if queue:
+        got = submake.enqueue(queue, by="Raws (auto)")
+        if got.get("added"):
+            joblog.log(f"raws: {got['added']} file(s) queued for the subtitle maker "
+                       f"before anything is replaced", "info", system="subneed")
+    return out
 
 
 def snapshot() -> dict:
