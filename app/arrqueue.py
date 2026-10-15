@@ -42,6 +42,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 import re
 import time
 import urllib.error
@@ -199,6 +200,135 @@ def _verdict(a, row: dict) -> str:
     if NOTHING_LEFT in low and _folder_empty(row.get("outputPath") or "") and _has_file(a, row):
         return "already imported - the download folder is empty and the arr has the file"
     return ""
+
+
+# ----------------------------------------- names the arr could not read --
+# "[Hakata Ramen] Pokemon Movie 09 - Pokmon Ranger and the Temple of the Sea"
+# finished downloading and sat in Radarr's queue as "Unable to parse release":
+# the arr does not know what it is, so it never imports it and never lets it
+# go. Qwen reads the name; the file is imported only when that reading matches
+# exactly ONE film (title and year) or ONE episode (series, season and
+# episode) the arr has, and the arr itself offers the file for it. Anything
+# else stays for a person. Each download is tried once.
+UNREAD_SAYS = ("unable to parse", "unknown series", "unknown movie", "not parsed",
+               "could not be parsed", "manual import required", "unknown episode")
+KV_PARSED = "arrqueue.parsed"
+
+
+def _unread(a, row: dict) -> bool:
+    if (row.get("status") or "") != "completed" or (row.get("sizeleft") or 0) > 0:
+        return False
+    if a.kind == "sonarr" and not row.get("seriesId"):
+        return True
+    if a.kind == "radarr" and not row.get("movieId"):
+        return True
+    low = " | ".join(m for s in (row.get("statusMessages") or [])
+                     for m in ([s.get("title") or ""] + list(s.get("messages") or []))).lower()
+    return any(k in low for k in UNREAD_SAYS)
+
+
+def _norm(t) -> str:
+    import unicodedata
+    t = unicodedata.normalize("NFKD", str(t or "")).encode("ascii", "ignore").decode()
+    return re.sub(r"[^a-z0-9]+", "", t.lower())
+
+
+def _match(a, p: dict) -> dict | None:
+    """The one item in this arr Qwen's reading names, or None."""
+    want = _norm(p.get("title"))
+    if not want:
+        return None
+    if a.kind == "radarr":
+        hits = []
+        for m in _call(a, "/api/v3/movie") or []:
+            names = {_norm(m.get("title")), _norm(m.get("originalTitle"))} | {
+                _norm(x.get("title")) for x in (m.get("alternateTitles") or [])}
+            if want in names and (not p.get("year") or abs(int(m.get("year") or 0) - int(p["year"])) <= 1):
+                hits.append(m)
+        return {"movieId": hits[0]["id"], "what": f"{hits[0]['title']} ({hits[0].get('year')})"} \
+            if len(hits) == 1 else None
+    if p.get("season") is None or p.get("episode") is None:
+        return None
+    hits = [s_ for s_ in (_call(a, "/api/v3/series") or [])
+            if want in ({_norm(s_.get("title"))} | {_norm(x.get("title")) for x in (s_.get("alternateTitles") or [])})]
+    if len(hits) != 1:
+        return None
+    eps = [e for e in (_call(a, f"/api/v3/episode?seriesId={hits[0]['id']}") or [])
+           if e.get("seasonNumber") == int(p["season"]) and e.get("episodeNumber") == int(p["episode"])]
+    if len(eps) != 1:
+        return None
+    return {"seriesId": hits[0]["id"], "episodeIds": [eps[0]["id"]],
+            "what": f"{hits[0]['title']} S{int(p['season']):02d}E{int(p['episode']):02d}"}
+
+
+def _import_unread(items: list) -> list:
+    """items: [(arr, row)]. -> rows for the recent list."""
+    import subprocess
+    from .config import NO_WINDOW
+    from .db import kv_get, kv_set
+    from . import heavy
+    try:
+        tried = set(json.loads(kv_get(KV_PARSED) or "[]"))
+    except Exception:                                            # noqa: BLE001
+        tried = set()
+    items = [(a, r) for a, r in items if str(r.get("downloadId") or r.get("id")) not in tried]
+    if not items:
+        return []
+    got, holder = heavy.claim("Qwen release names", ttl=900)
+    if not got:
+        STATS["detail"].append(f"unreadable release names wait - {holder} has the GPU lane")
+        return []
+    try:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        r = subprocess.run([sys.executable, "-m", "app.qwentools", "--parse-names"],
+                           input=json.dumps([row.get("title") or "" for _a, row in items]),
+                           capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           cwd=root, timeout=600, creationflags=NO_WINDOW)
+    finally:
+        heavy.release("Qwen release names")
+    parsed = []
+    for ln in (r.stdout or "").splitlines():
+        try:
+            d = json.loads(ln)
+        except Exception:                                        # noqa: BLE001
+            continue
+        parsed = d.get("parsed") or parsed
+    rows = []
+    for (a, row), p in zip(items, parsed):
+        tried.add(str(row.get("downloadId") or row.get("id")))
+        name = row.get("title") or ""
+        hit = None
+        try:
+            hit = _match(a, p)
+        except Exception as e:                                   # noqa: BLE001
+            STATS["detail"].append(f"{a.name}: could not look up {name[:50]}: {type(e).__name__}")
+        if not hit:
+            STATS["detail"].append(f"{a.name}: {name[:60]} - read as {p.get('title')!r}"
+                                   f"{' S%sE%s' % (p.get('season'), p.get('episode')) if p.get('episode') is not None else ''}"
+                                   f", which matches no single item here - left for you")
+            continue
+        try:
+            q = urllib.parse.urlencode({"folder": row.get("outputPath") or "", "downloadId": row.get("downloadId") or "",
+                                        **({"seriesId": hit["seriesId"]} if "seriesId" in hit else {"movieId": hit["movieId"]}),
+                                        "filterExistingFiles": "false"})
+            cands = [c for c in (_call(a, "/api/v3/manualimport?" + q) or [])
+                     if os.path.splitext(c.get("path") or "")[1].lower() in (".mkv", ".mp4", ".avi", ".m4v", ".ts")]
+            if len(cands) != 1:
+                STATS["detail"].append(f"{a.name}: {name[:60]} - {len(cands)} video files offered, left for you")
+                continue
+            c = cands[0]
+            f = {"path": c["path"], "quality": c.get("quality"), "languages": c.get("languages") or [],
+                 "releaseGroup": c.get("releaseGroup") or "", "downloadId": row.get("downloadId") or ""}
+            f.update({k: hit[k] for k in ("seriesId", "episodeIds", "movieId") if k in hit})
+            _call(a, "/api/v3/command", "POST", {"name": "ManualImport", "files": [f], "importMode": "auto"})
+            rows.append({"at": time.time(), "arr": a.name, "title": name, "client": row.get("downloadClient") or "",
+                         "why": f"the arr could not read this name; Qwen read it as {hit['what']}, the only match "
+                                f"here, and it was imported", "kind": "parsed"})
+            STATS["detail"].append(f"{a.name}: imported {name[:60]} as {hit['what']} (name read by Qwen)")
+        except Exception as e:                                   # noqa: BLE001
+            STATS["detail"].append(f"{a.name}: could not import {name[:60]}: {type(e).__name__}: {e}"[:160])
+    kv_set(KV_PARSED, json.dumps(sorted(tried)[-500:]))
+    return rows
 
 
 def _remove(a, row: dict, blocklist: bool = False) -> None:
@@ -470,6 +600,11 @@ def _pass() -> str:
     # and the client sweep would then take them as untracked - an import in
     # flight deleted because Sonarr was slow to answer. No sweep this pass.
     sweep_ok = len(queues) == len(arrs)
+    unread = [(a, r) for a, rows in queues for r in rows if _unread(a, r)]
+    if unread:
+        new_parsed = _import_unread(unread)
+    else:
+        new_parsed = []
     for a, rows in queues:
         # TWO DOWNLOADS FOR ONE EPISODE: KEEP THE BEST, DROP THE REST NOW.
         # The arr grabs a release, a better one appears, it grabs that too as
@@ -548,7 +683,7 @@ def _pass() -> str:
     else:
         swept, srows = 0, []
         STATS["detail"].append("client sweep skipped: an arr's queue could not be read this pass")
-    _remember(new + srows)
+    _remember(new_parsed + new + srows)
     STATS.update(removed=STATS["removed"] + removed, swept=STATS["swept"] + swept, kept=kept)
     bits = []
     if malware:

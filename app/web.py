@@ -5235,6 +5235,20 @@ def api_qwenjudge_use(on: int = 0):
     return {"on": bool(on)}
 
 
+@app.get("/api/subocr/qwenfix")
+def api_subocr_qwenfix():
+    from . import subocr
+    return {"on": subocr.qwen_fix_on(), "recent": subocr.qwen_fixes()}
+
+
+@app.post("/api/subocr/qwenfix")
+def api_subocr_qwenfix_set(on: int = 0):
+    from . import subocr
+    subocr.set_qwen_fix(bool(on))
+    joblog.log(f"subtitle OCR: Qwen repair {'ON' if on else 'off'}", "info")
+    return {"on": bool(on)}
+
+
 @app.post("/api/qwenjudge/stop")
 def api_qwenjudge_stop():
     from . import qwenjudge
@@ -34589,6 +34603,33 @@ async function savePlexCfg(btn){
 // install rather than six library-sized copies of the same decision.
 let _soc=null, _pad=null, _ocrEng='tesseract';
 
+// QWEN REPAIRS THE OCR'D TEXT - a switch, and every change it made, so the
+// switch is turned on by somebody who has read what it does.
+async function qfixLoad(){
+  const el=document.getElementById('qfixBox'); if(!el) return;
+  let d; try{ d=await (await fetch('/api/subocr/qwenfix')).json(); }catch(e){ return; }
+  const rec=d.recent||[];
+  el.innerHTML=`<div class="lkind" style="padding:11px 12px;margin-bottom:10px">
+    <div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px;flex-wrap:wrap">
+      <b style="color:#f0b37e">Qwen repairs what the OCR misread</b>
+      <label class="gsw"><input type="checkbox" ${d.on?'checked':''} onchange="qfixSet(this.checked)">
+        <span class="gname">${d.on?'on':'off'}</span></label></div>
+    <div class="dim" style="font-size:11px;margin-top:4px">After a picture track is read, Qwen looks for OCR's character errors -
+      <span class="mono">l</span> for <span class="mono">I</span>, <span class="mono">rn</span> for <span class="mono">m</span>,
+      <span class="mono">0</span> for <span class="mono">O</span>, a dropped apostrophe. A correction is kept only when it is a repair:
+      the same number of words, each changed word a near-spelling of what was read. A line it wants to rephrase is left exactly as
+      read. Tested: "l don't" → "I don't", "rnove" → "move", "Its" → "It's" kept; "Me want go house" → "I want to go home" refused.
+      Off until you turn it on; each track costs about half a minute on the card.</div>
+    ${rec.length?`<div style="margin-top:7px;font-size:11px"><b>What it changed</b>${rec.slice(0,8).map(r=>`<div style="margin-top:4px">
+        <span class="dim mono">${ago(r.at)}</span> ${esc((r.file||'').slice(0,70))} - ${fmt(r.changed||0)} of ${fmt(r.lines||0)} lines
+        ${(r.examples||[]).slice(0,4).map(x=>`<div class="mono" style="font-size:10.5px;padding-left:14px"><span style="color:#e0575b">${esc(x.was)}</span> → <span style="color:#7fd4a3">${esc(x.now)}</span></div>`).join('')}</div>`).join('')}</div>`
+      :'<div class="dim" style="font-size:11px;margin-top:6px">nothing repaired yet</div>'}
+  </div>`;
+}
+async function qfixSet(on){
+  await fetch('/api/subocr/qwenfix?on='+(on?1:0),{method:'POST'});
+  qfixLoad();
+}
 async function loadOcr(){
   const el=document.getElementById('ocrBody');
   if(!el) return;
@@ -34665,7 +34706,8 @@ async function loadOcr(){
     </div>`;
   }
 
-  el.innerHTML=head+ocrCompareHtml(s,p)+`
+  setTimeout(qfixLoad, 0);
+  el.innerHTML=head+`<div id="qfixBox"></div>`+ocrCompareHtml(s,p)+`
     <div class="lkind" style="margin-top:10px">
       <div class="lkindhead"><b style="color:#6fb0ff">What is installed</b></div>
       <table style="width:100%;font-size:12px;border-collapse:collapse">
@@ -37202,14 +37244,15 @@ async function loadQwen(){
         ${row('runs as', esc(q.compute||''), 'loaded only while a file is being made, in its own process')}
       </table></div>
     <div class="lkind" style="margin-top:10px"><div class="lkindhead"><b style="color:#79c0ff">What it is for</b></div>
-      <div style="font-size:11.5px;padding:8px 12px">The Subtitle maker reads text on screen with PaddleOCR - signs, title
-        cards, and in some films every line of dialogue - and this turns it into English. Children&rsquo;s films write almost
-        everything in hiragana, which a translation model trained on ordinary sentences cannot read: NLLB-200 turned
-        <span class="mono">あめがやまないと</span> (&ldquo;if the rain doesn&rsquo;t stop&rdquo;) into &ldquo;I have to stop&rdquo;.
-        A language model reads it in context, so the lines go to it in numbered batches with the film&rsquo;s title.
-        What is <i>said</i> is translated by Whisper, not by this.
-        <div class="dim" style="margin-top:5px">last used ${q.last_used?esc(ago(q.last_used)):'not yet'} · the results are on the
-          Subtitle maker panel, Subtitles page</div></div></div>
+      <div style="font-size:11.5px;padding:8px 12px">Six jobs, each in a process of its own on the shared GPU lane:
+        <div style="margin-top:4px">· <b>Subtitle maker</b> - translates a file's subtitle track in another language into English, keeping every cue's timing; and translates the text read off the screen.</div>
+        <div>· <b>Picture judge</b> - reads the lines the burned-in subtitle check kept and says whether they are dialogue.</div>
+        <div>· <b>Track judge</b> - reads a text track whose title contradicts its cue count and says dialogue, signs or songs.</div>
+        <div>· <b>Release names</b> - reads a finished download's name the arr could not parse, for the queue janitor.</div>
+        <div>· <b>OCR repair</b> - fixes character errors in subtitles read from pictures (off until switched on, on OCR engines).</div>
+        <div class="dim" style="margin-top:5px">Children&rsquo;s films write almost everything in hiragana, which a translation model trained on
+        ordinary sentences cannot read; a language model reads it in context. What is <i>said</i> is translated by Whisper, not by this.
+        Last used ${q.last_used?esc(ago(q.last_used)):'not yet'}.</div></div></div></div>
     <div class="lkind" style="margin-top:10px"><div class="lkindhead"><b style="color:#79c0ff">Languages in your library</b>
         <span class="dim">every audio language the libraries hold, read fresh each time - a new one appears here by itself</span></div>
       <table style="width:100%;font-size:12px;border-collapse:collapse">
@@ -39130,6 +39173,10 @@ function qjHtml(){
         <td><b>${pc(y)}</b> <span class="dim">${fmt(y.agree||0)} of ${fmt(y.n||0)} files you set to dialogue</span></td></tr>
       <tr style="border-top:1px solid var(--line)"><td style="padding:3px 8px 3px 0;text-align:right" class="dim">agreed on not dialogue</td>
         <td><b>${pc(n)}</b> <span class="dim">${fmt(n.agree||0)} of ${fmt(n.n||0)} files dismissed</span></td></tr>
+      ${a.tracks?`<tr style="border-top:1px solid var(--line)"><td style="padding:3px 8px 3px 0;text-align:right" class="dim">text tracks</td>
+        <td><b>${pc({n:(a.tracks.yes.n+a.tracks.no.n), agree:(a.tracks.yes.agree+a.tracks.no.agree)})}</b>
+          <span class="dim">${fmt(a.tracks.yes.agree+a.tracks.no.agree)} of ${fmt(a.tracks.yes.n+a.tracks.no.n)} tracks whose kind you set
+          · ${fmt(a.tracks_judged||0)} judged · ${fmt(a.tracks_waiting||0)} waiting</span></td></tr>`:''}
       <tr style="border-top:1px solid var(--line)"><td style="padding:3px 8px 3px 0;text-align:right" class="dim">judged</td>
         <td>${fmt(a.judged||0)} <span class="dim">· ${fmt(a.waiting||0)} waiting · ${fmt(a.with_lines||0)} pictures have lines so far - the rest
           get them as the picture check re-reads them</span></td></tr>
@@ -40782,7 +40829,8 @@ function smRowHtml(r){
   }else{
     const burned=!r.ok && /burned into the picture/.test(r.why||'');
     res=`<td class="l" style="font-size:10.5px">${r.ok
-        ?`<span style="color:#7fd4a3">${fmt(r.narration||0)} spoken + ${fmt(r.onscreen||0)} on-screen</span>`
+        ?(r.translated?`<span style="color:#7fd4a3">${fmt(r.translated)} lines translated</span>`
+          :`<span style="color:#7fd4a3">${fmt(r.narration||0)} spoken + ${fmt(r.onscreen||0)} on-screen</span>`)
         :`<span style="color:${burned?'#e8a33d':'#e0575b'}">${burned?'skipped':'failed'}</span>`}
       <div class="dim" style="font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.why||'')}</div></td>`;
     where=`<td class="c" style="font-size:10.5px">${r.ok?(r.where==='embedded'
@@ -40798,7 +40846,8 @@ function smRowHtml(r){
       :r.kind==='queued'?`<div><span class="dim">queued:</span> ${r.at?esc(new Date(r.at*1000).toLocaleString()):'—'}</div>
         <div class="dim">It starts when the file ahead of it is done and the heavy lane is free.</div>`
       :`<div><span class="dim">result:</span> ${esc(r.why||'')}</div>
-        ${r.ok?`<div><span class="dim">lines:</span> ${fmt(r.narration||0)} from the audio (Whisper, timed by the voice detector) · ${fmt(r.onscreen||0)} from the picture (OCR, translated, shown at the top)</div>`:''}
+        ${r.ok?(r.translated?`<div><span class="dim">lines:</span> ${fmt(r.translated)} translated by Qwen from ${esc(r.source||'a subtitle track')}, every cue keeping its original timing</div>`
+          :`<div><span class="dim">lines:</span> ${fmt(r.narration||0)} from the audio (Whisper, timed by the voice detector) · ${fmt(r.onscreen||0)} from the picture (OCR, translated, shown at the top)</div>`):''}
         ${r.sidecar?`<div><span class="dim">subtitle file:</span> <span class="mono">${esc(r.sidecar)}</span>${r.where==='embedded'?' <span class="dim">- taken into the file and recycled</span>':''}</div>`:''}
         <div><span class="dim">took:</span> ${r.secs!=null?esc(hsDur(r.secs)):'—'} · <span class="dim">finished</span> ${r.at?esc(new Date(r.at*1000).toLocaleString()):'—'}</div>`}
       <div><span class="dim">file:</span> <span class="mono">${esc(r.file||'')}</span> · <span class="dim">audio</span> ${esc(r.lang||'—')} · <span class="dim">library</span> ${esc(r.library||'—')}${r.by?` · <span class="dim">asked by</span> ${esc(r.by)}`:''}</div>
@@ -46689,7 +46738,7 @@ async function loadArrsTab(){
         +'One exception to that: a download whose file is a program (.exe, .scr, '
         +'.bat, .msi and the like) posing as an episode or movie is removed the '
         +'moment its file list is known, even mid-download, and blocklisted so the '
-        +'arr goes looking for a real release instead.',
+        +'arr goes looking for a real release instead. And a finished download the arr cannot place - "Unable to parse release", an unknown series or film - has its name read by Qwen, and is imported when that reading matches exactly one film or episode here and the arr offers the file for it; anything else stays for you.',
         d.toggles.queue_janitor, qjst,
         {label:'', kind:'queue_janitor', names:{}, empty:'', adder:qjList(qj)})
     + job('tvdb_fix','TVDB re-ID repair: series TheTVDB deleted and re-added',
@@ -46735,7 +46784,7 @@ function qjRowHtml(r,i){
     <td class="c dim">${esc(r.client||'')}</td>
     <td class="l" style="cursor:pointer" title="${esc(r.title||'')}" onclick="qjOpen('${id}',event)"
       ><span class="actcaret">${open?'▾':'▸'}</span><span class="mono">${esc(r.title||'')}</span>
-      <div class="${r.kind==='malware'?'':'dim'}" style="font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-left:14px${r.kind==='malware'?';color:var(--bad,#e5534b);font-weight:600':r.kind==='stalled'?';color:#e8a33d':''}">${esc(r.why||'')}</div></td>
+      <div class="${r.kind==='malware'?'':'dim'}" style="font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-left:14px${r.kind==='malware'?';color:var(--bad,#e5534b);font-weight:600':r.kind==='stalled'?';color:#e8a33d':r.kind==='parsed'?';color:#f0b37e':''}">${esc(r.why||'')}</div></td>
   </tr>${open?`<tr class="det" id="qjdet-${esc(id)}"><td colspan="4" style="padding:0;border-bottom:1px solid var(--line);white-space:normal;background:rgba(255,255,255,.025)">
     <div style="font-size:11px;padding:6px 10px 8px 34px">
       <div style="display:flex;gap:8px;margin:2px 0"><span class="dim" style="flex:none;width:96px;text-align:right">release</span><span class="mono" style="overflow-wrap:anywhere">${esc(r.title||'')}</span></div>

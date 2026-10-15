@@ -48,6 +48,62 @@ STATE: dict = {"running": False, "last_run": 0.0, "next_run": 0.0, "last_result"
 _PROC = None
 
 
+# THE SAME QUESTION FOR TEXT TRACKS. A track whose title contradicts its cue
+# count ("Signs only" at the pace of people talking) is the third reader's
+# finding; its lines are clean text, so Qwen reads a sample of them directly.
+TRACK_SYS = ("You judge a subtitle track from a video. You get lines sampled through the episode, "
+             "in order, and the track's title. Decide whether the track is the DIALOGUE (people "
+             "talking), or SIGNS / SONGS only (on-screen text, song lyrics, karaoke, typesetting), "
+             "or BOTH. Reply exactly: DIALOGUE CHANCE: a number 0-100; KIND: dialogue or signs or "
+             "songs or both; WHY: one short sentence.")
+
+
+def init_tracks() -> None:
+    from .db import cursor
+    with cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS subtitle_qwen(
+                file_id    INTEGER,
+                track      INTEGER,
+                size       INTEGER,
+                dialogue_p INTEGER,
+                kind       TEXT,
+                why        TEXT,
+                at         REAL,
+                PRIMARY KEY (file_id, track)
+            )""")
+
+
+def track_verdicts() -> dict:
+    """{(file_id, track): {"p", "kind", "why", "size"}}"""
+    from .db import cursor
+    init_tracks()
+    out = {}
+    with cursor() as cur:
+        for r in cur.execute("SELECT * FROM subtitle_qwen"):
+            out[(int(r["file_id"]), int(r["track"]))] = {"p": int(r["dialogue_p"] or 0),
+                                                         "kind": r["kind"] or "", "why": r["why"] or "",
+                                                         "size": int(r["size"] or 0)}
+    return out
+
+
+def pending_tracks() -> list:
+    from . import subtitletitle as stt
+    have = track_verdicts()
+    out = []
+    for r in (stt.cached().get("rows") or []):
+        if r.get("unread") or not r.get("mkv_id") and r.get("mkv_id") != 0:
+            continue
+        k = (int(r["file_id"]), int(r["track"]))
+        v = have.get(k)
+        if v and v["size"] == int(r.get("size") or 0):
+            continue
+        out.append({"file_id": k[0], "track": k[1], "mkv_id": int(r["mkv_id"]), "path": r.get("path"),
+                    "size": int(r.get("size") or 0), "title": r.get("old") or "",
+                    "label": r.get("label") or ""})
+    return out
+
+
 # ----------------------------------------------------------------- server --
 def pending(limit: int = BATCH) -> list:
     from .db import cursor
@@ -63,7 +119,8 @@ async def run() -> str:
     from . import heavy, joblog
     from .config import NO_WINDOW
     todo = pending()
-    if not todo:
+    tracks = pending_tracks()[:BATCH]
+    if not todo and not tracks:
         return "nothing to judge"
     got, holder = heavy.claim(LANE, ttl=1800)
     if not got:
@@ -73,8 +130,15 @@ async def run() -> str:
                  started=time.time())
     try:
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        tf = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "..",
+                          "qwen_tracks.json")
+        from .config import DATA_DIR
+        tf = os.path.join(str(DATA_DIR), "qwen_tracks.json")
+        with open(tf, "w", encoding="utf-8") as f:
+            json.dump(tracks, f)
+        STATE["total"] = min(len(todo), BATCH) + len(tracks)
         p = await asyncio.create_subprocess_exec(
-            sys.executable, "-m", "app.qwenjudge", "--batch", str(BATCH), cwd=root,
+            sys.executable, "-m", "app.qwenjudge", "--batch", str(BATCH), "--tracks", tf, cwd=root,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
             creationflags=NO_WINDOW)
         _PROC = p
@@ -154,6 +218,25 @@ def agreement() -> dict:
                 if not ok and len(out["wrong"]) < 12:
                     out["wrong"].append({"file": os.path.basename(r["path"] or ""), "truth": side,
                                          "p": int(r["dialogue_p"] or 0)})
+            # TRACKS: a kind set by hand is the answer.
+            try:
+                from . import subtitletitle as stt
+                tv = track_verdicts()
+                tr = {"yes": {"n": 0, "agree": 0}, "no": {"n": 0, "agree": 0}}
+                for r in (stt.cached().get("rows") or []):
+                    if not r.get("chosen"):
+                        continue
+                    v = tv.get((int(r["file_id"]), int(r["track"])))
+                    if not v:
+                        continue
+                    side = "no" if r.get("kind") in ("signs", "none") else "yes"
+                    tr[side]["n"] += 1
+                    tr[side]["agree"] += int((v["p"] >= 50) == (side == "yes"))
+                out["tracks"] = tr
+                out["tracks_judged"] = len(tv)
+                out["tracks_waiting"] = len(pending_tracks())
+            except Exception:                                    # noqa: BLE001
+                pass
             out["judged"] = cur.execute("SELECT COUNT(*) n FROM hardsub_qwen").fetchone()["n"]
             out["waiting"] = cur.execute(
                 "SELECT COUNT(*) n FROM hardsub h LEFT JOIN hardsub_qwen q ON q.file_id=h.file_id "
@@ -311,6 +394,64 @@ def _judge(limit: int) -> None:
     print(json.dumps({"judged": done}), flush=True)
 
 
+def _judge_tracks(tf: str, offset: int) -> None:
+    import subprocess as sp
+    from app.db import cursor
+    from app.jobs import _ffmpeg_exe
+    from app import qwenlib
+    try:
+        tracks = json.load(open(tf, encoding="utf-8"))
+    except Exception:                                            # noqa: BLE001
+        return
+    init_tracks()
+    users, keep = [], []
+    for i, t in enumerate(tracks):
+        print(json.dumps({"progress": offset + i, "total": offset + len(tracks),
+                          "file": os.path.basename(t["path"] or "")}), flush=True)
+        try:
+            raw = sp.run([_ffmpeg_exe(), "-v", "error", "-i", t["path"], "-map", f"0:{t['mkv_id']}",
+                          "-f", "srt", "-"], capture_output=True, timeout=180).stdout.decode("utf-8", "replace")
+        except Exception:                                        # noqa: BLE001
+            continue
+        lines = []
+        for b in re.split(r"\r?\n\s*\r?\n", raw.strip()):
+            L = [x for x in b.splitlines() if x.strip()]
+            k = next((j for j, x in enumerate(L) if "-->" in x), None)
+            if k is not None:
+                body = " ".join(re.sub(r"<[^>]+>|\{[^}]*\}", "", x) for x in L[k + 1:]).strip()
+                if body:
+                    lines.append(body[:120])
+        if not lines:
+            continue
+        step = max(1, len(lines) // 40)
+        sample = lines[::step][:40]
+        users.append(f"Track title: {t['title'] or '(none)'}\nFrom: {t['label']}\n"
+                     f"{len(lines)} lines in all; a sample in order:\n" + "\n".join(sample))
+        keep.append(t)
+    answers = qwenlib.ask_many(TRACK_SYS, users, max_len=80) if users else []
+    with cursor() as cur:
+        for t, a in zip(keep, answers):
+            c = re.search(r"CHANCE:\s*(\d{1,3})", a, re.I)
+            if not c:
+                continue
+            k = re.search(r"KIND:\s*(\w+)", a, re.I)
+            w = re.search(r"WHY:\s*(.+)", a, re.I | re.S)
+            # THE KIND IS THE ANSWER; THE NUMBER FOLLOWS IT. Measured on 30
+            # tracks set by hand: the kind matched 27, while the chance it
+            # gave beside it often did not match its own kind ("signs", 70%).
+            kind = (k.group(1).lower() if k else "")
+            p = max(0, min(100, int(c.group(1))))
+            p = (max(p, 75) if kind == "dialogue" else 45 if kind == "both"
+                 else min(p, 25) if kind in ("signs", "songs") else p)
+            cur.execute("INSERT INTO subtitle_qwen(file_id,track,size,dialogue_p,kind,why,at) "
+                        "VALUES(?,?,?,?,?,?,?) ON CONFLICT(file_id,track) DO UPDATE SET "
+                        "size=excluded.size, dialogue_p=excluded.dialogue_p, kind=excluded.kind, "
+                        "why=excluded.why, at=excluded.at",
+                        (t["file_id"], t["track"], t["size"], p, kind,
+                         (w.group(1).strip().splitlines()[0] if w else "")[:200], time.time()))
+    print(json.dumps({"tracks_judged": len(answers)}), flush=True)
+
+
 _ONLY: list = []
 
 if __name__ == "__main__":
@@ -318,9 +459,12 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--batch", type=int, default=BATCH)
     ap.add_argument("--ids", default="", help="judge exactly these file ids (testing)")
+    ap.add_argument("--tracks", default="", help="a JSON file of text tracks to judge as well")
     a = ap.parse_args()
     _ONLY = [int(x) for x in a.ids.split(",") if x.strip()]
     try:
         _judge(a.batch)
+        if a.tracks:
+            _judge_tracks(a.tracks, 0)
     except Exception as e:                                       # noqa: BLE001
         print(json.dumps({"judged": 0, "error": f"{type(e).__name__}: {e}"[:300]}), flush=True)

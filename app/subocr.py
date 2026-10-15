@@ -1272,6 +1272,64 @@ def ocr(sup: str, tick=None, base: float = 0.0, span: float = 1.0,
     return srt
 
 
+# ------------------------------------------------------- Qwen OCR repair --
+# OCR misreads characters - "l" for "I", "rn" for "m", a dropped apostrophe -
+# and those errors reach the screen. With this switched on, each converted
+# track goes through Qwen (in a child process, on the heavy lane) and a line
+# is replaced only when the correction is small: the same number of words,
+# each changed word a near-spelling of the one read. A line it wants to rewrite is left as the
+# OCR read it. OFF by default: it changes text people read, so it is turned
+# on by a person who has looked at the corrections below the switch.
+KV_QWEN_FIX = "subocr.qwen_fix"
+KV_QWEN_FIXES = "subocr.qwen_fixes"
+
+
+def qwen_fix_on() -> bool:
+    from .db import kv_get
+    return str(kv_get(KV_QWEN_FIX) or "0") == "1"
+
+
+def set_qwen_fix(on: bool) -> None:
+    from .db import kv_set
+    kv_set(KV_QWEN_FIX, "1" if on else "0")
+
+
+def qwen_fixes() -> list:
+    from .db import kv_get
+    try:
+        return json.loads(kv_get(KV_QWEN_FIXES) or "[]")
+    except Exception:                                            # noqa: BLE001
+        return []
+
+
+def qwen_fix(srt: str, name: str, force: bool = False) -> dict:
+    """Run one SRT through Qwen's repair in place. -> {lines, changed, examples}."""
+    import sys as _sys
+    from . import heavy
+    from .db import kv_set
+    got, holder = heavy.claim("Qwen OCR repair", ttl=900)
+    if not got:
+        return {"skipped": f"{holder} has the GPU lane"}
+    try:
+        out = srt + ".qwen"
+        r = subprocess.run([_sys.executable, "-m", "app.qwentools", "--fix-ocr", srt, out],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           timeout=900, creationflags=NO_WINDOW)
+    finally:
+        heavy.release("Qwen OCR repair")
+    res = {}
+    for ln in (r.stdout or "").splitlines():
+        try:
+            res = json.loads(ln).get("fixed") or res
+        except Exception:                                        # noqa: BLE001
+            pass
+    if res and os.path.exists(out):
+        os.replace(out, srt)
+        kv_set(KV_QWEN_FIXES, json.dumps(([{"at": time.time(), "file": name, **res}] + qwen_fixes())[:30]))
+    return res
+
+
 def clean(text: str) -> str:
     """Repair only the OCR mistakes that are unambiguous.
 
@@ -2040,6 +2098,14 @@ def run_one(path: str, probe: dict, work_root: str | None = None,
                 txt = clean(f.read())
             with open(srt, "w", encoding="utf-8") as f:
                 f.write(txt)
+            # QWEN REPAIRS WHAT THE OCR MISREAD - only when switched on, and
+            # only small corrections survive (see qwentools.fix_ocr).
+            if qwen_fix_on():
+                try:
+                    tick(base + span * 0.92, f"Qwen checking the OCR'd text{who}")
+                    qwen_fix(srt, os.path.basename(path))
+                except Exception as e:                           # noqa: BLE001
+                    notes.append(f"rel {t['rel']}: Qwen fix skipped - {type(e).__name__}")
             ok, why, got = validate(srt, t.get("cues"), t.get("minutes"),
                                     signs_ok=bool(t.get("signs_ok")))
             if not ok:

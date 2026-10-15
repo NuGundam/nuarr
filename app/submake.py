@@ -151,6 +151,69 @@ def _sidecar(path: str) -> str:
     return os.path.splitext(path)[0] + ".en.srt"
 
 
+_TEXT_CODECS = {"subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text", "microdvd"}
+_NOT_DIALOGUE = ("sign", "song", "forced", "karaoke", "op/ed", "commentary")
+
+
+def _lname(code: str) -> str:
+    try:
+        from .submake_worker import lang_plan
+        return lang_plan(code)["name"]
+    except Exception:                                            # noqa: BLE001
+        return code
+
+
+def text_source(r: dict) -> dict | None:
+    """A subtitle track in another language this file already has, as text.
+    -> {"spec": "stream:N" | "file:path", "lang", "what"} or None.
+
+    Inside the file first (ffprobe's stream index, which ffmpeg -map takes),
+    then files beside it. Picture tracks are not text; tracks titled signs,
+    songs or forced are not the dialogue; English and untagged are skipped -
+    English needs nothing, and untagged could be anything."""
+    import subprocess
+    from .jobs import _ffprobe_exe
+    try:
+        raw = subprocess.run([_ffprobe_exe(), "-v", "error", "-select_streams", "s",
+                              "-show_entries", "stream=index,codec_name:stream_tags=language,title:"
+                              "stream_disposition=forced", "-of", "json", r["path"]],
+                             capture_output=True, text=True, timeout=60,
+                             creationflags=NO_WINDOW).stdout
+        streams = json.loads(raw or "{}").get("streams") or []
+    except Exception:                                            # noqa: BLE001
+        streams = []
+    best = None
+    for st in streams:
+        lang = str((st.get("tags") or {}).get("language") or "").lower()
+        title = str((st.get("tags") or {}).get("title") or "").lower()
+        if (st.get("codec_name") or "").lower() not in _TEXT_CODECS:
+            continue
+        if lang in ("", "und", "eng", "en") or (st.get("disposition") or {}).get("forced"):
+            continue
+        if any(w in title for w in _NOT_DIALOGUE):
+            continue
+        best = best or {"spec": f"stream:{int(st['index'])}", "lang": lang,
+                        "what": f"the {_lname(lang)} subtitle track inside the file"}
+    if best:
+        return best
+    try:
+        from . import subembed
+        for side in subembed.sidecars_for(r["path"], fresh=True):
+            if not side.lower().endswith((".srt", ".ass", ".ssa", ".vtt")):
+                continue
+            nm = subembed.read_sidecar_name(r["path"], side)
+            lang = str(nm.get("lang") or "").lower()
+            if not nm.get("ok") or lang in ("", "und", "eng", "en"):
+                continue
+            if any(w in str(nm.get("role") or "").lower() for w in ("forced", "sdh")):
+                continue
+            return {"spec": f"file:{side}", "lang": lang,
+                    "what": f"the {_lname(lang)} subtitle file beside it ({os.path.basename(side)})"}
+    except Exception:                                            # noqa: BLE001
+        pass
+    return None
+
+
 def _lang_of(r: dict) -> str:
     langs = [x.strip() for x in str(r.get("audio_langs") or "").split(",") if x.strip()]
     for x in langs:
@@ -283,6 +346,14 @@ async def _one(file_id: int, overwrite: bool, by: str = "you") -> None:
     cmd = [sys.executable, "-m", "app.submake_worker", "--src", r["path"], "--out", tmp,
            "--lang", lang, "--title", film, "--duration", str(float(r["duration"] or 0)),
            "--data", str(DATA_DIR), "--ffmpeg", _ffmpeg_exe()] + (["--force"] if overwrite else [])
+    # TRANSLATE WHAT IS WRITTEN BEFORE LISTENING TO WHAT IS SAID. A text track
+    # in another language is a person's timing and a person's words; Whisper
+    # is the fallback for a file that has none.
+    src = await asyncio.to_thread(text_source, r)
+    if src:
+        cmd += ["--from-subs", src["spec"], "--sub-lang", src["lang"]]
+        STATE["note"] = "translating " + src["what"]
+        joblog.log(f"subtitle maker: {label} - translating {src['what']}", "info")
     global _PROC, _STOPPED
     _STOPPED = False
     p = await asyncio.create_subprocess_exec(*cmd, cwd=root, stdout=asyncio.subprocess.PIPE,
@@ -325,6 +396,7 @@ async def _one(file_id: int, overwrite: bool, by: str = "you") -> None:
     except OSError:
         pass
     row.update(ok=True, narration=end.get("narration", 0), onscreen=end.get("onscreen", 0),
+               translated=end.get("translated", 0), source=(src or {}).get("what", ""),
                sidecar=os.path.basename(side))
     # THE LIBRARY'S RULE DECIDES WHERE IT LIVES - see the module docstring.
     from . import subembed
@@ -346,8 +418,10 @@ async def _one(file_id: int, overwrite: bool, by: str = "you") -> None:
     else:
         row.update(where="sidecar", why=f"kept beside the file - {lib or 'this library'} does not embed sidecars")
     _remember(row)
-    joblog.log(f"subtitle maker: {label} - {row['narration']} spoken + {row['onscreen']} on-screen "
-               f"line(s), {row['why']}", "ok")
+    joblog.log(f"subtitle maker: {label} - "
+               + (f"{row['translated']} line(s) translated from {row['source']}" if row.get("translated")
+                  else f"{row['narration']} spoken + {row['onscreen']} on-screen line(s)")
+               + f", {row['why']}", "ok")
     try:
         from . import pushover
         if pushover.enabled():

@@ -1520,10 +1520,12 @@ def score_of(row) -> dict:
         if lo < r < hi:
             s = (1 - QWEN_WEIGHT) * r + QWEN_WEIGHT * p
             note = f" (in doubt by the rules, so it carries {int(QWEN_WEIGHT * 100)}% of this score)"
-        elif (r >= hi and p <= 15) or (r <= lo and p >= 85):
-            s = (lo + hi) / 2
-            note = " - strongly against the rules' answer, so this one is put to you"
         else:
+            # NOT EVEN WHEN IT STRONGLY DISAGREES. Measured on 148 answers:
+            # 48 of 48 dismissals agreed, but 29 of 100 real dialogue files
+            # were read as "not dialogue", some at 0-10% - old SDTV episodes
+            # where the reader gets a few garbled lines. Putting those back to
+            # a person would turn good files into questions.
             s = r
             note = " - the rules were already sure, so it does not move the score"
         return {"score": int(max(0, min(100, round(s)))), "why": d["why"] + "; " + said + note,

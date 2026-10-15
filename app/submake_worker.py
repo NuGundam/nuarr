@@ -400,6 +400,55 @@ def translate(lines, title, llm_dir, src_name="Japanese"):
     return out
 
 
+# ------------------------------------------------- from a subtitle track --
+# THE TEXT IS ALREADY THERE. A file whose only subtitles are Spanish, or
+# Chinese, over Japanese audio is a raw to an English speaker - but its
+# subtitles are timed by a person, and clean text. Translating them keeps every
+# cue's timing exactly and starts from what the subtitler wrote rather than
+# from what Whisper heard, so it is the maker's first choice whenever a
+# text track in another language exists.
+def _srt_parse(text):
+    cues = []
+    for b in re.split(r"\r?\n\s*\r?\n", text.strip()):
+        L = [x for x in b.splitlines() if x.strip()]
+        k = next((i for i, x in enumerate(L) if "-->" in x), None)
+        if k is None:
+            continue
+        a, z = [x.strip() for x in L[k].split("-->")[:2]]
+        body = " ".join(re.sub(r"<[^>]+>|\{[^}]*\}", "", x).strip() for x in L[k + 1:]).strip()
+        if body:
+            cues.append([a, z.split(" ")[0], body])
+    return cues
+
+
+def from_subs(src, spec, src_name, ffmpeg, out):
+    from app import qwenlib
+    say(stage="reading the subtitle track", pct=3)
+    if spec.startswith("stream:"):
+        cmd = [ffmpeg, "-v", "error", "-i", src, "-map", "0:" + spec.split(":", 1)[1], "-f", "srt", "-"]
+    else:
+        cmd = [ffmpeg, "-v", "error", "-i", spec.split(":", 1)[1], "-f", "srt", "-"]
+    raw = subprocess.run(cmd, capture_output=True).stdout.decode("utf-8", "replace")
+    cues = _srt_parse(raw)
+    if not cues:
+        say(error="the subtitle track could not be read")
+        return
+    say(stage="loading the translator", pct=10, note=f"{len(cues)} lines")
+    sysm = (f"You are a {src_name}-to-English subtitle translator. Translate each numbered "
+            f"{src_name} subtitle line into natural, short ENGLISH subtitles. Keep names as they are. "
+            f"Reply in English only, with exactly the same numbered lines and nothing else.")
+    words = qwenlib.numbered(sysm, [c[2] for c in cues], batch=40, check=qwenlib.english,
+                             on_batch=lambda d, t: say(stage="translating the subtitles",
+                                                       pct=12 + 83 * d / t, note=f"{d} of {t} lines"))
+    keep = [(a, z, w) for (a, z, _t), w in zip(cues, words) if w]
+    say(stage="writing", pct=96)
+    tmp = out + ".part"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("\n\n".join(f"{i + 1}\n{a} --> {z}\n{w}" for i, (a, z, w) in enumerate(keep)) + "\n")
+    os.replace(tmp, out)
+    say(done=True, narration=0, onscreen=0, translated=len(keep), dropped=len(cues) - len(keep))
+
+
 # ---------------------------------------------------------------- main ----
 def main():
     ap = argparse.ArgumentParser()
@@ -415,10 +464,18 @@ def main():
     ap.add_argument("--burned-only", action="store_true", help="only answer the burned-in check")
     ap.add_argument("--llm-test", action="store_true", help="translate a few sample lines")
     ap.add_argument("--llm-fetch", action="store_true", help="download the translation model")
+    ap.add_argument("--from-subs", default="", help="stream:N or file:path - translate this track")
+    ap.add_argument("--sub-lang", default="", help="the language of --from-subs")
     a = ap.parse_args()
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from app import audiolang
     audiolang._add_cuda_dirs()
+    if a.from_subs:
+        try:
+            from_subs(a.src, a.from_subs, lang_plan(a.sub_lang)["name"], a.ffmpeg, a.out)
+        except Exception as e:                                   # noqa: BLE001
+            say(error=f"{type(e).__name__}: {e}"[:300])
+        return
     if a.llm_test or a.llm_fetch:
         llm_dir = os.path.join(a.data, "llm", "qwen2.5-7b-instruct-ct2-int8")
         try:

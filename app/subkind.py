@@ -163,9 +163,28 @@ def _track_rows(limit: int) -> list:
     from . import subtitletitle as stt
     d = stt.cached()
     out = []
+    try:
+        from . import hardsub, qwenjudge
+        qv, q_on = qwenjudge.track_verdicts(), hardsub.qwen_on()
+        lo, hi = hardsub.dismiss_at(), hardsub.mark_at()
+    except Exception:                                            # noqa: BLE001
+        qv, q_on, lo, hi = {}, False, 30, 85
     for r in (d.get("rows") or [])[:limit]:
         unread = bool(r.get("unread"))
         score = 0 if unread else int(r.get("sure") or 0)
+        # QWEN READ THE LINES. Said in the reason always; when the switch on
+        # the scoring panel is on it moves the score the way it does for a
+        # picture - only where the rules were in doubt; a confident rule
+        # stands (see hardsub.score_of for the measurement).
+        qnote = ""
+        q = qv.get((int(r["file_id"]), int(r["track"])))
+        if q and not unread:
+            agree = q["p"] if (r.get("kind") or "") in ("dialogue", "hybrid") else 100 - q["p"]
+            qnote = (f"; Qwen read the lines and puts dialogue at {q['p']}%"
+                     + (f" ({q['kind']})" if q["kind"] else "") + (f" - {q['why']}" if q["why"] else ""))
+            if q_on and not r.get("chosen"):
+                if lo < score < hi:
+                    score = int(round(0.3 * score + 0.7 * agree))
         rewritable = bool(r.get("rewritable"))
         settled = bool(r.get("settled"))
         acked = bool(r.get("acked"))
@@ -203,7 +222,7 @@ def _track_rows(limit: int) -> list:
             "evidence": f"{r.get('cues') or 0} cues · {r.get('cpm') or 0}/min",
             "plain_rate": r.get("rate") or 0,
             "shape": r.get("shape") or "",
-            "why": r.get("kind_why") or r.get("why") or "",
+            "why": (r.get("kind_why") or r.get("why") or "") + qnote,
             "auto": auto, "auto_why": auto_why,
             "title_old": r.get("old") or "", "title_new": r.get("new") or "",
             # THE FLAG IS PART OF THE CORRECTION, so the row says so before
