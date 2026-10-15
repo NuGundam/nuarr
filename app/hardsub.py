@@ -92,7 +92,12 @@ SAMPLES = 24
 # the first two". Costs one ffmpeg grab and one OCR call per extra frame, and
 # only on files that carry text at all - 772 of 3,941 sampled here.
 CONFIRM = 4
-CONFIRM_MAX = 12
+CONFIRM_MAX = 24
+# 12 WAS NOT ENOUGH, because the candidates are offered brightest first and the
+# brightest frames are not always captions. Case Closed OVA 09: the top seven
+# by bright pixels (1,600-3,500) were lit scenes the OCR read as "aie _ ee ie
+# e RO", "7", "Ww Nt"; the captions sat at 900-1,300 and only began at the
+# eighth. With every lit frame allowed, an unanswered question reads them all.
 # The caption band. Measured against the City Hunter frames, where the yellow
 # dialogue sits about four fifths of the way down.
 LOW_BAND = "crop=iw:ih/3:0:ih*2/3"
@@ -133,6 +138,10 @@ MIN_CHARS = 6
 #   5  reading more words made the credit-roll veto too strict: any single
 #      credit word voided the read, and "assistant" is one. It is a
 #      fraction now, like the junk test beside it.
+#   8  a caption is recognised by its SHAPE as well as its words, and the
+#      search may read every lit frame. OVA 09 said "none" over 20 of 24
+#      frames of English: "Conan-kun!", "Exactly!", "Hey, lunchtime." carry
+#      no function word, and the reader stopped before reaching most of them.
 #   6  the OCR is whichever engine the install is set to. It was Tesseract,
 #      hardcoded, while every library was set to PaddleOCR - and Paddle
 #      refuses noise Tesseract invents, so the verdicts can differ.
@@ -147,7 +156,7 @@ MIN_CHARS = 6
 #      "undecided", which is the whole reason it cannot decide: median words
 #      stored ZERO, against eleven frames of twenty-four carrying marks. A
 #      revision that does not move is a library that never hears the news.
-READER_REV = 7
+READER_REV = 8
 
 # BELOW THIS A BAND IS BLANK, whatever the font. MIN_PX is a guess about how
 # many pixels a CAPTION makes; this is the far weaker claim that something is
@@ -469,6 +478,38 @@ def _tesseract() -> str:
 
 
 _WORD = re.compile(r"[A-Za-z]{3,}")
+
+
+# A LINE OF SUBTITLE, BY ITS SHAPE. Short spoken lines - "Conan-kun!",
+# "Exactly!", "Hey, lunchtime." - carry none of the function words the read
+# otherwise needs, and an episode of them was judged a title card. What they
+# do have is the look of a typeset line: almost nothing but letters, spaces
+# and sentence punctuation, a real word in it, and a capital at the start or
+# punctuation at the end. OCR junk over artwork ("aie _ ee ie e RO", "Ww Nt",
+# "jv ou") fails on one of those. One such frame proves nothing - a sign has
+# the same shape - so it takes CAPTION_FRAMES of them, at caption height.
+_CAP_OK = re.compile(r"[A-Za-z\s.,!?'\u2019\-\u2026\u2014\"]")
+CAPTION_FRAMES = 3
+
+
+def _caption_line(text: str) -> bool:
+    for ln in (text or "").splitlines():
+        t = ln.strip()
+        if len(t) < 4:
+            continue
+        good = len(_CAP_OK.findall(t))
+        if good < len(t) * 0.9:
+            continue
+        if not re.search(r"[A-Za-z]{3,}", t):
+            continue
+        # most of its letters are in real words: "gt TOLM WO es." has the
+        # shape but only 4 of its 10 letters are; "I'm so tired." has 5 of 9
+        toks = re.findall(r"[A-Za-z]+", t)
+        if sum(len(x) for x in toks if len(x) >= 3) < sum(len(x) for x in toks) * 0.5:
+            continue
+        if t[0].isupper() or t[-1] in "!?.\u2026":
+            return True
+    return False
 
 
 # ---- THE OCR, WHICHEVER ONE THE INSTALL IS SET TO ------------------------
@@ -798,11 +839,17 @@ def probe_one(file_id: int, samples: int = SAMPLES,
     lit: list = []                       # brightness of frames that held words
     _shown = cand[:max(0, reach)]
     _eng = _engine_name(ocr_engine())
+    cap_frames = 0                       # frames holding a subtitle-shaped line
     for _i, (t, _c) in enumerate(_shown, 1):
         _say(f"reading frame {_i} of {len(_shown)} \u00b7 {_eng}",
              55.0 + 33.0 * (_i - 1) / max(1, len(_shown)))
-        got = [w.lower() for w in _words(_read_text(path, t, LOW_BAND))
-               if len(w) >= 3]
+        _txt = _read_text(path, t, LOW_BAND)
+        got = [w.lower() for w in _words(_txt) if len(w) >= 3]
+        if got and _caption_line(_txt):
+            cap_frames += 1
+            text_frames += 1 if len(got) < 2 else 0
+            words.extend(got if len(got) < 2 else [])
+            lit.append(_c)
         # TWO REAL WORDS IN ONE FRAME, not two glyphs across four frames.
         # "uce, wee" cleared the old character-count bar and is not language.
         if len(got) >= 2:
@@ -819,7 +866,7 @@ def probe_one(file_id: int, samples: int = SAMPLES,
         # nothing more to learn from a third frame. Without one, the search
         # keeps going while there are candidates, up to CONFIRM_MAX, because
         # only a thorough look makes an empty result mean anything.
-        if _FUNCTION & set(words):
+        if _FUNCTION & set(words) or cap_frames >= CAPTION_FRAMES:
             if text_frames >= MIN_TEXT_FRAMES:
                 break
         elif _i >= max(0, confirm) and text_frames >= MIN_TEXT_FRAMES \
@@ -944,9 +991,11 @@ def probe_one(file_id: int, samples: int = SAMPLES,
     # easily while a line of speech that happens to mention a producer does
     # not.
     credit_roll = bool(uniq) and len(credits) >= max(2, len(uniq) * 0.34)
+    # Speech is a function word, or enough frames of subtitle-shaped lines.
     confirmed = (text_frames >= MIN_TEXT_FRAMES
                  and sum(len(w) for w in uniq) >= MIN_CHARS
-                 and bool(speech) and not credit_roll
+                 and (bool(speech) or cap_frames >= CAPTION_FRAMES)
+                 and not credit_roll
                  and not seen_before and not mostly_junk)
 
     if not confirmed:
