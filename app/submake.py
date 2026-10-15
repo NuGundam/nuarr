@@ -361,6 +361,111 @@ def as_running() -> list:
     }]
 
 
+# ------------------------------------------------------------- the models --
+LLM_REPO = "jncraton/Qwen2.5-7B-Instruct-ct2-int8"
+LLM_DIR = os.path.join(str(DATA_DIR), "llm", "qwen2.5-7b-instruct-ct2-int8")
+WHISPER_LARGE_DIR = os.path.join(str(DATA_DIR), "whisper", "models--Systran--faster-whisper-large-v3")
+# NLLB-200 was tried first and could not read hiragana (see submake_worker's
+# docstring). Its download stayed behind; it is offered for removal, never used.
+NLLB_DIR = os.path.join(str(DATA_DIR), "nllb")
+LLM_STATE: dict = {"busy": "", "result": None, "error": "", "at": 0.0}
+
+
+def _dir_size(p: str) -> int:
+    # Each file once: the Hugging Face cache links the same blob under both
+    # blobs/ and snapshots/, and adding both doubled large-v3 to 6.2 GB.
+    n, seen = 0, set()
+    for root, _d, files in os.walk(p):
+        for f in files:
+            try:
+                st = os.stat(os.path.join(root, f))
+            except OSError:
+                continue
+            key = (st.st_dev, st.st_ino)
+            if st.st_ino and key in seen:
+                continue
+            seen.add(key)
+            n += st.st_size
+    return n
+
+
+def _last_use(kind: str) -> float:
+    """When a made file last used this model: Whisper for any made file,
+    Qwen only for one that had on-screen text to translate."""
+    for r in _recent():
+        if r.get("ok") and (kind == "whisper" or (r.get("onscreen") or 0) > 0):
+            return float(r.get("at") or 0)
+    return 0.0
+
+
+def models_info() -> dict:
+    try:
+        import ctranslate2
+        ct2, cuda = ctranslate2.__version__, ctranslate2.get_cuda_device_count()
+    except Exception as e:                                       # noqa: BLE001
+        ct2, cuda = f"not importable: {type(e).__name__}", 0
+    llm_ok = os.path.exists(os.path.join(LLM_DIR, "model.bin"))
+    wl_ok = os.path.isdir(WHISPER_LARGE_DIR)
+    return {
+        "llm": {"repo": LLM_REPO, "name": "Qwen2.5-7B-Instruct", "quant": "int8 (CTranslate2)",
+                "path": LLM_DIR, "present": llm_ok,
+                "size": _dir_size(LLM_DIR) if llm_ok else 0,
+                "tokenizer": os.path.exists(os.path.join(LLM_DIR, "tokenizer.json")),
+                "ctranslate2": ct2, "cuda_devices": cuda,
+                "compute": "int8_float16 on the GPU" if cuda else "int8 on the CPU",
+                "last_used": _last_use("llm")},
+        "whisper_large": {"name": "large-v3", "path": WHISPER_LARGE_DIR, "present": wl_ok,
+                          "size": _dir_size(WHISPER_LARGE_DIR) if wl_ok else 0,
+                          "last_used": _last_use("whisper")},
+        "nllb": {"path": NLLB_DIR, "present": os.path.isdir(NLLB_DIR),
+                 "size": _dir_size(NLLB_DIR) if os.path.isdir(NLLB_DIR) else 0},
+        "state": dict(LLM_STATE),
+        "lane": heavy.state(),
+    }
+
+
+def remove_nllb() -> dict:
+    import shutil
+    if not os.path.isdir(NLLB_DIR):
+        return {"ok": True, "freed": 0}
+    n = _dir_size(NLLB_DIR)
+    shutil.rmtree(NLLB_DIR, ignore_errors=True)
+    joblog.log(f"removed the unused NLLB translation model ({n / 1e9:.1f} GB)", "info")
+    return {"ok": not os.path.isdir(NLLB_DIR), "freed": n}
+
+
+async def llm_job(what: str) -> None:
+    """'test' translates a few lines; 'fetch' downloads the model. Both in a
+    worker process, on the heavy lane, so neither can collide with a run."""
+    got, holder = heavy.claim(f"Qwen {what}", ttl=3600)
+    if not got:
+        LLM_STATE.update(error=f"{holder} is using the GPU lane - try when it finishes", busy="")
+        return
+    LLM_STATE.update(busy=what, result=None, error="", at=time.time())
+    try:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        p = await asyncio.create_subprocess_exec(
+            sys.executable, "-m", "app.submake_worker", "--src", "-", "--out", "-",
+            "--data", str(DATA_DIR), "--ffmpeg", "-", f"--llm-{what}", cwd=root,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+            creationflags=NO_WINDOW)
+        out, _ = await p.communicate()
+        for ln in out.decode("utf-8", "replace").splitlines():
+            try:
+                d = json.loads(ln)
+            except Exception:                                    # noqa: BLE001
+                continue
+            if "llm" in d:
+                LLM_STATE["result"] = d["llm"]
+            if d.get("error"):
+                LLM_STATE["error"] = d["error"]
+        if p.returncode and not LLM_STATE["result"] and not LLM_STATE["error"]:
+            LLM_STATE["error"] = f"the worker stopped (exit {p.returncode})"
+    finally:
+        LLM_STATE["busy"] = ""
+        heavy.release(f"Qwen {what}")
+
+
 def snapshot() -> dict:
     q = _queue()
     rows = []

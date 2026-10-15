@@ -63,7 +63,9 @@ LANGS = {
 
 
 def say(**k):
-    print(json.dumps(k, ensure_ascii=False), flush=True)
+    # ASCII on the wire: the pipe is the console code page under the service,
+    # and a Japanese line in a test result raised UnicodeEncodeError there.
+    print(json.dumps(k, ensure_ascii=True), flush=True)
 
 
 def ts(t):
@@ -285,9 +287,13 @@ def translate(lines, title, llm_dir):
         g = ctranslate2.Generator(llm_dir, device="cuda", compute_type="int8_float16")
     except Exception:                                            # noqa: BLE001
         g = ctranslate2.Generator(llm_dir, device="cpu", compute_type="int8")
-    sysm = ("You translate on-screen text from a film into natural English subtitles. "
-            "Children's films write mostly in hiragana; read it in context. Keep each line short. "
-            "Reply with exactly the same numbered lines, translated, and nothing else.")
+    # ENGLISH, SAID TWICE. "into natural English subtitles" alone let Qwen
+    # answer in Chinese when the film title gave it little to go on - the
+    # test on the Qwen page came back 天上的国家？ for くものうえのくに？.
+    sysm = ("You are a Japanese-to-English subtitle translator. Translate each numbered "
+            "Japanese line into natural ENGLISH. Children's films write mostly in hiragana; "
+            "read it in context. Keep each line short. Reply in English only - never in "
+            "Chinese or Japanese - with exactly the same numbered lines and nothing else.")
     out = [None] * len(lines)
     B = 40
     for i in range(0, len(lines), B):
@@ -303,6 +309,20 @@ def translate(lines, title, llm_dir):
                 out[i + int(m.group(1)) - 1] = m.group(2).strip()
         say(stage="translating the on-screen text", pct=78 + 17 * min(1, (i + B) / len(lines)),
             note=f"{min(len(lines), i + B)} of {len(lines)} lines")
+    # A LINE THAT DID NOT COME BACK IN ENGLISH is asked again on its own, more
+    # bluntly; if it still is not English it is dropped rather than shown.
+    def english(t):
+        return bool(t) and bool(re.search(r"[A-Za-z]", t)) and not re.search(r"[぀-ヿ一-鿿]", t)
+    for k, t in enumerate(out):
+        if english(t):
+            continue
+        prompt = ("<|im_start|>system\nTranslate the Japanese text into English. Reply with the "
+                  "English translation only.<|im_end|>\n<|im_start|>user\n"
+                  f"{lines[k]}<|im_end|>\n<|im_start|>assistant\n")
+        r = g.generate_batch([tok.encode(prompt).tokens], max_length=64, sampling_topk=1,
+                             include_prompt_in_result=False, end_token="<|im_end|>")
+        t2 = tok.decode(r[0].sequences_ids[0]).strip().splitlines()
+        out[k] = t2[0].strip() if t2 and english(t2[0]) else None
     del g
     gc.collect()
     return out
@@ -321,10 +341,30 @@ def main():
     ap.add_argument("--no-ocr", action="store_true")
     ap.add_argument("--force", action="store_true", help="make them even if English is burned in")
     ap.add_argument("--burned-only", action="store_true", help="only answer the burned-in check")
+    ap.add_argument("--llm-test", action="store_true", help="translate a few sample lines")
+    ap.add_argument("--llm-fetch", action="store_true", help="download the translation model")
     a = ap.parse_args()
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from app import audiolang
     audiolang._add_cuda_dirs()
+    if a.llm_test or a.llm_fetch:
+        llm_dir = os.path.join(a.data, "llm", "qwen2.5-7b-instruct-ct2-int8")
+        try:
+            if a.llm_fetch:
+                from huggingface_hub import snapshot_download
+                snapshot_download(LLM_REPO, local_dir=llm_dir)
+                say(llm={"fetched": True})
+                return
+            # Hiragana on purpose: it is what an ordinary translator fails on.
+            src = ["くものうえのくに？", "あめがやまないと", "くにがなくなっちゃう？",
+                   "みずのしんでんにいこう！", "だまっていてごめんなさい……"]
+            t0 = time.time()
+            got = translate(src, "a children's anime film", llm_dir)
+            say(llm={"pairs": [[x, y or ""] for x, y in zip(src, got)],
+                     "secs": round(time.time() - t0, 1)})
+        except Exception as e:                                   # noqa: BLE001
+            say(error=f"{type(e).__name__}: {e}"[:300])
+        return
     wlang, plang, script = LANGS.get(a.lang, (a.lang[:2], "", ""))
     t0 = time.time()
     try:

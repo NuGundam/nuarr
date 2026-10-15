@@ -5206,9 +5206,42 @@ async def api_encoders(force: int = 0):
 
 @app.get("/api/whisper")
 def api_whisper():
-    """What the language identifier is, and whether it can actually run."""
+    """What the language identifier is, and whether it can actually run -
+    and the Subtitle maker's larger model beside it."""
     from . import audiolang as _al
-    return _al.info()
+    d = _al.info()
+    try:
+        from . import submake
+        d["large"] = submake.models_info()["whisper_large"]
+    except Exception:                                    # noqa: BLE001
+        d["large"] = {}
+    return d
+
+
+@app.get("/api/qwen")
+def api_qwen():
+    from . import submake
+    return submake.models_info()
+
+
+@app.post("/api/qwen/test")
+async def api_qwen_test():
+    from . import submake
+    asyncio.create_task(submake.llm_job("test"))
+    return {"started": True}
+
+
+@app.post("/api/qwen/fetch")
+async def api_qwen_fetch():
+    from . import submake
+    asyncio.create_task(submake.llm_job("fetch"))
+    return {"started": True}
+
+
+@app.post("/api/qwen/remove-nllb")
+def api_qwen_remove_nllb():
+    from . import submake
+    return submake.remove_nllb()
 
 
 @app.post("/api/whisper/check")
@@ -28984,7 +29017,7 @@ const PANE_OF = {ffmpeg:'ffPane', backup:'bkPane',  rules:'rulesPane',
                  lang:'langPane', libs:'libPane',
                  vcodec:'vcodecPane', acodec:'acodecPane',
                  alang:'alangPane', cache:'cachePane',
-                 whisper:'whisperPane', plex:'plexPane',
+                 whisper:'whisperPane', qwen:'qwenPane', plex:'plexPane',
                  tautulli:'tautPane',
                  pushover:'pushoverPane',
                  ocr:'ocrPane', plexwork:'plexworkPane', ruleschk:'ruleschkPane',
@@ -29293,6 +29326,11 @@ function wtab(which){
   if(which==='whisper'){
     if(hint) hint.textContent='· whisper';
     paneLoad('whisper', loadWhisper);
+    return;
+  }
+  if(which==='qwen'){
+    if(hint) hint.textContent='· qwen';
+    paneLoad('qwen', loadQwen);
     return;
   }
   if(which==='plex'){
@@ -37022,6 +37060,75 @@ function etPaint(el,d){
   el.innerHTML=h;
 }
 
+// ---- Qwen: the Subtitle maker's translator -------------------------------
+let _qw=null, _qwPoll=null;
+async function loadQwen(){
+  const el=document.getElementById('qwenBody'); if(!el) return;
+  try{ _qw=await (await fetch('/api/qwen')).json(); }
+  catch(e){ el.innerHTML='<div class="dim" style="padding:14px">could not load</div>'; return; }
+  const q=_qw.llm||{}, st=_qw.state||{}, nl=_qw.nllb||{};
+  const gb=n=>(n/1073741824).toFixed(1)+' GB';
+  const row=(k,v,why)=>`<tr style="border-top:1px solid var(--line)"><td style="padding:5px 12px;white-space:nowrap">${k}</td>
+    <td class="mono" style="font-size:11.5px">${v}</td><td class="dim" style="font-size:11px;padding-right:12px">${why||''}</td></tr>`;
+  const head=!q.present?['not downloaded - the Subtitle maker fetches it on its first file with text on screen','#e2b341']
+    : q.cuda_devices?['downloaded and using the GPU','#7fd4a3']:['downloaded, running on the CPU (slow)','#e2b341'];
+  const res=st.result&&st.result.pairs?`<table style="width:100%;font-size:12px;border-collapse:collapse;margin-top:6px">
+      ${st.result.pairs.map(p=>`<tr style="border-top:1px solid var(--line)"><td class="mono" style="padding:4px 12px;width:40%">${esc(p[0])}</td>
+        <td style="color:#7fd4a3">${esc(p[1]||'—')}</td></tr>`).join('')}</table>
+      <div class="dim" style="font-size:11px;margin-top:4px">${esc(String(st.result.secs))} s, including loading the model</div>`
+    : st.result&&st.result.fetched?'<div style="color:#7fd4a3;font-size:11.5px;margin-top:6px">downloaded</div>':'';
+  el.innerHTML=`
+    <div class="lkind" style="padding:11px 12px;margin-bottom:10px">
+      <div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px">
+        <b style="color:#79c0ff">Translator</b><span style="color:${head[1]};font-size:12px">${esc(head[0])}</span></div>
+      <div style="margin-top:7px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        ${q.present?`<button onclick="qwenRun('test',this)" ${st.busy?'disabled':''} title="Load the model and translate five lines of hiragana - the kind of text an ordinary translator gets wrong. Takes about half a minute, on the same lane as the other heavy GPU jobs.">${st.busy==='test'?'translating…':'Test translation'}</button>`
+          :`<button onclick="qwenRun('fetch',this)" ${st.busy?'disabled':''}>${st.busy==='fetch'?'downloading… (7 GB)':'Download now (7 GB)'}</button>`}
+        ${st.error?`<span style="color:#e0575b;font-size:11.5px">${esc(st.error)}</span>`:''}
+      </div>${res}
+    </div>
+    <div class="lkind"><div class="lkindhead"><b style="color:#79c0ff">What is installed</b></div>
+      <table style="width:100%;font-size:12px;border-collapse:collapse">
+        ${row('model', esc(q.name||''), 'a language model, used here only to translate')}
+        ${row('build', esc(q.quant||''), 'pre-converted, so nothing is compiled or converted on this machine')}
+        ${row('downloaded', q.present?gb(q.size||0):'not yet', q.present?'kept with Nuarr&rsquo;s other managed files':'about 7 GB')}
+        ${row('tokenizer', q.tokenizer?'present':'missing', 'read by the tokenizers package that is already installed for Whisper')}
+        ${row('CTranslate2', esc(q.ctranslate2||'—'), 'the same inference engine Whisper runs on')}
+        ${row('runs as', esc(q.compute||''), 'loaded only while a file is being made, in its own process')}
+      </table></div>
+    <div class="lkind" style="margin-top:10px"><div class="lkindhead"><b style="color:#79c0ff">What it is for</b></div>
+      <div style="font-size:11.5px;padding:8px 12px">The Subtitle maker reads text on screen with PaddleOCR - signs, title
+        cards, and in some films every line of dialogue - and this turns it into English. Children&rsquo;s films write almost
+        everything in hiragana, which a translation model trained on ordinary sentences cannot read: NLLB-200 turned
+        <span class="mono">あめがやまないと</span> (&ldquo;if the rain doesn&rsquo;t stop&rdquo;) into &ldquo;I have to stop&rdquo;.
+        A language model reads it in context, so the lines go to it in numbered batches with the film&rsquo;s title.
+        What is <i>said</i> is translated by Whisper, not by this.
+        <div class="dim" style="margin-top:5px">last used ${q.last_used?esc(ago(q.last_used)):'not yet'} · the results are on the
+          Subtitle maker panel, Subtitles page</div></div></div>
+    <div class="lkind" style="margin-top:10px"><div class="lkindhead"><b style="color:#79c0ff">Where everything is</b></div>
+      <table style="width:100%;font-size:12px;border-collapse:collapse">
+        ${row(`<span style="color:${q.present?'#7fd4a3':'#e2b341'}">${q.present?'✓':'…'}</span> model`, esc(q.path||''), esc(q.repo||''))}
+        ${nl.present?row('<span style="color:#e2b341">!</span> NLLB-200 (unused)', esc(nl.path), `${gb(nl.size||0)} - tried first and replaced by this; nothing reads it
+            <button class="rmb" style="margin-left:6px" onclick="qwenRemoveNllb(this)">Remove</button>`):''}
+      </table></div>
+    <div class="lkind" style="margin-top:10px"><div class="lkindhead"><b style="color:#79c0ff">Upstream</b></div>
+      <table style="width:100%;font-size:12px;border-collapse:collapse">
+        ${row('Qwen2.5', 'the model, by the Qwen team at Alibaba', '<a href="https://huggingface.co/Qwen/Qwen2.5-7B-Instruct" target="_blank" rel="noopener noreferrer" class="mono">huggingface.co/Qwen/Qwen2.5-7B-Instruct</a>')}
+        ${row('this build', 'converted to CTranslate2, int8', `<a href="https://huggingface.co/${esc(q.repo||'')}" target="_blank" rel="noopener noreferrer" class="mono">huggingface.co/${esc(q.repo||'')}</a>`)}
+      </table></div>`;
+  if(_qwPoll) clearTimeout(_qwPoll);
+  if(st.busy) _qwPoll=setTimeout(loadQwen, 2500);
+}
+async function qwenRun(what, btn){
+  btn.disabled=true;
+  try{ await fetch('/api/qwen/'+what,{method:'POST'}); }catch(e){}
+  setTimeout(loadQwen, 800);
+}
+async function qwenRemoveNllb(btn){
+  btn.disabled=true; btn.textContent='removing…';
+  try{ await fetch('/api/qwen/remove-nllb',{method:'POST'}); }catch(e){}
+  loadQwen();
+}
 async function loadWhisper(){
   const el=document.getElementById('whisperBody');
   if(!el) return;
@@ -37162,6 +37269,22 @@ async function loadWhisper(){
               'set per library on the Audio codec tab')}
       </table>
     </div>
+
+    <div class="lkind" style="margin-top:10px">
+      <div class="lkindhead"><b style="color:#79c0ff">Subtitle maker model</b>
+        <span class="dim">the transcriber - a second, larger model, used only by the Subtitle maker</span></div>
+      <table style="width:100%;font-size:12px;border-collapse:collapse">
+        ${row('size', (w.large||{}).name||'large-v3', 'translates what is said into English; the small one above could not')}
+        ${row('downloaded', (w.large||{}).present ? ((w.large.size||0)/1073741824).toFixed(1)+' GB' : 'not yet',
+              (w.large||{}).present ? 'kept with Nuarr&rsquo;s other managed files' : 'fetched the first time the Subtitle maker runs')}
+        ${row('loaded now', 'only while a file is being made',
+              'it runs in its own process, which exits when the file is done - the VRAM is never held')}
+        ${row('timing', 'voice detector',
+              'lines start and end where the voice does; Whisper&rsquo;s own timestamps drifted up to 14 s')}
+        ${row('last used', (w.large||{}).last_used ? ago(w.large.last_used) : 'not yet',
+              'see the Subtitle maker panel on the Subtitles page')}
+      </table>
+    </div>
     ${w.last_error?`<div class="lkind" style="margin-top:10px;padding:11px 12px">
        <b style="color:#e2b341">Last load error</b>
        <div class="mono dim" style="font-size:11px;margin-top:4px">${esc(w.last_error)}</div>
@@ -37172,7 +37295,8 @@ async function loadWhisper(){
         <span class="dim">resolved live — for when detection stops working and
           the log does not say why</span></div>
       <table style="width:100%;font-size:12px;border-collapse:collapse">
-        ${(w.paths||[]).map(p=>`<tr style="border-top:1px solid var(--line)">
+        ${(w.paths||[]).concat((w.large||{}).path?[{what:'Model · Subtitle maker', path:w.large.path,
+            ok:!!w.large.present, pending:!w.large.present, note:'large-v3, in nuarr\'s folder'}]:[]).map(p=>`<tr style="border-top:1px solid var(--line)">
           <td style="padding:5px 12px;white-space:nowrap">
             <span style="color:${p.ok?'#7fd4a3':p.pending?'#e2b341':'#e0575b'}"
               >${p.ok?'✓':p.pending?'…':'✗'}</span>
@@ -48231,6 +48355,7 @@ _SETTINGS_NAV = [
     ("Tools",      [("ffmpeg",  "ffmpeg",          "film"),
                     ("mkv",     "MKVToolNix",      "tool"),
                     ("whisper", "Whisper",         "language"),
+                    ("qwen",    "Qwen",            "language"),
                     ("ocr",     "OCR engines",     "language")]),
     ("Integrations", [("arrs", "Arrs",             "link"),
                       ("plex", "Plex",             "play"),
@@ -48601,9 +48726,9 @@ html.mobile .setwrap:not(.rail) .setmain,html.mobile .setwrap:not(.rail) #worker
    here - the sections rendered as bare text with no card around them. Repeated
    rather than re-scoped, because widening the language selectors would change
    that page too, and it is not the one being edited. */
-#vcodecPane .lkind,#acodecPane .lkind,#alangPane .lkind,#cachePane .lkind,#whisperPane .lkind,#ocrPane .lkind{border:1px solid var(--line);
+#vcodecPane .lkind,#acodecPane .lkind,#alangPane .lkind,#cachePane .lkind,#whisperPane .lkind,#qwenPane .lkind,#ocrPane .lkind{border:1px solid var(--line);
   border-radius:8px;margin-top:10px}
-#vcodecPane .lkindhead,#acodecPane .lkindhead,#alangPane .lkindhead,#cachePane .lkindhead,#whisperPane .lkindhead,#ocrPane .lkindhead{padding:7px 12px;
+#vcodecPane .lkindhead,#acodecPane .lkindhead,#alangPane .lkindhead,#cachePane .lkindhead,#whisperPane .lkindhead,#qwenPane .lkindhead,#ocrPane .lkindhead{padding:7px 12px;
   border-bottom:1px solid var(--line);background:rgba(255,255,255,.02);
   font-weight:500;font-size:12.5px;display:flex;gap:10px;align-items:baseline;
   border-radius:8px 8px 0 0}
