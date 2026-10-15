@@ -96,6 +96,8 @@ async def run() -> str:
             err = d.get("error", err)
         await p.wait()
         _PROC = None
+        if n:
+            STATE["secs_each"] = (time.time() - STATE["started"]) / n
         res = f"judged {n} file(s)" + (f" - {err}" if err else "")
         STATE.update(judged=STATE["judged"] + n, error=err)
         if n:
@@ -114,6 +116,11 @@ async def run() -> str:
 async def watch() -> None:
     await asyncio.sleep(240)
     while True:
+        if paused():
+            STATE["last_result"] = "paused on the Concurrency page"
+            STATE["next_run"] = time.time() + POLL_S
+            await asyncio.sleep(POLL_S)
+            continue
         try:
             STATE["last_result"] = await run()
         except Exception as e:                                   # noqa: BLE001
@@ -157,6 +164,36 @@ def agreement() -> dict:
     except Exception as e:                                       # noqa: BLE001
         out["error"] = f"{type(e).__name__}: {e}"
     return out
+
+
+KV_PAUSED = "qwenjudge.paused"
+
+
+def paused() -> bool:
+    from .db import kv_get
+    return str(kv_get(KV_PAUSED) or "0") == "1"
+
+
+def set_paused(on: bool) -> None:
+    from .db import kv_set
+    kv_set(KV_PAUSED, "1" if on else "0")
+
+
+def cost() -> dict:
+    n = 0
+    try:
+        from .db import cursor
+        with cursor() as cur:
+            n = cur.execute("SELECT COUNT(*) n FROM hardsub_qwen").fetchone()["n"]
+    except Exception:                                            # noqa: BLE001
+        pass
+    per = STATE.get("secs_each")
+    return {"cpu": 1, "gpu": 3, "ram": 2, "disk": 1, "lead": "gpu",
+            "why": ("ONE MODEL, LOADED ONCE PER RUN. Qwen2.5-7B (about 8 GB of video memory) reads "
+                    "eight pictures' lines at a time. Loading it is most of a short run; after that a "
+                    "picture is a fraction of a second. Nothing is decoded and no pool disk is read - "
+                    "the lines are already in the database."),
+            "measured": ({"jobs": n, "secs": round(per, 1)} if per else None)}
 
 
 def stop() -> bool:

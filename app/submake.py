@@ -187,6 +187,31 @@ def cancel(file_id: int) -> bool:
     return len(keep) != len(q)
 
 
+KV_PAUSED = "submake.paused"
+
+
+def paused() -> bool:
+    return str(kv_get(KV_PAUSED) or "0") == "1"
+
+
+def set_paused(on: bool) -> None:
+    kv_set(KV_PAUSED, "1" if on else "0")
+    if not on:
+        kick()
+
+
+def cost() -> dict:
+    """For the Concurrency page: what one file costs, and how long one took."""
+    secs = sorted(int(r.get("secs") or 0) for r in _recent() if r.get("ok") and r.get("secs"))
+    return {"cpu": 2, "gpu": 3, "ram": 2, "disk": 1, "lead": "gpu",
+            "why": ("THREE MODELS, ONE AFTER ANOTHER, ALL ON THE CARD. Whisper large-v3 listens to "
+                    "every stretch of speech (about 3 GB of video memory), PaddleOCR reads two "
+                    "frames a second off the picture, and Qwen2.5-7B translates what it read (about "
+                    "8 GB). ffmpeg decodes the audio and the frames on the processor. Measured: a "
+                    "22-minute episode takes 7-8 minutes."),
+            "measured": ({"jobs": len(_tried()), "secs": secs[len(secs) // 2]} if secs else None)}
+
+
 def forget(ats: list) -> int:
     """Take finished rows off the list, by their time. Nothing on disk changes."""
     want = {round(float(x), 3) for x in ats or []}
@@ -208,6 +233,10 @@ def kick() -> None:
 
 async def _runner() -> None:
     while _queue():
+        if paused():
+            STATE["waiting_for"] = "paused on the Concurrency page"
+            await asyncio.sleep(30)
+            continue
         got, holder = heavy.claim(LANE, ttl=4 * 3600)
         if not got:
             STATE["waiting_for"] = holder

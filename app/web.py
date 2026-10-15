@@ -13433,7 +13433,44 @@ def api_workers():
                        "reserve": 2.0}
     except Exception:                                    # noqa: BLE001
         out["_box"] = {}
+    # OUTSIDE THE QUEUE. The Subtitle maker and the Qwen judge are not pools:
+    # each runs in a child process of its own, one at a time, on the heavy
+    # lane it shares with installs and engine tests. They have no count to
+    # set, but they do cost the card, and this page is where cost is shown.
+    try:
+        from . import submake, qwenjudge
+        out["_outside"] = [
+            {"key": "submake", "pool": "submake", "label": "Subtitle maker",
+             "hint": ("English subtitles for a file that has none: Whisper for what is said, "
+                      "PaddleOCR and Qwen for what is written. Runs when you ask, or first for a raw "
+                      "in auto, before anything is replaced."),
+             "cost": submake.cost(), "paused": submake.paused(),
+             "now": ("making " + submake.STATE.get("label", "")) if submake.STATE.get("running") else "",
+             "queued": len(submake._queue())},
+            {"key": "qwen", "pool": "qwen", "label": "Qwen judge",
+             "hint": ("Reads the lines the burned-in subtitle check kept and says how likely they are "
+                      "to be dialogue. Every ten minutes when there is something new."),
+             "cost": qwenjudge.cost(), "paused": qwenjudge.paused(),
+             "now": (f"judging {qwenjudge.STATE.get('done', 0)} of {qwenjudge.STATE.get('total', 0)}"
+                     if qwenjudge.STATE.get("running") else ""),
+             "queued": qwenjudge.waiting()},
+        ]
+    except Exception:                                    # noqa: BLE001
+        out["_outside"] = []
     return out
+
+
+@app.post("/api/outside/pause")
+def api_outside_pause(key: str, on: int = 1):
+    """Pause or run the Subtitle maker or the Qwen judge."""
+    from . import submake, qwenjudge
+    mod = {"submake": submake, "qwen": qwenjudge}.get(key)
+    if not mod:
+        raise HTTPException(400, "key must be submake or qwen")
+    mod.set_paused(bool(on))
+    joblog.log(f"{'Subtitle maker' if key == 'submake' else 'Qwen judge'} "
+               f"{'paused' if on else 'running again'}", "info")
+    return {"key": key, "paused": bool(on)}
 
 
 @app.post("/api/workers")
@@ -28987,6 +29024,36 @@ function costStrip(c){
       m.gb?` · ${m.gb} GB`:''}</span>` : '';
   return `<div style="margin-top:4px;display:flex;align-items:center;
       flex-wrap:wrap;gap:2px" title="${esc(c.why||'')}">${parts}${med}</div>`;
+}
+// OUTSIDE THE QUEUE - the Subtitle maker and the Qwen judge. Same row shape as
+// a pool, but no count: each is one at a time on the heavy lane, which it
+// shares with installs and engine tests, so a second one could only wait.
+function outsideRows(list){
+  if(!list.length) return '';
+  return `<div style="padding:10px 14px 4px"><b style="font-size:12px">Outside the queue</b>
+      <div class="dim" style="font-size:11px">Each runs in a process of its own, one at a time, on the lane it shares with
+      installs and engine tests - so there is no count to set, only whether it runs. Both use the card's cores, not
+      the encoder.</div></div>
+    <table>${list.map(v=>{
+      const pc=poolColor(v.pool), off=!!v.paused;
+      return `<tr class="${off?'wpaused':''}">
+        <td><div><span class="pill" style="color:${pc};border-color:${pc};margin-right:7px;font-size:10.5px">${esc(v.pool)}</span>${esc(v.label)}
+            ${off?`<span class="dim" style="font-size:10.5px;margin-left:8px">⏸ paused — what is running finishes, nothing new starts</span>`
+                 :(v.now?`<span style="font-size:10.5px;margin-left:8px;color:${pc}">${esc(v.now)}</span>`:'')}</div>
+          <div class="dim" style="font-size:11px">${esc(v.hint)}</div>
+          ${costStrip(v.cost)}</td>
+        <td style="width:250px;text-align:right;white-space:nowrap">
+          <b>1</b> <span class="dim" style="font-size:11px">at a time</span>
+          <div class="dim" style="font-size:11px">${v.queued?fmt(v.queued)+' waiting':'nothing waiting'}</div></td>
+        <td style="width:96px;text-align:right;vertical-align:middle">
+          <button class="wsw ${off?'off':'on'}" onclick="outsidePause('${v.key}',${off?0:1},this)"
+            title="${off?'Paused. Click to let it run.':'Running. Click to pause: what is running finishes, nothing new starts.'}"
+            ><span class="knob"></span>${off?'paused':'running'}</button></td></tr>`;}).join('')}</table>`;
+}
+async function outsidePause(key, on, btn){
+  btn.disabled=true;
+  try{ await fetch('/api/outside/pause?key='+key+'&on='+on,{method:'POST'}); }catch(e){}
+  loadWorkers();
 }
 function workerRow(k,v,extra){
   const st=stepFor(v);
@@ -48145,7 +48212,8 @@ function paintWorkers(){
   document.getElementById('workers').innerHTML=
     `<div class="dim" style="padding:9px 14px ${enc||box?'4px':'9px'};font-size:11px">${blurb}</div>`+enc+box
     + masterSwitch(w)
-    +'<table>'+rows.map(([k,v])=>workerRow(k,v,extraOf(k))).join('')+'</table>';
+    +'<table>'+rows.map(([k,v])=>workerRow(k,v,extraOf(k))).join('')+'</table>'
+    + (_wtab!=='timing' ? outsideRows(w._outside||[]) : '');
   const hint=document.getElementById('wtabhint');
   if(hint) hint.textContent = _wtab==='timing' ? '· holds & timing' : '· concurrency';
   if(_wtab!=='timing' && !_encLine) encLineFetch();
