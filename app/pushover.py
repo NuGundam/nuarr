@@ -387,6 +387,8 @@ def build(cfg, body: dict, files: list, detail: str, upgrade: bool) -> dict | No
     if eng:
         lines.insert(1 if sub else 0, "<b><font color=\"#2ea44f\">Now has English audio</font></b>")
     return {"arr": cfg.name, "kind": kind, "series": series, "label": label, "sub": sub,
+            "poster": _poster_url(body, kind), "cfg": cfg,
+            "mid": _obj(body.get("series") if kind == "sonarr" else body.get("movie")).get("id"),
             "spec": spec, "upgrade": upgrade, "lines": lines, "eng": eng,
             "ep": label[len(series):].strip() if label.startswith(series) else label,
             "at": time.time()}
@@ -440,15 +442,33 @@ async def _flush_loop() -> None:
                 joblog.log(f"pushover: {type(e).__name__}: {e}", "error")
 
 
+async def _item_poster(it: dict) -> bytes | None:
+    """The poster for an import: the webhook's own image list first, then the
+    arr's record of the series or film when the payload carried none."""
+    url = it.get("poster") or ""
+    if not url and it.get("cfg") is not None and it.get("mid"):
+        def look():
+            from .arrqueue import _call
+            path = ("/api/v3/series/" if it.get("kind") == "sonarr" else "/api/v3/movie/") + str(it["mid"])
+            return _poster_url({"x": _call(it["cfg"], path, timeout=15)}, "x")
+        try:
+            url = await asyncio.to_thread(look)
+        except Exception:                                        # noqa: BLE001
+            url = ""
+    return await _poster(url)
+
+
 async def _send_group(items: list) -> None:
     arr = items[0]["arr"]
+    img = await _item_poster(items[0])
     if len(items) == 1 or not opts().get("digest", True):
         for it in items:
             title = (f"{arr} · {'upgraded' if it['upgrade'] else 'imported'} · {it['label']}"
                      + (" · English audio" if it.get("eng") else ""))
             msg = (_arr_tag(arr, it.get("kind", "")) + " · <b>" + _esc(it["label"]) + "</b>\n"
                    + "\n".join(it["lines"]))
-            ok, err = await send(title, msg, url=_link())
+            ok, err = await send(title, msg, url=_link(),
+                                 attachment=img if it is items[0] else await _item_poster(it))
             _remember({"at": time.time(), "arr": arr, "title": it["label"],
                        "detail": _plain(it["spec"] or (it["lines"][0] if it["lines"] else "")),
                        "eng": int(bool(it.get("eng"))), "ok": ok, "error": err,
@@ -493,7 +513,7 @@ async def _send_group(items: list) -> None:
     if len(msg) > room:
         msg = msg[:room].rsplit("\n", 1)[0] + "\n…"
     msg += "\n" + "\n".join(tail)
-    ok, err = await send(title, msg, url=_link())
+    ok, err = await send(title, msg, url=_link(), attachment=img)
     _remember({"at": time.time(), "arr": arr, "title": f"{series} ({len(items)} files)",
                "detail": what, "eng": engs, "ok": ok, "error": err,
                "kind": "upgraded" if ups == len(items) else "imported", "files": len(items),
@@ -524,14 +544,47 @@ SEERR_KIND = {
 }
 
 
+# HALF-SIZE POSTERS. Pushover shows an attachment at its own size, and a
+# 600 px poster filled most of the phone's screen under a two-line import.
+# Seerr's TMDB poster is 600x900 and the arrs' run up to 2000x3000, so
+# every poster is fitted inside half of Seerr's - 300x450 - before attaching.
+POSTER_BOX = (300, 450)
+
+
+def _poster_url(body: dict, kind: str) -> str:
+    """The poster's remote URL from an arr record or webhook ("images" list)."""
+    rec = _obj(body.get("series") if kind == "sonarr" else
+               body.get("movie") if kind == "radarr" else body.get(kind))
+    for im in rec.get("images") or []:
+        im = _obj(im)
+        if str(im.get("coverType") or "").lower() == "poster":
+            u = im.get("remoteUrl") or im.get("url") or ""
+            if str(u).startswith("http"):
+                return str(u)
+    return ""
+
+
+def _half(data: bytes) -> bytes:
+    try:
+        from io import BytesIO
+        from PIL import Image
+        im = Image.open(BytesIO(data)).convert("RGB")
+        im.thumbnail(POSTER_BOX, Image.LANCZOS)
+        out = BytesIO()
+        im.save(out, "JPEG", quality=85)
+        return out.getvalue()
+    except Exception:                                            # noqa: BLE001
+        return data
+
+
 async def _poster(url: str) -> bytes | None:
-    if not url.startswith("http"):
+    if not str(url or "").startswith("http"):
         return None
     try:
         async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as c:
             r = await c.get(url)
-        if r.status_code == 200 and len(r.content) < 2_500_000:
-            return r.content
+        if r.status_code == 200 and len(r.content) < 5_000_000:
+            return await asyncio.to_thread(_half, r.content)
     except Exception:                                            # noqa: BLE001
         pass
     return None
