@@ -10678,6 +10678,33 @@ def api_submake():
     return submake.snapshot()
 
 
+@app.get("/api/submake/styles")
+def api_submake_styles():
+    from . import submake, substyle
+    return {**substyle.snapshot(), "counts": submake.style_counts(), "restyle": dict(submake.RESTYLE)}
+
+
+@app.post("/api/submake/style")
+def api_submake_style(group: str, preset: str):
+    from . import substyle
+    try:
+        c = substyle.set_chosen(group, preset)
+    except ValueError as e:
+        return {"ok": False, "why": str(e)}
+    joblog.log(f"subtitle maker: {group} subtitles now made as {preset}", "info")
+    return {"ok": True, "chosen": c}
+
+
+@app.post("/api/submake/restyle")
+async def api_submake_restyle(group: str = ""):
+    """Rewrite the subtitles already made in their group's style now."""
+    from . import submake
+    if submake.RESTYLE.get("running"):
+        return {"ok": False, "why": "already restyling"}
+    asyncio.get_running_loop().run_in_executor(None, submake.restyle_all, group)
+    return {"ok": True}
+
+
 @app.post("/api/submake")
 async def api_submake_add(file_id: str, overwrite: int = 0):
     """Queue English subtitles for these files (comma-separated ids)."""
@@ -40775,8 +40802,41 @@ async function snRun(btn){
 // and only the header counts and the table are redrawn, so the search box
 // keeps what you are typing and the scroll box keeps its place.
 let _sm=null, _smPoll=null, _smQ='', _smHits='', _smKey='';
+// HOW THE MADE SUBTITLES LOOK, per kind of media - see substyle.py.
+let _smSt=null, _smStKey='';
+async function smStyles(){
+  try{ _smSt=await (await fetch('/api/submake/styles')).json(); }catch(e){ return; }
+  const el=document.getElementById('smStyles'); if(!el) return;
+  const rs=_smSt.restyle||{};
+  const opts=g=>(_smSt.presets||[]).map(p=>`<option value="${p.id}" ${p.id===g.chosen?'selected':''}>${esc(p.word)}${p.id===g.default?' (default)':''}</option>`).join('');
+  const html=`<div class="lkind" style="padding:8px 10px">
+    <div style="font-size:11px;margin-bottom:5px"><b>Style</b> <span class="dim">- the look of what is made, by kind of media.
+      Every style but plain is an ASS track with its fonts carried inside the file, dialogue at the bottom and on-screen text at the top.
+      Plain is an SRT the player draws its own way - the one every Plex app plays without converting.</span></div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:6px 14px">${(_smSt.groups||[]).map(g=>{
+      const c=(_smSt.counts||{})[g.id]||{made:0,other:0};
+      return `<div style="font-size:11px"><span style="display:inline-block;width:78px"><b>${esc(g.word)}</b></span>
+        <select style="font-size:11px" onchange="smStyleSet('${g.id}',this.value)">${opts(g)}</select>
+        ${c.other?` <button class="rmb" onclick="smRestyle('${g.id}',this)" title="Rewrite the ${c.other} already made in this style - a sidecar in place, a track inside the file swapped in one rewrite">restyle ${c.other} made</button>`
+          :(c.made?` <span class="dim">${c.made} made, all in this style</span>`:'')}</div>`;}).join('')}</div>
+    ${rs.running?`<div style="font-size:11px;margin-top:5px;color:#79c0ff">restyling ${rs.done} of ${rs.total}…</div>`
+      :(rs.last&&rs.last.length?`<div class="dim" style="font-size:10.5px;margin-top:5px">last restyle: ${rs.last.map(x=>`${esc(x.label||'')} ${x.ok?(x.same?'(already)':'✓ '+esc(x.was||'')+' → '+esc(x.now||'')):'<span style="color:var(--bad)">✗ '+esc(x.why||'')+'</span>'}`).join(' · ')}</div>`:'')}
+  </div>`;
+  if(html!==_smStKey){ _smStKey=html; el.innerHTML=html; }
+  if(rs.running) setTimeout(smStyles, 2500);
+}
+async function smStyleSet(g,p){
+  await fetch(`/api/submake/style?group=${g}&preset=${p}`,{method:'POST'});
+  smStyles();
+}
+async function smRestyle(g,btn){
+  if(btn) btn.disabled=true;
+  await fetch(`/api/submake/restyle?group=${g}`,{method:'POST'});
+  setTimeout(smStyles, 800);
+}
 async function smLoad(){
   if(!document.getElementById('smPanel')) return;
+  if(!_smSt) setTimeout(smStyles, 0);
   try{ _sm=await (await fetch('/api/submake')).json(); }catch(e){ return; }
   smPaint();
   if(_smPoll) clearTimeout(_smPoll);
@@ -40790,8 +40850,9 @@ function smShell(){
       <span class="dim subssub" title="Whisper large-v3 for what is said, timed by the voice detector so a line starts when the voice does; PaddleOCR for what is written on screen, translated by Qwen2.5-7B and shown at the top. A file with English already burned into the picture is skipped. The first run on a new install downloads about 11 GB of models.">English subtitles for a file that has none - listens, reads the picture, translates</span>
       <span class="subsn" id="smCount"></span></div>
     <div class="dim" style="font-size:11px;margin:2px 0 6px">Where the result lives follows the library's sidecar rule: with
-      <i>embed sidecars</i> on it goes inside the file, otherwise it stays beside it as <span class="mono">name.en.srt</span>.
+      <i>embed sidecars</i> on it goes inside the file, otherwise it stays beside it as <span class="mono">name.en.ass</span> (or <span class="mono">.en.srt</span> when the style is plain).
       One file at a time, on the same lane as the other heavy GPU jobs.</div>
+    <div id="smStyles" style="margin:0 0 8px"></div>
     <div style="display:flex;gap:6px;align-items:center;margin-bottom:4px">
       <input id="smQ" placeholder="make subtitles for… (title or file name)" style="flex:1;font-size:11px"
         onkeydown="if(event.key==='Enter') smFind()">
@@ -40903,7 +40964,7 @@ async function smBulk(what, btn){
 }
 function smPaint(){
   const el=document.getElementById('smPanel'); if(!el||!_sm) return;
-  if(!document.getElementById('smTable')) el.innerHTML=smShell();
+  if(!document.getElementById('smTable')){ el.innerHTML=smShell(); _smStKey=''; smStyles(); }
   const st=_sm.state||{}, q=(_sm.queue||[]).filter(x=>!(st.running&&x.file_id===st.file_id));
   const rows=[];
   if(st.running) rows.push({kind:'running', st, file_id:st.file_id, label:st.label, library:st.library, file:st.file, lang:st.lang, at:st.started});

@@ -147,8 +147,12 @@ def _row(file_id: int) -> dict | None:
     return dict(r) if r else None
 
 
-def _sidecar(path: str) -> str:
-    return os.path.splitext(path)[0] + ".en.srt"
+def _sidecar(path: str, ext: str = ".srt") -> str:
+    return os.path.splitext(path)[0] + ".en" + ext
+
+
+def _have_sidecar(path: str) -> bool:
+    return any(os.path.exists(_sidecar(path, e)) for e in (".srt", ".ass"))
 
 
 _TEXT_CODECS = {"subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text", "microdvd"}
@@ -232,7 +236,7 @@ def enqueue(file_ids: list, overwrite: bool = False, by: str = "you") -> dict:
             skipped.append(f"{fid}: not in the library"); continue
         if fid in have or STATE.get("file_id") == fid:
             skipped.append(f"{display_label(r['title'], r['season'], r['episode'], r['path'])}: already queued"); continue
-        if os.path.exists(_sidecar(r["path"])) and not overwrite:
+        if _have_sidecar(r["path"]) and not overwrite:
             skipped.append(f"{display_label(r['title'], r['season'], r['episode'], r['path'])}: "
                            "already has an English subtitle beside it"); continue
         q.append({"file_id": fid, "overwrite": bool(overwrite), "at": time.time(), "by": by})
@@ -330,8 +334,12 @@ async def _one(file_id: int, overwrite: bool, by: str = "you") -> None:
     if not r or not os.path.exists(r["path"]):
         return
     label = display_label(r["title"], r["season"], r["episode"], r["path"])
-    side = _sidecar(r["path"])
-    if os.path.exists(side) and not overwrite:
+    # THE LOOK FOLLOWS THE KIND OF MEDIA - see substyle. Plain is an .srt;
+    # every other style is an .ass with the fonts attached when it goes in.
+    from . import substyle
+    style = substyle.for_library(r["library"] or "")
+    side = _sidecar(r["path"], ".srt" if style == "plain" else ".ass")
+    if _have_sidecar(r["path"]) and not overwrite:
         _remember({"at": time.time(), "file_id": file_id, "label": label, "ok": False,
                    "why": "an English subtitle is already beside it"})
         return
@@ -389,15 +397,28 @@ async def _one(file_id: int, overwrite: bool, by: str = "you") -> None:
     # file lives on the pool; os.replace cannot cross that, so the copy lands
     # beside the video under a temporary name and is renamed there.
     import shutil
-    shutil.copyfile(tmp, side + ".part")
+    if style == "plain":
+        shutil.copyfile(tmp, side + ".part")
+    else:
+        with open(tmp, encoding="utf-8", errors="replace") as f:
+            ass = substyle.to_ass(f.read(), style, label)
+        with open(side + ".part", "w", encoding="utf-8-sig") as f:
+            f.write(ass)
     os.replace(side + ".part", side)
+    for other in (".srt", ".ass"):
+        o = _sidecar(r["path"], other)
+        if o != side and os.path.exists(o) and overwrite:
+            try:
+                os.remove(o)
+            except OSError:
+                pass
     try:
         os.remove(tmp)
     except OSError:
         pass
     row.update(ok=True, narration=end.get("narration", 0), onscreen=end.get("onscreen", 0),
                translated=end.get("translated", 0), source=(src or {}).get("what", ""),
-               sidecar=os.path.basename(side))
+               sidecar=os.path.basename(side), style=style)
     # THE LIBRARY'S RULE DECIDES WHERE IT LIVES - see the module docstring.
     from . import subembed
     try:
@@ -430,6 +451,207 @@ async def _one(file_id: int, overwrite: bool, by: str = "you") -> None:
                                 f"{row['onscreen']} on-screen lines\n{pushover._esc(row['why'])}")
     except Exception:                                            # noqa: BLE001
         pass
+
+
+# ------------------------------------------------------------ restyle --
+# A STYLE CHOSEN AFTER THE FACT. The subtitles already made keep the look they
+# were made with until this rewrites them: a sidecar is rewritten in place; a
+# track inside the file is swapped for the restyled one in one mkvmerge pass
+# (fonts attached), read back, and committed through fileops.safe_replace -
+# the same road every other rewrite takes. Only nuarr's own track is touched:
+# the one named "English (nuarr)", or - for files made before tracks were
+# named - the file's only English text track, on a file the maker's own
+# history says it embedded into.
+TRACK_NAME = "English (nuarr)"
+
+
+def _mkvj(path: str) -> dict:
+    from .subembed import _mkvmerge
+    from .config import quiet_run
+    r = quiet_run([_mkvmerge(), "-J", path], capture_output=True, text=True,
+                  encoding="utf-8", errors="replace", timeout=120)
+    return json.loads(r.stdout or "{}")
+
+
+def _style_of_track(path: str, t: dict, sub_ord: int) -> str:
+    from .jobs import _ffmpeg_exe
+    from .config import quiet_run
+    from . import substyle
+    if "SubRip" in (t.get("codec") or ""):
+        return "plain"
+    r = quiet_run([_ffmpeg_exe(), "-v", "error", "-i", path, "-map", f"0:s:{sub_ord}", "-f", "ass", "-"],
+                  capture_output=True, timeout=300)
+    m = __import__("re").search(r"; nuarr style: (\w+)", r.stdout.decode("utf-8", "replace")[:3000])
+    return m.group(1) if m else "?"
+
+
+def restyle_one(file_id: int, style: str = "") -> dict:
+    """Rewrite one made subtitle in the style its group has now."""
+    import re
+    import shutil
+    from . import fileops, substyle, subembed
+    from .jobs import _ffmpeg_exe
+    from .config import quiet_run
+    r = _row(file_id)
+    if not r or not os.path.exists(r["path"]):
+        return {"ok": False, "why": "the file is not on disk"}
+    path = r["path"]
+    style = style or substyle.for_library(r["library"] or "")
+    label = display_label(r["title"], r["season"], r["episode"], path)
+    # A SIDECAR: rewritten beside the file, in place.
+    for ext in (".srt", ".ass"):
+        side = _sidecar(path, ext)
+        if os.path.exists(side):
+            text = open(side, encoding="utf-8-sig", errors="replace").read()
+            was = "plain" if ext == ".srt" else (substyle.preset_of_ass(side) or "?")
+            if was == style:
+                return {"ok": True, "same": True, "why": "already in that style"}
+            srt = text if ext == ".srt" else substyle.ass_to_srt(text)
+            new = _sidecar(path, ".srt" if style == "plain" else ".ass")
+            body = srt if style == "plain" else substyle.to_ass(srt, style, label)
+            with open(new + ".part", "w", encoding="utf-8" if style == "plain" else "utf-8-sig") as f:
+                f.write(body)
+            os.replace(new + ".part", new)
+            if new != side:
+                os.remove(side)
+            return {"ok": True, "where": "sidecar", "was": was, "now": style}
+    # INSIDE THE FILE.
+    if not path.lower().endswith(".mkv"):
+        return {"ok": False, "why": "not .mkv"}
+    if fileops.is_locked(path):
+        return {"ok": False, "why": "the file is in use"}
+    j = _mkvj(path)
+    subs = [t for t in j.get("tracks", []) if t.get("type") == "subtitles"]
+    eng_text = [(i, t) for i, t in enumerate(subs)
+                if (t.get("properties") or {}).get("language") in ("eng", "en")
+                and any(k in (t.get("codec") or "") for k in ("SubRip", "SubStationAlpha", "SSA", "ASS"))]
+    named = [(i, t) for i, t in eng_text if (t.get("properties") or {}).get("track_name") == TRACK_NAME]
+    made_here = any(x.get("file_id") == int(file_id) and x.get("ok") and x.get("where") == "embedded"
+                    for x in _recent())
+    pick = named[0] if named else (eng_text[0] if len(eng_text) == 1 and made_here else None)
+    if not pick:
+        return {"ok": False, "why": "cannot tell which English track is the one nuarr made - left alone"}
+    ordn, t = pick
+    was = _style_of_track(path, t, ordn)
+    if was == style:
+        return {"ok": True, "same": True, "why": "already in that style"}
+    fmt = "srt" if "SubRip" in (t.get("codec") or "") else "ass"
+    raw = quiet_run([_ffmpeg_exe(), "-v", "error", "-i", path, "-map", f"0:s:{ordn}", "-f", fmt, "-"],
+                    capture_output=True, timeout=300).stdout.decode("utf-8", "replace")
+    srt = raw if fmt == "srt" else substyle.ass_to_srt(raw)
+    if len(substyle.srt_cues(srt)) < 3:
+        return {"ok": False, "why": "could not read the track back out"}
+    work = os.path.join(str(DATA_DIR), f"restyle.{file_id}" + (".srt" if style == "plain" else ".ass"))
+    with open(work, "w", encoding="utf-8" if style == "plain" else "utf-8-sig") as f:
+        f.write(srt if style == "plain" else substyle.to_ass(srt, style, label))
+    ok_room, why_room = fileops.cache_room(os.path.getsize(path))
+    if not ok_room:
+        return {"ok": False, "why": why_room}
+    tmp = fileops.cache_temp(".mkv", "restyle")
+    have = {(a.get("file_name") or "").lower() for a in j.get("attachments", [])}
+    cmd = [subembed._mkvmerge(), "-o", tmp, "--subtitle-tracks", "!" + str(t["id"]), path,
+           "--language", "0:eng", "--track-name", f"0:{TRACK_NAME}", "--default-track-flag", "0:yes", work]
+    for fp in ([] if style == "plain" else substyle.font_paths(style)):
+        if os.path.basename(fp).lower() not in have:
+            cmd += ["--attachment-mime-type", "application/x-truetype-font", "--attach-file", fp]
+    try:
+        res = quiet_run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=3600)
+        if res.returncode not in (0, 1):
+            return {"ok": False, "why": f"mkvmerge said: {(res.stdout or '')[-200:]}"}
+        # READ IT BACK before anything replaces the original.
+        k = _mkvj(tmp)
+        kinds = lambda d, ty: sum(1 for x in d.get("tracks", []) if x.get("type") == ty)
+        if kinds(k, "video") != kinds(j, "video") or kinds(k, "audio") != kinds(j, "audio") \
+                or kinds(k, "subtitles") != kinds(j, "subtitles"):
+            return {"ok": False, "why": "the rebuilt file does not have the same tracks - nothing was replaced"}
+        new = [x for x in k.get("tracks", []) if (x.get("properties") or {}).get("track_name") == TRACK_NAME]
+        want = "SubRip" if style == "plain" else "SubStationAlpha"
+        if not new or want not in (new[0].get("codec") or ""):
+            return {"ok": False, "why": "the restyled track is not in the rebuilt file - nothing was replaced"}
+        d0 = float((j.get("container") or {}).get("properties", {}).get("duration") or 0) / 1e9
+        d1 = float((k.get("container") or {}).get("properties", {}).get("duration") or 0) / 1e9
+        if d0 and abs(d0 - d1) > 2:
+            return {"ok": False, "why": f"the rebuilt file runs {d1:.0f}s against {d0:.0f}s - nothing was replaced"}
+        rep = fileops.safe_replace(path, tmp)
+        if not getattr(rep, "ok", False):
+            return {"ok": False, "why": f"could not put the rebuilt file in place: {getattr(rep, 'why', '')}"}
+    finally:
+        fileops._quiet_remove(tmp)
+        try:
+            os.remove(work)
+        except OSError:
+            pass
+    try:
+        from . import jobs as _jobs
+        pr = quiet_run([_jobs._ffprobe_exe(), "-v", "quiet", "-print_format", "json", "-show_streams",
+                        "-show_format", path], capture_output=True, text=True, encoding="utf-8",
+                       errors="replace", timeout=180)
+        data = json.loads(pr.stdout or "{}")
+        if data.get("streams"):
+            _jobs.cache_probe(int(file_id), data)
+    except Exception:                                            # noqa: BLE001
+        pass
+    joblog.log(f"subtitle maker: {label} restyled {was} -> {style}", "ok")
+    return {"ok": True, "where": "embedded", "was": was, "now": style}
+
+
+RESTYLE: dict = {"running": False, "done": 0, "total": 0, "last": [], "at": 0.0}
+
+
+def _set_style(file_id: int, style: str) -> None:
+    rows = _recent()
+    for x in rows:
+        if x.get("file_id") == file_id and x.get("ok"):
+            x["style"] = style
+    kv_set(KV_RECENT, json.dumps(rows))
+
+
+def style_counts() -> dict:
+    """{group: {"made": n, "other": n}} - made ones not in the group's style
+    now (a row from before styles existed was plain SRT)."""
+    from . import substyle
+    ch = substyle.chosen()
+    out = {g: {"made": 0, "other": 0} for g in ch}
+    seen = set()
+    for x in _recent():
+        if not x.get("ok") or x.get("file_id") in seen:
+            continue
+        seen.add(x.get("file_id"))
+        g = substyle.group_of(x.get("library") or "")
+        out[g]["made"] += 1
+        out[g]["other"] += int((x.get("style") or "plain") != ch[g])
+    return out
+
+
+def restyle_all(group: str = "") -> dict:
+    """Every subtitle the maker has made, in its group's style now."""
+    from . import heavy as _heavy, substyle
+    rows = [x for x in _recent() if x.get("ok") and x.get("file_id")]
+    seen, todo = set(), []
+    for x in rows:
+        if x["file_id"] in seen:
+            continue
+        seen.add(x["file_id"])
+        if not group or substyle.group_of(x.get("library") or "") == group:
+            todo.append(x)
+    got, holder = _heavy.claim("Subtitle restyle", ttl=3600)
+    if not got:
+        return {"ok": False, "why": f"{holder} has the lane - try again when it is done"}
+    RESTYLE.update(running=True, done=0, total=len(todo), last=[], at=time.time())
+    try:
+        for x in todo:
+            try:
+                res = restyle_one(int(x["file_id"]))
+            except Exception as e:                               # noqa: BLE001
+                res = {"ok": False, "why": f"{type(e).__name__}: {e}"[:160]}
+            RESTYLE["last"].append({"label": x.get("label"), **res})
+            if res.get("ok") and res.get("now"):
+                _set_style(int(x["file_id"]), res["now"])
+            RESTYLE["done"] += 1
+    finally:
+        RESTYLE["running"] = False
+        _heavy.release("Subtitle restyle")
+    return {"ok": True, "results": RESTYLE["last"]}
 
 
 def as_running() -> list:

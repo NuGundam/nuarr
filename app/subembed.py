@@ -1121,7 +1121,35 @@ def embed_one(file_id: int, report=None, disk: str = "") -> dict:
         cmd += ["--language", f"0:{t['lang']}"]
         if "forced" in (t.get("role") or ""):
             cmd += ["--forced-track", "0:yes"]
+        # THE SUBTITLE MAKER'S OWN TRACK IS NAMED, so a later restyle can
+        # find it again among the file's other English tracks.
+        try:
+            from . import substyle as _st
+            if t["sidecar"].lower().endswith((".ass", ".srt")) and (
+                    _st.preset_of_ass(t["sidecar"]) or _made_by_maker(t["sidecar"])):
+                cmd += ["--track-name", "0:English (nuarr)"]
+        except Exception:                                        # noqa: BLE001
+            pass
         cmd += [t["sidecar"]]
+    # AN .ASS NAMES FONTS; THE FILE CARRIES THEM. A player without the font
+    # draws the fallback, which is the look the .ass was there to avoid. Only
+    # fonts this machine has, and only ones the file does not carry already.
+    try:
+        from . import substyle as _st
+        fonts = []
+        for t in takes:
+            if t["sidecar"].lower().endswith((".ass", ".ssa")):
+                fonts += _st.fonts_in_ass(t["sidecar"])
+        if fonts:
+            r_ = _plain([_mkvmerge(), "-J", path], 120)
+            have = {(a.get("file_name") or "").lower()
+                    for a in (json.loads(r_[1] or "{}").get("attachments") or [])}
+            for fp in dict.fromkeys(fonts):
+                if os.path.basename(fp).lower() not in have:
+                    cmd += ["--attachment-mime-type", "application/x-truetype-font",
+                            "--attach-file", fp]
+    except Exception:                                            # noqa: BLE001
+        pass
     # READ ITS PROGRESS AS IT GOES, rather than waiting sixty seconds for an
     # exit code. mkvmerge prints "Progress: 37%" as it copies; with --gui-mode
     # it prints "#GUI#progress 37%" on a line of its own, which is the same
@@ -1134,6 +1162,16 @@ def embed_one(file_id: int, report=None, disk: str = "") -> dict:
         if _mine:
             _work.close()
         _claim.__exit__(None, None, None)
+
+
+def _made_by_maker(sidecar: str) -> bool:
+    """Is this sidecar one the Subtitle maker wrote? Its history names it."""
+    try:
+        from . import submake
+        base = os.path.basename(sidecar).lower()
+        return any((x.get("sidecar") or "").lower() == base for x in submake._recent())
+    except Exception:                                            # noqa: BLE001
+        return False
 
 
 def _disk_of(file_id: int) -> str:
