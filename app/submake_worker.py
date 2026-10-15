@@ -50,16 +50,83 @@ UTT_GAP_S = 0.6
 UTT_MAX_S = 12.0
 HALLU = re.compile(r"thank(s| you) for (watching|your view)|translated by|subtitles? by|"
                    r"please subscribe|amara\.org|like and subscribe", re.I)
-# Whisper's code, PaddleOCR's language, and the script a line must contain
-LANGS = {
-    "jpn": ("ja", "japan", r"[぀-ヿ一-鿿]"),
-    "kor": ("ko", "korean", r"[가-힯]"),
-    "zho": ("zh", "ch", r"[一-鿿]"),
-    "chi": ("zh", "ch", r"[一-鿿]"),
-    "spa": ("es", "", ""), "fra": ("fr", "", ""), "fre": ("fr", "", ""),
-    "deu": ("de", "", ""), "ger": ("de", "", ""), "ita": ("it", "", ""),
-    "por": ("pt", "", ""), "rus": ("ru", "", ""), "tha": ("th", "", ""),
+# ANY LANGUAGE, NOT A LIST OF THIRTEEN. The table this replaced named the
+# languages it knew, cut every other code to its first two letters - Swedish
+# "swe" became Swahili "sw", Indonesian "ind" became "in" - and gave nothing
+# but Japanese, Korean and Chinese a reading of the picture. The plan is now
+# worked out per file from three sources: nuarr's ISO 639 table (the codes the
+# library's tracks carry), Whisper's own language list, and PaddleOCR's
+# script families. A language that first appears in the library tomorrow is
+# handled the same way with nothing to add here.
+_P_LATIN = {"af", "az", "bs", "cs", "cy", "da", "de", "es", "et", "fr", "ga", "hr", "hu", "id",
+            "is", "it", "ku", "la", "lt", "lv", "mi", "ms", "mt", "nl", "no", "oc", "pl", "pt",
+            "ro", "sk", "sl", "sq", "sv", "sw", "tl", "tr", "uz", "vi", "fi", "eu", "gl", "lb",
+            "rm", "ca", "qu"}
+_P_CYRILLIC = {"ru", "be", "uk", "bg", "mn", "kk", "ky", "tg", "mk", "tt", "ba"}
+_P_ARABIC = {"ar", "fa", "ug", "ur", "ps", "sd"}
+_P_DEVANAGARI = {"hi", "mr", "ne", "sa"}
+_SCRIPT = {
+    "japan": r"[\u3040-\u30ff\u4e00-\u9fff]",
+    "korean": r"[\uac00-\ud7af]",
+    "ch": r"[\u4e00-\u9fff]",
+    "latin": r"[A-Za-z\u00c0-\u024f]{2,}",
+    "cyrillic": r"[\u0400-\u04ff]",
+    "arabic": r"[\u0600-\u06ff]",
+    "devanagari": r"[\u0900-\u097f]",
+    "th": r"[\u0e00-\u0e7f]",
+    "el": r"[\u0370-\u03ff]",
 }
+
+
+def _iso_table() -> list:
+    try:
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_iso639.json")
+        with open(p, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:                                            # noqa: BLE001
+        return []
+
+
+def lang_plan(code: str) -> dict:
+    """What can be done for audio in this language.
+    -> {code, a2, name, whisper, ocr, script}; whisper None means Whisper is
+    left to detect it, ocr None means the picture is not read."""
+    c = str(code or "").strip().lower()
+    table = _iso_table()
+    try:
+        from app import langkey
+        k = langkey.key(c)
+    except Exception:                                            # noqa: BLE001
+        k = c
+    row = next((r for r in table if r.get("c") == k or r.get("c") == c), None) or {}
+    a2 = row.get("a2") or (c if len(c) == 2 else "")
+    if not a2:
+        for r in table:                       # a 639-2/B code under another row
+            if r.get("a2") and (r.get("c") == k):
+                a2 = r["a2"]; break
+    a2 = {"nb": "no", "nn": "no", "jp": "ja", "iw": "he", "in": "id"}.get(a2, a2)
+    try:
+        from faster_whisper.tokenizer import _LANGUAGE_CODES as W
+    except Exception:                                            # noqa: BLE001
+        W = ()
+    whisper = a2 if a2 in W else None
+    if a2 == "ja":
+        ocr = "japan"
+    elif a2 == "ko":
+        ocr = "korean"
+    elif a2 == "zh":
+        ocr = "ch"
+    elif a2 in ("th", "el"):
+        ocr = a2
+    elif a2 in _P_LATIN or a2 in _P_CYRILLIC or a2 in _P_ARABIC or a2 in _P_DEVANAGARI:
+        ocr = a2
+    else:
+        ocr = None                            # English needs no reading; others have no model
+    fam = (ocr if ocr in ("japan", "korean", "ch", "th", "el") else
+           "latin" if a2 in _P_LATIN else "cyrillic" if a2 in _P_CYRILLIC else
+           "arabic" if a2 in _P_ARABIC else "devanagari" if a2 in _P_DEVANAGARI else "")
+    return {"code": c, "a2": a2, "name": row.get("n") or c or "unknown", "whisper": whisper,
+            "ocr": ocr, "script": _SCRIPT.get(fam, "")}
 
 
 def say(**k):
@@ -275,7 +342,7 @@ def picture(src, plang, script, ffmpeg, duration):
 
 
 # -------------------------------------------------------- translation ------
-def translate(lines, title, llm_dir):
+def translate(lines, title, llm_dir, src_name="Japanese"):
     import ctranslate2
     import tokenizers
     from huggingface_hub import snapshot_download
@@ -290,10 +357,12 @@ def translate(lines, title, llm_dir):
     # ENGLISH, SAID TWICE. "into natural English subtitles" alone let Qwen
     # answer in Chinese when the film title gave it little to go on - the
     # test on the Qwen page came back 天上的国家？ for くものうえのくに？.
-    sysm = ("You are a Japanese-to-English subtitle translator. Translate each numbered "
-            "Japanese line into natural ENGLISH. Children's films write mostly in hiragana; "
-            "read it in context. Keep each line short. Reply in English only - never in "
-            "Chinese or Japanese - with exactly the same numbered lines and nothing else.")
+    kana = ("Children's films write mostly in hiragana; read it in context. "
+            if src_name.lower().startswith("japanese") else "")
+    sysm = (f"You are a {src_name}-to-English subtitle translator. Translate each numbered "
+            f"{src_name} line into natural ENGLISH. {kana}Keep each line short. Reply in English "
+            f"only - never in {src_name} or any other language - with exactly the same numbered "
+            f"lines and nothing else.")
     out = [None] * len(lines)
     B = 40
     for i in range(0, len(lines), B):
@@ -312,11 +381,14 @@ def translate(lines, title, llm_dir):
     # A LINE THAT DID NOT COME BACK IN ENGLISH is asked again on its own, more
     # bluntly; if it still is not English it is dropped rather than shown.
     def english(t):
-        return bool(t) and bool(re.search(r"[A-Za-z]", t)) and not re.search(r"[぀-ヿ一-鿿]", t)
+        # Latin letters, and none of the scripts English is not written in.
+        return (bool(t) and bool(re.search(r"[A-Za-z]", t)) and not re.search(
+            r"[\u0370-\u03ff\u0400-\u04ff\u0600-\u06ff\u0900-\u097f\u0e00-\u0e7f"
+            r"\u3040-\u30ff\u4e00-\u9fff\uac00-\ud7af]", t))
     for k, t in enumerate(out):
         if english(t):
             continue
-        prompt = ("<|im_start|>system\nTranslate the Japanese text into English. Reply with the "
+        prompt = (f"<|im_start|>system\nTranslate the {src_name} text into English. Reply with the "
                   "English translation only.<|im_end|>\n<|im_start|>user\n"
                   f"{lines[k]}<|im_end|>\n<|im_start|>assistant\n")
         r = g.generate_batch([tok.encode(prompt).tokens], max_length=64, sampling_topk=1,
@@ -365,7 +437,8 @@ def main():
         except Exception as e:                                   # noqa: BLE001
             say(error=f"{type(e).__name__}: {e}"[:300])
         return
-    wlang, plang, script = LANGS.get(a.lang, (a.lang[:2], "", ""))
+    plan = lang_plan(a.lang)
+    wlang, plang, script = plan["whisper"], plan["ocr"] or "", plan["script"]
     t0 = time.time()
     try:
         if a.burned_only:
@@ -402,7 +475,8 @@ def main():
             shown = picture(a.src, plang, script, a.ffmpeg, a.duration or (talk[-1][1] if talk else 3600))
             if shown:
                 words = translate([s[2] for s in shown], a.title,
-                                  os.path.join(a.data, "llm", "qwen2.5-7b-instruct-ct2-int8"))
+                                  os.path.join(a.data, "llm", "qwen2.5-7b-instruct-ct2-int8"),
+                                  plan["name"])
         say(stage="writing", pct=96)
         bot = []
         for s, e, t in talk:

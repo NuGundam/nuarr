@@ -419,9 +419,32 @@ def models_info() -> dict:
                           "last_used": _last_use("whisper")},
         "nllb": {"path": NLLB_DIR, "present": os.path.isdir(NLLB_DIR),
                  "size": _dir_size(NLLB_DIR) if os.path.isdir(NLLB_DIR) else 0},
+        "languages": languages(),
         "state": dict(LLM_STATE),
         "lane": heavy.state(),
     }
+
+
+def languages() -> list:
+    """Every audio language the library holds, and what the Subtitle maker
+    can do for it - worked out from the library each time, so a language that
+    shows up tomorrow is on this list tomorrow with nothing to add."""
+    from . import langpolicy
+    from .submake_worker import lang_plan
+    tot: dict = {}
+    libs: dict = {}
+    for lib, sides in (langpolicy.library_languages() or {}).items():
+        for code, n in ((sides or {}).get("audio") or {}).items():
+            tot[code] = tot.get(code, 0) + int(n or 0)
+            libs.setdefault(code, []).append(lib)
+    out = []
+    for code, n in sorted(tot.items(), key=lambda x: -x[1]):
+        p = lang_plan(code)
+        out.append({"code": code, "name": p["name"], "tracks": n, "libraries": libs[code],
+                    "english": p["a2"] == "en", "untagged": code in ("und", "un", "zxx", "mis", ""),
+                    "speech": bool(p["whisper"]), "picture": p["ocr"] or "",
+                    "translate": p["a2"] != "en"})
+    return out
 
 
 def remove_nllb() -> dict:

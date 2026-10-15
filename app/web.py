@@ -37105,6 +37105,19 @@ async function loadQwen(){
         What is <i>said</i> is translated by Whisper, not by this.
         <div class="dim" style="margin-top:5px">last used ${q.last_used?esc(ago(q.last_used)):'not yet'} · the results are on the
           Subtitle maker panel, Subtitles page</div></div></div>
+    <div class="lkind" style="margin-top:10px"><div class="lkindhead"><b style="color:#79c0ff">Languages in your library</b>
+        <span class="dim">every audio language the libraries hold, read fresh each time - a new one appears here by itself</span></div>
+      <table style="width:100%;font-size:12px;border-collapse:collapse">
+        <tr class="dim" style="font-size:10.5px"><td style="padding:4px 12px">LANGUAGE</td><td>TRACKS</td><td>SPEECH</td><td>TEXT ON SCREEN</td><td>LIBRARIES</td></tr>
+        ${(_qw.languages||[]).map(L=>{
+          const yes=t=>`<span style="color:#7fd4a3">${t}</span>`, no=t=>`<span class="dim">${t}</span>`;
+          const sp=L.english?no('already English')
+            :L.untagged?no('Whisper works out the language'):(L.speech?yes('Whisper → English'):no('Whisper detects it'));
+          const pic=L.english?no('—'):L.untagged?no('not read'):(L.picture?yes('PaddleOCR ('+esc(L.picture)+') → Qwen'):no('no OCR model for this script'));
+          return `<tr style="border-top:1px solid var(--line)"><td style="padding:4px 12px">${esc(L.name)} <span class="dim mono">${esc(L.code)}</span></td>
+            <td class="mono">${fmt(L.tracks)}</td><td>${sp}</td><td>${pic}</td>
+            <td class="dim" style="font-size:11px">${esc((L.libraries||[]).join(', '))}</td></tr>`;}).join('')}
+      </table></div>
     <div class="lkind" style="margin-top:10px"><div class="lkindhead"><b style="color:#79c0ff">Where everything is</b></div>
       <table style="width:100%;font-size:12px;border-collapse:collapse">
         ${row(`<span style="color:${q.present?'#7fd4a3':'#e2b341'}">${q.present?'✓':'…'}</span> model`, esc(q.path||''), esc(q.repo||''))}
