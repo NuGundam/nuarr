@@ -39085,11 +39085,26 @@ function skDetail(r){
   }else{
     ev=`${esc(r.evidence||'')} <span class="dim">— events not read yet</span>`;
   }
+  // WHAT THE RULES WOULD DO TO THIS FILE - the row the file-by-file list
+  // used to have for it, chips and reasons whole, with its Requeue button.
+  const e=(_subs&&_subs.rows||[]).find(x=>x.file_id===r.file_id);
+  const plan=e?`${e.owed?`<div style="color:var(--warn)">\u25cb waiting — ${esc(e.owed_why||'')}</div>`:''}${
+      (e.acts||[]).map(a=>{
+        const c=SUBS_C[a.key]||'#6fb0ff';
+        const state=a.on?'<span class="dim">nuarr will do this on its own</span>'
+          :(a.key==='ask'?'<span style="color:var(--warn)">\u25cb waiting on your answer - the buttons on this row</span>'
+            :`<a href="#" style="color:var(--warn)" onclick="subsToSwitch('${a.key}');return false">\u25cb waiting on a switch</a>`);
+        const rq=a.key==='drift'?(a.queued?` <span class="dim">already ${esc(a.queued)}</span>`
+          :` <button class="rmb" onclick="subDriftRequeue(${e.file_id},this)" title="Send this file back through the normal queue so it is rebuilt under today's rules.">Requeue</button>`):'';
+        return `<div style="margin:1px 0 4px"><span class="capsc" style="border-color:${c};color:${c}">${esc(a.word||'')}</span> ${state}${rq}
+          ${a.why?`<div style="margin-top:2px">${esc(String(a.why))}</div>`:''}</div>`;
+      }).join('')}`:'';
   return `<div style="font-size:11px;padding:6px 10px 8px 34px;white-space:normal">
     ${line('file', `<span class="mono">${esc(r.path||'')}</span>`)}
     ${line('added', r.added?esc(new Date(r.added*1000).toLocaleString()):'')}
     ${line(pic?'OCR read':'measured', ev)}
     ${line('so', esc(r.why||''))}
+    ${line('would happen', plan)}
     ${pic||r.source==='raw'?'':line('title', `<span style="color:var(--warn)">${esc(r.title_old||'')}</span>${
       r.action==='retitle'?` <span class="dim">→</span> <span style="color:var(--ok)">${esc(r.title_new||'')}</span>`
       :(r.unread?'':' <span class="dim">— left alone: it carries a name nuarr did not write</span>')}`)}
@@ -43086,6 +43101,14 @@ async function loadSubs(force){
   // being asked - so it is read every time rather than on the merge's cache.
   if(force || Date.now()-_subqAt > 4000) await loadSubQ();
   subsPaint();
+  // Subtitle User Input's open rows carry each file's rule finding ("would
+  // happen", from _subs.rows) - redraw them when that arrives or changes,
+  // or a row opened before it loaded stays without it.
+  try{
+    const sig=(_subs.rows||[]).map(x=>x.file_id+':'+(x.acts||[]).map(a=>a.key+(a.on?1:0)).join('')).join(',');
+    if(sig!==window._subsRowSig){ window._subsRowSig=sig;
+      if(typeof _sk!=='undefined' && _sk && document.getElementById('skPanel')){ _skKey=''; skPaint(); } }
+  }catch(e){}
   // ONE CLOCK FOR THE WHOLE PAGE.
   //
   // Every panel here used to keep its own timer: the merge at five seconds,
@@ -43857,7 +43880,10 @@ function subsPaint(){
   }
   // subsAskHtml is gone: its questions live in Subtitle User Input now,
   // which is the panel that was already asking you things.
-  const html = subsBoardHtml() + subsListHtml();
+  // "What the rules above would change, file by file" is gone as a panel:
+  // what it said about a file is in that file's row of Subtitle User Input,
+  // under the caret, where the question about it is already being asked.
+  const html = subsBoardHtml();
   // RESCUED BEFORE THE WIPE, AND THAT IS NOT AN OPTIONAL STEP.
   //
   // Each panel is moved into a slot inside this container, and this line
@@ -43880,8 +43906,6 @@ function subsPaint(){
   // Same rule for the two panels in this container: the count is the news.
   ifChanged('subs.board', `${_subs.total}/${_subs.held}/${_subs.drift}`,
             document.getElementById('subsPanelBoard'));
-  ifChanged('subs.list', `${_subs.total}/${_subs.ready}/${_subs.drift}`,
-            document.getElementById('subsPanelList'));
   // AND THEN EACH INTO ITS OWN ROW. Opening a row should drop its panel out
   // of that row; leaving it at the bottom of the page is what made opening
   // one feel like nothing had happened.
