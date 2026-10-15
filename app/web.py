@@ -39465,6 +39465,10 @@ function skDetail(r){
     ${line('file', `<span class="mono">${esc(r.path||'')}</span>`)}
     ${line('added', r.added?esc(new Date(r.added*1000).toLocaleString()):'')}
     ${line(pic?'OCR read':'measured', ev)}
+    ${pic&&(r.lines||[]).length?line('seen at', `<div class="mono" style="max-height:150px;overflow:auto">${
+      r.lines.map(x=>{const t=Math.round(+x.t||0);
+        const hms=`${Math.floor(t/3600)}:${String(Math.floor(t%3600/60)).padStart(2,'0')}:${String(t%60).padStart(2,'0')}`;
+        return `<div><span style="color:#79c0ff">${hms}</span>  ${esc(x.text||'')}</div>`;}).join('')}</div>`):''}
     ${line('so', esc(r.why||''))}
     ${line('would happen', plan)}
     ${pic||r.source==='raw'?'':line('title', `<span style="color:var(--warn)">${esc(r.title_old||'')}</span>${

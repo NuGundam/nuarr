@@ -125,7 +125,27 @@ def _picture_rows(limit: int) -> list:
     """Every picture-source finding, in the merged shape."""
     from . import hardsub
     out = []
-    for r in hardsub.found(limit):
+    found = hardsub.found(limit)
+    # WHERE IN THE FILE EACH LINE WAS READ. The reader keeps its lines with
+    # the second each frame was taken at; the row shows them so a person can
+    # jump to 0:47:12 and look, instead of judging a bag of words.
+    lines: dict = {}
+    try:
+        import json as _json
+        from .db import cursor as _cur
+        ids = [int(r["file_id"]) for r in found]
+        with _cur() as cur:
+            for i in range(0, len(ids), 500):
+                part = ids[i:i + 500]
+                for h in cur.execute(f"SELECT file_id, lines FROM hardsub WHERE file_id IN "
+                                     f"({','.join('?' * len(part))})", part):
+                    try:
+                        lines[int(h["file_id"])] = _json.loads(h["lines"] or "[]")[:40]
+                    except Exception:                            # noqa: BLE001
+                        pass
+    except Exception:                                            # noqa: BLE001
+        lines = {}
+    for r in found:
         kind = r.get("state") or ""
         score = int(r.get("score") or 0)
         # THE READER'S OWN VERDICT, not a second one: the sweep and the
@@ -143,6 +163,7 @@ def _picture_rows(limit: int) -> list:
             "kinds": r.get("kinds") or [],
             "sure": score, "read": True, "unread": False,
             "evidence": r.get("words") or "",
+            "lines": lines.get(int(r["file_id"])) or [],
             "why": r.get("why") or "",
             "auto": auto, "auto_why": auto_why,
             "action": "" if marked else "mark",
