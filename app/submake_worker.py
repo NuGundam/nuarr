@@ -320,6 +320,7 @@ def main():
     ap.add_argument("--ffmpeg", required=True)
     ap.add_argument("--no-ocr", action="store_true")
     ap.add_argument("--force", action="store_true", help="make them even if English is burned in")
+    ap.add_argument("--burned-only", action="store_true", help="only answer the burned-in check")
     a = ap.parse_args()
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from app import audiolang
@@ -327,9 +328,30 @@ def main():
     wlang, plang, script = LANGS.get(a.lang, (a.lang[:2], "", ""))
     t0 = time.time()
     try:
+        if a.burned_only:
+            hits, seen = burned_english(a.src, a.ffmpeg, a.duration)
+            say(burned=[hits, seen])
+            return
         if not a.force and a.duration > 60:
             say(stage="checking for subtitles already in the picture", pct=1)
-            hits, seen = burned_english(a.src, a.ffmpeg, a.duration)
+            # IN A PROCESS OF ITS OWN. PaddleOCR loads its own CUDA libraries,
+            # and once they are in this process Whisper's engine cannot load
+            # ("WinError 127 - the specified procedure could not be found").
+            # The picture is read again later, after Whisper is done with the
+            # card - so only this early look needs a separate process.
+            r = subprocess.run([sys.executable, "-m", "app.submake_worker", "--src", a.src,
+                                "--out", a.out, "--lang", a.lang, "--duration", str(a.duration),
+                                "--data", a.data, "--ffmpeg", a.ffmpeg, "--burned-only"],
+                               capture_output=True, text=True, encoding="utf-8", errors="replace",
+                               cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            hits = seen = 0
+            for ln in (r.stdout or "").splitlines():
+                try:
+                    d = json.loads(ln)
+                except Exception:                                # noqa: BLE001
+                    continue
+                if "burned" in d:
+                    hits, seen = d["burned"]
             if seen and hits >= max(4, seen * 0.2):
                 say(error=f"English is already burned into the picture ({hits} of {seen} sampled "
                           f"frames carry it) - nothing made. Use 'make anyway' to override.")

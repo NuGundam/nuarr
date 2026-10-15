@@ -10616,6 +10616,13 @@ def api_submake_forget(at: str):
     return {"removed": submake.forget([x for x in str(at).split(",") if x.strip()])}
 
 
+@app.post("/api/submake/stop")
+def api_submake_stop():
+    """Stop the file being made now (the worker card's Cancel)."""
+    from . import submake
+    return {"stopped": submake.stop()}
+
+
 @app.post("/api/submake/cancel")
 def api_submake_cancel(file_id: int):
     from . import submake
@@ -24331,6 +24338,7 @@ function poolColor(pool){
        : pool==='passthrough' ? 'var(--ok)'       // green - stream copy
        : pool==='audio'       ? '#39d3c3'         // teal - was violet, too close to subocr
        : pool==='decode'      ? '#e8a33d'         // amber - a CPU check, not a copy
+       : pool==='submake'     ? '#79c0ff'         // light blue - the Subtitle maker, its panel's colour
        : 'var(--ok)';
 }
 function diskColor(name){
@@ -25932,11 +25940,12 @@ function paintRunning(j){
           <span class="pill" style="color:${poolCol};border-color:${poolCol}"
             >${esc(w.pool)}</span>
           <b class="wrap">${esc(w.title||w.file)}</b>
-          <span class="right2">
-            <button class="${watchId===w.job_id?'on':''}"
+          <span class="right2">${w.pool==='submake'
+            ? `<button onclick="smStop(this)" title="Stop making subtitles for this file. Nothing is written; it can be queued again.">Cancel</button>`
+            : `<button class="${watchId===w.job_id?'on':''}"
                     onclick="watchLive('${esc(w.job_id)}')">${
                       watchId===w.job_id?'Hide':'Watch'}</button>
-            <button onclick="cancelJob('${esc(w.job_id)}')">Cancel</button></span>
+            <button onclick="cancelJob('${esc(w.job_id)}')">Cancel</button>`}</span>
         </div>
         <div class="mono wkfile m-file">${esc(w.file)}</div>
         ${doingChip(w)}
@@ -27539,6 +27548,11 @@ function watchScrollTop(id){
     const b=document.getElementById(id+'Resume');
     if(b) b.style.display = atTop ? 'none' : '';
   });
+}
+async function smStop(btn){
+  if(btn){ btn.disabled=true; btn.textContent='stopping…'; }
+  try{ await fetch('/api/submake/stop',{method:'POST'}); }catch(e){}
+  loadJobs();
 }
 async function cancelJob(id){
   await fetch('/api/jobs/cancel?job_id='+encodeURIComponent(id),{method:'POST'});
@@ -40279,7 +40293,8 @@ function snPaint(force){
         <td class="r askhost">${{pending:'<span style="color:#79c0ff;font-size:10.5px" title="The Subtitle maker has it - queued or being made now. Nothing is replaced while it works.">making subtitles…</span> ',
             failed:'<span style="color:#e0575b;font-size:10.5px" title="The Subtitle maker tried and could not make any. In auto this one is replaced next.">maker failed</span> ',
             ok:'<span style="color:#7fd4a3;font-size:10.5px" title="Subtitles were made; this leaves the list on the next pass.">subtitles made</span> ',
-            skipped:'<span style="color:#e8a33d;font-size:10.5px" title="English is already burned into the picture - not a raw.">English in the picture</span> '}[r.maker]||''}<button class="rmb" onclick="smMake(${r.file_id},this)"
+            skipped:'<span style="color:#e8a33d;font-size:10.5px" title="English is already burned into the picture - not a raw.">English in the picture</span> ',
+            retry:'<span style="color:#e8a33d;font-size:10.5px" title="The Subtitle maker itself failed - not a fact about this file. Nothing is replaced; it is tried again in a few hours.">maker error, will retry</span> '}[r.maker]||''}<button class="rmb" onclick="smMake(${r.file_id},this)"
           title="Listen to the audio and read the picture, and write English subtitles for it: Whisper for what is said, OCR and a language model for what is written on screen. Nothing is deleted. Where the result lives - beside the file or inside it - follows this library's sidecar rule.">Make subtitles</button>
           <button class="rmb" onclick="snAct(${r.file_id},this)"
           title="Blocklist this release so the arr never grabs it again, delete the file (${esc(String(gb(r.size)))} GB), and search for a replacement. Not reversible.">Blocklist &amp; re-download</button></td>

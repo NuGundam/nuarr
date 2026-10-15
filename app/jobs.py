@@ -7678,6 +7678,15 @@ def _why_idle(workers, depth: int) -> dict:
     return out
 
 
+def _submake_running() -> list:
+    """The Subtitle maker runs outside this queue; it is shown beside it."""
+    try:
+        from . import submake
+        return submake.as_running()
+    except Exception:                                            # noqa: BLE001
+        return []
+
+
 def live_snapshot() -> dict:
     """Just the moving parts, cheap enough to poll several times a second.
 
@@ -7698,7 +7707,7 @@ def live_snapshot() -> dict:
         depth = cur.execute(
             "SELECT COUNT(*) n FROM jobs WHERE state='queued'").fetchone()["n"]
     return {
-        "running": [w.as_dict() for w in workers],
+        "running": [w.as_dict() for w in workers] + _submake_running(),
         "queued": depth,
         "overall": _overall(depth, workers),
         "io": {
@@ -7855,7 +7864,7 @@ def snapshot(recent_limit: int = 60) -> dict:
         w.sample_io()
     _batch_reset_if_idle(depth, len(workers))
     return {
-        "running": [w.as_dict() for w in workers],
+        "running": [w.as_dict() for w in workers] + _submake_running(),
         "queued": depth,
         "queue": upcoming,
         "recent": recent_done,

@@ -42,10 +42,32 @@ KV_RECENT = "submake.recent"
 KV_TRIED = "submake.tried"     # file_id -> {"ok", "skipped", "at", "why"}, kept for good
 RECENT_KEEP = 40
 LANE = "Subtitle maker"
+RETRY_S = 6 * 3600          # a crashed run is offered again after this
 
 STATE: dict = {"running": False, "file_id": None, "label": "", "stage": "", "pct": 0.0,
                "note": "", "started": 0.0, "waiting_for": ""}
 _TASK: asyncio.Task | None = None
+_PROC = None                   # the worker process while one runs
+_STOPPED = False
+
+
+def stop() -> bool:
+    """Stop the file being made: the worker and anything it started."""
+    global _STOPPED
+    p = _PROC
+    if p is None or p.returncode is not None:
+        return False
+    _STOPPED = True
+    try:
+        import subprocess
+        subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"],
+                       capture_output=True, creationflags=NO_WINDOW)
+    except Exception:                                            # noqa: BLE001
+        try:
+            p.kill()
+        except Exception:                                        # noqa: BLE001
+            return False
+    return True
 
 
 def _queue() -> list:
@@ -83,6 +105,13 @@ def _remember(row: dict) -> None:
         t[str(int(row["file_id"]))] = {
             "ok": bool(row.get("ok")), "at": row.get("at") or time.time(),
             "skipped": "burned into the picture" in str(row.get("why") or ""),
+            # A CRASH IS NOT AN ANSWER. Only "nothing was spoken or written"
+            # says the file cannot be helped; a worker that died (WinError
+            # 127, a missing model, an exception) says nothing about the file
+            # and must never be what lets the Raws check delete it.
+            "error": (not row.get("ok")
+                      and "burned into the picture" not in str(row.get("why") or "")
+                      and not str(row.get("why") or "").startswith("nothing was spoken")),
             "why": str(row.get("why") or "")[:200]}
         kv_set(KV_TRIED, json.dumps(t))
 
@@ -92,7 +121,9 @@ def gate(file_id: int) -> str:
 
     'none'    never tried       'pending'  queued or being made now
     'ok'      subtitles made    'skipped'  English already burned in
-    'failed'  tried, and nothing came of it
+    'failed'  tried, and there was nothing to make subtitles from
+    'retry'   the worker itself failed - not a fact about the file; it is
+              offered again ('none') once RETRY_S has passed
     """
     fid = int(file_id)
     if STATE.get("file_id") == fid or any(int(x["file_id"]) == fid for x in _queue()):
@@ -102,7 +133,11 @@ def gate(file_id: int) -> str:
         return "none"
     if t.get("ok"):
         return "ok"
-    return "skipped" if t.get("skipped") else "failed"
+    if t.get("skipped"):
+        return "skipped"
+    if t.get("error"):
+        return "none" if time.time() - float(t.get("at") or 0) > RETRY_S else "retry"
+    return "failed"
 
 
 def _row(file_id: int) -> dict | None:
@@ -219,9 +254,12 @@ async def _one(file_id: int, overwrite: bool, by: str = "you") -> None:
     cmd = [sys.executable, "-m", "app.submake_worker", "--src", r["path"], "--out", tmp,
            "--lang", lang, "--title", film, "--duration", str(float(r["duration"] or 0)),
            "--data", str(DATA_DIR), "--ffmpeg", _ffmpeg_exe()] + (["--force"] if overwrite else [])
+    global _PROC, _STOPPED
+    _STOPPED = False
     p = await asyncio.create_subprocess_exec(*cmd, cwd=root, stdout=asyncio.subprocess.PIPE,
                                              stderr=asyncio.subprocess.DEVNULL,
                                              creationflags=NO_WINDOW)
+    _PROC = p
     end: dict = {}
     while True:
         ln = await p.stdout.readline()
@@ -236,6 +274,9 @@ async def _one(file_id: int, overwrite: bool, by: str = "you") -> None:
         if d.get("done") or d.get("error"):
             end = d
     await p.wait()
+    _PROC = None
+    if _STOPPED and not end.get("done"):
+        end = {"error": "stopped by you"}
     row = {"at": time.time(), "file_id": file_id, "label": label, "lang": lang,
            "library": r["library"] or "", "file": os.path.basename(r["path"]),
            "secs": round(time.time() - STATE["started"]), "by": by}
@@ -286,6 +327,38 @@ async def _one(file_id: int, overwrite: bool, by: str = "you") -> None:
                                 f"{row['onscreen']} on-screen lines\n{pushover._esc(row['why'])}")
     except Exception:                                            # noqa: BLE001
         pass
+
+
+def as_running() -> list:
+    """The maker as a worker card, for the job feed the dashboard and the
+    Processing System draw from - so a file being given subtitles shows where
+    every other piece of running work does, not only on the Subtitles page.
+    Empty when nothing is being made."""
+    if not STATE.get("running"):
+        return []
+    fid = STATE.get("file_id")
+    el = time.time() - float(STATE.get("started") or time.time())
+    pct = max(0.0, min(1.0, float(STATE.get("pct") or 0) / 100.0))
+    eta = round(el / pct - el) if 0.05 < pct < 1 else None
+    stage = STATE.get("stage") or "starting"
+    return [{
+        "job_id": f"submake-{fid}", "pool": "submake", "kind": "submake",
+        "title": STATE.get("label") or "", "file": STATE.get("file") or "",
+        "path": "", "stage": stage + (f" - {STATE['note']}" if STATE.get("note") else ""),
+        "progress": pct, "elapsed_s": round(el), "eta_s": eta, "eta_est": True,
+        "plan": "make English subtitles - Whisper for what is said, OCR and Qwen for what is written",
+        "why_pool": ("The Subtitle maker: English subtitles for a file that has none. One file "
+                     "at a time on the heavy lane; it runs outside the job queue, in its own "
+                     "process, and follows the library's sidecar rule when it is done."),
+        "doing": {"tool": "Whisper large-v3 + PaddleOCR + Qwen2.5-7B", "hw": "GPU",
+                  "why": stage},
+        "actions": [{"kind": "subtitle", "what": "make English subtitles",
+                     "why": "the file has no subtitles anyone here can read", "detail": ""}],
+        "venc": None, "fps": 0.0, "speed": 0.0, "paused_for_viewer": False,
+        "paused_for_load": False, "pace_factor": 0.0, "pace_why": "", "cancelled": False,
+        "by_bytes": False, "disk": "", "dest_disk": "", "lang": STATE.get("lang") or "",
+        "library": STATE.get("library") or "", "file_id": fid,
+    }]
 
 
 def snapshot() -> dict:
