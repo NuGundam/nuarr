@@ -165,7 +165,8 @@ async def _one(file_id: int, overwrite: bool) -> None:
         return
     lang = _lang_of(r)
     STATE.update(running=True, file_id=file_id, label=label, stage="starting", pct=0.0,
-                 note="", started=time.time())
+                 note="", started=time.time(), library=r["library"] or "",
+                 file=os.path.basename(r["path"]), lang=lang)
     joblog.log(f"subtitle maker: {label} ({lang} -> English)", "info")
     tmp = os.path.join(str(DATA_DIR), "submake.tmp.srt")
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -191,6 +192,7 @@ async def _one(file_id: int, overwrite: bool) -> None:
             end = d
     await p.wait()
     row = {"at": time.time(), "file_id": file_id, "label": label, "lang": lang,
+           "library": r["library"] or "", "file": os.path.basename(r["path"]),
            "secs": round(time.time() - STATE["started"])}
     if not end.get("done") or not os.path.exists(tmp):
         row.update(ok=False, why=end.get("error") or f"the worker stopped (exit {p.returncode})")
@@ -247,7 +249,9 @@ def snapshot() -> dict:
     for x in q:
         r = _row(int(x["file_id"]))
         if r:
-            rows.append({"file_id": r["id"], "label": display_label(r["title"], r["season"], r["episode"], r["path"])})
+            rows.append({"file_id": r["id"], "label": display_label(r["title"], r["season"], r["episode"], r["path"]),
+                         "library": r["library"] or "", "file": os.path.basename(r["path"]),
+                         "lang": _lang_of(r), "at": x.get("at")})
     return {"state": dict(STATE), "queue": rows, "recent": _recent(), "lane": heavy.state()}
 
 

@@ -40328,7 +40328,7 @@ function snPaint(force){
       _snDone?'hide':'also show'} the ${fmt(nDone)} answered</a>`:''}
   </div>${doneList}`;
 
-  const html=`<div class="subsp" id="subsPanelNeed">${head}<div id="smStrip"></div>${snScoreTable()}${snWantBox()}${prog}${table}${foot}</div>`;
+  const html=`<div class="subsp" id="subsPanelNeed">${head}${snScoreTable()}${snWantBox()}${prog}${table}${foot}</div>`;
 
   // WHAT COUNTS AS CHANGED IS THE ROWS, not the markup.
   //
@@ -40352,11 +40352,11 @@ function snPaint(force){
   if(!force && askOpen('snPanel')) { snSchedule(); return; }
   if(!force && !rowsChanged && (panelBusy('snPanel') || panelScrolled('snPanel'))) {
     snSchedule(); return; }
-  if(html===_snKey){ smPaint(); snSchedule(); return; }
+  if(html===_snKey){ snSchedule(); return; }
 
   const box=el.querySelector('.rowbox'), keep=box?box.scrollTop:0;
   _snKey=html; _snRowSig=sig; el.innerHTML=html;
-  smPaint(); smLoad();
+
   const nb=el.querySelector('.rowbox'); if(nb&&keep) nb.scrollTop=keep;
   // SAY SO WHEN IT MOVES. A row vanishing while you are looking at the panel
   // is news, and the same pulse every other panel here uses is how this page
@@ -40377,53 +40377,101 @@ async function snRun(btn){
   setTimeout(()=>loadSubNeed(true), 250);
 }
 // ---- the subtitle maker (submake.py) -----------------------------------
-// ITS OWN STRIP, FILLED SEPARATELY. The Raws panel only repaints when its
-// rows change; a progress figure that moves every few seconds would defeat
-// that, so the strip is a fixed slot in the panel and this fills it.
-let _sm=null, _smPoll=null;
+// ITS OWN PANEL, drawn like Subtitle User Input: a header with its count, a
+// search row, and one table in a scroll box - what is being made and what is
+// waiting at the top, what has been made under it. The shell is drawn once
+// and only the header counts and the table are redrawn, so the search box
+// keeps what you are typing and the scroll box keeps its place.
+let _sm=null, _smPoll=null, _smQ='', _smHits='', _smKey='';
 async function smLoad(){
+  if(!document.getElementById('smPanel')) return;
   try{ _sm=await (await fetch('/api/submake')).json(); }catch(e){ return; }
   smPaint();
   if(_smPoll) clearTimeout(_smPoll);
-  const busy=_sm.state&&_sm.state.running || (_sm.queue||[]).length;
-  if(busy && document.getElementById('smStrip')) _smPoll=setTimeout(smLoad, 3000);
+  const busy=(_sm.state&&_sm.state.running) || (_sm.queue||[]).length;
+  _smPoll=setTimeout(()=>{ if(document.getElementById('smPanel')) smLoad(); }, busy?3000:60000);
+}
+function smShell(){
+  return `<div class="subsp" id="subsPanelMake">
+    <div class="subshd"><b style="color:#79c0ff">Subtitle maker</b>
+      <span class="subskind k-yours" title="Nothing is made until you ask: a file found below, or the Make subtitles button on a raw.">when you ask</span>
+      <span class="dim subssub" title="Whisper large-v3 for what is said, timed by the voice detector so a line starts when the voice does; PaddleOCR for what is written on screen, translated by Qwen2.5-7B and shown at the top. A file with English already burned into the picture is skipped. The first run on a new install downloads about 11 GB of models.">English subtitles for a file that has none - listens, reads the picture, translates</span>
+      <span class="subsn" id="smCount"></span></div>
+    <div class="dim" style="font-size:11px;margin:2px 0 6px">Where the result lives follows the library's sidecar rule: with
+      <i>embed sidecars</i> on it goes inside the file, otherwise it stays beside it as <span class="mono">name.en.srt</span>.
+      One file at a time, on the same lane as the other heavy GPU jobs.</div>
+    <div style="display:flex;gap:6px;align-items:center;margin-bottom:4px">
+      <input id="smQ" placeholder="make subtitles for… (title or file name)" style="flex:1;font-size:11px"
+        onkeydown="if(event.key==='Enter') smFind()">
+      <button class="rmb" onclick="smFind()">Find</button></div>
+    <div id="smHits"></div>
+    <div id="smTable"></div>
+  </div>`;
+}
+function smRowHtml(r){
+  const lib=`<td class="c dim" style="font-size:10.5px">${esc(r.library||'—')}</td>`;
+  const ep=`<td class="l"><b style="font-size:11.5px">${esc(r.label||'')}</b>
+      <div class="dim mono" style="font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.file||'')}</div></td>`;
+  const when=`<td class="c dim mono" style="font-size:10.5px" title="${r.at?esc(new Date(r.at*1000).toLocaleString()):''}">${r.at?ago(r.at):'—'}</td>`;
+  if(r.kind==='running'){
+    const st=r.st;
+    return `<tr>${ep}${lib}<td class="c dim mono" style="font-size:10.5px">${esc(r.lang||'')}</td>${when}
+      <td class="l" colspan="2"><div style="font-size:10.5px"><b style="color:#79c0ff">making</b> · ${esc(st.stage||'')}${st.note?' <span class="dim">· '+esc(st.note)+'</span>':''}
+        <span class="mono" style="float:right">${Math.round(st.pct||0)}%</span></div>
+        <div style="height:4px;background:var(--line);border-radius:2px;margin-top:3px">
+          <div style="height:4px;width:${Math.min(100,st.pct||0)}%;background:#79c0ff;border-radius:2px"></div></div></td>
+      <td class="r"></td></tr>`;
+  }
+  if(r.kind==='queued')
+    return `<tr>${ep}${lib}<td class="c dim mono" style="font-size:10.5px">${esc(r.lang||'')}</td>${when}
+      <td class="l" colspan="2"><span style="color:#e8a33d;font-size:10.5px">queued</span>${
+        _sm.state&&_sm.state.waiting_for?` <span class="dim" style="font-size:10.5px">- waiting for ${esc(_sm.state.waiting_for)}</span>`:''}</td>
+      <td class="r"><button class="rmb" onclick="smCancel(${r.file_id},this)">Remove</button></td></tr>`;
+  const burned=!r.ok && /burned into the picture/.test(r.why||'');
+  return `<tr>${ep}${lib}<td class="c dim mono" style="font-size:10.5px">${esc(r.lang||'')}</td>${when}
+    <td class="l" style="font-size:10.5px">${r.ok
+        ?`<span style="color:#7fd4a3">${fmt(r.narration||0)} spoken + ${fmt(r.onscreen||0)} on-screen</span>`
+        :`<span style="color:${burned?'#e8a33d':'#e0575b'}">${burned?'skipped':'failed'}</span>`}
+      <div class="dim" style="font-size:10px;white-space:normal">${esc(r.why||'')}</div></td>
+    <td class="c" style="font-size:10.5px">${r.ok?(r.where==='embedded'
+        ?'<span style="color:#7fd4a3" title="inside the file - the library embeds sidecars">in the file</span>'
+        :'<span class="dim" title="beside the file as name.en.srt - this library keeps sidecars">beside it</span>'):'—'}</td>
+    <td class="r">${burned
+        ?`<button class="rmb" onclick="smMake(${r.file_id},this,1)" title="Make them even though English is already in the picture - the file gets a second English track.">Make anyway</button>`
+        :(!r.ok?`<button class="rmb" onclick="smMake(${r.file_id},this)">Try again</button>`:'')}</td></tr>`;
 }
 function smPaint(){
-  const el=document.getElementById('smStrip'); if(!el||!_sm) return;
-  const st=_sm.state||{}, q=_sm.queue||[], rec=(_sm.recent||[]).slice(0,4);
-  const bar=st.running?`<div style="display:flex;gap:10px;align-items:center">
-      <b style="color:#79c0ff">making subtitles</b><span>${esc(st.label||'')}</span>
-      <span class="dim">${esc(st.stage||'')}${st.note?' · '+esc(st.note):''}</span>
-      <span class="mono" style="margin-left:auto">${Math.round(st.pct||0)}%</span></div>
-      <div style="height:4px;background:var(--line);border-radius:2px;margin-top:3px">
-        <div style="height:4px;width:${Math.min(100,st.pct||0)}%;background:#79c0ff;border-radius:2px"></div></div>`
-    : (st.waiting_for?`<div class="dim">waiting for the heavy lane - ${esc(st.waiting_for)} is using it</div>`:'');
-  const qline=q.length?`<div class="dim" style="margin-top:3px">queued: ${q.map(x=>esc(x.label)).join(' · ')}</div>`:'';
-  const recs=rec.length?`<div style="margin-top:4px">${rec.map(r=>`<div style="font-size:10.5px">
-      <span class="dim mono">${ago(r.at)}</span> <b>${esc(r.label||'')}</b>
-      <span style="color:${r.ok?'#7fd4a3':'#e0575b'}">${r.ok?`${fmt(r.narration||0)} spoken + ${fmt(r.onscreen||0)} on-screen lines`:'failed'}</span>
-      <span class="dim">— ${esc(r.why||'')}</span>${!r.ok&&/burned into the picture/.test(r.why||'')
-        ?` <button class="rmb" style="font-size:10px" onclick="smMake(${r.file_id},this,1)" title="Make them even though English is already in the picture - the file gets a second English track.">Make anyway</button>`:''}</div>`).join('')}</div>`:'';
-  el.innerHTML=`<div style="font-size:11.5px;margin:6px 0;padding:6px 9px;border:1px solid var(--line);border-radius:6px;background:rgba(121,192,255,.05)">
-    <b>Subtitle maker</b> <span class="dim" style="font-size:10.5px" title="Whisper large-v3 for what is said (timed by the voice detector, so lines start when the voice does), PaddleOCR for what is written on screen, Qwen2.5-7B to translate it. The first run downloads about 11 GB of models.">listens, reads the picture, translates</span>
-    <div style="display:flex;gap:6px;align-items:center;margin-top:4px">
-      <input id="smQ" placeholder="make subtitles for… (title or file name)" style="flex:1;font-size:11px"
-        onkeydown="if(event.key==='Enter') smFind()" value="${esc(_smQ)}">
-      <button class="rmb" onclick="smFind()">Find</button></div>
-    <div id="smHits">${_smHits}</div>
-    ${bar}${qline}${recs}</div>`;
+  const el=document.getElementById('smPanel'); if(!el||!_sm) return;
+  if(!document.getElementById('smTable')) el.innerHTML=smShell();
+  const st=_sm.state||{}, q=(_sm.queue||[]).filter(x=>!(st.running&&x.file_id===st.file_id));
+  const rows=[];
+  if(st.running) rows.push({kind:'running', st, label:st.label, library:st.library, file:st.file, lang:st.lang, at:st.started});
+  q.forEach(x=>rows.push({kind:'queued', ...x}));
+  (_sm.recent||[]).forEach(x=>rows.push({kind:'done', ...x}));
+  const c=document.getElementById('smCount');
+  if(c) c.innerHTML=st.running||q.length
+    ? `${st.running?'1 making':''}${st.running&&q.length?' · ':''}${q.length?num(q.length,'you')+' <span class="dim">queued</span>':''}`
+    : `<span class="dim">${fmt((_sm.recent||[]).length)} made so far</span>`;
+  const h=document.getElementById('smHits'); if(h && h.innerHTML!==_smHits) h.innerHTML=_smHits;
+  const table=rows.length?`<div class="rowbox scrollbox"><table class="sktbl" style="width:100%;font-size:11.5px;table-layout:fixed">
+      <colgroup><col style="width:auto"><col style="width:96px"><col style="width:46px"><col style="width:70px"><col style="width:34%"><col style="width:76px"><col style="width:96px"></colgroup>
+      <thead><tr class="dim" style="font-size:10.5px"><th class="l">EPISODE</th><th class="c">LIBRARY</th><th class="c">AUDIO</th><th class="c">WHEN</th>
+        <th class="l">RESULT</th><th class="c">WHERE</th><th class="r">ANSWER</th></tr></thead>
+      <tbody>${rows.map(smRowHtml).join('')}</tbody></table></div>`
+    : '<div class="dim" style="font-size:11.5px;padding:6px 0">nothing made yet - find a file above, or use Make subtitles on a raw</div>';
+  if(table===_smKey && document.querySelector('#smTable .sktbl, #smTable .dim')) return;
+  _smKey=table; keepBox('smTable', table);
 }
-let _smQ='', _smHits='';
 async function smFind(){
   const i=document.getElementById('smQ'); _smQ=(i&&i.value||'').trim();
   if(!_smQ){ _smHits=''; smPaint(); return; }
   let d; try{ d=await (await fetch('/api/files?q='+encodeURIComponent(_smQ)+'&limit=12')).json(); }catch(e){ return; }
   const rows=(d.rows||[]);
-  _smHits=rows.length?`<table style="width:100%;font-size:10.5px;margin-top:3px">${rows.map(r=>`<tr>
-      <td>${esc(r.label||r.title||'')}</td>
-      <td class="dim">${esc(r.library||'')}</td><td class="dim mono">${esc(r.audio_langs||'')}</td>
-      <td class="r"><button class="rmb" onclick="smMake(${r.id},this)">Make subtitles</button></td></tr>`).join('')}</table>`
-    :'<div class="dim" style="font-size:10.5px">nothing matches</div>';
+  _smHits=rows.length?`<div class="rowbox" style="max-height:180px;margin-bottom:6px"><table class="sktbl" style="width:100%;font-size:11px">${rows.map(r=>`<tr>
+      <td class="l">${esc(r.label||r.title||'')}</td>
+      <td class="c dim">${esc(r.library||'')}</td><td class="c dim mono">${esc(r.audio_langs||'')}</td>
+      <td class="r"><button class="rmb" onclick="smMake(${r.id},this)">Make subtitles</button></td></tr>`).join('')}</table></div>`
+    :'<div class="dim" style="font-size:10.5px;margin-bottom:6px">nothing matches</div>';
   smPaint();
 }
 async function smMake(fid, btn, force){
@@ -40433,6 +40481,11 @@ async function smMake(fid, btn, force){
     btn.textContent=d.added?'queued':(d.skipped&&d.skipped[0]?'skipped':'—');
     if(!d.added && d.skipped && d.skipped[0]) btn.title=d.skipped[0];
   }catch(e){ btn.textContent=was; btn.disabled=false; }
+  smLoad();
+}
+async function smCancel(fid, btn){
+  btn.disabled=true;
+  try{ await fetch('/api/submake/cancel?file_id='+fid,{method:'POST'}); }catch(e){}
   smLoad();
 }
 async function snAct(fid, btn){
@@ -43710,6 +43763,7 @@ function subsPaint(){
   if(subsOpen('language') && document.getElementById('snPanel') && !_sn){
     try{ loadSubNeed(); }catch(e){}
   }
+  if(document.getElementById('smPanel') && !_smPoll){ try{ smLoad(); }catch(e){} }
 }
 
 function laneLines(fl, small){
