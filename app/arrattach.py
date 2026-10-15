@@ -48,6 +48,98 @@ STATS: dict = {"checked": 0, "reattached": 0, "unmatched": 0, "last_run": 0.0}
 _AIRDATE = re.compile(r"(?<!\d)(\d{4})-(\d{2})-(\d{2})(?!\d)")
 
 
+# QWEN READS THE NAME THE ARR COULD NOT. A special or an OVA is usually named
+# by its title ("Ah! My Goddess - OVA - An Exchange Diary with the Goddess"),
+# and Sonarr's parser only reads numbers. Qwen gets the name and the show's
+# episodes that have no file yet, and picks one - and that pick is used only
+# when the name itself backs it up (_fits): most of the episode title's words,
+# or its S00E07 / episode number, are in the name. One try per file.
+_STOP = {"the", "and", "with", "from", "for", "that", "this", "are", "was", "his", "her", "its",
+         "you", "your", "part", "episode", "special", "ova", "movie", "into", "out", "not"}
+KV_QWEN_EP = "arrattach.qwen_tried"
+
+
+def _words(t: str) -> set:
+    return {w for w in re.findall(r"[a-z0-9]+", (t or "").lower()) if len(w) >= 3 and w not in _STOP}
+
+
+def _fits(name: str, ep: dict, show: str = "") -> str:
+    """Why the name backs up this episode, or '' when it does not. The show's
+    own title words do not count: "Goddess" is in every Ah! My Goddess name,
+    and it let Qwen's wrong pick "Ah! My Goddess: The Movie" through."""
+    low = name.lower()
+    s, e = int(ep.get("seasonNumber") or 0), int(ep.get("episodeNumber") or 0)
+    if re.search(rf"s0*{s}e0*{e}(?!\d)", low):
+        return f"the name says S{s:02d}E{e:02d}"
+    sw = _words(show)
+    tw, nw = _words(ep.get("title") or "") - sw, _words(name) - sw
+    hit = tw & nw
+    if tw and len(hit) >= min(2, len(tw)) and len(hit) / len(tw) >= 0.6:
+        return f"{len(hit)} of {len(tw)} title words are in the name"
+    return ""
+
+
+async def _qwen_episode(c, parent_id: int, path: str) -> tuple[list[int], str]:
+    import json as _json
+    import subprocess
+    import sys
+    from . import heavy
+    from .config import NO_WINDOW, hidden_si
+    from .db import kv_get, kv_set
+    name = os.path.basename(path)
+    try:
+        tried = _json.loads(kv_get(KV_QWEN_EP) or "[]")
+    except Exception:                                            # noqa: BLE001
+        tried = []
+    if path in tried:
+        return [], "Qwen already tried this name and found no episode it backs"
+    eps = [e for e in (await c._get("/episode", seriesId=int(parent_id)) or [])
+           if not e.get("hasFile") and (e.get("title") or "").strip()]
+    if not eps:
+        return [], "every episode of the show already has a file"
+    # A long show's whole list is too much to read. Ranked by the title words
+    # it shares with the name (the show's own words not counted), specials
+    # first among equals; Detective Conan has hundreds of specials, and the
+    # first 120 in order did not reach OVA 11.
+    try:
+        show = (await c._get(f"/series/{int(parent_id)}") or {}).get("title") or ""
+    except Exception:                                            # noqa: BLE001
+        show = ""
+    nw = _words(name) - _words(show)
+    eps.sort(key=lambda e: (-len((_words(e.get("title")) - _words(show)) & nw),
+                            int(e.get("seasonNumber") or 0) != 0))
+    short = eps[:40]
+    got, holder = heavy.claim("Qwen episode match", ttl=600)
+    if not got:
+        return [], f"Qwen waits - {holder} has the GPU lane"
+    try:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        r = await asyncio.to_thread(
+            subprocess.run, [sys.executable, "-m", "app.qwentools", "--pick-episode"],
+            input=_json.dumps({"name": name, "episodes": [
+                {"id": e["id"], "s": e.get("seasonNumber"), "e": e.get("episodeNumber"),
+                 "title": e.get("title")} for e in short]}),
+            capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=root,
+            timeout=600, creationflags=NO_WINDOW, startupinfo=hidden_si())
+    finally:
+        heavy.release("Qwen episode match")
+    picked = {}
+    for ln in (r.stdout or "").splitlines():
+        try:
+            picked = _json.loads(ln).get("picked") or picked
+        except Exception:                                        # noqa: BLE001
+            pass
+    kv_set(KV_QWEN_EP, _json.dumps((tried + [path])[-300:]))
+    ep = next((e for e in short if e["id"] == picked.get("id")), None)
+    if not ep:
+        return [], "Qwen found no episode that clearly fits the name"
+    why = _fits(name, ep, show)
+    label = f"S{int(ep.get('seasonNumber') or 0):02d}E{int(ep.get('episodeNumber') or 0):02d} {ep.get('title')}"
+    if not why:
+        return [], f"Qwen said {label}, but the name does not back it up - left for you"
+    return [int(ep["id"])], f"Qwen read the name as {label} ({why})"
+
+
 async def _daily_episode(c, parent_id: int, path: str,
                          season: int | None) -> tuple[list[int], str]:
     """For an air-by-date series, the episode the filename's date names.
@@ -206,6 +298,11 @@ async def reattach(cfg, parent_id: int, path: str,
             # provider has wrong) is reported and left alone, because a wrong
             # attachment hides the problem behind a file on the wrong episode.
             eps, why = await _daily_episode(c, parent_id, path, season)
+            if not eps:
+                eps, why2 = await _qwen_episode(c, parent_id, path)
+                if not eps:
+                    return False, f"{why}; {why2}"
+                why = why2
             if not eps:
                 return False, why
             how = f"re-attached by manual import - {why}"

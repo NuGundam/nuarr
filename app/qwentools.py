@@ -2,6 +2,7 @@ r"""nuarr - small Qwen jobs, each in a child process of its own.
 
     python -m app.qwentools --parse-names     JSON list of names on stdin
     python -m app.qwentools --fix-ocr IN OUT  an OCR'd SRT in, a corrected one out
+    python -m app.qwentools --pick-episode    {name, episodes} on stdin
 
 Both print one JSON object per line on stdout. See qwenlib for why Qwen only
 ever runs in a child.
@@ -24,6 +25,27 @@ import json
 import os
 import re
 import sys
+
+# HIDE EVERY GRANDCHILD'S CONSOLE. This child is started hidden, but what it
+# starts (ffmpeg, ffprobe) gets a console of its own unless told otherwise -
+# the console watcher caught ffmpeg windows flashing from the Subtitle maker
+# and the Qwen jobs. Same patch as whisper_worker.py and paddle_worker.py.
+try:
+    import subprocess as _sp
+    if os.name == "nt":
+        _orig_popen = _sp.Popen.__init__
+
+        def _hidden_popen(self, *a, **kw):
+            kw["creationflags"] = (kw.get("creationflags") or 0) | 0x08000000
+            if not kw.get("startupinfo"):
+                si = _sp.STARTUPINFO()
+                si.dwFlags |= _sp.STARTF_USESHOWWINDOW
+                si.wShowWindow = 0                       # SW_HIDE
+                kw["startupinfo"] = si
+            return _orig_popen(self, *a, **kw)
+        _sp.Popen.__init__ = _hidden_popen               # type: ignore[method-assign]
+except Exception:                                        # noqa: BLE001
+    pass
 
 
 def _say(**k):
@@ -48,6 +70,25 @@ def parse_names(names: list) -> list:
             d = {}
         out.append({"name": n, **{k: d.get(k) for k in ("kind", "title", "year", "season", "episode")}})
     return out
+
+
+def pick_episode(name: str, episodes: list) -> dict:
+    """Which of these episodes is this file? -> {"id": int|None, "said": str}.
+    The caller checks the answer against the name before it acts on it."""
+    from app import qwenlib
+    sysm = ("You match a video file to its episode. You get the file name and a numbered list of "
+            "episodes of the same show (season, episode, title). Specials, OVAs and movies are season "
+            "0. Reply exactly: EPISODE: the SxxExx code of the one episode the file clearly is, or "
+            "EPISODE: NONE if no episode clearly fits. Then WHY: one short sentence.")
+    # CODES, NOT LIST NUMBERS. Asked for a list number, Qwen answered "18"
+    # and explained it as "S00E01" - list position and episode number are
+    # both small integers and it mixed them up.
+    code = {f"S{int(e.get('s') or 0):02d}E{int(e.get('e') or 0):02d}": e for e in episodes}
+    listing = "\n".join(f"{k} - {e.get('title') or ''}" for k, e in code.items())
+    said = qwenlib.ask(sysm, f"File: {name}\n\nEpisodes:\n{listing}", max_len=60) or ""
+    m = re.search(r"EPISODE:\s*S(\d+)\s*E(\d+)", said, re.I)
+    e = code.get(f"S{int(m.group(1)):02d}E{int(m.group(2)):02d}") if m else None
+    return {"id": e["id"] if e else None, "said": said.strip()[:200]}
 
 
 _SWAP = [set("lI1|!"), set("0Oo"), set("5S"), set("8B")]
@@ -118,6 +159,9 @@ def main():
         if args[:1] == ["--parse-names"]:
             names = json.loads(sys.stdin.read() or "[]")
             _say(parsed=parse_names(names))
+        elif args[:1] == ["--pick-episode"]:
+            d = json.loads(sys.stdin.read() or "{}")
+            _say(picked=pick_episode(d.get("name") or "", d.get("episodes") or []))
         elif args[:1] == ["--fix-ocr"] and len(args) >= 3:
             _say(fixed=fix_ocr(args[1], args[2]))
         else:

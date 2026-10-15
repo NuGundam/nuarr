@@ -43,6 +43,27 @@ import subprocess
 import sys
 import time
 
+# HIDE EVERY GRANDCHILD'S CONSOLE. This child is started hidden, but what it
+# starts (ffmpeg, ffprobe) gets a console of its own unless told otherwise -
+# the console watcher caught ffmpeg windows flashing from the Subtitle maker
+# and the Qwen jobs. Same patch as whisper_worker.py and paddle_worker.py.
+try:
+    import subprocess as _sp
+    if os.name == "nt":
+        _orig_popen = _sp.Popen.__init__
+
+        def _hidden_popen(self, *a, **kw):
+            kw["creationflags"] = (kw.get("creationflags") or 0) | 0x08000000
+            if not kw.get("startupinfo"):
+                si = _sp.STARTUPINFO()
+                si.dwFlags |= _sp.STARTF_USESHOWWINDOW
+                si.wShowWindow = 0                       # SW_HIDE
+                kw["startupinfo"] = si
+            return _orig_popen(self, *a, **kw)
+        _sp.Popen.__init__ = _hidden_popen               # type: ignore[method-assign]
+except Exception:                                        # noqa: BLE001
+    pass
+
 WHISPER_MODEL = "large-v3"
 LLM_REPO = "jncraton/Qwen2.5-7B-Instruct-ct2-int8"
 OCR_FPS = 2

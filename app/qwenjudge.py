@@ -41,6 +41,71 @@ SYS = ("You judge OCR output from a video. A program took a few frames spread th
        "only letter noise are NOT dialogue. Reply exactly: "
        "DIALOGUE CHANCE: a number 0-100 (100 = certainly burned-in dialogue, 0 = certainly "
        "not); WHY: one short sentence.")
+# LEARNING FROM THE ANSWERS ON RECORD. A show keeps the same on-screen text
+# from episode to episode - Beet the Vandel Buster's burned-in subtitles look
+# alike in every episode, and so does a channel logo - and the misses were
+# clustered by show (5 of 12 were Beet, 2 GaoGaiGar). So each file is judged
+# with a tally of a person's answers on OTHER files of the same show in
+# front of it. A file's own answer is never in its tally, which is also what keeps the measurement honest. When a show gets
+# a new answer, its files are judged again with it.
+EXAMPLES = 1          # 0 switches the tally off (measuring)
+LEARN_NOTE = ("You may be told what a person decided about OTHER episodes of the same show; a show's "
+              "on-screen text is usually the same kind in every episode, so weigh that heavily.")
+
+
+def series_of(path: str) -> str:
+    d = os.path.dirname(path or "")
+    if re.match(r"(?i)^(season\s*\d+|specials|s\d+)$", os.path.basename(d)):
+        d = os.path.dirname(d)
+    return d.lower()
+
+
+def pool(cur) -> dict:
+    """{series: [(file_id, 'yes'|'no', lines)]} - the answers on record."""
+    ign = {int(r["file_id"]) for r in cur.execute("SELECT file_id FROM hardsub_ignored")}
+    out: dict = {}
+    for r in cur.execute("SELECT file_id, path, chosen, lines FROM hardsub "
+                         " WHERE COALESCE(lines,'') NOT IN ('','[]') "
+                         "   AND (chosen IN ('dialogue','hybrid','none','signs') OR file_id IN "
+                         "        (SELECT file_id FROM hardsub_ignored)) ORDER BY file_id"):
+        fid = int(r["file_id"])
+        side = "no" if (fid in ign or r["chosen"] in ("none", "signs")) else "yes"
+        out.setdefault(series_of(r["path"]), []).append((fid, side, r["lines"]))
+    return out
+
+
+def pick(pl: dict, fid: int, path: str) -> list:
+    """Every answer on the same show, never this file's own."""
+    if EXAMPLES <= 0:
+        return []
+    return [x for x in pl.get(series_of(path), []) if x[0] != int(fid)]
+
+
+def _ex_sig(ex: list) -> str:
+    """What the prompt says, so a changed tally is judged again."""
+    if not ex:
+        return ""
+    y = sum(1 for x in ex if x[1] == "yes")
+    return f"{y}y{len(ex) - y}n"
+
+
+def _ex_text(ex: list) -> str:
+    # A TALLY, NOT THE LINES. Measured on the 149 answers on record, the
+    # other episodes' own lines put in front of the file made Qwen worse -
+    # 31 of 101 dialogue files against 76 without - because it compared the
+    # texts ("does not match the pattern of the previous files") instead of
+    # reading them. A sentence saying what a person decided does not invite that.
+    if not ex:
+        return ""
+    y = sum(1 for x in ex if x[1] == "yes")
+    n = len(ex) - y
+    said = ("all had burned-in dialogue subtitles" if not n else
+            "none had burned-in dialogue subtitles" if not y else
+            f"{y} had burned-in dialogue subtitles and {n} did not")
+    return (f"A person has already checked {len(ex)} other episode(s) of this same show: {said}. "
+            f"OCR on this show may be just as fragmentary.\n\n")
+
+
 # ONE NUMBER, NOT A VERDICT AND A CONFIDENCE. "VERDICT: NOT DIALOGUE; SURE: 0"
 # came back meaning "0% dialogue", which read as a sure "not" became 100%.
 STATE: dict = {"running": False, "last_run": 0.0, "next_run": 0.0, "last_result": "",
@@ -72,6 +137,43 @@ def init_tracks() -> None:
                 at         REAL,
                 PRIMARY KEY (file_id, track)
             )""")
+        cols = {r["name"] for r in cur.execute("PRAGMA table_info(subtitle_qwen)")}
+        if "ex" not in cols:
+            cur.execute("ALTER TABLE subtitle_qwen ADD COLUMN ex TEXT NOT NULL DEFAULT ''")
+
+
+# THE SAME TALLY FOR TRACKS: the kinds a person set on other tracks of the
+# same show, never this track's own.
+def track_pool(rows: list) -> dict:
+    out: dict = {}
+    for r in rows:
+        if r.get("chosen") and r.get("kind"):
+            out.setdefault(series_of(r.get("path") or ""), []).append(
+                ((int(r["file_id"]), int(r["track"])), str(r["kind"])))
+    return out
+
+
+def track_tally(pl: dict, key: tuple, path: str) -> dict:
+    if EXAMPLES <= 0:
+        return {}
+    t: dict = {}
+    for k, kind in pl.get(series_of(path), []):
+        if k != key and k[0] != key[0]:
+            t[kind] = t.get(kind, 0) + 1
+    return t
+
+
+def _tally_sig(t: dict) -> str:
+    return ",".join(f"{k}{v}" for k, v in sorted(t.items()))
+
+
+def _tally_text(t: dict) -> str:
+    if not t:
+        return ""
+    words = {"dialogue": "dialogue", "hybrid": "dialogue + signs", "signs": "signs / songs only",
+             "none": "not subtitles"}
+    return (f"A person already set the kind of {sum(t.values())} similar track(s) on other episodes of "
+            f"this show: " + ", ".join(f"{v} {words.get(k, k)}" for k, v in sorted(t.items())) + ".\n")
 
 
 def track_verdicts() -> dict:
@@ -83,36 +185,57 @@ def track_verdicts() -> dict:
         for r in cur.execute("SELECT * FROM subtitle_qwen"):
             out[(int(r["file_id"]), int(r["track"]))] = {"p": int(r["dialogue_p"] or 0),
                                                          "kind": r["kind"] or "", "why": r["why"] or "",
-                                                         "size": int(r["size"] or 0)}
+                                                         "size": int(r["size"] or 0), "ex": r["ex"] or ""}
     return out
 
 
 def pending_tracks() -> list:
     from . import subtitletitle as stt
     have = track_verdicts()
+    rows = stt.cached().get("rows") or []
+    pl = track_pool(rows)
     out = []
-    for r in (stt.cached().get("rows") or []):
+    for r in rows:
         if r.get("unread") or not r.get("mkv_id") and r.get("mkv_id") != 0:
             continue
         k = (int(r["file_id"]), int(r["track"]))
         v = have.get(k)
-        if v and v["size"] == int(r.get("size") or 0):
+        tally = track_tally(pl, k, r.get("path") or "")
+        if v and v["size"] == int(r.get("size") or 0) and v.get("ex", "") == _tally_sig(tally):
             continue
         out.append({"file_id": k[0], "track": k[1], "mkv_id": int(r["mkv_id"]), "path": r.get("path"),
                     "size": int(r.get("size") or 0), "title": r.get("old") or "",
-                    "label": r.get("label") or ""})
+                    "label": r.get("label") or "", "tally": tally})
     return out
 
 
 # ----------------------------------------------------------------- server --
-def pending(limit: int = BATCH) -> list:
+def init_learn() -> None:
     from .db import cursor
     with cursor() as cur:
-        return [int(r["file_id"]) for r in cur.execute(
-            "SELECT h.file_id FROM hardsub h LEFT JOIN hardsub_qwen q ON q.file_id = h.file_id "
-            " WHERE COALESCE(h.lines,'') NOT IN ('', '[]') "
-            "   AND (q.file_id IS NULL OR q.at < h.at) "
-            " ORDER BY h.at DESC LIMIT ?", (int(limit),))]
+        cols = {r["name"] for r in cur.execute("PRAGMA table_info(hardsub_qwen)")}
+        if cols and "ex" not in cols:
+            cur.execute("ALTER TABLE hardsub_qwen ADD COLUMN ex TEXT NOT NULL DEFAULT ''")
+
+
+def pending(limit: int = BATCH) -> list:
+    """Files with lines and no verdict, a verdict older than the lines, or a
+    verdict given with other examples than the show's answers now offer."""
+    from .db import cursor
+    init_learn()
+    out = []
+    with cursor() as cur:
+        pl = pool(cur)
+        for r in cur.execute(
+                "SELECT h.file_id, h.path, h.at, q.at qat, q.ex FROM hardsub h "
+                "  LEFT JOIN hardsub_qwen q ON q.file_id = h.file_id "
+                " WHERE COALESCE(h.lines,'') NOT IN ('', '[]') ORDER BY h.at DESC").fetchall():
+            if r["qat"] is None or r["qat"] < r["at"] or \
+                    (r["ex"] or "") != _ex_sig(pick(pl, r["file_id"], r["path"])):
+                out.append(int(r["file_id"]))
+                if len(out) >= limit:
+                    break
+    return out
 
 
 async def run() -> str:
@@ -350,7 +473,10 @@ def _judge(limit: int) -> None:
         g = ctranslate2.Generator(LLM_DIR, device="cuda", compute_type="int8_float16")
     except Exception:                                            # noqa: BLE001
         g = ctranslate2.Generator(LLM_DIR, device="cpu", compute_type="int8")
+    init_learn()
     ids = list(_ONLY) or pending(limit)
+    with cursor() as cur:
+        pl = pool(cur)
     with cursor() as cur:
         rows = [dict(r) for r in cur.execute(
             f"SELECT file_id, path, size, samples, lines FROM hardsub WHERE file_id IN "
@@ -361,21 +487,24 @@ def _judge(limit: int) -> None:
         part = rows[i:i + 8]
         print(json.dumps({"progress": i, "total": len(rows),
                           "file": os.path.basename(part[0]["path"] or "")}), flush=True)
-        prompts = []
+        prompts, exs = [], []
         for r in part:
+            ex = pick(pl, r["file_id"], r["path"])
+            exs.append(_ex_sig(ex))
             try:
                 L = json.loads(r["lines"] or "[]")
             except Exception:                                    # noqa: BLE001
                 L = []
             body = "\n".join(f"{x['t']}s: {x['text']}" for x in L)[:3000]
             prompts.append(tok.encode(
-                f"<|im_start|>system\n{SYS}<|im_end|>\n<|im_start|>user\nFile: "
+                f"<|im_start|>system\n{SYS} {LEARN_NOTE if ex else ''}<|im_end|>\n<|im_start|>user\n"
+                f"{_ex_text(ex)}File: "
                 f"{os.path.basename(r['path'] or '')}\n{len(L)} of {r['samples'] or len(L)} sampled "
                 f"frames had text:\n{body}<|im_end|>\n<|im_start|>assistant\n").tokens)
         res = g.generate_batch(prompts, max_length=80, sampling_topk=1,
                                include_prompt_in_result=False, end_token="<|im_end|>")
         with cursor() as cur:
-            for r, out in zip(part, res):
+            for r, out, sig in zip(part, res, exs):
                 t = tok.decode(out.sequences_ids[0]).strip()
                 c = re.search(r"CHANCE:\s*(\d{1,3})", t, re.I)
                 w = re.search(r"WHY:\s*(.+)", t, re.I | re.S)
@@ -383,13 +512,17 @@ def _judge(limit: int) -> None:
                     continue
                 p = max(0, min(100, int(c.group(1))))
                 verdict = "dialogue" if p >= 50 else "not dialogue"
+                if _DRY:
+                    print(json.dumps({"id": int(r["file_id"]), "p": p, "ex": sig, "why": t[:300]}), flush=True)
+                    done += 1
+                    continue
                 cur.execute(
-                    "INSERT INTO hardsub_qwen(file_id,path,size,verdict,dialogue_p,why,at) "
-                    "VALUES(?,?,?,?,?,?,?) ON CONFLICT(file_id) DO UPDATE SET path=excluded.path, "
+                    "INSERT INTO hardsub_qwen(file_id,path,size,verdict,dialogue_p,why,at,ex) "
+                    "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(file_id) DO UPDATE SET path=excluded.path, "
                     "size=excluded.size, verdict=excluded.verdict, dialogue_p=excluded.dialogue_p, "
-                    "why=excluded.why, at=excluded.at",
+                    "why=excluded.why, at=excluded.at, ex=excluded.ex",
                     (int(r["file_id"]), r["path"], r["size"], verdict, p,
-                     (w.group(1).strip().splitlines()[0] if w else "")[:200], time.time()))
+                     (w.group(1).strip().splitlines()[0] if w else "")[:200], time.time(), sig))
                 done += 1
     print(json.dumps({"judged": done}), flush=True)
 
@@ -425,10 +558,11 @@ def _judge_tracks(tf: str, offset: int) -> None:
             continue
         step = max(1, len(lines) // 40)
         sample = lines[::step][:40]
-        users.append(f"Track title: {t['title'] or '(none)'}\nFrom: {t['label']}\n"
+        users.append(_tally_text(t.get("tally") or {}) +
+                     f"Track title: {t['title'] or '(none)'}\nFrom: {t['label']}\n"
                      f"{len(lines)} lines in all; a sample in order:\n" + "\n".join(sample))
         keep.append(t)
-    answers = qwenlib.ask_many(TRACK_SYS, users, max_len=80) if users else []
+    answers = qwenlib.ask_many(TRACK_SYS + " " + LEARN_NOTE, users, max_len=80) if users else []
     with cursor() as cur:
         for t, a in zip(keep, answers):
             c = re.search(r"CHANCE:\s*(\d{1,3})", a, re.I)
@@ -443,25 +577,56 @@ def _judge_tracks(tf: str, offset: int) -> None:
             p = max(0, min(100, int(c.group(1))))
             p = (max(p, 75) if kind == "dialogue" else 45 if kind == "both"
                  else min(p, 25) if kind in ("signs", "songs") else p)
-            cur.execute("INSERT INTO subtitle_qwen(file_id,track,size,dialogue_p,kind,why,at) "
-                        "VALUES(?,?,?,?,?,?,?) ON CONFLICT(file_id,track) DO UPDATE SET "
+            if _DRY:
+                print(json.dumps({"key": [t["file_id"], t["track"]], "p": p, "kind": kind}), flush=True)
+                continue
+            cur.execute("INSERT INTO subtitle_qwen(file_id,track,size,dialogue_p,kind,why,at,ex) "
+                        "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(file_id,track) DO UPDATE SET "
                         "size=excluded.size, dialogue_p=excluded.dialogue_p, kind=excluded.kind, "
-                        "why=excluded.why, at=excluded.at",
+                        "why=excluded.why, at=excluded.at, ex=excluded.ex",
                         (t["file_id"], t["track"], t["size"], p, kind,
-                         (w.group(1).strip().splitlines()[0] if w else "")[:200], time.time()))
+                         (w.group(1).strip().splitlines()[0] if w else "")[:200], time.time(),
+                         _tally_sig(t.get("tally") or {})))
     print(json.dumps({"tracks_judged": len(answers)}), flush=True)
 
 
 _ONLY: list = []
+_DRY = False
 
 if __name__ == "__main__":
+
+    # HIDE EVERY GRANDCHILD'S CONSOLE. This child is started hidden, but what it
+    # starts (ffmpeg, ffprobe) gets a console of its own unless told otherwise -
+    # the console watcher caught ffmpeg windows flashing from the Subtitle maker
+    # and the Qwen jobs. Same patch as whisper_worker.py and paddle_worker.py.
+    try:
+        import subprocess as _sp
+        if os.name == "nt":
+            _orig_popen = _sp.Popen.__init__
+
+            def _hidden_popen(self, *a, **kw):
+                kw["creationflags"] = (kw.get("creationflags") or 0) | 0x08000000
+                if not kw.get("startupinfo"):
+                    si = _sp.STARTUPINFO()
+                    si.dwFlags |= _sp.STARTF_USESHOWWINDOW
+                    si.wShowWindow = 0                       # SW_HIDE
+                    kw["startupinfo"] = si
+                return _orig_popen(self, *a, **kw)
+            _sp.Popen.__init__ = _hidden_popen               # type: ignore[method-assign]
+    except Exception:                                        # noqa: BLE001
+        pass
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("--batch", type=int, default=BATCH)
     ap.add_argument("--ids", default="", help="judge exactly these file ids (testing)")
     ap.add_argument("--tracks", default="", help="a JSON file of text tracks to judge as well")
+    ap.add_argument("--dry", action="store_true", help="print verdicts, write nothing (measuring)")
+    ap.add_argument("--no-learn", action="store_true", help="judge without the show's answers (measuring)")
     a = ap.parse_args()
     _ONLY = [int(x) for x in a.ids.split(",") if x.strip()]
+    _DRY = a.dry
+    if a.no_learn:
+        EXAMPLES = 0
     try:
         _judge(a.batch)
         if a.tracks:

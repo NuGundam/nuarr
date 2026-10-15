@@ -430,6 +430,73 @@ def note_rejection(release: str, why: str = "", source: str = "",
     return out
 
 
+# ------------------------------------------------- terms that hit a title --
+# A TERM IS MATCHED AGAINST THE WHOLE NAME, TITLE INCLUDED. Sonarr shows a
+# format the full release name, so the imported term "ELiTE" (a release group)
+# matched "Classroom.of.the.Elite.S03E05...-VARYG" and every release of that
+# show scored -999,389; "SHiNiGAMi" did the same to "Shinigami Bocchan to Kuro
+# Maid". Checked through Sonarr's own /parse, 2026-10-14. Whole-word matching
+# (term_pattern) cannot help: there the word IS whole.
+#
+# The fix depends on what the term is. A group name belongs in a group ban,
+# which Sonarr matches against the release group it parsed - never the title -
+# so such a term is moved there by itself. Any other term that hits a title is
+# left as it is and listed for a person: no pattern change is safe without
+# knowing what the term was meant to catch. Radarr is not checked - it shows
+# formats "A Movie" in place of the title (see radarr_release_pattern).
+# Alternate titles carrying brackets ("[Erai-raws] Ore dake...") are scene
+# names, not titles, and are skipped.
+COLLISIONS: dict = {"at": 0.0, "moved": [], "left": []}
+
+
+def title_collisions() -> list:
+    """[{id, value, title, arrs}] - enabled terms that match a Sonarr title."""
+    from .config import SETTINGS
+    from .arrqueue import _call
+    init()
+    terms = [r for r in rows(False) if r["kind"] == "term" and (r.get("arrs") or "") != "radarr"]
+    if not terms:
+        return []
+    titles = set()
+    for a in SETTINGS.arrs:
+        if a.enabled and a.kind == "sonarr":
+            for sr in _call(a, "/api/v3/series", timeout=60) or []:
+                titles.add(sr.get("title") or "")
+                titles |= {x.get("title") or "" for x in (sr.get("alternateTitles") or [])}
+    titles = {t for t in titles if t and "[" not in t}
+    out = []
+    for r in terms:
+        try:
+            rx = re.compile(r["pattern"], re.I)
+        except re.error:
+            continue
+        for t in sorted(titles):
+            if rx.search(t) or rx.search(t.replace(" ", ".")):
+                out.append({"id": r["id"], "value": r["value"], "title": t, "arrs": r.get("arrs") or ""})
+                break
+    return out
+
+
+def fix_collisions() -> dict:
+    """Move each colliding group-name term to a group ban; list the rest."""
+    moved, left = [], []
+    for c in title_collisions():
+        if _looks_like_group(c["value"]):
+            add("group", c["value"], f"moved from banned terms - as a term it also matched the show "
+                                     f"title \"{c['title']}\"", "title check", by="nuarr", arrs=c["arrs"])
+            with cursor() as cur:
+                cur.execute("UPDATE arr_bans SET enabled=0, why=? WHERE id=?",
+                            (f"off: matched the show title \"{c['title']}\" - banned as a group instead",
+                             int(c["id"])))
+            moved.append(c)
+            joblog.log(f"banned term {c['value']!r} matched the show title {c['title']!r}; "
+                       f"it is now a group ban, which never looks at the title", "warn")
+        else:
+            left.append(c)
+    COLLISIONS.update(at=time.time(), moved=moved + COLLISIONS["moved"][:20], left=left)
+    return {"moved": moved, "left": left}
+
+
 # --------------------------------------------------------------- profiles --
 def profiles_for() -> dict:
     """{'radarr': [...names...], 'sonarr': [...]} - stored, or the rule."""
@@ -491,6 +558,10 @@ async def _sync_locked() -> str:
         restamp()
     except Exception:                                            # noqa: BLE001
         pass
+    try:
+        await asyncio.to_thread(fix_collisions)
+    except Exception as e:                                       # noqa: BLE001
+        joblog.log(f"banned terms: title check failed: {type(e).__name__}: {e}", "warn")
     live = [r for r in rows() if r["enabled"]]
     names = profiles_for()
     STATS["dirty"] = False
@@ -854,7 +925,7 @@ def restamp() -> int:
 def snapshot() -> dict:
     init()
     rs = rows()
-    return {"stats": dict(STATS), "rows": rs, "strikes": strikes(),
+    return {"stats": dict(STATS), "rows": rs, "strikes": strikes(), "collisions": COLLISIONS,
             "profiles": profiles_for(),
             "counts": {"release": sum(1 for r in rs if r["kind"] == "release"
                                       and r["enabled"]),

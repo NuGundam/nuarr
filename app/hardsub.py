@@ -440,7 +440,7 @@ def _bright(path: str, t: float, band: str) -> int:
             "-vf", f"{band},scale={W}:{H},format=gray", "-f", "rawvideo", "-"])
     try:
         r = subprocess.run(cmd, capture_output=True, timeout=90,
-                           creationflags=NO_WINDOW)
+                           creationflags=NO_WINDOW, startupinfo=hidden_si())
     except Exception:                                            # noqa: BLE001
         return -1
     b = r.stdout or b""
@@ -478,7 +478,7 @@ def _bands(path: str, t: float) -> tuple:
             "-f", "rawvideo", "-"])
     try:
         r = subprocess.run(cmd, capture_output=True, timeout=90,
-                           creationflags=NO_WINDOW)
+                           creationflags=NO_WINDOW, startupinfo=hidden_si())
     except Exception:                                            # noqa: BLE001
         return (-1, -1)
     b = r.stdout or b""
