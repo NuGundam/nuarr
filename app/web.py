@@ -46860,6 +46860,7 @@ async function loadArrsTab(){
 // a range), a caret on the name that opens the row for the numbers behind the
 // % and what to do, and a bar of batch actions while anything is selected.
 let _bc=null, _bcKey='', _bcLast=null, _bcShowKept=false;
+const _bcBusy=new Set();       // rows a Find a fuller copy is searching for right now
 const _bcSel=new Set(), _bcOpen=new Set(), _bcPrev={};
 const BC_COL={open:'#e8a33d',grabbed:'#79c0ff',fixed:'var(--ok)',none:'var(--dim)',kept:'var(--dim)'};
 const BC_WORD={open:'cut',grabbed:'fetching a fuller copy',fixed:'fuller copy imported',none:'nothing better found',kept:'kept'};
@@ -46906,7 +46907,9 @@ function bcRowHtml(r){
     <td class="c mono" style="font-size:10.5px">${esc(r.new||'')}<br><b style="color:#e8a33d">${(+r.new_gb).toFixed(2)} GB</b>${w.new_mbps!=null?` <span class="dim">${bcMbps(w.new_mbps)}</span>`:''}</td>
     <td class="c mono"><b style="color:${r.share<0.25?'var(--bad)':'#e8a33d'}">${Math.round((r.share||0)*100)}%</b></td>
     <td class="c" style="font-size:10.5px">${w.rec==='fetch'?'<span style="color:var(--bad)">fetch</span>':'<span style="color:#e8a33d">your call</span>'}</td>
-    <td class="l" style="font-size:10.5px"><span style="color:${BC_COL[r.state]||'var(--dim)'}">${esc(BC_WORD[r.state]||r.state||'')}</span></td>
+    <td class="l" style="font-size:10.5px">${_bcBusy.has(k)?'<span style="color:#79c0ff">searching the indexers…</span>'
+      :`<span style="color:${BC_COL[r.state]||'var(--dim)'}">${esc(BC_WORD[r.state]||r.state||'')}</span>${
+        r.note&&r.state!=='open'?`<div class="dim" style="font-size:10px;white-space:normal" title="${esc(r.note)}">${esc(r.note)}</div>`:''}`}</td>
     <td class="r" style="white-space:nowrap">${can?`<button class="rmb" onclick="bcFetch([${k}],this)">Find a fuller copy</button>
       <button class="rmb" onclick="bcKeep([${k}])">Keep</button>`:''}</td></tr>
     ${open?`<tr><td></td><td colspan="7">${bcDetail(r)}</td></tr>`:''}`;
@@ -46940,7 +46943,7 @@ function bcPaint(){
       has it) with at least four fifths of the old picture that nothing bans; the arr will call it "not an upgrade", so the
       queue janitor imports it by hand instead of clearing it. <b>Keep</b> drops the row.</div>
     ${rows.length?`${bcSelBar()}<div class="rowbox scrollbox" style="max-height:380px"><table class="sktbl" style="width:100%;font-size:11.5px;table-layout:fixed">
-      <colgroup><col style="width:24px"><col style="width:auto"><col style="width:200px"><col style="width:200px"><col style="width:66px"><col style="width:74px"><col style="width:140px"><col style="width:170px"></colgroup>
+      <colgroup><col style="width:24px"><col style="width:auto"><col style="width:200px"><col style="width:200px"><col style="width:66px"><col style="width:74px"><col style="width:240px"><col style="width:170px"></colgroup>
       <thead><tr class="dim" style="font-size:10.5px"><th class="c"><input type="checkbox" ${allOn?'checked':''} title="Select every row" onclick="bcSelAll(this.checked)"></th>
         <th class="l">FILE</th><th class="c">WAS</th><th class="c">NOW</th><th class="c" title="Share of the old file's picture the new one keeps">KEPT</th>
         <th class="c">ADVICE</th><th class="l">STATE</th><th class="r"></th></tr></thead>
@@ -46977,16 +46980,16 @@ async function bcPreview(id,btn){
   try{ _bcPrev[id]=await (await fetch('/api/bitcut/preview?file_id='+id)).json(); }catch(e){ _bcPrev[id]={ok:false,why:'could not ask the arr'}; }
   bcPaint();
 }
+// THE ANSWER LANDS ON THE ROW, not in a pop-up: its state cell says
+// "searching the indexers…" while the arr is asked, then what came of it -
+// the release grabbed, or why nothing qualified.
 async function bcFetch(ids,btn){
-  if(btn){ btn.disabled=true; btn.textContent='searching…'; }
-  const fails=[];
+  ids.forEach(id=>_bcBusy.add(id)); _bcKey=''; bcPaint();
   for(const id of ids){
-    let d={}; try{ d=await (await fetch('/api/bitcut/fetch?file_id='+id,{method:'POST'})).json(); }catch(e){}
-    if(!d.ok) fails.push(((_bc.rows||[]).find(r=>r.file_id===id)||{}).label+': '+(d.why||'failed'));
-    _bcSel.delete(id);
+    try{ await (await fetch('/api/bitcut/fetch?file_id='+id,{method:'POST'})).json(); }catch(e){}
+    _bcSel.delete(id); _bcBusy.delete(id); _bcKey='';
     await bcLoad();
   }
-  if(fails.length) alert(fails.join('\n'));
 }
 async function bcKeep(ids){
   for(const id of ids){ await fetch('/api/bitcut/keep?file_id='+id,{method:'POST'}); _bcSel.delete(id); }
