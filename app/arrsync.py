@@ -129,7 +129,10 @@ async def scan() -> dict:
 
     import asyncio
 
-    probe = _probe_rows()
+    # OFF THE LOOP. Every stored probe for every arr-tracked file, read and
+    # copied into a dict: the stall watch caught this holding the whole server
+    # for 15.4 s, right after a restart when the health page asks first.
+    probe = await asyncio.to_thread(_probe_rows)
     found = {k: [] for k in CHECKS}
     counts = {"checked": 0}
 

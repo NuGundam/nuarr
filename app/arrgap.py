@@ -290,14 +290,19 @@ async def scan() -> dict:
             # for live rows would have called them unwalked, which is what the
             # first version of this did and it was wrong in a way that made the
             # fix a no-op. The state is the whole answer, so fetch the state.
-            with cursor() as cur:
-                have = {r["arr_file_id"]: (r["state"], r["state_reason"],
-                                           r["id"])
-                        for r in cur.execute(
-                            "SELECT id, arr_file_id, state, state_reason "
-                            "FROM files "
-                            "WHERE arr_name=? AND arr_file_id IS NOT NULL",
-                            (cfg.name,)).fetchall()}
+            # ON A THREAD: every file row nuarr has for this arr, read on the
+            # event loop, held the whole server 3.6 s (the stall watch).
+            def _have(name=cfg.name):
+                with cursor() as cur:
+                    return {r["arr_file_id"]: (r["state"], r["state_reason"],
+                                               r["id"])
+                            for r in cur.execute(
+                                "SELECT id, arr_file_id, state, state_reason "
+                                "FROM files "
+                                "WHERE arr_name=? AND arr_file_id IS NOT NULL",
+                                (name,)).fetchall()}
+            import asyncio as _aio
+            have = await _aio.to_thread(_have)
             _CACHE["now"] = f"comparing {cfg.name} against nuarr's index"
             st["total"] = len(files)
             _CACHE["total"] = _CACHE.get("total", 0) + len(files)

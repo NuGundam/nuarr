@@ -79,6 +79,7 @@ the one this replaces.
 """
 from __future__ import annotations
 
+import threading
 import time
 
 from .config import SETTINGS
@@ -154,6 +155,35 @@ def classify(item: dict) -> tuple[str, str]:
     return "live", "no animation genre"
 
 
+def _store_kinds(arr_name: str, items: list) -> tuple[int, dict]:
+    """Classify one arr's titles and store the verdicts. On a worker thread."""
+    counts: dict = {}
+    rows = []
+    for it in items:
+        if it.get("id") is None:
+            continue
+        kind, why = classify(it)
+        counts[kind] = counts.get(kind, 0) + 1
+        genres = ", ".join(str(g) for g in (it.get("genres") or []))
+        lang = str(((it.get("originalLanguage") or {}).get("name")
+                    or "")).strip()
+        stype = str(it.get("seriesType") or "").strip()
+        rows.append((arr_name, int(it["id"]), kind, why, genres, lang, stype))
+    if rows:
+        now = time.time()
+        with cursor() as cur:
+            cur.executemany(
+                "INSERT INTO parent_kind"
+                "(arr_name,parent_id,kind,why,genres,lang,stype,at) "
+                "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(arr_name,parent_id) "
+                "DO UPDATE SET kind=excluded.kind, why=excluded.why, "
+                "              genres=excluded.genres, lang=excluded.lang, "
+                "              stype=excluded.stype, at=excluded.at",
+                [(a, p, k, w, g, l, st, now)
+                 for a, p, k, w, g, l, st in rows])
+    return len(rows), counts
+
+
 async def sync() -> dict:
     """Read genres and original language from every arr, store the verdict."""
     from .arr import shared_client
@@ -171,32 +201,13 @@ async def sync() -> dict:
         except Exception as e:
             errs.append(f"{cfg.name}: {type(e).__name__}")
             continue
-        rows = []
-        for it in items or []:
-            if it.get("id") is None:
-                continue
-            kind, why = classify(it)
-            counts[kind] += 1
-            total += 1
-            genres = ", ".join(str(g) for g in (it.get("genres") or []))
-            lang = str(((it.get("originalLanguage") or {}).get("name")
-                        or "")).strip()
-            stype = str(it.get("seriesType") or "").strip()
-            rows.append((cfg.name, int(it["id"]), kind, why,
-                         genres, lang, stype))
-        if not rows:
-            continue
-        now = time.time()
-        with cursor() as cur:
-            cur.executemany(
-                "INSERT INTO parent_kind"
-                "(arr_name,parent_id,kind,why,genres,lang,stype,at) "
-                "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(arr_name,parent_id) "
-                "DO UPDATE SET kind=excluded.kind, why=excluded.why, "
-                "              genres=excluded.genres, lang=excluded.lang, "
-                "              stype=excluded.stype, at=excluded.at",
-                [(a, p, k, w, g, l, st, now)
-                 for a, p, k, w, g, l, st in rows])
+        # OFF THE LOOP: classifying 3,268 titles and writing them back held
+        # the whole server 1.6-2.2 s per pass (caught by the stall watch).
+        import asyncio
+        n, got = await asyncio.to_thread(_store_kinds, cfg.name, items or [])
+        total += n
+        for k, v in got.items():
+            counts[k] = counts.get(k, 0) + v
     return {"titles": total, "counts": counts, "errors": errs}
 
 
@@ -256,12 +267,10 @@ def combine(folder_kind: str, meta_kind: str | None) -> str:
 # work from that alone, and it has to be a dict read rather than a query
 # because decide() runs tens of thousands of times in a scan.
 _PATHS: dict = {"at": 0.0, "map": None}
+_PATHS_LOCK = threading.Lock()
 
 
-def _path_map() -> dict[str, str]:
-    now = time.time()
-    if _PATHS["map"] is not None and now - _PATHS["at"] < _TTL:
-        return _PATHS["map"]
+def _path_map_build() -> dict:
     m: dict[str, str] = {}
     try:
         with cursor() as cur:
@@ -273,8 +282,32 @@ def _path_map() -> dict[str, str]:
                 m[(r["path"] or "").lower()] = r["kind"]
     except Exception:
         m = _PATHS["map"] or {}
-    _PATHS.update(at=now, map=m)
+    _PATHS.update(at=time.time(), map=m)
     return m
+
+
+def _path_map() -> dict:
+    # STALE WHILE IT REBUILDS. Rebuilding is a 49,000-row join, and whoever
+    # found the cache a minute old paid for it - including the event loop,
+    # reached through jobs.cache_probe -> remedy.reconsider -> rules.is_anime:
+    # the stall watch caught that holding the whole server for 4.7 s. A kind
+    # changes when an arr retags a title, not between two calls, so the old
+    # map is answered and a thread builds the new one. Only the very first
+    # call, with no map at all, waits.
+    now = time.time()
+    if _PATHS["map"] is None:
+        with _PATHS_LOCK:
+            if _PATHS["map"] is None:
+                return _path_map_build()
+        return _PATHS["map"]
+    if now - _PATHS["at"] >= _TTL and _PATHS_LOCK.acquire(blocking=False):
+        def _bg():
+            try:
+                _path_map_build()
+            finally:
+                _PATHS_LOCK.release()
+        threading.Thread(target=_bg, daemon=True, name="contentkind-paths").start()
+    return _PATHS["map"]
 
 
 def by_path(path: str) -> str | None:

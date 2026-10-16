@@ -71,6 +71,14 @@ class RenamePlan:
 
 
 # ---------------------------------------------------------------- CHECK ----
+def _disk_facts(ex_abs: str, nw_abs: str) -> dict:
+    """What the pool says about one rename's two paths. On a worker thread."""
+    ex = os.path.exists(ex_abs)
+    locked = bool(ex and fileops.is_locked(ex_abs))
+    return {"ex": ex, "nw": os.path.exists(nw_abs),
+            "locked": locked, "who": fileops.who_locks(ex_abs) if locked else None}
+
+
 async def plan_for_parent(client: ArrClient, parent_id: int,
                           parent_title: str = "", parent_path: str | None = None
                           ) -> list[RenamePlan]:
@@ -115,7 +123,12 @@ async def plan_for_parent(client: ArrClient, parent_id: int,
         )
 
         # --- pre-flight ----------------------------------------------------
-        if not os.path.exists(ex_abs):
+        # THE DISK QUESTIONS ON A THREAD. This coroutine runs twenty at a time
+        # across the library, and asking the pool whether a file exists, and
+        # then opening it to see whether it is locked, ran on the event loop:
+        # the stall watch caught one pass holding the whole server for 3.9 s.
+        fx = await asyncio.to_thread(_disk_facts, ex_abs, nw_abs)
+        if not fx["ex"]:
             p.issues.append(f"source not on disk: {ex_abs}")
         # Only a real limit blocks a rename. This machine has LongPathsEnabled,
         # and Sonarr renames 300+ character paths here without complaint - so
@@ -126,7 +139,7 @@ async def plan_for_parent(client: ArrClient, parent_id: int,
                 f"destination path {len(nw_abs)} chars, over limit "
                 f"{SETTINGS.max_path_length} - arr rename will fail"
             )
-        if os.path.exists(nw_abs) and os.path.normcase(nw_abs) != os.path.normcase(ex_abs):
+        if fx["nw"] and os.path.normcase(nw_abs) != os.path.normcase(ex_abs):
             p.issues.append(f"destination already exists: {nw_abs}")
         bad_group, good_group = _corrupt_group(nw_abs, parent_title)
         if bad_group:
@@ -147,9 +160,9 @@ async def plan_for_parent(client: ArrClient, parent_id: int,
             p.corrupt_group = bad_group
             p.good_group = good_group
 
-        if os.path.exists(ex_abs) and fileops.is_locked(ex_abs):
+        if fx["locked"]:
             # not a blocker - we wait for locks - but surface who has it
-            p.locked_by = fileops.who_locks(ex_abs)
+            p.locked_by = fx["who"]
 
         plans.append(p)
 

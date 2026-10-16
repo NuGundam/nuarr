@@ -594,6 +594,42 @@ def api_rules():
     return rules.describe()
 
 
+# ---- event-loop stall watch ------------------------------------------------
+# WHAT WAS THE LOOP DOING WHEN IT DID NOT ANSWER. A library scan froze the
+# whole server for 1-3.7 s at a time - every page waited - and "the scan is
+# slow" says nothing about which line held the loop. A thread asks the loop to
+# run a no-op every 100 ms; if the answer takes longer than STALL_MS, it takes
+# the loop thread's stack at that moment and keeps it. Read at /api/diag/pool.
+STALL_MS = 400
+STALLS: list = []
+_LOOP_THREAD: dict = {"id": None}
+
+
+def _stall_watch(loop) -> None:
+    import sys as _sys
+    import traceback as _tb
+    while True:
+        done = threading.Event()
+        t0 = time.perf_counter()
+        try:
+            loop.call_soon_threadsafe(done.set)
+        except RuntimeError:
+            return                                   # the loop has closed
+        sampled = None
+        if not done.wait(STALL_MS / 1000):
+            fr = _sys._current_frames().get(_LOOP_THREAD["id"])
+            if fr is not None:
+                sampled = [f"{os.path.basename(x.filename)}:{x.lineno} {x.name}"
+                           for x in _tb.extract_stack(fr)[-14:]
+                           if "asyncio" not in x.filename and "selectors" not in x.filename]
+            done.wait(60)
+        ms = (time.perf_counter() - t0) * 1000
+        if sampled is not None:
+            STALLS.insert(0, {"at": time.time(), "ms": round(ms), "stack": sampled})
+            del STALLS[40:]
+        time.sleep(0.1)
+
+
 @app.get("/api/diag/pool")
 async def api_diag_pool():
     """Separate 'the query is slow' from 'nothing could get a thread to run it'.
@@ -652,6 +688,7 @@ async def api_diag_pool():
             "threads_alive": threading.active_count(),
             # Call sites still doing SQLite on the loop thread, worst first.
             # Self-reporting, so the remaining work is evidence not guesswork.
+            "stalls": STALLS[:15],
             "db_on_loop": dict(sorted(db_on_loop.items(),
                                       key=lambda kv: -kv[1])[:15]),
             "db_on_loop_total": sum(db_on_loop.values())}
@@ -659,6 +696,9 @@ async def api_diag_pool():
 
 @app.on_event("startup")
 async def _startup() -> None:
+    _LOOP_THREAD["id"] = threading.get_ident()
+    threading.Thread(target=_stall_watch, args=(asyncio.get_running_loop(),),
+                     daemon=True, name="stall-watch").start()
     # A WIDER DEFAULT EXECUTOR. See jobs.WORK: the long job bodies have their
     # own pool now, and this one keeps the short database reads every endpoint
     # makes. 24 threads was measured starving; 48 gives a burst of polls room.
@@ -776,6 +816,8 @@ async def _startup() -> None:
         # Upgrades that cut the bitrate: the auto sweep (does nothing in manual).
         from . import bitcut as _bc
         asyncio.create_task(_bc.watch())
+        # The health answer, built before anybody asks - see _HEALTH.
+        asyncio.get_running_loop().call_later(60, _health_kick)
         # ONE SUBTITLE SYSTEM, AND THIS IS ITS RUNNER.
         #
         # subembed.watch and subdupe.watch used to start here, one after the
@@ -6100,8 +6142,86 @@ def _true_left_count(led: dict) -> dict:
     return out
 
 
+# THE HEALTH ANSWER, NEVER WAITED FOR. Built cold - the first ask after a
+# restart - it took 13.7 s in a quiet process and 26 s on the live server:
+# the subtitle-rule decisions behind the Plex collections row, the audio
+# tracks never listened to (40,000 stored probes), Whisper's CUDA probe and a
+# WMI disk sample all fill their caches on that first call. /api/summary asks
+# it too, so the dashboard header on every page stalled with it. Now the
+# answer is built on a thread - thirty seconds after startup, and again behind
+# any ask that finds it more than HEALTH_FRESH_S old - and an ask is answered
+# from the last build at once. The last build is kept in kv, so the very first
+# ask after a restart shows the answer from before it, marked as such, while
+# the new one is made. ?fresh=1 builds now (Run now, a mode change).
+_HEALTH: dict = {"at": 0.0, "data": None, "busy": False, "restart": False, "saved_at": 0.0,
+                 "born": time.time()}
+# NOT DURING STARTUP. A cold build is fourteen seconds of Python while every
+# watcher is also starting; kicked by the first ask three seconds after a
+# restart it stretched other requests to ten seconds. The answer from before
+# the restart is shown until the scheduled build at sixty seconds.
+HEALTH_QUIET_S = 90.0
+_HEALTH_LOCK = threading.Lock()
+HEALTH_FRESH_S = 8.0
+
+
+def _health_store(d: dict) -> None:
+    _HEALTH.update(at=time.time(), data=d, restart=False)
+    if time.time() - _HEALTH["saved_at"] > 300:
+        try:
+            kv_set("health.last", json.dumps({"at": time.time(), "d": d}, default=str))
+            _HEALTH["saved_at"] = time.time()
+        except Exception:                                    # noqa: BLE001
+            pass
+
+
+def _health_refresh() -> None:
+    if not _HEALTH_LOCK.acquire(blocking=False):
+        return
+    _HEALTH["busy"] = True
+    try:
+        _health_store(_health_build())
+    except Exception as e:                                   # noqa: BLE001
+        joblog.log(f"health: could not build the answer: {type(e).__name__}: {e}", "warn")
+    finally:
+        _HEALTH["busy"] = False
+        _HEALTH_LOCK.release()
+
+
+def _health_kick() -> None:
+    if not _HEALTH["busy"]:
+        threading.Thread(target=_health_refresh, daemon=True, name="health-build").start()
+
+
 @app.get("/api/health")
-def api_health():
+def api_health(fresh: int = 0):
+    """Every self-check nuarr runs - from the last build, never waited for."""
+    if fresh:
+        with _HEALTH_LOCK:
+            _health_store(_health_build())
+        return dict(_HEALTH["data"], age_s=0, building=False)
+    d = _HEALTH["data"]
+    if d is None:
+        try:
+            saved = json.loads(kv_get("health.last") or "{}")
+        except Exception:                                    # noqa: BLE001
+            saved = {}
+        if saved.get("d"):
+            _HEALTH.update(data=saved["d"], at=float(saved.get("at") or 0), restart=True)
+            d = _HEALTH["data"]
+    if d is None:
+        # a first install: nothing to show yet, so this one ask waits
+        with _HEALTH_LOCK:
+            if _HEALTH["data"] is None:
+                _health_store(_health_build())
+        d = _HEALTH["data"]
+    age = time.time() - _HEALTH["at"]
+    if (age >= HEALTH_FRESH_S or _HEALTH["restart"])             and time.time() - _HEALTH["born"] > HEALTH_QUIET_S:
+        _health_kick()
+    return dict(d, age_s=round(age), building=_HEALTH["busy"],
+                from_before_restart=bool(_HEALTH["restart"]))
+
+
+def _health_build():
     r"""Every self-check nuarr runs, on one page - what found what, and where.
 
     WHY A HUB. The checks grew one at a time, each with its own card in
@@ -6634,7 +6754,7 @@ async def api_health_mode(mode: str):
     SETTINGS.subocr_auto = (mode == "auto")
     joblog.log(f"all correction systems set to {mode} from the health page",
                "info")
-    return api_health()
+    return api_health(fresh=1)
 
 
 @app.get("/api/observer")
@@ -32729,19 +32849,20 @@ function kdRows(){
 
 // ---- health: every self-check on one page --------------------------------
 let _hl=null, _hlTimer=null;
-async function loadHealth(){
+async function loadHealth(fresh){
   const el=document.getElementById('healthBody');
   // STOP WHEN THE PAGE IS NOT SHOWING, not only when it is gone. The settings
   // page hides panes rather than removing them, so after one visit to Health
   // this asked /api/health every ten seconds from every other page for as long
   // as the tab stayed open. Opening Health again calls this afresh.
   if(!el){ if(_hlTimer) clearTimeout(_hlTimer); _hlTimer=null; return; }
-  try{ _hl=await (await fetch('/api/health')).json(); }
+  try{ _hl=await (await fetch('/api/health'+(fresh===true?'?fresh=1':''))).json(); }
   catch(e){ el.innerHTML='<span class="dim">could not load</span>'; return; }
   hlPaint();
   if(_hlTimer) clearTimeout(_hlTimer);
-  // Faster while anything is re-checking, so the running rows move.
-  const busy=(_hl.checks||[]).some(c=>c.running);
+  // Faster while anything is re-checking, so the running rows move - and
+  // while the answer on screen is the one from before a restart.
+  const busy=(_hl.checks||[]).some(c=>c.running) || _hl.from_before_restart || _hl.building;
   _hlTimer=setTimeout(()=>{ _hlTimer=null; shownPoll('healthBody', loadHealth); }, busy?2000:10000);
 }
 function hlPaint(){
@@ -32754,6 +32875,7 @@ function hlPaint(){
   const head=`
     <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;
                 font-size:12px;margin-bottom:8px">
+      ${_hl.from_before_restart?`<span class="dim" style="font-size:11px">showing the answer from before the restart (${ago(Date.now()/1000-(_hl.age_s||0))}) - a fresh one is being built</span>`:''}
       <b style="color:${_hl.all_clear?'var(--ok)':'var(--warn)'}">
         ${_hl.all_clear?'everything checks out'
           :fmt(_hl.warnings)+' check'+(_hl.warnings===1?'':'s')+' found something'}</b>
@@ -32863,7 +32985,7 @@ async function hlRun(){
     if(m) m.textContent=(r.started||[]).length
       ? 'checking: '+r.started.join(', ') : 'everything was already running';
   }catch(e){ if(m) m.textContent='could not start'; }
-  loadHealth();
+  loadHealth(true);
 }
 async function hlMode(mode){
   const m=document.getElementById('hlMsg'); if(m) m.textContent='saving…';

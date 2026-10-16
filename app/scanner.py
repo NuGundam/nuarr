@@ -248,11 +248,28 @@ def _register_with_storage() -> None:
         pass
 
 
+_POOL_DISKS: dict = {"at": 0.0, "d": None}
+
+
 def pool_disks() -> dict[str, str]:
     """label -> path of that disk's PoolPart folder (DrivePool-specific).
 
     Kept as the fallback for media_roots(); prefer that.
+
+    HELD FOR TEN MINUTES. It lists the root of every drive letter looking for
+    PoolPart folders, and it was asked on every library scan pass from the
+    event loop - 1.6 s of the whole server waiting (the stall watch) for an
+    answer that changes when a disk is added to the pool.
     """
+    now = time.time()
+    if _POOL_DISKS["d"] is not None and now - _POOL_DISKS["at"] < 600:
+        return dict(_POOL_DISKS["d"])
+    d = _pool_disks()
+    _POOL_DISKS.update(at=now, d=dict(d))
+    return d
+
+
+def _pool_disks() -> dict[str, str]:
     disks: dict[str, str] = {}
     seen: set[str] = set()
 

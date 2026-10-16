@@ -77,6 +77,56 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 
+def _sniffio_stand_in() -> None:
+    r"""A sniffio for an interpreter that has none - before httpcore is imported.
+
+    httpcore asks `import sniffio` on EVERY request it makes (Sonarr, Radarr,
+    Plex, Tautulli...), and with sniffio not installed that is a failed import
+    each time: a fresh search of every sys.path folder, because Python does not
+    remember a miss. Cheap on an idle machine; under a library scan the stall
+    watch caught it holding the event loop - the whole server - for 0.5-2.3 s
+    per request. This answers what sniffio would: "asyncio" inside a running
+    loop, AsyncLibraryNotFoundError outside one. nuarr runs on asyncio alone.
+    A real sniffio, if one is ever installed, is used instead.
+    """
+    try:
+        import sniffio  # noqa: F401
+        return
+    except ImportError:
+        pass
+    import asyncio
+    import contextvars
+    import types
+
+    class AsyncLibraryNotFoundError(RuntimeError):
+        pass
+
+    # anyio sets this around the code it runs (set_current_async_library), as
+    # it does with the real sniffio; an answer set here wins, as it does there.
+    cvar = contextvars.ContextVar("current_async_library_cvar", default=None)
+
+    def current_async_library() -> str:
+        v = cvar.get()
+        if v is not None:
+            return v
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            raise AsyncLibraryNotFoundError(
+                "unknown async library, or not in async context") from None
+        return "asyncio"
+
+    m = types.ModuleType("sniffio")
+    m.current_async_library = current_async_library
+    m.current_async_library_cvar = cvar
+    m.AsyncLibraryNotFoundError = AsyncLibraryNotFoundError
+    m.__nuarr_stand_in__ = True
+    sys.modules["sniffio"] = m
+
+
+_sniffio_stand_in()
+
+
 def _log_config() -> dict:
     """uvicorn logging, but to a rotating file rather than a console."""
     return {
@@ -116,16 +166,42 @@ def _log_config() -> dict:
     }
 
 
+def _loopback6(port: int):
+    """A listener on the IPv6 loopback beside the IPv4 one, or None.
+
+    LOCALHOST IS ::1 FIRST ON WINDOWS. With only 0.0.0.0 bound, every request
+    to http://localhost:8770 tried ::1, was refused, and fell back to
+    127.0.0.1 - about 200 ms added to each one, and a page making thirty
+    requests a second paid it thirty times. ::1 only, not "::": this makes
+    localhost answer at once without opening nuarr on any IPv6 address the
+    network can reach.
+    """
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        s.bind(("::1", port))
+        s.listen(2048)
+        s.set_inheritable(True)
+        return s
+    except OSError:
+        return None
+
+
 def main() -> None:
     import uvicorn
     from app.config import SETTINGS
 
-    uvicorn.run(
-        "app.web:app",
-        host=getattr(SETTINGS, "host", "0.0.0.0"),
-        port=int(getattr(SETTINGS, "port", 8770) or 8770),
-        log_config=_log_config(),
-    )
+    host = getattr(SETTINGS, "host", "0.0.0.0")
+    port = int(getattr(SETTINGS, "port", 8770) or 8770)
+    config = uvicorn.Config("app.web:app", host=host, port=port,
+                            log_config=_log_config())
+    six = _loopback6(port) if host in ("0.0.0.0", "127.0.0.1") else None
+    if six is None:
+        uvicorn.Server(config).run()
+        return
+    four = config.bind_socket()
+    uvicorn.Server(config).run(sockets=[four, six])
 
 
 if __name__ == "__main__":

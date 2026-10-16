@@ -3707,7 +3707,11 @@ async def status() -> GateStatus:
         await check_arrs(),
         # Between the arrs and Plex: like Plex it is a live subsystem sharing
         # the hardware, and unlike the checks above it can never hold anything.
-        check_audiolang(),
+        # ON A THREAD, like the plex/disks/cache checks above. It was the one
+        # check called bare on the event loop, and every twenty seconds its
+        # pending_count() cache ran out and re-ran audiolang.pending() there:
+        # caught by the stall watch holding the whole server for 4.7-10.2 s.
+        await asyncio.to_thread(check_audiolang),
         plex,
     ]
     return GateStatus(open=not any(r.blocked for r in reasons),
