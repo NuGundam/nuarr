@@ -46950,6 +46950,7 @@ async function loadArrsTab(refresh){
          next to the same choice nuarr makes for its own files.</div>`
     + `<div id="bcBox" style="margin-top:12px"></div>`;
   loadHookState();
+  _bcKey='';                 // the box is new and empty - paint it whatever the data says
   bcLoad();
 }
 
@@ -47125,7 +47126,14 @@ function bcPaint(){
     ${kept||done?`<div style="font-size:11px;margin-top:5px">${done?`<a href="#" onclick="_bcShowDone=!_bcShowDone;_bcKey='';bcPaint();return false">${_bcShowDone?'hide':'also show'} the ${done} brought back</a>`:''}
       ${kept?` <a href="#" style="margin-left:10px" onclick="_bcShowKept=!_bcShowKept;_bcKey='';bcPaint();return false">${_bcShowKept?'hide':'also show'} the ${kept} kept</a>`:''}</div>`:''}
   </div>`;
-  if(html===_bcKey) return;
+  // PAINT INTO AN EMPTY BOX WHATEVER THE CACHE SAYS. The page rebuilds its
+  // body once a minute (arrsRefresh), which puts a fresh, blank bcBox in the
+  // page; the html was unchanged, so this returned without writing it - and
+  // the panel vanished a minute after the page opened. And not while a hand
+  // is in the "every" field: a repaint would take the half-typed number away.
+  const a=document.activeElement;
+  if(a && el.contains(a) && /^(INPUT|SELECT)$/.test(a.tagName) && a.type!=='checkbox') return;
+  if(html===_bcKey && el.innerHTML.length>200) return;
   _bcKey=html;
   const box=el.querySelector('.scrollbox'), top=box?box.scrollTop:0;
   el.innerHTML=html;
