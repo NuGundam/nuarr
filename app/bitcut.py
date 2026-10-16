@@ -322,7 +322,63 @@ def import_wanted(queues: list) -> tuple[list, set]:
     return rows, hold
 
 
+_AUD = re.compile(r"(\d\.\d)")
+
+
+def explain(x: dict) -> dict:
+    """What the % means for this row, in numbers, and what to do about it."""
+    f = _file(x["file_id"])
+    secs = float(f.get("duration") or 0)
+    res = (_RES.search(x.get("old") or "") or _RES.search(x.get("new") or ""))
+    res = res.group(1).lower() if res else ""
+    plenty = PLENTY_MBPS.get(res, 0)
+    out = {"secs": secs, "res": res, "plenty": plenty,
+           "old_codec_f": _eff(x.get("old")), "new_codec_f": _eff(x.get("new"))}
+    if secs > 60:
+        for k in ("old", "new"):
+            mbps = x[f"{k}_gb"] * 8000 / secs
+            out[f"{k}_mbps"] = round(mbps, 1)
+            out[f"{k}_eq"] = round(mbps / _eff(x.get(k)), 1)
+    notes = []
+    # what else the "upgrade" changed, beside the picture
+    ao, an = _AUD.search(x.get("old") or ""), _AUD.search(x.get("new") or "")
+    if ao and an and float(an.group(1)) < float(ao.group(1)):
+        notes.append(f"the sound went from {ao.group(1)} to {an.group(1)} channels too")
+    so, sn = (x.get("old") or "").split("-")[0].lower(), (x.get("new") or "").split("-")[0].lower()
+    if so.startswith("bluray") and sn.startswith(("webdl", "webrip")):
+        notes.append("the source went from Blu-ray to a web copy")
+    if "x264" in (x.get("new") or "").lower() and re.search(r"x265|h265", x.get("old") or "", re.I):
+        notes.append("the codec went from HEVC to H.264, which needs more bits for the same picture")
+    eq, share = out.get("new_eq"), float(x.get("share") or 0)
+    if share < 0.25 or (eq is not None and plenty and eq < plenty * 0.5):
+        rec, why = "fetch", ("well under what this resolution needs" if eq is not None and plenty
+                             and eq < plenty * 0.5 else "most of the picture went")
+    elif share < 0.4:
+        rec, why = "fetch", "a clear loss, worth a fuller copy if one exists"
+    else:
+        rec, why = "maybe", "borderline - a fuller copy is better, but this one is watchable"
+    out.update(rec=rec, rec_why=why, notes=notes)
+    return out
+
+
+def preview(file_id: int) -> dict:
+    """What Find a fuller copy WOULD grab - the top few - without grabbing."""
+    cands, ids = candidates(file_id)
+    if not cands:
+        return {"ok": False, "why": ids.get("why") or "nothing of the same resolution (and HDR, where the "
+                                                       "file has it) carries enough picture"}
+    return {"ok": True, "n": len(cands), "top": [
+        {"title": r.get("title"), "gb": round((r.get("size") or 0) / 1e9, 2), "score": r.get("customFormatScore"),
+         "indexer": r.get("indexer"), "protocol": r.get("protocol"), "seeders": r.get("seeders")}
+        for r in cands[:4]]}
+
+
 def snapshot() -> dict:
     rows = _load()
+    for x in rows:
+        try:
+            x["why"] = explain(x)
+        except Exception:                                        # noqa: BLE001
+            x["why"] = {}
     return {"rows": rows, "open": sum(1 for x in rows if x.get("state") == "open"),
             "rule": {"ratio": RATIO, "refetch_at": REFETCH_AT}}

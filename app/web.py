@@ -10691,6 +10691,13 @@ async def api_bitcut_fetch(file_id: int):
     return await asyncio.to_thread(bitcut.fetch, int(file_id))
 
 
+@app.get("/api/bitcut/preview")
+async def api_bitcut_preview(file_id: int):
+    """What Find a fuller copy would grab, without grabbing."""
+    from . import bitcut
+    return await asyncio.to_thread(bitcut.preview, int(file_id))
+
+
 @app.post("/api/bitcut/keep")
 def api_bitcut_keep(file_id: int):
     """Keep the smaller copy - the row leaves the list."""
@@ -46849,45 +46856,142 @@ async function loadArrsTab(){
 }
 
 // ---- upgrades that cut the bitrate - see bitcut.py -------------------------
-let _bc=null;
+// THE SAME TABLE AS SUBTITLE USER INPUT: a checkbox per row (shift-click takes
+// a range), a caret on the name that opens the row for the numbers behind the
+// % and what to do, and a bar of batch actions while anything is selected.
+let _bc=null, _bcKey='', _bcLast=null, _bcShowKept=false;
+const _bcSel=new Set(), _bcOpen=new Set(), _bcPrev={};
+const BC_COL={open:'#e8a33d',grabbed:'#79c0ff',fixed:'var(--ok)',none:'var(--dim)',kept:'var(--dim)'};
+const BC_WORD={open:'cut',grabbed:'fetching a fuller copy',fixed:'fuller copy imported',none:'nothing better found',kept:'kept'};
+function bcRows(){ return (_bc&&_bc.rows||[]).filter(r=>_bcShowKept||r.state!=='kept'); }
 async function bcLoad(){
-  const el=document.getElementById('bcBox'); if(!el) return;
+  if(!document.getElementById('bcBox')) return;
   try{ _bc=await (await fetch('/api/bitcut')).json(); }catch(e){ return; }
-  const rows=(_bc.rows||[]).filter(r=>r.state!=='kept');
-  const col={open:'#e8a33d',grabbed:'#79c0ff',fixed:'var(--ok)',none:'var(--dim)'};
-  const word={open:'cut',grabbed:'fetching a fuller copy',fixed:'fuller copy imported',none:'nothing better found'};
-  el.innerHTML=`<div class="lkind" style="padding:10px 12px">
-    <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:baseline">
-      <b style="color:#e8a33d">Upgrades that cut the bitrate</b>
-      <span class="dim" style="font-size:11px">${fmt(_bc.open||0)} open</span></div>
-    <div class="dim" style="font-size:11px;margin:3px 0 7px">An arr ranks releases by custom-format score, which knows nothing
-      about how many bits went into the picture - Lioness S03E03 went from 7.42 GB to 2.66 GB of 2160p as an "upgrade".
-      Listed: same resolution, the new file carrying under half the old one's picture with the codec allowed for
-      (HEVC counts as needing 65% of H.264's bits), a Remux source left out, and a new file that still has plenty
-      (15 Mbps of H.264 at 2160p, 5 at 1080p) left out. <b>Find a fuller copy</b> grabs the best-scored release of the same
-      resolution with at least four fifths of the old picture that nothing bans; the arr will call it "not an upgrade",
-      so the queue janitor imports it by hand instead of clearing it. <b>Keep</b> drops the row.</div>
-    ${rows.length?`<div class="rowbox scrollbox" style="max-height:340px"><table class="sktbl" style="width:100%;font-size:11.5px">
-      <thead><tr class="dim" style="font-size:10.5px"><th class="l">FILE</th><th class="c">WAS</th><th class="c">NOW</th>
-        <th class="c">PICTURE KEPT</th><th class="l">STATE</th><th class="r"></th></tr></thead><tbody>${rows.map(r=>`<tr>
-        <td class="l"><b>${esc(r.label||'')}</b><div class="dim" style="font-size:10px">${esc(r.library||'')} · ${r.at?ago(r.at):''}</div></td>
-        <td class="c mono" style="font-size:10.5px">${esc(r.old||'')}<br><b>${(+r.old_gb).toFixed(2)} GB</b></td>
-        <td class="c mono" style="font-size:10.5px">${esc(r.new||'')}<br><b style="color:#e8a33d">${(+r.new_gb).toFixed(2)} GB</b></td>
-        <td class="c mono"><b style="color:${r.share<0.25?'var(--bad)':'#e8a33d'}">${Math.round((r.share||0)*100)}%</b></td>
-        <td class="l" style="font-size:10.5px"><span style="color:${col[r.state]||'var(--dim)'}">${esc(word[r.state]||r.state||'')}</span>
-          ${r.note?`<div class="dim" style="font-size:10px">${esc(r.note)}</div>`:''}</td>
-        <td class="r" style="white-space:nowrap">${r.state==='open'||r.state==='none'?`<button class="rmb" onclick="bcFetch(${r.file_id},this)">Find a fuller copy</button>
-          <button class="rmb" onclick="bcKeep(${r.file_id})">Keep</button>`:''}</td></tr>`).join('')}</tbody></table></div>`
-      :'<div class="dim" style="font-size:11.5px">no upgrade has cut a file\'s picture</div>'}
+  bcPaint();
+  if((_bc.rows||[]).some(r=>r.state==='grabbed')) setTimeout(bcLoad, 30000);
+}
+function bcMbps(v){ return v==null?'—':(+v).toFixed(1)+' Mbps'; }
+function bcDetail(r){
+  const w=r.why||{}, line=(k,v)=>`<div style="display:flex;gap:10px;margin:2px 0"><span class="dim" style="width:110px;text-align:right;flex:none">${k}</span><span style="flex:1">${v}</span></div>`;
+  const recC=w.rec==='fetch'?'var(--bad)':'#e8a33d';
+  const pv=_bcPrev[r.file_id];
+  const pvHtml=pv===undefined?`<button class="rmb" onclick="bcPreview(${r.file_id},this)" title="Ask the arr for this item's releases now and show what Find a fuller copy would take - nothing is grabbed">Check what is available</button>`
+    : pv==='…'?'<span class="dim">asking the arr…</span>'
+    : pv.ok?`<div>${fmt(pv.n)} release(s) qualify - the first is what would be grabbed:</div>${pv.top.map((t,k)=>`<div class="mono" style="font-size:10.5px;${k?'':'color:var(--ok)'}">${k?'':'→ '}${esc(t.title||'')} <span class="dim">· ${(+t.gb).toFixed(2)} GB · score ${fmt(t.score||0)} · ${esc(t.indexer||'')}${t.protocol==='torrent'?' · '+fmt(t.seeders||0)+' seeders':''}</span></div>`).join('')}`
+    : `<span style="color:#e8a33d">${esc(pv.why||'nothing qualifies')}</span>`;
+  return `<div style="font-size:11px;padding:6px 10px 8px 34px;white-space:normal">
+    ${line('the %', `the new file keeps <b>${Math.round((r.share||0)*100)}%</b> of the old file's picture - its bits for the
+      picture against the old one's, each counted as H.264 (HEVC is taken to need 65% of H.264's bits
+      for the same picture, AV1 half). Under 50% is listed.`)}
+    ${w.old_mbps!=null?line('bitrate', `was <b>${bcMbps(w.old_mbps)}</b> <span class="dim">(${bcMbps(w.old_eq)} as H.264)</span>
+      → now <b style="color:#e8a33d">${bcMbps(w.new_mbps)}</b> <span class="dim">(${bcMbps(w.new_eq)} as H.264)</span>
+      over ${Math.round((w.secs||0)/60)} min`):''}
+    ${w.plenty?line('enough for '+esc(w.res||''), `${w.plenty} Mbps as H.264 - a file at or over that is never listed;
+      this one is at ${w.new_eq!=null?Math.round(w.new_eq/w.plenty*100)+'%':'—'} of it`):''}
+    ${(w.notes||[]).length?line('also', w.notes.map(esc).join('; ')):''}
+    ${line('recommend', `<b style="color:${recC}">${w.rec==='fetch'?'Find a fuller copy':'Your call'}</b> - ${esc(w.rec_why||'')}`)}
+    ${line('file', `<span class="mono">${esc(r.label||'')}</span> <span class="dim">· upgraded ${r.at?esc(new Date(r.at*1000).toLocaleString()):''}</span>`)}
+    ${r.note?line('state', esc(r.note)):''}
+    ${line('available', pvHtml)}
   </div>`;
 }
-async function bcFetch(id,btn){
+function bcRowHtml(r){
+  const k=r.file_id, on=_bcSel.has(k), open=_bcOpen.has(k), w=r.why||{};
+  const can=(r.state==='open'||r.state==='none');
+  return `<tr>
+    <td class="c" onclick="event.stopPropagation()">${can?`<input type="checkbox" ${on?'checked':''} onclick="bcPick(${k},event)">`:''}</td>
+    <td class="l" style="cursor:pointer" onclick="bcOpenRow(${k})"><span class="actcaret">${open?'▾':'▸'}</span><b>${esc(r.label||'')}</b>
+      <div class="dim" style="font-size:10px;padding-left:14px">${esc(r.library||'')} · ${r.at?ago(r.at):''}</div></td>
+    <td class="c mono" style="font-size:10.5px">${esc(r.old||'')}<br><b>${(+r.old_gb).toFixed(2)} GB</b>${w.old_mbps!=null?` <span class="dim">${bcMbps(w.old_mbps)}</span>`:''}</td>
+    <td class="c mono" style="font-size:10.5px">${esc(r.new||'')}<br><b style="color:#e8a33d">${(+r.new_gb).toFixed(2)} GB</b>${w.new_mbps!=null?` <span class="dim">${bcMbps(w.new_mbps)}</span>`:''}</td>
+    <td class="c mono"><b style="color:${r.share<0.25?'var(--bad)':'#e8a33d'}">${Math.round((r.share||0)*100)}%</b></td>
+    <td class="c" style="font-size:10.5px">${w.rec==='fetch'?'<span style="color:var(--bad)">fetch</span>':'<span style="color:#e8a33d">your call</span>'}</td>
+    <td class="l" style="font-size:10.5px"><span style="color:${BC_COL[r.state]||'var(--dim)'}">${esc(BC_WORD[r.state]||r.state||'')}</span></td>
+    <td class="r" style="white-space:nowrap">${can?`<button class="rmb" onclick="bcFetch([${k}],this)">Find a fuller copy</button>
+      <button class="rmb" onclick="bcKeep([${k}])">Keep</button>`:''}</td></tr>
+    ${open?`<tr><td></td><td colspan="7">${bcDetail(r)}</td></tr>`:''}`;
+}
+function bcSelBar(){
+  const live=new Set(bcRows().map(r=>r.file_id));
+  for(const k of [..._bcSel]) if(!live.has(k)) _bcSel.delete(k);
+  const n=_bcSel.size; if(!n) return '';
+  return `<div class="banselbar" style="margin:4px 0 6px">
+    <b style="font-size:11.5px;color:#e3b341">${fmt(n)} selected</b>
+    <button class="rmb" onclick="bcFetch([..._bcSel],this)" title="One at a time: each asks the arr for its releases and grabs the best fuller copy">Find fuller copies for ${fmt(n)}</button>
+    <button class="rmb" onclick="bcKeep([..._bcSel])">Keep ${fmt(n)}</button>
+    <button class="rmb" onclick="_bcSel.clear();_bcLast=null;bcPaint()">Clear</button>
+    <span class="dim" style="font-size:10.5px">shift-click to take a range</span></div>`;
+}
+function bcPaint(){
+  const el=document.getElementById('bcBox'); if(!el||!_bc) return;
+  const rows=bcRows(), pick=rows.filter(r=>r.state==='open'||r.state==='none');
+  const allOn=pick.length&&pick.every(r=>_bcSel.has(r.file_id));
+  const kept=(_bc.rows||[]).filter(r=>r.state==='kept').length;
+  const fetchN=rows.filter(r=>(r.state==='open'||r.state==='none')&&(r.why||{}).rec==='fetch').length;
+  const html=`<div class="lkind" style="padding:10px 12px">
+    <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:baseline">
+      <b style="color:#e8a33d">Upgrades that cut the bitrate</b>
+      <span class="dim" style="font-size:11px">${fmt(_bc.open||0)} open${fetchN?` · <a href="#" onclick="bcPickRec();return false">select the ${fetchN} worth fetching</a>`:''}</span></div>
+    <div class="dim" style="font-size:11px;margin:3px 0 7px">An arr ranks releases by custom-format score, which knows nothing
+      about how many bits went into the picture - Lioness S03E03 went from 7.42 GB to 2.66 GB of 2160p as an "upgrade".
+      Listed: same resolution, the new file keeping under half the old one's picture (HEVC counted as needing 65% of H.264's
+      bits), a Remux source left out, and a new file that still has enough left out. Open a row for the numbers and a
+      recommendation. <b>Find a fuller copy</b> grabs the best-scored release of the same resolution (and HDR, where the file
+      has it) with at least four fifths of the old picture that nothing bans; the arr will call it "not an upgrade", so the
+      queue janitor imports it by hand instead of clearing it. <b>Keep</b> drops the row.</div>
+    ${rows.length?`${bcSelBar()}<div class="rowbox scrollbox" style="max-height:380px"><table class="sktbl" style="width:100%;font-size:11.5px;table-layout:fixed">
+      <colgroup><col style="width:24px"><col style="width:auto"><col style="width:200px"><col style="width:200px"><col style="width:66px"><col style="width:74px"><col style="width:140px"><col style="width:170px"></colgroup>
+      <thead><tr class="dim" style="font-size:10.5px"><th class="c"><input type="checkbox" ${allOn?'checked':''} title="Select every row" onclick="bcSelAll(this.checked)"></th>
+        <th class="l">FILE</th><th class="c">WAS</th><th class="c">NOW</th><th class="c" title="Share of the old file's picture the new one keeps">KEPT</th>
+        <th class="c">ADVICE</th><th class="l">STATE</th><th class="r"></th></tr></thead>
+      <tbody>${rows.map(bcRowHtml).join('')}</tbody></table></div>`
+      :'<div class="dim" style="font-size:11.5px">no upgrade has cut a file\'s picture</div>'}
+    ${kept?`<div style="font-size:11px;margin-top:5px"><a href="#" onclick="_bcShowKept=!_bcShowKept;bcPaint();return false">${_bcShowKept?'hide':'also show'} the ${kept} kept</a></div>`:''}
+  </div>`;
+  if(html===_bcKey) return;
+  _bcKey=html;
+  const box=el.querySelector('.scrollbox'), top=box?box.scrollTop:0;
+  el.innerHTML=html;
+  const nb=el.querySelector('.scrollbox'); if(nb) nb.scrollTop=top;
+}
+function bcPick(k, ev){
+  const keys=bcRows().filter(r=>r.state==='open'||r.state==='none').map(r=>r.file_id), i=keys.indexOf(k);
+  if(ev&&ev.shiftKey&&_bcLast!==null&&i>=0){
+    const a=Math.min(i,_bcLast), b=Math.max(i,_bcLast), on=!_bcSel.has(k);
+    for(let x=a;x<=b;x++){ if(on) _bcSel.add(keys[x]); else _bcSel.delete(keys[x]); }
+  }else{ if(_bcSel.has(k)) _bcSel.delete(k); else _bcSel.add(k); }
+  if(i>=0) _bcLast=i;
+  bcPaint();
+}
+function bcSelAll(on){
+  _bcSel.clear(); if(on) bcRows().filter(r=>r.state==='open'||r.state==='none').forEach(r=>_bcSel.add(r.file_id));
+  _bcLast=null; bcPaint();
+}
+function bcPickRec(){
+  _bcSel.clear(); bcRows().filter(r=>(r.state==='open'||r.state==='none')&&(r.why||{}).rec==='fetch').forEach(r=>_bcSel.add(r.file_id));
+  bcPaint();
+}
+function bcOpenRow(k){ if(_bcOpen.has(k)) _bcOpen.delete(k); else _bcOpen.add(k); bcPaint(); }
+async function bcPreview(id,btn){
+  _bcPrev[id]='…'; bcPaint();
+  try{ _bcPrev[id]=await (await fetch('/api/bitcut/preview?file_id='+id)).json(); }catch(e){ _bcPrev[id]={ok:false,why:'could not ask the arr'}; }
+  bcPaint();
+}
+async function bcFetch(ids,btn){
   if(btn){ btn.disabled=true; btn.textContent='searching…'; }
-  let d={}; try{ d=await (await fetch('/api/bitcut/fetch?file_id='+id,{method:'POST'})).json(); }catch(e){}
-  if(!d.ok && d.why) alert(d.why);
+  const fails=[];
+  for(const id of ids){
+    let d={}; try{ d=await (await fetch('/api/bitcut/fetch?file_id='+id,{method:'POST'})).json(); }catch(e){}
+    if(!d.ok) fails.push(((_bc.rows||[]).find(r=>r.file_id===id)||{}).label+': '+(d.why||'failed'));
+    _bcSel.delete(id);
+    await bcLoad();
+  }
+  if(fails.length) alert(fails.join('\n'));
+}
+async function bcKeep(ids){
+  for(const id of ids){ await fetch('/api/bitcut/keep?file_id='+id,{method:'POST'}); _bcSel.delete(id); }
   bcLoad();
 }
-async function bcKeep(id){ await fetch('/api/bitcut/keep?file_id='+id,{method:'POST'}); bcLoad(); }
 
 // ---- the queue janitor's recent removals ----------------------------------
 // THE SAME SHAPE AS THE BAN LIST: a table in a scroll box, headings that
