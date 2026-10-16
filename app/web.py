@@ -18018,16 +18018,24 @@ async function loadAll(){
   // Asked once; hostIoLoad reschedules itself only if there IS a remote host.
   if(_hostIo===null) hostIoLoad();
 
-  loadLibs();
+  // ONLY WHAT IS ON SCREEN. Each of these paints one panel and already has a
+  // gated poll of its own; from here they ran bare, so on /settings - where
+  // the tile row keeps this wave alive while every one of those panels is
+  // hidden - the wave fired nine requests for nothing every fifteen seconds,
+  // and everything the page did want queued behind them in the browser's six
+  // connections. loadCtl, ffCheck and ffProgress stay bare: they feed the
+  // header, which is on every page, and cost a few milliseconds each.
+  gated(loadLibs,'scanPanel')();
 
   // rescan is driven from the Libraries panel now, which can also do one library
   if(s.scan.running) setTimeout(loadAll,3000);
 
-  loadWorkers(); loadHooks(); loadHistory(); loadGate(); loadRenq();
-ffCheck(); loadCtl(); loadCmq(); loadPq();
-// A download survives a page reload - pick it back up, and surface a build
-// that finished staging while the page was closed.
-ffProgress();
+  if(_wdata===undefined||_wdata===null) loadWorkers(); else gated(loadWorkers,'jobCap')();
+  gated(loadHooks,'hooks')(); gated(loadHistory,'jobCap')(); gated(loadGate,'gate')(); gated(loadRenq,'renq')();
+  ffCheck(); loadCtl(); gated(loadCmq,'cmq')(); gated(loadPq,'pq')();
+  // A download survives a page reload - pick it back up, and surface a build
+  // that finished staging while the page was closed.
+  ffProgress();
 
   const a=await (await fetch('/api/arrs')).json();
   setHTML(document.getElementById('arrs'), Object.entries(a).map(([n,v])=>
