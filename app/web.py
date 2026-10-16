@@ -10678,6 +10678,20 @@ def api_submake():
     return submake.snapshot()
 
 
+# THEIR OWN WORKERS. A release search is a minute of waiting on the arr, and
+# on the shared thread pool it queued behind nuarr's other work - the row sat
+# at "starting" before anything had begun. Four threads, used by nothing else.
+_BC_POOL = None
+
+
+async def _bc_run(fn, *a):
+    global _BC_POOL
+    if _BC_POOL is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _BC_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="bitcut")
+    return await asyncio.get_running_loop().run_in_executor(_BC_POOL, fn, *a)
+
+
 @app.get("/api/bitcut")
 def api_bitcut():
     from . import bitcut
@@ -10688,21 +10702,28 @@ def api_bitcut():
 async def api_bitcut_fetch(file_id: int):
     """Grab the best fuller copy of a file an upgrade cut the bitrate of."""
     from . import bitcut
-    return await asyncio.to_thread(bitcut.fetch, int(file_id))
+    return await _bc_run(bitcut.fetch, int(file_id))
 
 
 @app.get("/api/bitcut/preview")
 async def api_bitcut_preview(file_id: int):
     """What Find a fuller copy would grab, without grabbing."""
     from . import bitcut
-    return await asyncio.to_thread(bitcut.preview, int(file_id))
+    return await _bc_run(bitcut.preview, int(file_id))
+
+
+@app.get("/api/bitcut/progress")
+async def api_bitcut_progress():
+    """What each running find / restore / check is doing right now."""
+    from . import bitcut
+    return bitcut.progress()
 
 
 @app.post("/api/bitcut/restore")
 async def api_bitcut_restore(file_id: int):
     """Bring back the file an upgrade replaced - recycle bin, or its release again."""
     from . import bitcut
-    return await asyncio.to_thread(bitcut.restore, int(file_id))
+    return await _bc_run(bitcut.restore, int(file_id))
 
 
 @app.post("/api/bitcut/keep")
@@ -46868,6 +46889,31 @@ async function loadArrsTab(){
 // % and what to do, and a bar of batch actions while anything is selected.
 let _bc=null, _bcKey='', _bcLast=null, _bcShowKept=false, _bcShowDone=false;
 const _bcBusy=new Set();       // rows a Find a fuller copy is searching for right now
+// LIVE PROGRESS. The server says which step each running find / restore /
+// check is on; a striped bar moves while it works and fills against how long
+// a release search has been taking, so a long wait reads as a wait and not a
+// hang. Polled once a second while anything here is running.
+let _bcProg={rows:{}}, _bcPollT=null;
+function bcBusyAny(){ return _bcBusy.size || Object.values(_bcPrev).some(v=>v==='…'); }
+async function bcPoll(){
+  if(_bcPollT) clearTimeout(_bcPollT);
+  if(!bcBusyAny()) return;
+  try{ _bcProg=await (await fetch('/api/bitcut/progress')).json(); }catch(e){}
+  _bcKey=''; bcPaint();
+  _bcPollT=setTimeout(bcPoll, 1000);
+}
+const _bcT0={};                 // when the page asked, for the wait before the server starts
+function bcProgHtml(id, fallback){
+  const p=(_bcProg.rows||{})[String(id)], avg=_bcProg.search_s;
+  if(!_bcT0[id]) _bcT0[id]=Date.now();
+  const el=p?p.elapsed:Math.round((Date.now()-_bcT0[id])/1000);
+  const searching=p&&/asking every indexer/.test(p.step||'');
+  const pct=searching&&avg?Math.min(95, Math.round((p.step_at?(Date.now()/1000-p.step_at):0)/avg*100)):null;
+  return `<div class="bcprog"><div style="color:#79c0ff;font-size:10.5px">${esc(p?p.what:fallback)}
+      <span class="dim mono" style="float:right">${el}s${searching&&avg?` · a search takes ~${avg}s`:''}</span></div>
+    <div class="bcbar"><div class="${pct==null?'bcrun':'bcfill'}" style="${pct==null?'':'width:'+pct+'%'}"></div></div>
+    <div class="dim" style="font-size:10px;white-space:normal">${esc(p?p.step:'waiting for the server to start it…')}</div></div>`;
+}
 const _bcSel=new Set(), _bcOpen=new Set(), _bcPrev={};
 const BC_COL={open:'#e8a33d',grabbed:'#79c0ff',fixed:'var(--ok)',none:'var(--dim)',kept:'var(--dim)'};
 const BC_WORD={open:'cut',grabbed:'fetching a fuller copy',fixed:'fuller copy imported',none:'nothing better found',kept:'kept'};
@@ -46886,7 +46932,7 @@ function bcDetail(r){
   const recC=w.rec==='fetch'?'var(--bad)':'#e8a33d';
   const pv=_bcPrev[r.file_id];
   const pvHtml=pv===undefined?`<button class="rmb" onclick="bcPreview(${r.file_id},this)" title="Ask the arr for this item's releases now and show what Find a fuller copy would take - nothing is grabbed">Check what is available</button>`
-    : pv==='…'?'<span class="dim">asking the arr…</span>'
+    : pv==='…'?bcProgHtml(r.file_id,'checking what is available')
     : pv.ok?`<div>${fmt(pv.n)} release(s) qualify - the first is what would be grabbed:</div>${pv.top.map((t,k)=>`<div class="mono" style="font-size:10.5px;${k?'':'color:var(--ok)'}">${k?'':'→ '}${esc(t.title||'')} <span class="dim">· ${(+t.gb).toFixed(2)} GB · score ${fmt(t.score||0)} · ${esc(t.indexer||'')}${t.protocol==='torrent'?' · '+fmt(t.seeders||0)+' seeders':''}</span></div>`).join('')}`
     : `<span style="color:#e8a33d">${esc(pv.why||'nothing qualifies')}</span>`;
   const old=pv&&pv!=='…'&&pv.old||null;
@@ -46927,7 +46973,7 @@ function bcRowHtml(r){
       :r.state==='grabbed'?'<span style="color:#79c0ff">on its way</span>'
       :r.state==='kept'?'<span class="dim">kept</span>'
       :w.rec==='fetch'?'<span style="color:var(--bad)">fetch</span>':'<span style="color:#e8a33d">your call</span>'}</td>
-    <td class="l" style="font-size:10.5px">${_bcBusy.has(k)?'<span style="color:#79c0ff">searching the indexers…</span>'
+    <td class="l" style="font-size:10.5px">${_bcBusy.has(k)?bcProgHtml(k,'working')
       :`<span style="color:${BC_COL[r.state]||'var(--dim)'}">${esc(BC_WORD[r.state]||r.state||'')}</span>${
         r.note&&r.state!=='open'?`<div class="dim" style="font-size:10px;white-space:normal" title="${esc(r.note)}">${esc(r.note)}</div>`:''}`}</td>
     <td class="r" style="white-space:nowrap">${can?(r.state==='none'
@@ -46955,7 +47001,14 @@ function bcPaint(){
   const allOn=pick.length&&pick.every(r=>_bcSel.has(r.file_id));
   const kept=(_bc.rows||[]).filter(r=>r.state==='kept').length, done=(_bc.rows||[]).filter(r=>r.state==='fixed').length;
   const fetchN=rows.filter(r=>(r.state==='open'||r.state==='none')&&(r.why||{}).rec==='fetch').length;
-  const html=`<div class="lkind" style="padding:10px 12px">
+  const html=`<style>
+    .bcbar{height:5px;background:var(--line);border-radius:3px;overflow:hidden;margin:3px 0 2px;position:relative}
+    .bcfill{height:5px;background:#79c0ff;border-radius:3px;transition:width .9s linear}
+    .bcrun{position:absolute;inset:0;background:repeating-linear-gradient(45deg,#79c0ff 0 8px,#3b6f99 8px 16px);
+      background-size:200% 100%;animation:bcmove 1s linear infinite}
+    @keyframes bcmove{from{background-position:0 0}to{background-position:-22.6px 0}}
+    .bcfill{background-image:repeating-linear-gradient(45deg,#79c0ff 0 8px,#5aa0d8 8px 16px);animation:bcmove 1s linear infinite}
+  </style><div class="lkind" style="padding:10px 12px">
     <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:baseline">
       <b style="color:#e8a33d">Upgrades that cut the bitrate</b>
       <span class="dim" style="font-size:11px">${fmt(_bc.open||0)} open${fetchN?` · <a href="#" onclick="bcPickRec();return false">select the ${fetchN} worth fetching</a>`:''}</span></div>
@@ -47001,27 +47054,28 @@ function bcPickRec(){
 }
 function bcOpenRow(k){ if(_bcOpen.has(k)) _bcOpen.delete(k); else _bcOpen.add(k); bcPaint(); }
 async function bcPreview(id,btn){
-  _bcPrev[id]='…'; bcPaint();
+  _bcPrev[id]='…'; _bcKey=''; bcPaint(); bcPoll();
   try{ _bcPrev[id]=await (await fetch('/api/bitcut/preview?file_id='+id)).json(); }catch(e){ _bcPrev[id]={ok:false,why:'could not ask the arr'}; }
+  delete _bcT0[id];
   bcPaint();
 }
 // THE ANSWER LANDS ON THE ROW, not in a pop-up: its state cell says
 // "searching the indexers…" while the arr is asked, then what came of it -
 // the release grabbed, or why nothing qualified.
 async function bcFetch(ids,btn){
-  ids.forEach(id=>_bcBusy.add(id)); _bcKey=''; bcPaint();
+  ids.forEach(id=>_bcBusy.add(id)); _bcKey=''; bcPaint(); bcPoll();
   for(const id of ids){
     try{ await (await fetch('/api/bitcut/fetch?file_id='+id,{method:'POST'})).json(); }catch(e){}
-    _bcSel.delete(id); _bcBusy.delete(id); _bcKey='';
+    _bcSel.delete(id); _bcBusy.delete(id); delete _bcT0[id]; _bcKey='';
     await bcLoad();
   }
 }
 // THE OLD ONE BACK - when nothing fuller exists. The row says what came of it.
 async function bcRestore(ids,btn){
-  ids.forEach(id=>_bcBusy.add(id)); _bcKey=''; bcPaint();
+  ids.forEach(id=>_bcBusy.add(id)); _bcKey=''; bcPaint(); bcPoll();
   for(const id of ids){
     try{ await (await fetch('/api/bitcut/restore?file_id='+id,{method:'POST'})).json(); }catch(e){}
-    _bcSel.delete(id); _bcBusy.delete(id); _bcKey='';
+    _bcSel.delete(id); _bcBusy.delete(id); delete _bcT0[id]; _bcKey=''; 
     await bcLoad();
   }
 }

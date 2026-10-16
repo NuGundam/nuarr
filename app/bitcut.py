@@ -206,11 +206,48 @@ def _ids(file_id: int):
     return x, f, a, ids
 
 
-def _releases(a, ids: dict) -> list:
+# WHAT IT IS DOING, FOR THE ROW. A release search is the arr asking every
+# indexer at once and takes ten seconds to a minute; the row shows the step it
+# is on and, from the searches before it, how long one usually takes.
+PROG: dict = {}            # file_id -> {"what", "step", "started", "step_at"}
+_SEARCH_S: list = []       # the last few release searches, in seconds
+
+
+def _step(file_id, step: str, what: str = "") -> None:
+    p = PROG.setdefault(int(file_id), {"what": what or "working", "started": time.time()})
+    if what:
+        p["what"] = what
+    p.update(step=step, step_at=time.time())
+
+
+def _done(file_id) -> None:
+    PROG.pop(int(file_id), None)
+
+
+def progress() -> dict:
+    avg = round(sum(_SEARCH_S) / len(_SEARCH_S)) if _SEARCH_S else None
+    now = time.time()
+    return {"rows": {str(k): {**v, "elapsed": round(now - v["started"])} for k, v in PROG.items()},
+            "search_s": avg}
+
+
+def _releases(a, ids: dict, file_id: int = 0) -> list:
     from .arrqueue import _call
+    if file_id:
+        _step(file_id, f"asking every indexer through {a.name} for this "
+                       f"{'episode' if a.kind == 'sonarr' else 'film'}'s releases")
+        PROG[int(file_id)]["search_at"] = time.time()
+    t0 = time.time()
     if a.kind == "sonarr":
-        return _call(a, f"/api/v3/release?episodeId={ids['episodeIds'][0]}", timeout=240) or []
-    return _call(a, f"/api/v3/release?movieId={ids['movieId']}", timeout=240) or []
+        out = _call(a, f"/api/v3/release?episodeId={ids['episodeIds'][0]}", timeout=240) or []
+    else:
+        out = _call(a, f"/api/v3/release?movieId={ids['movieId']}", timeout=240) or []
+    _SEARCH_S.append(time.time() - t0)
+    del _SEARCH_S[:-8]
+    if file_id:
+        PROG[int(file_id)].pop("search_at", None)
+        _step(file_id, f"weighing {len(out)} release(s) against the old file")
+    return out
 
 
 def candidates(file_id: int) -> tuple[list, dict]:
@@ -219,7 +256,7 @@ def candidates(file_id: int) -> tuple[list, dict]:
     if isinstance(got, str):
         return [], {"why": got}
     x, f, a, ids = got
-    rel = _releases(a, ids)
+    rel = _releases(a, ids, file_id)
     want_res = (_RES.search(x["old"]) or _RES.search(x["new"])).group(1).lower()
     # HDR STAYS HDR. The first fuller copy fetched for Lioness S03E03 was
     # Amazon's 2160p at 20 Mbps - and 8-bit SDR, which its name never said.
@@ -253,6 +290,14 @@ def candidates(file_id: int) -> tuple[list, dict]:
 
 def fetch(file_id: int) -> dict:
     """Grab the best fuller copy, and remember it so the janitor imports it."""
+    _step(file_id, "finding the episode or film in the arr", "finding a fuller copy")
+    try:
+        return _fetch(file_id)
+    finally:
+        _done(file_id)
+
+
+def _fetch(file_id: int) -> dict:
     from .arrqueue import _call
     from . import joblog
     cands, ids = candidates(file_id)
@@ -263,6 +308,7 @@ def fetch(file_id: int) -> dict:
         return {"ok": False, "why": why}
     r = cands[0]
     a = ids.pop("arr")
+    _step(file_id, f"grabbing {r['title']}")
     _call(a, "/api/v3/release", "POST", {"guid": r["guid"], "indexerId": r["indexerId"]})
     set_state(file_id, "grabbed", f"grabbed {r['title']} ({r['size'] / 1e9:.2f} GB, {r.get('indexer')})",
               release=r["title"], arr=a.name, ids=ids, cut_release=_safe_now(file_id))
@@ -414,6 +460,14 @@ def _in_recycle(a, deleted: str) -> str:
 def restore(file_id: int) -> dict:
     """Bring the file the upgrade replaced back: from the recycle bin, or by
     grabbing its release again. The janitor imports a grab as for a fuller copy."""
+    _step(file_id, "reading the arr's history for the file the upgrade replaced", "getting the old one back")
+    try:
+        return _restore(file_id)
+    finally:
+        _done(file_id)
+
+
+def _restore(file_id: int) -> dict:
     import os
     from .arrqueue import _call
     from . import joblog
@@ -426,8 +480,10 @@ def restore(file_id: int) -> dict:
         set_state(file_id, "none", old.get("why") or "the old release is not known")
         return {"ok": False, "why": old.get("why")}
     # 1. the recycle bin
+    _step(file_id, f"looking in {a.name}'s recycle bin for {old['title'][:60]}")
     src = _in_recycle(a, old.get("deleted"))
     if src:
+        _step(file_id, "found it in the recycle bin - putting it back and importing it")
         dst = os.path.join(os.path.dirname(f["path"]), os.path.basename(src))
         os.replace(src, dst)
         q = __import__("urllib.parse").parse.urlencode(
@@ -449,7 +505,8 @@ def restore(file_id: int) -> dict:
         joblog.log(f"bitrate cut: {x['label']} - the old file restored from the recycle bin", "ok")
         return {"ok": True, "how": "recycle bin", "file": os.path.basename(dst)}
     # 2. the same release, again
-    rel = _releases(a, ids)
+    _step(file_id, "not in the recycle bin - looking for the same release on the indexers")
+    rel = _releases(a, ids, file_id)
     k = _key(old["title"])
     hits = [r for r in rel if _key(r.get("title")) == k
             and not any(str(c.get("name") or "").startswith("Nuarr:") for c in (r.get("customFormats") or []))]
@@ -459,6 +516,7 @@ def restore(file_id: int) -> dict:
         set_state(file_id, "none", why)
         return {"ok": False, "why": why}
     r = hits[0]
+    _step(file_id, f"grabbing {r['title']} again")
     _call(a, "/api/v3/release", "POST", {"guid": r["guid"], "indexerId": r["indexerId"]})
     ids.pop("arr", None)
     set_state(file_id, "grabbed", f"grabbing the old release again: {r['title']} ({r['size'] / 1e9:.2f} GB, "
@@ -575,7 +633,16 @@ def explain(x: dict) -> dict:
 
 def preview(file_id: int) -> dict:
     """What Find a fuller copy WOULD grab - the top few - without grabbing."""
+    _step(file_id, "finding the episode or film in the arr", "checking what is available")
+    try:
+        return _preview(file_id)
+    finally:
+        _done(file_id)
+
+
+def _preview(file_id: int) -> dict:
     cands, ids = candidates(file_id)
+    _step(file_id, "reading the arr's history for the file the upgrade replaced")
     try:
         old = old_release(file_id)
     except Exception:                                            # noqa: BLE001
