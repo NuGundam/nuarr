@@ -10868,6 +10868,33 @@ def api_bitcut_every(h: float):
     return {"every_h": bitcut.set_every_h(h)}
 
 
+@app.get("/api/dlleft")
+def api_dlleft():
+    """Downloads left in the completed folder that no queue or client lists."""
+    from . import dlleft
+    return dlleft.snapshot()
+
+
+@app.post("/api/dlleft/act")
+async def api_dlleft_act(path: str, action: str, kind: str = ""):
+    """hand (ask the arr to import it), delete (Recycle Bin) or keep (stop listing)."""
+    from . import dlleft
+    if action == "hand":
+        return await asyncio.to_thread(dlleft.hand_to_arr, path, kind)
+    if action == "delete":
+        return await asyncio.to_thread(dlleft.delete, path)
+    if action == "keep":
+        dlleft.keep(path)
+        return {"ok": True}
+    return {"ok": False, "why": "unknown action"}
+
+
+@app.post("/api/dlleft/scan")
+async def api_dlleft_scan():
+    from . import dlleft
+    return await asyncio.to_thread(dlleft.scan)
+
+
 @app.post("/api/bitcut/mode")
 def api_bitcut_mode(mode: str):
     """manual: list the cuts and wait. auto: fetch a fuller copy for the ones advised fetch."""
@@ -19844,6 +19871,7 @@ const ATTN_STYLE={
   'bitrate cuts':   ['#e8a33d','an upgrade cut the picture - find a fuller copy, or keep'],
   'banned terms':   ['#e0575b','a banned term also matches a show title'],
   'tvdb re-ids':    ['#e2b341','TheTVDB re-added a series and the repair could not match it'],
+  'download leftovers': ['#e2b341','left in the download folder with video in it - import, delete or keep'],
 };
 
 function attnPaint(){
@@ -47138,6 +47166,7 @@ async function loadArrsTab(refresh){
   loadHookState();
   _bcKey='';                 // the box is new and empty - paint it whatever the data says
   bcLoad();
+  dlLoad();
 }
 
 // ---- upgrades that cut the bitrate - see bitcut.py -------------------------
@@ -47454,7 +47483,54 @@ function qjList(qj){
     <div style="font-size:11px;font-weight:600">Removed${_qjRows.length?` (last ${_qjRows.length})`:''}
       ${st.running?'<span class="dim" style="font-weight:400"> · running…</span>':''}</div>
     <div id="qjTable" style="margin-top:4px">${qjTableHtml()}</div>
+    <div id="dlBox" style="margin-top:10px"></div>
   </div>`;
+}
+// ---- left in the download folder - see dlleft.py --------------------------
+let _dl=null;
+async function dlLoad(){
+  const el=document.getElementById('dlBox'); if(!el) return;
+  try{ _dl=await (await fetch('/api/dlleft')).json(); }catch(e){ return; }
+  const rows=_dl.listed||[];
+  el.innerHTML=`<div style="font-size:11px;font-weight:600">Left in the download folder
+      <span class="dim" style="font-weight:400">${(_dl.roots||[]).map(esc).join(', ')||'-'} ·
+      ${rows.length?fmt(rows.length)+' with video in them, yours to decide':'nothing with video left behind'}
+      ${_dl.removed_total?` · ${fmt(_dl.removed_total)} empty folder(s) recycled since start`:''}
+      ${_dl.at?` · looked ${ago(_dl.at)}`:''}</span>
+      <button class="rmb" style="margin-left:6px" onclick="dlScan(this)">Look now</button></div>
+    <div class="dim" style="font-size:11px;margin:3px 0 5px">Folders no Sonarr/Radarr queue and no download client
+      lists any more - the janitor cannot remove those through the arr, so they sat here. One whose files have
+      already gone (an empty shell) is recycled on its own; one that still holds a video is yours:
+      <b>Hand to the arr</b> asks Sonarr or Radarr to import that folder by its own rules; <b>Delete</b> moves it
+      to the Recycle Bin; <b>Keep</b> stops listing it. Anything touched in the last ${_dl.min_age_h||6} hours is left
+      alone - it may still be unpacking.</div>
+    ${_dl.error?`<div class="warn" style="font-size:11px">${esc(_dl.error)}</div>`:''}
+    ${rows.length?`<div class="rowbox scrollbox" style="max-height:300px"><table class="sktbl" style="width:100%;font-size:11.5px;table-layout:fixed">
+      <colgroup><col style="width:auto"><col style="width:70px"><col style="width:60px"><col style="width:60px"><col style="width:100px"><col style="width:260px"></colgroup>
+      <thead><tr class="dim" style="font-size:10.5px"><th class="l">FOLDER</th><th class="c">SIZE</th><th class="c">VIDEOS</th>
+        <th class="c">AGE</th><th class="c">ARR</th><th class="r"></th></tr></thead><tbody>${rows.map((r,i)=>`<tr>
+        <td class="l" title="${esc(r.path)}"><b>${esc(r.name)}</b><div class="dim mono" style="font-size:10px;overflow:hidden;text-overflow:ellipsis">${esc((r.videos||[]).slice(0,2).join(' · '))}${r.n_videos>2?` +${r.n_videos-2}`:''}</div>
+          ${r.handed?`<div style="font-size:10px;color:#79c0ff">handed to ${esc(r.handed.arr)} ${ago(r.handed.at)} - it imports what its rules allow; a folder it took leaves this list</div>`:''}</td>
+        <td class="c mono">${gb(r.size||0)}</td><td class="c">${fmt(r.n_videos||0)}</td>
+        <td class="c dim">${r.age_h<48?Math.round(r.age_h)+'h':Math.round(r.age_h/24)+'d'}</td>
+        <td class="c"><select id="dlk${i}" style="font-size:10.5px"><option value="sonarr" ${r.kind==='sonarr'?'selected':''}>Sonarr</option><option value="radarr" ${r.kind==='radarr'?'selected':''}>Radarr</option></select></td>
+        <td class="r" style="white-space:nowrap"><button class="rmb" onclick="dlAct(${i},'hand',this)">Hand to the arr</button>
+          <button class="rmb" onclick="dlAct(${i},'delete',this)">Delete</button>
+          <button class="rmb" onclick="dlAct(${i},'keep',this)">Keep</button></td></tr>`).join('')}</tbody></table></div>`:''}`;
+}
+async function dlAct(i,action,btn){
+  const r=(_dl.listed||[])[i]; if(!r) return;
+  if(action==='delete' && !confirm(`Move "${r.name}" (${gb(r.size||0)}) to the Recycle Bin?`)) return;
+  if(btn){ btn.disabled=true; btn.textContent='…'; }
+  const kind=(document.getElementById('dlk'+i)||{}).value||r.kind;
+  let d={}; try{ d=await (await fetch(`/api/dlleft/act?path=${encodeURIComponent(r.path)}&action=${action}&kind=${kind}`,{method:'POST'})).json(); }catch(e){}
+  if(!d.ok && d.why) alert(d.why);
+  dlLoad();
+}
+async function dlScan(btn){
+  if(btn){ btn.disabled=true; btn.textContent='looking…'; }
+  try{ await fetch('/api/dlleft/scan',{method:'POST'}); }catch(e){}
+  dlLoad();
 }
 
 // ---- Pushover: the arrs' imports on the phone -----------------------------

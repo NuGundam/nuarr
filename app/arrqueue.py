@@ -714,6 +714,20 @@ def _pass() -> str:
         bits.append(f"{swept} left in the clients, removed")
     if kept:
         bits.append(f"{kept} with a warning kept for a person")
+    # THE FOLDER, NOT ONLY THE LISTS. A download no queue and no client lists
+    # any more is still on disk - see dlleft.py.
+    try:
+        from . import dlleft
+        dl = dlleft.scan()
+        if dl["removed"]:
+            bits.append(f"{len(dl['removed'])} empty leftover folder(s) in the download folder recycled")
+            _remember([{"at": time.time(), "arr": "", "title": r["name"], "client": "folder",
+                        "why": "an empty leftover in the completed folder - its files had already gone; "
+                               "moved to the Recycle Bin", "kind": "leftover"} for r in dl["removed"]])
+        if dl["listed"]:
+            bits.append(f"{len(dl['listed'])} leftover download(s) with video in them, listed for you")
+    except Exception as e:                                       # noqa: BLE001
+        STATS["detail"].append(f"download folder sweep: {type(e).__name__}: {e}"[:160])
     return "; ".join(bits) or "nothing to clean"
 
 

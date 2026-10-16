@@ -148,8 +148,21 @@ def _tvdb_left() -> dict | None:
             "items": [{"title": r.get("title") or "", "detail": (r.get("why") or "")[:140]} for r in left[:6]]}
 
 
+def _download_leftovers() -> dict | None:
+    """Folders left in the completed-download folder with video still in them."""
+    from . import dlleft
+    rows = dlleft.STATE.get("listed") or []
+    if not rows:
+        return None
+    return {"what": "download leftovers", "n": len(rows),
+            "note": f"{len(rows)} left in the download folder with video in them",
+            "goto": "/settings#arrs@dlBox",
+            "items": [{"title": r["name"], "detail": f"{r['n_videos']} video(s), "
+                       f"{round(r['size'] / 1e9, 1)} GB, {round(r['age_h'])} h old"} for r in rows[:6]]}
+
+
 SOURCES = (_subtitle_input, _raws, _audio_questions, _rules_gap, _bitrate_cuts,
-           _ban_collisions, _tvdb_left)
+           _ban_collisions, _tvdb_left, _download_leftovers)
 
 
 def _build() -> list:
