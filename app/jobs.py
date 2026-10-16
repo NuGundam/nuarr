@@ -7861,7 +7861,13 @@ def snapshot(recent_limit: int = 60) -> dict:
             "   AND event IN ('imported','upgraded') "
             " ORDER BY at DESC LIMIT 1) AS landed FROM jobs j "
             "LEFT JOIN files f ON f.id=j.file_id "
-            "WHERE j.state IN ('done','failed','skipped','cancelled',"
+            # +j.state: KEEP THE STATE INDEX OUT OF THIS. The planner, told
+            # the six finished states average 56,000 rows each, gathered all
+            # 166,000 of them through ix_jobs_state and sorted - 470 ms of
+            # every dashboard poll. Walking ix_jobs_finished newest-first and
+            # stopping at the limit is 0.5 ms; the unary plus is how SQLite is
+            # told a column's index must not be used for that term.
+            "WHERE +j.state IN ('done','failed','skipped','cancelled',"
             "'blocked','deferred') "
             "ORDER BY j.finished_at DESC LIMIT ?", (recent_limit,))]
     for r in recent_done:

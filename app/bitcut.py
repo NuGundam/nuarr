@@ -35,6 +35,7 @@ KV_BACKFILL = "bitcut.backfilled"
 RATIO = 0.5          # below this share of the old picture, an upgrade is a cut
 REFETCH_AT = 0.8     # a replacement must carry at least this share of it
 _RES = re.compile(r"(2160p|1080p|720p|576p|480p)", re.I)
+_RANK = {"480p": 1, "576p": 2, "720p": 3, "1080p": 4, "2160p": 5}
 _HDR = re.compile(r"HDR|DV|DoVi|Dolby.?Vision|HLG", re.I)
 
 
@@ -68,11 +69,21 @@ def ratio(old: str, old_gb: float, new: str, new_gb: float, secs: float = 0.0):
     rule does not apply (different resolution, small file, remux source, or
     a new file that still has plenty)."""
     ra, rb = _RES.search(old or ""), _RES.search(new or "")
-    if not (ra and rb) or ra.group(1).lower() != rb.group(1).lower() or old_gb < 1:
+    if not (ra and rb) or old_gb <= 0:
         return None
-    if "remux" in (old or "").lower():
+    # A DROP IN RESOLUTION IS A CUT WHATEVER THE BITS SAY. Death March S01E01-
+    # E07 went from 4K Blu-ray dual audio (YURASUKA, score 4,950) to 720p TV
+    # rips (Golumpa, 2,000) on 2026-10-16 as "upgrades": the Anime profile did
+    # not allow 2160p, and Sonarr calls ANY allowed quality an upgrade over one
+    # the profile does not want. The same-resolution rule never looked at it.
+    lower = _RANK.get(rb.group(1).lower(), 0) < _RANK.get(ra.group(1).lower(), 0)
+    if ra.group(1).lower() != rb.group(1).lower() and not lower:
         return None
-    if secs > 60:
+    if old_gb < 1 and not lower:
+        return None
+    if "remux" in (old or "").lower() and not lower:
+        return None
+    if secs > 60 and not lower:
         mbps = new_gb * 8000 / secs / _eff(new)
         if mbps >= PLENTY_MBPS.get(ra.group(1).lower(), 99):
             return None
@@ -703,6 +714,9 @@ def explain(x: dict) -> dict:
     if lc.get("lost"):
         notes.append("the upgrade dropped " + " and ".join(lc["lost"]) + " audio")
     eq, share = out.get("new_eq"), float(x.get("share") or 0)
+    ro, rn = _RES.search(x.get("old") or ""), _RES.search(x.get("new") or "")
+    if ro and rn and _RANK.get(rn.group(1).lower(), 0) < _RANK.get(ro.group(1).lower(), 0):
+        notes.insert(0, f"the resolution dropped from {ro.group(1)} to {rn.group(1)}")
     if "English" in (lc.get("gained") or []):
         rec, why = "keep", ("the upgrade brought English audio - the smaller picture was the price of it; "
                             "a fuller copy would have to be dual-audio too")
