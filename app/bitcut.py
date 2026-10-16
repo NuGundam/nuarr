@@ -748,7 +748,30 @@ def _preview(file_id: int) -> dict:
 # it is yours. A sweep runs a minute after a new cut lands and every hour.
 KV_MODE = "bitcut.mode"
 KV_AUTO_LOG = "bitcut.auto_log"
+KV_EVERY_H = "bitcut.sweep_h"
 SWEEP_S = 3600
+
+
+def every_h() -> float:
+    """How often auto sweeps, in hours - a setting on the box; 1 by default."""
+    from .db import kv_get
+    try:
+        return max(0.25, min(168.0, float(kv_get(KV_EVERY_H) or 1.0)))
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def set_every_h(h: float) -> float:
+    from .db import kv_set
+    h = max(0.25, min(168.0, float(h)))
+    kv_set(KV_EVERY_H, str(h))
+    if AUTO.get("last_at"):
+        AUTO["next_at"] = AUTO["last_at"] + h * 3600
+    return h
+
+
+def sweep_s() -> float:
+    return every_h() * 3600
 AUTO: dict = {"last_at": 0.0, "next_at": 0.0, "running": False, "fetched": 0, "none": 0, "kick": 0.0}
 
 
@@ -817,9 +840,18 @@ def auto_sweep() -> dict:
             joblog.log(f"bitrate cuts (auto): fetched a fuller copy for {fetched}, nothing fuller for {none}",
                        "info")
     finally:
-        AUTO.update(running=False, last_at=time.time(), next_at=time.time() + SWEEP_S,
+        AUTO.update(running=False, last_at=time.time(), next_at=time.time() + sweep_s(),
                     fetched=AUTO["fetched"] + fetched, none=AUTO["none"] + none)
     return {"fetched": fetched, "none": none}
+
+
+async def run_now() -> dict:
+    """The Run now button: one sweep, whatever the mode."""
+    import asyncio
+    if AUTO["running"]:
+        return {"ok": False, "why": "already sweeping"}
+    AUTO["kick"] = 0.0
+    return {"ok": True, **await asyncio.to_thread(auto_sweep)}
 
 
 async def watch() -> None:
@@ -839,7 +871,7 @@ async def watch() -> None:
         except Exception as e:                                   # noqa: BLE001
             from . import joblog
             joblog.log(f"bitrate cuts (auto): {type(e).__name__}: {e}", "warn")
-            AUTO["next_at"] = time.time() + SWEEP_S
+            AUTO["next_at"] = time.time() + sweep_s()
 
 
 def snapshot() -> dict:
@@ -851,7 +883,7 @@ def snapshot() -> dict:
             x["why"] = {}
     return {"rows": rows, "open": sum(1 for x in rows if x.get("state") == "open"),
             "rule": {"ratio": RATIO, "refetch_at": REFETCH_AT},
-            "mode": mode(), "auto": {**AUTO, "log": _auto_log()[:12],
+            "mode": mode(), "auto": {**AUTO, "log": _auto_log()[:12], "every_h": every_h(),
                                      "due": len([x for x in rows if x.get("state") == "open"
                                                  and not x.get("auto_tried")
                                                  and (x.get("why") or {}).get("rec") == "fetch"])}}

@@ -10725,6 +10725,19 @@ async def api_bitcut_progress():
     return bitcut.progress()
 
 
+@app.post("/api/bitcut/run")
+async def api_bitcut_run():
+    """One sweep now - fetch for every open row advised fetch - in either mode."""
+    from . import bitcut
+    return await bitcut.run_now()
+
+
+@app.post("/api/bitcut/every")
+def api_bitcut_every(h: float):
+    from . import bitcut
+    return {"every_h": bitcut.set_every_h(h)}
+
+
 @app.post("/api/bitcut/mode")
 def api_bitcut_mode(mode: str):
     """manual: list the cuts and wait. auto: fetch a fuller copy for the ones advised fetch."""
@@ -47080,11 +47093,21 @@ function bcPaint(){
         <span class="dim" title="Manual lists the cuts and waits for you. Auto runs Find a fuller copy by itself on every row advised fetch - once per row; your-call rows, keep rows and rows where nothing fuller was found stay yours.">for the ones advised fetch</span>
         <span class="pill ${_bc.mode==='manual'?'p-acc':'p-dim'}" style="cursor:pointer" onclick="bcMode('manual')">manual</span>
         <span class="pill ${_bc.mode==='auto'?'p-ok':'p-dim'}" style="cursor:pointer" onclick="bcMode('auto')">auto</span></span></div>
-    ${_bc.mode==='auto'?`<div style="font-size:11px;margin:3px 0 0;color:var(--ok)">auto ·
-      ${(_bc.auto||{}).running?'sweeping now…':((_bc.auto||{}).due?`${fmt(_bc.auto.due)} to fetch on the next sweep`:'nothing waiting')}
-      <span class="dim">· ${(_bc.auto||{}).last_at?'last sweep '+ago(_bc.auto.last_at):'no sweep yet'}${(_bc.auto||{}).next_at&&!(_bc.auto||{}).running?' · next '+ago(_bc.auto.next_at).replace(' ago','').replace(/^/,'in '):''}
-      · ${fmt((_bc.auto||{}).fetched||0)} fetched, ${fmt((_bc.auto||{}).none||0)} with nothing fuller, since start</span>
-      ${((_bc.auto||{}).log||[]).length?`<div class="dim" style="font-size:10.5px;margin-top:2px">${_bc.auto.log.slice(0,4).map(l=>`${esc(l.label||'')}: ${l.ok?'<span style="color:var(--ok)">grabbed</span> ':'<span style="color:#e8a33d">nothing fuller</span> - '}${esc(String(l.what||'').slice(0,70))}`).join(' · ')}</div>`:''}</div>`:''}
+    ${(()=>{ const A=_bc.auto||{}, auto=_bc.mode==='auto';
+      return `<div class="mono" style="font-size:11px;margin:4px 0 0;display:flex;gap:14px;flex-wrap:wrap;align-items:center">
+        <span title="${A.last_at?esc(new Date(A.last_at*1000).toLocaleString()):''}"><span class="dim">last run</span> ${
+          A.running?'<span style="color:var(--acc)">running now…</span>'
+          :A.last_at?`${ago(A.last_at)} <span class="dim">(${new Date(A.last_at*1000).toLocaleTimeString()})</span>`:'<span class="dim">not yet</span>'}</span>
+        <span title="${A.next_at?esc(new Date(A.next_at*1000).toLocaleString()):''}"><span class="dim">next run</span> ${
+          !auto?'<span class="dim">only in auto</span>'
+          :A.running?'<span class="dim">—</span>'
+          :A.kick?'<span style="color:var(--acc)">within a minute</span>'
+          :A.next_at?`${(d=>d<=5?'due now':'in '+(d<90?Math.round(d)+'s':d<5400?Math.round(d/60)+'m':(d/3600).toFixed(1)+'h'))(A.next_at-Date.now()/1000)} <span class="dim">(${new Date(A.next_at*1000).toLocaleTimeString()})</span>`:'<span class="dim">—</span>'}</span>
+        <span><span class="dim">every</span> <input type="number" min="0.25" max="168" step="0.25" value="${A.every_h||1}" style="width:52px;font-size:11px"
+          title="Hours between sweeps in auto" onchange="bcEvery(this.value)"> <span class="dim">h</span></span>
+        <button class="rmb" ${A.running?'disabled':''} onclick="bcRunNow(this)" title="One sweep now, in either mode: Find a fuller copy for every open row advised fetch">Run now</button>
+        <span class="dim">${A.running?'':(A.due?`${fmt(A.due)} to fetch`:'nothing to fetch')} · ${fmt(A.fetched||0)} fetched, ${fmt(A.none||0)} with nothing fuller, since start</span>
+      </div>${(A.log||[]).length?`<div class="dim" style="font-size:10.5px;margin-top:2px">${A.log.slice(0,4).map(l=>`${esc(l.label||'')}: ${l.ok?'<span style="color:var(--ok)">grabbed</span> ':'<span style="color:#e8a33d">nothing fuller</span> - '}${esc(String(l.what||'').slice(0,70))}`).join(' · ')}</div>`:''}`; })()}
     <div class="dim" style="font-size:11px;margin:3px 0 7px">An arr ranks releases by custom-format score, which knows nothing
       about how many bits went into the picture - Lioness S03E03 went from 7.42 GB to 2.66 GB of 2160p as an "upgrade".
       Listed: same resolution, the new file keeping under half the old one's picture (HEVC counted as needing 65% of H.264's
@@ -47151,6 +47174,16 @@ async function bcRestore(ids,btn){
     _bcSel.delete(id); _bcBusy.delete(id); delete _bcT0[id]; _bcKey=''; 
     await bcLoad();
   }
+}
+async function bcRunNow(btn){
+  if(btn){ btn.disabled=true; btn.textContent='sweeping…'; }
+  _bcKey=''; setTimeout(bcLoad, 1500);
+  try{ await fetch('/api/bitcut/run',{method:'POST'}); }catch(e){}
+  _bcKey=''; bcLoad();
+}
+async function bcEvery(h){
+  await fetch('/api/bitcut/every?h='+encodeURIComponent(h),{method:'POST'});
+  _bcKey=''; bcLoad();
 }
 async function bcMode(m){
   await fetch('/api/bitcut/mode?mode='+m,{method:'POST'});
