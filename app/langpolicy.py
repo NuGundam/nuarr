@@ -221,6 +221,16 @@ def _migrate_v1() -> dict:
     return out
 
 
+# THE BUILT POLICY, KEYED ON WHAT IT IS BUILT FROM. load() is called per
+# file by the checks - 2,262 times in one /api/health - and each call seeded
+# and normalised every library again: 13,572 _seed() deep copies and 27,144
+# _norm() passes, 0.26 s of a 0.4 s request. The result depends only on the
+# stored text and the library list, so it is built once per change of either
+# and handed out as a fresh parse: every caller still gets its own copy to
+# mutate, which is the rule the text cache above already keeps.
+_BUILT: dict = {"key": None, "text": ""}
+
+
 def load() -> dict:
     """Policy for every CURRENT library, filled in from the seeds."""
     raw = _stored()
@@ -228,13 +238,18 @@ def load() -> dict:
         raw = _migrate_v1()
         if raw:
             _write(raw)
+    libs = tuple(libraries())
+    key = (_CACHE.get("text") or json.dumps(raw, sort_keys=True), libs)
+    if _BUILT["key"] == key and _BUILT["text"]:
+        return json.loads(_BUILT["text"])
     pol: dict = {}
-    for name in libraries():
+    for name in libs:
         base = _seed(name)
         got = raw.get(name) or {}
         for side in ("audio", "subs"):
             _norm(got.get(side) or {}, base[side])
         pol[name] = base
+    _BUILT.update(key=key, text=json.dumps(pol))
     return pol
 
 

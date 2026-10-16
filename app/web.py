@@ -17325,6 +17325,32 @@ function poll(fn, ms, id){
   _gatedOnShow.push(g);
   return setInterval(g, ms);
 }
+// THE SELF-RESCHEDULING LOADERS, THE SAME RULE. A dozen panels poll with a
+// setTimeout that re-arms itself and stopped only when its element was
+// REMOVED - but the settings page hides panes, it does not remove them, so
+// after one visit to Subtitles the page went on asking /api/subs (a 250 ms
+// merge) every six seconds from every other page until the tab was closed;
+// Health, Audio language and the subtitle maker the same. shownPoll runs the
+// next pass only while the element is on screen and the tab is visible, and
+// parks it otherwise; a parked loader is resumed the moment its element is
+// shown again - a pane switch, or the tab coming back.
+const _pollParked={};
+function shownPoll(id, fn){
+  const e=document.getElementById(id);
+  if(!e) return;
+  if(e.offsetParent!==null && !document.hidden){ fn(); return; }
+  _pollParked[id]=fn;
+}
+function _pollResume(){
+  if(document.hidden) return;
+  for(const id of Object.keys(_pollParked)){
+    const e=document.getElementById(id);
+    if(!e){ delete _pollParked[id]; continue; }
+    if(e.offsetParent!==null){ const fn=_pollParked[id]; delete _pollParked[id]; try{ fn(); }catch(_){ } }
+  }
+}
+setInterval(_pollResume, 1500);
+document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) setTimeout(_pollResume, 50); });
 
 // KEEPING YOUR PLACE ON A PAGE THAT REBUILDS ITSELF UNDER YOU.
 //
@@ -32705,6 +32731,10 @@ function kdRows(){
 let _hl=null, _hlTimer=null;
 async function loadHealth(){
   const el=document.getElementById('healthBody');
+  // STOP WHEN THE PAGE IS NOT SHOWING, not only when it is gone. The settings
+  // page hides panes rather than removing them, so after one visit to Health
+  // this asked /api/health every ten seconds from every other page for as long
+  // as the tab stayed open. Opening Health again calls this afresh.
   if(!el){ if(_hlTimer) clearTimeout(_hlTimer); _hlTimer=null; return; }
   try{ _hl=await (await fetch('/api/health')).json(); }
   catch(e){ el.innerHTML='<span class="dim">could not load</span>'; return; }
@@ -32712,7 +32742,7 @@ async function loadHealth(){
   if(_hlTimer) clearTimeout(_hlTimer);
   // Faster while anything is re-checking, so the running rows move.
   const busy=(_hl.checks||[]).some(c=>c.running);
-  _hlTimer=setTimeout(loadHealth, busy?2000:10000);
+  _hlTimer=setTimeout(()=>{ _hlTimer=null; shownPoll('healthBody', loadHealth); }, busy?2000:10000);
 }
 function hlPaint(){
   const el=document.getElementById('healthBody');
@@ -34377,7 +34407,7 @@ async function loadTautulli(force){
   tautBusy(false);
   if(_tautPoll) clearTimeout(_tautPoll);
   if((_taut.import||{}).running)
-    _tautPoll=setTimeout(()=>{ if(document.getElementById('tautBody')) loadTautulli(true); }, 1200);
+    _tautPoll=setTimeout(()=>{ shownPoll('tautBody', ()=>loadTautulli(true)); }, 1200);
 }
 function tautBusy(on){
   const b=document.getElementById('tautRefresh');
@@ -35446,7 +35476,7 @@ async function gapLoad(){
   // list on the server the moment it is read back; a card that only refreshed
   // on a click would go on naming it. Ten seconds is cheap - the endpoint is
   // a dict copy - and the list node is kept, so nothing on screen jumps.
-  _gapPoll=setTimeout(()=>{ if(document.getElementById('gapBody')) gapLoad(); },
+  _gapPoll=setTimeout(()=>{ shownPoll('gapBody', ()=>gapLoad()); },
                       scanning?700:(queueing?900:(counting?4000:10000)));
   gapClock();
 }
@@ -36156,7 +36186,7 @@ function gapAfterFade(n){
     if(b){ b.disabled=false; b.textContent='Requeue all '+fmt(left); }
   }
   if(_gapPoll) clearTimeout(_gapPoll);
-  _gapPoll=setTimeout(()=>{ if(document.getElementById('gapBody')) gapLoad(); },
+  _gapPoll=setTimeout(()=>{ shownPoll('gapBody', ()=>gapLoad()); },
                       35000);
 }
 
@@ -39209,7 +39239,7 @@ function alpPaint(){
   const html=`<div class="lkind" style="padding:11px 12px">${head}${bar}${foot}</div>`;
   if(html!==_alpKey){ _alpKey=html; el.innerHTML=html; }
   clearTimeout(_alpPoll);
-  if(running) _alpPoll=setTimeout(()=>{ if(document.getElementById('alBacklog')) loadAlangProg(); }, 1500);
+  if(running) _alpPoll=setTimeout(()=>{ shownPoll('alBacklog', ()=>loadAlangProg()); }, 1500);
 }
 
 // ---- does the subtitle title describe the subtitle? ---------------------
@@ -40933,7 +40963,7 @@ async function smLoad(){
   smPaint();
   if(_smPoll) clearTimeout(_smPoll);
   const busy=(_sm.state&&_sm.state.running) || (_sm.queue||[]).length;
-  _smPoll=setTimeout(()=>{ if(document.getElementById('smPanel')) smLoad(); }, busy?3000:60000);
+  _smPoll=setTimeout(()=>{ shownPoll('smPanel', ()=>smLoad()); }, busy?3000:60000);
 }
 function smShell(){
   return `<div class="subsp" id="subsPanelMake">
@@ -42226,7 +42256,7 @@ function hsPaint(){
   // reloads the page is a screenshot.
   if(d.running){
     clearTimeout(_hsPoll);
-    _hsPoll=setTimeout(()=>{ if(document.getElementById('hsPanel')) loadHardsub(); }, 1500);
+    _hsPoll=setTimeout(()=>{ shownPoll('hsPanel', ()=>loadHardsub()); }, 1500);
   }
 }
 // Durations the way a person says them: seconds under a minute, then minutes,
@@ -42563,7 +42593,7 @@ async function loadAud(force){
   // used to keep their own timers, so two of them describing the same library
   // could be seconds apart - and the moment you noticed was always the moment
   // one of them was wrong.
-  _audPoll=setTimeout(()=>{ if(document.getElementById('audTop')) loadAud(); },
+  _audPoll=setTimeout(()=>{ shownPoll('audTop', ()=>loadAud()); },
                       5000);
 }
 
@@ -43653,7 +43683,7 @@ async function loadSubs(force){
   // Five seconds is the live half - what is in flight and what failed. The
   // merge behind it is cached server-side for twenty, so this costs a dict
   // read most of the time.
-  _subsPoll=setTimeout(()=>{ if(document.getElementById('subsTop')) loadSubs(); },
+  _subsPoll=setTimeout(()=>{ shownPoll('subsTop', ()=>loadSubs()); },
                        5000);
 }
 
@@ -44901,14 +44931,14 @@ function sePaint(force){
     const html=seWaitHtml(w);
     if(html!==_seKey){ _seKey=html; el.innerHTML=html; }
     clearTimeout(_sePoll);
-    _sePoll=setTimeout(()=>{ if(document.getElementById('sePanel')) loadSubEmbed(); }, 1500);
+    _sePoll=setTimeout(()=>{ shownPoll('sePanel', ()=>loadSubEmbed()); }, 1500);
     return;
   }
   if(w.running){
     // A refresh behind an answer that is already on screen: keep the answer,
     // put the bar in the header.
     clearTimeout(_sePoll);
-    _sePoll=setTimeout(()=>{ if(document.getElementById('sePanel')) loadSubEmbed(); }, 2000);
+    _sePoll=setTimeout(()=>{ shownPoll('sePanel', ()=>loadSubEmbed()); }, 2000);
   }
   const sum=d.summary||{files:0,subs:0,by_library:{}};
   const on=Object.entries(d.libraries||{}).filter(([,v])=>v).map(([k])=>k);
@@ -47289,7 +47319,7 @@ async function loadPushover(force){
   poPaint();
   if(b) b.classList.remove('spinning');
   if(_poPoll) clearTimeout(_poPoll);
-  if((_po.stats||{}).pending) _poPoll=setTimeout(()=>{ if(document.getElementById('poBody')) loadPushover(true); }, 3000);
+  if((_po.stats||{}).pending) _poPoll=setTimeout(()=>{ shownPoll('poBody', ()=>loadPushover(true)); }, 3000);
 }
 function poPaint(){
   const el=document.getElementById('poBody');
