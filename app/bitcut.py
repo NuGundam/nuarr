@@ -294,7 +294,12 @@ def candidates(file_id: int) -> tuple[list, dict]:
         if need_langs and not need_langs <= have:
             continue
         out.append(r)
-    out.sort(key=lambda r: (r.get("protocol") != "usenet", -(r.get("customFormatScore") or 0), -(r.get("size") or 0)))
+    # AN SDR FILE STAYS SDR WHEN IT CAN. Terminator 2's fuller copy came back as
+    # a 1080p HDR10+ hybrid; Plex tone-maps that for every SDR screen, which
+    # is a transcode. Not excluded - it may be the only fuller copy - but a
+    # plain copy outranks it.
+    out.sort(key=lambda r: ((not had_hdr) and bool(_HDR.search(r.get("title") or "")),
+                            r.get("protocol") != "usenet", -(r.get("customFormatScore") or 0), -(r.get("size") or 0)))
     return out, ids
 
 
@@ -767,12 +772,29 @@ def set_every_h(h: float) -> float:
     kv_set(KV_EVERY_H, str(h))
     if AUTO.get("last_at"):
         AUTO["next_at"] = AUTO["last_at"] + h * 3600
+        _auto_save()
     return h
 
 
 def sweep_s() -> float:
     return every_h() * 3600
 AUTO: dict = {"last_at": 0.0, "next_at": 0.0, "running": False, "fetched": 0, "none": 0, "kick": 0.0}
+KV_AUTO_STATE = "bitcut.auto_state"
+
+
+def _auto_load() -> None:
+    """The run line survives a restart: last run, next run and the tallies."""
+    from .db import kv_get
+    try:
+        d = json.loads(kv_get(KV_AUTO_STATE) or "{}")
+        AUTO.update({k: d[k] for k in ("last_at", "next_at", "fetched", "none") if k in d})
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _auto_save() -> None:
+    from .db import kv_set
+    kv_set(KV_AUTO_STATE, json.dumps({k: AUTO[k] for k in ("last_at", "next_at", "fetched", "none")}))
 
 
 def mode() -> str:
@@ -842,6 +864,7 @@ def auto_sweep() -> dict:
     finally:
         AUTO.update(running=False, last_at=time.time(), next_at=time.time() + sweep_s(),
                     fetched=AUTO["fetched"] + fetched, none=AUTO["none"] + none)
+        _auto_save()
     return {"fetched": fetched, "none": none}
 
 
@@ -856,8 +879,10 @@ async def run_now() -> dict:
 
 async def watch() -> None:
     import asyncio
+    _auto_load()
     await asyncio.sleep(180)
-    AUTO["next_at"] = time.time() + 60
+    if not AUTO["next_at"] or AUTO["next_at"] < time.time():
+        AUTO["next_at"] = time.time() + 60
     while True:
         await asyncio.sleep(20)
         if mode() != "auto" or AUTO["running"]:
