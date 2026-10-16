@@ -18236,7 +18236,9 @@ async function loadAll(){
   // and everything the page did want queued behind them in the browser's six
   // connections. loadCtl, ffCheck and ffProgress stay bare: they feed the
   // header, which is on every page, and cost a few milliseconds each.
-  gated(loadLibs,'scanPanel')();
+  // on 'libs', the panel it paints - 'scanPanel' is the scan-progress strip,
+  // hidden unless a scan runs, and gating on it left Libraries a skeleton.
+  gated(loadLibs,'libs')();
 
   // rescan is driven from the Libraries panel now, which can also do one library
   if(s.scan.running) setTimeout(loadAll,3000);
