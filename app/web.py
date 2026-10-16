@@ -3773,7 +3773,7 @@ def _summary_impl():
         if al and al[0]["n"]:
             attention.append({"what": "audio language", "n": int(al[0]["n"]),
                               "note": "listened, no confident answer",
-                              "goto": "/settings#alang"})
+                              "goto": "/settings#alang@alAskPanel"})
     except Exception:                                    # noqa: BLE001
         pass
     try:
@@ -3787,7 +3787,7 @@ def _summary_impl():
                                        f"{_first['source'] or _first['type']}"
                                        + (f" and {len(_ah) - 1} more"
                                           if len(_ah) > 1 else "")),
-                              "goto": "/settings#arrs"})
+                              "goto": "/settings#arrs@arrHealth"})
     except Exception:                                    # noqa: BLE001
         pass
     try:
@@ -3842,6 +3842,16 @@ def _summary_impl():
         _row = _ag.attention()
         if _row:
             attention.append(_row)
+    except Exception:                                    # noqa: BLE001
+        pass
+    try:
+        # THE QUESTIONS NUARR WILL NOT ANSWER FOR YOU - Subtitle and Audio
+        # User Input, Raws, bitrate cuts, banned terms that hit a title, TVDB
+        # re-ids left over. Each counted the way its own panel counts it, each
+        # linking straight to that panel. See userinput.py.
+        from . import userinput as _ui
+        for _r in _ui.rows():
+            attention.append({k: _r[k] for k in ("what", "n", "note", "goto")})
     except Exception:                                    # noqa: BLE001
         pass
     # THE HEALTH VERDICT RIDES ALONG, so the dashboard can carry a tile
@@ -12149,7 +12159,7 @@ def _attention(limit: int = 400):
                     "path": r["path"] or "",
                     "detail": nm or ("an audio track has no language and "
                                      "listening gave no confident answer"),
-                    "goto": "/settings#alang", "act": "",
+                    "goto": "/settings#alang@alAskPanel", "act": "",
                     "refetch_kind": "content" if nm else "", "refetch_why": nm or ""})
 
     # A TAG THAT LIES, WHICH THE TILE COUNTED AND THE PANEL COULD NOT SHOW.
@@ -12173,7 +12183,7 @@ def _attention(limit: int = 400):
                            + (" - and the file carries that language twice, so "
                               "it is not dual audio at all"
                               if m["fake_dual"] else "")),
-                "goto": "/settings#alang", "act": "",
+                "goto": "/settings#alang@alAskPanel", "act": "",
                 "fix": "audiolang", "fake_dual": m["fake_dual"],
                 "refetch_kind": "", "refetch_why": ""})
     except Exception:                                        # noqa: BLE001
@@ -12190,7 +12200,7 @@ def _attention(limit: int = 400):
                 "title": f"{w['arr']}: {w['source'] or w['type']}",
                 "path": "", "detail": w["message"] or w["type"],
                 "url": w["url"], "level": w["level"],
-                "goto": "/settings#arrs", "act": ""})
+                "goto": "/settings#arrs@arrHealth", "act": ""})
     except Exception:                                        # noqa: BLE001
         pass
     try:
@@ -12216,6 +12226,18 @@ def _attention(limit: int = 400):
                                 "detail": f"{r.get('check', '')}: the arr's "
                                           f"record does not match the file",
                                 "goto": "/settings#arrsync", "act": ""})
+    except Exception:                                        # noqa: BLE001
+        pass
+
+    try:
+        from . import userinput as _ui
+        for _r in _ui.rows():
+            its = _r.get("items") or [{"title": _r["note"], "detail": ""}]
+            for it in its:
+                out.append({"source": _r["what"], "id": 0, "title": it.get("title") or "",
+                            "path": "", "detail": it.get("detail") or "",
+                            "goto": _r["goto"], "act": "", "n_total": _r["n"],
+                            "note": _r["note"]})
     except Exception:                                        # noqa: BLE001
         pass
 
@@ -19815,6 +19837,13 @@ const ATTN_STYLE={
   // is not its own.
   'mislabelled audio': ['#e0575b','a track is tagged a language it is not'],
   'arr health':     ['#e2b341','Sonarr / Radarr warning'],
+  'subtitle questions': ['#e8a33d','Subtitle User Input is waiting on your answer'],
+  'raws':           ['#e8a33d','no track in a language the library requires'],
+  'audio questions': ['#e8a33d','Audio User Input is waiting on your answer'],
+  'subtitle rules changed': ['#e2b341','files that no longer match the subtitle rules - manual mode'],
+  'bitrate cuts':   ['#e8a33d','an upgrade cut the picture - find a fuller copy, or keep'],
+  'banned terms':   ['#e0575b','a banned term also matches a show title'],
+  'tvdb re-ids':    ['#e2b341','TheTVDB re-added a series and the repair could not match it'],
 };
 
 function attnPaint(){
@@ -19845,8 +19874,9 @@ function attnPaint(){
     h+=`<div style="padding:9px 14px 4px;border-top:1px solid var(--line);
           display:flex;gap:10px;align-items:baseline;flex-wrap:wrap">
         <b style="color:${col}">${esc(src)}</b>
-        <span class="dim" style="font-size:11px">${list.length} · ${esc(blurb)}</span>
-        ${go.goto?`<a href="${esc(go.goto)}" style="font-size:11px">open the ${esc(src)} page →</a>`:''}
+        <span class="dim" style="font-size:11px">${fmt(go.n_total||list.length)} · ${esc(blurb)}${
+          go.n_total&&go.n_total>list.length?` <span class="dim">(the first ${list.length} below)</span>`:''}</span>
+        ${go.goto?`<a href="${esc(go.goto)}" style="font-size:11px">${go.goto.includes('@')?'go to it':'open the '+esc(src)+' page'} →</a>`:''}
       </div>`;
     if(src==='file errors'){
       // THE ROWS THEMSELVES, not a count and a door. This used to say "N
@@ -46988,7 +47018,7 @@ async function loadArrsTab(refresh){
   const jobDedupe=xs=>{ const m=new Map(); xs.forEach(x=>m.set(x,(m.get(x)||0)+1));
     return [...m].map(([x,n])=>n>1?x+'  ×'+n:x); };
   const job=(id,title,desc,on,st,ed)=>`
-    <div style="border:1px solid var(--line);border-radius:8px;padding:10px 14px;margin-bottom:10px">
+    <div id="job-${id}" style="border:1px solid var(--line);border-radius:8px;padding:10px 14px;margin-bottom:10px">
       <div style="display:flex;align-items:center;gap:10px">
         <b>${title}</b>
         <span class="pill ${on?'p-ok':'p-dim'}" style="cursor:pointer"
@@ -49367,10 +49397,56 @@ _SETTINGS_SHIM = """
     if(location.hash !== '#'+key) history.replaceState(null,'','#'+key);
   }
   window._setLit = lit;
+  // #page@element - OPEN THE PAGE, THEN GO TO THE PANEL. The Attention tile
+  // links to the questions themselves ("/settings#lang@skPanel"), not to a
+  // page you then scroll looking for them. The panel is often painted a
+  // moment after the page opens, so this waits for it (up to 15 s), brings it
+  // to the middle of the screen and outlines it for a couple of seconds.
+  function goSection(id){
+    const t0=Date.now();
+    (function look(){
+      const e=document.getElementById(id);
+      if(e && e.offsetParent!==null && (e.innerText||'').trim().length){
+        // CLEAR OF THE HEADER. It is sticky, and taller when a narrow window
+        // wraps it - 150 to 200 px - so it is measured, not assumed.
+        const hdr=document.querySelector('header');
+        const top0=Math.round((hdr?hdr.getBoundingClientRect().bottom:150)+14);
+        e.style.scrollMarginTop=top0+'px';
+        e.scrollIntoView({behavior:'smooth', block:'start'});
+        e.style.transition='box-shadow .4s';
+        e.style.boxShadow='0 0 0 2px var(--acc,#58a6ff)';
+        e.style.borderRadius=e.style.borderRadius||'8px';
+        // AND KEPT THERE WHILE THE PAGE SETTLES. Panels above this one paint
+        // after it - on Subtitles for several seconds - and push it two
+        // thousand pixels down. For ten seconds it is put back under the
+        // header whenever it drifts, and the moment you scroll, click or press
+        // a key it lets go, so it never fights you for the page.
+        let held=true;
+        const letGo=()=>{ held=false; };
+        for(const ev of ['wheel','touchstart','keydown','mousedown'])
+          window.addEventListener(ev, letGo, {once:true, passive:true});
+        const t1=Date.now();
+        (function hold(){
+          if(!held || Date.now()-t1>10000) return;
+          const t=e.getBoundingClientRect().top;
+          if(t<top0-40 || t>top0+160) e.scrollIntoView({block:'start'});
+          setTimeout(hold, 350);
+        })();
+        setTimeout(()=>{ e.style.boxShadow=''; }, 3200);
+        return;
+      }
+      // Up to thirty seconds: right after a restart a panel can take that long.
+      if(Date.now()-t0<30000) setTimeout(look, 300);
+    })();
+  }
+  window._goSection = goSection;
   function go(key, push){
+    let sec='';
+    if(key.indexOf('@')>=0){ sec=key.slice(key.indexOf('@')+1); key=key.slice(0, key.indexOf('@')); }
     if(VALID.indexOf(key) < 0) key = KEYS[0];
     wtab(key);                 // which calls lit() on the way through
-    if(push) lit(key);
+    if(push || sec) lit(key);
+    if(sec) goSection(sec);
   }
   // The URL is the point of the exercise: /settings#arrs survives a refresh,
   // can be bookmarked, and can be linked to from anywhere.
