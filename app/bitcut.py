@@ -263,6 +263,10 @@ def candidates(file_id: int) -> tuple[list, dict]:
     # When the file now carries HDR or Dolby Vision, a replacement has to say
     # so in its name too.
     had_hdr = bool(_HDR.search(f.get("path") or ""))
+    lc = _langs(x)
+    # what the old file had, and English if the new one brought it - not every
+    # extra the upgrade carried (Terminator 2's added a Spanish track)
+    need_langs = set(lc.get("old") or []) | ({"English"} & set(lc.get("new") or []))
 
     need = (x["old_gb"] / _eff(x["old"])) * REFETCH_AT
     ok_words = ("existing file", "upgrade", "cutoff", "is already in the queue")
@@ -283,6 +287,9 @@ def candidates(file_id: int) -> tuple[list, dict]:
             continue
         if had_hdr and not _HDR.search(r.get("title") or ""):
             continue
+        have = {str(l.get("name")) for l in (r.get("languages") or [])}
+        if need_langs and not need_langs <= have:
+            continue
         out.append(r)
     out.sort(key=lambda r: (r.get("protocol") != "usenet", -(r.get("customFormatScore") or 0), -(r.get("size") or 0)))
     return out, ids
@@ -302,8 +309,9 @@ def _fetch(file_id: int) -> dict:
     from . import joblog
     cands, ids = candidates(file_id)
     if not cands:
-        why = ids.get("why") or ("no release of the same resolution (and HDR, where the file has it) "
-                                 f"carries at least {round(REFETCH_AT * 100)}% of the old file's picture")
+        why = ids.get("why") or ("no release of the same resolution (and HDR, where the file has it, and "
+                                 "the old file's audio languages, and English) carries at least "
+                                 f"{round(REFETCH_AT * 100)}% of the old file's picture")
         set_state(file_id, "none", why)
         return {"ok": False, "why": why}
     r = cands[0]
@@ -314,6 +322,69 @@ def _fetch(file_id: int) -> dict:
               release=r["title"], arr=a.name, ids=ids, cut_release=_safe_now(file_id))
     joblog.log(f"bitrate cut: grabbed a fuller copy - {r['title']} ({r['size'] / 1e9:.2f} GB)", "info")
     return {"ok": True, "release": r["title"], "gb": round(r["size"] / 1e9, 2)}
+
+
+# ------------------------------------------------- what the sound did --
+# A SMALLER PICTURE CAN BE THE PRICE OF A LANGUAGE. An anime film going from
+# a Japanese-only release to a dual-audio one gains English and often loses
+# bits - that is the upgrade working, and the row says keep. And the other
+# way: Pokemon the Movie: Secrets of the Jungle went from English + Japanese
+# (EMBER) to English + Turkish (TURKO) - the "upgrade" dropped the original
+# audio as well as half the picture. The arrs' history carries each event's
+# languages: the upgrade's deletion has the old file's, its import the new
+# file's. A fuller copy has to carry every language either of them had.
+def langs_change(file_id: int) -> dict:
+    import datetime as _dt
+    x = next((r for r in _load() if r["file_id"] == int(file_id)), None)
+    if x and x.get("ids") and x.get("arr") and _arr(x["arr"]):
+        a, ids = _arr(x["arr"]), dict(x["ids"])
+    else:
+        got = _ids(file_id)
+        if isinstance(got, str):
+            return {}
+        x, f, a, ids = got
+    h = _hist(a, ids)
+
+    def ts(e):
+        try:
+            return _dt.datetime.fromisoformat(e["date"].replace("Z", "+00:00")).timestamp()
+        except Exception:                                        # noqa: BLE001
+            return 0.0
+    dels = [e for e in h if e.get("eventType") in ("movieFileDeleted", "episodeFileDeleted")
+            and str((e.get("data") or {}).get("reason") or "").lower() == "upgrade"]
+    if not dels:
+        return {}
+    d = min(dels, key=lambda e: abs(ts(e) - float(x.get("at") or 0)))
+    imps = [e for e in h if e.get("eventType") == "downloadFolderImported" and abs(ts(e) - ts(d)) < 600]
+    if not imps:
+        return {}
+    imp = min(imps, key=lambda e: abs(ts(e) - ts(d)))
+
+    def names(e):
+        return [str(l.get("name")) for l in (e.get("languages") or [])
+                if l.get("name") and str(l.get("name")).lower() not in ("unknown", "any")]
+    old, new = names(d), names(imp)
+    if not old or not new:
+        return {"old": old, "new": new}
+    return {"old": old, "new": new, "gained": [l for l in new if l not in old],
+            "lost": [l for l in old if l not in new]}
+
+
+def _langs(x: dict) -> dict:
+    """The row's language change, looked up once and kept on the row."""
+    if "langs" in x:
+        return x["langs"] or {}
+    try:
+        ch = langs_change(x["file_id"])
+    except Exception:                                            # noqa: BLE001
+        return {}
+    rows = _load()
+    for r in rows:
+        if r["file_id"] == x["file_id"]:
+            r["langs"] = ch
+    _save(rows)
+    x["langs"] = ch
+    return ch
 
 
 # --------------------------------------------- and the cut copy stays out --
@@ -619,8 +690,17 @@ def explain(x: dict) -> dict:
         notes.append("the source went from Blu-ray to a web copy")
     if "x264" in (x.get("new") or "").lower() and re.search(r"x265|h265", x.get("old") or "", re.I):
         notes.append("the codec went from HEVC to H.264, which needs more bits for the same picture")
+    lc = _langs(x)
+    out["langs"] = lc
+    if lc.get("lost"):
+        notes.append("the upgrade dropped " + " and ".join(lc["lost"]) + " audio")
     eq, share = out.get("new_eq"), float(x.get("share") or 0)
-    if share < 0.25 or (eq is not None and plenty and eq < plenty * 0.5):
+    if "English" in (lc.get("gained") or []):
+        rec, why = "keep", ("the upgrade brought English audio - the smaller picture was the price of it; "
+                            "a fuller copy would have to be dual-audio too")
+    elif lc.get("lost"):
+        rec, why = "fetch", "it lost " + " and ".join(lc["lost"]) + " audio as well as picture"
+    elif share < 0.25 or (eq is not None and plenty and eq < plenty * 0.5):
         rec, why = "fetch", ("well under what this resolution needs" if eq is not None and plenty
                              and eq < plenty * 0.5 else "most of the picture went")
     elif share < 0.4:

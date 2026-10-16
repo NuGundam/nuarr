@@ -46950,7 +46950,11 @@ function bcDetail(r){
     ${w.plenty?line('enough for '+esc(w.res||''), `${w.plenty} Mbps as H.264 - a file at or over that is never listed;
       this one is at ${w.new_eq!=null?Math.round(w.new_eq/w.plenty*100)+'%':'—'} of it`):''}
     ${(w.notes||[]).length?line('also', w.notes.map(esc).join('; ')):''}
-    ${line('recommend', `<b style="color:${recC}">${w.rec==='fetch'?'Find a fuller copy':'Your call'}</b> - ${esc(w.rec_why||'')}`)}
+    ${(w.langs&&(w.langs.old||[]).length)?line('audio', `was <b>${esc((w.langs.old||[]).join(' + '))}</b> → now <b>${esc((w.langs.new||[]).join(' + '))}</b>${
+        (w.langs.gained||[]).length?` <span style="color:var(--ok)">gained ${esc(w.langs.gained.join(', '))}</span>`:''}${
+        (w.langs.lost||[]).length?` <span style="color:var(--bad)">lost ${esc(w.langs.lost.join(', '))}</span>`:''}
+        <span class="dim">- from the arr's history; a fuller copy must keep the old languages, and English</span>`):''}
+    ${line('recommend', `<b style="color:${w.rec==='keep'?'var(--ok)':recC}">${w.rec==='fetch'?'Find a fuller copy':w.rec==='keep'?'Keep':'Your call'}</b> - ${esc(w.rec_why||'')}`)}
     ${line('file', `<span class="mono">${esc(r.label||'')}</span> <span class="dim">· upgraded ${r.at?esc(new Date(r.at*1000).toLocaleString()):''}</span>`)}
     ${r.note?line('state', esc(r.note)):''}
     ${r.banned?line('banned', `<span class="mono" style="font-size:10.5px">${esc(r.banned)}</span> <span class="dim">- the release that cut it, banned on every indexer so the arr cannot "upgrade" back to it</span>`)
@@ -46972,6 +46976,7 @@ function bcRowHtml(r){
     <td class="c" style="font-size:10.5px">${r.state==='fixed'?'<span style="color:var(--ok)">done</span>'
       :r.state==='grabbed'?'<span style="color:#79c0ff">on its way</span>'
       :r.state==='kept'?'<span class="dim">kept</span>'
+      :w.rec==='keep'?'<span style="color:var(--ok)" title="the upgrade brought English audio">keep</span>'
       :w.rec==='fetch'?'<span style="color:var(--bad)">fetch</span>':'<span style="color:#e8a33d">your call</span>'}</td>
     <td class="l" style="font-size:10.5px">${_bcBusy.has(k)?bcProgHtml(k,'working')
       :`<span style="color:${BC_COL[r.state]||'var(--dim)'}">${esc(BC_WORD[r.state]||r.state||'')}</span>${
