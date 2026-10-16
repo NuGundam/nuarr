@@ -9817,19 +9817,22 @@ def api_history(limit: int = Query(100, le=1000), event: str | None = None):
 @app.get("/api/arrs")
 async def api_arrs():
     from .arr import shared_client
-    out = {}
-    for cfg in SETTINGS.arrs:
-        # Shared client - this endpoint is polled by the dashboard, and building
-        # an httpx.AsyncClient here meant an SSL-context construction on the
-        # event loop every time. Same defect as gate.check_arrs had.
+
+    # Shared client - this endpoint is polled by the dashboard, and building
+    # an httpx.AsyncClient here meant an SSL-context construction on the
+    # event loop every time. Same defect as gate.check_arrs had.
+    # BOTH ARRS AT ONCE: they are separate services, and asking Sonarr then
+    # Radarr spent the whole of each one's latency in turn - 600 ms for the
+    # header's two pills while Sonarr was busy with a search.
+    async def one(cfg):
         c = shared_client(cfg)
         st = await c.ping()
         if st.get("ok"):
             busy, reason = await c.busy()
             st["busy"] = busy
             st["busy_reason"] = reason
-        out[cfg.name] = st
-    return out
+        return cfg.name, st
+    return dict(await asyncio.gather(*[one(cfg) for cfg in SETTINGS.arrs]))
 
 
 _SCAN_LOCK = asyncio.Lock()
@@ -45920,7 +45923,11 @@ async function loadArrSync(){
   // the whole point, and a count only falls if something goes and looks.
   const busy = _arrSync && (_arrSync.running
                             || (_arrSync.fixing && _arrSync.fixing.running));
-  if(busy) _arrSyncTimer=setTimeout(loadArrSync, 1200);
+  // FOUR SECONDS, NOT 1.2. A full compare runs for an hour and each answer
+  // carries the whole finding list; asked every 1.2 s the answers overlapped
+  // and sat on the browser's six connections, and every other request on the
+  // page waited behind them. The bar still moves; it moves in steps.
+  if(busy) _arrSyncTimer=setTimeout(loadArrSync, 4000);
 }
 function arrSyncPaint(){
   const el=document.getElementById('arrSyncBody');
