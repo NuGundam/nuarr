@@ -265,9 +265,81 @@ def fetch(file_id: int) -> dict:
     a = ids.pop("arr")
     _call(a, "/api/v3/release", "POST", {"guid": r["guid"], "indexerId": r["indexerId"]})
     set_state(file_id, "grabbed", f"grabbed {r['title']} ({r['size'] / 1e9:.2f} GB, {r.get('indexer')})",
-              release=r["title"], arr=a.name, ids=ids)
+              release=r["title"], arr=a.name, ids=ids, cut_release=_safe_now(file_id))
     joblog.log(f"bitrate cut: grabbed a fuller copy - {r['title']} ({r['size'] / 1e9:.2f} GB)", "info")
     return {"ok": True, "release": r["title"], "gb": round(r["size"] / 1e9, 2)}
+
+
+# --------------------------------------------- and the cut copy stays out --
+# BRINGING THE PICTURE BACK IS NOT ENOUGH ON ITS OWN. The release that cut it
+# still outscores what replaced it - that is how it won the first time - so
+# the arr's next search would "upgrade" straight back to it. Once the fuller
+# copy is in, the cut release's NAME is banned the way nuarr bans a rejected
+# release (arrban: a -999999 custom format on every indexer). Other releases
+# of the same small cut can still come; one that does is listed here again.
+def now_release(file_id: int) -> str:
+    """The release name of the upgrade that cut the picture, from history."""
+    import datetime as _dt
+    x = next((r for r in _load() if r["file_id"] == int(file_id)), None)
+    if x and x.get("ids") and x.get("arr") and _arr(x["arr"]):
+        # after the import the file row and the arr's file id have moved on;
+        # the ids kept at grab time still name the episode or film
+        a, ids = _arr(x["arr"]), dict(x["ids"])
+    else:
+        got = _ids(file_id)
+        if isinstance(got, str):
+            return ""
+        x, f, a, ids = got
+    h = _hist(a, ids)
+
+    def ts(e):
+        try:
+            return _dt.datetime.fromisoformat(e["date"].replace("Z", "+00:00")).timestamp()
+        except Exception:                                        # noqa: BLE001
+            return 0.0
+    dels = [e for e in h if e.get("eventType") in ("movieFileDeleted", "episodeFileDeleted")
+            and str((e.get("data") or {}).get("reason") or "").lower() == "upgrade"]
+    if not dels:
+        return ""
+    d = min(dels, key=lambda e: abs(ts(e) - float(x.get("at") or 0)))
+    imps = [e for e in h if e.get("eventType") == "downloadFolderImported" and abs(ts(e) - ts(d)) < 600]
+    return (min(imps, key=lambda e: abs(ts(e) - ts(d))).get("sourceTitle") or "") if imps else ""
+
+
+def _safe_now(file_id: int) -> str:
+    try:
+        return now_release(file_id)
+    except Exception:                                            # noqa: BLE001
+        return ""
+
+
+def _safe_ban(file_id: int) -> None:
+    try:
+        ban_cut(file_id)
+    except Exception as e:                                       # noqa: BLE001
+        from . import joblog
+        joblog.log(f"bitrate cut: could not ban the cut release: {type(e).__name__}: {e}", "warn")
+
+
+def ban_cut(file_id: int, title: str = "") -> str:
+    """Ban the release that cut this file's picture. -> the name, or ''."""
+    from . import arrban, joblog
+    x = next((r for r in _load() if r["file_id"] == int(file_id)), None)
+    title = title or (x or {}).get("cut_release") or now_release(file_id)
+    if not title or not x:
+        return ""
+    a = _arr((x.get("arr") or _file(file_id).get("arr_name") or ""))
+    arrban.add("release", title, f"an upgrade that cut {x['label']} to {round(x['share'] * 100)}% of "
+                                 f"its picture - the fuller copy was brought back", "bitrate cut",
+               by="nuarr", arrs=(a.kind if a else ""))
+    arrban.kick(arrban.SYNC_HAND_S)
+    rows = _load()
+    for r in rows:
+        if r["file_id"] == int(file_id):
+            r["banned"] = title
+    _save(rows)
+    joblog.log(f"bitrate cut: {x['label']} - banned the release that cut it: {title}", "info")
+    return title
 
 
 # ------------------------------------------------------- the old one back --
@@ -370,7 +442,10 @@ def restore(file_id: int) -> dict:
               "releaseGroup": c.get("releaseGroup") or ""}
         fl.update({k: ids[k] for k in ("seriesId", "episodeIds", "movieId") if k in ids})
         _call(a, "/api/v3/command", "POST", {"name": "ManualImport", "files": [fl], "importMode": "move"})
-        set_state(file_id, "fixed", f"the old file came back from {a.name}'s recycle bin: {os.path.basename(dst)}")
+        cut = _safe_now(file_id)
+        set_state(file_id, "fixed", f"the old file came back from {a.name}'s recycle bin: {os.path.basename(dst)}",
+                  arr=a.name, cut_release=cut)
+        _safe_ban(file_id)
         joblog.log(f"bitrate cut: {x['label']} - the old file restored from the recycle bin", "ok")
         return {"ok": True, "how": "recycle bin", "file": os.path.basename(dst)}
     # 2. the same release, again
@@ -387,7 +462,8 @@ def restore(file_id: int) -> dict:
     _call(a, "/api/v3/release", "POST", {"guid": r["guid"], "indexerId": r["indexerId"]})
     ids.pop("arr", None)
     set_state(file_id, "grabbed", f"grabbing the old release again: {r['title']} ({r['size'] / 1e9:.2f} GB, "
-                                  f"{r.get('indexer')})", release=r["title"], arr=a.name, ids=ids)
+                                  f"{r.get('indexer')})", release=r["title"], arr=a.name, ids=ids,
+              cut_release=_safe_now(file_id))
     joblog.log(f"bitrate cut: {x['label']} - grabbing the old release again: {r['title']}", "info")
     return {"ok": True, "how": "grabbed", "release": r["title"]}
 
@@ -447,6 +523,7 @@ def import_wanted(queues: list) -> tuple[list, set]:
                 _call(a, "/api/v3/command", "POST", {"name": "ManualImport", "files": [f], "importMode": "auto"})
                 set_state(x["file_id"], "fixed", f"imported {x['release']} by hand - the arr called it "
                                                  f"not an upgrade, which is why nuarr fetched it")
+                _safe_ban(x["file_id"])
                 rows.append({"at": time.time(), "arr": a.name, "title": q.get("title") or "",
                              "client": q.get("downloadClient") or "", "kind": "parsed",
                              "why": "a fuller copy nuarr fetched after an upgrade cut the bitrate; "

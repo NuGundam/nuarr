@@ -46866,12 +46866,14 @@ async function loadArrsTab(){
 // THE SAME TABLE AS SUBTITLE USER INPUT: a checkbox per row (shift-click takes
 // a range), a caret on the name that opens the row for the numbers behind the
 // % and what to do, and a bar of batch actions while anything is selected.
-let _bc=null, _bcKey='', _bcLast=null, _bcShowKept=false;
+let _bc=null, _bcKey='', _bcLast=null, _bcShowKept=false, _bcShowDone=false;
 const _bcBusy=new Set();       // rows a Find a fuller copy is searching for right now
 const _bcSel=new Set(), _bcOpen=new Set(), _bcPrev={};
 const BC_COL={open:'#e8a33d',grabbed:'#79c0ff',fixed:'var(--ok)',none:'var(--dim)',kept:'var(--dim)'};
 const BC_WORD={open:'cut',grabbed:'fetching a fuller copy',fixed:'fuller copy imported',none:'nothing better found',kept:'kept'};
-function bcRows(){ return (_bc&&_bc.rows||[]).filter(r=>_bcShowKept||r.state!=='kept'); }
+// DONE ROWS FOLD AWAY, as Subtitle User Input's answered ones do: a fuller
+// copy imported (or the old one back) is history, shown only when asked.
+function bcRows(){ return (_bc&&_bc.rows||[]).filter(r=>(_bcShowKept||r.state!=='kept')&&(_bcShowDone||r.state!=='fixed')); }
 async function bcLoad(){
   if(!document.getElementById('bcBox')) return;
   try{ _bc=await (await fetch('/api/bitcut')).json(); }catch(e){ return; }
@@ -46905,6 +46907,8 @@ function bcDetail(r){
     ${line('recommend', `<b style="color:${recC}">${w.rec==='fetch'?'Find a fuller copy':'Your call'}</b> - ${esc(w.rec_why||'')}`)}
     ${line('file', `<span class="mono">${esc(r.label||'')}</span> <span class="dim">· upgraded ${r.at?esc(new Date(r.at*1000).toLocaleString()):''}</span>`)}
     ${r.note?line('state', esc(r.note)):''}
+    ${r.banned?line('banned', `<span class="mono" style="font-size:10.5px">${esc(r.banned)}</span> <span class="dim">- the release that cut it, banned on every indexer so the arr cannot "upgrade" back to it</span>`)
+      :(r.cut_release&&r.state!=='fixed'?line('will ban', `<span class="mono" style="font-size:10.5px">${esc(r.cut_release)}</span> <span class="dim">- once the fuller copy is in</span>`):'')}
     ${line('available', pvHtml)}
     ${oldHtml?line('the old one', oldHtml):''}
   </div>`;
@@ -46919,7 +46923,10 @@ function bcRowHtml(r){
     <td class="c mono" style="font-size:10.5px">${esc(r.old||'')}<br><b>${(+r.old_gb).toFixed(2)} GB</b>${w.old_mbps!=null?` <span class="dim">${bcMbps(w.old_mbps)}</span>`:''}</td>
     <td class="c mono" style="font-size:10.5px">${esc(r.new||'')}<br><b style="color:#e8a33d">${(+r.new_gb).toFixed(2)} GB</b>${w.new_mbps!=null?` <span class="dim">${bcMbps(w.new_mbps)}</span>`:''}</td>
     <td class="c mono"><b style="color:${r.share<0.25?'var(--bad)':'#e8a33d'}">${Math.round((r.share||0)*100)}%</b></td>
-    <td class="c" style="font-size:10.5px">${w.rec==='fetch'?'<span style="color:var(--bad)">fetch</span>':'<span style="color:#e8a33d">your call</span>'}</td>
+    <td class="c" style="font-size:10.5px">${r.state==='fixed'?'<span style="color:var(--ok)">done</span>'
+      :r.state==='grabbed'?'<span style="color:#79c0ff">on its way</span>'
+      :r.state==='kept'?'<span class="dim">kept</span>'
+      :w.rec==='fetch'?'<span style="color:var(--bad)">fetch</span>':'<span style="color:#e8a33d">your call</span>'}</td>
     <td class="l" style="font-size:10.5px">${_bcBusy.has(k)?'<span style="color:#79c0ff">searching the indexers…</span>'
       :`<span style="color:${BC_COL[r.state]||'var(--dim)'}">${esc(BC_WORD[r.state]||r.state||'')}</span>${
         r.note&&r.state!=='open'?`<div class="dim" style="font-size:10px;white-space:normal" title="${esc(r.note)}">${esc(r.note)}</div>`:''}`}</td>
@@ -46946,7 +46953,7 @@ function bcPaint(){
   const el=document.getElementById('bcBox'); if(!el||!_bc) return;
   const rows=bcRows(), pick=rows.filter(r=>r.state==='open'||r.state==='none');
   const allOn=pick.length&&pick.every(r=>_bcSel.has(r.file_id));
-  const kept=(_bc.rows||[]).filter(r=>r.state==='kept').length;
+  const kept=(_bc.rows||[]).filter(r=>r.state==='kept').length, done=(_bc.rows||[]).filter(r=>r.state==='fixed').length;
   const fetchN=rows.filter(r=>(r.state==='open'||r.state==='none')&&(r.why||{}).rec==='fetch').length;
   const html=`<div class="lkind" style="padding:10px 12px">
     <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:baseline">
@@ -46966,7 +46973,8 @@ function bcPaint(){
         <th class="c">ADVICE</th><th class="l">STATE</th><th class="r"></th></tr></thead>
       <tbody>${rows.map(bcRowHtml).join('')}</tbody></table></div>`
       :'<div class="dim" style="font-size:11.5px">no upgrade has cut a file\'s picture</div>'}
-    ${kept?`<div style="font-size:11px;margin-top:5px"><a href="#" onclick="_bcShowKept=!_bcShowKept;bcPaint();return false">${_bcShowKept?'hide':'also show'} the ${kept} kept</a></div>`:''}
+    ${kept||done?`<div style="font-size:11px;margin-top:5px">${done?`<a href="#" onclick="_bcShowDone=!_bcShowDone;_bcKey='';bcPaint();return false">${_bcShowDone?'hide':'also show'} the ${done} brought back</a>`:''}
+      ${kept?` <a href="#" style="margin-left:10px" onclick="_bcShowKept=!_bcShowKept;_bcKey='';bcPaint();return false">${_bcShowKept?'hide':'also show'} the ${kept} kept</a>`:''}</div>`:''}
   </div>`;
   if(html===_bcKey) return;
   _bcKey=html;
