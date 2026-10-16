@@ -332,6 +332,52 @@ def _import_unread(items: list) -> list:
     return rows
 
 
+def _video_cands(a, row: dict) -> list:
+    # BY THE DOWNLOAD ALONE - with a seriesId Sonarr lists the series folder
+    # instead (see bitcut.import_wanted).
+    q = urllib.parse.urlencode({"downloadId": row.get("downloadId") or "", "filterExistingFiles": "false"})
+    return [c for c in (_call(a, "/api/v3/manualimport?" + q) or [])
+            if os.path.splitext(c.get("path") or "")[1].lower() in (".mkv", ".mp4", ".avi", ".m4v", ".ts")]
+
+
+def _import_known(items: list) -> list:
+    """"Found matching movie via grab history, but release was matched to
+    movie by ID. Manual Import required." The arr KNOWS which movie (or
+    episode) it is - the queue row carries the id - it only will not import
+    on its own. Fate/stay night HF-I sat completed for a day with that.
+    Imported here with the row's own ids: one video in the download only."""
+    rows = []
+    for a, row in items:
+        low = " | ".join(m for s in (row.get("statusMessages") or [])
+                         for m in list(s.get("messages") or [])).lower()
+        if "matched to" not in low or "by id" not in low:
+            continue
+        ids = {"movieId": row["movieId"]} if a.kind == "radarr" and row.get("movieId") else \
+              {"seriesId": row["seriesId"], "episodeIds": [row["episodeId"]]} \
+              if a.kind == "sonarr" and row.get("seriesId") and row.get("episodeId") else None
+        name = row.get("title") or ""
+        if not ids:
+            continue
+        try:
+            cands = _video_cands(a, row)
+            if len(cands) != 1:
+                STATS["detail"].append(f"{a.name}: {name[:60]} - {len(cands)} video files offered, left for you")
+                continue
+            c = cands[0]
+            f = {"path": c["path"], "quality": c.get("quality"), "languages": c.get("languages") or [],
+                 "releaseGroup": c.get("releaseGroup") or "", "downloadId": row.get("downloadId") or ""}
+            f.update(ids)
+            _call(a, "/api/v3/command", "POST", {"name": "ManualImport", "files": [f], "importMode": "auto"})
+            row["_nuarr_imported"] = True
+            rows.append({"at": time.time(), "arr": a.name, "title": name, "client": row.get("downloadClient") or "",
+                         "why": "the arr knew what it was (matched by id from its grab) but asked for a manual "
+                                "import - imported with that id", "kind": "parsed"})
+            STATS["detail"].append(f"{a.name}: imported {name[:60]} by the id the arr matched it to")
+        except Exception as e:                                   # noqa: BLE001
+            STATS["detail"].append(f"{a.name}: could not import {name[:60]}: {type(e).__name__}: {e}"[:160])
+    return rows
+
+
 def _remove(a, row: dict, blocklist: bool = False) -> None:
     _call(a, f"/api/v3/queue/{row['id']}?removeFromClient=true"
              f"&blocklist={'true' if blocklist else 'false'}&skipRedownload=false", "DELETE")
@@ -350,6 +396,14 @@ def _malware(row: dict, exe: dict) -> str:
         if k in low:
             m = re.search(r"extension:\s*'([^']+)'", low)
             return f"malware: the arr found an executable ({m.group(1) if m else 'unknown type'}) in it"
+    # SABNZBD HANDS OVER THE PROGRAM ITSELF. A fake "Marshals S02E03 ... -CAKES"
+    # unpacks to "F:\Ready\Marshals S02E03 ... -CAKES.exe"; Sonarr says only
+    # "No files found are eligible for import in ...exe" and the row sat there,
+    # "kept for a person", because neither phrase above appears.
+    for p in [row.get("outputPath") or ""] + re.findall(r"[a-z]:\\[^|]*", low):
+        ext = os.path.splitext(p.strip().rstrip("\\/"))[1].lower()
+        if ext in EXEC_EXT:
+            return f"malware: the download is {os.path.basename(p.strip())}, not a video"
     return ""
 
 
@@ -550,7 +604,11 @@ def _sweep_clients(arrs, tracked: set) -> tuple[int, list, list]:
             elif c["impl"] == "Sabnzbd":
                 s = _Sab(c)
                 gone = [x for x in s.finished(c["cats"])
-                        if str(x.get("nzo_id") or "") not in tracked
+                        # UPPER, as `tracked` is: SABnzbd's ids are "SABnzbd_nzo_..."
+                        # and compared as written none matched - every finished
+                        # job still waiting on an import was taken as untracked
+                        # and deleted with its files (Fate/stay night HF-I, 10-16).
+                        if str(x.get("nzo_id") or "").upper() not in tracked
                         and time.time() - (x.get("completed") or 0) > 600]
                 if gone:
                     s.remove([x["nzo_id"] for x in gone])
@@ -603,7 +661,8 @@ def _pass() -> str:
     sweep_ok = len(queues) == len(arrs)
     unread = [(a, r) for a, rows in queues for r in rows if _unread(a, r)]
     if unread:
-        new_parsed = _import_unread(unread)
+        new_parsed = _import_known(unread)
+        new_parsed += _import_unread([(a, r) for a, r in unread if not r.get("_nuarr_imported")])
     else:
         new_parsed = []
     # A FULLER COPY NUARR FETCHED is "not a Custom Format upgrade" to the arr

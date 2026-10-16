@@ -285,7 +285,10 @@ def candidates(file_id: int) -> tuple[list, dict]:
     need = (x["old_gb"] / _eff(x["old"])) * REFETCH_AT
     ok_words = ("existing file", "upgrade", "cutoff", "is already in the queue")
     out = []
+    lost = {_key(t) for t in x.get("tried") or []}      # fetched before and lost - see reconcile
     for r in rel:
+        if _key(r.get("title")) in lost:
+            continue
         res = str(((r.get("quality") or {}).get("quality") or {}).get("resolution") or "")
         if not res or f"{res}p" != want_res:
             continue
@@ -628,6 +631,66 @@ def _key(title) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(title or "").lower())
 
 
+GONE_H = 3.0     # a grab with no queue row and no history this long after is lost
+
+
+def reconcile(queues: list, w: dict) -> list:
+    """Grabbed rows whose download is in no queue any more - what happened?
+
+    THE ARR CAN IMPORT IT ITSELF. import_wanted only saw rows still in a
+    queue, so a fuller copy the arr took on its own (Terminator 2, The
+    Rainmaker S01E02 - an upgrade to the arr too) left the row at "fetching
+    a fuller copy... on its way" for good, and the cut release was never
+    banned. The arr's history says which: imported -> fixed and the cut
+    banned; failed, or gone with no trace for GONE_H hours -> back to open
+    with a note, that release skipped next time, so it can be fetched again.
+    """
+    import datetime as _dt
+    from .arrqueue import STATS
+    from . import joblog
+    queued = {_key(q.get("title")) for _a, qrows in queues for q in qrows}
+    out = []
+
+    def ts(e):
+        try:
+            return _dt.datetime.fromisoformat(e["date"].replace("Z", "+00:00")).timestamp()
+        except Exception:                                        # noqa: BLE001
+            return 0.0
+    for k, x in w.items():
+        if k in queued:
+            continue
+        a = _arr(x.get("arr") or "")
+        ids = x.get("ids") or {}
+        if not a or not ids:
+            continue
+        since = float(x.get("state_at") or 0) - 120
+        try:
+            h = [e for e in _hist(a, ids) if ts(e) >= since and _key(e.get("sourceTitle")) == k]
+        except Exception as e:                                   # noqa: BLE001
+            STATS["detail"].append(f"{a.name}: fuller copy {x['release'][:50]} - history: {type(e).__name__}")
+            continue
+        types = {e.get("eventType") for e in h}
+        if "downloadFolderImported" in types:
+            set_state(x["file_id"], "fixed", f"{x['release']} imported - the arr took it as an upgrade itself")
+            _safe_ban(x["file_id"])
+            out.append({"at": time.time(), "arr": a.name, "title": x["release"], "client": "", "kind": "parsed",
+                        "why": "the fuller copy nuarr fetched after a bitrate cut was imported by the arr; "
+                               "the cut release is banned"})
+            STATS["detail"].append(f"{a.name}: fuller copy {x['release'][:60]} was imported - row closed")
+            continue
+        failed = "downloadFailed" in types
+        if failed or time.time() - float(x.get("state_at") or 0) > GONE_H * 3600:
+            why = ("the fuller copy failed to download" if failed else
+                   "the fuller copy left the queue without being imported")
+            tried = list(x.get("tried") or []) + [x["release"]]
+            # auto gets one more go with the next release; after two lost, a person
+            set_state(x["file_id"], "open", f"{why}: {x['release']} - fetch again to try the next one",
+                      tried=tried, auto_tried=x.get("auto_tried") if len(tried) >= 2 else None)
+            joblog.log(f"bitrate cut: {why} - {x['release']}", "warn")
+            STATS["detail"].append(f"{a.name}: {why} - {x['release'][:60]}; row back to open")
+    return out
+
+
 def import_wanted(queues: list) -> tuple[list, set]:
     """Called by the queue janitor before it clears anything: a fetched copy
     that finished is imported by hand. -> (rows for its recent list, queue
@@ -638,7 +701,8 @@ def import_wanted(queues: list) -> tuple[list, set]:
     w = wanted()
     if not w:
         return [], set()
-    rows, hold = [], set()
+    rows, hold = reconcile(queues, w), set()
+    w = wanted()
     for a, qrows in queues:
         for q in qrows:
             x = w.get(_key(q.get("title")))
