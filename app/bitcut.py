@@ -120,6 +120,8 @@ def note(file_id: int, detail: str, at: float | None = None, quiet: bool = False
     rows = [x for x in rows if x["file_id"] != int(file_id) or x.get("state") in ("fixed",)] + [row]
     rows.sort(key=lambda x: -(x.get("at") or 0))
     _save(rows)
+    if mode() == "auto":
+        AUTO["kick"] = time.time()
     if not quiet:
         from . import joblog
         joblog.log(f"upgrade cut the bitrate: {label} - {p[1]:.2f} GB -> {p[3]:.2f} GB "
@@ -132,7 +134,8 @@ def note(file_id: int, detail: str, at: float | None = None, quiet: bool = False
                     "nuarr · an upgrade cut the bitrate",
                     f"<b>{pushover._esc(label)}</b>\n{pushover._esc(p[0])} · {p[1]:.2f} GB\n→ "
                     f"{pushover._esc(p[2])} · {p[3]:.2f} GB\nabout {round(r * 100)}% of the picture "
-                    f"- Find a fuller copy is on the arrs page"))
+                    + ("- auto is on: nuarr is finding a fuller copy" if mode() == "auto"
+                       and explain(row).get("rec") == "fetch" else "- Find a fuller copy is on the arrs page")))
         except Exception:                                        # noqa: BLE001
             pass
     return row
@@ -736,6 +739,109 @@ def _preview(file_id: int) -> dict:
         for r in cands[:4]]}
 
 
+# ------------------------------------------------------------- auto mode --
+# MANUAL OR AUTO, like Subtitle User Input. Manual lists the cuts and waits.
+# Auto runs Find a fuller copy by itself on every open row the advice says
+# "fetch" for - the clear losses - and leaves the "your call" ones, the "keep"
+# ones (an upgrade that brought English audio) and anything where nothing
+# fuller was found for a person. Each row gets one automatic try; after that
+# it is yours. A sweep runs a minute after a new cut lands and every hour.
+KV_MODE = "bitcut.mode"
+KV_AUTO_LOG = "bitcut.auto_log"
+SWEEP_S = 3600
+AUTO: dict = {"last_at": 0.0, "next_at": 0.0, "running": False, "fetched": 0, "none": 0, "kick": 0.0}
+
+
+def mode() -> str:
+    from .db import kv_get
+    return "auto" if str(kv_get(KV_MODE) or "manual") == "auto" else "manual"
+
+
+def set_mode(m: str) -> str:
+    from .db import kv_set
+    m = "auto" if m == "auto" else "manual"
+    kv_set(KV_MODE, m)
+    if m == "auto":
+        AUTO["kick"] = time.time()          # sweep at once, not in an hour
+    return m
+
+
+def _auto_log() -> list:
+    from .db import kv_get
+    try:
+        return json.loads(kv_get(KV_AUTO_LOG) or "[]")
+    except Exception:                                            # noqa: BLE001
+        return []
+
+
+def _auto_note(row: dict) -> None:
+    from .db import kv_set
+    kv_set(KV_AUTO_LOG, json.dumps(([row] + _auto_log())[:40]))
+
+
+def auto_due() -> list:
+    """Open rows the advice says fetch for, not yet tried by auto."""
+    out = []
+    for x in _load():
+        if x.get("state") != "open" or x.get("auto_tried"):
+            continue
+        try:
+            if explain(x).get("rec") == "fetch":
+                out.append(x)
+        except Exception:                                        # noqa: BLE001
+            continue
+    return out
+
+
+def auto_sweep() -> dict:
+    """One pass: fetch for every row auto_due() lists. Runs on a thread."""
+    from . import joblog
+    AUTO.update(running=True)
+    fetched = none = 0
+    try:
+        for x in auto_due():
+            rows = _load()
+            for r in rows:
+                if r["file_id"] == x["file_id"]:
+                    r["auto_tried"] = time.time()
+            _save(rows)
+            try:
+                res = fetch(int(x["file_id"]))
+            except Exception as e:                               # noqa: BLE001
+                res = {"ok": False, "why": f"{type(e).__name__}: {e}"[:160]}
+            _auto_note({"at": time.time(), "label": x.get("label"), "ok": bool(res.get("ok")),
+                        "what": res.get("release") or res.get("why") or ""})
+            fetched += int(bool(res.get("ok")))
+            none += int(not res.get("ok"))
+        if fetched or none:
+            joblog.log(f"bitrate cuts (auto): fetched a fuller copy for {fetched}, nothing fuller for {none}",
+                       "info")
+    finally:
+        AUTO.update(running=False, last_at=time.time(), next_at=time.time() + SWEEP_S,
+                    fetched=AUTO["fetched"] + fetched, none=AUTO["none"] + none)
+    return {"fetched": fetched, "none": none}
+
+
+async def watch() -> None:
+    import asyncio
+    await asyncio.sleep(180)
+    AUTO["next_at"] = time.time() + 60
+    while True:
+        await asyncio.sleep(20)
+        if mode() != "auto" or AUTO["running"]:
+            continue
+        due = AUTO["kick"] and time.time() - AUTO["kick"] >= 60
+        if not due and time.time() < AUTO["next_at"]:
+            continue
+        AUTO["kick"] = 0.0
+        try:
+            await asyncio.to_thread(auto_sweep)
+        except Exception as e:                                   # noqa: BLE001
+            from . import joblog
+            joblog.log(f"bitrate cuts (auto): {type(e).__name__}: {e}", "warn")
+            AUTO["next_at"] = time.time() + SWEEP_S
+
+
 def snapshot() -> dict:
     rows = _load()
     for x in rows:
@@ -744,4 +850,8 @@ def snapshot() -> dict:
         except Exception:                                        # noqa: BLE001
             x["why"] = {}
     return {"rows": rows, "open": sum(1 for x in rows if x.get("state") == "open"),
-            "rule": {"ratio": RATIO, "refetch_at": REFETCH_AT}}
+            "rule": {"ratio": RATIO, "refetch_at": REFETCH_AT},
+            "mode": mode(), "auto": {**AUTO, "log": _auto_log()[:12],
+                                     "due": len([x for x in rows if x.get("state") == "open"
+                                                 and not x.get("auto_tried")
+                                                 and (x.get("why") or {}).get("rec") == "fetch"])}}

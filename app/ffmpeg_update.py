@@ -953,10 +953,44 @@ def _norm(v: str) -> tuple:
     return tuple(int(x) for x in nums[:4]) or (0,)
 
 
-async def check() -> dict:
+# ONE ANSWER PER TWO MINUTES. The dashboard's loadAll() asks this every
+# fifteen seconds from every open tab, and each ask was a process spawn
+# (ffmpeg -version) plus a network round trip - 450 ms of server work that
+# every other request on the page then queued behind. The answer does not
+# change between asks; the one event that changes it (an update applied)
+# calls with force.
+_CHECK: dict = {"at": 0.0, "out": None, "sig": None}
+_VERIFY: dict = {"at": 0.0, "out": None, "sig": None}
+CHECK_TTL_S = 120.0
+
+
+def _sig(*paths) -> tuple:
+    """Path and modification time of each binary: a swapped-in build is a new
+    signature, so an applied update misses both caches without being told."""
+    out = []
+    for p in paths:
+        try:
+            out.append((p, os.path.getmtime(p)))
+        except OSError:
+            out.append((p, None))
+    return tuple(out)
+
+
+async def check(force: bool = False) -> dict:
     """Compare the installed build against the latest published one."""
-    out: dict = {"checked_at": time.time()}
     cur_exe, _ = installed_paths()
+    sig = _sig(cur_exe)
+    if (not force and _CHECK["out"] is not None and _CHECK["sig"] == sig
+            and time.time() - _CHECK["at"] < CHECK_TTL_S):
+        return dict(_CHECK["out"])
+    out = await _check(cur_exe)
+    if "error" not in out:
+        _CHECK.update(at=time.time(), out=dict(out), sig=sig)
+    return out
+
+
+async def _check(cur_exe: str) -> dict:
+    out: dict = {"checked_at": time.time()}
     # to_thread even with the cache: the first call after an update still pays
     # a process spawn, and this runs on the loop.
     out["current"] = await asyncio.to_thread(local_version, cur_exe)
@@ -1146,6 +1180,18 @@ async def stage(confirm: bool = False, force: bool = False) -> dict:
 
 
 def verify_install() -> dict:
+    """_verify_install, answered from the cache for two minutes - it spawns
+    both binaries, and the dashboard asked every fifteen seconds."""
+    own_ff, own_fp = str(BIN_DIR / "ffmpeg.exe"), str(BIN_DIR / "ffprobe.exe")
+    sig = _sig(own_ff, own_fp)
+    if _VERIFY["out"] is not None and _VERIFY["sig"] == sig and time.time() - _VERIFY["at"] < CHECK_TTL_S:
+        return dict(_VERIFY["out"])
+    out = _verify_install()
+    _VERIFY.update(at=time.time(), out=dict(out), sig=sig)
+    return out
+
+
+def _verify_install() -> dict:
     """Is the installed build actually usable?
 
     Checks the two things that matter and are cheap: both binaries exist, and

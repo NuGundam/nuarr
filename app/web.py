@@ -773,6 +773,9 @@ async def _startup() -> None:
         from . import integrity as _ig
         _ig.init()
         asyncio.create_task(_ig.watch())
+        # Upgrades that cut the bitrate: the auto sweep (does nothing in manual).
+        from . import bitcut as _bc
+        asyncio.create_task(_bc.watch())
         # ONE SUBTITLE SYSTEM, AND THIS IS ITS RUNNER.
         #
         # subembed.watch and subdupe.watch used to start here, one after the
@@ -10717,6 +10720,15 @@ async def api_bitcut_progress():
     """What each running find / restore / check is doing right now."""
     from . import bitcut
     return bitcut.progress()
+
+
+@app.post("/api/bitcut/mode")
+def api_bitcut_mode(mode: str):
+    """manual: list the cuts and wait. auto: fetch a fuller copy for the ones advised fetch."""
+    from . import bitcut
+    m = bitcut.set_mode(mode)
+    joblog.log(f"bitrate cuts: {m} mode", "info")
+    return {"mode": m}
 
 
 @app.post("/api/bitcut/restore")
@@ -46666,17 +46678,47 @@ async function arrSyncFix(){
   loadArrSync();                       // picks up fixing:{running:true}, polls on
 }
 
-async function loadArrsTab(){
-  loadArrConns();
-  loadArrHealth();
-  loadLangSync();
-  loadPathMap();
-  loadArrSync();
+// THE ARRS PAGE REFRESHES ITSELF. Everything under the webhooks box - each
+// job's "last run 9m ago", the janitor's removals, the TVDB repairs, the ban
+// list - was painted once when the tab opened and never again, so the page
+// said "last run 9m ago" an hour later and a removal the janitor made while
+// you watched did not appear. The body is rebuilt from /api/arrguard once a
+// minute while it is on screen, UNLESS you are in the middle of something on
+// it: a name box focused, a Pick… list open, a ban list filter typed, or a
+// fuller-copy search running (its bar would be reset). Scroll boxes keep their
+// place across the rebuild, and the rows' open/selected sets are globals.
+let _arrsRefreshT=null;
+function arrsBusyEditing(){
+  const body=document.getElementById('arrsBody'); if(!body) return true;
+  const a=document.activeElement;
+  if(a && body.contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName) && a.type!=='checkbox') return true;
+  if([...body.querySelectorAll('[id^="pick-"]')].some(e=>e.style.display!=='none')) return true;
+  if(typeof bcBusyAny==='function' && bcBusyAny()) return true;
+  if(document.getElementById('arrsBusy')) return true;
+  return false;
+}
+async function arrsRefresh(){
+  const body=document.getElementById('arrsBody');
+  if(!body || body.offsetParent===null || document.hidden || arrsBusyEditing()) return;
+  const keep=[...body.querySelectorAll('.scrollbox, .rowbox')].map(e=>e.scrollTop);
+  await loadArrsTab(true);
+  const boxes=[...body.querySelectorAll('.scrollbox, .rowbox')];
+  keep.forEach((t,i)=>{ if(boxes[i]) boxes[i].scrollTop=t; });
+}
+async function loadArrsTab(refresh){
+  if(!refresh){
+    loadArrConns();
+    loadArrHealth();
+    loadLangSync();
+    loadPathMap();
+    loadArrSync();
+  }
+  if(!_arrsRefreshT) _arrsRefreshT=setInterval(arrsRefresh, 60000);
   const el=document.getElementById('arrsBody');
   if(!el) return;
   let d;
   try{ d=await (await fetch('/api/arrguard')).json(); }
-  catch(e){ el.innerHTML=`<div class="err">could not load: ${esc(String(e))}</div>`; return; }
+  catch(e){ if(!refresh) el.innerHTML=`<div class="err">could not load: ${esc(String(e))}</div>`; return; }
   const g=d.stats.guard||{}, t=d.stats.trash||{};
   const rb=d.release_ban||{}, rbst=(rb.stats||{});
   const qj=d.queue_janitor||{}, qjst=(qj.stats||{});
@@ -46893,7 +46935,7 @@ const _bcBusy=new Set();       // rows a Find a fuller copy is searching for rig
 // check is on; a striped bar moves while it works and fills against how long
 // a release search has been taking, so a long wait reads as a wait and not a
 // hang. Polled once a second while anything here is running.
-let _bcProg={rows:{}}, _bcPollT=null;
+let _bcProg={rows:{}}, _bcPollT=null, _bcReload=null;
 function bcBusyAny(){ return _bcBusy.size || Object.values(_bcPrev).some(v=>v==='…'); }
 async function bcPoll(){
   if(_bcPollT) clearTimeout(_bcPollT);
@@ -46924,7 +46966,9 @@ async function bcLoad(){
   if(!document.getElementById('bcBox')) return;
   try{ _bc=await (await fetch('/api/bitcut')).json(); }catch(e){ return; }
   bcPaint();
-  if((_bc.rows||[]).some(r=>r.state==='grabbed')) setTimeout(bcLoad, 30000);
+  if(_bcReload) clearTimeout(_bcReload);
+  const sweeping=(_bc.auto||{}).running;
+  if(sweeping||(_bc.rows||[]).some(r=>r.state==='grabbed')) _bcReload=setTimeout(bcLoad, sweeping?3000:30000);
 }
 function bcMbps(v){ return v==null?'—':(+v).toFixed(1)+' Mbps'; }
 function bcDetail(r){
@@ -47016,7 +47060,16 @@ function bcPaint(){
   </style><div class="lkind" style="padding:10px 12px">
     <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:baseline">
       <b style="color:#e8a33d">Upgrades that cut the bitrate</b>
-      <span class="dim" style="font-size:11px">${fmt(_bc.open||0)} open${fetchN?` · <a href="#" onclick="bcPickRec();return false">select the ${fetchN} worth fetching</a>`:''}</span></div>
+      <span style="font-size:11px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <span class="dim">${fmt(_bc.open||0)} open${fetchN&&_bc.mode!=='auto'?` · <a href="#" onclick="bcPickRec();return false">select the ${fetchN} worth fetching</a>`:''}</span>
+        <span class="dim" title="Manual lists the cuts and waits for you. Auto runs Find a fuller copy by itself on every row advised fetch - once per row; your-call rows, keep rows and rows where nothing fuller was found stay yours.">for the ones advised fetch</span>
+        <span class="pill ${_bc.mode==='manual'?'p-acc':'p-dim'}" style="cursor:pointer" onclick="bcMode('manual')">manual</span>
+        <span class="pill ${_bc.mode==='auto'?'p-ok':'p-dim'}" style="cursor:pointer" onclick="bcMode('auto')">auto</span></span></div>
+    ${_bc.mode==='auto'?`<div style="font-size:11px;margin:3px 0 0;color:var(--ok)">auto ·
+      ${(_bc.auto||{}).running?'sweeping now…':((_bc.auto||{}).due?`${fmt(_bc.auto.due)} to fetch on the next sweep`:'nothing waiting')}
+      <span class="dim">· ${(_bc.auto||{}).last_at?'last sweep '+ago(_bc.auto.last_at):'no sweep yet'}${(_bc.auto||{}).next_at&&!(_bc.auto||{}).running?' · next '+ago(_bc.auto.next_at).replace(' ago','').replace(/^/,'in '):''}
+      · ${fmt((_bc.auto||{}).fetched||0)} fetched, ${fmt((_bc.auto||{}).none||0)} with nothing fuller, since start</span>
+      ${((_bc.auto||{}).log||[]).length?`<div class="dim" style="font-size:10.5px;margin-top:2px">${_bc.auto.log.slice(0,4).map(l=>`${esc(l.label||'')}: ${l.ok?'<span style="color:var(--ok)">grabbed</span> ':'<span style="color:#e8a33d">nothing fuller</span> - '}${esc(String(l.what||'').slice(0,70))}`).join(' · ')}</div>`:''}</div>`:''}
     <div class="dim" style="font-size:11px;margin:3px 0 7px">An arr ranks releases by custom-format score, which knows nothing
       about how many bits went into the picture - Lioness S03E03 went from 7.42 GB to 2.66 GB of 2160p as an "upgrade".
       Listed: same resolution, the new file keeping under half the old one's picture (HEVC counted as needing 65% of H.264's
@@ -47083,6 +47136,11 @@ async function bcRestore(ids,btn){
     _bcSel.delete(id); _bcBusy.delete(id); delete _bcT0[id]; _bcKey=''; 
     await bcLoad();
   }
+}
+async function bcMode(m){
+  await fetch('/api/bitcut/mode?mode='+m,{method:'POST'});
+  _bcKey=''; await bcLoad();
+  if(m==='auto') setTimeout(bcLoad, 3000);
 }
 async function bcKeep(ids){
   for(const id of ids){ await fetch('/api/bitcut/keep?file_id='+id,{method:'POST'}); _bcSel.delete(id); }
