@@ -185,28 +185,41 @@ def _arr(name: str):
     return next((a for a in SETTINGS.arrs if a.name == name and a.enabled), None)
 
 
-def candidates(file_id: int) -> tuple[list, dict]:
-    """Releases that would bring the picture back, best first, and the ids."""
+def _ids(file_id: int):
+    """(finding, file row, arr, ids) or a 'why' string."""
     from .arrqueue import _call
     x = next((r for r in _load() if r["file_id"] == int(file_id)), None)
     f = _file(file_id)
     if not x or not f or not f.get("arr_name"):
-        return [], {"why": "nuarr does not know which arr item this file is"}
+        return "nuarr does not know which arr item this file is"
     a = _arr(f["arr_name"])
     if not a:
-        return [], {"why": f"{f['arr_name']} is not enabled"}
+        return f"{f['arr_name']} is not enabled"
     if a.kind == "sonarr":
         eps = [e for e in (_call(a, f"/api/v3/episode?seriesId={int(f['arr_parent_id'])}") or [])
                if e.get("episodeFileId") == f.get("arr_file_id")]
         if not eps:
-            return [], {"why": "Sonarr no longer lists an episode on this file"}
+            return "Sonarr no longer lists an episode on this file"
         ids = {"arr": a, "seriesId": int(f["arr_parent_id"]), "episodeIds": [e["id"] for e in eps]}
-        rel = []
-        for e in eps[:1]:
-            rel += _call(a, f"/api/v3/release?episodeId={e['id']}", timeout=240) or []
     else:
         ids = {"arr": a, "movieId": int(f["arr_parent_id"])}
-        rel = _call(a, f"/api/v3/release?movieId={int(f['arr_parent_id'])}", timeout=240) or []
+    return x, f, a, ids
+
+
+def _releases(a, ids: dict) -> list:
+    from .arrqueue import _call
+    if a.kind == "sonarr":
+        return _call(a, f"/api/v3/release?episodeId={ids['episodeIds'][0]}", timeout=240) or []
+    return _call(a, f"/api/v3/release?movieId={ids['movieId']}", timeout=240) or []
+
+
+def candidates(file_id: int) -> tuple[list, dict]:
+    """Releases that would bring the picture back, best first, and the ids."""
+    got = _ids(file_id)
+    if isinstance(got, str):
+        return [], {"why": got}
+    x, f, a, ids = got
+    rel = _releases(a, ids)
     want_res = (_RES.search(x["old"]) or _RES.search(x["new"])).group(1).lower()
     # HDR STAYS HDR. The first fuller copy fetched for Lioness S03E03 was
     # Amazon's 2160p at 20 Mbps - and 8-bit SDR, which its name never said.
@@ -255,6 +268,128 @@ def fetch(file_id: int) -> dict:
               release=r["title"], arr=a.name, ids=ids)
     joblog.log(f"bitrate cut: grabbed a fuller copy - {r['title']} ({r['size'] / 1e9:.2f} GB)", "info")
     return {"ok": True, "release": r["title"], "gb": round(r["size"] / 1e9, 2)}
+
+
+# ------------------------------------------------------- the old one back --
+# WHEN NOTHING FULLER IS OUT THERE, THE OLD FILE STILL WAS. The arr's history
+# says what it was: the upgrade's deletion of it, and the import before that
+# with the release name it came from. Demon City Shinjuku's was "[Bluray-1080p]
+# [FLAC 2.0][x265]-Iznjie Biznjie" from NZBFinder, 13.5 GB, swapped on
+# 2026-10-04 for a 1.2 GB x264 copy. Two ways back, in this order: the arr's
+# own recycle bin (it keeps a replaced file for the days it is set to), and
+# that same release, grabbed again by name.
+def _hist(a, ids: dict) -> list:
+    from .arrqueue import _call
+    if a.kind == "sonarr":
+        h = _call(a, f"/api/v3/history/series?seriesId={ids['seriesId']}") or []
+        h = [e for e in h if e.get("episodeId") in ids["episodeIds"]]
+    else:
+        h = _call(a, f"/api/v3/history/movie?movieId={ids['movieId']}") or []
+    return sorted(h, key=lambda e: e.get("date") or "", reverse=True)
+
+
+def old_release(file_id: int) -> dict:
+    """What the file was before the upgrade that cut it - from the arr's history."""
+    got = _ids(file_id)
+    if isinstance(got, str):
+        return {"why": got}
+    x, f, a, ids = got
+    h = _hist(a, ids)
+    dels = [e for e in h if e.get("eventType") in ("movieFileDeleted", "episodeFileDeleted")
+            and str((e.get("data") or {}).get("reason") or "").lower() == "upgrade"]
+    if not dels:
+        return {"why": "the arr's history has no upgrade deletion for this file"}
+    # the deletion nearest the finding (its time is the upgrade's)
+    import datetime as _dt
+
+    def ts(e):
+        try:
+            return _dt.datetime.fromisoformat(e["date"].replace("Z", "+00:00")).timestamp()
+        except Exception:                                        # noqa: BLE001
+            return 0.0
+    d = min(dels, key=lambda e: abs(ts(e) - float(x.get("at") or 0)))
+    imp = next((e for e in h if e.get("eventType") == "downloadFolderImported" and ts(e) < ts(d) - 1), None)
+    if not imp:
+        return {"why": "the arr's history does not say which release the old file came from",
+                "deleted": d.get("sourceTitle")}
+    grab = next((e for e in h if e.get("eventType") == "grabbed" and ts(e) <= ts(imp)
+                 and _key(e.get("sourceTitle")) == _key(imp.get("sourceTitle"))), None)
+    return {"title": imp.get("sourceTitle") or "", "deleted": d.get("sourceTitle") or "",
+            "deleted_at": d.get("date"), "gb": round(int((d.get("data") or {}).get("size") or 0) / 1e9, 2),
+            "indexer": ((grab or {}).get("data") or {}).get("indexer") or "", "arr": a.name}
+
+
+def _in_recycle(a, deleted: str) -> str:
+    """The replaced file, if the arr's recycle bin still has it."""
+    import os
+    from .arrqueue import _call
+    try:
+        rb = (_call(a, "/api/v3/config/mediamanagement") or {}).get("recycleBin") or ""
+    except Exception:                                            # noqa: BLE001
+        return ""
+    if not rb or not deleted:
+        return ""
+    name = os.path.basename(deleted)
+    parts = os.path.normpath(deleted).split(os.sep)
+    # the arr keeps the folder: <bin>\<show or film folder>[\<season>]\<file>
+    for k in (3, 2):
+        cand = os.path.join(rb, *parts[-k:])
+        if os.path.isfile(cand):
+            return cand
+    return ""
+
+
+def restore(file_id: int) -> dict:
+    """Bring the file the upgrade replaced back: from the recycle bin, or by
+    grabbing its release again. The janitor imports a grab as for a fuller copy."""
+    import os
+    from .arrqueue import _call
+    from . import joblog
+    got = _ids(file_id)
+    if isinstance(got, str):
+        return {"ok": False, "why": got}
+    x, f, a, ids = got
+    old = old_release(file_id)
+    if not old.get("title"):
+        set_state(file_id, "none", old.get("why") or "the old release is not known")
+        return {"ok": False, "why": old.get("why")}
+    # 1. the recycle bin
+    src = _in_recycle(a, old.get("deleted"))
+    if src:
+        dst = os.path.join(os.path.dirname(f["path"]), os.path.basename(src))
+        os.replace(src, dst)
+        q = __import__("urllib.parse").parse.urlencode(
+            {"folder": os.path.dirname(dst), "filterExistingFiles": "false",
+             **({"seriesId": ids["seriesId"]} if "seriesId" in ids else {"movieId": ids["movieId"]})})
+        c = next((c for c in (_call(a, "/api/v3/manualimport?" + q) or [])
+                  if os.path.normcase(c.get("path") or "") == os.path.normcase(dst)), None)
+        if not c:
+            return {"ok": False, "why": f"put {os.path.basename(dst)} back beside the file, but the arr does "
+                                        f"not offer it for import - import it in the arr by hand"}
+        fl = {"path": c["path"], "quality": c.get("quality"), "languages": c.get("languages") or [],
+              "releaseGroup": c.get("releaseGroup") or ""}
+        fl.update({k: ids[k] for k in ("seriesId", "episodeIds", "movieId") if k in ids})
+        _call(a, "/api/v3/command", "POST", {"name": "ManualImport", "files": [fl], "importMode": "move"})
+        set_state(file_id, "fixed", f"the old file came back from {a.name}'s recycle bin: {os.path.basename(dst)}")
+        joblog.log(f"bitrate cut: {x['label']} - the old file restored from the recycle bin", "ok")
+        return {"ok": True, "how": "recycle bin", "file": os.path.basename(dst)}
+    # 2. the same release, again
+    rel = _releases(a, ids)
+    k = _key(old["title"])
+    hits = [r for r in rel if _key(r.get("title")) == k
+            and not any(str(c.get("name") or "").startswith("Nuarr:") for c in (r.get("customFormats") or []))]
+    hits.sort(key=lambda r: (r.get("protocol") != "usenet", -(r.get("seeders") or 0)))
+    if not hits:
+        why = (f"the old release ({old['title']}) is not in the recycle bin and no indexer offers it now")
+        set_state(file_id, "none", why)
+        return {"ok": False, "why": why}
+    r = hits[0]
+    _call(a, "/api/v3/release", "POST", {"guid": r["guid"], "indexerId": r["indexerId"]})
+    ids.pop("arr", None)
+    set_state(file_id, "grabbed", f"grabbing the old release again: {r['title']} ({r['size'] / 1e9:.2f} GB, "
+                                  f"{r.get('indexer')})", release=r["title"], arr=a.name, ids=ids)
+    joblog.log(f"bitrate cut: {x['label']} - grabbing the old release again: {r['title']}", "info")
+    return {"ok": True, "how": "grabbed", "release": r["title"]}
 
 
 def wanted() -> dict:
@@ -364,10 +499,14 @@ def explain(x: dict) -> dict:
 def preview(file_id: int) -> dict:
     """What Find a fuller copy WOULD grab - the top few - without grabbing."""
     cands, ids = candidates(file_id)
+    try:
+        old = old_release(file_id)
+    except Exception:                                            # noqa: BLE001
+        old = {}
     if not cands:
-        return {"ok": False, "why": ids.get("why") or "nothing of the same resolution (and HDR, where the "
-                                                       "file has it) carries enough picture"}
-    return {"ok": True, "n": len(cands), "top": [
+        return {"ok": False, "old": old, "why": ids.get("why") or "nothing of the same resolution (and HDR, "
+                                                                  "where the file has it) carries enough picture"}
+    return {"ok": True, "old": old, "n": len(cands), "top": [
         {"title": r.get("title"), "gb": round((r.get("size") or 0) / 1e9, 2), "score": r.get("customFormatScore"),
          "indexer": r.get("indexer"), "protocol": r.get("protocol"), "seeders": r.get("seeders")}
         for r in cands[:4]]}

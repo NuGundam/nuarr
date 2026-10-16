@@ -10698,6 +10698,13 @@ async def api_bitcut_preview(file_id: int):
     return await asyncio.to_thread(bitcut.preview, int(file_id))
 
 
+@app.post("/api/bitcut/restore")
+async def api_bitcut_restore(file_id: int):
+    """Bring back the file an upgrade replaced - recycle bin, or its release again."""
+    from . import bitcut
+    return await asyncio.to_thread(bitcut.restore, int(file_id))
+
+
 @app.post("/api/bitcut/keep")
 def api_bitcut_keep(file_id: int):
     """Keep the smaller copy - the row leaves the list."""
@@ -46880,6 +46887,11 @@ function bcDetail(r){
     : pv==='…'?'<span class="dim">asking the arr…</span>'
     : pv.ok?`<div>${fmt(pv.n)} release(s) qualify - the first is what would be grabbed:</div>${pv.top.map((t,k)=>`<div class="mono" style="font-size:10.5px;${k?'':'color:var(--ok)'}">${k?'':'→ '}${esc(t.title||'')} <span class="dim">· ${(+t.gb).toFixed(2)} GB · score ${fmt(t.score||0)} · ${esc(t.indexer||'')}${t.protocol==='torrent'?' · '+fmt(t.seeders||0)+' seeders':''}</span></div>`).join('')}`
     : `<span style="color:#e8a33d">${esc(pv.why||'nothing qualifies')}</span>`;
+  const old=pv&&pv!=='…'&&pv.old||null;
+  const oldHtml=old&&old.title?`<span class="mono" style="font-size:10.5px">${esc(old.title)}</span>
+      <span class="dim">· ${(+old.gb||0).toFixed(2)} GB${old.indexer?' · from '+esc(old.indexer):''} · replaced ${old.deleted_at?esc(new Date(old.deleted_at).toLocaleDateString()):''}</span>
+      ${r.state==='open'||r.state==='none'?` <button class="rmb" onclick="bcRestore([${r.file_id}],this)">Get the old one back</button>`:''}`
+    : (old&&old.why?`<span class="dim">${esc(old.why)}</span>`:'');
   return `<div style="font-size:11px;padding:6px 10px 8px 34px;white-space:normal">
     ${line('the %', `the new file keeps <b>${Math.round((r.share||0)*100)}%</b> of the old file's picture - its bits for the
       picture against the old one's, each counted as H.264 (HEVC is taken to need 65% of H.264's bits
@@ -46894,6 +46906,7 @@ function bcDetail(r){
     ${line('file', `<span class="mono">${esc(r.label||'')}</span> <span class="dim">· upgraded ${r.at?esc(new Date(r.at*1000).toLocaleString()):''}</span>`)}
     ${r.note?line('state', esc(r.note)):''}
     ${line('available', pvHtml)}
+    ${oldHtml?line('the old one', oldHtml):''}
   </div>`;
 }
 function bcRowHtml(r){
@@ -46910,7 +46923,9 @@ function bcRowHtml(r){
     <td class="l" style="font-size:10.5px">${_bcBusy.has(k)?'<span style="color:#79c0ff">searching the indexers…</span>'
       :`<span style="color:${BC_COL[r.state]||'var(--dim)'}">${esc(BC_WORD[r.state]||r.state||'')}</span>${
         r.note&&r.state!=='open'?`<div class="dim" style="font-size:10px;white-space:normal" title="${esc(r.note)}">${esc(r.note)}</div>`:''}`}</td>
-    <td class="r" style="white-space:nowrap">${can?`<button class="rmb" onclick="bcFetch([${k}],this)">Find a fuller copy</button>
+    <td class="r" style="white-space:nowrap">${can?(r.state==='none'
+        ?`<button class="rmb" onclick="bcRestore([${k}],this)" title="Bring back the file this upgrade replaced: from the arr's recycle bin if it is still there, otherwise by grabbing the same release again">Get the old one back</button>`
+        :`<button class="rmb" onclick="bcFetch([${k}],this)">Find a fuller copy</button>`)+`
       <button class="rmb" onclick="bcKeep([${k}])">Keep</button>`:''}</td></tr>
     ${open?`<tr><td></td><td colspan="7">${bcDetail(r)}</td></tr>`:''}`;
 }
@@ -46921,6 +46936,8 @@ function bcSelBar(){
   return `<div class="banselbar" style="margin:4px 0 6px">
     <b style="font-size:11.5px;color:#e3b341">${fmt(n)} selected</b>
     <button class="rmb" onclick="bcFetch([..._bcSel],this)" title="One at a time: each asks the arr for its releases and grabs the best fuller copy">Find fuller copies for ${fmt(n)}</button>
+    ${(()=>{ const none=[..._bcSel].filter(id=>((_bc.rows||[]).find(r=>r.file_id===id)||{}).state==='none');
+      return none.length?`<button class="rmb" onclick="bcRestore([${none.join(',')}],this)" title="For the ones nothing fuller was found for: bring back the file the upgrade replaced">Get the old ones back for ${fmt(none.length)}</button>`:''; })()}
     <button class="rmb" onclick="bcKeep([..._bcSel])">Keep ${fmt(n)}</button>
     <button class="rmb" onclick="_bcSel.clear();_bcLast=null;bcPaint()">Clear</button>
     <span class="dim" style="font-size:10.5px">shift-click to take a range</span></div>`;
@@ -46987,6 +47004,15 @@ async function bcFetch(ids,btn){
   ids.forEach(id=>_bcBusy.add(id)); _bcKey=''; bcPaint();
   for(const id of ids){
     try{ await (await fetch('/api/bitcut/fetch?file_id='+id,{method:'POST'})).json(); }catch(e){}
+    _bcSel.delete(id); _bcBusy.delete(id); _bcKey='';
+    await bcLoad();
+  }
+}
+// THE OLD ONE BACK - when nothing fuller exists. The row says what came of it.
+async function bcRestore(ids,btn){
+  ids.forEach(id=>_bcBusy.add(id)); _bcKey=''; bcPaint();
+  for(const id of ids){
+    try{ await (await fetch('/api/bitcut/restore?file_id='+id,{method:'POST'})).json(); }catch(e){}
     _bcSel.delete(id); _bcBusy.delete(id); _bcKey='';
     await bcLoad();
   }
