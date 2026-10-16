@@ -426,6 +426,23 @@ async def _one(file_id: int, overwrite: bool, by: str = "you") -> None:
     except Exception:                                            # noqa: BLE001
         pass
     lib = r["library"] or ""
+    if overwrite and subembed.enabled(lib) and r["path"].lower().endswith(".mkv"):
+        STATE.update(stage="replacing nuarr's track inside the file", pct=98)
+        try:
+            text = open(side, encoding="utf-8-sig", errors="replace").read()
+            srt = text if side.endswith(".srt") else substyle.ass_to_srt(text)
+            res = await asyncio.to_thread(restyle_one, file_id, style, srt)
+        except Exception as e:                                   # noqa: BLE001
+            res = {"ok": False, "why": f"{type(e).__name__}: {e}"}
+        if res.get("ok"):
+            try:
+                os.remove(side)
+            except OSError:
+                pass
+            row.update(where="embedded", why="replaced nuarr's own track inside the file")
+            _remember(row)
+            joblog.log(f"subtitle maker: {label} - remade, nuarr's track replaced", "ok")
+            return
     if subembed.enabled(lib):
         STATE.update(stage="putting it inside the file", pct=98)
         try:
@@ -485,8 +502,11 @@ def _style_of_track(path: str, t: dict, sub_ord: int) -> str:
     return m.group(1) if m else "?"
 
 
-def restyle_one(file_id: int, style: str = "") -> dict:
-    """Rewrite one made subtitle in the style its group has now."""
+def restyle_one(file_id: int, style: str = "", srt_text: str = "") -> dict:
+    """Rewrite one made subtitle in the style its group has now. With
+    srt_text, the track inside the file is REPLACED by that text - a remake
+    with overwrite, which the sidecar embed would otherwise throw away as a
+    second copy of a language the file already has."""
     import re
     import shutil
     from . import fileops, substyle, subembed
@@ -499,7 +519,7 @@ def restyle_one(file_id: int, style: str = "") -> dict:
     style = style or substyle.for_library(r["library"] or "")
     label = display_label(r["title"], r["season"], r["episode"], path)
     # A SIDECAR: rewritten beside the file, in place.
-    for ext in (".srt", ".ass"):
+    for ext in (() if srt_text else (".srt", ".ass")):
         side = _sidecar(path, ext)
         if os.path.exists(side):
             text = open(side, encoding="utf-8-sig", errors="replace").read()
@@ -533,13 +553,13 @@ def restyle_one(file_id: int, style: str = "") -> dict:
         return {"ok": False, "why": "cannot tell which English track is the one nuarr made - left alone"}
     ordn, t = pick
     was = _style_of_track(path, t, ordn)
-    if was == style:
+    if was == style and not srt_text:
         return {"ok": True, "same": True, "why": "already in that style"}
     fmt = "srt" if "SubRip" in (t.get("codec") or "") else "ass"
     raw = quiet_run([_ffmpeg_exe(), "-v", "error", "-i", path, "-map", f"0:s:{ordn}", "-f", fmt, "-"],
                     capture_output=True, timeout=300).stdout.decode("utf-8", "replace")
-    srt = raw if fmt == "srt" else substyle.ass_to_srt(raw)
-    if len(substyle.srt_cues(srt)) < 3:
+    srt = srt_text or (raw if fmt == "srt" else substyle.ass_to_srt(raw))
+    if len(substyle.srt_cues(srt)) < (1 if srt_text else 3):
         return {"ok": False, "why": "could not read the track back out"}
     work = os.path.join(str(DATA_DIR), f"restyle.{file_id}" + (".srt" if style == "plain" else ".ass"))
     with open(work, "w", encoding="utf-8" if style == "plain" else "utf-8-sig") as f:
