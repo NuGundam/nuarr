@@ -47117,13 +47117,17 @@ async function loadArrsTab(refresh){
          empty:'none listed — every anime format the guides publish that already exists in the arr',
          adder:newFmts(t)})
     + job('release_ban','Rejected releases, banned for every indexer',
-        'When nuarr rejects a release - no English in a file that said DUAL, a raw '
-        +'with nothing to read, a container that does not decode - the arr blocklists '
+        'When nuarr rejects a release - no English in a file that said DUAL, a '
+        +'container that does not decode, a raw the Subtitle maker could not subtitle - the arr blocklists '
         +'that ONE grab from that ONE indexer, and the same release is on four others. '
         +'This bans the release NAME as a -999999 custom format on the profiles listed, '
         +'so no indexer can hand it back; a group that keeps doing it is banned outright '
         +'after '+String(rb.group_strikes||3)+' strikes. The list below is the whole '
-        +'state and yours to edit.',
+        +'state and yours to edit. <b>Since the Subtitle maker</b> (2026-10-16): a raw with no English '
+        +'subtitles is no longer a reason on its own - Raws makes them first, and only a raw the maker '
+        +'fails on is rejected and banned. The 45 releases and 7 groups banned for that reason before the '
+        +'maker existed were switched off, each with a note saying so; wrong-audio, broken-file, '
+        +'bitrate-cut and downgrade bans stand.',
         d.toggles.release_ban, rbst,
         {label:'Profiles to score on (empty = every profile in that arr)',
          kind:'release_ban', names:rb.profiles||{},
