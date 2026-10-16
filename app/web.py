@@ -10678,6 +10678,27 @@ def api_submake():
     return submake.snapshot()
 
 
+@app.get("/api/bitcut")
+def api_bitcut():
+    from . import bitcut
+    return bitcut.snapshot()
+
+
+@app.post("/api/bitcut/fetch")
+async def api_bitcut_fetch(file_id: int):
+    """Grab the best fuller copy of a file an upgrade cut the bitrate of."""
+    from . import bitcut
+    return await asyncio.to_thread(bitcut.fetch, int(file_id))
+
+
+@app.post("/api/bitcut/keep")
+def api_bitcut_keep(file_id: int):
+    """Keep the smaller copy - the row leaves the list."""
+    from . import bitcut
+    bitcut.set_state(int(file_id), "kept", "kept as it is")
+    return {"ok": True}
+
+
 @app.get("/api/submake/styles")
 def api_submake_styles():
     from . import submake, substyle
@@ -46821,9 +46842,52 @@ async function loadArrsTab(){
     + `<div class="dim" style="font-size:11px;margin-top:10px;padding:0 4px">Where the arrs'
          imports land - the disk nuarr picks for them, and the last few placed - is on the
          <a href="#drivepool">DrivePool page</a>,
-         next to the same choice nuarr makes for its own files.</div>`;
+         next to the same choice nuarr makes for its own files.</div>`
+    + `<div id="bcBox" style="margin-top:12px"></div>`;
   loadHookState();
+  bcLoad();
 }
+
+// ---- upgrades that cut the bitrate - see bitcut.py -------------------------
+let _bc=null;
+async function bcLoad(){
+  const el=document.getElementById('bcBox'); if(!el) return;
+  try{ _bc=await (await fetch('/api/bitcut')).json(); }catch(e){ return; }
+  const rows=(_bc.rows||[]).filter(r=>r.state!=='kept');
+  const col={open:'#e8a33d',grabbed:'#79c0ff',fixed:'var(--ok)',none:'var(--dim)'};
+  const word={open:'cut',grabbed:'fetching a fuller copy',fixed:'fuller copy imported',none:'nothing better found'};
+  el.innerHTML=`<div class="lkind" style="padding:10px 12px">
+    <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:baseline">
+      <b style="color:#e8a33d">Upgrades that cut the bitrate</b>
+      <span class="dim" style="font-size:11px">${fmt(_bc.open||0)} open</span></div>
+    <div class="dim" style="font-size:11px;margin:3px 0 7px">An arr ranks releases by custom-format score, which knows nothing
+      about how many bits went into the picture - Lioness S03E03 went from 7.42 GB to 2.66 GB of 2160p as an "upgrade".
+      Listed: same resolution, the new file carrying under half the old one's picture with the codec allowed for
+      (HEVC counts as needing 65% of H.264's bits), a Remux source left out, and a new file that still has plenty
+      (15 Mbps of H.264 at 2160p, 5 at 1080p) left out. <b>Find a fuller copy</b> grabs the best-scored release of the same
+      resolution with at least four fifths of the old picture that nothing bans; the arr will call it "not an upgrade",
+      so the queue janitor imports it by hand instead of clearing it. <b>Keep</b> drops the row.</div>
+    ${rows.length?`<div class="rowbox scrollbox" style="max-height:340px"><table class="sktbl" style="width:100%;font-size:11.5px">
+      <thead><tr class="dim" style="font-size:10.5px"><th class="l">FILE</th><th class="c">WAS</th><th class="c">NOW</th>
+        <th class="c">PICTURE KEPT</th><th class="l">STATE</th><th class="r"></th></tr></thead><tbody>${rows.map(r=>`<tr>
+        <td class="l"><b>${esc(r.label||'')}</b><div class="dim" style="font-size:10px">${esc(r.library||'')} · ${r.at?ago(r.at):''}</div></td>
+        <td class="c mono" style="font-size:10.5px">${esc(r.old||'')}<br><b>${(+r.old_gb).toFixed(2)} GB</b></td>
+        <td class="c mono" style="font-size:10.5px">${esc(r.new||'')}<br><b style="color:#e8a33d">${(+r.new_gb).toFixed(2)} GB</b></td>
+        <td class="c mono"><b style="color:${r.share<0.25?'var(--bad)':'#e8a33d'}">${Math.round((r.share||0)*100)}%</b></td>
+        <td class="l" style="font-size:10.5px"><span style="color:${col[r.state]||'var(--dim)'}">${esc(word[r.state]||r.state||'')}</span>
+          ${r.note?`<div class="dim" style="font-size:10px">${esc(r.note)}</div>`:''}</td>
+        <td class="r" style="white-space:nowrap">${r.state==='open'||r.state==='none'?`<button class="rmb" onclick="bcFetch(${r.file_id},this)">Find a fuller copy</button>
+          <button class="rmb" onclick="bcKeep(${r.file_id})">Keep</button>`:''}</td></tr>`).join('')}</tbody></table></div>`
+      :'<div class="dim" style="font-size:11.5px">no upgrade has cut a file\'s picture</div>'}
+  </div>`;
+}
+async function bcFetch(id,btn){
+  if(btn){ btn.disabled=true; btn.textContent='searching…'; }
+  let d={}; try{ d=await (await fetch('/api/bitcut/fetch?file_id='+id,{method:'POST'})).json(); }catch(e){}
+  if(!d.ok && d.why) alert(d.why);
+  bcLoad();
+}
+async function bcKeep(id){ await fetch('/api/bitcut/keep?file_id='+id,{method:'POST'}); bcLoad(); }
 
 // ---- the queue janitor's recent removals ----------------------------------
 // THE SAME SHAPE AS THE BAN LIST: a table in a scroll box, headings that

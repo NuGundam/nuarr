@@ -308,8 +308,9 @@ def _import_unread(items: list) -> list:
                                    f", which matches no single item here - left for you")
             continue
         try:
-            q = urllib.parse.urlencode({"folder": row.get("outputPath") or "", "downloadId": row.get("downloadId") or "",
-                                        **({"seriesId": hit["seriesId"]} if "seriesId" in hit else {"movieId": hit["movieId"]}),
+            # BY THE DOWNLOAD ALONE - with a seriesId Sonarr lists the series
+            # folder instead (see bitcut.import_wanted).
+            q = urllib.parse.urlencode({"downloadId": row.get("downloadId") or "",
                                         "filterExistingFiles": "false"})
             cands = [c for c in (_call(a, "/api/v3/manualimport?" + q) or [])
                      if os.path.splitext(c.get("path") or "")[1].lower() in (".mkv", ".mp4", ".avi", ".m4v", ".ts")]
@@ -605,6 +606,23 @@ def _pass() -> str:
         new_parsed = _import_unread(unread)
     else:
         new_parsed = []
+    # A FULLER COPY NUARR FETCHED is "not a Custom Format upgrade" to the arr
+    # by design - see bitcut.py. It is imported by hand here, and left out of
+    # everything below, which would otherwise clear it as exactly that.
+    try:
+        from . import bitcut
+        cut_rows, hold = bitcut.import_wanted(queues)
+    except Exception as e:                                       # noqa: BLE001
+        cut_rows, hold = [], set()
+        STATS["detail"].append(f"fuller copies: {type(e).__name__}: {e}"[:160])
+    if hold:
+        for _a, rows in queues:
+            for r in rows:
+                if r.get("id") in hold and r.get("downloadId"):
+                    tracked.add(str(r["downloadId"]).upper())
+                    tracked.add(str(r["downloadId"]))
+        queues = [(a, [r for r in rows if r.get("id") not in hold]) for a, rows in queues]
+    new_parsed = cut_rows + new_parsed
     for a, rows in queues:
         # TWO DOWNLOADS FOR ONE EPISODE: KEEP THE BEST, DROP THE REST NOW.
         # The arr grabs a release, a better one appears, it grabs that too as

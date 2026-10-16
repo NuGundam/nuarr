@@ -689,6 +689,15 @@ def _tell_phone(cfg, body: dict, files: list, detail: str, upgrade: bool) -> Non
         joblog.log(f"pushover: {type(e).__name__}: {e}", "warn")
 
 
+def _bitcut(arr_name: str, arr_file_id, detail: str) -> None:
+    """An upgrade that cut the picture's bitrate is listed - see bitcut.py."""
+    try:
+        from . import bitcut
+        bitcut.note_arr_file(arr_name, int(arr_file_id), detail)
+    except Exception as e:                                       # noqa: BLE001
+        joblog.log(f"bitrate check: {type(e).__name__}: {e}", "warn")
+
+
 async def _handle(cfg, body: dict) -> str:
     ev = body.get("eventType") or ""
     kind = cfg.kind
@@ -714,6 +723,8 @@ async def _handle(cfg, body: dict) -> str:
             for f in files:
                 if f.get("id"):
                     await _sync_file(cfg, f["id"], pid, up, event=evname)
+                    if body.get("isUpgrade"):
+                        _bitcut(cfg.name, f["id"], up)
             for d in _objs(body.get("deletedFiles")):
                 if d.get("id"):
                     _mark_deleted(cfg.name, d["id"],
@@ -766,6 +777,8 @@ async def _handle(cfg, body: dict) -> str:
                 await _sync_file(cfg, mf["id"], pid, up,
                                  event="upgraded" if body.get("isUpgrade")
                                  else "imported")
+                if body.get("isUpgrade"):
+                    _bitcut(cfg.name, mf["id"], up)
             for d in _objs(body.get("deletedFiles")):
                 if d.get("id"):
                     _mark_deleted(cfg.name, d["id"],
