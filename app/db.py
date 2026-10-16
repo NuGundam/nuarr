@@ -547,6 +547,16 @@ def init_db() -> None:
                     "AND state IN ('queued','running')")
         cur.execute("CREATE INDEX IF NOT EXISTS ix_jobs_claim "
                     "ON jobs(state, pool, priority, created_at)")
+        # THE LIVE JOBS, ON THEIR OWN. 166,000 rows, 25 of them queued: the
+        # stats can only say "about 56,000 per state" (four states, averaged),
+        # so the planner judged ix_jobs_state useless for state IN ('queued',
+        # 'running') and scanned the table - 320 ms for each of the Subtitles
+        # page's rules-gap counts, every few seconds. A partial index holding
+        # only the live rows is small whatever the history grows to, and the
+        # planner takes it: 320 ms -> 0.1 ms.
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_jobs_live "
+                    "ON jobs(state, source, file_id) "
+                    "WHERE state IN ('queued','running')")
         # Also here, not only in the schema above: an install that already
         # exists never re-runs the CREATE TABLE block, and this index is
         # worth more to a long-lived database (62k rows and climbing) than

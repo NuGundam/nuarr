@@ -40895,7 +40895,7 @@ async function snRun(btn){
 // keeps what you are typing and the scroll box keeps its place.
 let _sm=null, _smPoll=null, _smQ='', _smHits='', _smKey='';
 // HOW THE MADE SUBTITLES LOOK, per kind of media - see substyle.py.
-let _smSt=null, _smStKey='';
+let _smSt=null, _smStKey='', _smMadeN=null;
 async function smStyles(){
   try{ _smSt=await (await fetch('/api/submake/styles')).json(); }catch(e){ return; }
   const el=document.getElementById('smStyles'); if(!el) return;
@@ -41057,6 +41057,10 @@ async function smBulk(what, btn){
 function smPaint(){
   const el=document.getElementById('smPanel'); if(!el||!_sm) return;
   if(!document.getElementById('smTable')){ el.innerHTML=smShell(); _smStKey=''; smStyles(); }
+  // THE STYLE BOX'S COUNTS FOLLOW WHAT IS MADE. It loaded once, so a file made
+  // after the page opened never showed up in "restyle N made".
+  const nMade=(_sm.recent||[]).length;
+  if(nMade!==_smMadeN){ if(_smMadeN!==null) smStyles(); _smMadeN=nMade; }
   const st=_sm.state||{}, q=(_sm.queue||[]).filter(x=>!(st.running&&x.file_id===st.file_id));
   const rows=[];
   if(st.running) rows.push({kind:'running', st, file_id:st.file_id, label:st.label, library:st.library, file:st.file, lang:st.lang, at:st.started});

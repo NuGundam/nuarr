@@ -287,6 +287,7 @@ async def run() -> str:
             STATE["secs_each"] = (time.time() - STATE["started"]) / n
         res = f"judged {n} file(s)" + (f" - {err}" if err else "")
         STATE.update(judged=STATE["judged"] + n, error=err)
+        _WAITING["at"] = 0.0                 # the count has moved - recount on the next ask
         if n:
             joblog.log(f"qwen judge: {res}", "info", system="hardsub")
         try:
@@ -443,11 +444,25 @@ def as_running() -> list:
     }]
 
 
+_WAITING: dict = {"at": 0.0, "n": 0}
+
+
 def waiting() -> int:
+    """How many pictures wait for a verdict - for the reader row on the
+    Subtitles page, which asks every few seconds. Since the judge started
+    learning from the answers on record, pending() builds every show's tally
+    and checks all 5,600 pictures against it - 150 ms that the page paid on
+    every poll for a number that moves when the judge runs, not in between.
+    Thirty seconds old at most, and fresh as soon as a run ends."""
+    now = time.time()
+    if now - _WAITING["at"] < 30 and not STATE.get("running"):
+        return _WAITING["n"]
     try:
-        return len(pending(100000))
+        n = len(pending(100000))
     except Exception:                                            # noqa: BLE001
-        return 0
+        n = 0
+    _WAITING.update(at=now, n=n)
+    return n
 
 
 def snapshot() -> dict:
