@@ -264,6 +264,24 @@ def _releases(a, ids: dict, file_id: int = 0) -> list:
     return out
 
 
+def _banned(r: dict, strict: bool = False) -> bool:
+    """A release one of nuarr's ban lists hits. By NAME, not by the 'Nuarr:'
+    prefix: "Nuarr: has English audio" is a reward, and the prefix test took
+    every English release for a banned one. strict: also the arr's own
+    group, low-quality and raw formats - for when the profile minimum (which
+    would otherwise keep those out) is set aside."""
+    from .arrban import CF_GROUPS, CF_RELEASES, CF_TERMS
+    names = [str(c.get("name") or "") for c in (r.get("customFormats") or [])]
+    if any(n in (CF_GROUPS, CF_RELEASES, CF_TERMS) for n in names):
+        return True
+    if strict:
+        if any(w in n.lower() for n in names for w in ("banned", " lq", "raws", "bad dual", "unwanted")):
+            return True
+        if any("blocklisted" in str(j).lower() for j in (r.get("rejections") or [])):
+            return True
+    return False
+
+
 def candidates(file_id: int) -> tuple[list, dict]:
     """Releases that would bring the picture back, best first, and the ids."""
     got = _ids(file_id)
@@ -284,15 +302,26 @@ def candidates(file_id: int) -> tuple[list, dict]:
 
     need = (x["old_gb"] / _eff(x["old"])) * REFETCH_AT
     ok_words = ("existing file", "upgrade", "cutoff", "is already in the queue")
+    # USENET TAKEN DOWN. Every Usenet copy of The Sandman's 2160p Netflix
+    # releases - HONE, APEX, the old file's own - aborted in SABnzbd as
+    # "cannot be completed"; the seeded UHD Blu-ray torrents were left out only
+    # for carrying no release group (under the profile's minimum score). Once a
+    # Usenet grab for this row has failed that way, torrents only, and the
+    # profile-minimum rejection is allowed - nothing else is.
+    dead = bool(x.get("usenet_dead"))
+    if dead:
+        ok_words = ok_words + ("profile minimum",)
     out = []
     lost = {_key(t) for t in x.get("tried") or []}      # fetched before and lost - see reconcile
     for r in rel:
         if _key(r.get("title")) in lost:
             continue
+        if dead and r.get("protocol") != "torrent":
+            continue
         res = str(((r.get("quality") or {}).get("quality") or {}).get("resolution") or "")
         if not res or f"{res}p" != want_res:
             continue
-        if any(str(c.get("name") or "").startswith("Nuarr:") for c in (r.get("customFormats") or [])):
+        if _banned(r, strict=dead):
             continue
         rej = [str(j) for j in (r.get("rejections") or [])]
         if any(not any(w in j.lower() for w in ok_words) for j in rej):
@@ -601,9 +630,23 @@ def _restore(file_id: int) -> dict:
     _step(file_id, "not in the recycle bin - looking for the same release on the indexers")
     rel = _releases(a, ids, file_id)
     k = _key(old["title"])
-    hits = [r for r in rel if _key(r.get("title")) == k
-            and not any(str(c.get("name") or "").startswith("Nuarr:") for c in (r.get("customFormats") or []))]
+    dead = bool(x.get("usenet_dead"))
+    hits = [r for r in rel if _key(r.get("title")) == k and not _banned(r)
+            and not any("blocklisted" in str(j).lower() for j in (r.get("rejections") or []))
+            and (r.get("protocol") == "torrent" and (r.get("seeders") or 0) >= 1 or
+                 r.get("protocol") == "usenet" and not dead)]
     hits.sort(key=lambda r: (r.get("protocol") != "usenet", -(r.get("seeders") or 0)))
+    if not hits and dead:
+        # the old release is only on Usenet, and Usenet has lost it - a fuller
+        # copy from the torrents is the next best thing
+        _step(file_id, "the old release's Usenet copies are taken down - looking for a fuller copy on the torrents")
+        r = _fetch(file_id)
+        if r.get("ok"):
+            return {"ok": True, "how": "fuller copy", "release": r["release"]}
+        why = (f"the old release ({old['title']}) is gone - not in the recycle bin, its Usenet copies taken "
+               f"down - and no seeded torrent carries enough of the picture")
+        set_state(file_id, "none", why)
+        return {"ok": False, "why": why}
     if not hits:
         why = (f"the old release ({old['title']}) is not in the recycle bin and no indexer offers it now")
         set_state(file_id, "none", why)
@@ -683,9 +726,17 @@ def reconcile(queues: list, w: dict) -> list:
             why = ("the fuller copy failed to download" if failed else
                    "the fuller copy left the queue without being imported")
             tried = list(x.get("tried") or []) + [x["release"]]
+            # "Aborted, cannot be completed" - articles missing: a takedown, and
+            # every other Usenet post of the title usually went with it
+            dead = x.get("usenet_dead") or any(
+                "cannot be completed" in str((e.get("data") or {}).get("message") or "").lower()
+                for e in h if e.get("eventType") == "downloadFailed")
+            if dead:
+                why += " (Usenet copies taken down - torrents next)"
             # auto gets one more go with the next release; after two lost, a person
             set_state(x["file_id"], "open", f"{why}: {x['release']} - fetch again to try the next one",
-                      tried=tried, auto_tried=x.get("auto_tried") if len(tried) >= 2 else None)
+                      tried=tried, usenet_dead=bool(dead),
+                      auto_tried=x.get("auto_tried") if len(tried) >= 2 else None)
             joblog.log(f"bitrate cut: {why} - {x['release']}", "warn")
             STATS["detail"].append(f"{a.name}: {why} - {x['release'][:60]}; row back to open")
     return out
