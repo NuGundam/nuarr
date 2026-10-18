@@ -7678,6 +7678,15 @@ def _why_idle(workers, depth: int) -> dict:
     return out
 
 
+def _oldest_first(rows: list) -> list:
+    """LONGEST-RUNNING FIRST, NEW ONES BELOW. The Subtitle maker's card was
+    appended after the queue's workers, so every encode or decode that started
+    while a 20-minute subtitle run was going pushed it down the panel - the
+    long item jumped every time something short began. Ordered by how long
+    each has been running, a card keeps its place and newcomers join the end."""
+    return sorted(rows, key=lambda w: -float(w.get("elapsed_s") or 0))
+
+
 def _submake_running() -> list:
     """The Subtitle maker runs outside this queue; it is shown beside it."""
     out = []
@@ -7714,7 +7723,7 @@ def live_snapshot() -> dict:
         depth = cur.execute(
             "SELECT COUNT(*) n FROM jobs WHERE state='queued'").fetchone()["n"]
     return {
-        "running": [w.as_dict() for w in workers] + _submake_running(),
+        "running": _oldest_first([w.as_dict() for w in workers] + _submake_running()),
         "queued": depth,
         "overall": _overall(depth, workers),
         "io": {
@@ -7877,7 +7886,7 @@ def snapshot(recent_limit: int = 60) -> dict:
         w.sample_io()
     _batch_reset_if_idle(depth, len(workers))
     return {
-        "running": [w.as_dict() for w in workers] + _submake_running(),
+        "running": _oldest_first([w.as_dict() for w in workers] + _submake_running()),
         "queued": depth,
         "queue": upcoming,
         "recent": recent_done,

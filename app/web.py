@@ -3255,14 +3255,14 @@ def api_pushover_opts(body: dict = Body(...)):
 
 @app.post("/api/pushover/root")
 def api_pushover_root(body: dict = Body(...)):
-    """Allow or silence notifications for one root folder an arr manages."""
+    """How much one root folder an arr manages may send: off, basic, noart, full."""
     from . import pushover
     path = str(body.get("path") or "")
-    on = bool(body.get("on"))
-    if not path:
+    level = str(body.get("level") or ("full" if body.get("on", True) else "off"))
+    if not path or level not in pushover.LEVELS:
         return {"ok": False}
-    r = pushover.set_root(path, on)
-    joblog.log(f"Pushover: notifications from {path} {'allowed' if on else 'ignored'}", "info")
+    r = pushover.set_root(path, level)
+    joblog.log(f"Pushover: notifications from {path} set to {level}", "info")
     return {"ok": True, "roots": r}
 
 
@@ -47642,11 +47642,14 @@ function poPaint(){
         ${d.link?` Link target: <span class="mono">${esc(d.link)}</span>.`:''}
       </div>
       <div style="margin-top:10px;font-size:11.5px;font-weight:600">From these folders</div>
-      <div class="dim" style="font-size:11px;margin:2px 0 6px">Every root folder Sonarr and Radarr manage. Switch one
-        off and anything imported or upgraded under it sends nothing - Seerr requests are not tied to a folder and
-        are not affected.</div>
+      <div class="dim" style="font-size:11px;margin:2px 0 6px">Every root folder Sonarr and Radarr manage, each with
+        its own level: <b>Off</b> sends nothing; <b>Basic</b> one plain line - &ldquo;The Boys S04E05 downloaded&rdquo;,
+        no detail, no poster; <b>No art</b> the full message without the poster; <b>Full</b> everything, poster
+        included. Seerr requests follow the level of the folder the show or film lives in; a brand-new request,
+        not yet added to an arr, has no folder and is sent in full.</div>
       <div style="display:flex;flex-wrap:wrap;gap:10px 22px">
-        ${(d.roots||[]).length?(d.roots||[]).map((r,i)=>`<label class="gsw" title="${esc(r.arr)}: ${esc(r.path)}"><input type="checkbox" ${r.on?'checked':''} onchange="poRoot(${i},this.checked)"><span class="gname"><span style="color:${r.kind==='radarr'?'#ffc230':'#35c5f4'}">${esc(r.arr)}</span> <span class="mono">${esc(r.path)}</span></span><span class="gstate ${r.on?'on':'off'}">${r.on?'on':'off'}</span></label>`).join(''):'<span class="dim" style="font-size:11px">the arrs did not answer - no folders to list</span>'}
+        ${(d.roots||[]).length?(d.roots||[]).map((r,i)=>`<span style="display:inline-flex;align-items:center;gap:6px;font-size:11.5px" title="${esc(r.arr)}: ${esc(r.path)}"><span style="color:${r.kind==='radarr'?'#ffc230':'#35c5f4'}">${esc(r.arr)}</span> <span class="mono">${esc(r.path)}</span>
+          <select onchange="poRoot(${i},this.value)" style="font-size:11px;${r.level==='off'?'opacity:.6':''}">${[['off','Off'],['basic','Basic'],['noart','No art'],['full','Full']].map(([v,t])=>`<option value="${v}" ${(r.level||'full')===v?'selected':''}>${t}</option>`).join('')}</select></span>`).join(''):'<span class="dim" style="font-size:11px">the arrs did not answer - no folders to list</span>'}
       </div>
     </div>
 
@@ -47779,9 +47782,9 @@ async function poOpt(k,v){
   await fetch('/api/pushover/opts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
   loadPushover(true);
 }
-async function poRoot(i,on){
+async function poRoot(i,level){
   const r=((_po&&_po.roots)||[])[i]; if(!r) return;
-  await fetch('/api/pushover/root',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:r.path,on:!!on})});
+  await fetch('/api/pushover/root',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:r.path,level:String(level)})});
   loadPushover(true);
 }
 async function poSave(btn){

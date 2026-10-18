@@ -83,13 +83,19 @@ def opts() -> dict:
 
 
 # ------------------------------------------------------- root folders -----
-# WHICH OF THE ARRS' FOLDERS MAY TALK. Erik keeps a Sonarr root, "P:\BackUp
-# Data\Files\Video Files", that nuarr already leaves alone (scanner exclusion)
-# - but every import there still went to the phone: "I'm Dating a Dark
-# Summoner S01E03" six times in two hours. Each root folder Sonarr and Radarr
-# manage gets its own switch; a root switched off sends nothing for anything
-# imported under it. Default on - a root nobody has looked at keeps talking.
-KV_ROOTS = "pushover.roots"          # {root path: false}
+# WHICH OF THE ARRS' FOLDERS MAY TALK, AND HOW MUCH. Erik keeps a Sonarr root,
+# "P:\BackUp Data\Files\Video Files", that nuarr already leaves alone - but
+# every import there still went to the phone: "I'm Dating a Dark Summoner
+# S01E03" six times in two hours. Each root folder Sonarr and Radarr manage
+# gets a level of its own:
+#   off    nothing is sent
+#   basic  one plain line - "The Boys S04E05 downloaded" - no detail, no poster
+#   noart  the full message, without the poster
+#   full   the full message with the poster (the default - a root nobody has
+#          looked at keeps talking as it always did)
+# Seerr requests follow the same levels, by the folder the show or film is in.
+KV_ROOTS = "pushover.roots"          # {root path: level}; false (older) = off
+LEVELS = ("off", "basic", "noart", "full")
 _ROOTS: dict = {"at": 0.0, "list": []}
 ROOTS_TTL_S = 600.0
 
@@ -98,16 +104,21 @@ def _norm_path(p: str) -> str:
     return os.path.normcase(os.path.normpath(str(p or "").rstrip("\\/"))) if p else ""
 
 
-def _off_roots() -> set:
+def _levels() -> dict:
+    """{normalised root: level} for every root set away from 'full'."""
     try:
         d = json.loads(kv_get(KV_ROOTS) or "{}")
     except Exception:                                            # noqa: BLE001
         d = {}
-    return {_norm_path(k) for k, v in d.items() if not v}
+    out = {}
+    for k, v in d.items():
+        lv = "off" if v is False else str(v) if str(v) in LEVELS else "full"
+        out[_norm_path(k)] = lv
+    return out
 
 
 def roots(force: bool = False) -> list:
-    """[{arr, kind, path, on}] - every root folder the arrs manage."""
+    """[{arr, kind, path, level, on}] - every root folder the arrs manage."""
     if force or not _ROOTS["list"] or time.time() - _ROOTS["at"] > ROOTS_TTL_S:
         from .arrqueue import _call
         out = []
@@ -120,31 +131,44 @@ def roots(force: bool = False) -> list:
                 continue
         if out:
             _ROOTS.update(at=time.time(), list=out)
-    off = _off_roots()
-    return [{**r, "on": _norm_path(r["path"]) not in off} for r in _ROOTS["list"]]
+    lv = _levels()
+    rows = []
+    for r in _ROOTS["list"]:
+        level = lv.get(_norm_path(r["path"]), "full")
+        rows.append({**r, "level": level, "on": level != "off"})
+    return rows
 
 
-def set_root(path: str, on: bool) -> list:
+def set_root(path: str, level: str) -> list:
+    level = level if level in LEVELS else "full"
     try:
         d = json.loads(kv_get(KV_ROOTS) or "{}")
     except Exception:                                            # noqa: BLE001
         d = {}
     d = {k: v for k, v in d.items() if _norm_path(k) != _norm_path(path)}
-    if not on:
-        d[path] = False
+    if level != "full":
+        d[path] = level
     kv_set(KV_ROOTS, json.dumps(d))
     return roots()
 
 
+def level_for(path: str) -> tuple[str, str]:
+    """(level, root) for a path - the deepest root it sits under; 'full' when
+    it sits under none that was changed."""
+    p = _norm_path(path)
+    best = ("full", "")
+    if not p:
+        return best
+    for r, lv in _levels().items():
+        if (p == r or p.startswith(r + os.sep)) and len(r) > len(best[1]):
+            best = (lv, r)
+    return best
+
+
 def muted_root(path: str) -> str:
     """The switched-off root this path sits under, or ''."""
-    p = _norm_path(path)
-    if not p:
-        return ""
-    for r in _off_roots():
-        if p == r or p.startswith(r + os.sep):
-            return r
-    return ""
+    lv, r = level_for(path)
+    return r if lv == "off" else ""
 
 
 def set_opts(changes: dict) -> dict:
@@ -389,9 +413,9 @@ def build(cfg, body: dict, files: list, detail: str, upgrade: bool) -> dict | No
         return None
     where = (_obj(body.get("series")).get("path") or _obj(body.get("movie")).get("folderPath")
              or next((_obj(f).get("path") for f in files or [] if _obj(f).get("path")), ""))
-    off = muted_root(where)
-    if off:
-        joblog.log(f"Pushover: not sent - {where} is under a root switched off ({off})", "debug")
+    tier, root = level_for(where)
+    if tier == "off":
+        joblog.log(f"Pushover: not sent - {where} is under a root switched off ({root})", "debug")
         return None
     kind = cfg.kind
     label = _media_label(body, kind)
@@ -462,7 +486,7 @@ def build(cfg, body: dict, files: list, detail: str, upgrade: bool) -> dict | No
             "mid": _obj(body.get("series") if kind == "sonarr" else body.get("movie")).get("id"),
             "spec": spec, "upgrade": upgrade, "lines": lines, "eng": eng,
             "ep": label[len(series):].strip() if label.startswith(series) else label,
-            "at": time.time()}
+            "tier": tier, "at": time.time()}
 
 
 def queue(item: dict | None) -> None:
@@ -529,9 +553,40 @@ async def _item_poster(it: dict) -> bytes | None:
     return await _poster(url)
 
 
+async def _send_basic(items: list) -> None:
+    """The 'basic' level: one plain line, no detail, no poster."""
+    arr = items[0]["arr"]
+    ups = sum(1 for x in items if x["upgrade"])
+    verb = "upgraded" if ups == len(items) else "downloaded"
+    if len(items) == 1 or not opts().get("digest", True):
+        for it in items:
+            line = f"{it['label']} {'upgraded' if it['upgrade'] else 'downloaded'}"
+            ok, err = await send(f"{arr} · {line}", _esc(line))
+            _remember({"at": time.time(), "arr": arr, "title": it["label"], "detail": "basic",
+                       "eng": 0, "ok": ok, "error": err, "kind": "upgraded" if it["upgrade"] else "imported",
+                       "files": 1, "ptitle": f"{arr} · {line}", "msg": _esc(line)})
+        return
+    items.sort(key=lambda x: x["ep"])
+    series = items[0]["series"]
+    eps = ", ".join(x["ep"] for x in items if x["ep"])
+    line = f"{series} - {len(items)} episodes {verb}" + (f": {eps}" if eps else "")
+    line = line[:MSG_LIMIT]
+    ok, err = await send(f"{arr} · {series} · {len(items)} {verb}", _esc(line))
+    _remember({"at": time.time(), "arr": arr, "title": f"{series} ({len(items)} files)", "detail": "basic",
+               "eng": 0, "ok": ok, "error": err, "kind": "upgraded" if ups == len(items) else "imported",
+               "files": len(items), "ptitle": f"{arr} · {series} · {len(items)} {verb}", "msg": _esc(line)})
+
+
 async def _send_group(items: list) -> None:
     arr = items[0]["arr"]
-    img = await _item_poster(items[0])
+    tier = items[0].get("tier") or "full"
+    if tier == "basic":
+        return await _send_basic(items)
+    art = tier == "full"
+
+    async def poster(it):
+        return await _item_poster(it) if art else None
+    img = await poster(items[0])
     if len(items) == 1 or not opts().get("digest", True):
         for it in items:
             title = (f"{arr} · {'upgraded' if it['upgrade'] else 'imported'} · {it['label']}"
@@ -539,7 +594,7 @@ async def _send_group(items: list) -> None:
             msg = (_arr_tag(arr, it.get("kind", "")) + " · <b>" + _esc(it["label"]) + "</b>\n"
                    + "\n".join(it["lines"]))
             ok, err = await send(title, msg, url=_link(),
-                                 attachment=img if it is items[0] else await _item_poster(it))
+                                 attachment=img if it is items[0] else await poster(it))
             _remember({"at": time.time(), "arr": arr, "title": it["label"],
                        "detail": _plain(it["spec"] or (it["lines"][0] if it["lines"] else "")),
                        "eng": int(bool(it.get("eng"))), "ok": ok, "error": err,
@@ -661,6 +716,29 @@ async def _poster(url: str) -> bytes | None:
     return None
 
 
+def _seerr_folder(med: dict) -> str:
+    """The folder the requested show or film lives in, from the arr that has it
+    (by TVDB/TMDB id) - '' when no arr has added it yet."""
+    from .arrqueue import _call
+    mt = str(med.get("media_type") or "")
+    tvdb, tmdb = med.get("tvdbId") or med.get("tvdb_id"), med.get("tmdbId") or med.get("tmdb_id")
+    for a in [a for a in SETTINGS.arrs if a.enabled and a.kind in ("sonarr", "radarr")]:
+        try:
+            if a.kind == "sonarr" and mt == "tv" and tvdb:
+                rows = _call(a, f"/api/v3/series?tvdbId={int(tvdb)}", timeout=15) or []
+            elif a.kind == "radarr" and mt == "movie" and tmdb:
+                rows = _call(a, f"/api/v3/movie?tmdbId={int(tmdb)}", timeout=15) or []
+            else:
+                continue
+            rows = rows if isinstance(rows, list) else [rows]
+            for r in rows:
+                if r.get("path"):
+                    return r["path"]
+        except Exception:                                        # noqa: BLE001
+            continue
+    return ""
+
+
 async def seerr(body: dict) -> str:
     """One Seerr webhook -> one message. Returns what happened, for the log."""
     nt = str(body.get("notification_type") or "")
@@ -671,6 +749,23 @@ async def seerr(body: dict) -> str:
     verb, col = SEERR_KIND.get(nt, (nt.lower().replace("_", " ") or "event", "#9b7bf7"))
     subject = str(body.get("subject") or "").strip() or "Seerr"
     req, iss, com, med = (_obj(body.get(k)) for k in ("request", "issue", "comment", "media"))
+    # THE SAME FOLDER LEVELS AS THE IMPORTS. A request for something an arr
+    # already has (an extra season, a re-request, an issue) follows the level
+    # of the folder it lives in; a brand-new request - not added to an arr yet,
+    # so in no folder - is sent in full, as before.
+    folder = await asyncio.to_thread(_seerr_folder, med) if med else ""
+    tier, root = level_for(folder) if folder else ("full", "")
+    if tier == "off":
+        joblog.log(f"Pushover: Seerr {nt} for {subject} not sent - {folder} is under a root switched off", "debug")
+        return f"{verb}: {subject} (folder switched off)"
+    who0 = (req.get("requestedBy_username") or _obj(body.get("issue")).get("reportedBy_username") or "")
+    if tier == "basic":
+        line = f"{subject} - {verb}" + (f" by {who0}" if who0 else "")
+        ok, err = await send(f"Seerr · {verb} · {subject}", _esc(line))
+        _remember({"at": time.time(), "arr": "Seerr", "title": subject, "detail": f"{verb} (basic)",
+                   "ok": ok, "error": err, "kind": "seerr", "files": "", "ptitle": f"Seerr · {verb} · {subject}",
+                   "msg": _esc(line)})
+        return f"{verb}: {subject}" + ("" if ok else f" (send failed: {err})")
     who = (req.get("requestedBy_username") or iss.get("reportedBy_username")
            or com.get("commentedBy_username") or "")
     lines = [f'<b><font color="{col}">{_esc(verb[:1].upper() + verb[1:])}</font></b>'
@@ -691,7 +786,7 @@ async def seerr(body: dict) -> str:
         lines.append('<font color="#8b949e">' + _esc(text[:360] + ("…" if len(text) > 360 else "")) + "</font>")
     msg = _arr_tag("Seerr", "seerr") + " · <b>" + _esc(subject) + "</b>\n" + "\n".join(lines)
     title = f"Seerr · {verb} · {subject}"
-    img = await _poster(str(body.get("image") or ""))
+    img = await _poster(str(body.get("image") or "")) if tier == "full" else None
     ok, err = await send(title, msg, url=_link(), attachment=img)
     _remember({"at": time.time(), "arr": "Seerr", "title": subject,
                "detail": verb + (f" by {who}" if who else ""), "ok": ok, "error": err,
