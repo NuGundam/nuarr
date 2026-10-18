@@ -54,6 +54,10 @@ CF_TERMS = "Nuarr: banned terms"
 # guides' own Banned Groups formats use, for the same reason.
 SCORE = -999999
 GROUP_STRIKES = 3           # rejections from one group before the group is banned
+# rejection reasons that describe the copy that arrived, not the group's work -
+# these ban the release and give the group no strike (see note_rejection)
+DOWNLOAD_FAULTS = ("decoded nothing", "interrupted download", "truncated", "no video stream",
+                   "could not be read", "corrupt", "incomplete", "zero bytes", "unreadable")
 PER_FORMAT = 250            # release patterns per format before rolling over
 SYNC_DEBOUNCE_S = 45.0      # nuarr's own rejections: batch them
 SYNC_HAND_S = 2.0           # a change made on the card: push it now
@@ -412,6 +416,15 @@ def note_rejection(release: str, why: str = "", source: str = "",
     if not grp or len(grp) < 2:
         return out
     out["group"] = grp
+    # A BROKEN DOWNLOAD IS NOT THE GROUP'S DOING. Kitsune was banned on three
+    # strikes - two interrupted downloads and a post with no video in it -
+    # and a group ban scores every file the group ALREADY HOLDS at -999,999:
+    # 906 Kitsune files, 699 of them dual audio, that any Japanese-only rip
+    # then "upgraded" (Black Clover, 36 episodes, 2026-10-17). A fault in the
+    # copy that arrived bans that release only; the strike is for what the
+    # group makes - wrong language, raws, hardsubs, fakes.
+    if any(w in (why or "").lower() for w in DOWNLOAD_FAULTS):
+        return out
     now = time.time()
     with cursor() as cur:
         cur.execute(

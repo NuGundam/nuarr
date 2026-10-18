@@ -211,7 +211,8 @@ def _verdict(a, row: dict) -> str:
 # episode) the arr has, and the arr itself offers the file for it. Anything
 # else stays for a person. Each download is tried once.
 UNREAD_SAYS = ("unable to parse", "unknown series", "unknown movie", "not parsed",
-               "could not be parsed", "manual import required", "unknown episode")
+               "could not be parsed", "manual import required", "unknown episode",
+               "automatic import is not possible")      # Sonarr's wording of "matched by id"
 KV_PARSED = "arrqueue.parsed"
 
 
@@ -340,6 +341,35 @@ def _video_cands(a, row: dict) -> list:
             if os.path.splitext(c.get("path") or "")[1].lower() in (".mkv", ".mp4", ".avi", ".m4v", ".ts")]
 
 
+def _parse_agrees(a, row: dict) -> str:
+    """'' when the arr's own parser ties this release name to the row's
+    series + episode (or movie); otherwise why not. For a film the parser
+    cannot place at all (Fate/stay night: 'Unknown Movie'), the year in the
+    name has to be the film's - that is as far as trust goes."""
+    name = row.get("title") or ""
+    p = _call(a, "/api/v3/parse?" + urllib.parse.urlencode({"title": name})) or {}
+    if a.kind == "sonarr":
+        sid = (p.get("series") or {}).get("id")
+        eps = {e.get("id") for e in p.get("episodes") or []}
+        if sid == row.get("seriesId") and row.get("episodeId") in eps:
+            return ""
+        if sid is None:
+            return "the arr's parser finds no series in this name"
+        if sid != row.get("seriesId"):
+            return f"the arr's parser reads it as another series ({(p.get('series') or {}).get('title')})"
+        return "the arr's parser reads it as a different episode"
+    mid = (p.get("movie") or {}).get("id")
+    if mid == row.get("movieId"):
+        return ""
+    if mid is not None:
+        return f"the arr's parser reads it as another film ({(p.get('movie') or {}).get('title')})"
+    m = _call(a, f"/api/v3/movie/{row['movieId']}") or {}
+    yr = str(m.get("year") or "")
+    if yr and yr in name:
+        return ""
+    return f"the arr's parser finds no film in this name and it does not carry the year ({yr})"
+
+
 def _import_known(items: list) -> list:
     """"Found matching movie via grab history, but release was matched to
     movie by ID. Manual Import required." The arr KNOWS which movie (or
@@ -347,6 +377,7 @@ def _import_known(items: list) -> list:
     on its own. Fate/stay night HF-I sat completed for a day with that.
     Imported here with the row's own ids: one video in the download only."""
     rows = []
+    gone: set = set()
     for a, row in items:
         low = " | ".join(m for s in (row.get("statusMessages") or [])
                          for m in list(s.get("messages") or [])).lower()
@@ -357,6 +388,37 @@ def _import_known(items: list) -> list:
               if a.kind == "sonarr" and row.get("seriesId") and row.get("episodeId") else None
         name = row.get("title") or ""
         if not ids:
+            continue
+        did = str(row.get("downloadId") or "").upper()
+        if did and did in gone:
+            row["_nuarr_imported"] = True            # its pack went with an earlier row
+            continue
+        # THE ID CAN BE WRONG. An episode search for Detective Conan brought
+        # back its movies, and a 2025 special series "Detective Conan vs The
+        # Black Organization", each tied by the indexer to S01E03, S01E05...
+        # Sonarr's own parser finds NO series in those names - which is why
+        # it would not import them. Imported by the row's id they would have
+        # become S01E03. So the arr's parser has to agree with the row; when
+        # it does not, the grab was a mis-match: removed and blocklisted, or
+        # the next search grabs it again.
+        try:
+            verdict = _parse_agrees(a, row)
+        except Exception as e:                                   # noqa: BLE001
+            STATS["detail"].append(f"{a.name}: could not parse {name[:60]}: {type(e).__name__}")
+            continue
+        if verdict:
+            try:
+                _remove(a, row, blocklist=True)
+            except urllib.error.HTTPError as he:
+                if he.code != 404:
+                    raise
+            if did:
+                gone.add(did)
+            row["_nuarr_imported"] = True
+            rows.append({"at": time.time(), "arr": a.name, "title": name, "client": row.get("downloadClient") or "",
+                         "why": f"a mis-matched grab: {verdict} - removed and blocklisted so it is not grabbed again",
+                         "kind": "misgrab"})
+            STATS["detail"].append(f"{a.name}: removed mis-matched grab {name[:60]} - {verdict}")
             continue
         try:
             cands = _video_cands(a, row)
