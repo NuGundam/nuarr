@@ -70,7 +70,22 @@ OCR_FPS = 2
 UTT_GAP_S = 0.6
 UTT_MAX_S = 12.0
 HALLU = re.compile(r"thank(s| you) for (watching|your view)|translated by|subtitles? by|"
-                   r"please subscribe|amara\.org|like and subscribe", re.I)
+                   r"please subscribe|amara\.org|like and subscribe|subscribe to (the|my|our) channel|"
+                   # what Whisper invents over Spanish silence - heard as "¡Suscríbete al
+                   # canal!" in a hole of The Velvet Collection's finale
+                   r"suscr[ií]bete|gracias por ver|subt[ií]tulos (realizados )?por|"
+                   # ...and in English when it translates them
+                   r"see you (in the|on the) next (video|episode)|don'?t forget to (like|subscribe)|"
+                   r"hit the bell", re.I)
+# THE SPEECH THE DETECTOR MISSED. Silero VAD at 0.5 marked 35.6 minutes of
+# The Velvet Collection's 82-minute finale as speech, and almost all of that got
+# a line - but 10 of the 25 longest stretches WITHOUT a line held dialogue it
+# never marked ("No va a pasar nada, ¿me oyes? ... Todo va a salir bien,
+# confía"): quiet, overlapped or under the score. After the first pass every
+# hole of HOLE_MIN_S or more is listened to again, by Whisper itself with a
+# much looser detector, and what it hears there is kept only when it is sure.
+HOLE_MIN_S = 3.0
+HOLE_WIN_S = 30.0
 # ANY LANGUAGE, NOT A LIST OF THIRTEEN. The table this replaced named the
 # languages it knew, cut every other code to its first two letters - Swedish
 # "swe" became Swahili "sw", Indonesian "ind" became "in" - and gave nothing
@@ -233,21 +248,59 @@ def speech(src, wlang, model_dir, ffmpeg):
     except Exception:                                            # noqa: BLE001
         m = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8", download_root=model_dir)
     task = "transcribe" if wlang == "en" else "translate"
+
+    def good(x, strict=False):
+        t = x.text.strip()
+        if len(t) < 2 or HALLU.search(t):
+            return False
+        if strict:
+            return (x.no_speech_prob < 0.6 and x.avg_logprob > -1.0
+                    and getattr(x, "compression_ratio", 1) < 2.4 and len(t) > 3)
+        return x.no_speech_prob <= 0.85 and x.avg_logprob >= -1.3 and getattr(x, "compression_ratio", 1) < 2.6
+
     out = []
     for i, (s, e) in enumerate(utt):
         a, b = int(max(0, s - 0.15) * 16000), int((e + 0.15) * 16000)
         segs, _ = m.transcribe(audio[a:b], language=wlang, task=task, beam_size=5,
                                condition_on_previous_text=False, vad_filter=False)
-        segs = list(segs)
-        text = " ".join(x.text.strip() for x in segs).strip()
-        if (not text or HALLU.search(text)
-                or max((x.no_speech_prob for x in segs), default=1) > 0.85
-                or min((x.avg_logprob for x in segs), default=-9) < -1.3):
-            continue
-        out.append([s, e, text])
+        # EACH SEGMENT ON ITS OWN. One mumbled clause used to throw away the
+        # whole stretch - up to UTT_MAX_S of dialogue - with it.
+        text = " ".join(x.text.strip() for x in segs if good(x)).strip()
+        if text:
+            out.append([s, e, text])
         if i % 10 == 0:
-            say(stage="listening", pct=8 + 37 * (i + 1) / max(1, len(utt)),
+            say(stage="listening", pct=8 + 30 * (i + 1) / max(1, len(utt)),
                 note=f"{i + 1} of {len(utt)} stretches")
+    # THE HOLES, AGAIN - see HOLE_MIN_S.
+    dur = len(audio) / 16000
+    spans = sorted((s, e) for s, e, _t in out)
+    holes, last = [], 0.0
+    for s, e in spans:
+        if s - last >= HOLE_MIN_S:
+            holes.append((last, s))
+        last = max(last, e)
+    if dur - last >= HOLE_MIN_S:
+        holes.append((last, dur))
+    wins = [(w, min(w + HOLE_WIN_S, he)) for hs, he in holes
+            for w in [hs + k * HOLE_WIN_S for k in range(int((he - hs) // HOLE_WIN_S) + 1)] if min(w + HOLE_WIN_S, he) - w >= 1.0]
+    found = 0
+    for j, (ws, we) in enumerate(wins):
+        segs, _ = m.transcribe(audio[int(ws * 16000):int(we * 16000)], language=wlang, task=task, beam_size=5,
+                               condition_on_previous_text=False, vad_filter=True,
+                               vad_parameters=dict(threshold=0.2, min_silence_duration_ms=300, speech_pad_ms=120))
+        prev = ""
+        for x in segs:
+            t = x.text.strip()
+            if not good(x, strict=True) or sim(t, prev) > 0.85:
+                continue
+            out.append([ws + x.start, min(we, ws + x.end), t])
+            prev = t
+            found += 1
+        if j % 10 == 0:
+            say(stage="listening again in the gaps", pct=38 + 7 * (j + 1) / max(1, len(wins)),
+                note=f"{j + 1} of {len(wins)} windows, {found} lines found")
+    out.sort(key=lambda x: x[0])
+    say(stage="listening done", pct=45, note=f"{len(out)} lines, {found} of them from the gaps")
     del m
     gc.collect()
     return out
