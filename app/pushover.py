@@ -82,6 +82,71 @@ def opts() -> dict:
     return o
 
 
+# ------------------------------------------------------- root folders -----
+# WHICH OF THE ARRS' FOLDERS MAY TALK. Erik keeps a Sonarr root, "P:\BackUp
+# Data\Files\Video Files", that nuarr already leaves alone (scanner exclusion)
+# - but every import there still went to the phone: "I'm Dating a Dark
+# Summoner S01E03" six times in two hours. Each root folder Sonarr and Radarr
+# manage gets its own switch; a root switched off sends nothing for anything
+# imported under it. Default on - a root nobody has looked at keeps talking.
+KV_ROOTS = "pushover.roots"          # {root path: false}
+_ROOTS: dict = {"at": 0.0, "list": []}
+ROOTS_TTL_S = 600.0
+
+
+def _norm_path(p: str) -> str:
+    return os.path.normcase(os.path.normpath(str(p or "").rstrip("\\/"))) if p else ""
+
+
+def _off_roots() -> set:
+    try:
+        d = json.loads(kv_get(KV_ROOTS) or "{}")
+    except Exception:                                            # noqa: BLE001
+        d = {}
+    return {_norm_path(k) for k, v in d.items() if not v}
+
+
+def roots(force: bool = False) -> list:
+    """[{arr, kind, path, on}] - every root folder the arrs manage."""
+    if force or not _ROOTS["list"] or time.time() - _ROOTS["at"] > ROOTS_TTL_S:
+        from .arrqueue import _call
+        out = []
+        for a in [a for a in SETTINGS.arrs if a.enabled and a.kind in ("sonarr", "radarr")]:
+            try:
+                for r in _call(a, "/api/v3/rootfolder", timeout=20) or []:
+                    if r.get("path"):
+                        out.append({"arr": a.name, "kind": a.kind, "path": r["path"]})
+            except Exception:                                    # noqa: BLE001
+                continue
+        if out:
+            _ROOTS.update(at=time.time(), list=out)
+    off = _off_roots()
+    return [{**r, "on": _norm_path(r["path"]) not in off} for r in _ROOTS["list"]]
+
+
+def set_root(path: str, on: bool) -> list:
+    try:
+        d = json.loads(kv_get(KV_ROOTS) or "{}")
+    except Exception:                                            # noqa: BLE001
+        d = {}
+    d = {k: v for k, v in d.items() if _norm_path(k) != _norm_path(path)}
+    if not on:
+        d[path] = False
+    kv_set(KV_ROOTS, json.dumps(d))
+    return roots()
+
+
+def muted_root(path: str) -> str:
+    """The switched-off root this path sits under, or ''."""
+    p = _norm_path(path)
+    if not p:
+        return ""
+    for r in _off_roots():
+        if p == r or p.startswith(r + os.sep):
+            return r
+    return ""
+
+
 def set_opts(changes: dict) -> dict:
     o = opts()
     for k in DEFAULT_OPTS:
@@ -321,6 +386,12 @@ def build(cfg, body: dict, files: list, detail: str, upgrade: bool) -> dict | No
     if upgrade and not o.get("upgrades", True):
         return None
     if not upgrade and not o.get("imports", True):
+        return None
+    where = (_obj(body.get("series")).get("path") or _obj(body.get("movie")).get("folderPath")
+             or next((_obj(f).get("path") for f in files or [] if _obj(f).get("path")), ""))
+    off = muted_root(where)
+    if off:
+        joblog.log(f"Pushover: not sent - {where} is under a root switched off ({off})", "debug")
         return None
     kind = cfg.kind
     label = _media_label(body, kind)
@@ -635,4 +706,4 @@ def snapshot() -> dict:
             "user_set": bool(SETTINGS.pushover_user), "enabled": enabled(),
             "on": str(kv_get(KV_ON) or "0") == "1", "opts": opts(),
             "stats": dict(STATS), "recent": _recent(), "quiet_s": QUIET_S,
-            "link": _link()}
+            "link": _link(), "roots": roots()}

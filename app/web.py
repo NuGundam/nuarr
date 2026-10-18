@@ -3253,6 +3253,19 @@ def api_pushover_opts(body: dict = Body(...)):
     return {"opts": pushover.set_opts(body or {})}
 
 
+@app.post("/api/pushover/root")
+def api_pushover_root(body: dict = Body(...)):
+    """Allow or silence notifications for one root folder an arr manages."""
+    from . import pushover
+    path = str(body.get("path") or "")
+    on = bool(body.get("on"))
+    if not path:
+        return {"ok": False}
+    r = pushover.set_root(path, on)
+    joblog.log(f"Pushover: notifications from {path} {'allowed' if on else 'ignored'}", "info")
+    return {"ok": True, "roots": r}
+
+
 @app.post("/api/pushover/forget")
 def api_pushover_forget(body: dict = Body(...)):
     """Take messages off the list (ids from the page). The phone is untouched."""
@@ -47628,6 +47641,13 @@ function poPaint(){
         beside the new one. Every message arrives with the Nuarr icon.
         ${d.link?` Link target: <span class="mono">${esc(d.link)}</span>.`:''}
       </div>
+      <div style="margin-top:10px;font-size:11.5px;font-weight:600">From these folders</div>
+      <div class="dim" style="font-size:11px;margin:2px 0 6px">Every root folder Sonarr and Radarr manage. Switch one
+        off and anything imported or upgraded under it sends nothing - Seerr requests are not tied to a folder and
+        are not affected.</div>
+      <div style="display:flex;flex-wrap:wrap;gap:10px 22px">
+        ${(d.roots||[]).length?(d.roots||[]).map((r,i)=>`<label class="gsw" title="${esc(r.arr)}: ${esc(r.path)}"><input type="checkbox" ${r.on?'checked':''} onchange="poRoot(${i},this.checked)"><span class="gname"><span style="color:${r.kind==='radarr'?'#ffc230':'#35c5f4'}">${esc(r.arr)}</span> <span class="mono">${esc(r.path)}</span></span><span class="gstate ${r.on?'on':'off'}">${r.on?'on':'off'}</span></label>`).join(''):'<span class="dim" style="font-size:11px">the arrs did not answer - no folders to list</span>'}
+      </div>
     </div>
 
     <div class="lkind" style="padding:11px 12px">
@@ -47757,6 +47777,11 @@ async function poEnable(on){
 async function poOpt(k,v){
   const body={}; body[k]=(k==='priority')?parseInt(v,10):!!v;
   await fetch('/api/pushover/opts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  loadPushover(true);
+}
+async function poRoot(i,on){
+  const r=((_po&&_po.roots)||[])[i]; if(!r) return;
+  await fetch('/api/pushover/root',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:r.path,on:!!on})});
   loadPushover(true);
 }
 async function poSave(btn){
