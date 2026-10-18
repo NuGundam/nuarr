@@ -274,6 +274,11 @@ def _banned(r: dict, strict: bool = False) -> bool:
     names = [str(c.get("name") or "") for c in (r.get("customFormats") or [])]
     if any(n in (CF_GROUPS, CF_RELEASES, CF_TERMS) for n in names):
         return True
+    # since 2026-10-17 the bans are the "Nuarr bans" release profile: the arr
+    # rejects a banned release for a must-not-contain term instead of scoring it
+    if any(w in str(j).lower() for j in (r.get("rejections") or [])
+           for w in ("restricted", "not allowed", "ignored term", "contains one or more")):
+        return True
     if strict:
         if any(w in n.lower() for n in names for w in ("banned", " lq", "raws", "bad dual", "unwanted")):
             return True

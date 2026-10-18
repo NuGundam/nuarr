@@ -1,4 +1,8 @@
-r"""Releases nuarr has rejected, pushed back to the arrs as a custom format.
+r"""Releases nuarr has rejected, pushed back to the arrs as a release profile.
+
+(Until 2026-10-17 as custom formats scored -999,999 - see RP_NAME for why
+that scored the library's own files too, and why it changed. The history
+below is kept as written.)
 
 WHY A BLOCKLIST ENTRY IS NOT ENOUGH. Erik: "the blocklist only blocks that
 one entry from that indexer and many indexers carry the same file". True.
@@ -59,6 +63,17 @@ GROUP_STRIKES = 3           # rejections from one group before the group is bann
 DOWNLOAD_FAULTS = ("decoded nothing", "interrupted download", "truncated", "no video stream",
                    "could not be read", "corrupt", "incomplete", "zero bytes", "unreadable")
 PER_FORMAT = 250            # release patterns per format before rolling over
+# WHERE THE BANS LIVE: A RELEASE PROFILE, NOT A CUSTOM FORMAT (2026-10-17).
+# A format scored -999,999 is judged against the files ALREADY IN THE LIBRARY
+# too, and a file it matches loses to anything: 454 files with English audio
+# (playWEB, ZR, HHWEB, ShiNiGAMi...) were scored worthless, and Vinland Saga,
+# Food Wars, Teach You a Lesson and Black Clover lost their English tracks to
+# Japanese-only "upgrades". A release profile's must-not-contain list is
+# checked only against releases offered for GRABBING - every indexer, before
+# the grab, which is all a ban was ever for - and never against a file on
+# disk. The three old formats are deleted from the arrs on the first push.
+RP_NAME = "Nuarr bans"
+PER_PROFILE = 400           # entries per release profile before rolling over
 SYNC_DEBOUNCE_S = 45.0      # nuarr's own rejections: batch them
 SYNC_HAND_S = 2.0           # a change made on the card: push it now
 
@@ -200,6 +215,27 @@ def radarr_release_pattern(title: str) -> str | None:
 def group_pattern(group: str) -> str:
     g = str(group or "").strip()
     return "^" + "".join(_esc(c) for c in g) + "$"
+
+
+def rp_group_pattern(group: str) -> str:
+    """A group as a release profile sees it - in the WHOLE name, so the group
+    has to be where groups go: "[Group] Show - 01" at the front, or "...-Group"
+    at the end (an indexer's "[rarbg]" or a container extension after it
+    allowed). Never mid-name, where "ZR" or "ELiTE" would hit a title."""
+    g = "".join(_esc(c) for c in str(group or "").strip())
+    return (r"(?:^\[" + g + r"\]|[-._ ]" + g
+            + r"(?:\[[^\]]*\])?(?:\.(?:mkv|mp4|avi|m4v|ts))?\s*$)")
+
+
+def rp_entry(r: dict) -> str:
+    """One ban as a release-profile 'must not contain' entry (a /regex/i)."""
+    if r["kind"] == "release":
+        pat = release_pattern(r["value"])
+    elif r["kind"] == "group":
+        pat = rp_group_pattern(r["value"])
+    else:
+        pat = term_pattern(r["value"])
+    return "/" + pat + "/i"
 
 
 def term_pattern(term: str) -> str:
@@ -613,151 +649,70 @@ async def _sync_one(cfg, live: list, names: dict) -> str:
     trm = [r for r in mine if r["kind"] == "term"]
     c = shared_client(cfg)
     try:
-        st.update(step="reading formats")
-        have = {f["name"]: f for f in await c._get("/customformat")}
+        # THE LIST, AS MUST-NOT-CONTAIN ENTRIES. Releases are matched by their
+        # full name here in both apps - a release profile sees the real title,
+        # not Radarr's "A Movie" (see radarr_release_pattern, which only a
+        # custom format needed).
+        entries = sorted({rp_entry(r) for r in mine})
+        st.update(step="reading release profiles")
+        rps = await c._get("/releaseprofile") or []
+        ours = {p.get("name"): p for p in rps if str(p.get("name") or "").startswith(RP_NAME)}
         wanted: dict = {}
-        for i, chunk in enumerate(_chunks(rel, PER_FORMAT)):
-            nm = CF_RELEASES if i == 0 else f"{CF_RELEASES} {i + 1}"
-            # Radarr sees "A Movie" where the title was - see
-            # radarr_release_pattern. A name with no year cannot be written
-            # that way and keeps its full-name pattern (which Radarr ignores).
-            specs = [{"name": r["value"][:80],
-                      "implementation": "ReleaseTitleSpecification",
-                      "negate": False, "required": False,
-                      "fields": [{"name": "value", "value":
-                                  ((radarr_release_pattern(r["value"]) or r["pattern"])
-                                   if cfg.kind == "radarr" else r["pattern"])}]}
-                     for r in chunk] or [{
-                "name": "nothing rejected yet",
-                "implementation": "ReleaseTitleSpecification",
-                "negate": False, "required": True,
-                "fields": [{"name": "value", "value": r"^\b$"}]}]
-            wanted[nm] = specs
-        wanted[CF_TERMS] = [{
-            "name": r["value"][:80],
-            "implementation": "ReleaseTitleSpecification",
-            "negate": False, "required": False,
-            "fields": [{"name": "value", "value": r["pattern"]}]}
-            for r in trm] or [{
-            "name": "no term banned yet",
-            "implementation": "ReleaseTitleSpecification",
-            "negate": False, "required": True,
-            "fields": [{"name": "value", "value": r"^\b$"}]}]
-        wanted[CF_GROUPS] = [{
-            "name": r["value"][:80],
-            "implementation": "ReleaseGroupSpecification",
-            "negate": False, "required": False,
-            "fields": [{"name": "value", "value": r["pattern"]}]}
-            for r in grp] or [{
-            "name": "no group banned yet",
-            "implementation": "ReleaseGroupSpecification",
-            "negate": False, "required": True,
-            "fields": [{"name": "value", "value": r"^\b$"}]}]
-        st.update(step="formats", done=0, total=len(wanted))
-        ids: dict = {}
-        for nm, specs in wanted.items():
-            # A FORMAT THAT ALREADY SAYS THIS IS LEFT ALONE. Every push used to
-            # rewrite all of them; removing one term changes one format.
-            if nm in have and _spec_key(have[nm].get("specifications")) \
-                    == _spec_key(specs):
-                ids[nm] = int(have[nm]["id"])
+        for i, chunk in enumerate(_chunks(entries, PER_PROFILE)):
+            if chunk:
+                wanted[RP_NAME if i == 0 else f"{RP_NAME} {i + 1}"] = chunk
+        st.update(step="release profiles", done=0, total=len(wanted))
+        for nm, terms in wanted.items():
+            have = ours.get(nm)
+            if have and sorted(have.get("ignored") or []) == terms and have.get("enabled", True) \
+                    and not have.get("required") and not have.get("tags") and not have.get("indexerId"):
                 st["same"] += 1
                 st["done"] += 1
                 continue
-            body = {"name": nm, "includeCustomFormatWhenRenaming": False,
-                    "specifications": specs}
-            # ONE FORMAT FAILING MUST NOT COST THE SCORING. The first live
-            # sync got a 500 from Sonarr on a create that had in fact
-            # succeeded, and the exception skipped the profile step, so
-            # the format existed and did nothing. Re-read after a failure
-            # - it may be there - and carry on with what is.
-            try:
-                if nm in have:
-                    body["id"] = have[nm]["id"]
-                    r = await c._put(f"/customformat/{have[nm]['id']}", body)
-                else:
-                    r = await c._post("/customformat", body)
-                ids[nm] = int(r["id"])
-                st["changed"] += 1
-            except Exception as e:                               # noqa: BLE001
-                again = {f["name"]: f for f in await c._get("/customformat")}
-                if nm in again:
-                    ids[nm] = int(again[nm]["id"])
-                    have[nm] = again[nm]
-                else:
-                    st["note"] = f"{nm}: {type(e).__name__}: {e}"[:200]
+            body = {"name": nm, "enabled": True, "required": [], "ignored": terms,
+                    "indexerId": 0, "tags": []}
+            if cfg.kind == "sonarr":
+                body["excludedTags"] = []
+            if have:
+                body["id"] = have["id"]
+                await c._put(f"/releaseprofile/{have['id']}", body)
+            else:
+                await c._post("/releaseprofile", body)
+            st["changed"] += 1
             st["done"] += 1
-        # formats of ours that are no longer needed (a list that shrank)
-        for nm, f in have.items():
-            if (nm.startswith(CF_RELEASES) or nm in (CF_GROUPS, CF_TERMS)) \
-                    and nm not in wanted:
+        # profiles of ours no longer needed (a list that shrank, or emptied -
+        # a release profile with nothing in it is not valid, so it goes)
+        for nm, p in ours.items():
+            if nm not in wanted:
+                await c._delete(f"/releaseprofile/{p['id']}")
+                st["changed"] += 1
+        # THE OLD FORMATS GO. While "Nuarr: rejected groups/releases/banned
+        # terms" exist they keep scoring the library's files at -999,999. The
+        # arr drops a deleted format from every quality profile itself.
+        st.update(step="removing the old ban formats")
+        gone = 0
+        for f in await c._get("/customformat") or []:
+            nm = f.get("name") or ""
+            if nm.startswith(CF_RELEASES) or nm in (CF_GROUPS, CF_TERMS):
                 await c._delete(f"/customformat/{f['id']}")
+                gone += 1
                 st["changed"] += 1
-        # and the score, on every profile named - EACH ONE ON ITS OWN.
-        # A profile the arr refuses to save must not cost the others:
-        # Radarr would not accept its own "HD-All" and "Animation"
-        # profiles at all ("Minimum Custom Format Score can never be
-        # satisfied" - both ask for 1 point and have nothing positive to
-        # score), and that one 400 aborted the whole app's pass, so
-        # nothing in Radarr was scored.
-        profs = [pr for pr in await c._get("/qualityprofile")
-                 if _want_profile(pr.get("name") or "", names.get(cfg.kind) or [])]
-        st.update(step="profiles", done=0, total=len(profs))
-        scored, refused = [], []
-        for pr in profs:
-            try:
-                # The list endpoint already carries formatItems, so there is
-                # no second read per profile.
-                full = pr
-                items = full.get("formatItems") or []
-                seen = {it.get("format") for it in items}
-                changed = False
-                for it in items:
-                    if it.get("format") in ids.values() \
-                            and it.get("score") != SCORE:
-                        it["score"] = SCORE
-                        changed = True
-                for nm, fid in ids.items():
-                    if fid not in seen:
-                        items.append({"format": fid, "name": nm,
-                                      "score": SCORE})
-                        changed = True
-                if changed:
-                    full["formatItems"] = items
-                    await c._put(f"/qualityprofile/{pr['id']}", full)
-                    st["changed"] += 1
-                scored.append(pr["name"])
-            except Exception as e:                               # noqa: BLE001
-                # THE REASON IS IN THE BODY, NOT THE MESSAGE. httpx's
-                # text is "400 Bad Request for url ..."; the arr's own
-                # sentence is in the response, and that is the one a
-                # person can act on.
-                why = str(e)
-                try:
-                    body = e.response.text                       # type: ignore[attr-defined]
-                    if "never be satisfied" in body:
-                        why = ("minimum custom format score can never "
-                               "be met - fix the profile in Radarr")
-                    else:
-                        m = re.search(r'"errorMessage":\s*"([^"]+)"', body)
-                        if m:
-                            why = m.group(1)
-                except Exception:                                # noqa: BLE001
-                    pass
-                refused.append(f"{pr.get('name')} - {why[:90]}")
-            st["done"] += 1
         st.update(step="done", ok=True,
-                  note=(f"{st['changed']} change(s)" if st["changed"]
-                        else "already up to date")
-                  + (f"; {len(refused)} profile(s) refused" if refused else ""))
-        return (f"{cfg.name}: {len(rel)} release(s), {len(grp)} "
-                f"group(s), {len(trm)} term(s) scored on "
-                f"{len(scored)} profile(s)"
-                + (f"; could not save {len(refused)}: "
-                   + "; ".join(refused) if refused else ""))
+                  note=(f"{st['changed']} change(s)" if st["changed"] else "already up to date")
+                  + (f"; {gone} old ban format(s) removed" if gone else ""))
+        return (f"{cfg.name}: {len(rel)} release(s), {len(grp)} group(s), {len(trm)} term(s) "
+                f"in release profile {RP_NAME!r} ({len(entries)} entries)"
+                + (f"; {gone} old ban format(s) removed" if gone else ""))
     except Exception as e:                                       # noqa: BLE001
-        st.update(step="failed", ok=False, note=f"{type(e).__name__}: {e}"[:200])
-        return f"{cfg.name}: {type(e).__name__}: {e}"
+        why = f"{type(e).__name__}: {e}"
+        try:
+            m = re.search(r'"errorMessage":\s*"([^"]+)"', e.response.text)   # type: ignore[attr-defined]
+            if m:
+                why = m.group(1)
+        except Exception:                                        # noqa: BLE001
+            pass
+        st.update(step="failed", ok=False, note=why[:200])
+        return f"{cfg.name}: {why}"
 
 
 async def _sync_after(delay: float) -> None:
