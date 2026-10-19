@@ -127,6 +127,113 @@ def _sniffio_stand_in() -> None:
 _sniffio_stand_in()
 
 
+# Windows errors that belong to ONE connection, not to the listening socket.
+_CONN_ERRORS = {64, 121, 1236, 10053, 10054, 995}   # netname deleted, timeout, aborted, reset, op aborted
+
+
+def _accept_keeps_listening() -> None:
+    r"""One client hanging up must not close the server's listening socket.
+
+    asyncio's proactor accept loop (BaseProactorEventLoop._start_serving)
+    treats ANY OSError while accepting as fatal for the socket: it reports
+    "Accept failed on a socket" and closes it. On Windows a client that drops
+    its connection mid-handshake raises WinError 64 ("The specified network
+    name is no longer available") there - and at 20:57 on 2026-10-18 that is
+    exactly what took nuarr's 0.0.0.0:8770 listener down. localhost (the ::1
+    socket) kept answering, every other device on the network got "refused".
+
+    Same loop as the standard library's, except a per-connection error is
+    logged and accepting carries on; anything else still closes the socket.
+    """
+    import asyncio
+    import logging
+    from asyncio import exceptions, proactor_events, trsock
+    base = proactor_events.BaseProactorEventLoop
+    log = logging.getLogger("uvicorn.error")
+
+    def _start_serving(self, protocol_factory, sock, sslcontext=None, server=None, backlog=100,
+                       ssl_handshake_timeout=None, ssl_shutdown_timeout=None):
+        def loop(f=None):
+            try:
+                if f is not None:
+                    try:
+                        conn, addr = f.result()
+                    except OSError as exc:
+                        if getattr(exc, "winerror", None) in _CONN_ERRORS or isinstance(
+                                exc, (ConnectionResetError, ConnectionAbortedError)):
+                            log.warning("a client dropped its connection while it was being accepted "
+                                        "(%s) - still listening", exc)
+                            conn = None
+                        else:
+                            raise
+                    if conn is not None:
+                        protocol = protocol_factory()
+                        if sslcontext is not None:
+                            self._make_ssl_transport(
+                                conn, protocol, sslcontext, server_side=True,
+                                extra={"peername": addr}, server=server,
+                                ssl_handshake_timeout=ssl_handshake_timeout,
+                                ssl_shutdown_timeout=ssl_shutdown_timeout)
+                        else:
+                            self._make_socket_transport(conn, protocol, extra={"peername": addr},
+                                                        server=server)
+                if self.is_closed():
+                    return
+                f = self._proactor.accept(sock)
+            except OSError as exc:
+                if sock.fileno() != -1:
+                    self.call_exception_handler({"message": "Accept failed on a socket",
+                                                 "exception": exc, "socket": trsock.TransportSocket(sock)})
+                    sock.close()
+            except exceptions.CancelledError:
+                sock.close()
+            else:
+                self._accept_futures[sock.fileno()] = f
+                f.add_done_callback(loop)
+        self.call_soon(loop)
+
+    base._start_serving = _start_serving
+
+
+if sys.platform == "win32":
+    try:
+        _accept_keeps_listening()
+    except Exception:                                    # noqa: BLE001
+        pass
+
+
+def _listener_watchdog(port: int) -> None:
+    r"""The safety net: if the IPv4 listener is gone anyway, start over.
+
+    Every minute, connect to 127.0.0.1 - which only the 0.0.0.0 socket serves.
+    A busy server still completes the connect (the kernel queues it), so only
+    a REFUSED connect means the socket itself is closed. Three in a row and
+    the process exits non-zero; Task Scheduler restarts nuarr a minute later
+    (RestartCount 3, RestartInterval 1 min on the nuarr task)."""
+    import socket
+    import threading
+    import time as _t
+
+    def watch():
+        _t.sleep(120)
+        refused = 0
+        while True:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=10):
+                    refused = 0
+            except ConnectionRefusedError:
+                refused += 1
+                print(f"listener watchdog: 127.0.0.1:{port} refused ({refused}/3)", flush=True)
+                if refused >= 3:
+                    print("listener watchdog: the network listener is gone - exiting so Task "
+                          "Scheduler restarts nuarr", flush=True)
+                    os._exit(1)
+            except Exception:                            # noqa: BLE001
+                refused = 0                              # slow or busy is not gone
+            _t.sleep(60)
+    threading.Thread(target=watch, daemon=True, name="listener-watchdog").start()
+
+
 def _log_config() -> dict:
     """uvicorn logging, but to a rotating file rather than a console."""
     return {
@@ -197,6 +304,8 @@ def main() -> None:
     config = uvicorn.Config("app.web:app", host=host, port=port,
                             log_config=_log_config())
     six = _loopback6(port) if host in ("0.0.0.0", "127.0.0.1") else None
+    if host in ("0.0.0.0", "127.0.0.1"):
+        _listener_watchdog(port)
     if six is None:
         uvicorn.Server(config).run()
         return
