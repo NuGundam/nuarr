@@ -171,9 +171,14 @@ def scan() -> dict:
             if p in kept:
                 continue
             kind, match = _kind_of(name)
-            listed.append({"name": name, "path": p, "root": root, "size": m["size"],
-                           "videos": m["videos"][:20], "n_videos": len(m["videos"]),
-                           "age_h": round(age_h, 1), "kind": kind, "match": match})
+            row = {"name": name, "path": p, "root": root, "size": m["size"],
+                   "videos": m["videos"][:20], "n_videos": len(m["videos"]),
+                   "age_h": round(age_h, 1), "kind": kind, "match": match}
+            try:
+                row["advice"] = _assess(row)
+            except Exception as e:                               # noqa: BLE001
+                row["advice"] = {"rec": "", "why": f"could not compare: {type(e).__name__}"}
+            listed.append(row)
     if removed:
         joblog.log(f"download leftovers: {len(removed)} empty folder(s) in the completed folder "
                    f"moved to the Recycle Bin", "info")
@@ -187,6 +192,116 @@ def scan() -> dict:
     STATE.update(at=time.time(), roots=rs, listed=listed, error="",
                  removed=STATE.get("removed", 0) + len(removed))
     return {"removed": removed, "listed": listed}
+
+
+_ADVICE_CACHE: dict = {}
+NOT_BETTER = ("not a custom format upgrade", "not an upgrade", "equal or higher", "is not an upgrade",
+              "existing file on disk", "do not improve")
+
+
+def _spec(q: str, score, langs: list, size: int = 0) -> str:
+    lg = "+".join(l[:2].upper() if l.lower() not in ("unknown",) else "?" for l in langs) if langs else "?"
+    return f"{q} · score {score if score is not None else '?'} · {lg}" + (f" · {size / 1e9:.1f} GB" if size else "")
+
+
+def _assess(x: dict) -> dict:
+    """IS IT WORTH KEEPING? The arr is asked about every video in the folder
+    (manual import, by folder): which episode or film it is, its quality,
+    custom-format score and languages - and whether its rules would take it
+    over the library's file. Each file is then 'delete' (the library already
+    has it at the same or better quality - the arr says not an upgrade),
+    'hand' (an upgrade, or the library has no file for it), or unclear.
+    -> {rec: delete|hand|mixed|'', why, have, this, counts}"""
+    key = (x["path"], x["n_videos"], int(x["size"]))
+    if key in _ADVICE_CACHE:
+        return _ADVICE_CACHE[key]
+    from .arrqueue import _call
+    import urllib.parse
+    a = next((a for a in _arrs() if a.kind == x["kind"]), None)
+    if not a:
+        return {"rec": "", "why": f"no {x['kind']} configured"}
+    cands = [c for c in (_call(a, "/api/v3/manualimport?" + urllib.parse.urlencode(
+        {"folder": x["path"], "filterExistingFiles": "false"}), timeout=60) or [])
+             if str(c.get("path") or "").lower().endswith(VIDEO)]
+    if not cands:
+        out = {"rec": "", "why": f"{a.name} could not read the files in it"}
+        _ADVICE_CACHE[key] = out
+        return out
+    verdicts, notes, have_s, this_s = [], [], "", ""
+
+    def facts(rec):
+        q = ((rec.get("quality") or {}).get("quality") or {})
+        langs = [l.get("name") for l in rec.get("languages") or []]
+        return {"q": q.get("name") or "?", "res": int(q.get("resolution") or 0),
+                "score": rec.get("customFormatScore"), "langs": langs, "size": rec.get("size") or 0,
+                "eng": "English" in langs}
+
+    for c in cands:
+        rej = [str(j.get("reason") or "") for j in c.get("rejections") or []]
+        low = " | ".join(rej).lower()
+        new = facts(c)
+        have = None
+        if a.kind == "sonarr":
+            fids = {e.get("episodeFileId") for e in c.get("episodes") or [] if e.get("episodeFileId")}
+            for fid in list(fids)[:1]:
+                try:
+                    have = facts(_call(a, f"/api/v3/episodefile/{fid}", timeout=20) or {})
+                except Exception:                                # noqa: BLE001
+                    pass
+            known = bool(c.get("episodes"))
+        else:
+            mv = c.get("movie") or {}
+            known = bool(mv.get("id"))
+            if known:
+                try:
+                    fs = _call(a, f"/api/v3/moviefile?movieId={mv['id']}", timeout=20) or []
+                    if fs:
+                        have = facts(fs[0])
+                except Exception:                                # noqa: BLE001
+                    pass
+        this_s = this_s or _spec(new["q"], new["score"], new["langs"], new["size"])
+        if have:
+            have_s = have_s or _spec(have["q"], have["score"], have["langs"], have["size"])
+        # THE ARR'S WORD FIRST, THEN THE FILES THEMSELVES. Manual import does
+        # not object to a copy equal to the library's (Food Wars S05E01-05 were
+        # the original downloads of what was already imported), and a higher
+        # score can still be a smaller picture.
+        ns, hs = new["score"] or 0, (have or {}).get("score") or 0
+        if any(w in low for w in NOT_BETTER):
+            verdicts.append("delete"); notes.append("not better")
+        elif not known:
+            verdicts.append("unclear"); notes.append("the arr cannot tell which episode or film")
+        elif not have:
+            verdicts.append("hand"); notes.append("the library has no file for it")
+        elif new["eng"] and not have["eng"]:
+            verdicts.append("hand"); notes.append("adds English audio"
+                                                  + (f" (at {new['res']}p against {have['res']}p)" if new["res"] and have["res"] and new["res"] < have["res"] else ""))
+        elif ns <= hs and new["res"] <= have["res"] and set(new["langs"]) <= set(have["langs"]):
+            verdicts.append("delete"); notes.append("the same as the library's file or worse")
+        elif new["res"] and have["res"] and new["res"] < have["res"]:
+            verdicts.append("unclear"); notes.append(f"scores higher but {new['res']}p against the library's {have['res']}p")
+        elif rej:
+            verdicts.append("unclear"); notes.append(rej[0][:90])
+        else:
+            verdicts.append("hand"); notes.append("an upgrade on the library's file")
+    n = {v: verdicts.count(v) for v in set(verdicts)}
+    first = notes[0] if notes else ""
+    many = len(verdicts) > 1
+    if n.get("delete") == len(verdicts):
+        rec = "delete"
+        why = ((f"all {len(verdicts)}: " if many else "")
+               + (first if len(set(notes)) == 1 else "not better than the library's files")
+               + " - the library already has " + ("them" if many else "it"))
+    elif n.get("hand") == len(verdicts):
+        rec = "hand"
+        why = (f"all {len(verdicts)}: " if many else "") + (first if len(set(notes)) == 1 else "worth importing")
+    else:
+        rec = "mixed"
+        why = (", ".join(f"{v} {k}" for k, v in (("worth handing", n.get("hand", 0)), ("not better", n.get("delete", 0)),
+                                                ("unclear", n.get("unclear", 0))) if v) if many else first) + " - your call"
+    out = {"rec": rec, "why": why, "have": have_s, "this": this_s, "counts": n}
+    _ADVICE_CACHE[key] = out
+    return out
 
 
 _KIND_CACHE: dict = {}
@@ -334,8 +449,8 @@ def _check_handed() -> None:
                              + ("neither arr recognised the name - try the other one" if (x.get("match") or "") == "" else
                                 "most likely the library already has it at the same or better quality"))
                 h["done_at"] = time.time()
-        # a folder the arr emptied leaves the list a minute after it was told so
-        if h.get("state") == "imported" and time.time() - float(h.get("done_at") or 0) > 60:
+        # a folder the arr emptied leaves the list at once
+        if h.get("state") == "imported":
             continue
         keep_rows.append(x)
     STATE["listed"] = keep_rows

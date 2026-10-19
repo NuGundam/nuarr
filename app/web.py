@@ -47562,6 +47562,10 @@ function dlPaint(){
       it to the Recycle Bin; <b>Keep</b> stops listing it. Anything touched in the last ${_dl.min_age_h||6} hours is
       left alone - it may still be unpacking.</div>
     ${_dl.error?`<div class="warn" style="font-size:11px">${esc(_dl.error)}</div>`:''}
+    ${(()=>{ const nd=rows.filter(r=>(r.advice||{}).rec==='delete').length, nh=rows.filter(r=>(r.advice||{}).rec==='hand').length;
+      return (nd||nh)?`<div style="font-size:11px;margin:2px 0 4px">Advice from comparing each file with the library's:
+        ${nd?`<button class="rmb" onclick="dlSelRec('delete')">select the ${fmt(nd)} to delete</button>`:''}
+        ${nh?`<button class="rmb" onclick="dlSelRec('hand')">select the ${fmt(nh)} to hand over</button>`:''}</div>`:''; })()}
     ${dlSelBar()}
     ${rows.length?`<div class="rowbox scrollbox" style="max-height:340px"><table class="sktbl" style="width:100%;font-size:11.5px;table-layout:fixed">
       <colgroup><col style="width:26px"><col style="width:auto"><col style="width:70px"><col style="width:60px"><col style="width:60px"><col style="width:100px"><col style="width:250px"></colgroup>
@@ -47573,7 +47577,8 @@ function dlPaint(){
         <td class="c"><input type="checkbox" ${_dlSel.has(r.path)?'checked':''} onclick="dlPick(${i},event)"></td>
         <td class="l" title="${esc(r.path)}"><b>${esc(r.name)}</b><div class="dim mono" style="font-size:10px;overflow:hidden;text-overflow:ellipsis">${esc((r.videos||[]).slice(0,2).join(' · '))}${r.n_videos>2?` +${r.n_videos-2}`:''}</div>
           ${r.match?`<div style="font-size:10px;color:#8b949e">${r.kind==='sonarr'?'Sonarr':'Radarr'} knows it: ${esc(r.match)}</div>`:`<div style="font-size:10px;color:#8b949e">neither arr recognises the name - ${r.kind==='sonarr'?'looks like episodes':'looks like a film'}</div>`}
-          ${st?`<div style="font-size:10px;color:${st[0]}">${h.state==='working'?'<span class="dlspin"></span>':''}${esc(h.arr)} ${esc(st[1])}${h.result?' - '+esc(h.result):''} · ${ago(h.done_at||h.at)}</div>`:''}</td>
+          ${st?`<div style="font-size:10px;color:${st[0]}">${h.state==='working'?'<span class="dlspin"></span>':''}${esc(h.arr)} ${esc(st[1])}${h.result?' - '+esc(h.result):''} · ${ago(h.done_at||h.at)}</div>`:''}
+          ${dlAdvice(r)}</td>
         <td class="c mono">${gb(r.size||0)}</td><td class="c">${fmt(r.n_videos||0)}</td>
         <td class="c dim">${r.age_h<48?Math.round(r.age_h)+'h':Math.round(r.age_h/24)+'d'}</td>
         <td class="c"><select class="dlk" style="font-size:10.5px"><option value="sonarr" ${r.kind==='sonarr'?'selected':''}>Sonarr</option><option value="radarr" ${r.kind==='radarr'?'selected':''}>Radarr</option></select></td>
@@ -47582,6 +47587,15 @@ function dlPaint(){
           <button class="rmb" onclick="dlAct(this,'delete')">Delete</button>
           <button class="rmb" onclick="dlAct(this,'keep')">Keep</button>`}</td></tr>`;}).join('')}</tbody></table></div>`:''}`;
 }
+const DL_REC={delete:['#e0575b','delete it'],hand:['#3fb950','hand it to the arr'],mixed:['#e3b341','your call']};
+function dlAdvice(r){
+  const a=r.advice||{}; if(!a.rec&&!a.why) return '';
+  const c=DL_REC[a.rec]||['#8b949e','no advice'];
+  return `<div style="font-size:10px;margin-top:2px"><span style="color:${c[0]};font-weight:600;border:1px solid ${c[0]};border-radius:8px;padding:0 5px">advice: ${c[1]}</span>
+    <span class="dim">${esc(a.why||'')}</span>
+    ${a.have||a.this?`<div class="mono dim" style="font-size:9.5px">${a.have?'library: '+esc(a.have):'library: no file'}${a.this?' &nbsp;|&nbsp; this: '+esc(a.this):''}</div>`:''}</div>`;
+}
+function dlSelRec(rec){ _dlSel=new Set(dlRows().filter(r=>(r.advice||{}).rec===rec).map(r=>r.path)); _dlLast=null; dlPaint(); }
 function dlKindOf(path){
   const i=dlRows().findIndex(r=>r.path===path);
   const tr=document.querySelector(`#dlBox tr[data-i="${i}"]`);
