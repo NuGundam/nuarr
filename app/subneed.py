@@ -200,6 +200,33 @@ _ENGLISH_STOP = {
 }
 
 
+_A2: dict = {}
+
+
+def _lang3(code: str) -> str:
+    """'en' -> 'eng', 'ja' -> 'jpn'; a three-letter code is returned as it is.
+
+    A SIDECAR'S NAME USUALLY CARRIES THE TWO-LETTER CODE. The Subtitle maker
+    writes "Film.en.ass", as Bazarr and most clients do, and the check below
+    compared its first three letters with "eng" - so "en" never matched, and
+    Lupin the Third vs. Detective Conan and Pokemon: The First Movie stayed on
+    the Raws list for a day reading "subtitles made" beside a .en.ass that
+    was there all along."""
+    c = str(code or "").lower().strip()
+    if len(c) != 2:
+        return c[:3]
+    if not _A2:
+        try:
+            from .langpolicy import iso_languages
+            for row in iso_languages():
+                if row.get("a2") and row.get("c") and row["a2"] not in _A2:
+                    _A2[row["a2"]] = row["c"]
+        except Exception:                                        # noqa: BLE001
+            pass
+        _A2.setdefault("en", "eng")
+    return _A2.get(c, c)
+
+
 def _is_english(lang: str) -> bool:
     return str(lang or "").strip().lower()[:3] in ("eng", "en")
 
@@ -916,12 +943,12 @@ def verdict(file_id: int, lang: str, cur, facts=None,
     # script does, so a Japanese film whose only English track translates the
     # shop fronts counted as subtitled and nobody ever looked again.
     mine = [t for t in tracks
-            if str(t.get("lang") or "").lower()[:3] == lang]
+            if _lang3(t.get("lang")) == _lang3(lang)]
     for t in mine:
         if _is_dialogue(t):
             return OK, f"carries a full {lang} dialogue track", "track"
     for s in sides:
-        if str(s.get("lang") or "").lower()[:3] == lang:
+        if _lang3(s.get("lang")) == _lang3(lang):
             return OK, f"has a {lang} subtitle file beside it", "side"
     # NUARR'S OWN NOTE TO ITSELF. See the marker rung.
     for t in mine:
@@ -1552,7 +1579,7 @@ def raw_score(file_id: int, lang: str, cur, facts=None, pic=None,
 
     # ---- is there nothing to read ----------------------------------------
     mine = [t for t in tracks
-            if str(t.get("lang") or "").lower()[:3] == lang]
+            if _lang3(t.get("lang")) == _lang3(lang)]
     if not tracks:
         terms.append("no_track")
         pts += RAW_POINTS["no_track"]
