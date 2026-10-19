@@ -10902,6 +10902,14 @@ async def api_dlleft_act(path: str, action: str, kind: str = ""):
     return {"ok": False, "why": "unknown action"}
 
 
+@app.post("/api/dlleft/bulk")
+async def api_dlleft_bulk(body: dict = Body(...)):
+    """{"paths": [...], "action": hand|delete|keep, "kinds": {path: sonarr|radarr}}"""
+    from . import dlleft
+    return await asyncio.to_thread(dlleft.bulk, list(body.get("paths") or []), str(body.get("action") or ""),
+                                   dict(body.get("kinds") or {}))
+
+
 @app.post("/api/dlleft/scan")
 async def api_dlleft_scan():
     from . import dlleft
@@ -47509,12 +47517,38 @@ function qjList(qj){
   </div>`;
 }
 // ---- left in the download folder - see dlleft.py --------------------------
-let _dl=null;
+let _dl=null, _dlSel=new Set(), _dlLast=null, _dlBusy=new Set(), _dlTimer=null;
+const DL_STATE={working:['#79c0ff','importing…'],imported:['#3fb950','imported'],partly:['#e3b341','partly imported'],refused:['#e0575b','imported nothing']};
 async function dlLoad(){
   const el=document.getElementById('dlBox'); if(!el) return;
   try{ _dl=await (await fetch('/api/dlleft')).json(); }catch(e){ return; }
-  const rows=_dl.listed||[];
-  el.innerHTML=`<div style="font-size:11px;font-weight:600">Left in the download folder
+  dlPaint();
+  // AN ARR AT WORK IS WATCHED. While a hand-off is running, the list asks
+  // again every 3 s so its result shows without a reload.
+  clearTimeout(_dlTimer);
+  if((_dl.listed||[]).some(r=>(r.handed||{}).state==='working')) _dlTimer=setTimeout(dlLoad,3000);
+}
+function dlRows(){ return (_dl&&_dl.listed)||[]; }
+function dlSelBar(){
+  const live=new Set(dlRows().map(r=>r.path));
+  for(const k of [..._dlSel]) if(!live.has(k)) _dlSel.delete(k);
+  const n=_dlSel.size; if(!n) return '';
+  return `<div class="banselbar" style="margin:4px 0 6px">
+    <b style="font-size:11.5px;color:#e3b341">${fmt(n)} selected</b>
+    <button class="rmb" onclick="dlBulk('hand',this)" title="Each goes to the arr its row names - Sonarr or Radarr, whichever recognised it">Hand ${fmt(n)} to their arr</button>
+    <button class="rmb" onclick="dlBulk('delete',this)">Delete ${fmt(n)}</button>
+    <button class="rmb" onclick="dlBulk('keep',this)">Keep ${fmt(n)}</button>
+    <button class="rmb" onclick="_dlSel.clear();_dlLast=null;dlPaint()">Clear</button>
+    <span class="dim" style="font-size:10.5px">shift-click to take a range</span></div>`;
+}
+function dlPaint(){
+  const el=document.getElementById('dlBox'); if(!el||!_dl) return;
+  const rows=dlRows();
+  const allOn=rows.length&&rows.every(r=>_dlSel.has(r.path));
+  el.innerHTML=`<style>
+    .dlspin{display:inline-block;width:9px;height:9px;border:2px solid #79c0ff;border-right-color:transparent;border-radius:50%;animation:dlrot .8s linear infinite;vertical-align:-1px;margin-right:4px}
+    @keyframes dlrot{to{transform:rotate(360deg)}}
+  </style><div style="font-size:11px;font-weight:600">Left in the download folder
       <span class="dim" style="font-weight:400">${(_dl.roots||[]).map(esc).join(', ')||'-'} ·
       ${rows.length?fmt(rows.length)+' with video in them, yours to decide':'nothing with video left behind'}
       ${_dl.removed_total?` · ${fmt(_dl.removed_total)} empty folder(s) recycled since start`:''}
@@ -47523,34 +47557,70 @@ async function dlLoad(){
     <div class="dim" style="font-size:11px;margin:3px 0 5px">Folders no Sonarr/Radarr queue and no download client
       lists any more - the janitor cannot remove those through the arr, so they sat here. One whose files have
       already gone (an empty shell) is recycled on its own; one that still holds a video is yours:
-      <b>Hand to the arr</b> asks Sonarr or Radarr to import that folder by its own rules; <b>Delete</b> moves it
-      to the Recycle Bin; <b>Keep</b> stops listing it. Anything touched in the last ${_dl.min_age_h||6} hours is left
-      alone - it may still be unpacking.</div>
+      <b>Hand to the arr</b> asks Sonarr or Radarr to import that folder by its own rules - the ARR column is
+      whichever of them recognised the name, and the row says what it took once it is done; <b>Delete</b> moves
+      it to the Recycle Bin; <b>Keep</b> stops listing it. Anything touched in the last ${_dl.min_age_h||6} hours is
+      left alone - it may still be unpacking.</div>
     ${_dl.error?`<div class="warn" style="font-size:11px">${esc(_dl.error)}</div>`:''}
-    ${rows.length?`<div class="rowbox scrollbox" style="max-height:300px"><table class="sktbl" style="width:100%;font-size:11.5px;table-layout:fixed">
-      <colgroup><col style="width:auto"><col style="width:70px"><col style="width:60px"><col style="width:60px"><col style="width:100px"><col style="width:260px"></colgroup>
-      <thead><tr class="dim" style="font-size:10.5px"><th class="l">FOLDER</th><th class="c">SIZE</th><th class="c">VIDEOS</th>
-        <th class="c">AGE</th><th class="c">ARR</th><th class="r"></th></tr></thead><tbody>${rows.map((r,i)=>`<tr>
+    ${dlSelBar()}
+    ${rows.length?`<div class="rowbox scrollbox" style="max-height:340px"><table class="sktbl" style="width:100%;font-size:11.5px;table-layout:fixed">
+      <colgroup><col style="width:26px"><col style="width:auto"><col style="width:70px"><col style="width:60px"><col style="width:60px"><col style="width:100px"><col style="width:250px"></colgroup>
+      <thead><tr class="dim" style="font-size:10.5px"><th class="c"><input type="checkbox" title="select all" ${allOn?'checked':''} onchange="dlAll(this.checked)"></th>
+        <th class="l">FOLDER</th><th class="c">SIZE</th><th class="c">VIDEOS</th>
+        <th class="c">AGE</th><th class="c">ARR</th><th class="r"></th></tr></thead><tbody>${rows.map((r,i)=>{
+        const h=r.handed||{}, st=DL_STATE[h.state]||null, busy=_dlBusy.has(r.path);
+        return `<tr data-i="${i}">
+        <td class="c"><input type="checkbox" ${_dlSel.has(r.path)?'checked':''} onclick="dlPick(${i},event)"></td>
         <td class="l" title="${esc(r.path)}"><b>${esc(r.name)}</b><div class="dim mono" style="font-size:10px;overflow:hidden;text-overflow:ellipsis">${esc((r.videos||[]).slice(0,2).join(' · '))}${r.n_videos>2?` +${r.n_videos-2}`:''}</div>
-          ${r.handed?`<div style="font-size:10px;color:#79c0ff">handed to ${esc(r.handed.arr)} ${ago(r.handed.at)} - it imports what its rules allow; a folder it took leaves this list</div>`:''}</td>
+          ${r.match?`<div style="font-size:10px;color:#8b949e">${r.kind==='sonarr'?'Sonarr':'Radarr'} knows it: ${esc(r.match)}</div>`:`<div style="font-size:10px;color:#8b949e">neither arr recognises the name - ${r.kind==='sonarr'?'looks like episodes':'looks like a film'}</div>`}
+          ${st?`<div style="font-size:10px;color:${st[0]}">${h.state==='working'?'<span class="dlspin"></span>':''}${esc(h.arr)} ${esc(st[1])}${h.result?' - '+esc(h.result):''} · ${ago(h.done_at||h.at)}</div>`:''}</td>
         <td class="c mono">${gb(r.size||0)}</td><td class="c">${fmt(r.n_videos||0)}</td>
         <td class="c dim">${r.age_h<48?Math.round(r.age_h)+'h':Math.round(r.age_h/24)+'d'}</td>
-        <td class="c"><select id="dlk${i}" style="font-size:10.5px"><option value="sonarr" ${r.kind==='sonarr'?'selected':''}>Sonarr</option><option value="radarr" ${r.kind==='radarr'?'selected':''}>Radarr</option></select></td>
-        <td class="r" style="white-space:nowrap"><button class="rmb" onclick="dlAct(${i},'hand',this)">Hand to the arr</button>
-          <button class="rmb" onclick="dlAct(${i},'delete',this)">Delete</button>
-          <button class="rmb" onclick="dlAct(${i},'keep',this)">Keep</button></td></tr>`).join('')}</tbody></table></div>`:''}`;
+        <td class="c"><select class="dlk" style="font-size:10.5px"><option value="sonarr" ${r.kind==='sonarr'?'selected':''}>Sonarr</option><option value="radarr" ${r.kind==='radarr'?'selected':''}>Radarr</option></select></td>
+        <td class="r" style="white-space:nowrap">${busy?'<span class="dlspin"></span><span class="dim" style="font-size:10.5px">working…</span>':
+          `<button class="rmb" onclick="dlAct(this,'hand')" ${h.state==='working'?'disabled':''}>Hand to the arr</button>
+          <button class="rmb" onclick="dlAct(this,'delete')">Delete</button>
+          <button class="rmb" onclick="dlAct(this,'keep')">Keep</button>`}</td></tr>`;}).join('')}</tbody></table></div>`:''}`;
 }
-async function dlAct(i,action,btn){
-  const r=(_dl.listed||[])[i]; if(!r) return;
+function dlKindOf(path){
+  const i=dlRows().findIndex(r=>r.path===path);
+  const tr=document.querySelector(`#dlBox tr[data-i="${i}"]`);
+  return (tr&&tr.querySelector('.dlk')||{}).value||((dlRows()[i]||{}).kind)||'';
+}
+function dlPick(i,ev){
+  const rows=dlRows(), r=rows[i]; if(!r) return;
+  if(ev.shiftKey&&_dlLast!==null){
+    const [a,b]=[Math.min(_dlLast,i),Math.max(_dlLast,i)], on=!_dlSel.has(r.path);
+    for(let k=a;k<=b;k++){ on?_dlSel.add(rows[k].path):_dlSel.delete(rows[k].path); }
+  } else { _dlSel.has(r.path)?_dlSel.delete(r.path):_dlSel.add(r.path); }
+  _dlLast=i; dlPaint();
+}
+function dlAll(on){ _dlSel=new Set(on?dlRows().map(r=>r.path):[]); _dlLast=null; dlPaint(); }
+async function dlAct(btn,action){
+  // THE ROW BY ITS PATH, NOT A REMEMBERED POSITION: the path is read off the
+  // painted row at the moment of the click.
+  const tr=btn.closest('tr'), r=dlRows()[+tr.dataset.i]; if(!r) return;
   if(action==='delete' && !confirm(`Move "${r.name}" (${gb(r.size||0)}) to the Recycle Bin?`)) return;
-  if(btn){ btn.disabled=true; btn.textContent='…'; }
-  const kind=(document.getElementById('dlk'+i)||{}).value||r.kind;
+  const kind=dlKindOf(r.path);
+  _dlBusy.add(r.path); dlPaint();
   let d={}; try{ d=await (await fetch(`/api/dlleft/act?path=${encodeURIComponent(r.path)}&action=${action}&kind=${kind}`,{method:'POST'})).json(); }catch(e){}
+  _dlBusy.delete(r.path);
   if(!d.ok && d.why) alert(d.why);
   dlLoad();
 }
+async function dlBulk(action,btn){
+  const paths=[..._dlSel]; if(!paths.length) return;
+  const size=dlRows().filter(r=>_dlSel.has(r.path)).reduce((t,r)=>t+(r.size||0),0);
+  if(action==='delete' && !confirm(`Move ${paths.length} folder(s) (${gb(size)}) to the Recycle Bin?`)) return;
+  const kinds={}; for(const p of paths) kinds[p]=dlKindOf(p);
+  paths.forEach(p=>_dlBusy.add(p)); dlPaint();
+  let d={}; try{ d=await (await fetch('/api/dlleft/bulk',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({paths,action,kinds})})).json(); }catch(e){}
+  paths.forEach(p=>_dlBusy.delete(p)); _dlSel.clear(); _dlLast=null;
+  if(d.failed&&d.failed.length) alert(d.failed.length+' could not be done:\n'+d.failed.map(f=>f.why).slice(0,5).join('\n'));
+  dlLoad();
+}
 async function dlScan(btn){
-  if(btn){ btn.disabled=true; btn.textContent='looking…'; }
+  if(btn){ btn.disabled=true; btn.innerHTML='<span class="dlspin"></span>looking…'; }
   try{ await fetch('/api/dlleft/scan',{method:'POST'}); }catch(e){}
   dlLoad();
 }
