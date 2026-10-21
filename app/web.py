@@ -947,6 +947,8 @@ async def _startup() -> None:
     from . import schedules as _sch
     _sch.bind_loop(asyncio.get_running_loop())
     asyncio.create_task(arrhealth.watch())
+    from . import svcnurse
+    asyncio.create_task(svcnurse.watch())
     asyncio.create_task(subneed.watch())
     # Twice a day: do nuarr and the arrs still describe the same files? The
     # check existed before this line did, which meant it only ever ran when
@@ -6335,6 +6337,10 @@ def _health_build():
         "integrity": ("replace",
                       "a file that will not decode cannot be re-encoded into "
                       "one that will"),
+        "svcnurse": ("restart, or switch off",
+                     "starts Docker Desktop or the proxy container when they "
+                     "are down; switches off an indexer that has failed for "
+                     "days with the proxy fine, and back on when it answers"),
     }
 
     # WHICH SYSTEM DOES THE WORK BEHIND THIS ROW, and how far it has got.
@@ -6576,6 +6582,23 @@ def _health_build():
             "check unavailable", warn=False,
             when="the arrs' own report")
 
+    # BELOW THE ARRS' WARNINGS: the services they depend on. The arrs say
+    # "indexer unavailable"; this says "because Docker is down", and starts
+    # it. See svcnurse.py.
+    try:
+        from . import svcnurse as _sn
+        d = _sn.snapshot()
+        fx = [f for f in d["findings"] if f.get("fixed")]
+        top = next((f["what"] for f in d["findings"] if f.get("level") in ("error", "warn") and not f.get("fixed")), "")
+        add("svcnurse", "Are Prowlarr, its proxy and Docker up?", "arrs", d["open"],
+            (top if top else
+             f"fixed: {fx[0]['what']}" if fx else
+             "Prowlarr, its proxies and Docker all answer" if d["checked"] else "not checked yet"),
+            mode=d["mode"], running=d["running"])
+    except Exception as e:                                   # noqa: BLE001
+        add("svcnurse", "Are Prowlarr, its proxy and Docker up?", "arrs", 0,
+            f"check unavailable: {type(e).__name__}", warn=True)
+
     # SSD WEAR. The NVMe drives' own "Percentage Used" and bytes written,
     # read from their health logs - the figure StableBit Scanner shows. Amber
     # at diskwear.WARN_AT%, or on a drive's own critical flag / spare / media
@@ -6812,6 +6835,8 @@ async def api_health_mode(mode: str):
     SETTINGS.plexsync_mode = mode
     SETTINGS.rulesgap_mode = mode
     SETTINGS.subocr_auto = (mode == "auto")
+    from . import svcnurse
+    svcnurse.set_mode(mode)
     joblog.log(f"all correction systems set to {mode} from the health page",
                "info")
     return api_health(fresh=1)
@@ -11433,6 +11458,40 @@ async def api_subneed_replace(file_id: int):
     if out.get("ok"):
         subneed.answered(int(file_id))
     return out
+
+
+@app.get("/api/nurse")
+def api_nurse():
+    from . import svcnurse
+    return svcnurse.snapshot()
+
+
+@app.post("/api/nurse/run")
+async def api_nurse_run(act: int = -1):
+    from . import svcnurse
+    asyncio.create_task(svcnurse.check(None if act < 0 else bool(act)))
+    return {"started": True}
+
+
+@app.post("/api/nurse/mode")
+def api_nurse_mode(mode: str = "auto"):
+    from . import svcnurse
+    svcnurse.set_mode(mode)
+    joblog.log(f"services nurse set to {svcnurse.mode()}", "info", system="nurse")
+    return {"mode": svcnurse.mode()}
+
+
+@app.post("/api/nurse/prowlarr")
+def api_nurse_prowlarr(url: str = "", key: str = ""):
+    from . import svcnurse
+    svcnurse.set_prowlarr(url or None, key or None)
+    return {"url": svcnurse.prowlarr_url(), "has_key": bool(svcnurse.prowlarr_key())}
+
+
+@app.post("/api/nurse/indexer")
+def api_nurse_indexer(name: str, on: int = 1):
+    from . import svcnurse
+    return svcnurse.indexer_set(name, bool(on))
 
 
 @app.get("/api/arrs/health")
@@ -34593,9 +34652,61 @@ function arrHealthPoll(on){
   }, 30000);
 }
 
+// ---- the services nurse (svcnurse.py): Prowlarr, its proxy, Docker ----
+async function loadNurse(){
+  const el=document.getElementById('nurseCard'); if(!el) return;
+  let d; try{ d=await (await fetch('/api/nurse')).json(); }catch(e){ return; }
+  const lv={error:'#e0575b',warn:'#e2b341',info:'#8a97a6'};
+  const fnd=(d.findings||[]).map(f=>`<div style="font-size:11px;margin-top:3px;display:flex;gap:7px;align-items:baseline">
+      <span style="width:8px;height:8px;border-radius:50%;flex:none;background:${f.fixed?'#7fd4a3':lv[f.level]||lv.info}"></span>
+      <span><b>${esc(f.what)}</b>${f.fixed?' <span style="color:#7fd4a3">- fixed</span>':''} <span class="dim">- ${esc(f.detail||'')}${f.fix&&!f.fixed?` · fix: ${esc(f.fix)}`:''}</span>
+      ${f.off?` <button style="font-size:10.5px;padding:0 7px" onclick="nurseIdx('${jsq(f.name)}',1)">switch back on</button>`:''}</span></div>`).join('');
+  const prox=(d.proxies||[]).map(p=>`<span class="pill ${p.up?'p-ok':'p-bad'}" title="${esc(p.host)}">${esc(p.name)} ${p.up?'answers':'down'}</span>`).join(' ');
+  const idx=Object.entries(d.indexers||{}).filter(([n,m])=>m.outages).sort((a,b)=>(b[1].down_s||0)-(a[1].down_s||0));
+  const idxHtml=idx.length?`<div class="dim" style="font-size:11px;margin-top:7px"><b>Indexer record</b> - what the nurse has seen each one do
+      <div style="display:flex;flex-wrap:wrap;gap:4px 14px;margin-top:3px">${idx.map(([n,m])=>{
+        const down=m.down_since?` · <span style="color:#e2b341">down now</span>`:'';
+        const off=m.off_by_nurse?` · <span style="color:#e2b341">off since ${new Date(m.off_by_nurse*1000).toLocaleDateString()}</span> <button style="font-size:10px;padding:0 6px" onclick="nurseIdx('${jsq(n)}',1)">on</button>`:'';
+        return `<span>${esc(n)}: ${m.outages} outage${m.outages===1?'':'s'}, ${(m.down_s/3600).toFixed(1)} h${down}${off}</span>`;}).join('')}</div></div>`:'';
+  const acts=(d.actions||[]).slice(0,6).map(a=>`<div style="font-size:10.5px;color:${a.ok?'#7fd4a3':'#e2b341'}">${esc(ago(a.at))} - ${esc(a.what)}</div>`).join('');
+  el.innerHTML=`<div style="border:1px solid var(--line);border-radius:8px;padding:9px 12px;margin-bottom:8px">
+    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+      <b>Services nurse</b>
+      ${d.running?`<span class="pill" style="color:#79c0ff;border-color:#79c0ff"><span class="dlspin"></span> ${esc(d.stage||'checking')}</span>`
+        : d.open?`<span class="pill p-warn">${d.open} open</span>`:(d.checked?`<span class="pill p-ok">all up</span>`:'')}
+      <span class="pill ${d.prowlarr&&d.prowlarr.ok?'p-ok':'p-bad'}">Prowlarr ${d.prowlarr&&d.prowlarr.ok?'v'+esc(d.prowlarr.version||''):'unreachable'}</span>
+      ${prox}
+      <span class="pill ${d.docker?'p-ok':(d.docker===false?'p-bad':'')}">Docker ${d.docker?'up':d.docker===false?'down':'?'}</span>
+      <span style="margin-left:auto;display:inline-flex;border:1px solid var(--line);border-radius:5px;overflow:hidden">
+        ${['manual','auto'].map(m=>`<button onclick="nurseMode('${m}')" style="font-size:11px;padding:2px 10px;border:0;cursor:pointer;background:${d.mode===m?'var(--acc)':'transparent'};color:${d.mode===m?'#0b0e13':'var(--dim,#8a97a6)'}">${m}</button>`).join('')}</span>
+      <button onclick="nurseRun()" style="font-size:11px">Check now</button>
+    </div>
+    <div class="dim" style="font-size:11px;margin-top:5px">The arrs' warnings above are symptoms; this looks at the causes underneath them - Prowlarr itself, the Cloudflare proxy it
+      sends sites through, and Docker, which the proxy lives in - and in <b>auto</b> starts what is stopped (Docker Desktop through its scheduled task, a
+      stopped container with docker start), then re-tests the indexers that were down so the warnings clear now. An indexer that still fails for
+      ${d.disable_after_days} days with the proxy fine is switched off in Prowlarr and tested daily; it comes back on by itself the day it answers.
+      Checked every ${Math.round((d.poll_s||300)/60)} min${d.at?' · last '+esc(ago(d.at)):''}.</div>
+    ${fnd||(d.checked?'<div class="dim" style="font-size:11px;margin-top:4px">nothing wrong underneath</div>':'')}
+    ${idxHtml}
+    ${acts?`<div style="margin-top:6px">${acts}</div>`:''}
+    <div class="dim" style="font-size:11px;margin-top:7px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">Prowlarr
+      <input id="nurseUrl" value="${esc(d.prowlarr_url||'')}" style="width:190px;font-size:11px">
+      <input id="nurseKey" placeholder="${d.has_key?(d.key_from_config?'API key read from Prowlarr\'s own config':'API key set'):'API key'}" style="width:200px;font-size:11px">
+      <button style="font-size:11px" onclick="nurseProwlarr()">Save</button></div>
+  </div>`;
+}
+async function nurseMode(m){ await fetch('/api/nurse/mode?mode='+m,{method:'POST'}); loadNurse(); }
+async function nurseRun(){ await fetch('/api/nurse/run',{method:'POST'}); setTimeout(loadNurse,1500); setTimeout(loadNurse,8000); setTimeout(loadNurse,30000); }
+async function nurseIdx(name,on){ await fetch('/api/nurse/indexer?name='+encodeURIComponent(name)+'&on='+(on?1:0),{method:'POST'}); loadNurse(); }
+async function nurseProwlarr(){
+  const u=document.getElementById('nurseUrl').value, k=document.getElementById('nurseKey').value;
+  await fetch('/api/nurse/prowlarr?url='+encodeURIComponent(u)+(k?'&key='+encodeURIComponent(k):''),{method:'POST'});
+  nurseRun();
+}
 async function loadArrHealth(force){
   const el=document.getElementById('arrHealth');
   if(!el) return;
+  try{ loadNurse(); }catch(e){}
   let d;
   try{ d=await (await fetch('/api/arrs/health'+(force?'?refresh=true':''))).json(); }
   catch(e){ el.innerHTML=''; return; }
@@ -37698,6 +37809,7 @@ async function vfyLoad(force){
   return _vfy;
 }
 function vfyVote(v){ const c=VFY_VOTE[v]||['#8b949e','-']; return `<span style="color:${c[0]}">${esc(c[1])}</span>`; }
+let _vfyMsg=null;   /* the last Verify-now reply, shown for 2 minutes */
 function vfyBlock(kind){
   const v=_vfy; if(!v) return '<div class="dim" style="font-size:11px">loading the second opinion…</div>';
   const eng=v.engines||{};
@@ -37714,6 +37826,7 @@ function vfyBlock(kind){
         · <input type="number" min="1" max="60" value="${v.per_hour}" style="width:58px;box-sizing:border-box;font-size:11px" onchange="vfyBudget(null,this.value)">/hour
         <button class="rmb" onclick="vfyRun(this)" ${v.running?'disabled':''}>Verify 3 now</button>
         ${v.running?`<button class="rmb" onclick="fetch('/api/verify/stop',{method:'POST'})">Stop</button>`:''}</span></div>
+    ${_vfyMsg&&Date.now()-_vfyMsg.at<120000?`<div style="font-size:11.5px;margin:5px 0 0;color:${_vfyMsg.c}">${esc(_vfyMsg.t)}</div>`:''}
     <style>.vfybar{height:6px;background:var(--line);border-radius:3px;overflow:hidden;position:relative;flex:1;min-width:120px}
       .vfyfill{height:6px;background:#79c0ff;border-radius:3px;transition:width .9s linear}
       .vfyrun{position:absolute;inset:0;background:repeating-linear-gradient(45deg,rgba(121,192,255,.35) 0 8px,transparent 8px 16px);background-size:200% 100%;animation:vfymove 1s linear infinite}
@@ -37769,7 +37882,13 @@ async function vfyMode(m){ await fetch('/api/verify/mode?mode='+m,{method:'POST'
 async function vfyBudget(sure,ph){ const q=[]; if(sure!=null) q.push('sure='+encodeURIComponent(sure)); if(ph!=null) q.push('per_hour='+encodeURIComponent(ph)); await fetch('/api/verify/budget?'+q.join('&'),{method:'POST'}); await vfyLoad(true); for(const k of ['whisper','qwen','ocr','subai']) lrnPaint(k); }
 async function vfyRun(btn){
   if(btn){ btn.disabled=true; btn.innerHTML='<span class="dlspin"></span>verifying…'; }
-  fetch('/api/verify/run?n=3',{method:'POST'}).catch(()=>{});
+  const say=(t,c)=>{ _vfyMsg={t:t,c:c||'var(--dim)',at:Date.now()}; vfyLoad(true).then(()=>{ for(const k of ['whisper','qwen','ocr','subai']) lrnPaint(k); }).catch(()=>{}); };
+  fetch('/api/verify/run?n=3',{method:'POST'}).then(r=>r.ok?r.json():Promise.reject(new Error('HTTP '+r.status))).then(d=>{
+    if(d.busy) say('Already verifying - the run in progress has to finish first.','#d29922');
+    else if(d.skipped) say('Not started: '+d.skipped+' - try again when it is free.','#d29922');
+    else if(!d.done) say('Nothing to verify - there are no unsure rows on the board right now.');
+    else say('Verified '+d.done+(d.done===1?' file':' files')+', answered '+d.answered+(d.done>d.answered?' - '+(d.done-d.answered)+' left for you':'')+'.','#3fb950');
+  }).catch(e=>say('The request failed: '+((e&&e.message)||e),'#f85149'));
   const tick=async()=>{ await vfyLoad(true); for(const k of ['whisper','qwen','ocr','subai']) lrnPaint(k); if(_vfy&&_vfy.running) setTimeout(tick,3000); };
   setTimeout(tick,1500);
 }
