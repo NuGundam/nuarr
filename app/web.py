@@ -6309,7 +6309,8 @@ def _health_build():
             "notland": "Still not landed", "counts": "Counts", "logs": "Logs",
             "ocr": "OCR engines", "ruleschk": "Rule check",
             "process": "Processing System", "alang": "Audio language",
-            "plex": "Plex", "tmdisk": "Task manager · disks"}
+            "plex": "Plex", "tmdisk": "Task manager · disks",
+            "indexers": "Prowlarr & indexers", "meta": "Metadata"}
 
     # key -> (what fixes it, the sentence explaining why the others do not)
     REMEDY = {
@@ -6590,13 +6591,13 @@ def _health_build():
         d = _sn.snapshot()
         fx = [f for f in d["findings"] if f.get("fixed")]
         top = next((f["what"] for f in d["findings"] if f.get("level") in ("error", "warn") and not f.get("fixed")), "")
-        add("svcnurse", "Are Prowlarr, its proxy and Docker up?", "arrs", d["open"],
+        add("svcnurse", "Are Prowlarr, its proxy and Docker up?", "indexers", d["open"],
             (top if top else
              f"fixed: {fx[0]['what']}" if fx else
              "Prowlarr, its proxies and Docker all answer" if d["checked"] else "not checked yet"),
             mode=d["mode"], running=d["running"])
     except Exception as e:                                   # noqa: BLE001
-        add("svcnurse", "Are Prowlarr, its proxy and Docker up?", "arrs", 0,
+        add("svcnurse", "Are Prowlarr, its proxy and Docker up?", "indexers", 0,
             f"check unavailable: {type(e).__name__}", warn=True)
 
     # SSD WEAR. The NVMe drives' own "Percentage Used" and bytes written,
@@ -11486,6 +11487,36 @@ def api_nurse_prowlarr(url: str = "", key: str = ""):
     from . import svcnurse
     svcnurse.set_prowlarr(url or None, key or None)
     return {"url": svcnurse.prowlarr_url(), "has_key": bool(svcnurse.prowlarr_key())}
+
+
+@app.get("/api/nurse/indexers")
+def api_nurse_indexers():
+    from . import svcnurse
+    try:
+        d = svcnurse.indexers_view()
+    except Exception as e:                                   # noqa: BLE001
+        d = {"indexers": [], "apps": [], "error": f"{type(e).__name__}: {e}"[:200]}
+    d["containers"] = svcnurse.containers()
+    d["docker"] = svcnurse.docker_up()
+    return d
+
+
+@app.post("/api/nurse/test")
+def api_nurse_test(name: str):
+    from . import svcnurse
+    return svcnurse.indexer_test(name)
+
+
+@app.post("/api/nurse/sync")
+def api_nurse_sync():
+    from . import svcnurse
+    return svcnurse.sync_apps()
+
+
+@app.post("/api/nurse/container")
+def api_nurse_container(name: str, op: str = "start"):
+    from . import svcnurse
+    return svcnurse.container_op(name, op)
 
 
 @app.post("/api/nurse/indexer")
@@ -29664,7 +29695,7 @@ const PANE_OF = {ffmpeg:'ffPane', backup:'bkPane',  rules:'rulesPane',
                  vcodec:'vcodecPane', acodec:'acodecPane',
                  alang:'alangPane', cache:'cachePane',
                  whisper:'whisperPane', qwen:'qwenPane', plex:'plexPane',
-                 subai:'subaiPane',
+                 subai:'subaiPane', indexers:'idxPane',
                  tautulli:'tautPane',
                  pushover:'pushoverPane',
                  ocr:'ocrPane', plexwork:'plexworkPane', ruleschk:'ruleschkPane',
@@ -29978,6 +30009,11 @@ function wtab(which){
   if(which==='subai'){
     if(hint) hint.textContent='· subtitle ai';
     paneLoad('subai', loadSubai);
+    return;
+  }
+  if(which==='indexers'){
+    if(hint) hint.textContent='· prowlarr & indexers';
+    paneLoad('indexers', loadIdx);
     return;
   }
   if(which==='qwen'){
@@ -32065,7 +32101,26 @@ async function dpToggle(key,on){
   try{ await fetch('/api/drivepool/toggle?key='+encodeURIComponent(key)+'&on='+(on?'true':'false'),{method:'POST'}); }catch(e){}
   loadDrivePool();
 }
+// TVDB re-ID repair, drawn on Metadata - its switch and Run now are the
+// arrguard ones, so they repaint this page as well as the Arrs page.
+async function loadMetaTvdb(){
+  const el=document.getElementById('metaTvdb'); if(!el) return;
+  let d; try{ d=await (await fetch('/api/arrguard')).json(); }catch(e){ return; }
+  el.innerHTML=arrJobCard('tvdb_fix','TVDB re-ID repair: series TheTVDB deleted and re-added',
+        'TheTVDB sometimes deletes a series and creates it again under a new id. Sonarr '
+        +'keeps the dead id - no new episodes, no metadata, a red line on its health page - '
+        +'until the series is removed and added back. Every '+String(Math.round(((d.tvdb_fix||{}).poll_s||21600)/3600))
+        +' hours this finds those and, only when exactly one TheTVDB entry has the same title '
+        +'and year, removes the series with its files kept, renames the folder to the new '
+        +'{tvdb-...} id, and adds it back with the same profile, tags and monitoring, no '
+        +'search. Sonarr re-imports the files on its rescan. No match, or more than one, is '
+        +'listed here for you and nothing is touched. Sonarr\'s own history for a repaired '
+        +'series is lost.',
+        d.toggles.tvdb_fix, ((d.tvdb_fix||{}).stats||{}),
+        {label:'', kind:'tvdb_fix', names:{}, empty:'', adder:tvList(d.tvdb_fix||{})});
+}
 async function loadMetaTab(){
+  try{ loadMetaTvdb(); }catch(e){}
   const el=document.getElementById('metaBody');
   if(!el) return;
   el.innerHTML='<div class="dim">loading…</div>';
@@ -34674,9 +34729,10 @@ async function loadNurse(){
       <b>Services nurse</b>
       ${d.running?`<span class="pill" style="color:#79c0ff;border-color:#79c0ff"><span class="dlspin"></span> ${esc(d.stage||'checking')}</span>`
         : d.open?`<span class="pill p-warn">${d.open} open</span>`:(d.checked?`<span class="pill p-ok">all up</span>`:'')}
-      <span class="pill ${d.prowlarr&&d.prowlarr.ok?'p-ok':'p-bad'}">Prowlarr ${d.prowlarr&&d.prowlarr.ok?'v'+esc(d.prowlarr.version||''):'unreachable'}</span>
+      ${!d.checked?'<span class="pill p-dim">first check within a minute of starting</span>'
+        :`<span class="pill ${d.prowlarr&&d.prowlarr.ok?'p-ok':'p-bad'}">Prowlarr ${d.prowlarr&&d.prowlarr.ok?'v'+esc(d.prowlarr.version||''):'unreachable'}</span>`}
       ${prox}
-      <span class="pill ${d.docker?'p-ok':(d.docker===false?'p-bad':'')}">Docker ${d.docker?'up':d.docker===false?'down':'?'}</span>
+      ${d.checked?`<span class="pill ${d.docker?'p-ok':'p-bad'}">Docker ${d.docker?'up':'down'}</span>`:''}
       <span style="margin-left:auto;display:inline-flex;border:1px solid var(--line);border-radius:5px;overflow:hidden">
         ${['manual','auto'].map(m=>`<button onclick="nurseMode('${m}')" style="font-size:11px;padding:2px 10px;border:0;cursor:pointer;background:${d.mode===m?'var(--acc)':'transparent'};color:${d.mode===m?'#0b0e13':'var(--dim,#8a97a6)'}">${m}</button>`).join('')}</span>
       <button onclick="nurseRun()" style="font-size:11px">Check now</button>
@@ -34695,9 +34751,106 @@ async function loadNurse(){
       <button style="font-size:11px" onclick="nurseProwlarr()">Save</button></div>
   </div>`;
 }
+let _idx=null, _idxBusy={};
+async function loadIdx(){
+  loadNurse();
+  const el=document.getElementById('idxBody'); if(!el) return;
+  try{ _idx=await (await fetch('/api/nurse/indexers')).json(); }catch(e){ el.innerHTML='<div class="dim">could not load</div>'; return; }
+  idxPaint();
+}
+function idxPaint(){
+  const el=document.getElementById('idxBody'); if(!el||!_idx) return;
+  const d=_idx, rows=d.indexers||[];
+  const pct=(a,b)=>b?Math.round(100*a/b)+'%':'—';
+  const act=(w,label,n)=>w==null?'<span class="dim" title="tracking began '+esc(d.tracked_since||'today')+' - a week needs a week of snapshots">—</span>'
+    :`<span title="${label}: ${w[0]} queries, ${w[1]} grabs, ${w[2]} failed queries">${fmt(w[1])}<span class="dim"> / ${fmt(w[0])}</span></span>`;
+  const st=r=>!r.enabled?(r.off_by_nurse?`<span class="pill p-warn" title="the nurse switched it off ${esc(ago(r.off_by_nurse))}; tested daily">off - nurse</span>`:'<span class="pill p-dim">off</span>')
+    :r.down?`<span class="pill p-bad" title="failing since ${new Date(r.down_since*1000).toLocaleString()}; Prowlarr retries ${r.retry_at?new Date(r.retry_at*1000).toLocaleString():'soon'}">down ${r.down_since?esc(ago(r.down_since).replace(' ago','')):''}</span>`
+    :'<span class="pill p-ok">ok</span>';
+  const btn=(r)=>{
+    const b=_idxBusy[r.name];
+    return `<button style="font-size:10.5px;padding:1px 8px" ${b?'disabled':''} onclick="idxTest('${jsq(r.name)}')">${b==='test'?'testing…':'Test'}</button>
+      <button style="font-size:10.5px;padding:1px 8px" ${b?'disabled':''} onclick="idxOn('${jsq(r.name)}',${r.enabled?0:1})">${r.enabled?'Off':'On'}</button>`;
+  };
+  const res=r=>{ const t=_idxBusy['res:'+r.name]; return t?`<div style="font-size:10.5px;color:${t.ok?'#7fd4a3':'#e0575b'}">${t.ok?'answers ('+t.secs+' s)':esc(t.why||'failed')}</div>`:''; };
+  const cons=(d.containers||[]);
+  el.innerHTML=`
+   <div class="lkind" style="padding:10px 12px;margin-top:6px">
+    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+      <b style="color:#6fb0ff">Indexers</b>
+      <span class="dim" style="font-size:11px">${rows.length} in Prowlarr · ${rows.filter(r=>r.enabled&&!r.down).length} working ·
+        ${rows.filter(r=>r.down).length} down · ${rows.filter(r=>!r.enabled).length} off</span>
+      ${(d.apps||[]).map(a=>`<span class="pill" title="Prowlarr ${esc(a.sync)} to ${esc(a.name)}, indexers tagged ${esc((a.tags||[]).join(', ')||'anything')}">${esc(a.name)} · ${esc(a.sync==='fullSync'?'full sync':a.sync)}</span>`).join(' ')}
+      <button style="margin-left:auto;font-size:11px" onclick="idxSync(this)" title="Push Prowlarr's indexers and their settings to Sonarr and Radarr now, rather than waiting for its own schedule">Sync to the arrs</button>
+      <a href="${esc(d.url||'#')}" target="_blank" rel="noopener" style="font-size:11px">open Prowlarr ›</a>
+    </div>
+    ${d.error?`<div class="err" style="font-size:11px;margin-top:5px">${esc(d.error)}</div>`:''}
+    <div style="overflow-x:auto;margin-top:7px">
+    <table style="width:100%;font-size:11.5px;border-collapse:collapse;min-width:760px">
+      <tr class="dim" style="font-size:10.5px;text-align:left">
+        <td style="padding:3px 6px">INDEXER</td><td>STATE</td><td title="Prowlarr priority - lower is tried first">PRI</td><td>FEEDS</td>
+        <td title="grabs / queries over the last 7 days, from nuarr's daily snapshot">7 DAYS</td>
+        <td title="grabs / queries over the last 30 days">30 DAYS</td>
+        <td title="since the indexer was added to Prowlarr">ALL TIME</td>
+        <td title="share of queries that failed, all time">FAIL</td><td title="average response">SPEED</td>
+        <td title="outages the nurse has seen, and the hours they lasted">RECORD</td><td></td></tr>
+      ${rows.map(r=>`<tr style="border-top:1px solid var(--line);${r.enabled?'':'opacity:.6'}">
+        <td style="padding:5px 6px"><b>${esc(r.name)}</b>
+          <div class="dim" style="font-size:10px">${esc(r.protocol||'')} · ${esc(r.privacy||'')}${r.proxy?' · <span title="sent through the Cloudflare proxy (Byparr)">via proxy</span>':''}</div>${res(r)}</td>
+        <td>${st(r)}</td><td class="mono">${r.priority}</td>
+        <td class="dim" style="font-size:10.5px">${esc((r.to||[]).join(', ')||'none')}</td>
+        <td class="mono">${act(r.week,'7 days')}</td><td class="mono">${act(r.month,'30 days')}</td>
+        <td class="mono">${fmt(r.grabs)}<span class="dim"> / ${fmt(r.queries)}</span></td>
+        <td class="mono" style="color:${r.queries&&r.failed_q/r.queries>0.05?'#e2b341':'inherit'}">${pct(r.failed_q,r.queries)}</td>
+        <td class="mono" style="color:${r.avg_ms>3000?'#e2b341':'inherit'}">${r.avg_ms?(r.avg_ms>=1000?(r.avg_ms/1000).toFixed(1)+' s':r.avg_ms+' ms'):'—'}</td>
+        <td class="mono" style="font-size:10.5px">${r.outages?`${r.outages}× · ${r.down_h} h`:'<span class="dim">clean</span>'}</td>
+        <td style="white-space:nowrap;text-align:right">${btn(r)}</td></tr>`).join('')}
+    </table></div>
+    <div class="dim" style="font-size:10.5px;margin-top:5px">Grabs / queries. The 7- and 30-day columns fill in as nuarr's daily snapshots age
+      (tracking since ${esc(d.tracked_since||'today')}); an indexer that is queried every day and never grabbed is one that costs search time for nothing.</div>
+   </div>
+   <div class="lkind" style="padding:10px 12px;margin-top:10px">
+    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+      <b style="color:#6fb0ff">Docker containers</b>
+      <span class="pill ${d.docker?'p-ok':'p-bad'}">engine ${d.docker?'up':'down'}</span>
+      <span class="dim" style="font-size:11px">${cons.filter(c=>c.up).length} of ${cons.length} running - the proxy lives here, and so do Profilarr, Immich and Nextcloud</span>
+    </div>
+    ${cons.length?`<table style="width:100%;font-size:11.5px;border-collapse:collapse;margin-top:6px">
+      ${cons.map(c=>`<tr style="border-top:1px solid var(--line)">
+        <td style="padding:4px 6px"><b>${esc(c.name)}</b><div class="dim mono" style="font-size:10px">${esc(c.image)}</div></td>
+        <td style="color:${c.up?(/unhealthy/.test(c.status)?'#e2b341':'#7fd4a3'):'#e0575b'}">${esc(c.status)}</td>
+        <td class="dim mono">${c.ports?':'+esc(c.ports):''}</td>
+        <td style="white-space:nowrap;text-align:right">
+          ${c.up?`<button style="font-size:10.5px;padding:1px 8px" onclick="idxCon('${jsq(c.name)}','restart',this)">Restart</button>`
+                :`<button style="font-size:10.5px;padding:1px 8px" onclick="idxCon('${jsq(c.name)}','start',this)">Start</button>`}</td></tr>`).join('')}
+    </table>`:`<div class="dim" style="font-size:11px;margin-top:5px">${d.docker?'no containers':'Docker Desktop is not running - the nurse starts it in auto mode, or use Check now above'}</div>`}
+   </div>`;
+}
+async function idxTest(name){
+  _idxBusy[name]='test'; idxPaint();
+  let r; try{ r=await (await fetch('/api/nurse/test?name='+encodeURIComponent(name),{method:'POST'})).json(); }catch(e){ r={ok:false,why:'no answer'}; }
+  delete _idxBusy[name]; _idxBusy['res:'+name]=r; loadIdx();
+}
+async function idxOn(name,on){
+  _idxBusy[name]='on'; idxPaint();
+  await fetch('/api/nurse/indexer?name='+encodeURIComponent(name)+'&on='+on,{method:'POST'});
+  delete _idxBusy[name]; loadIdx();
+}
+async function idxSync(btn){
+  btn.disabled=true; btn.textContent='syncing…';
+  await fetch('/api/nurse/sync',{method:'POST'});
+  setTimeout(()=>{ btn.disabled=false; btn.textContent='Sync to the arrs'; loadIdx(); },3000);
+}
+async function idxCon(name,op,btn){
+  if(op!=='start' && !confirm(op+' '+name+'?')) return;
+  btn.disabled=true; btn.textContent=op==='start'?'starting…':'restarting…';
+  const r=await (await fetch('/api/nurse/container?name='+encodeURIComponent(name)+'&op='+op,{method:'POST'})).json();
+  if(!r.ok) alert(r.why||'failed');
+  loadIdx();
+}
 async function nurseMode(m){ await fetch('/api/nurse/mode?mode='+m,{method:'POST'}); loadNurse(); }
-async function nurseRun(){ await fetch('/api/nurse/run',{method:'POST'}); setTimeout(loadNurse,1500); setTimeout(loadNurse,8000); setTimeout(loadNurse,30000); }
-async function nurseIdx(name,on){ await fetch('/api/nurse/indexer?name='+encodeURIComponent(name)+'&on='+(on?1:0),{method:'POST'}); loadNurse(); }
+async function nurseRun(){ await fetch('/api/nurse/run',{method:'POST'}); setTimeout(loadNurse,1500); setTimeout(loadIdx,8000); setTimeout(loadIdx,30000); }
+async function nurseIdx(name,on){ await fetch('/api/nurse/indexer?name='+encodeURIComponent(name)+'&on='+(on?1:0),{method:'POST'}); loadIdx(); }
 async function nurseProwlarr(){
   const u=document.getElementById('nurseUrl').value, k=document.getElementById('nurseKey').value;
   await fetch('/api/nurse/prowlarr?url='+encodeURIComponent(u)+(k?'&key='+encodeURIComponent(k):''),{method:'POST'});
@@ -34706,7 +34859,6 @@ async function nurseProwlarr(){
 async function loadArrHealth(force){
   const el=document.getElementById('arrHealth');
   if(!el) return;
-  try{ loadNurse(); }catch(e){}
   let d;
   try{ d=await (await fetch('/api/arrs/health'+(force?'?refresh=true':''))).json(); }
   catch(e){ el.innerHTML=''; return; }
@@ -47519,6 +47671,71 @@ async function arrsRefresh(){
   const boxes=[...body.querySelectorAll('.scrollbox, .rowbox')];
   keep.forEach((t,i)=>{ if(boxes[i]) boxes[i].scrollTop=t; });
 }
+// THE CARD EVERY ARR JOB IS DRAWN WITH - hoisted out of loadArrsTab so a job
+// that belongs on another page (TVDB re-ID repair, on Metadata) looks the same there.
+const arrJobNameRow=(ed,arr)=>{
+  const list=(ed.names[arr]||[]);
+  return `<div style="margin-top:4px">
+    <div style="display:flex;gap:6px;align-items:center">
+      <span class="dim" style="width:52px;flex:none;font-size:11px">${arr}</span>
+      <input id="nm-${ed.kind}-${arr}" style="flex:1;min-width:0;font-size:11px"
+             placeholder="comma-separated names — leave empty for none"
+             value="${esc(list.join(', '))}">
+      <button style="font-size:10px;padding:2px 9px;flex:none"
+              onclick="arrsPick('${ed.kind}','${arr}')">Pick…</button>
+    </div>
+    <div id="pick-${ed.kind}-${arr}" style="display:none;margin:5px 0 0 58px;
+         border:1px solid var(--line);border-radius:6px;max-height:210px;
+         overflow:auto;background:rgba(255,255,255,.02)"></div>
+  </div>`;
+};
+// A JOB WITH NOTHING TO NAME (the queue janitor) gets only its own list.
+const arrJobEditor=ed=>!ed?'':!ed.label?(ed.adder||''):`
+  <div style="margin-top:8px;border-top:1px solid var(--line);padding-top:8px">
+    <div style="font-size:11px;font-weight:600">${esc(ed.label)}</div>
+    ${arrJobNameRow(ed,'radarr')}${arrJobNameRow(ed,'sonarr')}
+    <div style="display:flex;gap:8px;align-items:center;margin-top:6px">
+      <button style="font-size:11px" onclick="arrsSaveNames('${ed.kind}')">Save</button>
+      <button style="font-size:11px" onclick="arrsResetNames('${ed.kind}')">Reset to defaults</button>
+      <span id="nmmsg-${ed.kind}" class="dim" style="font-size:11px"></span>
+    </div>
+    ${(!(ed.names.radarr||[]).length && !(ed.names.sonarr||[]).length)
+      ? `<div class="warn" style="font-size:11px;margin-top:4px">${esc(ed.empty)}</div>`:''}
+    ${ed.adder||''}
+  </div>`;
+// "in 4m" / "due now" for a timestamp ahead; the clock time sits beside it.
+const arrJobIn=t=>{ const s=t-Date.now()/1000; return s<=5?'due now'
+  : s<60?'in '+Math.round(s)+'s' : s<3600?'in '+Math.round(s/60)+'m'
+  : 'in '+(s/3600).toFixed(1)+'h'; };
+// The same line twelve times is one line with a count.
+const arrJobDedupe=xs=>{ const m=new Map(); xs.forEach(x=>m.set(x,(m.get(x)||0)+1));
+  return [...m].map(([x,n])=>n>1?x+'  ×'+n:x); };
+const arrJobCard=(id,title,desc,on,st,ed)=>`
+  <div id="job-${id}" style="border:1px solid var(--line);border-radius:8px;padding:10px 14px;margin-bottom:10px">
+    <div style="display:flex;align-items:center;gap:10px">
+      <b>${title}</b>
+      <span class="pill ${on?'p-ok':'p-dim'}" style="cursor:pointer"
+        title="click to turn ${on?'off':'on'}"
+        onclick="arrsToggle('${id}',${on?0:1})">${on?'ON':'off'}</span>
+      <button style="margin-left:auto" onclick="arrsRun('${id}')">Run now</button>
+    </div>
+    <div class="dim" style="font-size:11px;margin:6px 0 4px">${desc}</div>
+    <div class="mono" style="font-size:11px">
+      <div style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:2px">
+        <span title="${st.last_run?esc(new Date(st.last_run*1000).toLocaleString()):''}"><span class="dim">last run</span> ${
+          st.running?'<span style="color:var(--acc)">running now…</span>'
+          :st.last_run?`${ago(st.last_run)} <span class="dim">(${new Date(st.last_run*1000).toLocaleTimeString()})</span>`:'<span class="dim">not yet</span>'}</span>
+        <span title="${st.next_run?esc(new Date(st.next_run*1000).toLocaleString()):''}"><span class="dim">next run</span> ${
+          !on?'<span class="dim">off</span>'
+          :st.next_run?`${arrJobIn(st.next_run)} <span class="dim">(${new Date(st.next_run*1000).toLocaleTimeString()})</span>`:'<span class="dim">—</span>'}</span>
+      </div>
+      ${st.last_run?`<div>${esc(st.last_result||'')}</div>`:''}
+      ${(st.new_formats&&st.new_formats.length&&!ed)?`<div class="dim" style="margin-top:4px">new in the guides: ${esc(st.new_formats.join(', '))}</div>`:''}
+      ${(st.detail&&st.detail.length&&st.detail.join('; ')!==(st.last_result||''))
+        ?`<div class="dim" style="margin-top:4px">${arrJobDedupe(st.detail).map(x=>esc(x)).join('<br>')}</div>`:''}
+    </div>
+    ${arrJobEditor(ed)}
+  </div>`;
 async function loadArrsTab(refresh){
   if(!refresh){
     loadArrConns();
@@ -47541,36 +47758,6 @@ async function loadArrsTab(refresh){
   // the edge: a flex item's default minimum is its CONTENT width, so a long
   // comma-separated value refused to shrink and shoved the button out of the
   // panel. flex:none on the button keeps it its natural size either way.
-  const nameRow=(ed,arr)=>{
-    const list=(ed.names[arr]||[]);
-    return `<div style="margin-top:4px">
-      <div style="display:flex;gap:6px;align-items:center">
-        <span class="dim" style="width:52px;flex:none;font-size:11px">${arr}</span>
-        <input id="nm-${ed.kind}-${arr}" style="flex:1;min-width:0;font-size:11px"
-               placeholder="comma-separated names — leave empty for none"
-               value="${esc(list.join(', '))}">
-        <button style="font-size:10px;padding:2px 9px;flex:none"
-                onclick="arrsPick('${ed.kind}','${arr}')">Pick…</button>
-      </div>
-      <div id="pick-${ed.kind}-${arr}" style="display:none;margin:5px 0 0 58px;
-           border:1px solid var(--line);border-radius:6px;max-height:210px;
-           overflow:auto;background:rgba(255,255,255,.02)"></div>
-    </div>`;
-  };
-  // A JOB WITH NOTHING TO NAME (the queue janitor) gets only its own list.
-  const editor=ed=>!ed?'':!ed.label?(ed.adder||''):`
-    <div style="margin-top:8px;border-top:1px solid var(--line);padding-top:8px">
-      <div style="font-size:11px;font-weight:600">${esc(ed.label)}</div>
-      ${nameRow(ed,'radarr')}${nameRow(ed,'sonarr')}
-      <div style="display:flex;gap:8px;align-items:center;margin-top:6px">
-        <button style="font-size:11px" onclick="arrsSaveNames('${ed.kind}')">Save</button>
-        <button style="font-size:11px" onclick="arrsResetNames('${ed.kind}')">Reset to defaults</button>
-        <span id="nmmsg-${ed.kind}" class="dim" style="font-size:11px"></span>
-      </div>
-      ${(!(ed.names.radarr||[]).length && !(ed.names.sonarr||[]).length)
-        ? `<div class="warn" style="font-size:11px;margin-top:4px">${esc(ed.empty)}</div>`:''}
-      ${ed.adder||''}
-    </div>`;
   // NEW FORMATS THE GUIDES HAVE AND YOUR ARR DOES NOT. The sync only ever
   // listed these, which was the right default and also meant adding fifteen
   // of them was fifteen trips through the arr's own UI. Ticked list + one
@@ -47610,39 +47797,7 @@ async function loadArrsTab(refresh){
       </div>
     </div>`;
   };
-  // "in 4m" / "due now" for a timestamp ahead; the clock time sits beside it.
-  const jobIn=t=>{ const s=t-Date.now()/1000; return s<=5?'due now'
-    : s<60?'in '+Math.round(s)+'s' : s<3600?'in '+Math.round(s/60)+'m'
-    : 'in '+(s/3600).toFixed(1)+'h'; };
-  // The same line twelve times is one line with a count.
-  const jobDedupe=xs=>{ const m=new Map(); xs.forEach(x=>m.set(x,(m.get(x)||0)+1));
-    return [...m].map(([x,n])=>n>1?x+'  ×'+n:x); };
-  const job=(id,title,desc,on,st,ed)=>`
-    <div id="job-${id}" style="border:1px solid var(--line);border-radius:8px;padding:10px 14px;margin-bottom:10px">
-      <div style="display:flex;align-items:center;gap:10px">
-        <b>${title}</b>
-        <span class="pill ${on?'p-ok':'p-dim'}" style="cursor:pointer"
-          title="click to turn ${on?'off':'on'}"
-          onclick="arrsToggle('${id}',${on?0:1})">${on?'ON':'off'}</span>
-        <button style="margin-left:auto" onclick="arrsRun('${id}')">Run now</button>
-      </div>
-      <div class="dim" style="font-size:11px;margin:6px 0 4px">${desc}</div>
-      <div class="mono" style="font-size:11px">
-        <div style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:2px">
-          <span title="${st.last_run?esc(new Date(st.last_run*1000).toLocaleString()):''}"><span class="dim">last run</span> ${
-            st.running?'<span style="color:var(--acc)">running now…</span>'
-            :st.last_run?`${ago(st.last_run)} <span class="dim">(${new Date(st.last_run*1000).toLocaleTimeString()})</span>`:'<span class="dim">not yet</span>'}</span>
-          <span title="${st.next_run?esc(new Date(st.next_run*1000).toLocaleString()):''}"><span class="dim">next run</span> ${
-            !on?'<span class="dim">off</span>'
-            :st.next_run?`${jobIn(st.next_run)} <span class="dim">(${new Date(st.next_run*1000).toLocaleTimeString()})</span>`:'<span class="dim">—</span>'}</span>
-        </div>
-        ${st.last_run?`<div>${esc(st.last_result||'')}</div>`:''}
-        ${(st.new_formats&&st.new_formats.length&&!ed)?`<div class="dim" style="margin-top:4px">new in the guides: ${esc(st.new_formats.join(', '))}</div>`:''}
-        ${(st.detail&&st.detail.length&&st.detail.join('; ')!==(st.last_result||''))
-          ?`<div class="dim" style="margin-top:4px">${jobDedupe(st.detail).map(x=>esc(x)).join('<br>')}</div>`:''}
-      </div>
-      ${editor(ed)}
-    </div>`;
+  const job=arrJobCard;
   // WEBHOOKS FIRST, GUARDS LAST. Webhooks are how Nuarr hears about the arrs
   // at all - if they are broken nothing else on this page matters. The guards
   // are optional scripts that fix a specific annoyance, so they sit at the
@@ -47725,18 +47880,8 @@ async function loadArrsTab(refresh){
         +'arr goes looking for a real release instead. And a finished download the arr cannot place - "Unable to parse release", an unknown series or film - has its name read by Qwen, and is imported when that reading matches exactly one film or episode here and the arr offers the file for it; anything else stays for you.',
         d.toggles.queue_janitor, qjst,
         {label:'', kind:'queue_janitor', names:{}, empty:'', adder:qjList(qj)})
-    + job('tvdb_fix','TVDB re-ID repair: series TheTVDB deleted and re-added',
-        'TheTVDB sometimes deletes a series and creates it again under a new id. Sonarr '
-        +'keeps the dead id - no new episodes, no metadata, a red line on its health page - '
-        +'until the series is removed and added back. Every '+String(Math.round(((d.tvdb_fix||{}).poll_s||21600)/3600))
-        +' hours this finds those and, only when exactly one TheTVDB entry has the same title '
-        +'and year, removes the series with its files kept, renames the folder to the new '
-        +'{tvdb-...} id, and adds it back with the same profile, tags and monitoring, no '
-        +'search. Sonarr re-imports the files on its rescan. No match, or more than one, is '
-        +'listed here for you and nothing is touched. Sonarr\'s own history for a repaired '
-        +'series is lost.',
-        d.toggles.tvdb_fix, ((d.tvdb_fix||{}).stats||{}),
-        {label:'', kind:'tvdb_fix', names:{}, empty:'', adder:tvList(d.tvdb_fix||{})})
+    + `<div class="dim" style="font-size:11px;margin:0 4px 10px">TVDB re-ID repair (series TheTVDB deleted and
+         re-added) is on the <a href="#meta">Metadata page</a>.</div>`
     + `<div class="dim" style="font-size:11px;margin-top:10px;padding:0 4px">Where the arrs'
          imports land - the disk nuarr picks for them, and the last few placed - is on the
          <a href="#drivepool">DrivePool page</a>,
@@ -49040,12 +49185,14 @@ async function banStrike(grp,action,i){
 async function arrsToggle(job,on){
   await fetch(`/api/arrguard/toggle?job=${job}&on=${on}`,{method:'POST'});
   loadArrsTab();
+  loadMetaTvdb();
 }
 async function arrsRun(job){
   const el=document.getElementById('arrsBody');
   if(el) el.insertAdjacentHTML('afterbegin','<div class="dim" id="arrsBusy">running…</div>');
   try{ await fetch(`/api/arrguard/run?job=${job}`,{method:'POST'}); }catch(e){}
   loadArrsTab();
+  loadMetaTvdb();
 }
 function arrsSay(kind,html){
   const m=document.getElementById('nmmsg-'+kind);
@@ -49957,6 +50104,7 @@ _SETTINGS_NAV = [
                     ("qwen",    "Qwen",            "language"),
                     ("ocr",     "OCR engines",     "language")]),
     ("Integrations", [("arrs", "Arrs",             "link"),
+                      ("indexers", "Prowlarr & indexers", "search"),
                       ("plex", "Plex",             "play"),
                       ("tautulli", "Tautulli",     "health"),
                       ("pushover", "Pushover",     "bell"),
@@ -50048,6 +50196,7 @@ _SETTINGS_SHIM = """
     ffmpeg:  I('<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M3 15h18M8 4v16M16 4v16"/>'),
     mkv:     I('<path d="M14 6a4 4 0 0 0-5.7 5.7L3 17l4 4 5.3-5.3A4 4 0 0 0 18 10l-2.5 2.5-2-2L16 8z"/>'),
     whisper: I('<path d="M4 12c2-5 5-7 8-7s6 2 8 7c-2 5-5 7-8 7s-6-2-8-7z"/><circle cx="12" cy="12" r="2.5"/>'),
+    search:  I('<circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/>'),
     subai:   I('<path d="M12 3l1.8 4.6L18 9.4l-4.2 1.8L12 16l-1.8-4.8L6 9.4l4.2-1.8z"/><path d="M5 17l.8 2 2 .8-2 .8L5 22l-.8-1.4-2-.8 2-.8z"/><path d="M19 15l.6 1.5 1.4.5-1.4.6L19 19l-.6-1.4-1.4-.6 1.4-.5z"/>'),
     ocr:     I('<path d="M4 8V5h3M17 5h3v3M20 16v3h-3M7 19H4v-3M8 12h8M12 8v8"/>'),
     arrs:    I('<path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7L11.5 6.8M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1.5-1.5"/>'),

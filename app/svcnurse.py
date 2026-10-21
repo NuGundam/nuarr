@@ -176,7 +176,7 @@ async def _notify(title: str, text: str) -> None:
     try:
         from . import pushover
         if pushover.configured() and pushover.enabled():
-            await pushover.send(title, text, url=pushover._link() + "/settings#arrs", url_title="open nuarr")
+            await pushover.send(title, text, url=pushover._link() + "/settings#indexers", url_title="open nuarr")
     except Exception:                                    # noqa: BLE001
         pass
 
@@ -493,3 +493,130 @@ async def watch() -> None:
         except Exception as e:                           # noqa: BLE001
             joblog.log(f"services nurse: {type(e).__name__}: {e}", "warn", system="nurse")
         await asyncio.sleep(POLL_S)
+
+
+# ------------------------------------------------- the indexers page ----
+# MANAGING AND TRACKING, on one page. Prowlarr knows each indexer's totals
+# since it was added; nuarr keeps a snapshot of them once a day, so the page
+# can say what each one did THIS WEEK - the figure that tells a dead source
+# from a quiet one - and the nurse's outage record sits beside it.
+SNAP_KEEP_DAYS = 35
+
+
+def _snap_daily(stats: list) -> None:
+    mem = _memory()
+    day = time.strftime("%Y-%m-%d")
+    daily = mem.setdefault("daily", {})
+    if day in daily:
+        return
+    daily[day] = {s["indexerName"]: [int(s.get("numberOfQueries") or 0), int(s.get("numberOfGrabs") or 0),
+                                     int(s.get("numberOfFailedQueries") or 0), int(s.get("numberOfFailedGrabs") or 0)]
+                  for s in stats or []}
+    for d in sorted(daily)[:-SNAP_KEEP_DAYS]:
+        daily.pop(d, None)
+    _remember(mem)
+
+
+def _since(daily: dict, name: str, cur: list, days: int):
+    """What an indexer did over the last `days`, from the oldest snapshot in
+    range - None until a snapshot that old exists."""
+    cut = time.strftime("%Y-%m-%d", time.localtime(time.time() - days * 86400))
+    old = [d for d in sorted(daily) if d <= cut]
+    base = daily[old[-1]].get(name) if old else None
+    if base is None:
+        return None
+    return [max(0, c - b) for c, b in zip(cur, base)]
+
+
+def indexers_view() -> dict:
+    """Every Prowlarr indexer with its status, totals, recent activity and record."""
+    idx = _api("/indexer") or []
+    status = {s["indexerId"]: s for s in (_api("/indexerstatus") or [])}
+    stats = {s["indexerId"]: s for s in ((_api("/indexerstats") or {}).get("indexers") or [])}
+    tags = {t["id"]: t["label"] for t in (_api("/tag") or [])}
+    apps = _api("/applications") or []
+    try:
+        _snap_daily(list(stats.values()))
+    except Exception:                                    # noqa: BLE001
+        pass
+    mem = _memory()
+    daily = mem.get("daily") or {}
+    rec = mem.get("indexers") or {}
+    rows = []
+    for i in sorted(idx, key=lambda x: (x.get("priority") or 25, x["name"].lower())):
+        st = stats.get(i["id"]) or {}
+        cur = [int(st.get("numberOfQueries") or 0), int(st.get("numberOfGrabs") or 0),
+               int(st.get("numberOfFailedQueries") or 0), int(st.get("numberOfFailedGrabs") or 0)]
+        s = status.get(i["id"]) or {}
+        itags = [tags.get(t, str(t)) for t in i.get("tags") or []]
+        to = [a["name"] for a in apps if not a.get("tags") or set(a["tags"]) & set(i.get("tags") or [])]
+        m = rec.get(i["name"]) or {}
+        rows.append({
+            "id": i["id"], "name": i["name"], "enabled": bool(i.get("enable")), "protocol": i.get("protocol"),
+            "privacy": i.get("privacy"), "priority": i.get("priority"), "tags": itags, "to": to,
+            "proxy": "cloudflare" in [t.lower() for t in itags],
+            "down": bool(s), "down_since": _ts(s.get("initialFailure")) if s else 0,
+            "retry_at": _ts(s.get("disabledTill")) if s else 0,
+            "queries": cur[0], "grabs": cur[1], "failed_q": cur[2], "failed_g": cur[3],
+            "avg_ms": int(st.get("averageResponseTime") or 0),
+            "week": _since(daily, i["name"], cur, 7), "month": _since(daily, i["name"], cur, 30),
+            "outages": int(m.get("outages") or 0), "down_h": round(float(m.get("down_s") or 0) / 3600, 1),
+            "off_by_nurse": float(m.get("off_by_nurse") or 0),
+        })
+    return {"indexers": rows, "apps": [{"name": a["name"], "sync": a.get("syncLevel"),
+                                         "tags": [tags.get(t, str(t)) for t in a.get("tags") or []]} for a in apps],
+            "tracked_since": min(daily) if daily else "", "url": prowlarr_url()}
+
+
+def indexer_test(name: str) -> dict:
+    idx = _api("/indexer") or []
+    i = next((x for x in idx if x["name"] == name), None)
+    if not i:
+        return {"ok": False, "why": "no such indexer"}
+    t0 = time.time()
+    try:
+        _api("/indexer/test", "POST", i, timeout=120)
+        ok, why = True, ""
+    except urllib.error.HTTPError as e:
+        ok = False
+        try:
+            why = (json.loads(e.read().decode("utf-8")) or [{}])[0].get("errorMessage", "")[:200]
+        except Exception:                                # noqa: BLE001
+            why = f"HTTP {e.code}"
+    except Exception as e:                               # noqa: BLE001
+        ok, why = False, f"{type(e).__name__}"
+    _act(f"tested {name}: {'answers' if ok else 'failed - ' + why}", ok=ok)
+    return {"ok": ok, "why": why, "secs": round(time.time() - t0, 1)}
+
+
+def sync_apps() -> dict:
+    """Push Prowlarr's indexers to Sonarr and Radarr now."""
+    try:
+        _api("/command", "POST", {"name": "ApplicationIndexerSync"})
+        _act("asked Prowlarr to sync its indexers to the arrs")
+        return {"ok": True}
+    except Exception as e:                               # noqa: BLE001
+        return {"ok": False, "why": f"{type(e).__name__}"}
+
+
+def containers() -> list:
+    rc, out = _run(["docker", "ps", "-a", "--format", "{{.Names}}|{{.Status}}|{{.Ports}}|{{.Image}}"])
+    if rc:
+        return []
+    rows = []
+    for line in out.splitlines():
+        p = line.split("|", 3)
+        if len(p) == 4:
+            rows.append({"name": p[0], "status": p[1], "up": p[1].startswith("Up"),
+                         "ports": ", ".join(sorted(set(re.findall(r":(\d+)->", p[2])))), "image": p[3]})
+    return rows
+
+
+def container_op(name: str, op: str) -> dict:
+    if op not in ("start", "restart", "stop"):
+        return {"ok": False, "why": "start, restart or stop"}
+    if name not in {c["name"] for c in containers()}:
+        return {"ok": False, "why": "no such container"}
+    rc, out = _run(["docker", op, name], timeout=120)
+    _act(f"docker {op} {name}" + ("" if not rc else f" failed: {out.strip()[:120]}"), ok=not rc)
+    return {"ok": not rc, "why": out.strip()[:200] if rc else ""}
