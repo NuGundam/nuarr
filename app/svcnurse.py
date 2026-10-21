@@ -306,6 +306,27 @@ async def check(act: bool | None = None) -> dict:
                 await _retest_arrs(back)
                 for name in back:
                     failing.pop(name, None)
+        # 5b. STALE MARKS ON THE ARRS. Prowlarr may have cleared an indexer
+        # (the proxy was fixed by a person, or came back by itself) while
+        # Sonarr and Radarr still hold "unavailable for more than 6 hours"
+        # until their own next look. Ask them to test it now.
+        if proxies_fine and act:
+            try:
+                from . import arrhealth
+                stale = set()
+                for row in arrhealth.STATE.get("arrs") or []:
+                    for h in row.get("health") or []:
+                        if "Indexer" in str(h.get("type") or ""):
+                            for n in re.findall(r"([^,:]+?)\s*\(Prowlarr\)", h.get("message") or ""):
+                                n = n.strip()
+                                if n and n not in failing:
+                                    stale.add(n)
+                if stale:
+                    STATE["stage"] = "clearing stale marks on the arrs"
+                    await _retest_arrs(sorted(stale))
+                    _act(f"asked the arrs to re-test {', '.join(sorted(stale))} - Prowlarr no longer has them down")
+            except Exception:                            # noqa: BLE001
+                pass
         # 6. AN INDEXER THAT KEEPS FAILING WHILE THE PROXY IS FINE
         if proxies_fine:
             for name, r in failing.items():
