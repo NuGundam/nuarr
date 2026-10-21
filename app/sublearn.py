@@ -75,6 +75,15 @@ def init() -> None:
         cur.execute("""CREATE TABLE IF NOT EXISTS learn_orig(
             file_id INTEGER PRIMARY KEY, path TEXT NOT NULL, show TEXT NOT NULL, tool TEXT NOT NULL DEFAULT '',
             text TEXT NOT NULL DEFAULT '', made_at REAL NOT NULL DEFAULT 0, checked_at REAL NOT NULL DEFAULT 0)""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS learn_styles(
+            show TEXT NOT NULL, font TEXT NOT NULL, size INTEGER NOT NULL, align INTEGER NOT NULL,
+            margin_v INTEGER NOT NULL, bold INTEGER NOT NULL DEFAULT 0, outline REAL NOT NULL DEFAULT 2,
+            primary_c TEXT NOT NULL DEFAULT '', outline_c TEXT NOT NULL DEFAULT '',
+            n INTEGER NOT NULL DEFAULT 1, files INTEGER NOT NULL DEFAULT 1, at REAL NOT NULL DEFAULT 0,
+            PRIMARY KEY(show, font, size, align))""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS learn_signstyles(
+            show TEXT NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL, n INTEGER NOT NULL DEFAULT 1,
+            at REAL NOT NULL DEFAULT 0, PRIMARY KEY(show, name))""")
         cur.execute("""CREATE TABLE IF NOT EXISTS learn_events(
             id INTEGER PRIMARY KEY AUTOINCREMENT, at REAL NOT NULL, kind TEXT NOT NULL,
             show TEXT NOT NULL DEFAULT '', detail TEXT NOT NULL DEFAULT '')""")
@@ -515,6 +524,128 @@ async def watch() -> None:
         await asyncio.sleep(86400)
 
 
+# ------------------------------------------------------------ styles -----
+# HOW THE SHOW ALREADY LOOKS. Every ASS track the second opinion reads says
+# which font, size and placement its dialogue uses and which style names are
+# signs or songs. The Subtitle maker can match that instead of a preset, so a
+# made episode sits beside the fansub's own like one of them.
+KV_MATCH = "sublearn.match_style"
+STYLE_MIN_FILES = 2
+
+
+def match_style_on() -> bool:
+    from .db import kv_get as _g
+    return str(_g(KV_MATCH) or "1") == "1"
+
+
+def set_match_style(on: bool) -> None:
+    from .db import kv_set as _s
+    _s(KV_MATCH, "1" if on else "0")
+
+
+_POSD = re.compile(r"\\(?:pos|move|an[1-9])\b")
+
+
+def _ass_styles(ass_text: str) -> tuple:
+    """({style name: fields}, {style name: event count}, {style name: positioned count})"""
+    styles, used, posd = {}, {}, {}
+    fmt = None
+    for ln in (ass_text or "").splitlines():
+        if ln.startswith("Format:") and fmt is None and "Fontname" in ln:
+            fmt = [x.strip().lower() for x in ln[7:].split(",")]
+        elif ln.startswith("Style:") and fmt:
+            parts = [x.strip() for x in ln[6:].split(",")]
+            if len(parts) >= len(fmt):
+                styles[parts[0]] = dict(zip(fmt, parts))
+        elif ln.startswith("Dialogue:"):
+            parts = ln[9:].split(",", 9)
+            if len(parts) >= 10:
+                st = parts[3].strip()
+                used[st] = used.get(st, 0) + 1
+                if _POSD.search(parts[9]):
+                    posd[st] = posd.get(st, 0) + 1
+    return styles, used, posd
+
+
+def _looks_sign(name: str) -> bool:
+    try:
+        from .subtitletitle import _style_is_sign
+        return bool(_style_is_sign(name))
+    except Exception:                                            # noqa: BLE001
+        return bool(re.search(r"sign|song|\bop\b|\bed\b|title|karaoke|lyric", name, re.I))
+
+
+def learn_style(show: str, ass_text: str, path_hint: str = "") -> dict | None:
+    """Record the dialogue style and the sign-style names of one ASS track."""
+    init()
+    styles, used, posd = _ass_styles(ass_text)
+    if not styles or not used:
+        return None
+    main = None
+    for name, n in sorted(used.items(), key=lambda x: -x[1]):
+        if name in styles and n >= 10 and posd.get(name, 0) < 0.3 * n and not _looks_sign(name):
+            main = name
+            break
+    out = {"dialogue_style": main, "signs": []}
+    now = time.time()
+    with cursor() as cur:
+        _touch_show(cur, show, path_hint)
+        if main:
+            f = styles[main]
+
+            def num(k, d):
+                try:
+                    return float(f.get(k, d))
+                except Exception:                                # noqa: BLE001
+                    return d
+            scale = 1.0
+            m = re.search(r"^PlayResY:\s*(\d+)", ass_text, re.M)
+            if m and int(m.group(1)) not in (0, 1080):
+                scale = 1080.0 / int(m.group(1))          # sizes are kept at 1080 lines
+            font = f.get("fontname") or ""
+            size = int(round(num("fontsize", 60) * scale))
+            align = int(num("alignment", 2))
+            mv = int(round(num("marginv", 40) * scale))
+            cur.execute("INSERT INTO learn_styles(show, font, size, align, margin_v, bold, outline, primary_c, outline_c, n, files, at) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,1,?) ON CONFLICT(show, font, size, align) DO UPDATE SET "
+                        "n=learn_styles.n+excluded.n, files=learn_styles.files+1, margin_v=excluded.margin_v, at=excluded.at",
+                        (show, font, size, align, mv, int(num("bold", 0) != 0), round(num("outline", 2) * scale, 1),
+                         f.get("primarycolour") or "", f.get("outlinecolour") or "", int(used[main]), now))
+            out.update(font=font, size=size, align=align, margin_v=mv)
+        for name, n in used.items():
+            if name == main or n < 3:
+                continue
+            if posd.get(name, 0) >= 0.6 * n or _looks_sign(name):
+                out["signs"].append(name)
+                cur.execute("INSERT INTO learn_signstyles(show, name, kind, n, at) VALUES(?,?,'sign',1,?) "
+                            "ON CONFLICT(show, name) DO UPDATE SET n=learn_signstyles.n+1, at=excluded.at",
+                            (show, name, now))
+        if main:
+            _event(cur, "style", show, f"dialogue style read: {out['font']} {out['size']}px, alignment {out['align']}, "
+                                       f"margin {out['margin_v']}" + (f"; sign styles: {', '.join(out['signs'][:4])}" if out["signs"] else ""))
+    return out
+
+
+def style_for(show: str) -> dict | None:
+    """The show's own dialogue look, when enough files agree - for substyle.to_ass."""
+    if not match_style_on():
+        return None
+    init()
+    with cursor() as cur:
+        r = cur.execute("SELECT * FROM learn_styles WHERE show=? ORDER BY files DESC, n DESC LIMIT 1", (show,)).fetchone()
+    if not r or int(r["files"] or 0) < STYLE_MIN_FILES or not r["font"]:
+        return None
+    return {"font": r["font"], "size": int(r["size"]), "align": int(r["align"]), "margin_v": int(r["margin_v"]),
+            "bold": -1 if r["bold"] else 0, "outline": float(r["outline"] or 2),
+            "primary": r["primary_c"] or "", "outline_c": r["outline_c"] or "", "files": int(r["files"])}
+
+
+def sign_styles(show: str) -> set:
+    init()
+    with cursor() as cur:
+        return {r["name"] for r in cur.execute("SELECT name FROM learn_signstyles WHERE show=? AND n>=2", (show,))}
+
+
 # --------------------------------------------------------- the panels -----
 def snapshot(kind: str = "") -> dict:
     init()
@@ -539,10 +670,15 @@ def snapshot(kind: str = "") -> dict:
             "SELECT e.*, COALESCE(s.label, e.show) label FROM learn_events e LEFT JOIN learn_shows s ON s.show=e.show "
             "ORDER BY e.id DESC LIMIT 40").fetchall()]
         made = cur.execute("SELECT COUNT(*) n FROM learn_orig").fetchone()["n"]
+        styles = [dict(r) for r in cur.execute(
+            "SELECT t.*, COALESCE(s.label, t.show) label, "
+            " (SELECT GROUP_CONCAT(name, ', ') FROM learn_signstyles g WHERE g.show=t.show) sign_names "
+            "FROM learn_styles t LEFT JOIN learn_shows s ON s.show=t.show ORDER BY t.files DESC, t.n DESC LIMIT 60")]
     for f in fx:
         f["active"] = bool(f["on_"]) and (f["source"] != "qwen" or f["n"] >= QWEN_ADOPT_N)
     out = {"shows": shows, "fixes": fx, "events": ev, "made_kept": made, "qwen_adopt_n": QWEN_ADOPT_N,
-           "names_max": NAMES_MAX, **STATE}
+           "names_max": NAMES_MAX, "styles": styles, "match_style": match_style_on(),
+           "style_min_files": STYLE_MIN_FILES, **STATE}
     if kind == "qwen":
         try:
             from . import qwenjudge

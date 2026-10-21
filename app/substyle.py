@@ -158,8 +158,20 @@ def srt_cues(text: str) -> list:
     return out
 
 
-def to_ass(srt_text: str, preset: str, title: str = "") -> str:
-    p = PRESETS[preset]
+def to_ass(srt_text: str, preset: str, title: str = "", override: dict | None = None) -> str:
+    p = dict(PRESETS[preset])
+    # THE SHOW'S OWN LOOK, when sublearn has read enough of its tracks: font,
+    # size and placement follow the fansub's dialogue style; the preset keeps
+    # supplying what the track did not say.
+    if override:
+        for k in ("font", "size", "align", "margin_v", "bold", "outline"):
+            if override.get(k) not in (None, ""):
+                p[k] = override[k]
+        if override.get("primary"):
+            p["primary"] = override["primary"]
+        if override.get("outline_c"):
+            p["outline_c"] = override["outline_c"]
+    align = int(p.get("align") or 2)
     head = [
         "[Script Info]",
         f"; nuarr style: {preset}",
@@ -176,7 +188,7 @@ def to_ass(srt_text: str, preset: str, title: str = "") -> str:
         "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, "
         "Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
         f"Style: Default,{p['font']},{p['size']},{p['primary']},&H000000FF,{p['outline_c']},{p['back']},"
-        f"{p['bold']},0,0,0,100,100,0,0,1,{p['outline']},{p['shadow']},2,120,120,{p['margin_v']},1",
+        f"{p['bold']},0,0,0,100,100,0,0,1,{p['outline']},{p['shadow']},{align},120,120,{p['margin_v']},1",
         f"Style: Sign,{p['font']},{p['sign_size']},{p['sign_primary']},&H000000FF,{p['sign_outline_c']},"
         f"{p['back']},{p['bold']},0,0,0,100,100,0,0,1,{p['sign_outline']},{p['shadow']},8,120,120,"
         f"{p['margin_v']},1",

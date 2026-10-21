@@ -7700,6 +7700,11 @@ def _submake_running() -> list:
         out += qwenjudge.as_running()
     except Exception:                                            # noqa: BLE001
         pass
+    try:
+        from . import subverify
+        out += subverify.as_running()
+    except Exception:                                            # noqa: BLE001
+        pass
     return out
 
 

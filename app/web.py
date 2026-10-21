@@ -811,6 +811,10 @@ async def _startup() -> None:
         from . import sublearn as _sl
         _sl.init()
         asyncio.create_task(_sl.watch())
+        # THE SECOND OPINION: the three engines settle the board's unsure rows.
+        from . import subverify as _sv
+        _sv.init()
+        asyncio.create_task(_sv.watch())
         # DECODE, DON'T JUST PROBE. Truncation is the commonest way a file in
         # a media library is broken and the only one ffprobe cannot see, so
         # this reads a window at each end. Bounded, and only while the pool is
@@ -10942,6 +10946,47 @@ def api_learn_fix(body: dict = Body(...)):
     return {"ok": sublearn.set_fix(str(body.get("show") or sublearn.ALL), str(body.get("wrong") or ""),
                                    str(body.get("right") or ""), str(body.get("scope") or "any"),
                                    str(body.get("action") or ""))}
+
+
+@app.post("/api/learn/match_style")
+def api_learn_match_style(on: int = 1):
+    from . import sublearn
+    sublearn.set_match_style(bool(on))
+    return {"on": bool(on)}
+
+
+@app.get("/api/verify")
+def api_verify():
+    """The second opinion: mode, engine reliability, what it verified lately."""
+    from . import subverify
+    return subverify.snapshot()
+
+
+@app.post("/api/verify/mode")
+def api_verify_mode(mode: str):
+    from . import subverify
+    m = subverify.set_mode(mode)
+    joblog.log(f"second opinion: mode set to {m}", "info")
+    return {"mode": m}
+
+
+@app.post("/api/verify/budget")
+def api_verify_budget(sure: int | None = None, per_hour: int | None = None):
+    from . import subverify
+    return subverify.set_budget(sure, per_hour)
+
+
+@app.post("/api/verify/run")
+async def api_verify_run(n: int = 3):
+    """Verify the next N unsure rows now (the heavy lane permitting)."""
+    from . import subverify
+    return await asyncio.to_thread(subverify.run_batch, max(1, min(20, int(n))))
+
+
+@app.post("/api/verify/stop")
+def api_verify_stop():
+    from . import subverify
+    return {"ok": subverify.stop()}
 
 
 @app.post("/api/learn/scan")
@@ -37611,6 +37656,90 @@ function etPaint(el,d){
 
 // ---- Qwen: the Subtitle maker's translator -------------------------------
 let _qw=null, _qwPoll=null;
+// ---- the second opinion (subverify.py) - shown at the top of each learning panel ----
+let _vfy=null, _vfyAt=0, _vfyOpen=null;
+const VFY_VOTE={dialogue:['#3fb950','dialogue'],not:['#e0575b','not dialogue'],undecided:['#8b949e','unsure'],english:['#3fb950','English spoken'],raw:['#e3b341','a raw']};
+async function vfyLoad(force){
+  if(!force && _vfy && Date.now()-_vfyAt<15000) return _vfy;
+  try{ _vfy=await (await fetch('/api/verify')).json(); _vfyAt=Date.now(); }catch(e){}
+  return _vfy;
+}
+function vfyVote(v){ const c=VFY_VOTE[v]||['#8b949e','-']; return `<span style="color:${c[0]}">${esc(c[1])}</span>`; }
+function vfyBlock(kind){
+  const v=_vfy; if(!v) return '<div class="dim" style="font-size:11px">loading the second opinion…</div>';
+  const eng=v.engines||{};
+  const engChip=(k,word)=>{ const e=eng[k]||{}; const n=e.total||0; return `<span title="${n} verdict(s) it took part in; its weight in the next vote is ${e.weight}" style="display:inline-block;margin-right:10px">${word}: <b>${n?Math.round(e.rate*100)+'%':'no record yet'}</b><span class="dim"> right${n?' of '+fmt(n):''} · weight ${e.weight}</span></span>`; };
+  const focus={whisper:'Whisper',qwen:'Qwen',ocr:'the readers'}[kind];
+  const rows=v.recent||[];
+  return `<div class="lkind" style="margin-top:12px;padding:11px 12px">
+    <div class="lkindhead"><b style="color:#79c0ff">The second opinion</b>
+      <span class="dim" style="font-size:11px">${v.running?`<span class="dlspin"></span>verifying <b>${esc(v.label||'')}</b> - ${esc(v.stage||'')} ${Math.round(v.pct||0)}%`:
+        `${fmt(v.waiting<0?0:v.waiting)} unsure file(s) waiting · ${fmt(v.answered)} answered by it so far · ${fmt(v.left)} left for you${v.last_run?' · last '+ago(v.last_run):''}`}</span>
+      <span style="margin-left:auto;display:flex;gap:6px;align-items:center;font-size:11px">
+        <select onchange="vfyMode(this.value)" style="font-size:11px" title="off: never runs. advise: verifies and attaches the evidence to the row, a person still answers. auto: answers at or above the sure line and carries the fix out.">
+          ${[['off','off'],['advise','advise only'],['auto','auto - answer and fix']].map(([k,w])=>`<option value="${k}" ${v.mode===k?'selected':''}>${w}</option>`).join('')}</select>
+        sure at <input type="number" min="50" max="100" value="${v.sure_at}" style="width:46px;font-size:11px" onchange="vfyBudget(this.value,null)">%
+        · <input type="number" min="1" max="60" value="${v.per_hour}" style="width:40px;font-size:11px" onchange="vfyBudget(null,this.value)">/hour
+        <button class="rmb" onclick="vfyRun(this)" ${v.running?'disabled':''}>Verify 3 now</button>
+        ${v.running?`<button class="rmb" onclick="fetch('/api/verify/stop',{method:'POST'})">Stop</button>`:''}</span></div>
+    <div class="dim" style="font-size:11px;margin:4px 0 2px">Every file the subtitle board is unsure about - "72% sure this is burned-in dialogue", "58% sure this track is signs" -
+      gets all three engines instead of a person: <b>Whisper</b> listens at the moments the lines appear and writes what is said there in English;
+      if the screen says what the voices say it is dialogue, if people talk and the screen says something else it is a sign or a title.
+      <b>Qwen</b> gives the judge's reading, taught by every answer on the same show; <b>the readers</b> give what they read.
+      The votes are weighted by how often each engine was right before, and agreement is the confidence. At or above the sure line the file
+      is answered the way you would answer it - so every rule, the Qwen judge and the shape memory learn from it - and in auto the fix is carried out.
+      For a raw, Whisper's language head settles whether English is in fact spoken. Each ASS track it reads also teaches the show's style below.</div>
+    <div style="font-size:11px;margin:6px 0">How often each engine agreed with the final verdict: ${engChip('whisper','Whisper')}${engChip('qwen','Qwen')}${engChip('rules','the readers')}</div>
+    ${rows.length?`<div class="rowbox scrollbox" style="max-height:320px"><table class="sktbl" style="width:100%;font-size:11.5px;table-layout:fixed">
+      <colgroup><col style="width:52px"><col style="width:auto"><col style="width:44px"><col style="width:78px"><col style="width:86px"><col style="width:82px"><col style="width:84px"><col style="width:150px"></colgroup>
+      <thead><tr class="dim" style="font-size:10.5px"><th class="l">WHEN</th><th class="l">FILE · QUESTION</th><th class="c">WAS</th><th class="c">READERS</th><th class="c">WHISPER</th><th class="c">QWEN</th><th class="c">VERDICT</th><th class="l">DONE</th></tr></thead><tbody>
+      ${rows.map((r,i)=>{ const e=r.evidence||{}, vt=e.votes||{}, w=e.whisper||{}, q=e.qwen; const open=_vfyOpen===r.id;
+        const verdictWord=r.kind?r.kind:(r.verdict||'undecided');
+        return `<tr style="cursor:pointer" onclick="_vfyOpen=${open?'null':r.id};lrnPaint('${kind}')">
+          <td class="l dim" style="font-size:10.5px">${ago(r.at)}</td>
+          <td class="l" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(r.path)}"><b>${esc(r.label)}</b><div class="dim" style="font-size:10px">${esc(r.question)}</div></td>
+          <td class="c dim" title="how sure the board was before">${r.was_sure}%</td>
+          <td class="c" style="font-size:10.5px">${vfyVote(vt.rules)}</td>
+          <td class="c" style="font-size:10.5px">${vt.whisper?vfyVote(vt.whisper):'<span class="dim">-</span>'}${w.compared?`<div class="dim" style="font-size:10px">${w.matched}/${w.compared} lines match</div>`:''}</td>
+          <td class="c" style="font-size:10.5px">${vt.qwen?vfyVote(vt.qwen):'<span class="dim">not asked</span>'}${q?`<div class="dim" style="font-size:10px">${q.p}% dialogue</div>`:''}</td>
+          <td class="c"><b style="color:${r.confidence>=v.sure_at?'#3fb950':r.verdict?'#e3b341':'#8b949e'}">${esc(verdictWord)}</b><div class="dim" style="font-size:10px">${r.confidence?r.confidence+'%':''}</div></td>
+          <td class="l" style="font-size:10.5px;color:${r.action.startsWith('answered')?'#3fb950':r.action.startsWith('failed')?'#e0575b':'var(--dim)'}">${esc(r.action)}</td></tr>
+          ${open?`<tr><td colspan="8" style="background:rgba(255,255,255,.025);padding:6px 10px;font-size:11px;white-space:normal">
+            ${(w.pairs||[]).length?`<div style="font-weight:600;margin-bottom:3px">On the screen · what Whisper heard there</div>${w.pairs.map(p=>`<div class="mono" style="font-size:10.5px"><span style="color:${p.match>=0.34?'#3fb950':'#e0575b'}">${Math.round(p.match*100)}%</span> &nbsp;${esc(p.screen)} <span class="dim">·</span> <i>${esc(p.heard||'(nothing heard)')}</i></div>`).join('')}`:''}
+            ${(w.audio||[]).length?`<div><b>Audio tracks:</b> ${w.audio.map(a=>`track ${a.track+1}: ${esc(a.code||'?')} ${Math.round(a.confidence*100)}%`).join(' · ')}</div>`:''}
+            ${w.note?`<div class="dim">${esc(w.note)}</div>`:''}
+            ${e.rules?`<div class="dim" style="margin-top:3px">The readers said: ${esc(e.rules.why||'')}</div>`:''}
+            ${q&&q.why?`<div class="dim">Qwen: ${esc(q.why)}</div>`:''}
+            ${e.style&&e.style.font?`<div class="dim">Style learnt: ${esc(e.style.font)} ${e.style.size}px, alignment ${e.style.align}${(e.style.signs||[]).length?', sign styles '+esc(e.style.signs.join(', ')):''}</div>`:''}
+            ${r.note?`<div style="color:#e0575b">${esc(r.note)}</div>`:''}
+            <div class="dim">took ${r.secs}s</div></td></tr>`:''}`; }).join('')}
+      </tbody></table></div>`:`<div class="dim" style="font-size:11px">Nothing verified yet${v.mode==='off'?' - it is switched off':v.waiting?' - the first run is minutes away, or press Verify 3 now':' - nothing is unsure right now'}.</div>`}
+  </div>`;
+}
+async function vfyMode(m){ await fetch('/api/verify/mode?mode='+m,{method:'POST'}); await vfyLoad(true); for(const k of ['whisper','qwen','ocr']) lrnPaint(k); }
+async function vfyBudget(sure,ph){ const q=[]; if(sure!=null) q.push('sure='+encodeURIComponent(sure)); if(ph!=null) q.push('per_hour='+encodeURIComponent(ph)); await fetch('/api/verify/budget?'+q.join('&'),{method:'POST'}); await vfyLoad(true); for(const k of ['whisper','qwen','ocr']) lrnPaint(k); }
+async function vfyRun(btn){
+  if(btn){ btn.disabled=true; btn.innerHTML='<span class="dlspin"></span>verifying…'; }
+  fetch('/api/verify/run?n=3',{method:'POST'}).catch(()=>{});
+  const tick=async()=>{ await vfyLoad(true); for(const k of ['whisper','qwen','ocr']) lrnPaint(k); if(_vfy&&_vfy.running) setTimeout(tick,3000); };
+  setTimeout(tick,1500);
+}
+function lrnStyles(kind,d){
+  const st=d.styles||[]; if(kind==='ocr') return '';
+  return `<div style="font-size:11.5px;font-weight:600;margin:12px 0 4px">The shows' own subtitle style
+    <span class="dim" style="font-weight:400">- read from their ASS tracks; with ${d.style_min_files}+ files agreeing the Subtitle maker matches it</span>
+    <label class="gsw" style="margin-left:10px;font-weight:400"><input type="checkbox" ${d.match_style?'checked':''} onchange="fetch('/api/learn/match_style?on='+(this.checked?1:0),{method:'POST'}).then(()=>lrnLoad('${kind}',true))"><span class="gname">match the show's style</span><span class="gstate ${d.match_style?'on':'off'}">${d.match_style?'on':'off'}</span></label></div>
+    ${st.length?`<div class="rowbox scrollbox" style="max-height:200px"><table class="sktbl" style="width:100%;font-size:11.5px;table-layout:fixed">
+      <colgroup><col style="width:auto"><col style="width:150px"><col style="width:50px"><col style="width:90px"><col style="width:60px"><col style="width:50px"><col style="width:auto"></colgroup>
+      <thead><tr class="dim" style="font-size:10.5px"><th class="l">SHOW</th><th class="l">FONT</th><th class="c">SIZE</th><th class="c">PLACEMENT</th><th class="c">MARGIN</th><th class="c">FILES</th><th class="l">SIGN STYLES</th></tr></thead><tbody>
+      ${st.map(s=>`<tr><td class="l" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(s.show)}"><b>${esc(s.label)}</b></td>
+        <td class="l">${esc(s.font)}${s.bold?' <span class="dim">bold</span>':''}</td><td class="c">${s.size}</td>
+        <td class="c dim">${({1:'bottom left',2:'bottom',3:'bottom right',4:'middle left',5:'middle',6:'middle right',7:'top left',8:'top',9:'top right'})[s.align]||s.align}</td>
+        <td class="c dim">${s.margin_v}</td><td class="c" style="color:${s.files>=d.style_min_files?'#3fb950':'var(--dim)'}">${s.files}</td>
+        <td class="l dim" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(s.sign_names||'-')}</td></tr>`).join('')}
+      </tbody></table></div>`:'<div class="dim" style="font-size:11px">No track read yet - the second opinion reads one each time it checks a text track.</div>'}`;
+}
+
 // ---- what the subtitle tools learn (sublearn.py) - one panel, three pages ----
 let _lrn={}, _lrnAt={}, _lrnOpen={}, _lrnShow={};
 const LRN_TXT={
@@ -37633,6 +37762,7 @@ async function lrnLoad(kind,force){
   const el=lrnHost(kind); if(!el) return;
   if(!force && _lrnAt[kind] && Date.now()-_lrnAt[kind]<20000 && _lrn[kind]){ lrnPaint(kind); return; }
   try{ _lrn[kind]=await (await fetch('/api/learn?kind='+kind)).json(); _lrnAt[kind]=Date.now(); }catch(e){ return; }
+  await vfyLoad(force);
   lrnPaint(kind);
 }
 function lrnPaint(kind){
@@ -37683,7 +37813,7 @@ function lrnPaint(kind){
       <span class="dim" style="font-weight:400">- burned-in subtitle questions you answered; shown to Qwen as examples for the same show</span></div>
     ${(d.answers||[]).length?`<div style="display:flex;flex-wrap:wrap;gap:4px 14px;font-size:11px">${(d.answers||[]).slice(0,30).map(a=>
       `<span title="${esc(a.show)}">${esc(a.label)} <span class="dim">${a.yes} yes · ${a.no} no</span></span>`).join('')}</div>`:'<div class="dim" style="font-size:11px">none yet</div>'}`:'';
-  el.innerHTML=`<div class="lkind" style="margin-top:12px;padding:11px 12px">
+  el.innerHTML=vfyBlock(kind)+`<div class="lkind" style="margin-top:12px;padding:11px 12px">
     <div class="lkindhead"><b style="color:#79c0ff">What it learns</b>
       <span class="dim" style="font-size:11px">${fmt(withNames)} show(s) with names · ${fmt(active)} correction(s) in use${waiting?` · ${fmt(waiting)} waiting for a second sighting`:''}
         · ${fmt(d.made_kept||0)} made subtitle(s) watched for your edits${d.last_scan?` · last looked ${ago(d.last_scan)}`:''}</span>
@@ -37691,7 +37821,7 @@ function lrnPaint(kind){
     <div class="dim" style="font-size:11px;margin:4px 0 2px">${LRN_TXT[kind]}</div>
     <div class="dim" style="font-size:11px">Your edits: change a subtitle nuarr made - the <span class="mono">.en.ass</span>/<span class="mono">.en.srt</span> beside a file, in Subtitle Edit or any editor, or the "English (nuarr)" track inside it - and the changed words are learnt the next time it looks.
       ${d.last_scan_result?` <span>Last look: ${esc(d.last_scan_result)}.</span>`:''}</div>
-    ${showsTbl}${fxTbl}${answers}
+    ${showsTbl}${lrnStyles(kind,d)}${fxTbl}${answers}
     ${(d.events||[]).length?`<div style="font-size:11.5px;font-weight:600;margin:12px 0 4px">Lately</div>
       <div style="font-size:11px">${(d.events||[]).slice(0,10).map(e=>`<div><span class="dim">${ago(e.at)}</span> · <b>${esc(e.label||e.show||'')}</b> - ${esc(e.detail)}</div>`).join('')}</div>`:''}
   </div>`;

@@ -348,6 +348,44 @@ def speech(src, wlang, model_dir, ffmpeg):
     return out
 
 
+# ------------------------------------------------------ second opinion ----
+def verify(src, windows, wlang, model_dir, ffmpeg):
+    """What is SAID at a few moments of the file, in English - for subverify.
+    windows: [{t, len, a}] seconds; a = audio track ordinal. -> [{t, text, speech}]"""
+    import numpy as np
+    from faster_whisper import WhisperModel
+    say(stage=f"loading Whisper {WHISPER_MODEL}", pct=5)
+    try:
+        m = WhisperModel(WHISPER_MODEL, device="cuda", compute_type="float16", download_root=model_dir)
+    except Exception:                                            # noqa: BLE001
+        m = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8", download_root=model_dir)
+    task = "transcribe" if (wlang or "") == "en" else "translate"
+    out = []
+    for i, w in enumerate(windows):
+        t0 = max(0.0, float(w["t"]) - float(w.get("before", 5)))
+        ln = float(w.get("len", 14))
+        raw = subprocess.run([ffmpeg, "-v", "error", "-ss", f"{t0:.2f}", "-t", f"{ln:.2f}", "-i", src,
+                              "-map", f"0:a:{int(w.get('a', 0))}", "-ac", "1", "-ar", "16000", "-f", "f32le", "-"],
+                             capture_output=True).stdout
+        audio = np.frombuffer(raw, np.float32)
+        text, speech = "", False
+        if len(audio) > 16000:
+            segs, info = m.transcribe(audio, language=(wlang or None), task=task, beam_size=5,
+                                      condition_on_previous_text=False, vad_filter=False)
+            segs = list(segs)
+            speech = any(x.no_speech_prob < 0.6 for x in segs)
+            text = " ".join(x.text.strip() for x in segs if x.no_speech_prob < 0.8 and x.avg_logprob > -1.5)
+            lang = getattr(info, "language", "") or ""
+        else:
+            lang = ""
+        out.append({"t": float(w["t"]), "text": text, "speech": speech, "lang": lang})
+        say(stage="listening at the lines", pct=10 + 85 * (i + 1) / max(1, len(windows)),
+            note=f"{i + 1} of {len(windows)} moments")
+    del m
+    gc.collect()
+    say(heard=out)
+
+
 # ----------------------------------------------------------- picture ------
 def picture(src, plang, script, ffmpeg, duration):
     import numpy as np
@@ -584,6 +622,7 @@ def main():
     ap.add_argument("--from-subs", default="", help="stream:N or file:path - translate this track")
     ap.add_argument("--sub-lang", default="", help="the language of --from-subs")
     ap.add_argument("--learn", default="", help="json: the show's names and corrections (sublearn)")
+    ap.add_argument("--verify", default="", help="json file: {windows:[{t,len,a}]} - what is said there, in English")
     a = ap.parse_args()
     if a.learn:
         try:
@@ -593,6 +632,14 @@ def main():
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from app import audiolang
     audiolang._add_cuda_dirs()
+    if a.verify:
+        try:
+            spec = json.load(open(a.verify, encoding="utf-8"))
+            wl = lang_plan(a.lang)["whisper"] if a.lang and a.lang != "und" else ""
+            verify(a.src, spec.get("windows") or [], wl, os.path.join(a.data, "whisper"), a.ffmpeg)
+        except Exception as e:                                   # noqa: BLE001
+            say(error=f"{type(e).__name__}: {e}"[:300])
+        return
     if a.from_subs:
         try:
             from_subs(a.src, a.from_subs, lang_plan(a.sub_lang)["name"], a.ffmpeg, a.out)

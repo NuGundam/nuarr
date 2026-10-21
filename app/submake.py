@@ -421,7 +421,7 @@ async def _one(file_id: int, overwrite: bool, by: str = "you") -> None:
         shutil.copyfile(tmp, side + ".part")
     else:
         with open(tmp, encoding="utf-8", errors="replace") as f:
-            ass = substyle.to_ass(f.read(), style, label)
+            ass = substyle.to_ass(f.read(), style, label, override=sublearn.style_for(show))
         with open(side + ".part", "w", encoding="utf-8-sig") as f:
             f.write(ass)
     os.replace(side + ".part", side)
