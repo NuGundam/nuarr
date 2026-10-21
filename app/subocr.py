@@ -2147,6 +2147,17 @@ def run_one(path: str, probe: dict, work_root: str | None = None,
             shutil.rmtree(work, ignore_errors=True)
             return {"ok": False, "why": "; ".join(notes) or "nothing converted",
                     "typeset": typeset}
+        # KEPT AS WRITTEN, to learn from what you change in it later - the
+        # English track by its title; see sublearn.scan_edits. An edit to an
+        # OCR'd track teaches the OCR correction memory in particular.
+        if file_id:
+            try:
+                from . import sublearn
+                pick = next((m for m in made if re.search(r"(eng|english)", str(m[1] or ""), re.I)), made[0])
+                with open(pick[0], encoding="utf-8", errors="replace") as f:
+                    sublearn.remember_made(int(file_id), path, f.read(), "ocr", title=str(pick[1] or ""))
+            except Exception:                                # noqa: BLE001
+                pass
         if not mux:
             # Caller only wanted the subtitles. Whoever rewrites the file next
             # will carry them in, so no mux and no commit happens here.

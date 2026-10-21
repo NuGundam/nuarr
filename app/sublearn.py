@@ -72,9 +72,18 @@ def init() -> None:
             n INTEGER NOT NULL DEFAULT 1, applied INTEGER NOT NULL DEFAULT 0, source TEXT NOT NULL DEFAULT '',
             on_ INTEGER NOT NULL DEFAULT 1, at REAL NOT NULL DEFAULT 0,
             PRIMARY KEY(show, wrong, scope))""")
+        # ONE ROW PER FILE AND TOOL. The maker's English subtitle and the OCR
+        # converter's text track can both be in one file, each watched for
+        # your edits. The first shape keyed on the file alone; it was a day
+        # old and empty, so it is replaced rather than migrated.
+        pk = [r for r in cur.execute("PRAGMA table_info(learn_orig)") if r["pk"]]
+        if pk and len(pk) == 1 and pk[0]["name"] == "file_id":
+            cur.execute("DROP TABLE learn_orig")
         cur.execute("""CREATE TABLE IF NOT EXISTS learn_orig(
-            file_id INTEGER PRIMARY KEY, path TEXT NOT NULL, show TEXT NOT NULL, tool TEXT NOT NULL DEFAULT '',
-            text TEXT NOT NULL DEFAULT '', made_at REAL NOT NULL DEFAULT 0, checked_at REAL NOT NULL DEFAULT 0)""")
+            file_id INTEGER NOT NULL, tool TEXT NOT NULL DEFAULT 'submake', path TEXT NOT NULL, show TEXT NOT NULL,
+            title TEXT NOT NULL DEFAULT '', text TEXT NOT NULL DEFAULT '',
+            made_at REAL NOT NULL DEFAULT 0, checked_at REAL NOT NULL DEFAULT 0,
+            PRIMARY KEY(file_id, tool))""")
         cur.execute("""CREATE TABLE IF NOT EXISTS learn_styles(
             show TEXT NOT NULL, font TEXT NOT NULL, size INTEGER NOT NULL, align INTEGER NOT NULL,
             margin_v INTEGER NOT NULL, bold INTEGER NOT NULL DEFAULT 0, outline REAL NOT NULL DEFAULT 2,
@@ -409,16 +418,19 @@ def set_fix(show: str, wrong: str, right: str, scope: str, action: str) -> bool:
 
 
 # ------------------------------------------------------------ edits -----
-def remember_made(file_id: int, path: str, srt_text: str, tool: str) -> None:
-    """Keep a subtitle as nuarr wrote it, to see later what you changed."""
+def remember_made(file_id: int, path: str, srt_text: str, tool: str, title: str = "") -> None:
+    """Keep a subtitle as nuarr wrote it, to see later what you changed.
+    tool: 'submake' (the Subtitle maker) or 'ocr' (a picture track converted);
+    title: the track's name inside the file, so it can be found again."""
     init()
     show = show_of(path)
     with cursor() as cur:
         _touch_show(cur, show, path)
-        cur.execute("INSERT INTO learn_orig(file_id, path, show, tool, text, made_at, checked_at) VALUES(?,?,?,?,?,?,?) "
-                    "ON CONFLICT(file_id) DO UPDATE SET path=excluded.path, show=excluded.show, tool=excluded.tool, "
-                    "text=excluded.text, made_at=excluded.made_at, checked_at=excluded.checked_at",
-                    (int(file_id), path, show, tool, srt_text or "", time.time(), time.time()))
+        cur.execute("INSERT INTO learn_orig(file_id, tool, path, show, title, text, made_at, checked_at) "
+                    "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(file_id, tool) DO UPDATE SET path=excluded.path, "
+                    "show=excluded.show, title=excluded.title, text=excluded.text, made_at=excluded.made_at, "
+                    "checked_at=excluded.checked_at",
+                    (int(file_id), tool, path, show, title or "", srt_text or "", time.time(), time.time()))
 
 
 def _cues(srt_text: str) -> dict:
@@ -437,17 +449,21 @@ def _cues(srt_text: str) -> dict:
 
 
 def _current(row) -> tuple:
-    """(text now, where) - the sidecar if there is one, else nuarr's track inside the file."""
+    """(text now, where) - the sidecar if there is one (the maker's), else the
+    track inside the file named as it was written."""
     from . import substyle
     from .submake import TRACK_NAME, _sidecar
     path = row["path"]
-    for ext in (".srt", ".ass"):
-        side = _sidecar(path, ext)
-        if os.path.exists(side):
-            if os.path.getmtime(side) <= float(row["checked_at"] or 0):
-                return None, "unchanged"
-            t = open(side, encoding="utf-8-sig", errors="replace").read()
-            return (t if ext == ".srt" else substyle.ass_to_srt(t)), "sidecar"
+    tool = row["tool"] if "tool" in row.keys() else "submake"
+    want = (row["title"] if "title" in row.keys() else "") or (TRACK_NAME if tool == "submake" else "")
+    if tool == "submake":
+        for ext in (".srt", ".ass"):
+            side = _sidecar(path, ext)
+            if os.path.exists(side):
+                if os.path.getmtime(side) <= float(row["checked_at"] or 0):
+                    return None, "unchanged"
+                t = open(side, encoding="utf-8-sig", errors="replace").read()
+                return (t if ext == ".srt" else substyle.ass_to_srt(t)), "sidecar"
     if not os.path.exists(path) or os.path.getmtime(path) <= float(row["checked_at"] or 0):
         return None, "unchanged"
     from .jobs import _ffmpeg_exe
@@ -460,9 +476,9 @@ def _current(row) -> tuple:
                                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout)["streams"]
     except Exception:                                            # noqa: BLE001
         return None, "unreadable"
-    k = next((i for i, s in enumerate(st) if ((s.get("tags") or {}).get("title") or "") == TRACK_NAME), None)
+    k = next((i for i, s in enumerate(st) if ((s.get("tags") or {}).get("title") or "") == want), None)
     if k is None:
-        return None, "nuarr's track is gone"
+        return None, "the track is gone"
     out = subprocess.run([ff, "-v", "error", "-i", path, "-map", f"0:s:{k}", "-f", "srt", "-"],
                          capture_output=True, timeout=600,
                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
@@ -494,16 +510,18 @@ def scan_edits() -> dict:
             n = 0
             if diff and not remade:
                 changed += 1
-                n = learn_pairs(row["show"], diff, "edit", "any", row["path"])
+                scope = "ocr" if (row["tool"] if "tool" in row.keys() else "") == "ocr" else "any"
+                n = learn_pairs(row["show"], diff, "edit", scope, row["path"])
                 learnt += n
                 if n:
                     with cursor() as cur:
                         _event(cur, "edit", row["show"],
-                               f"your edit of {os.path.basename(row['path'])[:70]} ({where}): {len(diff)} line(s) changed, "
+                               f"your edit of {os.path.basename(row['path'])[:70]} ({where}"
+                               f"{', an OCR track' if scope == 'ocr' else ''}): {len(diff)} line(s) changed, "
                                f"{n} correction(s)")
             with cursor() as cur:
-                cur.execute("UPDATE learn_orig SET text=?, checked_at=? WHERE file_id=?",
-                            (now_text, time.time(), int(row["file_id"])))
+                cur.execute("UPDATE learn_orig SET text=?, checked_at=? WHERE file_id=? AND tool=?",
+                            (now_text, time.time(), int(row["file_id"]), row["tool"] if "tool" in row.keys() else "submake"))
         res = f"{looked} made subtitle(s) looked at, {changed} edited, {learnt} correction(s) learnt"
         STATE.update(last_scan=time.time(), last_scan_result=res)
         return {"looked": looked, "edited": changed, "learnt": learnt}
@@ -670,6 +688,7 @@ def snapshot(kind: str = "") -> dict:
             "SELECT e.*, COALESCE(s.label, e.show) label FROM learn_events e LEFT JOIN learn_shows s ON s.show=e.show "
             "ORDER BY e.id DESC LIMIT 40").fetchall()]
         made = cur.execute("SELECT COUNT(*) n FROM learn_orig").fetchone()["n"]
+        made_ocr = cur.execute("SELECT COUNT(*) n FROM learn_orig WHERE tool='ocr'").fetchone()["n"]
         styles = [dict(r) for r in cur.execute(
             "SELECT t.*, COALESCE(s.label, t.show) label, "
             " (SELECT GROUP_CONCAT(name, ', ') FROM learn_signstyles g WHERE g.show=t.show) sign_names "
@@ -677,7 +696,7 @@ def snapshot(kind: str = "") -> dict:
     for f in fx:
         f["active"] = bool(f["on_"]) and (f["source"] != "qwen" or f["n"] >= QWEN_ADOPT_N)
     out = {"shows": shows, "fixes": fx, "events": ev, "made_kept": made, "qwen_adopt_n": QWEN_ADOPT_N,
-           "names_max": NAMES_MAX, "styles": styles, "match_style": match_style_on(),
+           "names_max": NAMES_MAX, "made_ocr": made_ocr, "styles": styles, "match_style": match_style_on(),
            "style_min_files": STYLE_MIN_FILES, **STATE}
     if kind == "qwen":
         try:

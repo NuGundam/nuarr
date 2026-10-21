@@ -37816,10 +37816,10 @@ function lrnPaint(kind){
   el.innerHTML=vfyBlock(kind)+`<div class="lkind" style="margin-top:12px;padding:11px 12px">
     <div class="lkindhead"><b style="color:#79c0ff">What it learns</b>
       <span class="dim" style="font-size:11px">${fmt(withNames)} show(s) with names · ${fmt(active)} correction(s) in use${waiting?` · ${fmt(waiting)} waiting for a second sighting`:''}
-        · ${fmt(d.made_kept||0)} made subtitle(s) watched for your edits${d.last_scan?` · last looked ${ago(d.last_scan)}`:''}</span>
+        · ${fmt(d.made_kept||0)} made subtitle(s) watched for your edits${d.made_ocr?` (${fmt(d.made_ocr)} OCR'd)`:''}${d.last_scan?` · last looked ${ago(d.last_scan)}`:''}</span>
       <button class="rmb" style="margin-left:6px" onclick="lrnScan('${kind}',this)" title="Compare every subtitle nuarr made with the one on disk now; what you changed becomes corrections and names. Runs by itself once a day.">${d.scanning?'looking…':'Look for your edits now'}</button></div>
     <div class="dim" style="font-size:11px;margin:4px 0 2px">${LRN_TXT[kind]}</div>
-    <div class="dim" style="font-size:11px">Your edits: change a subtitle nuarr made - the <span class="mono">.en.ass</span>/<span class="mono">.en.srt</span> beside a file, in Subtitle Edit or any editor, or the "English (nuarr)" track inside it - and the changed words are learnt the next time it looks.
+    <div class="dim" style="font-size:11px">Your edits: change a subtitle nuarr made - the <span class="mono">.en.ass</span>/<span class="mono">.en.srt</span> beside a file or the "English (nuarr)" track inside it, or a text track the OCR converter made from a picture track (named as it was written) - in Subtitle Edit or any editor, and the changed words are learnt the next time it looks; an edit to an OCR'd track goes to the OCR correction memory.
       ${d.last_scan_result?` <span>Last look: ${esc(d.last_scan_result)}.</span>`:''}</div>
     ${showsTbl}${lrnStyles(kind,d)}${fxTbl}${answers}
     ${(d.events||[]).length?`<div style="font-size:11.5px;font-weight:600;margin:12px 0 4px">Lately</div>
