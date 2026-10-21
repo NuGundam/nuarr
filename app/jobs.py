@@ -5731,6 +5731,39 @@ async def _transcode(w: Worker, probe_data: dict) -> None:
                    f"{type(e).__name__}: {e}", "warn", job.id)
         _sub_task = None
 
+    # THE CQ THIS FILE NEEDS, MEASURED - see vmaftarget.py. Samples are
+    # encoded with the plan's own settings and scored against the source
+    # with VMAF; the real encode then runs at the highest CQ that still meets
+    # the target. Anything it cannot judge (burned subtitle, HDR, short) or a
+    # failure keeps the library's CQ, exactly as before.
+    if job.plan.encode:
+        try:
+            from . import vmaftarget as _vt
+            _skip = _vt.skip_reason(job.plan, probe_data, w.duration)
+            if _vt.cfg()["on"] and not _skip:
+                w.stage, w.stage_at = "finding quality (VMAF)", time.time()
+
+                def _vtick(line, frac):
+                    w.last_line = line
+                _vr = await asyncio.to_thread(
+                    _vt.choose, job.id, job.file_id, job.path, job.plan, probe_data, w.duration,
+                    _library_of_file(job.file_id), os.path.join(SETTINGS.cache_dir, "vmaf"), _vtick)
+                if _vr.get("cq") is not None:
+                    _fixed = int((job.plan.venc or {}).get("cq") or 0)
+                    job.plan.venc = dict(job.plan.venc or {}, cq=int(_vr["cq"]), cq_fixed=_fixed,
+                                         vmaf=_vr.get("vmaf"))
+                    joblog.log(f"VMAF target: CQ {_vr['cq']} instead of {_fixed} - scores {_vr['vmaf']} "
+                               f"(worst sample {_vr['worst']}), samples "
+                               + (f"{_vr['saved']:+.0f}% smaller" if (_vr.get('saved') or 0) >= 0
+                                  else f"{-_vr['saved']:.0f}% larger")
+                               + f"; {_vr['probes']} probes in {_vr['secs']:.0f}s ({_vr['note']})",
+                               "info", job.id)
+                w.last_line = ""
+            elif _vt.cfg()["on"] and _skip and _skip != "no encode":
+                joblog.log(f"VMAF target skipped: {_skip} - library CQ kept", "info", job.id)
+        except Exception as _ve:                             # noqa: BLE001
+            joblog.log(f"VMAF target unavailable ({type(_ve).__name__}) - library CQ kept", "warn", job.id)
+
     cmd = build_ffmpeg(job.path, out, job.plan, w.duration, probe_data)
     joblog.log("ffmpeg " + " ".join(shlex.quote(c) for c in cmd[1:]), "debug", job.id)
 

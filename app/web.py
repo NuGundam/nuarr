@@ -11461,6 +11461,21 @@ async def api_subneed_replace(file_id: int):
     return out
 
 
+@app.get("/api/vmaf")
+def api_vmaf():
+    from . import vmaftarget
+    return vmaftarget.snapshot()
+
+
+@app.post("/api/vmaf/cfg")
+def api_vmaf_cfg(on: int = -1, target: float = 0, samples: int = 0, floor: float = -1):
+    from . import vmaftarget
+    c = vmaftarget.set_cfg(on=None if on < 0 else bool(on), target=target or None,
+                           samples=samples or None, floor=None if floor < 0 else floor)
+    joblog.log(f"VMAF target: {'on' if c['on'] else 'off'}, {c['target']:g}, {c['samples']} samples", "info")
+    return c
+
+
 @app.get("/api/nurse")
 def api_nurse():
     from . import svcnurse
@@ -30060,6 +30075,7 @@ function wtab(which){
     const side = which==='vcodec' ? 'video' : 'audio';
     if(hint) hint.textContent = '· '+(side==='video'?'video':'audio')+' codec';
     paneLoad(which, loadCodecTab, side);
+    if(side==='video') loadVmaf();
     // The title check belongs beside the settings that caused the mismatch:
     // this page decides what tracks are converted TO, and the title is what
     // the picker will then claim they are.
@@ -34847,6 +34863,60 @@ async function idxCon(name,op,btn){
   const r=await (await fetch('/api/nurse/container?name='+encodeURIComponent(name)+'&op='+op,{method:'POST'})).json();
   if(!r.ok) alert(r.why||'failed');
   loadIdx();
+}
+// ---- quality-targeted encoding (vmaftarget.py) ----
+let _vmafT=null;
+async function loadVmaf(){
+  const el=document.getElementById('vmafBox'); if(!el) return;
+  let d; try{ d=await (await fetch('/api/vmaf')).json(); }catch(e){ return; }
+  const c=d.cfg, b=d.bounds;
+  const sz=v=>v==null?'—':(v>=0?`<span style="color:#7fd4a3">${v.toFixed(0)}% smaller</span>`:`<span style="color:#e2b341">${(-v).toFixed(0)}% larger</span>`);
+  const run=(d.running||[]).map(r=>`<div style="font-size:11px;margin-top:4px"><span class="dlspin"></span> <b>${esc(r.label)}</b>
+      <span class="dim">probe ${r.probe} · trying CQ ${r.cq} · ${Math.round(Date.now()/1000-r.at)}s</span></div>`).join('');
+  el.innerHTML=`<div class="lkind" style="padding:10px 12px">
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+      <b style="color:#6fb0ff">Quality target (VMAF)</b>
+      <span class="pill ${c.on?'p-ok':'p-dim'}" style="cursor:pointer" onclick="vmafSet({on:${c.on?0:1}})">${c.on?'ON':'off'}</span>
+      <span style="font-size:11.5px">look like the source to
+        <input type="number" min="80" max="99" step="0.5" value="${c.target}" style="width:62px;box-sizing:border-box;font-size:11px" onchange="vmafSet({target:this.value})"> VMAF</span>
+      <span style="font-size:11.5px"><input type="number" min="2" max="8" value="${c.samples}" style="width:52px;box-sizing:border-box;font-size:11px" onchange="vmafSet({samples:this.value})"> samples</span>
+      <span style="font-size:11.5px" title="no single sample may fall further than this below the target - one bad scene is what people notice">worst sample within
+        <input type="number" min="0" max="10" step="0.5" value="${c.floor}" style="width:56px;box-sizing:border-box;font-size:11px" onchange="vmafSet({floor:this.value})"></span>
+    </div>
+    <div class="dim" style="font-size:11px;margin-top:6px">One CQ for every file is right for none of them: it spends the same on a flat cartoon, where most of it is wasted,
+      as on grainy film. Before each encode nuarr cuts ${c.samples} ${c.sample_s}-second samples from across the file, encodes them with the very
+      settings the real encode will use, scores each against the source with <b>VMAF</b> (Netflix's model of what a viewer sees; ~95 is
+      indistinguishable on a TV) and runs the encode at the <b>highest CQ that still scores the target</b>. Never more than ${b.down} below
+      or ${b.up} above the library's CQ below, and the bitrate cap still applies. It learns where each library lands, so the next file starts there.
+      Left at the library's CQ: a burned-in subtitle, HDR, anything under ${b.min_minutes} minutes. The output is an ordinary file - playback is unchanged.</div>
+    ${run}
+    <div style="display:flex;gap:18px;flex-wrap:wrap;font-size:11.5px;margin-top:8px">
+      <span><b>${fmt(d.count)}</b> <span class="dim">files measured</span></span>
+      <span><span class="dim">samples vs the fixed CQ:</span> ${sz(d.avg_saved)}</span>
+      <span><span class="dim">CQ moved</span> <b>${d.avg_shift==null?'—':(d.avg_shift>0?'+':'')+d.avg_shift}</b> <span class="dim">on average</span></span>
+      <span class="dim">${d.count?`${d.avg_probes} probes · ${d.avg_secs}s per file`:''}</span>
+    </div>
+    ${d.by.length?`<div style="margin-top:8px;font-size:11px"><b>Where each library lands</b>
+      <table style="width:100%;border-collapse:collapse;margin-top:3px">
+        <tr class="dim" style="font-size:10.5px"><td style="padding:3px 6px">LIBRARY</td><td>TARGET</td><td>FILES</td><td>FIXED CQ</td><td>CHOSEN</td><td>NEXT STARTS AT</td><td>SAMPLES</td></tr>
+        ${d.by.map(x=>`<tr style="border-top:1px solid var(--line)"><td style="padding:3px 6px">${esc(x.library||'—')}</td>
+          <td class="mono">${esc(x.target)} · ${esc(x.family)}</td><td class="mono">${x.n}</td><td class="mono">${Math.round(x.fixed)}</td>
+          <td class="mono">${(+x.cq).toFixed(1)}</td><td class="mono">${x.guess??'—'}</td><td>${sz(x.saved)}</td></tr>`).join('')}
+      </table></div>`:''}
+    ${d.recent.length?`<details style="margin-top:8px;font-size:11px"><summary class="dim" style="cursor:pointer">last ${d.recent.length} files</summary>
+      <table style="width:100%;border-collapse:collapse;margin-top:3px">
+        ${d.recent.map(r=>`<tr style="border-top:1px solid var(--line)"><td style="padding:3px 6px;max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(r.name)}">${esc(r.name)}</td>
+          <td class="mono">CQ ${r.cq_fixed} → <b>${r.cq_chosen}</b></td>
+          <td class="mono" title="mean over the samples; worst sample ${r.vmaf_min}">${r.vmaf}</td><td>${sz(r.saved_pct)}</td>
+          <td class="dim">${r.probes} probes · ${Math.round(r.secs)}s</td><td class="dim">${esc(ago(r.at))}</td></tr>`).join('')}
+      </table></details>`:''}
+  </div>`;
+  clearTimeout(_vmafT);
+  if((d.running||[]).length) _vmafT=setTimeout(()=>shownPoll('vmafBox', loadVmaf), 3000);
+}
+async function vmafSet(o){
+  const q=Object.entries(o).map(([k,v])=>k+'='+encodeURIComponent(v)).join('&');
+  await fetch('/api/vmaf/cfg?'+q,{method:'POST'}); loadVmaf();
 }
 async function nurseMode(m){ await fetch('/api/nurse/mode?mode='+m,{method:'POST'}); loadNurse(); }
 async function nurseRun(){ await fetch('/api/nurse/run',{method:'POST'}); setTimeout(loadNurse,1500); setTimeout(loadIdx,8000); setTimeout(loadIdx,30000); }
