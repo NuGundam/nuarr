@@ -585,6 +585,22 @@ def snapshot() -> dict:
         waiting = len(candidates(400))
     except Exception:                                            # noqa: BLE001
         waiting = -1
+    # SPEED AND ETA, measured: seconds per file over the last twenty, files
+    # in the last hour, and what is left at that pace - but never faster than
+    # the hourly budget allows.
+    with cursor() as cur:
+        last = [float(r["secs"] or 0) for r in cur.execute(
+            "SELECT secs FROM verify_log WHERE secs > 0 ORDER BY id DESC LIMIT 20")]
+        hour_n = cur.execute("SELECT COUNT(*) n FROM verify_log WHERE at > ?", (time.time() - 3600,)).fetchone()["n"]
+    avg = (sum(last) / len(last)) if last else 0.0
+    eta = 0.0
+    if waiting > 0:
+        by_pace = waiting * (avg or 30.0)
+        by_budget = waiting / max(1, per_hour()) * 3600 if mode() != "off" else 0.0
+        eta = max(by_pace, by_budget)
+    el = (time.time() - float(STATE["started"] or time.time())) if STATE.get("running") else 0.0
     return {"mode": mode(), "sure_at": sure_at(), "per_hour": per_hour(), "engines": engine_stats(),
             "recent": rows, "total": int(tot["n"] or 0), "answered": int(tot["a"] or 0), "left": int(tot["l"] or 0),
-            "waiting": waiting, **{k: STATE[k] for k in ("running", "label", "stage", "pct", "last_run", "last_result", "next_run")}}
+            "waiting": waiting, "avg_secs": round(avg, 1), "hour_n": int(hour_n or 0), "eta_s": round(eta),
+            "elapsed_s": round(el), "file_eta_s": (round(max(0.0, avg - el)) if avg and STATE.get("running") else None),
+            **{k: STATE[k] for k in ("running", "label", "stage", "pct", "last_run", "last_result", "next_run")}}

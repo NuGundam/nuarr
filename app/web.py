@@ -37678,8 +37678,7 @@ function vfyBlock(kind){
   const rows=v.recent||[];
   return `<div class="lkind" style="margin-top:12px;padding:11px 12px">
     <div class="lkindhead"><b style="color:#79c0ff">The second opinion</b>
-      <span class="dim" style="font-size:11px">${v.running?`<span class="dlspin"></span>verifying <b>${esc(v.label||'')}</b> - ${esc(v.stage||'')} ${Math.round(v.pct||0)}%`:
-        `${fmt(v.waiting<0?0:v.waiting)} unsure file(s) waiting · ${fmt(v.answered)} answered by it so far · ${fmt(v.left)} left for you${v.last_run?' · last '+ago(v.last_run):''}`}</span>
+      <span class="dim" style="font-size:11px">${v.running?'at work':v.last_run?'last verdict '+ago(v.last_run):'has not run yet'}</span>
       <span style="margin-left:auto;display:flex;gap:6px;align-items:center;font-size:11px">
         <select onchange="vfyMode(this.value)" style="font-size:11px" title="off: never runs. advise: verifies and attaches the evidence to the row, a person still answers. auto: answers at or above the sure line and carries the fix out.">
           ${[['off','off'],['advise','advise only'],['auto','auto - answer and fix']].map(([k,w])=>`<option value="${k}" ${v.mode===k?'selected':''}>${w}</option>`).join('')}</select>
@@ -37687,6 +37686,23 @@ function vfyBlock(kind){
         · <input type="number" min="1" max="60" value="${v.per_hour}" style="width:40px;font-size:11px" onchange="vfyBudget(null,this.value)">/hour
         <button class="rmb" onclick="vfyRun(this)" ${v.running?'disabled':''}>Verify 3 now</button>
         ${v.running?`<button class="rmb" onclick="fetch('/api/verify/stop',{method:'POST'})">Stop</button>`:''}</span></div>
+    <style>.vfybar{height:6px;background:var(--line);border-radius:3px;overflow:hidden;position:relative;flex:1;min-width:120px}
+      .vfyfill{height:6px;background:#79c0ff;border-radius:3px;transition:width .9s linear}
+      .vfyrun{position:absolute;inset:0;background:repeating-linear-gradient(45deg,rgba(121,192,255,.35) 0 8px,transparent 8px 16px);background-size:200% 100%;animation:vfymove 1s linear infinite}
+      @keyframes vfymove{from{background-position:0 0}to{background-position:-22.6px 0}}</style>
+    <div style="display:flex;flex-wrap:wrap;gap:8px 18px;align-items:center;font-size:11.5px;margin:6px 0 2px">
+      <span><b>${fmt(v.total)}</b> <span class="dim">processed</span></span>
+      <span><b>${fmt(v.answered)}</b> <span class="dim">answered</span></span>
+      <span><b>${fmt(v.left)}</b> <span class="dim">left for you</span></span>
+      <span><b>${fmt(v.waiting<0?0:v.waiting)}</b> <span class="dim">in the queue</span></span>
+      <span class="dim">${v.avg_secs?`${v.avg_secs}s per file · ${v.hour_n} this hour`:'no pace measured yet'}${v.eta_s?` · queue done in ~${v.eta_s<90?v.eta_s+'s':v.eta_s<5400?Math.round(v.eta_s/60)+' min':Math.round(v.eta_s/3600*10)/10+' h'}`:''}</span>
+    </div>
+    ${v.running?`<div style="display:flex;gap:10px;align-items:center;font-size:11.5px;margin:2px 0 6px">
+      <span class="dlspin"></span><b style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:340px">${esc(v.label||'')}</b>
+      <div class="vfybar"><div class="vfyfill" style="width:${Math.max(2,Math.min(100,Math.round(v.pct||0)))}%"></div><div class="vfyrun"></div></div>
+      <span class="mono" style="font-variant-numeric:tabular-nums">${Math.round(v.pct||0)}%</span>
+      <span class="dim" style="white-space:nowrap">${esc(v.stage||'')} · ${v.elapsed_s||0}s${v.file_eta_s!=null?` · ~${v.file_eta_s}s left`:''}</span></div>`:
+      `<div class="dim" style="font-size:11px;margin:0 0 4px">${v.waiting>0?(v.mode==='off'?'switched off - nothing runs':`idle - next pass ${v.next_run&&v.next_run>Date.now()/1000?'in '+Math.max(1,Math.round((v.next_run-Date.now()/1000)/60))+' min':'within 5 minutes'}`):'idle - nothing is unsure right now'}</div>`}
     <div class="dim" style="font-size:11px;margin:4px 0 2px">Every file the subtitle board is unsure about - "72% sure this is burned-in dialogue", "58% sure this track is signs" -
       gets all three engines instead of a person: <b>Whisper</b> listens at the moments the lines appear and writes what is said there in English;
       if the screen says what the voices say it is dialogue, if people talk and the screen says something else it is a sign or a title.
