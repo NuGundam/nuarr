@@ -86,6 +86,45 @@ HALLU = re.compile(r"thank(s| you) for (watching|your view)|translated by|subtit
 # much looser detector, and what it hears there is kept only when it is sure.
 HOLE_MIN_S = 3.0
 HOLE_WIN_S = 30.0
+# WHAT THE SHOW HAS TAUGHT NUARR - see app/sublearn.py. Names go to Whisper as
+# a prompt and to Qwen as spellings to keep; corrections are applied to the
+# lines before they are written. Filled from --learn.
+LEARN = {"names": [], "fixes": []}
+
+
+def _names_prompt():
+    n = LEARN.get("names") or []
+    return ("Names: " + ", ".join(n[:40]) + ".") if n else None
+
+
+def _names_rule():
+    n = LEARN.get("names") or []
+    return (" These names are spelled exactly like this: " + ", ".join(n[:40]) + ".") if n else ""
+
+
+def _leak(text):
+    """Whisper repeating its own prompt into a quiet stretch."""
+    p = _names_prompt()
+    t = text.strip()
+    return bool(p) and (t.lower().startswith("names:") or sim(t.lower(), p.lower()) > 0.6)
+
+
+def _apply_fixes(lines):
+    """[(s, e, text)] -> same, corrected; and {wrong->right: times}."""
+    hits = {}
+    pairs = LEARN.get("fixes") or []
+    if not pairs:
+        return lines, hits
+    out = []
+    for s, e, t in lines:
+        for w, r in pairs:
+            pat = r"(?<![\w'])" + re.escape(w) + r"(?![\w'])"
+            t, n = re.subn(pat, r.replace("\\", "\\\\"), t)
+            if n:
+                k = w + "→" + r
+                hits[k] = hits.get(k, 0) + n
+        out.append([s, e, t])
+    return out, hits
 # ANY LANGUAGE, NOT A LIST OF THIRTEEN. The table this replaced named the
 # languages it knew, cut every other code to its first two letters - Swedish
 # "swe" became Swahili "sw", Indonesian "ind" became "in" - and gave nothing
@@ -262,7 +301,9 @@ def speech(src, wlang, model_dir, ffmpeg):
     for i, (s, e) in enumerate(utt):
         a, b = int(max(0, s - 0.15) * 16000), int((e + 0.15) * 16000)
         segs, _ = m.transcribe(audio[a:b], language=wlang, task=task, beam_size=5,
-                               condition_on_previous_text=False, vad_filter=False)
+                               condition_on_previous_text=False, vad_filter=False,
+                               initial_prompt=_names_prompt())
+        segs = [x for x in segs if not _leak(x.text)]
         # EACH SEGMENT ON ITS OWN. One mumbled clause used to throw away the
         # whole stretch - up to UTT_MAX_S of dialogue - with it.
         text = " ".join(x.text.strip() for x in segs if good(x)).strip()
@@ -287,11 +328,12 @@ def speech(src, wlang, model_dir, ffmpeg):
     for j, (ws, we) in enumerate(wins):
         segs, _ = m.transcribe(audio[int(ws * 16000):int(we * 16000)], language=wlang, task=task, beam_size=5,
                                condition_on_previous_text=False, vad_filter=True,
-                               vad_parameters=dict(threshold=0.2, min_silence_duration_ms=300, speech_pad_ms=120))
+                               vad_parameters=dict(threshold=0.2, min_silence_duration_ms=300, speech_pad_ms=120),
+                               initial_prompt=_names_prompt())
         prev = ""
         for x in segs:
             t = x.text.strip()
-            if not good(x, strict=True) or sim(t, prev) > 0.85:
+            if not good(x, strict=True) or sim(t, prev) > 0.85 or _leak(t):
                 continue
             out.append([ws + x.start, min(we, ws + x.end), t])
             prev = t
@@ -436,7 +478,7 @@ def translate(lines, title, llm_dir, src_name="Japanese"):
     sysm = (f"You are a {src_name}-to-English subtitle translator. Translate each numbered "
             f"{src_name} line into natural ENGLISH. {kana}Keep each line short. Reply in English "
             f"only - never in {src_name} or any other language - with exactly the same numbered "
-            f"lines and nothing else.")
+            f"lines and nothing else.{_names_rule()}")
     out = [None] * len(lines)
     B = 40
     for i in range(0, len(lines), B):
@@ -509,18 +551,19 @@ def from_subs(src, spec, src_name, ffmpeg, out):
         return
     say(stage="loading the translator", pct=10, note=f"{len(cues)} lines")
     sysm = (f"You are a {src_name}-to-English subtitle translator. Translate each numbered "
-            f"{src_name} subtitle line into natural, short ENGLISH subtitles. Keep names as they are. "
+            f"{src_name} subtitle line into natural, short ENGLISH subtitles. Keep names as they are.{_names_rule()} "
             f"Reply in English only, with exactly the same numbered lines and nothing else.")
     words = qwenlib.numbered(sysm, [c[2] for c in cues], batch=40, check=qwenlib.english,
                              on_batch=lambda d, t: say(stage="translating the subtitles",
                                                        pct=12 + 83 * d / t, note=f"{d} of {t} lines"))
     keep = [(a, z, w) for (a, z, _t), w in zip(cues, words) if w]
+    keep, hits = _apply_fixes(keep)
     say(stage="writing", pct=96)
     tmp = out + ".part"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write("\n\n".join(f"{i + 1}\n{a} --> {z}\n{w}" for i, (a, z, w) in enumerate(keep)) + "\n")
     os.replace(tmp, out)
-    say(done=True, narration=0, onscreen=0, translated=len(keep), dropped=len(cues) - len(keep))
+    say(done=True, narration=0, onscreen=0, translated=len(keep), dropped=len(cues) - len(keep), applied=hits)
 
 
 # ---------------------------------------------------------------- main ----
@@ -540,7 +583,13 @@ def main():
     ap.add_argument("--llm-fetch", action="store_true", help="download the translation model")
     ap.add_argument("--from-subs", default="", help="stream:N or file:path - translate this track")
     ap.add_argument("--sub-lang", default="", help="the language of --from-subs")
+    ap.add_argument("--learn", default="", help="json: the show's names and corrections (sublearn)")
     a = ap.parse_args()
+    if a.learn:
+        try:
+            LEARN.update(json.load(open(a.learn, encoding="utf-8")))
+        except Exception:                                        # noqa: BLE001
+            pass
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from app import audiolang
     audiolang._add_cuda_dirs()
@@ -629,6 +678,7 @@ def main():
             bot[i][1] = max(min(bot[i][1], bot[i + 1][0] - 0.05), bot[i][0] + 0.8)
         top = [[s, max(e, s + 1.5), "{\\an8}" + w] for (s, e, _j), w in zip(shown, words) if w]
         ev = sorted(bot + top, key=lambda x: x[0])
+        ev, hits = _apply_fixes(ev)
         if not ev:
             say(error="nothing was spoken or written that could be turned into a subtitle")
             return
@@ -636,7 +686,7 @@ def main():
         with open(tmp, "w", encoding="utf-8") as f:
             f.write("\n\n".join(f"{i + 1}\n{ts(s)} --> {ts(e)}\n{t}" for i, (s, e, t) in enumerate(ev)) + "\n")
         os.replace(tmp, a.out)
-        say(done=True, narration=len(bot), onscreen=len(top), seconds=round(time.time() - t0))
+        say(done=True, narration=len(bot), onscreen=len(top), seconds=round(time.time() - t0), applied=hits)
     except Exception as e:                                       # noqa: BLE001
         say(error=f"{type(e).__name__}: {e}"[:300])
 

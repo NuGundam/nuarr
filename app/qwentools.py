@@ -121,7 +121,7 @@ def qwenlib_english(t):
     return qwenlib.english(t)
 
 
-def fix_ocr(src: str, dst: str) -> dict:
+def fix_ocr(src: str, dst: str, names: str = "") -> dict:
     from app import qwenlib
     text = open(src, encoding="utf-8", errors="replace").read()
     blocks = re.split(r"\r?\n\s*\r?\n", text.strip())
@@ -137,7 +137,8 @@ def fix_ocr(src: str, dst: str) -> dict:
             "errors (l for I, rn for m, 0 for O, missing apostrophes, joined or split words). For each "
             "numbered line reply with the corrected line on the same number. Fix only OCR errors; do "
             "not rephrase, translate or change meaning. Keep ' / ' where it appears. If a line is "
-            "already right, repeat it exactly.")
+            "already right, repeat it exactly."
+            + (f" These names are spelled correctly as they are: {names}." if names else ""))
     got = qwenlib.numbered(sysm, lines, batch=40, max_per_line=60)
     changed, kept_out = [], []
     for (head, body), old, new in zip(cues, lines, got):
@@ -149,7 +150,8 @@ def fix_ocr(src: str, dst: str) -> dict:
     with open(tmp, "w", encoding="utf-8") as f:
         f.write("\n\n".join(kept_out) + "\n")
     os.replace(tmp, dst)
-    return {"lines": len(lines), "changed": len(changed), "examples": changed[:12]}
+    return {"lines": len(lines), "changed": len(changed), "examples": changed[:12],
+            "pairs": [(c["was"], c["now"]) for c in changed]}
 
 
 def main():
@@ -163,7 +165,8 @@ def main():
             d = json.loads(sys.stdin.read() or "{}")
             _say(picked=pick_episode(d.get("name") or "", d.get("episodes") or []))
         elif args[:1] == ["--fix-ocr"] and len(args) >= 3:
-            _say(fixed=fix_ocr(args[1], args[2]))
+            names = args[args.index("--names") + 1] if "--names" in args[3:] else ""
+            _say(fixed=fix_ocr(args[1], args[2], names))
         else:
             _say(error="usage: --parse-names | --fix-ocr IN OUT")
     except Exception as e:                                       # noqa: BLE001

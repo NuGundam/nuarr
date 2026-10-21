@@ -806,6 +806,11 @@ async def _startup() -> None:
         from . import remedy as _rm
         _rm.init()
         asyncio.create_task(_rm.watch())
+        # WHAT THE SUBTITLE TOOLS LEARN - names, corrections, your edits. Once
+        # a day it compares each subtitle nuarr made with the one on disk.
+        from . import sublearn as _sl
+        _sl.init()
+        asyncio.create_task(_sl.watch())
         # DECODE, DON'T JUST PROBE. Truncation is the commonest way a file in
         # a media library is broken and the only one ffprobe cannot see, so
         # this reads a window at each end. Bounded, and only while the pool is
@@ -10900,6 +10905,50 @@ async def api_dlleft_act(path: str, action: str, kind: str = ""):
         dlleft.keep(path)
         return {"ok": True}
     return {"ok": False, "why": "unknown action"}
+
+
+@app.get("/api/learn")
+def api_learn(kind: str = ""):
+    """What the subtitle tools have learnt: shows, corrections, events."""
+    from . import sublearn
+    return sublearn.snapshot(kind)
+
+
+@app.get("/api/learn/show")
+def api_learn_show(show: str):
+    from . import sublearn
+    return sublearn.show_detail(show)
+
+
+@app.post("/api/learn/names/rebuild")
+async def api_learn_rebuild(show: str):
+    """Gather the show's names again from the English subtitles in its folder."""
+    from . import sublearn
+    return await asyncio.to_thread(sublearn.build_names, show, True)
+
+
+@app.post("/api/learn/name")
+def api_learn_name(body: dict = Body(...)):
+    """{show, name, action: add|on|off|remove}"""
+    from . import sublearn
+    return {"ok": sublearn.set_name(str(body.get("show") or sublearn.ALL), str(body.get("name") or ""),
+                                    str(body.get("action") or ""))}
+
+
+@app.post("/api/learn/fix")
+def api_learn_fix(body: dict = Body(...)):
+    """{show, wrong, right, scope, action: add|on|off|delete}"""
+    from . import sublearn
+    return {"ok": sublearn.set_fix(str(body.get("show") or sublearn.ALL), str(body.get("wrong") or ""),
+                                   str(body.get("right") or ""), str(body.get("scope") or "any"),
+                                   str(body.get("action") or ""))}
+
+
+@app.post("/api/learn/scan")
+async def api_learn_scan():
+    """Look for your edits in the subtitles nuarr made, now."""
+    from . import sublearn
+    return await asyncio.to_thread(sublearn.scan_edits)
 
 
 @app.post("/api/dlleft/bulk")
@@ -34984,6 +35033,7 @@ async function qfixSet(on){
 }
 async function loadOcr(){
   const el=document.getElementById('ocrBody');
+  lrnLoad('ocr');
   if(!el) return;
   try{
     const [a,b,c]=await Promise.all([
@@ -37561,8 +37611,152 @@ function etPaint(el,d){
 
 // ---- Qwen: the Subtitle maker's translator -------------------------------
 let _qw=null, _qwPoll=null;
+// ---- what the subtitle tools learn (sublearn.py) - one panel, three pages ----
+let _lrn={}, _lrnAt={}, _lrnOpen={}, _lrnShow={};
+const LRN_TXT={
+  whisper:`<b>Whisper itself is never retrained</b> - the same audio gives the same words. What improves is what it
+    is told: before the Subtitle maker listens to an episode, Whisper is given that show's <b>names</b> (so a
+    character is spelt the same way every time), and what it hears is passed through the show's
+    <b>corrections</b> before it is written. Names come from the English subtitles already in the show's folder,
+    from your edits, and from you.`,
+  qwen:`<b>Qwen is never retrained either</b> - it learns by being shown things. It is given your
+    <b>answers</b> on the same show as examples when it judges burned-in subtitles (Subtitle User Input), the
+    show's <b>names</b> when it translates and when it repairs OCR text, and every repair it makes is remembered:
+    once the same fix is seen twice for a show it becomes a <b>correction</b> applied without asking Qwen.`,
+  ocr:`<b>The readers (Tesseract, PaddleOCR) do not learn</b> - a misread shape is misread the same way next
+    time. The <b>correction memory</b> does: misreads fixed before - by Qwen's OCR repair (adopted once seen twice
+    for a show), by your edits to a subtitle nuarr made (adopted at once), or added here - are fixed again for
+    that show as each picture track is read, without asking Qwen.`};
+const LRN_SRC={subtitles:'its subtitles',edit:'your edit',you:'you',qwen:'Qwen repair'};
+function lrnHost(kind){ return document.getElementById('lrn-'+kind); }
+async function lrnLoad(kind,force){
+  const el=lrnHost(kind); if(!el) return;
+  if(!force && _lrnAt[kind] && Date.now()-_lrnAt[kind]<20000 && _lrn[kind]){ lrnPaint(kind); return; }
+  try{ _lrn[kind]=await (await fetch('/api/learn?kind='+kind)).json(); _lrnAt[kind]=Date.now(); }catch(e){ return; }
+  lrnPaint(kind);
+}
+function lrnPaint(kind){
+  const el=lrnHost(kind), d=_lrn[kind]; if(!el||!d) return;
+  const shows=d.shows||[], fx=d.fixes||[];
+  const active=fx.filter(f=>f.active).length, waiting=fx.filter(f=>f.on_&&!f.active).length;
+  const withNames=shows.filter(s=>s.names_on>0).length;
+  const showsTbl=(kind!=='ocr')?`
+    <div style="font-size:11.5px;font-weight:600;margin:10px 0 4px">Names, per show
+      <span class="dim" style="font-weight:400">- up to ${d.names_max} go to ${kind==='whisper'?'Whisper as its prompt':'Qwen as spellings to keep'}</span></div>
+    ${shows.length?`<div class="rowbox scrollbox" style="max-height:300px"><table class="sktbl" style="width:100%;font-size:11.5px;table-layout:fixed">
+      <colgroup><col style="width:auto"><col style="width:80px"><col style="width:90px"><col style="width:150px"><col style="width:70px"><col style="width:90px"></colgroup>
+      <thead><tr class="dim" style="font-size:10.5px"><th class="l">SHOW</th><th class="c">NAMES</th><th class="c">CORRECTIONS</th>
+        <th class="c">NAMES FROM</th><th class="c">MADE</th><th class="r"></th></tr></thead><tbody>
+      ${shows.map((s,i)=>`<tr><td class="l" title="${esc(s.show)}"><b>${esc(s.label||s.show)}</b></td>
+        <td class="c">${fmt(s.names_on)}${s.names_all>s.names_on?`<span class="dim"> /${fmt(s.names_all)}</span>`:''}</td>
+        <td class="c">${fmt(s.fixes_on)}${s.applied?`<span class="dim" title="times applied"> · ${fmt(s.applied)}×</span>`:''}</td>
+        <td class="c dim" style="font-size:10.5px">${esc(s.names_from||'-')}${s.names_built_at?' · '+ago(s.names_built_at):''}</td>
+        <td class="c dim" title="subtitles nuarr made for this show, watched for your edits">${fmt(s.made||0)}</td>
+        <td class="r"><button class="rmb" onclick="lrnOpen('${kind}',${i})">${_lrnOpen[kind]===s.show?'Close':'Names…'}</button></td></tr>
+        ${_lrnOpen[kind]===s.show?`<tr><td colspan="6" style="background:rgba(255,255,255,.025);padding:6px 10px;white-space:normal">${lrnShowBody(kind,s)}</td></tr>`:''}`).join('')}
+      </tbody></table></div>`:`<div class="dim" style="font-size:11px">No show has been through the Subtitle maker or the OCR repair yet - names are gathered the first time one is.</div>`}`:'';
+  const scopeOf={whisper:['whisper','any'],qwen:['qwen','ocr','any'],ocr:['ocr','any']}[kind];
+  const fxTbl=`
+    <div style="font-size:11.5px;font-weight:600;margin:12px 0 4px">${kind==='ocr'?'Correction memory':'Corrections'}
+      <span class="dim" style="font-weight:400">- wrong → right, whole words, for that show (or every show)</span></div>
+    ${fx.length?`<div class="rowbox scrollbox" style="max-height:280px"><table class="sktbl" style="width:100%;font-size:11.5px;table-layout:fixed">
+      <colgroup><col style="width:22%"><col style="width:auto"><col style="width:58px"><col style="width:74px"><col style="width:44px"><col style="width:44px"><col style="width:84px"><col style="width:118px"></colgroup>
+      <thead><tr class="dim" style="font-size:10.5px"><th class="l">SHOW</th><th class="l">WRONG → RIGHT</th><th class="c">FOR</th><th class="c">FROM</th>
+        <th class="c">SEEN</th><th class="c">USED</th><th class="c">STATE</th><th class="r"></th></tr></thead><tbody>
+      ${fx.map((f,i)=>`<tr><td class="l" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(f.show)}">${f.show==='*'?'<i>every show</i>':esc(f.label||f.show)}</td>
+        <td class="l mono" style="font-size:11px"><span style="color:#e0575b">${esc(f.wrong)}</span> → <span style="color:#3fb950">${esc(f.right)}</span></td>
+        <td class="c dim">${esc(f.scope)}</td><td class="c dim">${esc(LRN_SRC[f.source]||f.source)}</td>
+        <td class="c">${fmt(f.n)}</td><td class="c">${fmt(f.applied||0)}</td>
+        <td class="c" style="font-size:10.5px;color:${f.active?'#3fb950':f.on_?'#e3b341':'var(--dim)'}">${f.active?'in use':f.on_?`waiting (${f.n}/${d.qwen_adopt_n})`:'off'}</td>
+        <td class="r" style="white-space:nowrap"><button class="rmb" onclick="lrnFix('${kind}',${i},'${f.on_?'off':'on'}')">${f.on_?'Turn off':'Turn on'}</button>
+          <button class="rmb" onclick="lrnFix('${kind}',${i},'delete')">Delete</button></td></tr>`).join('')}
+      </tbody></table></div>`:`<div class="dim" style="font-size:11px">Nothing learnt yet.</div>`}
+    <div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:6px;font-size:11px">
+      add: <select id="lrnShow-${kind}" style="font-size:11px;max-width:220px"><option value="*">every show</option>
+        ${shows.map(s=>`<option value="${esc(s.show)}">${esc(s.label||s.show)}</option>`).join('')}</select>
+      <input id="lrnW-${kind}" placeholder="wrong" style="font-size:11px;width:130px">
+      <span>→</span><input id="lrnR-${kind}" placeholder="right" style="font-size:11px;width:130px">
+      <select id="lrnS-${kind}" style="font-size:11px">${scopeOf.map(s=>`<option value="${s}">${s==='any'?'everywhere':s}</option>`).join('')}</select>
+      <button class="rmb" onclick="lrnAddFix('${kind}')">Add correction</button></div>`;
+  const answers=(kind==='qwen')?`
+    <div style="font-size:11.5px;font-weight:600;margin:12px 0 4px">Your answers Qwen learns from
+      <span class="dim" style="font-weight:400">- burned-in subtitle questions you answered; shown to Qwen as examples for the same show</span></div>
+    ${(d.answers||[]).length?`<div style="display:flex;flex-wrap:wrap;gap:4px 14px;font-size:11px">${(d.answers||[]).slice(0,30).map(a=>
+      `<span title="${esc(a.show)}">${esc(a.label)} <span class="dim">${a.yes} yes · ${a.no} no</span></span>`).join('')}</div>`:'<div class="dim" style="font-size:11px">none yet</div>'}`:'';
+  el.innerHTML=`<div class="lkind" style="margin-top:12px;padding:11px 12px">
+    <div class="lkindhead"><b style="color:#79c0ff">What it learns</b>
+      <span class="dim" style="font-size:11px">${fmt(withNames)} show(s) with names · ${fmt(active)} correction(s) in use${waiting?` · ${fmt(waiting)} waiting for a second sighting`:''}
+        · ${fmt(d.made_kept||0)} made subtitle(s) watched for your edits${d.last_scan?` · last looked ${ago(d.last_scan)}`:''}</span>
+      <button class="rmb" style="margin-left:6px" onclick="lrnScan('${kind}',this)" title="Compare every subtitle nuarr made with the one on disk now; what you changed becomes corrections and names. Runs by itself once a day.">${d.scanning?'looking…':'Look for your edits now'}</button></div>
+    <div class="dim" style="font-size:11px;margin:4px 0 2px">${LRN_TXT[kind]}</div>
+    <div class="dim" style="font-size:11px">Your edits: change a subtitle nuarr made - the <span class="mono">.en.ass</span>/<span class="mono">.en.srt</span> beside a file, in Subtitle Edit or any editor, or the "English (nuarr)" track inside it - and the changed words are learnt the next time it looks.
+      ${d.last_scan_result?` <span>Last look: ${esc(d.last_scan_result)}.</span>`:''}</div>
+    ${showsTbl}${fxTbl}${answers}
+    ${(d.events||[]).length?`<div style="font-size:11.5px;font-weight:600;margin:12px 0 4px">Lately</div>
+      <div style="font-size:11px">${(d.events||[]).slice(0,10).map(e=>`<div><span class="dim">${ago(e.at)}</span> · <b>${esc(e.label||e.show||'')}</b> - ${esc(e.detail)}</div>`).join('')}</div>`:''}
+  </div>`;
+}
+function lrnShowBody(kind,s){
+  const det=_lrnShow[s.show];
+  if(!det) return '<span class="dim">loading…</span>';
+  const nm=det.names||[];
+  return `<div style="font-size:11px;margin-bottom:4px">${nm.length?nm.map((n,i)=>`<span onclick="lrnName('${kind}',${i},'${n.on_?'off':'on'}')" title="${esc(LRN_SRC[n.source]||n.source)} · seen ${n.n}× - click to turn ${n.on_?'off':'on'}"
+      style="display:inline-block;margin:2px 3px;padding:0 6px;border:1px solid ${n.on_?'#3b6f99':'var(--line)'};border-radius:9px;cursor:pointer;${n.on_?'':'opacity:.45;text-decoration:line-through'}">${esc(n.name)}<span class="dim"> ${n.n}</span></span>`).join(''):'<span class="dim">no names yet</span>'}</div>
+    <div style="display:flex;gap:6px;align-items:center;font-size:11px">
+      <input id="lrnN-${kind}" placeholder="add a name" style="font-size:11px;width:160px">
+      <button class="rmb" onclick="lrnAddName('${kind}')">Add</button>
+      <button class="rmb" onclick="lrnRebuild('${kind}',this)" title="Read the English subtitles in this show's folder again">Gather again</button>
+      <span class="dim">click a name to switch it off or on</span></div>`;
+}
+async function lrnOpen(kind,i){
+  const s=(_lrn[kind].shows||[])[i]; if(!s) return;
+  if(_lrnOpen[kind]===s.show){ _lrnOpen[kind]=null; lrnPaint(kind); return; }
+  _lrnOpen[kind]=s.show; lrnPaint(kind);
+  try{ _lrnShow[s.show]=await (await fetch('/api/learn/show?show='+encodeURIComponent(s.show))).json(); }catch(e){}
+  lrnPaint(kind);
+}
+async function lrnPost(url,body){
+  try{ return await (await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json(); }catch(e){ return {}; }
+}
+async function lrnName(kind,i,action){
+  const show=_lrnOpen[kind], n=((_lrnShow[show]||{}).names||[])[i]; if(!n) return;
+  await lrnPost('/api/learn/name',{show,name:n.name,action});
+  _lrnShow[show]=await (await fetch('/api/learn/show?show='+encodeURIComponent(show))).json(); lrnLoad(kind,true);
+}
+async function lrnAddName(kind){
+  const show=_lrnOpen[kind], inp=document.getElementById('lrnN-'+kind); if(!show||!inp||!inp.value.trim()) return;
+  await lrnPost('/api/learn/name',{show,name:inp.value.trim(),action:'add'});
+  _lrnShow[show]=await (await fetch('/api/learn/show?show='+encodeURIComponent(show))).json(); lrnLoad(kind,true);
+}
+async function lrnRebuild(kind,btn){
+  const show=_lrnOpen[kind]; if(!show) return;
+  if(btn){ btn.disabled=true; btn.textContent='reading…'; }
+  try{ await fetch('/api/learn/names/rebuild?show='+encodeURIComponent(show),{method:'POST'}); }catch(e){}
+  _lrnShow[show]=await (await fetch('/api/learn/show?show='+encodeURIComponent(show))).json(); lrnLoad(kind,true);
+}
+async function lrnFix(kind,i,action){
+  const f=((_lrn[kind]||{}).fixes||[])[i]; if(!f) return;
+  if(action==='delete'&&!confirm(`Forget "${f.wrong} → ${f.right}"?`)) return;
+  await lrnPost('/api/learn/fix',{show:f.show,wrong:f.wrong,right:f.right,scope:f.scope,action});
+  lrnLoad(kind,true);
+}
+async function lrnAddFix(kind){
+  const g=id=>(document.getElementById(id)||{}).value||'';
+  const wrong=g('lrnW-'+kind).trim(), right=g('lrnR-'+kind).trim();
+  if(!wrong||!right) return;
+  await lrnPost('/api/learn/fix',{show:g('lrnShow-'+kind)||'*',wrong,right,scope:g('lrnS-'+kind)||'any',action:'add'});
+  lrnLoad(kind,true);
+}
+async function lrnScan(kind,btn){
+  if(btn){ btn.disabled=true; btn.textContent='looking…'; }
+  let d={}; try{ d=await (await fetch('/api/learn/scan',{method:'POST'})).json(); }catch(e){}
+  if(d.busy) alert('already looking');
+  lrnLoad(kind,true);
+}
+
 async function loadQwen(){
   const el=document.getElementById('qwenBody'); if(!el) return;
+  lrnLoad('qwen');
   try{ _qw=await (await fetch('/api/qwen')).json(); }
   catch(e){ el.innerHTML='<div class="dim" style="padding:14px">could not load</div>'; return; }
   const q=_qw.llm||{}, st=_qw.state||{}, nl=_qw.nllb||{};
@@ -37644,6 +37838,7 @@ async function qwenRemoveNllb(btn){
 }
 async function loadWhisper(){
   const el=document.getElementById('whisperBody');
+  lrnLoad('whisper');
   if(!el) return;
   try{ _whis=await (await fetch('/api/whisper')).json(); }
   catch(e){ el.innerHTML='<div class="dim" style="padding:14px">could not load</div>'; return; }

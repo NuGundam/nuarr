@@ -1302,8 +1302,12 @@ def qwen_fixes() -> list:
         return []
 
 
-def qwen_fix(srt: str, name: str, force: bool = False) -> dict:
-    """Run one SRT through Qwen's repair in place. -> {lines, changed, examples}."""
+def qwen_fix(srt: str, name: str, force: bool = False, video: str = "") -> dict:
+    """Run one SRT through Qwen's repair in place. -> {lines, changed, examples}.
+
+    With the video's path, Qwen is told the show's names (so it does not
+    "correct" them) and what it changed is handed to sublearn: a repair seen
+    twice for the same show becomes a correction applied without Qwen."""
     import sys as _sys
     from . import heavy
     from .db import kv_set
@@ -1312,7 +1316,15 @@ def qwen_fix(srt: str, name: str, force: bool = False) -> dict:
         return {"skipped": f"{holder} has the GPU lane"}
     try:
         out = srt + ".qwen"
-        r = subprocess.run([_sys.executable, "-m", "app.qwentools", "--fix-ocr", srt, out],
+        names = ""
+        if video:
+            try:
+                from . import sublearn
+                names = ", ".join(sublearn.names(sublearn.show_of(video)))
+            except Exception:                                    # noqa: BLE001
+                names = ""
+        r = subprocess.run([_sys.executable, "-m", "app.qwentools", "--fix-ocr", srt, out]
+                           + (["--names", names] if names else []),
                            capture_output=True, text=True, encoding="utf-8", errors="replace",
                            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                            timeout=900, creationflags=NO_WINDOW)
@@ -1326,7 +1338,14 @@ def qwen_fix(srt: str, name: str, force: bool = False) -> dict:
             pass
     if res and os.path.exists(out):
         os.replace(out, srt)
+        pairs = res.pop("pairs", None) or [(x.get("was"), x.get("now")) for x in res.get("examples") or []]
         kv_set(KV_QWEN_FIXES, json.dumps(([{"at": time.time(), "file": name, **res}] + qwen_fixes())[:30]))
+        if video and pairs:
+            try:
+                from . import sublearn
+                sublearn.learn_pairs(sublearn.show_of(video), pairs, "qwen", "ocr", video)
+            except Exception:                                    # noqa: BLE001
+                pass
     return res
 
 
@@ -2096,6 +2115,16 @@ def run_one(path: str, probe: dict, work_root: str | None = None,
                 continue
             with open(srt, encoding="utf-8", errors="replace") as f:
                 txt = clean(f.read())
+            # THE CORRECTION MEMORY - see sublearn. Misreads fixed before (by
+            # Qwen's repair, seen twice; by your edits; by you) are fixed
+            # again here, for this show, without asking Qwen.
+            try:
+                from . import sublearn
+                _show = sublearn.show_of(path)
+                txt, _hits = sublearn.apply(txt, sublearn.fixes(_show, "ocr"))
+                sublearn.note_applied(_show, _hits)
+            except Exception:                                    # noqa: BLE001
+                pass
             with open(srt, "w", encoding="utf-8") as f:
                 f.write(txt)
             # QWEN REPAIRS WHAT THE OCR MISREAD - only when switched on, and
@@ -2103,7 +2132,7 @@ def run_one(path: str, probe: dict, work_root: str | None = None,
             if qwen_fix_on():
                 try:
                     tick(base + span * 0.92, f"Qwen checking the OCR'd text{who}")
-                    qwen_fix(srt, os.path.basename(path))
+                    qwen_fix(srt, os.path.basename(path), video=path)
                 except Exception as e:                           # noqa: BLE001
                     notes.append(f"rel {t['rel']}: Qwen fix skipped - {type(e).__name__}")
             ok, why, got = validate(srt, t.get("cues"), t.get("minutes"),

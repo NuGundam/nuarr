@@ -354,6 +354,26 @@ async def _one(file_id: int, overwrite: bool, by: str = "you") -> None:
     cmd = [sys.executable, "-m", "app.submake_worker", "--src", r["path"], "--out", tmp,
            "--lang", lang, "--title", film, "--duration", str(float(r["duration"] or 0)),
            "--data", str(DATA_DIR), "--ffmpeg", _ffmpeg_exe()] + (["--force"] if overwrite else [])
+    # WHAT THIS SHOW HAS TAUGHT US - see sublearn. The show's names (gathered
+    # once from the English subtitles already in its folder) go to Whisper as
+    # a prompt and to Qwen as spellings to keep; its corrections are applied
+    # to what comes back.
+    from . import sublearn
+    show = sublearn.show_of(r["path"])
+    learn = os.path.join(str(DATA_DIR), "submake.learn.json")
+    try:
+        STATE.update(stage="gathering the show's names", pct=1)
+        await asyncio.wait_for(asyncio.to_thread(sublearn.build_names, show), timeout=600)
+    except Exception:                                            # noqa: BLE001
+        pass
+    try:
+        fx = sublearn.fixes(show, "whisper")
+        fx += [p for p in sublearn.fixes(show, "qwen") if p not in fx]
+        with open(learn, "w", encoding="utf-8") as f:
+            json.dump({"names": sublearn.names(show), "fixes": fx}, f)
+        cmd += ["--learn", learn]
+    except Exception:                                            # noqa: BLE001
+        pass
     # TRANSLATE WHAT IS WRITTEN BEFORE LISTENING TO WHAT IS SAID. A text track
     # in another language is a person's timing and a person's words; Whisper
     # is the fallback for a file that has none.
@@ -413,9 +433,21 @@ async def _one(file_id: int, overwrite: bool, by: str = "you") -> None:
             except OSError:
                 pass
     try:
+        made_text = open(tmp, encoding="utf-8", errors="replace").read()
+    except OSError:
+        made_text = ""
+    try:
         os.remove(tmp)
     except OSError:
         pass
+
+    def _learnt():
+        # kept as written, to learn later from what you change in it
+        try:
+            sublearn.remember_made(file_id, r["path"], made_text, "submake")
+            sublearn.note_applied(show, end.get("applied") or {})
+        except Exception:                                        # noqa: BLE001
+            pass
     row.update(ok=True, narration=end.get("narration", 0), onscreen=end.get("onscreen", 0),
                translated=end.get("translated", 0), source=(src or {}).get("what", ""),
                sidecar=os.path.basename(side), style=style)
@@ -440,6 +472,7 @@ async def _one(file_id: int, overwrite: bool, by: str = "you") -> None:
             except OSError:
                 pass
             row.update(where="embedded", why="replaced nuarr's own track inside the file")
+            _learnt()
             _remember(row)
             joblog.log(f"subtitle maker: {label} - remade, nuarr's track replaced", "ok")
             return
@@ -455,6 +488,7 @@ async def _one(file_id: int, overwrite: bool, by: str = "you") -> None:
             row.update(where="sidecar", why="kept beside the file - could not embed: " + str(res.get("why") or "nothing to take")[:160])
     else:
         row.update(where="sidecar", why=f"kept beside the file - {lib or 'this library'} does not embed sidecars")
+    _learnt()
     _remember(row)
     joblog.log(f"subtitle maker: {label} - "
                + (f"{row['translated']} line(s) translated from {row['source']}" if row.get("translated")
