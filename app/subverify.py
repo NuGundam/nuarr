@@ -194,7 +194,7 @@ def _match(a: str, b: str) -> float:
 
 def _sentence_like(t: str) -> bool:
     w = _norm_words(t)
-    return len(w) >= 4 and sum(1 for x in w if x.isalpha()) >= 3
+    return len(w) >= 3 and sum(1 for x in w if x.isalpha()) >= 3
 
 
 def _audio_lang(file_id: int) -> str:
@@ -337,7 +337,34 @@ def verify_one(row: dict, act: bool | None = None, dry: bool = False) -> dict:
                                     "not" if hits / len(pairs) <= 0.17 and spoken >= max(2, len(pairs) // 2) else "undecided")
                 strength["whisper"] = (hits / len(pairs)) if votes["whisper"] == "dialogue" else (1 - hits / len(pairs))
             else:
-                ev["whisper"] = {"compared": 0, "note": "too few readable lines to listen at"}
+                # THE TEXT IS TOO GARBLED TO MATCH (old SDTV anime: EyeShield 21,
+                # Fighting Spirit) but the MOMENTS are still known. Burned-in
+                # dialogue sits where people speak; a title card or a credit
+                # does not need a voice under it. Listen at the moments text
+                # was seen and vote on whether speech is there - a weaker vote.
+                with cursor() as cur:
+                    r = cur.execute("SELECT lines FROM hardsub WHERE file_id=?", (fid,)).fetchone()
+                allp = [l for l in json.loads((r["lines"] if r else "") or "[]") if l.get("t")]
+                allp = _spread(sorted(allp, key=lambda l: l["t"]), LINES_MAX)
+                if len(allp) >= 3:
+                    heard = _whisper(path, [{"t": l["t"], "before": 3, "len": 9} for l in allp], _audio_lang(fid),
+                                     tick=lambda s, p: tick(s, 35 + p * 0.5))
+                    spoken = sum(1 for h in heard if h.get("speech") and len(_norm_words(h.get("text", ""))) >= 3)
+                    pairs = [(l["text"], h.get("text", ""), _match(l["text"], h.get("text", ""))) for l, h in zip(allp, heard)]
+                    hits = sum(1 for p in pairs if p[2] >= MATCH_AT)
+                    share = spoken / len(heard)
+                    ev["whisper"] = {"compared": len(pairs), "matched": hits, "listened": len(heard), "spoken": spoken,
+                                     "note": f"the lines were barely readable; {hits} still match what is said, and speech was "
+                                             f"heard at {spoken} of {len(heard)} moments text was on screen",
+                                     "pairs": [{"screen": a[:70], "heard": b[:70], "match": round(m, 2)} for a, b, m in pairs]}
+                    # WORDS THAT MATCH ARE THE REAL VOTE; coincidence is the weaker one
+                    if hits / len(pairs) >= 0.5:
+                        votes["whisper"], strength["whisper"] = "dialogue", hits / len(pairs)
+                    else:
+                        votes["whisper"] = "dialogue" if share >= 0.8 else "not" if share <= 0.34 else "undecided"
+                        strength["whisper"] = 0.5
+                else:
+                    ev["whisper"] = {"compared": 0, "note": "too few lines to listen at"}
             q = hardsub.qwen_of({"file_id": fid, "path": path})
             if q:
                 ev["qwen"] = {"p": q["p"], "why": (q.get("why") or "")[:160]}
