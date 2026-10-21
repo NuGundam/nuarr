@@ -1085,6 +1085,13 @@ def _env() -> dict:
         td = os.path.join(tdir, "tessdata")
         if os.path.isdir(td):
             env.setdefault("TESSDATA_PREFIX", td)
+    # The vision reader of last resort: a model name when it may be asked,
+    # nothing when it may not (off, not pulled, Ollama down) - qwenvl.py.
+    try:
+        from . import qwenvl
+        env["NUARR_QWENVL"] = qwenvl.env_model()
+    except Exception:                                    # noqa: BLE001
+        env["NUARR_QWENVL"] = ""
     return env
 
 
@@ -2809,6 +2816,15 @@ def _run_progress(args: list[str], tick, base: float, span: float,
                              f"({i}/{n} cues)")
                 except (ValueError, ZeroDivisionError):
                     pass
+            elif line.startswith("VLSTAT "):
+                # How often the vision model was asked, and answered: the
+                # Qwen page's running totals.
+                try:
+                    from . import qwenvl
+                    qwenvl.record_line(line)
+                except Exception:                        # noqa: BLE001
+                    pass
+                tail.append(line)
             else:
                 tail.append(line)
         # A WAIT WITH NO TIMEOUT IS A PROCESS THAT CAN OUTLIVE THE PROGRAM.

@@ -179,10 +179,11 @@ def make_reader(engine: str, lang: str, device: str):
                 pic = np.stack([pic] * 3, axis=-1)
             if pic.shape[2] == 4:
                 pic = pic[:, :, :3]
-            texts, ys = [], []
+            texts, ys, scores = [], [], []
             for r in ocr.predict(pic):
                 got = list(r.get("rec_texts") or [])
                 texts += got
+                scores += [float(x) for x in (r.get("rec_scores") or [])]
                 # WHERE THE WORDS ARE, not where the bitmap is. A PGS display
                 # set gives the position of the whole BITMAP, and for a sign
                 # that bitmap is often most of the frame with the text in one
@@ -204,6 +205,9 @@ def make_reader(engine: str, lang: str, device: str):
             # lands in the middle and moves BOTH somewhere neither belongs; on
             # a real episode that was 324 of 681 cues. The caller uses the
             # spread to refuse to guess.
+            # Kept on the function, not returned: both callers unpack a
+            # triple, and only the vision fallback wants the scores.
+            read.last_scores = scores
             if not ys:
                 return texts, None, None
             return texts, sum(ys) / len(ys), (max(ys) - min(ys))
@@ -226,6 +230,23 @@ def make_reader(engine: str, lang: str, device: str):
     return read
 
 
+def _vl_helper():
+    """The vision reader of last resort - see qwenvl.py. Off unless nuarr
+    put a model name in the environment (Ollama up, model pulled, switched
+    on); then asked only about cues the engine doubted, up to its budget."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import qwenvl
+    return qwenvl, qwenvl.Helper.from_env()
+
+
+def _with_vl(qwenvl, vl, read, pic, texts):
+    """The engine's lines, or the vision model's when the engine doubted."""
+    if not vl or not qwenvl.doubt(texts, getattr(read, "last_scores", None)):
+        return texts, False
+    got = vl.ask(pic)
+    return (got, True) if got else (texts, False)
+
+
 def serve(engine: str, lang: str, device: str) -> None:
     r"""Answer one image path per line on stdin, one JSON line per answer.
 
@@ -243,11 +264,13 @@ def serve(engine: str, lang: str, device: str) -> None:
     import numpy as np
     read = make_reader(engine, lang, device)
     from PIL import Image
+    qwenvl, vl = _vl_helper()
     # WHAT IT GOT, NOT WHAT IT WAS ASKED FOR. A reader that answers "gpu"
     # while running on the processor is how a measured column ends up
     # quoting the wrong silicon.
     print(json.dumps({"ready": True, "engine": engine,
-                      "device": getattr(read, "device", device)}),
+                      "device": getattr(read, "device", device),
+                      "vl": vl.model}),
           flush=True)
     for line in sys.stdin:
         p = line.strip()
@@ -256,8 +279,15 @@ def serve(engine: str, lang: str, device: str) -> None:
         try:
             pic = np.array(Image.open(p).convert("RGB"))
             texts, cy, spread = read(pic)
+            # THE SERVED PATH HAS NO END, so the budget is per frame: the
+            # hardsub reader asks for a handful of frames per file, and each
+            # answer carries whether the vision model gave it.
+            vl.asked = 0
+            texts, by_vl = _with_vl(qwenvl, vl, read, pic, texts)
             print(json.dumps({"ok": True, "text": "\n".join(
-                t.strip() for t in texts if t and t.strip())}), flush=True)
+                t.strip() for t in texts if t and t.strip()), "vl": by_vl,
+                "vl_secs": round(vl.secs, 2) if by_vl else 0}), flush=True)
+            vl.secs = 0.0
         except Exception as e:                           # noqa: BLE001
             print(json.dumps({"ok": False, "why": str(e)[:160]}), flush=True)
 
@@ -309,6 +339,9 @@ def main() -> None:
     read = make_reader(a.engine, a.lang, a.device)
     print(f"TIMING load={time.time() - _t0:.3f} "
           f"device={getattr(read, 'device', a.device)}", flush=True)
+    qwenvl, vl = _vl_helper()
+    if vl.model:
+        print(f"VL model={vl.model} max={vl.max}", flush=True)
 
     rows = []
     n = len(cues)
@@ -318,9 +351,11 @@ def main() -> None:
         try:
             texts, ty, spread = read(img)
         except Exception:                                # noqa: BLE001
-            _read_s += time.time() - _t0
-            continue
+            # An engine that cannot read this cue is a doubt like any other:
+            # the vision model may still get it (budget permitting).
+            texts, ty, spread = [], None, None
         _read_s += time.time() - _t0
+        texts, _by_vl = _with_vl(qwenvl, vl, read, img, texts)
         txt = "\n".join(t.strip() for t in texts if t and t.strip())
         if not txt:
             continue
@@ -338,6 +373,8 @@ def main() -> None:
         if a.progress:
             print(f"PROGRESS {i + 1}/{n}", flush=True)
 
+    if vl.model:
+        print(vl.stat_line(), flush=True)
     if not rows:
         _die("nothing was read from any cue")
 

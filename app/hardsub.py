@@ -642,6 +642,11 @@ def _ocr_proc(engine: str):
     except Exception:                                            # noqa: BLE001
         pass
     try:
+        from . import qwenvl
+        env["NUARR_QWENVL"] = qwenvl.env_model()
+    except Exception:                                            # noqa: BLE001
+        env["NUARR_QWENVL"] = ""
+    try:
         p = subprocess.Popen(
             [_sys.executable,
              os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -686,6 +691,12 @@ def _read_served(engine: str, img: str) -> str:
             if not line:
                 raise RuntimeError("worker closed")
             d = json.loads(line)
+            if d.get("ok") and d.get("vl"):
+                try:
+                    from . import qwenvl
+                    qwenvl.record(1, 1 if d.get("text") else 0, float(d.get("vl_secs") or 0))
+                except Exception:                                # noqa: BLE001
+                    pass
             return str(d.get("text") or "") if d.get("ok") else ""
         except Exception:                                        # noqa: BLE001
             _ocr_close()

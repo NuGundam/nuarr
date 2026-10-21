@@ -5365,6 +5365,34 @@ def api_qwen_remove_nllb():
     return submake.remove_nllb()
 
 
+@app.get("/api/qwenvl")
+def api_qwenvl():
+    from . import qwenvl
+    return qwenvl.info()
+
+
+@app.post("/api/qwenvl/on")
+def api_qwenvl_on(on: int = 1):
+    from . import qwenvl
+    qwenvl.set_on(bool(on))
+    joblog.log(f"Qwen-VL reader {'ON' if on else 'off'}", "info")
+    return {"on": qwenvl.on()}
+
+
+@app.post("/api/qwenvl/model")
+def api_qwenvl_model(name: str = ""):
+    from . import qwenvl
+    qwenvl.set_model(name)
+    return {"model": qwenvl.model(), "present": bool(qwenvl.present())}
+
+
+@app.post("/api/qwenvl/pull")
+def api_qwenvl_pull():
+    from . import qwenvl
+    joblog.log(f"Qwen-VL: pulling {qwenvl.model()} through Ollama", "info")
+    return qwenvl.pull()
+
+
 @app.post("/api/whisper/check")
 async def api_whisper_check():
     """Is there a newer faster-whisper than the installed one."""
@@ -37682,8 +37710,8 @@ function vfyBlock(kind){
       <span style="margin-left:auto;display:flex;gap:6px;align-items:center;font-size:11px">
         <select onchange="vfyMode(this.value)" style="font-size:11px" title="off: never runs. advise: verifies and attaches the evidence to the row, a person still answers. auto: answers at or above the sure line and carries the fix out.">
           ${[['off','off'],['advise','advise only'],['auto','auto - answer and fix']].map(([k,w])=>`<option value="${k}" ${v.mode===k?'selected':''}>${w}</option>`).join('')}</select>
-        sure at <input type="number" min="50" max="100" value="${v.sure_at}" style="width:46px;font-size:11px" onchange="vfyBudget(this.value,null)">%
-        · <input type="number" min="1" max="60" value="${v.per_hour}" style="width:40px;font-size:11px" onchange="vfyBudget(null,this.value)">/hour
+        sure at <input type="number" min="50" max="100" value="${v.sure_at}" style="width:64px;box-sizing:border-box;font-size:11px" onchange="vfyBudget(this.value,null)">%
+        · <input type="number" min="1" max="60" value="${v.per_hour}" style="width:58px;box-sizing:border-box;font-size:11px" onchange="vfyBudget(null,this.value)">/hour
         <button class="rmb" onclick="vfyRun(this)" ${v.running?'disabled':''}>Verify 3 now</button>
         ${v.running?`<button class="rmb" onclick="fetch('/api/verify/stop',{method:'POST'})">Stop</button>`:''}</span></div>
     <style>.vfybar{height:6px;background:var(--line);border-radius:3px;overflow:hidden;position:relative;flex:1;min-width:120px}
@@ -37916,10 +37944,56 @@ async function lrnScan(kind,btn){
   lrnLoad(kind,true);
 }
 
+// ---- Qwen-VL: the vision model, the reader of last resort (qwenvl.py) ----
+function qwenVlBlock(vl, row, gb){
+  if(!vl) return '';
+  const st=vl.stats||{}, pl=vl.pull||{};
+  const head=!vl.ollama?['Ollama is not running at '+vl.url+' - nothing can be asked','#e0575b']
+    : pl.busy?['downloading through Ollama','#e2b341']
+    : !vl.present?['not downloaded - Ollama has not got '+vl.model,'#e2b341']
+    : !vl.on?['downloaded, switched off','#e2b341']
+    : vl.loaded?['downloaded, loaded on the GPU right now','#7fd4a3']:['downloaded, loaded when a reader doubts a cue','#7fd4a3'];
+  const pct=pl.total?Math.round(100*pl.done/pl.total):0;
+  const used=st.asked?`asked about <b>${fmt(st.asked)}</b> picture(s), read <b>${fmt(st.got)}</b>${st.failed?`, failed ${fmt(st.failed)}`:''}, ${(st.secs/Math.max(1,st.asked)).toFixed(1)} s each · last ${ago(st.last)}`:'not asked yet';
+  return `<div class="lkind" style="margin-top:10px;padding:11px 12px">
+      <div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px">
+        <b style="color:#79c0ff">Reader of last resort <span class="dim" style="font-weight:400">- Qwen-VL</span></b><span style="color:${head[1]};font-size:12px">${esc(head[0])}</span></div>
+      <div class="dim" style="font-size:11.5px;margin-top:6px">The OCR engines read pixels and the text model above repairs words - neither can do the other's job, and a cue that
+        comes back empty or as <span class="mono">lLlknow ldo.</span> has nothing to repair. This model is shown the picture itself. It is slow (a second or more
+        a cue against Paddle's fifth of one), so it is never the first reader: it is asked only about a cue the engine doubted - nothing read, low confidence,
+        or text that does not look like words - and at most ${vl.vl_max} times a track. The same for the burned-in subtitle check's frames.</div>
+      <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        ${vl.ollama&&!vl.present&&!pl.busy?`<button onclick="qwenVlPull(this)">Download now (${vl.model.indexOf('8b')>=0?'6 GB':'a few GB'})</button>`:''}
+        ${pl.busy?`<span style="font-size:11.5px">${esc(pl.status||'')} ${pl.total?pct+'% of '+gb(pl.total):''}</span>`:''}
+        ${vl.present?`<label class="cfsw"><input type="checkbox" ${vl.on?'checked':''} onchange="qwenVlOn(this.checked)"> ask it when a reader doubts a cue</label>`:''}
+        ${pl.error?`<span style="color:#e0575b;font-size:11.5px">${esc(pl.error)}</span>`:''}
+      </div>
+      <div class="lkindhead" style="margin-top:10px"><b style="color:#79c0ff">What is installed</b></div>
+      <table style="width:100%;font-size:12px;border-collapse:collapse">
+        ${row('model', esc(vl.model)+(vl.params?' <span class="dim">('+esc(vl.params)+')</span>':''), 'a vision-language model: it is shown the subtitle picture and asked what it says')}
+        ${row('build', esc([vl.format?vl.format.toUpperCase():'', vl.quant].filter(Boolean).join(' ')||'—'), 'pre-quantised by Ollama, so nothing is converted on this machine')}
+        ${row('downloaded', vl.present?gb(vl.size||0):'not yet', vl.present?'kept in Ollama&rsquo;s own model store, not with Nuarr&rsquo;s files':'about 6 GB for the 8B build')}
+        ${row('Ollama', esc(vl.ollama_version||'not reachable'), 'the server that holds and runs it - the same one the household&rsquo;s doorbell model uses')}
+        ${row('runs as', vl.ollama?'Ollama on the GPU':'—', 'loaded on the first doubtful cue, kept '+esc(vl.keep_alive)+' after the last one, then unloaded by itself')}
+        ${row('used', used, 'every answer it gave; the correction memory and the second opinion judge what it read like any other reader')}
+      </table></div>`;
+}
+async function qwenVlOn(on){
+  await fetch('/api/qwenvl/on?on='+(on?1:0),{method:'POST'});
+  loadQwen();
+}
+async function qwenVlPull(btn){
+  btn.disabled=true;
+  await fetch('/api/qwenvl/pull',{method:'POST'});
+  const tick=async()=>{ let d; try{ d=await (await fetch('/api/qwenvl')).json(); }catch(e){ return; }
+    loadQwen(); if(d.pull&&d.pull.busy) setTimeout(tick,2000); };
+  setTimeout(tick,1500);
+}
 async function loadQwen(){
   const el=document.getElementById('qwenBody'); if(!el) return;
   try{ _qw=await (await fetch('/api/qwen')).json(); }
   catch(e){ el.innerHTML='<div class="dim" style="padding:14px">could not load</div>'; return; }
+  let vl=null; try{ vl=await (await fetch('/api/qwenvl')).json(); }catch(e){}
   const q=_qw.llm||{}, st=_qw.state||{}, nl=_qw.nllb||{};
   const gb=n=>(n/1073741824).toFixed(1)+' GB';
   const row=(k,v,why)=>`<tr style="border-top:1px solid var(--line)"><td style="padding:5px 12px;white-space:nowrap">${k}</td>
@@ -37960,6 +38034,7 @@ async function loadQwen(){
         <div class="dim" style="margin-top:5px">Children&rsquo;s films write almost everything in hiragana, which a translation model trained on
         ordinary sentences cannot read; a language model reads it in context. What is <i>said</i> is translated by Whisper, not by this.
         Last used ${q.last_used?esc(ago(q.last_used)):'not yet'}.</div></div></div></div>
+    ${qwenVlBlock(vl, row, gb)}
     <div class="lkind" style="margin-top:10px"><div class="lkindhead"><b style="color:#79c0ff">Languages in your library</b>
         <span class="dim">every audio language the libraries hold, read fresh each time - a new one appears here by itself</span></div>
       <table style="width:100%;font-size:12px;border-collapse:collapse">
