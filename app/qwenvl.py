@@ -31,7 +31,7 @@ OLLAMA = os.environ.get("NUARR_OLLAMA", "http://127.0.0.1:11434")
 MODEL_DEFAULT = "qwen3-vl:8b-instruct"
 VL_MAX_DEFAULT = 200           # cues per track it may be asked about
 DOUBT_SCORE = 0.72             # mean Paddle confidence under this is a doubt
-KEEP_ALIVE = "10m"             # Ollama unloads it after this long idle
+KEEP_ALIVE = "3m"              # Ollama unloads it after this long idle; loading again costs about a second
 
 PROMPT = ("This image is one subtitle cue cut from a video. Transcribe the text "
           "exactly as written, one line per line of text, keeping the original "
