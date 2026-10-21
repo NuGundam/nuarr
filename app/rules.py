@@ -900,26 +900,78 @@ def _short(t: str, n: int = 80) -> str:
     return t if len(t) <= n else t[:n - 1].rstrip() + "…"
 
 
+# TITLES THAT SAY "THIS IS THE SCRIPT". A track named like this is never a
+# burn target, whatever flags it carries - burning it paints every line of
+# dialogue into the picture for good.
+BURN_NEVER_TITLE_RE = re.compile(
+    r"full|dialog|complete|translation|non[\s-]*forced|not\s*forced|unforced|"
+    r"\bsdh\b|closed\s*caption|\bcc\b", re.I)
+
+
+def _burn_looks_dialogue(s: dict, pool: list[dict]) -> str:
+    """Why this track must not be burned, or '' when nothing says so.
+
+    THE FLAG WAS BELIEVED OVER THE TITLE, and that burned full dialogue into
+    102 Blu-ray/WEB files. Please Teacher! (URANiME) labels its tracks
+    backwards: 'English Translation' - the whole script - carries the forced
+    flag, and 'English Forced' - the signs - carries none. The Forced variant
+    matched the flag on track 0 first and burned the script. Turn A Gundam
+    and City Hunter went the same way. Three independent checks now stand in
+    front of any burn: the title, the cue count, and the cue count against
+    the other tracks in the same language.
+    """
+    title = _title(s)
+    if BURN_NEVER_TITLE_RE.search(title or ""):
+        return f"titled {title!r}, which names the full script"
+    try:
+        from . import subocr as _so
+        n = _so.cues(s)
+        if n is not None and n / _so.FRAMES_PER_CUE >= _so.dialogue_min_cues():
+            return f"{int(n / _so.FRAMES_PER_CUE)} cues - a script, not signs"
+        if n is not None:
+            # ANOTHER TRACK IN THE SAME LANGUAGE WITH FAR FEWER CUES is the
+            # signs track, which makes this one the dialogue.
+            for o in pool:
+                if o is s or _lang(o) != _lang(s):
+                    continue
+                m = _so.cues(o)
+                if m is not None and m * 3 < n:
+                    return (f"{n} display sets against {m} on the other "
+                            f"{_lang(s) or 'untagged'} track - this is the dialogue")
+    except Exception:                                    # noqa: BLE001
+        pass
+    return ""
+
+
 def pick_burn_target(subs: list[dict],
                      lang_guard: bool | None = None) -> tuple[int | None, str]:
-    """First subtitle matching an enabled signs/forced variant, by priority.
+    """The subtitle to burn: a signs/forced track, by priority.
+
+    TITLE BEFORE FLAG. Each variant is tried twice - first only on what the
+    titles say, then on the disposition flags - so a track NAMED forced/signs
+    is preferred over one that is merely FLAGGED, and no track that reads as
+    the full script (see _burn_looks_dialogue) is ever returned.
 
     `lang_guard` lets the caller pass the per-library switch; None keeps the
     global constant, so every other caller behaves exactly as before.
     """
     if lang_guard is None:
         lang_guard = CONFIG["burnLangGuard"]
-    for variant in SIGNS_VARIANTS:
+    for by_flag, variant in [(f, v) for f in (False, True) for v in SIGNS_VARIANTS]:
         if not variant["enabled"]:
             continue
         for i, s in enumerate(subs):
             title, lang = _title(s), _lang(s)
             if any(rx.search(title or "") for rx in variant.get("exclude", [])):
                 continue
-            hit = any(rx.search(title) or rx.search(lang)
-                      for rx in variant["patterns"])
-            hit = hit or any(_disp(s, f) for f in variant["flags"])
+            if by_flag:
+                hit = any(_disp(s, f) for f in variant["flags"])
+            else:
+                hit = any(rx.search(title) or rx.search(lang)
+                          for rx in variant["patterns"])
             if not hit:
+                continue
+            if _burn_looks_dialogue(s, subs):
                 continue
             # An UNTITLED default-flagged track is ambiguous: the exclude list
             # ("full", "dialogue"...) matches on the title, so with no title the
@@ -2237,7 +2289,7 @@ def decide(probe: dict, *, anime: bool = False, filename: str = "",
         if known:
             for n, i in enumerate(p.keep_subs or range(len(subs))):
                 if i in known and (subs[i].get("codec_name") or "").lower() \
-                        in IMAGE_SUB_CODECS:
+                        in IMAGE_SUB_CODECS and not _burn_looks_dialogue(subs[i], subs):
                     bi, variant = n, "typeset pictures"
                     break
         if bi is None:
