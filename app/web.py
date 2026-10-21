@@ -29577,6 +29577,7 @@ const PANE_OF = {ffmpeg:'ffPane', backup:'bkPane',  rules:'rulesPane',
                  vcodec:'vcodecPane', acodec:'acodecPane',
                  alang:'alangPane', cache:'cachePane',
                  whisper:'whisperPane', qwen:'qwenPane', plex:'plexPane',
+                 subai:'subaiPane',
                  tautulli:'tautPane',
                  pushover:'pushoverPane',
                  ocr:'ocrPane', plexwork:'plexworkPane', ruleschk:'ruleschkPane',
@@ -29885,6 +29886,11 @@ function wtab(which){
   if(which==='whisper'){
     if(hint) hint.textContent='· whisper';
     paneLoad('whisper', loadWhisper);
+    return;
+  }
+  if(which==='subai'){
+    if(hint) hint.textContent='· subtitle ai';
+    paneLoad('subai', loadSubai);
     return;
   }
   if(which==='qwen'){
@@ -35078,7 +35084,6 @@ async function qfixSet(on){
 }
 async function loadOcr(){
   const el=document.getElementById('ocrBody');
-  lrnLoad('ocr');
   if(!el) return;
   try{
     const [a,b,c]=await Promise.all([
@@ -37716,12 +37721,12 @@ function vfyBlock(kind){
       </tbody></table></div>`:`<div class="dim" style="font-size:11px">Nothing verified yet${v.mode==='off'?' - it is switched off':v.waiting?' - the first run is minutes away, or press Verify 3 now':' - nothing is unsure right now'}.</div>`}
   </div>`;
 }
-async function vfyMode(m){ await fetch('/api/verify/mode?mode='+m,{method:'POST'}); await vfyLoad(true); for(const k of ['whisper','qwen','ocr']) lrnPaint(k); }
-async function vfyBudget(sure,ph){ const q=[]; if(sure!=null) q.push('sure='+encodeURIComponent(sure)); if(ph!=null) q.push('per_hour='+encodeURIComponent(ph)); await fetch('/api/verify/budget?'+q.join('&'),{method:'POST'}); await vfyLoad(true); for(const k of ['whisper','qwen','ocr']) lrnPaint(k); }
+async function vfyMode(m){ await fetch('/api/verify/mode?mode='+m,{method:'POST'}); await vfyLoad(true); for(const k of ['whisper','qwen','ocr','subai']) lrnPaint(k); }
+async function vfyBudget(sure,ph){ const q=[]; if(sure!=null) q.push('sure='+encodeURIComponent(sure)); if(ph!=null) q.push('per_hour='+encodeURIComponent(ph)); await fetch('/api/verify/budget?'+q.join('&'),{method:'POST'}); await vfyLoad(true); for(const k of ['whisper','qwen','ocr','subai']) lrnPaint(k); }
 async function vfyRun(btn){
   if(btn){ btn.disabled=true; btn.innerHTML='<span class="dlspin"></span>verifying…'; }
   fetch('/api/verify/run?n=3',{method:'POST'}).catch(()=>{});
-  const tick=async()=>{ await vfyLoad(true); for(const k of ['whisper','qwen','ocr']) lrnPaint(k); if(_vfy&&_vfy.running) setTimeout(tick,3000); };
+  const tick=async()=>{ await vfyLoad(true); for(const k of ['whisper','qwen','ocr','subai']) lrnPaint(k); if(_vfy&&_vfy.running) setTimeout(tick,3000); };
   setTimeout(tick,1500);
 }
 function lrnStyles(kind,d){
@@ -37740,7 +37745,13 @@ function lrnStyles(kind,d){
       </tbody></table></div>`:'<div class="dim" style="font-size:11px">No track read yet - the second opinion reads one each time it checks a text track.</div>'}`;
 }
 
-// ---- what the subtitle tools learn (sublearn.py) - one panel, three pages ----
+// ---- Subtitle AI: the maker, the second opinion and what the tools learn ----
+async function loadSubai(){
+  if(!document.getElementById('subaiPane')) return;
+  try{ smLoad(); }catch(e){}
+  lrnLoad('subai', true);
+}
+// ---- what the subtitle tools learn (sublearn.py) - one panel ----
 let _lrn={}, _lrnAt={}, _lrnOpen={}, _lrnShow={};
 const LRN_TXT={
   whisper:`<b>Whisper itself is never retrained</b> - the same audio gives the same words. What improves is what it
@@ -37756,6 +37767,11 @@ const LRN_TXT={
     time. The <b>correction memory</b> does: misreads fixed before - by Qwen's OCR repair (adopted once seen twice
     for a show), by your edits to a subtitle nuarr made (adopted at once), or added here - are fixed again for
     that show as each picture track is read, without asking Qwen.`};
+LRN_TXT.subai=`<b>None of the three models is ever retrained</b> - the same audio, the same picture, the same words give the same answer.
+    What improves is what they are told and what is done with what they say. <b>Whisper</b> is given each show's <b>names</b> as its prompt;
+    <b>Qwen</b> is given the names as spellings to keep, your <b>answers</b> on the same show as examples when it judges burned-in subtitles,
+    and every OCR repair it makes is remembered; the <b>readers'</b> misreads are fixed by the <b>correction memory</b> before anyone sees them.
+    Corrections come from Qwen's repairs (once seen twice for a show), from your edits (at once) and from you.`;
 const LRN_SRC={subtitles:'its subtitles',edit:'your edit',you:'you',qwen:'Qwen repair'};
 function lrnHost(kind){ return document.getElementById('lrn-'+kind); }
 async function lrnLoad(kind,force){
@@ -37772,7 +37788,7 @@ function lrnPaint(kind){
   const withNames=shows.filter(s=>s.names_on>0).length;
   const showsTbl=(kind!=='ocr')?`
     <div style="font-size:11.5px;font-weight:600;margin:10px 0 4px">Names, per show
-      <span class="dim" style="font-weight:400">- up to ${d.names_max} go to ${kind==='whisper'?'Whisper as its prompt':'Qwen as spellings to keep'}</span></div>
+      <span class="dim" style="font-weight:400">- up to ${d.names_max} go to ${kind==='whisper'?'Whisper as its prompt':kind==='qwen'?'Qwen as spellings to keep':'Whisper as its prompt and to Qwen as spellings to keep'}</span></div>
     ${shows.length?`<div class="rowbox scrollbox" style="max-height:300px"><table class="sktbl" style="width:100%;font-size:11.5px;table-layout:fixed">
       <colgroup><col style="width:auto"><col style="width:80px"><col style="width:90px"><col style="width:150px"><col style="width:70px"><col style="width:90px"></colgroup>
       <thead><tr class="dim" style="font-size:10.5px"><th class="l">SHOW</th><th class="c">NAMES</th><th class="c">CORRECTIONS</th>
@@ -37785,7 +37801,7 @@ function lrnPaint(kind){
         <td class="r"><button class="rmb" onclick="lrnOpen('${kind}',${i})">${_lrnOpen[kind]===s.show?'Close':'Names…'}</button></td></tr>
         ${_lrnOpen[kind]===s.show?`<tr><td colspan="6" style="background:rgba(255,255,255,.025);padding:6px 10px;white-space:normal">${lrnShowBody(kind,s)}</td></tr>`:''}`).join('')}
       </tbody></table></div>`:`<div class="dim" style="font-size:11px">No show has been through the Subtitle maker or the OCR repair yet - names are gathered the first time one is.</div>`}`:'';
-  const scopeOf={whisper:['whisper','any'],qwen:['qwen','ocr','any'],ocr:['ocr','any']}[kind];
+  const scopeOf={whisper:['whisper','any'],qwen:['qwen','ocr','any'],ocr:['ocr','any'],subai:['any','whisper','qwen','ocr']}[kind]||['any'];
   const fxTbl=`
     <div style="font-size:11.5px;font-weight:600;margin:12px 0 4px">${kind==='ocr'?'Correction memory':'Corrections'}
       <span class="dim" style="font-weight:400">- wrong → right, whole words, for that show (or every show)</span></div>
@@ -37808,7 +37824,7 @@ function lrnPaint(kind){
       <span>→</span><input id="lrnR-${kind}" placeholder="right" style="font-size:11px;width:130px">
       <select id="lrnS-${kind}" style="font-size:11px">${scopeOf.map(s=>`<option value="${s}">${s==='any'?'everywhere':s}</option>`).join('')}</select>
       <button class="rmb" onclick="lrnAddFix('${kind}')">Add correction</button></div>`;
-  const answers=(kind==='qwen')?`
+  const answers=(kind==='qwen'||kind==='subai')?`
     <div style="font-size:11.5px;font-weight:600;margin:12px 0 4px">Your answers Qwen learns from
       <span class="dim" style="font-weight:400">- burned-in subtitle questions you answered; shown to Qwen as examples for the same show</span></div>
     ${(d.answers||[]).length?`<div style="display:flex;flex-wrap:wrap;gap:4px 14px;font-size:11px">${(d.answers||[]).slice(0,30).map(a=>
@@ -37886,7 +37902,6 @@ async function lrnScan(kind,btn){
 
 async function loadQwen(){
   const el=document.getElementById('qwenBody'); if(!el) return;
-  lrnLoad('qwen');
   try{ _qw=await (await fetch('/api/qwen')).json(); }
   catch(e){ el.innerHTML='<div class="dim" style="padding:14px">could not load</div>'; return; }
   const q=_qw.llm||{}, st=_qw.state||{}, nl=_qw.nllb||{};
@@ -37968,7 +37983,6 @@ async function qwenRemoveNllb(btn){
 }
 async function loadWhisper(){
   const el=document.getElementById('whisperBody');
-  lrnLoad('whisper');
   if(!el) return;
   try{ _whis=await (await fetch('/api/whisper')).json(); }
   catch(e){ el.innerHTML='<div class="dim" style="padding:14px">could not load</div>'; return; }
@@ -49718,6 +49732,7 @@ _SETTINGS_NAV = [
                     ("timing", "Holds and timing", "clock"),
                     ("gate",   "Job gate",         "shield"),
                     ("lang",   "Subtitles",        "language"),
+                    ("subai",  "Subtitle AI",      "language"),
                     ("vcodec", "Video codec",      "film"),
                     ("acodec", "Audio codec",      "sliders"),
                     ("alang",  "Audio language",   "language"),
@@ -49823,6 +49838,7 @@ _SETTINGS_SHIM = """
     ffmpeg:  I('<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M3 15h18M8 4v16M16 4v16"/>'),
     mkv:     I('<path d="M14 6a4 4 0 0 0-5.7 5.7L3 17l4 4 5.3-5.3A4 4 0 0 0 18 10l-2.5 2.5-2-2L16 8z"/>'),
     whisper: I('<path d="M4 12c2-5 5-7 8-7s6 2 8 7c-2 5-5 7-8 7s-6-2-8-7z"/><circle cx="12" cy="12" r="2.5"/>'),
+    subai:   I('<path d="M12 3l1.8 4.6L18 9.4l-4.2 1.8L12 16l-1.8-4.8L6 9.4l4.2-1.8z"/><path d="M5 17l.8 2 2 .8-2 .8L5 22l-.8-1.4-2-.8 2-.8z"/><path d="M19 15l.6 1.5 1.4.5-1.4.6L19 19l-.6-1.4-1.4-.6 1.4-.5z"/>'),
     ocr:     I('<path d="M4 8V5h3M17 5h3v3M20 16v3h-3M7 19H4v-3M8 12h8M12 8v8"/>'),
     arrs:    I('<path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7L11.5 6.8M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1.5-1.5"/>'),
     plex:    I('<path d="M5 3h5l7 9-7 9H5l7-9z"/>'),

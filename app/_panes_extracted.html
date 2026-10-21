@@ -302,12 +302,11 @@
             <div id="snPanel" style="padding:0 14px 6px"></div>
           </div>
         </div>
-        <!-- The subtitle maker: English subtitles made from the audio and
-             the picture, for a file that has none. Its own panel, always
-             shown - it is a tool you point at a file. Drawn by smPaint. -->
-        <div id="smHome">
-          <div id="smPanel" style="padding:0 14px 6px"></div>
-        </div>
+        <!-- The subtitle maker moved to the Subtitle AI page (subaiPane) with
+             the second opinion and what the tools learn. -->
+        <div class="dim" style="padding:6px 14px 10px;font-size:11px">The <b>Subtitle maker</b> (English subtitles for a
+          file that has none), the <b>second opinion</b> and what the tools learn are on
+          <a href="#" onclick="wtab('subai');return false">Subtitle AI</a>.</div>
 
         <!-- CHECK ONE FILE NOW. The readers above are sweeps; this is the
              same reader pointed at a file you chose, with a clock on it. It
@@ -427,6 +426,21 @@
           <div class="dim" style="padding:14px">loading&hellip;</div>
         </div>
       </div>
+      <div id="subaiPane" style="display:none">
+        <div class="dim" style="padding:9px 14px;font-size:11px">
+          <b>Subtitle AI</b> &mdash; the three models nuarr points at subtitles, in one place:
+          <b>Whisper</b> (what is said), <b>Qwen</b> (what it means, and the judge), and the
+          <b>OCR engines</b> (what is written in the picture). The <b>Subtitle maker</b> makes English
+          subtitles for a file that has none; the <b>second opinion</b> settles the files the subtitle
+          board is unsure about by asking all three; and below that is everything they learn from
+          your library and your answers. The models themselves are configured on their own pages
+          under Tools.
+        </div>
+        <div id="smHome">
+          <div id="smPanel" style="padding:0 14px 6px"></div>
+        </div>
+        <div id="lrn-subai" style="padding:0 14px 14px"></div>
+      </div>
       <div id="qwenPane" style="display:none">
         <div class="dim" style="padding:9px 14px;font-size:11px">
           The translator behind the <b>Subtitle maker</b>: it turns the text read
@@ -437,7 +451,8 @@
         <div id="qwenBody" style="padding:0 14px 14px">
           <div class="dim" style="padding:14px">loading&hellip;</div>
         </div>
-        <div id="lrn-qwen" style="padding:0 14px 14px"></div>
+        <div class="dim" style="padding:0 14px 14px;font-size:11px">What Qwen learns - the show names, the corrections,
+          your edits and the second opinion - is on <a href="#" onclick="wtab('subai');return false">Subtitle AI</a>.</div>
       </div>
       <div id="whisperPane" style="display:none">
         <div class="dim" style="padding:9px 14px;font-size:11px">
@@ -454,7 +469,8 @@
         <div id="whisperBody" style="padding:0 14px 14px">
           <div class="dim" style="padding:14px">loading&hellip;</div>
         </div>
-        <div id="lrn-whisper" style="padding:0 14px 14px"></div>
+        <div class="dim" style="padding:0 14px 14px;font-size:11px">What Whisper learns - the show names, the corrections,
+          your edits and the second opinion - is on <a href="#" onclick="wtab('subai');return false">Subtitle AI</a>.</div>
       </div>
       <div id="ocrPane" style="display:none">
         <div class="dim" style="padding:9px 14px;font-size:11px">
@@ -470,7 +486,8 @@
         <div id="ocrBody" style="padding:0 14px 14px">
           <div class="dim" style="padding:14px">loading&hellip;</div>
         </div>
-        <div id="lrn-ocr" style="padding:0 14px 14px"></div>
+        <div class="dim" style="padding:0 14px 14px;font-size:11px">What the OCR engines learns - the show names, the corrections,
+          your edits and the second opinion - is on <a href="#" onclick="wtab('subai');return false">Subtitle AI</a>.</div>
       </div>
       <div id="plexworkPane" style="display:none">
         <div class="dim" style="padding:9px 14px;font-size:11px">
