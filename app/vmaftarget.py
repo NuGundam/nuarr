@@ -36,6 +36,7 @@ import os
 import re
 import statistics
 import subprocess
+import threading
 import time
 
 from . import joblog
@@ -49,6 +50,13 @@ CQ_DOWN = 4            # at most this many CQ steps BELOW the library's CQ
 CQ_UP = 10             # at most this many above it
 MIN_MINUTES = 4.0
 MAX_PROBES = 6
+# THE SEARCH IS CPU WORK, THE ENCODE IS GPU WORK. With four encode slots and a
+# search in three of them the CPU sat at 97 % and NVENC at 19-28 %: the card
+# waited on the scorer. Two searches at a time keeps the other slots encoding,
+# and every 4th frame scored (about 36 a sample) halves each search's cost.
+MAX_SEARCHES = 2
+SUBSAMPLE = 4
+_SLOTS = threading.Semaphore(MAX_SEARCHES)
 LEARN_KEEP = 25
 
 STATE: dict = {}       # job id -> what it is doing, for the page
@@ -179,7 +187,7 @@ def _score(ff, ref, enc, ten, threads) -> tuple[float, float, float] | None:
     lav = (f"[0:v]format={fmt},setpts=PTS-STARTPTS[d];"
            f"[1:v]format={fmt},setpts=PTS-STARTPTS[r];"
            f"[d][r]libvmaf=log_fmt=json:log_path='{log.replace(chr(92), '/').replace(':', chr(92) + ':')}'"
-           f":n_threads={threads}:n_subsample=2:feature=name=cambi")
+           f":n_threads={threads}:n_subsample={SUBSAMPLE}:feature=name=cambi")
     args = [ff, "-hide_banner", "-nostdin", "-v", "error", "-i", enc, "-i", ref,
             "-lavfi", lav, "-f", "null", "-"]
     rc, err = _run(args, 600)
@@ -217,6 +225,28 @@ def skip_reason(plan, probe: dict | None, duration: float) -> str:
 
 def choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, duration: float,
            library: str | None, work_dir: str, tick=None) -> dict:
+    """Find the CQ for this file - one of MAX_SEARCHES at a time (see above).
+    A file that has to wait says so on its card."""
+    if not cfg()["on"] or skip_reason(plan, probe, duration):
+        return _choose(job_id, file_id, src, plan, probe, duration, library, work_dir, tick)
+    if not _SLOTS.acquire(blocking=False):
+        t0 = time.time()
+        STATE[job_id] = {"label": os.path.basename(src), "probe": 0, "cq": None, "at": t0, "waiting": True}
+        while not _SLOTS.acquire(timeout=5):
+            if tick:
+                try:
+                    tick(f"waiting for a quality-search slot ({int(time.time() - t0)}s) - "
+                         f"{MAX_SEARCHES} run at once", 0.0, {})
+                except TypeError:
+                    tick("waiting for a quality-search slot", 0.0)
+    try:
+        return _choose(job_id, file_id, src, plan, probe, duration, library, work_dir, tick)
+    finally:
+        _SLOTS.release()
+
+
+def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, duration: float,
+           library: str | None, work_dir: str, tick=None) -> dict:
     """Find the CQ for this file. Returns {"cq": int|None, ...}; None = use the plan's."""
     c = cfg()
     if not c["on"]:
@@ -240,7 +270,7 @@ def choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durati
     want, floor, banding = float(c["target"]), float(c["floor"]), float(c["banding"])
     n, length = int(c["samples"]), float(c["sample_s"])
     times = _sample_times(duration, n, length)
-    threads = max(2, (os.cpu_count() or 8) // 4)
+    threads = max(2, (os.cpu_count() or 8) // (MAX_SEARCHES + 1))
     # ONE FOLDER PER JOB. The first trial ran three encodes at once, all at
     # CQ 20, and every sample file was named by process, CQ and sample - so
     # the three wrote over each other and none could be scored.
