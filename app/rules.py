@@ -1766,14 +1766,18 @@ def decide(probe: dict, *, anime: bool = False, filename: str = "",
     # the library's switch is still off and whatever kind they are - the way
     # to look at a handful of results before letting a whole library go. The
     # ceiling and the HDR rule still apply to them.
-    _trial = False
+    _trial = _trial_hevc10 = False
     try:
         if file_id:
             import json as _json
             from .db import kv_get as _kvg
             _trial = int(file_id) in set(_json.loads(_kvg("shrink.trial") or "[]"))
+            # and, for a trial, whether it goes to 10-bit HEVC rather than
+            # keeping the source codec - 8-bit H.264 anime bands at any CQ
+            # that saves much; 10-bit HEVC measured band-free at CQ 27.
+            _trial_hevc10 = _trial and str(_kvg("shrink.trial_hevc10") or "0") == "1"
     except Exception:                                    # noqa: BLE001
-        _trial = False
+        _trial = _trial_hevc10 = False
     oversized = ((_v("shrink_enabled", CONFIG["spaceSaver"]["enabled"]) or _trial)
                  and overall_mbps > ceiling * CONFIG["spaceSaver"]["triggerFactor"]
                  and (_v("shrink_include_hdr",
@@ -1804,8 +1808,24 @@ def decide(probe: dict, *, anime: bool = False, filename: str = "",
               f"{p.venc['encoder']} cq={p.venc['cq']}")
     elif oversized:          # only reachable if the shrink is re-enabled
         p.encode = True
+        if _trial_hevc10:
+            # TO 10-BIT HEVC. Safe on the anime profile, which scores x265 +200
+            # and 10bit +50; the Nu profiles score sub-2160p x265 -999999,
+            # which is why this is a trial switch and not the default.
+            p.target = target = "h265"
+            _tg = CONFIG["videoTargets"][target]
+            _hv = _tg["encoder"]
+            try:
+                from . import encoders as _enc3
+                _hv = _enc3.encoder_for(p.venc.get("family") or "nvenc", "hevc")
+            except Exception:                            # noqa: BLE001
+                pass
+            p.venc.update(encoder=_hv, preset=str(_v("h265_preset", _tg["preset"])),
+                          cq=int(_v("h265_cq", _tg["cq"])),
+                          extra=CONFIG["nvencExtra"].get(target, ""))
+            p.ten_bit = True
         # keep SOURCE codec on shrink -> avoids arr h265 re-download loops
-        if not _v("shrink_force_h265", CONFIG["spaceSaver"]["forceH265"]) \
+        elif not _v("shrink_force_h265", CONFIG["spaceSaver"]["forceH265"]) \
                 and vcodec == "h264":
             p.target = target = "h264"
             _tg = CONFIG["videoTargets"][target]
@@ -1821,9 +1841,11 @@ def decide(probe: dict, *, anime: bool = False, filename: str = "",
                           preset=str(_v("h264_preset", _tg["preset"])),
                           cq=int(_v("h264_cq", _tg["cq"])),
                           extra=CONFIG["nvencExtra"].get(target, ""))
-        p.add("video", f"shrink the video ({overall_mbps:.1f} Mbps is high for this size)",
+        p.add("video", f"shrink the video ({overall_mbps:.1f} Mbps is high for this size)"
+                       + (" to 10-bit HEVC" if _trial_hevc10 else ""),
               f"above the {ceiling} Mbps ceiling for {_res_tier(height)}p; "
-              f"source codec kept to avoid an arr re-download loop",
+              + ("10-bit HEVC keeps flat colour and dark gradients from banding"
+                 if _trial_hevc10 else "source codec kept to avoid an arr re-download loop"),
               f"maxrate {max(overall_mbps * p.venc['maxrate_factor'], p.venc['maxrate_floor_mbps']):.1f} Mbps")
     elif hdr:
         # NOTE, not an action. "copy video (HDR preserved)" describes what we are
