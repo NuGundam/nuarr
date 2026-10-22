@@ -234,8 +234,36 @@ def mode() -> str:
     return m if m in ("manual", "auto") else "manual"
 
 
+# WHAT A DECODER SAYS WHEN IT STARTS IN THE MIDDLE, which is not damage.
+#
+# The windows here begin with -ss, so the first frames decoded can point at
+# reference frames that were never decoded. H.264 then says so:
+#
+#     mmco: unref short failure
+#     number of reference frames (0+6) exceeds max (5; probably corrupt input),
+#         discarding one
+#
+# and "probably corrupt" matched the corrupt rule. On 2026-10-21 that threw
+# away six good Cyborg 009 Blu-rays (CW) - deleted, blocklisted and banned by
+# name - while a full decode of the same files from the start showed none of
+# it at those points. These lines are about where decoding began, so they are
+# taken out before anything is matched. Real damage brings its own lines
+# ("error while decoding MB", "concealing", "invalid NAL unit") and those
+# still count.
+_SEEK_NOISE = re.compile(
+    r"mmco: unref short failure|"
+    r"number of reference frames .*exceeds max|"
+    r"reference picture missing during reorder|"
+    r"missing reference picture|"
+    r"co located pocs unavailable|"
+    r"reference \d+ >= \d+|"
+    r"illegal short term buffer state detected|"
+    r"last message repeated \d+ times", re.I)
+
+
 def _fatal(err: str) -> str:
-    low = (err or "").lower()
+    low = "\n".join(ln for ln in (err or "").splitlines()
+                    if not _SEEK_NOISE.search(ln)).lower()
     for pat, why in _FATAL:
         if re.search(pat, low):
             return why
