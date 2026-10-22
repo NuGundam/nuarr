@@ -7271,6 +7271,22 @@ def _library_of_file(file_id: int) -> str | None:
 
 
 # ---------------------------------------------------------------- ffmpeg ---
+def _filter_path(path: str) -> str:
+    r"""A file path as a filter option value, escaped for BOTH parsers.
+
+    QUOTING IS NOT ENOUGH. This was subtitles='P\:/...', which breaks on the
+    first apostrophe in the path - "Doesn't", "Adventurer's" - closing the quote
+    early; 13 shrink jobs failed on exactly that on 2026-10-21. ffmpeg reads a
+    -vf value twice: the filtergraph parser (specials \ ' [ ] , ;) and then
+    the filter's option parser (specials \ ' :). Escaping each layer in turn,
+    with no quotes, survives any of those characters - measured on the
+    failing file.
+    """
+    def esc(s: str, chars: str) -> str:
+        return "".join("\\" + c if c in chars else c for c in s)
+    return esc(esc(path.replace("\\", "/"), "\\':"), "\\'[],;")
+
+
 def build_ffmpeg(src: str, dst: str, plan, duration: float,
                  probe: dict | None = None) -> list[str]:
     """Translate a plan into an ffmpeg command.
@@ -7399,8 +7415,7 @@ def build_ffmpeg(src: str, dst: str, plan, duration: float,
                       f"[0:v:0][0:s:{burn}]{ov}[v]")
                 a += ["-filter_complex", fc, "-map", "[v]"]
             else:
-                esc_src = src.replace("\\", "/").replace(":", "\\:")
-                vf = f"subtitles='{esc_src}':si={burn}"
+                vf = f"subtitles={_filter_path(src)}:si={burn}"
                 if ten:
                     # libass composites in 8-bit RGB regardless, so this cannot
                     # make the SUBTITLE 10-bit - it puts the picture back into
