@@ -1762,7 +1762,19 @@ def decide(probe: dict, *, anime: bool = False, filename: str = "",
               "sd": int(_v("shrink_sd_mbps",
                            CONFIG["spaceSaver"]["maxMbps"]["sd"]))}
     ceiling = _tiers.get(_res_tier(height), float("inf"))
-    oversized = (_v("shrink_enabled", CONFIG["spaceSaver"]["enabled"])
+    # A SHRINK TRIAL: files picked by hand (kv shrink.trial) may shrink while
+    # the library's switch is still off and whatever kind they are - the way
+    # to look at a handful of results before letting a whole library go. The
+    # ceiling and the HDR rule still apply to them.
+    _trial = False
+    try:
+        if file_id:
+            import json as _json
+            from .db import kv_get as _kvg
+            _trial = int(file_id) in set(_json.loads(_kvg("shrink.trial") or "[]"))
+    except Exception:                                    # noqa: BLE001
+        _trial = False
+    oversized = ((_v("shrink_enabled", CONFIG["spaceSaver"]["enabled"]) or _trial)
                  and overall_mbps > ceiling * CONFIG["spaceSaver"]["triggerFactor"]
                  and (_v("shrink_include_hdr",
                          CONFIG["spaceSaver"]["includeHDR"]) or not hdr)
@@ -1770,7 +1782,7 @@ def decide(probe: dict, *, anime: bool = False, filename: str = "",
                  # skipKinds note in CONFIG. This does NOT stop anime being
                  # re-encoded for a real reason: a burn-in or an unplayable
                  # codec still goes through the branch above.
-                 and kind not in CONFIG["spaceSaver"].get("skipKinds", []))
+                 and (_trial or kind not in CONFIG["spaceSaver"].get("skipKinds", [])))
 
     # av1 is conditional - see convertAv1. Everything else in this tuple is a
     # format we are happy to leave alone.

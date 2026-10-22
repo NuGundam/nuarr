@@ -5753,7 +5753,7 @@ async def _transcode(w: Worker, probe_data: dict) -> None:
                     job.plan.venc = dict(job.plan.venc or {}, cq=int(_vr["cq"]), cq_fixed=_fixed,
                                          vmaf=_vr.get("vmaf"))
                     joblog.log(f"VMAF target: CQ {_vr['cq']} instead of {_fixed} - scores {_vr['vmaf']} "
-                               f"(worst sample {_vr['worst']}), samples "
+                               f"(worst sample {_vr['worst']}, banding {_vr.get('cambi')}), samples "
                                + (f"{_vr['saved']:+.0f}% smaller" if (_vr.get('saved') or 0) >= 0
                                   else f"{-_vr['saved']:.0f}% larger")
                                + f"; {_vr['probes']} probes in {_vr['secs']:.0f}s ({_vr['note']})",

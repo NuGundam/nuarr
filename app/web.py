@@ -11461,6 +11461,27 @@ async def api_subneed_replace(file_id: int):
     return out
 
 
+@app.post("/api/shrink/trial")
+async def api_shrink_trial(ids: str = ""):
+    """A shrink trial: these files may shrink while the library's switch is
+    off (rules.py reads kv shrink.trial), and are queued now."""
+    want = [int(x) for x in ids.split(",") if x.strip().isdigit()]
+    kv_set("shrink.trial", json.dumps(want))
+    queued = []
+    for fid in want:
+        rows = _rows("SELECT path, title FROM files WHERE id=?", (fid,))
+        if not rows:
+            continue
+        try:
+            j = await jobs.enqueue(fid, rows[0]["path"], rows[0]["title"] or "", source="shrink trial")
+            if j:
+                queued.append(fid)
+        except Exception as e:                               # noqa: BLE001
+            joblog.log(f"shrink trial: could not queue {fid}: {e}", "warn")
+    joblog.log(f"shrink trial: {len(queued)} of {len(want)} file(s) queued", "info")
+    return {"trial": want, "queued": queued}
+
+
 @app.get("/api/vmaf")
 def api_vmaf():
     from . import vmaftarget
@@ -11468,10 +11489,11 @@ def api_vmaf():
 
 
 @app.post("/api/vmaf/cfg")
-def api_vmaf_cfg(on: int = -1, target: float = 0, samples: int = 0, floor: float = -1):
+def api_vmaf_cfg(on: int = -1, target: float = 0, samples: int = 0, floor: float = -1, banding: float = 0):
     from . import vmaftarget
     c = vmaftarget.set_cfg(on=None if on < 0 else bool(on), target=target or None,
-                           samples=samples or None, floor=None if floor < 0 else floor)
+                           samples=samples or None, floor=None if floor < 0 else floor,
+                           banding=banding or None)
     joblog.log(f"VMAF target: {'on' if c['on'] else 'off'}, {c['target']:g}, {c['samples']} samples", "info")
     return c
 
@@ -34882,6 +34904,8 @@ async function loadVmaf(){
       <span style="font-size:11.5px"><input type="number" min="2" max="8" value="${c.samples}" style="width:52px;box-sizing:border-box;font-size:11px" onchange="vmafSet({samples:this.value})"> samples</span>
       <span style="font-size:11.5px" title="no single sample may fall further than this below the target - one bad scene is what people notice">worst sample within
         <input type="number" min="0" max="10" step="0.5" value="${c.floor}" style="width:56px;box-sizing:border-box;font-size:11px" onchange="vmafSet({floor:this.value})"></span>
+      <span style="font-size:11.5px" title="CAMBI, Netflix's banding index: about 5 is where banding in flat colours and dark gradients becomes visible. VMAF alone under-scores banding, and banding is what cartoons show first.">banding at most
+        <input type="number" min="1" max="20" step="0.5" value="${c.banding}" style="width:56px;box-sizing:border-box;font-size:11px" onchange="vmafSet({banding:this.value})"></span>
     </div>
     <div class="dim" style="font-size:11px;margin-top:6px">One CQ for every file is right for none of them: it spends the same on a flat cartoon, where most of it is wasted,
       as on grainy film. Before each encode nuarr cuts ${c.samples} ${c.sample_s}-second samples from across the file, encodes them with the very
@@ -34907,7 +34931,8 @@ async function loadVmaf(){
       <table style="width:100%;border-collapse:collapse;margin-top:3px">
         ${d.recent.map(r=>`<tr style="border-top:1px solid var(--line)"><td style="padding:3px 6px;max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(r.name)}">${esc(r.name)}</td>
           <td class="mono">CQ ${r.cq_fixed} → <b>${r.cq_chosen}</b></td>
-          <td class="mono" title="mean over the samples; worst sample ${r.vmaf_min}">${r.vmaf}</td><td>${sz(r.saved_pct)}</td>
+          <td class="mono" title="mean over the samples; worst sample ${r.vmaf_min}">${r.vmaf}</td>
+          <td class="mono dim" title="banding (CAMBI) - under 5 is not visible">${r.cambi==null?'':'band '+r.cambi}</td><td>${sz(r.saved_pct)}</td>
           <td class="dim">${r.probes} probes · ${Math.round(r.secs)}s</td><td class="dim">${esc(ago(r.at))}</td></tr>`).join('')}
       </table></details>`:''}
   </div>`;

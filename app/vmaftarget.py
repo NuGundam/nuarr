@@ -44,7 +44,7 @@ from .db import cursor, kv_get, kv_set
 
 KV = "vmaf.cfg"
 KV_LEARN = "vmaf.learn"
-DEFAULTS = {"on": True, "target": 95.0, "samples": 4, "sample_s": 6.0, "floor": 2.0}
+DEFAULTS = {"on": True, "target": 95.0, "samples": 4, "sample_s": 6.0, "floor": 2.0, "banding": 4.0}
 CQ_DOWN = 4            # at most this many CQ steps BELOW the library's CQ
 CQ_UP = 10             # at most this many above it
 MIN_MINUTES = 4.0
@@ -78,6 +78,8 @@ def set_cfg(**kw) -> dict:
             c[k] = max(3.0, min(15.0, float(v)))
         elif k == "floor":
             c[k] = max(0.0, min(10.0, float(v)))
+        elif k == "banding":
+            c[k] = max(1.0, min(20.0, float(v)))
     kv_set(KV, json.dumps(c))
     return c
 
@@ -89,6 +91,8 @@ def init() -> None:
             path TEXT, library TEXT, target TEXT, family TEXT,
             cq_fixed INTEGER, cq_chosen INTEGER, vmaf REAL, vmaf_min REAL, want REAL,
             saved_pct REAL, probes INTEGER, secs REAL, note TEXT)""")
+        if "cambi" not in [r["name"] for r in cur.execute("PRAGMA table_info(vmaf_log)")]:
+            cur.execute("ALTER TABLE vmaf_log ADD COLUMN cambi REAL")
 
 
 def _learn() -> dict:
@@ -133,30 +137,50 @@ def _sample_times(duration: float, n: int, length: float) -> list[float]:
     return [lo + (hi - lo) * i / max(1, n - 1) for i in range(n)]
 
 
-def _encode_sample(ff, src, t, length, family, codec, cq, preset, ten, out) -> int:
-    """One sample at one CQ; returns its size in bytes (0 on failure)."""
-    from . import encoders
+def _cut_reference(ff, src, t, length, out) -> bool:
+    """The source's frames at this moment, cut ONCE and losslessly (FFV1).
+
+    WHY. Seeking the source twice - once to encode the sample, once to score
+    it - does not reliably land on the same first frame: the encoder's seek
+    and the scorer's seek resolve differently around B-frames and odd start
+    times (JUJUTSU KAISEN starts at 0.007 s, Slime at 0.021 s). One frame of
+    drift turns a 96 into a 41 on a moving shot, and the search then believes
+    the target is unreachable. Encoding FROM this cut and scoring AGAINST it
+    means both sides hold exactly the same frames, numbered from zero."""
     args = [ff, "-hide_banner", "-nostdin", "-y", "-v", "error", "-ss", f"{t:.3f}", "-t", f"{length:.3f}",
-            "-i", src, "-map", "0:v:0", "-an", "-sn", "-dn"]
+            "-i", src, "-map", "0:v:0", "-an", "-sn", "-dn", "-c:v", "ffv1", "-level", "3", out]
+    rc, err = _run(args, 300)
+    return rc == 0 and os.path.exists(out) and os.path.getsize(out) > 0
+
+
+def _encode_sample(ff, ref, family, codec, cq, preset, ten, out) -> int:
+    """One sample at one CQ, from the reference cut; its size in bytes (0 on failure)."""
+    from . import encoders
+    args = [ff, "-hide_banner", "-nostdin", "-y", "-v", "error",
+            "-i", ref, "-map", "0:v:0", "-an", "-sn", "-dn"]
     args += encoders.video_args(family, codec, int(cq), preset, ten, False)
     args += [out]
     rc, err = _run(args, 300)
     return os.path.getsize(out) if rc == 0 and os.path.exists(out) else 0
 
 
-def _score(ff, src, t, length, enc, ten, threads) -> tuple[float, float] | None:
-    """(mean, 5th-percentile-ish min) VMAF of an encoded sample against the source."""
+def _score(ff, ref, enc, ten, threads) -> tuple[float, float, float] | None:
+    """(mean VMAF, 5th-percentile-ish VMAF, mean CAMBI) of an encoded sample.
+
+    CAMBI is Netflix's banding index, computed by the same libvmaf call. VMAF
+    is known to under-score banding - the flat gradients and dark skies that
+    cel animation is made of - and banding is exactly why anime was kept out
+    of the shrink in the first place (Oshi no Ko -73% and the worst-looking).
+    About 5 is where Netflix finds banding becomes visible."""
     fmt = "yuv420p10le" if ten else "yuv420p"
     log = enc + ".json"
-    # Distorted first, reference second - libvmaf's order. Both normalised to
-    # the same format and timeline; the source is cut at the same instant the
-    # sample was, so frame N meets frame N.
+    # Distorted first, reference second - libvmaf's order. The reference is
+    # the very cut the sample was encoded from, so frame N meets frame N.
     lav = (f"[0:v]format={fmt},setpts=PTS-STARTPTS[d];"
            f"[1:v]format={fmt},setpts=PTS-STARTPTS[r];"
            f"[d][r]libvmaf=log_fmt=json:log_path='{log.replace(chr(92), '/').replace(':', chr(92) + ':')}'"
-           f":n_threads={threads}:n_subsample=2")
-    args = [ff, "-hide_banner", "-nostdin", "-v", "error", "-i", enc,
-            "-ss", f"{t:.3f}", "-t", f"{length:.3f}", "-i", src,
+           f":n_threads={threads}:n_subsample=2:feature=name=cambi")
+    args = [ff, "-hide_banner", "-nostdin", "-v", "error", "-i", enc, "-i", ref,
             "-lavfi", lav, "-f", "null", "-"]
     rc, err = _run(args, 600)
     if rc != 0 or not os.path.exists(log):
@@ -166,7 +190,8 @@ def _score(ff, src, t, length, enc, ten, threads) -> tuple[float, float] | None:
         frames = [f["metrics"]["vmaf"] for f in d.get("frames") or [] if "vmaf" in f.get("metrics", {})]
         mean = float(d["pooled_metrics"]["vmaf"]["mean"])
         low = sorted(frames)[max(0, len(frames) // 20)] if frames else mean
-        return mean, float(low)
+        cambi = float(((d["pooled_metrics"].get("cambi") or {}).get("mean")) or 0.0)
+        return mean, float(low), cambi
     except Exception:                                    # noqa: BLE001
         return None
     finally:
@@ -212,11 +237,25 @@ def choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durati
     if family == "cpu":
         lo, hi = max(lo, 14), min(hi, 34)
     ff = jobs._ffmpeg_exe()
-    want, floor = float(c["target"]), float(c["floor"])
+    want, floor, banding = float(c["target"]), float(c["floor"]), float(c["banding"])
     n, length = int(c["samples"]), float(c["sample_s"])
     times = _sample_times(duration, n, length)
     threads = max(2, (os.cpu_count() or 8) // 4)
+    # ONE FOLDER PER JOB. The first trial ran three encodes at once, all at
+    # CQ 20, and every sample file was named by process, CQ and sample - so
+    # the three wrote over each other and none could be scored.
+    import re as _re
+    import shutil as _sh
+    work_dir = os.path.join(work_dir, _re.sub(r"[^\w-]", "_", str(job_id)) or "job")
     os.makedirs(work_dir, exist_ok=True)
+    refs = []
+    for k, t in enumerate(times):
+        ref = os.path.join(work_dir, f"ref-{k}.mkv")
+        if _cut_reference(ff, src, t, length, ref):
+            refs.append(ref)
+    if not refs:
+        _sh.rmtree(work_dir, ignore_errors=True)
+        return {"cq": None, "note": "could not cut reference samples from the source"}
     t0 = time.time()
     tried: dict[int, dict] = {}
     STATE[job_id] = {"label": os.path.basename(src), "probe": 0, "cq": None, "at": t0}
@@ -225,31 +264,33 @@ def choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durati
         if cq in tried:
             return tried[cq]
         STATE[job_id].update(probe=len(tried) + 1, cq=cq)
-        sizes, means, lows = 0, [], []
-        for k, t in enumerate(times):
+        sizes, means, lows, bands = 0, [], [], []
+        for k, ref in enumerate(refs):
             if tick:
-                tick(f"VMAF: CQ {cq}, sample {k + 1}/{len(times)}", (len(tried) + k / len(times)) / MAX_PROBES)
-            out = os.path.join(work_dir, f"vmaf-{os.getpid()}-{cq}-{k}.mkv")
+                tick(f"VMAF: CQ {cq}, sample {k + 1}/{len(refs)}", (len(tried) + k / len(refs)) / MAX_PROBES)
+            out = os.path.join(work_dir, f"enc-{cq}-{k}.mkv")
             try:
-                sz = _encode_sample(ff, src, t, length, family, codec, cq, preset, ten, out)
+                sz = _encode_sample(ff, ref, family, codec, cq, preset, ten, out)
                 if not sz:
                     raise RuntimeError("sample encode failed")
-                sc = _score(ff, src, t, length, out, ten, threads)
+                sc = _score(ff, ref, out, ten, threads)
                 if not sc:
                     raise RuntimeError("VMAF could not score the sample")
                 sizes += sz
                 means.append(sc[0])
                 lows.append(sc[1])
+                bands.append(sc[2])
             finally:
                 try:
                     os.remove(out)
                 except OSError:
                     pass
         r = {"cq": cq, "size": sizes, "vmaf": round(statistics.mean(means), 2), "low": round(min(lows), 2),
-             "worst": round(min(means), 2)}
+             "worst": round(min(means), 2), "cambi": round(max(bands), 2)}
         # PASSES = the samples average the target AND none of them falls more
-        # than `floor` below it - one bad scene is what people notice.
-        r["ok"] = r["vmaf"] >= want and r["worst"] >= want - floor
+        # than `floor` below it - one bad scene is what people notice - AND no
+        # sample bands visibly.
+        r["ok"] = r["vmaf"] >= want and r["worst"] >= want - floor and r["cambi"] <= banding
         tried[cq] = r
         return r
 
@@ -292,23 +333,37 @@ def choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durati
                     break
                 a, step = b, step * 2
             if best is None:
-                best = lo           # the target is out of reach; the most bits the range allows
+                # OUT OF REACH KEEPS THE LIBRARY'S CQ. Reaching for more bits
+                # here made the first trial's samples 63-98 % LARGER than the
+                # fixed CQ; a file that cannot score the target at the
+                # library's own setting is better left at it than inflated.
+                best = fixed
         chosen = tried.get(best) or probe_cq(best)
+        # A SCORE THAT CANNOT BE RIGHT IS A BROKEN MEASUREMENT, not a verdict.
+        # A modern encoder at the library's CQ does not score under 70 on a
+        # clean source; when the library's CQ (or the start point) does, the
+        # samples did not line up and nothing above can be trusted.
+        _sane = [v for k2, v in tried.items() if k2 <= max(fixed, start)]
+        if _sane and min(v["worst"] for v in _sane) < 70:
+            raise RuntimeError(f"implausible VMAF ({min(v['worst'] for v in _sane):.0f} at CQ <= {max(fixed, start)})"
+                               " - the samples did not line up")
         base = tried.get(fixed)
         if base is None and len(tried) < MAX_PROBES + 1:
             base = probe_cq(fixed)              # the honest comparison: what fixed CQ would have cost
         saved = round(100.0 * (1 - chosen["size"] / base["size"]), 1) if base and base["size"] else None
         secs = round(time.time() - t0, 1)
-        note = ("reached the target" if chosen["ok"] else f"could not reach {want:g} within CQ {lo}-{hi}")
+        note = ("reached the target" if chosen["ok"] else
+                f"could not reach {want:g} without banding within CQ {lo}-{hi}")
         _remember(library, target, family, best)
         with cursor() as cur:
             cur.execute("INSERT INTO vmaf_log(at,file_id,job_id,path,library,target,family,cq_fixed,cq_chosen,"
-                        "vmaf,vmaf_min,want,saved_pct,probes,secs,note) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        "vmaf,vmaf_min,want,saved_pct,probes,secs,note,cambi) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (time.time(), file_id, job_id, src, library, target, family, fixed, best,
-                         chosen["vmaf"], chosen["worst"], want, saved, len(tried), secs, note))
+                         chosen["vmaf"], chosen["worst"], want, saved, len(tried), secs, note, chosen["cambi"]))
         return {"cq": best, "fixed": fixed, "vmaf": chosen["vmaf"], "worst": chosen["worst"], "saved": saved,
+                "cambi": chosen["cambi"],
                 "probes": len(tried), "secs": secs, "note": note,
-                "tried": sorted(({"cq": k, "vmaf": v["vmaf"], "worst": v["worst"], "ok": v["ok"]}
+                "tried": sorted(({"cq": k, "vmaf": v["vmaf"], "worst": v["worst"], "cambi": v["cambi"], "ok": v["ok"]}
                                  for k, v in tried.items()), key=lambda x: x["cq"])}
     except Exception as e:                               # noqa: BLE001
         joblog.log(f"VMAF search failed ({type(e).__name__}: {e}) - encoding at the library's CQ {fixed}",
@@ -316,6 +371,7 @@ def choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durati
         return {"cq": None, "note": f"failed: {type(e).__name__}"}
     finally:
         STATE.pop(job_id, None)
+        _sh.rmtree(work_dir, ignore_errors=True)
 
 
 # ----------------------------------------------------------------- page ----
@@ -324,7 +380,7 @@ def snapshot() -> dict:
     with cursor() as cur:
         rows = [dict(r) for r in cur.execute(
             "SELECT at,file_id,path,library,target,family,cq_fixed,cq_chosen,vmaf,vmaf_min,want,saved_pct,"
-            "probes,secs,note FROM vmaf_log ORDER BY id DESC LIMIT 40")]
+            "probes,secs,note,cambi FROM vmaf_log ORDER BY id DESC LIMIT 40")]
         tot = cur.execute("SELECT COUNT(*) n, AVG(saved_pct) s, AVG(secs) t, AVG(probes) p, "
                           "AVG(cq_chosen - cq_fixed) d FROM vmaf_log").fetchone()
         by = [dict(r) for r in cur.execute(
