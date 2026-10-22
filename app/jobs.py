@@ -847,6 +847,13 @@ class Worker:
     # shape so the card can render them with the same strip.
     sub_fix_frac: float = 0.0
     sub_fix_stage: str = ""
+    # THE QUALITY SEARCH before an encode (vmaftarget.py): a minute or four of
+    # sample encodes and VMAF scoring that used to show as a full, motionless
+    # bar. Its own strip, with the CQs tried so far.
+    vmaf_frac: float = 0.0
+    vmaf_stage: str = ""
+    vmaf_at: float = 0.0
+    vmaf_info: dict = field(default_factory=dict)
     _cm_bytes: int = 0
     _cm_at: float = 0.0
     # ffmpeg's out_time does not advance on every file - see read_progress().
@@ -1356,6 +1363,10 @@ class Worker:
             "ocr_device": _ocr_device_of(self),
             "sub_fix_frac": round(self.sub_fix_frac, 4),
             "sub_fix_stage": self.sub_fix_stage,
+            "vmaf_frac": round(self.vmaf_frac, 4),
+            "vmaf_stage": self.vmaf_stage,
+            "vmaf_at": self.vmaf_at,
+            "vmaf_info": self.vmaf_info,
             "by_bytes": self.by_bytes,
             # Seconds left on the commit copy, from the smoothed rate. Computed
             # here rather than in the browser so it cannot disagree with the
@@ -5743,8 +5754,12 @@ async def _transcode(w: Worker, probe_data: dict) -> None:
             if _vt.cfg()["on"] and not _skip:
                 w.stage, w.stage_at = "finding quality (VMAF)", time.time()
 
-                def _vtick(line, frac):
-                    w.last_line = line
+                w.vmaf_at, w.vmaf_frac, w.vmaf_stage, w.vmaf_info = time.time(), 0.0, "starting", {}
+
+                def _vtick(line, frac, info=None):
+                    w.vmaf_stage, w.vmaf_frac = line, float(frac or 0)
+                    if info is not None:
+                        w.vmaf_info = info
                 _vr = await asyncio.to_thread(
                     _vt.choose, job.id, job.file_id, job.path, job.plan, probe_data, w.duration,
                     _library_of_file(job.file_id), os.path.join(SETTINGS.cache_dir, "vmaf"), _vtick)
@@ -5758,7 +5773,7 @@ async def _transcode(w: Worker, probe_data: dict) -> None:
                                   else f"{-_vr['saved']:.0f}% larger")
                                + f"; {_vr['probes']} probes in {_vr['secs']:.0f}s ({_vr['note']})",
                                "info", job.id)
-                w.last_line = ""
+                w.vmaf_stage, w.vmaf_frac, w.vmaf_info = "", 0.0, {}
             elif _vt.cfg()["on"] and _skip and _skip != "no encode":
                 joblog.log(f"VMAF target skipped: {_skip} - library CQ kept", "info", job.id)
         except Exception as _ve:                             # noqa: BLE001

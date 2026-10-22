@@ -248,8 +248,29 @@ def choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durati
     import shutil as _sh
     work_dir = os.path.join(work_dir, _re.sub(r"[^\w-]", "_", str(job_id)) or "job")
     os.makedirs(work_dir, exist_ok=True)
+    # HOW FAR ALONG, HONESTLY. The probes a search will need are not known
+    # up front: a library with a learned CQ usually settles in 3-4, a cold one
+    # takes up to MAX_PROBES. The estimate starts there and grows if the
+    # search runs past it, so the bar never sits at 100 % while work remains.
+    _g0 = guess(library, target, family)
+    est = {"probes": 4 if _g0 is not None else MAX_PROBES}
+    tried: dict[int, dict] = {}
+
+    def _report(text, done_units):
+        if not tick:
+            return
+        total = 1 + est["probes"]                    # 1 unit for cutting, 1 per probe
+        info = {"tried": sorted(({"cq": k2, "vmaf": v["vmaf"], "cambi": v["cambi"], "ok": v["ok"]}
+                                 for k2, v in tried.items()), key=lambda x: x["cq"]),
+                "want": want, "banding": banding, "probes_est": est["probes"]}
+        try:
+            tick(text, min(0.99, done_units / total), info)
+        except TypeError:
+            tick(text, min(0.99, done_units / total))
+
     refs = []
     for k, t in enumerate(times):
+        _report(f"cutting sample {k + 1}/{len(times)} from the source", k / max(1, len(times)))
         ref = os.path.join(work_dir, f"ref-{k}.mkv")
         if _cut_reference(ff, src, t, length, ref):
             refs.append(ref)
@@ -257,7 +278,6 @@ def choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durati
         _sh.rmtree(work_dir, ignore_errors=True)
         return {"cq": None, "note": "could not cut reference samples from the source"}
     t0 = time.time()
-    tried: dict[int, dict] = {}
     STATE[job_id] = {"label": os.path.basename(src), "probe": 0, "cq": None, "at": t0}
 
     def probe_cq(cq: int) -> dict:
@@ -265,9 +285,9 @@ def choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durati
             return tried[cq]
         STATE[job_id].update(probe=len(tried) + 1, cq=cq)
         sizes, means, lows, bands = 0, [], [], []
+        est["probes"] = max(est["probes"], len(tried) + 1)
         for k, ref in enumerate(refs):
-            if tick:
-                tick(f"VMAF: CQ {cq}, sample {k + 1}/{len(refs)}", (len(tried) + k / len(refs)) / MAX_PROBES)
+            _report(f"CQ {cq}: sample {k + 1}/{len(refs)}", 1 + len(tried) + k / len(refs))
             out = os.path.join(work_dir, f"enc-{cq}-{k}.mkv")
             try:
                 sz = _encode_sample(ff, ref, family, codec, cq, preset, ten, out)

@@ -15745,6 +15745,13 @@ button[disabled]{opacity:.5;cursor:default}
    started an animation the next one interrupted - the bar trailed nearly half
    a second behind the number printed beside it and never settled. */
 .socrbar i{display:block;height:100%;transition:width .18s linear}
+/* the quality search: the same strip, striped and moving while it works */
+.vmafbar{flex:0 0 180px;height:6px;background:#20262e;border-radius:3px;overflow:hidden;position:relative}
+.vmafbar i{display:block;height:100%;background:#b48cff;transition:width .6s linear}
+.vmafbar b{position:absolute;inset:0;background:repeating-linear-gradient(45deg,rgba(255,255,255,.18) 0 6px,transparent 6px 12px);
+           animation:vmafmove .8s linear infinite}
+@keyframes vmafmove{from{background-position:0 0}to{background-position:17px 0}}
+.vmafcq{display:inline-block;padding:0 5px;border-radius:7px;font-size:10px;margin-right:3px;border:1px solid}
 .wkstats{display:flex;gap:18px;font-size:12px;color:var(--dim);margin-top:5px}
 .wkstats b{color:var(--fg);font-variant-numeric:tabular-nums}
 /* The encoder chip. Green for hardware because that is the fast, expected
@@ -25175,6 +25182,29 @@ function sizeDelta(w){
 // percentage several times a second, so there is nothing to smooth over -
 // the ratchet exists for OCR because its progress arrives in long, uneven
 // jumps.
+// THE QUALITY SEARCH, before the encode proper: sample encodes scored with
+// VMAF and the banding index until the highest CQ that still passes is found.
+// A real fraction (cutting + probes, the probe count estimated and grown as
+// the search runs), the time left from the pace so far, and each CQ tried
+// with its score - green passed, red did not.
+function vmafCell(w){
+  if(!w.vmaf_stage) return '';
+  const f = Math.max(0, Math.min(1, w.vmaf_frac||0)), pct = f*100;
+  const el = w.vmaf_at ? Math.max(0, Date.now()/1000 - w.vmaf_at) : 0;
+  const left = (f > 0.08 && el > 5) ? el*(1-f)/f : null;
+  const mmss = s => s >= 90 ? Math.round(s/60)+'m' : Math.round(s)+'s';
+  const info = w.vmaf_info||{}, tried = info.tried||[];
+  const col = '#b48cff';
+  const chips = tried.map(t => `<span class="vmafcq" title="CQ ${t.cq}: VMAF ${t.vmaf}, banding ${t.cambi}"
+      style="color:${t.ok?'#7fd4a3':'#e0575b'};border-color:${t.ok?'rgba(127,212,163,.45)':'rgba(224,87,91,.45)'}">CQ ${t.cq} ${t.ok?'✓':'✗'} ${t.vmaf}</span>`).join('');
+  return `<div class="socr vmafrow">
+    <span class="pill" style="color:${col};border-color:${col}">quality</span>
+    <span class="vmafbar"><i style="width:${pct.toFixed(1)}%"></i><b></b></span>
+    <span class="mono socrpct" style="color:${col};min-width:40px">${pct.toFixed(0)}%</span>
+    <span class="dim">${esc(w.vmaf_stage)} · ${mmss(el)}${left!=null?' · ~'+mmss(left)+' left':''}</span>
+    <span>${chips}</span>
+    <span class="dim">· looking for the smallest file that still scores VMAF ${info.want??95} with banding under ${info.banding??4}</span></div>`;
+}
 function subFixCell(w){
   if(!w.sub_fix_stage) return '';
   const pct = Math.max(0, Math.min(100, (w.sub_fix_frac||0)*100));
@@ -26677,7 +26707,7 @@ function paintRunning(j){
         <div class="bar big"><i class="${indet?'indet':''}${bs.held?' held':''}${reset?' nogrow':''}"
              style="width:${pct.toFixed(1)}%;background-color:${col}"></i></div>
         <div class="wkstats">${wkStatsHtml(w, pct, indet)}</div>
-        <div class="socrzone">${subOcrCell(w)}${subFixCell(w)}</div>
+        <div class="socrzone">${vmafCell(w)}${subOcrCell(w)}${subFixCell(w)}</div>
         <div class="iozone">${ioCell(w)}</div>
         <div class="wlzone">${w.last_line?`<div class="dim mono wkline">${esc(w.last_line)}</div>`:''}</div>
         ${watchId===w.job_id
@@ -27002,7 +27032,7 @@ function tryPatchCards(j){
     const st = card.querySelector('.wkstats');
     if(st) st.innerHTML = wkStatsHtml(w, bs.pct, bs.indet);
     const sz = card.querySelector('.socrzone');
-    if(sz) sz.innerHTML = subOcrCell(w) + subFixCell(w);
+    if(sz) sz.innerHTML = vmafCell(w) + subOcrCell(w) + subFixCell(w);
     const io = card.querySelector('.iozone');
     if(io) io.innerHTML = ioCell(w);
     const wl = card.querySelector('.wlzone');
