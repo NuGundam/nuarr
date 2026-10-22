@@ -250,8 +250,18 @@ async def run() -> str:
         return f"waiting - {holder} has the GPU lane"
     global _PROC
     STATE.update(running=True, error="", done=0, total=min(len(todo), BATCH), file="",
-                 started=time.time())
+                 started=time.time(), stage="checking GPU memory")
     try:
+        # ROOM FIRST. Loading a 7B model into a full card is how this sat at
+        # "loading Qwen" with nothing moving - see gpubudget.py.
+        from . import gpubudget
+
+        def _wait(free, need, el):
+            STATE["stage"] = f"waiting for GPU memory - {free:.1f} of {need:g} GB free ({int(el)}s)"
+        ok, why = await asyncio.to_thread(gpubudget.make_room, gpubudget.COST_GB["qwen"], "qwen", 600, _wait)
+        if not ok:
+            return f"waiting - GPU memory: {why}"
+        STATE["stage"] = "loading Qwen"
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         tf = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "..",
                           "qwen_tracks.json")
@@ -278,7 +288,7 @@ async def run() -> str:
                 continue
             if "progress" in d:
                 STATE.update(done=int(d["progress"]), total=int(d.get("total") or STATE["total"]),
-                             file=str(d.get("file") or ""))
+                             file=str(d.get("file") or ""), stage="reading the lines")
             n = int(d.get("judged", n))
             err = d.get("error", err)
         await p.wait()
@@ -424,10 +434,18 @@ def as_running() -> list:
     el = time.time() - float(STATE.get("started") or time.time())
     tot, done = int(STATE.get("total") or 0), int(STATE.get("done") or 0)
     pct = (done / tot) if tot else 0.0
+    # TITLED BY THE FILE, like every other card: "City Hunter - S00E01", with
+    # what the judge is doing and how far it is in the stage line.
+    f = STATE.get("file") or ""
+    import re as _re
+    stem = _re.sub(r"\.[A-Za-z0-9]{2,4}$", "", f)
+    m = _re.match(r"(.+?)(?: \(\d{4}\))? - (S\d+E\d+)", stem)
+    label = f"{m.group(1)} - {m.group(2)}" if m else (stem.split(" [")[0] or "Qwen judge")
     return [{
         "job_id": "qwenjudge", "pool": "qwen", "kind": "qwen",
-        "title": f"Qwen judge - {done} of {tot} pictures", "file": STATE.get("file") or "",
-        "path": "", "stage": "reading the lines" if done else "loading Qwen",
+        "title": label, "file": f,
+        "path": "", "stage": f"Qwen judge · {done} of {tot} pictures · "
+                             + (STATE.get("stage") or ("reading the lines" if done else "loading Qwen")),
         "progress": pct, "elapsed_s": round(el),
         "eta_s": round(el / pct - el) if 0.05 < pct < 1 else None, "eta_est": True,
         "plan": "read each picture's lines in order and say how likely they are to be dialogue",

@@ -31,6 +31,7 @@ OLLAMA = os.environ.get("NUARR_OLLAMA", "http://127.0.0.1:11434")
 MODEL_DEFAULT = "qwen3-vl:8b-instruct"
 VL_MAX_DEFAULT = 200           # cues per track it may be asked about
 DOUBT_SCORE = 0.72             # mean Paddle confidence under this is a doubt
+LOAD_GB = 7.0                  # free GPU memory needed to LOAD it (5.5 + room for the rest)
 KEEP_ALIVE = "3m"              # Ollama unloads it after this long idle; loading again costs about a second
 
 PROMPT = ("This image is one subtitle cue cut from a video. Transcribe the text "
@@ -83,7 +84,10 @@ def read_image(png: bytes, model: str = "", timeout: float = 90.0) -> str:
         "model": model or MODEL_DEFAULT, "prompt": PROMPT, "stream": False,
         "images": [base64.b64encode(png).decode("ascii")],
         "keep_alive": KEEP_ALIVE,
-        "options": {"temperature": 0, "num_predict": 160},
+        # 2048 TOKENS OF CONTEXT, not Ollama's default 32k: one picture and a
+        # one-line answer need a fraction of it, and the default held 10.3 GB
+        # of the card where 2048 holds 5.5 GB - same answer, measured.
+        "options": {"temperature": 0, "num_predict": 160, "num_ctx": 2048},
     }).encode("utf-8")
     req = urllib.request.Request(OLLAMA + "/api/generate", data=body,
                                  headers={"Content-Type": "application/json"})
@@ -125,9 +129,35 @@ class Helper:
     def __bool__(self) -> bool:
         return bool(self.model) and self.asked < self.max
 
+    def _room(self) -> bool:
+        """Loaded already, or room on the card to load it. A fallback reader
+        must never be the thing that crowds the card out - so it is skipped
+        when it would have to load into less than LOAD_GB."""
+        now = time.time()
+        if now - getattr(self, "_room_at", 0.0) < 20:
+            return self._room_ok
+        ok = True
+        try:
+            with urllib.request.urlopen(OLLAMA + "/api/ps", timeout=3) as r:
+                loaded = any((m.get("name") or "").startswith(self.model.split(":")[0])
+                             for m in json.loads(r.read().decode("utf-8")).get("models") or [])
+            if not loaded:
+                import subprocess
+                out = subprocess.run(["nvidia-smi", "--query-gpu=memory.used,memory.total",
+                                      "--format=csv,noheader,nounits"], capture_output=True, text=True,
+                                     timeout=10, creationflags=0x08000000).stdout.split(",")
+                free = (float(out[1]) - float(out[0])) / 1024
+                ok = free >= LOAD_GB
+        except Exception:                                # noqa: BLE001
+            ok = True
+        self._room_at, self._room_ok = now, ok
+        if not ok:
+            self.skipped = getattr(self, "skipped", 0) + 1
+        return ok
+
     def ask(self, pic) -> list:
         """Lines the vision model read from a numpy image; [] if none/failed."""
-        if not self:
+        if not self or not self._room():
             return []
         self.asked += 1
         t0 = time.time()

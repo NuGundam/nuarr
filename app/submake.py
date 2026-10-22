@@ -309,6 +309,14 @@ async def _runner() -> None:
             STATE["waiting_for"] = holder
             await asyncio.sleep(60)
             continue
+        # Whisper and Qwen both load in the maker's worker; room for the bigger.
+        from . import gpubudget as _gb
+        _ok, _why = await asyncio.to_thread(_gb.make_room, _gb.COST_GB["qwen"], "submake", 300)
+        if not _ok:
+            heavy.release(LANE)
+            STATE["waiting_for"] = f"GPU memory - {_why}"
+            await asyncio.sleep(60)
+            continue
         STATE["waiting_for"] = ""
         try:
             q = _queue()

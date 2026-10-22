@@ -11482,6 +11482,12 @@ async def api_shrink_trial(ids: str = ""):
     return {"trial": want, "queued": queued}
 
 
+@app.get("/api/gpu/budget")
+def api_gpu_budget():
+    from . import gpubudget
+    return gpubudget.snapshot()
+
+
 @app.get("/api/vmaf")
 def api_vmaf():
     from . import vmaftarget

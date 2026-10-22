@@ -520,6 +520,11 @@ def run_batch(n: int) -> dict:
         got, holder = heavy.claim(LANE, ttl=1800)
         if not got:
             return {"skipped": f"{holder} has the GPU lane"}
+        from . import gpubudget as _gb
+        _ok, _why = _gb.make_room(_gb.COST_GB["whisper"], "verify", 300)
+        if not _ok:
+            heavy.release(LANE)
+            return {"skipped": f"GPU memory - {_why}"}
         try:
             done = []
             for r in candidates(n):
