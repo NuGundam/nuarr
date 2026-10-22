@@ -54,9 +54,48 @@ MAX_PROBES = 6
 # search in three of them the CPU sat at 97 % and NVENC at 19-28 %: the card
 # waited on the scorer. Two searches at a time keeps the other slots encoding,
 # and every 4th frame scored (about 36 a sample) halves each search's cost.
-MAX_SEARCHES = 2
+MAX_SEARCHES = 2               # the default; kv vmaf.searches overrides (1-4)
 SUBSAMPLE = 4
-_SLOTS = threading.Semaphore(MAX_SEARCHES)
+_COND = threading.Condition()
+_ACTIVE = {"n": 0}
+
+
+def searches() -> int:
+    try:
+        return max(1, min(4, int(kv_get("vmaf.searches") or MAX_SEARCHES)))
+    except (TypeError, ValueError):
+        return MAX_SEARCHES
+
+
+def set_searches(n: int) -> int:
+    kv_set("vmaf.searches", str(max(1, min(4, int(n)))))
+    with _COND:
+        _COND.notify_all()
+    return searches()
+
+
+def active() -> int:
+    return _ACTIVE["n"]
+
+
+def _acquire(block: bool, timeout: float = 5.0) -> bool:
+    with _COND:
+        if _ACTIVE["n"] < searches():
+            _ACTIVE["n"] += 1
+            return True
+        if not block:
+            return False
+        _COND.wait(timeout)
+        if _ACTIVE["n"] < searches():
+            _ACTIVE["n"] += 1
+            return True
+        return False
+
+
+def _release() -> None:
+    with _COND:
+        _ACTIVE["n"] = max(0, _ACTIVE["n"] - 1)
+        _COND.notify_all()
 LEARN_KEEP = 25
 
 STATE: dict = {}       # job id -> what it is doing, for the page
@@ -229,20 +268,20 @@ def choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durati
     A file that has to wait says so on its card."""
     if not cfg()["on"] or skip_reason(plan, probe, duration):
         return _choose(job_id, file_id, src, plan, probe, duration, library, work_dir, tick)
-    if not _SLOTS.acquire(blocking=False):
+    if not _acquire(False):
         t0 = time.time()
         STATE[job_id] = {"label": os.path.basename(src), "probe": 0, "cq": None, "at": t0, "waiting": True}
-        while not _SLOTS.acquire(timeout=5):
+        while not _acquire(True, 5.0):
             if tick:
                 try:
                     tick(f"waiting for a quality-search slot ({int(time.time() - t0)}s) - "
-                         f"{MAX_SEARCHES} run at once", 0.0, {})
+                         f"{searches()} run at once", 0.0, {})
                 except TypeError:
                     tick("waiting for a quality-search slot", 0.0)
     try:
         return _choose(job_id, file_id, src, plan, probe, duration, library, work_dir, tick)
     finally:
-        _SLOTS.release()
+        _release()
 
 
 def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, duration: float,
@@ -270,7 +309,7 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
     want, floor, banding = float(c["target"]), float(c["floor"]), float(c["banding"])
     n, length = int(c["samples"]), float(c["sample_s"])
     times = _sample_times(duration, n, length)
-    threads = max(2, (os.cpu_count() or 8) // (MAX_SEARCHES + 1))
+    threads = max(2, (os.cpu_count() or 8) // (searches() + 1))
     # ONE FOLDER PER JOB. The first trial ran three encodes at once, all at
     # CQ 20, and every sample file was named by process, CQ and sample - so
     # the three wrote over each other and none could be scored.

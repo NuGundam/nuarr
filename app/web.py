@@ -4271,7 +4271,7 @@ def api_queue(pool: str | None = None, disk: str | None = None,
     return {"total": tot["n"], "bytes": tot["bytes"], "shown": len(rows),
             "items": rows, "by_disk": by_disk, "by_pool": by_pool,
             "capacity": cap_now, "sorted_by": sort, "running": running,
-            "timing": _t}
+            "timing": _t, "outside": _outside_live()}
 
 
 @app.post("/api/queue/by_codec")
@@ -10608,7 +10608,7 @@ def api_jobs(recent: int = Query(60, le=1000)):
     # with the worker rows it sits above.
     # `recent` defaults low: this is polled every 2 s, and shipping 300 finished
     # rows each time made a 160 KB response out of data that rarely changes.
-    return jobs.snapshot(recent_limit=recent) | {"system": system.snapshot()}
+    return jobs.snapshot(recent_limit=recent) | {"system": system.snapshot(), "outside": _outside_live()}
 
 
 _TAUT_PROBE: dict = {"at": 0.0, "d": None, "busy": False}
@@ -13991,6 +13991,61 @@ async def api_gate_toggle(key: str, on: bool):
     return {"ok": True, "gate": st.as_dict() | {"toggles": gate.toggles()}}
 
 
+def _outside_live() -> list:
+    """Everything that does work outside the queue's pools, with how many are
+    running now and how many may - the same shape on every page that draws
+    workers, so none of them can fall behind when one is added."""
+    out = []
+    try:
+        from . import submake, qwenjudge, subverify, vmaftarget, qwenvl
+        sv = subverify.STATE
+        out = [
+            {"key": "quality", "pool": "quality", "label": "Quality searches",
+             "running": vmaftarget.active(), "cap": vmaftarget.searches(),
+             "paused": not vmaftarget.cfg().get("on", True), "adjust": [1, 4],
+             "now": (f"{vmaftarget.active()} searching" if vmaftarget.active() else ""),
+             "queued": sum(1 for v in vmaftarget.STATE.values() if v.get("waiting")),
+             "hint": ("Before an encode: sample encodes scored with VMAF and the banding index until the "
+                      "smallest file that still scores the target is found. CPU work - more at once "
+                      "starves the encoder of frames; two keeps NVENC busy.")},
+            {"key": "submake", "pool": "submake", "label": "Subtitle maker",
+             "running": 1 if submake.STATE.get("running") else 0, "cap": 1, "paused": submake.paused(),
+             "now": ("making " + submake.STATE.get("label", "")) if submake.STATE.get("running") else "",
+             "queued": len(submake._queue()),
+             "hint": ("English subtitles for a file that has none: Whisper for what is said, "
+                      "PaddleOCR and Qwen for what is written. Runs when you ask, or first for a raw "
+                      "in auto, before anything is replaced."), "cost": submake.cost()},
+            {"key": "qwen", "pool": "qwen", "label": "Qwen judge",
+             "running": 1 if qwenjudge.STATE.get("running") else 0, "cap": 1, "paused": qwenjudge.paused(),
+             "now": (f"judging {qwenjudge.STATE.get('done', 0)} of {qwenjudge.STATE.get('total', 0)}"
+                     if qwenjudge.STATE.get("running") else ""),
+             "queued": qwenjudge.waiting(),
+             "hint": ("Reads the lines the burned-in subtitle check kept and says how likely they are "
+                      "to be dialogue. Every ten minutes when there is something new."), "cost": qwenjudge.cost()},
+            {"key": "verify", "pool": "verify", "label": "Second opinion",
+             "running": 1 if sv.get("running") else 0, "cap": 1, "paused": subverify.paused(),
+             "now": ("checking " + (sv.get("label") or "")) if sv.get("running") else "",
+             "queued": 0,
+             "hint": ("Files the subtitle board is unsure about get Whisper, Qwen and the readers instead of a "
+                      "person; settles them at the sure % on the Subtitle AI page.")},
+            {"key": "qwenvl", "pool": "qwenvl", "label": "Qwen-VL reader",
+             "running": 0, "cap": 1, "paused": not qwenvl.on(),
+             "now": "", "queued": 0,
+             "hint": ("The reader of last resort: asked about a subtitle picture only when OCR doubted it. "
+                      "Through Ollama, loaded on demand, never into less than 7 GB free.")},
+        ]
+        try:
+            for m in qwenvl._get("/api/ps").get("models") or []:
+                if (m.get("name") or "").startswith("qwen3-vl"):
+                    out[-1]["running"] = 1
+                    out[-1]["now"] = "loaded"
+        except Exception:                                # noqa: BLE001
+            pass
+    except Exception:                                    # noqa: BLE001
+        pass
+    return out
+
+
 @app.get("/api/workers")
 def api_workers():
     """Every dial, plus what this box is - the page needs both to say where
@@ -14007,40 +14062,37 @@ def api_workers():
     # each runs in a child process of its own, one at a time, on the heavy
     # lane it shares with installs and engine tests. They have no count to
     # set, but they do cost the card, and this page is where cost is shown.
-    try:
-        from . import submake, qwenjudge
-        out["_outside"] = [
-            {"key": "submake", "pool": "submake", "label": "Subtitle maker",
-             "hint": ("English subtitles for a file that has none: Whisper for what is said, "
-                      "PaddleOCR and Qwen for what is written. Runs when you ask, or first for a raw "
-                      "in auto, before anything is replaced."),
-             "cost": submake.cost(), "paused": submake.paused(),
-             "now": ("making " + submake.STATE.get("label", "")) if submake.STATE.get("running") else "",
-             "queued": len(submake._queue())},
-            {"key": "qwen", "pool": "qwen", "label": "Qwen judge",
-             "hint": ("Reads the lines the burned-in subtitle check kept and says how likely they are "
-                      "to be dialogue. Every ten minutes when there is something new."),
-             "cost": qwenjudge.cost(), "paused": qwenjudge.paused(),
-             "now": (f"judging {qwenjudge.STATE.get('done', 0)} of {qwenjudge.STATE.get('total', 0)}"
-                     if qwenjudge.STATE.get("running") else ""),
-             "queued": qwenjudge.waiting()},
-        ]
-    except Exception:                                    # noqa: BLE001
-        out["_outside"] = []
+    out["_outside"] = _outside_live()
     return out
 
 
 @app.post("/api/outside/pause")
 def api_outside_pause(key: str, on: int = 1):
-    """Pause or run the Subtitle maker or the Qwen judge."""
-    from . import submake, qwenjudge
-    mod = {"submake": submake, "qwen": qwenjudge}.get(key)
-    if not mod:
-        raise HTTPException(400, "key must be submake or qwen")
-    mod.set_paused(bool(on))
-    joblog.log(f"{'Subtitle maker' if key == 'submake' else 'Qwen judge'} "
-               f"{'paused' if on else 'running again'}", "info")
+    """Pause or run anything outside the queue."""
+    from . import submake, qwenjudge, subverify, vmaftarget, qwenvl
+    names = {"submake": "Subtitle maker", "qwen": "Qwen judge", "verify": "Second opinion",
+             "quality": "Quality searches", "qwenvl": "Qwen-VL reader"}
+    if key not in names:
+        raise HTTPException(400, "unknown key")
+    if key == "quality":
+        vmaftarget.set_cfg(on=not bool(on))           # paused = encodes keep the library's CQ
+    elif key == "qwenvl":
+        qwenvl.set_on(not bool(on))
+    else:
+        {"submake": submake, "qwen": qwenjudge, "verify": subverify}[key].set_paused(bool(on))
+    joblog.log(f"{names[key]} {'paused' if on else 'running again'}", "info")
     return {"key": key, "paused": bool(on)}
+
+
+@app.post("/api/outside/count")
+def api_outside_count(key: str, n: int):
+    """How many quality searches may run at once - the one outside count."""
+    from . import vmaftarget
+    if key != "quality":
+        raise HTTPException(400, "only quality has a count")
+    v = vmaftarget.set_searches(n)
+    joblog.log(f"quality searches at once: {v}", "info")
+    return {"key": key, "value": v}
 
 
 @app.post("/api/workers")
@@ -15753,7 +15805,7 @@ button[disabled]{opacity:.5;cursor:default}
 .socrbar i{display:block;height:100%;transition:width .18s linear}
 /* the quality search: the same strip, striped and moving while it works */
 .vmafbar{flex:0 0 180px;height:6px;background:#20262e;border-radius:3px;overflow:hidden;position:relative}
-.vmafbar i{display:block;height:100%;background:#b48cff;transition:width .6s linear}
+.vmafbar i{display:block;height:100%;background:#a2e05e;transition:width .6s linear}
 .vmafbar b{position:absolute;inset:0;background:repeating-linear-gradient(45deg,rgba(255,255,255,.18) 0 6px,transparent 6px 12px);
            animation:vmafmove .8s linear infinite}
 @keyframes vmafmove{from{background-position:0 0}to{background-position:17px 0}}
@@ -25062,6 +25114,9 @@ function poolColor(pool){
        : pool==='decode'      ? '#e8a33d'         // amber - a CPU check, not a copy
        : pool==='submake'     ? '#79c0ff'         // light blue - the Subtitle maker, its panel's colour
        : pool==='qwen'        ? '#f0b37e'         // apricot - the Qwen judge
+       : pool==='quality'     ? '#a2e05e'         // lime - the VMAF quality search
+       : pool==='verify'      ? '#ff7b72'         // coral - the second opinion
+       : pool==='qwenvl'      ? '#ff9e64'         // orange - the Qwen-VL reader
        : 'var(--ok)';
 }
 function diskColor(name){
@@ -25200,7 +25255,7 @@ function vmafCell(w){
   const left = (f > 0.08 && el > 5) ? el*(1-f)/f : null;
   const mmss = s => s >= 90 ? Math.round(s/60)+'m' : Math.round(s)+'s';
   const info = w.vmaf_info||{}, tried = info.tried||[];
-  const col = '#b48cff';
+  const col = poolColor('quality');
   const chips = tried.map(t => `<span class="vmafcq" title="CQ ${t.cq}: VMAF ${t.vmaf}, banding ${t.cambi}"
       style="color:${t.ok?'#7fd4a3':'#e0575b'};border-color:${t.ok?'rgba(127,212,163,.45)':'rgba(224,87,91,.45)'}">CQ ${t.cq} ${t.ok?'✓':'✗'} ${t.vmaf}</span>`).join('');
   return `<div class="socr vmafrow">
@@ -26116,6 +26171,13 @@ async function loadQueue(){
              >${esc(p)} <b>${fmt(n)}</b>${
                run?`<i class="qrun">\u25b6${run}</i>`:''}${
                cap===0?'<b class="qpaused">off</b>':''}</span>`;
+    }).join('') + (q.outside||[]).map(v=>{
+      const c = poolColor(v.pool), quiet = !v.running && !v.queued;
+      return `<span class="qchip${quiet?' qzero':''}" title="${esc(v.label+': '+(v.now||'idle')+(v.queued?' - '+v.queued+' waiting':''))}"
+             style="cursor:default;color:${quiet?'var(--dim)':c};border-color:${quiet?'var(--line)':c}"
+             >${esc(v.pool)} <b>${fmt(v.queued||0)}</b>${
+               v.running?`<i class="qrun">\u25b6${v.running}</i>`:''}${
+               v.paused?'<b class="qpaused">off</b>':''}</span>`;
     }).join('');
     // keep the disk filter list in sync with what is actually queued
     const sel=document.getElementById('qfDisk');
@@ -26407,6 +26469,7 @@ async function loadJobs(){
   const held = new Set(j.plex_disks||[]);
   // The Workers panel says how many of each MAY run; this is how many are.
   _poolUse = j.in_use||{}; _poolCap = j.capacity||{};
+  _outLive = j.outside||[];
   _ioLowJobs = new Set(j.io_low_jobs||[]);
   // HOW MANY of this pool's jobs are actually demoted, not "is the feature on".
   // Priority is now applied per spindle, so with a viewer on one disk and four
@@ -26464,6 +26527,13 @@ async function loadJobs(){
     // name wears its pool colour, so the strip and the card pills agree.
     + ['audio','decode','listen','subread'].map(p=>
         capCell(p, (j.in_use||{})[p]||0, (j.capacity||{})[p]||0, p)).join('')
+    // AND EVERYTHING OUTSIDE THE QUEUE, each in its own colour - the quality
+    // search, the Subtitle maker, the Qwen judge, the second opinion, Qwen-VL.
+    + (j.outside||[]).map(v=>`<span class="grp" title="${esc(v.hint||'')}">`
+        + `<span class="k" style="color:${poolColor(v.pool)};opacity:${v.paused?'.45':'.9'}">${esc(v.pool)}</span>`
+        + `<span class="v" style="color:${v.running?(v.running>=(v.cap||1)?'var(--ok)':'var(--acc)'):'var(--dim)'}">${v.running||0}</span>`
+        + (v.paused?`<span class="dim" style="font-size:10px;margin-left:3px">⏸ paused</span>`:`<span class="dim">/${v.cap||1}</span>`)
+        + `</span>`).join('')
     // THE ONE queued figure. It used to appear here AND six lines below in the
     // run-progress line, computed a moment apart so the two disagreed by a
     // handful - two different numbers for the same thing. The other one is
@@ -27743,8 +27813,13 @@ function renderDone(j){
   function szCells(b,a,cur){
     if(b&&a){
       const d=(a-b)/b*100;
-      return `<span class="szc"><span>${gb(b)}</span><span class="dim">→</span><span>${gb(a)}</span>`
-        +`<span style="color:${d<0?'var(--ok)':(d>0?'var(--warn)':'var(--dim)')}">${d>0?'+':''}${d.toFixed(1)}%</span></span>`;
+      // SMALLER IS GREEN, BIGGER IS RED, the same both sides of the arrow: the
+      // before figure in a quieter tone of the same colour, the after in full.
+      const up = a > b, same = Math.abs(d) < 0.05;
+      const full = same ? 'var(--dim)' : (up ? '#ff7b72' : '#7fd4a3');
+      const soft = same ? 'var(--dim)' : (up ? 'rgba(255,123,114,.6)' : 'rgba(127,212,163,.6)');
+      return `<span class="szc"><span style="color:${soft}">${gb(b)}</span><span style="color:${soft}">${same?'→':(up?'↗':'↘')}</span><span style="color:${full};font-weight:600">${gb(a)}</span>`
+        +`<span style="color:${full}">${d>0?'+':''}${d.toFixed(1)}%</span></span>`;
     }
     return `<span class="szc"><span></span><span></span><span class="dim">${cur?gb(cur):'—'}</span><span></span></span>`;
   }
@@ -29676,9 +29751,9 @@ function costStrip(c){
 function outsideRows(list){
   if(!list.length) return '';
   return `<div style="padding:10px 14px 4px"><b style="font-size:12px">Outside the queue</b>
-      <div class="dim" style="font-size:11px">Each runs in a process of its own, one at a time, on the lane it shares with
-      installs and engine tests - so there is no count to set, only whether it runs. Both use the card's cores, not
-      the encoder.</div></div>
+      <div class="dim" style="font-size:11px">Work that is not a queue pool: the quality search runs inside an encode slot
+      before the encode proper; the rest each run in a process of their own, one at a time, on the GPU lane they share
+      with installs and engine tests. Only the quality search has a count to set; the others only run or pause.</div></div>
     <table>${list.map(v=>{
       const pc=poolColor(v.pool), off=!!v.paused;
       return `<tr class="${off?'wpaused':''}">
@@ -29688,12 +29763,20 @@ function outsideRows(list){
           <div class="dim" style="font-size:11px">${esc(v.hint)}</div>
           ${costStrip(v.cost)}</td>
         <td style="width:250px;text-align:right;white-space:nowrap">
-          <b>1</b> <span class="dim" style="font-size:11px">at a time</span>
-          <div class="dim" style="font-size:11px">${v.queued?fmt(v.queued)+' waiting':'nothing waiting'}</div></td>
+          ${v.adjust?`<button onclick="outsideCount('${v.key}',${(v.cap||1)-1})" ${(v.cap||1)<=v.adjust[0]?'disabled':''}>−</button>
+            <b style="display:inline-block;min-width:22px;text-align:center">${v.cap||1}</b>
+            <button onclick="outsideCount('${v.key}',${(v.cap||1)+1})" ${(v.cap||1)>=v.adjust[1]?'disabled':''}>+</button>
+            <span class="dim" style="font-size:11px">at once</span>`
+            :`<b>${v.cap||1}</b> <span class="dim" style="font-size:11px">at a time</span>`}
+          <div class="dim" style="font-size:11px">${v.running?`<span style="color:${pc}">${v.running} running</span> · `:''}${v.queued?fmt(v.queued)+' waiting':'nothing waiting'}</div></td>
         <td style="width:96px;text-align:right;vertical-align:middle">
           <button class="wsw ${off?'off':'on'}" onclick="outsidePause('${v.key}',${off?0:1},this)"
             title="${off?'Paused. Click to let it run.':'Running. Click to pause: what is running finishes, nothing new starts.'}"
             ><span class="knob"></span>${off?'paused':'running'}</button></td></tr>`;}).join('')}</table>`;
+}
+async function outsideCount(key, n){
+  try{ await fetch('/api/outside/count?key='+key+'&n='+n,{method:'POST'}); }catch(e){}
+  loadWorkers();
 }
 async function outsidePause(key, on, btn){
   btn.disabled=true;
@@ -49820,7 +49903,8 @@ async function bkRestore(name){
   }catch(e){ if(m) m.textContent='failed: '+e.message; }
   loadBackup(false);
 }
-let _encLine='';   // "encoding on: ..." - fetched once, painted into the header
+let _encLine='';
+let _outLive=[];   // what runs outside the queue, live from the jobs feed   // "encoding on: ..." - fetched once, painted into the header
 // THE DASHBOARD IS NOT THE SETTINGS PAGE, and this panel is on both.
 //
 // Workers - concurrency is the one settings pane that stays on the dashboard,
@@ -49857,7 +49941,19 @@ function workersCompact(w){
   };
   const pools = KEYS.filter(k=>(w[k]||{}).pool);
   const off = pools.filter(k=>w[k].paused).length;
-  return `<div class="wcgrid">${KEYS.map(cell).join('')}</div>
+  // AND WHAT RUNS OUTSIDE THE QUEUE, live from the jobs feed when it has it.
+  const outs = (_outLive && _outLive.length ? _outLive : (w._outside||[]));
+  const ocell = (v)=>{
+    const col = poolColor(v.pool);
+    return `<div class="wcell${v.paused?' off':''}" onclick="location.href='/settings#counts'"
+         title="${esc(v.hint||'')}">
+         <div class="wcname" style="color:${col}">${esc(v.label)}</div>
+         <div class="wcval"><b style="color:${v.running?col:'var(--dim)'}">${v.cap||1}</b>`
+      + (v.paused ? `<span class="wcsub" style="color:var(--warn)">\u23f8 paused</span>`
+                  : `<span class="wcsub">${v.running?`${v.running} running now`:(v.adjust?'at once':'at a time')}</span>`)
+      + `</div></div>`;
+  };
+  return `<div class="wcgrid">${KEYS.map(cell).join('')}${outs.map(ocell).join('')}</div>
       <div class="wcfoot">${off
         ? `<span class="warn">${off} of ${pools.length} pools paused \u2014 what is running finishes, nothing new starts</span>`
         : 'how many of each may run at once \u2014 hover one for what it costs the box'}</div>

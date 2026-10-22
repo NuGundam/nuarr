@@ -545,13 +545,23 @@ def stop() -> bool:
     return True
 
 
+def paused() -> bool:
+    """The Concurrency page's switch - separate from the mode, which says what
+    an answer may do; this only says whether it runs now."""
+    return str(kv_get("verify.paused") or "0") == "1"
+
+
+def set_paused(on: bool) -> None:
+    kv_set("verify.paused", "1" if on else "0")
+
+
 async def watch() -> None:
     import asyncio
     await asyncio.sleep(600)
     while True:
         STATE["next_run"] = time.time() + TICK_S
         try:
-            if mode() != "off":
+            if mode() != "off" and not paused():
                 now = time.time()
                 if now - STATE["hour_start"] > 3600:
                     STATE.update(hour_start=now, hour_count=0)
