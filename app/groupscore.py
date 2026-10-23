@@ -40,7 +40,34 @@ SAMPLE_S = 4.0
 REV = 1
 KV_PAUSED = "groups.paused"
 BELOW_NORMAL = 0x00004000
-STATE: dict = {"running": False, "label": "", "at": 0.0, "last": "", "done_session": 0}
+STATE: dict = {"running": False, "label": "", "at": 0.0, "last": "", "done_session": 0,
+               "left": None, "left_at": 0.0}
+# THE TWO SLOW PARTS OF THE SCORECARD, CACHED. Scanning 105 MB of plan_json
+# for shrink results took 0.8 s and re-planning the whole queue to count
+# what is left 0.4 s - on a page that refreshes every minute. Shrink results
+# change a few times an hour, the count once per measured file.
+_SHRINK: dict = {"at": 0.0, "rows": []}
+SHRINK_TTL = 600.0
+
+
+def _shrink_rows() -> list:
+    if time.time() - _SHRINK["at"] < SHRINK_TTL:
+        return _SHRINK["rows"]
+    with cursor() as cur:
+        rows = [dict(r) for r in cur.execute(
+            "SELECT file_id, size_before, size_after FROM jobs WHERE kind='transcode' AND state='done' "
+            "AND size_before>0 AND size_after>0 AND size_after<size_before "
+            "AND (plan_json LIKE '%convert the video to 10-bit HEVC%' OR plan_json LIKE '%shrink the video%')")]
+    _SHRINK.update(at=time.time(), rows=rows)
+    return rows
+
+
+def _left() -> int | None:
+    if paused():
+        return None
+    if STATE["left"] is None or time.time() - STATE["left_at"] > 600:
+        STATE.update(left=len(plan(100000)), left_at=time.time())
+    return STATE["left"]
 
 
 def init() -> None:
@@ -197,7 +224,8 @@ async def step() -> bool:
                      round(mbps, 2), res.get("banding"), res.get("banding_max"), res.get("block"), res.get("blur"),
                      time.time(), REV, res.get("err")))
     STATE.update(running=False, label="", last=f"{r['grp']}: {os.path.basename(r['path'])[:60]}",
-                 done_session=STATE["done_session"] + 1)
+                 done_session=STATE["done_session"] + 1,
+                 left=(STATE["left"] - 1) if STATE["left"] else STATE["left"])
     return True
 
 
@@ -248,11 +276,8 @@ def scorecard(library: str = "") -> dict:
         strikes = {r["grp"]: int(r["n"] or 0) for r in cur.execute("SELECT grp, n FROM arr_ban_strikes")}
         bans = [dict(r) for r in cur.execute("SELECT kind, value FROM arr_bans WHERE enabled=1")]
         broken = {r["file_id"] for r in cur.execute("SELECT file_id FROM integrity WHERE verdict='corrupt'")}
-        shrink = [dict(r) for r in cur.execute(
-            "SELECT j.file_id, j.size_before, j.size_after FROM jobs j WHERE j.state='done' AND j.size_before>0 "
-            "AND j.size_after>0 AND (j.plan_json LIKE '%convert the video to 10-bit HEVC%' "
-            "OR j.plan_json LIKE '%shrink the video%')")]
         pending = cur.execute("SELECT COUNT(*) n FROM group_measure").fetchone()["n"]
+    shrink = _shrink_rows()
     grp_of = {f["id"]: f["grp"] for f in files}
     by: dict = {}
     for f in files:
@@ -312,7 +337,7 @@ def scorecard(library: str = "") -> dict:
               "codec": "/".join(sorted({(m["codec"] or "?") + (" 10-bit" if m["tenbit"] else "") for m in ms}))}
              for gname, ms in gs.items()], key=lambda x: (x["banding"] if x["banding"] is not None else 99))})
     heads.sort(key=lambda h: -sum(g["n"] for g in h["groups"]))
-    left = len(plan(100000)) if not paused() else None
+    left = _left()
     return {"library": lib, "libraries": libs, "groups": rows, "head_to_head": heads[:60],
             "measured_total": pending, "left": left, "paused": paused(),
             "running": STATE["running"], "now": STATE["label"], "last": STATE["last"],
