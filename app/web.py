@@ -951,6 +951,8 @@ async def _startup() -> None:
     asyncio.create_task(svcnurse.watch())
     from . import hevcconvert
     asyncio.create_task(hevcconvert.watch())
+    from . import groupscore
+    asyncio.create_task(groupscore.watch())
     asyncio.create_task(subneed.watch())
     # Twice a day: do nuarr and the arrs still describe the same files? The
     # check existed before this line did, which meant it only ever ran when
@@ -11488,6 +11490,19 @@ async def api_shrink_trial(ids: str = ""):
 def api_gpu_budget():
     from . import gpubudget
     return gpubudget.snapshot()
+
+
+@app.get("/api/groups")
+def api_groups(library: str = ""):
+    from . import groupscore
+    return groupscore.scorecard(library)
+
+
+@app.post("/api/groups/pause")
+def api_groups_pause(on: int = 1):
+    from . import groupscore
+    groupscore.set_paused(bool(on))
+    return {"paused": groupscore.paused()}
 
 
 @app.get("/api/convert")
@@ -29911,7 +29926,7 @@ const PANE_OF = {ffmpeg:'ffPane', backup:'bkPane',  rules:'rulesPane',
                  vcodec:'vcodecPane', acodec:'acodecPane',
                  alang:'alangPane', cache:'cachePane',
                  whisper:'whisperPane', qwen:'qwenPane', plex:'plexPane',
-                 subai:'subaiPane', indexers:'idxPane',
+                 subai:'subaiPane', indexers:'idxPane', groups:'grpPane',
                  tautulli:'tautPane',
                  pushover:'pushoverPane',
                  ocr:'ocrPane', plexwork:'plexworkPane', ruleschk:'ruleschkPane',
@@ -30230,6 +30245,11 @@ function wtab(which){
   if(which==='indexers'){
     if(hint) hint.textContent='· prowlarr & indexers';
     paneLoad('indexers', loadIdx);
+    return;
+  }
+  if(which==='groups'){
+    if(hint) hint.textContent='· release groups';
+    paneLoad('groups', loadGroups);
     return;
   }
   if(which==='qwen'){
@@ -35151,6 +35171,80 @@ async function loadConvert(){
       ${d.failed?`<span style="color:#e2b341">${d.failed} failed</span>`:''}
     </div></div>`;
 }
+// ---- release group scorecard (groupscore.py) ----
+let _grp=null, _grpLib='', _grpSort='score', _grpMin=1, _grpQ='';
+async function loadGroups(){
+  const el=document.getElementById('grpBody'); if(!el) return;
+  try{ _grp=await (await fetch('/api/groups?library='+encodeURIComponent(_grpLib))).json(); }catch(e){ el.innerHTML='<div class="dim">could not load</div>'; return; }
+  _grpLib=_grp.library; grpPaint();
+}
+function grpPaint(){
+  const el=document.getElementById('grpBody'); if(!el||!_grp) return;
+  const d=_grp;
+  // colour a value by where it sits among this library's groups: green best third, red worst third
+  const scale=(k,lowGood)=>{ const v=d.groups.map(g=>g[k]).filter(x=>x!=null).sort((a,b)=>a-b);
+    return x=>{ if(x==null||v.length<3) return 'var(--dim)'; const r=v.indexOf(x)/(v.length-1);
+      const q=lowGood?r:1-r; return q<0.34?'#7fd4a3':q<0.67?'#e2b341':'#ff7b72'; }; };
+  const cB=scale('banding',true), cK=scale('block',true), cU=scale('blur',true);
+  const keyOf={score:g=>-(g.score??-1), files:g=>-g.files, banding:g=>(g.banding??99), block:g=>(g.block??99),
+               blur:g=>(g.blur??99), mbps:g=>-(g.mbps1080??-1), issues:g=>-g.issues, shrink:g=>-(g.shrink??-999), grp:g=>g.grp.toLowerCase()};
+  let rows=d.groups.filter(g=>g.files>=_grpMin && (!_grpQ || g.grp.toLowerCase().includes(_grpQ)));
+  rows=rows.slice().sort((a,b)=>{ const ka=keyOf[_grpSort](a), kb=keyOf[_grpSort](b); return ka<kb?-1:ka>kb?1:0; });
+  const th=(k,t,tip)=>`<td style="padding:4px 6px;cursor:pointer;white-space:nowrap;${_grpSort===k?'color:#6fb0ff':''}" title="${esc(tip)}" onclick="_grpSort='${k}';grpPaint()">${t}${_grpSort===k?' ▾':''}</td>`;
+  const num=(x,c)=>x==null?'<span class="dim">—</span>':`<span style="color:${c||'inherit'}">${x}</span>`;
+  const bar=s=>s==null?'<span class="dim" title="fewer than 3 files measured">—</span>'
+    :`<span style="display:inline-flex;align-items:center;gap:6px"><span style="width:60px;height:6px;background:var(--line);border-radius:3px;overflow:hidden;display:inline-block"><i style="display:block;height:6px;width:${s}%;background:${s>=67?'#7fd4a3':s>=34?'#e2b341':'#ff7b72'}"></i></span><b>${s}</b></span>`;
+  const iss=g=>{ if(!g.issues) return '<span class="dim">none</span>';
+    const t=Object.entries(g.issue_detail).filter(([k,v])=>v).map(([k,v])=>v===true?k:`${v} ${k}`).join(', ');
+    return `<span style="color:#ff7b72" title="${esc(t)}">${g.issues}</span>`; };
+  const prog = d.paused ? '<span style="color:#e2b341">measuring paused</span>'
+    : d.running ? `<span class="dlspin"></span> measuring <b>${esc(d.now)}</b>`
+    : (d.left ? `${fmt(d.left)} files still to measure` : 'every group measured');
+  el.innerHTML=`
+   <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-size:12px;margin-bottom:8px">
+     <select onchange="_grpLib=this.value;loadGroups()" style="font-size:12px">${d.libraries.map(l=>`<option ${l===d.library?'selected':''}>${esc(l)}</option>`).join('')}</select>
+     <span class="dim">groups with at least</span>
+     <select onchange="_grpMin=+this.value;grpPaint()" style="font-size:12px">${[1,5,20,100].map(n=>`<option value="${n}" ${n===_grpMin?'selected':''}>${n} file${n>1?'s':''}</option>`).join('')}</select>
+     <input placeholder="find a group" value="${esc(_grpQ)}" style="font-size:12px;width:140px" oninput="_grpQ=this.value.toLowerCase();grpPaint()">
+     <span class="dim" style="margin-left:auto">${fmt(d.measured_total)} files measured · ${prog}</span>
+     <button style="font-size:11px" onclick="grpPause(${d.paused?0:1})">${d.paused?'Resume':'Pause'} measuring</button>
+     <button style="font-size:11px" onclick="loadGroups()">Refresh</button>
+   </div>
+   <div class="dim" style="font-size:11px;margin-bottom:6px">Up to ${d.per_group} files per group, ${d.per_show} per show, three short samples each, measured in the background at low priority and never on a disk someone is watching from.
+     The <b>score</b> is where a group sits among this library's groups on banding, blocking and blur together (100 = cleanest), shown once 3 files are measured. Colours compare a group with the others here, not with an absolute line.</div>
+   <div style="overflow-x:auto"><table style="width:100%;font-size:11.5px;border-collapse:collapse;min-width:820px">
+     <tr class="dim" style="font-size:10.5px;text-transform:uppercase">
+       ${th('grp','Group','release group')}${th('score','Score','banding, blocking and blur ranked against this library\'s groups - 100 cleanest')}
+       ${th('files','Files','files in this library · shows')}
+       ${th('banding','Banding','CAMBI, median of the measured files - about 5 is visible; the worst sample in brackets')}
+       ${th('block','Blocking','blockdetect, median - compression squares')}
+       ${th('blur','Blur','blurdetect, median - smeared detail, upscales, heavy denoise')}
+       ${th('mbps','1080p Mbps','median bitrate of their 1080p files')}
+       <td style="padding:4px 6px" title="share of the measured files that are HEVC / 10-bit">HEVC · 10-bit</td>
+       ${th('shrink','Shrinks','median size cut when nuarr converted or shrank their files at VMAF 95 - big numbers mean bloated releases')}
+       ${th('issues','Issues','release bans, strikes, files the decode check found broken; a group ban counts 5')}</tr>
+     ${rows.slice(0,300).map(g=>`<tr style="border-top:1px solid var(--line);${g.measured<3?'opacity:.75':''}">
+       <td style="padding:5px 6px"><b>${esc(g.grp)}</b></td><td>${bar(g.score)}</td>
+       <td class="mono">${fmt(g.files)} <span class="dim">· ${g.shows} show${g.shows===1?'':'s'}${g.measured?` · ${g.measured} measured`:''}</span></td>
+       <td class="mono">${num(g.banding,cB(g.banding))}${g.banding_max!=null?` <span class="dim">(${g.banding_max})</span>`:''}</td>
+       <td class="mono">${num(g.block,cK(g.block))}</td><td class="mono">${num(g.blur,cU(g.blur))}</td>
+       <td class="mono">${num(g.mbps1080)}</td>
+       <td class="mono dim">${g.hevc==null?'—':g.hevc+'% · '+g.tenbit+'%'}</td>
+       <td class="mono">${g.shrink==null?'<span class="dim">—</span>':`<span title="${g.shrunk} file(s)">−${g.shrink}%</span>`}</td>
+       <td class="mono">${iss(g)}</td></tr>`).join('')}
+   </table></div>
+   ${rows.length>300?`<div class="dim" style="font-size:11px;margin-top:4px">showing 300 of ${rows.length} - narrow it with the filters</div>`:''}
+   <details style="margin-top:12px"><summary style="cursor:pointer;font-size:12px"><b style="color:#6fb0ff">Head to head</b>
+     <span class="dim">- shows where two or more groups' releases have been measured (${d.head_to_head.length}); cleanest banding first</span></summary>
+     ${d.head_to_head.map(h=>`<div class="lkind" style="padding:7px 10px;margin-top:6px"><b style="font-size:12px">${esc(h.show)}</b>
+       <table style="width:100%;font-size:11.5px;border-collapse:collapse;margin-top:3px">
+       ${h.groups.map((g,i)=>`<tr style="border-top:1px solid var(--line)"><td style="padding:3px 6px;width:180px">${i===0?'🏆 ':''}<b>${esc(g.grp)}</b> <span class="dim">(${g.n})</span></td>
+         <td class="mono">banding ${num(g.banding)}</td><td class="mono">blocking ${num(g.block)}</td><td class="mono">blur ${num(g.blur)}</td>
+         <td class="mono">${num(g.mbps)} Mbps</td><td class="dim">${esc(g.codec)}</td></tr>`).join('')}
+       </table></div>`).join('') || '<div class="dim" style="font-size:11px;margin-top:6px">nothing yet - it fills in as more files are measured</div>'}
+   </details>`;
+}
+async function grpPause(on){ await fetch('/api/groups/pause?on='+on,{method:'POST'}); loadGroups(); }
 async function convSet(o){
   const q=Object.entries(o).map(([k,v])=>k+'='+encodeURIComponent(v)).join('&');
   await fetch('/api/convert/cfg?'+q,{method:'POST'}); loadConvert();
@@ -50432,6 +50526,7 @@ _SETTINGS_NAV = [
                     ("ocr",     "OCR engines",     "language")]),
     ("Integrations", [("arrs", "Arrs",             "link"),
                       ("indexers", "Prowlarr & indexers", "search"),
+                      ("groups", "Release groups", "list"),
                       ("plex", "Plex",             "play"),
                       ("tautulli", "Tautulli",     "health"),
                       ("pushover", "Pushover",     "bell"),
