@@ -1091,6 +1091,8 @@ def _env() -> dict:
         from . import qwenvl
         env["NUARR_QWENVL"] = qwenvl.env_model()
         env["NUARR_QWENVL_LIVE"] = qwenvl.live_path()
+        # WHICH FILE, so the Qwen-VL card can say what it is reading for
+        env["NUARR_QWENVL_FOR"] = os.path.basename(getattr(_TLS, "path", "") or "")
     except Exception:                                    # noqa: BLE001
         env["NUARR_QWENVL"] = ""
     return env
@@ -2017,6 +2019,7 @@ def run_one(path: str, probe: dict, work_root: str | None = None,
     if not targets:
         return {"ok": False, "why": "no English non-signs image sub to convert"}
     _TLS.on_child = on_child          # this thread's children only; see _TLS
+    _TLS.path = path                  # named to the vision reader - see _env
     work = tempfile.mkdtemp(prefix="subocr_",
                             dir=work_root or getattr(SETTINGS, "cache_dir", None))
     made: list[tuple[str, str]] = []

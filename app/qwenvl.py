@@ -182,7 +182,8 @@ class Helper:
             self._t0 = time.time() - last
         try:
             with open(p + ".tmp", "w", encoding="utf-8") as f:
-                json.dump({"pid": os.getpid(), "asked": self.asked, "got": self.got, "failed": self.failed,
+                json.dump({"pid": os.getpid(), "for": os.environ.get("NUARR_QWENVL_FOR", ""),
+                           "asked": self.asked, "got": self.got, "failed": self.failed,
                            "secs": round(self.secs, 2), "last": round(last, 2), "max": self.max,
                            "at": time.time(), "started": self._t0, "model": self.model}, f)
             os.replace(p + ".tmp", p)
@@ -325,6 +326,20 @@ def live_path() -> str:
 
 
 _PS: dict = {"at": 0.0, "m": None}
+_FOR: dict = {"file": "", "at": 0.0, "last": ""}
+
+
+def note_for(path: str) -> None:
+    """The file a long-lived reader is working on right now (the picture
+    check's served worker reads for many files in turn)."""
+    _FOR.update(file=os.path.basename(path or ""), at=time.time())
+
+
+def _nice(fname: str) -> str:
+    """'City Hunter (1987) - S01E39 - Title [WEBDL...].mkv' -> 'City Hunter - S01E39'."""
+    stem = re.sub(r"\.[A-Za-z0-9]{2,4}$", "", fname or "")
+    m = re.match(r"(.+?)(?: \(\d{4}\))?(?: \{[^}]*\})? - (S\d+E\d+)", stem)
+    return f"{m.group(1)} - {m.group(2)}" if m else stem.split(" [")[0]
 
 
 def _loaded() -> dict | None:
@@ -357,15 +372,28 @@ def as_running() -> list:
     reading = bool(live) and now - float(live.get("at") or 0) < 30
     if not reading and not m:
         return []
-    for_what = ""
-    try:
-        from . import jobs as _j
-        for w in list(_j.RUNNING.values()):
-            if getattr(w, "sub_ocr_active", False) or getattr(w, "pool", "") in ("subocr", "subread"):
-                for_what = w.job.title
-                break
-    except Exception:                                    # noqa: BLE001
-        pass
+    # WHAT IT IS READING FOR: the file the worker was started for, or the one
+    # the picture check's served worker last turned to - and while it sits
+    # loaded and idle, the file it read last.
+    fname = (live.get("for") or "") if reading else ""
+    if reading and not fname and now - _FOR["at"] < 600:
+        fname = _FOR["file"]
+    if reading and not fname:
+        try:
+            from . import jobs as _j
+            for w in list(_j.RUNNING.values()):
+                if getattr(w, "sub_ocr_active", False) or getattr(w, "pool", "") in ("subocr", "subread"):
+                    fname = os.path.basename(w.job.path)
+                    break
+        except Exception:                                # noqa: BLE001
+            pass
+    from .db import kv_get, kv_set
+    if fname and fname != _FOR["last"]:
+        _FOR["last"] = fname
+        kv_set("qwenvl.last_for", fname)     # survives a restart
+    if not _FOR["last"]:
+        _FOR["last"] = kv_get("qwenvl.last_for") or ""
+    shown = fname or _FOR["last"]
     from . import outside as _out
     vram = int((m or {}).get("size_vram") or 0)
     if reading:
@@ -397,9 +425,12 @@ def as_running() -> list:
         pct = max(0.0, min(1.0, left / 180.0))
         extra = {"eta_s": round(max(0, left)), "eta_est": False}
         el = 0
+    if not reading and shown:
+        stage = f"last read for {_nice(shown)} · " + stage
     return [{"job_id": "qwenvl", "pool": "qwenvl", "kind": "qwenvl",
-             "title": ("Qwen-VL - " + for_what) if (reading and for_what) else "Qwen-VL reader",
-             "file": "", "stage": stage, "progress": pct, "elapsed_s": el, "eta_est": True,
+             "title": _nice(shown) if shown else "Qwen-VL reader",
+             "file": shown or "(nothing read since nuarr started)",
+             "stage": stage, "progress": pct, "elapsed_s": el, "eta_est": True,
              "plan": "the reader of last resort: a subtitle picture OCR doubted, read by a vision model",
              "why_pool": "GPU through Ollama - loaded on demand, let go after three idle minutes",
              "doing": {"tool": (live.get("model") or model()) if reading else model(), "hw": "GPU",

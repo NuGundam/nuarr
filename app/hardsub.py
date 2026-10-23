@@ -705,6 +705,12 @@ def _read_served(engine: str, img: str) -> str:
 
 
 def _read_text(path: str, t: float, band: str) -> str:
+    # the served worker reads for many files in turn; say which one now
+    try:
+        from . import qwenvl as _vl
+        _vl.note_for(path)
+    except Exception:                                            # noqa: BLE001
+        pass
     """OCR one band of one frame. Empty string when nothing readable."""
     engine = ocr_engine()
     exe = _tesseract()
