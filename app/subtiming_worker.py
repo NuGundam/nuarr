@@ -368,7 +368,7 @@ def _sum(sl: list, min_r: float = 0.12) -> dict:
     # taller than any other shift or pinned at the end of the range (further
     # out than the search reaches - which is itself the answer)
     good = [s for s in sl if s["late"] is not None and s["r"] >= min_r
-            and (s.get("margin", 1) >= 0.03 or s.get("edge"))]
+            and (s.get("margin", 1) >= 0.03 or s.get("edge") or s["r"] >= 0.45)]
     if not good:
         return {"n": 0, "median_abs": None, "within": 0.0}
     ab = np.array([abs(s["late"]) for s in good])
@@ -392,7 +392,11 @@ def measure_track(sp: np.ndarray, cs: list, dur: float, search: bool) -> dict:
     if not search:
         return out
     best = (-9.0, 1.0, "", 0.0)
-    for k, name in RATES:
+    rates = list(RATES)
+    fit = _fit_drift(before)
+    if fit is not None:
+        rates.append(fit)
+    for k, name in rates:
         c = _xcorr(spc, _down(_raster(cs, k, 0.0, n, STEP), f), lagc)
         i = int(np.argmax(c))
         # another rate has to beat "as it is" clearly, not by noise
@@ -411,13 +415,46 @@ def measure_track(sp: np.ndarray, cs: list, dur: float, search: bool) -> dict:
     return out
 
 
+def _fit_drift(before: list):
+    """A straight line through how late each slice is: the subtitle runs at
+    a rate of its own - a cut a few frames different, a conversion done with
+    the wrong figure. Not a rate in the table, but mkvmerge applies any
+    ratio. Only offered when the slope is real and the line fits."""
+    good = [s for s in before if s["late"] is not None and s["r"] >= 0.2
+            and (s.get("margin", 1) >= 0.03 or s["r"] >= 0.45) and not s.get("edge")]
+    if len(good) < 4:
+        return None
+    t = np.array([s["t"] * 60 + s.get("len", 5) * 30 for s in good])
+    y = np.array([s["late"] for s in good])
+    w = np.array([s["r"] for s in good])
+    A = np.vstack([np.ones_like(t), t]).T * w[:, None]
+    try:
+        (a, b), *_ = np.linalg.lstsq(A, y * w, rcond=None)
+    except Exception:                                            # noqa: BLE001
+        return None
+    resid = y - (a + b * t)
+    if abs(b) < 2e-5 or abs(b) > 0.06 or np.median(np.abs(resid)) > 0.3:
+        return None
+    k = 1.0 / (1.0 + b)
+    if any(abs(k - kk) < 5e-5 for kk, _ in RATES):
+        return None
+    return (k, f"runs {abs(b) * 100:.3f}% {'slow' if b > 0 else 'fast'} - a fitted drift")
+
+
 def judge(m: dict) -> tuple[str, str]:
     """ok | offset | drift | messy | unsure, and the sentence that says why."""
     b, a = m["before_sum"], m.get("after_sum") or {}
     k, d = m.get("rate", 1.0), m.get("offset", 0.0)
     heard = sum(1 for x in (m.get("after") or m.get("before") or []) if x["late"] is not None)
-    fixed = (a.get("n", 0) >= max(2, int(0.6 * heard)) and (a.get("median_abs") or 9) <= 0.15
-             and a.get("within", 0) >= 0.75 and (m.get("r_after") or 0) >= m["r_before"] + 0.02)
+    am = a.get("median_abs")
+    bm = b.get("median_abs")
+    # IN STEP AFTER THE CORRECTION: enough slices judged, the typical slice
+    # within 0.2 s (a subtitle's own scatter is that much), three in four
+    # within 0.3 s, and clearly better than it was. A perfect 0.0 counts - it
+    # was once read as "no data" and two perfect corrections were thrown away.
+    fixed = (a.get("n", 0) >= max(2, int(0.6 * heard)) and am is not None and am <= 0.2
+             and a.get("within", 0) >= 0.75 and (m.get("r_after") or 0) >= m["r_before"] + 0.01
+             and (bm is None or am <= max(0.1, bm * 0.6)))
     # NOTHING LINES UP AS IT IS - which is what a 4 % drift looks like, and
     # also what a track with no real dialogue looks like. A correction that
     # brings every slice into step tells the two apart.
@@ -431,7 +468,7 @@ def judge(m: dict) -> tuple[str, str]:
         return "drift", ((f"in step at the start, {b.get('worst', 0):+.1f}s out by minute {b.get('worst_at', 0):.0f} - "
                           if b["n"] else "further out every minute - ")
                          + f"{m['rate_name']}; corrected every slice is within {a['median_abs']:.2f}s")
-    if fixed and abs(d) >= 0.35:
+    if fixed and abs(d) >= 0.3:
         return "offset", (f"every line {'late' if d < 0 else 'early'} by {abs(d):.2f}s; "
                           f"moved, every slice is within {a['median_abs']:.2f}s")
     if not bad_before:
@@ -517,7 +554,8 @@ def main() -> int:
         t["audio_ord"], t["audio_lang"] = best[2], best[3]
         if a.check_only:
             b = m["before_sum"]
-            t["verdict"] = "ok" if b["n"] and (b["median_abs"] or 9) <= 0.2 and b["within"] >= 0.7 else "off"
+            t["verdict"] = ("ok" if b["n"] and b["median_abs"] is not None and b["median_abs"] <= 0.2
+                            and b["within"] >= 0.7 else "off")
             t["why"] = f"median {b['median_abs']}s off, {int(b['within'] * 100)}% of slices within 0.3s"
         else:
             t["verdict"], t["why"] = judge(m)
