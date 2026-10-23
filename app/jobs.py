@@ -7811,6 +7811,11 @@ def _submake_running() -> list:
         out += subverify.as_running()
     except Exception:                                            # noqa: BLE001
         pass
+    try:
+        from . import subtiming
+        out += subtiming.as_running()
+    except Exception:                                            # noqa: BLE001
+        pass
     return out
 
 

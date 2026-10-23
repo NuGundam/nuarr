@@ -815,6 +815,11 @@ async def _startup() -> None:
         from . import subverify as _sv
         _sv.init()
         asyncio.create_task(_sv.watch())
+        # SUBTITLE TIMING: text tracks lined up against the speech; offsets
+        # and frame-rate drifts corrected in place (subtiming.py).
+        from . import subtiming as _stm
+        _stm.init()
+        asyncio.create_task(_stm.watch())
         # DECODE, DON'T JUST PROBE. Truncation is the commonest way a file in
         # a media library is broken and the only one ffprobe cannot see, so
         # this reads a window at each end. Bounded, and only while the pool is
@@ -11047,6 +11052,44 @@ def api_verify_stop():
     return {"ok": subverify.stop()}
 
 
+@app.get("/api/subtiming")
+def api_subtiming():
+    """Subtitle timing: what was checked, what was out of step, what was fixed."""
+    from . import subtiming
+    return subtiming.snapshot()
+
+
+@app.post("/api/subtiming/mode")
+def api_subtiming_mode(mode: str):
+    from . import subtiming
+    m = subtiming.set_mode(mode)
+    joblog.log(f"subtitle timing: mode set to {m}", "info")
+    return {"mode": m}
+
+
+@app.post("/api/subtiming/budget")
+def api_subtiming_budget(per_hour: int):
+    from . import subtiming
+    return {"per_hour": subtiming.set_per_hour(per_hour)}
+
+
+@app.post("/api/subtiming/run")
+async def api_subtiming_run(n: int = 3, file_id: int = 0, path: str = ""):
+    """Check the next N files now - or one file, by id or by path."""
+    from . import subtiming
+    if path and not file_id:
+        file_id = subtiming.file_by_path(path)
+        if not file_id:
+            raise HTTPException(404, "that path is not in the library")
+    return await asyncio.to_thread(subtiming.run_batch, max(1, min(20, int(n))), int(file_id))
+
+
+@app.post("/api/subtiming/stop")
+def api_subtiming_stop():
+    from . import subtiming
+    return {"ok": subtiming.stop()}
+
+
 @app.post("/api/learn/scan")
 async def api_learn_scan():
     """Look for your edits in the subtitles nuarr made, now."""
@@ -14039,7 +14082,7 @@ def _outside_live() -> list:
     workers, so none of them can fall behind when one is added."""
     out = []
     try:
-        from . import submake, qwenjudge, subverify, vmaftarget, qwenvl
+        from . import submake, qwenjudge, subverify, vmaftarget, qwenvl, subtiming
         sv = subverify.STATE
         out = [
             {"key": "quality", "pool": "quality", "label": "Quality searches",
@@ -14070,6 +14113,12 @@ def _outside_live() -> list:
              "queued": 0,
              "hint": ("Files the subtitle board is unsure about get Whisper, Qwen and the readers instead of a "
                       "person; settles them at the sure % on the Subtitle AI page.")},
+            {"key": "subtiming", "pool": "subtiming", "label": "Subtitle timing",
+             "running": 1 if subtiming.STATE.get("running") else 0, "cap": 1, "paused": subtiming.paused(),
+             "now": ("checking " + (subtiming.STATE.get("label") or "")) if subtiming.STATE.get("running") else "",
+             "queued": max(0, subtiming._WAIT.get("n", 0)),
+             "hint": ("Lines up each text subtitle with the speech in the audio; a track that is late, early "
+                      "or drifting (a frame-rate mismatch) is corrected in place. CPU, about 15 s a file.")},
             {"key": "qwenvl", "pool": "qwenvl", "label": "Qwen-VL reader",
              "running": 0, "cap": 1, "paused": not qwenvl.on(),
              "now": "", "queued": 0,
@@ -14111,9 +14160,9 @@ def api_workers():
 @app.post("/api/outside/pause")
 def api_outside_pause(key: str, on: int = 1):
     """Pause or run anything outside the queue."""
-    from . import submake, qwenjudge, subverify, vmaftarget, qwenvl
+    from . import submake, qwenjudge, subverify, vmaftarget, qwenvl, subtiming
     names = {"submake": "Subtitle maker", "qwen": "Qwen judge", "verify": "Second opinion",
-             "quality": "Quality searches", "qwenvl": "Qwen-VL reader"}
+             "quality": "Quality searches", "qwenvl": "Qwen-VL reader", "subtiming": "Subtitle timing"}
     if key not in names:
         raise HTTPException(400, "unknown key")
     if key == "quality":
@@ -14121,7 +14170,7 @@ def api_outside_pause(key: str, on: int = 1):
     elif key == "qwenvl":
         qwenvl.set_on(not bool(on))
     else:
-        {"submake": submake, "qwen": qwenjudge, "verify": subverify}[key].set_paused(bool(on))
+        {"submake": submake, "qwen": qwenjudge, "verify": subverify, "subtiming": subtiming}[key].set_paused(bool(on))
     joblog.log(f"{names[key]} {'paused' if on else 'running again'}", "info")
     return {"key": key, "paused": bool(on)}
 
@@ -25164,6 +25213,7 @@ function poolColor(pool){
        : pool==='quality'     ? '#a2e05e'         // lime - the VMAF quality search
        : pool==='verify'      ? '#ff7b72'         // coral - the second opinion
        : pool==='qwenvl'      ? '#ff9e64'         // orange - the Qwen-VL reader
+       : pool==='subtiming'   ? '#6ee7f7'         // cyan - subtitle timing
        : 'var(--ok)';
 }
 function diskColor(name){
@@ -38562,8 +38612,99 @@ function lrnStyles(kind,d){
 async function loadSubai(){
   if(!document.getElementById('subaiPane')) return;
   try{ smLoad(); }catch(e){}
+  stmLoad();
   lrnLoad('subai', true);
 }
+// ---- subtitle timing (subtiming.py) ----
+let _stm=null, _stmOpen=null, _stmMsg=null, _stmTimer=null;
+const STM_V={ok:['#3fb950','in step'],offset:['#e3b341','offset'],drift:['#e3b341','drift'],messy:['#e0575b','out of step'],
+  unsure:['#8b949e','unsure'],skipped:['#8b949e','skipped'],failed:['#e0575b','failed'],off:['#e0575b','still off']};
+function stmWord(v){ const c=STM_V[v]||['#8b949e',v||'-']; return `<span style="color:${c[0]}">${esc(c[1])}</span>`; }
+async function stmLoad(){
+  try{ _stm=await (await fetch('/api/subtiming')).json(); }catch(e){ return; }
+  stmPaint();
+  clearTimeout(_stmTimer);
+  if(document.getElementById('stmHost')&&document.getElementById('subaiPane').style.display!=='none')
+    _stmTimer=setTimeout(stmLoad,_stm.running?3000:30000);
+}
+function stmSlices(sl){
+  if(!(sl||[]).length) return '<span class="dim">-</span>';
+  return sl.map(s=>{ if(s.late==null) return `<span class="dim" title="minute ${s.t}: too little speech">·</span>`;
+    const a=Math.abs(s.late), c=a<=0.3?'#3fb950':a<=0.8?'#e3b341':'#e0575b';
+    return `<span title="minute ${s.t}: ${s.late>0?'+':''}${s.late}s (${s.late>0?'late':'early'}), match ${s.r}" style="display:inline-block;min-width:34px;text-align:right;color:${c}">${s.late>0?'+':''}${s.late.toFixed(1)}</span>`; }).join(' ');
+}
+function stmPaint(){
+  const el=document.getElementById('stmHost'), v=_stm; if(!el||!v) return;
+  const by=v.by||{}, rows=v.rows||[];
+  const eta=v.eta_s?(v.eta_s<5400?Math.round(v.eta_s/60)+' min':v.eta_s<172800?Math.round(v.eta_s/3600*10)/10+' h':Math.round(v.eta_s/86400)+' days'):'';
+  el.innerHTML=`<div class="lkind" style="margin-top:12px;padding:11px 12px">
+    <div class="lkindhead"><b style="color:#6ee7f7">Subtitle timing</b>
+      <span class="dim" style="font-size:11px">${v.running?'at work':v.last_run?'last check '+ago(v.last_run):'has not run yet'}</span>
+      <span style="margin-left:auto;display:flex;gap:6px;align-items:center;font-size:11px">
+        <select onchange="stmMode(this.value)" style="font-size:11px" title="off: never runs. advise: measures and lists, changes nothing. auto: corrects a fixed offset or a frame-rate drift in place, after proving the result is in step.">
+          ${[['off','off'],['advise','advise only'],['auto','auto - fix in place']].map(([k,w])=>`<option value="${k}" ${v.mode===k?'selected':''}>${w}</option>`).join('')}</select>
+        <input type="number" min="1" max="600" value="${v.per_hour}" style="width:62px;box-sizing:border-box;font-size:11px" onchange="stmBudget(this.value)">/hour
+        <button class="rmb" onclick="stmRun(this)" ${v.running?'disabled':''}>Check 3 now</button>
+        ${v.running?`<button class="rmb" onclick="fetch('/api/subtiming/stop',{method:'POST'})">Stop</button>`:''}</span></div>
+    ${_stmMsg&&Date.now()-_stmMsg.at<120000?`<div style="font-size:11.5px;margin:5px 0 0;color:${_stmMsg.c}">${esc(_stmMsg.t)}</div>`:''}
+    <div style="display:flex;flex-wrap:wrap;gap:8px 18px;align-items:center;font-size:11.5px;margin:6px 0 2px">
+      <span><b>${fmt(v.total)}</b> <span class="dim">checked</span></span>
+      <span><b style="color:#3fb950">${fmt(by.ok||0)}</b> <span class="dim">in step</span></span>
+      <span><b style="color:#6ee7f7">${fmt(v.fixed)}</b> <span class="dim">fixed</span></span>
+      <span><b style="color:#e0575b">${fmt(by.messy||0)}</b> <span class="dim">out of step, left alone</span></span>
+      <span><b>${fmt((by.unsure||0)+(by.skipped||0))}</b> <span class="dim">unsure / nothing to measure</span></span>
+      <span><b>${fmt(v.waiting<0?0:v.waiting)}</b> <span class="dim">in the queue</span></span>
+      <span class="dim">${v.avg_secs?`${v.avg_secs}s per file · ${v.hour_n} this hour`:'no pace measured yet'}${eta?` · queue done in ~${eta}`:''}</span>
+    </div>
+    ${v.running?`<div style="display:flex;gap:10px;align-items:center;font-size:11.5px;margin:2px 0 6px">
+      <span class="dlspin"></span><b style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:340px">${esc(v.label||'')}</b>
+      <div class="vfybar"><div class="vfyfill" style="background:#6ee7f7;width:${Math.max(2,Math.min(100,Math.round(v.pct||0)))}%"></div><div class="vfyrun"></div></div>
+      <span class="dim" style="white-space:nowrap">${esc(v.stage||'')} · ${v.elapsed_s||0}s</span></div>`:
+      `<div class="dim" style="font-size:11px;margin:0 0 4px">${v.mode==='off'?'switched off - nothing runs':v.paused?'paused on the Concurrency page':v.waiting>0?`idle - next pass ${v.next_run&&v.next_run>Date.now()/1000?'in '+Math.max(1,Math.round((v.next_run-Date.now()/1000)/60))+' min':'within 2 minutes'}`:'idle - every file has been checked'}${v.last_result?' · last: '+esc(v.last_result):''}</div>`}
+    <div class="dim" style="font-size:11px;margin:4px 0 2px">Every file with a text subtitle is checked once (again if it changes), newest first: the voice detector marks where somebody
+      speaks, and each track's spoken lines are lined up with it - over the whole file and then five minutes at a time. A track that is <b>late or early by the same amount</b>
+      throughout, or that <b>drifts</b> further each minute because it was timed for another frame rate (24 vs 23.976 fps, 25 PAL), is corrected in place with
+      mkvmerge - the track is not converted, only its timestamps move - and the rebuilt file is measured again before it replaces the original.
+      A track that is out of step in a way one correction cannot fix (another cut, a missing scene) is listed and left alone. Picture tracks are not measured,
+      and files on a disk somebody is watching from wait. The numbers per row are how late the lines are, slice by slice (+ late, − early).</div>
+    <div style="display:flex;gap:6px;align-items:center;margin:6px 0;font-size:11px">check one file:
+      <input id="stmPath" placeholder="full path of a file in the library" style="font-size:11px;flex:1;max-width:520px">
+      <button class="rmb" onclick="stmOne(this)">Check</button></div>
+    ${rows.length?`<div class="rowbox scrollbox" style="max-height:340px"><table class="sktbl" style="width:100%;font-size:11.5px;table-layout:fixed">
+      <colgroup><col style="width:60px"><col style="width:auto"><col style="width:96px"><col style="width:auto"><col style="width:150px"></colgroup>
+      <thead><tr class="dim" style="font-size:10.5px"><th class="l">WHEN</th><th class="l">FILE · TRACK</th><th class="c">FOUND</th><th class="l">WHAT</th><th class="l">DONE</th></tr></thead><tbody>
+      ${rows.map(r=>{ const open=_stmOpen===r.file_id; const tr=(r.tracks||[]).filter(t=>t.verdict&&t.verdict!=='skipped');
+        return `<tr style="cursor:pointer" onclick="_stmOpen=${open?'null':r.file_id};stmPaint()">
+          <td class="l dim" style="font-size:10.5px">${ago(r.at)}</td>
+          <td class="l" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(r.path)}"><b>${esc(r.label)}</b>
+            <div class="dim" style="font-size:10px">${tr.map(t=>`${t.ord+1}: ${esc(t.title||t.lang)}`).join(' · ')}</div></td>
+          <td class="c">${stmWord(r.verdict)}</td>
+          <td class="l" style="font-size:10.5px;white-space:normal">${tr.filter(t=>t.verdict!=='ok').map(t=>esc(t.why||'')).slice(0,1).join('')||esc(r.note||'')}</td>
+          <td class="l" style="font-size:10.5px;color:${r.action.startsWith('fixed')?'#3fb950':r.action.includes('fail')?'#e0575b':'var(--dim)'}">${esc(r.action)}${r.note&&r.action.includes('fail')?`<div class="dim" style="font-size:10px;white-space:normal">${esc(r.note)}</div>`:''}</td></tr>
+          ${open?`<tr><td colspan="5" style="background:rgba(255,255,255,.025);padding:6px 10px;font-size:11px;white-space:normal">
+            ${tr.map(t=>`<div style="margin-bottom:6px"><b>Track ${t.ord+1}</b> ${esc(t.title||'')} <span class="dim">${esc(t.lang)} · ${esc(t.codec)} · ${t.cues||0} spoken lines${t.audio_lang?' · against the '+esc(t.audio_lang)+' audio':''}</span> - ${stmWord(t.verdict)} <span class="dim">${esc(t.why||'')}</span>
+              <div class="mono" style="font-size:10.5px;margin-top:2px"><span class="dim" style="display:inline-block;width:92px">as it was</span>${stmSlices(t.before)}</div>
+              ${t.after&&t.verdict!=='ok'?`<div class="mono" style="font-size:10.5px"><span class="dim" style="display:inline-block;width:92px">${t.fixed?'corrected':'if corrected'}</span>${stmSlices(t.after)}</div>`:''}
+              ${t.check&&t.check.length?`<div class="mono" style="font-size:10.5px"><span class="dim" style="display:inline-block;width:92px">measured after</span>${stmSlices(t.check)}</div>`:''}
+              ${t.verdict!=='ok'&&t.rate?`<div class="dim" style="font-size:10.5px">correction: ${t.rate!==1?'× '+t.rate.toFixed(6)+' ('+esc(t.rate_name)+')':''}${t.offset?' shift '+(t.offset>0?'+':'')+t.offset.toFixed(2)+'s':''}</div>`:''}</div>`).join('')}
+            <div class="dim">took ${r.secs}s</div></td></tr>`:''}`; }).join('')}
+      </tbody></table></div>`:`<div class="dim" style="font-size:11px">Nothing out of step found yet${v.total?` in ${fmt(v.total)} checked`:''}.</div>`}
+  </div>`;
+}
+async function stmMode(m){ await fetch('/api/subtiming/mode?mode='+m,{method:'POST'}); stmLoad(); }
+async function stmBudget(n){ await fetch('/api/subtiming/budget?per_hour='+encodeURIComponent(n),{method:'POST'}); stmLoad(); }
+function stmSay(t,c){ _stmMsg={t:t,c:c||'var(--dim)',at:Date.now()}; stmLoad(); }
+function stmGo(url,btn){
+  if(btn){ btn.disabled=true; btn.innerHTML='<span class="dlspin"></span>checking…'; }
+  fetch(url,{method:'POST'}).then(r=>r.ok?r.json():r.json().then(j=>Promise.reject(new Error(j.detail||('HTTP '+r.status))))).then(d=>{
+    if(d.busy) stmSay('Already checking - the run in progress has to finish first.','#d29922');
+    else if(!d.done) stmSay('Nothing to check right now.');
+    else stmSay('Checked '+d.done+(d.done===1?' file':' files')+(d.fixed?', fixed '+d.fixed:'')+' - '+(d.results||[]).map(x=>x.verdict+(x.action?' ('+x.action+')':'')).join(', ')+'.','#3fb950');
+  }).catch(e=>stmSay('The request failed: '+((e&&e.message)||e),'#f85149'));
+  setTimeout(stmLoad,1500);
+}
+function stmRun(btn){ stmGo('/api/subtiming/run?n=3',btn); }
+function stmOne(btn){ const p=(document.getElementById('stmPath').value||'').trim(); if(!p) return; stmGo('/api/subtiming/run?path='+encodeURIComponent(p),btn); }
 // ---- what the subtitle tools learn (sublearn.py) - one panel ----
 let _lrn={}, _lrnAt={}, _lrnOpen={}, _lrnShow={};
 const LRN_TXT={
