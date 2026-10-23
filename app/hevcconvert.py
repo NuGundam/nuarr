@@ -105,11 +105,17 @@ def wants(library: str | None, vcodec: str, ten_bit: bool, hdr: bool,
     return mbps >= floors.get(tier(height or 0), 99.0)
 
 
+# A CONVERSION IS KNOWN BY WHAT ITS PLAN SAYS, not by who queued it: a
+# re-plan sweep ("subtitle rules changed") queued 100 of them on 2026-10-22,
+# and the panel, the pace and the do-not-retry list all missed them.
+PLAN_MARK = "%convert the video to 10-bit HEVC%"
+
+
 def _done_ids(cur) -> set:
-    """Files this has already had a go at - converted, discarded or failed."""
+    """Files that have already had a go - converted, discarded or failed."""
     return {r["file_id"] for r in cur.execute(
-        "SELECT DISTINCT file_id FROM jobs WHERE source=? AND state NOT IN ('queued','running')",
-        (SOURCE,))}
+        "SELECT DISTINCT file_id FROM jobs WHERE (source=? OR plan_json LIKE ?) "
+        "AND state NOT IN ('queued','running')", (SOURCE, PLAN_MARK))}
 
 
 def candidates(force: bool = False) -> list:
@@ -170,8 +176,8 @@ async def feed() -> int:
         return 0
     from . import jobs
     with cursor() as cur:
-        queued = cur.execute("SELECT COUNT(*) n FROM jobs WHERE source=? AND state IN ('queued','running')",
-                             (SOURCE,)).fetchone()["n"]
+        queued = cur.execute("SELECT COUNT(*) n FROM jobs WHERE (source=? OR plan_json LIKE ?) "
+                             "AND state IN ('queued','running')", (SOURCE, PLAN_MARK)).fetchone()["n"]
     room = c["keep"] - queued
     if room <= 0:
         return 0
@@ -192,13 +198,27 @@ async def feed() -> int:
 def progress() -> dict:
     with cursor() as cur:
         rows = [dict(r) for r in cur.execute(
-            "SELECT state, size_before, size_after, started_at, finished_at FROM jobs WHERE source=?", (SOURCE,))]
+            "SELECT state, size_before, size_after, started_at, finished_at FROM jobs "
+            "WHERE source=? OR plan_json LIKE ?", (SOURCE, PLAN_MARK))]
     done = [r for r in rows if r["state"] == "done" and r["size_after"]]
     b = sum(r["size_before"] or 0 for r in done) / 1e9
     a = sum(r["size_after"] or 0 for r in done) / 1e9
     hr = [r for r in done if (r["finished_at"] or 0) > time.time() - 6 * 3600]
     left = len(STATE["cands"]) + sum(1 for r in rows if r["state"] in ("queued", "running"))
     rate = len(hr) / 6.0
+    # WHAT THE SLOTS CAN DO, when the measured pace says less than half of it:
+    # a held queue or a restart in the window is not the conversion's speed.
+    durs = sorted((r["finished_at"] - r["started_at"]) for r in done
+                  if r.get("finished_at") and r.get("started_at"))
+    if durs:
+        try:
+            from . import workers
+            slots = max(1, int(workers.get().as_dict()["encode_workers"]["value"]))
+        except Exception:                                # noqa: BLE001
+            slots = 4
+        capacity = slots * 3600.0 / durs[len(durs) // 2]
+        if rate < capacity / 2:
+            rate = capacity
     return {"cfg": cfg(), "libraries": libraries(), "done": len(done), "before_gb": round(b, 1), "after_gb": round(a, 1),
             "kept_original": sum(1 for r in rows if r["state"] == "skipped"),
             "failed": sum(1 for r in rows if r["state"] == "failed"),
