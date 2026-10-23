@@ -55,6 +55,13 @@ MAX_PROBES = 6
 # waited on the scorer. Two searches at a time keeps the other slots encoding,
 # and every 4th frame scored (about 36 a sample) halves each search's cost.
 MAX_SEARCHES = 2               # the default; kv vmaf.searches overrides (1-4)
+# BANDING IS JUDGED AGAINST THE SOURCE, not against a fixed line. Chicago P.D.
+# S14E03 (Amazon WEB-DL, 8-bit) bands on its own - CAMBI 6 to 18 on the source
+# samples - so no encode could ever get under 4 and the search gave up at the
+# library CQ, while its encodes measured 9.5-12.5: smoother than the source.
+# An encode passes when each sample is under the fixed line OR adds no more
+# than this much over that sample's own banding.
+BAND_MARGIN = 1.0
 SUBSAMPLE = 4
 _COND = threading.Condition()
 _ACTIVE = {"n": 0}
@@ -346,6 +353,12 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
     if not refs:
         _sh.rmtree(work_dir, ignore_errors=True)
         return {"cq": None, "note": "could not cut reference samples from the source"}
+    # each sample's own banding, measured once (the cut scored against itself)
+    src_band = []
+    for k, ref in enumerate(refs):
+        _report(f"measuring the source's own banding {k + 1}/{len(refs)}", 1.0)
+        sc0 = _score(ff, ref, ref, ten, threads)
+        src_band.append(float(sc0[2]) if sc0 else 0.0)
     t0 = time.time()
     STATE[job_id] = {"label": os.path.basename(src), "probe": 0, "cq": None, "at": t0}
 
@@ -375,11 +388,15 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
                 except OSError:
                     pass
         r = {"cq": cq, "size": sizes, "vmaf": round(statistics.mean(means), 2), "low": round(min(lows), 2),
-             "worst": round(min(means), 2), "cambi": round(max(bands), 2)}
+             "worst": round(min(means), 2), "cambi": round(max(bands), 2),
+             "src_cambi": round(max(src_band), 2) if src_band else None,
+             "band_added": round(max((b - sb) for b, sb in zip(bands, src_band)), 2) if src_band else None}
         # PASSES = the samples average the target AND none of them falls more
         # than `floor` below it - one bad scene is what people notice - AND no
         # sample bands visibly.
-        r["ok"] = r["vmaf"] >= want and r["worst"] >= want - floor and r["cambi"] <= banding
+        band_ok = all(b <= max(banding, sb + BAND_MARGIN)
+                      for b, sb in zip(bands, src_band or [0.0] * len(bands)))
+        r["ok"] = r["vmaf"] >= want and r["worst"] >= want - floor and band_ok
         tried[cq] = r
         return r
 
@@ -452,6 +469,7 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
         return {"cq": best, "fixed": fixed, "vmaf": chosen["vmaf"], "worst": chosen["worst"], "saved": saved,
                 "cambi": chosen["cambi"],
                 "probes": len(tried), "secs": secs, "note": note,
+                "src_cambi": chosen.get("src_cambi"), "band_added": chosen.get("band_added"),
                 "tried": sorted(({"cq": k, "vmaf": v["vmaf"], "worst": v["worst"], "cambi": v["cambi"], "ok": v["ok"]}
                                  for k, v in tried.items()), key=lambda x: x["cq"])}
     except Exception as e:                               # noqa: BLE001

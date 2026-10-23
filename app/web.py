@@ -25289,7 +25289,7 @@ function vmafCell(w){
     return `<div class="socr vmafrow">
       <span class="pill" style="color:${col};border-color:${col}">quality ✓</span>
       <span><b style="color:${col}">CQ ${r.cq}</b> <span class="dim">chosen (library ${r.fixed})</span> · VMAF <b>${r.vmaf}</b>
-        <span class="dim">(worst ${r.worst})</span> · banding <b>${r.cambi}</b>${svt?' · '+svt:''}</span>
+        <span class="dim">(worst ${r.worst})</span> · banding <b>${r.cambi}</b>${r.src_cambi!=null?` <span class="dim" title="the source's own banding on the same samples - an encode passes if it adds no more than 1 point to it">(source ${r.src_cambi})</span>`:''}${svt?' · '+svt:''}</span>
       <span>${chips}</span>
       <span class="dim">${r.probes||''} probes in ${Math.round(r.secs||0)}s</span></div>`;
   }
@@ -25308,7 +25308,7 @@ function vmafCell(w){
     <span class="mono socrpct" style="color:${col};min-width:40px">${pct.toFixed(0)}%</span>
     <span class="dim">${esc(w.vmaf_stage)} · ${mmss(el)}${left!=null?' · ~'+mmss(left)+' left':''}</span>
     <span>${chips}</span>
-    <span class="dim">· looking for the smallest file that still scores VMAF ${info.want??95} with banding under ${info.banding??4}</span></div>`;
+    <span class="dim">· looking for the smallest file that still scores VMAF ${info.want??95} without adding banding</span></div>`;
 }
 function subFixCell(w){
   if(!w.sub_fix_stage) return '';
