@@ -207,6 +207,56 @@ def _cut_reference(ff, src, t, length, out) -> bool:
     return rc == 0 and os.path.exists(out) and os.path.getsize(out) > 0
 
 
+BURN_LEAD_S = 15.0
+
+
+def burn_filter(src: str, burn: int, image: bool, ten: bool) -> tuple[str, str]:
+    """(kind, filter) - THE SAME burn the real encode applies (jobs.build_ffmpeg):
+    a picture track overlaid (scaled to the video when the config says so),
+    a text track rendered by libass. Kept as one definition so the sample and
+    the encode cannot drift into burning differently."""
+    from . import rules
+    if image:
+        ov = "overlay=format=yuv420p10" if ten else "overlay"
+        fc = (f"[0:s:{burn}][0:v:0]scale2ref[sp][vp];[vp][sp]{ov}[v]"
+              if rules.CONFIG.get("scalePgsToVideo", True) else f"[0:v:0][0:s:{burn}]{ov}[v]")
+        return "complex", fc
+    from .jobs import _filter_path
+    vf = f"subtitles={_filter_path(src)}:si={burn}"
+    if ten:
+        vf += ",format=yuv420p10le"
+    return "vf", vf
+
+
+def _cut_reference_burned(ff, src, t, length, out, burn: int, image: bool, ten: bool) -> bool:
+    """The reference with the signs painted on, as the encode will paint them.
+
+    WHY. VMAF scores an encode against its reference. With a burn, the encode
+    carries signs the plain source does not, every sign reads as damage, and
+    the search believes it needs more bits than it does - so burn jobs were
+    left at the library CQ. Painting the same signs on the reference makes
+    both sides identical but for compression.
+
+    TIMING. Decoding starts BURN_LEAD_S early so a sign that began before the
+    sample is already on screen when it starts (a picture track only shows a
+    cue once its packet is decoded), and -copyts keeps the original clock so
+    libass draws the lines that belong at this point in the episode rather
+    than the first ones in the file. The output -ss then cuts at the true
+    moment."""
+    lead = min(BURN_LEAD_S, t)
+    kind, f = burn_filter(src, burn, image, ten)
+    args = [ff, "-hide_banner", "-nostdin", "-y", "-v", "error", "-copyts",
+            "-ss", f"{t - lead:.3f}", "-i", src]
+    if kind == "complex":
+        args += ["-filter_complex", f, "-map", "[v]"]
+    else:
+        args += ["-map", "0:v:0", "-vf", f]
+    args += ["-ss", f"{t:.3f}", "-t", f"{length:.3f}", "-an", "-sn", "-dn",
+             "-c:v", "ffv1", "-level", "3", out]
+    rc, err = _run(args, 300)
+    return rc == 0 and os.path.exists(out) and os.path.getsize(out) > 0
+
+
 def _encode_sample(ff, ref, family, codec, cq, preset, ten, out) -> int:
     """One sample at one CQ, from the reference cut; its size in bytes (0 on failure)."""
     from . import encoders
@@ -259,8 +309,6 @@ def _score(ff, ref, enc, ten, threads) -> tuple[float, float, float] | None:
 def skip_reason(plan, probe: dict | None, duration: float) -> str:
     if not getattr(plan, "encode", False):
         return "no encode"
-    if getattr(plan, "burn_index", None) is not None:
-        return "a subtitle is burned in - nothing honest to compare against"
     if duration and duration < MIN_MINUTES * 60:
         return f"shorter than {MIN_MINUTES:g} minutes"
     vs = next((s for s in (probe or {}).get("streams", []) if s.get("codec_type") == "video"), None) or {}
@@ -348,7 +396,10 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
     for k, t in enumerate(times):
         _report(f"cutting sample {k + 1}/{len(times)} from the source", k / max(1, len(times)))
         ref = os.path.join(work_dir, f"ref-{k}.mkv")
-        if _cut_reference(ff, src, t, length, ref):
+        _burn = getattr(plan, "burn_index", None)
+        ok = (_cut_reference_burned(ff, src, t, length, ref, int(_burn), bool(getattr(plan, "burn_image", False)), ten)
+              if _burn is not None else _cut_reference(ff, src, t, length, ref))
+        if ok:
             refs.append(ref)
     if not refs:
         _sh.rmtree(work_dir, ignore_errors=True)
