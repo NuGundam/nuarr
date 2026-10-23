@@ -317,3 +317,44 @@ def scorecard(library: str = "") -> dict:
             "measured_total": pending, "left": left, "paused": paused(),
             "running": STATE["running"], "now": STATE["label"], "last": STATE["last"],
             "per_group": PER_GROUP, "per_show": PER_SHOW}
+
+
+def group_detail(library: str, grp: str) -> dict:
+    """One group up close: its shows, every measured file, and its issues."""
+    init()
+    with cursor() as cur:
+        files = [dict(r) for r in cur.execute(
+            "SELECT id, path, height, size, duration FROM files WHERE library=? AND release_group=? "
+            "AND state NOT IN ('deleted','duplicate') AND duration>0", (library, grp))]
+        meas = {r["file_id"]: dict(r) for r in cur.execute(
+            "SELECT * FROM group_measure WHERE library=? AND grp=? AND rev=? AND err IS NULL", (library, grp, REV))}
+        bans = [dict(r) for r in cur.execute("SELECT kind, value, why, added_at FROM arr_bans WHERE enabled=1")]
+        strike = cur.execute("SELECT n, why, last FROM arr_ban_strikes WHERE grp=?", (grp,)).fetchone()
+        broken = {r["file_id"]: r["detail"] for r in cur.execute("SELECT file_id, detail FROM integrity WHERE verdict='corrupt'")}
+    shows: dict = {}
+    for f in files:
+        sh = shows.setdefault(_show(f["path"]), {"show": _show(f["path"]), "files": 0, "measured": [], "mbps": []})
+        sh["files"] += 1
+        sh["mbps"].append(f["size"] * 8 / f["duration"] / 1e6)
+        if f["id"] in meas:
+            m = meas[f["id"]]
+            sh["measured"].append({"name": os.path.basename(f["path"]), "banding": m["banding"],
+                                   "banding_max": m["banding_max"], "block": m["block"], "blur": m["blur"],
+                                   "mbps": m["mbps"], "codec": m["codec"], "tenbit": m["tenbit"]})
+    out = []
+    for sh in shows.values():
+        ms = sh["measured"]
+        out.append({"show": sh["show"], "files": sh["files"], "mbps": round(statistics.median(sh["mbps"]), 1),
+                    "banding": _med([m["banding"] for m in ms]), "block": _med([m["block"] for m in ms]),
+                    "blur": _med([m["blur"] for m in ms]), "measured": ms})
+    out.sort(key=lambda s: (-len(s["measured"]), -s["files"]))
+    rx = re.compile(rf"-{re.escape(grp)}\b", re.I)
+    issues = [{"what": "release banned", "detail": b["value"], "why": b["why"]} for b in bans
+              if b["kind"] == "release" and rx.search(b["value"] or "")]
+    issues += [{"what": "group banned", "detail": grp, "why": b["why"]} for b in bans
+               if b["kind"] == "group" and (b["value"] or "").lower() == grp.lower()]
+    if strike:
+        issues.append({"what": f"{strike['n']} strike(s)", "detail": "", "why": strike["why"]})
+    issues += [{"what": "broken file", "detail": os.path.basename(f["path"]), "why": broken[f["id"]]}
+               for f in files if f["id"] in broken]
+    return {"library": library, "grp": grp, "files": len(files), "shows": out, "issues": issues}
