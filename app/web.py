@@ -14669,12 +14669,17 @@ tr.logdrop td{padding:0 0 8px 0;background:#1c2129;border-bottom:1px solid var(-
    ones stay fixed, the elastic ones share what is left in a stated ratio,
    and a cell is centred in its track rather than in whatever was left over.
    The header is the same grid, so it cannot drift. */
+/* THE SOURCE COLUMN FITS ITS WIDEST PILL. --qsrcw is measured after every
+   repaint (qFitSource), the same for every row so they stay aligned; 80px
+   until the first measure. A fixed 80px let "subtitle rules changed" run
+   over the title. */
 #queueList .qrow{display:grid;align-items:center;column-gap:10px;
-  grid-template-columns:40px 78px 80px minmax(0,3.4fr) minmax(0,2fr)
+  grid-template-columns:40px 78px var(--qsrcw,80px) minmax(0,3.4fr) minmax(0,2fr)
                         minmax(0,1.1fr) 100px 68px 84px}
 #queueList.haswhy .qrow{
-  grid-template-columns:40px 78px 80px minmax(0,3fr) minmax(0,1.6fr)
+  grid-template-columns:40px 78px var(--qsrcw,80px) minmax(0,3fr) minmax(0,1.6fr)
                         minmax(0,1fr) 100px 68px minmax(0,1.5fr) 84px}
+#queueList .qrow .qsrc{white-space:nowrap}
 #queueList .qrow > *{min-width:0}
 #queueList .qrow .qpool,#queueList .qrow .qsrc{justify-self:center}
 #queueList .qrow .qmv{justify-self:end}
@@ -26058,7 +26063,22 @@ const SRC_TAG = {
   // name from now on rather than borrowing somebody else's.
   subtitles: ['subtitles','#6fb0ff',
               'the subtitle reading found this and handed it over'],
+  // THE SOURCES THAT CAME LATER, each short enough to sit in its column, in a
+  // colour of its own, with the full story on hover.
+  'hevc10 convert':        ['HEVC convert', '#a2e05e', 'the 10-bit HEVC conversion queued this - see Video codec'],
+  'subtitle rules changed':['sub rules',    '#f778ba', 'a change to the subtitle rules re-planned this file'],
+  'shrink trial':          ['shrink trial', '#e8a33d', 'picked for a shrink trial'],
+  'settling check':        ['settling',     '#39d3c3', 'the settling check found this file still needed work'],
 };
+// MEASURE, THEN SET: the widest source pill in the list decides the column.
+function qFitSource(box){
+  try{
+    let w = 0;
+    box.querySelectorAll('.qrow:not(.qhead) .qsrc').forEach(el=>{ w = Math.max(w, el.scrollWidth); });
+    const want = Math.max(56, Math.min(170, Math.ceil(w) + 6));
+    if(box.__qsrcw !== want){ box.__qsrcw = want; box.style.setProperty('--qsrcw', want+'px'); }
+  }catch(e){}
+}
 function srcTag(s){
   const t = SRC_TAG[s] || [String(s||'manual'), '#8b95a5',
                           'queued by '+String(s||'something unnamed')];
@@ -26421,6 +26441,7 @@ async function loadQueue(){
         <span class="qmv" style="visibility:hidden"><button>⤒</button
           ><button>↑</button><button>↓</button><button>⤓</button></span>
       </div>`;
+    requestAnimationFrame(()=>qFitSource(box));
     box.innerHTML = items.length
       ? headHtml
         + (pinned
