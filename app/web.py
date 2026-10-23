@@ -35088,16 +35088,17 @@ async function loadConvert(){
   el.innerHTML=`<div class="lkind" style="padding:10px 12px">
     <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
       <b style="color:#6fb0ff">Convert to 10-bit HEVC</b>
-      <span class="pill ${c.on?'p-ok':'p-dim'}" style="cursor:pointer" onclick="convSet({on:${c.on?0:1}})">${c.on?'ON':'off'}</span>
-      <span class="dim" style="font-size:11.5px">${esc((c.libraries||[]).join(', '))}</span>
-      <span style="font-size:11.5px" title="8-bit H.264 below this bitrate is left alone - it has little to give and a generation to lose">from
-        <input type="number" min="0.5" step="0.5" value="${mm['1080']}" style="width:56px;box-sizing:border-box;font-size:11px" onchange="convSet({m1080:this.value})"> Mbps at 1080p,
-        <input type="number" min="0.5" step="0.5" value="${mm['720']}" style="width:56px;box-sizing:border-box;font-size:11px" onchange="convSet({m720:this.value})"> at 720p,
-        <input type="number" min="0.5" step="0.5" value="${mm['sd']}" style="width:56px;box-sizing:border-box;font-size:11px" onchange="convSet({msd:this.value})"> at SD</span>
+      <span class="pill ${c.on?'p-ok':'p-dim'}" style="cursor:pointer" onclick="convSet({on:${c.on?0:1}})"
+        title="${c.on?'running - click to pause every library':'paused - click to let the libraries that are switched on convert'}">${c.on?'running':'paused'}</span>
+      <span class="dim" style="font-size:11.5px">${(d.libraries||[]).length
+        ? 'switched on for '+esc(d.libraries.join(', '))
+        : 'switched on for no library yet'} · <a href="#" onclick="document.querySelector('[data-cp-key=hevc10_convert]')?.scrollIntoView({block:'center'});return false">per library, under Shrink oversized files ↓</a></span>
       <span style="font-size:11.5px" title="how many conversions are kept in the queue at once - the rest of the queue is never starved">keep
         <input type="number" min="1" max="200" value="${c.keep}" style="width:58px;box-sizing:border-box;font-size:11px" onchange="convSet({keep:this.value})"> queued</span>
     </div>
-    <div class="dim" style="font-size:11px;margin-top:6px">8-bit H.264 bands in flat colour and dark gradients at any setting that saves much; 10-bit HEVC
+    <div class="dim" style="font-size:11px;margin-top:6px">Each library turns this on, and sets its own bitrate floors, in its video settings below,
+      under Shrink oversized files. This panel is what they share: the progress, how many conversions are kept queued, and one switch to pause them all.
+      8-bit H.264 bands in flat colour and dark gradients at any setting that saves much; 10-bit HEVC
       held VMAF 95 with banding around 2.5 on the anime trial and came out 85-90% smaller. Every conversion goes through the quality
       search above, keeps signs burned and subtitles as they were, and is thrown away unless it saves at least ${Math.round(d.min_saving*100)}% -
       the original stays. New arrivals in the library are converted on their first pass too.</div>
@@ -40172,7 +40173,7 @@ function codecField(lib,side,f){
   const defTxt=Array.isArray(def[f.key])?(def[f.key].join(', ')||'none')
               :(typeof def[f.key]==='boolean'?(def[f.key]?'on':'off')
                                              :def[f.key]);
-  return `<div class="cfrow${isDefault?'':' cfchanged'}">
+  return `<div class="cfrow${isDefault?'':' cfchanged'}" data-cp-key="${esc(f.key)}">
     <div class="cfmain">
       <div class="cflabel">${esc(f.label)}
         ${isDefault?'':`<button class="cfreset"

@@ -68,15 +68,41 @@ def tier(height: int) -> str:
     return "1080" if height > 760 else "720" if height > 580 else "sd"
 
 
+def lib_cfg(library: str | None) -> dict | None:
+    """The library's own switch and floors, from the Video codec page -
+    None when the library does not convert."""
+    if not library:
+        return None
+    try:
+        from . import codecpolicy
+        v = codecpolicy.for_library(library, "video")
+    except Exception:                                    # noqa: BLE001
+        return None
+    if not v.get("hevc10_convert"):
+        return None
+    return {"1080": float(v.get("hevc10_1080_mbps") or 4), "720": float(v.get("hevc10_720_mbps") or 3),
+            "sd": float(v.get("hevc10_sd_mbps") or 2)}
+
+
+def libraries() -> list:
+    """Every library whose policy has the conversion switched on."""
+    try:
+        from . import codecpolicy
+        return [name for name in (codecpolicy.load() or {}) if lib_cfg(name)]
+    except Exception:                                    # noqa: BLE001
+        return []
+
+
 def wants(library: str | None, vcodec: str, ten_bit: bool, hdr: bool,
           height: int, mbps: float) -> bool:
-    """The planner's question: should this file become 10-bit HEVC?"""
-    c = cfg()
-    if not c["on"] or not library or library not in c["libraries"]:
+    """The planner's question: should this file become 10-bit HEVC?
+    The library's switch decides; the master switch (on) only pauses it."""
+    if not cfg()["on"]:
         return False
-    if vcodec != "h264" or ten_bit or hdr:
+    floors = lib_cfg(library)
+    if floors is None or vcodec != "h264" or ten_bit or hdr:
         return False
-    return mbps >= float(c["min_mbps"].get(tier(height or 0), 99))
+    return mbps >= floors.get(tier(height or 0), 99.0)
 
 
 def _done_ids(cur) -> set:
@@ -90,18 +116,21 @@ def candidates(force: bool = False) -> list:
     """Every file still worth converting, highest bitrate first. Cached 30 min."""
     if not force and STATE["cands"] and time.time() - STATE["cand_at"] < 1800:
         return STATE["cands"]
-    c = cfg()
+    libs = libraries()
     out = []
+    if not libs:
+        STATE.update(cands=[], cand_at=time.time())
+        return out
     with cursor() as cur:
         tried = _done_ids(cur)
         busy = {r["file_id"] for r in cur.execute(
             "SELECT file_id FROM jobs WHERE state IN ('queued','running') AND file_id IS NOT NULL")}
-        q = ",".join("?" * len(c["libraries"])) or "''"
+        q = ",".join("?" * len(libs))
         for r in cur.execute(
                 f"SELECT f.id, f.path, f.title, f.size, f.duration, f.height, f.pool_disk, f.library, p.json probe "
                 f"FROM files f JOIN file_probes p ON p.file_id=f.id WHERE f.library IN ({q}) "
                 f"AND f.state NOT IN ('deleted','duplicate') AND f.duration>240 AND f.size>0",
-                tuple(c["libraries"])):
+                tuple(libs)):
             if r["id"] in tried or r["id"] in busy:
                 continue
             try:
@@ -170,7 +199,7 @@ def progress() -> dict:
     hr = [r for r in done if (r["finished_at"] or 0) > time.time() - 6 * 3600]
     left = len(STATE["cands"]) + sum(1 for r in rows if r["state"] in ("queued", "running"))
     rate = len(hr) / 6.0
-    return {"cfg": cfg(), "done": len(done), "before_gb": round(b, 1), "after_gb": round(a, 1),
+    return {"cfg": cfg(), "libraries": libraries(), "done": len(done), "before_gb": round(b, 1), "after_gb": round(a, 1),
             "kept_original": sum(1 for r in rows if r["state"] == "skipped"),
             "failed": sum(1 for r in rows if r["state"] == "failed"),
             "queued": sum(1 for r in rows if r["state"] in ("queued", "running")),

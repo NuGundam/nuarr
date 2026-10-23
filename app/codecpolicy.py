@@ -212,6 +212,27 @@ FIELDS: dict[str, list[dict]] = {
                  "bigger risk to Sonarr and Radarr — they may decide the "
                  "file no longer matches the profile and re-download it — "
                  "than the extra space is worth."},
+        {"key": "hevc10_convert", "label": "Convert 8-bit H.264 to 10-bit HEVC",
+         "type": "bool", "default": False,
+         "what": "Re-encodes 8-bit H.264 above the floors below to 10-bit "
+                 "HEVC at the CQ the quality search finds (VMAF 95, banding "
+                 "under 4), new arrivals included. Not just for oversized "
+                 "files: on the anime library it came out 85-90% smaller, "
+                 "and 10-bit stops the banding 8-bit shows in flat colour. A "
+                 "conversion that saves under 20% is thrown away and the "
+                 "original kept. Only safe where the arr profile does not "
+                 "penalise x265 - the Anime profile rewards it; the Nu "
+                 "profiles score sub-4K x265 from non-tier groups -999999."},
+        {"parent": "hevc10_convert", "key": "hevc10_1080_mbps", "label": "Convert from — 1080p",
+         "type": "int", "min": 1, "max": 100, "step": 1, "default": 4, "unit": "Mbps",
+         "what": "8-bit H.264 at 1080p below this is left alone: it is already "
+                 "lean, has little to give, and a re-encode costs a generation."},
+        {"parent": "hevc10_convert", "key": "hevc10_720_mbps", "label": "Convert from — 720p",
+         "type": "int", "min": 1, "max": 100, "step": 1, "default": 3, "unit": "Mbps",
+         "what": "The same floor for 720p."},
+        {"parent": "hevc10_convert", "key": "hevc10_sd_mbps", "label": "Convert from — SD",
+         "type": "int", "min": 1, "max": 100, "step": 1, "default": 2, "unit": "Mbps",
+         "what": "The same floor for SD."},
     ],
     "audio": [
         {"key": "surround_bitrate", "label": "Surround bitrate", "type": "int",
