@@ -35177,10 +35177,19 @@ async function loadGroups(){
   const el=document.getElementById('grpBody'); if(!el) return;
   try{ _grp=await (await fetch('/api/groups?library='+encodeURIComponent(_grpLib))).json(); }catch(e){ el.innerHTML='<div class="dim">could not load</div>'; return; }
   _grpLib=_grp.library; grpPaint();
+  // LIVE, while the page is showing - new measurements appear on their own
+  clearTimeout(window._grpT);
+  window._grpT=setTimeout(()=>shownPoll('grpBody', loadGroups), 60000);
 }
 function grpPaint(){
   const el=document.getElementById('grpBody'); if(!el||!_grp) return;
   const d=_grp;
+  // THE SAME SCROLL BOXES AS SUBTITLE USER INPUT: one height, the heading row
+  // stuck to the top, a count line under each - and where you had scrolled to
+  // survives the repaint instead of jumping back to the top.
+  const _k1=(document.getElementById('grpMainBox')||{}).scrollTop||0;
+  const _k2=(document.getElementById('grpH2HBox')||{}).scrollTop||0;
+  const BOXH = 460;
   // colour a value by where it sits among this library's groups: green best third, red worst third
   const scale=(k,lowGood)=>{ const v=d.groups.map(g=>g[k]).filter(x=>x!=null).sort((a,b)=>a-b);
     return x=>{ if(x==null||v.length<3) return 'var(--dim)'; const r=v.indexOf(x)/(v.length-1);
@@ -35190,7 +35199,8 @@ function grpPaint(){
                blur:g=>(g.blur??99), mbps:g=>-(g.mbps1080??-1), issues:g=>-g.issues, shrink:g=>-(g.shrink??-999), grp:g=>g.grp.toLowerCase()};
   let rows=d.groups.filter(g=>g.files>=_grpMin && (!_grpQ || g.grp.toLowerCase().includes(_grpQ)));
   rows=rows.slice().sort((a,b)=>{ const ka=keyOf[_grpSort](a), kb=keyOf[_grpSort](b); return ka<kb?-1:ka>kb?1:0; });
-  const th=(k,t,tip)=>`<td style="padding:4px 6px;cursor:pointer;white-space:nowrap;${_grpSort===k?'color:#6fb0ff':''}" title="${esc(tip)}" onclick="_grpSort='${k}';grpPaint()">${t}${_grpSort===k?' ▾':''}</td>`;
+  const th=(k,t,tip)=>`<th style="padding:6px 6px;cursor:pointer;white-space:nowrap;text-align:left;font-weight:500;${_grpSort===k?'color:#6fb0ff':''}" title="${esc(tip)}" onclick="_grpSort='${k}';grpPaint()">${t}${_grpSort===k?' ▾':''}</th>`;
+  const STICK='position:sticky;top:0;z-index:2;background:var(--panel);box-shadow:0 1px 0 var(--line)';
   const num=(x,c)=>x==null?'<span class="dim">—</span>':`<span style="color:${c||'inherit'}">${x}</span>`;
   const bar=s=>s==null?'<span class="dim" title="fewer than 3 files measured">—</span>'
     :`<span style="display:inline-flex;align-items:center;gap:6px"><span style="width:60px;height:6px;background:var(--line);border-radius:3px;overflow:hidden;display:inline-block"><i style="display:block;height:6px;width:${s}%;background:${s>=67?'#7fd4a3':s>=34?'#e2b341':'#ff7b72'}"></i></span><b>${s}</b></span>`;
@@ -35212,8 +35222,9 @@ function grpPaint(){
    </div>
    <div class="dim" style="font-size:11px;margin-bottom:6px">Up to ${d.per_group} files per group, ${d.per_show} per show, three short samples each, measured in the background at low priority and never on a disk someone is watching from.
      The <b>score</b> is where a group sits among this library's groups on banding, blocking and blur together (100 = cleanest), shown once 3 files are measured. Colours compare a group with the others here, not with an absolute line.</div>
-   <div style="overflow-x:auto"><table style="width:100%;font-size:11.5px;border-collapse:collapse;min-width:820px">
-     <tr class="dim" style="font-size:10.5px;text-transform:uppercase">
+   <div id="grpMainBox" class="scrollbox" style="height:${BOXH}px;overflow:auto;border:1px solid var(--line);border-radius:6px">
+     <table style="width:100%;font-size:11.5px;border-collapse:collapse;min-width:820px">
+     <thead><tr class="dim" style="font-size:10.5px;text-transform:uppercase;${STICK}">
        ${th('grp','Group','release group')}${th('score','Score','banding, blocking and blur ranked against this library\'s groups - 100 cleanest')}
        ${th('files','Files','files in this library · shows')}
        ${th('banding','Banding','CAMBI, median of the measured files - about 5 is visible; the worst sample in brackets')}
@@ -35222,8 +35233,8 @@ function grpPaint(){
        ${th('mbps','1080p Mbps','median bitrate of their 1080p files')}
        <td style="padding:4px 6px" title="share of the measured files that are HEVC / 10-bit">HEVC · 10-bit</td>
        ${th('shrink','Shrinks','median size cut when nuarr converted or shrank their files at VMAF 95 - big numbers mean bloated releases')}
-       ${th('issues','Issues','release bans, strikes, files the decode check found broken; a group ban counts 5')}</tr>
-     ${rows.slice(0,300).map(g=>`<tr style="border-top:1px solid var(--line);${g.measured<3?'opacity:.75':''}">
+       ${th('issues','Issues','release bans, strikes, files the decode check found broken; a group ban counts 5')}</tr></thead>
+     <tbody>${rows.map(g=>`<tr style="border-top:1px solid var(--line);${g.measured<3?'opacity:.75':''}">
        <td style="padding:5px 6px"><b>${esc(g.grp)}</b></td><td>${bar(g.score)}</td>
        <td class="mono">${fmt(g.files)} <span class="dim">· ${g.shows} show${g.shows===1?'':'s'}${g.measured?` · ${g.measured} measured`:''}</span></td>
        <td class="mono">${num(g.banding,cB(g.banding))}${g.banding_max!=null?` <span class="dim">(${g.banding_max})</span>`:''}</td>
@@ -35231,18 +35242,30 @@ function grpPaint(){
        <td class="mono">${num(g.mbps1080)}</td>
        <td class="mono dim">${g.hevc==null?'—':g.hevc+'% · '+g.tenbit+'%'}</td>
        <td class="mono">${g.shrink==null?'<span class="dim">—</span>':`<span title="${g.shrunk} file(s)">−${g.shrink}%</span>`}</td>
-       <td class="mono">${iss(g)}</td></tr>`).join('')}
+       <td class="mono">${iss(g)}</td></tr>`).join('')}</tbody>
    </table></div>
-   ${rows.length>300?`<div class="dim" style="font-size:11px;margin-top:4px">showing 300 of ${rows.length} - narrow it with the filters</div>`:''}
-   <details style="margin-top:12px"><summary style="cursor:pointer;font-size:12px"><b style="color:#6fb0ff">Head to head</b>
-     <span class="dim">- shows where two or more groups' releases have been measured (${d.head_to_head.length}); cleanest banding first</span></summary>
-     ${d.head_to_head.map(h=>`<div class="lkind" style="padding:7px 10px;margin-top:6px"><b style="font-size:12px">${esc(h.show)}</b>
-       <table style="width:100%;font-size:11.5px;border-collapse:collapse;margin-top:3px">
-       ${h.groups.map((g,i)=>`<tr style="border-top:1px solid var(--line)"><td style="padding:3px 6px;width:180px">${i===0?'🏆 ':''}<b>${esc(g.grp)}</b> <span class="dim">(${g.n})</span></td>
-         <td class="mono">banding ${num(g.banding)}</td><td class="mono">blocking ${num(g.block)}</td><td class="mono">blur ${num(g.blur)}</td>
-         <td class="mono">${num(g.mbps)} Mbps</td><td class="dim">${esc(g.codec)}</td></tr>`).join('')}
-       </table></div>`).join('') || '<div class="dim" style="font-size:11px;margin-top:6px">nothing yet - it fills in as more files are measured</div>'}
-   </details>`;
+   <div class="dim" style="font-size:11px;margin-top:4px">${fmt(rows.length)} group${rows.length===1?'':'s'}${rows.length!==d.groups.length?` of ${fmt(d.groups.length)}`:''}
+     · ${fmt(rows.filter(g=>g.score!=null).length)} scored · sorted by ${esc(_grpSort==='grp'?'name':_grpSort)} · click a heading to sort</div>
+   <div style="margin-top:14px;display:flex;align-items:baseline;gap:8px;flex-wrap:wrap">
+     <b style="color:#6fb0ff;font-size:12px">Head to head</b>
+     <span class="dim" style="font-size:11px">shows where two or more groups' releases have been measured - each show's cleanest banding first (🏆)</span></div>
+   <div id="grpH2HBox" class="scrollbox" style="height:${BOXH}px;overflow:auto;border:1px solid var(--line);border-radius:6px;margin-top:6px">
+     <table style="width:100%;font-size:11.5px;border-collapse:collapse;min-width:820px">
+     <thead><tr class="dim" style="font-size:10.5px;text-transform:uppercase;${STICK}">
+       <th style="padding:6px;text-align:left;font-weight:500">Show</th><th style="text-align:left;font-weight:500">Group</th>
+       <th style="text-align:left;font-weight:500">Banding</th><th style="text-align:left;font-weight:500">Blocking</th>
+       <th style="text-align:left;font-weight:500">Blur</th><th style="text-align:left;font-weight:500">Mbps</th>
+       <th style="text-align:left;font-weight:500">Video</th></tr></thead>
+     <tbody>${d.head_to_head.map(h=>h.groups.map((g,i)=>`<tr style="border-top:1px solid ${i===0?'var(--line)':'rgba(255,255,255,.04)'}">
+       <td style="padding:4px 6px;vertical-align:top">${i===0?`<b>${esc(h.show)}</b>`:''}</td>
+       <td>${i===0?'🏆 ':''}<b>${esc(g.grp)}</b> <span class="dim">(${g.n})</span></td>
+       <td class="mono">${num(g.banding)}</td><td class="mono">${num(g.block)}</td><td class="mono">${num(g.blur)}</td>
+       <td class="mono">${num(g.mbps)}</td><td class="dim">${esc(g.codec)}</td></tr>`).join('')).join('')
+       || `<tr><td colspan="7" class="dim" style="padding:10px;font-size:11px">nothing yet - it fills in as more files are measured</td></tr>`}</tbody>
+     </table></div>
+   <div class="dim" style="font-size:11px;margin-top:4px">${fmt(d.head_to_head.length)} show${d.head_to_head.length===1?'':'s'} with more than one group measured</div>`;
+  const b1=document.getElementById('grpMainBox'), b2=document.getElementById('grpH2HBox');
+  if(b1) b1.scrollTop=_k1; if(b2) b2.scrollTop=_k2;
 }
 async function grpPause(on){ await fetch('/api/groups/pause?on='+on,{method:'POST'}); loadGroups(); }
 async function convSet(o){
